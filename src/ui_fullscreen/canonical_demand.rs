@@ -492,14 +492,7 @@ impl App {
             inputs.push((rotation, fit));
             layouts.push(layout);
         }
-        let legacy_auto = matches!(
-            self.settings.fullscreen_fit_mode,
-            FullscreenFitMode::MarginFit
-        ) || self.settings.margin_fit_enabled;
-        let base_trim_mode = crate::view_trim::effective_view_trim_base_apply_mode(
-            self.view_trim_apply_mode,
-            legacy_auto,
-        );
+        let base_trim_mode = self.resolved_view_trim_base_mode();
         let linked_pair_trim =
             occurrences.len() == 2 && inputs.iter().all(|(rotation, _)| rotation.is_none());
         let mut content = Vec::with_capacity(occurrences.len());

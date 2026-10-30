@@ -5848,6 +5848,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let old = PathBuf::from(r"D:\Comics\旧.zip");
         let new = PathBuf::from(r"D:\Comics\新.zip");
+        // Deliberately retain formatting/unknown fields: key migration must not decode JSON.
+        let state_json = r#"{ "version":2, "preference":"follow_global", "apply_mode":"none", "book_settings":{}, "future": [1, 2] }"#;
         {
             let conn = open(dir.path(), "view_trim.db");
             conn.execute_batch(
@@ -5858,8 +5860,8 @@ mod tests {
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO view_trim_books (book_key, state_json) VALUES (?1, '{}')",
-                [crate::path_key::normalize(&old)],
+                "INSERT INTO view_trim_books (book_key, state_json) VALUES (?1, ?2)",
+                rusqlite::params![crate::path_key::normalize(&old), state_json],
             )
             .unwrap();
             conn.execute(
@@ -5884,6 +5886,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(books, 1, "本単位の表示トリム設定が移る (drive 除去キー)");
+        let moved: String = conn
+            .query_row(
+                "SELECT state_json FROM view_trim_books WHERE book_key=?1",
+                [crate::path_key::normalize(&new)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved.as_bytes(), state_json.as_bytes());
         let pages: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM view_trim_pages WHERE page_path = ?1",
@@ -5895,6 +5905,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pages, 1, "ページ上書きも移る (keep-drive キー)");
+        drop(conn);
+        let restored = PathBuf::from(r"D:\Comics\restored.zip");
+        let copied = copy_restore_stores_without_identity_at(
+            dir.path(),
+            &[StoreCopyPathMapping::exact(&new, &restored)],
+        );
+        assert!(copied.errors.is_empty(), "{:?}", copied.errors);
+        let conn = open(dir.path(), "view_trim.db");
+        for path in [&new, &restored] {
+            let json: String = conn
+                .query_row(
+                    "SELECT state_json FROM view_trim_books WHERE book_key=?1",
+                    [crate::path_key::normalize(path)],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(json.as_bytes(), state_json.as_bytes());
+        }
     }
 
     /// 単一ファイル改名: ★ (rated_at / source_path 込み)・タグ・回転・複数ブックマークが

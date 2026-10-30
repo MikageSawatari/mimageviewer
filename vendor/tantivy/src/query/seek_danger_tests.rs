@@ -11,10 +11,11 @@ use std::sync::OnceLock;
 
 use proptest::prelude::*;
 
+use super::doc_predicate_query::{DocPredicateQuery, FunctionPredicate};
 use super::*;
 use crate::docset::SeekDangerResult;
 use crate::schema::{Field, IndexRecordOption, Schema, FAST, TEXT};
-use crate::{DocId, DocSet, Index, Searcher, Term, TERMINATED};
+use crate::{DocId, DocSet, Index, Searcher, SegmentReader, Term, TERMINATED};
 
 #[derive(Clone, Copy, Debug)]
 enum Kind {
@@ -26,6 +27,7 @@ enum Kind {
     Phrase,
     PhrasePrefix,
     FastFieldRange,
+    Predicate,
     ScorerWrapper,
 }
 
@@ -63,11 +65,12 @@ implementations! {
     ("intersection.rs", Intersection, query_seek_danger_intersection),
     ("", BufferedUnion, query_seek_danger_buffered_union),
     ("boost_query.rs", Boost, query_seek_danger_boost),
-    ("", ConstScore, query_seek_danger_const_score),
+    ("const_score_query.rs", ConstScore, query_seek_danger_const_score),
     ("reqopt_scorer.rs", RequiredOptional, query_seek_danger_required_optional),
     ("phrase_query/phrase_scorer.rs", Phrase, query_seek_danger_phrase),
     ("phrase_prefix_query/phrase_prefix_scorer.rs", PhrasePrefix, query_seek_danger_phrase_prefix),
-    ("", FastFieldRange, query_seek_danger_fast_field_range),
+    ("range_query/fast_field_range_doc_set.rs", FastFieldRange, query_seek_danger_fast_field_range),
+    ("doc_predicate_query/mod.rs", Predicate, query_seek_danger_predicate),
     ("disjunction.rs", ScorerWrapper, query_seek_danger_scorer_wrapper),
 }
 
@@ -116,6 +119,9 @@ impl Expr {
                 Bound::Included(Term::from_field_u64(number, 3)),
                 Bound::Excluded(Term::from_field_u64(number, 8)),
             )),
+            Kind::Predicate => Box::new(DocPredicateQuery::from(FunctionPredicate::from(
+                |_: &SegmentReader| Ok(|doc: DocId| doc.is_multiple_of(13)),
+            ))),
             // ScorerWrapper is private to Disjunction and its override is not
             // called by Disjunction's normal traversal. Exercise it directly.
             Kind::ScorerWrapper => left,
@@ -189,9 +195,10 @@ fn scorer(expr: &Expr, scoring: bool) -> Box<dyn Scorer> {
         .scorer(fixture.searcher.segment_reader(0), 1.0)
         .unwrap();
     if matches!(expr, Expr::Node(Kind::ScorerWrapper, _, _)) {
-        // ConstScorer does not forward seek_danger in 0.26, so use the
-        // test-only Scorer implementation to exercise ScorerWrapper directly.
-        Box::new(super::disjunction::seek_danger_test_wrapper(scorer))
+        Box::new(ConstScorer::new(
+            super::disjunction::seek_danger_test_wrapper(scorer),
+            1.0,
+        ))
     } else {
         scorer
     }
@@ -313,5 +320,9 @@ fn seek_danger_implementation_inventory() {
     }
     // Trait default (used by TermScorer) and the Box / &mut forwarding impls.
     covered.insert("docset.rs".to_string(), 3);
-    assert_eq!(found, covered, "Register new seek_danger implementations in seek_danger_tests.rs and add their query/scorer to the generator");
+    assert_eq!(
+        found, covered,
+        "Register new seek_danger implementations in seek_danger_tests.rs and add their \
+         query/scorer to the generator"
+    );
 }

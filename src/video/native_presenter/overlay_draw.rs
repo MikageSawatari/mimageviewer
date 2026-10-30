@@ -2539,14 +2539,28 @@ pub(super) fn draw_native_bar_lock_button(
     resp.rect
 }
 
-pub(super) fn native_top_bar_lock_button_rect(overlay_width_points: f32) -> egui::Rect {
+fn native_top_bar_control_rect(overlay_width_points: f32, offset_from_close: usize) -> egui::Rect {
     let button_size = 28.0;
     let gap = 8.0;
     let close_x = overlay_width_points - 12.0 - button_size;
     egui::Rect::from_min_size(
-        egui::pos2(close_x - button_size - gap, 13.0),
+        egui::pos2(
+            close_x - (button_size + gap) * offset_from_close as f32,
+            13.0,
+        ),
         egui::vec2(button_size, button_size),
     )
+}
+
+pub(super) fn native_top_bar_lock_button_rect(
+    overlay_width_points: f32,
+    show_more: bool,
+) -> egui::Rect {
+    native_top_bar_control_rect(overlay_width_points, 1 + usize::from(show_more))
+}
+
+pub(super) fn native_top_bar_more_button_rect(overlay_width_points: f32) -> egui::Rect {
+    native_top_bar_control_rect(overlay_width_points, 1)
 }
 
 #[allow(dead_code)] // Normal-size compatibility wrapper; fitted HUD callers use the `_in` form.
@@ -4400,6 +4414,8 @@ pub(super) struct NativeTopBarLayout {
     pub(super) painted_rect: Option<egui::Rect>,
     pub(super) controls_rect: Option<egui::Rect>,
     pub(super) vst_button_rect: Option<egui::Rect>,
+    pub(super) more_button_rect: Option<egui::Rect>,
+    pub(super) lock_button_rect: Option<egui::Rect>,
     pub(super) text_rect: egui::Rect,
     pub(super) title_rect: Option<egui::Rect>,
     pub(super) subtitle_rect: Option<egui::Rect>,
@@ -4481,6 +4497,8 @@ pub(super) fn draw_top_bar_text_lines(
         painted_rect: None,
         controls_rect,
         vst_button_rect: None,
+        more_button_rect: None,
+        lock_button_rect: None,
         text_rect,
         title_rect: title.as_ref().map(|(rect, _)| *rect),
         subtitle_rect: subtitle.as_ref().map(|(rect, _)| *rect),
@@ -4606,6 +4624,134 @@ fn draw_native_panorama_projection_popup(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn draw_native_more_popup(
+    ctx: &egui::Context,
+    full_rect: egui::Rect,
+    button_rect: egui::Rect,
+    current: crate::settings::VideoDeinterlaceMode,
+    popup_open: &mut bool,
+    popup_rect_out: &mut Option<egui::Rect>,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    if !*popup_open {
+        return;
+    }
+    let note_font = egui::FontId::proportional(11.0);
+    let note = ctx.fonts_mut(|fonts| {
+        fonts.layout(
+            "この動画を閉じると環境設定の値に戻ります".to_owned(),
+            note_font,
+            egui::Color32::from_gray(180),
+            (full_rect.width() - 40.0).clamp(120.0, 360.0),
+        )
+    });
+    let popup_size = egui::vec2(
+        (note.size().x + 24.0).max(180.0),
+        64.0 + 3.0 * NATIVE_MORE_POPUP_ROW_HEIGHT + 12.0 + note.size().y + 12.0,
+    );
+    let popup_rect = native_panorama_projection_popup_rect(
+        full_rect,
+        button_rect.min.x,
+        crate::video::native_presenter::HUD_TOP_HEIGHT + 4.0,
+        popup_size,
+    );
+    let mut drawn_popup_rect = popup_rect;
+    let mut selected = None;
+    egui::Area::new(egui::Id::unique("native_video_more_popup"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(popup_rect.min)
+        .show(ctx, |ui| {
+            crate::os_theme::apply_dark_ui(ui);
+            let (rect, _) = ui.allocate_exact_size(popup_size, egui::Sense::hover());
+            drawn_popup_rect = rect;
+            let painter = ui.painter();
+            painter.rect_filled(
+                rect,
+                6.0,
+                egui::Color32::from_rgba_unmultiplied(30, 30, 30, 240),
+            );
+            painter.rect_stroke(
+                rect,
+                6.0,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(100)),
+                egui::StrokeKind::Outside,
+            );
+            for (label, y, size) in [
+                ("その他の機能", 16.0, 11.0),
+                ("デインターレース", 46.0, 13.0),
+            ] {
+                painter.text(
+                    rect.min + egui::vec2(12.0, y),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::proportional(size),
+                    ui.visuals().text_color(),
+                );
+            }
+            for (row, &mode) in crate::settings::VideoDeinterlaceMode::all()
+                .iter()
+                .enumerate()
+            {
+                let item_rect = native_more_popup_row_rect(rect, row);
+                let response = ui.interact(
+                    item_rect,
+                    egui::Id::unique(("native_video_deinterlace_mode", row)),
+                    egui::Sense::click(),
+                );
+                let active = mode == current;
+                draw_overlay_button_bg(painter, item_rect, response.hovered(), active);
+                if active {
+                    painter.circle_filled(
+                        egui::pos2(item_rect.min.x + 14.0, item_rect.center().y),
+                        3.0,
+                        ui.visuals().text_color(),
+                    );
+                }
+                painter.text(
+                    egui::pos2(item_rect.min.x + 28.0, item_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    mode.label(),
+                    egui::FontId::proportional(13.0),
+                    ui.visuals().text_color(),
+                );
+                if response.hovered() {
+                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if response.clicked() {
+                    selected = Some(mode);
+                }
+            }
+            painter.galley(
+                egui::pos2(rect.min.x + 12.0, rect.max.y - 12.0 - note.size().y),
+                note.clone(),
+                egui::Color32::from_gray(180),
+            );
+        });
+    if let Some(mode) = selected {
+        commands.push(NativeOverlayCommand::SetDeinterlaceMode { mode });
+        *popup_open = false;
+    } else if let Some(pos) = ctx.input(|input| input.pointer.press_origin())
+        && !drawn_popup_rect.contains(pos)
+        && !button_rect.contains(pos)
+        && ctx.input(|input| input.pointer.any_pressed())
+    {
+        *popup_open = false;
+    }
+    if *popup_open {
+        *popup_rect_out = Some(drawn_popup_rect);
+    }
+}
+
+const NATIVE_MORE_POPUP_ROW_HEIGHT: f32 = 32.0;
+
+pub(super) fn native_more_popup_row_rect(rect: egui::Rect, row: usize) -> egui::Rect {
+    egui::Rect::from_min_size(
+        rect.min + egui::vec2(4.0, 64.0 + row as f32 * NATIVE_MORE_POPUP_ROW_HEIGHT),
+        egui::vec2(rect.width() - 8.0, NATIVE_MORE_POPUP_ROW_HEIGHT - 4.0),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_native_top_bar(
     ctx: &egui::Context,
     overlay_width_points: f32,
@@ -4617,6 +4763,8 @@ pub(super) fn draw_native_top_bar(
     video_zoom_scale: Option<f32>,
     panorama_projection_popup_open: &mut bool,
     panorama_projection_popup_rect_out: &mut Option<egui::Rect>,
+    more_popup_open: &mut bool,
+    more_popup_rect_out: &mut Option<egui::Rect>,
     fallback_file_name: &str,
     perf_visible: bool,
     vst3_available: bool,
@@ -4640,11 +4788,17 @@ pub(super) fn draw_native_top_bar(
     >,
 ) -> NativeTopBarLayout {
     *panorama_projection_popup_rect_out = None;
+    *more_popup_rect_out = None;
+    if audio_only {
+        *more_popup_open = false;
+    }
     if panorama_pose.is_none() || audio_only {
         *panorama_projection_popup_open = false;
     }
     let mut panorama_projection_button_rect = None;
     let mut vst_button_rect = None;
+    let mut more_button_rect = None;
+    let mut lock_button_rect = None;
     let layout = egui::Area::new(egui::Id::unique("native_video_top_bar"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
@@ -4721,7 +4875,30 @@ pub(super) fn draw_native_top_bar(
                 commands,
             );
             include_native_top_bar_control(&mut controls_rect, close_rect);
-            let lock_rect = native_top_bar_lock_button_rect(overlay_width_points);
+            if !audio_only {
+                let more_rect = native_top_bar_more_button_rect(overlay_width_points);
+                let response = ui.interact(
+                    more_rect,
+                    egui::Id::unique("native_top_more"),
+                    egui::Sense::click(),
+                );
+                draw_overlay_button_bg(&painter, more_rect, response.hovered(), *more_popup_open);
+                crate::ui_fullscreen::draw_icons::draw_more_icon(
+                    &painter,
+                    more_rect.center(),
+                    btn_size * 0.28,
+                );
+                let response = response.hover_tip_dark("その他の機能");
+                if response.clicked() {
+                    *more_popup_open = !*more_popup_open;
+                    if *more_popup_open {
+                        *panorama_projection_popup_open = false;
+                    }
+                }
+                more_button_rect = Some(response.rect);
+                include_native_top_bar_control(&mut controls_rect, response.rect);
+            }
+            let lock_rect = native_top_bar_lock_button_rect(overlay_width_points, !audio_only);
             let lock_rect = draw_native_bar_lock_button(
                 ui,
                 &painter,
@@ -4740,7 +4917,8 @@ pub(super) fn draw_native_top_bar(
                 commands,
             );
             include_native_top_bar_control(&mut controls_rect, lock_rect);
-            x -= btn_size + gap;
+            lock_button_rect = Some(lock_rect);
+            x = lock_rect.min.x - btn_size - gap;
             let window_rect = draw_native_top_button(
                 ui,
                 &painter,
@@ -4855,6 +5033,9 @@ pub(super) fn draw_native_top_bar(
                 include_native_top_bar_control(&mut controls_rect, projection_resp.rect);
                 if panorama_controls_enabled && projection_resp.clicked() {
                     *panorama_projection_popup_open = !*panorama_projection_popup_open;
+                    if *panorama_projection_popup_open {
+                        *more_popup_open = false;
+                    }
                 }
                 x -= btn_size + gap;
                 let reset_rect = draw_native_top_button_enabled(
@@ -5066,8 +5247,26 @@ pub(super) fn draw_native_top_bar(
     } else {
         *panorama_projection_popup_open = false;
     }
+    if let Some(button_rect) = more_button_rect {
+        draw_native_more_popup(
+            ctx,
+            egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(overlay_width_points, overlay_height_points),
+            ),
+            button_rect,
+            metadata.map_or(crate::settings::VideoDeinterlaceMode::Auto, |metadata| {
+                metadata.deinterlace_mode
+            }),
+            more_popup_open,
+            more_popup_rect_out,
+            commands,
+        );
+    }
     let mut layout = layout.inner;
     layout.vst_button_rect = vst_button_rect;
+    layout.more_button_rect = more_button_rect;
+    layout.lock_button_rect = lock_button_rect;
     layout
 }
 
@@ -6259,6 +6458,7 @@ pub(super) fn draw_native_metadata_panel(
                 metadata.deinterlace_mode,
                 metadata.deinterlace_status,
                 metadata.interlace_detected,
+                metadata.deinterlace_manual,
             );
             let audio_label = metadata
                 .audio_track_rows
@@ -7747,16 +7947,17 @@ pub(super) fn format_bitrate(bit_rate_bps: i64) -> String {
 
 /// 右パネル「デインターレース」行の表示文字列を組み立てる。
 ///
-/// 入力は open 時の Settings モード (`mode`) と decoder thread から動的に
+/// 入力は player の現在モード (`mode`) と decoder thread から動的に
 /// 更新される `status` / `interlace_detected` の組み合わせ。
 pub(super) fn format_deinterlace_status(
     mode: crate::settings::VideoDeinterlaceMode,
     status: crate::video::decoder::DeinterlaceStatusSnapshot,
     interlace_detected: bool,
+    manual: bool,
 ) -> String {
     use crate::settings::VideoDeinterlaceMode;
     use crate::video::decoder::DeinterlaceStatusSnapshot as S;
-    match mode {
+    let status = match mode {
         VideoDeinterlaceMode::Off => "オフ".to_string(),
         VideoDeinterlaceMode::On => match status {
             S::Active => "常時 (適用中)".to_string(),
@@ -7775,6 +7976,11 @@ pub(super) fn format_deinterlace_status(
                 }
             }
         },
+    };
+    if manual {
+        format!("手動: {status}")
+    } else {
+        status
     }
 }
 
@@ -8055,6 +8261,8 @@ pub(crate) mod tests {
                         None,
                         &mut popup_open,
                         &mut popup_rect,
+                        &mut false,
+                        &mut None,
                         "test-video.mp4",
                         false,
                         true,
@@ -8137,6 +8345,8 @@ pub(crate) mod tests {
                 None,
                 &mut projection_popup_open,
                 &mut projection_popup_rect,
+                &mut false,
+                &mut None,
                 title,
                 false,
                 vst3_available,
@@ -8195,6 +8405,7 @@ pub(crate) mod tests {
             gpu_path_active: true,
             d3d11va_supported: true,
             deinterlace_mode: crate::settings::VideoDeinterlaceMode::Auto,
+            deinterlace_manual: false,
             last_present_path: crate::video::decoder::PresentPathSnapshot::Gpu,
             deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot::Inactive,
             interlace_detected: false,
@@ -8243,6 +8454,8 @@ pub(crate) mod tests {
                         None,
                         &mut popup_open,
                         &mut popup_rect,
+                        &mut false,
+                        &mut None,
                         "test-video.mp4",
                         false,
                         false,
@@ -8341,6 +8554,8 @@ pub(crate) mod tests {
                     None,
                     &mut popup_open,
                     &mut popup_rect,
+                    &mut false,
+                    &mut None,
                     "test-video.mp4",
                     false,
                     false,
@@ -8465,6 +8680,8 @@ pub(crate) mod tests {
                     video_zoom_scale,
                     &mut projection_popup_open,
                     &mut projection_popup_rect,
+                    &mut false,
+                    &mut None,
                     &metadata.file_name,
                     false,
                     true,
@@ -8667,10 +8884,10 @@ pub(crate) mod tests {
             assert_top_bar_text_clears_controls(layout);
             assert!(layout.title_galley.as_ref().unwrap().text().ends_with('…'));
         }
-        // Baseline video row is 316pt wide. Panorama adds projection + reset (72pt),
+        // Baseline video row is 352pt wide. Panorama adds projection + reset (72pt),
         // while zoom adds reset (36pt) + its 48pt readout and two 8pt gaps (92pt).
-        assert_eq!(panorama.controls_rect.unwrap().width(), 388.0);
-        assert_eq!(zoom.controls_rect.unwrap().width(), 408.0);
+        assert_eq!(panorama.controls_rect.unwrap().width(), 424.0);
+        assert_eq!(zoom.controls_rect.unwrap().width(), 444.0);
     }
 
     #[test]
@@ -8744,6 +8961,7 @@ pub(crate) mod tests {
         let preview = preview_layout.unwrap();
 
         for layout in [&audio, &tile, &preview] {
+            assert!(layout.more_button_rect.is_none());
             assert_top_bar_text_clears_controls(layout);
             assert!(layout.title_galley.as_ref().unwrap().text().ends_with('…'));
         }
@@ -8784,6 +9002,8 @@ pub(crate) mod tests {
                         None,
                         &mut projection_popup_open,
                         &mut projection_popup_rect,
+                        &mut false,
+                        &mut None,
                         &title,
                         false,
                         true,
@@ -9413,6 +9633,174 @@ pub(crate) mod tests {
         let landscape = fit_rect_in_rect(egui::vec2(1280.0, 720.0), slot);
         assert!((landscape.width() - slot.width()).abs() < 1e-3);
         assert!(slot.contains_rect(landscape));
+    }
+
+    #[test]
+    fn native_deinterlace_status_manual_prefix_preserves_every_existing_status() {
+        use crate::settings::VideoDeinterlaceMode as M;
+        use crate::video::decoder::DeinterlaceStatusSnapshot as S;
+        let statuses = [S::Pending, S::Inactive, S::Active, S::Failed];
+        for (mode, detected, expected) in [
+            (M::Off, false, ["オフ", "オフ", "オフ", "オフ"]),
+            (M::Off, true, ["オフ", "オフ", "オフ", "オフ"]),
+            (
+                M::On,
+                false,
+                [
+                    "常時 (準備中)",
+                    "常時 (準備中)",
+                    "常時 (適用中)",
+                    "常時 (初期化失敗)",
+                ],
+            ),
+            (
+                M::On,
+                true,
+                [
+                    "常時 (準備中)",
+                    "常時 (準備中)",
+                    "常時 (適用中)",
+                    "常時 (初期化失敗)",
+                ],
+            ),
+            (
+                M::Auto,
+                false,
+                [
+                    "自動 - 確認中",
+                    "自動 - プログレッシブ",
+                    "自動 - 適用中",
+                    "自動 - 初期化失敗",
+                ],
+            ),
+            (
+                M::Auto,
+                true,
+                [
+                    "自動 - 確認中",
+                    "自動 - 待機中",
+                    "自動 - 適用中",
+                    "自動 - 初期化失敗",
+                ],
+            ),
+        ] {
+            for (status, expected) in statuses.into_iter().zip(expected) {
+                for manual in [false, true] {
+                    assert_eq!(
+                        format_deinterlace_status(mode, status, detected, manual),
+                        if manual {
+                            format!("手動: {expected}")
+                        } else {
+                            expected.to_owned()
+                        },
+                        "mode={mode:?}, status={status:?}, detected={detected}, manual={manual}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_top_more_and_lock_use_the_same_drawn_control_layout() {
+        for width in [720.0, 1200.0] {
+            let video = test_normal_top_bar_layout(
+                width,
+                1.0,
+                "video.mp4",
+                false,
+                false,
+                false,
+                false,
+                None,
+            );
+            let audio = test_normal_top_bar_layout(
+                width,
+                1.0,
+                "audio.flac",
+                true,
+                false,
+                false,
+                false,
+                None,
+            );
+            assert_eq!(
+                video.more_button_rect,
+                Some(native_top_bar_more_button_rect(width))
+            );
+            assert_eq!(
+                video.lock_button_rect,
+                Some(native_top_bar_lock_button_rect(width, true))
+            );
+            assert_eq!(audio.more_button_rect, None);
+            assert_eq!(
+                audio.lock_button_rect,
+                Some(native_top_bar_lock_button_rect(width, false))
+            );
+            assert_eq!(
+                video.lock_button_rect.unwrap().min.x + 36.0,
+                audio.lock_button_rect.unwrap().min.x
+            );
+            assert!(video.lock_button_rect.unwrap().max.x < video.more_button_rect.unwrap().min.x);
+        }
+    }
+
+    #[test]
+    fn native_video_more_popup_snapshot() {
+        let mut fonts_ready = false;
+        let mut popup_open = true;
+        let mut popup_rect = None;
+        let mut metadata = test_overlay_metadata(
+            "sample.mp4".into(),
+            Err(crate::video::spherical_metadata::VideoPanoramaRejection::NotPanoramic),
+        );
+        metadata.deinterlace_mode = crate::settings::VideoDeinterlaceMode::On;
+        metadata.deinterlace_manual = true;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(540.0, 330.0))
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |_| {});
+                    draw_native_top_bar(
+                        ctx,
+                        540.0,
+                        330.0,
+                        71.0,
+                        100.0,
+                        Some(&metadata),
+                        None,
+                        None,
+                        &mut false,
+                        &mut None,
+                        &mut popup_open,
+                        &mut popup_rect,
+                        "sample.mp4",
+                        false,
+                        false,
+                        false,
+                        false,
+                        crate::settings::FsSidePanelMode::Hover,
+                        false,
+                        false,
+                        false,
+                        &mut Vec::new(),
+                        #[cfg(feature = "test-script")]
+                        &mut None,
+                        #[cfg(feature = "test-script")]
+                        None,
+                        #[cfg(feature = "test-script")]
+                        &mut None,
+                    );
+                });
+            });
+        harness.run();
+        harness.snapshot("native_video_more_popup");
     }
 
     #[test]

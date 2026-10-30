@@ -138,6 +138,14 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
   `src/app.rs` 約 57696)。拒否は上の handler の return で行う。共通入口に到達した場合も、進行中の `ListOrder` を cancel・再開始しないことを検証する。
 - この操作の準備中に Ctrl+↑↓ を押した場合、Ctrl+↑↓ の準備中にこの操作を押した場合も、既存の gate で拒否される。cancel して乗り換える処理は作らない。
 - 累積 (`MAX_PENDING_NAV`) には乗せない。新しい状態 field は足さない。
+- 表示待ちの受付方針は worker の寿命から独立させる。受理済みの既存 sequence の purpose に
+  `ListOrderNavigation` を保持し、動画・音声への着地で `FolderNavigation` に移るときも
+  typed な origin に引き継ぐ。Ctrl・兄弟移動・共通入口は、準備・表示待ちの間は拒否する。
+  sequence の終端失敗 (RenditionFailed) とパスワード待ちの受付方針は既存の phase / modal に従い、
+  表示用の旧画像が残っていることだけで新しい要求を拒否しない。
+  再 capture も準備・表示待ちが継続中の場合だけ一覧順の受付方針を引き継ぎ、終端失敗から
+  スライドショー等の新しい移動を開始するときに拒否状態を復活させない。
+  通常の Fullscreen 由来の表示待ち中の継続受付は維持する (2026-10-27 独立コードレビュー P2 対応)。
 
 ### 4.3 着地
 
@@ -247,6 +255,20 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
 
 ## 9. レビュー指摘への対応
 
+### 実装時の補足 (2026-10-26)
+
+- helper・worker の実装は `app/list_order_navigation.rs` に分け、App は bundle の投影 field を持つ。
+  `grid_physical_navigation` の共通入口で通常フォルダ・ZIP/PDF を取得し、変換書庫の
+  Enter / double-click / 明示指定の3入口では load 前に同じ helper を呼ぶ (helper 呼出しは計4か所)。
+- 既存 `FsBoundaryHint::Edge` はページ端用の「先頭です / 末尾です」と Home/End・DFS 案内だけを
+  持っていたため、typed な `FsBoundaryEdgeScope::Page | ListOrder` を付けた。
+  Page の挙動は維持し、ListOrder だけ指定の「一覧の先頭です / 一覧の末尾です」を egui/native で共有する。
+  これは端通知の文言を区別するための局所的な拡張で、移動用の状態 field は追加しない。
+- `EachPhysicalPress` は既存Ctrl操作と同じ helper を使う。egui は複数の物理押下を数え、
+  repeatだけのframeは1回に集約する。準備中は専用handlerが追加受付を拒否し、累積しない。
+  native動画のrepeatは既存Ctrl操作と同じくdispatcherで無視する。eguiも全面的にrepeatを
+  無視するという指定ではないので、専用no-repeat APIは追加しない。
+
 ### 第 3 版 (ACCEPT WITH CHANGES) の指摘
 
 | 指摘 | 対応 |
@@ -273,3 +295,509 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
 P1-1 (由来で決める) は第 3 版で「保持・破棄をしない」形に置き換えた。P1-2 (目的地の差し替え) は §4.1 の `FolderNavMode::ListOrder`、
 P2-3 (変換書庫の入口) は §3.3、P2-4 (開き方・戻り方) は §4.3、P2-5 (Folder の定義と anchor) は §4.1・§3.4、
 P2-6 (main と F12 linked) は §3.4、P2-7 (native 動画) は §8.1 で対応した。
+
+## 10. 実装・検証記録 (2026-10-26〜27)
+
+対象は `listorder-1444` / 基点 `a32559dca` の未コミット差分。commit・製品アプリ起動は行わない。
+実装者側の独立コードレビューは、入力の直dispatchが共通受付処理を迂回する指摘を修正し、
+追加の必須修正指摘なし。入力 intent は一時的な `FsKeyAction` に載せ、ROOT / forwarded ROOT /
+viewport から既存のナビゲーション dispatcher を通す。準備中と利用資格なしの拒否は、
+評価復帰・required-open・preview の owner を退役する前に専用 handler で判定する。
+
+### テストの範囲
+
+- `app/list_order_tests.rs`: 種類・凍結・重複除去、通常/詳細の名前・日付昇降順、スマートフィルタの
+  facet と Ctrl+F / 評価の合成、取得受付・surface / owner 除外、論理sourceの位置、境界、★固定、
+  cold/warm PDF採用、EPUB cache世代lease、PDF取消後、評価由来の物理本。
+- `app/list_order_worker_tests.rs`: 停止条件、空・消失・書庫/文書のみのfolderと子孫を飛ばす規則、
+  前後・端・取消、事前scanと再表示、sequence / hydration後の表示lock、Ctrl/兄弟との相互拒否、
+  共通入口の非再開始、eguiの既定/再割当/repeat/入力欄/modal、端・利用不可の通知。
+- `app/list_order_virtual_tests.rs`: handler→worker→分類→PhysicalHistoryTransition→prepared採用→
+  hydration→再openを既存Fullscreenと比較 (通常folder・ZIP・cold/warm PDF・変換cache・音声と内側ZIP)。
+  ZIP/PDFの列挙待ちでは、DeferredFsReopenが本を開く設定ではなくbook_nav_resumeを使い、保存ページへ戻ることも検査する。
+- registry: bundle swap・両fork子の空・兄弟不変・park/mount・promote後の旧owner無効。
+  keymap / native resolver・dispatcher / 動画help / egui operation identity / 実pointer double-click /
+  受理前後の評価復帰・preview・required-open ownerもhandler-levelで検査する。
+
+### コードの前提と検証の限界
+
+- staged preflightで全ページを採用したZIP/PDFは、既存Fullscreenでも列挙pendingが残らず先頭へ再表示する。
+  `book_nav_resume`を読むのは既存の列挙待ちDeferred経路。今回は両modeの同じ採用・再表示を共有し、
+  既存Fullscreen自体の再開位置規則は変更しない。
+- Collection ownerは現行APIではCollection surfaceでのみ成立するため、Folder surfaceと同時の
+  fixtureは作らずsurface除外で検証する。Folder surfaceでも成立するRating ownerは直接検証する。
+- PDFの実デコード・EPUB変換器・実native動画presenterの操作は行わない。PDF枚数採用は既存の
+  completed-enumerate / ready-preflight seam、EPUBは実cache publication・leaseとprepared採用を使う。
+- `test-lib-full.ps1` と実アプリ確認はClaudeCode側。実アプリは隔離data-dirで、スマートフィルタ＋
+  日付降順の通常フォルダ一覧から開き、Ctrl+Shift+↑↓、両端、ページ一覧経由、既存Ctrl+↑↓、native動画、
+  ★固定・F12別窓での通知を確認する。
+
+### 自動検証
+
+ログは `target/list-order-verification/`。ネイティブbuildは `MSBUILDDISABLENODEREUSE=1`。
+初回TurboJPEGの並列MSBuildが非ゼロになったため、診断の単一並列build後、ネイティブ依存のcold buildは
+`CARGO_BUILD_JOBS=1`で実行する。構築済み依存を使うRust再コンパイル・テストは通常並列でよい。
+これはビルド実行環境だけの変更で、ソース/配布設定は変更しない。
+
+関連nextestの初回は385件中380成功・5失敗。失敗は追加テストの (a) egui repeat無視という仮定、
+(b) writer公開snapshotを通さない読書位置の直接DB書込み、(c) Folderへのfile_operation_path使用。
+正本と既存helper契約を再照合し、writer FIFOからの保存位置公開をassertし、Folderのパス取得も修正した。
+読書位置の期待2は維持。製品コードを変えず、同じ385件の再実行は全件成功した。
+取得・位置の15件は重複を避けて同nextestから除外し、`test-focused.ps1`で別に全件成功した。
+
+関連nextestのfilter (以下 `$relatedFilter`):
+
+```powershell
+$relatedFilter = '(test(/list_order/) or test(/keymap::tests::/) or test(/folder_nav/) or test(/fullscreen_ctrl_nav/) or test(/fullscreen_sibling_nav/) or test(/counted_action/) or test(/boundary_notice_setting_only_hides_edge_hints/) or test(/static_and_native_boundary_titles_use_the_same_wording/) or test(/context_async_owner_registry_audits_bundle_pending_fields/) or test(/raw_text_edits_are_ime_aware_or_explicitly_exempt/)) and not test(/app::list_order_tests::/)'
+```
+
+| コマンド | exit code・結果 | ログ |
+| --- | --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 初回1 (TurboJPEG MSBuild)、単一並列で再実行0 | `check.*.log` (再実行) |
+| `cmake --build target/debug/build/turbojpeg-sys-4adae978226e4e06/out/build --target install --config Debug --parallel 1 -- /verbosity:normal` | 0、初回MSBuildの診断・依存buildのみ | tool出力 |
+| `cargo check -p mimageviewer --bin mimageviewer-core --features test-script` | 0 | `check-test-script.*.log` |
+| `UPDATE_KEYMAP_DEFAULT=1 cargo nextest run -p mimageviewer --lib -E 'test(/the_checked_in_default_keymap_matches_what_the_app_writes/)'` (環境変数はPowerShellで設定) | 通常並列101 (依存MSBuild)、単一並列101 (追加testのcompile error 10件)、test側修正後0・1件成功。`.default`再生成済み | `keymap-generate*.*.log` |
+| `cargo nextest run -p mimageviewer --lib -E $relatedFilter` | 初回100・380/385成功、test修正後0・385/385成功。通常実行の生成一致テストも含む | `related.*.log` / `related-fixed.*.log` |
+| `.\scripts\test-focused.ps1 -Path src/app/list_order_tests.rs` | 0・15/15成功 | `target/test-focused/runs/20261026T144917237Z-e99b8ea8/` |
+| `cargo test -p mimageviewer --test ui_snapshot` | 0・203/203成功、snapshot更新なし | `ui-snapshot.*.log` |
+| `cargo fmt --check` | 0 | tool出力 |
+| `python scripts/check_ui_glyphs.py` | 0、危険グリフ0件 | tool出力 |
+| `python scripts/check_site_cards.py` | 0、49 cards / 違反0件 | tool出力 |
+| `git diff --check` | 0 | tool出力 |
+| `cargo build --profile dev-runtime -p turbojpeg-sys` (`CARGO_BUILD_JOBS=1`) | 0、確認用profileのネイティブ依存を事前build | `dev-native-prerequisite.*.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | 0、normal feature set・core/remote/EPUB worker生成、runtime DLL配置、PE依存検査runtime=4 / pe=3成功。起動なし | tool出力 / `target/vcrt-pe-reports/dev-runtime.json` |
+
+build-devの待機を0にしたのは、先行MSBuildの終了後もidle node processが残っていたため。
+実行中アプリを止めず、build script・配布構成・設定profileは変更していない。
+
+### 確認用ビルドと手動確認
+
+2026-10-27に `target/dev-runtime/mimageviewer-core.exe` と同protocolのRemote service・EPUB workerを生成済み。
+エージェントから起動はしていない。今回の手動確認では、リポジトリルートから隔離data-dirを指定する:
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe -ArgumentList '--data-dir', '.\target\dev-runtime\data'
+```
+
+通常profileで起動するコマンドは次のとおり。こちらは実利用中の `%APPDATA%\mimageviewer` を使い、
+設定・キャッシュ・ログ等の実データを更新し得る。通常版とsingle-instanceの名前空間を共有するため、
+インストール版・tray常駐版を終了してから起動する:
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+手動で確認する操作 (未実施):
+
+1. 通常フォルダの本一覧をスマートフィルタで絞り、日付降順にして本を開く。
+   Ctrl+Shift+↓/↑でその表示順に移り、両端で一覧の端の通知が出て折り返さないこと。
+2. ページを直接表示する設定とページ一覧を経由する設定の両方で確認する。
+   空・消失・ZIP/PDFだけのフォルダは停止条件に従って飛ばし、Ctrl+↑↓は従来のツリー順を維持すること。
+3. 動画を含む本ではnative動画の同じキーでも移れること。準備中の連打で追加入力が積まれず、
+   ★固定中・F12別窓では短い通知だけでmainの一覧を動かさないこと。
+
+lib全件・workspace/vendor/docのfull gate、実GPU/実native presenter・実EPUB変換器を使う確認は未実施。
+ClaudeCode側の後続検証へ引き継ぐ。
+
+### 変更ファイル
+
+- 実装: `src/app.rs`、`src/app/list_order_navigation.rs` (新規)、`src/app/collection_grid.rs`、
+  `src/app/native_video.rs`、`src/app/viewer_context_registry.rs`、`src/keymap.rs`、
+  `src/ui_fullscreen.rs`、`src/ui_main.rs`、`src/ui_dialogs/context_shortcuts.rs`。
+- 既存EdgeのPage分類と一時intentの空初期化: `src/app/book_composition_permission.rs`、
+  `src/app/collection_navigation.rs`、`src/ui_conceal.rs`、`src/ui_crop.rs`、`src/ui_erase.rs`、
+  `src/ui_sns_split.rs`、`src/ui_fullscreen/tests/still_seek_menu.rs`。
+- 新規test module: `src/app/list_order_tests.rs`、`src/app/list_order_virtual_tests.rs`、
+  `src/app/list_order_worker_tests.rs`。上記既存実装fileにも回帰を追加した。
+- 文書/生成物: `docs/README.md`、`docs/architecture-overview.md`、`docs/async-architecture.md`、
+  `docs/detached-rework-plan.md`、`docs/fullscreen-navigation-consistency.md`、
+  `docs/key-customization-impl-plan.md`、`docs/keymap-spec.md`、`docs/keymap.ini.default`、本書、
+  `docs/next-release-backlog.md`、`docs/spec.md`、`htdocs/mimageviewer/index.html`、
+  `htdocs/mimageviewer/manual/fullscreen.html`、`htdocs/mimageviewer/manual/shortcuts.html`。
+  CHANGELOG・版番号・build/test scriptは変更しない。
+
+## 11. 独立コードレビュー P2 対応 (2026-10-27)
+
+対象は `32711c833` からの未コミット差分。レビュー全文の判定は ACCEPT WITH CHANGES、
+必須修正は以下の2件。commit・製品アプリ起動は行わない。
+
+- **ゲームパッドの取得漏れ**: `handle_gamepad_grid_accept` の通常フォルダは履歴・自動表示・
+  評価フィルタの既存処理を行って Direct を直接返し、変換書庫も直接 load していた。
+  その挙動を維持して各分岐の load 前に同じ capture helper を呼ぶ。ZIP/PDF は既存の
+  `grid_physical_navigation` 経由を維持する。初回実装の4か所に2か所を加え、計6呼出しとなる。
+  §3.3 の「ゲームパッドも共通入口を通る」というコードの前提に漏れがあったため補正した。
+- **worker 後の表示待ち**: 受理済み sequence の `FsNavigationPurpose::ListOrderNavigation` を
+  既存共通入口の gate 後に設定する。動画・音声の着地で legacy holdover へ移るとき、
+  `FsFolderNavigationOrigin::Ordinary | ListOrder` に由来を引き継ぐ。
+  Ctrl・兄弟 handler は継続受付より先に同じ owner の受付方針を調べ、共通入口・locked resolver
+  も同じ述語を使う。通常由来の Fullscreen / 兄弟の継続受付は維持する。
+  画像をラッチで解放しても origin は維持し、既存の終了・取消・解放でまとめて退役する。
+  既存 sequence の終端失敗 (RenditionFailed)・パスワード待ちは既存 phase の受付規則を維持する。
+  新しい並列 bool / Option、worker、同期 I/O、registry 遷移規則は追加しない。
+- 独立 reviewer は所有者拡張を構造的修正として受け入れ、終端失敗後に受付を再開する既存規則も
+  確認した。detached 境界の実際の範囲は `detached-rework-plan.md` §11 の同項に追記した。
+
+### 追加した回帰と修正前の失敗
+
+- ゲームパッド2件: 既存決定 handler を通して通常フォルダ / 変換書庫を開き、古い snapshot が
+  新しい表示順 (画像行除外) に置き換わり、Direct の既存挙動を変えないこと。
+  製品修正前は2件とも stale snapshot の検査で失敗 (exit 100、`gamepad-pre-fix.log`)。
+- 動画着地4件: 実 worker → 結果取得 → 採用 → hydration → media 用 owner への bind を通す。
+  worker 不在・lock 継続中の Ctrl / 兄弟 / 一覧順と共通入口を両方向で検査する。
+  製品修正前は Ctrl・兄弟・共通入口の3件が新しい DFS を始めて失敗し、通常 Fullscreen 由来の
+  継続受付1件は成功 (exit 100、`gate-pre-fix-corrected.log`)。
+- 所有者の状態遷移2件: 静止画の Display sequence でも由来を維持し、media の再 capture と
+  描画用画像の解放後も表示待ち中は拒否する。解放 / RequestFailed 終端で受付方針が退役すること。
+- 終端失敗1件: production resolver が RenditionFailed にして lock を解放した後、
+  旧画像と purpose を保持したまま Ctrl・兄弟・共通入口・一覧順の新しい要求を受理すること。
+  再 capture → SlideshowNext の既存呼出し順でも一覧順の拒否を復活させず、新しい worker を受理すること。
+- 最初の gate fixture は AppTestEnv の型 / 借用に誤りがあり compile exit 101。
+  次の試行は media bind 呼出しがなく、通常 DFS の向きも逆で、fixture の検査で exit 100。
+  これらは製品不具合の失敗証明とせず、補正後の上記3件の失敗を証明に使う。
+
+### 検証記録
+
+ログは `target/list-order-p2-verification/`。`MSBUILDDISABLENODEREUSE=1` を使用。
+最終コマンドの結果と確認用 build は以下のとおり。
+
+関連 nextest の式 (`$relatedFilter`):
+
+```powershell
+$relatedFilter = 'test(/list_order/) or test(/gamepad_grid/) or test(/folder_nav/) or test(/fullscreen_ctrl_nav/) or test(/fullscreen_sibling_nav/) or test(/holdover/) or test(/nav_lock/) or test(/navigation_sequence/) or test(/similar_navigation_tests/) or test(/vram_accounting/) or test(/context_async_owner_registry_audits_bundle_pending_fields/)'
+cargo nextest run -p mimageviewer --lib -E $relatedFilter
+```
+
+| コマンド / 条件 | exit code | 結果 / ログ |
+| --- | --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/list_order_gamepad_/)'` (修正前) | 100 | 2件とも stale snapshot の検査で失敗。`gamepad-pre-fix.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/list_order_video_display_wait/)'` (fixture補正後・製品修正前) | 100 | 3件が意図した検査で失敗、通常Fullscreen継続1件成功。`gate-pre-fix-corrected.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 / 0 | 初回39.29秒、最終ソース31.35秒。`check.log` / `check-final.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core --features test-script` | 0 | 1分6秒。`check-test-script.log` |
+| 上記関連 nextest (追加9件・取得/位置・既存Ctrl/兄弟・native・holdover・別窓・類似・VRAM・owner監査) | 0 / 0 | 補正前321/321、再capture補正後も321/321 (26.296秒)。`related.log` / `related-final.log` |
+| `cargo test -p mimageviewer --test ui_snapshot` | 0 | 203/203 (33.44秒)。snapshot更新なし。`ui-snapshot.log` |
+| `cargo fmt --check` | 0 | 最終ソースで成功。`fmt-check-final.log` |
+| `python scripts/check_ui_glyphs.py` | 0 | 危険文字0件。`glyphs-final.log` |
+| `git diff --check` | 0 | 差分の空白検査成功。CRLF変換の案内のみ |
+| `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | 0 | 通常featureのcore (3分32秒)・remote・EPUB workerを生成。VCRT/PE監査 runtime=4 / pe=3 成功。`build-dev.log` |
+
+初回の gate fixture compile 失敗は `gate-pre-fix.log` (exit 101)、次のfixture失敗は
+`gate-pre-fix-valid.log` (exit 100) に残す。修正前の製品不具合の証明は表の corrected の結果を使う。
+独立コードレビューと再captureの追補レビューは、ともに ACCEPT、追加の必須指摘なし。
+
+### 今回の変更ファイル (12)
+
+- 実装: `src/app.rs`、`src/ui_fullscreen.rs`、`src/app/gamepad_input.rs`。
+- 既存 holdover の型に合わせる投影 / producer: `src/app/vram_accounting.rs`、
+  `src/app/collection_navigation.rs`。通常由来の挙動は維持する。
+- 新規回帰: `src/app/gamepad_input.rs` 内に2件、`src/app/list_order_worker_tests.rs` に7件。
+  既存fixture / patternの型追従: `src/app/tests.rs`、`src/app/similar_navigation_tests.rs`、
+  `src/app/tests/startup_notices.rs`、および上記既存実装file内のテスト。
+- 文書: 本書、`docs/detached-rework-plan.md`、`docs/fullscreen-navigation-consistency.md`。
+  CHANGELOG・版番号・build/test script・keymap定義・生成default・UI snapshotは変更しない。
+
+### 後続の実アプリ確認 (未実施)
+
+確認用バイナリは `target/dev-runtime/mimageviewer-core.exe`。ビルドのみで起動していない。
+同じ作業ツリーのルートから、隔離確認には次を使う。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe -ArgumentList '--data-dir', '.\target\dev-runtime\data'
+```
+
+通常起動は `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+引数なしでは実利用中の `%APPDATA%\mimageviewer` を使い、設定・データ等を更新し得る。
+通常起動はsingle-instance mutexも共有するため、先にインストール版 / tray常駐版を終了する。
+`dev-runtime` は最適化profileであり、portable featureは使っていない。
+
+- 隔離 data-dir の通常フォルダ一覧をスマートフィルタ＋日付降順にし、ゲームパッドの決定で
+  通常フォルダ / 変換書庫を開く。親一覧の順を変えて開き直した場合も、Ctrl+Shift+↑↓ が
+  最後に開いた一覧の順を使うこと。
+- 一覧順移動で動画の本に着地する準備・表示待ち中に、Ctrl+↑↓ / 兄弟移動 / 一覧順移動へ
+  乗り換わらず、表示後は次の操作を受け付けること。通常 Ctrl+↑↓ 由来の移動は従来どおり。
+- 実 native presenter・ゲームパッド機器・変換器・GPUでの確認とlib全件は未実施。
+  ClaudeCode側の後続検証へ引き継ぐ。自動試験の動画は表示を行わないfixtureであり、
+  変換書庫の回帰も実変換器の起動を要しない。
+
+### 実アプリ確認 (2026-10-27、ClaudeCode、隔離 data-dir)
+
+`target/dev-runtime` の試験版を `--data-dir` で起動し、日付を変えた 6 冊の一覧 (F_book.zip・E_zipsonly (中は ZIP だけ)・D_book・C_empty (空)・
+B_book.zip・A_book) を「日付↓」で並べ、F から Ctrl+Shift+↓ / ↑ を押した。
+- ↓: F → D (E を飛ばす) → B (C を飛ばす) → A → 「一覧の末尾です」で停止。
+- ↑: A → B → D、D から ↑ で F (E を飛ばす) → 「一覧の先頭です」で停止。
+- 既存の Ctrl+↓ は木の順のまま (D → E_zipsonly\inner.zip)。そこから Ctrl+Shift+↓ で D (中の書庫に着いていても一覧の位置は E の行)。
+- 未確認: ゲームパッドでの決定・動画への着地中の押下・detached / F12 linked での通知・EPUB / 変換書庫・評価一覧経由 (自動テストのみ)。
+
+## 12. 5ch >>649 評価フィルタと一覧順移動の調査 (2026-10-29)
+
+「共通受付への修正設計」より前は `8775cbfa1` に含まれる**修正前の調査記録**。
+修正後の設計決定・実装・検証は本節の末尾に追記する。
+
+対象: `ratingnav-649`、基点 `f9156a375`。Codexによるソース調査と非対話テスト。
+製品コードの修正・製品バイナリの起動・commitは行わない。
+報告者の観測は「移動前に★一時解除中になる」までであり、絞り込み対象外の本への
+実移動を観測したかは不明。以下の開発側の結果と区別する。
+
+### 検証経路
+
+使い捨ての `AppTestEnv` と一時フォルダに、実PNGが2ページ入ったA/B/CのZIP、
+または画像だけのA/B/Cフォルダを作る。本の評価は5/1/5、ページは未評価。
+`rating_db`へfixtureの評価を保存し、`load_folder`と既存のidentity準備helperで
+通常の親一覧を作る。★5に絞った一覧の取得順を期待値として手で代入しない。
+
+- Enter: 合成Enterイベント → `handle_keyboard`。
+- ダブルクリック: 合成pointerの2回の押下/解放 → `handle_cell_interaction`。
+- ゲームパッド: 既存の決定handler `handle_gamepad_grid_accept`。
+- いずれも通常の `grid_physical_navigation` → 一覧記録 → 起点に対応する
+  `MainFrameNavigation` のlane → `post_render_main_navigation` → 実際のopen/adoption。
+- 本の移動は `handle_fullscreen_list_order_nav_context_with_operation` → 実worker →
+  `poll_folder_nav` → `apply_folder_nav_result` → 分類・ZIP列挙・hydration・再open。
+  workerが返した論理パスと採用後の `effective_folder()` の両方を検査する。
+- 親への復帰はfullscreenを閉じ、既存の `handle_grid_parent_folder_action` →
+  通常dispatcher → 親一覧の採用。保存設定は一時profileへsave/loadして検査する。
+
+名前順は `[A,C]` でA→C→A。更新日時はA<B<Cとし、日付降順は `[C,A]` でC→A→C。
+各経路は自動ページ表示ON/OFFの両方を試す。OFFはページ一覧からEnterでページを開く。
+通常フォルダのEnterではONでもページ一覧に止まる別不具合を検出したため、
+移動対象の検査はそのページ一覧からEnterでページを開いて続行し、自動表示の失敗は専用回帰へ分離した。
+採用後の未評価ページの可視集合とfullscreenのopenまでが検査範囲であり、
+実ウィンドウ・実ゲームパッド・GPU描画・表示完了ACKは検査しない。
+次の本移動前には既存workerテストと同じ `release_fs_nav_lock` のheadless seamを使う。
+開いた後のフィルタ変更への追従、★固定、別窓、PDF/変換書庫/ZIP内部階層は今回の範囲外。
+
+### ソース上の確認
+
+- 一時解除helperは `settings.rating_filter` を変更せず、anchorだけを設定する。
+  `effective_rating_filter()` は解除中だけ全ONを返す。helper自体は可視一覧を作り直さない。
+- フォルダのdouble-click/gamepadは解除設定→一覧記録、EnterとZIPは一覧記録→採用の順。
+  この順の相違だけでは、記録される列が広がる根拠にはならない。
+- `capture_main_folder_list_order` は既存の `current_grid_order()` をコピーし、
+  workerの `navigate_list_order` はその列以外を候補にしない。
+- v4.9.0とHEADで、`list_order_navigation.rs`・`collection_grid.rs`の全体、
+  `effective_rating_filter`から復元helper群まで、一覧順のoperation付きhandler、
+  `handle_gamepad_grid_accept`の本体、Enterのcontainer受付部分が一致することを
+  `git show` のテキスト比較で確認した。
+  後続機能も入った現在の作業ツリーでのテストであり、v4.9.0の別buildでの実行ではない。
+
+### 実行結果と引き継ぎ
+
+追加test: `src/app/list_order_ratingnav649_tests.rs` の `ratingnav649_` 14件。
+移動の12件は `ratingnav649_{zip,folder}_{enter,double_click,gamepad}_{name,date_desc}` の全組合せ。
+これとは別にEnterの自動表示を検査する2件を追加した (下記の失敗名)。
+pointer用helperは `ui_main.rs` の `#[cfg(test)]` のみで、製品buildには入らない。
+ログは `target/ratingnav649/`。ビルド・テストには `MSBUILDDISABLENODEREUSE=1` を指定する。
+初回のcold buildは既存のネイティブ依存ビルド方針に従って `CARGO_BUILD_JOBS=1`。
+
+**結果: 評価の一時解除によって一覧順移動の対象が広がる現象は、今回の範囲では再現しなかった。**
+移動の12件は成功し、各件でON/OFFの計24シナリオ・48回の本移動を検査した。
+Enterの通常フォルダは上記の追加ページEnterが必要だった。
+
+| 本の種類・開く入口 | 名前順の記録と移動 | 日付降順の記録と移動 | 自動ページ表示ON時の初回open |
+| --- | --- | --- | --- |
+| ZIP / Enter | `[A.zip,C.zip]`、A→C→A | `[C.zip,A.zip]`、C→A→C | ページ表示 |
+| ZIP / ダブルクリック | 同上 | 同上 | ページ表示 |
+| ZIP / ゲームパッド | 同上 | 同上 | ページ表示 |
+| 画像フォルダ / Enter | `[A,C]`、A→C→A | `[C,A]`、C→A→C | **ページ一覧で停止**。ページEnter後に移動を検査 |
+| 画像フォルダ / ダブルクリック | 同上 | 同上 | ページ表示 |
+| 画像フォルダ / ゲームパッド | 同上 | 同上 | ページ表示 |
+
+名前順での状態推移 (日付降順はAとCを交換):
+
+| 段階 | 記録列 | 解除anchor | 実効評価条件 |
+| --- | --- | --- | --- |
+| 親一覧の★5絞り込み後 | なし | なし | ★5のみ |
+| ZIP全入口 / フォルダEnterのopen受付直後 | `[A,C]` | なし | ★5のみ |
+| フォルダdouble-click/gamepadのopen受付直後 | `[A,C]` | A | 全ON。ただし可視一覧はA・Cのまま |
+| Aの採用後 | `[A,C]` | A | 全ON。未評価2ページを採用・open可能 |
+| ↓のworker決定・C採用後 | `[A,C]` | C | 全ON。決定先も採用先もC |
+| ↑のworker決定・A採用後 | `[A,C]` | A | 全ON。決定先も採用先もA |
+| 親への復帰後 | `[A,C]` (同じArcを保持) | なし | ★5のみ。親一覧はA・Cのみ |
+
+保存した `settings.rating_filter` は全段階で★5のみ、DB評価はA=5/B=1/C=5、
+ページ評価は0のまま。Bは記録列にもworkerの決定先にも採用先にも入らなかった。
+
+### 別途確認した不具合: 通常フォルダをEnterで開いたときの自動表示予約漏れ
+
+専用の `ratingnav649_folder_enter_auto_open_with_rating_filter` と
+`ratingnav649_folder_enter_auto_open_without_rating_filter` は、期待どおり**失敗状態で残す**。
+両方とも `should_auto_fullscreen_grid_container(0)=true` なのに、受付後の
+`pending_auto_fs_open=false`、画像フォルダ採用後の `fullscreen_idx=None`。
+評価OFFでも同じため、これを>>649の評価フィルタによる移動対象拡大の原因とは断定しない。
+
+具体的な経路と原因 (行番号は今回の作業ツリー):
+
+- `src/app.rs:58155`: Enterは `auto_fs` を求めて `grid_physical_navigation` を返すが、
+  通常フォルダ用の自動表示予約を設定しない。
+- `src/app/collection_grid.rs:1373` / `:1420`: 共通受付は列を記録するが、FolderのDirect要求では
+  `auto_fullscreen` を実際の表示予約へ反映せず、`StartupListIntent` だけへ渡す。
+- `src/app.rs:31505`: folderの準備は既存の `pending_auto_fs_open` がtrueの場合に限り
+  `auto_open_image_folder` を作り、`:31798` で `AutoFullscreenFolder` をhydrationへ渡す。
+  Enterではこの条件を通らない。
+- `src/ui_main.rs:17025` / `src/app/gamepad_input.rs:9598`: double-click/gamepadは、
+  共通受付より前に既存の予約を設定するのでページ表示へ進める。
+
+修正方針は、通常フォルダのopen受付の共通境界で既存の自動表示意図を一度だけ反映し、
+各入力入口の重複処理を揃えること。新たなbool/pending、待ち・guard、評価解除の廃止は不要。
+一覧記録・ページ用の一時解除・保存評価・帰路を保持し、今回の2件と移動12件で検証する。
+共通受付と3入口の整合を取る局所的な規模と見込む。製品修正は今回の依頼範囲外のため未実施。
+
+### コマンドと結果
+
+各コマンドの前にPowerShellで `$env:MSBUILDDISABLENODEREUSE='1'` を設定した。
+`--lib`、通常feature、test profile、非対話実行のみ。
+
+| コマンド (`cargo nextest run -p mimageviewer --lib -E` に続くfilter) | 結果 / exit code | ログ |
+| --- | --- | --- |
+| `'test(/list_order_capture_intersects_ctrl_f_facet_name_and_rating_filters/)'` | 1/1成功 / 0。初回cold compile 26分43秒 | `baseline.log` |
+| `'test(/ratingnav649_zip_/)' --no-fail-fast --success-output immediate --failure-output immediate` | 最終6/6成功 / 0、1.184秒 | `zip-final.log` |
+| `'test(/ratingnav649_folder_/)' --no-fail-fast --success-output immediate --failure-output immediate` | 最終6成功・自動表示2失敗 / 100、1.220秒 | `folder-final.log` |
+| `'test(/app::list_order_tests::/) and not test(/ratingnav649/) and not test(/list_order_capture_intersects_ctrl_f_facet_name_and_rating_filters/)' --no-fail-fast` | 既存残り14/14成功 / 0、1.234秒。baselineの1件と合わせて既存15件成功 | `existing.log` |
+| `cargo fmt --check` / `git diff --check` | ともに成功 / 0 | `fmt-final.log` / tool出力 |
+
+初回ZIPは6成功 (`zip.log`)。初回folderは移動テスト内の自動表示assertでEnter2件が失敗、
+double-click/gamepad4件は成功 (`folder.log`)。失敗を緩和せず専用2件へ分離し、
+移動テストは実際に見えるページ一覧から既存Enterを通して残りの検査を完了した。
+製品修正の成功証明としては扱わない。lib全件/full gate・実UIは未実施。
+製品コードを変更していない調査・testのみのため、ユーザー確認用の製品buildは行っていない。
+各段階の `649` 行と最終summaryを抜き出した記録は `state-traces.log` にも保存した。
+
+>>649の残る不明点は、表示への違和感か、実際に対象外の本へ移動したか。
+追加確認を求めるなら、その区別と、実移動がある場合だけ「元→先の本の種類・評価」を1例に絞る。
+現時点で一覧順移動や評価一時解除を変更する根拠はなく、別の自動表示不具合とは切り分けて扱う。
+
+### 共通受付への修正設計・着手前の入口比較 (2026-10-29)
+
+基点は調査記録をcommitした `8775cbfa1`。ClaudeCode設計担当から、Enterだけに予約を
+追加せず、3入口の一覧から本を開く受付を単一helperへ集約する指示を受けた。
+以下は製品コード編集前の照合結果。
+
+| 項目 | Enter | ダブルクリック | ゲームパッド | 共通化の扱い |
+| --- | --- | --- | --- | --- |
+| 履歴のmissing確認・一覧復元cursor保存 | guard→cursor保存 | activation許可→cursor保存 | guard→cursor保存 | 入口の前処理として維持 |
+| ファイル名stackの直接閲覧 | `stack_try_open_from_grid(..., false)` | 同 `true` | 同 `false` | pointer由来の差を入口に残す |
+| 独立book openへの配送 | stack後・kind分岐前 | 同左 | 同左 | 既存の専用ownerへの配送と順序を維持。変換書庫等も利用するため共通helperの外 |
+| global searchのFolder drill-in | 専用分岐なし | `active && drill.is_some()`なら履歴記録→drill、通常openを通さない | 専用分岐なし | 意図的なdouble-clickの例外として入口に残す |
+| 自動表示の判定 | `should_auto_fullscreen_grid_container` | 同左 | 同左 | helperへ集約 |
+| auto時の旧active context park | あり、失敗ならopen中止 | 同左 | **呼出しなし** | 未確定の差①、設計判断待ち |
+| Smart folderへの配送 | park後、通常処理より先 | 同左 | 自動表示判定後、通常処理より先 | helper内で通常Folderの副作用より先に既存ownerへ渡す |
+| 通常Folderの読書履歴への帰路記録 | **受付時なし** | 受付時に記録 | `!is_virtual_folder(path)`なら記録 | Enterは予約と同じcommitで削除された。Folderの受付へ戻す案 |
+| 通常Folderの評価一時解除 | **受付時なし**。採用時のscope再評価で発動 | 受付時に発動 | `!is_virtual_folder(path)`なら受付時に発動 | Enterの欠落を揃える案。解除で一覧を再構築せず、設定を書き換えない |
+| 通常Folderの自動表示予約 | **なし** | auto時に既存 `pending_auto_fs_open` を設定 | `!is_virtual_folder(path)`かつauto時に設定 | 今回確認したEnterの回帰を修正 |
+| 通常Folderと書庫の判別 | 入力armは型。上記3副作用自体なし | `GridItem::Folder`という型 | **パス拡張子の `is_virtual_folder`** | 未確定の差②。`A.zip`等の名前の実Folderで異なる |
+| ZIP/PDFの履歴・評価解除・auto意図 | `GridVirtualOpenEffects`として採用時に反映 | 同左 | 同左 | 意図的な採用境界。Folderの受付時副作用を適用しない |
+| 一覧順の記録・物理open要求 | `grid_physical_navigation` | 同左 (Folderは副作用設定後) | 同左 (通常Folderは副作用設定後) | helperの末尾で既存入口へ渡す。列の固定規則は維持 |
+
+構造案は、既存の状態・workerを増やさず、受付の副作用を一つのhelperに集約すること。
+2026-10-29の独立設計レビュー (GPT-6.1 Sol / xhigh) は、これは症状パッチではなく
+受付の所有境界を揃える構造的修正と判断した。ただし次の2差は変更してよいとの根拠が不足し、
+依頼者の「判断できない差・出荷済み挙動を変える差は実装を止めて報告」に従い、
+製品コード未編集で設計担当へ返した。
+
+1. gamepadのparkなしは初期追加 `07eb006ce` (2026-06-07) から存在。
+   Enter/double-clickへparkを加えた `5ba4d5373` (2026-07-01) もgamepadを変更していない。
+   現在のgamepad配送はmain前面ならrootの一覧へ配送されるため、active contextが有っても
+   park不要という説明は成立しない。一方、下位のZIPには別のpreserve/promote処理があり、
+   今回追加してよいと断定する直接の仕様・回帰証拠は見つからなかった。
+2. gamepadの拡張子判定は `77f9a346d` で通常FolderとZIP/PDFの副作用を分けた際に入った。
+   型へ揃えると `A.zip` / `A.pdf` という実directoryで履歴・解除・予約を変更する。
+   新しい入力制限ではないが、今回どこまで揃えるか設計判断が必要。
+
+### Enter予約欠落の導入履歴
+
+- 原因commit: `77f9a346df1e64391c3fef323409056e615390f5`
+  (2026-09-27、`Folder history for Rating and Collection children; keep Rating view order`)。
+  ZIP/PDFの履歴・評価・表示意図を採用時のeffectsへ移す変更で、同じmatch armにあった
+  Folderの `note_reading_history_open` / `pending_auto_fs_open` / 評価解除まで削除された。
+  `grid_physical_navigation(idx, p, auto_fs)`のFolder用Direct要求は表示予約へ反映しないため、
+  Enterだけ自動表示しなくなった。
+- `v4.1.0`のEnterの該当armには3処理とも存在し、最初に原因commitを含むtagは `v4.2.0`。
+  `v4.2.0` / `v4.3.0` / `v4.4.0` / `v4.5.0` / `v4.6.0` / `v4.7.0` /
+  `v4.8.0` / `v4.9.0`のソースで欠落を確認した。各旧版の実行検査はしていない。
+
+### §1.480の設計担当決定と実装 (2026-10-29)
+
+設計担当ClaudeCodeは、Enterとdouble-clickだけを共通化し、gamepadのparkと拡張子付き
+実Folderの差は出荷済み挙動として維持・§1.481へ分離すると決定した。
+独立設計レビュー (GPT-6.1 Sol / xhigh) は、保留2点を変更範囲から外したこの設計を
+実装可能とし、既存の受付副作用を単一境界へ集約する構造的修正であって症状パッチではないと確認した。
+
+`app/collection_grid.rs::accept_grid_container_open(ctx,index)` に既存double-clickの順で
+自動表示判定→auto時の既存park→Smartの専用ownerへ配送→通常Folderの履歴記録・評価解除・
+既存の自動表示予約→`grid_physical_navigation`をまとめた。
+Enterとdouble-clickはこのhelperへ渡す。待機・新しい製品状態・worker・回復機構は追加しない。
+
+| 項目 | Enter修正後 | double-click修正後 | gamepad修正後 |
+| --- | --- | --- | --- |
+| Folder/ZIP/PDFの受付 | 共通helperへ1回 | 共通helperへ1回 | 既存コードのまま。helperを通らない |
+| auto判定・park・Smart | helperの既存順 | helperの既存順 | 既存の差を維持 |
+| 通常Folderの履歴・評価解除・予約 | 削除されていた3処理を復元 | 既存と同じ副作用・順 | 既存の拡張子判定を維持 |
+| global search Folder drill-in | 既存どおり | 呼出側で既存例外を維持 | 既存どおり |
+| 独立book open・stack・入力guard | helperより先の既存入口 | 同左。pointer由来のstack引数も維持 | 製品無差分 |
+| ZIP/PDF effects | 従来の採用時に反映 | 従来の採用時に反映 | 従来どおり |
+| 一覧記録 | 既存 `grid_physical_navigation` | 同左 | 同左 |
+
+#### v4.1.0のEnterとの比較
+
+- 履歴記録 `note_reading_history_open`、評価解除 `maybe_suppress_rating_filter_for_opened_container`、
+  auto時の既存予約は、いずれもv4.1.0のEnterが持っていた処理であり、新機能ではない。
+- v4.1.0は履歴→予約→評価解除、今回は現行double-clickに合わせ履歴→評価解除→予約。
+  解除helperは設定・一覧を変更せず、予約はbool代入であり、どちらもload/一覧記録より前に
+  同じ値が成立する。途中の非同期採用や待機はなく、handler-levelで受付後の値を検査する。
+- v4.1.0の同じarmにあったfacet解除と `record_rating_view_nav_open` は、現在の
+  FacetRouteとtypedな `GridVirtual` / `RatingSource` の採用責務へ移っているため復活しない。
+  ZIP/PDFを受付時解除へ戻すこともない。
+- 現行のSmart `StartupListIntent`、独立book open、一覧順snapshot等はv4.1.0後の仕組みだが、
+  修正前のEnterにも既に接続されていた。今回それらの機能・配送・採用境界は変更しない。
+
+#### 修正後の検証
+
+検証担当はCodex root。ログは `target/ratingnav649-fix/`。
+ビルド・テストには `MSBUILDDISABLENODEREUSE=1`。製品起動とcommitは行わない。
+既存の14件は期待を緩めず、auto ONの全入口は直接ページ表示、OFFはページ一覧と厳密に検査する。
+Enter/pointerの同helperへの1回の到達 (test専用thread-local counter)、Folderの既存帰路clear、
+ZIPの採用前不変を加え、履歴からのFolder open/帰路とgamepadの拡張子付き実Folder維持も追加した。
+Smartに消費されたdouble-clickの早期returnも維持する。独立レビューでこの制御フロー差を
+P2として指摘されて修正し、Folder/ZIPの両方で同passのprimary/secondary releaseを使う回帰を追加した。
+同じ入力が通常受付では実際にmenuを開くpositive controlを先に検査し、その後Smart受付では
+要求だけが受理され、menu・通常Folder副作用・列の再取得へ進まないことを確認する。
+フォローアップ独立レビューはACCEPT、新しいP1/P2なし。
+
+| コマンド・条件 | 結果 | ログ |
+| --- | --- | --- |
+| `cargo fmt` (引数なし) | 成功 / 0 | tool出力 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/ratingnav649/)' --no-fail-fast --success-output immediate --failure-output immediate` | 最終17/17成功 / 0、2.011秒 | `focused-ratingnav-final.log` |
+| `.\scripts\test-focused.ps1` | 共有pathの `app.rs` と文書を検出、テストを走らせずexit 2 | `test-focused-final.log` |
+| `.\scripts\test-lib-full.ps1` | 14,888/14,888成功・既存ignored 65件 / 0、524.883秒 | `test-lib-full.log` / 下記台帳 |
+| `cargo fmt --check` / `git diff --check` | ともに成功 / 0 | `fmt-check.log` / tool出力 |
+| `cargo build --profile dev-runtime -p turbojpeg-sys` (`CARGO_BUILD_JOBS=1`) | coldなネイティブ依存準備、成功 / 0、2分35秒 | `dev-native-prerequisite.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | 通常featureのcore/remote/EPUB workerとDLLを作成、成功 / 0。VCRT/PE監査 runtime=4 / pe=3 成功、起動なし | `build-dev.log` |
+
+最初の焦点検証16件も16/16成功 (2.302秒、`focused-ratingnav.log`)。
+その後、上記P2の修正と回帰追加により最終17件を再検証した。
+
+lib全件のrunは `target/test-lib-full/runs/20261029T121511774Z-61d3f033/`、
+成功receiptは `target/test-lib-full/a3f9eed91078c47dfdb284e37972f930785da6dd1593e88a08eb387f5463eab7.json`。
+一覧順移動・評価フィルタ・自動表示・double-click・gamepad・Smart/Collection/Rating・
+既存のdetached/headless入力回帰を含むlib全件を通し、レビュー側はこの結果を再利用する。
+workspace/vendor/doctestのfull gateと、実UI/実ゲームパッドの操作は今回行っていない。
+確認用buildは既存の方針に従い準備し、エージェントからは起動しない。
+
+同じ全件runのJUnitから関連名を抽出した `target/ratingnav649-fix/related-counts.json` では、
+一覧順67件、評価filter/membership/suppression 118件、auto表示34件、double-click/reclick 77件、
+gamepad 143件が成功、失敗/skipは各0。分類には重複があり、別の再実行ではない。
+
+変更ファイルは製品の `src/app.rs` / `src/app/collection_grid.rs` / `src/ui_main.rs`、
+回帰の `src/app/list_order_ratingnav649_tests.rs`、本書と `docs/next-release-backlog.md` /
+`docs/detached-rework-plan.md`。gamepad製品コード・keymap・設定形式・依存・build/test scriptは無差分。
+
+確認用バイナリは `target/dev-runtime/mimageviewer-core.exe`。通常featureで、portableではない。
+ユーザーが確認する場合のコマンド (エージェント未実行):
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+引数なしでは実利用中の `%APPDATA%\mimageviewer` を使い、設定・データを更新し得る。
+single-instance mutexを共有するため、先にインストール版・tray常駐版を終了する。
+確認対象は、画像だけの通常FolderをEnter/double-clickで開く際のauto ONで直接ページ表示、
+OFFでページ一覧、★5絞り込みからの一覧順A/C移動と親での条件復元。
+今回の作業は非対話検証のみで、起動・実入力・commitを行っていない。

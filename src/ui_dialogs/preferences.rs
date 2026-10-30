@@ -2164,6 +2164,7 @@ fn preferences_change_book_append_write_settings(live: &Settings, edited: &Setti
             live.default_reading_direction,
             live.follow_document_reading_direction,
             live.final_cover_spread_enabled,
+            live.auto_view_trim_default_enabled,
             live.singleton_spread_first_enabled,
             live.singleton_spread_last_enabled,
             live.page_after_cover_alone_enabled,
@@ -2175,6 +2176,7 @@ fn preferences_change_book_append_write_settings(live: &Settings, edited: &Setti
             edited.default_reading_direction,
             edited.follow_document_reading_direction,
             edited.final_cover_spread_enabled,
+            edited.auto_view_trim_default_enabled,
             edited.singleton_spread_first_enabled,
             edited.singleton_spread_last_enabled,
             edited.page_after_cover_alone_enabled,
@@ -2751,6 +2753,7 @@ impl App {
             let old_fullscreen_side_panel_mode =
                 self.settings.fullscreen_side_panel_mode.normalized();
             let old_final_cover_spread_enabled = self.settings.final_cover_spread_enabled;
+            let old_auto_view_trim_default_enabled = self.settings.auto_view_trim_default_enabled;
             let old_singleton_spread_placement_enabled = (
                 self.settings.singleton_spread_first_enabled,
                 self.settings.singleton_spread_last_enabled,
@@ -2826,6 +2829,18 @@ impl App {
             }
             prepare_preferences_state_settings_for_commit(&mut state, &mut self.settings);
             self.install_preferences_settings(state.settings);
+            if old_auto_view_trim_default_enabled != self.settings.auto_view_trim_default_enabled {
+                #[cfg(windows)]
+                self.invalidate_auto_view_trim_display_in_parked_contexts();
+                if self.view_trim_book_preference
+                    == crate::view_trim::ViewTrimBookPreference::FollowGlobal
+                {
+                    if let Some(idx) = self.fullscreen_idx {
+                        self.reanchor_continuous_reading_after_view_trim_change(idx);
+                    }
+                    ctx.request_repaint();
+                }
+            }
             if old_final_cover_spread_enabled != self.settings.final_cover_spread_enabled {
                 #[cfg(windows)]
                 self.invalidate_final_cover_spread_display_in_parked_contexts();
@@ -2907,7 +2922,9 @@ impl App {
                 }
                 self.creative_lut_library
                     .reload(&self.settings.creative_luts);
-                self.clear_all_final_pipeline_caches();
+                self.clear_all_final_pipeline_caches(
+                    crate::app::FinalPipelineInvalidation::CreativeLutSettingsChanged,
+                );
                 #[cfg(windows)]
                 self.sync_native_video_grade();
             }
@@ -3776,10 +3793,7 @@ impl App {
         let _ = std::fs::remove_file(crate::editing_addon::active_pointer_path());
         // 2. フォント / 被写体マットキャッシュ無効化。
         //    active pointer を外した後なので refresh は None になり、被写体マスク生成が即 disabled になる。
-        self.comic_fonts = None;
-        self.comic_fonts_loaded = false;
-        self.comic_loaded_font_keys.clear();
-        self.comic_font_registry_loaded = false; // pack フォントを一覧から外す
+        self.invalidate_comic_fonts(crate::app::comic_fonts::FontInvalidation::SourcesChanged);
         // フォントソースが変わったので見本 / オノマトペプレビュー + 焼き済み注釈
         // (comic_cache) も無効化する (Codex P2)。
         self.font_sample_cache.clear();
@@ -4529,6 +4543,96 @@ mod tests {
                 .file_type_visibility
                 .is_all_visible()
         );
+    }
+
+    #[test]
+    fn auto_view_trim_default_is_a_preferences_book_append_write_setting() {
+        let live = Settings::default();
+        let mut edited = live.clone();
+        assert!(!preferences_change_book_append_write_settings(
+            &live, &edited
+        ));
+        edited.auto_view_trim_default_enabled = true;
+        assert!(preferences_change_book_append_write_settings(
+            &live, &edited
+        ));
+        assert!(preferences_change_book_append_write_settings(
+            &edited, &live
+        ));
+    }
+
+    #[test]
+    fn auto_view_trim_default_preferences_cancel_ok_save_and_reopen() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        assert!(!app.settings.auto_view_trim_default_enabled);
+        app.open_preferences_request(PreferencesOpenRequest::anchored(
+            PreferencesPage::SpreadMode,
+            "spread/auto-view-trim",
+        ));
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_ui_state(
+                |root_ui, app| app.show_preferences_dialog(&root_ui.ctx().clone()),
+                app,
+            );
+        for (cancel, expected) in [(true, false), (false, true), (false, false)] {
+            if !harness.state().show_preferences {
+                harness
+                    .state_mut()
+                    .open_preferences_request(PreferencesOpenRequest::anchored(
+                        PreferencesPage::SpreadMode,
+                        "spread/auto-view-trim",
+                    ));
+            }
+            harness.run_steps(5);
+            assert!(!harness.state().preferences_dialog_has_unsaved_changes());
+            harness
+                .get_by_label("自動余白カットを標準で有効にする")
+                .click();
+            harness.run();
+            assert!(harness.state().preferences_dialog_has_unsaved_changes());
+            // The live value changes only at OK, never while editing a draft.
+            let before = harness.state().settings.auto_view_trim_default_enabled;
+            harness
+                .get_by_label(if cancel { "キャンセル" } else { "  OK  " })
+                .click();
+            harness.run();
+            if cancel {
+                assert!(harness.state().show_preferences_discard_confirm);
+                assert_eq!(
+                    harness.state().settings.auto_view_trim_default_enabled,
+                    before
+                );
+                harness.get_by_label("破棄して閉じる").click();
+                harness.run();
+            }
+            assert!(!harness.state().show_preferences);
+            assert_eq!(
+                harness.state().settings.auto_view_trim_default_enabled,
+                expected
+            );
+            assert_eq!(Settings::load().auto_view_trim_default_enabled, expected);
+            harness
+                .state_mut()
+                .open_preferences_request(PreferencesOpenRequest::anchored(
+                    PreferencesPage::SpreadMode,
+                    "spread/auto-view-trim",
+                ));
+            harness.run_steps(5);
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .auto_view_trim_default_enabled,
+                expected
+            );
+            assert!(!harness.state().preferences_dialog_has_unsaved_changes());
+        }
     }
 
     #[test]
@@ -5435,6 +5539,62 @@ mod tests {
         app.pref_state = Some(Box::new(preferences_state_for_test(&app.settings)));
         app.apply_preferences_dialog(&ctx);
         assert_eq!(app.media_memory_clear_generation, generation + 1);
+    }
+
+    #[test]
+    fn thumb_name_preferences_combobox_ok_save_reload_and_cancel() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
+        assert!(!harness.state().preferences_dialog_has_unsaved_changes());
+        let scale = harness.state().settings.ui_scale_factor;
+        harness.get_by_label("名前の文字サイズ:").click();
+        harness.run_steps(3);
+        harness.get_by_label("175%").click();
+        harness.run_steps(3);
+        harness.get_by_label("名前の最大行数:").click();
+        harness.run_steps(3);
+        harness.get_by_label("4 行").click();
+        harness.run_steps(3);
+        assert!(harness.state().preferences_dialog_has_unsaved_changes());
+        assert_eq!(harness.state().settings.thumb_name_font_scale_percent, 100);
+        assert_eq!(harness.state().settings.thumb_name_max_lines, 1);
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+        assert_eq!(harness.state().settings.thumb_name_font_scale_percent, 175);
+        assert_eq!(harness.state().settings.thumb_name_max_lines, 4);
+        assert_eq!(harness.state().settings.ui_scale_factor, scale);
+
+        let db = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
+        let persisted = db.load_into_settings().unwrap();
+        assert_eq!(persisted.thumb_name_font_scale_percent, 175);
+        assert_eq!(persisted.thumb_name_max_lines, 4);
+        assert_eq!(persisted.ui_scale_factor, scale);
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Thumbnail);
+        harness.run_steps(3);
+        assert!(!harness.state().preferences_dialog_has_unsaved_changes());
+        harness.get_by_label("名前の文字サイズ:").click();
+        harness.run_steps(3);
+        harness.get_by_label("125%").click();
+        harness.run_steps(3);
+        harness.get_by_label("名前の最大行数:").click();
+        harness.run_steps(3);
+        harness.get_by_label("2 行").click();
+        harness.run_steps(3);
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        assert!(harness.state().show_preferences_discard_confirm);
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+        assert_eq!(harness.state().settings.thumb_name_font_scale_percent, 175);
+        assert_eq!(harness.state().settings.thumb_name_max_lines, 4);
+        let after_cancel = db.load_into_settings().unwrap();
+        assert_eq!(after_cancel.thumb_name_font_scale_percent, 175);
+        assert_eq!(after_cancel.thumb_name_max_lines, 4);
     }
 
     #[test]
@@ -6598,6 +6758,44 @@ mod tests {
             });
         harness.run();
         harness.snapshot("preferences_viewer_notice_visibility");
+    }
+
+    #[test]
+    fn auto_view_trim_default_setting_snapshot_light_off() {
+        auto_view_trim_default_setting_snapshot(
+            "preferences_auto_view_trim_default_light_off",
+            crate::os_theme::ResolvedTheme::Light,
+            false,
+        );
+    }
+
+    #[test]
+    fn auto_view_trim_default_setting_snapshot_dark_on() {
+        auto_view_trim_default_setting_snapshot(
+            "preferences_auto_view_trim_default_dark_on",
+            crate::os_theme::ResolvedTheme::Dark,
+            true,
+        );
+    }
+
+    fn auto_view_trim_default_setting_snapshot(
+        name: &str,
+        theme: crate::os_theme::ResolvedTheme,
+        mut enabled: bool,
+    ) {
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(400.0, 100.0))
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    crate::os_theme::apply_resolved(root_ui.ctx(), theme);
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        draw_auto_view_trim_default_setting(ui, &mut enabled);
+                    });
+                });
+            });
+        harness.run();
+        harness.snapshot(name);
     }
 
     #[test]
@@ -7785,6 +7983,100 @@ mod tests {
         harness.state_mut().show_preferences = true;
         harness.run();
         assert_preferences_position(&harness, position.page, position.scroll_y);
+    }
+
+    #[test]
+    fn clipboard_bake_stage_ui_ok_save_and_reload_preserves_selected_stage() {
+        use crate::bake_stage::BakeStage;
+        use egui_kittest::kittest::Queryable;
+
+        let mut app = crate::app::setup_app_for_test();
+        assert!(
+            crate::settings_db::boot_settings_db(app.tmp.path())
+                .db
+                .is_some()
+        );
+        app.open_preferences_page(PreferencesPage::BakeStage);
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_ui_state(
+                |root_ui, app| app.show_preferences_dialog(&root_ui.ctx().clone()),
+                app,
+            );
+        harness.run();
+        for stage in BakeStage::ALL {
+            harness
+                .get_by_label(&format!("クリップボードへコピー / {}", stage.label()))
+                .click();
+            harness.run();
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .bake_stage_clipboard,
+                stage
+            );
+            harness.get_by_label("  OK  ").click();
+            harness.run();
+            assert!(!harness.state().show_preferences);
+            assert_eq!(harness.state().settings.bake_stage_clipboard, stage);
+            let loaded = crate::settings_db::SettingsDb::open(harness.state().tmp.path())
+                .unwrap()
+                .load_into_settings()
+                .unwrap();
+            assert_eq!(loaded.bake_stage_clipboard, stage);
+            harness.state_mut().settings.bake_stage_clipboard = loaded.bake_stage_clipboard;
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::BakeStage);
+            harness.run();
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .bake_stage_clipboard,
+                stage
+            );
+        }
+    }
+
+    #[test]
+    fn clipboard_bake_stage_preferences_snapshot() {
+        use egui_kittest::kittest::Queryable;
+
+        let state = preferences_state_for_test(&crate::settings::Settings::default());
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(590.0, 365.0))
+            .build_ui_state(
+                |root_ui, state| {
+                    crate::os_theme::apply_resolved(
+                        root_ui.ctx(),
+                        crate::os_theme::ResolvedTheme::Dark,
+                    );
+                    egui::CentralPanel::default().show(root_ui, |ui| page_bake_stage(ui, state));
+                },
+                state,
+            );
+        harness.run();
+        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(590.0, 365.0));
+        for stage in crate::bake_stage::BakeStage::ALL {
+            assert!(
+                bounds.contains_rect(
+                    harness
+                        .get_by_label(&format!("クリップボードへコピー / {}", stage.label()))
+                        .rect()
+                )
+            );
+        }
+        harness.snapshot("clipboard_bake_stage_preferences");
     }
 
     #[test]

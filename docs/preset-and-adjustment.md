@@ -228,11 +228,13 @@ native presenter の画像補正パネル末尾に読込行と保存行を表示
 
 | 要素 | 仕様 |
 | --- | --- |
-| L/R セレクタ | 「左ページ」「右ページ」の 2 ボタン (selectable_label)。既定は **常に左ページ**。`open_fullscreen` (= ページ送り、ペア切替、初回フルスクリーン) と spread_mode 切替で `AdjustSpreadTarget::Left` にリセット。Single (単ページ / 表紙単独 / 横長単独) のときは表示しない |
+| L/R セレクタ | 「左ページ」「右ページ」の 2 ボタン (selectable_label)。`adjust_spread_target: Option<AdjustSpreadTarget>` の None は未選択で、**表示中の組から読む順の最初のページ (左→右なら左、右→左なら右)** を都度導く。末尾の表紙補助表示では配置指定にかかわらず Navigation の実ページを選ぶ。左右ボタンを押すと Some でその画面上の側を明示選択し、同じページに留まる間と連続読みの通常の seek・再アンカーでは保持する。ページ単位の送り・ずらしの受付・open_fullscreen・モード変更・読む向き同期では None に戻す。Single (単ページ / 表紙単独 / 横長単独) のときは表示しない |
 | L/R 基準 | **画面上の左右で固定** (LTR/RTL 不変)。消しゴム `EraseSpreadCtx` の慣習と統一 |
-| 編集対象解決 | パネル冒頭で `resolve_spread_pair(fs_root_idx)` を引き、Double のとき `adjust_spread_target` に応じて `target_idx = left or right`。以降のスライダー読み書き / 個別化 / Undo はすべて `target_idx` 経由 (= 単ページ経路と同一) |
+| 編集対象解決 | `resolve_visible_spread_edit_pages(fs_root_idx)` が、同じ役割付きページ列から画面上のペアと `AdjustSpreadTarget::reading_start` による開始側を返す。描画済みレイアウトは対象 idx を Navigation として含むときだけ採用し、それ以外は現在の構成を使う。補正パネル / 補正レイヤーパネル / スロット適用は明示選択があればその側、なければ開始側を使う。編集入口は同じ列の開始側を使う。以降のスライダー読み書き / 個別化 / Undo はすべて `target_idx` 経由 (= 単ページ経路と同一) |
 | コピーボタン | 「← コピー」(右→左) と「コピー →」(左→右) の対称配置。`App::copy_spread_adjust(src, dst)` を呼ぶ |
 | 同一判定 | `effective_params(left) == effective_params(right)` (実効値の `==`)。一致しているときは両コピーボタン disabled (= 「揃っている」状態が UI から自明) |
+
+実アプリでの確認 (§1.458、2026-10-28、観測者 ClaudeCode。隔離データ・dev-runtime ビルドを computer-use で操作): 右→左の見開きで補正パネルを開くと「右ページ」が選ばれ、「左ページ」を選んでから次の見開きへ送ると「右ページ」に戻った。左→右と末尾の表紙補助表示は実アプリでは未確認 (自動テストのみ)。
 
 #### コピー操作の中身
 
@@ -260,7 +262,7 @@ disabled だった頃は顕在化していなかった 2 点を併せて修正�
 設計初期は「両ページ」モードを検討したが、左右が異なる状態で「両ページ」を選んだ瞬間に
 片方の補正値がもう片方で上書きされる破壊的操作が避けられず、デフォルト選択
 (同一なら両ページ / 異なれば左) のロジックも暗黙的になりやすい。代わりに
-「常に左ページから始まる + 揃えたいときはコピーボタン」という明示的 UI に絞った。
+「読む順の最初のページから始まる + 揃えたいときはコピーボタン」という明示的 UI に絞った。
 両ページ同値の運用要望は **お気に入り標準 (favorite_params) で代替できる** ため、
 今回は意図的にスコープ外。
 
@@ -704,9 +706,12 @@ final composite の `params_hash` から `colorize` / `creative_lut` / `post_fil
   (色調補正と同じ扱い)。legacy `adjustment_cache` には焼き込まず、消しゴム / MI-GAN /
   補正レイヤーの入力は source 解像度の edit pipeline から取るので、シャープ結果が
   編集系の入力へ混入することはない。
-- **コピー / 書き出し**: `prepare_capture_pixel_job` が final composite pixels を取得して
+- **キャプチャ (Ctrl+S / カメラボタン)**: `prepare_capture_pixel_job` が final composite pixels を取得して
   `capture::run_pixel_job` へ渡すため、表示どおりに反映される。capture worker は
   AdjustParams / AI / final filter を再実行せず、出力専用の conceal / crop / rotation のみを扱う。
+- **Ctrl+E / 編集を反映した画像をコピー**: source と編集 snapshot を worker で再合成し、
+  選択した段が `DisplayAdjust` のときに共通 compositor がスマートシャープを適用する。
+  表示 cache は使わない。既存の「画像をクリップボードにコピー」は向きと回転のみのまま。
 - **alpha**: unmultiplied RGBA に展開して RGB のみ強調 → 再 premultiply。透明部に
   hidden RGB を作らない (`adjustment::apply_final_smart_sharpen`)。
 - **360 パノラマ settle**: settle 再レンダリングはシャープ化を再現しないため、
@@ -720,8 +725,8 @@ final composite の `params_hash` から `colorize` / `creative_lut` / `post_fil
 | --- | --- | --- |
 | `fs_cache` | `HashMap<idx, FsCacheEntry>` | 生デコード結果。Static / Animated / Failed |
 | `erase_result_cache` | `HashMap<EraseResultKey, EraseResultCacheEntry>` | 消しゴム MI-GAN 確定結果。`idx + input_generation + erase_mask_generation` で識別 |
-| `local_adjust_cache` | `HashMap<LocalAdjustResultKey, LocalAdjustCacheEntry>` | 補正レイヤー合成結果。`idx + input_generation + erase_mask_generation + local_adjust_generation` で識別 |
-| `conceal_cache` | `HashMap<idx, ConcealCacheEntry>` | 隠蔽加工合成済みテクスチャ |
+| `local_adjust_cache` | `HashMap<LocalAdjustResultKey, LocalAdjustCacheEntry>` | 補正レイヤー合成画素と任意のtexture。`idx + input_generation + erase_mask_generation + local_adjust_generation` で識別 |
+| `conceal_cache` | `HashMap<idx, ConcealCacheEntry>` | 隠蔽加工合成画素と任意のtexture。現在の隠蔽世代を照合する |
 | `edit_result_cache` | `HashMap<EditResultKey, EditResultEntry>` | `raw -> erase -> local_adjust -> conceal` の source 解像度 edit 結果。AdjustParams / AI / post_filter / crop は含めない |
 | `final_ai_cache` | `HashMap<FinalAiKey, FinalAiEntry>` | 色調補正後の edit 結果へ AI アップスケール / デノイズを適用した結果。`FinalAiEntry` は `pixels` と smart sharpen 判定用の `used_upscale` を持つ |
 | `retained_final_ai_cache` | `HashMap<RetainedFinalAiKey, RetainedFinalAiEntry>` | fullscreen session をまたいで保持する final AI entry。`metadata_cache_key(idx) + edit_size + color_ai_hash + bg` で識別し、PDF retained page cache と合算した枚数 / MiB の LRU で退去。PDF display job は session close / keep-set eviction 時に最大 1 件だけ retained store 目的で完走を許可できる |
@@ -762,6 +767,30 @@ local / conceal の DB load、decode、raster、compose は非同期境界であ
 active local の現在世代 pixels、または必要な conceal result がまだ無ければ `None` を返し、
 未完成の入力から `edit_result_cache` を作らない。`ensure_final_composite_texture` も edit result の
 `None` をそのまま伝播し、不完全な final assembly を開始しない。
+
+**次unitの編集準備とCPU-only段cache（§28段階B、2026-10-28〜29、実装済み・検証結果は別記）**
+
+ON／pagedの現unit提示後、Nextの局所補正・隠蔽・final・注釈を同じkeyの一つのworkerで準備する。
+入力が完成eraseならMI-GAN／黒背景合成を再適用せず、after-AIは結果の`used_upscale`で後段を解く。
+注釈はclamp前のfinal正本を下地にし、finalと注釈それぞれをTriangle clampする。
+全照合後に段・edit・final・対応comicを一括公開し、final正本と`comic_cache.base`は同じArcを持つ。
+font不足・空docのcold読取りも正常結果であり、`comic_docs`の欠けているkeyへだけ採用する。
+既存doc／finalをfont不足だけで上書き・削除せず、画像なし結果は予約を解放する。
+
+Bの公開では`local_adjust_cache`／`conceal_cache`へtextureなしのCPU-only entryを入れられる。
+実体化済みはexact画素と現在入力に対する層の寸法正規化で判定し、texture不足でproducerを再起動しない。
+`current_*_material`はtextureを持つ描画可能な素材だけを副作用なしで返す。
+局所補正／隠蔽の編集表示やfinal不在時に段textureが必要なら、明示的な表示ensureが既存画素だけを1 frame 1枚uploadする。
+このuploadは画素・keyを変えず、上段を失効させない。Ctrl+Eの段gateも画素を見てCPU-onlyで満たせる。
+CPU-only段entryを新規公開するのはBだけで、既存producerは従来どおりtexture付きで公開する。
+
+正規化したlocal層の採用は`adopt_materialized_local_layers`で層・presence・選択・prepared snapshotの整合だけを更新する。
+local世代を進めず、利用者producerを取り消さず、兄弟contextへpublicationしない。
+同じkeyの段の一括採用では既存の上段失効helperを呼ばず、利用者の実編集・source・params変更による失効は維持する。
+表示入口はBを非blocking受信し、Computingなら取消して通常経路へ戻し、CpuReady／Registeringなら作成済みhandleごと引き取る。
+Ctrl+Eを含む編集の入場・切替・original待ち再開・ResumeはBを取り消してから既存ownerへ渡す。
+新しい待機や演出省略は加えない。設計・実装記録は[紙めくり計画§28.5](page-turn-animation-plan.md)、
+検証結果と残件は`target/pageturn-1461/implementation-report-b.md`を参照する。
 
 表示 resolver は pending 中だけ下位レイヤーへフォールバックする。local 編集中は
 `erase_result_cache > fs_cache`、conceal は active local の完成を待ってから合成し、local を飛ばして
@@ -1112,6 +1141,16 @@ failed / pending をクリアする。これがないと
 
 ---
 
+### 4.2 編集を反映した画像のクリップボードコピー
+
+「編集を反映した画像をコピー」は `Settings::bake_stage_clipboard`（既定 `DisplayAdjust`）までを、
+Ctrl+E と同じ `CompositeSource` + `BakedEditSnapshot` → `books::compose_export_entry` で worker 合成する。
+表示済みページは canonical 寸法を含む snapshot を使い、未表示の一覧ページは一括書き出しと同じ snapshot を使う。
+見開きはページごとに合成してから結合し、倍率による拡大縮小をせず `jpeg_matte` で透過を平らにする。
+worker 用 snapshot の `crop_legacy_writeback` は `None` とし、コピー完了が編集 DB・sidecar を更新しない。
+既存の「画像をクリップボードにコピー」（向きと回転のみ）と、表示画素を使うキャプチャコピーは別経路のまま残す。
+詳細は [clipboard-edited-copy-plan.md](clipboard-edited-copy-plan.md)。
+
 ## 5. 消しゴム (Erase) との関係
 
 製本追加の headless bake (`BookPageSource::Composited` / `BakedEditSnapshot`) も同じ早期
@@ -1140,7 +1179,7 @@ local_adjust_cache ─▶ conceal_cache ─▶ edit_result_cache
                                       Creative LUT ─▶ post_filter ─▶ final_composite_cache ─▶ 画面
                                                                        │
                                                                        ▼
-                                     (Ctrl+S / Ctrl+E) crop で切り出し ─▶ 保存
+                                     (Ctrl+S) crop で切り出し ─▶ 保存
                                            │
                                            └─ (編集 preview) 下地／注釈へ crop
                                                                   ├─▶ 下地 WebP
@@ -1148,7 +1187,9 @@ local_adjust_cache ─▶ conceal_cache ─▶ edit_result_cache
 ```
 
 crop はフルスクリーン通常表示には反映されず (crop 外を暗くする overlay のみ)、保存 / 書き出し時に
-final composite を切り出す最終段として働く。編集プレビューでは edit-result と各注釈レイヤーを同じ
+出力画素を切り出す最終段として働く。Ctrl+E と編集反映コピーは上図の表示 cache を使わず、
+source + 編集 snapshot を worker で再合成して最後に crop を適用する (§4.2)。
+編集プレビューでは edit-result と各注釈レイヤーを同じ
 矩形で切り出すため、一覧のサムネイルとアスペクト比には反映される。
 
 `fs_cache` は raw decode 専用で、消しゴム確定結果を書き戻さない。マスクが存在する画像は
@@ -1161,6 +1202,11 @@ final composite を切り出す最終段として働く。編集プレビュー�
 先読みページの処理・キャッシュ・ログは継続し、途中のページ移動は通知時点の表示で判定するため追加の可視性状態やモーダル化は不要（まれな失敗は既定の割り切り）。
 
 ### MI-GAN の原寸入力と段階補完 (v2.5.0)
+
+消しゴム編集中は目のボタン、または既定の `Tab`（`ErasePreviewHold`）を押している間、
+現在のマスクを補完した結果を保存せずにプレビューする（モザイクは除外）。両入力は一つの
+開始遷移を共有し、保持中は再投入しない。両方離すと編集表示へ戻る。描画・図形編集の途中で
+押したキーでは開始せず、操作完了後に押し直す。キーは操作カスタマイズで変更・解除できる。
 
 MI-GAN の入力は 512x512 固定だが、512px 未満の mask bbox + context を縦横別倍率で
 引き伸ばさない。画像が各軸 512px 以上なら、bbox 周囲を画像内で原寸 512px 以上まで広げ、

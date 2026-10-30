@@ -214,6 +214,7 @@ fn menu_key_frame(key: egui::Key) -> (FsKeyAction, bool) {
         close_to_page_list: false,
         page_nav: FsPageNav::None,
         ctrl_nav: None,
+        list_order_nav: None,
         sibling_nav: None,
         mouse_nav: None,
         jump_to: None,

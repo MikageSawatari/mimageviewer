@@ -1,5 +1,5 @@
 ﻿================================================================
- mImageViewer (エムイメージビューワー) ポータブル版 Version 4.8.3
+ mImageViewer (エムイメージビューワー) ポータブル版 Version 4.10.0
 ================================================================
 
 Windows 向け 高速サムネイル画像ビューワー（ポータブル版）
@@ -145,7 +145,7 @@ HEIC / JPEG XL 表示は Windows Imaging Component（WIC）を
   - LibRaw (CDDL-1.0): LibRaw LLC
     ライセンス全文と著作権表記: LIBRAW-LICENSE.txt
     AVIF のライセンス全文と著作権表記: LIBAVIF-LICENSE.txt / DAV1D-LICENSE.txt / LIBYUV-LICENSE.txt
-    対応ソース: https://mikage.to/mimageviewer/libraw-0.22.2-source.tar.gz
+    対応ソース: https://mikage.to/mimageviewer/libraw-0.22.3-source.tar.gz
   - zlib 1.3.1 (zlib): Jean-loup Gailly and Mark Adler
     ライセンス全文: ZLIB-LICENSE.txt
   - libjpeg-turbo (IJG / BSD-3-Clause / zlib)

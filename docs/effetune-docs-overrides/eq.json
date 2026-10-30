@@ -7,8 +7,8 @@
   },
   {
     "operation": "replace_paragraph",
-    "anchor": "測定データは端末内の参照です。URLやプリセットには選択した測定の名前と識別子だけが保存され、測定データ自体は含まれません。別の端末で使うには、測定画面で **測定JSONのエクスポートにインパルス応答を含める** を有効にしてエクスポートし、別の端末でインポートしてから選択してください。このオプションは初期状態ではオフで、インパルス応答を含めるとファイルが数十MB大きくなる場合があります。測定が見つからない場合は警告が表示され、Room EQは古い補正データを使わず時間を合わせたバイパスになります。",
-    "replacement": "測定データは端末内の参照です。URLやプリセットには選択した測定の名前と識別子だけが保存され、測定データ自体は含まれません。デスクトップ版 EffeTune の測定画面で **測定JSONのエクスポートにインパルス応答を含める** を有効にして書き出し、mImageViewer の Room EQ で取り込んでから選択してください。このオプションは初期状態ではオフで、インパルス応答を含めるとファイルが数十MB大きくなる場合があります。測定が見つからない場合は警告が表示され、Room EQは古い補正データを使わず時間を合わせたバイパスになります。",
+    "anchor": "**端末間での測定の共有**: プリセットとURLに保存されるのは測定の名前とIDで、音響データは含まれません。測定を別の端末へ移すには、エクスポートの前に周波数応答測定ツールで **測定JSONのエクスポートにインパルス応答を含める** を有効にし（初期状態で有効。ファイルが数十MB大きくなることがあります）、移行先の端末でそのJSONファイルをインポートします。選択した測定が見つからない場合、Room EQは警告を表示し、補正せずに信号を通します。",
+    "replacement": "測定データは端末内の参照です。URLやプリセットには選択した測定の名前と識別子だけが保存され、測定データ自体は含まれません。デスクトップ版 EffeTune の測定画面で **測定JSONのエクスポートにインパルス応答を含める** を有効にして書き出し、mImageViewer の Room EQ で取り込んでから選択してください。このオプションは初期状態ではオンで、インパルス応答を含めるとファイルが数十MB大きくなる場合があります。測定が見つからない場合は警告が表示され、Room EQは古い補正データを使わず時間を合わせたバイパスになります。",
     "reason": "Clarify external measurement/export versus bundled import path."
   },
   {
@@ -35,21 +35,32 @@
   {
     "operation": "replace_inline",
     "scope_heading_id": "room-eq",
-    "anchor": "Room EQにはWASM DSPエンジンが必要です。利用できない場合、信号は変更されずに通過します。",
+    "anchor": "Room EQにはWASM DSPエンジンが必要で、利用できない場合は信号を変えずにそのまま通します。",
     "replacement": "",
     "reason": "Bundled vst-audio-manager uses native audio processing; standalone WASM prerequisite/configuration is inapplicable."
   },
   {
     "operation": "replace_inline",
     "scope_heading_id": "tonal-balance-eq",
-    "anchor": "無音時の省電力による停止から処理が再開したときも、測定は最初からやり直しになります。",
+    "anchor": "省電力による停止から処理が再開したときも、測定は最初からやり直しになります。",
     "replacement": "",
     "reason": "Codex P3 対応: bundled vst-audio-manager.js:1296 disables the standalone silence power policy in startPowerPolicyController(); retain the explicit Reset operation."
   },
   {
-    "operation": "replace_paragraph",
-    "anchor": "モバイルでは、5Band PEQ、5Band FIR PEQ、Group Delay PEQ、Room EQのAdditional EQ、Tonal Balance EQのTarget Adjustは、選択した1バンドの設定だけを表示します。番号付きのバンドボタンをタップして、編集するバンドを切り替えてください。切り替えても、各バンドの設定は保持されます。",
+    "operation": "remove_section",
+    "heading_id": "モバイルでのバンド選択",
+    "reason": "VST always uses desktop layout; remove the new standalone-only heading together with its paragraph, leaving no empty section."
+  },
+  {
+    "operation": "replace_html",
+    "anchor": "<!-- spectrum-overlay -->",
     "replacement": "",
-    "reason": "Codex P3 対応: v0.14.0 vst-bootstrap.js:399 defines window.electronAPI, so electron-integration.js:19 reports Electron and layout-mode-manager.js:59 always selects desktop mode; the mobile single-band editor is unreachable in the VST."
+    "reason": "Upstream marker precedes shared category guidance, not a plugin-list item."
+  },
+  {
+    "operation": "move_section_before_heading",
+    "heading_id": "スペクトラムオーバーレイ",
+    "before_heading_id": "プラグイン一覧",
+    "reason": "Preserve shared spectrum instructions at category level before splitting plugin sections, including the existing heading id."
   }
 ]

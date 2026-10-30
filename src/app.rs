@@ -538,12 +538,44 @@ mod color_filter;
 mod content_identity_detection;
 pub(crate) mod content_identity_restore;
 #[cfg(windows)]
+mod detached_page_overview;
+#[cfg(windows)]
 mod detached_placement;
 #[cfg(windows)]
 mod detached_window_manager;
+#[cfg(windows)]
+pub(crate) use detached_page_overview::DetachedPageOverviewInputProvenance;
 mod facet_name_filter;
 mod facet_navigation;
 pub(crate) mod file_type_resume;
+pub(crate) mod page_overview;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewerForegroundThumbnailConsumer {
+    Seek,
+    PageOverview,
+}
+
+/// Admission diagnostics describe the actual priority producer's exit, not display guesses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PriorityThumbnailAdmission {
+    SidecarRestore,
+    AlreadyRequested,
+    MissingState,
+    Loaded,
+    NoArt,
+    Failed,
+    MissingMetadata,
+    NoLoadRequest,
+    MissingReloadQueue,
+    MissingHeavyQueue,
+    ReservationRejected,
+    Enqueued,
+    UnsupportedOverviewItem,
+    FrameBudget,
+    InactiveConsumer,
+    PrunedOutsideKeep,
+}
 mod main_chrome;
 mod page_param_writes;
 #[cfg(test)]
@@ -657,19 +689,34 @@ use book_structural_op::BookStructuralOp;
 mod startup_list_restore;
 pub(crate) mod top_level_grid_view;
 pub(crate) use startup_list_restore::StartupListIntent;
+mod list_order_navigation;
+#[cfg(test)]
+mod list_order_tests;
+#[cfg(test)]
+mod list_order_virtual_tests;
+#[cfg(test)]
+mod list_order_worker_tests;
 mod rating_membership_ops;
 #[cfg(test)]
 pub(crate) mod rating_membership_tests;
 mod viewer_context_registry;
+pub(crate) use list_order_navigation::ListOrderSnapshot;
+#[cfg(test)]
+pub(crate) use list_order_navigation::{ListOrderEntry, ListOrderEntryKind};
 #[cfg(windows)]
 pub(crate) use viewer_context_registry::ContextResidence;
 pub(crate) use viewer_context_registry::ViewerContextId;
 #[cfg(windows)]
 use viewer_context_registry::{BuildOutcome, ContextRef, RetireError, ViewerContextRegistry};
+pub(crate) mod comic_fonts;
 pub(crate) mod final_prepare;
 mod final_prepare_budget;
 mod final_prepare_cpu;
+mod prepared_edit;
 use final_prepare::{FinalEffectOrigin, FinalEffectReady, FinalEffectReceiver, FinalEffectState};
+pub(crate) use prepared_edit::{
+    FinalPipelineInvalidation, PreparedEditCancel, PreparedEditDisposition, PreparedEditReject,
+};
 #[cfg(test)]
 pub(crate) mod final_prepare_tests;
 #[cfg(windows)]
@@ -687,8 +734,8 @@ pub(crate) use detached_window_manager::{
     DetachedActivationWatchDiagnostic, DetachedActivationWatchSample, DetachedActivationWatchState,
     DetachedActivationWatchStepResult, DetachedActivationWatchTarget,
     DetachedActivationWatchTargetRect, DetachedCloseRequest, DetachedHostClaim,
-    DetachedSessionLease, DetachedWindowHwndDiff, DetachedWindowManager, DetachedWindowRuntime,
-    DetachedWindowState, IdentifiedRightDragCommand,
+    DetachedSessionLease, DetachedWindowCommand, DetachedWindowHwndDiff, DetachedWindowManager,
+    DetachedWindowRuntime, DetachedWindowState, IdentifiedRightDragCommand,
 };
 #[cfg(all(windows, test))]
 pub(crate) use detached_window_manager::{DetachedActivationIntent, PendingRightDragCommand};
@@ -703,6 +750,8 @@ pub(crate) use folder_scan::{ScannedDir, scan_directory_with_settings, signature
 pub use grid_paint::draw_audio_thumbnail_indicator_snapshot_fixture;
 #[doc(hidden)]
 pub use grid_paint::draw_collection_placeholder_snapshot_fixture;
+#[doc(hidden)]
+pub use grid_paint::draw_thumbnail_name_style_snapshot_fixture;
 #[doc(hidden)]
 pub use grid_paint::draw_video_thumbnail_indicator_snapshot_fixture;
 pub(crate) use grid_paint::{
@@ -1849,12 +1898,58 @@ pub(crate) enum DetachedRightDragViewerIdentity {
     },
 }
 
+/// Passive content is one projection; overview does not require full-image pixels.
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) enum DetachedImageWindowDisplay {
+    Still(crate::gpu_lanczos::FullscreenPaintResource),
+    PageOverview(DetachedPageOverviewProjection),
+}
+
+#[cfg(windows)]
+impl From<crate::gpu_lanczos::FullscreenPaintResource> for DetachedImageWindowDisplay {
+    fn from(resource: crate::gpu_lanczos::FullscreenPaintResource) -> Self {
+        Self::Still(resource)
+    }
+}
+
+#[cfg(windows)]
+impl DetachedImageWindowDisplay {
+    pub(crate) fn still(&self) -> Option<&crate::gpu_lanczos::FullscreenPaintResource> {
+        match self {
+            Self::Still(resource) => Some(resource),
+            Self::PageOverview(_) => None,
+        }
+    }
+    pub(crate) fn overview(&self) -> Option<&DetachedPageOverviewProjection> {
+        match self {
+            Self::PageOverview(overview) => Some(overview),
+            Self::Still(_) => None,
+        }
+    }
+}
+
+/// Immutable metadata is shared; only the capture-time overscan owns texture handles.
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct DetachedPageOverviewProjection {
+    pub(crate) view: crate::page_overview::PageOverviewView,
+    pub(crate) captured_layout: crate::page_overview::PageOverviewLayout,
+    pub(crate) thumbnails: HashMap<usize, crate::ui_page_overview::PageOverviewThumbnail>,
+    pub(crate) retained_textures: Vec<egui::TextureHandle>,
+    pub(crate) direction: crate::page_overview::PageOverviewDirection,
+    pub(crate) current_items_indices: Vec<usize>,
+    pub(crate) keymap: crate::keymap::Keymap,
+    pub(crate) executable_actions: Vec<crate::keymap::KeyAction>,
+    pub(crate) input_blocked: bool,
+}
+
 // フィールド型 (ViewerContextDescriptor / ViewerContextBundle) が cfg(windows) の
 // detached 専用型なので、struct と impl も揃えてゲートする (非 Windows check 対応)。
 #[cfg(windows)]
 pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) id: u64,
-    pub(crate) texture: crate::gpu_lanczos::FullscreenPaintResource,
+    pub(crate) display: DetachedImageWindowDisplay,
     pub(crate) title: String,
     pub(crate) location_display: String,
     pub(crate) image_dims: Option<(u32, u32)>,
@@ -1905,7 +2000,7 @@ pub(crate) enum DetachedImageWindowUnderlay {
 #[derive(Clone)]
 pub(crate) struct DeferredDetachedImageWindowView {
     pub(crate) id: u64,
-    pub(crate) texture: crate::gpu_lanczos::FullscreenPaintResource,
+    pub(crate) display: DetachedImageWindowDisplay,
     pub(crate) location_display: String,
     pub(crate) image_dims: Option<(u32, u32)>,
     pub(crate) rotation: crate::rotation_db::Rotation,
@@ -1935,7 +2030,7 @@ impl DeferredDetachedImageWindowView {
     ) -> Self {
         Self {
             id: window.id,
-            texture: window.texture.clone(),
+            display: window.display.clone(),
             location_display: window.location_display.clone(),
             image_dims: window.image_dims,
             rotation: window.rotation,
@@ -1957,6 +2052,11 @@ impl DeferredDetachedImageWindowView {
 #[cfg(windows)]
 #[derive(Debug, Clone)]
 pub(crate) enum DeferredDetachedImageWindowEvent {
+    PageOverview {
+        id: u64,
+        command: page_overview::PageOverviewCommand,
+        provenance: DetachedPageOverviewInputProvenance,
+    },
     FirstCallback {
         id: u64,
     },
@@ -2133,7 +2233,7 @@ impl Clone for DetachedImageWindowSnapshot {
     fn clone(&self) -> Self {
         Self {
             id: self.id,
-            texture: self.texture.clone(),
+            display: self.display.clone(),
             title: self.title.clone(),
             location_display: self.location_display.clone(),
             image_dims: self.image_dims,
@@ -3667,6 +3767,12 @@ impl App {
             return false;
         };
         let id = dispatch.window_id;
+        if let Some(DetachedWindowCommand::PageOverview(command)) = dispatch.command.as_ref() {
+            if !self.can_activate_detached_page_overview_command(id, command) {
+                self.detached_window_manager.discard_detached_command(id);
+                return false;
+            }
+        }
         let frame = self.frame_counter;
         self.log_detached_image_window_debug(format!(
             "deferred_activate_commit frame={frame} id={id} before_active_dispatch=true \
@@ -3679,7 +3785,7 @@ impl App {
                 if self.active_detached_window_id() == Some(id) {
                     if self
                         .detached_window_manager
-                        .mark_right_drag_pending_execution(id, command)
+                        .mark_detached_command_pending_execution(id, command)
                     {
                         self.log_detached_image_window_debug(format!(
                             "right_drag_command_pending_execution frame={frame} id={id}"
@@ -3689,10 +3795,7 @@ impl App {
                             "right_drag_command_dropped frame={frame} id={id} \
                              phase=activating reason=illegal_activation_transition"
                         ));
-                        self.discard_detached_right_drag_command(
-                            id,
-                            "illegal_activation_transition",
-                        );
+                        self.detached_window_manager.discard_detached_command(id);
                     }
                 } else {
                     self.log_detached_image_window_debug(format!(
@@ -3700,7 +3803,7 @@ impl App {
                          phase=activating reason=active_window_mismatch active_id={:?}",
                         self.active_detached_window_id()
                     ));
-                    self.discard_detached_right_drag_command(id, "active_window_mismatch");
+                    self.detached_window_manager.discard_detached_command(id);
                 }
             }
             self.log_detached_image_window_debug(format!(
@@ -3712,7 +3815,7 @@ impl App {
             ));
             true
         } else {
-            self.discard_detached_right_drag_command(id, "activation_failed");
+            self.detached_window_manager.discard_detached_command(id);
             self.log_detached_image_window_debug(format!(
                 "deferred_activate_commit_failed frame={frame} id={id} \
                  passive_windows={} active_context={}",
@@ -4498,6 +4601,11 @@ pub(crate) enum FolderNavMode {
     Fullscreen,
     /// フルスクリーン表示中。現在地と同じ親の前後兄弟だけを対象にする。
     SiblingFullscreen,
+    /// 最後に通常フォルダ一覧から開いたときの凍結した表示順。位置は入力時に導く。
+    ListOrder {
+        snapshot: Arc<ListOrderSnapshot>,
+        from_index: usize,
+    },
     /// お気に入り検索コンテキスト。DFS 結果が root 配下なら `nav_stack` に積んで
     /// `load_folder`、root 外なら `favsearch_navigate_sibling` にフォールバックする。
     /// `fullscreen=true` のときは移動後に先頭の画像系アイテムを再度フルスクリーンで開く。
@@ -5493,7 +5601,42 @@ impl CompareViewMode {
     }
 }
 
+#[derive(Clone)]
+pub(crate) enum PinnedOriginalSource {
+    Raw {
+        pixels: Arc<egui::ColorImage>,
+        processed_source_size: [usize; 2],
+        crop: Option<crate::export_crop::CropRect>,
+        rotation: crate::rotation_db::Rotation,
+    },
+    SameAsProcessed,
+    Unavailable,
+}
+
+#[cfg(all(test, windows))]
+#[path = "app/compare_original_lifecycle_tests.rs"]
+mod compare_original_lifecycle_tests;
+
+/// 加工版を受理した時点の幾何。元画像ホールド時の設定から再構築しない。
+#[derive(Clone, Copy)]
+pub(crate) struct CompareSourceGeometry {
+    pub(crate) processed_source_size: [usize; 2],
+    pub(crate) crop: Option<crate::export_crop::CropRect>,
+    pub(crate) rotation: crate::rotation_db::Rotation,
+}
+
+impl CompareSourceGeometry {
+    pub(crate) fn from_job(job: &crate::capture::CapturePixelJob) -> Self {
+        Self {
+            processed_source_size: job.source.size,
+            crop: job.crop,
+            rotation: job.rotation,
+        }
+    }
+}
+
 pub(crate) struct PinnedCompareSlot {
+    pub(crate) original_source: PinnedOriginalSource,
     pub(crate) pixels: Arc<egui::ColorImage>,
     /// 右下インジケーター専用の小型画像。フル解像度textureを72x54表示のためだけに
     /// uploadしないよう、compare-pin workerで事前縮小する。
@@ -5518,6 +5661,7 @@ pub(crate) struct ComparePinResult {
 }
 
 pub(crate) struct ComparePinPending {
+    pub(crate) original_source: PinnedOriginalSource,
     pub(crate) source_idx: usize,
     pub(crate) external_item_key: Option<String>,
     pub(crate) rx: mpsc::Receiver<Result<ComparePinResult, String>>,
@@ -6324,12 +6468,28 @@ pub(crate) struct ComparePinLoadPending {
 }
 
 pub(crate) struct ComparePreparedPair {
+    pub(crate) current_geometry: CompareSourceGeometry,
+    pub(crate) original: CompareOriginalVariant,
     pub(crate) key: u64,
     pub(crate) current_idx: usize,
     pub(crate) pinned_source_idx: usize,
     pub(crate) current_input_size: [usize; 2],
     pub(crate) pinned_input_size: [usize; 2],
     pub(crate) target_size: [usize; 2],
+    pub(crate) pixels: ComparePreparedPixels,
+    pub(crate) pinned_texture: Option<egui::TextureHandle>,
+    pub(crate) current_texture: Option<egui::TextureHandle>,
+    pub(crate) diff_texture: Option<egui::TextureHandle>,
+}
+
+pub(crate) enum CompareOriginalVariant {
+    Absent,
+    Ready(CompareOriginalPixels),
+    Failed,
+}
+
+pub(crate) struct CompareOriginalPixels {
+    pub(crate) key: u64,
     pub(crate) pixels: ComparePreparedPixels,
     pub(crate) pinned_texture: Option<egui::TextureHandle>,
     pub(crate) current_texture: Option<egui::TextureHandle>,
@@ -6436,8 +6596,58 @@ impl ComparePreparedPixels {
 }
 
 impl ComparePreparedPair {
+    pub(crate) fn managed_gpu_texture_count(&self) -> usize {
+        let count = |pinned: &Option<egui::TextureHandle>,
+                     current: &Option<egui::TextureHandle>,
+                     diff: &Option<egui::TextureHandle>| {
+            usize::from(pinned.is_some())
+                + usize::from(current.is_some())
+                + usize::from(diff.is_some())
+        };
+        count(
+            &self.pinned_texture,
+            &self.current_texture,
+            &self.diff_texture,
+        ) + match &self.original {
+            CompareOriginalVariant::Ready(original) => count(
+                &original.pinned_texture,
+                &original.current_texture,
+                &original.diff_texture,
+            ),
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn allocated_cpu_buffers(&self) -> usize {
+        self.pixels.buffer_count()
+            + match &self.original {
+                CompareOriginalVariant::Ready(original) => original.pixels.buffer_count(),
+                _ => 0,
+            }
+    }
+
     pub(crate) fn allocated_cpu_bytes(&self) -> u64 {
         self.pixels.allocated_bytes()
+            + match &self.original {
+                CompareOriginalVariant::Ready(original) => original.pixels.allocated_bytes(),
+                _ => 0,
+            }
+    }
+
+    pub(crate) fn draw_pixels(&self, original: bool) -> &ComparePreparedPixels {
+        if original && let CompareOriginalVariant::Ready(original) = &self.original {
+            &original.pixels
+        } else {
+            &self.pixels
+        }
+    }
+
+    pub(crate) fn draw_key(&self, original: bool) -> u64 {
+        if original && let CompareOriginalVariant::Ready(original) = &self.original {
+            original.key
+        } else {
+            self.key
+        }
     }
 }
 
@@ -6449,6 +6659,7 @@ pub(crate) struct ComparePrepareRequest {
 }
 
 pub(crate) struct ComparePrepareResult {
+    pub(crate) key: u64,
     pub(crate) current_idx: usize,
     pub(crate) pinned_source_idx: usize,
     pub(crate) width: u32,
@@ -6470,6 +6681,8 @@ impl ComparePrepareScope {
 }
 
 pub(crate) struct ComparePreparePending {
+    pub(crate) key: u64,
+    pub(crate) current_geometry: CompareSourceGeometry,
     pub(crate) request: ComparePrepareRequest,
     pub(crate) scope: ComparePrepareScope,
     pub(crate) source_indices: Vec<usize>,
@@ -6491,6 +6704,10 @@ pub(crate) enum ComparePreparationState {
     Unprepared,
     WaitingForSource(ComparePrepareRequest),
     Preparing(ComparePreparePending),
+    PreparingOriginal {
+        pair: ComparePreparedPair,
+        pending: ComparePreparePending,
+    },
     /// 入力が失効したが、途中cancel不能なworkerの完了を回収するまで次を直列化する状態。
     Draining(ComparePreparePending),
     Ready(ComparePreparedPair),
@@ -6500,7 +6717,9 @@ impl ComparePreparationState {
     pub(crate) fn request(&self) -> Option<ComparePrepareRequest> {
         match self {
             Self::WaitingForSource(request) => Some(*request),
-            Self::Preparing(pending) | Self::Draining(pending) => Some(pending.request),
+            Self::Preparing(pending)
+            | Self::Draining(pending)
+            | Self::PreparingOriginal { pending, .. } => Some(pending.request),
             Self::Ready(pair) => Some(ComparePrepareRequest {
                 current_idx: pair.current_idx,
                 pinned_source_idx: pair.pinned_source_idx,
@@ -6512,14 +6731,14 @@ impl ComparePreparationState {
 
     pub(crate) fn prepared_pair(&self) -> Option<&ComparePreparedPair> {
         match self {
-            Self::Ready(pair) => Some(pair),
+            Self::Ready(pair) | Self::PreparingOriginal { pair, .. } => Some(pair),
             _ => None,
         }
     }
 
     pub(crate) fn prepared_pair_mut(&mut self) -> Option<&mut ComparePreparedPair> {
         match self {
-            Self::Ready(pair) => Some(pair),
+            Self::Ready(pair) | Self::PreparingOriginal { pair, .. } => Some(pair),
             _ => None,
         }
     }
@@ -6527,14 +6746,19 @@ impl ComparePreparationState {
     pub(crate) fn is_pending(&self) -> bool {
         matches!(
             self,
-            Self::WaitingForSource(_) | Self::Preparing(_) | Self::Draining(_)
+            Self::WaitingForSource(_)
+                | Self::Preparing(_)
+                | Self::Draining(_)
+                | Self::PreparingOriginal { .. }
         )
     }
 
     pub(crate) fn invalidate(&mut self) {
         let old = std::mem::take(self);
         *self = match old {
-            Self::Preparing(pending) | Self::Draining(pending) => Self::Draining(pending),
+            Self::Preparing(pending)
+            | Self::Draining(pending)
+            | Self::PreparingOriginal { pending, .. } => Self::Draining(pending),
             _ => Self::Unprepared,
         };
     }
@@ -7040,6 +7264,18 @@ struct ThumbnailKeepProjection {
     interactive_pages: HashSet<usize>,
 }
 
+#[derive(Debug)]
+struct GridThumbnailRetentionGeometry {
+    cols: usize,
+    items_per_page: usize,
+    vis_count: usize,
+    vis_first: usize,
+    fractional_drag_y: f32,
+    strict_visible_end: usize,
+    strict_visible_items: usize,
+    vis_keep_start_capped: usize,
+    vis_keep_end: usize,
+}
 mod thumbnail_requests;
 use thumbnail_requests::{ThumbnailReceipt, ThumbnailRequestKind, ThumbnailRequests};
 
@@ -7949,6 +8185,7 @@ impl FolderNavMode {
             FolderNavMode::Grid => "grid",
             FolderNavMode::SiblingGrid => "grid_sibling",
             FolderNavMode::Fullscreen => "fullscreen",
+            FolderNavMode::ListOrder { .. } => "list_order",
             FolderNavMode::SiblingFullscreen => "fullscreen_sibling",
             FolderNavMode::Favsearch { .. } => "favsearch",
             FolderNavMode::SmartFolder { .. } => "smart_folder",
@@ -10063,10 +10300,11 @@ pub(crate) struct LocalAdjustPrefixPreviewKey {
 
 /// 補正レイヤー合成結果の cache entry。
 pub(crate) struct LocalAdjustCacheEntry {
+    pub(crate) texture_options: egui::TextureOptions,
     pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     #[allow(dead_code)]
     pub pixels: Arc<egui::ColorImage>,
-    pub texture: egui::TextureHandle,
+    pub texture: Option<egui::TextureHandle>,
 }
 
 /// 隠蔽合成結果のキャッシュエントリ (Phase 4)。
@@ -10075,12 +10313,13 @@ pub(crate) struct LocalAdjustCacheEntry {
 /// `generation` は `App::conceal_generation` のスナップショットで、グローバル
 /// パラメータが変わったあと最初に lookup が走った時点で stale 判定される。
 pub(crate) struct ConcealCacheEntry {
+    pub(crate) texture_options: egui::TextureOptions,
     pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     /// 合成済み RGBA。Phase 5 の `Ctrl+E` エクスポートでこの pixels を JPEG/PNG/WebP に
     /// 書き出すので、現状は描画パスでは未使用だが将来使う前提でフィールドを保持。
     #[allow(dead_code)]
     pub pixels: Arc<egui::ColorImage>,
-    pub texture: egui::TextureHandle,
+    pub texture: Option<egui::TextureHandle>,
     pub generation: u64,
 }
 
@@ -10097,6 +10336,8 @@ pub(crate) struct ComicCacheEntry {
     #[allow(dead_code)]
     pub pixels: Arc<egui::ColorImage>,
     pub texture: egui::TextureHandle,
+    /// Actual sampler/mipmap options used when this annotation was registered.
+    pub texture_options: egui::TextureOptions,
     /// 下地 final composite pixels の Arc 自体を保持する。`Arc::ptr_eq` で同一性を判定する
     /// ことで、下地が作り直されたら (= 別アロケーション) 再ベイクし、かつ Arc を生かして
     /// おくのでアドレス再利用による ABA を原理的に防ぐ (Codex P2)。下地が変わるのは
@@ -10303,6 +10544,7 @@ pub(crate) struct EraseResultKey {
 
 /// 消しゴム確定結果 (= MI-GAN inpaint 出力) の cache entry。
 pub(crate) struct EraseResultCacheEntry {
+    pub(crate) texture_options: egui::TextureOptions,
     pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     pub pixels: Arc<egui::ColorImage>,
     pub texture: egui::TextureHandle,
@@ -11776,8 +12018,9 @@ impl LocalAdjustCacheEntry {
     pub(crate) fn raster(pixels: Arc<egui::ColorImage>, texture: egui::TextureHandle) -> Self {
         let display_basis = normal_raster_material_basis(texture.size(), pixels.size, None, false);
         Self {
+            texture_options: DISPLAY_IMAGE_TEXTURE_OPTIONS,
             pixels,
-            texture,
+            texture: Some(texture),
             display_basis,
         }
     }
@@ -11791,8 +12034,9 @@ impl ConcealCacheEntry {
     ) -> Self {
         let display_basis = normal_raster_material_basis(texture.size(), pixels.size, None, false);
         Self {
+            texture_options: DISPLAY_IMAGE_TEXTURE_OPTIONS,
             pixels,
-            texture,
+            texture: Some(texture),
             generation,
             display_basis,
         }
@@ -11803,6 +12047,7 @@ impl EraseResultCacheEntry {
     pub(crate) fn raster(pixels: Arc<egui::ColorImage>, texture: egui::TextureHandle) -> Self {
         let display_basis = normal_raster_material_basis(texture.size(), pixels.size, None, false);
         Self {
+            texture_options: DISPLAY_IMAGE_TEXTURE_OPTIONS,
             pixels,
             texture,
             display_basis,
@@ -11857,7 +12102,7 @@ pub(crate) enum FsHoldover {
     /// Legacy owner for detached/slideshow folder transitions. Main-view manual
     /// browsing uses `NavigationSequence`, whose target must be presented before
     /// another target can be accepted.
-    FolderNavigation(Option<FsDisplayUnitHoldover>),
+    FolderNavigation(Option<FsDisplayUnitHoldover>, FsFolderNavigationOrigin),
     /// A display-only bridge while an in-window still viewer moves to the dedicated
     /// fullscreen viewport. It is not a folder-navigation owner and must never keep
     /// the viewer session alive across content teardown.
@@ -11866,10 +12111,29 @@ pub(crate) enum FsHoldover {
     FinalEffectSourceReload(FinalEffectSourceReloadHoldover),
 }
 
+/// Admission policy belongs to the navigation owner, even after its pixels are released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FsFolderNavigationOrigin {
+    Ordinary,
+    ListOrder,
+}
+
 impl FsHoldover {
+    pub(crate) fn folder_navigation_origin(&self) -> FsFolderNavigationOrigin {
+        match self {
+            Self::FolderNavigation(_, origin) => *origin,
+            Self::NavigationSequence(sequence)
+                if matches!(sequence.purpose, FsNavigationPurpose::ListOrderNavigation) =>
+            {
+                FsFolderNavigationOrigin::ListOrder
+            }
+            _ => FsFolderNavigationOrigin::Ordinary,
+        }
+    }
+
     pub(crate) fn folder_navigation_display_unit(&self) -> Option<&FsDisplayUnitHoldover> {
         match self {
-            Self::FolderNavigation(unit) => unit.as_ref(),
+            Self::FolderNavigation(unit, _) => unit.as_ref(),
             Self::PresentationSwitch(_)
             | Self::NavigationSequence(_)
             | Self::FinalEffectSourceReload(_) => None,
@@ -11878,7 +12142,7 @@ impl FsHoldover {
 
     pub(crate) fn continues_viewer_during_content_teardown(&self) -> bool {
         match self {
-            Self::FolderNavigation(_) => true,
+            Self::FolderNavigation(_, _) => true,
             Self::NavigationSequence(sequence) => {
                 sequence.continues_viewer_during_content_teardown()
             }
@@ -11889,7 +12153,7 @@ impl FsHoldover {
     pub(crate) fn navigation_sequence(&self) -> Option<&FsNavigationSequence> {
         match self {
             Self::NavigationSequence(sequence) => Some(sequence),
-            Self::FolderNavigation(_)
+            Self::FolderNavigation(_, _)
             | Self::PresentationSwitch(_)
             | Self::FinalEffectSourceReload(_) => None,
         }
@@ -11898,7 +12162,7 @@ impl FsHoldover {
     pub(crate) fn navigation_sequence_mut(&mut self) -> Option<&mut FsNavigationSequence> {
         match self {
             Self::NavigationSequence(sequence) => Some(sequence),
-            Self::FolderNavigation(_)
+            Self::FolderNavigation(_, _)
             | Self::PresentationSwitch(_)
             | Self::FinalEffectSourceReload(_) => None,
         }
@@ -11917,7 +12181,7 @@ impl FsHoldover {
 
     pub(crate) fn final_effect_wait(&self) -> Option<(usize, std::time::Instant)> {
         match self {
-            Self::FolderNavigation(_)
+            Self::FolderNavigation(_, _)
             | Self::PresentationSwitch(_)
             | Self::NavigationSequence(_) => None,
             Self::FinalEffectSourceReload(holdover) => {
@@ -11931,7 +12195,7 @@ impl FsHoldover {
         texture_id: egui::TextureId,
     ) -> Option<&FsDisplayUnitHoldoverPage> {
         let unit = match self {
-            Self::FolderNavigation(unit) => unit.as_ref()?,
+            Self::FolderNavigation(unit, _) => unit.as_ref()?,
             Self::PresentationSwitch(unit) => unit,
             Self::NavigationSequence(sequence) => sequence.previous.as_ref()?,
             Self::FinalEffectSourceReload(holdover) => &holdover.previous,
@@ -11949,7 +12213,7 @@ impl FsHoldover {
         fs_idx: usize,
     ) -> Option<&FsDisplayUnitHoldover> {
         match self {
-            Self::FolderNavigation(previous) => previous.as_ref(),
+            Self::FolderNavigation(previous, _) => previous.as_ref(),
             Self::PresentationSwitch(unit) => Some(unit),
             Self::NavigationSequence(sequence) => {
                 let previous_is_still_visible = sequence.displays_previous_unit()
@@ -11975,7 +12239,7 @@ impl FsHoldover {
     #[cfg(test)]
     pub(crate) fn primary_texture_id(&self) -> egui::TextureId {
         match self {
-            Self::FolderNavigation(unit) => unit
+            Self::FolderNavigation(unit, _) => unit
                 .as_ref()
                 .expect("folder navigation display unit must be captured for this test")
                 .pages
@@ -12057,6 +12321,8 @@ pub(crate) struct CapturedPagedDisplayUnit {
 
 #[derive(Clone)]
 pub(crate) struct FsDisplayUnitHoldoverPage {
+    /// Capture-time crop; the occurrence index may be reused by a new folder.
+    pub(crate) crop: Option<crate::export_crop::CropSettings>,
     /// Capture-time occurrence retained for tracing and `fullscreen_page_layout` identity only.
     /// Geometry must never be re-derived from it because folder navigation can replace items
     /// while the holdover remains visible.
@@ -12109,6 +12375,8 @@ pub(crate) struct FsNavigationSequence {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FsNavigationPurpose {
     Ordinary,
+    /// No traversal continuation may replace this accepted list-order target before display.
+    ListOrderNavigation,
     /// A Smart Ctrl traversal owns the holdover before DFS resolves and while its offscreen
     /// child is preparing. The visible source PDF/ZIP receiver must not finish this sequence.
     SmartFolderNavigation {
@@ -12120,14 +12388,14 @@ pub(crate) enum FsNavigationPurpose {
 impl FsNavigationPurpose {
     pub(crate) fn diagnostic_trace(&self) -> Option<&SimilarMoveTrace> {
         match self {
-            Self::Ordinary | Self::SmartFolderNavigation { .. } => None,
+            Self::Ordinary | Self::ListOrderNavigation | Self::SmartFolderNavigation { .. } => None,
             Self::SimilarBookVisit(intent) => intent.diagnostic_trace.as_ref(),
         }
     }
 
     pub(crate) fn take_diagnostic_trace(&mut self) -> Option<SimilarMoveTrace> {
         match self {
-            Self::Ordinary | Self::SmartFolderNavigation { .. } => None,
+            Self::Ordinary | Self::ListOrderNavigation | Self::SmartFolderNavigation { .. } => None,
             Self::SimilarBookVisit(intent) => intent.diagnostic_trace.take(),
         }
     }
@@ -12725,6 +12993,30 @@ pub(crate) struct PageEditSpreadPivot {
 }
 
 impl App {
+    /// ペアと初期編集側を、同じ表示単位の役割付きページ列から解決する。
+    pub(crate) fn resolve_visible_spread_edit_pages(
+        &mut self,
+        idx: usize,
+    ) -> Option<VisibleSpreadEditPages> {
+        let pages = if self.spread_mode.is_spread()
+            && let Some(pages) = self.fullscreen_page_layout.spread_occurrences()
+            && pages.iter().any(|page| {
+                page.role == crate::ui_fullscreen::SpreadPageRole::Navigation && page.idx == idx
+            }) {
+            pages.to_vec()
+        } else {
+            self.spread_display_composition_for_anchor(idx)
+                .pages_in_screen_order(self.spread_mode)
+        };
+        let [left, right] = pages.as_slice() else {
+            return None;
+        };
+        Some(VisibleSpreadEditPages {
+            pair: (left.idx, right.idx),
+            reading_start: AdjustSpreadTarget::reading_start(self.spread_mode, &pages),
+        })
+    }
+
     /// 編集するページと、見開きなら戻すための退避を決める。**この時点では何も変えない。**
     ///
     /// 素材の取得など失敗しうる準備を先に済ませてから
@@ -12734,17 +13026,17 @@ impl App {
         &mut self,
         fs_idx: usize,
     ) -> (usize, Option<PageEditSpreadPivot>) {
-        match self.resolve_visible_spread_pair(fs_idx) {
-            crate::ui_fullscreen::SpreadPair::Double { left, right } => (
-                left,
+        match self.resolve_visible_spread_edit_pages(fs_idx) {
+            Some(pages) => (
+                pages.target_idx(pages.reading_start),
                 Some(PageEditSpreadPivot {
                     saved_mode: self.spread_mode,
-                    pair: (left, right),
+                    pair: pages.pair,
                     navigation_anchor_idx: fs_idx,
                 }),
             ),
             // 単ページ / 表紙単独 / 横長単独。倒す必要が無い。
-            crate::ui_fullscreen::SpreadPair::Single => (fs_idx, None),
+            None => (fs_idx, None),
         }
     }
 
@@ -12831,12 +13123,59 @@ impl App {
 /// 見開き表示中に補正パネルが編集対象とするページ (画面上の左/右で固定、
 /// LTR/RTL は問わない)。Single (単ページ / 表紙単独 / 横長単独) では参照されず、
 /// L/R セレクタも UI 上に出ない。`open_fullscreen` (= ページ送り、ペア切替、
-/// 初回フルスクリーン) と spread_mode 切替で `Left` にリセットされる。
+/// 初回フルスクリーン) と spread_mode 切替で明示選択を解除する。
+/// 選択が無ければ、現在表示される組の読む順の最初のページを都度使う。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum AdjustSpreadTarget {
     #[default]
     Left,
     Right,
+}
+
+/// 画面上のペアと、その同じ表示単位で最初に編集する側。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VisibleSpreadEditPages {
+    pub pair: (usize, usize),
+    pub reading_start: AdjustSpreadTarget,
+}
+
+impl VisibleSpreadEditPages {
+    pub(crate) fn target_idx(self, side: AdjustSpreadTarget) -> usize {
+        match side {
+            AdjustSpreadTarget::Left => self.pair.0,
+            AdjustSpreadTarget::Right => self.pair.1,
+        }
+    }
+}
+
+impl AdjustSpreadTarget {
+    /// 見開きで最初に編集する側。左右の意味は画面上の位置のまま保つ。
+    pub(crate) fn reading_start(
+        spread_mode: crate::settings::SpreadMode,
+        screen_pages: &[crate::ui_fullscreen::SpreadPageOccurrence],
+    ) -> Self {
+        use crate::ui_fullscreen::SpreadPageRole;
+
+        // 単独表示の配置指定で実ページが反対側に来ても、補助表紙からは始めない。
+        if screen_pages
+            .iter()
+            .any(|page| page.role == SpreadPageRole::FrontCoverSupplement)
+            && let Some(position) = screen_pages
+                .iter()
+                .position(|page| page.role == SpreadPageRole::Navigation)
+        {
+            return if position == 0 {
+                Self::Left
+            } else {
+                Self::Right
+            };
+        }
+        if spread_mode.is_rtl() {
+            Self::Right
+        } else {
+            Self::Left
+        }
+    }
 }
 
 /// 仮想フォルダ (PDF/ZIP) 進入時の親 catalog への write-back ターゲット。
@@ -13423,6 +13762,8 @@ pub(crate) enum GridSortLockReason {
     PageOrderFixed,
     /// この一覧は固有の順序を持ち、一覧 sort は適用されない。
     FixedOrder,
+    /// タグビューでは通常ソートでなく、専用の並べ替えを使う。
+    TagViewOrder,
     /// 詳細一覧の列ヘッダが並びを所有している。
     DetailsHeaderSort,
     /// 手動順のコレクションでは列ヘッダが順序を上書きできない。
@@ -13449,6 +13790,7 @@ impl GridSortLockReason {
         match self {
             Self::PageOrderFixed => "固定",
             Self::FixedOrder => "並べ替え固定",
+            Self::TagViewOrder => "タグ専用",
             Self::DetailsHeaderSort => "列ヘッダ",
             Self::CollectionManualOrder => "手動順",
             Self::CollectionShuffleOrder => "シャッフル",
@@ -13468,6 +13810,7 @@ impl GridSortLockReason {
                 "本として表示中や閲覧履歴では、並び順が固定されます（一覧の並べ替えは使えません）。"
             }
             Self::FixedOrder => "この一覧は並べ替え固定です。",
+            Self::TagViewOrder => "タグビューの並べ替えはツールバーで選べます。",
             Self::DetailsHeaderSort => {
                 "詳細一覧の列ヘッダで並べ替え中です。\nヘッダをもう一度クリックして「ソートなし」に戻すと有効になります。"
             }
@@ -15839,6 +16182,8 @@ pub struct App {
     pub(crate) items: Vec<GridItem>,
     pub(crate) projection_recipe: book_materialization::ProjectionRecipe,
     pub(crate) page_identity_index: Arc<file_type_resume::PreparedPageIdentityIndex>,
+    pub(crate) page_overview: crate::page_overview::PageOverviewState,
+    pub(crate) page_overview_incarnation: u64,
     /// Hands out content identities. Process-wide on purpose: it maps content to identity and
     /// holds no per-viewer state, so sharing it lets the same page keep one id across every
     /// viewer context.
@@ -16065,6 +16410,8 @@ pub struct App {
     /// Ctrl+↑↓ のバックグラウンドフォルダナビゲーション結果待ち。
     /// navigate_folder_with_skip をワーカースレッドで実行し、UIスレッドをブロックしない。
     folder_nav_pending: Option<FolderNavPending>,
+    /// Context-owned frozen book rows; no stored current position.
+    pub(crate) list_order: Option<Arc<ListOrderSnapshot>>,
     /// 実フォルダ open の worker scan 待ち ([`FolderPaneOpenPending`])。
     /// folder pane と detached image open のどちらも bundle ownership で保持する。
     folder_pane_open_pending: Option<FolderPaneOpenPending>,
@@ -16231,8 +16578,8 @@ pub struct App {
     /// 表示トリム (読みながら使う表示専用の余白カット) の調整パネル表示。
     /// 出力用の切り取りとは独立し、保存 / エクスポートのピクセルには影響しない。
     pub(crate) view_trim_mode: bool,
-    /// 表示トリムの本単位適用モード。Page は旧 DB 互換用で、新規 UI ではここへ永続しない。
-    pub(crate) view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode,
+    /// 本別の選択だけを保持し、表示モードは全体既定とページ行から解決する。
+    pub(crate) view_trim_book_preference: crate::view_trim::ViewTrimBookPreference,
     /// 廃止済みの一時 Page scope slot。detached viewer の凍結中は context bundle の形を
     /// 変えないため常に None の互換枠として残す。適用範囲は enabled なページ行から導出する。
     pub(crate) view_trim_page_apply_root_idx: Option<usize>,
@@ -16347,6 +16694,8 @@ pub struct App {
     pub(crate) empty_items_reason: Option<(u64, crate::empty_items_reason::EmptyItemsReason)>,
     /// 現在の `items` がタグビュー (Ctrl+T) の一時結果一覧かを示す。
     pub(crate) items_are_tag_view: bool,
+    /// 検索結果を採用した時点の、一致したタグの付与時刻 (ミリ秒)。一覧contextが所有する。
+    pub(crate) tag_view_applied_times: std::collections::HashMap<String, i64>,
     /// 現在の `items` が閲覧履歴の仮想ビューかを示す。
     pub(crate) items_are_reading_history_view: bool,
     /// 現在の `items` がブックマーク一覧の仮想ビューかを示す。
@@ -16732,6 +17081,9 @@ pub struct App {
     pub(crate) export_batch_dialog: Option<crate::ui_dialogs::export_batch::ExportBatchDialogState>,
     /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。単ページと一括の両方が使う。
     pub(crate) export_pending: Option<crate::export_dialog::ExportPending>,
+    /// OS-global clipboard output; intentionally stays outside viewer context bundles.
+    pub(crate) edited_clipboard_copy:
+        Option<crate::edited_clipboard_copy::EditedClipboardCopyPending>,
     /// 現在表示中の実フォルダを、メイン viewer が閉じた後に再読み込みする対象。
     /// Ctrl+E 完了と、viewer 中に届いた監視由来の再走査が同じ先送りを使う。
     pub(crate) folder_refresh_pending: Option<book_append_refresh::FolderRefreshRequest>,
@@ -18111,8 +18463,9 @@ pub struct App {
     /// 見開きから SNS 分割モードに入ったときの spread 状態スナップショット。
     pub(crate) sns_split_spread_ctx: Option<PageEditSpreadPivot>,
     /// 見開き表示中に補正パネルが操作する側 (画面上の左/右)。Single 表示中は
-    /// 参照されない。`open_fullscreen` / spread_mode 切替で Left にリセット。
-    pub(crate) adjust_spread_target: AdjustSpreadTarget,
+    /// 参照されない。`open_fullscreen` / spread_mode 切替で明示選択を解除する。
+    /// None follows the current spread's reading start; Some is an explicit screen-side choice.
+    pub(crate) adjust_spread_target: Option<AdjustSpreadTarget>,
     /// 補正パネルの標準 / このページ選択。対象 idx が変わったときだけ初期化する。
     pub(crate) adjust_scope_selection: AdjustScopeSelection,
     /// `adjust_scope_selection` を初期化済みの編集対象 idx。
@@ -18823,14 +19176,17 @@ pub struct App {
     /// 隠蔽マスクの世代番号。mask / shape の保存・削除で idx 単位に +1 する。
     pub(crate) conceal_mask_generation: std::collections::HashMap<usize, u64>,
 
-    /// 消しゴム編集モード中の「プレビューボタン押下」状態。
-    /// パネル右上の目アイコンを押している間 true。表示パイプラインは
+    /// 消しゴム編集モード中の「プレビューボタンまたはキー押下」状態。
+    /// パネル右上の目アイコンまたはプレビューキーを押している間 true。表示パイプラインは
     /// false のとき `erase_base_cache` (pre-inpaint) を、true のとき通常パイプライン
     /// (= inpaint 反映後の fs_cache、隠蔽合成は省略) を出力する。
     pub(crate) erase_preview_active: bool,
+    /// プレビューキーの保持受付。描画中の押下は解放まで受け付けない。
+    pub(crate) erase_preview_hold: crate::edit_preview::EditPreviewHoldState,
     /// 隠蔽編集モード中の「プレビューボタン押下」状態。
     /// 押している間 true で、`ensure_conceal_texture` が conceal_mode でも合成を実行する。
     pub(crate) conceal_preview_active: bool,
+    pub(crate) conceal_preview_hold: crate::edit_preview::EditPreviewHoldState,
     /// 前フレームで確定した隠蔽プレビュー目アイコンの矩形。
     ///
     /// 画像テクスチャの解決はパネル描画より先に行われるため、当該フレームの pointer
@@ -18881,16 +19237,8 @@ pub struct App {
     /// 注釈編集の世代番号 (Inc 2 以降で編集確定ごとに +1)。`comic_cache` の各 entry は
     /// この値と照合され、不一致なら miss 扱い (conceal_generation と同じ lazy eviction)。
     pub(crate) comic_generation: u64,
-    /// 注釈描画用フォントセット (遅延ロード、Arc 共有)。`comic_fonts_loaded` が false の間
-    /// だけ既定フォント (COMIC_FONT_KEY="ui") をロードする。追加で参照されたフォント
-    /// (pack オノマトペ / ユーザー選択フォント) は `ensure_comic_fonts_for` が
-    /// 必要に応じて差し込み再構築する (Inc 4c)。
-    pub(crate) comic_fonts: Option<Arc<comic_core::FontSet>>,
-    pub(crate) comic_fonts_loaded: bool,
-    /// 現在 `comic_fonts` (FontSet) に parse 済みのフォントキー集合。既定 "ui" 以外で
-    /// 何が読み込み済みかを追跡し、`ensure_comic_fonts_for` が「未ロードの参照フォントが
-    /// あるか」を O(1) で判定して不要な再構築を避ける (Inc 4c)。
-    pub(crate) comic_loaded_font_keys: std::collections::HashSet<String>,
+    /// App-wide annotation fonts and their speculative loader.
+    pub(crate) comic_fonts: comic_fonts::ComicFontOwner,
     /// 注釈フォントの列挙結果 (ピッカー一覧、表示名→パス)。`comic_font_registry_loaded`
     /// が false の間だけ 1 度列挙する。pack 導入 / 削除で invalidate される (Inc 4c)。
     pub(crate) comic_available_fonts: Vec<crate::font_assets::FontAsset>,
@@ -20064,6 +20412,7 @@ impl App {
             crate::startup_result(miv_startup::Stage::AppDbOpen, "view_trim_db", || {
                 crate::view_trim_db::ViewTrimDb::open()
             })
+            .map_err(|error| crate::logger::log(format!("view_trim.db open failed: {error}")))
             .ok();
         crate::perf::emit_ms("startup", "db_open_view_trim", 0, t);
         let content_identity_fallback_io_sem =
@@ -20388,6 +20737,8 @@ impl App {
             items: Vec::new(),
             projection_recipe: Default::default(),
             page_identity_index: Default::default(),
+            page_overview: crate::page_overview::PageOverviewState::Closed,
+            page_overview_incarnation: 0,
             item_id_interner: std::cell::RefCell::default(),
             texture_identity: std::cell::RefCell::default(),
             passthrough_unavailable: None,
@@ -20454,6 +20805,7 @@ impl App {
             keep_start_shared: Arc::new(AtomicUsize::new(0)),
             keep_end_shared: Arc::new(AtomicUsize::new(0)),
             folder_nav_pending: None,
+            list_order: None,
             folder_pane_open_pending: None,
             pending_folder_nav_steps: 0,
             pending_folder_nav_mode: FolderNavMode::Grid,
@@ -20517,7 +20869,7 @@ impl App {
                 crate::ui_fullscreen::FullscreenNavigatorInteractionOwner::default(),
             fs_margin_bbox_cache: std::collections::HashMap::new(),
             view_trim_mode: false,
-            view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode::default(),
+            view_trim_book_preference: crate::view_trim::ViewTrimBookPreference::default(),
             view_trim_page_apply_root_idx: None,
             view_trim_page_spread_separate: false,
             view_trim_book_settings: crate::view_trim::ViewTrimBookSettings::default(),
@@ -20558,6 +20910,7 @@ impl App {
             items_are_global_search_view: false,
             empty_items_reason: None,
             items_are_tag_view: false,
+            tag_view_applied_times: Default::default(),
             items_are_reading_history_view: false,
             items_are_bookmark_view: false,
             items_are_rating_view: false,
@@ -20717,6 +21070,7 @@ impl App {
             export_dialog: None,
             export_batch_dialog: None,
             export_pending: None,
+            edited_clipboard_copy: None,
             folder_refresh_pending: None,
             pinned_compare_slot: None,
             compare_view_mode: CompareViewMode::Off,
@@ -21220,7 +21574,7 @@ impl App {
             sns_split: None,
             sns_split_drag: None,
             sns_split_spread_ctx: None,
-            adjust_spread_target: AdjustSpreadTarget::Left,
+            adjust_spread_target: None,
             adjust_scope_selection: AdjustScopeSelection::Standard,
             adjust_scope_selection_idx: None,
             adjustment_page_params: std::collections::HashMap::new(),
@@ -21478,9 +21832,7 @@ impl App {
             comic_bake_pending: std::collections::HashMap::new(),
             comic_bake_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             comic_generation: 0,
-            comic_fonts: None,
-            comic_fonts_loaded: false,
-            comic_loaded_font_keys: std::collections::HashSet::new(),
+            comic_fonts: comic_fonts::ComicFontOwner::default(),
             comic_available_fonts: Vec::new(),
             comic_font_paths: std::collections::HashMap::new(),
             comic_font_registry_loaded: false,
@@ -21543,7 +21895,9 @@ impl App {
             comic_undo_key: None,
             comic_tail_stash: std::collections::HashMap::new(),
             erase_preview_active: false,
+            erase_preview_hold: Default::default(),
             conceal_preview_active: false,
+            conceal_preview_hold: Default::default(),
             conceal_preview_button_rect: None,
             erase_base_tex_cache: std::collections::HashMap::new(),
             fs_nav_locked_gen: None,
@@ -22893,6 +23247,7 @@ impl App {
     // Ctrl+G UI 実装 (後続コミット) で使用。現状は API 先行追加。
     #[allow(dead_code)]
     pub(crate) fn push_grid_item_pending(&mut self, item: GridItem) -> usize {
+        self.close_page_overview();
         let idx = self.items.len();
         self.items.push(item);
         self.thumbnails.push(ThumbnailState::Pending);
@@ -24172,7 +24527,10 @@ impl App {
     }
 
     pub(crate) fn resolve_grid_parent_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
-        if let Some(nav) = self.collection_grid_parent_nav() {
+        if let Some((nav, selection)) = self.collection_grid_parent_navigation() {
+            if selection.is_some() {
+                self.select_after_load = selection;
+            }
             return Some(nav);
         }
         if let Some(nav) = self.bookmark_view_back_nav() {
@@ -28167,22 +28525,18 @@ impl App {
         key: &std::path::Path,
         fallback: Option<&std::path::Path>,
     ) {
-        let state = self
-            .view_trim_db
-            .as_ref()
-            .and_then(|db| db.get_book_state(key))
-            .or_else(|| {
-                fallback.and_then(|fb| {
-                    self.view_trim_db
-                        .as_ref()
-                        .and_then(|db| db.get_book_state(fb))
-                })
-            })
-            .unwrap_or_default();
-        self.view_trim_apply_mode = match state.apply_mode {
-            crate::view_trim::ViewTrimApplyMode::Page => crate::view_trim::ViewTrimApplyMode::None,
-            mode => mode,
-        };
+        let loaded = self.view_trim_db.as_ref().map_or_else(
+            || {
+                crate::view_trim_db::ViewTrimBookLoad::Error(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                    Some("view_trim.db を利用できません".to_string()),
+                ))
+            },
+            |db| db.load_book_preference_with_fallback(key, fallback),
+        );
+        self.notify_view_trim_load_failure(&loaded);
+        let state = loaded.state_or_default();
+        self.view_trim_book_preference = state.preference;
         self.view_trim_book_settings = state.book_settings;
         self.view_trim_page_apply_root_idx = None;
         self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
@@ -28191,33 +28545,57 @@ impl App {
             self.settings.fullscreen_fit_mode,
             crate::settings::FullscreenFitMode::MarginFit
         ) || self.settings.margin_fit_enabled;
-        if legacy_margin_fit {
+        if legacy_margin_fit
+            && !matches!(
+                loaded,
+                crate::view_trim_db::ViewTrimBookLoad::Invalid(_)
+                    | crate::view_trim_db::ViewTrimBookLoad::Error(_)
+            )
+        {
             self.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Page;
             self.settings.margin_fit_enabled = false;
-            if matches!(
-                self.view_trim_apply_mode,
-                crate::view_trim::ViewTrimApplyMode::None
-            ) {
-                self.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
-            }
             self.settings.save();
-            if let Some(db) = &self.view_trim_db {
+            if loaded.allows_legacy_margin_fit_migration() {
+                self.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Auto;
                 let migrated = crate::view_trim::ViewTrimBookState {
-                    apply_mode: self.view_trim_apply_mode,
+                    preference: self.view_trim_book_preference,
                     book_settings: self.view_trim_book_settings,
                 };
                 if let Some(service) = &self.book_composition_service {
                     let _ = service.save_view_trim(crate::view_trim_db::ViewTrimWriteBatch {
-                        book: Some((key.to_owned(), migrated)),
+                        book: Some((
+                            key.to_owned(),
+                            fallback.map(std::path::Path::to_owned),
+                            migrated,
+                        )),
                         pages: vec![],
                     });
-                } else if let Err(err) = db.set_book_state(key, migrated) {
-                    crate::logger::log(format!(
-                        "view_trim: failed to migrate legacy margin fit for book: {err}"
-                    ));
+                } else if let Some(db) = &self.view_trim_db {
+                    if let Err(err) = db.set_book_state(key, fallback, migrated) {
+                        crate::logger::log(format!(
+                            "view_trim: failed to migrate legacy margin fit for book: {err}"
+                        ));
+                    }
                 }
             }
         }
+    }
+
+    pub(crate) fn notify_view_trim_load_failure(
+        &mut self,
+        loaded: &crate::view_trim_db::ViewTrimBookLoad,
+    ) {
+        let error = match loaded {
+            crate::view_trim_db::ViewTrimBookLoad::Invalid(error) => error.to_string(),
+            crate::view_trim_db::ViewTrimBookLoad::Error(error) => error.to_string(),
+            _ => return,
+        };
+        crate::logger::log(format!(
+            "view_trim: failed to load book preference: {error}"
+        ));
+        self.show_feedback_toast(
+            "表示トリムの設定を読み込めないため、トリムなしで表示しています".to_string(),
+        );
     }
 
     pub(crate) fn persist_current_view_trim_book_state(&mut self) {
@@ -28227,21 +28605,19 @@ impl App {
         if !self.admit_book_append_followup_mutation() {
             return;
         }
-        let (Some(db), Some(key)) = (&self.view_trim_db, self.spread_container_key()) else {
+        let (Some(db), Some(key)) = (
+            &self.view_trim_db,
+            self.spread_container_key_with_fallback(),
+        ) else {
             return;
         };
         let state = crate::view_trim::ViewTrimBookState {
-            apply_mode: match self.view_trim_apply_mode {
-                crate::view_trim::ViewTrimApplyMode::Page => {
-                    crate::view_trim::ViewTrimApplyMode::None
-                }
-                mode => mode,
-            },
+            preference: self.view_trim_book_preference,
             book_settings: self.view_trim_book_settings,
         };
         if let Some(service) = &self.book_composition_service {
             let receipt = service.save_view_trim(crate::view_trim_db::ViewTrimWriteBatch {
-                book: Some((key, state)),
+                book: Some((key.exact, key.fallback, state)),
                 pages: vec![],
             });
             if let Ok(Err(error)) = receipt.try_recv() {
@@ -28253,7 +28629,7 @@ impl App {
             }
             return;
         }
-        if let Err(err) = db.set_book_state(&key, state) {
+        if let Err(err) = db.set_book_state(&key.exact, key.fallback.as_deref(), state) {
             crate::logger::log(format!("view_trim: failed to save book state: {err}"));
         } else {
             self.record_current_container_content_identity(
@@ -28506,7 +28882,7 @@ impl App {
         self.fs_upload_backlog.clear();
         self.fs_pending.clear();
         self.input_generation.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::ItemsChanged);
         self.clear_color_filter_for_new_items();
         self.current_color_cache_map = None;
         self.current_color_catalog = None;
@@ -29560,12 +29936,6 @@ impl App {
             self.show_snapshot_out_of_scope_open_feedback();
             return FolderOpenOutcome::Ignored;
         }
-        if matches!(owner, OpenRequestOwner::Navigation)
-            && self.main_folder_history_available()
-            && self.restore_smart_folder_for_synthetic_path(&path)
-        {
-            return FolderOpenOutcome::Loaded;
-        }
         if Self::path_needs_open_classification(&path) {
             return match self.start_open_path_classification_at_stage(
                 path.clone(),
@@ -29705,6 +30075,20 @@ impl App {
         if !self.snapshot_scope_allows_open(&path, &owner) {
             self.reject_snapshot_out_of_scope_open();
             return FolderOpenOutcome::Ignored;
+        }
+        // Direct input and immediate fullscreen close share this dispatcher. A Smart root
+        // is a view identity, never a directory to scan (including failed restoration).
+        if matches!(owner, OpenRequestOwner::Navigation)
+            && self.main_folder_history_available()
+            && smart_folder::is_smart_folder_synthetic_path(&path)
+        {
+            return if self
+                .restore_smart_folder_for_synthetic_path_with_navigation(&path, navigation)
+            {
+                FolderOpenOutcome::Loaded
+            } else {
+                FolderOpenOutcome::Ignored
+            };
         }
         if classified_kind != Some(OpenPathKind::Directory)
             && let Some(reason) = self.pdf_open_refusal(&path)
@@ -33160,6 +33544,7 @@ impl App {
         }
         let fallback_origin = self.current_folder.clone();
         let transferred_origin = self.take_origin_for_search_entry(SearchMode::TagView);
+        self.reset_details_sort_to_toolbar();
         self.tag_view.active = true;
         self.tag_view.focus_request = focus_request;
         if let Some(origin) = transferred_origin {
@@ -33442,6 +33827,8 @@ impl App {
         self.tag_view.truncated = false;
         self.tag_view.reject_message = None;
         self.items_are_tag_view = false;
+        self.tag_view_applied_times.clear();
+        self.reset_details_sort_if_hidden();
         let path = self.tag_view.saved_folder.take();
         let subfolder_restore = self.tag_view_subfolder_restore.take();
         let canonical = self.top_level_grid_view.take_return_origin();
@@ -33538,11 +33925,13 @@ impl App {
     }
 
     pub(crate) fn execute_tag_view(&mut self) {
-        if self.tag_view.query != self.tag_view.last_executed
-            || self.tag_view.kind_filter != self.tag_view.last_executed_kind_filter
-        {
-            self.retire_main_list_requests_for_surface_switch();
+        if !self.items_are_tag_view {
+            // 子フォルダからの戻りや履歴経由の再入場も、専用の並びを優先する。
+            self.reset_details_sort_to_toolbar();
         }
+        // 同じ検索語でのソート変更・再検索も、新しい結果一覧への明示要求。
+        // 子を開く準備と同じ置換境界を通し、先に受理した要求を退役させる。
+        self.retire_main_list_requests_for_surface_switch();
         self.tag_view.last_executed = self.tag_view.query.clone();
         self.tag_view.last_executed_kind_filter = self.tag_view.kind_filter;
         self.tag_view.reject_message = None;
@@ -33591,6 +33980,21 @@ impl App {
     }
 
     fn apply_tag_view_result(&mut self, mut result: crate::tag_view::TagViewResult) {
+        if !self.items_are_tag_view {
+            self.reset_details_sort_to_toolbar();
+        }
+        let retained_applied_at_sort = (self.items_are_tag_view
+            && self.settings.details_sort_key == crate::settings::DetailsSortKey::AppliedAt)
+            .then_some(self.settings.details_sort_ascending);
+        let applied_times = result
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .applied_at_ms
+                    .map(|time| (crate::tags_db::item_key_for_path(&entry.path), time))
+            })
+            .collect();
         self.video_thumb_overrides = std::mem::take(&mut result.video_thumb_overrides);
         result.entries.retain(|entry| {
             entry.kind != crate::tag_view::TagViewItemKind::PdfFile
@@ -33686,19 +34090,104 @@ impl App {
         {
             self.tag_view_subfolder_restore = Some(restore_state);
         }
-        self.start_loading_extracted_items(
-            book_materialization::ExtractedSurface::Search(
-                top_level_grid_view::TopLevelSearchView::Tag,
-            ),
-            search_results_synthetic_path(),
-            items,
-            image_metas,
-            existing_keys,
-            video_items,
-            None,
-        );
+        if self.items_are_tag_view {
+            // 同じ検索surfaceの再検索はsource-openではない。★一覧と同じ既存の
+            // identity転送で、待っている間に開いた画像・動画・音声も新しい位置へ渡す。
+            self.finish_rating_membership_edit_boundary();
+            let viewer = self.prepare_rating_membership_items_swap(&items);
+            let selected_key = self
+                .selected
+                .and_then(|idx| self.items.get(idx))
+                .map(GridItem::perf_key);
+            self.save_departing_session_grid_positions();
+            self.clear_page_edit_state();
+            self.bump_render_epoch_only();
+            self.install_new_items(items, image_metas);
+            self.items_are_tag_view = true;
+            self.projection_recipe = book_materialization::ProjectionRecipe::ExtractedResult(
+                book_materialization::ExtractedSurface::Search(
+                    top_level_grid_view::TopLevelSearchView::Tag,
+                ),
+            );
+            self.invalidate_idx_state_and_queues();
+            self.restart_thumbnail_workers_after_metadata_pin_refresh();
+            self.search_filter = None;
+            self.search_filter_origin_folder = None;
+            if let Some(pending) = self.search_pending.take() {
+                pending.cancel();
+            }
+            if let Some(pending) = self.metadata_pending.take() {
+                pending.cancel();
+            }
+            self.clear_tags_cache();
+            let selected = selected_key
+                .and_then(|key| self.items.iter().position(|item| item.perf_key() == key));
+            self.move_grid_cursor(selected, GridCursorIntent::Automatic);
+            self.prewarm_rating_cache();
+            self.prewarm_grid_tags();
+            // 動画は通常thumbnail queueの対象外。旧世代のworker結果を待たず、
+            // 従来の明示更新と同じく、全動画を既存workerへ新世代で渡す。
+            if !video_items.is_empty() {
+                let pin_blobs = self
+                    .video_pin_db
+                    .as_ref()
+                    .map(|db| db.lookup_webps_many(video_items.iter().map(|(_, path, _)| path)))
+                    .unwrap_or_default();
+                self.spawn_video_thread(
+                    self.tx.clone(),
+                    Arc::clone(&self.cancel_token),
+                    video_items,
+                    self.video_thumb_overrides.clone(),
+                    Arc::new(pin_blobs),
+                );
+            }
+            self.prepare_current_listing_page_identity_index(
+                self.settings.file_type_visibility.clone(),
+                None,
+            );
+            self.prepare_page_edits_for_current_virtual_items();
+            self.finish_rating_membership_viewer_swap(viewer);
+        } else {
+            self.start_loading_extracted_items(
+                book_materialization::ExtractedSurface::Search(
+                    top_level_grid_view::TopLevelSearchView::Tag,
+                ),
+                search_results_synthetic_path(),
+                items,
+                image_metas,
+                existing_keys,
+                video_items,
+                None,
+            );
+        }
         self.items_are_tag_view = true;
+        self.tag_view_applied_times = applied_times;
+        self.rebuild_visible_indices();
+        if let Some(ascending) = retained_applied_at_sort {
+            self.settings.details_sort_key = crate::settings::DetailsSortKey::AppliedAt;
+            self.settings.details_sort_ascending = ascending;
+        }
+        self.rebuild_details_order();
         self.address = format!("タグビュー: {}", self.tag_view.query.trim());
+    }
+
+    pub(crate) fn set_tag_view_sort(&mut self, sort: crate::tag_view::TagViewSort) {
+        if !self.items_are_tag_view || self.settings.tag_view_sort == sort {
+            return;
+        }
+        self.settings.tag_view_sort = sort;
+        self.settings.save();
+        self.execute_tag_view();
+    }
+
+    pub(crate) fn tag_view_applied_at_ms(&self, idx: usize) -> Option<i64> {
+        if !self.items_are_tag_view {
+            return None;
+        }
+        let path = self.items.get(idx)?.drag_source_path()?;
+        self.tag_view_applied_times
+            .get(&crate::tags_db::item_key_for_path(path))
+            .copied()
     }
 
     /// 検索コンテキスト中の Ctrl+↑↓ ナビゲーション。
@@ -34745,6 +35234,11 @@ impl App {
         }
         self.cancel_unresolved_open_for_navigation(explicit_request);
         self.retire_close_returns_for_main_admission();
+        // タグ結果の再検索中に子の open 等を受理したら、遅着した root 結果で
+        // 新しい行き先を上書きしない。タグ自身の採用時は poll が既に take 済み。
+        if let Some(pending) = self.tag_view_pending.take() {
+            pending.cancel();
+        }
         if retained != Some(MainListRequestOwner::Classification) {
             self.top_level_grid_view.set_open_path_classification(None);
         }
@@ -36478,16 +36972,10 @@ impl App {
         {
             FolderNavHistoryTarget::CollectionPhysical(
                 top_level_grid_view::CollectionGridPhysicalRestore {
-                    root: top_level_grid_view::CollectionGridRestore {
-                        identity: top_level_grid_view::CollectionGridIdentity {
-                            collection_id: collection.stamp.collection_id,
-                        },
-                        revision_at_open: collection
-                            .accepted_revision
-                            .max(collection.wanted_revision),
-                        viewport_anchor: Some(collection.anchor.clone()),
-                    },
-                    root_source_path: owner.source_path.clone(),
+                    root: collection
+                        .physical
+                        .restore(collection.physical.wanted_revision),
+                    root_source_path: collection.physical.root_source_path.clone(),
                     visible_path: request.path.clone(),
                 },
             )
@@ -36827,16 +37315,10 @@ impl App {
                 let collection = archive.collection_grid_owner.as_ref().unwrap();
                 FolderNavHistoryTarget::CollectionPhysical(
                     top_level_grid_view::CollectionGridPhysicalRestore {
-                        root: top_level_grid_view::CollectionGridRestore {
-                            identity: top_level_grid_view::CollectionGridIdentity {
-                                collection_id: collection.stamp.collection_id,
-                            },
-                            revision_at_open: collection
-                                .accepted_revision
-                                .max(collection.wanted_revision),
-                            viewport_anchor: Some(collection.anchor.clone()),
-                        },
-                        root_source_path: archive.source_path.clone(),
+                        root: collection
+                            .physical
+                            .restore(collection.physical.wanted_revision),
+                        root_source_path: collection.physical.root_source_path.clone(),
                         visible_path: path.to_path_buf(),
                     },
                 )
@@ -38242,6 +38724,7 @@ impl App {
         // start_loading_items で行う (二重にやらない)。
         self.save_leaving_folder_grid_position();
         self.retire_direct_media_reader_for_source_adoption();
+        self.close_page_overview();
         self.items.clear();
         self.thumbnails.clear();
         self.image_metas.clear();
@@ -42638,7 +43121,7 @@ impl App {
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
         self.edit_result_cache.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::ItemsChanged);
         self.cancel_all_local_adjust_pending();
         self.local_adjust_layer_bypass_cache.clear();
         self.local_adjust_prefix_preview_cache.clear();
@@ -42652,7 +43135,7 @@ impl App {
         self.erase_result_cache.clear();
         self.input_generation.clear();
         self.edit_result_cache.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::ItemsChanged);
         self.cancel_all_erase_inpaint_pending();
         // 360 度パノラマビュー: フォルダ変更で cache 全体が変わったので世代を一斉 bump
         // (§3.6.2.2)。adjustment_generation / ai_upscale_generation の HashMap
@@ -43384,8 +43867,23 @@ impl App {
         }
     }
 
+    fn close_page_overview_if_reader_order_changed(&mut self) {
+        let changed = self.page_overview.session().is_some_and(|session| {
+            session.view().projection.reader_order().as_slice()
+                != crate::ui_helpers::still_image_display_indices(
+                    &self.items,
+                    self.current_reader_order(),
+                )
+                .as_slice()
+        });
+        if changed {
+            self.close_page_overview();
+        }
+    }
+
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
+            self.close_page_overview();
             self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
             self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
             // Retire this context's old request namespace, including unadopted images.
@@ -43513,6 +44011,7 @@ impl App {
         }
         self.persist_pending_view_trim_state();
         self.items = items;
+        self.tag_view_applied_times.clear();
         self.projection_recipe = Default::default();
         self.image_metas = image_metas;
         self.thumb_edit_preview_keys.clear();
@@ -45602,7 +46101,7 @@ impl App {
         self.local_adjust_layer_bypass_cache.clear();
         self.local_adjust_prefix_preview_cache.clear();
         self.edit_result_cache.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::PageEditsReplaced);
         self.export_crop_mode = false;
         self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::ModeExit);
         self.export_crop_spread_ctx = None;
@@ -47380,6 +47879,8 @@ impl App {
         self.retain_tags_cache(|key| !matches_key(key));
         self.folder_pin_map.retain(|key, _| !matches_key(key));
         self.rating_view_rows.retain(|row| !matches_key(&row.key));
+        self.tag_view_applied_times
+            .retain(|key, _| !matches_key(key));
         if self
             .fullscreen_video_marker_cache
             .as_ref()
@@ -48340,7 +48841,7 @@ impl App {
             self.cancel_all_local_adjust_pending();
             self.cancel_all_erase_inpaint_pending();
             self.bump_all_adjustment_generations();
-            self.clear_all_final_pipeline_caches();
+            self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::VirtualPagesReprepared);
         }
         if virtual_page_reprepare {
             self.reprepare_page_edits_for_existing_virtual_order();
@@ -48407,13 +48908,9 @@ impl App {
             self.singleton_spread_endpoint_preferences =
                 container.singleton_spread_endpoint_preferences;
             self.page_alone_preferences = container.page_alone_preferences;
-            let trim = container.view_trim.unwrap_or_default();
-            self.view_trim_apply_mode = match trim.apply_mode {
-                crate::view_trim::ViewTrimApplyMode::Page => {
-                    crate::view_trim::ViewTrimApplyMode::None
-                }
-                mode => mode,
-            };
+            self.notify_view_trim_load_failure(&container.view_trim);
+            let trim = container.view_trim.state_or_default();
+            self.view_trim_book_preference = trim.preference;
             self.view_trim_book_settings = trim.book_settings;
             self.view_trim_page_apply_root_idx = None;
             self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
@@ -50389,6 +50886,7 @@ impl App {
         };
         let source_idx = pending.source_idx;
         let external_item_key = pending.external_item_key.clone();
+        let original_source = pending.original_source.clone();
         self.compare_pin_pending = None;
         self.compare_pin_load_pending = None;
         match result {
@@ -50417,6 +50915,7 @@ impl App {
                     &result.indicator_rgba,
                 );
                 self.pinned_compare_slot = Some(PinnedCompareSlot {
+                    original_source,
                     source_size: pixels.size,
                     pixels: Arc::new(pixels),
                     indicator_pixels: Arc::new(indicator_pixels),
@@ -50500,6 +50999,7 @@ impl App {
     pub(crate) fn poll_compare_prepare_pending(&mut self, ctx: &egui::Context) {
         let (pending, draining) = match &self.compare_preparation {
             ComparePreparationState::Preparing(pending) => (pending, false),
+            ComparePreparationState::PreparingOriginal { pending, .. } => (pending, false),
             ComparePreparationState::Draining(pending) => (pending, true),
             _ => return,
         };
@@ -50512,12 +51012,11 @@ impl App {
                 Err("比較表示の準備が中断されました".to_string())
             }
         };
-        let pending = match std::mem::replace(
-            &mut self.compare_preparation,
-            ComparePreparationState::Unprepared,
-        ) {
+        // 完了を受信済みなので、この take は実行中 worker の所有を落とさない。
+        let (pending, original_pair) = match std::mem::take(&mut self.compare_preparation) {
             ComparePreparationState::Preparing(pending)
-            | ComparePreparationState::Draining(pending) => pending,
+            | ComparePreparationState::Draining(pending) => (pending, None),
+            ComparePreparationState::PreparingOriginal { pair, pending } => (pending, Some(pair)),
             _ => unreachable!(),
         };
         let request = pending.request;
@@ -50527,6 +51026,48 @@ impl App {
             crate::logger::log(
                 "[compare-memory] stage=worker-result-drained reason=source-invalidated old_pair_release=before_next_worker",
             );
+            ctx.request_repaint();
+            return;
+        }
+
+        // PinnedNormal を非表示にした場合も結果を保持する。active_output の検査より先に回収。
+        // pair を捨てる操作は全て invalidate() で Draining へ移している。
+        if let Some(mut pair) = original_pair {
+            let result = result.and_then(|result| {
+                if pending.key != pair.key
+                    || result.key != pair.key
+                    || result.current_idx != request.current_idx
+                    || result.pinned_source_idx != request.pinned_source_idx
+                    || pair.current_idx != request.current_idx
+                    || pair.pinned_source_idx != request.pinned_source_idx
+                    || pair.pixels.output() != request.output
+                    || [result.width as usize, result.height as usize] != pair.target_size
+                    || pending.expected_target_size != pair.target_size
+                    || result.pixels.output() != request.output
+                    || !result.pixels.valid_for_size(pair.target_size)
+                {
+                    return Err("比較元画像の結果が要求と一致しません".to_string());
+                }
+                Ok(result.pixels)
+            });
+            pair.original = match result {
+                Ok(pixels) => {
+                    let key = self.next_compare_prepared_key();
+                    CompareOriginalVariant::Ready(CompareOriginalPixels {
+                        key,
+                        pixels,
+                        pinned_texture: None,
+                        current_texture: None,
+                        diff_texture: None,
+                    })
+                }
+                Err(err) => {
+                    crate::logger::log(format!("compare original prepare failed: {err}"));
+                    self.show_feedback_warning(format!("比較元画像を準備できません: {err}"));
+                    CompareOriginalVariant::Failed
+                }
+            };
+            self.compare_preparation = ComparePreparationState::Ready(pair);
             ctx.request_repaint();
             return;
         }
@@ -50550,7 +51091,8 @@ impl App {
 
         match result {
             Ok(result) => {
-                if result.current_idx != request.current_idx
+                if result.key != pending.key
+                    || result.current_idx != request.current_idx
                     || result.pinned_source_idx != request.pinned_source_idx
                 {
                     return;
@@ -50610,11 +51152,10 @@ impl App {
                     result.pixels.allocated_bytes(),
                     result.pixels.buffer_count(),
                 ));
-                let key = self.compare_prepared_next_key;
-                self.compare_prepared_next_key =
-                    self.compare_prepared_next_key.wrapping_add(1).max(1);
                 self.compare_preparation = ComparePreparationState::Ready(ComparePreparedPair {
-                    key,
+                    key: pending.key,
+                    current_geometry: pending.current_geometry,
+                    original: CompareOriginalVariant::Absent,
                     current_idx: result.current_idx,
                     pinned_source_idx: result.pinned_source_idx,
                     current_input_size: pending.current_input_size,
@@ -51519,6 +52060,13 @@ impl App {
     }
 
     fn current_bookmark_panel_thumbnail_pages(&mut self) -> Vec<usize> {
+        // An inactive consumer owns no demand; resolving its spread can read cold rotations.
+        if !self.adjustment_mode.is_open()
+            || self.settings.fullscreen_left_panel_tab
+                != crate::settings::FullscreenLeftPanelTab::Bookmarks
+        {
+            return Vec::new();
+        }
         let Some(fs_idx) = self.fullscreen_idx else {
             return Vec::new();
         };
@@ -51527,10 +52075,7 @@ impl App {
             self.resolve_visible_spread_pair(fs_idx),
             crate::ui_fullscreen::SpreadPair::Double { .. }
         );
-        if !self.fullscreen_adjustment_panel_draw_reachable(fs_idx, is_video, is_spread_double)
-            || self.settings.fullscreen_left_panel_tab
-                != crate::settings::FullscreenLeftPanelTab::Bookmarks
-        {
+        if !self.fullscreen_adjustment_panel_draw_reachable(fs_idx, is_video, is_spread_double) {
             return Vec::new();
         }
         // Image-folder eligibility scans every materialized item. Repeating that scan in the
@@ -54005,6 +54550,44 @@ impl App {
         }
     }
 
+    /// Install worker-prepared resources only for a Search whose mounted context has no pool.
+    /// The ordinary context token/channel own the pool and the existing load/exit cancels it.
+    pub(crate) fn install_missing_search_thumbnail_workers(
+        &mut self,
+        cache_map: Arc<std::sync::RwLock<HashMap<String, crate::catalog::CacheEntry>>>,
+        catalog: Option<Arc<crate::catalog::CatalogDb>>,
+    ) {
+        if self.reload_queue.is_some() {
+            return;
+        }
+        debug_assert!(self.heavy_io_queue.is_none());
+        self.cache_gen_total = 0;
+        self.cache_gen_done = Arc::new(AtomicUsize::new(0));
+        if let Some(catalog) = catalog.as_ref()
+            && self
+                .current_color_catalog
+                .as_ref()
+                .is_none_or(|existing| !Arc::ptr_eq(existing, catalog))
+        {
+            self.cache_preopened_catalog(&search_results_synthetic_path(), Arc::clone(catalog));
+        }
+        self.current_color_cache_map = Some(Arc::clone(&cache_map));
+        self.current_color_catalog = catalog.clone();
+        let reload_queue: Arc<NotifyQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let heavy_io_queue: Arc<NotifyQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        self.reload_queue = Some(Arc::clone(&reload_queue));
+        self.heavy_io_queue = Some(Arc::clone(&heavy_io_queue));
+        self.spawn_thumbnail_workers(
+            &self.tx,
+            Arc::clone(&self.cancel_token),
+            reload_queue,
+            heavy_io_queue,
+            cache_map,
+            catalog,
+            self.folder_thumb_pin_db.clone(),
+        );
+    }
+
     /// 永続サムネイルワーカープールを `parallelism.thread_count()` 個 spawn する。
     /// 各ワーカーは `reload_queue` を `scroll_hint` 優先度で消費し続け、
     /// `cancel` が立つまで動作する。
@@ -54974,6 +55557,140 @@ impl App {
         self.details_thumb_suppression_applied = self.keep_set.is_empty();
     }
 
+    /// Transient canonical grid band; shared by normal bookkeeping and foreground demand.
+    fn grid_thumbnail_retention_geometry(
+        &self,
+        ctx: &egui::Context,
+    ) -> GridThumbnailRetentionGeometry {
+        let cols = self.settings.grid_cols.max(1);
+        // 極端に小さい cell_h (1〜数 px) では `viewport_h / cell_h` が数千行に膨れて
+        // keep_set が数万 idx に達し、下流の make_load_request / texture_backlog で
+        // UI スレッドが固まる。render_grid 側の MIN_CELL_PX=32 と揃える。
+        let cell_h = self.last_cell_h.max(32.0);
+        let viewport_h = self.last_viewport_h.max(cell_h);
+
+        let rows_per_page = (viewport_h / cell_h).ceil() as usize;
+        let items_per_page = (rows_per_page * cols).max(1);
+        // 設計: prefetch / eviction 対象は「display list = visible_indices の一部」を
+        // そのまま使い、raw idx の連続範囲には**絶対に潰さない**。
+        // `visible_indices` が★フィルタや Ctrl+F で疎になったとき、raw range で扱うと
+        // 非可視 idx を大量 (フォルダ 1300 件中 3 件表示 → 991 件の非可視) に enqueue
+        // してしまう。詳細は docs/async-architecture.md「display list vs filesystem list」。
+        let vis_count = self.visible_indices.len();
+        // スクロール位置が vis_count を超えるとき (フィルタ直後の縮退ケース) は末尾に寄せる。
+        // さらに vis_count=0 は冒頭で早期 return 済みなのでここでは 1 以上。
+        let vis_first_raw = (self.scroll_offset_y / cell_h) as usize * cols;
+        let grid_vis_first = vis_first_raw.min(vis_count.saturating_sub(1));
+        let vis_first = thumbnail_retention_anchor_position(
+            &self.visible_indices,
+            grid_vis_first,
+            self.fullscreen_idx,
+        );
+        let fractional_drag_y = crate::ui_main::root_grid_touch_scroll_remainder(
+            ctx,
+            self.scroll_offset_y,
+            cell_h,
+            self.items_generation,
+        );
+        let strict_visible_end = crate::ui_main::extend_grid_end_for_touch_fraction(
+            vis_first.saturating_add(items_per_page),
+            cols,
+            vis_count,
+            fractional_drag_y,
+        );
+        let strict_visible_items = strict_visible_end.saturating_sub(vis_first);
+
+        let prev_pages = self.settings.thumb_prev_pages as usize;
+        let next_pages = self.settings.thumb_next_pages as usize;
+
+        let vis_keep_start = vis_first.saturating_sub(prev_pages * items_per_page);
+        let mut vis_keep_end = vis_first
+            .saturating_add((1 + next_pages) * items_per_page)
+            .min(vis_count);
+        vis_keep_end = crate::ui_main::extend_grid_end_for_touch_fraction(
+            vis_keep_end,
+            cols,
+            vis_count,
+            fractional_drag_y,
+        );
+
+        // ── 共有 VRAM pool: サムネイル保持帯 ───────────────────────────
+        // モード別のサムネイル配分を超えている場合だけ、実 texture 寸法と TextureId
+        // 重複排除で保持帯を縮める。未ロード項目は 0 texel なので先読み要求自体は許可し、
+        // texture が載った後の次フレームで自然に配分へ収束する。現在位置は常に残す。
+        let mut vis_keep_start_capped = vis_keep_start;
+        let budget = self.vram_pool_budget();
+        if let Some(cap_bytes) = budget.thumbnail_bytes {
+            let cap_texels = crate::vram_budget::rgba8_bytes_to_texels(cap_bytes);
+            let desired = vis_keep_end.saturating_sub(vis_keep_start);
+            if desired > 0 {
+                let texture_texels_for_bounds = |start: usize, end: usize| {
+                    let indices = self
+                        .visible_indices
+                        .get(start..end)
+                        .unwrap_or(&[])
+                        .iter()
+                        .copied()
+                        .collect::<HashSet<_>>();
+                    self.thumbnail_texture_texels_for_indices(&indices)
+                };
+                let desired_texels = texture_texels_for_bounds(vis_keep_start, vis_keep_end);
+                if desired_texels > cap_texels {
+                    let mut chosen =
+                        thumbnail_keep_bounds_for_count(vis_keep_start, vis_keep_end, vis_first, 1);
+                    let mut low = 1usize;
+                    let mut high = desired;
+                    while low <= high {
+                        let count = low + (high - low) / 2;
+                        let bounds = thumbnail_keep_bounds_for_count(
+                            vis_keep_start,
+                            vis_keep_end,
+                            vis_first,
+                            count,
+                        );
+                        if count == 1 || texture_texels_for_bounds(bounds.0, bounds.1) <= cap_texels
+                        {
+                            chosen = bounds;
+                            low = count.saturating_add(1);
+                        } else {
+                            high = count.saturating_sub(1);
+                        }
+                    }
+                    vis_keep_start_capped = chosen.0;
+                    vis_keep_end = chosen.1;
+                    crate::logger::log(format!(
+                        "  VRAM thumbnail band reduced: mode={} desired={} kept={} \
+                         loaded={} MiB cap={} MiB",
+                        self.vram_budget_mode().as_str(),
+                        desired,
+                        vis_keep_end.saturating_sub(vis_keep_start_capped),
+                        crate::vram_budget::rgba8_texels_to_bytes(desired_texels) / (1024 * 1024),
+                        cap_bytes / (1024 * 1024),
+                    ));
+                }
+            }
+        }
+        if crate::ui_main::grid_touch_fraction_is_visible(fractional_drag_y) {
+            // The fractional viewport exposes this whole extra row. Even when
+            // the VRAM band is capped, do not evict the row currently peeking
+            // in at the bottom of the touch-dragged grid.
+            vis_keep_start_capped = vis_keep_start_capped.min(vis_first);
+            vis_keep_end = vis_keep_end.max(strict_visible_end);
+        }
+
+        GridThumbnailRetentionGeometry {
+            cols,
+            items_per_page,
+            vis_count,
+            vis_first,
+            fractional_drag_y,
+            strict_visible_end,
+            strict_visible_items,
+            vis_keep_start_capped,
+            vis_keep_end,
+        }
+    }
+
     fn install_thumbnail_keep_projection(
         &mut self,
         projection: ThumbnailKeepProjection,
@@ -55046,6 +55763,14 @@ impl App {
             // Keep departure discards only images. A running source still owns its save terminal.
             self.requested.discard_images_outside(&self.keep_set);
             for (idx, request_id) in locally_canceled {
+                if self.page_overview.session().is_some() {
+                    crate::logger::log(format!(
+                        "[page-overview-demand] stage=Prune context={} items_generation={} idx={idx} request_id={request_id:?} reason={:?}",
+                        self.projected_viewer_context_id().serial(),
+                        self.items_generation,
+                        PriorityThumbnailAdmission::PrunedOutsideKeep
+                    ));
+                }
                 self.requested.cancel_queued(idx, request_id);
             }
         }
@@ -55157,12 +55882,58 @@ impl App {
     ///
     /// `keep_range` はグリッド worker の安価な bounding box のまま維持する。遠いページを
     /// hover しても 0..N の巨大な range にせず、priority request だけが range を迂回する。
-    fn clear_still_seek_thumbnail_requests(&mut self) {
+    pub(crate) fn clear_still_seek_thumbnail_requests(&mut self) {
+        if self.page_overview.session().is_some() {
+            return; // The strip is not the foreground consumer in this mode.
+        }
+        self.withdraw_foreground_thumbnail_requests();
+    }
+
+    /// Withdraw only this mounted owner's demand; parked overview metadata remains Open.
+    pub(in crate::app) fn withdraw_foreground_thumbnail_requests(&mut self) {
         self.rotation_cache.cancel_still_seek_rotations();
         self.still_seek_thumbnail_pages.clear();
         if let Ok(mut shared) = self.still_seek_thumbnail_pages_shared.write() {
             shared.clear();
         }
+        self.reconcile_foreground_thumbnail_keep_owners(None);
+    }
+
+    pub(crate) fn reconcile_foreground_thumbnail_keep_owners(
+        &mut self,
+        ctx: Option<&egui::Context>,
+    ) {
+        if self.sidecar_restore_active() || self.delete_pending.is_some() {
+            return;
+        }
+        let detached = self.viewer_session_is_detached();
+        let details = self.settings.grid_view_mode == crate::settings::GridViewMode::Details;
+        let grid_pages = if detached || details {
+            Vec::new()
+        } else {
+            // Mutation-only closes without a UI context use the existing mutation/frame boundary.
+            let Some(ctx) = ctx else {
+                return;
+            };
+            let band = self.grid_thumbnail_retention_geometry(ctx);
+            self.visible_indices
+                .get(band.vis_keep_start_capped..band.vis_keep_end)
+                .unwrap_or(&[])
+                .to_vec()
+        };
+        let projection = thumbnail_keep_projection(
+            self.items.len(),
+            grid_pages,
+            self.current_navigation_thumbnail_pages(),
+            details.then_some(self.details_hover_thumb_idx).flatten(),
+            self.current_bookmark_panel_thumbnail_pages(),
+            self.still_seek_thumbnail_pages.iter().copied(),
+        );
+        self.install_thumbnail_keep_projection(projection, true);
+        crate::thumb_loader::cancel_raw_thumb_tickets_outside_keep(
+            &self.raw_thumb_develop,
+            &self.keep_set,
+        );
     }
 
     pub(crate) fn ensure_still_seek_thumbnail_requests(
@@ -55170,29 +55941,97 @@ impl App {
         ctx: &egui::Context,
         pages: &[usize],
     ) {
+        self.ensure_foreground_thumbnail_requests(
+            ctx,
+            pages,
+            ViewerForegroundThumbnailConsumer::Seek,
+        );
+    }
+
+    /// Gallery uses the same context-stamped thumbnail admission and PDF promotion as the strip.
+    pub(crate) fn ensure_page_overview_requests(&mut self, ctx: &egui::Context, pages: &[usize]) {
+        self.ensure_foreground_thumbnail_requests(
+            ctx,
+            pages,
+            ViewerForegroundThumbnailConsumer::PageOverview,
+        );
+    }
+
+    /// One dispatcher selects the current consumer, so a hidden strip cannot withdraw overview demand.
+    fn ensure_foreground_thumbnail_requests(
+        &mut self,
+        ctx: &egui::Context,
+        pages: &[usize],
+        consumer: ViewerForegroundThumbnailConsumer,
+    ) {
+        let overview = consumer == ViewerForegroundThumbnailConsumer::PageOverview;
+        if overview != self.page_overview.session().is_some() {
+            if overview {
+                self.trace_page_overview_thumbnail_demand(
+                    ctx,
+                    pages
+                        .iter()
+                        .map(|&idx| (idx, PriorityThumbnailAdmission::InactiveConsumer))
+                        .collect(),
+                );
+            }
+            return;
+        }
+        if overview {
+            // The overview replaces the seek overlay, including its completion consumer.
+            // Drain this mounted owner's existing worker before restarting reads or projecting
+            // Loaded pixels; an unknown rotation must not remain a permanent placeholder.
+            self.poll_still_seek_rotations();
+        }
         if pages.is_empty() {
             self.rotation_cache.cancel_still_seek_rotations();
         }
-        let next = pages
+        // Keep the caller's visible-first order; the set only owns exact demand membership.
+        let mut next = HashSet::new();
+        let request_pages = pages
             .iter()
             .copied()
-            .filter(|idx| *idx < self.items.len())
-            .collect::<HashSet<_>>();
+            .filter(|idx| *idx < self.items.len() && next.insert(*idx))
+            .collect::<Vec<_>>();
         if self.still_seek_thumbnail_pages != next {
             self.still_seek_thumbnail_pages = next;
             if let Ok(mut shared) = self.still_seek_thumbnail_pages_shared.write() {
                 shared.clone_from(&self.still_seek_thumbnail_pages);
             }
+            self.reconcile_foreground_thumbnail_keep_owners(Some(ctx));
         }
-        self.keep_set
-            .extend(self.still_seek_thumbnail_pages.iter().copied());
-        let request_pages = self
-            .still_seek_thumbnail_pages
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-        for idx in request_pages.iter().copied() {
-            self.enqueue_priority_thumbnail(idx);
+        let enqueue_started = std::time::Instant::now();
+        let mut new_requests = 0usize;
+        let mut admissions = Vec::new();
+        for (offset, idx) in request_pages.iter().copied().enumerate() {
+            if overview {
+                if !matches!(
+                    self.items.get(idx),
+                    Some(GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. })
+                ) {
+                    admissions.push((idx, PriorityThumbnailAdmission::UnsupportedOverviewItem));
+                    continue;
+                }
+                if new_requests >= 32
+                    || enqueue_started.elapsed() >= std::time::Duration::from_millis(2)
+                {
+                    admissions.extend(
+                        request_pages[offset..]
+                            .iter()
+                            .map(|&idx| (idx, PriorityThumbnailAdmission::FrameBudget)),
+                    );
+                    break;
+                }
+            }
+            let existed = self.requested.contains_key(&idx);
+            let admission = self.enqueue_priority_thumbnail(idx);
+            if overview {
+                admissions.push((idx, admission));
+            }
+            new_requests += usize::from(!existed && self.requested.contains_key(&idx));
+        }
+        if overview {
+            self.trace_page_overview_thumbnail_demand(ctx, admissions);
         }
         let pdf_keys = request_pages
             .iter()
@@ -55207,10 +56046,22 @@ impl App {
         if !pdf_keys.is_empty() {
             self.promote_viewer_pdf_keys(pdf_keys);
         }
-        if request_pages
-            .iter()
-            .any(|idx| self.requested.contains_key(idx))
-        {
+        if request_pages.iter().any(|idx| {
+            self.requested.contains_key(idx)
+                || (overview
+                    && matches!(
+                        self.items.get(*idx),
+                        Some(
+                            GridItem::Image(_)
+                                | GridItem::ZipImage { .. }
+                                | GridItem::PdfPage { .. }
+                        )
+                    )
+                    && matches!(
+                        self.thumbnails.get(*idx),
+                        Some(ThumbnailState::Pending | ThumbnailState::Evicted)
+                    ))
+        }) {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
         if self.settings.grid_view_mode == crate::settings::GridViewMode::Details {
@@ -55222,21 +56073,24 @@ impl App {
         self.enqueue_priority_thumbnail(idx);
     }
 
-    fn enqueue_priority_thumbnail(&mut self, idx: usize) {
+    fn enqueue_priority_thumbnail(&mut self, idx: usize) -> PriorityThumbnailAdmission {
         // The current items generation has no live thumbnail workers until the sidecar recovery
         // continuation creates fresh queues.  Enqueuing into the cancelled previous generation
         // would strand `requested[idx]` and prevent the first-display worker from retrying it.
         if self.sidecar_restore_active() {
-            return;
+            return PriorityThumbnailAdmission::SidecarRestore;
         }
         if self.requested.contains_key(&idx) {
-            return;
+            return PriorityThumbnailAdmission::AlreadyRequested;
         }
         let Some(state) = self.thumbnails.get(idx) else {
-            return;
+            return PriorityThumbnailAdmission::MissingState;
         };
-        if !matches!(state, ThumbnailState::Pending | ThumbnailState::Evicted) {
-            return;
+        match state {
+            ThumbnailState::Loaded { .. } => return PriorityThumbnailAdmission::Loaded,
+            ThumbnailState::NoArt => return PriorityThumbnailAdmission::NoArt,
+            ThumbnailState::Failed => return PriorityThumbnailAdmission::Failed,
+            ThumbnailState::Pending | ThumbnailState::Evicted => {}
         }
 
         let use_full_path_keys = self.use_full_path_cache_keys();
@@ -55259,7 +56113,7 @@ impl App {
                     matches!(self.items.get(idx), Some(GridItem::Audio(_))).then_some((0, 0))
                 })
             else {
-                return;
+                return PriorityThumbnailAdmission::MissingMetadata;
             };
             self.items.get(idx).and_then(|item| {
                 make_load_request_with_visibility(
@@ -55284,7 +56138,7 @@ impl App {
         };
 
         let Some(mut req) = req_opt else {
-            return;
+            return PriorityThumbnailAdmission::NoLoadRequest;
         };
         self.attach_edit_preview_to_request(&mut req);
         if !self.items_are_drive_list
@@ -55302,7 +56156,11 @@ impl App {
             self.reload_queue.clone()
         };
         let Some(queue_arc) = queue else {
-            return;
+            return if is_heavy {
+                PriorityThumbnailAdmission::MissingHeavyQueue
+            } else {
+                PriorityThumbnailAdmission::MissingReloadQueue
+            };
         };
         let edit_preview_epoch = self
             .edit_preview_cache
@@ -55314,7 +56172,7 @@ impl App {
             ThumbnailRequestKind::Normal,
             edit_preview_epoch,
         ) else {
-            return;
+            return PriorityThumbnailAdmission::ReservationRejected;
         };
         req.request_id = request_id;
         let (ref mtx, ref cvar) = *queue_arc;
@@ -55322,6 +56180,7 @@ impl App {
         q.push(req);
         drop(q);
         cvar.notify_one();
+        PriorityThumbnailAdmission::Enqueued
     }
 
     /// 段階 B: ページ単位先読み + eviction のメインロジック。
@@ -55425,121 +56284,17 @@ impl App {
         self.display_px_shared
             .store(current_display_px, Ordering::Relaxed);
 
-        let cols = self.settings.grid_cols.max(1);
-        // 極端に小さい cell_h (1〜数 px) では `viewport_h / cell_h` が数千行に膨れて
-        // keep_set が数万 idx に達し、下流の make_load_request / texture_backlog で
-        // UI スレッドが固まる。render_grid 側の MIN_CELL_PX=32 と揃える。
-        let cell_h = self.last_cell_h.max(32.0);
-        let viewport_h = self.last_viewport_h.max(cell_h);
-
-        let rows_per_page = (viewport_h / cell_h).ceil() as usize;
-        let items_per_page = (rows_per_page * cols).max(1);
-        // 設計: prefetch / eviction 対象は「display list = visible_indices の一部」を
-        // そのまま使い、raw idx の連続範囲には**絶対に潰さない**。
-        // `visible_indices` が★フィルタや Ctrl+F で疎になったとき、raw range で扱うと
-        // 非可視 idx を大量 (フォルダ 1300 件中 3 件表示 → 991 件の非可視) に enqueue
-        // してしまう。詳細は docs/async-architecture.md「display list vs filesystem list」。
-        let vis_count = self.visible_indices.len();
-        // スクロール位置が vis_count を超えるとき (フィルタ直後の縮退ケース) は末尾に寄せる。
-        // さらに vis_count=0 は冒頭で早期 return 済みなのでここでは 1 以上。
-        let vis_first_raw = (self.scroll_offset_y / cell_h) as usize * cols;
-        let grid_vis_first = vis_first_raw.min(vis_count.saturating_sub(1));
-        let vis_first = thumbnail_retention_anchor_position(
-            &self.visible_indices,
-            grid_vis_first,
-            self.fullscreen_idx,
-        );
-        let fractional_drag_y = crate::ui_main::grid_touch_scroll_remainder(
-            ctx,
-            self.scroll_offset_y,
-            cell_h,
-            self.items_generation,
-        );
-        let strict_visible_end = crate::ui_main::extend_grid_end_for_touch_fraction(
-            vis_first.saturating_add(items_per_page),
+        let GridThumbnailRetentionGeometry {
             cols,
+            items_per_page,
             vis_count,
+            vis_first,
             fractional_drag_y,
-        );
-        let strict_visible_items = strict_visible_end.saturating_sub(vis_first);
-
-        let prev_pages = self.settings.thumb_prev_pages as usize;
-        let next_pages = self.settings.thumb_next_pages as usize;
-
-        let vis_keep_start = vis_first.saturating_sub(prev_pages * items_per_page);
-        let mut vis_keep_end = vis_first
-            .saturating_add((1 + next_pages) * items_per_page)
-            .min(vis_count);
-        vis_keep_end = crate::ui_main::extend_grid_end_for_touch_fraction(
+            strict_visible_end,
+            strict_visible_items,
+            vis_keep_start_capped,
             vis_keep_end,
-            cols,
-            vis_count,
-            fractional_drag_y,
-        );
-
-        // ── 共有 VRAM pool: サムネイル保持帯 ───────────────────────────
-        // モード別のサムネイル配分を超えている場合だけ、実 texture 寸法と TextureId
-        // 重複排除で保持帯を縮める。未ロード項目は 0 texel なので先読み要求自体は許可し、
-        // texture が載った後の次フレームで自然に配分へ収束する。現在位置は常に残す。
-        let mut vis_keep_start_capped = vis_keep_start;
-        let budget = self.vram_pool_budget();
-        if let Some(cap_bytes) = budget.thumbnail_bytes {
-            let cap_texels = crate::vram_budget::rgba8_bytes_to_texels(cap_bytes);
-            let desired = vis_keep_end.saturating_sub(vis_keep_start);
-            if desired > 0 {
-                let texture_texels_for_bounds = |start: usize, end: usize| {
-                    let indices = self
-                        .visible_indices
-                        .get(start..end)
-                        .unwrap_or(&[])
-                        .iter()
-                        .copied()
-                        .collect::<HashSet<_>>();
-                    self.thumbnail_texture_texels_for_indices(&indices)
-                };
-                let desired_texels = texture_texels_for_bounds(vis_keep_start, vis_keep_end);
-                if desired_texels > cap_texels {
-                    let mut chosen =
-                        thumbnail_keep_bounds_for_count(vis_keep_start, vis_keep_end, vis_first, 1);
-                    let mut low = 1usize;
-                    let mut high = desired;
-                    while low <= high {
-                        let count = low + (high - low) / 2;
-                        let bounds = thumbnail_keep_bounds_for_count(
-                            vis_keep_start,
-                            vis_keep_end,
-                            vis_first,
-                            count,
-                        );
-                        if count == 1 || texture_texels_for_bounds(bounds.0, bounds.1) <= cap_texels
-                        {
-                            chosen = bounds;
-                            low = count.saturating_add(1);
-                        } else {
-                            high = count.saturating_sub(1);
-                        }
-                    }
-                    vis_keep_start_capped = chosen.0;
-                    vis_keep_end = chosen.1;
-                    crate::logger::log(format!(
-                        "  VRAM thumbnail band reduced: mode={} desired={} kept={} \
-                         loaded={} MiB cap={} MiB",
-                        self.vram_budget_mode().as_str(),
-                        desired,
-                        vis_keep_end.saturating_sub(vis_keep_start_capped),
-                        crate::vram_budget::rgba8_texels_to_bytes(desired_texels) / (1024 * 1024),
-                        cap_bytes / (1024 * 1024),
-                    ));
-                }
-            }
-        }
-        if crate::ui_main::grid_touch_fraction_is_visible(fractional_drag_y) {
-            // The fractional viewport exposes this whole extra row. Even when
-            // the VRAM band is capped, do not evict the row currently peeking
-            // in at the bottom of the touch-dragged grid.
-            vis_keep_start_capped = vis_keep_start_capped.min(vis_first);
-            vis_keep_end = vis_keep_end.max(strict_visible_end);
-        }
+        } = self.grid_thumbnail_retention_geometry(ctx);
 
         // Build the shared owner projection from the already capped grid slice. Do not derive the
         // grid owner from the previous aggregate keep_set: that would keep released hover/seek
@@ -57446,28 +58201,10 @@ impl App {
                         return None;
                     }
                     match self.items.get(idx) {
-                        Some(GridItem::Folder(p))
-                        | Some(GridItem::ZipFile(p))
-                        | Some(GridItem::PdfFile(p)) => {
-                            // 環境設定 ON のとき ZIP/PDF、または画像だけの通常フォルダは
-                            // ページ一覧を経由せずフルスクリーンで開く。
-                            let p = p.clone();
-                            let auto_fs = self.should_auto_fullscreen_grid_container(idx);
-                            #[cfg(windows)]
-                            if auto_fs
-                                && !self.park_active_detached_context_for_new_grid_open(ctx, idx)
-                            {
-                                return None;
-                            }
-                            if self.begin_smart_grid_container_navigation(
-                                idx,
-                                p.clone(),
-                                auto_fs,
-                                crate::app::StartupListIntent::container_open(auto_fs),
-                            ) {
-                                return None;
-                            }
-                            return Some(self.grid_physical_navigation(idx, p, auto_fs));
+                        Some(GridItem::Folder(_))
+                        | Some(GridItem::ZipFile(_))
+                        | Some(GridItem::PdfFile(_)) => {
+                            return self.accept_grid_container_open(ctx, idx);
                         }
                         Some(GridItem::Video(p)) if external_player_video => {
                             crate::ui_helpers::open_external_player(p);
@@ -57505,6 +58242,7 @@ impl App {
                                 return None;
                             }
                             let owner = self.main_grid_archive_open_owner(idx, &pf);
+                            self.capture_main_folder_list_order(idx);
                             let _open_outcome = self
                                 .load_folder_or_convert_archive_with_auto_fullscreen_owned(
                                     pf,
@@ -57749,6 +58487,15 @@ impl App {
         if self.viewer_mutation_modal_active() {
             return;
         }
+        // List order neither joins a burst nor supersedes an in-flight traversal.
+        if self.fs_list_order_navigation_blocks_new_target()
+            || self.folder_nav_pending.as_ref().is_some_and(|pending| {
+                matches!(pending.mode, FolderNavMode::ListOrder { .. })
+                    || matches!(mode, FolderNavMode::ListOrder { .. })
+            })
+        {
+            return;
+        }
         if self.main_folder_history_available() {
             // Accept traversal now; its worker must not race an older initial open.
             self.cancel_unresolved_open_for_navigation(true);
@@ -57786,6 +58533,16 @@ impl App {
         // 新しい nav 列開始: アキュームレータをリセットしてから spawn
         self.pending_folder_nav_steps = 0;
         self.pending_folder_nav_mode = mode.clone();
+        // Stamp only after admission. The handler's fresh FolderItems sequence starts as
+        // Ordinary, so the initial request is admitted while every later request is rejected.
+        if matches!(mode, FolderNavMode::ListOrder { .. })
+            && let Some(sequence) = self
+                .fs_holdover_tex
+                .as_mut()
+                .and_then(FsHoldover::navigation_sequence_mut)
+        {
+            sequence.purpose = FsNavigationPurpose::ListOrderNavigation;
+        }
         self.spawn_folder_nav(current, forward, mode);
     }
 
@@ -57853,6 +58610,13 @@ impl App {
             FolderNavMode::SmartFolder { state, .. } => Some(state.clone()),
             _ => None,
         };
+        let list_order = match &mode {
+            FolderNavMode::ListOrder {
+                snapshot,
+                from_index,
+            } => Some((Arc::clone(snapshot), *from_index)),
+            _ => None,
+        };
         let smart_fullscreen = matches!(
             &mode,
             FolderNavMode::SmartFolder {
@@ -57888,7 +58652,17 @@ impl App {
                     ],
                 );
             }
-            let outcome = if let Some(state) = smart_state.as_ref() {
+            let outcome = if let Some((snapshot, from_index)) = list_order.as_ref() {
+                list_order_navigation::navigate_list_order(
+                    snapshot,
+                    *from_index,
+                    forward,
+                    tree_opts.clone(),
+                    &cancel_w,
+                    cache,
+                    memo,
+                )
+            } else if let Some(state) = smart_state.as_ref() {
                 navigate_smart_folder_scope(
                     state,
                     &current,
@@ -59376,6 +60150,7 @@ impl App {
                     return None;
                 }
                 let owner = self.main_grid_archive_open_owner(idx, &path);
+                self.capture_main_folder_list_order(idx);
                 let _open_outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
                     path,
                     auto_fs,
@@ -59647,6 +60422,20 @@ impl App {
         let Some(target) = result.target else {
             // DFS が尽きた (forward で末尾、backward で先頭に達した等)
             match result.mode {
+                FolderNavMode::ListOrder { .. } => {
+                    let hint = crate::ui_fullscreen::FsBoundaryHint::Edge {
+                        scope: crate::ui_fullscreen::FsBoundaryEdgeScope::ListOrder,
+                        at_end: result.forward,
+                        at: std::time::Instant::now(),
+                    };
+                    self.fs_boundary_hint = Some(hint);
+                    #[cfg(windows)]
+                    if self.native_video_fullscreen_active_for_main_backdrop() {
+                        self.show_native_video_boundary_hint_overlay(hint);
+                    }
+                    self.clear_pending_folder_nav_steps();
+                    self.release_fs_nav_lock();
+                }
                 FolderNavMode::SiblingGrid => {
                     self.show_feedback_warning(if result.forward {
                         "次の兄弟フォルダはありません".to_string()
@@ -59805,9 +60594,11 @@ impl App {
         // Fullscreen モードで skip_limit 尽きフォールバックの場合は、画像・動画の無い
         // フォルダへ飛ばしてフルスクリーンが解除されるのを避けるため、現状維持で
         // 中央ヒントを出す。Grid モードは従来通り移動 (段階的に進める導線)。
-        if (matches!(result.mode, FolderNavMode::Fullscreen)
-            || (self.navigation_scope.is_detached_physical()
-                && matches!(result.mode, FolderNavMode::SiblingFullscreen))
+        if (matches!(
+            result.mode,
+            FolderNavMode::Fullscreen | FolderNavMode::ListOrder { .. }
+        ) || (self.navigation_scope.is_detached_physical()
+            && matches!(result.mode, FolderNavMode::SiblingFullscreen))
             || matches!(
                 result.mode,
                 FolderNavMode::SmartFolder {
@@ -59859,6 +60650,7 @@ impl App {
                 FolderNavMode::Grid
                     | FolderNavMode::SiblingGrid
                     | FolderNavMode::Fullscreen
+                    | FolderNavMode::ListOrder { .. }
                     | FolderNavMode::SiblingFullscreen
                     | FolderNavMode::SlideshowNext
             )
@@ -59869,6 +60661,7 @@ impl App {
             let fullscreen = matches!(
                 result.mode,
                 FolderNavMode::Fullscreen
+                    | FolderNavMode::ListOrder { .. }
                     | FolderNavMode::SiblingFullscreen
                     | FolderNavMode::SlideshowNext
             );
@@ -59957,6 +60750,7 @@ impl App {
                 return;
             }
             FolderNavMode::Fullscreen
+            | FolderNavMode::ListOrder { .. }
             | FolderNavMode::SiblingFullscreen
             | FolderNavMode::SlideshowNext => {
                 let resume_slideshow = matches!(result.mode, FolderNavMode::SlideshowNext);
@@ -60956,8 +61750,13 @@ impl App {
             return;
         };
         if let Some(verb) = verb {
-            self.invoke_shell_clipboard_verb(ctx, verb);
+            if verb == crate::native_context_menu::ShellClipboardVerb::Copy {
+                self.execute_copy_key_action(ctx, KeyAction::GridCopyFiles);
+            } else {
+                self.invoke_shell_clipboard_verb(ctx, verb);
+            }
         }
+        self.handle_copy_action_keys(ctx, false);
 
         if ctrl_v {
             self.handle_clipboard_paste_with(
@@ -64290,9 +65089,18 @@ impl App {
         apply_initial_placement: bool,
     ) -> DeferredDetachedImageWindowView {
         let owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
-        let right_drag_guide = self
-            .right_drag_guide_for_owner(owner, self.right_drag_context_for_window_id(window.id));
-        let view = DeferredDetachedImageWindowView::from_snapshot(
+        let overview_actions = match &window.display {
+            DetachedImageWindowDisplay::PageOverview(overview) => {
+                Some(overview.executable_actions.as_slice())
+            }
+            DetachedImageWindowDisplay::Still(_) => None,
+        };
+        let right_drag_guide = self.right_drag_guide_for_owner_with_actions(
+            owner,
+            self.right_drag_context_for_window_id(window.id),
+            overview_actions,
+        );
+        let mut view = DeferredDetachedImageWindowView::from_snapshot(
             window,
             placement,
             apply_initial_placement,
@@ -64302,6 +65110,13 @@ impl App {
                 egui::Color32::from_rgb(red, green, blue)
             },
         );
+        if let DetachedImageWindowDisplay::PageOverview(overview) = &mut view.display {
+            overview.keymap = self.keymap.clone();
+            overview.input_blocked = self.any_dialog_open()
+                || self.remote_session_blocks_local_control()
+                || self.document_open_modal_admission_blocked()
+                || self.sidecar_restore_blocks_window(window.id);
+        }
         #[cfg(feature = "test-script")]
         let view = {
             let mut view = view;
@@ -66442,6 +67257,7 @@ impl App {
                 app.poll_local_adjust_lut_load(ctx);
                 app.poll_local_adjust_segmentation(ctx);
 
+                app.execute_pending_page_overview_command_in_mounted_context(ctx);
                 app.execute_pending_right_drag_command_in_mounted_context(ctx);
 
                 if app.active_detached_transition_outstanding() {
@@ -66481,8 +67297,10 @@ impl App {
                         app.evict_final_pipeline_cache(fs_idx);
                     }
                     if let Some(other) = spread_other {
+                        app.resolve_prepared_edit_for_display(ctx, other);
                         app.maybe_start_local_adjust_render(other);
                     }
+                    app.resolve_prepared_edit_for_display(ctx, fs_idx);
                     app.maybe_start_local_adjust_render(fs_idx);
                     if let Some(keep_set) = continuous_keep_set.as_ref() {
                         app.evict_adjustment_cache_for_keep_set(keep_set);
@@ -66724,13 +67542,89 @@ impl App {
             ));
             return None;
         }
+        // Open metadata has a complete display projection even before any full-image
+        // texture exists. Never send it through the still-image snapshot prerequisite.
+        if let Some(view) = self.page_overview_view() {
+            let id = self.ensure_detached_viewer_window_id();
+            let placement =
+                self.ensure_detached_window_runtime_placement(id, "build_overview_snapshot");
+            let surface = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Self::detached_snapshot_client_size(placement)
+                    / crate::settings::normalize_ui_scale_factor(self.settings.ui_scale_factor),
+            );
+            let direction = self.page_overview_direction();
+            let layout =
+                crate::ui_page_overview::page_overview_geometry(surface, &view, direction).layout;
+            let pages = layout
+                .overscan_ordinals(view.scroll_anchor)
+                .filter_map(|ordinal| view.projection.entry(ordinal).map(|entry| entry.items_idx))
+                .collect::<Vec<_>>();
+            let thumbnails = self.page_overview_thumbnail_projection(&pages);
+            let retained_textures = self.page_overview_retained_thumbnail_textures(&pages);
+            let captured_layout = ctx
+                .and_then(|ctx| Self::page_overview_cached_layout(ctx, &view))
+                .unwrap_or(layout);
+            let current_items_indices = match self.resolve_visible_spread_pair(idx) {
+                crate::ui_fullscreen::SpreadPair::Double { left, right } => vec![left, right],
+                crate::ui_fullscreen::SpreadPair::Single => vec![idx],
+            };
+            let display =
+                DetachedImageWindowDisplay::PageOverview(DetachedPageOverviewProjection {
+                    view,
+                    captured_layout,
+                    thumbnails,
+                    retained_textures,
+                    direction,
+                    current_items_indices,
+                    keymap: self.keymap.clone(),
+                    executable_actions: self.page_overview_executable_actions(),
+                    input_blocked: self.any_dialog_open()
+                        || self.remote_session_blocks_local_control()
+                        || self.document_open_modal_admission_blocked(),
+                });
+            let reopen_collection_root = self.detached_collection_root_image_open_plan(idx);
+            let reopen_descriptor = if reopen_collection_root.is_some() {
+                None
+            } else {
+                match self.parked_still_reopen_descriptor_for_idx(idx) {
+                    DetachedBuild::Built(descriptor) => Some(descriptor),
+                    DetachedBuild::NotApplicable => None,
+                    DetachedBuild::Refused(reason) => {
+                        self.show_open_admission_refusal(reason);
+                        return None;
+                    }
+                }
+            };
+            return Some(DetachedImageWindowSnapshot {
+                id,
+                display,
+                title: self.detached_image_snapshot_title_for_idx(idx),
+                location_display: self.detached_image_snapshot_location_for_idx(idx),
+                image_dims: None,
+                rotation: crate::rotation_db::Rotation::None,
+                zoom_pan: None,
+                free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor,
+                reopen_sync_stamp: self.viewer_sync_stamp_for_idx(idx),
+                reopen_collection_root,
+                activation_ready_frame: self.frame_counter.saturating_add(1),
+                activation_armed: false,
+                focused_last_frame: false,
+                initial_placement_applied: false,
+            });
+        }
         // Select the actual last-painted paged presentation before looking up `items[idx]`.
         // A navigation/source-reload holdover can still own the visible pixels after that index
         // has been rebound (or while its replacement has no texture at all).
         let paged_display_unit = self
             .reading_flow
             .is_paged()
-            .then(|| self.capture_paged_display_unit_for_snapshot(idx))
+            .then(|| self.capture_paged_display_unit_for_snapshot(ctx, idx))
             .flatten();
         let last_painted_is_holdover = paged_display_unit.as_ref().is_some_and(|captured| {
             matches!(
@@ -66921,7 +67815,7 @@ impl App {
         ));
         Some(DetachedImageWindowSnapshot {
             id,
-            texture,
+            display: texture.into(),
             title: self.detached_image_snapshot_title_for_idx(idx),
             location_display: self.detached_image_snapshot_location_for_idx(idx),
             image_dims: Some((texture_size.x as u32, texture_size.y as u32)),
@@ -66969,7 +67863,7 @@ impl App {
         ));
         Some(DetachedImageWindowSnapshot {
             id,
-            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+            display: crate::gpu_lanczos::FullscreenPaintResource::direct(texture).into(),
             title,
             location_display,
             image_dims: None,
@@ -67722,7 +68616,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn detached_toggle_disabled_by_always_new_images(&self) -> bool {
+    pub(crate) fn detached_toggle_disabled_by_always_new_images(&self) -> bool {
         if !self.settings.detached_viewer_open_images_in_window {
             return false;
         }
@@ -69521,7 +70415,7 @@ impl App {
             FsOpenPerfSpan::RefreshFullscreenVideoMarkerCache,
             refresh_video_markers_perf_t0,
         );
-        self.adjust_spread_target = AdjustSpreadTarget::Left;
+        self.adjust_spread_target = None;
         // PDF pool の Critical 予約は `pdf_loader::CRITICAL_RESERVATION_ACTIVE` を
         // 常時 ON にする方針 (v1.0.0)。グリッドからの Enter (= Critical な
         // enumerate_pages_async) が、サムネ先読みの Normal ジョブ in-flight 待ちで
@@ -70563,6 +71457,7 @@ impl App {
                 &self.settings,
                 column,
                 self.items_are_rating_view,
+                self.items_are_tag_view,
             )
     }
 
@@ -71783,6 +72678,7 @@ impl App {
             self.visible_indices = (0..self.items.len()).collect();
             self.details_thumb_suppression_applied = false;
             self.details_order.clear();
+            self.close_page_overview_if_reader_order_changed();
             self.viewer_navigation_caches.invalidate();
             if selection_policy == VisibleSelectionPolicy::General {
                 self.ensure_selected_visible_or_first();
@@ -71811,6 +72707,7 @@ impl App {
                 .unwrap_or_default();
             self.details_thumb_suppression_applied = false;
             self.details_order.clear();
+            self.close_page_overview_if_reader_order_changed();
             self.viewer_navigation_caches.invalidate();
             if !self.checked.is_empty() {
                 let vi = &self.visible_indices;
@@ -72027,6 +72924,7 @@ impl App {
         } else {
             self.details_order.clear();
         }
+        self.close_page_overview_if_reader_order_changed();
         self.viewer_navigation_caches.invalidate();
         // WYSIWYG 原則: 非表示になったアイテムは checked / selected の対象から外す。
         // これで `handle_grid_keys` の `position().unwrap_or(0)` 起因の
@@ -72953,6 +73851,7 @@ impl App {
                 self.details_order.clear();
                 self.details_order_revision = self.details_order_revision.wrapping_add(1);
                 self.details_tag_prewarm_indices.clear();
+                self.close_page_overview_if_reader_order_changed();
                 self.viewer_navigation_caches.invalidate();
             }
         }
@@ -73010,11 +73909,17 @@ impl App {
         use top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
         if matches!(
             self.top_level_grid_view.surface(),
-            TopLevelGridSurface::Search(TopLevelSearchView::Favorite | TopLevelSearchView::Tag)
+            TopLevelGridSurface::Search(TopLevelSearchView::Favorite)
                 | TopLevelGridSurface::ReadingHistory
                 | TopLevelGridSurface::Snapshot
                 | TopLevelGridSurface::DriveList
-        ) {
+        ) || (matches!(
+            self.top_level_grid_view.surface(),
+            TopLevelGridSurface::Search(TopLevelSearchView::Tag)
+        ) && !self.items_are_tag_view)
+        {
+            // タグから入った子フォルダには専用ソートを適用しない。
+            // 共通ソートも従来どおり無効にし、結果一覧だけの3択に限定する。
             return Some(GridSortLockReason::FixedOrder);
         }
         if let Some(order) = self.collection_grid_root_order() {
@@ -73068,6 +73973,9 @@ impl App {
             DetailsSortKey::Rating => self.settings.details_show_rating,
             DetailsSortKey::RatedAt => {
                 self.items_are_rating_view && self.settings.details_show_rated_at
+            }
+            DetailsSortKey::AppliedAt => {
+                self.items_are_tag_view && self.settings.details_show_applied_at
             }
             DetailsSortKey::Tags => self.settings.details_show_tags,
             DetailsSortKey::Kind => self.settings.details_show_kind,
@@ -73161,6 +74069,7 @@ impl App {
             // PageCount へ切り替えた直後は全件取得が終わるまで toolbar 順を維持する。
             // Finished で Ready になった時点で poll_details_meta_load が再構築する。
             self.details_order = self.visible_indices.clone();
+            self.close_page_overview_if_reader_order_changed();
             return;
         }
         // 列ヘッダが並びを所有していない状態 (ソートなし / 本のページ順 / 閲覧履歴 /
@@ -73168,6 +74077,7 @@ impl App {
         // `details_header_sort_active` が唯一の所有者で、UI の無効化もそこから導く。
         if !self.details_header_sort_active() {
             self.details_order = self.visible_indices.clone();
+            self.close_page_overview_if_reader_order_changed();
             return;
         }
         let visible = self.visible_indices.clone();
@@ -73177,6 +74087,7 @@ impl App {
             .collect();
         rows.sort_by(|a, b| Self::compare_details_sort_rows(a, b, key, ascending));
         self.details_order = rows.into_iter().map(|row| row.idx).collect();
+        self.close_page_overview_if_reader_order_changed();
     }
 
     fn details_sort_row(
@@ -73197,6 +74108,7 @@ impl App {
             DetailsSortKey::RatedAt => {
                 DetailsSortPrimary::I64(self.rating_view_row(idx).and_then(|row| row.rated_at_ms))
             }
+            DetailsSortKey::AppliedAt => DetailsSortPrimary::I64(self.tag_view_applied_at_ms(idx)),
             DetailsSortKey::Tags => DetailsSortPrimary::Text(self.cell_tag_list(idx).join(" ")),
             DetailsSortKey::Kind => DetailsSortPrimary::Text(self.details_kind_sort_key(idx)),
             DetailsSortKey::PageCount => {
@@ -73252,7 +74164,8 @@ impl App {
             DetailsSortKey::Size
             | DetailsSortKey::Modified
             | DetailsSortKey::Created
-            | DetailsSortKey::RatedAt => {
+            | DetailsSortKey::RatedAt
+            | DetailsSortKey::AppliedAt => {
                 // ★設定時刻を含む optional 時刻は、NULL を空欄として扱い、昇順・降順の
                 // どちらでも末尾へ置く。下の反転対象からも外してこの規約を維持する。
                 let DetailsSortPrimary::I64(av) = &a.primary else {
@@ -73283,6 +74196,7 @@ impl App {
             | DetailsSortKey::Modified
             | DetailsSortKey::Created
             | DetailsSortKey::RatedAt
+            | DetailsSortKey::AppliedAt
             | DetailsSortKey::PageCount
             | DetailsSortKey::ImageDimensions
             | DetailsSortKey::VideoDuration
@@ -73293,6 +74207,11 @@ impl App {
 
         if primary != Ordering::Equal {
             return primary;
+        }
+        if key == DetailsSortKey::AppliedAt {
+            // 元のタグ結果はどの専用ソートでも、同時刻内を実パス順にしている。
+            // ファイル名だけの自然順へ変えず、その順を昇順・降順とも保持する。
+            return a.idx.cmp(&b.idx);
         }
         Self::compare_details_sort_names(a, b).then_with(|| a.idx.cmp(&b.idx))
     }
@@ -76910,6 +77829,7 @@ impl App {
         entry: OriginalMaterialEntry,
     ) -> bool {
         if entry != OriginalMaterialEntry::MaterialOnly {
+            self.cancel_prepared_edit_for_entry(idx);
             self.cancel_original_material_entry_intents(None);
         }
         if self.current_raw_source_pixels(idx).is_some() {
@@ -77064,6 +77984,7 @@ impl App {
         if entry == OriginalMaterialEntry::MaterialOnly {
             return;
         }
+        self.cancel_prepared_edit_for_entry(idx);
         if let OriginalMaterialEntry::ViewTrim { request } = entry {
             self.resume_view_trim_after_original(ctx, idx, request);
             return;
@@ -79290,16 +80211,13 @@ impl App {
         self.cancel_media_navigation_pending_for_current_context("close_fullscreen");
         // 表示モード / フィットのポップアップを開いたまま抜けると、次回フルスクリーンで
         // メニューが残り、カーソル自動非表示やページ送りの抑制が効いたままになるため解除する。
-        self.spread_popup_open = false;
-        self.fit_popup_open = false;
-        self.panorama_projection_popup_open = false;
         // The top bar's overflow panel belongs to this list for the same reason and was missing
         // from it: it is drawn only in fullscreen, and it holds the keyboard while it is open -
         // including the Esc that would close it. Leaving fullscreen by any other route (the
         // right-click close, the window's own close) strands it, with nothing on screen to show
         // why the application stopped responding. It survived until now only because changing
         // file clears it, which is luck rather than a rule.
-        self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+        self.dismiss_fs_transient_menu_state();
         self.cancel_mouse_ring_flick();
         self.capture_region_selection = None;
         self.clear_fullscreen_tag_picker_state();
@@ -79425,6 +80343,7 @@ impl App {
             if matches!(
                 pending.mode,
                 FolderNavMode::Fullscreen
+                    | FolderNavMode::ListOrder { .. }
                     | FolderNavMode::SiblingFullscreen
                     | FolderNavMode::Favsearch {
                         fullscreen: true,
@@ -81488,7 +82407,7 @@ impl App {
         let annotations = if let Some(objects) = annotation_objects {
             // fullscreen の comic 表示時に解決済みの FontSet を Arc clone する。close / page
             // navigation 境界で新しいフォント列挙やファイル読み込みを同期実行しない。
-            let Some(fonts) = self.comic_fonts.clone() else {
+            let Some(fonts) = self.comic_fonts.fonts().clone() else {
                 // 注釈を欠いたプレビューで旧結果を上書きしない。
                 return Some(EditPreviewCloseUpdate::Skip {
                     observation: EditPreviewCloseObservation {
@@ -82454,6 +83373,15 @@ impl App {
         if let Some(key) = self.page_path_key(idx) {
             self.cancel_superseded_page_edit_producers(&key, &layers, false);
         }
+        self.adopt_materialized_local_layers(idx, layers);
+    }
+
+    /// Adopt normalization/hydration without publishing an edit or cancelling its producers.
+    pub(crate) fn adopt_materialized_local_layers(
+        &mut self,
+        idx: usize,
+        layers: local_adjust_core::LocalAdjustmentLayers,
+    ) {
         if layers.is_empty() {
             self.local_adjust_page_layers.remove(&idx);
             self.local_adjust_pages.remove(&idx);
@@ -82640,13 +83568,61 @@ impl App {
         Some(adopted)
     }
 
+    /// Pixel basis available to both crop acceptance and ordinary display.
+    /// Thumbnail layout dimensions (notably a PDF page box) and processed/AI
+    /// sampler sizes are not source coordinates. A whole-source thumbnail with
+    /// no coordinate metadata can still supply the legacy raster fallback.
+    pub(crate) fn resident_export_crop_source_size(&self, idx: usize) -> Option<[usize; 2]> {
+        self.canonical_source_dimensions(idx)
+            .map(|dims| dims.as_size())
+            .or_else(|| self.fs_early_dims.get(&idx).copied())
+            .or_else(|| {
+                self.fs_page_coordinate_source_size(idx)
+                    .map(|size| [size.x.round() as usize, size.y.round() as usize])
+            })
+            .or_else(|| {
+                let resource = self.fs_thumbnail_resource_for_display(idx).ok()?;
+                matches!(
+                    resource.source_coverage(),
+                    crate::source_coverage::SourceCoverage::FullSource
+                )
+                .then(|| resource.source_texture().size())
+            })
+    }
+
+    /// Immutable document crop binding. Unlike export_crop_for_idx, this does
+    /// not adopt legacy dimensions, hydrate metadata, or persist anything.
+    pub(crate) fn resident_export_crop_for_idx(
+        &self,
+        idx: usize,
+    ) -> Option<crate::export_crop::CropSettings> {
+        let settings = self.export_crop_page_settings.get(&idx).copied()?;
+        if settings.valid_source_size().is_some() {
+            return Some(settings);
+        }
+        if let Some(accepted) = self.page_turn_legacy_crop(idx, settings) {
+            // This also preserves an unresolved legacy value when the accepted
+            // raster was too small. Quality publication is not a crop edit.
+            return Some(accepted);
+        }
+        // Resolve the same memory-only basis as ordinary crop display, including
+        // thumbnail-only pages. Only ordinary display commits its later adoption.
+        let size = self.resident_export_crop_source_size(idx);
+        Some(size.map_or(settings, |size| settings.with_legacy_source_size(size)))
+    }
+
     pub(crate) fn export_crop_for_idx(
         &mut self,
         idx: usize,
         image_size: [usize; 2],
     ) -> Option<crate::export_crop::CropSettings> {
-        self.ensure_export_crop_source_size(idx, image_size)
-            .map(|settings| settings.scaled_to(image_size))
+        let settings = self.resident_export_crop_for_idx(idx)?;
+        if let Some(size) = settings.valid_source_size() {
+            let _ = self.ensure_export_crop_source_size(idx, size);
+        }
+        // Unresolved legacy settings are only clamped for this paint. Layout or
+        // processed-sampler dimensions must not become a persisted reference.
+        Some(settings.scaled_to(image_size))
     }
 
     /// 保存対象画像 (final composite。AI アップスケールで source とサイズが違うことが
@@ -82852,24 +83828,29 @@ impl App {
         }
     }
 
+    #[track_caller]
     fn clear_edit_result_caches_for_idx(&mut self, idx: usize) {
         self.edit_result_cache.retain(|key, _| key.idx != idx);
         self.clear_final_pipeline_caches_for_idx(idx);
     }
 
+    #[track_caller]
     fn clear_edit_result_caches_for_idx_preserving_retained_final_ai(&mut self, idx: usize) {
         self.edit_result_cache.retain(|key, _| key.idx != idx);
         self.clear_final_pipeline_caches_for_idx_preserving_retained_final_ai(idx);
     }
 
+    #[track_caller]
     fn clear_final_pipeline_caches_for_idx(&mut self, idx: usize) {
         self.clear_final_pipeline_caches_for_idx_inner(idx, true);
     }
 
+    #[track_caller]
     fn clear_final_pipeline_caches_for_idx_preserving_retained_final_ai(&mut self, idx: usize) {
         self.clear_final_pipeline_caches_for_idx_inner(idx, false);
     }
 
+    #[track_caller]
     fn clear_final_pipeline_caches_for_idx_inner(&mut self, idx: usize, clear_retained: bool) {
         self.cancel_final_ai_for_idx(idx);
         self.cancel_final_effects_for_idx(idx);
@@ -82886,14 +83867,15 @@ impl App {
         self.cancel_comic_bake_for_idx(idx);
     }
 
-    pub(crate) fn clear_all_final_pipeline_caches(&mut self) {
+    #[track_caller]
+    pub(crate) fn clear_all_final_pipeline_caches(&mut self, reason: FinalPipelineInvalidation) {
         for pending in self.final_ai_pending.values() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         self.final_ai_pending.clear();
         self.final_ai_cache.clear();
         self.final_ai_failed.clear();
-        self.cancel_all_final_effects();
+        self.cancel_all_final_effects(PreparedEditCancel::PipelineInvalidation(reason));
         self.final_composite_cache
             .clear_with_drop_reason("pipeline_invalidate_all");
         self.comic_cache.clear();
@@ -82907,7 +83889,9 @@ impl App {
         }
         self.final_ai_cache.clear();
         self.final_ai_failed.clear();
-        self.cancel_all_final_effects();
+        self.cancel_all_final_effects(PreparedEditCancel::PipelineInvalidation(
+            FinalPipelineInvalidation::SessionClosed,
+        ));
         self.final_composite_cache
             .clear_with_drop_reason("session_close");
         self.comic_cache.clear();
@@ -82981,6 +83965,72 @@ impl App {
         self.local_adjust_cache
             .get(&key)
             .map(|entry| Arc::clone(&entry.pixels))
+    }
+
+    /// Exact CPU completion is independent of whether this stage has been uploaded.
+    pub(crate) fn local_adjust_is_materialized(&self, idx: usize) -> bool {
+        let Some(layers) = self.local_adjust_page_layers.get(&idx) else {
+            return !self.local_adjust_pages.contains(&idx);
+        };
+        if let Some(source) = self.current_local_adjust_source_pixels(idx)
+            && layers
+                .iter()
+                .any(|layer| !layer.masks_match_dims(source.size[0].max(1), source.size[1].max(1)))
+        {
+            return false;
+        }
+        !layers
+            .iter()
+            .any(|layer| layer.enabled && layer.opacity > 0.0)
+            || self.current_local_adjust_pixels(idx).is_some()
+    }
+
+    /// Upload an already materialized stage without changing its key or invalidating later stages.
+    pub(crate) fn ensure_local_adjust_material(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        self.resolve_prepared_edit_for_display(ctx, idx);
+        if !self.local_adjust_is_materialized(idx) {
+            self.maybe_start_local_adjust_render(idx);
+            return None;
+        }
+        let key = self.current_local_adjust_key(idx);
+        let entry = self.local_adjust_cache.get(&key)?;
+        if entry.texture.is_none() {
+            if self.last_edit_materialize_upload_frame == self.frame_counter {
+                ctx.request_repaint();
+                return None;
+            }
+            let pixels = Arc::clone(&entry.pixels);
+            let options = self.display_texture_options(idx);
+            self.speculative_gpu_frame.note_ordinary_upload();
+            let upload_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
+            let texture = ctx.load_texture(
+                format!(
+                    "local_adjust_{}_{}_{}_{}",
+                    key.idx, key.input_gen, key.erase_mask_gen, key.local_gen
+                ),
+                final_prepare::final_upload_pixels(&pixels),
+                options,
+            );
+            if let Some(upload_t0) = upload_t0 {
+                emit_edit_materialize_ms(
+                    "upload",
+                    "local",
+                    self.page_path_key(idx).as_deref(),
+                    self.input_seq,
+                    upload_t0,
+                );
+            }
+            self.bind_display_texture_identity(&texture, self.item_id(idx));
+            self.last_edit_materialize_upload_frame = self.frame_counter;
+            let entry = self.local_adjust_cache.get_mut(&key)?;
+            entry.texture_options = options;
+            entry.texture = Some(texture);
+        }
+        self.current_local_adjust_material(idx)
     }
 
     pub(crate) fn current_local_adjust_layer_bypass_key(
@@ -83100,6 +84150,9 @@ impl App {
         idx: usize,
         continuation: LocalMaterializeContinuation,
     ) {
+        if continuation != LocalMaterializeContinuation::Display {
+            self.cancel_prepared_edit_for_entry(idx);
+        }
         if !self.local_adjust_pages.contains(&idx)
             && !self.local_adjust_page_layers.contains_key(&idx)
         {
@@ -83192,7 +84245,7 @@ impl App {
         if loaded_layers_are_inactive && !masks_need_resize {
             return;
         }
-        if self.current_local_adjust_texture(idx).is_some() && !masks_need_resize {
+        if self.current_local_adjust_pixels(idx).is_some() && !masks_need_resize {
             return;
         }
         if masks_need_resize {
@@ -83414,6 +84467,31 @@ impl App {
         }
     }
 
+    /// Adoption and resident preparation use the same current-input predicate.
+    /// A received result still belongs to the producer until it is adopted.
+    fn current_edit_materialize_request_matches(
+        &self,
+        idx: usize,
+        request: EditMaterializeRequest,
+    ) -> bool {
+        request.items_generation == self.items_generation
+            && match request.kind {
+                EditMaterializeKind::Local { key, .. } => {
+                    key.idx == idx && key == self.current_local_adjust_key(idx)
+                }
+                EditMaterializeKind::Conceal { key, .. } => {
+                    key.idx == idx && key == self.current_edit_result_key(idx)
+                }
+            }
+    }
+
+    fn current_edit_stage_producer_pending(&self, idx: usize) -> bool {
+        self.local_adjust_pending.get(&idx).is_some_and(|pending| {
+            !pending.cancel.load(Ordering::Relaxed)
+                && self.current_edit_materialize_request_matches(idx, pending.request)
+        })
+    }
+
     fn apply_edit_materialize_result(
         &mut self,
         ctx: &egui::Context,
@@ -83421,18 +84499,7 @@ impl App {
         result: EditMaterializeResult,
         request: EditMaterializeRequest,
     ) -> bool {
-        if request.items_generation != self.items_generation {
-            return false;
-        }
-        let request_is_current = match request.kind {
-            EditMaterializeKind::Local { key, .. } => {
-                key.idx == idx && key == self.current_local_adjust_key(idx)
-            }
-            EditMaterializeKind::Conceal { key, .. } => {
-                key.idx == idx && key == self.current_edit_result_key(idx)
-            }
-        };
-        if !request_is_current {
+        if !self.current_edit_materialize_request_matches(idx, request) {
             return false;
         }
 
@@ -83443,7 +84510,7 @@ impl App {
                         EditMaterializeKind::Local { continuation, .. } => continuation,
                         _ => return false,
                     };
-                    self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
+                    self.adopt_materialized_local_layers(idx, layers);
                     self.local_adjust_cache.retain(|key, _| key.idx != idx);
                     let key = self.current_local_adjust_key(idx);
                     let pixels = Arc::new(image);
@@ -83467,6 +84534,7 @@ impl App {
                     self.local_adjust_cache.insert(
                         key,
                         LocalAdjustCacheEntry {
+                            texture_options: Self::resident_texture_options(ctx, &texture),
                             display_basis: self.accept_current_producer_display_basis(
                                 key.idx,
                                 texture.size(),
@@ -83474,7 +84542,7 @@ impl App {
                                 false,
                             ),
                             pixels,
-                            texture,
+                            texture: Some(texture),
                         },
                     );
                     if !matches!(
@@ -83505,7 +84573,7 @@ impl App {
                         _ => return false,
                     };
                     let layers_empty = layers.is_empty();
-                    self.set_local_adjust_layers_for_idx_memory_only_inner(idx, layers);
+                    self.adopt_materialized_local_layers(idx, layers);
                     if layers_empty && let Some(page_key) = self.page_path_key(idx) {
                         Self::set_page_key_presence(
                             &mut self.local_adjust_page_keys,
@@ -83566,6 +84634,7 @@ impl App {
                     self.conceal_cache.insert(
                         idx,
                         ConcealCacheEntry {
+                            texture_options: Self::resident_texture_options(ctx, &texture),
                             display_basis: self.accept_current_producer_display_basis(
                                 idx,
                                 texture.size(),
@@ -83573,7 +84642,7 @@ impl App {
                                 false,
                             ),
                             pixels,
-                            texture,
+                            texture: Some(texture),
                             generation: key.conceal_gen,
                         },
                     );
@@ -83717,6 +84786,7 @@ impl App {
                 self.local_adjust_layer_bypass_cache.insert(
                     pending.key,
                     LocalAdjustCacheEntry {
+                        texture_options: Self::resident_texture_options(ctx, &texture),
                         display_basis: self.accept_current_producer_display_basis(
                             key.idx,
                             texture.size(),
@@ -83724,7 +84794,7 @@ impl App {
                             false,
                         ),
                         pixels,
-                        texture,
+                        texture: Some(texture),
                     },
                 );
                 ctx.request_repaint();
@@ -83798,6 +84868,7 @@ impl App {
                 self.local_adjust_prefix_preview_cache.insert(
                     pending.key,
                     LocalAdjustCacheEntry {
+                        texture_options: Self::resident_texture_options(ctx, &texture),
                         display_basis: self.accept_current_producer_display_basis(
                             key.idx,
                             texture.size(),
@@ -83805,7 +84876,7 @@ impl App {
                             false,
                         ),
                         pixels,
-                        texture,
+                        texture: Some(texture),
                     },
                 );
                 ctx.request_repaint();
@@ -84086,7 +85157,7 @@ impl App {
         self.conceal_cache.clear();
         self.comic_cache.clear();
         self.edit_result_cache.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::EraseGenerationChanged);
     }
 
     /// 消しゴムマスクが変わったことを idx 単位の世代で表す。
@@ -84327,7 +85398,7 @@ impl App {
         // job が完了して旧結果を再挿入することもない。
         self.clear_retained_final_ai_cache("conceal_generation_change");
         self.edit_result_cache.clear();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::ConcealGenerationChanged);
     }
 
     /// 表示パイプライン用: 該当 idx に隠蔽マスクが保存されていれば、現在の
@@ -84351,6 +85422,17 @@ impl App {
         idx: usize,
         purpose: ConcealMaterializePurpose,
     ) {
+        if !matches!(purpose, ConcealMaterializePurpose::Display) {
+            self.cancel_prepared_edit_for_entry(idx);
+        }
+        if purpose == ConcealMaterializePurpose::Display
+            && self
+                .conceal_cache
+                .get(&idx)
+                .is_some_and(|entry| entry.generation == self.conceal_generation)
+        {
+            return;
+        }
         if self.local_adjust_pages.contains(&idx)
             && !self.local_adjust_page_layers.contains_key(&idx)
         {
@@ -84512,9 +85594,10 @@ impl App {
 
     fn ensure_conceal_texture_impl(
         &mut self,
-        _ctx: &egui::Context,
+        ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
+        self.resolve_prepared_edit_for_display(ctx, idx);
         if self.erase_mode || (self.conceal_mode && !self.conceal_preview_active) {
             return None;
         }
@@ -84523,10 +85606,42 @@ impl App {
             return None;
         }
         let current_gen = self.conceal_generation;
-        if let Some(entry) = self.conceal_cache.get(&idx) {
-            if entry.generation == current_gen {
-                return Some(entry.texture.clone());
+        if let Some(entry) = self
+            .conceal_cache
+            .get(&idx)
+            .filter(|entry| entry.generation == current_gen)
+        {
+            if let Some(texture) = &entry.texture {
+                return Some(texture.clone());
             }
+            if self.last_edit_materialize_upload_frame == self.frame_counter {
+                ctx.request_repaint();
+                return None;
+            }
+            let pixels = Arc::clone(&entry.pixels);
+            let options = self.display_texture_options(idx);
+            self.speculative_gpu_frame.note_ordinary_upload();
+            let upload_t0 = crate::perf::is_enabled().then(std::time::Instant::now);
+            let texture = ctx.load_texture(
+                format!("conceal_{idx}_g{current_gen}"),
+                final_prepare::final_upload_pixels(&pixels),
+                options,
+            );
+            if let Some(upload_t0) = upload_t0 {
+                emit_edit_materialize_ms(
+                    "upload",
+                    "conceal",
+                    self.page_path_key(idx).as_deref(),
+                    self.input_seq,
+                    upload_t0,
+                );
+            }
+            self.bind_display_texture_identity(&texture, self.item_id(idx));
+            self.last_edit_materialize_upload_frame = self.frame_counter;
+            let entry = self.conceal_cache.get_mut(&idx)?;
+            entry.texture_options = options;
+            entry.texture = Some(texture.clone());
+            return Some(texture);
         }
         self.maybe_start_conceal_materialize(idx, ConcealMaterializePurpose::Display);
         None
@@ -84571,35 +85686,105 @@ impl App {
         })
     }
 
-    /// Borrow only the current context's immutable, canonical still raster. Sharing
-    /// a handle does not materialize an upload and says nothing about final completeness.
-    fn shared_source_texture_for_edit(
+    pub(crate) fn resident_texture_options(
+        ctx: &egui::Context,
+        texture: &egui::TextureHandle,
+    ) -> egui::TextureOptions {
+        // Copy the immutable metadata before any handle clone can take a write lock.
+        ctx.tex_manager()
+            .read()
+            .meta(texture.id())
+            .expect("owned texture")
+            .options
+    }
+
+    /// Select the highest exact resident cumulative edit stage without starting work.
+    /// This display fallback does not prove that every active edit is complete.
+    pub(crate) fn exact_resident_edit_stage(
+        &self,
+        idx: usize,
+    ) -> Option<(
+        crate::gpu_lanczos::FullscreenPaintResource,
+        Arc<egui::ColorImage>,
+        &'static str,
+    )> {
+        if let Some(material) = self.current_conceal_material(idx) {
+            return Some((
+                material,
+                self.conceal_cache.get(&idx)?.pixels.clone(),
+                "conceal",
+            ));
+        }
+        if let Some(material) = self.current_local_adjust_material(idx) {
+            return Some((
+                material,
+                self.local_adjust_cache
+                    .get(&self.current_local_adjust_key(idx))?
+                    .pixels
+                    .clone(),
+                "local_adjust",
+            ));
+        }
+        self.current_erase_result_material(idx).map(|material| {
+            (
+                material,
+                self.erase_result_cache[&self.current_erase_result_key(idx)]
+                    .pixels
+                    .clone(),
+                "erase",
+            )
+        })
+    }
+
+    /// Borrow this context's actual immutable edit input allocation. The LINEAR
+    /// edit contract must survive changes to the final sampler (including Nearest).
+    fn shared_resident_texture_for_edit(
         &self,
         ctx: &egui::Context,
         key: &EditResultKey,
         edit_pixels: &Arc<egui::ColorImage>,
-    ) -> Option<egui::TextureHandle> {
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
         if *key != self.current_edit_result_key(key.idx) {
             return None;
         }
-        let FsCacheEntry::Static {
-            tex,
-            pixels,
-            animation: StaticAnimationState::Still,
-            ..
-        } = self.fs_cache.get(&key.idx)?
-        else {
-            return None;
-        };
-        if !Arc::ptr_eq(pixels, edit_pixels) {
-            return None;
-        }
-        // Display allocations never change sampler options in place. Release the
-        // manager read lock before cloning the handle (retain takes a write lock).
+        let candidate = self
+            .exact_resident_edit_stage(key.idx)
+            .filter(|(_, pixels, _)| Arc::ptr_eq(pixels, edit_pixels))
+            .map(|(material, _, _)| material)
+            .or_else(|| {
+                let FsCacheEntry::Static {
+                    pixels,
+                    animation: StaticAnimationState::Still,
+                    ..
+                } = self.fs_cache.get(&key.idx)?
+                else {
+                    return None;
+                };
+                Arc::ptr_eq(pixels, edit_pixels)
+                    .then(|| self.source_material_for_idx(key.idx))
+                    .flatten()
+            })?;
+        let tex = candidate.source_texture();
+        // Release the manager read lock before retaining the allocation.
         let matches = ctx.tex_manager().read().meta(tex.id()).is_some_and(|meta| {
             meta.size == edit_pixels.size && meta.options == DISPLAY_IMAGE_TEXTURE_OPTIONS
         });
-        (matches && self.display_texture_matches_page(tex, key.idx)).then(|| tex.clone())
+        if matches && self.display_texture_matches_page(tex, key.idx) {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    fn shared_source_texture_for_edit(
+        &self,
+        ctx: &egui::Context,
+        key: &EditResultKey,
+        pixels: &Arc<egui::ColorImage>,
+    ) -> Option<egui::TextureHandle> {
+        self.shared_resident_texture_for_edit(ctx, key, pixels)
+            .map(|material| material.source_texture().clone())
     }
 
     /// 表示パイプライン用: 編集結果ピクセル + 表示テクスチャを確保する。先読みで
@@ -84609,6 +85794,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<(EditResultKey, Arc<egui::ColorImage>)> {
+        self.resolve_prepared_edit_for_display(ctx, idx);
         if self.fs_entry_is_animated(idx) {
             // Animated images are playback-only. Edit/final cache keys are not
             // frame-aware, so caching a derived frame here would freeze playback.
@@ -84620,8 +85806,10 @@ impl App {
                 return Some((key, Arc::clone(&entry.pixels)));
             }
             let pixels = Arc::clone(&entry.pixels);
-            if let Some(texture) = self.shared_source_texture_for_edit(ctx, &key, &pixels) {
-                self.edit_result_cache.get_mut(&key)?.texture = Some(texture);
+            if let Some(material) = self.shared_resident_texture_for_edit(ctx, &key, &pixels) {
+                let entry = self.edit_result_cache.get_mut(&key)?;
+                entry.display_basis = material.display_basis();
+                entry.texture = Some(material.source_texture().clone());
             } else if self.last_edit_materialize_upload_frame != self.frame_counter {
                 self.last_edit_materialize_upload_frame = self.frame_counter;
                 self.speculative_gpu_frame.note_ordinary_upload();
@@ -84643,9 +85831,25 @@ impl App {
         }
 
         let pixels = self.assemble_edit_result_pixels(ctx, idx)?;
-        let texture = if let Some(texture) = self.shared_source_texture_for_edit(ctx, &key, &pixels)
-        {
-            Some(texture)
+        let shared = self.shared_resident_texture_for_edit(ctx, &key, &pixels);
+        let display_basis = shared
+            .as_ref()
+            .map(|material| material.display_basis())
+            .or_else(|| {
+                self.exact_resident_edit_stage(idx)
+                    .filter(|(_, stage, _)| Arc::ptr_eq(stage, &pixels))
+                    .map(|(material, _, _)| material.display_basis())
+            })
+            .unwrap_or_else(|| {
+                self.accept_current_producer_display_basis(
+                    idx,
+                    material_sampler_size(pixels.size),
+                    pixels.size,
+                    false,
+                )
+            });
+        let texture = if let Some(material) = shared {
+            Some(material.source_texture().clone())
         } else if self.last_edit_materialize_upload_frame != self.frame_counter {
             self.last_edit_materialize_upload_frame = self.frame_counter;
             self.speculative_gpu_frame.note_ordinary_upload();
@@ -84666,12 +85870,7 @@ impl App {
         self.edit_result_cache.insert(
             key,
             EditResultEntry {
-                display_basis: self.accept_current_producer_display_basis(
-                    idx,
-                    material_sampler_size(pixels.size),
-                    pixels.size,
-                    false,
-                ),
+                display_basis,
                 pixels: Arc::clone(&pixels),
                 texture,
             },
@@ -84700,12 +85899,18 @@ impl App {
         self.edit_result_cache.insert(
             key,
             EditResultEntry {
-                display_basis: self.accept_current_producer_display_basis(
-                    idx,
-                    material_sampler_size(pixels.size),
-                    pixels.size,
-                    false,
-                ),
+                display_basis: self
+                    .exact_resident_edit_stage(idx)
+                    .filter(|(_, stage, _)| Arc::ptr_eq(stage, &pixels))
+                    .map(|(material, _, _)| material.display_basis())
+                    .unwrap_or_else(|| {
+                        self.accept_current_producer_display_basis(
+                            idx,
+                            material_sampler_size(pixels.size),
+                            pixels.size,
+                            false,
+                        )
+                    }),
                 pixels: Arc::clone(&pixels),
                 texture: None,
             },
@@ -86021,7 +87226,7 @@ impl App {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         self.final_ai_pending.clear();
-        self.cancel_all_final_effects();
+        self.cancel_all_final_effects(PreparedEditCancel::FullResolutionDeferred);
     }
 
     #[cfg(test)]
@@ -86703,7 +87908,16 @@ impl App {
         true
     }
 
+    #[track_caller]
     fn cancel_final_effects_for_idx(&mut self, idx: usize) {
+        self.cancel_final_effects_for_idx_with_reason(
+            idx,
+            PreparedEditCancel::PipelineInvalidation(FinalPipelineInvalidation::EditStagesChanged),
+        );
+    }
+
+    #[track_caller]
+    fn cancel_final_effects_for_idx_with_reason(&mut self, idx: usize, reason: PreparedEditCancel) {
         let keys: Vec<FinalCompositeKey> = self
             .final_effect_pending
             .keys()
@@ -86711,15 +87925,15 @@ impl App {
             .filter(|key| key.edit_key.idx == idx)
             .collect();
         for key in keys {
-            if let Some(pending) = self.final_effect_pending.remove(&key) {
-                pending.cancel.store(true, Ordering::Relaxed);
-            }
+            self.cancel_final_effect_key(key, reason);
         }
     }
 
-    fn cancel_all_final_effects(&mut self) {
-        for (_, pending) in self.final_effect_pending.drain() {
-            pending.cancel.store(true, Ordering::Relaxed);
+    #[track_caller]
+    fn cancel_all_final_effects(&mut self, reason: PreparedEditCancel) {
+        let keys: Vec<_> = self.final_effect_pending.keys().copied().collect();
+        for key in keys {
+            self.cancel_final_effect_key(key, reason);
         }
     }
 
@@ -86783,9 +87997,24 @@ impl App {
             }
         }
         for key in disconnected {
-            self.final_effect_pending.remove(&key);
-            self.final_composite_cache
-                .remove_with_drop_reason(&key, "worker_disconnected");
+            self.record_prepared_edit_disposition(
+                key,
+                PreparedEditDisposition::Cancelled(PreparedEditCancel::WorkerDisconnected),
+            );
+            let edited = self
+                .final_effect_pending
+                .remove(&key)
+                .is_some_and(|pending| pending.state.edit_input().is_some());
+            if !edited {
+                self.final_composite_cache
+                    .remove_with_drop_reason(&key, "worker_disconnected");
+            } else {
+                crate::logger::log(format!(
+                    "[edit-prepare] worker disconnected idx={}",
+                    key.edit_key.idx
+                ));
+                self.show_feedback_toast("編集画像の先読みを完了できませんでした".to_owned());
+            }
         }
         completed
     }
@@ -86815,6 +88044,9 @@ impl App {
         }
         let mut had_updates = false;
         for key in completed {
+            if self.adopt_prepared_edit(ctx, key, phase, false) {
+                continue;
+            }
             let Some(pending) = self.final_effect_pending.get(&key) else {
                 continue;
             };
@@ -86940,6 +88172,7 @@ impl App {
                 _ => None,
             };
             let (result, prepared_upload) = match ready {
+                FinalEffectReady::Edited(_) => unreachable!("edit pipeline adopted by its owner"),
                 FinalEffectReady::Legacy(result) => (result, None),
                 FinalEffectReady::Prepared(ready) => (
                     FinalCompositeResult::Ready {
@@ -87208,6 +88441,7 @@ impl App {
         source_size: [usize; 2],
         output_complete: bool,
     ) -> Option<egui::TextureHandle> {
+        self.resolve_prepared_edit_for_display(ctx, key.edit_key.idx);
         let reuse_prefetch = self
             .final_effect_pending
             .get(&key)
@@ -87231,7 +88465,12 @@ impl App {
         // 再合成中もその texture を返し、完成結果の同一 key insert で原子的に差し替える。
         self.cancel_prefetch_final_effects_except(reuse_prefetch.then_some(key));
         if !reuse_prefetch {
-            self.cancel_final_effects_for_idx(key.edit_key.idx);
+            self.cancel_final_effects_for_idx_with_reason(
+                key.edit_key.idx,
+                PreparedEditCancel::PipelineInvalidation(
+                    FinalPipelineInvalidation::DisplayEffectReplaced,
+                ),
+            );
         }
         if reuse_prefetch {
             if let Some(pending) = self.final_effect_pending.get_mut(&key) {
@@ -87560,6 +88799,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
+        self.resolve_prepared_edit_for_display(ctx, idx);
         #[cfg(test)]
         final_prepare_tests::observe_lookup(self);
         self.poll_final_effects(ctx);
@@ -87961,7 +89201,8 @@ impl App {
     /// 触れる前に呼ぶことで、注釈無し画像の通常閲覧をほぼゼロオーバーヘッドに保つ
     /// (Codex P3。comic.db lookup は page_path_key ごとに 1 度だけ、以降はメモリ)。
     /// デモ有効時はシードのため常に true。
-    pub(crate) fn comic_has_objects(&mut self, idx: usize) -> bool {
+    pub(crate) fn comic_has_objects(&mut self, ctx: &egui::Context, idx: usize) -> bool {
+        self.resolve_prepared_edit_for_display(ctx, idx);
         let Some(key) = self.page_path_key(idx) else {
             return false; // Folder / Video 等 (page_path_key 無し) は対象外
         };
@@ -87985,91 +89226,28 @@ impl App {
         self.comic_font_paths = paths;
     }
 
-    /// 既定フォント (COMIC_FONT_KEY="ui") + `extra_keys` + これまでロード済みのキーを
-    /// parse した新しい `FontSet` を構築して `comic_fonts` に差し替える。既定フォントを
-    /// 必ず最初に入れることで `FontSet::default_key` が "ui" になり、未知キーは既定へ
-    /// fallback する (= 既存注釈の互換)。フォント追加は新規参照時のみなので毎フレームでは
-    /// 走らない (Inc 4c)。
-    fn rebuild_comic_fontset(&mut self, extra_keys: &[String]) {
-        self.comic_fonts_loaded = true;
-        // 既定 JP フォント ("ui") を先頭に。見つからなければテキストを焼けない。
-        let Some(mut set) = crate::comic_overlay::load_comic_fonts() else {
-            self.comic_fonts = None;
-            self.comic_loaded_font_keys.clear();
-            crate::logger::log(
-                "[comic] 注釈描画用の日本語フォントが見つかりませんでした".to_string(),
-            );
-            return;
-        };
-        // これまでロード済みのキー ∪ 新規要求キー を parse して差し込む。
-        let mut keys: Vec<String> = self.comic_loaded_font_keys.iter().cloned().collect();
-        for k in extra_keys {
-            if !keys.iter().any(|e| e == k) {
-                keys.push(k.clone());
-            }
-        }
-        let mut loaded: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for key in keys {
-            let Some(path) = self.comic_font_paths.get(&key).cloned() else {
-                continue;
-            };
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            if let Ok(font) = comic_core::LoadedFont::from_bytes(key.clone(), bytes) {
-                set.insert(font);
-                loaded.insert(key);
-            }
-        }
-        self.comic_loaded_font_keys = loaded;
-        self.comic_fonts = Some(Arc::new(set));
-    }
-
-    /// 注釈描画用フォントセットを遅延ロードして返す (既定フォントのみ保証)。フォントが
-    /// 見つからなければ `None` (= テキストを焼けないので comic 合成自体をスキップ)。
-    /// 特定フォントを確実に含めたいベイク経路では [`ensure_comic_fonts_for`] を使う。
+    /// Display/edit/export adopts ready prefetch first, then reads missing fonts synchronously.
     pub(crate) fn ensure_comic_fonts(&mut self) -> Option<Arc<comic_core::FontSet>> {
-        self.ensure_comic_font_registry();
-        if !self.comic_fonts_loaded {
-            self.rebuild_comic_fontset(&[]);
+        self.comic_fonts.poll();
+        if self.comic_fonts.needs_sync(&[]) {
+            self.ensure_comic_font_registry();
+            self.comic_fonts.ensure(&[], &self.comic_font_paths);
         }
-        self.comic_fonts.clone()
+        self.comic_fonts.fonts().clone()
     }
 
-    /// `objects` が参照する全フォントを parse 済みにしてから `FontSet` を返す。未ロードの
-    /// 参照フォント (pack オノマトペ / ユーザー選択フォント) があれば 1 度だけ再構築する。
-    /// 既に全て揃っていればキャッシュ済み Arc をそのまま返す (ベイクの度には走らない)。
+    /// Include font references from both body text and name plates.
     pub(crate) fn ensure_comic_fonts_for(
         &mut self,
         objects: &[comic_core::AnnotationObject],
     ) -> Option<Arc<comic_core::FontSet>> {
-        self.ensure_comic_font_registry();
-        // 参照されていて、まだ未ロードで、パスが分かっているキーだけを集める。
-        // オブジェクト内の **全 TextBlock** を見る (本文 + メッセージウィンドウの名前
-        // プレート)。本文だけだと名前プレートの独自フォントが既定へ落ちる (Codex P2)。
-        let mut needed: Vec<String> = Vec::new();
-        let consider = |k: &str, needed: &mut Vec<String>| {
-            if k.is_empty() || k == crate::comic_overlay::COMIC_FONT_KEY {
-                return; // 既定は base ロードで賄う
-            }
-            if self.comic_loaded_font_keys.contains(k) {
-                return; // parse 済み
-            }
-            if !self.comic_font_paths.contains_key(k) {
-                return; // パス不明 → fallback 描画 (再構築しても無駄)
-            }
-            if !needed.iter().any(|e| e == k) {
-                needed.push(k.to_string());
-            }
-        };
-        for key in crate::comic_overlay::referenced_font_keys(objects) {
-            consider(&key, &mut needed);
+        self.comic_fonts.poll();
+        let keys = crate::comic_overlay::referenced_font_keys(objects);
+        if self.comic_fonts.needs_sync(&keys) {
+            self.ensure_comic_font_registry();
+            self.comic_fonts.ensure(&keys, &self.comic_font_paths);
         }
-        if self.comic_fonts.is_some() && needed.is_empty() {
-            return self.comic_fonts.clone();
-        }
-        self.rebuild_comic_fontset(&needed);
-        self.comic_fonts.clone()
+        self.comic_fonts.fonts().clone()
     }
 
     /// 被写体マット (BiRefNet) モデルパスのキャッシュを再評価する。
@@ -88314,7 +89492,7 @@ impl App {
             });
         }
         // 注釈が無い画像は下地に触れず即 None (通常閲覧はゼロオーバーヘッド、Codex P3)。
-        if !self.comic_has_objects(idx) {
+        if !self.comic_has_objects(ctx, idx) {
             return None;
         }
         // 下地は AI 完了済み (complete) の最終 composite。AI 待ちの間は None が返るので
@@ -88456,13 +89634,14 @@ impl App {
                 &bake_base, &layers,
             ));
             let upload = clamp_for_gpu(&composed).into_owned();
+            let texture_options = self.display_texture_options(idx);
             let texture = ctx.load_texture(
                 format!(
                     "comic_{idx}_{}_{comic_gen}_{preview_scale}",
                     Arc::as_ptr(&base) as usize
                 ),
                 upload,
-                self.display_texture_options(idx),
+                texture_options,
             );
             self.comic_cache.insert(
                 idx,
@@ -88473,6 +89652,7 @@ impl App {
                     ),
                     pixels: composed,
                     texture: texture.clone(),
+                    texture_options,
                     base: Arc::clone(&base),
                     comic_gen,
                     dims: [w, h],
@@ -88611,7 +89791,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<Arc<egui::ColorImage>> {
-        if !self.comic_has_objects(idx) {
+        if !self.comic_has_objects(ctx, idx) {
             return None;
         }
         let base = self.ensure_final_composite_pixels(ctx, idx)?;
@@ -88765,7 +89945,12 @@ impl App {
                     };
                     if live_pending {
                         self.final_ai_cache.insert(key, entry);
-                        self.cancel_final_effects_for_idx(key.edit_key.idx);
+                        self.cancel_final_effects_for_idx_with_reason(
+                            key.edit_key.idx,
+                            PreparedEditCancel::PipelineInvalidation(
+                                FinalPipelineInvalidation::FinalAiCompleted,
+                            ),
+                        );
                         repaint = true;
                     } else if retained_stored {
                         crate::logger::log(format!(
@@ -88855,9 +90040,7 @@ impl App {
             .filter(|key| !keep_set.contains(&key.edit_key.idx))
             .collect();
         for key in final_effect_evict {
-            if let Some(pending) = self.final_effect_pending.remove(&key) {
-                pending.cancel.store(true, Ordering::Relaxed);
-            }
+            self.cancel_final_effect_key(key, PreparedEditCancel::KeepSetEviction);
         }
         // comic は final composite を下地にするので keep_set に追従させる (Codex P2:
         // フル解像度 comic を eviction で生き残らせない + 下地と整合)。
@@ -91103,15 +92286,12 @@ impl App {
     /// に応じた左/右ページの idx。フルスクリーンを開いていなければ None。
     pub(crate) fn current_adjust_target_idx(&mut self) -> Option<usize> {
         let fs_idx = self.fullscreen_idx?;
-        Some(match self.resolve_visible_spread_pair(fs_idx) {
-            crate::ui_fullscreen::SpreadPair::Double { left, right } => {
-                match self.adjust_spread_target {
-                    AdjustSpreadTarget::Left => left,
-                    AdjustSpreadTarget::Right => right,
-                }
-            }
-            crate::ui_fullscreen::SpreadPair::Single => fs_idx,
-        })
+        Some(
+            self.resolve_visible_spread_edit_pages(fs_idx)
+                .map_or(fs_idx, |pages| {
+                    pages.target_idx(self.adjust_spread_target.unwrap_or(pages.reading_start))
+                }),
+        )
     }
 
     /// 保存スロットをグリッド上の対象に適用する。対象はページ単位のみ
@@ -91284,7 +92464,7 @@ impl App {
                 pair.pinned_input_size[0],
                 pair.pinned_input_size[1],
                 pair.allocated_cpu_bytes(),
-                usize::from(pair.pinned_texture.is_some()),
+                pair.managed_gpu_texture_count(),
             ));
         }
     }
@@ -91296,14 +92476,7 @@ impl App {
             .prepared_pair()
             .map_or(0, ComparePreparedPair::allocated_cpu_bytes);
         self.compare_view_mode = CompareViewMode::Off;
-        // 実行中workerはrun_pixel_workの途中で止められない。receiverを捨てると再開時に
-        // 次workerを起動できて並走するため、Preparingだけはpollして捨てるまで所有を保つ。
-        if !matches!(
-            self.compare_preparation,
-            ComparePreparationState::Preparing(_) | ComparePreparationState::Draining(_)
-        ) {
-            self.compare_preparation = ComparePreparationState::Unprepared;
-        }
+        self.compare_preparation.invalidate();
         self.clear_compare_gpu_pair();
         if released_cpu_bytes > 0 {
             crate::logger::log(format!(
@@ -91367,7 +92540,10 @@ impl App {
     pub(crate) fn clear_final_stage_only_caches(&mut self, idx: usize) {
         self.adjustment_cache.remove(&idx);
         self.invalidate_compare_prepared_for_idx(idx);
-        self.cancel_final_effects_for_idx(idx);
+        self.cancel_final_effects_for_idx_with_reason(
+            idx,
+            PreparedEditCancel::PipelineInvalidation(FinalPipelineInvalidation::AdjustmentChanged),
+        );
         // 360 度パノラマビュー: cache 内容が変わったので世代 bump (§3.6.2.2)。
         self.bump_adjustment_generation(idx);
         self.final_composite_cache
@@ -91435,7 +92611,7 @@ impl App {
         self.compare_preparation.invalidate();
         self.clear_compare_gpu_pair();
         self.compare_view_mode.cancel_wipe_drag();
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::AdjustmentChanged);
         // 360 度パノラマビュー: バルク clear に追随して全 entry を bump (§3.6.2.2)。
         self.bump_all_adjustment_generations();
     }
@@ -91642,7 +92818,12 @@ impl App {
         // 毎回 AI を待たされる退行があった (= 「先読み表示は出ているのに次画像で
         // 一瞬アップスケール前が見えて、AI 処理から再表示」のユーザー報告)。
         let Some(key) = self.metadata_cache_key(idx) else {
-            self.cancel_final_effects_for_idx(idx);
+            self.cancel_final_effects_for_idx_with_reason(
+                idx,
+                PreparedEditCancel::PipelineInvalidation(
+                    FinalPipelineInvalidation::AdjustmentChanged,
+                ),
+            );
             self.final_composite_cache
                 .retain_with_drop_reason("adjustment_generation", |cache_key, _| {
                     cache_key.edit_key.idx != idx
@@ -91652,7 +92833,10 @@ impl App {
         };
         let slot = self.adjustment_generation.entry(key).or_insert(0);
         *slot = slot.saturating_add(1);
-        self.cancel_final_effects_for_idx(idx);
+        self.cancel_final_effects_for_idx_with_reason(
+            idx,
+            PreparedEditCancel::PipelineInvalidation(FinalPipelineInvalidation::AdjustmentChanged),
+        );
         self.final_composite_cache
             .retain_with_drop_reason("adjustment_generation", |cache_key, _| {
                 cache_key.edit_key.idx != idx
@@ -91669,7 +92853,7 @@ impl App {
         for v in self.ai_upscale_generation.values_mut() {
             *v = v.saturating_add(1);
         }
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::AiGenerationChanged);
     }
 
     /// `adjustment_generation` の全 entry を +1 する (saturating)。
@@ -91679,7 +92863,7 @@ impl App {
         for v in self.adjustment_generation.values_mut() {
             *v = v.saturating_add(1);
         }
-        self.clear_all_final_pipeline_caches();
+        self.clear_all_final_pipeline_caches(FinalPipelineInvalidation::AdjustmentChanged);
     }
 
     /// 指定 source_key の `ai_upscale_generation` を +1 する (saturating)。
@@ -95534,6 +96718,7 @@ impl App {
                         return;
                     }
                     self.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::Edge {
+                        scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                         at_end: delta > 0,
                         at: std::time::Instant::now(),
                     });
@@ -102920,8 +104105,9 @@ mod material_display_owner_tests {
                     app.local_adjust_layer_bypass_cache.insert(
                         key,
                         LocalAdjustCacheEntry {
+                            texture_options: App::resident_texture_options(&ctx, &texture),
                             pixels,
-                            texture: texture.clone(),
+                            texture: Some(texture.clone()),
                             display_basis: expected,
                         },
                     );
@@ -102931,8 +104117,9 @@ mod material_display_owner_tests {
                     app.local_adjust_prefix_preview_cache.insert(
                         key,
                         LocalAdjustCacheEntry {
+                            texture_options: App::resident_texture_options(&ctx, &texture),
                             pixels,
-                            texture: texture.clone(),
+                            texture: Some(texture.clone()),
                             display_basis: expected,
                         },
                     );
@@ -103234,12 +104421,15 @@ impl App {
         &self,
         idx: usize,
     ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        if !self.local_adjust_is_materialized(idx) {
+            return None;
+        }
         let entry = self
             .local_adjust_cache
             .get(&self.current_local_adjust_key(idx))?;
         Some(self.fs_resource_for_accepted_texture(
             idx,
-            entry.texture.clone(),
+            entry.texture.as_ref()?.clone(),
             crate::source_coverage::SourceCoverage::FullSource,
             entry.display_basis,
         ))
@@ -103254,7 +104444,7 @@ impl App {
             .get(&self.current_local_adjust_layer_bypass_key(idx, layer_idx))?;
         Some(self.fs_resource_for_accepted_texture(
             idx,
-            entry.texture.clone(),
+            entry.texture.as_ref()?.clone(),
             crate::source_coverage::SourceCoverage::FullSource,
             entry.display_basis,
         ))
@@ -103269,7 +104459,7 @@ impl App {
             .get(&self.current_local_adjust_prefix_preview_key(idx, layer_count))?;
         Some(self.fs_resource_for_accepted_texture(
             idx,
-            entry.texture.clone(),
+            entry.texture.as_ref()?.clone(),
             crate::source_coverage::SourceCoverage::FullSource,
             entry.display_basis,
         ))
@@ -103310,7 +104500,7 @@ impl App {
             .filter(|entry| entry.generation == self.conceal_generation)?;
         Some(self.fs_resource_for_accepted_texture(
             idx,
-            entry.texture.clone(),
+            entry.texture.as_ref()?.clone(),
             crate::source_coverage::SourceCoverage::FullSource,
             entry.display_basis,
         ))

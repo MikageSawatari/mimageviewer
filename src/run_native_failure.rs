@@ -53,6 +53,9 @@ fn report_with_gpu(
                 egui_wgpu::WgpuError::NoSurfaceFormatsAvailable => {
                     ("Wgpu.NoSurfaceFormatsAvailable", None)
                 }
+                egui_wgpu::WgpuError::UnsupportedSurface { .. } => {
+                    ("Wgpu.UnsupportedSurface", None)
+                }
                 egui_wgpu::WgpuError::RequestDeviceError(cause) => {
                     ("Wgpu.RequestDeviceError", Some(cause))
                 }
@@ -111,6 +114,9 @@ fn report_with_gpu(
             ) => Some(Stage::AdapterSelection),
             eframe::Error::Wgpu(egui_wgpu::WgpuError::NoSurfaceFormatsAvailable) => {
                 Some(Stage::PipelineCreate)
+            }
+            eframe::Error::Wgpu(egui_wgpu::WgpuError::UnsupportedSurface { .. }) => {
+                Some(Stage::SurfaceCapabilities)
             }
             eframe::Error::Wgpu(egui_wgpu::WgpuError::CreateSurfaceError(_)) => {
                 Some(Stage::SurfaceCreate)
@@ -201,6 +207,144 @@ pub(crate) fn finish_run_native(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn startup_surface_failure_is_saved_before_notification() {
+        for mode in ["dialog", "script"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "run_native_failure::tests::startup_surface_failure_saved_log_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("MIV_STARTUP_SURFACE_FAILURE_TEST_CHILD", mode)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: isolated log/notification test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "isolated helper invoked by startup_surface_failure_is_saved_before_notification"]
+    fn startup_surface_failure_saved_log_child() {
+        let mode = std::env::var("MIV_STARTUP_SURFACE_FAILURE_TEST_CHILD").unwrap();
+        assert!(matches!(mode.as_str(), "dialog" | "script"));
+        let directory = tempfile::tempdir().unwrap();
+        let logs = directory.path().join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        let writer = crate::log_writer::test_support::writer(&logs, 32, 65536);
+        crate::log_writer::test_support::install_global(&writer);
+        let log_path = logs.join("mimageviewer.log");
+        let shown = RefCell::new(Vec::<String>::new());
+        let events = RefCell::new(Vec::new());
+
+        struct SavedLogExit<'a> {
+            path: &'a Path,
+            events: &'a RefCell<Vec<&'static str>>,
+            shown: &'a RefCell<Vec<String>>,
+        }
+        impl ExitEffects for SavedLogExit<'_> {
+            fn suspend_watchdog(&mut self) {
+                self.events.borrow_mut().push("suspend");
+            }
+            fn record(&mut self, report: &FailureReport) {
+                // Exercise the actual product path, which calls logger::log
+                // directly and does not depend on the dependency-target filter.
+                NativeExit.record(report);
+                self.events.borrow_mut().push("record");
+            }
+            fn terminal(&mut self, outcome: miv_startup::Outcome) {
+                NativeExit.terminal(outcome);
+                self.events.borrow_mut().push("terminal");
+            }
+            fn finish_logs(&mut self) {
+                NativeExit.finish_logs();
+                self.events.borrow_mut().push("flushed");
+            }
+            fn show(&mut self, body: &str) {
+                assert_eq!(self.events.borrow().last(), Some(&"flushed"));
+                let saved = std::fs::read_to_string(self.path).unwrap();
+                assert!(saved.contains("run_native failed: kind=Wgpu.UnsupportedSurface"));
+                assert!(saved.contains("injected startup GPU"));
+                assert!(saved.contains("SurfaceCapabilities"));
+                assert!(saved.contains("logging shutdown requested"));
+                assert!(body.contains("injected startup GPU"));
+                assert!(body.contains("段階: SurfaceCapabilities"));
+                assert!(body.contains("--gpu-backend vulkan"));
+                assert!(body.contains(&self.path.parent().unwrap().display().to_string()));
+                self.shown.borrow_mut().push(body.to_owned());
+            }
+        }
+
+        use crate::gpu_startup_diagnostics as gpu;
+        gpu::begin(crate::wgpu_backend_policy::GpuBackendRequest::Dx12);
+        let mut info = wgpu::AdapterInfo::new(wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Dx12);
+        info.name = "injected startup GPU".into();
+        gpu::observe(&egui_wgpu::StartupDiagnosticEvent::AdapterSelected(
+            info.clone(),
+        ));
+        gpu::observe(&egui_wgpu::StartupDiagnosticEvent::Begin(
+            egui_wgpu::StartupGpuStage::SurfaceCapabilities,
+        ));
+        gpu::observe(&egui_wgpu::StartupDiagnosticEvent::End {
+            stage: egui_wgpu::StartupGpuStage::SurfaceCapabilities,
+            success: false,
+        });
+        // Inject the same typed Err returned by the first root configuration.
+        // No device, window or native MessageBox is created by this fixture.
+        let result = finish_run_native(
+            Err(eframe::Error::Wgpu(
+                egui_wgpu::WgpuError::UnsupportedSurface {
+                    adapter: info.name,
+                    backend: info.backend,
+                },
+            )),
+            mode == "script",
+            directory.path(),
+            || events.borrow_mut().push("cleanup"),
+            SavedLogExit {
+                path: &log_path,
+                events: &events,
+                shown: &shown,
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(eframe::Error::Wgpu(
+                egui_wgpu::WgpuError::UnsupportedSurface { .. }
+            ))
+        ));
+        assert_eq!(
+            *events.borrow(),
+            ["suspend", "record", "cleanup", "terminal", "flushed"]
+        );
+        let saved = std::fs::read_to_string(&log_path).unwrap();
+        assert!(saved.contains("run_native failed: kind=Wgpu.UnsupportedSurface"));
+        assert!(saved.contains("injected startup GPU"));
+        assert!(saved.contains("SurfaceCapabilities"));
+        assert!(saved.contains("logging shutdown requested"));
+        assert_eq!(shown.borrow().len(), usize::from(mode == "dialog"));
+    }
+
+    #[test]
+    fn unsupported_surface_reports_gpu_and_capabilities_stage() {
+        let error = eframe::Error::Wgpu(egui_wgpu::WgpuError::UnsupportedSurface {
+            adapter: "injected GPU".into(),
+            backend: wgpu::Backend::Dx12,
+        });
+        let report = report_with_gpu(&error, "logs", &Default::default());
+        assert_eq!(report.kind, "Wgpu.UnsupportedSurface");
+        assert!(report.log_detail.contains("injected GPU"));
+        assert!(report.dialog_body.contains("injected GPU"));
+        assert!(report.dialog_body.contains("段階: SurfaceCapabilities"));
+        assert!(report.dialog_body.contains("ドライバー"));
+    }
 
     #[test]
     fn gpu_startup_diagnostics_only_extend_graphics_failure_and_resolve_fatal_stage() {

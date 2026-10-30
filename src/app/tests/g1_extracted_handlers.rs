@@ -36,6 +36,7 @@ impl Entrance {
                     kind_filter: crate::tag_view::TagViewKindFilter::All,
                     summaries: Vec::new(),
                     entries: vec![crate::tag_view::TagViewEntry {
+                        applied_at_ms: None,
                         path: page.to_path_buf(),
                         kind: crate::tag_view::TagViewItemKind::Image,
                         mtime: 1,

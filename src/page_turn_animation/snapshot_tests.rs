@@ -26,6 +26,7 @@ enum SceneGeometry {
     SpineEdge,
     FixedSingleSpine,
     ResidentQuality,
+    Crop,
 }
 
 impl SceneGeometry {
@@ -39,6 +40,7 @@ impl SceneGeometry {
             Self::SpineEdge => "spine_edge_",
             Self::FixedSingleSpine => "fixed_spine_",
             Self::ResidentQuality => "resident_quality_",
+            Self::Crop => "crop_",
         }
     }
 
@@ -266,6 +268,7 @@ fn units(textures: &SceneTextures, spread: bool, cell: Rect) -> (CanonicalUnit, 
             &textures.old[slot as usize]
         }),
         underlay: Some(material(&textures.checker)),
+        crop: None,
     };
     let unit = |incoming| CanonicalUnit {
         pixels_per_point: 1.0,
@@ -317,6 +320,13 @@ fn paint_canonical(painter: &egui::Painter, unit: &CanonicalUnit) {
                 *texture_id,
                 Color32::WHITE,
             );
+        }
+        if let Some(crop) = page.crop {
+            for draw in project_flat_crop(page.rect, page.clip_rect, &rectangle(page.rect), crop) {
+                painter
+                    .with_clip_rect(draw.clip_rect)
+                    .add(egui::Shape::mesh(draw.mesh));
+            }
         }
     }
 }
@@ -412,9 +422,19 @@ let ctx = &root_ui.ctx().clone();
                         page.rect = Rect::from_center_size(center, vec2(page.rect.width(), 184.0));
                     }
                 }
-                SceneGeometry::Equal | SceneGeometry::PortraitPdf | SceneGeometry::OpaqueBlack | SceneGeometry::SpineEdge | SceneGeometry::FixedSingleSpine | SceneGeometry::ResidentQuality => {}
+                SceneGeometry::Equal | SceneGeometry::PortraitPdf | SceneGeometry::OpaqueBlack | SceneGeometry::SpineEdge | SceneGeometry::FixedSingleSpine | SceneGeometry::ResidentQuality | SceneGeometry::Crop => {}
             }
             let mut old = old;
+            if matches!(geometry, SceneGeometry::Crop) {
+                for unit in [&mut old, &mut new] {
+                    for page in &mut unit.pages {
+                        page.crop = Some(PageCropPaint {
+                            full: rectangle(unit_uv()).try_into().unwrap(),
+                            corners: rectangle(Rect::from_min_max(pos2(0.16, 0.21), pos2(0.82, 0.75))).try_into().unwrap(),
+                        });
+                    }
+                }
+            }
             if matches!(geometry, SceneGeometry::TallerIncoming) {
                 for page in &mut old.pages {
                     page.rect = Rect::from_center_size(page.rect.center(), vec2(page.rect.width(), 184.0 / 1.5));
@@ -537,6 +557,7 @@ fn moving_spine_units(textures: &SceneTextures, cell: Rect) -> (CanonicalUnit, C
                         &textures.old[slot]
                     }),
                     underlay: Some(material(&textures.checker)),
+                    crop: None,
                 })
                 .collect(),
         }
@@ -924,6 +945,7 @@ fn spread_window_fixture(
                         &pair.old[slot]
                     }),
                     underlay: Some(material(&pair.checker)),
+                    crop: None,
                 })
                 .collect(),
         };
@@ -975,6 +997,7 @@ fn spread_window_fixture(
                 },
                 material_rotation,
             )),
+            crop: None,
         }],
     }
 }
@@ -1772,3 +1795,11 @@ route_test!(
     true,
     false
 );
+
+#[test]
+fn page_turn_projection_snapshot_crop_flat_front_back_canonical() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    snapshots.extend(snapshot_scene(false, false, true, SceneGeometry::Crop));
+    snapshots.extend(snapshot_scene(true, true, true, SceneGeometry::Crop));
+    snapshots.unwrap();
+}

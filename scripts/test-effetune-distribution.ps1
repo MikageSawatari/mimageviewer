@@ -71,7 +71,7 @@ try {
     [System.IO.File]::WriteAllText($manifestPath, ($manifestLines -join "`n") + "`n")
     $versionPath = Join-Path $source 'VERSION'
     $versionBytes = [System.IO.File]::ReadAllBytes($versionPath)
-    foreach ($unsupported in @('0.13.0', '99.0.0')) {
+    foreach ($unsupported in @('0.13.0', '0.14.0', '99.0.0')) {
         [System.IO.File]::WriteAllText($versionPath, $unsupported)
         Assert-Throws { Assert-MivEffetuneSource -SourceRoot $source -NoticesRoot $noticesRoot } 'Unsupported VERSION'
     }

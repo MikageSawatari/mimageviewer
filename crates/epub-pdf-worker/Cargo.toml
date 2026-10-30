@@ -14,7 +14,9 @@ path = "src/job_probe.rs"
 [dependencies]
 libavif-sys = { path = "../libavif-sys" }
 quick-xml = "0.41"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+# 2.6.1 regresses data_start bounds, corrupt local-header rejection and I/O details.
+# Unpin only after all three contracts are preserved; see dependency-update-20261028.md.
+zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }

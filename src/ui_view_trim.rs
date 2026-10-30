@@ -5,8 +5,8 @@ use crate::settings::FullscreenFitMode;
 use crate::ui_fullscreen::SpreadPair;
 use crate::ui_fullscreen::draw_icons::draw_close_icon;
 use crate::view_trim::{
-    MAX_VIEW_TRIM_MARGIN, ViewTrimApplyMode, ViewTrimBookSettings, ViewTrimLinkedMargins,
-    ViewTrimMargins, ViewTrimPageOverride, ViewTrimSpreadSide,
+    MAX_VIEW_TRIM_MARGIN, ViewTrimApplyMode, ViewTrimBookPreference, ViewTrimBookSettings,
+    ViewTrimLinkedMargins, ViewTrimMargins, ViewTrimPageOverride, ViewTrimSpreadSide,
 };
 
 const PANEL_W: f32 = 260.0;
@@ -14,13 +14,6 @@ const PANEL_MARGIN: f32 = 14.0;
 const PANEL_TOP: f32 = 72.0;
 const PANEL_MIN_H: f32 = 250.0;
 const PANEL_MAX_H: f32 = 560.0;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ViewTrimUiMode {
-    None,
-    Auto,
-    Manual,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OriginalViewTrimAction {
@@ -37,31 +30,6 @@ pub(crate) struct OriginalViewTrimRequest {
     pub(crate) spread_pair: SpreadPair,
     pub(crate) action: OriginalViewTrimAction,
     state_fingerprint: u64,
-}
-
-fn view_trim_ui_mode_from_internal(
-    base_apply_mode: ViewTrimApplyMode,
-    page_apply: bool,
-) -> ViewTrimUiMode {
-    if page_apply {
-        return ViewTrimUiMode::Manual;
-    }
-    match base_apply_mode {
-        ViewTrimApplyMode::None => ViewTrimUiMode::None,
-        ViewTrimApplyMode::Auto => ViewTrimUiMode::Auto,
-        ViewTrimApplyMode::Book | ViewTrimApplyMode::Page => ViewTrimUiMode::Manual,
-    }
-}
-
-fn view_trim_internal_from_ui(
-    ui_mode: ViewTrimUiMode,
-    manual_page_apply: bool,
-) -> (ViewTrimApplyMode, bool) {
-    match ui_mode {
-        ViewTrimUiMode::None => (ViewTrimApplyMode::None, false),
-        ViewTrimUiMode::Auto => (ViewTrimApplyMode::Auto, false),
-        ViewTrimUiMode::Manual => (ViewTrimApplyMode::Book, manual_page_apply),
-    }
 }
 
 pub(crate) struct PendingViewTrimTransfer {
@@ -725,46 +693,6 @@ mod tests {
         assert!(!page_overrides.contains_key(&right_idx));
         assert_eq!(dirty, std::collections::HashSet::from([left_idx]));
     }
-
-    #[test]
-    fn view_trim_ui_state_maps_to_existing_internal_modes() {
-        assert_eq!(
-            view_trim_internal_from_ui(ViewTrimUiMode::None, true),
-            (ViewTrimApplyMode::None, false)
-        );
-        assert_eq!(
-            view_trim_internal_from_ui(ViewTrimUiMode::Auto, true),
-            (ViewTrimApplyMode::Auto, false)
-        );
-        assert_eq!(
-            view_trim_internal_from_ui(ViewTrimUiMode::Manual, false),
-            (ViewTrimApplyMode::Book, false)
-        );
-        assert_eq!(
-            view_trim_internal_from_ui(ViewTrimUiMode::Manual, true),
-            (ViewTrimApplyMode::Book, true)
-        );
-    }
-
-    #[test]
-    fn view_trim_internal_modes_map_to_three_ui_modes() {
-        assert_eq!(
-            view_trim_ui_mode_from_internal(ViewTrimApplyMode::None, false),
-            ViewTrimUiMode::None
-        );
-        assert_eq!(
-            view_trim_ui_mode_from_internal(ViewTrimApplyMode::Auto, false),
-            ViewTrimUiMode::Auto
-        );
-        assert_eq!(
-            view_trim_ui_mode_from_internal(ViewTrimApplyMode::Book, false),
-            ViewTrimUiMode::Manual
-        );
-        assert_eq!(
-            view_trim_ui_mode_from_internal(ViewTrimApplyMode::Book, true),
-            ViewTrimUiMode::Manual
-        );
-    }
 }
 
 fn set_book_spread_separate(book: &mut ViewTrimBookSettings, separate: bool) {
@@ -876,10 +804,12 @@ impl App {
         ) || self.settings.margin_fit_enabled
     }
 
-    fn effective_view_trim_base_apply_mode(&self) -> ViewTrimApplyMode {
-        crate::view_trim::effective_view_trim_base_apply_mode(
-            self.view_trim_apply_mode,
-            self.legacy_margin_fit_active_for_view_trim(),
+    pub(crate) fn resolved_view_trim_base_mode(&self) -> ViewTrimApplyMode {
+        crate::view_trim::resolve_view_trim_apply_mode(
+            self.view_trim_book_preference,
+            self.settings.auto_view_trim_default_enabled,
+            false,
+            None,
         )
     }
 
@@ -890,8 +820,10 @@ impl App {
         // (表示トリム実装時の見落とし。2026-07-28 修正)。
         // view_trim_pages はリリース済みデータなので削除・移行はしない。旧実装では
         // 「チェックしている間だけ効く」値だった行が、以後は常に効くようになる。
-        crate::view_trim::effective_view_trim_apply_mode(
-            self.effective_view_trim_base_apply_mode(),
+        crate::view_trim::resolve_view_trim_apply_mode(
+            self.view_trim_book_preference,
+            self.settings.auto_view_trim_default_enabled,
+            false,
             self.view_trim_page_overrides.get(&idx).copied(),
         )
     }
@@ -954,7 +886,7 @@ impl App {
         left_idx: usize,
         right_idx: usize,
     ) -> (Option<egui::Rect>, Option<egui::Rect>) {
-        match self.effective_view_trim_base_apply_mode() {
+        match self.resolved_view_trim_base_mode() {
             ViewTrimApplyMode::None => (None, None),
             ViewTrimApplyMode::Auto => crate::view_trim::harmonize_spread_auto_bboxes(
                 self.view_trim_auto_content_bbox(left_idx, "spread_pair_left"),
@@ -1022,10 +954,7 @@ impl App {
         _fs_idx: usize,
         _spread_pair: SpreadPair,
     ) -> bool {
-        !matches!(
-            self.effective_view_trim_base_apply_mode(),
-            ViewTrimApplyMode::None
-        )
+        !matches!(self.resolved_view_trim_base_mode(), ViewTrimApplyMode::None)
     }
 
     fn view_trim_original_state_fingerprint(&self, anchor: usize, pair: SpreadPair) -> u64 {
@@ -1040,7 +969,7 @@ impl App {
         let state = format!(
             "{:?}",
             (
-                self.view_trim_apply_mode,
+                self.view_trim_book_preference,
                 self.view_trim_book_settings,
                 self.view_trim_page_spread_separate,
                 self.view_trim_page_overrides.get(&left),
@@ -1071,7 +1000,7 @@ impl App {
         {
             return false;
         }
-        let base_mode = self.effective_view_trim_base_apply_mode();
+        let base_mode = self.resolved_view_trim_base_mode();
         let page = view_trim_page_scope_selected(
             &self.view_trim_page_overrides,
             anchor,
@@ -1371,15 +1300,12 @@ impl App {
         if !self.view_trim_save_pending {
             return None;
         }
-        let book = self.spread_container_key().map(|key| {
+        let book = self.spread_container_key_with_fallback().map(|key| {
             let state = crate::view_trim::ViewTrimBookState {
-                apply_mode: match self.view_trim_apply_mode {
-                    ViewTrimApplyMode::Page => ViewTrimApplyMode::None,
-                    mode => mode,
-                },
+                preference: self.view_trim_book_preference,
                 book_settings: self.view_trim_book_settings,
             };
-            (key, state)
+            (key.exact, key.fallback, state)
         });
         let mut dirty_page_indices = self
             .view_trim_dirty_page_overrides
@@ -1441,12 +1367,12 @@ impl App {
             SpreadPair::Single => (page_single_existing, page_single_existing),
         };
 
-        let mut base_apply_mode = self.effective_view_trim_base_apply_mode();
+        let mut base_apply_mode = self.resolved_view_trim_base_mode();
         let page_scope_selected =
             view_trim_page_scope_selected(&self.view_trim_page_overrides, fs_idx, spread_pair);
         let mut page_apply =
             matches!(base_apply_mode, ViewTrimApplyMode::Book) && page_scope_selected;
-        let mut ui_mode = view_trim_ui_mode_from_internal(base_apply_mode, page_apply);
+        let mut ui_mode = self.view_trim_book_preference;
         let mut base_mode_changed = false;
         let mut page_spread_separate = match spread_pair {
             SpreadPair::Double { .. } if page_apply => page_spread_separate_from_overrides(
@@ -1515,26 +1441,48 @@ impl App {
                 // 同じラジオ列と独立 checkbox に混在させ、間に scope control が
                 // 挟まるため、続くスライダーの書き込み先が読み取りにくかった。
                 let ui_mode_before = ui_mode;
-                ui.radio_value(&mut ui_mode, ViewTrimUiMode::None, "トリムなし");
+                let inherited_mode = crate::view_trim::resolve_view_trim_apply_mode(
+                    ViewTrimBookPreference::FollowGlobal,
+                    self.settings.auto_view_trim_default_enabled,
+                    false,
+                    None,
+                );
                 ui.radio_value(
                     &mut ui_mode,
-                    ViewTrimUiMode::Auto,
+                    ViewTrimBookPreference::FollowGlobal,
+                    format!(
+                        "全体設定に従う（現在: {}）",
+                        if inherited_mode == ViewTrimApplyMode::Auto {
+                            "自動余白カット"
+                        } else {
+                            "トリムなし"
+                        }
+                    ),
+                );
+                ui.radio_value(&mut ui_mode, ViewTrimBookPreference::None, "トリムなし");
+                ui.radio_value(
+                    &mut ui_mode,
+                    ViewTrimBookPreference::Auto,
                     "自動余白カット（本全体）",
                 )
                 .on_hover_text("本全体に適用します。余白量はページごとに自動検出します");
-                ui.radio_value(&mut ui_mode, ViewTrimUiMode::Manual, "手動設定");
+                ui.radio_value(&mut ui_mode, ViewTrimBookPreference::Manual, "手動設定");
 
                 if ui_mode != ui_mode_before {
-                    auto_page_seed_pending =
-                        ui_mode == ViewTrimUiMode::Manual && ui_mode_before == ViewTrimUiMode::Auto;
-                    let (next_base_mode, _) = view_trim_internal_from_ui(ui_mode, page_apply);
-                    base_mode_changed = next_base_mode != base_apply_mode;
-                    base_apply_mode = next_base_mode;
-                    page_apply = ui_mode == ViewTrimUiMode::Manual && page_scope_selected;
+                    auto_page_seed_pending = ui_mode == ViewTrimBookPreference::Manual
+                        && base_apply_mode == ViewTrimApplyMode::Auto;
+                    base_mode_changed = true;
+                    base_apply_mode = crate::view_trim::resolve_view_trim_apply_mode(
+                        ui_mode,
+                        self.settings.auto_view_trim_default_enabled,
+                        false,
+                        None,
+                    );
+                    page_apply = ui_mode == ViewTrimBookPreference::Manual && page_scope_selected;
                     repaint_requested = true;
                 }
 
-                if ui_mode == ViewTrimUiMode::Manual {
+                if ui_mode == ViewTrimBookPreference::Manual {
                     ui.horizontal(|ui| {
                         ui.add_space(12.0);
                         ui.label("適用範囲：");
@@ -1683,11 +1631,8 @@ impl App {
                 return;
             }
             changed = true;
-            match base_apply_mode {
-                ViewTrimApplyMode::Book => {
-                    book.enabled = true;
-                }
-                ViewTrimApplyMode::None | ViewTrimApplyMode::Auto | ViewTrimApplyMode::Page => {}
+            if base_apply_mode == ViewTrimApplyMode::Book {
+                book.enabled = true;
             }
             if self.legacy_margin_fit_active_for_view_trim() {
                 self.set_fullscreen_fit_mode_for_current(ctx, fs_idx, FullscreenFitMode::Page);
@@ -1765,13 +1710,13 @@ impl App {
         }
         if clear_page_requested {
             self.remove_view_trim_page_overrides_for_spread(fs_idx, spread_pair);
-            self.view_trim_apply_mode = base_apply_mode;
+            self.view_trim_book_preference = ui_mode;
             self.view_trim_page_spread_separate = book.spread_separate;
             self.view_trim_book_settings = book;
             changed = true;
             repaint_requested = true;
         } else {
-            self.view_trim_apply_mode = base_apply_mode;
+            self.view_trim_book_preference = ui_mode;
             self.view_trim_page_spread_separate = if page_apply {
                 page_spread_separate
             } else {
@@ -1799,7 +1744,7 @@ impl App {
 
         // Manual の本全体を実際に編集したら、Auto 由来の一時シード候補は古くなる。
         if changed
-            && ui_mode == ViewTrimUiMode::Manual
+            && ui_mode == ViewTrimBookPreference::Manual
             && !page_apply
             && !base_mode_changed
             && original_action.is_none()

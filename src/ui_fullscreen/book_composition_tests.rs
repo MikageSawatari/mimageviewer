@@ -174,7 +174,7 @@ fn book_composition_rating_key_rebase_recomputes_paint_permission_and_masked_anc
 
 #[test]
 fn composed_blank_trim_uses_physical_slot_and_single_projection_uses_single_margin() {
-    use crate::view_trim::{ViewTrimApplyMode, ViewTrimMargins, ViewTrimSpreadSide};
+    use crate::view_trim::{ViewTrimMargins, ViewTrimSpreadSide};
     for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
         let mut app = composed_app(&specified_book(
             direction,
@@ -185,7 +185,7 @@ fn composed_blank_trim_uses_physical_slot_and_single_projection_uses_single_marg
             false,
         ));
         app.view_trim_book_settings.enabled = true;
-        app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         app.view_trim_book_settings.spread_separate = true;
         app.view_trim_book_settings.single = ViewTrimMargins {
             left: 0.03,

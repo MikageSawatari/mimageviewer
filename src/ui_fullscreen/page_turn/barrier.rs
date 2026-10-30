@@ -427,7 +427,7 @@ impl App {
             if !self.set_live_spread_shift(anchor) {
                 return true;
             }
-            self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
+            self.adjust_spread_target = None;
         }
         if let ResolvedNavigationIntent::Slideshow { slice, purpose } = command.intent {
             self.complete_book_slideshow_target(ctx, command.target_idx, slice, purpose);

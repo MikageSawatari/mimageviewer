@@ -844,7 +844,7 @@ pub(super) struct ContainerEngine {
     pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
     pdf_page_counts: Mutex<HashMap<PdfIdentity, u32>>,
     spread_db: Mutex<Result<Option<crate::spread_db::SpreadDb>, String>>,
-    view_trim_db: Mutex<Option<crate::view_trim_db::ViewTrimDb>>,
+    view_trim_db: Mutex<Result<Option<crate::view_trim_db::ViewTrimDb>, String>>,
     resume_reader: Option<ResumeReader>,
     adjustment_settings: AdjustmentSettingsSource,
     creative_lut_cache: Mutex<RemoteCreativeLutCache>,
@@ -872,6 +872,8 @@ enum RemoteReadingSettingsSource {
     Live,
     #[cfg(test)]
     Snapshot(crate::settings_db::RemoteReadingSettings),
+    #[cfg(test)]
+    CountedSnapshot(crate::settings_db::RemoteReadingSettings, Arc<AtomicUsize>),
 }
 
 impl RemoteReadingSettingsSource {
@@ -886,6 +888,11 @@ impl RemoteReadingSettingsSource {
             }
             #[cfg(test)]
             Self::Snapshot(settings) => Ok(*settings),
+            #[cfg(test)]
+            Self::CountedSnapshot(settings, reads) => {
+                reads.fetch_add(1, Ordering::Relaxed);
+                Ok(*settings)
+            }
         }
     }
 }
@@ -2683,15 +2690,13 @@ impl ContainerEngine {
             });
         let view_trim_db_path = crate::data_dir::get().join("view_trim.db");
         let view_trim_db =
-            match crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&view_trim_db_path) {
-                Ok(db) => db,
-                Err(error) => {
+            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&view_trim_db_path)
+                .map_err(|error| {
                     crate::logger::log(format!(
                         "remote_ipc: view trim DB read-only open failed: {error}"
                     ));
-                    None
-                }
-            };
+                    error.to_string()
+                });
         let raw_develop_executor = raw_develop_executor.unwrap_or_else(|| {
             Arc::new(
                 crate::raw::RawDevelopExecutor::new(
@@ -7082,27 +7087,46 @@ impl ContainerEngine {
             &page_address.subresource,
         )
         .ok_or_else(|| media_error(MediaErrorCode::BadRequest, "表示トリム対象が不正です"))?;
-        let db = lock_with_remote_page_wait(&self.view_trim_db, wait_stage, None);
-        let state = db
+        let db_guard = lock_with_remote_page_wait(&self.view_trim_db, wait_stage, None);
+        let db = match db_guard.as_ref() {
+            Ok(db) => db,
+            Err(error) => {
+                crate::logger::log(format!("remote_ipc: view trim DB unavailable: {error}"));
+                return Ok(RemoteViewTrimPlan::Stored(None));
+            }
+        };
+        let loaded = db
             .as_ref()
-            .and_then(|db| db.get_book_state(&keys.exact))
-            .or_else(|| {
-                keys.fallback
-                    .as_deref()
-                    .and_then(|fallback| db.as_ref().and_then(|db| db.get_book_state(fallback)))
-            })
-            .unwrap_or_default();
+            .map(|db| db.load_book_preference_with_fallback(&keys.exact, keys.fallback.as_deref()))
+            .unwrap_or(crate::view_trim_db::ViewTrimBookLoad::Missing);
+        if matches!(
+            loaded,
+            crate::view_trim_db::ViewTrimBookLoad::Invalid(_)
+                | crate::view_trim_db::ViewTrimBookLoad::Error(_)
+        ) {
+            crate::logger::log(format!("remote_ipc: view trim read failed: {loaded:?}"));
+            return Ok(RemoteViewTrimPlan::Stored(None));
+        }
+        let allows_legacy_migration = loaded.allows_legacy_margin_fit_migration();
+        let state = loaded.state_or_default();
         let page_override = db.as_ref().and_then(|db| db.get_page_override(&page_key));
-        drop(db);
-        let legacy_margin_fit = matches!(
-            self.settings.fullscreen_fit_mode,
-            crate::settings::FullscreenFitMode::MarginFit
-        ) || self.settings.margin_fit_enabled;
-        let base_mode = crate::view_trim::effective_view_trim_base_apply_mode(
-            state.apply_mode,
+        drop(db_guard);
+        // Read live defaults exactly once for this page and its spread partner.
+        let reading_settings = self
+            .reading_settings
+            .load(&self.settings)
+            .map_err(remote_reading_settings_error)?;
+        let legacy_margin_fit = allows_legacy_migration
+            && (matches!(
+                reading_settings.fullscreen_fit_mode,
+                crate::settings::FullscreenFitMode::MarginFit
+            ) || reading_settings.margin_fit_enabled);
+        let mode = crate::view_trim::resolve_view_trim_apply_mode(
+            state.preference,
+            reading_settings.auto_view_trim_default_enabled,
             legacy_margin_fit,
+            page_override,
         );
-        let mode = crate::view_trim::effective_view_trim_apply_mode(base_mode, page_override);
         let spread_side = render_context.and_then(|context| match context.display_slot {
             RemotePageDisplaySlot::Single => None,
             RemotePageDisplaySlot::SpreadLeft => Some(crate::view_trim::ViewTrimSpreadSide::Left),
@@ -7124,6 +7148,29 @@ impl ContainerEngine {
             }
             let partner_resolved = self.resolve(&partner)?;
             self.remote_view_trim_keys(&partner, &partner_resolved, render_context)?;
+            let partner_key = crate::edit_source::page_key_for_remote(
+                &partner_resolved.logical,
+                &partner.subresource,
+            )
+            .ok_or_else(|| media_error(MediaErrorCode::BadRequest, "表示トリム対象が不正です"))?;
+            let db = self
+                .view_trim_db
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let partner_override = db
+                .as_ref()
+                .ok()
+                .and_then(|db| db.as_ref())
+                .and_then(|db| db.get_page_override(&partner_key));
+            let partner_mode = crate::view_trim::resolve_view_trim_apply_mode(
+                state.preference,
+                reading_settings.auto_view_trim_default_enabled,
+                legacy_margin_fit,
+                partner_override,
+            );
+            if partner_mode != crate::view_trim::ViewTrimApplyMode::Auto {
+                return Ok(RemoteViewTrimPlan::AutoSingle);
+            }
             return Ok(RemoteViewTrimPlan::AutoSpread { side, partner });
         }
         Ok(RemoteViewTrimPlan::Stored(
@@ -10181,8 +10228,9 @@ pub(super) mod tests {
         let db = crate::view_trim_db::ViewTrimDb::open_at(&db_path).unwrap();
         db.set_book_state(
             &root,
+            None,
             crate::view_trim::ViewTrimBookState {
-                apply_mode: crate::view_trim::ViewTrimApplyMode::Book,
+                preference: crate::view_trim::ViewTrimBookPreference::Manual,
                 book_settings: crate::view_trim::ViewTrimBookSettings {
                     enabled: true,
                     spread_separate: true,
@@ -10204,7 +10252,8 @@ pub(super) mod tests {
         )
         .unwrap();
         *engine.view_trim_db.lock().unwrap() =
-            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path).unwrap();
+            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path)
+                .map_err(|error| error.to_string());
         let address = RemoteAddress::file(root.to_string_lossy().into_owned());
         let resolved = engine.resolve(&address).unwrap();
         let page_address = zip_entry_address(&address, "page.png");
@@ -10298,8 +10347,9 @@ pub(super) mod tests {
         }
         db.set_book_state(
             &root,
+            None,
             crate::view_trim::ViewTrimBookState {
-                apply_mode: crate::view_trim::ViewTrimApplyMode::Auto,
+                preference: crate::view_trim::ViewTrimBookPreference::Auto,
                 ..Default::default()
             },
         )
@@ -10587,8 +10637,11 @@ pub(super) mod tests {
                 RemoteWriteRequest::SetViewTrim {
                     address: page.clone(),
                     context_address: RemoteAddress::file(root.to_string_lossy().into_owned()),
-                    state: serde_json::to_value(crate::view_trim::ViewTrimBookState::default())
-                        .unwrap(),
+                    state: super::super::remote_view_trim_wire_state(
+                        crate::view_trim::ViewTrimBookState::default(),
+                        false,
+                        false,
+                    ),
                 },
                 RemoteWriteRequest::SetSpread {
                     address: RemoteAddress::file(root.to_string_lossy().into_owned()),
@@ -11826,8 +11879,9 @@ pub(super) mod tests {
         view_trim
             .set_book_state(
                 &book,
+                None,
                 crate::view_trim::ViewTrimBookState {
-                    apply_mode: crate::view_trim::ViewTrimApplyMode::Auto,
+                    preference: crate::view_trim::ViewTrimBookPreference::Auto,
                     ..Default::default()
                 },
             )
@@ -12391,8 +12445,9 @@ pub(super) mod tests {
         view_trim
             .set_book_state(
                 &folder,
+                None,
                 crate::view_trim::ViewTrimBookState {
-                    apply_mode: crate::view_trim::ViewTrimApplyMode::Auto,
+                    preference: crate::view_trim::ViewTrimBookPreference::Auto,
                     ..Default::default()
                 },
             )
@@ -15466,8 +15521,9 @@ pub(super) mod tests {
         view_trim_db
             .set_book_state(
                 &book,
+                None,
                 crate::view_trim::ViewTrimBookState {
-                    apply_mode: crate::view_trim::ViewTrimApplyMode::Book,
+                    preference: crate::view_trim::ViewTrimBookPreference::Manual,
                     book_settings: crate::view_trim::ViewTrimBookSettings {
                         enabled: true,
                         single: crate::view_trim::ViewTrimMargins {
@@ -15638,8 +15694,9 @@ pub(super) mod tests {
         let db = crate::view_trim_db::ViewTrimDb::open_at(&db_path).unwrap();
         db.set_book_state(
             &book,
+            None,
             crate::view_trim::ViewTrimBookState {
-                apply_mode: crate::view_trim::ViewTrimApplyMode::Auto,
+                preference: crate::view_trim::ViewTrimBookPreference::Auto,
                 ..Default::default()
             },
         )
@@ -15655,7 +15712,8 @@ pub(super) mod tests {
             .view_trim_db
             .lock()
             .unwrap_or_else(|error| error.into_inner()) =
-            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path).unwrap();
+            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path)
+                .map_err(|error| error.to_string());
         let left = favorite_address(&favorite, "book/left.png");
         let right = favorite_address(&favorite, "book/right.png");
         let left_resolved = engine.resolve(&left).unwrap();
@@ -15742,6 +15800,111 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn remote_view_trim_uses_one_live_snapshot_for_unset_book_and_partner() {
+        let temp = tempfile::tempdir().unwrap();
+        let book = temp.path().join("book");
+        std::fs::create_dir(&book).unwrap();
+        std::fs::write(book.join("left.png"), b"page").unwrap();
+        std::fs::write(book.join("right.png"), b"page").unwrap();
+        let favorite = FavoriteEntry::new("test".to_owned(), temp.path().to_path_buf());
+        let mut engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            // The construction snapshot intentionally disagrees with the live source.
+            auto_view_trim_default_enabled: false,
+            margin_fit_enabled: true,
+            ..Default::default()
+        });
+        *engine.view_trim_db.lock().unwrap() = Ok(None);
+        let mut live = crate::settings_db::RemoteReadingSettings::from_settings(&engine.settings);
+        live.auto_view_trim_default_enabled = true;
+        live.margin_fit_enabled = false;
+        live.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Page;
+        let reads = Arc::new(AtomicUsize::new(0));
+        engine.reading_settings = RemoteReadingSettingsSource::CountedSnapshot(live, reads.clone());
+        let left = favorite_address(&favorite, "book/left.png");
+        let right = favorite_address(&favorite, "book/right.png");
+        let resolved = engine.resolve(&left).unwrap();
+        let context = RemotePageRenderContext {
+            context_address: favorite_address(&favorite, "book"),
+            display_slot: RemotePageDisplaySlot::SpreadLeft,
+            spread_partner: Some(right.clone()),
+        };
+        assert!(
+            matches!(engine.remote_view_trim_plan(&left, &resolved, Some(&context),
+            crate::rotation_db::Rotation::None).unwrap(),
+            RemoteViewTrimPlan::AutoSpread { partner, .. } if partner == right)
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        live.auto_view_trim_default_enabled = false;
+        engine.reading_settings = RemoteReadingSettingsSource::Snapshot(live);
+        assert!(matches!(
+            engine
+                .remote_view_trim_plan(
+                    &left,
+                    &resolved,
+                    Some(&context),
+                    crate::rotation_db::Rotation::None
+                )
+                .unwrap(),
+            RemoteViewTrimPlan::Stored(None)
+        ));
+        // A failed open must never turn into a missing row and inherit global Auto.
+        live.auto_view_trim_default_enabled = true;
+        engine.reading_settings = RemoteReadingSettingsSource::Snapshot(live);
+        *engine.view_trim_db.lock().unwrap() = Err("fixture open failure".into());
+        assert!(matches!(
+            engine
+                .remote_view_trim_plan(
+                    &left,
+                    &resolved,
+                    Some(&context),
+                    crate::rotation_db::Rotation::None
+                )
+                .unwrap(),
+            RemoteViewTrimPlan::Stored(None)
+        ));
+    }
+
+    #[test]
+    fn remote_view_trim_invalid_exact_does_not_fall_back_or_use_legacy_auto() {
+        let temp = tempfile::tempdir().unwrap();
+        let book = temp.path().join("book");
+        std::fs::create_dir(&book).unwrap();
+        std::fs::write(book.join("page.png"), b"page").unwrap();
+        let db_path = temp.path().join("view_trim.db");
+        let db = crate::view_trim_db::ViewTrimDb::open_at(&db_path).unwrap();
+        drop(db);
+        let raw = rusqlite::Connection::open(&db_path).unwrap();
+        raw.execute(
+            "INSERT INTO view_trim_books(book_key,state_json,updated_at) VALUES (?1,?2,0)",
+            rusqlite::params![crate::path_key::normalize(&book), "{invalid"],
+        )
+        .unwrap();
+        let favorite = FavoriteEntry::new("test".to_owned(), temp.path().to_path_buf());
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            favorites: vec![favorite.clone()],
+            auto_view_trim_default_enabled: true,
+            margin_fit_enabled: true,
+            ..Default::default()
+        });
+        *engine.view_trim_db.lock().unwrap() =
+            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path)
+                .map_err(|error| error.to_string());
+        let page = favorite_address(&favorite, "book/page.png");
+        let resolved = engine.resolve(&page).unwrap();
+        assert!(matches!(
+            engine
+                .remote_view_trim_plan(&page, &resolved, None, crate::rotation_db::Rotation::None)
+                .unwrap(),
+            RemoteViewTrimPlan::Stored(None)
+        ));
+        let saved: String = raw
+            .query_row("SELECT state_json FROM view_trim_books", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(saved, "{invalid");
+    }
+
+    #[test]
     fn remote_view_trim_resolves_book_and_page_rows_for_spread_side() {
         let temp = tempfile::tempdir().unwrap();
         let book = temp.path().join("book");
@@ -15754,8 +15917,9 @@ pub(super) mod tests {
         let db = crate::view_trim_db::ViewTrimDb::open_at(&db_path).unwrap();
         db.set_book_state(
             &book,
+            None,
             crate::view_trim::ViewTrimBookState {
-                apply_mode: crate::view_trim::ViewTrimApplyMode::Book,
+                preference: crate::view_trim::ViewTrimBookPreference::Manual,
                 book_settings: crate::view_trim::ViewTrimBookSettings {
                     enabled: true,
                     spread_linked: crate::view_trim::ViewTrimLinkedMargins {
@@ -15791,7 +15955,8 @@ pub(super) mod tests {
             .view_trim_db
             .lock()
             .unwrap_or_else(|error| error.into_inner()) =
-            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path).unwrap();
+            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path)
+                .map_err(|error| error.to_string());
         let context = RemotePageRenderContext {
             context_address: favorite_address(&favorite, "book"),
             display_slot: RemotePageDisplaySlot::SpreadRight,
@@ -15846,8 +16011,9 @@ pub(super) mod tests {
         let db = crate::view_trim_db::ViewTrimDb::open_at(&db_path).unwrap();
         db.set_book_state(
             &book,
+            None,
             crate::view_trim::ViewTrimBookState {
-                apply_mode: crate::view_trim::ViewTrimApplyMode::Auto,
+                preference: crate::view_trim::ViewTrimBookPreference::Auto,
                 ..Default::default()
             },
         )
@@ -15863,7 +16029,8 @@ pub(super) mod tests {
             .view_trim_db
             .lock()
             .unwrap_or_else(|error| error.into_inner()) =
-            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path).unwrap();
+            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path)
+                .map_err(|error| error.to_string());
         let left = favorite_address(&favorite, "book/left.png");
         let right = favorite_address(&favorite, "book/right.png");
         let resolved = engine.resolve(&left).unwrap();
@@ -15937,26 +16104,22 @@ pub(super) mod tests {
         write_auto_trim_test_page(&book.join("right.png"), 20, 40);
         let db_path = temp.path().join("view_trim.db");
         let db = crate::view_trim_db::ViewTrimDb::open_at(&db_path).unwrap();
-        db.set_book_state(
-            &book,
-            crate::view_trim::ViewTrimBookState {
-                apply_mode: crate::view_trim::ViewTrimApplyMode::Auto,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        // An unset book follows the live global default, including partner harmonization.
         drop(db);
 
         let favorite = FavoriteEntry::new("test".to_owned(), temp.path().to_path_buf());
         let engine = ContainerEngine::new(crate::settings::Settings {
+            auto_view_trim_default_enabled: true,
             favorites: vec![favorite.clone()],
             ..Default::default()
         });
+        crate::settings_db::with_db_result(|db| db.save_full(&engine.settings)).unwrap();
         *engine
             .view_trim_db
             .lock()
             .unwrap_or_else(|error| error.into_inner()) =
-            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path).unwrap();
+            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path)
+                .map_err(|error| error.to_string());
         let left = favorite_address(&favorite, "book/left.png");
         let right = favorite_address(&favorite, "book/right.png");
         let context_address = favorite_address(&favorite, "book");
@@ -16002,6 +16165,10 @@ pub(super) mod tests {
                     &cancel,
                 )
                 .unwrap();
+            assert!(
+                bbox.is_some(),
+                "the live global default must crop an unset book"
+            );
             encode_remote_page_jpeg(&loaded.pixels, 1024, bbox).unwrap()
         };
 
@@ -16018,6 +16185,10 @@ pub(super) mod tests {
         assert_eq!(left_payload.2, right_payload.2);
         assert_eq!(left_payload.1, right_payload.1);
         assert!(left_payload.2 > 140);
+        assert!(
+            left_payload.2 < 200,
+            "the JPEG must exclude the detected margins"
+        );
         assert_eq!(
             engine
                 .auto_trim_bbox_cache

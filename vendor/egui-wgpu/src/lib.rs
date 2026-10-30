@@ -69,6 +69,12 @@ pub enum WgpuError {
     #[error("Adapter selection failed: {0}")]
     CustomNativeAdapterSelectionError(String),
 
+    #[error("SurfaceCapabilities: the surface is not supported by GPU {adapter} ({backend:?})")]
+    UnsupportedSurface {
+        adapter: String,
+        backend: wgpu::Backend,
+    },
+
     #[error("There was no valid format for the surface at all.")]
     NoSurfaceFormatsAvailable,
 

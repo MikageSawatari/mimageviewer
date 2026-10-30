@@ -274,7 +274,7 @@ Rust (edition 2024、MSVC) + eframe / egui 0.37 (wgpu 30)。画像は `image` cr
   launcher は `-p mimageviewer-launcher --bin mimageviewer` が必要。配布物は必ず `scripts/build-dist.ps1`。
 - FFmpeg は **LGPL shared build だけを使い、GPL build を絶対に使わない**。DLL のファイル名を変えない。
   ビルドには `LIBCLANG_PATH` が必要。
-- ONNX Runtime DLL の版は `ort` crate の C API 版と揃える (ort 2.0.0-rc.12 ↔ 1.24.2)。
+- ONNX Runtime DLL は `ort` の選択 C API 版を満たすものを使う (ort 2.0.0-rc.15、既定feature無効 + `api-24` ↔ DirectML 1.24.4 / TensorRT pack GPU 1.24.2)。
 - VST3 host bridge は、**古い別 worktree の exe を流用しない** (IPC がずれて動画再生が激重になる)。
   C++ ソースを変えたら CMake で再ビルドする。
 

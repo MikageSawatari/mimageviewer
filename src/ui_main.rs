@@ -24,6 +24,87 @@ use crate::settings::{
     GridClickSelectionMode, GridViewMode,
 };
 use crate::tag_view::{TagViewMenuChoice, tag_view_menu_sections};
+
+// Headless pointer entry shared by the rating/list-order investigation tests.
+#[cfg(test)]
+pub(crate) fn ratingnav649_double_click_for_test(app: &mut App, idx: usize) -> AddressBarNav {
+    ratingnav649_pointer_open_for_test(app, idx, false)
+        .expect("physical double-click must reach the grid open handler")
+}
+
+#[cfg(test)]
+pub(crate) fn ratingnav649_pointer_open_for_test(
+    app: &mut App,
+    idx: usize,
+    simultaneous_secondary_release: bool,
+) -> Option<AddressBarNav> {
+    let ctx = egui::Context::default();
+    let rect = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(120.0, 120.0));
+    let pos = rect.center();
+    let mut nav = None;
+    for (frame, pressed) in [None, Some(true), Some(false), Some(true), Some(false)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        if let Some(pressed) = pressed {
+            events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        if frame == 4 && simultaneous_secondary_release {
+            for pressed in [true, false] {
+                events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+        }
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(460.0, 200.0),
+            )),
+            time: Some(frame as f64 * 0.02),
+            events,
+            ..Default::default()
+        });
+        app.begin_grid_click_input_frame(&ctx);
+        let suppress = app.begin_grid_right_drag_primary_frame(&ctx);
+        let pairing = app.begin_grid_primary_click_frame(
+            &ctx,
+            !suppress && ctx.input(|input| input.pointer.primary_clicked()),
+        );
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                if let Some(request) = app.handle_cell_interaction(
+                    ui,
+                    &ctx,
+                    rect,
+                    idx,
+                    &crate::thumb_overlay_layout::ThumbnailOverlayLayout::default(),
+                    false,
+                    suppress,
+                    pairing,
+                    None,
+                ) {
+                    assert!(nav.is_none(), "one double-click must produce one open");
+                    nav = Some(request);
+                }
+            });
+        });
+        ctx.end_pass().drop_without_applying_deltas();
+        if frame < 4 {
+            assert!(nav.is_none(), "selection/press alone must not open");
+        }
+    }
+    nav
+}
 use crate::ui_details_icon::{DetailsIconKind, details_icon_kind, draw_details_preview_icon};
 use crate::wheel_input::consume_wheel_input;
 
@@ -776,7 +857,17 @@ fn grid_touch_scroll_state(
     row_h: f32,
     items_generation: u64,
 ) -> GridTouchScrollState {
-    let id = grid_touch_scroll_state_id(ctx);
+    grid_touch_scroll_state_for_viewport(ctx, ctx.viewport_id(), anchor_y, row_h, items_generation)
+}
+
+fn grid_touch_scroll_state_for_viewport(
+    ctx: &egui::Context,
+    viewport: egui::ViewportId,
+    anchor_y: f32,
+    row_h: f32,
+    items_generation: u64,
+) -> GridTouchScrollState {
+    let id = egui::Id::unique(("miv_grid_touch_scroll_fraction", viewport));
     ctx.data(|data| data.get_temp::<GridTouchScrollState>(id))
         .filter(|state| {
             state.items_generation == items_generation
@@ -799,6 +890,23 @@ pub(crate) fn grid_touch_scroll_remainder(
     items_generation: u64,
 ) -> f32 {
     grid_touch_scroll_state(ctx, anchor_y, row_h, items_generation).remainder_y
+}
+
+/// Grid retention always belongs to ROOT, even when requested by a fullscreen callback.
+pub(crate) fn root_grid_touch_scroll_remainder(
+    ctx: &egui::Context,
+    anchor_y: f32,
+    row_h: f32,
+    items_generation: u64,
+) -> f32 {
+    grid_touch_scroll_state_for_viewport(
+        ctx,
+        egui::ViewportId::ROOT,
+        anchor_y,
+        row_h,
+        items_generation,
+    )
+    .remainder_y
 }
 
 fn set_grid_touch_scroll_state(
@@ -1960,7 +2068,49 @@ fn sort_combo_popup_style() -> egui::style::StyleModifier {
     })
 }
 
-/// Height of the sort popup's scroll viewport, in egui points. Count the actual
+/// Tag result ordering is independent of the configured normal-folder sort buttons.
+fn tag_view_sort_options() -> [crate::tag_view::TagViewSort; 3] {
+    use crate::tag_view::TagViewSort;
+    [
+        TagViewSort::PathOrder,
+        TagViewSort::AppliedAtDesc,
+        TagViewSort::AppliedAtAsc,
+    ]
+}
+
+/// Shared by the toolbar buttons and dropdown so tag results expose only their own order.
+fn draw_tag_view_sort_choices(
+    ui: &mut egui::Ui,
+    current: crate::tag_view::TagViewSort,
+    enabled: bool,
+    compact: bool,
+) -> Option<crate::tag_view::TagViewSort> {
+    let mut chosen = None;
+    for sort in tag_view_sort_options() {
+        let selected = current == sort;
+        if ui
+            .add_enabled(
+                enabled,
+                egui::Button::selectable(
+                    selected,
+                    if compact {
+                        sort.short_label()
+                    } else {
+                        sort.label()
+                    },
+                ),
+            )
+            .on_hover_text(sort.label())
+            .clicked()
+            && !selected
+        {
+            chosen = Some(sort);
+        }
+    }
+    chosen
+}
+
+/// Height of the sort popup's scroll viewport, in egui points. Count actual
 /// selectable rows and separators, including context-specific rows. A custom UI
 /// font can make a button taller than `interact_size`, so use its measured height.
 /// Only a short screen should need scrolling.
@@ -2380,6 +2530,7 @@ pub(crate) enum DetailsColumn {
     /// レーティング一覧は通常の「日付順」でファイル本来の更新日時も使うため、
     /// `Modified` の表示値を差し替えず、★設定時刻を独立した列として持つ。
     RatedAt,
+    AppliedAt,
     Tags,
     Kind,
     PageCount,
@@ -2568,6 +2719,7 @@ impl DetailsColumn {
             Self::Name,
             Self::Rating,
             Self::RatedAt,
+            Self::AppliedAt,
             Self::Tags,
             Self::Kind,
             Self::PageCount,
@@ -2589,6 +2741,7 @@ impl DetailsColumn {
             Self::Name => "名前",
             Self::Rating => "★",
             Self::RatedAt => "★設定時刻",
+            Self::AppliedAt => "タグ付与時刻",
             Self::Tags => "タグ",
             Self::Kind => "種類",
             Self::PageCount => "ページ数",
@@ -2610,6 +2763,7 @@ impl DetailsColumn {
             Self::Name => DetailsColumnId::Name,
             Self::Rating => DetailsColumnId::Rating,
             Self::RatedAt => DetailsColumnId::RatedAt,
+            Self::AppliedAt => DetailsColumnId::AppliedAt,
             Self::Tags => DetailsColumnId::Tags,
             Self::Kind => DetailsColumnId::Kind,
             Self::PageCount => DetailsColumnId::PageCount,
@@ -2631,6 +2785,7 @@ impl DetailsColumn {
             DetailsColumnId::Name => Self::Name,
             DetailsColumnId::Rating => Self::Rating,
             DetailsColumnId::RatedAt => Self::RatedAt,
+            DetailsColumnId::AppliedAt => Self::AppliedAt,
             DetailsColumnId::Tags => Self::Tags,
             DetailsColumnId::Kind => Self::Kind,
             DetailsColumnId::PageCount => Self::PageCount,
@@ -2652,6 +2807,7 @@ impl DetailsColumn {
             Self::Name => Some(DetailsSortKey::Name),
             Self::Rating => Some(DetailsSortKey::Rating),
             Self::RatedAt => Some(DetailsSortKey::RatedAt),
+            Self::AppliedAt => Some(DetailsSortKey::AppliedAt),
             Self::Tags => Some(DetailsSortKey::Tags),
             Self::Kind => Some(DetailsSortKey::Kind),
             Self::PageCount => Some(DetailsSortKey::PageCount),
@@ -2679,8 +2835,12 @@ impl DetailsColumn {
         )
     }
 
-    fn available_in_view(self, items_are_rating_view: bool) -> bool {
-        self != Self::RatedAt || items_are_rating_view
+    fn available_in_view(self, items_are_rating_view: bool, items_are_tag_view: bool) -> bool {
+        match self {
+            Self::RatedAt => items_are_rating_view,
+            Self::AppliedAt => items_are_tag_view,
+            _ => true,
+        }
     }
 
     fn configured_visible(
@@ -2704,6 +2864,9 @@ impl DetailsColumn {
             Self::RatedAt => dedicated
                 .then_some(settings.details_selection_bar_show_rated_at)
                 .unwrap_or(settings.details_show_rated_at),
+            Self::AppliedAt => dedicated
+                .then_some(settings.details_selection_bar_show_applied_at)
+                .unwrap_or(settings.details_show_applied_at),
             Self::Tags => dedicated
                 .then_some(settings.details_selection_bar_show_tags)
                 .unwrap_or(settings.details_show_tags),
@@ -2748,8 +2911,9 @@ impl DetailsColumn {
         settings: &crate::settings::Settings,
         column_set: DetailsColumnSet,
         items_are_rating_view: bool,
+        items_are_tag_view: bool,
     ) -> bool {
-        self.available_in_view(items_are_rating_view)
+        self.available_in_view(items_are_rating_view, items_are_tag_view)
             && self.configured_visible(settings, column_set)
     }
 
@@ -2763,6 +2927,7 @@ impl DetailsColumn {
             Self::Name => 140.0,
             Self::Rating => 79.0,
             Self::RatedAt => 138.0,
+            Self::AppliedAt => 138.0,
             Self::Tags => 160.0,
             Self::Kind => 96.0,
             Self::PageCount => 80.0,
@@ -2797,14 +2962,21 @@ fn details_ordered_columns(
     column_set: DetailsColumnSet,
     include_hidden: bool,
     items_are_rating_view: bool,
+    items_are_tag_view: bool,
 ) -> Vec<DetailsColumn> {
     details_storage_ordered_columns(settings, column_set)
         .into_iter()
         .filter(|col| {
             // `include_hidden` は列メニュー用だが、ビュー外の専用列まで出してはならない。
             column_set.includes(*col)
-                && col.available_in_view(items_are_rating_view)
-                && (include_hidden || col.visible(settings, column_set, items_are_rating_view))
+                && col.available_in_view(items_are_rating_view, items_are_tag_view)
+                && (include_hidden
+                    || col.visible(
+                        settings,
+                        column_set,
+                        items_are_rating_view,
+                        items_are_tag_view,
+                    ))
         })
         .collect()
 }
@@ -2838,16 +3010,30 @@ fn details_column_is_visible(
     column_set: DetailsColumnSet,
     column: DetailsColumn,
     items_are_rating_view: bool,
+    items_are_tag_view: bool,
 ) -> bool {
-    column_set.includes(column) && column.visible(settings, column_set, items_are_rating_view)
+    column_set.includes(column)
+        && column.visible(
+            settings,
+            column_set,
+            items_are_rating_view,
+            items_are_tag_view,
+        )
 }
 
 fn details_visible_columns(
     settings: &crate::settings::Settings,
     column_set: DetailsColumnSet,
     items_are_rating_view: bool,
+    items_are_tag_view: bool,
 ) -> Vec<DetailsColumn> {
-    details_ordered_columns(settings, column_set, false, items_are_rating_view)
+    details_ordered_columns(
+        settings,
+        column_set,
+        false,
+        items_are_rating_view,
+        items_are_tag_view,
+    )
 }
 
 fn selection_info_bottom_bar_is_hidden(settings: &crate::settings::Settings) -> bool {
@@ -2920,6 +3106,7 @@ pub(crate) fn selection_info_bottom_bar_shows_column(
     settings: &crate::settings::Settings,
     column: DetailsColumn,
     items_are_rating_view: bool,
+    items_are_tag_view: bool,
 ) -> bool {
     settings.selection_info_display_mode.shows_bottom_bar()
         && !selection_info_bottom_bar_is_hidden(settings)
@@ -2928,6 +3115,7 @@ pub(crate) fn selection_info_bottom_bar_shows_column(
             selection_info_bottom_bar_column_set(settings),
             column,
             items_are_rating_view,
+            items_are_tag_view,
         )
 }
 
@@ -2959,6 +3147,16 @@ fn details_column_width(
         .unwrap_or_else(|| col.default_width())
         .clamp(col.min_width(), 800.0);
     }
+    if col == DetailsColumn::AppliedAt {
+        return match column_set {
+            DetailsColumnSet::Details | DetailsColumnSet::SharedBar => {
+                settings.details_applied_at_width
+            }
+            DetailsColumnSet::DedicatedBar => settings.details_selection_bar_applied_at_width,
+        }
+        .unwrap_or_else(|| col.default_width())
+        .clamp(col.min_width(), 800.0);
+    }
     column_set
         .column_widths(settings)
         .iter()
@@ -2985,6 +3183,19 @@ fn set_details_column_width(
                 &mut settings.details_rated_at_width
             }
             DetailsColumnSet::DedicatedBar => &mut settings.details_selection_bar_rated_at_width,
+        };
+        if slot.is_some_and(|stored| (stored - width).abs() <= 0.1) {
+            return false;
+        }
+        *slot = Some(width);
+        return true;
+    }
+    if col == DetailsColumn::AppliedAt {
+        let slot = match column_set {
+            DetailsColumnSet::Details | DetailsColumnSet::SharedBar => {
+                &mut settings.details_applied_at_width
+            }
+            DetailsColumnSet::DedicatedBar => &mut settings.details_selection_bar_applied_at_width,
         };
         if slot.is_some_and(|stored| (stored - width).abs() <= 0.1) {
             return false;
@@ -3063,6 +3274,7 @@ fn details_column_visibility_slot(
         (false, DetailsColumn::Preview) => &mut settings.details_show_preview,
         (false, DetailsColumn::Rating) => &mut settings.details_show_rating,
         (false, DetailsColumn::RatedAt) => &mut settings.details_show_rated_at,
+        (false, DetailsColumn::AppliedAt) => &mut settings.details_show_applied_at,
         (false, DetailsColumn::Tags) => &mut settings.details_show_tags,
         (false, DetailsColumn::Kind) => &mut settings.details_show_kind,
         (false, DetailsColumn::PageCount) => &mut settings.details_show_page_count,
@@ -3078,6 +3290,7 @@ fn details_column_visibility_slot(
         (true, DetailsColumn::Preview) => &mut settings.details_selection_bar_show_preview,
         (true, DetailsColumn::Rating) => &mut settings.details_selection_bar_show_rating,
         (true, DetailsColumn::RatedAt) => &mut settings.details_selection_bar_show_rated_at,
+        (true, DetailsColumn::AppliedAt) => &mut settings.details_selection_bar_show_applied_at,
         (true, DetailsColumn::Tags) => &mut settings.details_selection_bar_show_tags,
         (true, DetailsColumn::Kind) => &mut settings.details_selection_bar_show_kind,
         (true, DetailsColumn::PageCount) => &mut settings.details_selection_bar_show_page_count,
@@ -3105,6 +3318,7 @@ fn set_details_name_width_auto(
     enabled: bool,
     current_name_width: f32,
     items_are_rating_view: bool,
+    items_are_tag_view: bool,
 ) -> bool {
     if column_set.name_width_auto(settings) == enabled {
         return false;
@@ -3127,6 +3341,7 @@ fn set_details_name_width_auto(
             column_set,
             current_name_width,
             items_are_rating_view,
+            items_are_tag_view,
         );
         set_details_name_width(settings, column_set, stored_width)
     }
@@ -3138,6 +3353,7 @@ struct DetailsColumnMenuState {
     show_preview: bool,
     show_rating: bool,
     show_rated_at: bool,
+    show_applied_at: bool,
     show_tags: bool,
     show_kind: bool,
     show_page_count: bool,
@@ -3177,6 +3393,7 @@ impl DetailsColumnMenuState {
             show_preview: DetailsColumn::Preview.configured_visible(settings, column_set),
             show_rating: DetailsColumn::Rating.configured_visible(settings, column_set),
             show_rated_at: DetailsColumn::RatedAt.configured_visible(settings, column_set),
+            show_applied_at: DetailsColumn::AppliedAt.configured_visible(settings, column_set),
             show_tags: DetailsColumn::Tags.configured_visible(settings, column_set),
             show_kind: DetailsColumn::Kind.configured_visible(settings, column_set),
             show_page_count: DetailsColumn::PageCount.configured_visible(settings, column_set),
@@ -3207,6 +3424,7 @@ impl DetailsColumnMenuState {
         column_set: DetailsColumnSet,
         current_name_width: f32,
         items_are_rating_view: bool,
+        items_are_tag_view: bool,
     ) -> DetailsColumnMenuChanges {
         let mut changes = DetailsColumnMenuChanges::default();
         changes.columns |= set_details_name_width_auto(
@@ -3215,6 +3433,7 @@ impl DetailsColumnMenuState {
             self.name_width_auto,
             current_name_width,
             items_are_rating_view,
+            items_are_tag_view,
         );
         apply_details_column_menu_visibility(self, settings, column_set, &mut changes);
         if settings.details_size_display_mode != self.size_display_mode {
@@ -3247,6 +3466,7 @@ fn apply_details_column_menu_visibility(
             (DetailsColumn::Preview, state.show_preview),
             (DetailsColumn::Rating, state.show_rating),
             (DetailsColumn::RatedAt, state.show_rated_at),
+            (DetailsColumn::AppliedAt, state.show_applied_at),
             (DetailsColumn::Tags, state.show_tags),
             (DetailsColumn::Kind, state.show_kind),
             (DetailsColumn::PageCount, state.show_page_count),
@@ -3597,6 +3817,7 @@ struct DetailsLayoutDebugSample<'a> {
     requested_extent: f32,
     column_set: DetailsColumnSet,
     items_are_rating_view: bool,
+    items_are_tag_view: bool,
     outer_inner_rect: egui::Rect,
     outer_content_size: egui::Vec2,
     outer_state: egui::scroll_area::State,
@@ -3647,6 +3868,7 @@ fn log_details_layout_debug(ctx: &egui::Context, sample: DetailsLayoutDebugSampl
         sample.settings,
         sample.column_set,
         sample.items_are_rating_view,
+        sample.items_are_tag_view,
     );
     let viewport_id = ctx.viewport_id();
     let rounding_slack = details_layout_right_guard(effective_ppp);
@@ -3745,12 +3967,19 @@ fn details_fixed_columns_width(
     settings: &crate::settings::Settings,
     column_set: DetailsColumnSet,
     items_are_rating_view: bool,
+    items_are_tag_view: bool,
 ) -> f32 {
-    details_ordered_columns(settings, column_set, false, items_are_rating_view)
-        .into_iter()
-        .filter(|col| *col != DetailsColumn::Name)
-        .map(|col| details_column_width(settings, column_set, col))
-        .sum()
+    details_ordered_columns(
+        settings,
+        column_set,
+        false,
+        items_are_rating_view,
+        items_are_tag_view,
+    )
+    .into_iter()
+    .filter(|col| *col != DetailsColumn::Name)
+    .map(|col| details_column_width(settings, column_set, col))
+    .sum()
 }
 
 /// この面では描かないが、元の列セットで表示中の列幅。
@@ -3761,13 +3990,19 @@ fn details_omitted_columns_width(
     settings: &crate::settings::Settings,
     column_set: DetailsColumnSet,
     items_are_rating_view: bool,
+    items_are_tag_view: bool,
 ) -> f32 {
     DetailsColumn::all()
         .iter()
         .copied()
         .filter(|column| {
             !column_set.includes(*column)
-                && column.visible(settings, column_set, items_are_rating_view)
+                && column.visible(
+                    settings,
+                    column_set,
+                    items_are_rating_view,
+                    items_are_tag_view,
+                )
         })
         .map(|column| details_column_width(settings, column_set, column))
         .sum()
@@ -3777,9 +4012,15 @@ fn details_effective_fixed_name_width(
     settings: &crate::settings::Settings,
     column_set: DetailsColumnSet,
     items_are_rating_view: bool,
+    items_are_tag_view: bool,
 ) -> f32 {
     details_name_fixed_width(settings, column_set)
-        + details_omitted_columns_width(settings, column_set, items_are_rating_view)
+        + details_omitted_columns_width(
+            settings,
+            column_set,
+            items_are_rating_view,
+            items_are_tag_view,
+        )
 }
 
 fn details_stored_name_width_from_effective(
@@ -3787,8 +4028,15 @@ fn details_stored_name_width_from_effective(
     column_set: DetailsColumnSet,
     width: f32,
     items_are_rating_view: bool,
+    items_are_tag_view: bool,
 ) -> f32 {
-    width - details_omitted_columns_width(settings, column_set, items_are_rating_view)
+    width
+        - details_omitted_columns_width(
+            settings,
+            column_set,
+            items_are_rating_view,
+            items_are_tag_view,
+        )
 }
 
 fn details_layout(
@@ -3798,9 +4046,20 @@ fn details_layout(
     settings: &crate::settings::Settings,
     column_set: DetailsColumnSet,
     items_are_rating_view: bool,
+    items_are_tag_view: bool,
 ) -> DetailsLayout {
-    let fixed = details_fixed_columns_width(settings, column_set, items_are_rating_view);
-    let omitted = details_omitted_columns_width(settings, column_set, items_are_rating_view);
+    let fixed = details_fixed_columns_width(
+        settings,
+        column_set,
+        items_are_rating_view,
+        items_are_tag_view,
+    );
+    let omitted = details_omitted_columns_width(
+        settings,
+        column_set,
+        items_are_rating_view,
+        items_are_tag_view,
+    );
     let columns_avail = (avail_w - gutter).max(0.0);
     let name_width_auto = column_set.name_width_auto(settings);
     let minimum_name_width = DetailsColumn::Name.default_width() + omitted;
@@ -3811,7 +4070,12 @@ fn details_layout(
     } else if name_width_auto {
         minimum_name_width
     } else {
-        details_effective_fixed_name_width(settings, column_set, items_are_rating_view)
+        details_effective_fixed_name_width(
+            settings,
+            column_set,
+            items_are_rating_view,
+            items_are_tag_view,
+        )
     };
     let columns_w = name_w + fixed;
     // Leave one physical pixel of slack when auto-fit has enough room. At UI
@@ -3853,6 +4117,7 @@ fn resolve_details_list_layout(
     pixels_per_point: f32,
     settings: &crate::settings::Settings,
     items_are_rating_view: bool,
+    items_are_tag_view: bool,
 ) -> DetailsListLayoutResolution {
     let scroll_style = details_scroll_style();
     let avail_w = source_rect.width().max(1.0);
@@ -3883,6 +4148,7 @@ fn resolve_details_list_layout(
             settings,
             DetailsColumnSet::Details,
             items_are_rating_view,
+            items_are_tag_view,
         );
         let horizontal_policy = details_horizontal_scroll_policy(
             source_rect,
@@ -3924,8 +4190,14 @@ fn details_column_rects_for_columns(
     settings: &crate::settings::Settings,
     column_set: DetailsColumnSet,
     items_are_rating_view: bool,
+    items_are_tag_view: bool,
 ) -> Vec<(DetailsColumn, egui::Rect)> {
-    let columns = details_visible_columns(settings, column_set, items_are_rating_view);
+    let columns = details_visible_columns(
+        settings,
+        column_set,
+        items_are_rating_view,
+        items_are_tag_view,
+    );
     let fixed: f32 = columns
         .iter()
         .copied()
@@ -3935,10 +4207,20 @@ fn details_column_rects_for_columns(
     let name_width = if column_set.name_width_auto(settings) {
         (rect.width() - fixed).max(
             DetailsColumn::Name.default_width()
-                + details_omitted_columns_width(settings, column_set, items_are_rating_view),
+                + details_omitted_columns_width(
+                    settings,
+                    column_set,
+                    items_are_rating_view,
+                    items_are_tag_view,
+                ),
         )
     } else {
-        details_effective_fixed_name_width(settings, column_set, items_are_rating_view)
+        details_effective_fixed_name_width(
+            settings,
+            column_set,
+            items_are_rating_view,
+            items_are_tag_view,
+        )
     };
     let specs = columns
         .into_iter()
@@ -3969,12 +4251,14 @@ fn details_column_rects(
     rect: egui::Rect,
     settings: &crate::settings::Settings,
     items_are_rating_view: bool,
+    items_are_tag_view: bool,
 ) -> Vec<(DetailsColumn, egui::Rect)> {
     details_column_rects_for_columns(
         rect,
         settings,
         DetailsColumnSet::Details,
         items_are_rating_view,
+        items_are_tag_view,
     )
 }
 
@@ -4011,11 +4295,18 @@ fn reorder_details_column(
     target: DetailsColumn,
     insert_after_target: bool,
     items_are_rating_view: bool,
+    items_are_tag_view: bool,
 ) -> bool {
     if dragged == target {
         return false;
     }
-    let mut columns = details_ordered_columns(settings, column_set, true, items_are_rating_view);
+    let mut columns = details_ordered_columns(
+        settings,
+        column_set,
+        true,
+        items_are_rating_view,
+        items_are_tag_view,
+    );
     let Some(from_pos) = columns.iter().position(|col| *col == dragged) else {
         return false;
     };
@@ -4035,7 +4326,9 @@ fn reorder_details_column(
     let new_order = details_storage_ordered_columns(settings, column_set)
         .into_iter()
         .map(|column| {
-            if column_set.includes(column) && column.available_in_view(items_are_rating_view) {
+            if column_set.includes(column)
+                && column.available_in_view(items_are_rating_view, items_are_tag_view)
+            {
                 reordered.next().unwrap_or(column)
             } else {
                 column
@@ -4058,6 +4351,7 @@ fn finish_details_header_drag(
     drag: DetailsHeaderDrag,
     min_delta_x: f32,
     items_are_rating_view: bool,
+    items_are_tag_view: bool,
 ) -> bool {
     if (drag.latest.x - drag.start.x).abs() < min_delta_x {
         return false;
@@ -4073,6 +4367,7 @@ fn finish_details_header_drag(
         target,
         insert_after,
         items_are_rating_view,
+        items_are_tag_view,
     )
 }
 
@@ -4910,6 +5205,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 None,
                 None,
                 false,
+                crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
             );
             crate::app::draw_cell(
                 ui,
@@ -8382,6 +8678,12 @@ impl App {
                                             }
                                             ui.separator();
                                         }
+                                        if self.items_are_tag_view {
+                                            if let Some(sort) = draw_tag_view_sort_choices(ui, self.settings.tag_view_sort, true, false) {
+                                                self.set_tag_view_sort(sort);
+                                                ui.close();
+                                            }
+                                        } else {
                                         for &order in crate::settings::SortOrder::all() {
                                             let checked = if let Some(root) = root_order {
                                                 root.mode == crate::collection_store::CollectionOrderMode::Standard && root.standard_sort == order
@@ -8430,6 +8732,7 @@ impl App {
                                                 }
                                                 SortControlDecision::None => {}
                                             }
+                                        }
                                         }
                                         if self.items_are_rating_view {
                                             ui.separator();
@@ -10774,6 +11077,11 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                     }
                                 }
                             }
+                            if self.items_are_tag_view {
+                                if let Some(sort) = draw_tag_view_sort_choices(ui, self.settings.tag_view_sort, !sort_disabled, true) {
+                                    self.set_tag_view_sort(sort);
+                                }
+                            } else {
                             for &order in &tb_sorts {
                                 let selected = if sort_disabled {
                                     false
@@ -10829,6 +11137,7 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                     }
                                     SortControlDecision::None => {}
                                 }
+                            }
                             }
                             if self.items_are_rating_view {
                                 for sort in [
@@ -10897,7 +11206,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             egui::ComboBox::is_open(ctx, combo.response.id);
                     }
                     // ソート候補を全部外したときの右クリック誘導 (Codex P3)。
-                    if tb_sorts.is_empty() {
+                    if tb_sorts.is_empty() && !self.items_are_tag_view {
                         ui.label(egui::RichText::new("(右クリックでソートを選択)").weak());
                     }
                     if self.grid_sort_refresh_available() {
@@ -12292,6 +12601,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             }
         } else if self.items_are_bookmark_view {
             self.bookmark_view_sort.short_label().to_string()
+        } else if self.items_are_tag_view {
+            self.settings.tag_view_sort.short_label().to_string()
         } else if self.items_are_rating_view {
             self.rating_view_sort.short_label().to_string()
         } else {
@@ -12317,7 +12628,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut reload_requested = false;
         let sort_popup_height = sort_combo_popup_height(
             ui,
-            tb_sorts.len(),
+            if self.items_are_tag_view {
+                3
+            } else {
+                tb_sorts.len()
+            },
             root_order.is_some(),
             self.items_are_rating_view,
             self.items_are_bookmark_view,
@@ -12375,6 +12690,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                         ui.separator();
                     }
+                    if self.items_are_tag_view {
+                        if let Some(sort) = draw_tag_view_sort_choices(ui, self.settings.tag_view_sort, !sort_disabled, false) {
+                            self.set_tag_view_sort(sort);
+                            ui.close();
+                        }
+                    } else {
                     for &order in &tb_sorts {
                         let selected = if let Some(root) = root_order {
                             root.mode == crate::collection_store::CollectionOrderMode::Standard
@@ -12456,6 +12777,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             }
                             SortControlDecision::None => {}
                         }
+                    }
                     }
                     if self.items_are_rating_view {
                         ui.separator();
@@ -14699,7 +15021,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     // 左端のラベルを右クリックすると、フォルダバーの設定メニューを開く
                     // (他のツールバーセクションと操作を揃える。実機フィードバック 2026-06-20)。
                     let folder_label_response = ui
-                        .add(egui::Label::new("フォルダ:").sense(
+                        .add(egui::Label::new("フォルダ:").selectable(false).sense(
                             if self.settings.toolbar_section_drag_enabled {
                                 egui::Sense::click_and_drag()
                             } else {
@@ -16702,46 +17024,18 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         self.note_reading_history_open(idx);
                         self.drill_into_subfolder(p);
                     } else {
-                        let p = p.clone();
-                        let auto_fs = self.should_auto_fullscreen_grid_container(idx);
-                        #[cfg(windows)]
-                        if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx, idx)
-                        {
+                        let Some(next_nav) = self.accept_grid_container_open(ctx, idx) else {
                             return nav;
-                        }
-                        if self.begin_smart_grid_container_navigation(
-                            idx,
-                            p.clone(),
-                            auto_fs,
-                            crate::app::StartupListIntent::container_open(auto_fs),
-                        ) {
-                            return nav;
-                        }
-                        self.note_reading_history_open(idx);
-                        self.maybe_suppress_rating_filter_for_opened_container(idx);
-                        if auto_fs {
-                            self.pending_auto_fs_open = true;
-                        }
-                        nav = Some(self.grid_physical_navigation(idx, p, auto_fs));
+                        };
+                        nav = Some(next_nav);
                     }
                 }
-                Some(GridItem::ZipFile(p)) | Some(GridItem::PdfFile(p)) => {
+                Some(GridItem::ZipFile(_)) | Some(GridItem::PdfFile(_)) => {
                     // Folder 分岐とは global_search drill-in 判定が違うためここは別のまま。
-                    let p = p.clone();
-                    let auto_fs = self.should_auto_fullscreen_grid_container(idx);
-                    #[cfg(windows)]
-                    if auto_fs && !self.park_active_detached_context_for_new_grid_open(ctx, idx) {
+                    let Some(next_nav) = self.accept_grid_container_open(ctx, idx) else {
                         return nav;
-                    }
-                    if self.begin_smart_grid_container_navigation(
-                        idx,
-                        p.clone(),
-                        auto_fs,
-                        crate::app::StartupListIntent::container_open(auto_fs),
-                    ) {
-                        return nav;
-                    }
-                    nav = Some(self.grid_physical_navigation(idx, p, auto_fs));
+                    };
+                    nav = Some(next_nav);
                 }
                 Some(GridItem::Image(_))
                 | Some(GridItem::Audio(_))
@@ -16792,6 +17086,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         return nav;
                     }
                     let owner = self.main_grid_archive_open_owner(idx, &pf);
+                    self.capture_main_folder_list_order(idx);
                     let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
                     let staged = self.will_stage_archive_navigation(&pf, &owner);
                     let open_outcome = self
@@ -17248,6 +17543,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             pixels_per_point,
             &self.settings,
             self.items_are_rating_view,
+            self.items_are_tag_view,
         );
         let details_scroll_style = details_scroll_style();
         let content_w = layout.pane_w;
@@ -17423,6 +17719,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 requested_extent: horizontal_policy.scroll_extent,
                 column_set: DetailsColumnSet::Details,
                 items_are_rating_view: self.items_are_rating_view,
+                items_are_tag_view: self.items_are_tag_view,
                 outer_inner_rect: horizontal_output.inner_rect,
                 outer_content_size: horizontal_output.content_size,
                 outer_state: horizontal_output.state,
@@ -17994,6 +18291,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     drag,
                     12.0,
                     self.items_are_rating_view,
+                    self.items_are_tag_view,
                 ) {
                     crate::logger::log(format!(
                         "details header reorder ({column_set:?}): {:?} -> x {:.1}",
@@ -18029,6 +18327,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             &self.settings,
             column_set,
             self.items_are_rating_view,
+            self.items_are_tag_view,
         );
         let current_name_width = columns
             .iter()
@@ -18245,6 +18544,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             &self.settings,
             job.key.column_set,
             self.items_are_rating_view,
+            self.items_are_tag_view,
         )
         .contains(&job.key.column)
         {
@@ -18442,6 +18742,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     column_set,
                     effective_width,
                     self.items_are_rating_view,
+                    self.items_are_tag_view,
                 );
                 set_details_name_width(&mut self.settings, column_set, stored_width)
             } else {
@@ -18486,6 +18787,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             &self.settings,
             DetailsColumnSet::Details,
             self.items_are_rating_view,
+            self.items_are_tag_view,
         );
         for (col, col_rect) in columns.iter().copied() {
             let response = self.interact_details_header_drag(
@@ -18645,6 +18947,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 if self.items_are_rating_view {
                     ui.checkbox(&mut menu_state.show_rated_at, "★設定時刻");
                 }
+                if self.items_are_tag_view {
+                    ui.checkbox(&mut menu_state.show_applied_at, "タグ付与時刻");
+                }
                 ui.checkbox(&mut menu_state.show_tags, "タグ");
                 ui.checkbox(&mut menu_state.show_kind, "種類");
                 ui.checkbox(&mut menu_state.show_page_count, "ページ数")
@@ -18693,6 +18998,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             column_set,
             current_name_width,
             self.items_are_rating_view,
+            self.items_are_tag_view,
         );
         // details_selection_bar_mode は環境設定ダイアログ所有のため、ダイアログを開いたまま
         // ここで切り替えた後に OK を押すと prepare_preferences_settings_for_commit が保持する
@@ -18742,6 +19048,17 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     .map(|rated_at_ms| {
                         format_details_mtime(
                             rated_at_ms.div_euclid(1000),
+                            self.settings.details_timestamp_show_seconds,
+                        )
+                    })
+                    .unwrap_or_default()
+            }
+            DetailsColumn::AppliedAt => {
+                // 検索に寄与するタグが無い行は空欄。日時の書式は他の日時列と共通。
+                self.tag_view_applied_at_ms(idx)
+                    .map(|applied_at_ms| {
+                        format_details_mtime(
+                            applied_at_ms.div_euclid(1000),
                             self.settings.details_timestamp_show_seconds,
                         )
                     })
@@ -18843,6 +19160,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             &self.settings,
             column_set,
             self.items_are_rating_view,
+            self.items_are_tag_view,
         );
         let columns = column_rects
             .iter()
@@ -18959,6 +19277,15 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     &content_painter,
                     col_rect,
                     row_data.text(DetailsColumn::RatedAt),
+                    egui::Align2::LEFT_CENTER,
+                    text_color,
+                    false,
+                ),
+                DetailsColumn::AppliedAt => draw_details_text_with_painter(
+                    ui,
+                    &content_painter,
+                    col_rect,
+                    row_data.text(DetailsColumn::AppliedAt),
                     egui::Align2::LEFT_CENTER,
                     text_color,
                     false,
@@ -19886,6 +20213,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     filter_match_count,
                                     media_duration.as_deref(),
                                     self.settings.thumb_show_resume_meter,
+                                    crate::thumb_overlay_layout::ThumbnailNameStyle { font_scale: self.settings.thumb_name_font_scale_percent as f32 / 100.0, max_lines: self.settings.thumb_name_max_lines as usize },
                                 );
 
                                 let selected_before = self.selected == Some(idx);
@@ -19995,6 +20323,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         filter_match_count,
                                         media_duration.as_deref(),
                                         self.settings.thumb_show_resume_meter,
+                                        crate::thumb_overlay_layout::ThumbnailNameStyle { font_scale: self.settings.thumb_name_font_scale_percent as f32 / 100.0, max_lines: self.settings.thumb_name_max_lines as usize },
                                     );
                                 }
 
@@ -20264,6 +20593,17 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 )
             ));
         }
+        if self.settings.details_show_applied_at
+            && let Some(applied_at_ms) = self.tag_view_applied_at_ms(idx)
+        {
+            lines.push(format!(
+                "タグ付与時刻 {}",
+                format_details_mtime(
+                    applied_at_ms.div_euclid(1000),
+                    self.settings.details_timestamp_show_seconds,
+                )
+            ));
+        }
 
         let mut fields = Vec::new();
         let mut full_location_line = None;
@@ -20450,6 +20790,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         pixels_per_point,
                         &self.settings,
                         self.items_are_rating_view,
+                        self.items_are_tag_view,
                     )
                     .gutter
                 } else {
@@ -20466,15 +20807,20 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     &self.settings,
                     column_set,
                     self.items_are_rating_view,
+                    self.items_are_tag_view,
                 );
                 let content_w = details_content_width_for_column_set(full_layout.pane_w);
                 let avail_h = ui.available_height().max(0.0);
-                let fixed_columns_w: f32 =
-                    details_visible_columns(&self.settings, column_set, self.items_are_rating_view)
-                        .into_iter()
-                        .filter(|column| *column != DetailsColumn::Name)
-                        .map(|column| details_column_width(&self.settings, column_set, column))
-                        .sum();
+                let fixed_columns_w: f32 = details_visible_columns(
+                    &self.settings,
+                    column_set,
+                    self.items_are_rating_view,
+                    self.items_are_tag_view,
+                )
+                .into_iter()
+                .filter(|column| *column != DetailsColumn::Name)
+                .map(|column| details_column_width(&self.settings, column_set, column))
+                .sum();
                 let horizontal_policy = details_horizontal_scroll_policy(
                     source_rect,
                     full_layout.extent,
@@ -20531,6 +20877,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         requested_extent: horizontal_policy.scroll_extent,
                         column_set,
                         items_are_rating_view: self.items_are_rating_view,
+                        items_are_tag_view: self.items_are_tag_view,
                         outer_inner_rect: output.inner_rect,
                         outer_content_size: output.content_size,
                         outer_state: output.state,
@@ -21184,20 +21531,20 @@ mod rated_at_details_column_tests {
         let settings = crate::settings::Settings::default();
 
         assert!(
-            !details_visible_columns(&settings, DetailsColumnSet::Details, false,)
+            !details_visible_columns(&settings, DetailsColumnSet::Details, false, false,)
                 .contains(&DetailsColumn::RatedAt)
         );
         assert!(
-            !details_ordered_columns(&settings, DetailsColumnSet::Details, true, false,)
+            !details_ordered_columns(&settings, DetailsColumnSet::Details, true, false, false,)
                 .contains(&DetailsColumn::RatedAt)
         );
 
         assert!(
-            details_visible_columns(&settings, DetailsColumnSet::Details, true,)
+            details_visible_columns(&settings, DetailsColumnSet::Details, true, false,)
                 .contains(&DetailsColumn::RatedAt)
         );
         assert!(
-            details_ordered_columns(&settings, DetailsColumnSet::Details, true, true,)
+            details_ordered_columns(&settings, DetailsColumnSet::Details, true, true, false,)
                 .contains(&DetailsColumn::RatedAt)
         );
         assert_eq!(
@@ -21253,6 +21600,428 @@ mod rated_at_details_column_tests {
                 .iter()
                 .any(|entry| entry.column == DetailsColumnId::RatedAt)
         );
+    }
+}
+
+#[cfg(test)]
+mod applied_at_details_column_tests {
+    use super::*;
+    use crate::tag_view::TagViewSort;
+    use egui_kittest::kittest::{NodeT, Queryable};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    #[test]
+    fn applied_at_column_menu_and_bar_are_tag_view_only() {
+        let mut settings = crate::settings::Settings::default();
+        for set in [
+            DetailsColumnSet::Details,
+            DetailsColumnSet::SharedBar,
+            DetailsColumnSet::DedicatedBar,
+        ] {
+            for (rating, tag) in [(false, false), (true, false), (false, true)] {
+                assert_eq!(
+                    details_visible_columns(&settings, set, rating, tag)
+                        .contains(&DetailsColumn::AppliedAt),
+                    tag
+                );
+                assert_eq!(
+                    details_ordered_columns(&settings, set, true, rating, tag)
+                        .contains(&DetailsColumn::AppliedAt),
+                    tag
+                );
+            }
+        }
+        assert_eq!(
+            DetailsColumn::AppliedAt.sort_key(),
+            Some(DetailsSortKey::AppliedAt)
+        );
+        settings.selection_info_display_mode = crate::settings::SelectionInfoDisplayMode::Both;
+        assert!(selection_info_bottom_bar_shows_column(
+            &settings,
+            DetailsColumn::AppliedAt,
+            false,
+            true
+        ));
+        assert!(!selection_info_bottom_bar_shows_column(
+            &settings,
+            DetailsColumn::AppliedAt,
+            false,
+            false
+        ));
+        settings.details_show_applied_at = false;
+        assert!(!selection_info_bottom_bar_shows_column(
+            &settings,
+            DetailsColumn::AppliedAt,
+            false,
+            true
+        ));
+        settings.details_selection_bar_mode = crate::settings::DetailsSelectionBarMode::Dedicated;
+        settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        assert!(selection_info_bottom_bar_shows_column(
+            &settings,
+            DetailsColumn::AppliedAt,
+            false,
+            true
+        ));
+        settings.details_selection_bar_show_applied_at = false;
+        assert!(!selection_info_bottom_bar_shows_column(
+            &settings,
+            DetailsColumn::AppliedAt,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn applied_at_width_and_visibility_follow_shared_and_dedicated_column_settings() {
+        let mut settings = crate::settings::Settings::default();
+        for (set, width) in [
+            (DetailsColumnSet::Details, 177.0),
+            (DetailsColumnSet::DedicatedBar, 233.0),
+        ] {
+            assert!(set_details_column_width(
+                &mut settings,
+                set,
+                DetailsColumn::AppliedAt,
+                width
+            ));
+            assert_eq!(
+                details_column_width(&settings, set, DetailsColumn::AppliedAt),
+                width
+            );
+        }
+        assert_eq!(
+            details_column_width(
+                &settings,
+                DetailsColumnSet::SharedBar,
+                DetailsColumn::AppliedAt
+            ),
+            177.0
+        );
+        assert_eq!(settings.details_applied_at_width, Some(177.0));
+        assert_eq!(settings.details_selection_bar_applied_at_width, Some(233.0));
+        assert!(
+            !settings
+                .details_column_widths
+                .iter()
+                .any(|entry| entry.column == DetailsColumnId::AppliedAt)
+        );
+        assert!(
+            !settings
+                .details_selection_bar_column_widths
+                .iter()
+                .any(|entry| entry.column == DetailsColumnId::AppliedAt)
+        );
+
+        let mut shared =
+            DetailsColumnMenuState::from_settings(&settings, DetailsColumnSet::SharedBar);
+        shared.show_applied_at = false;
+        assert!(
+            shared
+                .apply(
+                    &mut settings,
+                    DetailsColumnSet::SharedBar,
+                    180.0,
+                    false,
+                    true
+                )
+                .columns
+        );
+        assert!(!settings.details_show_applied_at);
+        assert!(settings.details_selection_bar_show_applied_at);
+        let mut dedicated =
+            DetailsColumnMenuState::from_settings(&settings, DetailsColumnSet::DedicatedBar);
+        dedicated.show_applied_at = false;
+        assert!(
+            dedicated
+                .apply(
+                    &mut settings,
+                    DetailsColumnSet::DedicatedBar,
+                    180.0,
+                    false,
+                    true
+                )
+                .columns
+        );
+        assert!(!settings.details_selection_bar_show_applied_at);
+    }
+
+    #[test]
+    fn tag_sort_choices_select_own_order_and_ignore_disabled_clicks() {
+        let current = Rc::new(Cell::new(TagViewSort::PathOrder));
+        let enabled = Rc::new(Cell::new(true));
+        let draw_current = Rc::clone(&current);
+        let draw_enabled = Rc::clone(&enabled);
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(240.0, 140.0))
+            .build_ui(move |root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    if let Some(sort) = draw_tag_view_sort_choices(
+                        ui,
+                        draw_current.get(),
+                        draw_enabled.get(),
+                        false,
+                    ) {
+                        draw_current.set(sort);
+                    }
+                });
+            });
+        harness.run();
+        for sort in [
+            TagViewSort::AppliedAtDesc,
+            TagViewSort::AppliedAtAsc,
+            TagViewSort::PathOrder,
+        ] {
+            harness.get_by_label(sort.label()).click();
+            harness.run();
+            assert_eq!(current.get(), sort);
+        }
+        enabled.set(false);
+        harness.run();
+        for sort in tag_view_sort_options() {
+            assert!(
+                harness
+                    .get_by_label(sort.label())
+                    .accesskit_node()
+                    .is_disabled()
+            );
+        }
+        harness
+            .get_by_label(TagViewSort::AppliedAtDesc.label())
+            .click();
+        harness.run();
+        assert_eq!(current.get(), TagViewSort::PathOrder);
+    }
+
+    #[test]
+    fn tag_sort_controls_show_only_tag_choices_on_every_surface() {
+        for surface in ["menu", "buttons", "toolbar_dropdown", "facet_dropdown"] {
+            let mut app = crate::app::setup_app_for_test();
+            app.items_are_tag_view = true;
+            app.settings.tag_view_sort = TagViewSort::AppliedAtDesc;
+            app.settings.show_toolbar_sort = true;
+            app.settings.toolbar_sort_items = crate::settings::SortOrder::all().to_vec();
+            app.settings.toolbar_sort_display = if surface == "buttons" {
+                crate::settings::ToolbarSectionDisplay::Buttons
+            } else {
+                crate::settings::ToolbarSectionDisplay::Dropdown
+            };
+            let app = Rc::new(RefCell::new(app));
+            let draw_app = Rc::clone(&app);
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(1700.0, 420.0))
+                .build_ui(move |root_ui| match surface {
+                    "menu" => {
+                        draw_app.borrow_mut().render_menubar(root_ui);
+                    }
+                    "facet_dropdown" => {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            draw_app
+                                .borrow_mut()
+                                .draw_grid_sort_dropdown(ui, "facet_sort_combo");
+                        });
+                    }
+                    _ => {
+                        draw_app.borrow_mut().render_toolbar(root_ui);
+                    }
+                });
+            harness.run();
+            if surface == "menu" {
+                harness.get_by_label("設定").click();
+                harness.run();
+                harness.get_by_label("ソート順").click();
+                harness.run();
+            } else if surface != "buttons" {
+                harness
+                    .get_all_by_role(egui::accesskit::Role::ComboBox)
+                    .into_iter()
+                    .find(|node| {
+                        node.value().as_deref() == Some(TagViewSort::AppliedAtDesc.short_label())
+                    })
+                    .expect("tag sort combo")
+                    .click();
+                harness.run();
+            }
+            for sort in tag_view_sort_options() {
+                assert!(
+                    harness
+                        .query_by_label(if surface == "buttons" {
+                            sort.short_label()
+                        } else {
+                            sort.label()
+                        })
+                        .is_some(),
+                    "{surface}: {sort:?}"
+                );
+            }
+            for sort in crate::settings::SortOrder::all() {
+                assert!(
+                    harness.query_by_label(sort.short_label()).is_none(),
+                    "{surface}: normal sort {sort:?}"
+                );
+                assert!(
+                    harness.query_by_label(sort.label()).is_none(),
+                    "{surface}: normal sort {sort:?}"
+                );
+            }
+            assert_eq!(
+                app.borrow().settings.tag_view_sort,
+                TagViewSort::AppliedAtDesc
+            );
+        }
+    }
+
+    #[test]
+    fn tag_sort_controls_are_disabled_while_details_header_owns_order() {
+        for surface in ["menu", "buttons", "toolbar_dropdown", "facet_dropdown"] {
+            let mut app = crate::app::setup_app_for_test();
+            app.items_are_tag_view = true;
+            app.settings.tag_view_sort = TagViewSort::AppliedAtAsc;
+            app.settings.grid_view_mode = GridViewMode::Details;
+            app.settings.details_sort_key = DetailsSortKey::AppliedAt;
+            app.settings.show_toolbar_sort = true;
+            app.settings.toolbar_sort_display = if surface == "buttons" {
+                crate::settings::ToolbarSectionDisplay::Buttons
+            } else {
+                crate::settings::ToolbarSectionDisplay::Dropdown
+            };
+            assert_eq!(
+                app.grid_sort_lock_reason(),
+                Some(crate::app::GridSortLockReason::DetailsHeaderSort)
+            );
+            let app = Rc::new(RefCell::new(app));
+            let draw_app = Rc::clone(&app);
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(1700.0, 420.0))
+                .build_ui(move |root_ui| match surface {
+                    "menu" => {
+                        draw_app.borrow_mut().render_menubar(root_ui);
+                    }
+                    "facet_dropdown" => {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            draw_app
+                                .borrow_mut()
+                                .draw_grid_sort_dropdown(ui, "facet_sort_combo");
+                        });
+                    }
+                    _ => {
+                        draw_app.borrow_mut().render_toolbar(root_ui);
+                    }
+                });
+            harness.run();
+            if surface == "menu" {
+                harness.get_by_label("設定").click();
+                harness.run();
+                let label = format!(
+                    "ソート順: {}",
+                    crate::app::GridSortLockReason::DetailsHeaderSort.short_label()
+                );
+                assert!(harness.get_by_label(&label).accesskit_node().is_disabled());
+            } else if surface == "buttons" {
+                for sort in tag_view_sort_options() {
+                    assert!(
+                        harness
+                            .get_by_label(sort.short_label())
+                            .accesskit_node()
+                            .is_disabled()
+                    );
+                }
+            } else {
+                let label = crate::app::GridSortLockReason::DetailsHeaderSort.short_label();
+                let combo = harness
+                    .get_all_by_role(egui::accesskit::Role::ComboBox)
+                    .into_iter()
+                    .find(|node| node.value().as_deref() == Some(label))
+                    .expect("locked tag sort combo");
+                if surface == "facet_dropdown" {
+                    // Facet refresh remains available while header sorting owns the order.
+                    assert!(!combo.accesskit_node().is_disabled());
+                    combo.click();
+                    harness.run();
+                    for sort in tag_view_sort_options() {
+                        assert!(
+                            harness
+                                .get_by_label(sort.label())
+                                .accesskit_node()
+                                .is_disabled()
+                        );
+                    }
+                    assert!(
+                        !harness
+                            .get_by_label("最新の情報に更新")
+                            .accesskit_node()
+                            .is_disabled()
+                    );
+                } else {
+                    assert!(combo.accesskit_node().is_disabled());
+                }
+            }
+            assert_eq!(
+                app.borrow().settings.tag_view_sort,
+                TagViewSort::AppliedAtAsc
+            );
+            assert_eq!(
+                app.borrow().settings.details_sort_key,
+                DetailsSortKey::AppliedAt
+            );
+        }
+    }
+
+    #[test]
+    fn tag_sort_choices_snapshot_dark() {
+        // Pure shared drawing only: no App, files, search worker, or native window.
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(320.0, 240.0))
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    crate::os_theme::apply_resolved(
+                        root_ui.ctx(),
+                        crate::os_theme::ResolvedTheme::Dark,
+                    );
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.label("タグビューのソート");
+                        draw_tag_view_sort_choices(ui, TagViewSort::AppliedAtDesc, true, false);
+                        ui.separator();
+                        ui.label("列ヘッダで並べ替え中");
+                        ui.horizontal(|ui| {
+                            draw_tag_view_sort_choices(ui, TagViewSort::AppliedAtDesc, false, true);
+                        });
+                        ui.separator();
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(300.0, 26.0), egui::Sense::hover());
+                        let painter = ui.painter().clone();
+                        draw_details_text_with_painter(
+                            ui,
+                            &painter,
+                            rect,
+                            DetailsColumn::AppliedAt.title(),
+                            egui::Align2::LEFT_CENTER,
+                            ui.visuals().text_color(),
+                            true,
+                        );
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(300.0, 26.0), egui::Sense::hover());
+                        draw_details_text_with_painter(
+                            ui,
+                            &painter,
+                            rect,
+                            &format_details_mtime(1_700_000_000, true),
+                            egui::Align2::LEFT_CENTER,
+                            ui.visuals().text_color(),
+                            false,
+                        );
+                    });
+                });
+            });
+        harness.run();
+        harness.snapshot("tag_sort_choices_dark");
     }
 }
 
@@ -21356,6 +22125,131 @@ mod selection_info_tests {
             app.details_row_data(0, &[DetailsColumn::RatedAt])
                 .unwrap()
                 .text(DetailsColumn::RatedAt),
+            ""
+        );
+    }
+
+    #[test]
+    fn tag_view_selection_info_and_cell_follow_timestamp_presence_and_column_settings() {
+        let path = PathBuf::from(r"C:\pics\tagged.jpg");
+        let mut app = app_with_item(GridItem::Image(path.clone()), Some((1_600_000_000, 100)));
+        app.items_are_tag_view = true;
+        app.tag_view_applied_times
+            .insert(crate::tags_db::item_key_for_path(&path), 1_700_000_000_123);
+
+        for seconds in [false, true] {
+            app.settings.details_timestamp_show_seconds = seconds;
+            let expected = format_details_mtime(1_700_000_000, seconds);
+            assert_eq!(
+                app.details_row_data(0, &[DetailsColumn::AppliedAt])
+                    .unwrap()
+                    .text(DetailsColumn::AppliedAt),
+                expected
+            );
+            assert!(
+                app.selection_info_content()
+                    .unwrap()
+                    .lines
+                    .contains(&format!("タグ付与時刻 {expected}"))
+            );
+        }
+
+        // The tooltip follows the list setting; a dedicated bar keeps its own visibility.
+        app.settings.details_show_applied_at = false;
+        app.settings.details_selection_bar_mode =
+            crate::settings::DetailsSelectionBarMode::Dedicated;
+        app.settings.details_selection_bar_show_applied_at = true;
+        assert!(
+            !app.selection_info_content()
+                .unwrap()
+                .single_line_text()
+                .contains("タグ付与時刻")
+        );
+        app.settings.details_show_applied_at = true;
+        app.tag_view_applied_times.clear();
+        assert!(
+            !app.selection_info_content()
+                .unwrap()
+                .single_line_text()
+                .contains("タグ付与時刻")
+        );
+        assert_eq!(
+            app.details_row_data(0, &[DetailsColumn::AppliedAt])
+                .unwrap()
+                .text(DetailsColumn::AppliedAt),
+            ""
+        );
+
+        app.tag_view_applied_times
+            .insert(crate::tags_db::item_key_for_path(&path), 1_700_000_000_123);
+        app.items_are_tag_view = false;
+        assert!(
+            !app.selection_info_content()
+                .unwrap()
+                .single_line_text()
+                .contains("タグ付与時刻")
+        );
+        assert_eq!(
+            app.details_row_data(0, &[DetailsColumn::AppliedAt])
+                .unwrap()
+                .text(DetailsColumn::AppliedAt),
+            ""
+        );
+    }
+
+    #[test]
+    fn tag_applied_at_snapshot_hides_column_menu_and_selection_information() {
+        let path = PathBuf::from(r"C:\pics\tagged.jpg");
+        let mut app = app_with_item(GridItem::Image(path.clone()), Some((1_600_000_000, 100)));
+        app.items_are_tag_view = true;
+        app.tag_view.active = true;
+        app.visible_indices = vec![0];
+        app.tag_view_applied_times
+            .insert(crate::tags_db::item_key_for_path(&path), 1_700_000_000_000);
+        assert!(
+            app.selection_info_content()
+                .unwrap()
+                .single_line_text()
+                .contains("タグ付与時刻")
+        );
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        for set in [
+            DetailsColumnSet::Details,
+            DetailsColumnSet::SharedBar,
+            DetailsColumnSet::DedicatedBar,
+        ] {
+            assert!(
+                !details_visible_columns(
+                    &app.settings,
+                    set,
+                    app.items_are_rating_view,
+                    app.items_are_tag_view
+                )
+                .contains(&DetailsColumn::AppliedAt)
+            );
+            // メニュー候補にも、設定値の有効／無効と独立に同じview制約を使う。
+            assert!(
+                !details_ordered_columns(
+                    &app.settings,
+                    set,
+                    true,
+                    app.items_are_rating_view,
+                    app.items_are_tag_view
+                )
+                .contains(&DetailsColumn::AppliedAt)
+            );
+        }
+        assert!(
+            !app.selection_info_content()
+                .unwrap()
+                .single_line_text()
+                .contains("タグ付与時刻")
+        );
+        assert_eq!(
+            app.details_row_data(0, &[DetailsColumn::AppliedAt])
+                .unwrap()
+                .text(DetailsColumn::AppliedAt),
             ""
         );
     }
@@ -22697,7 +23591,13 @@ mod compute_cell_size_tests {
         state.size_display_mode = DetailsSizeDisplayMode::FixedMb;
         state.timestamp_show_seconds = false;
         state.row_style = DetailsRowStyle::Plain;
-        let changes = state.apply(&mut settings, DetailsColumnSet::DedicatedBar, 321.0, false);
+        let changes = state.apply(
+            &mut settings,
+            DetailsColumnSet::DedicatedBar,
+            321.0,
+            false,
+            false,
+        );
 
         assert!(changes.columns);
         assert!(changes.lazy_columns);
@@ -22723,7 +23623,13 @@ mod compute_cell_size_tests {
             DetailsColumnMenuState::from_settings(&settings, DetailsColumnSet::SharedBar);
         assert!(!shared.show_tags);
         shared.show_tags = true;
-        let shared_changes = shared.apply(&mut settings, DetailsColumnSet::SharedBar, 180.0, false);
+        let shared_changes = shared.apply(
+            &mut settings,
+            DetailsColumnSet::SharedBar,
+            180.0,
+            false,
+            false,
+        );
         assert!(shared_changes.columns);
         assert!(settings.details_show_tags);
         assert!(
@@ -22877,7 +23783,15 @@ mod compute_cell_size_tests {
         ));
 
         // avail が狭くても、保存済みの広い列のために pane は名前列既定幅 + その列幅まで広がる。
-        let layout = details_layout(200.0, 0.0, 1.0, &settings, DetailsColumnSet::Details, false);
+        let layout = details_layout(
+            200.0,
+            0.0,
+            1.0,
+            &settings,
+            DetailsColumnSet::Details,
+            false,
+            false,
+        );
         assert_eq!(layout.pane_w, DetailsColumn::Name.default_width() + 220.0);
         assert_eq!(layout.extent, layout.pane_w, "gutter 0 なら extent == pane");
     }
@@ -22894,6 +23808,7 @@ mod compute_cell_size_tests {
             &settings,
             DetailsColumnSet::Details,
             false,
+            false,
         );
         assert!((layout.extent - 599.0).abs() < 0.01);
         assert!(
@@ -22909,7 +23824,15 @@ mod compute_cell_size_tests {
     #[test]
     fn details_layout_without_gutter_leaves_one_physical_pixel() {
         let settings = minimal_details_settings();
-        let layout = details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::Details, false);
+        let layout = details_layout(
+            600.0,
+            0.0,
+            1.0,
+            &settings,
+            DetailsColumnSet::Details,
+            false,
+            false,
+        );
         assert!((layout.extent - 599.0).abs() < 0.01);
         assert!((layout.pane_w - 599.0).abs() < 0.01);
     }
@@ -22924,6 +23847,7 @@ mod compute_cell_size_tests {
                 pixels_per_point,
                 &settings,
                 DetailsColumnSet::Details,
+                false,
                 false,
             );
             let device_pixel_gap = (600.0 - layout.extent) * pixels_per_point;
@@ -22950,6 +23874,7 @@ mod compute_cell_size_tests {
                 pixels_per_point,
                 &settings,
                 DetailsColumnSet::Details,
+                false,
                 false,
             );
             let policy = details_horizontal_scroll_policy(
@@ -23028,7 +23953,8 @@ mod compute_cell_size_tests {
                 egui::Rect::from_min_size(egui::pos2(8.0, 0.0), egui::vec2(avail_w, 400.0));
             let mut settings = minimal_details_settings();
             settings.details_name_width_auto = false;
-            let fixed = details_fixed_columns_width(&settings, DetailsColumnSet::Details, false);
+            let fixed =
+                details_fixed_columns_width(&settings, DetailsColumnSet::Details, false, false);
             let layout_avail_w =
                 details_horizontal_viewport_capacity(viewport, pixels_per_point).min(avail_w);
             let fitting_name =
@@ -23041,6 +23967,7 @@ mod compute_cell_size_tests {
                 pixels_per_point,
                 &settings,
                 DetailsColumnSet::Details,
+                false,
                 false,
             );
             let fitting_policy = details_horizontal_scroll_policy(
@@ -23062,6 +23989,7 @@ mod compute_cell_size_tests {
                 pixels_per_point,
                 &settings,
                 DetailsColumnSet::Details,
+                false,
                 false,
             );
             let overflow_policy = details_horizontal_scroll_policy(
@@ -23100,6 +24028,7 @@ mod compute_cell_size_tests {
                                 pixels_per_point,
                                 &settings,
                                 DetailsColumnSet::Details,
+                                false,
                                 false,
                             );
                             let policy = details_horizontal_scroll_policy(
@@ -23156,6 +24085,7 @@ mod compute_cell_size_tests {
                                 effective_ppp,
                                 &settings,
                                 DetailsColumnSet::Details,
+                                false,
                                 false,
                             );
                             let policy = details_horizontal_scroll_policy(
@@ -23965,7 +24895,7 @@ mod compute_cell_size_tests {
         ];
 
         assert_eq!(
-            details_visible_columns(&settings, DetailsColumnSet::SharedBar, false),
+            details_visible_columns(&settings, DetailsColumnSet::SharedBar, false, false),
             vec![
                 DetailsColumn::Kind,
                 DetailsColumn::Size,
@@ -24039,6 +24969,7 @@ mod compute_cell_size_tests {
             1.0,
             settings,
             false,
+            false,
         )
     }
 
@@ -24054,6 +24985,7 @@ mod compute_cell_size_tests {
             ),
             settings,
             column_set,
+            false,
             false,
         )
     }
@@ -24076,6 +25008,7 @@ mod compute_cell_size_tests {
             1.0,
             settings,
             DetailsColumnSet::SharedBar,
+            false,
             false,
         );
         let list_rects = layout_column_rects(resolved.layout, settings, DetailsColumnSet::Details);
@@ -24121,6 +25054,7 @@ mod compute_cell_size_tests {
             &settings,
             DetailsColumnSet::SharedBar,
             false,
+            false,
         );
         let long_bar = details_layout(
             600.0,
@@ -24128,6 +25062,7 @@ mod compute_cell_size_tests {
             1.0,
             &settings,
             DetailsColumnSet::SharedBar,
+            false,
             false,
         );
         let short_list_x = column_rect(
@@ -24177,6 +25112,7 @@ mod compute_cell_size_tests {
             &settings,
             DetailsColumnSet::SharedBar,
             false,
+            false,
         );
         let long_layout = details_layout(
             600.0,
@@ -24184,6 +25120,7 @@ mod compute_cell_size_tests {
             1.0,
             &settings,
             DetailsColumnSet::SharedBar,
+            false,
             false,
         );
         assert_eq!(
@@ -24209,6 +25146,7 @@ mod compute_cell_size_tests {
             &settings,
             DetailsColumnSet::DedicatedBar,
             false,
+            false,
         );
 
         assert_eq!(resolved.gutter, details_scroll_style().allocated_width());
@@ -24232,6 +25170,7 @@ mod compute_cell_size_tests {
                     &settings,
                     DetailsColumnSet::SharedBar,
                     false,
+                    false,
                 );
                 let text_width = details_content_width_for_column_set(full_layout.pane_w);
                 let full_rect = egui::Rect::from_min_size(
@@ -24240,11 +25179,12 @@ mod compute_cell_size_tests {
                 );
                 let text_rect =
                     egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(text_width, 24.0));
-                let full = details_column_rects(full_rect, &settings, false);
+                let full = details_column_rects(full_rect, &settings, false, false);
                 let text = details_column_rects_for_columns(
                     text_rect,
                     &settings,
                     DetailsColumnSet::SharedBar,
+                    false,
                     false,
                 );
 
@@ -24283,8 +25223,15 @@ mod compute_cell_size_tests {
                 let mut settings = bottom_bar_layout_settings(true, name_width_auto);
                 settings.grid_view_mode = grid_view_mode;
                 settings.details_selection_bar_mode = selection_bar_mode;
-                let list_layout =
-                    details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::Details, false);
+                let list_layout = details_layout(
+                    600.0,
+                    0.0,
+                    1.0,
+                    &settings,
+                    DetailsColumnSet::Details,
+                    false,
+                    false,
+                );
                 let list_rects = details_column_rects_for_columns(
                     egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -24293,15 +25240,17 @@ mod compute_cell_size_tests {
                     &settings,
                     DetailsColumnSet::Details,
                     false,
+                    false,
                 );
                 let column_set = selection_info_bottom_bar_column_set(&settings);
-                let layout = details_layout(600.0, 0.0, 1.0, &settings, column_set, false);
+                let layout = details_layout(600.0, 0.0, 1.0, &settings, column_set, false, false);
                 let content_width = details_content_width_for_column_set(layout.pane_w);
                 assert_eq!(content_width, layout.pane_w);
                 let rects = details_column_rects_for_columns(
                     egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(content_width, 24.0)),
                     &settings,
                     column_set,
+                    false,
                     false,
                 );
                 let list_size = list_rects
@@ -24330,8 +25279,15 @@ mod compute_cell_size_tests {
                 let mut settings = bottom_bar_layout_settings(false, name_width_auto);
                 settings.grid_view_mode = grid_view_mode;
                 settings.details_selection_bar_mode = selection_bar_mode;
-                let list_layout =
-                    details_layout(600.0, 0.0, 1.0, &settings, DetailsColumnSet::Details, false);
+                let list_layout = details_layout(
+                    600.0,
+                    0.0,
+                    1.0,
+                    &settings,
+                    DetailsColumnSet::Details,
+                    false,
+                    false,
+                );
                 let list = details_column_rects_for_columns(
                     egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -24340,14 +25296,17 @@ mod compute_cell_size_tests {
                     &settings,
                     DetailsColumnSet::Details,
                     false,
+                    false,
                 );
                 let column_set = selection_info_bottom_bar_column_set(&settings);
-                let bar_layout = details_layout(600.0, 0.0, 1.0, &settings, column_set, false);
+                let bar_layout =
+                    details_layout(600.0, 0.0, 1.0, &settings, column_set, false, false);
                 let content_width = details_content_width_for_column_set(bar_layout.pane_w);
                 let bar = details_column_rects_for_columns(
                     egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(content_width, 24.0)),
                     &settings,
                     column_set,
+                    false,
                     false,
                 );
                 assert_eq!(
@@ -24385,7 +25344,7 @@ mod compute_cell_size_tests {
         let shared_set = selection_info_bottom_bar_column_set(&settings);
         assert_eq!(shared_set, DetailsColumnSet::SharedBar);
         assert_eq!(
-            details_visible_columns(&settings, shared_set, false),
+            details_visible_columns(&settings, shared_set, false, false),
             vec![DetailsColumn::Size, DetailsColumn::Name]
         );
 
@@ -24393,7 +25352,7 @@ mod compute_cell_size_tests {
         let dedicated_set = selection_info_bottom_bar_column_set(&settings);
         assert_eq!(dedicated_set, DetailsColumnSet::DedicatedBar);
         assert_eq!(
-            details_visible_columns(&settings, dedicated_set, false),
+            details_visible_columns(&settings, dedicated_set, false, false),
             vec![DetailsColumn::Kind, DetailsColumn::Name]
         );
 
@@ -24446,6 +25405,7 @@ mod compute_cell_size_tests {
             &settings,
             selection_info_bottom_bar_column_set(&settings),
             false,
+            false,
         );
         assert_eq!(
             shared.iter().map(|(column, _)| *column).collect::<Vec<_>>(),
@@ -24459,6 +25419,7 @@ mod compute_cell_size_tests {
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(555.0, 24.0)),
             &settings,
             selection_info_bottom_bar_column_set(&settings),
+            false,
             false,
         );
         assert_eq!(
@@ -24485,6 +25446,7 @@ mod compute_cell_size_tests {
             &settings,
             DetailsColumn::Size,
             false,
+            false,
         ));
 
         settings.grid_view_mode = GridViewMode::Thumbnail;
@@ -24492,10 +25454,12 @@ mod compute_cell_size_tests {
             &settings,
             DetailsColumn::Size,
             false,
+            false,
         ));
         assert!(!selection_info_bottom_bar_shows_column(
             &settings,
             DetailsColumn::Preview,
+            false,
             false,
         ));
     }
@@ -24511,6 +25475,7 @@ mod compute_cell_size_tests {
             1.0,
             &settings,
             DetailsColumnSet::Details,
+            false,
             false,
         );
         assert!((layout.name_w - 500.0).abs() < 0.01, "固定幅を尊重");
@@ -24532,10 +25497,11 @@ mod compute_cell_size_tests {
             &settings,
             DetailsColumnSet::Details,
             false,
+            false,
         );
         assert!((layout.name_w - 120.0).abs() < 0.01);
         let columns_w = layout.name_w
-            + details_fixed_columns_width(&settings, DetailsColumnSet::Details, false);
+            + details_fixed_columns_width(&settings, DetailsColumnSet::Details, false, false);
         assert!(
             columns_w < layout.pane_w,
             "固定名前列が pane より狭いと右側に余白が残る"
@@ -24668,14 +25634,19 @@ mod compute_cell_size_tests {
         settings.details_show_preview = true;
         settings.details_name_width_auto = false;
         settings.details_name_width = 210.0;
-        let effective =
-            details_effective_fixed_name_width(&settings, DetailsColumnSet::SharedBar, false);
+        let effective = details_effective_fixed_name_width(
+            &settings,
+            DetailsColumnSet::SharedBar,
+            false,
+            false,
+        );
         assert_eq!(effective, 244.0);
         assert_eq!(
             details_stored_name_width_from_effective(
                 &settings,
                 DetailsColumnSet::SharedBar,
                 effective,
+                false,
                 false,
             ),
             210.0
@@ -24690,6 +25661,7 @@ mod compute_cell_size_tests {
         let rects = details_column_rects(
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 24.0)),
             &settings,
+            false,
             false,
         );
         let name_rect = rects
@@ -24712,6 +25684,7 @@ mod compute_cell_size_tests {
             DetailsColumnSet::Details,
             DetailsColumn::Size,
             DetailsColumn::Name,
+            false,
             false,
             false,
         ));
@@ -24739,6 +25712,11 @@ mod compute_cell_size_tests {
             .iter()
             .position(|id| *id == DetailsColumnId::RatedAt)
             .unwrap();
+        let applied_at_pos = expected
+            .iter()
+            .position(|id| *id == DetailsColumnId::AppliedAt)
+            .unwrap();
+        expected.remove(applied_at_pos);
         expected.remove(rated_at_pos);
         let size_pos = expected
             .iter()
@@ -24751,12 +25729,14 @@ mod compute_cell_size_tests {
             .unwrap();
         expected.insert(name_pos, size);
         expected.insert(rated_at_pos, DetailsColumnId::RatedAt);
+        expected.insert(applied_at_pos, DetailsColumnId::AppliedAt);
 
         assert!(reorder_details_column(
             &mut settings,
             DetailsColumnSet::Details,
             DetailsColumn::Size,
             DetailsColumn::Name,
+            false,
             false,
             false,
         ));
@@ -24786,6 +25766,7 @@ mod compute_cell_size_tests {
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1200.0, 24.0)),
             &settings,
             false,
+            false,
         );
         let size_rect = columns
             .iter()
@@ -24808,6 +25789,7 @@ mod compute_cell_size_tests {
                 latest: egui::pos2(name_rect.left() + 4.0, name_rect.center().y),
             },
             12.0,
+            false,
             false,
         ));
 
@@ -24840,6 +25822,7 @@ mod compute_cell_size_tests {
             DetailsColumnSet::DedicatedBar,
             DetailsColumn::Size,
             DetailsColumn::Name,
+            false,
             false,
             false,
         ));
@@ -24882,6 +25865,7 @@ mod compute_cell_size_tests {
             DetailsColumnSet::SharedBar,
             DetailsColumn::Size,
             DetailsColumn::Name,
+            false,
             false,
             false,
         ));
@@ -24929,6 +25913,7 @@ mod compute_cell_size_tests {
                 DetailsColumn::Size,
                 DetailsColumn::Size,
                 true,
+                false,
                 false,
             ));
             assert_eq!(serde_json::to_value(&settings).unwrap(), before);
@@ -26968,6 +27953,89 @@ mod grid_reclick_open_tests {
             );
         }
         harness.run();
+    }
+
+    #[test]
+    fn list_order_double_click_captures_folder_zip_pdf_and_conversion_before_open() {
+        use crate::app::ListOrderEntryKind;
+        use crate::app::top_level_grid_view::TopLevelGridSurface;
+        for activated in 0..4 {
+            let mut harness =
+                handler_harness(GridClickSelectionMode::Explorer, false, None, false, false);
+            let app = &mut harness.state_mut().app;
+            let folder = app.tmp.path().join("list-order-pointer-source");
+            std::fs::create_dir_all(&folder).unwrap();
+            let mut rows = vec![
+                GridItem::Folder(folder.join("folder-book")),
+                GridItem::ZipFile(folder.join("zip-book.zip")),
+                GridItem::PdfFile(folder.join("pdf-book.pdf")),
+                GridItem::ConvertibleArchive {
+                    path: folder.join("convert-book.7z"),
+                    format: crate::archive_converter::ArchiveFormat::SevenZ,
+                },
+            ];
+            // Keep the clicked cell at the same on-screen position in every case.
+            rows.swap(0, activated);
+            let expected = rows
+                .iter()
+                .rev()
+                .map(|item| item.container_path().unwrap().to_path_buf())
+                .collect::<Vec<_>>();
+            std::fs::write(folder.join("convert-book.7z"), b"test archive").unwrap();
+            app.current_folder = Some(folder.clone());
+            app.items = rows;
+            app.thumbnails = vec![ThumbnailState::Pending; 4];
+            app.image_metas = vec![None; 4];
+            app.visible_indices = vec![3, 2, 1, 0];
+            app.settings.grid_view_mode = GridViewMode::Thumbnail;
+            app.settings.auto_fullscreen_zip_pdf = false;
+            // Conversion stops at its ordinary confirmation; no external tool runs.
+            app.settings
+                .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+            app.top_level_grid_view
+                .replace_surface(TopLevelGridSurface::Folder);
+            assert!(app.list_order.is_none());
+            harness.run();
+            click_cell(&mut harness, 0, egui::Modifiers::NONE);
+            assert!(
+                harness.state().app.list_order.is_none(),
+                "selection alone cannot capture"
+            );
+            click_cell(&mut harness, 0, egui::Modifiers::NONE);
+            let app = &harness.state().app;
+            let captured = app
+                .list_order
+                .as_ref()
+                .expect("double-click captures before opening");
+            assert_eq!(captured.owner, app.virtual_list_context_id());
+            assert_eq!(
+                captured
+                    .entries
+                    .iter()
+                    .map(|entry| entry.path.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let mut expected_kinds = vec![
+                ListOrderEntryKind::Folder,
+                ListOrderEntryKind::Zip,
+                ListOrderEntryKind::Pdf,
+                ListOrderEntryKind::ConvertibleArchive,
+            ];
+            expected_kinds.swap(0, activated);
+            expected_kinds.reverse();
+            assert_eq!(
+                captured
+                    .entries
+                    .iter()
+                    .map(|entry| entry.kind)
+                    .collect::<Vec<_>>(),
+                expected_kinds
+            );
+            // Returned folder/container navigation has not been adopted, and conversion
+            // has only reached confirmation. The captured rows are the outgoing list.
+            assert_eq!(app.current_folder.as_ref(), Some(&folder));
+        }
     }
 
     fn rating_selection_harness(
@@ -29816,6 +30884,56 @@ mod section207_tests {
     }
 
     #[test]
+    fn section1450_other_toolbar_labels_do_not_select_text_when_dragged() {
+        for label in ["列:", "フォルダ:"] {
+            let mut app = crate::app::setup_app_for_test();
+            only_folder_and_tree(&mut app);
+            app.settings.show_toolbar_cols = true;
+            app.settings.toolbar_section_drag_enabled = true;
+            let fonts = Cell::new(false);
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(800.0, 220.0))
+                .build_ui(move |root| {
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(root.ctx());
+                        root.ctx().request_repaint();
+                        return;
+                    }
+                    app.render_toolbar(root);
+                });
+            harness.run();
+            let rect = harness
+                .get_by_role_and_label(egui::accesskit::Role::Label, label)
+                .rect();
+            let start = rect.left_center() + egui::vec2(2.0, 0.0);
+            let end = rect.right_center() - egui::vec2(2.0, 0.0);
+            harness.event(egui::Event::PointerMoved(start));
+            harness.event(egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.event(egui::Event::PointerMoved(end));
+            harness.event(egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.run();
+            assert!(
+                !harness
+                    .ctx
+                    .plugin::<egui::text_selection::LabelSelectionState>()
+                    .lock()
+                    .has_selection(),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
     fn file_organize_destinations_location_menu_navigation_and_snapshot() {
         use crate::settings::FileOrganizeDestination;
         let mut env = crate::app::setup_app_for_test();
@@ -31328,6 +32446,67 @@ mod pinned_search_review_tests {
         cell::{Cell, RefCell},
         rc::Rc,
     };
+
+    #[test]
+    fn section1450_pinned_search_drag_reorders_the_production_toolbar_without_selection() {
+        use crate::settings::ToolbarSectionId as TS;
+        let mut app = crate::app::setup_app_for_test();
+        for &section in TS::default_order() {
+            set_toolbar_section_visible(&mut app.settings, section, false);
+        }
+        for kind in Kind::ALL {
+            set_toolbar_section_visible(&mut app.settings, kind.section(), true);
+        }
+        app.settings.toolbar_section_drag_enabled = true;
+        let app = Rc::new(RefCell::new(app));
+        let render = app.clone();
+        let fonts = Cell::new(false);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1200.0, 260.0))
+            .build_ui(move |root| {
+                if !fonts.replace(true) {
+                    crate::ui_fonts::configure_fonts(root.ctx());
+                    root.ctx().request_repaint();
+                    return;
+                }
+                render.borrow_mut().render_toolbar(root);
+            });
+        harness.run();
+        let start = harness
+            .get_by_role_and_label(egui::accesskit::Role::Label, Kind::Metadata.label())
+            .rect()
+            .left_center()
+            + egui::vec2(2.0, 0.0);
+        let end = harness
+            .get_by_role_and_label(egui::accesskit::Role::Label, Kind::Container.label())
+            .rect()
+            .left_center();
+        harness.event(egui::Event::PointerMoved(start));
+        harness.event(egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.event(egui::Event::PointerMoved(end));
+        harness.event(egui::Event::PointerButton {
+            pos: end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        let order = TS::ordered_with_fallback(&app.borrow().settings.toolbar_section_order);
+        let index = |section| order.iter().position(|&s| s == section).unwrap();
+        assert!(index(TS::SearchMetadata) < index(TS::SearchContainer));
+        assert!(
+            !harness
+                .ctx
+                .plugin::<egui::text_selection::LabelSelectionState>()
+                .lock()
+                .has_selection()
+        );
+    }
 
     #[test]
     fn section1409_search_label_secondary_click_opens_settings_with_drag_disabled() {

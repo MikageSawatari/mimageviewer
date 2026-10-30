@@ -52,7 +52,7 @@ run_step() {
 run_step "PDFium" "vendor/pdfium/bin/pdfium.dll" \
     "bash scripts/setup-pdfium.sh"
 
-run_step "LibRaw 0.22.2 and zlib" "vendor/libraw/VERSION" \
+run_step "LibRaw 0.22.3 and zlib" "vendor/libraw/VERSION" \
     "bash scripts/setup-libraw.sh"
 
 # setup validates VERSION and every output; VERSION alone cannot prove completeness.

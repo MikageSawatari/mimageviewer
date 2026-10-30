@@ -44,6 +44,637 @@ fn loaded_thumbnail(ctx: &egui::Context, name: &str) -> ThumbnailState {
     )
 }
 
+fn main_grid_to_overview_app(kind: &str, ctx: &egui::Context) -> AppTestEnvForTest {
+    let mut app = setup_thumbnail_app(40);
+    app.items = (0..40)
+        .map(|idx| match kind {
+            "image" => GridItem::Image(PathBuf::from(format!("C:/overview/book/p{idx:03}.jpg"))),
+            "zip" => GridItem::ZipImage {
+                zip_path: PathBuf::from("C:/overview/book.zip"),
+                entry_name: format!("p{idx:03}.jpg"),
+            },
+            "pdf" => GridItem::PdfPage {
+                pdf_path: PathBuf::from("C:/overview/book.pdf"),
+                page_num: idx as u32,
+                content_type: None,
+            },
+            _ => unreachable!(),
+        })
+        .collect();
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.settings.grid_cols = 4;
+    // The main grid painted twelve cells; source prefetch may already have loaded the rest.
+    // Rotation hydration belongs to the painted cells, independent of source pixels.
+    for idx in 0..12 {
+        app.thumbnails[idx] = loaded_thumbnail(ctx, &format!("main-grid-{kind}-{idx}"));
+        app.rotation_cache
+            .insert(idx, crate::rotation_db::Rotation::None);
+    }
+    install_overview_demand(&mut app);
+    app.page_overview.close();
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
+    assert!(app.open_page_overview(
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200., 900.)),
+        Default::default(),
+    ));
+    app
+}
+
+fn draw_overview_frame(app: &mut App, ctx: &egui::Context) {
+    // Each test frame has one renderer pass, so a fast worker cannot be drained by an
+    // implicit egui discard pass before the explicit completion-wait checkpoint.
+    ctx.options_mut(|options| options.max_passes = 1.try_into().unwrap());
+    ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200., 900.),
+            )),
+            ..Default::default()
+        },
+        |root_ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(root_ui, |ui| {
+                    app.render_page_overview_surface(ui, ui.max_rect());
+                });
+        },
+    )
+    .drop_without_applying_deltas();
+}
+
+#[test]
+fn overview_main_grid_prefetched_pixels_complete_rotation_without_seek_overlay() {
+    let mut results = Vec::new();
+    for kind in ["image", "zip", "pdf"] {
+        let ctx = egui::Context::default();
+        let mut app = main_grid_to_overview_app(kind, &ctx);
+        for idx in 12..40 {
+            app.thumbnails[idx] = loaded_thumbnail(&ctx, &format!("prefetched-{kind}-{idx}"));
+        }
+        draw_overview_frame(&mut app, &ctx);
+        assert!(
+            app.requested.is_empty(),
+            "loaded pixels must not be redundantly decoded"
+        );
+        assert!(
+            !app.page_overview_thumbnail_projection(&[12, 39])
+                .contains_key(&12)
+        );
+        app.rotation_cache.wait_for_result_for_test();
+        // This is the real overview frame path, never a manual rotation poll/strip draw.
+        draw_overview_frame(&mut app, &ctx);
+        let visible = app.page_overview_thumbnail_projection(&[12, 39]);
+        results.push((kind, visible.contains_key(&12), visible.contains_key(&39)));
+        assert!(app.requested.is_empty());
+    }
+    assert_eq!(
+        results,
+        vec![
+            ("image", true, true),
+            ("zip", true, true),
+            ("pdf", true, true)
+        ],
+        "completed rotations must be drained by the real overview path"
+    );
+}
+
+#[test]
+fn overview_main_grid_partial_load_enqueues_later_pages_on_real_surface() {
+    let ctx = egui::Context::default();
+    for kind in ["image", "zip", "pdf"] {
+        for state in [ThumbnailState::Pending, ThumbnailState::Evicted] {
+            let mut app = main_grid_to_overview_app(kind, &ctx);
+            app.thumbnails[12..].fill(state.clone());
+            for _ in 0..40 {
+                draw_overview_frame(&mut app, &ctx);
+                app.update_thumbnail_frame_bookkeeping(&ctx, std::time::Instant::now());
+                if (12..40).all(|idx| app.requested.contains_key(&idx)) {
+                    break;
+                }
+            }
+            assert!(
+                (12..40).all(|idx| app.requested.contains_key(&idx)),
+                "{kind}: pages 13-40 must be requested"
+            );
+            assert!((0..12).all(|idx| !app.requested.contains_key(&idx)));
+            let queue = app.reload_queue.as_ref().unwrap().0.lock().unwrap();
+            assert_eq!(queue.len(), 28, "{kind}: one reservation per later page");
+            assert!(
+                queue
+                    .iter()
+                    .all(|request| request.priority && app.keep_set.contains(&request.idx))
+            );
+        }
+    }
+}
+
+fn install_overview_demand(app: &mut App) {
+    use crate::page_overview::{
+        PageOverviewDirection, PageOverviewProjection, PageOverviewStamp, PageOverviewState,
+    };
+    app.page_identity_index = Arc::new(file_type_resume::PreparedPageIdentityIndex::prepare(
+        &app.items,
+        None,
+        app.settings.file_type_visibility.clone(),
+    ));
+    let projection = Arc::new(
+        PageOverviewProjection::new(
+            Arc::clone(app.page_identity_index.overview_metadata()),
+            Arc::new((0..app.items.len()).collect()),
+        )
+        .unwrap(),
+    );
+    app.fullscreen_idx = Some(0);
+    app.page_overview = PageOverviewState::open(
+        projection,
+        PageOverviewStamp {
+            context_serial: app.projected_viewer_context_id().serial(),
+            items_generation: app.items_generation,
+            reader_order_revision: 1,
+            incarnation: 1,
+        },
+        0,
+        4,
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800., 600.)),
+        PageOverviewDirection::LeftToRight,
+    )
+    .unwrap();
+}
+
+fn prepare_pdf_overview(app: &mut App, path: &std::path::Path, count: usize) {
+    // Only admission is exercised: no worker, PDFium, or physical PDF is needed.
+    app.items = (0..count)
+        .map(|page_num| GridItem::PdfPage {
+            pdf_path: path.to_path_buf(),
+            page_num: page_num as u32,
+            content_type: None,
+        })
+        .collect();
+    app.image_metas = vec![Some((10, 20)); count];
+    app.thumbnails = vec![ThumbnailState::Pending; count];
+    app.visible_indices = (0..count).collect();
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+    app.reload_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+    app.heavy_io_queue = Some(Arc::new((Mutex::new(Vec::new()), Condvar::new())));
+    install_overview_demand(app);
+}
+
+fn overview_source_pixels(request: &LoadRequest) -> crate::thumb_loader::ThumbMsg {
+    crate::thumb_loader::ThumbMsg::from_legacy_parts(
+        request.idx,
+        Some(egui::ColorImage::filled([2, 2], egui::Color32::WHITE)),
+        crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            evaluated_display_px: 320,
+        },
+        false,
+        None,
+        Some((2, 2)),
+        None,
+        false,
+        false,
+        request.input_seq,
+        request.items_gen,
+    )
+    .with_request_id(request.request_id)
+    .source_pixels()
+}
+
+fn overview_terminal(
+    request: &LoadRequest,
+    payload: crate::thumb_loader::ThumbMsgPayload,
+) -> crate::thumb_loader::ThumbMsg {
+    crate::thumb_loader::ThumbMsg {
+        idx: request.idx,
+        input_seq: request.input_seq,
+        items_gen: request.items_gen,
+        request_id: request.request_id,
+        payload,
+    }
+}
+
+fn assert_overview_pdf_promotion(app: &App, path: &std::path::Path, page_num: u32) {
+    let PdfVisiblePromotionState::Tracking {
+        ticket,
+        keys,
+        retry_needed,
+    } = &app.pdf_visible_promotion
+    else {
+        panic!("overview admission must use the existing viewer promotion tracker");
+    };
+    assert!(ticket.same_request(&app.pdf_render_epoch.snapshot()));
+    assert_eq!(
+        keys,
+        &HashSet::from([crate::grid_item::pdf_page_perf_key(path, page_num)])
+    );
+    assert!(
+        *retry_needed,
+        "thumbnail jobs have not reached the PDF pool yet"
+    );
+}
+
+#[test]
+fn overview_pdf_close_reopen_prunes_local_queue_and_preserves_source_save_lifetime() {
+    use crate::pdf_loader::PdfRenderValidity;
+    use crate::thumb_loader::ThumbMsgPayload;
+    let ctx = egui::Context::default();
+    let mut app = setup_thumbnail_app(2);
+    prepare_pdf_overview(&mut app, std::path::Path::new("C:/overview/shared.pdf"), 2);
+    let ticket = app.pdf_render_epoch.snapshot();
+    let cancel = Arc::clone(&app.cancel_token);
+    app.ensure_page_overview_requests(&ctx, &[0, 1]);
+    let (popped, queued) = {
+        let mut queue = app.reload_queue.as_ref().unwrap().0.lock().unwrap();
+        assert_eq!(queue.len(), 2);
+        let queued = queue[1].clone();
+        (queue.remove(0), queued)
+    };
+    for request in [&popped, &queued] {
+        assert!(request.priority);
+        assert_eq!(Some(request.request_id), app.requested.id(request.idx));
+        assert!(
+            request
+                .pdf_render_validity
+                .same_request(&PdfRenderValidity::Viewer(ticket.clone()))
+        );
+    }
+    app.close_page_overview_with_ctx(&ctx);
+    assert!(
+        app.reload_queue
+            .as_ref()
+            .unwrap()
+            .0
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!app.requested.contains_key(&1));
+    assert_eq!(app.requested.id(0), Some(popped.request_id));
+    assert!(
+        !ticket.is_stale(),
+        "overview close must not invalidate the viewer epoch"
+    );
+    assert!(Arc::ptr_eq(&cancel, &app.cancel_token));
+    assert!(!cancel.load(Ordering::Relaxed));
+
+    install_overview_demand(&mut app);
+    app.ensure_page_overview_requests(&ctx, &[0, 1]);
+    let replacement = app.requested.id(1).unwrap();
+    assert_ne!(replacement, queued.request_id);
+    assert_eq!(
+        app.reload_queue.as_ref().unwrap().0.lock().unwrap().len(),
+        1
+    );
+    send_thumbnail_for_test!(app, overview_terminal(&queued, ThumbMsgPayload::Canceled)).unwrap();
+    send_thumbnail_for_test!(app, overview_source_pixels(&popped)).unwrap();
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::PassthroughRendition);
+    assert_eq!(app.requested.id(1), Some(replacement));
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+    assert_eq!(app.requested.id(0), Some(popped.request_id));
+
+    // Uploaded pixels are disposable, but the source-save terminal is still outstanding.
+    app.close_page_overview_with_ctx(&ctx);
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+    assert_eq!(app.requested.id(0), Some(popped.request_id));
+    install_overview_demand(&mut app);
+    app.ensure_page_overview_requests(&ctx, &[0]);
+    assert!(
+        app.reload_queue
+            .as_ref()
+            .unwrap()
+            .0
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    send_thumbnail_for_test!(app, overview_terminal(&popped, ThumbMsgPayload::Finalized)).unwrap();
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::PassthroughRendition);
+    assert!(!app.requested.contains_key(&0));
+    app.ensure_page_overview_requests(&ctx, &[0]);
+    assert_ne!(app.requested.id(0), Some(popped.request_id));
+    let queue = app.reload_queue.as_ref().unwrap().0.lock().unwrap();
+    assert_eq!(
+        queue.len(),
+        1,
+        "only the completed, evicted page may be requested again"
+    );
+    assert!(
+        queue[0]
+            .pdf_render_validity
+            .same_request(&PdfRenderValidity::Viewer(ticket))
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn overview_same_pdf_contexts_keep_separate_tickets_and_completion_channels() {
+    use crate::pdf_loader::{JobPriority, PdfRenderValidity, TestPdfQueue};
+    use crate::thumb_loader::ThumbMsgPayload;
+    let ctx = egui::Context::default();
+    let path = std::path::Path::new("C:/overview/sibling.pdf");
+    let mut app = setup_thumbnail_app(1);
+    prepare_pdf_overview(&mut app, path, 1);
+    app.ensure_page_overview_requests(&ctx, &[0]);
+    assert_overview_pdf_promotion(&app, path, 0);
+    let main_request = app
+        .reload_queue
+        .as_ref()
+        .unwrap()
+        .0
+        .lock()
+        .unwrap()
+        .pop()
+        .unwrap();
+    let main_shared = Arc::clone(&app.still_seek_thumbnail_pages_shared);
+    let main_cancel = Arc::clone(&app.cancel_token);
+    let detached = app.build_window_context_for_test(1340, |mounted| {
+        prepare_pdf_overview(mounted, path, 1);
+        mounted.ensure_page_overview_requests(&ctx, &[0]);
+        assert_overview_pdf_promotion(mounted, path, 0);
+    });
+    let detached_request = app
+        .with_viewer_context(detached, |mounted| {
+            assert!(!Arc::ptr_eq(
+                &main_shared,
+                &mounted.still_seek_thumbnail_pages_shared
+            ));
+            let request = mounted
+                .reload_queue
+                .as_ref()
+                .unwrap()
+                .0
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert!(
+                request
+                    .pdf_render_validity
+                    .same_request(&PdfRenderValidity::Viewer(
+                        mounted.pdf_render_epoch.snapshot()
+                    ))
+            );
+            request
+        })
+        .unwrap();
+    assert_eq!(main_request.path, detached_request.path);
+    assert_eq!(main_request.pdf_page, detached_request.pdf_page);
+    assert_ne!(main_request.request_id, detached_request.request_id);
+    assert!(
+        !main_request
+            .pdf_render_validity
+            .same_request(&detached_request.pdf_render_validity)
+    );
+    let key = crate::grid_item::pdf_page_perf_key(path, 0);
+    let mut pool = TestPdfQueue::new();
+    let main_reply = pool.enqueue(
+        &key,
+        main_request.pdf_render_validity.clone(),
+        JobPriority::HighNormal,
+    );
+    let detached_reply = pool.enqueue(
+        &key,
+        detached_request.pdf_render_validity.clone(),
+        JobPriority::HighNormal,
+    );
+
+    app.close_page_overview_with_ctx(&ctx);
+    install_overview_demand(&mut app);
+    app.ensure_page_overview_requests(&ctx, &[0]);
+    assert!(
+        app.reload_queue
+            .as_ref()
+            .unwrap()
+            .0
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(Arc::ptr_eq(&main_cancel, &app.cancel_token));
+    assert!(!main_request.pdf_render_validity.is_stale());
+    assert!(!detached_request.pdf_render_validity.is_stale());
+    pool.prune_stale();
+    assert!(pool.complete_next());
+    assert!(pool.complete_next());
+    main_reply.recv().unwrap();
+    detached_reply.recv().unwrap();
+
+    send_thumbnail_for_test!(app, overview_source_pixels(&main_request)).unwrap();
+    send_thumbnail_for_test!(
+        app,
+        overview_terminal(&main_request, ThumbMsgPayload::Finalized)
+    )
+    .unwrap();
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::PassthroughRendition);
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+    assert!(!app.requested.contains_key(&0));
+    app.with_viewer_context(detached, |mounted| {
+        assert_eq!(mounted.still_seek_thumbnail_pages, HashSet::from([0]));
+        assert_eq!(mounted.requested.id(0), Some(detached_request.request_id));
+        assert!(matches!(mounted.thumbnails[0], ThumbnailState::Pending));
+        send_thumbnail_for_test!(mounted, overview_source_pixels(&detached_request)).unwrap();
+        send_thumbnail_for_test!(
+            mounted,
+            overview_terminal(&detached_request, ThumbMsgPayload::Finalized)
+        )
+        .unwrap();
+        mounted.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::PassthroughRendition);
+        assert!(matches!(
+            mounted.thumbnails[0],
+            ThumbnailState::Loaded { .. }
+        ));
+        assert!(!mounted.requested.contains_key(&0));
+    })
+    .unwrap();
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+}
+
+#[test]
+fn overview_epub_admission_keeps_logical_identity_and_read_lease_across_close() {
+    use crate::pdf_loader::{LeasedEpubPath, PdfRenderValidity, acquire_epub_delete_coverage};
+    let ctx = egui::Context::default();
+    let mut app = setup_thumbnail_app(1);
+    // Unique disposable identity also prevents contention with unrelated EPUB gate tests.
+    let temporary = tempfile::tempdir().unwrap();
+    let logical = temporary.path().join("overview.epub");
+    let _pin = crate::pdf_loader::pin_epub_for_test(&logical, 1340, 800);
+    prepare_pdf_overview(&mut app, &logical, 1);
+    app.display_epub_source = Some(LeasedEpubPath::try_new(logical.clone()).unwrap());
+    let ticket = app.pdf_render_epoch.snapshot();
+    app.ensure_page_overview_requests(&ctx, &[0]);
+    assert_overview_pdf_promotion(&app, &logical, 0);
+    let request = app
+        .reload_queue
+        .as_ref()
+        .unwrap()
+        .0
+        .lock()
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(request.path, logical);
+    assert_eq!(request.pdf_page, Some(0));
+    assert_eq!(
+        request.pdf_stamp_policy,
+        crate::thumb_loader::PdfStampPolicy::ResolveInWorker
+    );
+    assert!(
+        request
+            .pdf_render_validity
+            .same_request(&PdfRenderValidity::Viewer(ticket.clone()))
+    );
+    assert_eq!(Some(request.request_id), app.requested.id(0));
+    // Use the same generation-stamping helper as the worker, retaining outer UI correlation.
+    let read = crate::pdf_loader::pinned_epub_target(&logical).unwrap();
+    let derived = crate::thumb_loader::stamp_resolved_pdf_request(&request, &read).unwrap();
+    assert_eq!(derived.path, logical);
+    assert_eq!(derived.pdf_page, request.pdf_page);
+    assert_eq!(derived.request_id, request.request_id);
+    assert_eq!(derived.items_gen, request.items_gen);
+    assert_eq!(derived.input_seq, request.input_seq);
+    assert!(
+        derived
+            .pdf_render_validity
+            .same_request(&request.pdf_render_validity)
+    );
+    assert_eq!(
+        Some((derived.mtime, derived.file_size)),
+        read.stamp.generation_catalog_pair()
+    );
+    assert!(acquire_epub_delete_coverage(&logical).is_err());
+    app.close_page_overview_with_ctx(&ctx);
+    assert!(app.display_epub_source.as_ref().unwrap().has_epub_lease());
+    assert!(acquire_epub_delete_coverage(&logical).is_err());
+    assert!(!ticket.is_stale());
+    install_overview_demand(&mut app);
+    app.ensure_page_overview_requests(&ctx, &[0]);
+    assert_eq!(app.requested.id(0), Some(request.request_id));
+    assert!(
+        app.reload_queue
+            .as_ref()
+            .unwrap()
+            .0
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        request
+            .pdf_render_validity
+            .same_request(&PdfRenderValidity::Viewer(app.pdf_render_epoch.snapshot()))
+    );
+    // Viewer-list replacement invalidates the original request, without freshening its ticket.
+    app.bump_render_epoch_only();
+    assert!(request.pdf_render_validity.is_stale());
+    assert!(derived.pdf_render_validity.is_stale());
+    assert!(acquire_epub_delete_coverage(&logical).is_err());
+    app.display_epub_source.take();
+    assert!(
+        acquire_epub_delete_coverage(&logical).is_err(),
+        "resolved generation still owns its read lease"
+    );
+    drop(read);
+    assert!(acquire_epub_delete_coverage(&logical).is_ok());
+}
+
+#[test]
+fn overview_detached_range_change_prunes_local_queue_but_preserves_popped_terminal() {
+    let ctx = egui::Context::default();
+    let mut app = setup_thumbnail_app(20);
+    install_overview_demand(&mut app);
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.viewer_presentation = ViewerPresentation::DetachedWindow;
+    app.fs_holdover_tex = Some(navigation_sequence(app.items_generation, vec![2]));
+    app.ensure_page_overview_requests(&ctx, &[4, 6]);
+    let popped = app
+        .reload_queue
+        .as_ref()
+        .unwrap()
+        .0
+        .lock()
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(popped.idx, 6);
+    app.thumbnails[4] = loaded_thumbnail(&ctx, "overview-departing");
+    app.ensure_page_overview_requests(&ctx, &[10]);
+    assert_eq!(app.keep_set, HashSet::from([2, 10]));
+    assert!(matches!(app.thumbnails[4], ThumbnailState::Evicted));
+    assert!(!app.requested.contains_key(&4));
+    assert_eq!(app.requested.id(6), Some(popped.request_id));
+    assert!(
+        app.reload_queue
+            .as_ref()
+            .unwrap()
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|req| req.idx == 10)
+    );
+    app.close_page_overview_with_ctx(&ctx);
+    assert_eq!(app.keep_set, HashSet::from([2]));
+    assert!(
+        app.still_seek_thumbnail_pages_shared
+            .read()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(app.requested.id(6), Some(popped.request_id));
+}
+
+#[test]
+fn overview_root_exact_replacement_retains_canonical_grid_band() {
+    let ctx = egui::Context::default();
+    let mut app = setup_thumbnail_app(200);
+    install_overview_demand(&mut app);
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
+    let band = app.grid_thumbnail_retention_geometry(&ctx);
+    let grid = app.visible_indices[band.vis_keep_start_capped..band.vis_keep_end].to_vec();
+    assert!(!grid.contains(&198));
+    app.ensure_page_overview_requests(&ctx, &[198]);
+    app.ensure_page_overview_requests(&ctx, &[196]);
+    assert!(!app.keep_set.contains(&198));
+    assert!(grid.iter().all(|idx| app.keep_set.contains(idx)));
+    app.close_page_overview_with_ctx(&ctx);
+    assert_eq!(app.keep_set, grid.into_iter().collect());
+}
+
+#[test]
+#[cfg(windows)]
+fn overview_park_withdraws_demand_without_closing_metadata() {
+    let ctx = egui::Context::default();
+    let mut app = setup_thumbnail_app(20);
+    install_overview_demand(&mut app);
+    app.viewer_presentation = ViewerPresentation::DetachedWindow;
+    let view = app.page_overview_view().unwrap();
+    app.ensure_page_overview_requests(&ctx, &[4, 6]);
+    app.pause_mounted_background_work_keep_current_frame();
+    assert_eq!(app.page_overview_view().unwrap().stamp, view.stamp);
+    assert!(Arc::ptr_eq(
+        &app.page_overview_view().unwrap().projection,
+        &view.projection
+    ));
+    assert!(app.still_seek_thumbnail_pages.is_empty());
+    assert!(
+        app.still_seek_thumbnail_pages_shared
+            .read()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(app.keep_set.is_empty());
+    assert!(
+        app.reload_queue
+            .as_ref()
+            .unwrap()
+            .0
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+}
+
 fn cached_all_items_are_images(app: &mut App) -> bool {
     let items_generation = app.items_generation;
     let reading_flow = app.reading_flow;

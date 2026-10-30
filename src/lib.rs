@@ -54,6 +54,8 @@ pub use app::LocalAiActivityLease;
 pub use app::draw_audio_thumbnail_indicator_snapshot_fixture;
 pub use app::draw_collection_placeholder_snapshot_fixture;
 #[doc(hidden)]
+pub use app::draw_thumbnail_name_style_snapshot_fixture;
+#[doc(hidden)]
 pub use app::draw_video_thumbnail_indicator_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_book_resume_meter_settings_snapshot_fixture;
@@ -152,6 +154,7 @@ mod edit_bundle_app;
 mod edit_bundle_bulk;
 pub mod edit_preview_cache;
 mod edit_source;
+mod edited_clipboard_copy;
 pub mod editing_addon;
 pub mod editing_addon_download;
 #[cfg(windows)]
@@ -254,6 +257,7 @@ mod native_name_dialog;
 pub mod open_with;
 pub mod os_theme;
 mod page_dims;
+pub mod page_overview;
 pub mod page_split;
 pub mod panorama;
 pub mod panorama_wgpu;
@@ -376,8 +380,11 @@ pub use ui_dialogs::preferences::draw_favorite_view_state_settings_snapshot_fixt
 pub use ui_dialogs::preferences::draw_video_bar_visibility_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_video_thumbnail_indicator_settings_snapshot_fixture;
+mod edit_preview;
 mod ui_erase;
 mod ui_folder_pane;
+#[doc(hidden)]
+pub use ui_folder_pane::draw_folder_pane_location_snapshot_fixture;
 pub mod ui_font_catalog;
 pub mod ui_fonts;
 mod ui_fullscreen;
@@ -396,6 +403,7 @@ pub use ui_fullscreen::{
 mod ui_details_icon;
 pub mod ui_helpers;
 mod ui_main;
+pub mod ui_page_overview;
 pub mod ui_pinned_search;
 pub mod ui_toolbar_layout;
 #[doc(hidden)]

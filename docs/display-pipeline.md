@@ -139,6 +139,31 @@ edit texture 確保前に再利用する。通常同期 miss、無補正 handle 
 現在は上記 D3-2 と下記 D3-4 の条件を満たす場合だけ先回り準備へ接続する。
 slideshow の still-only unit 計算は表示 cache を置換しない。詳細・検証は page-turn 計画 §27.17.12。
 
+### 次unitの編集素材の一括準備（§28 段階B、2026-10-28〜29、実装済み・検証結果は別記）
+
+段階BはON／pagedの現unit提示後、Nextだけで局所補正→隠蔽→final→注釈を先回りして作る。
+完成erase画素を入力にする場合はMI-GANや黒背景合成を再適用しない。after-AIは`used_upscale`に従い、
+注釈はclamp前のfinal正本へ合成する。finalと注釈のupload画素はそれぞれ通常と同じTriangle clampで作る。
+必要なfontが不足する場合もdoc解決は正常終端し、作れるlocal／conceal／finalは採用できる。
+注釈fontはApp共有の単一ownerが持ち、Nextの注釈頁から既定fontとhot docの不足keyをworkerへ要求する（§1.602）。
+workerは列挙・読取・parseを行い、rootの毎frame pollで採用する。ピッカー用の列挙には公開しない。
+採用後の再評価で注釈だけを準備できる。表示ensureは完了済みの結果を先に採用し、不足なら旧受信口を捨てて従来の同期読み込みを行う。
+失敗keyのattemptedは明示無効化まで累積し、既定fontなしも終端とする。F12／parkでownerや要求を移譲・破棄しない。
+入力・key・世代・params・doc／fontのpreflight後、必要なtextureが揃ってから段・edit・final・対応comicを一括公開する。
+final正本とcomicの下地は同じArcを持ち、段採用だけで上段を失効させない。
+
+local／concealの段cacheはCPU-only entryを持てる。実体化済みはexact画素＋寸法正規化、描画可能はそれにtextureがある状態である。
+resident lookupは副作用なし。表示ensureだけが既存画素を1 frame 1枚uploadし、texture不足を再レンダーやkey変更の理由にしない。
+新規の投機textureはROOT共通枠で1枚ずつ登録し、途中の非公開textureも全contextのVRAM会計へ入れる。
+登録残は次のROOT frameへ進め、OverBudgetでは結果を保持して再描画ループを起こさない。
+
+表示要求は先に非blocking受信する。BのComputingは取消して通常経路へ戻し、CpuReady／Registeringは表示へ引き取って作成済みhandleを再利用する。
+既存legacyカラー化／LUTの表示昇格契約は維持し、BをDisplayPreparedへ昇格させない。
+Ctrl+Eを含む編集入口はBを取り消して既存ownerへ渡す。Bの不足を理由にめくりの受付を待たせたり演出を省いたりしない。
+演出は受理済みのresident素材に固定し、品質公開でheld resource／canonical receiptを差し替えない。
+設計と実装記録は[紙めくり計画§28.5](page-turn-animation-plan.md)、検証結果・未計測の表示引取りGPUコストは
+`target/pageturn-1461/implementation-report-b.md`を参照する。
+
 ### 音声セルの代表画像 (§1.347、2026-10-08)
 
 同名補助画像の採用は表示行の種類投影から独立している。画像種類を隠しても既存の候補順で
@@ -447,6 +472,31 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
 重なる場合は左下の低優先要素を表示しない。右下の絞り込み件数は左上・左下と重ならない位置まで上げ、余地がなければ省略する。色・角丸・フォントなど各要素の見た目は
 `ui_helpers.rs` の個別描画関数が持つ。
 スタック枚数と絞り込み件数も狭幅では文字を短縮し、`draw_cell` の内容はセル内に clip する。
+
+名前表示は `ThumbnailNameStyle` を純粋レイアウト入力として受ける。環境設定の
+`thumb_name_font_scale_percent` は100/125/150/175/200%（既定100%、読込時100〜200へclamp）、
+`thumb_name_max_lines` は1〜4行（既定1、読込時clamp）。倍率は既存のファイル名11ptと
+フォルダ名のセル高依存サイズ、およびそれぞれの全paddingへ掛ける。全体のUI倍率とは掛け算で効き、
+形式・評価・タグ・長さ・件数等のスタイルとセル寸法・列数・行高は変えない。
+1行では既存 `fit_text` とファイル名の18文字ソフト上限を維持する。2行以上では18文字上限を外し、
+既存の `max_text_width` 内に入る最長接頭辞を行ごとの二分探索で求め、文字単位で折り返す。
+元の名前のLFも1行として消費し、各区間を幅で折り返す。途中の連続LFは空行として各1行を数え、
+末尾のLFはすべて無視する。LFだけの名前は複数行経路では表示しない。最終表示行に残りがあれば、
+後続LF以降をその行へ混ぜず、同じ幅内へ `…` を付けて省略する。各行は改行で結合した単一の
+`BadgePlacement.text` とし、計測・描画・ink範囲・当たり判定は同じgalley/配置を使う。
+下端は従来の `bottom_y` に固定して上へ伸ばす。チェック・枚数・左上レーンと交差するか、
+2行以上の試行でセル外へ出るときは最大行数を1つずつ減らして再配置する。1行の試行の配置は、
+従来の `blocked_by_top` だけで判定する（メーターON時の既存セル内判定は維持）。
+名前設定が1行の場合は元のLFも含めて従来の `fit_text` を使う。複数行設定から1行へ減らした場合は
+改行を数える整形を維持し、最初の区間だけを省略して1行に収める。メーターOFFの極小セルで
+従来許されていたセル外の1行配置も維持する。
+従来の判定でも1行が入らなければ出さない。
+実機確認 (ClaudeCode、2026-10-29、隔離データの dev-runtime): 既定は従来の1行、150%・3行 / 200%・2行で折り返しと非交差を確認。最終行の「…」省略は未確認。
+評価と右下の長さ・件数は高くなった名前の実測矩形を避けて上がり、余地がなければ出さない。
+設定は既存の環境設定の確定経路で反映し、表示専用の再構築状態・worker・I/Oは追加しない。
+非同期の組み合わせを増やす必要がないため、専用のモーダルや再構築経路も設けない。
+まれな設定DB書込失敗は既定の割り切り方針に従い、追加の回復処理を設けない。
+
 共有設定 `thumb_show_resume_meter` がONなら、`ThumbnailOverlayLayout` は本・動画・音声・画像・その他の
 全セルに固定下端帯を予約する。位置記録なし・長さ未取得でも同じ予約を行い、設定boolを
 `fraction.is_some()` へ置き換えない。帯は `inner = cell.shrink(4)` の全幅、高さ9 logical pt、
@@ -620,6 +670,80 @@ idle frame で本全体を再走査しない。本体側の見開き解決規則
 RotationDb read-only open / SELECT 回数が増えないこと、未確定セルの停止と worker 完了後の
 向き、失効中の release 入力、終了・context 交換、実テクスチャの UV と矩形を検査する。
 `still_seek_real_overlay_rotation_*` の PNG 6 枚で本体・列・吹き出しを同時に比較する。
+
+### 1.6.1 閲覧中のページ一覧 (§1.340、2026-10-27 独立レビューP2追補・指定自動検証済み)
+
+通常 fullscreen／メイン内閲覧／F12連動窓／独立窓は既存surface内で
+`ui_page_overview::draw_page_overview` を使う。現在の可視実ページ列を仮想行として描き、
+未生成／回転未確定／失敗セルも番号とidentityを持つ選択可能なplaceholderにする。
+列数・scroll・cursorはviewer内のセッション値で、入場／取消は読書位置とmain Gridを変更しない。
+新規入場とSelectは既存`page_overview_available()`へ集約したnavigation-sequence／page-turnの
+両admissionを共用し、animationのON／OFFにかかわらず未提示の受理済み移動があれば拒否する。
+通常出力の採用と受理済みcontinuationを保持する。O／HUD／ring／padは共通受付を使い、
+完了後にもう一度操作する。入場要求の保留・replay・新しい取消処理は作らない。
+Oの既存operation観測が通常flat完了を始める場合も、入場受付自体はpage-turn ownerを変更しない
+（2026-10-27の新coordinator手順2、一覧設計書§25.4）。旧選択肢2の即退役は採用しない。
+独立レビューP2-1の通常表示待ちへの拡張とP2-2の前面キー／共通chrome終了の指定自動検証は同§25.7で成功。
+新しいpredicate・pending・replay・取消は作らず、HUDのenabledはavailability、理由は既存optional reasonを使う。
+受理した共通入場だけが`dismiss_fs_transient_menu_state()`でspread／fit／panoramaのApp boolと
+overflowを終了し、通常`close_fullscreen`も同helperを使う。keyboard次キー／HUD Close／HUD Overviewの
+overflow-only終了は`dismiss_fs_overflow_panel()`へ揃える。rotation／seek等のegui Popupは
+表示／keepされなくなった所有viewportの`Memory::end_pass`で自然に退役するため、明示popup closeや
+兄弟viewportも消す`Popup::close_all`は加えない。keyboard seekの既存優先、context／modal／edit／pickerの
+入場拒否、physical stream、info lock、拒否されたring入場の旧chromeは維持する。
+front pointer captureは`fs_front_menu_presented`とoverflow rectだけを読む。通常adjustment／metadata／
+infoはその集合外で、非focused adjustmentは入場可能な場合もある。focused TextEdit／IMEは既存ownerで止める。
+tag pickerは既存common modal、overlay編集は既存availabilityの拒否を使う。hover tooltipは
+PopupKind::Tooltip／Sense::hoverと既定inactiveのArea／描画寿命であり、durable panelとともに一括resetしない。
+Selectはstamp／binding／items・projection revision／incarnation／stable identity／active資格の
+既存照合を全通過したら一覧をClosedにし、`land_still_page_navigation_target`の`LatestSeek`を
+ちょうど一度呼ぶ。即時着地・Checking後許可・後着拒否・同期拒否は通常navigation ownerが扱い、
+一覧の再open／待機／追加pending／受付証明を作らない。通常／連動のGrid追従、独立窓の
+main非干渉も通常ページ移動と同じ時点・規則で扱う（2026-10-27 coordinator判断、一覧設計書§25.1追補）。
+`LatestSeek`は既存seek／jumpと同じく、隣ページでも新curlを開始しない。
+`offer_page_turn_with_operation`の対象は`Sequential`だけ。選択先の通常flatが実表示受理された後、
+D3の次unit先読みは`prefetch_next_final_unit`の既存ON／paged／non-split／入力素材資格へ合流する。
+一覧専用policyや、同期停止・Checking後の結果から一覧を復元する経路は追加しない。
+
+一覧を描くCentralPanelのearly returnより前に、既存共通入力・案内へ到達する経路を持つ。
+`ui_fullscreen/viewer_chrome.rs`は通常viewerとactive一覧が共用するprimary suppression終端、
+右ドラッグ／gesture認識、中ボタン短押し、F11 borderless step、overlay／dialogの境界である。
+physical primaryはviewerのCentralPanel入口でkey handler前に一度advanceし、終端frameの
+抑止decisionを通常pointer／一覧へ渡す。Esc／Oで一覧が閉じてもPointerStreamのreleaseを
+取り逃さず、そのframeの背面clickを抑止したまま次の通常clickへ戻す（一覧設計書§24）。
+2026-10-27のmaster合流では、CentralPanelで一度captureした同frameのfront pointer入力値を
+primary終端／一覧／通常canvasへ渡し、一覧のright recognizerはmasterのrecognize／apply分離APIを使う。
+old-owned releaseの実renderer3surface回帰は追加したが未実行（一覧設計書§25.3）。
+通常callerのguard・タイミング・描画順を維持し、一覧は保存済み割当を一覧設計書§4.1の実行可能集合へ配送する。
+mouse ring／gesture／X長押しring、feedback、既存job進捗・picker／modalは既存guardで描く。
+passive guideは描画元のimmutable `overview.executable_actions`を使い、activeな別窓の集合を流用しない。
+F11のPrimeBlackFrame→ApplyWindowMode→Settleも同じconsumerを使い、prime black frame中は
+一覧body／guideを描かない。通常の画像ページ送り、wheel pan／zoom、中ドラッグzoom、
+短右click／long-press画像menu、編集canvas／navigator／stripは一覧へ開放しない。
+接続漏れの根因・限定レビュー・実renderer検証は
+[一覧設計書§23](detached-book-page-overview-plan.md#23-一覧で省略された共通入力案内の接続tile112026-10-13)を参照する。
+
+画像は既存 `ThumbnailState::Loaded` と在メモリの `thumb_adjust_tex` を投影する。
+調整drag中は元のLoaded texture、それ以外は評価済みtextureを優先し、保存回転の確定値から
+寸法とUVを解く。描画でDB読取、補正texture生成、GPU upload、元画像decodeを始めない。
+回転は§1.6の既存workerを使い、未確定値を0°と推測しない。
+一覧のactive需要dispatcherはconsumer適格性を確認した後、同contextの既存回転workerの
+完了を`poll_still_seek_rotations`で回収してから要求・投影する。通常stripを描画しない一覧中も
+完了consumerを省略しない。Loaded済み／回転未確定は新規decodeではなく完了採用で解消する。
+通常ログ`[page-overview-demand]`はSurface経路、Admissionの型付き終了理由、
+requested／keep／表示可否と局所Pruneを記録し、同じAdmission観測の反復を抑える。
+passive投影は全実ページのimmutable metadataと可視近傍のtexture handleだけを保持し、
+resize／DPI変更後の新セルもmetadataからtargetを解決する。full-image textureを入場条件にしない。
+
+前面需要は同一viewerのstrip／hoverと一覧のいずれか一つをdispatcherで選び、
+可視セルを先に、上下overscanを後に要求する。非表示stripが一覧のexact setを解除しない。
+一覧新規要求は通常画像／ZIP画像／PDFページ（変換済みEPUBを含む）を共通dispatcherへ渡す。
+PDFは§1.377の既存viewer ticket付き要求・owner-scoped昇格へ接続済み。
+2026-10-27のmaster統合では構成採用後の可視実items順とhiddenを反映する。
+白紙補助annotationは`None`のまま未接続で、fixtureの補助表示を製品接続済みとは扱わない。
+2026-10-12〜13のfull補完・独立ACCEPTと§25.6の統合commit `1c134703b`までの指定自動検証は履歴。
+独立レビューP2追補後の検証は§25.7で別に扱い、再レビュー・残工程はcoordinatorへ引き継ぐ。
+[所有・入力・統合の正本§25](detached-book-page-overview-plan.md#25-2026-10-27-master統合記録)を参照する。
 
 ### 1.7 サムネイル画質ダイアログのプレビュー寸法
 
@@ -1579,6 +1703,10 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 5. フォールバック: サムネイル (低解像度)
 ```
 
+元画像ホールドのキー・フォーカス・モーダル・ナビゲーション抑止は共通のフレーム観測で解決する。
+通常経路の元画像表示と final pipeline bypass は比較 Off のときだけ有効にする。
+比較中は通常経路を迂回せず、準備済み pair の両側の元画像版を選択する（下の比較規則を参照）。
+
 AI 待ちの `complete=false` final composite も表示専用の候補である。final AI が到着しても
 同一 `FinalCompositeKey` の entry は消さず、AI 後の final-effect worker が完成するまで
 カラー化済みの暫定 texture を表示し続ける。完成結果の `insert` が同じ key を上書きするため、
@@ -1798,7 +1926,7 @@ D2の演出由来payloadだけはsourceを所有しない。全景coverageを既
 するため、callbackごとに異なるuniformとbind groupは`CompareShaderSlot::{Main, Navigator}`ごとに
 保持し、後のprepareが先の描画状態を上書きしない。
 本文の primary 描画は `CompareFramePrimaryDraw` が排他的に所有する。現在ページに一致する
-`ComparePreparationState::Ready` があるフレームは準備済み比較だけを描き、`Unprepared` /
+`ComparePreparationState::Ready` または `PreparingOriginal` の pair があるフレームは準備済み比較だけを描き、`Unprepared` /
 `WaitingForSource` / `Preparing` / `Draining` と別ページの `Ready` は通常ページだけを描く。準備中に raw pinned
 texture や Wipe の切れ端を通常ページへ重ねず、準備済み比較を描いた後も nav / source-reload holdover を
 重ねない。
@@ -1821,6 +1949,49 @@ layout結果ではなく表示モードで拒否する。ページ移動や表�
 待たずに完了を回収する。PinnedNormalはcurrentの完成寸法だけをworker開始前に使い、不要なcurrent RGBAを
 生成しない。描画方式ごとのtyped CPU payloadにより、WindowsのWipe / Diffは
 pinned/current RGBA 2枚だけを保持し、Diff用CPU画像 / managed textureはCPU fallbackのDiff時だけ作る。
+
+比較中の元画像ホールド（`FsOriginalPreviewHold`）は Wipe / Diff / PinnedNormal で共通とする。
+pin 時に `PinnedOriginalSource::Raw` として元画素の Arc、加工版 source 寸法、crop、rotation を保存し、
+外部 pin は `SameAsProcessed`、元画素が無ければ `Unavailable` とする。current 側の幾何も加工版
+job の作成時に pair へ保存する。ホールド時は worker 内で元画素を加工版 source 寸法へ Lanczos3
+再標本化し、同じ crop / rotation と同じ比較配置処理を pair の `target_size` で行う。補正・AI・
+カラー化・消しゴム・補正レイヤー・隠蔽・注釈を含めず、両版の寸法と配置を一致させる。
+元画素は通常の元画像表示と同じ fs_cache のラスタ（縮小済み／RAW 現像済みを含む）を使い、
+加工版 pair が Ready にならないアニメーションは対象外とする。
+
+完成状態は pair 内の `CompareOriginalVariant::{Absent, Ready, Failed}` が持ち、実行中 worker は
+外側の `ComparePreparationState::PreparingOriginal { pair, pending }` だけが所有する。
+加工版と元画像版の worker を合わせて常に1本にし、pair を捨てる全経路は `invalidate()` を通して
+pending があれば `Draining` にする。結果は pair key・request・寸法・payload の一致を確認して採用する。
+PinnedNormal の非表示は pair と worker を保持し、比較 Off でも結果を回収する。
+通常の fullscreen close も既存どおり加工版 pair・比較モード・pin を保持し、元画像版にも同じ寿命を適用する。
+close に伴う元画素cacheの破棄や入力世代更新だけでは、この保持済み pair を失効させない。
+「加工版 pair と同じ入力世代に属する」とは、加工版 pair を失効させる操作で元画像版も一緒に失効することを指す。
+PreparingOriginal の完了は close 後も pair identity が合えば回収する。
+再openでは、ページに入るたびの既存の `invalidate_compare_prepared_for_idx` に従い、
+加工版 pair と元画像版が一緒に失効する。PreparingOriginal 中なら共通遷移で Draining に移り、
+旧結果を回収してから次の加工版 worker を開始する。同一 pair の再入場を識別する条件や再利用規則は追加しない。
+current の元画素補充は既存の `MaterialOnly` / `preserve_completed` 経路を使い、完成済み加工版を保持する。
+再open後も、新しい加工版 pair が Ready / 元画像版が Absent のときにホールドすれば、
+必要に応じて同じ補充経路を使ってから元画像 worker を開始する。
+Unavailable と worker 失敗はログと通知1回で Failed にし、同じ pair では再試行しない。
+
+元画像版の準備中は加工版を表示し続け、完成後にホールド中だけ元画像版を描く。離すと即座に加工版へ戻り、
+再ホールドは保存済みの元画像版を再利用する。本文・ナビゲータ・CPU fallback・「元画像表示中」は
+`compare_original_for_frame` の同じ選択を使う。ワイプの位置・ドラッグ状態・Ctrl による線の表示規則は共通。
+compare_wgpu は pair の owner key ごとに加工版／元画像版の最大2組を持ち、各組が Main / Navigator の
+uniform と bind group を持つ。元画像版の texture key は共通採番器から発行し、ホールドの切替で再 upload しない。
+CPU fallback の managed texture も版ごとに pair 内へ保持する。
+編集overlay・そのポインタ入力・インジケータには `original_preview_visual_active_for_frame` を使う。
+通常表示の元画像フラグと、実際に primary に描いた比較元画像版を合わせた値であり、
+比較元画像に編集マスクを再び重ねない。通常pipelineの bypass 判定にはこの値を渡さない。
+ルーペは従来どおり current ページを `fullscreen_page_layout` の transform と正規化座標で拡大し、
+比較キャンバスや pinned 側の合成を拡大しない。比較中の current の素材だけは同じ
+`compare_original_for_frame` の結果で選び、元画像版のフレームは読み取り専用の
+`resolve_original_preview_material`、加工版のフレームは従来の加工payloadを使う。
+比較中は通常の元画像bypassを呼ばず、元素材が退去済みなら既存のthumbnail fallbackに任せて
+ルーペからMaterialOnlyロードや再試行を始めない。current以外の採取対象ページと比較Offは従来どおり。
+実アプリでの確認 (§1.79、2026-10-28、観測者 ClaudeCode。隔離データ・dev-runtime ビルドを computer-use で操作): ワイプ比較と差分強調で、押している間に両側が元画像になり、ワイプ位置は変わらず、離すと加工版へ戻った。PinnedNormal・ルーペ・ナビゲータは実アプリでは未確認 (自動テストのみ)。
 本文の比較 callback は、ズーム / パン後の実画像矩形と viewport の交差だけを callback rect にし、
 切り落とした範囲を uniform の UV 窓で元の合成画像座標へ戻す。テクスチャ採取と Wipe 境界判定は
 復元後の座標を共有するため、白線の基準である実画像矩形と一致する。ナビゲータは実画像矩形が
@@ -2151,6 +2322,44 @@ fullscreen の close はその context の状態を Idle にし、retire は bun
 選ぶ。対象はページ移動になる左右キーだけで、横連結中の左右スクロール、Shift / Ctrl+左右、
 `FsPagePrev/Next`、PageUp / PageDown、画面端クリック、ホイールには適用しない。
 
+Ctrl+Space＋primary 左右ドラッグの連続ズームは中ボタンドラッグと同じ `MiddleZoomDrag` を所有する。
+入力種類・開始した面（閲覧／編集）・開始時の `FsZoomOwner`・pivot・zoom・pan・rect center を固定し、共通の
+`zoom_at` で中ボタンは `2^(-dy/100)`、scrubby は `2^(dx/100)` を計算する。
+4 px のしきい値と `zoom_preserve_pivot` を共用し、通常・分析・編集は `ZOOM_MIN..ZOOM_MAX`、
+Z は既存の0.05～16に制限する。360は入力のみ消費する。終了時だけ各 owner の倍率で PDF を再描画する。
+4 px 未満では直前値を維持して書き戻さない。面／現在の `fs_zoom_owner()` が開始時と異なれば書き込まず終了する。
+閲覧処理は編集で開始した scrubby に触れず、編集 helper も閲覧で開始した状態に触れない。
+scrubby は分析モードでは開始せず、ガイド入力と組み合わせない。従来の分析ホイール／中ボタンは維持する。
+編集5モードは既存の Space パン helper を共用し、通常閲覧では touch／gesture／click／pan より先に primary を所有する。
+編集側はパネル上の開始拒否より先に共通 helper を駆動する。切り取りの `pointer_allowed` も開始許可として渡し、
+crop 枠の入力受付はその後で判定する。パネルを横切った Space パン／scrubby の継続と解放は共通 owner が処理する。
+chord 解放後は倍率変更を終了し、primary 解放まで同じ typed state に保持して他の操作へ流さない。
+入力所有・対象 context の詳細は [キー仕様](keymap-spec.md#左右ドラッグによる連続ズーム)。
+
+キーの段階ズーム（`FsZoomIn` / `FsZoomOut`、既定 `.` / テンキー `+` と
+`,` / テンキー `-`）は画面中央を基準に ×1.25 / ÷1.25。
+`fs_zoom_owner()` に従い、通常画像（単ページ / 見開き / 縦横連結）は `fs_zoom` / `fs_pan`、
+分析は `analysis_zoom` / `analysis_pan`、360 は FOV、Z 照準 / 確定中は `fs_zoom_factor` を変更する。
+通常 / 分析はピンチの倍率・pivot 関数、360 はピンチの FOV 関数、Z はホイール刻みを共用し、
+通常 / 分析の変化時だけ各倍率で PDF 再描画を要求する。既存の clamp / pan 制約を維持する。
+Image / Analysis は pivot と中心に同じ点を渡して pan を倍率比で拡縮するため、キー段で
+表示矩形 / seek geometry を計算しない。ページ単位表示の中央固定計算はキー段で完結し、viewer 配送や pending は増やさない。
+連結読みでは主軸位置を `fs_vertical_scroll` が持つため、キー / Ctrl+ホイール / ピンチの
+いずれも現在の `fs_pan` の拡縮だけでは中央がずれ得る。この共通課題は今回変更しない。
+動画 / 音声 / 編集モード / ページ一覧は対象外。比較では通常の画像キーと同様に有効。
+長押しリピートは同一フレームで各操作1回にまとめる。入力所有と詳細は [キー仕様](keymap-spec.md#キーによる段階ズーム1470)。
+
+通常表示への変換受け渡し `fs_zoom_pan()` は `zoom_differs_from_fit(fs_zoom)`
+または有意な pan がある場合に `Some` を返す。拡大・縮小を上下対称に扱い、1.0 付近の
+丸め誤差（0.99999 等）かつ pan なしだけを無変換にする。これにより fit から中央基準で
+縮小したキー / ゲームパッド LT / 中央での Ctrl+ホイールも `DisplayedImageTransform` へ倍率が届く。
+単ページ・白い相方付き単独配置・見開き・比較・類似プレビュー・snapshot の geometry は同じ値を使う。
+ページめくりアニメーションの既存 `fs_zoom_pan().is_none()` 条件も縮小中は不成立になる
+（無変換ページだけをめくる方針を維持）。入力所有・detached の述語 / viewport 経路は変更しない。
+ダブルクリックのリセット可否も同じ `zoom_differs_from_fit(zoom)` を使い、縮小中もリセットできる。
+この helper は `abs(zoom - 1.0) > ZOOM_NEAR_ONE - 1.0` を一か所で定義する。
+ゲームパッド pan、ピクセルグリッド、単クリック所有は「拡大中か」を問う既存上側閾値を維持する。
+
 **ZipPla 風 全画面ズームモード (<kbd>Z</kbd>、v2.0.0)** は、上記の通常ズーム/パンとは別系統だが
 **解決後の `DisplayedImageTransform` と描画は共用**する (`draw_fs_zoom_mode`)。`KeyAction::FsZoomMode` (KeyHold、既定 Z、
 keymap カスタマイズ可) のホールドで動き、
@@ -2270,7 +2479,16 @@ rect のうち bbox 部分だけを UV 指定して描く。トリム量によ�
 漫画ビューア用途で読みながら使う表示専用トリム。左端 / 上端 / 右端ホバーで開く左パネルの
 `画像補正 / 表示トリム / ブックマーク` タブから操作し、選択中タブは `Settings::fullscreen_left_panel_tab`
 へ保存する。
-本側の基本モードは `ViewTrimApplyMode::{None, Auto, Book}` のラジオで選ぶ。
+本側の保存値は `ViewTrimBookPreference::{FollowGlobal, None, Auto, Manual}` の 4 ラジオで選び
+(§1.216、設計は [auto-trim-global-default-plan.md](auto-trim-global-default-plan.md))、
+App / `ViewerContextBundle` はこの preference だけを持つ。表示側は描画のたびに共通 resolver で
+`Settings::auto_view_trim_default_enabled` (環境設定「自動余白カットを標準で有効にする」、既定 OFF) と
+合わせて基本モード `ViewTrimApplyMode::{None, Auto, Book}` へ解決する。`FollowGlobal` は全体 ON で
+`Auto`、OFF で `None`、`Manual` は `Book`。行が無い本は `FollowGlobal` なので、全体 OFF のままなら
+従来どおりトリムなし。全体設定の変更は環境設定の OK で、mounted context が `FollowGlobal` なら
+トリム panel のモード変更と同じ再 anchor、parked context は `FollowGlobal` のものだけ layout 等を
+無効化する (pan・自由回転と余白検出 cache は保持)。passive な F12 窓は再 active 化で通常描画へ戻る
+まで旧トリムの snapshot のまま。
 `None` は bbox を使わず、`Auto` は表示中ページごとに `cached_margin_bbox` を使う。
 ただし見開きの `Auto` は左右をペアで調停し、上下だけ少ないカット幅に揃える。
 `Book` は手動設定の基底モードで、各 `idx` に enabled なページ個別行があれば `Page`、
@@ -2302,10 +2520,16 @@ bbox を採用せず、ページ全体を回転して表示する。表示トリ
 手動値へ流し込む自動検出で左右の結果がずれないようにする。見開き連動で左右を別々に調整しない場合は、
 手動値へ流し込む自動検出も上下 / 中央側 / 外側の共通値に左右の少ないカット幅を採用する。
 `Auto` は保存済みの手動値を作らず、ページごとに検出する。
-旧 `FullscreenFitMode::MarginFit` が保存されている場合は、表示トリムの適用モード `Auto` と
-ページ全体フィットへ移行して保存する。
-基本適用モードと本全体設定は `view_trim.db::view_trim_books` に本キー
+旧 `FullscreenFitMode::MarginFit` が保存されている場合は、行が無い本か旧形式の `none` 行の本だけ
+表示トリムの `Auto` とページ全体フィットへ移行して保存する (新形式の明示値は上書きしない)。
+本別 preference と本全体設定は `view_trim.db::view_trim_books` に本キー
 (`spread_container_key` と同じ粒度。ネスト ZIP は zip_path + 実効 prefix) で保存する。
+`state_json` は `{"version":2,"preference":..,"apply_mode":<旧版向けの写し>,"book_settings":..}`。
+`version` の無い旧形式は `apply_mode` を `auto→Auto / book→Manual / none・page→None` と読む
+(旧版は `none` + 既定値の行を削除していたため、行なしと明示のトリムなしは区別できず、行なしは
+`FollowGlobal` と読む)。root の `FollowGlobal` + 既定値は行を持たず、ネスト本の `FollowGlobal` は
+root fallback を遮る行として残す (末尾表紙の本別設定と同じ規則)。読めない行・DB エラーは
+通知してトリムなしで表示し、fallback も書き換えもしない。メタ情報転送の portable 形式も同じ codec を通す。
 ページ個別設定は `view_trim.db::view_trim_pages` に `page_path_key` で保存する。
 `Page` は本側の適用モードとしては保存しない。代わりに enabled なページ個別行そのものが
 そのページの永続 Page 選択を表す。`effective_view_trim_apply_mode_for_idx(idx)` が基本モードと
@@ -3460,6 +3684,35 @@ AI を含む段では各エントリの合成中に AI も実行する。焼き�
   - 回転変更 → **キャッシュはクリアしない** (GPU 行列で回すため)
 
 #### 無変換の静止画テクスチャ共有（2026-10-17）
+
+2026-10-28（紙めくり計画 §28、段階 A）: exact な隠蔽・局所補正・消しゴムの累積段も
+共有候補に含める。選択は通常表示とめくり受付が同じ resident-only helper を使い、
+受付の edit_result だけは exact key と texture を必要とする（通常表示の holdover 一致は維持）。
+共有には現在 key・画素 Arc・item identity・寸法・実 LINEAR options の一致が必要で、
+NEAREST 段は共有しない。共有元の accepted display_basis を継承し、各段の実 options の
+mip 有無を VRAM 会計へ渡す。Native 先回りも実際に共有可能な段の material を返す。
+
+閲覧用 crop の暗転・枠は、基準寸法付きの crop 値を持つ prepared page が描く。
+通常 flat・curl 表裏・canonical は同じ leaf 投影と可視 polygon を使う。実二頁では抑止し、
+見開き設定中の片頁は描く。crop overlay は編集ハンドルと入力だけを所有する。
+受付はメモリだけを読み、legacy 基準寸法の永続採用は従来の通常表示 owner に残す。
+保持表示は capture-time crop を保持し、別フォルダで同じ idx を使っても新頁の crop を参照しない。
+
+Z照準／拡大は画像・pixel grid・照準暗転／照準枠を先に描き、実際のZ transformを使って
+同じflat crop ownerを呼ぶ。mainでは従来のcrop合成段（canvas overlayの後、crop handlesの前）、
+単独Z描画ではそのcompositeの最後に呼ぶ。crop暗転と枠を照準の下へ移さず、二度描かない。
+通常flatも実際にbindしたprepared pageのcrop／transform／clipをフレーム内の描画値として返し、
+pixel gridとcanvas overlayの後、handlesの前で同じownerが描く。受付・snapshotにはcrop bindingを残す。
+curlはこの後描画値を生成せず、各faceに投影する。canonicalの最初のflatから同じ後描画段を使い、
+演出OFF／非eligible／取消のflatも同じ境界を通す。捕捉表示は従来どおり捕捉cropを面と一緒に描く。
+
+準備済み比較（固定画像・ワイプ・差分）も、合成画像の実 transform で同じ flat crop owner を
+一度だけ呼ぶ。WipeはCPU／shaderともcomposite→操作表示→canvas overlay→crop暗転／枠の旧順。
+比較準備中は通常ページのownerを使い、編集overlayは引き続きハンドルだけを描く。
+legacy crop のメモリ内基準解決は受付と通常表示で共有し、FullSource サムネイルの原寸情報、
+情報がない場合の resident raster も含む。受付後の品質更新では既存の受付内容が crop を保持する。
+矩形が収まらず基準を未確定のまま受け付けた場合もその値を保持し、paint の clamp は transform に
+委ねる。基準が解決できた場合の永続採用は通常表示でだけ行う。
 
 `ensure_edit_result_pixels` は新規組立て時と CPU-only entry の表示昇格時の両方で、
 upload の枚数制限より先に現在 context の `fs_cache` の静止画 source を調べる。

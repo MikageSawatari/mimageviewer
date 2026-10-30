@@ -364,11 +364,32 @@ pub(super) fn remote_post_filter_state(
 pub(super) fn normalize_remote_view_trim_state(
     value: &serde_json::Value,
 ) -> Result<crate::view_trim::ViewTrimBookState, &'static str> {
-    let mut state: crate::view_trim::ViewTrimBookState =
+    #[derive(serde::Deserialize)]
+    struct WireState {
+        preference: crate::view_trim::ViewTrimBookPreference,
+        book_settings: crate::view_trim::ViewTrimBookSettings,
+    }
+    // effective_apply_mode is a server-owned readout, never an input to resolution.
+    let state: WireState =
         serde_json::from_value(value.clone()).map_err(|_| "表示トリム設定が正しくありません")?;
-    state.apply_mode = crate::view_trim::view_trim_base_apply_mode(state.apply_mode);
-    state.book_settings = state.book_settings.clamped();
+    let state = crate::view_trim::ViewTrimBookState {
+        preference: state.preference,
+        book_settings: state.book_settings.clamped(),
+    };
     Ok(state)
+}
+
+pub(super) fn remote_view_trim_wire_state(
+    state: crate::view_trim::ViewTrimBookState,
+    global_auto_enabled: bool,
+    legacy_auto: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "preference": state.preference,
+        "effective_apply_mode": crate::view_trim::resolve_view_trim_apply_mode(
+            state.preference, global_auto_enabled, legacy_auto, None),
+        "book_settings": state.book_settings.clamped(),
+    })
 }
 
 pub(super) enum RemoteSortSettingsSource {
@@ -771,9 +792,10 @@ mod adjustment_value_tests {
     }
 
     #[test]
-    fn remote_view_trim_normalization_clamps_every_book_margin_and_drops_page_mode() {
+    fn remote_view_trim_normalization_clamps_every_book_margin_and_ignores_effective_mode() {
         let value = serde_json::json!({
-            "apply_mode": "page",
+            "preference": "manual",
+            "effective_apply_mode": "none",
             "book_settings": {
                 "enabled": true,
                 "spread_separate": true,
@@ -785,8 +807,8 @@ mod adjustment_value_tests {
         });
         let normalized = normalize_remote_view_trim_state(&value).unwrap();
         assert_eq!(
-            normalized.apply_mode,
-            crate::view_trim::ViewTrimApplyMode::None
+            normalized.preference,
+            crate::view_trim::ViewTrimBookPreference::Manual
         );
         for margin in [
             normalized.book_settings.single.left,
@@ -808,6 +830,45 @@ mod adjustment_value_tests {
         ] {
             assert!((0.0..=crate::view_trim::MAX_VIEW_TRIM_MARGIN).contains(&margin));
         }
+    }
+
+    #[test]
+    fn remote_view_trim_wire_roundtrips_four_preferences_without_accepting_effective_mode() {
+        use crate::view_trim::{ViewTrimBookPreference as Preference, ViewTrimBookState};
+        for preference in [
+            Preference::FollowGlobal,
+            Preference::None,
+            Preference::Auto,
+            Preference::Manual,
+        ] {
+            for global in [false, true] {
+                let state = ViewTrimBookState {
+                    preference,
+                    ..Default::default()
+                };
+                let mut wire = remote_view_trim_wire_state(state, global, false);
+                assert_eq!(
+                    wire["effective_apply_mode"],
+                    serde_json::to_value(preference.resolve(global)).unwrap()
+                );
+                assert!(wire.get("version").is_none());
+                assert!(wire.get("apply_mode").is_none());
+                wire["effective_apply_mode"] = serde_json::json!("page");
+                assert_eq!(normalize_remote_view_trim_state(&wire).unwrap(), state);
+            }
+        }
+        assert!(
+            normalize_remote_view_trim_state(&serde_json::json!({
+                "preference": "book", "book_settings": {}
+            }))
+            .is_err()
+        );
+        assert!(
+            normalize_remote_view_trim_state(&serde_json::json!({
+                "apply_mode": "auto", "book_settings": {}
+            }))
+            .is_err()
+        );
     }
 
     #[test]

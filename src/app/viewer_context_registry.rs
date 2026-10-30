@@ -905,6 +905,14 @@ impl App {
         }
         let mut color_keys = std::collections::HashSet::new();
         let mut adjustment_keys = std::collections::HashSet::new();
+        let diagnostic_frame = self.frame_counter;
+        let diagnostic_pass = if super::prepared_edit::rejection::observing() {
+            self.edit_preview_repaint_ctx
+                .as_ref()
+                .map(egui::Context::current_pass_index)
+        } else {
+            None
+        };
         macro_rules! publish {
             ($state:expr, $default:expr) => {{
                 let state = $state;
@@ -993,6 +1001,19 @@ impl App {
                         });
                     state.final_effect_pending.retain(|key, pending| {
                         if affected.contains(&key.edit_key.idx) {
+                            super::prepared_edit::rejection::record_pending_disposition(
+                                pending,
+                                *key,
+                                PreparedEditDisposition::Cancelled(
+                                    PreparedEditCancel::PipelineInvalidation(
+                                        FinalPipelineInvalidation::AcceptedAdjustment,
+                                    ),
+                                ),
+                                Some(diagnostic_frame),
+                                diagnostic_pass,
+                                std::panic::Location::caller(),
+                                None,
+                            );
                             pending.cancel.store(true, Ordering::Relaxed);
                             false
                         } else {
@@ -1520,6 +1541,7 @@ pub(in crate::app) struct ViewerContextBundle {
     navigation_scope: ViewerNavigationScope,
     archive_source_override: Option<PathBuf>,
     zip_nav: Option<crate::zip_tree::ZipNavState>,
+    pub(in crate::app) list_order: Option<Arc<super::ListOrderSnapshot>>,
     stack_mode_requested: bool,
     stack_view: Option<std::sync::Arc<crate::filename_stack::StackView>>,
     stack_showing_flat: bool,
@@ -1531,6 +1553,8 @@ pub(in crate::app) struct ViewerContextBundle {
     stack_selection_target: Option<crate::filename_stack_ui::StackSelectionTarget>,
     items: Vec<GridItem>,
     page_identity_index: Arc<super::file_type_resume::PreparedPageIdentityIndex>,
+    page_overview: crate::page_overview::PageOverviewState,
+    page_overview_incarnation: u64,
     projection_recipe: super::book_materialization::ProjectionRecipe,
     current_book_bookmarks: Vec<crate::book_bookmarks::BookBookmark>,
     current_book_bookmarks_key: Option<BookBookmarkProjectionKey>,
@@ -1695,7 +1719,7 @@ pub(in crate::app) struct ViewerContextBundle {
     analysis_filter_mag: u8,
     analysis_guide_drag: Option<(egui::Pos2, egui::Pos2, u8)>,
     view_trim_mode: bool,
-    view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode,
+    view_trim_book_preference: crate::view_trim::ViewTrimBookPreference,
     view_trim_page_apply_root_idx: Option<usize>,
     view_trim_page_spread_separate: bool,
     view_trim_book_settings: crate::view_trim::ViewTrimBookSettings,
@@ -1738,6 +1762,7 @@ pub(in crate::app) struct ViewerContextBundle {
     favsearch_subfolder_restore: Option<super::subfolder_expansion::SubfolderExpansionRestoreState>,
     items_are_global_search_view: bool,
     items_are_tag_view: bool,
+    tag_view_applied_times: std::collections::HashMap<String, i64>,
     items_are_reading_history_view: bool,
     items_are_bookmark_view: bool,
     items_are_rating_view: bool,
@@ -1843,7 +1868,7 @@ pub(in crate::app) struct ViewerContextBundle {
     adjustment_dragging: bool,
     thumb_adjust_drag_color_dirty: bool,
     adjustment_mode: crate::ui_helpers::MetadataPanelOpenState,
-    adjust_spread_target: AdjustSpreadTarget,
+    adjust_spread_target: Option<AdjustSpreadTarget>,
     adjust_scope_selection: AdjustScopeSelection,
     adjust_scope_selection_idx: Option<usize>,
     local_adjust_mode: bool,
@@ -2353,6 +2378,16 @@ impl ContextAsyncOwner {
 
 #[cfg(windows)]
 impl<'a> ContextRef<'a> {
+    /// Passive surfaces share the immutable projection and never create an overview owner.
+    pub(in crate::app) fn page_overview_view(
+        self,
+    ) -> Option<crate::page_overview::PageOverviewView> {
+        let state = match self.source {
+            ContextRefSource::Mounted(app) => &app.page_overview,
+            ContextRefSource::AtRest(bundle) => &bundle.page_overview,
+        };
+        state.session().map(|session| session.view().clone())
+    }
     pub(in crate::app) fn mounted(app: &'a App) -> Self {
         Self {
             source: ContextRefSource::Mounted(app),
@@ -2395,6 +2430,7 @@ impl<'a> ContextRef<'a> {
                 similar_panel: &bundle.similar_panel,
                 fs_cache: &bundle.fs_cache,
                 final_composite_cache: &bundle.final_composite_cache,
+                final_effect_pending: &bundle.final_effect_pending,
                 adjustment_cache: &bundle.adjustment_cache,
                 erase_result_cache: &bundle.erase_result_cache,
                 erase_preview_cache: &bundle.erase_preview_cache,
@@ -2673,6 +2709,7 @@ impl ViewerContextBundle {
     /// one-shot worker だが、owner の消滅後に CPU / GPU / AI 処理を続ける理由がないので、
     /// 各 worker が既に監視している cancel token を立てる。
     fn cancel_all_context_work(&mut self) {
+        self.page_overview.close();
         if let Some(pending) = self.external_rescan_pending.take() {
             pending.cancel_and_retire();
         }
@@ -2707,7 +2744,18 @@ impl ViewerContextBundle {
         if let Some(holdover) = self.fs_holdover_tex.as_mut() {
             holdover.finish_navigation_diagnostic("context_retired");
         }
-        for pending in self.final_effect_pending.values() {
+        for (key, pending) in &self.final_effect_pending {
+            if !pending.cancel.load(Ordering::Relaxed) {
+                super::prepared_edit::rejection::record_pending_disposition(
+                    pending,
+                    *key,
+                    PreparedEditDisposition::Cancelled(PreparedEditCancel::SessionRetired),
+                    None,
+                    None,
+                    std::panic::Location::caller(),
+                    None,
+                );
+            }
             pending.cancel.store(true, Ordering::Relaxed);
         }
 
@@ -2754,6 +2802,7 @@ const _: () = {
 impl ViewerContextBundle {
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
+            self.page_overview.close();
             self.requested.clear();
             crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
             self.raw_thumb_develop
@@ -2796,6 +2845,7 @@ impl ViewerContextBundle {
             navigation_scope: ViewerNavigationScope::Main,
             archive_source_override: None,
             zip_nav: None,
+            list_order: None,
             stack_mode_requested: false,
             stack_view: None,
             stack_showing_flat: false,
@@ -2807,6 +2857,8 @@ impl ViewerContextBundle {
             stack_selection_target: None,
             items: Vec::new(),
             page_identity_index: Default::default(),
+            page_overview: crate::page_overview::PageOverviewState::Closed,
+            page_overview_incarnation: 0,
             projection_recipe: Default::default(),
             current_book_bookmarks: Vec::new(),
             current_book_bookmarks_key: None,
@@ -2928,7 +2980,7 @@ impl ViewerContextBundle {
             analysis_filter_mag: 0,
             analysis_guide_drag: None,
             view_trim_mode: false,
-            view_trim_apply_mode: crate::view_trim::ViewTrimApplyMode::default(),
+            view_trim_book_preference: crate::view_trim::ViewTrimBookPreference::default(),
             view_trim_page_apply_root_idx: None,
             view_trim_page_spread_separate: false,
             view_trim_book_settings: crate::view_trim::ViewTrimBookSettings::default(),
@@ -2956,6 +3008,7 @@ impl ViewerContextBundle {
             favsearch_subfolder_restore: None,
             items_are_global_search_view: false,
             items_are_tag_view: false,
+            tag_view_applied_times: Default::default(),
             items_are_reading_history_view: false,
             items_are_bookmark_view: false,
             items_are_rating_view: false,
@@ -3051,7 +3104,7 @@ impl ViewerContextBundle {
             adjustment_dragging: false,
             thumb_adjust_drag_color_dirty: false,
             adjustment_mode: crate::ui_helpers::MetadataPanelOpenState::Closed,
-            adjust_spread_target: AdjustSpreadTarget::Left,
+            adjust_spread_target: None,
             adjust_scope_selection: AdjustScopeSelection::Standard,
             adjust_scope_selection_idx: None,
             local_adjust_mode: false,
@@ -3138,6 +3191,9 @@ impl App {
         self.fs_nav_after_pdf_enumerate = None;
         self.fs_nav_locked_gen = None;
         self.fs_holdover_tex = None;
+        if self.page_overview.session().is_some() {
+            self.withdraw_foreground_thumbnail_requests();
+        }
         self.fs_nav_dropped_block_signature = None;
         self.fs_nav_dropped_block_count = 0;
         self.continuous_page_transitions.clear();
@@ -3223,6 +3279,7 @@ impl App {
             navigation_scope,
             archive_source_override,
             zip_nav,
+            list_order,
             stack_mode_requested,
             stack_view,
             stack_showing_flat,
@@ -3234,6 +3291,8 @@ impl App {
             stack_selection_target,
             items,
             page_identity_index,
+            page_overview,
+            page_overview_incarnation,
             projection_recipe,
             current_book_bookmarks,
             current_book_bookmarks_key,
@@ -3352,7 +3411,7 @@ impl App {
             analysis_filter_mag,
             analysis_guide_drag,
             view_trim_mode,
-            view_trim_apply_mode,
+            view_trim_book_preference,
             view_trim_page_apply_root_idx,
             view_trim_page_spread_separate,
             view_trim_book_settings,
@@ -3378,6 +3437,7 @@ impl App {
             favsearch_subfolder_restore,
             items_are_global_search_view,
             items_are_tag_view,
+            tag_view_applied_times,
             items_are_reading_history_view,
             items_are_bookmark_view,
             items_are_rating_view,
@@ -3544,6 +3604,7 @@ impl App {
         swap_field!(navigation_scope);
         swap_field!(archive_source_override);
         swap_field!(zip_nav);
+        swap_field!(list_order);
         swap_field!(stack_mode_requested);
         swap_field!(stack_view);
         swap_field!(stack_showing_flat);
@@ -3555,6 +3616,8 @@ impl App {
         swap_field!(stack_selection_target);
         swap_field!(items);
         swap_field!(page_identity_index);
+        swap_field!(page_overview);
+        swap_field!(page_overview_incarnation);
         swap_field!(projection_recipe);
         swap_field!(current_book_bookmarks);
         swap_field!(current_book_bookmarks_key);
@@ -3683,7 +3746,7 @@ impl App {
         swap_field!(analysis_filter_mag);
         swap_field!(analysis_guide_drag);
         swap_field!(view_trim_mode);
-        swap_field!(view_trim_apply_mode);
+        swap_field!(view_trim_book_preference);
         swap_field!(view_trim_page_apply_root_idx);
         swap_field!(view_trim_page_spread_separate);
         swap_field!(view_trim_book_settings);
@@ -3710,6 +3773,7 @@ impl App {
         swap_field!(favsearch_subfolder_restore);
         swap_field!(items_are_global_search_view);
         swap_field!(items_are_tag_view);
+        swap_field!(tag_view_applied_times);
         swap_field!(items_are_reading_history_view);
         swap_field!(items_are_bookmark_view);
         swap_field!(items_are_rating_view);
@@ -3907,6 +3971,7 @@ impl App {
         // Forking changes the exact viewer owner even when the new payload retains the same
         // fullscreen index. Never carry a physical right-button sequence across that boundary.
         self.fs_secondary_press.cancel();
+        self.close_page_overview();
         macro_rules! duplicate_for_parked {
             ($($field:ident),+ $(,)?) => {
                 $(*$field = self.$field.clone();)+
@@ -3933,6 +3998,7 @@ impl App {
             navigation_scope,
             archive_source_override,
             zip_nav,
+            list_order,
             stack_mode_requested,
             stack_view,
             stack_showing_flat,
@@ -3944,6 +4010,8 @@ impl App {
             stack_selection_target,
             items,
             page_identity_index,
+            page_overview,
+            page_overview_incarnation,
             projection_recipe,
             current_book_bookmarks,
             current_book_bookmarks_key,
@@ -4062,7 +4130,7 @@ impl App {
             analysis_filter_mag,
             analysis_guide_drag,
             view_trim_mode,
-            view_trim_apply_mode,
+            view_trim_book_preference,
             view_trim_page_apply_root_idx,
             view_trim_page_spread_separate,
             view_trim_book_settings,
@@ -4088,6 +4156,7 @@ impl App {
             favsearch_subfolder_restore,
             items_are_global_search_view,
             items_are_tag_view,
+            tag_view_applied_times,
             items_are_reading_history_view,
             items_are_bookmark_view,
             items_are_rating_view,
@@ -4216,6 +4285,9 @@ impl App {
         // EOF 連続再生 / 前後ファイル移動が参照する一覧 identity は parked にも複製する。
         // A fork copies the requirement values, never the mutable worker projection.
         // Otherwise the new overlay (or its generation invalidation) cancels main's work.
+        // A new identity never inherits the source viewer's overview incarnation/session.
+        *page_overview = self.page_overview.fork_closed();
+        *page_overview_incarnation = 0;
         *still_seek_thumbnail_pages_shared = Arc::new(std::sync::RwLock::new(
             self.still_seek_thumbnail_pages.clone(),
         ));
@@ -4279,6 +4351,7 @@ impl App {
             favsearch_subfolder_restore,
             items_are_global_search_view,
             items_are_tag_view,
+            tag_view_applied_times,
             items_are_reading_history_view,
             items_are_bookmark_view,
             items_are_rating_view,
@@ -4398,6 +4471,7 @@ impl App {
         // グリッド worker / 詳細列 / タグ prewarm / 編集・見開き・view-trim / folder-nav は
         // main が原本を保持する。parked メディア窓はこれらを駆動しないので empty のままでよい。
         keep_in_main!(
+            list_order,
             current_folder_watch,
             current_folder_watch_failed,
             external_rescan_pending,
@@ -4465,7 +4539,7 @@ impl App {
             current_color_cache_map,
             current_color_catalog,
             view_trim_mode,
-            view_trim_apply_mode,
+            view_trim_book_preference,
             view_trim_page_apply_root_idx,
             view_trim_page_spread_separate,
             view_trim_book_settings,
@@ -4593,7 +4667,7 @@ impl App {
         let mut detached = self.split_current_context_preserving_main_grid();
 
         detached.view_trim_mode = self.view_trim_mode;
-        detached.view_trim_apply_mode = self.view_trim_apply_mode;
+        detached.view_trim_book_preference = self.view_trim_book_preference;
         detached.view_trim_page_apply_root_idx = self.view_trim_page_apply_root_idx;
         detached.view_trim_page_spread_separate = self.view_trim_page_spread_separate;
         detached.view_trim_book_settings = self.view_trim_book_settings.clone();
@@ -5112,6 +5186,32 @@ impl App {
     /// Every context except the one currently projected onto `App`. See `ContextTable::other_ids`.
     pub(in crate::app) fn other_viewer_context_ids(&self) -> Vec<ViewerContextId> {
         self.viewer_contexts.table.other_ids()
+    }
+
+    /// Trim changes affect display geometry, not source pixels or detection results.
+    /// Parked contexts keep their pan/rotation and reanchor through the normal renderer.
+    pub(crate) fn invalidate_auto_view_trim_display_in_parked_contexts(&mut self) {
+        for id in self.viewer_contexts.table.other_ids() {
+            let Some(bundle) = self.viewer_contexts.table.at_rest_mut(id) else {
+                continue;
+            };
+            if bundle.view_trim_book_preference
+                != crate::view_trim::ViewTrimBookPreference::FollowGlobal
+            {
+                continue;
+            }
+            bundle.fullscreen_page_layout.clear();
+            bundle.fs_vertical_cache_keep_set.clear();
+            bundle.continuous_page_transitions.clear();
+            bundle.slideshow_scroll_range_cache = None;
+            if !bundle.reading_flow.is_paged() && bundle.fullscreen_idx.is_some() {
+                bundle.fs_vertical_scroll = 0.0;
+                bundle.continuous_reading_scroll_transition =
+                    Some(ContinuousReadingScrollTransition::AwaitingReanchor {
+                        history_trigger: HistoryTrigger::UserChosen,
+                    });
+            }
+        }
     }
 
     /// A global final-cover setting is shared by every viewer context, while the geometry and
@@ -5879,7 +5979,7 @@ impl App {
         );
         let snapshot = DetachedImageWindowSnapshot {
             id: window_id,
-            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+            display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
             title: format!("paused-{window_id}"),
             location_display: format!("paused-{window_id}"),
             image_dims: None,
@@ -5960,6 +6060,185 @@ mod tests {
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+
+    #[cfg(windows)]
+    fn list_order_snapshot_for_test(
+        owner: ViewerContextId,
+        folder: &Path,
+    ) -> Arc<super::super::ListOrderSnapshot> {
+        Arc::new(super::super::ListOrderSnapshot {
+            owner,
+            entries: Arc::from([super::super::ListOrderEntry {
+                path: folder.to_path_buf(),
+                kind: super::super::ListOrderEntryKind::Folder,
+            }]),
+        })
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn list_order_registry_bundle_swap_preserves_each_context_snapshot() {
+        let mut app = crate::app::setup_app_for_test();
+        let main = app.viewer_context_main();
+        let folder = app.tmp.path().join("list-order-main");
+        let main_snapshot = list_order_snapshot_for_test(main, &folder);
+        app.current_folder = Some(folder.clone());
+        app.list_order = Some(Arc::clone(&main_snapshot));
+        assert_eq!(app.list_order_position().unwrap().1, 0);
+
+        let mut bundle = ViewerContextBundle::empty();
+        assert!(bundle.list_order.is_none());
+        let other_folder = app.tmp.path().join("list-order-other");
+        let other_snapshot =
+            list_order_snapshot_for_test(ViewerContextId::for_test(999), &other_folder);
+        bundle.current_folder = Some(other_folder.clone());
+        bundle.list_order = Some(Arc::clone(&other_snapshot));
+
+        app.swap_viewer_context_bundle(&mut bundle);
+        assert!(Arc::ptr_eq(
+            app.list_order.as_ref().unwrap(),
+            &other_snapshot
+        ));
+        assert_eq!(app.current_folder.as_ref(), Some(&other_folder));
+        assert!(Arc::ptr_eq(
+            bundle.list_order.as_ref().unwrap(),
+            &main_snapshot
+        ));
+        assert_eq!(bundle.current_folder.as_ref(), Some(&folder));
+        app.swap_viewer_context_bundle(&mut bundle);
+        assert!(Arc::ptr_eq(
+            app.list_order.as_ref().unwrap(),
+            &main_snapshot
+        ));
+        assert!(Arc::ptr_eq(
+            bundle.list_order.as_ref().unwrap(),
+            &other_snapshot
+        ));
+        assert_eq!(app.list_order_position().unwrap().1, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tag_applied_at_registry_swap_and_clear_preserve_the_sibling_context() {
+        let mut app = crate::app::setup_app_for_test();
+        let path = app.tmp.path().join("tag-context.jpg");
+        let key = crate::tags_db::item_key_for_path(&path);
+        app.items = vec![GridItem::Image(path.clone())];
+        app.items_are_tag_view = true;
+        app.tag_view_applied_times.insert(key.clone(), 10_000);
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = vec![GridItem::Image(path)];
+        bundle.items_are_tag_view = true;
+        bundle.tag_view_applied_times.insert(key.clone(), 20_000);
+
+        app.swap_viewer_context_bundle(&mut bundle);
+        assert_eq!(app.tag_view_applied_at_ms(0), Some(20_000));
+        assert_eq!(bundle.tag_view_applied_times.get(&key), Some(&10_000));
+        app.tag_view_applied_times.clear();
+        app.swap_viewer_context_bundle(&mut bundle);
+        assert_eq!(app.tag_view_applied_at_ms(0), Some(10_000));
+        assert!(bundle.tag_view_applied_times.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn list_order_registry_forks_start_empty_and_preserve_main_snapshot() {
+        for live in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let main = app.viewer_context_main();
+            let folder = app.tmp.path().join("list-order-fork");
+            let snapshot = list_order_snapshot_for_test(main, &folder);
+            app.current_folder = Some(folder.clone());
+            app.items = vec![GridItem::Image(folder.join("page.png"))];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.fullscreen_idx = Some(0);
+            app.list_order = Some(Arc::clone(&snapshot));
+            let child = if live {
+                app.bind_window(main, 91444).unwrap();
+                app.fork_mounted_live_media_context(91444)
+            } else {
+                app.fork_materialized_still_context(&folder, 0)
+            };
+            assert_ne!(child, main);
+            assert_eq!(app.viewer_context_main(), main);
+            assert!(Arc::ptr_eq(app.list_order.as_ref().unwrap(), &snapshot));
+            assert_eq!(app.list_order_position().unwrap().1, 0);
+            app.with_viewer_context(child, |owner| {
+                assert!(owner.list_order.is_none());
+                assert!(owner.list_order_position().is_none());
+            })
+            .unwrap();
+            assert!(Arc::ptr_eq(app.list_order.as_ref().unwrap(), &snapshot));
+            assert_eq!(app.list_order_position().unwrap().1, 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn list_order_registry_mounts_keep_sibling_snapshot_and_promote_invalidates_old_owner() {
+        let mut app = crate::app::setup_app_for_test();
+        let old_main = app.viewer_context_main();
+        let folder = app.tmp.path().join("list-order-promote");
+        let main_snapshot = list_order_snapshot_for_test(old_main, &folder);
+        app.current_folder = Some(folder);
+        app.list_order = Some(Arc::clone(&main_snapshot));
+        let sibling_folder = app.tmp.path().join("list-order-sibling");
+        let mut sibling_snapshot = None;
+        let sibling = app.build_window_context_for_test(91445, |owner| {
+            assert!(owner.list_order.is_none());
+            let snapshot =
+                list_order_snapshot_for_test(owner.projected_viewer_context_id(), &sibling_folder);
+            owner.current_folder = Some(sibling_folder.clone());
+            owner.list_order = Some(Arc::clone(&snapshot));
+            sibling_snapshot = Some(snapshot);
+        });
+        let sibling_snapshot = sibling_snapshot.unwrap();
+        for _ in 0..2 {
+            app.with_viewer_context(sibling, |owner| {
+                assert!(Arc::ptr_eq(
+                    owner.list_order.as_ref().unwrap(),
+                    &sibling_snapshot
+                ));
+                assert_eq!(owner.current_folder.as_ref(), Some(&sibling_folder));
+                assert!(owner.list_order_position().is_none());
+            })
+            .unwrap();
+            assert!(Arc::ptr_eq(
+                app.list_order.as_ref().unwrap(),
+                &main_snapshot
+            ));
+            assert_eq!(app.list_order_position().unwrap().1, 0);
+        }
+
+        assert_eq!(
+            app.stash_mounted_and_start_fresh("list_order_promote"),
+            old_main
+        );
+        let new_main = app.viewer_context_main();
+        assert_ne!(old_main, new_main);
+        assert!(app.list_order.is_none());
+        app.with_viewer_context(old_main, |owner| {
+            assert_eq!(owner.list_order.as_ref().unwrap().owner, old_main);
+            assert!(Arc::ptr_eq(
+                owner.list_order.as_ref().unwrap(),
+                &main_snapshot
+            ));
+            assert!(owner.list_order_position().is_none());
+        })
+        .unwrap();
+        app.with_viewer_context(sibling, |owner| {
+            assert!(Arc::ptr_eq(
+                owner.list_order.as_ref().unwrap(),
+                &sibling_snapshot
+            ));
+            assert_eq!(owner.current_folder.as_ref(), Some(&sibling_folder));
+        })
+        .unwrap();
+        assert_eq!(app.viewer_context_main(), new_main);
+        assert!(app.list_order.is_none());
+    }
 
     #[cfg(windows)]
     fn seed_c1_subscription_scan(
@@ -6122,6 +6401,44 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn overview_bundle_fixture(serial: u64) -> ViewerContextBundle {
+        use crate::page_overview::{PageOverviewProjection, PageOverviewStamp, PageOverviewState};
+        let mut bundle = ViewerContextBundle::empty();
+        bundle.items = vec![GridItem::Image("book/page.jpg".into())];
+        bundle.items_generation = 7;
+        bundle.page_identity_index = Arc::new(
+            super::super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                &bundle.items,
+                None,
+                Default::default(),
+            ),
+        );
+        let projection = Arc::new(
+            PageOverviewProjection::new(
+                Arc::clone(bundle.page_identity_index.overview_metadata()),
+                Arc::new(vec![0]),
+            )
+            .unwrap(),
+        );
+        bundle.page_overview_incarnation = 19;
+        bundle.page_overview = PageOverviewState::open(
+            projection,
+            PageOverviewStamp {
+                context_serial: serial,
+                items_generation: 7,
+                reader_order_revision: 8,
+                incarnation: 19,
+            },
+            0,
+            5,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)),
+            Default::default(),
+        )
+        .unwrap();
+        bundle
+    }
+
+    #[cfg(windows)]
     fn pdf_promotion_for_test(
         ticket: &crate::pdf_loader::PdfRenderEpochTicket,
         retry_needed: bool,
@@ -6153,6 +6470,51 @@ mod tests {
             &std::collections::HashSet::from(["same.pdf:p:0@256".to_owned()])
         );
         assert_eq!(*retry_needed, expected_retry);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn overview_bundle_empty_fork_generation_and_retire_keep_sibling_owner() {
+        let empty = ViewerContextBundle::empty();
+        assert!(empty.page_overview.session().is_none());
+        assert_eq!(empty.page_overview_incarnation, 0);
+        let mut owner = overview_bundle_fixture(1);
+        let sibling = overview_bundle_fixture(2);
+        let sibling_projection =
+            Arc::clone(&sibling.page_overview.session().unwrap().view().projection);
+        let sibling_token = Arc::clone(&sibling.cancel_token);
+        assert!(owner.page_overview.fork_closed().session().is_none());
+        owner.set_items_generation(7);
+        assert!(
+            owner.page_overview.session().is_some(),
+            "same owner/generation retains the session"
+        );
+        owner.set_items_generation(8);
+        assert!(owner.page_overview.session().is_none());
+        assert_eq!(
+            owner.page_overview_incarnation, 19,
+            "reopen cannot reuse an incarnation"
+        );
+        let mut retiring = overview_bundle_fixture(3);
+        retiring.cancel_all_context_work();
+        assert!(retiring.page_overview.session().is_none());
+        drop(owner);
+        drop(retiring);
+        assert!(!sibling_token.load(Ordering::Relaxed));
+        assert!(Arc::ptr_eq(
+            &sibling_projection,
+            &sibling.page_overview.session().unwrap().view().projection
+        ));
+        assert_eq!(
+            sibling
+                .page_overview
+                .session()
+                .unwrap()
+                .view()
+                .stamp
+                .context_serial,
+            2
+        );
     }
 
     #[cfg(windows)]
@@ -6191,6 +6553,60 @@ mod tests {
         assert!(!main.is_stale());
         drop(app);
         assert!(main.is_stale());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn overview_bundle_registry_deposit_withdraw_preserves_same_session() {
+        // No App/DB fixture or I/O worker is needed: exercise the production table's
+        // actual ownership slots with the production payload, not a cloned session.
+        let mut table = ContextTable::<Box<ViewerContextBundle>>::new();
+        let owner = table.main();
+        let projection = overview_bundle_fixture(owner.serial());
+        let stamp = projection.page_overview.session().unwrap().view().stamp;
+        let metadata = Arc::clone(projection.page_identity_index.overview_metadata());
+        let (reserved, operations) = table.plan_begin_build();
+        assert_eq!(
+            operations,
+            vec![
+                TableOp::ReplaceProjectionWithFreshEmpty,
+                TableOp::DepositInto(owner)
+            ]
+        );
+        table.deposit(owner, Box::new(projection));
+        table.finish_begin_build();
+        let retained = table.at_rest(owner).unwrap();
+        assert_eq!(
+            retained.page_overview.session().unwrap().view().stamp,
+            stamp
+        );
+        assert_eq!(retained.page_overview_incarnation, 19);
+        assert!(Arc::ptr_eq(
+            retained.page_identity_index.overview_metadata(),
+            &metadata
+        ));
+        let operations = table.plan_abort_build();
+        assert_eq!(
+            operations,
+            vec![
+                TableOp::ReplaceProjectionWithFreshEmpty,
+                TableOp::DepositInto(reserved),
+                TableOp::WithdrawFrom(owner),
+                TableOp::RestoreProjectionAndDropDisplacedEmpty,
+                TableOp::WithdrawFrom(reserved),
+                TableOp::DropTransientAsRetired(reserved),
+            ]
+        );
+        table.deposit(reserved, Box::new(ViewerContextBundle::empty()));
+        let restored = table.withdraw(owner);
+        drop(table.withdraw(reserved));
+        table.finish_abort_build();
+        assert_eq!(table.mounted_id(), Some(owner));
+        assert_eq!(
+            restored.page_overview.session().unwrap().view().stamp,
+            stamp
+        );
+        assert!(!restored.cancel_token.load(Ordering::Relaxed));
     }
 
     #[cfg(windows)]
@@ -8422,6 +8838,68 @@ mod tests {
             assert_eq!(owner.fs_vertical_scroll, 333.0);
         })
         .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn global_auto_view_trim_change_invalidates_only_inherited_geometry_and_preserves_pixels() {
+        use crate::view_trim::ViewTrimBookPreference as P;
+        let mut app = crate::app::setup_app_for_test();
+        app.view_trim_book_preference = P::FollowGlobal;
+        app.fs_pan = egui::vec2(7.0, 9.0);
+        let mut contexts = Vec::new();
+        for (window, preference) in [
+            (741, P::FollowGlobal),
+            (742, P::None),
+            (743, P::Auto),
+            (744, P::Manual),
+        ] {
+            let id = app.build_window_context_for_test(window, |owner| {
+                owner.view_trim_book_preference = preference;
+                owner.fullscreen_idx = Some(0);
+                owner.reading_flow = crate::settings::ReadingFlow::Vertical;
+                owner.fs_vertical_scroll = 123.0;
+                owner.fs_pan = egui::vec2(13.0, 17.0);
+                owner.fs_free_rotation = 23.0;
+                owner.fs_margin_bbox_cache.insert(0, (4, 5, None));
+                owner.fs_vertical_cache_keep_set.insert(0);
+                owner
+                    .fullscreen_page_layout
+                    .begin(crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous);
+            });
+            contexts.push((id, preference));
+        }
+        app.invalidate_auto_view_trim_display_in_parked_contexts();
+        assert_eq!(app.fs_pan, egui::vec2(7.0, 9.0));
+        for (id, preference) in contexts {
+            let bundle = app.viewer_contexts.table.at_rest(id).unwrap();
+            assert_eq!(bundle.view_trim_book_preference, preference);
+            assert_eq!(bundle.fs_pan, egui::vec2(13.0, 17.0));
+            assert_eq!(bundle.fs_free_rotation, 23.0);
+            assert_eq!(bundle.fs_margin_bbox_cache.get(&0), Some(&(4, 5, None)));
+            if preference == P::FollowGlobal {
+                assert_eq!(
+                    bundle.fullscreen_page_layout.kind(),
+                    crate::displayed_image_transform::FullscreenPageLayoutKind::Empty
+                );
+                assert!(bundle.fs_vertical_cache_keep_set.is_empty());
+                assert_eq!(bundle.fs_vertical_scroll, 0.0);
+                assert!(matches!(
+                    bundle.continuous_reading_scroll_transition,
+                    Some(ContinuousReadingScrollTransition::AwaitingReanchor {
+                        history_trigger: HistoryTrigger::UserChosen
+                    })
+                ));
+            } else {
+                assert_eq!(
+                    bundle.fullscreen_page_layout.kind(),
+                    crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous
+                );
+                assert!(bundle.fs_vertical_cache_keep_set.contains(&0));
+                assert_eq!(bundle.fs_vertical_scroll, 123.0);
+                assert!(bundle.continuous_reading_scroll_transition.is_none());
+            }
+        }
     }
 
     #[cfg(windows)]

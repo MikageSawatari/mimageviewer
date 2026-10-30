@@ -1035,7 +1035,10 @@ fn failed_physical_scan_keeps_existing_snapshot_page_and_panel_but_retires_old_d
     app.capture_fs_nav_holdover(0);
     assert!(matches!(
         app.fs_holdover_tex,
-        Some(FsHoldover::FolderNavigation(None))
+        Some(FsHoldover::FolderNavigation(
+            None,
+            crate::app::FsFolderNavigationOrigin::Ordinary
+        ))
     ));
     let current = SimilarBookLocation::from_grid_item(&app.items[0]).unwrap();
     app.similar_panel
@@ -1315,7 +1318,7 @@ fn page_handler_supersedes_a_pending_required_scan_and_preserves_panel_lock() {
     assert!(app.fs_info_panel.locked);
     assert!(!matches!(
         app.fs_holdover_tex,
-        Some(FsHoldover::FolderNavigation(_))
+        Some(FsHoldover::FolderNavigation(_, _))
     ));
 }
 
@@ -1859,20 +1862,20 @@ fn presentation_switch_exposes_and_expires_its_asset_without_overwriting_navigat
     app.capture_fs_nav_holdover(0);
     assert!(matches!(
         app.fs_holdover_tex,
-        Some(FsHoldover::FolderNavigation(Some(_)))
+        Some(FsHoldover::FolderNavigation(Some(_), _))
     ));
     app.settings.video_in_window_mode = true;
     app.toggle_still_window_mode();
     assert!(matches!(
         app.fs_holdover_tex,
-        Some(FsHoldover::FolderNavigation(Some(_)))
+        Some(FsHoldover::FolderNavigation(Some(_), _))
     ));
     app.still_fullscreen_viewport_enter_suppress_until =
         Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
     assert!(!app.still_fullscreen_viewport_enter_suppressed());
     assert!(matches!(
         app.fs_holdover_tex,
-        Some(FsHoldover::FolderNavigation(Some(_)))
+        Some(FsHoldover::FolderNavigation(Some(_), _))
     ));
 }
 

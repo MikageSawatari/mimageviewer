@@ -395,6 +395,13 @@ fn classify_checked_file_operation_selection(
 }
 
 #[derive(Clone)]
+enum ItemCopyMenuSubject {
+    Item,
+    BookmarkSource(PathBuf),
+    Unavailable,
+}
+
+#[derive(Clone)]
 struct NativeGridContextMenuTarget {
     shell_paths: Option<Vec<PathBuf>>,
     real_paths: Vec<PathBuf>,
@@ -402,6 +409,7 @@ struct NativeGridContextMenuTarget {
     checked_file_operation_selection: CheckedFileOperationSelection,
     item: GridItem,
     item_index: Option<usize>,
+    copy_subject: ItemCopyMenuSubject,
     is_folder_context: bool,
     has_checked: bool,
     checked_count: usize,
@@ -425,6 +433,20 @@ const COLLECTION_JUMP_NO_PARENT_MESSAGE: &str =
     "ドライブまたは共有ルートには親フォルダがありません";
 
 impl NativeGridContextMenuTarget {
+    fn copy_command(&self, requested: MenuCommand) -> Option<MenuCommand> {
+        match &self.copy_subject {
+            ItemCopyMenuSubject::BookmarkSource(_) => {
+                (requested == MenuCommand::CopyPath).then_some(requested)
+            }
+            ItemCopyMenuSubject::Unavailable => None,
+            ItemCopyMenuSubject::Item => crate::context_menu_model::item_copy_command(
+                ContextMenuItemKind::from_grid_item(&self.item),
+                self.has_checked,
+                requested,
+            ),
+        }
+    }
+
     fn is_fullscreen_video(&self) -> bool {
         self.surface == ContextMenuSurface::Fullscreen && matches!(self.item, GridItem::Video(_))
     }
@@ -793,6 +815,101 @@ fn windows_path_root_for_file_operation(path: &Path) -> Option<String> {
 }
 
 impl crate::app::App {
+    /// Key and ring copy actions resolve the same item snapshot as its context menu.
+    pub(crate) fn execute_copy_key_action(
+        &mut self,
+        ctx: &egui::Context,
+        action: crate::keymap::KeyAction,
+    ) {
+        self.dispatch_copy_key_action_with(ctx, action, |app, ctx, command, target| {
+            let _ = app.dispatch_native_grid_context_command(ctx, command, target);
+        });
+    }
+
+    fn dispatch_copy_key_action_with(
+        &mut self,
+        ctx: &egui::Context,
+        action: crate::keymap::KeyAction,
+        dispatch: impl FnOnce(&mut Self, &egui::Context, MenuCommand, &NativeGridContextMenuTarget),
+    ) {
+        use crate::keymap::KeyAction::*;
+        let (surface, requested) = match action {
+            GridCopyFiles => (ContextMenuSurface::Grid, MenuCommand::CopyFiles),
+            GridCopyPath => (ContextMenuSurface::Grid, MenuCommand::CopyPath),
+            GridCopyFileName => (ContextMenuSurface::Grid, MenuCommand::CopyFileName),
+            GridCopyImage => (ContextMenuSurface::Grid, MenuCommand::CopyImageToClipboard),
+            GridCopyEditedImage => (
+                ContextMenuSurface::Grid,
+                MenuCommand::CopyEditedImageToClipboard,
+            ),
+            FsCopyFiles => (ContextMenuSurface::Fullscreen, MenuCommand::CopyFiles),
+            FsCopyPath => (ContextMenuSurface::Fullscreen, MenuCommand::CopyPath),
+            FsCopyFileName => (ContextMenuSurface::Fullscreen, MenuCommand::CopyFileName),
+            FsCopyImage => (
+                ContextMenuSurface::Fullscreen,
+                MenuCommand::CopyImageToClipboard,
+            ),
+            FsCopyEditedImage => (
+                ContextMenuSurface::Fullscreen,
+                MenuCommand::CopyEditedImageToClipboard,
+            ),
+            _ => return,
+        };
+        if !self.grid_item_input_allowed() {
+            return;
+        }
+        let idx = match surface {
+            ContextMenuSurface::Grid => self.selected.or_else(|| {
+                // Ctrl+C historically works on a checked set without a cursor, too.
+                (action == GridCopyFiles)
+                    .then(|| self.checked.iter().copied().min())
+                    .flatten()
+            }),
+            ContextMenuSurface::Fullscreen => self.fullscreen_idx,
+        };
+        let Some(idx) = idx else { return };
+        let Some(item) = self.items.get(idx).cloned() else {
+            return;
+        };
+        let has_checked = surface == ContextMenuSurface::Grid && !self.checked.is_empty();
+        let target = self.context_menu_target(idx, item, false, has_checked, None, surface, None);
+        let command = target.copy_command(requested);
+        // Preserve the released GridCopyFiles refusal for a virtual selection.
+        let Some(command) =
+            command.or_else(|| (action == GridCopyFiles).then_some(MenuCommand::CopyFiles))
+        else {
+            return;
+        };
+        dispatch(self, ctx, command, &target);
+    }
+
+    pub(crate) fn handle_copy_action_keys(&mut self, ctx: &egui::Context, fullscreen: bool) {
+        use crate::keymap::KeyAction::*;
+        let actions = if fullscreen {
+            [
+                FsCopyFiles,
+                FsCopyPath,
+                FsCopyFileName,
+                FsCopyImage,
+                FsCopyEditedImage,
+            ]
+            .as_slice()
+        } else {
+            // GridCopyFiles also accepts the OS semantic Copy event at its existing checkpoint.
+            [
+                GridCopyPath,
+                GridCopyFileName,
+                GridCopyImage,
+                GridCopyEditedImage,
+            ]
+            .as_slice()
+        };
+        for &action in actions {
+            if self.keymap.consume_action_no_repeat(ctx, action) {
+                self.execute_copy_key_action(ctx, action);
+            }
+        }
+    }
     pub(crate) fn capture_grid_context_menu_owner(&self, index: usize) -> GridContextMenuOwner {
         GridContextMenuOwner {
             index,
@@ -831,6 +948,7 @@ impl crate::app::App {
         let mut open_bookmark = false;
         let mut delete_bookmark = false;
         let mut open_explorer = false;
+        let mut copy_path = false;
         let checked_count = self.checked.len();
         let pos = self.context_menu_pos;
         egui::Window::new("bookmark-grid-context")
@@ -850,7 +968,7 @@ impl crate::app::App {
                     close = true;
                 }
                 if ui.button("パスをコピー").clicked() {
-                    copy_path_text(ctx, &source);
+                    copy_path = true;
                     close = true;
                 }
                 if explorer_target.is_some()
@@ -881,6 +999,18 @@ impl crate::app::App {
                     close = true;
                 }
             });
+        if copy_path {
+            let target = self.context_menu_target(
+                idx,
+                row.item.clone(),
+                false,
+                false,
+                None,
+                ContextMenuSurface::Grid,
+                None,
+            );
+            let _ = self.dispatch_native_grid_context_command(ctx, MenuCommand::CopyPath, &target);
+        }
         if open_bookmark {
             self.open_bookmark_browser_row(ctx, &row);
         }
@@ -1029,88 +1159,6 @@ impl crate::app::App {
         }
 
         nav
-    }
-
-    pub(crate) fn copy_item_path_to_clipboard(&mut self, ctx: &egui::Context, idx: usize) -> bool {
-        let Some(item) = self.items.get(idx).cloned() else {
-            return false;
-        };
-        let text = match item {
-            GridItem::Image(path)
-            | GridItem::Video(path)
-            | GridItem::Audio(path)
-            | GridItem::Folder(path)
-            | GridItem::ZipFile(path)
-            | GridItem::PdfFile(path) => native_path_text(&path),
-            GridItem::ConvertibleArchive { path, .. } | GridItem::SearchContainer { path, .. } => {
-                native_path_text(&path)
-            }
-            GridItem::ZipImage {
-                zip_path,
-                entry_name,
-            }
-            | GridItem::ZipDir {
-                zip_path,
-                dir_prefix: entry_name,
-                ..
-            } => format!("{}:{}", native_path_text(&zip_path), entry_name),
-            GridItem::PdfPage {
-                pdf_path, page_num, ..
-            } => format!("{}:Page {}", native_path_text(&pdf_path), page_num + 1),
-            // ファイル名スタック: 代表画像の実パスをコピー。
-            GridItem::Stack { representative, .. } => native_path_text(&representative),
-            GridItem::CollectionPlaceholder { path, .. } => native_path_text(&path),
-        };
-        ctx.copy_text(text);
-        true
-    }
-
-    pub(crate) fn copy_item_file_name_to_clipboard(
-        &mut self,
-        ctx: &egui::Context,
-        idx: usize,
-    ) -> bool {
-        let Some(item) = self.items.get(idx) else {
-            return false;
-        };
-        let name = item.name().to_string();
-        if name.is_empty() {
-            return false;
-        }
-        ctx.copy_text(name);
-        true
-    }
-
-    pub(crate) fn copy_item_image_to_clipboard(&mut self, idx: usize) -> bool {
-        let Some(item) = self.items.get(idx).cloned() else {
-            return false;
-        };
-        let rotation = self.get_rotation(idx);
-        match item {
-            GridItem::Image(path) => {
-                copy_image_to_clipboard(
-                    &path,
-                    rotation,
-                    self.raw_develop_executor.clone(),
-                    self.settings.raw_brightness,
-                );
-                true
-            }
-            GridItem::ZipImage {
-                zip_path,
-                entry_name,
-            } => {
-                copy_zip_image_to_clipboard(
-                    &zip_path,
-                    &entry_name,
-                    rotation,
-                    self.raw_develop_executor.clone(),
-                    self.settings.raw_brightness,
-                );
-                true
-            }
-            _ => false,
-        }
     }
 
     pub(crate) fn open_item_folder_in_explorer(&mut self, idx: usize) -> bool {
@@ -1341,6 +1389,21 @@ impl crate::app::App {
             checked_file_operation_selection,
             item,
             item_index: (!is_folder_context).then_some(idx),
+            copy_subject: if surface == ContextMenuSurface::Grid && !is_folder_context {
+                if self.items_are_drive_list {
+                    ItemCopyMenuSubject::Unavailable
+                } else if self.items_are_bookmark_view {
+                    self.bookmark_browser_rows
+                        .get(idx)
+                        .map_or(ItemCopyMenuSubject::Unavailable, |row| {
+                            ItemCopyMenuSubject::BookmarkSource(row.source_path().to_path_buf())
+                        })
+                } else {
+                    ItemCopyMenuSubject::Item
+                }
+            } else {
+                ItemCopyMenuSubject::Item
+            },
             is_folder_context,
             has_checked,
             checked_count: if has_checked { self.checked.len() } else { 0 },
@@ -1438,7 +1501,7 @@ impl crate::app::App {
                     ),
                     ContextMenuSurface::Fullscreen => (
                         None,
-                        None,
+                        Some(crate::keymap::KeyAction::FsCopyFiles),
                         crate::keymap::KeyAction::FsRotateCcw,
                         crate::keymap::KeyAction::FsRotateCw,
                         None,
@@ -1715,6 +1778,14 @@ impl crate::app::App {
                 None
             }
             MenuCommand::CopyPath | MenuCommand::CopyRepresentativePath => {
+                match &target.copy_subject {
+                    ItemCopyMenuSubject::BookmarkSource(path) => {
+                        copy_path_text(ctx, path);
+                        return None;
+                    }
+                    ItemCopyMenuSubject::Unavailable => return None,
+                    ItemCopyMenuSubject::Item => {}
+                }
                 if target.has_checked
                     && target.checked_file_operation_selection
                         != CheckedFileOperationSelection::RealOnly
@@ -1763,6 +1834,16 @@ impl crate::app::App {
                         ),
                         _ => {}
                     }
+                }
+                None
+            }
+            MenuCommand::CopyEditedImageToClipboard => {
+                if let Some(idx) = target.item_index {
+                    self.request_edited_clipboard_copy(
+                        ctx,
+                        idx,
+                        target.surface == ContextMenuSurface::Fullscreen,
+                    );
                 }
                 None
             }
@@ -2387,9 +2468,9 @@ impl crate::app::App {
 static CLIPBOARD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 画像クリップボード書き込み (OpenClipboard/SetClipboardData) を直列化するミューテックス。
-/// seq チェックは必ずこの lock 内で実行し、
-/// 「チェック通過 → 実際の書き込み」の間に別の writer が割り込まないようにする。
-/// 古い writer が遅れて clipboard を上書きする race を閉じる。
+/// worker はこの lock 内で OpenClipboard 成功後に seq を再判定する。
+/// UI 側の要求予約は lock を取らない。判定後の書き込み中に新しい要求が来た場合は、
+/// 新項目の OS baseline 検査で扱う (clipboard-edited-copy-plan.md §5.1)。
 static CLIPBOARD_WRITE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 次世代の seq を発行する。発行値が最新 (= CLIPBOARD_SEQ の現在値) かをチェックするには
@@ -2401,6 +2482,53 @@ fn bump_clipboard_seq() -> u64 {
 /// `my_seq` がまだ最新なら true。古ければ false — 書き込みをスキップすべき合図。
 fn clipboard_seq_is_latest(my_seq: u64) -> bool {
     CLIPBOARD_SEQ.load(std::sync::atomic::Ordering::Relaxed) == my_seq
+}
+
+/// Both generations belong to the request, not the later worker completion.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EditedClipboardWriteRequest {
+    my_seq: u64,
+    baseline: u32,
+}
+
+impl EditedClipboardWriteRequest {
+    pub(crate) fn sequence(self) -> u64 {
+        self.my_seq
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ClipboardImageWriteResult {
+    Written,
+    Superseded,
+    ClipboardChanged,
+    Failed(String),
+}
+
+/// UI entry point. Never take CLIPBOARD_WRITE_MUTEX here: EmptyClipboard may
+/// synchronously wait for a notification to the UI's previous clipboard owner.
+pub(crate) fn request_edited_clipboard_write() -> EditedClipboardWriteRequest {
+    #[cfg(windows)]
+    {
+        request_edited_clipboard_write_with(&mut NativeClipboardImageApi, bump_clipboard_seq)
+    }
+    #[cfg(not(windows))]
+    {
+        EditedClipboardWriteRequest {
+            my_seq: bump_clipboard_seq(),
+            baseline: 0,
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn request_edited_clipboard_write_with(
+    api: &mut impl ClipboardImageApi,
+    reserve: impl FnOnce() -> u64,
+) -> EditedClipboardWriteRequest {
+    let my_seq = reserve();
+    let baseline = api.sequence_number();
+    EditedClipboardWriteRequest { my_seq, baseline }
 }
 
 fn decode_clipboard_raw(
@@ -2579,50 +2707,110 @@ fn set_image_to_clipboard(img: &image::DynamicImage, my_seq: u64) {
 
 /// RGBA8 pixels をクリップボードに CF_DIB として設定する。
 fn set_rgba_to_clipboard(width: u32, height: u32, rgba: &[u8], my_seq: u64) {
+    let _ = write_rgba_to_clipboard(width, height, rgba, my_seq, None);
+}
+
+/// Worker-only entry point. The caller has already flattened alpha onto its
+/// export matte; the CF_DIB conversion retains the existing 24-bit encoding.
+pub(crate) fn write_edited_rgba_to_clipboard(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    request: EditedClipboardWriteRequest,
+) -> ClipboardImageWriteResult {
+    write_rgba_to_clipboard(width, height, rgba, request.my_seq, Some(request.baseline))
+}
+
+fn write_rgba_to_clipboard(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    my_seq: u64,
+    baseline: Option<u32>,
+) -> ClipboardImageWriteResult {
     #[cfg(windows)]
     {
         use windows::Win32::System::Ole::CF_DIB;
 
-        let row_size = (width * 3 + 3) & !3;
-        let pixel_size = row_size * height;
-        let header_size: u32 = 40;
-        let total_size = header_size as usize + pixel_size as usize;
-
-        // 重い DIB 構築は lock 外でローカルバッファに済ませる。
-        let mut buf = vec![0u8; total_size];
-        buf[0..4].copy_from_slice(&header_size.to_le_bytes());
-        buf[4..8].copy_from_slice(&(width as i32).to_le_bytes());
-        buf[8..12].copy_from_slice(&(height as i32).to_le_bytes());
-        buf[12..14].copy_from_slice(&1u16.to_le_bytes());
-        buf[14..16].copy_from_slice(&24u16.to_le_bytes());
-        for y in 0..height {
-            let src_row = (height - 1 - y) as usize;
-            let dst_offset = header_size as usize + (y * row_size) as usize;
-            for x in 0..width {
-                let src_idx = (src_row * width as usize + x as usize) * 4;
-                let dst_idx = dst_offset + (x * 3) as usize;
-                buf[dst_idx] = rgba[src_idx + 2];
-                buf[dst_idx + 1] = rgba[src_idx + 1];
-                buf[dst_idx + 2] = rgba[src_idx];
-            }
+        if !clipboard_seq_is_latest(my_seq) {
+            return ClipboardImageWriteResult::Superseded;
         }
+        // Pixel conversion and allocation remain outside the writer mutex.
+        let buf = match build_clipboard_dib(width, height, rgba) {
+            Ok(buf) => buf,
+            Err(error) => {
+                crate::logger::log(error.clone());
+                return ClipboardImageWriteResult::Failed(error);
+            }
+        };
 
-        // 実際のクリップボード書き込みは直列化 + seq 再確認。
+        // Workers alone wait for the writer mutex; UI requests never do.
         let Ok(_lock) = CLIPBOARD_WRITE_MUTEX.lock() else {
-            return;
+            let error = "Clipboard image writer mutex poisoned".to_owned();
+            crate::logger::log(error.clone());
+            return ClipboardImageWriteResult::Failed(error);
         };
         write_image_clipboard_if_latest(
             &mut NativeClipboardImageApi,
             &buf,
             CF_DIB.0 as u32,
             crate::clipboard_capture::data::process_nonce(),
+            baseline,
             || clipboard_seq_is_latest(my_seq),
-        );
+        )
     }
     #[cfg(not(windows))]
     {
-        let _ = (width, height, rgba, my_seq);
+        let _ = (width, height, rgba, my_seq, baseline);
+        ClipboardImageWriteResult::Failed("Image clipboard requires Windows".into())
     }
+}
+
+#[cfg(any(windows, test))]
+fn build_clipboard_dib(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    const HEADER_SIZE: usize = 40;
+    let invalid = || "Clipboard image dimensions or RGBA length are invalid".to_owned();
+    if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
+        return Err(invalid());
+    }
+    let width = width as usize;
+    let height = height as usize;
+    let expected = width.checked_mul(height).and_then(|n| n.checked_mul(4));
+    if expected != Some(rgba.len()) {
+        return Err(invalid());
+    }
+    let row_size = width
+        .checked_mul(3)
+        .and_then(|n| n.checked_add(3))
+        .map(|n| n & !3)
+        .ok_or_else(invalid)?;
+    let total_size = row_size
+        .checked_mul(height)
+        .and_then(|n| n.checked_add(HEADER_SIZE))
+        .ok_or_else(invalid)?;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(total_size)
+        .map_err(|error| format!("Clipboard DIB allocation failed: {error}"))?;
+    buf.resize(total_size, 0);
+    buf[0..4].copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+    buf[4..8].copy_from_slice(&(width as i32).to_le_bytes());
+    buf[8..12].copy_from_slice(&(height as i32).to_le_bytes());
+    buf[12..14].copy_from_slice(&1u16.to_le_bytes());
+    buf[14..16].copy_from_slice(&24u16.to_le_bytes());
+    for y in 0..height {
+        let src_row = height - 1 - y;
+        let dst_offset = HEADER_SIZE + y * row_size;
+        for x in 0..width {
+            let src_idx = (src_row * width + x) * 4;
+            let dst_idx = dst_offset + x * 3;
+            buf[dst_idx..dst_idx + 3].copy_from_slice(&[
+                rgba[src_idx + 2],
+                rgba[src_idx + 1],
+                rgba[src_idx],
+            ]);
+        }
+    }
+    Ok(buf)
 }
 
 /// Only the native calls are injected: the production writer and tests share
@@ -2637,6 +2825,7 @@ trait ClipboardImageApi {
     fn unlock(&mut self, memory: Self::Memory) -> Result<(), Self::Error>;
     fn free(&mut self, memory: Self::Memory) -> Result<(), Self::Error>;
     fn open(&mut self) -> Result<(), Self::Error>;
+    fn sequence_number(&mut self) -> u32;
     fn empty(&mut self) -> Result<(), Self::Error>;
     fn set_data(&mut self, format: u32, memory: Self::Memory) -> Result<(), Self::Error>;
     fn register_origin(&mut self) -> Result<u32, Self::Error>;
@@ -2656,67 +2845,85 @@ fn prepare_clipboard_memory<A: ClipboardImageApi>(
     api: &mut A,
     bytes: &[u8],
     role: &str,
-) -> Option<A::Memory> {
+) -> Result<A::Memory, String> {
     let memory = match api.allocate(bytes.len()) {
         Ok(memory) => memory,
         Err(error) => {
-            api.log(format!("Clipboard {role} allocation failed: {error}"));
-            return None;
+            let message = format!("Clipboard {role} allocation failed: {error}");
+            api.log(message.clone());
+            return Err(message);
         }
     };
     if let Err(error) = api.lock_and_copy(memory, bytes) {
-        api.log(format!("Clipboard {role} lock failed: {error}"));
+        let message = format!("Clipboard {role} lock failed: {error}");
+        api.log(message.clone());
         free_clipboard_memory(api, memory, role);
-        return None;
+        return Err(message);
     }
     if let Err(error) = api.unlock(memory) {
         api.log(format!("Clipboard {role} unlock failed: {error}"));
     }
-    Some(memory)
+    Ok(memory)
 }
 
-/// The caller holds CLIPBOARD_WRITE_MUTEX, including the final generation
-/// check. Once SetClipboardData succeeds, that allocation is system-owned.
+/// The worker holds CLIPBOARD_WRITE_MUTEX. Check generations again after open:
+/// a UI request can reserve a newer generation while OpenClipboard runs.
+/// Once SetClipboardData succeeds, that allocation is system-owned.
 #[cfg(any(windows, test))]
 fn write_image_clipboard_if_latest<A: ClipboardImageApi>(
     api: &mut A,
     dib: &[u8],
     dib_format: u32,
     nonce: &[u8],
-    is_latest: impl FnOnce() -> bool,
-) -> bool {
+    baseline: Option<u32>,
+    mut is_latest: impl FnMut() -> bool,
+) -> ClipboardImageWriteResult {
     if !is_latest() {
-        return false;
+        return ClipboardImageWriteResult::Superseded;
     }
-    let Some(image) = prepare_clipboard_memory(api, dib, "image") else {
-        return false;
+    let image = match prepare_clipboard_memory(api, dib, "image") {
+        Ok(image) => image,
+        Err(error) => return ClipboardImageWriteResult::Failed(error),
     };
     if let Err(error) = api.open() {
-        api.log(format!("OpenClipboard for image failed: {error}"));
+        let message = format!("OpenClipboard for image failed: {error}");
+        api.log(message.clone());
         free_clipboard_memory(api, image, "image");
-        return false;
+        return ClipboardImageWriteResult::Failed(message);
     }
-    let copied = match api.empty() {
-        Err(error) => {
-            api.log(format!("EmptyClipboard for image failed: {error}"));
-            free_clipboard_memory(api, image, "image");
-            false
-        }
-        Ok(()) => match api.set_data(dib_format, image) {
+    // Both rejection paths retain the previous clipboard and close the open
+    // interval below. Existing writers deliberately do not inspect OS sequence.
+    let copied = if !is_latest() {
+        free_clipboard_memory(api, image, "image");
+        ClipboardImageWriteResult::Superseded
+    } else if baseline.is_some_and(|expected| api.sequence_number() != expected) {
+        free_clipboard_memory(api, image, "image");
+        ClipboardImageWriteResult::ClipboardChanged
+    } else {
+        match api.empty() {
             Err(error) => {
-                api.log(format!("SetClipboardData for image failed: {error}"));
+                let message = format!("EmptyClipboard for image failed: {error}");
+                api.log(message.clone());
                 free_clipboard_memory(api, image, "image");
-                false
+                ClipboardImageWriteResult::Failed(message)
             }
-            Ok(()) => {
-                // Marker failures must never undo or prevent the saved CF_DIB.
-                match api.register_origin() {
-                    Err(error) => api.log(format!(
-                        "Clipboard image origin format registration failed: {error}"
-                    )),
-                    Ok(format) => {
-                        if let Some(marker) = prepare_clipboard_memory(api, nonce, "image origin") {
-                            if let Err(error) = api.set_data(format, marker) {
+            Ok(()) => match api.set_data(dib_format, image) {
+                Err(error) => {
+                    let message = format!("SetClipboardData for image failed: {error}");
+                    api.log(message.clone());
+                    free_clipboard_memory(api, image, "image");
+                    ClipboardImageWriteResult::Failed(message)
+                }
+                Ok(()) => {
+                    // Marker failures must never undo or prevent the saved CF_DIB.
+                    match api.register_origin() {
+                        Err(error) => api.log(format!(
+                            "Clipboard image origin format registration failed: {error}"
+                        )),
+                        Ok(format) => {
+                            if let Ok(marker) = prepare_clipboard_memory(api, nonce, "image origin")
+                                && let Err(error) = api.set_data(format, marker)
+                            {
                                 api.log(format!(
                                     "SetClipboardData for image origin failed: {error}"
                                 ));
@@ -2724,10 +2931,10 @@ fn write_image_clipboard_if_latest<A: ClipboardImageApi>(
                             }
                         }
                     }
+                    ClipboardImageWriteResult::Written
                 }
-                true
-            }
-        },
+            },
+        }
     };
     if let Err(error) = api.close() {
         api.log(format!("CloseClipboard for image failed: {error}"));
@@ -2803,6 +3010,10 @@ impl ClipboardImageApi for NativeClipboardImageApi {
 
     fn open(&mut self) -> Result<(), Self::Error> {
         unsafe { windows::Win32::System::DataExchange::OpenClipboard(None) }
+    }
+
+    fn sequence_number(&mut self) -> u32 {
+        unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() }
     }
 
     fn empty(&mut self) -> Result<(), Self::Error> {
@@ -3142,6 +3353,547 @@ fn open_folder_in_explorer(path: &std::path::Path) {
 }
 
 #[cfg(test)]
+mod copy_action_tests {
+    use super::*;
+    use crate::keymap::KeyAction;
+
+    fn actions() -> [(KeyAction, KeyAction, MenuCommand); 5] {
+        use KeyAction::*;
+        [
+            (GridCopyFiles, FsCopyFiles, MenuCommand::CopyFiles),
+            (GridCopyPath, FsCopyPath, MenuCommand::CopyPath),
+            (GridCopyFileName, FsCopyFileName, MenuCommand::CopyFileName),
+            (
+                GridCopyImage,
+                FsCopyImage,
+                MenuCommand::CopyImageToClipboard,
+            ),
+            (
+                GridCopyEditedImage,
+                FsCopyEditedImage,
+                MenuCommand::CopyEditedImageToClipboard,
+            ),
+        ]
+    }
+
+    fn take_copied_text(ctx: &egui::Context) -> Vec<String> {
+        ctx.output_mut(|out| {
+            std::mem::take(&mut out.commands)
+                .into_iter()
+                .filter_map(|command| {
+                    if let egui::OutputCommand::CopyText(text) = command {
+                        Some(text)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+    }
+
+    fn bookmark_rows() -> Vec<crate::bookmark_browser::BookmarkBrowserRow> {
+        use crate::book_bookmarks::{BookBookmark, BookContainerKind, PageIdentity};
+        use crate::bookmark_browser::{BookmarkBrowserRow, BookmarkRowSource};
+        let mut rows = Vec::new();
+        for (kind, source, item, page_identity) in [
+            (
+                BookContainerKind::CompiledBook,
+                r"C:/media/製本",
+                GridItem::Image(PathBuf::from(r"C:\media\製本\page.jpg")),
+                PageIdentity::RelativePath("page.jpg".into()),
+            ),
+            (
+                BookContainerKind::ImageFolder,
+                r"C:/media/画像本",
+                GridItem::Image(PathBuf::from(r"C:\media\画像本\page.jpg")),
+                PageIdentity::RelativePath("page.jpg".into()),
+            ),
+            (
+                BookContainerKind::Zip,
+                r"C:/media/book.zip",
+                GridItem::ZipImage {
+                    zip_path: PathBuf::from(r"C:\media\book.zip"),
+                    entry_name: "page.jpg".into(),
+                },
+                PageIdentity::ArchiveEntry("page.jpg".into()),
+            ),
+            (
+                BookContainerKind::Pdf,
+                r"C:/media/book.pdf",
+                GridItem::PdfPage {
+                    pdf_path: PathBuf::from(r"C:\media\book.pdf"),
+                    page_num: 2,
+                    content_type: None,
+                },
+                PageIdentity::PdfPage(2),
+            ),
+            (
+                BookContainerKind::OtherArchive,
+                r"C:/media/book.7z",
+                GridItem::ZipImage {
+                    zip_path: PathBuf::from(r"C:\cache\converted.zip"),
+                    entry_name: "page.jpg".into(),
+                },
+                PageIdentity::ArchiveEntry("page.jpg".into()),
+            ),
+        ] {
+            rows.push(BookmarkBrowserRow {
+                source: BookmarkRowSource::Book(BookBookmark {
+                    id: rows.len() as i64,
+                    container_key: source.into(),
+                    container_path: source.into(),
+                    container_kind: kind,
+                    page_identity,
+                    page_index_hint: 2,
+                    created_at_ms: 0,
+                    title: None,
+                }),
+                item,
+                relative_page_provenance: None,
+                image_meta: None,
+                marker_thumbnail: None,
+                created_at_ms: 0,
+                missing: false,
+            });
+        }
+        for is_audio in [false, true] {
+            let path = PathBuf::from(if is_audio {
+                r"C:/media/audio.flac"
+            } else {
+                r"C:/media/video.mp4"
+            });
+            rows.push(BookmarkBrowserRow {
+                source: BookmarkRowSource::Media {
+                    id: 10,
+                    path: path.clone(),
+                    pts_secs: 4.5,
+                    title: None,
+                    is_audio,
+                },
+                item: if is_audio {
+                    GridItem::Audio(path)
+                } else {
+                    GridItem::Video(path)
+                },
+                relative_page_provenance: None,
+                image_meta: None,
+                marker_thumbnail: None,
+                created_at_ms: 0,
+                missing: false,
+            });
+        }
+        rows
+    }
+
+    #[test]
+    fn bookmark_copy_actions_preserve_original_source_text_and_ignore_checks() {
+        use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+        let mut app = crate::app::setup_app_for_test();
+        app.items_are_bookmark_view = true;
+        app.bookmark_browser_rows = bookmark_rows();
+        app.items = app
+            .bookmark_browser_rows
+            .iter()
+            .map(|row| row.item.clone())
+            .collect();
+        let ctx = egui::Context::default();
+        for idx in 0..app.items.len() {
+            app.selected = Some(idx);
+            for checked in [false, true] {
+                app.checked.clear();
+                if checked {
+                    app.checked.extend([0, 2, 3]);
+                }
+                // Before this change the dedicated menu called exactly this helper.
+                copy_path_text(&ctx, app.bookmark_browser_rows[idx].source_path());
+                let expected = take_copied_text(&ctx);
+                assert_eq!(expected.len(), 1);
+                let target = app.context_menu_target(
+                    idx,
+                    app.items[idx].clone(),
+                    false,
+                    false,
+                    None,
+                    ContextMenuSurface::Grid,
+                    None,
+                );
+                let _ =
+                    app.dispatch_native_grid_context_command(&ctx, MenuCommand::CopyPath, &target);
+                assert_eq!(take_copied_text(&ctx), expected);
+                app.execute_copy_key_action(&ctx, KeyAction::GridCopyPath);
+                assert_eq!(take_copied_text(&ctx), expected);
+                let _ = app.apply_ring_action(
+                    &ctx,
+                    RingShortcutContext::Grid,
+                    RingActionId::ImageCopyPath,
+                    "bookmark-copy-test",
+                );
+                assert_eq!(take_copied_text(&ctx), expected);
+                for action in [
+                    KeyAction::GridCopyFileName,
+                    KeyAction::GridCopyImage,
+                    KeyAction::GridCopyEditedImage,
+                ] {
+                    app.dispatch_copy_key_action_with(&ctx, action, |_, _, _, _| {
+                        panic!("not offered by the bookmark menu")
+                    });
+                }
+                app.dispatch_copy_key_action_with(
+                    &ctx,
+                    KeyAction::GridCopyFiles,
+                    |app, _, command, target| {
+                        assert_eq!(command, MenuCommand::CopyFiles);
+                        match app.collect_shell_clipboard_paths() {
+                            Ok(paths) => assert_eq!(target.shell_paths.as_ref(), Some(&paths)),
+                            Err(_) => assert!(target.shell_paths.is_none()),
+                        }
+                    },
+                );
+            }
+        }
+        // The menu request owns its source even if the live sidecar is later replaced.
+        let target = app.context_menu_target(
+            0,
+            app.items[0].clone(),
+            false,
+            false,
+            None,
+            ContextMenuSurface::Grid,
+            None,
+        );
+        copy_path_text(&ctx, app.bookmark_browser_rows[0].source_path());
+        let expected = take_copied_text(&ctx);
+        app.bookmark_browser_rows.clear();
+        let _ = app.dispatch_native_grid_context_command(&ctx, MenuCommand::CopyPath, &target);
+        assert_eq!(take_copied_text(&ctx), expected);
+        app.execute_copy_key_action(&ctx, KeyAction::GridCopyPath);
+        assert!(take_copied_text(&ctx).is_empty());
+    }
+
+    #[test]
+    fn bookmark_menu_keeps_its_existing_entries_and_copy_click_result() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        for (checked, missing) in [(false, false), (true, false), (true, true)] {
+            let mut app = crate::app::setup_app_for_test();
+            app.items_are_bookmark_view = true;
+            app.bookmark_browser_rows = bookmark_rows();
+            app.bookmark_browser_rows[1].missing = missing;
+            app.items = app
+                .bookmark_browser_rows
+                .iter()
+                .map(|row| row.item.clone())
+                .collect();
+            app.selected = Some(1);
+            if checked {
+                app.checked.extend([2, 3]);
+            }
+            app.context_menu_idx = Some(app.capture_grid_context_menu_owner(1));
+            let expected = native_path_text(app.bookmark_browser_rows[1].source_path());
+            let mut fonts_ready = false;
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(560.0, 320.0))
+                .build_ui_state(
+                    move |ui, (app, copied): &mut (crate::app::AppTestEnvForTest, Vec<String>)| {
+                        if !fonts_ready {
+                            crate::ui_fonts::configure_fonts(ui.ctx());
+                            fonts_ready = true;
+                            ui.ctx().request_repaint();
+                            return;
+                        }
+                        if app.context_menu_idx.is_some() {
+                            let _ = app.show_bookmark_grid_context_menu(ui.ctx(), 1);
+                        }
+                        copied.extend(take_copied_text(ui.ctx()));
+                    },
+                    (app, Vec::new()),
+                );
+            harness.run();
+            let delete = if checked {
+                "ブックマークを 2 件削除"
+            } else {
+                "ブックマークを削除"
+            };
+            let labels = [
+                "ブックマーク位置を開く",
+                "パスをコピー",
+                "このフォルダをエクスプローラで開く",
+                delete,
+            ];
+            let rects: Vec<_> = labels
+                .iter()
+                .map(|label| harness.get_by_label(label).rect())
+                .collect();
+            assert!(
+                rects
+                    .windows(2)
+                    .all(|pair| pair[0].bottom() <= pair[1].top())
+            );
+            assert_eq!(
+                harness
+                    .get_by_label(labels[0])
+                    .accesskit_node()
+                    .is_disabled(),
+                missing
+            );
+            for label in [
+                "コピー",
+                "ファイル名をコピー",
+                "画像をクリップボードにコピー",
+                "編集を反映した画像をコピー",
+            ] {
+                assert!(harness.query_by_label(label).is_none(), "{label}");
+            }
+            harness.get_by_label("パスをコピー").click();
+            harness.run();
+            assert_eq!(harness.state().1, vec![expected]);
+            assert!(harness.state().0.context_menu_idx.is_none());
+        }
+    }
+
+    #[test]
+    fn drive_items_have_no_new_copy_menu_but_background_and_legacy_copy_stay_available() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items_are_drive_list = true;
+        app.items = vec![GridItem::Folder(PathBuf::from(r"C:\"))];
+        app.selected = Some(0);
+        let ctx = egui::Context::default();
+        for action in [
+            KeyAction::GridCopyPath,
+            KeyAction::GridCopyFileName,
+            KeyAction::GridCopyImage,
+            KeyAction::GridCopyEditedImage,
+        ] {
+            app.dispatch_copy_key_action_with(&ctx, action, |_, _, _, _| {
+                panic!("drive items have no item menu")
+            });
+        }
+        let mut called = false;
+        app.dispatch_copy_key_action_with(
+            &ctx,
+            KeyAction::GridCopyFiles,
+            |_, _, command, target| {
+                called = true;
+                assert_eq!(command, MenuCommand::CopyFiles);
+                assert_eq!(
+                    target.shell_paths.as_ref(),
+                    Some(&vec![PathBuf::from(r"C:\")])
+                );
+            },
+        );
+        assert!(called);
+        for bookmark_background in [false, true] {
+            app.items_are_drive_list = !bookmark_background;
+            app.items_are_bookmark_view = bookmark_background;
+            let path = PathBuf::from(r"C:\grid-background");
+            let target = app.context_menu_target(
+                usize::MAX,
+                GridItem::Folder(path.clone()),
+                true,
+                false,
+                Some(path.clone()),
+                ContextMenuSurface::Grid,
+                None,
+            );
+            let nodes = app.context_menu_nodes(&target, false);
+            assert!(nodes.iter().any(|node| matches!(
+                node,
+                MenuNode::Item {
+                    command: MenuCommand::CopyPath,
+                    ..
+                }
+            )));
+            let _ = app.dispatch_native_grid_context_command(&ctx, MenuCommand::CopyPath, &target);
+            assert_eq!(take_copied_text(&ctx), vec![native_path_text(&path)]);
+        }
+    }
+
+    #[test]
+    fn every_copy_action_dispatches_the_item_menu_command_and_target() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(PathBuf::from(r"C:\media\cursor.jpg")),
+            GridItem::Image(PathBuf::from(r"C:\media\viewer.jpg")),
+        ];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(1);
+        let ctx = egui::Context::default();
+        for (grid, fs, expected_command) in actions() {
+            for (action, idx, surface) in [
+                (grid, 0, ContextMenuSurface::Grid),
+                (fs, 1, ContextMenuSurface::Fullscreen),
+            ] {
+                let expected = app.context_menu_target(
+                    idx,
+                    app.items[idx].clone(),
+                    false,
+                    false,
+                    None,
+                    surface,
+                    None,
+                );
+                let mut called = false;
+                app.dispatch_copy_key_action_with(&ctx, action, |_, _, command, target| {
+                    called = true;
+                    assert_eq!(command, expected_command);
+                    assert_eq!(target.item_index, expected.item_index);
+                    assert_eq!(target.item.name(), expected.item.name());
+                    assert_eq!(target.surface, expected.surface);
+                    assert_eq!(target.shell_paths, expected.shell_paths);
+                    assert_eq!(target.has_checked, expected.has_checked);
+                });
+                assert!(called, "{action:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn copy_actions_keep_checked_menu_rules_and_fullscreen_ignores_checks() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Folder(PathBuf::from(r"C:\media\folder")),
+            GridItem::Image(PathBuf::from(r"C:\media\viewer.jpg")),
+        ];
+        app.selected = Some(1);
+        app.fullscreen_idx = Some(1);
+        app.checked.extend([0, 1]);
+        let paths = app.collect_shell_clipboard_paths().unwrap();
+        let ctx = egui::Context::default();
+        for (grid, fs, command) in actions() {
+            let mut called = false;
+            app.dispatch_copy_key_action_with(&ctx, grid, |_, _, found, target| {
+                called = true;
+                assert_eq!(found, command);
+                assert!(target.has_checked);
+                assert_eq!(target.real_paths, paths);
+                assert_eq!(target.shell_paths.as_ref(), Some(&paths));
+            });
+            assert_eq!(
+                called,
+                matches!(grid, KeyAction::GridCopyFiles | KeyAction::GridCopyPath)
+            );
+            app.dispatch_copy_key_action_with(&ctx, fs, |_, _, found, target| {
+                assert_eq!(found, command);
+                assert!(!target.has_checked);
+                assert_eq!(
+                    target.shell_paths.as_ref(),
+                    Some(&vec![PathBuf::from(r"C:\media\viewer.jpg")])
+                );
+            });
+        }
+        app.selected = None;
+        let mut called = false;
+        app.dispatch_copy_key_action_with(
+            &ctx,
+            KeyAction::GridCopyFiles,
+            |_, _, command, target| {
+                called = true;
+                assert_eq!(command, MenuCommand::CopyFiles);
+                assert_eq!(target.shell_paths.as_ref(), Some(&paths));
+            },
+        );
+        assert!(called);
+    }
+
+    #[test]
+    fn copy_actions_share_pdf_menu_aliases_and_reject_non_image_targets() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: PathBuf::from(r"C:\media\book.pdf"),
+            page_num: 2,
+            content_type: None,
+        }];
+        app.selected = Some(0);
+        let ctx = egui::Context::default();
+        app.dispatch_copy_key_action_with(
+            &ctx,
+            KeyAction::GridCopyFileName,
+            |_, _, command, target| {
+                assert_eq!(command, MenuCommand::CopyPageName);
+                assert_eq!(target.item_index, Some(0));
+            },
+        );
+        app.dispatch_copy_key_action_with(&ctx, KeyAction::GridCopyImage, |_, _, _, _| {
+            panic!("PDF has no unedited image copy menu entry")
+        });
+        app.items[0] = GridItem::Folder(PathBuf::from(r"C:\media\folder"));
+        for action in [KeyAction::GridCopyImage, KeyAction::GridCopyEditedImage] {
+            app.dispatch_copy_key_action_with(&ctx, action, |_, _, _, _| {
+                panic!("folder has no image copy menu entry")
+            });
+        }
+    }
+
+    #[test]
+    fn key_and_ring_text_copy_outputs_match_the_actual_menu_dispatch() {
+        use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(PathBuf::from(r"C:\media\cursor.jpg")),
+            GridItem::Image(PathBuf::from(r"C:\media\viewer.jpg")),
+        ];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(1);
+        let ctx = egui::Context::default();
+        let take_text = || {
+            ctx.output_mut(|out| {
+                std::mem::take(&mut out.commands)
+                    .into_iter()
+                    .filter_map(|command| {
+                        if let egui::OutputCommand::CopyText(text) = command {
+                            Some(text)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        for (context, idx, surface, path_key, name_key) in [
+            (
+                RingShortcutContext::Grid,
+                0,
+                ContextMenuSurface::Grid,
+                KeyAction::GridCopyPath,
+                KeyAction::GridCopyFileName,
+            ),
+            (
+                RingShortcutContext::ImageFullscreen,
+                1,
+                ContextMenuSurface::Fullscreen,
+                KeyAction::FsCopyPath,
+                KeyAction::FsCopyFileName,
+            ),
+        ] {
+            for (key, ring, command) in [
+                (path_key, RingActionId::ImageCopyPath, MenuCommand::CopyPath),
+                (
+                    name_key,
+                    RingActionId::ImageCopyFileName,
+                    MenuCommand::CopyFileName,
+                ),
+            ] {
+                let target = app.context_menu_target(
+                    idx,
+                    app.items[idx].clone(),
+                    false,
+                    false,
+                    None,
+                    surface,
+                    None,
+                );
+                let _ = app.dispatch_native_grid_context_command(&ctx, command, &target);
+                let expected = take_text();
+                assert_eq!(expected.len(), 1);
+                app.execute_copy_key_action(&ctx, key);
+                assert_eq!(take_text(), expected);
+                let _ = app.apply_ring_action(&ctx, context, ring, "copy-test");
+                assert_eq!(take_text(), expected);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod raw_clipboard_tests {
     use super::*;
     use image::GenericImageView;
@@ -3276,6 +4028,7 @@ mod delete_confirm_tests {
             checked_file_operation_selection: CheckedFileOperationSelection::Empty,
             item,
             item_index: Some(0),
+            copy_subject: ItemCopyMenuSubject::Item,
             is_folder_context: false,
             has_checked: false,
             checked_count: 0,
@@ -3905,6 +4658,7 @@ mod delete_confirm_tests {
             checked_file_operation_selection: CheckedFileOperationSelection::RealOnly,
             item: GridItem::Image(PathBuf::from(r"C:\media\clicked.jpg")),
             item_index: Some(0),
+            copy_subject: ItemCopyMenuSubject::Item,
             is_folder_context: false,
             has_checked: true,
             checked_count: 1,
@@ -4863,6 +5617,10 @@ mod delete_confirm_tests {
 #[cfg(test)]
 mod clipboard_image_writer_tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    };
 
     const DIB_FORMAT: u32 = 8;
     const ORIGIN_FORMAT: u32 = 0xc001;
@@ -4880,6 +5638,10 @@ mod clipboard_image_writer_tests {
         transferred: Vec<(u32, usize)>,
         payloads: Vec<(usize, Vec<u8>)>,
         opened: bool,
+        os_sequence: Arc<AtomicU32>,
+        on_open: Option<Box<dyn FnOnce() + Send>>,
+        on_empty: Option<Box<dyn FnOnce() + Send>>,
+        on_sequence: Option<Box<dyn FnOnce() + Send>>,
     }
 
     impl FakeClipboardImageApi {
@@ -4900,7 +5662,12 @@ mod clipboard_image_writer_tests {
         }
 
         fn write(&mut self) -> bool {
-            write_image_clipboard_if_latest(self, DIB, DIB_FORMAT, NONCE, || true)
+            write_image_clipboard_if_latest(self, DIB, DIB_FORMAT, NONCE, None, || true)
+                == ClipboardImageWriteResult::Written
+        }
+
+        fn write_edited(&mut self, baseline: u32) -> ClipboardImageWriteResult {
+            write_image_clipboard_if_latest(self, DIB, DIB_FORMAT, NONCE, Some(baseline), || true)
         }
     }
 
@@ -4954,12 +5721,28 @@ mod clipboard_image_writer_tests {
             assert!(!self.opened);
             self.result("open")?;
             self.opened = true;
+            if let Some(on_open) = self.on_open.take() {
+                on_open();
+            }
             Ok(())
+        }
+
+        fn sequence_number(&mut self) -> u32 {
+            self.events.push("sequence");
+            if let Some(on_sequence) = self.on_sequence.take() {
+                on_sequence();
+            }
+            self.os_sequence.load(Ordering::Relaxed)
         }
 
         fn empty(&mut self) -> Result<(), Self::Error> {
             assert!(self.opened);
-            self.result("empty")
+            self.result("empty")?;
+            if let Some(on_empty) = self.on_empty.take() {
+                on_empty();
+            }
+            self.os_sequence.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
 
         fn set_data(&mut self, format: u32, memory: usize) -> Result<(), Self::Error> {
@@ -4972,6 +5755,7 @@ mod clipboard_image_writer_tests {
                 "set_origin"
             })?;
             self.transferred.push((format, memory));
+            self.os_sequence.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
 
@@ -5078,19 +5862,299 @@ mod clipboard_image_writer_tests {
     fn obsolete_generation_does_not_allocate_open_or_write() {
         let mut api = FakeClipboardImageApi::default();
         let mut checks = 0;
-        assert!(!write_image_clipboard_if_latest(
+        assert_eq!(
+            write_image_clipboard_if_latest(&mut api, DIB, DIB_FORMAT, NONCE, Some(0), || {
+                checks += 1;
+                false
+            }),
+            ClipboardImageWriteResult::Superseded
+        );
+        assert_eq!(checks, 1);
+        assert!(api.events.is_empty());
+        assert!(api.logs.is_empty());
+    }
+
+    #[test]
+    fn newer_request_during_open_stops_existing_and_edited_writers_before_empty() {
+        for baseline in [None, Some(0)] {
+            let generation = Arc::new(AtomicU64::new(1));
+            let during_open = generation.clone();
+            let mut api = FakeClipboardImageApi {
+                on_open: Some(Box::new(move || {
+                    during_open.store(2, Ordering::Relaxed);
+                })),
+                ..Default::default()
+            };
+            let mut checks = 0;
+            let result =
+                write_image_clipboard_if_latest(&mut api, DIB, DIB_FORMAT, NONCE, baseline, || {
+                    checks += 1;
+                    generation.load(Ordering::Relaxed) == 1
+                });
+            assert_eq!(result, ClipboardImageWriteResult::Superseded);
+            assert_eq!(
+                checks, 2,
+                "pre-open short circuit and authoritative post-open check"
+            );
+            assert_eq!(api.freed, vec![1]);
+            assert!(api.transferred.is_empty());
+            assert!(!api.events.contains(&"empty"));
+            assert!(
+                !api.events.contains(&"sequence"),
+                "mIV supersession takes priority"
+            );
+            assert_eq!(api.events.last(), Some(&"close"));
+            assert!(!api.opened);
+            assert!(api.logs.is_empty());
+        }
+    }
+
+    #[test]
+    fn edited_writer_checks_os_generation_inside_open_before_empty() {
+        let mut api = FakeClipboardImageApi::default();
+        assert_eq!(api.write_edited(0), ClipboardImageWriteResult::Written);
+        let open = api
+            .events
+            .iter()
+            .position(|event| *event == "open")
+            .unwrap();
+        let sequence = api
+            .events
+            .iter()
+            .position(|event| *event == "sequence")
+            .unwrap();
+        let empty = api
+            .events
+            .iter()
+            .position(|event| *event == "empty")
+            .unwrap();
+        assert!(open < sequence && sequence < empty);
+        assert_eq!(
+            api.events
+                .iter()
+                .filter(|event| **event == "sequence")
+                .count(),
+            1
+        );
+        assert_eq!(api.transferred, vec![(DIB_FORMAT, 1), (ORIGIN_FORMAT, 2)]);
+        assert_eq!(api.events.last(), Some(&"close"));
+        assert!(!api.opened);
+    }
+
+    #[test]
+    fn os_generation_changed_during_open_is_detected_before_empty() {
+        let os_sequence = Arc::new(AtomicU32::new(23));
+        let during_open = os_sequence.clone();
+        let mut api = FakeClipboardImageApi {
+            os_sequence,
+            on_open: Some(Box::new(move || {
+                during_open.store(24, Ordering::Relaxed);
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            api.write_edited(23),
+            ClipboardImageWriteResult::ClipboardChanged
+        );
+        assert_eq!(api.freed, vec![1]);
+        assert!(!api.events.contains(&"empty"));
+        assert!(api.transferred.is_empty());
+        assert_eq!(api.events.last(), Some(&"close"));
+        assert!(!api.opened);
+    }
+
+    #[test]
+    fn text_or_external_copy_after_request_preserves_clipboard_and_reports_changed() {
+        let generation = AtomicU64::new(9);
+        let mut api = FakeClipboardImageApi::default();
+        let request = request_edited_clipboard_write_with(&mut api, || {
+            generation.fetch_add(1, Ordering::Relaxed) + 1
+        });
+        // Text copies need not reserve an mIV image generation.
+        api.os_sequence.fetch_add(1, Ordering::Relaxed);
+        let result = write_image_clipboard_if_latest(
             &mut api,
             DIB,
             DIB_FORMAT,
             NONCE,
-            || {
-                checks += 1;
-                false
-            }
-        ));
-        assert_eq!(checks, 1);
-        assert!(api.events.is_empty());
+            Some(request.baseline),
+            || generation.load(Ordering::Relaxed) == request.my_seq,
+        );
+        assert_eq!(result, ClipboardImageWriteResult::ClipboardChanged);
+        assert_eq!(api.freed, vec![1]);
+        assert!(!api.events.contains(&"empty"));
+        assert_eq!(api.events.last(), Some(&"close"));
         assert!(api.logs.is_empty());
+        assert!(!api.opened);
+    }
+
+    #[test]
+    fn request_after_finished_copy_records_new_baseline_and_can_write() {
+        let generation = Arc::new(AtomicU64::new(0));
+        let os_sequence = Arc::new(AtomicU32::new(50));
+        let mut first = FakeClipboardImageApi {
+            os_sequence: os_sequence.clone(),
+            ..Default::default()
+        };
+        assert!(first.write());
+        let mut second = FakeClipboardImageApi {
+            os_sequence,
+            ..Default::default()
+        };
+        let reserved = generation.clone();
+        second.on_sequence = Some(Box::new(move || {
+            assert_eq!(
+                reserved.load(Ordering::Relaxed),
+                1,
+                "reserve before OS baseline"
+            );
+        }));
+        let request = request_edited_clipboard_write_with(&mut second, || {
+            generation.fetch_add(1, Ordering::Relaxed) + 1
+        });
+        assert_eq!(request.baseline, 53);
+        assert_eq!(
+            write_image_clipboard_if_latest(
+                &mut second,
+                DIB,
+                DIB_FORMAT,
+                NONCE,
+                Some(request.baseline),
+                || generation.load(Ordering::Relaxed) == request.my_seq,
+            ),
+            ClipboardImageWriteResult::Written
+        );
+        assert_eq!(second.transferred.len(), 2);
+        assert!(!second.opened);
+    }
+
+    #[test]
+    fn request_during_previous_write_conservatively_reports_clipboard_changed() {
+        let os_sequence = Arc::new(AtomicU32::new(50));
+        let request_sequence = os_sequence.clone();
+        let (request_tx, request_rx) = mpsc::channel();
+        let mut first = FakeClipboardImageApi {
+            os_sequence: os_sequence.clone(),
+            on_empty: Some(Box::new(move || {
+                let mut request_api = FakeClipboardImageApi {
+                    os_sequence: request_sequence,
+                    ..Default::default()
+                };
+                request_tx
+                    .send(request_edited_clipboard_write_with(&mut request_api, || 2))
+                    .unwrap();
+            })),
+            ..Default::default()
+        };
+        // A passed its final check; B reserves during A's OS write interval.
+        assert!(first.write());
+        let request = request_rx.try_recv().unwrap();
+        let mut second = FakeClipboardImageApi {
+            os_sequence,
+            ..Default::default()
+        };
+        assert_eq!(
+            second.write_edited(request.baseline),
+            ClipboardImageWriteResult::ClipboardChanged
+        );
+        assert!(!second.events.contains(&"empty"));
+        assert!(!second.opened);
+    }
+
+    #[test]
+    fn existing_writer_does_not_read_or_compare_os_generation() {
+        let mut api = FakeClipboardImageApi::default();
+        api.os_sequence.store(734, Ordering::Relaxed);
+        assert!(api.write());
+        assert!(!api.events.contains(&"sequence"));
+        assert_eq!(api.transferred.len(), 2);
+    }
+
+    #[test]
+    fn request_returns_while_writer_mutex_is_held_and_empty_waits_for_ui() {
+        use std::time::Duration;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _lock = CLIPBOARD_WRITE_MUTEX.lock().unwrap();
+            let mut api = FakeClipboardImageApi {
+                on_empty: Some(Box::new(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                })),
+                ..Default::default()
+            };
+            assert!(api.write());
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (request_tx, request_rx) = mpsc::channel();
+        let requester = std::thread::spawn(move || {
+            let mut api = FakeClipboardImageApi::default();
+            let request = request_edited_clipboard_write_with(&mut api, || 42);
+            request_tx.send(request).unwrap();
+        });
+        let result = request_rx.recv_timeout(Duration::from_secs(2));
+        // Release before asserting so a regression cannot strand the writer.
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        requester.join().unwrap();
+        assert_eq!(result.unwrap().my_seq, 42);
+    }
+
+    #[test]
+    fn generation_rejection_still_attempts_close_when_free_or_close_fails() {
+        for failures in [&["free"][..], &["close"][..]] {
+            let mut api = FakeClipboardImageApi::with_failures(failures);
+            let mut checks = 0;
+            let result =
+                write_image_clipboard_if_latest(&mut api, DIB, DIB_FORMAT, NONCE, None, || {
+                    checks += 1;
+                    checks == 1
+                });
+            assert_eq!(result, ClipboardImageWriteResult::Superseded);
+            assert_eq!(api.events.last(), Some(&"close"));
+            assert!(!api.events.contains(&"empty"));
+            assert_eq!(api.logs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn edited_writer_failures_return_logged_reason() {
+        for failure in ["alloc_image", "lock_image", "open", "empty", "set_image"] {
+            let mut api = FakeClipboardImageApi::with_failures(&[failure]);
+            let ClipboardImageWriteResult::Failed(reason) = api.write_edited(0) else {
+                panic!("expected failure for {failure}");
+            };
+            assert!(reason.contains(failure));
+            assert_eq!(api.logs, vec![reason]);
+            assert!(!api.opened);
+        }
+    }
+
+    #[test]
+    fn dib_encoding_retains_bottom_up_bgr_zero_padding_and_discards_alpha() {
+        let dib = build_clipboard_dib(1, 2, &[1, 2, 3, 7, 8, 9, 10, 0]).unwrap();
+        let mut header = vec![0u8; 40];
+        header[..4].copy_from_slice(&40u32.to_le_bytes());
+        header[4..8].copy_from_slice(&1i32.to_le_bytes());
+        header[8..12].copy_from_slice(&2i32.to_le_bytes());
+        header[12..14].copy_from_slice(&1u16.to_le_bytes());
+        header[14..16].copy_from_slice(&24u16.to_le_bytes());
+        assert_eq!(&dib[..40], header);
+        assert_eq!(&dib[40..], &[10, 9, 8, 0, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn dib_rejects_invalid_dimensions_and_pixel_lengths() {
+        for (width, height, pixels) in [
+            (0, 1, &[][..]),
+            (1, 0, &[][..]),
+            (1, 1, &[1, 2, 3][..]),
+            (u32::MAX, 1, &[][..]),
+            (1, u32::MAX, &[][..]),
+        ] {
+            assert!(build_clipboard_dib(width, height, pixels).is_err());
+        }
     }
 
     #[test]

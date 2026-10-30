@@ -339,8 +339,14 @@ fn d3_entry_connections_and_receiver_contract() {
         "self.service_final_prepare_before_lookup(ctx);",
         "self.flush_submitted_page_turn_ready(ctx);",
     );
+    // Renderer fixtures can also iterate `events`; inspect the production
+    // dispatcher whose per-event lookup boundary this contract protects.
+    let gamepad_dispatch = gamepad
+        .split_once("fn dispatch_gamepad_batch_with_admission(")
+        .unwrap()
+        .1;
     ordered(
-        gamepad,
+        gamepad_dispatch,
         "for event in events {",
         "self.service_final_prepare_before_lookup(ctx);",
         "match event",

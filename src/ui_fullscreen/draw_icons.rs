@@ -267,7 +267,7 @@ pub(crate) fn draw_seek_strip_lock_button_visual(
 }
 
 /// 「その他の機能」ボタン。font glyph に頼らず、3 点を vector で描く。
-pub(super) fn draw_more_icon(painter: &egui::Painter, center: egui::Pos2, _r: f32) {
+pub(crate) fn draw_more_icon(painter: &egui::Painter, center: egui::Pos2, _r: f32) {
     for offset in [-7.0, 0.0, 7.0] {
         painter.circle_filled(center + egui::vec2(offset, 0.0), 2.0, egui::Color32::WHITE);
     }

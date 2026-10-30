@@ -3,19 +3,13 @@
     "operation": "insert_note",
     "heading_id": "基本操作---effetune",
     "note": "初めて EffeTune の画面を開くと、エフェクトの追加や音の調整に使う場所を案内します。設定メニューの **画面の案内を見る** から、いつでも見直せます。案内中の「DAW」は、ここでは音声を渡す mImageViewer を指します。音楽や動画は mImageViewer で再生してください。",
-    "reason": "v0.14.0 effetune.html:181 and js/ui/state-manager.js:126-127 use tour.menu; js/locales/ja.json5:2,10-12 provide the Japanese label and VST host wording. No standalone Help menu."
+    "reason": "v0.15.0 effetune.html:181 and js/ui/state-manager.js:126-127 use tour.menu; js/locales/ja.json5:2,10-12 provide the Japanese label and VST host wording. No standalone Help menu."
   },
   {
     "operation": "replace_paragraph",
-    "anchor": "PCではヘッダー、モバイルでは **プレーヤー** タブ、デスクトップアプリでは **表示** メニューから **Visualizer** を開きます。組み込みプリセットを選ぶか **Edit** で音声グラフ、ジャケット画像、曲情報を配置できます。変更はすぐに反映され、次回起動時にも復元されます。名前を付けて残すにはプリセットダイアログで保存します。詳しくは[Visualizerガイド](visualizer.md)をご覧ください。",
+    "anchor": "PCではヘッダー、モバイルでは **プレーヤー** タブ、デスクトップアプリでは **表示** メニューから **Visualizer** を開きます。組み込みのレイアウトを選ぶか、**Edit** で音声グラフ、ジャケット画像、曲情報を配置できます。変更はすぐに反映され、次回起動時にも復元されます。名前を付けて残すにはプリセットダイアログで保存します。表示の上にマウスを置くかタップして **⛶** を選ぶと、アプリのウィンドウいっぱいに表示されます。編集、エフェクト、表示オプションについては[Visualizerガイド](visualizer.md)をご覧ください。",
     "replacement": "EffeTune 画面のヘッダーにある **Visualizer** ボタンで開きます。組み込みプリセットを選ぶか **Edit** で音声グラフ、代表画像、曲情報を配置できます。音響調整を使用中はmImageViewerが再生中の情報を自動で渡します。変更はすぐに反映され、次回起動時にも復元されます。名前を付けて残すにはプリセットダイアログで保存します。詳しくは[Visualizerガイド](visualizer.md)をご覧ください。",
     "reason": "Bundled visualizerButton and mIV Now Playing metadata; standalone menus/player absent."
-  },
-  {
-    "operation": "replace_html",
-    "anchor": "<ul>\n<li><p>モバイルでは <strong>Effects</strong> タブを開き、+ ボタンから全画面リストを表示してエフェクトを追加します</p></li></ul>",
-    "replacement": "",
-    "reason": "VST UI minimum width 720; mobile tabs are outside mIV usage."
   },
   {
     "operation": "replace_inline",
@@ -33,49 +27,31 @@
     "operation": "replace_paragraph",
     "anchor": "既存の `.effetune_preset` ファイルの読み込み、書き出し、共有は、引き続きエフェクトチェーン全体のプリセットとして機能します。",
     "replacement": "既存の `.effetune_preset` ファイルは、EffeTune の窓へドラッグ＆ドロップすると読み込めます。mImageViewer の EffeTune では、現在のチェーンを `.effetune_preset` ファイルとして書き出すことはできません。名前を付けて残すには **パイプラインプリセット** の **保存**、保存済みデータをファイルにまとめるには **設定 > バックアップ / 復元** を使います。チェーンを URL で共有するには、**Effect Pipeline** エリアの右上にある **共有** ボタンを押します。現在選択しているチェーンの設定を含む EffeTune Web アプリの URL がクリップボードへコピーされます。",
-    "reason": "v0.14.0 vst-bootstrap.js onExportPreset remains eventNoop; ui/pipeline/ui-event-handler.js supports preset drops, preset-manager.js named saves, vst-bootstrap.js backup, ui-manager.js URL sharing."
+    "reason": "v0.15.0 vst-bootstrap.js onExportPreset remains eventNoop; ui/pipeline/ui-event-handler.js supports preset drops, preset-manager.js named saves, vst-bootstrap.js backup, ui-manager.js URL sharing."
   },
   {
     "operation": "replace_inline",
     "anchor": "起動時はパイプラインAのみが読み込まれ、パイプラインBは必要に応じて作成されます",
     "replacement": "初回はAのみがあり、パイプラインBは必要に応じて作成されます。次回以降の起動時は、保存されたA/B両方の内容と、どちらを選択していたかが復元されます",
-    "reason": "v0.14.0 app.js restores pipelineA, pipelineB and currentPipeline and updates the pipeline toggle; retain saved A/B and selection semantics."
+    "reason": "v0.15.0 app.js restores pipelineA, pipelineB and currentPipeline and updates the pipeline toggle; retain saved A/B and selection semantics."
   },
   {
     "operation": "replace_inline",
     "anchor": "デフォルトで「A」を表示（パイプラインAがアクティブ）",
     "replacement": "初回は「A」を表示します。次回以降は、復元された選択状態に応じて「A」または「B」を表示します",
-    "reason": "v0.14.0 app.js restores pipelineA, pipelineB and currentPipeline and updates the pipeline toggle; retain saved A/B and selection semantics."
-  },
-  {
-    "operation": "replace_paragraph",
-    "anchor": "**設定 > バックアップ / 復元** を開くと、保存済みのパイプラインプリセット、エフェクトプリセット、インパルス応答、測定結果を、ウェブ版、デスクトップ版、ブラウザ拡張の間で移行できます。項目ごと、またはカテゴリ単位で選択できます。プリセットを選ぶと、そのプリセットに必要なデータも選択されます。必要なデータの選択を外すと、それを使うプリセットも選択から外れます。",
-    "replacement": "**設定 > バックアップ / 復元** を開くと、保存済みのパイプラインプリセット、エフェクトプリセット、インパルス応答、測定結果をバックアップまたは復元できます。項目ごと、またはカテゴリ単位で選択できます。プリセットを選ぶと、そのプリセットに必要なデータも選択されます。必要なデータの選択を外すと、それを使うプリセットも選択から外れます。",
-    "reason": "v0.14.0 vst-bootstrap.js retains native backup/export; remove platform migration claims."
-  },
-  {
-    "operation": "replace_paragraph",
-    "anchor": "名前付きのVisualizerプリセットと背景画像もウェブ版・デスクトップ版のバックアップ対象です。現在編集中のレイアウトは含まれません。",
-    "replacement": "名前付きのVisualizerプリセットと背景画像もバックアップ対象です。現在編集中のレイアウトは含まれません。",
-    "reason": "Retain native backup support; remove standalone-only phrasing (visualizer.json)."
-  },
-  {
-    "operation": "replace_paragraph",
-    "anchor": "`.effetune_backup` ファイルの上限は256 MBです。選択内容が上限を超える場合は、複数のバックアップに分けてください。復元が途中で止まっても、完了済みの項目は残り、同じファイルで安全に再試行できます。バックアップにはプリセットの名前やコメント、元のインパルス応答ファイル、測定の詳細が含まれる場合があるため、共有前に選択内容を確認してください。音楽ファイル、Music Libraryのデータ、アプリの環境設定、デバイス選択、URLルール、認証情報、未保存の現在のパイプラインは含まれません。ブラウザ拡張で適用できないルーティングやエフェクトを含むプリセットも移行して保存でき、再度バックアップできます。",
-    "replacement": "`.effetune_backup` ファイルの上限は256 MBです。選択内容が上限を超える場合は、複数のバックアップに分けてください。復元が途中で止まっても、完了済みの項目は残り、同じファイルで安全に再試行できます。バックアップにはプリセットの名前やコメント、元のインパルス応答ファイル、測定の詳細が含まれる場合があるため、共有前に選択内容を確認してください。音楽ファイル、アプリの環境設定、未保存の現在のパイプラインは含まれません。",
-    "reason": "Remove absent standalone library/device/extension URL-rule guidance; retain backup limits and privacy guidance."
+    "reason": "v0.15.0 app.js restores pipelineA, pipelineB and currentPipeline and updates the pipeline toggle; retain saved A/B and selection semantics."
   },
   {
     "operation": "replace_html",
     "replacement": "",
     "reason": "doubleBlindTestButton is hidden by vst-bootstrap.js:30; ordinary A/B comparison remains.",
-    "anchor": "<li><p><strong>ブラインドテスト:</strong></p>\n<ul>\n<li><p>どちらが再生されているか分からない状態で、パイプラインAとパイプラインBを聴き比べます</p></li>\n<li><p>ABXテストで2つのパイプラインを本当に聞き分けられるかを確認したり、A/B比較テストでどちらが好みかを判定したりでき、統計的有意性も確認できます</p></li>\n<li><p>A/B切り替えボタン右の▼パイプラインメニューから開きます（デスクトップアプリではファイルメニューからも開けます）</p></li>\n<li><p>ブラインドテストの詳細</p></li></ul></li>"
+    "anchor": "<li><p><strong>ブラインドテスト：</strong></p>\n<ul>\n<li><p>どちらが再生されているか分からない状態で、パイプラインAとパイプラインBを聴き比べます。</p></li>\n<li><p>ABXテストで2つのパイプラインを本当に聞き分けられるかを確認したり、A/B比較テストでどちらが好みかを判定したりでき、統計的有意性も確認できます。</p></li>\n<li><p>A/B切り替えボタン右の▼パイプラインメニューから開きます（デスクトップアプリではファイルメニューからも開けます）。</p></li>\n<li><p>ブラインドテストの詳細</p></li></ul></li>"
   },
   {
     "operation": "replace_html",
     "replacement": "",
     "reason": "Standalone player is hidden; mIV playback shortcuts belong to mIV.",
-    "anchor": "<li><p><strong>キーボードショートカット（プレイヤー使用時）</strong>：</p>\n<ul>\n<li><p>Space：再生/一時停止</p></li>\n<li><p>Ctrl + → または N：次のトラック</p></li>\n<li><p>Ctrl + ← または P：前のトラック</p></li>\n<li><p>Shift + → または F または .：10秒早送り</p></li>\n<li><p>Shift + ← または R または ,：10秒巻き戻し</p></li>\n<li><p>Ctrl + M：リピートモード切り替え</p></li>\n<li><p>Ctrl + H：シャッフルモード切り替え</p></li>\n<li><p>T：パイプラインA/Bを切り替える</p></li>\n<li><p>A：パイプラインAに切り替える</p></li>\n<li><p>B：パイプラインBに切り替える</p></li></ul></li>"
+    "anchor": "<li><p><strong>キーボードショートカット（プレーヤー使用時）</strong>：</p>\n<ul>\n<li><p>Space：再生/一時停止</p></li>\n<li><p>Ctrl + → または N：次のトラック</p></li>\n<li><p>Ctrl + ← または P：前のトラック</p></li>\n<li><p>Shift + → または F または .：10秒早送り</p></li>\n<li><p>Shift + ← または R または ,：10秒巻き戻し</p></li>\n<li><p>Ctrl + M：リピートモード切り替え</p></li>\n<li><p>Ctrl + H：シャッフルモード切り替え</p></li>\n<li><p>T：パイプラインA/Bを切り替える</p></li>\n<li><p>A：パイプラインAに切り替える</p></li>\n<li><p>B：パイプラインBに切り替える</p></li></ul></li>"
   },
   {
     "operation": "insert_note",
@@ -84,9 +60,27 @@
     "reason": "Document plugin focus scope; no new mIV KeyAction."
   },
   {
-    "operation": "replace_inline",
-    "anchor": "現在のパイプライン、音量、選択中のプリセット、デバイス設定、拡張機能のURLルールは変更しません。",
-    "replacement": "現在のパイプライン、音量、選択中のプリセットは変更しません。",
-    "reason": "Remove absent standalone device and extension URL-rule guidance."
+    "operation": "replace_html",
+    "anchor": "<ul>\n<li><p>モバイルではエフェクトタブを開き、+ ボタンから全画面リストを表示してエフェクトを追加します。</p></li></ul>",
+    "replacement": "",
+    "reason": "No mobile tabs in bundled VST."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "**設定 > バックアップ / 復元** を開くと、保存済みのパイプラインプリセット、エフェクトプリセット、インパルス応答、測定結果を、ウェブアプリ、デスクトップアプリ、ブラウザ拡張の間で移行できます。ウェブアプリとデスクトップアプリでは、名前を付けて保存したVisualizerプリセットも含められます。プリセットを選ぶと、そのプリセットが使う測定データやインパルス応答データも自動で選択されます。",
+    "replacement": "**設定 > バックアップ / 復元** を開くと、保存済みのパイプラインプリセット、エフェクトプリセット、インパルス応答、測定結果をバックアップまたは復元できます。名前付きのVisualizerプリセットと背景画像もバックアップ対象です。現在編集中のレイアウトは含まれません。項目ごと、またはカテゴリ単位で選択できます。プリセットを選ぶと、そのプリセットが使う測定データやインパルス応答データも自動で選択されます。",
+    "reason": "Retain VST native backup data/categories; remove cross-platform promises."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "**測定データを含める** と **インパルス応答データを含める** は初期状態でオンになっており、バックアップだけで復元が完結します。どちらかをオフにするのは、復元先に同じ測定ファイルやインパルス応答ファイルがすでにある場合だけにしてください。復元したインパルス応答はEffeTuneの **Impulse Response Library** に追加されます。バックアップを復元しても、現在のパイプライン、音量、選択中のプリセット、デバイス設定、Music Library、拡張機能のURLルールは変わりません。`.effetune_backup` ファイル1つの上限は256 MBです。これを超える場合は、必要に応じて複数のファイルに分けてください。復元が途中で止まっても完了した項目は残り、同じファイルで安全に復元し直せます。",
+    "replacement": "**測定データを含める** と **インパルス応答データを含める** は初期状態でオンになっており、バックアップだけで復元が完結します。どちらかをオフにするのは、復元先に同じ測定ファイルやインパルス応答ファイルがすでにある場合だけにしてください。復元したインパルス応答は **Impulse Response Library** に追加されます。バックアップを復元しても、現在のパイプライン、音量、選択中のプリセットは変更しません。`.effetune_backup` ファイルの上限は256 MBです。超える場合は複数のファイルに分けてください。復元が途中で止まっても完了した項目は残り、同じファイルで復元し直せます。",
+    "reason": "Native backup retains existing scope; omit device/library/extension preferences."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "バックアップを共有する前に、選択内容を確認してください。プリセット名やコメント、元のインパルス応答ファイル、測定の詳細が含まれることがあります。音楽ファイル、Music Libraryのデータ、アプリの設定、デバイスの選択、URLルール、認証情報、保存していない現在のパイプラインは含まれません。",
+    "replacement": "バックアップを共有する前に、選択内容を確認してください。プリセット名やコメント、元のインパルス応答ファイル、測定の詳細が含まれることがあります。音楽ファイル、アプリの設定、保存していない現在のパイプラインは含まれません。",
+    "reason": "Retain privacy guidance without unavailable standalone storage categories."
   }
 ]

@@ -341,8 +341,10 @@ fn material_demand_revision_ready_local_stage_and_inactive_layers_need_no_origin
         app.settings.ai_feature_mode = crate::settings::AiFeatureMode::Disabled;
         app.settings.global_preset.upscale_model = None;
         app.comic_font_registry_loaded = true;
-        app.comic_fonts_loaded = true;
-        app.comic_fonts = Some(Arc::new(comic_core::FontSet::new()));
+        app.comic_fonts.seed_for_test(
+            Some(Arc::new(comic_core::FontSet::new())),
+            Default::default(),
+        );
         app.editing_addon_declined_session = true;
         app.show_whats_new = false;
         app.show_mouse_nav_migration_prompt = false;

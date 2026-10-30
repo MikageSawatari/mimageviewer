@@ -645,6 +645,7 @@ pub enum RingActionId {
     SiblingFolderPrev,
     SiblingFolderNext,
     ImageHome,
+    ImagePageOverview,
     ImageEnd,
     ImageSpreadShiftLeft,
     ImageSpreadShiftRight,
@@ -660,6 +661,8 @@ pub enum RingActionId {
     ImageBackgroundCycle,
     ImageFitModeCycle,
     ImageComparePin,
+    CopyFiles,
+    CopyEditedImage,
     ImageCopyToClipboard,
     ImageOpenFolder,
     ImageCopyPath,
@@ -682,6 +685,29 @@ pub enum RingActionId {
 }
 
 impl RingActionId {
+    /// Only actions whose existing viewer meaning belongs to overview's executable set.
+    /// ImageHome/End, slideshow, close, editing and other saved slots are never reinterpreted.
+    pub fn page_overview_key_action(&self) -> Option<crate::keymap::KeyAction> {
+        use crate::keymap::KeyAction;
+        Some(match self {
+            Self::ImagePageOverview => KeyAction::FsPageOverviewToggle,
+            Self::ToggleWindowMode => KeyAction::FsToggleWindowMode,
+            Self::ToggleDetachedViewer => KeyAction::ToggleDetachedViewerMode,
+            Self::TreeFolderPrev => KeyAction::FsCtrlNavPrev,
+            Self::TreeFolderNext => KeyAction::FsCtrlNavNext,
+            Self::SiblingFolderPrev => KeyAction::FsSiblingPrev,
+            Self::SiblingFolderNext => KeyAction::FsSiblingNext,
+            _ => return None,
+        })
+    }
+
+    pub fn is_executable_in_page_overview(&self, actions: &[crate::keymap::KeyAction]) -> bool {
+        matches!(self, Self::None)
+            || self
+                .page_overview_key_action()
+                .is_some_and(|action| actions.contains(&action))
+    }
+
     const FAVORITE_SLOT_STRINGS: [&'static str; 20] = [
         "open_favorite_1",
         "open_favorite_2",
@@ -1058,6 +1084,7 @@ impl RingActionId {
             Self::SiblingFolderPrev => "sibling_folder_prev",
             Self::SiblingFolderNext => "sibling_folder_next",
             Self::ImageHome => "image_home",
+            Self::ImagePageOverview => "image_page_overview",
             Self::ImageEnd => "image_end",
             Self::ImageSpreadShiftLeft => "image_spread_shift_left",
             Self::ImageSpreadShiftRight => "image_spread_shift_right",
@@ -1073,6 +1100,8 @@ impl RingActionId {
             Self::ImageBackgroundCycle => "image_background_cycle",
             Self::ImageFitModeCycle => "image_fit_mode_cycle",
             Self::ImageComparePin => "image_compare_pin",
+            Self::CopyFiles => "copy_files",
+            Self::CopyEditedImage => "copy_edited_image",
             Self::ImageCopyToClipboard => "image_copy_to_clipboard",
             Self::ImageOpenFolder => "image_open_folder",
             Self::ImageCopyPath => "image_copy_path",
@@ -1176,6 +1205,7 @@ impl RingActionId {
             "sibling_folder_prev" => Self::SiblingFolderPrev,
             "sibling_folder_next" => Self::SiblingFolderNext,
             "image_home" => Self::ImageHome,
+            "image_page_overview" => Self::ImagePageOverview,
             "image_end" => Self::ImageEnd,
             "image_spread_shift_left" => Self::ImageSpreadShiftLeft,
             "image_spread_shift_right" => Self::ImageSpreadShiftRight,
@@ -1191,6 +1221,8 @@ impl RingActionId {
             "image_background_cycle" => Self::ImageBackgroundCycle,
             "image_fit_mode_cycle" => Self::ImageFitModeCycle,
             "image_compare_pin" => Self::ImageComparePin,
+            "copy_files" => Self::CopyFiles,
+            "copy_edited_image" => Self::CopyEditedImage,
             "image_copy_to_clipboard" => Self::ImageCopyToClipboard,
             "image_open_folder" => Self::ImageOpenFolder,
             "image_copy_path" => Self::ImageCopyPath,
@@ -1351,6 +1383,7 @@ impl RingActionId {
             Self::SiblingFolderPrev => "兄弟フォルダ 前",
             Self::SiblingFolderNext => "兄弟フォルダ 次",
             Self::ImageHome => "先頭へ (Home)",
+            Self::ImagePageOverview => "本のページ一覧",
             Self::ImageEnd => "末尾へ (End)",
             Self::ImageSpreadShiftLeft => "見開き 1Pずらし 左",
             Self::ImageSpreadShiftRight => "見開き 1Pずらし 右",
@@ -1366,6 +1399,8 @@ impl RingActionId {
             Self::ImageBackgroundCycle => "背景色サイクル",
             Self::ImageFitModeCycle => "ズーム/フィット方式を切り替える",
             Self::ImageComparePin => "比較ピン",
+            Self::CopyFiles => "実ファイル/実フォルダをコピー",
+            Self::CopyEditedImage => "編集を反映した画像をコピー",
             Self::ImageCopyToClipboard => "画像をクリップボードにコピー",
             Self::ImageOpenFolder => "フォルダを開く",
             Self::ImageCopyPath => "パスをコピー",
@@ -1446,6 +1481,11 @@ impl RingActionId {
                     | Self::TreeFolderNext
                     | Self::SiblingFolderPrev
                     | Self::SiblingFolderNext
+                    | Self::CopyFiles
+                    | Self::ImageCopyPath
+                    | Self::ImageCopyFileName
+                    | Self::ImageCopyToClipboard
+                    | Self::CopyEditedImage
             ),
             RingShortcutContext::ImageFullscreen => matches!(
                 self,
@@ -1466,6 +1506,7 @@ impl RingActionId {
                     | Self::SiblingFolderPrev
                     | Self::SiblingFolderNext
                     | Self::ImageHome
+                    | Self::ImagePageOverview
                     | Self::ImageEnd
                     | Self::ImageSpreadShiftLeft
                     | Self::ImageSpreadShiftRight
@@ -1481,6 +1522,8 @@ impl RingActionId {
                     | Self::ImageBackgroundCycle
                     | Self::ImageFitModeCycle
                     | Self::ImageComparePin
+                    | Self::CopyFiles
+                    | Self::CopyEditedImage
                     | Self::ImageCopyToClipboard
                     | Self::ImageOpenFolder
                     | Self::ImageCopyPath
@@ -1599,6 +1642,11 @@ impl RingActionId {
                 Self::TreeFolderNext,
                 Self::SiblingFolderPrev,
                 Self::SiblingFolderNext,
+                Self::CopyFiles,
+                Self::ImageCopyPath,
+                Self::ImageCopyFileName,
+                Self::ImageCopyToClipboard,
+                Self::CopyEditedImage,
             ],
             RingShortcutContext::ImageFullscreen => vec![
                 Self::None,
@@ -1618,6 +1666,7 @@ impl RingActionId {
                 Self::SiblingFolderPrev,
                 Self::SiblingFolderNext,
                 Self::ImageHome,
+                Self::ImagePageOverview,
                 Self::ImageEnd,
                 Self::ImageSpreadShiftLeft,
                 Self::ImageSpreadShiftRight,
@@ -1633,6 +1682,8 @@ impl RingActionId {
                 Self::ImageBackgroundCycle,
                 Self::ImageFitModeCycle,
                 Self::ImageComparePin,
+                Self::CopyFiles,
+                Self::CopyEditedImage,
                 Self::ImageCopyToClipboard,
                 Self::ImageOpenFolder,
                 Self::ImageCopyPath,
@@ -1687,6 +1738,63 @@ impl RingActionId {
             .into_iter()
             .filter(|action| action.is_valid_for_right_drag_context(context))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod page_overview_tests {
+    use super::{RingActionId, RingShortcutContext};
+    use crate::keymap::{FS_PAGE_OVERVIEW_ACTION_PRIORITY, KeyAction};
+
+    #[test]
+    fn overview_ring_catalog_round_trips_and_is_image_only() {
+        let action = RingActionId::ImagePageOverview;
+        assert_eq!(
+            RingActionId::from_str(action.as_str()),
+            Some(action.clone())
+        );
+        assert_eq!(
+            action.page_overview_key_action(),
+            Some(KeyAction::FsPageOverviewToggle)
+        );
+        assert!(
+            RingActionId::available_for_context(RingShortcutContext::ImageFullscreen)
+                .contains(&action)
+        );
+        for context in [
+            RingShortcutContext::Grid,
+            RingShortcutContext::VideoFullscreen,
+        ] {
+            assert!(!action.is_valid_for_context(context));
+            assert!(!RingActionId::available_for_context(context).contains(&action));
+        }
+    }
+
+    #[test]
+    fn overview_ring_runtime_set_does_not_reinterpret_saved_image_slots() {
+        for action in [
+            RingActionId::ImageHome,
+            RingActionId::ImageEnd,
+            RingActionId::ImageSlideshow,
+            RingActionId::ImageRotateLeft,
+            RingActionId::ImageFitModeCycle,
+            RingActionId::CloseFullscreen,
+            RingActionId::QuitApplication,
+        ] {
+            assert!(action.is_valid_for_context(RingShortcutContext::ImageFullscreen));
+            assert!(!action.is_executable_in_page_overview(FS_PAGE_OVERVIEW_ACTION_PRIORITY));
+        }
+        for action in [
+            RingActionId::ImagePageOverview,
+            RingActionId::ToggleWindowMode,
+            RingActionId::ToggleDetachedViewer,
+            RingActionId::TreeFolderNext,
+            RingActionId::SiblingFolderPrev,
+        ] {
+            assert!(action.is_executable_in_page_overview(FS_PAGE_OVERVIEW_ACTION_PRIORITY));
+            assert!(!action.is_executable_in_page_overview(&[]));
+        }
+        assert!(RingActionId::None.is_executable_in_page_overview(&[]));
     }
 }
 
@@ -2921,6 +3029,84 @@ impl RightDragRecognition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_actions_are_candidates_in_grid_and_image_contexts_with_stable_ids() {
+        let defaults = RingShortcutSettings::default();
+        let mut settings = defaults.clone();
+        let samples = [
+            (RingActionId::CopyFiles, "copy_files"),
+            (RingActionId::ImageCopyPath, "image_copy_path"),
+            (RingActionId::ImageCopyFileName, "image_copy_file_name"),
+            (
+                RingActionId::ImageCopyToClipboard,
+                "image_copy_to_clipboard",
+            ),
+            (RingActionId::CopyEditedImage, "copy_edited_image"),
+        ];
+        for (slot, (action, id)) in samples.into_iter().enumerate() {
+            // The three image_* strings are existing saved assignment IDs.
+            let saved = serde_json::json!(id);
+            assert_eq!(
+                serde_json::from_value::<RingActionId>(saved.clone()).unwrap(),
+                action
+            );
+            assert_eq!(serde_json::to_value(&action).unwrap(), saved);
+            assert_eq!(RingActionId::from_str(id), Some(action.clone()));
+            for &context in RingShortcutContext::all() {
+                let valid = context != RingShortcutContext::VideoFullscreen;
+                assert_eq!(action.is_valid_for_context(context), valid);
+                assert_eq!(
+                    RingActionId::available_for_context(context).contains(&action),
+                    valid
+                );
+                assert_eq!(
+                    RingActionId::available_for_mouse_button_context(context).contains(&action),
+                    valid
+                );
+                assert_eq!(action.is_valid_for_mouse_button_context(context), valid);
+                assert!(!defaults.profile(context).slots.contains(&action));
+                for button in [
+                    MouseButtonSlot::Back,
+                    MouseButtonSlot::Forward,
+                    MouseButtonSlot::Middle,
+                ] {
+                    assert_ne!(
+                        defaults.mouse_button_profile(context).action(button),
+                        action
+                    );
+                }
+                if valid {
+                    settings.profile_mut(context).slots[slot] = action.clone();
+                }
+            }
+            use MouseGestureDirection::{Down, Left, Right, Up};
+            let patterns = [
+                [Up, Left],
+                [Up, Right],
+                [Down, Left],
+                [Down, Right],
+                [Up, Down],
+            ];
+            for drag in [RightDragContext::Grid, RightDragContext::ImageFullscreen] {
+                assert!(RingActionId::available_for_right_drag_context(drag).contains(&action));
+                settings
+                    .mouse_gesture_profile_mut(drag)
+                    .bindings
+                    .push(MouseGestureBinding::new(
+                        patterns[slot].to_vec(),
+                        action.clone(),
+                    ));
+            }
+        }
+        let mut loaded: RingShortcutSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        loaded.sanitize();
+        assert_eq!(
+            loaded, settings,
+            "saved copy assignments must survive sanitize"
+        );
+    }
 
     #[test]
     fn grid_column_actions_11_to_20_are_selectable_and_roundtrip() {

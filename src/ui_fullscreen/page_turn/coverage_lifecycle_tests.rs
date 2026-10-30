@@ -92,6 +92,8 @@ fn draw(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) -> SubmittedUnitR
             content_bbox,
             Some(&mut sources),
             true,
+            None,
+            crate::ui_fullscreen::page_turn::FlatCropPaint::WithPage,
         )
         .expect("a partial or underlay-only page still has a submitted transform");
     app.fullscreen_page_layout
@@ -152,7 +154,7 @@ fn run_coverage_lifecycle(empty: bool) {
         .unwrap(),
     );
     if empty {
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         app.view_trim_page_overrides.insert(
             1,
             crate::view_trim::ViewTrimPageOverride::from_margins(

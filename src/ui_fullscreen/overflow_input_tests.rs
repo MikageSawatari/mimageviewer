@@ -998,6 +998,7 @@ fn overflow_real_wipe_drag_respects_panel_press_origin_in_both_directions() {
                 egui::Color32::LIGHT_RED,
             ));
             app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+                original_source: crate::app::PinnedOriginalSource::SameAsProcessed,
                 pixels: Arc::clone(&pixels),
                 indicator_pixels: Arc::clone(&pixels),
                 indicator_texture: None,
@@ -1008,6 +1009,12 @@ fn overflow_real_wipe_drag_respects_panel_press_origin_in_both_directions() {
             });
             app.compare_preparation =
                 crate::app::ComparePreparationState::Ready(crate::app::ComparePreparedPair {
+                    original: crate::app::CompareOriginalVariant::Absent,
+                    current_geometry: crate::app::CompareSourceGeometry {
+                        processed_source_size: [1, 1],
+                        crop: None,
+                        rotation: crate::rotation_db::Rotation::None,
+                    },
                     key: 1,
                     current_idx: 1,
                     pinned_source_idx: 42,
@@ -2272,6 +2279,7 @@ fn overflow_nonoverlapping_front_region_still_shields_the_real_wipe_with_seek_po
         egui::Color32::LIGHT_RED,
     ));
     app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+        original_source: crate::app::PinnedOriginalSource::SameAsProcessed,
         pixels: Arc::clone(&pixels),
         indicator_pixels: Arc::clone(&pixels),
         indicator_texture: None,
@@ -2282,6 +2290,12 @@ fn overflow_nonoverlapping_front_region_still_shields_the_real_wipe_with_seek_po
     });
     app.compare_preparation =
         crate::app::ComparePreparationState::Ready(crate::app::ComparePreparedPair {
+            original: crate::app::CompareOriginalVariant::Absent,
+            current_geometry: crate::app::CompareSourceGeometry {
+                processed_source_size: [1, 1],
+                crop: None,
+                rotation: crate::rotation_db::Rotation::None,
+            },
             key: 1,
             current_idx: 1,
             pinned_source_idx: 42,

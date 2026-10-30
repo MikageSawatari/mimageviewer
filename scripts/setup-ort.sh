@@ -3,7 +3,7 @@
 #
 # 使い方:
 #   bash scripts/setup-ort.sh                # デフォルトバージョンをダウンロード
-#   bash scripts/setup-ort.sh 1.24.2         # バージョン指定
+#   bash scripts/setup-ort.sh 1.24.4         # バージョン指定
 #
 # 前提:
 #   - curl と unzip コマンドが使えること (Git Bash / MSYS2 等)
@@ -16,13 +16,14 @@
 #   %APPDATA%/mimageviewer/ へ展開される (PDFium と同じ流儀)。
 #
 # バージョン互換性:
-#   ort クレート v2.0.0-rc.12 は ONNX Runtime 1.24.2 (ms@1.24.2) の
-#   C API と ABI 互換。pyke のビルドスクリプトの dist.txt を参照。
-#   ort クレートをアップデートしたら対応する ORT バージョンを確認すること。
+#   ort v2.0.0-rc.15 は default-features=false + api-24 で C API 24 を選ぶ。
+#   DirectML 1.24.4 と TensorRT pack の GPU 1.24.2 はともに minor 24。
+#   既定の api-31 はこれらの DLL を拒否するため有効にしない。
+#   crate 更新時は全 workspace consumer の feature と DLL の API 互換性を確認する。
 
 set -euo pipefail
 
-VERSION="${1:-1.24.2}"
+VERSION="${1:-1.24.4}"
 VENDOR_DIR="vendor/ort"
 NUPKG_URL="https://globalcdn.nuget.org/packages/microsoft.ml.onnxruntime.directml.${VERSION}.nupkg"
 

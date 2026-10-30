@@ -1838,6 +1838,16 @@ impl App {
     }
 
     /// Confirm 段階で「変換して開く」が押されたときの遷移。
+    #[cfg(test)]
+    pub(crate) fn confirm_archive_convert_for_test(&mut self) {
+        assert!(
+            self.archive_convert
+                .as_ref()
+                .is_some_and(|state| matches!(state.phase, ArchiveConvertPhase::Confirm { .. }))
+        );
+        self.start_archive_convert();
+    }
+
     fn start_archive_convert(&mut self) {
         if self
             .archive_convert

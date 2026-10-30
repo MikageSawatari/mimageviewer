@@ -309,6 +309,39 @@ live Settings から引き継ぎ、
 
 ### HUD overlay HWND (v0.9.0+ 後期 — CP1-8 で導入)
 
+通常動画の上部バーは × の左に「…」(その他の機能) を置き、デインターレースの
+自動 / 常に有効 / 無効を再生中・一時停止中に切り替えられる (§1.105 / §1.660)。
+音声のみシェル・タイル一覧・移動プレビューでは表示しない。popup の実描画 rect は HUD
+region に加え、表示中は HUD を維持し、source 切り替え・タイル入場で閉じる。
+鍵の描画・hit rect は「…」の有無を受け取る共通配置計算を使う。
+
+モードは `VideoPlayer` が所有する `Arc<DeinterlaceControl>` の現在値 (atomic) と open 時の
+値だけで表す。手動表示は両者の差から導出し、全体設定やファイル別データへ保存しない。
+新しい player はその時点の `settings.video_deinterlace` を使う。HUD metadata は info の有無に
+かかわらず player の現在値を読み、情報表示は変更中だけ「手動: 」を付ける。
+`SetDeinterlaceMode` は音声トラック選択と同じ source epoch / 所有 context のイベント経路を通る。
+ParkedLive では従来の HUD クリックと同じく活性化要求だけになり、音声のみシェルでは拒否する。
+
+player の setter が値変更と表示更新の seek をまとめ、音声トラック変更と共通の位置解決
+(保留中・未表示の seek target 優先、frame-step 中は表示 PTS) と再生 intent を使う。
+DSP 取得中の内部 pause は停止意図として扱わず、同じ共通解決で handoff が保持する要求位置・再生要求を使う。
+EOF 停止中は値だけ変更し、次の再生・seek から反映する。decoder は各フレームで現在値を読み、
+変更時は bwdif と失敗 latch を破棄し Pending / Inactive へ戻す。Auto/On が必要な HW frame は
+従来どおり CPU download + bwdif を使う。開き直す方式は source swap による zoom・seek strip・
+resume・音声選択等への副作用が増えるため採用せず、既存 seek と filter 再生成へ集約した。
+
+bwdif の先読みを維持するため、frame-step は filter 出力 PTS で選別し、出力 time base を
+入力 time base へ換算する (§1.661)。demux 終端では codec の残りを出してから filter へ EOF を送り、
+末尾も通常の CPU 出力経路へ流す。seek・SW decoder 再オープン・モード変更での filter 破棄は
+drain しない。失敗時は既存のログ・失敗表示とし、新しい回復処理は設けない。
+Auto + stream interlaced hint の graph は frame flag によらず `deint=all` とし、混在 flag でも
+先読みを保持する。HW download 後も PTS と field flags を copy して filter に渡す。
+末尾の処理中や native source queue にフレームが残る間の EOF 先行を防ぐため、clock 所有の
+seek 世代付き `VideoEos` は Decoding → Decoded (全 enqueue 後) → Complete (出力消費後) を共有する。
+native / hidden / headless / 非 native の consumer が channel・保持 queue・当 pass の処理完了を確認し、
+既存 UI wake で通知する。player の EOF / loop は映像があれば Complete を要求し、seek は同じ
+世代更新境界で reset する。demux 終端の意味、音声 tail と出力 quiet の既存条件は維持する。
+
 複数の再生可能な音声トラックがある動画では、下部 HUD の速度とミュートの間に
 「音声 N」ボタンを置く。`N` は player の `applied` の ordinal。popup の行ラベルは
 `src/video/audio_track_ui.rs` が音声モード HUD と共有し、`NativeOverlayMetadata` は

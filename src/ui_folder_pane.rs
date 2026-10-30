@@ -69,6 +69,103 @@ fn show_bounded_folder_pane_body<R>(
     add_contents(&mut body_ui)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FolderPaneRowBackground {
+    None,
+    ActiveLocation,
+    FocusedCursor,
+}
+
+fn folder_pane_row_background(
+    is_active: bool,
+    is_cursor: bool,
+    has_focus: bool,
+) -> FolderPaneRowBackground {
+    if is_cursor && has_focus {
+        FolderPaneRowBackground::FocusedCursor
+    } else if is_active {
+        FolderPaneRowBackground::ActiveLocation
+    } else {
+        FolderPaneRowBackground::None
+    }
+}
+
+fn folder_pane_row_fill(
+    visuals: &egui::Visuals,
+    background: FolderPaneRowBackground,
+) -> Option<egui::Color32> {
+    match background {
+        FolderPaneRowBackground::None => None,
+        FolderPaneRowBackground::ActiveLocation => {
+            Some(visuals.selection.bg_fill.gamma_multiply(0.35))
+        }
+        FolderPaneRowBackground::FocusedCursor => Some(visuals.selection.bg_fill),
+    }
+}
+
+/// Pure row drawing shared by the live tree and snapshots. Commands remain with the pane owner.
+fn draw_folder_pane_row(
+    ui: &mut egui::Ui,
+    row: &folder_pane::FolderPaneRow,
+    has_focus: bool,
+) -> (egui::Response, egui::Response) {
+    ui.horizontal(|ui| {
+        ui.set_height(FOLDER_PANE_ROW_HEIGHT);
+        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.add_space(row.depth as f32 * FOLDER_PANE_INDENT_WIDTH);
+        let arrow = if row.has_children_or_unknown {
+            if row.expanded { "▼" } else { "▶" }
+        } else {
+            " "
+        };
+        let arrow_resp = ui.add_sized(
+            egui::vec2(FOLDER_PANE_ARROW_WIDTH, FOLDER_PANE_ROW_HEIGHT),
+            egui::Button::new(egui::RichText::new(arrow).size(16.0).strong()).frame(false),
+        );
+
+        let label = folder_pane::folder_label(&row.path);
+        let mut text = egui::RichText::new(label);
+        if row.is_active {
+            text = text.strong();
+        }
+        if row.error.is_some() {
+            text = text.color(ui.visuals().warn_fg_color);
+        }
+        let background = folder_pane_row_background(row.is_active, row.is_cursor, has_focus);
+        let trailing_width = folder_pane_trailing_width(ui, row.loading || row.error.is_some());
+        let label_width = (ui.available_width() - trailing_width).max(16.0);
+        let (label_rect, label_resp) = ui.allocate_exact_size(
+            egui::vec2(label_width, FOLDER_PANE_ROW_HEIGHT),
+            egui::Sense::click(),
+        );
+        if let Some(fill) = folder_pane_row_fill(ui.visuals(), background) {
+            ui.painter()
+                .rect_filled(label_rect, ui.visuals().widgets.active.corner_radius, fill);
+        }
+        let mut label_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(label_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        label_ui.set_clip_rect(label_rect.intersect(ui.clip_rect()));
+        label_ui.add(
+            egui::Label::new(text)
+                .truncate()
+                .selectable(false)
+                .halign(egui::Align::Min),
+        );
+        let resp = label_resp.on_hover_text(row.path.display().to_string());
+
+        if row.loading {
+            ui.spinner();
+        } else if row.error.is_some() {
+            ui.label(egui::RichText::new("!").color(ui.visuals().warn_fg_color));
+        }
+        (arrow_resp, resp)
+    })
+    .inner
+}
+
 impl App {
     pub(crate) fn set_folder_tree_pane_visible(&mut self, visible: bool) {
         self.settings.folder_tree_pane_visible = visible;
@@ -321,89 +418,30 @@ impl App {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 for row in rows {
-                    let mut row_response = None;
-                    ui.horizontal(|ui| {
-                        ui.set_height(FOLDER_PANE_ROW_HEIGHT);
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        ui.add_space(row.depth as f32 * FOLDER_PANE_INDENT_WIDTH);
-                        let arrow = if row.has_children_or_unknown {
-                            if row.expanded { "▼" } else { "▶" }
+                    let (arrow_resp, resp) =
+                        draw_folder_pane_row(ui, &row, self.folder_pane.has_focus);
+                    if row.has_children_or_unknown && arrow_resp.clicked() {
+                        self.folder_pane.set_focus_tree();
+                        self.folder_pane.set_cursor(row.path.clone());
+                        let key = if row.expanded {
+                            FolderPaneTreeKey::Left
                         } else {
-                            " "
+                            FolderPaneTreeKey::Right
                         };
-                        let arrow_resp = ui.add_sized(
-                            egui::vec2(FOLDER_PANE_ARROW_WIDTH, FOLDER_PANE_ROW_HEIGHT),
-                            egui::Button::new(egui::RichText::new(arrow).size(16.0).strong())
-                                .frame(false),
-                        );
-                        if row.has_children_or_unknown && arrow_resp.clicked() {
-                            self.folder_pane.set_focus_tree();
-                            self.folder_pane.set_cursor(row.path.clone());
-                            let key = if row.expanded {
-                                FolderPaneTreeKey::Left
-                            } else {
-                                FolderPaneTreeKey::Right
-                            };
-                            let _ = self.folder_pane.handle_tree_key(key);
+                        let _ = self.folder_pane.handle_tree_key(key);
+                    }
+                    if resp.clicked() {
+                        self.folder_pane.set_focus_tree();
+                        self.folder_pane.set_cursor(row.path.clone());
+                        if self
+                            .folder_pane
+                            .active_path()
+                            .is_none_or(|active| !crate::folder_tree::path_eq(active, &row.path))
+                        {
+                            nav = Some(row.path.clone());
                         }
-
-                        let label = folder_pane::folder_label(&row.path);
-                        let mut text = egui::RichText::new(label);
-                        if row.is_active {
-                            text = text.strong();
-                        }
-                        if row.error.is_some() {
-                            text = text.color(ui.visuals().warn_fg_color);
-                        }
-                        let selected = row.is_cursor && self.folder_pane.has_focus;
-                        let trailing_width =
-                            folder_pane_trailing_width(ui, row.loading || row.error.is_some());
-                        let label_width = (ui.available_width() - trailing_width).max(16.0);
-                        let (label_rect, label_resp) = ui.allocate_exact_size(
-                            egui::vec2(label_width, FOLDER_PANE_ROW_HEIGHT),
-                            egui::Sense::click(),
-                        );
-                        if selected {
-                            ui.painter().rect_filled(
-                                label_rect,
-                                ui.visuals().widgets.active.corner_radius,
-                                ui.visuals().selection.bg_fill,
-                            );
-                        }
-                        let mut label_ui = ui.new_child(
-                            egui::UiBuilder::new()
-                                .max_rect(label_rect)
-                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                        );
-                        label_ui.set_clip_rect(label_rect.intersect(ui.clip_rect()));
-                        label_ui.add(
-                            egui::Label::new(text)
-                                .truncate()
-                                .selectable(false)
-                                .halign(egui::Align::Min),
-                        );
-                        let resp = label_resp.on_hover_text(row.path.display().to_string());
-                        if resp.clicked() {
-                            self.folder_pane.set_focus_tree();
-                            self.folder_pane.set_cursor(row.path.clone());
-                            if self.folder_pane.active_path().is_none_or(|active| {
-                                !crate::folder_tree::path_eq(active, &row.path)
-                            }) {
-                                nav = Some(row.path.clone());
-                            }
-                        }
-                        if row.loading {
-                            ui.spinner();
-                        } else if row.error.is_some() {
-                            ui.label(egui::RichText::new("!").color(ui.visuals().warn_fg_color));
-                        }
-                        row_response = Some(resp);
-                    });
-
-                    if scroll_to_cursor
-                        && row.is_cursor
-                        && let Some(resp) = row_response
-                    {
+                    }
+                    if scroll_to_cursor && row.is_cursor {
                         resp.scroll_to_me(Some(egui::Align::Center));
                         cursor_scrolled = true;
                     }
@@ -416,9 +454,61 @@ impl App {
     }
 }
 
+#[doc(hidden)]
+pub fn draw_folder_pane_location_snapshot_fixture(ui: &mut egui::Ui) {
+    for (title, has_focus, cursor) in [
+        ("現在地のみ（フォーカスなし）", false, 1),
+        ("操作カーソル ≠ 現在地（フォーカスあり）", true, 2),
+        ("同じ行（フォーカスあり）", true, 1),
+    ] {
+        ui.push_id(title, |ui| {
+            ui.label(title);
+            for (index, path) in [
+                r"C:\Pictures",
+                r"C:\Pictures\現在のフォルダ",
+                r"C:\Pictures\次のフォルダ",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let row = folder_pane::FolderPaneRow {
+                    path: path.into(),
+                    depth: usize::from(index != 0),
+                    expanded: index == 0,
+                    loading: false,
+                    // Unloaded branches have a named disclosure arrow, like the live tree.
+                    has_children_or_unknown: true,
+                    is_active: index == 1,
+                    is_cursor: index == cursor,
+                    error: None,
+                };
+                draw_folder_pane_row(ui, &row, has_focus);
+            }
+        });
+        ui.separator();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section1451_current_location_and_focused_cursor_backgrounds() {
+        use FolderPaneRowBackground::*;
+        for (active, cursor, focus, expected) in [
+            (false, false, false, None),
+            (false, false, true, None),
+            (false, true, false, None),
+            (false, true, true, FocusedCursor),
+            (true, false, false, ActiveLocation),
+            (true, false, true, ActiveLocation),
+            (true, true, false, ActiveLocation),
+            (true, true, true, FocusedCursor),
+        ] {
+            assert_eq!(folder_pane_row_background(active, cursor, focus), expected);
+        }
+    }
 
     #[test]
     fn sort_control_and_reload_fit_the_minimum_folder_pane_width() {

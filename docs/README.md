@@ -8,10 +8,11 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
+| [list-order-book-navigation-plan.md](list-order-book-navigation-plan.md) | §1.444 一覧の表示順で前後の本へ移る操作。凍結列の context 所有・都度位置解決・既存 fullscreen 採用経路・検証記録 |
 | [section445-stepped-slider-input.md](section445-stepped-slider-input.md) | §1.445、GPUメモリ上限などの手入力。eguiの編集状態とstep丸めの原因、共通修正、兄弟欄とheadless回帰・検証記録 |
 | [section443-font-color-fix.md](section443-font-color-fix.md) | §1.443、単色 EBDT 字形のカラー誤判定。epaint 0.37 の vendor 差分、実フォント・mesh 回帰と検証記録 |
-| [gpu-init-fallback-plan.md](gpu-init-fallback-plan.md) | §1.448 GPU 初期化。`--gpu-backend`、DX12 の FXC 固定、初回 device 作成だけの DX12 → Vulkan 有限選択、試行別診断と起動中だけの Error 保存。報告環境の原因や改善は未確認 |
-| [render-init-failure-report-plan.md](render-init-failure-report-plan.md) | §1.428 run_nativeのErr終了。watchdog休止・原因連鎖の記録・cleanup・終了flush後のnative通知、script自動実行時の表示抑止と検証記録。panic経路の§1.429は対象外 |
+| [gpu-init-fallback-plan.md](gpu-init-fallback-plan.md) | §1.448 GPU 初期化と§12の§1.429 surface設定失敗。`--gpu-backend`、DX12 の FXC 固定、初回 device 作成だけの DX12 → Vulkan 有限選択、試行別診断と起動中だけの Error 保存。報告環境の原因や改善は未確認 |
+| [render-init-failure-report-plan.md](render-init-failure-report-plan.md) | §1.428 run_nativeのErr終了。watchdog休止・原因連鎖の記録・cleanup・終了flush後のnative通知、script自動実行時の表示抑止と検証記録。初回rootのsurface設定失敗は§1.429でErrへ接続し、起動後のsurface失敗とuncaptured-error handlerは従来のpanicを維持 |
 | [detached-snapshot-reader-plan.md](detached-snapshot-reader-plan.md) | 2026-10-15利用者採択はC1だけ。独立reader／promote後の受動更新を停止、能動Operation／BookAppend系の由来は要求・保留・完了・restartまで既存cause型で保持。整理完了もOperationへ接続。関連970件成功、fmt・通常／portable check成功。full一回は音声pumpの1件失敗・単独では成功、vendor gate未実施。実装・検証記録は§9。linked中は変更なし。案Aは履歴・source／main-owner境界だけ参照、C2／C3は今回対象外 |
 | [coding-conventions.md](coding-conventions.md) | CLAUDE.md から分けたコーディング規約の全文。UI・ダイアログ・パネル・IME・スクロール・配色・並行処理・UI スレッドの I/O・グリフ・外部ツール向けテキストを触るとき |
 | [native-dependencies.md](native-dependencies.md) | CLAUDE.md から分けたネイティブ依存物の管理。vendor/ の復旧、PDFium・ONNX Runtime・Susie・FFmpeg・LibRaw・VST3 bridge の更新やビルド |
@@ -84,6 +85,7 @@
 | [collection-remote-plan.md](collection-remote-plan.md) | Phase 5の認証済みRemote一覧・閲覧、server-side latest navigation、session / route owner、path・budget・終了順の実装・検収記録 |
 | [post-v3.9.0-sequential-work.md](post-v3.9.0-sequential-work.md) | v3.9.0後の直列開発。§1.115再確認から依存更新・UI改善を経て§1.220までの順序と完了管理 |
 | [dependency-update-20260912.md](dependency-update-20260912.md) | PDFium 8044更新とFFmpeg現行維持の理由、ライセンス、非対話試験、確認buildの内包照合 |
+| [dependency-update-20261028.md](dependency-update-20261028.md) | 依存物更新 段A/B/C。Rust・通常crate・PDFium 8125・LibRaw 0.22.3、ort rc.15 / ORT DirectML 1.24.4、tantivy 0.27.0の版・資産照合・旧索引互換・検証と保留事項 |
 | [msstore-startup-hang-vcrt-investigation-20260915.md](msstore-startup-hang-vcrt-investigation-20260915.md) | §1.241 VC++ ランタイムの無い Windows で起動が終わらない (Store 審査却下) の原因。onnxruntime.dll の依存、ort の失敗経路のデッドロック、Sandbox での陽性対照と修正候補 |
 | [section241-ort-vcrt-startup-fix-plan.md](section241-ort-vcrt-startup-fix-plan.md) | §1.241 の修正設計と検収記録。upstream ort backport、process 共通 AI runtime owner、app-local Microsoft VC runtime、TensorRT typed failure、全 PE 配布 gate |
 | [sidecar-first-visit-investigation-20260912.md](sidecar-first-visit-investigation-20260912.md) | §1.226 初訪問の旧XMPタグ読み取り待ちの調査と自動取り込み廃止。現在のタグDB・一般XMP・サイドカー復元を維持する境界 |
@@ -139,6 +141,7 @@
 | [detached-viewer-keepalive-design.md](detached-viewer-keepalive-design.md) | keep-alive の不変条件、target 設計、K0〜K3 の現況。K0 完了、K1 未完、K2/K3 部分完了で、single render entry は未実装 |
 | [detached-viewer-smoke-checklist.md](detached-viewer-smoke-checklist.md) | K0 詳細 smoke の補助チェックリスト。現行 registry ログ (`registered host` / `hwnd_adopted_*`) に対応。リリース全体は ship checklist を正とする |
 | [detached-rework-plan.md](detached-rework-plan.md) | **detached viewport リワーク正本**。§9 が唯一の現況表。R2b は部分完了、R3 は実質完了、R4 は未完 |
+| [detached-book-page-overview-plan.md](detached-book-page-overview-plan.md) | **§1.340 R5双方合意、PDF／EPUB接続と最終修正は独立ACCEPT、自動検証補完済み**。既定Oの通常fullscreen／メイン内／detachedページ一覧、通常ページ移動・Grid同期、active／passive所有、bounded demandと取消。§1.377の既存owner-scoped APIへ接続。full 1回の環境／fixture／回帰修正と補完実数、確認buildは§20。構成白紙adapterは§1.242未統合、実機受入は未完了。先行履歴は§17／§19 |
 | [detached-rework-ship-checklist.md](detached-rework-ship-checklist.md) | 現行リワーク出荷前 smoke matrix (F/W/V/P/R 系)。独立静止画窓の Ctrl 物理フォルダ移動と configurable 右クリックを含む |
 | [details-view-and-filter-plan.md](details-view-and-filter-plan.md) | **Ph1〜Ph4 + Ph5 画像/動画/作成日時遅延列まで実装済み**。ファイル選択画面の詳細表示モード (サムネ無しで名前/サイズ/日付＋★/タグ/編集フラグを行表示) ＋ Excel オートフィルタ風スマートフィルタの設計。現状は列セクションの詳細切替、右クリック列表示メニュー、`details_order` による列ヘッダ 3 トグルソート、種類/拡張子/場所/★/タグ/日付/サイズ/状態の共通 `FacetFilter`、遅延列 worker / 進捗表示、作成日時列、画像解像度列、長さ/動画解像度/コーデック列まで実装済み (長さ・コーデックは音声も対応)。場所は元ファイル/元コンテナの親フォルダで、製本フォルダは `本棚 > 本名` 表記。場所条件は移動で解除される非永続の一時条件。EXIF/PDF/アーカイブ系の追加遅延列は後続 |
 | [file-organize-destinations-plan.md](file-organize-destinations-plan.md) | **実装済み (レビュー前)**。固定整理先の登録、Shell によるコピー・移動と実機確認 |
@@ -177,6 +180,7 @@
 | [external-tool-launch-plan.md](external-tool-launch-plan.md) | **P0/P1/P2a/P2b/P2c/P3 実装済み (2026-09-01、P3 は実機確認待ち)、P4 以降は未実装**。backlog §1.117 の正本。導線は登録した全ツールを平坦に出す右クリックと、既定キーなしの Grid 専用固定スロット / ピッカーの 2 つ。ツールバーとメニューバーの直接起動は一度実装後に撤去した。フォルダー背景・コンテナー項目から現在のフォルダー / 本 1 件を渡す入口を持ち、複数対象は既定 `Each`、ツール別の確認 5 件 / 上限 10 件で扱う。変換アーカイブは元パスを使い、1 コンテナーに定まらない集約ビュー背景と仮想ページは拒否する。外部ツール起動を引数テンプレート / 作業フォルダー / 複数選択 / **ZIP・PDF 内ページの一時実体化** / **動画の現在フレーム**まで広げる設計で、**仮想パスをそのまま渡す方針は採らない**。一時ファイルは NeeView 同型のプロセス単位ディレクトリ + 終了時削除 + 起動時の孤児回収 |
 | [external-tool-file-list-plan.md](external-tool-file-list-plan.md) | §1.329 の決定済み仕様。起動ごとの UTF-8 BOM なし / CRLF リスト、実体化 worker と一時成果物の所有、index を保持したフレーム分割準備、取消・限界・検証 |
 | [sns-split-export-plan.md](sns-split-export-plan.md) | **P1〜P6 実装済み (2026-09-01)**。1 枚の絵を X / Instagram のカルーセル投稿用に 2〜4 枚へ切り分けて書き出す。`CropSettings` / `export_crop.db` には保存しない**一度きりのモード**として分離し、グループ矩形の操作だけを既存の `CropRect` と共有する。比率固定リサイズは反対辺 / 反対角を固定する共通挙動。**X の隙間を実測** (PC ブラウザ 1.588% / iOS アプリ 1.869% / モバイル Web 2.652%、隙間の絶対値は環境ごとに違う) し、枠幅比 **1.7% 固定**を採用。投稿先は X (3:4 / 1.7%) と Instagram (4:5 / 0%) の 2 択のみ。書き出しはパネルボタンから `ExportEntry` に crop を足し、既存の 1 スナップショット→N ファイル経路へ載せる。2x2 グリッドと縦並びは非対象 |
+| [clipboard-edited-copy-plan.md](clipboard-edited-copy-plan.md) | **§1.261 実装済み・レビュー前 (2026-10-28)**。右クリック「編集を反映した画像をコピー」。Ctrl+E と同じ source + 編集 snapshot の worker 合成を、焼き込み段の設定 (`bake_stage_clipboard`) まで通して CF_DIB へ置く。既存の「画像をクリップボードにコピー」は残す。job は 1 本、mIV 世代と OS のクリップボード世代で後のコピーを上書きしない |
 
 ## 設計メモ (特定領域の詳細)
 

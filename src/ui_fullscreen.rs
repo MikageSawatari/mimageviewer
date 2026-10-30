@@ -19,6 +19,7 @@
 //! しまう」誤認を避けるため明示。
 
 pub(crate) mod canonical_demand;
+mod compare_original;
 #[cfg(test)]
 mod front_pointer_ownership_tests;
 #[cfg(test)]
@@ -27,9 +28,15 @@ mod front_popup_input_tests;
 mod native_focus_tests;
 #[cfg(test)]
 mod overflow_input_tests;
+#[cfg(all(test, windows))]
+mod overlay_navigation_tests;
+#[cfg(test)]
+mod overview_page_turn_tests;
 mod page_turn;
 #[cfg(test)]
 mod prefetch_revision_tests;
+#[cfg(test)]
+mod prepared_edit_entry_tests;
 #[cfg(test)]
 mod retained_material_entry_tests;
 #[cfg(test)]
@@ -51,9 +58,13 @@ use eframe::egui;
 #[cfg(test)]
 mod book_composition_tests;
 #[cfg(test)]
+mod compare_crop_tests;
+#[cfg(test)]
 mod coverage_spread_tests;
 #[cfg(test)]
 mod coverage_tests;
+#[cfg(test)]
+mod crop_order_tests;
 #[cfg(test)]
 mod display_basis_tests;
 #[cfg(test)]
@@ -109,6 +120,11 @@ use crate::settings::{
     SlideshowEndAction, SpreadMode,
 };
 use crate::ui_helpers::{HoverTipExt, open_external_player};
+
+mod page_overview;
+mod viewer_chrome;
+#[cfg(test)]
+pub(crate) use viewer_chrome::assert_prepared_viewer_frame_idx;
 
 const FULLSCREEN_SECONDARY_PRESS_MOVE_THRESHOLD_PX: f32 =
     crate::ring_shortcut::MOUSE_FLICK_MOVE_THRESHOLD_PX;
@@ -1057,7 +1073,7 @@ impl FsPageTurnDecisionPerfRecorder {
 }
 
 #[derive(Debug, Default)]
-struct FsNavigationPerfRecorder {
+pub(crate) struct FsNavigationPerfRecorder {
     close: std::time::Duration,
     ctrl_sibling_mouse: std::time::Duration,
     page: std::time::Duration,
@@ -4368,17 +4384,18 @@ fn colorize_wait_indicator_visible(holdover: Option<&FsHoldover>, now: std::time
 /// Whether the accepted navigation target has not yet been presented long enough to explain the
 /// visible holdover to the user.
 ///
-/// The navigation sequence is the presentation fact: it is retired only after every page in the
-/// target display unit was painted live. Its own lifetime supplies the UX-delay anchor, independent
-/// of whether decode has completed and presentation is waiting on a later pipeline stage.
+/// The navigation sequence is retired only after every target page was painted live in canonical
+/// flat output. This pass's turn/landing submission can already show that unit while the sequence
+/// remains active. Otherwise its lifetime supplies the UX-delay anchor, independent of decode readiness.
 fn fs_page_wait_indicator_visible(
     processing_status_visible: bool,
+    target_presented_by_page_turn: bool,
     holdover: Option<&FsHoldover>,
     current_idx: usize,
     items_generation: u64,
     now: std::time::Instant,
 ) -> bool {
-    if !processing_status_visible {
+    if !processing_status_visible || target_presented_by_page_turn {
         return false;
     }
     let Some(sequence) = holdover
@@ -8433,6 +8450,11 @@ const TRANSFORM_EPSILON: f32 = 0.001;
 /// パンがゼロとみなせるしきい値（length_sq）
 const PAN_EPSILON_SQ: f32 = 0.25;
 
+/// 拡大・縮小を対称に扱い、fit 付近の丸め誤差だけを無変換とする。
+fn zoom_differs_from_fit(zoom: f32) -> bool {
+    (zoom - 1.0).abs() > ZOOM_NEAR_ONE - 1.0
+}
+
 /// 共有 pool 由来の HIGH を超えた場合だけ trim を開始し、遠い非可視 unit を何個外せば
 /// LOW 以下に到達するかを返す。候補が足りなければ全候補を返し、可視 unit と準備帯は
 /// 呼び出し側で除外する。0% (無制限) では HIGH/LOW が `None` なので trim を無効化する。
@@ -11286,10 +11308,27 @@ pub(crate) struct NavMarker {
 }
 
 /// フルスクリーン中央のヒントオーバーレイ。
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FsBoundaryEdgeScope {
+    Page,
+    ListOrder,
+}
+
+impl FsBoundaryEdgeScope {
+    pub(crate) fn title(self, at_end: bool) -> &'static str {
+        match (self, at_end) {
+            (Self::ListOrder, true) => "一覧の末尾です",
+            (Self::ListOrder, false) => "一覧の先頭です",
+            (Self::Page, _) => fullscreen_boundary_edge_title(at_end),
+        }
+    }
+}
+
 #[derive(Copy, Clone)]
 pub(crate) enum FsBoundaryHint {
     /// 先頭 / 末尾に到達 (at_end: true=末尾, false=先頭)。
     Edge {
+        scope: FsBoundaryEdgeScope,
         at_end: bool,
         at: std::time::Instant,
     },
@@ -11643,6 +11682,45 @@ impl App {
             .map(|material| material.source_texture().clone())
     }
 
+    fn prepare_single_crop_from_frame_state(
+        &mut self,
+        idx: usize,
+        state: &FsFrameState,
+    ) -> Option<crate::export_crop::CropSettings> {
+        let (w, h) = state.image_dims?;
+        let size = [w as usize, h as usize];
+        // This display accessor adopts only the same pure crop resolution as
+        // acceptance. Frame layout or quality dimensions are only paint inputs.
+        let _ = self.export_crop_for_idx(idx, size);
+        self.prepared_single_page_crop(idx, size, state.original_preview_active)
+    }
+
+    fn prepared_single_page_crop(
+        &self,
+        idx: usize,
+        image_size: [usize; 2],
+        original_preview_active: bool,
+    ) -> Option<crate::export_crop::CropSettings> {
+        let earlier_tool = self.erase_mode
+            || self.local_adjust_mode
+            || self.conceal_mode
+            || self.sns_split.is_some()
+            || self.adjustment_mode.is_open()
+            || self.analysis_mode;
+        if original_preview_active || (!self.export_crop_mode && earlier_tool) {
+            return None;
+        }
+        self.resident_export_crop_for_idx(idx).or_else(|| {
+            self.export_crop_mode.then(|| {
+                crate::export_crop::CropSettings::authored(
+                    crate::export_crop::CropRect::full(image_size[0], image_size[1]),
+                    self.export_crop_aspect_mode,
+                    image_size,
+                )
+            })
+        })
+    }
+
     fn resolve_fs_display_material_from_caches(
         &self,
         idx: usize,
@@ -11677,14 +11755,8 @@ impl App {
         if let Some(tex) = self.current_edit_result_material(idx) {
             return Some(tex);
         }
-        if let Some(material) = self.current_conceal_material(idx) {
+        if let Some((material, _, _)) = self.exact_resident_edit_stage(idx) {
             return Some(material);
-        }
-        if let Some(tex) = self.current_local_adjust_material(idx) {
-            return Some(tex);
-        }
-        if let Some(tex) = self.current_erase_result_material(idx) {
-            return Some(tex);
         }
         if let Some(material) = self.source_material_for_idx(idx) {
             return Some(material);
@@ -12156,7 +12228,11 @@ impl App {
             return "edit";
         }
         if self.conceal_cache.get(&idx).is_some_and(|entry| {
-            entry.generation == self.conceal_generation && entry.texture.id() == texture_id
+            entry.generation == self.conceal_generation
+                && entry
+                    .texture
+                    .as_ref()
+                    .is_some_and(|texture| texture.id() == texture_id)
         }) {
             return "conceal";
         }
@@ -12424,6 +12500,7 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn capture_paged_display_unit_for_snapshot(
         &mut self,
+        ctx: Option<&egui::Context>,
         idx: usize,
     ) -> Option<CapturedPagedDisplayUnit> {
         if let Some(mut unit) = self
@@ -12442,11 +12519,19 @@ impl App {
                 presentation: CapturedPagedDisplayPresentation::Holdover,
             });
         }
-        self.capture_fs_display_unit(idx)
-            .map(|unit| CapturedPagedDisplayUnit {
+        let original_preview =
+            ctx.is_some_and(|ctx| self.original_preview_active_for_frame(ctx, idx));
+        self.capture_fs_display_unit(idx).map(|mut unit| {
+            if original_preview {
+                for page in &mut unit.pages {
+                    page.crop = None;
+                }
+            }
+            CapturedPagedDisplayUnit {
                 unit,
                 presentation: CapturedPagedDisplayPresentation::Live,
-            })
+            }
+        })
     }
 
     /// Resolve the last unit painted by this mounted viewer context. Paged rendering clears and
@@ -12787,6 +12872,13 @@ impl App {
             .map(|entry| entry.load_seq())
             .unwrap_or(0);
         Some(FsDisplayUnitHoldoverPage {
+            crop: self.prepared_single_page_crop(
+                idx,
+                source_size
+                    .map(|v| [v.x.max(1.0) as usize, v.y.max(1.0) as usize])
+                    .unwrap_or(texture.size()),
+                rendition_ctx.is_some_and(|ctx| self.original_preview_active_for_frame(ctx, idx)),
+            ),
             occurrence,
             texture,
             rotation,
@@ -12892,18 +12984,13 @@ impl App {
     /// 持っている間、メイン ctx の modifier event は届かない
     /// (= `i.modifiers.shift` が常に false)。元画像表示の修飾キー検出と同じ理由。
     fn original_preview_active(&self, ctx: &egui::Context, idx: usize) -> bool {
-        // 比較表示中は元画像表示を無効にする (利用者判断 2026-08-13、§1.79)。
-        //
-        // 比較は加工済みピクセルから合成した対を描くので、元画像表示はもともと画面に効かない。
-        // それでいて有効なままにすると、比較用 source が確定していない扱いになって
-        // 「比較表示を準備中」トーストが出たり、組み上がった対が捨てられたりする。
-        // 見た目が変わらないのに副作用だけ起きる状態なので、ここで断つ。
-        //
-        // 「ワイプを保ったまま両側を元画像にする」形にするなら §1.79 を実装する。
-        // その場合はこの早期 return を外し、元画像版の対を用意する経路へ差し替える。
-        if !matches!(self.compare_view_mode, crate::app::CompareViewMode::Off) {
-            return false;
-        }
+        // §1.79: 通常経路は比較 Off のときだけ final pipeline を迂回する。
+        // 比較経路は同じ押下観測で pair の元画像版を選び、通常経路の副作用を起こさない。
+        matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
+            && self.original_preview_hold_active(ctx, idx)
+    }
+
+    fn original_preview_hold_active(&self, ctx: &egui::Context, idx: usize) -> bool {
         if self.fs_navigation_sequence_blocks_new_target() {
             // シーケンス進行中に画面へ出ているのは holdover (前の表示単位) であり、現ページでは
             // ない。「現ページの元画像を見せる」約束は対象が画面に無いので成立しない。
@@ -13010,7 +13097,7 @@ impl App {
         }
 
         let sequence_blocks_new_target_at_write = self.fs_navigation_sequence_blocks_new_target();
-        let active = self.original_preview_active(ctx, idx);
+        let active = self.original_preview_hold_active(ctx, idx);
         let sample = FsOriginalPreviewFrameSample {
             frame_nr,
             items_generation: self.items_generation,
@@ -13033,9 +13120,11 @@ impl App {
     }
 
     fn original_preview_active_for_frame(&self, ctx: &egui::Context, idx: usize) -> bool {
-        self.original_preview_frame_observation(ctx, idx)
-            .sample
-            .active
+        matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
+            && self
+                .original_preview_frame_observation(ctx, idx)
+                .sample
+                .active
     }
 
     /// 現在の表示が final pipeline (補正 / AI / カラー化合成) を迂回するか。
@@ -13240,7 +13329,7 @@ impl App {
                     return self.resolve_local_adjust_source_material(ctx, idx);
                 }
                 LocalAdjustPreviewAction::FullComposite => {
-                    if let Some(local_adjust_tex) = self.current_local_adjust_material(idx) {
+                    if let Some(local_adjust_tex) = self.ensure_local_adjust_material(ctx, idx) {
                         return Some(local_adjust_tex);
                     }
                     return self.resolve_local_adjust_source_material(ctx, idx);
@@ -13249,7 +13338,7 @@ impl App {
         }
 
         if self.conceal_mode && !self.conceal_preview_active {
-            if let Some(local_adjust_tex) = self.current_local_adjust_material(idx) {
+            if let Some(local_adjust_tex) = self.ensure_local_adjust_material(ctx, idx) {
                 return Some(local_adjust_tex);
             }
             if let Some(erase_result_tex) = self.ensure_erase_result_material(ctx, idx) {
@@ -13293,6 +13382,15 @@ impl App {
             .as_ref()
             .and_then(FsHoldover::navigation_sequence)
             .is_some_and(FsNavigationSequence::blocks_new_target)
+    }
+
+    pub(crate) fn fs_list_order_navigation_blocks_new_target(&self) -> bool {
+        self.fs_holdover_tex.as_ref().is_some_and(|owner| {
+            owner.folder_navigation_origin() == crate::app::FsFolderNavigationOrigin::ListOrder
+                // Failed renditions retain their pixels; password waits suspend this lock.
+                // Both keep the existing sequence's phase policy rather than its worker alive.
+                && owner.navigation_sequence().is_none_or(FsNavigationSequence::blocks_new_target)
+        })
     }
 
     /// Record that a navigation request was dropped, and why.
@@ -13588,13 +13686,18 @@ impl App {
                 .get(page.idx)
                 .is_some_and(GridItem::has_page_data)
         }) {
+            let origin = self
+                .fs_holdover_tex
+                .as_ref()
+                .unwrap()
+                .folder_navigation_origin();
             let previous = self
                 .fs_holdover_tex
                 .as_ref()
                 .and_then(FsHoldover::navigation_sequence)
                 .and_then(|sequence| sequence.previous.clone());
             self.finish_similar_move_diagnostic("display_target_not_page_data");
-            self.fs_holdover_tex = Some(FsHoldover::FolderNavigation(previous));
+            self.fs_holdover_tex = Some(FsHoldover::FolderNavigation(previous, origin));
             return false;
         }
         if let Some(sequence) = self
@@ -14004,7 +14107,7 @@ impl App {
                     accepted_generation
                 } if self.items_generation > accepted_generation
             ),
-            Some(FsHoldover::FolderNavigation(_)) => self
+            Some(FsHoldover::FolderNavigation(_, _)) => self
                 .fs_nav_locked_gen
                 .is_some_and(|locked_generation| self.items_generation > locked_generation),
             Some(FsHoldover::PresentationSwitch(_) | FsHoldover::FinalEffectSourceReload(_))
@@ -14108,7 +14211,8 @@ impl App {
                     }
                     return None;
                 }
-                if let Some(FsHoldover::FolderNavigation(previous)) = self.fs_holdover_tex.as_mut()
+                if let Some(FsHoldover::FolderNavigation(previous, _)) =
+                    self.fs_holdover_tex.as_mut()
                 {
                     // The legacy navigation owner outlives its drawable resource.  Keep the
                     // owner until poll/release reaches the terminal transition so an internal
@@ -14179,7 +14283,7 @@ impl App {
     ) {
         let had_navigation_owner = matches!(
             self.fs_holdover_tex.as_ref(),
-            Some(FsHoldover::FolderNavigation(_) | FsHoldover::NavigationSequence(_))
+            Some(FsHoldover::FolderNavigation(_, _) | FsHoldover::NavigationSequence(_))
         );
         let diagnostic_reason = match finish {
             crate::app::FsNavigationSequenceFinish::Superseded => "navigation_superseded",
@@ -14284,9 +14388,16 @@ impl App {
     /// なるのを防ぐ。`items_generation` のスナップショットは `poll_fs_nav_lock` の
     /// 「items が入れ替わる前にロックを解除しない」判定に使う。
     pub(crate) fn capture_fs_nav_holdover(&mut self, fs_idx: usize) {
+        // Recapturing an active transition keeps its admission policy. A retained failed or
+        // suspended sequence must not revive that policy for a newly accepted legacy request.
+        let origin = if self.fs_list_order_navigation_blocks_new_target() {
+            crate::app::FsFolderNavigationOrigin::ListOrder
+        } else {
+            crate::app::FsFolderNavigationOrigin::Ordinary
+        };
         let previous = self.capture_fs_display_unit(fs_idx);
         self.finish_superseded_fs_navigation_diagnostic();
-        self.fs_holdover_tex = Some(FsHoldover::FolderNavigation(previous));
+        self.fs_holdover_tex = Some(FsHoldover::FolderNavigation(previous, origin));
         self.fs_nav_locked_gen = Some(self.items_generation);
     }
 
@@ -14311,7 +14422,7 @@ impl App {
             .fs_holdover_tex
             .as_ref()
             .and_then(|holdover| match holdover {
-                FsHoldover::FolderNavigation(previous) => previous.clone(),
+                FsHoldover::FolderNavigation(previous, _) => previous.clone(),
                 FsHoldover::PresentationSwitch(unit) => Some(unit.clone()),
                 FsHoldover::NavigationSequence(sequence) => sequence.previous.clone(),
                 FsHoldover::FinalEffectSourceReload(_) => None,
@@ -14324,7 +14435,7 @@ impl App {
             && self.fullscreen_idx.is_none()
             && !matches!(
                 self.fs_holdover_tex.as_ref(),
-                Some(FsHoldover::FolderNavigation(_) | FsHoldover::NavigationSequence(_))
+                Some(FsHoldover::FolderNavigation(_, _) | FsHoldover::NavigationSequence(_))
             )
         {
             if let Some(trace) = purpose.take_diagnostic_trace() {
@@ -14470,9 +14581,9 @@ impl App {
     }
 
     /// フルスクリーン通常モードのズーム/パンが有効なら返す。
-    /// 閾値以下なら None (描画側で無変換パスに流れるよう明示するため)。
+    /// 1.0 付近の誤差範囲だけ None。縮小も描画側へ渡す。
     pub(crate) fn fs_zoom_pan(&self) -> Option<(f32, egui::Vec2)> {
-        if self.fs_zoom > ZOOM_NEAR_ONE || self.fs_pan.length_sq() > PAN_EPSILON_SQ {
+        if zoom_differs_from_fit(self.fs_zoom) || self.fs_pan.length_sq() > PAN_EPSILON_SQ {
             Some((self.fs_zoom, self.fs_pan))
         } else {
             None
@@ -14682,7 +14793,7 @@ impl App {
         state: &FsFrameState,
         seek_geometry: StillSeekGeometry,
     ) -> Option<DisplayedImageTransform> {
-        self.draw_fs_zoom_mode_with_receipt(
+        let painted = self.draw_fs_zoom_mode_with_receipt(
             ui,
             ctx,
             image_rect,
@@ -14691,7 +14802,28 @@ impl App {
             state,
             seek_geometry,
             None,
-        )
+        );
+        if let Some(transform) = painted.as_ref() {
+            let crop = self.prepare_single_crop_from_frame_state(fs_idx, state);
+            Self::paint_fs_frame_crop(ui, transform, crop);
+        }
+        painted
+    }
+
+    /// Route flat composites to the shared crop owner at the original phase,
+    /// after grid/aim/Wipe and canvas overlays, before crop edit handles.
+    fn paint_fs_frame_crop(
+        ui: &egui::Ui,
+        transform: &DisplayedImageTransform,
+        crop: Option<crate::export_crop::CropSettings>,
+    ) {
+        if let Some(crop) = crop {
+            page_turn::paint_flat_crop(
+                &ui.painter().with_clip_rect(transform.viewport_rect),
+                transform,
+                crop,
+            );
+        }
     }
 
     fn draw_fs_zoom_mode_with_receipt(
@@ -14757,6 +14889,8 @@ impl App {
                 None,
                 submitted,
                 false,
+                None,
+                page_turn::FlatCropPaint::WithPage,
             );
         };
         // 表示トリムが有効ならズーム対象をトリム後 bbox に絞る (切り落とした余白を見せない)。
@@ -14863,6 +14997,11 @@ impl App {
             trim_bbox,
             submitted,
             false,
+            // Z composes its aim/grid overlays before the shared crop owner.
+            // It is not an animated page; ordinary/canonical crop binding stays
+            // with the normal prepared-page path.
+            None,
+            page_turn::FlatCropPaint::WithPage,
         );
         if active {
             // Phase C: PDF ページはズーム後の実効倍率で高解像度へ再レンダ (鮮明化)。毎フレ呼ぶと
@@ -14965,6 +15104,9 @@ impl App {
         let Some(fov_y) = panorama_touch_zoom_fov(pano.fov_y, factor, pano.projection) else {
             return false;
         };
+        if (fov_y - pano.fov_y).abs() <= f32::EPSILON {
+            return false;
+        }
         pano.fov_y = fov_y;
         pano.sanitize();
         true
@@ -15030,6 +15172,30 @@ impl App {
         true
     }
 
+    /// Keyboard zoom shares the current viewer's zoom owner and existing clamps.
+    /// Keep the display center fixed: equal pivot/center points scale pan by
+    /// the zoom ratio for both Image and Analysis. No viewport geometry is needed.
+    fn apply_fs_key_zoom_step(&mut self, ctx: &egui::Context, zoom_in: bool) -> bool {
+        let factor = if zoom_in { 1.25 } else { 1.0 / 1.25 };
+        let owner = self.fs_zoom_owner();
+        let changed = match owner {
+            FsZoomOwner::ZoomMode => self.adjust_fs_zoom_factor(if zoom_in { 1.0 } else { -1.0 }),
+            FsZoomOwner::Panorama => self.apply_panorama_touch_zoom(factor),
+            FsZoomOwner::Image | FsZoomOwner::Analysis => {
+                self.apply_touch_zoom_factor_about_pivot(factor, egui::Pos2::ZERO, egui::Pos2::ZERO)
+            }
+        };
+        if changed {
+            match owner {
+                FsZoomOwner::Image => self.maybe_rerender_pdf(self.fs_zoom),
+                FsZoomOwner::Analysis => self.maybe_rerender_pdf(self.analysis_zoom),
+                FsZoomOwner::ZoomMode | FsZoomOwner::Panorama => {}
+            }
+            ctx.request_repaint();
+        }
+        changed
+    }
+
     /// ピンチ中の 2 本指平行移動を、いまの持ち主の pan へ流す。
     fn apply_touch_pan_delta(&mut self, delta: egui::Vec2, full_rect: egui::Rect) {
         match self.fs_zoom_owner() {
@@ -15058,19 +15224,7 @@ impl App {
         full_rect: egui::Rect,
         front: FsFrontPointerFrameInput,
     ) -> bool {
-        // ZipPla 風ズーム (照準中 / 確定中) は専用描画経路で fs_zoom/fs_pan を使わない。
-        // 中ボタンドラッグで不可視の fs_zoom を書き換えず、専用の fs_zoom_factor を動かす。
-        if self.fs_zoom_mode_engaged() {
-            return self.handle_zoom_mode_middle_drag(ctx, front);
-        }
-        // 360 度ビューも自前の視点を持つ。ここを塞がないと、中ボタンドラッグが
-        // 画面に何も起こさないまま fs_zoom を動かす (ピンチと同じ取りこぼし)。
-        // FOV はホイールが担当しているので、ここでは何もせず入力だけ消費する。
-        if matches!(self.fs_zoom_owner(), FsZoomOwner::Panorama) {
-            self.fs_middle_zoom_drag = None;
-            return ctx.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
-        }
-        let (is_down, is_pressed, is_released, current_pos) = ctx.input(|i| {
+        let (down, pressed, released, pos) = ctx.input(|i| {
             (
                 i.pointer.button_down(egui::PointerButton::Middle),
                 i.pointer.button_pressed(egui::PointerButton::Middle),
@@ -15079,149 +15233,222 @@ impl App {
                 i.pointer.interact_pos(),
             )
         });
-
-        // 押下開始フレーム: 現在のズーム/パン/ピボットをスナップショット。
-        // 同フレームで既にドラッグ中なら無視 (重複開始を防ぐ)。
-        if is_pressed && self.fs_middle_zoom_drag.is_none() {
-            if let Some(pos) = current_pos {
-                // 分析モードでは画像エリアが右パネル分左にずれるので中心が違う
-                let rect_center = if self.analysis_mode {
-                    analysis_image_rect(full_rect).center()
-                } else {
-                    full_rect.center()
-                };
-                let (start_zoom, start_pan) = if self.analysis_mode {
-                    (self.analysis_zoom, self.analysis_pan)
-                } else {
-                    (self.fs_zoom, self.fs_pan)
-                };
-                self.fs_middle_zoom_drag = Some(MiddleZoomDrag {
-                    pivot: pos,
-                    start_zoom,
-                    start_pan,
-                    rect_center,
-                    is_analysis: self.analysis_mode,
-                });
+        self.retire_changed_drag_zoom(ctx);
+        let owner = self.fs_zoom_owner();
+        if owner == FsZoomOwner::Panorama {
+            // Preserve the original middle-button consumption contract in 360.
+            if self
+                .fs_middle_zoom_drag
+                .as_ref()
+                .is_some_and(|drag| drag.input == ZoomDragInput::Middle)
+            {
+                self.fs_middle_zoom_drag = None;
             }
+            return down;
         }
+        let rect = if owner == FsZoomOwner::Analysis {
+            analysis_image_rect(full_rect)
+        } else {
+            full_rect
+        };
+        self.handle_drag_zoom(
+            ctx,
+            ZoomDragInput::Middle,
+            self.zoom_drag_surface(),
+            owner,
+            rect.center(),
+            true,
+            true,
+            pressed,
+            down,
+            released,
+            pos,
+        )
+    }
 
-        // ドラッグ中: 押しっぱなしの間、毎フレーム pivot からの差分で新しいズームを計算。
-        if is_down {
-            if let (Some(drag), Some(pos)) = (self.fs_middle_zoom_drag.clone(), current_pos) {
-                let dy = pos.y - drag.pivot.y;
-                if dy.abs() < MIDDLE_DRAG_THRESHOLD_PX {
-                    // しきい値以下: ズーム変更なし (クリック暴発防止)
-                    return true;
-                }
-                // 上方向 (dy < 0) で拡大、下方向で縮小
-                let factor = 2.0_f32.powf(-dy / MIDDLE_DRAG_UNIT_PX);
-                let new_zoom = (drag.start_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
-                // pivot 位置が画面上で動かないように pan を補正。ホイールズームと違い
-                // 差分累積ではなく毎回 start 値基準で計算することで、dy が元に戻れば
-                // pan も完全に元へ戻る (累積誤差が発生しない)。
-                let new_pan = zoom_preserve_pivot(
-                    drag.pivot,
-                    drag.rect_center,
-                    drag.start_pan,
-                    drag.start_zoom,
-                    new_zoom,
-                );
-                // 書き戻し先はドラッグ開始時の is_analysis で固定
-                // (途中でモードが切り替わっても書き先がブレないように)
-                if drag.is_analysis {
-                    self.analysis_zoom = new_zoom;
-                    self.analysis_pan = new_pan;
-                } else {
-                    self.fs_zoom = new_zoom;
-                    self.set_fs_pan_from_input(new_zoom, new_pan);
-                }
-                return true;
+    fn zoom_drag_surface(&self) -> ZoomDragSurface {
+        if self.is_overlay_edit_mode_active() {
+            ZoomDragSurface::Overlay
+        } else {
+            ZoomDragSurface::Viewer
+        }
+    }
+
+    /// Retire at the ownership boundary, without writing a now-hidden zoom or
+    /// scheduling a render through a different owner. Keep the primary stream
+    /// suppressed after a surface/mode switch until its physical release.
+    fn retire_changed_drag_zoom(&mut self, ctx: &egui::Context) -> bool {
+        let changed = self.fs_middle_zoom_drag.as_ref().is_some_and(|drag| {
+            drag.surface != self.zoom_drag_surface() || drag.owner != self.fs_zoom_owner()
+        });
+        if !changed {
+            return false;
+        }
+        let drag = self.fs_middle_zoom_drag.take().unwrap();
+        if drag.input == ZoomDragInput::Scrub {
+            if ctx.input(|i| i.pointer.primary_down()) {
+                self.fs_primary_suppression.arm_pointer_stream();
             }
+            return true;
         }
-
-        // リリース: PDF のときだけ新倍率で再レンダリング要求 (ドラッグ中は発行しない)。
-        if is_released {
-            if let Some(drag) = self.fs_middle_zoom_drag.take() {
-                let final_zoom = if drag.is_analysis {
-                    self.analysis_zoom
-                } else {
-                    self.fs_zoom
-                };
-                if (final_zoom - drag.start_zoom).abs() > f32::EPSILON {
-                    self.maybe_rerender_pdf(final_zoom);
-                }
-                return true;
-            }
-        }
-
         false
     }
 
-    fn handle_zoom_mode_middle_drag(
+    /// One owner and one start-relative calculation for middle and primary scrub drags.
+    /// A scrub whose chord ends retains the physical primary stream until release.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_drag_zoom(
         &mut self,
         ctx: &egui::Context,
-        front: FsFrontPointerFrameInput,
+        input: ZoomDragInput,
+        surface: ZoomDragSurface,
+        owner: FsZoomOwner,
+        rect_center: egui::Pos2,
+        held: bool,
+        can_start: bool,
+        pressed: bool,
+        down: bool,
+        released: bool,
+        pos: Option<egui::Pos2>,
     ) -> bool {
-        let (is_down, is_pressed, is_released, current_pos) = ctx.input(|i| {
-            (
-                i.pointer.button_down(egui::PointerButton::Middle),
-                i.pointer.button_pressed(egui::PointerButton::Middle),
-                !front.owns_release(egui::PointerButton::Middle)
-                    && i.pointer.button_released(egui::PointerButton::Middle),
-                i.pointer.interact_pos(),
-            )
-        });
-
-        if is_pressed && self.fs_middle_zoom_drag.is_none() {
-            if let Some(pos) = current_pos {
-                self.fs_middle_zoom_drag = Some(MiddleZoomDrag {
-                    pivot: pos,
-                    start_zoom: self.fs_zoom_factor,
-                    start_pan: egui::Vec2::ZERO,
-                    rect_center: egui::Pos2::ZERO,
-                    is_analysis: false,
-                });
+        if let Some(drag) = &self.fs_middle_zoom_drag {
+            if drag.input != input || drag.surface != surface {
+                return false;
             }
-        }
-
-        if is_down {
-            if let (Some(drag), Some(pos)) = (self.fs_middle_zoom_drag.clone(), current_pos) {
-                let dy = pos.y - drag.pivot.y;
-                if dy.abs() < MIDDLE_DRAG_THRESHOLD_PX {
-                    return true;
+            if drag.owner != owner || drag.surface != self.zoom_drag_surface() {
+                self.fs_middle_zoom_drag = None;
+                if input == ZoomDragInput::Scrub && down {
+                    self.fs_primary_suppression.arm_pointer_stream();
                 }
-                let factor = 2.0_f32.powf(-dy / MIDDLE_DRAG_UNIT_PX);
-                self.fs_zoom_factor = (drag.start_zoom * factor).clamp(0.05, 16.0);
-                ctx.request_repaint();
-                return true;
+                return input == ZoomDragInput::Scrub;
             }
+        } else if held
+            && can_start
+            && pressed
+            && let Some(pivot) = pos
+        {
+            let (start_zoom, start_pan) = match owner {
+                FsZoomOwner::Image => (self.fs_zoom, self.fs_pan),
+                FsZoomOwner::Analysis => (self.analysis_zoom, self.analysis_pan),
+                FsZoomOwner::ZoomMode => (self.fs_zoom_factor, egui::Vec2::ZERO),
+                FsZoomOwner::Panorama => (1.0, egui::Vec2::ZERO),
+            };
+            self.fs_middle_zoom_drag = Some(MiddleZoomDrag {
+                input,
+                surface,
+                owner,
+                pivot,
+                start_zoom,
+                start_pan,
+                rect_center,
+                phase: ZoomDragPhase::Dragging,
+            });
         }
-
-        if is_released && self.fs_middle_zoom_drag.take().is_some() {
-            ctx.request_repaint();
-            return true;
+        let Some(drag) = self.fs_middle_zoom_drag.clone() else {
+            return false;
+        };
+        if drag.phase == ZoomDragPhase::Dragging {
+            if !held || released || !down {
+                self.finish_drag_zoom(&drag);
+                if input == ZoomDragInput::Scrub && down && !released {
+                    self.fs_middle_zoom_drag.as_mut().unwrap().phase = ZoomDragPhase::AwaitRelease;
+                } else {
+                    self.fs_middle_zoom_drag = None;
+                }
+            } else if let Some(pos) = pos
+                && let Some((zoom, pan)) = drag.zoom_at(pos)
+            {
+                match drag.owner {
+                    FsZoomOwner::Image => {
+                        self.fs_zoom = zoom;
+                        self.set_fs_pan_from_input(zoom, pan);
+                    }
+                    FsZoomOwner::Analysis => {
+                        self.analysis_zoom = zoom;
+                        self.analysis_pan = pan;
+                    }
+                    FsZoomOwner::ZoomMode => {
+                        if self.fs_zoom_factor != zoom {
+                            self.fs_zoom_factor = zoom;
+                            ctx.request_repaint();
+                        }
+                    }
+                    FsZoomOwner::Panorama => {}
+                }
+            }
+        } else if released || !down {
+            self.fs_middle_zoom_drag = None;
         }
+        input == ZoomDragInput::Scrub || released || (down && pos.is_some())
+    }
 
-        false
+    fn finish_drag_zoom(&mut self, drag: &MiddleZoomDrag) {
+        let zoom = match drag.owner {
+            FsZoomOwner::Image => self.fs_zoom,
+            FsZoomOwner::Analysis => self.analysis_zoom,
+            FsZoomOwner::ZoomMode | FsZoomOwner::Panorama => return,
+        };
+        if (zoom - drag.start_zoom).abs() > f32::EPSILON {
+            self.maybe_rerender_pdf(zoom);
+        }
     }
 
     /// Overlay editing tools share Photoshop-style temporary pan: hold Space and
-    /// drag with the primary button. `can_start` should be false over tool panels,
-    /// but an already-started pan continues if the pointer crosses a panel.
+    /// drag with the primary button, or hold the scrub chord to zoom horizontally.
+    /// `can_start` controls admission only: callers must service this owner before
+    /// rejecting panel input, including on the release frame. An owned pan/scrub
+    /// continues and ends even when `can_start` is false over a tool panel.
     pub(crate) fn handle_overlay_space_pan_drag(
         &mut self,
         ctx: &egui::Context,
         space_held: bool,
+        scrub_held: bool,
+        rect_center: egui::Pos2,
         can_start: bool,
         primary_pressed: bool,
         primary_down: bool,
         primary_released: bool,
         pointer_pos: Option<egui::Pos2>,
     ) -> bool {
+        let scrub_held = scrub_held && !self.any_modal_dialog_open_for_fullscreen_keys();
+        // Scrub wins here, including Crop's Ctrl+Space pan exception.
+        let scrub_active = self.fs_middle_zoom_drag.as_ref().is_some_and(|drag| {
+            drag.input == ZoomDragInput::Scrub && drag.surface == ZoomDragSurface::Overlay
+        });
+        if scrub_active || (scrub_held && self.fs_pan_drag_start.is_none()) {
+            let used = self.handle_drag_zoom(
+                ctx,
+                ZoomDragInput::Scrub,
+                ZoomDragSurface::Overlay,
+                self.fs_zoom_owner(),
+                rect_center,
+                scrub_held,
+                can_start,
+                primary_pressed,
+                primary_down,
+                primary_released,
+                pointer_pos,
+            );
+            if used || (scrub_held && can_start) {
+                // A concurrent middle drag keeps the zoom owner; the scrub chord
+                // still claims this primary press so tools cannot start drawing.
+                if !used && primary_pressed {
+                    self.fs_primary_suppression.arm_pointer_stream();
+                }
+                ctx.set_cursor_icon(egui::CursorIcon::ZoomIn);
+                return true;
+            }
+        }
         let active = self.fs_pan_drag_start.is_some();
         if !space_held {
             if active {
                 self.fs_pan_drag_start = None;
+                // Ctrl added during an existing Space pan must not turn that
+                // same primary stream into a brush stroke or a new zoom.
+                if scrub_held && primary_down {
+                    self.fs_primary_suppression.arm_pointer_stream();
+                    return true;
+                }
             }
             return false;
         }
@@ -15338,19 +15565,60 @@ fn should_draw_fs_pixel_grid(
 
 /// 中ボタンドラッグズームのスナップショット状態 (v0.8.1)。
 /// ドラッグ開始フレームで固定し、以降はここからの差分でズームを計算する。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZoomDragInput {
+    Middle,
+    Scrub,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZoomDragSurface {
+    Viewer,
+    Overlay,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZoomDragPhase {
+    Dragging,
+    AwaitRelease,
+}
+
 #[derive(Clone)]
 pub(crate) struct MiddleZoomDrag {
-    /// ドラッグ開始時のカーソル位置 (このピボットが画面上で動かないように pan を補正)
-    pub pivot: egui::Pos2,
-    /// 開始時の zoom (fs_zoom または analysis_zoom のいずれか)
-    pub start_zoom: f32,
-    /// 開始時の pan
-    pub start_pan: egui::Vec2,
-    /// ピボット計算に使う画像エリアの中心 (通常モードは full_rect.center()、
-    /// 分析モードは analysis_image_rect.center())
-    pub rect_center: egui::Pos2,
-    /// ドラッグ開始時に分析モードだったか (途中でモード切替されても書き戻し先を固定)
-    pub is_analysis: bool,
+    input: ZoomDragInput,
+    surface: ZoomDragSurface,
+    owner: FsZoomOwner,
+    phase: ZoomDragPhase,
+    pivot: egui::Pos2,
+    start_zoom: f32,
+    start_pan: egui::Vec2,
+    rect_center: egui::Pos2,
+}
+
+impl MiddleZoomDrag {
+    fn zoom_at(&self, pos: egui::Pos2) -> Option<(f32, egui::Vec2)> {
+        let distance = match self.input {
+            ZoomDragInput::Middle => self.pivot.y - pos.y,
+            ZoomDragInput::Scrub => pos.x - self.pivot.x,
+        };
+        if distance.abs() < MIDDLE_DRAG_THRESHOLD_PX {
+            return None;
+        }
+        let (min, max) = if self.owner == FsZoomOwner::ZoomMode {
+            (0.05, 16.0)
+        } else {
+            (ZOOM_MIN, ZOOM_MAX)
+        };
+        let zoom = (self.start_zoom * 2.0_f32.powf(distance / MIDDLE_DRAG_UNIT_PX)).clamp(min, max);
+        let pan = zoom_preserve_pivot(
+            self.pivot,
+            self.rect_center,
+            self.start_pan,
+            self.start_zoom,
+            zoom,
+        );
+        Some((zoom, pan))
+    }
 }
 
 /// 分析モード時の画像表示領域（パネル分を右側に確保した残り）を返す。
@@ -18414,6 +18682,28 @@ struct FsFrameState {
     pdf_content_type: Option<PdfPageContentType>,
 }
 
+impl FsFrameState {
+    /// The existing viewport builder needs a still surface, not an image pipeline result.
+    /// Overview content comes from its metadata projection; never fabricate a backdrop texture.
+    fn overview_shell() -> Self {
+        Self {
+            is_video: false,
+            original_preview_active: false,
+            page_turn_decision: FsPageTurnDecision::normal(),
+            tex: None,
+            thumb_tex: None,
+            location_display: String::new(),
+            image_dims: None,
+            image_file_size: None,
+            image_downscaled: false,
+            is_loading: false,
+            vst3_waiting_for_video: false,
+            fs_load_failed: false,
+            pdf_content_type: None,
+        }
+    }
+}
+
 /// Per-frame page-turn choices. Paint selection owns full-resolution work admission: a target
 /// painted from its materialized source must be allowed to produce and consume the work that can
 /// retire its navigation sequence, while a ready pass-through rendition keeps that work deferred.
@@ -19271,6 +19561,7 @@ pub(crate) struct FsKeyAction {
     pub(crate) close_to_page_list: bool,
     pub(crate) page_nav: FsPageNav,
     pub(crate) ctrl_nav: Option<i32>,
+    pub(crate) list_order_nav: Option<bool>,
     pub(crate) sibling_nav: Option<i32>,
     pub(crate) mouse_nav: Option<crate::ui_main::AddressBarNav>,
     /// Home/End などの絶対ジャンプ先 item index
@@ -19291,7 +19582,7 @@ pub(crate) struct FsSeekInfo {
 impl FsSeekInfo {
     /// The page track/thumbnail content is available only for an all-image navigation list.
     /// Geometry and painting must use this same decision, including on the first frame.
-    fn has_page_strip_content(&self) -> bool {
+    pub(crate) fn has_page_strip_content(&self) -> bool {
         self.media_count == self.image_indices.len() && !self.image_indices.is_empty()
     }
 }
@@ -19306,6 +19597,13 @@ pub(crate) struct ViewerNavigationCaches {
     source: Option<(u64, ReadingFlow)>,
     nav_indices: Option<Arc<Vec<usize>>>,
     still_image_indices: Option<Arc<Vec<usize>>>,
+    overview_projection: Option<(
+        Arc<crate::page_overview::PageOverviewMetadata>,
+        Result<
+            Arc<crate::page_overview::PageOverviewProjection>,
+            crate::page_overview::PageOverviewProjectionError,
+        >,
+    )>,
     fs_seek_info: Option<(usize, FsSeekInfo)>,
     /// Exact `items` classification memo for the current source generation.
     ///
@@ -19319,6 +19617,7 @@ impl ViewerNavigationCaches {
         self.source = None;
         self.nav_indices = None;
         self.still_image_indices = None;
+        self.overview_projection = None;
         self.fs_seek_info = None;
         self.all_items_are_images = None;
     }
@@ -22773,6 +23072,9 @@ impl App {
         image_rect: egui::Rect,
         window: &crate::app::DeferredDetachedImageWindowView,
     ) {
+        let Some(texture) = window.display.still() else {
+            return;
+        };
         let painter = ui.painter().with_clip_rect(full_rect);
         let bg_style = Self::detached_image_underlay_style(&window.image_underlay);
         let (paint_rect, uv_rect) = fs_image_paint_rect_and_uv(
@@ -22787,11 +23089,8 @@ impl App {
             &bg_style,
         );
         #[cfg(test)]
-        crate::app::paint_record_test_support::record_selected_paint_resource(
-            &painter,
-            &window.texture,
-        );
-        window.texture.paint_source_region(
+        crate::app::paint_record_test_support::record_selected_paint_resource(&painter, texture);
+        texture.paint_source_region(
             &painter,
             image_rect,
             window.rotation,
@@ -22800,8 +23099,8 @@ impl App {
             egui::Color32::WHITE,
         );
         #[cfg(all(windows, feature = "test-script"))]
-        crate::test_script::record_drawn_paint(&painter, &window.texture, "snapshot_direct".into());
-        window.texture.retain_native_output_for_paint(&painter);
+        crate::test_script::record_drawn_paint(&painter, texture, "snapshot_direct".into());
+        texture.retain_native_output_for_paint(&painter);
     }
 
     #[cfg(all(test, windows))]
@@ -22815,6 +23114,22 @@ impl App {
 
     #[cfg(windows)]
     fn draw_detached_image_window_snapshot(
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        window: &crate::app::DeferredDetachedImageWindowView,
+    ) -> Vec<(
+        crate::app::page_overview::PageOverviewCommand,
+        crate::app::DetachedPageOverviewInputProvenance,
+    )> {
+        if let Some(overview) = window.display.overview() {
+            return Self::draw_passive_page_overview(ui, full_rect, window, overview);
+        }
+        Self::draw_detached_still_image_snapshot(ui, full_rect, window);
+        Vec::new()
+    }
+
+    #[cfg(windows)]
+    fn draw_detached_still_image_snapshot(
         ui: &mut egui::Ui,
         full_rect: egui::Rect,
         window: &crate::app::DeferredDetachedImageWindowView,
@@ -23306,6 +23621,13 @@ impl App {
         batch: &mut DetachedImageWindowEventBatch,
     ) {
         match event {
+            crate::app::DeferredDetachedImageWindowEvent::PageOverview {
+                id,
+                command,
+                provenance,
+            } => {
+                self.queue_detached_page_overview_command(id, command, provenance);
+            }
             crate::app::DeferredDetachedImageWindowEvent::FirstCallback { id } => {
                 if self
                     .detached_image_windows
@@ -23832,8 +24154,14 @@ impl App {
                     self.detached_window_context_is_at_rest(window.id),
                     window.reopen_descriptor.is_some(),
                     window.reopen_sync_stamp.is_some(),
-                    window.texture.size_vec2().x,
-                    window.texture.size_vec2().y,
+                    window
+                        .display
+                        .still()
+                        .map_or(0.0, |texture| texture.size_vec2().x),
+                    window
+                        .display
+                        .still()
+                        .map_or(0.0, |texture| texture.size_vec2().y),
                     window.frozen_continuous_pages.len(),
                     window.activation_armed,
                     window.focused_last_frame,
@@ -23983,16 +24311,32 @@ impl App {
                                 "deferred_first_draw",
                             );
                         }
-                        Self::draw_detached_image_window_snapshot(ui, full_rect, &view);
+                        for (command, provenance) in
+                            Self::draw_detached_image_window_snapshot(ui, full_rect, &view)
+                        {
+                            shared.push_event(
+                                crate::app::DeferredDetachedImageWindowEvent::PageOverview {
+                                    id: view.id,
+                                    command,
+                                    provenance,
+                                },
+                            );
+                        }
                         #[cfg(feature = "test-script")]
                         if let Some(owner) = view.test_script_window_identity.clone() {
                             let content = view
                                 .frozen_continuous_pages
                                 .is_empty()
-                                .then(|| view.texture.test_script_content_proof())
+                                .then(|| {
+                                    view.display
+                                        .still()
+                                        .and_then(|texture| texture.test_script_content_proof())
+                                })
                                 .flatten()
                                 .filter(|proof| {
-                                    proof.source_texture_id == view.texture.source_texture_id()
+                                    view.display.still().is_some_and(|texture| {
+                                        proof.source_texture_id == texture.source_texture_id()
+                                    })
                                 })
                                 .cloned();
                             if eframe::miv_test_script_window_witness::active()
@@ -24005,13 +24349,18 @@ impl App {
                         } else {
                             crate::test_script::discard_drawn_paint(vp_ctx.viewport_id());
                         }
-                        Self::draw_detached_image_window_bar(
-                            ui,
-                            vp_ctx,
-                            full_rect,
-                            &view,
-                            &mut bar_close_requested,
-                        );
+                        if view.display.overview().is_some() {
+                            bar_close_requested |=
+                                Self::draw_page_overview_window_close(ui, full_rect);
+                        } else {
+                            Self::draw_detached_image_window_bar(
+                                ui,
+                                vp_ctx,
+                                full_rect,
+                                &view,
+                                &mut bar_close_requested,
+                            );
+                        }
                         if let Some(guide) = view.right_drag_guide.as_ref() {
                             crate::app::draw_right_drag_guide(ui.painter(), full_rect, guide);
                         }
@@ -24224,10 +24573,16 @@ impl App {
                                 let content = view
                                     .frozen_continuous_pages
                                     .is_empty()
-                                    .then(|| view.texture.test_script_content_proof())
+                                    .then(|| {
+                                        view.display
+                                            .still()
+                                            .and_then(|texture| texture.test_script_content_proof())
+                                    })
                                     .flatten()
                                     .filter(|proof| {
-                                        proof.source_texture_id == view.texture.source_texture_id()
+                                        view.display.still().is_some_and(|texture| {
+                                            proof.source_texture_id == texture.source_texture_id()
+                                        })
                                     })
                                     .cloned();
                                 test_script_passive_frame =
@@ -24449,7 +24804,7 @@ impl App {
         }
     }
 
-    fn fullscreen_seek_overlay_allowed(&self, fs_idx: usize, is_video: bool) -> bool {
+    pub(crate) fn fullscreen_seek_overlay_allowed(&self, fs_idx: usize, is_video: bool) -> bool {
         !is_video
             && self.items.get(fs_idx).is_some_and(GridItem::has_page_data)
             && !self.any_dialog_open()
@@ -24851,7 +25206,7 @@ impl App {
     /// 描画されるが、中身は全 items の filter+collect ×2。10k ページ級のアーカイブで
     /// フレームごとに作り直すのは純粋な無駄なので、一覧キャッシュと同じ owner に
     /// 乗せる。fs_idx (ページ移動) が変わったときだけ作り直す。
-    fn fullscreen_seek_info_cached(&mut self, fs_idx: usize) -> Option<FsSeekInfo> {
+    pub(crate) fn fullscreen_seek_info_cached(&mut self, fs_idx: usize) -> Option<FsSeekInfo> {
         self.viewer_navigation_caches
             .ensure_source(self.items_generation, self.reading_flow);
         if let Some(info) = self.viewer_navigation_caches.fs_seek_info(fs_idx) {
@@ -25092,7 +25447,7 @@ impl App {
         ctx.request_repaint();
     }
 
-    fn land_still_page_navigation_target(
+    pub(crate) fn land_still_page_navigation_target(
         &mut self,
         ctx: &egui::Context,
         current_idx: usize,
@@ -26487,14 +26842,18 @@ impl App {
         // holdover へ縮退させず、通常レンダラと同じ visible-pages 経路で描く。
         let holdover = self.fs_nav_holdover_for_draw();
         let navigation_chrome = self.fs_navigation_chrome_for_draw();
-        let current_still = self.fullscreen_idx.and_then(|idx| {
-            detached_backstop_current_kind(
-                self.items.get(idx),
-                self.fs_music_view_active(idx),
-                self.continuous_reading_active_for_idx(idx),
-            )
-            .map(|kind| (idx, kind))
-        });
+        let overview_view = self.page_overview_view();
+        let current_still = self
+            .fullscreen_idx
+            .filter(|_| overview_view.is_none())
+            .and_then(|idx| {
+                detached_backstop_current_kind(
+                    self.items.get(idx),
+                    self.fs_music_view_active(idx),
+                    self.continuous_reading_active_for_idx(idx),
+                )
+                .map(|kind| (idx, kind))
+            });
         let backstop_draw = if let Some((idx, kind)) = current_still {
             if kind == DetachedBackstopCurrentKind::Continuous {
                 DetachedBackstopStillDraw::CurrentContinuous { idx }
@@ -26586,6 +26945,10 @@ impl App {
                 .show(vp_ctx_ui, |ui| {
                     let full_rect = ui.max_rect();
                     let layout = self.fs_navigation_gap_layout(full_rect, navigation_chrome);
+                    if let Some(view) = overview_view.as_ref() {
+                        self.draw_page_overview_readonly(ui, view);
+                        return;
+                    }
                     match &backstop_draw {
                         DetachedBackstopStillDraw::CurrentContinuous { idx } => {
                             self.draw_fs_continuous_reading(
@@ -26931,9 +27294,11 @@ impl App {
             && !self.fs_music_view_active(fs_idx);
 
         let mut close_fs = false;
+        let mut presentation_close_requested = false;
         let mut close_to_page_list = false;
         let mut page_nav = FsPageNav::None;
         let mut ctrl_nav: Option<i32> = None;
+        let mut list_order_nav: Option<bool> = None;
         let mut sibling_nav: Option<i32> = None;
         let mut mouse_nav: Option<crate::ui_main::AddressBarNav> = None;
         let mut jump_to: Option<usize> = None;
@@ -27048,11 +27413,12 @@ impl App {
             detached_open_pending,
             detached_open_holdover_ready,
         ) = if detached && !embedded {
-            // Visibility/readiness probe only: this &self lookup neither captures
-            // a paint source nor accepts an offer/receipt. Actual viewport selection
-            // passes begin_page_turn_viewer_frame's service prefix. Existing close
-            // ordering is retained separately for barrier/no-barrier paths.
-            let display_ready = self.resolve_fs_display_tex(fs_idx, true).is_some();
+            let display_ready = match &self.page_overview {
+                crate::page_overview::PageOverviewState::Open(_) => true,
+                crate::page_overview::PageOverviewState::Closed => {
+                    self.resolve_fs_display_tex(fs_idx, true).is_some()
+                }
+            };
             let cache_state = match self.fs_cache.get(&fs_idx) {
                 Some(FsCacheEntry::Static { .. }) => "static",
                 Some(FsCacheEntry::Animated { .. }) => "animated",
@@ -27290,7 +27656,7 @@ impl App {
                             return;
                         }
                     };
-                    self.handle_fs_navigation_with_operation(
+                    self.handle_fs_navigation_with_list_order_operation(
                         &root.context,
                         root_action.close,
                         root_action.close_to_page_list,
@@ -27308,6 +27674,7 @@ impl App {
                             root_action.jump_to
                         },
                         input_idx,
+                        root_action.list_order_nav,
                         root_operation,
                     );
                     if self.paged_viewer_drawing_path_changed(embedded) {
@@ -27520,6 +27887,8 @@ impl App {
                     close_fs = true;
                 }
                 fs_setup_ms = setup_t0.elapsed().as_secs_f64() * 1000.0;
+                // Preserve viewport/system close when a later input action replaces the canvas.
+                presentation_close_requested = close_fs;
 
                 let central_t0 = std::time::Instant::now();
                 let mut music_view_frame_ui = MusicViewFrameUiState::default();
@@ -27536,9 +27905,46 @@ impl App {
                     .show(root_ui, |ui| {
                         if self.viewer_mutation_modal_active() { ui.disable(); }
                         let full_rect = ui.max_rect();
+                        // Physical stream lifetime belongs to this viewer pass, before keys
+                        // can replace its surface. Keep the terminal frame's suppression
+                        // decision even after the persistent owner has returned to Idle.
+                        let (overflow_pointer_input, overflow_touch_excluded) = self.capture_fs_front_pointer_input(ctx, full_rect);
+                        let primary_suppression = self.advance_viewer_primary_pointer_frame(ctx, overflow_pointer_input.primary_owned);
+                        if self.page_overview.session().is_some() {
+                            let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
+                            let mut key_page_transition = key_action.page_transition;
+                            if key_page_transition != FsKeyPageTransition::Closed {
+                                close_fs |= self.render_page_overview_surface_with_primary_frame(
+                                    ui, full_rect, primary_suppression, overflow_pointer_input.clone(),
+                                );
+                                // Pointer selection can also land after the key handler returned.
+                                key_page_transition = self.fs_page_transition_after_overview_input(fs_idx);
+                            }
+                            match key_page_transition {
+                                FsKeyPageTransition::Unchanged => {}
+                                FsKeyPageTransition::Closed => { frame_exited = true; return; },
+                                FsKeyPageTransition::Rebased { idx } => {
+                                    fs_idx = idx;
+                                    if self.paged_viewer_drawing_path_changed(embedded) {
+                                        frame_path_changed = true;
+                                        return;
+                                    }
+                                    let presentation;
+                                    (state, _, presentation, spread_pair, is_spread_double) =
+                                        self.prepare_paged_viewer_frame(ctx, idx, embedded, &mut fs_render_perf);
+                                    display_composition = presentation.composition;
+                                    continuous = presentation.continuous;
+                                    checking_mode_surface = presentation.checking_mode_surface;
+                                    display_permission_allowed = presentation.allowed;
+                                    paint_idx = presentation.paint_idx;
+                                    presentation_trace_allowed = display_permission_allowed && !continuous;
+                                    frame_snapshot = Some((idx, state.is_video));
+                                }
+                            }
+                            return;
+                        }
                         // Determine this frame's front owner before keys can close it and before
                         // any backing raw-input consumer or ScrollArea handles its wheel.
-                        let (overflow_pointer_input, overflow_touch_excluded) = self.capture_fs_front_pointer_input(ctx, full_rect);
                         let music_overflow_input = self.begin_music_overflow_frame_input(ctx, full_rect, fs_idx);
                         let mut hud_popup_wheel = self
                             .fullscreen_front_popup_wheel_target(ctx, full_rect, fs_idx, music_overflow_input)
@@ -27750,11 +28156,16 @@ impl App {
                         } else {
                             self.handle_fs_key_input_with_operation(ctx, fs_idx, is_spread_double, &mut navigation_operation)
                         };
-                        #[cfg(all(windows, feature = "test-script"))]
-                        if !embedded {
-                            crate::test_script::finish_action_pass(ctx);
-                        }
-                        match key_action.page_transition {
+                        let overview_rendered = self.page_overview.session().is_some();
+                        let key_page_transition = if overview_rendered {
+                            close_fs |= self.render_page_overview_surface_with_primary_frame(
+                                ui, full_rect, primary_suppression, overflow_pointer_input.clone(),
+                            );
+                            self.fs_page_transition_after_overview_input(fs_idx)
+                        } else {
+                            key_action.page_transition
+                        };
+                        match key_page_transition {
                             FsKeyPageTransition::Unchanged => {}
                             FsKeyPageTransition::Closed => {
                                 frame_exited = true;
@@ -27778,6 +28189,7 @@ impl App {
                                 frame_snapshot = Some((idx, state.is_video));
                             }
                         }
+                        if overview_rendered { return; }
                         let still_seek_geometry =
                             self.still_seek_geometry_for_idx(full_rect, fs_idx, state.is_video);
                         let resolved_fullscreen_media_rect = self.fullscreen_media_rect_with_geometry(
@@ -27792,6 +28204,7 @@ impl App {
                         }
                         page_nav = if continuation_committed { FsPageNav::None } else { key_action.page_nav };
                         ctrl_nav = key_action.ctrl_nav;
+                        list_order_nav = key_action.list_order_nav;
                         sibling_nav = key_action.sibling_nav;
                         mouse_nav = key_action.mouse_nav;
                         jump_to = if continuation_committed { None } else { key_action.jump_to };
@@ -27800,6 +28213,8 @@ impl App {
                             self.bump_input_seq("fs_key", Some(&format!("page_nav={page_nav:?}")));
                         } else if ctrl_nav.is_some() {
                             self.bump_input_seq("fs_ctrl_nav", None);
+                        } else if list_order_nav.is_some() {
+                            self.bump_input_seq("fs_list_order_nav", None);
                         } else if sibling_nav.is_some() {
                             self.bump_input_seq("fs_sibling_nav", None);
                         } else if mouse_nav.is_some() {
@@ -27822,10 +28237,11 @@ impl App {
                             prev_foreground_hwnd,
                             &mut similar_preview_navigator_input,
                             hud_popup_wheel.as_ref(),
+                            primary_suppression,
                             music_overflow_input.owns_pointer,
                             &mut navigation_operation,
                             continuation_committed || close_fs || close_to_page_list
-                                || ctrl_nav.is_some() || sibling_nav.is_some()
+                                || ctrl_nav.is_some() || list_order_nav.is_some() || sibling_nav.is_some()
                                 || mouse_nav.is_some() || jump_to.is_some(),
                             true,
                             overflow_pointer_input.clone(),
@@ -27854,14 +28270,54 @@ impl App {
                         } else if click_close {
                             self.bump_input_seq("fs_close_click", None);
                         }
+                        // Saved pointer actions can enter overview. Finish the current input
+                        // phase, then paint the new surface without reusing its physical edges.
+                        if self.page_overview.session().is_some() {
+                            // Navigation candidates belong to the replaced ordinary input phase.
+                            // Keep no old key/wheel/click result alive across the surface change.
+                            wheel_frame_proposal = None;
+                            navigation_operation = None;
+                            page_nav = FsPageNav::None;
+                            ctrl_nav = None;
+                            list_order_nav = None;
+                            sibling_nav = None;
+                            mouse_nav = None;
+                            jump_to = None;
+                            close_fs = presentation_close_requested;
+                            close_to_page_list = false;
+                            close_fs |= self.render_page_overview_after_pointer_dispatch(ui, full_rect);
+                            let key_page_transition = self.fs_page_transition_after_overview_input(fs_idx);
+                            match key_page_transition {
+                                FsKeyPageTransition::Unchanged => {}
+                                FsKeyPageTransition::Closed => { frame_exited = true; return; },
+                                FsKeyPageTransition::Rebased { idx } => {
+                                    fs_idx = idx;
+                                    if self.paged_viewer_drawing_path_changed(embedded) {
+                                        frame_path_changed = true;
+                                        return;
+                                    }
+                                    let presentation;
+                                    (state, _, presentation, spread_pair, is_spread_double) =
+                                        self.prepare_paged_viewer_frame(ctx, idx, embedded, &mut fs_render_perf);
+                                    display_composition = presentation.composition;
+                                    continuous = presentation.continuous;
+                                    checking_mode_surface = presentation.checking_mode_surface;
+                                    display_permission_allowed = presentation.allowed;
+                                    paint_idx = presentation.paint_idx;
+                                    presentation_trace_allowed = display_permission_allowed && !continuous;
+                                    frame_snapshot = Some((idx, state.is_video));
+                                }
+                            }
+                            fs_input_ms = input_t0.elapsed().as_secs_f64() * 1000.0;
+                            return;
+                        }
                         // ホイール/キーでページ移動が確定済みなら、
                         // ホバーバーのボタンホバーで上書きされないよう保護
                         let nav_locked = wheel_result.wheel_navigation_produced || !page_nav.is_none();
 
                         fs_input_ms = input_t0.elapsed().as_secs_f64() * 1000.0;
 
-                        #[cfg(windows)]
-                        if detached && self.step_detached_viewer_borderless_transition(ctx) {
+                        if self.paint_viewer_presentation_interlude(ui, full_rect, ctx, detached, canvas_color) {
                             return;
                         }
 
@@ -27914,6 +28370,7 @@ impl App {
                             || close_to_page_list
                             || !page_nav.is_none()
                             || ctrl_nav.is_some()
+                            || list_order_nav.is_some()
                             || sibling_nav.is_some()
                             || mouse_nav.is_some()
                             || jump_to.is_some()
@@ -27934,6 +28391,7 @@ impl App {
                         let media_t0 = std::time::Instant::now();
                         self.fullscreen_page_layout.clear();
                         let mut single_transform: Option<DisplayedImageTransform> = None;
+                        let mut flat_crop = page_turn::FlatCrop::None;
                         let mut primary_draw = CompareFramePrimaryDraw::OrdinaryOnly;
                         let mut navigator_texture_sources = if spread_pair == SpreadPair::Single {
                             FsNavigatorTextureSources::single(
@@ -28108,6 +28566,7 @@ impl App {
                                                     paint_idx,
                                                     compare_mode,
                                                     zp,
+                                                    None,
                                                 );
                                             if prepared_compare_drawn {
                                                 navigator_texture_sources.submission = FsDisplayUnitSubmission::LegacyRendered;
@@ -28133,6 +28592,7 @@ impl App {
                                                 } else {
                                                     self.view_trim_single_content_bbox(paint_idx)
                                                 };
+                                                let crop = self.prepare_single_crop_from_frame_state(paint_idx, &state);
                                                 let paint_resource =
                                                     self.fullscreen_paint_payload_for_page(
                                                         paint_idx, state.tex.clone(), state.original_preview_active,
@@ -28178,6 +28638,8 @@ impl App {
                                                     content_bbox,
                                                     selected_display_unit.is_current().then_some(&mut navigator_texture_sources),
                                                     self.settings.page_turn_animation_enabled && !state.original_preview_active && self.page_turn_view_eligible(fs_idx),
+                                                    crop,
+                                                    page_turn::FlatCropPaint::AfterCanvas(&mut flat_crop),
                                                 );
                                                 #[cfg(all(windows, feature = "test-script"))]
                                                 if painted.is_some() {
@@ -28273,6 +28735,9 @@ impl App {
                         }
                         fs_media_ms = media_t0.elapsed().as_secs_f64() * 1000.0;
 
+                        let original_preview_visual_active = self.original_preview_visual_active_for_frame(
+                            ctx, paint_idx, state.original_preview_active, primary_draw,
+                        );
                         let edit_canvas_t0 = std::time::Instant::now();
                         if similar_preview_presentation.is_none() {
                         // ── 消しゴムモード: マスク塗り＋オーバーレイ描画 ──
@@ -28282,7 +28747,7 @@ impl App {
                         // フレーム単位の遷移期間が存在する。この 1 フレームでは見開き
                         // レンダ + 消しゴム overlay を併発させずスキップして、次フレームに
                         // 単一ページ表示で消しゴムを描画する。
-                        if self.erase_mode && !is_spread_double && !state.original_preview_active {
+                        if self.erase_mode && !is_spread_double && !original_preview_visual_active {
                             if let Some(transform) = single_transform.as_ref() {
                                 self.handle_erase_paint(ctx, transform, overflow_pointer_input.clone());
                                 self.draw_erase_overlay(ui, ctx, transform);
@@ -28297,7 +28762,7 @@ impl App {
                         // 消しゴム同様、見開き中は 1 フレーム遷移期間で is_spread_double が
                         // true のまま conceal_mode = true になりうるので、その 1 フレームは
                         // overlay 描画をスキップして単一ページ表示で出す次フレームに描画する。
-                        if self.conceal_mode && !is_spread_double && !state.original_preview_active
+                        if self.conceal_mode && !is_spread_double && !original_preview_visual_active
                         {
                             if let Some(transform) = single_transform.as_ref() {
                                 self.handle_conceal_paint(ctx, transform, overflow_pointer_input.clone());
@@ -28310,7 +28775,7 @@ impl App {
 
                         // ── テキスト注釈モード: キャンバス選択/移動 + パネル描画 ──
                         // (Inc 3b 座標逆写像 + 選択 / 3c ドラッグ移動 / 3d IME 編集)。
-                        if self.text_mode && !is_spread_double && !state.original_preview_active {
+                        if self.text_mode && !is_spread_double && !original_preview_visual_active {
                             if let Some(transform) = single_transform.as_ref() {
                                 // 子ダイアログ表示中はキャンバスのポインタ操作を止める (Codex P2:
                                 // ダイアログ上のクリック/ドラッグが背面オブジェクトの選択/移動/削除に
@@ -28327,7 +28792,7 @@ impl App {
 
                         if self.local_adjust_mode
                             && !is_spread_double
-                            && !state.original_preview_active
+                            && !original_preview_visual_active
                         {
                             if let Some(transform) = single_transform.as_ref() {
                                 let la_input_t0 = std::time::Instant::now();
@@ -28347,7 +28812,7 @@ impl App {
                             let image_size = [w as usize, h as usize];
                             if self.sns_split.is_some()
                                 && !is_spread_double
-                                && !state.original_preview_active
+                                && !original_preview_visual_active
                                 && let Some(transform) = single_transform.as_ref()
                             {
                                 let pointer_allowed = !self.any_dialog_open()
@@ -28368,6 +28833,10 @@ impl App {
                                 ctx.request_repaint();
                             }
 
+                            // Only actual flat paint, including the first canonical
+                            // landing, produces this value. Curl owns face-projected
+                            // crop and leaves it empty through its last frame.
+                            flat_crop.paint();
                             let has_crop = self.export_crop_for_idx(paint_idx, image_size).is_some();
                             // crop はパイプライン最後段。crop の枠 / 暗転は「切り取りツール」
                             // または「素の通常表示」でのみ出す。各ツールは自分の手前までの
@@ -28380,7 +28849,7 @@ impl App {
                                 || self.adjustment_mode.is_open()
                                 || self.analysis_mode;
                             if !is_spread_double
-                                && !state.original_preview_active
+                                && !original_preview_visual_active
                                 && (self.export_crop_mode || (has_crop && !in_earlier_tool))
                                 && let Some(transform) = single_transform.as_ref()
                             {
@@ -28390,6 +28859,17 @@ impl App {
                                             self.export_crop_panel_rect(full_rect).contains(p)
                                         })
                                     });
+                                if matches!(transform.placement, ResolvedDisplayPlacement::Z { .. })
+                                    || primary_draw.draws_prepared_compare()
+                                {
+                                    let crop = self.prepare_single_crop_from_frame_state(paint_idx, &state)
+                                        .map(|crop| if primary_draw.draws_prepared_compare() {
+                                            // Compare's canvas can differ from the source;
+                                            // keep the same coordinates as its crop handles.
+                                            crop.scaled_to(image_size)
+                                        } else { crop });
+                                    Self::paint_fs_frame_crop(ui, transform, crop);
+                                }
                                 let used = self.draw_export_crop_overlay(
                                     ui,
                                     transform,
@@ -28485,7 +28965,7 @@ impl App {
                         self.draw_original_preview_indicator(
                             ui,
                             content_rect,
-                            state.original_preview_active,
+                            original_preview_visual_active,
                         );
                         }
                         self.sync_slideshow_anchor_for_frame(ctx, paint_idx, &state);
@@ -28514,11 +28994,12 @@ impl App {
                         // ── 移動先ページ未提示インジケーター ──
                         // NavigationSequence は target display unit の全ページが live に描かれた
                         // frame で上の emit_fs_page_turn_ready_for_display_unit が破棄する。したがって
-                        // sequence 自身の未 retire 時間だけで判定し、decode pending の有無には
-                        // 結び付けない。decode 済みでも upload / presentation 待ちは起こり得る。
+                        // この pass で演出 owner の target unit を描いていれば表示しない。それ以外は
+                        // sequence の未 retire 時間で判定する。decode pending の有無には結び付けない。
                         if similar_preview_presentation.is_none()
                             && fs_page_wait_indicator_visible(
                             self.settings.fullscreen_processing_status_visible,
+                            self.fs_navigation_target_presented_by_page_turn(ctx, &navigator_texture_sources),
                             self.fs_holdover_tex.as_ref(),
                             paint_idx,
                             self.items_generation,
@@ -29189,75 +29670,13 @@ impl App {
                             self.draw_fs_ai_status(ui, fs_idx);
                         }
 
-                        // ── 右上フィードバックトースト ──
-                        let ring_surface_context = self
-                            .ring_shortcut_context_for_surface(crate::app::ActionSurface::Viewer);
-                        if self.mouse_ring_flick.is_some()
-                            && ring_surface_context
-                                == crate::ring_shortcut::RingShortcutContext::VideoFullscreen
-                        {
-                            self.sync_native_video_ring_guide_overlay_for_context(
-                                ctx,
-                                ring_surface_context,
-                            );
-                        }
-                        self.draw_mouse_ring_flick_overlay(ui, full_rect, ring_surface_context);
-                        self.draw_mouse_gesture_overlay(
-                            ui,
-                            full_rect,
-                            self.current_right_drag_context(),
-                        );
-                        self.draw_gamepad_ring_overlay(
-                            ui,
-                            full_rect,
-                            crate::app::ActionSurface::Viewer,
-                        );
-                        self.draw_gamepad_picker_overlay(
-                            ui,
-                            full_rect,
-                            crate::app::ActionSurface::Viewer,
-                        );
-                        self.draw_gamepad_favorite_picker_overlay(
-                            ui,
-                            full_rect,
-                            crate::app::ActionSurface::Viewer,
-                        );
-                        self.draw_gamepad_video_marker_picker_overlay(
-                            ui,
-                            full_rect,
-                            crate::app::ActionSurface::Viewer,
-                        );
-                        self.draw_feedback_toast(
-                            ui,
-                            full_rect,
-                            ctx,
-                            crate::app::ActionSurface::Viewer,
-                        );
-
-                        self.draw_colorize_wait_overlay(ui, full_rect, ctx);
-
-                        // ── スタンプ埋め込み worker の進行表示 (中央「読み込み中」) ──
-                        self.draw_stamp_embed_overlay(ui, full_rect, ctx);
-
-                        // ── 注釈ベイク worker の進行表示 (中央「テキスト処理中…」) ──
-                        self.draw_comic_bake_overlay(ui, full_rect, ctx);
-
-                        // 動画ブックマーク名編集ダイアログは native presenter overlay の
-                        // 中で描画される (= `native_presenter/overlay_draw.rs::draw_native_*`)。
-                        // eframe ビューポートからは描画しない。
-
-                        // ── 中央の先頭 / 末尾ヒント ──
-                        self.draw_boundary_hint(ui, full_rect, ctx);
+                        self.draw_viewer_shared_overlays(ui, full_rect, ctx);
 
                         // The touch help is the final canvas overlay: once it is visible,
                         // no panel, page, or gesture target should appear above its guide.
                         self.draw_still_touch_first_run_help_overlay(ui, ctx, full_rect, fs_idx);
 
-                        // ── スロット保存ダイアログ ──
-                        self.draw_slot_save_dialog(ctx);
-                        self.draw_favorite_default_clear_confirm_dialog(ctx);
-                        self.draw_export_dialog(ctx);
-                        self.draw_export_progress_dialog(ctx);
+                        self.draw_viewer_shared_dialogs(ctx);
 
                         // The popup edits temporary fields during drawing. Restore the
                         // previous state and persist the complete proposed presentation
@@ -29319,7 +29738,7 @@ impl App {
                                     if self.spread_mode.is_spread() && self.analysis_mode {
                                         self.reset_analysis_mode();
                                     }
-                                    self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
+                                    self.adjust_spread_target = None;
                                     if !spread_changed_from_direction {
                                         self.normalize_spread_position(ctx);
                                     }
@@ -29375,6 +29794,12 @@ impl App {
                         fs_tail_ms = tail_t0.elapsed().as_secs_f64() * 1000.0;
                     });
                 fs_central_ms = central_t0.elapsed().as_secs_f64() * 1000.0;
+                // Finish the same delivered action pass after either canvas mode, including
+                // overview's content return and presentation's black-frame suppression.
+                #[cfg(all(windows, feature = "test-script"))]
+                if !embedded {
+                    crate::test_script::finish_action_pass(ctx);
+                }
                 if frame_exited || frame_path_changed {
                     return;
                 }
@@ -29781,6 +30206,7 @@ impl App {
                     || close_fs
                     || close_to_page_list
                     || ctrl_nav.is_some()
+                    || list_order_nav.is_some()
                     || sibling_nav.is_some()
                     || mouse_nav.is_some()
                     || jump_to.is_some(),
@@ -29792,6 +30218,20 @@ impl App {
                 page_nav = result.page_nav;
             }
             close_fs |= result.close;
+            if self.page_overview.session().is_some() {
+                // This proposal was captured by the ordinary canvas. Its delayed
+                // secondary command can replace that canvas just like the immediate
+                // pointer path above. Spend the old phase once; retain only OS close.
+                navigation_operation = None;
+                page_nav = FsPageNav::None;
+                ctrl_nav = None;
+                list_order_nav = None;
+                sibling_nav = None;
+                mouse_nav = None;
+                jump_to = None;
+                close_to_page_list = false;
+                close_fs = presentation_close_requested;
+            }
         }
         let navigation_idx = self.fullscreen_idx.unwrap_or(fs_idx);
         self.handle_fs_navigation_with_render_perf(
@@ -29804,6 +30244,7 @@ impl App {
             page_nav,
             jump_to,
             navigation_idx,
+            list_order_nav,
             navigation_operation,
             &mut fs_render_perf,
         );
@@ -29839,6 +30280,9 @@ impl App {
 
     /// アニメーションフレームを進める（メインコンテキストの時刻を使う）。
     fn advance_animation(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.page_overview.session().is_some() {
+            return;
+        }
         let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         if is_video {
             return;
@@ -30055,7 +30499,9 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> Option<&'static str> {
-        if !self.reading_flow.is_paged() {
+        if self.page_overview.session().is_some() {
+            Some("page_overview")
+        } else if !self.reading_flow.is_paged() {
             Some("reading_flow_not_paged")
         } else if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
             Some("item_not_page_data")
@@ -30408,7 +30854,7 @@ impl App {
         self.service_final_prepare_before_lookup(ctx);
         let demand = self.book_target_presentation_demand(fs_idx);
         if !matches!(
-            self.book_presentation_allowed(&demand),
+            self.book_presentation_target_allowed(&demand),
             crate::book_composition::PresentationDecision::Allowed(_)
         ) {
             return FsPageTurnDecision::normal();
@@ -30905,7 +31351,9 @@ impl App {
                 self.finish_similar_move_diagnostic("presented");
                 self.similar_panel.complete_similar_book_visit(intent);
             }
-            FsNavigationPurpose::Ordinary | FsNavigationPurpose::SmartFolderNavigation { .. } => {
+            FsNavigationPurpose::Ordinary
+            | FsNavigationPurpose::ListOrderNavigation
+            | FsNavigationPurpose::SmartFolderNavigation { .. } => {
                 if let Some(location) = presented_location() {
                     self.similar_panel.observe_ordinary_book_page(location);
                 }
@@ -32451,7 +32899,46 @@ impl App {
         {
             self.invalidate_fullscreen_display_unit_owners();
         }
+        let metadata = Arc::clone(self.page_identity_index.overview_metadata());
+        if self
+            .viewer_navigation_caches
+            .overview_projection
+            .as_ref()
+            .is_none_or(|(cached, _)| !Arc::ptr_eq(cached, &metadata))
+        {
+            let retained = self
+                .page_overview
+                .session()
+                .map(|session| Arc::clone(&session.view().projection));
+            let projection = if let Some(retained) = retained.filter(|projection| {
+                Arc::ptr_eq(projection.metadata(), &metadata)
+                    && projection.reader_order().as_slice() == indices.as_slice()
+            }) {
+                Ok(retained)
+            } else {
+                self.close_page_overview();
+                crate::page_overview::PageOverviewProjection::new(
+                    Arc::clone(&metadata),
+                    Arc::clone(&indices),
+                )
+                .map(Arc::new)
+            };
+            self.viewer_navigation_caches.overview_projection = Some((metadata, projection));
+        }
         indices
+    }
+
+    pub(crate) fn prepared_page_overview_projection(
+        &mut self,
+    ) -> Option<Arc<crate::page_overview::PageOverviewProjection>> {
+        self.get_still_image_indices();
+        self.viewer_navigation_caches
+            .overview_projection
+            .as_ref()?
+            .1
+            .as_ref()
+            .ok()
+            .map(Arc::clone)
     }
 
     pub(crate) fn fullscreen_large_jump_target(
@@ -32786,7 +33273,7 @@ impl App {
                 if !self.set_live_spread_shift(anchor_idx) {
                     return;
                 }
-                self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
+                self.adjust_spread_target = None;
                 action.page_nav = FsPageNav::Target(new_idx);
             }
         } else {
@@ -33085,6 +33572,12 @@ impl App {
         if self.any_modal_dialog_open_for_fullscreen_keys() {
             return true;
         }
+        if self.page_overview.session().is_some() {
+            // The overview owns root forwarding too, including user-remapped chords.
+            // Its shared handler applies the runtime finite set and keyboard-owner gates.
+            self.handle_page_overview_keys(ctx);
+            return true;
+        }
         if !_owner.blocks_legacy_keymap_shortcuts() {
             self.page_turn_pre_draw(ctx);
         }
@@ -33153,6 +33646,8 @@ impl App {
             );
         } else if key_action.ctrl_nav.is_some() {
             self.bump_input_seq("fs_root_ctrl_nav", None);
+        } else if key_action.list_order_nav.is_some() {
+            self.bump_input_seq("fs_root_list_order_nav", None);
         } else if key_action.sibling_nav.is_some() {
             self.bump_input_seq("fs_root_sibling_nav", None);
         } else if key_action.mouse_nav.is_some() {
@@ -33163,7 +33658,7 @@ impl App {
             self.bump_input_seq("fs_root_close_key", None);
         }
 
-        self.handle_fs_navigation_with_operation(
+        self.handle_fs_navigation_with_list_order_operation(
             ctx,
             key_action.close,
             key_action.close_to_page_list,
@@ -33173,6 +33668,7 @@ impl App {
             key_action.page_nav,
             key_action.jump_to,
             fs_idx,
+            key_action.list_order_nav,
             navigation_operation,
         );
         true
@@ -33371,6 +33867,10 @@ impl App {
                     crate::key_input::SyntheticNavigationKey::F12 => KeyName::F12,
                     #[cfg(any(test, feature = "test-script"))]
                     crate::key_input::SyntheticNavigationKey::G => KeyName::G,
+                    #[cfg(test)]
+                    crate::key_input::SyntheticNavigationKey::Tab => KeyName::Tab,
+                    #[cfg(test)]
+                    crate::key_input::SyntheticNavigationKey::Space => KeyName::Space,
                 };
                 crate::test_script::KeymapLevelObservation {
                     frame_nr: observation.frame_nr,
@@ -33608,8 +34108,9 @@ impl App {
         let initial_demand = self
             .spread_display_composition_for_anchor(fs_idx)
             .presentation_demand(self.spread_mode, self.fullscreen_page_slice);
-        let target_load_allowed = !self.continuous_reading_active_for_idx(fs_idx)
-            && matches!(self.book_presentation_allowed(&initial_demand),
+        let target_load_allowed = self.page_overview.session().is_none()
+            && !self.continuous_reading_active_for_idx(fs_idx)
+            && matches!(self.book_presentation_target_allowed(&initial_demand),
                 crate::book_composition::PresentationDecision::Allowed(ref allowed)
                     if initial_demand.iter().zip(allowed).any(|(occurrence, allowed)|
                         occurrence.item_index == fs_idx && *allowed));
@@ -33665,7 +34166,9 @@ impl App {
         // Resolve permission in the actual drawing context after its pre-draw input commit.
         let presentation = self.resolve_book_fullscreen_presentation(fs_idx);
         let paint_idx = presentation.paint_idx;
-        let target_allowed = presentation.allowed && !presentation.continuous;
+        let target_allowed = self.page_overview.session().is_none()
+            && presentation.allowed
+            && !presentation.continuous;
         if target_allowed {
             if paint_idx != fs_idx {
                 self.ensure_fs_page_turn_target_load(page_turn_decision, paint_idx);
@@ -33713,12 +34216,16 @@ impl App {
             self.fullscreen_viewport_id()
         };
         self.sync_conceal_preview_before_pipeline(ctx, preview_viewport_id);
-        let state = self.prepare_fullscreen_state_with_permission(
-            ctx,
-            paint_idx,
-            page_turn_decision,
-            target_allowed,
-        );
+        let state = if self.page_overview.session().is_some() {
+            FsFrameState::overview_shell()
+        } else {
+            self.prepare_fullscreen_state_with_permission(
+                ctx,
+                paint_idx,
+                page_turn_decision,
+                target_allowed,
+            )
+        };
 
         (
             state,
@@ -34151,6 +34658,7 @@ impl App {
             close_to_page_list: false,
             page_nav: FsPageNav::None,
             ctrl_nav: None,
+            list_order_nav: None,
             sibling_nav: None,
             mouse_nav: None,
             jump_to: None,
@@ -34180,6 +34688,11 @@ impl App {
             return action;
         }
 
+        if self.page_overview.session().is_some() {
+            self.handle_page_overview_keys(ctx);
+            action.page_transition = self.fs_page_transition_after_overview_input(fs_idx);
+            return action;
+        }
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::mark_action_pass_eligible(ctx);
 
@@ -34202,7 +34715,18 @@ impl App {
                     .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }))
             })
         {
-            self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+            self.dismiss_fs_overflow_panel();
+        }
+
+        if !self.ime_input_active(ctx)
+            && !owner.blocks_legacy_keymap_shortcuts()
+            && self.page_overview_available()
+            && self
+                .keymap
+                .consume_action_no_repeat(ctx, KeyAction::FsPageOverviewToggle)
+        {
+            self.execute_page_overview_key_action(ctx, &KeyAction::FsPageOverviewToggle);
+            return action;
         }
 
         // ZipPla 風全画面ズーム (Z ホールド) のエッジ検出。編集/分析/見開き/連結/パノラマ/動画では
@@ -34956,6 +35480,12 @@ impl App {
         // ナビゲーションキーは input_mut で消費して、パネル内ウィジェット（スライダー等）に
         // 奪われないようにする
         let esc = self.consume_still_reader_close_key(ctx, fs_idx);
+        let list_next = self
+            .keymap
+            .consume_action_press_count(ctx, KeyAction::FsListOrderNext);
+        let list_prev = self
+            .keymap
+            .consume_action_press_count(ctx, KeyAction::FsListOrderPrev);
         // 左右キーは上下と分離して処理（RTL 反転のため）
         let ctrl_d_count = self
             .keymap
@@ -35228,6 +35758,9 @@ impl App {
             && !fs_music_view_active
             && self.fs_context_menu_idx.is_none()
             && self.keymap.consume_action(ctx, KeyAction::FsExport);
+        if !current_item_is_video && !fs_music_view_active && self.fs_context_menu_idx.is_none() {
+            self.handle_copy_action_keys(ctx, true);
+        }
         let key_sns_split = !is_video_fs
             && !fs_music_view_active
             && self.fs_context_menu_idx.is_none()
@@ -35620,6 +36153,21 @@ impl App {
         let key_0 =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsFitModeCycle);
 
+        // Keep media edges for FsVideo, and inherit the ordinary FsImage gates
+        // above (edit modes, overview, text/IME, modal and popup ownership).
+        if !self.fs_video_key_context_active(fs_idx) && !fs_music_view_active {
+            let zoom_in = self.keymap.consume_action(ctx, KeyAction::FsZoomIn);
+            let zoom_out = self.keymap.consume_action(ctx, KeyAction::FsZoomOut);
+            if zoom_in || zoom_out {
+                if zoom_in {
+                    self.apply_fs_key_zoom_step(ctx, true);
+                }
+                if zoom_out {
+                    self.apply_fs_key_zoom_step(ctx, false);
+                }
+            }
+        }
+
         // U / Shift+U / Alt+U: AI アップスケールモデル サイクル (次 / 前 / なしリセット)
         // 注意: egui の consume_key は matches_logically で判定されるため、Modifiers::NONE が
         // Shift/Alt を伴う入力まで吸収する。具体的な修飾子から先に consume する必要がある。
@@ -35999,6 +36547,24 @@ impl App {
                 action.close = true;
             }
         }
+        if list_next > 0 || list_prev > 0 {
+            if action.close || action.close_to_page_list {
+                return action;
+            }
+            // This operation has no accumulator: only the first press may start a
+            // navigation; subsequent presses during preparation are rejected.
+            let forward = list_prev == 0;
+            action.list_order_nav = Some(forward);
+            *navigation_operation = self.page_turn_navigation_key_operation(
+                ctx,
+                if forward {
+                    KeyAction::FsListOrderNext
+                } else {
+                    KeyAction::FsListOrderPrev
+                },
+            );
+            return action;
+        }
         // I / Tab は左右パネルの呼び出しモードを切り替える。
         if key_i {
             if self.adjustment_mode.is_open() {
@@ -36092,7 +36658,7 @@ impl App {
 
         // E: 消しゴムモード切り替え (分析・補正中は無効)。
         // 見開き中の起動は `enter_erase_mode` が一時的に Single に切り替えて
-        // 左ページを編集対象にする (Apply / Cancel で見開き状態に戻る)。
+        // 読む順の最初のページを編集対象にする (Apply / Cancel で見開き状態に戻る)。
         if key_e
             && !self.analysis_mode
             && !self.adjustment_mode.is_open()
@@ -36509,6 +37075,7 @@ impl App {
                 action.jump_to = Some(new_idx);
             } else {
                 self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
+                    scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                     at_end: forward,
                     at: std::time::Instant::now(),
                 });
@@ -36528,6 +37095,7 @@ impl App {
                 action.jump_to = Some(new_idx);
             } else {
                 self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
+                    scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                     at_end: forward,
                     at: std::time::Instant::now(),
                 });
@@ -36801,10 +37369,23 @@ impl App {
         });
     }
 
-    fn fullscreen_overflow_panel_view(&self, is_spread_double: bool) -> FsOverflowPanelView {
+    fn fullscreen_overflow_panel_view(&mut self, is_spread_double: bool) -> FsOverflowPanelView {
         let mut root_rows = Vec::new();
         for &item in FullscreenOverflowItemId::fixed_order() {
             let (label, status, enabled, disabled_reason) = match item {
+                FullscreenOverflowItemId::PageOverview => {
+                    let reason = self.page_overview_unavailable_reason();
+                    let enabled = self.page_overview_available();
+                    (
+                        self.keymap.first_chord_bracket_label(
+                            item.label(),
+                            KeyAction::FsPageOverviewToggle,
+                        ),
+                        String::new(),
+                        enabled,
+                        reason,
+                    )
+                }
                 FullscreenOverflowItemId::SpreadAdjustment => (
                     item.label().into(),
                     if self.spread_shift_anchor_idx().is_some() {
@@ -37174,6 +37755,17 @@ impl App {
         self.apply_fs_overflow_panel_action(ctx, &view, is_spread_double, action);
     }
 
+    pub(crate) fn dismiss_fs_overflow_panel(&mut self) {
+        self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+    }
+
+    pub(crate) fn dismiss_fs_transient_menu_state(&mut self) {
+        self.spread_popup_open = false;
+        self.fit_popup_open = false;
+        self.panorama_projection_popup_open = false;
+        self.dismiss_fs_overflow_panel();
+    }
+
     fn apply_fs_overflow_panel_action(
         &mut self,
         ctx: &egui::Context,
@@ -37188,7 +37780,7 @@ impl App {
                 self.start_local_composition_editor(ctx);
             }
             FsOverflowPanelAction::Close => {
-                self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+                self.dismiss_fs_overflow_panel();
             }
             FsOverflowPanelAction::Back => {
                 self.fs_overflow_panel_state = FsOverflowPanelState::Root;
@@ -37196,6 +37788,10 @@ impl App {
             FsOverflowPanelAction::Activate(item) => match item {
                 FullscreenOverflowItemId::SpreadAdjustment => {
                     self.fs_overflow_panel_state = FsOverflowPanelState::SpreadAdjustment;
+                }
+                FullscreenOverflowItemId::PageOverview => {
+                    self.dismiss_fs_overflow_panel();
+                    self.execute_page_overview_key_action(ctx, &KeyAction::FsPageOverviewToggle);
                 }
                 FullscreenOverflowItemId::NavigatorToggle => {
                     self.set_fullscreen_navigator_visible(
@@ -37323,6 +37919,14 @@ impl App {
         } else {
             FsOverflowPanelState::Root
         };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fullscreen_overflow_panel_rect_for_test(
+        &self,
+        full_rect: egui::Rect,
+    ) -> Option<egui::Rect> {
+        fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state)
     }
 
     pub(crate) fn fs_touch_tap_zones_enabled(&self) -> bool {
@@ -38305,6 +38909,7 @@ impl App {
         let ctrl_held =
             crate::keyboard_input::focused_key_state_permit(ctx).is_some_and(ctrl_held_via_os);
 
+        let original = self.compare_original_for_frame(ctx, fs_idx);
         let shader_shape = self
             .compare_preparation
             .prepared_pair()
@@ -38317,6 +38922,7 @@ impl App {
                     fraction,
                     None,
                     ctx.pixels_per_point(),
+                    original,
                 ),
                 crate::app::CompareViewMode::Diff => self.compare_shader_shape(
                     COMPARE_NAVIGATOR_SHADER_SLOT,
@@ -38326,6 +38932,7 @@ impl App {
                     0.5,
                     None,
                     ctx.pixels_per_point(),
+                    original,
                 ),
                 crate::app::CompareViewMode::Off | crate::app::CompareViewMode::PinnedNormal => {
                     None
@@ -38355,18 +38962,26 @@ impl App {
         };
         match mode {
             crate::app::CompareViewMode::PinnedNormal => {
-                let Some(tex) =
-                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Pinned)
-                else {
+                let Some(tex) = self.ensure_compare_prepared_texture(
+                    ctx,
+                    ComparePreparedTextureKind::Pinned,
+                    original,
+                ) else {
                     return false;
                 };
                 paint_texture(painter, &tex);
             }
             crate::app::CompareViewMode::Wipe { fraction, .. } => {
-                let current =
-                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Current);
-                let pinned =
-                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Pinned);
+                let current = self.ensure_compare_prepared_texture(
+                    ctx,
+                    ComparePreparedTextureKind::Current,
+                    original,
+                );
+                let pinned = self.ensure_compare_prepared_texture(
+                    ctx,
+                    ComparePreparedTextureKind::Pinned,
+                    original,
+                );
                 let (Some(current), Some(pinned)) = (current, pinned) else {
                     return false;
                 };
@@ -38386,9 +39001,11 @@ impl App {
                 );
             }
             crate::app::CompareViewMode::Diff => {
-                let Some(tex) =
-                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Diff)
-                else {
+                let Some(tex) = self.ensure_compare_prepared_texture(
+                    ctx,
+                    ComparePreparedTextureKind::Diff,
+                    original,
+                ) else {
                     return false;
                 };
                 paint_texture(painter, &tex);
@@ -38742,6 +39359,8 @@ impl App {
     ) -> (FsPageNav, bool) {
         let (overflow_pointer_input, overflow_touch_excluded) =
             self.capture_fs_front_pointer_input(ctx, full_rect);
+        let primary_suppression =
+            self.advance_viewer_primary_pointer_frame(ctx, overflow_pointer_input.primary_owned);
         let result = self.handle_fs_wheel_and_click_frame(
             ui,
             ctx,
@@ -38752,6 +39371,7 @@ impl App {
             prev_foreground_hwnd,
             navigator_reservation,
             front_wheel_owner,
+            primary_suppression,
             music_front_pointer_owned,
             navigation_operation,
             false,
@@ -38773,6 +39393,7 @@ impl App {
         prev_foreground_hwnd: usize,
         navigator_reservation: &mut Option<FsNavigatorInputReservation>,
         front_wheel_owner: Option<&FsHudPopupWheelInput>,
+        mut primary_suppression: FullscreenPrimarySuppressionDecision,
         music_front_pointer_owned: bool,
         navigation_operation: &mut Option<ViewerOperationId>,
         suppress_wheel_navigation: bool,
@@ -38781,6 +39402,9 @@ impl App {
         overflow_touch_excluded: &[egui::Rect],
     ) -> FsWheelFrameResult {
         *navigator_reservation = None;
+        if self.retire_changed_drag_zoom(ctx) {
+            primary_suppression = FullscreenPrimarySuppressionDecision::Suppress;
+        }
         let mut navigator_frame_input = FsNavigatorFrameInput::for_current_pass(ctx)
             .without_front_buttons(&overflow_pointer_input);
         if front_wheel_owner.is_some() {
@@ -38795,36 +39419,7 @@ impl App {
         // 同じ面の認識器を回す呼び出しが下に複数ある。接触の開始フレームを処理した
         // 呼び出しが所有者を決めるので、**全部で同じ値を使う**。
         let touch_tap_zones = self.fs_touch_tap_zones_enabled();
-        const FOCUS_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
-        let (primary_pressed, pointer_primary_down, primary_released) = ctx.input(|i| {
-            (
-                i.pointer.primary_pressed(),
-                i.pointer.primary_down(),
-                i.pointer.primary_released(),
-            )
-        });
-        if self.cancel_mouse_right_drag_on_primary_press(
-            crate::ring_shortcut::RightDragOwner::Root,
-            primary_pressed && !overflow_pointer_input.primary_owned,
-        ) {
-            self.fs_primary_suppression.arm_pointer_stream();
-        }
-        if let Some(t) = self.fs_focus_regained_at {
-            if t.elapsed() >= FOCUS_RESTORE_GRACE {
-                self.fs_focus_regained_at = None;
-            } else if !self.fs_primary_suppression.is_active() && pointer_primary_down {
-                self.fs_primary_suppression.arm_pointer_stream();
-                self.fs_focus_regained_at = None;
-            }
-        }
-        // Snapshot before releasing persistent ownership. The terminal frame
-        // itself remains suppressed, while later early returns cannot strand
-        // the owner because this transition runs at the function boundary.
-        let mut primary_suppression =
-            self.fs_primary_suppression
-                .apply(FullscreenPrimarySuppressionEvent::PointerFrame {
-                    released: primary_released,
-                });
+        let pointer_primary_down = ctx.input(|input| input.pointer.primary_down());
 
         // Music menu input was claimed at frame start, before a key or outside click
         // could close it. Complete primary release bookkeeping above, then leave the
@@ -39416,6 +40011,70 @@ impl App {
                         && !(top_bar_visible && fullscreen_top_bar_rect(full_rect).contains(pos))
                 })
             });
+        let scrub_active = self.fs_middle_zoom_drag.as_ref().is_some_and(|drag| {
+            drag.input == ZoomDragInput::Scrub && drag.surface == ZoomDragSurface::Viewer
+        });
+        let scrub_held =
+            crate::keyboard_input::focused_key_state_permit(ctx).is_some_and(|permit| {
+                self.keymap
+                    .key_held_action(ctx, permit, KeyAction::FsScrubZoomHold)
+            });
+        let scrub_canvas = !self.analysis_mode
+            && !state.is_video
+            && !music_view_active
+            && self.page_overview.session().is_none()
+            && !self.is_overlay_edit_mode_active()
+            && !self.view_trim_mode
+            && panel_fs_idx.is_some_and(|idx| {
+                matches!(
+                    self.items.get(idx),
+                    Some(GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. })
+                )
+            });
+        if scrub_active || (scrub_canvas && scrub_held) {
+            let (pressed, down, released, pos) = ctx.input(|i| {
+                (
+                    i.pointer.primary_pressed(),
+                    i.pointer.primary_down(),
+                    i.pointer.primary_released(),
+                    i.pointer.interact_pos(),
+                )
+            });
+            let owner = self.fs_zoom_owner();
+            let rect = self.fs_zoom_pivot_rect(full_rect, default_image_rect);
+            let can_start = !modal_input_blocked
+                && !edit_popup_open
+                && self.fs_context_menu_idx.is_none()
+                && pos.is_some_and(|pos| {
+                    full_rect.contains(pos)
+                        && !cursor_in_panel
+                        && !(top_bar_visible && fullscreen_top_bar_rect(full_rect).contains(pos))
+                })
+                && !overflow_pointer_input.primary_owned
+                && !primary_suppression.suppresses_current_frame()
+                && self.fs_pan_drag_start.is_none()
+                && self.fs_rotation_drag_start.is_none();
+            let used = self.handle_drag_zoom(
+                ctx,
+                ZoomDragInput::Scrub,
+                ZoomDragSurface::Viewer,
+                owner,
+                rect.center(),
+                scrub_held && scrub_canvas && !modal_input_blocked,
+                can_start,
+                pressed,
+                down,
+                released,
+                pos,
+            );
+            if used || (scrub_held && can_start && pressed) {
+                if pressed {
+                    self.fs_primary_suppression.arm_pointer_stream();
+                }
+                ctx.set_cursor_icon(egui::CursorIcon::ZoomIn);
+                return FsWheelFrameResult::default();
+            }
+        }
         self.handle_edit_brush_radius_wheel(ctx, cursor_on_edit_canvas);
         let touch_input_enabled = still_touch_input_enabled(StillTouchInputEnabledInputs {
             is_video: state.is_video,
@@ -39731,14 +40390,10 @@ impl App {
             self.handle_middle_drag_zoom(ctx, default_image_rect, overflow_pointer_input.clone());
         }
         if middle_short_click {
-            if let Some(nav) = self.apply_mouse_button(
-                ctx,
-                crate::ring_shortcut::MouseButtonSlot::Middle,
-                crate::app::ActionSurface::Viewer,
-                "fullscreen-middle-mouse",
-            ) {
-                self.mouse_ring_nav = Some(nav);
-            }
+            self.dispatch_viewer_middle_short_click(ctx);
+        }
+        if self.page_overview.session().is_some() {
+            return FsWheelFrameResult::default();
         }
 
         // 動画タイルモード中でも Ctrl なし Wheel は前後アイテム移動に使う。
@@ -40480,6 +41135,9 @@ impl App {
             }
         }
 
+        if self.page_overview.session().is_some() {
+            return FsWheelFrameResult::default();
+        }
         FsWheelFrameResult {
             page_nav,
             close,
@@ -40552,7 +41210,7 @@ impl App {
         {
             return FsCanvasClickAction::None;
         }
-        let has_transform = zoom > ZOOM_NEAR_ONE
+        let has_transform = zoom_differs_from_fit(zoom)
             || self.fs_free_rotation.abs() > TRANSFORM_EPSILON
             || pan.length_sq() > PAN_EPSILON_SQ;
         if self.fs_front_pointer.backing_double_clicked(response) && has_transform {
@@ -40652,7 +41310,13 @@ impl App {
             self.fs_secondary_press.cancel();
         }
         if pointer.middle_owned {
-            self.fs_middle_zoom_drag = None;
+            if self
+                .fs_middle_zoom_drag
+                .as_ref()
+                .is_some_and(|drag| drag.input == ZoomDragInput::Middle)
+            {
+                self.fs_middle_zoom_drag = None;
+            }
             self.cancel_mouse_middle_short_click();
         }
         let touch_excluded = if menu_presented || pointer.touch_owned {
@@ -40694,40 +41358,7 @@ impl App {
         prev_foreground_hwnd: usize,
         overflow_pointer_input: FsFrontPointerFrameInput,
     ) -> FsSecondaryAction {
-        let dialog_open_for_right_drag = self.any_dialog_open();
-        if dialog_open_for_right_drag {
-            self.cancel_mouse_ring_flick();
-            self.cancel_mouse_gesture();
-            self.fs_secondary_press.cancel();
-        }
-        let video_in_audio_mode = is_video
-            && self
-                .fullscreen_idx
-                .is_some_and(|idx| self.fs_music_view_active(idx));
-        let right_drag_context = self.current_right_drag_context();
-        let right_drag_mode = self
-            .settings
-            .ring_shortcuts
-            .right_drag_mode(right_drag_context);
-        let secondary_down = ctx.input(|i| i.pointer.secondary_down());
-        let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
-        let secondary_released = !overflow_pointer_input
-            .owns_release(egui::PointerButton::Secondary)
-            && ctx.input(|i| i.pointer.secondary_released());
-        let press_owner = overflow_pointer_input.secondary_owner;
-        if overflow_pointer_input.secondary_owned {
-            self.cancel_mouse_ring_flick();
-            self.cancel_mouse_gesture();
-            return FsSecondaryAction::None;
-        }
         let secondary_pos = fullscreen_pointer_pos_or(ctx, full_rect, full_rect.center());
-        let passive_secondary_pos = fullscreen_pointer_pos_or(
-            ctx,
-            full_rect,
-            self.fs_secondary_press
-                .start_pos()
-                .unwrap_or(full_rect.center()),
-        );
         let secondary_in_overlay_chrome = fullscreen_secondary_in_overlay_chrome(
             secondary_pos,
             full_rect,
@@ -40735,218 +41366,14 @@ impl App {
             seek_panel_rect,
             seek_panel_interactive,
         );
-        // 旧 egui HUD は撤去済 (native presenter overlay が右クリックも独自処理)。
-        // egui main window 側に右クリックを吸収すべき HUD 矩形は無い。
-        let popup_open = self.spread_popup_open
-            || self.fit_popup_open
-            || self.panorama_projection_popup_open
-            || fs_rotation_popup_open(ctx)
-            || fs_still_seek_strip_popup_open(ctx);
-        let right_drag_gate_reject = if is_video && !video_in_audio_mode {
-            Some("native_video")
-        } else if self.analysis_mode {
-            Some("analysis")
-        } else if dialog_open_for_right_drag {
-            Some("dialog")
-        } else if self.fs_context_menu_idx.is_some() {
-            Some("context_menu")
-        } else if popup_open {
-            Some("popup")
-        } else {
-            None
-        };
-        let passive_press_owner = fullscreen_secondary_press_owner_for_frame(
-            press_owner,
-            &right_drag_mode,
-            right_drag_context,
-            right_drag_gate_reject.is_some(),
+        self.recognize_viewer_right_drag_frame(
+            ctx,
+            full_rect,
+            is_video,
             secondary_in_overlay_chrome,
-        );
-        let passive_press_outcome = self.fs_secondary_press.advance(
-            passive_press_owner,
-            FullscreenSecondaryPressSample {
-                pressed: secondary_pressed,
-                down: secondary_down,
-                released: secondary_released,
-                pos: passive_secondary_pos,
-                now: std::time::Instant::now(),
-            },
-        );
-        #[cfg(windows)]
-        if self.viewer_session_is_detached_or_switching()
-            && Self::detached_image_window_debug_enabled()
-        {
-            let (
-                focused,
-                event_count,
-                key_pressed_count,
-                wheel_event_count,
-                secondary_button_events,
-            ) = ctx.input(|i| {
-                let key_pressed_count = i
-                    .events
-                    .iter()
-                    .filter(|event| matches!(event, egui::Event::Key { pressed: true, .. }))
-                    .count();
-                let wheel_event_count = i
-                    .events
-                    .iter()
-                    .filter(|event| matches!(event, egui::Event::MouseWheel { .. }))
-                    .count();
-                let secondary_button_events = i
-                    .events
-                    .iter()
-                    .filter(|event| {
-                        matches!(
-                            event,
-                            egui::Event::PointerButton {
-                                button: egui::PointerButton::Secondary,
-                                ..
-                            }
-                        )
-                    })
-                    .count();
-                (
-                    i.viewport().focused.unwrap_or(false),
-                    i.events.len(),
-                    key_pressed_count,
-                    wheel_event_count,
-                    secondary_button_events,
-                )
-            });
-            let right_drag_probe_event_frame =
-                secondary_pressed || secondary_released || secondary_button_events > 0;
-            if right_drag_probe_event_frame {
-                let foreground = current_foreground_hwnd();
-                let active_hwnd = self.detached_viewer_host_hwnd_raw() as usize;
-                self.log_detached_image_window_debug(format!(
-                    "right_drag_probe fs_idx={:?} window_id={:?} window_state={:?} \
-                 session={:?} is_video={} video_audio_mode={} analysis={} \
-                 dialog={} popup={} context_menu={} focused={} \
-                 foreground=0x{foreground:x} active_hwnd=0x{active_hwnd:x} \
-                 foreground_matches={} prev_foreground=0x{:x} \
-                 secondary_down={} secondary_pressed={} secondary_released={} \
-                 secondary_pos=({:.1},{:.1}) secondary_in_overlay_chrome={} \
-                 right_drag_context={right_drag_context:?} right_drag_mode={right_drag_mode:?} \
-                 gate={} events={} key_pressed={} wheel_events={} secondary_button_events={} \
-                 frame={}",
-                    self.fullscreen_idx,
-                    self.active_detached_window_id(),
-                    self.active_detached_window_state(),
-                    self.active_detached_session,
-                    is_video,
-                    video_in_audio_mode,
-                    self.analysis_mode,
-                    dialog_open_for_right_drag,
-                    popup_open,
-                    self.fs_context_menu_idx.is_some(),
-                    focused,
-                    foreground != 0 && foreground == active_hwnd,
-                    prev_foreground_hwnd,
-                    secondary_down,
-                    secondary_pressed,
-                    secondary_released,
-                    secondary_pos.x,
-                    secondary_pos.y,
-                    secondary_in_overlay_chrome,
-                    right_drag_gate_reject.unwrap_or("ok"),
-                    event_count,
-                    key_pressed_count,
-                    wheel_event_count,
-                    secondary_button_events,
-                    self.frame_counter
-                ));
-            }
-        }
-        if (!is_video || video_in_audio_mode)
-            && !self.analysis_mode
-            && !dialog_open_for_right_drag
-            && self.fs_context_menu_idx.is_none()
-            && !self.spread_popup_open
-            && !self.fit_popup_open
-            && !self.panorama_projection_popup_open
-            && !fs_rotation_popup_open(ctx)
-            && !fs_still_seek_strip_popup_open(ctx)
-        {
-            match right_drag_mode {
-                crate::ring_shortcut::RightDragMode::RingShortcut => {
-                    let Some(ring_context) = right_drag_context.ring_context() else {
-                        return FsSecondaryAction::None;
-                    };
-                    if secondary_in_overlay_chrome {
-                        self.cancel_mouse_ring_flick();
-                    } else if secondary_pressed {
-                        self.start_mouse_ring_flick(
-                            ctx,
-                            crate::ring_shortcut::RightDragOwner::Root,
-                            ring_context,
-                            secondary_pos,
-                            None,
-                        );
-                    }
-                    let recognition = self.recognize_mouse_ring_flick_with_pos(
-                        ctx,
-                        crate::ring_shortcut::RightDragOwner::Root,
-                        ring_context,
-                        secondary_pos,
-                        secondary_down,
-                        secondary_released,
-                    );
-                    return FsSecondaryAction::Recognized {
-                        context: right_drag_context,
-                        pos: secondary_pos,
-                        recognition,
-                    };
-                }
-                crate::ring_shortcut::RightDragMode::MouseGesture => {
-                    if secondary_in_overlay_chrome {
-                        self.cancel_mouse_gesture();
-                    } else if secondary_pressed {
-                        self.start_mouse_gesture(
-                            ctx,
-                            crate::ring_shortcut::RightDragOwner::Root,
-                            right_drag_context,
-                            secondary_pos,
-                            None,
-                        );
-                    }
-                    let recognition = self.recognize_mouse_gesture_with_pos(
-                        ctx,
-                        crate::ring_shortcut::RightDragOwner::Root,
-                        right_drag_context,
-                        secondary_pos,
-                        secondary_down,
-                        secondary_released,
-                    );
-                    return FsSecondaryAction::Recognized {
-                        context: right_drag_context,
-                        pos: secondary_pos,
-                        recognition,
-                    };
-                }
-                crate::ring_shortcut::RightDragMode::Disabled
-                | crate::ring_shortcut::RightDragMode::Unknown(_) => {
-                    if right_drag_context == crate::ring_shortcut::RightDragContext::EditMode {
-                        return FsSecondaryAction::None;
-                    }
-                    match passive_press_outcome {
-                        FullscreenSecondaryPressOutcome::ShortTap(pos) => {
-                            return FsSecondaryAction::ShortTap {
-                                context: right_drag_context,
-                                pos,
-                            };
-                        }
-                        FullscreenSecondaryPressOutcome::LongPress(pos) => {
-                            return FsSecondaryAction::LongPress(pos);
-                        }
-                        FullscreenSecondaryPressOutcome::Cancelled
-                        | FullscreenSecondaryPressOutcome::None => {}
-                    }
-                }
-            }
-        }
-
-        FsSecondaryAction::None
+            prev_foreground_hwnd,
+            overflow_pointer_input,
+        )
     }
 
     fn apply_fs_secondary_input(
@@ -40964,8 +41391,10 @@ impl App {
         match action {
             FsSecondaryAction::None => FsSecondaryInputOutcome::Continue,
             FsSecondaryAction::LongPress(pos) => {
-                self.fs_context_menu_idx = self.fullscreen_idx;
-                self.fs_context_menu_pos = pos;
+                if self.page_overview.session().is_none() {
+                    self.fs_context_menu_idx = self.fullscreen_idx;
+                    self.fs_context_menu_pos = pos;
+                }
                 FsSecondaryInputOutcome::Continue
             }
             FsSecondaryAction::ShortTap { context, pos } => short_click_outcome(
@@ -41015,6 +41444,12 @@ impl App {
         pos: egui::Pos2,
     ) -> bool {
         use crate::ring_shortcut::ViewerShortRightClickAction;
+
+        // An overview owns its tiles and cancel operation; image close/menu shortcuts
+        // must not escape the overview action set. Passive dispatch has the same policy.
+        if self.page_overview.session().is_some() {
+            return false;
+        }
 
         match self
             .settings
@@ -41940,6 +42375,7 @@ impl App {
             Some(target)
         } else {
             self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
+                scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                 at_end,
                 at: std::time::Instant::now(),
             });
@@ -41980,6 +42416,9 @@ impl App {
         &self,
         sibling: bool,
     ) -> Option<(PathBuf, crate::app::FolderNavMode)> {
+        if self.fs_list_order_navigation_blocks_new_target() {
+            return None;
+        }
         if let Some(mode) = self.inflight_fullscreen_folder_nav_mode(sibling) {
             let current = match &mode {
                 crate::app::FolderNavMode::Favsearch { .. } => {
@@ -42075,6 +42514,79 @@ impl App {
             .map(|current| (current, crate::app::FolderNavMode::Fullscreen))
     }
 
+    pub(crate) fn handle_fullscreen_list_order_nav_context(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        forward: bool,
+        native_toast: bool,
+    ) {
+        self.handle_fullscreen_list_order_nav_context_with_operation(
+            ctx,
+            fs_idx,
+            forward,
+            native_toast,
+            None,
+        );
+    }
+
+    pub(crate) fn handle_fullscreen_list_order_nav_context_with_operation(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        forward: bool,
+        native_toast: bool,
+        operation: Option<ViewerOperationId>,
+    ) {
+        if self.viewer_mutation_modal_active() {
+            return;
+        }
+        if self.fs_navigation_sequence_blocks_new_target() || self.fs_nav_is_locked() {
+            self.note_fullscreen_nav_request_dropped();
+            return;
+        }
+        let Some((snapshot, from_index)) = self.list_order_position() else {
+            #[cfg(windows)]
+            if native_toast {
+                self.show_native_video_overlay_warning("一覧から開いた本で使えます".into(), true);
+                self.request_native_video_hud_repaint(ctx);
+                return;
+            }
+            #[cfg(not(windows))]
+            let _ = native_toast;
+            self.show_feedback_warning("一覧から開いた本で使えます".into());
+            return;
+        };
+        // EgUI intents and the native presenter share this acceptance boundary.
+        // Rejected preparation/availability checks do not retire another owner.
+        self.cancel_rating_membership_restore();
+        self.supersede_required_fullscreen_folder_open();
+        self.similar_panel
+            .preview
+            .end_gesture_with_reason("navigation_or_close");
+        self.page_turn_excluded_navigation_with_operation(ctx, "list_order_navigation", operation);
+        self.slideshow_playing = false;
+        self.slideshow_anchor_idx = None;
+        self.continuous_reading_scroll_transition = None;
+        self.slideshow_scroll_range_cache = None;
+        #[cfg(windows)]
+        {
+            self.native_video_deferred_nav_delta = None;
+        }
+        let Some(current) = self.effective_folder() else {
+            return;
+        };
+        self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
+        self.start_folder_nav(
+            current,
+            forward,
+            crate::app::FolderNavMode::ListOrder {
+                snapshot,
+                from_index,
+            },
+        );
+    }
+
     pub(crate) fn handle_fullscreen_ctrl_nav_context(
         &mut self,
         ctx: &egui::Context,
@@ -42082,6 +42594,9 @@ impl App {
         forward: bool,
         native_toast: bool,
     ) {
+        if self.fs_list_order_navigation_blocks_new_target() {
+            return;
+        }
         // A follow-up for the same staged Smart DFS belongs to its typed request. The generic
         // folder-items sequence blocks unrelated targets until adoption, so admit this input
         // before consulting that block; sibling/page navigation remains blocked as before.
@@ -42285,7 +42800,9 @@ impl App {
         forward: bool,
         native_toast: bool,
     ) {
-        if self.fs_navigation_sequence_blocks_new_target() {
+        if self.fs_list_order_navigation_blocks_new_target()
+            || self.fs_navigation_sequence_blocks_new_target()
+        {
             return;
         }
         if self.fs_nav_is_locked() {
@@ -42525,6 +43042,35 @@ impl App {
         fs_idx: usize,
         operation: Option<ViewerOperationId>,
     ) {
+        self.handle_fs_navigation_with_list_order_operation(
+            ctx,
+            close_fs,
+            close_to_page_list,
+            ctrl_nav,
+            sibling_nav,
+            mouse_nav,
+            page_nav,
+            jump_to,
+            fs_idx,
+            None,
+            operation,
+        );
+    }
+
+    pub(crate) fn handle_fs_navigation_with_list_order_operation(
+        &mut self,
+        ctx: &egui::Context,
+        close_fs: bool,
+        close_to_page_list: bool,
+        ctrl_nav: Option<i32>,
+        sibling_nav: Option<i32>,
+        mouse_nav: Option<crate::ui_main::AddressBarNav>,
+        page_nav: FsPageNav,
+        jump_to: Option<usize>,
+        fs_idx: usize,
+        list_order_nav: Option<bool>,
+        operation: Option<ViewerOperationId>,
+    ) {
         let mut fs_render_perf = None;
         self.handle_fs_navigation_with_render_perf(
             ctx,
@@ -42536,6 +43082,7 @@ impl App {
             page_nav,
             jump_to,
             fs_idx,
+            list_order_nav,
             operation,
             &mut fs_render_perf,
         );
@@ -42552,6 +43099,7 @@ impl App {
         page_nav: FsPageNav,
         jump_to: Option<usize>,
         fs_idx: usize,
+        list_order_nav: Option<bool>,
         operation: Option<ViewerOperationId>,
         fs_render_perf: &mut Option<FsRenderPerfRecorder>,
     ) {
@@ -42579,6 +43127,7 @@ impl App {
         if !close_fs
             && !close_to_page_list
             && ctrl_nav.is_none()
+            && list_order_nav.is_none()
             && sibling_nav.is_none()
             && mouse_nav.is_none()
             && (self.settings.page_turn_animation_enabled || self.page_turn_completion_active())
@@ -42754,6 +43303,16 @@ impl App {
             for _ in 0..delta.unsigned_abs() {
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, delta > 0, false);
             }
+            finish_fs_navigation_perf_span(
+                &mut fs_navigation_perf,
+                FsNavigationPerfSpan::CtrlSiblingMouse,
+                context_nav_perf_t0,
+            );
+        } else if let Some(forward) = list_order_nav {
+            let context_nav_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
+            self.handle_fullscreen_list_order_nav_context_with_operation(
+                ctx, fs_idx, forward, false, operation,
+            );
             finish_fs_navigation_perf_span(
                 &mut fs_navigation_perf,
                 FsNavigationPerfSpan::CtrlSiblingMouse,
@@ -43100,6 +43659,7 @@ impl App {
                 }
                 self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
                 self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
+                    scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                     at_end,
                     at: std::time::Instant::now(),
                 });
@@ -43240,6 +43800,7 @@ impl App {
                     self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
                     // 境界到達: 中央にヒントを出す (nav_delta > 0 なら末尾)
                     self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
+                        scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                         at_end: nav_delta > 0,
                         at: std::time::Instant::now(),
                     });
@@ -43264,6 +43825,7 @@ impl App {
         // フォルダを変えた場合は close_fullscreen が slideshow_playing=false にする。
         let slideshow_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
         if self.slideshow_playing
+            && self.page_overview.session().is_none()
             && !self.viewer_mutation_modal_active()
             && !close_fs
             && !self.fs_nav_is_locked()
@@ -43639,6 +44201,8 @@ impl App {
             content_bbox,
             None,
             false,
+            None,
+            page_turn::FlatCropPaint::WithPage,
         )
     }
 
@@ -43672,6 +44236,8 @@ impl App {
         content_bbox: Option<egui::Rect>,
         submitted: Option<&mut FsNavigatorTextureSources>,
         live_eligible: bool,
+        crop: Option<crate::export_crop::CropSettings>,
+        mut flat_crop: page_turn::FlatCropPaint<'_>,
     ) -> Option<DisplayedImageTransform> {
         // Current items resolve the active split here. A captured holdover keeps
         // its capture-time crop even if the replacement item or mode changes.
@@ -43792,6 +44358,7 @@ impl App {
                 self.observe_raw_presentation(page_idx);
             }
             let page = PreparedPagedPage {
+                crop,
                 occurrence: SpreadPageOccurrence {
                     idx: page_idx,
                     role: SpreadPageRole::Navigation,
@@ -43815,8 +44382,12 @@ impl App {
             let img_rect = transform.full_image_rect;
             let total_scale = transform.total_scale;
             if let Some(submitted) = submitted {
-                let receipt =
-                    self.submit_paged_display_unit(ui.ctx(), std::slice::from_ref(&page), white);
+                let receipt = self.submit_paged_display_unit_with_flat_crop(
+                    ui.ctx(),
+                    std::slice::from_ref(&page),
+                    white,
+                    flat_crop,
+                );
                 let presentation = receipt
                     .as_ref()
                     .is_some_and(SubmittedUnitReceipt::has_presentation_binding);
@@ -43850,7 +44421,7 @@ impl App {
                     );
                     white_painter.rect_filled(white_rect, 0.0, egui::Color32::WHITE);
                 }
-                page_turn::paint_flat_page(&page);
+                page_turn::paint_flat_page_at_crop_phase(&page, &mut flat_crop);
             }
             if fit_bbox.is_none()
                 && should_draw_fs_pixel_grid(pixel_grid_enabled, using_full_texture, zoom_pan)
@@ -44706,7 +45277,7 @@ impl App {
         self.update_reading_direction_from_spread_mode(mode);
         self.spread_popup_open = false;
         self.panorama_projection_popup_open = false;
-        self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
+        self.adjust_spread_target = None;
         if !self.reading_flow.is_paged() {
             self.reset_continuous_reading_transform();
             self.disable_non_paged_fullscreen_modes(fs_idx);
@@ -44931,7 +45502,7 @@ impl App {
         self.fullscreen_page_layout.begin(previous.layout_kind);
         let bg_style = self.fs_bg_style(ctx);
         for (page, captured) in previous.previous.pages.iter().zip(&previous.transforms) {
-            if let Some(transform) = self.draw_fs_image(
+            if let Some(transform) = self.draw_fs_image_with_receipt(
                 ui,
                 image_rect,
                 page.idx(),
@@ -44944,7 +45515,7 @@ impl App {
                 Some(*captured),
                 None,
                 previous.previous.singleton_placement,
-                Some(&page.texture),
+                Some(&page.texture.clone().into()),
                 None,
                 false,
                 false,
@@ -44958,6 +45529,12 @@ impl App {
                 captured.fit_mode,
                 captured.fit_scale_limits,
                 page.content_bbox,
+                None,
+                false,
+                (previous.previous.pages.len() == 1)
+                    .then_some(page.crop)
+                    .flatten(),
+                page_turn::FlatCropPaint::WithPage,
             ) {
                 self.fullscreen_page_layout
                     .push_occurrence(transform, page.occurrence);
@@ -45002,7 +45579,7 @@ impl App {
         self.reading_direction = direction;
         self.spread_popup_open = false;
         self.panorama_projection_popup_open = false;
-        self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
+        self.adjust_spread_target = None;
         if !self.reading_flow.is_paged() {
             self.reset_continuous_reading_transform();
             self.disable_non_paged_fullscreen_modes(fs_idx);
@@ -45069,7 +45646,7 @@ impl App {
         if self.extracted_result_surface().is_none() {
             self.settings.update_active_favorite_spread_mode(new_mode);
         }
-        self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
+        self.adjust_spread_target = None;
         true
     }
 
@@ -47466,6 +48043,7 @@ impl App {
             return false;
         };
         if self.compare_prepared_pair_matches(fs_idx) {
+            self.ensure_compare_original_pair(ctx, fs_idx);
             return true;
         }
         let Some(output) = crate::app::ComparePrepareOutput::for_mode(
@@ -47479,6 +48057,13 @@ impl App {
             pinned_source_idx: slot.source_idx,
             output,
         };
+        if matches!(
+            self.compare_preparation,
+            crate::app::ComparePreparationState::PreparingOriginal { .. }
+        ) {
+            self.compare_preparation.invalidate();
+            self.clear_compare_gpu_pair();
+        }
         // run_pixel_work自体は途中cancelできない。別ページの要求へ受信口を差し替えると、
         // 旧workerも巨大RGBAを作り切る間に次workerが並走するため、常に1本へ直列化する。
         if matches!(
@@ -47489,7 +48074,6 @@ impl App {
             return false;
         }
 
-        let pinned_source_idx = slot.source_idx;
         let pinned_size = slot.source_size;
         let pinned_pixels = Arc::clone(&slot.pixels);
         let (current_job, scope, source_indices) =
@@ -47506,6 +48090,7 @@ impl App {
                             if waiting == request
                     );
                     if !already_waiting {
+                        self.compare_preparation.invalidate();
                         self.compare_preparation =
                             crate::app::ComparePreparationState::WaitingForSource(request);
                         self.clear_compare_gpu_pair();
@@ -47542,7 +48127,7 @@ impl App {
             .compare_preparation
             .prepared_pair()
             .map_or(0, crate::app::ComparePreparedPair::allocated_cpu_bytes);
-        self.compare_preparation = crate::app::ComparePreparationState::Unprepared;
+        self.compare_preparation.invalidate();
         self.clear_compare_gpu_pair();
         crate::logger::log(format!(
             "[compare-memory] stage=prepare-start target={}x{} current_input={}x{} pinned_input={}x{} scope={} output={} cpu_total_bytes=0 released_cpu_bytes={} gpu_total_bytes=0 old_pair_release=before_worker",
@@ -47557,100 +48142,20 @@ impl App {
             released_cpu_bytes,
         ));
         let (tx, rx) = std::sync::mpsc::channel();
-        let output = request.output;
+        let key = self.next_compare_prepared_key();
+        let current_geometry = crate::app::CompareSourceGeometry::from_job(&current_job);
         let repaint_ctx = ctx.clone();
         let started_at = std::time::Instant::now();
         let thread = std::thread::Builder::new()
             .name("compare-prepare".into())
             .spawn(move || {
-                let result = if output == crate::app::ComparePrepareOutput::PinnedTexture {
-                    let width = expected_target_size[0] as u32;
-                    let height = expected_target_size[1] as u32;
-                    align_compare_color_image_to_canvas(
-                        pinned_pixels.as_ref(),
-                        expected_target_size,
-                    )
-                    .map(|pinned_rgba| crate::app::ComparePrepareResult {
-                        current_idx: fs_idx,
-                        pinned_source_idx,
-                        width,
-                        height,
-                        pixels: crate::app::ComparePreparedPixels::PinnedTexture(Arc::new(
-                            egui::ColorImage::from_rgba_unmultiplied(
-                                expected_target_size,
-                                &pinned_rgba,
-                            ),
-                        )),
-                    })
-                } else {
-                    crate::capture::run_compare_pixel_job(current_job).and_then(
-                        |(_basename, current_width, current_height, current_source_rgba)| {
-                            let width = expected_target_size[0] as u32;
-                            let height = expected_target_size[1] as u32;
-                            let current_rgba = crate::capture::align_rgba_to_canvas_lanczos(
-                                current_width,
-                                current_height,
-                                &current_source_rgba,
-                                width,
-                                height,
-                                egui::Color32::BLACK,
-                            )?;
-                            let pinned_rgba = align_compare_color_image_to_canvas(
-                                pinned_pixels.as_ref(),
-                                expected_target_size,
-                            )?;
-                            let size = [width as usize, height as usize];
-                            let pixels = match output {
-                                crate::app::ComparePrepareOutput::ShaderPair => {
-                                    crate::app::ComparePreparedPixels::ShaderPair {
-                                        pinned_rgba: Arc::new(pinned_rgba),
-                                        current_rgba: Arc::new(current_rgba),
-                                    }
-                                }
-                                crate::app::ComparePrepareOutput::PinnedTexture => {
-                                    crate::app::ComparePreparedPixels::PinnedTexture(Arc::new(
-                                        egui::ColorImage::from_rgba_unmultiplied(
-                                            size,
-                                            &pinned_rgba,
-                                        ),
-                                    ))
-                                }
-                                crate::app::ComparePrepareOutput::WipeTextures => {
-                                    crate::app::ComparePreparedPixels::WipeTextures {
-                                        pinned: Arc::new(egui::ColorImage::from_rgba_unmultiplied(
-                                            size,
-                                            &pinned_rgba,
-                                        )),
-                                        current: Arc::new(
-                                            egui::ColorImage::from_rgba_unmultiplied(
-                                                size,
-                                                &current_rgba,
-                                            ),
-                                        ),
-                                    }
-                                }
-                                crate::app::ComparePrepareOutput::DiffTexture => {
-                                    let diff_rgba = crate::capture::diff_rgba_color(
-                                        width,
-                                        height,
-                                        &pinned_rgba,
-                                        &current_rgba,
-                                    )?;
-                                    crate::app::ComparePreparedPixels::DiffTexture(Arc::new(
-                                        egui::ColorImage::from_rgba_unmultiplied(size, &diff_rgba),
-                                    ))
-                                }
-                            };
-                            Ok(crate::app::ComparePrepareResult {
-                                current_idx: fs_idx,
-                                pinned_source_idx,
-                                width,
-                                height,
-                                pixels,
-                            })
-                        },
-                    )
-                };
+                let result = compare_original::run_compare_pair_job(
+                    current_job,
+                    pinned_pixels,
+                    request,
+                    key,
+                    expected_target_size,
+                );
                 let _ = tx.send(result);
                 repaint_ctx.request_repaint();
             });
@@ -47659,6 +48164,8 @@ impl App {
             Ok(_) => {
                 self.compare_preparation = crate::app::ComparePreparationState::Preparing(
                     crate::app::ComparePreparePending {
+                        key,
+                        current_geometry,
                         request,
                         scope,
                         source_indices,
@@ -47672,7 +48179,7 @@ impl App {
                 self.show_feedback_warning("比較表示を準備中".to_string());
             }
             Err(err) => {
-                self.compare_preparation = crate::app::ComparePreparationState::Unprepared;
+                self.compare_preparation.invalidate();
                 self.show_feedback_warning(format!("比較 worker を開始できません: {err}"));
             }
         }
@@ -47683,11 +48190,12 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         kind: ComparePreparedTextureKind,
+        original: bool,
     ) -> Option<egui::TextureHandle> {
         let pair = self.compare_preparation.prepared_pair_mut()?;
-        let key = pair.key;
+        let key = pair.draw_key(original);
         let target_size = pair.target_size;
-        let pixels = match (kind, &pair.pixels) {
+        let pixels = match (kind, pair.draw_pixels(original)) {
             (
                 ComparePreparedTextureKind::Pinned,
                 crate::app::ComparePreparedPixels::PinnedTexture(pinned),
@@ -47706,10 +48214,25 @@ impl App {
             ) => Arc::clone(diff),
             _ => return None,
         };
+        let (pinned_texture, current_texture, diff_texture) = if original
+            && let crate::app::CompareOriginalVariant::Ready(original) = &mut pair.original
+        {
+            (
+                &mut original.pinned_texture,
+                &mut original.current_texture,
+                &mut original.diff_texture,
+            )
+        } else {
+            (
+                &mut pair.pinned_texture,
+                &mut pair.current_texture,
+                &mut pair.diff_texture,
+            )
+        };
         let (slot, label) = match kind {
-            ComparePreparedTextureKind::Pinned => (&mut pair.pinned_texture, "pinned"),
-            ComparePreparedTextureKind::Current => (&mut pair.current_texture, "current"),
-            ComparePreparedTextureKind::Diff => (&mut pair.diff_texture, "diff"),
+            ComparePreparedTextureKind::Pinned => (pinned_texture, "pinned"),
+            ComparePreparedTextureKind::Current => (current_texture, "current"),
+            ComparePreparedTextureKind::Diff => (diff_texture, "diff"),
         };
         let created = slot.is_none();
         if created {
@@ -47725,16 +48248,14 @@ impl App {
         }
         let texture = slot.clone();
         if created {
-            let gpu_texture_count = usize::from(pair.pinned_texture.is_some())
-                + usize::from(pair.current_texture.is_some())
-                + usize::from(pair.diff_texture.is_some());
+            let gpu_texture_count = pair.managed_gpu_texture_count();
             crate::logger::log(format!(
                 "[compare-memory] stage=managed-gpu-ready target={}x{} output={} cpu_total_bytes={} cpu_buffers={} gpu_total_bytes={} gpu_textures={} gpu_mips=full old_pair_release=before_new_alloc",
                 target_size[0],
                 target_size[1],
                 pair.pixels.output().label(),
                 pair.allocated_cpu_bytes(),
-                pair.pixels.buffer_count(),
+                pair.allocated_cpu_buffers(),
                 crate::compare_wgpu::rgba8_texture_bytes(
                     target_size[0] as u32,
                     target_size[1] as u32,
@@ -47752,10 +48273,21 @@ impl App {
         zoom_pan: Option<(f32, egui::Vec2)>,
         fit_scale_limits: FullscreenFitScaleLimits,
     ) -> Option<egui::Rect> {
+        Self::compare_image_transform(full_rect, 0, image_size, zoom_pan, fit_scale_limits)
+            .map(|transform| transform.full_image_rect)
+    }
+
+    fn compare_image_transform(
+        full_rect: egui::Rect,
+        page_idx: usize,
+        image_size: [usize; 2],
+        zoom_pan: Option<(f32, egui::Vec2)>,
+        fit_scale_limits: FullscreenFitScaleLimits,
+    ) -> Option<DisplayedImageTransform> {
         let tex_size = egui::vec2(image_size[0] as f32, image_size[1] as f32);
         DisplayedImageTransform::resolve(DisplayedImageTransformInput {
             pixel_fit: RectPixelFit::Texels,
-            page_idx: 0,
+            page_idx,
             viewport_rect: full_rect,
             source_size: tex_size,
             texture_size: tex_size,
@@ -47768,7 +48300,6 @@ impl App {
             pixels_per_point: fit_scale_limits.pixels_per_point,
             placement: ResolvedDisplayPlacement::Normal { zoom_pan },
         })
-        .map(|transform| transform.full_image_rect)
     }
 
     #[cfg(windows)]
@@ -47781,12 +48312,13 @@ impl App {
         wipe_fraction: f32,
         zoom_pan: Option<(f32, egui::Vec2)>,
         pixels_per_point: f32,
+        original: bool,
     ) -> Option<CompareShaderShape> {
         let target_format = self.wgpu_render_state.as_ref()?.target_format;
         let crate::app::ComparePreparedPixels::ShaderPair {
             pinned_rgba,
             current_rgba,
-        } = &pair.pixels
+        } = pair.draw_pixels(original)
         else {
             return None;
         };
@@ -47799,12 +48331,14 @@ impl App {
         let (callback_rect, uv_window) = compare_shader_visible_region(draw_rect, image_rect)?;
         let callback = crate::compare_wgpu::CompareShaderCallback {
             slot,
-            key: pair.key,
+            owner_key: pair.key,
+            key: pair.draw_key(original),
             width: pair.target_size[0] as u32,
             height: pair.target_size[1] as u32,
             pinned_rgba: Arc::clone(pinned_rgba),
             current_rgba: Arc::clone(current_rgba),
             cpu_pair_bytes: pair.allocated_cpu_bytes(),
+            cpu_pair_buffers: pair.allocated_cpu_buffers(),
             mode,
             wipe_fraction,
             uv_window,
@@ -47829,6 +48363,7 @@ impl App {
         _wipe_fraction: f32,
         _zoom_pan: Option<(f32, egui::Vec2)>,
         _pixels_per_point: f32,
+        _original: bool,
     ) -> Option<CompareShaderShape> {
         None
     }
@@ -48552,15 +49087,26 @@ impl App {
         fs_idx: usize,
         mode: crate::app::CompareViewMode,
         zoom_pan: Option<(f32, egui::Vec2)>,
+        crop: Option<crate::export_crop::CropSettings>,
     ) -> bool {
         if !self.compare_prepared_pair_matches(fs_idx) {
             return false;
         }
+        let transform = self.compare_preparation.prepared_pair().and_then(|pair| {
+            Self::compare_image_transform(
+                image_rect,
+                fs_idx,
+                pair.target_size,
+                zoom_pan,
+                self.fullscreen_fit_scale_limits(ctx.pixels_per_point()),
+            )
+        });
         // Do not read `ctx.input().modifiers` here: the fullscreen viewport can retain a stale
         // modifier snapshot while the physical Ctrl state changes during the same drag.
         let ctrl_held =
             crate::keyboard_input::focused_key_state_permit(ctx).is_some_and(ctrl_held_via_os);
 
+        let original = self.compare_original_for_frame(ctx, fs_idx);
         let shader_shape = self
             .compare_preparation
             .prepared_pair()
@@ -48573,6 +49119,7 @@ impl App {
                     fraction,
                     zoom_pan,
                     ctx.pixels_per_point(),
+                    original,
                 ),
                 crate::app::CompareViewMode::Diff => self.compare_shader_shape(
                     COMPARE_MAIN_SHADER_SLOT,
@@ -48582,6 +49129,7 @@ impl App {
                     0.5,
                     zoom_pan,
                     ctx.pixels_per_point(),
+                    original,
                 ),
                 _ => None,
             });
@@ -48607,14 +49155,20 @@ impl App {
                     affordance,
                 );
             }
+            if let (Some(transform), Some(crop)) = (transform.as_ref(), crop) {
+                page_turn::paint_flat_crop(ui.painter(), transform, crop);
+            }
             return true;
         }
 
         let fit_scale_limits = self.fullscreen_fit_scale_limits(ctx.pixels_per_point());
-        match mode {
+        let painted = match mode {
             crate::app::CompareViewMode::PinnedNormal => {
-                let tex =
-                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Pinned);
+                let tex = self.ensure_compare_prepared_texture(
+                    ctx,
+                    ComparePreparedTextureKind::Pinned,
+                    original,
+                );
                 let Some(tex) = tex.as_ref() else {
                     return false;
                 };
@@ -48631,10 +49185,16 @@ impl App {
                 true
             }
             crate::app::CompareViewMode::Wipe { fraction, .. } => {
-                let current =
-                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Current);
-                let pinned =
-                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Pinned);
+                let current = self.ensure_compare_prepared_texture(
+                    ctx,
+                    ComparePreparedTextureKind::Current,
+                    original,
+                );
+                let pinned = self.ensure_compare_prepared_texture(
+                    ctx,
+                    ComparePreparedTextureKind::Pinned,
+                    original,
+                );
                 let (Some(current), Some(pinned)) = (current.as_ref(), pinned.as_ref()) else {
                     return false;
                 };
@@ -48668,13 +49228,14 @@ impl App {
                     Some(clip),
                     fit_scale_limits,
                 );
-                let affordance = compare_wipe_affordance(ctrl_held);
-                Self::draw_compare_wipe_affordance(ui, ref_rect, fraction, affordance);
                 true
             }
             crate::app::CompareViewMode::Diff => {
-                let tex =
-                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Diff);
+                let tex = self.ensure_compare_prepared_texture(
+                    ctx,
+                    ComparePreparedTextureKind::Diff,
+                    original,
+                );
                 let Some(tex) = tex.as_ref() else {
                     return false;
                 };
@@ -48691,7 +49252,22 @@ impl App {
                 true
             }
             crate::app::CompareViewMode::Off => false,
+        };
+        if painted
+            && let (Some(transform), crate::app::CompareViewMode::Wipe { fraction, .. }) =
+                (transform.as_ref(), mode)
+        {
+            Self::draw_compare_wipe_affordance(
+                ui,
+                transform.full_image_rect,
+                fraction,
+                compare_wipe_affordance(ctrl_held),
+            );
         }
+        if painted && let (Some(transform), Some(crop)) = (transform.as_ref(), crop) {
+            page_turn::paint_flat_crop(ui.painter(), transform, crop);
+        }
+        painted
     }
 
     fn draw_compare_pinned_image(
@@ -48967,6 +49543,36 @@ impl App {
         ctx.request_repaint_after(repaint);
     }
 
+    fn resolve_fs_loupe_page_payload(
+        &mut self,
+        ctx: &egui::Context,
+        current_idx: usize,
+        page_idx: usize,
+    ) -> Option<FullscreenPaintPayload> {
+        let comparing = !matches!(self.compare_view_mode, crate::app::CompareViewMode::Off);
+        let original = if comparing {
+            page_idx == current_idx && self.compare_original_for_frame(ctx, current_idx)
+        } else {
+            self.original_preview_active(ctx, page_idx)
+        };
+        // 比較の元画像版は通常pipelineへ逆流させない。元素材が退去済みなら
+        // 既存のthumbnail fallbackへ任せ、ルーペから補充loadを開始しない。
+        let page_tex = if comparing && original {
+            self.resolve_original_preview_material(page_idx)
+                .map(Into::into)
+        } else {
+            self.resolve_fs_processed_payload(ctx, page_idx, original)
+        };
+        let page_thumb = if !original && self.colorize_display_requires_final_effect(page_idx) {
+            None
+        } else {
+            self.fs_thumbnail_resource_for_display(page_idx)
+                .ok()
+                .map(Into::into)
+        };
+        page_tex.or(page_thumb)
+    }
+
     /// ルーペ (局所拡大) 描画。
     ///
     /// 有効条件:
@@ -49032,19 +49638,7 @@ impl App {
         if matches!(self.items.get(page_idx), Some(GridItem::Video(_))) {
             return;
         }
-        let page_original_preview_active = self.original_preview_active(ctx, page_idx);
-        let page_tex =
-            self.resolve_fs_processed_payload(ctx, page_idx, page_original_preview_active);
-        let page_thumb = if !page_original_preview_active
-            && self.colorize_display_requires_final_effect(page_idx)
-        {
-            None
-        } else {
-            self.fs_thumbnail_resource_for_display(page_idx)
-                .ok()
-                .map(Into::into)
-        };
-        let Some(resource) = page_tex.or(page_thumb) else {
+        let Some(resource) = self.resolve_fs_loupe_page_payload(ctx, fs_idx, page_idx) else {
             return;
         };
         let transform = page.transform;
@@ -49216,6 +49810,8 @@ impl App {
                         page.content_bbox,
                         Some(&mut sources),
                         false,
+                        page.crop,
+                        page_turn::FlatCropPaint::WithPage,
                     )
                 };
                 if let Some(transform) = transform {
@@ -50323,6 +50919,7 @@ impl App {
                 self.observe_raw_presentation(idx);
             }
             return Some(PreparedPagedPage {
+                crop: None,
                 occurrence: SpreadPageOccurrence {
                     idx,
                     role: SpreadPageRole::Navigation,
@@ -52658,6 +53255,7 @@ impl App {
             let composed = std::sync::Arc::new(pixels);
             let t_up = std::time::Instant::now();
             let upload = crate::app::clamp_for_gpu(&composed).into_owned();
+            let texture_options = self.display_texture_options(i);
             let texture = ctx.load_texture(
                 format!(
                     "comic_{i}_{}_{}_{}",
@@ -52669,7 +53267,7 @@ impl App {
                 // 注釈の焼き込みは同期経路 (`ensure_comic_composite_texture`) と
                 // この worker 完了経路の**2 つ**が上げる。片方だけ直したせいで、
                 // ニアレストが効かない症状が残った (利用者報告 2026-08-13)。
-                self.display_texture_options(i),
+                texture_options,
             );
             let upload_ms = t_up.elapsed().as_secs_f64() * 1000.0;
             if crate::perf::is_enabled() {
@@ -52709,6 +53307,7 @@ impl App {
                     ),
                     pixels: composed,
                     texture,
+                    texture_options,
                     base: p.base,
                     comic_gen: p.comic_gen,
                     dims: p.dims,
@@ -52989,6 +53588,11 @@ impl App {
         };
 
         let (title, body_lines): (&str, Vec<&str>) = match hint {
+            FsBoundaryHint::Edge {
+                scope: FsBoundaryEdgeScope::ListOrder,
+                at_end,
+                ..
+            } => (FsBoundaryEdgeScope::ListOrder.title(at_end), Vec::new()),
             FsBoundaryHint::Edge { at_end: true, .. } => (
                 fullscreen_boundary_edge_title(true),
                 vec!["[Home] 最初に戻る", "[Ctrl]+[↓] ツリー順で次へ"],
@@ -53369,6 +53973,7 @@ impl App {
         source_idx: usize,
         job: crate::capture::CapturePixelJob,
     ) {
+        let original_source = self.compare_pin_original_source(source_idx, &job);
         let (tx, rx) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("compare-pin".into())
@@ -53384,6 +53989,7 @@ impl App {
                 self.clear_compare_gpu_pair();
                 self.compare_pin_pending = Some(crate::app::ComparePinPending {
                     source_idx,
+                    original_source,
                     external_item_key: None,
                     rx,
                 });
@@ -53434,6 +54040,7 @@ impl App {
                 self.clear_compare_gpu_pair();
                 self.compare_pin_pending = Some(crate::app::ComparePinPending {
                     source_idx: EXTERNAL_COMPARE_SOURCE_IDX,
+                    original_source: crate::app::PinnedOriginalSource::SameAsProcessed,
                     external_item_key: Some(item_key),
                     rx,
                 });
@@ -53549,7 +54156,7 @@ impl App {
                         pair.pinned_input_size[1],
                         switch_started.elapsed().as_secs_f64() * 1000.0,
                         pair.allocated_cpu_bytes(),
-                        usize::from(pair.pinned_texture.is_some()),
+                        pair.managed_gpu_texture_count(),
                     ));
                 }
                 ctx.request_repaint();
@@ -54899,33 +55506,105 @@ impl App {
         })
     }
 
+    /// All materialized outputs use the same source mapping, including the current PDF password.
+    fn composite_source_for_idx(&self, idx: usize) -> Option<crate::books::CompositeSource> {
+        match self.items.get(idx)? {
+            GridItem::Image(path) => {
+                Some(crate::books::CompositeSource::File { path: path.clone() })
+            }
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => Some(crate::books::CompositeSource::ZipEntry {
+                zip_path: zip_path.clone(),
+                entry_name: entry_name.clone(),
+            }),
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => Some(crate::books::CompositeSource::PdfPage {
+                pdf_path: pdf_path.clone(),
+                page_num: *page_num,
+                password: self.pdf_current_password.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Snapshot only: no decode, rendering, or worker-side persistence for clipboard output.
+    fn edited_clipboard_page_for_idx(
+        &mut self,
+        idx: usize,
+    ) -> Result<crate::edited_clipboard_copy::EditedClipboardPage, String> {
+        let source = self
+            .composite_source_for_idx(idx)
+            .ok_or_else(|| "このアイテムは画像としてコピーできません".to_string())?;
+        let key = self
+            .page_path_key(idx)
+            .ok_or_else(|| "このアイテムは画像としてコピーできません".to_string())?;
+        let params = self.effective_params(idx).clone();
+        let rotation = self.get_rotation(idx);
+        let mut edits = self.book_baked_edit_snapshot(
+            &key,
+            Some(idx),
+            params,
+            rotation,
+            self.settings.bake_stage_clipboard,
+        )?;
+        // A delayed clipboard job must never write an old crop over a newer edit.
+        edits.crop_legacy_writeback = None;
+        Ok(crate::edited_clipboard_copy::EditedClipboardPage { source, edits })
+    }
+
+    pub(crate) fn prepare_edited_clipboard_pages(
+        &mut self,
+        idx: usize,
+        fullscreen: bool,
+    ) -> Result<crate::edited_clipboard_copy::EditedClipboardPages, String> {
+        use crate::edited_clipboard_copy::EditedClipboardPages;
+        if fullscreen
+            && (self.is_overlay_edit_mode_active()
+                || self.adjustment_mode.is_open()
+                || self.analysis_mode)
+        {
+            return Err("編集モードや補正・解析パネルを閉じてからコピーしてください".to_string());
+        }
+        let pair = if fullscreen {
+            self.resolve_visible_spread_output_pair(idx)
+        } else {
+            SpreadPair::Single
+        };
+        let indices = match pair {
+            SpreadPair::Single => vec![idx],
+            SpreadPair::Double { left, right } => vec![left, right],
+        };
+        if self.erase_inpaint_pending.keys().any(|key| {
+            indices.contains(&key.idx)
+                && matches!(key.kind, crate::ui_erase::EraseInpaintKind::Commit)
+        }) {
+            return Err("消しゴム補完の完了後にコピーしてください".to_string());
+        }
+        match pair {
+            SpreadPair::Single => self
+                .edited_clipboard_page_for_idx(idx)
+                .map(Box::new)
+                .map(EditedClipboardPages::Single),
+            SpreadPair::Double { left, right } => Ok(EditedClipboardPages::Spread {
+                left: Box::new(self.edited_clipboard_page_for_idx(left)?),
+                right: Box::new(self.edited_clipboard_page_for_idx(right)?),
+            }),
+        }
+    }
+
     /// `Ok(None)` は対象外 (フォルダ / 動画 / 音声 / アーカイブ本体など)。
     fn batch_export_item_for_idx(
         &mut self,
         idx: usize,
     ) -> Result<Option<crate::export_batch::BatchExportItem>, String> {
-        let item = self
-            .items
-            .get(idx)
-            .cloned()
-            .ok_or_else(|| "このアイテムは書き出せません".to_string())?;
-        let source = match &item {
-            GridItem::Image(path) => crate::books::CompositeSource::File { path: path.clone() },
-            GridItem::ZipImage {
-                zip_path,
-                entry_name,
-            } => crate::books::CompositeSource::ZipEntry {
-                zip_path: zip_path.clone(),
-                entry_name: entry_name.clone(),
-            },
-            GridItem::PdfPage {
-                pdf_path, page_num, ..
-            } => crate::books::CompositeSource::PdfPage {
-                pdf_path: pdf_path.clone(),
-                page_num: *page_num,
-                password: self.pdf_current_password.clone(),
-            },
-            _ => return Ok(None),
+        if self.items.get(idx).is_none() {
+            return Err("このアイテムは書き出せません".to_string());
+        }
+        let Some(source) = self.composite_source_for_idx(idx) else {
+            return Ok(None);
         };
         let filename = self
             .capture_basename_for_idx(idx)
@@ -55301,6 +55980,7 @@ impl App {
         indices: &[usize],
     ) -> Result<(), String> {
         for &idx in indices {
+            self.cancel_prepared_edit_for_entry(idx);
             if (self.has_active_local_adjust_layers(idx)
                 && self.current_local_adjust_pixels(idx).is_none())
                 || (self.local_adjust_pages.contains(&idx)
@@ -55341,35 +56021,18 @@ impl App {
     ) -> Result<crate::export_dialog::ExportPageComposite, String> {
         // source と編集 snapshot だけを UI スレッドで固定する。decode と、選択された段までの
         // 合成は worker が行う。注釈は共通 compositor が AI / 表示用補正の後に焼く。
-        let item = self
-            .items
-            .get(idx)
-            .cloned()
-            .ok_or_else(|| "このアイテムはエクスポートできません".to_string())?;
+        if self.items.get(idx).is_none() {
+            return Err("このアイテムはエクスポートできません".to_string());
+        }
         // 再生中の表示フレームは source file の decode からは復元できない。worker に
         // file だけを渡すと第 1 フレームを黙って保存するため、表示フレームを snapshot
         // できるようになるまでは従来どおり入口で拒否する。
         if self.fs_entry_is_animated(idx) {
             return Err("アニメーション画像はエクスポートできません".to_string());
         }
-        let source = match item {
-            GridItem::Image(path) => crate::books::CompositeSource::File { path },
-            GridItem::ZipImage {
-                zip_path,
-                entry_name,
-            } => crate::books::CompositeSource::ZipEntry {
-                zip_path,
-                entry_name,
-            },
-            GridItem::PdfPage {
-                pdf_path, page_num, ..
-            } => crate::books::CompositeSource::PdfPage {
-                pdf_path,
-                page_num,
-                password: self.pdf_current_password.clone(),
-            },
-            _ => return Err("このアイテムはエクスポートできません".to_string()),
-        };
+        let source = self
+            .composite_source_for_idx(idx)
+            .ok_or_else(|| "このアイテムはエクスポートできません".to_string())?;
         // プリセット出力 (_1〜_4) も同じ snapshot を使い、隠蔽 preset だけを worker 側で
         // 差し替える。`_0` は override を付けず、snapshot が持つ現在値を 1 回だけ適用する。
         let key = self
@@ -58413,6 +59076,7 @@ mod music_full_width_hud_tests {
 
 #[cfg(test)]
 mod tests {
+    include!("ui_fullscreen/compare_original_tests.rs");
     #[test]
     fn chrome_suppression_right_close_hit_keeps_raw_lock_in_still_and_music() {
         use crate::ui_helpers::MetadataPanelOpenState;
@@ -60202,7 +60866,7 @@ mod tests {
         let trim = egui::Rect::from_min_max(egui::pos2(0.2, 0.1), egui::pos2(0.8, 0.9));
         let window = crate::app::DeferredDetachedImageWindowView {
             id: 1,
-            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+            display: crate::gpu_lanczos::FullscreenPaintResource::direct(texture).into(),
             location_display: String::new(),
             image_dims: Some((8, 6)),
             rotation: crate::rotation_db::Rotation::Cw90,
@@ -62814,6 +63478,7 @@ mod tests {
             page_wait_navigation_sequence(opened_at, 3, vec![7], navigation_awaiting(vec![7]));
         assert!(!fs_page_wait_indicator_visible(
             true,
+            false,
             Some(&holdover),
             7,
             3,
@@ -62828,6 +63493,7 @@ mod tests {
             page_wait_navigation_sequence(opened_at, 3, vec![7], navigation_awaiting(vec![7]));
         assert!(fs_page_wait_indicator_visible(
             true,
+            false,
             Some(&holdover),
             7,
             3,
@@ -62847,12 +63513,15 @@ mod tests {
         let now = opened_at + std::time::Duration::from_secs(1);
         assert!(fs_page_wait_indicator_visible(
             true,
+            false,
             Some(&presenting),
             7,
             3,
             now,
         ));
-        assert!(!fs_page_wait_indicator_visible(true, None, 7, 3, now));
+        assert!(!fs_page_wait_indicator_visible(
+            true, false, None, 7, 3, now
+        ));
     }
 
     #[test]
@@ -62866,6 +63535,7 @@ mod tests {
         );
         assert!(fs_page_wait_indicator_visible(
             true,
+            false,
             Some(&holdover),
             7,
             3,
@@ -62874,11 +63544,30 @@ mod tests {
     }
 
     #[test]
+    fn page_wait_indicator_hides_for_presented_page_turn_target_with_sequence_still_active() {
+        let opened_at = std::time::Instant::now();
+        let holdover = page_wait_navigation_sequence(
+            opened_at,
+            3,
+            vec![7, 8],
+            navigation_presenting(vec![7, 8], FsNavigationPresentation::Materialized),
+        );
+        let now = opened_at + std::time::Duration::from_secs(1);
+        for presented in [false, true] {
+            assert_eq!(
+                fs_page_wait_indicator_visible(true, presented, Some(&holdover), 7, 3, now),
+                !presented,
+            );
+        }
+    }
+
+    #[test]
     fn page_wait_indicator_respects_processing_status_setting() {
         let opened_at = std::time::Instant::now();
         let holdover =
             page_wait_navigation_sequence(opened_at, 3, vec![7], navigation_awaiting(vec![7]));
         assert!(!fs_page_wait_indicator_visible(
+            false,
             false,
             Some(&holdover),
             7,
@@ -62892,6 +63581,7 @@ mod tests {
         let opened_at = std::time::Instant::now();
         assert!(!fs_page_wait_indicator_visible(
             true,
+            false,
             None,
             7,
             3,
@@ -63011,6 +63701,7 @@ mod tests {
         assert!(!fullscreen_boundary_hint_visible(
             false,
             FsBoundaryHint::Edge {
+                scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                 at_end: true,
                 at: now,
             },
@@ -63025,6 +63716,7 @@ mod tests {
         assert!(fullscreen_boundary_hint_visible(
             true,
             FsBoundaryHint::Edge {
+                scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                 at_end: false,
                 at: now,
             },
@@ -63038,6 +63730,7 @@ mod tests {
         for (at_end, expected) in [(false, "先頭です"), (true, "末尾です")] {
             assert_eq!(fullscreen_boundary_edge_title(at_end), expected);
             let text = crate::app::App::native_boundary_hint_text(FsBoundaryHint::Edge {
+                scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
                 at_end,
                 at: now,
             });
@@ -63578,7 +64271,7 @@ mod tests {
     }
 
     fn captured_folder_navigation_unit(app: &App) -> FsDisplayUnitHoldover {
-        let FsHoldover::FolderNavigation(Some(unit)) = app
+        let FsHoldover::FolderNavigation(Some(unit), _) = app
             .fs_holdover_tex
             .as_ref()
             .expect("folder navigation holdover captured")
@@ -64745,6 +65438,16 @@ mod tests {
                                     disabled_reason: None,
                                 },
                             );
+                            root_rows.insert(
+                                0,
+                                FsOverflowPanelRow {
+                                    item: FullscreenOverflowItemId::PageOverview,
+                                    label: "本のページ一覧 [O]".into(),
+                                    status: String::new(),
+                                    enabled: true,
+                                    disabled_reason: None,
+                                },
+                            );
                             let view = FsOverflowPanelView {
                                 state,
                                 root_rows,
@@ -64762,7 +65465,7 @@ mod tests {
                 });
             });
         harness.run();
-        if size.y >= 600.0 {
+        if size.y >= 614.0 {
             let (inner, content, offset) = harness.ctx.data(|data| {
                 data.get_temp(egui::Id::unique("fs_overflow_scroll_test_layout"))
                     .unwrap()
@@ -64792,7 +65495,9 @@ mod tests {
 
     #[test]
     fn fullscreen_overflow_panel_tall_viewport_keeps_the_production_body_height() {
-        for size in [egui::vec2(720.0, 600.0), egui::vec2(720.0, 720.0)] {
+        // Ten root rows need a viewport at least 608pt high, including the
+        // toolbar, header, panel padding and outer margins.
+        for size in [egui::vec2(720.0, 614.0), egui::vec2(720.0, 720.0)] {
             // The shared fixture retains its original Fits assertion; no PNG is
             // needed to detect the 8pt viewport shrink from build_ui's outer frame.
             let _ = fullscreen_overflow_panel_harness(FsOverflowPanelState::Root, size, false);
@@ -64824,7 +65529,7 @@ mod tests {
         snapshot_fullscreen_overflow_panel(
             "fullscreen_overflow_panel_root_tall",
             FsOverflowPanelState::Root,
-            egui::vec2(720.0, 600.0),
+            egui::vec2(720.0, 614.0),
             false,
         );
     }
@@ -64853,31 +65558,31 @@ mod tests {
     fn page_turn_animation_overflow_row_follows_shared_setting_and_keymap() {
         let mut app = crate::app::setup_app_for_test();
         assert!(!app.settings.page_turn_animation_enabled);
-        let row = |app: &App| {
+        let row = |app: &mut App| {
             app.fullscreen_overflow_panel_view(false)
                 .root_rows
                 .into_iter()
                 .find(|row| row.item == FullscreenOverflowItemId::PageTurnAnimationToggle)
                 .unwrap()
         };
-        assert_eq!(row(&app).label, "ページめくりアニメーション");
-        assert_eq!(row(&app).status, "OFF");
+        assert_eq!(row(&mut app).label, "ページめくりアニメーション");
+        assert_eq!(row(&mut app).status, "OFF");
         app.keymap = Keymap::from_ini_str("[FsImage]\nFsPageTurnAnimationToggle = Ctrl+Shift+A\n");
         let mut settings = app.settings.clone();
         settings.page_turn_animation_enabled = true;
         app.install_preferences_settings(settings);
-        assert_eq!(row(&app).status, "ON");
+        assert_eq!(row(&mut app).status, "ON");
         assert_eq!(
-            row(&app).label,
+            row(&mut app).label,
             app.keymap.first_chord_bracket_label(
                 "ページめくりアニメーション",
                 KeyAction::FsPageTurnAnimationToggle
             )
         );
-        assert!(row(&app).enabled);
+        assert!(row(&mut app).enabled);
         app.reading_flow = ReadingFlow::Vertical;
         assert!(
-            row(&app).enabled,
+            row(&mut app).enabled,
             "the global preference remains accessible in an unsupported flow"
         );
     }
@@ -65594,6 +66299,97 @@ mod tests {
         assert!(panned.length_sq() > PAN_EPSILON_SQ);
     }
 
+    #[test]
+    fn canvas_double_click_resets_shrunk_zoom_without_changing_single_click_ownership() {
+        for zoom in [
+            0.8,
+            1.25,
+            1.0,
+            0.99999,
+            1.00001,
+            ZOOM_NEAR_ONE,
+            2.0 - ZOOM_NEAR_ONE,
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = crate::app::setup_app_for_test();
+            app.fs_zoom = zoom;
+            app.fs_pan = egui::Vec2::ZERO;
+            app.fs_free_rotation = 0.0;
+            app.spread_mode = SpreadMode::Single;
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0));
+            let pos = egui::pos2(400.0, 200.0);
+            // Establish the hit target, then deliver two physical press/release pairs
+            // through the same backing-click boundary used by the fullscreen handler.
+            for frame in 0..5 {
+                let mut events = vec![egui::Event::PointerMoved(pos)];
+                if frame > 0 {
+                    events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: frame % 2 == 1,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(rect),
+                        time: Some(frame as f64 * 0.05),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.capture_fs_front_pointer_input(&ctx, rect);
+                        let response = ui.interact(
+                            rect,
+                            egui::Id::new("zoom-reset-canvas"),
+                            egui::Sense::click_and_drag(),
+                        );
+                        app.fs_front_pointer.accept_backing_click(&response, false);
+                        let action = app.plan_fs_canvas_click(
+                            &ctx,
+                            &response,
+                            rect,
+                            StillSeekGeometry::bar_only(),
+                            false,
+                            false,
+                            false,
+                            false,
+                            None,
+                            false,
+                            zoom,
+                            egui::Vec2::ZERO,
+                        );
+                        if frame == 2 {
+                            assert!(response.clicked(), "zoom={zoom}");
+                            if zoom > ZOOM_NEAR_ONE {
+                                assert!(matches!(action, FsCanvasClickAction::None));
+                            } else {
+                                assert!(
+                                    matches!(action, FsCanvasClickAction::PageSide(1)),
+                                    "zoom={zoom}"
+                                );
+                            }
+                        } else if frame == 4 {
+                            assert!(app.fs_front_pointer.backing_double_clicked(&response));
+                            if zoom == 0.8 || zoom == 1.25 {
+                                assert!(
+                                    matches!(action, FsCanvasClickAction::ResetTransform),
+                                    "zoom={zoom}"
+                                );
+                            } else {
+                                assert!(
+                                    matches!(action, FsCanvasClickAction::PageSide(1)),
+                                    "fit roundoff must not offer reset: zoom={zoom}"
+                                );
+                            }
+                        }
+                    },
+                )
+                .drop_without_applying_deltas();
+            }
+        }
+    }
+
     fn navigation_trace_page(
         idx: usize,
         navigation_anchor_idx: usize,
@@ -65621,6 +66417,7 @@ mod tests {
         texture: egui::TextureHandle,
     ) -> FsDisplayUnitHoldoverPage {
         FsDisplayUnitHoldoverPage {
+            crop: None,
             fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
             fit_scale_limits: FullscreenFitScaleLimits::default(),
             occurrence: SpreadPageOccurrence::navigation(idx, idx),
@@ -65704,9 +66501,12 @@ mod tests {
             "the password surface replaces the previous page"
         );
         assert!(
-            FsHoldover::FolderNavigation(Some(unit.clone()))
-                .last_painted_display_unit_for_snapshot(7)
-                .is_some()
+            FsHoldover::FolderNavigation(
+                Some(unit.clone()),
+                crate::app::FsFolderNavigationOrigin::Ordinary
+            )
+            .last_painted_display_unit_for_snapshot(7)
+            .is_some()
         );
         assert!(
             FsHoldover::PresentationSwitch(unit.clone())
@@ -67592,7 +68392,10 @@ mod tests {
         app.items_generation = 31;
         app.fullscreen_idx = None;
         app.fs_nav_locked_gen = Some(30);
-        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(None));
+        app.fs_holdover_tex = Some(FsHoldover::FolderNavigation(
+            None,
+            crate::app::FsFolderNavigationOrigin::Ordinary,
+        ));
         app.activate_sidecar_restore_modal_for_test(folder);
         assert!(app.defer_sidecar_restore_fullscreen(
             0,
@@ -67606,7 +68409,10 @@ mod tests {
         assert_eq!(app.fs_nav_locked_gen, Some(30));
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(None))
+            Some(FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary
+            ))
         ));
 
         app.items_generation = 32;
@@ -67783,6 +68589,7 @@ mod tests {
             singleton_placement: SingletonSpreadPlacement::Center,
             layout_projection: FsDisplayUnitLayoutProjection::Canonical,
             pages: vec![FsDisplayUnitHoldoverPage {
+                crop: None,
                 fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 occurrence: SpreadPageOccurrence::navigation(0, 0),
@@ -68350,6 +69157,7 @@ mod tests {
             ResolvedDisplayPlacement::Normal { zoom_pan: None },
         );
         let page = PreparedPagedPage {
+            crop: None,
             occurrence: SpreadPageOccurrence::navigation(0, 0),
             transform,
             resource: native.into(),
@@ -68425,6 +69233,7 @@ mod tests {
             ResolvedDisplayPlacement::Normal { zoom_pan: None },
         );
         let page = PreparedPagedPage {
+            crop: None,
             occurrence: SpreadPageOccurrence::navigation(0, 0),
             transform,
             resource: native.into(),
@@ -68496,6 +69305,7 @@ mod tests {
                     egui::Rect::from_min_max(egui::pos2(0.0, 0.25), egui::pos2(1.0, 0.75)),
                 );
                 Some(PreparedPagedPage {
+                    crop: None,
                     occurrence: SpreadPageOccurrence::navigation(idx, 0),
                     transform: navigator_test_transform(
                         idx,
@@ -68719,6 +69529,8 @@ mod tests {
                                     content_bbox,
                                     None,
                                     true,
+                                    None,
+                                    page_turn::FlatCropPaint::WithPage,
                                 )
                                 .is_some()
                             );
@@ -68899,6 +69711,7 @@ mod tests {
             singleton_placement: SingletonSpreadPlacement::Center,
             layout_projection: FsDisplayUnitLayoutProjection::Canonical,
             pages: vec![FsDisplayUnitHoldoverPage {
+                crop: None,
                 fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                 fit_scale_limits: FullscreenFitScaleLimits::default(),
                 occurrence: SpreadPageOccurrence::navigation(4, 4),
@@ -69495,6 +70308,1657 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn key_zoom_out_from_fit_reaches_displayed_transform_for_all_normal_inputs() {
+        for producer in 0..3 {
+            let (mut app, _, idx) = setup_flat_navigator_input_test();
+            let ctx = egui::Context::default();
+            app.fs_zoom = 1.0;
+            app.fs_pan = egui::Vec2::ZERO;
+            app.settings.page_turn_animation_enabled = true;
+            assert!(app.page_turn_view_eligible(idx));
+            let fit = navigator_test_transform(
+                idx,
+                crate::rotation_db::Rotation::None,
+                ResolvedDisplayPlacement::Normal {
+                    zoom_pan: app.fs_zoom_pan(),
+                },
+            );
+            match producer {
+                0 => assert!(app.apply_fs_key_zoom_step(&ctx, false)),
+                1 => assert!(app.apply_gamepad_fullscreen_zoom(-1.0, 1.0)),
+                _ => {
+                    let (mut zoom, mut pan) = (app.fs_zoom, app.fs_pan);
+                    assert!(App::apply_wheel_zoom(
+                        &mut zoom,
+                        &mut pan,
+                        -WHEEL_SENSITIVITY,
+                        Some(egui::Pos2::ZERO),
+                        egui::Pos2::ZERO
+                    ));
+                    app.fs_zoom = zoom;
+                    app.set_fs_pan_from_input(zoom, pan);
+                }
+            }
+            assert!(app.fs_zoom < 1.0);
+            assert_eq!(app.fs_pan, egui::Vec2::ZERO);
+            assert_eq!(app.fs_zoom_pan(), Some((app.fs_zoom, egui::Vec2::ZERO)));
+            assert!(!app.page_turn_view_eligible(idx));
+            let shrunk = navigator_test_transform(
+                idx,
+                crate::rotation_db::Rotation::None,
+                ResolvedDisplayPlacement::Normal {
+                    zoom_pan: app.fs_zoom_pan(),
+                },
+            );
+            assert!(
+                (shrunk.layout_full_image_rect.size()
+                    - fit.layout_full_image_rect.size() * app.fs_zoom)
+                    .length()
+                    < 2.0
+            );
+            assert!(shrunk.layout_full_image_rect.width() < fit.layout_full_image_rect.width());
+            assert!(
+                shrunk
+                    .layout_full_image_rect
+                    .center()
+                    .distance(fit.layout_full_image_rect.center())
+                    < 1.1
+            );
+            if producer == 0 {
+                assert_eq!(app.fs_zoom, 0.8);
+            }
+        }
+    }
+
+    #[test]
+    fn fs_zoom_pan_treats_fit_roundoff_symmetrically_and_preserves_pan() {
+        let mut app = crate::app::setup_app_for_test();
+        app.fs_pan = egui::Vec2::ZERO;
+        for zoom in [1.0, 0.99999, 1.00001, ZOOM_NEAR_ONE, 2.0 - ZOOM_NEAR_ONE] {
+            app.fs_zoom = zoom;
+            assert_eq!(app.fs_zoom_pan(), None, "zoom={zoom}");
+        }
+        for zoom in [0.8, 1.25] {
+            app.fs_zoom = zoom;
+            assert_eq!(app.fs_zoom_pan(), Some((zoom, egui::Vec2::ZERO)));
+        }
+        app.fs_zoom = 1.0;
+        app.fs_pan = egui::vec2(10.0, -20.0);
+        assert_eq!(app.fs_zoom_pan(), Some((1.0, app.fs_pan)));
+    }
+
+    #[test]
+    fn key_zoom_image_and_analysis_keep_center_and_other_owner_unchanged() {
+        for analysis in [false, true] {
+            let (mut app, _, _) = setup_flat_navigator_input_test();
+            let ctx = egui::Context::default();
+            app.analysis_mode = analysis;
+            app.fs_zoom = 2.0;
+            app.analysis_zoom = 2.0;
+            app.fs_pan = egui::vec2(20.0, -15.0);
+            app.analysis_pan = egui::vec2(-30.0, 40.0);
+            let before = (app.fs_zoom, app.fs_pan, app.analysis_zoom, app.analysis_pan);
+            assert!(app.apply_fs_key_zoom_step(&ctx, true));
+            if analysis {
+                assert_eq!((app.fs_zoom, app.fs_pan), (before.0, before.1));
+                assert_eq!(app.analysis_zoom, 2.5);
+                assert_eq!(app.analysis_pan, before.3 * 1.25);
+            } else {
+                assert_eq!((app.analysis_zoom, app.analysis_pan), (before.2, before.3));
+                assert_eq!(app.fs_zoom, 2.5);
+                assert_eq!(app.fs_pan, before.1 * 1.25);
+            }
+            assert!(app.apply_fs_key_zoom_step(&ctx, false));
+            assert_eq!(
+                (app.fs_zoom, app.fs_pan, app.analysis_zoom, app.analysis_pan),
+                before
+            );
+            for (limit, zoom_in) in [(ZOOM_MIN, false), (ZOOM_MAX, true)] {
+                if analysis {
+                    app.analysis_zoom = limit;
+                } else {
+                    app.fs_zoom = limit;
+                }
+                let before = (app.fs_zoom, app.fs_pan, app.analysis_zoom, app.analysis_pan);
+                assert!(!app.apply_fs_key_zoom_step(&ctx, zoom_in));
+                assert_eq!(
+                    (app.fs_zoom, app.fs_pan, app.analysis_zoom, app.analysis_pan),
+                    before
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn key_zoom_panorama_and_z_only_change_their_visible_owner() {
+        let ctx = egui::Context::default();
+        let (mut app, _, _) = setup_panorama_navigator_input_test(&ctx);
+        app.analysis_zoom = 3.0;
+        app.analysis_pan = egui::vec2(30.0, 40.0);
+        let unchanged = (app.fs_zoom, app.fs_pan, app.analysis_zoom, app.analysis_pan);
+        let fov = app.panorama_state.as_ref().unwrap().fov_y;
+        assert!(app.apply_fs_key_zoom_step(&ctx, true));
+        assert!((app.panorama_state.as_ref().unwrap().fov_y - fov / 1.25).abs() < 1e-6);
+        assert!(app.apply_fs_key_zoom_step(&ctx, false));
+        assert!((app.panorama_state.as_ref().unwrap().fov_y - fov).abs() < 1e-6);
+        // Repeated steps eventually reach each projection's existing FOV clamp.
+        for zoom_in in [true, false] {
+            for _ in 0..100 {
+                app.apply_fs_key_zoom_step(&ctx, zoom_in);
+            }
+            assert!(!app.apply_fs_key_zoom_step(&ctx, zoom_in));
+        }
+        assert_eq!(
+            (app.fs_zoom, app.fs_pan, app.analysis_zoom, app.analysis_pan),
+            unchanged
+        );
+        app.panorama_state = None;
+        for aiming in [true, false] {
+            app.fs_zoom_aiming = aiming;
+            app.fs_zoom_active = !aiming;
+            app.fs_zoom_factor = 2.0;
+            assert_eq!(app.fs_zoom_owner(), FsZoomOwner::ZoomMode);
+            assert!(app.apply_fs_key_zoom_step(&ctx, true));
+            assert_eq!(app.fs_zoom_factor, 2.5);
+            assert!(app.apply_fs_key_zoom_step(&ctx, false));
+            assert_eq!(app.fs_zoom_factor, 2.0);
+            for (limit, zoom_in) in [(0.05, false), (16.0, true)] {
+                app.fs_zoom_factor = limit;
+                assert!(!app.apply_fs_key_zoom_step(&ctx, zoom_in));
+                assert_eq!(app.fs_zoom_factor, limit);
+            }
+            assert_eq!(
+                (app.fs_zoom, app.fs_pan, app.analysis_zoom, app.analysis_pan),
+                unchanged
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scrub_zoom_primary_handler_owns_click_and_drag_but_excludes_media() {
+        use crate::key_input::{SyntheticKeyCommand, SyntheticModifiers, SyntheticNavigationKey};
+        let _serial = crate::key_input::lock_test_input();
+        for media in 0..3 {
+            let (mut app, rect, idx) = setup_flat_navigator_input_test();
+            app.settings.fullscreen_navigator_visible = false;
+            app.settings.touch_still_chrome_learned = true;
+            app.fs_prev_focused = true;
+            app.keymap =
+                crate::keymap::Keymap::from_ini_str("[FsImage]\nFsScrubZoomHold = Ctrl+Tab\n");
+            if media == 1 {
+                app.items[idx] = GridItem::Video(PathBuf::from("scrub.mp4"));
+            }
+            if media == 2 {
+                app.items[idx] = GridItem::Audio(PathBuf::from("scrub.mp3"));
+            }
+            let mut state = navigator_test_frame_state();
+            state.is_video = media == 1;
+            let ctx = egui::Context::default();
+            install_fs_navigator_input_tracking(&ctx);
+            crate::key_input::arm_test_synthetic_input(0xE007, egui::ViewportId::ROOT);
+            let now = std::time::Instant::now();
+            crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+                now,
+                SyntheticNavigationKey::Tab,
+                SyntheticModifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            ));
+            crate::key_input::advance_test_synthetic_input(now);
+            let start = rect.center();
+            for frame in 0..4 {
+                let pos = start + egui::vec2(if frame == 0 { 0.0 } else { 100.0 }, 0.0);
+                if frame == 2 {
+                    let later = now + std::time::Duration::from_millis(1);
+                    crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::up(
+                        later,
+                        SyntheticNavigationKey::Tab,
+                    ));
+                    crate::key_input::advance_test_synthetic_input(later);
+                }
+                let mut events = vec![egui::Event::PointerMoved(pos)];
+                if frame == 0 || frame == 3 {
+                    events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: frame == 0,
+                        modifiers: if frame == 0 {
+                            egui::Modifiers::CTRL
+                        } else {
+                            egui::Modifiers::NONE
+                        },
+                    });
+                }
+                app.frame_counter += 1;
+                let mut result = (FsPageNav::None, false);
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            screen_rect: Some(rect),
+                            events,
+                            focused: true,
+                            time: Some(frame as f64 * 0.1),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            let _owner = app.keyboard_owner_for_pass(ctx);
+                            ctx.root_ui(|root| {
+                                egui::CentralPanel::default().frame(egui::Frame::NONE).show(
+                                    root,
+                                    |ui| {
+                                        result = app.handle_fs_wheel_and_click(
+                                            ui, ctx, rect, &state, false, 0, &mut None,
+                                        );
+                                    },
+                                );
+                            });
+                        },
+                    )
+                    .drop_without_applying_deltas();
+                if media == 0 {
+                    assert!(matches!(result.0, FsPageNav::None));
+                    assert_eq!(app.fs_zoom, if frame == 0 { 2.0 } else { 4.0 });
+                    assert_eq!(app.fs_middle_zoom_drag.is_some(), frame < 3);
+                    assert!(app.fs_pan_drag_start.is_none());
+                } else {
+                    assert!(app.fs_middle_zoom_drag.is_none());
+                    assert_eq!(app.fs_zoom, 2.0);
+                }
+            }
+            crate::key_input::clear_test_synthetic_input();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scrub_zoom_erase_press_does_not_paint_and_drawing_cannot_start_scrub() {
+        use crate::key_input::{SyntheticKeyCommand, SyntheticModifiers, SyntheticNavigationKey};
+        let _serial = crate::key_input::lock_test_input();
+        for drawing in [false, true] {
+            let (mut app, _, idx) = setup_flat_navigator_input_test();
+            app.erase_mode = true;
+            app.erase_tool = crate::app::EraseTool::Brush;
+            app.keymap =
+                crate::keymap::Keymap::from_ini_str("[Erase]\nEraseScrubZoomHold = Ctrl+Tab\n");
+            if drawing {
+                app.erase_line_start = Some((10.0, 10.0));
+            }
+            let transform = navigator_test_transform(
+                idx,
+                crate::rotation_db::Rotation::None,
+                ResolvedDisplayPlacement::Normal {
+                    zoom_pan: Some((2.0, egui::Vec2::ZERO)),
+                },
+            );
+            let pos = transform.viewport_rect.center();
+            let ctx = egui::Context::default();
+            install_fs_navigator_input_tracking(&ctx);
+            crate::key_input::arm_test_synthetic_input(0xE008, egui::ViewportId::ROOT);
+            let now = std::time::Instant::now();
+            crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+                now,
+                SyntheticNavigationKey::Tab,
+                SyntheticModifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            ));
+            crate::key_input::advance_test_synthetic_input(now);
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        focused: true,
+                        screen_rect: Some(transform.viewport_rect),
+                        events: vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed: true,
+                                modifiers: egui::Modifiers::CTRL,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        let _owner = app.keyboard_owner_for_pass(ctx);
+                        app.handle_erase_paint(ctx, &transform, Default::default());
+                    },
+                )
+                .drop_without_applying_deltas();
+            assert_eq!(app.fs_middle_zoom_drag.is_some(), !drawing);
+            if !drawing {
+                assert!(app.erase_last_paint_pos.is_none());
+                assert!(app.erase_drag.is_none());
+            }
+            crate::key_input::clear_test_synthetic_input();
+        }
+    }
+
+    #[cfg(windows)]
+    fn erase_preview_canvas_test(
+        ctx: &egui::Context,
+        tool: crate::app::EraseTool,
+    ) -> (
+        crate::app::AppTestEnvForTest,
+        DisplayedImageTransform,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use crate::ui_erase::{
+            EraseInpaintKind, EraseInpaintPending, EraseInpaintPendingKey, EraseInpaintProgress,
+            EraseInpaintPurpose,
+        };
+        let (mut app, _, idx) = setup_flat_navigator_input_test();
+        let transform = navigator_test_transform(
+            idx,
+            crate::rotation_db::Rotation::None,
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((2.0, egui::Vec2::ZERO)),
+            },
+        );
+        app.erase_mode = true;
+        app.erase_tool = tool;
+        app.erase_paint_mode = true;
+        app.erase_mask_size = [1600, 1200];
+        app.erase_mask = Some(vec![false; 1600 * 1200]);
+        app.erase_shapes = vec![crate::mask_db::Shape::Line {
+            op: crate::mask_db::ShapeOp::Add,
+            kind: crate::mask_db::LineKind::Diagonal,
+            p0: (400.0, 600.0),
+            p1: (1200.0, 600.0),
+            thickness: 40.0,
+        }];
+        let pixels = Arc::new(egui::ColorImage::filled([1600, 1200], egui::Color32::WHITE));
+        let display_basis = crate::material_display_basis::MaterialDisplayBasis::from_sampler(
+            [1600, 1200],
+            crate::source_coverage::SourceCoverage::FullSource,
+        );
+        app.erase_base_cache.insert(
+            idx,
+            crate::app::EraseBaseSource::raster(Arc::clone(&pixels)),
+        );
+        app.erase_preview_cache.insert(
+            idx,
+            crate::app::ErasePreviewCacheEntry {
+                display_basis,
+                texture: ctx.load_texture(
+                    "erase-preview-canvas",
+                    Arc::clone(&pixels),
+                    egui::TextureOptions::LINEAR,
+                ),
+                pixels,
+            },
+        );
+        // Keep a completed preview and an in-flight request: neither may be
+        // invalidated by input which the preview owns. No AI worker is started.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let (_progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let items_generation = app.items_generation;
+        let path_key = app.page_path_key(idx);
+        app.erase_inpaint_pending.insert(
+            EraseInpaintPendingKey {
+                idx,
+                kind: EraseInpaintKind::Preview,
+            },
+            EraseInpaintPending {
+                display_basis,
+                idx,
+                items_generation,
+                path_key,
+                rx,
+                progress_rx,
+                progress: EraseInpaintProgress::Preparing,
+                cancel: Arc::clone(&cancel),
+                started_at: std::time::Instant::now(),
+                input_generation: 0,
+                mask_generation: 0,
+                purpose: EraseInpaintPurpose::Preview {
+                    origin: "canvas-regression",
+                },
+            },
+        );
+        app.erase_preview_active = true;
+        (app, transform, cancel)
+    }
+
+    #[cfg(windows)]
+    fn erase_preview_canvas_key(
+        key: crate::key_input::SyntheticNavigationKey,
+        down: bool,
+        ctrl: bool,
+    ) {
+        let now = std::time::Instant::now();
+        let command = if down {
+            crate::key_input::SyntheticKeyCommand::down(
+                now,
+                key,
+                crate::key_input::SyntheticModifiers {
+                    ctrl,
+                    ..Default::default()
+                },
+            )
+        } else {
+            crate::key_input::SyntheticKeyCommand::up(now, key)
+        };
+        crate::key_input::enqueue_test_synthetic_command(command);
+        crate::key_input::advance_test_synthetic_input(now);
+    }
+
+    #[cfg(windows)]
+    fn erase_preview_canvas_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        transform: &DisplayedImageTransform,
+        events: Vec<egui::Event>,
+    ) {
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(transform.viewport_rect),
+                focused: true,
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                app.keyboard_owner_for_pass(ctx);
+                // The production wheel/click router advances this same owner before
+                // edit input. Exercise its release transition, never reset the field.
+                let _ = app.fs_primary_suppression.apply(
+                    FullscreenPrimarySuppressionEvent::PointerFrame {
+                        released: ctx.input(|input| input.pointer.primary_released()),
+                    },
+                );
+                app.handle_erase_paint(ctx, transform, Default::default());
+                app.draw_erase_overlay(ui, ctx, transform);
+            },
+        )
+        .drop_without_applying_deltas();
+    }
+
+    #[cfg(windows)]
+    fn erase_preview_canvas_primary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            pressed,
+            button: egui::PointerButton::Primary,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_preview_canvas_primary_cannot_mutate_any_tool_or_invalidate_preview() {
+        use crate::app::EraseTool;
+        let _input = crate::key_input::lock_test_input();
+        for tool in [
+            EraseTool::Brush,
+            EraseTool::Bucket,
+            EraseTool::Lasso,
+            EraseTool::Polygon,
+            EraseTool::Line,
+            EraseTool::VertLine,
+            EraseTool::HorizLine,
+            EraseTool::Rect,
+            EraseTool::Ellipse,
+            EraseTool::Select,
+        ] {
+            crate::key_input::arm_test_synthetic_input(0xE010, egui::ViewportId::ROOT);
+            erase_preview_canvas_key(crate::key_input::SyntheticNavigationKey::Tab, true, false);
+            let ctx = egui::Context::default();
+            crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
+            let (mut app, transform, cancel) = erase_preview_canvas_test(&ctx, tool);
+            let idx = app.fullscreen_idx.unwrap();
+            let texture = app.erase_preview_cache[&idx].texture.id();
+            let shapes = app.erase_shapes.clone();
+            let pos = transform.viewport_rect.center();
+            erase_preview_canvas_frame(
+                &mut app,
+                &ctx,
+                &transform,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    erase_preview_canvas_primary(pos, true),
+                ],
+            );
+            assert!(app.fs_primary_suppression.is_active(), "{tool:?}");
+            erase_preview_canvas_frame(
+                &mut app,
+                &ctx,
+                &transform,
+                vec![egui::Event::PointerMoved(pos + egui::vec2(60.0, 35.0))],
+            );
+            assert!(app.erase_preview_active);
+            assert!(app.erase_mask.as_ref().unwrap().iter().all(|pixel| !pixel));
+            assert_eq!(app.erase_shapes, shapes);
+            assert!(app.erase_selected_shape.is_none());
+            assert!(
+                app.erase_last_paint_pos.is_none()
+                    && app.erase_line_start.is_none()
+                    && app.erase_shape_drag_start.is_none()
+                    && app.erase_drag.is_none()
+                    && app.erase_lasso_points.is_empty()
+            );
+            assert!(app.erase_undo_stack.is_empty());
+            assert_eq!(app.erase_preview_cache[&idx].texture.id(), texture);
+            assert_eq!(app.erase_inpaint_pending.len(), 1);
+            assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_preview_canvas_requires_a_fresh_primary_press_after_preview_release() {
+        let _input = crate::key_input::lock_test_input();
+        crate::key_input::arm_test_synthetic_input(0xE011, egui::ViewportId::ROOT);
+        erase_preview_canvas_key(crate::key_input::SyntheticNavigationKey::Tab, true, false);
+        let ctx = egui::Context::default();
+        let (mut app, transform, cancel) =
+            erase_preview_canvas_test(&ctx, crate::app::EraseTool::Brush);
+        let pos = transform.viewport_rect.center() + egui::vec2(0.0, 100.0);
+        erase_preview_canvas_frame(
+            &mut app,
+            &ctx,
+            &transform,
+            vec![
+                egui::Event::PointerMoved(pos),
+                erase_preview_canvas_primary(pos, true),
+            ],
+        );
+        erase_preview_canvas_key(crate::key_input::SyntheticNavigationKey::Tab, false, false);
+        erase_preview_canvas_frame(&mut app, &ctx, &transform, vec![]);
+        assert!(!app.erase_preview_active);
+        erase_preview_canvas_frame(
+            &mut app,
+            &ctx,
+            &transform,
+            vec![egui::Event::PointerMoved(pos + egui::vec2(30.0, 0.0))],
+        );
+        assert!(app.erase_mask.as_ref().unwrap().iter().all(|pixel| !pixel));
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        erase_preview_canvas_frame(
+            &mut app,
+            &ctx,
+            &transform,
+            vec![erase_preview_canvas_primary(pos, false)],
+        );
+        assert!(!app.fs_primary_suppression.is_active());
+        erase_preview_canvas_frame(
+            &mut app,
+            &ctx,
+            &transform,
+            vec![
+                egui::Event::PointerMoved(pos),
+                erase_preview_canvas_primary(pos, true),
+            ],
+        );
+        assert!(app.erase_mask.as_ref().unwrap().iter().any(|pixel| *pixel));
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_preview_canvas_keeps_space_pan_and_ctrl_space_zoom_available() {
+        let _input = crate::key_input::lock_test_input();
+        for ctrl in [false, true] {
+            crate::key_input::arm_test_synthetic_input(0xE012, egui::ViewportId::ROOT);
+            erase_preview_canvas_key(crate::key_input::SyntheticNavigationKey::Tab, true, false);
+            let ctx = egui::Context::default();
+            let (mut app, transform, cancel) =
+                erase_preview_canvas_test(&ctx, crate::app::EraseTool::Brush);
+            erase_preview_canvas_key(crate::key_input::SyntheticNavigationKey::Space, true, ctrl);
+            let pos = transform.viewport_rect.center();
+            erase_preview_canvas_frame(
+                &mut app,
+                &ctx,
+                &transform,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    erase_preview_canvas_primary(pos, true),
+                ],
+            );
+            assert!(!app.fs_primary_suppression.is_active());
+            erase_preview_canvas_frame(
+                &mut app,
+                &ctx,
+                &transform,
+                vec![egui::Event::PointerMoved(pos + egui::vec2(100.0, 0.0))],
+            );
+            if ctrl {
+                assert!((app.fs_zoom - 4.0).abs() < 1e-4);
+            } else {
+                assert_ne!(app.fs_pan, egui::Vec2::ZERO);
+                assert!(app.erase_preview_active);
+            }
+            assert!(app.erase_mask.as_ref().unwrap().iter().all(|pixel| !pixel));
+            assert!(
+                app.erase_preview_cache
+                    .contains_key(&app.fullscreen_idx.unwrap())
+            );
+            assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+            erase_preview_canvas_frame(
+                &mut app,
+                &ctx,
+                &transform,
+                vec![erase_preview_canvas_primary(pos, false)],
+            );
+            assert!(app.fs_pan_drag_start.is_none());
+            assert!(app.fs_middle_zoom_drag.is_none());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_preview_canvas_does_not_latch_a_primary_click_released_in_the_same_frame() {
+        let _input = crate::key_input::lock_test_input();
+        crate::key_input::arm_test_synthetic_input(0xE013, egui::ViewportId::ROOT);
+        erase_preview_canvas_key(crate::key_input::SyntheticNavigationKey::Tab, true, false);
+        let ctx = egui::Context::default();
+        let (mut app, transform, cancel) =
+            erase_preview_canvas_test(&ctx, crate::app::EraseTool::Brush);
+        let pos = transform.viewport_rect.center();
+        erase_preview_canvas_frame(
+            &mut app,
+            &ctx,
+            &transform,
+            vec![
+                egui::Event::PointerMoved(pos),
+                erase_preview_canvas_primary(pos, true),
+                erase_preview_canvas_primary(pos, false),
+            ],
+        );
+        assert!(!app.fs_primary_suppression.is_active());
+        assert!(app.erase_mask.as_ref().unwrap().iter().all(|pixel| !pixel));
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[cfg(windows)]
+    fn scrub_review_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        state: &FsFrameState,
+        pos: egui::Pos2,
+        edge: Option<bool>,
+        spread: bool,
+        overlay: Option<KeyAction>,
+    ) {
+        install_fs_navigator_input_tracking(ctx);
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        if let Some(pressed) = edge {
+            events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::CTRL,
+            });
+        }
+        app.frame_counter += 1;
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    events,
+                    focused: true,
+                    screen_rect: Some(rect),
+                    time: Some(app.frame_counter as f64 * 0.1),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let _owner = app.keyboard_owner_for_pass(ctx);
+                    ctx.root_ui(|root| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root, |ui| {
+                                let result = app.handle_fs_wheel_and_click(
+                                    ui, ctx, rect, state, spread, 0, &mut None,
+                                );
+                                assert!(matches!(result.0, FsPageNav::None));
+                                if let Some(action) = overlay {
+                                    let held = crate::keyboard_input::focused_key_state_permit(ctx)
+                                        .is_some_and(|permit| {
+                                            app.keymap.key_held_action(ctx, permit, action)
+                                        });
+                                    let (pressed, down, released) = ctx.input(|i| {
+                                        (
+                                            i.pointer.primary_pressed(),
+                                            i.pointer.primary_down(),
+                                            i.pointer.primary_released(),
+                                        )
+                                    });
+                                    assert!(app.handle_overlay_space_pan_drag(
+                                        ctx,
+                                        false,
+                                        held,
+                                        rect.center(),
+                                        true,
+                                        pressed,
+                                        down,
+                                        released,
+                                        Some(pos)
+                                    ));
+                                }
+                            });
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
+    }
+
+    fn scrub_review_edit_mode(app: &mut App, mode: usize, enabled: bool) {
+        match mode {
+            0 => app.erase_mode = enabled,
+            1 => app.conceal_mode = enabled,
+            2 => app.export_crop_mode = enabled,
+            3 => app.text_mode = enabled,
+            4 => app.local_adjust_mode = enabled,
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scrub_zoom_all_five_edit_modes_continue_after_each_viewer_input_pass() {
+        use crate::key_input::{SyntheticKeyCommand, SyntheticModifiers, SyntheticNavigationKey};
+        let _serial = crate::key_input::lock_test_input();
+        for (mode, action) in [
+            KeyAction::EraseScrubZoomHold,
+            KeyAction::ConcealScrubZoomHold,
+            KeyAction::CropScrubZoomHold,
+            KeyAction::TextScrubZoomHold,
+            KeyAction::LaScrubZoomHold,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (mut app, rect, _) = setup_flat_navigator_input_test();
+            scrub_review_edit_mode(&mut app, mode, true);
+            app.settings.fullscreen_navigator_visible = false;
+            app.settings.touch_still_chrome_learned = true;
+            app.keymap = crate::keymap::Keymap::from_ini_str(&format!(
+                "[FsImage]\nFsScrubZoomHold = Ctrl+Tab\n[{}]\n{} = Ctrl+Tab\n",
+                action.context().ini_name(),
+                action.ini_name()
+            ));
+            let ctx = egui::Context::default();
+            crate::key_input::arm_test_synthetic_input(0xE020, egui::ViewportId::ROOT);
+            let now = std::time::Instant::now();
+            crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+                now,
+                SyntheticNavigationKey::Tab,
+                SyntheticModifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            ));
+            crate::key_input::advance_test_synthetic_input(now);
+            let state = navigator_test_frame_state();
+            for (frame, dx, zoom) in [
+                (0, 0.0, 2.0),
+                (1, 100.0, 4.0),
+                (2, -100.0, 1.0),
+                (3, 100.0, 4.0),
+            ] {
+                scrub_review_frame(
+                    &mut app,
+                    &ctx,
+                    rect,
+                    &state,
+                    rect.center() + egui::vec2(dx, 0.0),
+                    (frame == 0).then_some(true),
+                    false,
+                    Some(action),
+                );
+                assert_eq!(app.fs_zoom, zoom, "{action:?} frame={frame}");
+                let drag = app.fs_middle_zoom_drag.as_ref().unwrap();
+                assert_eq!(drag.surface, ZoomDragSurface::Overlay);
+                assert_eq!(drag.phase, ZoomDragPhase::Dragging);
+            }
+            scrub_review_frame(
+                &mut app,
+                &ctx,
+                rect,
+                &state,
+                rect.center(),
+                Some(false),
+                false,
+                Some(action),
+            );
+            assert!(app.fs_middle_zoom_drag.is_none());
+            crate::key_input::clear_test_synthetic_input();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scrub_zoom_viewer_starts_in_single_spread_and_both_continuous_flows_but_not_analysis() {
+        use crate::key_input::{SyntheticKeyCommand, SyntheticModifiers, SyntheticNavigationKey};
+        let _serial = crate::key_input::lock_test_input();
+        for mode in 0..5 {
+            let (mut app, rect, idx) = setup_flat_navigator_input_test();
+            app.settings.fullscreen_navigator_visible = false;
+            app.settings.touch_still_chrome_learned = true;
+            app.keymap =
+                crate::keymap::Keymap::from_ini_str("[FsImage]\nFsScrubZoomHold = Ctrl+Tab\n");
+            match mode {
+                2 => app.reading_flow = ReadingFlow::Vertical,
+                3 => app.reading_flow = ReadingFlow::Horizontal,
+                4 => app.analysis_mode = true,
+                _ => {}
+            }
+            if matches!(mode, 2 | 3) {
+                assert!(app.continuous_reading_active_for_idx(idx));
+            }
+            let ctx = egui::Context::default();
+            crate::key_input::arm_test_synthetic_input(0xE021, egui::ViewportId::ROOT);
+            let now = std::time::Instant::now();
+            crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+                now,
+                SyntheticNavigationKey::Tab,
+                SyntheticModifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            ));
+            crate::key_input::advance_test_synthetic_input(now);
+            let state = navigator_test_frame_state();
+            let analysis_zoom = app.analysis_zoom;
+            for frame in 0..3 {
+                scrub_review_frame(
+                    &mut app,
+                    &ctx,
+                    rect,
+                    &state,
+                    rect.center() + egui::vec2(if frame == 0 { 0.0 } else { 100.0 }, 0.0),
+                    match frame {
+                        0 => Some(true),
+                        2 => Some(false),
+                        _ => None,
+                    },
+                    mode == 1,
+                    None,
+                );
+                assert_eq!(
+                    app.fs_zoom,
+                    if mode != 4 && frame > 0 { 4.0 } else { 2.0 },
+                    "mode={mode} frame={frame}"
+                );
+                assert_eq!(app.analysis_zoom, analysis_zoom);
+                assert_eq!(app.fs_middle_zoom_drag.is_some(), mode != 4 && frame < 2);
+            }
+            crate::key_input::clear_test_synthetic_input();
+        }
+    }
+
+    #[test]
+    fn scrub_zoom_surface_changes_retire_without_writes_for_all_edit_modes() {
+        for mode in 0..5 {
+            for from_overlay in [false, true] {
+                let mut app = crate::app::setup_app_for_test();
+                scrub_review_edit_mode(&mut app, mode, from_overlay);
+                let ctx = egui::Context::default();
+                let pivot = egui::pos2(300.0, 200.0);
+                let surface = app.zoom_drag_surface();
+                assert!(app.handle_drag_zoom(
+                    &ctx,
+                    ZoomDragInput::Scrub,
+                    surface,
+                    FsZoomOwner::Image,
+                    pivot,
+                    true,
+                    true,
+                    true,
+                    true,
+                    false,
+                    Some(pivot)
+                ));
+                scrub_review_edit_mode(&mut app, mode, !from_overlay);
+                let before = (
+                    app.fs_zoom,
+                    app.fs_pan,
+                    app.analysis_zoom,
+                    app.analysis_pan,
+                    app.fs_zoom_factor,
+                );
+                assert!(app.retire_changed_drag_zoom(&ctx));
+                assert!(app.fs_middle_zoom_drag.is_none());
+                assert_eq!(
+                    (
+                        app.fs_zoom,
+                        app.fs_pan,
+                        app.analysis_zoom,
+                        app.analysis_pan,
+                        app.fs_zoom_factor
+                    ),
+                    before
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scrub_zoom_middle_and_scrub_retire_when_current_zoom_owner_changes() {
+        for input in [ZoomDragInput::Middle, ZoomDragInput::Scrub] {
+            for next in [
+                FsZoomOwner::ZoomMode,
+                FsZoomOwner::Panorama,
+                FsZoomOwner::Analysis,
+            ] {
+                let ctx = egui::Context::default();
+                let (mut app, _, _) = setup_panorama_navigator_input_test(&ctx);
+                let panorama = app.panorama_state.take().unwrap();
+                let pivot = egui::pos2(300.0, 200.0);
+                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+                let button = if input == ZoomDragInput::Middle {
+                    egui::PointerButton::Middle
+                } else {
+                    egui::PointerButton::Primary
+                };
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            events: vec![
+                                egui::Event::PointerMoved(pivot),
+                                navigator_button_event(pivot, button, true),
+                            ],
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            let current_owner = app.fs_zoom_owner();
+                            let used = if input == ZoomDragInput::Middle {
+                                app.handle_middle_drag_zoom(ctx, rect, Default::default())
+                            } else {
+                                app.handle_drag_zoom(
+                                    ctx,
+                                    input,
+                                    ZoomDragSurface::Viewer,
+                                    current_owner,
+                                    pivot,
+                                    true,
+                                    true,
+                                    true,
+                                    true,
+                                    false,
+                                    Some(pivot),
+                                )
+                            };
+                            assert!(used);
+                        },
+                    )
+                    .drop_without_applying_deltas();
+                match next {
+                    FsZoomOwner::ZoomMode => app.fs_zoom_active = true,
+                    FsZoomOwner::Panorama => app.panorama_state = Some(panorama),
+                    FsZoomOwner::Analysis => app.analysis_mode = true,
+                    _ => unreachable!(),
+                }
+                assert_eq!(app.fs_zoom_owner(), next);
+                let before = (
+                    app.fs_zoom,
+                    app.fs_pan,
+                    app.analysis_zoom,
+                    app.analysis_pan,
+                    app.fs_zoom_factor,
+                );
+                let moved = pivot + egui::vec2(100.0, -100.0);
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            events: vec![egui::Event::PointerMoved(moved)],
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            let current_owner = app.fs_zoom_owner();
+                            let used = if input == ZoomDragInput::Middle {
+                                app.handle_middle_drag_zoom(ctx, rect, Default::default())
+                            } else {
+                                app.handle_drag_zoom(
+                                    ctx,
+                                    input,
+                                    ZoomDragSurface::Viewer,
+                                    current_owner,
+                                    pivot,
+                                    true,
+                                    true,
+                                    false,
+                                    true,
+                                    false,
+                                    Some(moved),
+                                )
+                            };
+                            assert_eq!(
+                                used,
+                                input == ZoomDragInput::Scrub || next == FsZoomOwner::Panorama
+                            );
+                        },
+                    )
+                    .drop_without_applying_deltas();
+                assert!(app.fs_middle_zoom_drag.is_none());
+                assert_eq!(
+                    (
+                        app.fs_zoom,
+                        app.fs_pan,
+                        app.analysis_zoom,
+                        app.analysis_pan,
+                        app.fs_zoom_factor
+                    ),
+                    before
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scrub_zoom_middle_consumption_and_dead_zone_keep_the_released_contract() {
+        let ctx = egui::Context::default();
+        for owner in [
+            FsZoomOwner::Image,
+            FsZoomOwner::Analysis,
+            FsZoomOwner::ZoomMode,
+            FsZoomOwner::Panorama,
+        ] {
+            let ctx = egui::Context::default();
+            let (mut app, _, _) = setup_panorama_navigator_input_test(&ctx);
+            if owner != FsZoomOwner::Panorama {
+                app.panorama_state = None;
+            }
+            app.analysis_mode = owner == FsZoomOwner::Analysis;
+            app.fs_zoom_active = owner == FsZoomOwner::ZoomMode;
+            app.fs_zoom = 2.0;
+            app.analysis_zoom = 2.0;
+            app.fs_zoom_factor = 2.0;
+            let pos = egui::pos2(300.0, 200.0);
+            for (frame, dy, edge, expected_used, zoom) in [
+                (0, 0.0, None, false, 2.0),
+                (1, 0.0, Some(true), true, 2.0),
+                (2, -3.0, None, true, 2.0),
+                (3, -100.0, None, true, 4.0),
+                (4, 0.0, None, true, 4.0),
+                (5, 0.0, Some(false), owner != FsZoomOwner::Panorama, 4.0),
+                (6, 0.0, None, false, 4.0),
+            ] {
+                let moved = pos + egui::vec2(0.0, dy);
+                let mut events = vec![egui::Event::PointerMoved(moved)];
+                if let Some(pressed) = edge {
+                    events.push(navigator_button_event(
+                        moved,
+                        egui::PointerButton::Middle,
+                        pressed,
+                    ));
+                }
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            events,
+                            time: Some(frame as f64 * 0.1),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            assert_eq!(
+                                app.handle_middle_drag_zoom(
+                                    ctx,
+                                    egui::Rect::from_min_size(
+                                        egui::Pos2::ZERO,
+                                        egui::vec2(800.0, 600.0)
+                                    ),
+                                    Default::default()
+                                ),
+                                expected_used,
+                                "{owner:?} frame={frame}"
+                            );
+                        },
+                    )
+                    .drop_without_applying_deltas();
+                let actual = match owner {
+                    FsZoomOwner::Image => app.fs_zoom,
+                    FsZoomOwner::Analysis => app.analysis_zoom,
+                    FsZoomOwner::ZoomMode => app.fs_zoom_factor,
+                    FsZoomOwner::Panorama => 2.0,
+                };
+                assert_eq!(
+                    actual,
+                    if owner == FsZoomOwner::Panorama {
+                        2.0
+                    } else {
+                        zoom
+                    }
+                );
+            }
+        }
+        let mut app = crate::app::setup_app_for_test();
+        let pivot = egui::pos2(300.0, 200.0);
+        assert!(app.handle_drag_zoom(
+            &ctx,
+            ZoomDragInput::Middle,
+            ZoomDragSurface::Viewer,
+            FsZoomOwner::Image,
+            pivot,
+            true,
+            true,
+            true,
+            true,
+            false,
+            Some(pivot)
+        ));
+        assert!(!app.handle_drag_zoom(
+            &ctx,
+            ZoomDragInput::Middle,
+            ZoomDragSurface::Viewer,
+            FsZoomOwner::Image,
+            pivot,
+            true,
+            true,
+            false,
+            true,
+            false,
+            None
+        ));
+    }
+
+    #[test]
+    fn scrub_zoom_stationary_drag_does_not_create_a_repaint_loop() {
+        for input in [ZoomDragInput::Middle, ZoomDragInput::Scrub] {
+            for owner in [
+                FsZoomOwner::Image,
+                FsZoomOwner::Analysis,
+                FsZoomOwner::ZoomMode,
+                FsZoomOwner::Panorama,
+            ] {
+                let mut app = crate::app::setup_app_for_test();
+                let ctx = egui::Context::default();
+                let pivot = egui::pos2(300.0, 200.0);
+                let mut delay = std::time::Duration::ZERO;
+                for frame in 0..4 {
+                    let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
+                        assert!(app.handle_drag_zoom(
+                            ctx,
+                            input,
+                            ZoomDragSurface::Viewer,
+                            owner,
+                            pivot,
+                            true,
+                            true,
+                            frame == 0,
+                            true,
+                            false,
+                            Some(pivot)
+                        ));
+                    });
+                    delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+                    output.drop_without_applying_deltas();
+                }
+                assert_eq!(delay, std::time::Duration::MAX, "{input:?} {owner:?}");
+                // An actual Z factor change still wakes the dedicated drawing path.
+                if owner == FsZoomOwner::ZoomMode {
+                    let moved = pivot
+                        + match input {
+                            ZoomDragInput::Middle => egui::vec2(0.0, -100.0),
+                            ZoomDragInput::Scrub => egui::vec2(100.0, 0.0),
+                        };
+                    let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
+                        assert!(app.handle_drag_zoom(
+                            ctx,
+                            input,
+                            ZoomDragSurface::Viewer,
+                            owner,
+                            pivot,
+                            true,
+                            true,
+                            false,
+                            true,
+                            false,
+                            Some(moved)
+                        ));
+                    });
+                    assert_eq!(
+                        output.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+                        std::time::Duration::ZERO
+                    );
+                    output.drop_without_applying_deltas();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scrub_zoom_and_middle_share_start_pivot_threshold_and_owner_limits() {
+        for owner in [
+            FsZoomOwner::Image,
+            FsZoomOwner::Analysis,
+            FsZoomOwner::ZoomMode,
+        ] {
+            let base = MiddleZoomDrag {
+                input: ZoomDragInput::Middle,
+                surface: ZoomDragSurface::Viewer,
+                owner,
+                phase: ZoomDragPhase::Dragging,
+                pivot: egui::pos2(240.0, 180.0),
+                rect_center: egui::pos2(300.0, 220.0),
+                start_zoom: 2.0,
+                start_pan: egui::vec2(20.0, -10.0),
+            };
+            let scrub = MiddleZoomDrag {
+                input: ZoomDragInput::Scrub,
+                ..base.clone()
+            };
+            for distance in [-10000.0, -100.0, -4.0, -3.0, 0.0, 3.0, 4.0, 100.0, 10000.0] {
+                let expected = base.zoom_at(base.pivot + egui::vec2(0.0, -distance));
+                let actual = scrub.zoom_at(scrub.pivot + egui::vec2(distance, 300.0));
+                assert_eq!(actual, expected);
+                if distance.abs() < MIDDLE_DRAG_THRESHOLD_PX {
+                    assert_eq!(actual, None);
+                }
+                let (min, max) = if owner == FsZoomOwner::ZoomMode {
+                    (0.05, 16.0)
+                } else {
+                    (ZOOM_MIN, ZOOM_MAX)
+                };
+                if distance == -10000.0 {
+                    assert_eq!(actual.unwrap().0, min);
+                }
+                if distance == 10000.0 {
+                    assert_eq!(actual.unwrap().0, max);
+                }
+            }
+            assert_eq!(
+                base.zoom_at(base.pivot + egui::vec2(0.0, -100.0))
+                    .unwrap()
+                    .0,
+                4.0
+            );
+            assert_eq!(base.zoom_at(base.pivot), None);
+        }
+    }
+
+    #[test]
+    fn scrub_zoom_writes_start_owner_and_finishes_pdf_once_on_chord_release() {
+        let ctx = egui::Context::default();
+        let pivot = egui::pos2(300.0, 200.0);
+        for owner in [
+            FsZoomOwner::Image,
+            FsZoomOwner::Analysis,
+            FsZoomOwner::ZoomMode,
+            FsZoomOwner::Panorama,
+        ] {
+            let mut app = super::specified_scale_consumer_tests::pdf_app(&ctx, 1);
+            app.fs_zoom = 1.0;
+            app.analysis_zoom = 1.0;
+            app.fs_zoom_factor = 1.0;
+            let probe = crate::app::PdfRerenderRequestProbe::start();
+            assert!(app.handle_drag_zoom(
+                &ctx,
+                ZoomDragInput::Scrub,
+                ZoomDragSurface::Viewer,
+                owner,
+                pivot,
+                true,
+                true,
+                true,
+                true,
+                false,
+                Some(pivot)
+            ));
+            // A different input cannot replace the current owner.
+            assert!(!app.handle_drag_zoom(
+                &ctx,
+                ZoomDragInput::Middle,
+                ZoomDragSurface::Viewer,
+                FsZoomOwner::Image,
+                pivot,
+                true,
+                true,
+                true,
+                true,
+                false,
+                Some(pivot)
+            ));
+            assert!(app.handle_drag_zoom(
+                &ctx,
+                ZoomDragInput::Scrub,
+                ZoomDragSurface::Viewer,
+                owner,
+                pivot,
+                true,
+                true,
+                false,
+                true,
+                false,
+                Some(pivot + egui::vec2(100.0, 0.0))
+            ));
+            assert_eq!(
+                app.fs_zoom,
+                if owner == FsZoomOwner::Image {
+                    2.0
+                } else {
+                    1.0
+                }
+            );
+            assert_eq!(
+                app.analysis_zoom,
+                if owner == FsZoomOwner::Analysis {
+                    2.0
+                } else {
+                    1.0
+                }
+            );
+            assert_eq!(
+                app.fs_zoom_factor,
+                if owner == FsZoomOwner::ZoomMode {
+                    2.0
+                } else {
+                    1.0
+                }
+            );
+            assert!(probe.take_requests().is_empty());
+            assert!(app.handle_drag_zoom(
+                &ctx,
+                ZoomDragInput::Scrub,
+                ZoomDragSurface::Viewer,
+                owner,
+                pivot,
+                false,
+                true,
+                false,
+                true,
+                false,
+                Some(pivot)
+            ));
+            assert_eq!(
+                probe.take_requests().len(),
+                usize::from(matches!(owner, FsZoomOwner::Image | FsZoomOwner::Analysis))
+            );
+            assert_eq!(
+                app.fs_middle_zoom_drag.as_ref().unwrap().phase,
+                ZoomDragPhase::AwaitRelease
+            );
+            assert!(app.handle_drag_zoom(
+                &ctx,
+                ZoomDragInput::Scrub,
+                ZoomDragSurface::Viewer,
+                owner,
+                pivot,
+                false,
+                true,
+                false,
+                false,
+                true,
+                Some(pivot)
+            ));
+            assert!(app.fs_middle_zoom_drag.is_none());
+            assert!(probe.take_requests().is_empty());
+        }
+    }
+
+    #[test]
+    fn scrub_zoom_overlay_wins_pan_blocks_panel_and_keeps_primary_until_release() {
+        let mut app = crate::app::setup_app_for_test();
+        app.erase_mode = true;
+        let ctx = egui::Context::default();
+        let pos = egui::pos2(300.0, 200.0);
+        assert!(!app.handle_overlay_space_pan_drag(
+            &ctx,
+            true,
+            true,
+            pos,
+            false,
+            true,
+            true,
+            false,
+            Some(pos)
+        ));
+        assert!(app.fs_middle_zoom_drag.is_none());
+        assert!(app.handle_overlay_space_pan_drag(
+            &ctx,
+            true,
+            true,
+            pos,
+            true,
+            true,
+            true,
+            false,
+            Some(pos)
+        ));
+        assert!(app.fs_pan_drag_start.is_none());
+        assert!(app.fs_middle_zoom_drag.is_some());
+        // Continuing over a panel is allowed. The dead zone keeps the latest zoom/pan.
+        let start = (app.fs_zoom, app.fs_pan);
+        assert!(app.handle_overlay_space_pan_drag(
+            &ctx,
+            true,
+            true,
+            pos,
+            false,
+            false,
+            true,
+            false,
+            Some(pos + egui::vec2(100.0, 0.0))
+        ));
+        assert!(app.fs_zoom > start.0);
+        assert!(app.handle_overlay_space_pan_drag(
+            &ctx,
+            true,
+            true,
+            pos,
+            false,
+            false,
+            true,
+            false,
+            Some(pos)
+        ));
+        assert_eq!(app.fs_zoom, start.0 * 2.0);
+        assert!(app.handle_overlay_space_pan_drag(
+            &ctx,
+            false,
+            false,
+            pos,
+            false,
+            false,
+            true,
+            false,
+            Some(pos)
+        ));
+        assert!(app.handle_overlay_space_pan_drag(
+            &ctx,
+            false,
+            false,
+            pos,
+            false,
+            false,
+            false,
+            true,
+            Some(pos)
+        ));
+        assert!(app.fs_middle_zoom_drag.is_none());
+        // Holding a chord after primary went down cannot start a new scrub.
+        assert!(app.handle_overlay_space_pan_drag(
+            &ctx,
+            false,
+            true,
+            pos,
+            true,
+            false,
+            true,
+            false,
+            Some(pos)
+        ));
+        assert!(app.fs_middle_zoom_drag.is_none());
+        assert!(app.handle_overlay_space_pan_drag(
+            &ctx,
+            true,
+            false,
+            pos,
+            true,
+            true,
+            true,
+            false,
+            Some(pos)
+        ));
+        assert!(app.fs_pan_drag_start.is_some());
+        assert!(app.handle_overlay_space_pan_drag(
+            &ctx,
+            false,
+            true,
+            pos,
+            true,
+            false,
+            true,
+            false,
+            Some(pos)
+        ));
+        assert!(app.fs_pan_drag_start.is_none());
+        assert!(app.fs_middle_zoom_drag.is_none());
+        assert!(app.fs_primary_suppression.is_active());
+    }
+
+    #[test]
+    fn key_zoom_pdf_requests_follow_image_and_analysis_owner_only() {
+        let ctx = egui::Context::default();
+        for analysis in [false, true] {
+            let mut app = super::specified_scale_consumer_tests::pdf_app(&ctx, 1);
+            app.analysis_mode = analysis;
+            let probe = crate::app::PdfRerenderRequestProbe::start();
+            assert!(app.apply_fs_key_zoom_step(&ctx, true));
+            let requests = probe.take_requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].0, 0);
+            assert_eq!(
+                requests[0].1,
+                crate::pdf_loader::zoom_render_long_edge(4096, 1.25, None)
+            );
+        }
+        let (mut app, _, _) = setup_flat_navigator_input_test();
+        let probe = crate::app::PdfRerenderRequestProbe::start();
+        assert!(app.apply_fs_key_zoom_step(&ctx, true));
+        assert!(probe.take_requests().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn key_zoom_handler_coalesces_frame_repeats_and_accepts_next_frame() {
+        let _input_guard = crate::key_input::lock_test_input();
+        for (virtual_key, shift, factor) in [
+            (0xBE, false, 1.25),
+            (0xBC, false, 1.0 / 1.25),
+            (0x6B, false, 1.25),
+            (0x6D, false, 1.0 / 1.25),
+        ] {
+            let (mut app, _, idx) = setup_flat_navigator_input_test();
+            let ctx = egui::Context::default();
+            let mut expected_zoom = app.fs_zoom;
+            // Initial press plus two repeats, then three repeats in a new frame,
+            // then no edge. Each frame must apply at most one zoom step.
+            for frame in 0..3 {
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            focused: true,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            let edges = if frame < 2 {
+                                (0..3)
+                                    .map(|event| crate::key_input::KeyEdge {
+                                        operation_id: crate::key_input::KeyOperationId::unassigned(
+                                        ),
+                                        source_hwnd: 1,
+                                        source_viewport: ctx.viewport_id(),
+                                        virtual_key,
+                                        scan_code: 0,
+                                        extended: false,
+                                        pressed: true,
+                                        repeat: frame > 0 || event > 0,
+                                        ctrl: false,
+                                        shift,
+                                        alt: false,
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            crate::key_input::set_test_frame(edges);
+                            app.handle_fs_key_input(ctx, idx, false);
+                            if frame < 2 {
+                                expected_zoom *= factor;
+                            }
+                            assert!(
+                                (app.fs_zoom - expected_zoom).abs() < 1e-6,
+                                "frame={frame}, vk={virtual_key:#x}"
+                            );
+                            // Finish this physical input frame, including redundant edges.
+                            crate::key_input::clear_test_frame();
+                        },
+                    )
+                    .drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn key_zoom_handler_preserves_media_edges_and_obeys_image_mode_gates() {
+        let _input_guard = crate::key_input::lock_test_input();
+        for mode in 0..13 {
+            let (mut app, _, idx) = setup_flat_navigator_input_test();
+            let ctx = egui::Context::default();
+            // Use a customized key so the handler gate is also tested independently
+            // of JIS/US punctuation translation and of existing edit shortcuts.
+            app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsZoomIn = F24\n");
+            match mode {
+                1 => app.items[idx] = GridItem::Video(PathBuf::from("keyzoom.mp4")),
+                2 => app.items[idx] = GridItem::Audio(PathBuf::from("keyzoom.mp3")),
+                3 => app.erase_mode = true,
+                4 => app.conceal_mode = true,
+                5 => app.export_crop_mode = true,
+                6 => app.text_mode = true,
+                7 => app.local_adjust_mode = true,
+                8 => app.reading_flow = ReadingFlow::Vertical,
+                9 => app.reading_flow = ReadingFlow::Horizontal,
+                10 => app.compare_view_mode = crate::app::CompareViewMode::wipe(0.5),
+                12 => {
+                    app.sns_split = Some(crate::sns_split::SnsSplitLayout::centered_max(
+                        crate::sns_split::SnsTarget::X,
+                        2,
+                        [800, 1200],
+                    ))
+                }
+                _ => {}
+            }
+            let _ = ctx
+                .run_pass(
+                    egui::RawInput {
+                        focused: true,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        crate::key_input::set_test_frame(vec![crate::key_input::KeyEdge {
+                            operation_id: crate::key_input::KeyOperationId::unassigned(),
+                            source_hwnd: 1,
+                            source_viewport: ctx.viewport_id(),
+                            virtual_key: 0x87,
+                            scan_code: 0,
+                            extended: false,
+                            pressed: true,
+                            repeat: false,
+                            ctrl: false,
+                            shift: false,
+                            alt: false,
+                        }]);
+                        app.handle_fs_key_input(ctx, idx, mode == 11);
+                        let allowed = matches!(mode, 0 | 8..=11);
+                        assert_eq!(app.fs_zoom, if allowed { 2.5 } else { 2.0 }, "mode={mode}");
+                        assert_eq!(
+                            app.keymap.consume_action(ctx, KeyAction::FsZoomIn),
+                            !allowed,
+                            "mode={mode}"
+                        );
+                        crate::key_input::clear_test_frame();
+                    },
+                )
+                .drop_without_applying_deltas();
+        }
+    }
+
     fn setup_flat_navigator_input_test() -> (crate::app::AppTestEnvForTest, egui::Rect, usize) {
         let mut app = crate::app::setup_app_for_test();
         let fs_idx = app.items.len();
@@ -70003,6 +72467,118 @@ mod tests {
         ));
     }
 
+    fn list_order_acceptance_fixture() -> (crate::app::AppTestEnvForTest, usize) {
+        let (mut app, _, fs_idx) = setup_flat_navigator_input_test();
+        let folder = app.tmp.path().to_path_buf();
+        app.current_folder = Some(folder.clone());
+        app.items[fs_idx] = GridItem::Image(folder.join("page.png"));
+        app.visible_indices = vec![fs_idx];
+        app.selected = Some(fs_idx);
+        app.top_level_grid_view
+            .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
+        app.list_order = Some(Arc::new(crate::app::ListOrderSnapshot {
+            owner: app.virtual_list_context_id(),
+            entries: vec![crate::app::ListOrderEntry {
+                path: folder,
+                kind: crate::app::ListOrderEntryKind::Folder,
+            }]
+            .into(),
+        }));
+        assert!(app.list_order_position().is_some());
+        (app, fs_idx)
+    }
+
+    #[test]
+    fn list_order_handler_retires_rating_restore_only_after_acceptance() {
+        use crate::rating_membership::RatingAdoptionIntent;
+        for (has_snapshot, locked) in [(true, true), (false, false), (true, false)] {
+            let (mut app, fs_idx) = list_order_acceptance_fixture();
+            let ctx = egui::Context::default();
+            let (rating_tx, rx) = std::sync::mpsc::channel();
+            let restore = RatingAdoptionIntent::RestoreOrigin(app.capture_rating_origin().unwrap());
+            app.rating_view_pending = Some(crate::rating_view::RatingViewPending {
+                stars: 3,
+                sequence: 1,
+                source_generation: app.items_generation,
+                context: app.virtual_list_context_id(),
+                rating_write_generation: app.rating_session_write_generation,
+                rating_preview: Default::default(),
+                rating_adoption: restore.clone(),
+                sort: Default::default(),
+                membership_only: true,
+                navigation: None,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                rx,
+            });
+            if !has_snapshot {
+                app.list_order = None;
+            }
+            if locked {
+                app.fs_nav_locked_gen = Some(app.items_generation);
+            }
+            app.handle_fullscreen_list_order_nav_context(&ctx, fs_idx, true, false);
+            let accepted = has_snapshot && !locked;
+            assert_eq!(
+                app.rating_view_pending.as_ref().unwrap().rating_adoption,
+                if accepted {
+                    RatingAdoptionIntent::Reconcile
+                } else {
+                    restore
+                },
+            );
+            assert_eq!(app.list_order_pending_owners_for_test().0, accepted);
+            drop(rating_tx);
+        }
+    }
+
+    #[test]
+    fn list_order_handler_ends_preview_gesture_only_after_acceptance() {
+        for (has_snapshot, locked) in [(true, true), (false, false), (true, false)] {
+            let (mut app, fs_idx) = list_order_acceptance_fixture();
+            let ctx = egui::Context::default();
+            begin_navigator_preview_for_test(&mut app, &ctx, fs_idx);
+            assert!(app.similar_panel.preview.has_active_gesture());
+            if !has_snapshot {
+                app.list_order = None;
+            }
+            if locked {
+                app.fs_nav_locked_gen = Some(app.items_generation);
+            }
+            app.handle_fullscreen_list_order_nav_context(&ctx, fs_idx, true, false);
+            let accepted = has_snapshot && !locked;
+            assert_eq!(app.similar_panel.preview.has_active_gesture(), !accepted);
+            assert_eq!(app.list_order_pending_owners_for_test().0, accepted);
+        }
+    }
+
+    #[test]
+    fn list_order_handler_supersedes_required_open_only_after_acceptance() {
+        for (has_snapshot, locked) in [(true, true), (false, false), (true, false)] {
+            let (mut app, fs_idx) = list_order_acceptance_fixture();
+            let ctx = egui::Context::default();
+            let required_folder = app.tmp.path().to_path_buf();
+            let required_target =
+                crate::snapshot::SnapshotTarget::Fs(required_folder.join("required.png"));
+            app.start_required_fullscreen_folder_open(
+                required_folder,
+                required_target,
+                crate::app::HistoryTrigger::UserChosen,
+                crate::app::FsNavigationPurpose::Ordinary,
+            );
+            assert!(app.list_order_pending_owners_for_test().1);
+            if !has_snapshot {
+                app.list_order = None;
+            }
+            if locked {
+                app.fs_nav_locked_gen = Some(app.items_generation);
+            }
+            app.handle_fullscreen_list_order_nav_context(&ctx, fs_idx, true, false);
+            let accepted = has_snapshot && !locked;
+            assert_eq!(app.list_order_pending_owners_for_test().1, !accepted);
+            assert_eq!(app.list_order_pending_owners_for_test().0, accepted);
+        }
+    }
+
     fn complete_navigator_preview_for_test(app: &mut App, color: egui::Color32) {
         let completion = app.similar_panel.preview.take_test_completion();
         completion
@@ -70245,6 +72821,7 @@ mod tests {
         let pinned_pixels = Arc::new(egui::ColorImage::filled([7, 5], egui::Color32::LIGHT_RED));
         let pinned_identity = Arc::as_ptr(&pinned_pixels);
         app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+            original_source: crate::app::PinnedOriginalSource::SameAsProcessed,
             pixels: Arc::clone(&pinned_pixels),
             indicator_pixels: Arc::clone(&pinned_pixels),
             indicator_texture: None,
@@ -71393,6 +73970,7 @@ mod tests {
             let pixels = Arc::new(egui::ColorImage::filled([19, 13], egui::Color32::LIGHT_RED));
             let identity = Arc::as_ptr(&pixels);
             app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+                original_source: crate::app::PinnedOriginalSource::SameAsProcessed,
                 pixels: Arc::clone(&pixels),
                 indicator_pixels: Arc::clone(&pixels),
                 indicator_texture: None,
@@ -71404,6 +73982,12 @@ mod tests {
             app.compare_view_mode = crate::app::CompareViewMode::PinnedNormal;
             app.compare_preparation =
                 crate::app::ComparePreparationState::Ready(crate::app::ComparePreparedPair {
+                    original: crate::app::CompareOriginalVariant::Absent,
+                    current_geometry: crate::app::CompareSourceGeometry {
+                        processed_source_size: [1, 1],
+                        crop: None,
+                        rotation: crate::rotation_db::Rotation::None,
+                    },
                     key: 991,
                     current_idx: fs_idx,
                     pinned_source_idx: 41,
@@ -73798,6 +76382,7 @@ mod tests {
                     singleton_placement: SingletonSpreadPlacement::Center,
                     layout_projection: FsDisplayUnitLayoutProjection::Canonical,
                     pages: vec![FsDisplayUnitHoldoverPage {
+                        crop: None,
                         fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
                         fit_scale_limits: FullscreenFitScaleLimits::default(),
                         occurrence: SpreadPageOccurrence::navigation(0, 0),
@@ -73825,23 +76410,27 @@ mod tests {
             started_at + COLORIZE_WAIT_INDICATOR_DELAY,
         ));
 
-        let folder_navigation = FsHoldover::FolderNavigation(Some(FsDisplayUnitHoldover {
-            singleton_placement: SingletonSpreadPlacement::Center,
-            layout_projection: FsDisplayUnitLayoutProjection::Canonical,
-            pages: vec![FsDisplayUnitHoldoverPage {
-                fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
-                fit_scale_limits: FullscreenFitScaleLimits::default(),
-                occurrence: SpreadPageOccurrence::navigation(0, 0),
-                layout_size: texture.size_vec2(),
-                post_filter: crate::adjustment::PostFilter::None,
-                trace_key: None,
-                trace_load_seq: 0,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
-                rotation: crate::rotation_db::Rotation::None,
-                source_size: None,
-                content_bbox: None,
-            }],
-        }));
+        let folder_navigation = FsHoldover::FolderNavigation(
+            Some(FsDisplayUnitHoldover {
+                singleton_placement: SingletonSpreadPlacement::Center,
+                layout_projection: FsDisplayUnitLayoutProjection::Canonical,
+                pages: vec![FsDisplayUnitHoldoverPage {
+                    crop: None,
+                    fit_input: FullscreenFitInput::legacy(FullscreenFitMode::Page),
+                    fit_scale_limits: FullscreenFitScaleLimits::default(),
+                    occurrence: SpreadPageOccurrence::navigation(0, 0),
+                    layout_size: texture.size_vec2(),
+                    post_filter: crate::adjustment::PostFilter::None,
+                    trace_key: None,
+                    trace_load_seq: 0,
+                    texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                    rotation: crate::rotation_db::Rotation::None,
+                    source_size: None,
+                    content_bbox: None,
+                }],
+            }),
+            crate::app::FsFolderNavigationOrigin::Ordinary,
+        );
         assert!(!colorize_wait_indicator_visible(
             Some(&folder_navigation),
             started_at + COLORIZE_WAIT_INDICATOR_DELAY * 10,
@@ -74076,6 +76665,7 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         let pixels = std::sync::Arc::new(egui::ColorImage::filled([1, 1], egui::Color32::WHITE));
         app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+            original_source: crate::app::PinnedOriginalSource::SameAsProcessed,
             pixels: pixels.clone(),
             indicator_pixels: pixels.clone(),
             indicator_texture: None,
@@ -74116,6 +76706,7 @@ mod tests {
                                     7,
                                     crate::app::CompareViewMode::wipe(0.5),
                                     None,
+                                    None,
                                 );
                             })
                     });
@@ -74130,6 +76721,12 @@ mod tests {
         app.compare_view_mode = crate::app::CompareViewMode::PinnedNormal;
         app.compare_preparation =
             crate::app::ComparePreparationState::Ready(crate::app::ComparePreparedPair {
+                original: crate::app::CompareOriginalVariant::Absent,
+                current_geometry: crate::app::CompareSourceGeometry {
+                    processed_source_size: [1, 1],
+                    crop: None,
+                    rotation: crate::rotation_db::Rotation::None,
+                },
                 key: 1,
                 current_idx: 7,
                 pinned_source_idx: 2,
@@ -74162,6 +76759,7 @@ mod tests {
                                     image_rect,
                                     8,
                                     crate::app::CompareViewMode::PinnedNormal,
+                                    None,
                                     None,
                                 );
                             })
@@ -74275,6 +76873,7 @@ mod tests {
         let pinned =
             std::sync::Arc::new(egui::ColorImage::filled([2, 3], egui::Color32::LIGHT_BLUE));
         app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+            original_source: crate::app::PinnedOriginalSource::SameAsProcessed,
             pixels: pinned.clone(),
             indicator_pixels: pinned,
             indicator_texture: None,
@@ -74344,6 +76943,7 @@ mod tests {
         let pinned = std::sync::Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::WHITE));
         app.fullscreen_idx = Some(7);
         app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+            original_source: crate::app::PinnedOriginalSource::SameAsProcessed,
             pixels: pinned.clone(),
             indicator_pixels: pinned.clone(),
             indicator_texture: None,
@@ -74355,6 +76955,12 @@ mod tests {
         app.compare_view_mode = crate::app::CompareViewMode::PinnedNormal;
         app.compare_preparation =
             crate::app::ComparePreparationState::Ready(crate::app::ComparePreparedPair {
+                original: crate::app::CompareOriginalVariant::Absent,
+                current_geometry: crate::app::CompareSourceGeometry {
+                    processed_source_size: [1, 1],
+                    crop: None,
+                    rotation: crate::rotation_db::Rotation::None,
+                },
                 key: 41,
                 current_idx: 7,
                 pinned_source_idx: 2,
@@ -74455,6 +77061,12 @@ mod tests {
         let (_tx, rx) = std::sync::mpsc::channel();
         let mut state =
             crate::app::ComparePreparationState::Preparing(crate::app::ComparePreparePending {
+                key: 1,
+                current_geometry: crate::app::CompareSourceGeometry {
+                    processed_source_size: [1, 1],
+                    crop: None,
+                    rotation: crate::rotation_db::Rotation::None,
+                },
                 request,
                 scope: crate::app::ComparePrepareScope::SinglePage,
                 source_indices: vec![7],
@@ -74479,6 +77091,7 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         let pixels = std::sync::Arc::new(egui::ColorImage::filled([2, 3], egui::Color32::WHITE));
         app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+            original_source: crate::app::PinnedOriginalSource::SameAsProcessed,
             pixels: pixels.clone(),
             indicator_pixels: pixels,
             indicator_texture: None,
@@ -74496,6 +77109,7 @@ mod tests {
         };
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(Ok(crate::app::ComparePrepareResult {
+            key: 1,
             current_idx: 7,
             pinned_source_idx: 2,
             width: 3,
@@ -74511,6 +77125,12 @@ mod tests {
         .unwrap();
         app.compare_preparation =
             crate::app::ComparePreparationState::Preparing(crate::app::ComparePreparePending {
+                key: 1,
+                current_geometry: crate::app::CompareSourceGeometry {
+                    processed_source_size: [1, 1],
+                    crop: None,
+                    rotation: crate::rotation_db::Rotation::None,
+                },
                 request,
                 scope: crate::app::ComparePrepareScope::SinglePage,
                 source_indices: vec![7],
@@ -74535,6 +77155,7 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         let pixels = std::sync::Arc::new(egui::ColorImage::filled([2, 3], egui::Color32::WHITE));
         app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+            original_source: crate::app::PinnedOriginalSource::SameAsProcessed,
             pixels: pixels.clone(),
             indicator_pixels: pixels,
             indicator_texture: None,
@@ -74552,6 +77173,7 @@ mod tests {
         };
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(Ok(crate::app::ComparePrepareResult {
+            key: 1,
             current_idx: 7,
             pinned_source_idx: 2,
             width: 3,
@@ -74577,6 +77199,12 @@ mod tests {
         );
         app.compare_preparation =
             crate::app::ComparePreparationState::Preparing(crate::app::ComparePreparePending {
+                key: 1,
+                current_geometry: crate::app::CompareSourceGeometry {
+                    processed_source_size: [1, 1],
+                    crop: None,
+                    rotation: crate::rotation_db::Rotation::None,
+                },
                 request,
                 scope: crate::app::ComparePrepareScope::SinglePage,
                 source_indices: vec![7],
@@ -89556,7 +92184,7 @@ mod specified_scale_consumer_tests {
 
     #[test]
     fn specified_scale_review_real_eviction_re_resolves_book_and_page_trim() {
-        use crate::view_trim::{ViewTrimApplyMode, ViewTrimMargins, ViewTrimPageOverride};
+        use crate::view_trim::{ViewTrimMargins, ViewTrimPageOverride};
         for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
             for paired in [false, true] {
                 for page_scope in [false, true] {
@@ -89564,7 +92192,8 @@ mod specified_scale_consumer_tests {
                     let (mut app, units) = specified_eviction_fixture(&ctx, flow, paired);
                     app.settings.fullscreen_specified_scale = height(100);
                     app.settings.spread_page_gap_px = 0;
-                    app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+                    app.view_trim_book_preference =
+                        crate::view_trim::ViewTrimBookPreference::Manual;
                     let rect =
                         egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
                     app.continuous_reading_layout(&ctx, rect, &units, 0, false)
@@ -89719,7 +92348,7 @@ mod specified_scale_consumer_tests {
                 height(100)
             };
             if matches!(change, Change::Rotation) {
-                app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+                app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
                 app.view_trim_book_settings.enabled = true;
                 app.view_trim_book_settings.single.top = 0.1;
                 app.view_trim_book_settings.single.bottom = 0.1;
@@ -89900,7 +92529,7 @@ mod specified_scale_consumer_tests {
             );
         };
         install(&mut app, pixels(20), 1);
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Auto;
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
         app.continuous_reading_layout(&ctx, rect, &units, 0, false)
             .unwrap();
@@ -89930,7 +92559,7 @@ mod specified_scale_consumer_tests {
         );
         // Manual policy reads current settings; returning to Auto uses only the
         // accepted detection input, never the previous Manual policy's bbox.
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         app.view_trim_book_settings.enabled = true;
         app.view_trim_book_settings.single.top = 0.1;
         app.view_trim_book_settings.single.bottom = 0.1;
@@ -89941,7 +92570,7 @@ mod specified_scale_consumer_tests {
             .continuous_specified_reference_fit(rect, ReadingFlow::Vertical, 1.0)
             .unwrap();
         assert!((manual.scale - 1.25).abs() < 0.00001);
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Auto;
         app.reanchor_continuous_reading_after_view_trim_change(40);
         app.continuous_reading_layout(&ctx, rect, &units, 40, false)
             .unwrap();
@@ -89991,7 +92620,7 @@ mod specified_scale_consumer_tests {
             owner.reading_flow = ReadingFlow::Vertical;
             owner.spread_mode = crate::settings::SpreadMode::Single;
             owner.viewer_presentation = ViewerPresentation::DetachedWindow;
-            owner.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
+            owner.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Auto;
             owner.fs_continuous_fit_reference = reference;
             owner.transition_detached_window_state(
                 window_id,
@@ -90030,7 +92659,11 @@ mod specified_scale_consumer_tests {
         });
         assert_eq!(reference_idx(&app), 0);
         assert_eq!(
-            app.view_trim_apply_mode,
+            app.view_trim_book_preference,
+            crate::view_trim::ViewTrimBookPreference::FollowGlobal
+        );
+        assert_eq!(
+            app.resolved_view_trim_base_mode(),
             crate::view_trim::ViewTrimApplyMode::None
         );
     }
@@ -91330,7 +93963,7 @@ mod specified_scale_consumer_tests {
         app.text_selected_ids = vec![1];
         // This fixture exercises input in the real annotation panel, without font loading/baking.
         app.comic_font_registry_loaded = true;
-        app.comic_fonts_loaded = true;
+        app.comic_fonts.seed_for_test(None, Default::default());
         app.comic_presets_loaded = true;
         let page_key = app.page_path_key(0).unwrap();
         app.comic_docs.insert(
@@ -91796,7 +94429,7 @@ mod specified_scale_consumer_tests {
         let mut app = pdf_app(&ctx, 2);
         let _probe = PdfRerenderRequestProbe::start();
         app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         let trim = crate::view_trim::ViewTrimPageOverride::from_margins(
             crate::view_trim::ViewTrimMargins {
                 left: 0.1,
@@ -92156,6 +94789,23 @@ pub(crate) mod page_turn_submission_tests {
         }
     }
 
+    pub(crate) fn offer_texture_for_test(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> egui::TextureId {
+        app.page_turn_external_operation(
+            ctx,
+            ViewerOperationId::Slideshow(next_operation_batch()),
+            OperationPhase::Press,
+            "slideshow",
+        );
+        app.offer_page_turn(ctx, idx, true);
+        app.page_turn_held_resource(idx)
+            .expect("incoming page-turn source")
+            .source_texture_id()
+    }
+
     pub(crate) fn ready_app(
         ctx: &egui::Context,
         mode: SpreadMode,
@@ -92257,6 +94907,8 @@ pub(crate) mod page_turn_submission_tests {
                         None,
                         Some(&mut sources),
                         app.settings.page_turn_animation_enabled,
+                        app.prepared_single_page_crop(page.idx, [80, 120], false),
+                        crate::ui_fullscreen::page_turn::FlatCropPaint::WithPage,
                     )
                     .unwrap();
                 app.fullscreen_page_layout.push_occurrence(transform, *page);
@@ -92687,6 +95339,44 @@ pub(crate) mod page_turn_submission_tests {
     }
 
     #[test]
+    fn list_order_key_collector_returns_intent_with_original_operation() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        app.keymap = crate::keymap::Keymap::from_ini_str("[FsCommon]\nFsListOrderNext = F17\n");
+        seed_interrupted_leaf(&ctx, &mut app, 2);
+        frame_with_events(
+            &ctx,
+            vec![pressed(egui::Key::F17), pressed(egui::Key::B)],
+            |ctx| {
+                app.page_turn_pre_draw(ctx);
+                let original = crate::key_input::operation_key_edges(ctx, ctx.viewport_id())
+                    .into_iter()
+                    .find(|edge| {
+                        matches!(
+                            edge,
+                            crate::key_input::KeyOperationEdge::Egui {
+                                key: egui::Key::F17,
+                                ..
+                            }
+                        )
+                    })
+                    .unwrap()
+                    .operation_id();
+                let mut operation = None;
+                let action = app.handle_fs_key_input_with_operation(ctx, 1, false, &mut operation);
+                assert_eq!(action.list_order_nav, Some(true));
+                assert!(action.page_nav.is_none());
+                assert!(!app.list_order_pending_owners_for_test().0);
+                assert_eq!(operation, Some(ViewerOperationId::Key(original)));
+            },
+        );
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+    }
+
+    #[test]
     fn page_turn_actual_key_producer_carries_original_consumed_edge_identity() {
         #[cfg(windows)]
         let _serial = crate::key_input::lock_test_input();
@@ -93006,6 +95696,7 @@ pub(crate) mod page_turn_submission_tests {
                             [40, 60],
                         );
                         PreparedPagedPage {
+                            crop: None,
                             occurrence: displayed.occurrence(),
                             transform: displayed.transform,
                             resource: native.into(),
@@ -93181,6 +95872,7 @@ pub(crate) mod page_turn_submission_tests {
                                 )
                                 .unwrap();
                                 let page = PreparedPagedPage {
+                                    crop: None,
                                     occurrence: SpreadPageOccurrence::navigation(1, 1),
                                     transform,
                                     resource: native.clone().into(),
@@ -93469,6 +96161,7 @@ pub(crate) mod page_turn_submission_tests {
                                                 );
                                                 let idx = slot + if incoming { 2 } else { 0 };
                                                 CanonicalPage {
+                                                    crop: None,
                                                     occurrence: Some(slot as u64),
                                                     rect,
                                                     clip_rect: ui.max_rect(),
@@ -95141,3 +97834,6 @@ mod music_overflow_tests {
 #[cfg(test)]
 #[path = "ui_fullscreen/manual_nav_wrap_tests.rs"]
 mod manual_nav_wrap_tests;
+
+#[cfg(all(test, windows))]
+mod conceal_preview_tests;

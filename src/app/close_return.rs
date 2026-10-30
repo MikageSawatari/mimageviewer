@@ -302,9 +302,11 @@ impl App {
     pub(super) fn resolve_close_return_navigation(
         &self,
     ) -> Option<(crate::ui_main::AddressBarNav, Option<String>)> {
+        if let Some(navigation) = self.collection_grid_parent_navigation() {
+            return Some(navigation);
+        }
         if let Some(nav) = self
-            .collection_grid_parent_nav()
-            .or_else(|| self.bookmark_view_back_nav())
+            .bookmark_view_back_nav()
             .or_else(|| self.reading_history_back_nav())
             .or_else(|| {
                 self.rating_view_parent_nav_available()

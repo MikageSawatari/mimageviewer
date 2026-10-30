@@ -1362,7 +1362,7 @@ mod tests {
                 )
                 .unwrap();
                 let source_trim = crate::view_trim::ViewTrimBookState {
-                    apply_mode: crate::view_trim::ViewTrimApplyMode::Book,
+                    preference: crate::view_trim::ViewTrimBookPreference::Manual,
                     book_settings: crate::view_trim::ViewTrimBookSettings {
                         enabled: true,
                         single: crate::view_trim::ViewTrimMargins {
@@ -1375,11 +1375,20 @@ mod tests {
                     },
                 };
                 let sibling_trim = crate::view_trim::ViewTrimBookState {
-                    apply_mode: crate::view_trim::ViewTrimApplyMode::Auto,
+                    preference: crate::view_trim::ViewTrimBookPreference::Auto,
                     ..Default::default()
                 };
-                trim.set_book_state(source, source_trim).unwrap();
-                trim.set_book_state(&sibling, sibling_trim).unwrap();
+                trim.set_book_state(source, None, source_trim).unwrap();
+                trim.set_book_state(&sibling, None, sibling_trim).unwrap();
+                let source_trim_json =
+                    format!(" \n{} \n", serde_json::to_string(&source_trim).unwrap());
+                Connection::open(fixture.data.path().join("view_trim.db"))
+                    .unwrap()
+                    .execute(
+                        "UPDATE view_trim_books SET state_json=?1 WHERE book_key=?2",
+                        rusqlite::params![source_trim_json, crate::path_key::normalize(source)],
+                    )
+                    .unwrap();
 
                 let (shift, shift_owner) =
                     SpreadShiftService::spawn_at(fixture.data.path().to_owned(), None).unwrap();
@@ -1473,9 +1482,21 @@ mod tests {
                         .unwrap(),
                     alone
                 );
-                assert_eq!(trim.get_book_state(destination), Some(source_trim));
-                assert_eq!(trim.get_book_state(source), Some(source_trim));
-                assert_eq!(trim.get_book_state(&sibling), Some(sibling_trim));
+                assert_eq!(
+                    trim.load_book_preference_with_fallback(destination, None)
+                        .state_or_default(),
+                    source_trim
+                );
+                assert_eq!(
+                    trim.load_book_preference_with_fallback(source, None)
+                        .state_or_default(),
+                    source_trim
+                );
+                assert_eq!(
+                    trim.load_book_preference_with_fallback(&sibling, None)
+                        .state_or_default(),
+                    sibling_trim
+                );
                 assert_eq!(spread.get_state_with_fallback(source, None), source_spread);
                 assert_eq!(
                     spread.get_final_cover_spread_preference_with_fallback(source, None),
@@ -1557,6 +1578,16 @@ mod tests {
                     1
                 );
                 let trim_conn = Connection::open(fixture.data.path().join("view_trim.db")).unwrap();
+                for path in [source, destination] {
+                    let json: String = trim_conn
+                        .query_row(
+                            "SELECT state_json FROM view_trim_books WHERE book_key=?1",
+                            [crate::path_key::normalize(path)],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(json.as_bytes(), source_trim_json.as_bytes());
+                }
                 assert_eq!(
                     trim_conn
                         .query_row(

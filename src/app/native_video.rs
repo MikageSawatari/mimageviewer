@@ -5527,6 +5527,7 @@ impl App {
             | Ev::ToggleVst3Gui
             | Ev::ToggleAudioMode
             | Ev::SelectAudioTrack { .. }
+            | Ev::SetDeinterlaceMode { .. }
             | Ev::CloseFullscreen { .. }
             | Ev::ToggleWindowMode
             | Ev::SetVst3VideoCompact { .. }
@@ -5953,6 +5954,16 @@ impl App {
             }
         }
         match event {
+            crate::video::NativeVideoOutputEvent::SetDeinterlaceMode { mode } => {
+                let changed = self.fs_cache.get(&fs_idx).is_some_and(|entry| {
+                    matches!(entry, FsCacheEntry::Video { player, .. }
+                        if player.set_deinterlace_mode(mode))
+                });
+                if changed {
+                    self.sync_native_video_metadata(fs_idx);
+                    self.request_native_video_hud_repaint(ctx);
+                }
+            }
             crate::video::NativeVideoOutputEvent::SelectAudioTrack { stream_index } => {
                 let valid = self.fs_cache.get(&fs_idx).is_some_and(|entry| {
                     matches!(entry,
@@ -8885,6 +8896,8 @@ impl App {
             | KeyAction::FsBackToList
             | KeyAction::FsCtrlNavPrev
             | KeyAction::FsCtrlNavNext
+            | KeyAction::FsListOrderPrev
+            | KeyAction::FsListOrderNext
             | KeyAction::FsSiblingPrev
             | KeyAction::FsSiblingNext => true,
             action if action.is_location_navigation_action() => !row.shortcut_labels.is_empty(),
@@ -9487,7 +9500,8 @@ impl App {
                 hw_decode_active: info.hw_decode_active,
                 gpu_path_active: info.gpu_path_active,
                 d3d11va_supported: info.d3d11va_supported,
-                deinterlace_mode: info.effective_deinterlace_mode,
+                deinterlace_mode: player.deinterlace_mode(),
+                deinterlace_manual: player.deinterlace_manual(),
                 last_present_path,
                 deinterlace_status,
                 interlace_detected,
@@ -9525,7 +9539,8 @@ impl App {
                 hw_decode_active: false,
                 gpu_path_active: false,
                 d3d11va_supported: false,
-                deinterlace_mode: self.settings.video_deinterlace,
+                deinterlace_mode: player.deinterlace_mode(),
+                deinterlace_manual: player.deinterlace_manual(),
                 last_present_path: crate::video::decoder::PresentPathSnapshot::Pending,
                 deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot::Pending,
                 interlace_detected: false,
@@ -12571,6 +12586,8 @@ impl App {
         for action in [
             KeyAction::FsCtrlNavPrev,
             KeyAction::FsCtrlNavNext,
+            KeyAction::FsListOrderPrev,
+            KeyAction::FsListOrderNext,
             KeyAction::FsSiblingPrev,
             KeyAction::FsSiblingNext,
         ] {
@@ -12645,6 +12662,8 @@ impl App {
                         | KeyAction::FsJumpLast
                         | KeyAction::FsCtrlNavPrev
                         | KeyAction::FsCtrlNavNext
+                        | KeyAction::FsListOrderPrev
+                        | KeyAction::FsListOrderNext
                         | KeyAction::FsSiblingPrev
                         | KeyAction::FsSiblingNext
                 )
@@ -12988,6 +13007,15 @@ impl App {
                 ));
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, true, true);
                 NativeVideoKeyOutcome::Action(KeyAction::FsCtrlNavNext)
+            }
+            // Ctrl+Shift+Up / Down: use the frozen order of the last normal folder list.
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsListOrderPrev) => {
+                self.handle_fullscreen_list_order_nav_context(ctx, fs_idx, false, true);
+                NativeVideoKeyOutcome::Action(KeyAction::FsListOrderPrev)
+            }
+            _ if !key.repeat && resolved_action == Some(KeyAction::FsListOrderNext) => {
+                self.handle_fullscreen_list_order_nav_context(ctx, fs_idx, true, true);
+                NativeVideoKeyOutcome::Action(KeyAction::FsListOrderNext)
             }
             // Ctrl+PageUp / PageDown: move to the previous / next sibling folder.
             _ if !key.repeat && resolved_action == Some(KeyAction::FsSiblingPrev) => {
@@ -14995,17 +15023,16 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn native_boundary_hint_text(hint: crate::ui_fullscreen::FsBoundaryHint) -> String {
         match hint {
-            crate::ui_fullscreen::FsBoundaryHint::Edge { at_end, .. } => {
+            crate::ui_fullscreen::FsBoundaryHint::Edge { scope, at_end, .. } => {
+                if scope == crate::ui_fullscreen::FsBoundaryEdgeScope::ListOrder {
+                    return scope.title(at_end).to_string();
+                }
                 let body = if at_end {
                     "[Ctrl]+[↓] ツリー順で次へ"
                 } else {
                     "[Ctrl]+[↑] ツリー順で前へ"
                 };
-                format!(
-                    "{}  {}",
-                    crate::ui_fullscreen::fullscreen_boundary_edge_title(at_end),
-                    body
-                )
+                format!("{}  {}", scope.title(at_end), body)
             }
             crate::ui_fullscreen::FsBoundaryHint::NoImageFolder { forward, .. } => {
                 if forward {
@@ -15184,6 +15211,7 @@ impl App {
     #[cfg(windows)]
     pub(super) fn show_native_video_boundary_toast(&mut self, ctx: &egui::Context, at_end: bool) {
         let hint = crate::ui_fullscreen::FsBoundaryHint::Edge {
+            scope: crate::ui_fullscreen::FsBoundaryEdgeScope::Page,
             at_end,
             at: std::time::Instant::now(),
         };
@@ -16225,6 +16253,25 @@ impl App {
 }
 
 #[cfg(all(test, windows))]
+mod deinterlace_routing_tests {
+    use super::App;
+    use crate::settings::VideoDeinterlaceMode;
+    use crate::video::NativeVideoOutputEvent;
+
+    #[test]
+    fn deinterlace_is_video_only_while_audio_track_selection_remains_allowed() {
+        assert!(!App::native_event_allowed_in_music_shell(
+            &NativeVideoOutputEvent::SetDeinterlaceMode {
+                mode: VideoDeinterlaceMode::On
+            }
+        ));
+        assert!(App::native_event_allowed_in_music_shell(
+            &NativeVideoOutputEvent::SelectAudioTrack { stream_index: 1 }
+        ));
+    }
+}
+
+#[cfg(all(test, windows))]
 mod manual_nav_wrap_native_media_tests {
     use super::*;
     use crate::ui_fullscreen::page_turn_submission_tests::ready_app;
@@ -16622,6 +16669,109 @@ mod native_video_display_mode_toggle_tests {
 #[cfg(all(test, windows))]
 mod configurable_video_seek_dispatch_tests {
     use super::*;
+
+    #[test]
+    fn list_order_native_dispatch_starts_the_captured_book_order_worker() {
+        let (mut app, idx) = setup_seek_app();
+        let root = app.tmp.path().join("native-list-order");
+        let first = root.join("z-first");
+        let next = root.join("a-next");
+        for folder in [&first, &next] {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("page.png"), b"page").unwrap();
+        }
+        app.current_folder = Some(first.clone());
+        app.top_level_grid_view
+            .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
+        app.list_order = Some(Arc::new(ListOrderSnapshot {
+            owner: app.viewer_context_main(),
+            entries: [first, next.clone()]
+                .into_iter()
+                .map(|path| ListOrderEntry {
+                    path,
+                    kind: ListOrderEntryKind::Folder,
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        }));
+        let ctx = egui::Context::default();
+        assert_eq!(
+            app.dispatch_native_video_key_event(&ctx, idx, native_key(0x28, true, true)),
+            NativeVideoKeyOutcome::Action(KeyAction::FsListOrderNext)
+        );
+        let pending = app
+            .folder_nav_pending
+            .take()
+            .expect("native action starts traversal");
+        assert!(matches!(
+            pending.mode,
+            FolderNavMode::ListOrder { from_index: 0, .. }
+        ));
+        let result = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("native navigation worker");
+        assert_eq!(result.target.unwrap().logical_source(), next);
+        assert!(result.hit_image_folder);
+    }
+
+    #[test]
+    fn list_order_native_keys_dispatch_defaults_and_overrides_without_repeats() {
+        let ctx = egui::Context::default();
+        for (bindings, prev, next) in [
+            (
+                "[FsCommon]\n",
+                native_key(0x26, true, true),
+                native_key(0x28, true, true),
+            ),
+            (
+                "[FsCommon]\nFsListOrderPrev = F16\nFsListOrderNext = F17\n",
+                native_key(0x7f, false, false),
+                native_key(0x80, false, false),
+            ),
+        ] {
+            let (mut app, idx) = setup_seek_app();
+            app.keymap = crate::keymap::Keymap::from_ini_str(bindings);
+            for (action, key) in [
+                (KeyAction::FsListOrderPrev, prev),
+                (KeyAction::FsListOrderNext, next),
+            ] {
+                assert_eq!(
+                    app.resolve_native_video_key_action(idx, &key, false, false),
+                    Some(action)
+                );
+                assert_eq!(
+                    app.dispatch_native_video_key_event(&ctx, idx, key),
+                    NativeVideoKeyOutcome::Action(action)
+                );
+                let repeat = crate::video::native_window::NativeVideoKeyEvent {
+                    repeat: true,
+                    ..key
+                };
+                assert_eq!(
+                    app.resolve_native_video_key_action(idx, &repeat, false, false),
+                    None
+                );
+                assert_eq!(
+                    app.dispatch_native_video_key_event(&ctx, idx, repeat),
+                    NativeVideoKeyOutcome::NoMatch
+                );
+                // No captured normal folder list: the handler reports unavailability,
+                // rather than falling back to DFS or changing the playing file.
+                assert!(app.folder_nav_pending.is_none());
+                assert_eq!(app.fullscreen_idx, Some(idx));
+                assert_eq!(player_seek_base(&app, idx), 100.0);
+            }
+            let rows = app.keymap.command_display_rows_for_active_scopes(
+                crate::keymap::FS_VIDEO_ACTIVE_SCOPES,
+                false,
+            );
+            for action in [KeyAction::FsListOrderPrev, KeyAction::FsListOrderNext] {
+                let row = rows.iter().find(|row| row.spec.action == action).unwrap();
+                assert!(App::native_video_help_includes_row(row));
+            }
+        }
+    }
 
     #[test]
     fn manual_nav_wrap_does_not_change_native_or_music_seek_targets() {

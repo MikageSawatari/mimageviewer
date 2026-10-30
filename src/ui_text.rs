@@ -1972,7 +1972,7 @@ fn annotation_dialog_contents_ui(
 impl App {
     // ── モード入退場 ────────────────────────────────────────────────
 
-    /// テキスト編集モードに入る。見開き中は左ページへ Single ピボットする
+    /// テキスト編集モードに入る。見開き中は読む順の最初のページへ Single ピボットする
     /// (消しゴム / 隠蔽の enter と同じ作法)。`comic_docs` に作業セットをロードする。
     pub(crate) fn enter_text_mode(&mut self, fs_idx: usize) {
         if !self.fullscreen_edit_mode_entry_allowed(fs_idx) {
@@ -1986,6 +1986,7 @@ impl App {
         let Some(key) = self.page_path_key(target_idx) else {
             return;
         };
+        self.cancel_prepared_edit_for_entry(target_idx);
         self.cancel_original_material_entry_intents(None);
 
         if let Some(pivot) = pivot {
@@ -2048,6 +2049,7 @@ impl App {
         if !self.raw_edit_target_entry_allowed(new_idx) {
             return;
         }
+        self.cancel_prepared_edit_for_entry(new_idx);
         if self.fullscreen_idx == Some(new_idx) {
             return;
         }
@@ -2467,6 +2469,11 @@ impl App {
             && self.handle_overlay_space_pan_drag(
                 ctx,
                 space_pan_held,
+                crate::keyboard_input::focused_key_state_permit(ctx).is_some_and(|permit| {
+                    self.keymap
+                        .key_held_action(ctx, permit, KeyAction::TextScrubZoomHold)
+                }),
+                transform.viewport_rect.center(),
                 !pointer_over_floating_ui,
                 pressed,
                 down,
@@ -4461,7 +4468,7 @@ impl App {
             return None;
         }
         // 再列挙してこのフォントを一覧に載せる。
-        self.comic_font_registry_loaded = false;
+        self.invalidate_comic_fonts(crate::app::comic_fonts::FontInvalidation::FontAdded);
         self.ensure_comic_font_registry();
         self.font_sample_cache.clear();
         self.font_sample_failed.clear();

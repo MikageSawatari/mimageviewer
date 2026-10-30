@@ -145,10 +145,30 @@ pub(crate) struct IdentifiedRightDragCommand {
 
 #[cfg(windows)]
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum PendingRightDragCommand {
-    Recognized { command: IdentifiedRightDragCommand },
-    Activating { command: IdentifiedRightDragCommand },
-    PendingExecution { command: IdentifiedRightDragCommand },
+pub(crate) enum PendingDetachedCommand<T> {
+    Recognized { command: T },
+    Activating { command: T },
+    PendingExecution { command: T },
+}
+
+#[cfg(windows)]
+pub(crate) type PendingRightDragCommand = PendingDetachedCommand<IdentifiedRightDragCommand>;
+#[cfg(windows)]
+pub(crate) type PendingPageOverviewCommand =
+    PendingDetachedCommand<super::detached_page_overview::IdentifiedPageOverviewCommand>;
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DetachedWindowCommand {
+    RightDrag(IdentifiedRightDragCommand),
+    PageOverview(super::detached_page_overview::IdentifiedPageOverviewCommand),
+}
+
+#[cfg(windows)]
+impl From<IdentifiedRightDragCommand> for DetachedWindowCommand {
+    fn from(command: IdentifiedRightDragCommand) -> Self {
+        Self::RightDrag(command)
+    }
 }
 
 #[cfg(windows)]
@@ -156,13 +176,14 @@ pub(crate) enum PendingRightDragCommand {
 pub(crate) enum DetachedActivationIntent {
     ActivateOnly,
     RightDrag(PendingRightDragCommand),
+    PageOverview(PendingPageOverviewCommand),
 }
 
 #[cfg(windows)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DetachedActivationDispatch {
     pub(crate) window_id: u64,
-    pub(crate) command: Option<IdentifiedRightDragCommand>,
+    pub(crate) command: Option<DetachedWindowCommand>,
 }
 
 #[cfg(windows)]
@@ -1073,6 +1094,15 @@ impl DetachedWindowManager {
         (was_pending, runtime.state)
     }
 
+    pub(super) fn pending_activation_is_activate_only(&self, window_id: u64) -> bool {
+        self.runtime(window_id).is_some_and(|runtime| {
+            matches!(
+                runtime.activation_intent,
+                Some(DetachedActivationIntent::ActivateOnly)
+            )
+        })
+    }
+
     /// Read-only arbitration probe used before a test-script activation joins the
     /// production intent queue. Closing and in-flight right-drag states count too:
     /// none of them may be overtaken by an automation request.
@@ -1089,9 +1119,9 @@ impl DetachedWindowManager {
         default_linked: bool,
     ) -> (bool, DetachedWindowState) {
         let runtime = self.entry_mut(window_id, default_linked);
-        let accepted = !matches!(
+        let accepted = matches!(
             runtime.activation_intent,
-            Some(DetachedActivationIntent::RightDrag(_))
+            None | Some(DetachedActivationIntent::ActivateOnly)
         );
         if accepted {
             runtime.activation_intent = Some(DetachedActivationIntent::RightDrag(
@@ -1127,6 +1157,9 @@ impl DetachedWindowManager {
                             | Some(DetachedActivationIntent::RightDrag(
                                 PendingRightDragCommand::Recognized { .. }
                             ))
+                            | Some(DetachedActivationIntent::PageOverview(
+                                PendingPageOverviewCommand::Recognized { .. }
+                            ))
                     )
             })
             .map(|(&id, _)| id)
@@ -1144,7 +1177,17 @@ impl DetachedWindowManager {
                         command: command.clone(),
                     },
                 ));
-                Some(command)
+                Some(DetachedWindowCommand::RightDrag(command))
+            }
+            DetachedActivationIntent::PageOverview(PendingPageOverviewCommand::Recognized {
+                command,
+            }) => {
+                runtime.activation_intent = Some(DetachedActivationIntent::PageOverview(
+                    PendingPageOverviewCommand::Activating {
+                        command: command.clone(),
+                    },
+                ));
+                Some(DetachedWindowCommand::PageOverview(command))
             }
             other => {
                 runtime.activation_intent = Some(other);
@@ -1157,11 +1200,142 @@ impl DetachedWindowManager {
         })
     }
 
+    /// One runtime owns either activation-only, a right-drag command, or a bounded
+    /// overview batch. Repeated wheel/column input joins that batch without a second owner.
+    pub(super) fn queue_page_overview_command(
+        &mut self,
+        window_id: u64,
+        command: super::page_overview::PageOverviewCommand,
+        activate: bool,
+        default_linked: bool,
+    ) -> bool {
+        use super::detached_page_overview::IdentifiedPageOverviewCommand;
+        let runtime = self.entry_mut(window_id, default_linked);
+        if runtime.state == DetachedWindowState::Closing {
+            return false;
+        }
+        match runtime.activation_intent.as_mut() {
+            Some(DetachedActivationIntent::PageOverview(pending)) => {
+                match pending {
+                    PendingPageOverviewCommand::Recognized { command: batch }
+                    | PendingPageOverviewCommand::PendingExecution { command: batch } => {
+                        batch.push(command)
+                    }
+                    // The synchronous activation dispatch already owns its exact payload.
+                    PendingPageOverviewCommand::Activating { .. } => false,
+                }
+            }
+            None | Some(DetachedActivationIntent::ActivateOnly) => {
+                let batch = IdentifiedPageOverviewCommand::new(command);
+                runtime.activation_intent =
+                    Some(DetachedActivationIntent::PageOverview(if activate {
+                        PendingPageOverviewCommand::Recognized { command: batch }
+                    } else {
+                        PendingPageOverviewCommand::PendingExecution { command: batch }
+                    }));
+                true
+            }
+            Some(DetachedActivationIntent::RightDrag(_)) => false,
+        }
+    }
+
+    pub(super) fn mark_detached_command_pending_execution(
+        &mut self,
+        window_id: u64,
+        command: DetachedWindowCommand,
+    ) -> bool {
+        match command {
+            DetachedWindowCommand::RightDrag(command) => {
+                self.mark_right_drag_pending_execution(window_id, command)
+            }
+            DetachedWindowCommand::PageOverview(command) => {
+                let Some(runtime) = self.runtimes.get_mut(&window_id) else {
+                    return false;
+                };
+                let Some(pending) = runtime.activation_intent.take() else {
+                    return false;
+                };
+                match pending {
+                    DetachedActivationIntent::PageOverview(
+                        PendingPageOverviewCommand::Activating {
+                            command: activating,
+                        },
+                    ) if activating == command => {
+                        runtime.activation_intent = Some(DetachedActivationIntent::PageOverview(
+                            PendingPageOverviewCommand::PendingExecution { command },
+                        ));
+                        true
+                    }
+                    other => {
+                        runtime.activation_intent = Some(other);
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn pending_page_overview_execution_window_ids(&self) -> Vec<u64> {
+        self.runtimes
+            .iter()
+            .filter_map(|(&id, runtime)| {
+                matches!(
+                    runtime.activation_intent,
+                    Some(DetachedActivationIntent::PageOverview(
+                        PendingPageOverviewCommand::PendingExecution { .. }
+                    ))
+                )
+                .then_some(id)
+            })
+            .collect()
+    }
+
+    pub(super) fn take_pending_page_overview_execution(
+        &mut self,
+        window_id: u64,
+    ) -> Option<super::detached_page_overview::IdentifiedPageOverviewCommand> {
+        let runtime = self.runtimes.get_mut(&window_id)?;
+        match runtime.activation_intent.take()? {
+            DetachedActivationIntent::PageOverview(
+                PendingPageOverviewCommand::PendingExecution { command },
+            ) => Some(command),
+            other => {
+                runtime.activation_intent = Some(other);
+                None
+            }
+        }
+    }
+
+    /// Activation failure/modal/terminal retirement drops the single command owner.
+    pub(super) fn discard_detached_command(&mut self, window_id: u64) -> bool {
+        self.runtimes
+            .get_mut(&window_id)
+            .is_some_and(|runtime| runtime.activation_intent.take().is_some())
+    }
+
+    pub(super) fn discard_page_overview_command(&mut self, window_id: u64) -> bool {
+        let Some(runtime) = self.runtimes.get_mut(&window_id) else {
+            return false;
+        };
+        if matches!(
+            runtime.activation_intent,
+            Some(DetachedActivationIntent::PageOverview(_))
+        ) {
+            runtime.activation_intent = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub(super) fn mark_right_drag_pending_execution(
         &mut self,
         window_id: u64,
-        command: IdentifiedRightDragCommand,
+        command: impl Into<DetachedWindowCommand>,
     ) -> bool {
+        let DetachedWindowCommand::RightDrag(command) = command.into() else {
+            return false;
+        };
         let Some(runtime) = self.runtimes.get_mut(&window_id) else {
             return false;
         };
@@ -1402,7 +1576,10 @@ mod tests {
         let dispatch = manager
             .take_pending_deferred_activation()
             .expect("recognized dispatch");
-        assert_eq!(dispatch.command, Some(command.clone()));
+        assert_eq!(
+            dispatch.command,
+            Some(DetachedWindowCommand::RightDrag(command.clone()))
+        );
         assert!(matches!(
             manager.activation_intent(9),
             Some(DetachedActivationIntent::RightDrag(
@@ -1420,6 +1597,129 @@ mod tests {
         assert_eq!(manager.take_pending_right_drag_execution(9), Some(command));
         assert!(manager.activation_intent(9).is_none());
         assert!(!manager.has_activation_intent());
+    }
+
+    fn overview_scroll(delta: isize) -> super::super::page_overview::PageOverviewCommand {
+        super::super::page_overview::PageOverviewCommand::ScrollRows {
+            stamp: crate::page_overview::PageOverviewStamp {
+                context_serial: 17,
+                items_generation: 18,
+                reader_order_revision: 19,
+                incarnation: 20,
+            },
+            delta,
+        }
+    }
+
+    #[test]
+    fn overview_pointer_joins_native_activation_and_executes_exactly_once() {
+        let mut manager = DetachedWindowManager::new();
+        manager.transition_state(30, DetachedWindowState::Parked, false);
+        manager.queue_deferred_activation(30, false);
+        assert!(manager.pending_activation_is_activate_only(30));
+        assert!(manager.queue_page_overview_command(30, overview_scroll(2), true, false));
+        assert!(!manager.pending_activation_is_activate_only(30));
+        assert!(manager.queue_page_overview_command(30, overview_scroll(3), true, false));
+        let dispatch = manager
+            .take_pending_deferred_activation()
+            .expect("overview activation");
+        let command = dispatch
+            .command
+            .expect("typed command survives native ActivateOnly");
+        assert!(
+            matches!(&command, DetachedWindowCommand::PageOverview(batch)
+            if batch.commands() == &[overview_scroll(5)])
+        );
+        assert!(manager.take_pending_deferred_activation().is_none());
+        assert!(manager.take_pending_page_overview_execution(30).is_none());
+        assert!(manager.mark_detached_command_pending_execution(30, command));
+        assert_eq!(
+            manager.pending_page_overview_execution_window_ids(),
+            vec![30]
+        );
+        assert_eq!(
+            manager
+                .take_pending_page_overview_execution(30)
+                .unwrap()
+                .commands(),
+            &[overview_scroll(5)]
+        );
+        assert!(manager.take_pending_page_overview_execution(30).is_none());
+        assert!(!manager.has_activation_intent());
+    }
+
+    #[test]
+    fn overview_already_active_input_never_dispatches_a_second_activation() {
+        let mut manager = DetachedWindowManager::new();
+        manager.transition_state(31, DetachedWindowState::Active, false);
+        assert!(manager.queue_page_overview_command(31, overview_scroll(1), false, false));
+        assert!(manager.take_pending_deferred_activation().is_none());
+        assert!(manager.queue_page_overview_command(31, overview_scroll(2), false, false));
+        assert_eq!(
+            manager
+                .take_pending_page_overview_execution(31)
+                .unwrap()
+                .commands(),
+            &[overview_scroll(3)]
+        );
+        assert!(manager.take_pending_deferred_activation().is_none());
+    }
+
+    #[test]
+    fn overview_and_right_drag_share_one_exclusive_runtime_owner() {
+        let mut manager = DetachedWindowManager::new();
+        manager.queue_right_drag_command(32, identified(short_click_command()), false);
+        assert!(!manager.queue_page_overview_command(32, overview_scroll(1), true, false));
+        assert!(!manager.discard_page_overview_command(32));
+        assert!(matches!(
+            manager.activation_intent(32),
+            Some(DetachedActivationIntent::RightDrag(_))
+        ));
+        manager.discard_detached_command(32);
+        assert!(manager.queue_page_overview_command(32, overview_scroll(1), true, false));
+        assert!(
+            !manager
+                .queue_right_drag_command(32, identified(short_click_command()), false)
+                .0
+        );
+        assert!(matches!(
+            manager.activation_intent(32),
+            Some(DetachedActivationIntent::PageOverview(_))
+        ));
+    }
+
+    #[test]
+    fn overview_stale_pending_execution_is_discarded_without_activation_or_replay() {
+        let mut manager = DetachedWindowManager::new();
+        assert!(manager.queue_page_overview_command(33, overview_scroll(1), false, false));
+        assert!(manager.discard_page_overview_command(33));
+        assert!(!manager.discard_page_overview_command(33));
+        assert!(manager.take_pending_page_overview_execution(33).is_none());
+        assert!(manager.take_pending_deferred_activation().is_none());
+        manager.transition_state(33, DetachedWindowState::Closing, false);
+        assert!(!manager.queue_page_overview_command(33, overview_scroll(1), true, false));
+    }
+
+    #[test]
+    fn overview_wrong_activation_payload_does_not_advance_the_intent() {
+        let mut manager = DetachedWindowManager::new();
+        assert!(manager.queue_page_overview_command(34, overview_scroll(1), true, false));
+        let dispatch = manager.take_pending_deferred_activation().unwrap();
+        let wrong = DetachedWindowCommand::PageOverview(
+            super::super::detached_page_overview::IdentifiedPageOverviewCommand::new(
+                overview_scroll(2),
+            ),
+        );
+        assert!(!manager.mark_detached_command_pending_execution(34, wrong));
+        assert!(!manager.queue_page_overview_command(34, overview_scroll(2), true, false));
+        assert!(manager.mark_detached_command_pending_execution(34, dispatch.command.unwrap()));
+        assert_eq!(
+            manager
+                .take_pending_page_overview_execution(34)
+                .unwrap()
+                .commands(),
+            &[overview_scroll(1)]
+        );
     }
 
     #[test]

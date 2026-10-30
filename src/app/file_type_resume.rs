@@ -9,6 +9,7 @@ use crate::{
     book_resume_db::{PageIdentity, ReadingPosition},
     file_type_visibility::FileTypeVisibility,
     grid_item::GridItem,
+    page_overview::{PageOverviewEntry, PageOverviewMetadata, PageOverviewPage},
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -20,6 +21,7 @@ pub(crate) struct PreparedPageIdentityIndex {
     shift_identities: Arc<HashMap<PageIdentity, usize>>,
     current_slots: Vec<Option<usize>>,
     readable_indices: HashSet<usize>,
+    overview_metadata: Arc<PageOverviewMetadata>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,8 +41,17 @@ impl PreparedPageIdentityIndex {
     ) -> Self {
         let mut identities = HashMap::new();
         let mut readable_indices = std::collections::HashSet::new();
+        let mut overview_entries = Vec::new();
         for (index, item) in items.iter().enumerate() {
             if let Some(identity) = PageIdentity::for_item(item, logical_container) {
+                overview_entries.push(PageOverviewEntry {
+                    items_idx: index,
+                    page: Arc::new(PageOverviewPage {
+                        identity: identity.clone(),
+                        label: Arc::from(item.name().as_ref()),
+                        white_companion: None,
+                    }),
+                });
                 // Same-name real-directory/nested-archive collisions are unsupported.
                 identities.entry(identity).or_insert(index);
                 readable_indices.insert(index);
@@ -53,6 +64,10 @@ impl PreparedPageIdentityIndex {
             shift_identities: Arc::new(shift_identities),
             current_slots: (0..items.len()).map(Some).collect(),
             readable_indices,
+            overview_metadata: Arc::new(
+                PageOverviewMetadata::new(overview_entries)
+                    .expect("prepared items have unique integer indices"),
+            ),
         }
     }
 
@@ -86,6 +101,13 @@ impl PreparedPageIdentityIndex {
                 .iter()
                 .filter_map(|index| remap(*index))
                 .collect(),
+            overview_metadata: Arc::new(
+                self.overview_metadata
+                    .remap_items(self.overview_metadata.entries().filter_map(|entry| {
+                        remap(entry.items_idx).map(|idx| (entry.items_idx, idx))
+                    }))
+                    .expect("row deletion preserves unique integer indices"),
+            ),
         }
     }
 
@@ -129,12 +151,31 @@ impl PreparedPageIdentityIndex {
             )
             .max(slots.iter().flatten().max().map_or(0, |max| max + 1));
         let shift_identities = prepare_shift_identities(&identities);
+        let mut overview_entries: HashMap<usize, PageOverviewEntry> = self
+            .overview_metadata
+            .entries()
+            .map(|entry| (entry.items_idx, entry.clone()))
+            .collect();
+        for entry in additions.overview_metadata.entries() {
+            if let Some(index) = slots.get(entry.items_idx).copied().flatten() {
+                overview_entries
+                    .entry(index)
+                    .or_insert_with(|| PageOverviewEntry {
+                        items_idx: index,
+                        page: Arc::clone(&entry.page),
+                    });
+            }
+        }
         Self {
             policy: self.policy.clone(),
             identities: Arc::new(identities),
             shift_identities: Arc::new(shift_identities),
             current_slots: (0..len).map(Some).collect(),
             readable_indices,
+            overview_metadata: Arc::new(
+                PageOverviewMetadata::new(overview_entries.into_values())
+                    .expect("worker merge has unique accepted integer indices"),
+            ),
         }
     }
 
@@ -155,6 +196,11 @@ impl PreparedPageIdentityIndex {
         } else {
             PositionResolution::InvalidRaw
         }
+    }
+
+    /// Shared canonical payload prepared with the items. Opening needs no name/path work.
+    pub(crate) fn overview_metadata(&self) -> &Arc<PageOverviewMetadata> {
+        &self.overview_metadata
     }
 
     /// Shift lookup shares the accepted row slots, with its own specified slash/case rule.
@@ -385,5 +431,87 @@ mod remap_tests {
             base.resolve(&position(&rows[0])),
             PositionResolution::HiddenIdentity
         );
+    }
+
+    #[test]
+    fn overview_metadata_prepares_logical_archive_document_and_display_labels() {
+        let rows = [
+            GridItem::Image("folder/first.jpg".into()),
+            GridItem::Folder("folder/chapter".into()),
+            GridItem::ZipImage {
+                zip_path: "cache/book.zip".into(),
+                entry_name: "chapter/second.png".into(),
+            },
+            GridItem::PdfPage {
+                pdf_path: "cache/book.pdf".into(),
+                page_num: 4,
+                content_type: None,
+            },
+        ];
+        let logical = Path::new("books/source.epub");
+        let index = PreparedPageIdentityIndex::prepare(&rows, Some(logical), Default::default());
+        assert_eq!(index.overview_metadata().entries().count(), 3);
+        assert!(index.overview_metadata().entry(1).is_none());
+        for idx in [0, 2, 3] {
+            let entry = index.overview_metadata().entry(idx).unwrap();
+            assert_eq!(
+                entry.page.identity,
+                PageIdentity::for_item(&rows[idx], Some(logical)).unwrap()
+            );
+            assert_eq!(entry.page.label.as_ref(), rows[idx].name().as_ref());
+            assert!(entry.page.white_companion.is_none());
+        }
+        let shared = index.clone();
+        assert!(Arc::ptr_eq(
+            index.overview_metadata(),
+            shared.overview_metadata()
+        ));
+    }
+
+    #[test]
+    fn overview_metadata_repeated_deletion_and_worker_merge_share_payloads() {
+        let rows = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"].map(|p| GridItem::Image(p.into()));
+        let original = PreparedPageIdentityIndex::prepare(&rows, None, Default::default());
+        let removed = original
+            .without_removed_indices(&[0])
+            .without_removed_indices(&[1]);
+        assert_eq!(removed.overview_metadata().entries().count(), 2);
+        for (old, new) in [(1, 0), (3, 1)] {
+            assert!(Arc::ptr_eq(
+                &original.overview_metadata().entry(old).unwrap().page,
+                &removed.overview_metadata().entry(new).unwrap().page,
+            ));
+        }
+        let additions = PreparedPageIdentityIndex::prepare(&rows[..3], None, Default::default());
+        let merged = removed.with_mapped_additions(&additions, &[Some(2), None, Some(3)]);
+        assert_eq!(merged.overview_metadata().entries().count(), 4);
+        for (source, old, new) in [
+            (&removed, 0, 0),
+            (&removed, 1, 1),
+            (&additions, 0, 2),
+            (&additions, 2, 3),
+        ] {
+            assert!(Arc::ptr_eq(
+                &source.overview_metadata().entry(old).unwrap().page,
+                &merged.overview_metadata().entry(new).unwrap().page,
+            ));
+            assert_eq!(
+                merged.resolve(&ReadingPosition {
+                    page: 99,
+                    identity: Some(
+                        merged
+                            .overview_metadata()
+                            .entry(new)
+                            .unwrap()
+                            .page
+                            .identity
+                            .clone()
+                    ),
+                }),
+                PositionResolution::Restored(new)
+            );
+        }
+        assert_eq!(original.overview_metadata().entry(0).unwrap().items_idx, 0);
+        assert_eq!(removed.overview_metadata().entries().count(), 2);
     }
 }

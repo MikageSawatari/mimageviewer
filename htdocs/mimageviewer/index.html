@@ -31,8 +31,8 @@
     "applicationCategory": "MultimediaApplication",
     "applicationSubCategory": "画像ビューア",
     "operatingSystem": "Windows 11 (64bit)",
-    "softwareVersion": "4.8.3",
-    "dateModified": "2026-10-26",
+    "softwareVersion": "4.10.0",
+    "dateModified": "2026-10-30",
     "inLanguage": "ja",
     "description": "フォルダを開くだけで、数十万枚でもサムネイルで一覧できる Windows 用の画像ビューア。ZIP・PDF はディスクに展開せずに中のページを閲覧でき、長い動画はタイル表示で全体を見渡せます。RAW・HEIC・AVIF に対応し、AI アップスケールと非破壊編集を内蔵します。mImageViewer 本体の画像 AI 処理は利用者の PC 内で完結します。",
     "screenshot": "https://mikage.to/mimageviewer/ogp.jpg",
@@ -897,7 +897,7 @@
     <div class="usecase-card">
       <div class="uc-icon">🧹</div>
       <div class="uc-title">スキャンの汚れを補修したい</div>
-      <p class="uc-desc">非破壊で元のファイルを修正することなしに、スキャン汚れなどを消しゴムツールで補修。</p>
+      <p class="uc-desc">非破壊で元のファイルを修正することなしに、スキャン汚れなどを消しゴムツールで補修。消しゴム・隠蔽加工では Tab を押している間、仕上がりをプレビューできます。</p>
     </div>
     <div class="usecase-card">
       <div class="uc-icon">💬</div>
@@ -1034,7 +1034,7 @@
       <div class="feature-card">
         <div class="icon">🖼️</div>
         <h3>フルスクリーン表示</h3>
-        <p>クリックで全画面表示。モニター全面とウィンドウ内をワンクリックで切り替え、Ctrl+ホイールでズーム、ドラッグで移動、回転やフィットの切り替えに対応します。F12 で一覧とは別のウィンドウにも表示できます。</p>
+        <p>クリックで全画面表示。モニター全面とウィンドウ内をワンクリックで切り替え、Ctrl+ホイールや . / , キー（テンキーの + / - も可）でズーム、ドラッグで移動、回転やフィットの切り替えに対応します。F12 で一覧とは別のウィンドウにも表示できます。</p>
       </div>
       <div class="feature-card">
         <div class="icon">📖</div>
@@ -1099,7 +1099,7 @@
       <div class="feature-card">
         <div class="icon">🏷️</div>
         <h3>タグ・レーティングで整理</h3>
-        <p>画像・動画・フォルダ・ZIP/PDF に mIV 内タグや★1〜5 を付けて整理。いずれも元ファイルを書き換えない非破壊方式で、★の数やタグで一覧を絞り込めます。</p>
+        <p>画像・動画・フォルダ・ZIP/PDF に mIV 内タグや★1〜5 を付けて整理。元ファイルを書き換えず、★の数やタグで一覧を絞り込めます。タグを付けた時刻順にも並べられ、間違えて付けたタグを探せます。</p>
       </div>
       <div class="feature-card">
         <div class="icon">🔍</div>
@@ -1126,9 +1126,9 @@
       <li><strong>メタ情報の持ち運び</strong> — 評価・タグ・動画 / 音声 / 本のブックマークや編集内容を実フォルダ単位で書き出し、別環境へ取り込み</li>
       <li><strong>カテゴリ表示順</strong> — 実フォルダ / アーカイブ類 / 画像 / 動画・音声を、分ける・混ぜる・前後を入れ替える表示設定に対応</li>
       <li><strong>選択情報の下部バー</strong> — 詳細表示と同じ列のヘッダと選択中の 1 行を、一覧に重ならないウィンドウ下部で確認。ツールチップとの併用や非表示も選択可能</li>
-      <li><strong>表示トリム</strong> — スキャン本の余白を、読むときだけ自動 / 手動でカット（非破壊）</li>
+      <li><strong>表示トリム</strong> — スキャン本の余白を、読むときだけ自動 / 手動でカット（非破壊）。自動を全体の既定にもできます</li>
       <li><strong>高品質な縮小表示</strong> — 表示サイズに合わせて画像を縮小し、網点やトーンが気になるときは「縮小時のなめらかさ」を調整</li>
-      <li><strong>部分拡大ズーム</strong> — Z キーで一部を画面いっぱいに拡大し、マウスでパン（倍率はページ送りでも保持）</li>
+      <li><strong>部分拡大ズーム</strong> — Z キーで一部を画面いっぱいに拡大し、マウスでパン（倍率はページ送りでも保持）。静止画の閲覧・編集では Ctrl+Space を押しながらペンやマウスを左右にドラッグして、押した位置を中心に拡大・縮小できます</li>
       <li><strong>ルーペ機能</strong> — Shift 押下中 / M キーでカーソル周辺を拡大表示</li>
       <li><strong>全画面中の固定表示</strong> — 上部バー・下部バーとストリップ・右情報パネル・ナビゲータを、F11 全画面の間だけ自動表示に切り替えられます。固定設定は保持します</li>
       <li><strong>その他の機能パネル</strong> — 上部バー右端の「×」の左にある「…」から、ナビゲータ・分析・ピクセルグリッド・ルーペ固定をタッチ / マウス共通で操作</li>
@@ -1145,16 +1145,19 @@
       <li><strong>Creative LUT</strong> — 組み込みプリセットと 3D LUT ファイルを、静止画・動画へ適用量つきで適用</li>
       <li><strong>ポストフィルタ (38 プリセット)</strong> — CRT エミュ・フィルムグレイン・カラーグレーディング等を T キーで切替</li>
       <li><strong>画像分析モード</strong> — カラーピッカー・ΔE 比較・ヒストグラム等、色彩分析に特化したツール</li>
+      <li><strong>画像の比較</strong> — ワイプ・差分強調・ピン画像の切り替えで見比べられます。比較中に右Ctrlを押している間は、両側を元画像で確認できます</li>
       <li><strong>SNS 分割書き出し</strong> — 1 枚の絵を 2〜4 枚に切り分け、複数枚投稿で 1 枚の絵に見せるための画像を作成</li>
       <li><strong>バリエーション一括エクスポート</strong> — 補正・消しゴム・隠蔽の結果を JPEG/PNG/WebP で別ファイル保存</li>
       <li><strong>キャプチャコピー</strong> — 表示中の画像 / ページや、ドラッグした範囲をクリップボードへコピー</li>
+      <li><strong>編集を反映した画像をコピー</strong> — 補正・切り取り・注釈などを反映して他のアプリへ貼り付け。見開きは 1 枚につなげてコピー。<a href="manual/export.html#edited-copy">使い方を見る</a></li>
       <li><strong>外部ツール連携</strong> — よく使うアプリを登録し、右クリックやキー 1 つで選択したフォルダーや表示中のページを渡して開く。ZIP / PDF の中のページや動画のコマも渡せます。複数の対象はファイルの一覧を書いたリストでも渡せます</li>
       <li><strong>画像色で絞り込み</strong> — 選んだ色を主要色に含む画像だけを抽出（カラー検索）</li>
       <li><strong>コンテナ検索</strong> — Ctrl+S でフォルダ・ZIP・PDF を名前で横断検索</li>
       <li><strong>代表サムネを手動で指定</strong> — フォルダ / ZIP / PDF の表紙を好きな 1 枚に固定</li>
       <li><strong>お気に入りフォルダ</strong> — よく使うフォルダに名前を付けて登録</li>
       <li><strong>スマートフォルダ</strong> — ダウンロード先と複数の整理済みフォルダなど、任意の場所から本・画像・動画・音声を表示条件付きのフラット一覧へ集約</li>
-      <li><strong>フォルダツリー巡回</strong> — 左ツリー表示と Ctrl+↑↓ の深さ優先フォルダ移動</li>
+      <li><strong>フォルダツリー巡回</strong> — 現在地が背景色で分かる左ツリー表示と Ctrl+↑↓ の深さ優先フォルダ移動</li>
+      <li><strong>一覧順で本を巡回</strong> — Ctrl+Shift+↑↓ で、最後に通常フォルダ一覧から本を開いたときの絞り込み・並べ替え順に前後の本を表示。<a href="manual/fullscreen.html#list-order-navigation">使い方</a></li>
       <li><strong>自動索引管理</strong> — ファイル追加 / 更新 / 削除を自動監視して索引を最新に維持</li>
       <li><strong>同名ファイル処理</strong> — 同名 ZIP を優先し、書庫 + フォルダ、動画・音声 + 画像なども自動整理</li>
       <li><strong>ZIP ファイルへ変換</strong> — RAR / 7z / LZH と同じ場所へ、通常ファイルとして残る同名 ZIP を作成</li>
@@ -1251,13 +1254,13 @@
     <h2>ダウンロード</h2>
     <div class="download-box" style="flex-direction:column; align-items:stretch;">
       <div class="download-info" style="text-align:center;">
-        <div class="version">mImageViewer v4.8.3</div>
-        <div class="meta">Windows 11（64bit） &nbsp;·&nbsp; 最終更新: 2026-10-26</div>
+        <div class="version">mImageViewer v4.10.0</div>
+        <div class="meta">Windows 11（64bit） &nbsp;·&nbsp; 最終更新: 2026-10-30</div>
       </div>
       <div style="display:flex; gap:1rem; justify-content:center; flex-wrap:wrap;">
         <a class="btn-download" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mImageViewer_setup.exe">インストーラ版</a>
         <a class="btn-download" style="background:linear-gradient(135deg,#ffb0d9,#d63384);" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mimageviewer.exe">単体 exe 版</a>
-        <a class="btn-download" style="background:linear-gradient(135deg,#7ee0c0,#1f9e7a);" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mImageViewer_portable_v4.8.3.zip">ポータブル版（zip）</a>
+        <a class="btn-download" style="background:linear-gradient(135deg,#7ee0c0,#1f9e7a);" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mImageViewer_portable_v4.10.0.zip">ポータブル版（zip）</a>
       </div>
 
       <!-- Microsoft Store（副導線） -->
@@ -1415,11 +1418,12 @@
       RAW の表示・現像には <a href="https://www.libraw.org/">LibRaw</a> を CDDL-1.0 で使用しています。対応するソースコードを以下から入手できます。
     </p>
     <ul style="font-size:0.9rem;">
-      <li>LibRaw バージョン: 0.22.2</li>
-      <li>対応ソース: <a href="https://mikage.to/mimageviewer/libraw-0.22.2-source.tar.gz">libraw-0.22.2-source.tar.gz</a>（改変していない公式ソース。<a href="https://github.com/LibRaw/LibRaw/tree/0.22.2">配布元</a>）</li>
+      <li>LibRaw バージョン: 0.22.3</li>
+      <li>対応ソース: <a href="https://mikage.to/mimageviewer/libraw-0.22.3-source.tar.gz">libraw-0.22.3-source.tar.gz</a>（改変していない公式ソース。<a href="https://github.com/LibRaw/LibRaw/tree/0.22.3">配布元</a>）</li>
       <li>ライセンス全文・著作権表記: アプリの「バージョン情報」から確認できます。インストーラ版・ポータブル版には LIBRAW-LICENSE.txt（CDDL-1.0 と BSD 表記を含む）も同梱しています</li>
       <li>zlib 1.3.1（zlib ライセンス）: アプリの「バージョン情報」で全文を確認できます。インストーラ版・ポータブル版には ZLIB-LICENSE.txt も同梱しています</li>
       <li>libjpeg-turbo（IJG / BSD-3-Clause / zlib）: アプリの「バージョン情報」で全文を確認できます。インストーラ版・ポータブル版には LIBJPEG-TURBO-LICENSE.txt も同梱しています。This software is based in part on the work of the Independent JPEG Group.</li>
+      <li>以前のバージョン向けの対応ソース: <a href="https://mikage.to/mimageviewer/libraw-0.22.2-source.tar.gz">libraw-0.22.2-source.tar.gz</a></li>
     </ul>
 
     <h3 style="margin-top:1.6rem;">サードパーティ ソフトウェア（EffeTune / VST3 SDK）</h3>

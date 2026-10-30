@@ -3,6 +3,10 @@
 ## Everything 検索のsourceと物理child（§1.374、未リリース）
 
 Everythingは新しい最上位surfaceを増やさず `TopLevelGridView::Search` を共有する。
+代表画像なしのドライブ一覧など、通常thumbnail workerを持たない起点からの検索も同じownerを使う。
+Everything / Ctrl+Gの既存prepare workerで不足するcatalogとcacheを準備し、結果採用時だけ通常の
+thumbnail queue / workerを作る。cold open / load_allはUIへ持ち込まない。検索終了は既存のDriveList
+復元へ戻し、代表画像なしのドライブは引き続き固定アイコンで表示する。
 検索開始前の唯一の `return_origin` は通常Searchと同じownerが保持し、query送信やsource変更で
 復元先を別の一覧へすり替えない。draft `SearchSource` とaccepted `SearchAccepted` は別で、
 未実行queryや失敗した新producerが表示済みdatasetの出所を上書きしない。
@@ -164,6 +168,12 @@ root snapshot の表示順で前後の Folder/PDF/ZIP/変換書庫 entry へ移�
 グリッド、リング、ゲームパッド、画像
 フルスクリーン、native 動画は同じ `FolderNavMode::SmartFolder` を使う。
 
+ZIP内の子階層は既存ZIPナビゲーションで一段ずつ戻り、root行から開いたZIP / PDFの最上位では
+スマートフォルダのrootへ戻って開いた行を選択する。BS / 親ボタン / 全画面closeのDirect要求は、
+共通のopen dispatcherで合成pathを既存Smart復元へ配送し、実フォルダscanへ渡さない。
+履歴の型付きSmartFolder帰路と同じsession / root復元を使い、専用flagや再試行は設けない。
+簡素化として既存ownerの復元とprepare / adoptionへ揃え、別の待機・rollback ownerは作らない。
+
 通常の戻る / 進む履歴では scoped drill や root container 内の実パスをそのまま保存せず、
 `SmartFolderViewState` の位置を型付きで保持する。root と各 Scoped/Container current は別の
 履歴地点なので「戻る」で root、「進む」で元の子へ復帰する。Container は root 行の本を一つの
@@ -186,6 +196,11 @@ wanted revision進行や定義削除だけでは現在の子表示を置き換�
 収束する。アドレス入力、履歴、お気に入り、folder pane等の独立navigationはownerを持たず、scan成功や
 ZIP / PDF非同期開始などvisible loadの採用境界でだけsurfaceを`Folder`へ切り替えてsessionを破棄する。
 scan失敗、scope拒否、stale async result、変換dialog取消ではcollection rootのsurfaceとitemsを分裂させない。
+
+変換書庫の `CollectionGridSourceOpenOwner` も同じ `CollectionGridPhysicalLoadOwner` を所有し、
+Root／PhysicalSource の受理・採用・論理元パスと登録項目の帰路を ZIP/PDF と共有する。
+Ask の確認、変換、キャッシュ採用、RAR 直読みをまたいでも cache path を登録元に置き換えない。
+ゲームパッドのフォルダ open／前後移動もキーボードと同じ collection owner／navigation 入口を使う。
 
 collection root installはviewer bundle所有の通常thumbnail poolを新items generationへ作り直し、画像・Folder・
 ZIP・PDFの既存producerを起動する。collection専用video workerだけをsessionがcancelし、bundleの共有pool tokenを

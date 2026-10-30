@@ -27,6 +27,14 @@ Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ
 「どの処理がどのスレッド/プロセスで走るか」「どうやってキャンセルするか」「キャッシュ競合をどう避けるか」
 の一覧。並列処理を追加・変更するときの設計テンプレートとして使う。
 
+比較元画像ホールド（§1.79）は加工版と同じ単一 worker owner を使う。
+`ComparePreparationState::PreparingOriginal { pair, pending }` は加工版 pair を描画可能なまま
+元画像の再標本化・crop・回転・配置を worker で行う。完成状態だけを pair 内へ保持し、
+全失効経路の `invalidate()` が pending を `Draining` へ移す。回収前に次の比較 worker を開始しない。
+キー解放や PinnedNormal 非表示は worker を取り消さず、完成結果を同じ pair へ採用する。
+元画素補充には既存の MaterialOnly ロードを使い、完成加工版を失効させない。
+失敗はログ・通知1回で閉じ、同じ pair では再試行しない。詳細は [表示パイプライン](display-pipeline.md)。
+
 ---
 
 ## 紙めくりの入力leaseとpresentation素材（D2、2026-10-16）
@@ -89,6 +97,14 @@ D3-2 は同じ pending を `Computing | CpuReady` に拡張する。新 D3 の w
 CPU-ready の採用は selector を呼ばず、要求時 identity と世代を照合して既存 final cache へ move する。
 既存 legacy 表示/先読みの要求範囲と通常登録は維持し、これらを含む全 CPU 仕事が1件になるとは主張しない。
 park は開始済み final-effect を保持し、新しい D3 開始を止める。詳細は [D3計画](page-turn-animation-plan.md) §27.17.13。
+
+§28 段階 A（2026-10-28）は既存 D3 owner の入力を `AfterAi / ResidentEdited / Unedited` に分ける。
+ResidentEdited は必要な全編集を反映済みの exact な最上位累積段だけを受け付け、下位 cache の
+再生成を要求しない。全開始経路で現在入力の erase/local/conceal producer（受信済み未採用の
+ready を含む）が無いことを確認し、待つ頁は continue して相方の準備を進める。
+local/conceal の現在入力判定は採用側と共有する純粋 helper を使う。Next/Previous は同じ解決を使い、
+要求 key と source_size は開始時に固定する。新しい stage producer・queue・pending は追加しない。
+この段階に残った後発local寸法正規化による同key失効は、下記段階Bの一括公開・正規化採用境界で扱う。
 入力・permission の再開・実表示復帰は selector 非依存の共通 service を通るが、単なる context mount は通さない。
 app 共通 GPU 登録枠は ROOT の cumulative frame を使い、viewport/context swap/discard retry では返却しない。
 通常 source/edit 登録を記録する基盤と実 TextureOptions による投機 admission を用い、D3-2 の CpuReady 登録で本番の投機 claim を行う。
@@ -103,13 +119,37 @@ park／mount／fork の新しい非同期 owner は作らず、cold metadata 準
 D3-5整理（2026-10-19）: Native canonical の完全性・位置検索は既存 installed topology の証拠／索引を使い、
 未採用なら skip する。slideshow の nav/unit 列も収集・再照合から再構築しない。最新 callback の値は
 既存 frame owner に置き、最終 hook の処理後に消費する。別 cache owner／queue／heartbeat は作らない。
-source／AI の既存先読み要求範囲と producer は維持する。D3-3 の編集入力・comic CPU-only 化は
-次の版の後の [backlog §1.401](next-release-backlog.md) へ延期し、通常表示要求の従来経路は保持する。
+source／AI の既存先読み要求範囲と producer は維持する。D3-5当時延期したD3-3の編集入力・comic準備は、
+2026-10-28の利用者判断により下記§28段階Bで扱う。通常表示要求の従来経路は保持する。
 横断監査と計測／未確認事項の正本は [page-turn 計画 §27.17.17](page-turn-animation-plan.md)。
 CPU 需要用の従来 resolver に残っていた全頁走査・mixed slideshow 列再構築も、D3-5 で同じ既存
 `SpreadDisplayUnitsCache` 内の派生 record へ移す。cold だけ導出し、warm は scalar／Arc identity と索引で読む。
 共通adoption／producer／keepのprefixで同pass採用し、ROOT直接採用も覆う。visible token／units／証拠は変更せず、
 同じ枝は既存索引を参照し、異なる枝だけ完全recordを持つ。forkのfresh owner、mount／park／promoteの移譲は維持する。
+
+§28 段階B（2026-10-28〜29、実装済み・検証結果は別記）は`app/prepared_edit.rs`にNextの編集一式のCPU準備を置く。
+`final_effect_pending`の排他的な`Computing / CpuReady / Registering`が要求・結果・登録途中textureを所有し、
+別map／queue／readyフラグは作らない。UIで固定したcontext・item identity・世代・各key・params・入力Arc・canonical寸法から、
+workerが局所補正（coldならDB読取りと寸法正規化）→隠蔽→final→注釈→各upload clampを行う。
+現在入力のerase Commit、local／conceal／comic、該当LUT／segmentation producerと競合する頁は開始せず、相方へ進む。
+Previousはresident-onlyのままで、BのためにMI-GANやfinal AIを開始しない。
+
+共通投機permitと必要なcomic実走行枠は取消後もworker実終了まで保持する。CPU結果予約はallocation単位で共有Arcを重複計上せず、
+channel／CpuReady／Registering／表示引取りを通じて公開・破棄まで保持する。context 1unit／全体2unit／1GiBは維持する。
+font不足や空docでもcold doc解決は正常結果で、照合後に既存`comic_docs`の欠けているkeyだけへ採用する。
+画像なし結果はGPU登録を待たず予約を解放し、font不足だけで画像jobを再spawnしない。
+
+公開は全照合と注釈の除外可否を最初のmutation前に決め、段・edit・final・対応comicを一括採用する。
+Registeringの新規textureはROOT共通枠で1枚ずつ作り、途中はpending内に私有して全contextのVRAMへ計上する。
+共有handleは追加枠を使わない。登録残は次のROOT frameを要求し、OverBudgetでは結果を保持して再描画・再計算ループを作らない。
+表示入口は非blocking受信後にComputingなら取消・公開権撤去、CpuReady／Registeringなら表示引取りとし、作成済みhandleを再利用する。
+BはDisplayPreparedへ昇格しない。編集の入場・切替・original待ち再開・Resume・Ctrl+EはBを取り消して既存ownerへ渡し、
+B完了から編集continuationを発火させない。
+
+parkでは新jobを開始しないが、開始済みworker内部の全段は完走してよい。結果・予約・非公開textureは同ownerに残し、resume時に再照合する。
+F12は同ownerを移し、forkはpending／receiver／取消tokenを共有しない。兄弟contextへ失効や正規化のpublicationを送らない。
+新しい待機仕様はなく、めくりは受理時のresident素材を用いる。設計は[計画§28.5](page-turn-animation-plan.md)、
+検証結果と残件は`target/pageturn-1461/implementation-report-b.md`を参照する。
 
 ## 音楽タイムラインのベース計算（鍵盤設計 §13）
 
@@ -699,7 +739,8 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 | カラー化 / 最終エフェクト | `std::thread` (`miv-final-effect-{idx}` / `miv-final-effect-prefetch-{idx}`、要求ごとの短命 worker) + 個別 mpsc | 表示要求 + 背景先読み最大 1 本 | final AI / sharpen 後の `ColorImage` に、モノクロ系判定、スクリーントーン濃淡変換、階調カラー LUT、ポストフィルタを順に適用する。AI と共通の前後枚数を候補にし、ページ送りでは従来どおり、連結読みでは `fs_vertical_cache_keep_set` との積に絞り、実テクスチャ会計が共有 pool 由来の LOW 未満のときだけ遠方ページを先読みする。厳密可視の前後 1 ユニットの準備帯は LOW をバイパスして非表示ページを 1 枚ずつ先行処理し、色調補正・smart sharpen も worker 上で行う。可視ページの表示要求は水位をバイパスする。先読み／表示開始時とも無着色の provisional texture を upload せず、完成結果だけを `final_composite_cache` へ upload する。表示要求が先読み中の同じ key に来た場合は job を昇格して再利用し、同一 viewer のページ送りでは完成まで直前ページを holdover する。連結読みでは keep-set 内の各表示済みページがページ別 transition texture を持ち、raw source 差し替えや incomplete → complete 再合成で live final が一時的に消えても黒い読込表示へ戻さない。complete final の GPU 登録後に差し替え、keep-set 離脱時は旧 texture も破棄する。ページ入場だけでは完成 cache / pending を破棄しない。別 key の表示要求、設定変更、keep-set 除外、context close / drop では `Arc<AtomicBool>` を立て、`items_generation` と composite key が一致する結果だけを採用する。pending map とページ別 transition は viewer context の swap / park と一緒に所有権移動するため、別ウィンドウの要求や表示を誤って共有しない |
 | edit materialization (local / conceal) | `std::thread` (`local-adjust-render` / `conceal-materialize`、要求ごとの短命 worker) + idx 別 mpsc | viewer context 内で idx ごとに最新 1 本。可視ページが複数なら別 idx は並行し得る | source 解像度 edit chain の lazy LocalAdjust DB / JSON load、mask resize、local compose、および Conceal DB read、deflate / JSON decode、shape raster、conceal compose を UI thread 外で行う。local と conceal は同じ `local_adjust_pending[idx]` slot を共有し、後段が必要な local 完了前に conceal を誤った下位 source へ合成しない。CPU 結果だけを返し、generation / key を UI 側で検証した後、共通予算で 1 フレーム 1 枚だけ GPU upload する。詳細は §3.2.2 |
 | AI 消しゴム (MI-GAN inpaint) | `std::thread` (使い捨て) + mpsc | preview/commit ごと | erase ツールの補完推論 (`erase_inpaint_pending`、final pipeline とは別経路、§3.3) |
-| Ctrl+E エクスポート | `std::thread` (`ctrl-e-export`) + mpsc | ダイアログ確定ごとに 1 本 | UI スレッドで snapshot した base pixels / composite mask / preset を使い、隠蔽合成と JPEG/PNG/WebP 保存を順番に実行する。元画像メタデータ転記と `create_new` 書き込みも worker 側で実行し、キャンセルは各エントリ開始前に `Arc<AtomicBool>` を確認する |
+| Ctrl+E エクスポート | `std::thread` (`ctrl-e-export`) + mpsc | ダイアログ確定ごとに 1 本 | UI スレッドで固定した `CompositeSource` / `BakedEditSnapshot` / preset を使い、worker で decode・選択した焼き込み段までの合成・見開き結合・倍率変更と JPEG/PNG/WebP 保存を順番に実行する。表示 cache の画素は使わない。元画像メタデータ転記と `create_new` 書き込みも worker 側で実行し、キャンセルは各エントリ開始前に `Arc<AtomicBool>` を確認する |
+| 編集を反映した画像のコピー | `std::thread` (`clipboard-edited-copy`) + mpsc（`edited_clipboard_copy.rs`） | App 全体で pending 1 本 | Ctrl+E と共通の source / 編集 snapshot を専用設定の段まで合成し、見開き結合・matte・CF_DIB 書き込みを行う。新要求は旧 cancel を立てて結果 channel ごと置き換える。worker は終端まで AI activity lease を所有し、成功・失敗・取消の終端で結果送信後に ROOT repaint を要求する。常時 timer は置かない。要求側は writer mutex を待たず、書き込みは OpenClipboard 後・EmptyClipboard 前に mIV 世代と OS 世代を検査する。編集 DB / sidecar には書かない。詳細は [clipboard-edited-copy-plan.md](clipboard-edited-copy-plan.md) |
 | 外部受け渡し準備 / 実体化 | UI の frame cursor + `std::thread` (`external-tool-materialize`) + mpsc | 単一 owner の Preparing → Confirmation → Materializing → Launching。cancel 済み旧 worker は drain 中のみ重なり得る | Preparing は一覧 index / context / items generation / typed source identity を保持し、表示順・Stack・編集 snapshot を 128 entry / 2ms に分割する。所有 context の mutation / close で準備を破棄し、別 context の変更は無関係。具体的 source が確定した後は明示 cancel / supersede の既存契約を維持する。worker は補正 DB read-only、ZIP read、source stat、画像 / PDF / 動画 frame decode、見開き・編集合成、encode、リスト生成、process / Shell Invoke を行う。実体化後は UI の frame tail の launch ACK を待つ。新規メディアとリストは `create_new` の request-owned RAII lease が持ち、起動成功時だけ process 所有へ一緒に移す。画像の cache hit は process-owned 借用、リストは cache key を作らず起動ごとの別名。keep_temp は双方の終了時削除に適用する。孤児回収 / 終了時 cleanup の短命 worker と reparse point 非追従を流用し、worker / 削除 timer を増やさない |
 | 操作カスタマイズ共有 / 世代取り込み | `std::thread` (操作ごとの短命 worker) + mpsc | 「設定の復元」ダイアログ中に最大 1 本 | 過去世代 DB の一時コピーと読み込み、`.mivkeys.json` の読み書き、取り込み前の自動退避を UI スレッド外で行う。UI は native ファイルダイアログでパスを選び、50ms polling で結果を受け取ってから差分表示またはライブ適用する |
 | サブ展開 snapshot | `std::thread` (`subfolder-expansion` / `subfolder-view-prepare`) + mpsc | 最大 1 scan + 1 prepare | 現在地以下の画像 / 動画、ZIP/PDF 本体、設定上の画像フォルダ本を共通 recursive snapshot walker で列挙する。ZIP/PDF 内部は開かない。`GlobalIoSemaphore` Normal priority と `ActivityGate` を通し、`Arc<AtomicBool>` で cancel、generation で stale 結果を破棄する。大量ソート、metadata 構築、コンテナピンの一括照会も worker 側で行う |
@@ -1082,6 +1123,7 @@ Ctrl+↑↓ は複数の起点から発火し、DFS 完了時に異なる後処�
 | --- | --- | --- |
 | `Grid` | `navigate()` の Ctrl+↑↓ (通常グリッド) | `load_folder_nav_target(p)` のみ。RAR/7z/LZH などは変換ダイアログまたはキャッシュ経由で開く |
 | `Fullscreen` | `handle_fs_navigation` の Ctrl+↑↓ (フルスクリーン中) | `close_fullscreen` → `load_folder_nav_target(p)` → `open_fullscreen(先頭 image-like idx)` |
+| `ListOrder { snapshot, from_index }` | Ctrl+Shift+↑↓ | 通常フォルダ一覧の凍結した本の行を同じ停止条件で前後に探す。行き先の事前scan・採用・再openは Fullscreen と共有。sequence / 表示待ち中は拒否し、累積・乗り換えをしない |
 | `Favsearch { root, fullscreen: false }` | `favsearch_ctrl_nav` (お気に入り検索中) | `is_under(p, root)` が真なら `load_folder_nav_target + nav_stack.push + update_favsearch_address`、偽なら `favsearch_navigate_sibling(±1)` |
 | `Favsearch { root, fullscreen: true }` | フルスクリーン中の Ctrl+S スコープナビ | 上記に加えて `close_fullscreen` → `open_fullscreen(先頭 image-like idx)` でフルスクリーンを維持 |
 | `SmartFolder { state, fullscreen }` | スマートフォルダ root / scoped drill / root 直下の本のグリッド、リング、ゲームパッド、フルスクリーン | Folder `entry_root` 内だけを DFS。端または root 直下の本からは、最終 root items 表示順の Folder/PDF/ZIP/変換書庫 entry へ移る（単体画像・動画は除外）。worker に渡した単一の型付き root 列と可視列が異なれば旧結果は採用しない。新しい Folder/PDF/ZIP は offscreen `SmartFolderTransition` で準備し、可視採用時に `SmartFolderViewState` と fullscreen 継続を一度だけ更新する |
@@ -1382,15 +1424,39 @@ STALE checkpointは従来どおりworker pop直後、ZIP/Folder heavy I/O resolv
 RAW deferred callback/follow-upとEPUB fallbackも元のID・世代・操作sequence・immutable PDF render ticketを保つ。
 [寿命計画・回帰・検証証拠](thumbnail-request-lifecycle-plan.md)。
 
-静止画ページシークのサムネイル列 / hover preview はグリッド保持帯から遠いページを
-要求できるため、`keep_range` を広げず `still_seek_thumbnail_pages` の bounded exact set
-を `keep_set` へ合流する。要求は priority とし、worker は同 set の read-only shared
-projection で上記 3 箇所の STALE 判定を行う。これにより数万ページ先を指しても bbox の
-間を埋めず、指示位置が変わった後の ZIP/PDF 処理も次の checkpoint で取り消せる。
+静止画ページシークの列 / hover preview と閲覧中のページ一覧（§1.340）はグリッド保持帯から
+遠いページを要求できるため、`keep_range` を広げず `still_seek_thumbnail_pages` の
+bounded exact set を `keep_set` へ合流する。集合の名前は維持し、
+`ensure_foreground_thumbnail_requests` が同一viewerのSeek／PageOverviewの一方だけを
+前面consumerとして選ぶ。非表示stripの更新／clearはOpen中の一覧需要を撤回しない。
+要求はpriorityとし、workerは同setのread-only shared projectionで上記3箇所のSTALE判定を行う。
+これにより数万ページ先を指してもbboxの間を埋めない。
 
-この集合の更新者は overlay で、各描画フレームに列と preview の要求を置換する。
+各描画フレームにstrip＋preview、または一覧の可視セル＋上下overscanへ需要を置換する。
+一覧は可視順を先に保ち、新規enqueueを1 frame 32件／2msで区切る。全ページを生成しない。
+`ensure_page_overview_requests` は通常画像／ZIP画像／`PdfPage` を同じ要求境界へ渡す。
+PDF／変換済みEPUBは、master取込み後に§1.377の既存 `PdfRenderEpochOwner`／ticketと
+`promote_viewer_pdf_keys`／`PdfVisiblePromotionState` へ接続済み。
+同じowner・current要求世代・同keyだけを昇格・追跡し、遅着再評価も既存状態を使う。
+別のcancel identity API、Unscopedへの迂回、新しいretry ownerは作らない。
+一覧のcloseはこの前面需要の撤回であり、PDF render owner全体のadvance／retireではない。
+需要置換／取消は既存のkeep投影を再計算し、相関付き局所queued pruneとRAW ticket取消へ渡す。
+通常surfaceではGridの保持帯・VRAM cap・ROOTのtouch余白を既存bookkeepingと同じ計算で保ち、
+detachedではGrid保持を足さない。parkはbounded描画投影を採取後、Open metadataを保持して
+当該contextのexact需要を撤回する。worker取得後の要求は保存終端まで既存ownerに残る。
+PDF接続・最終修正の独立レビューはACCEPT、自動検証はfull 1回後のaffected範囲・vendor gateを補完済み。所有契約は
+[一覧計画§18](detached-book-page-overview-plan.md#18-t2-pdf昇格は1377の既存owner-scoped-apiへ接続する2026-10-12決定)、検証実数・残工程は同書§20を参照する。
+
+一覧Open／incarnationとprepared metadata／実ページprojectionは同じViewerContextBundleに属し、
+mount／depositで移譲、forkはClosed、items／読み順の置換とteardownで当該ownerだけを閉じる。
+passive描画はimmutable metadata全体と可視近傍のtextureを参照してstamped commandを返し、
+context／items世代／読み順revision／一覧incarnationと、実行時のactual active ownerを検証する。
+非active Selectを着地・再activation・再配送せずOpenを保持し、受理したSelectだけを通常の
+LatestSeek navigationへ渡す。描画更新だけでforeground／raiseを要求しない。
+
 同じ items 世代内のページ着地は集合を終了しない。単ページ / 見開きの通常着地と
-縦 / 横連結読みは同じ寿命を持つ。全消去は overlay の非表示、fullscreen 終了、
+縦 / 横連結読みは同じ寿命を持つ（一覧選択の受理ではoverviewを閉じてその需要を解除する）。
+全消去は前面consumerの非表示／一覧取消、fullscreen 終了、
 idx 空間の無効化、および `set_items_generation` での世代変更に限定する。
 コンテナ差し替えも `install_new_items` の世代更新で旧集合を失効させる。
 通常 worker の pop 後、heavy I/O 後、PDF レンダ前は、いずれも

@@ -10618,7 +10618,8 @@ function normalizedTrimMargins(value, keys) {
 
 export function normalizeRemoteViewTrimState(value) {
   if (!value || typeof value !== "object") return null;
-  if (!["none", "auto", "book"].includes(value.apply_mode)) return null;
+  if (!["follow_global", "none", "auto", "manual"].includes(value.preference)) return null;
+  if (!["none", "auto", "book"].includes(value.effective_apply_mode)) return null;
   const book = value.book_settings;
   if (!book || typeof book !== "object") return null;
   const single = normalizedTrimMargins(book.single, ["left", "top", "right", "bottom"]);
@@ -10627,7 +10628,8 @@ export function normalizeRemoteViewTrimState(value) {
   const right = normalizedTrimMargins(book.spread_right, ["left", "top", "right", "bottom"]);
   if (!single || !linked || !left || !right) return null;
   return {
-    apply_mode: value.apply_mode,
+    preference: value.preference,
+    effective_apply_mode: value.effective_apply_mode,
     book_settings: {
       enabled: Boolean(book.enabled),
       spread_separate: Boolean(book.spread_separate),
@@ -10672,9 +10674,10 @@ export class ViewerViewTrimPanel {
     modeRow.append(textElement("span", "適用モード"));
     this.modeSelect = document.createElement("select");
     for (const [value, label] of [
+      ["follow_global", "全体設定に従う"],
       ["none", "トリムなし"],
       ["auto", "自動余白カット（本全体）"],
-      ["book", "手動設定（本全体）"],
+      ["manual", "手動設定（本全体）"],
     ]) {
       const option = document.createElement("option");
       option.value = value;
@@ -10683,11 +10686,11 @@ export class ViewerViewTrimPanel {
     }
     this.modeSelect.addEventListener("change", () => {
       if (!this.serverState) return;
-      this.serverState.apply_mode = this.modeSelect.value;
-      if (this.serverState.apply_mode === "book") {
+      this.serverState.preference = this.modeSelect.value;
+      if (this.serverState.preference === "manual") {
         this.serverState.book_settings.enabled = true;
       }
-      this.renderState();
+      this.renderState(false);
       this.commit().catch((error) => this.showError(error));
     });
     modeRow.append(this.modeSelect);
@@ -10763,12 +10766,19 @@ export class ViewerViewTrimPanel {
     this.status.textContent = "スライダーを離すと保存します。";
   }
 
-  renderState() {
+  renderState(hasServerEffectiveMode = true) {
     const value = this.serverState;
     if (!value) return;
     const isSpread = pageGroupPresentationSlots(currentPageGroup()).length === 2;
-    const manual = value.apply_mode === "book";
-    this.modeSelect.value = value.apply_mode;
+    const manual = value.preference === "manual";
+    this.modeSelect.value = value.preference;
+    // Explicit modes do not disclose the global result. A pending choice also
+    // has no matching effective value until its server response arrives.
+    const effectiveLabels = { none: "トリムなし", auto: "自動余白カット" };
+    const globalLabel = "全体設定に従う";
+    this.modeSelect.children[0].textContent = value.preference === "follow_global" && hasServerEffectiveMode
+      ? `${globalLabel}（現在: ${effectiveLabels[value.effective_apply_mode]}）`
+      : globalLabel;
     this.enabledInput.checked = value.book_settings.enabled;
     this.enabledRow.hidden = !manual;
     this.separateInput.checked = value.book_settings.spread_separate;
@@ -10975,7 +10985,10 @@ export class ViewerViewTrimPanel {
   commit() {
     const target = this.currentTarget();
     if (!target || !this.serverState) return Promise.resolve();
-    const requestState = cloneViewTrimState(this.serverState);
+    const requestState = {
+      preference: this.serverState.preference,
+      book_settings: cloneViewTrimState(this.serverState.book_settings),
+    };
     const commitId = ++this.commitSequence;
     this.status.classList.remove("is-error");
     this.status.textContent = "保存中…";

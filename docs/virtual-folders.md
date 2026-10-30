@@ -330,10 +330,11 @@ mtime / size と画像認識 fingerprint を identity に catalog cache へ保�
 コレクションでは同名ファイルが異なる親に存在し得るため正規化した full path をキーにする。
 root の準備は worker が行い、source を開いて子へ入った後も root の戻り先と現在 entry を
 viewer context が保持する。別の実フォルダへの明示移動は読込成功時だけその owner を退役し、
-取消・失敗では元の root を保つ。コレクションから開いた PDF / ZIP のページを Esc / Enter /
+取消・失敗では元の root を保つ。コレクションに直接登録した PDF / ZIP のページを Esc / Enter /
 右クリックで閉じる場合も、実ファイルの親フォルダではなく、collection ID・revision・entry ID・
-source key を持つ typed restore で同じ root へ戻る。ネストした ZIP 内の子から直接閉じる場合も
-同じ root entry を選択し、コレクションの順序とスクロール復元を維持する。
+source key を持つ typed restore で同じ root へ戻る。
+登録項目の厳密な子孫からの親移動は通常の物理／論理の親へ戻り、登録項目そのものからの親移動で
+同じ root entry を選択する。全画面から親一覧へ直帰する場合も同じ判定を使い、変換書庫は論理元パスで扱い、コレクションの順序とスクロール復元を維持する。
 
 サムネイルの full-path cache key を使うかどうかの正本は
 `App::use_full_path_cache_keys()`。検索結果（Ctrl+S / Ctrl+G）、タグ一覧、閲覧履歴、
@@ -605,6 +606,11 @@ importは選択originへ復元する前に対象ページ区分のsource/cache�
 ### 2.1 ZIP / 直接閲覧 RAR を開く (`App::load_zip_as_folder`)
 
 #### 親一覧の位置保存と履歴復帰 (§1.328)
+
+スマートフォルダの結果から直接開いたZIP / PDFの最上位では、BS・「上へ」・設定に従う全画面の
+親一覧への直帰が同じSmart root復元を使い、開いた本を選択する。合成pathは通常open dispatcherで
+復元ownerへ配送し、実directoryとして走査しない。ZIP内の子階層は従来どおりZIP navで一段ずつ戻る。
+実Folder entry配下の本はそのFolderへ戻ってからSmart rootへ戻る。←の型付き履歴復元も維持する。
 
 通常 item install と ZIP の先出し表示は `folder_history` (scroll / selected) の保存処理を
 `save_leaving_folder_grid_position` に集約する。通常 install は `start_loading_items_inner` から呼び、

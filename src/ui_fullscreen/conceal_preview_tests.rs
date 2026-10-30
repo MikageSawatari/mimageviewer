@@ -1,0 +1,837 @@
+//! Headless production handlers: key dispatch → pipeline sync → canvas → panel.
+use super::*;
+use crate::conceal::ConcealTool;
+use crate::displayed_image_transform::{
+    DisplayedImageTransformInput, FullscreenFitScaleLimits, RectPixelFit, ResolvedDisplayPlacement,
+};
+use crate::edit_preview::EditPreviewHoldState;
+use crate::key_input::{SyntheticKeyCommand, SyntheticNavigationKey};
+
+fn key_level(key: SyntheticNavigationKey, down: bool) {
+    let now = std::time::Instant::now();
+    crate::key_input::enqueue_test_synthetic_command(if down {
+        SyntheticKeyCommand::down(now, key, Default::default())
+    } else {
+        SyntheticKeyCommand::up(now, key)
+    });
+    crate::key_input::advance_test_synthetic_input(now);
+}
+
+fn fixture() -> (crate::app::AppTestEnvForTest, egui::Context) {
+    crate::key_input::arm_test_synthetic_input(0xE040, egui::ViewportId::ROOT);
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
+    let mut app = crate::app::setup_app_for_test();
+    app.items = vec![crate::grid_item::GridItem::Image(
+        app.tmp.path().join("conceal-preview.png"),
+    )];
+    app.fullscreen_idx = Some(0);
+    app.conceal_mode = true;
+    app.conceal_tool = ConcealTool::Brush;
+    app.conceal_mask_size = [200, 200];
+    app.conceal_mask = Some(vec![false; 200 * 200]);
+    app.settings.conceal_brush_radius = 1.0;
+    let pixels = Arc::new(egui::ColorImage::filled([200, 200], egui::Color32::WHITE));
+    app.conceal_base_cache.insert(0, Arc::clone(&pixels));
+    let generation = app.conceal_generation;
+    app.conceal_cache.insert(
+        0,
+        crate::app::ConcealCacheEntry {
+            texture_options: egui::TextureOptions::LINEAR,
+            display_basis: crate::material_display_basis::MaterialDisplayBasis::from_sampler(
+                [200, 200],
+                crate::source_coverage::SourceCoverage::FullSource,
+            ),
+            pixels,
+            texture: None,
+            generation,
+        },
+    );
+    (app, ctx)
+}
+
+fn frame(
+    app: &mut App,
+    ctx: &egui::Context,
+    key: egui::Key,
+    pointer: Option<(egui::Pos2, Option<bool>)>,
+    owner: Option<crate::keyboard_input::KeyboardOwner>,
+) -> bool {
+    frame_with_extra_events(app, ctx, key, pointer, owner, &[])
+}
+
+fn frame_with_extra_events(
+    app: &mut App,
+    ctx: &egui::Context,
+    key: egui::Key,
+    pointer: Option<(egui::Pos2, Option<bool>)>,
+    owner: Option<crate::keyboard_input::KeyboardOwner>,
+    extra_events: &[egui::Event],
+) -> bool {
+    // Keep a repeat event after release too: the OS level must beat stale egui state.
+    let mut events = vec![egui::Event::Key {
+        key,
+        physical_key: Some(key),
+        pressed: true,
+        repeat: true,
+        modifiers: egui::Modifiers::NONE,
+    }];
+    events.extend_from_slice(extra_events);
+    if let Some((pos, edge)) = pointer {
+        events.push(egui::Event::PointerMoved(pos));
+        if let Some(pressed) = edge {
+            events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+    }
+    let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0));
+    let mut pipeline_active = false;
+    ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(full_rect),
+            focused: true,
+            events,
+            ..Default::default()
+        },
+        |_ui| {
+            app.keyboard_owner_for_pass(ctx);
+            if let Some(owner) = owner {
+                crate::keyboard_input::cache_keyboard_owner(ctx, owner);
+            }
+            if !crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx)
+                && owner != Some(crate::keyboard_input::KeyboardOwner::Modal)
+            {
+                if app.erase_mode {
+                    app.handle_erase_keys(ctx, 0);
+                } else {
+                    app.handle_conceal_keys(ctx, 0);
+                }
+                if extra_events.is_empty() {
+                    assert!(!ctx.input(|i| i.events.iter().any(|event| matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::Tab,
+                            ..
+                        }
+                    ))));
+                }
+            }
+            app.sync_conceal_preview_before_pipeline(ctx, egui::ViewportId::ROOT);
+            pipeline_active = app.conceal_preview_active;
+            let transform = DisplayedImageTransform::from_resolved_rect(
+                DisplayedImageTransformInput {
+                    page_idx: 0,
+                    viewport_rect: full_rect,
+                    source_size: egui::vec2(200.0, 200.0),
+                    texture_size: egui::vec2(200.0, 200.0),
+                    rotation: crate::rotation_db::Rotation::None,
+                    free_rotation_rad: 0.0,
+                    content_bbox: None,
+                    fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                        crate::settings::FullscreenFitMode::Page,
+                    ),
+                    fit_scale_limits: FullscreenFitScaleLimits::default(),
+                    pixels_per_point: 1.0,
+                    placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                    pixel_fit: RectPixelFit::Texels,
+                },
+                egui::Rect::from_min_size(egui::pos2(600.0, 100.0), egui::vec2(200.0, 200.0)),
+            )
+            .unwrap();
+            // Same suppression retirement as handle_fs_wheel_and_click, before canvas dispatch.
+            let _ =
+                app.fs_primary_suppression
+                    .apply(FullscreenPrimarySuppressionEvent::PointerFrame {
+                        released: ctx.input(|i| i.pointer.primary_released()),
+                    });
+            if app.erase_mode {
+                app.handle_erase_paint(ctx, &transform, Default::default());
+                app.draw_erase_overlay(_ui, ctx, &transform);
+            } else {
+                app.handle_conceal_paint(ctx, &transform, Default::default());
+                app.draw_conceal_panel(ctx, full_rect);
+            }
+        },
+    )
+    .drop_without_applying_deltas();
+    pipeline_active
+}
+
+#[test]
+fn conceal_tool_switch_by_key_releases_old_operation_before_eye_preview() {
+    conceal_tool_switch_releases_old_operation(false);
+}
+
+#[test]
+fn conceal_tool_switch_by_panel_releases_old_operation_before_eye_preview() {
+    conceal_tool_switch_releases_old_operation(true);
+}
+
+fn conceal_tool_switch_releases_old_operation(panel: bool) {
+    let _input = crate::key_input::lock_test_input();
+    // Brush, line, shape, move, freehand lasso, polygon, and resize.
+    for kind in 0..7 {
+        let (mut app, ctx) = fixture();
+        app.conceal_tool = match kind {
+            1 => ConcealTool::Line,
+            2 => ConcealTool::Rect,
+            4 => ConcealTool::Lasso,
+            5 => ConcealTool::Polygon,
+            _ => ConcealTool::Brush,
+        };
+        if kind == 3 || kind == 6 {
+            app.conceal_shapes.push(crate::mask_db::Shape::Rect {
+                center: (50.0, 50.0),
+                half_w: 20.0,
+                half_h: 20.0,
+                rotation_rad: 0.0,
+                op: crate::mask_db::ShapeOp::Add,
+            });
+            app.conceal_selected_shape = Some(0);
+        }
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        let start = if kind == 6 {
+            egui::pos2(670.0, 170.0)
+        } else {
+            egui::pos2(650.0, 150.0)
+        };
+        let end = egui::pos2(690.0, 190.0);
+        frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((start, Some(true))),
+            None,
+        );
+        frame(&mut app, &ctx, egui::Key::Tab, Some((end, None)), None);
+        match kind {
+            0 => assert!(app.conceal_last_paint_pos.is_some()),
+            1 => assert!(app.conceal_line_start.is_some()),
+            2 => assert!(app.conceal_shape_drag_start.is_some()),
+            3 | 6 => assert!(app.conceal_drag.is_some()),
+            _ => assert!(!app.conceal_lasso_points.is_empty()),
+        }
+        let mask = app.conceal_mask.clone();
+        let shapes = app.conceal_shapes.clone();
+        let selection = app.conceal_selected_shape;
+        let undo_len = app.conceal_undo_stack.len();
+        if panel {
+            // Exercise the panel handler's own cleanup, without a preceding canvas release
+            // clearing the old tool state on its behalf.
+            conceal_panel_pointer_frame(&mut app, &ctx, end, false);
+            let select = ctx
+                .data(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::unique("conceal_select_button_test_rect"))
+                })
+                .unwrap()
+                .center();
+            conceal_panel_pointer_frame(&mut app, &ctx, select, true);
+            conceal_panel_pointer_frame(&mut app, &ctx, select, false);
+        } else {
+            frame_with_extra_events(
+                &mut app,
+                &ctx,
+                egui::Key::Tab,
+                Some((end, None)),
+                None,
+                &[egui::Event::Key {
+                    key: egui::Key::S,
+                    physical_key: Some(egui::Key::S),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+        assert_eq!(
+            app.conceal_tool,
+            ConcealTool::Select,
+            "kind={kind} panel={panel}"
+        );
+        assert!(app.conceal_last_paint_pos.is_none());
+        assert!(app.conceal_line_start.is_none() && app.conceal_line_end.is_none());
+        assert!(app.conceal_shape_drag_start.is_none() && app.conceal_shape_drag_end.is_none());
+        assert!(app.conceal_drag.is_none());
+        assert!(app.conceal_lasso_points.is_empty());
+        assert_eq!(app.conceal_mask, mask, "keep already painted pixels");
+        assert_eq!(
+            app.conceal_shapes, shapes,
+            "keep edits, do not commit pending shapes"
+        );
+        assert_eq!(
+            app.conceal_selected_shape, selection,
+            "keep selection on entry to Select"
+        );
+        assert_eq!(app.conceal_undo_stack.len(), undo_len);
+        if !panel {
+            frame(
+                &mut app,
+                &ctx,
+                egui::Key::Tab,
+                Some((end, Some(false))),
+                None,
+            );
+        }
+        let eye = app.conceal_preview_button_rect.unwrap().center();
+        assert!(
+            frame(
+                &mut app,
+                &ctx,
+                egui::Key::Tab,
+                Some((eye, Some(true))),
+                None
+            ),
+            "eye pipeline blocked after switch: kind={kind} panel={panel}"
+        );
+        assert!(app.conceal_preview_active);
+        assert!(!frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((eye, Some(false))),
+            None
+        ));
+        assert!(!app.conceal_preview_active);
+    }
+}
+
+fn conceal_panel_pointer_frame(app: &mut App, ctx: &egui::Context, pos: egui::Pos2, pressed: bool) {
+    let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0));
+    ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(full_rect),
+            focused: true,
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |_ui| app.draw_conceal_panel(ctx, full_rect),
+    )
+    .drop_without_applying_deltas();
+}
+
+#[test]
+fn conceal_preview_eye_crossing_keeps_the_canvas_drag_owner() {
+    let _input = crate::key_input::lock_test_input();
+    for (tool, handle) in [
+        (ConcealTool::Brush, false),
+        (ConcealTool::Line, false),
+        (ConcealTool::VertLine, false),
+        (ConcealTool::HorizLine, false),
+        (ConcealTool::Rect, false),
+        (ConcealTool::Ellipse, false),
+        (ConcealTool::Lasso, false),
+        (ConcealTool::Select, false),
+        (ConcealTool::Brush, true),
+    ] {
+        let (mut app, ctx) = fixture();
+        app.conceal_tool = tool;
+        if tool == ConcealTool::Select || handle {
+            app.conceal_shapes.push(crate::mask_db::Shape::Rect {
+                center: (50.0, 50.0),
+                half_w: 20.0,
+                half_h: 20.0,
+                rotation_rad: 0.0,
+                op: crate::mask_db::ShapeOp::Add,
+            });
+            if handle {
+                app.conceal_selected_shape = Some(0);
+            }
+        }
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        let eye = app.conceal_preview_button_rect.unwrap().center();
+        let start = if handle {
+            egui::pos2(670.0, 170.0) // Selected rectangle's bottom-right handle.
+        } else {
+            egui::pos2(650.0, 150.0)
+        };
+        let end = egui::pos2(750.0, 250.0);
+        frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((start, Some(true))),
+            None,
+        );
+        for pos in [eye, end] {
+            assert!(
+                !frame(&mut app, &ctx, egui::Key::Tab, Some((pos, None)), None),
+                "pipeline preview stole {tool:?}"
+            );
+            assert!(!app.conceal_preview_active, "panel preview stole {tool:?}");
+            assert!(!app.fs_primary_suppression.is_active(), "{tool:?}");
+        }
+        if handle {
+            assert!(app.conceal_drag.is_some());
+            assert!(matches!(
+                app.conceal_shapes[0],
+                crate::mask_db::Shape::Rect {
+                    center: (90.0, 90.0),
+                    half_w: 60.0,
+                    half_h: 60.0,
+                    ..
+                }
+            ));
+        } else {
+            match tool {
+                ConcealTool::Brush => {
+                    assert_eq!(app.conceal_last_paint_pos, Some(end));
+                    assert!(app.conceal_mask.as_ref().unwrap()[150 * 200 + 150]);
+                }
+                ConcealTool::Line | ConcealTool::VertLine | ConcealTool::HorizLine => {
+                    assert_eq!(app.conceal_line_end, Some((150.0, 150.0)));
+                }
+                ConcealTool::Rect | ConcealTool::Ellipse => {
+                    assert_eq!(app.conceal_shape_drag_end, Some((150.0, 150.0)));
+                }
+                ConcealTool::Lasso => {
+                    assert_eq!(app.conceal_lasso_points.last(), Some(&(150.0, 150.0)));
+                }
+                ConcealTool::Select => assert!(matches!(
+                    app.conceal_shapes[0],
+                    crate::mask_db::Shape::Rect {
+                        center: (150.0, 150.0),
+                        ..
+                    }
+                )),
+                _ => unreachable!(),
+            }
+        }
+        frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((end, Some(false))),
+            None,
+        );
+        assert!(!app.conceal_preview_active);
+        assert!(app.conceal_last_paint_pos.is_none());
+        assert!(app.conceal_line_start.is_none());
+        assert!(app.conceal_shape_drag_start.is_none());
+        assert!(app.conceal_drag.is_none());
+        assert!(app.conceal_lasso_points.is_empty());
+    }
+}
+
+#[test]
+fn conceal_preview_eye_press_and_release_work_without_a_canvas_owner() {
+    let _input = crate::key_input::lock_test_input();
+    for polygon_waiting in [false, true] {
+        let (mut app, ctx) = fixture();
+        if polygon_waiting {
+            app.conceal_tool = ConcealTool::Polygon;
+            // Pending vertices span separate presses; they do not own this press.
+            app.conceal_lasso_points = vec![(10.0, 10.0), (30.0, 10.0)];
+        }
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        let eye = app.conceal_preview_button_rect.unwrap().center();
+        assert!(frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((eye, Some(true))),
+            None
+        ));
+        assert!(app.conceal_preview_active);
+        assert!(frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((eye, None)),
+            None
+        ));
+        assert!(!frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((eye, Some(false))),
+            None
+        ));
+        assert!(!app.conceal_preview_active);
+        assert!(!app.conceal_mask.as_ref().unwrap().iter().any(|p| *p));
+        if polygon_waiting {
+            assert_eq!(app.conceal_lasso_points, vec![(10.0, 10.0), (30.0, 10.0)]);
+        }
+    }
+}
+
+#[test]
+fn conceal_preview_hold_release_and_eye_share_preview_without_invalidating_cache() {
+    let _input = crate::key_input::lock_test_input();
+    let (mut app, ctx) = fixture();
+    let pixels = Arc::clone(&app.conceal_cache[&0].pixels);
+    let generation = app.conceal_generation;
+    key_level(SyntheticNavigationKey::Tab, true);
+    frame(&mut app, &ctx, egui::Key::Tab, None, None);
+    assert!(app.conceal_preview_active);
+    assert!(frame(&mut app, &ctx, egui::Key::Tab, None, None));
+    let eye = app.conceal_preview_button_rect.unwrap().center();
+    frame(
+        &mut app,
+        &ctx,
+        egui::Key::Tab,
+        Some((eye, Some(true))),
+        None,
+    );
+    key_level(SyntheticNavigationKey::Tab, false);
+    frame(&mut app, &ctx, egui::Key::Tab, Some((eye, None)), None);
+    assert!(app.conceal_preview_active, "eye holds after key release");
+    frame(
+        &mut app,
+        &ctx,
+        egui::Key::Tab,
+        Some((eye, Some(false))),
+        None,
+    );
+    assert!(!app.conceal_preview_active);
+    assert!(!frame(&mut app, &ctx, egui::Key::Tab, None, None));
+    assert_eq!(app.conceal_generation, generation);
+    assert!(Arc::ptr_eq(&pixels, &app.conceal_cache[&0].pixels));
+    key_level(SyntheticNavigationKey::Tab, true);
+    frame(&mut app, &ctx, egui::Key::Tab, None, None);
+    app.reset_conceal_mode();
+    assert_eq!(app.conceal_preview_hold, EditPreviewHoldState::Released);
+    assert!(!app.conceal_preview_active);
+}
+
+#[test]
+fn conceal_preview_hold_during_drawing_and_on_release_requires_a_new_press() {
+    let _input = crate::key_input::lock_test_input();
+    for kind in 0..5 {
+        let (mut app, ctx) = fixture();
+        match kind {
+            0 => app.conceal_last_paint_pos = Some(egui::pos2(700.0, 200.0)),
+            1 => app.conceal_line_start = Some((0.0, 0.0)),
+            2 => app.conceal_shape_drag_start = Some((0.0, 0.0)),
+            3 => app.conceal_lasso_points.push((0.0, 0.0)),
+            _ => {
+                app.conceal_drag = Some(crate::vector_edit::begin_drag(
+                    crate::vector_edit::HoverTarget::Body,
+                    0,
+                    crate::mask_db::Shape::Rect {
+                        center: (10.0, 10.0),
+                        half_w: 5.0,
+                        half_h: 5.0,
+                        rotation_rad: 0.0,
+                        op: crate::mask_db::ShapeOp::Add,
+                    },
+                    (0.0, 0.0),
+                ))
+            }
+        }
+        key_level(SyntheticNavigationKey::Tab, true);
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        assert_eq!(
+            app.conceal_preview_hold,
+            EditPreviewHoldState::BlockedUntilRelease
+        );
+        assert!(!app.conceal_preview_active, "kind={kind}");
+        app.conceal_last_paint_pos = None;
+        app.conceal_line_start = None;
+        app.conceal_shape_drag_start = None;
+        app.conceal_lasso_points.clear();
+        app.conceal_drag = None;
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        assert!(!app.conceal_preview_active);
+        key_level(SyntheticNavigationKey::Tab, false);
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        key_level(SyntheticNavigationKey::Tab, true);
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        assert!(app.conceal_preview_active);
+    }
+}
+
+#[test]
+fn conceal_preview_hold_blocks_brush_selection_and_shape_operations_until_pointer_release() {
+    let _input = crate::key_input::lock_test_input();
+    for tool in [
+        ConcealTool::Brush,
+        ConcealTool::Select,
+        ConcealTool::Rect,
+        ConcealTool::Lasso,
+        ConcealTool::Polygon,
+        ConcealTool::Bucket,
+    ] {
+        let (mut app, ctx) = fixture();
+        app.conceal_tool = tool;
+        if tool == ConcealTool::Select {
+            app.conceal_shapes.push(crate::mask_db::Shape::Rect {
+                center: (100.0, 100.0),
+                half_w: 30.0,
+                half_h: 30.0,
+                rotation_rad: 0.0,
+                op: crate::mask_db::ShapeOp::Add,
+            });
+        }
+        let shapes = app.conceal_shapes.clone();
+        key_level(SyntheticNavigationKey::Tab, true);
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        let pos = egui::pos2(700.0, 200.0);
+        frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((pos, Some(true))),
+            None,
+        );
+        assert!(app.fs_primary_suppression.is_active());
+        key_level(SyntheticNavigationKey::Tab, false);
+        frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((pos + egui::vec2(20.0, 0.0), None)),
+            None,
+        );
+        frame(&mut app, &ctx, egui::Key::Tab, Some((pos, None)), None);
+        assert!(!app.conceal_preview_active);
+        assert!(app.conceal_last_paint_pos.is_none(), "{tool:?}");
+        assert!(app.conceal_line_start.is_none());
+        assert!(app.conceal_shape_drag_start.is_none());
+        assert!(app.conceal_drag.is_none());
+        assert!(app.conceal_lasso_points.is_empty());
+        assert!(!app.conceal_mask.as_ref().unwrap().iter().any(|p| *p));
+        assert_eq!(app.conceal_shapes, shapes);
+        assert!(app.conceal_selected_shape.is_none());
+        frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((pos, Some(false))),
+            None,
+        );
+        app.conceal_tool = ConcealTool::Brush;
+        frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((pos, Some(true))),
+            None,
+        );
+        assert!(app.conceal_mask.as_ref().unwrap().iter().any(|p| *p));
+    }
+}
+
+#[test]
+fn conceal_preview_hold_simultaneous_brush_start_and_brush_release_keep_drawing_owner() {
+    let _input = crate::key_input::lock_test_input();
+    for on_release in [false, true] {
+        let (mut app, ctx) = fixture();
+        let pos = egui::pos2(700.0, 200.0);
+        if on_release {
+            frame(
+                &mut app,
+                &ctx,
+                egui::Key::Tab,
+                Some((pos, Some(true))),
+                None,
+            );
+            assert!(app.conceal_last_paint_pos.is_some());
+        }
+        key_level(SyntheticNavigationKey::Tab, true);
+        frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((pos, Some(!on_release))),
+            None,
+        );
+        assert_eq!(
+            app.conceal_preview_hold,
+            EditPreviewHoldState::BlockedUntilRelease
+        );
+        assert!(!app.conceal_preview_active);
+        if !on_release {
+            frame(
+                &mut app,
+                &ctx,
+                egui::Key::Tab,
+                Some((pos, Some(false))),
+                None,
+            );
+        }
+        assert!(app.conceal_last_paint_pos.is_none());
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        assert!(!app.conceal_preview_active);
+    }
+}
+
+#[test]
+fn conceal_preview_hold_rebinding_disable_and_keyboard_ownership() {
+    use crate::keyboard_input::{KeyboardOwner, TextInputPhase};
+    let _input = crate::key_input::lock_test_input();
+    let (mut app, ctx) = fixture();
+    // G is supported by synthetic input. Free its ordinary operation for this binding test.
+    app.keymap = crate::keymap::Keymap::from_ini_str(
+        "[Conceal]\nConcealPreviewHold = G\nConcealPixelGrid = none\n",
+    );
+    key_level(SyntheticNavigationKey::Tab, true);
+    frame(&mut app, &ctx, egui::Key::Tab, None, None);
+    assert!(!app.conceal_preview_active);
+    key_level(SyntheticNavigationKey::Tab, false);
+    key_level(SyntheticNavigationKey::G, true);
+    for owner in [
+        KeyboardOwner::Modal,
+        KeyboardOwner::TextInput {
+            viewport: egui::ViewportId::ROOT,
+            widget_id: egui::Id::unique("conceal-ime"),
+            phase: TextInputPhase::ImeComposing,
+        },
+    ] {
+        frame(&mut app, &ctx, egui::Key::G, None, Some(owner));
+        assert!(!app.conceal_preview_active);
+    }
+    frame(&mut app, &ctx, egui::Key::G, None, None);
+    assert!(app.conceal_preview_active);
+    app.keymap = crate::keymap::Keymap::from_ini_str(
+        "[Conceal]\nConcealPreviewHold = none\nConcealPixelGrid = none\n",
+    );
+    frame(&mut app, &ctx, egui::Key::G, None, None);
+    assert!(!app.conceal_preview_active);
+}
+
+fn set_erase_mode(app: &mut App) {
+    app.conceal_mode = false;
+    app.erase_mode = true;
+    app.erase_tool = crate::app::EraseTool::Brush;
+    app.erase_mask_size = [200, 200];
+    app.erase_mask = Some(vec![false; 200 * 200]);
+    app.erase_base_cache.insert(
+        0,
+        crate::app::EraseBaseSource::raster(Arc::clone(&app.conceal_base_cache[&0])),
+    );
+    app.ai_runtime_init =
+        crate::ai::runtime::AiRuntimeInitOwner::failed_for_test("preview routing");
+}
+
+#[test]
+fn edit_preview_hold_rejects_polygon_confirm_cancel_and_tool_switch_before_canvas() {
+    let _input = crate::key_input::lock_test_input();
+    for erase in [false, true] {
+        for finish_key in [egui::Key::Enter, egui::Key::Escape, egui::Key::B] {
+            let (mut app, ctx) = fixture();
+            let points = vec![(10.0, 10.0), (30.0, 10.0), (30.0, 30.0)];
+            if erase {
+                set_erase_mode(&mut app);
+                app.erase_tool = crate::app::EraseTool::Polygon;
+                app.erase_lasso_points = points;
+            } else {
+                app.conceal_tool = ConcealTool::Polygon;
+                app.conceal_lasso_points = points;
+            }
+            key_level(SyntheticNavigationKey::Tab, true);
+            frame_with_extra_events(
+                &mut app,
+                &ctx,
+                egui::Key::Tab,
+                None,
+                None,
+                &[egui::Event::Key {
+                    key: finish_key,
+                    physical_key: Some(finish_key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            let (hold, active, points) = if erase {
+                (
+                    app.erase_preview_hold,
+                    app.erase_preview_active,
+                    &app.erase_lasso_points,
+                )
+            } else {
+                (
+                    app.conceal_preview_hold,
+                    app.conceal_preview_active,
+                    &app.conceal_lasso_points,
+                )
+            };
+            assert!(
+                points.is_empty(),
+                "key handler finished the drawing: {finish_key:?}"
+            );
+            assert_eq!(
+                hold,
+                EditPreviewHoldState::BlockedUntilRelease,
+                "erase={erase} {finish_key:?}"
+            );
+            assert!(!active);
+            frame(&mut app, &ctx, egui::Key::Tab, None, None);
+            assert!(!app.erase_preview_active && !app.conceal_preview_active);
+        }
+    }
+}
+
+#[test]
+fn edit_preview_hold_press_on_panel_cannot_become_a_brush_drag_after_key_release() {
+    let _input = crate::key_input::lock_test_input();
+    for erase in [false, true] {
+        let (mut app, ctx) = fixture();
+        if erase {
+            set_erase_mode(&mut app);
+        }
+        key_level(SyntheticNavigationKey::Tab, true);
+        frame(&mut app, &ctx, egui::Key::Tab, None, None);
+        // The erase preview needs a nonempty mask and a retained result. Use the actual
+        // preview state here: this test targets pointer ownership, not MI-GAN submission.
+        if erase {
+            app.erase_preview_active = true;
+        }
+        let panel = egui::pos2(20.0, 700.0);
+        frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((panel, Some(true))),
+            None,
+        );
+        assert!(app.fs_primary_suppression.is_active(), "erase={erase}");
+        key_level(SyntheticNavigationKey::Tab, false);
+        frame(&mut app, &ctx, egui::Key::Tab, Some((panel, None)), None);
+        let canvas = egui::pos2(700.0, 200.0);
+        frame(&mut app, &ctx, egui::Key::Tab, Some((canvas, None)), None);
+        frame(&mut app, &ctx, egui::Key::Tab, Some((canvas, None)), None);
+        let mask = if erase {
+            &app.erase_mask
+        } else {
+            &app.conceal_mask
+        };
+        assert!(!mask.as_ref().unwrap().iter().any(|p| *p), "erase={erase}");
+        frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((canvas, Some(false))),
+            None,
+        );
+        frame(
+            &mut app,
+            &ctx,
+            egui::Key::Tab,
+            Some((canvas, Some(true))),
+            None,
+        );
+        let mask = if erase {
+            &app.erase_mask
+        } else {
+            &app.conceal_mask
+        };
+        assert!(mask.as_ref().unwrap().iter().any(|p| *p), "erase={erase}");
+    }
+}

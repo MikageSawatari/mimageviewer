@@ -9,6 +9,7 @@ pub enum KeyContext {
     Global,
     Grid,
     FsCommon,
+    FsPageOverview,
     Rating,
     FsImage,
     FsVideo,
@@ -26,6 +27,7 @@ impl KeyContext {
             KeyContext::Global => "Global",
             KeyContext::Grid => "Grid",
             KeyContext::FsCommon => "FsCommon",
+            KeyContext::FsPageOverview => "FsPageOverview",
             KeyContext::Rating => "Rating",
             KeyContext::FsImage => "FsImage",
             KeyContext::FsVideo => "FsVideo",
@@ -43,6 +45,7 @@ impl KeyContext {
             KeyContext::Global => "全体共通",
             KeyContext::Grid => "サムネイル一覧",
             KeyContext::FsCommon => "フルスクリーン共通",
+            KeyContext::FsPageOverview => "ページ一覧",
             KeyContext::Rating => "レーティング",
             KeyContext::FsImage => "画像フルスクリーン",
             KeyContext::FsVideo => "動画フルスクリーン",
@@ -61,6 +64,7 @@ impl KeyContext {
             KeyContext::Global,
             KeyContext::Grid,
             KeyContext::FsCommon,
+            KeyContext::FsPageOverview,
             KeyContext::Rating,
             KeyContext::FsImage,
             KeyContext::FsVideo,
@@ -172,11 +176,16 @@ impl ModKind {
             Some(Self::Alt)
         } else if value.eq_ignore_ascii_case("rightctrl")
             || value.eq_ignore_ascii_case("rightcontrol")
+            || value.eq_ignore_ascii_case(Self::RightCtrl.display_name())
         {
             Some(Self::RightCtrl)
-        } else if value.eq_ignore_ascii_case("rightshift") {
+        } else if value.eq_ignore_ascii_case("rightshift")
+            || value.eq_ignore_ascii_case(Self::RightShift.display_name())
+        {
             Some(Self::RightShift)
-        } else if value.eq_ignore_ascii_case("rightalt") {
+        } else if value.eq_ignore_ascii_case("rightalt")
+            || value.eq_ignore_ascii_case(Self::RightAlt.display_name())
+        {
             Some(Self::RightAlt)
         } else {
             None
@@ -1271,6 +1280,19 @@ impl Chord {
         )
     }
 
+    fn validate_for_action(self, action: KeyAction) -> Result<(), &'static str> {
+        if action.trigger() == KeyTrigger::KeyHold
+            && action.binding_policy() == BindingPolicy::FullChord
+        {
+            return if matches!(self, Self::Key { .. }) {
+                Ok(())
+            } else {
+                Err("KeyHold actions require a normal key")
+            };
+        }
+        self.validate_for_trigger(action.trigger())
+    }
+
     fn validate_for_trigger(self, trigger: KeyTrigger) -> Result<(), &'static str> {
         match trigger {
             KeyTrigger::Press if matches!(self, Self::Key { .. }) => Ok(()),
@@ -1302,6 +1324,21 @@ impl Chord {
         self.format_name(true)
     }
 
+    /// INI comment markers cannot be used as literal key names. Keep the
+    /// settings/JSON spelling intact and use the parsed KeySlot alias in INI.
+    fn ini_name(self) -> String {
+        let settings = self.settings_name();
+        if let Self::Key { key, .. } = self
+            && (settings.contains(';') || settings.contains('#'))
+        {
+            return match settings.rsplit_once('+') {
+                Some((modifiers, _)) => format!("{modifiers}+{key:?}"),
+                None => format!("{key:?}"),
+            };
+        }
+        settings
+    }
+
     fn format_name(self, settings: bool) -> String {
         let Self::Key {
             ctrl,
@@ -1321,11 +1358,12 @@ impl Chord {
             .to_string();
         };
         let question_mark = shift && key == KeyName::Slash;
+        let plus = !settings && shift && key == KeyName::Semicolon;
         let mut parts = Vec::new();
         if ctrl {
             parts.push("Ctrl".to_string());
         }
-        if shift && !question_mark {
+        if shift && !question_mark && !plus {
             parts.push("Shift".to_string());
         }
         if alt {
@@ -1333,6 +1371,10 @@ impl Chord {
         }
         if question_mark {
             parts.push("?".to_string());
+            return parts.join("+");
+        }
+        if plus {
+            parts.push("+".to_string());
             return parts.join("+");
         }
         parts.push(if settings {
@@ -1584,6 +1626,10 @@ pub enum KeyAction {
     GridDeselect,
     GridCutFiles,
     GridCopyFiles,
+    GridCopyPath,
+    GridCopyFileName,
+    GridCopyImage,
+    GridCopyEditedImage,
     GridOrganizeFiles,
     GridToggleCheck,
     GridDelete,
@@ -1658,6 +1704,14 @@ pub enum KeyAction {
     GridDeleteEraseMask,
     GridDeleteConcealMask,
     FsToggleMetadata,
+    FsPageOverviewToggle,
+    FsPageOverviewConfirm,
+    FsPageOverviewPagePrev,
+    FsPageOverviewPageNext,
+    FsPageOverviewFirst,
+    FsPageOverviewLast,
+    FsPageOverviewColumnsLess,
+    FsPageOverviewColumnsMore,
     FsClose,
     FsBackToList,
     FsToggleWindowMode,
@@ -1665,6 +1719,8 @@ pub enum KeyAction {
     FsJumpLast,
     FsCtrlNavPrev,
     FsCtrlNavNext,
+    FsListOrderPrev,
+    FsListOrderNext,
     FsSiblingPrev,
     FsSiblingNext,
     FsPagePrev,
@@ -1714,6 +1770,11 @@ pub enum KeyAction {
     FsAddToActiveBook,
     FsAddToCollectionTarget,
     FsExport,
+    FsCopyEditedImage,
+    FsCopyFiles,
+    FsCopyPath,
+    FsCopyFileName,
+    FsCopyImage,
     FsCompareToggle,
     FsCompareCycle,
     FsCompareWipe,
@@ -1722,6 +1783,7 @@ pub enum KeyAction {
     FsRotateCcw,
     FsImageAnalysis,
     FsZoomMode,
+    FsScrubZoomHold,
     FsPanorama,
     FsPanoramaProjection,
     FsNavigatorToggle,
@@ -1751,6 +1813,8 @@ pub enum KeyAction {
     FsReadingFlowCycle,
     FsReadingDirectionToggle,
     FsFitModeCycle,
+    FsZoomIn,
+    FsZoomOut,
     FsAiModelNext,
     FsAiModelPrev,
     FsAiModelReset,
@@ -1904,6 +1968,8 @@ pub enum KeyAction {
     ErasePaintMode,
     EraseEraseMode,
     EraseSpacePan,
+    EraseScrubZoomHold,
+    ErasePreviewHold,
     ConcealExit,
     ConcealConfirmPolygon,
     ConcealRedo,
@@ -1928,14 +1994,18 @@ pub enum KeyAction {
     ConcealToolRect,
     ConcealToolEllipse,
     ConcealSpacePan,
+    ConcealScrubZoomHold,
+    ConcealPreviewHold,
     CropForceCreateHold,
     CropSpacePan,
+    CropScrubZoomHold,
     CropExecute,
     SnsSplitExecute,
     TextConfirm,
     TextRedo,
     TextUndo,
     TextSpacePan,
+    TextScrubZoomHold,
     LaShowSource,
     LaShowMask,
     LaPaintAdd,
@@ -1955,6 +2025,7 @@ pub enum KeyAction {
     LaConfirmPolygon,
     LaDeleteShape,
     LaSpacePan,
+    LaScrubZoomHold,
 }
 
 /// Video adjustment-slot load actions in slot-index order.
@@ -2164,6 +2235,10 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridDeselect,
     KeyAction::GridCutFiles,
     KeyAction::GridCopyFiles,
+    KeyAction::GridCopyPath,
+    KeyAction::GridCopyFileName,
+    KeyAction::GridCopyImage,
+    KeyAction::GridCopyEditedImage,
     KeyAction::GridOrganizeFiles,
     KeyAction::GridToggleCheck,
     KeyAction::GridDelete,
@@ -2238,6 +2313,14 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridDeleteEraseMask,
     KeyAction::GridDeleteConcealMask,
     KeyAction::FsToggleMetadata,
+    KeyAction::FsPageOverviewToggle,
+    KeyAction::FsPageOverviewConfirm,
+    KeyAction::FsPageOverviewPagePrev,
+    KeyAction::FsPageOverviewPageNext,
+    KeyAction::FsPageOverviewFirst,
+    KeyAction::FsPageOverviewLast,
+    KeyAction::FsPageOverviewColumnsLess,
+    KeyAction::FsPageOverviewColumnsMore,
     KeyAction::FsClose,
     KeyAction::FsBackToList,
     KeyAction::FsToggleWindowMode,
@@ -2245,6 +2328,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsJumpLast,
     KeyAction::FsCtrlNavPrev,
     KeyAction::FsCtrlNavNext,
+    KeyAction::FsListOrderPrev,
+    KeyAction::FsListOrderNext,
     KeyAction::FsSiblingPrev,
     KeyAction::FsSiblingNext,
     KeyAction::FsPagePrev,
@@ -2294,6 +2379,11 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsAddToActiveBook,
     KeyAction::FsAddToCollectionTarget,
     KeyAction::FsExport,
+    KeyAction::FsCopyEditedImage,
+    KeyAction::FsCopyFiles,
+    KeyAction::FsCopyPath,
+    KeyAction::FsCopyFileName,
+    KeyAction::FsCopyImage,
     KeyAction::FsCompareToggle,
     KeyAction::FsCompareCycle,
     KeyAction::FsCompareWipe,
@@ -2302,6 +2392,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsRotateCcw,
     KeyAction::FsImageAnalysis,
     KeyAction::FsZoomMode,
+    KeyAction::FsScrubZoomHold,
     KeyAction::FsPanorama,
     KeyAction::FsPanoramaProjection,
     KeyAction::FsNavigatorToggle,
@@ -2331,6 +2422,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsReadingFlowCycle,
     KeyAction::FsReadingDirectionToggle,
     KeyAction::FsFitModeCycle,
+    KeyAction::FsZoomIn,
+    KeyAction::FsZoomOut,
     KeyAction::FsAiModelNext,
     KeyAction::FsAiModelPrev,
     KeyAction::FsAiModelReset,
@@ -2482,6 +2575,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ErasePaintMode,
     KeyAction::EraseEraseMode,
     KeyAction::EraseSpacePan,
+    KeyAction::EraseScrubZoomHold,
+    KeyAction::ErasePreviewHold,
     KeyAction::ConcealExit,
     KeyAction::ConcealConfirmPolygon,
     KeyAction::ConcealRedo,
@@ -2506,14 +2601,18 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ConcealToolRect,
     KeyAction::ConcealToolEllipse,
     KeyAction::ConcealSpacePan,
+    KeyAction::ConcealScrubZoomHold,
+    KeyAction::ConcealPreviewHold,
     KeyAction::CropForceCreateHold,
     KeyAction::CropSpacePan,
+    KeyAction::CropScrubZoomHold,
     KeyAction::CropExecute,
     KeyAction::SnsSplitExecute,
     KeyAction::TextConfirm,
     KeyAction::TextRedo,
     KeyAction::TextUndo,
     KeyAction::TextSpacePan,
+    KeyAction::TextScrubZoomHold,
     KeyAction::LaShowSource,
     KeyAction::LaShowMask,
     KeyAction::LaPaintAdd,
@@ -2533,6 +2632,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::LaConfirmPolygon,
     KeyAction::LaDeleteShape,
     KeyAction::LaSpacePan,
+    KeyAction::LaScrubZoomHold,
 ];
 // Keep this list in sync with `KeyAction`. The keymap tests compare the enum
 // inventory and this array so newly added actions cannot silently miss ini generation.
@@ -2551,7 +2651,7 @@ impl CommandSpec {
             action,
             scope: action.context(),
             trigger: action.trigger(),
-            binding_policy: BindingPolicy::for_trigger(action.trigger()),
+            binding_policy: action.binding_policy(),
         }
     }
 
@@ -4221,6 +4321,10 @@ impl KeyAction {
             GridDeselect => "GridDeselect",
             GridCutFiles => "GridCutFiles",
             GridCopyFiles => "GridCopyFiles",
+            GridCopyPath => "GridCopyPath",
+            GridCopyFileName => "GridCopyFileName",
+            GridCopyImage => "GridCopyImage",
+            GridCopyEditedImage => "GridCopyEditedImage",
             GridOrganizeFiles => "GridOrganizeFiles",
             GridToggleCheck => "GridToggleCheck",
             GridDelete => "GridDelete",
@@ -4295,6 +4399,14 @@ impl KeyAction {
             GridDeleteEraseMask => "GridDeleteEraseMask",
             GridDeleteConcealMask => "GridDeleteConcealMask",
             FsToggleMetadata => "FsToggleMetadata",
+            FsPageOverviewToggle => "FsPageOverviewToggle",
+            FsPageOverviewConfirm => "FsPageOverviewConfirm",
+            FsPageOverviewPagePrev => "FsPageOverviewPagePrev",
+            FsPageOverviewPageNext => "FsPageOverviewPageNext",
+            FsPageOverviewFirst => "FsPageOverviewFirst",
+            FsPageOverviewLast => "FsPageOverviewLast",
+            FsPageOverviewColumnsLess => "FsPageOverviewColumnsLess",
+            FsPageOverviewColumnsMore => "FsPageOverviewColumnsMore",
             FsClose => "FsClose",
             FsBackToList => "FsBackToList",
             FsToggleWindowMode => "FsToggleWindowMode",
@@ -4302,6 +4414,8 @@ impl KeyAction {
             FsJumpLast => "FsJumpLast",
             FsCtrlNavPrev => "FsCtrlNavPrev",
             FsCtrlNavNext => "FsCtrlNavNext",
+            FsListOrderPrev => "FsListOrderPrev",
+            FsListOrderNext => "FsListOrderNext",
             FsSiblingPrev => "FsSiblingPrev",
             FsSiblingNext => "FsSiblingNext",
             FsPagePrev => "FsPagePrev",
@@ -4351,6 +4465,11 @@ impl KeyAction {
             FsAddToActiveBook => "FsAddToActiveBook",
             FsAddToCollectionTarget => "FsAddToCollectionTarget",
             FsExport => "FsExport",
+            FsCopyEditedImage => "FsCopyEditedImage",
+            FsCopyFiles => "FsCopyFiles",
+            FsCopyPath => "FsCopyPath",
+            FsCopyFileName => "FsCopyFileName",
+            FsCopyImage => "FsCopyImage",
             FsCompareToggle => "FsCompareToggle",
             FsCompareCycle => "FsCompareCycle",
             FsCompareWipe => "FsCompareWipe",
@@ -4359,6 +4478,7 @@ impl KeyAction {
             FsRotateCcw => "FsRotateCcw",
             FsImageAnalysis => "FsImageAnalysis",
             FsZoomMode => "FsZoomMode",
+            FsScrubZoomHold => "FsScrubZoomHold",
             FsPanorama => "FsPanorama",
             FsPanoramaProjection => "FsPanoramaProjection",
             FsNavigatorToggle => "FsNavigatorToggle",
@@ -4388,6 +4508,8 @@ impl KeyAction {
             FsReadingFlowCycle => "FsReadingFlowCycle",
             FsReadingDirectionToggle => "FsReadingDirectionToggle",
             FsFitModeCycle => "FsFitModeCycle",
+            FsZoomIn => "FsZoomIn",
+            FsZoomOut => "FsZoomOut",
             FsAiModelNext => "FsAiModelNext",
             FsAiModelPrev => "FsAiModelPrev",
             FsAiModelReset => "FsAiModelReset",
@@ -4539,6 +4661,9 @@ impl KeyAction {
             ErasePaintMode => "ErasePaintMode",
             EraseEraseMode => "EraseEraseMode",
             EraseSpacePan => "EraseSpacePan",
+            EraseScrubZoomHold => "EraseScrubZoomHold",
+            ErasePreviewHold => "ErasePreviewHold",
+            ConcealPreviewHold => "ConcealPreviewHold",
             ConcealExit => "ConcealExit",
             ConcealConfirmPolygon => "ConcealConfirmPolygon",
             ConcealRedo => "ConcealRedo",
@@ -4563,14 +4688,17 @@ impl KeyAction {
             ConcealToolRect => "ConcealToolRect",
             ConcealToolEllipse => "ConcealToolEllipse",
             ConcealSpacePan => "ConcealSpacePan",
+            ConcealScrubZoomHold => "ConcealScrubZoomHold",
             CropForceCreateHold => "CropForceCreateHold",
             CropSpacePan => "CropSpacePan",
+            CropScrubZoomHold => "CropScrubZoomHold",
             CropExecute => "CropExecute",
             SnsSplitExecute => "SnsSplitExecute",
             TextConfirm => "TextConfirm",
             TextRedo => "TextRedo",
             TextUndo => "TextUndo",
             TextSpacePan => "TextSpacePan",
+            TextScrubZoomHold => "TextScrubZoomHold",
             LaShowSource => "LaShowSource",
             LaShowMask => "LaShowMask",
             LaPaintAdd => "LaPaintAdd",
@@ -4590,6 +4718,7 @@ impl KeyAction {
             LaConfirmPolygon => "LaConfirmPolygon",
             LaDeleteShape => "LaDeleteShape",
             LaSpacePan => "LaSpacePan",
+            LaScrubZoomHold => "LaScrubZoomHold",
         }
     }
 
@@ -4958,6 +5087,10 @@ impl KeyAction {
             GridDeselect => "チェックをすべて解除する",
             GridCutFiles => "選択中またはチェック済みの実ファイル/実フォルダを切り取る",
             GridCopyFiles => "選択中またはチェック済みの実ファイル/実フォルダをコピーする",
+            GridCopyPath => "パスをコピー",
+            GridCopyFileName => "ファイル名をコピー",
+            GridCopyImage => "画像をクリップボードにコピー",
+            GridCopyEditedImage => "編集を反映した画像をコピー",
             GridOrganizeFiles => "選択中またはチェック済みの実ファイル/実フォルダの整理先を選ぶ",
             GridToggleCheck => "選択中の項目のチェックを切り替える",
             GridDelete => {
@@ -5040,6 +5173,14 @@ impl KeyAction {
             GridDeleteEraseMask => "選択中またはチェック済み画像の消しゴムマスクを削除する",
             GridDeleteConcealMask => "選択中またはチェック済み画像の隠蔽マスクを削除する",
             FsToggleMetadata => "左右パネルの表示モードを切り替える",
+            FsPageOverviewToggle => "ページ一覧の表示を切り替える",
+            FsPageOverviewConfirm => "ページ一覧で選択したページへ移動する",
+            FsPageOverviewPagePrev => "ページ一覧を前の画面へ送る",
+            FsPageOverviewPageNext => "ページ一覧を次の画面へ送る",
+            FsPageOverviewFirst => "ページ一覧の先頭へ移動する",
+            FsPageOverviewLast => "ページ一覧の末尾へ移動する",
+            FsPageOverviewColumnsLess => "ページ一覧の列数を減らす",
+            FsPageOverviewColumnsMore => "ページ一覧の列数を増やす",
             FsClose => "画像フルスクリーンを閉じる",
             FsBackToList => "フルスクリーンを閉じて一覧へ戻る",
             FsToggleWindowMode => "ウィンドウ表示と全画面表示を切り替える",
@@ -5047,6 +5188,8 @@ impl KeyAction {
             FsJumpLast => "末尾の項目へ移動する",
             FsCtrlNavPrev => "前のフォルダまたは検索結果へ移動する",
             FsCtrlNavNext => "次のフォルダまたは検索結果へ移動する",
+            FsListOrderPrev => "一覧の表示順で前の本を開く",
+            FsListOrderNext => "一覧の表示順で次の本を開く",
             FsSiblingPrev => "前の兄弟フォルダへ移動する",
             FsSiblingNext => "次の兄弟フォルダへ移動する",
             FsPagePrev => "前のページへ移動する",
@@ -5096,6 +5239,11 @@ impl KeyAction {
             FsAddToActiveBook => "現在のページを追加先の本へ追加する",
             FsAddToCollectionTarget => "現在の実画像を追加先のコレクションへ追加する",
             FsExport => "現在の表示結果を別ファイルへ書き出す",
+            FsCopyEditedImage => "編集を反映した画像をコピー",
+            FsCopyFiles => "表示中の実ファイルをコピーする",
+            FsCopyPath => "パスをコピー",
+            FsCopyFileName => "ファイル名をコピー",
+            FsCopyImage => "画像をクリップボードにコピー",
             FsCompareToggle => "現在の画像を比較スロットに固定または解除する",
             FsCompareCycle => "比較スロットのピン画像と現在画像を切り替えて表示する",
             FsCompareWipe => "ワイプ比較を切り替える",
@@ -5103,6 +5251,7 @@ impl KeyAction {
             FsRotateCw => "現在の画像を右に90度回転する",
             FsRotateCcw => "現在の画像を左に90度回転する",
             FsImageAnalysis => "画像分析モードを開く",
+            FsScrubZoomHold => "押しながら左右ドラッグで拡大・縮小する",
             FsZoomMode => "全画面ズームモード (押している間ズーム範囲を指定)",
             FsPanorama => "360度表示または通常動画の拡大表示を切り替える",
             FsPanoramaProjection => "360度パノラマの投影方式を切り替える",
@@ -5133,6 +5282,8 @@ impl KeyAction {
             FsReadingFlowCycle => "ページ単位/縦連結/横連結を切り替える",
             FsReadingDirectionToggle => "横方向の読み進み方向を切り替える",
             FsFitModeCycle => "ズーム/フィット方式を切り替える",
+            FsZoomIn => "画像を拡大する",
+            FsZoomOut => "画像を縮小する",
             FsAiModelNext => "AIモデルを次へ切り替える",
             FsAiModelPrev => "AIモデルを前へ切り替える",
             FsAiModelReset => "AIモデルを標準に戻す",
@@ -5291,7 +5442,10 @@ impl KeyAction {
             EraseToolEllipse => "楕円ツールに切り替える",
             ErasePaintMode => "描画モードに切り替える",
             EraseEraseMode => "消去モードに切り替える",
+            EraseScrubZoomHold => "押しながら左右ドラッグで拡大・縮小する",
             EraseSpacePan => "押している間だけ画像をパン操作する",
+            ErasePreviewHold => "押している間だけ消しゴムの結果をプレビューする",
+            ConcealPreviewHold => "押している間だけ隠蔽加工の結果をプレビューする",
             ConcealExit => "隠蔽加工モードを終了する",
             ConcealConfirmPolygon => "隠蔽加工の多角形を確定する",
             ConcealRedo => "隠蔽加工編集をやり直す",
@@ -5315,14 +5469,17 @@ impl KeyAction {
             ConcealToolHLine => "横線ツールに切り替える",
             ConcealToolRect => "矩形ツールに切り替える",
             ConcealToolEllipse => "楕円ツールに切り替える",
+            ConcealScrubZoomHold => "押しながら左右ドラッグで拡大・縮小する",
             ConcealSpacePan => "押している間だけ画像をパン操作する",
             CropForceCreateHold => "押している間、ドラッグで新しい切り取り枠を作る",
+            CropScrubZoomHold => "押しながら左右ドラッグで拡大・縮小する",
             CropSpacePan => "押している間だけ画像をパン操作する",
             CropExecute => "切り取りを実行する",
             SnsSplitExecute => "SNS 分割を実行する",
             TextConfirm => "テキスト注釈モードを確定または終了する",
             TextRedo => "テキスト注釈編集をやり直す",
             TextUndo => "テキスト注釈編集を元に戻す",
+            TextScrubZoomHold => "押しながら左右ドラッグで拡大・縮小する",
             TextSpacePan => "押している間だけ画像をパン操作する",
             LaShowSource => "元画像表示を切り替える",
             LaShowMask => "マスク表示を切り替える",
@@ -5342,6 +5499,7 @@ impl KeyAction {
             LaToolEllipse => "楕円ツールに切り替える",
             LaConfirmPolygon => "補正レイヤーの多角形マスクを確定する",
             LaDeleteShape => "選択中の補正図形を削除する",
+            LaScrubZoomHold => "押しながら左右ドラッグで拡大・縮小する",
             LaSpacePan => "押している間だけ画像をパン操作する",
         }
     }
@@ -5349,6 +5507,12 @@ impl KeyAction {
     pub fn context(self) -> KeyContext {
         use KeyAction::*;
         match self {
+            FsScrubZoomHold => KeyContext::FsImage,
+            EraseScrubZoomHold => KeyContext::Erase,
+            ConcealScrubZoomHold => KeyContext::Conceal,
+            CropScrubZoomHold => KeyContext::Crop,
+            TextScrubZoomHold => KeyContext::Text,
+            LaScrubZoomHold => KeyContext::LocalAdjust,
             GlobalLocalSearch
             | GlobalFavSearch
             | GlobalMetadataSearch
@@ -5529,6 +5693,10 @@ impl KeyAction {
             | GridDeselect
             | GridCutFiles
             | GridCopyFiles
+            | GridCopyPath
+            | GridCopyFileName
+            | GridCopyImage
+            | GridCopyEditedImage
             | GridOrganizeFiles
             | GridToggleCheck
             | GridDelete
@@ -5603,8 +5771,17 @@ impl KeyAction {
             | GridDeleteEraseMask
             | GridDeleteConcealMask => KeyContext::Grid,
             FsToggleMetadata | FsToggleWindowMode | FsBackToList | FsJumpFirst | FsJumpLast
-            | FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext | FsPanorama
-            | FsPanoramaProjection => KeyContext::FsCommon,
+            | FsCtrlNavPrev | FsCtrlNavNext | FsListOrderPrev | FsListOrderNext | FsSiblingPrev
+            | FsSiblingNext | FsPanorama | FsPanoramaProjection | FsPageOverviewToggle => {
+                KeyContext::FsCommon
+            }
+            FsPageOverviewConfirm
+            | FsPageOverviewPagePrev
+            | FsPageOverviewPageNext
+            | FsPageOverviewFirst
+            | FsPageOverviewLast
+            | FsPageOverviewColumnsLess
+            | FsPageOverviewColumnsMore => KeyContext::FsPageOverview,
             RatingItem1
             | RatingItem2
             | RatingItem3
@@ -5653,6 +5830,11 @@ impl KeyAction {
             | FsAddToActiveBook
             | FsAddToCollectionTarget
             | FsExport
+            | FsCopyEditedImage
+            | FsCopyFiles
+            | FsCopyPath
+            | FsCopyFileName
+            | FsCopyImage
             | FsCompareToggle
             | FsCompareCycle
             | FsCompareWipe
@@ -5688,6 +5870,8 @@ impl KeyAction {
             | FsReadingFlowCycle
             | FsReadingDirectionToggle
             | FsFitModeCycle
+            | FsZoomIn
+            | FsZoomOut
             | FsAiModelNext
             | FsAiModelPrev
             | FsAiModelReset
@@ -5825,7 +6009,7 @@ impl KeyAction {
             | EraseToolSelect | EraseToolBrush | EraseToolBucket | EraseToolLasso
             | EraseToolPolygon | EraseToolVLine | EraseToolHLine | EraseToolLine
             | EraseToolRect | EraseToolEllipse | ErasePaintMode | EraseEraseMode
-            | EraseSpacePan => KeyContext::Erase,
+            | EraseSpacePan | ErasePreviewHold => KeyContext::Erase,
             ConcealExit
             | ConcealConfirmPolygon
             | ConcealRedo
@@ -5849,7 +6033,8 @@ impl KeyAction {
             | ConcealToolHLine
             | ConcealToolRect
             | ConcealToolEllipse
-            | ConcealSpacePan => KeyContext::Conceal,
+            | ConcealSpacePan
+            | ConcealPreviewHold => KeyContext::Conceal,
             CropExecute | CropForceCreateHold | CropSpacePan => KeyContext::Crop,
             SnsSplitExecute => KeyContext::SnsSplit,
             TextConfirm | TextRedo | TextUndo | TextSpacePan => KeyContext::Text,
@@ -5860,14 +6045,25 @@ impl KeyAction {
         }
     }
 
+    pub fn binding_policy(self) -> BindingPolicy {
+        use KeyAction::*;
+        match self {
+            FsScrubZoomHold | EraseScrubZoomHold | ConcealScrubZoomHold | CropScrubZoomHold
+            | TextScrubZoomHold | LaScrubZoomHold => BindingPolicy::FullChord,
+            _ => BindingPolicy::for_trigger(self.trigger()),
+        }
+    }
+
     pub fn trigger(self) -> KeyTrigger {
         use KeyAction::*;
         match self {
+            FsScrubZoomHold | EraseScrubZoomHold | ConcealScrubZoomHold | CropScrubZoomHold
+            | TextScrubZoomHold | LaScrubZoomHold => KeyTrigger::KeyHold,
             FsNavigatorHold | FsLoupeHold | FsOriginalPreviewHold | CropForceCreateHold => {
                 KeyTrigger::ModifierHold
             }
-            EraseSpacePan | ConcealSpacePan | CropSpacePan | TextSpacePan | LaSpacePan
-            | FsZoomMode => KeyTrigger::KeyHold,
+            EraseSpacePan | ErasePreviewHold | ConcealSpacePan | ConcealPreviewHold
+            | CropSpacePan | TextSpacePan | LaSpacePan | FsZoomMode => KeyTrigger::KeyHold,
             GlobalLocalSearch
             | GlobalFavSearch
             | GlobalMetadataSearch
@@ -6048,6 +6244,10 @@ impl KeyAction {
             | GridDeselect
             | GridCutFiles
             | GridCopyFiles
+            | GridCopyPath
+            | GridCopyFileName
+            | GridCopyImage
+            | GridCopyEditedImage
             | GridOrganizeFiles
             | GridToggleCheck
             | GridDelete
@@ -6122,6 +6322,14 @@ impl KeyAction {
             | GridDeleteEraseMask
             | GridDeleteConcealMask
             | FsToggleMetadata
+            | FsPageOverviewToggle
+            | FsPageOverviewConfirm
+            | FsPageOverviewPagePrev
+            | FsPageOverviewPageNext
+            | FsPageOverviewFirst
+            | FsPageOverviewLast
+            | FsPageOverviewColumnsLess
+            | FsPageOverviewColumnsMore
             | FsClose
             | FsBackToList
             | FsToggleWindowMode
@@ -6129,6 +6337,8 @@ impl KeyAction {
             | FsJumpLast
             | FsCtrlNavPrev
             | FsCtrlNavNext
+            | FsListOrderPrev
+            | FsListOrderNext
             | FsSiblingPrev
             | FsSiblingNext
             | FsPagePrev
@@ -6178,6 +6388,11 @@ impl KeyAction {
             | FsAddToActiveBook
             | FsAddToCollectionTarget
             | FsExport
+            | FsCopyEditedImage
+            | FsCopyFiles
+            | FsCopyPath
+            | FsCopyFileName
+            | FsCopyImage
             | FsCompareToggle
             | FsCompareCycle
             | FsCompareWipe
@@ -6211,6 +6426,8 @@ impl KeyAction {
             | FsReadingFlowCycle
             | FsReadingDirectionToggle
             | FsFitModeCycle
+            | FsZoomIn
+            | FsZoomOut
             | FsAiModelNext
             | FsAiModelPrev
             | FsAiModelReset
@@ -6411,14 +6628,13 @@ impl KeyAction {
     }
 
     /// Actions whose repeated physical presses are safe and meaningful as
-    /// cumulative steps opt in here. Toggles, dialogs, destructive operations,
+    /// steps opt in here. Toggles, dialogs, destructive operations,
     /// and other one-shot commands remain single-dispatch by default.
     pub fn press_multiplicity(self) -> PressMultiplicity {
         use KeyAction::*;
         match self {
-            FsCtrlNavPrev | FsCtrlNavNext | FsSiblingPrev | FsSiblingNext => {
-                PressMultiplicity::EachPhysicalPress
-            }
+            FsCtrlNavPrev | FsCtrlNavNext | FsListOrderPrev | FsListOrderNext | FsSiblingPrev
+            | FsSiblingNext => PressMultiplicity::EachPhysicalPress,
             _ => PressMultiplicity::SinglePerFrame,
         }
     }
@@ -6610,6 +6826,10 @@ impl KeyAction {
             GridDeselect => ChordList::two(Chord::ctrl(D), Chord::ctrl_shift(A)),
             GridCutFiles => ChordList::one(Chord::ctrl(X)),
             GridCopyFiles => ChordList::one(Chord::ctrl(C)),
+            GridCopyPath => ChordList::EMPTY,
+            GridCopyFileName => ChordList::EMPTY,
+            GridCopyImage => ChordList::EMPTY,
+            GridCopyEditedImage => ChordList::EMPTY,
             GridToggleCheck => ChordList::one(Chord::key(Space)),
             GridDelete => ChordList::one(Chord::key(Delete)),
             GridRename | GridReload | GridOrganizeFiles => ChordList::EMPTY,
@@ -6676,6 +6896,14 @@ impl KeyAction {
             GridDeleteEraseMask => ChordList::two(Chord::shift(F7), Chord::shift(F8)),
             GridDeleteConcealMask => ChordList::two(Chord::shift(F9), Chord::shift(F10)),
             FsToggleMetadata => ChordList::two(Chord::key(I), Chord::key(Tab)),
+            FsPageOverviewToggle => ChordList::one(Chord::key(O)),
+            FsPageOverviewConfirm => ChordList::one(Chord::key(Enter)),
+            FsPageOverviewPagePrev => ChordList::one(Chord::key(PageUp)),
+            FsPageOverviewPageNext => ChordList::one(Chord::key(PageDown)),
+            FsPageOverviewFirst => ChordList::one(Chord::key(Home)),
+            FsPageOverviewLast => ChordList::one(Chord::key(End)),
+            FsPageOverviewColumnsLess => ChordList::EMPTY,
+            FsPageOverviewColumnsMore => ChordList::EMPTY,
             FsClose => ChordList::one(Chord::key(Enter)),
             FsBackToList => ChordList::one(Chord::key(Backspace)),
             FsToggleWindowMode => ChordList::one(Chord::key(F11)),
@@ -6683,6 +6911,8 @@ impl KeyAction {
             FsJumpLast => ChordList::one(Chord::key(End)),
             FsCtrlNavPrev => ChordList::one(Chord::ctrl(Up)),
             FsCtrlNavNext => ChordList::one(Chord::ctrl(Down)),
+            FsListOrderPrev => ChordList::one(Chord::ctrl_shift(Up)),
+            FsListOrderNext => ChordList::one(Chord::ctrl_shift(Down)),
             FsSiblingPrev => ChordList::one(Chord::ctrl(PageUp)),
             FsSiblingNext => ChordList::one(Chord::ctrl(PageDown)),
             FsPagePrev | FsPageNext => ChordList::EMPTY,
@@ -6727,6 +6957,11 @@ impl KeyAction {
             FsAddToActiveBook => ChordList::one(Chord::ctrl(B)),
             FsAddToCollectionTarget => ChordList::EMPTY,
             FsExport => ChordList::one(Chord::ctrl(E)),
+            FsCopyEditedImage => ChordList::EMPTY,
+            FsCopyFiles => ChordList::EMPTY,
+            FsCopyPath => ChordList::EMPTY,
+            FsCopyFileName => ChordList::EMPTY,
+            FsCopyImage => ChordList::EMPTY,
             FsCompareToggle => ChordList::one(Chord::key(X)),
             FsCompareCycle => ChordList::one(Chord::key(C)),
             FsCompareWipe => ChordList::one(Chord::shift(C)),
@@ -6737,6 +6972,7 @@ impl KeyAction {
             // Shift+Z へ移動・アクション名も FsImageAnalysis へ改名した (v2.0.0、旧 `FsAnalysis`
             // のカスタム割当は未知アクションとして無視され、新既定へ移行する)。
             FsImageAnalysis => ChordList::one(Chord::shift(Z)),
+            FsScrubZoomHold => ChordList::one(Chord::ctrl(Space)),
             FsZoomMode => ChordList::one(Chord::key(Z)),
             FsPanorama => ChordList::one(Chord::key(V)),
             FsPanoramaProjection => ChordList::one(Chord::shift(V)),
@@ -6766,6 +7002,8 @@ impl KeyAction {
             FsReadingFlowCycle => digit_pair(Num6, Numpad6),
             FsReadingDirectionToggle => digit_pair(Num7, Numpad7),
             FsFitModeCycle => digit_pair(Num0, Numpad0),
+            FsZoomIn => ChordList::two(Chord::key(Period), Chord::key(NumpadAdd)),
+            FsZoomOut => ChordList::two(Chord::key(Comma), Chord::key(NumpadSubtract)),
             FsAiModelNext => ChordList::one(Chord::key(U)),
             FsAiModelPrev => ChordList::one(Chord::shift(U)),
             FsAiModelReset => ChordList::one(Chord::alt(U)),
@@ -6918,7 +7156,9 @@ impl KeyAction {
             EraseToolEllipse => ChordList::one(Chord::key(O)),
             ErasePaintMode => ChordList::one(Chord::key(D)),
             EraseEraseMode => ChordList::one(Chord::key(F)),
+            EraseScrubZoomHold => ChordList::one(Chord::ctrl(Space)),
             EraseSpacePan => ChordList::one(Chord::key(Space)),
+            ErasePreviewHold | ConcealPreviewHold => ChordList::one(Chord::key(Tab)),
             ConcealExit => ChordList::one(Chord::ctrl(M)),
             ConcealConfirmPolygon => ChordList::one(Chord::key(Enter)),
             ConcealRedo => ChordList::two(Chord::ctrl(Y), Chord::ctrl_shift(Z)),
@@ -6942,14 +7182,17 @@ impl KeyAction {
             ConcealToolHLine => ChordList::one(Chord::key(H)),
             ConcealToolRect => ChordList::one(Chord::key(R)),
             ConcealToolEllipse => ChordList::one(Chord::key(O)),
+            ConcealScrubZoomHold => ChordList::one(Chord::ctrl(Space)),
             ConcealSpacePan => ChordList::one(Chord::key(Space)),
             CropForceCreateHold => ChordList::one(Chord::modifier(ModKind::Ctrl)),
+            CropScrubZoomHold => ChordList::one(Chord::ctrl(Space)),
             CropSpacePan => ChordList::one(Chord::key(Space)),
             CropExecute => ChordList::one(Chord::ctrl(E)),
             SnsSplitExecute => ChordList::EMPTY,
             TextConfirm => ChordList::one(Chord::ctrl(T)),
             TextRedo => ChordList::two(Chord::ctrl(Y), Chord::ctrl_shift(Z)),
             TextUndo => ChordList::one(Chord::ctrl(Z)),
+            TextScrubZoomHold => ChordList::one(Chord::ctrl(Space)),
             TextSpacePan => ChordList::one(Chord::key(Space)),
             LaShowSource => ChordList::one(Chord::key(Q)),
             LaShowMask => ChordList::one(Chord::key(W)),
@@ -6969,6 +7212,7 @@ impl KeyAction {
             LaToolEllipse => ChordList::one(Chord::key(O)),
             LaConfirmPolygon => ChordList::one(Chord::key(Enter)),
             LaDeleteShape => ChordList::one(Chord::key(Delete)),
+            LaScrubZoomHold => ChordList::one(Chord::ctrl(Space)),
             LaSpacePan => ChordList::one(Chord::key(Space)),
         }
     }
@@ -7150,10 +7394,44 @@ pub const FS_VIDEO_ACTIVE_SCOPES: &[CommandScope] = &[
     KeyContext::FsVideo,
 ];
 
+/// Scope selection alone does not authorize every Global/FsCommon command in the overview.
+pub const FS_PAGE_OVERVIEW_ACTIVE_SCOPES: &[CommandScope] = &[
+    KeyContext::Global,
+    KeyContext::FsCommon,
+    KeyContext::FsPageOverview,
+];
+
+/// Potential executable actions, in dispatch priority order. Runtime presentation and
+/// navigation gates may remove actions, but must not add actions outside this set.
+/// Fixed Escape cancellation precedes this list; fixed cursor navigation follows it.
+pub const FS_PAGE_OVERVIEW_ACTION_PRIORITY: &[KeyAction] = &[
+    KeyAction::HelpShowContextShortcuts,
+    KeyAction::FsPageOverviewToggle,
+    KeyAction::FsToggleWindowMode,
+    KeyAction::ToggleDetachedViewerMode,
+    KeyAction::ToggleAlwaysOnTop,
+    KeyAction::FsCtrlNavPrev,
+    KeyAction::FsCtrlNavNext,
+    KeyAction::FsSiblingPrev,
+    KeyAction::FsSiblingNext,
+    KeyAction::FsPageOverviewConfirm,
+    KeyAction::FsPageOverviewPagePrev,
+    KeyAction::FsPageOverviewPageNext,
+    KeyAction::FsPageOverviewFirst,
+    KeyAction::FsPageOverviewLast,
+    KeyAction::FsPageOverviewColumnsLess,
+    KeyAction::FsPageOverviewColumnsMore,
+];
+
+pub fn page_overview_action_allowed(action: KeyAction) -> bool {
+    FS_PAGE_OVERVIEW_ACTION_PRIORITY.contains(&action)
+}
+
 const ACTIVE_SCOPE_SETS: &[&[CommandScope]] = &[
     GRID_ACTIVE_SCOPES,
     FS_IMAGE_ACTIVE_SCOPES,
     FS_VIDEO_ACTIVE_SCOPES,
+    FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
     &[KeyContext::Erase],
     &[KeyContext::Conceal],
     &[KeyContext::Crop],
@@ -7167,6 +7445,20 @@ pub fn command_scopes_overlap(a: CommandScope, b: CommandScope) -> bool {
         || ACTIVE_SCOPE_SETS
             .iter()
             .any(|set| set.contains(&a) && set.contains(&b))
+}
+
+fn native_video_shortcut_action(action: KeyAction) -> bool {
+    action != KeyAction::FsPageOverviewToggle
+        && (matches!(
+            action.context(),
+            KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
+        ) || matches!(
+            action,
+            KeyAction::ToggleDetachedViewerMode
+                | KeyAction::ToggleAlwaysOnTop
+                | KeyAction::ClearVideoMediaMemory
+                | KeyAction::ClearBookResumePositions
+        ))
 }
 
 fn is_overlay_edit_scope(scope: CommandScope) -> bool {
@@ -7186,6 +7478,18 @@ fn help_context_shortcuts_overlaps_scope(action: KeyAction, scope: CommandScope)
 }
 
 fn actions_can_overlap(first: KeyAction, second: KeyAction) -> bool {
+    // Local overview actions coexist only with the finite executable set. The toggle
+    // also exists in ordinary still-image viewing, but never in video or edit modes.
+    if first.context() == KeyContext::FsPageOverview
+        || second.context() == KeyContext::FsPageOverview
+    {
+        return page_overview_action_allowed(first) && page_overview_action_allowed(second);
+    }
+    if first == KeyAction::FsPageOverviewToggle || second == KeyAction::FsPageOverviewToggle {
+        return (page_overview_action_allowed(first) && page_overview_action_allowed(second))
+            || (FS_IMAGE_ACTIVE_SCOPES.contains(&first.context())
+                && FS_IMAGE_ACTIVE_SCOPES.contains(&second.context()));
+    }
     command_scopes_overlap(first.context(), second.context())
         || help_context_shortcuts_overlaps_scope(first, second.context())
         || help_context_shortcuts_overlaps_scope(second, first.context())
@@ -7491,7 +7795,7 @@ impl Keymap {
             }
             match parse_chord(rhs) {
                 Ok(chord) => {
-                    if let Err(msg) = chord.validate_for_trigger(action.trigger()) {
+                    if let Err(msg) = chord.validate_for_action(action) {
                         warnings.push(format!(
                             "line {line_no}: '{}' ignored: {msg}",
                             action.ini_name()
@@ -7637,6 +7941,37 @@ impl Keymap {
     ) -> Vec<CommandDisplayRow> {
         command_catalog()
             .filter(|spec| active_scopes.contains(&spec.scope))
+            .filter(|spec| {
+                !active_scopes.contains(&KeyContext::FsVideo)
+                    || spec.action != KeyAction::FsPageOverviewToggle
+            })
+            .filter(|spec| {
+                !active_scopes.contains(&KeyContext::FsPageOverview)
+                    || page_overview_action_allowed(spec.action)
+            })
+            .filter(|spec| spec.action != KeyAction::HelpShowContextShortcuts)
+            .filter(|spec| spec.action.is_user_facing())
+            .filter_map(|spec| {
+                let shortcut_labels = self.chord_labels(spec.action);
+                if shortcut_labels.is_empty() && !include_unassigned {
+                    return None;
+                }
+                Some(CommandDisplayRow {
+                    spec,
+                    shortcut_labels,
+                })
+            })
+            .collect()
+    }
+
+    /// Build help from the exact runtime executable action set, after availability gates.
+    pub fn command_display_rows_for_actions(
+        &self,
+        executable_actions: &[KeyAction],
+        include_unassigned: bool,
+    ) -> Vec<CommandDisplayRow> {
+        command_catalog()
+            .filter(|spec| executable_actions.contains(&spec.action))
             .filter(|spec| spec.action != KeyAction::HelpShowContextShortcuts)
             .filter(|spec| spec.action.is_user_facing())
             .filter_map(|spec| {
@@ -7697,6 +8032,8 @@ impl Keymap {
         priority.iter().copied().find(|action| {
             action.trigger() == KeyTrigger::Press
                 && active_scopes.contains(&action.context())
+                && (!active_scopes.contains(&KeyContext::FsPageOverview)
+                    || page_overview_action_allowed(*action))
                 && self.action_has_chord(*action, chord)
         })
     }
@@ -7710,7 +8047,26 @@ impl Keymap {
         priority.iter().copied().find(|action| {
             action.trigger() == KeyTrigger::Press
                 && active_scopes.contains(&action.context())
+                && (!active_scopes.contains(&KeyContext::FsPageOverview)
+                    || page_overview_action_allowed(*action))
                 && self.consume_action(ctx, *action)
+        })
+    }
+
+    /// Dispatch a runtime-filtered priority list without retriggering held Press actions.
+    /// Keyboard ownership and physical-edge consumption remain in the existing helpers.
+    pub fn consume_first_action_no_repeat(
+        &self,
+        ctx: &egui::Context,
+        active_scopes: &[CommandScope],
+        priority: &[KeyAction],
+    ) -> Option<KeyAction> {
+        priority.iter().copied().find(|action| {
+            action.trigger() == KeyTrigger::Press
+                && active_scopes.contains(&action.context())
+                && (!active_scopes.contains(&KeyContext::FsPageOverview)
+                    || page_overview_action_allowed(*action))
+                && self.consume_action_no_repeat(ctx, *action)
         })
     }
 
@@ -8241,6 +8597,45 @@ impl Keymap {
             .any(|chord| self.key_held_chord(ctx, permit, chord))
     }
 
+    /// Physical release evidence for rejecting a KeyHold during drawing. Modifier changes and loss of
+    /// keyboard ownership must not masquerade as releasing the binding's key.
+    /// This can reject or retire a blocked hold; activation still uses key_held_action.
+    /// None means that this pass has no authority to observe the key's level.
+    pub(crate) fn key_hold_binding_released(
+        &self,
+        ctx: &egui::Context,
+        permit: crate::keyboard_input::FocusedKeyStatePermit,
+        action: KeyAction,
+    ) -> Option<bool> {
+        debug_assert_eq!(action.trigger(), KeyTrigger::KeyHold);
+        if !permit.allows(ctx) || crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
+            return None;
+        }
+        Some(self.effective_chords(action).into_iter().all(|chord| {
+            let Some(key) = chord.key_name() else {
+                return false;
+            };
+            #[cfg(windows)]
+            {
+                // An absent viewport latch (notably Enter after focus loss) is
+                // not release evidence. For the shared Return VK, require both
+                // slots up; the real OS level cannot distinguish them.
+                let up = !crate::key_input::physical_key_down(
+                    crate::key_input::PhysicalKeySlot::new(key.to_vk(), false),
+                );
+                up && (key.routed_hold_extended().is_none()
+                    || !crate::key_input::physical_key_down(
+                        crate::key_input::PhysicalKeySlot::new(key.to_vk(), true),
+                    ))
+            }
+            #[cfg(not(windows))]
+            {
+                key.to_egui()
+                    .is_some_and(|key| ctx.input(|i| !i.key_down(key)))
+            }
+        }))
+    }
+
     /// Resolve the crop mode's temporary pan without weakening the generic
     /// `KeyHold` exact-modifier contract.
     ///
@@ -8516,18 +8911,11 @@ impl Keymap {
 
     pub fn install_global_native_video_shortcuts(&self) {
         let mut chords = Vec::new();
-        for action in KeyAction::all().iter().copied().filter(|action| {
-            matches!(
-                action.context(),
-                KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
-            ) || matches!(
-                action,
-                KeyAction::ToggleDetachedViewerMode
-                    | KeyAction::ToggleAlwaysOnTop
-                    | KeyAction::ClearVideoMediaMemory
-                    | KeyAction::ClearBookResumePositions
-            )
-        }) {
+        for action in KeyAction::all()
+            .iter()
+            .copied()
+            .filter(|action| native_video_shortcut_action(*action))
+        {
             if let Some(override_chords) = self.overrides.get(&action) {
                 chords.extend(override_chords.iter().copied());
             } else {
@@ -8618,7 +9006,9 @@ impl Keymap {
         out.push_str(
             "#   いずれか 1 つだけ指定できます。Right* は右側限定、それ以外は左右不問です。\n",
         );
-        out.push_str("# - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。\n");
+        out.push_str(
+            "# - KeyHold は通常キー 1 つです。左右ドラッグズームだけ修飾キーも指定できます。\n",
+        );
         out.push_str(
             "# - キー名の例: A..Z, 0..9, Numpad0..Numpad9, F1..F24, Left, Right, Up, Down,\n",
         );
@@ -8626,7 +9016,7 @@ impl Keymap {
             "#   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete,\n",
         );
         out.push_str(
-            "#   [, ], ;, :, ,, ., \\, /, ?, -, ^, @, Yen, Ro, NumpadAdd, NumpadSubtract, NumpadEnter\n",
+            "#   [, ], Semicolon, :, ,, ., \\, /, ?, -, ^, @, Yen, Ro, NumpadAdd, NumpadSubtract, NumpadEnter\n",
         );
         out.push_str("# - テンキー数字は通常の数字キーとは別キーとして扱われます。\n");
         out.push_str("#   従来の数字キー既定操作は互換のため 1 と Numpad1 の両方を既定割り当てにしています。\n");
@@ -8664,6 +9054,7 @@ impl Keymap {
             KeyContext::Global,
             KeyContext::Grid,
             KeyContext::FsCommon,
+            KeyContext::FsPageOverview,
             KeyContext::Rating,
             KeyContext::FsImage,
             KeyContext::FsVideo,
@@ -8689,7 +9080,7 @@ impl Keymap {
                 let defaults: Vec<String> = action
                     .default_chords()
                     .iter()
-                    .map(Chord::settings_name)
+                    .map(Chord::ini_name)
                     .collect();
                 if defaults.len() <= 1 {
                     let default = defaults
@@ -9341,10 +9732,9 @@ impl Keymap {
         chord: Chord,
     ) -> bool {
         let _ = ctx;
-        // KeyHold は「修飾キーなしの通常キー」契約 (validate_for_trigger 参照)。修飾キーが
-        // 同時に押されている間は不成立にして、Ctrl+Z (undo) / Shift+Z (分析) 等が KeyHold
-        // アクション (例: 全画面ズーム) を誤起動しないようにする (Codex P1)。FS ビューポートで
-        // stale な egui modifiers を避け、押下中判定と同じく OS 直読みを使う。
+        // Exact modifiers keep Ctrl+Z / Shift+Z from activating a plain Z hold.
+        // Only scrub actions accept modified bindings at validation. On Windows,
+        // read OS levels to avoid stale egui modifiers in fullscreen viewports.
         #[cfg(windows)]
         {
             // Windows では OS 直読み (KeyName の固有 VK) を唯一の判定にする
@@ -9359,9 +9749,9 @@ impl Keymap {
         }
         #[cfg(not(windows))]
         {
-            if chord.has_key_modifiers() {
+            let Some((ctrl, shift, alt)) = chord.key_modifiers() else {
                 return false;
-            }
+            };
             let Some(name) = chord.key_name() else {
                 return false;
             };
@@ -9370,7 +9760,7 @@ impl Keymap {
             };
             ctx.input(|i| {
                 let m = i.modifiers;
-                !m.ctrl && !m.shift && !m.alt && i.key_down(key)
+                m.ctrl == ctrl && m.shift == shift && m.alt == alt && i.key_down(key)
             })
         }
     }
@@ -9612,18 +10002,7 @@ pub fn native_video_fullscreen_shortcut_key(
     KeyAction::all()
         .iter()
         .copied()
-        .filter(|action| {
-            matches!(
-                action.context(),
-                KeyContext::FsCommon | KeyContext::FsVideo | KeyContext::Rating
-            ) || matches!(
-                action,
-                KeyAction::ToggleDetachedViewerMode
-                    | KeyAction::ToggleAlwaysOnTop
-                    | KeyAction::ClearVideoMediaMemory
-                    | KeyAction::ClearBookResumePositions
-            )
-        })
+        .filter(|action| native_video_shortcut_action(*action))
         .any(|action| fallback.matches_vk_action(action, key))
 }
 
@@ -9740,7 +10119,7 @@ fn parse_setting_chords(
         }
         match parse_chord(trimmed) {
             Ok(chord) => {
-                if let Err(msg) = chord.validate_for_trigger(action.trigger()) {
+                if let Err(msg) = chord.validate_for_action(action) {
                     warnings.push(format!(
                         "settings: '{}'.{} ignored: {}",
                         action.ini_name(),
@@ -9775,9 +10154,7 @@ pub fn parse_chord_for_action(action: KeyAction, text: &str) -> Result<Option<Ch
         return Ok(None);
     }
     let chord = parse_chord(trimmed)?;
-    chord
-        .validate_for_trigger(action.trigger())
-        .map_err(str::to_string)?;
+    chord.validate_for_action(action).map_err(str::to_string)?;
     Ok(Some(chord))
 }
 
@@ -9787,7 +10164,21 @@ fn parse_chord(rhs: &str) -> Result<Chord, String> {
     let mut alt = false;
     let mut key = None;
     let mut right_modifier = None;
-    for token in rhs.split('+').map(str::trim).filter(|s| !s.is_empty()) {
+    // A displayed '+' is a key, while the preceding '+' remains a separator:
+    // '+' -> Shift+Semicolon, 'Ctrl++' -> Ctrl+Shift+Semicolon.
+    let trimmed = rhs.trim();
+    let (modifier_part, plus_key) = if trimmed == "+" {
+        ("", true)
+    } else if let Some(prefix) = trimmed.strip_suffix("++") {
+        (prefix, !prefix.is_empty())
+    } else {
+        (trimmed, false)
+    };
+    for token in modifier_part
+        .split('+')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         if let Some(kind) = ModKind::parse(token) {
             match kind {
                 ModKind::Ctrl | ModKind::Shift | ModKind::Alt => {
@@ -9836,6 +10227,13 @@ fn parse_chord(rhs: &str) -> Result<Chord, String> {
             }
         }
     }
+    if plus_key {
+        if key.is_some() || right_modifier.is_some() {
+            return Err(format!("'{rhs}' combines '+' with another key"));
+        }
+        shift = true;
+        key = Some(KeyName::Semicolon);
+    }
     if let Some(kind) = right_modifier {
         return Ok(Chord::modifier(kind));
     }
@@ -9875,6 +10273,117 @@ mod tests {
     use super::*;
 
     #[test]
+    fn page_overview_actions_register_defaults_and_keep_existing_bindings() {
+        let defaults = [
+            (KeyAction::FsPageOverviewToggle, Some(KeyName::O)),
+            (KeyAction::FsPageOverviewConfirm, Some(KeyName::Enter)),
+            (KeyAction::FsPageOverviewPagePrev, Some(KeyName::PageUp)),
+            (KeyAction::FsPageOverviewPageNext, Some(KeyName::PageDown)),
+            (KeyAction::FsPageOverviewFirst, Some(KeyName::Home)),
+            (KeyAction::FsPageOverviewLast, Some(KeyName::End)),
+            (KeyAction::FsPageOverviewColumnsLess, None),
+            (KeyAction::FsPageOverviewColumnsMore, None),
+        ];
+        for (action, key) in defaults {
+            assert!(ALL_ACTIONS.contains(&action));
+            assert_eq!(KeyAction::from_ini_name(action.ini_name()), Some(action));
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert_eq!(
+                action.context(),
+                if action == KeyAction::FsPageOverviewToggle {
+                    KeyContext::FsCommon
+                } else {
+                    KeyContext::FsPageOverview
+                }
+            );
+            assert_eq!(action.default_chords().iter().next(), key.map(Chord::key));
+            assert_eq!(
+                action.default_chords().iter().count(),
+                usize::from(key.is_some())
+            );
+            assert!(action.is_user_facing());
+        }
+        assert_eq!(
+            KeyContext::parse("FsPageOverview"),
+            Some(KeyContext::FsPageOverview)
+        );
+        for (action, chord) in [
+            (KeyAction::FsSlideshow, Chord::key(KeyName::S)),
+            (KeyAction::FsSeekStripToggle, Chord::shift(KeyName::S)),
+            (KeyAction::FsCapture, Chord::ctrl(KeyName::S)),
+            (KeyAction::GlobalOpenFolder, Chord::ctrl(KeyName::O)),
+            (KeyAction::EraseToolEllipse, Chord::key(KeyName::O)),
+            (KeyAction::ConcealToolEllipse, Chord::key(KeyName::O)),
+            (KeyAction::LaToolEllipse, Chord::key(KeyName::O)),
+        ] {
+            assert_eq!(
+                action.default_chords().iter().next(),
+                Some(chord),
+                "{action:?}"
+            );
+        }
+        for other in KeyAction::all().iter().copied().filter(|other| {
+            *other != KeyAction::FsPageOverviewToggle
+                && actions_can_overlap(KeyAction::FsPageOverviewToggle, *other)
+        }) {
+            assert!(
+                !other
+                    .default_chords()
+                    .iter()
+                    .any(|chord| chord == Chord::key(KeyName::O)),
+                "the overview O default conflicts with {other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn page_overview_help_and_resolver_use_the_finite_action_set() {
+        let keymap = Keymap::empty();
+        let rows =
+            keymap.command_display_rows_for_active_scopes(FS_PAGE_OVERVIEW_ACTIVE_SCOPES, true);
+        assert!(
+            rows.iter()
+                .all(|row| page_overview_action_allowed(row.spec.action))
+        );
+        assert_eq!(rows.len(), FS_PAGE_OVERVIEW_ACTION_PRIORITY.len() - 1);
+        for action in [
+            KeyAction::FsClose,
+            KeyAction::FsBackToList,
+            KeyAction::FsToggleMetadata,
+            KeyAction::FsPageNext,
+            KeyAction::FsSlideshow,
+            KeyAction::RatingItem1,
+            KeyAction::GlobalOpenFolder,
+        ] {
+            assert!(!page_overview_action_allowed(action), "{action:?}");
+            assert!(!rows.iter().any(|row| row.spec.action == action));
+        }
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(
+                Chord::key(KeyName::Backspace),
+                FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
+                &[KeyAction::FsBackToList]
+            ),
+            None
+        );
+        let executable = FS_PAGE_OVERVIEW_ACTION_PRIORITY
+            .iter()
+            .copied()
+            .filter(|action| {
+                *action != KeyAction::ToggleDetachedViewerMode
+                    && *action != KeyAction::FsCtrlNavPrev
+            })
+            .collect::<Vec<_>>();
+        let rows = keymap.command_display_rows_for_actions(&executable, true);
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.spec.action == KeyAction::ToggleDetachedViewerMode
+                    || row.spec.action == KeyAction::FsCtrlNavPrev)
+        );
+    }
+
+    #[test]
     fn generic_book_view_actions_are_assignable_without_default_bindings() {
         let mut settings = KeymapSettings::default();
         for (action, key) in [
@@ -9899,6 +10408,153 @@ mod tests {
             Keymap::default().effective_chords(KeyAction::FsSpreadLtr),
             &[Chord::key(KeyName::Num2), Chord::key(KeyName::Numpad2)]
         );
+    }
+
+    #[test]
+    fn page_overview_coexistence_checks_all_potential_actions_without_edit_or_video() {
+        for first in FS_PAGE_OVERVIEW_ACTION_PRIORITY.iter().copied() {
+            for second in FS_PAGE_OVERVIEW_ACTION_PRIORITY.iter().copied() {
+                assert!(actions_can_overlap(first, second), "{first:?} / {second:?}");
+            }
+        }
+        for local in KeyAction::all()
+            .iter()
+            .copied()
+            .filter(|action| action.context() == KeyContext::FsPageOverview)
+        {
+            for excluded in [
+                KeyAction::FsClose,
+                KeyAction::FsBackToList,
+                KeyAction::GlobalOpenFolder,
+                KeyAction::FsSlideshow,
+                KeyAction::RatingItem1,
+                KeyAction::VideoTileMode,
+                KeyAction::EraseToolEllipse,
+                KeyAction::ConcealToolEllipse,
+                KeyAction::LaToolEllipse,
+            ] {
+                assert!(
+                    !actions_can_overlap(local, excluded),
+                    "{local:?} / {excluded:?}"
+                );
+                assert!(!actions_can_overlap(excluded, local));
+            }
+        }
+        for excluded in [
+            KeyAction::VideoTileMode,
+            KeyAction::EraseToolEllipse,
+            KeyAction::ConcealToolEllipse,
+            KeyAction::LaToolEllipse,
+        ] {
+            assert!(!actions_can_overlap(
+                KeyAction::FsPageOverviewToggle,
+                excluded
+            ));
+        }
+        assert!(actions_can_overlap(
+            KeyAction::FsPageOverviewToggle,
+            KeyAction::FsClose
+        ));
+        assert!(!native_video_shortcut_action(
+            KeyAction::FsPageOverviewToggle
+        ));
+        assert!(native_video_shortcut_action(KeyAction::FsToggleWindowMode));
+        assert!(native_video_shortcut_action(KeyAction::VideoTileMode));
+        for action in [
+            KeyAction::ClearVideoMediaMemory,
+            KeyAction::ClearBookResumePositions,
+            KeyAction::FsListOrderPrev,
+            KeyAction::FsListOrderNext,
+        ] {
+            assert!(native_video_shortcut_action(action), "{action:?}");
+            assert!(!page_overview_action_allowed(action), "{action:?}");
+        }
+        let keymap = Keymap::empty();
+        assert!(
+            !keymap
+                .command_display_rows_for_active_scopes(FS_VIDEO_ACTIVE_SCOPES, true)
+                .iter()
+                .any(|row| row.spec.action == KeyAction::FsPageOverviewToggle)
+        );
+        assert!(
+            keymap
+                .command_display_rows_for_active_scopes(FS_IMAGE_ACTIVE_SCOPES, true)
+                .iter()
+                .any(|row| row.spec.action == KeyAction::FsPageOverviewToggle)
+        );
+    }
+
+    #[test]
+    fn page_overview_toggle_enter_reports_confirm_conflict_and_resolves_toggle_first() {
+        let keymap = Keymap::from_ini_str("[FsCommon]\nFsPageOverviewToggle = Enter\n");
+        assert!(
+            keymap
+                .binding_conflicts()
+                .iter()
+                .any(
+                    |conflict| conflict.action == KeyAction::FsPageOverviewToggle
+                        && conflict.other_action == Some(KeyAction::FsPageOverviewConfirm)
+                )
+        );
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(
+                Chord::key(KeyName::Enter),
+                FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
+                FS_PAGE_OVERVIEW_ACTION_PRIORITY
+            ),
+            Some(KeyAction::FsPageOverviewToggle)
+        );
+    }
+
+    #[test]
+    fn page_overview_no_repeat_dispatch_consumes_enter_once_without_confirm_fallthrough() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+        let ctx = egui::Context::default();
+        let keymap = Keymap::from_ini_str("[FsCommon]\nFsPageOverviewToggle = Enter\n");
+        begin_key_pass(&ctx, egui::Key::Enter, egui::Modifiers::NONE);
+        assert_eq!(
+            keymap.consume_first_action_no_repeat(
+                &ctx,
+                FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
+                FS_PAGE_OVERVIEW_ACTION_PRIORITY
+            ),
+            Some(KeyAction::FsPageOverviewToggle)
+        );
+        assert_eq!(
+            keymap.consume_first_action_no_repeat(
+                &ctx,
+                FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
+                FS_PAGE_OVERVIEW_ACTION_PRIORITY
+            ),
+            None
+        );
+        ctx.end_pass().drop_without_applying_deltas();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        cache_test_keyboard_owner(&ctx);
+        assert_eq!(
+            keymap.consume_first_action_no_repeat(
+                &ctx,
+                FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
+                FS_PAGE_OVERVIEW_ACTION_PRIORITY
+            ),
+            None
+        );
+        assert!(ctx.input(|input| input.events.is_empty()));
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -10638,11 +11294,17 @@ mod tests {
             "ImageCapture".to_string(),
             "ImageToggleMetadata".to_string(),
             "ImageSlideshow".to_string(),
+            "ImagePageOverview".to_string(),
             "ImageZoomMode".to_string(),
             "ImagePixelGrid".to_string(),
             "ImageBackgroundCycle".to_string(),
             "ImageFitModeCycle".to_string(),
             "ImageComparePin".to_string(),
+            "CopyFiles".to_string(),
+            "CopyEditedImage".to_string(),
+            "ImageCopyToClipboard".to_string(),
+            "ImageCopyPath".to_string(),
+            "ImageCopyFileName".to_string(),
             "ImageHome".to_string(),
             "ImageEnd".to_string(),
             "ImageSpreadShiftLeft".to_string(),
@@ -10688,13 +11350,10 @@ mod tests {
             "GridScrollBottom".to_string(),
             "GridToggleSnapshotLock".to_string(),
             "ImageOpenFolder".to_string(),
-            // These are intentionally fixed because they depend on OS/browser/clipboard routes
+            // These are intentionally fixed because they depend on OS/browser routes
             // or reserved navigation semantics rather than ordinary keymap dispatch.
             "GridHistoryBack".to_string(),
             "GridHistoryForward".to_string(),
-            "ImageCopyToClipboard".to_string(),
-            "ImageCopyPath".to_string(),
-            "ImageCopyFileName".to_string(),
             // PageUp/PageDown-style fixed direction for ring/mouse/gesture assignments.
             "ImageSpreadShiftPrev".to_string(),
             "ImageSpreadShiftNext".to_string(),
@@ -10725,7 +11384,7 @@ mod tests {
             assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
             for chord in action.default_chords().iter() {
                 assert!(
-                    chord.validate_for_trigger(action.trigger()).is_ok(),
+                    chord.validate_for_action(action).is_ok(),
                     "{} has an invalid default chord: {}",
                     action.ini_name(),
                     chord.display_name()
@@ -10763,6 +11422,82 @@ mod tests {
             grid_default
         );
         assert_eq!(keymap.effective_chords(KeyAction::FsExport), vec![rebound]);
+    }
+
+    #[test]
+    fn edited_image_copy_is_an_unbound_rebindable_fullscreen_press_action() {
+        let action = KeyAction::FsCopyEditedImage;
+        assert!(KeyAction::all().contains(&action));
+        assert_eq!(action.context(), KeyContext::FsImage);
+        assert_eq!(action.trigger(), KeyTrigger::Press);
+        assert_eq!(KeyAction::parse_ini_name("FsCopyEditedImage"), Some(action));
+        assert!(action.default_chords().iter().next().is_none());
+        let rebound = Chord::ctrl_shift(KeyName::C);
+        let mut settings = KeymapSettings::default();
+        settings.set_override_chords(action, vec![rebound]);
+        assert_eq!(
+            Keymap::from_settings(&settings).effective_chords(action),
+            vec![rebound]
+        );
+    }
+
+    #[test]
+    fn copy_actions_keep_contexts_defaults_and_independent_overrides() {
+        use crate::context_menu_model::ContextMenuItemId;
+
+        let pairs = [
+            (KeyAction::GridCopyFiles, KeyAction::FsCopyFiles, None),
+            (
+                KeyAction::GridCopyPath,
+                KeyAction::FsCopyPath,
+                Some(ContextMenuItemId::CopyPath),
+            ),
+            (
+                KeyAction::GridCopyFileName,
+                KeyAction::FsCopyFileName,
+                Some(ContextMenuItemId::CopyFileName),
+            ),
+            (
+                KeyAction::GridCopyImage,
+                KeyAction::FsCopyImage,
+                Some(ContextMenuItemId::CopyImageToClipboard),
+            ),
+            (
+                KeyAction::GridCopyEditedImage,
+                KeyAction::FsCopyEditedImage,
+                Some(ContextMenuItemId::CopyEditedImageToClipboard),
+            ),
+        ];
+        let rebound = Chord::ctrl_shift(KeyName::C);
+        for (grid, fullscreen, menu_item) in pairs {
+            for (action, context) in [(grid, KeyContext::Grid), (fullscreen, KeyContext::FsImage)] {
+                assert!(KeyAction::all().contains(&action));
+                assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+                assert_eq!(action.context(), context);
+                assert_eq!(action.trigger(), KeyTrigger::Press);
+                assert!(action.is_user_facing());
+                if let Some(item) = menu_item {
+                    assert_eq!(action.description(), item.label());
+                }
+                let expected = if action == KeyAction::GridCopyFiles {
+                    vec![Chord::ctrl(KeyName::C)]
+                } else {
+                    vec![]
+                };
+                assert_eq!(action.default_chords().iter().collect::<Vec<_>>(), expected);
+                let mut settings = KeymapSettings::default();
+                settings.set_override_chords(action, vec![rebound]);
+                let settings: KeymapSettings =
+                    serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+                let keymap = Keymap::from_settings(&settings);
+                assert_eq!(keymap.effective_chords(action), vec![rebound]);
+                let sibling = if action == grid { fullscreen } else { grid };
+                assert_eq!(
+                    keymap.effective_chords(sibling),
+                    sibling.default_chords().iter().collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[test]
@@ -11067,10 +11802,7 @@ mod tests {
             );
             assert_eq!(spec.scope, spec.action.context());
             assert_eq!(spec.trigger, spec.action.trigger());
-            assert_eq!(
-                spec.binding_policy,
-                BindingPolicy::for_trigger(spec.action.trigger())
-            );
+            assert_eq!(spec.binding_policy, spec.action.binding_policy());
         }
     }
 
@@ -11700,6 +12432,8 @@ mod tests {
             KeyAction::FsToggleWindowMode,
             KeyAction::FsCtrlNavPrev,
             KeyAction::FsCtrlNavNext,
+            KeyAction::FsListOrderPrev,
+            KeyAction::FsListOrderNext,
             KeyAction::FsSiblingPrev,
             KeyAction::FsSiblingNext,
         ] {
@@ -11727,6 +12461,8 @@ mod tests {
             KeyAction::FsToggleWindowMode,
             KeyAction::FsCtrlNavPrev,
             KeyAction::FsCtrlNavNext,
+            KeyAction::FsListOrderPrev,
+            KeyAction::FsListOrderNext,
             KeyAction::FsSiblingPrev,
             KeyAction::FsSiblingNext,
         ] {
@@ -12625,6 +13361,104 @@ mod tests {
     }
 
     #[test]
+    fn scrub_zoom_defaults_policy_contexts_and_conflicts() {
+        let actions = [
+            (KeyAction::FsScrubZoomHold, KeyContext::FsImage),
+            (KeyAction::EraseScrubZoomHold, KeyContext::Erase),
+            (KeyAction::ConcealScrubZoomHold, KeyContext::Conceal),
+            (KeyAction::CropScrubZoomHold, KeyContext::Crop),
+            (KeyAction::TextScrubZoomHold, KeyContext::Text),
+            (KeyAction::LaScrubZoomHold, KeyContext::LocalAdjust),
+        ];
+        for (action, scope) in actions {
+            assert!(KeyAction::all().contains(&action));
+            assert_eq!(action.trigger(), KeyTrigger::KeyHold);
+            assert_eq!(action.context(), scope);
+            assert_eq!(action.binding_policy(), BindingPolicy::FullChord);
+            let chord = Chord::ctrl(KeyName::Space);
+            assert_eq!(
+                action.default_chords().iter().collect::<Vec<_>>(),
+                vec![chord]
+            );
+            assert_eq!(
+                parse_chord_for_action(action, "Ctrl+Space"),
+                Ok(Some(chord))
+            );
+            assert!(parse_chord_for_action(action, "Ctrl").is_err());
+            let rebound = Keymap::from_ini_str(&format!(
+                "[{}]\n{} = Ctrl+Space\n",
+                scope.ini_name(),
+                action.ini_name()
+            ));
+            assert!(rebound.warnings().is_empty(), "{:?}", rebound.warnings());
+            assert!(rebound.binding_conflicts().is_empty());
+            for other in KeyAction::all()
+                .iter()
+                .copied()
+                .filter(|other| *other != action && actions_can_overlap(action, *other))
+            {
+                assert!(
+                    !other.default_chords().iter().any(|c| c == chord),
+                    "{other:?}"
+                );
+            }
+        }
+        for action in [
+            KeyAction::FsZoomMode,
+            KeyAction::EraseSpacePan,
+            KeyAction::ErasePreviewHold,
+            KeyAction::ConcealSpacePan,
+            KeyAction::CropSpacePan,
+            KeyAction::TextSpacePan,
+            KeyAction::LaSpacePan,
+        ] {
+            assert_eq!(action.binding_policy(), BindingPolicy::SinglePlainKey);
+            assert!(parse_chord_for_action(action, "Ctrl+Space").is_err());
+        }
+        let chord = KeyAction::FsSpaceCheck
+            .default_chords()
+            .iter()
+            .next()
+            .unwrap();
+        assert!(!chord.matches_egui(egui::Key::Space, egui::Modifiers::CTRL));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scrub_zoom_modified_hold_uses_focused_physical_chord_and_stops_on_release() {
+        use crate::key_input::{SyntheticKeyCommand, SyntheticModifiers, SyntheticNavigationKey};
+        let _serial = crate::key_input::lock_test_input();
+        let ctx = egui::Context::default();
+        crate::key_input::arm_test_synthetic_input(0xE006, egui::ViewportId::ROOT);
+        let keymap = Keymap::from_ini_str(
+            "[FsImage]\nFsScrubZoomHold = Ctrl+Tab\n[Erase]\nEraseSpacePan = Tab\n",
+        );
+        let now = std::time::Instant::now();
+        crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+            now,
+            SyntheticNavigationKey::Tab,
+            SyntheticModifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        ));
+        crate::key_input::advance_test_synthetic_input(now);
+        begin_key_pass(&ctx, egui::Key::Tab, egui::Modifiers::CTRL);
+        let permit = crate::keyboard_input::focused_key_state_permit(&ctx).unwrap();
+        assert!(keymap.key_held_action(&ctx, permit, KeyAction::FsScrubZoomHold));
+        assert!(!keymap.key_held_action(&ctx, permit, KeyAction::EraseSpacePan));
+        let later = now + std::time::Duration::from_millis(1);
+        crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::up(
+            later,
+            SyntheticNavigationKey::Tab,
+        ));
+        crate::key_input::advance_test_synthetic_input(later);
+        assert!(!keymap.key_held_action(&ctx, permit, KeyAction::FsScrubZoomHold));
+        ctx.end_pass().drop_without_applying_deltas();
+        crate::key_input::clear_test_synthetic_input();
+    }
+
+    #[test]
     fn zoom_and_analysis_default_chords_and_triggers() {
         assert_eq!(KeyAction::FsZoomMode.trigger(), KeyTrigger::KeyHold);
         assert_eq!(KeyAction::FsImageAnalysis.trigger(), KeyTrigger::Press);
@@ -12636,6 +13470,118 @@ mod tests {
             KeyAction::FsImageAnalysis.default_chords().iter().next(),
             Some(Chord::shift(KeyName::Z))
         );
+    }
+
+    #[test]
+    fn erase_preview_hold_defaults_display_and_policy_are_complete_and_nonconflicting() {
+        for action in [KeyAction::ErasePreviewHold, KeyAction::ConcealPreviewHold] {
+            let context = action.context();
+            let keymap = Keymap::empty();
+            let chord = Chord::key(KeyName::Tab);
+            assert!(KeyAction::all().contains(&action));
+            assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+            assert!(matches!(context, KeyContext::Erase | KeyContext::Conceal));
+            assert_eq!(action.trigger(), KeyTrigger::KeyHold);
+            assert_eq!(
+                CommandSpec::from_action(action).binding_policy,
+                BindingPolicy::SinglePlainKey
+            );
+            assert_eq!(
+                action.default_chords().iter().collect::<Vec<_>>(),
+                vec![chord]
+            );
+            assert!(action.is_user_facing());
+            assert!(
+                keymap
+                    .command_display_rows_for_active_scopes(&[context], false)
+                    .iter()
+                    .any(|row| row.spec.action == action)
+            );
+            assert_eq!(
+                keymap.chord_list_bracket_label("preview", action),
+                "preview [Tab]"
+            );
+            for other in KeyAction::all()
+                .iter()
+                .copied()
+                .filter(|other| *other != action && actions_can_overlap(action, *other))
+            {
+                assert!(
+                    !other
+                        .default_chords()
+                        .iter()
+                        .any(|candidate| candidate == chord),
+                    "{other:?}"
+                );
+            }
+            assert!(!actions_can_overlap(action, KeyAction::FsToggleMetadata));
+            let rebound = Keymap::from_ini_str(&format!(
+                "[{}]\n{} = U\n",
+                context.ini_name(),
+                action.ini_name()
+            ));
+            assert!(rebound.warnings().is_empty());
+            assert_eq!(
+                rebound.chord_list_bracket_label("preview", action),
+                "preview [U]"
+            );
+            let disabled = Keymap::from_ini_str(&format!(
+                "[{}]\n{} = none\n",
+                context.ini_name(),
+                action.ini_name()
+            ));
+            assert_eq!(
+                disabled.chord_list_bracket_label("preview", action),
+                "preview"
+            );
+            assert!(parse_chord_for_action(action, "Ctrl").is_err());
+            assert!(parse_chord_for_action(action, "Ctrl+Tab").is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_preview_release_evidence_does_not_treat_missing_return_latch_as_key_up() {
+        use crate::key_input::{SyntheticKeyCommand, SyntheticNavigationKey};
+        let _input = crate::key_input::lock_test_input();
+        let ctx = egui::Context::default();
+        crate::key_input::arm_test_synthetic_input(0xE005, egui::ViewportId::ROOT);
+        let now = std::time::Instant::now();
+        crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+            now,
+            SyntheticNavigationKey::Enter,
+            Default::default(),
+        ));
+        crate::key_input::advance_test_synthetic_input(now);
+        crate::key_input::set_test_return_key_state(egui::ViewportId::ROOT, false, false);
+        begin_key_pass(&ctx, egui::Key::Enter, egui::Modifiers::NONE);
+        let permit = crate::keyboard_input::focused_key_state_permit(&ctx).unwrap();
+        for binding in ["Enter", "NumpadEnter"] {
+            let keymap = Keymap::from_ini_str(&format!("[Erase]\nErasePreviewHold = {binding}\n"));
+            assert!(!keymap.key_held_action(&ctx, permit, KeyAction::ErasePreviewHold));
+            assert_eq!(
+                keymap.key_hold_binding_released(&ctx, permit, KeyAction::ErasePreviewHold),
+                Some(false)
+            );
+            let released_at = now + std::time::Duration::from_millis(1);
+            crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::up(
+                released_at,
+                SyntheticNavigationKey::Enter,
+            ));
+            crate::key_input::advance_test_synthetic_input(released_at);
+            assert_eq!(
+                keymap.key_hold_binding_released(&ctx, permit, KeyAction::ErasePreviewHold),
+                Some(true)
+            );
+            crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+                released_at,
+                SyntheticNavigationKey::Enter,
+                Default::default(),
+            ));
+            crate::key_input::advance_test_synthetic_input(released_at);
+            crate::key_input::set_test_return_key_state(egui::ViewportId::ROOT, false, false);
+        }
+        ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -12920,10 +13866,12 @@ mod tests {
     }
 
     #[test]
-    fn press_multiplicity_selects_only_cumulative_fullscreen_folder_navigation() {
+    fn press_multiplicity_selects_fullscreen_folder_navigation_physical_presses() {
         for action in [
             KeyAction::FsCtrlNavPrev,
             KeyAction::FsCtrlNavNext,
+            KeyAction::FsListOrderPrev,
+            KeyAction::FsListOrderNext,
             KeyAction::FsSiblingPrev,
             KeyAction::FsSiblingNext,
         ] {
@@ -12945,6 +13893,99 @@ mod tests {
                 PressMultiplicity::SinglePerFrame,
                 "{action:?}"
             );
+        }
+    }
+
+    #[test]
+    fn list_order_navigation_defaults_are_distinct_shared_press_actions() {
+        let keymap = Keymap::empty();
+        for (action, key) in [
+            (KeyAction::FsListOrderPrev, KeyName::Up),
+            (KeyAction::FsListOrderNext, KeyName::Down),
+        ] {
+            let chord = Chord::ctrl_shift(key);
+            assert_eq!(action.context(), KeyContext::FsCommon);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert_eq!(
+                action.default_chords().iter().collect::<Vec<_>>(),
+                vec![chord]
+            );
+            assert!(ALL_ACTIONS.contains(&action));
+            for scopes in [FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES] {
+                assert_eq!(
+                    keymap.resolve_first_action_for_chord(chord, scopes, ALL_ACTIONS),
+                    Some(action)
+                );
+            }
+            assert_eq!(
+                keymap.resolve_first_action_for_chord(chord, GRID_ACTIVE_SCOPES, ALL_ACTIONS),
+                None
+            );
+            assert!(
+                !KeyAction::FsCtrlNavPrev
+                    .default_chords()
+                    .iter()
+                    .any(|c| c == chord)
+            );
+            assert!(
+                !KeyAction::FsCtrlNavNext
+                    .default_chords()
+                    .iter()
+                    .any(|c| c == chord)
+            );
+        }
+        let keymap =
+            Keymap::from_ini_str("[FsCommon]\nFsListOrderPrev = F16\nFsListOrderNext = F17\n");
+        for (action, key) in [
+            (KeyAction::FsListOrderPrev, KeyName::F16),
+            (KeyAction::FsListOrderNext, KeyName::F17),
+        ] {
+            assert_eq!(
+                keymap.resolve_first_action_for_chord(
+                    Chord::key(key),
+                    FS_VIDEO_ACTIVE_SCOPES,
+                    ALL_ACTIONS
+                ),
+                Some(action)
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn list_order_navigation_counts_physical_presses_and_coalesces_repeat_like_ctrl_nav() {
+        let _serial = crate::key_input::lock_test_input();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        for (repeats, expected) in [(vec![false, false, true], 2), (vec![true, true], 1)] {
+            ctx.begin_pass(Default::default());
+            cache_test_keyboard_owner(&ctx);
+            crate::key_input::set_test_frame(
+                repeats
+                    .iter()
+                    .map(|&repeat| {
+                        let mut edge = ctrl_down_edge(repeat);
+                        edge.shift = true;
+                        edge
+                    })
+                    .collect(),
+            );
+            assert_eq!(
+                keymap.consume_action_press_count(&ctx, KeyAction::FsListOrderNext),
+                expected
+            );
+            assert_eq!(
+                keymap.consume_action_press_count(&ctx, KeyAction::FsCtrlNavNext),
+                0
+            );
+            crate::key_input::set_test_frame(repeats.into_iter().map(ctrl_down_edge).collect());
+            assert_eq!(
+                keymap.consume_action_press_count(&ctx, KeyAction::FsCtrlNavNext),
+                expected,
+                "ListOrder and Ctrl navigation share the same physical-press/repeat policy"
+            );
+            ctx.end_pass().drop_without_applying_deltas();
         }
     }
 
@@ -15047,6 +16088,335 @@ mod tests {
             keymap.warnings()
         );
         assert!(keymap.overrides.is_empty());
+    }
+
+    #[test]
+    fn key_zoom_defaults_display_and_context_are_complete_and_nonconflicting() {
+        for (action, expected) in [
+            (
+                KeyAction::FsZoomIn,
+                vec![Chord::key(KeySlot::Period), Chord::key(KeySlot::NumpadAdd)],
+            ),
+            (
+                KeyAction::FsZoomOut,
+                vec![
+                    Chord::key(KeySlot::Comma),
+                    Chord::key(KeySlot::NumpadSubtract),
+                ],
+            ),
+        ] {
+            assert!(KeyAction::all().contains(&action));
+            assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+            assert_eq!(action.context(), KeyContext::FsImage);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert_eq!(
+                action.press_multiplicity(),
+                PressMultiplicity::SinglePerFrame
+            );
+            assert!(action.is_user_facing());
+            assert_eq!(action.default_chords().iter().collect::<Vec<_>>(), expected);
+            for removed in [
+                Chord::key(KeySlot::Semicolon),
+                Chord::key(KeySlot::Minus),
+                Chord::shift(KeySlot::Semicolon),
+            ] {
+                assert!(!action.default_chords().iter().any(|chord| chord == removed));
+            }
+            assert!(!page_overview_action_allowed(action));
+            assert!(
+                Keymap::empty()
+                    .command_display_rows_for_active_scopes(FS_IMAGE_ACTIVE_SCOPES, false)
+                    .iter()
+                    .any(|row| row.spec.action == action)
+            );
+            assert!(
+                !Keymap::empty()
+                    .command_display_rows_for_active_scopes(FS_VIDEO_ACTIVE_SCOPES, false)
+                    .iter()
+                    .any(|row| row.spec.action == action)
+            );
+            for chord in expected {
+                assert_eq!(
+                    parse_chord_for_action(action, &chord.settings_name()).unwrap(),
+                    Some(chord)
+                );
+                for other in KeyAction::all()
+                    .iter()
+                    .copied()
+                    .filter(|other| *other != action && actions_can_overlap(action, *other))
+                {
+                    assert!(
+                        !other
+                            .default_chords()
+                            .iter()
+                            .any(|candidate| candidate == chord),
+                        "{action:?}: {chord:?} conflicts with {other:?}"
+                    );
+                }
+            }
+        }
+        let plus = Chord::shift(KeySlot::Semicolon);
+        assert_eq!(plus.display_name(), "+");
+        assert_eq!(plus.settings_name(), "Shift+;");
+        for spelling in ["Shift+;", "Shift+Semicolon"] {
+            assert_eq!(
+                parse_chord_for_action(KeyAction::FsZoomIn, spelling).unwrap(),
+                Some(plus)
+            );
+        }
+        assert!(plus.matches_vk_parts(0xBB, false, true, false));
+        assert!(Chord::key(KeySlot::Minus).matches_vk_parts(0xBD, false, false, false));
+        assert_eq!(
+            Chord::ctrl_shift(KeySlot::Semicolon).display_name(),
+            "Ctrl++"
+        );
+        assert_eq!(
+            Chord::ctrl_shift(KeySlot::Semicolon).settings_name(),
+            "Ctrl+Shift+;"
+        );
+        assert_eq!(Chord::key(KeySlot::Semicolon).display_name(), ";");
+        assert_eq!(
+            parse_chord_for_action(KeyAction::FsZoomIn, "+").unwrap(),
+            Some(plus)
+        );
+    }
+
+    #[test]
+    fn key_zoom_missing_saved_overrides_inherit_defaults_like_page_overview() {
+        let keymap = Keymap::from_ini_str(
+            "[FsImage]\nFsCapture = Period\nFsRotateCw = Minus\nFsZoomOut = none\n[FsCommon]\nFsClose = O\n",
+        );
+        let restored = Keymap::from_settings(&KeymapSettings::from_keymap(&keymap));
+        assert_eq!(
+            restored.effective_chords(KeyAction::FsZoomIn),
+            KeyAction::FsZoomIn
+                .default_chords()
+                .iter()
+                .collect::<Vec<_>>()
+        );
+        assert!(restored.effective_chords(KeyAction::FsZoomOut).is_empty());
+        assert_eq!(
+            restored.effective_chords(KeyAction::FsPageOverviewToggle),
+            KeyAction::FsPageOverviewToggle
+                .default_chords()
+                .iter()
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            restored
+                .binding_conflicts()
+                .iter()
+                .any(|conflict| conflict.action == KeyAction::FsZoomIn
+                    && conflict.other_action == Some(KeyAction::FsCapture)
+                    || conflict.action == KeyAction::FsCapture
+                        && conflict.other_action == Some(KeyAction::FsZoomIn))
+        );
+        assert_eq!(
+            restored.effective_chords(KeyAction::FsCapture),
+            vec![Chord::key(KeySlot::Period)]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn key_zoom_native_repeats_are_single_per_frame_and_keep_repeating() {
+        let _serial = crate::key_input::lock_test_input();
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        for repeat in [false, true] {
+            ctx.begin_pass(Default::default());
+            cache_test_keyboard_owner(&ctx);
+            let mut edge = ctrl_down_edge(repeat);
+            edge.virtual_key = 0xBE;
+            edge.ctrl = false;
+            edge.shift = false;
+            crate::key_input::set_test_frame(vec![edge, edge, edge]);
+            assert_eq!(
+                keymap.consume_action_press_count(&ctx, KeyAction::FsZoomIn),
+                1
+            );
+            crate::key_input::clear_test_frame();
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn display_chords_roundtrip_all_action_defaults_and_key_slots() {
+        for action in KeyAction::all().iter().copied() {
+            for chord in action.default_chords().iter() {
+                assert_eq!(
+                    parse_chord_for_action(action, &chord.display_name()).unwrap(),
+                    Some(chord),
+                    "{action:?}: {chord:?}"
+                );
+            }
+        }
+        for name in enum_variant_names_from_source("KeySlot") {
+            let key = KeySlot::parse(&name).unwrap();
+            for bits in 0..8 {
+                let chord = Chord::new(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, key);
+                assert_eq!(
+                    parse_chord(&chord.display_name()).unwrap(),
+                    chord,
+                    "{chord:?}"
+                );
+            }
+        }
+        for kind in ModKind::ALL {
+            let chord = Chord::modifier(kind);
+            assert_eq!(parse_chord(&chord.display_name()).unwrap(), chord);
+        }
+    }
+
+    #[test]
+    fn plus_display_chords_parse_without_changing_storage_or_ini_spelling() {
+        for text in ["Shift+;", "Shift+Semicolon", "+"] {
+            assert_eq!(
+                parse_chord_for_action(KeyAction::FsZoomIn, text).unwrap(),
+                Some(Chord::shift(KeySlot::Semicolon))
+            );
+        }
+        for (text, ctrl, alt) in [
+            ("+", false, false),
+            ("Ctrl++", true, false),
+            ("Alt++", false, true),
+            ("Ctrl+Alt++", true, true),
+        ] {
+            let expected = Chord::new(ctrl, true, alt, KeySlot::Semicolon);
+            assert_eq!(parse_chord(text).unwrap(), expected);
+            let ini = Keymap::from_ini_str(&format!("[FsImage]\nFsZoomIn = {text} ; zoom\n"));
+            assert_eq!(
+                ini.override_chords(KeyAction::FsZoomIn),
+                Some(&[expected][..])
+            );
+            assert_eq!(parse_chord(&expected.ini_name()).unwrap(), expected);
+            assert!(!expected.ini_name().contains(';'));
+            assert!(expected.settings_name().ends_with(';'));
+        }
+        assert_eq!(
+            parse_chord("Ctrl+Alt+A").unwrap(),
+            Chord::ctrl_alt(KeySlot::A)
+        );
+        assert_eq!(
+            parse_chord("Ctrl+NumpadAdd").unwrap(),
+            Chord::ctrl(KeySlot::NumpadAdd)
+        );
+        for invalid in ["A++", "RightCtrl++", "Ctrl+A++", "++"] {
+            assert!(parse_chord(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn ini_chord_names_roundtrip_every_key_slot_without_comment_markers() {
+        let mut escaped_slots = Vec::new();
+        for name in enum_variant_names_from_source("KeySlot") {
+            let key = KeySlot::parse(&name).expect("KeySlot variant has a parsed alias");
+            let settings = key.settings_name();
+            if settings.contains(';') || settings.contains('#') {
+                escaped_slots.push(name.clone());
+            }
+            for bits in 0..8 {
+                let chord = Chord::Key {
+                    ctrl: bits & 1 != 0,
+                    shift: bits & 2 != 0,
+                    alt: bits & 4 != 0,
+                    key,
+                };
+                let ini_name = chord.ini_name();
+                assert!(
+                    !ini_name.contains(';') && !ini_name.contains('#'),
+                    "{chord:?}"
+                );
+                let parsed = Keymap::from_ini_str(&format!(
+                    "[FsImage]\nFsZoomIn = {ini_name} ; description # comment\n"
+                ));
+                assert_eq!(
+                    parsed.override_chords(KeyAction::FsZoomIn),
+                    Some(&[chord][..]),
+                    "{chord:?}"
+                );
+                if !chord.settings_name().contains(';') && !chord.settings_name().contains('#') {
+                    assert_eq!(ini_name, chord.settings_name());
+                }
+            }
+        }
+        // No current KeySlot emits '#'; ';' is the only spelling needing an alias.
+        assert_eq!(escaped_slots, vec!["Semicolon"]);
+        for kind in ModKind::ALL {
+            let chord = Chord::modifier(kind);
+            assert_eq!(chord.ini_name(), chord.settings_name());
+        }
+    }
+
+    #[test]
+    fn ini_zoom_template_lines_can_be_uncommented_and_loaded() {
+        for template in [Keymap::user_ini_template(), Keymap::default_reference_ini()] {
+            let lines = template
+                .lines()
+                .filter_map(|line| {
+                    let line = line.strip_prefix("# ")?;
+                    (line.starts_with("FsZoomIn.") || line.starts_with("FsZoomOut."))
+                        .then_some(line)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(lines.len(), 4);
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with("FsZoomIn.1 = . ;"))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with("FsZoomOut.1 = , ;"))
+            );
+            let parsed = Keymap::from_ini_str(&format!("[FsImage]\n{}\n", lines.join("\n")));
+            assert!(parsed.warnings().is_empty(), "{:?}", parsed.warnings());
+            for action in [KeyAction::FsZoomIn, KeyAction::FsZoomOut] {
+                assert_eq!(
+                    parsed.override_chords(action),
+                    Some(
+                        action
+                            .default_chords()
+                            .iter()
+                            .collect::<Vec<_>>()
+                            .as_slice()
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ini_zoom_legacy_import_preserves_json_semicolon_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keymap.ini");
+        std::fs::write(
+            &path,
+            "[FsImage]\nFsZoomIn.1 = Shift+Semicolon ; zoom in\nFsZoomIn.2 = Semicolon # alias\n",
+        )
+        .unwrap();
+        let mut settings = KeymapSettings::default();
+        let imported = settings.import_legacy_ini_if_needed(&path);
+        assert!(imported.warnings.is_empty(), "{:?}", imported.warnings);
+        let binding = settings
+            .overrides
+            .iter()
+            .find(|binding| binding.action == "FsZoomIn")
+            .unwrap();
+        assert_eq!(binding.chords, vec!["Shift+;", ";"]);
+        let json = serde_json::to_string(&settings).unwrap();
+        let restored = Keymap::from_settings(&serde_json::from_str(&json).unwrap());
+        assert_eq!(
+            restored.override_chords(KeyAction::FsZoomIn),
+            Some(
+                &[
+                    Chord::shift(KeySlot::Semicolon),
+                    Chord::key(KeySlot::Semicolon)
+                ][..]
+            )
+        );
     }
 
     /// `docs/keymap.ini.default` は生成物と一致していなければならない。

@@ -56,7 +56,11 @@ mod pdf_render_epoch;
 mod notification_duration;
 
 #[path = "tests/plain_folder_spread.rs"]
-mod plain_folder_spread;
+pub(crate) mod plain_folder_spread;
+mod resident_edit_material;
+
+#[path = "tests/tag_applied_at.rs"]
+mod tag_applied_at;
 
 #[path = "tests/startup_notices.rs"]
 pub(super) mod startup_notices;
@@ -6297,7 +6301,7 @@ fn phase_a_missing_comic_fonts_close_preserves_shared_preview() {
             comic_core::TextBlock::default(),
         )],
     );
-    app.comic_fonts = None;
+    app.comic_fonts.seed_for_test(None, Default::default());
     let edit_key = app.current_edit_result_key(0);
     app.edit_result_cache.insert(
         edit_key,
@@ -7938,25 +7942,32 @@ fn spread_cache_does_not_cross_viewer_bundles() {
 }
 
 fn single_folder_navigation_holdover(page_idx: usize, texture: egui::TextureHandle) -> FsHoldover {
-    FsHoldover::FolderNavigation(Some(FsDisplayUnitHoldover {
-        singleton_placement: crate::displayed_image_transform::SingletonSpreadPlacement::Center,
-        layout_projection: crate::app::FsDisplayUnitLayoutProjection::Canonical,
-        pages: vec![FsDisplayUnitHoldoverPage {
-            fit_scale_limits: crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
-            fit_input: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
-                crate::settings::FullscreenFitMode::Page,
-            ),
-            occurrence: crate::ui_fullscreen::SpreadPageOccurrence::navigation(page_idx, page_idx),
-            layout_size: texture.size_vec2(),
-            post_filter: crate::adjustment::PostFilter::None,
-            trace_key: None,
-            trace_load_seq: 0,
-            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
-            rotation: crate::rotation_db::Rotation::None,
-            source_size: None,
-            content_bbox: None,
-        }],
-    }))
+    FsHoldover::FolderNavigation(
+        Some(FsDisplayUnitHoldover {
+            singleton_placement: crate::displayed_image_transform::SingletonSpreadPlacement::Center,
+            layout_projection: crate::app::FsDisplayUnitLayoutProjection::Canonical,
+            pages: vec![FsDisplayUnitHoldoverPage {
+                crop: None,
+                fit_scale_limits:
+                    crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+                fit_input: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                    crate::settings::FullscreenFitMode::Page,
+                ),
+                occurrence: crate::ui_fullscreen::SpreadPageOccurrence::navigation(
+                    page_idx, page_idx,
+                ),
+                layout_size: texture.size_vec2(),
+                post_filter: crate::adjustment::PostFilter::None,
+                trace_key: None,
+                trace_load_seq: 0,
+                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                rotation: crate::rotation_db::Rotation::None,
+                source_size: None,
+                content_bbox: None,
+            }],
+        }),
+        crate::app::FsFolderNavigationOrigin::Ordinary,
+    )
 }
 
 #[test]
@@ -8037,7 +8048,7 @@ fn contextless_test_window(ctx: &egui::Context, id: u64) -> DetachedImageWindowS
     );
     DetachedImageWindowSnapshot {
         id,
-        texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+        display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
         title: format!("paused-{id}"),
         location_display: format!("paused-{id}"),
         image_dims: None,
@@ -31354,6 +31365,7 @@ mod phase_c_drill_nav_tests {
             kind_filter: crate::tag_view::TagViewKindFilter::All,
             summaries: Vec::new(),
             entries: vec![crate::tag_view::TagViewEntry {
+                applied_at_ms: None,
                 path: tag_hit,
                 kind: crate::tag_view::TagViewItemKind::Image,
                 mtime: 2,
@@ -31402,6 +31414,7 @@ mod phase_c_drill_nav_tests {
             kind_filter: crate::tag_view::TagViewKindFilter::All,
             summaries: Vec::new(),
             entries: vec![crate::tag_view::TagViewEntry {
+                applied_at_ms: None,
                 path: audio.clone(),
                 kind: crate::tag_view::TagViewItemKind::Audio,
                 mtime: 1,
@@ -39546,10 +39559,268 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.current_adjust_target_idx(), Some(0));
 
         app.spread_mode = SpreadMode::Ltr;
-        app.adjust_spread_target = AdjustSpreadTarget::Left;
+        app.adjust_spread_target = Some(AdjustSpreadTarget::Left);
         assert_eq!(app.current_adjust_target_idx(), Some(0));
-        app.adjust_spread_target = AdjustSpreadTarget::Right;
+        app.adjust_spread_target = Some(AdjustSpreadTarget::Right);
         assert_eq!(app.current_adjust_target_idx(), Some(1));
+    }
+
+    #[test]
+    fn view_trim_unavailable_database_does_not_inherit_global_auto_or_migrate_legacy_fit() {
+        let mut app = setup_app();
+        app.view_trim_db = None;
+        app.settings.auto_view_trim_default_enabled = true;
+        app.settings.margin_fit_enabled = true;
+        let key = app.tmp.path().join("unavailable-trim-db");
+        app.apply_view_trim_for_key(&key);
+        assert_eq!(
+            app.view_trim_book_preference,
+            crate::view_trim::ViewTrimBookPreference::None
+        );
+        assert_eq!(
+            app.effective_view_trim_apply_mode_for_idx(0),
+            crate::view_trim::ViewTrimApplyMode::None
+        );
+        assert!(app.settings.margin_fit_enabled);
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(text, _, _)| text
+                    == "表示トリムの設定を読み込めないため、トリムなしで表示しています")
+        );
+    }
+
+    #[test]
+    fn pending_view_trim_transfer_keeps_nested_follow_global_marker() {
+        use crate::view_trim::{ViewTrimBookPreference as P, ViewTrimBookState};
+        let mut app = setup_app();
+        let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
+        nav.enter("bookA/");
+        app.zip_nav = Some(nav);
+        let key = app.spread_container_key_with_fallback().unwrap();
+        let root = key
+            .fallback
+            .as_ref()
+            .expect("nested book has root fallback");
+        app.view_trim_db
+            .as_ref()
+            .unwrap()
+            .set_book_state(
+                root,
+                None,
+                ViewTrimBookState {
+                    preference: P::Auto,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        app.view_trim_book_preference = P::FollowGlobal;
+        app.view_trim_save_pending = true;
+        let pending = app.take_pending_view_trim_transfer().unwrap();
+        assert_eq!(
+            pending
+                .batch
+                .book
+                .as_ref()
+                .map(|(exact, fallback, _)| (exact, fallback)),
+            Some((&key.exact, &key.fallback))
+        );
+        app.view_trim_db
+            .as_mut()
+            .unwrap()
+            .apply_write_batch(&pending.batch)
+            .unwrap();
+        let loaded = app
+            .view_trim_db
+            .as_ref()
+            .unwrap()
+            .load_book_preference_with_fallback(&key.exact, key.fallback.as_deref());
+        assert!(matches!(
+            loaded,
+            crate::view_trim_db::ViewTrimBookLoad::Stored(
+                ViewTrimBookState {
+                    preference: P::FollowGlobal,
+                    ..
+                },
+                _
+            )
+        ));
+    }
+
+    #[test]
+    fn view_trim_manual_selection_enables_default_book_and_follow_global_preserves_settings() {
+        use crate::view_trim::{ViewTrimBookPreference as P, ViewTrimBookSettings};
+        use crate::view_trim_db::ViewTrimBookLoad;
+        use egui_kittest::kittest::Queryable;
+
+        fn select_mode(app: &mut App, label: &str) {
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(460.0, 680.0))
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .build_ui(|ui| {
+                    let ctx = ui.ctx().clone();
+                    app.draw_view_trim_controls(
+                        ui,
+                        &ctx,
+                        0,
+                        crate::ui_fullscreen::SpreadPair::Single,
+                        420.0,
+                        640.0,
+                    );
+                });
+            harness.run();
+            harness.get_by_label(label).click();
+            harness.run();
+        }
+
+        let mut app = setup_app();
+        app.current_folder = Some(app.tmp.path().join("trim-default-book"));
+        let path = app.current_folder.as_ref().unwrap().join("page.jpg");
+        app.items.push(GridItem::Image(path));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+        let key = app.spread_container_key_with_fallback().unwrap();
+        assert!(key.fallback.is_none());
+        assert!(matches!(
+            app.view_trim_db
+                .as_ref()
+                .unwrap()
+                .load_book_preference_with_fallback(&key.exact, None),
+            ViewTrimBookLoad::Missing
+        ));
+        assert_eq!(app.view_trim_book_preference, P::FollowGlobal);
+        assert_eq!(app.view_trim_book_settings, ViewTrimBookSettings::default());
+
+        select_mode(&mut app, "手動設定");
+        let ViewTrimBookLoad::Stored(manual, _) = app
+            .view_trim_db
+            .as_ref()
+            .unwrap()
+            .load_book_preference_with_fallback(&key.exact, None)
+        else {
+            panic!("Manual selection must persist a book row");
+        };
+        assert_eq!(manual.preference, P::Manual);
+        assert!(manual.book_settings.enabled);
+
+        // 保存した手動余白も、FollowGlobal への切替で保持する。
+        app.view_trim_book_settings.single.left = 0.08;
+        app.view_trim_book_settings.spread_linked.outer = 0.06;
+        app.persist_current_view_trim_book_state();
+        let book = app.view_trim_book_settings;
+        select_mode(&mut app, "全体設定に従う（現在: トリムなし）");
+        let ViewTrimBookLoad::Stored(inherited, _) = app
+            .view_trim_db
+            .as_ref()
+            .unwrap()
+            .load_book_preference_with_fallback(&key.exact, None)
+        else {
+            panic!("FollowGlobal must retain the enabled book settings and margins");
+        };
+        assert_eq!(inherited.preference, P::FollowGlobal);
+        assert_eq!(inherited.book_settings, book);
+        assert!(inherited.book_settings.enabled);
+    }
+
+    #[test]
+    fn view_trim_panel_mode_changes_preserve_manual_values_and_page_rows() {
+        use crate::view_trim::{
+            ViewTrimBookPreference as P, ViewTrimMargins, ViewTrimPageOverride,
+        };
+        use egui_kittest::kittest::Queryable;
+        let mut app = setup_app();
+        app.current_folder = Some(app.tmp.path().join("trim-book"));
+        let path = app.current_folder.as_ref().unwrap().join("page.jpg");
+        app.items.push(GridItem::Image(path));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+        app.view_trim_book_preference = P::Manual;
+        app.view_trim_book_settings.single.left = 0.08;
+        let book = app.view_trim_book_settings;
+        let page = ViewTrimPageOverride::from_margins(ViewTrimMargins {
+            top: 0.09,
+            ..Default::default()
+        });
+        app.view_trim_page_overrides.insert(0, page);
+        app.persist_view_trim_page_override(0, page);
+        let key = app.page_path_key(0).unwrap();
+        for (global, label, preference) in [
+            (false, "トリムなし", P::None),
+            (false, "自動余白カット（本全体）", P::Auto),
+            (false, "全体設定に従う（現在: トリムなし）", P::FollowGlobal),
+            (
+                true,
+                "全体設定に従う（現在: 自動余白カット）",
+                P::FollowGlobal,
+            ),
+            (true, "手動設定", P::Manual),
+        ] {
+            app.settings.auto_view_trim_default_enabled = global;
+            {
+                let mut harness = crate::test_ui::builder()
+                    .with_size(egui::vec2(460.0, 680.0))
+                    .with_context_setup(crate::ui_fonts::configure_fonts)
+                    .build_ui(|ui| {
+                        let ctx = ui.ctx().clone();
+                        app.draw_view_trim_controls(
+                            ui,
+                            &ctx,
+                            0,
+                            crate::ui_fullscreen::SpreadPair::Single,
+                            420.0,
+                            640.0,
+                        );
+                    });
+                harness.run();
+                harness.get_by_label(label).click();
+                harness.run();
+            }
+            assert_eq!(app.view_trim_book_preference, preference);
+            let mut expected_book = book;
+            if preference == P::Manual {
+                expected_book.enabled = true;
+            }
+            assert_eq!(app.view_trim_book_settings, expected_book);
+            assert_eq!(app.view_trim_page_overrides.get(&0), Some(&page));
+            assert_eq!(
+                app.view_trim_db.as_ref().unwrap().get_page_override(&key),
+                Some(page)
+            );
+        }
+    }
+
+    #[test]
+    fn view_trim_load_only_migrates_missing_and_legacy_none_and_preserves_invalid_row() {
+        use crate::view_trim::{ViewTrimBookPreference as P, ViewTrimBookState};
+        let mut app = setup_app();
+        let conn = rusqlite::Connection::open(app.tmp.path().join("view_trim.db")).unwrap();
+        for (name, json, expected) in [
+            ("missing", None, P::Auto),
+            ("legacy-none", Some(r#"{"apply_mode":"none","book_settings":{"single":{"left":0.08,"top":0,"right":0,"bottom":0}}}"#.to_string()), P::Auto),
+            ("legacy-page", Some(r#"{"apply_mode":"page"}"#.to_string()), P::None),
+            ("current-none", Some(serde_json::to_string(&ViewTrimBookState { preference: P::None, ..Default::default() }).unwrap()), P::None),
+            ("current-marker", Some(serde_json::to_string(&ViewTrimBookState::default()).unwrap()), P::FollowGlobal),
+            ("invalid", Some(r#"{"version":3,"preference":"auto"}"#.to_string()), P::None),
+        ] {
+            let path = app.tmp.path().join(name);
+            let key = crate::path_key::normalize(&path);
+            if let Some(json) = &json {
+                conn.execute("INSERT INTO view_trim_books(book_key,state_json) VALUES(?1,?2)", rusqlite::params![key, json]).unwrap();
+            }
+            app.settings.margin_fit_enabled = true;
+            app.settings.auto_view_trim_default_enabled = true;
+            app.apply_view_trim_for_key(&path);
+            assert_eq!(app.view_trim_book_preference, expected, "{name}");
+            if name == "legacy-none" { assert_eq!(app.view_trim_book_settings.single.left, 0.08); }
+            if name.starts_with("current") || name == "invalid" || name == "legacy-page" {
+                let after: String = conn.query_row("SELECT state_json FROM view_trim_books WHERE book_key=?1", [&key], |row| row.get(0)).unwrap();
+                assert_eq!(Some(after), json, "{name} must not be rewritten");
+            }
+            if name == "invalid" {
+                assert_eq!(app.effective_view_trim_apply_mode_for_idx(0), crate::view_trim::ViewTrimApplyMode::None);
+                assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| text == "表示トリムの設定を読み込めないため、トリムなしで表示しています"));
+            }
+        }
     }
 
     #[test]
@@ -39604,7 +39875,7 @@ mod favorite_adjustment_defaults_tests {
         app.hydrate_view_trim_page_overrides_for_current_items();
 
         assert_eq!(app.view_trim_page_overrides.get(&0), Some(&saved));
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         // 再水和した enabled 行は一時的な選択操作を待たず、そのページの手動設定になる。
         assert_eq!(
             app.effective_view_trim_apply_mode_for_idx(0),
@@ -39635,7 +39906,7 @@ mod favorite_adjustment_defaults_tests {
             top: 0.04,
             ..Default::default()
         });
-        app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         app.view_trim_book_settings.enabled = true;
         app.view_trim_book_settings.single = book_margins;
         app.view_trim_page_overrides.insert(0, page_override);
@@ -39664,7 +39935,7 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn non_manual_view_trim_modes_ignore_page_overrides() {
         use crate::grid_item::{GridItem, ThumbnailState};
-        use crate::view_trim::{ViewTrimApplyMode, ViewTrimMargins, ViewTrimPageOverride};
+        use crate::view_trim::{ViewTrimMargins, ViewTrimPageOverride};
 
         let mut app = setup_app();
         app.items
@@ -39678,9 +39949,15 @@ mod favorite_adjustment_defaults_tests {
             }),
         );
 
-        for mode in [ViewTrimApplyMode::None, ViewTrimApplyMode::Auto] {
-            app.view_trim_apply_mode = mode;
-            assert_eq!(app.effective_view_trim_apply_mode_for_idx(0), mode);
+        for preference in [
+            crate::view_trim::ViewTrimBookPreference::None,
+            crate::view_trim::ViewTrimBookPreference::Auto,
+        ] {
+            app.view_trim_book_preference = preference;
+            assert_eq!(
+                app.effective_view_trim_apply_mode_for_idx(0),
+                preference.resolve(false)
+            );
             assert_eq!(app.view_trim_single_bbox(0), None);
         }
     }
@@ -39688,9 +39965,7 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn manual_spread_resolves_one_sided_override_and_book_fallback() {
         use crate::grid_item::{GridItem, ThumbnailState};
-        use crate::view_trim::{
-            ViewTrimApplyMode, ViewTrimMargins, ViewTrimPageOverride, ViewTrimSpreadSide,
-        };
+        use crate::view_trim::{ViewTrimMargins, ViewTrimPageOverride, ViewTrimSpreadSide};
 
         let mut app = setup_app();
         for name in ["left.jpg", "right.jpg"] {
@@ -39708,7 +39983,7 @@ mod favorite_adjustment_defaults_tests {
             right: 0.06,
             ..Default::default()
         };
-        app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         app.view_trim_book_settings.enabled = true;
         app.view_trim_book_settings.spread_separate = true;
         app.view_trim_book_settings.spread_right = right_book;
@@ -40028,6 +40303,559 @@ mod favorite_adjustment_defaults_tests {
         app.analysis_mode = false;
     }
 
+    fn section1458_spread_app(
+        ctx: &egui::Context,
+        mode: crate::settings::SpreadMode,
+        count: usize,
+    ) -> AppTestEnv {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("section1458-book");
+        std::fs::create_dir_all(&folder).unwrap();
+        app.current_folder = Some(folder.clone());
+        app.top_level_grid_view
+            .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
+        app.items = (0..count)
+            .map(|idx| GridItem::Image(folder.join(format!("{idx}.png"))))
+            .collect();
+        app.visible_indices = (0..count).collect();
+        app.details_order = (0..count).collect();
+        app.thumbnails = (0..count).map(|_| ThumbnailState::Pending).collect();
+        app.viewer_navigation_caches.invalidate();
+        for idx in 0..count {
+            insert_export_static_source(&mut app, ctx, idx, [4, 6], "section1458-source");
+        }
+        app.spread_mode = mode;
+        app.fullscreen_idx = Some(0);
+        app
+    }
+
+    #[test]
+    fn section1458_page_edit_pivot_follows_reading_order_and_keeps_screen_pair() {
+        use crate::settings::SpreadMode;
+
+        for (mode, anchor, target, pair) in [
+            (SpreadMode::Ltr, 1, 0, (0, 1)),
+            (SpreadMode::Rtl, 1, 0, (1, 0)),
+            (SpreadMode::LtrCover, 2, 1, (1, 2)),
+            (SpreadMode::RtlCover, 2, 1, (2, 1)),
+        ] {
+            let mut app = section1458_spread_app(&egui::Context::default(), mode, 4);
+            let (actual, pivot) = app.plan_page_edit_pivot(anchor);
+            assert_eq!(actual, target, "{mode:?}");
+            let pivot = pivot.unwrap();
+            assert_eq!(pivot.pair, pair);
+            assert_eq!(pivot.navigation_anchor_idx, anchor);
+            assert_eq!(pivot.saved_mode, mode);
+            assert_eq!(
+                app.spread_mode, mode,
+                "planning must not mutate display state"
+            );
+        }
+        for (mode, anchor) in [(SpreadMode::Single, 1), (SpreadMode::RtlCover, 0)] {
+            let mut app = section1458_spread_app(&egui::Context::default(), mode, 4);
+            let (target, pivot) = app.plan_page_edit_pivot(anchor);
+            assert_eq!(target, anchor);
+            assert!(pivot.is_none());
+        }
+    }
+
+    fn section1458_paint_spread(
+        app: &mut App,
+        screen_pages: impl IntoIterator<Item = crate::ui_fullscreen::SpreadPageOccurrence>,
+    ) {
+        use crate::displayed_image_transform::{
+            DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
+            FullscreenPageLayoutKind, RectPixelFit, ResolvedDisplayPlacement,
+        };
+
+        app.fullscreen_page_layout
+            .begin(FullscreenPageLayoutKind::Spread);
+        for (slot, page) in screen_pages.into_iter().enumerate() {
+            let rect =
+                egui::Rect::from_min_size(egui::pos2(slot as f32 * 4.0, 0.0), egui::vec2(4.0, 6.0));
+            let transform = DisplayedImageTransform::from_resolved_rect(
+                DisplayedImageTransformInput {
+                    pixel_fit: RectPixelFit::Texels,
+                    page_idx: page.idx,
+                    viewport_rect: egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(8.0, 6.0),
+                    ),
+                    source_size: egui::vec2(4.0, 6.0),
+                    texture_size: egui::vec2(4.0, 6.0),
+                    rotation: crate::rotation_db::Rotation::None,
+                    free_rotation_rad: 0.0,
+                    content_bbox: None,
+                    fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                        crate::settings::FullscreenFitMode::Page,
+                    ),
+                    fit_scale_limits: FullscreenFitScaleLimits::default(),
+                    pixels_per_point: 1.0,
+                    placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                },
+                rect,
+            )
+            .unwrap();
+            app.fullscreen_page_layout.push_occurrence(transform, page);
+        }
+    }
+
+    #[test]
+    fn section1458_final_cover_edit_and_adjustment_start_on_navigation_page() {
+        use crate::settings::{FinalCoverSpreadPreference, SpreadMode};
+        use crate::ui_fullscreen::SpreadPageRole;
+
+        for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+            for (count, forced_last) in [(4, false), (4, true), (5, true)] {
+                let mut app = section1458_spread_app(&egui::Context::default(), mode, count);
+                app.settings.final_cover_spread_enabled = true;
+                app.final_cover_spread_preference = FinalCoverSpreadPreference::On;
+                app.settings.last_page_alone_enabled = forced_last;
+                let anchor = count - 1;
+                app.fullscreen_idx = Some(anchor);
+                let pages = app
+                    .resolve_visible_spread_presentation_in_reading_order(anchor)
+                    .unwrap();
+                assert_eq!(pages[0].role, SpreadPageRole::Navigation);
+                assert_eq!(pages[0].idx, anchor);
+                assert_eq!(pages[1].role, SpreadPageRole::FrontCoverSupplement);
+                let (target, pivot) = app.plan_page_edit_pivot(anchor);
+                let pivot = pivot.unwrap();
+                assert_eq!(target, anchor, "{mode:?}, forced_last={forced_last}");
+                let navigation_on_right = mode.is_rtl() != (forced_last && count % 2 == 0);
+                assert_eq!(
+                    pivot.pair,
+                    if navigation_on_right {
+                        (0, anchor)
+                    } else {
+                        (anchor, 0)
+                    }
+                );
+                assert_eq!(pivot.navigation_anchor_idx, anchor);
+                assert!(app.adjust_spread_target.is_none());
+                assert_eq!(app.current_adjust_target_idx(), Some(anchor));
+                assert_eq!(
+                    app.resolve_visible_spread_edit_pages(anchor)
+                        .unwrap()
+                        .reading_start,
+                    if navigation_on_right {
+                        AdjustSpreadTarget::Right
+                    } else {
+                        AdjustSpreadTarget::Left
+                    }
+                );
+
+                // The painted-layout path must retain the same role and physical pair.
+                let screen_pages = app
+                    .spread_display_composition_for_anchor(anchor)
+                    .pages_in_screen_order(mode);
+                section1458_paint_spread(&mut app, screen_pages);
+                let (painted_target, painted_pivot) = app.plan_page_edit_pivot(anchor);
+                assert_eq!(painted_target, anchor);
+                assert_eq!(painted_pivot.unwrap().pair, pivot.pair);
+            }
+        }
+    }
+
+    #[test]
+    fn section1458_stale_tail_cover_layout_does_not_pivot_front_cover_to_tail() {
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::SpreadPageOccurrence as Page;
+
+        for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+            let mut app = section1458_spread_app(&egui::Context::default(), mode, 4);
+            app.settings.final_cover_spread_enabled = true;
+            // Build the old tail independently of the current front-cover composition.
+            let navigation = Page::navigation(3, 3);
+            let supplement = Page::final_cover_supplement(0, 3);
+            section1458_paint_spread(
+                &mut app,
+                if mode.is_rtl() {
+                    [supplement, navigation]
+                } else {
+                    [navigation, supplement]
+                },
+            );
+            assert!(app.resolve_visible_spread_edit_pages(3).is_some());
+            app.fullscreen_idx = Some(0);
+            assert!(app.resolve_visible_spread_edit_pages(0).is_none());
+            let (target, pivot) = app.plan_page_edit_pivot(0);
+            assert_eq!(target, 0);
+            assert!(
+                pivot.is_none(),
+                "{mode:?}: a supplement occurrence is not a navigation match"
+            );
+            assert_eq!(app.current_adjust_target_idx(), Some(0));
+            assert_eq!(app.current_local_adjust_edit_idx(), Some(0));
+        }
+    }
+
+    #[test]
+    fn section1458_adjust_default_follows_shift_landing_in_paged_and_continuous_reading() {
+        use crate::settings::{ReadingFlow, SpreadMode};
+        use crate::ui_fullscreen::FsPageNav;
+
+        for flow in [
+            ReadingFlow::Paged,
+            ReadingFlow::Vertical,
+            ReadingFlow::Horizontal,
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = section1458_spread_app(&ctx, SpreadMode::RtlCover, 4);
+            app.settings.final_cover_spread_enabled = true;
+            app.settings.last_page_alone_enabled = true;
+            app.reading_flow = flow;
+            app.fullscreen_idx = Some(3);
+            assert_eq!(app.continuous_reading_active_for_idx(3), !flow.is_paged());
+            let from = app.resolve_visible_spread_edit_pages(3).unwrap();
+            assert_eq!(from.pair, (3, 0));
+            assert_eq!(from.reading_start, AdjustSpreadTarget::Left);
+            assert_eq!(app.current_adjust_target_idx(), Some(3));
+            app.adjust_spread_target = Some(AdjustSpreadTarget::Left);
+
+            let mut action = crate::ui_fullscreen::FsKeyAction::default();
+            app.queue_spread_shift_action(3, -1, &mut action);
+            let FsPageNav::Target(target) = action.page_nav else {
+                panic!("shift must produce a concrete landing target");
+            };
+            assert_eq!(target, 2);
+            assert!(app.adjust_spread_target.is_none());
+            let mut perf = None;
+            app.land_still_page_navigation_target(
+                &ctx,
+                3,
+                target,
+                crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                &mut perf,
+            );
+            assert_eq!(
+                app.fullscreen_idx,
+                Some(2),
+                "{flow:?}: exercise the actual landing"
+            );
+            let landed = app.resolve_visible_spread_edit_pages(2).unwrap();
+            assert_eq!(landed.pair, (2, 1));
+            assert_eq!(landed.reading_start, AdjustSpreadTarget::Right);
+            assert!(app.adjust_spread_target.is_none());
+            assert_eq!(app.current_adjust_target_idx(), Some(1), "{flow:?}");
+            assert_eq!(app.current_local_adjust_edit_idx(), Some(1), "{flow:?}");
+            assert_eq!(app.plan_page_edit_pivot(2).0, 1);
+        }
+    }
+
+    #[test]
+    fn section1458_last_page_setting_rebuild_keeps_adjustment_and_editor_on_navigation() {
+        use crate::settings::SpreadMode;
+        use crate::ui_fullscreen::SpreadPageOccurrence as Page;
+
+        let _input_guard = crate::key_input::lock_test_input();
+        for initially_alone in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = section1458_spread_app(&ctx, SpreadMode::RtlCover, 4);
+            app.settings.final_cover_spread_enabled = true;
+            app.settings.last_page_alone_enabled = initially_alone;
+            app.fullscreen_idx = Some(3);
+            let navigation = Page::navigation(3, 3);
+            let supplement = Page::final_cover_supplement(0, 3);
+            section1458_paint_spread(
+                &mut app,
+                if initially_alone {
+                    [navigation, supplement]
+                } else {
+                    [supplement, navigation]
+                },
+            );
+            assert_eq!(app.current_adjust_target_idx(), Some(3));
+            app.keymap =
+                crate::keymap::Keymap::from_ini_str("[FsImage]\nFsToggleLastPageAlone = F13\n");
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::F13,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            });
+            app.keyboard_owner_for_pass(&ctx);
+            let _ = app.handle_fs_key_input(&ctx, 3, false);
+            ctx.end_pass().drop_without_applying_deltas();
+            assert_eq!(
+                app.page_alone_enabled_for_current_book().last,
+                !initially_alone
+            );
+            let rebuilt = app.resolve_visible_spread_edit_pages(3).unwrap();
+            assert_eq!(rebuilt.pair, if initially_alone { (0, 3) } else { (3, 0) });
+            assert!(app.adjust_spread_target.is_none());
+            assert_eq!(app.current_adjust_target_idx(), Some(3));
+            assert_eq!(app.current_local_adjust_edit_idx(), Some(3));
+            app.enter_local_adjust_mode(&ctx);
+            assert!(app.local_adjust_mode);
+            assert_eq!(app.fullscreen_idx, Some(3));
+            assert_eq!(app.spread_mode, SpreadMode::Single);
+        }
+    }
+
+    #[test]
+    fn section1458_explicit_adjust_side_persists_in_continuous_reading_and_clears_on_paged_turn() {
+        use crate::settings::{ReadingFlow, SpreadMode};
+
+        for flow in [
+            ReadingFlow::Paged,
+            ReadingFlow::Vertical,
+            ReadingFlow::Horizontal,
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = section1458_spread_app(&ctx, SpreadMode::Rtl, 6);
+            app.reading_flow = flow;
+            // This is the state stored by the physical left-page selector.
+            app.adjust_spread_target = Some(AdjustSpreadTarget::Left);
+            for _ in 0..2 {
+                assert_eq!(app.current_adjust_target_idx(), Some(1));
+                assert_eq!(app.current_local_adjust_edit_idx(), Some(1));
+                assert_eq!(
+                    app.plan_page_edit_pivot(0).0,
+                    0,
+                    "entry keeps its reading-start rule"
+                );
+                assert_eq!(app.adjust_spread_target, Some(AdjustSpreadTarget::Left));
+            }
+            if !flow.is_paged() {
+                app.seek_to_continuous_page_with_contract(
+                    &ctx,
+                    0,
+                    crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                );
+                assert_eq!(app.adjust_spread_target, Some(AdjustSpreadTarget::Left));
+            }
+            let mut perf = None;
+            app.land_still_page_navigation_target(
+                &ctx,
+                0,
+                2,
+                crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                &mut perf,
+            );
+            assert_eq!(app.fullscreen_idx, Some(2));
+            if flow.is_paged() {
+                assert!(app.adjust_spread_target.is_none());
+                assert_eq!(app.current_adjust_target_idx(), Some(2));
+                assert_eq!(app.current_local_adjust_edit_idx(), Some(2));
+            } else {
+                assert_eq!(app.adjust_spread_target, Some(AdjustSpreadTarget::Left));
+                assert_eq!(app.current_adjust_target_idx(), Some(3));
+                assert_eq!(app.current_local_adjust_edit_idx(), Some(3));
+                // Scrolling can re-anchor without opening or seeking a file.
+                app.adjust_spread_target = Some(AdjustSpreadTarget::Right);
+                app.reanchor_continuous_reading_viewer(
+                    &ctx,
+                    &[0.0, 100.0, 200.0],
+                    1,
+                    2,
+                    crate::page_split::PageSlice::Full,
+                    HistoryTrigger::AutoAdvance,
+                );
+                assert_eq!(app.fullscreen_idx, Some(2));
+                assert_eq!(app.adjust_spread_target, Some(AdjustSpreadTarget::Right));
+                app.reanchor_continuous_reading_viewer(
+                    &ctx,
+                    &[0.0, 100.0, 200.0],
+                    2,
+                    4,
+                    crate::page_split::PageSlice::Full,
+                    HistoryTrigger::AutoAdvance,
+                );
+                assert_eq!(app.fullscreen_idx, Some(4));
+                assert_eq!(app.adjust_spread_target, Some(AdjustSpreadTarget::Right));
+                assert_eq!(app.current_adjust_target_idx(), Some(4));
+                assert_eq!(app.current_local_adjust_edit_idx(), Some(4));
+            }
+        }
+    }
+
+    fn section1458_finish_conceal_entry(app: &mut App, ctx: &egui::Context) {
+        // Exercise the real worker and its adoption path through complete_conceal_mode_entry.
+        assert!(!app.conceal_mode);
+        assert!(app.local_adjust_pending.contains_key(&0));
+        assert!(!app.local_adjust_pending.contains_key(&1));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.conceal_mode && std::time::Instant::now() < deadline {
+            app.poll_local_adjust_render(ctx);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(app.conceal_mode, "conceal worker must complete entry");
+        assert!(app.conceal_base_cache.contains_key(&0));
+        assert!(!app.conceal_base_cache.contains_key(&1));
+    }
+
+    #[test]
+    fn section1458_every_edit_entry_uses_reading_start_including_async_conceal() {
+        use crate::settings::SpreadMode;
+
+        for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+            for tool in 0..6 {
+                let ctx = egui::Context::default();
+                let mut app = section1458_spread_app(&ctx, mode, 4);
+                // Enter from the second page's navigation index as well as the first page.
+                app.fullscreen_idx = Some(1);
+                match tool {
+                    0 => app.enter_erase_mode(1),
+                    1 => {
+                        app.enter_conceal_mode(&ctx, 1);
+                        section1458_finish_conceal_entry(&mut app, &ctx);
+                    }
+                    2 => app.enter_local_adjust_mode(&ctx),
+                    3 => app.enter_export_crop_mode(1),
+                    4 => app.enter_text_mode(1),
+                    5 => app.enter_sns_split_mode(1).unwrap(),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    [
+                        app.erase_mode,
+                        app.conceal_mode,
+                        app.local_adjust_mode,
+                        app.export_crop_mode,
+                        app.text_mode,
+                        app.sns_split.is_some()
+                    ][tool]
+                );
+                assert_eq!(app.fullscreen_idx, Some(0), "{mode:?}, tool={tool}");
+                assert_eq!(app.spread_mode, SpreadMode::Single);
+                assert_eq!(
+                    app.page_edit_spread_pair(),
+                    Some(if mode.is_rtl() { (1, 0) } else { (0, 1) })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn section1458_edit_keys_use_reading_start_including_async_conceal() {
+        use crate::settings::SpreadMode;
+
+        let _input_guard = crate::key_input::lock_test_input();
+        for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+            // Crop has no entry KeyAction; its handler entry is covered above.
+            for (tool, key, modifiers) in [
+                (0, egui::Key::E, egui::Modifiers::NONE),
+                (1, egui::Key::M, egui::Modifiers::CTRL),
+                (2, egui::Key::G, egui::Modifiers::CTRL),
+                (3, egui::Key::T, egui::Modifiers::CTRL),
+                (4, egui::Key::F13, egui::Modifiers::NONE),
+            ] {
+                let ctx = egui::Context::default();
+                let mut app = section1458_spread_app(&ctx, mode, 4);
+                app.fullscreen_idx = Some(1);
+                app.keymap =
+                    crate::keymap::Keymap::from_ini_str("[FsImage]\nFsSnsSplitMode = F13\n");
+                ctx.begin_pass(egui::RawInput {
+                    events: vec![
+                        egui::Event::ModifiersChanged(modifiers),
+                        egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                        },
+                    ],
+                    ..Default::default()
+                });
+                app.keyboard_owner_for_pass(&ctx);
+                let _ = app.handle_fs_key_input(&ctx, 1, false);
+                ctx.end_pass().drop_without_applying_deltas();
+                if tool == 1 {
+                    section1458_finish_conceal_entry(&mut app, &ctx);
+                }
+                assert!(
+                    [
+                        app.erase_mode,
+                        app.conceal_mode,
+                        app.local_adjust_mode,
+                        app.text_mode,
+                        app.sns_split.is_some()
+                    ][tool],
+                    "{mode:?}, key={key:?}"
+                );
+                assert_eq!(app.fullscreen_idx, Some(0));
+                assert_eq!(app.spread_mode, SpreadMode::Single);
+                assert_eq!(
+                    app.page_edit_spread_pair(),
+                    Some(if mode.is_rtl() { (1, 0) } else { (0, 1) })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn section1458_adjust_target_resets_on_open_mode_shift_and_direction() {
+        use crate::settings::{ReadingDirection, SpreadMode};
+
+        for (mode, opposite, expected, direction) in [
+            (
+                SpreadMode::Ltr,
+                SpreadMode::Rtl,
+                AdjustSpreadTarget::Left,
+                ReadingDirection::Ltr,
+            ),
+            (
+                SpreadMode::Rtl,
+                SpreadMode::Ltr,
+                AdjustSpreadTarget::Right,
+                ReadingDirection::Rtl,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = section1458_spread_app(&ctx, mode, 6);
+            app.adjust_spread_target = Some(if expected == AdjustSpreadTarget::Left {
+                AdjustSpreadTarget::Right
+            } else {
+                AdjustSpreadTarget::Left
+            });
+            app.fullscreen_idx = None;
+            app.open_fullscreen(0, HistoryTrigger::UserChosen);
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.adjust_spread_target, None, "open {mode:?}");
+
+            app.adjust_spread_target = Some(expected);
+            app.spread_mode = opposite;
+            assert!(app.apply_fullscreen_spread_mode(&ctx, 0, mode));
+            assert_eq!(app.adjust_spread_target, None, "mode {mode:?}");
+
+            app.adjust_spread_target = Some(if expected == AdjustSpreadTarget::Left {
+                AdjustSpreadTarget::Right
+            } else {
+                AdjustSpreadTarget::Left
+            });
+            let mut action = crate::ui_fullscreen::FsKeyAction::default();
+            app.queue_spread_shift_action(0, 1, &mut action);
+            assert!(
+                !action.page_nav.is_none(),
+                "shift must actually be accepted"
+            );
+            assert_eq!(app.adjust_spread_target, None, "shift {mode:?}");
+
+            app.adjust_spread_target = Some(expected);
+            app.spread_mode = opposite;
+            app.reading_direction = direction;
+            assert!(app.sync_spread_mode_from_reading_direction());
+            assert_eq!(app.spread_mode, mode);
+            assert_eq!(app.adjust_spread_target, None, "direction {mode:?}");
+
+            // open_fullscreen also tears down an editor's Single pivot. Resolve the
+            // initial target after that restores the actual reading direction.
+            app.reset_live_spread_shift(false);
+            app.enter_erase_mode(0);
+            assert!(app.erase_mode);
+            assert_eq!(app.spread_mode, SpreadMode::Single);
+            app.open_fullscreen(0, HistoryTrigger::UserChosen);
+            assert_eq!(app.spread_mode, mode);
+            assert_eq!(app.adjust_spread_target, None, "open after erase {mode:?}");
+        }
+    }
+
     /// **6 つの編集ツールが同じ手順で単ページへ倒れ、抜けたら見開きへ戻る。**
     ///
     /// 補正レイヤー (Ctrl+G) だけこの手順を持たず、見開きから入るとマスク編集も左右の
@@ -40148,7 +40976,8 @@ mod favorite_adjustment_defaults_tests {
             app.final_cover_spread_preference = FinalCoverSpreadPreference::On;
             app.fullscreen_idx = Some(3);
 
-            let (_, pivot) = app.plan_page_edit_pivot(3);
+            let (target, pivot) = app.plan_page_edit_pivot(3);
+            assert_eq!(target, 3, "editing starts on the Navigation page");
             let pivot = pivot.expect("final singleton has a presentation supplement");
             assert_eq!(pivot.pair, screen_pair);
             assert_eq!(pivot.navigation_anchor_idx, 3);
@@ -48267,7 +49096,7 @@ mod favorite_adjustment_defaults_tests {
 
         app.capture_fs_nav_holdover(idx);
 
-        let FsHoldover::FolderNavigation(Some(unit)) =
+        let FsHoldover::FolderNavigation(Some(unit), _) =
             app.fs_holdover_tex.as_ref().expect("holdover captured")
         else {
             panic!("folder navigation must own a captured display unit");
@@ -48399,7 +49228,7 @@ mod favorite_adjustment_defaults_tests {
         ] {
             app.spread_mode = mode;
             app.capture_fs_nav_holdover(first);
-            let FsHoldover::FolderNavigation(Some(unit)) = app
+            let FsHoldover::FolderNavigation(Some(unit), _) = app
                 .fs_holdover_tex
                 .as_ref()
                 .expect("spread holdover captured")
@@ -49769,7 +50598,10 @@ mod favorite_adjustment_defaults_tests {
         app.capture_fs_nav_holdover(0);
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(None))
+            Some(FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary
+            ))
         ));
 
         app.close_fullscreen_for_folder_nav_reopen();
@@ -49780,7 +50612,10 @@ mod favorite_adjustment_defaults_tests {
         );
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(None))
+            Some(FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary
+            ))
         ));
         app.open_fullscreen(0, HistoryTrigger::UserChosen);
         assert_eq!(app.fullscreen_idx, Some(0));
@@ -50663,7 +51498,10 @@ mod favorite_adjustment_defaults_tests {
         );
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(None))
+            Some(FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary
+            ))
         ));
         assert!(
             app.fs_nav_is_locked(),
@@ -50684,7 +51522,10 @@ mod favorite_adjustment_defaults_tests {
         );
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(None))
+            Some(FsHoldover::FolderNavigation(
+                None,
+                crate::app::FsFolderNavigationOrigin::Ordinary
+            ))
         ));
 
         app.thumbnails = vec![ThumbnailState::loaded_raster(
@@ -53307,6 +54148,7 @@ mod pipeline_cache_refactor_tests {
                     crate::displayed_image_transform::SingletonSpreadPlacement::Center,
                 layout_projection: crate::app::FsDisplayUnitLayoutProjection::Canonical,
                 pages: vec![FsDisplayUnitHoldoverPage {
+                    crop: None,
                     fit_scale_limits:
                         crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
                     fit_input: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
@@ -66142,6 +66984,113 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
+    fn native_deinterlace_event_checks_owner_epoch_and_preserves_settings_and_sibling() {
+        use crate::settings::VideoDeinterlaceMode as Mode;
+        use crate::video::NativeVideoOutputEvent as Ev;
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.settings.video_deinterlace = Mode::Auto;
+        for idx in 0..2 {
+            let player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(
+                app.tmp.path().join(format!("deinterlace-{idx}.mkv")),
+            );
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+        }
+        app.fullscreen_idx = Some(0);
+        let mode = |app: &App, idx| match app.fs_cache.get(&idx).unwrap() {
+            FsCacheEntry::Video { player, .. } => player.deinterlace_mode(),
+            _ => unreachable!(),
+        };
+        let initial = mode(&app, 0);
+        let event = || Ev::SetDeinterlaceMode { mode: Mode::On };
+        app.handle_native_video_output_event(&ctx, 1, 0, event());
+        app.handle_native_video_output_event(&ctx, 0, 99, event());
+        assert_eq!(mode(&app, 0), initial);
+        assert_eq!(mode(&app, 1), initial);
+        app.handle_native_video_output_event(&ctx, 0, 0, event());
+        assert_eq!(mode(&app, 0), Mode::On);
+        assert_eq!(mode(&app, 1), initial);
+        assert_eq!(app.settings.video_deinterlace, Mode::Auto);
+
+        // A parked HUD click activates its owner, even with an old source epoch,
+        // without applying the command to that source.
+        app.native_video_parked_live_input_window_id = Some(92);
+        app.handle_native_video_output_event(
+            &ctx,
+            0,
+            99,
+            Ev::SetDeinterlaceMode { mode: Mode::Off },
+        );
+        assert_eq!(app.native_video_parked_live_activation_requests, vec![92]);
+        assert_eq!(mode(&app, 0), Mode::On);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn native_deinterlace_event_uses_mounted_viewer_player_only() {
+        use crate::settings::VideoDeinterlaceMode as Mode;
+        use crate::video::NativeVideoOutputEvent as Ev;
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let path = app.tmp.path().join("deinterlace-main.mkv");
+        let idx = push_video(&mut app, path.to_str().unwrap());
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(path),
+                ),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(idx);
+        let original = match app.fs_cache.get(&idx).unwrap() {
+            FsCacheEntry::Video { player, .. } => player.deinterlace_mode(),
+            _ => unreachable!(),
+        };
+        let detached_path = app.tmp.path().join("deinterlace-detached.mkv");
+        let other = app.build_window_context_for_test(903, |mounted| {
+            let path = detached_path;
+            let idx = push_video(mounted, path.to_str().unwrap());
+            mounted.fs_cache.insert(
+                idx,
+                FsCacheEntry::Video {
+                    player: Box::new(
+                        crate::video::VideoPlayer::stream_ready_disconnected_for_test(path),
+                    ),
+                    load_seq: 0,
+                },
+            );
+            mounted.fullscreen_idx = Some(idx);
+        });
+        app.with_viewer_context(other, |mounted| {
+            let idx = mounted.fullscreen_idx.unwrap();
+            mounted.handle_native_video_output_event(
+                &ctx,
+                idx,
+                0,
+                Ev::SetDeinterlaceMode { mode: Mode::On },
+            );
+            let FsCacheEntry::Video { player, .. } = mounted.fs_cache.get(&idx).unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(player.deinterlace_mode(), Mode::On);
+        })
+        .unwrap();
+        let FsCacheEntry::Video { player, .. } = app.fs_cache.get(&idx).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(player.deinterlace_mode(), original);
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn native_audio_track_event_checks_owner_epoch_and_track_then_uses_norm_owner() {
         use crate::video::NativeVideoOutputEvent as Ev;
         let mut app = setup_app();
@@ -77396,7 +78345,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 7,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: "parked media".to_owned(),
                 location_display: "parked media".to_owned(),
                 image_dims: None,
@@ -77485,7 +78434,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 61,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(media_tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(media_tex)).into(),
                 title: "parked media".to_owned(),
                 location_display: "parked media".to_owned(),
                 image_dims: None,
@@ -77713,7 +78662,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 61,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(media_tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(media_tex)).into(),
                 title: "parked media".to_owned(),
                 location_display: "parked media".to_owned(),
                 image_dims: None,
@@ -77787,7 +78736,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let make_snapshot =
             |id: u64, tex: egui::TextureHandle, path: &str| DetachedImageWindowSnapshot {
                 id,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: format!("still {id}"),
                 location_display: format!("still {id}"),
                 image_dims: None,
@@ -78350,7 +79299,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 91,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(media_tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(media_tex)).into(),
                 title: "parked".to_owned(),
                 location_display: "parked".to_owned(),
                 image_dims: None,
@@ -78660,7 +79609,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 95,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: "parked music".to_owned(),
                 location_display: "parked music".to_owned(),
                 image_dims: None,
@@ -79305,7 +80254,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 93,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: "parked".to_owned(),
                 location_display: "parked".to_owned(),
                 image_dims: None,
@@ -79357,7 +80306,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 94,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: "parked still".to_owned(),
                 location_display: "parked still".to_owned(),
                 image_dims: None,
@@ -80620,7 +81569,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: WINDOW_ID,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
                 title: "a.pdf - mimageviewer".to_string(),
                 location_display: "a.pdf".to_string(),
                 image_dims: Some((1, 1)),
@@ -80767,7 +81716,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 42,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(first_texture),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(first_texture))
+                    .into(),
                 title: "a.pdf - mimageviewer".to_string(),
                 location_display: "a.pdf".to_string(),
                 image_dims: Some((1, 1)),
@@ -80981,7 +81931,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 1,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
                 title: "pinned.pdf - mimageviewer".to_string(),
                 location_display: "pinned.pdf".to_string(),
                 image_dims: Some((1, 1)),
@@ -81291,7 +82241,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 },
                 maximized: false,
             });
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         app.view_trim_book_settings.enabled = true;
         app.view_trim_book_settings.spread_separate = false;
         app.view_trim_book_settings.single = crate::view_trim::ViewTrimMargins {
@@ -81931,7 +82881,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
             let captured_before = app
                 .with_active_viewer_context(|mounted| {
-                    mounted.capture_paged_display_unit_for_snapshot(0)
+                    mounted.capture_paged_display_unit_for_snapshot(None, 0)
                 })
                 .flatten()
                 .expect("mounted Z projection");
@@ -82002,7 +82952,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 assert_eq!(remounted.fs_zoom_active, active);
                 assert_eq!(remounted.fs_zoom_aiming, !active);
                 let captured = remounted
-                    .capture_paged_display_unit_for_snapshot(0)
+                    .capture_paged_display_unit_for_snapshot(None, 0)
                     .expect("remounted Z projection");
                 assert_eq!(captured.unit.pages.len(), 1);
                 assert!(matches!(
@@ -82098,7 +83048,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         }
 
         let captured = app
-            .capture_paged_display_unit_for_snapshot(left)
+            .capture_paged_display_unit_for_snapshot(None, left)
             .expect("Z spread capture");
         assert!(matches!(
             captured.unit.layout_projection,
@@ -82198,6 +83148,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                     target_idx: 0,
                     previous: FsDisplayUnitHoldover {
                         pages: vec![FsDisplayUnitHoldoverPage {
+                            crop: None,
                             fit_scale_limits:
                                 crate::displayed_image_transform::FullscreenFitScaleLimits::default(
                                 ),
@@ -82240,7 +83191,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_ne!(old_texture_id, current_texture_id);
         app.with_active_viewer_context(|mounted| {
             let captured = mounted
-                .capture_paged_display_unit_for_snapshot(0)
+                .capture_paged_display_unit_for_snapshot(None, 0)
                 .expect("last-painted holdover capture");
             assert!(matches!(
                 captured.presentation,
@@ -82269,7 +83220,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             .iter()
             .find(|snapshot| snapshot.id == window_id)
             .expect("old held frame was parked");
-        assert_eq!(passive.texture.source_texture_id(), old_texture_id);
+        assert_eq!(
+            passive
+                .display
+                .still()
+                .expect("still snapshot")
+                .source_texture_id(),
+            old_texture_id
+        );
         assert_eq!(passive.frozen_continuous_pages.len(), 1);
         assert_eq!(
             passive.frozen_continuous_pages[0]
@@ -82363,7 +83321,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             crate::ui_fullscreen::SpreadPageOccurrence::navigation(0, 0),
         );
         let captured = app
-            .capture_paged_display_unit_for_snapshot(0)
+            .capture_paged_display_unit_for_snapshot(None, 0)
             .expect("rotated singleton capture");
         assert_eq!(
             captured.unit.pages[0].post_filter,
@@ -82504,7 +83462,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.set_detached_window_binding_for_test(Some(72));
         app.spread_mode = crate::settings::SpreadMode::Ltr;
         app.fs_transparent_bg_mode = 1;
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         app.view_trim_book_settings.enabled = true;
         app.view_trim_book_settings.spread_separate = true;
         app.view_trim_book_settings.spread_left = crate::view_trim::ViewTrimMargins {
@@ -82670,7 +83628,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.transition_detached_window_state(73, DetachedWindowState::Active, "test");
         app.set_detached_window_binding_for_test(Some(73));
         app.spread_mode = crate::settings::SpreadMode::Ltr;
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Auto;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Auto;
         let left = push_image(&mut app, r"C:\pics\auto-trim-left.png");
         let right = push_image(&mut app, r"C:\pics\auto-trim-right.png");
 
@@ -82768,7 +83726,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
         app.set_detached_window_binding_for_test(Some(74));
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         app.view_trim_book_settings.enabled = true;
         app.view_trim_book_settings.single = crate::view_trim::ViewTrimMargins {
             left: 0.10,
@@ -82786,7 +83744,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fullscreen_idx = None;
         app.selected = Some(main_idx);
         app.viewer_presentation = ViewerPresentation::MainWindow;
-        app.view_trim_apply_mode = crate::view_trim::ViewTrimApplyMode::None;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::None;
         app.view_trim_book_settings = crate::view_trim::ViewTrimBookSettings::default();
         app.view_trim_page_overrides.clear();
 
@@ -82797,8 +83755,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 ViewerPresentation::DetachedWindow
             );
             assert_eq!(
-                mounted.view_trim_apply_mode,
-                crate::view_trim::ViewTrimApplyMode::Book,
+                mounted.view_trim_book_preference,
+                crate::view_trim::ViewTrimBookPreference::Manual,
                 "active detached context must not inherit the main folder trim mode"
             );
             let actual = mounted
@@ -82809,8 +83767,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         .expect("active detached context should mount");
 
         assert_eq!(
-            app.view_trim_apply_mode,
-            crate::view_trim::ViewTrimApplyMode::None,
+            app.view_trim_book_preference,
+            crate::view_trim::ViewTrimBookPreference::None,
             "mounting the detached context must restore the main folder trim mode"
         );
     }
@@ -84524,7 +85482,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 43,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
                 title: "a.jpg - mimageviewer".to_string(),
                 location_display: "a.jpg".to_string(),
                 image_dims: Some((1, 1)),
@@ -84648,7 +85606,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 62,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
                 title: "parked.flac - mimageviewer".to_owned(),
                 location_display: "parked.flac".to_owned(),
                 image_dims: None,
@@ -84787,7 +85745,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 102,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture.clone()),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture.clone()))
+                    .into(),
                 title: "passive.jpg - mimageviewer".to_owned(),
                 location_display: "passive.jpg".to_owned(),
                 image_dims: Some((1, 1)),
@@ -84817,7 +85776,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 103,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
                 title: "live.mp4 - mimageviewer".to_owned(),
                 location_display: "live.mp4".to_owned(),
                 image_dims: None,
@@ -85075,7 +86034,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 61,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: "live".to_owned(),
                 location_display: "live".to_owned(),
                 image_dims: None,
@@ -85412,7 +86371,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 72,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
                 title: "live.mp4 - mimageviewer".to_owned(),
                 location_display: "live.mp4".to_owned(),
                 image_dims: None,
@@ -86693,7 +87652,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 71,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: "old".to_owned(),
                 location_display: "old".to_owned(),
                 image_dims: None,
@@ -86754,7 +87713,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 81,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: "live".to_owned(),
                 location_display: "live".to_owned(),
                 image_dims: None,
@@ -88530,7 +89489,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 82,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(tex),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(tex)).into(),
                 title: "live".to_owned(),
                 location_display: "live".to_owned(),
                 image_dims: None,
@@ -88759,7 +89718,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             assert_eq!(app.fullscreen_idx, Some(main_idx));
             app.with_active_viewer_context(|parked| {
                 assert_eq!(parked.fullscreen_idx, Some(owner_idx));
-                assert_eq!(parked.conceal_cache[&owner_idx].texture.id(), owner_texture);
+                assert_eq!(
+                    parked.conceal_cache[&owner_idx]
+                        .texture
+                        .as_ref()
+                        .unwrap()
+                        .id(),
+                    owner_texture
+                );
             })
             .unwrap();
             rendered.1.drop_without_applying_deltas();
@@ -88991,7 +89957,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.capture_fs_nav_holdover(idx);
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(_))
+            Some(FsHoldover::FolderNavigation(_, _))
         ));
 
         app.close_fullscreen_for_folder_nav_reopen();
@@ -89045,7 +90011,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.capture_fs_nav_holdover(idx);
         assert!(matches!(
             app.fs_holdover_tex,
-            Some(FsHoldover::FolderNavigation(_))
+            Some(FsHoldover::FolderNavigation(_, _))
         ));
 
         app.close_fullscreen_for_folder_nav_reopen();
@@ -89768,6 +90734,465 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         app.native_video_parked_live_input_window_id = Some(8);
         assert!(!app.current_context_owns_source_swap_pending());
+    }
+
+    fn install_open_overview_snapshot_fixture(
+        app: &mut App,
+        count: usize,
+    ) -> Arc<crate::page_overview::PageOverviewProjection> {
+        use crate::page_overview::{
+            PageOverviewDirection, PageOverviewProjection, PageOverviewStamp, PageOverviewState,
+        };
+        app.items = (0..count)
+            .map(|idx| GridItem::Image(format!("C:/pics/{idx}.jpg").into()))
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Pending; count];
+        app.image_metas = vec![None; count];
+        app.visible_indices = (0..count).collect();
+        app.details_order.clear();
+        app.fullscreen_idx = Some(0);
+        app.page_identity_index = Arc::new(file_type_resume::PreparedPageIdentityIndex::prepare(
+            &app.items,
+            None,
+            app.settings.file_type_visibility.clone(),
+        ));
+        let metadata = Arc::clone(app.page_identity_index.overview_metadata());
+        let projection = Arc::new(
+            PageOverviewProjection::new(metadata, Arc::new((0..count).collect())).unwrap(),
+        );
+        let stamp = PageOverviewStamp {
+            context_serial: app.projected_viewer_context_id().serial(),
+            items_generation: app.items_generation,
+            reader_order_revision: Arc::as_ptr(&projection) as usize as u64,
+            incarnation: 1,
+        };
+        app.page_overview_incarnation = 1;
+        app.page_overview = PageOverviewState::open(
+            Arc::clone(&projection),
+            stamp,
+            0,
+            5,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 660.0)),
+            PageOverviewDirection::LeftToRight,
+        )
+        .unwrap();
+        projection
+    }
+
+    #[test]
+    fn overview_select_uses_ordinary_root_navigation_grid_sync() {
+        use crate::app::page_overview::PageOverviewCommand;
+        use crate::page_overview::PageOverviewDirection;
+        for presentation in [
+            ViewerPresentation::MainWindow,
+            ViewerPresentation::Fullscreen,
+        ] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            install_open_overview_snapshot_fixture(&mut app, 4);
+            app.viewer_presentation = presentation;
+            app.selected = Some(0);
+            app.scroll_to_selected = false;
+            let selection = app.page_overview_view().unwrap().capture_select(2).unwrap();
+            let active_context = app.page_overview_active_context_serial();
+            assert!(app.handle_page_overview_command(
+                &ctx,
+                &PageOverviewCommand::Select(selection),
+                ctx.content_rect(),
+                PageOverviewDirection::LeftToRight,
+                active_context,
+            ));
+            assert_eq!(app.fullscreen_idx, Some(2));
+            assert_eq!(app.selected, Some(2));
+            assert!(app.scroll_to_selected);
+            assert!(app.page_overview.session().is_none());
+            app.sync_detached_viewer_to_selected(&ctx);
+            assert_eq!(app.fullscreen_idx, Some(2));
+        }
+    }
+
+    #[test]
+    fn overview_reader_rebuild_compares_only_canonical_real_pages() {
+        let mut app = setup_app();
+        install_open_overview_snapshot_fixture(&mut app, 3);
+        app.items.push(GridItem::Folder("C:/pics/subfolder".into()));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.visible_indices = vec![3, 0, 1, 2];
+        let view = app.page_overview_view().unwrap();
+        app.close_page_overview_if_reader_order_changed();
+        assert_eq!(app.page_overview_view().unwrap().stamp, view.stamp);
+        app.visible_indices = vec![3, 0, 2, 1];
+        app.close_page_overview_if_reader_order_changed();
+        assert!(app.page_overview.session().is_none());
+    }
+
+    #[test]
+    fn overview_root_forwarding_accepts_remapped_confirm_and_blocks_grid_fallthrough() {
+        let _input_guard = crate::key_input::lock_test_input();
+        struct ClearInput;
+        impl Drop for ClearInput {
+            fn drop(&mut self) {
+                crate::key_input::clear_test_frame();
+            }
+        }
+        let _clear = ClearInput;
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        install_open_overview_snapshot_fixture(&mut app, 4);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.keymap =
+            crate::keymap::Keymap::from_ini_str("[FsPageOverview]\nFsPageOverviewConfirm = Q\n");
+        let view = app.page_overview_view().unwrap();
+        let target = view.capture_select(2).unwrap().target;
+        let layout = view.layout(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960., 660.)),
+            crate::page_overview::PageOverviewDirection::LeftToRight,
+        );
+        app.page_overview
+            .session_mut()
+            .unwrap()
+            .set_cursor_target(&target, &layout);
+        ctx.begin_pass(egui::RawInput {
+            focused: true,
+            ..Default::default()
+        });
+        crate::key_input::set_test_frame_for_viewport(
+            ctx.viewport_id(),
+            vec![crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
+                source_hwnd: 1,
+                source_viewport: ctx.viewport_id(),
+                virtual_key: 0x51,
+                scan_code: 0x10,
+                extended: false,
+                pressed: true,
+                repeat: false,
+                ctrl: false,
+                shift: false,
+                alt: false,
+            }],
+        );
+        assert!(app.handle_fullscreen_root_key_input(&ctx));
+        ctx.end_pass().drop_without_applying_deltas();
+        assert_eq!(app.fullscreen_idx, Some(2));
+        assert!(app.page_overview.session().is_none());
+    }
+
+    #[test]
+    fn overview_key_exit_reports_typed_page_rebase_for_selection_and_same_page_cancel() {
+        let _input_guard = crate::key_input::lock_test_input();
+        struct ClearInput;
+        impl Drop for ClearInput {
+            fn drop(&mut self) {
+                crate::key_input::clear_test_frame();
+            }
+        }
+        let _clear = ClearInput;
+        for (virtual_key, expected_idx) in [(0x0d, 2), (0x1b, 0)] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            install_open_overview_snapshot_fixture(&mut app, 4);
+            app.viewer_presentation = ViewerPresentation::MainWindow;
+            let view = app.page_overview_view().unwrap();
+            let target = view.capture_select(2).unwrap().target;
+            let layout = view.layout(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800., 600.)),
+                crate::page_overview::PageOverviewDirection::LeftToRight,
+            );
+            app.page_overview
+                .session_mut()
+                .unwrap()
+                .set_cursor_target(&target, &layout);
+            ctx.begin_pass(egui::RawInput {
+                focused: true,
+                events: vec![egui::Event::Key {
+                    key: if virtual_key == 0x1b {
+                        egui::Key::Escape
+                    } else {
+                        egui::Key::Enter
+                    },
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800., 600.),
+                )),
+                ..Default::default()
+            });
+            crate::key_input::set_test_frame_for_viewport(
+                ctx.viewport_id(),
+                vec![crate::key_input::KeyEdge {
+                    operation_id: crate::key_input::KeyOperationId::unassigned(),
+                    source_hwnd: 1,
+                    source_viewport: ctx.viewport_id(),
+                    virtual_key,
+                    scan_code: 0,
+                    extended: false,
+                    pressed: true,
+                    repeat: false,
+                    ctrl: false,
+                    shift: false,
+                    alt: false,
+                }],
+            );
+            let action = app.handle_fs_key_input(&ctx, 0, false);
+            ctx.end_pass().drop_without_applying_deltas();
+            assert_eq!(
+                action.page_transition,
+                crate::ui_fullscreen::FsKeyPageTransition::Rebased { idx: expected_idx }
+            );
+            assert_eq!(app.fullscreen_idx, Some(expected_idx));
+            assert!(app.page_overview.session().is_none());
+        }
+    }
+
+    #[test]
+    fn overview_direction_uses_reader_direction_even_for_single_page_mode() {
+        let mut app = setup_app();
+        for spread in [
+            crate::settings::SpreadMode::Single,
+            crate::settings::SpreadMode::Vertical,
+            crate::settings::SpreadMode::Rtl,
+        ] {
+            app.spread_mode = spread;
+            app.reading_direction = crate::settings::ReadingDirection::Rtl;
+            assert_eq!(
+                app.page_overview_direction(),
+                crate::page_overview::PageOverviewDirection::RightToLeft
+            );
+            app.reading_direction = crate::settings::ReadingDirection::Ltr;
+            assert_eq!(
+                app.page_overview_direction(),
+                crate::page_overview::PageOverviewDirection::LeftToRight
+            );
+        }
+    }
+
+    #[test]
+    fn overview_remote_acquire_blocks_delivered_local_commands_before_any_change() {
+        use crate::app::page_overview::PageOverviewCommand;
+        use crate::page_overview::PageOverviewDirection;
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        install_open_overview_snapshot_fixture(&mut app, 4);
+        let view = app.page_overview_view().unwrap();
+        let active = app.page_overview_active_context_serial();
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "overview-regression".into(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        assert!(app.page_overview_executable_actions().is_empty());
+        for command in [
+            PageOverviewCommand::Select(view.capture_select(2).unwrap()),
+            PageOverviewCommand::Cancel { stamp: view.stamp },
+            PageOverviewCommand::ScrollRows {
+                stamp: view.stamp,
+                delta: 2,
+            },
+        ] {
+            assert!(!app.handle_page_overview_command(
+                &ctx,
+                &command,
+                ctx.content_rect(),
+                PageOverviewDirection::LeftToRight,
+                active,
+            ));
+        }
+        assert_eq!(app.fullscreen_idx, Some(0));
+        let after = app.page_overview_view().unwrap();
+        assert_eq!(after.stamp, view.stamp);
+        assert_eq!(after.scroll_anchor, view.scroll_anchor);
+        assert_eq!(after.cursor, view.cursor);
+    }
+
+    #[test]
+    fn overview_inactive_select_preserves_open_view_and_active_presentation() {
+        use crate::app::page_overview::PageOverviewCommand;
+        use crate::page_overview::PageOverviewDirection;
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        install_open_overview_snapshot_fixture(&mut app, 4);
+        app.selected = Some(0);
+        app.scroll_to_selected = false;
+        let view = app.page_overview_view().unwrap();
+        let selection = view.capture_select(2).unwrap();
+        let session = app.active_detached_session.map(|session| session.window_id);
+        let presentation = app.viewer_presentation;
+        let binding = app.detached_viewer_window_id();
+        assert!(!app.handle_page_overview_command(
+            &ctx,
+            &PageOverviewCommand::Select(selection),
+            ctx.content_rect(),
+            PageOverviewDirection::LeftToRight,
+            Some(view.stamp.context_serial + 1),
+        ));
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(app.selected, Some(0));
+        assert!(!app.scroll_to_selected);
+        assert_eq!(
+            app.active_detached_session.map(|session| session.window_id),
+            session
+        );
+        assert_eq!(app.viewer_presentation, presentation);
+        assert_eq!(app.detached_viewer_window_id(), binding);
+        assert_eq!(app.page_overview_view().unwrap().stamp, view.stamp);
+    }
+
+    #[test]
+    fn detached_overview_snapshot_parks_metadata_without_any_full_image_or_thumbnail() {
+        let mut app = setup_app();
+        let projection = install_open_overview_snapshot_fixture(&mut app, 2048);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.set_detached_window_binding_for_test(Some(99));
+        app.begin_active_detached_session(99, DetachedSource::Image);
+        assert!(app.fs_cache.is_empty());
+        assert!(app.park_active_detached_image_window());
+        let snapshot = app.detached_image_windows.last().unwrap();
+        assert!(snapshot.display.still().is_none());
+        let overview = snapshot
+            .display
+            .overview()
+            .expect("overview requires no image resource");
+        assert!(Arc::ptr_eq(&overview.view.projection, &projection));
+        assert_eq!(overview.view.projection.len(), 2048);
+        assert!(overview.thumbnails.is_empty());
+        assert!(overview.retained_textures.is_empty());
+        assert!(overview.view.capture_select(2047).is_some());
+        assert!(snapshot.frozen_continuous_pages.is_empty());
+        let placement = app.detached_window_runtime_placement(snapshot.id).unwrap();
+        let deferred = DeferredDetachedImageWindowView::from_snapshot(
+            snapshot,
+            placement,
+            false,
+            None,
+            egui::Color32::BLACK,
+        );
+        assert!(Arc::ptr_eq(
+            &deferred.display.overview().unwrap().view.projection,
+            &projection
+        ));
+        assert!(deferred.display.still().is_none());
+        assert!(app.page_overview.session().is_some());
+    }
+
+    #[test]
+    fn detached_overview_snapshot_retains_only_capture_time_overscan_textures() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let projection = install_open_overview_snapshot_fixture(&mut app, 2048);
+        let loaded = mutation_refresh_loaded_thumb(&ctx);
+        app.thumbnails.fill(loaded);
+        for idx in 0..app.items.len() {
+            app.rotation_cache
+                .insert(idx, crate::rotation_db::Rotation::None);
+        }
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.set_detached_window_binding_for_test(Some(100));
+        app.begin_active_detached_session(100, DetachedSource::Image);
+        let snapshot = app
+            .build_active_detached_image_window_snapshot(Some(&ctx))
+            .unwrap();
+        let overview = snapshot.display.overview().unwrap();
+        assert!(Arc::ptr_eq(&overview.view.projection, &projection));
+        assert!(!overview.retained_textures.is_empty());
+        assert_eq!(overview.thumbnails.len(), overview.retained_textures.len());
+        assert!(overview.retained_textures.len() <= 100);
+        assert!(!overview.thumbnails.contains_key(&2047));
+        assert!(
+            overview.view.capture_select(2047).is_some(),
+            "metadata identifies newly exposed placeholders"
+        );
+    }
+
+    #[test]
+    fn overview_items_generation_change_closes_only_the_changed_owner() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        install_open_overview_snapshot_fixture(&mut app, 3);
+        let sibling = app.push_window_context_for_test(&ctx, 101, |owner| {
+            install_open_overview_snapshot_fixture(owner, 4);
+            owner.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            owner.current_folder = Some("C:/pics".into());
+        });
+        let unchanged = app.items_generation;
+        app.set_items_generation(unchanged);
+        assert!(app.page_overview.session().is_some());
+        app.set_items_generation(unchanged.wrapping_add(1));
+        assert!(app.page_overview.session().is_none());
+        assert!(
+            app.with_viewer_context_ref(sibling, |owner| owner.page_overview_view().is_some())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn overview_global_filter_rebuild_preserves_unchanged_detached_reader() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        install_open_overview_snapshot_fixture(&mut app, 3);
+        let sibling = app.push_window_context_for_test(&ctx, 102, |owner| {
+            install_open_overview_snapshot_fixture(owner, 4);
+            owner.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+            owner.current_folder = Some("C:/pics".into());
+        });
+        let before = app
+            .with_viewer_context_ref(sibling, |owner| owner.page_overview_view().unwrap())
+            .unwrap();
+        app.search_filter = Some(std::collections::HashSet::new().into());
+        app.rebuild_all_viewer_context_visible_indices();
+        assert!(app.page_overview.session().is_none());
+        let after = app
+            .with_viewer_context_ref(sibling, |owner| owner.page_overview_view().unwrap())
+            .unwrap();
+        assert_eq!(after.stamp, before.stamp);
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(after.scroll_anchor, before.scroll_anchor);
+        assert!(Arc::ptr_eq(&before.projection, &after.projection));
+    }
+
+    #[test]
+    fn overview_entry_refuses_existing_image_picker_without_committing_or_dropping_it() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, "C:/pics/picker.jpg");
+        app.fullscreen_idx = Some(idx);
+        let picker =
+            app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::ImageFullscreen);
+        let before = (
+            picker.owner,
+            picker.row,
+            picker.item_rating,
+            picker.dirty_rows.clone(),
+        );
+        app.ring_picker = Some(picker);
+        assert_eq!(
+            app.page_overview_unavailable_reason(),
+            Some("選択画面を閉じてからページ一覧を開いてください")
+        );
+        assert!(!app.open_page_overview(
+            ctx.content_rect(),
+            crate::page_overview::PageOverviewDirection::LeftToRight
+        ));
+        let after = app.ring_picker.as_ref().unwrap();
+        assert_eq!(
+            (
+                after.owner,
+                after.row,
+                after.item_rating,
+                after.dirty_rows.clone()
+            ),
+            before
+        );
+        assert_eq!(app.fullscreen_idx, Some(idx));
+        assert!(app.page_overview.session().is_none());
     }
 
     #[test]
@@ -90693,7 +92118,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.detached_image_windows
             .push(DetachedImageWindowSnapshot {
                 id: 7,
-                texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+                display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
                 title: "a.jpg - mimageviewer".to_string(),
                 location_display: "a.jpg".to_string(),
                 image_dims: Some((1, 1)),
@@ -90781,7 +92206,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let placement = app.detached_viewer_window_placement();
         let snapshot = DetachedImageWindowSnapshot {
             id: 7,
-            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+            display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
             title: "a.jpg - mimageviewer".to_string(),
             location_display: "a.jpg".to_string(),
             image_dims: Some((1, 1)),
@@ -90883,7 +92308,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         };
         let snapshot = DetachedImageWindowSnapshot {
             id: 7,
-            texture: crate::gpu_lanczos::FullscreenPaintResource::direct(texture),
+            display: (crate::gpu_lanczos::FullscreenPaintResource::direct(texture)).into(),
             title: "deferred.jpg - mimageviewer".to_string(),
             location_display: "deferred.jpg".to_string(),
             image_dims: Some((1, 1)),
@@ -97995,6 +99420,104 @@ mod smart_folder_transition_tests {
     }
 
     #[test]
+    fn section1453_smart_books_parent_dispatch_restores_root_and_opened_selection() {
+        for kind in ["flat.zip", "tree.zip", "book.pdf"] {
+            for exit in ["backspace", "up", "escape", "history"] {
+                let mut app = setup_app();
+                app.active_quick_folder_slot = None;
+                app.settings.auto_fullscreen_zip_pdf = false;
+                let source = app.tmp.path().join("library");
+                let shelf = source.join("shelf");
+                std::fs::create_dir_all(&shelf).unwrap();
+                let book = shelf.join(kind);
+                if kind.ends_with(".pdf") {
+                    std::fs::write(&book, b"%PDF-1.4\n").unwrap();
+                } else {
+                    let mut zip = zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
+                    let names = if kind == "tree.zip" {
+                        vec!["vol1/page.jpg", "vol2/page.jpg"]
+                    } else {
+                        vec!["page.jpg"]
+                    };
+                    for name in names {
+                        zip.start_file(name, zip::write::SimpleFileOptions::default())
+                            .unwrap();
+                        std::io::Write::write_all(&mut zip, b"page").unwrap();
+                    }
+                    zip.finish().unwrap();
+                }
+                let definition = definition("Parent dispatch", source);
+                let id = definition.id;
+                app.settings.smart_folders = vec![definition];
+                let ctx = egui::Context::default();
+                app.open_smart_folder(id, false);
+                wait_for_smart_folder_idle(&mut app, &ctx, id);
+                // Return must select the opened book even when the parked selection differs.
+                select_real_path(&mut app, &shelf);
+                assert!(app.begin_staged_smart_drill(&book));
+                if kind.ends_with(".pdf") {
+                    finish_smart_pdf_enumeration(&mut app, &book);
+                } else {
+                    wait_for_staged_smart_terminal(&mut app, &ctx);
+                }
+                if kind == "tree.zip" {
+                    app.zip_nav_enter("vol1/");
+                    assert!(app.handle_grid_parent_folder_action().is_none());
+                    assert!(!app.items_are_smart_folder_view);
+                    assert!(app.zip_nav.as_ref().unwrap().at_root());
+                }
+                if exit == "history" {
+                    app.dispatch_folder_history_input_for_test(FolderHistoryDirection::Back);
+                } else {
+                    let nav = match exit {
+                        "backspace" => app.handle_grid_parent_folder_action().unwrap(),
+                        "up" => {
+                            let target = app.grid_parent_nav_target().unwrap();
+                            let nav = app.resolve_grid_parent_nav().unwrap();
+                            assert_eq!(format!("{target:?}"), format!("{nav:?}"));
+                            nav
+                        }
+                        "escape" => {
+                            app.settings.auto_fullscreen_zip_pdf = true;
+                            app.fullscreen_idx = Some(0);
+                            app.pending_return_to_parent.clear();
+                            app.handle_fullscreen_close_request();
+                            assert!(app.pending_return_to_parent.is_pending());
+                            app.take_pending_return_to_parent_nav().unwrap()
+                        }
+                        _ => unreachable!(),
+                    };
+                    let crate::ui_main::AddressBarNav::Direct(path, intent) = nav else {
+                        panic!("unexpected parent: {nav:?}");
+                    };
+                    if exit == "escape" {
+                        assert!(app.apply_fullscreen_close_nav_immediate(
+                            crate::ui_main::AddressBarNav::Direct(path, intent)
+                        ));
+                    } else {
+                        // The main-frame dispatcher enters here, bypassing the upper loader.
+                        app.open_direct_navigation_target(
+                            path,
+                            None,
+                            OpenRequestOwner::Navigation,
+                            None,
+                            None,
+                            intent,
+                        );
+                    }
+                }
+                wait_for_smart_folder_idle(&mut app, &ctx, id);
+                assert_eq!(
+                    selected_real_path(&app),
+                    Some(book.as_path()),
+                    "{kind} {exit}"
+                );
+                assert!(app.zip_nav.is_none());
+            }
+        }
+    }
+
+    #[test]
     fn smart_folder_pdf_open_then_parent_handler_restores_root_offset() {
         let mut app = setup_app();
         app.active_quick_folder_slot = None;
@@ -104222,7 +105745,6 @@ mod rating_folder_r2_tests {
         let mut app = setup_app();
         for surface in [
             TopLevelGridSurface::Search(TopLevelSearchView::Favorite),
-            TopLevelGridSurface::Search(TopLevelSearchView::Tag),
             TopLevelGridSurface::ReadingHistory,
             TopLevelGridSurface::Snapshot,
             TopLevelGridSurface::DriveList,
@@ -108749,6 +110271,7 @@ mod background_click_scroll_regression_tests {
                 None,
                 None,
                 app.settings.thumb_show_resume_meter,
+                crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
             );
             let pos = if filename {
                 layout
@@ -108963,6 +110486,7 @@ mod background_click_scroll_regression_tests {
             None,
             None,
             app.settings.thumb_show_resume_meter,
+            crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
         )
     }
 
@@ -109440,6 +110964,7 @@ mod background_click_scroll_regression_tests {
                 None,
                 None,
                 app.settings.thumb_show_resume_meter,
+                crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
             );
             let pos = if check {
                 layout.check.expect("check badge").center()

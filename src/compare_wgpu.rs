@@ -78,11 +78,13 @@ pub enum CompareShaderSlot {
 pub struct CompareShaderCallback {
     pub slot: CompareShaderSlot,
     pub key: u64,
+    pub owner_key: u64,
     pub width: u32,
     pub height: u32,
     pub pinned_rgba: Arc<Vec<u8>>,
     pub current_rgba: Arc<Vec<u8>>,
     pub cpu_pair_bytes: u64,
+    pub cpu_pair_buffers: usize,
     pub mode: CompareShaderMode,
     pub wipe_fraction: f32,
     pub uv_window: [f32; 4],
@@ -95,10 +97,9 @@ struct CompareGpuResources {
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     mipmap_generator: egui_wgpu::MipmapGenerator,
-    // App側が保持する準備済み比較組は常に1組だけで、keyも再利用されない。
-    // 過去組をHashMapへ残すと、完全なmip chainを持つ2 textureが組数分だけ
-    // VRAMへ蓄積するため、GPU側も現在組1つだけを所有する。
-    pair: Option<(u64, CompareGpuPair)>,
+    // 現在の owner に加工版と元画像版の最大2組。各組に Main / Navigator の uniform を持つ。
+    owner_key: Option<u64>,
+    pairs: [Option<(u64, CompareGpuPair)>; 2],
 }
 
 struct CompareGpuPair {
@@ -317,7 +318,8 @@ impl CompareGpuResources {
             bind_group_layout,
             sampler,
             mipmap_generator: egui_wgpu::MipmapGenerator::new(device),
-            pair: None,
+            owner_key: None,
+            pairs: [None, None],
         }
     }
 
@@ -327,8 +329,21 @@ impl CompareGpuResources {
         queue: &wgpu::Queue,
         callback: &CompareShaderCallback,
     ) {
-        let recreate = self
-            .pair
+        let released_owner_bytes = if self.owner_key != Some(callback.owner_key) {
+            let released: u128 = self
+                .pairs
+                .iter()
+                .flatten()
+                .map(|(_, pair)| rgba8_texture_bytes(pair.width, pair.height, true) * 2)
+                .sum();
+            self.pairs = [None, None];
+            self.owner_key = Some(callback.owner_key);
+            released
+        } else {
+            0
+        };
+        let variant_slot = compare_variant_slot(callback.owner_key, callback.key);
+        let recreate = self.pairs[variant_slot]
             .as_ref()
             .map(|(key, pair)| {
                 *key != callback.key
@@ -340,12 +355,10 @@ impl CompareGpuResources {
             if compare_texture_extent(callback.width, callback.height).is_none() {
                 return;
             }
-            // 新textureを確保する前に旧組をdropし、8K比較で旧/new組が同時に
-            // VRAMへ残る時間を作らない。wgpu backend側のin-flight解放遅延を除けば、
-            // CompareGpuResourcesが所有する完全mip chainは常に2枚までになる。
-            let released_gpu_bytes = self.pair.take().map_or(0, |(_, pair)| {
-                rgba8_texture_bytes(pair.width, pair.height, true) * 2
-            });
+            let released_gpu_bytes = released_owner_bytes
+                + self.pairs[variant_slot].take().map_or(0, |(_, pair)| {
+                    rgba8_texture_bytes(pair.width, pair.height, true) * 2
+                });
             let Some(pinned) = upload_rgba_texture(
                 device,
                 queue,
@@ -375,7 +388,7 @@ impl CompareGpuResources {
                 &pinned.view,
                 &current.view,
             );
-            self.pair = Some((
+            self.pairs[variant_slot] = Some((
                 callback.key,
                 CompareGpuPair {
                     _pinned_texture: pinned.texture,
@@ -387,16 +400,25 @@ impl CompareGpuResources {
                     height: callback.height,
                 },
             ));
+            let gpu_bytes: u128 = self
+                .pairs
+                .iter()
+                .flatten()
+                .map(|(_, pair)| rgba8_texture_bytes(pair.width, pair.height, true) * 2)
+                .sum();
+            let gpu_textures = self.pairs.iter().flatten().count() * 2;
             crate::logger::log(format!(
-                "[compare-memory] stage=gpu-ready target={}x{} cpu_total_bytes={} cpu_buffers=2 gpu_total_bytes={} gpu_textures=2 gpu_mips=full released_gpu_bytes={} old_pair_release=before_new_alloc",
+                "[compare-memory] stage=gpu-ready target={}x{} cpu_total_bytes={} cpu_buffers={} gpu_total_bytes={} gpu_textures={} gpu_mips=full released_gpu_bytes={} old_pair_release=before_new_alloc",
                 callback.width,
                 callback.height,
                 callback.cpu_pair_bytes,
-                rgba8_texture_bytes(callback.width, callback.height, true) * 2,
+                callback.cpu_pair_buffers,
+                gpu_bytes,
+                gpu_textures,
                 released_gpu_bytes,
             ));
         }
-        if let Some((key, pair)) = self.pair.as_ref()
+        if let Some((key, pair)) = self.pairs[variant_slot].as_ref()
             && *key == callback.key
         {
             let write = uniform_write(
@@ -411,18 +433,26 @@ impl CompareGpuResources {
 }
 
 /// 比較overlayを使わない状態へ移るとき、pipeline/samplerは保持したまま
-/// 高解像度texture 2枚だけを即時dropする。
+/// 加工版 / 元画像版の高解像度texture（最大4枚）を即時dropする。
 pub fn clear_gpu_pair(callback_resources: &mut egui_wgpu::CallbackResources) {
     if let Some(resources) = callback_resources.get_mut::<CompareGpuResources>() {
-        if let Some((_, pair)) = resources.pair.take() {
+        let released: u128 = resources
+            .pairs
+            .iter_mut()
+            .filter_map(Option::take)
+            .map(|(_, pair)| rgba8_texture_bytes(pair.width, pair.height, true) * 2)
+            .sum();
+        resources.owner_key = None;
+        if released > 0 {
             crate::logger::log(format!(
-                "[compare-memory] stage=gpu-clear target={}x{} released_gpu_bytes={} gpu_total_bytes=0 gpu_mips=full",
-                pair.width,
-                pair.height,
-                rgba8_texture_bytes(pair.width, pair.height, true) * 2,
+                "[compare-memory] stage=gpu-clear released_gpu_bytes={released} gpu_total_bytes=0 gpu_mips=full",
             ));
         }
     }
+}
+
+fn compare_variant_slot(owner_key: u64, key: u64) -> usize {
+    usize::from(owner_key != key)
 }
 
 struct UploadedTexture {
@@ -566,7 +596,12 @@ impl egui_wgpu::CallbackTrait for CompareShaderCallback {
         let Some(resources) = callback_resources.get::<CompareGpuResources>() else {
             return;
         };
-        let Some((key, pair)) = resources.pair.as_ref() else {
+        if resources.owner_key != Some(self.owner_key) {
+            return;
+        }
+        let Some((key, pair)) =
+            resources.pairs[compare_variant_slot(self.owner_key, self.key)].as_ref()
+        else {
             return;
         };
         if *key != self.key {
@@ -698,11 +733,13 @@ mod gpu_tests {
         CompareShaderCallback {
             slot,
             key: 41,
+            owner_key: 41,
             width: 4,
             height: 1,
             current_rgba: Arc::new([0, 255, 0, 255].repeat(4)),
             pinned_rgba,
             cpu_pair_bytes: 32,
+            cpu_pair_buffers: 2,
             mode: CompareShaderMode::Wipe,
             wipe_fraction: 1.0,
             uv_window,
@@ -741,6 +778,111 @@ mod gpu_tests {
         let pixels = gpu.render(&jobs, [8, 4], [0, 0, 0, 0]);
         assert_rgba(pixels[8], [255, 0, 0, 255]);
         assert_rgba(pixels[15], [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn compare_offscreen_original_and_processed_keep_two_uploads_and_clear_together() {
+        let mut gpu = OffscreenGpu::new();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(4.0, 4.0));
+        let mut textures = Vec::new();
+        for (key, color) in [
+            (41, [255, 0, 0, 255]),
+            (93, [0, 0, 255, 255]),
+            (41, [255, 0, 0, 255]),
+            (93, [0, 0, 255, 255]),
+        ] {
+            let mut paint = paint_callback(
+                CompareShaderSlot::Main,
+                [0.0, 0.0, 1.0, 1.0],
+                Arc::new(color.repeat(4)),
+            );
+            paint.key = key;
+            let output = gpu.render(&[callback(rect, paint)], [4, 4], [0, 0, 0, 0]);
+            assert_rgba(output[8], color);
+            let resources = gpu
+                .renderer
+                .callback_resources
+                .get::<CompareGpuResources>()
+                .unwrap();
+            let pair = &resources.pairs[compare_variant_slot(41, key)]
+                .as_ref()
+                .unwrap()
+                .1;
+            textures.push(pair._pinned_texture.clone());
+        }
+        assert_eq!(
+            textures[0], textures[2],
+            "releasing must reuse the processed upload"
+        );
+        assert_eq!(
+            textures[1], textures[3],
+            "holding again must reuse the original upload"
+        );
+        let resources = gpu
+            .renderer
+            .callback_resources
+            .get::<CompareGpuResources>()
+            .unwrap();
+        assert!(resources.pairs.iter().all(Option::is_some));
+        clear_gpu_pair(&mut gpu.renderer.callback_resources);
+        let resources = gpu
+            .renderer
+            .callback_resources
+            .get::<CompareGpuResources>()
+            .unwrap();
+        assert!(resources.pairs.iter().all(Option::is_none));
+        assert!(resources.owner_key.is_none());
+    }
+
+    #[test]
+    fn compare_offscreen_owner_change_releases_both_variants_without_clear() {
+        let mut gpu = OffscreenGpu::new();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(4.0, 4.0));
+        for key in [41, 93] {
+            let mut paint = paint_callback(
+                CompareShaderSlot::Main,
+                [0.0, 0.0, 1.0, 1.0],
+                Arc::new([255, 0, 0, 255].repeat(4)),
+            );
+            paint.key = key;
+            gpu.render(&[callback(rect, paint)], [4, 4], [0, 0, 0, 0]);
+        }
+        let resources = gpu
+            .renderer
+            .callback_resources
+            .get::<CompareGpuResources>()
+            .unwrap();
+        assert_eq!(resources.owner_key, Some(41));
+        let old_textures: Vec<_> = resources
+            .pairs
+            .iter()
+            .map(|variant| {
+                let pair = &variant.as_ref().expect("both variants must exist").1;
+                (pair._pinned_texture.clone(), pair._current_texture.clone())
+            })
+            .collect();
+        // A new owner drops both old variants, even when only one variant is requested.
+        let mut paint = paint_callback(
+            CompareShaderSlot::Navigator,
+            [0.0, 0.0, 1.0, 1.0],
+            Arc::new([0, 255, 0, 255].repeat(4)),
+        );
+        paint.owner_key = 101;
+        paint.key = 101;
+        gpu.render(&[callback(rect, paint)], [4, 4], [0, 0, 0, 0]);
+        let resources = gpu
+            .renderer
+            .callback_resources
+            .get::<CompareGpuResources>()
+            .unwrap();
+        assert_eq!(resources.owner_key, Some(101));
+        let (key, pair) = resources.pairs[0].as_ref().unwrap();
+        assert_eq!(*key, 101);
+        for (old_pinned, old_current) in old_textures {
+            assert_ne!(pair._pinned_texture, old_pinned);
+            assert_ne!(pair._current_texture, old_current);
+        }
+        assert!(resources.pairs[1].is_none());
     }
 
     #[test]

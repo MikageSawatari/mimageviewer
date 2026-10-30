@@ -747,6 +747,7 @@ impl App {
             return Ok(());
         }
         let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
+        self.cancel_prepared_edit_for_entry(target_idx);
         if let Some(error) = self.sns_split_rotation_error(target_idx) {
             return Err(error);
         }
@@ -809,6 +810,7 @@ impl App {
             close_to_page_list: false,
             page_nav: crate::ui_fullscreen::FsPageNav::None,
             ctrl_nav: None,
+            list_order_nav: None,
             sibling_nav: None,
             mouse_nav: None,
             jump_to: None,

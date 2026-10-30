@@ -4,9 +4,10 @@
     "reason": "Select VST-applicable operations by exact heading; standalone player, LAN remote and MCP sections are excluded. Tour guidance is inserted in README.json using bundled ja locale tour.menu.",
     "title": "基本操作 - EffeTune",
     "sections": [
-      "Visualizerで音を表示する",
+      "Visualizer",
       "エフェクトチェーンの作成",
       "プリセットの使用",
+      "エフェクトの共通操作",
       "保存データのバックアップと復元",
       "セクション機能の使用方法",
       "ABパイプライン機能の使用",
@@ -24,7 +25,7 @@
   },
   "controller-mapping.md": {
     "include": true,
-    "reason": "v0.14.0 vst-bootstrap.js:41 exposes physical-control-section; effect/automation and non-player app targets are available. VST-specific limits in controller-mapping.json."
+    "reason": "v0.15.0 vst-bootstrap.js:43 exposes physical-control-section; effect/automation and non-player app targets are available. VST-specific limits in controller-mapping.json."
   },
   "double-blind-test.md": {
     "include": false,
@@ -44,7 +45,7 @@
   },
   "pipeline-analyzer.md": {
     "include": false,
-    "reason": "v0.14.0 ui-manager.js disables Pipeline Analyzer in VST mode; JS analysis would not measure native VST DSP."
+    "reason": "v0.15.0 ui-manager.js disables Pipeline Analyzer in VST mode; JS analysis would not measure native VST DSP."
   },
   "bus-function.md": {
     "include": true,
@@ -109,5 +110,17 @@
   "plugins/spatial.md": {
     "include": true,
     "reason": "Bundled stereo/spatial effects."
+  },
+  "measurement.md": {
+    "include": false,
+    "reason": "Standalone microphone/output measurement; VST bootstrap hides measurement section. Room EQ retains stored measurements."
+  },
+  "music-player.md": {
+    "include": false,
+    "reason": "Standalone player controls and media loading; bundled VST processes mIV audio and hides player entry."
+  },
+  "openhome.md": {
+    "include": false,
+    "reason": "Standalone OpenHome network renderer; electronAPI.remoteV1/OpenHome APIs are absent in VST."
   }
 }

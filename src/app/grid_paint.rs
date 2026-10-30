@@ -353,6 +353,7 @@ pub(crate) fn layout_cell_overlays(
     filter_match_count: Option<u32>,
     media_duration: Option<&str>,
     book_resume_meter: bool,
+    name_style: crate::thumb_overlay_layout::ThumbnailNameStyle,
 ) -> ThumbnailOverlayLayout {
     let inner = rect.shrink(4.0);
     let item_name = match item {
@@ -417,6 +418,7 @@ pub(crate) fn layout_cell_overlays(
             bottom_container,
             rating_text: rating_text.as_deref(),
             filename,
+            name_style,
         },
         |text, style| crate::ui_helpers::measure_thumbnail_badge_text(painter, text, style),
     )
@@ -1521,6 +1523,212 @@ pub(crate) fn grid_tag_badge_hit_rect(layout: &ThumbnailOverlayLayout) -> Option
 }
 
 #[cfg(test)]
+mod thumbnail_name_style_tests {
+    use super::*;
+    use crate::thumb_overlay_layout::{BadgeKind, ThumbnailNameStyle};
+    use egui::emath::GuiRounding;
+
+    fn is_name(kind: BadgeKind) -> bool {
+        matches!(
+            kind,
+            BadgeKind::Filename | BadgeKind::BottomContainer(BottomContainerKind::Folder)
+        )
+    }
+
+    #[test]
+    fn thumbnail_name_style_real_painter_matches_layout_ink_and_hit_areas() {
+        let name = "旅先で撮影した桜と青空と山並みの写真と長い英数字abcdefghijklmnopを集めた作品集";
+        for dark in [false, true] {
+            for dpi in [1.0, 1.25, 1.5, 2.0] {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(dpi);
+                crate::ui_fonts::configure_fonts(&ctx);
+                crate::os_theme::apply_resolved(
+                    &ctx,
+                    if dark {
+                        crate::os_theme::ResolvedTheme::Dark
+                    } else {
+                        crate::os_theme::ResolvedTheme::Light
+                    },
+                );
+                for (item, loaded) in [
+                    (GridItem::Folder(name.into()), true),
+                    (GridItem::Folder(name.into()), false),
+                    (GridItem::ZipFile(format!("{name}.zip").into()), true),
+                    (GridItem::PdfFile(format!("{name}.pdf").into()), true),
+                    (GridItem::Video(format!("{name}.mp4").into()), true),
+                    (GridItem::Audio(format!("{name}.flac").into()), true),
+                ] {
+                    for name_style in [
+                        ThumbnailNameStyle::default(),
+                        ThumbnailNameStyle {
+                            font_scale: 1.5,
+                            max_lines: 3,
+                        },
+                    ] {
+                        let mut output = None;
+                        let mut expected = Vec::new();
+                        for _ in 0..2 {
+                            output =
+                                Some(crate::test_ui::headless_paint_output(ctx.run_pass(
+                                    egui::RawInput::default(),
+                                    |ctx| {
+                                        ctx.root_ui(|root_ui| {
+                                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                                let cell = egui::Rect::from_min_size(
+                                                    egui::pos2(20.3, 20.7),
+                                                    egui::vec2(240.0, 220.0),
+                                                );
+                                                let thumb = if loaded {
+                                                    snapshot_thumbnail(
+                                                        ctx,
+                                                        "thumbnail-name-style-test",
+                                                    )
+                                                } else {
+                                                    ThumbnailState::Failed
+                                                };
+                                                let tags = vec!["#旅先".to_owned()];
+                                                let make_layout =
+                                                    |name_style| {
+                                                        layout_cell_overlays(
+                                                ui.painter(), cell, EditBadgeFlags::default(), 4,
+                                                &item, &thumb, &tags, None, false,
+                                                VideoThumbnailIndicator::BottomLeftBadge,
+                                                AudioThumbnailIndicator::default(), false, None,
+                                                None, true, name_style,
+                                            )
+                                                    };
+                                                let baseline =
+                                                    make_layout(ThumbnailNameStyle::default());
+                                                let layout = make_layout(name_style);
+                                                let areas = draw_cell_with_hit_areas(
+                                                    ui,
+                                                    cell,
+                                                    false,
+                                                    false,
+                                                    false,
+                                                    &layout,
+                                                    &item,
+                                                    &thumb,
+                                                    crate::rotation_db::Rotation::None,
+                                                    None,
+                                                    false,
+                                                    VideoThumbnailIndicator::BottomLeftBadge,
+                                                    AudioThumbnailIndicator::default(),
+                                                    false,
+                                                    Some(0.4),
+                                                );
+                                                expected.clear();
+                                                for badge in layout.badge_placements() {
+                                                    if !is_name(badge.kind) {
+                                                        let previous = baseline
+                                                            .badge_placements()
+                                                            .find(|other| other.kind == badge.kind)
+                                                            .expect(
+                                                                "unscaled badge remains present",
+                                                            );
+                                                        assert_eq!(badge.style, previous.style);
+                                                        continue;
+                                                    }
+                                                    let previous = baseline
+                                                        .badge_placements()
+                                                        .find(|other| other.kind == badge.kind)
+                                                        .expect("default name is present");
+                                                    assert!(
+                                                        (badge.style.font_size
+                                                            - previous.style.font_size
+                                                                * name_style.font_scale)
+                                                            .abs()
+                                                            < 0.001
+                                                    );
+                                                    let ink = thumbnail_badge_ink_rect(
+                                                        ui.painter(),
+                                                        badge,
+                                                    );
+                                                    assert!(
+                                                        cell.contains_rect(ink),
+                                                        "{item:?}: {badge:?}, ink={ink:?}"
+                                                    );
+                                                    assert!(
+                                                        !layout
+                                                            .book_resume_meter
+                                                            .unwrap()
+                                                            .intersects(ink)
+                                                    );
+                                                    for other in layout
+                                                        .badge_placements()
+                                                        .filter(|other| other.kind != badge.kind)
+                                                    {
+                                                        assert!(
+                                                            !other.rect.intersects(ink),
+                                                            "name ink intersects {other:?}"
+                                                        );
+                                                    }
+                                                    assert!(areas.rects.contains(&badge.rect));
+                                                    assert!(areas.rects.contains(&ink));
+                                                    assert!(areas.contains(ink.center()));
+                                                    if name_style.max_lines == 1 {
+                                                        assert_eq!(badge.text.lines().count(), 1);
+                                                    } else {
+                                                        assert_eq!(
+                                                            badge.text.lines().count(),
+                                                            3,
+                                                            "{badge:?}"
+                                                        );
+                                                        assert!(badge.text.ends_with('…'));
+                                                        assert!(
+                                                            badge
+                                                                .text
+                                                                .chars()
+                                                                .filter(|c| *c != '\n')
+                                                                .count()
+                                                                > 18,
+                                                            "{item:?}: {badge:?}"
+                                                        );
+                                                    }
+                                                    expected.push((badge.clone(), ink));
+                                                }
+                                                assert_eq!(
+                                                    expected.len(),
+                                                    1,
+                                                    "name missing for {item:?}"
+                                                );
+                                            });
+                                        });
+                                    },
+                                )));
+                        }
+                        let output = output.unwrap();
+                        for (badge, ink) in &expected {
+                            let painted = output
+                                .shapes
+                                .iter()
+                                .find_map(|shape| match &shape.shape {
+                                    egui::Shape::Text(text) if text.galley.text() == badge.text => {
+                                        Some((shape.clip_rect, text))
+                                    }
+                                    _ => None,
+                                })
+                                .expect(
+                                    "layout name must be painted by the production cell renderer",
+                                );
+                            assert_eq!(painted.1.galley.rows.len(), badge.text.lines().count());
+                            let painted_ink = painted
+                                .1
+                                .galley
+                                .mesh_bounds
+                                .translate(painted.1.pos.round_to_pixels(dpi).to_vec2());
+                            assert_eq!(painted_ink, *ink);
+                            assert!(painted.0.contains_rect(painted_ink));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod book_resume_meter_tests {
     use super::*;
     use crate::book_resume_db::ReadingMeterValue;
@@ -1569,7 +1777,8 @@ mod book_resume_meter_tests {
                             output=Some(crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(),|ctx| {ctx.root_ui(|root_ui| egui::CentralPanel::default().show(root_ui,|ui| {
                             let cell=egui::Rect::from_min_size(egui::pos2(20.3,20.7),egui::vec2(width,width));
                             let layout=layout_cell_overlays(ui.painter(),cell,EditBadgeFlags::default(),4,&item,&ThumbnailState::Pending,&[],None,false,
-                                VideoThumbnailIndicator::PlayIcon,AudioThumbnailIndicator::default(), false,None,Some("22:35"),true);
+                                VideoThumbnailIndicator::PlayIcon,AudioThumbnailIndicator::default(), false,None,Some("22:35"),true,
+                                crate::thumb_overlay_layout::ThumbnailNameStyle::default(),);
                             let raw=layout.book_resume_meter.unwrap(); let meter=thumbnail_resume_meter_rect(ui.painter(),&layout).unwrap();
                             assert_eq!(raw.height(),9.0); assert_eq!(raw.min.x,cell.min.x+4.0);assert_eq!(raw.max.x,cell.max.x-4.0);
                             assert!((meter.height()*dpi-(9.0_f32*dpi).floor()).abs()<0.001);
@@ -1651,6 +1860,7 @@ mod book_resume_meter_tests {
                                             None,
                                             None,
                                             enabled,
+                                            crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                                         );
                                         draw_cell(
                                             ui,
@@ -1762,6 +1972,7 @@ mod book_resume_meter_tests {
                                     None,
                                     None,
                                     true,
+                                    crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                                 );
                                 draw_cell(
                                     ui,
@@ -1852,6 +2063,7 @@ mod book_resume_meter_tests {
                                         None,
                                         None,
                                         true,
+                                        crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                                     );
                                     draw_cell(
                                         ui,
@@ -2075,6 +2287,7 @@ mod book_resume_meter_tests {
                                                     None,
                                                     duration,
                                                     enabled,
+                                                    crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                                                 );
                                                 band = layout.book_resume_meter;
                                                 draw_cell(
@@ -2192,6 +2405,7 @@ mod book_resume_meter_tests {
                                     None,
                                     None,
                                     true,
+                                    crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                                 );
                                 draw_cell(
                                     ui,
@@ -2272,6 +2486,7 @@ mod book_resume_meter_tests {
                                 None,
                                 Some("1:02:03"),
                                 true,
+                                crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                             );
                             assert!(layout.book_resume_meter.is_some());
                             draw_cell(
@@ -2535,6 +2750,7 @@ mod book_resume_meter_tests {
             dense.then_some(42),
             duration,
             true,
+            crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
         );
         draw_cell(
             ui,
@@ -2810,6 +3026,7 @@ mod book_resume_meter_tests {
                         None,
                         duration,
                         enabled,
+                        crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                     );
                     draw_cell(
                         ui,
@@ -3343,6 +3560,7 @@ fn draw_video_indicator_snapshot_cell(
         None,
         None,
         false,
+        crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
     );
     draw_cell(
         ui,
@@ -3400,6 +3618,96 @@ fn snapshot_thumbnail(ctx: &egui::Context, name: &str) -> ThumbnailState {
         Some((1920, 1080)),
         None,
     )
+}
+
+/// Fixed in-memory cells using the same name layout, drawing and hit areas as the grid.
+#[doc(hidden)]
+pub fn draw_thumbnail_name_style_snapshot_fixture(ui: &mut egui::Ui) {
+    ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+    ui.label("名前の文字サイズ 150% / 最大3行");
+    let loaded = snapshot_thumbnail(ui.ctx(), "thumbnail-name-style-snapshot");
+    let tags = vec!["#旅行".to_owned()];
+    let cases = [
+        (
+            "フォルダー・代表画像あり",
+            GridItem::Folder("春の旅先で撮影した桜と青空と山並みの写真を集めたフォルダー".into()),
+            true,
+        ),
+        (
+            "フォルダー・代表画像なし",
+            GridItem::Folder(
+                "秋の旅先で撮影した紅葉と夕焼けと街並みの写真を集めたフォルダー".into(),
+            ),
+            false,
+        ),
+        (
+            "ZIP",
+            GridItem::ZipFile(
+                "春の旅先で撮影した桜と青空と山並みの写真をまとめた作品集.zip".into(),
+            ),
+            true,
+        ),
+        (
+            "動画",
+            GridItem::Video("秋の旅先で撮影した紅葉と夕焼けと街並みを記録した長い動画.mp4".into()),
+            true,
+        ),
+    ];
+    for row in cases.chunks(2) {
+        ui.horizontal(|ui| {
+            for (label, item, has_thumbnail) in row {
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(*label).small());
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(214.0, 172.0), egui::Sense::hover());
+                    let thumb = if *has_thumbnail {
+                        &loaded
+                    } else {
+                        &ThumbnailState::Failed
+                    };
+                    let duration = matches!(item, GridItem::Video(_)).then_some("12:34");
+                    let layout = layout_cell_overlays(
+                        ui.painter(),
+                        rect,
+                        EditBadgeFlags::default(),
+                        4,
+                        item,
+                        thumb,
+                        &tags,
+                        None,
+                        false,
+                        VideoThumbnailIndicator::PlayIcon,
+                        AudioThumbnailIndicator::default(),
+                        false,
+                        None,
+                        duration,
+                        true,
+                        crate::thumb_overlay_layout::ThumbnailNameStyle {
+                            font_scale: 1.5,
+                            max_lines: 3,
+                        },
+                    );
+                    draw_cell_with_hit_areas(
+                        ui,
+                        rect,
+                        false,
+                        false,
+                        false,
+                        &layout,
+                        item,
+                        thumb,
+                        crate::rotation_db::Rotation::None,
+                        None,
+                        false,
+                        VideoThumbnailIndicator::PlayIcon,
+                        AudioThumbnailIndicator::default(),
+                        false,
+                        Some(0.4),
+                    );
+                });
+            }
+        });
+    }
 }
 
 /// Snapshot fixture that routes every cell through the production grid layout and paint helpers.
@@ -3832,6 +4140,7 @@ pub fn draw_audio_thumbnail_indicator_snapshot_fixture(ui: &mut egui::Ui) {
                     None,
                     Some("3:45"),
                     true,
+                    crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                 );
                 draw_cell(
                     ui,

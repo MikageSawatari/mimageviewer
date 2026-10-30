@@ -23,10 +23,10 @@
 # - 通常の押下操作は Ctrl/Shift/Alt + 通常キーを指定できます。
 # - ModifierHold は Ctrl / Shift / Alt / RightCtrl / RightShift / RightAlt の
 #   いずれか 1 つだけ指定できます。Right* は右側限定、それ以外は左右不問です。
-# - KeyHold は修飾キーなしの通常キー 1 つだけ指定できます。
+# - KeyHold は通常キー 1 つです。左右ドラッグズームだけ修飾キーも指定できます。
 # - キー名の例: A..Z, 0..9, Numpad0..Numpad9, F1..F24, Left, Right, Up, Down,
 #   Home, End, PageUp, PageDown, Space, Enter, Esc, Tab, Backspace, Delete,
-#   [, ], ;, :, ,, ., \, /, ?, -, ^, @, Yen, Ro, NumpadAdd, NumpadSubtract, NumpadEnter
+#   [, ], Semicolon, :, ,, ., \, /, ?, -, ^, @, Yen, Ro, NumpadAdd, NumpadSubtract, NumpadEnter
 # - テンキー数字は通常の数字キーとは別キーとして扱われます。
 #   従来の数字キー既定操作は互換のため 1 と Numpad1 の両方を既定割り当てにしています。
 # - Alt+F4 / Alt+Tab / Alt+Esc / Alt+Space / Ctrl+Alt+Del / Win キー系など、
@@ -236,6 +236,10 @@
 # GridDeselect.2 = Ctrl+Shift+A ; チェックをすべて解除する
 # GridCutFiles = Ctrl+X ; 選択中またはチェック済みの実ファイル/実フォルダを切り取る
 # GridCopyFiles = Ctrl+C ; 選択中またはチェック済みの実ファイル/実フォルダをコピーする
+# GridCopyPath = none ; パスをコピー
+# GridCopyFileName = none ; ファイル名をコピー
+# GridCopyImage = none ; 画像をクリップボードにコピー
+# GridCopyEditedImage = none ; 編集を反映した画像をコピー
 # GridOrganizeFiles = none ; 選択中またはチェック済みの実ファイル/実フォルダの整理先を選ぶ
 # GridToggleCheck = Space ; 選択中の項目のチェックを切り替える
 # GridDelete = Delete ; 通常一覧では実ファイル/実フォルダを削除し、コレクション直下では参照登録を外す
@@ -337,16 +341,28 @@
 [FsCommon] ; フルスクリーン共通
 # FsToggleMetadata.1 = I ; 左右パネルの表示モードを切り替える
 # FsToggleMetadata.2 = Tab ; 左右パネルの表示モードを切り替える
+# FsPageOverviewToggle = O ; ページ一覧の表示を切り替える
 # FsBackToList = Backspace ; フルスクリーンを閉じて一覧へ戻る
 # FsToggleWindowMode = F11 ; ウィンドウ表示と全画面表示を切り替える
 # FsJumpFirst = Home ; 先頭の項目へ移動する
 # FsJumpLast = End ; 末尾の項目へ移動する
 # FsCtrlNavPrev = Ctrl+Up ; 前のフォルダまたは検索結果へ移動する
 # FsCtrlNavNext = Ctrl+Down ; 次のフォルダまたは検索結果へ移動する
+# FsListOrderPrev = Ctrl+Shift+Up ; 一覧の表示順で前の本を開く
+# FsListOrderNext = Ctrl+Shift+Down ; 一覧の表示順で次の本を開く
 # FsSiblingPrev = Ctrl+PageUp ; 前の兄弟フォルダへ移動する
 # FsSiblingNext = Ctrl+PageDown ; 次の兄弟フォルダへ移動する
 # FsPanorama = V ; 360度表示または通常動画の拡大表示を切り替える
 # FsPanoramaProjection = Shift+V ; 360度パノラマの投影方式を切り替える
+
+[FsPageOverview] ; ページ一覧
+# FsPageOverviewConfirm = Enter ; ページ一覧で選択したページへ移動する
+# FsPageOverviewPagePrev = PageUp ; ページ一覧を前の画面へ送る
+# FsPageOverviewPageNext = PageDown ; ページ一覧を次の画面へ送る
+# FsPageOverviewFirst = Home ; ページ一覧の先頭へ移動する
+# FsPageOverviewLast = End ; ページ一覧の末尾へ移動する
+# FsPageOverviewColumnsLess = none ; ページ一覧の列数を減らす
+# FsPageOverviewColumnsMore = none ; ページ一覧の列数を増やす
 
 [Rating] ; レーティング
 # RatingItem1 = F1 ; 星1を付ける（アイテム）
@@ -399,6 +415,11 @@
 # FsAddToActiveBook = Ctrl+B ; 現在のページを追加先の本へ追加する
 # FsAddToCollectionTarget = none ; 現在の実画像を追加先のコレクションへ追加する
 # FsExport = Ctrl+E ; 現在の表示結果を別ファイルへ書き出す
+# FsCopyEditedImage = none ; 編集を反映した画像をコピー
+# FsCopyFiles = none ; 表示中の実ファイルをコピーする
+# FsCopyPath = none ; パスをコピー
+# FsCopyFileName = none ; ファイル名をコピー
+# FsCopyImage = none ; 画像をクリップボードにコピー
 # FsCompareToggle = X ; 現在の画像を比較スロットに固定または解除する
 # FsCompareCycle = C ; 比較スロットのピン画像と現在画像を切り替えて表示する
 # FsCompareWipe = Shift+C ; ワイプ比較を切り替える
@@ -407,6 +428,7 @@
 # FsRotateCcw = L ; 現在の画像を左に90度回転する
 # FsImageAnalysis = Shift+Z ; 画像分析モードを開く
 # FsZoomMode = Z ; 全画面ズームモード (押している間ズーム範囲を指定)
+# FsScrubZoomHold = Ctrl+Space ; 押しながら左右ドラッグで拡大・縮小する
 # FsNavigatorToggle = Alt+N ; ナビゲータの表示を切り替える
 # FsPageTurnAnimationToggle = none ; ページめくりアニメーションを切り替える
 # FsNavigatorHold = Alt ; 押している間だけナビゲータを表示する
@@ -444,6 +466,10 @@
 # FsReadingDirectionToggle.2 = Numpad7 ; 横方向の読み進み方向を切り替える
 # FsFitModeCycle.1 = 0 ; ズーム/フィット方式を切り替える
 # FsFitModeCycle.2 = Numpad0 ; ズーム/フィット方式を切り替える
+# FsZoomIn.1 = . ; 画像を拡大する
+# FsZoomIn.2 = NumpadAdd ; 画像を拡大する
+# FsZoomOut.1 = , ; 画像を縮小する
+# FsZoomOut.2 = NumpadSubtract ; 画像を縮小する
 # FsAiModelNext = U ; AIモデルを次へ切り替える
 # FsAiModelPrev = Shift+U ; AIモデルを前へ切り替える
 # FsAiModelReset = Alt+U ; AIモデルを標準に戻す
@@ -631,6 +657,8 @@
 # ErasePaintMode = D ; 描画モードに切り替える
 # EraseEraseMode = F ; 消去モードに切り替える
 # EraseSpacePan = Space ; 押している間だけ画像をパン操作する
+# EraseScrubZoomHold = Ctrl+Space ; 押しながら左右ドラッグで拡大・縮小する
+# ErasePreviewHold = Tab ; 押している間だけ消しゴムの結果をプレビューする
 
 [Conceal] ; 隠蔽加工モード
 # ConcealExit = Ctrl+M ; 隠蔽加工モードを終了する
@@ -662,10 +690,13 @@
 # ConcealToolRect = R ; 矩形ツールに切り替える
 # ConcealToolEllipse = O ; 楕円ツールに切り替える
 # ConcealSpacePan = Space ; 押している間だけ画像をパン操作する
+# ConcealScrubZoomHold = Ctrl+Space ; 押しながら左右ドラッグで拡大・縮小する
+# ConcealPreviewHold = Tab ; 押している間だけ隠蔽加工の結果をプレビューする
 
 [Crop] ; 切り取りモード
 # CropForceCreateHold = Ctrl ; 押している間、ドラッグで新しい切り取り枠を作る
 # CropSpacePan = Space ; 押している間だけ画像をパン操作する
+# CropScrubZoomHold = Ctrl+Space ; 押しながら左右ドラッグで拡大・縮小する
 # CropExecute = Ctrl+E ; 切り取りを実行する
 
 [SnsSplit] ; SNS 分割モード
@@ -677,6 +708,7 @@
 # TextRedo.2 = Ctrl+Shift+Z ; テキスト注釈編集をやり直す
 # TextUndo = Ctrl+Z ; テキスト注釈編集を元に戻す
 # TextSpacePan = Space ; 押している間だけ画像をパン操作する
+# TextScrubZoomHold = Ctrl+Space ; 押しながら左右ドラッグで拡大・縮小する
 
 [LocalAdjust] ; 補正レイヤー
 # LaShowSource = Q ; 元画像表示を切り替える
@@ -698,3 +730,4 @@
 # LaConfirmPolygon = Enter ; 補正レイヤーの多角形マスクを確定する
 # LaDeleteShape = Delete ; 選択中の補正図形を削除する
 # LaSpacePan = Space ; 押している間だけ画像をパン操作する
+# LaScrubZoomHold = Ctrl+Space ; 押しながら左右ドラッグで拡大・縮小する

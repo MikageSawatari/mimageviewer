@@ -136,7 +136,13 @@ pub(crate) fn wait_ready(app: &mut App, idx: usize) -> FinalCompositeKey {
             rx.recv_timeout(Duration::from_secs(10))
                 .expect("legacy pixels"),
         ),
-        FinalEffectState::CpuReady(_) => {
+        FinalEffectState::Computing(FinalEffectReceiver::Edited { rx, .. }) => {
+            FinalEffectReady::Edited(
+                rx.recv_timeout(Duration::from_secs(10))
+                    .expect("prepared edit pixels"),
+            )
+        }
+        FinalEffectState::CpuReady(_) | FinalEffectState::Registering(_) => {
             wait_idle(app);
             return key;
         }

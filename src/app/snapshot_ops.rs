@@ -991,6 +991,8 @@ impl App {
             self.global_search.saved_folder.clone()
         } else if self.favsearch.active {
             self.favsearch.saved_folder.clone()
+        } else if self.tag_view.active {
+            self.tag_view.saved_folder.clone()
         } else {
             None
         };
@@ -998,12 +1000,14 @@ impl App {
         // 旧 state / テスト補助経路などで検索 active flag と TopLevelGridView の同期前に
         // snapshot が開始されても、結果一覧の合成 path を戻り先にしない。通常経路では
         // return_to が既に完全な SmartFolder state 等を持つため、その値を優先する。
-        if self.global_search.active || self.favsearch.active {
+        if self.global_search.active || self.favsearch.active || self.tag_view.active {
             top_level_return = self.top_level_grid_view.return_to().cloned().or_else(|| {
                 let subfolder_restore = if self.global_search.active {
                     self.global_search_subfolder_restore.clone()
-                } else {
+                } else if self.favsearch.active {
                     self.favsearch_subfolder_restore.clone()
+                } else {
+                    self.tag_view_subfolder_restore.clone()
                 };
                 Some(self.view_return_context_from_parts(
                     pre_snapshot_search_origin.clone(),
@@ -1012,6 +1016,19 @@ impl App {
                 ))
             });
         }
+        // Tagの終了処理はreturn originも消費するので、戻り先とrouteを終了前に対で確定する。
+        let top_level_return = top_level_return.map(|restore| {
+            let route = self
+                .top_level_grid_view
+                .return_origin()
+                .filter(|origin| {
+                    super::FolderNavHistoryTarget::from_restore(&origin.restore)
+                        == super::FolderNavHistoryTarget::from_restore(&restore)
+                })
+                .map(|origin| origin.route.clone())
+                .unwrap_or_else(|| self.facet_navigation.route().clone());
+            super::top_level_grid_view::TopLevelGridOrigin { restore, route }
+        });
         let mut membership: std::collections::HashMap<SnapshotKey, usize> =
             std::collections::HashMap::with_capacity(captured_entries.len());
         for (idx, entry) in captured_entries.iter().enumerate() {
@@ -1127,21 +1144,9 @@ impl App {
         });
         // The original shift owner is parked above; the extracted list has no Book scope.
         self.spread_shift.detach_book_scope_for_ordinary_list();
-        let return_origin = top_level_return.map(|restore| {
-            let route = self
-                .top_level_grid_view
-                .return_origin()
-                .filter(|origin| {
-                    super::FolderNavHistoryTarget::from_restore(&origin.restore)
-                        == super::FolderNavHistoryTarget::from_restore(&restore)
-                })
-                .map(|origin| origin.route.clone())
-                .unwrap_or_else(|| self.facet_navigation.route().clone());
-            super::top_level_grid_view::TopLevelGridOrigin { restore, route }
-        });
         self.top_level_grid_view.begin_with_origin(
             super::top_level_grid_view::TopLevelGridSurface::Snapshot,
-            return_origin,
+            top_level_return,
         );
 
         // ★items_generation bump + invalidate_idx_state_and_queues (= Codex P1-1):
@@ -1637,11 +1642,18 @@ impl App {
         true
     }
 
-    /// 検索系 (Ctrl+F / Ctrl+S / Ctrl+G) を全部 close する (= snapshot ON 時に呼ぶ)。
+    /// 検索系を全部 close する (= snapshot ON 時に呼ぶ)。
     ///
     /// 戻り値: いずれかの検索が active だったか (= toast 文面の分岐用)。
     fn close_searches_for_snapshot(&mut self) -> bool {
         let mut had_active = false;
+
+        // 戻り先は activate_snapshot で保存済み。固定一覧へ検索結果を遅着させず、
+        // タグ専用列・選択情報も同じ検索の終了境界で退役させる。
+        if self.tag_view.active || self.items_are_tag_view || self.tag_view_pending.is_some() {
+            had_active = true;
+            let _ = self.dismiss_tag_view_without_restore();
+        }
 
         // Ctrl+F (= text search): search bar を閉じる + pending cancel + query クリア
         if self.show_search_bar {

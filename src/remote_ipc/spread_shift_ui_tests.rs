@@ -128,7 +128,7 @@ mod spread_shift_d3 {
             BookCompositionService, PageDomain, ReadingDirection, fixtures::four_page_book,
         };
         use crate::view_trim::{
-            ViewTrimApplyMode, ViewTrimBookSettings, ViewTrimBookState, ViewTrimLinkedMargins,
+            ViewTrimBookPreference, ViewTrimBookSettings, ViewTrimBookState, ViewTrimLinkedMargins,
             ViewTrimMargins,
         };
         use crate::view_trim_db::{ViewTrimDb, ViewTrimWriteBatch};
@@ -160,7 +160,7 @@ mod spread_shift_d3 {
                 mimageviewer_ipc::RemoteAddress::file(book.to_string_lossy().into_owned());
             let key = remote_spread_key(&address).unwrap();
             let older = ViewTrimBookState {
-                apply_mode: ViewTrimApplyMode::Book,
+                preference: ViewTrimBookPreference::Manual,
                 book_settings: ViewTrimBookSettings {
                     enabled: true,
                     spread_separate: true,
@@ -168,7 +168,7 @@ mod spread_shift_d3 {
                 },
             };
             let requested = ViewTrimBookState {
-                apply_mode: ViewTrimApplyMode::Page,
+                preference: ViewTrimBookPreference::FollowGlobal,
                 book_settings: ViewTrimBookSettings {
                     enabled: true,
                     spread_separate: false,
@@ -190,13 +190,13 @@ mod spread_shift_d3 {
                 },
             };
             let mut expected = requested;
-            expected.apply_mode = ViewTrimApplyMode::None;
+            expected.preference = ViewTrimBookPreference::FollowGlobal;
             expected.book_settings.spread_separate = true;
             expected.book_settings = expected.book_settings.with_spread_separate(false);
             let (entered, release) = service.hold_worker_for_test();
             entered.recv_timeout(Duration::from_secs(30)).unwrap();
             drop(service.save_view_trim(ViewTrimWriteBatch {
-                book: Some((key.exact.clone(), older)),
+                book: Some((key.exact.clone(), key.fallback.clone(), older)),
                 pages: vec![],
             }));
             let (handle, owner, _) = active_session();
@@ -208,17 +208,19 @@ mod spread_shift_d3 {
                 RemoteWriteRequest::SetViewTrim {
                     address: address.clone(),
                     context_address: address,
-                    state: serde_json::to_value(requested).unwrap(),
+                    state: crate::remote_ipc::remote_view_trim_wire_state(requested, false, false),
                 },
             );
             let ctx = egui::Context::default();
             app.apply_pending_remote_write(pending, &ctx);
             assert!(
-                app.view_trim_db
-                    .as_ref()
-                    .unwrap()
-                    .get_book_state(&key.exact)
-                    .is_none(),
+                matches!(
+                    app.view_trim_db
+                        .as_ref()
+                        .unwrap()
+                        .load_book_preference_with_fallback(&key.exact, key.fallback.as_deref()),
+                    crate::view_trim_db::ViewTrimBookLoad::Missing
+                ),
                 "Remote must enqueue rather than write ahead of the held projection batch"
             );
             assert!(matches!(
@@ -278,8 +280,9 @@ mod spread_shift_d3 {
                 app.view_trim_db
                     .as_ref()
                     .unwrap()
-                    .get_book_state(&key.exact),
-                Some(expected)
+                    .load_book_preference_with_fallback(&key.exact, key.fallback.as_deref())
+                    .state_or_default(),
+                expected
             );
             if cancel_before_receipt {
                 assert!(
@@ -306,7 +309,7 @@ mod spread_shift_d3 {
                 };
                 assert_eq!(
                     result.view_trim_state,
-                    Some(serde_json::to_value(expected).unwrap())
+                    Some(crate::remote_ipc::remote_view_trim_wire_state(expected, false, false))
                 );
                 assert!(!app.settings.margin_fit_enabled);
                 assert_eq!(

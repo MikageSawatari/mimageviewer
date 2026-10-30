@@ -1,5 +1,13 @@
 # アーキテクチャ概観
 
+## 通常フォルダ一覧の表示順ナビゲーション (§1.444)
+
+`app/list_order_navigation` は、main の通常フォルダ一覧から本を開く受付時の本の行だけを
+`ListOrderSnapshot` として凍結する。`ViewerContextBundle` が列と取得元 context id を持ち、
+現在位置は表示中の論理 source から導く。fork の子には渡さず、promote 後の旧 main は id の照合で使えない。
+`FolderNavMode::ListOrder` の行き先選択だけを worker に足し、停止判定・事前走査・採用・本の再表示は
+既存の Fullscreen フォルダナビゲーションと共有する。[仕様と検証](list-order-book-navigation-plan.md)。
+
 ## 本のitems生成境界（§1.242 G1）
 
 `app/book_materialization`に既存ZIP階層、PDF/EPUB page row、folder listingの生成を集約する。
@@ -154,6 +162,50 @@ volatileを反映する。非resident ownerも対象とし、同keyの未確定d
 詳細は [ページ補正の所有設計](page-adjustment-owner-plan.md)。
 
 ---
+
+### 閲覧中のページ一覧 (§1.340、2026-10-27 独立レビューP2追補・指定自動検証済み)
+
+`PageOverviewState::Closed | Open(PageOverviewSession)` は `ViewerContextBundle` が所有し、
+mount / deposit で状態と incarnation を移譲する。独立 fork は Closed で開始し、
+items／読み順の置換と terminal teardown は当該 owner の一覧を閉じる。
+`PreparedPageIdentityIndex` が既存一覧の準備境界で実ページの identity／表示名を持つ
+immutable metadata を作り、`ViewerNavigationCaches` が現在の実ページ列との projection を共有する。
+通常 fullscreen、メイン内閲覧、F12連動窓、独立窓は同じ描画・入力・ページ着地の境界を使う。
+passive は `StillImage | PageOverview` の投影を持ち、全実ページ metadata の Arc と
+可視近傍の bounded texture だけを保持する。全ページ画像の生成や別の navigation owner は作らない。
+新規入場とSelectは既存`page_overview_available()`にまとめた
+`fs_navigation_sequence_blocks_new_target()`／`page_turn_barrier_active()`を共用する。
+animationのON／OFFに依存せず、受理済み移動が未提示の間は入場を拒否する。
+受理済み移動と既存continuationの完了を維持し、利用者が完了後に
+O／HUD／ring／padをもう一度操作する。全入口は`open_page_overview_for_viewer`→`open_page_overview`へ
+通し、保留・replay・新しい取消ownerを追加しない。2026-10-27の新coordinator手順2
+（同期完了なし→入場拒否）を独立レビューP2-1で通常の表示待ちにも拡張し、旧選択肢2の即退役は不採用。
+新しいpredicate・pending・replay・取消は作らない。既存前面操作のキー優先順と、共通入場受理時の
+chrome終了はP2-2で揃える。`dismiss_fs_transient_menu_state()`はApp boolのspread／fit／panoramaと
+overflowを終了し、通常closeと受理入場が共用する。次キー／HUDのoverflow-only終了は
+`dismiss_fs_overflow_panel()`で維持する。egui Popupは所有viewportの`Memory::end_pass`で自然に退役し、
+明示的な全viewport closeを足さない。physical streamとinfo lock、拒否入場のchromeを保持する。
+front captureは`fs_front_menu_presented`とoverflow rectに限り、通常adjustment／metadata／infoは含めない。
+tag pickerとoverlay編集の既存入場拒否、TextEdit／IMEのkeyboard ownerは維持し、durable panelや
+hover tooltipの寿命を一括resetで置き換えない。
+追補後の指定自動検証は同§25.7で成功。新差分の独立再レビューはcoordinatorへ引き継ぐ。
+
+PDF／EPUBの要求・昇格も、master取込み後に§1.377の既存 `PdfRenderEpochOwner`／ticket、
+`promote_viewer_pdf_keys`／`PdfVisiblePromotionState` へ接続済み。別の要求ownerは作らない。
+接続・最終修正の独立レビューはACCEPT。full 1回で見つかった環境／fixture／回帰を補完済みで、実機受入は未完了。
+これは2026-10-12〜13の検証履歴。§25.6の指定自動検証は統合commit `1c134703b`までの履歴で、
+独立レビューP2追補後の成功証拠とはしない。
+独立レビュー・full-lib・build-dev・実機確認はcoordinatorへ引き継ぐ。
+2026-10-27のmaster統合では構成採用後の可視実items順とhiddenを反映し、
+白紙補助annotationは`None`のまま未接続とする。
+Selectは既存のstamp／binding／items・projection revision／incarnation／stable identity／active資格を
+すべて照合した時点で受理し、Closed→既存landing一回へ進む。即時・Checking後許可・後着拒否・
+同期拒否は通常navigation ownerへ任せ、一覧の再open／待機／追加pending／受付証明は作らない。
+LatestSeekは既存seek／jumpと同じく新curl対象外。選択先flatの実表示受理後のD3先読みも
+既存`prefetch_next_final_unit`資格を使い、一覧専用policyを設けない。
+masterのphysical placementは既存client-size変換とUI scale正規化を使い、front pointerは
+CentralPanelで一度captureしてprimary終端／一覧／通常canvasが同frameの値を共有する。
+[R5・統合契約と今回の記録§25](detached-book-page-overview-plan.md#25-2026-10-27-master統合記録)。
 
 ### 音声サムネイル (§1.347、2026-10-08)
 
@@ -326,6 +378,7 @@ GPU 情報・ドライバー・段階・エラー行・試行履歴と条件付�
 | `run_native_failure.rs` | `run_native` 復帰後の単一終了境界。watchdog休止、失敗分類・原因連鎖の記録、既存cleanup、terminal・flush後のnative通知を順序付ける。自動script実行は通知だけを抑止する。詳細は [描画失敗の報告設計](render-init-failure-report-plan.md) |
 | `app.rs` | `App` 構造体と `eframe::App` 実装。非描画の`logic`と、root Uiを受ける`ui`へ状態遷移を接続する |
 | `app/update_phases.rs` | service・input・render・post-renderの既存順序を所有。表示採用とGPU uploadはUI側へ残す |
+| `app/prepared_edit.rs` | 紙めくり§28段階BのNext編集準備。局所補正・隠蔽・final・注釈をCPU workerで作り、既存`final_effect_pending`のComputing／CpuReady／Registeringで一括公開まで所有する。新しい待機ownerを持たず、表示引取りと編集入口の取消を同じ境界へ集約する。実装・検証進行中、結果は`target/pageturn-1461/implementation-report-b.md` |
 | `app/close_return.rs` / `app/root_lifecycle.rs` | teardown前に捕捉したClose帰還を存続mainの既存navigation ownerへ移し、root Closeをlogic直後のbackend終了判定へ接続する |
 | `crates/startup-diagnostics` | launcher/core共通の常時起動timeline。UIは固定容量のmemoryへ非blockingで公開し、独立writerがJSONLを保存する。UI heartbeatと独立した限定watchdog、同runの引継ぎ、保存先分類を所有する。詳細は [startup-diagnostics-plan.md](startup-diagnostics-plan.md) §3・§10 |
 | `ui_startup.rs` | 起動stage/経過時間と「検索の準備中」の純粋描画。Indexerの5秒overlay上限・worker継続・単一採用はAppの `IndexerInit` が所有する |
@@ -406,6 +459,8 @@ GPU 情報・ドライバー・段階・エラー行・試行履歴と条件付�
 | `ui_pinned_search.rs` / `app/pinned_search.rs` | 4種類の常設検索入力の幅・純粋描画と、既存検索への単一transaction・Esc router。結果/worker ownerは追加しない |
 | `ui_dialogs/smart_folder_editor.rs` | 名前だけのスマートフォルダ作成、現在の実フォルダ + facet 条件をルールとして追加する確認 UI、ルール / グループ化単位の管理 UI。場所 / AI / 画像色など保存対象外の条件を明示する。管理中のテキストはローカル draft に保持し、フォーカス離脱・選択変更・ダイアログ操作の確定境界でだけ Settings 保存と対応 worker / snapshot の無効化を行う。終了・トレイ退避の共通保存境界では有効 draft を Settings へ確定するが worker は開始せず、トレイ復帰時だけ遅延した副作用を1回適用する |
 | `ui_fullscreen.rs` | フルスクリーンビューポート (`show_viewport_immediate`)。描画テクスチャの優先順位はここで決定。見開きのcanonical `SpreadDisplayUnit`はpage列と形成理由（paired / 本当に相方がない / 横長境界 / 非ペア境界）を同じcache tokenで所有し、共通compositionだけが端の単ページ配置を解決する。paged、F12、連結読み、holdover、Remoteはtyped placementを消費し、縦横を再判定しない |
+| `page_overview.rs` / `ui_page_overview.rs` | viewer所有のClosed／Open、実ページprojection、stamp、cursor／仮想行／RTLの純粋モデルと共通描画。描画はstamped commandを返し、I/Oやページ移動を実行しない |
+| `app/page_overview.rs` / `app/detached_page_overview.rs` / `ui_fullscreen/page_overview.rs` | 一覧の適格性、root／detached入力所有、passive投影、bounded前面需要、既存LatestSeek着地を接続する。入力stampと実際のactive ownerを別々に検証する |
 | `seek_ruler.rs` | 静止画 / 本のページ数と動画 / 音楽の duration から、トラック幅に収まる 1 / 2 / 5 系の目盛り位置と大小区分を生成する純ロジック。3 面の共通寸法・低コントラスト色も所有する |
 | `page_dims.rs` | 一度判明したページ寸法を GPU texture の生存期間から分離して保持する generation 付き CPU cache。`ViewerContextBundle` 所有で、同じ idx の別 items へ寸法を誤適用しない |
 | `source_coverage.rs` | §1.165 B1 の素材の収録範囲。`SourceCoverage::{FullSource, Known(EditPreviewGeometry), Unknown}` が通常素材・生成由来が既知の編集 preview・旧行を区別する。正規座標の元寸法、切り出し前 raster 寸法、実整数 pixel bounds を別に持ち、現在 crop と独立した UV を供給する。Unknown の代役可否は共通 typed policy 一か所で解決する |
@@ -416,6 +471,7 @@ GPU 情報・ドライバー・段階・エラー行・試行履歴と条件付�
 | `vendor/egui-wgpu` | egui-wgpu 0.37.0 / wgpu 30のmanaged textureにopt-in GPU mipmapを追加するローカルパッチ。`TextureOptions::mipmap_mode`指定時だけ完全なmip chainを生成し、静止画の論理`TextureHandle` / cache構造は変えない。map化deltaの同一texture内順序を保持し、旧set/partial→submission→後発freeを完結させる。`Rgba8Unorm`生成器は比較callbackと360度パノラマにも共用。WindowsではPainterが全viewportのHWNDにdevice上限の外寸制約を所有し、初回取り付けと迂回resizeで実窓を補正・client寸法を再取得する。外寸制約はconfigureへ渡す物理client寸法をdeviceのmax_texture_dimension_2d以下に保つための保守的な設計で、再configure／Lost再作成も同じ不変条件に従う。device要求上限の既定8192は変更しない（§1.395）。上流license本文をcrate内に保持する |
 | `ui_fullscreen/draw_icons.rs` | フルスクリーン上部バー / 動画 HUD のボタン・アイコン描画 helper、ファイル情報文字列 builder |
 | `export_dialog.rs` | Ctrl+E エクスポートのダイアログ状態・worker・ファイル名衝突回避。UI は source identity / 編集 snapshot / preset を固定し、元画像の decode、選択段までの合成、見開き結合、画像エンコード、メタデータ転記は worker が担当 |
+| `edited_clipboard_copy.rs` | 編集を反映した画像のコピー。Ctrl+E と同じ source / 編集 snapshot から、専用の焼き込み段までの合成・見開き結合・matte・CF_DIB 書き込みを worker で行う。App 全体の pending 1 本で置き換えを所有し、完了は結果 channel と ROOT repaint で通知する（常時 timer なし）。書き込みは共通 writer の mIV 世代と OS クリップボード世代で後のコピーを保護し、worker は編集 DB / sidecar へ書かない |
 | `ui_helpers.rs` | メニューバー、ツールバー、アドレスバー等の共通 UI |
 | `grid_item.rs` | `GridItem` 列挙型と `ThumbnailState` (Pending/Loaded/Failed/Evicted)。`GridItem::Stack { key, representative, count }` (v2.0.0) はファイル名スタックの畳んだ集約セル (ZipDir と同じ仮想コンテナ扱い = pin/snapshot/file-op/checkable/rating 対象外)。`arrange_grid_items` は実フォルダ / アーカイブ類 / 画像 / 動画・音声の設定行を全グリッド構築経路へ適用する単一チョークポイント |
 | `filename_stack.rs` | ファイル名 prefix スタック (v2.0.0) の純ロジック。`StackMember`/`StackGroup`/`StackView` + `group_media` (末尾区切り文字の前でグループ化、動画は単独固定) / `materialize_aggregated` (集約グリッド) / `materialize_flat` (フラット読書フルスクリーン) / flat-index 写像 / `stack_jump_target` (Shift+↓↑)。I/O 無しで unit test 容易 |
@@ -445,6 +501,12 @@ GPU 情報・ドライバー・段階・エラー行・試行履歴と条件付�
 | `video/native_touch.rs` | presenter / HUD HWND が共有する薄い `WM_POINTER` アダプタ。HWND ごとの bounded stream ownership、client-pixel→points 共通変換、source typed event、共有 `TouchRecognizer` への入力、先頭接点の pointer emulation、chrome command 写像を担当する。HUD source は OS hit-test を正本として geometry 再分類を行わず widget passthrough に固定する |
 | `folder_tree.rs` | 深さ優先前順トラバーサル (Ctrl+↑↓ 用) |
 | `panorama.rs` / `panorama_wgpu.rs` | 360 度パノラマビュー (Phase 1 + 1.5 + 2a)。`panorama.rs` は state / GPano XMP 検出 / 解像度ゲート / settle policy / CPU bilinear sampler / `render_settle_overlay`、`panorama_wgpu.rs` は equirect WGSL シェーダ + 8K base アップロード + settle overlay の alpha blend pipeline。詳細は [`docs/panorama-360-view-plan.md`](panorama-360-view-plan.md) |
+
+動画のデインターレースは通常動画 HUD 上部の「…」から再生中にも変更できる (§1.660)。
+`VideoPlayer` が open 時の値と decoder と共有する atomic 現在値を所有し、手動状態は両者の差から導出する。
+全体設定へは保存せず、player の再作成で環境設定値へ戻る。setter が音声トラック変更と共通の
+位置解決・再生 intent を使って seek し、EOF 停止中は値だけ変更する。App は既存の per-context
+`fs_cache` と source epoch の経路で処理し、detached 固有の状態や受付境界を追加しない。
 
 ### 音楽ビュー / 音声再生 (v2.3.0)
 
@@ -532,6 +594,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `ui_metadata_panel.rs` | 右情報パネル (AI メタデータ + EXIF + XMP ツイート情報 + 類似画像)。類似タブ・照会表示・サムネイル要求と完了channelは `ViewerContextBundle` が所有する。可視カードとhoverページ帯の需要だけを描画後に処理し、workerは4枠、GPU uploadは1フレーム1件、派生キャッシュは512件以内に保つ。要求IDと内容stampを照合して退避・取消後の古い完了を拒否する |
 | `ui_erase.rs` | 消しゴムモード (筆 / 囲み / 直線 / 縦線 / 横線 / 矩形 / 楕円 → MI-GAN で inpaint) |
 | `ui_conceal.rs` | 隠蔽加工モード (同じマスク編集 UI でモザイク / 塗りつぶし / ぼかしを合成) |
+| `edit_preview.rs` | 消しゴム・隠蔽の結果プレビュー共通受付。キー保持の解放待ち、目ボタンとの合成、プレビュー中の primary stream 所有を担当。処理要求・cache・viewport 配送は各既存経路を使用 |
 | `ui_dialogs/` | 環境設定・サムネイルキャッシュ管理・変換済みアーカイブ管理と EPUB 変換キャッシュ管理の独立したダイアログ (`archive_cache_manager.rs`)・アーカイブ変換ダイアログ (`archive_convert.rs`)・お気に入り編集・スライドショー設定・ネットワーク上のデータ保存先に関する起動案内等。アーカイブ変換は `ArchiveConvertState` が scan / password retry / convert 共通の cancel token と completion policy を所有し、state drop と競合 navigation で worker と receiver を同時に終了する。モーダル相当の表示状態は `App::common_modal_dialog_open` に集約し、`process_scroll` のポインタ直下 floating-layer guard と組み合わせてダイアログ内 wheel の背面グリッドへの伝播を防ぐ。TensorRT パック取得のような長時間ツール Window はモデルレスとし、表示中も閲覧を止めない |
 | `native_name_dialog.rs` | 名前変更 / 新規フォルダ作成で共有する Windows 標準の単一行入力画面。メモリ上のダイアログテンプレートを同期モーダル表示し、IME・書記素編集・クリップボード・Undo を OS に委譲する。非 Windows では no-op stub |
 | `ui_dialogs/preferences.rs` | 環境設定ダイアログの状態、App 連携、ツリー / ページ dispatch。環境設定と操作カスタマイズの draft は App が `Option<Box<PreferencesState>>` で所有し、ページ追加による App のスタックサイズ増大を避ける |

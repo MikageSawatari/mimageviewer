@@ -18,7 +18,7 @@
 #include "utf8_paths.h"
 
 // mImageViewer maintained MIT copy: explicit UTF-8/UTF-16 filesystem boundaries.
-// Upstream source: VST3 SDK 3.8.0 public.sdk/source/vst/hosting/module_win32.cpp
+// Upstream source: VST3 SDK 3.8.1 public.sdk/source/vst/hosting/module_win32.cpp
 #include "public.sdk/source/vst/utility/optional.h"
 #include "public.sdk/source/vst/utility/stringconvert.h"
 

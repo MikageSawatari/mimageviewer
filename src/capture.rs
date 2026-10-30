@@ -813,7 +813,7 @@ fn encode_rgba<W: Write>(
     }
 }
 
-fn flatten_rgba_to_rgb(rgba: &[u8], width: u32, matte: JpegMatte) -> Vec<u8> {
+pub(crate) fn flatten_rgba_to_rgb(rgba: &[u8], width: u32, matte: JpegMatte) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
     for (i, px) in rgba.chunks_exact(4).enumerate() {
         let alpha = px[3] as u16;

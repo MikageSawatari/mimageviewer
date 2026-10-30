@@ -245,7 +245,13 @@ static ORT_PROVIDERS_SHARED_BYTES: &[u8] =
 
 /// ort::init_from() の結果。プロセス内 1 回限りなので OnceLock で保持。
 /// バックエンド切り替え時は再起動が必要。
-static ORT_INIT: OnceLock<Result<ActiveBackend, String>> = OnceLock::new();
+static ORT_INIT: OnceLock<Result<InitializedOrt, String>> = OnceLock::new();
+
+/// rc.15 は環境を暗黙に保持しないため、DLL 選択と同じ process lifetime で所有する。
+struct InitializedOrt {
+    backend: ActiveBackend,
+    environment: ort::environment::Environment,
+}
 
 /// 指定ディレクトリを Windows の DLL 検索パスの **先頭** に固定する。
 ///
@@ -355,8 +361,8 @@ pub struct ActiveBackend {
 /// `requested` がユーザー選択バックエンド。TensorRt が選択されたが pack 不在/破損なら
 /// DirectMl にフォールバック。CPU は DirectML 版 DLL のままセッション側で EP 登録なし
 /// にする (CPU EP は両方の ORT DLL に内蔵)。
-fn ensure_ort_initialized(requested: AiBackend) -> Result<ActiveBackend, AiError> {
-    let result = ORT_INIT.get_or_init(|| -> Result<ActiveBackend, String> {
+fn ensure_ort_initialized(requested: AiBackend) -> Result<&'static InitializedOrt, AiError> {
+    let result = ORT_INIT.get_or_init(|| -> Result<InitializedOrt, String> {
         let dir = crate::data_dir::get();
         std::fs::create_dir_all(&dir).map_err(|e| format!("data_dir create failed: {e}"))?;
         let mut trt_fallback_reason = None;
@@ -375,16 +381,22 @@ fn ensure_ort_initialized(requested: AiBackend) -> Result<ActiveBackend, AiError
 
                 match ort::init_from(&pack_dll) {
                     Ok(env_builder) => {
-                        env_builder.commit();
+                        // init_from 成功後は DLL が固定済み。環境生成の失敗は再試行しない。
+                        let environment = env_builder
+                            .build()
+                            .map_err(|e| format!("TensorRT pack の ORT environment build: {e}"))?;
                         crate::logger::log(format!(
                             "[AI] ORT initialized with TensorRT pack: {}",
                             pack_dll.display()
                         ));
-                        return Ok(ActiveBackend {
-                            requested: AiBackend::TensorRt,
-                            effective: AiBackend::TensorRt,
-                            dll_path: pack_dll,
-                            fallback_reason: None,
+                        return Ok(InitializedOrt {
+                            backend: ActiveBackend {
+                                requested: AiBackend::TensorRt,
+                                effective: AiBackend::TensorRt,
+                                dll_path: pack_dll,
+                                fallback_reason: None,
+                            },
+                            environment,
                         });
                     }
                     Err(e) => {
@@ -427,9 +439,10 @@ fn ensure_ort_initialized(requested: AiBackend) -> Result<ActiveBackend, AiError
             dll_path
         };
 
-        ort::init_from(&dll_path)
+        let environment = ort::init_from(&dll_path)
             .map_err(|e| format!("ort::init_from: {e}"))?
-            .commit();
+            .build()
+            .map_err(|e| format!("ORT environment build: {e}"))?;
 
         let fallback_reason = if requested == AiBackend::TensorRt {
             Some(trt_fallback_reason.unwrap_or_else(|| {
@@ -442,15 +455,18 @@ fn ensure_ort_initialized(requested: AiBackend) -> Result<ActiveBackend, AiError
             AiBackend::TensorRt => AiBackend::DirectMl, // フォールバック
             other => other,
         };
-        Ok(ActiveBackend {
-            requested,
-            effective,
-            dll_path,
-            fallback_reason,
+        Ok(InitializedOrt {
+            backend: ActiveBackend {
+                requested,
+                effective,
+                dll_path,
+                fallback_reason,
+            },
+            environment,
         })
     });
     match result {
-        Ok(active) => Ok(active.clone()),
+        Ok(initialized) => Ok(initialized),
         Err(e) => Err(AiError::Ort(e.clone())),
     }
 }
@@ -523,7 +539,7 @@ impl AiRuntime {
         let active = ensure_ort_initialized(backend)?;
         Ok(AiRuntime {
             sessions: Mutex::new(HashMap::new()),
-            backend: active,
+            backend: active.backend.clone(),
             trt_worker_lifecycle,
         })
     }
@@ -602,8 +618,10 @@ impl AiRuntime {
             backend_label
         ));
 
-        let mut builder =
-            Session::builder().map_err(|e| AiError::Ort(format!("Session::builder: {e}")))?;
+        // constructor が確定した同じ環境を使う。後着の呼び出しは cached 参照取得だけ。
+        let initialized = ensure_ort_initialized(self.backend.effective)?;
+        let mut builder = Session::builder(&initialized.environment)
+            .map_err(|e| AiError::Ort(format!("Session::builder: {e}")))?;
 
         builder = builder
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
@@ -976,20 +994,65 @@ mod tests {
             return;
         }
 
-        let exe = std::env::current_exe().expect("test executable");
         let cases: &[&str] = if cfg!(windows) {
             &["missing", "missing-api"]
         } else {
             &["missing"]
         };
+        run_isolated_ort_cases(
+            "ai::runtime::tests::dynamic_load_failures_return_without_reentering_once_lock",
+            CHILD_ENV,
+            cases,
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vendor_ort_loads_api24_environment_session_and_f32_tensor() {
+        const CHILD_ENV: &str = "MIV_ORT_VENDOR_LOAD_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // 製品の data_dir / ORT_INIT を使わず、取得済み vendor を直接検査する。
+            assert_eq!(ort::MINOR_VERSION, 24);
+            let dll = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/ort/onnxruntime.dll");
+            let environment = ort::init_from(dll)
+                .expect("vendor DLL must load with api-24")
+                .with_telemetry(false)
+                .build()
+                .expect("vendor environment must build");
+            // Build info は版番号を含むとは限らない（公式DLLも git-branch=HEAD）。
+            // DLL の版・同一性は更新時の nupkg / SHA-256 照合で確認する。
+            let build_info = ort::info();
+            assert!(!build_info.is_empty());
+            println!("{build_info}");
+            let builder = Session::builder(&environment).expect("API 24 session builder");
+            drop(environment); // builder は環境の強参照を保持する。
+            let tensor = ort::value::Tensor::from_array(
+                ndarray::Array4::from_shape_vec((1, 1, 1, 2), vec![0.25_f32, 0.75]).unwrap(),
+            )
+            .expect("owned ndarray f32 tensor");
+            let (shape, values) = tensor.try_extract_tensor::<f32>().unwrap();
+            assert_eq!(shape.as_ref(), &[1, 1, 1, 2]);
+            assert_eq!(values, &[0.25, 0.75]);
+            assert!(tensor.try_extract_tensor::<i64>().is_err());
+            drop(tensor);
+            drop(builder);
+            return;
+        }
+        run_isolated_ort_cases(
+            "ai::runtime::tests::vendor_ort_loads_api24_environment_session_and_f32_tensor",
+            CHILD_ENV,
+            &["vendor"],
+        );
+    }
+
+    fn run_isolated_ort_cases(test_name: &str, child_env: &str, cases: &[&str]) {
+        let exe = std::env::current_exe().expect("test executable");
         for case in cases {
             let mut child = std::process::Command::new(&exe)
                 .arg("--exact")
-                .arg(
-                    "ai::runtime::tests::dynamic_load_failures_return_without_reentering_once_lock",
-                )
+                .arg(test_name)
                 .arg("--nocapture")
-                .env(CHILD_ENV, case)
+                .env(child_env, case)
                 .spawn()
                 .expect("spawn isolated load failure test");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

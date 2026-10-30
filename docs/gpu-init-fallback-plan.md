@@ -411,3 +411,147 @@ vendor/egui-wgpu/src/lib.rs
 vendor/egui-wgpu/src/setup.rs
 vendor/egui-wgpu/src/startup_diagnostics.rs
 ```
+
+## 12. §1.429 surface 非対応の Err 終了 (2026-10-27、v4.9.0)
+
+同時に実装した §1.440・§1.441 は利用者判断で v4.9.0 から外し差し戻した
+(経緯・学びは backlog §1.440、試作はブランチ `hud-1440-1441-trial`)。
+
+状態: 実装済み (ブランチ hud-gpu-1440-1441-1429、未 merge)。
+現行§1.448の `native_adapter_candidates` は既に `is_surface_supported` で候補を除外し、
+対応候補なしはAdapterSelectionのErrにしているため、候補選択・APIの試行順は変更しない。
+残る `get_default_config(...).expect(...)` のErr化は、最初のroot surface設置に限る。
+GPU名/backendと失敗段階SurfaceCapabilitiesを既存§1.428/§1.448の失敗ダイアログ・保存ログへ渡す。
+初回rootがゼロ寸法の場合も対応確認だけ行い、configure自体はしない。
+
+独立レビューP2へのcoordinator判断により、実行中の新規/immediate/detached viewport、root再設置、
+resize/再設定/モニター移動等は変更前のexpectによるpanicへ戻す。起動観測がpendingでも、
+それだけではErr化しない。rootかつrender stateを初めて生成するinstall入口でのみ失敗方針を選び、
+runtime入口は常にpanicとする。新しい永続flag・viewport stateは持たない。
+失敗surface/depth/MSAAを除去して描画を続ける仕組みと、そのためのhelper/testは撤去する。
+起動後の資源寿命は変更前と同じ。共有viewport入口の変更範囲と構造的修正の合意は、
+ClaudeCodeが `ce2e15760` で `docs/detached-rework-plan.md` §11へ記録済み。
+初回rootのErrは既存のrun_native終了処理でPainterごと終了し、続行や再試行はしない。
+
+coordinator判断: 既定uncaptured-error handlerのpanicは今回は変えず、起動中止の伝播経路を追加しない (§1.448と同じ)。
+単にloggerへ送るhandlerへの置換は、不正なGPU状態で処理が続くため採らない。
+まれな失敗は既定の割り切り (ログ + 通知)。永続データやdetached述語は変更しない。
+
+GPU不要のfailure injectionは `require_surface_configuration(None, ...)` で実際の失敗分岐を通す。
+Err/GPU名/段階と成功値・startup通知の範囲をvendorテストで検査し、製品側では通知本文・ログへの接続を検査する。
+実HWNDによるsurface失敗注入flagは追加せず、製品は起動しない。
+
+§1.429の検証結果は以下。本体lib全件・build-dev・独立レビューはClaudeCodeへ引き継ぐ。
+
+### 12.2 初回実装の自動検証 (8cbf9e38e時点の履歴)
+
+基準 `7a8a25b06`、ブランチ `hud-gpu-1440-1441-1429`。全build/testで `MSBUILDDISABLENODEREUSE=1`。
+初回native依存を直列で用意した後、最終検証は `CARGO_BUILD_JOBS=24`。
+コマンド全文・exit・所要時間は `target/hud-gpu-validation/*.json`、出力は同名logへ保存した。
+
+§1.429では製品失敗通知のGPU名/SurfaceCapabilitiesの検査と、vendorのNone注入/成功値/通知範囲を追加した。
+初期案のinstall失敗時の資源除去/成功時の保持テストは、独立レビューP2の方針変更で撤去した (§12.4)。
+
+| 検証 | exit | 結果 |
+| --- | ---: | --- |
+| cargo fmt (引数なし) | 0 | `fmt-complete.log` |
+| 通常core check | 0 | `check-complete.log` |
+| test-script core check | 0 | `check-script-complete.log` |
+| cargo test -p mimageviewer --test ui_snapshot | 0 | 213成功。`snapshot.log` |
+| egui-wgpu nextest (winit / lib、全件) | 0 | 49件成功 (初期案)。`vendor-complete.log` |
+| 変更vendorのrustfmt --check | 0 | `vendor-fmt.log` |
+| viewer context audit | 0 | 指摘0件。`audit-complete.log` |
+| cargo fmt --check / UI glyph / git diff --check | 0 | `fmt-check.log` / `glyphs-complete.log` / `whitespace.log` |
+
+最初の通常check/lib testビルドはturbojpeg-sysのCMake `--parallel 24` がexit 1。
+Cargo並列数1でnative前提を構築した後に再検査した。失敗を成功扱いにはしていない。
+headless unit/fake-input/offscreenのみで、実環境の非対応surfaceと実MessageBoxの表示は未確認。
+
+### 12.3 §1.429の変更ファイル (基準7a8a25b06)
+
+```text
+docs/README.md
+docs/detached-rework-plan.md
+docs/gpu-init-fallback-plan.md
+docs/next-release-backlog.md
+src/run_native_failure.rs
+vendor/egui-wgpu/PATCHES.md
+vendor/egui-wgpu/src/lib.rs
+vendor/egui-wgpu/src/winit.rs
+```
+
+### 12.4 独立レビューの修正 (8cbf9e38e後)
+
+- P2: Err化を初回root installだけへ限定。runtimeの「logだけで戻る」「失敗資源を外して続行」を撤去し、
+  従来のexpect panicへ戻した。既存の製品panic.log経路とuncaptured-error handlerは変更しない。
+- root初回/既存render stateのroot/childそれぞれの方針と、起動観測pending中のruntime panicをGPU不要のNone注入で検査する。
+  runtimeのconfigure/resize入口は従来と同じvoid契約を維持し、Errを握り潰すcall siteは残さない。
+- 起動失敗の保存証明: 一時data-dirのlogsへ製品loggerの実writerを設定し、実NativeExit.recordと実finish_logsを通す。
+  run_nativeのUnsupportedSurface Errを注入し、GPU名・SurfaceCapabilities・終了ログがファイルに保存された後に
+  同じGPU名/段階/ログフォルダーを含む通知本文が届くことを検査する。scripted_runでも保存し、通知だけを抑止する。
+  OnceLockを隔離する単体テスト子processを用い、製品exe・HWND・実MessageBox・通常profileは使わない。
+  logger.rsのdependency target filterを広げず、製品の直接logger::log経路で保存されることを確認する。
+- P3 (detached記録): ClaudeCodeが `ce2e15760` で§11に記録済み。
+  初回rootとruntimeの失敗契約を分ける共有入口の変更範囲、および独立レビュー/ClaudeCodeの構造的修正としての合意を残している。
+
+§12.2は前回の検証履歴。今回の最終結果は以下 (HEAD 8cbf9e38eからの未コミット差分)。
+全build/testでMSBUILDDISABLENODEREUSE=1、CARGO_BUILD_JOBS=24。
+実引数・exit・所要時間はtarget/hud-gpu-validation/review-*.json、stdout/stderrは同名logへ保存。
+初回vendor checkは既存test fixtureがconfigure_surfaceの旧引数形を使うためE0061。
+runtime入口を元のvoid契約/引数形へ戻して再検査した (test fixture側の変更なし)。
+
+| 検証 | exit | 結果 |
+| --- | ---: | --- |
+| cargo fmt (引数なし) | 0 | 成功。`review-fmt.log` |
+| 通常core check | 0 | 成功。`review-check.log` |
+| test-script core check | 0 | 成功。`review-check-script.log` |
+| 関連nextest (前回範囲 + 製品logger target filterの既存検査) | 0 | 728件、728 passed, 13890 skipped。`review-focused.log` |
+| 関連nextest (test-script、前回範囲) | 0 | 36件、36 passed, 14728 skipped。`review-focused-script.log` |
+| cargo test -p mimageviewer --test ui_snapshot | 0 | 213成功 / 0失敗。`review-snapshot.log` |
+| egui-wgpu nextest (winit / lib、全件) | 0 | 48件、48 passed, 0 skipped。`review-vendor.log` |
+| viewer context audit | 0 | 指摘0件。`review-audit.log` |
+| cargo fmt --check | 0 | 成功。`review-fmt-check.log` |
+| 変更vendorのrustfmt --check | 0 | 成功。`review-vendor-fmt.log` |
+| UI glyph check | 0 | 危険グリフ0件。`review-glyphs.log` |
+| git diff --check | 0 | 成功。`review-whitespace.log` |
+
+保存ログの検査は一時data-dirのlogs/mimageviewer.logを実writerで作り、実record/finish_logsを経由する。
+子processは同じlib test exeのexactなignored helperだけを起動する (parentは通常nextest対象)。
+MessageBoxのOS呼出だけをcaptureへ置換し、保存済みのファイルとGPU名・段階・API案内・ログフォルダーを含む通知本文を照合した。
+通常/feature付きの両方でdialog/scriptモードを検査し、scriptはログ保存を保って通知だけを出さない。
+vendorはNone注入で初回root Err、child/root再設置のpanic、起動観測pending中でもruntimeはpanicであることを検査した。
+以前の資源除去/保持に関する2件を撤去し、限定方針の検査1件を追加したためvendor全件は49→48件。
+
+起動後の資源寿命は従来どおり。共有viewport入口の契約変更はdetached計画§11に記録済み。
+製品は起動せず、通常profileをテスト準備で操作していない。本体lib全件/build-devは前回同様ClaudeCodeへ引き継ぐ。
+実GPUでの非対応surfaceと実MessageBoxの表示は未実施。既定uncaptured-error handlerは変更しない。
+
+#### §1.429単独の再検証 (2026-10-27)
+
+指定の8ファイルを `git show 7a8a25b06:<path>` のbytesへ復元し、追加テスト2ファイルを削除した。
+§1.429のコードと保存ログ/通知テスト、vendor patch、README、detached記録は差し戻し前のハッシュと一致させる。
+撤回した型/helperへの依存がsrc/vendorに残っていないことと、単独でのcompile/testを検査する。
+差し戻し後の最終検証は以下。全段で `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=24`。
+実引数・exit・所要秒は `target/hud-gpu-validation/rollback-*.json`、出力は同名logへ保存した。
+
+| 検証 | exit | 結果 | log/json basename |
+| --- | --- | --- | --- |
+| cargo fmt (no arguments) | 0 | PASS | `rollback-fmt` |
+| cargo check -p mimageviewer --bin mimageviewer-core | 0 | PASS | `rollback-check` |
+| cargo check -p mimageviewer --bin mimageviewer-core --features test-script | 0 | PASS | `rollback-check-script` |
+| related nextest (normal: sections 1.429/1.428/1.448/1.192) | 0 | Summary [  15.427s] 723 tests run: 723 passed, 13890 skipped | `rollback-nextest` |
+| related nextest (--features test-script) | 0 | Summary [   1.621s] 53 tests run: 53 passed, 14706 skipped | `rollback-nextest-script` |
+| egui-wgpu nextest (winit / lib, all tests) | 0 | Summary [   2.955s] 48 tests run: 48 passed, 0 skipped | `rollback-vendor` |
+| cargo test --test ui_snapshot | 0 | test result: ok. 213 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 29.94s | `rollback-snapshot` |
+| viewer_context_audit | 0 | PASS (0 findings) | `rollback-audit` |
+| cargo fmt --check | 0 | PASS | `rollback-fmt-check` |
+| vendor rustfmt --check | 0 | PASS | `rollback-vendor-fmt` |
+| UI glyph check | 0 | PASS (0 findings) | `rollback-glyphs` |
+| git diff --check | 0 | PASS | `rollback-diff-check` |
+
+基準8ファイルのbytesとdiffが一致し、削除対象2ファイルが存在せず、保持対象6ファイルのSHA-256も一致した。
+証跡は `rollback-restore.json` / `rollback-scope-verified.json`。基準から残る差分は§12.3の8ファイルだけ。
+§1.429は撤回した機能の型/helperへの参照を持たず、単独構成で検査した。
+§1.429は通常/test-scriptの両方でcompileし、実logger保存/通知の検査とvendorの初回root Err/runtime panic範囲の検査も成功した。
+実環境の非対応surfaceと実MessageBox表示は未実施。製品起動・gitの書き込みは行っていない。
+本体lib全件/build-dev/実機確認は従来どおりClaudeCodeへ引き継ぐ。

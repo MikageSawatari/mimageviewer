@@ -198,7 +198,7 @@ fn image_to_screen(
     ))
 }
 
-fn crop_corners(
+pub(crate) fn crop_corners(
     transform: &DisplayedImageTransform,
     image_size: [usize; 2],
     rect: CropRect,
@@ -252,33 +252,6 @@ fn handle_points(
             image_to_screen(transform, image_size, [rect.min_x, cy]),
         ),
     ]
-}
-
-fn paint_outside_crop(
-    painter: &egui::Painter,
-    transform: &DisplayedImageTransform,
-    image_size: [usize; 2],
-    crop: CropRect,
-) {
-    let full = crop_corners(
-        transform,
-        image_size,
-        CropRect::full(image_size[0], image_size[1]),
-    );
-    let crop = crop_corners(transform, image_size, crop);
-    let color = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 145);
-    for points in [
-        vec![full[0], full[1], crop[1], crop[0]],
-        vec![full[1], full[2], crop[2], crop[1]],
-        vec![full[2], full[3], crop[3], crop[2]],
-        vec![full[3], full[0], crop[0], crop[3]],
-    ] {
-        painter.add(egui::Shape::convex_polygon(
-            points,
-            color,
-            egui::Stroke::NONE,
-        ));
-    }
 }
 
 fn crop_handle_cursor(handle: CropHandle) -> egui::CursorIcon {
@@ -421,6 +394,7 @@ impl App {
         if !self.raw_edit_target_entry_allowed(target_idx) {
             return;
         }
+        self.cancel_prepared_edit_for_entry(target_idx);
         self.cancel_original_material_entry_intents(None);
         if let Some(pivot) = pivot {
             self.export_crop_spread_ctx = Some(pivot);
@@ -461,6 +435,7 @@ impl App {
             close_to_page_list: false,
             page_nav: crate::ui_fullscreen::FsPageNav::None,
             ctrl_nav: None,
+            list_order_nav: None,
             sibling_nav: None,
             mouse_nav: None,
             jump_to: None,
@@ -758,19 +733,9 @@ impl App {
                 image_size,
             )
         });
-        let crop_corners = crop_corners(transform, image_size, settings.rect);
         let painter = ui.painter().with_clip_rect(transform.viewport_rect);
-        paint_outside_crop(&painter, transform, image_size, settings.rect);
-        let mut outline = crop_corners.to_vec();
-        outline.push(crop_corners[0]);
-        painter.add(egui::Shape::line(
-            outline.clone(),
-            egui::Stroke::new(3.0, egui::Color32::BLACK),
-        ));
-        painter.add(egui::Shape::line(
-            outline,
-            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 230, 100)),
-        ));
+        // The prepared page owns dimming and the border in flat and curl
+        // paint. Only editing handles and pointer ownership stay in this overlay.
 
         if !self.export_crop_mode {
             return false;
@@ -788,17 +753,16 @@ impl App {
             );
         }
 
-        let drag_in_progress =
-            self.export_crop_drag.is_some() || self.export_crop_create_drag.is_some();
-        if !crop_overlay_keeps_the_pointer(
-            pointer_allowed && !front.owns(egui::PointerButton::Primary),
-            drag_in_progress,
-            ui.input(|i| i.pointer.primary_down()),
-        ) {
-            return false;
-        }
-
-        self.handle_export_crop_pointer(ui, transform, fs_idx, image_size, settings, handles, front)
+        self.handle_export_crop_pointer(
+            ui,
+            transform,
+            fs_idx,
+            image_size,
+            settings,
+            handles,
+            pointer_allowed,
+            front,
+        )
     }
 
     fn handle_export_crop_pointer(
@@ -809,6 +773,7 @@ impl App {
         image_size: [usize; 2],
         settings: CropSettings,
         handles: [(CropHandle, egui::Pos2); 8],
+        pointer_allowed: bool,
         front: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) -> bool {
         let (space_pan_held, force_create_held) = crate::keyboard_input::focused_key_state_permit(
@@ -830,6 +795,7 @@ impl App {
             handles,
             space_pan_held,
             force_create_held,
+            pointer_allowed,
             front,
         )
     }
@@ -856,6 +822,7 @@ impl App {
             handles,
             space_pan_held,
             force_create_held,
+            true,
             Default::default(),
         )
     }
@@ -871,6 +838,7 @@ impl App {
         handles: [(CropHandle, egui::Pos2); 8],
         space_pan_held: bool,
         force_create_held: bool,
+        pointer_allowed: bool,
         front: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) -> bool {
         if self.book_structural_op.is_some() {
@@ -926,7 +894,12 @@ impl App {
             && self.handle_overlay_space_pan_drag(
                 ui.ctx(),
                 space_pan_held,
-                pointer_pos.is_some_and(|pos| transform.contains_screen(pos)),
+                crate::keyboard_input::focused_key_state_permit(ui.ctx()).is_some_and(|permit| {
+                    self.keymap
+                        .key_held_action(ui.ctx(), permit, KeyAction::CropScrubZoomHold)
+                }),
+                transform.viewport_rect.center(),
+                pointer_allowed && pointer_pos.is_some_and(|pos| transform.contains_screen(pos)),
                 primary_pressed,
                 primary_down,
                 primary_released,
@@ -934,6 +907,16 @@ impl App {
             )
         {
             return true;
+        }
+
+        // The shared navigation owner has already continued or retired Space
+        // pan/scrub even over a panel. This gate only admits crop-frame input.
+        if !crop_overlay_keeps_the_pointer(
+            pointer_allowed && !front.owns(egui::PointerButton::Primary),
+            crop_drag_in_progress,
+            primary_down,
+        ) {
+            return false;
         }
 
         if !crop_drag_in_progress && let Some(origin) = press_origin {
@@ -1066,6 +1049,61 @@ fn centered_default_crop(image_size: [usize; 2]) -> CropRect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crop_overlay_keeps_edit_handles_without_repainting_page_dim_or_border() {
+        let mut app = crate::app::setup_app_for_test();
+        let path = app.tmp.path().join("crop-overlay.jpg");
+        app.items.push(crate::grid_item::GridItem::Image(path));
+        app.fullscreen_idx = Some(0);
+        let size = [100, 100];
+        app.set_export_crop_for_idx(
+            0,
+            Some(CropSettings::authored(
+                centered_default_crop(size),
+                CropAspectMode::Free,
+                size,
+            )),
+            size,
+        );
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 400.0));
+        let transform = test_transform(rect, size);
+        let ctx = egui::Context::default();
+        for editing in [false, true] {
+            app.export_crop_mode = editing;
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root| {
+                        egui::CentralPanel::default().show(root, |ui| {
+                            assert!(!app.draw_export_crop_overlay(
+                                ui,
+                                &transform,
+                                0,
+                                size,
+                                false,
+                                Default::default()
+                            ));
+                        });
+                    })
+                },
+            ));
+            let mut circles = 0;
+            for shape in output.shapes {
+                match shape.shape {
+                    egui::Shape::Circle(_) => circles += 1,
+                    egui::Shape::Path(_) | egui::Shape::Mesh(_) => {
+                        panic!("prepared page exclusively owns crop dim and border")
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(circles, if editing { 16 } else { 0 });
+        }
+    }
 
     fn test_transform(rect: egui::Rect, image_size: [usize; 2]) -> DisplayedImageTransform {
         DisplayedImageTransform::resolve(

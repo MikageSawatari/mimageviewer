@@ -29,6 +29,17 @@ use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
 
 #[test]
+fn thumbnail_name_style_multiline_dark() {
+    snapshot_with_theme_at_size(
+        "thumbnail_name_style_multiline_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(460.0, 440.0),
+        None,
+        mimageviewer::draw_thumbnail_name_style_snapshot_fixture,
+    );
+}
+
+#[test]
 fn toolbar_pinned_search_light() {
     snapshot_with_theme_at_size(
         "toolbar_pinned_search_light",
@@ -47,6 +58,28 @@ fn toolbar_pinned_search_narrow_dark() {
         egui::vec2(360.0, 300.0),
         None,
         mimageviewer::ui_pinned_search::draw_pinned_search_snapshot_fixture,
+    );
+}
+
+#[test]
+fn folder_pane_location_light() {
+    snapshot_with_theme_at_size(
+        "folder_pane_location_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(420.0, 380.0),
+        None,
+        mimageviewer::draw_folder_pane_location_snapshot_fixture,
+    );
+}
+
+#[test]
+fn folder_pane_location_dark() {
+    snapshot_with_theme_at_size(
+        "folder_pane_location_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(420.0, 380.0),
+        None,
+        mimageviewer::draw_folder_pane_location_snapshot_fixture,
     );
 }
 
@@ -3092,6 +3125,7 @@ fn cell_filename_mixed_glyphs_dark() {
             let empty_tags = Vec::new();
             let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
+                    name_style: Default::default(),
                     cell,
                     inner,
                     book_resume_meter: false,
@@ -3157,6 +3191,7 @@ fn compact_file_format_badges_light() {
                 .then_some(name);
                 let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
                     mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
+                        name_style: Default::default(),
                         cell,
                         inner,
                         book_resume_meter: false,
@@ -3272,6 +3307,7 @@ fn rating_shares_the_bottom_row_with_a_centred_filename_dark() {
             let empty_tags = Vec::new();
             let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
+                    name_style: Default::default(),
                     cell,
                     inner,
                     book_resume_meter: false,
@@ -3331,6 +3367,7 @@ fn media_duration_badges_fixture(ui: &mut egui::Ui) {
         );
         let layout = layout_thumbnail_overlays(
             ThumbnailOverlayLayoutInput {
+                name_style: Default::default(),
                 cell,
                 inner,
                 book_resume_meter: false,
@@ -3453,6 +3490,7 @@ fn bookmark_time_and_tag_badges_dark() {
             let tags = vec!["#長い日本語タグ".to_owned(), "旅行".to_owned()];
             let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
+                    name_style: Default::default(),
                     cell,
                     inner,
                     book_resume_meter: false,
@@ -4277,6 +4315,198 @@ fn diagnostics_export_error_light() {
 #[test]
 fn diagnostics_export_error_dark() {
     diagnostics_export_snapshot("error", "dark", mimageviewer::os_theme::ResolvedTheme::Dark);
+}
+
+fn page_overview_snapshot(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    size: egui::Vec2,
+    rtl: bool,
+    white_companion: bool,
+) {
+    page_overview_snapshot_with_columns(
+        name,
+        theme,
+        size,
+        rtl,
+        white_companion,
+        mimageviewer::page_overview::PageOverviewLayout::DEFAULT_COLUMNS,
+    );
+}
+
+fn page_overview_snapshot_with_columns(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    size: egui::Vec2,
+    rtl: bool,
+    white_companion: bool,
+    columns: u8,
+) {
+    use mimageviewer::book_resume_db::PageIdentity;
+    use mimageviewer::page_overview::{
+        PageOverviewDirection, PageOverviewEntry, PageOverviewMetadata, PageOverviewPage,
+        PageOverviewProjection, PageOverviewStamp, PageOverviewState, WhiteCompanion,
+    };
+    use mimageviewer::ui_page_overview::{
+        PageOverviewRenderInput, PageOverviewThumbnail, draw_page_overview,
+    };
+    use std::sync::Arc;
+
+    let labels = [
+        "表紙.png",
+        "第1章 / 風が吹く庭.png",
+        "長い日本語のページ名もセルの外へはみ出さずに省略する.png",
+        "読み込みに失敗したページ.png",
+    ];
+    let metadata = PageOverviewMetadata::new((0..80).map(|idx| PageOverviewEntry {
+        items_idx: idx,
+        page: Arc::new(PageOverviewPage {
+            identity: PageIdentity::Image {
+                path: format!("g:/snapshot/book/{idx}.png"),
+            },
+            label: Arc::from(labels[idx % labels.len()]),
+            white_companion: if white_companion && idx == 1 {
+                Some(WhiteCompanion::Composition)
+            } else if white_companion && idx == 2 {
+                Some(WhiteCompanion::DisplayPadding)
+            } else {
+                None
+            },
+        }),
+    }))
+    .unwrap();
+    let direction = if rtl {
+        PageOverviewDirection::RightToLeft
+    } else {
+        PageOverviewDirection::LeftToRight
+    };
+    let state = PageOverviewState::open(
+        Arc::new(
+            PageOverviewProjection::new(Arc::new(metadata), Arc::new((0..80).collect())).unwrap(),
+        ),
+        PageOverviewStamp {
+            context_serial: 1,
+            items_generation: 2,
+            reader_order_revision: 3,
+            incarnation: 4,
+        },
+        0,
+        columns,
+        egui::Rect::from_min_size(egui::Pos2::ZERO, size),
+        direction,
+    )
+    .unwrap();
+    let mut view = state.session().unwrap().view().clone();
+    view.cursor = 2;
+    let thumbnails = std::collections::HashMap::from([(3, PageOverviewThumbnail::Failed)]);
+    snapshot_with_theme_contrast_and_size(
+        name,
+        theme,
+        mimageviewer::settings::TextContrast::Standard,
+        size,
+        |ui| {
+            draw_page_overview(
+                ui,
+                PageOverviewRenderInput {
+                    view: &view,
+                    title: "花と風の図鑑 / 第十二章",
+                    current_items_indices: &[0, 1],
+                    thumbnails: Some(&thumbnails),
+                    direction,
+                    input_enabled: false,
+                },
+            );
+        },
+    );
+}
+
+#[test]
+fn page_overview_light() {
+    page_overview_snapshot(
+        "page_overview_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(600.0, 420.0),
+        false,
+        false,
+    );
+}
+
+#[test]
+fn page_overview_dark() {
+    page_overview_snapshot(
+        "page_overview_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(600.0, 420.0),
+        false,
+        false,
+    );
+}
+
+#[test]
+fn page_overview_narrow_light() {
+    page_overview_snapshot(
+        "page_overview_narrow_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(200.0, 440.0),
+        false,
+        false,
+    );
+}
+
+#[test]
+fn page_overview_narrow_dark() {
+    page_overview_snapshot(
+        "page_overview_narrow_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(200.0, 440.0),
+        false,
+        false,
+    );
+}
+
+#[test]
+fn page_overview_rtl_dark() {
+    page_overview_snapshot(
+        "page_overview_rtl_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(600.0, 420.0),
+        true,
+        false,
+    );
+}
+
+#[test]
+fn page_overview_white_companion_dark() {
+    page_overview_snapshot(
+        "page_overview_white_companion_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(600.0, 420.0),
+        false,
+        true,
+    );
+}
+
+#[test]
+fn page_overview_eight_columns_dark() {
+    page_overview_snapshot(
+        "page_overview_eight_columns_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(960.0, 480.0),
+        false,
+        false,
+    );
+}
+
+#[test]
+fn page_overview_twenty_columns_dark() {
+    page_overview_snapshot_with_columns(
+        "page_overview_twenty_columns_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(2200.0, 440.0),
+        false,
+        false,
+        20,
+    );
 }
 
 #[test]

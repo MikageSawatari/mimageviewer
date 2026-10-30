@@ -25,7 +25,8 @@
 set -euo pipefail
 
 # ───────────────────────────────────────────────
-# バージョン pin (ort 2.0.0-rc.12 ↔ ONNX Runtime 1.24.2 ↔ CUDA 12.x ↔ cuDNN 9.x ↔ TRT 10.x)
+# バージョン pin (ONNX Runtime GPU 1.24.2 ↔ CUDA 12.x ↔ cuDNN 9.x ↔ TRT 10.x)
+# ort 2.0.0-rc.15 は default-features=false + api-24 で互換。pack は据え置く。
 # ───────────────────────────────────────────────
 ORT_GPU_VERSION="1.24.2"
 CUDA_CUDART_VERSION="12.9.79"
