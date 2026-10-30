@@ -31,6 +31,17 @@ fn show_folder_pane_panel<R>(
     let resize_id = root_ui
         .make_persistent_id(FOLDER_PANE_PANEL_ID)
         .with("__resize");
+    // Match Panel::accesskit_resize_request: opposing steps cancel, and only
+    // numeric SetValue requests are accepted. Read before drawing contents,
+    // at the same input boundary where Panel applies these requests.
+    let accesskit_resize_requested = root_ui.input(|input| {
+        use egui::accesskit::{Action, ActionData};
+        input.num_accesskit_action_requests(resize_id, Action::Increment)
+            != input.num_accesskit_action_requests(resize_id, Action::Decrement)
+            || input
+                .accesskit_action_requests(resize_id, Action::SetValue)
+                .any(|request| matches!(request.data, Some(ActionData::NumericValue(_))))
+    });
     let panel = egui::Panel::left(FOLDER_PANE_PANEL_ID)
         .resizable(resizable)
         .default_size(default_width)
@@ -40,10 +51,11 @@ fn show_folder_pane_panel<R>(
     // the user's preferred ratio. Include the release frame: Panel also uses
     // its final pointer position there when committing the resized width.
     let resized_by_user = resizable
-        && root_ui
-            .ctx()
-            .read_response(resize_id)
-            .is_some_and(|response| response.dragged() || response.drag_stopped());
+        && (accesskit_resize_requested
+            || root_ui
+                .ctx()
+                .read_response(resize_id)
+                .is_some_and(|response| response.dragged() || response.drag_stopped()));
     let width_ratio = (panel.response.rect.width() / content_width)
         .clamp(FOLDER_PANE_MIN_RATIO, FOLDER_PANE_MAX_RATIO);
     let changed_ratio =
@@ -526,13 +538,19 @@ mod tests {
     struct WidthTest {
         ctx: egui::Context,
         saved_ratio: f32,
+        resizable: bool,
+        resize_node: Option<egui::accesskit::NodeId>,
     }
 
     impl WidthTest {
         fn new(saved_ratio: f32) -> Self {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
             Self {
-                ctx: egui::Context::default(),
+                ctx,
                 saved_ratio,
+                resizable: true,
+                resize_node: None,
             }
         }
 
@@ -549,7 +567,7 @@ mod tests {
                 },
                 |root_ui| {
                     let (panel, changed_ratio) =
-                        show_folder_pane_panel(root_ui, self.saved_ratio, true, |ui| {
+                        show_folder_pane_panel(root_ui, self.saved_ratio, self.resizable, |ui| {
                             // Exercise another drag target as well as the resize handle.
                             ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
                         });
@@ -559,6 +577,15 @@ mod tests {
                     }
                 },
             );
+            // Target the splitter egui actually exposes, without reproducing its ID rule.
+            self.resize_node = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("AccessKit tree update")
+                .nodes
+                .iter()
+                .find_map(|(id, node)| (node.role() == egui::Role::Splitter).then_some(*id));
             // No renderer is used by these geometry/input tests.
             output.textures_delta.clear();
             rect
@@ -579,6 +606,102 @@ mod tests {
             pressed,
             modifiers: egui::Modifiers::NONE,
         }
+    }
+
+    fn accesskit_resize_event(
+        target_node: egui::accesskit::NodeId,
+        action: egui::accesskit::Action,
+        data: Option<egui::accesskit::ActionData>,
+    ) -> egui::Event {
+        egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+            action,
+            target_tree: egui::accesskit::TreeId::ROOT,
+            target_node,
+            data,
+        })
+    }
+
+    fn assert_accesskit_resize_persists(action: egui::accesskit::Action, fraction: Option<f64>) {
+        let mut pane = WidthTest::new(0.25);
+        let initial = pane.frame(1920.0, vec![]);
+        let step = pane.ctx.global_style().spacing.interact_size.x;
+        let expected_width = match action {
+            egui::accesskit::Action::Increment => initial.width() + step,
+            egui::accesskit::Action::Decrement => initial.width() - step,
+            egui::accesskit::Action::SetValue => fraction.unwrap() as f32 * 1920.0,
+            _ => unreachable!(),
+        };
+        let request = accesskit_resize_event(
+            pane.resize_node.expect("real panel splitter"),
+            action,
+            fraction.map(egui::accesskit::ActionData::NumericValue),
+        );
+        let resized = pane.frame(1920.0, vec![request]);
+        assert!((resized.width() - expected_width).abs() < 1.0);
+        assert!((pane.saved_ratio - expected_width / 1920.0).abs() < 0.0001);
+        let ratio = pane.saved_ratio;
+        pane.frame(2560.0, vec![]);
+        assert_eq!(pane.saved_ratio, ratio);
+        let mut restarted = WidthTest::new(ratio);
+        assert!((restarted.frame(1920.0, vec![]).width() - resized.width()).abs() < 1.0);
+        assert_eq!(restarted.saved_ratio, ratio);
+    }
+
+    #[test]
+    fn section1472_accesskit_increment_persists_across_restart() {
+        assert_accesskit_resize_persists(egui::accesskit::Action::Increment, None);
+    }
+
+    #[test]
+    fn section1472_accesskit_decrement_persists_across_restart() {
+        assert_accesskit_resize_persists(egui::accesskit::Action::Decrement, None);
+    }
+
+    #[test]
+    fn section1472_accesskit_set_value_persists_across_restart() {
+        assert_accesskit_resize_persists(egui::accesskit::Action::SetValue, Some(0.4));
+    }
+
+    #[test]
+    fn section1472_accesskit_unapplied_requests_do_not_save_constrained_width() {
+        use egui::accesskit::Action;
+        let mut pane = WidthTest::new(0.12);
+        pane.frame(1280.0, vec![]);
+        let target = pane.resize_node.unwrap();
+        for requests in [
+            vec![accesskit_resize_event(
+                egui::accesskit_root_id().accesskit_id(),
+                Action::Increment,
+                None,
+            )],
+            vec![accesskit_resize_event(target, Action::SetValue, None)],
+            vec![
+                accesskit_resize_event(target, Action::Increment, None),
+                accesskit_resize_event(target, Action::Decrement, None),
+            ],
+        ] {
+            let rect = pane.frame(1280.0, requests);
+            assert!((rect.width() - FOLDER_PANE_MIN_WIDTH).abs() < 1.0);
+            assert_eq!(pane.saved_ratio, 0.12);
+        }
+    }
+
+    #[test]
+    fn section1472_accesskit_blocked_resize_does_not_change_width_or_ratio() {
+        let mut pane = WidthTest::new(0.12);
+        let initial = pane.frame(1280.0, vec![]);
+        let target = pane.resize_node.unwrap();
+        pane.resizable = false;
+        let resized = pane.frame(
+            1280.0,
+            vec![accesskit_resize_event(
+                target,
+                egui::accesskit::Action::Increment,
+                None,
+            )],
+        );
+        assert_eq!(resized.width(), initial.width());
+        assert_eq!(pane.saved_ratio, 0.12);
     }
 
     #[test]
