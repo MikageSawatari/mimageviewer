@@ -1,5 +1,9 @@
 # mimageviewer 仕様書
 
+### 前回の正常終了を確認できない場合（§1.482 段A）
+
+通常 GUI の開始/終了を小資料に記録し、前回 Running のままなら次回の通常 root 描画時に、原因未記録であることと最終記録時刻を表示する。本文は明示操作でコピーでき、閉じるまで保持する。強制終了・OS終了・電断・保存失敗と crash を区別しない。正常/制御Err return、二重起動、worker/help、play-test/test-script/DComp 試験は異常終了通知へ流用しない。ファイル名・パス・検索語・任意エラー本文を小資料/コピーへ含めず、自動送信しない。記録は今回/前回の2 run、通常版LOCALAPPDATAの起動記録配下、portable/明示data_dirは当該dataのlogs/startup配下へ保存する。AI/GPU checkpoint と fatal 観測、ORT 即時通知は後続段。詳細は [確定設計](ai-crash-655-investigation.md#確定設計-2026-10-30)。
+
 ### 一覧の表示順で前後の本へ移動 (§1.444)
 
 フルスクリーンの Ctrl+Shift+↑/↓ は、最後に通常フォルダの一覧から本を開く操作を受け付けた時点の

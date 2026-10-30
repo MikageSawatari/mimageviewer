@@ -384,7 +384,7 @@ device loss後に同じdeviceで通知UIを描ける保証もない。安全な�
 
 ## 確定設計 (2026-10-30)
 
-対象は [backlog §1.482](next-release-backlog.md)。ClaudeCode の範囲決定と、独立設計レビュー REVISE の P2 4件を反映した設計の正本とする。**この節の確定は実装完了・独立レビューの再受入れを意味しない。製品コードはまだ変更しない。** >>655 の原因は引き続き未特定。
+対象は [backlog §1.482](next-release-backlog.md)。ClaudeCode の範囲決定と、独立設計レビュー REVISE の P2 4件を反映した設計の正本とする。設計確定時点では未実装。その後の再レビュー P2/P3 と段A実装は本節・後掲の実装記録へ反映する。段B以降は未着手。>>655 の原因は引き続き未特定。
 
 前節の比較・調査記録は履歴として残すが、競合する提案は本節で置き換える。特に (c) の fatal reader 用 atomic snapshot publication、ring、seqlock、二重 buffer は作らず、fatal handler は最新の表示・job・GPU 状態を読まない。「直前」「採取0.8秒前」という旧例も鮮度の保証には使わない。
 
@@ -417,15 +417,15 @@ admission 後、診断 worker を1本起動する。通常版は既存 startup �
 
 worker の初期化順序は **前回小資料・対応 native 区間を上限付きで読む → schema/run/lease を検査して前回表示モデルをメモリへ確保 → 今回の記録先を準備 → Running を一度保存 → 必要な古い診断資料を整理**。native recorder の今回 open/rotation/登録も、この前回資料確保より後へ移す。通常 logger の本文や旧 panic.log は今回要約の採用元にしない。UI は初期化完了を非blocking poll し、worker を待たず起動を続ける。事前 open が完了する前の異常は新しい小証拠を残せない限界として扱う。既存の詳細 panic hook はその間も維持する。
 
-保存は今回/前回の2 run 分だけ。run 固有の記録先と、今回を指す小さな参照を worker が管理する。checkpoint/終了印は同じ小ファイルを一時ファイル経由で置換する。run ごとの保存先にすることで、終了予算を超えて残った旧 worker の I/O が新 run のファイルや参照を上書きしない。終了開始後は参照の更新・世代整理を行わない。参照・各ファイルのサイズ、schema、件数、identity を検査し、不明・破損・欠落は不明として扱う。資料のない旧版からの初回起動では警告しない。
+保存は今回/前回の2 run 分だけ。run 固有の記録先と、今回を指す小さな参照を worker が管理する。checkpoint/終了印は同じ小ファイルを一時ファイル経由で置換する。初期化中に終端要求を受けても、今回を指す参照を一度公開・2runへ整理してから終端を保存する。旧Runningを参照に残して再通知しないための順序である。全I/Oの間はnamespaceの非待機診断leaseを保持し、旧writerが残る間は新writerが資料を書き換えずログのみで停止する。終端保存後の参照更新・整理は行わない。namespaceはsingle-instanceと同じdata_dir正規化キーを背景workerで解決し、相対/絶対・大小文字などの等価表記で分断しない。参照・各ファイルのサイズ、schema、件数、identity を検査し、不明・破損・欠落は不明として扱う。資料のない旧版からの初回起動では警告しない。
 
 #### main の最終境界
 
 終了状態は単一 enum `Running / ReturnedOk / ReturnedError` で所有する。最終化要求には結果と、既存の制御エラー通知の扱いを typed に添える。`ReturnedError` は異常消失とは区別し、既存 `run_native` Err 通知の対象は次回同じ警告を出さない。
 
-現状 `finish_run_native` は cleanup・terminal・`finish_logs()`・必要な native 通知を済ませてから main に戻る。**今回の writer は startup writer と別の、main owner 所有の writer** とし、`finish_logs()` では停止させない。既存 Err の「ログ排出後に通知」の順序は保持する。main は run の結果を受け取り、通常ログの最終処理など panic し得る終了作業を済ませた最後に、診断 owner へ一度だけ `ReturnedOk` または `ReturnedError` を確定する。App Drop、unwind 中の RAII Drop、window close、非表示、tray 移行では確定しない。main を抜ける直前の小さな処理まで終了理由を必ず取れる保証はしない。
+現状 `finish_run_native` は cleanup・terminal・`finish_logs()`・必要な native 通知を済ませてから main に戻る。この順序は変更し、同関数は cleanup・エラーの記録後に、結果と必要な通知本文を main へ返す。**今回の writer は startup writer と別の、main owner 所有の writer** とし、`finish_logs()` では停止させない。main の最終境界で共通終了処理・通常/startup ログ排出・診断終端 `ReturnedOk` または `ReturnedError` の保存を済ませ、その後に同期 MessageBox を表示する。利用者の応答待ちは保存予算の前へ挟まない。既存 Err の「ログ排出後に通知」は保持する。App Drop、unwind 中の RAII Drop、window close、非表示、tray 移行では確定しない。main を抜ける直前の小さな処理まで終了理由を必ず取れる保証はしない。
 
-既存の合計2秒の終了 deadline を明示的に共有できる形へ接続する。前段の `finish_logs()` で既に費消した時間を取り戻す新しい2秒待ちは作らず、main 最終境界では残予算だけを使う。予算超過・writer 停止では join・flush・再試行を追加せず終了する。通常の状態でも UI frame 内では待たない。最終保存が失われると次回 Running のままになる可能性は明記する。
+既存の合計2秒の終了 deadline を明示的に共有できる形へ接続する。共通終了処理で予算を共有し、新しい2秒待ちは作らない。予算超過・writer 停止では join・flush・再試行を追加せず終了する。通常の状態でも UI frame 内では待たない。最終保存が失われると次回 Running のままになる可能性は明記する。通常の MessageBox 読取り時間によって保存待ちの予算を消費することはない（再レビュー P2 対応）。
 
 最終要求は通常の coalesce データに紛れ込ませず、owner の吸収的な終端遷移として受理する。単一 writer が進行中の Running 書込みを終え、残る最新値を一度だけ組み込み、終端を最後に保存して停止する。終端確定後の producer 更新・遅着 checkpoint・device-loss latch は Running を復活させず、終端ファイルを置換しない。AI worker の detach は維持し、正常終了に AI 完了待ちを加えない。
 
@@ -474,7 +474,7 @@ panic hook の最初で、借用した `&str` / `String::as_str()` を既知の�
 
 ただし単発の同期 [WriteFile](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-writefile) に**実行時間の上限はない**。best effort は保存成功や即時復帰の保証ではない。panic/既存 VEH の短い直接記録に限る割り切りで、通常 UI と device-lost callback の保存には使わない。
 
-OOM の確かな分類は描画用 wgpu の typed `Error::OutOfMemory` を観測できる境界に置く。必要な uncaptured handler の接続は既定の fatal 契約を保つ最小変更とし、固定分類の panic に進める。Validation/Internal/一般 panic も分類を区別する。任意 payload に「memory」があるだけで OOM と断定しない。panic を握りつぶして描画継続する変更はしない。worker panic・捕捉 panic は process 終了と同義でなく、ReturnedOk なら次回異常終了通知を作らない。
+OOM の確かな分類は描画用 wgpu の typed `Error::OutOfMemory` を観測できる境界に置く。必要な uncaptured handler の接続は既定の fatal 契約を保つ最小変更とする。**小資料には固定分類だけを保存し、既存の詳細 panic.log には元エラー本文を保持する**。固定文だけの payload へ置換して Validation/Internal の本文を失わせない。元本文を保持した panic へ進め、hook 前段で小資料の分類だけを別に記録する（再レビュー P3 対応）。Validation/Internal/一般 panic も分類を区別する。任意 payload に「memory」があるだけで OOM と断定しない。panic を握りつぶして描画継続する変更はしない。worker panic・捕捉 panic は process 終了と同義でなく、ReturnedOk なら次回異常終了通知を作らない。
 
 #### native 例外の run 相関（P2-2）
 
@@ -558,9 +558,11 @@ native の証拠があれば、例2へ「終了前に観測された例外（fir
 | C panic/native/device-lost | 事前openの短いpanic証拠、native run相関、root deviceのatomic reason latch、worker保存 | 同じtest exeの限定子 processでworker/main panic注入、worker panic後に正常終了、強制終了でRunning残留。hookの重い既存処理より先に固定記録、再入skip/上限/未準備sink/単発短書込みを注入。nativeは既存子process/固定formatter試験を拡張し、複数run/旧行/別mode/rotation前確保/不完全行の誤相関なし。callbackはfakeでCASのみ、重複理由・明示destroy・保存前終了・旧deviceを確認。panic/native/device観測が互い/遅いcheckpointで消えない |
 | D ORT 即時通知 | 現役DisplayのFailedをfeedback/詳細へ接続 | handler級試験で有効key/job/contextだけ1回通知、prefetch/取消/orphan/別context/staleは通知なし。正常Resultと終了印を混同しない。パス/ZIP名/検索語を埋めた未分類payloadを注入し、checkpointと表示/コピーの全出力に含まれないことを検査 |
 
+再レビューで追加する検査: 段Aは、本番のmain最終化境界へreal storeとfake通知を渡し、通知前に `ReturnedError` が保存済みであること、通知がfake時計を3秒進めても次回に再通知しないことを確認する。段Cではパス入りの元エラー本文を注入し、小資料へは固定分類だけが入り、既存ローカル詳細ログには元本文が残ることを検査する。
+
 全試験は TempDir/明示 data_dir とローカル sink を使い、通常の settings/DB/ログに触れない。panic/native handler の process-global 状態は子 process ごとに隔離する。実 GPU OOM/TDR、通常製品 exe の起動、デスクトップ操作は自動 gate に含めない。過去20件の headless 成功は調査証拠として再利用するが、今回の診断機能・実描画の検証済み証拠には転用しない。
 
-将来の実装検証は focused → 必要な shared 回帰/full gate の順とし、[開発ビルドとテスト](development-build-and-test.md) に従う。UI snapshot は1093×614/1366×728、倍率100%/200%、長文/unknown/閉じる/コピー操作の到達性を含め、fmt/UI glyph検査も行う。native/device 接続は実機未確認を残し、実装後に検証バイナリを build して利用者へ渡す。agent の実画面検証は別途、具体的 suite の明示承認と使い捨て portable の準備が必要。本段階は文書のみなので build・テスト・製品起動は行わない。
+実装検証は focused → 必要な shared 回帰/full gate の順とし、[開発ビルドとテスト](development-build-and-test.md) に従う。UI snapshot は1093×614/1366×728、倍率100%/200%、長文/unknown/閉じる/コピー操作の到達性を含め、fmt/UI glyph検査も行う。native/device 接続は実機未確認を残し、実装後に検証バイナリを build して利用者へ渡す。agent の実画面検証は別途、具体的 suite の明示承認と使い捨て portable の準備が必要。設計追記時は文書のみだったが、後続の段A実装・検証を次節へ記録する。製品起動は行わない。
 
 ### 9. 変更ファイルの見込みと UI 応答性確認
 
@@ -568,7 +570,7 @@ native の証拠があれば、例2へ「終了前に観測された例外（fir
 | --- | --- |
 | 新規 `src/previous_run_diagnostics.rs` 等 | GUI owner/状態、専用 writer、checkpoint schema、許可項目 formatter、前回読取り・typed表示モデル、panic sink/device latch。必要なら小moduleに分割 |
 | `src/main.rs` / `src/lib.rs` | owner引渡し、first admission/guard寿命、除外mode、hook前段、早期exit/最終境界、共有deadline接続 |
-| `src/run_native_failure.rs` | 制御Err通知の扱いをownerへ渡す接続。既存ログ排出→native通知の順序を保持 |
+| `src/run_native_failure.rs` | 制御Errの結果・通知本文をmainへ返す。共通終了・終端保存→native通知の順序を保証 |
 | `crates/startup-diagnostics/src/` | 既存identity/保存先/lease/deadlineの必要最小の公開。startup writerを診断writerの代用にしない |
 | `src/app.rs` / `src/app/` / `src/ai/{upscale,final_pipeline,runtime}.rs` 等 | job/実Run/取消/結果/後段登録の観測点、既存活動情報、現役Failedのfeedback。dead legacy producerへ主経路を誤接続しない |
 | `src/gpu_info.rs` / `src/native_exception_log.rs` | adapter指定sampler、native header/各行identityと読取りformatter試験 |
@@ -577,3 +579,36 @@ native の証拠があれば、例2へ「終了前に観測された例外（fir
 | 本書、backlog、startup/async/UI応答性/仕様の該当文書、manual/製品ページ/privacy | 実装段階で診断内容・保存範囲・限界を同期更新。本依頼で変更するのは本書だけ |
 
 [UI応答性 §4](ui-responsiveness.md#4-新機能追加時のチェックリスト) に照合した設計上の確認: **UIへ同期I/Oを追加しない**。前回資料の read/open/metadata/rotation、事前open、serialize/置換保存、DXGI/COM、CPUメモリ照会はすべて背景側。UIは固定上限の整数/enum record の非待機受渡し、表示モデルのpoll、既存texture登録点の観測、描画と明示clipboard操作だけを行う。診断のためのdecode、DB open/検索、全フォルダ/cache走査、追加GPU upload、session/queue待ち、sleep、周期repaintはない。main最終境界以外でbarrier待ちをせず、fatalの限定直接書込みは通常UI経路へ流用しない。detached述語/viewport所有/表示切替は変更対象に含めず、接続上それらへ入る必要が判明した場合はrework規則に従って別途設計合意を取る。
+
+### 10. 段Aの実装記録（2026-10-30、未コミット）
+
+- 再レビューP2: `finish_run_native` はcleanup後に結果と通知本文を返す。mainが通常/startupログ排出・診断終端保存を共通2秒deadline内で行ってからnative通知を表示する。fake通知が3秒進んでも、通知前に実ファイルへReturnedErrorが保存され、次回再通知しない回帰を追加した。
+- 再レビューP3: 小資料は固定分類だけ、既存詳細panic.logには元エラー本文を保持する契約と、段Cでの漏洩/保持検査を明文化した。段Aでは既存panic hookを変更していない。
+- main所有`GuiRunSession`がfirst-instance guard・runtime共有lease・診断ownerを保持する。runtime leaseは元の取得位置/条件を変えずに所有先だけを移し、mainの通知中も保護を維持する。GUI早期exitも同じ最終化へ接続し、TensorRT等のworkerには既存の引数なし終了入口を維持する。play-test/test-script/DComp等は診断admissionから除外した。
+- 新規`previous_run_diagnostics`は小資料のread/replace/整理を専用workerで行う。初期化中の終端要求でもcurrent参照を更新してから終端を書き、診断leaseで旧writerのI/Oと新writerを排他する。2run保持・等価data_dir表記・限定子processの回帰を追加した。
+- 新規`ui_previous_run_notice`は不変本文の表示・明示コピー・閉じるだけを行う。通常rootが表示可能になるまで前回通知を消費せず、起動overlay/非表示/最小化/他の起動案内中は保持する。配色はmainで適用済みのos_themeのVisualsを継承し、固定文字色を追加しない。初回focusedは26成功/1件の本文高さ検査失敗（1366×728・100%、340ptのouter上限で本文245pt）。固定上限を撤去して長文は画面内の高さを利用、短文のauto-shrinkは維持した。検査閾値は緩めず45%へ強化し、修正後の検証へ進む。
+- 段B〜D、GPU/AIの周期checkpoint、native/panicの新しい短い記録、device-loss callback、ORT即時feedbackには着手していない。製品起動・デスクトップ操作・commitは行わない。
+- 独立コードレビュー（gpt-6.1-sol / xhigh）で指摘された初期化参照race・data_dir表記によるnamespace分断・初期化中終端の保持数を修正した。runtime lease・UI高さの追補と下記の成功証拠を確認し、段AはACCEPT、未解決P1/P2なし。指定自動検証は成功。追加全体gateは下記の環境前提不足で停止し、確認用buildは未実施。
+
+検証（MSBUILDDISABLENODEREUSE=1）:
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt` | 成功 |
+| `cargo check -p mimageviewer --lib --tests --features test-script` | 最終成功（4分48秒）。初回は既存worker終了入口の互換・MouseWheel fixtureの必須field不足を検出、修正後再実行 |
+| `python scripts/check_ui_glyphs.py` | 0件、成功 |
+| `python scripts/check_site_cards.py` | 49 cards、超過0、成功 |
+| `scripts/test-focused.ps1` | broad/sharedを検出、実行0件。全ライブラリgateへ移行 |
+| `cargo test -p mimageviewer --lib previous_run -- --nocapture` | 最終27成功/0失敗。新規snapshot2枚を通常比較、目視再確認。初回の本文高さ失敗は上記修正で解消 |
+| `cargo test -p mimageviewer --lib run_native_failure -- --nocapture` | 14成功/0失敗、隔離子process helper 1件ignored。通知前ReturnedError保存・runtime lease保持の回帰を含む |
+| snapshot更新 | 新規2枚のみ。計198,175 bytes。`target/stage-a-snapshot.log`、`stage-a-previous-run.log`、`stage-a-run-native-failure.log`に出力保存。runtime lease移管のcfg付与構文エラーは修正済み |
+| `scripts/test-focused.ps1` → `scripts/test-lib-full.ps1` | focused exit 2。full libは15,092成功/0失敗、67 skipped、732.507秒。`target/test-lib-full/runs/20261030T113117089Z-92cfdf8b/`、receipt `9961baa2bae74b68a4b93926fc525936783ee633dcbb037d8f97af4606febab6.json` |
+| `cargo test -p miv-startup` | 37成功/0失敗、doctest 0件。`target/stage-a-startup.log` |
+| `cargo run --locked -p viewer_context_audit` | exit 0、成功。`target/stage-a-viewer-context-audit.log` |
+| 最終 `cargo check -p mimageviewer --lib --tests --features test-script` | exit 0、1分13秒。`target/stage-a-check-final.log` |
+| `cargo test --test ui_snapshot` | 214成功/0失敗、34.19秒（compileは3分01秒）。`target/stage-a-ui-snapshot.log` |
+| `git diff --check` | 成功 |
+| 追加 `scripts/test-full.ps1 -SuppressCrashDialogs` | exit 101、workspaceテスト開始前のlauncher build scriptで停止。`target/release/mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe` が不足。テスト失敗とは区別し、workspace/vendor/doctest gateは未完了。VST3用CRT4本の事前検査は成功。error modeは元に復元済み |
+| 確認用 `scripts/build-dev.ps1` | 未実施。利用者の「前提の食い違いがあれば止めて報告」に従い、上記不足を検出した段階で追加ビルドを停止。release入力の用意やbuild回避用flagを独断で追加しない。製品起動・commitなし |
+
+引継ぎ: 上記3本のlauncher入力をこのworktreeで用意した後、追加全体gateと確認用buildを行う必要がある。段Aの指定check/full-lib/UI snapshot/auditとfocused回帰の成功は、Rustソースを変更しない限り再利用できる。検証記録の追記だけでも機械的な全ファイルhashは変わるため、receiptのsource hashと現在の文書差分を混同しない。>>655の原因が判明した、段B〜Dが実装済み、full gate完了とは扱わない。

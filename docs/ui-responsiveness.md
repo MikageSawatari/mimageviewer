@@ -471,6 +471,8 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 
 ## 4. 新機能追加時のチェックリスト
 
+§1.482 段Aの前回終了通知は、資料のread/open/metadata/置換/整理を専用writerで行う。Appは不変本文を非blockingで一度受け取り、起動overlay/非表示/最小化中に消費せず、表示と明示コピーだけを行う。初期化完了の一度のrepaint以外に周期repaintを作らない。main最終境界だけが共通終了deadlineまで保存完了を待ち、その後に制御エラーのnative通知を出す。
+
 注釈fontの先回り（§1.602）はNext頁の計画でメモリ上の需要だけを判断し、列挙・font読取・parseを`comic-font-load` workerへ置く。
 App共有ownerの受信口は1つ。root pollは非blockingで採用し、workerの完了時にroot再描画を要求する。
 `comic / font_load`に所要ms・要求key数・読込key数・結果を記録する。同期表示はworkerを待たず、不足時は受信口を捨てて既存の同期経路を維持する。

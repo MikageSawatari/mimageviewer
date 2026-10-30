@@ -1,3 +1,4 @@
+mod previous_run_notice;
 mod reading_history_origin;
 use reading_history_origin::MainListRestoreDestination;
 mod grid_parent;
@@ -16912,6 +16913,7 @@ pub struct App {
     // ── 統合環境設定ダイアログ ─────────────────────────────────────
     pub(crate) show_preferences: bool,
     pub(crate) diagnostics_export: crate::diagnostics::ExportOwner,
+    previous_run_notice: previous_run_notice::PreviousRunNotice,
     /// 編集の保存・破棄とは独立した、プロセス内だけの環境設定表示位置。
     pub(crate) preferences_view_position: crate::ui_dialogs::preferences::PreferencesViewPosition,
     /// 右ペイン ScrollArea の id に使う、ダイアログを閉じても保持する単調増加値。
@@ -20983,6 +20985,7 @@ impl App {
             rename_migration_data_dir_override: None,
             show_preferences: false,
             diagnostics_export: crate::diagnostics::ExportOwner::Idle,
+            previous_run_notice: previous_run_notice::PreviousRunNotice::default(),
             preferences_view_position: Default::default(),
             preferences_right_panel_scroll_sequence: 0,
             preferences_requested_page: None,
@@ -99430,6 +99433,7 @@ impl eframe::App for App {
         self.update_frame(ui, frame);
         self.render_update_after_frame(ctx);
         self.render_update_owner_dialogs(ctx);
+        self.show_previous_run_notice(ctx);
         // `update_frame` has several native/fullscreen early returns. Recovery polling belongs
         // outside it so worker completions, writer fences, and the terminal continuation cannot
         // stall behind a presentation path. Running it after the frame also keeps the modal/input
