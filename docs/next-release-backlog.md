@@ -62,6 +62,7 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 現状 (v4.9.0 のタグと現在のコードを確認、実画面試験なし): O キーの `FsPageOverviewToggle` の説明は「ページ一覧の表示を切り替える」。操作カスタマイズのコマンド一覧は `compact_key_action_label` / `compact_operation_label` により「ページ一覧の表示」へ短縮する。一方、リング・ジェスチャ候補の `ImagePageOverview` は「本のページ一覧」であり、同じ開閉操作だと分かりにくい。割り当て候補と O キー共通の実行経路は既に存在し、一覧表示中の同操作は取消・元ページへの復帰になる。
 - 方針: 共通の短い操作名を **「ページ一覧の表示切替」** とし、コマンド一覧・割り当て編集・リング / ジェスチャ / マウスボタン / パッドの候補・案内で揃える。詳細説明には「O キーと同じ操作。もう一度実行すると一覧を閉じる」と分かる内容を残す。別の操作である「本をページ一覧で開く」「フルスクリーンを閉じて一覧へ戻る」とは区別する。
 - 互換性と検証: `FsPageOverviewToggle` / `image_page_overview` の保存 ID、既定 O、利用可能な文脈・受付条件・開閉処理は変更しない。短縮処理で「表示切替」が消えず、同じ操作を検索・選択できること、既存の割り当てが読み戻せること、通常 / 別ウィンドウの開閉を既存テストと必要な UI snapshot で確認する。他の操作や入力共通化まで範囲を広げない。
+- 補足 (ClaudeCode がコードで確認、2026-10-30): リング候補名 `ImagePageOverview` の「本のページ一覧」は、ゲームパッド / ジェスチャのガイド表示 (`src/app/gamepad_input.rs` の候補表と `gamepad_input/overview_guide_snapshots.rs`・ガイド描画テストの期待文字列) にも出るので、名称変更ではそれらも揃える。一方、`src/ui_dialogs/context_shortcuts.rs` の `ShortcutHelpContext::FsPageOverview` の題名「本のページ一覧」は「一覧を開いている間に使えるキー」という文脈の名前で、開閉操作の名称ではないので変えない。
 - 対象: `src/keymap.rs`、`src/ring_shortcut.rs`、`src/ui_dialogs/preferences/pages.rs`、関連マニュアル。[キー仕様](keymap-spec.md)、[操作カスタマイズ計画](key-customization-impl-plan.md)、[ページ一覧計画](detached-book-page-overview-plan.md)。対外回答は文案作成段階で、投稿済みとは扱わない。規模 / 優先度: Small / P3。
 
 ### 1.481 ゲームパッドの本openとEnter/ダブルクリックで、parkと拡張子付き実フォルダの受付が異なる — §1.480 の着手前調査で開発側が確認 (2026-10-29)
