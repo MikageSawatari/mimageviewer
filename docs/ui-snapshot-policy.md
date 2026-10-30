@@ -221,7 +221,7 @@ copying_small_light,result_small_dark}` の代表4枚を保持する。製品と
 App、変換worker、製品起動、実IME入力はこの純描画検査に含めない。
 
 §1.482段Dは`tests/ui_snapshot.rs`の`ai_failure_feedback_hover_small_light`の1枚（1093×614）で、
-本体と同じtoast actionのhover詳細を確認する。固定分類・status番号・job/context/ページ/寸法だけの本文で、
+本体と同じtoast actionのhover詳細を確認する。固定分類・エラー番号・画面/処理番号・ページ/寸法・観測日時だけの本文で、
 hoverと明示クリックのコピーが同一であること、hoverだけではコピーしないこと、100%/200%の通知矩形が
 画面内に収まることをheadless回帰で別に検査する。新しいdialogやviewportを作らず、既存の暗色tooltip helperを使う。
 PNGは生成後に目視確認する。libの`ai_failure_feedback_hover_and_explicit_copy`は操作/コピー検査を保持し、PNG比較はintegration側だけが所有する。実ORT/GPU障害や製品起動の証拠とは区別する。
@@ -231,6 +231,14 @@ integrationの`SNAPSHOT_CURSOR_EXTENT_PHYSICAL`（上0・下34 physical pixels�
 enabledな暗色tooltipには`hover_tip_dark_with_cursor_extent`、disabled tooltipには既存の同等helperを使う。
 製品の実カーソル寸法対応は維持する。§1.482の旧lib PNGは実寸/取得不可fallbackの差により
 本文が同一でもtooltip全体が16px移動した。基準画像の単純な再生成や許容差拡大で済ませず、外部入力を固定する。
+
+§1.482の前回終了通知は短い要点を常時表示し、「詳細（報告用）」は既定で畳む。
+libの`previous_run_notice_{small_light,small_200_dark,observations_small_light}`は畳んだ表示、
+`previous_run_notice_checkpoint_small_light`は展開した詳細と固定操作行を検査する。
+要点・詳細見出し・操作行はScrollAreaの外、詳細本文だけがスクロールする。
+常時表示の要点を優先するため、展開した詳細は要点と見出しを引いた残り高さを使う（本文だけの従来の45%要件とは分ける）。
+明暗・小/大画面・100%/200%で折り畳み中の全文コピー、展開後の操作可視性、末尾到達後の操作行固定を検査する。
+日時fixtureはUTC+09:00の数値オフセットを注入し、OSのタイムゾーンや現在日時に依存させない。
 
 ## ディレクトリ構成
 

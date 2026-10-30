@@ -1,10 +1,10 @@
-use crate::previous_run_diagnostics::PreviousRunReportHandle;
+use crate::previous_run_diagnostics::{PreviousRunReport, PreviousRunReportHandle};
 
 /// Process-wide notice; viewer open/switch/close does not consume it.
 #[derive(Default)]
 pub(crate) enum PreviousRunNotice {
     Waiting(PreviousRunReportHandle),
-    Visible(String),
+    Visible(PreviousRunReport),
     #[default]
     Closed,
 }
@@ -15,7 +15,7 @@ impl PreviousRunNotice {
             && let Self::Waiting(handle) = self
             && let Some(report) = handle.take_report()
         {
-            *self = Self::Visible(report.body().to_owned());
+            *self = Self::Visible(report);
         }
     }
 
@@ -71,7 +71,10 @@ mod tests {
         let PreviousRunNotice::Visible(body) = &notice else {
             panic!("missing report")
         };
-        assert!(body.contains("前回の正常終了を確認できませんでした"));
+        assert!(
+            body.summary()
+                .contains("前回、mIV は正常に終了しませんでした")
+        );
         assert!(
             handle.take_report().is_none(),
             "one owner consumes the immutable report once"
@@ -83,7 +86,10 @@ mod tests {
 
     #[test]
     fn visible_report_survives_hidden_frames_and_is_immutable() {
-        let body = "前回の正常終了を確認できませんでした。".to_owned();
+        let body = PreviousRunReport::from_sections(
+            "前回、mIV は正常に終了しませんでした。".into(),
+            "詳細".into(),
+        );
         let mut notice = PreviousRunNotice::Visible(body.clone());
         let ctx = egui::Context::default();
         for _ in 0..3 {

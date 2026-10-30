@@ -44,10 +44,11 @@ impl App {
         key: FinalAiKey,
         job_id: u64,
         request: FinalAiFeedbackRequest,
-        diagnostic: crate::ai::failure::FailureDiagnostic,
+        failure: &crate::ai::failure::FinalAiFailure,
     ) {
         let report = Arc::new(crate::feedback::AiFailureReport::new(
-            diagnostic,
+            failure.diagnostic(),
+            failure.observed_at(),
             self.projected_viewer_context_id().serial(),
             self.items_generation,
             job_id,

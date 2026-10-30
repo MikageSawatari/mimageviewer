@@ -23,6 +23,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(test)]
 mod diagnostic_entry_tests;
+mod diagnostic_time;
 #[cfg(test)]
 mod egui037_stage4_gpu_tests;
 mod egui_output;

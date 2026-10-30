@@ -3,10 +3,12 @@
 
 const COPY_LABEL: &str = "報告用の文をコピー";
 const CLOSE_LABEL: &str = "閉じる";
+const DETAILS_LABEL: &str = "詳細（報告用）";
+use crate::previous_run_diagnostics::PreviousRunReport;
 
 /// Returns true only when the user closes this notice. No I/O or live diagnostics
 /// are performed here; copying requires an explicit click and uses the displayed text.
-pub(crate) fn draw(ctx: &egui::Context, report: &str) -> bool {
+pub(crate) fn draw(ctx: &egui::Context, report: &PreviousRunReport) -> bool {
     draw_notice(ctx, report).closed
 }
 
@@ -17,15 +19,19 @@ struct DrawResult {
     body: Option<crate::test_ui::scroll_layout::ScrollLayout>,
     #[cfg(test)]
     controls: Vec<egui::Response>,
+    #[cfg(test)]
+    heading: Option<egui::Response>,
+    #[cfg(test)]
+    summary: Option<egui::Rect>,
 }
 
-fn draw_notice(ctx: &egui::Context, report: &str) -> DrawResult {
+fn draw_notice(ctx: &egui::Context, report: &PreviousRunReport) -> DrawResult {
     let viewport = ctx.content_rect();
     let size = egui::vec2(
         600.0_f32.min((viewport.width() - 40.0).max(1.0)),
         // Window sizes include its title and frame. Let a long report use the
         // available screen; ScrollArea still shrinks a short report naturally.
-        (viewport.height() - 70.0).max(1.0),
+        (viewport.height() - 40.0).max(1.0),
     );
     let mut open = true;
     let mut result = DrawResult::default();
@@ -56,30 +62,48 @@ fn draw_notice(ctx: &egui::Context, report: &str) -> DrawResult {
             let separator_height = 8.0;
             let footer_height =
                 action_height + separator_height + 2.0 * ui.spacing().item_spacing.y;
-            let body_height = (ui.available_height() - footer_height)
-                .min(viewport.bottom() - 16.0 - ui.cursor().top() - footer_height)
-                .max(1.0);
-            let body = egui::ScrollArea::vertical()
-                .id_salt("previous_run_report_body")
-                .max_height(body_height)
-                .min_scrolled_height(0.0)
-                .auto_shrink([false, true])
+            let summary = ui.add(egui::Label::new(report.summary()).wrap());
+            #[cfg(test)]
+            {
+                result.summary = Some(summary.rect);
+            }
+            #[cfg(not(test))]
+            let _ = summary;
+            let header = egui::CollapsingHeader::new(DETAILS_LABEL)
+                .id_salt("previous_run_details")
+                .default_open(false)
                 .show(ui, |ui| {
-                    ui.add(egui::Label::new(report).wrap());
+                    let body_height = (ui.available_height() - footer_height)
+                        .min(viewport.bottom() - 16.0 - ui.cursor().top() - footer_height)
+                        .max(1.0);
+                    let body = egui::ScrollArea::vertical()
+                        .id_salt("previous_run_report_body")
+                        .max_height(body_height)
+                        .min_scrolled_height(0.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.add(egui::Label::new(report.details()).wrap());
+                        });
+                    #[cfg(test)]
+                    {
+                        result.body = Some(
+                            crate::test_ui::scroll_layout::ScrollLayout::from_output(&body),
+                        );
+                    }
+                    #[cfg(not(test))]
+                    let _ = body;
                 });
             #[cfg(test)]
             {
-                result.body = Some(crate::test_ui::scroll_layout::ScrollLayout::from_output(
-                    &body,
-                ));
+                result.heading = Some(header.header_response);
             }
             #[cfg(not(test))]
-            let _ = body;
+            let _ = header;
             ui.add(egui::Separator::default().spacing(separator_height));
             ui.horizontal(|ui| {
                 let copy = ui.button(COPY_LABEL);
                 if copy.clicked() {
-                    ctx.copy_text(report.to_owned());
+                    ctx.copy_text(report.body().to_owned());
                 }
                 let close = ui.button(CLOSE_LABEL);
                 result.closed = close.clicked();
@@ -100,7 +124,18 @@ mod tests {
     use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
     use egui_kittest::{Harness, kittest::Queryable};
 
-    const REPORT: &str = "前回の正常終了を確認できませんでした。原因は記録されていません。\n前回の版: 4.10.0\n記録ID: core-1234-5678\n正常終了の記録が残らない理由には、強制終了や電源断、記録の保存失敗などもあります。";
+    const SUMMARY: &str = "前回、mIV は正常に終了しませんでした。\n原因は記録されていません。強制終了・電源断などでも、この表示になります。";
+    const DETAILS: &str = "最終記録時刻: 2026-10-30 19:23:45 (UTC+09:00) / 終了との間隔不明\nmIV 4.10.0 / 記録ID core-1234-5678\n最終記録以降に状態が変わった可能性があります。\n";
+    fn fixture_report(long: bool) -> PreviousRunReport {
+        let summary = if long {
+            crate::previous_run_diagnostics::test_support::checkpoint_report()
+                .summary()
+                .to_owned()
+        } else {
+            SUMMARY.to_owned()
+        };
+        PreviousRunReport::from_sections(summary, DETAILS.repeat(if long { 20 } else { 1 }))
+    }
 
     #[derive(Default)]
     struct State {
@@ -117,11 +152,7 @@ mod tests {
         theme: ResolvedTheme,
         long: bool,
     ) -> Harness<'static, State> {
-        let report = if long {
-            REPORT.repeat(20)
-        } else {
-            REPORT.to_owned()
-        };
+        let report = fixture_report(long);
         harness_report(size, scale, theme, report)
     }
 
@@ -129,7 +160,7 @@ mod tests {
         size: egui::Vec2,
         scale: f32,
         theme: ResolvedTheme,
-        report: String,
+        report: PreviousRunReport,
     ) -> Harness<'static, State> {
         let mut fonts_ready = false;
         crate::test_ui::builder().with_size(size).build_ui_state(
@@ -184,6 +215,12 @@ mod tests {
             h.step();
         }
     }
+    fn expand(h: &mut Harness<'_, State>) {
+        let pos = h.state().result.heading.as_ref().unwrap().rect.center();
+        click(h, pos);
+        h.run_steps(24);
+        assert!(h.state().result.body.is_some());
+    }
 
     #[test]
     fn previous_run_notice_small_viewport_controls_and_explicit_copy() {
@@ -206,16 +243,25 @@ mod tests {
                         );
                         assert!(response.interact_rect.contains_rect(response.rect));
                     }
-                    let body = h.state().result.body.unwrap();
-                    body.assert_height(HeightExpectation::Scrolls, viewport, scale);
+                    assert!(h.state().result.body.is_none(), "details default collapsed");
+                    assert!(viewport.contains_rect(h.state().result.summary.unwrap()));
                     assert!(
-                        body.inner.height() >= viewport.height() * 0.45,
-                        "{size:?}/{scale}/{theme:?}: body {body:?}, viewport {viewport:?}"
+                        viewport.contains_rect(h.state().result.heading.as_ref().unwrap().rect)
                     );
                     let copy_pos = controls[0].rect.center();
                     click(&mut h, copy_pos);
-                    assert_eq!(h.state().copied, [REPORT.repeat(20)]);
+                    assert_eq!(h.state().copied, [fixture_report(true).body()]);
                     assert!(!h.state().closed);
+                    expand(&mut h);
+                    let body = h.state().result.body.unwrap();
+                    body.assert_height(HeightExpectation::Scrolls, viewport, scale);
+                    // After the always-visible summary and header, details use
+                    // the remaining height; the fixed actions must still fit.
+                    assert!(body.inner.height() > 20.0);
+                    assert!(viewport.contains_rect(body.inner));
+                    for response in &h.state().result.controls {
+                        assert!(viewport.contains_rect(response.rect));
+                    }
                     let close_pos = h.state().result.controls[1].rect.center();
                     click(&mut h, close_pos);
                     assert!(h.state().closed, "fixed close receives pointer");
@@ -238,7 +284,11 @@ mod tests {
     fn previous_run_notice_body_scroll_reaches_end_without_moving_actions() {
         let mut h = harness(egui::vec2(1093.0, 614.0), 2.0, ResolvedTheme::Dark, true);
         h.run_steps(12);
+        expand(&mut h);
         let before: ScrollLayout = h.state().result.body.unwrap();
+        let summary = h.state().result.summary;
+        let heading = h.state().result.heading.as_ref().unwrap().rect;
+        before.assert_height(HeightExpectation::Scrolls, h.ctx.content_rect(), 2.0);
         let controls: Vec<_> = h.state().result.controls.iter().map(|r| r.rect).collect();
         h.hover_at(before.inner.center());
         h.event(egui::Event::MouseWheel {
@@ -264,12 +314,15 @@ mod tests {
             controls
         );
         assert!(h.state().copied.is_empty());
+        assert_eq!(h.state().result.summary, summary);
+        assert_eq!(h.state().result.heading.as_ref().unwrap().rect, heading);
     }
 
     #[test]
     fn previous_run_notice_short_body_fits() {
         let mut h = harness(egui::vec2(1366.0, 728.0), 1.0, ResolvedTheme::Light, false);
         h.run_steps(12);
+        expand(&mut h);
         h.state().result.body.unwrap().assert_height(
             HeightExpectation::Fits,
             h.ctx.content_rect(),
@@ -292,7 +345,7 @@ mod tests {
     }
     #[test]
     fn previous_run_notice_snapshot_checkpoint_small_light() {
-        let report = crate::previous_run_diagnostics::test_support::checkpoint_report_body();
+        let report = crate::previous_run_diagnostics::test_support::checkpoint_report();
         let mut h = harness_report(
             egui::vec2(1093.0, 614.0),
             1.0,
@@ -300,6 +353,7 @@ mod tests {
             report.clone(),
         );
         h.run_steps(12);
+        expand(&mut h);
         let viewport = h.ctx.content_rect();
         for control in &h.state().result.controls {
             assert!(viewport.contains_rect(control.rect));
@@ -307,12 +361,12 @@ mod tests {
         h.snapshot("previous_run_notice_checkpoint_small_light");
         let copy_pos = h.state().result.controls[0].rect.center();
         click(&mut h, copy_pos);
-        assert_eq!(h.state().copied, [report]);
+        assert_eq!(h.state().copied, [report.body()]);
     }
 
     #[test]
     fn previous_run_notice_snapshot_observations_small_light() {
-        let report = crate::previous_run_diagnostics::test_support::stage_c_report_body();
+        let report = crate::previous_run_diagnostics::test_support::stage_c_report();
         let mut h = harness_report(
             egui::vec2(1093.0, 614.0),
             1.0,
@@ -326,6 +380,6 @@ mod tests {
         h.snapshot("previous_run_notice_observations_small_light");
         let copy = h.state().result.controls[0].rect.center();
         click(&mut h, copy);
-        assert_eq!(h.state().copied, [report]);
+        assert_eq!(h.state().copied, [report.body()]);
     }
 }

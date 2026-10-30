@@ -30,8 +30,12 @@ pub(crate) struct FailureDiagnostic {
 pub(crate) struct FinalAiFailure {
     detail: String,
     diagnostic: FailureDiagnostic,
+    observed_at: Option<crate::diagnostic_time::LocalDateTime>,
 }
 impl FinalAiFailure {
+    pub(crate) fn observed_at(&self) -> Option<crate::diagnostic_time::LocalDateTime> {
+        self.observed_at
+    }
     pub(crate) fn diagnostic(&self) -> FailureDiagnostic {
         self.diagnostic
     }
@@ -46,6 +50,7 @@ impl FinalAiFailure {
     pub(crate) fn model_unavailable(detail: &'static str) -> Self {
         Self {
             detail: detail.into(),
+            observed_at: crate::diagnostic_time::LocalDateTime::now(),
             diagnostic: FailureDiagnostic {
                 kind: FailureKind::ModelLoad,
                 ort_code: None,
@@ -65,6 +70,7 @@ impl From<AiError> for FinalAiFailure {
         };
         Self {
             detail: error.to_string(),
+            observed_at: crate::diagnostic_time::LocalDateTime::now(),
             diagnostic: FailureDiagnostic { kind, ort_code },
         }
     }
@@ -73,6 +79,7 @@ impl From<String> for FinalAiFailure {
     fn from(detail: String) -> Self {
         Self {
             detail,
+            observed_at: crate::diagnostic_time::LocalDateTime::now(),
             diagnostic: FailureDiagnostic {
                 kind: FailureKind::Unknown,
                 ort_code: None,

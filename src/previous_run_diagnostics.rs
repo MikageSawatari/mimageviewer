@@ -31,12 +31,32 @@ pub enum GuiRunOutcome {
     ReturnedError,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreviousRunReport {
     body: String,
+    summary_end: usize,
+    details_start: usize,
 }
 impl PreviousRunReport {
-    /// The exact same allowlisted text is displayed and explicitly copied.
+    pub(crate) fn from_sections(summary: String, details: String) -> Self {
+        let summary_end = summary.len();
+        let mut body = summary;
+        body.push_str("\n\n詳細（報告用）\n");
+        let details_start = body.len();
+        body.push_str(&details);
+        Self {
+            body,
+            summary_end,
+            details_start,
+        }
+    }
+    pub(crate) fn summary(&self) -> &str {
+        &self.body[..self.summary_end]
+    }
+    pub(crate) fn details(&self) -> &str {
+        &self.body[self.details_start..]
+    }
+    /// Copies both sections, including details while their UI is collapsed.
     pub fn body(&self) -> &str {
         &self.body
     }
@@ -598,6 +618,96 @@ fn diagnostic_ai_gpu_correlation(
     }
 }
 
+fn elapsed_seconds(ms: u64) -> String {
+    format!("{}.{:03}", ms / 1000, ms % 1000)
+}
+
+fn report_summary(
+    record: &Record,
+    panic: &[fatal::PanicObservation],
+    devices: &[device_loss::DeviceObservation],
+    native: &[crate::native_exception_log::NativeObservation],
+    date: &impl Fn(u64) -> String,
+) -> String {
+    let mut observations = Vec::new();
+    if panic
+        .iter()
+        .any(|event| event.kind == fatal::PanicKind::GraphicsOutOfMemory)
+    {
+        observations.push("終了前に、描画用のGPUメモリの確保に失敗していました。".to_owned());
+    }
+    if !devices.is_empty() {
+        observations.push("終了前に、画面表示の機能（GPU）が使えなくなっていました。".to_owned());
+    }
+    if observations.is_empty() && !panic.is_empty() {
+        observations.push("終了前に、プログラム内部のエラーが起きていました。".to_owned());
+    }
+    if observations.is_empty() && !native.is_empty() {
+        observations.push(
+            "終了前に、プログラムの例外が記録されていました（処理が続いた場合も含みます）。"
+                .to_owned(),
+        );
+    }
+    if let Some(cp) = &record.checkpoint {
+        // A retained/cancelled background job must not be described as the
+        // current page. All jobs remain available in the report's details.
+        if let Some(display) = &cp.display
+            && let Some(job) = cp.jobs.iter().find(|job| {
+                job.active
+                    && !job.cancel_requested
+                    && job.metadata.context_id == Some(display.value.context_id)
+                    && job.metadata.items_generation == Some(display.value.items_generation)
+                    && job.metadata.page.is_some()
+                    && job.metadata.page == display.value.page
+                    && matches!(
+                        job.update.stage,
+                        checkpoint::JobStage::ModelLoad
+                            | checkpoint::JobStage::ScaleDetect
+                            | checkpoint::JobStage::TileRun
+                            | checkpoint::JobStage::Blend
+                    )
+            })
+        {
+            observations.push(format!(
+                "最後の記録ではAI処理の実行中でした（ページ {}/{}、{}）。",
+                diagnostic_optional(job.metadata.page),
+                diagnostic_optional(job.metadata.total),
+                diagnostic_model(
+                    job.update
+                        .model
+                        .or(job.metadata.upscale_model)
+                        .or(job.metadata.denoise_model)
+                )
+            ));
+        }
+        // This is the rendering adapter, never labelled as AI VRAM. UMA and
+        // failed queries keep their explicit qualification in the details.
+        if cp.gpu.value.status == crate::gpu_info::diagnostic_sampler::GpuSampleStatus::Available
+            && cp.gpu.value.uma == Some(false)
+            && let Some(memory) = cp.gpu.value.local
+        {
+            observations.push(format!(
+                "描画用GPUメモリ 使用 {} / 予算 {} MiB（{}）。",
+                memory.usage_bytes / (1024 * 1024),
+                memory.budget_bytes / (1024 * 1024),
+                date(cp.gpu.stamp.utc_ms)
+            ));
+        }
+    }
+    let mut summary = "前回、mIV は正常に終了しませんでした。".to_owned();
+    if observations.is_empty() {
+        summary
+            .push_str("\n原因は記録されていません。強制終了・電源断などでも、この表示になります。");
+    } else {
+        for observation in observations.iter().take(2) {
+            summary.push('\n');
+            summary.push_str(observation);
+        }
+        summary.push_str("\n記録だけでは、終了の原因は断定できません。");
+    }
+    summary
+}
+
 fn format_report(record: &Record) -> PreviousRunReport {
     format_report_with_observations(record, &[], &[], &[])
 }
@@ -607,41 +717,49 @@ fn format_report_with_observations(
     devices: &[device_loss::DeviceObservation],
     native: &[crate::native_exception_log::NativeObservation],
 ) -> PreviousRunReport {
+    format_report_at(record, panic, devices, native, &|ms| {
+        crate::diagnostic_time::LocalDateTime::from_utc_ms(ms)
+    })
+}
+fn format_report_at(
+    record: &Record,
+    panic: &[fatal::PanicObservation],
+    devices: &[device_loss::DeviceObservation],
+    native: &[crate::native_exception_log::NativeObservation],
+    local: &impl Fn(u64) -> Option<crate::diagnostic_time::LocalDateTime>,
+) -> PreviousRunReport {
     // The typed schema has no arbitrary diagnostic strings. Formatting is
     // shared by the visible body and the explicit copy action.
     let [major, minor, patch] = record.version;
-    let introduction = if panic.is_empty() && devices.is_empty() && native.is_empty() {
-        "前回の正常終了を確認できませんでした。原因は記録されていません。"
-    } else {
-        "前回の正常終了を確認できませんでした。終了前に観測された情報があります。"
-    };
-    let mut report = PreviousRunReport {
-        body: format!(
-            "{introduction}\n最終記録時刻: UTC {} ミリ秒 / 終了との間隔不明\n時刻は1970年1月1日（UTC）からの経過ミリ秒です。\nmIV {major}.{minor}.{patch} / 記録ID {}\n強制終了・OS終了・電源断・記録失敗とクラッシュは区別できません。\n最終記録以降に状態が変わった可能性があります。",
-            record.last_recorded_utc_ms,
-            record.identity.name()
-        ),
-    };
-    append_observations(&mut report.body, panic, devices, native);
+    let date = |ms| crate::diagnostic_time::display(local(ms));
+    let mut body = format!(
+        "最終記録時刻: {} / 終了との間隔不明\nmIV {major}.{minor}.{patch} / 記録ID {:016x}-core-{}-{:016x}\n起動時刻: {}\n強制終了・OS終了・電源断・記録失敗とクラッシュは区別できません。\n最終記録以降に状態が変わった可能性があります。",
+        date(record.last_recorded_utc_ms),
+        record.identity.run,
+        record.identity.core_pid,
+        record.identity.core_started_ticks,
+        date(record.identity.core_started_utc_ms)
+    );
+    append_observations(&mut body, panic, devices, native, &date);
     if let Some(checkpoint) = &record.checkpoint {
         use std::fmt::Write as _;
         let _ = write!(
-            report.body,
-            "\n定期記録: UTC {} ミリ秒 / 記録開始後 {} ミリ秒 / 終了との間隔不明\n活動数 {} / 処理数 {} / 省略した処理数 {} / 受渡しできなかった更新数 {}",
-            checkpoint.stamp.utc_ms,
-            checkpoint.stamp.run_elapsed_ms,
+            body,
+            "\n定期記録: {} / 記録開始後 {} 秒 / 終了との間隔不明\n活動数 {} / 処理数 {} / 省略した処理数 {} / 受渡しできなかった更新数 {}",
+            date(checkpoint.stamp.utc_ms),
+            elapsed_seconds(checkpoint.stamp.run_elapsed_ms),
             checkpoint.active_leases,
             checkpoint.active_jobs,
             checkpoint.omitted_jobs,
             checkpoint.dropped_updates
         );
-        report.body.push_str(if checkpoint.active_leases == 0 {
+        body.push_str(if checkpoint.active_leases == 0 {
             " / 活動終了（待機中）"
         } else {
             " / 活動中"
         });
         let _ = write!(
-            report.body,
+            body,
             "\n実行待ち {} / 保持入力容量（バイト） {} / 実行中 {} / 結果待ち {} / 後段合成 {} / GPU登録要求 {}\n入力画像の共有分も含むため、追加メモリ量とは異なります。GPUへの登録要求はGPU処理の完了を意味しません。",
             checkpoint.queued_jobs,
             diagnostic_optional(checkpoint.queued_source_bytes),
@@ -650,19 +768,19 @@ fn format_report_with_observations(
             checkpoint.final_effect_jobs,
             checkpoint.gpu_registration_jobs
         );
-        report.body.push_str(
+        body.push_str(
             "\n処理方式は選択された方式です。AIライブラリ内部の実際の割当先は未確認です。",
         );
         if let Some(display) = &checkpoint.display {
             let _ = write!(
-                report.body,
-                "\n表示: 画面番号 {} / 更新番号 {} / ページ {}/{} / UTC {} ミリ秒 / 記録開始後 {} ミリ秒 / 終了との間隔不明",
+                body,
+                "\n表示: 画面番号 {} / 更新番号 {} / ページ {}/{} / {} / 記録開始後 {} 秒 / 終了との間隔不明",
                 display.value.context_id,
                 display.value.items_generation,
                 diagnostic_optional(display.value.page),
                 diagnostic_optional(display.value.total),
-                display.stamp.utc_ms,
-                display.stamp.run_elapsed_ms
+                date(display.stamp.utc_ms),
+                elapsed_seconds(display.stamp.run_elapsed_ms)
             );
         }
         for job in &checkpoint.jobs {
@@ -673,8 +791,8 @@ fn format_report_with_observations(
             };
             let backend = job.update.backend.unwrap_or(job.metadata.backend);
             let _ = write!(
-                report.body,
-                "\n{job_label}: 画面番号 {} / 更新番号 {} / ページ {}/{} / 段階 {} / 処理方式 {} / 拡大モデル {} / ノイズ除去モデル {} / 使用モデル {} / 入力画像の寸法 {} / 保持入力容量（バイト） {} / 出力画像の寸法 {} / 分割画像の寸法 {} {}/{} / UTC {} ミリ秒 / 記録開始後 {} ミリ秒 / 終了との間隔不明\n取消の確認: {} / UTC {} ミリ秒 / 記録開始後 {} ミリ秒",
+                body,
+                "\n{job_label}: 画面番号 {} / 更新番号 {} / ページ {}/{} / 段階 {} / 処理方式 {} / 拡大モデル {} / ノイズ除去モデル {} / 使用モデル {} / 入力画像の寸法 {} / 保持入力容量（バイト） {} / 出力画像の寸法 {} / 分割画像の寸法 {} {}/{} / {} / 記録開始後 {} 秒 / 終了との間隔不明\n取消の確認: {} / {} / 記録開始後 {} 秒",
                 diagnostic_optional(job.metadata.context_id),
                 diagnostic_optional(job.metadata.items_generation),
                 diagnostic_optional(job.metadata.page),
@@ -690,11 +808,11 @@ fn format_report_with_observations(
                 diagnostic_dimensions(job.update.tile),
                 diagnostic_optional(job.update.tile_index),
                 diagnostic_optional(job.update.tile_total),
-                job.stamp.utc_ms,
-                job.stamp.run_elapsed_ms,
+                date(job.stamp.utc_ms),
+                elapsed_seconds(job.stamp.run_elapsed_ms),
                 diagnostic_yes_no(Some(job.cancel_requested)),
-                job.cancel_stamp.utc_ms,
-                job.cancel_stamp.run_elapsed_ms
+                date(job.cancel_stamp.utc_ms),
+                elapsed_seconds(job.cancel_stamp.run_elapsed_ms)
             );
         }
         let cpu = &checkpoint.cpu_private_bytes;
@@ -702,62 +820,53 @@ fn format_report_with_observations(
             .value
             .map_or_else(|| "不明".into(), |value| value.to_string());
         let _ = write!(
-            report.body,
-            "\nアプリ専用メモリ確保量（バイト）: {cpu_value} / UTC {} ミリ秒 / 記録開始後 {} ミリ秒 / 終了との間隔不明",
-            cpu.stamp.utc_ms, cpu.stamp.run_elapsed_ms
+            body,
+            "\nアプリ専用メモリ確保量（バイト）: {cpu_value} / {} / 記録開始後 {} 秒 / 終了との間隔不明",
+            date(cpu.stamp.utc_ms),
+            elapsed_seconds(cpu.stamp.run_elapsed_ms)
         );
         let gpu = &checkpoint.gpu;
         let _ = write!(
-            report.body,
-            "\n描画用GPUの照会: {} / GPU識別情報 {} / GPU内の区分番号 {} / メモリ共有型か {} / GPU側メモリ区分 {} / システム側メモリ区分 {} / UTC {} ミリ秒 / 記録開始後 {} ミリ秒 / 終了との間隔不明\nAI処理GPUとの一致状況: {}（一致未確認）\nメモリ区分は専用メモリの有無を示しません。GPU使用量・予算だけでは終了原因は判断できません。",
+            body,
+            "\n描画用GPUの照会: {} / GPU識別情報 {} / GPU内の区分番号 {} / メモリ共有型か {} / GPU側メモリ区分 {} / システム側メモリ区分 {} / {} / 記録開始後 {} 秒 / 終了との間隔不明\nAI処理GPUとの一致状況: {}（一致未確認）\nメモリ区分は専用メモリの有無を示しません。GPU使用量・予算だけでは終了原因は判断できません。",
             diagnostic_gpu_status(gpu.value.status),
             diagnostic_adapter(gpu.value.adapter),
             diagnostic_optional(gpu.value.node_index),
             diagnostic_yes_no(gpu.value.uma),
             diagnostic_segment(gpu.value.local),
             diagnostic_segment(gpu.value.nonlocal),
-            gpu.stamp.utc_ms,
-            gpu.stamp.run_elapsed_ms,
+            date(gpu.stamp.utc_ms),
+            elapsed_seconds(gpu.stamp.run_elapsed_ms),
             diagnostic_ai_gpu_correlation(checkpoint.ai_adapter_correlation)
         );
     }
     if let (Some(checkpoint), Some(observation)) = (&record.checkpoint, panic.last()) {
-        append_panic_interval(
-            &mut report.body,
-            "定期記録",
-            checkpoint.stamp,
-            observation.stamp,
-        );
+        append_panic_interval(&mut body, "定期記録", checkpoint.stamp, observation.stamp);
         if let Some(display) = &checkpoint.display {
-            append_panic_interval(
-                &mut report.body,
-                "表示状態",
-                display.stamp,
-                observation.stamp,
-            );
+            append_panic_interval(&mut body, "表示状態", display.stamp, observation.stamp);
         }
         append_panic_interval(
-            &mut report.body,
+            &mut body,
             "アプリのメモリ記録",
             checkpoint.cpu_private_bytes.stamp,
             observation.stamp,
         );
         append_panic_interval(
-            &mut report.body,
+            &mut body,
             "GPUメモリ記録",
             checkpoint.gpu.stamp,
             observation.stamp,
         );
         for job in &checkpoint.jobs {
             append_panic_interval(
-                &mut report.body,
+                &mut body,
                 &format!("処理番号 {}", job.metadata.job_id),
                 job.stamp,
                 observation.stamp,
             );
         }
     }
-    report
+    PreviousRunReport::from_sections(report_summary(record, panic, devices, native, &date), body)
 }
 
 fn append_observations(
@@ -765,6 +874,7 @@ fn append_observations(
     panic: &[fatal::PanicObservation],
     devices: &[device_loss::DeviceObservation],
     native: &[crate::native_exception_log::NativeObservation],
+    date: &impl Fn(u64) -> String,
 ) {
     use std::fmt::Write as _;
     for event in panic {
@@ -778,15 +888,19 @@ fn append_observations(
         };
         let _ = write!(
             body,
-            "\n終了前に観測された情報: {classification}\n内部エラーの観測時刻: UTC {} ミリ秒 / 記録開始後 {} ミリ秒 / 実行単位番号 {}",
-            event.stamp.utc_ms, event.stamp.run_elapsed_ms, event.thread
+            "\n終了前に観測された情報: {classification}\n内部エラーの観測時刻: {} / 記録開始後 {} 秒 / 実行単位番号 {}",
+            date(event.stamp.utc_ms),
+            elapsed_seconds(event.stamp.run_elapsed_ms),
+            event.thread
         );
     }
     for event in devices {
         let _ = write!(
             body,
-            "\n終了前に観測された情報: 描画機能の利用不能（番号 {}） / 理由 不明\n保存処理の確認時刻: UTC {} ミリ秒 / 記録開始後 {} ミリ秒（異常の発生時刻・終了時刻ではありません）",
-            event.device_id, event.stamp.utc_ms, event.stamp.run_elapsed_ms
+            "\n終了前に観測された情報: 描画機能の利用不能（番号 {}） / 理由 不明\n保存処理の確認時刻: {} / 記録開始後 {} 秒（異常の発生時刻・終了時刻ではありません）",
+            event.device_id,
+            date(event.stamp.utc_ms),
+            elapsed_seconds(event.stamp.run_elapsed_ms)
         );
     }
     // Keep presentation bounded even after a run hits the native recorder cap.
@@ -808,8 +922,9 @@ fn append_observations(
         };
         let _ = write!(
             body,
-            "\n終了前に観測された例外（処理が続いた場合も含む）: {classification} / 例外番号 0x{:08X} / UTC {} ミリ秒。終了原因かは不明です。",
-            event.code, event.utc_ms
+            "\n終了前に観測された例外（処理が続いた場合も含む）: {classification} / 例外番号 0x{:08X} / {}。終了原因かは不明です。",
+            event.code,
+            date(event.utc_ms)
         );
     }
     if !panic.is_empty() || !devices.is_empty() || !native.is_empty() {
@@ -821,8 +936,8 @@ fn append_panic_interval(body: &mut String, label: &str, sample: Stamp, panic: S
     if sample.utc_ms <= panic.utc_ms && sample.run_elapsed_ms <= panic.run_elapsed_ms {
         let _ = write!(
             body,
-            "\n{label}採取→同じ実行の最後の内部エラー観測: {} ミリ秒前（終了との間隔は不明）",
-            panic.run_elapsed_ms - sample.run_elapsed_ms
+            "\n{label}採取→同じ実行の最後の内部エラー観測: {} 秒前（終了との間隔は不明）",
+            elapsed_seconds(panic.run_elapsed_ms - sample.run_elapsed_ms)
         );
     } else {
         let _ = write!(
@@ -1054,16 +1169,25 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn checkpoint_report_body() -> String {
-        format_report(&checkpoint_record()).body
+        checkpoint_report().body
+    }
+    pub(crate) fn checkpoint_report() -> PreviousRunReport {
+        format_report_at(&checkpoint_record(), &[], &[], &[], &fixture_local)
+    }
+    fn fixture_local(ms: u64) -> Option<crate::diagnostic_time::LocalDateTime> {
+        crate::diagnostic_time::LocalDateTime::with_offset(ms, 540)
     }
 
     pub(crate) fn stage_c_report_body() -> String {
+        stage_c_report().body
+    }
+    pub(crate) fn stage_c_report() -> PreviousRunReport {
         let record = checkpoint_record();
         let stamp = Stamp {
             utc_ms: record.last_recorded_utc_ms + 700,
             run_elapsed_ms: 12_700,
         };
-        format_report_with_observations(
+        format_report_at(
             &record,
             &[fatal::PanicObservation {
                 stamp,
@@ -1079,11 +1203,11 @@ pub(crate) mod test_support {
                 utc_ms: stamp.utc_ms,
                 code: 0xC0000005,
             }],
+            &fixture_local,
         )
-        .body
     }
 
-    fn checkpoint_record() -> Record {
+    pub(super) fn checkpoint_record() -> Record {
         use crate::gpu_info::diagnostic_sampler::{
             AdapterIdentity, DiagnosticBackend as GpuBackend, GpuMemorySample, GpuSampleStatus,
             SegmentMemory,
@@ -1101,7 +1225,7 @@ pub(crate) mod test_support {
                 context_id: Some(3),
                 items_generation: Some(17),
                 job_id: 655,
-                page: Some(11),
+                page: Some(12),
                 total: Some(40),
                 upscale_model: Some(checkpoint::DiagnosticModel::UpscaleRealEsrGeneralV3),
                 source: Some(checkpoint::Dimensions {
@@ -1111,7 +1235,7 @@ pub(crate) mod test_support {
                 source_bytes: Some(34_560_000),
                 ..Default::default()
             },
-            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         job.update(checkpoint::JobUpdate {
             stage: checkpoint::JobStage::TileRun,
@@ -1153,6 +1277,7 @@ pub(crate) mod test_support {
                             budget_bytes: 8_000_000_000,
                         }),
                         node_index: Some(0),
+                        uma: Some(false),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -1388,7 +1513,7 @@ mod tests {
         assert!(
             report
                 .body()
-                .contains("前回の正常終了を確認できませんでした")
+                .contains("前回、mIV は正常に終了しませんでした")
         );
         assert!(other.take_report().is_none());
         finish(&mut next, GuiRunOutcome::ReturnedOk);
@@ -1869,14 +1994,16 @@ mod tests {
             last_recorded_utc_ms: now_ms(),
             checkpoint: Some(captured),
         };
-        let report = format_report(&record);
+        let report = format_report_at(&record, &[], &[], &[], &|ms| {
+            crate::diagnostic_time::LocalDateTime::with_offset(ms, 540)
+        });
         assert!(report.body().contains(
-            "アプリ専用メモリ確保量（バイト）: 不明 / UTC 100 ミリ秒 / 記録開始後 10 ミリ秒"
+            "アプリ専用メモリ確保量（バイト）: 不明 / 1970-01-01 09:00:00 (UTC+09:00) / 記録開始後 0.010 秒"
         ));
         assert!(
-            report
-                .body()
-                .contains("UTC 90 ミリ秒 / 記録開始後 20 ミリ秒 / 終了との間隔不明")
+            report.body().contains(
+                "1970-01-01 09:00:00 (UTC+09:00) / 記録開始後 0.020 秒 / 終了との間隔不明"
+            )
         );
         assert!(report.body().contains("処理番号 不明"));
         assert!(report.body().contains("DirectML"));
@@ -2041,7 +2168,7 @@ mod tests {
         assert!(report.contains("保存処理の確認時刻"));
         assert!(report.contains("処理が続いた場合も含む"));
         assert!(report.contains("終了原因かは不明"));
-        assert!(report.contains("700 ミリ秒前（終了との間隔は不明）"));
+        assert!(report.contains("0.700 秒前（終了との間隔は不明）"));
         assert!(!report.contains("address="));
         assert!(!report.contains("target="));
         let sample = Stamp {
@@ -2071,10 +2198,99 @@ mod tests {
                 };
                 256
             ],
+            &|ms| {
+                crate::diagnostic_time::display(crate::diagnostic_time::LocalDateTime::with_offset(
+                    ms, 540,
+                ))
+            },
         );
         assert_eq!(native.matches("処理が続いた場合も含む）:").count(), 8);
         assert!(native.contains("248件を省略"));
         assert!(native.len() < MAX_RECORD_BYTES as usize);
+    }
+
+    #[test]
+    fn diagnostic_summary_is_short_and_details_keep_all_allowlisted_evidence() {
+        let report = test_support::stage_c_report();
+        assert_eq!(report.summary().lines().count(), 4);
+        assert!(
+            report
+                .summary()
+                .contains("描画用のGPUメモリの確保に失敗していました")
+        );
+        assert!(
+            report
+                .summary()
+                .contains("画面表示の機能（GPU）が使えなくなっていました")
+        );
+        for internal in [
+            "記録ID",
+            "処理番号",
+            "活動数",
+            "保持入力容量",
+            "UTC 179",
+            "ミリ秒",
+            "直前",
+            "原因です",
+        ] {
+            assert!(!report.summary().contains(internal), "summary: {internal}");
+        }
+        assert!(report.details().contains("例外番号 0xC0000005"));
+        assert!(report.details().contains("処理番号 655"));
+        assert!(report.details().contains("(UTC+09:00)"));
+        assert!(!report.body().contains("1793340000000"));
+        assert!(!report.body().contains("ミリ秒"));
+        assert_eq!(
+            report.body(),
+            format!(
+                "{}\n\n詳細（報告用）\n{}",
+                report.summary(),
+                report.details()
+            )
+        );
+
+        let report = test_support::checkpoint_report();
+        assert_eq!(report.summary().lines().count(), 4);
+        assert!(
+            report
+                .summary()
+                .contains("AI処理の実行中でした（ページ 12/40、高速汎用）")
+        );
+        assert!(
+            report
+                .summary()
+                .contains("描画用GPUメモリ 使用 1907 / 予算 3814 MiB")
+        );
+    }
+
+    #[test]
+    fn diagnostic_summary_never_attributes_background_or_cancelled_jobs_to_current_page() {
+        let mut record = test_support::checkpoint_record();
+        let render = |record: &Record| {
+            format_report_at(record, &[], &[], &[], &|ms| {
+                crate::diagnostic_time::LocalDateTime::with_offset(ms, 540)
+            })
+        };
+        record.checkpoint.as_mut().unwrap().jobs[0].cancel_requested = true;
+        assert!(!render(&record).summary().contains("AI処理の実行中"));
+        record.checkpoint.as_mut().unwrap().jobs[0].cancel_requested = false;
+        record.checkpoint.as_mut().unwrap().jobs[0]
+            .metadata
+            .context_id = Some(4);
+        assert!(!render(&record).summary().contains("AI処理の実行中"));
+        record.checkpoint.as_mut().unwrap().jobs[0]
+            .metadata
+            .context_id = Some(3);
+        record.checkpoint.as_mut().unwrap().jobs[0].metadata.page = Some(11);
+        assert!(!render(&record).summary().contains("AI処理の実行中"));
+        record.checkpoint = None;
+        let report = render(&record);
+        assert_eq!(report.summary().lines().count(), 2);
+        assert!(
+            report
+                .summary()
+                .contains("原因は記録されていません。強制終了・電源断")
+        );
     }
 
     #[test]
@@ -2126,7 +2342,7 @@ mod tests {
         }
         let report = test_support::stage_c_report_body();
         assert!(report.contains("例外番号 0xC0000005"));
-        assert!(report.contains("700 ミリ秒前"));
+        assert!(report.contains("0.700 秒前"));
     }
 
     #[test]
@@ -2281,7 +2497,12 @@ mod tests {
             test_support::admit(&mut next, directory.path());
             let report = next.report_handle().unwrap().take_report().unwrap();
             assert!(report.body().contains("プログラム内部のエラー"));
-            assert!(report.body().contains(&reference.current.name()));
+            assert!(report.body().contains(&format!(
+                "記録ID {:016x}-core-{}-{:016x}",
+                reference.current.run,
+                reference.current.core_pid,
+                reference.current.core_started_ticks
+            )));
             finish(&mut next, GuiRunOutcome::ReturnedOk);
         }
     }

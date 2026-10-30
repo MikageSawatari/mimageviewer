@@ -90176,7 +90176,7 @@ impl App {
                     if live_pending {
                         let first_failure = self.final_ai_failed.insert(key);
                         if first_failure && let Some(request) = failure_feedback {
-                            self.notify_final_ai_failure(key, job_id, request, error.diagnostic());
+                            self.notify_final_ai_failure(key, job_id, request, &error);
                         }
                         crate::logger::log(format!(
                             "[AI] Final AI failed idx={} job_id={job_id} error={error}",

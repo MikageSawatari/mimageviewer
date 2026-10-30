@@ -12,6 +12,7 @@ pub(crate) struct AiFailureReport {
 impl AiFailureReport {
     pub(crate) fn new(
         diagnostic: FailureDiagnostic,
+        observed_at: Option<crate::diagnostic_time::LocalDateTime>,
         owner: u64,
         generation: u64,
         job: u64,
@@ -23,11 +24,12 @@ impl AiFailureReport {
         let code = diagnostic
             .ort_code
             .map_or_else(|| "不明".into(), |code| code.to_string());
+        let observed_at = crate::diagnostic_time::display(observed_at);
         Self {
             owner,
             summary: format!("AI処理に失敗（{label}）・クリックでコピー"),
             body: format!(
-                "AI処理に失敗しました（{label}）。\nエラー番号: {code}\n画面番号 {owner} / 更新番号 {generation} / 処理番号 {job}\nページ {page}/{total} / 入力画像の寸法 {}x{}\nこの記録は処理の失敗です。異常終了やGPUの喪失を示すものではありません。\nエラーの原文は既存の詳細ログに残ります。",
+                "AI処理に失敗しました（{label}）。\n観測時刻: {observed_at}\nエラー番号: {code}\n画面番号 {owner} / 更新番号 {generation} / 処理番号 {job}\nページ {page}/{total} / 入力画像の寸法 {}x{}\nこの記録は処理の失敗です。異常終了やGPUの喪失を示すものではありません。\nエラーの原文は既存の詳細ログに残ります。",
                 source[0], source[1]
             ),
         }
@@ -100,6 +102,7 @@ fn ai_failure_snapshot_report() -> std::sync::Arc<AiFailureReport> {
             kind: crate::ai::failure::FailureKind::Inference,
             ort_code: Some(6),
         },
+        crate::diagnostic_time::LocalDateTime::with_offset(1_793_355_825_000, 540),
         3,
         17,
         655,
@@ -355,6 +358,7 @@ mod ai_failure_ui_tests {
                     kind,
                     ort_code: None,
                 },
+                None,
                 1,
                 2,
                 3,
@@ -363,6 +367,7 @@ mod ai_failure_ui_tests {
                 [6, 7],
             );
             assert!(report.body().contains("エラー番号: 不明"));
+            assert!(report.body().contains("観測時刻: 時刻不明"));
             assert!(
                 report
                     .body()
@@ -442,6 +447,19 @@ mod ai_failure_ui_tests {
 
     #[test]
     fn ai_failure_feedback_hover_and_explicit_copy() {
+        assert!(report().body().contains("2026-10-30 19:23:45 (UTC+09:00)"));
+        let manual = include_str!("../htdocs/mimageviewer/manual/troubleshooting.html");
+        let example = manual
+            .split("<pre>AI処理に失敗しました")
+            .nth(1)
+            .unwrap()
+            .split("</pre>")
+            .next()
+            .unwrap();
+        assert_eq!(
+            report().body(),
+            format!("AI処理に失敗しました{}", example.replace("\r\n", "\n"))
+        );
         for scale in [1.0, 2.0] {
             let mut h = harness(scale);
             h.run_steps(12);

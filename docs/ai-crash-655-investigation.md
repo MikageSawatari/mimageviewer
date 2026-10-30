@@ -500,32 +500,38 @@ panic・native・通常 state/device-loss の sink は分離する。通常 writ
 
 ### 6. 次回通知、許可項目、表示とコピーの例
 
-前回 Running のままなら「前回の正常終了を確認できませんでした」を基準とする。情報なしでは「原因は記録されていません」。観測があれば「終了前に観測された情報」として添え、taskkill/OS終了/電断/記録失敗と crash の区別は保証しない。
+前回 Running のままなら「前回、mIV は正常に終了しませんでした。」を基準とする。要点は2〜4行とし、観測を利用者の言葉で添える。終了時刻が分からないため「直前」とは書かず、「終了前に」「最後の記録では」とする。情報なしでは「原因は記録されていません。強制終了・電源断などでも、この表示になります。」とする。taskkill/OS終了/電断/記録失敗と crash の区別は保証しない。
 
-UI は通常 root の描画が可能で、起動 overlay を塞がずに出せる段階に、消えない小さな通知と詳細欄を一度表示する。tray/最小化中には表示済みを消費せず、復帰後に表示する。「報告用の文をコピー」「閉じる」は常時到達できる位置に置き、本文だけ scroll する。前回1件の提示済み/閉じるは診断 owner が管理し、通知を毎 frame 再生成しない。今回も描画不能なら既存の native エラー表示が限界。自動送信・自動 clipboard 更新はしない。
+UI は通常 root の描画が可能で、起動 overlay を塞がずに出せる段階に、消えない小さな通知と詳細欄を一度表示する。要点は常時表示し、「詳細（報告用）」は既定で畳む。tray/最小化中には表示済みを消費せず、復帰後に表示する。要点・詳細の見出し・「報告用の文をコピー」「閉じる」はScrollAreaの外へ置き、展開した詳細本文だけ scroll する。コピーは畳んだ状態でも要点＋詳細の全文。前回1件の提示済み/閉じるは診断 owner が管理し、通知を毎 frame 再生成しない。今回も描画不能なら既存の native エラー表示が限界。自動送信・自動 clipboard 更新はしない。
 
 **checkpoint とコピー文の両方を許可項目から組み立てる。** 許可するのは schema、製品/build/依存版、OS の数値版、短命 run/context/job/device ID と世代、時刻、既知 model/backend/API enum、ページ番号/総数、段階/取消/件数、寸法/bytes、照会結果/相関可否、既知の失敗分類と数値 code。adapter は vendor/device 数値 ID と役割で識別する。GPU 名・driver/ORT/panic の任意文字列は流し込まず、必要な版も数値/既知形式だけにする。
 
 ファイル名、ZIP 内名、絶対/相対パス、検索語、コマンドライン、ユーザー名、画像内容、任意の model 名、panic/ORT/driver の生 message、backtrace/source path は許可しない。パスらしい部分を除去する文字列加工で安全にしようとせず、未分類は固定の一般文へ落とす。既存詳細ログの記録方針は維持するが、自動で添付しない。worker が一度作った同じ本文を画面とコピーに使用し、コピーだけに隠れた追加項目を入れない。
 
+日時はローカル日時（YYYY-MM-DD HH:MM:SS）＋数値時差（UTC+09:00等）とし、エポックミリ秒は記録ID内も含めて表示・コピーしない。記録ID内の起動時刻は別の日時へ分離する。相対時間は記録開始後の秒数とする。troubleshootingの`#previous-exit` / `#ai-failure`にも現在の例を載せる。
+
 例1（架空値。typed OOM 分類と同一 run の panic 観測がある場合）:
 
 ```text
-前回の正常終了を確認できませんでした。
+前回、mIV は正常に終了しませんでした。
+終了前に、描画用のGPUメモリの確保に失敗していました。
+記録だけでは、終了の原因は断定できません。
+
+詳細（報告用）
 終了前に観測された情報: 描画用GPUメモリの確保失敗 / プログラム内部のエラー
-内部エラー観測時刻: 2026-10-30 12:34:56.400 UTC
-最終記録時刻: 2026-10-30 12:34:55.000 UTC（内部エラー観測の1.4秒前）
-表示状態の採取時刻: 2026-10-30 12:34:54.800 UTC（内部エラー観測の1.6秒前）
+内部エラー観測時刻: 2026-10-30 21:34:56 (UTC+09:00)
+最終記録時刻: 2026-10-30 21:34:55 (UTC+09:00)（内部エラー観測の1.400秒前）
+表示状態の採取時刻: 2026-10-30 21:34:54 (UTC+09:00)（内部エラー観測の1.600秒前）
 表示: 画面番号3・更新番号7・ページ11/30
-実行状態の採取時刻: 2026-10-30 12:34:54.900 UTC
+実行状態の採取時刻: 2026-10-30 21:34:54 (UTC+09:00)
 AI処理番号42: ページ6/30・高速汎用・DirectML・分割画像の推論中
 入力画像の寸法1440x1920 / 出力画像の寸法5760x7680 / 分割画像の寸法512x512・3/20
 処理番号42: 取消要求済み・実行終了未確認
-GPU採取時刻: 2026-10-30 12:34:54.600 UTC（内部エラー観測の1.8秒前）
+GPU採取時刻: 2026-10-30 21:34:54 (UTC+09:00)（内部エラー観測の1.800秒前）
 描画用GPU: メーカー番号0x10DE / 機種番号0x2684 / DirectX 12 / 区分番号0
 GPU側区分の使用量1700 MiB / 予算1900 MiB、システム側区分の使用量80 MiB / 予算4096 MiB
 AI処理GPUとの一致未確認
-アプリのメモリ採取時刻: 2026-10-30 12:34:54.700 UTC / 専用メモリ確保量2100 MiB
+アプリのメモリ採取時刻: 2026-10-30 21:34:54 (UTC+09:00) / 専用メモリ確保量2100 MiB
 mIV x.y.z / AIライブラリ1.24.4 / 記録ID core-1234-5678
 各状態は最終記録以降に変わった可能性があります。
 観測された情報だけでは終了原因を確定できません。
@@ -534,10 +540,14 @@ mIV x.y.z / AIライブラリ1.24.4 / 記録ID core-1234-5678
 例2（終了観測がなく、古い checkpoint だけの場合）:
 
 ```text
-前回の正常終了を確認できませんでした。原因は記録されていません。
-最終記録時刻: 2026-10-30 10:00:00 UTC / 終了との間隔不明
-表示状態の採取時刻: 2026-10-30 09:59:59 UTC / 表示11/30
-GPU採取時刻: 2026-10-30 09:59:58 UTC / 描画用GPUのGPU側区分の使用量1700 MiB・予算1900 MiB
+前回、mIV は正常に終了しませんでした。
+描画用GPUメモリ 使用 1700 / 予算 1900 MiB（2026-10-30 18:59:58 (UTC+09:00)）。
+記録だけでは、終了の原因は断定できません。
+
+詳細（報告用）
+最終記録時刻: 2026-10-30 19:00:00 (UTC+09:00) / 終了との間隔不明
+表示状態の採取時刻: 2026-10-30 18:59:59 (UTC+09:00) / 表示11/30
+GPU採取時刻: 2026-10-30 18:59:58 (UTC+09:00) / 描画用GPUのGPU側区分の使用量1700 MiB・予算1900 MiB
 AIの実行状態: 不明 / AI処理GPUとの一致未確認
 mIV x.y.z / 記録ID core-1234-5678
 使用量の値だけではメモリ不足を確定できません。
@@ -856,3 +866,46 @@ backlog §1.482を「段A〜D実装済み・実機未確認、段D指定自動�
 lib内PNGが許される既存方針は維持する。前回通知のcrate内部の描画/formatter fixtureはlibで検査するが、今回問題になったAI通知PNGはintegrationへ移し、指定の`UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot`で更新できる。libのクリック/コピー回帰は削除・弱体化していない。実カーソルを読む製品動作は維持する。
 
 以上はサンドボックス内の検証。外側での同一case再実行・本体全件は設計担当へ引き継ぎ、外側でも実行済みとは主張しない。commit・製品起動・追加の独立レビューは行っていない。
+
+### 18. 前回終了通知の表示再設計（2026-10-31、未コミット）
+
+`a906a20f9`を起点に、要点と報告用詳細を分ける。常時表示は2〜4行とし、描画メモリ確保失敗、描画機能の利用不能、内部エラー、例外、現在ページのAI処理、描画用GPUメモリの順に最大2項目を載せ、原因を断定できない旨を1行にまとめる。エラーのない記録ではAIやGPUの状態を載せ、項目がなければ原因未記録と強制終了・電源断の可能性を示す。「直前」の鮮度保証は設けない。
+
+AIの要点は表示と画面番号・更新番号・ページが一致し、未取消・活動中で推論等を実行している処理だけを対象にする。背景処理や取消された処理も詳細には残す。GPUの要点は照会成功かつ非共有型と確認された描画用GPUの値に限り、AIのVRAMとは呼ばない。共有型・種類不明・照合不能は詳細で明示する。
+
+`PreviousRunReport`は一度生成した本文と二つの節境界を所有し、画面とコピーが同じ許可項目だけを使う。「詳細（報告用）」は既定で畳み、コピーには閉じた詳細も含める。要点・詳細見出し・操作行をScrollAreaの外へ置き、詳細だけスクロールする。`default_pos`と親の`os_theme`を継承する方式は維持する。要点を常時表示する分、詳細は残り高さを使い、本文だけの従来45%基準とは分ける。
+
+日時は通常workerでWindowsの日時変換を行い、対象日時のローカル日時＋数値時差（`2026-10-30 19:23:45 (UTC+09:00)`等）とする。変換不能は固定文「時刻不明」。エポックミリ秒は本文・コピーに出さず、記録ID中の起動時刻も独立した日時に分離する。記録開始後の経過や内部エラー観測との差は秒（小数3桁）で残す。保存schema・fatal handler・周期採取・native相関・終了境界は変更しない。
+
+即時AI失敗はworkerで`FinalAiFailure`を構築する時点の日時を保持する。UIは取得済み日時と固定分類・数値の整形だけを行い、時刻変換・I/O・DXGI照会・待機を加えない。1行のtoast、hover詳細、同一本文の明示コピー、現役処理の判定と失敗keyの寿命を維持する。マニュアルのAIコピー例はfixtureと全文一致を検査する。
+
+日時fixtureは固定時差を注入し、フォント・カーソル寸法は§17の共通harnessを維持する。短い要点、隠れた詳細を含むコピー、現在ページへの誤帰属防止、時差と日付の繰越、取得不能、展開後の操作行・末尾スクロールを検査する。検証結果と更新PNGは以下へ記録する。
+
+すべて`MSBUILDDISABLENODEREUSE=1`、同じ未コミット差分で実施。通常UIの同期I/Oは追加していない（`docs/ui-responsiveness.md` §4）。
+
+| 自動検証 | 結果・ログ（`target/ai-crash-presentation-`以下） |
+| --- | --- |
+| `cargo fmt` | 成功 |
+| `cargo check -p mimageviewer --lib --tests --features test-script` | exit 0、40.89秒。既存warningあり。`check-final.log` |
+| `cargo test -p mimageviewer --lib previous_run_notice` | 更新指定で9成功、更新指定なしでも9成功・0失敗、1.37秒。`previous_run_notice.log` / `notice-compare.log` |
+| `cargo test -p mimageviewer --lib previous_run_diagnostics` | 53成功・0失敗、2.77秒。`previous_run_diagnostics.log` |
+| `cargo test -p mimageviewer --lib ai_failure` | 7成功・0失敗、1.79秒。`ai_failure.log` |
+| `cargo test -p mimageviewer --lib diagnostic_time` | 2成功・0失敗。`diagnostic_time.log` |
+| `cargo test -p mimageviewer --lib final_ai` | 27成功・0失敗、4.12秒。`final_ai.log` |
+| `cargo test -p mimageviewer --lib final_pipeline` | 1成功・0失敗、0.17秒。`final_pipeline.log` |
+| `UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot` | 215成功・0失敗、実行30.65秒。`ui-update.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険glyph 0件 |
+
+更新PNGは次の5枚（すべて1093×614）。全5枚を目視確認し、短い要点、200%の折返し、開閉の見出しと固定操作行、日時付きAI hoverを確認した。更新指定なしの比較結果は後記する。
+
+- `tests/snapshots/previous_run_notice_small_light.png`（43,408 bytes）
+- `tests/snapshots/previous_run_notice_small_200_dark.png`（115,944 bytes）
+- `tests/snapshots/previous_run_notice_checkpoint_small_light.png`（247,255 bytes、詳細を展開）
+- `tests/snapshots/previous_run_notice_observations_small_light.png`（55,585 bytes、詳細を畳む）
+- `tests/snapshots/ai_failure_feedback_hover_small_light.png`（67,797 bytes）
+
+更新指定なしの`cargo test --test ui_snapshot`は214件成功後、変更していない`fullscreen_specified_scale_live_popup_snapshots`だけが15分を超えても完了しなかった。失敗assertionやdiff画像は出ていない。実行中のexeが当worktreeのtest executableであることと開始時刻を確認し、そのプロセスだけを停止した（終了値-1）。この中断を製品テスト失敗とは分類せず、今回差分・並行負荷・環境のいずれが原因かも断定しない。ログは`target/ai-crash-presentation-ui-compare.log`。
+
+ソース・期待画像を変えず、`UPDATE_SNAPSHOTS`を外した`cargo test --test ui_snapshot -- --test-threads=1`では**215成功・0失敗、189.55秒、exit 0**。先ほど未完了だったケースも成功した。`target/ai-crash-presentation-ui-serial-compare.log`。`cargo fmt --check`と`git diff --check`も成功。通常比較によるPNGの追加変更はなく、変更画像は上記5枚だけ。
+
+以上はサンドボックス内の自動検証であり、本体lib全件・外側での同一検査・実機確認は設計担当の範囲として未実施。確認用ビルドも前回の分担どおり設計担当へ引き継ぐ。製品起動・commit・追加の独立レビューは行っていない。
