@@ -99,11 +99,12 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.488 一覧へ戻ると保存した位置から上へ動く — 5ch >>661／コレクション帰還 (2026-10-30)
 
-- 状態: **実装済み・実機未確認（v4.11.0予定）**。ツリー等で長い一覧→短い一覧→元の一覧と移動した場合や、コレクションの本から戻った場合の共通修正。出荷・統合の判断は設計担当の検収と残るリリースgate後に行う。
+- 状態: **実装済み・master取り込み済み（`d8c13925a`、v4.11.0予定）**。ツリー等で長い一覧→短い一覧→元の一覧と移動した場合や、コレクションの本から戻った場合の共通修正。出荷・統合の判断は設計担当の検収と残るリリースgate後に行う。
 - 原因: 保存位置と選択は正しく復元されるが、同じegui ScrollAreaに残る旧一覧のmaxでphysicsが復元位置をoverscrollと判定し、上へ押し戻す。詳細／サムネイル共通。非同期の復元が最初の描画より早く終わる場合に決定的に再現する。
 - 修正: canonical位置・一回要求・未消費RowAnchor・描画geometryをcontextのscroll ownerへ集約。現在extentと明示更新の意味をphysics前、描画のviewport／originをその後の位置で確定するopt-in契約を両rendererへ接続した。可視一覧と入力の寿命を分け、旧一覧の慣性・capture・touch commandを引き継がず、同一覧の正当な操作とcontextのmove／swapを保つ。遅延や毎frameの強制復元は使わない。
 - **あわせて直した既存の不具合**: 詳細表示の再読み込み・自動再走査・resumeで、保存する行位置が以前のサムネイル列数を使い、選択行の画面内位置がずれる。実列数1・行高・body viewportを同じownerへ記録して保存／復元／revealで共有した。
 - 自動検証: 実装レビューのP2四件と再レビューのmouse click誤抑止を再修正。元の4再現、R1〜R4、Collection **20件すべて成功**。最新の本体全件 **15,006件成功・66件除外**、UI snapshot214件成功・PNG差分なし、test-script check成功、audit違反0。今回vendorは無変更（前回egui165件成功）。同frameのtouch／mouse click混在は設計担当判断で§1.487へ含め、抑止しない許容挙動も回帰で確認した。独立再レビュー待ち。共通workspace full gateはrelease内包exe3点未配置で未完了。出荷前に整った環境で完走する。[最新の再修正台帳](scroll-661-investigation.md#implementation-review-mixed-release)を参照。
+- 取り込み後 (2026-10-30): 独立再レビューACCEPT (P3は文書で対応)。master で `test-full` 16,453件成功。ClaudeCode が隔離data-dirの dev-runtime ビルドを画面操作して確認 (Windows 11、マウス・キーボードのみ): ツリーでZIP 200冊→100冊→200冊の往復をサムネイル3回・詳細2回、本を開いてBS/ビューア→Escで戻る経路、コレクション (200冊) で末尾と途中位置から本を開いて戻る経路で、いずれも保存位置と選択が保たれた。修正前の版との同条件の比較は行っていない (自然な完了順では修正前も保持する場合がある)。タッチ・報告者環境は未確認。
 - 別件: touchとmouseを同時に使う旧第二指のsynthetic Move誤採用は基点からの既存不具合として§1.487へ分離し、理由付きignoreで保持した。新契約では同frameの描画にも出る差がある。Windows実機・報告者環境の製品確認は未実施。
 - 根拠: [>>661調査・設計・実装記録](scroll-661-investigation.md)、[Collection帰還の調査](collection-return-investigation.md)。DB/schema変更なし。F12／兄弟contextの所有境界は[detached §11](detached-rework-plan.md#11-リワーク外からの変更記録)に記録。規模: Medium。
 
@@ -126,8 +127,9 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.473 閲覧履歴から開いたフォルダで親へ移動すると内部キャッシュへ入る — 5ch >>643・>>656 (2026-10-29)
 
-- 状態: **実装済み・実機未確認 (2026-10-30、対象 v4.11.0 予定)**。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、「履歴フォルダ」からフォルダを開いた後、親へ移動すると `mImageViewer_portable\data\cache` へ移ると報告。開発側では「本→親で閲覧履歴へ正常復帰→さらに親で実data_dir、cache選択→Enterで実cache」を再現した。報告者が同じ追加操作をしたかと、実アプリでの確認は未確認。
+- 状態: **実装済み・master取り込み済み (`186a85557`、対象 v4.11.0 予定)**。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、「履歴フォルダ」からフォルダを開いた後、親へ移動すると `mImageViewer_portable\data\cache` へ移ると報告。開発側では「本→親で閲覧履歴へ正常復帰→さらに親で実data_dir、cache選択→Enterで実cache」を再現した。報告者が同じ追加操作をしたかと、実アプリでの確認は未確認。
 - 実装・検証: typed root/完全な帰路、親受付の共通化、Tagの漏れを修正。最終全libraryは**14,965成功・失敗0・既存skip65**、うち§1.473は**53件全成功**（元の赤2件を含む）。core/feature付きlib-tests check、fmt、glyph、context audit（違反0）も成功し、独立実装レビューACCEPT。通常/portable相当の一時data_dirで検証し、製品起動・コミットは行っていない。生ログ・補完した同型経路は[調査記録](history-parent-1473-investigation.md)末尾を参照。
+- 取り込み後 (2026-10-30): master で `test-full` 16,453件成功。ClaudeCode が隔離data-dirの dev-runtime ビルドを画面操作して確認: 空の閲覧履歴rootで親→入口の zip-200 (位置・選択も保持)、zip-100 から閲覧履歴に入り履歴の本を開く→BSでroot→親で入口の zip-100 へ戻った (data_dir・本の物理親へは行かない)。報告者の環境は未確認。
 - 再開判断 (2026-10-30): Snapshot全体の所有を作り直す課題は§1.486へ分離。完全な固定一覧再採用の既存経路がないため、既存dismissで固定を終えて入口payloadのcanonical originへ戻す案を採った。固定の部分復帰や新field/逆算は追加せず、同pathのH1/H2と解除後取消も自動検証済み。固定中の親ボタンdisabledは維持し、許可されるBS/Alt+↑/mouse/ringを同じ退出へ通す。
 - 実装停止時の記録 (2026-10-30、WIP `7916a1e97`保存前): 承認設計 `cae94fb27` とmarker不在時Directの補足に沿う途中差分で、45件中44成功・Snapshot1失敗を確認した。Snapshot canonical originが共有TopLevelGridViewにしかなく、H採用で破棄され、list復帰もsurface/来歴/routeを再採用しないため停止。設計担当の限定解除方針を受領して再開し、現在は上記検証を完了した。Snapshot本体の所有問題は§1.486に残す。
 - 回答済みの条件 ([>>656](https://egg.5ch.io/test/read.cgi/software/1782419551/656)): 入口は**閲覧履歴**。主にマウスのサイドボタンへ割り当てて使い、ファイルメニューから閲覧履歴を開いても同じ。フォルダバーの「履歴▼」から開く場合は起きない。入口は再質問しない。
