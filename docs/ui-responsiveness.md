@@ -168,6 +168,8 @@ process memory の毎フレーム sample は追加していない（page-fault �
 
 ## 2. 非同期 I/O の実装テンプレ
 
+§1.482段Dの即時AI失敗通知は既存の結果poll内で現役jobを検証し、固定分類・数値だけから短い本文を一度作る。UIで詳細ログの読取り、ORT/DXGI照会、保存、worker待機を行わない。hover表示と明示コピーは既存toastのactionで処理し、新しいmodal、監視thread、再試行や周期起床を追加しない。
+
 ### FTS 起動整理と失敗表示 (§1.367)
 
 metadata manager worker の所有範囲 cleanup/Failed reconciliation は supervisor spawn 前に行うが、

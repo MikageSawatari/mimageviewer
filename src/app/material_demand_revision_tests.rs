@@ -163,6 +163,7 @@ fn material_demand_revision_existing_ai_outcomes_do_not_hydrate_input() {
                 app.final_ai_pending.insert(
                     key,
                     FinalAiPending {
+                        feedback_request: crate::app::FinalAiFeedbackRequest::default(),
                         job_id: 9001,
                         cancel: Arc::new(AtomicBool::new(true)),
                         retained_key: None,

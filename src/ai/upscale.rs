@@ -231,8 +231,8 @@ fn detect_scale_factor(
 
     let test_size = model_tile_size(model_kind, effective_backend) as usize;
     let dummy = ndarray::Array4::<f32>::zeros((1, 3, test_size, test_size));
-    let tensor =
-        ort::value::Tensor::from_array(dummy).map_err(|e| AiError::Ort(format!("Tensor: {e}")))?;
+    let tensor = ort::value::Tensor::from_array(dummy)
+        .map_err(|e| AiError::ort_status(&e, format!("Tensor: {e}")))?;
 
     let scale = runtime.with_session(model_kind, |session| {
         // Scale detection always uses the local session, even when the image's
@@ -251,10 +251,10 @@ fn detect_scale_factor(
         });
         let outputs = session
             .run(ort::inputs![tensor])
-            .map_err(|e| AiError::Ort(format!("detect_scale run: {e}")))?;
+            .map_err(|e| AiError::ort_status(&e, format!("detect_scale run: {e}")))?;
         let (shape, _) = outputs[0]
             .try_extract_tensor::<f32>()
-            .map_err(|e| AiError::Ort(format!("detect_scale extract: {e}")))?;
+            .map_err(|e| AiError::ort_status(&e, format!("detect_scale extract: {e}")))?;
 
         let dims: Vec<i64> = shape.iter().copied().collect();
         if dims.len() >= 4 {
@@ -927,7 +927,7 @@ fn run_tile_inference(
         // ローカル DirectML 経路 (既存)
         let t0 = std::time::Instant::now();
         let input_tensor = ort::value::Tensor::from_array(input)
-            .map_err(|e| AiError::Ort(format!("Tensor: {e}")))?;
+            .map_err(|e| AiError::ort_status(&e, format!("Tensor: {e}")))?;
         let tensor_build_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         runtime.with_session(model_kind, |session| {
@@ -936,13 +936,13 @@ fn run_tile_inference(
             let t_run = std::time::Instant::now();
             let outputs = session
                 .run(ort::inputs![input_tensor])
-                .map_err(|e| AiError::Ort(format!("run ({model_kind:?}): {e}")))?;
+                .map_err(|e| AiError::ort_status(&e, format!("run ({model_kind:?}): {e}")))?;
             let session_run_ms = t_run.elapsed().as_secs_f64() * 1000.0;
 
             let t_extract = std::time::Instant::now();
             let (shape, raw) = outputs[0]
                 .try_extract_tensor::<f32>()
-                .map_err(|e| AiError::Ort(format!("extract ({model_kind:?}): {e}")))?;
+                .map_err(|e| AiError::ort_status(&e, format!("extract ({model_kind:?}): {e}")))?;
             let tensor_extract_ms = t_extract.elapsed().as_secs_f64() * 1000.0;
 
             let dims: Vec<i64> = shape.iter().copied().collect();

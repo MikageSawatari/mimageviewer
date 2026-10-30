@@ -169,6 +169,7 @@ mod tests {
 
     fn pending(job_id: u64, cancelled: bool) -> FinalAiPending {
         FinalAiPending {
+            feedback_request: crate::app::FinalAiFeedbackRequest::default(),
             job_id,
             cancel: Arc::new(AtomicBool::new(cancelled)),
             retained_key: None,

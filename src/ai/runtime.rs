@@ -655,23 +655,23 @@ impl AiRuntime {
         // constructor が確定した同じ環境を使う。後着の呼び出しは cached 参照取得だけ。
         let initialized = ensure_ort_initialized(self.backend.effective)?;
         let mut builder = Session::builder(&initialized.environment)
-            .map_err(|e| AiError::Ort(format!("Session::builder: {e}")))?;
+            .map_err(|e| AiError::ort_status(&e, format!("Session::builder: {e}")))?;
 
         builder = builder
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-            .map_err(|e| AiError::Ort(format!("optimization_level: {e}")))?;
+            .map_err(|e| AiError::ort_status(&e, format!("optimization_level: {e}")))?;
 
         builder = builder
             .with_intra_threads(4)
-            .map_err(|e| AiError::Ort(format!("intra_threads: {e}")))?;
+            .map_err(|e| AiError::ort_status(&e, format!("intra_threads: {e}")))?;
 
         if !force_cpu {
             builder = self.register_eps(builder, kind);
         }
 
-        let session = builder
-            .commit_from_file(model_path)
-            .map_err(|e| AiError::Ort(format!("Failed to load {}: {e}", model_path.display())))?;
+        let session = builder.commit_from_file(model_path).map_err(|e| {
+            AiError::ort_status(&e, format!("Failed to load {}: {e}", model_path.display()))
+        })?;
 
         crate::logger::log(format!("[AI] Model {:?} loaded successfully", kind));
         sessions.insert(kind, session);

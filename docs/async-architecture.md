@@ -1,12 +1,14 @@
 # 非同期・並列アーキテクチャ
 
-## 前回終了の単一 writer（§1.482 段A〜C）
+## 前回終了の単一 writerと現役AI失敗の通知（§1.482 段A〜D）
 
 `previous_run_diagnostics::GuiRunDiagnostics` は first admission 後に専用 worker を開始し、前回資料を読む→今回 Running を保存→main の終端を保存、の順序を所有する。AI等の実活動中だけ約1秒を目標にcheckpointを保存し、idleは周期起床なしでparkする。UI/App Drop では clean にせず、main 最終境界で共通2秒deadlineの残りだけを使う。結果と通知本文を返した `finish_run_native` の後、main が共通ログ・診断終端の保存を済ませてから native MessageBox を出す。初期化中の終了要求も同じ writer が直列化し、無期限 join/再試行/AI 完了待ちは追加しない。診断 lease の保有中は別 writer が資料を上書きしない。詳細は [確定設計](ai-crash-655-investigation.md#確定設計-2026-10-30)。
 
 段Cでは、このworkerが前回identityに相関するnative例外をrotationより先に確保し、今回のpanic/native sinkを事前openする。panic hookの前段は固定buffer・単発raw書込み・再入skip・上限付きの別sinkで固定分類だけを残す。既存詳細ログには元本文を保持する。root device生成直後のcallbackは、そのdevice専用の理由atomicへ最初の異常をCASするだけであり、I/O・clock・wake・lock・wgpu再入を行わない。workerが活動中の採取時、既存root maintenanceからの起床時、終端時にlatchを読み、worker観測時刻を付けて別の上限付きファイルへ一度だけ保存する。即死して読む前なら記録できず、常駐監視や回復処理は追加しない。first-chance/捕捉panicも観測されるため、clean記録を覆したり終了原因と断定したりしない。
 
 panic sinkの公開前に、今回のRunningとcurrent参照を保存する。公開後から初期化完了までのpanicも次回の参照から読める。checkpointとpanicは同じ初期QPC ticks/frequencyを保持し、準備時の時計対応付けや採取間の遅延加算を行わない。新しい同期I/O・gate待機・再試行をUIへ追加しない（初期化gateは限定libtest子processだけ）。
+
+段Dは既存final AIの結果採用境界だけに通知を追加する。enqueue時のDisplay/Prefetch用途と寸法をpendingが保持し、remove/Dropより前にjob ID・取消・現在のページ/世代/item/keyを確認する。有効なDisplay Failedの失敗key初回登録だけが所有contextのError feedbackを出す。retained orphan/先読み/別contextへの配送・既存の失敗key寿命・cancel/再試行方針は維持する。自由文は詳細ログのみに保持し、固定分類/既知の数値statusから作った本文をhoverと明示コピーへ渡す。actionに不変context IDを付けて別contextでの描画/コピーを防ぎ、新しいmodal、I/O、worker待ちや終了印への書込みは追加しない。
 
 ## 本の列生成の共通境界（§1.242 G1）
 

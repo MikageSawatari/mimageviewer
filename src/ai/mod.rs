@@ -11,6 +11,7 @@
 pub mod classify;
 pub mod denoise;
 pub(crate) mod diagnostic_observation;
+pub(crate) mod failure;
 pub mod final_pipeline;
 pub mod model_manager;
 pub mod runtime;
@@ -82,6 +83,8 @@ impl AiBackend {
 pub enum AiError {
     /// ONNX Runtime エラー
     Ort(String),
+    /// Preserve a typed ORT status before detailed formatting discards its code.
+    OrtStatus { code: i32, detail: String },
     /// モデルファイルが見つからない
     ModelNotFound(ModelKind),
     /// 画像処理エラー
@@ -96,6 +99,7 @@ impl fmt::Display for AiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AiError::Ort(e) => write!(f, "ONNX Runtime error: {e}"),
+            AiError::OrtStatus { detail, .. } => write!(f, "ONNX Runtime error: {detail}"),
             AiError::ModelNotFound(k) => write!(f, "Model not found: {k:?}"),
             AiError::ImageProcessing(e) => write!(f, "Image processing error: {e}"),
             AiError::Io(e) => write!(f, "IO error: {e}"),
@@ -107,6 +111,16 @@ impl fmt::Display for AiError {
 impl From<std::io::Error> for AiError {
     fn from(e: std::io::Error) -> Self {
         AiError::Io(e)
+    }
+}
+
+impl AiError {
+    pub(crate) fn ort_status<R>(error: &ort::Error<R>, detail: String) -> Self {
+        let code: ort::sys::OrtErrorCode = error.code().into();
+        Self::OrtStatus {
+            code: code as i32,
+            detail,
+        }
     }
 }
 

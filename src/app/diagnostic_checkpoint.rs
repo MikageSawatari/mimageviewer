@@ -187,6 +187,7 @@ mod tests {
         app.final_ai_pending.insert(
             key,
             FinalAiPending {
+                feedback_request: crate::app::FinalAiFeedbackRequest::default(),
                 job_id: 7,
                 cancel,
                 retained_key: None,

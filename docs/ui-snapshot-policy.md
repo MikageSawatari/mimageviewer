@@ -220,6 +220,12 @@ copying_small_light,result_small_dark}` の代表4枚を保持する。製品と
 代表4枚は合計388,195 bytes（約0.37 MiB）。生成後に全4枚を目視確認した。
 App、変換worker、製品起動、実IME入力はこの純描画検査に含めない。
 
+§1.482段Dは`ai_failure_feedback_hover_small_light`の1枚（1093×614、57,181 bytes）で、
+本体と同じtoast actionのhover詳細を確認する。固定分類・status番号・job/context/ページ/寸法だけの本文で、
+hoverと明示クリックのコピーが同一であること、hoverだけではコピーしないこと、100%/200%の通知矩形が
+画面内に収まることをheadless回帰で別に検査する。新しいdialogやviewportを作らず、既存の暗色tooltip helperを使う。
+PNGは生成後に目視確認済み。実ORT/GPU障害や製品起動の証拠とは区別する。
+
 ## ディレクトリ構成
 
 §1.341の両端配置は環境設定`preferences_singleton_spread_placement_setting*`と本別HUDの

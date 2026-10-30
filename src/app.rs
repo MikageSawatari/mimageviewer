@@ -1,7 +1,9 @@
+mod ai_failure_feedback;
 mod diagnostic_checkpoint;
 use crate::previous_run_diagnostics::checkpoint::{
     ActivityLease, CheckpointPublisher, JobLease, JobMetadata, JobStage, JobUpdate,
 };
+pub(crate) use ai_failure_feedback::FinalAiFeedbackRequest;
 mod previous_run_notice;
 mod reading_history_origin;
 use reading_history_origin::MainListRestoreDestination;
@@ -11027,6 +11029,7 @@ impl FsPageLoadState {
 const MAX_RETAINED_FINAL_AI_ORPHAN_JOBS: usize = 1;
 
 pub(crate) struct FinalAiPending {
+    pub(crate) feedback_request: FinalAiFeedbackRequest,
     pub(crate) job_id: u64,
     pub(crate) cancel: Arc<AtomicBool>,
     pub(crate) retained_key: Option<RetainedFinalAiKey>,
@@ -11064,7 +11067,7 @@ pub(crate) enum FinalAiResult {
         diagnostic: Option<JobLease>,
         job_id: u64,
         key: FinalAiKey,
-        error: String,
+        error: crate::ai::failure::FinalAiFailure,
     },
 }
 
@@ -18796,9 +18799,8 @@ pub struct App {
     pub(crate) fs_feedback_toast: Option<(String, std::time::Instant, f32)>,
     #[cfg(test)]
     pub(crate) feedback_toasts_for_test: Vec<(String, crate::feedback::FeedbackKind)>,
-    /// フィードバックトーストをクリックしたときに Explorer で選択表示する対象。
-    /// 通常トーストでは None。キャプチャ保存成功時だけ Some にする。
-    pub(crate) fs_feedback_toast_reveal_path: Option<PathBuf>,
+    /// Mutually exclusive saved-file reveal or allowlisted diagnostic copy.
+    pub(crate) fs_feedback_toast_action: Option<crate::feedback::FeedbackAction>,
     /// 現在のトーストを描画する面。`Some` なら該当面の `draw_feedback_toast`
     /// だけが描く (detached 窓とグリッドの二重表示防止)。`None` は発火面不明の
     /// 従来トーストで、従来どおり全面に描く。
@@ -21711,7 +21713,7 @@ impl App {
             fs_feedback_toast: None,
             #[cfg(test)]
             feedback_toasts_for_test: Vec::new(),
-            fs_feedback_toast_reveal_path: None,
+            fs_feedback_toast_action: None,
             fs_feedback_toast_surface: None,
             stamp_embed_pending: None,
             cursor_last_activity: None,
@@ -88017,6 +88019,10 @@ impl App {
         self.final_ai_pending.insert(
             key,
             FinalAiPending {
+                feedback_request: FinalAiFeedbackRequest {
+                    priority,
+                    source: source_image.size,
+                },
                 job_id,
                 cancel: Arc::clone(&cancel),
                 retained_key: retained_key.clone(),
@@ -90064,6 +90070,9 @@ impl App {
                 }
                 continue;
             }
+            let failure_feedback = matches!(&result, FinalAiResult::Failed { .. })
+                .then(|| self.final_ai_failure_feedback_request(key, job_id))
+                .flatten();
             if live_pending {
                 self.final_ai_pending.remove(&key);
             }
@@ -90165,7 +90174,10 @@ impl App {
                 } => {
                     diagnostic_stage(&result_diagnostic, JobStage::Failed);
                     if live_pending {
-                        self.final_ai_failed.insert(key);
+                        let first_failure = self.final_ai_failed.insert(key);
+                        if first_failure && let Some(request) = failure_feedback {
+                            self.notify_final_ai_failure(key, job_id, request, error.diagnostic());
+                        }
                         crate::logger::log(format!(
                             "[AI] Final AI failed idx={} job_id={job_id} error={error}",
                             key.edit_key.idx
@@ -90962,13 +90974,13 @@ impl App {
             }
         }
         self.fs_feedback_toast = Some((text, std::time::Instant::now(), resolved.seconds));
-        self.fs_feedback_toast_reveal_path = None;
+        self.fs_feedback_toast_action = None;
         self.fs_feedback_toast_surface = surface;
     }
 
     pub(crate) fn clear_fullscreen_feedback_for_viewer_switch(&mut self) {
         self.fs_feedback_toast = None;
-        self.fs_feedback_toast_reveal_path = None;
+        self.fs_feedback_toast_action = None;
         self.fs_feedback_toast_surface = None;
         self.fs_boundary_hint = None;
     }
@@ -91053,7 +91065,7 @@ impl App {
             .unwrap_or("capture")
             .to_string();
         self.show_saved_output_feedback(format!("保存しました: {name}"));
-        self.fs_feedback_toast_reveal_path = Some(path);
+        self.fs_feedback_toast_action = Some(crate::feedback::FeedbackAction::RevealPath(path));
         self.fs_feedback_toast_surface = None;
     }
 

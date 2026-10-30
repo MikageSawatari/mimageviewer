@@ -1,8 +1,8 @@
 # アーキテクチャ概観
 
-## 前回 GUI 終了の診断（§1.482 段A）
+## 前回 GUI 終了の診断と現役AI失敗の通知（§1.482 段A〜D）
 
-`previous_run_diagnostics` は main 所有の終了状態と専用 writer を持ち、通常 GUI の first admission 後だけ開始する。`GuiRunSession` は single-instance guard を最終保存まで保持する。前回資料の読取り・置換保存・保持整理は worker、UI は不変な許可項目本文を非blockingで受け取る。`ui_previous_run_notice` は本文の表示と明示コピーだけを担当する。通常/startup ログと終了状態の保存後に、必要な制御エラーの native 通知を行う。設定 DB への項目追加はない。採取・保存範囲と制約は [設計](ai-crash-655-investigation.md#確定設計-2026-10-30) を参照。AI/GPU checkpoint・fatal 観測・ORT feedback は後続段で、段Aには含まない。
+`previous_run_diagnostics` は main 所有の終了状態と専用 writer を持ち、通常 GUI の first admission 後だけ開始する。`GuiRunSession` は single-instance guard を最終保存まで保持する。前回資料の読取り・活動中のAI/GPU checkpoint・置換保存・保持整理はworker、UIは不変な許可項目本文を非blockingで受け取る。panicの小sinkは今回参照の保存後に公開し、nativeはrun相関、device-lostは専用atomic latchからworkerで記録する。`ui_previous_run_notice`は本文の表示と明示コピーを担当する。現役DisplayのORT Failedは既存の結果採用/失敗key寿命で一度だけ所有contextへError feedbackを出し、固定分類と数値だけの詳細をhover・明示コピーへ渡す。通常/startupログと終了状態の保存後に、必要な制御エラーのnative通知を行う。設定DBへの項目追加・回復処理はない。採取・保存範囲と制約は [設計](ai-crash-655-investigation.md#確定設計-2026-10-30) を参照。
 
 ## 通常フォルダ一覧の表示順ナビゲーション (§1.444)
 

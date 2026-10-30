@@ -231,7 +231,9 @@ impl App {
                     .and_then(|n| n.to_str())
                     .unwrap_or("debug-pipeline");
                 self.show_saved_output_feedback(format!("デバッグ出力しました: {name}"));
-                self.fs_feedback_toast_reveal_path = Some(done.manifest_path);
+                self.fs_feedback_toast_action = Some(crate::feedback::FeedbackAction::RevealPath(
+                    done.manifest_path,
+                ));
                 self.fs_feedback_toast_surface = None;
             }
             Err(err) => {

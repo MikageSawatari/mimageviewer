@@ -5513,7 +5513,7 @@ impl ContainerEngine {
                             RemoteAiRunError::Failed("AI job was cancelled".to_owned())
                         }
                         crate::ai::final_pipeline::FinalAiExecutionError::Failed(error) => {
-                            RemoteAiRunError::Failed(error)
+                            RemoteAiRunError::Failed(error.to_string())
                         }
                     })?;
                     let pixels = Arc::new(output.image);

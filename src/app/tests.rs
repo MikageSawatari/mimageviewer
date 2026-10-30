@@ -58525,6 +58525,7 @@ mod pipeline_cache_refactor_tests {
     ) -> (FinalAiPending, Arc<std::sync::atomic::AtomicBool>) {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pending = FinalAiPending {
+            feedback_request: crate::app::FinalAiFeedbackRequest::default(),
             job_id,
             cancel: Arc::clone(&cancel),
             retained_key: None,
@@ -58668,7 +58669,7 @@ mod pipeline_cache_refactor_tests {
             diagnostic: None,
             job_id: 0,
             key: failed_key,
-            error: "boom".to_string(),
+            error: "boom".to_string().into(),
         })
         .unwrap();
 
@@ -58737,6 +58738,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_pending.insert(
             key,
             FinalAiPending {
+                feedback_request: crate::app::FinalAiFeedbackRequest::default(),
                 job_id: 44,
                 cancel: Arc::clone(&cancel),
                 retained_key: Some(retained_key),
@@ -76125,7 +76127,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             std::time::Instant::now(),
             5.0,
         ));
-        app.fs_feedback_toast_reveal_path = Some(PathBuf::from(r"C:\pics\saved.jpg"));
+        app.fs_feedback_toast_action = Some(crate::feedback::FeedbackAction::RevealPath(
+            PathBuf::from(r"C:\pics\saved.jpg"),
+        ));
         app.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::NavNoOp {
             reason: crate::ui_fullscreen::FsNavNoOpReason::DetachedIndependent,
             at: std::time::Instant::now(),
@@ -76134,7 +76138,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(app.activate_detached_image_window_snapshot(&ctx, first_window_id));
 
         assert!(app.fs_feedback_toast.is_none());
-        assert!(app.fs_feedback_toast_reveal_path.is_none());
+        assert!(app.fs_feedback_toast_action.is_none());
         assert!(app.fs_boundary_hint.is_none());
     }
 
@@ -84081,6 +84085,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.final_ai_pending.insert(
                 key,
                 FinalAiPending {
+                    feedback_request: crate::app::FinalAiFeedbackRequest::default(),
                     job_id: 7,
                     cancel: Arc::clone(&cancel),
                     retained_key: None,
@@ -84291,6 +84296,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             bundle.final_ai_pending.insert(
                 key,
                 FinalAiPending {
+                    feedback_request: crate::app::FinalAiFeedbackRequest::default(),
                     job_id: 99,
                     cancel,
                     retained_key: None,

@@ -551,6 +551,8 @@ native の証拠があれば、例2へ「終了前に観測された例外（fir
 
 即時通知の詳細/コピーも許可項目から同じ本文を作り、既存 feedback から開ける診断詳細へ接続する。通知時間は既存 feedback ポリシーに従う。通常 Result の失敗を終了印にせず、device loss や native 例外の証明にも使わない。CPU fallback の追加や再試行は行わない。
 
+段Dでは、既存toastのhover詳細に報告用本文を表示し、クリックでその同じ本文を直接コピーする。新しいmodal/Window/再表示状態を増やさない簡素化を採用する。保存ファイルのrevealと診断コピーは既存action欄の単一enumで排他的に扱う。通知は既存の表示時間で消えるため、この操作は通知が表示されている間に行う。任意のエラー文を分類に使わず、`AiError`のvariantと取得済みのORT statusだけを渡し、codeが残っていない失敗はunknownとする。typed OOMはないので、messageにmemory/OOM等が含まれてもメモリ不足に分類しない。owner context IDをactionに保持し、別contextへ同じtoastを描画・コピーしない。
+
 ### 8. 実装段階と検証所有
 
 実装は後続の承認された依頼で開始する。各段は同じ設計 owner の範囲内で進め、担当実装者が focused 検証を所有し、独立 reviewer は同一 source/条件の成功証拠を再利用する。これは本追記で新たな実装・製品起動を許可するものではない。
@@ -776,3 +778,43 @@ backendはruntime/推論経路の選択値を記録・表示する。ORT内部�
 | `git diff --check` | 成功 |
 
 UI本文/schemaの変更はないため、今回のUI snapshot再生成・glyph検査は行っていない。全件/確認用buildは設計担当へ引き継ぐ。新しい製品の待機・再試行・回復処理、段D、製品起動、commit、追加独立レビューはない。
+
+### 16. 段Dの実装記録（2026-10-31、未コミット）
+
+設計担当から段C修正`d56c14c75`の独立再レビューACCEPT（指摘なし）、本体全件15,161成功・失敗0との報告を受け、段Dへ進んだ。これを段D差分の全件成功証拠へ転用しない。
+
+- **安全な失敗型**: `AiError::OrtStatus`で、ORT errorから取得済みのstatus enumを数値へ変換し、従来の詳細本文とは別に保持する。final pipelineの失敗は`FinalAiFailure`へ渡し、通知用の`FailureDiagnostic`には固定kindと任意の数値codeだけを出す。legacyの文字列エラーにcodeを推測して付けずunknownとする。memory/OOM/driver等の文字列からメモリ不足やdevice lossを判定しない。ローカル詳細ログのDisplayは元本文を保持し、Remote/書出しの既存文字列境界へは同じ詳細Displayを返す。処理順・既存のmodel選択/denoise後続処理・取消・再試行方針は維持する。
+- **現役jobの境界**: `FinalAiPending`がenqueue時のDisplay/Prefetch用途と入力寸法を一体で持つ。`poll_final_ai`でpendingをremoveする前（Dropがcancel tokenを立てる前）に、job ID・未取消・Display用途・現在ページ・item identity/世代/入力世代・現在のAI設定keyの一致を確認する。既存のretained orphan回収/別contextへのdeferは変更しない。現役に採用されたFailedを既存`final_ai_failed`へ初めてinsertしたときだけ、所有contextの`show_feedback_result_on(..., Viewer, Error)`へ接続する。失敗keyの既存clear/retain/evictの寿命で重複通知を抑止し、別の通知済み集合や再試行は足さない。
+- **詳細とコピーの簡素化**: 通知のhoverで報告本文を表示し、クリックでその同じ本文をコピーする。新しいdialog/modalの状態を足す案を採らず、既存toast actionを`RevealPath / Diagnostic`の単一enumへ一般化した。保存/キャプチャ/パイプライン資料のreveal動作と通知時間設定を維持する。診断actionは不変の所有context IDを持ち、別のmounted contextでは描画・クリックの対象にしない。viewport生成・detached述語・contextのmount/配送/所有構造は変更しない。診断本文は固定分類・数値code・context/job/世代/ページ番号/寸法からのみ構築し、パス・ZIP内名・検索語・任意エラー本文を流し込まない。表示前/hoverだけではコピーせず、既存期間の通知が見えている間の明示クリックだけでコピーする。
+- **保存/負荷**: 新しいI/O、DXGI/ORT照会、logger同期待ち、設定変更、device再作成・再推論・AI無効化・CPU fallbackは追加しない。通常ResultのFailedは終了印を書かず、fatal/device lossの証明にも使わない。通知用本文は短い許可項目だけで生成し、checkpointや既存詳細ログをUIで読み直さない。
+- **検証境界**: 同じhandlerへ合成Failedを渡し、有効key/job/contextで1回通知、prefetch/取消/世代/入力/設定/ページ/別item/古いjob/orphanでは通知なし、deferred結果は所有contextだけに通知することを検査する。パス・検索語・OOM/driver文を含む未分類payloadの安全分類、元詳細保持、hover/コピーの一致・明示操作・小画面100%/200%を確認する。実ORT/GPU障害や製品の起動は行わない。
+
+指定の検証結果は以下へ追記する。全件は設計担当が実行する。commit・追加独立レビュー・製品起動は行わない。
+
+段Dの検証（`MSBUILDDISABLENODEREUSE=1`）:
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt` | 成功 |
+| `cargo check -p mimageviewer --lib --tests --features test-script` | 最終sourceでexit 0、57.93秒。既存warningあり。`target/ai-crash-655-stage-d-check-final.log` |
+| `cargo test -p mimageviewer --lib ai_failure -- --nocapture` | 更新指定なしの最終比較で7成功・0失敗、1.81秒。新規handler/分類/コピー/hover回帰6件と既存の失敗時合成完了回帰を含む。`target/ai-crash-655-stage-d-ai_failure-final.log` |
+| `cargo test -p mimageviewer --lib notification_duration -- --nocapture` | 11成功・0失敗、0.75秒。保存先reveal/キャプチャ/資料保存のactionと面・native/eguiの通知時間を保持。`target/ai-crash-655-stage-d-notification_duration-final.log` |
+| `cargo test -p mimageviewer --lib final_ai -- --nocapture` | 27成功・0失敗、4.05秒。通常配送、prefetch、取消、retained orphan、context defer等。`target/ai-crash-655-stage-d-final_ai-final.log` |
+| `cargo test -p mimageviewer --lib final_pipeline -- --nocapture` | 1成功・0失敗、0.16秒。`target/ai-crash-655-stage-d-final_pipeline-final.log` |
+| 新規lib UI snapshot | `ai_failure_feedback_hover_small_light.png`を生成・目視確認し、更新指定なしの上記比較も成功。1093×614・100%の通知とhover本文の1枚、57,181 bytes。100%/200%の通知矩形と明示コピーは同じhandlerで検査 |
+| `python scripts/check_ui_glyphs.py` | 成功、危険glyph 0件 |
+| `python scripts/check_site_cards.py` | 成功、49枚・上限超過0件 |
+
+modelロード失敗の生本文は従来のloadログに残し、pipelineからRemote/書出しへ返す従来の`no usable AI model (load failed)`要約も維持した。新しいORT statusはこの要約と分離して通知用に保持する。Remoteの既存modal/barrier/推論/保存・書出しの挙動を変更しない。
+
+| 最終検査 | 結果 |
+| --- | --- |
+| `cargo test --test ui_snapshot` | 214成功・0失敗、コンパイル2分16秒・実行32.70秒。既存基準画像は変更なし。`target/ai-crash-655-stage-d-ui.log` |
+| `cargo run --locked -p viewer_context_audit` | exit 0。`target/ai-crash-655-stage-d-context-audit.log`（PowerShellのstderr表示にNativeCommandErrorの体裁が含まれるが、cargo/auditorの終了値は0） |
+| `cargo fmt --check` / 最終glyph検査 | exit 0、危険glyph 0件 |
+| `scripts/test-focused.ps1` | broad/shared/unmapped入力によりexit 2、選択実行0件。全件へ自動で進めず、上記の明示filterで補完 |
+| `git diff --check` | 成功 |
+
+backlog §1.482を「段A〜D実装済み・実機未確認、段D指定自動検証成功・未コミット・独立レビュー待ち」へ更新した。troubleshootingの`#ai-failure`に通知のhover/明示コピーと表示期間を追記し、既存の`#previous-exit`にも次回通知の確認/コピー操作があることを確認した。製品ページ/privacy・関連設計文書も同期更新した。
+
+段Dの本体全件・独立レビュー・確認用build/実機検証は設計担当へ引き継ぐ。実装担当では製品起動、実ORT/GPU障害の注入、commit、追加独立レビューを行っていない。
