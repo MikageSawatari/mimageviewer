@@ -303,3 +303,322 @@ GlobalSearchは外部索引を起動せず、空結果を製品の行producerで
 そのうえで、既存のtyped履歴計画で自己markerをどのように跨ぐか、forward履歴をどう維持するかを先に確定する必要がある。
 rootの入口を保持する場合も既存のtyped origin／session ownerを使い、独立の帰路フラグを追加しない。
 規模は暫定 **Medium**。単一ifの補充で完了するSmall変更としては扱わない。
+
+## 修正の設計
+
+2026-10-30、設計案。利用者判断により **v4.11.0予定の次版で修正する**。
+調査コミット `1e29e853d` を継承し、v4.10.0公開後のmasterを取り込んだ
+`eca8d7345` を設計のコード基準とする。この節は上記「小さな修正として実施しなかった理由と提案」を具体化する。
+**本作業は文書だけ。製品コード・テストは変更せず、ClaudeCodeの設計確認と別担当の
+GPT-6.1 Sol / xhighによる独立レビューを経てから実装する。今回の案に対するレビューは未実施。**
+
+### 1. 決定する動作と不変条件
+
+1. 合成一覧の親は、その一覧の論理的な所有者が決める。合成pathは表示・互換routing用であり、
+   物理的な親の根拠にしない。内部dataを通常の親として開かず、cache選択を後段で隠して済ませない。
+   利用者がアドレス等から実data_dirを明示的に開く操作を一般に禁止する設計でもない。
+2. **閲覧履歴rootの親は、その閲覧履歴へ入ったときの場所へ1操作で退出する。**
+   本からrootへ戻る操作とは別であり、本やその実子孫を往復しても入口を取り直さない。
+   本を開いた行・scrollの復元は既存の `ReadingHistoryEntrance::Return` の規則を維持する。
+3. **入口がないrootの親は `DriveList(None)` にする。** デスクトップは選ばない。
+   ドライブ一覧自身は既存どおり親なし。Bookmarksの「履歴があれば入口へ」、★一覧の
+   「保存元へ」という意味に揃え、入口なしの扱いは閲覧履歴設計§7.2で許容されているドライブ一覧に確定する。
+   他rootの入口なしno-op規則を変更して一律化はしない。
+4. 検索は既存どおり透明な一時overlayとする。検索中から場所を切り替えて閲覧履歴を開く場合、
+   退出先は検索が所有していたcanonicalな元の場所とする。終了済みquery/resultを新たに復活させない。
+   Snapshot等からの入場可否も既存のadmissionを維持する。
+5. タグの親は既存 `tag_view_back` が所有する。rootでは停止、子では検索内の帰路を1段戻り、
+   ZIP内部は既存ZIP親が先。マウス・リング・Padもキー・ボタンと同じ意味で実行する。
+6. 親の可否・行先・選択ヒントの算出は1つ。入力callerは可否を別のif列で推測せず、
+   readonly previewと実行は同じ解決結果を使う。previewは状態・履歴・選択を変更しない。
+7. 履歴cursor、場所、facet routeは既存 `MainListNavigation` の成功adoptionで一緒に確定する。
+   通常の履歴←/→の1件移動は変えない。root退出だけが入口までのまとまった履歴計画を作る。
+8. 元RAR/EPUB、読込cache ZIP/PDF、ZIP内部prefix、閲覧履歴への本の帰路、rootからの退出先を混同しない。
+   非rootのZIP内部移動をroot退出で飛ばさない。入力元やdata_dir配置で意味を変えない。
+9. main / A / Bの履歴、viewerの帰路、workerは既存の所有contextだけに作用する。
+   mainの一覧操作のために独立viewerの履歴・PDF要求・再生・textureを変更しない。
+
+### 2. 現在の違反箇所と、変える所有境界
+
+以下の行番号は `eca8d7345`。調査コミットとの差分を確認したところ、この親・履歴・openの関数群は変更されていない。
+
+| 所有者 / 境界 | 現状と修正責務 |
+| --- | --- |
+| `src/app.rs:24480` `grid_parent_nav_target` / `:24519` `resolve_grid_parent_nav` | 同じif列を二重に持ち、ReadingHistory rootを落として `effective_folder().parent()` へ進める。共有の親解決へ置換する |
+| `src/app.rs:57384` `handle_grid_parent_folder_action`、`:57330`付近のstack再構成中のキー入口、`src/ui_main.rs:15185–15270,15837` の親ボタン | 検索・ZIP・選択を各入口で実行する。入力可否と表示の条件は保持し、意味の解決・実行を共通化する |
+| `src/app/gamepad_input.rs:9688` `handle_gamepad_grid_back` | Tag分岐がない。分岐をコピーせず共有親受付への薄いadapterにする |
+| `src/app.rs:34500` `enter_reading_history_with_entrance` / `:34848` のroot install、`app/top_level_grid_view.rs` のReadingHistory surface/restore | rootに入口の意味がなく、`replace_surface` で汎用 `return_to` も消える。ReadingHistoryの型付きroot identityに退出情報を持たせる |
+| `src/app.rs:24331` `note_reading_history_container_open_path`、`GridVirtualOpenEffects`、`MainGridArchiveTransitionIntent` | 本への帰路が元コンテナpathだけ。既存帰路payloadを型へ置換し、どのrootへ戻るかも同じopen要求で運ぶ |
+| `src/app.rs:1259` `FolderHistoryPlan` / `:26305` `dispatch_main_folder_history_input` | 普通のBackは1件pop。root退出用の計画を同じownerに加え、自己markerを跨ぐ規則とforwardへの移動をここで所有する |
+| `src/app.rs:25304`付近 `adopt_main_list_navigation_with_completion` / `:26400`付近 `dispatch_folder_history_entry` | 既存の採用境界を再利用する。root退出のための別load、stackの先行pop、後からのrollbackを追加しない |
+
+原因は選択の先頭補正やconversionではなく、rootの親・入口を所有していないことと、入力ごとの意味の分散である。
+
+### 3. 閲覧履歴rootと本の帰路を既存の型へまとめる
+
+**既存のReadingHistory variantと帰路payloadを拡張・置換する。Appに入口用bool / Option / pendingを並設しない。**
+以下の型名は実装時の目安であり、責務と保持する内容を設計契約とする。
+
+- `ReadingHistoryRootRestore` は、今回の入場を表すvisit identityと、退出先を所有する。
+  visit identityは既存context ID・surface generation・slot-switch sequenceから入場時に作る値とし、
+  時刻やpath同値から推測しない。比較・履歴内の境界識別にだけ使い、新しいworkerや待機を作らない。
+- 退出先は排他的な `ReadingHistoryExit` とする。
+  `RecordedEntry(FolderNavHistoryEntry)`（通常の明示入場で入口をBackへ積んだ）、
+  `CanonicalOrigin(TopLevelGridOrigin)`（検索等からの切替で履歴cursorを進めず元場所を引き継いだ）、
+  `DriveList`（入口なし）の3種類。entry/routeを保持し、入口を単なるpathへ潰さない。
+- `TopLevelGridSurface::ReadingHistory`、`TopLevelGridRestore::ReadingHistory`、
+  `FolderNavHistoryTarget` の閲覧履歴地点はこのroot restoreを運ぶ。
+  履歴の `Path(__reading_history__)` をReadingHistoryの型付きvariantへ置換する。
+  `current_top_level_restore_snapshot` / `folder_nav_current_target` は可視rootのこの型を投影する。
+  退出先を汎用 `return_to` とroot payloadの二か所に同時保持しない。
+  `folder_nav_targets_eq` は閲覧履歴の同一visitを比較し、facet scope・表示address・favorite設定キーは
+  従来の論理rootのままとする。visit identityをDBキーや最近開いた実フォルダへ流さない。
+- 既存 `reading_history_return_from: Option<PathBuf>` は、元コンテナとroot restoreを対で持つ
+  `Option<ReadingHistoryBookReturn>` に置換する。`GridVirtualOpenEffects`、変換書庫intent、
+  physical adoption、viewer bundleも同じpayload型に揃える。既存の元path一致・ZIP root判定は維持する。
+  rootから本への要求を作った時点でroot restoreも捕捉し、cache変換後に現在の一覧から取り直さない。
+  `AddressBarNav::ReadingHistory` 等のReturn要求にもこのrootを含める。`Menu/Return` という目的の区別は
+  維持し、payloadを持たないReturnから現在地を入口として取り直す経路を残さない。
+- root位置の `SessionGridPosition` は既存 `TopLevelGridView` のcontext内所有を維持する。
+  退出情報へ選択・scroll・巨大なitems/検索datasetを複製しない。履歴entryにworkerやmutableなviewを入れない。
+
+入場・復帰・破棄の規則:
+
+| 遷移 | root / 帰路の扱い |
+| --- | --- |
+| ファイル/場所メニュー、mouse/ring/gesture/Padの「閲覧履歴」 | 同じMenu受付で、元表示を退役させる前に入口entryまたはcanonical originを捕捉。既存履歴抑止の決定と一緒に退出種別を確定し、root採用時にだけ公開する |
+| 既に同じrootにいるときの再度Menu、検索overlayのcanonical originが同じrootの場合 | 新しい「自分を入口にしたroot」を作らず、そのrootを引き継ぐ。Menuの位置を先頭へ戻す既存仕様は維持する |
+| rootからFolder/画像フォルダ本/ZIP/PDF/RAR/EPUBを開く | §1.480の `accept_grid_container_open` と既存virtual/archive producerで同じrootを帰路へ移す。Enter・ダブルクリックで差を作らない |
+| 本の実子孫/ZIP内部を移動、同じ本をreload | 既存の帰路有効範囲を維持。深いZIPではroot帰路を使わない。帰路を有効に保持する既存分岐ではpayload全体を保持し、元pathだけ復活させない |
+| 本から親、または既存Esc直帰 | `reading_history_back_nav` は保持したrootをReturn目的で返す。入口を本で上書きせず、既存root位置を復元する |
+| 履歴←/→でrootを復元 | 保存entryのroot restoreを復元。移動開始時の現在地を新しい入口にしない |
+| 起動指定/合成path互換入口等で、保持rootも元場所もない | `DriveList` 退出を持つrootを作る。pathの親を代替にしない。session内の型変更でありDB migrationを増やさない |
+| 独立した場所移動、別rootへの入場、取消/未採用、contextの退役 | 現在の帰路clear/要求drop境界でpayload全体を移譲または破棄する。独立移動で古いroot帰路を再使用しない。旧rootの履歴entryはそのentryのimmutable snapshotとして残る |
+
+`CanonicalOrigin` は既存の検索closeで使うoriginのmoveを使い、元画面を一度再構築してから履歴を開かない。
+実Folderの子へ開き直したとき等、現在の製品が `reading_history_return_from` をclearする条件は拡張しない。
+たとえばFolderの子から物理親へ戻っただけで、失効した閲覧履歴帰路を新たに復活させる変更はしない。
+rootへ復帰する場合の入口情報を保持することと、その復帰操作を新しく許すことは別である。
+型の再帰（他の一時ビューのoriginが閲覧履歴である場合）は必要なvariantをBox化する。
+root入場自身は同じrootを再利用するため自己参照を作らない。履歴内の複製はimmutableな場所snapshotであり、
+実行中要求のownerを共有しない。
+
+### 4. root退出、自己marker、forward履歴
+
+root ownerの `plan_root_exit` は、保持した退出情報と**現在の有効なmain/slotの履歴**から
+`FolderHistoryPlan` を作り、既存 `MainHistoryOperation::Replay` とtyped destinationのdispatcherへ渡す。
+通常の `advance(Back/Forward)` を全場所で「同じpathをskip」に変えない。
+
+`RecordedEntry` の場合:
+
+1. 現rootのvisitに属するBack内のroot markerを境界とする。同じ合成pathの別の入場を境界にしない。
+   本/実子孫の往復で境界より後ろに積まれたentryを、仮cursor上でBackした順に扱う。
+2. 仮currentと同じvisitのrootが直ちに現れる場合は自己markerとして消費し、rootを再loadしない。
+   この消費では仮currentのroot/routeを古いmarkerで上書きしない。Forwardへ残すのは現在表示中のrootである。
+   その後、保持した入口entryまでを1つの退出計画にする。子の履歴を見つけたところで止まらない。
+3. 普通のBack/Forwardで既に境界markerを消費してrootへ来ている場合は、Back末尾の入口entryを消費する。
+   その際もentryのlocationとrouteを扱い、別visitの同pathを探し回らない。
+4. 上限100件によって境界も入口entryも既に落ちていた場合は、残存する当該visit以後の履歴を
+   forward側へ移す計画とし、保持した入口へ退出する。prune済みの古いBack prefixや別slotの履歴を復活させない。
+   境界不在かつ末尾が入口でない場合のこの扱いも正常な長時間利用の契約としてテストする。
+
+`CanonicalOrigin` は、当該visitのmarker/子の履歴までを同じ計画で処理するが、入場時に積んでいない
+元場所のentryをBackからpopしない。canonicalなtyped originを既存復元経路へ渡す。
+`DriveList` も当該visitを処理してドライブ一覧を採用する。どちらも合成pathの親へは落ちない。
+これらの計画も、宛先のprepare/adoptionと同じ要求でcursorをcommitする。
+
+**forwardの規則は、自己markerを除き、途中を描画せず同じ回数のBackをした結果に揃える。**
+既存forwardをclearせず、その末尾へ仮currentを既存の重複整理規則で積む。
+連続する自己markerのための余分なrootを追加しない。実際に別の本や子を挟んだ複数回のroot訪問は残し、
+訪問自体や本の履歴を一括削除しない。出口へ移動した後の通常のForwardは1件ずつ戻す。
+
+表記はstackの右端が次にpopされる側。`H`は同一visit、`O`は入口、`B`は本、`C`は実子孫。
+
+| 操作前 `current / back / forward` | 親1回の採用後 | 続くForward |
+| --- | --- | --- |
+| Menu直後 `H / [X,O] / []` | `O / [X] / [H]` | `H` |
+| 本からReturn `H / [X,O,H] / []` | `O / [X] / [H]` | `H`。自己marker分の余計な1操作なし |
+| 普通のBackで本からroot `H / [X,O] / [B]` | `O / [X] / [B,H]` | `H`、次が `B`。既存forwardも保持 |
+| 計画単体の複数entry例 `H / [X,O,H,B,C] / []` | `O / [X] / [H,C,B,H]` | 入場root、`B`、`C`、最後のroot。途中の訪問を削除しない（実Folder子からReturnを新たに許す意味ではない） |
+| 起動直後 `H / [] / []` | `DriveList / [] / [H]` | 元の `H`。その親は再びDriveListで、data_dirには進まない |
+
+rootの位置・facet routeも同じadoptionで復元する。入口に戻るときに子名 `__reading_history__` を
+選択hintにせず、入口側の既存の保存選択/scrollを使う。
+rootへのForwardはReturn目的の位置復元とする。Menuで明示的に再入場した場合の先頭化は変えない。
+
+退出中に同じrootの親をもう一度受理した場合、既存の要求/provisional planを同じroot退出として扱い、
+同じsuffixを二重popしない。新しいpendingは作らず、同宛先要求の再利用/置換は既存navigation ownerに委ねる。
+明示的な履歴←/→は既存のprovisional cursorを進める規則を維持する。
+別navigation、slot切替、取消、入力禁止の扱いも既存の `MainListNavigation` の検証・退役に従う。
+宛先が存在しない等の既存の拒否では未採用計画を捨て、別の内部フォルダを代替で開かない。
+
+### 5. 親の解決を1つにする
+
+`app`内に純粋な `GridParentAction` の解決と、その実行を置く（必要なら小moduleへ抽出）。
+これは1入力分の値であり、Appへ保存する状態ではない。
+actionは `NoOp` / 検索ownerへ戻す / Tag ownerへ戻す / Rating ownerへ戻す / ZIP内Back /
+ReadingHistoryRootExit / 既存typed navigation等を排他的に表す。
+物理親actionには行先と子選択を一緒に含める。`None` が「該当ownerなし」と「そのownerのrootで停止」の
+両方を表して物理fallbackへ流れる構造をなくす。
+
+適用順は既存キーの意味を基準にする。Snapshotのlist復帰、検索（Global/Everything・Favorite・Tag）、
+Rating、ローカル絞り込み、ZIP内部、各typed root/帰路、最後に通常の物理親、という所有優先を1か所で決める。
+各owner内のZIP Backを二度呼ばない。Collection/Smartのroot停止やsourceからの復帰など、
+既存ownerが所有する境界を通常の物理親より先に終端させる。
+Snapshot rootの既存の範囲拒否・通知は維持し、全入力の無言no-opへの置換はしない。
+
+入口の具体的な扱い:
+
+- 通常キーの `GridParentFolder`（BS / Alt+↑ / カスタム割当）、一覧余白double-click/double-tap、
+  mouse button / ring / gesture / Pad B・割当操作、親ボタンクリックは同じ親action受付を使う。
+  `handle_gamepad_grid_back` は意味を持つif列を撤去する。新しいKeyActionや保存設定は増やさない。
+- ボタンのenabled/tooltip用previewも同じresolverを使う。検索rootのボタン無効、Snapshot中のボタン無効等の
+  既存表示制約は維持する。クリック後の `search_drill_up` と `zip_nav_back` の別実行列は共通実行へ移す。
+- stack再構成中の `handle_stack_refresh_keyboard` は既存allowlistを残し、許可された親だけ同じ受付へ通す。
+  再構成中の項目操作を追加で解禁しない。
+- `global_search_ui/everything.rs:574` の物理子孫からの親は、上位の検索受付へ再入すると再帰する。
+  Everything ownerがscopeを確認した後、共有resolverの**物理子の親**という下位操作へ委譲する形に分ける。
+  それを通常の入力入口として公開せず、結果rootへの帰路・datasetの保持を変更しない。
+- `resolve_close_return_navigation` / `resolve_return_to_parent_nav` は全画面closeのownerを維持する。
+  共有すべきReadingHistoryのtyped帰路だけを運び、全画面closeをgridの親入力へ丸ごと置換しない。
+
+入力可否、IME/text focus、modal、repeat、viewport入力所有、Snapshotのボタン表示制約はcaller側の契約を残す。
+また既存のdetached保護/closeは意味の解決と分けた既存presentation境界に残す。
+キー経路の `close_detached_viewer_for_virtual_page_list_parent_nav` 等を、共有化のためにそのまま
+mouse/ring全体へ広げない。逆にキーから削除もしない。input originが必要なら1入力のenumで渡し、
+それで行先やTag停止を選ばない。意味の共有と無関係な窓の寿命変更は今回の修正へ含めない。
+
+### 6. 同型経路と出荷済み挙動への影響
+
+| 一覧 / context | この設計での扱い |
+| --- | --- |
+| 閲覧履歴root（直後/本からReturn/履歴replay/入口なし） | 型付きroot ownerが入口またはDriveListへ退出。すべての親入力で同じ |
+| 閲覧履歴から開いた通常Folder・画像本・ZIP/PDF・RAR等・EPUB | 元コンテナとroot帰路を対で運ぶ。ZIP深層→root→履歴という順とEsc直帰、cacheの論理元を維持 |
+| 「履歴▼」、アドレス、ツリー、お気に入りから開いた実場所 | 閲覧履歴rootの帰路を新規付与しない。通常の実親と来た子の選択を維持 |
+| Tag root/子/ZIP内部 | 既存 `tag_view_back` へ一本化。root停止、子は1段、検索自体は閉じない |
+| Ctrl+G / Everything、Ctrl+S | 各検索ownerのroot停止/子戻り。Everythingの起点から結果への帰路と保持datasetはそのまま |
+| Bookmarks root/読込中/開いた本 | 履歴があれば戻り、なければno-op。専用本帰路を維持。今回のroot退出skipを流用して別仕様へ変えない |
+| ★一覧root/子/読込中 | `rating_view_parent_nav` とsaved origin/nav chainを維持。入力側が再実装しない |
+| DriveList、Collection root/子/Deleted、Smart root/scoped/container | 各ownerの停止・typed親・既存Deleted規則を維持。root不成立を物理pathの親へ読み替えない |
+| サブフォルダ展開、Snapshot、本棚 | 展開の保存元、固定一覧/範囲拒否、実本棚の物理親を維持 |
+| main normal / quick slot A / B | root退出は発行元slotの履歴だけ。別slotへ切替後の旧要求は既存検証で退役し、他slotをpopしない |
+| main内/linked全画面、独立F12/複数静止画窓、動画/ParkedLive、Remote | 一覧の親はmain owner、viewer close/物理移動は既存context owner。下記§7の境界を維持。Remoteの一覧/IPC/履歴へ新機能を足さない |
+
+意図して変わる出荷済みの結果は次の範囲に限る。
+
+1. 閲覧履歴rootで親を実行すると、内部dataではなく入口/DriveListへ移動する。
+   子往復後も1操作で入口へ退出し、rootの自己markerのための空振りを要求しない。
+2. Tag rootでmouse/ring/Padの親を実行しても内部dataへ移らない。Tag子でも既存キーの帰路に一致する。
+3. 閲覧履歴rootの親ボタンpreview/tooltipは入口への退出（またはDriveList）を示す。
+   合成pathの実親を表示せず、実行結果と一致させる。
+4. 閲覧履歴rootからの親退出に限り、§4のまとまったBack計画がforwardを作る。
+   通常の履歴←/→や他rootの履歴計画は変更しない。
+
+**通常利用を遅くする、操作を増やす、既存の一覧や本を開けなくする変更は採らない。**
+新しい確認dialog/モーダルや、変換中以外のナビゲーション停止は設けない。
+実装時の調査でこの範囲を超える挙動変更、検索結果そのものの復活、全画面/別窓の新しいclose、
+履歴entryの一括削除が必要と分かった場合は、実装を止めてClaudeCodeへ返す。
+現在の設計では、通常の使い方を不便にする変更を必要としない。
+
+### 7. F12・複数ウィンドウとdetached憲法
+
+`reading_history_return_from` の型置換は `src/app/viewer_context_registry.rs` の
+`ViewerContextBundle` の同field、構築・swap・fork/moveにも機械的に波及する。
+このため「detachedと無関係」とは扱わない。ただし入力対象、HWND、viewport、placement、
+park/promote/retireの判定を変更する設計ではない。
+
+- 独立の物理viewerは既存のFolder/DetachedPhysical scopeを持ち、mainのroot退出計画を実行しない。
+  `main_folder_history_available` の所有判定を維持する。履歴vectorsをbundleへ移さない。
+- root restoreはimmutableな帰路データとして既存帰路と一緒に移る。
+  clone/forkは既存の帰路継承契約を維持し、mainのmutable stack/退出要求を共有しない。
+  normal/A/Bを切り替えたり、独立窓を閉じたりしてもsiblingの帰路をconsumeしない。
+- 共通親の実行によってmainでrootを退出しても、別contextのPDF ticket・worker・cache epoch、
+  texture、動画再生を失効させない。既存のpresentation cleanupを他入力へ横展開しない。
+
+`docs/detached-rework-plan.md` §2を読んだうえで、これは**帰路の意味を型付きownerへ集約する構造修正**と位置付ける。
+BA-7に該当するApp側フラグの追加、時間窓、rect/HWND推測、再生成は行わない。
+実装前にClaudeCodeと独立レビューがこの構造修正という判断に合意し、実装で触れたbundle/共通入口の範囲と
+理由を同計画§11へ記録する。今回の文書作業では同計画や製品コードは変更しない。
+
+### 8. 簡素化の検討と採らない案
+
+| 案 | 判断 |
+| --- | --- |
+| 入口を所有せず、rootに `HistoryBack` を1つ足す / 末尾の同pathだけskip | 不採用。自己markerの問題だけでなく、履歴に記録しない検索からの入場のcanonical originや、入口なしを決められない。pathだけでは別visitの境界も区別できない |
+| rootの親を無効化/no-op | 不採用。入口へ戻る既存設計を削り、終了のために別操作を要求する |
+| すべての合成rootをDriveListへ送る | 不採用。Bookmarks/★/検索/Smart等の出荷済みの固有規則を失う |
+| data/cacheへの移動をpath guardで拒否、cacheを隠す、選択を変える | 不採用。間違った親を作る所有者を残し、明示的な実folder openにも影響する |
+| 入力入口ごとにReadingHistory/Tag分岐をコピー | 不採用。今回のTag漏れを再生産する。親actionの意味を1か所へ減らす |
+| Appにroot originや戻り待ちのfieldを追加し、既存path帰路と並存 | 不採用。open/Return/replay/取消で不一致になる組合せを増やす。既存variantと帰路payloadの型置換で1つにする |
+| 通常Back/Forward全体で同値地点をskip、Return時にstackを全整理 | 不採用。親以外の1件移動や、別visit・facet routeの履歴まで変える。root退出だけの計画に限定する |
+| 本を閉じるたびにrootを新規Menuとして作り直す | 不採用。入口を本に上書きし、既存の行/scroll復元も失う。Returnは同じrootを再構築する |
+| 閲覧履歴中/退出中の操作を新しいmodalで止めて組合せを除く | 不採用。通常の親操作・履歴入力を制限する。長い変換等は既存modalが既に所有し、今回の退出は既存navigation transactionで処理できる |
+
+採る簡素化は、**親の意味の決定点を1つ、root退出の履歴確定点を既存adoptionの1つに減らすこと**。
+原一覧を一度restoreしてから次のsurfaceを開く中間状態を作らず、既存のprepare/installで完成結果を採用する。
+新しいrollback、resume、待機、遅延、再試行、全interleavingを管理するownerを設計しない。
+まれな失敗は既定の割り切り（ログ＋通知［＋作り直し］）に従い、個別の回復設計は加えない。
+
+### 9. テスト計画と受入条件
+
+実装時の検証担当は実装者1名とし、独立レビューは有効な同一差分の実行証跡を再利用する。
+製品バイナリ起動・desktop操作はこの開発検証に含めない。全fixtureは一時data_dir・一時book_rootを使い、
+通常配置 `tmp/appdata/mimageviewer` とportable相当 `tmp/exe/data` の両方を保つ。
+
+1. 残した赤2件を通す。
+   `section1473_reading_history_root_parent_never_opens_internal_data` は従来60条件を残し、
+   内部pathに入らないだけでなく**入口libraryと保存選択への1操作復帰**までassertする。
+   修正後にcacheへEnterする旧観測部分は入口への期待に置き換え、誤移動を期待して通す形にはしない。
+   `section1473_other_synthetic_roots_parent_inventory` は110条件を維持し、Tagの4漏れをroot停止へ直す。
+2. 元の11成功を維持する。通常Folder・画像本・ZIP・PDF・warm/cold RAR・EPUB、ZIP内部、
+   「履歴▼」2回親の対照、raw HistoryBackが自己markerを1件消費する既存特性を含む。
+   型置換に伴うassert表現だけ直し、raw Backまで親退出の期待へ変えない。
+3. root退出のpure plan testを追加する。§4の全stack例、既存forwardあり、連続自己marker、別visitの同path、
+   同pathでrouteの異なる入口、自己markerと可視rootのrouteの差、複数回Menu、markerを履歴Back/Forwardで消費済み、100件truncation、
+   canonical origin入場、入口なしから本を往復した後、A/B/normalの分離を検査する。
+   target・両stack・routeの全文を比較し、markerだけでなく子履歴とforwardの保存も確かめる。
+4. 実処理で `origin → 閲覧履歴 → Folder → 実子孫 → 親でFolder` の後の帰路を検査する。
+   実Folderの子へ開き直して既存帰路が失効する条件は、物理親の既存結果を維持することをassertし、
+   その後は通常の履歴Backで保存rootへ復帰してから親でoriginへ退出する。失効した帰路を復活させない。
+   別の本を連続して開く場合、明示的に別場所から再Menu入場する場合、入口がBookmarks/★/Smart/
+   Collectionのroot・物理子/DriveListの場合も、正しいtyped入口へ戻ることを検査する。
+   検索/Tagから入った場合はcanonical originへ戻り、検索を勝手に再実行しないことを確認する。
+5. 入口routing testを補う。親ボタンの実headlessクリック、合成キーのBS/Alt+↑と変更済み割当、
+   mouse/ringに加えgesture・Pad B・stack再構成中の許可入口・余白double-clickを共有受付まで通す。
+   サムネイル/詳細で意味が同じこと、preview前後で状態不変・previewと実行の行先一致を検査する。
+   Tagはrootだけでなく実Folder子・ZIP内子から結果rootまでを全adapterで比較する。
+6. 既存のReadingHistory back/converted archive、§1.328位置復元、§1.480 Enter/double-click、
+   Global/Everything/Favorite検索、Rating/Collection/Smart、Snapshot、ZIP nestedの関連試験を回す。
+   変換成功・取消、未採用、同一root退出の連続入力、別navigation・slot切替による旧要求退役でも、
+   採用前にcommitted stackを変えず、負けた要求が入口を上書きしないことを検査する。
+7. viewer bundleのheadless mount/swap/fork/retire testで帰路payloadの移譲とsibling不変を検査する。
+   同じPDFを読む独立窓を模した別contextのticket/世代がmain親退出で失効しないこと、
+   linked/独立viewerの既存close条件が入力共通化で増減しないことを既存testと合わせて確認する。
+
+実装時の順序は、pure plan → `section1473` → 関連handler/owner試験 → gate。
+build/testでは必ず `MSBUILDDISABLENODEREUSE=1`。
+`.\scripts\test-focused.ps1` を実行し、広域変更等でexit 2なら `.\scripts\test-lib-full.ps1` へ進む。
+共有履歴型/入力ownerを変えるため最終は `.\scripts\test-full.ps1` の非対話gateも通す。
+`cargo fmt` / `cargo fmt --check` / `git diff --check` を行い、UI文言を変えた場合はglyph検査も行う。
+テストをignoreしたり、不変条件を弱めたりして緑にしない。製品修正後の確認用buildは既存方針に従うが、起動はしない。
+
+今回は設計だけなので、過去13件の11成功/既知不具合2失敗という証拠を保持し、新たな成功結果とは扱わない。
+実装受入時はこの2失敗を含め全対象greenであることが必要。実マウス/実キー・配布portableの既定data_dir・
+native HWND等の実機確認は別の了承済み検証枠に残し、headless結果を実機確認済みとは書かない。
+
+### 10. 規模・実装の区切り・レビュー論点
+
+**Medium（履歴型と帰路payloadの変更を含む）。** 製品は主に `app.rs`、`top_level_grid_view.rs`、
+`collection_grid.rs`、`gamepad_input.rs`、`ui_main.rs`、`global_search_ui/everything.rs`、
+`viewer_context_registry.rs` と帰路を作る/消す兄弟producer。単純な2か所のif補充にはしない。
+製品差分は概算400〜800行、テスト追加/更新は概算300〜600行、実装・自動検証・指摘修正を合わせ
+3〜5開発日を目安とする（cold build待ち・実機確認・公開作業を除く）。詳細型の採用後に再見積もりする。
+
+実装は、(a) typed root/帰路と退出計画、(b) 親受付の集約とTag修正、(c) 同型監査・回帰・関連文書更新、
+の順で一つの機能として仕上げる。途中で旧帰路と新帰路を並存させた製品を出荷しない。
+実装完了時に `reading-history-plan.md`、`top-level-grid-view.md`、`keymap-spec.md`、
+§1.473と必要なdetached§11を更新する。過去調査の失敗証跡は履歴として残す。コミットはClaudeCodeが行う。
+
+独立設計レビューでは、入口のtyped捕捉と検索透明性、visit境界/履歴truncation/forwardの表、
+通常Backとの分離、共有親の優先順とEverything再帰回避、入力ごとのpresentation契約、
+viewer/slotの所有分離を重点確認する。通常利用の不便化が見つかったら実装へ進まず、ClaudeCodeから利用者へ相談する。
