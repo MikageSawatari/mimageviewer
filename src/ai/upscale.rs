@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use super::runtime::AiRuntime;
 use super::{AiError, ModelKind};
+use crate::previous_run_diagnostics::checkpoint::{Dimensions, JobStage, JobUpdate};
 
 /// ModelKind ごとのスケール倍率キャッシュ。
 /// 同一モデルの detect_scale_factor を毎回実行する無駄を省く。
@@ -234,6 +235,20 @@ fn detect_scale_factor(
         ort::value::Tensor::from_array(dummy).map_err(|e| AiError::Ort(format!("Tensor: {e}")))?;
 
     let scale = runtime.with_session(model_kind, |session| {
+        // Scale detection always uses the local session, even when the image's
+        // tile route is TensorRT. The routed backend above selects tile size.
+        super::diagnostic_observation::publish(JobUpdate {
+            stage: JobStage::ScaleDetect,
+            backend: Some(runtime.active_backend().effective.into()),
+            model: Some(model_kind.into()),
+            output: None,
+            tile: Some(Dimensions {
+                width: test_size as u32,
+                height: test_size as u32,
+            }),
+            tile_index: Some(1),
+            tile_total: Some(1),
+        });
         let outputs = session
             .run(ort::inputs![tensor])
             .map_err(|e| AiError::Ort(format!("detect_scale run: {e}")))?;
@@ -548,6 +563,23 @@ fn upscale_with_timings_impl(
                     tile_input,
                     crop_w,
                     crop_h,
+                    JobUpdate {
+                        stage: JobStage::TileRun,
+                        // Filled at the actual route/session execution below.
+                        backend: None,
+                        model: Some(model_kind.into()),
+                        output: Some(Dimensions {
+                            width: out_w,
+                            height: out_h,
+                        }),
+                        // extract_tile pads edge tiles to this actual Run shape.
+                        tile: Some(Dimensions {
+                            width: tile_size,
+                            height: tile_size,
+                        }),
+                        tile_index: u32::try_from(tile_idx + 1).ok(),
+                        tile_total: u32::try_from(tiles.len()).ok(),
+                    },
                 ) {
                     Ok(out) => out,
                     Err(e) => {
@@ -595,6 +627,20 @@ fn upscale_with_timings_impl(
             }
 
             // 全タイル送信完了 → blender の残作業を待つ (blend_wait_ms)
+            // Only the inference thread publishes; the concurrent blender does
+            // not inherit TLS or overwrite a tile Run that is still executing.
+            super::diagnostic_observation::publish(JobUpdate {
+                stage: JobStage::Blend,
+                backend: Some(effective_backend_for_route(runtime, &inference_route).into()),
+                model: Some(model_kind.into()),
+                output: Some(Dimensions {
+                    width: out_w,
+                    height: out_h,
+                }),
+                tile: None,
+                tile_index: u32::try_from(tiles.len()).ok(),
+                tile_total: u32::try_from(tiles.len()).ok(),
+            });
             let t_wait_begin = std::time::Instant::now();
             drop(tx);
             let timings = blender
@@ -843,9 +889,12 @@ fn run_tile_inference(
     input: ndarray::Array4<f32>,
     crop_w: usize,
     crop_h: usize,
+    mut observation: JobUpdate,
 ) -> Result<(TileOutput, InferBreakdown), AiError> {
     if route.uses_worker() {
         // TRT ワーカー経路: tensor_build / extract / shm 転送はワーカー内で完結
+        observation.backend = Some(super::AiBackend::TensorRt.into());
+        super::diagnostic_observation::publish(observation);
         let t_run = std::time::Instant::now();
         match route.infer(model_kind, &input) {
             Ok((shape, raw)) => {
@@ -882,6 +931,8 @@ fn run_tile_inference(
         let tensor_build_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         runtime.with_session(model_kind, |session| {
+            observation.backend = Some(runtime.active_backend().effective.into());
+            super::diagnostic_observation::publish(observation);
             let t_run = std::time::Instant::now();
             let outputs = session
                 .run(ort::inputs![input_tensor])

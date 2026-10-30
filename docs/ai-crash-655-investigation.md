@@ -384,7 +384,7 @@ device loss後に同じdeviceで通知UIを描ける保証もない。安全な�
 
 ## 確定設計 (2026-10-30)
 
-対象は [backlog §1.482](next-release-backlog.md)。ClaudeCode の範囲決定と、独立設計レビュー REVISE の P2 4件を反映した設計の正本とする。設計確定時点では未実装。その後の再レビュー P2/P3 と段A実装は本節・後掲の実装記録へ反映する。段B以降は未着手。>>655 の原因は引き続き未特定。
+対象は [backlog §1.482](next-release-backlog.md)。ClaudeCode の範囲決定と、独立設計レビュー REVISE の P2 4件を反映した設計の正本とする。設計確定時点では未実装。その後の再レビュー P2/P3 と段A・段Bの実装状況は本節・後掲の実装記録へ反映する。段Bは実装済みだが、全ライブラリgateと独立受入は未達。段C/Dは未実装。>>655 の原因は引き続き未特定。
 
 前節の比較・調査記録は履歴として残すが、競合する提案は本節で置き換える。特に (c) の fatal reader 用 atomic snapshot publication、ring、seqlock、二重 buffer は作らず、fatal handler は最新の表示・job・GPU 状態を読まない。「直前」「採取0.8秒前」という旧例も鮮度の保証には使わない。
 
@@ -587,7 +587,7 @@ native の証拠があれば、例2へ「終了前に観測された例外（fir
 - main所有`GuiRunSession`がfirst-instance guard・runtime共有lease・診断ownerを保持する。runtime leaseは元の取得位置/条件を変えずに所有先だけを移し、mainの通知中も保護を維持する。GUI早期exitも同じ最終化へ接続し、TensorRT等のworkerには既存の引数なし終了入口を維持する。play-test/test-script/DComp等は診断admissionから除外した。
 - 新規`previous_run_diagnostics`は小資料のread/replace/整理を専用workerで行う。初期化中の終端要求でもcurrent参照を更新してから終端を書き、診断leaseで旧writerのI/Oと新writerを排他する。2run保持・等価data_dir表記・限定子processの回帰を追加した。
 - 新規`ui_previous_run_notice`は不変本文の表示・明示コピー・閉じるだけを行う。通常rootが表示可能になるまで前回通知を消費せず、起動overlay/非表示/最小化/他の起動案内中は保持する。配色はmainで適用済みのos_themeのVisualsを継承し、固定文字色を追加しない。初回focusedは26成功/1件の本文高さ検査失敗（1366×728・100%、340ptのouter上限で本文245pt）。固定上限を撤去して長文は画面内の高さを利用、短文のauto-shrinkは維持した。検査閾値は緩めず45%へ強化し、修正後の検証へ進む。
-- 段B〜D、GPU/AIの周期checkpoint、native/panicの新しい短い記録、device-loss callback、ORT即時feedbackには着手していない。製品起動・デスクトップ操作・commitは行わない。
+- 段A完了時点では、段B〜D、GPU/AIの周期checkpoint、native/panicの新しい短い記録、device-loss callback、ORT即時feedbackには着手していない。製品起動・デスクトップ操作・commitは行わない。後続の段Bは次節へ分離して記録する。
 - 独立コードレビュー（gpt-6.1-sol / xhigh）で指摘された初期化参照race・data_dir表記によるnamespace分断・初期化中終端の保持数を修正した。runtime lease・UI高さの追補と下記の成功証拠を確認し、段AはACCEPT、未解決P1/P2なし。指定自動検証は成功。追加全体gateは下記の環境前提不足で停止し、確認用buildは未実施。
 
 検証（MSBUILDDISABLENODEREUSE=1）:
@@ -611,4 +611,79 @@ native の証拠があれば、例2へ「終了前に観測された例外（fir
 | 追加 `scripts/test-full.ps1 -SuppressCrashDialogs` | exit 101、workspaceテスト開始前のlauncher build scriptで停止。`target/release/mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe` が不足。テスト失敗とは区別し、workspace/vendor/doctest gateは未完了。VST3用CRT4本の事前検査は成功。error modeは元に復元済み |
 | 確認用 `scripts/build-dev.ps1` | 未実施。利用者の「前提の食い違いがあれば止めて報告」に従い、上記不足を検出した段階で追加ビルドを停止。release入力の用意やbuild回避用flagを独断で追加しない。製品起動・commitなし |
 
-引継ぎ: 上記3本のlauncher入力をこのworktreeで用意した後、追加全体gateと確認用buildを行う必要がある。段Aの指定check/full-lib/UI snapshot/auditとfocused回帰の成功は、Rustソースを変更しない限り再利用できる。検証記録の追記だけでも機械的な全ファイルhashは変わるため、receiptのsource hashと現在の文書差分を混同しない。>>655の原因が判明した、段B〜Dが実装済み、full gate完了とは扱わない。
+段A完了時の引継ぎ: 上記3本のlauncher入力をこのworktreeで用意した後、追加全体gateと確認用buildを行う必要がある。段Aの指定check/full-lib/UI snapshot/auditとfocused回帰の成功は、同一Rustソース・条件に対してのみ再利用できる。検証記録の追記だけでも機械的な全ファイルhashは変わるため、receiptのsource hashと現在の文書差分を混同しない。>>655の原因が判明した、段B〜Dが検証済み、full gate完了とは扱わない。
+
+### 11. 段Bの実装記録（2026-10-30）
+
+段Aの終了owner/専用writerに、通常thread用の有界latest-value mailboxと活動lease、typed checkpointを追加する。診断は観測のみで、処理の再試行、GPU再作成、AIの制限、cache一括破棄、回復処理は追加しない。既存の詳細ログ・結果配送・取消・PDF orphan・trayの契約を維持する。**段Cのpanic/native/device-loss接続と段DのORT即時feedbackは未実装**であり、今回のcheckpointだけから終了原因を分類しない。
+
+実装済み・接続確認中の構造:
+
+- `previous_run_diagnostics::checkpoint` が、run内単調時刻とUTC、表示context/世代/ページ、jobの不変metadataと段階の組、queue/実行/結果待ち/後段合成/GPU登録要求の件数を保持する。job詳細は固定6枠と省略・更新欠落数で有界化し、枚数上限に合わせて製品のjobを止めない。入力の所有bytesはArc共有を含むため、追加RAM量として単純加算しない。
+- writerは実活動中だけ約1秒を目標に最新値へcoalesceして保存する。これは鮮度の上限保証ではない。開始・終了境界は周期より優先し、終了状態を1回保存した後はidleの周期deadlineを持たない。cacheにAI結果があるだけでは活動にしない。UIへの定期repaint・同期I/O・完了待ちは追加しない。
+- 短いmailbox保護を解いた後にsampling/serialize/I/Oを行う。CPU/GPUは各照会直後に親の時計で個別Stampを採り、GPU照会の遅延をCPU採取時刻へ流用しない。表示/job/取消観測もそれぞれの採時を保持する。取得失敗はunknown、前回成功値の再利用は行わない。記録が古い場合もその採取時刻を表示し、終了観測のない段Bでは「終了との間隔不明」を維持する。
+- `gpu_info::diagnostic_sampler` はUIからadapter/deviceのcloneだけを受け取る。workerで既存DX12 deviceのLUIDを取得し、DXGIの同LUIDとPCI vendor/device IDを照合してからnode 0のlocal/nonlocal Usage/Budgetを照会する。Vulkan、LUID取得不能、不一致、照会失敗では数値を補わない。別GPUの列挙順・専用VRAM容量を代用せず、専用VRAM 0のadapterも除外しない。UMAはAPI型相違（wgpu-halのwindows 0.62と製品の0.61）のため直接照会を採用せず、不明を許容する。容量から推定せず、新依存/raw COM castを足さない。ORT所有のDirectML deviceとの相関は不明であり、採取値は描画adapterのprocess usageであってAIのVRAM使用量ではない。
+- `ai::diagnostic_observation` は通常推論threadの`Option<JobLease>`をRAII scopeで保持する。scopeのない要求は更新せず、`enter(None)`は外側scopeを遮断する。scale detectのlocal Run直前とtile Run直前にmodel/backend/寸法/位置を一体更新する。TRT側は既存infer要求の呼出境界の観測であり、子process内の実Run開始時刻の保証ではない。fallback localでは同じjob/寸法/位置とruntime側のbackend選択値を組で更新する。denoiseも同じtile実装を通る。全tile Runの帰還後は同じ推論threadからBlendを公開し、blenderの残処理待ちを区別する。scopeはblenderやnative handlerへ伝播しない。
+- 保存・表示・コピーは整数、真偽、既知enum、寸法の許可項目だけで作る。sourceは画像寸法/所有bytesでありpathや任意文字列ではない。model/backendも選択可能な既知分類だけで、adapter名、driverの任意説明、ファイル名、検索語、画像内容、panic/ORT等の生messageは収集しない。画面と明示コピーは同じ本文を使い、自動送信しない。既存の詳細ログは別物として維持する。
+
+段A P3補完もこの変更群に追加する。`diagnostic_entry_tests`は本番mode/admission/early-exit/mainへのowner接続をsource契約で検査し、admit/finishの削除mutationを拒否する。限定libtest子processから実`exit_gui_startup(0/2)`を呼び、一時storeの終端保存とexit codeを確認する。`app::tests::diagnostic_lifecycle`はfake tray controllerとHWNDなしのROOT Closeから実tray policyを通し、非表示・実App Drop後もRunningであることを確認する。実AiJobQueue::Dropとworker gateを使い、worker未完了でも診断終端を保存できることを検査する。実GUI、製品exe、OS tray、実in-flight ORT Runを動かした証拠ではない。
+
+backendはruntime/推論経路の選択値を記録・表示する。ORT内部のEP配置は確認していないため、CPU fallback等を含む各nodeの実行providerを確定したとは扱わない。表示本文にもこの区別を記載する。未取得値は`unknown`、寸法は`幅x高さ`と表示する。
+
+活動境界での起床は、run全体の活動lease数が0→1・1→0になるときだけ行う。活動が重なる間のjob追加・回収は件数を正確に更新するが、保存を促さず通常周期へcoalesceする。保存中に活動が一周しても境界revisionを保持し、最後のidle資料を保存した後は周期起床を止める。999件の重複jobをfake clockの1秒未満で進める回帰と、保存中の完全な活動一周の回帰で、この保存頻度と最終保存の両方を検査する。
+
+活動inventoryと不足経路の追補:
+
+| 経路 | 活動ownerと段Bの接続 |
+| --- | --- |
+| 通常final AI/legacy/消しゴム/export/clipboard/external tool | `App::local_ai_activity_lease`をworkerへ移す既存経路がある。段Bの診断活動はそのleaseにも接続する。job/result/backlog/後段/GPU登録は別の引継ぎが必要で、UI pending件数だけでは判断しない |
+| Remote final AI/編集素材化 | 既存`LocalAiActivityLease`には含まれなかったため、`RemoteAiExecutionBridge`が共有runtimeの待機開始から`diagnostic_activity`を保持し、返す`RemoteAiResources`へ引き継ぐ。final AIの実worker入口も活動を持ち、ページ間・資源bundle解放後の完了時検証まで継続する。編集素材化はbundle全体を関数末尾まで保持し、managerの部分moveでleaseを早期破棄しない。generic活動のみで、localの表示context/ページやjob metadataを推定しない |
+| 動画upscale | `ui_dialogs::video_upscale`がspawn前に診断専用`ActivityLease`を捕捉し、preflight/`run_job`/結果送信を含む実worker終端まで保持する。既存のRemote排他用`LocalAiActivityLease`は増やさず、動画の`paused_idle`中にRemoteを取得できる既存動作を維持する。診断の活動はUIのpending撤去やpauseフラグだけでは終了させない。generic活動であり動画のフレームをlocal表示ページと混同しない |
+| runtime初期化 | `AiRuntimeInitOwner`へGUI側から`CheckpointPublisher`を一度だけinstallし、`start`の実初期化taskへ活動leaseを捕捉する。初期化/終端公開/repaintまで保持し、spawn失敗ではtaskのDropで解放する。App側ownerを落としても開始済みtaskの活動が残る。UIの待機や初期化の追加はない |
+
+検証所有は親へ集約する。追加テストはfake clock/sampler、adapter一致/不一致/UMA/unknown/照会失敗、個別採時、in-memory publisherでのTLS scope/実初期化taskのfake gate/Remote待機取消と資源bundleのlease寿命、隔離store・限定子process・headless Appを対象とする。実初期化taskのfixtureはfake runtimeだけを返し、ORT/GPUの初期化や推論を行わない。結果は次節へ記録する。段Aの成功結果や過去20試行を段Bの検証成功へ転用しない。製品起動・デスクトップ操作も実施していない。
+
+### 12. 段Bの検証結果と停止点（2026-10-30）
+
+`ai-crash-655` / HEAD `84cebb529` からの未commit差分。build/testは`MSBUILDDISABLENODEREUSE=1`で実行した。段A P3の補完と段Bまでを実装し、段C/Dへは進めていない。独立reviewはClaudeCodeが別に依頼するため、この作業では立てていない。
+
+| コマンド・検査 | 結果 |
+| --- | --- |
+| `cargo fmt` / `cargo fmt --check` | 成功 |
+| `cargo check -p mimageviewer --lib --tests --features test-script` | 最終sourceで成功、49.20秒。`target/ai-crash-655-stage-b-check-final.log` |
+| `scripts/test-focused.ps1` | broad/sharedを検出してexit 2、選択実行0件。下記full-libへ移行 |
+| `cargo test -p mimageviewer --lib diagnostic -- --nocapture` | 途中sourceで129成功・1 ignored。TLS、sampler、入口・寿命、backlog、privacy等の部分結果。後の修正は下記で別に検証 |
+| `cargo test -p mimageviewer --lib previous_run_diagnostics -- --nocapture` | 保存頻度の修正後に33成功。重複jobのcoalesce、完全な活動一周、終端の吸収、旧schema、採時・privacy・上限を含む。`target/ai-crash-655-stage-b-previous-run-final.log` |
+| `cargo test -p mimageviewer --lib remote_diagnostic_activity_spans_runtime_wait_and_returned_resources -- --nocapture` | 1成功。Remote全体の活動と資源bundleの活動が独立して保持・解放されることを検査 |
+| `cargo test -p mimageviewer --lib video_diagnostic_capture_preserves_paused_idle_remote_admission -- --nocapture` | 最終sourceで1成功。診断専用leaseを実capture helperから取得しても、paused-idle動画のRemote取得を妨げない。`target/ai-crash-655-stage-b-video-final.log` |
+| 新規snapshotの生成・コピー検査 | `previous_run_notice_snapshot_checkpoint_small_light` 1成功。新規PNGは1枚、233,548 bytes。1093×614で本文スクロール、固定コピー/閉じる、明色の文字と枠を目視確認。表示とコピーは同一のallowlist本文 |
+| `cargo test --test ui_snapshot` | 最終sourceで214成功・0失敗。実行38.53秒、compile 1分19秒。`target/ai-crash-655-stage-b-ui-snapshot-final.log` |
+| `cargo run --locked -p viewer_context_audit` | 最終sourceでexit 0。`target/ai-crash-655-stage-b-context-audit-final.log` |
+| `python scripts/check_ui_glyphs.py` | 最終sourceで危険なglyph 0件、成功 |
+| `python scripts/check_site_cards.py` | 49 cards、超過0、成功 |
+| `git diff --check` | 成功。結果追記後にも実施 |
+
+途中で発見した実装上の問題は修正した。`AdapterProbe`のwgpu具体型が共有ownerのSend/Sync証明を深くするため、privateな`Arc<dyn WorkerProbe + Send + Sync>`へ隠し、recursion limitの引上げやunsafeなSend/Sync追加は行わなかった。保存workerの起床は全体の活動0→1・1→0へ限定し、重複jobごとの保存を防いだ。動画には診断専用leaseを使い、既存Remote排他用counterを増やさない。これらはdevice再作成・再推論・AI無効化・再試行を追加する変更ではない。
+
+**全ライブラリgateは未達。成功receiptは得られていない。** full-libは以下の3回を実行し、テスト除外・自動retry・timeout設定変更はしていない。件数は各回の結果であり、重複合算しない。
+
+| 回 | `target/test-lib-full/runs/`以下の記録 | 結果 |
+| --- | --- | --- |
+| 1 | `20261030T124447766Z-c52375dc/` | 15,127実行、15,126成功・1失敗・67 skipped、588.290秒。source `ac28d4b1da6a58e16916e92ddbb3d5bda1a74b417faf3644b7521e6ab86dbc12` |
+| 2 | `20261030T130648931Z-583926af/` | 15,129実行、15,125成功・3失敗・1 timeout・67 skipped、1143.735秒（1 leaky）。source `ca3a0fdff63c720b654781e4860db9e29fbbcbeabcd9ba01cf2fb1c5d6bfaf1f` |
+| 3（最終Rust source） | `20261030T133528589Z-2b851027/` | 15,130実行、15,126成功・4失敗・67 skipped、1103.957秒。source `906c22f6ce23a9815ce6462e11b2088e3ee811866a60f8a21a8f1bd321ec4448` |
+
+1回目の失敗は`scroll_661::row_anchor_observation_keeps_middle_selected_row_in_both_renderers`（`must adopt changed rows`）。単独では成功した。2回目は`main_chrome_folder_tree_clicks_follow_common_modal_ownership`（Harness未settle）、`folder_mtime_rescan_real_changes_still_fully_reload`（listing identity未settle）、`page_turn_mainwindow_submits_visible_vacant_leaf_both_directions`（hidden image faceのpixel検査）が失敗し、3件とも単独では成功した。`section1375_large_physical_scan_10k_100k`はnextestの600秒制限でtimeoutした。これはcommand runner全体の中断やassertion失敗とは区別する。
+
+2回目までの途中で別hashのlibtest実行体も観測した。3回目は開始前に他のlibtest実行体が見えていないことを確認して実行したが、次の4件が失敗した。並行負荷が原因、既存のflake、今回差分と無関係などとは断定しない。
+
+| 最終全件gateの失敗 | 観測 | 最終sourceでの単独再実行 |
+| --- | --- | --- |
+| `rating_deferred_live_close_redo_and_empty_do_not_revive_superseded_first_display` | `src/app/tests.rs:293`、listing identity preparation未settle | 1成功、`target/ai-crash-655-stage-b-rating-followup.log` |
+| `row_anchor_observation_keeps_middle_selected_row_in_both_renderers` | `src/app/tests/scroll_661.rs:569`、`must adopt changed rows` | 1成功、`target/ai-crash-655-stage-b-scroll-final-followup.log` |
+| `product_book_query_store_change_retires_retained_ready_and_requeues_only_active` | `src/similar_index.rs:9538`、active clientのstore transition未settle | 1成功、`target/ai-crash-655-stage-b-similar-followup.log` |
+| `full_mask_with_large_subtract_preview_completes_quickly` | `src/ui_adjustment_panel.rs:918`、148.1503msで速度assertion失敗 | 1成功、`target/ai-crash-655-stage-b-subtract-followup.log` |
+
+単独成功は全件gate成功の代用にしない。これらの失敗を消すための製品変更、待機延長、fixture修正はこの作業では行わず、3回で全件再実行を止めて設計担当へ引き継ぐ。段Bの新規回帰は最終全件実行でも失敗していないが、段B全体の検証完了・受入とは扱わない。
+
+確認用`build-dev.ps1`は、AGENTS.mdの前提であるテスト成功を満たせないため未実施。製品起動、実機GPU/ORT推論、OS tray確認、commitも行っていない。workspace/vendor/doctest全体gateについても、段A末尾に記録したrelease launcher入力3本の不足は今回確認時点で継続しており、未完了を引き継ぐ。結果追記後の差分は文書のみで、最終全件実行以降にRust sourceは変更していない。

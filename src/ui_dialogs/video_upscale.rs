@@ -41,6 +41,14 @@ pub(crate) struct VideoUpscaleRunningTask {
     pub delete_artifacts_after_cancel: bool,
 }
 
+fn video_diagnostic_activity(
+    app: &App,
+) -> Option<crate::previous_run_diagnostics::checkpoint::ActivityLease> {
+    // A paused-idle video worker permits Remote acquisition. Diagnostic
+    // lifetime must not increment the legacy local-AI admission barrier.
+    app.ai_runtime_init.diagnostic_activity()
+}
+
 pub(crate) fn recover_video_upscale_queue_for_startup(queue: &mut TaskQueue) {
     queue.tasks.retain_mut(|task| {
         match task.state {
@@ -481,7 +489,9 @@ impl App {
             .mark_state(task.task_id, TaskState::Running);
         self.save_video_upscale_queue();
 
+        let diagnostic_activity = video_diagnostic_activity(self);
         thread::spawn(move || {
+            let _diagnostic_activity = diagnostic_activity;
             let result = preflight(&task_for_worker.source_path).and_then(|pre| {
                 progress_worker
                     .frames_total
@@ -1006,6 +1016,46 @@ fn same_upscale_target_ci(source_path: &Path, target_path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::video::upscale::queue::VideoUpscaleTask;
+
+    #[test]
+    fn video_diagnostic_capture_preserves_paused_idle_remote_admission() {
+        let mut app = crate::app::setup_app_for_test();
+        let publisher = crate::previous_run_diagnostics::test_support::publisher();
+        app.ai_runtime_init
+            .install_diagnostic_checkpoint(publisher.clone());
+        app.video_upscale_queue.paused = true;
+        let paused_idle = Arc::new(AtomicBool::new(true));
+        let (_result_tx, result_rx) = mpsc::channel();
+        let source_path = app.tmp.path().join("paused-video.mp4");
+        app.video_upscale_running = Some(VideoUpscaleRunningTask {
+            task_id: Uuid::new_v4(),
+            source_path,
+            cancel: Arc::new(AtomicBool::new(false)),
+            pause: Arc::new(AtomicBool::new(true)),
+            paused_idle: paused_idle.clone(),
+            progress: Arc::new(VideoUpscaleProgressShared::new(None)),
+            rx: result_rx,
+            delete_artifacts_after_cancel: false,
+        });
+        assert!(app.local_ai_remote_barrier_snapshot().is_quiesced());
+
+        // This is the exact helper captured by the real video spawn boundary.
+        let activity = video_diagnostic_activity(&app).expect("diagnostic activity installed");
+        assert_eq!(publisher.active_count_for_test(), 1);
+        assert!(
+            app.local_ai_remote_barrier_snapshot().is_quiesced(),
+            "diagnostic observation must preserve paused-video Remote admission"
+        );
+        paused_idle.store(false, Ordering::Release);
+        assert!(
+            !app.local_ai_remote_barrier_snapshot().is_quiesced(),
+            "a video worker that has not reached paused idle still blocks Remote"
+        );
+        paused_idle.store(true, Ordering::Release);
+        drop(activity);
+        assert_eq!(publisher.active_count_for_test(), 0);
+        assert!(app.local_ai_remote_barrier_snapshot().is_quiesced());
+    }
 
     fn task_with_state(state: TaskState) -> VideoUpscaleTask {
         VideoUpscaleTask {

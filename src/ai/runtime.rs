@@ -27,6 +27,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use ort::session::Session;
 
 use super::{AiBackend, AiError, ModelKind};
+use crate::previous_run_diagnostics::checkpoint::{ActivityLease, CheckpointPublisher};
 
 /// GUI process 全体の DirectML runtime 初期化を一度だけ所有する。
 ///
@@ -36,6 +37,7 @@ pub struct AiRuntimeInitOwner {
     state: Mutex<AiRuntimeInitState>,
     changed: Condvar,
     trt_worker_lifecycle: Arc<super::trt_worker_lifecycle::TrtWorkerLifecycleOwner>,
+    diagnostic_checkpoint: OnceLock<CheckpointPublisher>,
 }
 
 enum AiRuntimeInitState {
@@ -65,7 +67,20 @@ impl AiRuntimeInitOwner {
             state: Mutex::new(AiRuntimeInitState::Dormant),
             changed: Condvar::new(),
             trt_worker_lifecycle: crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new(),
+            diagnostic_checkpoint: OnceLock::new(),
         })
+    }
+
+    /// Installed by the admitted GUI before runtime initialization/Remote work.
+    /// This adds no initialization, native query, or wait to the caller.
+    pub(crate) fn install_diagnostic_checkpoint(&self, publisher: CheckpointPublisher) {
+        let _ = self.diagnostic_checkpoint.set(publisher);
+    }
+
+    pub(crate) fn diagnostic_activity(&self) -> Option<ActivityLease> {
+        self.diagnostic_checkpoint
+            .get()
+            .map(CheckpointPublisher::activity)
     }
 
     pub fn trt_worker_lifecycle(
@@ -158,7 +173,11 @@ impl AiRuntimeInitOwner {
         let owner = Arc::clone(self);
         let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(repaint);
         let repaint_worker = Arc::clone(&repaint);
+        let activity = self.diagnostic_activity();
         let task: Box<dyn FnOnce() + Send> = Box::new(move || {
+            // Retained through init, terminal publication, and repaint; a spawn
+            // failure drops the unexecuted closure and releases this lease.
+            let _activity = activity;
             let memory = crate::perf::memory::span("ai_runtime_init");
             let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(initialize))
                 .unwrap_or_else(|_| {
@@ -802,6 +821,98 @@ mod tests {
             },
             trt_worker_lifecycle: crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new(),
         }
+    }
+
+    fn wait_activity(publisher: &CheckpointPublisher, expected: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while publisher.active_count_for_test() != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "diagnostic activity did not reach {expected}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn diagnostic_activity_follows_real_initialization_task_not_app_owner_lifetime() {
+        let publisher = crate::previous_run_diagnostics::test_support::publisher();
+        let owner = AiRuntimeInitOwner::new();
+        owner.install_diagnostic_checkpoint(publisher.clone());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        assert!(owner.start_with(
+            "ai-init-diagnostic-lifetime-test",
+            move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(fake_runtime())
+            },
+            || {},
+        ));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .unwrap();
+        assert_eq!(publisher.active_count_for_test(), 1);
+        drop(owner);
+        assert_eq!(publisher.active_count_for_test(), 1);
+        release_tx.send(()).unwrap();
+        wait_activity(&publisher, 0);
+    }
+
+    #[test]
+    fn remote_diagnostic_activity_spans_runtime_wait_and_returned_resources() {
+        let publisher = crate::previous_run_diagnostics::test_support::publisher();
+        let owner = AiRuntimeInitOwner::new();
+        owner.install_diagnostic_checkpoint(publisher.clone());
+        let bridge = crate::remote_ipc::session::RemoteAiExecutionBridge::new(
+            owner.clone(),
+            Arc::new(crate::ai::model_manager::ModelManager::new()),
+            0,
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = cancel.clone();
+        let waiting_bridge = bridge.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiting = std::thread::spawn(move || {
+            let resources = waiting_bridge.resources_for_remote(&cancel_worker);
+            done_tx.send(resources.is_none()).unwrap();
+        });
+        wait_activity(&publisher, 1);
+        cancel.store(true, Ordering::Release);
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap()
+        );
+        waiting.join().unwrap();
+        assert_eq!(publisher.active_count_for_test(), 0);
+
+        assert!(owner.start_with(
+            "ai-init-remote-diagnostic-test",
+            || Ok(fake_runtime()),
+            || {}
+        ));
+        assert!(matches!(
+            owner.wait_terminal_while(|| true),
+            AiRuntimeInitWait::Ready(_)
+        ));
+        wait_activity(&publisher, 0);
+        let operation = bridge.diagnostic_activity();
+        assert_eq!(publisher.active_count_for_test(), 1);
+        let resources = bridge
+            .resources_for_remote(&AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(publisher.active_count_for_test(), 2);
+        let runtime = resources.runtime.clone();
+        let manager = resources.manager.clone();
+        assert_eq!(publisher.active_count_for_test(), 2);
+        drop(resources);
+        assert_eq!(publisher.active_count_for_test(), 1);
+        drop((runtime, manager));
+        assert_eq!(publisher.active_count_for_test(), 1);
+        drop(operation);
+        assert_eq!(publisher.active_count_for_test(), 0);
     }
 
     #[test]

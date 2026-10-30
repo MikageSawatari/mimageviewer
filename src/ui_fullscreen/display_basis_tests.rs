@@ -206,6 +206,7 @@ fn install_complete(
         app.final_ai_cache.insert(
             key,
             crate::app::FinalAiEntry {
+                diagnostic_metadata: None,
                 canonical_dims,
                 source_size: source,
                 pixels: output_pixels.clone(),

@@ -342,6 +342,7 @@ fn d3_2_legacy_colorize_and_lut_computing_channel_survives_real_park() {
                 owner.final_effect_pending.insert(
                     key,
                     FinalEffectPending {
+                        diagnostic: None,
                         pdf_metadata: None,
                         canonical_dims: None,
                         source_size: [80, 120],

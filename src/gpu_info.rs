@@ -3,6 +3,8 @@
 //! 主目的はプライマリ GPU の VRAM 容量を取得し、
 //! mImageViewer 全体の VRAM 上限を % 指定で計算できるようにすること。
 
+pub(crate) mod diagnostic_sampler;
+
 pub(crate) const FALLBACK_VRAM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// GPU ベンダー識別。TensorRT 設定の gating に使用。

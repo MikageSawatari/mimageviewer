@@ -122,6 +122,15 @@ mod tests {
         } else {
             REPORT.to_owned()
         };
+        harness_report(size, scale, theme, report)
+    }
+
+    fn harness_report(
+        size: egui::Vec2,
+        scale: f32,
+        theme: ResolvedTheme,
+        report: String,
+    ) -> Harness<'static, State> {
         let mut fonts_ready = false;
         crate::test_ui::builder().with_size(size).build_ui_state(
             move |ui, state: &mut State| {
@@ -280,5 +289,24 @@ mod tests {
         let mut h = harness(egui::vec2(1093.0, 614.0), 2.0, ResolvedTheme::Dark, true);
         h.run_steps(12);
         h.snapshot("previous_run_notice_small_200_dark");
+    }
+    #[test]
+    fn previous_run_notice_snapshot_checkpoint_small_light() {
+        let report = crate::previous_run_diagnostics::test_support::checkpoint_report_body();
+        let mut h = harness_report(
+            egui::vec2(1093.0, 614.0),
+            1.0,
+            ResolvedTheme::Light,
+            report.clone(),
+        );
+        h.run_steps(12);
+        let viewport = h.ctx.content_rect();
+        for control in &h.state().result.controls {
+            assert!(viewport.contains_rect(control.rect));
+        }
+        h.snapshot("previous_run_notice_checkpoint_small_light");
+        let copy_pos = h.state().result.controls[0].rect.center();
+        click(&mut h, copy_pos);
+        assert_eq!(h.state().copied, [report]);
     }
 }

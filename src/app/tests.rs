@@ -5,6 +5,9 @@ use super::*;
 #[path = "tests/ai_crash_655.rs"]
 mod ai_crash_655;
 
+#[path = "tests/diagnostic_lifecycle.rs"]
+mod diagnostic_lifecycle;
+
 // Legacy fixture paths now use the same immutable payload types as runtime navigation.
 pub(crate) fn reading_history_return_for_test(container: PathBuf) -> ReadingHistoryBookReturn {
     ReadingHistoryBookReturn::without_entrance(container)
@@ -54297,6 +54300,7 @@ mod pipeline_cache_refactor_tests {
                     app.final_ai_cache.insert(
                         key,
                         FinalAiEntry {
+                            diagnostic_metadata: None,
                             canonical_dims: None,
                             source_size: [4, 6],
                             pixels: Arc::new(egui::ColorImage::filled(
@@ -54642,6 +54646,7 @@ mod pipeline_cache_refactor_tests {
                 bg: 0,
             },
             FinalAiEntry {
+                diagnostic_metadata: None,
                 canonical_dims: None,
                 source_size: [1, 1],
                 pixels: Arc::new(egui::ColorImage::new(
@@ -55460,6 +55465,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_pending.insert(ai_key, pending);
         final_ai_tx
             .send(FinalAiResult::Ready {
+                diagnostic: None,
                 canonical_dims: None,
                 job_id: 0,
                 key: ai_key,
@@ -55519,6 +55525,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                diagnostic: None,
                 pdf_metadata: None,
                 canonical_dims: None,
                 source_size: edit_pixels.size,
@@ -55629,6 +55636,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                diagnostic: None,
                 pdf_metadata: None,
                 canonical_dims: None,
                 source_size: source.size,
@@ -55711,6 +55719,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                diagnostic: None,
                 pdf_metadata: None,
                 canonical_dims: None,
                 source_size: [1, 1],
@@ -55844,6 +55853,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                diagnostic: None,
                 pdf_metadata: None,
                 canonical_dims: None,
                 source_size: [2, 2],
@@ -55892,6 +55902,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                diagnostic: None,
                 pdf_metadata: None,
                 canonical_dims: None,
                 source_size: [2, 2],
@@ -58637,6 +58648,7 @@ mod pipeline_cache_refactor_tests {
         let (pending, _c) = make_fake_final_ai_pending();
         app.final_ai_pending.insert(ready_key, pending);
         tx.send(FinalAiResult::Ready {
+            diagnostic: None,
             canonical_dims: None,
             job_id: 0,
             key: ready_key,
@@ -58653,6 +58665,7 @@ mod pipeline_cache_refactor_tests {
         let (pending, _c) = make_fake_final_ai_pending();
         app.final_ai_pending.insert(failed_key, pending);
         tx.send(FinalAiResult::Failed {
+            diagnostic: None,
             job_id: 0,
             key: failed_key,
             error: "boom".to_string(),
@@ -58662,6 +58675,7 @@ mod pipeline_cache_refactor_tests {
         // (3) Unknown: pending に無い key の Ready → 捨てる (cache に入らない)
         let unknown_key = mk_key(2);
         tx.send(FinalAiResult::Ready {
+            diagnostic: None,
             canonical_dims: None,
             job_id: 0,
             key: unknown_key,
@@ -58777,6 +58791,7 @@ mod pipeline_cache_refactor_tests {
         };
         app.retained_final_ai_orphans.insert(key, 0);
         tx.send(FinalAiResult::Ready {
+            diagnostic: None,
             canonical_dims: None,
             job_id: 0,
             key,
@@ -58835,6 +58850,7 @@ mod pipeline_cache_refactor_tests {
         let (new_pending, _cancel) = make_fake_final_ai_pending_with_job_id(2);
         app.final_ai_pending.insert(key, new_pending);
         tx.send(FinalAiResult::Ready {
+            diagnostic: None,
             canonical_dims: None,
             job_id: 1,
             key,
@@ -58899,6 +58915,7 @@ mod pipeline_cache_refactor_tests {
         app.retained_final_ai_orphans.insert(key, 0);
         app.clear_retained_final_ai_cache("test_epoch_bump");
         tx.send(FinalAiResult::Ready {
+            diagnostic: None,
             canonical_dims: None,
             job_id: 0,
             key,
@@ -59849,6 +59866,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             effect_key,
             FinalEffectPending {
+                diagnostic: None,
                 pdf_metadata: None,
                 canonical_dims: None,
                 source_size: [1, 1],
@@ -59908,6 +59926,7 @@ mod pipeline_cache_refactor_tests {
             app.final_effect_pending.insert(
                 key,
                 FinalEffectPending {
+                    diagnostic: None,
                     pdf_metadata: None,
                     canonical_dims: None,
                     source_size: [1, 1],
@@ -61969,6 +61988,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_cache.insert(
             base_key,
             FinalAiEntry {
+                diagnostic_metadata: None,
                 canonical_dims: None,
                 source_size: [1, 1],
                 pixels: Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
@@ -62120,6 +62140,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                diagnostic: None,
                 pdf_metadata: None,
                 canonical_dims: None,
                 source_size: pending.source_size,
@@ -62817,6 +62838,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_cache.insert(
             ai_key,
             FinalAiEntry {
+                diagnostic_metadata: None,
                 canonical_dims: None,
                 source_size: [4, 1],
                 pixels: Arc::new(ai_image.clone()),
@@ -62857,6 +62879,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_cache.insert(
             dn_key,
             FinalAiEntry {
+                diagnostic_metadata: None,
                 canonical_dims: None,
                 source_size: [4, 1],
                 pixels: Arc::new(dn_image.clone()),
@@ -84278,6 +84301,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             );
         });
         tx.send(FinalAiResult::Ready {
+            diagnostic: None,
             canonical_dims: None,
             job_id: 99,
             key,

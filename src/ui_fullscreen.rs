@@ -91712,6 +91712,7 @@ mod specified_scale_consumer_tests {
             },
         );
         app.final_ai_result_backlog.push(FinalAiResult::Ready {
+            diagnostic: None,
             canonical_dims: None,
             job_id: 77,
             key,

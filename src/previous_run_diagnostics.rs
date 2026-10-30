@@ -10,6 +10,10 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub mod checkpoint;
+use crate::gpu_info::diagnostic_sampler::{AdapterProbe, DiagnosticSampler, MemorySample};
+use checkpoint::{Checkpoint, CheckpointPublisher, Publication, Schedule, Stamp};
+
 const SCHEMA: u32 = 1;
 const MAX_RECORD_BYTES: u64 = 16 * 1024;
 const MAX_REFERENCE_BYTES: u64 = 1024;
@@ -43,6 +47,7 @@ struct Shared {
     initialized: AtomicBool,
     repaint: OnceLock<egui::Context>,
     completion: AtomicU8,
+    checkpoint: Publication,
     #[cfg(test)]
     ready: (std::sync::Mutex<bool>, std::sync::Condvar),
 }
@@ -56,6 +61,7 @@ impl Shared {
             initialized: AtomicBool::new(false),
             repaint: OnceLock::new(),
             completion: AtomicU8::new(0),
+            checkpoint: Publication::new(),
             #[cfg(test)]
             ready: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
         }
@@ -195,6 +201,13 @@ impl GuiRunDiagnostics {
         }
     }
 
+    pub fn publisher(&self) -> Option<CheckpointPublisher> {
+        match &self.owner {
+            Owner::Inert => None,
+            Owner::Admitted { shared, .. } => Some(CheckpointPublisher::new(shared.clone())),
+        }
+    }
+
     /// Main's last explicit boundary, using the deadline already spent by the
     /// other log writers. No join, retries, fresh budget, or UI-frame wait.
     pub fn finish_until(&mut self, outcome: GuiRunOutcome, deadline: Instant) -> bool {
@@ -301,6 +314,8 @@ struct Record {
     version: [u16; 3],
     state: RunState,
     last_recorded_utc_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<Checkpoint>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -394,25 +409,160 @@ fn previous_report(directory: &Path, reference: &Reference) -> Option<PreviousRu
         || record.state != RunState::Running
         || record.last_recorded_utc_ms < record.identity.core_started_utc_ms
         || record.last_recorded_utc_ms > now_ms()
+        || record
+            .checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| !checkpoint.valid())
     {
         return None;
     }
     Some(format_report(&record))
 }
+fn diagnostic_optional<T: std::fmt::Debug>(value: Option<T>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |value| format!("{value:?}"))
+}
+fn diagnostic_dimensions(value: Option<checkpoint::Dimensions>) -> String {
+    value.map_or_else(
+        || "unknown".to_owned(),
+        |value| format!("{}x{}", value.width, value.height),
+    )
+}
+
 fn format_report(record: &Record) -> PreviousRunReport {
-    // Numeric schema alone is accepted. Neither arbitrary JSON fields nor
-    // native/panic/logger text can reach the display or clipboard in stage A.
+    // The typed schema has no arbitrary diagnostic strings. Formatting is
+    // shared by the visible body and the explicit copy action.
     let [major, minor, patch] = record.version;
-    PreviousRunReport {
+    let mut report = PreviousRunReport {
         body: format!(
             "前回の正常終了を確認できませんでした。原因は記録されていません。\n最終記録時刻: Unix {} ms (UTC) / 終了との間隔不明\nmIV {major}.{minor}.{patch} / 記録ID {}\n強制終了・OS終了・電源断・記録失敗とクラッシュは区別できません。\n最終記録以降に状態が変わった可能性があります。",
             record.last_recorded_utc_ms,
             record.identity.name()
         ),
+    };
+    if let Some(checkpoint) = &record.checkpoint {
+        use std::fmt::Write as _;
+        let _ = write!(
+            report.body,
+            "\ncheckpoint: UTC {} ms / run {} ms / 終了との間隔不明\n活動 lease {} / job {} / 省略 {} / 更新欠落 {}",
+            checkpoint.stamp.utc_ms,
+            checkpoint.stamp.run_elapsed_ms,
+            checkpoint.active_leases,
+            checkpoint.active_jobs,
+            checkpoint.omitted_jobs,
+            checkpoint.dropped_updates
+        );
+        report.body.push_str(if checkpoint.active_leases == 0 {
+            " / 活動終了 (idle)"
+        } else {
+            " / 活動中"
+        });
+        let _ = write!(
+            report.body,
+            "\nqueue {} / 所有入力bytes {} / 実行 {} / 結果待ち {} / 後段合成 {} / GPU登録要求 {}\n所有入力はArc共有を含み、追加RAM量ではありません。GPU登録要求はGPU完了を意味しません。",
+            checkpoint.queued_jobs,
+            diagnostic_optional(checkpoint.queued_source_bytes),
+            checkpoint.running_jobs,
+            checkpoint.result_waiting_jobs,
+            checkpoint.final_effect_jobs,
+            checkpoint.gpu_registration_jobs
+        );
+        report
+            .body
+            .push_str("\nbackendはruntime/推論経路の選択値です。ORT内部のEP配置は未確認です。");
+        if let Some(display) = &checkpoint.display {
+            let _ = write!(
+                report.body,
+                "\n表示: context {} / 世代 {} / 項目位置 {}/{} / UTC {} ms / run {} ms / 終了との間隔不明",
+                display.value.context_id,
+                display.value.items_generation,
+                diagnostic_optional(display.value.page),
+                diagnostic_optional(display.value.total),
+                display.stamp.utc_ms,
+                display.stamp.run_elapsed_ms
+            );
+        }
+        for job in &checkpoint.jobs {
+            let job_label = if job.metadata.job_id == 0 {
+                "job不明".into()
+            } else {
+                format!("job {}", job.metadata.job_id)
+            };
+            let backend = job.update.backend.unwrap_or(job.metadata.backend);
+            let _ = write!(
+                report.body,
+                "\n{job_label}: context {} / 世代 {} / 項目位置 {}/{} / {:?} / {:?} / upscale {} / denoise {} / 実行model {} / source {} / 所有入力bytes {} / output {} / tile {} {}/{} / UTC {} ms / run {} ms / 終了との間隔不明\n取消観測: {} / UTC {} ms / run {} ms",
+                diagnostic_optional(job.metadata.context_id),
+                diagnostic_optional(job.metadata.items_generation),
+                diagnostic_optional(job.metadata.page),
+                diagnostic_optional(job.metadata.total),
+                job.update.stage,
+                backend,
+                diagnostic_optional(job.metadata.upscale_model),
+                diagnostic_optional(job.metadata.denoise_model),
+                diagnostic_optional(job.update.model),
+                diagnostic_dimensions(job.metadata.source),
+                diagnostic_optional(job.metadata.source_bytes),
+                diagnostic_dimensions(job.update.output),
+                diagnostic_dimensions(job.update.tile),
+                diagnostic_optional(job.update.tile_index),
+                diagnostic_optional(job.update.tile_total),
+                job.stamp.utc_ms,
+                job.stamp.run_elapsed_ms,
+                job.cancel_requested,
+                job.cancel_stamp.utc_ms,
+                job.cancel_stamp.run_elapsed_ms
+            );
+        }
+        let cpu = &checkpoint.cpu_private_bytes;
+        let cpu_value = cpu
+            .value
+            .map_or_else(|| "unknown".into(), |value| value.to_string());
+        let _ = write!(
+            report.body,
+            "\nCPU private bytes: {cpu_value} / UTC {} ms / run {} ms / 終了との間隔不明",
+            cpu.stamp.utc_ms, cpu.stamp.run_elapsed_ms
+        );
+        let gpu = &checkpoint.gpu;
+        let _ = write!(
+            report.body,
+            "\n描画 adapter照会: {:?} / adapter {} / node {} / UMA {} / local {} / nonlocal {} / UTC {} ms / run {} ms / 終了との間隔不明\nAI adapter相関: {:?} (AI adapterとの一致未確認)\nGPU使用量・予算だけでは終了原因は判断できません。",
+            gpu.value.status,
+            diagnostic_optional(gpu.value.adapter),
+            diagnostic_optional(gpu.value.node_index),
+            diagnostic_optional(gpu.value.uma),
+            diagnostic_optional(gpu.value.local),
+            diagnostic_optional(gpu.value.nonlocal),
+            gpu.stamp.utc_ms,
+            gpu.stamp.run_elapsed_ms,
+            checkpoint.ai_adapter_correlation
+        );
     }
+    report
 }
 
 fn writer(directory: &Path, identity: RunIdentity, shared: &Shared) -> io::Result<()> {
+    let mut sampler = DiagnosticSampler::new();
+    writer_sampling(directory, identity, shared, |adapter| {
+        sampler.sample_timed(adapter, || shared.checkpoint.stamp())
+    })
+}
+
+fn capture_checkpoint(
+    shared: &Shared,
+    sample: &mut impl FnMut(Option<&AdapterProbe>) -> (MemorySample, Stamp, Stamp),
+) -> Checkpoint {
+    let snapshot = shared.checkpoint.snapshot();
+    // The mailbox guard has been released before any platform call.
+    let (memory, cpu_stamp, gpu_stamp) = sample(snapshot.adapter.as_ref());
+    snapshot.complete(&shared.checkpoint, memory, cpu_stamp, gpu_stamp)
+}
+
+fn writer_sampling(
+    directory: &Path,
+    identity: RunIdentity,
+    shared: &Shared,
+    mut sample: impl FnMut(Option<&AdapterProbe>) -> (MemorySample, Stamp, Stamp),
+) -> io::Result<()> {
     std::fs::create_dir_all(directory)?;
     // Held across initialization and every outstanding I/O, including after a
     // main deadline. A newer run never competes with this writer's reference
@@ -428,13 +578,17 @@ fn writer(directory: &Path, identity: RunIdentity, shared: &Shared) -> io::Resul
     let run_directory = directory.join(identity.name());
     std::fs::create_dir(&run_directory)?;
     let path = run_directory.join("state.json");
+    let initial_boundary = shared.checkpoint.boundaries();
+    let initial_active = shared.checkpoint.active();
     let mut record = Record {
         schema: SCHEMA,
         identity,
         version: version(),
         state: RunState::Running,
         last_recorded_utc_ms: now_ms(),
+        checkpoint: Some(capture_checkpoint(shared, &mut sample)),
     };
+    record.last_recorded_utc_ms = now_ms();
     replace(&path, &record)?;
     // Initial publication must also happen when main requested a terminal
     // during initialization: otherwise an old Running reference survives a
@@ -451,9 +605,32 @@ fn writer(directory: &Path, identity: RunIdentity, shared: &Shared) -> io::Resul
     replace(&directory.join("current.json"), &reference)?;
     retain_two(directory, &reference)?;
     shared.initialized();
+    let mut schedule = Schedule::default();
+    schedule.saved(
+        shared.checkpoint.elapsed_ms(),
+        initial_active,
+        initial_boundary,
+    );
     loop {
         match shared.state.load(Ordering::Acquire) {
-            RUNNING => std::thread::park(),
+            RUNNING => {
+                let now = shared.checkpoint.elapsed_ms();
+                let active = shared.checkpoint.active();
+                let boundary = shared.checkpoint.boundaries();
+                if schedule.due(now, active, boundary) {
+                    record.checkpoint = Some(capture_checkpoint(shared, &mut sample));
+                    record.last_recorded_utc_ms = now_ms();
+                    replace(&path, &record)?;
+                    // Save only the revision captured before sampling/I/O.
+                    // Changes during either operation require another pass.
+                    schedule.saved(shared.checkpoint.elapsed_ms(), active, boundary);
+                    continue;
+                }
+                match schedule.wait(now, active) {
+                    Some(wait) => std::thread::park_timeout(wait),
+                    None => std::thread::park(),
+                }
+            }
             ABANDONED => return Ok(()),
             terminal => {
                 record.state = if terminal == RETURNED_OK {
@@ -461,6 +638,7 @@ fn writer(directory: &Path, identity: RunIdentity, shared: &Shared) -> io::Resul
                 } else {
                     RunState::ReturnedError
                 };
+                record.checkpoint = Some(capture_checkpoint(shared, &mut sample));
                 record.last_recorded_utc_ms = now_ms();
                 return replace(&path, &record);
             }
@@ -514,6 +692,114 @@ pub(crate) mod test_support {
     use std::time::Duration;
     static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 
+    /// In-memory publisher only; no worker, namespace, files or native queries.
+    pub(crate) fn publisher() -> CheckpointPublisher {
+        CheckpointPublisher::new(Arc::new(Shared::new()))
+    }
+
+    pub(crate) fn checkpoint_report_body() -> String {
+        use crate::gpu_info::diagnostic_sampler::{
+            AdapterIdentity, DiagnosticBackend as GpuBackend, GpuMemorySample, GpuSampleStatus,
+            SegmentMemory,
+        };
+        let shared = Arc::new(Shared::new());
+        let publisher = CheckpointPublisher::new(shared.clone());
+        publisher.publish_display(checkpoint::DisplaySnapshot {
+            context_id: 3,
+            items_generation: 17,
+            page: Some(12),
+            total: Some(40),
+        });
+        let job = publisher.begin_job(
+            checkpoint::JobMetadata {
+                context_id: Some(3),
+                items_generation: Some(17),
+                job_id: 655,
+                page: Some(11),
+                total: Some(40),
+                upscale_model: Some(checkpoint::DiagnosticModel::UpscaleRealEsrGeneralV3),
+                source: Some(checkpoint::Dimensions {
+                    width: 2400,
+                    height: 3600,
+                }),
+                source_bytes: Some(34_560_000),
+                ..Default::default()
+            },
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        job.update(checkpoint::JobUpdate {
+            stage: checkpoint::JobStage::TileRun,
+            backend: Some(checkpoint::DiagnosticBackend::DirectMl),
+            model: Some(checkpoint::DiagnosticModel::UpscaleRealEsrGeneralV3),
+            output: Some(checkpoint::Dimensions {
+                width: 9600,
+                height: 14400,
+            }),
+            tile: Some(checkpoint::Dimensions {
+                width: 256,
+                height: 256,
+            }),
+            tile_index: Some(37),
+            tile_total: Some(150),
+        });
+        let stamp = Stamp {
+            utc_ms: 1_793_340_000_000,
+            run_elapsed_ms: 12_000,
+        };
+        let mut cp = capture_checkpoint(&shared, &mut |_| {
+            (
+                MemorySample {
+                    cpu_private_bytes: Some(1_200_000_000),
+                    rendering: GpuMemorySample {
+                        status: GpuSampleStatus::Available,
+                        adapter: Some(AdapterIdentity {
+                            vendor_id: 4318,
+                            device_id: 9860,
+                            backend: GpuBackend::Dx12,
+                            luid: Some([10, 0]),
+                        }),
+                        local: Some(SegmentMemory {
+                            usage_bytes: 2_000_000_000,
+                            budget_bytes: 4_000_000_000,
+                        }),
+                        nonlocal: Some(SegmentMemory {
+                            usage_bytes: 100_000_000,
+                            budget_bytes: 8_000_000_000,
+                        }),
+                        node_index: Some(0),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                stamp,
+                stamp,
+            )
+        });
+        cp.stamp = stamp;
+        cp.display.as_mut().unwrap().stamp = stamp;
+        cp.cpu_private_bytes.stamp = stamp;
+        cp.gpu.stamp = stamp;
+        for job in &mut cp.jobs {
+            job.stamp = stamp;
+            job.cancel_stamp = stamp;
+        }
+        format_report(&Record {
+            schema: SCHEMA,
+            identity: RunIdentity {
+                role: RunRole::Core,
+                run: 655,
+                core_pid: 1234,
+                core_started_utc_ms: stamp.utc_ms - 12_000,
+                core_started_ticks: 1,
+            },
+            version: [4, 10, 0],
+            state: RunState::Running,
+            last_recorded_utc_ms: stamp.utc_ms,
+            checkpoint: Some(cp),
+        })
+        .body
+    }
+
     pub(super) fn identity() -> RunIdentity {
         RunIdentity {
             role: RunRole::Core,
@@ -559,6 +845,10 @@ pub(crate) mod test_support {
         }
     }
 
+    pub(crate) fn is_running(directory: &Path) -> bool {
+        record(directory).is_some_and(|record| record.state == RunState::Running)
+    }
+
     /// A ready immutable report for headless presentation/hidden-root tests.
     pub(crate) fn report_handle() -> PreviousRunReportHandle {
         let shared = Arc::new(Shared::new());
@@ -568,6 +858,7 @@ pub(crate) mod test_support {
             version: [4, 10, 0],
             state: RunState::Running,
             last_recorded_utc_ms: now_ms(),
+            checkpoint: None,
         }));
         shared.initialized();
         PreviousRunReportHandle(shared)
@@ -787,6 +1078,7 @@ mod tests {
             version: [1, 2, 3],
             state: RunState::Running,
             last_recorded_utc_ms: now_ms(),
+            checkpoint: None,
         };
         replace(
             &directory.path().join(identity.name()).join("state.json"),
@@ -829,6 +1121,7 @@ mod tests {
                     version: [1, 2, 3],
                     state: RunState::Running,
                     last_recorded_utc_ms: time,
+                    checkpoint: None,
                 },
             )
             .unwrap();
@@ -842,6 +1135,7 @@ mod tests {
                 version: [1, 2, 3],
                 state: RunState::Running,
                 last_recorded_utc_ms: 1000,
+                checkpoint: None,
             },
         )
         .unwrap();
@@ -884,6 +1178,7 @@ mod tests {
                     version: [1, 2, 3],
                     state: RunState::Running,
                     last_recorded_utc_ms: now_ms(),
+                    checkpoint: None,
                 },
             )
             .unwrap();
@@ -908,6 +1203,7 @@ mod tests {
                     version: [1, 2, 3],
                     state: RunState::ReturnedOk,
                     last_recorded_utc_ms: now_ms(),
+                    checkpoint: None,
                 },
             )
             .unwrap();
@@ -1037,6 +1333,7 @@ mod tests {
             version: [4, 10, 0],
             state: RunState::Running,
             last_recorded_utc_ms: now_ms(),
+            checkpoint: None,
         };
         let report = format_report(&record);
         for forbidden in [
@@ -1053,6 +1350,209 @@ mod tests {
         }
         assert!(report.body().len() < MAX_RECORD_BYTES as usize);
         assert!(serde_json::to_vec(&record).unwrap().len() < 1024);
+    }
+
+    #[test]
+    fn stage_b_initialization_boundaries_and_late_terminal_are_absorbing() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = test_support::identity();
+        let shared = Arc::new(Shared::new());
+        let publisher = CheckpointPublisher::new(shared.clone());
+        let mut lease = Some(publisher.begin_job(
+            checkpoint::JobMetadata::default(),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let mut samples = 0;
+        writer_sampling(directory.path(), identity, &shared, |_| {
+            samples += 1;
+            match samples {
+                1 => {
+                    // Activity ends while the initial checkpoint is sampled.
+                    lease.as_ref().unwrap().update(checkpoint::JobUpdate {
+                        stage: checkpoint::JobStage::Completed,
+                        ..Default::default()
+                    });
+                    drop(lease.take());
+                }
+                2 => {
+                    assert_eq!(
+                        shared.state.compare_exchange(
+                            RUNNING,
+                            RETURNED_OK,
+                            Ordering::AcqRel,
+                            Ordering::Acquire
+                        ),
+                        Ok(RUNNING)
+                    );
+                    publisher.publish_display(checkpoint::DisplaySnapshot {
+                        context_id: 999,
+                        ..Default::default()
+                    });
+                }
+                3 => {}
+                _ => panic!("unexpected periodic wake while idle"),
+            }
+            (
+                MemorySample::default(),
+                shared.checkpoint.stamp(),
+                shared.checkpoint.stamp(),
+            )
+        })
+        .unwrap();
+        assert_eq!(samples, 3);
+        let record = test_support::record(directory.path()).unwrap();
+        assert_eq!(record.state, RunState::ReturnedOk);
+        let checkpoint = record.checkpoint.unwrap();
+        assert_eq!(checkpoint.active_leases, 0);
+        assert_eq!(
+            checkpoint.jobs[0].update.stage,
+            checkpoint::JobStage::Completed
+        );
+        assert!(checkpoint.display.is_none());
+        // A late producer can never re-open the finished run.
+        publisher.publish_display(checkpoint::DisplaySnapshot::default());
+        assert_eq!(
+            test_support::record(directory.path()).unwrap().state,
+            RunState::ReturnedOk
+        );
+    }
+
+    #[test]
+    fn stage_b_report_keeps_old_source_times_and_only_typed_fields() {
+        let shared = Arc::new(Shared::new());
+        let publisher = CheckpointPublisher::new(shared.clone());
+        let lease = publisher.begin_job(
+            checkpoint::JobMetadata {
+                job_id: 0,
+                backend: checkpoint::DiagnosticBackend::Unknown,
+                ..Default::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+        );
+        lease.update(checkpoint::JobUpdate {
+            stage: checkpoint::JobStage::GpuRegistration,
+            backend: Some(checkpoint::DiagnosticBackend::DirectMl),
+            ..Default::default()
+        });
+        let mut captured = capture_checkpoint(&shared, &mut |_| {
+            (
+                MemorySample::default(),
+                Stamp {
+                    utc_ms: 100,
+                    run_elapsed_ms: 10,
+                },
+                Stamp {
+                    utc_ms: 90,
+                    run_elapsed_ms: 20,
+                },
+            )
+        });
+        captured.stamp = Stamp {
+            utc_ms: 900,
+            run_elapsed_ms: 800,
+        };
+        let record = Record {
+            schema: SCHEMA,
+            identity: test_support::identity(),
+            version: [4, 10, 0],
+            state: RunState::Running,
+            last_recorded_utc_ms: now_ms(),
+            checkpoint: Some(captured),
+        };
+        let report = format_report(&record);
+        assert!(
+            report
+                .body()
+                .contains("CPU private bytes: unknown / UTC 100 ms / run 10 ms")
+        );
+        assert!(
+            report
+                .body()
+                .contains("UTC 90 ms / run 20 ms / 終了との間隔不明")
+        );
+        assert!(report.body().contains("job不明"));
+        assert!(report.body().contains("DirectMl"));
+        assert!(!report.body().contains("秒前"));
+        assert!(!report.body().contains("終了原因: OOM"));
+        let mut json = serde_json::to_value(&record).unwrap();
+        json["checkpoint"]["jobs"][0]["metadata"]["path"] =
+            serde_json::json!("C:/private/secret.png");
+        assert!(serde_json::from_value::<Record>(json).is_err());
+        drop(lease);
+    }
+
+    #[test]
+    fn stage_b_maximum_numeric_record_and_copy_body_remain_bounded() {
+        let shared = Arc::new(Shared::new());
+        let publisher = CheckpointPublisher::new(shared.clone());
+        let dims = checkpoint::Dimensions {
+            width: u32::MAX,
+            height: u32::MAX,
+        };
+        publisher.publish_display(checkpoint::DisplaySnapshot {
+            context_id: u64::MAX,
+            items_generation: u64::MAX,
+            page: Some(u32::MAX),
+            total: Some(u32::MAX),
+        });
+        let leases: Vec<_> = (1..=6)
+            .map(|id| {
+                let lease = publisher.begin_job(
+                    checkpoint::JobMetadata {
+                        context_id: Some(u64::MAX),
+                        items_generation: Some(u64::MAX),
+                        job_id: id,
+                        page: Some(u32::MAX),
+                        total: Some(u32::MAX),
+                        upscale_model: Some(checkpoint::DiagnosticModel::UpscaleRealEsrganAnime6B),
+                        denoise_model: Some(checkpoint::DiagnosticModel::DenoiseRealplksr),
+                        backend: checkpoint::DiagnosticBackend::DirectMl,
+                        source: Some(dims),
+                        source_bytes: Some(u64::MAX / 6),
+                    },
+                    Arc::new(AtomicBool::new(true)),
+                );
+                lease.update(checkpoint::JobUpdate {
+                    stage: checkpoint::JobStage::TileRun,
+                    backend: Some(checkpoint::DiagnosticBackend::DirectMl),
+                    model: Some(checkpoint::DiagnosticModel::UpscaleRealEsrganAnime6B),
+                    output: Some(dims),
+                    tile: Some(dims),
+                    tile_index: Some(u32::MAX),
+                    tile_total: Some(u32::MAX),
+                });
+                lease
+            })
+            .collect();
+        let record = Record {
+            schema: SCHEMA,
+            identity: test_support::identity(),
+            version: [u16::MAX; 3],
+            state: RunState::Running,
+            last_recorded_utc_ms: now_ms(),
+            checkpoint: Some(capture_checkpoint(&shared, &mut |_| {
+                (
+                    MemorySample::default(),
+                    shared.checkpoint.stamp(),
+                    shared.checkpoint.stamp(),
+                )
+            })),
+        };
+        assert!(serde_json::to_vec(&record).unwrap().len() < MAX_RECORD_BYTES as usize);
+        assert!(format_report(&record).body().len() < MAX_RECORD_BYTES as usize);
+        drop(leases);
+    }
+
+    #[test]
+    fn stage_b_reads_stage_a_records_without_a_checkpoint() {
+        let identity = test_support::identity();
+        let json = serde_json::json!({
+            "schema":SCHEMA, "identity": identity, "version":[4,10,0],
+            "state":"Running", "last_recorded_utc_ms":now_ms()
+        });
+        let record: Record = serde_json::from_value(json).unwrap();
+        assert!(record.checkpoint.is_none());
+        assert!(format_report(&record).body().contains("終了との間隔不明"));
     }
 
     #[test]

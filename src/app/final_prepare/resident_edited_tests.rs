@@ -81,6 +81,7 @@ fn after_ai(app: &mut App, idx: usize) -> Arc<egui::ColorImage> {
     app.final_ai_cache.insert(
         key,
         FinalAiEntry {
+            diagnostic_metadata: None,
             canonical_dims: None,
             source_size: [12, 18],
             pixels: pixels.clone(),

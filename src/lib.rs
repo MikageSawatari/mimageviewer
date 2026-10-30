@@ -22,6 +22,8 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(test)]
+mod diagnostic_entry_tests;
+#[cfg(test)]
 mod egui037_stage4_gpu_tests;
 mod egui_output;
 mod gpu_startup_diagnostics;
@@ -1853,6 +1855,7 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
     let creator_book_composition_owner = Arc::clone(&book_composition_owner);
     gpu_startup_diagnostics::begin(gpu_request);
     let previous_run_report = session.diagnostics.report_handle();
+    let diagnostic_checkpoint = session.diagnostics.publisher();
     let run_result = eframe::run_native(
         "mimageviewer",
         options,
@@ -1916,6 +1919,7 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
                 )
             });
             app.install_previous_run_notice(previous_run_report, &cc.egui_ctx);
+            app.install_diagnostic_checkpoint(diagnostic_checkpoint, cc.wgpu_render_state.as_ref());
             match collection_install.clone() {
                 Ok((client, events)) => {
                     app.install_process_owned_collection_runtime(client, events)
