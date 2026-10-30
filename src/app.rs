@@ -11343,6 +11343,7 @@ fn run_ai_worker(
         // pop 前に cancel された (= 高速ページ送りで keep_set から外れた等) ジョブは
         // 推論せずに Cancelled を返す。これにより無駄な GPU 推論が始まる前に止まる。
         if job.cancel.load(Ordering::Relaxed) {
+            diagnostic_stage(&job.diagnostic, JobStage::ResultWaiting);
             let _ = tx.send(FinalAiResult::Cancelled {
                 diagnostic: job.diagnostic.clone(),
                 job_id: job.job_id,

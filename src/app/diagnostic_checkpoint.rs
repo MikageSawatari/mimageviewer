@@ -126,9 +126,15 @@ impl App {
 mod tests {
     use super::*;
     use crate::app::tests::phase_c_support;
-    use crate::app::{FinalAiEntry, FinalAiPending, FinalAiResult, GridItem};
+    use crate::app::{
+        AiJob, AiJobPriority, AiJobQueue, AiJobQueueState, FinalAiEntry, FinalAiPending,
+        FinalAiResult, GridItem, LocalAiActivityLease, run_ai_worker,
+    };
     use crate::previous_run_diagnostics::test_support;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex, mpsc};
+    use std::time::{Duration, Instant};
 
     fn setup() -> (phase_c_support::AppTestEnv, CheckpointPublisher) {
         let mut app = phase_c_support::setup_app();
@@ -199,6 +205,85 @@ mod tests {
         assert_eq!(publisher.active_count_for_test(), 1);
         app.final_ai_result_backlog.clear();
         assert_eq!(publisher.active_count_for_test(), 0);
+    }
+
+    #[test]
+    fn cancelled_before_run_is_result_waiting_while_receiver_is_held() {
+        let (app, publisher) = setup();
+        let key = FinalAiKey {
+            edit_key: app.current_edit_result_key(0),
+            color_ai_hash: 1,
+            bg: 0,
+        };
+        let cancel = Arc::new(AtomicBool::new(true));
+        let diagnostic = publisher.begin_job(
+            app.diagnostic_job_metadata(7, key, [2, 3], None, None),
+            cancel.clone(),
+        );
+        let worker_activity = Arc::new(AtomicUsize::new(0));
+        let job = AiJob {
+            diagnostic: Some(diagnostic),
+            canonical_dims: None,
+            job_id: 7,
+            key,
+            priority: AiJobPriority::Display,
+            cancel: cancel.clone(),
+            retained_key: None,
+            retained_epoch: 0,
+            runtime: Arc::new(crate::ai::runtime::AiRuntime::empty_for_test()),
+            manager: app.ai_model_manager.clone(),
+            source: Arc::new(egui::ColorImage::filled([2, 3], egui::Color32::WHITE)),
+            adjust_before_ai: None,
+            denoise_kind: None,
+            upscale_kind: None,
+            _local_activity: LocalAiActivityLease::new(worker_activity.clone()),
+        };
+        assert_eq!(publisher.queue_counts_for_test(), (1, Some(24), 0));
+        let inner = Arc::new((
+            Mutex::new(AiJobQueueState {
+                display: [job].into(),
+                prefetch: Default::default(),
+                shutdown: false,
+            }),
+            Condvar::new(),
+        ));
+        let queue = AiJobQueue {
+            inner: inner.clone(),
+        };
+        let (result_tx, result_rx) = mpsc::channel();
+        let (exited_tx, exited_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            run_ai_worker(inner, result_tx);
+            let _ = exited_tx.send(());
+        });
+        // The existing lease drops after the actual job has been sent and
+        // destroyed. Do not drain the result channel to observe completion.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while worker_activity.load(Ordering::Acquire) != 0 {
+            assert!(Instant::now() < deadline, "cancelled worker did not finish");
+            std::thread::yield_now();
+        }
+        drop(queue);
+        exited_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        worker.join().unwrap();
+        assert!(cancel.load(Ordering::Acquire));
+        assert_eq!(publisher.active_count_for_test(), 1);
+        assert_eq!(publisher.queue_counts_for_test(), (0, Some(0), 1));
+
+        let result = result_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        let FinalAiResult::Cancelled {
+            job_id,
+            key: result_key,
+            ..
+        } = &result
+        else {
+            panic!("cancelled job unexpectedly executed");
+        };
+        assert_eq!((*job_id, *result_key), (7, key));
+        assert_eq!(publisher.queue_counts_for_test(), (0, Some(0), 1));
+        drop(result);
+        assert_eq!(publisher.active_count_for_test(), 0);
+        assert_eq!(publisher.queue_counts_for_test(), (0, Some(0), 0));
     }
 
     #[test]

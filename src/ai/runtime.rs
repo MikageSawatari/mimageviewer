@@ -514,6 +514,21 @@ pub struct AiRuntime {
 }
 
 impl AiRuntime {
+    /// Empty test fixture: no ORT environment, DLL, device, or model is loaded.
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            backend: ActiveBackend {
+                requested: AiBackend::DirectMl,
+                effective: AiBackend::DirectMl,
+                dll_path: PathBuf::from("fake-onnxruntime.dll"),
+                fallback_reason: None,
+            },
+            trt_worker_lifecycle: super::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new(),
+        }
+    }
+
     /// 新しい AiRuntime を作成する (DirectML バックエンド、互換 API)。
     ///
     /// テスト・ベンチなど独立process用のショートハンド。GUI process は
@@ -811,16 +826,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn fake_runtime() -> AiRuntime {
-        AiRuntime {
-            sessions: Mutex::new(HashMap::new()),
-            backend: ActiveBackend {
-                requested: AiBackend::DirectMl,
-                effective: AiBackend::DirectMl,
-                dll_path: PathBuf::from("fake-onnxruntime.dll"),
-                fallback_reason: None,
-            },
-            trt_worker_lifecycle: crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new(),
-        }
+        AiRuntime::empty_for_test()
     }
 
     fn wait_activity(publisher: &CheckpointPublisher, expected: u64) {

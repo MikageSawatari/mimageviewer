@@ -4,7 +4,7 @@ use super::{RUNNING, Shared, now_ms};
 use crate::gpu_info::diagnostic_sampler::{AdapterProbe, GpuMemorySample, MemorySample};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 const JOB_SLOTS: usize = 6;
@@ -151,7 +151,6 @@ struct JobSlot {
 struct Mailbox {
     display: Option<Observed<DisplaySnapshot>>,
     jobs: [Option<JobSlot>; JOB_SLOTS],
-    adapter: Option<AdapterProbe>,
 }
 pub(super) struct Publication {
     origin: Instant,
@@ -163,6 +162,9 @@ pub(super) struct Publication {
     stages: [AtomicU64; JobStage::COUNT],
     queued_source_bytes: AtomicU64,
     queued_unknown_sources: AtomicU64,
+    // One immutable source, installed by the sole UI initializer. The writer
+    // only uses get(), so mailbox contention cannot drop its registration.
+    adapter: OnceLock<AdapterProbe>,
     mailbox: Mutex<Mailbox>,
 }
 impl Publication {
@@ -177,6 +179,7 @@ impl Publication {
             stages: std::array::from_fn(|_| AtomicU64::new(0)),
             queued_source_bytes: AtomicU64::new(0),
             queued_unknown_sources: AtomicU64::new(0),
+            adapter: OnceLock::new(),
             mailbox: Mutex::new(Mailbox::default()),
         }
     }
@@ -217,7 +220,7 @@ impl Publication {
         PendingSnapshot {
             display: mailbox.display.clone(),
             jobs: mailbox.jobs.clone(),
-            adapter: mailbox.adapter.clone(),
+            adapter: self.adapter.get().cloned(),
         }
     }
 }
@@ -245,6 +248,18 @@ impl CheckpointPublisher {
             .display
             .map(|display| display.value)
     }
+    #[cfg(test)]
+    pub(crate) fn queue_counts_for_test(&self) -> (u64, Option<u64>, u64) {
+        let checkpoint = super::capture_checkpoint(&self.0, &mut |_| {
+            let stamp = self.0.checkpoint.stamp();
+            (MemorySample::default(), stamp, stamp)
+        });
+        (
+            checkpoint.queued_jobs,
+            checkpoint.queued_source_bytes,
+            checkpoint.result_waiting_jobs,
+        )
+    }
     fn publish(&self, update: impl FnOnce(&mut Mailbox, Stamp)) {
         if self.0.state.load(Ordering::Acquire) != RUNNING {
             return;
@@ -261,9 +276,13 @@ impl CheckpointPublisher {
     pub fn publish_display(&self, value: DisplaySnapshot) {
         self.publish(|mailbox, stamp| mailbox.display = Some(Observed { stamp, value }));
     }
-    /// Clones only existing adapter/device owners. Querying happens on writer.
+    /// The sole startup UI initializer installs an existing adapter/device
+    /// owner once. The writer never initializes this cell or waits on it.
+    /// No query, mailbox lock, retry, or periodic wake is needed here.
     pub(crate) fn set_adapter(&self, adapter: AdapterProbe) {
-        self.publish(|mailbox, _| mailbox.adapter = Some(adapter));
+        if self.0.state.load(Ordering::Acquire) == RUNNING {
+            let _ = self.0.checkpoint.adapter.set(adapter);
+        }
     }
     /// Clones share one real activity group, including after UI pending removal.
     pub fn activity(&self) -> ActivityLease {
@@ -513,6 +532,7 @@ impl Schedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu_info::diagnostic_sampler::{DiagnosticSampler, GpuSampleStatus};
     use crate::previous_run_diagnostics::{RETURNED_OK, capture_checkpoint};
 
     fn publisher() -> CheckpointPublisher {
@@ -541,6 +561,43 @@ mod tests {
             },
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    #[test]
+    fn adapter_registration_survives_busy_mailbox_and_reaches_later_samples() {
+        let publisher = publisher();
+        assert!(publisher.0.checkpoint.snapshot().adapter.is_none());
+        let guard = publisher.0.checkpoint.mailbox.lock().unwrap();
+        // Demonstrate real mailbox contention, without releasing it for install.
+        publisher.publish_display(DisplaySnapshot::default());
+        let installer_publisher = publisher.clone();
+        let (installed_tx, installed_rx) = std::sync::mpsc::channel();
+        let installer = std::thread::spawn(move || {
+            installer_publisher.set_adapter(AdapterProbe::for_test());
+            installed_tx.send(()).unwrap();
+        });
+        let installed = installed_rx.recv_timeout(Duration::from_secs(20));
+        drop(guard); // Release even on failure, so a blocking regression can exit.
+        installer.join().unwrap();
+        assert!(installed.is_ok(), "adapter install waited for the mailbox");
+
+        let sampler = std::thread::spawn(move || {
+            let mut sampler = DiagnosticSampler::new();
+            for _ in 0..2 {
+                let checkpoint = capture_checkpoint(&publisher.0, &mut |adapter| {
+                    sampler.sample_timed(adapter, || publisher.0.checkpoint.stamp())
+                });
+                // This fake Vulkan source needs no GPU/DXGI. It must reach the
+                // real sampler, rather than staying NoRenderAdapter forever.
+                assert_eq!(
+                    checkpoint.gpu.value.status,
+                    GpuSampleStatus::UnsupportedBackend
+                );
+                assert_eq!(checkpoint.gpu.value.adapter.unwrap().vendor_id, 100);
+                assert_eq!(checkpoint.dropped_updates, 1);
+            }
+        });
+        sampler.join().unwrap();
     }
 
     #[test]

@@ -33,6 +33,26 @@ impl AdapterProbe {
     fn descriptor(&self) -> ProbeDescriptor {
         self.0.descriptor()
     }
+
+    /// In-memory source for ownership tests; never creates or queries a GPU.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        struct TestProbe;
+        impl WorkerProbe for TestProbe {
+            fn descriptor(&self) -> ProbeDescriptor {
+                ProbeDescriptor {
+                    identity: AdapterIdentity {
+                        vendor_id: 100,
+                        device_id: 200,
+                        backend: DiagnosticBackend::Vulkan,
+                        luid: None,
+                    },
+                    uma: None,
+                }
+            }
+        }
+        Self(Arc::new(TestProbe))
+    }
 }
 
 impl WorkerProbe for RenderAdapterProbe {

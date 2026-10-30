@@ -460,6 +460,8 @@ producer は既存所有境界で短命の診断活動 lease/件数を渡し、�
 
 DXGI sampler は背景側だけで、既に選択された adapter の LUID/node に相関して local/nonlocal Usage/Budget を照会する。既存 `gpu_info::query_dxgi_video_memory_snapshot` は最初の専用 VRAM 付き adapter を選ぶので、そのまま「AI の VRAM」に転用しない。描画 adapter と ORT/DirectML adapter は別に相関の可否を持ち、ORT 内部 device への直接照会や新しい device 作成を足さない。
 
+起動時に一度だけ決まる不変の採取元は、欠落を許すmailboxと分離した`OnceLock<AdapterProbe>`が保持する。設定するのは既存の起動UI入口だけで、writerは初期化せず`get()`で読む。mailboxとの競合で登録を捨てず、UIの待機・再試行・追加の周期起床も行わない。登録前に採ったsnapshotが未取得でも、後続の採取は設定済みの同じownerを使う。
+
 一致確認できた側だけ「描画 adapter」「AI と同一 adapter」と表記し、DML 側不明なら「AI adapter との一致未確認」。UMA を専用 VRAM 0 の理由で除外せず、local/nonlocal の区分をそのまま出す。LUID/照会不可は unknown。sample ごとに成功/未取得/古い値と採取時刻を持つ。PDH の毎回 open/列挙は常時経路に使わない。予算超過・古い sample だけで OOM/TDR/終了原因を断定せず、予算内でも失敗を否定しない。
 
 checkpoint は通常2～4 KiBを目標、schema 全体16 KiBを上限とする。活動中毎秒保存なら約7～14 MiB/時、上限16 KiBなら約56 MiB/時の論理書込み量になる（計算値であり実測ではない。置換に伴うファイルシステム等の追加書込みは別）。idle は周期起床なし。初期化・保存失敗時に UI の同期 fallback を作らない。
@@ -687,3 +689,24 @@ backendはruntime/推論経路の選択値を記録・表示する。ORT内部�
 単独成功は全件gate成功の代用にしない。これらの失敗を消すための製品変更、待機延長、fixture修正はこの作業では行わず、3回で全件再実行を止めて設計担当へ引き継ぐ。段Bの新規回帰は最終全件実行でも失敗していないが、段B全体の検証完了・受入とは扱わない。
 
 確認用`build-dev.ps1`は、AGENTS.mdの前提であるテスト成功を満たせないため未実施。製品起動、実機GPU/ORT推論、OS tray確認、commitも行っていない。workspace/vendor/doctest全体gateについても、段A末尾に記録したrelease launcher入力3本の不足は今回確認時点で継続しており、未完了を引き継ぐ。結果追記後の差分は文書のみで、最終全件実行以降にRust sourceは変更していない。
+
+### 13. 段B独立レビュー P2/P3 の補正（2026-10-30）
+
+対象は`acab65ef3`への独立レビューREVISE（P2 1件、P3 1件）。この節は同commitからの未commit補正の記録であり、前節までの検証履歴と区別する。段C/Dには進めていない。
+
+- **P2・adapter登録の欠落**: 不変の`AdapterProbe`を`Mailbox`から`Publication`内の`OnceLock`へ移した。既存の起動UI入口が一度だけ設定し、writerはsnapshotごとに`get().cloned()`で読む。writerは初期化に参加しないためUIに他initializerの待機を作らず、mailboxの`try_lock`失敗とも無関係に保持する。serialize/DXGI/I/Oのworker分離、idle時の周期停止は維持し、登録時の再試行・追加起床は行わない。
+- **P2回帰**: `adapter_registration_survives_busy_mailbox_and_reaches_later_samples`で、初回snapshotが未取得だった後、mailboxを保持したまま別threadの登録完了を受信する。metadataのpublishは実際に欠落する競合を作り、その後の別worker上の2回の本体capture/samplerに同じ採取元が届くことを確認する。偽Vulkan sourceを使い、`NoRenderAdapter`ではなくadapter ID付きの`UnsupportedBackend`となることを検査する。GPU/device作成・DXGI照会は行わない（CPU private memoryは通常の採取経路を通る）。
+- **P3・取消済みjobの結果待ち**: `run_ai_worker`が実行前の取消を観測した分岐で、`Cancelled`の送信前に診断段階を`ResultWaiting`へ進める。queue件数と所有入力bytesから除き、結果を回収・破棄するまでは結果待ち件数と活動を保持する。既存の取消token、優先順、推論処理、queueのdetachは変更しない。
+- **P3回帰**: `cancelled_before_run_is_result_waiting_while_receiver_is_held`で、空のtest runtimeと取消済みjobを実dispatcherへ渡す。既存のworker leaseの解放を確認してdispatcherを停止し、receiver未受信のまま本体checkpoint集計が`queue=0 / 所有入力bytes=0 / 結果待ち=1 / 活動=1`であることを検査する。受信した`Cancelled`を保持しても結果待ちは1のまま、破棄後は0となる。ORT環境・DLL・device・modelをロードしないfixtureを既存runtime試験と共有した。
+
+`MSBUILDDISABLENODEREUSE=1`で以下を実行した。新しいUI文言・レイアウト、保存schema、表示/コピー項目の変更はない。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt` / `cargo fmt --check` | 成功 |
+| `cargo check -p mimageviewer --lib --tests --features test-script` | exit 0、1分02秒。`target/ai-crash-655-stage-b-review-check.log` |
+| `cargo test -p mimageviewer --lib diagnostic -- --nocapture` | exit 0、134成功・0失敗・1 ignored。実行1.72秒。上記P2/P3回帰、checkpoint、GPU sampler、runtime活動、入口/寿命の既存回帰を含む。`target/ai-crash-655-stage-b-review-diagnostic.log` |
+| `scripts/test-focused.ps1` | broad/sharedの`src/app.rs`等を検出してexit 2、選択実行0件。`target/ai-crash-655-stage-b-review-focused.log` |
+| `git diff --check` | 成功、記録追記後にも確認 |
+
+全件`test-lib-full.ps1`は設計担当がPCの空いている時に実施するという今回の明示指示に従い、exit 2から自動で進めていない。過去の全件失敗を解消済みとは扱わない。製品起動・commit・追加の独立レビューは行っていない。
