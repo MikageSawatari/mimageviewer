@@ -1332,6 +1332,61 @@ fn section1473_equal_entrance_revisit_via_rating_keeps_complete_back_forward() {
 }
 
 #[test]
+fn section1473_both_markers_truncated_equal_revisit_keeps_entrance_destination() {
+    for portable in [false, true] {
+        let mut app = setup(portable);
+        configure(&mut app);
+        let (origin, kind) = fixture(&mut app, "folder");
+        app.load_folder(origin.clone());
+        settle(&mut app);
+        let entrance = app.folder_nav_current_entry().unwrap();
+        add_history(&app, &origin, kind);
+        enter(&mut app, Entrance::Menu);
+        let root = adopted_history_root(&app);
+        let history = app.folder_nav_current_entry().unwrap();
+        open_container_path(&mut app, &origin);
+        let revisit = app.folder_nav_current_entry().unwrap();
+        assert!(App::folder_nav_targets_eq(
+            &entrance.location,
+            &revisit.location
+        ));
+        assert_eq!(entrance.route, revisit.route);
+        app.enter_rating_view(3);
+        settle(&mut app);
+        // Complete every real Rating adoption, overflowing both the entrance and H marker.
+        for number in 0..MAX_FOLDER_NAV_STACK + 5 {
+            app.enter_rating_view((number % 5 + 1) as u8);
+            settle(&mut app);
+            assert!(app.items_are_rating_view);
+        }
+        assert_eq!(app.folder_nav_back_stack.len(), MAX_FOLDER_NAV_STACK);
+        assert!(
+            app.folder_nav_back_stack
+                .iter()
+                .all(|entry| matches!(entry.location, FolderNavHistoryTarget::Rating(_)))
+        );
+        parent_and_settle(&mut app, "backspace");
+        assert_eq!(app.folder_nav_current_entry(), Some(revisit.clone()));
+        app.enter_rating_view(3);
+        settle(&mut app);
+        parent_and_settle(&mut app, "backspace");
+        parent_and_settle(&mut app, "backspace");
+        assert_eq!(adopted_history_root(&app), root);
+        assert_eq!(app.folder_nav_current_entry(), Some(history.clone()));
+        assert_eq!(app.folder_nav_back_stack.last(), Some(&revisit));
+        assert!(!app.folder_nav_back_stack.iter().any(
+            |entry| matches!(&entry.location, FolderNavHistoryTarget::ReadingHistory(marker)
+                if marker.visit == root.visit)
+        ));
+        // After both markers expire beyond the 100-entry limit, an equal revisit may
+        // affect Back/Forward ordering. This accepted tradeoff must still reach O;
+        // do not require Direct or freeze the stacks for this rare combination.
+        parent_and_settle(&mut app, "backspace");
+        assert_eq!(app.effective_folder(), Some(origin));
+    }
+}
+
+#[test]
 fn section1473_nested_history_rating_preserves_both_visits() {
     for portable in [false, true] {
         for roundtrip in [false, true] {
@@ -1447,6 +1502,48 @@ fn section1473_rating_exit_keeps_its_own_complete_origin() {
             }
         }
     }
+}
+
+#[test]
+fn section1473_bookmark_entrance_direct_exit_must_not_cycle_parent() {
+    let mut results = Vec::new();
+    for portable in [false, true] {
+        let mut app = setup(portable);
+        configure(&mut app);
+        let (book, _) = fixture(&mut app, "zip");
+        let origin = book.parent().unwrap().to_owned();
+        app.load_folder(origin.clone());
+        settle(&mut app);
+        enter_other_root(&mut app, "bookmarks", &origin);
+        let bookmarks = app.current_top_level_restore_snapshot().unwrap();
+        enter(&mut app, Entrance::Menu);
+        let history = adopted_history_root(&app);
+        parent_and_settle(&mut app, "backspace");
+        assert_eq!(
+            app.current_top_level_restore_snapshot(),
+            Some(bookmarks.clone())
+        );
+        let after_exit = app.folder_nav_history_snapshot();
+        parent_and_settle(&mut app, "backspace");
+        let after_two = app.effective_folder();
+        let returned_to_history = matches!(app.current_top_level_restore_snapshot(),
+            Some(top_level_grid_view::TopLevelGridRestore::ReadingHistory(ref root))
+                if root == &history);
+        parent_and_settle(&mut app, "backspace");
+        let returned_to_bookmarks = app.current_top_level_restore_snapshot() == Some(bookmarks);
+        let repeated_cursor = app.folder_nav_history_snapshot() == after_exit;
+        results.push((
+            portable,
+            after_two == Some(origin),
+            returned_to_history,
+            returned_to_bookmarks,
+            repeated_cursor,
+        ));
+    }
+    assert!(
+        results.iter().all(|result| result.1),
+        "(portable, reaches O, returns H, returns Bookmarks, complete cursor repeats): {results:?}"
+    );
 }
 
 #[test]

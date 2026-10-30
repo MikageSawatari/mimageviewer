@@ -617,6 +617,14 @@ markerが見つからない場合は、下記補足に従って同じtyped desti
 - この補足は下の旧stack例のうちmarkerなしの履歴操作を置き換える。
   起動直後の入口なしも既存DirectでDriveListへ移り、rootの型付きpayloadを記録する。
 
+**2026-10-30 再確認後の最終補足（既知の割り切り）**:
+入口判定は`5d63ee761`を維持する。root markerがあればその最初のmarkerの手前、無ければBack全体から入口を探す。
+root markerなしを一律Directにすると、Bookmarksの親（HistoryBack）との間で循環し、通常の退出を壊すため採らない。
+100件上限で入口/rootの両markerが脱落し、さらに同場所・同routeの再訪が残った場合だけは、
+その再訪を入口と認めてBack/Forwardの並びが変わることを既知の割り切りとする。
+行き先は保持したtyped originの入口で正しく、データも失われないため、CLAUDE.mdの
+「まれな失敗は既定で割り切る」に従い、識別field・推定guard・履歴の再構築は追加しない。
+
 **markerありのforwardの規則は、自己markerを除き、途中を描画せず同じ回数のBackをした結果に揃える。**
 既存forwardをclearせず、その末尾へ仮currentを既存の重複整理規則で積む。
 連続する自己markerのための余分なrootを追加しない。実際に別の本や子を挟んだ複数回のroot訪問は残し、
@@ -747,6 +755,7 @@ BA-7に該当するApp側フラグの追加、時間窓、rect/HWND推測、再�
 | 入口を履歴entryだけにして、退出直前にRating/展開等のApp slotから補完 | 不採用（P2×2）。普通の本openがslotを消すため成立しない。path投影の前に完全なpayloadを捕捉し、同じnative ownerへ渡す |
 | 合成一覧の入れ子を禁止/平坦化する / 一覧の組ごとの専用帰路を増やす | 不採用（§3.0）。前者は出荷済みの戻りを失い、後者は組合せを増やす。共通のtyped originで表現を一本化し、Ratingの旧帰路対を置換する |
 | marker不在時の入場前prefix/脱落後suffixを識別し、Back/Forwardを組み直す | **不採用（2026-10-30補足）**。検索経由/上限超過の組合せを扱う境界状態を増やさず、どちらも既存Directへ揃える。完全な入口payloadで行先と位置を維持し、履歴操作だけ通常の前進規則を使う |
+| root markerなしを一律Directにする / 両marker脱落後の再訪を厳密に識別する | **不採用（最終補足）**。前者はBookmarksの親と循環する通常操作回帰を生む。入口探索は`5d63ee761`へ戻し、100件超過と同値再訪が重なる場合のBack/Forward順の差は、行き先が正しくデータ損失もない既知の割り切りとする |
 | Snapshot固定とroot退出prepareを並存させ、成功時にだけ固定を解除 | **不採用（§3.1.1）**。固定のmembership外の入口へは既存admissionで進めない。受付で既存解除を完了してから通常navigationへ揃え、固定＋prepareの組合せと取消時の復活を作らない |
 | 通常Back/Forward全体で同値地点をskip、Return時にstackを全整理 | 不採用。親以外の1件移動や、別visit・facet routeの履歴まで変える。root退出だけの計画に限定する |
 | 本を閉じるたびにrootを新規Menuとして作り直す | 不採用。入口を本に上書きし、既存の行/scroll復元も失う。Returnは同じrootを再構築する |
@@ -1202,4 +1211,45 @@ P2・P3解消、追加指摘なし。設計からの逸脱・操作制限・新�
 実行ログ/JUnitは`target/test-lib-full/runs/20261030T043858389Z-c46bbbe8/`、
 成功台帳は`target/test-lib-full/b45dd14c9b8efc1ec7447d9773427d221413c17f144d1e5f4bfccc2c526e043e.json`。
 検証後の変更はこの結果記録のみ。製品起動・desktop操作・利用者設定/実データの変更・
+確認用build・コミットは行っていない。
+
+### root marker不在時の探索を維持する最終判断（2026-10-30）
+
+`5d63ee761`の再確認後、一度はroot marker不在を一律Directとしたが、
+`O → ブックマークB → H → 親B → 親H → 親B`の循環をheadless試験で再現して停止した。
+通常版/portable相当の両方で、最後の全履歴snapshotが最初のB退出後と一致した。
+停止時の§1.473試験は54成功・3失敗（`target/section1473-marker-missing-targeted.log`）、
+循環の追加実証は2成功・1失敗（`target/section1473-marker-missing-bookmark-cycle.log`）。
+旧Replay前提の展開一覧/lifecycle fixtureに加え、Bookmarksの通常の帰路が失われる回帰だった。
+
+設計担当がこの退行を確認し、一律Directの指示を撤回した。
+製品の入口判定と旧テストの前提を`5d63ee761`へ戻し、新しいfieldや推定guardは追加していない。
+最新の割り切りを設計§4の補足と§8、reading-history-plan、top-level-grid-viewへ反映した。
+追加した試験は消さず、次の名前と責務で残す。
+
+- `section1473_bookmark_entrance_direct_exit_must_not_cycle_parent`:
+  Bookmarksへ退出した後の親でOへ戻れ、H/Bの循環に入らないことを検査する。
+- `section1473_both_markers_truncated_equal_revisit_keeps_entrance_destination`:
+  実際に★段数切替の各adoptionを完了して100件を超え、両markerを失ってから同値の再訪を作る。
+  最後の行き先が入口Oであることを検査し、このまれな組合せのBack/Forward順は固定しない。
+- `section1473_root_exit_plan_without_own_marker_keeps_entrance_destination`:
+  root markerが無く、同値entryが複数あるpure planでも入口payloadを返すことを検査する。
+  同様にDirectや履歴順を要求しない。両試験とも割り切りの理由をコメントした。
+
+復帰後の§1.473絞り込みは**58件全成功**（62.737s、`target/section1473-restored-targeted.log`）。
+ブックマーク循環の回帰と、停止時に失敗した展開一覧・lifecycleの旧前提2件も成功した。
+製品部分が`5d63ee761`と一致することを照合し、今回の差分は追加テストと文書のみである。
+
+| 最終コマンド（Cargoは全て`MSBUILDDISABLENODEREUSE=1`） | 結果・証拠 |
+| --- | --- |
+| `cargo fmt`（引数なし） | exit 0 |
+| `scripts/test-focused.ps1` | 文書変更を含むためexit 2、`target/section1473-restored-focused.log`。指示どおり全libraryへ進んだ |
+| `scripts/test-lib-full.ps1` | **exit 0、14,970成功・失敗0・既存skip65**、788.929s、`target/section1473-restored-lib-full.log` |
+| `cargo run --locked -p viewer_context_audit` | **exit 0・違反0**、`target/section1473-restored-context-audit.log` |
+| `git diff --check` | exit 0 |
+
+JUnitと成功台帳の件数・exitを照合し、全library中の§1.473の58件も全成功と確認した。
+生ログ/JUnitは`target/test-lib-full/runs/20261030T051942333Z-2081b212/`、
+成功台帳は`target/test-lib-full/9909e59567aa3d3849962fec113bc58d168c8552ccc43c4b8b8ef764fab2573f.json`。
+検証後は本節の結果記録だけを更新した。製品起動・desktop操作・利用者設定/実データの変更・
 確認用build・コミットは行っていない。

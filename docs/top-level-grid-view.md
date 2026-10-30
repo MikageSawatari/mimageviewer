@@ -10,6 +10,8 @@ Everythingの既存scope判定後の物理親だけは下位操作へ渡し、�
 ReadingHistoryのrootはvisit identityと完全な `TopLevelGridOrigin` の退出先を所有する。
 本からrootへのReturnと、rootから入口への退出を区別し、同じ合成pathでも別visitを統合しない。
 入口markerが履歴に残れば自己markerを跨ぐBack計画、なければ通常Directで同じ入口へ退出する。
+入口の探索範囲は現visitの最初のroot markerより手前、root markerが無ければBack全体とする。
+100件上限で両markerが脱落し同場所・同routeの再訪が残る場合、入口への到達を維持し、Back/Forward順の差は既知の割り切りとする。
 どちらも同じoriginから場所・行・scroll・native帰路を復元し、marker脱落の推定stateは追加しない。
 
 Rating自身の帰路はpath/展開restoreの対から単一のtyped originへ置換し、入場、transition、

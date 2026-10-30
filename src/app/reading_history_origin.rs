@@ -586,6 +586,32 @@ mod tests {
     }
 
     #[test]
+    fn section1473_root_exit_plan_without_own_marker_keeps_entrance_destination() {
+        let o = origin("O");
+        let root = make_root(
+            17,
+            ReadingHistoryExit::RecordedEntrance(Box::new(o.clone())),
+        );
+        let h = history(&root, "H");
+        for back in [
+            vec![folder("X"), entry(&o)],
+            vec![folder("X"), entry(&o), folder("Y"), entry(&o)],
+        ] {
+            let forward = vec![folder("F")];
+            let (_plan, actual) = FolderHistoryPlan::reading_history_root_exit(
+                h.clone(),
+                &back,
+                &forward,
+                None,
+                &root,
+            );
+            // Both markers may have expired while an equal revisit remains. The accepted
+            // tradeoff preserves the entrance destination, without fixing stack ordering.
+            assert_eq!(actual, o);
+        }
+    }
+
+    #[test]
     fn section1473_root_exit_plan_skips_only_own_adjacent_markers_and_keeps_visible_route() {
         let o = origin("O");
         let root = make_root(
