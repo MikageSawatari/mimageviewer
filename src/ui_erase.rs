@@ -29,27 +29,8 @@ use crate::ui_fullscreen::FsKeyAction;
 use crate::ui_fullscreen::draw_icons::{PanelToggleColors, panel_toggle_button};
 use crate::vector_edit;
 
-/// キー保持の受付だけを所有する。ボタンとの合成・補完投入は既存の preview 遷移で行う。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum ErasePreviewHoldState {
-    #[default]
-    Released,
-    Held,
-    BlockedUntilRelease,
-}
-
-impl ErasePreviewHoldState {
-    fn update(&mut self, held: bool, released: Option<bool>, drawing_in_progress: bool) {
-        *self = match (*self, held, released, drawing_in_progress) {
-            (_, _, Some(true), _) => Self::Released,
-            (Self::BlockedUntilRelease, _, _, _) | (Self::Released, _, Some(false), true) => {
-                Self::BlockedUntilRelease
-            }
-            (_, true, _, _) => Self::Held,
-            _ => Self::Released,
-        };
-    }
-}
+#[cfg(test)]
+use crate::edit_preview::EditPreviewHoldState;
 
 /// 消しゴム MI-GAN ジョブの用途。
 ///
@@ -719,6 +700,13 @@ impl App {
     /// 消しゴムモード中のキー入力を処理する。
     /// 通常のフルスクリーンショートカットをブロックし、消しゴム専用キーのみ有効にする。
     pub(crate) fn handle_erase_keys(&mut self, ctx: &egui::Context, fs_idx: usize) -> FsKeyAction {
+        let drawing_in_progress = self.erase_drawing_in_progress();
+        self.erase_preview_hold.read_before_keys(
+            ctx,
+            &self.keymap,
+            KeyAction::ErasePreviewHold,
+            drawing_in_progress,
+        );
         if self.book_structural_op.is_some() {
             return Default::default();
         }
@@ -1650,29 +1638,13 @@ impl App {
     }
 
     fn update_erase_preview_hold(&mut self, ctx: &egui::Context) {
-        // Legacy keymap helpers leave Modal to their callers (unlike TextInput).
-        // This canvas-side reader must enforce that same pass owner itself.
-        let permit = crate::keyboard_input::focused_key_state_permit(ctx).filter(|_| {
-            crate::keyboard_input::cached_keyboard_owner(ctx)
-                != Some(crate::keyboard_input::KeyboardOwner::Modal)
-        });
-        let held = permit.is_some_and(|permit| {
-            self.keymap
-                .key_held_action(ctx, permit, KeyAction::ErasePreviewHold)
-        });
         let drawing_in_progress = self.erase_drawing_in_progress();
-        let released = if drawing_in_progress
-            || self.erase_preview_hold == ErasePreviewHoldState::BlockedUntilRelease
-        {
-            permit.and_then(|permit| {
-                self.keymap
-                    .key_hold_binding_released(ctx, permit, KeyAction::ErasePreviewHold)
-            })
-        } else {
-            None
-        };
-        self.erase_preview_hold
-            .update(held, released, drawing_in_progress);
+        self.erase_preview_hold.read(
+            ctx,
+            &self.keymap,
+            KeyAction::ErasePreviewHold,
+            drawing_in_progress,
+        );
     }
 
     /// ドラッグ入力を処理する（ツール別分岐）。
@@ -1751,17 +1723,11 @@ impl App {
             return;
         }
 
-        if pointer_over_panel && !primary_released {
+        if self.edit_preview_owns_canvas(self.erase_preview_active, primary_down) {
             return;
         }
 
-        // Preview owns the canvas; navigation above keeps its own primary stream.
-        // Consume a held canvas press through its release so leaving preview
-        // cannot turn the remainder of that press into a brush/shape operation.
-        if self.erase_preview_active {
-            if primary_down {
-                self.fs_primary_suppression.arm_pointer_stream();
-            }
+        if pointer_over_panel && !primary_released {
             return;
         }
 
@@ -3032,18 +2998,13 @@ impl App {
 
     /// ボタンとキーを合成した一つの押下遷移で、保存なしプレビューを投入する。
     fn update_erase_preview(&mut self, ctx: &egui::Context, pointer_pressed: bool) {
-        // Canvas input precedes the panel. A key and a drawing press can arrive
-        // together, so respect a drawing owner created in this same frame too.
-        if !self.erase_preview_active
-            && self.erase_preview_hold == ErasePreviewHoldState::Held
-            && self.erase_drawing_in_progress()
-        {
-            self.erase_preview_hold = ErasePreviewHoldState::BlockedUntilRelease;
-        }
-        // MI-GAN は既存の非同期経路を使う。保持中は再投入せず、押し直すと
-        // 最新マスクで再投入する。空マスクなら何も起きない。
-        let preview_pressed =
-            pointer_pressed || self.erase_preview_hold == ErasePreviewHoldState::Held;
+        let drawing_in_progress = self.erase_drawing_in_progress();
+        let preview_pressed = self.erase_preview_hold.merge(
+            pointer_pressed,
+            self.erase_preview_active,
+            drawing_in_progress,
+        );
+        // MI-GAN は既存の非同期経路を使い、合成した false → true でだけ投入する。
         let preview_just_pressed = !self.erase_preview_active && preview_pressed;
         self.erase_preview_active = preview_pressed;
         if preview_just_pressed && let Some(fs_idx) = self.fullscreen_idx {
@@ -4971,7 +4932,7 @@ mod book_erase_tests {
         preview_hold_frame(&mut app, &ctx, egui::Key::Tab, true, false, true, None);
         assert!(Arc::ptr_eq(&second, &preview_job_cancel(&app)));
         app.reset_erase_mode();
-        assert_eq!(app.erase_preview_hold, ErasePreviewHoldState::Released);
+        assert_eq!(app.erase_preview_hold, EditPreviewHoldState::Released);
         assert!(!app.erase_preview_active);
         assert!(second.load(Ordering::Relaxed));
     }
@@ -5063,7 +5024,7 @@ mod book_erase_tests {
             preview_hold_frame(&mut app, &ctx, egui::Key::Tab, false, false, true, None);
             assert_eq!(
                 app.erase_preview_hold,
-                ErasePreviewHoldState::BlockedUntilRelease,
+                EditPreviewHoldState::BlockedUntilRelease,
                 "kind={kind}"
             );
             assert!(!app.erase_preview_active);
@@ -5089,7 +5050,7 @@ mod book_erase_tests {
             preview_hold_frame(&mut app, &ctx, egui::Key::Tab, true, false, true, None);
             assert_eq!(
                 app.erase_preview_hold,
-                ErasePreviewHoldState::BlockedUntilRelease
+                EditPreviewHoldState::BlockedUntilRelease
             );
             preview_key_level(crate::key_input::SyntheticNavigationKey::G, false);
             preview_hold_frame(&mut app, &ctx, egui::Key::Tab, true, false, true, None);
@@ -5108,7 +5069,7 @@ mod book_erase_tests {
             preview_hold_frame(&mut app, &ctx, egui::Key::Tab, true, false, true, None);
             assert_eq!(
                 app.erase_preview_hold,
-                ErasePreviewHoldState::BlockedUntilRelease
+                EditPreviewHoldState::BlockedUntilRelease
             );
             assert!(!app.erase_preview_active);
             preview_key_level(key, false);
@@ -6045,7 +6006,7 @@ mod section1445_slider_tests {
         );
         assert_eq!(
             harness.state().erase_preview_hold,
-            ErasePreviewHoldState::BlockedUntilRelease
+            EditPreviewHoldState::BlockedUntilRelease
         );
         assert!(!harness.state().erase_preview_active);
         assert!(harness.state().erase_inpaint_pending.is_empty());
@@ -6107,7 +6068,7 @@ mod section1445_slider_tests {
         );
         assert_eq!(
             harness.state().erase_preview_hold,
-            ErasePreviewHoldState::BlockedUntilRelease
+            EditPreviewHoldState::BlockedUntilRelease
         );
         harness.run_steps(2);
         assert!(!harness.state().erase_preview_active);

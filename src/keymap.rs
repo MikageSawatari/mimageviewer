@@ -1995,6 +1995,7 @@ pub enum KeyAction {
     ConcealToolEllipse,
     ConcealSpacePan,
     ConcealScrubZoomHold,
+    ConcealPreviewHold,
     CropForceCreateHold,
     CropSpacePan,
     CropScrubZoomHold,
@@ -2601,6 +2602,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ConcealToolEllipse,
     KeyAction::ConcealSpacePan,
     KeyAction::ConcealScrubZoomHold,
+    KeyAction::ConcealPreviewHold,
     KeyAction::CropForceCreateHold,
     KeyAction::CropSpacePan,
     KeyAction::CropScrubZoomHold,
@@ -4661,6 +4663,7 @@ impl KeyAction {
             EraseSpacePan => "EraseSpacePan",
             EraseScrubZoomHold => "EraseScrubZoomHold",
             ErasePreviewHold => "ErasePreviewHold",
+            ConcealPreviewHold => "ConcealPreviewHold",
             ConcealExit => "ConcealExit",
             ConcealConfirmPolygon => "ConcealConfirmPolygon",
             ConcealRedo => "ConcealRedo",
@@ -5442,6 +5445,7 @@ impl KeyAction {
             EraseScrubZoomHold => "押しながら左右ドラッグで拡大・縮小する",
             EraseSpacePan => "押している間だけ画像をパン操作する",
             ErasePreviewHold => "押している間だけ消しゴムの結果をプレビューする",
+            ConcealPreviewHold => "押している間だけ隠蔽加工の結果をプレビューする",
             ConcealExit => "隠蔽加工モードを終了する",
             ConcealConfirmPolygon => "隠蔽加工の多角形を確定する",
             ConcealRedo => "隠蔽加工編集をやり直す",
@@ -6029,7 +6033,8 @@ impl KeyAction {
             | ConcealToolHLine
             | ConcealToolRect
             | ConcealToolEllipse
-            | ConcealSpacePan => KeyContext::Conceal,
+            | ConcealSpacePan
+            | ConcealPreviewHold => KeyContext::Conceal,
             CropExecute | CropForceCreateHold | CropSpacePan => KeyContext::Crop,
             SnsSplitExecute => KeyContext::SnsSplit,
             TextConfirm | TextRedo | TextUndo | TextSpacePan => KeyContext::Text,
@@ -6057,8 +6062,8 @@ impl KeyAction {
             FsNavigatorHold | FsLoupeHold | FsOriginalPreviewHold | CropForceCreateHold => {
                 KeyTrigger::ModifierHold
             }
-            EraseSpacePan | ErasePreviewHold | ConcealSpacePan | CropSpacePan | TextSpacePan
-            | LaSpacePan | FsZoomMode => KeyTrigger::KeyHold,
+            EraseSpacePan | ErasePreviewHold | ConcealSpacePan | ConcealPreviewHold
+            | CropSpacePan | TextSpacePan | LaSpacePan | FsZoomMode => KeyTrigger::KeyHold,
             GlobalLocalSearch
             | GlobalFavSearch
             | GlobalMetadataSearch
@@ -7153,7 +7158,7 @@ impl KeyAction {
             EraseEraseMode => ChordList::one(Chord::key(F)),
             EraseScrubZoomHold => ChordList::one(Chord::ctrl(Space)),
             EraseSpacePan => ChordList::one(Chord::key(Space)),
-            ErasePreviewHold => ChordList::one(Chord::key(Tab)),
+            ErasePreviewHold | ConcealPreviewHold => ChordList::one(Chord::key(Tab)),
             ConcealExit => ChordList::one(Chord::ctrl(M)),
             ConcealConfirmPolygon => ChordList::one(Chord::key(Enter)),
             ConcealRedo => ChordList::two(Chord::ctrl(Y), Chord::ctrl_shift(Z)),
@@ -13469,59 +13474,69 @@ mod tests {
 
     #[test]
     fn erase_preview_hold_defaults_display_and_policy_are_complete_and_nonconflicting() {
-        let action = KeyAction::ErasePreviewHold;
-        let keymap = Keymap::empty();
-        let chord = Chord::key(KeyName::Tab);
-        assert!(KeyAction::all().contains(&action));
-        assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
-        assert_eq!(action.context(), KeyContext::Erase);
-        assert_eq!(action.trigger(), KeyTrigger::KeyHold);
-        assert_eq!(
-            CommandSpec::from_action(action).binding_policy,
-            BindingPolicy::SinglePlainKey
-        );
-        assert_eq!(
-            action.default_chords().iter().collect::<Vec<_>>(),
-            vec![chord]
-        );
-        assert!(action.is_user_facing());
-        assert!(
-            keymap
-                .command_display_rows_for_active_scopes(&[KeyContext::Erase], false)
-                .iter()
-                .any(|row| row.spec.action == action)
-        );
-        assert_eq!(
-            keymap.chord_list_bracket_label("preview", action),
-            "preview [Tab]"
-        );
-        for other in KeyAction::all()
-            .iter()
-            .copied()
-            .filter(|other| *other != action && actions_can_overlap(action, *other))
-        {
-            assert!(
-                !other
-                    .default_chords()
-                    .iter()
-                    .any(|candidate| candidate == chord),
-                "{other:?}"
+        for action in [KeyAction::ErasePreviewHold, KeyAction::ConcealPreviewHold] {
+            let context = action.context();
+            let keymap = Keymap::empty();
+            let chord = Chord::key(KeyName::Tab);
+            assert!(KeyAction::all().contains(&action));
+            assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+            assert!(matches!(context, KeyContext::Erase | KeyContext::Conceal));
+            assert_eq!(action.trigger(), KeyTrigger::KeyHold);
+            assert_eq!(
+                CommandSpec::from_action(action).binding_policy,
+                BindingPolicy::SinglePlainKey
             );
+            assert_eq!(
+                action.default_chords().iter().collect::<Vec<_>>(),
+                vec![chord]
+            );
+            assert!(action.is_user_facing());
+            assert!(
+                keymap
+                    .command_display_rows_for_active_scopes(&[context], false)
+                    .iter()
+                    .any(|row| row.spec.action == action)
+            );
+            assert_eq!(
+                keymap.chord_list_bracket_label("preview", action),
+                "preview [Tab]"
+            );
+            for other in KeyAction::all()
+                .iter()
+                .copied()
+                .filter(|other| *other != action && actions_can_overlap(action, *other))
+            {
+                assert!(
+                    !other
+                        .default_chords()
+                        .iter()
+                        .any(|candidate| candidate == chord),
+                    "{other:?}"
+                );
+            }
+            assert!(!actions_can_overlap(action, KeyAction::FsToggleMetadata));
+            let rebound = Keymap::from_ini_str(&format!(
+                "[{}]\n{} = U\n",
+                context.ini_name(),
+                action.ini_name()
+            ));
+            assert!(rebound.warnings().is_empty());
+            assert_eq!(
+                rebound.chord_list_bracket_label("preview", action),
+                "preview [U]"
+            );
+            let disabled = Keymap::from_ini_str(&format!(
+                "[{}]\n{} = none\n",
+                context.ini_name(),
+                action.ini_name()
+            ));
+            assert_eq!(
+                disabled.chord_list_bracket_label("preview", action),
+                "preview"
+            );
+            assert!(parse_chord_for_action(action, "Ctrl").is_err());
+            assert!(parse_chord_for_action(action, "Ctrl+Tab").is_err());
         }
-        assert!(!actions_can_overlap(action, KeyAction::FsToggleMetadata));
-        let rebound = Keymap::from_ini_str("[Erase]\nErasePreviewHold = G\n");
-        assert!(rebound.warnings().is_empty());
-        assert_eq!(
-            rebound.chord_list_bracket_label("preview", action),
-            "preview [G]"
-        );
-        let disabled = Keymap::from_ini_str("[Erase]\nErasePreviewHold = none\n");
-        assert_eq!(
-            disabled.chord_list_bracket_label("preview", action),
-            "preview"
-        );
-        assert!(parse_chord_for_action(action, "Ctrl").is_err());
-        assert!(parse_chord_for_action(action, "Ctrl+Tab").is_err());
     }
 
     #[cfg(windows)]

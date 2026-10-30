@@ -175,6 +175,7 @@ impl App {
 
         self.conceal_mode = true;
         self.conceal_preview_active = false;
+        self.conceal_preview_hold = Default::default();
         self.conceal_preview_button_rect = None;
         self.clear_meta_undo();
         if !self.post_filter_bypassed {
@@ -226,13 +227,7 @@ impl App {
         // キーボードやページ切替で mid-drag 終了された場合も、保存前の解像度同期を
         // ブロックしないよう中間状態だけ先に畳む。未確定の線/矩形/lasso は
         // 通常の release 前キャンセルとして破棄される。
-        self.conceal_drag = None;
-        self.conceal_last_paint_pos = None;
-        self.conceal_lasso_points.clear();
-        self.conceal_line_start = None;
-        self.conceal_line_end = None;
-        self.conceal_shape_drag_start = None;
-        self.conceal_shape_drag_end = None;
+        self.cancel_conceal_tool_operation();
         if let Some((pixels, _)) = self.current_conceal_source_pixels(idx) {
             self.rescale_active_conceal_edit_to_size(idx, pixels.size, reason);
         }
@@ -267,6 +262,7 @@ impl App {
 
         self.conceal_mode = false;
         self.conceal_preview_active = false;
+        self.conceal_preview_hold = Default::default();
         self.conceal_preview_button_rect = None;
 
         if was_conceal_mode {
@@ -362,6 +358,7 @@ impl App {
         // install the new editor in the same pass.
         self.conceal_mode = false;
         self.conceal_preview_active = false;
+        self.conceal_preview_hold = Default::default();
         self.conceal_mask = None;
         self.conceal_mask_size = [0, 0];
         self.conceal_mask_texture = None;
@@ -615,6 +612,13 @@ impl App {
         ctx: &egui::Context,
         _fs_idx: usize,
     ) -> FsKeyAction {
+        let drawing_in_progress = self.conceal_drawing_in_progress();
+        self.conceal_preview_hold.read_before_keys(
+            ctx,
+            &self.keymap,
+            KeyAction::ConcealPreviewHold,
+            drawing_in_progress,
+        );
         if self.book_structural_op.is_some() {
             return Default::default();
         }
@@ -824,24 +828,8 @@ impl App {
             switched = Some(ConcealTool::Ellipse);
         }
         if let Some(tool) = switched
-            && tool != self.conceal_tool
+            && self.switch_conceal_tool(tool)
         {
-            let entering_select = tool == ConcealTool::Select;
-            self.conceal_tool = tool;
-            self.conceal_drag = None;
-            self.conceal_lasso_points.clear();
-            self.conceal_line_start = None;
-            self.conceal_line_end = None;
-            self.conceal_shape_drag_start = None;
-            self.conceal_shape_drag_end = None;
-            // ツール切替時は選択も解除 (= 別ツールに移ったので前の shape の
-            // ハンドル編集は終了とみなす、Codex P1 対応)。
-            // ただし **Select に入る場合は保持** (commit_conceal_shape が auto-select
-            // した shape を [S] でそのまま編集できるようにする、code-review CONFIRMED)。
-            if !entering_select {
-                self.conceal_selected_shape = None;
-            }
-            self.conceal_mask_texture = None;
             let toast = self.conceal_tool_toast(Self::conceal_tool_base_label(tool), tool);
             self.show_feedback_toast(toast);
         }
@@ -1315,6 +1303,45 @@ impl App {
 
     // ── 入力処理 ──────────────────────────────────────────────────
 
+    /// 退出・ページ切替と同じく、反映済みの筆跡・図形の変形は残し、未確定形状を破棄する。
+    fn cancel_conceal_tool_operation(&mut self) {
+        self.conceal_drag = None;
+        self.conceal_last_paint_pos = None;
+        self.conceal_lasso_points.clear();
+        self.conceal_line_start = None;
+        self.conceal_line_end = None;
+        self.conceal_shape_drag_start = None;
+        self.conceal_shape_drag_end = None;
+    }
+
+    /// キー・パネル共通のツール切替。旧ツールの操作所有は次のツールへ持ち越さない。
+    fn switch_conceal_tool(&mut self, tool: ConcealTool) -> bool {
+        if tool == self.conceal_tool {
+            return false;
+        }
+        self.cancel_conceal_tool_operation();
+        self.conceal_tool = tool;
+        // Select 入場時は自動選択した図形をそのまま編集できるよう保持する。
+        if tool != ConcealTool::Select {
+            self.conceal_selected_shape = None;
+        }
+        self.conceal_mask_texture = None;
+        true
+    }
+
+    fn conceal_drawing_in_progress(&self) -> bool {
+        self.conceal_pointer_operation_in_progress() || !self.conceal_lasso_points.is_empty()
+    }
+
+    /// 継続中の左ドラッグの所有者。多角形の頂点待ちは次の押下を所有しない。
+    fn conceal_pointer_operation_in_progress(&self) -> bool {
+        self.conceal_last_paint_pos.is_some()
+            || self.conceal_line_start.is_some()
+            || self.conceal_shape_drag_start.is_some()
+            || self.conceal_drag.is_some()
+            || (self.conceal_tool == ConcealTool::Lasso && !self.conceal_lasso_points.is_empty())
+    }
+
     /// ドラッグ入力を処理する (ツール別 dispatch)。
     pub(crate) fn handle_conceal_paint(
         &mut self,
@@ -1322,6 +1349,14 @@ impl App {
         transform: &DisplayedImageTransform,
         overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
+        // 解放処理より前に読み、描画終了フレームの押下も持ち越さない。
+        let drawing_in_progress = self.conceal_drawing_in_progress();
+        self.conceal_preview_hold.read(
+            ctx,
+            &self.keymap,
+            KeyAction::ConcealPreviewHold,
+            drawing_in_progress,
+        );
         if self.book_structural_op.is_some() {
             return;
         }
@@ -1359,11 +1394,6 @@ impl App {
         // パネル上で離した場合は state を片付けないとリーク (Codex P2 #6) する。
         // → release 検知時は通常 dispatch を通し、各 tool ハンドラが state リセットする。
         let panel_rect = self.conceal_panel_rect(full_rect);
-        let drawing_in_progress = self.conceal_last_paint_pos.is_some()
-            || self.conceal_line_start.is_some()
-            || self.conceal_shape_drag_start.is_some()
-            || self.conceal_drag.is_some()
-            || !self.conceal_lasso_points.is_empty();
         let pointer_over_panel = pointer_pos.is_some_and(|pos| panel_rect.contains(pos));
         if !drawing_in_progress
             && self.handle_overlay_space_pan_drag(
@@ -1381,6 +1411,10 @@ impl App {
                 pointer_pos,
             )
         {
+            return;
+        }
+
+        if self.edit_preview_owns_canvas(self.conceal_preview_active, primary_down) {
             return;
         }
 
@@ -1976,12 +2010,19 @@ impl App {
         // press already has its canonical owner from the previous pass; do not reinterpret
         // that overflow press as an eye-button hold after entering conceal mode by key.
         let primary_down = primary_down && !self.fs_front_pointer.owns_primary_in(viewport_id);
-        self.conceal_preview_active = conceal_preview_pointer_active(
-            self.conceal_mode,
-            self.conceal_preview_button_rect,
-            pointer_pos,
-            primary_down,
-        );
+        // An editing drag keeps its owner while crossing the panel. Do not let the
+        // geometric eye pre-read turn that stream into preview suppression.
+        let pointer_active = !self.conceal_pointer_operation_in_progress()
+            && conceal_preview_pointer_active(
+                self.conceal_mode,
+                self.conceal_preview_button_rect,
+                pointer_pos,
+                primary_down,
+            );
+        // キー受付は所有 viewport の canvas が担当する。ROOT の入力で読み直さず、
+        // 前 pass で受付済みの保持を目ボタンと合成して pipeline の前に確定する。
+        self.conceal_preview_active =
+            self.conceal_mode && self.conceal_preview_hold.active(pointer_active);
         #[cfg(test)]
         ctx.data_mut(|data| {
             data.insert_temp(
@@ -2348,13 +2389,19 @@ impl App {
                                     if eye_resp.is_pointer_button_down_on() {
                                         preview_pressed = true;
                                     }
-                                    eye_resp.on_hover_text(
+                                    eye_resp.on_hover_text(self.keymap.chord_list_bracket_label(
                                         "押している間: モザイク反映後の最終結果プレビュー",
-                                    );
+                                        KeyAction::ConcealPreviewHold,
+                                    ));
                                 },
                             );
                         });
-                        self.conceal_preview_active = preview_pressed;
+                        let drawing_in_progress = self.conceal_drawing_in_progress();
+                        self.conceal_preview_active = self.conceal_preview_hold.merge(
+                            preview_pressed,
+                            self.conceal_preview_active,
+                            drawing_in_progress,
+                        );
                         if close_clicked {
                             should_close_after_draw = true;
                         }
@@ -2538,15 +2585,21 @@ impl App {
                                                 for &(kind, base_label) in row.iter() {
                                                     let label =
                                                         self.conceal_tool_label(base_label, kind);
-                                                    if panel_toggle_button(
+                                                    let response = panel_toggle_button(
                                                         ui,
                                                         label.as_str(),
                                                         tool == kind,
                                                         Some(btn_size),
                                                         None,
-                                                    )
-                                                    .clicked()
-                                                    {
+                                                    );
+                                                    #[cfg(test)]
+                                                    if kind == ConcealTool::Select {
+                                                        ctx.data_mut(|data| data.insert_temp(
+                                                            egui::Id::unique("conceal_select_button_test_rect"),
+                                                            response.rect,
+                                                        ));
+                                                    }
+                                                    if response.clicked() {
                                                         tool = kind;
                                                     }
                                                 }
@@ -2562,23 +2615,7 @@ impl App {
                                             )
                                             .wrap(),
                                         );
-                                        if tool != self.conceal_tool {
-                                            let entering_select = tool == ConcealTool::Select;
-                                            self.conceal_tool = tool;
-                                            self.conceal_drag = None;
-                                            self.conceal_lasso_points.clear();
-                                            self.conceal_line_start = None;
-                                            self.conceal_line_end = None;
-                                            self.conceal_shape_drag_start = None;
-                                            self.conceal_shape_drag_end = None;
-                                            // ツール切替時は選択もクリア (Codex P1 対応)。
-                                            // Select 入場時は auto-select 維持
-                                            // (code-review CONFIRMED)。
-                                            if !entering_select {
-                                                self.conceal_selected_shape = None;
-                                            }
-                                            self.conceal_mask_texture = None;
-                                        }
+                                        self.switch_conceal_tool(tool);
 
                                         // ツール固有設定。設定を持たないツールでは区切りも見出しも出さない。
                                         let settings_tool_name = match self.conceal_tool {
