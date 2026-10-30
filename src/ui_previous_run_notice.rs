@@ -124,7 +124,7 @@ mod tests {
     use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
     use egui_kittest::{Harness, kittest::Queryable};
 
-    const SUMMARY: &str = "前回、mIV は正常に終了しませんでした。\n原因は記録されていません。強制終了・電源断などでも、この表示になります。";
+    const SUMMARY: &str = "前回の正常終了を確認できませんでした。\n原因は記録されていません。強制終了・電源断などでも、この表示になります。";
     const DETAILS: &str = "最終記録時刻: 2026-10-30 19:23:45 (UTC+09:00) / 終了との間隔不明\nmIV 4.10.0 / 記録ID core-1234-5678\n最終記録以降に状態が変わった可能性があります。\n";
     fn fixture_report(long: bool) -> PreviousRunReport {
         let summary = if long {

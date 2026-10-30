@@ -73,7 +73,7 @@ mod tests {
         };
         assert!(
             body.summary()
-                .contains("前回、mIV は正常に終了しませんでした")
+                .contains("前回の正常終了を確認できませんでした")
         );
         assert!(
             handle.take_report().is_none(),
@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn visible_report_survives_hidden_frames_and_is_immutable() {
         let body = PreviousRunReport::from_sections(
-            "前回、mIV は正常に終了しませんでした。".into(),
+            "前回の正常終了を確認できませんでした。".into(),
             "詳細".into(),
         );
         let mut notice = PreviousRunNotice::Visible(body.clone());

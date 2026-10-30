@@ -694,7 +694,7 @@ fn report_summary(
             ));
         }
     }
-    let mut summary = "前回、mIV は正常に終了しませんでした。".to_owned();
+    let mut summary = "前回の正常終了を確認できませんでした。".to_owned();
     if observations.is_empty() {
         summary
             .push_str("\n原因は記録されていません。強制終了・電源断などでも、この表示になります。");
@@ -1513,7 +1513,7 @@ mod tests {
         assert!(
             report
                 .body()
-                .contains("前回、mIV は正常に終了しませんでした")
+                .contains("前回の正常終了を確認できませんでした")
         );
         assert!(other.take_report().is_none());
         finish(&mut next, GuiRunOutcome::ReturnedOk);
