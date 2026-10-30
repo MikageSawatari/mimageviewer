@@ -1023,3 +1023,86 @@ default ScrollArea、physics式、F12／contextのmove／swap／fork／parkの�
 最終の文書・証跡照合もSol / xhigh独立レビューでACCEPTとなった。
 reviewerは各結果と、変更した四つのRust sourceのSHAがfull検証時のものと一致することを確認し、
 Cargoや製品実行を重複していない。追加の未解決指摘はない。
+
+<a id="implementation-review-orphan-release"></a>
+
+### 20be36843 の再レビュー後の確認と設計前提の相違（2026-10-30）
+
+開始時は `20be36843`、作業ツリーはclean。前回四件の解消は再レビューで確認されたが、
+「本物mouseのclickの後の孤立したRetired releaseを、セルclickの発生元と誤認する」P2が追加された。
+今回は以下の実Context回帰を追加した。**修正完了ではなく、所有境界の設計補足が必要なため停止している。**
+
+#### 依頼された入力列のRED
+
+`src/app/tests/scroll_661.rs` の次の二件は、実App・両rendererの実cell captureを通す。
+
+- `thumbnail_mouse_click_before_retired_orphan_release_is_applied`
+- `details_mouse_click_before_retired_orphan_release_is_applied`
+
+二指touchのStart後、同pathのA/B採用でsessionを交代し、旧主指のEnd／release／Goneを処理する。
+その旧captureのreleaseが選択を変えないことを確認したうえで、第二指だけが残る状態から、
+本物mouseのMoved→press→release、旧第二指のEnd(q)→release(p)→Goneを同frameへ渡す。
+nativeのcell ID／`clicked_by(Primary)`／`InteractionSnapshot.clicked`、二つのreleaseの`Some(click)`を確認し、
+mouse clickによる選択とExplorerのチェック解除を期待する。HEADでは両方とも選択がNoneのままで失敗した。
+先行REDは **0 PASS / 2 FAIL**（exit100）、`target/scroll661-orphan-release-red.log`。
+
+#### press区間だけでは実capture区間を復元できない
+
+frame-localにpress／releaseを順に読み、各releaseは「前frameからの区間、または新pressが開いた区間」を
+一度だけ閉じるものとする候補を試した。後続のpressなしreleaseはclick-bearingでも発生元候補にしない。
+any buttonのreleaseでeguiの共有captureが解放される点も反映した。
+この候補では依頼二件・既存の旧cell release二件・ordinal回帰一件の **5 PASS**を確認した
+（exit0、`target/scroll661-orphan-release-green.log`、run `8ab8a4c8-e4c3-4d36-bc7f-560484d22f4d`）。
+途中の参照型の推論ミスによるcompile失敗は、テスト結果には数えていない。
+
+ただし、新pressが**実際にwidgetをcaptureしたか**は、この区間列には含まれない。
+同じ適用境界の次の列で、旧Retired clickを本物mouseへ誤って付け替える。
+
+1. 前frameに旧touchでcellをpressし、eguiの実captureを成立させる。
+2. session交代後のframeに、旧End→release→Goneを渡す。これは旧cellのnative clickを生成する。
+3. 同frameの後半に、widgetのない場所で本物mouseをMoved→press→releaseする。
+   後者にも`Some(click)`が付くが、captureがないのでnativeのclicked IDは更新されない。
+
+`touch_correlation::tests::retired_capture_click_is_not_reassigned_to_later_uncaptured_mouse_interval`
+は実Contextと実`TouchCorrelationState`でこの列を検査する。最初のcapture、最後のnative clicked ID、
+二つのclick-bearing release、序数0のRetired／序数1のMouseを確認し、旧cell clickの抑止を期待する。
+press区間候補でも **0 PASS / 1 FAIL**（exit100、`target/scroll661-orphan-release-capture-interval-red.log`）となった。
+空間のcontains判定で推定するとeguiの前pass hit-test／重なり／
+hit radius等をAppで再実装することになるため、そのguardは足さない。
+
+`vendor/egui/src/interaction.rs::interact` は、release時に`potential_click_id`が実widgetを指す場合だけ
+`clicked`を更新し、すべてのreleaseでcaptureを解放する。孤立releaseだけでなく、click対象のない新pressの
+後のreleaseも、既存の`clicked`を上書きしない。一方、公開の`InteractionSnapshot`はclicked IDだけを返し、
+それを更新したreleaseの序数を返さない。`Memory::interaction()`もcrate-privateであり、描画時点では
+release済みcaptureの履歴が残っていない。順序付き入力だけから実widgetのclick発生元を決められる、という
+前提が不足しているため、候補の製品コード変更を撤回し、回帰だけを残す。
+
+#### 設計担当へ渡す最小の補足案（未承認・未実装）
+
+- eguiの`interaction.rs::interact`が**実captureからclickedを更新した瞬間**に、そのpointer releaseの
+  button／序数をsnapshotのframe-localな由来情報として対応付ける。clickを更新しなかったreleaseは
+  この情報を変更しない。既存のclick／drag／captureの配送判断は変えない。
+- Appは既存の公開`Context::interaction_snapshot`で、そのclicked IDに対応する由来を読み、
+  `CorrelatedPrimary`の既存release ordinalと照合する。クリックのcaptureをAppで複製しない。
+  clickのないStill dragのterminal抑止は、click由来とは分けて維持する。
+- 新しい永続bool／pending／guard、待機、capture移送、再hit-test、mouse混在の中断規則変更は不要。
+  新Heldを変更しない。long-touch等のpointer release以外のclickは別の由来として区別する。
+- `context.rs`／`scroll_physics.rs`／egui-winitの変更は不要と考えるが、少なくとも
+  **現在変更禁止の`interaction.rs`への変更が必要になる案**であり、設計担当による範囲補足前には実装しない。
+  snapshotの型／API・既定経路への影響・vendor台帳は、その補足とレビューで確定する。
+
+#### 停止時の検証範囲
+
+全build／testは `MSBUILDDISABLENODEREUSE=1`。製品候補の修正は残さず、追加回帰はignoreせずに保持する。
+候補撤回後の最終差分は本節とテスト三件だけ。`cargo fmt`（引数なし）／`git diff --check`は成功した。
+最終状態で次のコマンドを実行し、**0 PASS / 3 FAIL**（exit100、0.988s）を確認した。
+ログは `target/scroll661-orphan-release-final-red.log`。native capture／clickの前提assertをすべて通過し、
+二件は本物mouseの選択適用、一件は旧Retired clickの抑止という本来の期待値で失敗している。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/mouse_click_before_retired_orphan_release_is_applied/) | test(/retired_capture_click_is_not_reassigned_to_later_uncaptured_mouse_interval/)' --no-fail-fast --retries 0 --no-tests fail
+```
+
+今回の未解決相違を直した実装としてのfeature check／focused→full／snapshot／auditは未完了であり、
+前節の成功を今回の修正完了の根拠にはしない。vendor・製品起動・desktop操作・実profile・commitは変更／実行していない。
+独立レビューはClaudeCodeが別に依頼する。本節に独立レビューの合格判断は含めない。

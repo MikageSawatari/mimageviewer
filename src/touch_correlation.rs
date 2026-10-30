@@ -2927,6 +2927,82 @@ mod tests {
     }
 
     #[test]
+    fn retired_capture_click_is_not_reassigned_to_later_uncaptured_mouse_interval() {
+        let ctx = egui::Context::default();
+        let mut state = TouchCorrelationState::default();
+        let old_scope = egui::Id::unique("captured-click-old");
+        let new_scope = egui::Id::unique("captured-click-new");
+        let cell_id = egui::Id::unique("captured-click-cell");
+        let cell_rect = Rect::from_min_max(pos2(100.0, 100.0), pos2(200.0, 200.0));
+        let point = cell_rect.center();
+        let outside = pos2(800.0, 600.0);
+        let mut run = |scope, events: Vec<Event>, time: f64| {
+            state.select_scope(CommandScope::MainGrid(scope));
+            let frame =
+                state.process_frame(&grid_geometry(), &events, (time * 1000.0) as u64, true);
+            let mut response = None;
+            ctx.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(grid_geometry().surface),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|ui| {
+                        response = Some(ui.interact(cell_rect, cell_id, egui::Sense::click()));
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
+            (response.unwrap(), frame)
+        };
+        let _ = run(old_scope, Vec::new(), 0.0);
+        let (held, _) = run(old_scope, grid_start(1, point), 0.1);
+        assert!(held.is_pointer_button_down_on());
+        let (response, frame) = run(
+            new_scope,
+            vec![
+                touch(1, egui::TouchPhase::End, point),
+                primary(point, false),
+                Event::PointerGone,
+                Event::PointerMoved(outside),
+                primary(outside, true),
+                primary(outside, false),
+            ],
+            0.2,
+        );
+        assert!(response.clicked_by(PointerButton::Primary));
+        assert_eq!(
+            ctx.interaction_snapshot(|snapshot| snapshot.clicked),
+            Some(cell_id)
+        );
+        assert!(!response.contains_pointer());
+        let releases = ctx.input(|input| {
+            input
+                .pointer
+                .released_buttons_with_click_counts()
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(releases.len(), 2);
+        assert!(releases.iter().all(|(_, click)| click.is_some()));
+        assert!(frame.primary_events.iter().any(|event| {
+            event.phase == PrimaryPhase::Button(false)
+                && event.release_ordinal == 0
+                && event.ownership == PrimaryOwnership::Retired
+        }));
+        assert!(frame.primary_events.iter().any(|event| {
+            event.phase == PrimaryPhase::Button(false)
+                && event.release_ordinal == 1
+                && event.ownership == PrimaryOwnership::Mouse
+        }));
+        assert!(
+            frame.should_suppress_response(&response),
+            "the native cell click closed the retired capture; the later mouse press hit no widget"
+        );
+    }
+
+    #[test]
     fn response_release_ordinal_survives_removed_current_and_later_nonclick_release() {
         for nonclick_tail in [false, true] {
             let ctx = egui::Context::default();

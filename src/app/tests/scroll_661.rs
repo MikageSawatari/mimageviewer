@@ -1790,3 +1790,111 @@ fn retired_thumbnail_cell_release_does_not_consume_later_mouse_hold() {
 fn retired_details_cell_release_does_not_consume_later_mouse_hold() {
     retired_cell_tap_after_adoption(true, true);
 }
+
+fn mouse_cell_click_before_retired_orphan_release(details: bool) {
+    #[cfg(windows)]
+    let _native_input = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    let (mut env, mut driver, _) = input_fixture(details);
+    env.grid_scroll.request_edge(GridScrollIntent::Top);
+    driver.tick(&mut env, None);
+    let point = cell_input_response(&env, &driver.ctx, 1)
+        .interact_rect
+        .center();
+    let secondary = point + egui::vec2(20.0, 0.0);
+    let source = env.current_folder.clone().unwrap();
+    env.set_quick_folder_slot_target(QuickFolderSlotId::A, source.clone());
+    env.set_quick_folder_slot_target(QuickFolderSlotId::B, source.clone());
+    env.active_quick_folder_slot = Some(QuickFolderSlotId::A);
+    driver.tick_events(
+        &mut env,
+        None,
+        vec![
+            raw_touch(1, egui::TouchPhase::Start, point),
+            egui::Event::PointerMoved(point),
+            pointer_button(point, true),
+            raw_touch(2, egui::TouchPhase::Start, secondary),
+        ],
+    );
+    assert!(cell_input_response(&env, &driver.ctx, 1).is_pointer_button_down_on());
+    let old_scope = env.grid_scroll_scope();
+    assert!(matches!(
+        env.activate_quick_folder_slot(QuickFolderSlotId::B),
+        QuickFolderSwitchTarget::Current
+    ));
+    assert_ne!(env.grid_scroll_scope(), old_scope);
+    let selected = env.selected;
+    driver.tick_events(
+        &mut env,
+        None,
+        vec![
+            raw_touch(1, egui::TouchPhase::End, point),
+            pointer_button(point, false),
+            egui::Event::PointerGone,
+        ],
+    );
+    assert_eq!(
+        env.selected, selected,
+        "the old captured touch release must remain rejected"
+    );
+    env.checked.insert(4);
+    let point = cell_input_response(&env, &driver.ctx, 1)
+        .interact_rect
+        .center();
+    let cell_id = cell_input_response(&env, &driver.ctx, 1).id;
+    driver.tick_events(
+        &mut env,
+        None,
+        vec![
+            egui::Event::PointerMoved(point),
+            pointer_button(point, true),
+            pointer_button(point, false),
+            // The old secondary never supplied a native press. egui-winit's open
+            // touch gate still emits its release at the last mouse cursor point.
+            raw_touch(2, egui::TouchPhase::End, secondary + egui::vec2(2.0, 1.0)),
+            pointer_button(point, false),
+            egui::Event::PointerGone,
+        ],
+    );
+    let response = cell_input_response(&env, &driver.ctx, 1);
+    assert_eq!(response.id, cell_id);
+    assert!(response.clicked_by(egui::PointerButton::Primary));
+    assert_eq!(
+        driver.ctx.interaction_snapshot(|snapshot| snapshot.clicked),
+        Some(cell_id)
+    );
+    let releases = driver.ctx.input(|input| {
+        input
+            .pointer
+            .released_buttons_with_click_counts()
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(releases.len(), 2);
+    assert!(
+        releases
+            .iter()
+            .all(|(button, click)| *button == egui::PointerButton::Primary && click.is_some()),
+        "both releases look clickable to PointerState, but only the first closes a capture"
+    );
+    assert_eq!(
+        env.selected,
+        Some(1),
+        "the genuine mouse click must survive the later retired orphan release"
+    );
+    assert!(
+        env.checked.is_empty(),
+        "the genuine plain Explorer click must clear checks"
+    );
+    assert_eq!(env.current_folder.as_ref(), Some(&source));
+    assert!(env.fullscreen_idx.is_none());
+}
+
+#[test]
+fn thumbnail_mouse_click_before_retired_orphan_release_is_applied() {
+    mouse_cell_click_before_retired_orphan_release(false);
+}
+#[test]
+fn details_mouse_click_before_retired_orphan_release_is_applied() {
+    mouse_cell_click_before_retired_orphan_release(true);
+}
