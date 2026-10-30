@@ -324,11 +324,14 @@ touch の描画位置 = canonical + 既存の一時 remainder
 - `DrivenSurface` と replay result の既存フレーム印にも MainGrid の所属を含める。**通常drive・transport-only・replayは、すべて同じviewportの `ctx.cumulative_frame_nr()` を共有する。** 現 `ui_main.rs:19512` 付近の `self.frame_counter` を渡す経路はこのviewport番号へ接続する。`App::input_frame_diagnostics`（`update_phases.rs:1748`付近）はApp更新呼出しごとにcounterを増やすため、同一egui frameのdiscard / 複数passの再生判定には使わない。App全体のcounterとその既存用途は変更せず、touchの共有駆動印を使うStillFullscreen側も同じviewport番号で照合する。別viewportの値は混ぜない。
 - 同じ `ctx.cumulative_frame_nr()` の後続passでsessionが替わっても、既に駆動したイベントを新規Startとして再駆動しない。コマンドは再配送せず、Retiredの相関・抑止情報を保つ。描画前に採用した宛先へ初めてdriveする場合は、そのframeの新Startを宛先で受理する。次のviewport frameでは新規入力を通常受理する。
 
-**同frameのtouch／mouse混在についての設計補足（設計担当判断 2026-10-30）**:
+**同frameの複数所属release混在についての設計補足（設計担当判断 2026-10-30）**:
 旧touch由来のセルclickは、そのframeのclick-bearing primary releaseがすべてRetiredの場合だけ抑止する。
 同frameにMouseのclick-bearing releaseが一つでもあれば抑止せず、v4.10.0のpointer fallbackを保つ。
 曖昧Currentの除去で所属を証明できないreleaseも、Retiredとはみなさない。判定は既存のframe-localな
 `PrimaryOwnership`とrelease ordinalで行い、press区間の推測、追加bool／pending／guardは使わない。
+許容範囲はMouseの混在だけではない。抑止しないCurrent tapや所属不明のclick-bearing releaseが同frameに
+混ざる場合も、v4.10.0と同じpointer fallbackになる。純touchでCurrentとRetiredが同frameに共存する場合を
+含む、**複数所属のreleaseが混在するframe**を§1.487の範囲とし、そのcell clickの完全な隔離は保証しない。
 非clickのmouse releaseはこの混在判定へ数えず、clickがないStill dragのterminal抑止と、
 既存Current gestureが要求する抑止は維持する。
 
@@ -1143,6 +1146,9 @@ cargo nextest run -p mimageviewer --lib -E 'test(/mouse_click_before_retired_orp
 既存`PrimaryOwnership`へ対応させる。旧touch由来のセル応答は、すべてRetiredの場合だけ抑止する。
 Mouseが一つでもあれば抑止しない。曖昧Currentが除去されて所属を証明できないreleaseも抑止根拠にせず、
 ordinary pointer fallbackを維持する。クリックのない場合は、従来どおり最後のterminal releaseを用いる。
+これはMouseだけの例外ではなく、抑止しないCurrent tapや所属不明のclick-bearing releaseが同frameに
+混ざる場合もv4.10.0と同じfallbackになる。純touchのCurrent／Retired共存を含む複数所属のrelease混在も
+§1.487の許容範囲であり、隔離保証の対象外とする。
 共通helperを使うStillFullscreen等の既存Current gestureの`should_suppress`要求も保持する。
 状態field／bool／pending／guard／queueは増やさず、press区間の候補は使わない。
 新Held、一般のmouse混在によるrecognizer中断、transport照合、eguiのcapture配送を変更しない。
@@ -1201,3 +1207,34 @@ F12／contextのmove・swap・fork・park、rendererのgeometry、一般のmouse
 共通workspace fullのrelease内包exe不足による前節の未完了は継続し、今回の本体lib全件成功とは区別する。
 実機未確認。独立レビューはClaudeCodeが別に依頼する。
 製品起動・desktop操作・実profile・確認用build・commitは行っていない。
+
+### be45531ec の再レビューP3補足（2026-10-30）
+
+設計担当から独立再レビューのACCEPT（P1・P2なし）とP3一件の説明補足依頼を受けた。
+開始時HEADは `be45531ec`、作業ツリーはclean。今回は製品ロジックを変更していない。
+
+- 設計補足と§1.487に、fallbackがMouse混在だけの例外ではないことを明記した。
+  抑止しないCurrent tapや所属不明のclick-bearing releaseが同frameに混ざる場合も、
+  v4.10.0と同じfallbackになる。純touchでCurrentとRetiredが共存する場合を含む
+  複数所属releaseの混在は、cell clickを完全に隔離した保証の範囲外である。
+- `ambiguous_click_release_ordinals_preserve_pointer_fallback_with_nonclick_tail` では、
+  該当press位置にraw Touch Startがないこと、最初の曖昧判定原因がそのpressの`UnmatchedPrimary`であること、
+  frameでMouseに分類されることを追加assertした。先行Currentの相関結果が除去される既存assertと、
+  release ordinal／click有無／Retired所属／fallback／replayの期待はすべて維持した。
+- 製品コード・vendor・状態field・ignoreは変更しない。再レビューの判断は設計担当からの受領記録であり、
+  この補足差分について独立レビューを実行したという意味ではない。
+
+検証は `MSBUILDDISABLENODEREUSE=1` で実施した。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt`（引数なし） | 成功 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/touch_correlation::/) \| test(/scroll_661::/)' --no-fail-fast --retries 0 --no-tests fail` | **71 PASS / 0 FAIL**、実行10.404s、compile 1m57s、exit0 |
+| `git diff --check` | 成功 |
+
+runは `1fa82995-b30a-4290-96eb-37fb2c7ddabe`、ログは `target/scroll661-p3-release-scope-tests.log`。
+追加assertはnonclick tailの有無の両方で成功した。既存の入力列・期待値・ignoreは変更していない。
+HEADと現在の `touch_correlation.rs` をLF正規化し、`#[cfg(test)] mod tests` より前の内容が同一であることも確認した
+（SHA-256 `265b9a874c3986a22fcf55703d1c3dc281feb6ac6ee838428f9244e6afd72f26`）。
+今回の差分は文書と試験内の観測・assertだけなので、指示範囲の二モジュールを実行し、前節の全件／snapshot／
+auditは再実行していない。製品起動・desktop操作・確認用build・commitも行っていない。

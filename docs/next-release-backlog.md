@@ -78,12 +78,14 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.487 旧二指touchの第二指のMoveが、新しく始めたmouse dragへ混ざる — >>661の統合確認から (2026-10-30)
 
-- 状態: **未着手・>>661から分離（設計担当判断 2026-10-30）**。touchとmouseを同時に使う操作の既存不具合。通常の一覧移動で旧bounds・速度・captureを持ち越す>>661とは分けて扱う。
+- 状態: **未着手・>>661から分離（設計担当判断 2026-10-30）**。touchとmouseを同時に使う操作の既存不具合と、同frameの複数所属release混在に対する許容範囲。通常の一覧移動で旧bounds・速度・captureを持ち越す>>661とは分けて扱う。
 - 再現: 旧一覧で二指touch → 別一覧へ移る → 主指を離す（第二指は保持）→ 新mouseで一覧背景をdrag → 旧第二指を動かす。backendの空いたpointer gateから出るsynthetic Moveを、新mouseのnative scrollが採る。
 - 基点検証: v4.10.0の `b10dc7406` をテスト用に展開し、同じ入力列・実worker・両入力の対照・実rendererを通す回帰が失敗。no-tailはnative offset756を維持、旧Moveありは756→800、直後のmouse移動も対照656に対し576となる。基点の同frame描画は756のまま、行丸め後は両方630となり、このfixtureでは差が見えない。>>661修正後はphysics後の位置でviewport／content originを確定するため同frameのviewportも800となる。この反映タイミングの差を「今回の影響なし」とは扱わない。
 - 根拠と証跡: [>>661調査書の基点比較](scroll-661-investigation.md#mixed-input-v410-baseline)。native pointer eventの由来を受理境界へつなぎ、本物mouseのcapture・慣性・直前位置を保って旧touch由来だけを隔離する設計が必要。修正案・規模は未確定。
 - 回帰は `src/app/tests/scroll_661.rs::retired_secondary_touch_move_cannot_drive_a_new_mouse_capture` を理由付きignoreで保持。基点でもState不変assertが失敗することを記録し、設計担当の指示に従って>>661の必須gateから除外する。実機イベント配送・製品画面は未確認。
 - 同frameのrelease／click混在も本項の範囲（設計担当判断 2026-10-30）。旧touchのreleaseとMouseのclick-bearing releaseが同frameに入る場合は、v4.10.0と同じくセル応答を抑止しない。例: 旧touchでcellをpress→一覧session交代→同frameに旧End／release／Gone→widgetのない場所へmouseをMoved／press／release。この場合も旧cellのnative clickは適用される。混在しない旧touch releaseは>>661の修正で拒否する。`mixed_retired_capture_and_uncaptured_mouse_click_keep_v410_pointer_fallback` はこの許容挙動を自動検査し、ignoreしない。[設計補足・再修正台帳](scroll-661-investigation.md#implementation-review-mixed-release)を参照。egui中核interactionの変更案は保守負担から不採用。
+
+- 許容範囲はMouseの混在に限らない。抑止しないCurrent tapや所属不明のclick-bearing releaseが同frameに混ざる場合も、v4.10.0と同じpointer fallbackとする。純touchでCurrentとRetiredが共存する場合を含む「複数所属のreleaseが混在するframe」では、cell clickを完全に隔離したとは扱わない。すべてのclick-bearing releaseが抑止対象の場合だけ拒否する規則であり、既存Current gestureの抑止要求は維持する。
 
 ### 1.488 一覧へ戻ると保存した位置から上へ動く — 5ch >>661／コレクション帰還 (2026-10-30)
 

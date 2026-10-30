@@ -3027,7 +3027,21 @@ mod tests {
                     primary(retired, false),
                 ]);
             }
-            let frame = state.process_frame(&grid_geometry(), &events, 100, true);
+            // This press has no raw Touch Start. It is unmatched mouse input,
+            // whose ambiguity removes the earlier Current correlation results.
+            assert!(!events.iter().any(|event| matches!(
+                event,
+                Event::Touch { phase: egui::TouchPhase::Start, pos, .. } if *pos == retired
+            )));
+            let (frame, diagnostics) =
+                state.process_frame_with_diagnostics(&grid_geometry(), &events, 100, true, true);
+            let diagnostics = diagnostics.unwrap();
+            assert!(diagnostics.ambiguous());
+            assert!(diagnostics.ambiguity_causes.first().is_some_and(|cause| {
+                matches!(cause.kind, AmbiguityCauseKind::UnmatchedPrimary)
+                    && cause.event == primary(retired, true)
+            }));
+            assert!(frame.is_mouse_primary(retired, true));
             assert!(
                 !frame
                     .primary_events
