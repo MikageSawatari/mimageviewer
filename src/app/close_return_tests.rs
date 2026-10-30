@@ -50,7 +50,7 @@ fn main_bookmarks(env: &mut AppTestEnvForTest, target: BookmarkViewReturnTarget)
         grid: BookmarkViewReturnGridState {
             row_keys: (1..=30).map(|id| (0, id)).collect(),
             selected_key: Some((0, 2)),
-            opened_key: (0, 2),
+            opened_key: Some((0, 2)),
             scroll_offset_y: 240.0,
         },
     });
@@ -389,7 +389,7 @@ fn close_return_main_selection_scroll_and_same_list_refresh_survive_until_consum
     };
     assert_eq!(grid.selected_key, Some((0, 10)));
     assert_eq!(grid.scroll_offset_y, 420.0);
-    assert_eq!(grid.opened_key, (0, 2));
+    assert_eq!(grid.opened_key, Some((0, 2)));
     let grid = grid.clone();
     let keys: Vec<_> = env
         .bookmark_browser_rows
@@ -473,7 +473,7 @@ fn close_return_changed_bookmark_poll_preserves_live_main_position_before_consum
             };
             assert_eq!(grid.selected_key, Some(selected_key));
             assert_eq!(grid.scroll_offset_y, 420.0);
-            assert_eq!(grid.opened_key, (0, 2));
+            assert_eq!(grid.opened_key, Some((0, 2)));
             assert_eq!(
                 grid.row_keys,
                 env.bookmark_browser_rows
@@ -554,7 +554,7 @@ fn close_return_empty_bookmark_poll_adopts_empty_live_grid() {
         "deleted rows cannot return as saved keys"
     );
     assert_eq!(grid.selected_key, None);
-    assert_eq!(grid.opened_key, (0, 2));
+    assert_eq!(grid.opened_key, Some((0, 2)));
     assert_eq!(grid.scroll_offset_y, 420.0);
     env.finish_page_identity_preparation_for_test();
 
@@ -788,7 +788,7 @@ fn close_return_standalone_bookmark_navigation_survives_viewer_teardown() {
         grid: BookmarkViewReturnGridState {
             row_keys: vec![(1, 4)],
             selected_key: Some((1, 4)),
-            opened_key: (1, 4),
+            opened_key: Some((1, 4)),
             scroll_offset_y: 123.0,
         },
     });
@@ -813,7 +813,7 @@ fn close_return_standalone_bookmark_navigation_survives_viewer_teardown() {
     let Some(BookmarkViewState::Opening { grid, .. }) = env.bookmark_view_state.as_ref() else {
         panic!("the existing Bookmarks dispatcher receives the retained grid");
     };
-    assert_eq!(grid.opened_key, (1, 4));
+    assert_eq!(grid.opened_key, Some((1, 4)));
     assert_eq!(grid.scroll_offset_y, 123.0);
     assert!(env.take_pending_return_to_parent_nav().is_none());
 }

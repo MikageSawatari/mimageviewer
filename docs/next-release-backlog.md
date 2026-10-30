@@ -85,13 +85,31 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 方針: ユーザーが選んだ幅と、起動途中・制約下の描画幅を区別し、画面サイズの変化だけで保存する希望値が書き換わらないようにする。比率 / 実幅のどちらを設定として持つか、手動リサイズと上下限の扱いを設計時に確定する。遅延や強制リセットで症状だけを抑えない。
 - 検証: 起動と終了を繰り返す幅復元、通常 → 最大化、同一サイズの対照、手動リサイズ、DPI / 作業領域の変更、最小・最大幅を回帰する。関連: [起動時のちらつき調査](section327-startup-window-flicker-investigation.md)、`vendor/egui/src/containers/panel.rs::outer_size`。規模 / 優先度: Small〜Medium の暫定見積り / P2。
 
-### 1.473 履歴から開いたフォルダで親へ移動すると内部キャッシュへ入る — 5ch >>643 (2026-10-29)
+### 1.486 Snapshot（★固定）の固定ownerとcanonical origin / routeの単一所有
 
-- 状態: **未着手・不具合調査として採用 (2026-10-29)**。原因未特定、実アプリでの再現は未確認、修正時期は未指定。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、「履歴フォルダ」からフォルダを開いた後、親へ移動すると `mImageViewer_portable\data\cache` へ移ると報告。
+- 状態: **未着手・§1.473から分離（設計担当決定 2026-10-30）**。根拠は[§1.473調査記録の再停止](history-parent-1473-investigation.md#再停止snapshotの固定ownerに関する設計前提不足2026-10-30)。`docs/`全体の`### 1.48`を検索し、1.486が未使用であることを確認して採番した。
+- 問題: 固定rowsはSnapshotState、canonical origin/routeはTopLevelGridViewが別々に持つ。一時的な別surfaceの採用で帰路が失われ、既存の固定list復帰はrows/path/recipeまででsurface・行provenance・routeを一括で再採用しない。同じpathの固定listと別surfaceもpath比較では区別できない。
+- 方針: 固定ownerと完全な帰路の単一所有、一時surfaceを採用しても失わない配送、固定listの再採用をsurface・行provenance・routeまで含むowner操作として設計する。解除/dismiss、Back/Forward、fork/close、同pathと異なるcontextの生命周期を揃え、新bool/並列Option/逆算guardで補わない。
+- §1.473の限定対応: 閲覧履歴rootからの親は既存の固定解除を終えて捕捉済canonical originへ戻す。固定listの完全な再採用機構は今回作らない。
+- 受入候補: 普通Folder/ReadingHistory/★/Bookmarks/検索由来の固定から別surfaceへ入り、固定listへの復帰・解除・一時ビュー移譲を確認する。特に同pathの別visit、行flag/来歴/route、行・scroll、未採用/取消、bundle/fork/closeとsibling不変を含める。設計時に通常利用の挙動を確定する。
+
+### 1.473 閲覧履歴から開いたフォルダで親へ移動すると内部キャッシュへ入る — 5ch >>643・>>656 (2026-10-29)
+
+- 状態: **実装済み・実機未確認 (2026-10-30、対象 v4.11.0 予定)**。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、「履歴フォルダ」からフォルダを開いた後、親へ移動すると `mImageViewer_portable\data\cache` へ移ると報告。開発側では「本→親で閲覧履歴へ正常復帰→さらに親で実data_dir、cache選択→Enterで実cache」を再現した。報告者が同じ追加操作をしたかと、実アプリでの確認は未確認。
+- 実装・検証: typed root/完全な帰路、親受付の共通化、Tagの漏れを修正。最終全libraryは**14,965成功・失敗0・既存skip65**、うち§1.473は**53件全成功**（元の赤2件を含む）。core/feature付きlib-tests check、fmt、glyph、context audit（違反0）も成功し、独立実装レビューACCEPT。通常/portable相当の一時data_dirで検証し、製品起動・コミットは行っていない。生ログ・補完した同型経路は[調査記録](history-parent-1473-investigation.md)末尾を参照。
+- 再開判断 (2026-10-30): Snapshot全体の所有を作り直す課題は§1.486へ分離。完全な固定一覧再採用の既存経路がないため、既存dismissで固定を終えて入口payloadのcanonical originへ戻す案を採った。固定の部分復帰や新field/逆算は追加せず、同pathのH1/H2と解除後取消も自動検証済み。固定中の親ボタンdisabledは維持し、許可されるBS/Alt+↑/mouse/ringを同じ退出へ通す。
+- 実装停止時の記録 (2026-10-30、WIP `7916a1e97`保存前): 承認設計 `cae94fb27` とmarker不在時Directの補足に沿う途中差分で、45件中44成功・Snapshot1失敗を確認した。Snapshot canonical originが共有TopLevelGridViewにしかなく、H採用で破棄され、list復帰もsurface/来歴/routeを再採用しないため停止。設計担当の限定解除方針を受領して再開し、現在は上記検証を完了した。Snapshot本体の所有問題は§1.486に残す。
+- 回答済みの条件 ([>>656](https://egg.5ch.io/test/read.cgi/software/1782419551/656)): 入口は**閲覧履歴**。主にマウスのサイドボタンへ割り当てて使い、ファイルメニューから閲覧履歴を開いても同じ。フォルダバーの「履歴▼」から開く場合は起きない。入口は再質問しない。
 - 期待する動作: 現在の一覧の論理的な場所と戻り元に従って移動する。閲覧履歴へ戻す仕様と実フォルダの親へ移る仕様は区別するが、内部キャッシュを利用者向けの親フォルダとして開くのは意図しない。
 - コード確認: `src/app.rs::effective_folder` は `archive_source_override` を優先し、`reading_history_back_nav` / `resolve_grid_parent_nav` は履歴等の戻り先を先に判定する。変換済み書庫から履歴へ戻る単体テスト (`reading_history_back_nav_handles_converted_archive`) もある。このため、単純にキャッシュ ZIP の親を見ていると断定せず、履歴からの open 完了時に論理パス・実体パス・戻り元が正しく渡るか調べる。`reading_history_synthetic_path` は `data/__reading_history__` であり、報告の `data/cache` と同一視しない。
-- 調査: 場所メニューの「閲覧履歴」、フォルダバーの「履歴▼」、戻る / 進むの入口を確認し、実フォルダと変換書庫の各 load / switch / back 経路を追う。親ボタンとキー操作の共通処理、メイン / 別窓での所有状態も確認し、利用者に全組み合わせの試験を頼まない。「履歴フォルダ」がどの入口かは未確定なので、追加質問をする場合は入口の確認だけに絞る。
-- 修正時: 誤った場所・戻り元を作る境界で直し、正常な閲覧履歴への復帰や書庫内の階層移動を壊さない。入口から親移動までの状態遷移に回帰テストを追加する。関連: [ナビゲーション仕様](fullscreen-navigation-consistency.md)、`src/ui_main.rs` の親ボタンとフォルダ open。規模 / 優先度: 原因調査後に確定 / P2。
+- 調査: ファイルメニュー・リング・マウス割り当ての「閲覧履歴」を入口とし、フォルダバーの「履歴▼」を対照にする。通常フォルダ・画像フォルダ本・ZIP/PDF・変換書庫・EPUB の open / 採用 / 親移動を非対話テストで追い、論理場所・元ファイル・読込実体・履歴への戻り元を区別する。親ボタン・BS・キー・マウス割り当ての共通処理も確認し、利用者に全組み合わせの試験を頼まない。
+- 初回試験: `section1473_*` 9件（248条件＋ZIP内階層／v4.9.0のEnter境界試験）と既存履歴復帰テスト10件が通過。本からの親1回までではcacheへの移動は再現しなかった。ZIP内部からはrootまで戻ってから閲覧履歴へ復帰する。
+- root追補: 通常／portable配置 × 一覧を開いた直後／本から戻った後 × Menu／Ring／Mouse入口 × 親5操作、**全60条件で実data_dirへ移り、cacheを選択、Enterで実cacheへ到達**。親ボタンは実toolbarのheadlessクリックでも確認。原因は `grid_parent_nav_target` / `resolve_grid_parent_nav` にReadingHistory rootの親規則がなく、`data/__reading_history__` を普通の物理pathとして `.parent()` すること（`src/app.rs:24506,24550`）。子名markerは実在しないため選択ヒントが外れ、今回の実一覧 `cache, logs` の先頭が選ばれる。
+- 他root: 11種類×親5操作×2配置の110条件で、**Tag rootのmouse／ringの4条件だけ同型にdata_dirへ漏れcacheを選択**。`handle_gamepad_grid_back` にBS側にあるtag分岐がない（`src/app/gamepad_input.rs:9688` / `src/app.rs:57413`）。Bookmarks／★一覧／検索／Drive／Collection／Smart／サブ展開／Snapshot／実本棚の既存の帰路・停止は内部へ漏れない。
+- 調査時の修正判断 (2026-10-29): 製品コードは変更せず設計へ返した。既存閲覧履歴設計は入口へ戻る仕様だが、単純なHistoryBack追加では本からReturn後の自己markerを消費するだけで余計な1操作を要することも実行確認。root ownerで入口への退出と自己marker／forward履歴を扱い、入口なしの行先を確定する必要があった。独立レビューもSmall変更として実施せず設計へ戻す判断に合意。追加質問・広い再試験依頼は報告者へ出さない。
+- 調査時の最終検証 (2026-10-29): 追補込み13テストは**11成功／既知不具合の安全契約2件が意図して失敗**（root60条件、Tag4条件）。この2件は実装途中の2026-10-30の再試験で成功したが、別のSnapshot受入1件が未解決。製品起動・実データ変更・コミットなし。詳細・生ログ・修正方針は[調査記録](history-parent-1473-investigation.md)の追補を参照。
+- 版差分: タグ v4.9.0 の通常 Folder の Enter には帰路記録の欠落があり、元フォルダの実親へ戻る。master の既存 §1.480 修正で補われているが、今回の合成rootの親欠落とは別件。親 resolver・変換 source/backing・描画後 dispatch の該当処理は同一。
+- 修正時: 合成rootの親を決める所有者で直し、正常な閲覧履歴への復帰、書庫内の階層移動、通常の履歴←→、他rootの固有規則を変えない。新bool／pending／cacheを隠すguardは追加しない。関連: [ナビゲーション仕様](fullscreen-navigation-consistency.md)、[閲覧履歴設計§7.2](reading-history-plan.md#72-backspace--履歴ボタン)。規模 / 優先度: Medium暫定 / P2。
 
 ### 1.475 コレクションの挙動が不安定・本を閉じたときの保存に時間がかかる — X の投稿 (2026-10-29)
 

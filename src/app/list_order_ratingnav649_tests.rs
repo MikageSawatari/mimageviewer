@@ -306,12 +306,16 @@ fn scenario(zip_books: bool, entry: Entry, date_desc: bool) {
             .iter()
             .position(|item| item.container_path() == Some(first.as_path()));
         let previous_return = root.join("previous-history-return");
-        app.reading_history_return_from = Some(previous_return.clone());
+        app.reading_history_return_from = Some(ReadingHistoryBookReturn::without_entrance(
+            previous_return.clone(),
+        ));
         let nav = accept_entry(&mut app, &ctx, entry)
             .expect("normal input must return the container request");
         if zip_books {
             assert_eq!(
-                app.reading_history_return_from.as_ref(),
+                app.reading_history_return_from
+                    .as_ref()
+                    .map(|reservation| &reservation.container),
                 Some(&previous_return)
             );
             assert!(
@@ -478,7 +482,12 @@ fn ratingnav649_enter_and_pointer_folder_receipt_preserve_history_return() {
             assert_eq!(app.items.len(), 1);
             app.selected = Some(0);
             let nav = accept_entry(&mut app, &ctx, entry).unwrap();
-            assert_eq!(app.reading_history_return_from.as_ref(), Some(&book));
+            assert_eq!(
+                app.reading_history_return_from
+                    .as_ref()
+                    .map(|reservation| &reservation.container),
+                Some(&book)
+            );
             assert_eq!(
                 app.rating_filter_suppressed_at.as_ref().map(|(p, _)| p),
                 Some(&book)
@@ -492,7 +501,12 @@ fn ratingnav649_enter_and_pointer_folder_receipt_preserve_history_return() {
             settle(&mut app, &ctx);
             assert_eq!(app.effective_folder().as_ref(), Some(&book));
             assert_eq!(app.fullscreen_idx.is_some(), auto_open);
-            assert_eq!(app.reading_history_return_from.as_ref(), Some(&book));
+            assert_eq!(
+                app.reading_history_return_from
+                    .as_ref()
+                    .map(|reservation| &reservation.container),
+                Some(&book)
+            );
             app.close_fullscreen();
             let nav = app.handle_grid_parent_folder_action().unwrap();
             apply_open(&mut app, &ctx, nav, Entry::Enter);
@@ -533,11 +547,17 @@ fn ratingnav649_gamepad_extension_named_folder_keeps_existing_receipt() {
         assert!(matches!(app.items.as_slice(), [GridItem::Folder(_)]));
         app.selected = Some(0);
         let previous = root.join("previous-return");
-        app.reading_history_return_from = Some(previous.clone());
+        app.reading_history_return_from =
+            Some(ReadingHistoryBookReturn::without_entrance(previous.clone()));
         let nav = accept_entry(&mut app, &ctx, Entry::Gamepad).unwrap();
         assert!(matches!(nav, crate::ui_main::AddressBarNav::Direct(ref path, _) if path == &book));
         assert_eq!(captured_paths(&app), [book]);
-        assert_eq!(app.reading_history_return_from.as_ref(), Some(&previous));
+        assert_eq!(
+            app.reading_history_return_from
+                .as_ref()
+                .map(|reservation| &reservation.container),
+            Some(&previous)
+        );
         assert!(app.rating_filter_suppressed_at.is_none());
         assert!(
             !app.pending_auto_fs_open,
@@ -631,7 +651,8 @@ fn ratingnav649_smart_pointer_consumed_open_does_not_fall_through_to_secondary_c
             .position(|item| item.container_path() == Some(book.as_path()))
             .expect("Smart root contains the book");
         app.selected = Some(idx);
-        app.reading_history_return_from = Some(source.clone());
+        app.reading_history_return_from =
+            Some(ReadingHistoryBookReturn::without_entrance(source.clone()));
         app.take_grid_container_open_accept_count_for_test();
         let nav = crate::ui_main::ratingnav649_pointer_open_for_test(&mut app, idx, true);
         assert_eq!(app.take_grid_container_open_accept_count_for_test(), 1);
@@ -644,7 +665,12 @@ fn ratingnav649_smart_pointer_consumed_open_does_not_fall_through_to_secondary_c
             app.context_menu_idx.is_none(),
             "consumed open must return before processing the secondary release"
         );
-        assert_eq!(app.reading_history_return_from.as_ref(), Some(&source));
+        assert_eq!(
+            app.reading_history_return_from
+                .as_ref()
+                .map(|reservation| &reservation.container),
+            Some(&source)
+        );
         assert!(app.rating_filter_suppressed_at.is_none());
         assert!(!app.pending_auto_fs_open);
         assert!(Arc::ptr_eq(app.list_order.as_ref().unwrap(), &snapshot));

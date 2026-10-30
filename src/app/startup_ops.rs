@@ -2974,7 +2974,7 @@ mod tests {
                         return_grid: BookmarkViewReturnGridState {
                             row_keys: vec![],
                             selected_key: None,
-                            opened_key: (1, 419),
+                            opened_key: Some((1, 419)),
                             scroll_offset_y: 0.0,
                         },
                     },
@@ -3456,6 +3456,42 @@ mod tests {
         assert_eq!(app.startup_open_path.as_ref(), Some(&target));
         app.load_folder(folder);
         assert!(app.startup_open_path.is_none());
+    }
+
+    #[test]
+    fn section1473_history_menu_retires_startup_even_through_transparent_search() {
+        for search in [false, true] {
+            let mut app = setup_app_for_test();
+            let origin = app.tmp.path().join("origin");
+            std::fs::create_dir(&origin).unwrap();
+            app.current_folder = Some(origin);
+            if search {
+                app.open_global_search();
+                assert!(app.global_search.active);
+            }
+            let stale = app.tmp.path().join("initial");
+            app.set_startup_open_path(stale.clone());
+            let (_tx, cancel) =
+                section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &stale);
+
+            app.enter_reading_history_from_menu();
+
+            assert!(cancel.load(Ordering::Relaxed));
+            assert!(app.startup_open_path.is_none());
+            assert!(app.startup_open_path_resolve_pending.is_none());
+            assert!(app.items_are_reading_history_view);
+            assert!(!app.global_search.active);
+            let top_level_grid_view::TopLevelGridSurface::ReadingHistory(root) =
+                app.top_level_grid_view.surface()
+            else {
+                panic!("history menu must adopt its typed root");
+            };
+            assert_eq!(
+                matches!(root.exit, ReadingHistoryExit::CanonicalOrigin(_)),
+                search,
+                "search changes history recording, not the explicit menu intent"
+            );
+        }
     }
 
     #[test]
@@ -4525,7 +4561,7 @@ mod tests {
             grid: BookmarkViewReturnGridState {
                 row_keys: vec![(0, 1)],
                 selected_key: Some((0, 1)),
-                opened_key: (0, 1),
+                opened_key: Some((0, 1)),
                 scroll_offset_y: 0.0,
             },
         });
@@ -4654,6 +4690,36 @@ mod tests {
             );
             assert_eq!(app.bookmark_view_target().is_some(), adopted);
         }
+    }
+
+    #[test]
+    fn section1473_quick_reselect_keeps_physical_history_parent_return() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join("reader.zip");
+        write_section1339_bookmark_zip(&path);
+        app.current_folder = Some(path.clone());
+        app.set_quick_folder_slot_target(QuickFolderSlotId::A, path.clone());
+        let parent = ReadingHistoryBookReturn::without_entrance(path.clone());
+        app.reading_history_return_from = Some(parent.clone());
+        assert!(matches!(
+            app.folder_nav_current_target(),
+            Some(FolderNavHistoryTarget::Physical(PhysicalGridRestore {
+                parent: PhysicalParentReturn::ReadingHistory(_),
+                ..
+            }))
+        ));
+        let history = app.folder_nav_history_snapshot();
+        let generation = app.items_generation;
+
+        assert_eq!(
+            app.activate_quick_folder_slot(QuickFolderSlotId::A),
+            QuickFolderSwitchTarget::Current
+        );
+
+        assert_eq!(app.reading_history_return_from, Some(parent));
+        assert_eq!(app.current_folder, Some(path));
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.folder_nav_history_snapshot(), history);
     }
 
     #[test]

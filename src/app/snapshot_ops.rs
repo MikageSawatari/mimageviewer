@@ -1355,9 +1355,9 @@ impl App {
         {
             let current_in_scope = self.current_folder.as_deref().is_some_and(|current| {
                 if state.contains_scoped_path(current) {
-                    state.move_to(current)
+                    state.state.move_to(current)
                 } else {
-                    state.enter_containing_path(current)
+                    state.state.enter_containing_path(current)
                 }
             });
             if at_origin || current_in_scope {

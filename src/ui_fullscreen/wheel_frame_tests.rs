@@ -849,7 +849,7 @@ fn egui037_wheel_frame_recognized_live_return_keeps_original_page_and_return_own
                     grid: BookmarkViewReturnGridState {
                         row_keys: vec![(0, 1), (0, 2)],
                         selected_key: Some((0, 2)),
-                        opened_key: (0, 2),
+                        opened_key: Some((0, 2)),
                         scroll_offset_y: 73.0,
                     },
                 });

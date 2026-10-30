@@ -699,7 +699,9 @@ fn visibility_collection_and_rating_converted_refresh_keep_canonical_source_and_
             app.current_folder = Some(rating_view_synthetic_path());
             app.items_are_rating_view = true;
             app.rating_view_stars = 4;
-            app.rating_view_saved_folder = Some(app.tmp.path().to_path_buf());
+            app.rating_view_return_to = Some(grid_origin_for_test(
+                top_level_grid_view::TopLevelGridRestore::Folder(app.tmp.path().to_path_buf()),
+            ));
             app.top_level_grid_view
                 .replace_surface(TopLevelGridSurface::Rating { stars: 4 });
             OpenRequestOwner::RatingPhysical(app.rating_view_physical_load_owner(&source).unwrap())

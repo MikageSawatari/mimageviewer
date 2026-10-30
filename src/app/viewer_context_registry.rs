@@ -1774,14 +1774,12 @@ pub(in crate::app) struct ViewerContextBundle {
     rating_view_request_sequence: u64,
     rating_view_accepted_write_generation: u64,
     rating_view_skipped: usize,
-    rating_view_saved_folder: Option<PathBuf>,
-    rating_view_subfolder_restore:
-        Option<super::subfolder_expansion::SubfolderExpansionRestoreState>,
+    rating_view_return_to: Option<Box<super::top_level_grid_view::TopLevelGridOrigin>>,
     rating_view_nav_stack: Vec<PathBuf>,
     items_are_subfolder_expansion_view: bool,
     items_are_smart_folder_view: bool,
     items_are_drive_list: bool,
-    reading_history_return_from: Option<PathBuf>,
+    reading_history_return_from: Option<super::ReadingHistoryBookReturn>,
     bookmark_view_state: Option<BookmarkViewState>,
     bookmark_open_pending: Option<crate::bookmark_browser::PendingBookmarkOpen>,
     fs_open_intent_from_grid: bool,
@@ -3020,8 +3018,7 @@ impl ViewerContextBundle {
             rating_view_request_sequence: 0,
             rating_view_accepted_write_generation: 0,
             rating_view_skipped: 0,
-            rating_view_saved_folder: None,
-            rating_view_subfolder_restore: None,
+            rating_view_return_to: None,
             rating_view_nav_stack: Vec::new(),
             items_are_subfolder_expansion_view: false,
             items_are_smart_folder_view: false,
@@ -3449,8 +3446,7 @@ impl App {
             rating_view_request_sequence,
             rating_view_accepted_write_generation,
             rating_view_skipped,
-            rating_view_saved_folder,
-            rating_view_subfolder_restore,
+            rating_view_return_to,
             rating_view_nav_stack,
             items_are_subfolder_expansion_view,
             items_are_smart_folder_view,
@@ -3785,8 +3781,7 @@ impl App {
         swap_field!(rating_view_request_sequence);
         swap_field!(rating_view_accepted_write_generation);
         swap_field!(rating_view_skipped);
-        swap_field!(rating_view_saved_folder);
-        swap_field!(rating_view_subfolder_restore);
+        swap_field!(rating_view_return_to);
         swap_field!(rating_view_nav_stack);
         swap_field!(items_are_subfolder_expansion_view);
         swap_field!(items_are_smart_folder_view);
@@ -4168,8 +4163,7 @@ impl App {
             rating_view_request_sequence,
             rating_view_accepted_write_generation,
             rating_view_skipped,
-            rating_view_saved_folder,
-            rating_view_subfolder_restore,
+            rating_view_return_to,
             rating_view_nav_stack,
             items_are_subfolder_expansion_view,
             items_are_smart_folder_view,
@@ -4486,8 +4480,7 @@ impl App {
             rating_view_request_sequence,
             rating_view_accepted_write_generation,
             rating_view_skipped,
-            rating_view_saved_folder,
-            rating_view_subfolder_restore,
+            rating_view_return_to,
             rating_view_nav_stack,
             // 新しい parked context は複製済み items/cache の独立 owner になる。進行中の
             // receiver だけは複製できないため、元の main context に残す。

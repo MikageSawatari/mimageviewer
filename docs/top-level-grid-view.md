@@ -1,5 +1,34 @@
 # 最上位一覧ビューの ownership とスマートフォルダ scope
 
+## 合成一覧の親と完全な帰路（§1.473）
+
+一覧の親入力とtoolbar previewは `app/grid_parent` の同じ純粋なaction解決を使う。
+検索/Tag/Rating/ZIP等のnative ownerが親を決め、root停止と「所有者なし」を区別する。
+入力adapterはIME/modal/viewport等の受付条件を保ち、行先のif列を複製しない。
+Everythingの既存scope判定後の物理親だけは下位操作へ渡し、検索ownerへ再入しない。
+
+ReadingHistoryのrootはvisit identityと完全な `TopLevelGridOrigin` の退出先を所有する。
+本からrootへのReturnと、rootから入口への退出を区別し、同じ合成pathでも別visitを統合しない。
+入口markerが履歴に残れば自己markerを跨ぐBack計画、なければ通常Directで同じ入口へ退出する。
+入口の探索範囲は現visitの最初のroot markerより手前、root markerが無ければBack全体とする。
+100件上限で両markerが脱落し同場所・同routeの再訪が残る場合、入口への到達を維持し、Back/Forward順は保証しない (合意した仕様上の制約)。
+どちらも同じoriginから場所・行・scroll・native帰路を復元し、marker脱落の推定stateは追加しない。
+
+Rating自身の帰路はpath/展開restoreの対から単一のtyped originへ置換し、入場、transition、
+物理子、履歴復元、closeまで運ぶ。`H1 → Rating → H2` から順に戻る場合もH1のvisitと退出先を保持する。
+展開のsnapshot/roots/除外、Collectionのreturn origin、Smartの保存元/帰路、Bookmarksのstable-key位置も、
+現在のApp slotの残存に頼らずcaptureしたpayloadを既存prepare/adoptionへ渡す。
+完全originを通常の履歴identityへ投影する処理と、nativeな復元payloadの寿命を区別する。
+mutableなworker/sessionを共有せず、context/slotを越えた履歴変更やPDF等の失効は行わない。
+
+Snapshotからファイルメニューで入ったReadingHistory rootの退出は、既存dismissで固定を終了してから
+保存済canonical originへ通常のprepare/adoptionを通す。解除の副作用で消費された可視H ownerだけを
+既存replace_surfaceへ保持し直し、rows/path/routeを部分的な固定一覧へ戻さない。取消時も固定は解除済みとする。
+可視Snapshotのcanonical originがH1の場合は新しいH2 visitを作る。H2上でのMenu再押下は同visitを保つ。
+固定ownerと帰路の単一所有・固定一覧の完全な再採用は、別項目§1.486で扱う。
+
+詳細な契約・状態表・検証は[調査記録の修正設計](history-parent-1473-investigation.md#修正の設計)を参照する。
+
 ## Everything 検索のsourceと物理child（§1.374、未リリース）
 
 Everythingは新しい最上位surfaceを増やさず `TopLevelGridView::Search` を共有する。

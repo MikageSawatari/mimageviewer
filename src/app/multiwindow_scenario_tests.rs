@@ -3069,7 +3069,7 @@ fn multiwindow_scenario_noncollection_image_controls_remain_physical() {
     for surface in [
         TopLevelGridSurface::Search(TopLevelSearchView::Global),
         TopLevelGridSurface::Rating { stars: 5 },
-        TopLevelGridSurface::ReadingHistory,
+        TopLevelGridSurface::ReadingHistory(ReadingHistoryRootRestore::unavailable()),
     ] {
         let mut app = setup_app_for_test();
         let ctx = egui::Context::default();
@@ -3085,7 +3085,8 @@ fn multiwindow_scenario_noncollection_image_controls_remain_physical() {
         app.selected = Some(0);
         app.items_are_global_search_view = matches!(surface, TopLevelGridSurface::Search(_));
         app.items_are_rating_view = matches!(surface, TopLevelGridSurface::Rating { .. });
-        app.items_are_reading_history_view = matches!(surface, TopLevelGridSurface::ReadingHistory);
+        app.items_are_reading_history_view =
+            matches!(surface, TopLevelGridSurface::ReadingHistory(_));
         assert!(matches!(
             app.detached_grid_item_open_plan(0, false),
             DetachedBuild::Built(DetachedGridItemOpenPlan::Descriptor {

@@ -2,6 +2,54 @@
 use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
 
+// Legacy fixture paths now use the same immutable payload types as runtime navigation.
+pub(crate) fn reading_history_return_for_test(container: PathBuf) -> ReadingHistoryBookReturn {
+    ReadingHistoryBookReturn::without_entrance(container)
+}
+
+pub(crate) fn install_reading_history_surface_for_test(app: &mut App) {
+    let root = top_level_grid_view::ReadingHistoryRootRestore::unavailable();
+    app.items_are_reading_history_view = true;
+    app.facet_navigation
+        .reproject(facet_navigation::FacetRoute::root(
+            App::facet_scope_for_location(&FolderNavHistoryTarget::ReadingHistory(root.clone())),
+        ));
+    app.top_level_grid_view.replace_surface(
+        top_level_grid_view::TopLevelGridSurface::ReadingHistory(root),
+    );
+}
+
+pub(crate) fn expansion_origin_for_test(app: &App) -> Box<top_level_grid_view::TopLevelGridOrigin> {
+    Box::new(top_level_grid_view::TopLevelGridOrigin {
+        restore: top_level_grid_view::TopLevelGridRestore::SubfolderExpansion(
+            subfolder_expansion::SubfolderExpansionRestoreState {
+                root: app.subfolder_expansion_root.clone(),
+                roots: app.subfolder_expansion_roots.clone(),
+                saved_folder: app.subfolder_expansion_saved_folder.clone(),
+                snapshot: app.subfolder_expansion_snapshot.clone(),
+                removed_paths: app.subfolder_expansion_removed_paths.clone(),
+            },
+        ),
+        route: app.facet_navigation.route().clone(),
+    })
+}
+
+pub(crate) fn rating_root_for_test(stars: u8) -> top_level_grid_view::RatingRootRestore {
+    top_level_grid_view::RatingRootRestore {
+        stars,
+        return_to: None,
+    }
+}
+
+pub(crate) fn grid_origin_for_test(
+    restore: top_level_grid_view::TopLevelGridRestore,
+) -> Box<top_level_grid_view::TopLevelGridOrigin> {
+    Box::new(top_level_grid_view::TopLevelGridOrigin {
+        restore,
+        route: Default::default(),
+    })
+}
+
 /// Preserve the headless renderer's logical client dimensions while fixtures
 /// use the same physical outer placement as a decorated native window.
 #[cfg(windows)]
@@ -44,6 +92,15 @@ mod thumbnail_request_lifecycle;
 
 #[path = "tests/section1328_session.rs"]
 mod section1328_session;
+
+#[path = "tests/history_parent_1473.rs"]
+mod history_parent_1473;
+
+#[path = "tests/history_parent_context_1473.rs"]
+mod history_parent_context_1473;
+
+#[path = "tests/history_parent_lifecycle_1473.rs"]
+mod history_parent_lifecycle_1473;
 
 #[path = "tests/pdf_render_epoch.rs"]
 mod pdf_render_epoch;
@@ -2164,7 +2221,9 @@ fn mutation_refresh_rating_sort_fixture() -> AppTestEnvForTest {
     app.current_folder = Some(search_results_synthetic_path());
     app.items_are_rating_view = true;
     app.rating_view_stars = 3;
-    app.rating_view_saved_folder = Some(app.tmp.path().to_path_buf());
+    app.rating_view_return_to = Some(crate::app::tests::grid_origin_for_test(
+        top_level_grid_view::TopLevelGridRestore::Folder(app.tmp.path().to_path_buf()),
+    ));
     app.top_level_grid_view
         .replace_surface(top_level_grid_view::TopLevelGridSurface::Rating { stars: 3 });
     for path in [parent, child] {
@@ -2222,7 +2281,7 @@ fn mutation_refresh_assert_rating_sort(physical_mode: PhysicalFolderSortReload) 
     let mut app = mutation_refresh_rating_sort_fixture();
     let location = app.folder_nav_current_target();
     let chain = app.rating_view_nav_stack.clone();
-    let saved = app.rating_view_saved_folder.clone();
+    let saved = app.rating_view_return_to.clone();
     let history = app.folder_nav_history_snapshot();
     assert!(!history.back_stack.is_empty());
     assert!(!history.forward_stack.is_empty());
@@ -2263,7 +2322,7 @@ fn mutation_refresh_assert_rating_sort(physical_mode: PhysicalFolderSortReload) 
     assert_eq!(app.items[1].name(), "a.png");
     assert_eq!(app.folder_nav_current_target(), location);
     assert_eq!(app.rating_view_nav_stack, chain);
-    assert_eq!(app.rating_view_saved_folder, saved);
+    assert_eq!(app.rating_view_return_to, saved);
     assert!(matches!(
         app.resolve_return_to_parent_nav(),
         Some(crate::ui_main::AddressBarNav::RatingViewBack)
@@ -3894,8 +3953,10 @@ fn ignored_epub_grid_preflight_preserves_reading_history_return() {
     std::fs::write(&epub, b"book").unwrap();
     let previous = app.tmp.path().join("previous.pdf");
     app.items = vec![GridItem::PdfFile(epub.clone())];
-    app.items_are_reading_history_view = true;
-    app.reading_history_return_from = Some(previous.clone());
+    crate::app::tests::install_reading_history_surface_for_test(&mut app);
+    app.reading_history_return_from = Some(crate::app::tests::reading_history_return_for_test(
+        previous.clone(),
+    ));
     app.address = "閲覧履歴".into();
     app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
 
@@ -3915,7 +3976,10 @@ fn ignored_epub_grid_preflight_preserves_reading_history_return() {
         app.poll_open_path_classification(&ctx);
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert_eq!(app.reading_history_return_from, Some(previous));
+    assert_eq!(
+        app.reading_history_return_from,
+        Some(crate::app::tests::reading_history_return_for_test(previous))
+    );
     assert_eq!(app.address, "閲覧履歴");
     assert!(app.pdf_enumerate_pending.is_none());
 }
@@ -14368,7 +14432,7 @@ mod startup_open_path_resolve_tests {
         BookmarkViewReturnGridState {
             row_keys: vec![(0, 1)],
             selected_key: Some((0, 1)),
-            opened_key: (0, 1),
+            opened_key: Some((0, 1)),
             scroll_offset_y: 120.0,
         }
     }
@@ -20245,6 +20309,7 @@ mod quick_folder_restart_tests {
 
 #[cfg(test)]
 mod phase_c_folder_nav_history_tests {
+    use crate::app::top_level_grid_view;
     use crate::app::{
         App, FolderHistoryDirection, FolderHistoryPlan, FolderNavHistoryState,
         FolderNavHistoryTarget, FolderOpenOutcome, FolderPaneOpenReady, GridClickSelectionAnchor,
@@ -21663,7 +21728,9 @@ mod phase_c_folder_nav_history_tests {
         std::fs::write(&zip, b"invalid ZIP").unwrap();
         let prior_reading = saved.join("prior-reading.zip");
         arm_favorite_search_for_staged_archive_test(&mut app, saved);
-        app.reading_history_return_from = Some(prior_reading.clone());
+        app.reading_history_return_from = Some(crate::app::tests::reading_history_return_for_test(
+            prior_reading.clone(),
+        ));
         app.settings.rating_filter = [false, false, false, false, false, true];
         app.settings
             .facet_filter
@@ -21689,7 +21756,12 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.items_generation, generation);
         assert_eq!(app.address, address);
         assert!(app.favsearch.nav_stack.is_empty());
-        assert_eq!(app.reading_history_return_from, Some(prior_reading.clone()));
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(crate::app::tests::reading_history_return_for_test(
+                prior_reading.clone()
+            ))
+        );
         assert!(app.rating_filter_suppressed_at.is_none());
         assert!(!app.facet_navigation.suppressed());
         assert_eq!(
@@ -21708,7 +21780,12 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.items_generation, generation);
         assert_eq!(app.address, address);
         assert!(app.favsearch.nav_stack.is_empty());
-        assert_eq!(app.reading_history_return_from, Some(prior_reading));
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(crate::app::tests::reading_history_return_for_test(
+                prior_reading
+            ))
+        );
         assert!(app.rating_filter_suppressed_at.is_none());
         assert!(!app.facet_navigation.suppressed());
         assert_eq!(
@@ -21729,7 +21806,9 @@ mod phase_c_folder_nav_history_tests {
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
         let prior_reading = saved.join("prior-reading.pdf");
         arm_favorite_search_for_staged_archive_test(&mut app, saved);
-        app.reading_history_return_from = Some(prior_reading.clone());
+        app.reading_history_return_from = Some(crate::app::tests::reading_history_return_for_test(
+            prior_reading.clone(),
+        ));
         app.settings.rating_filter = [false, false, false, false, false, true];
         app.settings
             .facet_filter
@@ -21763,7 +21842,12 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.items_generation, generation);
         assert_eq!(app.address, pdf.to_string_lossy());
         assert!(app.favsearch.nav_stack.is_empty());
-        assert_eq!(app.reading_history_return_from, Some(prior_reading.clone()));
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(crate::app::tests::reading_history_return_for_test(
+                prior_reading.clone()
+            ))
+        );
         assert!(app.rating_filter_suppressed_at.is_none());
         assert!(!app.facet_navigation.suppressed());
         assert_eq!(
@@ -21782,7 +21866,12 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.items_generation, generation);
         assert_eq!(app.address, address);
         assert!(app.favsearch.nav_stack.is_empty());
-        assert_eq!(app.reading_history_return_from, Some(prior_reading));
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(crate::app::tests::reading_history_return_for_test(
+                prior_reading
+            ))
+        );
         assert!(app.rating_filter_suppressed_at.is_none());
         assert!(!app.facet_navigation.suppressed());
         assert_eq!(
@@ -21873,8 +21962,10 @@ mod phase_c_folder_nav_history_tests {
             app.install_new_items(vec![old_item], vec![None]);
             app.visible_indices = vec![0];
             app.current_folder = Some(source.clone());
-            app.items_are_reading_history_view = true;
-            app.reading_history_return_from = Some(source.clone());
+            crate::app::tests::install_reading_history_surface_for_test(&mut app);
+            app.reading_history_return_from = Some(
+                crate::app::tests::reading_history_return_for_test(source.clone()),
+            );
             app.settings.rating_filter = [false, false, false, false, false, true];
             app.settings.facet_filter.kinds.insert(if use_pdf {
                 crate::settings::FacetItemKind::Pdf
@@ -21910,7 +22001,10 @@ mod phase_c_folder_nav_history_tests {
                 app.items.first(),
                 Some(GridItem::ZipFile(_) | GridItem::PdfFile(_))
             ));
-            assert_eq!(app.reading_history_return_from, Some(source));
+            assert_eq!(
+                app.reading_history_return_from,
+                Some(crate::app::tests::reading_history_return_for_test(source))
+            );
             assert!(app.rating_filter_suppressed_at.is_none());
             assert!(!app.facet_navigation.suppressed());
             assert_eq!(app.settings.facet_filter, facet_before);
@@ -21938,7 +22032,12 @@ mod phase_c_folder_nav_history_tests {
                 app.items.first(),
                 Some(GridItem::ZipImage { .. } | GridItem::PdfPage { .. })
             ));
-            assert_eq!(app.reading_history_return_from, Some(path.clone()));
+            assert_eq!(
+                app.reading_history_return_from,
+                Some(crate::app::tests::reading_history_return_for_test(
+                    path.clone()
+                ))
+            );
             assert!(app.rating_filter_suppressed_at.is_some());
             assert_eq!(app.facet_navigation.saved_frame_count(), 1);
             assert!(app.settings.facet_filter.kinds.is_empty());
@@ -21968,8 +22067,10 @@ mod phase_c_folder_nav_history_tests {
         app.install_new_items(vec![GridItem::ZipFile(target.clone())], vec![None]);
         app.visible_indices = vec![0];
         app.current_folder = Some(source.clone());
-        app.items_are_reading_history_view = true;
-        app.reading_history_return_from = Some(source.clone());
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
+        app.reading_history_return_from = Some(crate::app::tests::reading_history_return_for_test(
+            source.clone(),
+        ));
 
         let crate::ui_main::AddressBarNav::GridVirtual(intent) =
             app.grid_physical_navigation(0, target.clone(), true)
@@ -21977,11 +22078,17 @@ mod phase_c_folder_nav_history_tests {
             panic!("stale ZIP tile must retain its typed grid request");
         };
         assert!(app.start_grid_virtual_open(intent));
-        assert_eq!(app.reading_history_return_from, Some(source));
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(crate::app::tests::reading_history_return_for_test(source))
+        );
         finish_staged_physical_history_for_test(&mut app);
 
         assert_eq!(app.current_folder.as_deref(), Some(target.as_path()));
-        assert_eq!(app.reading_history_return_from, Some(target));
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(crate::app::tests::reading_history_return_for_test(target))
+        );
         assert!(app.rating_filter_suppressed_at.is_some());
         assert_eq!(app.facet_navigation.saved_frame_count(), 1);
         assert_eq!(app.visible_indices, vec![0]);
@@ -22491,7 +22598,9 @@ mod phase_c_folder_nav_history_tests {
         app.active_quick_folder_slot = Some(QuickFolderSlotId::A);
         app.rating_view_stars = 1;
         app.rating_view_nav_stack = vec![source.clone()];
-        app.rating_view_saved_folder = Some(app.tmp.path().join("before-rating"));
+        app.rating_view_return_to = Some(crate::app::tests::grid_origin_for_test(
+            top_level_grid_view::TopLevelGridRestore::Folder(app.tmp.path().join("before-rating")),
+        ));
         assert!(matches!(
             app.folder_nav_current_target(),
             Some(FolderNavHistoryTarget::RatingPhysical(_))
@@ -23240,13 +23349,19 @@ mod phase_c_folder_nav_history_tests {
             Some(GridSortLockReason::DetailsHeaderSort)
         );
 
-        app.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
-        app.items_are_reading_history_view = true;
-        app.current_folder = None;
+        app.current_folder = Some(std::path::PathBuf::from(r"C:\x\book.zip"));
         assert_eq!(
             app.grid_sort_lock_reason(),
             Some(GridSortLockReason::PageOrderFixed),
             "ページ順の固定が列ヘッダより優先する"
+        );
+
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
+        app.current_folder = None;
+        assert_eq!(
+            app.grid_sort_lock_reason(),
+            Some(GridSortLockReason::FixedOrder),
+            "正規の閲覧履歴一覧ではsurfaceが固定順を所有する"
         );
     }
 
@@ -23279,7 +23394,9 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.effective_folder().as_deref(), Some(folder.as_path()));
         assert_eq!(
             app.folder_history_back_target(),
-            Some(&FolderNavHistoryTarget::Rating { stars: 4 })
+            Some(&FolderNavHistoryTarget::Rating(
+                crate::app::tests::rating_root_for_test(4)
+            ))
         );
     }
 
@@ -25310,6 +25427,7 @@ mod phase_c_folder_nav_history_tests {
             app.current_folder = Some(parent);
             app.enter_rating_view(3);
             finish_rating_navigation_for_test(&mut app);
+            let expected_rating_return = app.rating_view_return_to.clone();
             app.select_rating_view_row_for_opened_path(&opened);
             assert_eq!(app.selected, Some(4));
             let nav = app.grid_physical_navigation(4, opened.clone(), false);
@@ -25343,7 +25461,12 @@ mod phase_c_folder_nav_history_tests {
             assert_eq!(app.rating_view_nav_stack, vec![opened.clone()]);
             assert_eq!(
                 app.folder_history_back_target(),
-                Some(&FolderNavHistoryTarget::Rating { stars: 3 })
+                Some(&FolderNavHistoryTarget::Rating(
+                    top_level_grid_view::RatingRootRestore {
+                        stars: 3,
+                        return_to: expected_rating_return.clone()
+                    }
+                ))
             );
             app.selected = Some(3);
             if backspace {
@@ -26153,7 +26276,9 @@ mod phase_c_folder_nav_history_tests {
         app.open_collection_grid_after_context_change(
             crate::collection_store::CollectionId::new(),
             None,
-            Some(super::top_level_grid_view::TopLevelGridRestore::Rating { stars: 3 }),
+            Some(super::top_level_grid_view::TopLevelGridRestore::Rating(
+                crate::app::tests::rating_root_for_test(3),
+            )),
         );
         assert!(!app.items_are_rating_view);
         app.enter_rating_view(3);
@@ -26346,6 +26471,7 @@ mod phase_c_folder_nav_history_tests {
 
         app.enter_rating_view_from_menu(3);
         finish_rating_navigation_for_test(&mut app);
+        let expected_rating_return = app.rating_view_return_to.clone();
 
         app.enter_rating_view_from_menu(5);
         finish_rating_navigation_for_test(&mut app);
@@ -26354,7 +26480,10 @@ mod phase_c_folder_nav_history_tests {
             app.folder_nav_back_stack,
             vec![
                 FolderNavHistoryTarget::Path(real.clone()),
-                FolderNavHistoryTarget::Rating { stars: 3 },
+                FolderNavHistoryTarget::Rating(top_level_grid_view::RatingRootRestore {
+                    stars: 3,
+                    return_to: expected_rating_return.clone()
+                }),
             ]
         );
 
@@ -26367,7 +26496,12 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.rating_view_stars, 3);
         assert_eq!(
             app.folder_nav_forward_stack,
-            vec![FolderNavHistoryTarget::Rating { stars: 5 }]
+            vec![FolderNavHistoryTarget::Rating(
+                top_level_grid_view::RatingRootRestore {
+                    stars: 5,
+                    return_to: expected_rating_return.clone()
+                }
+            )]
         );
 
         assert!(app.start_rating_history_replay(FolderHistoryDirection::Forward, 5));
@@ -26377,7 +26511,10 @@ mod phase_c_folder_nav_history_tests {
             app.folder_nav_back_stack,
             vec![
                 FolderNavHistoryTarget::Path(real),
-                FolderNavHistoryTarget::Rating { stars: 3 },
+                FolderNavHistoryTarget::Rating(top_level_grid_view::RatingRootRestore {
+                    stars: 3,
+                    return_to: expected_rating_return.clone()
+                }),
             ]
         );
     }
@@ -26434,6 +26571,8 @@ mod phase_c_folder_nav_history_tests {
         app.current_folder = Some(saved);
         app.enter_rating_view_from_menu(1);
         finish_rating_navigation_for_test(&mut app);
+        let expected_return = app.rating_view_return_to.clone();
+        assert!(expected_return.is_some());
         let before = app.folder_nav_history_snapshot();
         let owner = app.rating_view_physical_load_owner(&pdf).unwrap();
         assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
@@ -26449,6 +26588,7 @@ mod phase_c_folder_nav_history_tests {
             app.top_level_grid_view.surface(),
             super::top_level_grid_view::TopLevelGridSurface::Rating { stars: 1 }
         ));
+        assert_eq!(app.rating_view_return_to, expected_return);
         assert_eq!(app.folder_nav_back_stack, before.back_stack);
         assert!(app.cancel_pdf_password_dialog_request());
         assert!(
@@ -26458,6 +26598,7 @@ mod phase_c_folder_nav_history_tests {
         );
         assert!(app.grid_item_input_allowed());
         assert!(app.items_are_rating_view);
+        assert_eq!(app.rating_view_return_to, expected_return);
         assert_eq!(app.folder_nav_back_stack, before.back_stack);
         assert_eq!(app.folder_nav_forward_stack, before.forward_stack);
     }
@@ -26474,6 +26615,7 @@ mod phase_c_folder_nav_history_tests {
         app.current_folder = Some(saved);
         app.enter_rating_view_from_menu(1);
         finish_rating_navigation_for_test(&mut app);
+        let expected_rating_return = app.rating_view_return_to.clone();
         let before = app.folder_nav_history_snapshot();
 
         let owner = app.rating_view_physical_load_owner(&pdf).unwrap();
@@ -26508,7 +26650,12 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.rating_view_nav_stack, vec![pdf]);
         assert_eq!(
             app.folder_history_back_target(),
-            Some(&FolderNavHistoryTarget::Rating { stars: 1 })
+            Some(&FolderNavHistoryTarget::Rating(
+                top_level_grid_view::RatingRootRestore {
+                    stars: 1,
+                    return_to: expected_rating_return.clone()
+                }
+            ))
         );
         assert!(
             app.top_level_grid_view
@@ -26579,6 +26726,8 @@ mod phase_c_folder_nav_history_tests {
         app.current_folder = Some(saved);
         app.enter_rating_view_from_menu(1);
         finish_rating_navigation_for_test(&mut app);
+        let expected_return = app.rating_view_return_to.clone();
+        assert!(expected_return.is_some());
         let before = app.folder_nav_history_snapshot();
 
         let _id = start_staged_rating_conversion_for_test(&mut app, &source);
@@ -26587,6 +26736,7 @@ mod phase_c_folder_nav_history_tests {
             app.top_level_grid_view.surface(),
             super::top_level_grid_view::TopLevelGridSurface::Rating { stars: 1 }
         ));
+        assert_eq!(app.rating_view_return_to, expected_return);
         assert_eq!(app.folder_nav_back_stack, before.back_stack);
         assert!(app.cancel_archive_convert_for_navigation("test_staged_cancel"));
         app.poll_collection_history_transition(&egui::Context::default());
@@ -26599,6 +26749,7 @@ mod phase_c_folder_nav_history_tests {
         assert!(app.grid_item_input_allowed());
         assert!(app.items_are_rating_view);
         assert!(app.rating_view_nav_stack.is_empty());
+        assert_eq!(app.rating_view_return_to, expected_return);
         assert_eq!(app.folder_nav_back_stack, before.back_stack);
         assert_eq!(app.folder_nav_forward_stack, before.forward_stack);
     }
@@ -26702,6 +26853,7 @@ mod phase_c_folder_nav_history_tests {
         app.current_folder = Some(saved);
         app.enter_rating_view_from_menu(1);
         finish_rating_navigation_for_test(&mut app);
+        let expected_rating_return = app.rating_view_return_to.clone();
         let before = app.folder_nav_history_snapshot();
 
         let id = start_staged_rating_conversion_for_test(&mut app, &source);
@@ -26723,7 +26875,12 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.rating_view_nav_stack, vec![source]);
         assert_eq!(
             app.folder_history_back_target(),
-            Some(&FolderNavHistoryTarget::Rating { stars: 1 })
+            Some(&FolderNavHistoryTarget::Rating(
+                top_level_grid_view::RatingRootRestore {
+                    stars: 1,
+                    return_to: expected_rating_return.clone()
+                }
+            ))
         );
     }
 
@@ -26742,7 +26899,11 @@ mod phase_c_folder_nav_history_tests {
 
         app.enter_rating_view_from_menu(1);
         finish_rating_navigation_for_test(&mut app);
-        let rating = FolderNavHistoryTarget::Rating { stars: 1 };
+        let expected_rating_return = app.rating_view_return_to.clone();
+        let rating = FolderNavHistoryTarget::Rating(top_level_grid_view::RatingRootRestore {
+            stars: 1,
+            return_to: expected_rating_return.clone(),
+        });
         let owner_f = app
             .rating_view_physical_load_owner(&f)
             .expect("Rating root owns F");
@@ -26891,6 +27052,7 @@ mod phase_c_folder_nav_history_tests {
         // 通常アドレスバー (quick folder A/B スロット非アクティブ) の ←/→ 経路。
         app.active_quick_folder_slot = None;
         app.current_folder = Some(super::reading_history_synthetic_path());
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(real.clone()).into()];
         app.folder_nav_forward_stack = Vec::new();
 
@@ -26915,7 +27077,9 @@ mod phase_c_folder_nav_history_tests {
         // 現在地だった合成パスを forward に残し、ビューへ戻せる。
         assert_eq!(
             app.folder_nav_forward_stack,
-            vec![super::reading_history_synthetic_path()]
+            vec![FolderNavHistoryTarget::ReadingHistory(
+                top_level_grid_view::ReadingHistoryRootRestore::unavailable()
+            )]
         );
     }
 
@@ -26954,7 +27118,9 @@ mod phase_c_folder_nav_history_tests {
         plan.commit(&mut app);
         assert_eq!(
             app.folder_nav_back_stack,
-            vec![FolderNavHistoryTarget::Rating { stars: 4 }]
+            vec![FolderNavHistoryTarget::Rating(
+                crate::app::tests::rating_root_for_test(4)
+            )]
         );
     }
 
@@ -26976,22 +27142,21 @@ mod phase_c_folder_nav_history_tests {
             Some(&super::reading_history_synthetic_path())
         );
 
+        let history_root = app
+            .folder_nav_current_target()
+            .expect("reading-history root");
         app.load_folder(after.clone());
         app.finish_page_identity_preparation_for_test();
         assert_eq!(
             app.folder_nav_back_stack
                 .last()
                 .map(|entry| &entry.location),
-            Some(&FolderNavHistoryTarget::Path(
-                super::reading_history_synthetic_path()
-            ))
+            Some(&history_root.clone())
         );
 
         assert_eq!(
             app.folder_history_back_target(),
-            Some(&FolderNavHistoryTarget::Path(
-                super::reading_history_synthetic_path()
-            ))
+            Some(&history_root.clone())
         );
         app.finish_page_identity_preparation_for_test();
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
@@ -27018,9 +27183,7 @@ mod phase_c_folder_nav_history_tests {
 
         assert_eq!(
             app.folder_history_back_target(),
-            Some(&FolderNavHistoryTarget::Path(
-                super::reading_history_synthetic_path()
-            ))
+            Some(&history_root.clone())
         );
         app.finish_page_identity_preparation_for_test();
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
@@ -27039,9 +27202,9 @@ mod phase_c_folder_nav_history_tests {
         rating_app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(prior.clone()).into()];
         rating_app.set_active_folder_nav_suppress_record_once(true);
         assert_eq!(
-            rating_app.dispatch_synthetic_folder_history_target(&FolderNavHistoryTarget::Rating {
-                stars: 4
-            }),
+            rating_app.dispatch_synthetic_folder_history_target(&FolderNavHistoryTarget::Rating(
+                crate::app::tests::rating_root_for_test(4)
+            )),
             super::SyntheticFolderHistoryDispatch::Restored
         );
         // The old physical location remains current until the Rating rows are installed.
@@ -27077,7 +27240,9 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(rating_app.address, "★★★★ レーティング一覧");
         assert_eq!(
             rating_app.folder_nav_current_target(),
-            Some(FolderNavHistoryTarget::Rating { stars: 4 })
+            Some(FolderNavHistoryTarget::Rating(
+                crate::app::tests::rating_root_for_test(4)
+            ))
         );
         assert!(
             !rating_app.suppress_folder_nav_record_once,
@@ -27161,7 +27326,7 @@ mod phase_c_folder_nav_history_tests {
         app.current_folder = Some(real.clone());
         let slot = QuickFolderSlotId::A;
         app.quick_folder_workspaces[slot.index()].history.back_stack =
-            vec![FolderNavHistoryTarget::Rating { stars: 0 }.into()];
+            vec![FolderNavHistoryTarget::Rating(crate::app::tests::rating_root_for_test(0)).into()];
         let snapshot = app.folder_nav_history_snapshot();
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
         assert_eq!(
@@ -27172,7 +27337,9 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.current_folder.as_ref(), Some(&real));
         assert_eq!(
             app.quick_folder_workspaces[slot.index()].history.back_stack,
-            vec![FolderNavHistoryTarget::Rating { stars: 0 }]
+            vec![FolderNavHistoryTarget::Rating(
+                crate::app::tests::rating_root_for_test(0)
+            )]
         );
         assert!(
             app.quick_folder_workspaces[slot.index()]
@@ -27595,10 +27762,12 @@ mod phase_c_folder_nav_history_tests {
         let book = destination.join("book.zip");
         std::fs::write(&book, b"not-a-real-zip").unwrap();
         app.install_new_items(vec![GridItem::ZipFile(book.clone())], vec![None]);
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.current_folder = Some(crate::app::reading_history_synthetic_path());
         app.top_level_grid_view
-            .replace_surface(TopLevelGridSurface::ReadingHistory);
+            .replace_surface(TopLevelGridSurface::ReadingHistory(
+                top_level_grid_view::ReadingHistoryRootRestore::unavailable(),
+            ));
 
         assert!(
             app.begin_context_jump_to_folder(JumpToFolderRequest {
@@ -28400,7 +28569,9 @@ mod phase_c_folder_nav_history_tests {
         );
         app.top_level_grid_view.begin(
             TopLevelGridSurface::Search(TopLevelSearchView::Tag),
-            Some(TopLevelGridRestore::Rating { stars: 3 }),
+            Some(TopLevelGridRestore::Rating(
+                crate::app::tests::rating_root_for_test(3),
+            )),
         );
 
         assert!(
@@ -28417,7 +28588,9 @@ mod phase_c_folder_nav_history_tests {
         );
         assert!(matches!(
             app.top_level_grid_view.return_to(),
-            Some(TopLevelGridRestore::Rating { stars: 3 })
+            Some(TopLevelGridRestore::Rating(
+                top_level_grid_view::RatingRootRestore { stars: 3, .. }
+            ))
         ));
         assert!(
             !app.quick_folder_workspaces[slot.index()]
@@ -28441,7 +28614,7 @@ mod phase_c_folder_nav_history_tests {
                 .collect::<Vec<_>>(),
             vec![
                 FolderNavHistoryTarget::Path(older),
-                FolderNavHistoryTarget::Rating { stars: 3 }
+                FolderNavHistoryTarget::Rating(crate::app::tests::rating_root_for_test(3))
             ]
         );
     }
@@ -28823,6 +28996,7 @@ mod phase_c_folder_nav_history_tests {
 #[cfg(test)]
 mod phase_c_drill_nav_tests {
     use super::phase_c_support::setup_app;
+    use crate::app::top_level_grid_view;
     use crate::app::{
         AdjustmentDragSession, App, FacetField, GridEditBadges, subfolder_expansion_synthetic_path,
     };
@@ -31089,7 +31263,7 @@ mod phase_c_drill_nav_tests {
     fn install_new_items_resets_reading_history_view_state() {
         use crate::grid_item::GridItem;
         let mut app = setup_app();
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.reading_history_rows.insert(
             "c:/books/a.zip".to_string(),
             crate::reading_history_db::ReadingHistoryEntry {
@@ -31464,7 +31638,7 @@ mod phase_c_drill_nav_tests {
             ),
         });
         app.rating_view_stars = 3;
-        app.rating_view_saved_folder = Some(subfolder_expansion_synthetic_path());
+        app.rating_view_return_to = Some(crate::app::tests::expansion_origin_for_test(&app));
 
         app.apply_rating_view_result(crate::rating_view::RatingViewBuildResult {
             visibility_notice: None,
@@ -31732,7 +31906,7 @@ mod phase_c_drill_nav_tests {
         let path = std::path::PathBuf::from("c:/books/a.zip");
         let key = crate::path_key::normalize_keep_drive(&path);
 
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.items = vec![GridItem::ZipFile(path.clone())];
         app.reading_history_rows.insert(
             key.clone(),
@@ -31839,7 +32013,7 @@ mod phase_c_drill_nav_tests {
             ("c:/books/book.pdf", ReadingHistoryKind::Pdf),
             ("c:/books/book.rar", ReadingHistoryKind::Archive),
         ];
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         for (path, kind) in specs {
             let path = std::path::PathBuf::from(path);
             let entry = ReadingHistoryEntry::new(
@@ -31895,7 +32069,7 @@ mod phase_c_drill_nav_tests {
             ("c:/other/song.flac", ReadingHistoryKind::Audio),
             ("c:/books/book.zip", ReadingHistoryKind::Zip),
         ];
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         for (path, kind) in specs {
             let path = std::path::PathBuf::from(path);
             let entry = ReadingHistoryEntry::new(
@@ -32059,7 +32233,7 @@ mod phase_c_drill_nav_tests {
         );
         entry.media_position_ms = Some(95_000);
         entry.media_duration_ms = Some(100_000);
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.items = vec![GridItem::Video(path)];
         app.reading_history_rows.insert(entry.key.clone(), entry);
 
@@ -32113,7 +32287,7 @@ mod phase_c_drill_nav_tests {
         let path = app.tmp.path().join("missing.zip");
         let key = crate::path_key::normalize_keep_drive(&path);
 
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.items = vec![GridItem::ZipFile(path.clone())];
         app.thumbnails = vec![ThumbnailState::Pending];
         app.image_metas = vec![None];
@@ -32158,29 +32332,33 @@ mod phase_c_drill_nav_tests {
         let mut app = setup_app();
 
         // 閲覧履歴ビューで本 (ZIP) を開いた → 戻り先予約が立つ。
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.items = vec![GridItem::ZipFile(std::path::PathBuf::from(
             "c:/books/a.zip",
         ))];
         app.note_reading_history_open(0);
         assert_eq!(
             app.reading_history_return_from,
-            Some(std::path::PathBuf::from("c:/books/a.zip"))
+            Some(crate::app::tests::reading_history_return_for_test(
+                std::path::PathBuf::from("c:/books/a.zip")
+            ))
         );
 
         // 本を開いた後 (ビューを抜け current_folder = 本) は、親へ戻る操作で閲覧履歴へ。
         app.items_are_reading_history_view = false;
+        app.top_level_grid_view
+            .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
         app.current_folder = Some(std::path::PathBuf::from("c:/books/a.zip"));
         assert!(matches!(
             app.reading_history_back_nav(),
             Some(crate::ui_main::AddressBarNav::ReadingHistory(
-                crate::app::ReadingHistoryEntrance::Return
+                crate::app::ReadingHistoryEntrance::Return(_)
             ))
         ));
         assert!(matches!(
             app.handle_grid_parent_folder_action(),
             Some(crate::ui_main::AddressBarNav::ReadingHistory(
-                crate::app::ReadingHistoryEntrance::Return
+                crate::app::ReadingHistoryEntrance::Return(_)
             ))
         ));
 
@@ -32193,6 +32371,8 @@ mod phase_c_drill_nav_tests {
         // 閲覧履歴ビュー外で開いても予約は立たない。
         app.reading_history_return_from = None;
         app.items_are_reading_history_view = false;
+        app.top_level_grid_view
+            .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
         app.note_reading_history_open(0);
         assert!(app.reading_history_return_from.is_none());
     }
@@ -32203,23 +32383,29 @@ mod phase_c_drill_nav_tests {
         let mut app = setup_app();
 
         // 履歴から本を開いて予約を立てる。
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.items = vec![GridItem::ZipFile(std::path::PathBuf::from(
             "c:/books/a.zip",
         ))];
         app.note_reading_history_open(0);
         assert_eq!(
             app.reading_history_return_from,
-            Some(std::path::PathBuf::from("c:/books/a.zip"))
+            Some(crate::app::tests::reading_history_return_for_test(
+                std::path::PathBuf::from("c:/books/a.zip")
+            ))
         );
 
         // 本の中でページ (画像) を開くだけでは予約は維持される。
         app.items_are_reading_history_view = false;
+        app.top_level_grid_view
+            .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
         app.items = vec![GridItem::Image(std::path::PathBuf::from("c:/books/p1.jpg"))];
         app.note_reading_history_open(0);
         assert_eq!(
             app.reading_history_return_from,
-            Some(std::path::PathBuf::from("c:/books/a.zip"))
+            Some(crate::app::tests::reading_history_return_for_test(
+                std::path::PathBuf::from("c:/books/a.zip")
+            ))
         );
 
         // 閲覧履歴ビュー以外で別のコンテナを開いたら予約を捨てる
@@ -32241,7 +32427,11 @@ mod phase_c_drill_nav_tests {
         app.settings.auto_fullscreen_zip_pdf = true;
         app.current_folder = Some(reserved_book.clone());
         app.items_are_reading_history_view = false;
-        app.reading_history_return_from = Some(reserved_book.clone());
+        app.top_level_grid_view
+            .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
+        app.reading_history_return_from = Some(crate::app::tests::reading_history_return_for_test(
+            reserved_book.clone(),
+        ));
         app.items = vec![GridItem::PdfFile(detached_book)];
         app.thumbnails = vec![ThumbnailState::Pending];
         app.image_metas = vec![None];
@@ -32259,13 +32449,15 @@ mod phase_c_drill_nav_tests {
         );
         assert_eq!(
             app.reading_history_return_from,
-            Some(reserved_book.clone()),
+            Some(crate::app::tests::reading_history_return_for_test(
+                reserved_book.clone()
+            )),
             "detached navigation must not clear the mounted main reservation"
         );
         assert!(matches!(
             app.reading_history_back_nav(),
             Some(crate::ui_main::AddressBarNav::ReadingHistory(
-                crate::app::ReadingHistoryEntrance::Return
+                crate::app::ReadingHistoryEntrance::Return(_)
             ))
         ));
     }
@@ -32288,7 +32480,12 @@ mod phase_c_drill_nav_tests {
             app.settings.detached_viewer_open_images_in_window = false;
             app.settings.auto_fullscreen_zip_pdf = false;
             app.items_are_reading_history_view = from_history;
-            app.reading_history_return_from = Some(previous.clone());
+            if from_history {
+                crate::app::tests::install_reading_history_surface_for_test(&mut app);
+            }
+            app.reading_history_return_from = Some(
+                crate::app::tests::reading_history_return_for_test(previous.clone()),
+            );
             app.items = vec![GridItem::PdfFile(book.clone())];
             app.thumbnails = vec![ThumbnailState::Pending];
             app.image_metas = vec![None];
@@ -32303,11 +32500,11 @@ mod phase_c_drill_nav_tests {
             assert_eq!(intent.path, book.clone());
             assert_eq!(
                 intent.effects.reading_history_return_from,
-                from_history.then_some(book)
+                from_history.then(|| crate::app::tests::reading_history_return_for_test(book))
             );
             assert_eq!(
                 app.reading_history_return_from,
-                Some(previous),
+                Some(crate::app::tests::reading_history_return_for_test(previous)),
                 "reading-history state stays with the visible source until adoption"
             );
         }
@@ -32331,13 +32528,17 @@ mod phase_c_drill_nav_tests {
             let folder = parent.join("mixed-folder");
             std::fs::create_dir_all(folder.join("nested-container")).unwrap();
             let previous = app.tmp.path().join("previous.zip");
-            let initial_reservation = (!from_history).then_some(previous);
+            let initial_reservation = (!from_history)
+                .then(|| crate::app::tests::reading_history_return_for_test(previous));
             let scan = scan_directory(&folder);
 
             app.settings.detached_viewer_open_images_in_window = true;
             app.settings.auto_fullscreen_image_folders = true;
             app.current_folder = Some(parent);
             app.items_are_reading_history_view = from_history;
+            if from_history {
+                crate::app::tests::install_reading_history_surface_for_test(&mut app);
+            }
             app.reading_history_return_from = initial_reservation.clone();
             app.items = vec![GridItem::Folder(folder.clone())];
             app.thumbnails = vec![ThumbnailState::Pending];
@@ -32382,7 +32583,8 @@ mod phase_c_drill_nav_tests {
             assert_eq!(adopted_path, folder);
             assert_eq!(
                 app.reading_history_return_from,
-                from_history.then_some(adopted_path),
+                from_history
+                    .then(|| crate::app::tests::reading_history_return_for_test(adopted_path)),
                 "the adopted main fallback must preserve the historical set/clear semantics"
             );
         }
@@ -32395,7 +32597,7 @@ mod phase_c_drill_nav_tests {
         let mut app = setup_app();
 
         // 閲覧履歴の変換アーカイブを開く → 予約は (キャッシュ ZIP ではなく) 元アーカイブ。
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.items = vec![GridItem::ConvertibleArchive {
             path: std::path::PathBuf::from("c:/books/a.rar"),
             format: ArchiveFormat::Rar,
@@ -32403,19 +32605,23 @@ mod phase_c_drill_nav_tests {
         app.note_reading_history_open(0);
         assert_eq!(
             app.reading_history_return_from,
-            Some(std::path::PathBuf::from("c:/books/a.rar"))
+            Some(crate::app::tests::reading_history_return_for_test(
+                std::path::PathBuf::from("c:/books/a.rar")
+            ))
         );
 
         // 開いた後は current_folder = キャッシュ ZIP / archive_source_override = 元アーカイブ。
         // open_archive_via_cache が予約を元アーカイブへ復元しているので、effective_folder()
         // (= override) と一致し、閉じると閲覧履歴へ戻る。
         app.items_are_reading_history_view = false;
+        app.top_level_grid_view
+            .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
         app.current_folder = Some(std::path::PathBuf::from("c:/cache/abcd/book.zip"));
         app.archive_source_override = Some(std::path::PathBuf::from("c:/books/a.rar"));
         assert!(matches!(
             app.reading_history_back_nav(),
             Some(crate::ui_main::AddressBarNav::ReadingHistory(
-                crate::app::ReadingHistoryEntrance::Return
+                crate::app::ReadingHistoryEntrance::Return(_)
             ))
         ));
 
@@ -32429,7 +32635,7 @@ mod phase_c_drill_nav_tests {
             grid: super::BookmarkViewReturnGridState {
                 row_keys: Vec::new(),
                 selected_key: None,
-                opened_key: (1, 1),
+                opened_key: Some((1, 1)),
                 scroll_offset_y: 0.0,
             },
         });
@@ -33096,7 +33302,7 @@ fn bookmark_open_routes_fullscreen_close_back_to_bookmark_view() {
         grid: super::BookmarkViewReturnGridState {
             row_keys: vec![(1, 7)],
             selected_key: Some((1, 7)),
-            opened_key: (1, 7),
+            opened_key: Some((1, 7)),
             scroll_offset_y: 0.0,
         },
     });
@@ -33154,7 +33360,7 @@ fn bookmark_media_close_returns_only_while_original_file_is_open() {
             grid: super::BookmarkViewReturnGridState {
                 row_keys: vec![(0, 7)],
                 selected_key: Some((0, 7)),
-                opened_key: (0, 7),
+                opened_key: Some((0, 7)),
                 scroll_offset_y: 0.0,
             },
         });
@@ -33175,7 +33381,7 @@ fn bookmark_media_close_returns_only_while_original_file_is_open() {
             grid: super::BookmarkViewReturnGridState {
                 row_keys: vec![(0, 7)],
                 selected_key: Some((0, 7)),
-                opened_key: (0, 7),
+                opened_key: Some((0, 7)),
                 scroll_offset_y: 0.0,
             },
         });
@@ -33200,7 +33406,7 @@ fn native_immediate_close_consumes_bookmark_return_in_same_dispatch() {
         grid: super::BookmarkViewReturnGridState {
             row_keys: vec![(0, 7)],
             selected_key: Some((0, 7)),
-            opened_key: (0, 7),
+            opened_key: Some((0, 7)),
             scroll_offset_y: 240.0,
         },
     });
@@ -33226,7 +33432,7 @@ fn bookmark_return_target_is_cleared_only_after_container_navigation() {
         grid: super::BookmarkViewReturnGridState {
             row_keys: vec![(0, 7)],
             selected_key: Some((0, 7)),
-            opened_key: (0, 7),
+            opened_key: Some((0, 7)),
             scroll_offset_y: 240.0,
         },
     });
@@ -33256,7 +33462,7 @@ fn bookmark_open_pending_is_owned_by_viewer_context_bundle() {
     let return_grid = super::BookmarkViewReturnGridState {
         row_keys: vec![(0, 5), (0, 7)],
         selected_key: Some((0, 7)),
-        opened_key: (0, 7),
+        opened_key: Some((0, 7)),
         scroll_offset_y: 360.0,
     };
     app.bookmark_view_state = Some(super::BookmarkViewState::Opening {
@@ -33383,7 +33589,7 @@ fn arm_detached_bookmark_book_open(
         grid: super::BookmarkViewReturnGridState {
             row_keys: vec![(1, 9)],
             selected_key: Some((1, 9)),
-            opened_key: (1, 9),
+            opened_key: Some((1, 9)),
             scroll_offset_y: 320.0,
         },
     });
@@ -34285,7 +34491,7 @@ fn begin_detached_bookmark_media_test(
         grid: super::BookmarkViewReturnGridState {
             row_keys: vec![(0, 7)],
             selected_key: Some((0, 7)),
-            opened_key: (0, 7),
+            opened_key: Some((0, 7)),
             scroll_offset_y: 240.0,
         },
     });
@@ -34779,7 +34985,7 @@ fn fullfeature_bookmark_book_parks_active_bookmark_media_before_main_open() {
         grid: super::BookmarkViewReturnGridState {
             row_keys: vec![(1, 73)],
             selected_key: Some((1, 73)),
-            opened_key: (1, 73),
+            opened_key: Some((1, 73)),
             scroll_offset_y: 360.0,
         },
     });
@@ -64967,6 +65173,7 @@ fn install_collection_item_for_detached_plan(
     crate::app::top_level_grid_view::CollectionGridRestore {
         identity: CollectionGridIdentity { collection_id },
         revision_at_open: 7,
+        return_to: None,
         viewport_anchor: Some(CollectionGridViewportAnchor {
             entry_id,
             source_key,
@@ -72181,7 +72388,7 @@ mod still_window_mode_key_tests {
                 grid: BookmarkViewReturnGridState {
                     row_keys: vec![(1, 1)],
                     selected_key: Some((1, 1)),
-                    opened_key: (1, 1),
+                    opened_key: Some((1, 1)),
                     scroll_offset_y: 0.0,
                 },
             });
@@ -72544,7 +72751,7 @@ mod still_window_mode_key_tests {
             grid: BookmarkViewReturnGridState {
                 row_keys: vec![(3, 3)],
                 selected_key: Some((3, 3)),
-                opened_key: (3, 3),
+                opened_key: Some((3, 3)),
                 scroll_offset_y: 0.0,
             },
         });
@@ -73835,6 +74042,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 collection_id: CollectionId::new(),
             },
             revision_at_open: 9,
+            return_to: None,
             viewport_anchor: Some(CollectionGridViewportAnchor {
                 entry_id: CollectionEntryId::new(),
                 source_key: source.key().clone(),
@@ -93259,7 +93467,9 @@ mod rating_view_navigation_tests {
     fn rating_view_nav_open_dedupes_only_after_visible_adoption_and_close_clears_stack() {
         let mut app = setup_app();
         let path = app.tmp.path().join("rating-child");
+        let origin = app.tmp.path().join("before-rating");
         std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir_all(&origin).unwrap();
 
         assert!(app.rating_view_physical_load_owner(&path).is_none());
         assert!(
@@ -93270,7 +93480,9 @@ mod rating_view_navigation_tests {
         app.active_quick_folder_slot = None;
         app.current_folder = Some(super::rating_view_synthetic_path());
         app.rating_view_stars = 4;
-        app.rating_view_saved_folder = Some(app.tmp.path().join("before-rating"));
+        app.rating_view_return_to = Some(crate::app::tests::grid_origin_for_test(
+            top_level_grid_view::TopLevelGridRestore::Folder(origin.clone()),
+        ));
         app.items_are_rating_view = true;
         app.top_level_grid_view.begin(
             super::top_level_grid_view::TopLevelGridSurface::Rating { stars: 4 },
@@ -93323,11 +93535,26 @@ mod rating_view_navigation_tests {
                 .is_none()
         );
 
-        assert_eq!(app.rating_view_nav_stack, vec![path]);
+        assert_eq!(app.rating_view_nav_stack, vec![path.clone()]);
 
         app.finish_page_identity_preparation_for_test();
         app.close_rating_view();
 
+        assert_eq!(
+            app.rating_view_nav_stack,
+            vec![path.clone()],
+            "退出先の採用前は現在のレーティング物理子の帰路を保持する"
+        );
+        assert_eq!(app.current_folder.as_ref(), Some(&path));
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+
+        app.finish_history_restore_preparation_for_test();
+
+        assert_eq!(app.current_folder.as_ref(), Some(&origin));
         assert!(
             app.rating_view_nav_stack.is_empty(),
             "レーティング一覧を閉じたら仮想階層スタックも破棄する"
@@ -93350,7 +93577,9 @@ mod rating_view_navigation_tests {
             .set_user_rating(&key, 4, Some(&meta))
             .unwrap();
         app.rating_view_stars = 4;
-        app.rating_view_saved_folder = Some(app.tmp.path().join("before"));
+        app.rating_view_return_to = Some(crate::app::tests::grid_origin_for_test(
+            top_level_grid_view::TopLevelGridRestore::Folder(app.tmp.path().join("before")),
+        ));
         app.rating_view_rows = vec![crate::rating_view::RatingViewRow {
             key: "container".to_string(),
             item: GridItem::ZipFile(opened.clone()),
@@ -93382,8 +93611,10 @@ mod rating_view_navigation_tests {
         );
         assert_eq!(app.selected, Some(0));
         assert_eq!(
-            app.rating_view_saved_folder,
-            Some(app.tmp.path().join("before"))
+            app.rating_view_return_to,
+            Some(crate::app::tests::grid_origin_for_test(
+                top_level_grid_view::TopLevelGridRestore::Folder(app.tmp.path().join("before"))
+            ))
         );
     }
 
@@ -95324,7 +95555,7 @@ mod smart_folder_transition_tests {
             back_stack: Vec::new(),
         };
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone().into()).into());
         let ctx = egui::Context::default();
 
         assert!(app.begin_smart_history_navigation(
@@ -95376,7 +95607,7 @@ mod smart_folder_transition_tests {
         app.settings.smart_folders = vec![definition];
         let target = SmartFolderViewState::root(id, Vec::new());
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone().into()).into());
         let ctx = egui::Context::default();
 
         assert!(app.begin_smart_history_navigation(
@@ -95439,7 +95670,7 @@ mod smart_folder_transition_tests {
         app.settings.smart_folders = vec![definition];
         let target = SmartFolderViewState::root(id, Vec::new());
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone().into()).into());
 
         assert!(app.begin_smart_history_navigation(
             target,
@@ -95543,7 +95774,7 @@ mod smart_folder_transition_tests {
         app.settings.smart_folders = vec![definition];
         let target = SmartFolderViewState::root(id, Vec::new());
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone().into()).into());
         assert!(app.begin_smart_history_navigation(
             target.clone(),
             crate::app::smart_folder::SmartHistoryDirection::Back,
@@ -95559,7 +95790,7 @@ mod smart_folder_transition_tests {
         assert_eq!(app.current_folder.as_deref(), Some(prior.as_path()));
         assert_eq!(
             app.folder_nav_back_stack,
-            vec![FolderNavHistoryTarget::SmartFolder(target)]
+            vec![FolderNavHistoryTarget::SmartFolder(target.into())]
         );
         assert!(app.folder_nav_forward_stack.is_empty());
     }
@@ -95586,8 +95817,8 @@ mod smart_folder_transition_tests {
         let root_b = SmartFolderViewState::root(definition_b.id, Vec::new());
         app.settings.smart_folders = vec![definition_a, definition_b];
         app.folder_nav_back_stack = vec![
-            FolderNavHistoryTarget::SmartFolder(root_a.clone()).into(),
-            FolderNavHistoryTarget::SmartFolder(root_b.clone()).into(),
+            FolderNavHistoryTarget::SmartFolder(root_a.clone().into()).into(),
+            FolderNavHistoryTarget::SmartFolder(root_b.clone().into()).into(),
         ];
         assert!(app.begin_smart_history_navigation(
             root_b.clone(),
@@ -95605,7 +95836,7 @@ mod smart_folder_transition_tests {
             app.folder_nav_forward_stack,
             vec![
                 FolderNavHistoryTarget::Path(prior),
-                FolderNavHistoryTarget::SmartFolder(root_b),
+                FolderNavHistoryTarget::SmartFolder(root_b.into()),
             ]
         );
     }
@@ -95631,7 +95862,7 @@ mod smart_folder_transition_tests {
         app.settings.smart_folders = vec![definition];
         app.folder_nav_back_stack = vec![
             FolderNavHistoryTarget::Path(earlier.clone()).into(),
-            FolderNavHistoryTarget::SmartFolder(root.clone()).into(),
+            FolderNavHistoryTarget::SmartFolder(root.clone().into()).into(),
         ];
         assert!(app.begin_smart_history_navigation(
             root.clone(),
@@ -95663,7 +95894,7 @@ mod smart_folder_transition_tests {
             app.folder_nav_forward_stack,
             vec![
                 FolderNavHistoryTarget::Path(current),
-                FolderNavHistoryTarget::SmartFolder(root),
+                FolderNavHistoryTarget::SmartFolder(root.into()),
             ]
         );
     }
@@ -95707,7 +95938,7 @@ mod smart_folder_transition_tests {
         let history_before = app.folder_nav_back_stack.clone();
         app.settings.sort_order = SortOrder::DateDesc;
         assert!(app.begin_smart_history_navigation(
-            root,
+            root.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         assert_eq!(app.current_folder.as_deref(), Some(child.as_path()));
@@ -95732,7 +95963,7 @@ mod smart_folder_transition_tests {
         let root = SmartFolderViewState::root(id, Vec::new());
         app.top_level_grid_view.begin(
             TopLevelGridSurface::Search(TopLevelSearchView::Global),
-            Some(TopLevelGridRestore::SmartFolder(root)),
+            Some(TopLevelGridRestore::SmartFolder(root.into())),
         );
         app.global_search.active = true;
         app.global_search.metadata_draft = "result".into();
@@ -96475,7 +96706,7 @@ mod smart_folder_transition_tests {
             back_stack: Vec::new(),
         };
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone().into()).into());
         let history = app.folder_nav_history_snapshot();
         assert!(app.begin_smart_history_navigation(
             target,
@@ -96969,7 +97200,7 @@ mod smart_folder_transition_tests {
             back_stack: Vec::new(),
         };
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone().into()).into());
         assert!(app.begin_smart_history_navigation(
             target,
             crate::app::smart_folder::SmartHistoryDirection::Back,
@@ -97041,7 +97272,7 @@ mod smart_folder_transition_tests {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct ConvertibleArchiveMainState {
-        reading_history_return_from: Option<PathBuf>,
+        reading_history_return_from: Option<ReadingHistoryBookReturn>,
         rating_filter_suppressed_at: Option<(PathBuf, [bool; 6])>,
         facet_filter: crate::settings::FacetFilter,
         facet_navigation: crate::app::FacetNavigationState,
@@ -97111,7 +97342,9 @@ mod smart_folder_transition_tests {
             .insert(crate::settings::FacetItemKind::Archive);
         app.rebuild_visible_indices();
         assert!(app.visible_indices.contains(&idx));
-        app.reading_history_return_from = Some(app.tmp.path().join("reserved-history.zip"));
+        app.reading_history_return_from = Some(crate::app::tests::reading_history_return_for_test(
+            app.tmp.path().join("reserved-history.zip"),
+        ));
         assert!(app.rating_filter_suppressed_at.is_none());
         assert!(!app.facet_navigation.suppressed());
 
@@ -97664,7 +97897,11 @@ mod smart_folder_transition_tests {
         assert!(!app.settings.facet_filter.is_active());
         assert_eq!(app.facet_navigation.saved_frame_count(), 1);
         let destination = FolderNavHistoryTarget::SmartFolder(
-            app.top_level_grid_view.smart_folder().unwrap().clone(),
+            app.top_level_grid_view
+                .smart_folder()
+                .unwrap()
+                .clone()
+                .into(),
         );
         assert_eq!(
             app.facet_navigation.route().current(),
@@ -98243,7 +98480,8 @@ mod smart_folder_transition_tests {
         app.load_folder(outside.clone());
         app.finish_page_identity_preparation_for_test();
         assert!(app.top_level_grid_view.smart_folder_session().is_none());
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::SmartFolder(saved.clone()).into()];
+        app.folder_nav_back_stack =
+            vec![FolderNavHistoryTarget::SmartFolder(saved.clone().into()).into()];
         assert!(app.begin_smart_history_navigation(
             saved,
             crate::app::smart_folder::SmartHistoryDirection::Back,
@@ -98330,7 +98568,8 @@ mod smart_folder_transition_tests {
         std::fs::create_dir_all(&outside).unwrap();
         app.load_folder(outside.clone());
         app.finish_page_identity_preparation_for_test();
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::SmartFolder(saved.clone()).into()];
+        app.folder_nav_back_stack =
+            vec![FolderNavHistoryTarget::SmartFolder(saved.clone().into()).into()];
         assert!(app.begin_smart_history_navigation(
             saved,
             crate::app::smart_folder::SmartHistoryDirection::Back,
@@ -98411,7 +98650,8 @@ mod smart_folder_transition_tests {
         let outside = app.tmp.path().join("outside-nested-archive");
         std::fs::create_dir_all(&outside).unwrap();
         app.load_folder(outside.clone());
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::SmartFolder(saved.clone()).into()];
+        app.folder_nav_back_stack =
+            vec![FolderNavHistoryTarget::SmartFolder(saved.clone().into()).into()];
         assert!(app.begin_smart_history_navigation(
             saved,
             crate::app::smart_folder::SmartHistoryDirection::Back,
@@ -99064,7 +99304,9 @@ mod smart_folder_transition_tests {
         let outside = app.tmp.path().join("outside-snapshot-scope");
         std::fs::create_dir_all(&outside).unwrap();
         let reserved_history = app.tmp.path().join("still-reserved-history.zip");
-        app.reading_history_return_from = Some(reserved_history.clone());
+        app.reading_history_return_from = Some(crate::app::tests::reading_history_return_for_test(
+            reserved_history.clone(),
+        ));
         app.suppress_nav_record_for_search_restore = true;
 
         let folder_before = app.current_folder.clone();
@@ -99077,7 +99319,12 @@ mod smart_folder_transition_tests {
         app.load_folder(outside);
 
         assert_eq!(app.current_folder, folder_before);
-        assert_eq!(app.reading_history_return_from, Some(reserved_history));
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(crate::app::tests::reading_history_return_for_test(
+                reserved_history
+            ))
+        );
         assert!(app.suppress_nav_record_for_search_restore);
         assert_eq!(app.top_level_grid_view.surface(), &surface_before);
         assert_eq!(app.current_smart_folder_id, smart_id_before);
@@ -99859,7 +100106,7 @@ mod smart_folder_transition_tests {
         };
         assert!(matches!(back.position, SmartFolderPosition::Root));
         assert!(app.begin_smart_history_navigation(
-            back,
+            back.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         assert!(matches!(
@@ -99878,7 +100125,7 @@ mod smart_folder_transition_tests {
             SmartFolderPosition::Container { .. }
         ));
         assert!(app.begin_smart_history_navigation(
-            forward,
+            forward.state,
             crate::app::smart_folder::SmartHistoryDirection::Forward,
         ));
         wait_for_no_resident_smart_pdf_open(&mut app, &ctx, &pdf);
@@ -99962,7 +100209,7 @@ mod smart_folder_transition_tests {
             _ => panic!("back to no-resident PDF"),
         };
         assert!(app.begin_smart_history_navigation(
-            back,
+            back.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         assert_eq!(app.folder_nav_back_stack, before.back_stack);
@@ -100018,7 +100265,7 @@ mod smart_folder_transition_tests {
             _ => panic!("folder history target missing"),
         };
         assert!(app.begin_smart_history_navigation(
-            container_target,
+            container_target.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         wait_for_smart_folder_scope(&mut app, &ctx, &folder);
@@ -100045,7 +100292,7 @@ mod smart_folder_transition_tests {
         };
         assert!(matches!(root_target.position, SmartFolderPosition::Root));
         assert!(app.begin_smart_history_navigation(
-            root_target,
+            root_target.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         assert!(matches!(
@@ -100115,7 +100362,7 @@ mod smart_folder_transition_tests {
             _ => panic!("back to PDF"),
         };
         assert!(app.begin_smart_history_navigation(
-            back,
+            back.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         assert_eq!(app.current_folder.as_deref(), Some(normal.as_path()));
@@ -100154,7 +100401,7 @@ mod smart_folder_transition_tests {
             _ => panic!("back to PDF"),
         };
         assert!(app.begin_smart_history_navigation(
-            back,
+            back.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -100212,7 +100459,7 @@ mod smart_folder_transition_tests {
             _ => panic!("back to PDF"),
         };
         assert!(app.begin_smart_history_navigation(
-            back,
+            back.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -100848,7 +101095,7 @@ mod smart_folder_transition_tests {
             super::top_level_grid_view::SmartFolderPosition::Root
         ));
         assert!(app.begin_smart_history_navigation(
-            back,
+            back.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         assert!(matches!(
@@ -100865,7 +101112,7 @@ mod smart_folder_transition_tests {
         assert_eq!(forward.definition_id, id);
         assert_eq!(forward.scoped_current(), Some(entry.as_path()));
         assert!(app.begin_smart_history_navigation(
-            forward,
+            forward.state,
             crate::app::smart_folder::SmartHistoryDirection::Forward,
         ));
         wait_for_smart_folder_scope(&mut app, &ctx, &entry);
@@ -100888,7 +101135,7 @@ mod smart_folder_transition_tests {
         assert_eq!(back_to_entry.definition_id, id);
         assert_eq!(back_to_entry.scoped_current(), Some(entry.as_path()));
         assert!(app.begin_smart_history_navigation(
-            back_to_entry,
+            back_to_entry.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         wait_for_smart_folder_scope(&mut app, &ctx, &entry);
@@ -105741,7 +105988,9 @@ mod rating_folder_r2_tests {
         let mut app = setup_app();
         for surface in [
             TopLevelGridSurface::Search(TopLevelSearchView::Favorite),
-            TopLevelGridSurface::ReadingHistory,
+            TopLevelGridSurface::ReadingHistory(
+                top_level_grid_view::ReadingHistoryRootRestore::unavailable(),
+            ),
             TopLevelGridSurface::Snapshot,
             TopLevelGridSurface::DriveList,
         ] {
