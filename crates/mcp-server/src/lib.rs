@@ -1,8 +1,10 @@
 //! Bounded stdio MCP adapter. Protocol metadata stays here, outside core IPC.
+mod input;
 pub mod pipe;
 mod schema;
 #[cfg(test)]
 mod tests;
+use input::{InputLifetime, InputLine, InputQueue};
 use mimageviewer_agent_ipc::*;
 use pipe::{Backend, CallControl};
 use serde::Deserialize;
@@ -49,7 +51,7 @@ enum Session {
     },
 }
 enum Event {
-    Line(Vec<u8>),
+    InputAvailable,
     InputError,
     Eof,
     OutputError(io::Error),
@@ -102,16 +104,6 @@ fn cancel_active(owner: &ActiveOwner) {
     let control = owner.lock().unwrap().take().map(|a| a.control);
     if let Some(control) = control {
         control.cancel();
-    }
-}
-fn eager_cancel(owner: &ActiveOwner, line: &[u8]) {
-    if let Ok(value) = serde_json::from_slice::<Value>(line) {
-        if value.get("jsonrpc") == Some(&json!("2.0"))
-            && value.get("id").is_none()
-            && value.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
-        {
-            cancel_matching(owner, value.pointer("/params/requestId"));
-        }
     }
 }
 struct PermissionObserver {
@@ -190,6 +182,7 @@ fn writer_loop<W: Write>(
     output: &mut W,
     output_recv: &mpsc::Receiver<Envelope>,
     owner: &ActiveOwner,
+    events: &mpsc::SyncSender<Event>,
 ) -> io::Result<()> {
     while let Ok(envelope) = output_recv.recv() {
         let serialized = serialize_response(&envelope.value);
@@ -205,10 +198,12 @@ fn writer_loop<W: Write>(
             active.take();
             drop(active);
             if cancelled {
+                let _ = events.try_send(Event::InputAvailable);
                 continue;
             }
         }
         write_serialized(output, &serialized)?;
+        let _ = events.try_send(Event::InputAvailable);
     }
     Ok(())
 }
@@ -229,13 +224,15 @@ pub fn run_stdio_with_eof<
     backend: Arc<dyn Backend>,
     on_eof: F,
 ) -> io::Result<()> {
-    let (send, recv) = mpsc::sync_channel(32);
+    let (send, recv) = mpsc::sync_channel(input::CAPACITY);
+    let input_queue = Arc::new(InputQueue::new());
+    let _input_lifetime = InputLifetime(input_queue.clone());
     let owner: ActiveOwner = Arc::new(Mutex::new(None));
     let (output_send_queue, output_recv) = mpsc::sync_channel::<Envelope>(32);
     let writer_owner = owner.clone();
     let writer_events = send.clone();
     std::thread::spawn(move || {
-        let outcome = writer_loop(&mut output, &output_recv, &writer_owner);
+        let outcome = writer_loop(&mut output, &output_recv, &writer_owner, &writer_events);
         // Release blocked output producers before delivering a terminal event.
         drop(output_recv);
         if let Err(error) = outcome {
@@ -244,6 +241,7 @@ pub fn run_stdio_with_eof<
     });
     let input_send = send.clone();
     let input_owner = owner.clone();
+    let reader_queue = input_queue.clone();
     std::thread::spawn(move || {
         let mut input = BufReader::new(input);
         loop {
@@ -254,24 +252,30 @@ pub fn run_stdio_with_eof<
                 .read_until(b'\n', &mut line)
             {
                 Ok(0) => {
+                    reader_queue.close();
                     cancel_active(&input_owner);
                     on_eof();
                     let _ = input_send.send(Event::Eof);
                     break;
                 }
                 Ok(_) if line.len() as u64 > MAX_LINE_BYTES => {
+                    reader_queue.close();
+                    cancel_active(&input_owner);
                     let _ = input_send.send(Event::InputError);
                     break;
                 }
                 Ok(_) => {
-                    eager_cancel(&input_owner, &line);
-                    // Retain FIFO delivery as well: a preceding tool may not yet
-                    // have been admitted when the reader first sees its cancel.
-                    if input_send.send(Event::Line(line)).is_err() {
+                    if !reader_queue.cancel_notification(&input_owner, &line)
+                        && !reader_queue.push(line, &input_owner)
+                    {
                         break;
                     }
+                    // A wake only: the bounded FIFO retains the actual input.
+                    let _ = input_send.try_send(Event::InputAvailable);
                 }
                 Err(_) => {
+                    reader_queue.close();
+                    cancel_active(&input_owner);
                     let _ = input_send.send(Event::InputError);
                     break;
                 }
@@ -280,7 +284,25 @@ pub fn run_stdio_with_eof<
     });
     let mut session = Session::Fresh;
     let mut serial = 0;
-    while let Ok(event) = recv.recv() {
+    loop {
+        // Check the FIFO before sleeping, including after Active retires. A wake
+        // may be coalesced when the control-event channel is already full.
+        while let Some(response) = input_queue.dispatch_next(&owner, |line| match line {
+            InputLine::Request { bytes, .. } | InputLine::Other(bytes) => {
+                handle_line(&bytes, &mut session, &owner, &backend, &send, &mut serial)
+            }
+            InputLine::Rejected(response) => Some(response),
+        }) {
+            if let Some(response) = response {
+                output_send(&output_send_queue, Envelope::plain(response)).map_err(|error| {
+                    cancel_active(&owner);
+                    error
+                })?;
+            }
+        }
+        let Ok(event) = recv.recv() else {
+            break;
+        };
         let response = match event {
             Event::Eof | Event::InputError => {
                 cancel_active(&owner);
@@ -348,10 +370,7 @@ pub fn run_stdio_with_eof<
                     request: Some((done_serial, control)),
                 })
             }
-            Event::Line(line) => {
-                handle_line(&line, &mut session, &owner, &backend, &send, &mut serial)
-                    .map(Envelope::plain)
-            }
+            Event::InputAvailable => None,
         };
         if let Some(response) = response {
             output_send(&output_send_queue, response).map_err(|error| {
@@ -515,39 +534,36 @@ fn handle_line(
                     )),
                     "ping" if !modern => Some(success(id, json!({}), false)),
                     "tools/list" | "tools/call" => {
-                        if owner.lock().unwrap().is_some() {
-                            Some(error(id, -32000, "Busy: one request is already running"))
-                        } else {
-                            let parsed = if method == "tools/list" {
-                                if params.get("cursor").is_some() {
-                                    Err("Tool list does not have another page")
-                                } else {
-                                    Ok((Action::List, Command::Status))
-                                }
+                        debug_assert!(owner.lock().unwrap().is_none());
+                        let parsed = if method == "tools/list" {
+                            if params.get("cursor").is_some() {
+                                Err("Tool list does not have another page")
                             } else {
-                                parse_tool(&params)
-                            };
-                            match parsed {
-                                Err(message) => Some(error(id, -32602, message)),
-                                Ok((action, command)) => {
-                                    *serial += 1;
-                                    let request_serial = *serial;
-                                    let control = Arc::new(CallControl::default());
-                                    *owner.lock().unwrap() = Some(Active {
-                                        serial: request_serial,
-                                        id,
-                                        modern,
-                                        phase: ActivePhase::Executing(action),
-                                        control: control.clone(),
-                                    });
-                                    let backend = backend.clone();
-                                    let send = send.clone();
-                                    std::thread::spawn(move || {
-                                        let result = backend.call(command, &client, control);
-                                        let _ = send.send(Event::Done(request_serial, result));
-                                    });
-                                    None
-                                }
+                                Ok((Action::List, Command::Status))
+                            }
+                        } else {
+                            parse_tool(&params)
+                        };
+                        match parsed {
+                            Err(message) => Some(error(id, -32602, message)),
+                            Ok((action, command)) => {
+                                *serial += 1;
+                                let request_serial = *serial;
+                                let control = Arc::new(CallControl::default());
+                                *owner.lock().unwrap() = Some(Active {
+                                    serial: request_serial,
+                                    id,
+                                    modern,
+                                    phase: ActivePhase::Executing(action),
+                                    control: control.clone(),
+                                });
+                                let backend = backend.clone();
+                                let send = send.clone();
+                                std::thread::spawn(move || {
+                                    let result = backend.call(command, &client, control);
+                                    let _ = send.send(Event::Done(request_serial, result));
+                                });
+                                None
                             }
                         }
                     }

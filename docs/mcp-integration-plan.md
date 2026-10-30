@@ -581,7 +581,7 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
 確認された前提: Remote の通常データ要求は操作権必須、指定した reader は worker から使える、
 純粋な読み取りを全 Remote phase で受けても cache 整合を壊さない、data dir はプロセス内で固定。
 
-## 14. 段階 0 の実装記録 (2026-10-30、round 3 `ee59d0cb9`・round 4 修正)
+## 14. 段階 0 の実装記録 (2026-10-30、round 5 修正、基点 `64bba7220`)
 
 作業先は `G:\home\mimageviewer-mcp` / `mcp-trial`。製品 core・launcher・インストール版は起動せず、
 通常の APPDATA をテストに使わない。MCP adapter だけは、設計担当の明示判断に従い使い捨て fixture
@@ -870,7 +870,7 @@ MCP adapter と使い捨て fixture のみを起動する。
   mapping を検査する unit test を追加した。
 - 待機口は `cfg(test)` のみ。製品側に同期待機・再試行や UI thread の変更を加えていない。
 
-### Round 4 の sandbox 内検証 (実装担当実行、未コミット差分)
+### Round 4 の sandbox 内検証 (実装担当実行、のちに `0695e9cc4` として commit)
 
 | コマンド | 実 exit code / 結果 | ログ |
 |---|---|---|
@@ -920,3 +920,88 @@ idle reader shutdown、実 core handler を使う fixture への stdio adapter �
 - legacy 接続の 1 秒ごとの Status 照会は、待機中は core 接続・permit を保持せず UI を起こさない
   (レビュー確認)。tool 実行中も照会する点と、有効時に 1 秒 2 要求分の worker 処理がある点は
   段階 1 で push 通知へ置き換えるか再検討する。
+
+### Round 5 の実機観測 (ClaudeCode 実行、full-trust、製品 build 基点 `0695e9cc4`)
+
+以下は ClaudeCode が disposable portable mIV と隔離 data dir
+`G:\home\mimageviewer-mcp\target\portable-smoke\data` を使い、agent_level=read_only で観測した結果。
+実装担当による製品起動・観測ではない。
+
+- `target\debug\mimageviewer-mcp.exe --data-dir <上記の隔離 data>` へ
+  initialize(2025-06-18) / notifications/initialized / tools/list(id=2) /
+  tools/call miv_status(id=3) を連続送信すると、initialize 結果、id=3 の adapter Busy、id=2 の
+  tools/list 結果の順で返った。同一クライアントの先行要求を Active 判定で拒否していた。
+- 一件ずつ送信した miv_status / list_tags / items_by_tag は seed データを正しく返した。
+  tools/list は5 tool すべてを readOnlyHint=true で列挙した。
+- `claude -p --mcp-config ... --strict-mcp-config` は server を connected と報告した。
+  model call は CLI login の期限切れで未実行。この認証状態を製品の不具合とは扱わない。
+
+### Round 5 の修正設計
+
+- client の入力は深さ32の単一 FIFO に保持し、Active がなくなってから次を実行する。
+  追加の待機 registry や並列 core worker 群は作らない。通常の pipeline に対する adapter Busy を削除し、
+  core の応答として届いた Busy はそのまま返す。既存の permission observer は変更しない。
+- raw line を control event channel から別の待機列へ積み直さず、同じ入力 FIFO が waiting request を所有する。
+  満杯は Condvar の backpressure。InputAvailable event は有界 channel 上の wake のみとし、
+  main loop は recv 前に必ず FIFO を確認する。writer の終了/取消 skip も非blocking wake を送る。
+- dequeue と Active への登録は同じ queue lock 内で行う。stdin owner の取消も queue→Active の順で
+  同じ lock を使い、待機要求の除去と実行中要求の取消を処理する。引き渡し途中の取消を失わない。
+  queue lock 内では stdout 書き込みや core IPC を待たない。
+- 待機中の取消は core を呼ばず、応答も返さない。
+  legacy も [2025-11-25 cancellation](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation)
+  の取消後は応答しない指針に従う。initialize は取消対象にしない。
+- 重複 request ID は Active と最大32件の待機列を同じ lock 内で調べ、FIFO 内の型付き rejection とする。
+  同じ ID の要求を二度 core へ送らない。shutdown は FIFO を Closed にして待機要求を破棄し、
+  空きを待つ stdin owner も起こす。EOF は従来どおり child の終了を担当する。
+
+状態を減らす検討: 同じ adapter から複数の core request を並行実行せず、一つの FIFO と既存 Active に
+集約する。入力/出力両 queue 飽和に関する round 4 の既定の割り切り判断は変更しない。
+
+独立 reviewer (gpt-6.1-sol / xhigh、read-only) は設計と完成差分を確認した。
+入力 error 検出時にも FIFO を先に閉じる点を追加指摘し、oversized line / read error の両経路を
+close→Active cancel→InputError event に揃えて修正した。これらは EOF hook を呼ばない。
+最終 source review で追加の P1/P2 はなし。
+
+### Round 5 の sandbox 内検証 (実装担当実行、未コミット差分)
+
+| コマンド | 実 exit code / 結果 | ログ |
+|---|---|---|
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | `target/mcp-r5-core-check.log` |
+| `cargo check -p mimageviewer-mcp --bin mimageviewer-mcp` | 0 | `target/mcp-r5-mcp-check-final.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 101。IPC 6成功、MCP 34成功/2失敗、ignored 0 | `target/mcp-r5-crates-final.log` |
+| 上記の core 焦点 nextest | 100。19実行、17成功/2失敗 | `target/mcp-r5-focused.log` |
+| `cargo build -p mimageviewer-mcp --bin mimageviewer-mcp` | 0。`target/debug/mimageviewer-mcp.exe` 更新 | `target/mcp-r5-adapter-build.log` |
+| `cargo fmt` → `cargo fmt --check` | 各0。全 workspace | `target/mcp-r5-fmt-check.log` / tool 実行記録 |
+| `python scripts/check_ui_glyphs.py` / `git diff --check` | 各0 | tool 実行記録 |
+
+3版の full stdio runtime に initialize/initialized (legacy のみ) と list/call/call を一括投入し、
+後続の core call が先行 query の解放まで呼ばれないことと応答順を検査した。
+legacy の既存 Status observer は query の同時実行数計測から除外し、時刻や1秒未満の実行速度に依存しない。
+modern では先頭 tools/list の Status 自体を channel で止め、3要求すべての backend 呼び出しが最大1件で
+順番に成功することを検査した。待機中の取消も3版で core call・応答とも出ないことを確認した。
+深さ32での背圧と空き/終了による再開、queue→Active 引き渡し中の取消、initialize 取消除外、
+重複 ID、実 core Busy の tool error 保持も成功した。
+
+失敗は次の実 pipe 4件で、いずれも既知の restricted-token 環境の OS 5。
+
+- MCP `pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld`
+- MCP `pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked`
+- core `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`
+- core `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`
+
+stdio exe 結合検査は fixture pipe 作成で拒否され、adapter 起動まで到達しなかった。
+通常権限での新 adapter を使った結合検査は下記コマンドで確認する。
+skip/ignore、DACL 緩和、製品 core/launcher 起動、通常 APPDATA 使用、snapshot 更新、test-full、
+commit は行っていない。製品 core は今回変更しておらず `build-dev.ps1` は未実施。
+console adapter は build 済み。今回の full-trust 結果は未受領。
+
+### Round 5 の sandbox 外再検証コマンド (ClaudeCode 担当)
+
+```powershell
+Set-Location G:\home\mimageviewer-mcp
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_level/) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(=remote_ipc::pipe::tests::remote_pipe_dacl_has_one_current_user_ace)'
+```
+
+前者は IPC 6件 + MCP 36件、後者は core 19件を通常ユーザーの full-trust context で実行する。
+新 FIFO の回帰と、実 core handler を使う使い捨て fixture への stdio adapter 接続を含む。
