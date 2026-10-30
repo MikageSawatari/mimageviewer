@@ -2004,7 +2004,7 @@ mod tests {
                         .is_cancelled()
                 );
                 assert_eq!(held.borrow().selected, Some(0));
-                assert_eq!(held.borrow().scroll_offset_y, 0.0);
+                assert_eq!(held.borrow().grid_scroll.offset(), 0.0);
                 // Pointer cancellation is explicit even while the IME owns Escape.
                 h.get_by_label("\u{53d6}\u{6d88}").click();
                 h.run();

@@ -3452,6 +3452,7 @@ pub(crate) fn install_fs_navigator_input_tracking(ctx: &egui::Context) {
     if already_installed {
         return;
     }
+    crate::touch_correlation::install_main_grid_touch_transport_observer(ctx);
     ctx.on_begin_pass(
         "miv_fs_navigator_input_tracking",
         Arc::new(|ui| FsNavigatorFrameInput::record_current_pass(ui.ctx())),
@@ -25435,7 +25436,7 @@ impl App {
         self.begin_normal_book_reading();
         self.fullscreen_idx = Some(target_idx);
         self.move_grid_cursor(Some(target_idx), crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
         self.fs_vertical_scroll = 0.0;
         self.update_last_selected_image();
         self.record_book_resume(target_idx);
@@ -33867,6 +33868,10 @@ impl App {
                     crate::key_input::SyntheticNavigationKey::F12 => KeyName::F12,
                     #[cfg(any(test, feature = "test-script"))]
                     crate::key_input::SyntheticNavigationKey::G => KeyName::G,
+                    #[cfg(test)]
+                    crate::key_input::SyntheticNavigationKey::Tab => KeyName::Tab,
+                    #[cfg(test)]
+                    crate::key_input::SyntheticNavigationKey::Space => KeyName::Space,
                 };
                 crate::test_script::KeymapLevelObservation {
                     frame_nr: observation.frame_nr,
@@ -39486,7 +39491,7 @@ impl App {
                         tap_zones: touch_tap_zones,
                     },
                 },
-                self.frame_counter,
+                ctx.cumulative_frame_nr(),
                 false,
             );
             let _ =
@@ -39625,7 +39630,7 @@ impl App {
                             tap_zones: touch_tap_zones,
                         },
                     },
-                    self.frame_counter,
+                    ctx.cumulative_frame_nr(),
                     true,
                 );
                 let _ = self.fs_primary_suppression.apply(
@@ -39946,7 +39951,7 @@ impl App {
                             tap_zones: touch_tap_zones,
                         },
                     },
-                    self.frame_counter,
+                    ctx.cumulative_frame_nr(),
                     false,
                 );
                 let _ = self.fs_primary_suppression.apply(
@@ -40154,7 +40159,7 @@ impl App {
                     tap_zones: touch_tap_zones_enabled,
                 },
             },
-            self.frame_counter,
+            ctx.cumulative_frame_nr(),
             touch_input_enabled,
         );
         let touch_activity = touch_frame.has_touch_derived_pointer_activity();
@@ -41643,7 +41648,7 @@ impl App {
             return;
         }
         self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
         self.update_last_selected_image();
         if matches!(
             continuation,
@@ -42342,7 +42347,7 @@ impl App {
             }
         }
         self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
         self.slideshow_anchor_idx = None;
         // The accepted curl still owns presentation; arm the interval only after
         // its canonical flat is adopted, using the existing frame anchor owner.
@@ -97830,3 +97835,6 @@ mod music_overflow_tests {
 #[cfg(test)]
 #[path = "ui_fullscreen/manual_nav_wrap_tests.rs"]
 mod manual_nav_wrap_tests;
+
+#[cfg(all(test, windows))]
+mod conceal_preview_tests;

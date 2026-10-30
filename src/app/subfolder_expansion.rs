@@ -2441,32 +2441,34 @@ impl App {
         target: PathBuf,
         navigation: MainListNavigation,
     ) -> bool {
-        if !crate::folder_tree::path_eq(&target, &subfolder_expansion_synthetic_path())
-            || !self.main_list_navigation_is_current(&navigation)
-        {
+        if !crate::folder_tree::path_eq(&target, &subfolder_expansion_synthetic_path()) {
             return false;
         }
-        let state = self.folder_nav_subfolder_restore.as_ref();
-        let snapshot = state
-            .as_ref()
-            .and_then(|state| state.snapshot.clone())
-            .or_else(|| self.subfolder_expansion_snapshot.clone());
-        let root = state
-            .as_ref()
-            .and_then(|state| state.root.clone().or_else(|| state.saved_folder.clone()))
-            .or_else(|| {
-                self.subfolder_expansion_root
-                    .clone()
-                    .or_else(|| self.subfolder_expansion_saved_folder.clone())
+        let state = self
+            .folder_nav_subfolder_restore
+            .clone()
+            .unwrap_or_else(|| SubfolderExpansionRestoreState {
+                root: self.subfolder_expansion_root.clone(),
+                roots: self.subfolder_expansion_roots.clone(),
+                saved_folder: self.subfolder_expansion_saved_folder.clone(),
+                snapshot: self.subfolder_expansion_snapshot.clone(),
+                removed_paths: self.subfolder_expansion_removed_paths.clone(),
             });
-        let roots = state
-            .as_ref()
-            .map(|state| state.roots.clone())
-            .unwrap_or_else(|| self.subfolder_expansion_roots.clone());
-        let removed_paths = state
-            .map(|state| state.removed_paths.clone())
-            .unwrap_or_else(|| self.subfolder_expansion_removed_paths.clone());
-        if snapshot.is_none() && root.is_none() {
+        self.restore_subfolder_expansion_navigation_with_state(state, navigation)
+    }
+
+    /// Complete entrance state is an explicit native prepare argument, independent of the last
+    /// expansion's compatibility restore slot. The common navigation owns its adoption lifetime.
+    pub(crate) fn restore_subfolder_expansion_navigation_with_state(
+        &mut self,
+        state: SubfolderExpansionRestoreState,
+        navigation: MainListNavigation,
+    ) -> bool {
+        if !self.main_list_navigation_is_current(&navigation) {
+            return false;
+        }
+        let root = state.root.clone().or_else(|| state.saved_folder.clone());
+        if state.snapshot.is_none() && root.is_none() {
             return false;
         }
         self.retire_replaced_main_list_requests_with_startup_intent(
@@ -2480,16 +2482,16 @@ impl App {
         let owned = Some(SubfolderExpansionAdoption {
             purpose: SubfolderInstallPurpose::Return,
             navigation,
-            removed_paths,
+            removed_paths: state.removed_paths,
         });
-        if let Some(snapshot) = snapshot {
+        if let Some(snapshot) = state.snapshot {
             self.start_subfolder_expansion_prepare_owned(snapshot, false, None, owned);
             true
         } else if let Some(root) = root {
-            let roots = if roots.is_empty() {
+            let roots = if state.roots.is_empty() {
                 vec![root.clone()]
             } else {
-                roots
+                state.roots
             };
             self.start_subfolder_expansion_scan_roots_owned(root, roots, owned);
             true
@@ -2666,6 +2668,8 @@ impl App {
         purpose: SubfolderInstallPurpose,
     ) -> MainListHydration {
         self.capture_main_list_restore_cursor();
+        self.save_departing_session_grid_positions();
+        self.retire_rating_navigation_owner();
         let install_t0 = Instant::now();
         let perf_on = crate::perf::is_enabled();
         let seq = self.input_seq;
@@ -2801,11 +2805,12 @@ impl App {
                     .find(|&index| self.rating_path_key(index).as_deref() == Some(key))
             });
         if restored.is_some() {
-            self.scroll_offset_y = position.as_ref().unwrap().scroll_offset_y;
+            self.grid_scroll
+                .set_position(position.as_ref().unwrap().scroll_offset_y);
         }
         let selected = restored.or_else(|| self.visible_indices.first().copied());
         self.move_grid_cursor(selected, crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = selected.is_some();
+        self.grid_scroll.set_reveal_requested(selected.is_some());
         if perf_on {
             crate::perf::event(
                 "subfolder",

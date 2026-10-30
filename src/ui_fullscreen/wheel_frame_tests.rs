@@ -828,7 +828,7 @@ fn egui037_wheel_frame_recognized_live_return_keeps_original_page_and_return_own
             app.settings.auto_fullscreen_image_folders = false;
             app.fullscreen_idx = Some(1);
             app.selected = Some(1);
-            app.scroll_offset_y = 73.0;
+            app.grid_scroll.set_position(73.0);
             app.slideshow_playing = true;
             app.slideshow_anchor_idx = app.fullscreen_idx;
             app.slideshow_next_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
@@ -849,7 +849,7 @@ fn egui037_wheel_frame_recognized_live_return_keeps_original_page_and_return_own
                     grid: BookmarkViewReturnGridState {
                         row_keys: vec![(0, 1), (0, 2)],
                         selected_key: Some((0, 2)),
-                        opened_key: (0, 2),
+                        opened_key: Some((0, 2)),
                         scroll_offset_y: 73.0,
                     },
                 });
@@ -923,7 +923,7 @@ fn egui037_wheel_frame_recognized_live_return_keeps_original_page_and_return_own
                     assert_eq!(app.page_turn_destination(), destination);
                     assert_eq!(app.items_generation, items);
                     assert_eq!(app.selected, Some(1));
-                    assert_eq!(app.scroll_offset_y, 73.0);
+                    assert_eq!(app.grid_scroll.offset(), 73.0);
                     assert_eq!(app.bookmark_view_state, bookmark_owner);
                     assert_eq!(app.current_folder, folder_owner);
                     assert_eq!(app.last_reading_history_touch, history_before);

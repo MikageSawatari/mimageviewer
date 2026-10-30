@@ -951,7 +951,7 @@ fn book_resume_meter_is_hidden_on_synthetic_surfaces_and_virtual_container_grids
         TopLevelGridSurface::Search(TopLevelSearchView::Global),
         TopLevelGridSurface::Search(TopLevelSearchView::Favorite),
         TopLevelGridSurface::Search(TopLevelSearchView::Tag),
-        TopLevelGridSurface::ReadingHistory,
+        TopLevelGridSurface::ReadingHistory(crate::app::ReadingHistoryRootRestore::unavailable()),
         TopLevelGridSurface::Bookmarks,
         TopLevelGridSurface::DriveList,
         TopLevelGridSurface::Collection(CollectionGridIdentity {

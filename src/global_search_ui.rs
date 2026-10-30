@@ -2556,10 +2556,10 @@ impl App {
         // 復元できなかった (= 旧選択アイテムが消えた / 初回 install) ときは従来通り
         // 先頭にスクロール。
         if restored_selected.is_some() {
-            self.scroll_to_selected = true;
+            self.grid_scroll.set_reveal_requested(true);
         } else {
-            self.scroll_offset_y = 0.0;
-            self.scroll_to_selected = false;
+            self.grid_scroll.set_position(0.0);
+            self.grid_scroll.set_reveal_requested(false);
         }
         self.scroll_hint.store(0, Ordering::Relaxed);
         if let Some(keys) = detail_keys.as_ref() {
@@ -3093,7 +3093,7 @@ impl App {
         // early return する本関数の冒頭で 1 箇所だけ判定すれば足りる。
         if self.global_search.aggregate_auto
             && self.global_search.drill.is_none()
-            && (self.selected.is_some() || self.scroll_offset_y > 0.5)
+            && (self.selected.is_some() || self.grid_scroll.offset() > 0.5)
         {
             self.global_search.aggregate_auto = false;
         }
@@ -3749,7 +3749,7 @@ impl App {
                 .or_else(|| self.visible_indices.first().copied());
             if let Some(index) = index {
                 self.move_grid_cursor(Some(index), crate::app::GridCursorIntent::Automatic);
-                self.scroll_to_selected = true;
+                self.grid_scroll.set_reveal_requested(true);
             }
         }
     }
@@ -3902,6 +3902,16 @@ impl App {
         adoption: SearchViewAdoption,
         install: impl FnOnce(&mut Self),
     ) -> bool {
+        // Opening the search bar only prepares a request; its previous physical rows
+        // remain interactive. End their input lifetime only when search rows are adopted.
+        let first_search_rows = !self.items_are_global_search_view;
+        let session_before = self.grid_scroll.session();
+        let install = move |app: &mut Self| {
+            install(app);
+            if first_search_rows && app.grid_scroll.session() == session_before {
+                app.grid_scroll.renew_session();
+            }
+        };
         match adoption {
             SearchViewAdoption::Main {
                 navigation,
@@ -4051,7 +4061,7 @@ impl App {
                 .or_else(|| self.visible_indices.first().copied());
             if let Some(idx) = resolved {
                 self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-                self.scroll_to_selected = true;
+                self.grid_scroll.set_reveal_requested(true);
             }
         }
         self.update_global_search_address();
@@ -4246,7 +4256,7 @@ impl App {
                     crate::app::HistoryTrigger::UserChosen,
                 );
                 self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-                self.scroll_to_selected = true;
+                self.grid_scroll.set_reveal_requested(true);
                 self.update_last_selected_image();
                 return true;
             }
@@ -4818,7 +4828,7 @@ impl App {
         // 旧クエリ結果から作った items は直後の rebuild で全て無効化されるので、
         // selected / scroll もここで「ユーザー未操作」状態へ戻す。
         self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
-        self.scroll_offset_y = 0.0;
+        self.grid_scroll.set_position(0.0);
         // query == last_executed でも debounce → spawn を必ず再走させる。
         // そうしないと、Enter 2 連打で旧検索が cancel されたあと
         // poll_global_search_debounce が「クエリが変わっていない」と判定して
@@ -4837,6 +4847,45 @@ impl App {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn grid_scroll_session_search_renews_at_first_rows_and_drill_not_stream_reprojection() {
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("scroll-search");
+        std::fs::create_dir(&folder).unwrap();
+        let paths = [folder.join("first.png"), folder.join("second.png")];
+        for path in &paths {
+            image::RgbImage::new(2, 3).save(path).unwrap();
+        }
+        app.load_folder(folder.clone());
+        app.settle_open_path_classification_for_test();
+        app.finish_page_identity_preparation_for_test();
+        let physical = app.grid_scroll.session();
+        app.open_global_search();
+        assert_eq!(
+            app.grid_scroll.session(),
+            physical,
+            "a search request has not adopted rows"
+        );
+        let ctx = egui::Context::default();
+        g1_publish_search_hits(&mut app, &ctx, &paths);
+        let root = app.grid_scroll.session();
+        assert_ne!(root, physical);
+        app.request_search_view_build(None);
+        section1409_settle_metadata(&mut app, &ctx, |app| app.items.len() == 2);
+        assert_eq!(
+            app.grid_scroll.session(),
+            root,
+            "streaming/sort reprojects the same owner"
+        );
+        app.drill_into_container(folder, false);
+        section1409_settle_metadata(&mut app, &ctx, |app| app.items.len() == 2);
+        assert_ne!(
+            app.grid_scroll.session(),
+            root,
+            "root and child have distinct input lifetimes"
+        );
+    }
 
     fn section1409_metadata_stream(
         app: &mut App,

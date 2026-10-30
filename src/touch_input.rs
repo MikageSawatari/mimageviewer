@@ -277,6 +277,12 @@ impl TouchRecognizer {
         self.contacts.len()
     }
 
+    /// Scope adapters must reject a previous session's tail before Cancel,
+    /// whose recognizer-level meaning is to terminate the entire gesture.
+    pub(crate) fn has_contact(&self, id: u64) -> bool {
+        self.contacts.iter().any(|contact| contact.id == id)
+    }
+
     /// Whether the correlated synthetic primary click must be suppressed for
     /// the current (or just-completed) touch stream.
     pub(crate) fn should_suppress_primary(&self) -> bool {

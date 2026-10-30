@@ -467,7 +467,8 @@ impl App {
         let restore_reading_history = self
             .reading_history_return_from
             .as_ref()
-            .is_some_and(|from| crate::folder_tree::path_eq(from, &src));
+            .filter(|from| crate::folder_tree::path_eq(&from.container, &src))
+            .cloned();
         let restore_bookmark_view = self
             .bookmark_view_state
             .as_ref()
@@ -512,8 +513,8 @@ impl App {
             self.remember_recent_folder(&src);
         }
         self.update_active_quick_folder_target(&src);
-        if restore_reading_history {
-            self.reading_history_return_from = Some(src.clone());
+        if let Some(return_to) = restore_reading_history {
+            self.reading_history_return_from = Some(return_to);
         }
         if let Some(state) = restore_bookmark_view {
             self.bookmark_view_state = Some(state);
@@ -578,8 +579,8 @@ impl App {
             self.remember_recent_folder(&source);
         }
         self.update_active_quick_folder_target(&source);
-        if commit.restore_reading_history {
-            self.reading_history_return_from = Some(source.clone());
+        if let Some(return_to) = commit.restore_reading_history {
+            self.reading_history_return_from = Some(return_to);
         }
         if let Some(state) = commit.restore_bookmark_view {
             self.bookmark_view_state = Some(state);
@@ -1209,8 +1210,10 @@ impl App {
                 // load_folder(cache_zip) で閲覧履歴の戻り先予約が落ちるので、元アーカイブと
                 // 一致していたかを退避し、override 復元と同じく後で書き戻す。
                 let restore_reading_history = match (&src, &self.reading_history_return_from) {
-                    (Some(s), Some(from)) => crate::folder_tree::path_eq(from, s),
-                    _ => false,
+                    (Some(s), Some(from)) if crate::folder_tree::path_eq(&from.container, s) => {
+                        Some(from.clone())
+                    }
+                    _ => None,
                 };
                 let restore_bookmark_view = src.as_ref().and_then(|source| {
                     self.bookmark_view_state
@@ -1389,8 +1392,8 @@ impl App {
                         self.remember_recent_folder(&src);
                     }
                     self.update_active_quick_folder_target(&src);
-                    if restore_reading_history {
-                        self.reading_history_return_from = Some(src.clone());
+                    if let Some(return_to) = restore_reading_history {
+                        self.reading_history_return_from = Some(return_to);
                     }
                     if let Some(state) = restore_bookmark_view {
                         self.bookmark_view_state = Some(state);

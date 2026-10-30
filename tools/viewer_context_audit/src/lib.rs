@@ -221,6 +221,7 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
 const PUBLIC_API_ALLOWLIST: &[&str] = &[
     // 1.340 R5: immutable overview metadata/cursor projection only; no mount or mutation.
     // Accepted owner-scoped design and independent non-PDF implementation review (2026-10-12).
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn grid_scroll (self) -> & 'a super :: GridScrollState",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn page_overview_view (self ,) -> Option < crate :: page_overview :: PageOverviewView >",
     // egui 0.37 stage 1b (9481bc344): state-only mounts use the existing table,
     // restore the original owner even on unwind, and leave publication in the UI
@@ -370,6 +371,7 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_final_cover_spread_display_in_parked_contexts (& mut self)",
     "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_singleton_spread_placement_in_parked_contexts (& mut self , first_changed : bool , last_changed : bool ,)",
     "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_page_alone_in_parked_contexts (& mut self , after_cover_changed : bool , last_changed : bool ,)",
+    "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_auto_view_trim_display_in_parked_contexts (& mut self)",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn with_viewer_context_ref < R > (& self , id : ViewerContextId , f : impl FnOnce (ContextRef < '_ >) -> R ,) -> Option < R >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn bind_window (& mut self , id : ViewerContextId , window_id : u64 ,) -> Result < () , BindError >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn unbind_window (& mut self , window_id : u64) -> Option < ViewerContextId >",

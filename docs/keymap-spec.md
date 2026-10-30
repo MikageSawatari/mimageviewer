@@ -659,6 +659,12 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 
 ## グリッドビュー (フルスクリーン外) 共通
 
+「親フォルダへ」(`GridParentFolder`) はキー、親ボタン、マウスボタン、リング/ジェスチャ、Padで
+同じ一覧ownerの規則を使う。閲覧履歴の一覧では開く前の場所へ戻り、入口なしはドライブ一覧へ戻る。
+本から閲覧履歴へ戻る操作と一覧から入口へ戻る操作は別で、ZIP内部は1階層ずつ戻る。
+タグの結果rootでは全入力とも停止し、開いた子からはタグ検索内の帰路を戻る。
+通常の履歴←/→ (`GridHistoryBack/Forward`) は別操作として1件移動を維持する。
+
 Everything ファイル名検索は `GlobalEverythingSearch` / `Grid` / `Press`、既定
 `Ctrl+R`。名前の Global は検索範囲を表し、fullscreen の Global scope へは登録しない。
 main の一覧からだけ開き、text focus / IME（focus recovery を含む）/ modal / Remote lock
@@ -1002,8 +1008,10 @@ U / N / T、<kbd>Ctrl</kbd>+数字、<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+数字、
 
 結果プレビューは `ErasePreviewHold`（Erase / KeyHold、既定 Tab）と目のボタンを OR で合成し、
 既存の false → true 遷移で保存なし補完を 1 回だけ投入する。両方押しても再投入せず、両方離すと終了する。
-キーの保持判定はパネル描画の外、キャンバスのドラッグ解放処理より前に行い、
-`focused_key_state_permit` / keymap の TextEdit・IME・modal・非アクティブ窓の入力所有に従う。
+キーの保持判定はパネル描画の外、キャンバスのドラッグ解放処理より前に行う。
+多角形確定・取消・ツール切替が描画状態を消す前にも、共通 helper で拒否だけを先に確定する。
+通常の保持開始はキャンバス側に残し、同時押下の描画を優先する。
+入力の受付は `focused_key_state_permit` / keymap の TextEdit・IME・modal・非アクティブ窓の入力所有に従う。
 legacy keymap helper は Modal を呼出元で止める契約なので、このキャンバス側のキー受付も
 cached `KeyboardOwner::Modal` では保持・解放を観測しない。
 筆・囲み・多角形・線・図形作成・ハンドル編集の進行中に押したキーは保持受付を拒否し、
@@ -1013,7 +1021,8 @@ permit のあるフレームで割当キー自体の解放を確認してから�
 プレビュー中に押し始めた左ボタンでは、プレビューを解除しても描画を始めず、一度離して押し直す。
 保持受付は Released / Held / BlockedUntilRelease の一つの状態とし、入場・退出で初期化する。
 設計の簡素化: キーとボタンに別々の補完要求や worker を設けず、既存のプレビュー遷移を共用する。
-目のボタンの hover、`?` ヘルプ、操作カスタマイズは実割り当てを表示する。隠蔽加工には追加しない。
+目のボタンの hover、`?` ヘルプ、操作カスタマイズは実割り当てを表示する。
+保持受付・目のボタンとの合成・キャンバス入力の抑止は隠蔽加工と `edit_preview` helper を共用する。
 
 | 入力 | 動作 |
 |---|---|
@@ -1022,7 +1031,7 @@ permit のあるフレームで割当キー自体の解放を確認してから�
 | <kbd>S</kbd> / <kbd>B</kbd> / <kbd>K</kbd> / <kbd>L</kbd> / <kbd>P</kbd> / <kbd>I</kbd> / <kbd>V</kbd> / <kbd>H</kbd> / <kbd>R</kbd> / <kbd>O</kbd> | 選択 / 筆 / バケツ / 囲み / 多角形 / 直線 / 縦線 / 横線 / 矩形 / 楕円ツール |
 | <kbd>D</kbd> / <kbd>F</kbd> | 描画 / 消去モード切替 |
 | <kbd>Space</kbd>+左ドラッグ | 一時パン |
-| <kbd>Tab</kbd>（押している間） | 消しゴム適用後の結果プレビュー（モザイクは除外）。Action: `ErasePreviewHold`。操作カスタマイズで変更・解除できる。描画ドラッグ中の押下は無効なので、終了後に押し直す |
+| <kbd>Tab</kbd>（押している間） | 消しゴム適用後の結果プレビュー。Action: `ErasePreviewHold`。操作カスタマイズで変更・解除できる。描画ドラッグ中の押下は無効なので、終了後に押し直す |
 | <kbd>Ctrl</kbd>+マウスホイール | ズーム。ツールパネル上でも同じ |
 | マウスホイール | 画像上ではズーム。ツールパネル上ではパネルスクロール |
 | 矢印 / <kbd>Ctrl</kbd>+矢印 | マスクまたは選択オブジェクトを 1px / 10px 移動 |
@@ -1036,10 +1045,28 @@ permit のあるフレームで割当キー自体の解放を確認してから�
 
 ## 隠蔽加工モード
 
+`ConcealPreviewHold`（Conceal / KeyHold、既定 Tab、変更・解除可）と目のボタンで結果をプレビューする。
+消しゴムと同じ共通 helper を使い、描画中の押下を実際に離すまで拒否し、同時押下は描画を優先する。
+プレビュー中の描画・選択・図形操作を止め、その間に押した左ボタンは離すまで描画へ渡さない。
+Space パン／Ctrl+Space ズーム、TextEdit・IME・modal・非アクティブ窓の入力所有も消しゴムと同じ。
+キー受付は所有 viewport のキャンバス解放処理より前、合成はパネルで行う。
+キーによる描画終端・ツール切替の前には、消しゴムと同じく描画中の拒否だけを先に確定する。
+`sync_conceal_preview_before_pipeline` は受付済みの保持と既存の目ボタン判定を合成してから
+画像 pipeline へ渡す（消しゴム同様、canvas／panel で更新したキー状態は次の pipeline 解決で使う）。
+隠蔽の描画・選択・ハンドル操作がポインタを所有している間は、目の矩形を通過しても
+先読みを開始しない。既存の操作状態で判定し、多角形の次の点を待つ状態は含めない。
+キーとパネルのツール切替は共通処理で旧ツールの途中状態を終える。退出・ページ切替と同じく、
+描画済みの筆跡・図形の変形は残し、未確定の線・図形・投げ縄・多角形は破棄する。
+ROOT のキー所有を子 viewport に流用せず、viewport 配送は変更しない。
+切替ではマスク・設定・世代・cache を失効させず、既存の合成済み結果を再利用する。
+設計の簡素化: 専用の処理要求や worker は追加せず、既存の目ボタンと表示経路を共用する。
+
+
 | 入力 | 動作 |
 |---|---|
 | <kbd>?</kbd> (既定) | 隠蔽加工モードで使えるショートカット一覧を表示する。Action: `HelpShowContextShortcuts`。keymap 化済み操作は現在読み込まれている割り当て済みのものを表示し、固定扱いの操作は別枠で表示する |
 | <kbd>Ctrl</kbd>+<kbd>M</kbd> | 隠蔽加工モード終了 |
+| <kbd>Tab</kbd>（押している間） | 隠蔽加工後の結果プレビュー。Action: `ConcealPreviewHold`。操作カスタマイズで変更・解除できる。描画ドラッグ中は受け付けず、終了後に押し直す |
 | <kbd>Esc</kbd> | 選択中オブジェクトがあるときは選択解除、なければ隠蔽加工モード終了 |
 | <kbd>T</kbd> | 隠蔽タイプを順に切替 |
 | <kbd>G</kbd> | ピクセルグリッド表示 ON/OFF (ユーザーズームが等倍より拡大中、かつ高倍率時のみ画像ピクセル境界を表示) |
@@ -1232,6 +1259,10 @@ snapshot 中のキー操作は以下のように再定義される:
 | <kbd>Backspace</kbd> / <kbd>Alt</kbd>+<kbd>↑</kbd> / <kbd>Alt</kbd>+<kbd>←</kbd>/<kbd>→</kbd> / フォルダツリー / お気に入りクリック / フォルダパス入力 | 無効、toast「スナップショット中は他のフォルダに移動できません」 |
 | <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd> / <kbd>Ctrl</kbd>+<kbd>T</kbd> | snapshot 自動解除 + 検索 mode 起動 (= scope mutual exclusion) |
 | `[★固定]` ボタン再クリック | snapshot 解除 (= 元のフォルダ表示に戻る) |
+
+§1.473の例外：固定中にファイルメニューから開いた閲覧履歴rootでは、BS/Alt+↑およびマウス・リングの
+親操作が固定を終了し、入口payloadのcanonical originへ戻す。親ボタンは固定中disabledの既存制約を維持する。
+同pathでも固定一覧と新しい閲覧履歴visitを区別する。固定一覧の完全な再採用は§1.486の別課題とする。
 
 snapshot 末尾到達時は `FsBoundaryHint::NoImageFolder` で boundary hint を表示。
 

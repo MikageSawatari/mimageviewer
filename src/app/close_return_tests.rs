@@ -43,14 +43,14 @@ fn main_bookmarks(env: &mut AppTestEnvForTest, target: BookmarkViewReturnTarget)
     env.items_are_bookmark_view = true;
     env.current_folder = Some(bookmark_view_synthetic_path());
     env.selected = Some(1);
-    env.scroll_offset_y = 240.0;
+    env.grid_scroll.set_position(240.0);
     env.bookmark_open_request_seq = 41;
     env.bookmark_view_state = Some(BookmarkViewState::Opening {
         target,
         grid: BookmarkViewReturnGridState {
             row_keys: (1..=30).map(|id| (0, id)).collect(),
             selected_key: Some((0, 2)),
-            opened_key: (0, 2),
+            opened_key: Some((0, 2)),
             scroll_offset_y: 240.0,
         },
     });
@@ -370,7 +370,7 @@ fn close_return_main_selection_scroll_and_same_list_refresh_survive_until_consum
     let mut backend = eframe::HeadlessEpiIntegration::new(ctx);
     close_logic(&mut backend, &mut env, viewport);
     env.selected = Some(9);
-    env.scroll_offset_y = 420.0;
+    env.grid_scroll.set_position(420.0);
     // Selection, scroll, and a read-model row replacement are not navigation admission.
     let read_model_tx = ready_read_model(&mut env);
     let ctx = backend.context().clone();
@@ -378,7 +378,7 @@ fn close_return_main_selection_scroll_and_same_list_refresh_survive_until_consum
         .drop_without_applying_deltas();
     assert!(read_model_tx.send(Err("duplicate".into())).is_err());
     assert_eq!(env.selected, Some(9));
-    assert_eq!(env.scroll_offset_y, 420.0);
+    assert_eq!(env.grid_scroll.offset(), 420.0);
     assert!(matches!(
         env.pending_return_to_parent,
         FullscreenCloseContinuation::Terminal(_)
@@ -389,7 +389,7 @@ fn close_return_main_selection_scroll_and_same_list_refresh_survive_until_consum
     };
     assert_eq!(grid.selected_key, Some((0, 10)));
     assert_eq!(grid.scroll_offset_y, 420.0);
-    assert_eq!(grid.opened_key, (0, 2));
+    assert_eq!(grid.opened_key, Some((0, 2)));
     let grid = grid.clone();
     let keys: Vec<_> = env
         .bookmark_browser_rows
@@ -398,7 +398,7 @@ fn close_return_main_selection_scroll_and_same_list_refresh_survive_until_consum
         .collect();
     env.restore_bookmark_view_grid(grid, &keys);
     assert_eq!(env.selected, Some(9));
-    assert_eq!(env.scroll_offset_y, 420.0);
+    assert_eq!(env.grid_scroll.offset(), 420.0);
     assert!(env.take_pending_return_to_parent_nav().is_none());
 }
 
@@ -424,7 +424,7 @@ fn close_return_changed_bookmark_poll_preserves_live_main_position_before_consum
             let mut backend = eframe::HeadlessEpiIntegration::new(ctx.clone());
             close_logic(&mut backend, &mut env, viewport);
             env.selected = Some(9);
-            env.scroll_offset_y = 420.0;
+            env.grid_scroll.set_position(420.0);
             let selected_key = env.bookmark_browser_rows[9].stable_key();
             let mut rows = env.bookmark_browser_rows.clone();
             match change {
@@ -457,10 +457,11 @@ fn close_return_changed_bookmark_poll_preserves_live_main_position_before_consum
                 Some(selected_key)
             );
             assert_eq!(
-                env.scroll_offset_y, 420.0,
+                env.grid_scroll.offset(),
+                420.0,
                 "{book}/{change}: live grid before consumer"
             );
-            assert!(!env.scroll_to_selected);
+            assert!(!env.grid_scroll.reveal_requested());
             assert!(matches!(
                 env.pending_return_to_parent,
                 FullscreenCloseContinuation::Terminal(_)
@@ -473,7 +474,7 @@ fn close_return_changed_bookmark_poll_preserves_live_main_position_before_consum
             };
             assert_eq!(grid.selected_key, Some(selected_key));
             assert_eq!(grid.scroll_offset_y, 420.0);
-            assert_eq!(grid.opened_key, (0, 2));
+            assert_eq!(grid.opened_key, Some((0, 2)));
             assert_eq!(
                 grid.row_keys,
                 env.bookmark_browser_rows
@@ -485,7 +486,7 @@ fn close_return_changed_bookmark_poll_preserves_live_main_position_before_consum
             // The install starts the ordinary asynchronous page-index hydration.
             // Complete that owner before admitting another read-model result.
             env.finish_page_identity_preparation_for_test();
-            assert_eq!(env.scroll_offset_y, 420.0);
+            assert_eq!(env.grid_scroll.offset(), 420.0);
             assert_eq!(
                 env.selected
                     .map(|idx| env.bookmark_browser_rows[idx].stable_key()),
@@ -514,10 +515,11 @@ fn close_return_changed_bookmark_poll_preserves_live_main_position_before_consum
                 Some(selected_key)
             );
             assert_eq!(
-                env.scroll_offset_y, 420.0,
+                env.grid_scroll.offset(),
+                420.0,
                 "{book}/{change}: restored adopted grid"
             );
-            assert!(!env.scroll_to_selected);
+            assert!(!env.grid_scroll.reveal_requested());
             assert!(!env.pending_return_to_parent.is_pending());
             assert!(env.take_pending_return_to_parent_nav().is_none());
         }
@@ -534,7 +536,7 @@ fn close_return_empty_bookmark_poll_adopts_empty_live_grid() {
     let viewport = register(&mut env, &ctx, 94_006);
     let mut backend = eframe::HeadlessEpiIntegration::new(ctx.clone());
     close_logic(&mut backend, &mut env, viewport);
-    env.scroll_offset_y = 420.0;
+    env.grid_scroll.set_position(420.0);
     let generation = env.items_generation;
     let tx = ready_read_model_with_rows(&mut env, vec![]);
     ctx.run_ui(Default::default(), |ui| env.poll_bookmark_browser(ui.ctx()))
@@ -544,7 +546,7 @@ fn close_return_empty_bookmark_poll_adopts_empty_live_grid() {
     assert!(env.bookmark_browser_rows.is_empty());
     assert!(env.items.is_empty());
     assert_eq!(env.selected, None);
-    assert_eq!(env.scroll_offset_y, 420.0);
+    assert_eq!(env.grid_scroll.offset(), 420.0);
     assert!(env.take_pending_return_to_parent_nav().is_none());
     let Some(BookmarkViewState::Restoring { grid }) = env.bookmark_view_state.as_ref() else {
         panic!("the return consumer must adopt the live empty grid");
@@ -554,7 +556,7 @@ fn close_return_empty_bookmark_poll_adopts_empty_live_grid() {
         "deleted rows cannot return as saved keys"
     );
     assert_eq!(grid.selected_key, None);
-    assert_eq!(grid.opened_key, (0, 2));
+    assert_eq!(grid.opened_key, Some((0, 2)));
     assert_eq!(grid.scroll_offset_y, 420.0);
     env.finish_page_identity_preparation_for_test();
 
@@ -567,7 +569,7 @@ fn close_return_empty_bookmark_poll_adopts_empty_live_grid() {
     assert!(env.bookmark_browser_rows.is_empty());
     assert!(env.items.is_empty());
     assert_eq!(env.selected, None);
-    assert_eq!(env.scroll_offset_y, 420.0);
+    assert_eq!(env.grid_scroll.offset(), 420.0);
     assert!(!env.pending_return_to_parent.is_pending());
 }
 
@@ -583,7 +585,7 @@ fn close_return_bookmark_delete_receipt_preserves_live_main_position_before_cons
     let mut backend = eframe::HeadlessEpiIntegration::new(ctx.clone());
     close_logic(&mut backend, &mut env, viewport);
     env.selected = Some(9);
-    env.scroll_offset_y = 420.0;
+    env.grid_scroll.set_position(420.0);
     let selected_key = env.bookmark_browser_rows[9].stable_key();
     let (tx, rx) = mpsc::channel();
     tx.send(Ok(())).unwrap();
@@ -598,8 +600,8 @@ fn close_return_bookmark_delete_receipt_preserves_live_main_position_before_cons
     assert_eq!(env.bookmark_browser_rows.len(), 29);
     assert_eq!(env.selected, Some(8));
     assert_eq!(env.bookmark_browser_rows[8].stable_key(), selected_key);
-    assert_eq!(env.scroll_offset_y, 420.0);
-    assert!(!env.scroll_to_selected);
+    assert_eq!(env.grid_scroll.offset(), 420.0);
+    assert!(!env.grid_scroll.reveal_requested());
     assert!(env.take_pending_return_to_parent_nav().is_none());
     let Some(BookmarkViewState::Restoring { grid }) = &env.bookmark_view_state else {
         panic!("bookmark return must own the updated live grid");
@@ -788,7 +790,7 @@ fn close_return_standalone_bookmark_navigation_survives_viewer_teardown() {
         grid: BookmarkViewReturnGridState {
             row_keys: vec![(1, 4)],
             selected_key: Some((1, 4)),
-            opened_key: (1, 4),
+            opened_key: Some((1, 4)),
             scroll_offset_y: 123.0,
         },
     });
@@ -813,7 +815,7 @@ fn close_return_standalone_bookmark_navigation_survives_viewer_teardown() {
     let Some(BookmarkViewState::Opening { grid, .. }) = env.bookmark_view_state.as_ref() else {
         panic!("the existing Bookmarks dispatcher receives the retained grid");
     };
-    assert_eq!(grid.opened_key, (1, 4));
+    assert_eq!(grid.opened_key, Some((1, 4)));
     assert_eq!(grid.scroll_offset_y, 123.0);
     assert!(env.take_pending_return_to_parent_nav().is_none());
 }
@@ -917,7 +919,7 @@ fn close_return_native_hard_close_flag_reaches_production_poll_before_teardown()
     .unwrap();
     let generation = env.items_generation;
     let selected = env.selected;
-    let scroll = env.scroll_offset_y;
+    let scroll = env.grid_scroll.offset();
     // No synthetic Close event/helper: poll_video sees the real existing native closed flag.
     env.with_viewer_context(owner, |viewer| viewer.poll_video(&ctx))
         .unwrap();
@@ -927,7 +929,7 @@ fn close_return_native_hard_close_flag_reaches_production_poll_before_teardown()
     ));
     assert_eq!(env.items_generation, generation);
     assert_eq!(env.selected, selected);
-    assert_eq!(env.scroll_offset_y, scroll);
+    assert_eq!(env.grid_scroll.offset(), scroll);
     assert!(env.bookmark_browser_pending.is_none());
     assert!(env.take_pending_return_to_parent_nav().is_none());
     assert!(matches!(
