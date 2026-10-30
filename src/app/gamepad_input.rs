@@ -681,7 +681,7 @@ mod overview_viewer_chrome_tests {
                         }
                         let output = frame(app, ctx, vec![egui::Event::PointerMoved(end)]);
                         let label = if cancels {
-                            "本のページ一覧"
+                            "ページ一覧の表示切替"
                         } else {
                             "無効: スライドショー"
                         };
@@ -885,7 +885,11 @@ mod overview_viewer_chrome_tests {
         for mode in [Mode::Fullscreen, Mode::MainWindow, Mode::Detached] {
             for (action, label, cancels) in [
                 (RingActionId::ImageSlideshow, "無効: スライドショー", false),
-                (RingActionId::ImagePageOverview, "本のページ一覧", true),
+                (
+                    RingActionId::ImagePageOverview,
+                    "ページ一覧の表示切替",
+                    true,
+                ),
             ] {
                 fixture(mode, |app, ctx| {
                     app.settings.gamepad_enabled = true;

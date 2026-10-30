@@ -45,7 +45,7 @@ fn overview_guide_snapshot_gamepad_ring_dark() {
     .map(|action| overview_label(&action));
 
     assert_eq!(labels[0], "無効: スライドショー");
-    assert_eq!(labels[1], "本のページ一覧");
+    assert_eq!(labels[1], "ページ一覧の表示切替");
     snapshot_guide("page_overview_gamepad_ring_dark", move |ui| {
         let full_rect = ui.max_rect();
         draw_ring_guide_donut(
