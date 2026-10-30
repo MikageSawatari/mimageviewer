@@ -189,6 +189,9 @@ impl Publication {
             run_elapsed_ms: self.elapsed_ms(),
         }
     }
+    pub(super) fn origin(&self) -> Instant {
+        self.origin
+    }
     pub(super) fn elapsed_ms(&self) -> u64 {
         self.origin
             .elapsed()
@@ -275,6 +278,17 @@ impl CheckpointPublisher {
     }
     pub fn publish_display(&self, value: DisplaySnapshot) {
         self.publish(|mailbox, stamp| mailbox.display = Some(Observed { stamp, value }));
+        // Existing normal root maintenance/event path, never the callback.
+        if self.0.state.load(Ordering::Acquire) == RUNNING && self.0.device_loss.pending() {
+            self.0.wake();
+        }
+    }
+    pub(crate) fn register_device_loss_source(
+        &self,
+    ) -> Option<Arc<super::device_loss::DeviceLossLatch>> {
+        (self.0.state.load(Ordering::Acquire) == RUNNING)
+            .then(|| self.0.device_loss.register())
+            .flatten()
     }
     /// The sole startup UI initializer installs an existing adapter/device
     /// owner once. The writer never initializes this cell or waits on it.

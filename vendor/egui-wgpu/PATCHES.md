@@ -191,3 +191,14 @@ GPU名/backendとSurfaceCapabilitiesの失敗を既存run_native終了通知・�
 runtimeのconfigure/resize入口はvoidのまま。失敗したsurface/depth/MSAAの除去・続行helperと回帰は撤去した。
 GPU不要のNone注入で初回rootのErrとGPU名/段階、child/再設置rootのpanic、Someの保持を検査する。
 起動後の資源寿命・既定uncaptured-error handlerは変更しない。
+
+## §1.482 段C: device生成直後の診断observer（2026-10-31）
+
+`WgpuConfiguration::on_device_created`は既定`None`の任意callbackで、Cloneは同じArcを共有し、Debugはcallbackを評価しない。
+`RenderState::create`のNew/Existing合流後、surface capabilities照会・renderer allocationより前に、選択済みdeviceを一度渡す。
+adapter候補の順序・request失敗/fallback・surface再生成・資源配送は変更しない。
+coreだけがここでtypedなfatal error handlerとdeviceごとのdevice-lost atomic latchを接続し、
+既定のfatal契約と元エラー本文を保持する。vendor側は分類・保存・回復処理を持たない。
+headlessの任意設定/Clone/Debugと呼出し順序の2回帰を追加した。
+`cargo test --locked --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib device_creation_observer`は2成功。
+実device障害の検証やvendor全件gateを済ませた意味ではない。

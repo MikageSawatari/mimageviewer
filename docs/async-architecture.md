@@ -1,8 +1,10 @@
 # 非同期・並列アーキテクチャ
 
-## 前回終了の単一 writer（§1.482 段A）
+## 前回終了の単一 writer（§1.482 段A〜C）
 
-`previous_run_diagnostics::GuiRunDiagnostics` は first admission 後に専用 worker を開始し、前回資料を読む→今回 Running を保存→main の終端を保存、の順序を所有する。通常時は park し、周期起床はない。UI/App Drop では clean にせず、main 最終境界で共通2秒deadlineの残りだけを使う。結果と通知本文を返した `finish_run_native` の後、main が共通ログ・診断終端の保存を済ませてから native MessageBox を出す。初期化中の終了要求も同じ writer が直列化し、無期限 join/再試行/AI 完了待ちは追加しない。診断 lease の保有中は別 writer が資料を上書きしない。詳細は [確定設計](ai-crash-655-investigation.md#確定設計-2026-10-30)。
+`previous_run_diagnostics::GuiRunDiagnostics` は first admission 後に専用 worker を開始し、前回資料を読む→今回 Running を保存→main の終端を保存、の順序を所有する。AI等の実活動中だけ約1秒を目標にcheckpointを保存し、idleは周期起床なしでparkする。UI/App Drop では clean にせず、main 最終境界で共通2秒deadlineの残りだけを使う。結果と通知本文を返した `finish_run_native` の後、main が共通ログ・診断終端の保存を済ませてから native MessageBox を出す。初期化中の終了要求も同じ writer が直列化し、無期限 join/再試行/AI 完了待ちは追加しない。診断 lease の保有中は別 writer が資料を上書きしない。詳細は [確定設計](ai-crash-655-investigation.md#確定設計-2026-10-30)。
+
+段Cでは、このworkerが前回identityに相関するnative例外をrotationより先に確保し、今回のpanic/native sinkを事前openする。panic hookの前段は固定buffer・単発raw書込み・再入skip・上限付きの別sinkで固定分類だけを残す。既存詳細ログには元本文を保持する。root device生成直後のcallbackは、そのdevice専用の理由atomicへ最初の異常をCASするだけであり、I/O・clock・wake・lock・wgpu再入を行わない。workerが活動中の採取時、既存root maintenanceからの起床時、終端時にlatchを読み、worker観測時刻を付けて別の上限付きファイルへ一度だけ保存する。即死して読む前なら記録できず、常駐監視や回復処理は追加しない。first-chance/捕捉panicも観測されるため、clean記録を覆したり終了原因と断定したりしない。
 
 ## 本の列生成の共通境界（§1.242 G1）
 

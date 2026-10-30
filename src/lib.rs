@@ -28,6 +28,7 @@ mod egui037_stage4_gpu_tests;
 mod egui_output;
 mod gpu_startup_diagnostics;
 mod previous_run_diagnostics;
+mod render_failure_diagnostics;
 mod run_native_failure;
 mod ui_previous_run_notice;
 pub use run_native_failure::PreparedRunExit;
@@ -601,7 +602,16 @@ fn install_panic_log_hook() {
     // data_dir 初期化直後から panic.log に残す。ネイティブ DLL / driver の
     // access violation は Rust panic ではないので、この hook では捕捉できない。
     std::panic::set_hook(Box::new(|info| {
-        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+        previous_run_diagnostics::fatal::record_panic(render_failure_diagnostics::classify_panic(
+            info.payload(),
+        ));
+        let payload = if let Some(render_panic) =
+            info.payload()
+                .downcast_ref::<render_failure_diagnostics::RenderPanic>()
+        {
+            // Keep the default wgpu handler's detailed text, after the small record.
+            format!("wgpu error: {}\n", render_panic.error)
+        } else if let Some(s) = info.payload().downcast_ref::<&str>() {
             (*s).to_string()
         } else if let Some(s) = info.payload().downcast_ref::<String>() {
             s.clone()
@@ -1376,7 +1386,10 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
     install_panic_log_hook();
     install_texture_delta_ledger();
     #[cfg(windows)]
-    let native_exception_log_result = native_exception_log::install();
+    if session.diagnostics.publisher().is_none() {
+        // Admitted GUI runs install only after their worker reads previous evidence.
+        native_exception_log::install_background();
+    }
 
     // 通常ログ (mimageviewer.log) は常時記録する。logger 側が 16MiB で
     // ローテーション (現行 + .bak の 2 世代) し、起動時に前回分を .prev へ
@@ -1385,8 +1398,6 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
     // 前に有効化していないと痕跡が残らない」問題があったため常時 ON に変更。
     // `--log` 引数は後方互換のため受け付けるが現在は no-op。
     startup_operation(miv_startup::Stage::Logger, "Logger", || logger::init());
-    #[cfg(windows)]
-    native_exception_log::report_install_result(native_exception_log_result);
 
     #[cfg(all(windows, not(feature = "portable")))]
     {
@@ -1645,6 +1656,10 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
     // Finite root API selection completes before AppCreator runs.
     // Native video and its separate DX12 HUD remain independent.
     let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
+    let diagnostic_publisher = session.diagnostics.publisher();
+    wgpu_options.on_device_created = Some(Arc::new(move |device| {
+        render_failure_diagnostics::install_root_device(device, diagnostic_publisher.as_ref());
+    }));
     configure_wgpu_presentation(&mut wgpu_options);
     wgpu_options.startup_diagnostics = Some(Arc::new(|event| {
         gpu_startup_diagnostics::observe(&event);

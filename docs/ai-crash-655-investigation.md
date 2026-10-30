@@ -1,6 +1,6 @@
 # 5ch >>655 AI 処理中の連続ページ送り調査
 
-調査日: 2026-10-29。製品コードの修正・製品 exe の起動・デスクトップ操作・コミットは行っていない。
+調査日: 2026-10-29。当初調査では製品コードの修正・製品 exe の起動・デスクトップ操作・コミットは行っていない。後続の段階実装・検証は末尾の記録を参照。
 この文書は調査記録であり、原因が確認される前の候補を製品の確定不具合として扱わない。
 
 **結果: 公開版 v4.9.0 と依存更新後の HEAD の各10試行、計20試行で終了症状は未再現。**
@@ -470,7 +470,7 @@ checkpoint は通常2～4 KiBを目標、schema 全体16 KiBを上限とする�
 
 #### panic と描画エラー
 
-panic hook の最初で、借用した `&str` / `String::as_str()` を既知の固定分類へ変換して、小さな別 panic sink に直接記録する。既存 hook の payload 複製、location 整形、backtrace 構築、panic.log append、一般 logger より**前**に行う。新しい分類・書込みで任意の `Display` / `Debug` を呼ばない。長い payload は走査量にも上限を設け、未分類は「Rust panic（詳細は分類できませんでした）」だけとする。生 payload・source path は新しい小資料に残さない。
+panic hook の最初で、借用した payload を既知の固定分類へ変換して、小さな別 panic sink に直接記録する。段Cの実装では描画境界で元のtyped errorを保持したpayloadを渡し、hookはそのvariantだけをdowncastして判定する。`&str` / `String` を含むその他のpayloadは走査せず「Rust panic（詳細は分類できませんでした）」とする。既存 hook の payload 複製、location 整形、backtrace 構築、panic.log append、一般 logger より**前**に行う。新しい分類・書込みで任意の `Display` / `Debug` を呼ばず、生 payload・source path は新しい小資料に残さない。
 
 安全契約は **通常 worker で事前 open、固定 buffer、再入/競合時 skip、件数上限（例16件/run）、1件につき単発 WriteFile、一般 logger/flush/再試行なし**。run identity は初期化済み不変値だけを使い、UTC・同じ run 内単調時刻・thread ID・既知分類と数値だけを固定長で書く。alloc、Rust lock 待ち、TLS 初期化、COM/DXGI、backtrace、worker/barrier 待ちを追加しない。未準備 sink は skip。製品用 handle/buffer は process 終了まで存続し、停止時に hook と close/reopen を競合させない。
 
@@ -710,3 +710,44 @@ backendはruntime/推論経路の選択値を記録・表示する。ORT内部�
 | `git diff --check` | 成功、記録追記後にも確認 |
 
 全件`test-lib-full.ps1`は設計担当がPCの空いている時に実施するという今回の明示指示に従い、exit 2から自動で進めていない。過去の全件失敗を解消済みとは扱わない。製品起動・commit・追加の独立レビューは行っていない。
+
+### 14. 段Cの実装記録（2026-10-31、未コミット）
+
+設計担当から、段B修正`8555bcc46`は独立再レビューACCEPT（指摘なし）、本体全件は15,132成功・失敗0との報告を受けて段Cへ進んだ。§12〜13の過去の失敗記録とは実行条件・sourceが異なる。今回の全件gateは設計担当が別途所有し、実装担当では再実行しない。
+
+- **panic**: `previous_run_diagnostics/fatal.rs`に、workerで事前openするprocess寿命の専用sinkを追加した。hook最初のborrowed downcastで`Rust / GraphicsOutOfMemory / GraphicsValidation / GraphicsInternal`に分類し、固定384-byte buffer、非待機CAS、16件/run上限、1件1回raw `WriteFile`でidentity・UTC・同一runのQPC相対時刻・thread・分類だけを追記する。未準備/競合/再入/上限時はskip、短書込みや失敗でも再試行・flush・loggerは呼ばない。新経路にalloc、Rust lock/TLS、backtrace、COM/DXGI、待機を追加しない。同期WriteFileの所要時間は保証できない。
+- **描画のtypedエラー**: `egui-wgpu`に任意observerを追加し、生成済みdeviceをsurface照会・renderer構築より先に渡す。rootのuncaptured handlerは元の`wgpu::Error`を保持したtyped panicへ進む。hookの小記録より後に既存形式の元本文を整形し、従来の`panic.log`へ残す。任意文字列の推測分類や描画継続・回復処理は加えない。
+- **native**: 通常workerが前回GUI identityのcurrent/bakを各最大1 MiB読んで本文を確保してから、今回のrotation/openを行う。起動headerと各例外行にschema/run/PID/開始UTC/開始ticks/roleを記録する。旧行・別run/role・headerなし・不整合/不完全行を採用しない。VEHの固定2048-byte buffer、再入skip、256件/run、単発raw append、CONTINUE_SEARCHを維持する。除外modeの既存recorderも専用起動workerへ移し、UIの同期I/Oを増やさない。
+- **device-lost**: rootの有限なDX12/Vulkan起動経路に対応する2つのdevice identityと独立latchを保持する。callbackは`Destroyed`を除外し、未知理由を1回CASするだけ。messageの加工/複製、採時、I/O、logger、通知/wake、lock、wgpu再入・復旧を行わない。通常workerが活動中/通常root maintenanceからの起床時/終端時に読み、**workerの観測時刻**を付け、最大2件/4 KiBの別ファイルへ一度だけ追記する。保存前に即死すると失われる。idleの周期起床・常駐監視・保存失敗の再試行はない。
+- **次回本文**: 前回Runningだけに、同一identityの固定分類・数値を添える。first-chanceは「終了前に観測された例外」で、終了原因へ昇格しない。native表示は直近8件と省略件数へ制限する（元の詳細ログは維持）。checkpoint/表示/CPU/GPU/jobの時刻差は、順序が有効な同一runの最後のpanic観測がある場合だけ示し、終了との間隔とは区別する。表示と明示コピーには同じ不変本文を使う。ReturnedOk/ReturnedErrorは捕捉panic等の観測で覆さない。
+- **保持/応答性**: panic・native・device観測はcheckpoint置換と別sinkで先の証拠を消さない。2run整理は既知の小資料だけを削除し、未知内容へ再帰しない。通常のread/open/rotation/serialize/DXGI/保存はworker、UIは既存値のpublishと不変本文の表示・明示コピーだけで、§4の同期I/O/待機禁止を維持する。段D、ORT即時通知、device再作成/再推論/AI無効化/再試行は実装しない。
+
+検証結果は以下へ追記する。製品起動・実GPU OOM/TDR・実native fault注入・デスクトップ操作・commit・追加の独立レビューは行わない。限定子processはlibtestの特定caseだけを起動し、一時data_dirと専用sinkを使う。
+
+| コマンド/検査（`MSBUILDDISABLENODEREUSE=1`） | 結果 |
+| --- | --- |
+| `cargo fmt` | 成功 |
+| `cargo check -p mimageviewer --lib --tests --features test-script` | 成功、2分14秒。`target/ai-crash-655-stage-c-check.log`。既存warningあり。以後に追加した回帰は下記libtestでコンパイル・実行し、最終feature checkも別途確認する |
+| `cargo test -p mimageviewer --lib previous_run_diagnostics -- --nocapture` | 46成功・0失敗、実行2.63秒。固定sinkの再入/短書込み/上限/未準備、相関読取り、各時刻/本文、正常終了抑止、限定子processのmain/worker panic/killを含む。`target/ai-crash-655-stage-c-diagnostics.log` |
+| `cargo test -p mimageviewer --lib native_exception_log -- --skip native_exception_real --nocapture` | 20成功・0失敗、実行0.02秒。実AV/SOの2caseは明示除外し、local recorder/formatter・複数run/role/旧行/不完全行/上限/rotation前確保を検査。`target/ai-crash-655-stage-c-native.log` |
+| `cargo test -p mimageviewer --lib render_failure_diagnostics -- --nocapture` | 3成功・0失敗、実行1.80秒。typed全variantの借用分類と任意formatter非呼出し、実hookの限定Rust/Validation panic子processでパス入り本文の小資料非流出と詳細ログ保持を確認。`target/ai-crash-655-stage-c-render.log` |
+| `cargo test --locked --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib device_creation_observer` | 2成功・0失敗、コンパイル込み29.27秒。任意observerの既定値/clone、New/Existing両方の生成境界と後段処理の呼出し順序をheadlessで確認。`target/ai-crash-655-stage-c-vendor.log` |
+| `cargo test -p mimageviewer --lib previous_run_notice -- --nocapture` | 9成功・0失敗、実行1.21秒。追加1枚のPNGを生成・目視後、更新指定なしの比較も成功。1093×614、100%の固定本文・観測分類・first-chance注記と操作行を確認、表示とコピーは同一。追加PNGは224,535 bytes。`target/ai-crash-655-stage-c-notice.log` |
+| `scripts/test-focused.ps1` | 共有`src/lib.rs`/vendor等を検出してexit 2、選択実行0件。全件は設計担当が実施する明示指示に従い自動で進めない。`target/ai-crash-655-stage-c-focused.log` |
+| `python scripts/check_ui_glyphs.py` | 成功、危険なglyph 0件 |
+| `python scripts/check_site_cards.py` | 成功、49枚・上限超過0件 |
+
+上記のsource contract/enum注入やheadless PNGは、実device callback・driver障害・実画面の挙動を実機で検証した証拠にはしない。
+
+| 最終確認 | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --lib --tests --features test-script`（最終source） | exit 0、40.44秒。`target/ai-crash-655-stage-c-check-final.log` |
+| `cargo test --test ui_snapshot` | 214成功・0失敗、コンパイル2分12秒・実行29.94秒。`target/ai-crash-655-stage-c-ui.log` |
+| `cargo run --locked -p viewer_context_audit` | exit 0。`target/ai-crash-655-stage-c-context-audit.log`（PowerShellのstderr表示にNativeCommandErrorの体裁が含まれるが、cargo/auditorの終了値は0） |
+| `cargo fmt --check` / `git diff --check` | 成功 |
+
+検証用の通常profileバイナリは、必須の非対話検査が成功してから`.\scripts\build-dev.ps1 -PreserveRuntime`で準備する。実行中のdev-runtimeを停止せず、アプリは起動しない。
+
+**検証用buildは未完了。** `MSBUILDDISABLENODEREUSE=1`で`.\scripts\build-dev.ps1 -PreserveRuntime`を実行したが、`turbojpeg-sys 1.2.0`のCMake/MSBuild工程でexit 1となった。初期の`[vcrt-pe] passed: runtime=4 pe=0`、CMakeのconfigure/generate完了、続く`cmake --build ... --target install --config RelWithDebInfo --parallel 24`の失敗、`cmake-0.1.58` build script panicを確認した。出力上は本体Rust変更のコンパイルエラーではないが、依存build失敗の根本原因は未確定であり環境/並行負荷とは断定しない。残った資料は`target/dev-runtime/build/turbojpeg-sys-ad9ab6b47bbc75e3/out/build/`。`target/dev-runtime/mimageviewer-core.exe`は生成されていない。前提不一致として停止し、依存物・build設定の変更や再実行はしていない。
+
+指定された非対話検査は上表のとおり成功したが、段Cの本体全件・workspace/vendor全件・独立レビュー・通常検証用build・実機確認の完了を意味しない。製品起動・実GPU OOM/TDR・実native fault・commit・追加独立レビュー・段Dの実装は行っていない。

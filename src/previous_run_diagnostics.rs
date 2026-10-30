@@ -11,6 +11,8 @@ use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub mod checkpoint;
+pub(crate) mod device_loss;
+pub(crate) mod fatal;
 use crate::gpu_info::diagnostic_sampler::{AdapterProbe, DiagnosticSampler, MemorySample};
 use checkpoint::{Checkpoint, CheckpointPublisher, Publication, Schedule, Stamp};
 
@@ -48,6 +50,7 @@ struct Shared {
     repaint: OnceLock<egui::Context>,
     completion: AtomicU8,
     checkpoint: Publication,
+    device_loss: device_loss::Registry,
     #[cfg(test)]
     ready: (std::sync::Mutex<bool>, std::sync::Condvar),
 }
@@ -62,6 +65,7 @@ impl Shared {
             repaint: OnceLock::new(),
             completion: AtomicU8::new(0),
             checkpoint: Publication::new(),
+            device_loss: device_loss::Registry::new(),
             #[cfg(test)]
             ready: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
         }
@@ -146,9 +150,10 @@ impl GuiRunDiagnostics {
             return;
         }
         let data_dir = resolved_data_dir.to_path_buf();
-        self.admit_resolving(
+        self.admit_resolving_with_setup(
             move || resolve_directory_with(&data_dir, miv_startup::gui_diagnostics_directory),
             RunIdentity::from(identity),
+            Some(resolved_data_dir.join("logs")),
         );
     }
 
@@ -161,6 +166,15 @@ impl GuiRunDiagnostics {
         &mut self,
         resolve: impl FnOnce() -> io::Result<PathBuf> + Send + 'static,
         identity: RunIdentity,
+    ) {
+        self.admit_resolving_with_setup(resolve, identity, None);
+    }
+
+    fn admit_resolving_with_setup(
+        &mut self,
+        resolve: impl FnOnce() -> io::Result<PathBuf> + Send + 'static,
+        identity: RunIdentity,
+        setup_logs: Option<PathBuf>,
     ) {
         if !matches!(self.owner, Owner::Inert) {
             return;
@@ -176,8 +190,18 @@ impl GuiRunDiagnostics {
             .name("gui-run-diagnostics".into())
             .spawn(move || {
                 let _ = worker_shared.writer.set(std::thread::current());
-                let result =
-                    resolve().and_then(|directory| writer(&directory, identity, &worker_shared));
+                let result = resolve().and_then(|directory| {
+                    let mut sampler = DiagnosticSampler::new();
+                    writer_sampling_with_setup(
+                        &directory,
+                        identity,
+                        &worker_shared,
+                        |adapter| {
+                            sampler.sample_timed(adapter, || worker_shared.checkpoint.stamp())
+                        },
+                        setup_logs.as_deref(),
+                    )
+                });
                 if let Err(error) = &result {
                     log::warn!("GUI run diagnostics unavailable: {error}");
                 }
@@ -290,6 +314,15 @@ impl From<miv_startup::ProcessIdentity> for RunIdentity {
     }
 }
 impl RunIdentity {
+    fn process_identity(self) -> miv_startup::ProcessIdentity {
+        miv_startup::ProcessIdentity {
+            role: miv_startup::Role::Core,
+            run: self.run,
+            pid: self.core_pid,
+            started_utc_ms: self.core_started_utc_ms,
+            started_ticks: self.core_started_ticks,
+        }
+    }
     fn name(self) -> String {
         format!(
             "{:016x}-core-{}-{}-{:016x}",
@@ -399,6 +432,13 @@ fn read_reference(directory: &Path) -> Option<Reference> {
     .then_some(value)
 }
 fn previous_report(directory: &Path, reference: &Reference) -> Option<PreviousRunReport> {
+    previous_report_with_native(directory, reference, None)
+}
+fn previous_report_with_native(
+    directory: &Path,
+    reference: &Reference,
+    native_logs: Option<&Path>,
+) -> Option<PreviousRunReport> {
     let record: Record = bounded_read(
         &directory.join(reference.current.name()).join("state.json"),
         MAX_RECORD_BYTES,
@@ -416,7 +456,28 @@ fn previous_report(directory: &Path, reference: &Reference) -> Option<PreviousRu
     {
         return None;
     }
-    Some(format_report(&record))
+    let private = directory.join(record.identity.name());
+    let panic = fatal::read_observations(&private, record.identity).unwrap_or_else(|error| {
+        log::warn!("panic evidence unavailable: {error}");
+        Vec::new()
+    });
+    let devices =
+        device_loss::read_observations(&private, record.identity).unwrap_or_else(|error| {
+            log::warn!("device evidence unavailable: {error}");
+            Vec::new()
+        });
+    let native = native_logs
+        .map(|logs| {
+            crate::native_exception_log::read_correlated(logs, record.identity.process_identity())
+                .unwrap_or_else(|error| {
+                    log::warn!("native evidence unavailable: {error}");
+                    Vec::new()
+                })
+        })
+        .unwrap_or_default();
+    Some(format_report_with_observations(
+        &record, &panic, &devices, &native,
+    ))
 }
 fn diagnostic_optional<T: std::fmt::Debug>(value: Option<T>) -> String {
     value.map_or_else(|| "unknown".to_owned(), |value| format!("{value:?}"))
@@ -429,16 +490,30 @@ fn diagnostic_dimensions(value: Option<checkpoint::Dimensions>) -> String {
 }
 
 fn format_report(record: &Record) -> PreviousRunReport {
+    format_report_with_observations(record, &[], &[], &[])
+}
+fn format_report_with_observations(
+    record: &Record,
+    panic: &[fatal::PanicObservation],
+    devices: &[device_loss::DeviceObservation],
+    native: &[crate::native_exception_log::NativeObservation],
+) -> PreviousRunReport {
     // The typed schema has no arbitrary diagnostic strings. Formatting is
     // shared by the visible body and the explicit copy action.
     let [major, minor, patch] = record.version;
+    let introduction = if panic.is_empty() && devices.is_empty() && native.is_empty() {
+        "前回の正常終了を確認できませんでした。原因は記録されていません。"
+    } else {
+        "前回の正常終了を確認できませんでした。終了前に観測された情報があります。"
+    };
     let mut report = PreviousRunReport {
         body: format!(
-            "前回の正常終了を確認できませんでした。原因は記録されていません。\n最終記録時刻: Unix {} ms (UTC) / 終了との間隔不明\nmIV {major}.{minor}.{patch} / 記録ID {}\n強制終了・OS終了・電源断・記録失敗とクラッシュは区別できません。\n最終記録以降に状態が変わった可能性があります。",
+            "{introduction}\n最終記録時刻: Unix {} ms (UTC) / 終了との間隔不明\nmIV {major}.{minor}.{patch} / 記録ID {}\n強制終了・OS終了・電源断・記録失敗とクラッシュは区別できません。\n最終記録以降に状態が変わった可能性があります。",
             record.last_recorded_utc_ms,
             record.identity.name()
         ),
     };
+    append_observations(&mut report.body, panic, devices, native);
     if let Some(checkpoint) = &record.checkpoint {
         use std::fmt::Write as _;
         let _ = write!(
@@ -537,7 +612,113 @@ fn format_report(record: &Record) -> PreviousRunReport {
             checkpoint.ai_adapter_correlation
         );
     }
+    if let (Some(checkpoint), Some(observation)) = (&record.checkpoint, panic.last()) {
+        append_panic_interval(
+            &mut report.body,
+            "checkpoint",
+            checkpoint.stamp,
+            observation.stamp,
+        );
+        if let Some(display) = &checkpoint.display {
+            append_panic_interval(
+                &mut report.body,
+                "表示状態",
+                display.stamp,
+                observation.stamp,
+            );
+        }
+        append_panic_interval(
+            &mut report.body,
+            "CPU sample",
+            checkpoint.cpu_private_bytes.stamp,
+            observation.stamp,
+        );
+        append_panic_interval(
+            &mut report.body,
+            "GPU sample",
+            checkpoint.gpu.stamp,
+            observation.stamp,
+        );
+        for job in &checkpoint.jobs {
+            append_panic_interval(
+                &mut report.body,
+                &format!("job {}", job.metadata.job_id),
+                job.stamp,
+                observation.stamp,
+            );
+        }
+    }
     report
+}
+
+fn append_observations(
+    body: &mut String,
+    panic: &[fatal::PanicObservation],
+    devices: &[device_loss::DeviceObservation],
+    native: &[crate::native_exception_log::NativeObservation],
+) {
+    use std::fmt::Write as _;
+    for event in panic {
+        let classification = match event.kind {
+            fatal::PanicKind::Rust => "Rust panic（詳細は分類できませんでした）",
+            fatal::PanicKind::GraphicsOutOfMemory => "描画用GPUメモリの確保失敗 / Rust panic",
+            fatal::PanicKind::GraphicsValidation => "描画APIの検証エラー / Rust panic",
+            fatal::PanicKind::GraphicsInternal => "描画APIの内部エラー / Rust panic",
+        };
+        let _ = write!(
+            body,
+            "\n終了前に観測された情報: {classification}\npanic観測時刻: UTC {} ms / run {} ms / thread {}",
+            event.stamp.utc_ms, event.stamp.run_elapsed_ms, event.thread
+        );
+    }
+    for event in devices {
+        let _ = write!(
+            body,
+            "\n終了前に観測された情報: 描画device {} の喪失 / 理由 unknown\n保存workerの観測時刻: UTC {} ms / run {} ms（callback発生時刻・終了時刻ではありません）",
+            event.device_id, event.stamp.utc_ms, event.stamp.run_elapsed_ms
+        );
+    }
+    // Keep presentation bounded even after a run hits the native recorder cap.
+    // The local native log retains every event; copy and display share this tail.
+    let omitted = native.len().saturating_sub(8);
+    if omitted != 0 {
+        let _ = write!(body, "\n以前のnative例外観測: {omitted}件を省略");
+    }
+    for event in native.iter().skip(omitted) {
+        let classification = match event.code {
+            0xC0000005 => "access violation",
+            0xC00000FD => "stack overflow",
+            0x80000003 => "breakpoint",
+            0xC000001D => "illegal instruction",
+            0xC0000094 => "integer divide by zero",
+            0xC0000095 => "integer overflow",
+            0xC0000374 => "heap corruption",
+            _ => "unknown",
+        };
+        let _ = write!(
+            body,
+            "\n終了前に観測された例外（first-chance）: {classification} / code 0x{:08X} / UTC {} ms。終了原因かは不明です。",
+            event.code, event.utc_ms
+        );
+    }
+    if !panic.is_empty() || !devices.is_empty() || !native.is_empty() {
+        body.push_str("\n観測された情報だけでは終了原因を確定できません。背景thread・捕捉されたpanicやfirst-chanceでも記録されます。");
+    }
+}
+fn append_panic_interval(body: &mut String, label: &str, sample: Stamp, panic: Stamp) {
+    use std::fmt::Write as _;
+    if sample.utc_ms <= panic.utc_ms && sample.run_elapsed_ms <= panic.run_elapsed_ms {
+        let _ = write!(
+            body,
+            "\n{label}採取→同一runの最後のpanic観測: {} ms前（終了との間隔は不明）",
+            panic.run_elapsed_ms - sample.run_elapsed_ms
+        );
+    } else {
+        let _ = write!(
+            body,
+            "\n{label}採取と同一runの最後のpanic観測との間隔: 不明"
+        );
+    }
 }
 
 fn writer(directory: &Path, identity: RunIdentity, shared: &Shared) -> io::Result<()> {
@@ -561,7 +742,16 @@ fn writer_sampling(
     directory: &Path,
     identity: RunIdentity,
     shared: &Shared,
+    sample: impl FnMut(Option<&AdapterProbe>) -> (MemorySample, Stamp, Stamp),
+) -> io::Result<()> {
+    writer_sampling_with_setup(directory, identity, shared, sample, None)
+}
+fn writer_sampling_with_setup(
+    directory: &Path,
+    identity: RunIdentity,
+    shared: &Shared,
     mut sample: impl FnMut(Option<&AdapterProbe>) -> (MemorySample, Stamp, Stamp),
+    setup_logs: Option<&Path>,
 ) -> io::Result<()> {
     std::fs::create_dir_all(directory)?;
     // Held across initialization and every outstanding I/O, including after a
@@ -571,12 +761,31 @@ fn writer_sampling(
     let previous = read_reference(directory);
     if let Some(report) = previous
         .as_ref()
-        .and_then(|reference| previous_report(directory, reference))
+        .and_then(|reference| previous_report_with_native(directory, reference, setup_logs))
     {
         let _ = shared.report.set(report);
     }
     let run_directory = directory.join(identity.name());
     std::fs::create_dir(&run_directory)?;
+    // Previous immutable report is secured above, before native rotation/open.
+    // Global process-lifetime sinks are prepared only for real GUI admission;
+    // ordinary unit fixtures retain local/isolated recorders.
+    if let Some(logs) = setup_logs {
+        if let Err(error) = fatal::prepare(&run_directory, identity, shared.checkpoint.origin()) {
+            log::warn!("panic evidence unavailable: {error}");
+        }
+        crate::native_exception_log::report_install_result(
+            crate::native_exception_log::install_in(logs, Some(identity.process_identity())),
+        );
+    }
+    let mut device_writer = match device_loss::Writer::open(&run_directory) {
+        Ok(writer) => Some(writer),
+        Err(error) => {
+            log::warn!("device evidence unavailable: {error}");
+            None
+        }
+    };
+    observe_devices(shared, identity, &mut device_writer);
     let path = run_directory.join("state.json");
     let initial_boundary = shared.checkpoint.boundaries();
     let initial_active = shared.checkpoint.active();
@@ -614,10 +823,11 @@ fn writer_sampling(
     loop {
         match shared.state.load(Ordering::Acquire) {
             RUNNING => {
+                let new_device_event = observe_devices(shared, identity, &mut device_writer);
                 let now = shared.checkpoint.elapsed_ms();
                 let active = shared.checkpoint.active();
                 let boundary = shared.checkpoint.boundaries();
-                if schedule.due(now, active, boundary) {
+                if new_device_event || schedule.due(now, active, boundary) {
                     record.checkpoint = Some(capture_checkpoint(shared, &mut sample));
                     record.last_recorded_utc_ms = now_ms();
                     replace(&path, &record)?;
@@ -633,6 +843,7 @@ fn writer_sampling(
             }
             ABANDONED => return Ok(()),
             terminal => {
+                observe_devices(shared, identity, &mut device_writer);
                 record.state = if terminal == RETURNED_OK {
                     RunState::ReturnedOk
                 } else {
@@ -644,6 +855,23 @@ fn writer_sampling(
             }
         }
     }
+}
+
+fn observe_devices(
+    shared: &Shared,
+    identity: RunIdentity,
+    writer: &mut Option<device_loss::Writer>,
+) -> bool {
+    let observations = shared.device_loss.collect(shared.checkpoint.stamp());
+    let changed = !observations.is_empty();
+    for observation in observations {
+        if let Some(writer) = writer {
+            if let Err(error) = writer.append(identity, observation) {
+                log::warn!("device evidence write failed: {error}");
+            }
+        }
+    }
+    changed
 }
 
 fn retain_two(directory: &Path, reference: &Reference) -> io::Result<()> {
@@ -665,6 +893,17 @@ fn retain_two(directory: &Path, reference: &Reference) -> io::Result<()> {
             || Some(record.identity) == reference.previous
         {
             continue;
+        }
+        for name in ["panic-events.log", device_loss::FILE_NAME] {
+            let owned = path.join(name);
+            match std::fs::symlink_metadata(&owned) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    std::fs::remove_file(owned)?;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
         std::fs::remove_file(path.join("state.json"))?;
         // No recursive deletion: unrecognized contents are never removed.
@@ -698,6 +937,36 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn checkpoint_report_body() -> String {
+        format_report(&checkpoint_record()).body
+    }
+
+    pub(crate) fn stage_c_report_body() -> String {
+        let record = checkpoint_record();
+        let stamp = Stamp {
+            utc_ms: record.last_recorded_utc_ms + 700,
+            run_elapsed_ms: 12_700,
+        };
+        format_report_with_observations(
+            &record,
+            &[fatal::PanicObservation {
+                stamp,
+                thread: 17,
+                kind: fatal::PanicKind::GraphicsOutOfMemory,
+            }],
+            &[device_loss::DeviceObservation {
+                device_id: 1,
+                stamp,
+                reason: device_loss::DeviceReason::Unknown,
+            }],
+            &[crate::native_exception_log::NativeObservation {
+                utc_ms: stamp.utc_ms,
+                code: 0xC0000005,
+            }],
+        )
+        .body
+    }
+
+    fn checkpoint_record() -> Record {
         use crate::gpu_info::diagnostic_sampler::{
             AdapterIdentity, DiagnosticBackend as GpuBackend, GpuMemorySample, GpuSampleStatus,
             SegmentMemory,
@@ -783,7 +1052,7 @@ pub(crate) mod test_support {
             job.stamp = stamp;
             job.cancel_stamp = stamp;
         }
-        format_report(&Record {
+        Record {
             schema: SCHEMA,
             identity: RunIdentity {
                 role: RunRole::Core,
@@ -796,8 +1065,32 @@ pub(crate) mod test_support {
             state: RunState::Running,
             last_recorded_utc_ms: stamp.utc_ms,
             checkpoint: Some(cp),
-        })
-        .body
+        }
+    }
+
+    fn panic_identity(pid: u32) -> RunIdentity {
+        RunIdentity {
+            role: RunRole::Core,
+            run: 1,
+            core_pid: pid,
+            core_started_utc_ms: 1,
+            core_started_ticks: 1,
+        }
+    }
+    pub(crate) fn prepare_panic_sink(directory: &Path) {
+        fatal::prepare(
+            directory,
+            panic_identity(std::process::id()),
+            Instant::now(),
+        )
+        .unwrap();
+    }
+    pub(crate) fn panic_kinds(directory: &Path, pid: u32) -> Vec<fatal::PanicKind> {
+        fatal::read_observations(directory, panic_identity(pid))
+            .unwrap()
+            .into_iter()
+            .map(|event| event.kind)
+            .collect()
     }
 
     pub(super) fn identity() -> RunIdentity {
@@ -1556,6 +1849,175 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_device_latch_is_saved_by_normal_maintenance_and_clean_suppresses_notice() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut owner = GuiRunDiagnostics::new();
+        test_support::admit(&mut owner, directory.path());
+        let publisher = owner.publisher().unwrap();
+        let latch = publisher.register_device_loss_source().unwrap();
+        let identity = test_support::record(directory.path()).unwrap().identity;
+        let private = directory.path().join(identity.name());
+        latch.observe(wgpu::DeviceLostReason::Unknown);
+        // Only normal maintenance/initialization can consume and save the latch.
+        publisher.publish_display(checkpoint::DisplaySnapshot::default());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if !device_loss::read_observations(&private, identity)
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "normal maintenance must wake idle writer"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            test_support::record(directory.path()).unwrap().state,
+            RunState::Running
+        );
+        finish(&mut owner, GuiRunOutcome::ReturnedOk);
+        let reference = read_reference(directory.path()).unwrap();
+        assert!(previous_report(directory.path(), &reference).is_none());
+        assert_eq!(
+            device_loss::read_observations(&private, identity)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn diagnostic_device_failed_save_is_not_retried_and_does_not_replace_panic_evidence() {
+        let shared = Shared::new();
+        let latch = shared.device_loss.register().unwrap();
+        latch.observe(wgpu::DeviceLostReason::Unknown);
+        let identity = test_support::identity();
+        // A failed open has no retry or recovery path; consume once.
+        assert!(observe_devices(&shared, identity, &mut None));
+        assert!(!observe_devices(&shared, identity, &mut None));
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("panic-events.log"),
+            b"prior panic evidence",
+        )
+        .unwrap();
+        let mut writer = Some(device_loss::Writer::open(directory.path()).unwrap());
+        assert!(!observe_devices(&shared, identity, &mut writer));
+        let second = shared.device_loss.register().unwrap();
+        second.observe(wgpu::DeviceLostReason::Unknown);
+        assert!(observe_devices(&shared, identity, &mut writer));
+        assert_eq!(
+            std::fs::read(directory.path().join("panic-events.log")).unwrap(),
+            b"prior panic evidence"
+        );
+        assert_eq!(
+            device_loss::read_observations(directory.path(), identity).unwrap()[0].device_id,
+            2
+        );
+    }
+
+    #[test]
+    fn diagnostic_observation_report_is_bounded_and_intervals_are_only_same_run_panic() {
+        let report = test_support::stage_c_report_body();
+        assert!(report.contains("描画用GPUメモリの確保失敗"));
+        assert!(report.contains("保存workerの観測時刻"));
+        assert!(report.contains("first-chance"));
+        assert!(report.contains("終了原因かは不明"));
+        assert!(report.contains("700 ms前（終了との間隔は不明）"));
+        assert!(!report.contains("address="));
+        assert!(!report.contains("target="));
+        let sample = Stamp {
+            utc_ms: 100,
+            run_elapsed_ms: 10,
+        };
+        let mut reversed = String::new();
+        append_panic_interval(
+            &mut reversed,
+            "sample",
+            sample,
+            Stamp {
+                utc_ms: 99,
+                run_elapsed_ms: 20,
+            },
+        );
+        assert!(reversed.ends_with("間隔: 不明"));
+        let mut native = String::new();
+        append_observations(
+            &mut native,
+            &[],
+            &[],
+            &vec![
+                crate::native_exception_log::NativeObservation {
+                    utc_ms: 100,
+                    code: 0xC0000005
+                };
+                256
+            ],
+        );
+        assert_eq!(native.matches("first-chance）:").count(), 8);
+        assert!(native.contains("248件を省略"));
+        assert!(native.len() < MAX_RECORD_BYTES as usize);
+    }
+
+    #[test]
+    fn diagnostic_previous_run_report_combines_only_correlated_native_and_device_observations() {
+        let directory = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let mut owner = GuiRunDiagnostics::new();
+        test_support::admit(&mut owner, directory.path());
+        let record = test_support::record(directory.path()).unwrap();
+        let private = directory.path().join(record.identity.name());
+        let stamp = Stamp {
+            utc_ms: now_ms(),
+            run_elapsed_ms: 20,
+        };
+        device_loss::Writer::open(&private)
+            .unwrap()
+            .append(
+                record.identity,
+                device_loss::DeviceObservation {
+                    device_id: 1,
+                    stamp,
+                    reason: device_loss::DeviceReason::Unknown,
+                },
+            )
+            .unwrap();
+        test_support::wait_abandoned(owner);
+        let id = record.identity;
+        let fields = format!(
+            "schema=1 run={} pid={} start_utc_ms={} start_ticks={} role=core",
+            id.run, id.core_pid, id.core_started_utc_ms, id.core_started_ticks
+        );
+        let event = format!(
+            "[SystemTime {{ intervals: {} }}] NATIVE EXCEPTION chance=first code=0xC0000005 flags=0x0 address=0x1234 thread=4 version=4.10.0 exe_base=0x0 ntdll_base=0x0 {fields}\n",
+            (stamp.utc_ms + 11_644_473_600_000) * 10_000
+        );
+        let path = logs.path().join("native-exception.log");
+        std::fs::write(&path, &event).unwrap(); // A line identity alone is insufficient.
+        let reference = read_reference(directory.path()).unwrap();
+        let uncorrelated =
+            previous_report_with_native(directory.path(), &reference, Some(logs.path())).unwrap();
+        assert!(uncorrelated.body().contains("描画device 1 の喪失"));
+        assert!(!uncorrelated.body().contains("first-chance）："));
+        assert!(!uncorrelated.body().contains("access violation"));
+        std::fs::write(&path, format!("NATIVE RUN {fields}\n{event}")).unwrap();
+        let correlated =
+            previous_report_with_native(directory.path(), &reference, Some(logs.path())).unwrap();
+        assert!(correlated.body().contains("access violation"));
+        assert!(correlated.body().contains("終了原因かは不明"));
+        assert!(!correlated.body().contains("0x1234"));
+        let mut clean = record;
+        clean.state = RunState::ReturnedError;
+        replace(&private.join("state.json"), &clean).unwrap();
+        assert!(
+            previous_report_with_native(directory.path(), &reference, Some(logs.path())).is_none()
+        );
+    }
+
+    #[test]
     fn diagnostic_child() {
         let Some(directory) = std::env::var_os("MIV_GUI_DIAGNOSTIC_CHILD_DIR") else {
             return;
@@ -1563,6 +2025,19 @@ mod tests {
         let mode = std::env::var("MIV_GUI_DIAGNOSTIC_CHILD_MODE").unwrap();
         let mut owner = GuiRunDiagnostics::new();
         test_support::admit(&mut owner, Path::new(&directory));
+        let _data_lock = crate::data_dir::test_override_lock();
+        crate::data_dir::set_test_override(Some(directory.clone().into()));
+        let record = test_support::record(Path::new(&directory)).unwrap();
+        let Owner::Admitted { shared, .. } = &owner.owner else {
+            unreachable!()
+        };
+        fatal::prepare(
+            &Path::new(&directory).join(record.identity.name()),
+            record.identity,
+            shared.checkpoint.origin(),
+        )
+        .unwrap();
+        crate::install_panic_log_hook();
         println!("GUI_DIAGNOSTIC_READY");
         std::io::stdout().flush().unwrap();
         match mode.as_str() {
@@ -1651,6 +2126,17 @@ mod tests {
                 "{mode}"
             );
             assert_eq!(test_support::terminal(directory.path()), terminal, "{mode}");
+            let record = test_support::record(directory.path()).unwrap();
+            let evidence = fatal::read_observations(
+                &directory.path().join(record.identity.name()),
+                record.identity,
+            )
+            .unwrap();
+            assert_eq!(
+                evidence.len(),
+                usize::from(matches!(mode, "panic" | "worker-panic-ok")),
+                "{mode}"
+            );
             let mut next = GuiRunDiagnostics::new();
             test_support::admit(&mut next, directory.path());
             assert_eq!(

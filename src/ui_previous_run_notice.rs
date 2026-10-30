@@ -309,4 +309,23 @@ mod tests {
         click(&mut h, copy_pos);
         assert_eq!(h.state().copied, [report]);
     }
+
+    #[test]
+    fn previous_run_notice_snapshot_observations_small_light() {
+        let report = crate::previous_run_diagnostics::test_support::stage_c_report_body();
+        let mut h = harness_report(
+            egui::vec2(1093.0, 614.0),
+            1.0,
+            ResolvedTheme::Light,
+            report.clone(),
+        );
+        h.run_steps(12);
+        for control in &h.state().result.controls {
+            assert!(h.ctx.content_rect().contains_rect(control.rect));
+        }
+        h.snapshot("previous_run_notice_observations_small_light");
+        let copy = h.state().result.controls[0].rect.center();
+        click(&mut h, copy);
+        assert_eq!(h.state().copied, [report]);
+    }
 }
