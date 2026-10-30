@@ -34,6 +34,8 @@ impl Server {
                     producer,
                     session,
                     active: AtomicUsize::new(0),
+                    #[cfg(test)]
+                    search_hooks: None,
                 }))?,
             })
         }
@@ -50,6 +52,22 @@ struct Handlers {
     producer: Option<crate::collection_store::CollectionRemoteProducerControl>,
     session: Option<crate::remote_ipc::session::SessionHandle>,
     active: AtomicUsize,
+    #[cfg(test)]
+    search_hooks: Option<Arc<SearchHooks>>,
+}
+
+#[cfg(test)]
+struct SearchHooks {
+    now: Box<dyn Fn() -> Instant + Send + Sync>,
+    worker: Box<
+        dyn Fn(
+                &str,
+                &[uuid::Uuid],
+                &Arc<AtomicBool>,
+                &crossbeam_channel::Sender<crate::global_search::SearchStreamEvent>,
+            ) + Send
+            + Sync,
+    >,
 }
 
 struct Running {
@@ -523,21 +541,32 @@ impl Handlers {
         let (tx, rx) = crossbeam_channel::bounded(4);
         let search_cancel = Arc::new(AtomicBool::new(false));
         let cancel_worker = search_cancel.clone();
+        let now = || {
+            #[cfg(test)]
+            if let Some(hooks) = &self.search_hooks {
+                return (hooks.now)();
+            }
+            Instant::now()
+        };
+        // Include worker startup in the response budget. Capture before spawning
+        // so both the real worker and a controlled test worker see a fixed deadline.
+        let deadline = now() + Duration::from_secs(20);
+        #[cfg(test)]
+        let hooks = self.search_hooks.clone();
         let worker = match std::thread::Builder::new()
             .name("agent-search".into())
             .spawn(move || {
+                #[cfg(test)]
+                if let Some(hooks) = hooks {
+                    (hooks.worker)(&query, &ids, &cancel_worker, &tx);
+                    return;
+                }
                 crate::global_search::run(&query, &ids, &scope, &fts, &cancel_worker, &tx, None)
             }) {
             Ok(w) => w,
             Err(_) => return (Err(internal()), None),
         };
-        let collected = collect_search(
-            &rx,
-            cancel,
-            offset + limit,
-            Instant::now() + Duration::from_secs(20),
-            Instant::now,
-        );
+        let collected = collect_search(&rx, cancel, offset + limit, deadline, now);
         search_cancel.store(true, Ordering::Release);
         drop(rx);
         (

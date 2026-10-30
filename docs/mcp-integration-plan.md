@@ -581,7 +581,7 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
 確認された前提: Remote の通常データ要求は操作権必須、指定した reader は worker から使える、
 純粋な読み取りを全 Remote phase で受けても cache 整合を壊さない、data dir はプロセス内で固定。
 
-## 14. 段階 0 の実装記録 (2026-10-30、初回 `0a993c355`・追加修正済み、full-trust 検証待ち)
+## 14. 段階 0 の実装記録 (2026-10-30、round 2 `28664e3dd`・round 3 修正)
 
 作業先は `G:\home\mimageviewer-mcp` / `mcp-trial`。製品 core・launcher・インストール版は起動せず、
 通常の APPDATA をテストに使わない。MCP adapter だけは、設計担当の明示判断に従い使い捨て fixture
@@ -607,10 +607,11 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
 - pipe は server / client とも overlapped I/O。server の停止 event は各 I/O の待機集合に入り、
   停止と I/O 開始の競合をなくす。停止時は `ConnectionAborted` (再試行しない終端) を返す。
   client の各 read/write は独立した OVERLAPPED を持ち、応答待ち中でも Cancel を送れる。
-- MCP exe は stdin EOF または有界入力 queue の満杯を、stdin owner の専用 hook から
-  `ExitProcess(0)` へ渡す。stdout backpressure・Rust stdout cleanup・worker join を待たずに
-  OS が pipe を閉じ、core は切断として取消する。test は hook を通知 callback に置き換え、
-  blocked writer を保持したまま300ms以内に EOF / queue overflow が届くことを検査する。
+- MCP exe は実際の stdin EOF を stdin owner の専用 hook から `ExitProcess(0)` へ渡す。
+  stdout backpressure・Rust stdout cleanup・worker join を待たず、OS が pipe を閉じる。
+  入力 queue 満杯での終了は round 3 で削除し、通常の backpressure とした。
+  test は hook を通知 callback に置き換え、blocked writer 中の真の EOF と、入力を閉じない
+  burst の継続・完全な JSON line の配送を別々に検査する。
 - 投影は path/subresource・name・kind・tags・rating、tag/collection の name/count だけ。
   TagItems の thumbnail/sidecar materializer は通さず、★は rating DB から別に引く。
   全一覧 tool の cursor は版・tool・正規化引数/順序・返却済件数を符号化し、再実行して skip する。
@@ -703,7 +704,7 @@ commit は ClaudeCode が `0a993c355` として作成した。実装担当は co
 通常 APPDATA へのテスト・snapshot 更新・test-full は実施していない。
 実 core / Claude Desktop / ChatGPT からの確認は別の受入れ gate に残る。
 
-### 追加修正後の検証 (実装担当が sandbox 内で実行、未コミット差分)
+### Round 2 の sandbox 内検証 (実装担当実行、のちに `28664e3dd` として commit)
 
 | コマンド | 実 exit code / 結果 | ログ |
 |---|---|---|
@@ -743,4 +744,100 @@ cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_lev
 
 後者には ignore を外した stdio 結合検査が含まれる。必要な adapter の build/パス解決は検査内で
 Cargo artifact を通して行い、起動先には使い捨て fixture の `--data-dir` を渡す。
-成功を確認するのは上記3件の実 pipe 経路を含む両コマンド全体。sandbox 外の最新結果は未受領。
+成功を確認するのは上記3件の実 pipe 経路を含む両コマンド全体。結果は次の round 2 記録を参照。
+
+### Round 2 の sandbox 外検証 (ClaudeCode 実行、基点 `28664e3dd`)
+
+以下は ClaudeCode が通常権限 full-trust context で実行し、round 3 の依頼で報告した結果。
+実装担当が sandbox 内で実行した結果ではない。
+
+- `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored`
+  → **exit 0、IPC 6件 + MCP 18件成功**。
+- 上記の core 焦点 nextest → **exit 0、18/18成功**。
+  `stdio_exe_uses_real_core_fixture_handlers` による adapter 起動も含む。
+
+### Round 3 の受理指摘と設計
+
+`4b3c9da43..28664e3dd` に対する独立レビュー (gpt-6.1-sol / xhigh、read-only) の
+P2 3件・P3 2件を設計担当がすべて受理した。
+
+- **legacy の tool 一覧更新**: 実際の agent wire 応答には permission epoch が含まれないため、
+  adapter が既存 Status IPC を legacy Ready 中に1秒間隔で照会し、有効な tool 集合の変化を観測する。
+  Stage 0 の集合は Disabled/ReadOnly の2通りだけなので wire の epoch 追加は不要。
+  第二の設定 reader や core 側の subscription/接続所有を作らず、idle 中も照会できるこの方式を選ぶ。
+  legacy handshake では `tools.listChanged=true` を広告し、変化時に
+  `notifications/tools/list_changed` を送る。監視停止時は timer を止め、未完了の同期 IPC を join しない。
+  古い poll 結果が新しい tools/list・Disabled 観測を上書きしないよう、Session 内の局所 revision で照合する。
+- **modern の更新**: `subscriptions/listen` には filter・ack・終了/cancel の所有が追加で必要になる。
+  Stage 0 ではこれを増やさず、2026-07-28 の tools/list は引き続き `ttlMs=0` / `cacheScope=private`
+  とし、必要時の再一覧取得で更新する。modern に `listChanged` を広告せず、未購読の通知も送らない。
+  [公式 SDK の版移行説明](https://ts.sdk.modelcontextprotocol.io/v2/migration/support-2026-07-28) の
+  subscription による change 通知の扱いを確認した。
+  [公式 caching](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/caching) は
+  listChanged を広告せず TTL だけを提供する方式を許容している。
+- **出力と制御**: stdout は有界 channel に接続した単一 writer が所有する。
+  stdin owner は受信した取消を shared Active owner へ即反映し、同じ通知を通常 FIFO にも残す。
+  これにより tool Line の受付と Active 作成の間の取消も失わない。取消は idempotent にする。
+  Active は Executing/ReplyQueued の型付き phase で保持し、queue 内にある応答も取消可能にする。
+  writer は JSON serialize/文字数上限処理後、短い lock 内で取消確認と該当 Active の退役を確定し、
+  直ちに1本の完全な JSON line を書く。書き始めた frame の途中を取消で切らない。
+- **入力過負荷と EOF**: 通常の入力 queue 満杯は backpressure とし、受理済み要求・応答を捨てたり
+  process を終了したりしない。ExitProcess hook は実際に stdin が EOF になった場合だけ呼ぶ。
+  既に受信した取消と EOF の制御は stdout write/flush を待たない。
+- **deadline の検査**: test 専用の worker と manual clock を real Connection::request 経路へ注入する。
+  2要求とも本番 setup と permit 取得を通し、deadline 部分応答後も worker 解放まで2枠が保持されること、
+  第三要求が Busy になること、実 controller join 後に枠が戻ることを検査する。
+- **初期化中 ping**: legacy の ping は Ready 判定より先に空の result を返す。
+  [2025-11-25 lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle) に従う。
+  版メタ情報付きの要求は通常の版検証へ通し、未対応版の拒否を迂回しない。
+
+状態を減らす検討: tool 処理を output write と一体化して modal にすると取消を受信できないため採用しない。
+専用 writer と既存 Active の型付き phase に集約し、別の pending response registry や回復 loop は作らない。
+入力満杯には通常の backpressure を使い、過負荷を EOF として扱う分岐を削除する。
+
+独立 reviewer (gpt-6.1-sol / xhigh、read-only) は今回の所有・取消・queue・idle 通知・deadline の
+差分を確認し、初期化中 ping の版メタ情報迂回を追加指摘した。両 legacy 版の回帰テストと条件修正後、
+追加の P1/P2 はなし。実 pipe の full-trust 検証を source review で代替しない。
+
+### Round 3 の sandbox 内検証 (実装担当実行、未コミット差分)
+
+| コマンド | 実 exit code / 結果 | ログ |
+|---|---|---|
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | `target/mcp-r3-core-check-final.log` |
+| `cargo check -p mimageviewer-mcp --bin mimageviewer-mcp` | 0 | `target/mcp-r3-mcp-check-final.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 101。IPC 6成功、MCP 27成功/2失敗、ignored 0 | `target/mcp-r3-crates-final.log` |
+| 上記の core 焦点 nextest | 100。18実行、16成功/2失敗 | `target/mcp-r3-focused-final.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(=agent_ipc::tests::deadline_returns_partial_without_releasing_the_running_worker_slot)'` | 0。1/1成功 | `target/mcp-r3-deadline-test.log` |
+| `cargo fmt` → `cargo fmt --check` | 0。全 workspace | `target/mcp-r3-fmt-check.log` / tool 実行記録 |
+| `python scripts/check_ui_glyphs.py` / `git diff --check` | 各0 | tool 実行記録 |
+
+上表の crate 失敗は次の実 pipe 2件で、いずれも fixture thread 起動前の client open が OS 5。
+
+- `pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld`
+- `pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked` (今回追加)
+
+core 焦点 nextest の失敗は、前 round と同じ次の2件。idle reader は client open、stdio 結合検査は
+fixture pipe の作成で OS 5 となり、adapter の起動には到達していない。新しい deadline 検査は成功した。
+
+- `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`
+- `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`
+
+通常の入力100件の burst を stdin を閉じずに流し、両 queue 満杯から全応答が完全な JSON line で戻ること、
+続く101件目にも応答することを検査した。writer が停止中の取消・EOF、writer エラー時の queue 解放、
+応答 queue 中の取消、受付前の取消 FIFO、古い権限 poll の破棄、idle 中の権限通知も成功した。
+実 pipe の新しい取消検査は、stdout を止めたまま fixture が実際の Cancel frame を受け取ることを要求する。
+DACL・integrity level の緩和、skip/ignore、製品 core/launcher 起動、通常 APPDATA 使用、snapshot 更新、
+test-full、commit は行っていない。今回の full-trust 結果は未受領。
+実 pipe gate が未成立のため `build-dev.ps1` は実行していない。
+
+### Round 3 の sandbox 外再検証コマンド (ClaudeCode 担当)
+
+```powershell
+Set-Location G:\home\mimageviewer-mcp
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_level/) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(=remote_ipc::pipe::tests::remote_pipe_dacl_has_one_current_user_ace)'
+```
+
+通常ユーザーの full-trust context で上記全体を実行し、新規 blocked-stdout 実 Cancel を含む4件の
+実 pipe 経路も確認する。core/launcher の製品バイナリは起動しない。stdio 結合検査は許可済みの
+MCP adapter と使い捨て fixture のみを起動する。

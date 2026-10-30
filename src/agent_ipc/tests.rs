@@ -26,6 +26,7 @@ impl Fixture {
             ),
             session: None,
             active: AtomicUsize::new(0),
+            search_hooks: None,
         });
         Self {
             _dir: dir,
@@ -210,52 +211,105 @@ fn admission_cancel_disconnect_and_slot_lifetime() {
 
 #[test]
 fn deadline_returns_partial_without_releasing_the_running_worker_slot() {
-    let f = Fixture::new();
+    let mut f = Fixture::new();
+    f.seed_index();
+    let start = Instant::now();
+    let elapsed_seconds = Arc::new(AtomicUsize::new(0));
+    let clock_elapsed = elapsed_seconds.clone();
+    let (started, workers_started) = crossbeam_channel::unbounded();
+    let (release, worker_gate) = crossbeam_channel::unbounded();
+    Arc::get_mut(&mut f.handlers).unwrap().search_hooks = Some(Arc::new(SearchHooks {
+        now: Box::new(move || {
+            start + Duration::from_secs(clock_elapsed.load(Ordering::Acquire) as u64)
+        }),
+        worker: Box::new(move |query, favorite_ids, cancel, tx| {
+            assert_eq!(query, "cat");
+            assert_eq!(favorite_ids.len(), 1, "search must load live favorites");
+            tx.send(crate::global_search::SearchStreamEvent::Batch {
+                hits: vec![crate::global_search::GlobalHit {
+                    path: "C:/fixture/cat0.png".into(),
+                    score: 1.,
+                    stars: 0,
+                    mtime: 0,
+                    file_size: Some(0),
+                }],
+                scanned_candidates: 1,
+                valid_hits: 1,
+                visibility_notice: None,
+            })
+            .unwrap();
+            started.send(cancel.clone()).unwrap();
+            // Mimic an in-flight synchronous Tantivy page: cancellation is
+            // requested at the deadline, but the worker cannot return yet.
+            worker_gate.recv_timeout(Duration::from_secs(10)).unwrap();
+        }),
+    }));
     let a = f.connection();
     let b = f.connection();
-    let (permit, cancel) = a.acquire(10).unwrap();
-    let (other, _) = b.acquire(11).unwrap();
+    let c = f.connection();
     let (tx, rx) = crossbeam_channel::unbounded();
-    tx.send(crate::global_search::SearchStreamEvent::Batch {
-        hits: vec![crate::global_search::GlobalHit {
-            path: "C:/cat.png".into(),
-            score: 1.,
-            stars: 0,
-            mtime: 0,
-            file_size: Some(0),
-        }],
-        scanned_candidates: 1,
-        valid_hits: 1,
-        visibility_notice: None,
-    })
-    .unwrap();
-    let start = Instant::now();
-    let calls = AtomicUsize::new(0);
-    let (items, truncated) =
-        collect_search(&rx, &cancel, 50, start + Duration::from_secs(20), || {
-            if calls.fetch_add(1, Ordering::Relaxed) < 2 {
-                start
-            } else {
-                start + Duration::from_secs(20)
-            }
+    let controllers: Vec<_> = [&a, &b]
+        .into_iter()
+        .enumerate()
+        .map(|(index, connection)| {
+            connection
+                .request(
+                    Request {
+                        id: 10 + index as u64,
+                        command: Command::SearchItems {
+                            query: "cat".into(),
+                            kind: Some(ItemKind::Image),
+                            limit: Some(50),
+                            cursor: None,
+                        },
+                    },
+                    tx.clone(),
+                )
+                .expect("real request controller")
         })
-        .unwrap();
-    assert_eq!(items.len(), 1);
-    assert!(truncated);
+        .collect();
+    let cancels: Vec<_> = (0..2)
+        .map(|_| {
+            workers_started
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+        })
+        .collect();
+    // Both deadlines were captured before these workers started. Whether their
+    // queued batches were consumed before the deadline does not affect slot ownership.
+    elapsed_seconds.store(20, Ordering::Release);
+    let mut response_ids = Vec::new();
+    for _ in 0..2 {
+        let response = rx.recv_timeout(Duration::from_secs(10)).unwrap().wire();
+        response_ids.push(response.id);
+        let Payload::Items(page) = response.result.unwrap() else {
+            panic!("expected a partial search response")
+        };
+        assert!(page.items.len() <= 1);
+        if let Some(item) = page.items.first() {
+            assert_eq!(item.path, "C:/fixture/cat0.png");
+        }
+        assert!(page.truncated);
+    }
+    response_ids.sort();
+    assert_eq!(response_ids, [10, 11]);
+    assert!(cancels.iter().all(|cancel| cancel.load(Ordering::Acquire)));
     assert_eq!(f.handlers.active.load(Ordering::Acquire), 2);
+    assert!(controllers.iter().all(|worker| !worker.is_finished()));
     assert_eq!(
-        f.call(&a, 12, Command::Status).result.unwrap_err().code,
+        f.call(&c, 12, Command::Status).result.unwrap_err().code,
         ErrorCode::Busy
     );
-    cancel.store(true, Ordering::Release);
-    assert_eq!(
-        collect_search(&rx, &cancel, 50, start + Duration::from_secs(20), || start)
-            .unwrap_err()
-            .code,
-        ErrorCode::Cancelled
-    );
-    drop(permit);
-    drop(other);
+    for _ in 0..2 {
+        release.send(()).unwrap();
+    }
+    for controller in controllers {
+        controller.join().unwrap();
+    }
+    assert_eq!(f.handlers.active.load(Ordering::Acquire), 0);
+    assert!(a.running.lock().unwrap().is_none());
+    assert!(b.running.lock().unwrap().is_none());
+    assert!(f.call(&c, 13, Command::Status).result.is_ok());
 }
 
 #[test]

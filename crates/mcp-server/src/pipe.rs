@@ -33,7 +33,9 @@ impl Drop for WriterLease {
 impl CallControl {
     /// Never wait for a pipe write on the stdin/event-loop thread (including EOF).
     pub fn cancel(self: &Arc<Self>) {
-        self.cancelled.store(true, Ordering::Release);
+        if self.cancelled.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let control = self.clone();
         std::thread::spawn(move || control.write_cancel());
     }
@@ -232,6 +234,17 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld() {
+        for cancel_hello in [true, false] {
+            real_pipe_fixture(cancel_hello, false);
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked() {
+        real_pipe_fixture(false, true);
+    }
+    #[cfg(windows)]
+    fn real_pipe_fixture(cancel_hello: bool, blocked_stdout: bool) {
         use std::{
             fs::File,
             os::windows::io::{AsRawHandle, FromRawHandle},
@@ -252,7 +265,7 @@ mod tests {
             },
             core::PCWSTR,
         };
-        for cancel_hello in [true, false] {
+        {
             let temp = tempfile::tempdir().unwrap();
             let name = derive_pipe_name(temp.path(), &current_user_sid().unwrap()).unwrap();
             let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
@@ -332,6 +345,15 @@ mod tests {
                 }
             });
             let backend = PipeBackend { pipe_name: name };
+            if blocked_stdout {
+                crate::tests::run_pipe_cancel_with_blocked_stdout(
+                    Arc::new(backend),
+                    started,
+                    cancel_received,
+                );
+                server_thread.join().unwrap();
+                return;
+            }
             let control = Arc::new(CallControl::default());
             let worker_control = control.clone();
             let (done_send, done) = mpsc::channel();

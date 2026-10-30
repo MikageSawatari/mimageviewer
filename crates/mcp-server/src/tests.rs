@@ -438,7 +438,7 @@ fn stdin_owner_invokes_exit_callback_even_when_stdout_is_blocked() {
             Ok(())
         }
     }
-    for queued_messages in [0, 33] {
+    for queued_messages in [0] {
         let (input_send, input_recv) = mpsc::channel();
         let (entered_send, entered) = mpsc::channel();
         let (release_send, release) = mpsc::channel();
@@ -478,4 +478,489 @@ fn stdin_owner_invokes_exit_callback_even_when_stdout_is_blocked() {
         done.recv_timeout(Duration::from_secs(5)).unwrap();
         thread.join().unwrap();
     }
+}
+
+struct TrackedInput {
+    inner: Input,
+    reads: mpsc::Sender<()>,
+}
+impl Read for TrackedInput {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let _ = self.reads.send(());
+        self.inner.read(bytes)
+    }
+}
+struct GateOutput {
+    inner: Output,
+    entered: mpsc::Sender<()>,
+    release: Option<mpsc::Receiver<()>>,
+}
+impl Write for GateOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let Some(release) = self.release.take() {
+            self.entered.send(()).unwrap();
+            release.recv().unwrap();
+        }
+        self.inner.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+fn gated_runtime(
+    backend: Arc<dyn Backend>,
+) -> (
+    Harness,
+    mpsc::Receiver<()>,
+    mpsc::Sender<()>,
+    mpsc::Receiver<()>,
+    mpsc::Receiver<()>,
+) {
+    let (input, receiver) = mpsc::channel();
+    let (sender, output) = mpsc::channel();
+    let (done_send, done) = mpsc::channel();
+    let (entered_send, entered) = mpsc::channel();
+    let (release_send, release) = mpsc::channel();
+    let (eof_send, eof) = mpsc::channel();
+    let (read_send, reads) = mpsc::channel();
+    std::thread::spawn(move || {
+        run_stdio_with_eof(
+            TrackedInput {
+                inner: Input {
+                    receiver,
+                    current: io::Cursor::new(vec![]),
+                },
+                reads: read_send,
+            },
+            GateOutput {
+                inner: Output {
+                    sender,
+                    bytes: vec![],
+                },
+                entered: entered_send,
+                release: Some(release),
+            },
+            backend,
+            move || {
+                let _ = eof_send.send(());
+            },
+        )
+        .unwrap();
+        done_send.send(()).unwrap();
+    });
+    reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    (
+        Harness {
+            input: Some(input),
+            output,
+            done,
+        },
+        entered,
+        release_send,
+        eof,
+        reads,
+    )
+}
+pub(crate) fn run_pipe_cancel_with_blocked_stdout(
+    backend: Arc<dyn Backend>,
+    started: mpsc::Receiver<()>,
+    cancel_received: mpsc::Receiver<()>,
+) {
+    let (mut h, entered, release, _eof, reads) = gated_runtime(backend);
+    h.send(modern(1, "server/discover", json!({})));
+    reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.send(modern(
+        2,
+        "tools/call",
+        json!({"name":"miv_status","arguments":{}}),
+    ));
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}));
+    cancel_received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("core must receive Cancel while stdout is still blocked");
+    h.send(modern(3, "server/discover", json!({})));
+    release.send(()).unwrap();
+    assert_eq!(h.receive()["id"], 1);
+    assert_eq!(h.receive()["id"], 3);
+    h.close();
+    assert!(h.output.try_recv().is_err());
+}
+
+#[test]
+fn blocked_stdout_does_not_block_eager_cancellation() {
+    let (started_send, started) = mpsc::channel();
+    let (release_work, release_recv) = mpsc::channel();
+    let (mut h, entered, release_output, _eof, reads) = gated_runtime(Arc::new(Blocked {
+        started: started_send,
+        release: Mutex::new(release_recv),
+    }));
+    h.send(modern(1, "server/discover", json!({})));
+    reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.send(modern(
+        2,
+        "tools/call",
+        json!({"name":"miv_status","arguments":{}}),
+    ));
+    reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    let control = started.recv_timeout(Duration::from_secs(5)).unwrap();
+    h.send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}));
+    reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(control.cancelled.load(Ordering::Acquire));
+    release_work.send(()).unwrap();
+    h.send(modern(3, "server/discover", json!({})));
+    release_output.send(()).unwrap();
+    assert_eq!(h.receive()["id"], 1);
+    assert_eq!(h.receive()["id"], 3);
+    h.close();
+    assert!(h.output.try_recv().is_err());
+}
+
+#[test]
+fn queued_response_is_suppressed_when_cancelled_before_writer_commit() {
+    let (owner, control) = (Arc::new(Mutex::new(None)), Arc::new(CallControl::default()));
+    *owner.lock().unwrap() = Some(Active {
+        serial: 2,
+        id: json!(2),
+        modern: true,
+        phase: ActivePhase::ReplyQueued,
+        control: control.clone(),
+    });
+    let (tx, rx) = mpsc::sync_channel(32);
+    let (output_send, output) = mpsc::channel();
+    let (entered_send, entered) = mpsc::channel();
+    let (release_send, release) = mpsc::channel();
+    let writer_owner = owner.clone();
+    let writer = std::thread::spawn(move || {
+        let mut output = GateOutput {
+            inner: Output {
+                sender: output_send,
+                bytes: vec![],
+            },
+            entered: entered_send,
+            release: Some(release),
+        };
+        writer_loop(&mut output, &rx, &writer_owner).unwrap();
+    });
+    tx.send(Envelope::plain(success(json!(1), json!({}), true)))
+        .unwrap();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    tx.send(Envelope {
+        value: success(json!(2), json!({}), true),
+        request: Some((2, control)),
+    })
+    .unwrap();
+    cancel_matching(&owner, Some(&json!(2)));
+    release_send.send(()).unwrap();
+    drop(tx);
+    writer.join().unwrap();
+    assert_eq!(
+        output.recv_timeout(Duration::from_secs(5)).unwrap()["id"],
+        1
+    );
+    assert!(output.try_recv().is_err());
+    assert!(owner.lock().unwrap().is_none());
+}
+
+#[test]
+fn cancellation_received_before_admission_is_replayed_in_fifo() {
+    let owner = Arc::new(Mutex::new(None));
+    let mut session = Session::Fresh;
+    let (send, recv) = mpsc::sync_channel(32);
+    let mut serial = 0;
+    let (started_send, started) = mpsc::channel();
+    let (release, release_recv) = mpsc::channel();
+    let backend: Arc<dyn Backend> = Arc::new(Blocked {
+        started: started_send,
+        release: Mutex::new(release_recv),
+    });
+    let cancel =
+        json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}})
+            .to_string()
+            .into_bytes();
+    eager_cancel(&owner, &cancel);
+    assert!(owner.lock().unwrap().is_none());
+    assert!(
+        handle_line(
+            modern(1, "tools/call", json!({"name":"miv_status","arguments":{}}))
+                .to_string()
+                .as_bytes(),
+            &mut session,
+            &owner,
+            &backend,
+            &send,
+            &mut serial
+        )
+        .is_none()
+    );
+    let control = started.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(handle_line(&cancel, &mut session, &owner, &backend, &send, &mut serial).is_none());
+    assert!(control.cancelled.load(Ordering::Acquire));
+    release.send(()).unwrap();
+    assert!(matches!(
+        recv.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Event::Done(1, _)
+    ));
+}
+
+#[test]
+fn full_input_and_output_queues_apply_backpressure_without_exiting_or_losing_ids() {
+    let (mut h, entered, release, eof, reads) =
+        gated_runtime(Arc::new(Fixture { disabled: false }));
+    h.send(modern(1, "server/discover", json!({})));
+    reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    for id in 2..=100 {
+        h.send(modern(id, "server/discover", json!({})));
+    }
+    // With the writer stopped, these reads fill both bounded queues and leave
+    // stdin open. No queue-full condition is an EOF/process-exit instruction.
+    for _ in 0..65 {
+        reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    assert!(eof.try_recv().is_err());
+    release.send(()).unwrap();
+    for id in 1..=100 {
+        assert_eq!(h.receive()["id"], id);
+    }
+    assert!(eof.try_recv().is_err());
+    h.send(modern(101, "server/discover", json!({})));
+    assert_eq!(h.receive()["id"], 101);
+    h.close();
+}
+
+#[test]
+fn oversized_input_and_read_errors_are_not_true_eof() {
+    struct FailedInput;
+    impl Read for FailedInput {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("fixture"))
+        }
+    }
+    for input in [
+        Box::new(FailedInput) as Box<dyn Read + Send>,
+        Box::new(io::Cursor::new(vec![b'x'; MAX_LINE_BYTES as usize + 1])),
+    ] {
+        let (tx, rx) = mpsc::channel();
+        run_stdio_with_eof(
+            input,
+            io::sink(),
+            Arc::new(Fixture { disabled: false }),
+            move || {
+                let _ = tx.send(());
+            },
+        )
+        .unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+}
+
+#[test]
+fn legacy_pending_ping_and_capability_contracts() {
+    for version in &VERSIONS[1..] {
+        let mut h = Harness::new(Arc::new(Fixture { disabled: false }));
+        h.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}));
+        let r = h.receive();
+        assert_eq!(r["result"]["capabilities"]["tools"]["listChanged"], true);
+        h.send(json!({"jsonrpc":"2.0","id":2,"method":"ping"}));
+        assert_eq!(h.receive()["result"], json!({}));
+        h.close();
+    }
+    let mut h = Harness::new(Arc::new(Fixture { disabled: false }));
+    h.send(modern(1, "server/discover", json!({})));
+    let r = h.receive();
+    assert!(
+        r["result"]["capabilities"]["tools"]
+            .get("listChanged")
+            .is_none()
+    );
+    h.send(modern(2, "tools/list", json!({})));
+    let r = h.receive();
+    assert_eq!(r["result"]["ttlMs"], 0);
+    assert_eq!(r["result"]["cacheScope"], "private");
+    h.close();
+}
+
+#[test]
+fn legacy_pending_ping_with_version_metadata_uses_normal_version_validation() {
+    for version in &VERSIONS[1..] {
+        let mut h = Harness::new(Arc::new(Fixture { disabled: false }));
+        h.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}));
+        h.receive();
+        let mut unsupported = modern(2, "ping", json!({}));
+        unsupported["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+            json!("2099-01-01");
+        h.send(unsupported);
+        assert_eq!(h.receive()["error"]["code"], -32022);
+        h.send(modern(3, "ping", json!({})));
+        assert_eq!(h.receive()["error"]["code"], -32601);
+        h.send(json!({"jsonrpc":"2.0","id":4,"method":"ping"}));
+        assert_eq!(h.receive()["result"], json!({}));
+        h.close();
+    }
+}
+
+struct LiveStatus {
+    enabled: std::sync::atomic::AtomicBool,
+    calls: mpsc::Sender<bool>,
+}
+impl Backend for LiveStatus {
+    fn call(&self, command: Command, _: &str, _: Arc<CallControl>) -> Result<Payload, AgentError> {
+        assert_eq!(command, Command::Status);
+        let enabled = self.enabled.load(Ordering::Acquire);
+        let _ = self.calls.send(enabled);
+        if enabled {
+            Ok(Payload::Status(StatusPayload {
+                app_version: "fixture".into(),
+                agent_level: AgentLevel::ReadOnly,
+                fts_ready: true,
+                remote_active: false,
+            }))
+        } else {
+            Err(AgentError::new(ErrorCode::Disabled, "disabled"))
+        }
+    }
+}
+#[test]
+fn idle_legacy_permission_observer_notifies_changes_and_refreshes_lists() {
+    for version in &VERSIONS[1..] {
+        let (call_send, calls) = mpsc::channel();
+        let backend = Arc::new(LiveStatus {
+            enabled: std::sync::atomic::AtomicBool::new(false),
+            calls: call_send,
+        });
+        let mut h = Harness::new(backend.clone());
+        h.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}));
+        h.receive();
+        h.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+        h.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}));
+        assert_eq!(h.receive()["result"]["tools"], json!([]));
+        while calls.try_recv().is_ok() {}
+        backend.enabled.store(true, Ordering::Release);
+        while !calls.recv_timeout(Duration::from_secs(5)).unwrap() {}
+        assert_eq!(h.receive()["method"], "notifications/tools/list_changed");
+        h.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}));
+        assert_eq!(h.receive()["result"]["tools"].as_array().unwrap().len(), 5);
+        while calls.try_recv().is_ok() {}
+        assert!(calls.recv_timeout(Duration::from_secs(5)).unwrap());
+        h.send(json!({"jsonrpc":"2.0","id":4,"method":"ping"}));
+        assert_eq!(h.receive()["id"], 4);
+        backend.enabled.store(false, Ordering::Release);
+        while calls.recv_timeout(Duration::from_secs(5)).unwrap() {}
+        assert_eq!(h.receive()["method"], "notifications/tools/list_changed");
+        h.send(json!({"jsonrpc":"2.0","id":5,"method":"tools/list"}));
+        assert_eq!(h.receive()["result"]["tools"], json!([]));
+        h.send(json!({"jsonrpc":"2.0","id":6,"method":"ping"}));
+        assert_eq!(h.receive()["id"], 6);
+        h.close();
+    }
+}
+#[test]
+fn permission_observer_discards_old_poll_after_newer_actual_observations() {
+    let (stop, _recv) = mpsc::sync_channel(1);
+    let mut observer = PermissionObserver {
+        stop,
+        revision: Arc::new(AtomicU64::new(0)),
+        effective: None,
+    };
+    assert!(observer.observe(false, None).is_none());
+    let old = observer.revision.load(Ordering::Acquire);
+    assert!(observer.observe(true, None).is_some());
+    assert!(observer.observe(false, None).is_some());
+    assert!(observer.observe(true, Some(old)).is_none());
+    assert_eq!(observer.effective, Some(false));
+    let current = observer.revision.load(Ordering::Acquire);
+    assert!(observer.observe(false, Some(current)).is_none());
+    for code in [ErrorCode::Busy, ErrorCode::NotReady, ErrorCode::Internal] {
+        assert_eq!(permission_bit(&Err(AgentError::new(code, "fixture"))), None);
+    }
+}
+
+#[test]
+fn stdout_failure_releases_full_queue_and_cancels_active_work_without_eof() {
+    struct FailedOutput {
+        entered: mpsc::Sender<()>,
+        release: Option<mpsc::Receiver<()>>,
+    }
+    impl Write for FailedOutput {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            if let Some(release) = self.release.take() {
+                self.entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "fixture stdout closed",
+            ))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let (input_send, input_recv) = mpsc::channel();
+    let (read_send, reads) = mpsc::channel();
+    let (entered_send, entered) = mpsc::channel();
+    let (release_output, release_recv) = mpsc::channel();
+    let (started_send, started) = mpsc::channel();
+    let (release_work, release_work_recv) = mpsc::channel();
+    let (done_send, done) = mpsc::channel();
+    let runtime = std::thread::spawn(move || {
+        let result = run_stdio(
+            TrackedInput {
+                inner: Input {
+                    receiver: input_recv,
+                    current: io::Cursor::new(vec![]),
+                },
+                reads: read_send,
+            },
+            FailedOutput {
+                entered: entered_send,
+                release: Some(release_recv),
+            },
+            Arc::new(Blocked {
+                started: started_send,
+                release: Mutex::new(release_work_recv),
+            }),
+        );
+        done_send.send(result).unwrap();
+    });
+    reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    input_send
+        .send(format!("{}\n", modern(1, "server/discover", json!({}))).into_bytes())
+        .unwrap();
+    reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    input_send
+        .send(
+            format!(
+                "{}\n",
+                modern(2, "tools/call", json!({"name":"miv_status","arguments":{}}))
+            )
+            .into_bytes(),
+        )
+        .unwrap();
+    reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    let control = started.recv_timeout(Duration::from_secs(5)).unwrap();
+    for id in 3..=102 {
+        input_send
+            .send(format!("{}\n", modern(id, "server/discover", json!({}))).into_bytes())
+            .unwrap();
+    }
+    for _ in 0..65 {
+        reads.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    release_output.send(()).unwrap();
+    assert_eq!(
+        done.recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert!(control.cancelled.load(Ordering::Acquire));
+    release_work.send(()).unwrap();
+    runtime.join().unwrap();
+    drop(input_send);
 }
