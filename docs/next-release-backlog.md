@@ -112,12 +112,16 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.472 フォルダツリーの幅が再起動するたびに狭くなる — 5ch >>643 (2026-10-29)
 
-- 状態: **未着手・修正対象として採用 (2026-10-29)**。修正時期は未指定。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、広げたツリー幅が再起動のたびに狭くなり、最後は一定幅になると報告。
-- 調査結果: `src/ui_folder_pane.rs::render_folder_pane` は、保存比率と現在の画面幅から初期幅を求める一方、描画後の実幅 / 現在の画面幅を毎回設定へ書き戻す。egui の `PanelState` は初回の幅を保持し、その後の `.default_size` より優先するため、初回描画後に画面幅が増えると、ツリーの実幅が変わらないまま保存比率だけが小さくなる。
+- 状態: **実装済み・実機未確認 (2026-10-30、v4.10.1 対象)**。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、広げたツリー幅が再起動のたびに狭くなり、最後は一定幅になると報告。製品起動・報告者環境での確認は未実施。
+- 原因: 修正前の `src/ui_folder_pane.rs::render_folder_pane` は、保存比率と現在の画面幅から初期幅を求める一方、描画後の実幅 / 現在の画面幅を毎回設定へ書き戻していた。egui の `PanelState` は初回の幅を保持し、その後の `.default_size` より優先するため、初回描画後に画面幅が増えると、ツリーの実幅が変わらないまま保存比率だけが小さくなる。
 - 非対話試験: 同じ Panel と幅計算を使い、毎回新しい egui Context で画面幅 1280 → 1920 の起動を繰り返すと、保存比率 0.35 からツリー幅が 448 → 299 → 199 → 180px と縮み、比率下限 0.12 で止まった。1920 → 1920 の対照条件では 672px / 0.35 を維持した。**相当する描画処理での再現であり、mIV 実画面や報告者と同じ条件での再現ではない。**
-- 起動経路の候補: `src/lib.rs` と `src/app.rs` は通常サイズで生成後、DPI・作業領域に合わせたサイズ補正や表示後の最大化を行う。ツリーの初回描画とそのサイズ変更の順序を確認する。白い画面のちらつきを防ぐ既存の起動手順を取り除く修正にはしない。
-- 方針: ユーザーが選んだ幅と、起動途中・制約下の描画幅を区別し、画面サイズの変化だけで保存する希望値が書き換わらないようにする。比率 / 実幅のどちらを設定として持つか、手動リサイズと上下限の扱いを設計時に確定する。遅延や強制リセットで症状だけを抑えない。
-- 検証: 起動と終了を繰り返す幅復元、通常 → 最大化、同一サイズの対照、手動リサイズ、DPI / 作業領域の変更、最小・最大幅を回帰する。関連: [起動時のちらつき調査](section327-startup-window-flicker-investigation.md)、`vendor/egui/src/containers/panel.rs::outer_size`。規模 / 優先度: Small〜Medium の暫定見積り / P2。
+- 起動経路: `src/lib.rs` と `src/app.rs` は通常サイズで生成後、DPI・作業領域に合わせたサイズ補正や表示後の最大化を行う。実画面での初回ツリー描画との順序は未確認。白い画面のちらつきを防ぐ既存の起動手順は変更しない。
+- 修正: `show_folder_pane_panel` に本体とテスト共通の Panel 描画・幅計算を置き、境界ハンドルの `dragged()` / `drag_stopped()` があるときだけ保存比率を更新する。`Context::read_response` で既存ハンドルを読み、vendor の変更・追加の永続状態・時間条件はない。ハンドル ID は vendored egui の親 scope + panel salt + `__resize` 規則に依存し、実ハンドルへの合成入力で検査する。設定の意味・保存形式、幅 180〜900pt（右側領域の制約あり）・比率 0.12〜0.45 の制限、既存の起動手順は維持する。
+- 変わる挙動: 起動中のサイズ補正・最大化・ウィンドウのリサイズや上下限制約だけでは保存比率を更新しない。同一起動中は egui が保持する実幅を使い、次回起動時は保存比率 × 初回描画時の画面幅から始める。
+- 回帰テスト: `cargo test -p mimageviewer --lib section1472 -- --nocapture` は修正前2成功・4失敗（RED）、修正後 **6件成功**。新しい Context での 1280 → 1920 の起動5回でも比率 0.35 を維持し、1920 → 1920 の対照、初期幅 / ウィンドウ縮小の制約、境界ドラッグと上下限、release の最終座標、その後の画面拡大、境界以外のドラッグを確認した。実画面の再起動・通常 → 最大化・DPI / 作業領域変更は未確認。
+- 自動検証: `cargo fmt` / `cargo fmt --check`、`cargo check -p mimageviewer --lib --tests --features test-script` 成功。`scripts/test-focused.ps1` は文書変更により exit 2 → `scripts/test-lib-full.ps1` は **15,069成功・1失敗・66除外（exit 100）**。本節6件と既存のモーダル中リサイズ抑止を含む関連11件は全て成功。`cargo test --test ui_snapshot` は **214件成功・PNG差分なし**、`python scripts/check_site_cards.py` は49件・違反0。`scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` は core / Remote / EPUB worker と依存DLL検査まで成功（通常profile、未起動）。仕様 §2.4・マニュアル・製品ページへ幅の記憶を反映。
+- 全件の未通過: 既存 [§1.447](#1447-ページめくりの描画テストが全件実行の高負荷時だけ落ちる--master-の全件テストで観測-2026-10-26) と同名の `ui_fullscreen::page_turn::draw_submit_tests::page_turn_mainwindow_submits_visible_vacant_leaf_both_directions`。全件では `draw_submit_tests.rs:401` の Started に対し Finished、単独再実行でも `:431` の曲面幅assertで失敗した。ツリーペインを通らない描画経路で、今回このテスト・紙めくりは無変更。実時計を使うが今回の根因は未確定。期待値・待ち・retry・ignoreは変えず、全件成功とは扱わない。全件のJUnit / ログは `target/test-lib-full/runs/20261030T112257917Z-ee4be6e8/`、単独は `target/section1472/page-turn-rerun.log`。
+- 検証環境: `MSBUILDDISABLENODEREUSE=1`。初回のtest graphは TurboJPEG の CMake/MSBuild で停止したため、このworktree内に事前ビルド済みの同一 TurboJPEG 3.1.0 static archiveを `TURBOJPEG_SOURCE=explicit` で再利用（製品のbuild設定は無変更）。LibRaw向けに通常形式のinclude pathを `CXXFLAGS` で補う。環境指定とログは `target/section1472/test-env.ps1`・同directoryの `red.log` / `green.log`。関連: [起動時のちらつき調査](section327-startup-window-flicker-investigation.md)、`vendor/egui/src/containers/panel.rs::resize_widget_id`。規模 / 優先度: Small / P2。
 
 ### 1.486 Snapshot（★固定）の固定ownerとcanonical origin / routeの単一所有
 
