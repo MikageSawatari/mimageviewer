@@ -111326,3 +111326,5 @@ fn front_popup_presentation_open_keeps_page_owner_until_the_display_target_chang
         "native commit transfers the presentation owner too"
     );
 }
+
+mod collection_return;
