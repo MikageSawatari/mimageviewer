@@ -1238,3 +1238,78 @@ HEADと現在の `touch_correlation.rs` をLF正規化し、`#[cfg(test)] mod te
 （SHA-256 `265b9a874c3986a22fcf55703d1c3dc281feb6ac6ee838428f9244e6afd72f26`）。
 今回の差分は文書と試験内の観測・assertだけなので、指示範囲の二モジュールを実行し、前節の全件／snapshot／
 auditは再実行していない。製品起動・desktop操作・確認用build・commitも行っていない。
+
+### 全件負荷でのR3 observation試験の不安定さ（2026-10-30）
+
+`flaky-661`（基点 `4b3c9da43`）で、
+`row_anchor_observation_keeps_middle_selected_row_in_both_renderers` の失敗を調査した。
+元の二作業ツリーの失敗ログは残っておらず、そのassertとの同一性は確認できない。
+以下は今回新たに採取した再現証拠である。
+
+原因はテストの待機条件の不足だった。`Driver::settled` はpane scan・hydration・詳細metadata・
+offsetの静止を確認するが、`external_rescan_pending`を待っていなかった。
+初期監視登録や通知後の走査が残ったままfixtureを追加／削除すると、次の
+`start_external_rescan_with_cause`は同sourceの既存workerへ合流し、`restart_requested`を立てる。
+observation試験はその古いworkerのreceiverを保持し、最初の返信を変更完了後の一覧と仮定していた。
+製品は古い返信の処理後に再走査するが、試験はその前に失敗していた。
+
+- 未変更の試験を16プロセス並列で80回実行し、通常CPU条件では **80成功／0失敗**。
+- 同じ16プロセスをaffinity `0xf`（4論理CPU）へ集めると **62成功／18失敗**。
+  `must adopt changed rows`、または描画前の表示順assertで失敗した。
+  例: 削除完了後の期待位置100に対し114。描画後の「上から2行」は失敗箇所ではなかった。
+- 待機・期待値を変えず診断printlnだけ加え、同じ負荷で40回実行すると **36成功／4失敗**。
+  失敗4件とも変更開始前からrescanが残っていた。
+  `target/flaky661-diagnostic/0006.log` は削除開始時 `rescan=Some((2, false))`、
+  返信時 `equal=true restart=true` の後に `must adopt changed rows`。
+  `0005.log` は追加開始時にも走査が残り、`equal=false restart=true`、表示順105／期待120だった。
+
+修正は`Driver::settled`に`external_rescan_pending.is_none()`を加えるだけとした。
+再走査はpoll内で同期的に登録されるので、その連鎖も完了してから次のfixture変更へ進む。
+fixtureのファイル変更中はApp frameを進めず、OS callbackは通知をenqueueするだけである。
+したがって変更後に明示開始し保持するreceiverは、変更完了後の走査に属する。
+別途debounceを待つ必要はない。既存の実worker・hydration・両renderer・追加／削除・行位置2・
+選択とoffsetのassert、期限、sleepは維持し、診断printlnは撤去した。製品コード・vendorは無変更。
+Sol / xhighの独立したsource／再現ログレビューも同じ原因と修正方針を確認した。
+
+反復用driverは`target/flaky661-repeat.py`、各回の全出力と件数は
+`target/flaky661-{before,before-affinity,diagnostic}/`の`*.log`／`summary.json`。
+実行は全て`MSBUILDDISABLENODEREUSE=1`、`test-script`付きのlib test binaryを使い、
+1プロセスにつき当該1試験だけを`--exact --nocapture --test-threads=1`で実行した。
+製品起動・実profile・desktop操作・commitは行わない。テストだけの変更なので確認用製品buildは不要。
+
+修正後は同じaffinity `0xf`／16プロセス並列で **160成功／0失敗**。
+`cargo check -p mimageviewer --lib --tests --features test-script`も並行し、exit0（1m00s）。
+全160ログで1試験ずつ実行したことを確認した。結果は`target/flaky661-after-affinity/summary.json`、
+checkは`target/flaky661-check{.log,-exit.txt}`。`cargo fmt`と`cargo fmt --check`は成功した。
+`scripts/test-focused.ps1 -Features test-script`は調査文書が選択不能なためexit2となり、
+指定どおり`test-lib-full.ps1 -Features test-script`へ移行した。
+
+全件は **15,201成功／assert失敗8／timeout1／skipped66、exit100**（1145.078s）。
+`scroll_661::`は **27成功／0失敗／既存ignore 1**。対象のobservation試験も成功（12.457s）。
+ignoreは既存の`retired_secondary_touch_move_cannot_drive_a_new_mouse_capture`で、今回追加・変更していない。
+全件gateの成功とは扱わない。
+run `985a08fc-40e7-4116-8b63-be4dc65c9c03`、JUnitと全ログは
+`target/test-lib-full/runs/20261030T130757553Z-8256c58e/`、
+コマンドexit記録は`target/flaky661-lib-full-exit.txt`。
+実行中、別のnextestプロセスも並行稼働していることを観測した（起動元は未確認）。
+
+変更対象外の失敗は次のとおり。
+
+- `video::tests::real_decoder_eof_full_loop_preserves_single_tail_burst_per_epoch`:
+  `tail10ms.mkv rate=48000 serial=2`、burst回数2／期待1。
+- `app::rar_archive_cache_tests`の4件: fixture初回表示がsettleせず、`rar_archive_cache_tests.rs:118`。
+- `app::tests::still_window_mode_key_tests`のRemote取得2件: `AcquiringRemote`／期待`RemoteActive`。
+- `ui_fullscreen::page_turn::draw_submit_tests::page_turn_mainwindow_submits_visible_vacant_leaf_both_directions`:
+  `old9 must remain visible outside the growing black leaf`。
+- `app::folder_scan::section1375_scan_perf_tests::section1375_large_physical_scan_10k_100k`:
+  nextestの600秒上限（600.493s）でtimeout。製品のassert失敗とは区別し、再実行していない。
+
+assert失敗8件は、全件完走後、同じbinary・featureで各1回だけ直列実行し **8成功／0失敗**。
+全件の失敗を取り消す証拠とは扱わず、対象外コード・期待値・期限は変更しなかった。
+正確なテスト名・各回のexit・時間・全出力は`target/flaky661-isolated/summary.json`と`01.log`〜`08.log`。
+直列確認driverは`target/flaky661-isolate-failures.py`。
+
+最終Rust差分は待機条件1行と理由コメント3行だけで、独立した限定再確認もACCEPT・未解決所見なし。
+反復・check・全件後の対象source SHA-256はすべて
+`ad8fd70967a81ba634c5d9c62070659df07a6ef51a5c045e4ac6d6ea69108561`で一致する。
+最後の文書更新は検証結果の追記のみ。コミットと製品起動はしていない。
