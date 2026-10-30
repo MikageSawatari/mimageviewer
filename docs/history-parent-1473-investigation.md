@@ -587,7 +587,9 @@ markerが見つからない場合は、下記補足に従って同じtyped desti
 
 `RecordedEntrance` の場合（cursor操作には完全なoriginから導出したentryを使う）:
 
-1. 現rootのvisitに属するBack内のroot markerを境界とする。同じ合成pathの別の入場を境界にしない。
+1. 現rootのvisitに属するBack内の**最初の**root markerを境界とし、その手前だけから場所とrouteが一致する入口を探す。
+   同visitのmarkerがBackに無い場合は、現在表示中のrootを境界としてBack内を探す（入場直後や通常Backで自己markerを消費済みの場合）。
+   入場後に同じ場所・routeへ再訪しても入口候補にしない。同じ合成pathの別の入場を境界にしない。
    本/実子孫の往復で境界より後ろに積まれたentryを、仮cursor上でBackした順に扱う。
 2. 仮currentと同じvisitのrootが直ちに現れる場合は自己markerとして消費し、rootを再loadしない。
    この消費では仮currentのroot/routeを古いmarkerで上書きしない。Forwardへ残すのは現在表示中のrootである。
@@ -1156,3 +1158,48 @@ JUnitから抽出した§1.473の**53件は全成功**。元のroot60条件/Tag4
 今回のユーザー指定範囲はtest-lib-fullまでであり、workspace/vendor/doc gateは追加実行していない。
 関連仕様・キー仕様・Snapshot設計の例外・マニュアル2ページ・backlog§1.473/§1.486・detached§11を更新した。
 製品起動・desktop操作・利用者の設定/実データの変更・確認用build・コミットは行っていない。
+
+### 実装レビュー修正（`c494cb0b9`へのP2・P3、2026-10-30）
+
+P2の原因は、`FolderHistoryPlan::reading_history_root_exit`がBack全体から最後の同location・同routeを
+入口としていたこと。`Path(O)`と、閲覧履歴への帰路を持つ`Physical(O)`も場所の同値判定では一致する。
+`O → H → O → ★一覧 → 親でO → 親でH`では、入場後の再訪を入口として誤認し、
+最初の入口と自己markerをBackに残してしまう。
+
+検索範囲を、Backにある**最初の現visit root markerの手前**に限定する。
+同visit markerがBackに無い場合は、表示中のrootを境界としてBack全体を対象にする。
+境界前に入口が見つからない場合は、承認済みの通常Direct退出を使う。
+別visitを境界にせず、新しいfield・履歴の推定・guardは加えない。
+退出先のpayload、prepare/adoption、通常の1件Back/Forward、contextとdetachedの所有範囲は変えない。
+
+追加回帰:
+
+- `section1473_root_exit_plan_excludes_equal_revisits_after_first_own_marker`:
+  同場所・同routeの再訪1回/複数回と、入口が欠落して再訪だけ残ったDirectを検査する。
+  計画の元/currentおよびBack/Forward全文を比較する。
+- `section1473_equal_entrance_revisit_via_rating_keeps_complete_back_forward`:
+  通常版/portable相当の一時data_dirで上記の実handler往復を通す。
+  最終退出前の`H / [X,O,H,Physical(O)] / [F]`から、
+  `O / [X] / [F,H,Physical(O),H]`への全履歴遷移を検査する。
+
+P3は`docs/spec.md`の親ボタンとBS仕様へ、入口/DriveListへの退出、タグの共通解決、
+★固定からMenuで開いた閲覧履歴の限定解除と親ボタンdisabledの例外を反映した。
+
+修正前の追加2件はいずれも期待どおりBack全文の比較で失敗（exit 100、
+`target/section1473-review-red.log`）。修正後の§1.473絞り込みは**55件全成功**（57.278s、
+`target/section1473-review-targeted.log`）。限定独立レビュー（GPT-6.1 Sol / xhigh、読み取り専用）も
+P2・P3解消、追加指摘なし。設計からの逸脱・操作制限・新しい復元経路はない。
+
+| 再検証コマンド（Cargoは全て`MSBUILDDISABLENODEREUSE=1`） | 結果・証拠 |
+| --- | --- |
+| `cargo fmt`（引数なし） | exit 0 |
+| `scripts/test-focused.ps1` | 文書を含むためexit 2、`target/section1473-review-focused.log`。全libraryへ進んだ |
+| `scripts/test-lib-full.ps1` | **exit 0、14,967成功・失敗0・既存skip65**、581.272s、`target/section1473-review-lib-full.log` |
+| `cargo run --locked -p viewer_context_audit` | **exit 0・違反0**、`target/section1473-review-context-audit.log`。新しい公開APIはなく登録追加不要 |
+| `git diff --check` | exit 0 |
+
+全libraryのJUnitと台帳の件数・exitを照合し、§1.473の55件も全成功と確認した。
+実行ログ/JUnitは`target/test-lib-full/runs/20261030T043858389Z-c46bbbe8/`、
+成功台帳は`target/test-lib-full/b45dd14c9b8efc1ec7447d9773427d221413c17f144d1e5f4bfccc2c526e043e.json`。
+検証後の変更はこの結果記録のみ。製品起動・desktop操作・利用者設定/実データの変更・
+確認用build・コミットは行っていない。

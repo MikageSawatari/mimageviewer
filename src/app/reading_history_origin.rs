@@ -379,15 +379,19 @@ impl FolderHistoryPlan {
         let ReadingHistoryExit::RecordedEntrance(_) = &root.exit else {
             return (None, origin);
         };
-        let Some(stop) = back.iter().rposition(|entry| {
+        let same_visit = |entry: &FolderNavHistoryEntry| {
+            matches!(&entry.location,
+            FolderNavHistoryTarget::ReadingHistory(marker) if marker.visit == root.visit)
+        };
+        // A later visit to the entrance (including an equivalent Physical target) belongs
+        // to this visit's suffix, not to its entrance. The first own root marker bounds
+        // that suffix; without one, the currently visible root is the boundary.
+        let boundary = back.iter().position(&same_visit).unwrap_or(back.len());
+        let Some(stop) = back[..boundary].iter().rposition(|entry| {
             App::folder_nav_targets_eq(&entry.location, &destination.location)
                 && entry.route == destination.route
         }) else {
             return (None, origin);
-        };
-        let same_visit = |entry: &FolderNavHistoryEntry| {
-            matches!(&entry.location,
-            FolderNavHistoryTarget::ReadingHistory(marker) if marker.visit == root.visit)
         };
         let mut plan = Self {
             previous: Some(current.clone()),
@@ -542,6 +546,43 @@ mod tests {
                 result_forward,
             );
         }
+    }
+
+    #[test]
+    fn section1473_root_exit_plan_excludes_equal_revisits_after_first_own_marker() {
+        let o = origin("O");
+        let root = make_root(
+            16,
+            ReadingHistoryExit::RecordedEntrance(Box::new(o.clone())),
+        );
+        let h = history(&root, "H");
+        let entrance = entry(&o);
+        for suffix in [
+            vec![h.clone(), entrance.clone()],
+            vec![h.clone(), entrance.clone(), h.clone(), entrance.clone()],
+        ] {
+            let mut back = vec![folder("X"), entrance.clone()];
+            back.extend(suffix.clone());
+            let mut forward = vec![folder("F"), h.clone()];
+            forward.extend(suffix.into_iter().rev());
+            assert_plan(
+                &root,
+                h.clone(),
+                back,
+                vec![folder("F")],
+                vec![folder("X")],
+                forward,
+            );
+        }
+        // An equal revisit cannot replace an entrance that fell out of the bounded stack.
+        let back = vec![folder("X"), h.clone(), entrance];
+        let forward = vec![folder("F")];
+        let (plan, actual) =
+            FolderHistoryPlan::reading_history_root_exit(h, &back, &forward, None, &root);
+        assert!(plan.is_none());
+        assert_eq!(actual, o);
+        assert_eq!(back, vec![folder("X"), history(&root, "H"), entry(&o)]);
+        assert_eq!(forward, vec![folder("F")]);
     }
 
     #[test]

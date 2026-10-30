@@ -1279,6 +1279,59 @@ fn nested_rating_history_case(portable: bool, roundtrip: bool, physical_child: b
 }
 
 #[test]
+fn section1473_equal_entrance_revisit_via_rating_keeps_complete_back_forward() {
+    for portable in [false, true] {
+        let mut app = setup(portable);
+        configure(&mut app);
+        let (origin, kind) = fixture(&mut app, "folder");
+        app.load_folder(origin.clone());
+        settle(&mut app);
+        let previous = app.tmp.path().join("previous");
+        std::fs::create_dir_all(&previous).unwrap();
+        app.push_nav_history_entry(previous);
+        let prefix = app.folder_nav_back_stack.clone();
+        let entrance = app.folder_nav_current_entry().unwrap();
+        add_history(&app, &origin, kind);
+        enter(&mut app, Entrance::Menu);
+        let root = adopted_history_root(&app);
+        let history = app.folder_nav_current_entry().unwrap();
+        open_container_path(&mut app, &origin);
+        let revisit = app.folder_nav_current_entry().unwrap();
+        assert!(matches!(
+            &revisit.location,
+            FolderNavHistoryTarget::Physical(_)
+        ));
+        assert!(App::folder_nav_targets_eq(
+            &entrance.location,
+            &revisit.location
+        ));
+        assert_eq!(entrance.route, revisit.route);
+        app.enter_rating_view(3);
+        settle(&mut app);
+        parent_and_settle(&mut app, "backspace");
+        assert_eq!(app.folder_nav_current_entry(), Some(revisit.clone()));
+        parent_and_settle(&mut app, "backspace");
+        assert_eq!(adopted_history_root(&app), root);
+        assert_eq!(app.folder_nav_current_entry(), Some(history.clone()));
+        let mut expected_back = prefix.clone();
+        expected_back.extend([entrance.clone(), history.clone(), revisit.clone()]);
+        assert_eq!(app.folder_nav_back_stack, expected_back);
+        assert!(app.folder_nav_forward_stack.is_empty());
+        let future: FolderNavHistoryEntry =
+            FolderNavHistoryTarget::Path(app.tmp.path().join("future")).into();
+        app.folder_nav_forward_stack.push(future.clone());
+        parent_and_settle(&mut app, "backspace");
+        assert_eq!(app.effective_folder(), Some(origin));
+        assert_eq!(app.folder_nav_current_entry(), Some(entrance));
+        assert_eq!(app.folder_nav_back_stack, prefix);
+        assert_eq!(
+            app.folder_nav_forward_stack,
+            vec![future, history.clone(), revisit, history]
+        );
+    }
+}
+
+#[test]
 fn section1473_nested_history_rating_preserves_both_visits() {
     for portable in [false, true] {
         for roundtrip in [false, true] {
