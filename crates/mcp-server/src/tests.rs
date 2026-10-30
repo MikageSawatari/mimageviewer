@@ -4,6 +4,51 @@ struct Input {
     receiver: mpsc::Receiver<Vec<u8>>,
     current: io::Cursor<Vec<u8>>,
 }
+
+#[test]
+fn catalog_tools_forward_and_validate_paging_arguments() {
+    for name in ["list_tags", "list_collections"] {
+        let mut arguments = json!({"limit":17,"cursor":"opaque"});
+        if name == "list_tags" {
+            arguments["choice"] = json!("all");
+        }
+        let (_, command) = parse_tool(&json!({"name":name,"arguments":arguments})).unwrap();
+        assert_eq!(
+            command,
+            if name == "list_tags" {
+                Command::ListTags {
+                    choice: TagChoice::All,
+                    limit: Some(17),
+                    cursor: Some("opaque".into()),
+                }
+            } else {
+                Command::ListCollections {
+                    limit: Some(17),
+                    cursor: Some("opaque".into()),
+                }
+            }
+        );
+        for bad in [json!(0), json!(201), json!("50")] {
+            arguments["limit"] = bad;
+            assert!(parse_tool(&json!({"name":name,"arguments":arguments})).is_err());
+        }
+        arguments["limit"] = json!(null);
+        arguments["cursor"] = json!("x".repeat(8193));
+        assert!(parse_tool(&json!({"name":name,"arguments":arguments})).is_err());
+        arguments["cursor"] = json!(null);
+        assert!(parse_tool(&json!({"name":name,"arguments":arguments})).is_ok());
+        let tool = schema::tools()
+            .into_iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap();
+        assert_eq!(tool["inputSchema"]["properties"]["limit"]["default"], 50);
+        assert_eq!(tool["inputSchema"]["properties"]["limit"]["maximum"], 200);
+        assert_eq!(
+            tool["inputSchema"]["properties"]["cursor"]["maxLength"],
+            8192
+        );
+    }
+}
 impl Read for Input {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         loop {
@@ -73,7 +118,7 @@ impl Backend for Fixture {
                 cursor: None,
                 truncated: false,
             }),
-            Command::ListCollections => Payload::Collections(CollectionPage {
+            Command::ListCollections { .. } => Payload::Collections(CollectionPage {
                 collections: vec![Collection {
                     name: "book".into(),
                     count: 1,

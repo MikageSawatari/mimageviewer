@@ -74,8 +74,8 @@ impl CollectionEngine {
     pub(super) fn agent_tags(
         &self,
         choice: mimageviewer_agent_ipc::TagChoice,
-    ) -> Result<mimageviewer_agent_ipc::TagPage, mimageviewer_agent_ipc::AgentError> {
-        use mimageviewer_agent_ipc::{AgentError, ErrorCode, Tag, TagChoice, TagPage};
+    ) -> Result<Vec<mimageviewer_agent_ipc::Tag>, mimageviewer_agent_ipc::AgentError> {
+        use mimageviewer_agent_ipc::{AgentError, ErrorCode, Tag, TagChoice};
         let settings = self
             .settings
             .load()
@@ -83,11 +83,7 @@ impl CollectionEngine {
         let path = crate::tags_db::TagsDb::db_path();
         let db = crate::agent_ipc::optional_tags(&path)?;
         let Some(db) = db else {
-            return Ok(TagPage {
-                tags: vec![],
-                cursor: None,
-                truncated: false,
-            });
+            return Ok(vec![]);
         };
         let summaries = db.tag_summaries();
         let tags: Vec<Tag> = if choice == TagChoice::All {
@@ -115,19 +111,7 @@ impl CollectionEngine {
                 })
                 .collect()
         };
-        let mut page = TagPage {
-            tags,
-            cursor: None,
-            truncated: false,
-        };
-        let original = page.tags.len();
-        page.tags
-            .truncate(mimageviewer_agent_ipc::MAX_LIMIT as usize);
-        while crate::agent_ipc::json_chars(&page) > mimageviewer_agent_ipc::MAX_PAGE_CHARS {
-            page.tags.pop();
-        }
-        page.truncated = page.tags.len() < original;
-        Ok(page)
+        Ok(tags)
     }
 
     pub(super) fn agent_tag_items(

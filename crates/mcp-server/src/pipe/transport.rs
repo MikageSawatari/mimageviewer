@@ -4,7 +4,50 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Write},
     sync::Arc,
+    time::{Duration, Instant},
 };
+
+const CONNECT_BUDGET: Duration = Duration::from_secs(2);
+const ERROR_PIPE_BUSY_CODE: i32 = 231;
+const ERROR_SEM_TIMEOUT_CODE: i32 = 121;
+
+/// Busy is an ordinary listener-reuse race. The caller's single total budget
+/// covers every WaitNamedPipe/open attempt, including contention after a wake.
+fn connect_with_budget<T>(
+    mut open: impl FnMut() -> io::Result<T>,
+    mut wait: impl FnMut(u32) -> io::Result<()>,
+    mut elapsed: impl FnMut() -> Duration,
+) -> io::Result<T> {
+    match open() {
+        Ok(stream) => return Ok(stream),
+        Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY_CODE) => {}
+        Err(error) => return Err(error),
+    }
+    loop {
+        let remaining = CONNECT_BUDGET
+            .checked_sub(elapsed())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| io::Error::from_raw_os_error(ERROR_PIPE_BUSY_CODE))?;
+        let timeout_ms = remaining.as_millis().max(1) as u32;
+        match wait(timeout_ms) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(ERROR_SEM_TIMEOUT_CODE | ERROR_PIPE_BUSY_CODE)
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        if elapsed() >= CONNECT_BUDGET {
+            return Err(io::Error::from_raw_os_error(ERROR_PIPE_BUSY_CODE));
+        }
+        match open() {
+            Ok(stream) => return Ok(stream),
+            Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY_CODE) => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct PipeStream {
@@ -14,6 +57,38 @@ pub(super) struct PipeStream {
 }
 impl PipeStream {
     pub(super) fn connect(name: &str) -> io::Result<Self> {
+        let started = Instant::now();
+        connect_with_budget(
+            || Self::open(name),
+            |timeout_ms| {
+                #[cfg(windows)]
+                {
+                    use windows::{
+                        Win32::{Foundation::GetLastError, System::Pipes::WaitNamedPipeW},
+                        core::PCWSTR,
+                    };
+                    let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+                    if unsafe { WaitNamedPipeW(PCWSTR(wide.as_ptr()), timeout_ms) }.as_bool() {
+                        Ok(())
+                    } else {
+                        Err(io::Error::from_raw_os_error(
+                            unsafe { GetLastError() }.0 as i32,
+                        ))
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = timeout_ms;
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "mIV IPC requires Windows",
+                    ))
+                }
+            },
+            || started.elapsed(),
+        )
+    }
+    fn open(name: &str) -> io::Result<Self> {
         let mut options = OpenOptions::new();
         options.read(true).write(true);
         #[cfg(windows)]
@@ -125,5 +200,114 @@ impl Write for PipeStream {
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{cell::Cell, collections::VecDeque};
+
+    #[test]
+    fn busy_connect_reuses_one_total_budget_when_another_client_wins() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut opens =
+            VecDeque::from([Err(ERROR_PIPE_BUSY_CODE), Err(ERROR_PIPE_BUSY_CODE), Ok(7)]);
+        let mut waits = vec![];
+        let result = connect_with_budget(
+            || {
+                opens
+                    .pop_front()
+                    .unwrap()
+                    .map_err(io::Error::from_raw_os_error)
+            },
+            |remaining| {
+                waits.push(remaining);
+                elapsed.set(elapsed.get() + Duration::from_millis(100));
+                Ok(())
+            },
+            || elapsed.get(),
+        )
+        .unwrap();
+        assert_eq!(result, 7);
+        assert_eq!(waits, [2000, 1900]);
+        assert!(opens.is_empty());
+    }
+
+    #[test]
+    fn busy_connect_deadline_never_restarts_and_timeout_stays_busy() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let opens = Cell::new(0);
+        let mut waits = vec![];
+        let error = connect_with_budget::<()>(
+            || {
+                opens.set(opens.get() + 1);
+                Err(io::Error::from_raw_os_error(ERROR_PIPE_BUSY_CODE))
+            },
+            |remaining| {
+                waits.push(remaining);
+                elapsed.set(if waits.len() == 1 {
+                    Duration::from_millis(1999)
+                } else {
+                    CONNECT_BUDGET
+                });
+                Err(io::Error::from_raw_os_error(ERROR_SEM_TIMEOUT_CODE))
+            },
+            || elapsed.get(),
+        )
+        .unwrap_err();
+        assert_eq!(waits, [2000, 1]);
+        assert_eq!(opens.get(), 2);
+        assert_eq!(error.raw_os_error(), Some(ERROR_PIPE_BUSY_CODE));
+    }
+
+    #[test]
+    fn nonbusy_open_and_wait_errors_are_not_retried() {
+        for code in [2, 5, 6] {
+            let error = connect_with_budget::<()>(
+                || Err(io::Error::from_raw_os_error(code)),
+                |_| panic!("only ERROR_PIPE_BUSY may wait"),
+                || panic!("nonbusy error must return immediately"),
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+            let error = connect_with_budget::<()>(
+                || Err(io::Error::from_raw_os_error(ERROR_PIPE_BUSY_CODE)),
+                |_| Err(io::Error::from_raw_os_error(code)),
+                || Duration::ZERO,
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+        assert_eq!(
+            connect_with_budget(
+                || Ok(9),
+                |_| panic!("successful open must not wait"),
+                || panic!("successful open must return immediately")
+            )
+            .unwrap(),
+            9
+        );
+    }
+
+    #[test]
+    fn wait_success_does_not_allow_open_after_deadline() {
+        let elapsed = Cell::new(Duration::ZERO);
+        let opens = Cell::new(0);
+        let error = connect_with_budget::<()>(
+            || {
+                opens.set(opens.get() + 1);
+                Err(io::Error::from_raw_os_error(ERROR_PIPE_BUSY_CODE))
+            },
+            |remaining| {
+                assert_eq!(remaining, 2000);
+                elapsed.set(CONNECT_BUDGET);
+                Ok(())
+            },
+            || elapsed.get(),
+        )
+        .unwrap_err();
+        assert_eq!(opens.get(), 1);
+        assert_eq!(error.raw_os_error(), Some(ERROR_PIPE_BUSY_CODE));
     }
 }

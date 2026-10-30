@@ -581,10 +581,11 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
 確認された前提: Remote の通常データ要求は操作権必須、指定した reader は worker から使える、
 純粋な読み取りを全 Remote phase で受けても cache 整合を壊さない、data dir はプロセス内で固定。
 
-## 14. 段階 0 の実装記録 (2026-10-30、未コミット・検証中)
+## 14. 段階 0 の実装記録 (2026-10-30、初回 `0a993c355`・追加修正済み、full-trust 検証待ち)
 
-作業先は `G:\home\mimageviewer-mcp` / `mcp-trial`。製品 core・launcher・MCP exe は起動せず、
-通常の APPDATA をテストに使わない。公開文書・配布スクリプト・Remote wire v72 は変更しない。
+作業先は `G:\home\mimageviewer-mcp` / `mcp-trial`。製品 core・launcher・インストール版は起動せず、
+通常の APPDATA をテストに使わない。MCP adapter だけは、設計担当の明示判断に従い使い捨て fixture
+への stdio 結合テストから起動する。公開文書・配布スクリプト・Remote wire v72 は変更しない。
 
 - `crates/agent-ipc`: MCP に依存しない要求・応答、独立版 v1、長さ上限つき codec。
   SID と解決済み絶対 data dir の SHA-256 (先頭 128 bit) を常に名前に含める。
@@ -612,7 +613,7 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
   blocked writer を保持したまま300ms以内に EOF / queue overflow が届くことを検査する。
 - 投影は path/subresource・name・kind・tags・rating、tag/collection の name/count だけ。
   TagItems の thumbnail/sidecar materializer は通さず、★は rating DB から別に引く。
-  item cursor は版・tool・正規化引数/順序・返却済件数を符号化し、再実行して skip する。
+  全一覧 tool の cursor は版・tool・正規化引数/順序・返却済件数を符号化し、再実行して skip する。
   core page は8,000文字を目安に制限し、MCP は structuredContent と text の重複・escaping を含む
   最終 JSON が40,000文字以内か実測する。上限超過を黙って成功にはしない。
 - ログ/perf は tool・duration・count・error kind だけ。問い合わせ文字列・結果 path は記録しない。
@@ -633,20 +634,37 @@ MCP の新旧契約は公式の [versioning](https://modelcontextprotocol.io/spe
 Windows の同時 read/write は [overlapped pipe I/O](https://learn.microsoft.com/en-us/windows/win32/ipc/synchronous-and-overlapped-input-and-output)
 の契約に従う。
 
-### 設計担当の判断待ち
+### 設計担当の決定と追加修正 (ClaudeCode、2026-10-30)
 
-1. §7 は「全 tool に既定50件・最大200件、続きはcursor」とする一方、実装 brief の
-   `ListTags{choice}` / `ListCollections` には limit/cursor が無い。現時点の両一覧は上限で
-   打ち切り、`truncated=true` を返すが、その先を要求する手段がない。要求と MCP schema に
-   limit/cursor を加えるか、段階0だけ打ち切りとするかを問い合わせ中。未承認の契約変更はしない。
-2. 実装 brief の「mimageviewer*.exe の起動禁止」と「MCP exe の stdio 結合テスト」の適用範囲。
-   `stdio_exe_uses_real_core_fixture_handlers` を作成したが、製品 exe 起動の例外が明示されるまで
-   ignored としておく。test pipe は実 core handler と使い捨てタグ・collection・FTS fixture を使い、
-   core 本体や利用者の profile を起動しない。
+1. client の再接続間隙・複数 AI アプリによる `ERROR_PIPE_BUSY` (231) は通常利用で到達する。
+   `WaitNamedPipeW` と再 open を**合計2秒**の一つの期限内で行い、期限後は Busy とする。
+   `ERROR_FILE_NOT_FOUND` (2) は NotReady、`ERROR_ACCESS_DENIED` (5) は権限拒否専用の日本語
+   (既存 ErrorCode では Internal)、その他は短い Internal として OS code だけ stderr に記録する。
+   DACL・integrity level は拡大しない。fixture の Disconnect→Connect 間隙を sleep で隠さない。
+2. `ListTags{choice, limit, cursor}` / `ListCollections{limit, cursor}` に変更する。
+   MCP schema と parser も同じ契約へ揃え、既定50件・最大200件・文字数上限・不透明 cursor を使う。
+   共通の `bounded_rows` が文字数調整後の実返却件数で cursor を進める。タグの choice/並び順、
+   collection の catalog 順を cursor の引数に含め、別条件の cursor は BadRequest にする。
+3. `stdio_exe_uses_real_core_fixture_handlers` の ignore を解除する。MCP adapter の fixture 起動は
+   許可済み。`CARGO_BIN_EXE_mimageviewer-mcp` が使えない core lib test では、Cargo の
+   `compiler-artifact.executable` から adapter を build/取得する。target/profile の推測はしない。
+   test pipe は実 core handler と使い捨てタグ・collection・FTS fixture を使い、`--data-dir` を
+   必ず明示する。core / launcher / 利用者の profile は起動しない。
 
-判断待ちは完了扱いにしない。実 core / Claude Desktop / ChatGPT からの確認も未実施。
+### ClaudeCode が sandbox 外で実行した証拠 (2026-10-30、基点 `0a993c355`)
 
-### 自動検証の証跡 (最終差分、未完了)
+以下は ClaudeCode が通常権限 full-trust context で実行し、実装担当へ報告した結果。
+実装担当がこの sandbox 内で実行した結果と混同しない。
+
+- `cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_level/) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(=remote_ipc::pipe::tests::remote_pipe_dacl_has_one_current_user_ace)'`
+  → **exit 0、15/15 成功**。idle reader の shutdown 検査も成功。前回 sandbox での OS 5 は
+  restricted token によるもので、core の製品欠陥ではないと設計担当が確認した。
+- `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored`
+  → **exit 101**。probe 接続は成功したが、再接続の client open が ERROR_PIPE_BUSY となり、
+  `real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld` が失敗した。
+  上記1の修正はこの通常利用の不具合への対応である。修正後の full-trust 成功は別の gate とする。
+
+### 初回試験の自動検証の証跡 (基点 `0a993c355`、履歴)
 
 MCP の既定 data dir は、GUI/native 依存を console exe に持ち込まないため、通常版の
 `data_dir::flavor_default` の `%APPDATA%/mimageviewer` (未設定時は `./mimageviewer`) を
@@ -680,6 +698,49 @@ root の実行 token は `OpenProcessToken(TOKEN_QUERY)` / `IsTokenRestricted` �
 その途中差分の焦点8件は exit 0 (`target/agent-focused-tests-r3.log`) だが、上表の最終結果で置き換える。
 MCP 担当側の IPC 6 / MCP 12 成功 (各 exit 0) もあるが、root の再実行失敗を打ち消す証拠とはしない。
 
-stdio exe 結合テストは作成済み・未実行 (ignored)。製品 exe 起動・通常 APPDATA へのテスト・
-snapshot 更新・test-full・commit は行っていない。検証未完了と設計判断待ちのため、確認用
-`build-dev.ps1` も未実行。配布・検収可能な完成状態とは扱わない。
+初回試験では stdio exe 結合テストは ignored・未実行、確認用 `build-dev.ps1` も未実行だった。
+commit は ClaudeCode が `0a993c355` として作成した。実装担当は commit していない。
+通常 APPDATA へのテスト・snapshot 更新・test-full は実施していない。
+実 core / Claude Desktop / ChatGPT からの確認は別の受入れ gate に残る。
+
+### 追加修正後の検証 (実装担当が sandbox 内で実行、未コミット差分)
+
+| コマンド | 実 exit code / 結果 | ログ |
+|---|---|---|
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | `target/mcp-followup-core-check.log` |
+| `cargo check -p mimageviewer-mcp --bin mimageviewer-mcp` | 0 | `target/mcp-followup-mcp-check.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 101。IPC 6成功、MCP 17成功/1失敗、ignored 0 | `target/mcp-followup-crates-final.log` |
+| 下記の焦点 nextest | 100。18実行、16成功/2失敗 | `target/mcp-followup-focused.log` |
+| `cargo build -p mimageviewer-mcp --bin mimageviewer-mcp --message-format=json` | 0。Cargo が adapter の executable artifact を報告 | `target/mcp-followup-adapter-artifacts.jsonl` / `target/mcp-followup-adapter-build.log` |
+| `cargo fmt` → `cargo fmt --check` | 0。全 workspace | tool 実行記録 |
+| `python scripts/check_ui_glyphs.py` / `git diff --check` | 各0 | tool 実行記録 |
+
+接続エラー分類と Busy 残予算の5件、MCP schema/parser のページ引数検査が成功した。
+core 側では205件のタグ・collection を既定50件から継続して最後まで取得する検査、choice/tool が
+異なる cursor の拒否、文字数調整後の実返却件数と cursor の検査も成功した。
+独立レビューは追加差分の接続予算・エラー分類・共通ページ境界・fixture adapter 解決を確認し、
+追加の P1/P2 はなかった。実 pipe 成功をそのレビューで代替してはいない。
+
+残る失敗は次の3件。制限 token の回避や skip/ignore は追加していない。
+
+- MCP: `pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld`
+  は client の preflight open で OS 5。
+- core: `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`
+  は client open で OS 5。基点の同検査は ClaudeCode の full-trust 実行で成功済み。
+- core: `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`
+  は fixture pipe の作成で OS 5。今回は adapter の起動まで到達しなかった。
+
+adapter だけはビルド済み。core/launcher の起動、通常 APPDATA での実行、snapshot 更新、test-full、
+commit は行っていない。実 pipe の最終 gate が未成立のため `build-dev.ps1` は未実行。
+
+### ClaudeCode が通常権限 full-trust context で実行する最終コマンド
+
+```powershell
+Set-Location G:\home\mimageviewer-mcp
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_level/) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(=remote_ipc::pipe::tests::remote_pipe_dacl_has_one_current_user_ace)'
+```
+
+後者には ignore を外した stdio 結合検査が含まれる。必要な adapter の build/パス解決は検査内で
+Cargo artifact を通して行い、起動先には使い捨て fixture の `--data-dir` を渡す。
+成功を確認するのは上記3件の実 pipe 経路を含む両コマンド全体。sandbox 外の最新結果は未受領。

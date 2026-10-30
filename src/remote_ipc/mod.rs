@@ -73,7 +73,7 @@ impl SharedReaders {
     pub(crate) fn agent_tags(
         &self,
         choice: mimageviewer_agent_ipc::TagChoice,
-    ) -> Result<mimageviewer_agent_ipc::TagPage, mimageviewer_agent_ipc::AgentError> {
+    ) -> Result<Vec<mimageviewer_agent_ipc::Tag>, mimageviewer_agent_ipc::AgentError> {
         self.collections.agent_tags(choice)
     }
 

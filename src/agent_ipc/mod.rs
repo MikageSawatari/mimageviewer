@@ -315,7 +315,7 @@ fn tool_name(command: &Command) -> &'static str {
         Command::SearchItems { .. } => "search_items",
         Command::ListTags { .. } => "list_tags",
         Command::ItemsByTag { .. } => "items_by_tag",
-        Command::ListCollections => "list_collections",
+        Command::ListCollections { .. } => "list_collections",
         Command::Cancel { .. } => "cancel",
     }
 }
@@ -367,7 +367,30 @@ impl Handlers {
                     s.snapshot().phase != crate::remote_ipc::session::RemoteControlPhase::Local
                 }),
             })),
-            Command::ListTags { choice } => self.readers.agent_tags(choice).map(Payload::Tags),
+            Command::ListTags {
+                choice,
+                limit,
+                cursor,
+            } => {
+                let args = serde_json::json!([choice, "tag_menu_order"]);
+                let offset = decode_cursor(cursor.as_deref(), "list_tags", &args)?;
+                let limit = limit_value(limit)?;
+                let tags = self.readers.agent_tags(choice)?;
+                let more = tags.len() > offset + limit;
+                let (tags, cursor, truncated) = bounded_rows(
+                    tags.into_iter().skip(offset).take(limit).collect(),
+                    offset,
+                    more,
+                    "list_tags",
+                    args,
+                    "tags",
+                )?;
+                Ok(Payload::Tags(TagPage {
+                    tags,
+                    cursor,
+                    truncated,
+                }))
+            }
             Command::ItemsByTag {
                 tag,
                 kind,
@@ -384,13 +407,23 @@ impl Handlers {
                         .agent_tag_items(tag, kind, offset + limit + 1, cancel)?;
                 page(items, offset, limit, truncated, "items_by_tag", args).map(Payload::Items)
             }
-            Command::ListCollections => self.collections(cancel).map(Payload::Collections),
+            Command::ListCollections { limit, cursor } => self
+                .collections(limit, cursor, cancel)
+                .map(Payload::Collections),
             Command::Cancel { .. } | Command::SearchItems { .. } => unreachable!(),
         })();
         (result, None)
     }
 
-    fn collections(&self, cancel: &AtomicBool) -> Result<CollectionPage, AgentError> {
+    fn collections(
+        &self,
+        limit: Option<u32>,
+        cursor: Option<String>,
+        cancel: &AtomicBool,
+    ) -> Result<CollectionPage, AgentError> {
+        let args = serde_json::json!(["catalog_order"]);
+        let offset = decode_cursor(cursor.as_deref(), "list_collections", &args)?;
+        let limit = limit_value(limit)?;
         let lease = self
             .producer
             .as_ref()
@@ -403,12 +436,9 @@ impl Handlers {
             .recv()
             .map_err(|_| internal())?
             .map_err(|_| internal())?;
-        let mut page = CollectionPage {
-            collections: Vec::new(),
-            cursor: None,
-            truncated: false,
-        };
-        for definition in catalog.definitions.iter() {
+        let more = catalog.definitions.len() > offset + limit;
+        let mut collections = Vec::new();
+        for definition in catalog.definitions.iter().skip(offset).take(limit) {
             if cancel.load(Ordering::Relaxed) {
                 return Err(cancelled());
             }
@@ -419,17 +449,24 @@ impl Handlers {
                 .recv()
                 .map_err(|_| internal())?
                 .map_err(|_| internal())?;
-            page.collections.push(Collection {
+            collections.push(Collection {
                 name: definition.name.clone(),
                 count: snapshot.entries.len() as u64,
             });
-            if page.collections.len() > MAX_LIMIT as usize || json_chars(&page) > MAX_PAGE_CHARS {
-                page.collections.pop();
-                page.truncated = true;
-                break;
-            }
         }
-        Ok(page)
+        let (collections, cursor, truncated) = bounded_rows(
+            collections,
+            offset,
+            more,
+            "list_collections",
+            args,
+            "collections",
+        )?;
+        Ok(CollectionPage {
+            collections,
+            cursor,
+            truncated,
+        })
     }
 
     fn search(
@@ -713,21 +750,49 @@ fn page(
     args: serde_json::Value,
 ) -> Result<ItemPage, AgentError> {
     let total = items.len();
-    let mut page = ItemPage {
-        items: items.into_iter().skip(offset).take(limit).collect(),
-        cursor: None,
-        truncated: source_truncated || total > offset + limit,
-    };
-    enrich(&mut page.items)?;
+    let mut items = items
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    enrich(&mut items)?;
+    let (items, cursor, truncated) = bounded_rows(
+        items,
+        offset,
+        source_truncated || total > offset + limit,
+        tool,
+        args,
+        "items",
+    )?;
+    Ok(ItemPage {
+        items,
+        cursor,
+        truncated,
+    })
+}
+
+/// One character/cursor boundary for every paginated projection. The cursor
+/// advances by the rows actually returned, including a character-limited page.
+fn bounded_rows<T: Serialize>(
+    mut rows: Vec<T>,
+    offset: usize,
+    mut truncated: bool,
+    tool: &str,
+    args: serde_json::Value,
+    field: &str,
+) -> Result<(Vec<T>, Option<String>, bool), AgentError> {
     loop {
-        page.cursor = (page.truncated && !page.items.is_empty())
-            .then(|| encode_cursor(tool, args.clone(), offset + page.items.len()));
-        if json_chars(&page) <= MAX_PAGE_CHARS {
-            return Ok(page);
+        let cursor = (truncated && !rows.is_empty())
+            .then(|| encode_cursor(tool, args.clone(), offset + rows.len()));
+        if json_chars(
+            &serde_json::json!({ (field): &rows, "cursor": &cursor, "truncated": truncated }),
+        ) <= MAX_PAGE_CHARS
+        {
+            return Ok((rows, cursor, truncated));
         }
-        page.items.pop();
-        page.truncated = true;
-        if page.items.is_empty() {
+        rows.pop();
+        truncated = true;
+        if rows.is_empty() {
             return Err(error(
                 ErrorCode::BadRequest,
                 "項目が応答の上限を超えています",

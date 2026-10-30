@@ -140,6 +140,8 @@ fn permission_is_live_and_handshake_is_strict() {
         Command::Status,
         Command::ListTags {
             choice: TagChoice::All,
+            limit: None,
+            cursor: None,
         },
         Command::Cancel { request_id: 3 },
     ] {
@@ -380,11 +382,47 @@ fn fts_fixture_search_uses_live_favorites_and_has_cursor() {
     assert!(other.items.is_empty());
 }
 
-/// This one test launches the MCP console adapter only, never the product core.
-/// It is kept separate because this implementation brief prohibits all product exe launches.
+/// Cargo exposes CARGO_BIN_EXE only to the package that owns a binary. This
+/// core-library test instead resolves the adapter from Cargo's executable
+/// artifact, so custom target directories/profiles cannot select a stale guess.
+#[cfg(windows)]
+fn mcp_fixture_executable() -> std::path::PathBuf {
+    if let Some(exe) = option_env!("CARGO_BIN_EXE_mimageviewer-mcp") {
+        return exe.into();
+    }
+    let build = std::process::Command::new(env!("CARGO"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args([
+            "build",
+            "-p",
+            "mimageviewer-mcp",
+            "--bin",
+            "mimageviewer-mcp",
+            "--message-format=json",
+        ])
+        .output()
+        .expect("build the fixture-only MCP adapter");
+    assert!(
+        build.status.success(),
+        "MCP fixture build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    String::from_utf8(build.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|message| {
+            message["reason"] == "compiler-artifact"
+                && message["target"]["name"] == "mimageviewer-mcp"
+                && message["executable"].is_string()
+        })
+        .and_then(|message| message["executable"].as_str().map(std::path::PathBuf::from))
+        .expect("Cargo must report the MCP adapter's executable artifact")
+}
+
+/// Launches only the authorized console adapter against disposable core fixtures.
 #[cfg(windows)]
 #[test]
-#[ignore = "requires explicit approval to launch the MCP exe against disposable fixtures"]
 fn stdio_exe_uses_real_core_fixture_handlers() {
     use serde_json::json;
     use std::io::{BufRead, Write};
@@ -395,7 +433,7 @@ fn stdio_exe_uses_real_core_fixture_handlers() {
     let mut tags = crate::tags_db::TagsDb::open().unwrap();
     tags.set_item_tags(
         &crate::tags_db::item_key_for_path(&path),
-        ["cat"],
+        ["cat", "dog", "fox"],
         crate::tags_db::source::EDIT,
     )
     .unwrap();
@@ -408,15 +446,18 @@ fn stdio_exe_uses_real_core_fixture_handlers() {
         .recv()
         .unwrap()
         .unwrap();
+    f.runtime
+        .as_ref()
+        .unwrap()
+        .client()
+        .create_collection("second collection".into())
+        .unwrap()
+        .recv()
+        .unwrap()
+        .unwrap();
     // The real core handler, Connection admission, wire codec and pipe transport are used.
     let server = super::pipe::fixture_server(f.handlers.clone()).unwrap();
-    let exe = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("mimageviewer-mcp.exe");
+    let exe = mcp_fixture_executable();
     struct ChildGuard(std::process::Child);
     impl Drop for ChildGuard {
         fn drop(&mut self) {
@@ -451,9 +492,9 @@ fn stdio_exe_uses_real_core_fixture_handlers() {
     let meta = json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}});
     for (id, name, arguments) in [
         (1, "miv_status", json!({})),
-        (2, "list_tags", json!({"choice":"all"})),
+        (2, "list_tags", json!({"choice":"all","limit":1})),
         (3, "items_by_tag", json!({"tag":"cat"})),
-        (4, "list_collections", json!({})),
+        (4, "list_collections", json!({"limit":1})),
         (5, "search_items", json!({"query":"cat","limit":2})),
     ] {
         writeln!(input, "{}", json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments,"_meta":meta}})).unwrap();
@@ -476,6 +517,43 @@ fn stdio_exe_uses_real_core_fixture_handlers() {
             }
             "search_items" => assert_eq!(structured["items"].as_array().unwrap().len(), 2),
             _ => unreachable!(),
+        }
+        if matches!(name, "list_tags" | "list_collections") {
+            let cursor = structured["cursor"]
+                .as_str()
+                .expect("fixture must have another page");
+            let arguments = if name == "list_tags" {
+                json!({"choice":"all","limit":1,"cursor":cursor})
+            } else {
+                json!({"limit":1,"cursor":cursor})
+            };
+            writeln!(input, "{}", json!({"jsonrpc":"2.0","id":100+id,"method":"tools/call","params":{"name":name,"arguments":arguments,"_meta":meta}})).unwrap();
+            input.flush().unwrap();
+            let line = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let next: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(next["id"], 100 + id);
+            assert_eq!(next["result"]["isError"], false, "{next}");
+            let rows = if name == "list_tags" {
+                "tags"
+            } else {
+                "collections"
+            };
+            assert_eq!(
+                next["result"]["structuredContent"][rows]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_ne!(
+                next["result"]["structuredContent"][rows][0]["name"],
+                structured[rows][0]["name"]
+            );
+            let text: serde_json::Value =
+                serde_json::from_str(next["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(next["result"]["structuredContent"], text);
+            assert!(line.chars().count() <= MAX_MCP_RESPONSE_CHARS);
         }
     }
     drop(input);
@@ -561,6 +639,8 @@ fn tags_use_the_projection_and_real_rating_database() {
             2,
             Command::ListTags {
                 choice: TagChoice::All,
+                limit: None,
+                cursor: None,
             },
         )
         .result
@@ -570,9 +650,250 @@ fn tags_use_the_projection_and_real_rating_database() {
     };
     assert_eq!(page.tags[0].name, "cat");
     assert_eq!(page.tags[0].count, 1);
-    let Payload::Collections(page) = f.call(&c, 3, Command::ListCollections).result.unwrap() else {
+    let Payload::Collections(page) = f
+        .call(
+            &c,
+            3,
+            Command::ListCollections {
+                limit: None,
+                cursor: None,
+            },
+        )
+        .result
+        .unwrap()
+    else {
         panic!()
     };
     assert_eq!(page.collections[0].name, "fixture collection");
     assert_eq!(page.collections[0].count, 1);
+}
+
+#[test]
+fn tag_and_collection_pages_continue_past_200_and_validate_cursors() {
+    let f = Fixture::new();
+    let path = crate::data_dir::get().join("catalog.png");
+    std::fs::write(&path, []).unwrap();
+    let mut db = crate::tags_db::TagsDb::open().unwrap();
+    db.set_item_tags(
+        &crate::tags_db::item_key_for_path(&path),
+        (0..205).map(|i| format!("tag-{i:03}")),
+        crate::tags_db::source::EDIT,
+    )
+    .unwrap();
+    let actor = f.runtime.as_ref().unwrap().client();
+    for i in 0..205 {
+        actor
+            .create_collection(format!("collection-{i:03}"))
+            .unwrap()
+            .recv()
+            .unwrap()
+            .unwrap();
+    }
+    let c = f.connection();
+    let Payload::Tags(first) = f
+        .call(
+            &c,
+            1,
+            Command::ListTags {
+                choice: TagChoice::All,
+                limit: None,
+                cursor: None,
+            },
+        )
+        .result
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(first.tags.len(), DEFAULT_LIMIT as usize);
+    assert!(first.truncated);
+    let tag_cursor = first.cursor.clone().unwrap();
+    let Payload::Tags(second) = f
+        .call(
+            &c,
+            2,
+            Command::ListTags {
+                choice: TagChoice::All,
+                limit: Some(MAX_LIMIT),
+                cursor: first.cursor,
+            },
+        )
+        .result
+        .unwrap()
+    else {
+        panic!()
+    };
+    let names = first
+        .tags
+        .iter()
+        .chain(&second.tags)
+        .map(|t| t.name.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        (0..205).map(|i| format!("tag-{i:03}")).collect::<Vec<_>>()
+    );
+    assert!(!second.truncated);
+    assert!(second.cursor.is_none());
+    assert_eq!(
+        f.call(
+            &c,
+            3,
+            Command::ListTags {
+                choice: TagChoice::Recent,
+                limit: None,
+                cursor: Some(tag_cursor.clone())
+            }
+        )
+        .result
+        .unwrap_err()
+        .code,
+        ErrorCode::BadRequest
+    );
+    assert_eq!(
+        f.call(
+            &c,
+            4,
+            Command::ListCollections {
+                limit: None,
+                cursor: Some(tag_cursor)
+            }
+        )
+        .result
+        .unwrap_err()
+        .message,
+        "最初からやり直してください"
+    );
+
+    let Payload::Collections(first) = f
+        .call(
+            &c,
+            5,
+            Command::ListCollections {
+                limit: None,
+                cursor: None,
+            },
+        )
+        .result
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(first.collections.len(), DEFAULT_LIMIT as usize);
+    assert!(first.truncated);
+    let Payload::Collections(second) = f
+        .call(
+            &c,
+            6,
+            Command::ListCollections {
+                limit: Some(MAX_LIMIT),
+                cursor: first.cursor,
+            },
+        )
+        .result
+        .unwrap()
+    else {
+        panic!()
+    };
+    let names = first
+        .collections
+        .iter()
+        .chain(&second.collections)
+        .map(|t| t.name.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        (0..205)
+            .map(|i| format!("collection-{i:03}"))
+            .collect::<Vec<_>>()
+    );
+    assert!(second.collections.iter().all(|row| row.count == 0));
+    assert!(!second.truncated);
+    assert!(second.cursor.is_none());
+    for limit in [0, MAX_LIMIT + 1] {
+        for command in [
+            Command::ListTags {
+                choice: TagChoice::All,
+                limit: Some(limit),
+                cursor: None,
+            },
+            Command::ListCollections {
+                limit: Some(limit),
+                cursor: None,
+            },
+        ] {
+            assert_eq!(
+                f.call(&c, 7, command).result.unwrap_err().code,
+                ErrorCode::BadRequest
+            );
+        }
+    }
+}
+
+#[test]
+fn named_pages_use_actual_serialized_character_cap_and_returned_offset() {
+    let args = serde_json::json!([TagChoice::All, "tag_menu_order"]);
+    let tags = (0..20)
+        .map(|i| Tag {
+            name: format!("{i}{}", "猫\\\"".repeat(300)),
+            count: 1,
+        })
+        .collect();
+    let (tags, cursor, truncated) =
+        bounded_rows(tags, 50, false, "list_tags", args.clone(), "tags").unwrap();
+    assert!(truncated);
+    assert!(!tags.is_empty());
+    assert!(tags.len() < 20);
+    let page = TagPage {
+        tags,
+        cursor,
+        truncated,
+    };
+    assert!(json_chars(&page) <= MAX_PAGE_CHARS);
+    assert_eq!(
+        decode_cursor(page.cursor.as_deref(), "list_tags", &args).unwrap(),
+        50 + page.tags.len()
+    );
+    let args = serde_json::json!(["catalog_order"]);
+    let rows = (0..20)
+        .map(|i| Collection {
+            name: format!("{i}{}", "猫\\\"".repeat(300)),
+            count: 5,
+        })
+        .collect();
+    let (collections, cursor, truncated) = bounded_rows(
+        rows,
+        200,
+        false,
+        "list_collections",
+        args.clone(),
+        "collections",
+    )
+    .unwrap();
+    let page = CollectionPage {
+        collections,
+        cursor,
+        truncated,
+    };
+    assert!(page.truncated);
+    assert!(!page.collections.is_empty());
+    assert!(json_chars(&page) <= MAX_PAGE_CHARS);
+    assert_eq!(
+        decode_cursor(page.cursor.as_deref(), "list_collections", &args).unwrap(),
+        200 + page.collections.len()
+    );
+    assert!(
+        bounded_rows(
+            vec![Tag {
+                name: "猫".repeat(MAX_PAGE_CHARS),
+                count: 1
+            }],
+            0,
+            false,
+            "list_tags",
+            serde_json::json!([]),
+            "tags"
+        )
+        .is_err()
+    );
 }

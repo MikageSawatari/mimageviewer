@@ -35,6 +35,8 @@ pub enum Command {
     },
     ListTags {
         choice: TagChoice,
+        limit: Option<u32>,
+        cursor: Option<String>,
     },
     ItemsByTag {
         tag: String,
@@ -42,7 +44,10 @@ pub enum Command {
         limit: Option<u32>,
         cursor: Option<String>,
     },
-    ListCollections,
+    ListCollections {
+        limit: Option<u32>,
+        cursor: Option<String>,
+    },
     Cancel {
         request_id: u64,
     },
@@ -409,6 +414,8 @@ mod tests {
             Command::Status,
             Command::ListTags {
                 choice: TagChoice::Pinned,
+                limit: Some(17),
+                cursor: Some("tags-cursor".into()),
             },
             Command::ItemsByTag {
                 tag: "猫".into(),
@@ -416,7 +423,10 @@ mod tests {
                 limit: None,
                 cursor: Some("opaque".into()),
             },
-            Command::ListCollections,
+            Command::ListCollections {
+                limit: Some(23),
+                cursor: Some("collections-cursor".into()),
+            },
             Command::Cancel { request_id: 2 },
         ];
         for command in commands {

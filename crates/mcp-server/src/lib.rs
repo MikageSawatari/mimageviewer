@@ -404,6 +404,14 @@ struct TagArgs {
 #[serde(deny_unknown_fields)]
 struct TagsArgs {
     choice: TagChoice,
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PageArgs {
+    limit: Option<u32>,
+    cursor: Option<String>,
 }
 fn parse_tool(params: &Value) -> Result<(Action, Command), &'static str> {
     let args = params
@@ -417,12 +425,27 @@ fn parse_tool(params: &Value) -> Result<(Action, Command), &'static str> {
             ("miv_status", Command::Status)
         }
         Some("list_collections") => {
-            let _: EmptyArgs = serde_json::from_value(args).map_err(bad)?;
-            ("list_collections", Command::ListCollections)
+            let a: PageArgs = serde_json::from_value(args).map_err(bad)?;
+            validate_paging(a.limit, a.cursor.as_deref())?;
+            (
+                "list_collections",
+                Command::ListCollections {
+                    limit: a.limit,
+                    cursor: a.cursor,
+                },
+            )
         }
         Some("list_tags") => {
             let a: TagsArgs = serde_json::from_value(args).map_err(bad)?;
-            ("list_tags", Command::ListTags { choice: a.choice })
+            validate_paging(a.limit, a.cursor.as_deref())?;
+            (
+                "list_tags",
+                Command::ListTags {
+                    choice: a.choice,
+                    limit: a.limit,
+                    cursor: a.cursor,
+                },
+            )
         }
         Some("search_items") => {
             let a: SearchArgs = serde_json::from_value(args).map_err(bad)?;
@@ -455,12 +478,15 @@ fn parse_tool(params: &Value) -> Result<(Action, Command), &'static str> {
     Ok((Action::Tool(name), command))
 }
 fn validate_page(text: &str, limit: Option<u32>, cursor: Option<&str>) -> Result<(), &'static str> {
-    if text.is_empty()
-        || text.chars().count() > 200
-        || limit.is_some_and(|n| n == 0 || n > MAX_LIMIT)
-        || cursor.is_some_and(|c| c.len() > 8_192)
-    {
+    if text.is_empty() || text.chars().count() > 200 {
         Err("Invalid query, tag, limit, or cursor")
+    } else {
+        validate_paging(limit, cursor)
+    }
+}
+fn validate_paging(limit: Option<u32>, cursor: Option<&str>) -> Result<(), &'static str> {
+    if limit.is_some_and(|n| n == 0 || n > MAX_LIMIT) || cursor.is_some_and(|c| c.len() > 8_192) {
+        Err("Invalid limit or cursor")
     } else {
         Ok(())
     }

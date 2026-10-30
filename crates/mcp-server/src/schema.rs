@@ -9,6 +9,9 @@ fn nullable_string() -> Value {
 fn kind() -> Value {
     json!({"type":"string","enum":["image","pdf","video","audio","archive","folder","other"]})
 }
+fn paging() -> Value {
+    json!({"limit":{"type":["integer","null"],"minimum":1,"maximum":200,"default":50},"cursor":{"type":["string","null"],"maxLength":8192}})
+}
 fn output(name: &str) -> Value {
     match name {
         "miv_status" => object(
@@ -41,18 +44,24 @@ pub fn tools() -> Vec<Value> {
     [
         ("miv_status", "Read the running mIV version, permission level, index readiness, and Remote activity."),
         ("search_items", "Search the mIV index using the same query syntax as Ctrl+G. Return paths, names, kinds, tags and ratings."),
-        ("list_tags", "List pinned, recent, frequent, or all tags and counts. This list is capped; truncated indicates omitted entries."),
+        ("list_tags", "List pinned, recent, frequent, or all tags and counts. Use the returned cursor for the next page."),
         ("items_by_tag", "List library items using the same tag-view query as mIV, with paths, names, kinds, tags and ratings."),
-        ("list_collections", "List collection names and item counts. This list is capped; truncated indicates omitted entries."),
+        ("list_collections", "List collection names and item counts. Use the returned cursor for the next page."),
     ].into_iter().map(|(name, description)| {
         let input = match name {
             "search_items" | "items_by_tag" => {
                 let key = if name == "search_items" { "query" } else { "tag" };
-                let mut props = json!({"kind":{"anyOf":[kind(),{"type":"null"}]},"limit":{"type":["integer","null"],"minimum":1,"maximum":200,"default":50},"cursor":{"type":["string","null"],"maxLength":8192}});
+                let mut props = paging();
+                props["kind"] = json!({"anyOf":[kind(),{"type":"null"}]});
                 props[key] = json!({"type":"string","minLength":1,"maxLength":200});
                 object(props, &[key])
             },
-            "list_tags" => object(json!({"choice":{"type":"string","enum":["pinned","recent","frequent","all"]}}), &["choice"]),
+            "list_tags" => {
+                let mut props = paging();
+                props["choice"] = json!({"type":"string","enum":["pinned","recent","frequent","all"]});
+                object(props, &["choice"])
+            },
+            "list_collections" => object(paging(), &[]),
             _ => object(json!({}), &[]),
         };
         let success = output(name);

@@ -95,6 +95,24 @@ fn unavailable() -> AgentError {
 fn invalid_response() -> AgentError {
     AgentError::new(ErrorCode::Internal, "mIV からの応答を確認できませんでした")
 }
+fn connection_error(error: io::Error) -> AgentError {
+    match error.raw_os_error() {
+        Some(2) => unavailable(), // ERROR_FILE_NOT_FOUND
+        Some(231) => AgentError::new(
+            ErrorCode::Busy,
+            "mIV の AI 連携が混み合っています。少し待ってからもう一度お試しください",
+        ),
+        Some(5) => AgentError::new(
+            ErrorCode::Internal,
+            "mIV への接続が拒否されました。mIV と AI アプリを同じユーザーの通常の権限で起動してください",
+        ),
+        code => {
+            // Diagnostics contain the OS code only, never the pipe/data path.
+            eprintln!("mimageviewer-mcp: pipe connect failed; os_error={code:?}");
+            AgentError::new(ErrorCode::Internal, "mIV に接続できませんでした")
+        }
+    }
+}
 fn receive(file: &mut PipeStream, id: u64) -> Result<Payload, AgentError> {
     let response: Response = read_frame(file)
         .map_err(|_| unavailable())?
@@ -111,7 +129,7 @@ impl Backend for PipeBackend {
         client_name: &str,
         control: Arc<CallControl>,
     ) -> Result<Payload, AgentError> {
-        let mut reader = PipeStream::connect(&self.pipe_name).map_err(|_| unavailable())?;
+        let mut reader = PipeStream::connect(&self.pipe_name).map_err(connection_error)?;
         let _lease = WriterLease(control.clone());
         let mut writer = control.writer.lock().map_err(|_| invalid_response())?;
         if control.cancelled.load(Ordering::Acquire) {
@@ -155,6 +173,35 @@ impl Backend for PipeBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn connection_error_mapping_distinguishes_busy_missing_denied_and_other() {
+        let missing = connection_error(io::Error::from_raw_os_error(2));
+        assert_eq!(missing.code, ErrorCode::NotReady);
+        assert_eq!(
+            missing.message,
+            "mIV が起動していません。mIV を起動してからもう一度お試しください"
+        );
+        let busy = connection_error(io::Error::from_raw_os_error(231));
+        assert_eq!(busy.code, ErrorCode::Busy);
+        assert_eq!(
+            busy.message,
+            "mIV の AI 連携が混み合っています。少し待ってからもう一度お試しください"
+        );
+        let denied = connection_error(io::Error::from_raw_os_error(5));
+        assert_eq!(denied.code, ErrorCode::Internal);
+        assert_eq!(
+            denied.message,
+            "mIV への接続が拒否されました。mIV と AI アプリを同じユーザーの通常の権限で起動してください"
+        );
+        for error in [
+            io::Error::from_raw_os_error(6),
+            io::Error::other("private diagnostic path"),
+        ] {
+            let error = connection_error(error);
+            assert_eq!(error.code, ErrorCode::Internal);
+            assert_eq!(error.message, "mIV に接続できませんでした");
+        }
+    }
     #[test]
     fn cancellation_targets_current_request_and_worker_exit_closes_writer() {
         for request_id in [1, 2] {
