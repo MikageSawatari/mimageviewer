@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 // App and its workers must drop before the override, temporary files and global lock.
-struct CaseEnv {
+pub(super) struct CaseEnv {
     app: App,
     _epub_pin: Option<crate::pdf_loader::TestEpubPin>,
     pdf_backend: Option<crate::pdf_loader::RemotePdfTestBackend>,
@@ -25,7 +25,7 @@ impl std::ops::DerefMut for CaseEnv {
         &mut self.app
     }
 }
-fn setup(portable_layout: bool) -> CaseEnv {
+pub(super) fn setup(portable_layout: bool) -> CaseEnv {
     let lock = crate::data_dir::test_override_lock();
     let tmp = tempfile::TempDir::new().unwrap();
     let data_dir = tmp.path().join(if portable_layout {
@@ -97,7 +97,7 @@ fn trace(app: &App, stage: &str) {
     }
 }
 
-fn settle(app: &mut App) {
+pub(super) fn settle(app: &mut App) {
     let ctx = egui::Context::default();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -256,6 +256,25 @@ fn enter_other_root(app: &mut App, kind: &str, origin: &Path) {
                 .recv_timeout(Duration::from_secs(10))
                 .unwrap()
                 .unwrap();
+            let source = origin.join("owned-source");
+            if source.is_dir() {
+                let registration =
+                    crate::collection_store::CollectionRegistration::from_trusted_path(
+                        &source,
+                        crate::collection_store::CollectionResolvedKind::Folder,
+                    )
+                    .unwrap();
+                client
+                    .add_batch(
+                        created.collection_id(),
+                        created.revision(),
+                        vec![registration],
+                    )
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .unwrap();
+            }
             app.open_collection_grid_from_navigation(created.collection_id());
         }
         "smart" => {
@@ -487,7 +506,14 @@ fn enter(app: &mut App, entrance: Entrance) {
         Entrance::FolderBar => unreachable!(),
     }
     settle(app);
-    assert!(app.items_are_reading_history_view);
+    assert!(
+        app.items_are_reading_history_view,
+        "history admission: surface={:?}, current={:?}, busy={}, feedback={:?}",
+        app.top_level_grid_view.surface(),
+        app.current_folder,
+        app.sidecar_restore_active(),
+        app.feedback_toasts_for_test
+    );
     assert_eq!(app.current_folder, Some(reading_history_synthetic_path()));
 }
 
@@ -942,7 +968,6 @@ fn root_parent_input(app: &mut App, route: &str) -> Option<crate::ui_main::Addre
 
 #[test]
 fn section1473_reading_history_root_parent_never_opens_internal_data() {
-    let mut leaks = Vec::new();
     for portable in [false, true] {
         for returned_from_book in [false, true] {
             for entrance in [Entrance::Menu, Entrance::Ring, Entrance::Mouse] {
@@ -953,6 +978,11 @@ fn section1473_reading_history_root_parent_never_opens_internal_data() {
                     let origin = book.parent().unwrap().to_owned();
                     app.load_folder(origin.clone());
                     settle(&mut app);
+                    let origin_selection = app
+                        .selected
+                        .and_then(|index| app.items.get(index))
+                        .and_then(GridItem::container_path)
+                        .map(Path::to_owned);
                     add_history(&app, &book, kind);
                     enter(&mut app, entrance);
                     if returned_from_book {
@@ -1002,27 +1032,26 @@ fn section1473_reading_history_root_parent_never_opens_internal_data() {
                         "1473 root-parent-adopted logical={:?} selected={selected:?} rows={rows:?}",
                         app.effective_folder()
                     );
-                    if app.effective_folder().is_some_and(|path| {
-                        path.is_dir() && crate::path_key::physical_path_is_within(&path, &data_dir)
-                    }) {
-                        leaks.push(format!(
-                            "{portable}/{returned_from_book}/{entrance:?}/{route}"
-                        ));
-                        if selected.as_deref() == Some(data_dir.join("cache").as_path()) {
-                            let nav = key(&mut app, egui::Key::Enter, egui::Modifiers::NONE);
-                            apply(&mut app, nav);
-                            eprintln!("1473 root-parent-then-enter={:?}", app.effective_folder());
-                            assert_eq!(app.effective_folder(), Some(data_dir.join("cache")));
-                        }
-                    }
+                    assert!(
+                        !app.effective_folder().is_some_and(|path| {
+                            path.is_dir()
+                                && crate::path_key::physical_path_is_within(&path, &data_dir)
+                        }),
+                        "synthetic root parent entered internal data"
+                    );
+                    assert_eq!(
+                        app.effective_folder(),
+                        Some(origin),
+                        "one parent must exit to the entrance: {portable}/{returned_from_book}/{entrance:?}/{route}"
+                    );
+                    assert_eq!(
+                        selected, origin_selection,
+                        "entrance selection must be restored"
+                    );
                 }
             }
         }
     }
-    assert!(
-        leaks.is_empty(),
-        "synthetic root parent entered internal data: {leaks:?}"
-    );
 }
 
 #[test]
@@ -1041,9 +1070,10 @@ fn section1473_returned_history_back_candidate_consumes_self_marker_first() {
     let nav = root_parent_input(&mut app, "backspace");
     apply(&mut app, nav);
     assert!(app.items_are_reading_history_view);
-    assert!(
-        matches!(app.folder_history_back_target(), Some(FolderNavHistoryTarget::Path(path)) if path == &reading_history_synthetic_path())
-    );
+    assert!(matches!(
+        app.folder_history_back_target(),
+        Some(FolderNavHistoryTarget::ReadingHistory(_))
+    ));
     app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
     settle(&mut app);
     eprintln!(
@@ -1111,5 +1141,641 @@ fn section1473_folder_bar_second_parent_keeps_physical_ancestors() {
             apply(&mut app, nav);
             assert_eq!(app.effective_folder(), Some(origin));
         }
+    }
+}
+
+fn adopted_history_root(app: &App) -> top_level_grid_view::ReadingHistoryRootRestore {
+    match app
+        .current_top_level_restore_snapshot()
+        .expect("adopted location")
+    {
+        top_level_grid_view::TopLevelGridRestore::ReadingHistory(root) => root,
+        other => panic!("expected a typed history root, got {other:?}"),
+    }
+}
+
+fn parent_and_settle(app: &mut App, route: &str) {
+    let before = app.folder_nav_history_snapshot();
+    let _ = app.grid_parent_nav_target();
+    assert_eq!(
+        app.folder_nav_history_snapshot(),
+        before,
+        "preview must not advance history"
+    );
+    let nav = root_parent_input(app, route);
+    apply_on(
+        app,
+        nav,
+        if route == "button" {
+            "address"
+        } else {
+            "keyboard"
+        },
+    );
+}
+
+fn open_container_path(app: &mut App, path: &Path) {
+    app.selected = Some(
+        app.items
+            .iter()
+            .position(|item| {
+                item.container_path()
+                    .is_some_and(|candidate| crate::folder_tree::path_eq(candidate, path))
+            })
+            .expect("fixture must expose the requested container"),
+    );
+    let nav = key(app, egui::Key::Enter, egui::Modifiers::NONE);
+    apply(app, nav);
+    if app.fullscreen_idx.is_some() {
+        app.close_fullscreen();
+        settle(app);
+    }
+    assert_eq!(app.effective_folder().as_deref(), Some(path));
+}
+
+fn history_book_roundtrip(app: &mut App, book: &Path, route: &str) {
+    let root = adopted_history_root(app);
+    open_container_path(app, book);
+    parent_and_settle(app, route);
+    assert_eq!(
+        adopted_history_root(app),
+        root,
+        "Return must preserve the exact visit and exit payload"
+    );
+}
+
+fn nested_rating_history_case(portable: bool, roundtrip: bool, physical_child: bool, route: &str) {
+    let mut app = setup(portable);
+    configure(&mut app);
+    let (book, kind) = fixture(&mut app, "zip");
+    let (rated, _) = fixture(&mut app, "folder");
+    let origin = book.parent().unwrap().to_owned();
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set(&crate::adjustment_db::normalize_path(&rated), 3)
+        .unwrap();
+    app.load_folder(origin.clone());
+    settle(&mut app);
+    add_history(&app, &book, kind);
+    enter(&mut app, Entrance::Menu);
+    let h1 = adopted_history_root(&app);
+    app.enter_rating_view(3);
+    settle(&mut app);
+    assert!(app.items_are_rating_view);
+    let h1_restore = top_level_grid_view::TopLevelGridRestore::ReadingHistory(h1.clone());
+    assert_eq!(
+        app.rating_view_return_to.as_ref().unwrap().restore,
+        h1_restore
+    );
+    if physical_child {
+        open_container_path(&mut app, &rated);
+    }
+    let rating_restore = app.current_top_level_restore_snapshot().unwrap();
+    enter(&mut app, Entrance::Menu);
+    let h2 = adopted_history_root(&app);
+    assert_ne!(
+        h1.visit, h2.visit,
+        "same synthetic path must not merge distinct visits"
+    );
+    match &h2.exit {
+        top_level_grid_view::ReadingHistoryExit::RecordedEntrance(exit) => {
+            assert_eq!(exit.restore, rating_restore)
+        }
+        other => panic!("rating entrance must be recorded: {other:?}"),
+    }
+    // The payload must survive the actual ZIP adoption clearing native Rating fields.
+    // Also cover direct exit with no surviving native slot at all.
+    app.rating_view_return_to = None;
+    if roundtrip {
+        history_book_roundtrip(&mut app, &book, route);
+    }
+    parent_and_settle(&mut app, route);
+    assert_eq!(
+        app.current_top_level_restore_snapshot().unwrap(),
+        rating_restore
+    );
+    if physical_child {
+        assert_eq!(app.effective_folder(), Some(rated));
+        parent_and_settle(&mut app, route);
+    }
+    assert!(app.items_are_rating_view);
+    assert_eq!(
+        app.rating_view_return_to.as_ref().unwrap().restore,
+        h1_restore
+    );
+    parent_and_settle(&mut app, route);
+    assert_eq!(
+        adopted_history_root(&app),
+        h1,
+        "Rating close must restore H1, not create a new root"
+    );
+    parent_and_settle(&mut app, route);
+    assert_eq!(
+        app.effective_folder(),
+        Some(origin),
+        "H1 must still exit to O"
+    );
+}
+
+#[test]
+fn section1473_nested_history_rating_preserves_both_visits() {
+    for portable in [false, true] {
+        for roundtrip in [false, true] {
+            for route in ["button", "backspace", "alt-up", "mouse", "ring"] {
+                nested_rating_history_case(portable, roundtrip, false, route);
+            }
+        }
+    }
+}
+
+#[test]
+fn section1473_nested_history_rating_physical_child_keeps_root_exit() {
+    for portable in [false, true] {
+        for roundtrip in [false, true] {
+            nested_rating_history_case(portable, roundtrip, true, "backspace");
+        }
+    }
+}
+
+#[test]
+fn section1473_expansion_entrance_owns_complete_restore() {
+    for portable in [false, true] {
+        for roundtrip in [false, true] {
+            let mut app = setup(portable);
+            configure(&mut app);
+            let (book, kind) = fixture(&mut app, "zip");
+            let (folder, _) = fixture(&mut app, "folder");
+            let origin = book.parent().unwrap().to_owned();
+            let other = app.tmp.path().join("other-root");
+            std::fs::create_dir_all(&other).unwrap();
+            image::RgbImage::new(3, 4)
+                .save(other.join("other.png"))
+                .unwrap();
+            app.load_folder(origin.clone());
+            settle(&mut app);
+            app.start_subfolder_expansion_scan_roots(origin.clone(), vec![origin.clone(), other]);
+            settle(&mut app);
+            assert!(app.items_are_subfolder_expansion_view);
+            assert!(
+                app.folder_nav_subfolder_restore.is_none(),
+                "new expansion has no generic backup slot"
+            );
+            app.subfolder_expansion_removed_paths
+                .insert(crate::adjustment_db::normalize_path(&folder));
+            let expected = app.current_top_level_restore_snapshot().unwrap();
+            add_history(&app, &book, kind);
+            enter(&mut app, Entrance::Menu);
+            let root = adopted_history_root(&app);
+            app.folder_nav_subfolder_restore = None;
+            if roundtrip {
+                history_book_roundtrip(&mut app, &book, "backspace");
+            }
+            parent_and_settle(&mut app, "backspace");
+            assert!(app.items_are_subfolder_expansion_view);
+            assert_eq!(app.current_top_level_restore_snapshot().unwrap(), expected);
+            assert!(
+                !app.items
+                    .iter()
+                    .any(|item| item.container_path() == Some(folder.as_path())),
+                "removed path must not reappear"
+            );
+            // Forward returns to the retained root payload, independent of native slots.
+            app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
+            settle(&mut app);
+            assert_eq!(adopted_history_root(&app), root);
+            app.folder_nav_subfolder_restore = None;
+            parent_and_settle(&mut app, "backspace");
+            assert_eq!(app.current_top_level_restore_snapshot().unwrap(), expected);
+            parent_and_settle(&mut app, "backspace");
+            assert_eq!(app.effective_folder(), Some(origin));
+        }
+    }
+}
+
+#[test]
+fn section1473_rating_exit_keeps_its_own_complete_origin() {
+    for portable in [false, true] {
+        for entrance in ["folder", "drives", "subfolder-expansion"] {
+            for roundtrip in [false, true] {
+                let mut app = setup(portable);
+                configure(&mut app);
+                let (book, kind) = fixture(&mut app, "zip");
+                let origin = book.parent().unwrap().to_owned();
+                app.load_folder(origin.clone());
+                settle(&mut app);
+                if entrance != "folder" {
+                    enter_other_root(&mut app, entrance, &origin);
+                }
+                let before_rating = app.current_top_level_restore_snapshot().unwrap();
+                app.enter_rating_view(3);
+                settle(&mut app);
+                let rating_restore = app.current_top_level_restore_snapshot().unwrap();
+                add_history(&app, &book, kind);
+                enter(&mut app, Entrance::Menu);
+                app.rating_view_return_to = None;
+                if roundtrip {
+                    history_book_roundtrip(&mut app, &book, "backspace");
+                }
+                parent_and_settle(&mut app, "backspace");
+                assert_eq!(
+                    app.current_top_level_restore_snapshot().unwrap(),
+                    rating_restore
+                );
+                parent_and_settle(&mut app, "backspace");
+                assert_eq!(
+                    app.current_top_level_restore_snapshot().unwrap(),
+                    before_rating
+                );
+                if entrance == "subfolder-expansion" {
+                    parent_and_settle(&mut app, "backspace");
+                    assert_eq!(app.effective_folder(), Some(origin));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn section1473_other_owned_entrances_survive_history_and_book() {
+    for portable in [false, true] {
+        for kind in ["bookmarks", "smart", "collection", "drives"] {
+            for roundtrip in [false, true] {
+                let mut app = setup(portable);
+                configure(&mut app);
+                let (book, history_kind) = fixture(&mut app, "zip");
+                let origin = book.parent().unwrap().to_owned();
+                app.load_folder(origin.clone());
+                settle(&mut app);
+                enter_other_root(&mut app, kind, &origin);
+                let expected = app.current_top_level_restore_snapshot().unwrap();
+                add_history(&app, &book, history_kind);
+                enter(&mut app, Entrance::Menu);
+                if roundtrip {
+                    history_book_roundtrip(&mut app, &book, "backspace");
+                }
+                parent_and_settle(&mut app, "backspace");
+                assert_eq!(
+                    app.current_top_level_restore_snapshot().unwrap(),
+                    expected,
+                    "complete entrance must survive: {kind}/{portable}/{roundtrip}"
+                );
+                if kind == "bookmarks" {
+                    parent_and_settle(&mut app, "backspace");
+                    assert_eq!(app.effective_folder(), Some(origin));
+                } else {
+                    let before = app.folder_nav_history_snapshot();
+                    parent_and_settle(&mut app, "backspace");
+                    assert_eq!(app.current_top_level_restore_snapshot().unwrap(), expected);
+                    assert_eq!(
+                        app.folder_nav_history_snapshot(),
+                        before,
+                        "synthetic root keeps its existing stop rule"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn section1473_search_transfers_complete_canonical_origin() {
+    for portable in [false, true] {
+        for origin_kind in ["rating", "subfolder-expansion"] {
+            for search in ["global-search", "favorite-search", "tag"] {
+                let mut app = setup(portable);
+                configure(&mut app);
+                let (book, history_kind) = fixture(&mut app, "zip");
+                let origin = book.parent().unwrap().to_owned();
+                app.load_folder(origin.clone());
+                settle(&mut app);
+                enter_other_root(&mut app, origin_kind, &origin);
+                let expected = app.current_top_level_restore_snapshot().unwrap();
+                enter_other_root(&mut app, search, &origin);
+                add_history(&app, &book, history_kind);
+                // File-menu admission is intentionally different from blocked location jumps.
+                enter(&mut app, Entrance::Menu);
+                app.rating_view_return_to = None;
+                app.folder_nav_subfolder_restore = None;
+                history_book_roundtrip(&mut app, &book, "backspace");
+                parent_and_settle(&mut app, "backspace");
+                assert!(!app.global_search.active && !app.favsearch.active && !app.tag_view.active);
+                assert_eq!(
+                    app.current_top_level_restore_snapshot().unwrap(),
+                    expected,
+                    "search must transfer its complete canonical origin: {origin_kind}/{search}"
+                );
+                parent_and_settle(&mut app, "backspace");
+                assert_eq!(app.effective_folder(), Some(origin));
+            }
+        }
+    }
+}
+
+#[test]
+fn section1473_snapshot_keeps_input_specific_admission_and_parent_owner() {
+    for portable in [false, true] {
+        let mut app = setup(portable);
+        configure(&mut app);
+        let (book, kind) = fixture(&mut app, "zip");
+        let origin = book.parent().unwrap().to_owned();
+        app.load_folder(origin.clone());
+        settle(&mut app);
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        settle(&mut app);
+        assert!(app.is_snapshot_active());
+        let ctx = egui::Context::default();
+        assert!(
+            app.apply_ring_action(
+                &ctx,
+                RingShortcutContext::Grid,
+                RingActionId::OpenLocationReadingHistory,
+                "1473-snapshot"
+            )
+            .is_none()
+        );
+        assert!(app.is_snapshot_active());
+        assert_eq!(app.effective_folder(), Some(origin.clone()));
+        add_history(&app, &book, kind);
+        // The file menu does not impose the location-menu Snapshot prohibition.
+        enter(&mut app, Entrance::Menu);
+        assert!(app.is_snapshot_active());
+        parent_and_settle(&mut app, "backspace");
+        assert!(app.is_snapshot_active());
+        assert_eq!(app.effective_folder(), Some(origin));
+        assert!(!app.items_are_reading_history_view);
+    }
+}
+
+#[test]
+fn section1473_folder_descendant_does_not_resurrect_expired_book_return() {
+    for portable in [false, true] {
+        let mut app = setup(portable);
+        configure(&mut app);
+        let (folder, kind) = fixture(&mut app, "folder");
+        let origin = folder.parent().unwrap().to_owned();
+        app.load_folder(origin.clone());
+        settle(&mut app);
+        add_history(&app, &folder, kind);
+        enter(&mut app, Entrance::Menu);
+        let root = adopted_history_root(&app);
+        open_container_path(&mut app, &folder);
+        open_container_path(&mut app, &folder.join("child"));
+        assert!(app.reading_history_return_from.is_none());
+        parent_and_settle(&mut app, "backspace");
+        assert_eq!(app.effective_folder(), Some(folder));
+        parent_and_settle(&mut app, "backspace");
+        assert_eq!(app.effective_folder(), Some(origin.clone()));
+        for _ in 0..8 {
+            if app.items_are_reading_history_view {
+                break;
+            }
+            app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+            settle(&mut app);
+        }
+        assert_eq!(adopted_history_root(&app), root);
+        parent_and_settle(&mut app, "backspace");
+        assert_eq!(app.effective_folder(), Some(origin));
+    }
+}
+
+#[test]
+fn section1473_marker_presence_selects_back_or_direct_without_losing_entrance_position() {
+    for portable in [false, true] {
+        for mode in ["recorded", "search", "truncated"] {
+            let mut app = setup(portable);
+            configure(&mut app);
+            let (book, kind) = fixture(&mut app, "zip");
+            let origin = book.parent().unwrap().to_owned();
+            for number in 0..70 {
+                let path = origin.join(format!("folder-{number:03}"));
+                std::fs::create_dir_all(path).unwrap();
+            }
+            app.load_folder(origin.clone());
+            settle(&mut app);
+            let selected_path = origin.join("folder-040");
+            app.selected = Some(
+                app.items
+                    .iter()
+                    .position(|item| item.container_path() == Some(selected_path.as_path()))
+                    .unwrap(),
+            );
+            app.scroll_offset_y = 360.0;
+            for number in 0..2 {
+                let path = app.tmp.path().join(format!("previous-{number}"));
+                std::fs::create_dir_all(&path).unwrap();
+                app.push_nav_history_entry(path);
+            }
+            let old_prefix = app.folder_nav_back_stack.clone();
+            add_history(&app, &book, kind);
+            if mode == "search" {
+                app.open_global_search();
+                app.replace_search_view_items(Vec::new(), Vec::new());
+                settle(&mut app);
+            }
+            enter(&mut app, Entrance::Menu);
+            let history_entry = app.folder_nav_current_entry().unwrap();
+            if mode == "truncated" {
+                // Use the real bounded-stack producer, rather than fabricating a truncated vector.
+                for number in 0..105 {
+                    let path = app.tmp.path().join(format!("later-{number:03}"));
+                    std::fs::create_dir_all(&path).unwrap();
+                    app.push_nav_history_entry(path);
+                }
+                assert_eq!(app.folder_nav_back_stack.len(), 100);
+                assert!(
+                    !app.folder_nav_back_stack
+                        .iter()
+                        .any(|entry| matches!(&entry.location,
+                    FolderNavHistoryTarget::Path(path) if path == &origin))
+                );
+            }
+            let future = app.tmp.path().join("future");
+            std::fs::create_dir_all(&future).unwrap();
+            let future_entry: FolderNavHistoryEntry = FolderNavHistoryTarget::Path(future).into();
+            app.folder_nav_forward_stack.push(future_entry.clone());
+            let before_back = app.folder_nav_back_stack.clone();
+            parent_and_settle(&mut app, "backspace");
+            assert_eq!(app.effective_folder(), Some(origin.clone()), "mode={mode}");
+            assert_eq!(
+                app.selected
+                    .and_then(|index| app.items.get(index))
+                    .and_then(GridItem::container_path),
+                Some(selected_path.as_path()),
+                "mode={mode}"
+            );
+            assert_eq!(app.scroll_offset_y, 360.0, "mode={mode}");
+            if mode == "recorded" {
+                assert_eq!(app.folder_nav_back_stack, old_prefix);
+                assert_eq!(
+                    app.folder_nav_forward_stack,
+                    vec![future_entry, history_entry]
+                );
+            } else {
+                let mut expected_back = before_back;
+                App::push_folder_nav_stack(&mut expected_back, history_entry);
+                assert_eq!(
+                    app.folder_nav_back_stack, expected_back,
+                    "markerless exit uses ordinary Direct"
+                );
+                assert!(
+                    app.folder_nav_forward_stack.is_empty(),
+                    "ordinary Direct clears forward"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn section1473_history_without_entrance_keeps_drive_exit_after_book_and_replay() {
+    for portable in [false, true] {
+        for roundtrip in [false, true] {
+            let mut app = setup(portable);
+            configure(&mut app);
+            let (book, kind) = fixture(&mut app, "zip");
+            assert!(app.current_top_level_restore_snapshot().is_none());
+            add_history(&app, &book, kind);
+            enter(&mut app, Entrance::Menu);
+            let root = adopted_history_root(&app);
+            assert!(matches!(
+                root.exit,
+                top_level_grid_view::ReadingHistoryExit::DriveList
+            ));
+            if roundtrip {
+                history_book_roundtrip(&mut app, &book, "backspace");
+            }
+            parent_and_settle(&mut app, "backspace");
+            assert!(app.items_are_drive_list);
+            app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+            settle(&mut app);
+            assert_eq!(adopted_history_root(&app), root);
+            parent_and_settle(&mut app, "backspace");
+            assert!(app.items_are_drive_list);
+        }
+    }
+}
+
+#[test]
+fn section1473_bookmark_entrance_restores_stable_key_and_scroll_then_its_parent() {
+    for portable in [false, true] {
+        let mut app = setup(portable);
+        configure(&mut app);
+        let (book, kind) = fixture(&mut app, "zip");
+        let origin = book.parent().unwrap().to_owned();
+        app.load_folder(origin.clone());
+        settle(&mut app);
+        for number in 0..45 {
+            let path = origin.join(format!("video-{number:03}.mp4"));
+            std::fs::write(&path, []).unwrap();
+            app.video_bookmark_db
+                .as_ref()
+                .unwrap()
+                .add(&path, number as f64, None, &[])
+                .unwrap();
+        }
+        app.open_bookmark_browser();
+        settle(&mut app);
+        assert_eq!(app.bookmark_browser_rows.len(), 45);
+        app.selected = Some(31);
+        app.scroll_offset_y = 280.0;
+        let expected = app.current_top_level_restore_snapshot().unwrap();
+        let key = app.bookmark_browser_rows[31].stable_key();
+        add_history(&app, &book, kind);
+        enter(&mut app, Entrance::Menu);
+        history_book_roundtrip(&mut app, &book, "backspace");
+        parent_and_settle(&mut app, "backspace");
+        assert_eq!(app.current_top_level_restore_snapshot().unwrap(), expected);
+        assert_eq!(
+            app.selected
+                .map(|index| app.bookmark_browser_rows[index].stable_key()),
+            Some(key)
+        );
+        assert_eq!(app.scroll_offset_y, 280.0);
+        parent_and_settle(&mut app, "backspace");
+        assert_eq!(app.effective_folder(), Some(origin));
+    }
+}
+
+#[test]
+fn section1473_smart_and_collection_physical_entrances_keep_native_root_and_origin() {
+    for portable in [false, true] {
+        for kind in ["smart", "collection"] {
+            for roundtrip in [false, true] {
+                let mut app = setup(portable);
+                configure(&mut app);
+                let (book, history_kind) = fixture(&mut app, "zip");
+                let origin = book.parent().unwrap().to_owned();
+                let source = origin.join("owned-source");
+                std::fs::create_dir_all(source.join("child")).unwrap();
+                app.load_folder(origin.clone());
+                settle(&mut app);
+                enter_other_root(&mut app, kind, &origin);
+                let root = app.current_top_level_restore_snapshot().unwrap();
+                open_container_path(&mut app, &source);
+                let physical = app.current_top_level_restore_snapshot().unwrap();
+                add_history(&app, &book, history_kind);
+                enter(&mut app, Entrance::Menu);
+                if roundtrip {
+                    history_book_roundtrip(&mut app, &book, "backspace");
+                }
+                parent_and_settle(&mut app, "backspace");
+                assert_eq!(app.current_top_level_restore_snapshot().unwrap(), physical);
+                parent_and_settle(&mut app, "backspace");
+                assert_eq!(app.current_top_level_restore_snapshot().unwrap(), root);
+                // The native temporary-search return must still point to this root.
+                enter_other_root(&mut app, "global-search", &origin);
+                app.close_global_search();
+                settle(&mut app);
+                assert_eq!(app.current_top_level_restore_snapshot().unwrap(), root);
+            }
+        }
+    }
+}
+
+#[test]
+fn section1473_snapshot_subset_cannot_overwrite_ordinary_entrance_position() {
+    for portable in [false, true] {
+        let mut app = setup(portable);
+        configure(&mut app);
+        let (book, _) = fixture(&mut app, "zip");
+        let origin = book.parent().unwrap().to_owned();
+        for number in 0..70 {
+            std::fs::create_dir_all(origin.join(format!("folder-{number:03}"))).unwrap();
+        }
+        app.load_folder(origin.clone());
+        settle(&mut app);
+        let selected_path = origin.join("folder-040");
+        let selected = app
+            .items
+            .iter()
+            .position(|item| item.container_path() == Some(selected_path.as_path()))
+            .unwrap();
+        app.selected = Some(selected);
+        app.scroll_offset_y = 360.0;
+        app.visible_indices = (20..60).collect();
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        settle(&mut app);
+        assert!(app.is_snapshot_active());
+        let saved = app.folder_history.get(&origin).copied().unwrap();
+        assert_eq!(saved, (360.0, Some(selected)));
+        app.selected = Some(0);
+        app.scroll_offset_y = 40.0;
+        // This is the production handoff used when a new view accepts the fixed owner.
+        app.dismiss_snapshot_with_origin();
+        let other = app.settings.book_root.as_ref().unwrap().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        app.load_folder(other);
+        settle(&mut app);
+        assert_eq!(app.folder_history.get(&origin).copied(), Some(saved));
+        app.load_folder(origin);
+        settle(&mut app);
+        assert_eq!(
+            app.selected
+                .and_then(|index| app.items.get(index))
+                .and_then(GridItem::container_path),
+            Some(selected_path.as_path())
+        );
+        assert_eq!(app.scroll_offset_y, 360.0);
     }
 }

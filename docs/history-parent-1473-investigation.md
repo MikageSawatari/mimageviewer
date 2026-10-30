@@ -554,7 +554,8 @@ Ratingの入場・return・closeの型付き帰路をそこへ戻さない。
 ### 4. root退出、自己marker、forward履歴
 
 root ownerの `plan_root_exit` は、保持した退出情報と**現在の有効なmain/slotの履歴**から
-`FolderHistoryPlan` を作り、既存 `MainHistoryOperation::Replay` とtyped destinationのdispatcherへ渡す。
+入口markerが見つかる場合に `FolderHistoryPlan` を作り、既存 `MainHistoryOperation::Replay` とtyped destinationのdispatcherへ渡す。
+markerが見つからない場合は、下記補足に従って同じtyped destinationへ既存の `MainHistoryOperation::Direct` で移る。
 通常の `advance(Back/Forward)` を全場所で「同じpathをskip」に変えない。
 
 `RecordedEntrance` の場合（cursor操作には完全なoriginから導出したentryを使う）:
@@ -564,11 +565,9 @@ root ownerの `plan_root_exit` は、保持した退出情報と**現在の有�
 2. 仮currentと同じvisitのrootが直ちに現れる場合は自己markerとして消費し、rootを再loadしない。
    この消費では仮currentのroot/routeを古いmarkerで上書きしない。Forwardへ残すのは現在表示中のrootである。
    その後、保持した入口entryまでを1つの退出計画にする。子の履歴を見つけたところで止まらない。
-3. 普通のBack/Forwardで既に境界markerを消費してrootへ来ている場合は、Back末尾の入口entryを消費する。
-   その際もentryのlocationとrouteを扱い、別visitの同pathを探し回らない。
-4. 上限100件によって境界も入口entryも既に落ちていた場合は、残存する当該visit以後の履歴を
-   forward側へ移す計画とし、保持した入口へ退出する。prune済みの古いBack prefixや別slotの履歴を復活させない。
-   境界不在かつ末尾が入口でない場合のこの扱いも正常な長時間利用の契約としてテストする。
+3. 普通のBack/Forwardで自己markerを消費済みでも、入口markerが残っていればそのentryまでBack計画に含める。
+4. 入口markerが見つからない場合は、以下の2026-10-30補足を優先する。
+   旧案の「marker脱落後のsuffixを推定してForwardへ移す」は撤回する。
 
 `CanonicalOrigin` は、当該visitのmarker/子の履歴までを同じ計画で処理するが、入場時に積んでいない
 元場所のentryをBackからpopしない。canonicalなtyped originを既存復元経路へ渡す。
@@ -576,7 +575,20 @@ root ownerの `plan_root_exit` は、保持した退出情報と**現在の有�
 `DriveList` も当該visitを処理してドライブ一覧を採用する。どちらも合成pathの親へは落ちない。
 これらの計画も、宛先のprepare/adoptionと同じ要求でcursorをcommitする。
 
-**forwardの規則は、自己markerを除き、途中を描画せず同じ回数のBackをした結果に揃える。**
+**2026-10-30 ClaudeCode設計担当による補足（実装停止理由への決定）**:
+
+- 判定は、入口markerが現在の有効な履歴に見つかるかの1つとする。見つかる場合だけ上記のBack計画を使う。
+- 見つからない場合（検索overlay経由の非記録入場、履歴上限による脱落等）は、入場直後/脱落後を区別しない。
+  rootが保持する完全な `TopLevelGridOrigin` へ**通常の前進ナビゲーション**で移る。
+  アドレスから場所を開く場合と同じ既存Directの規則で現在位置をBackへ1件記録し、forwardを扱う。
+  既存entryを推定でpopしたり、Back/Forwardを再構築したりしない。
+- 両方式の宛先、行・scroll・native帰路の復元payloadは同じ。入力元や現在のAppの残存slotから取り直さない。
+- 新しい履歴境界field、脱落推定guard、入場前prefixを復元する独自の履歴検索は作らない。
+  現在の履歴と既存の場所/route照合でmarkerの有無を確認できる範囲だけを使う。
+- この補足は下の旧stack例のうちmarkerなしの履歴操作を置き換える。
+  起動直後の入口なしも既存DirectでDriveListへ移り、rootの型付きpayloadを記録する。
+
+**markerありのforwardの規則は、自己markerを除き、途中を描画せず同じ回数のBackをした結果に揃える。**
 既存forwardをclearせず、その末尾へ仮currentを既存の重複整理規則で積む。
 連続する自己markerのための余分なrootを追加しない。実際に別の本や子を挟んだ複数回のroot訪問は残し、
 訪問自体や本の履歴を一括削除しない。出口へ移動した後の通常のForwardは1件ずつ戻す。
@@ -589,7 +601,9 @@ root ownerの `plan_root_exit` は、保持した退出情報と**現在の有�
 | 本からReturn `H / [X,O,H] / []` | `O / [X] / [H]` | `H`。自己marker分の余計な1操作なし |
 | 普通のBackで本からroot `H / [X,O] / [B]` | `O / [X] / [B,H]` | `H`、次が `B`。既存forwardも保持 |
 | 計画単体の複数entry例 `H / [X,O,H,B,C] / []` | `O / [X] / [H,C,B,H]` | 入場root、`B`、`C`、最後のroot。途中の訪問を削除しない（実Folder子からReturnを新たに許す意味ではない） |
-| 起動直後 `H / [] / []` | `DriveList / [] / [H]` | 元の `H`。その親は再びDriveListで、data_dirには進まない |
+| 検索経由・入口markerなし `H / [X,Y] / [F]` | `O / [X,Y,H] / []`（Direct） | 既存Directどおりforwardなし。入場前のentryを推定で消費しない |
+| 上限で入口marker脱落 `H / [E1,…,E100] / [F]` | `O / [E2,…,E100,H] / []`（Direct） | 通常の100件制限以外のentry消費/再構築をしない |
+| 起動直後 `H / [] / []` | `DriveList / [H] / []`（Direct） | rootをBack側に記録。合成pathの物理親へ進まない |
 
 rootの位置・facet routeも同じadoptionで復元する。入口に戻るときに子名 `__reading_history__` を
 選択hintにせず、入口側の既存の保存選択/scrollを使う。
@@ -703,6 +717,7 @@ BA-7に該当するApp側フラグの追加、時間窓、rect/HWND推測、再�
 | Appにroot originや戻り待ちのfieldを追加し、既存path帰路と並存 | 不採用。open/Return/replay/取消で不一致になる組合せを増やす。既存variantと帰路payloadの型置換で1つにする |
 | 入口を履歴entryだけにして、退出直前にRating/展開等のApp slotから補完 | 不採用（P2×2）。普通の本openがslotを消すため成立しない。path投影の前に完全なpayloadを捕捉し、同じnative ownerへ渡す |
 | 合成一覧の入れ子を禁止/平坦化する / 一覧の組ごとの専用帰路を増やす | 不採用（§3.0）。前者は出荷済みの戻りを失い、後者は組合せを増やす。共通のtyped originで表現を一本化し、Ratingの旧帰路対を置換する |
+| marker不在時の入場前prefix/脱落後suffixを識別し、Back/Forwardを組み直す | **不採用（2026-10-30補足）**。検索経由/上限超過の組合せを扱う境界状態を増やさず、どちらも既存Directへ揃える。完全な入口payloadで行先と位置を維持し、履歴操作だけ通常の前進規則を使う |
 | 通常Back/Forward全体で同値地点をskip、Return時にstackを全整理 | 不採用。親以外の1件移動や、別visit・facet routeの履歴まで変える。root退出だけの計画に限定する |
 | 本を閉じるたびにrootを新規Menuとして作り直す | 不採用。入口を本に上書きし、既存の行/scroll復元も失う。Returnは同じrootを再構築する |
 | 閲覧履歴中/退出中の操作を新しいmodalで止めて組合せを除く | 不採用。通常の親操作・履歴入力を制限する。長い変換等は既存modalが既に所有し、今回の退出は既存navigation transactionで処理できる |
@@ -781,6 +796,10 @@ BA-7に該当するApp側フラグの追加、時間窓、rect/HWND推測、再�
     ★rootでの星数切替・sort/reload・membership更新・準備取消でもH1の帰路を維持し、
     戻り先なしの場合や、元場所が通常Folder/DriveList/展開/Bookmarksの場合の既存close結果を保つ。
     代表的なnative owner間の往復と共通型の再帰payload試験を組み合わせ、一覧A×一覧Bごとの専用実装を前提にしない。
+15. **marker有無の補足の必須受入**：入口markerあり、検索overlay経由でmarkerなし、100件上限でmarkerが脱落、
+    の3条件で同じ入口へ退出し、その入口の選択行・scrollを復元する。
+    markerありはBack計画の両stack全文、markerなしは既存Directと同じ記録/forward処理をassertする。
+    unrelatedなentryを推定で消費・改変せず、脱落したprefixを再作成しないことも検査する。
 
 実装時の順序は、pure plan → `section1473` → 関連handler/owner試験 → gate。
 build/testでは必ず `MSBUILDDISABLENODEREUSE=1`。
@@ -789,7 +808,7 @@ build/testでは必ず `MSBUILDDISABLENODEREUSE=1`。
 `cargo fmt` / `cargo fmt --check` / `git diff --check` を行い、UI文言を変えた場合はglyph検査も行う。
 テストをignoreしたり、不変条件を弱めたりして緑にしない。製品修正後の確認用buildは既存方針に従うが、起動はしない。
 
-今回は設計だけなので、過去13件の11成功/既知不具合2失敗という証拠を保持し、新たな成功結果とは扱わない。
+設計承認時点では、過去13件の11成功/既知不具合2失敗という証拠を保持し、新たな成功結果とは扱わない。
 実装受入時はこの2失敗を含め全対象greenであることが必要。実マウス/実キー・配布portableの既定data_dir・
 native HWND等の実機確認は別の了承済み検証枠に残し、headless結果を実機確認済みとは書かない。
 
@@ -825,3 +844,196 @@ viewer/slotの所有分離に加え、**展開state全体の配送と、★→H1
 今回の改訂は残ったP2×1への対応であり、実装済み/今回の改訂の再レビュー承認済みとは扱わない。
 新しい利用制限・確認操作・待機を要する点は今回のソース監査では見つかっていない。
 製品コード変更・ビルド・テスト・製品起動・コミットは行わず、設計再レビューへ返す。
+
+## 実装着手と停止の記録（承認設計 `cae94fb27` の続き）
+
+2026-10-30。ClaudeCodeから独立設計レビューACCEPT（P1/P2/P3なし）と構造的修正への双方同意を受け、実装へ着手した。
+**履歴境界の前提不足を実装中に発見し、依頼の「前提がコードと食い違ったら止める」に従い停止した。**
+設計を黙って変更する、推定guardを加える、境界fieldを追加する、という対応はしていない。
+
+### 止めた理由：canonical入場前のBackと、marker消失後のBackを識別できない
+
+承認設計§4は、次の両方を要求している。
+
+| 状態 | 必要な退出計画 |
+| --- | --- |
+| `O → 検索 → H` の直後。Hは `CanonicalOrigin(O)`、入場前からBackに `[X,Y]` がある。Hの自己markerはまだない | Backの `[X,Y]` を保持し、HからOへ退出。入場前の履歴を消費しない |
+| canonical入場したHの帰路を保持する別一覧・子への遷移を重ね、履歴上限でHのmarkerが脱落した状態 | 承認設計のtruncation規則では、当該visit以後の残存履歴をForwardへ移し、Oへ退出。落ちた古いBack prefixを復活させない |
+
+基準ソース `cae94fb27:src/app.rs` の `adopt_synthetic_surface`（26594付近）は検索中の入場を
+`MainHistoryOperation::Restore` へ変え、既存cursorを動かさない。
+一方 `push_folder_nav_stack`（24820付近）は100件を超えた先頭を除去する。
+保持するrootは `visit { context, surface_generation, switch_sequence }` と退出originだけであり、
+**入場前のBack prefixと、入場後のsuffixの境界を表す情報を持たない**。
+場所/routeの値は再訪で同じになり得るため、現在のentry値やpath一致から境界を推測してはいけない。
+
+実装途中の `reading_history_origin.rs::FolderHistoryPlan::reading_history_root_exit` で
+marker不在を一律に先頭まで消費すると、最初のケースの既存Backまで消費してしまう。
+逆に一律に保持すると、設計のtruncation時のForward規則を満たせない。
+これは型/所有境界と退出契約を確定するための情報不足であり、入力ごとの分岐追加では解消しない。
+後者の具体的な長時間操作列の実行再現は未実施で、ここでは承認設計が要求する状態に対するソース/状態モデルの照合を記録する。
+
+設計補足が必要な論点は、root入場時に履歴境界もimmutable payloadとして所有するか、
+その境界をtruncation・replay・slot切替後もどう解釈するかである。
+停止時点では境界の表現と採用は**未決定**だった。単なるBack件数やpath探索で決め打ちせず、設計担当と独立レビューへ返した。
+通常操作の制限や、履歴保存を落とす方針への変更は行わない。
+
+### 保存した差分と検証状態
+
+作業開始時のtreeはclean。未コミットの作業差分を保持しているが、**実装途中でありコンパイル成立を確認していない**。
+修正完了・出荷可能・実機未確認の完成状態としては扱わない。
+
+- typed root/origin/BookReturn/Rating帰路対置換、capture/dispatchとroot退出計画の骨格。
+- `grid_parent.rs` の共有action/実行、Tag、toolbar、mouse/ring/Pad、Everything下位親への接続の初稿。
+- 変換書庫の帰路payload保持、描画後dispatch、bundleの帰路移譲の追従。
+- 既存テストfixtureの型移行、赤いroot再現テストの入口/選択assert強化、§9.8〜14等のruntime受入テストの初稿。
+
+未完はSubfolder/Smart/Collection/Bookmarkの完全payload配送、残る型参照/inline test、pure plan試験、
+adapter/slot/sibling回帰の追加・実行、全体コンパイル/指定gate、関連マニュアル/仕様書の完成更新である。
+旧帰路の撤去を含む移行全体は完了していないため、この差分をそのまま統合しない。
+
+`git diff --check` は停止時の差分で通過。担当の新規 `grid_parent.rs` だけは停止前にrustfmtを実行したが、
+要求された全体の `cargo fmt`、2種類のcargo check、focused/full gate、glyph、viewer_context_auditは**未実行**。
+Cargoによる成功証拠や、追加テストの実行結果はまだない。過去の調査結果をこの実装差分の検証へ流用しない。
+製品起動・デスクトップ操作・実データ変更・確認用build・コミットは行っていない。
+
+## 実装再開（2026-10-30、設計担当補足）
+
+上記の停止後、設計担当から§4・§8・§9.15の補足を受領した。
+入口markerが現在の履歴にある場合だけまとまったBack計画を使い、存在しない場合は
+同じ完全な入口payloadへ通常Directで移る。検索経由と上限脱落を区別する状態を追加しない。
+この補足を設計へ追記した後、保存差分から実装を再開した。上記の停止時点の未実行・未完記録は履歴として残す。
+
+### 実装の所有境界
+
+- `top_level_grid_view.rs` にvisit付きReadingHistory root、BookReturn、完全なRating帰路、
+  Bookmark/Smart/Collection/物理子の復元payloadを置く。入口捕捉時にAppの外部slotから必要な値をまとめ、
+  退出時の残存slotや履歴検索で欠落値を補わない。Ratingの旧path/展開restore対は撤去する。
+- `reading_history_origin.rs` に入口捕捉・native ownerへの明示配送・root退出計画を置く。
+  `MainListNavigation.destination` が既存requestの寿命に沿って復元先を所有し、成功adoptionで採用する。
+  本からのReturnは同じroot/visitを保ち、通常Back/Forwardの1件移動は変えない。
+- `grid_parent.rs` で副作用のない親actionを決め、previewと実行の入口を揃える。
+  Tag、Snapshot、検索、Rating、ZIP内部、合成rootの既存優先順を保ち、
+  BS/Alt+↑/再割当キー/親ボタン/mouse/ring/gesture/Pad/背景操作から配送する。
+  Everythingの下位物理親は専用委譲とし、上位検索ownerへ再帰させない。
+- 変換書庫では元containerと帰路payloadを一緒に保持し、cache実体のpathだけに射影しない。
+  viewer bundleは既存のmove/swap/fork契約を使い、main履歴の所有範囲を広げない。
+- 実装中レビューで、SmartのDirect採用時にorigin routeを失う点と、連続Back/Forward・EPUBの別名PDF保存で
+  宛先変更後も旧payloadを持つ点を修正対象にした。Smartの受付でoriginを捕捉し、cursor/保存先を変えるproducerで
+  typed destinationも同時に差し替える。採用側のpath一致guardや新しいApp pendingは追加しない。
+
+### 受入条件と自動テストの対応
+
+以下は追加・強化した試験の対応表。実行結果は検証記録で別に示す。
+
+| 設計§9 | 主な試験 |
+| --- | --- |
+| 1–2 | 既存`history_parent_1473.rs`の赤2件を含む13件（root60条件・他root110条件、書庫/EPUB/履歴▼/raw Back） |
+| 3 | `reading_history_origin.rs::section1473_root_exit_plan_*` 5件（stack/route/visit/上限/slot全文） |
+| 4, 8–10, 12–14 | `nested_history_rating_*`、`expansion_entrance_owns_complete_restore`、`rating_exit_keeps_its_own_complete_origin`、`folder_descendant_does_not_resurrect_expired_book_return` |
+| 5 | `grid_parent.rs::section1473_router_*` 3件と既存headless toolbar/背景pointer試験 |
+| 6, 10, 14 | `history_parent_lifecycle_1473.rs::section1473_lifecycle_*` 5件（未採用/反復/取消/slot退役/Rating更新/None/Bookmarks） |
+| 7 | `history_parent_context_1473.rs::section1473_*` 3件（mount/swap/stash/fork/retire、独立同PDFのticket/job不変） |
+| 11 | `other_owned_entrances_survive_history_and_book`、`bookmark_entrance_restores_stable_key_and_scroll_then_its_parent`、`smart_and_collection_physical_entrances_keep_native_root_and_origin`、`search_transfers_complete_canonical_origin`、`snapshot_keeps_input_specific_admission_and_parent_owner` |
+| 15 | `marker_presence_selects_back_or_direct_without_losing_entrance_position`（通常/portable相当×3条件、行/scroll/両stack全文） |
+| 同型producer監査 | `rapid_history_rebinds_typed_and_plain_physical_destinations`、`rapid_smart_history_rebinds_destination_before_cross_kind_handoff`、`direct_smart_entry_captures_source_route_before_adoption` |
+
+runtime fixtureは一時data_dirと一時libraryだけを使う。入口なし→本→root退出→通常Backでのroot復元も
+`history_without_entrance_keeps_drive_exit_after_book_and_replay`で検査する。
+
+### ビルド・検証の途中記録
+
+すべてのCargo実行で `MSBUILDDISABLENODEREUSE=1` を設定した。
+初回のcore checkはcold native buildの`turbojpeg-sys`並列ビルドで失敗したため、依頼の許容範囲で`-j 1`へ切り替えた。
+以後はnative buildを通過し、型移行のコンパイルエラーを修正した。
+`cargo check -p mimageviewer --lib --tests --features test-script -j 1` は追加テスト込みでexit 0
+（`target/section1473-test-check-2.log`）。`cargo fmt`（引数なし）と整形後の`git diff --check`も通過した。
+`viewer_context_audit`は初回、新テストmoduleのtest-only属性の認識でA6が2件出たため、
+crate-levelの`cfg(all(test, windows))`を明示し、再実行はexit 0・違反0
+（`target/section1473-context-audit-2.log`）。
+`test-focused.ps1`は共通型/文書を含む変更としてexit 2、部分テストを実行せず全library試験を案内した。
+UI glyph検査もexit 0。この段階ではruntime test・最終gateの成功証拠とは区別する。
+
+初回の `cargo test -p mimageviewer --lib section1473 -j 1 -- --test-threads=1` は
+44件中38成功・6失敗（`target/section1473-tests-1.log`、初回実行体ビルド9m56s、試験169.92s）。
+調査時に残したroot/Tagの赤2件、pure plan/rapid回帰8件、context3件、lifecycle5件は成功した。
+失敗はrouter3件、検索経由の入口行/scroll、Rating物理子の退出、Snapshot入口の6件。
+routerのkeyboard-owner公開省略等のfixture問題と、Ratingの旧native nav chainの退役漏れを切り分けた。
+検索の普通Folder位置は、既存の`folder_history`保存が物理load固有の`save_leaving_folder_grid_position`にあり、
+検索row採用の共通出発保存に接続されていなかった。入口位置を新fieldで持ち直さず、既存位置ownerの保存を
+row交代の共通境界へ集約する。これらの修正後の結果は別に記録する。
+
+## 再停止：Snapshotの固定ownerに関する設計前提不足（2026-10-30）
+
+### 確認結果と停止理由
+
+2回目の `cargo test -p mimageviewer --lib section1473 -j 1 -- --test-threads=1` は
+**45件中44成功・1失敗**（`target/section1473-tests-2.log`、実行体ビルド10m03s、試験324.89s）。
+前回6失敗のうち、router3件、検索経由の行/scroll、Rating物理子は解消した。
+追加した `section1473_snapshot_subset_cannot_overwrite_ordinary_entrance_position` も成功した。
+調査で残した赤2件、§9.12〜15、pure plan、context3件、lifecycle5件は成功している。
+
+残る失敗は `section1473_snapshot_keeps_input_specific_admission_and_parent_owner`
+（`src/app/tests/history_parent_1473.rs:1506`）。一時data_dirの通常配置で、
+`普通Folder O → Snapshot固定 → ファイルメニューで閲覧履歴 → 親` を実行すると、
+固定stateを維持しOへ戻るassertまでは成功するが、**`items_are_reading_history_view` がtrueのまま**で失敗する。
+最初の試験での入場失敗は、Snapshotの非同期準備が終わる前にMenuを呼んだfixtureの問題だった。
+準備の完了を実pollで待った2回目では入場でき、上記の行owner不一致が独立して残った。
+portable相当を含むloopの最初の条件で止まるため、この失敗をportable側でも実測したとは扱わない。
+
+ソースを照合すると、単なるflagのクリア漏れより広い所有境界がある。
+
+| 境界 | 現在の処理と不足 |
+| --- | --- |
+| 固定（`snapshot_ops.rs::activate_snapshot`, ~912/1147） | 固定rowsは`SnapshotState`へ置くが、canonical `TopLevelGridOrigin`/routeは`TopLevelGridView::begin_with_origin(Snapshot, ...)`にしか置かない |
+| Snapshotの値（`src/snapshot.rs::SnapshotState`, ~530） | 保存rows・固定rows・path・recipe等を持つが、完全なcanonical origin/routeと固定list再採用の行ownerを所有していない |
+| H採用（`app.rs::install_reading_history_surface`, ~34733/34773、`install_prepared_reading_history_entries`, ~35050） | `replace_surface(ReadingHistory(...))`が固定Snapshot側の唯一のcanonical slotを置き換える。Hのexitへ入口は捕捉されるが、Snapshot ownerへの保持/再配送の契約はない |
+| surface交代（`top_level_grid_view.rs::replace_surface`, ~1836/1862） | surfaceを変え、`return_to=None`とする。これは通常の新surface採用として妥当だが、残っているSnapshot固定ownerとの分担を表していない |
+| 固定list復帰（`snapshot_ops.rs::snapshot_return_to_list_view`, ~1543） | rows/path/recipeを戻し、surface・行flag/来歴・canonical origin/routeは再採用しない。従ってH由来のsurface/flagが残る（flagは上記試験で実測、surface/帰路の不一致はソース照合） |
+| 親選択（`grid_parent.rs::grid_parent_action`, ~359） | Snapshotのoriginとcurrent pathの一致でlist復帰を選ぶ。**ReadingHistory由来の固定 → Menuで別のH**では両pathが`__reading_history__`となり、固定listと別surfaceを識別できない。この条件はソース上の未試験経路である |
+
+`deactivate_snapshot` / `dismiss_snapshot_with_origin` も既に置き換えられたTopLevelGridViewからcanonicalを取り直す。
+したがって設計§3.1/§9.11の「固定ownerを同contextに保持し、既存list復帰へ委譲すれば完全に戻る」という前提が成立しない。
+独立レビュー（GPT-6.1 Sol / xhigh）も**P2相当の設計前提不足として停止に同意**した。
+行flagだけ落とす、H.exitからSnapshot由来を逆算する専用分岐、汎用return_toの並列保持は行っていない。
+通常操作を不便にするためSnapshot中のファイルメニュー入場を禁止する変更も行わない。
+
+### 再開に必要な補足設計
+
+1. Snapshotの固定ownerとcanonical origin/routeの**単一の所有者**を決め、別の一時surfaceを採用しても失わない配送を定義する。
+   新しいbool/並列Optionや、退出時の履歴検索で補う案にしない。
+2. 固定listの再採用を、rows/pathだけでなくsurface・行provenance・routeまで含むowner操作として定義する。
+   Snapshot解除/一時ビュー切替/fork/closeも同じ所有契約へ接続し、固定stateを複製して解決しない。
+3. 「固定listを表示中」と「同じpathの別surfaceを表示中」を型付きowner/既存row provenanceで識別する。
+   物理Oの現在のfixtureに加え、ReadingHistory/★/Bookmarks/検索由来の固定、同pathのH入場、
+   親を続けた場合、固定解除/別一時ビューへの移譲、context/siblingの受入を確定する。
+
+実装者はこの補足を決め打ちせず設計担当へ返す。現在の共通root/帰路の製品差分と成功済み試験は保存するが、
+このまま統合・出荷しない。§1.473は「実装済み・実機未確認」へ進めず、実装途中とする。
+
+### 停止時点の差分と検証
+
+- 製品の主な変更先：`app.rs` / 新規`reading_history_origin.rs` / `top_level_grid_view.rs`（typed root/帰路/退出計画/位置保存）、
+  新規`grid_parent.rs` / `gamepad_input.rs` / `ui_main.rs` / `global_search_ui/everything.rs`（親受付）、
+  `subfolder_expansion.rs` / `smart_folder.rs` / `collection_grid.rs` / `collection_navigation.rs` / `snapshot_ops.rs` / `close_return.rs`
+  / `viewer_context_registry.rs` / `update_phases.rs` / `ui_dialogs/archive_convert.rs` / `ui_dialogs/collections.rs`（native配送・変換・bundle・表示追従）。
+  `snapshot_ops.rs`の製品変更はSmart restore wrapperのmutアクセス追従のみで、今回のSnapshot所有境界へは手を入れていない。
+- `history_parent_1473.rs`の受入強化、新規`history_parent_context_1473.rs` / `history_parent_lifecycle_1473.rs`、
+  pure/adapter試験、既存fixtureの型移行を保存。PDFパスワード/書庫変換取消のtyped帰路全文assertは追加済みだが、
+  個別実行/全library gateは停止時点では未実行。
+- 関連仕様3文書とマニュアル2ページは新しい通常の親規則へ更新した作業差分で、機能全体の完成を意味しない。
+  backlogとdetached§11には今回の停止と未完を明記した。コミットはしていない。
+
+| コマンド | この停止差分の結果 / 証拠 |
+| --- | --- |
+| `cargo fmt`（引数なし） | 成功。2回目試験の前に全体整形 |
+| `cargo check -p mimageviewer --bin mimageviewer-core -j 1` | exit 0、`target/section1473-core-check-final.log` |
+| `cargo check -p mimageviewer --lib --tests --features test-script -j 1` | exit 0、`target/section1473-test-check-final.log` |
+| `cargo test -p mimageviewer --lib section1473 -j 1 -- --test-threads=1` | exit 101、44成功/1失敗、`target/section1473-tests-2.log` |
+| `scripts/test-focused.ps1` | 共通変更としてexit 2、`target/section1473-focused.log` |
+| `scripts/test-lib-full.ps1` / `scripts/test-full.ps1` | **未実行**。新たな設計前提不足で停止し、既知の赤を含む完成gateへは進めていない |
+| `python scripts/check_ui_glyphs.py` | 途中差分でexit 0。以後UI文字列の変更なし |
+| `cargo run --locked -p viewer_context_audit` | 途中差分でexit 0・違反0（`target/section1473-context-audit-2.log`）。その後の位置保存/Rating退役変更を含む最終監査は未実行 |
+
+Cargoはすべて`MSBUILDDISABLENODEREUSE=1`。製品起動・desktop操作・通常設定/実データの変更・
+確認用build・コミットは行っていない。以後の製品変更とgateは補足設計を受領するまで停止する。

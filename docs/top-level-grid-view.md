@@ -1,5 +1,26 @@
 # 最上位一覧ビューの ownership とスマートフォルダ scope
 
+## 合成一覧の親と完全な帰路（§1.473）
+
+一覧の親入力とtoolbar previewは `app/grid_parent` の同じ純粋なaction解決を使う。
+検索/Tag/Rating/ZIP等のnative ownerが親を決め、root停止と「所有者なし」を区別する。
+入力adapterはIME/modal/viewport等の受付条件を保ち、行先のif列を複製しない。
+Everythingの既存scope判定後の物理親だけは下位操作へ渡し、検索ownerへ再入しない。
+
+ReadingHistoryのrootはvisit identityと完全な `TopLevelGridOrigin` の退出先を所有する。
+本からrootへのReturnと、rootから入口への退出を区別し、同じ合成pathでも別visitを統合しない。
+入口markerが履歴に残れば自己markerを跨ぐBack計画、なければ通常Directで同じ入口へ退出する。
+どちらも同じoriginから場所・行・scroll・native帰路を復元し、marker脱落の推定stateは追加しない。
+
+Rating自身の帰路はpath/展開restoreの対から単一のtyped originへ置換し、入場、transition、
+物理子、履歴復元、closeまで運ぶ。`H1 → Rating → H2` から順に戻る場合もH1のvisitと退出先を保持する。
+展開のsnapshot/roots/除外、Collectionのreturn origin、Smartの保存元/帰路、Bookmarksのstable-key位置も、
+現在のApp slotの残存に頼らずcaptureしたpayloadを既存prepare/adoptionへ渡す。
+完全originを通常の履歴identityへ投影する処理と、nativeな復元payloadの寿命を区別する。
+mutableなworker/sessionを共有せず、context/slotを越えた履歴変更やPDF等の失効は行わない。
+
+詳細な契約・状態表・検証は[調査記録の修正設計](history-parent-1473-investigation.md#修正の設計)を参照する。
+
 ## Everything 検索のsourceと物理child（§1.374、未リリース）
 
 Everythingは新しい最上位surfaceを増やさず `TopLevelGridView::Search` を共有する。

@@ -2974,7 +2974,7 @@ mod tests {
                         return_grid: BookmarkViewReturnGridState {
                             row_keys: vec![],
                             selected_key: None,
-                            opened_key: (1, 419),
+                            opened_key: Some((1, 419)),
                             scroll_offset_y: 0.0,
                         },
                     },
@@ -4525,7 +4525,7 @@ mod tests {
             grid: BookmarkViewReturnGridState {
                 row_keys: vec![(0, 1)],
                 selected_key: Some((0, 1)),
-                opened_key: (0, 1),
+                opened_key: Some((0, 1)),
                 scroll_offset_y: 0.0,
             },
         });

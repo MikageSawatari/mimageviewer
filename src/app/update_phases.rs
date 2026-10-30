@@ -1268,6 +1268,10 @@ impl App {
                         self.enter_reading_history_with_entrance(entrance);
                         None
                     }
+                    crate::ui_main::AddressBarNav::ReadingHistoryRootExit => {
+                        self.exit_reading_history_root();
+                        None
+                    }
                     crate::ui_main::AddressBarNav::Bookmarks => {
                         self.enter_bookmark_view();
                         None
@@ -1347,6 +1351,10 @@ impl App {
                             }
                             crate::ui_main::AddressBarNav::ReadingHistory(entrance) => {
                                 self.enter_reading_history_with_entrance(entrance);
+                                None
+                            }
+                            crate::ui_main::AddressBarNav::ReadingHistoryRootExit => {
+                                self.exit_reading_history_root();
                                 None
                             }
                             crate::ui_main::AddressBarNav::Bookmarks => {
@@ -1495,6 +1503,10 @@ impl App {
                     }
                     Some(crate::ui_main::AddressBarNav::ReadingHistory(entrance)) => {
                         self.enter_reading_history_with_entrance(entrance);
+                        None
+                    }
+                    Some(crate::ui_main::AddressBarNav::ReadingHistoryRootExit) => {
+                        self.exit_reading_history_root();
                         None
                     }
                     Some(crate::ui_main::AddressBarNav::Bookmarks) => {

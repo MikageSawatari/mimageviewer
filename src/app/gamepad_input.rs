@@ -9686,28 +9686,7 @@ impl App {
     }
 
     pub(crate) fn handle_gamepad_grid_back(&mut self) -> Option<AddressBarNav> {
-        if self.is_snapshot_active() && self.snapshot_return_to_list_view() {
-            return None;
-        }
-        if self.global_search.active {
-            if self.global_search.drill.is_some() || self.everything_has_physical_child() {
-                self.drill_back_one_level();
-            }
-            return None;
-        }
-        if self.favsearch.active {
-            self.favsearch_back();
-            return None;
-        }
-        if self.local_search_blocks_parent_nav() {
-            self.cancel_pending_folder_nav();
-            return None;
-        }
-        // ネスト ZIP ツリー内なら 1 階層戻る (ルートなら false → 親フォルダへ抜ける)。
-        if self.zip_nav_back() {
-            return None;
-        }
-        self.resolve_grid_parent_nav()
+        self.handle_grid_parent_action()
     }
 
     fn scroll_gamepad_grid(&mut self, direction: f32) {

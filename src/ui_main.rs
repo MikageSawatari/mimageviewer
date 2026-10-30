@@ -356,6 +356,7 @@ pub(crate) enum AddressBarNav {
     },
     DriveList(Option<PathBuf>),
     ReadingHistory(crate::app::ReadingHistoryEntrance),
+    ReadingHistoryRootExit,
     Bookmarks,
     RatingViewBack,
     BooksRoot,
@@ -14778,7 +14779,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let enter_pressed = self.dialog_enter_pressed(ctx);
         let effective_folder = self.effective_folder();
         let has_current = effective_folder.is_some();
-        let parent_nav_target = self.grid_parent_nav_target();
+        let parent_action = self.grid_parent_action();
+        let parent_action_available = parent_action.available();
+        let parent_nav_target = parent_action.into_nav_target();
         let back_target = self.folder_history_back_target().cloned();
         let forward_target = self.folder_history_forward_target().cloned();
         let back_target_label = back_target
@@ -14811,10 +14814,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.show_search_bar || self.search_filter.is_some() || self.search_pending.is_some();
         // 検索の仮想階層でドリルイン中か (= ⬆ で 1 段戻れる / ▲▼ で前後ヒットへ
         // 動ける状態。最上位ではこれらを disabled にする条件)。
-        let search_drilled_in = (self.global_search.active
-            && (self.global_search.drill.is_some() || self.everything_has_physical_child()))
-            || (self.favsearch.active && !self.favsearch.nav_stack.is_empty())
-            || (self.tag_view.active && !self.tag_view.nav_stack.is_empty());
+        let search_drilled_in = search_active && parent_action_available;
         let search_tree_drilled_in = (self.global_search.active
             && self.global_search.drill.is_some())
             || (self.favsearch.active && !self.favsearch.nav_stack.is_empty());
@@ -15225,6 +15225,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     Some(AddressBarNav::ReadingHistory(_)) => {
                                         "閲覧履歴へ戻る [BS]".to_string()
                                     }
+                                    Some(AddressBarNav::ReadingHistoryRootExit) => self
+                                        .reading_history_root_exit_target_label()
+                                        .map(|label| format!("親へ戻る [BS]\n{label}"))
+                                        .unwrap_or_else(|| "ドライブ一覧へ [BS]".to_string()),
                                     Some(AddressBarNav::Bookmarks) => {
                                         "ブックマークへ戻る [BS]".to_string()
                                     }
@@ -15252,7 +15256,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             };
                             if ui
                                 .add_enabled(
-                                    parent_nav_target.is_some()
+                                    parent_action_available
                                         && !snapshot_active
                                         && !local_search_blocks_parent,
                                     egui::Button::new("⬆"),
@@ -15260,12 +15264,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 .hover_tip(parent_hover)
                                 .clicked()
                             {
-                                // BS と同じ優先順位: ネスト ZIP ツリー内なら実フォルダ親へ
-                                // 抜ける前に 1 階層戻る (tooltip も「[BS]」と同挙動を謳って
-                                // いるため。レビュー P3)。ルートでは false → 従来どおり親へ。
-                                if !self.zip_nav_back() {
-                                    result = self.resolve_grid_parent_nav();
-                                }
+                                result = self.handle_grid_parent_action();
                             }
                         }
                     }
@@ -15835,13 +15834,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 }
                 // 検索中の ⬆ ボタン: 検索仮想階層を 1 段ドリルアップ (BS と同じ動作)。
                 if search_drill_up {
-                    if self.global_search.active {
-                        self.drill_back_one_level();
-                    } else if self.favsearch.active {
-                        self.favsearch_back();
-                    } else if self.tag_view.active {
-                        self.tag_view_back();
-                    }
+                    result = self.handle_grid_parent_action();
                 }
                 result
             },
@@ -28840,7 +28833,7 @@ mod grid_reclick_open_tests {
                             grid: crate::app::BookmarkViewReturnGridState {
                                 row_keys: Vec::new(),
                                 selected_key: None,
-                                opened_key: (1, 1),
+                                opened_key: Some((1, 1)),
                                 scroll_offset_y: 0.0,
                             },
                         });

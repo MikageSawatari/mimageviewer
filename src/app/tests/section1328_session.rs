@@ -297,7 +297,12 @@ fn session1328_reading_zip_main_return(input: Session1328ReadingReturn) {
         session1328_settle(&mut app);
         assert!(!app.items_are_reading_history_view);
         assert!(app.zip_nav.as_ref().is_some_and(|nav| nav.at_root()));
-        assert_eq!(app.reading_history_return_from.as_ref(), Some(&zip));
+        assert_eq!(
+            app.reading_history_return_from
+                .as_ref()
+                .map(|reservation| &reservation.container),
+            Some(&zip)
+        );
         let saved_key = crate::path_key::normalize_keep_drive(&zip);
         assert_eq!(
             app.top_level_grid_view
@@ -450,7 +455,7 @@ fn section1328_session_reading_deep_zip_parent_does_not_return_to_history() {
     writer.finish().unwrap();
     app.load_folder(zip.clone());
     session1328_settle(&mut app);
-    app.reading_history_return_from = Some(zip.clone());
+    app.reading_history_return_from = Some(reading_history_return_for_test(zip.clone()));
     app.zip_nav_enter("A/");
     session1328_settle(&mut app);
     app.zip_nav_enter("A/sub/");
@@ -474,10 +479,15 @@ fn section1328_session_reading_deep_zip_parent_does_not_return_to_history() {
     assert!(matches!(
         app.reading_history_back_nav(),
         Some(crate::ui_main::AddressBarNav::ReadingHistory(
-            ReadingHistoryEntrance::Return
+            ReadingHistoryEntrance::Return(_)
         ))
     ));
-    assert_eq!(app.reading_history_return_from.as_ref(), Some(&zip));
+    assert_eq!(
+        app.reading_history_return_from
+            .as_ref()
+            .map(|reservation| &reservation.container),
+        Some(&zip)
+    );
 }
 
 #[test]
@@ -859,7 +869,7 @@ fn section1328_session_r13_cancelled_rating_close_does_not_mark_current_rows_dep
     app.active_quick_folder_slot = None;
     let root = app.tmp.path().join("source");
     session1328_expansion(&mut app, &root, 6);
-    app.rating_view_saved_folder = Some(super::subfolder_expansion_synthetic_path());
+    app.rating_view_return_to = Some(expansion_origin_for_test(&app));
     app.apply_rating_view_result(crate::rating_view::RatingViewBuildResult {
         visibility_notice: None,
         stars: 3,

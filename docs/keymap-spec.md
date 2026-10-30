@@ -659,6 +659,12 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 
 ## グリッドビュー (フルスクリーン外) 共通
 
+「親フォルダへ」(`GridParentFolder`) はキー、親ボタン、マウスボタン、リング/ジェスチャ、Padで
+同じ一覧ownerの規則を使う。閲覧履歴の一覧では開く前の場所へ戻り、入口なしはドライブ一覧へ戻る。
+本から閲覧履歴へ戻る操作と一覧から入口へ戻る操作は別で、ZIP内部は1階層ずつ戻る。
+タグの結果rootでは全入力とも停止し、開いた子からはタグ検索内の帰路を戻る。
+通常の履歴←/→ (`GridHistoryBack/Forward`) は別操作として1件移動を維持する。
+
 Everything ファイル名検索は `GlobalEverythingSearch` / `Grid` / `Press`、既定
 `Ctrl+R`。名前の Global は検索範囲を表し、fullscreen の Global scope へは登録しない。
 main の一覧からだけ開き、text focus / IME（focus recovery を含む）/ modal / Remote lock

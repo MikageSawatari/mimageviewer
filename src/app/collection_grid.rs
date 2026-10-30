@@ -140,6 +140,7 @@ pub(crate) fn resolve_collection_history_child(
                 entry_id: entry.entry_id,
                 source_key: entry.source_key.clone(),
             }),
+            return_to: None,
         },
         root_source_path: entry.source_path.clone(),
         visible_path: saved.visible_path.clone(),
@@ -1178,6 +1179,11 @@ impl App {
             identity: session.identity,
             revision_at_open: session.accepted_revision.max(session.wanted_revision),
             viewport_anchor,
+            return_to: self
+                .top_level_grid_view
+                .return_origin()
+                .cloned()
+                .map(Box::new),
         }))
     }
 
@@ -1251,6 +1257,11 @@ impl App {
                     entry_id: *entry_id,
                     source_key: source_key.clone(),
                 }),
+                return_to: self
+                    .top_level_grid_view
+                    .return_origin()
+                    .cloned()
+                    .map(Box::new),
             }),
             None,
         ))
@@ -1443,9 +1454,7 @@ impl App {
                 path: path.clone(),
                 source,
                 effects: super::GridVirtualOpenEffects {
-                    reading_history_return_from: self
-                        .items_are_reading_history_view
-                        .then_some(path),
+                    reading_history_return_from: self.capture_reading_history_book_return(&path),
                     suppress_rating_filter: true,
                     // Grid activation only exposes rows accepted by the current facet filter.
                     suppress_facet_filter: self.facet_filter_active(),
@@ -1837,6 +1846,7 @@ impl App {
             identity: session.identity,
             revision_at_open: session.accepted_revision.max(session.wanted_revision),
             viewport_anchor: Some(anchor),
+            return_to: None,
         })
     }
 
@@ -2074,6 +2084,7 @@ impl App {
                 identity: CollectionGridIdentity { collection_id },
                 revision_at_open: self.collection_catalog_revision(collection_id).unwrap_or(0),
                 viewport_anchor: None,
+                return_to: origin.clone().map(Box::new),
             },
         ));
         let destination =
@@ -2557,11 +2568,11 @@ impl App {
             .current_folder
             .as_ref()
             .is_none_or(|current| !crate::folder_tree::path_eq(current, load_path));
-        let restore_reading_history = aliased
-            && self
-                .reading_history_return_from
-                .as_ref()
-                .is_some_and(|from| crate::folder_tree::path_eq(from, &path));
+        let restore_reading_history = self
+            .reading_history_return_from
+            .as_ref()
+            .filter(|from| aliased && crate::folder_tree::path_eq(&from.container, &path))
+            .cloned();
         let restore_bookmark_view = aliased
             .then(|| {
                 self.bookmark_view_state
@@ -2628,7 +2639,7 @@ impl App {
             if app
                 .reading_history_return_from
                 .as_ref()
-                .is_some_and(|from| !crate::folder_tree::path_eq(from, &path))
+                .is_some_and(|from| !crate::folder_tree::path_eq(&from.container, &path))
             {
                 app.reading_history_return_from = None;
             }
@@ -2666,8 +2677,8 @@ impl App {
                 app.update_active_quick_folder_target(&path);
                 app.archive_source_override = Some(path.clone());
                 app.transition_favorite_view_for_path(Some(&path));
-                if restore_reading_history {
-                    app.reading_history_return_from = Some(path);
+                if let Some(return_to) = restore_reading_history {
+                    app.reading_history_return_from = Some(return_to);
                 }
                 if let Some(state) = restore_bookmark_view {
                     app.bookmark_view_state = Some(state);
@@ -3682,6 +3693,8 @@ impl App {
         )>,
         page_identity_index: Arc<super::file_type_resume::PreparedPageIdentityIndex>,
     ) {
+        self.save_departing_session_grid_positions();
+        self.retire_rating_navigation_owner();
         // A grid menu owns the old item generation. Do not let its saved row index operate on
         // the newly installed collection; a menu owned by another viewer context is untouched.
         if self
@@ -5044,8 +5057,8 @@ mod tests {
                     },
                     None,
                 ),
-            super::super::FolderNavHistoryTarget::Rating { stars } => {
-                app.start_rating_history_replay(direction, *stars)
+            super::super::FolderNavHistoryTarget::Rating(root) => {
+                app.start_rating_history_replay(direction, root.stars)
             }
             super::super::FolderNavHistoryTarget::RatingPhysical(restore) => app
                 .start_rating_physical_restore(
@@ -7634,6 +7647,7 @@ mod tests {
             },
             revision_at_open: next.revision(),
             viewport_anchor: None,
+            return_to: None,
         };
         let mut pending = app
             .start_collection_history_prepare(restore.clone())
@@ -7692,6 +7706,7 @@ mod tests {
                 },
                 revision_at_open: target.revision(),
                 viewport_anchor: None,
+                return_to: None,
             };
             let history_target = super::super::FolderNavHistoryTarget::Collection(restore);
             app.folder_nav_back_stack
@@ -7967,6 +7982,7 @@ mod tests {
             },
             revision_at_open: snapshot.revision(),
             viewport_anchor: None,
+            return_to: None,
         };
         let old_surface = app.top_level_grid_view.surface().clone();
         let old_items = app.items.clone();
@@ -8026,6 +8042,7 @@ mod tests {
             },
             revision_at_open: snapshot.revision(),
             viewport_anchor: None,
+            return_to: None,
         };
         let mut pending = app
             .start_collection_history_prepare(restore.clone())

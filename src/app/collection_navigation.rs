@@ -254,6 +254,7 @@ impl PreparedCollectionPhysicalNavigation {
                     entry_id: self.target.entry_id,
                     source_key: self.target.source_key.clone(),
                 }),
+                return_to: None,
             },
             root_source_path: self.target.source_path.clone(),
             visible_path: self.target.source_path.clone(),
@@ -3739,6 +3740,7 @@ impl App {
                 entry_id: target.entry_id,
                 source_key: target.source_key.clone(),
             }),
+            return_to: None,
         };
         let location = super::FolderNavHistoryTarget::CollectionPhysical(
             super::top_level_grid_view::CollectionGridPhysicalRestore {
@@ -5125,6 +5127,7 @@ mod tests {
                         entry_id: added.snapshot.entries[0].id,
                         source_key: added.snapshot.entries[0].source_key.clone(),
                     }),
+                    return_to: None,
                 },
                 root_source_path: child.clone(),
                 visible_path: child.clone(),
@@ -5469,6 +5472,7 @@ mod tests {
                     },
                     revision_at_open: unrelated.revision(),
                     viewport_anchor: None,
+                    return_to: None,
                 },
             )
             .into(),
@@ -5963,6 +5967,7 @@ mod tests {
                 },
                 revision_at_open: 1,
                 viewport_anchor: None,
+                return_to: None,
             },
             root_source_path: folder.clone(),
             visible_path: folder,
@@ -10520,6 +10525,7 @@ mod tests {
                         entry_id: first.entry_id,
                         source_key: first.source_key.clone(),
                     }),
+                    return_to: None,
                 },
             )),
         );

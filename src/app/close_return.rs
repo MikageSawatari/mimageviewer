@@ -104,6 +104,7 @@ impl App {
                 source_location: self.folder_nav_current_entry(),
                 source_proof: self.copied_destination_source_proof(),
                 history: MainHistoryOperation::Direct(DirectNavigationPurpose::Navigation),
+                destination: super::MainListRestoreDestination::Native,
                 selection_after_load: None,
             },
             bookmark_request_id: crate::bookmark_browser::BookmarkOpenRequestId(

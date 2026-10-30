@@ -5229,7 +5229,7 @@ mod tests {
             grid: crate::app::BookmarkViewReturnGridState {
                 row_keys: vec![(0, 7)],
                 selected_key: Some((0, 7)),
-                opened_key: (0, 7),
+                opened_key: Some((0, 7)),
                 scroll_offset_y: 125.0,
             },
         });

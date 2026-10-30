@@ -1455,6 +1455,38 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### §1.473 合成一覧の親・typed帰路（2026-10-30、実装途中で停止）
+
+承認設計 `cae94fb27`（[調査・設計記録](history-parent-1473-investigation.md)）に対し、
+独立設計レビューとClaudeCode/Codexは、合成rootと帰路の所有を直す構造的修正である点に合意した。
+着手した差分では `ViewerContextBundle` のReadingHistory帰路を元path＋typed originのpayloadへ、
+Ratingのpath/展開restore対を単一のtyped originへ置換し、既存構築・swap/moveのfield移譲を追従している。
+親入力の共有では、キー/背景にあったdetached保護・closeをmouse/ring全体へ広げず既存presentation境界を保つ方針である。
+HWND/rect/viewport/placement、park/promote/retireの述語やmain履歴の所有判定を変える目的の修正ではなく、
+Appの新しいdetachedフラグ、時間窓、回復処理は追加していない。
+
+root退出のBack境界を識別する情報が承認設計に不足することを発見し、依頼どおり実装を停止した。
+差分は未完成・コンパイル未確認であり、bundle/siblingの退行試験も未実行。
+本記録は実装完了や独立実装レビュー承認の宣言ではない。再開時は境界の設計補足を先に合意し、
+context/slotの所有、fork/closeと同じPDFを読むsibling不変の回帰を完了する。
+停止理由と未完範囲は調査記録末尾の「実装着手と停止の記録」を参照。
+
+再開（同日）: 設計担当からmarker不在時は通常Directへ揃える補足を受領し、
+設計へ記録して再開した。ReadingHistoryの帰路とRatingの帰路対をimmutableな共通originへ置換し、
+既存bundleのswap・park複製・close用originの移譲へ乗せる。Rating native表示stateをforkへ複製する規則には変えない。
+専用のheadless回帰はmount/swap/retire、stash/fork、main root退出時に同じPDFを読むsiblingの
+ticket・世代・cancel・待機jobが保たれることを対象とする。実行結果は調査記録の検証欄へ記す。
+
+再停止（同日、Snapshot前提不足）: 上記context回帰3件は成功した。pure plan/共通親/ライフサイクル等を含む
+`section1473`は45件中44成功・1失敗で、残るSnapshotは固定listのrows/pathへ戻ってもHの行flag/surfaceが残る。
+Snapshotのcanonical origin/routeは共有TopLevelGridViewにしかなく、H採用が置き換えるため、
+設計の「既存固定owner保持＋既存list復帰だけで完結」という前提を補う必要がある。独立レビューも停止に同意。
+SnapshotStateへの新slot、flagだけの修正、pathからの逆算は追加せず、製品差分は未完成のまま保存している。
+位置保存の集約ではbundle外のfolder_historyをmain ownerに限定し、Snapshot/集約行を既存recipeで除外した。
+HWND/viewport、park/promote/retireの述語、入力ごとの既存presentation cleanupは変えていない。
+2種類の指定cargo checkは成功、全library/最終gateと最終監査は未実行。補足設計を受領してから再開する。
+詳細と生ログは調査記録末尾の「再停止：Snapshotの固定ownerに関する設計前提不足」を参照。
+
 ### 2026-10-29 §1.480 Enterとdouble-clickの本open受付の共通化
 
 設計担当ClaudeCodeの決定に従い、`accept_grid_container_open`へEnter/double-clickの

@@ -237,13 +237,13 @@ media_position_ms / media_duration_ms を意味を分けた列として保存す
   トーストを出してその行を履歴から削除し、コンテナの中には入らない。外付けドライブ未接続など
   存在しないと断定できない場合は、履歴を残したままトーストだけ出す。`note_reading_history_open` が
   戻り先予約 (`reading_history_return_from`) を更新する: 閲覧履歴ビューで本 (コンテナ) を
-  開いたら本の container パスを焼き付け、閲覧履歴ビュー以外で別コンテナを開いたら捨てる。
+  開いたら本のcontainerパスと元のroot（visit・完全な入口・route）を一つのpayloadへ保存し、
+  閲覧履歴ビュー以外で別コンテナを開いたら捨てる。
   画像 / ページ (非コンテナ) のオープンでは変えない (本の中でページを読むだけなので保持)
 - 本を「親へ戻る」操作で閉じる (Backspace / アドレスバーの親へ戻る / 自動フルスクリーン時の
   Esc 直帰): 実ディレクトリではなく閲覧履歴ビューへ戻る。判定は `reading_history_back_nav()`
-  (= `effective_folder()` が `reading_history_return_from` と一致する間だけ ReadingHistory を
-  返す)。`grid_parent_nav_target` / `resolve_grid_parent_nav` / `resolve_return_to_parent_nav`
-  の 3 経路で同じ判定を通す
+  (= `effective_folder()` がBookReturnのcontainerと一致する間だけ、同じrootへのReturnを返す)。
+  Gridの親previewと実行は共有resolverを通し、viewerの`resolve_return_to_parent_nav`も同じ帰路判定を使う。
 - **戻り先予約の寿命管理**:
   - ネスト ZIP の深い階層 (`zip_nav` が root でない) では `reading_history_back_nav` は
     None を返す (`effective_folder()` は深さに関わらず root ZIP のままなので、明示的に弾く)。
@@ -254,13 +254,12 @@ media_position_ms / media_duration_ms を意味を分けた列として保存す
   - **変換アーカイブの例外**: 閲覧履歴の RAR/7z/LZH を開くと `open_archive_via_cache` /
     変換完了処理が `load_folder(cache_zip)` を呼ぶため、`cache_zip != 元アーカイブ` で予約が
     `load_folder_with_scan` のクリアに巻き込まれる。`archive_source_override` を元パスへ戻すのと
-    同様に、ロード前に「予約が元アーカイブと一致したか」を退避し、ロード成功後に
-    `reading_history_return_from = 元アーカイブ` を書き戻す (= 閉じると閲覧履歴へ戻れる)。
-    閲覧履歴以外から開いた変換アーカイブでは退避フラグが立たないので誤保持しない
-- 閲覧履歴の合成パスは履歴 back/forward スタックに積まない (`record_folder_nav_transition` /
-  quick folder target capture で `__search_results__` と同様に除外)。閲覧履歴へ戻るのは上記
-  「親へ戻る」専用経路だけにし、Alt+← で実体のない合成パスを開こうとする事故を防ぐ
-- Backspace: 閲覧履歴へ来る前の場所に戻る。起動直後はドライブ一覧またはデスクトップへ
+    同様に、ロード前に元アーカイブと一致する型付きBookReturn全体を退避し、ロード成功時に
+    同じpayloadを採用する (= 閉じると同じvisitの閲覧履歴へ戻れる)。
+    閲覧履歴以外から開いた変換アーカイブでは帰路payloadがないので誤保持しない
+- 閲覧履歴は合成パスを物理folderとして開かず、visitと完全な入口を持つ型付きrootとして
+  Back/Forwardへ記録する。通常のBackは1件移動を保ち、rootからの親退出だけが自己markerを跨ぐ。
+- Backspaceなどの「親」: 閲覧履歴へ来る前の場所に戻る。入口がない場合はドライブ一覧へ戻る。
 - 右クリック:
   - 履歴から削除
   - この本のフォルダに移動 (本を含む実フォルダへ移動して前後の本を探す。
@@ -456,10 +455,18 @@ variant を先に見る。`Drives` と `ReadingHistory` がどちらも「実パ
 
 閲覧履歴は合成ビューなので、検索結果やドライブ一覧に近い扱いにする。
 
-- 閲覧履歴へ入る前の場所があれば Backspace / 履歴戻るで戻る
-- 起動直後など戻り先がなければドライブ一覧またはデスクトップへ戻る
+- 閲覧履歴一覧の「親」（Backspace / Alt+↑ / 親ボタン / 割当操作）は、一覧を開く前の場所へ戻る。
+  起動直後など入口がない場合はドライブ一覧へ戻る。合成pathの物理親へは移動しない。
+- 本から一覧へ戻るReturnと、一覧から入口へ退出する操作を区別する。
+  型付きのroot visit/入口originを保持し、本や別の合成一覧を往復しても入口を取り直さない。
+- 入口markerが現在の履歴にあれば、自己markerを跨ぐ既存typed Back計画で退出する。
+  markerがなければ同じ入口payloadへ通常のDirectで退出し、履歴は通常の前進規則に従う。
+  閲覧履歴の入口退出によるこの処理と、通常の履歴←/→の1件移動は別である。
 - 閲覧履歴内の項目を開いた場合は、通常のフォルダ履歴へ遷移を積む
 - 閲覧履歴自体を「最近開いたフォルダ履歴」には入れない
+
+§1.473の所有境界・Ratingとのtyped帰路・検索のcanonical origin・テストの正本は
+[調査と修正設計](history-parent-1473-investigation.md#修正の設計)。
 
 ### 7.3 last_folder
 

@@ -1891,8 +1891,13 @@ impl App {
     ) -> String {
         match target {
             crate::app::FolderNavHistoryTarget::Path(path) => path.to_string_lossy().into_owned(),
-            crate::app::FolderNavHistoryTarget::Rating { stars } => {
-                format!("レーティング: {}", "★".repeat(usize::from(*stars)))
+            crate::app::FolderNavHistoryTarget::ReadingHistory(_) => "閲覧履歴".to_owned(),
+            crate::app::FolderNavHistoryTarget::Bookmarks(_) => "ブックマーク一覧".to_owned(),
+            crate::app::FolderNavHistoryTarget::Physical(restore) => {
+                restore.visible_path.to_string_lossy().into_owned()
+            }
+            crate::app::FolderNavHistoryTarget::Rating(restore) => {
+                format!("レーティング: {}", "★".repeat(usize::from(restore.stars)))
             }
             crate::app::FolderNavHistoryTarget::RatingPhysical(restore) => {
                 restore.visible_path.to_string_lossy().into_owned()
@@ -6429,6 +6434,7 @@ mod tests {
                 },
                 revision_at_open: deleted.revision(),
                 viewport_anchor: None,
+                return_to: None,
             },
         );
         let retained_target = crate::app::FolderNavHistoryTarget::Collection(
@@ -6438,6 +6444,7 @@ mod tests {
                 },
                 revision_at_open: retained.revision(),
                 viewport_anchor: None,
+                return_to: None,
             },
         );
         app.folder_nav_back_stack = vec![
