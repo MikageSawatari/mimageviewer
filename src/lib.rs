@@ -47,6 +47,8 @@ pub mod ai;
 mod app;
 pub mod detached_window_geometry;
 pub(crate) mod feedback;
+#[doc(hidden)]
+pub use feedback::draw_ai_failure_feedback_snapshot_fixture;
 #[cfg(feature = "dev-tools")]
 pub mod raw;
 #[cfg(not(feature = "dev-tools"))]

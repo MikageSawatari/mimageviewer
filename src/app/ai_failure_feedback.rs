@@ -144,8 +144,8 @@ mod tests {
         );
         assert_eq!(app.fs_feedback_toast_surface, Some(ActionSurface::Viewer));
         let body = report(&app).body().to_owned();
-        assert!(body.contains("ORT code: 6"));
-        assert!(body.contains("job 7"));
+        assert!(body.contains("エラー番号: 6"));
+        assert!(body.contains("処理番号 7"));
         assert!(body.contains("ページ 1/1"));
         for forbidden in [
             PRIVATE,

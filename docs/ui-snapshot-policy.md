@@ -220,11 +220,17 @@ copying_small_light,result_small_dark}` の代表4枚を保持する。製品と
 代表4枚は合計388,195 bytes（約0.37 MiB）。生成後に全4枚を目視確認した。
 App、変換worker、製品起動、実IME入力はこの純描画検査に含めない。
 
-§1.482段Dは`ai_failure_feedback_hover_small_light`の1枚（1093×614、57,181 bytes）で、
+§1.482段Dは`tests/ui_snapshot.rs`の`ai_failure_feedback_hover_small_light`の1枚（1093×614）で、
 本体と同じtoast actionのhover詳細を確認する。固定分類・status番号・job/context/ページ/寸法だけの本文で、
 hoverと明示クリックのコピーが同一であること、hoverだけではコピーしないこと、100%/200%の通知矩形が
 画面内に収まることをheadless回帰で別に検査する。新しいdialogやviewportを作らず、既存の暗色tooltip helperを使う。
-PNGは生成後に目視確認済み。実ORT/GPU障害や製品起動の証拠とは区別する。
+PNGは生成後に目視確認する。libの`ai_failure_feedback_hover_and_explicit_copy`は操作/コピー検査を保持し、PNG比較はintegration側だけが所有する。実ORT/GPU障害や製品起動の証拠とは区別する。
+
+tooltip位置がカーソル画像寸法に依存するfixtureは、実デスクトップの`GetCursorInfo/GetIconInfo`を呼ばない。
+integrationの`SNAPSHOT_CURSOR_EXTENT_PHYSICAL`（上0・下34 physical pixels）を明示して本体共通helperへ渡す。
+enabledな暗色tooltipには`hover_tip_dark_with_cursor_extent`、disabled tooltipには既存の同等helperを使う。
+製品の実カーソル寸法対応は維持する。§1.482の旧lib PNGは実寸/取得不可fallbackの差により
+本文が同一でもtooltip全体が16px移動した。基準画像の単純な再生成や許容差拡大で済ませず、外部入力を固定する。
 
 ## ディレクトリ構成
 

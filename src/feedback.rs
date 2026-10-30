@@ -22,12 +22,12 @@ impl AiFailureReport {
         let label = diagnostic.kind.label();
         let code = diagnostic
             .ort_code
-            .map_or_else(|| "unknown".into(), |code| code.to_string());
+            .map_or_else(|| "不明".into(), |code| code.to_string());
         Self {
             owner,
             summary: format!("AI処理に失敗（{label}）・クリックでコピー"),
             body: format!(
-                "AI処理に失敗しました（{label}）。\nORT code: {code}\ncontext {owner} / 世代 {generation} / job {job}\nページ {page}/{total} / source {}x{}\nこの記録は処理の失敗です。異常終了やGPUの喪失を示すものではありません。\nエラーの原文は既存の詳細ログに残ります。",
+                "AI処理に失敗しました（{label}）。\nエラー番号: {code}\n画面番号 {owner} / 更新番号 {generation} / 処理番号 {job}\nページ {page}/{total} / 入力画像の寸法 {}x{}\nこの記録は処理の失敗です。異常終了やGPUの喪失を示すものではありません。\nエラーの原文は既存の詳細ログに残ります。",
                 source[0], source[1]
             ),
         }
@@ -51,6 +51,14 @@ pub(crate) enum FeedbackAction {
 }
 impl FeedbackAction {
     pub(crate) fn response(&self, ui: &egui::Ui, rect: egui::Rect) -> egui::Response {
+        self.response_with_cursor_extent(ui, rect, None)
+    }
+    fn response_with_cursor_extent(
+        &self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        cursor_extent: Option<(f32, f32)>,
+    ) -> egui::Response {
         use crate::ui_helpers::HoverTipExt as _;
         let response = ui
             .interact(
@@ -61,7 +69,14 @@ impl FeedbackAction {
             .on_hover_cursor(egui::CursorIcon::PointingHand);
         match self {
             Self::RevealPath(_) => response.hover_tip_dark("クリックで保存ファイルを表示"),
-            Self::Diagnostic(report) => response.hover_tip_dark(report.body()),
+            Self::Diagnostic(report) => match cursor_extent {
+                Some(extent) => crate::ui_helpers::hover_tip_dark_with_cursor_extent(
+                    response,
+                    report.body(),
+                    extent,
+                ),
+                None => response.hover_tip_dark(report.body()),
+            },
         }
     }
     pub(crate) fn activate(&self, ctx: &egui::Context) {
@@ -77,6 +92,59 @@ impl FeedbackAction {
             Self::Diagnostic(_) => None,
         }
     }
+}
+
+fn ai_failure_snapshot_report() -> std::sync::Arc<AiFailureReport> {
+    std::sync::Arc::new(AiFailureReport::new(
+        FailureDiagnostic {
+            kind: crate::ai::failure::FailureKind::Inference,
+            ort_code: Some(6),
+        },
+        3,
+        17,
+        655,
+        12,
+        40,
+        [2400, 3600],
+    ))
+}
+
+/// Pure UI fixture shared by the integration snapshot and lib input regression.
+/// Fonts/theme come from the standard snapshot harness; cursor extent is fixed.
+#[doc(hidden)]
+pub fn draw_ai_failure_feedback_snapshot_fixture(
+    ui: &mut egui::Ui,
+    cursor_extent: (f32, f32),
+) -> egui::Rect {
+    let report = ai_failure_snapshot_report();
+    let action = FeedbackAction::Diagnostic(report.clone());
+    let galley = ui.painter().layout_no_wrap(
+        report.summary().to_owned(),
+        egui::FontId::proportional(18.0),
+        egui::Color32::WHITE,
+    );
+    let rect = egui::Rect::from_min_size(
+        ui.max_rect().min + egui::vec2(12.0, 12.0),
+        galley.size() + egui::vec2(32.0, 20.0),
+    );
+    ui.painter()
+        .rect_filled(rect, 8.0, egui::Color32::from_gray(30));
+    ui.painter().galley(
+        rect.min + egui::vec2(16.0, 10.0),
+        galley,
+        egui::Color32::WHITE,
+    );
+    // Match tests/ui_snapshot.rs: physical pixels above/below the hotspot.
+    if action
+        .response_with_cursor_extent(ui, rect, Some(cursor_extent))
+        .clicked()
+    {
+        action.activate(ui.ctx());
+    }
+    // The standard integration helper uses a wrapping Frame. A paint-only
+    // fixture must reserve its viewport so that frame paints its background.
+    ui.allocate_space(ui.available_size());
+    rect
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -270,18 +338,7 @@ mod ai_failure_ui_tests {
     use crate::os_theme::ResolvedTheme;
 
     fn report() -> std::sync::Arc<AiFailureReport> {
-        std::sync::Arc::new(AiFailureReport::new(
-            FailureDiagnostic {
-                kind: FailureKind::Inference,
-                ort_code: Some(6),
-            },
-            3,
-            17,
-            655,
-            12,
-            40,
-            [2400, 3600],
-        ))
+        ai_failure_snapshot_report()
     }
 
     #[test]
@@ -305,7 +362,19 @@ mod ai_failure_ui_tests {
                 5,
                 [6, 7],
             );
-            assert!(report.body().contains("ORT code: unknown"));
+            assert!(report.body().contains("エラー番号: 不明"));
+            assert!(
+                report
+                    .body()
+                    .contains("画面番号 1 / 更新番号 2 / 処理番号 3")
+            );
+            assert!(report.body().contains("入力画像の寸法 6x7"));
+            for internal in ["ORT code", "unknown", "context ", "世代", "job ", "source "] {
+                assert!(
+                    !report.body().contains(internal),
+                    "internal term: {internal}"
+                );
+            }
             assert!(
                 report
                     .body()
@@ -329,8 +398,6 @@ mod ai_failure_ui_tests {
     }
 
     fn harness(scale: f32) -> egui_kittest::Harness<'static, State> {
-        let report = report();
-        let action = FeedbackAction::Diagnostic(report.clone());
         let mut fonts_ready = false;
         crate::test_ui::builder()
             .with_size(egui::vec2(1093.0, 614.0))
@@ -349,29 +416,11 @@ mod ai_failure_ui_tests {
                     }
                     crate::test_ui::full_viewport_ui(ui, |ui| {
                         egui::CentralPanel::default().show(ui, |ui| {
-                            let galley = ui.painter().layout_no_wrap(
-                                report.summary().to_owned(),
-                                egui::FontId::proportional(18.0),
-                                egui::Color32::WHITE,
-                            );
-                            state.rect = egui::Rect::from_min_size(
-                                ui.max_rect().min + egui::vec2(12.0, 12.0),
-                                galley.size() + egui::vec2(32.0, 20.0),
-                            );
+                            state.rect = draw_ai_failure_feedback_snapshot_fixture(ui, (0.0, 34.0));
                             assert!(
                                 ctx.content_rect().contains_rect(state.rect),
                                 "toast fits at {scale}"
                             );
-                            ui.painter()
-                                .rect_filled(state.rect, 8.0, egui::Color32::from_gray(30));
-                            ui.painter().galley(
-                                state.rect.min + egui::vec2(16.0, 10.0),
-                                galley,
-                                egui::Color32::WHITE,
-                            );
-                            if action.response(ui, state.rect).clicked() {
-                                action.activate(&ctx);
-                            }
                         });
                     });
                     state.copied.extend(ctx.output_mut(|output| {
@@ -392,7 +441,7 @@ mod ai_failure_ui_tests {
     }
 
     #[test]
-    fn ai_failure_feedback_hover_snapshot_and_explicit_copy() {
+    fn ai_failure_feedback_hover_and_explicit_copy() {
         for scale in [1.0, 2.0] {
             let mut h = harness(scale);
             h.run_steps(12);
@@ -401,9 +450,7 @@ mod ai_failure_ui_tests {
             h.hover_at(pos);
             h.run_steps(30);
             assert!(h.state().copied.is_empty(), "hover must not copy");
-            if scale == 1.0 {
-                h.snapshot("ai_failure_feedback_hover_small_light");
-            }
+            // PNG belongs to tests/ui_snapshot.rs; this test covers input/copy.
             for pressed in [true, false] {
                 h.event(egui::Event::PointerButton {
                     pos,

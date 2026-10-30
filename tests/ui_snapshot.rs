@@ -86,6 +86,34 @@ fn folder_pane_location_dark() {
 // Physical pixels above/below the hotspot. Never sample the desktop cursor in a fixture.
 const SNAPSHOT_CURSOR_EXTENT_PHYSICAL: (f32, f32) = (0.0, 34.0);
 
+#[test]
+fn ai_failure_feedback_hover_small_light() {
+    let toast_rect = std::rc::Rc::new(std::cell::Cell::new(egui::Rect::NOTHING));
+    let drawn_rect = toast_rect.clone();
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        "ai_failure_feedback_hover_small_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(1093.0, 614.0),
+        move |ui| {
+            ui.ctx()
+                .global_style_mut(|style| style.interaction.tooltip_delay = 0.0);
+            drawn_rect.set(mimageviewer::draw_ai_failure_feedback_snapshot_fixture(
+                ui,
+                SNAPSHOT_CURSOR_EXTENT_PHYSICAL,
+            ));
+        },
+        move |harness| {
+            harness.hover_at(toast_rect.get().center());
+            harness.run();
+            assert!(
+                harness.query_by_label_contains("エラー番号: 6").is_some(),
+                "the actual tooltip must be visible"
+            );
+        },
+    );
+}
+
 #[path = "support/ui_harness.rs"]
 mod test_ui;
 

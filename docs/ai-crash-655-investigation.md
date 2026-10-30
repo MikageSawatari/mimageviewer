@@ -512,21 +512,21 @@ UI は通常 root の描画が可能で、起動 overlay を塞がずに出せ�
 
 ```text
 前回の正常終了を確認できませんでした。
-終了前に観測された情報: 描画用GPUメモリの確保失敗 / Rust panic
-panic観測時刻: 2026-10-30 12:34:56.400 UTC
-最終記録時刻: 2026-10-30 12:34:55.000 UTC（panic観測の1.4秒前）
-表示状態の採取時刻: 2026-10-30 12:34:54.800 UTC（panic観測の1.6秒前）
-表示: context3・世代7・11/30
+終了前に観測された情報: 描画用GPUメモリの確保失敗 / プログラム内部のエラー
+内部エラー観測時刻: 2026-10-30 12:34:56.400 UTC
+最終記録時刻: 2026-10-30 12:34:55.000 UTC（内部エラー観測の1.4秒前）
+表示状態の採取時刻: 2026-10-30 12:34:54.800 UTC（内部エラー観測の1.6秒前）
+表示: 画面番号3・更新番号7・ページ11/30
 実行状態の採取時刻: 2026-10-30 12:34:54.900 UTC
-AI job42: 6/30・高速汎用・DirectML・tile Run中
-入力1440x1920 / 出力5760x7680 / tile512x512・3/20
-job42: 取消要求済み・Run終了未確認
-GPU採取時刻: 2026-10-30 12:34:54.600 UTC（panic観測の1.8秒前）
-描画adapter: vendor 0x10DE / device 0x2684 / DX12 / node0
-local使用量1700 MiB / 予算1900 MiB、nonlocal使用量80 MiB / 予算4096 MiB
-AI adapterとの一致未確認
-CPU採取時刻: 2026-10-30 12:34:54.700 UTC / private 2100 MiB
-mIV x.y.z / ORT 1.24.4 / 記録ID core-1234-5678
+AI処理番号42: ページ6/30・高速汎用・DirectML・分割画像の推論中
+入力画像の寸法1440x1920 / 出力画像の寸法5760x7680 / 分割画像の寸法512x512・3/20
+処理番号42: 取消要求済み・実行終了未確認
+GPU採取時刻: 2026-10-30 12:34:54.600 UTC（内部エラー観測の1.8秒前）
+描画用GPU: メーカー番号0x10DE / 機種番号0x2684 / DirectX 12 / 区分番号0
+GPU側区分の使用量1700 MiB / 予算1900 MiB、システム側区分の使用量80 MiB / 予算4096 MiB
+AI処理GPUとの一致未確認
+アプリのメモリ採取時刻: 2026-10-30 12:34:54.700 UTC / 専用メモリ確保量2100 MiB
+mIV x.y.z / AIライブラリ1.24.4 / 記録ID core-1234-5678
 各状態は最終記録以降に変わった可能性があります。
 観測された情報だけでは終了原因を確定できません。
 ```
@@ -537,13 +537,13 @@ mIV x.y.z / ORT 1.24.4 / 記録ID core-1234-5678
 前回の正常終了を確認できませんでした。原因は記録されていません。
 最終記録時刻: 2026-10-30 10:00:00 UTC / 終了との間隔不明
 表示状態の採取時刻: 2026-10-30 09:59:59 UTC / 表示11/30
-GPU採取時刻: 2026-10-30 09:59:58 UTC / 描画adapter local使用量1700 MiB・予算1900 MiB
-AIの実行状態: 不明 / AI adapterとの一致未確認
+GPU採取時刻: 2026-10-30 09:59:58 UTC / 描画用GPUのGPU側区分の使用量1700 MiB・予算1900 MiB
+AIの実行状態: 不明 / AI処理GPUとの一致未確認
 mIV x.y.z / 記録ID core-1234-5678
 使用量の値だけではメモリ不足を確定できません。
 ```
 
-native の証拠があれば、例2へ「終了前に観測された例外（first-chance）: access violation / code 0xC0000005 / 観測時刻 …。終了原因かは不明」を添える。欠落項目は省略または不明を明示し、架空の値で補完しない。
+native の証拠があれば、例2へ「終了前に観測された例外（処理が続いた場合も含む）: アクセス違反 / 例外番号0xC0000005 / 観測時刻 …。終了原因かは不明」を添える。欠落項目は省略または不明を明示し、架空の値で補完しない。
 
 ### 7. ORT の即時 feedback
 
@@ -818,3 +818,41 @@ modelロード失敗の生本文は従来のloadログに残し、pipelineから
 backlog §1.482を「段A〜D実装済み・実機未確認、段D指定自動検証成功・未コミット・独立レビュー待ち」へ更新した。troubleshootingの`#ai-failure`に通知のhover/明示コピーと表示期間を追記し、既存の`#previous-exit`にも次回通知の確認/コピー操作があることを確認した。製品ページ/privacy・関連設計文書も同期更新した。
 
 段Dの本体全件・独立レビュー・確認用build/実機検証は設計担当へ引き継ぐ。実装担当では製品起動、実ORT/GPU障害の注入、commit、追加独立レビューを行っていない。
+
+### 17. 段D再レビューP3と全件snapshot差分の修正（2026-10-31、未コミット）
+
+対象は`24d156910`。設計担当がサンドボックス外で実行した全件は15,166成功・1失敗であり、段Dの全件成功とは扱わない。今回も全件は設計担当が所有する。
+
+- **P3・利用者向け文言**: 即時通知の共通本文を「エラー番号 / 不明」「画面番号 / 更新番号 / 処理番号」「入力画像の寸法」へ変更した。hoverとコピーは同じ不変本文を使い、数値・未取得の意味・原因を断定しない注記を維持する。
+- **段A〜Cへの適用**: 前回通知の定期記録・処理段階・モデル・方式・GPU照会結果・メモリ区分・内部エラー/例外の観測を固定の表示語へ変換する。raw Debug enum/struct、context/job/source/unknown/worker/first-chance等を利用者本文へ出さず、記録ID、各番号、寸法、時刻/間隔、使用量/予算、例外code等の数値は維持する。保存schema・観測/分類・終了状態・通知条件は変更しない。モデルは既存UIの固定表示名を使う。文言の禁止語と数値保持を回帰で検査する。
+- **画像差分の原因**: 提供された基準PNGとnew PNGを解析した。通知本体（y=0..65）はRGBA完全一致し、tooltip領域（基準x=230..730,y=85..250とnew側y=69..234）も16pxずらすと完全一致した。字体/大きさの違いではない。旧lib fixtureは本体の`FeedbackAction::response`→`hover_tip_dark`→`cursor_extent_physical_win`から実デスクトップのカーソル画像寸法を読んでいた。寸法取得時と取得できず34pxを使う場合等でanchorが変わる。OS入力依存の16px移動を、フォント解決の差とは扱わない。元PNG/new/diffは`target/ai-crash-655-stage-d-wording-artifacts/`へ保存した。
+- **テスト構成**: PNG比較を`tests/ui_snapshot.rs`へ移し、既存の共通builder、`snapshot_with_theme_contrast_and_size_with_interaction`、本体標準フォント/配色/Standard設定を使用する。fixtureは既存の固定カーソル寸法（上0/下34 physical pixels）をenabled dark tooltip helperへ渡し、実カーソルを照会しない。libは100%/200%の寸法・hover時の非コピー・明示クリックの本文一致を保持する。失敗testのignore/除外、画像の許容差拡大、フォントの置換、製品のカーソル動作変更は行わない。
+- **マニュアル**: troubleshootingに新しい本文の例と識別番号/不明の意味を追記した。設計の表示例とsnapshot方針も同期した。
+
+`MSBUILDDISABLENODEREUSE=1`で実装担当が指定検査を行い、以下へ結果を追記する。サンドボックス外の再実行/本体全件・実機確認は未実施で、設計担当へ引き継ぐ。commit・追加独立レビュー・製品起動は行わない。
+
+検証結果（`MSBUILDDISABLENODEREUSE=1`）:
+
+| コマンド/検査 | 結果 |
+| --- | --- |
+| `cargo fmt` / `cargo fmt --check` | 成功 |
+| `cargo check -p mimageviewer --lib --tests --features test-script` | 最終sourceでexit 0、38.19秒。既存warningあり。`target/ai-crash-655-stage-d-wording-check-final.log` |
+| `UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot` | 最終fixtureで215成功・0失敗、コンパイル39.13秒・実行30.55秒。`target/ai-crash-655-stage-d-wording-ui-update-final.log` |
+| `cargo test --test ui_snapshot`（更新指定なし） | 215成功・0失敗、実行28.91秒。`target/ai-crash-655-stage-d-wording-ui-compare.log` |
+| `UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib previous_run_notice -- --nocapture` | 9成功・0失敗。A〜Cの内部UI用2枚を更新。`target/ai-crash-655-stage-d-wording-notice-update.log` |
+| `cargo test -p mimageviewer --lib previous_run_diagnostics -- --nocapture` | 51成功・0失敗、2.69秒。新しい禁止語/数値保持と既存の時刻・分類・保存回帰を含む。`target/ai-crash-655-stage-d-wording-previous_run_diagnostics.log` |
+| `cargo test -p mimageviewer --lib previous_run_notice -- --nocapture`（更新指定なし） | 9成功・0失敗、1.19秒。本文/コピー・小画面・2枚を含む既存PNGを通常比較。`target/ai-crash-655-stage-d-wording-previous_run_notice.log` |
+| `cargo test -p mimageviewer --lib ai_failure -- --nocapture` | 最終fixtureで7成功・0失敗、1.74秒。100%/200%の領域・hover非コピー・明示コピー本文一致、文言・配送/重複抑止回帰を保持。`target/ai-crash-655-stage-d-wording-ai-final.log` |
+| マニュアル例文照合 | Rust共通本文のtemplate/固定分類と同じ値から組み立てた文がHTML例文に完全一致することを確認 |
+| `python scripts/check_ui_glyphs.py` | 成功、危険glyph 0件 |
+| `git diff --check` | 成功 |
+
+変更した基準PNGは以下の3枚だけ。すべて目視し、通知・tooltip本文・固定コピー/閉じるの可視性を確認した。AI通知はintegrationの標準Frameで背景領域も確保するfixtureとし、フォント/色・表示内容以外の実OS入力を使わない。
+
+- `tests/snapshots/ai_failure_feedback_hover_small_light.png`（61,055 bytes）
+- `tests/snapshots/previous_run_notice_checkpoint_small_light.png`（261,300 bytes）
+- `tests/snapshots/previous_run_notice_observations_small_light.png`（244,983 bytes）
+
+lib内PNGが許される既存方針は維持する。前回通知のcrate内部の描画/formatter fixtureはlibで検査するが、今回問題になったAI通知PNGはintegrationへ移し、指定の`UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot`で更新できる。libのクリック/コピー回帰は削除・弱体化していない。実カーソルを読む製品動作は維持する。
+
+以上はサンドボックス内の検証。外側での同一case再実行・本体全件は設計担当へ引き継ぎ、外側でも実行済みとは主張しない。commit・製品起動・追加の独立レビューは行っていない。
