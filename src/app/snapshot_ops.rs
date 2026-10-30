@@ -1087,7 +1087,9 @@ impl App {
         let saved_image_metas = std::mem::replace(&mut self.image_metas, captured_image_metas);
         let saved_visible_indices =
             std::mem::replace(&mut self.visible_indices, snapshot_visible_indices);
-        let saved_scroll_offset_y = std::mem::replace(&mut self.scroll_offset_y, 0.0);
+        self.grid_scroll.renew_session();
+        let saved_scroll_offset_y = self.grid_scroll.offset();
+        self.grid_scroll.set_position(0.0);
         let saved_selected = std::mem::replace(&mut self.selected, new_selected);
         // snapshot は別の item 配列なので、元一覧の index アンカーを持ち込まない。
         // 次の Shift+クリックは snapshot 側の selected を起点に再確立する。
@@ -1102,7 +1104,7 @@ impl App {
         // 画面外にあるとユーザー視認できないため)。new_selected が None なら scroll_offset_y
         // = 0.0 のままで先頭表示。
         if new_selected.is_some() {
-            self.scroll_to_selected = true;
+            self.grid_scroll.set_reveal_requested(true);
         }
         // ★情報 / 回転 / タグ / EXIF 等の idx-based cache を全 clear する。
         // items を入れ替えたので idx の意味が変わる (= 旧 idx → stars の対応が壊れ、
@@ -1475,13 +1477,14 @@ impl App {
                     }
                 }
             }
+            self.grid_scroll.renew_session();
             self.items = snap.saved_items;
             self.page_identity_index = snap.saved_page_identity_index;
             self.projection_recipe = snap.saved_projection_recipe;
             self.thumbnails = merged_thumbnails;
             self.image_metas = snap.saved_image_metas;
             self.visible_indices = snap.saved_visible_indices;
-            self.scroll_offset_y = snap.saved_scroll_offset_y;
+            self.grid_scroll.set_position(snap.saved_scroll_offset_y);
             // ネスト ZIP 由来の snapshot: saved_items (= ZIP 階層の items) と対で
             // ナビ状態も復元する。これをしないと「ZIP items なのに nav なし」になり、
             // BS が階層を戻らず ZIP ごと抜ける / ZipDir セルの Enter が無反応になる。
@@ -1607,6 +1610,7 @@ impl App {
             crate::zip_loader::clear_nested_cache();
         }
         // items 入れ替え (= 保存したサムネ付き state を復帰)
+        self.grid_scroll.renew_session();
         self.items = list_items;
         self.page_identity_index = list_identity_index;
         self.projection_recipe = list_recipe;
@@ -1616,8 +1620,8 @@ impl App {
         self.display_epub_source = display_epub_source;
         self.current_folder = Some(snap_origin.clone());
         self.address = snap_origin.display().to_string();
-        self.scroll_offset_y = 0.0;
-        self.pending_grid_scroll = None;
+        self.grid_scroll.set_position(0.0);
+        self.grid_scroll.clear_edge();
         self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
         // items_generation bump + invalidate (= Codex P1-1)
         self.bump_items_generation();
@@ -3399,6 +3403,47 @@ mod tests {
     }
 
     #[test]
+    fn grid_scroll_session_snapshot_entry_exit_are_fresh_without_changing_saved_offset() {
+        let mut app = test_app_with_items(vec![
+            GridItem::Image(PathBuf::from(r"E:\test\a.png")),
+            GridItem::Image(PathBuf::from(r"E:\test\b.png")),
+        ]);
+        let session = app.grid_scroll.session();
+        app.grid_scroll.set_position(140.0);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        assert_ne!(app.grid_scroll.session(), session);
+        let snapshot_session = app.grid_scroll.session();
+        app.deactivate_snapshot();
+        assert!(!app.is_snapshot_active());
+        assert_ne!(app.grid_scroll.session(), snapshot_session);
+        assert_ne!(app.grid_scroll.session(), session);
+        assert_eq!(app.grid_scroll.offset(), 140.0);
+    }
+
+    #[test]
+    fn grid_scroll_session_snapshot_dismiss_and_child_unfix_keep_visible_rows_lifetime() {
+        for dismiss in [false, true] {
+            let mut app =
+                test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\test\a.png"))]);
+            app.activate_snapshot(SnapshotSourceLabel::Mixed);
+            assert!(app.is_snapshot_active());
+            app.current_folder = Some(PathBuf::from(r"E:\test\child"));
+            app.items = vec![GridItem::Image(PathBuf::from(r"E:\test\child\b.png"))];
+            let child = app.grid_scroll.session();
+            let rows = app.items.clone();
+            if dismiss {
+                assert!(app.dismiss_snapshot_with_origin().is_some());
+            } else {
+                app.deactivate_snapshot();
+            }
+            assert!(!app.is_snapshot_active());
+            assert_eq!(app.grid_scroll.session(), child);
+            assert_eq!(app.items, rows);
+        }
+    }
+
+    #[test]
     fn snapshot_inactive_by_default() {
         let app = setup_app_for_test();
         assert!(!app.is_snapshot_active());
@@ -3960,17 +4005,17 @@ mod tests {
             GridItem::Image(PathBuf::from(r"E:\img.png")),
         ];
         let mut app = test_app_with_items(original_items.clone());
-        app.scroll_offset_y = 123.0;
+        app.grid_scroll.set_position(123.0);
         app.selected = Some(1);
 
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
         assert!(app.is_snapshot_active());
         // snapshot 中は scroll はリセット、selected は snapshot 内対応 idx に変換される
         // (= 両 items とも snapshot 対象なので元 idx=1 → 新 idx=1)
-        assert_eq!(app.scroll_offset_y, 0.0);
+        assert_eq!(app.grid_scroll.offset(), 0.0);
         assert_eq!(app.selected, Some(1));
         assert!(
-            app.scroll_to_selected,
+            app.grid_scroll.reveal_requested(),
             "保持した selected が画面外に居る可能性があるので scroll_to_selected を立てる"
         );
 
@@ -3978,7 +4023,7 @@ mod tests {
         assert!(!app.is_snapshot_active());
         // 復元
         assert_eq!(app.items.len(), 2);
-        assert_eq!(app.scroll_offset_y, 123.0);
+        assert_eq!(app.grid_scroll.offset(), 123.0);
         assert_eq!(app.selected, Some(1));
     }
 
@@ -4077,7 +4122,7 @@ mod tests {
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
         assert_eq!(app.selected, None);
         // scroll_to_selected は new_selected が None なので立たない
-        assert!(!app.scroll_to_selected);
+        assert!(!app.grid_scroll.reveal_requested());
     }
 
     #[test]

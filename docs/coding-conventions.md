@@ -9,8 +9,25 @@
   スクロールオフセットは App が自前管理（egui の自動スクロールは使わない）。
 - **Row snapping**: オフセットは常に `cell_size` の整数倍。最大オフセットも
   `ceil((total_h - viewport_h) / cell_size) * cell_size` で行境界に揃える。
-  一覧の touch drag も `scroll_offset_y` 自体は anchor として行境界に保ち、1 行未満の
+  一覧の touch drag も `GridScrollState` のcanonical offset自体はanchorとして行境界に保ち、1 行未満の
   描画端数だけを viewport の一時データに分離する。端数を canonical offset へ混ぜない。
+- **一覧の位置とgeometryの契約（5ch >>661）**: offset・一回要求・未消費RowAnchor・描画geometryは
+  context所有の `GridScrollState` に集約する。詳細は実列数1／行高28、サムネイルは実列数／cell_hを記録する。
+  現在body高と全content高から一度だけextentを解決し、確保高とegui opt-in APIへ同じ結果を渡す。
+  viewport最小64 pt・margin 0を両者で揃える。復元／Edge／実移動／先行clamp・snapは `Set`、
+  通常同期は `Sync`、App所有touchの描画位置は `AppGesture`。native readbackは候補値を行丸め・clampして
+  採用し、明示要求を再発行しない。比率変更も描画proofに基づきgeometryとcanonicalを同時変換する。
+  実装段と検証状況は [調査書](scroll-661-investigation.md#修正の設計) を正本とする。
+- **一覧入力の寿命と再pass**: geometry／native慣性のStateはviewer context＋rendererで分け、
+  pointer transport IDは実viewportの一覧に安定させる。pressの所属と処理済frameの所属は同じcapture ownerで
+  区別し、順序付きイベントとeguiの実保持先で新pressを受理する。Responseの集約flagだけに依存しない。
+  同ownerのSync再passは、Appが半行未満のreadbackを採らなくても最初のnative移動・rubber-bandを保持する。
+  Set／AppGesture／session交代は明示位置を優先する。pointer・touchとも旧入力を宛先へ再所属させない。
+  旧touch由来Moveと新mouse captureを混在させる既存経路は、基点比較後の設計担当判断で
+  §1.487へ分離した。新契約では同frame描画にもその誤採用が出る差がある。範囲と完了状況は調査書を参照する。
+  セルのrelease受理も実TouchFrameへ接続し、後続pressのaggregate座標で旧clickの所属を上書きしない。
+  backend Endはraw Touch座標ではなく最後のcursor位置で相関する。barの完了click／保持区間はpress stamp順、
+  non-rubber位置はopt-inのcontent配置前に確定する。[再修正・検証](scroll-661-investigation.md#implementation-review-revise)を参照。
 - **Mouse wheel**: `ctx.input_mut` で MouseWheel イベントを消費し、1行分に変換。
 - **Popup / menu wheel passthrough**: `menu_button` / `ComboBox` / popup 内に
   `ScrollArea` を置く場合、popup が開いている frame では `raw_scroll_delta` /

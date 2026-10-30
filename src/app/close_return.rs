@@ -265,7 +265,7 @@ impl App {
                 .selected
                 .and_then(|idx| self.bookmark_browser_rows.get(idx))
                 .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key);
-            grid.scroll_offset_y = self.scroll_offset_y;
+            grid.scroll_offset_y = self.grid_scroll.offset();
             CloseReturnEffect::BookmarkRefresh { target, grid }
         } else {
             CloseReturnEffect::Navigation {
@@ -372,7 +372,7 @@ impl App {
                             .selected
                             .and_then(|idx| self.bookmark_browser_rows.get(idx))
                             .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key);
-                        grid.scroll_offset_y = self.scroll_offset_y;
+                        grid.scroll_offset_y = self.grid_scroll.offset();
                         let _ = target;
                         self.bookmark_view_state = Some(BookmarkViewState::Restoring { grid });
                         self.refresh_bookmark_browser();

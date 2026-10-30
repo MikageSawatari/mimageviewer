@@ -86,6 +86,27 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 直し方: AI action を全画面の viewport (表示中の viewer の入力所有者) へ送る。製品の main focus guard は変えない。直したら AI / GPU 経路を変える次の版で `-IncludeFirstAi` 付きの ReleaseChecks を実行して採用する。
 - 関連: [release-check-automation-plan.md](release-check-automation-plan.md)、`src/test_script.rs` の `release_check_first_ai`。規模: Small。
 
+### 1.487 旧二指touchの第二指のMoveが、新しく始めたmouse dragへ混ざる — >>661の統合確認から (2026-10-30)
+
+- 状態: **未着手・>>661から分離（設計担当判断 2026-10-30）**。touchとmouseを同時に使う操作の既存不具合と、同frameの複数所属release混在に対する許容範囲。通常の一覧移動で旧bounds・速度・captureを持ち越す>>661とは分けて扱う。
+- 再現: 旧一覧で二指touch → 別一覧へ移る → 主指を離す（第二指は保持）→ 新mouseで一覧背景をdrag → 旧第二指を動かす。backendの空いたpointer gateから出るsynthetic Moveを、新mouseのnative scrollが採る。
+- 基点検証: v4.10.0の `b10dc7406` をテスト用に展開し、同じ入力列・実worker・両入力の対照・実rendererを通す回帰が失敗。no-tailはnative offset756を維持、旧Moveありは756→800、直後のmouse移動も対照656に対し576となる。基点の同frame描画は756のまま、行丸め後は両方630となり、このfixtureでは差が見えない。>>661修正後はphysics後の位置でviewport／content originを確定するため同frameのviewportも800となる。この反映タイミングの差を「今回の影響なし」とは扱わない。
+- 根拠と証跡: [>>661調査書の基点比較](scroll-661-investigation.md#mixed-input-v410-baseline)。native pointer eventの由来を受理境界へつなぎ、本物mouseのcapture・慣性・直前位置を保って旧touch由来だけを隔離する設計が必要。修正案・規模は未確定。
+- 回帰は `src/app/tests/scroll_661.rs::retired_secondary_touch_move_cannot_drive_a_new_mouse_capture` を理由付きignoreで保持。基点でもState不変assertが失敗することを記録し、設計担当の指示に従って>>661の必須gateから除外する。実機イベント配送・製品画面は未確認。
+- 同frameのrelease／click混在も本項の範囲（設計担当判断 2026-10-30）。旧touchのreleaseとMouseのclick-bearing releaseが同frameに入る場合は、v4.10.0と同じくセル応答を抑止しない。例: 旧touchでcellをpress→一覧session交代→同frameに旧End／release／Gone→widgetのない場所へmouseをMoved／press／release。この場合も旧cellのnative clickは適用される。混在しない旧touch releaseは>>661の修正で拒否する。`mixed_retired_capture_and_uncaptured_mouse_click_keep_v410_pointer_fallback` はこの許容挙動を自動検査し、ignoreしない。[設計補足・再修正台帳](scroll-661-investigation.md#implementation-review-mixed-release)を参照。egui中核interactionの変更案は保守負担から不採用。
+
+- 許容範囲はMouseの混在に限らない。抑止しないCurrent tapや所属不明のclick-bearing releaseが同frameに混ざる場合も、v4.10.0と同じpointer fallbackとする。純touchでCurrentとRetiredが共存する場合を含む「複数所属のreleaseが混在するframe」では、cell clickを完全に隔離したとは扱わない。すべてのclick-bearing releaseが抑止対象の場合だけ拒否する規則であり、既存Current gestureの抑止要求は維持する。
+
+### 1.488 一覧へ戻ると保存した位置から上へ動く — 5ch >>661／コレクション帰還 (2026-10-30)
+
+- 状態: **実装済み・実機未確認（v4.11.0予定）**。ツリー等で長い一覧→短い一覧→元の一覧と移動した場合や、コレクションの本から戻った場合の共通修正。出荷・統合の判断は設計担当の検収と残るリリースgate後に行う。
+- 原因: 保存位置と選択は正しく復元されるが、同じegui ScrollAreaに残る旧一覧のmaxでphysicsが復元位置をoverscrollと判定し、上へ押し戻す。詳細／サムネイル共通。非同期の復元が最初の描画より早く終わる場合に決定的に再現する。
+- 修正: canonical位置・一回要求・未消費RowAnchor・描画geometryをcontextのscroll ownerへ集約。現在extentと明示更新の意味をphysics前、描画のviewport／originをその後の位置で確定するopt-in契約を両rendererへ接続した。可視一覧と入力の寿命を分け、旧一覧の慣性・capture・touch commandを引き継がず、同一覧の正当な操作とcontextのmove／swapを保つ。遅延や毎frameの強制復元は使わない。
+- **あわせて直した既存の不具合**: 詳細表示の再読み込み・自動再走査・resumeで、保存する行位置が以前のサムネイル列数を使い、選択行の画面内位置がずれる。実列数1・行高・body viewportを同じownerへ記録して保存／復元／revealで共有した。
+- 自動検証: 実装レビューのP2四件と再レビューのmouse click誤抑止を再修正。元の4再現、R1〜R4、Collection **20件すべて成功**。最新の本体全件 **15,006件成功・66件除外**、UI snapshot214件成功・PNG差分なし、test-script check成功、audit違反0。今回vendorは無変更（前回egui165件成功）。同frameのtouch／mouse click混在は設計担当判断で§1.487へ含め、抑止しない許容挙動も回帰で確認した。独立再レビュー待ち。共通workspace full gateはrelease内包exe3点未配置で未完了。出荷前に整った環境で完走する。[最新の再修正台帳](scroll-661-investigation.md#implementation-review-mixed-release)を参照。
+- 別件: touchとmouseを同時に使う旧第二指のsynthetic Move誤採用は基点からの既存不具合として§1.487へ分離し、理由付きignoreで保持した。新契約では同frameの描画にも出る差がある。Windows実機・報告者環境の製品確認は未実施。
+- 根拠: [>>661調査・設計・実装記録](scroll-661-investigation.md)、[Collection帰還の調査](collection-return-investigation.md)。DB/schema変更なし。F12／兄弟contextの所有境界は[detached §11](detached-rework-plan.md#11-リワーク外からの変更記録)に記録。規模: Medium。
+
 ### 1.472 フォルダツリーの幅が再起動するたびに狭くなる — 5ch >>643 (2026-10-29)
 
 - 状態: **未着手・修正対象として採用 (2026-10-29)**。修正時期は未指定。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、広げたツリー幅が再起動のたびに狭くなり、最後は一定幅になると報告。
@@ -154,6 +175,7 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
     - 製本・構成を変えた本。
     - 長時間使い続けた後の状態。
 - 計測の素材: `G:\home\mivtest-collection` (約 6.5 GB) と `E:\mivtest-collection` (約 12.9 GB)。再調査の材料として残してある。不要になったら削除してよい。
+- 別症状の追補 (2026-10-30、Codexの非対話試験): Xの「本から戻ると違う場所が表示される」は [位置復元の調査](collection-return-investigation.md) を参照。v4.10.0相当の実collection/worker/egui経路で、帰り先・選択・アドレス・ツリーは正しいまま、スクロールだけが上へずれる条件を確認した。短い側のページ一覧もスクロール可能な32ページ本で、>>661と同じ旧bounds/速度の持越しを再現（20件中13件が(c)の回帰検出で失敗、7件の対照は成功）。投稿者本人の原因は未確定。製品コード変更なし、`scroll-661` の共通修正後に今回の経路を確認するテストを追加。本節の「保存が遅い」調査結果とは分けて扱う。
 
 ### 1.476 タグビューで検索し直すと、開いていた画像が閉じる — §2.23 の実機確認で利用者が観測 (2026-10-29)
 

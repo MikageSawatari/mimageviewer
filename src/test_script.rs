@@ -6015,7 +6015,7 @@ mod tests {
         app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending; 600];
         app.visible_indices = (0..600).collect();
         app.selected = Some(0);
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_reveal_requested(false);
         let key = app.items[310].container_path().unwrap().to_path_buf();
         std::fs::create_dir(&key).unwrap();
         let ctx = egui::Context::default();
@@ -6071,14 +6071,14 @@ mod tests {
             assert!(
                 acked,
                 "target key never reached its actual cell: offset={} geometry={:?}",
-                app.scroll_offset_y,
+                app.grid_scroll.offset(),
                 super::grid_observation::snapshot(&ctx)
             );
             assert!(!super::widget_click_in_progress());
             if kind == super::WidgetClickKind::Hover {
                 assert!(navigation.is_none());
                 assert_eq!(app.selected, Some(0), "hover must not select or open");
-                assert!(app.scroll_offset_y > 20.0 * app.last_cell_h);
+                assert!(app.grid_scroll.offset() > 20.0 * app.last_cell_h);
             } else {
                 assert_eq!(app.selected, Some(310));
                 assert!(

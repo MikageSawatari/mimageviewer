@@ -1862,7 +1862,7 @@ fn section1473_marker_presence_selects_back_or_direct_without_losing_entrance_po
                     .position(|item| item.container_path() == Some(selected_path.as_path()))
                     .unwrap(),
             );
-            app.scroll_offset_y = 360.0;
+            app.grid_scroll.set_position(360.0);
             for number in 0..2 {
                 let path = app.tmp.path().join(format!("previous-{number}"));
                 std::fs::create_dir_all(&path).unwrap();
@@ -1906,7 +1906,7 @@ fn section1473_marker_presence_selects_back_or_direct_without_losing_entrance_po
                 Some(selected_path.as_path()),
                 "mode={mode}"
             );
-            assert_eq!(app.scroll_offset_y, 360.0, "mode={mode}");
+            assert_eq!(app.grid_scroll.offset(), 360.0, "mode={mode}");
             if mode == "recorded" {
                 assert_eq!(app.folder_nav_back_stack, old_prefix);
                 assert_eq!(
@@ -1980,7 +1980,7 @@ fn section1473_bookmark_entrance_restores_stable_key_and_scroll_then_its_parent(
         settle(&mut app);
         assert_eq!(app.bookmark_browser_rows.len(), 45);
         app.selected = Some(31);
-        app.scroll_offset_y = 280.0;
+        app.grid_scroll.set_position(280.0);
         let expected = app.current_top_level_restore_snapshot().unwrap();
         let key = app.bookmark_browser_rows[31].stable_key();
         add_history(&app, &book, kind);
@@ -1993,7 +1993,7 @@ fn section1473_bookmark_entrance_restores_stable_key_and_scroll_then_its_parent(
                 .map(|index| app.bookmark_browser_rows[index].stable_key()),
             Some(key)
         );
-        assert_eq!(app.scroll_offset_y, 280.0);
+        assert_eq!(app.grid_scroll.offset(), 280.0);
         parent_and_settle(&mut app, "backspace");
         assert_eq!(app.effective_folder(), Some(origin));
     }
@@ -2054,7 +2054,7 @@ fn section1473_snapshot_subset_cannot_overwrite_ordinary_entrance_position() {
             .position(|item| item.container_path() == Some(selected_path.as_path()))
             .unwrap();
         app.selected = Some(selected);
-        app.scroll_offset_y = 360.0;
+        app.grid_scroll.set_position(360.0);
         app.visible_indices = (20..60).collect();
         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
         settle(&mut app);
@@ -2062,7 +2062,7 @@ fn section1473_snapshot_subset_cannot_overwrite_ordinary_entrance_position() {
         let saved = app.folder_history.get(&origin).copied().unwrap();
         assert_eq!(saved, (360.0, Some(selected)));
         app.selected = Some(0);
-        app.scroll_offset_y = 40.0;
+        app.grid_scroll.set_position(40.0);
         // This is the production handoff used when a new view accepts the fixed owner.
         app.dismiss_snapshot_with_origin();
         let other = app.settings.book_root.as_ref().unwrap().join("other");
@@ -2078,6 +2078,6 @@ fn section1473_snapshot_subset_cannot_overwrite_ordinary_entrance_position() {
                 .and_then(GridItem::container_path),
             Some(selected_path.as_path())
         );
-        assert_eq!(app.scroll_offset_y, 360.0);
+        assert_eq!(app.grid_scroll.offset(), 360.0);
     }
 }

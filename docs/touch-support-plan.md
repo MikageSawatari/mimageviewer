@@ -1,5 +1,40 @@
 # タブレット PC タッチ操作対応 — 調査と設計方針
 
+## 5ch >>661: MainGrid入力の寿命（2026-10-30）
+
+一覧のcanonical位置はcontextの `GridScrollState` が行境界で保持し、端数・glide・pinchは
+`(viewport, ViewerContextId)` の一時状態を同じ一覧sessionと照合する。可視一覧の採用や実parkで旧入力を終え、
+同じ一覧のresize／filter／sort／再走査、bundleの一時mount／depositでは入力寿命を変えない。
+サムネイルのScrollGrid・glideに加え、Pinch中とZoom／PinchEndを適用するframeもAppが位置を所有し、
+native Yのdrag／coastを重ねない。現在scopeのtap候補もStartからterminal frameまで同じ所有とし、
+閾値未満の移動をnative Yへ漏らさない。接点終了後は通常マウスを受理する。詳細のnative touch dragは維持する。
+
+recognizerはMainGrid sessionで区切るが、egui-winitのpointer gateとexact signatureのtransport相関は保持する。
+旧Move／End／CancelはRetiredとして宛先のScrollGrid／Zoom／tapを発行せず、旧Cancelで新接点を消さない。
+旧接点held中の新raw Startも受理する。TouchFrameの生成とcommand消費は同じscopeを照合する。
+同frameの後続mouse edgeは順序付き相関で区別し、同座標でも旧touchの抑止を本物mouseへ広げない。
+MainGridの混在入力中断はrecognizerだけを終え、backendのgateを勝手に解放しない。
+
+実装レビュー後の再修正では、gate／cursor／既存pendingを同じtransport ownerにまとめた。
+Endのsynthetic releaseはraw End座標ではなくbackendの最後のcursor位置で厳密に照合し、
+cursorなしではGoneだけを待つ。旧scopeの正常なtailで現在接点を取り消さない。
+セルのclick／double-clickも実TouchFrameのrelease所属へ接続する。後続pressで変わるResponse座標に依存せず、
+frame-localなprimary-release ordinalでそのframeの全click-bearing releaseを照合する。
+旧touch由来のcell応答は全click-bearing releaseがRetiredの場合だけ抑止し、Mouseを含む混在frameは
+v4.10.0のpointer fallbackを維持する（設計担当判断 2026-10-30、§1.487）。曖昧Currentの除去後も序数は詰めず、
+所属不明をRetiredとは扱わない。既存Current gestureの抑止要求と、Stillの非click drag終端の最後のterminal
+releaseへの対応は維持する。press区間の推測やegui中核interactionの変更はしない。
+検証と制限は [再修正台帳](scroll-661-investigation.md#implementation-review-mixed-release) を参照。
+
+通常drive・StillFullscreen・transport-only・replayは当該viewportの `ctx.cumulative_frame_nr()` を使う。
+MainGrid非描画時は共通end-pass observerがtransportだけ観測し、discard後の再生ではcommandsを再配送しない。
+Appの更新counterをviewport frameの代用にしない。既存の方向settle・130 ms glide・列数pinchは維持する。
+自動回帰・独立レビュー・実機未確認の区別は [調査書](scroll-661-investigation.md) を参照。
+旧主接点のEnd後、新mouse captureへ旧第二接点のsynthetic Moveが流れる混在操作は、
+基点v4.10.0でも同じnative誤採用があると自動試験で確認し、設計担当判断で§1.487へ分離した。
+上記recognizer／commandの隔離だけで、このnative pointer混在まで解決したとは扱わない。
+新geometry契約ではphysics後の位置でviewport／content originを確定するため、この誤採用も同frame描画へ反映する差がある。
+
 > 状態: **調査完了 / 仕様確定 / Phase 1 Step 3b / 3c まで実装済み**。2026-08-08。
 > Step 0 診断プローブ、Step 1 純ロジック認識器、Step 2 egui 入力源相関、
 > Step 3 静止画フルスクリーンの左右タップ / 中央クローム / ピンチズーム・パン / 相関済みクリック抑止、
@@ -317,14 +352,16 @@ gate が真なら phase ごとのミラー遷移と合成列は次のとおり�
 | --- | --- | --- |
 | `Start` | `Some(id)` にする | `PointerMoved` → primary press |
 | `Move` | 変更しない | `PointerMoved` |
-| `End` | `None` にする | primary release → `PointerGone` |
+| `End` | `None` にする | cursorありなら最後のcursor位置でprimary release → `PointerGone`。cursorなしは `PointerGone` だけ |
 | `Cancel` | `None` にする | `PointerGone` のみ。primary release は出ない |
 
 したがって 2 本目の `Start` は、1 本目が `pointer_touch_id` を保持している間は合成 pointer を
 伴わない。一方、pointer 接点だった指が先に `End` すると id が `None` になって gate が再び開く。
 その後も画面上に残っている 2 本目の `Move` は `PointerMoved` を出し、続く `End` は、その接点が
-primary press を一度も出していなくても primary release → `PointerGone` を出す。mIV の相関層は
-この再開放を含めて gate と 1 対 1 でミラーし、release を正当な期待列として相関する。
+primary press を一度も出していなくても、cursorがあれば primary release → `PointerGone` を出す。
+End自体はcursorを更新しないため、raw End(q)と最後のcursor(p)が異なってもrelease(p)が正常列である。
+実mouseのPointerMovedもcursorを更新し、PointerGoneは消去する。mIVの相関層は現行vendored egui-winitでも
+このgateとcursorを同じtransportでミラーし、位置の近さを許容するのではなくbackendの実際の位置で照合する。
 
 `drive_egui_touch_input(..., enabled)` の `enabled` は、**入力を観測するかではなく、
 認識結果を実行してよいか**を表す。通常の呼び出しでは値にかかわらず raw Touch を処理し、

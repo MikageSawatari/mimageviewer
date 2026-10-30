@@ -6768,3 +6768,82 @@ bundle退役にも接続した。記録するcontextは要求に捕捉したowne
 `prepared_edit_disposition`の項目と理由型はpage-turn計画§28.5.1に記録した。
 detachedの実表示入口と、通常mounted状態での既存の編集切替・Resumeを、Bの各未公開状態で直接通すheadless回帰を追加した。
 採否やpresentation述語は変更せず、既存所有境界の観測と回帰を足す修正であり、症状パッチではない。
+
+### 2026-10-30: 5ch >>661 一覧スクロールの所有境界（設計ACCEPT・実装着手）
+
+設計正本は [調査書「修正の設計」第3版](scroll-661-investigation.md#修正の設計)、
+`446a435f1`。独立設計レビュー（GPT-6.1 Sol / xhigh）は追加指摘なしでACCEPT、
+ClaudeCodeとCodexは、現在geometry・位置更新の意味・入力所属を各ownerで確定する
+構造的修正であり、症状パッチではないことに合意した。
+
+対象はApp投影と `ViewerContextBundle` の一覧offset / reveal / edge / RowAnchorの集約、
+既存move / swap / fork / 実parkの入力寿命、MainGridのtouch生成・受理である。
+一時mount / deposit、兄弟のread-only open / closeでは寿命を変えない。
+geometry / velocityのegui Stateはviewer contextごと、captureの所属は実表示面の
+安定transport IDと一覧sessionで分離する。ROOTのtouch端数参照はmain ownerを明示する。
+
+新しいdetached bool、HWND同定・配置・viewport生成 / 閉鎖の変更、時間窓、追加repaint、
+兄弟のcache / generation失効は加えない。段A（挙動不変の集約）→B（>>661のgeometry契約）→
+C（入力寿命・contextの統合）の受入を順に行い、C完了まで出荷しない。
+本記録は着手前の構造合意であり、実装完了・検証成功を示さない。
+段ごとの実施結果は調査書の実装・検証台帳へ記録する。製品binaryは起動しない。
+
+同日、段Aのsource前提監査で、既存の未消費RowAnchorとEdgeの同時保持を設計の排他的requestが
+表現できない相違を確認し、依頼の停止条件に従って製品編集前に停止した。
+bundle / park / touch / vendorの変更・自動テストはまだ行っていない。
+詳細なproducer / consumer・既存試験・設計担当へ返す論点は調査書の「実装・検証記録」を参照。
+
+その後、ClaudeCodeがEdge等の一回限りの要求とRowAnchorの配置指定は寿命が違うため、
+同じ `GridScrollState` の別枠へ移すと補足し、再開を指示した。
+既存2試験の保持条件と起動hintのload reset跨ぎを保つ。これは旧状態の集約であり、
+新たなdetached bool / pendingを追加するものではない。
+再開後も各段の受入結果を調査書へ記録し、段C完了前には出荷しない。
+
+再開後、段AでApp / bundle / SmartRootのスクロール所有者を集約した。
+実mount / deposit、両fork、Smart退避・復帰のRowAnchor回帰を含む関連458件とowner単体5件、
+core check・context audit（違反0）は成功した。row hintはmoveで保持し、forkでは非継承とする。
+一方、R3の詳細表示で既存の `last_grid_cols` 捕捉不整合を検出したため、設計担当判断へ返して停止。
+段Aの受入は未完了で、B/Cのvendor / session / capture / recognizer / 実park接続には未着手。
+viewport / HWND / native表示・入力の操作は行っていない。詳細とログは同じ調査書の再開後台帳を参照。
+
+設計担当が詳細の実列数1の記録を段Bのgeometry契約に含め、R3の受入を段Bへ移した。
+段Aは挙動不変（R3を除く）として `a930891dd` にコミット済み。段Bを再開する。
+比率変更でcanonicalを先に変換する既存経路も、描画のcontext / 世代 / 列数の証明とgeometryを
+同じscroll ownerへ集約し、兄弟や未描画のgeometryを使わない。構造上の理由と検証は調査書へ記録する。
+
+段Cではscroll ownerのsessionを、成功した実pauseとlive-media parkの当該ownerで更新する。
+mainへ戻った一時投影から兄弟を更新せず、forkはfresh、move／swap／一時mount／depositは位置とownerを移す。
+ROOTのkeep／prefetchが読む端数は、read-only Main ContextRefのscroll ownerを明示して取得する。
+detachedを一時投影しているからという理由でROOTの端数をdetachedへ付け替えない。
+egui Stateの保存IDはcontext＋renderer、captureのtransport IDはphysical viewportで分ける。
+MainGrid recognizerとcommand batchは同じsessionへ結び、非描画区間も共通end-passでtransportだけ観測する。
+HWNDのowner／focus／z-order、viewport生成／閉鎖、detachedの表示述語は変更していない。
+これは一覧のgeometry・位置・入力所属を本来のownerへ揃える修正で、症状guardや兄弟resetではない。
+実施した自動回帰と未実施の実画面確認は調査書の段C台帳に記録する。
+
+段Bの元4再現・R3を含む15件と関連520件は成功した。段Cでは旧主接点Endでbackendの
+pointer gateが空いた後、新mouse captureへ残る旧第二接点のsynthetic Moveが入る設計上の不足を
+実App／egui Context試験で確認し、追加の製品変更を停止した。viewer contextのsessionが正しくても、
+native pointerの各eventの由来が消費境界へ届かない問題であり、HWND／focus／viewport述語の
+条件追加では直さない。設計補足待ちで段C未受入・出荷不可。詳細は調査書の同日停止記録を参照。
+
+同日、設計担当の指示で基点v4.10.0 `b10dc7406` に同じ入力回帰を移植し、native offsetの
+756→800と次のmouse deltaの汚染が既存であることを実行確認した。基点は同frameの描画に
+反映せず、新契約では描画にも出る差を明記したうえで、利用者の条件付き判断に従い§1.487へ分離した。
+当該回帰を理由付きignoreで保持し、>>661の段C統合確認を再開する。HWND／focus／viewportの
+変更やresetを追加する必要はない。最終受入結果は調査書の同日再開後記録へ集約する。
+
+再開後、同一Contextの別viewport・独立frame／discard／transport-only／replayを直接検査する2件を追加した。
+本体全件14,993件、Collection20件、snapshot214件とaudit違反0まで確認した。
+最後の本体fullで見つかった13件の失敗は、実描画しない起動復元fixtureが旧cacheだけへgeometryを手設定する
+API適合漏れで、ownerへ実際に模したgeometryを記録する6setupへ変更し、期待値と操作を維持した。
+当該73件と本体fullの再実行は全成功。製品のdetachedロジックやviewport述語を追加変更していない。
+共通workspace fullはランチャー内包release exe3点不足でテスト開始前に停止し、出荷判定は保留。
+全command・source・ログは [>>661最終台帳](scroll-661-investigation.md#stage-c-final-verification) を正本とする。
+
+実装独立レビューP2四件の再修正では、bar入力区間の順序・non-rubberの配置前確定と、
+旧touch releaseのセル受理／backend cursorに沿うtransport終端を所有境界内で修正した。
+新しいdetached状態や述語、HWND／viewport生成・閉鎖・focusは変更せず、既存のcontext移譲規則も維持する。
+同一path A/Bの実cell captureから旧tapを拒否し、後続mouse保持／新touchを受理する回帰を両rendererへ追加した。
+本体15,003件・vendor165件・snapshot214件とaudit違反0。共通workspace fullの前提不足は継続している。
+理由・先行RED・最終証跡は [再修正台帳](scroll-661-investigation.md#implementation-review-revise) に記録した。

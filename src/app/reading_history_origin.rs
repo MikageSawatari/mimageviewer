@@ -56,7 +56,7 @@ impl App {
                     .collect(),
                 selected_key,
                 opened_key: None,
-                scroll_offset_y: self.scroll_offset_y,
+                scroll_offset_y: self.grid_scroll.offset(),
             }),
         }
     }

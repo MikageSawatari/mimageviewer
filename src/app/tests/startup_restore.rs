@@ -5,6 +5,20 @@ use super::*;
 use crate::app::StartupListIntent;
 use crate::settings::{ListCursorHint, StartupListRestore, StartupListTarget};
 
+fn set_departure_grid_geometry(app: &mut App) {
+    // These handler-only fixtures model a three-column, three-visible-row grid.
+    // Record the modeled layout with the scroll owner, as a renderer now does;
+    // the old cache fields alone no longer supply cursor-save row geometry.
+    app.last_grid_cols = 3;
+    app.last_cell_h = 40.0;
+    app.last_viewport_h = 120.0;
+    let natural_h = app.current_grid_order().len().div_ceil(3) as f32 * 40.0;
+    let geometry = GridScrollGeometry::new(3, 40.0, 120.0, natural_h);
+    assert!(geometry.max_offset >= 80.0);
+    app.grid_scroll.record_geometry(geometry);
+    app.grid_scroll.set_position(80.0);
+}
+
 fn png_bytes() -> Vec<u8> {
     let mut output = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
@@ -1180,9 +1194,7 @@ fn direct_tray_book_env() -> (phase_c_support::AppTestEnv, PathBuf, PathBuf) {
         .position(|item| matches!(item, GridItem::ZipFile(path) if path == &book))
         .unwrap();
     assert_eq!(index, 12);
-    env.last_grid_cols = 3;
-    env.last_cell_h = 40.0;
-    env.scroll_offset_y = 80.0;
+    set_departure_grid_geometry(&mut env);
     env.selected = Some(index);
     // Accepted grid input owns the departing cursor capture and direct page open.
     let nav = env
@@ -1222,7 +1234,7 @@ fn section1335_tray_direct_book_hide_restore_returns_parent_and_preserves_record
             crate::settings::Settings::load().startup_list_restore,
             before
         );
-        assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+        assert_eq!(env.grid_scroll.row_anchor(), Some(2));
         let generation = env.items_generation;
         env.sync_after_restore(&egui::Context::default());
         assert!(env.window_visible);
@@ -1231,7 +1243,7 @@ fn section1335_tray_direct_book_hide_restore_returns_parent_and_preserves_record
         assert!(env.fullscreen_idx.is_none());
         assert_eq!(env.settings.startup_list_restore, before);
         assert_eq!(env.items[env.selected.unwrap()].name(), "book.zip");
-        assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+        assert_eq!(env.grid_scroll.row_anchor(), Some(2));
         // Returning to the parent must not reset the independently saved reading position.
         open_zip(&mut env, &book, true);
         assert_eq!(env.fullscreen_idx, Some(1));
@@ -1256,7 +1268,7 @@ fn section1335_tray_direct_book_quit_while_hidden_restarts_at_preserved_parent_l
     assert!(env.fullscreen_idx.is_none());
     assert_eq!(env.settings.startup_list_restore, before);
     assert_eq!(env.items[env.selected.unwrap()].name(), "book.zip");
-    assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+    assert_eq!(env.grid_scroll.row_anchor(), Some(2));
     open_zip(&mut env, &book, true);
     assert_eq!(env.fullscreen_idx, Some(1));
 }
@@ -2040,9 +2052,7 @@ fn section1335_departing_same_items_page_open_captures_list_cursor_before_page_n
             env.finish_page_identity_preparation_for_test();
             folder
         };
-        env.last_grid_cols = 3;
-        env.last_cell_h = 40.0;
-        env.scroll_offset_y = 80.0;
+        set_departure_grid_geometry(&mut env);
         env.selected = Some(12);
         // No explicit capture/save is performed here: accepted grid input owns the departure.
         assert!(
@@ -2070,7 +2080,7 @@ fn section1335_departing_same_items_page_open_captures_list_cursor_before_page_n
         assert_eq!(env.current_folder.as_ref(), Some(&target));
         assert!(env.fullscreen_idx.is_none());
         assert_eq!(env.items[env.selected.unwrap()].name(), names[12]);
-        assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+        assert_eq!(env.grid_scroll.row_anchor(), Some(2));
     }
 }
 
@@ -2159,9 +2169,7 @@ fn section1335_synthetic_install_captures_changed_physical_departure_without_man
             .position(|item| item.name() == "page-12.png")
             .unwrap();
         env.selected = Some(selected);
-        env.last_grid_cols = 3;
-        env.last_cell_h = 40.0;
-        env.scroll_offset_y = 80.0;
+        set_departure_grid_geometry(&mut env);
         let expected = Some(StartupListRestore::V1 {
             target: StartupListTarget::PhysicalList {
                 logical_path: folder.clone(),
@@ -2201,7 +2209,7 @@ fn section1335_synthetic_install_captures_changed_physical_departure_without_man
         assert_eq!(env.current_folder.as_ref(), Some(&folder));
         assert!(env.fullscreen_idx.is_none());
         assert_eq!(env.items[env.selected.unwrap()].name(), "page-12.png");
-        assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+        assert_eq!(env.grid_scroll.row_anchor(), Some(2));
     }
 }
 
@@ -2230,7 +2238,7 @@ fn section1335_startup_cursor_rows_survive_grid_page_acceptance_before_first_scr
     env.open_default_startup_target();
     settle_book(&mut env);
     assert_eq!(env.items[env.selected.unwrap()].name(), names[12]);
-    assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+    assert_eq!(env.grid_scroll.row_anchor(), Some(2));
     // No UI frame has measured this restored list's final scroll geometry.
     assert!(
         env.handle_gamepad_grid_accept(&egui::Context::default())
@@ -2250,7 +2258,7 @@ fn section1335_startup_cursor_rows_survive_grid_page_acceptance_before_first_scr
     settle_book(&mut env);
     assert!(env.fullscreen_idx.is_none());
     assert_eq!(env.items[env.selected.unwrap()].name(), names[12]);
-    assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+    assert_eq!(env.grid_scroll.row_anchor(), Some(2));
 }
 
 #[test]
@@ -2271,9 +2279,7 @@ fn section1335_similar_exact_page_move_preserves_accepted_departure_before_physi
     env.load_folder(source.clone());
     env.finish_page_identity_preparation_for_test();
     env.selected = Some(12);
-    env.last_grid_cols = 3;
-    env.last_cell_h = 40.0;
-    env.scroll_offset_y = 80.0;
+    set_departure_grid_geometry(&mut env);
     let expected = Some(StartupListRestore::V1 {
         target: StartupListTarget::PhysicalList {
             logical_path: source.clone(),
@@ -2490,9 +2496,7 @@ fn section1335_cached_smart_root_return_captures_changed_child_cursor_without_ma
         .items
         .iter()
         .position(|item| item.name() == "page-12.png");
-    env.last_grid_cols = 3;
-    env.last_cell_h = 40.0;
-    env.scroll_offset_y = 80.0;
+    set_departure_grid_geometry(&mut env);
     let expected = Some(StartupListRestore::V1 {
         target: StartupListTarget::PhysicalList {
             logical_path: child.clone(),
@@ -3454,9 +3458,7 @@ fn direct_tray_image_folder_book_env() -> (phase_c_support::AppTestEnv, PathBuf,
         .position(|item| matches!(item, GridItem::Folder(path) if path == &book))
         .unwrap();
     assert_eq!(index, 12);
-    env.last_grid_cols = 3;
-    env.last_cell_h = 40.0;
-    env.scroll_offset_y = 80.0;
+    set_departure_grid_geometry(&mut env);
     env.selected = Some(index);
     // Finish startup's resume read before the fixture's timed navigation.
     // Later position writes still need their own receipt before DB assertions.
@@ -3503,7 +3505,7 @@ fn section1335_tray_image_folder_book_direct_hide_restore_preserves_parent_curso
         assert!(env.fullscreen_idx.is_none());
         assert_eq!(env.current_folder.as_ref(), Some(&parent));
         assert_eq!(env.items[env.selected.unwrap()].name(), "book");
-        assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+        assert_eq!(env.grid_scroll.row_anchor(), Some(2));
         assert_eq!(env.settings.startup_list_restore, before);
         assert_eq!(
             crate::settings::Settings::load().startup_list_restore,
@@ -3515,7 +3517,7 @@ fn section1335_tray_image_folder_book_direct_hide_restore_preserves_parent_curso
         assert_eq!(env.current_folder.as_ref(), Some(&parent));
         assert_eq!(env.items_generation, generation);
         assert_eq!(env.items[env.selected.unwrap()].name(), "book");
-        assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+        assert_eq!(env.grid_scroll.row_anchor(), Some(2));
         assert_eq!(env.settings.startup_list_restore, before);
         open_selected_image_folder_book(&mut env, &book);
         assert_eq!(env.fullscreen_idx, Some(1));
@@ -3557,7 +3559,7 @@ fn section1335_tray_image_folder_book_direct_quit_restarts_parent_and_preserves_
     assert_eq!(env.current_folder.as_ref(), Some(&parent));
     assert!(env.fullscreen_idx.is_none());
     assert_eq!(env.items[env.selected.unwrap()].name(), "book");
-    assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+    assert_eq!(env.grid_scroll.row_anchor(), Some(2));
     assert_eq!(env.settings.startup_list_restore, before);
     open_selected_image_folder_book(&mut env, &book);
     assert_eq!(env.fullscreen_idx, Some(1));
@@ -3622,7 +3624,7 @@ fn section1335_tray_image_folder_book_setting_changed_in_f12_returns_parent_and_
     assert!(env.fullscreen_idx.is_none());
     assert_eq!(env.current_folder.as_ref(), Some(&parent));
     assert_eq!(env.items[env.selected.unwrap()].name(), "book");
-    assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+    assert_eq!(env.grid_scroll.row_anchor(), Some(2));
     assert_eq!(env.settings.startup_list_restore, before);
     assert_eq!(
         crate::settings::Settings::load().startup_list_restore,
@@ -3636,7 +3638,7 @@ fn section1335_tray_image_folder_book_setting_changed_in_f12_returns_parent_and_
     assert_eq!(env.current_folder.as_ref(), Some(&parent));
     assert_eq!(env.items_generation, generation);
     assert_eq!(env.items[env.selected.unwrap()].name(), "book");
-    assert_eq!(env.scroll_selected_to_rows_above, Some(2));
+    assert_eq!(env.grid_scroll.row_anchor(), Some(2));
     assert_eq!(env.settings.startup_list_restore, before);
     // A later open uses the new preference, while the saved reading position survives.
     let Some(crate::ui_main::AddressBarNav::Direct(path, intent)) =

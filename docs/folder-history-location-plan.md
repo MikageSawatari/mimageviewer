@@ -1,5 +1,14 @@
 # フォルダ履歴の現在地と表示位置 — §1.280 / §1.282 / §1.281
 
+### 5ch >>661のスクロール境界（2026-10-30）
+
+保存・採用する履歴位置の形式と選択の優先順位は維持する。復元位置はcontextの `GridScrollState` が
+canonicalと一回要求を同時に受け取り、現在の描画geometryを解決してからeguiへ `Set` として渡す。
+直前の短い一覧のbounds／慣性に復元を変更させない。RowAnchorはrefresh／resumeでも使い、
+選択解決済みのrevealでのみ消費する。詳細の実列数1の記録により、再読込／自動再走査でも画面内の行位置を保つ。
+App・bundle・SmartRootのowner移譲、入力寿命と自動検証の状況は [最終台帳](scroll-661-investigation.md#stage-c-final-verification) を参照。
+実装済み・実機未確認で、共通workspace fullはランチャーのrelease内包exe不足のため未完了。
+
 ### §1.328 閲覧履歴・サブ展開の位置境界（2026-10-25）
 
 閲覧履歴・サブ展開の行選択と scroll / Auto seed は、履歴地点や restore state へ追加せず、
