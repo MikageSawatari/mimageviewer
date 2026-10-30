@@ -16840,6 +16840,7 @@ pub struct App {
     // を同期更新) で運用する。
     // 起動時 DB オープンに失敗した場合は None (機能なしで動作継続)。
     pub(crate) indexer_init: IndexerInit,
+    pub(crate) agent_readers: Option<Arc<crate::remote_ipc::SharedReaders>>,
 
     // ── 別バージョン索引 ─────────────────────────────────────────
     // 別バージョン索引 service の runtime owner。`None` は UI と全 producer に共通の
@@ -20955,6 +20956,7 @@ impl App {
             fav_add_auto_index_thumbs: false,
             fav_add_auto_index_similar: false,
             indexer_init,
+            agent_readers: None,
             similar_index,
             name_index_manager: None,
             activity_gate,
@@ -33303,6 +33305,7 @@ impl App {
             }
         };
         self.housekeeping_armed = self.indexer_init.is_some();
+        self.publish_agent_index();
         self.sync_shared_favorite_indexers();
         if full_check_requested {
             self.request_index_full_check_shared();

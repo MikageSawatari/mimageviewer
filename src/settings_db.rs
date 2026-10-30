@@ -42,7 +42,7 @@ use crate::external_tool::{
     SelectionPolicy, SpreadPolicy, VideoPolicy, classify_legacy_recent_launch,
 };
 use crate::settings::{
-    FavoriteEntry, LegacyOpenWithApp, RecentApp, Settings, TagDef, Vst3ChainPresetSlot,
+    AgentLevel, FavoriteEntry, LegacyOpenWithApp, RecentApp, Settings, TagDef, Vst3ChainPresetSlot,
     Vst3ChainPresetSlots, Vst3PluginEntry,
 };
 
@@ -286,6 +286,16 @@ pub struct SettingsDb {
     inner: Mutex<Inner>,
 }
 
+// Allocate distinct permission epochs across reopened DB handles as well as commits.
+// A restore/reset can replace the global handle with another ReadOnly DB; its new
+// epoch must still revoke results admitted against the previous DB.
+static NEXT_AGENT_PERMISSION_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+fn next_agent_permission_epoch() -> u64 {
+    NEXT_AGENT_PERMISSION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Physical-folder listing decisions that must follow settings committed after startup.
 ///
 /// Keep this deliberately smaller than [`Settings`]. A full settings reload also reads
@@ -425,6 +435,8 @@ impl RemoteListingSettings {
 
 struct Inner {
     conn: Connection,
+    /// Protected by the same mutex as permission reads and successful commits.
+    agent_permission_epoch: u64,
     /// VST3 chain (= `Settings::vst3_plugins`) の **直近 commit 成功時** の中身。
     /// `None` = 未確認 (= 起動直後 / load 前)。現在値と `vst3_chain_unchanged` で
     /// 等しければ DB と in-memory は同じ内容なので DELETE+INSERT をスキップする。
@@ -680,6 +692,7 @@ impl SettingsDb {
         Ok(Self {
             inner: Mutex::new(Inner {
                 conn,
+                agent_permission_epoch: next_agent_permission_epoch(),
                 last_saved_vst3_chain: None,
                 last_saved_vst3_slots: None,
             }),
@@ -965,6 +978,20 @@ impl SettingsDb {
         })
     }
 
+    /// Agent worker が各要求の受付・応答時に現在の許可範囲だけを読む。
+    pub fn load_agent_level(&self) -> Result<AgentLevel, SettingsDbError> {
+        self.load_agent_permission().map(|(level, _)| level)
+    }
+
+    /// Read permission and its revocation epoch together. A worker must compare
+    /// the admitted epoch before returning data, even when the level is ReadOnly
+    /// again after an intervening disable. Unrelated settings saves keep the epoch.
+    pub fn load_agent_permission(&self) -> Result<(AgentLevel, u64), SettingsDbError> {
+        let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        let level = read_settings_kv_typed(&inner.conn, "agent_level", AgentLevel::default)?;
+        Ok((level, inner.agent_permission_epoch))
+    }
+
     /// Remote の集約系 worker が現在の共有並び順だけを読む。
     pub(crate) fn load_sort_order(&self) -> Result<crate::settings::SortOrder, SettingsDbError> {
         let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
@@ -990,6 +1017,9 @@ impl SettingsDb {
             }
             read_singleton_endpoint_settings(&inner.conn)?;
         }
+        let agent_level_changed =
+            read_settings_kv_typed(&inner.conn, "agent_level", AgentLevel::default)?
+                != settings.agent_level;
 
         // 1. 事前の差分判定 (transaction 外)。共有 `Arc` の同一性で見るので O(行数)。
         let chain_changed = inner
@@ -1113,6 +1143,9 @@ impl SettingsDb {
         tx.commit()?;
 
         // 4. commit 成功してから「直近保存した中身」を更新する。
+        if agent_level_changed {
+            inner.agent_permission_epoch = next_agent_permission_epoch();
+        }
         // clone は `Arc` の参照カウント加算だけで、state chunk は複製されない。
         if chain_changed {
             inner.last_saved_vst3_chain = Some(settings.vst3_plugins.clone());
@@ -1281,6 +1314,7 @@ impl SettingsDb {
         Ok(Self {
             inner: Mutex::new(Inner {
                 conn,
+                agent_permission_epoch: next_agent_permission_epoch(),
                 last_saved_vst3_chain: None,
                 last_saved_vst3_slots: None,
             }),
@@ -4652,6 +4686,72 @@ impl Drop for DataDirOverrideGuard {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_level_defaults_disabled_and_roundtrips_live_changes() {
+        assert_eq!(Settings::default().agent_level, AgentLevel::Disabled);
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.agent_level, AgentLevel::Disabled);
+
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        assert_eq!(db.load_agent_level().unwrap(), AgentLevel::Disabled);
+        for (level, stored) in [
+            (AgentLevel::ReadOnly, "read_only"),
+            (AgentLevel::Disabled, "disabled"),
+            (AgentLevel::ReadOnly, "read_only"),
+        ] {
+            let settings = Settings {
+                agent_level: level,
+                ..Settings::default()
+            };
+            db.save_full(&settings).unwrap();
+            assert_eq!(db.load_agent_level().unwrap(), level);
+            assert_eq!(db.load_into_settings().unwrap().agent_level, level);
+            assert_eq!(
+                serde_json::to_value(&settings).unwrap()["agent_level"],
+                stored
+            );
+        }
+        drop(db);
+        let db = SettingsDb::open(dir.path()).unwrap();
+        assert_eq!(db.load_agent_level().unwrap(), AgentLevel::ReadOnly);
+    }
+
+    #[test]
+    fn agent_level_missing_key_disables_and_invalid_value_returns_error() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let settings = Settings {
+            agent_level: AgentLevel::ReadOnly,
+            ..Settings::default()
+        };
+        db.save_full(&settings).unwrap();
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute("DELETE FROM settings_kv WHERE key = 'agent_level'", [])
+            .unwrap();
+        assert_eq!(db.load_agent_level().unwrap(), AgentLevel::Disabled);
+        assert_eq!(
+            db.load_into_settings().unwrap().agent_level,
+            AgentLevel::Disabled
+        );
+
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "INSERT INTO settings_kv (key, value) VALUES ('agent_level', ?1)",
+                [r#""future_permission""#],
+            )
+            .unwrap();
+        assert!(matches!(
+            db.load_agent_level(),
+            Err(SettingsDbError::Incompatible(_))
+        ));
+    }
+
     #[test]
     fn plain_folder_spread_settings_roundtrip_and_missing_key_default() {
         let db = SettingsDb::open_in_memory_for_test().unwrap();

@@ -4162,6 +4162,7 @@ dependencies = [
  "local-adjust-core",
  "log",
  "lopdf",
+ "mimageviewer-agent-ipc",
  "mimageviewer-ipc",
  "mimalloc",
  "miv-startup",
@@ -4214,6 +4215,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimageviewer-agent-ipc"
+version = "4.10.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "windows 0.61.3",
+]
+
+[[package]]
 name = "mimageviewer-ipc"
 version = "4.10.0"
 dependencies = [
@@ -4234,6 +4245,17 @@ dependencies = [
  "tempfile",
  "windows 0.61.3",
  "winresource",
+]
+
+[[package]]
+name = "mimageviewer-mcp"
+version = "4.10.0"
+dependencies = [
+ "mimageviewer-agent-ipc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "windows 0.61.3",
 ]
 
 [[package]]

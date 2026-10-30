@@ -15,7 +15,7 @@ use crate::ring_shortcut::{
     format_mouse_gesture_pattern, mouse_gesture_direction_from_delta,
 };
 use crate::settings::{
-    self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode,
+    self, AgentLevel, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode,
     FullscreenHorizontalCursorDirection, FullscreenJumpMode, FullscreenSeekDirection,
     GridItemDisplayKind, Parallelism, ReadingDirection, ReadingFlow, SortOrder, SpreadMode,
     StartupFolderMode, StartupWindowState, TextContrast, UI_FONT_VERTICAL_ADJUST_MAX,
@@ -131,6 +131,35 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(14.0);
     ui.separator();
     ui.add_space(8.0);
+    anchored(ui, state, "general/agent-level", |ui, state| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("AI 連携 (MCP):");
+            egui::ComboBox::from_id_salt("agent_level")
+                .selected_text(match state.settings.agent_level {
+                    AgentLevel::Disabled => "無効",
+                    AgentLevel::ReadOnly => "読み取りのみ",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut state.settings.agent_level,
+                        AgentLevel::Disabled,
+                        "無効",
+                    );
+                    ui.selectable_value(
+                        &mut state.settings.agent_level,
+                        AgentLevel::ReadOnly,
+                        "読み取りのみ",
+                    );
+                });
+        });
+        ui.label(
+            egui::RichText::new(
+                "有効にすると、ファイルの場所・名前・タグ・★・コレクション・検索結果が AI アプリの提供元へ送られます。",
+            )
+            .weak(),
+        );
+    });
+    ui.add_space(12.0);
     anchored(ui, state, "general/ai-processing", |ui, state| {
         ui.label(egui::RichText::new("表示時の AI 処理 (アップスケール / ノイズ除去)").strong());
         ui.add_space(4.0);

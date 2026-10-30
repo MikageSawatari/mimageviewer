@@ -23,6 +23,71 @@ pub(crate) mod session;
 pub(crate) use live_favorites::RemoteSettingsReaderControl;
 pub(crate) use service::{RemoteServiceControl, RemoteServiceManager, RemoteServiceStatus};
 
+/// One settings reader/control for both read lanes. Restoring settings pauses exactly
+/// this LiveFavorites connection; borrowing it never opens a second persistent reader.
+pub(crate) struct SharedReaders {
+    favorites: std::sync::Arc<live_favorites::LiveFavorites>,
+    collections: std::sync::Arc<collections::CollectionEngine>,
+    pub(crate) fts: std::sync::RwLock<Option<std::sync::Arc<crate::fts_index::FtsIndex>>>,
+}
+
+impl SharedReaders {
+    pub(crate) fn open(
+        settings: &crate::settings::Settings,
+    ) -> Result<std::sync::Arc<Self>, String> {
+        let favorites = live_favorites::LiveFavorites::live(settings.favorites.clone())?;
+        Ok(std::sync::Arc::new(Self {
+            collections: std::sync::Arc::new(
+                collections::CollectionEngine::new_with_live_favorites(
+                    settings.clone(),
+                    std::sync::Arc::clone(&favorites),
+                ),
+            ),
+            favorites,
+            fts: std::sync::RwLock::new(None),
+        }))
+    }
+
+    pub(crate) fn settings_reader_control(&self) -> RemoteSettingsReaderControl {
+        self.favorites.control()
+    }
+
+    pub(crate) fn favorites(
+        &self,
+    ) -> Result<
+        std::sync::Arc<Vec<crate::settings::FavoriteEntry>>,
+        mimageviewer_agent_ipc::AgentError,
+    > {
+        self.favorites.current().map_err(|error| {
+            mimageviewer_agent_ipc::AgentError::new(
+                if error.is_busy() {
+                    mimageviewer_agent_ipc::ErrorCode::Busy
+                } else {
+                    mimageviewer_agent_ipc::ErrorCode::Internal
+                },
+                "閲覧起点を読み込めませんでした",
+            )
+        })
+    }
+
+    pub(crate) fn agent_tags(
+        &self,
+        choice: mimageviewer_agent_ipc::TagChoice,
+    ) -> Result<mimageviewer_agent_ipc::TagPage, mimageviewer_agent_ipc::AgentError> {
+        self.collections.agent_tags(choice)
+    }
+
+    pub(crate) fn agent_tag_items(
+        &self,
+        tag: &str,
+        kind: Option<mimageviewer_agent_ipc::ItemKind>,
+        wanted: usize,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(Vec<mimageviewer_agent_ipc::Item>, bool), mimageviewer_agent_ipc::AgentError> {
+        self.collections.agent_tag_items(tag, kind, wanted, cancel)
+    }
+}
+
 #[cfg(test)]
 pub(crate) use container::resolve_remote_effective_params_for_test;
 pub(crate) mod ui;
@@ -909,6 +974,7 @@ impl RemoteIpcServerControl {
 impl RemoteIpcServer {
     pub(crate) fn start(
         settings: crate::settings::Settings,
+        readers: std::sync::Arc<SharedReaders>,
         persistent_collection_producer: Option<
             crate::collection_store::CollectionRemoteProducerControl,
         >,
@@ -919,6 +985,7 @@ impl RemoteIpcServer {
         {
             return pipe::ServerGuard::start(
                 settings,
+                readers,
                 persistent_collection_producer,
                 raw_develop_executor,
                 io_sem,
@@ -929,6 +996,7 @@ impl RemoteIpcServer {
         {
             let _ = (
                 settings,
+                readers,
                 persistent_collection_producer,
                 raw_develop_executor,
                 io_sem,

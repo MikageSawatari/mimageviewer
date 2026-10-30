@@ -580,3 +580,106 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
 
 確認された前提: Remote の通常データ要求は操作権必須、指定した reader は worker から使える、
 純粋な読み取りを全 Remote phase で受けても cache 整合を壊さない、data dir はプロセス内で固定。
+
+## 14. 段階 0 の実装記録 (2026-10-30、未コミット・検証中)
+
+作業先は `G:\home\mimageviewer-mcp` / `mcp-trial`。製品 core・launcher・MCP exe は起動せず、
+通常の APPDATA をテストに使わない。公開文書・配布スクリプト・Remote wire v72 は変更しない。
+
+- `crates/agent-ipc`: MCP に依存しない要求・応答、独立版 v1、長さ上限つき codec。
+  SID と解決済み絶対 data dir の SHA-256 (先頭 128 bit) を常に名前に含める。
+  `resolve_data_dir` / `derive_pipe_name` を両 exe が共有する。ファイルを開かず、dot component・
+  大小文字・separator・verbatim/UNC 表記を揃える。
+- `SharedReaders`: 旧 Remote 起動経路の `LiveFavorites` と `CollectionEngine` を一つの owner へ
+  抽出し、両 lane が同じ `Arc` を借りる。設定復元用 control もその同一 reader を指す。
+  Remote の sort/settings source・DACL helper の内容・操作権ルールは維持する。
+  agent に第2の settings DB 接続や第2の `LiveFavorites` は作らない。
+- FTS は既存 `IndexerManager::clone_fts_index` から公開するだけで、agent は別の索引を開かない。
+  未公開の検索は NotReady。collection は既存 actor の producer lease と client を借りる。
+  終了は agent pipe の停止・worker join を既存 producer drain / actor shutdown より前に置く。
+- 許可は DB の live 値を要求ごとに確認する。設定 DB の mutex 内で level と epoch を一緒に取得し、
+  許可変更の commit / DB 再 open で epoch を変える。無関係な設定保存では変えない。
+  実行完了時と pipe writer の送信直前にも照合し、Disabled→ReadOnly の往復でも旧結果を拒否する。
+- 接続ごと1件・全体2件の permit。検索は headless `global_search::run(..., wake=None)` と
+  応答 owner を分け、20秒期限では部分結果を返して協調取消する。実 worker の join まで permit は
+  保持する。Hello 等の完了済み read は permit 解放後に応答を公開する。
+- pipe は server / client とも overlapped I/O。server の停止 event は各 I/O の待機集合に入り、
+  停止と I/O 開始の競合をなくす。停止時は `ConnectionAborted` (再試行しない終端) を返す。
+  client の各 read/write は独立した OVERLAPPED を持ち、応答待ち中でも Cancel を送れる。
+- MCP exe は stdin EOF または有界入力 queue の満杯を、stdin owner の専用 hook から
+  `ExitProcess(0)` へ渡す。stdout backpressure・Rust stdout cleanup・worker join を待たずに
+  OS が pipe を閉じ、core は切断として取消する。test は hook を通知 callback に置き換え、
+  blocked writer を保持したまま300ms以内に EOF / queue overflow が届くことを検査する。
+- 投影は path/subresource・name・kind・tags・rating、tag/collection の name/count だけ。
+  TagItems の thumbnail/sidecar materializer は通さず、★は rating DB から別に引く。
+  item cursor は版・tool・正規化引数/順序・返却済件数を符号化し、再実行して skip する。
+  core page は8,000文字を目安に制限し、MCP は structuredContent と text の重複・escaping を含む
+  最終 JSON が40,000文字以内か実測する。上限超過を黙って成功にはしない。
+- ログ/perf は tool・duration・count・error kind だけ。問い合わせ文字列・結果 path は記録しない。
+  設定移行の opt-in 除外表にも agent_level を追加し、他 PC の許可を自動で有効化しない。
+
+### SDK の選択
+
+[公式 Rust SDK](https://github.com/modelcontextprotocol/rust-sdk) は 2026-07-28 と旧版への対応、
+stdio transport を公表している。導入を第一候補として `cargo info rmcp`、online での取得、
+`target/rmcp-sdk-probe` の最小 SDK consumer の `cargo check --offline` を試したが、
+キャッシュに rmcp がなく、registry 取得は proxy 127.0.0.1 への接続拒否、最小 build も
+`no matching package named rmcp found` (exit 1) で止まった。この環境では導入できないため、
+§8 の代替として serde による限定 JSON-RPC 実装を採用した。SDK の版対応不足とは判断していない。
+
+MCP の新旧契約は公式の [versioning](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning)、
+[server/discover](https://modelcontextprotocol.io/specification/2026-07-28/server/discover)、
+[caching](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/caching) に照合した。
+Windows の同時 read/write は [overlapped pipe I/O](https://learn.microsoft.com/en-us/windows/win32/ipc/synchronous-and-overlapped-input-and-output)
+の契約に従う。
+
+### 設計担当の判断待ち
+
+1. §7 は「全 tool に既定50件・最大200件、続きはcursor」とする一方、実装 brief の
+   `ListTags{choice}` / `ListCollections` には limit/cursor が無い。現時点の両一覧は上限で
+   打ち切り、`truncated=true` を返すが、その先を要求する手段がない。要求と MCP schema に
+   limit/cursor を加えるか、段階0だけ打ち切りとするかを問い合わせ中。未承認の契約変更はしない。
+2. 実装 brief の「mimageviewer*.exe の起動禁止」と「MCP exe の stdio 結合テスト」の適用範囲。
+   `stdio_exe_uses_real_core_fixture_handlers` を作成したが、製品 exe 起動の例外が明示されるまで
+   ignored としておく。test pipe は実 core handler と使い捨てタグ・collection・FTS fixture を使い、
+   core 本体や利用者の profile を起動しない。
+
+判断待ちは完了扱いにしない。実 core / Claude Desktop / ChatGPT からの確認も未実施。
+
+### 自動検証の証跡 (最終差分、未完了)
+
+MCP の既定 data dir は、GUI/native 依存を console exe に持ち込まないため、通常版の
+`data_dir::flavor_default` の `%APPDATA%/mimageviewer` (未設定時は `./mimageviewer`) を
+小さな関数で再現した。解決と pipe 名導出は agent-ipc の同じ関数を使用する。
+
+| コマンド | 実 exit code / 結果 | ログ |
+|---|---|---|
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | `target/agent-core-check-final.log` |
+| `cargo check -p mimageviewer-mcp --bin mimageviewer-mcp` | 0 | `target/agent-mcp-bin-check-final.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp` | 101。IPC 6成功、MCP 11成功/1失敗 | `target/agent-crates-final-diagnostic.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_level/) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/)'` | 100。14実行、13成功/1失敗 | `target/agent-focused-final.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(=remote_ipc::pipe::tests::remote_pipe_dacl_has_one_current_user_ace)'` | 0。1成功 | `target/agent-pipe-dacl-check.log` |
+| `cargo fmt` → `cargo fmt --check` | 0 | 全 workspace、引数なし |
+| `python scripts/check_ui_glyphs.py` | 0。危険 glyph なし | tool 実行記録 |
+| `git diff --check` | 0 | tool 実行記録 |
+
+core の失敗は `shutdown_interrupts_an_idle_connected_reader_without_retry` の client
+`OpenOptions::open` における OS 5 (AccessDenied)。MCP の失敗は当初
+`real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld` の要求到着待ち timeout。
+fixture thread 起動前の client 接続を診断するテストに直し、同じ接続が OS 5 で拒否されることを
+root と MCP 担当の両 context で確認した。テスト失敗経路に待機 thread を残さない。
+root の実行 token は `OpenProcessToken(TOKEN_QUERY)` / `IsTokenRestricted` で **True**
+(照会コマンド exit 0) と確認した。§5.1 / P3-13 の full-trust 条件を満たさない環境と整合するが、
+両失敗の原因確定や実装の正常性は主張しない。DACL・integrity level を広げず、失敗を skip/pass に
+変更しない。通常権限 full-trust の環境で該当する実 pipe 検査を行う必要がある。
+
+途中の記録: 初回 core check は新設定の settings-transfer 網羅表不足で非0となり、許可の自動移行を
+除外して修正した。初回 lib test は turbojpeg-sys の CMake/MSBuild が exit 1 (cargo subprocess 101)
+で止まり、テストは未実行。Ninja への切替試行も既存 generator 不一致で exit 101。
+元の generator のまま `MSBuild /m:1` (exit 0) と `CARGO_BUILD_JOBS=1` によって依存を構築できた。
+その途中差分の焦点8件は exit 0 (`target/agent-focused-tests-r3.log`) だが、上表の最終結果で置き換える。
+MCP 担当側の IPC 6 / MCP 12 成功 (各 exit 0) もあるが、root の再実行失敗を打ち消す証拠とはしない。
+
+stdio exe 結合テストは作成済み・未実行 (ignored)。製品 exe 起動・通常 APPDATA へのテスト・
+snapshot 更新・test-full・commit は行っていない。検証未完了と設計判断待ちのため、確認用
+`build-dev.ps1` も未実行。配布・検収可能な完成状態とは扱わない。

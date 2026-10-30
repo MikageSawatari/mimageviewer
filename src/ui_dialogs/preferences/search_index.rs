@@ -80,6 +80,19 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
+        "general/agent-level",
+        General,
+        "AI 連携 (MCP)",
+        [
+            "読み取りのみ",
+            "無効",
+            "Claude",
+            "ChatGPT",
+            "MCP",
+            "AIアプリ"
+        ]
+    ),
+    entry!(
         "general/ai-processing",
         General,
         "表示時の AI 処理 (アップスケール / ノイズ除去)",

@@ -1,0 +1,752 @@
+//! Read-only agent lane. No display state, UI dispatch, or metadata writers.
+use std::path::Path;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use mimageviewer_agent_ipc::*;
+use serde::{Deserialize, Serialize};
+
+#[cfg(windows)]
+mod pipe;
+#[cfg(test)]
+mod tests;
+
+pub(crate) struct Server {
+    #[cfg(windows)]
+    pipe: pipe::Server,
+}
+
+impl Server {
+    pub(crate) fn start(
+        readers: Arc<crate::remote_ipc::SharedReaders>,
+        producer: Option<crate::collection_store::CollectionRemoteProducerControl>,
+        session: Option<crate::remote_ipc::session::SessionHandle>,
+    ) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                pipe: pipe::Server::start(Arc::new(Handlers {
+                    readers,
+                    producer,
+                    session,
+                    active: AtomicUsize::new(0),
+                }))?,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (readers, producer, session);
+            Err(std::io::Error::other("Windows only"))
+        }
+    }
+}
+
+struct Handlers {
+    readers: Arc<crate::remote_ipc::SharedReaders>,
+    producer: Option<crate::collection_store::CollectionRemoteProducerControl>,
+    session: Option<crate::remote_ipc::session::SessionHandle>,
+    active: AtomicUsize,
+}
+
+struct Running {
+    id: u64,
+    cancel: Arc<AtomicBool>,
+}
+
+struct Reply {
+    response: Response,
+    permission_epoch: u64,
+}
+impl Reply {
+    fn wire(mut self) -> Response {
+        if self.response.result.is_ok() {
+            self.response.result = permission().and_then(|(_, epoch)| {
+                if epoch != self.permission_epoch {
+                    Err(error(
+                        ErrorCode::Disabled,
+                        "AI 連携の許可が変更されました。もう一度お試しください",
+                    ))
+                } else {
+                    self.response.result
+                }
+            });
+        }
+        self.response
+    }
+}
+
+/// The slot remains occupied until the actual read worker returns, including after
+/// a deadline response. A connection can cancel only its own active identity.
+struct Connection {
+    handlers: Arc<Handlers>,
+    running: Mutex<Option<Running>>,
+    hello: AtomicBool,
+}
+
+struct Permit {
+    connection: Arc<Connection>,
+}
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.connection.running.lock().unwrap().take();
+        self.connection
+            .handlers
+            .active
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn error(code: ErrorCode, message: &str) -> AgentError {
+    AgentError::new(code, message)
+}
+fn internal() -> AgentError {
+    error(ErrorCode::Internal, "読み取りに失敗しました")
+}
+fn cancelled() -> AgentError {
+    error(ErrorCode::Cancelled, "取り消しました")
+}
+fn permission() -> Result<(AgentLevel, u64), AgentError> {
+    let (level, epoch) = crate::settings_db::with_db_result(|db| db.load_agent_permission())
+        .map_err(|_| error(ErrorCode::Busy, "設定を読み込めませんでした"))?;
+    if level == AgentLevel::Disabled {
+        Err(error(ErrorCode::Disabled, "AI 連携 (MCP) は無効です"))
+    } else {
+        Ok((level, epoch))
+    }
+}
+
+impl Connection {
+    fn new(handlers: Arc<Handlers>) -> Arc<Self> {
+        Arc::new(Self {
+            handlers,
+            running: Mutex::new(None),
+            hello: AtomicBool::new(false),
+        })
+    }
+
+    fn disconnect(&self) {
+        if let Some(running) = self.running.lock().unwrap().as_ref() {
+            running.cancel.store(true, Ordering::Release);
+        }
+    }
+
+    fn acquire(self: &Arc<Self>, id: u64) -> Result<(Permit, Arc<AtomicBool>), AgentError> {
+        let mut running = self.running.lock().unwrap();
+        if running.is_some()
+            || self
+                .handlers
+                .active
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    (n < 2).then_some(n + 1)
+                })
+                .is_err()
+        {
+            return Err(error(
+                ErrorCode::Busy,
+                "処理中です。少し待ってから再試行してください",
+            ));
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        *running = Some(Running {
+            id,
+            cancel: cancel.clone(),
+        });
+        Ok((
+            Permit {
+                connection: self.clone(),
+            },
+            cancel,
+        ))
+    }
+
+    fn request(
+        self: &Arc<Self>,
+        request: Request,
+        replies: crossbeam_channel::Sender<Reply>,
+    ) -> Option<JoinHandle<()>> {
+        let started = Instant::now();
+        let tool = tool_name(&request.command);
+        let reject = |err| {
+            let result = Err(err);
+            record(tool, started, &result);
+            let _ = replies.send(Reply {
+                response: Response {
+                    id: request.id,
+                    result,
+                },
+                permission_epoch: 0,
+            });
+        };
+        let granted = match permission() {
+            Ok(p) => p,
+            Err(err) => {
+                reject(err);
+                return None;
+            }
+        };
+        if let Command::Cancel { request_id } = request.command {
+            if let Some(running) = self
+                .running
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|r| r.id == request_id)
+            {
+                running.cancel.store(true, Ordering::Release);
+            }
+            let result = permission().map(|_| Payload::Cancelled);
+            record(tool, started, &result);
+            let _ = replies.send(Reply {
+                response: Response {
+                    id: request.id,
+                    result,
+                },
+                permission_epoch: granted.1,
+            });
+            return None;
+        }
+        if !self.hello.load(Ordering::Acquire) && !matches!(request.command, Command::Hello { .. })
+        {
+            reject(error(
+                ErrorCode::BadRequest,
+                "先に接続の版を確認してください",
+            ));
+            return None;
+        }
+        let (permit, cancel) = match self.acquire(request.id) {
+            Ok(value) => value,
+            Err(err) => {
+                reject(err);
+                return None;
+            }
+        };
+        let connection = self.clone();
+        let fallback = replies.clone();
+        let id = request.id;
+        match std::thread::Builder::new()
+            .name("agent-read".into())
+            .spawn(move || {
+                let (result, search_worker) = connection.handlers.execute(request.command, &cancel);
+                // Revocation is checked after the read and immediately before publication.
+                let result = permission().and_then(|current| {
+                    if current != granted {
+                        Err(error(
+                            ErrorCode::Disabled,
+                            "AI 連携の許可が変更されました。もう一度お試しください",
+                        ))
+                    } else if cancel.load(Ordering::Acquire) {
+                        Err(cancelled())
+                    } else {
+                        result
+                    }
+                });
+                if matches!(result, Ok(Payload::Hello { .. })) {
+                    connection.hello.store(true, Ordering::Release);
+                }
+                record(tool, started, &result);
+                let reply = Reply {
+                    response: Response { id, result },
+                    permission_epoch: granted.1,
+                };
+                if let Some(worker) = search_worker {
+                    if worker.is_finished() {
+                        let _ = worker.join();
+                        drop(permit);
+                        let _ = replies.send(reply);
+                        return;
+                    }
+                    let _ = replies.send(reply);
+                    let _ = worker.join();
+                    drop(permit);
+                } else {
+                    // All read work has ended. Release admission before exposing the
+                    // response so a client's immediately following request cannot race it.
+                    drop(permit);
+                    let _ = replies.send(reply);
+                }
+            }) {
+            Ok(worker) => Some(worker),
+            Err(_) => {
+                let _ = fallback.send(Reply {
+                    response: Response {
+                        id,
+                        result: Err(internal()),
+                    },
+                    permission_epoch: 0,
+                });
+                None
+            }
+        }
+    }
+}
+
+fn record(tool: &'static str, started: Instant, result: &Result<Payload, AgentError>) {
+    let (count, error_kind) = result_summary(result);
+    crate::logger::log(format!(
+        "agent_ipc: tool={tool} duration_ms={} count={count} error={error_kind}",
+        started.elapsed().as_millis()
+    ));
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "agent_ipc",
+            tool,
+            None,
+            0,
+            &[
+                ("count", serde_json::json!(count)),
+                (
+                    "duration_ms",
+                    serde_json::json!(started.elapsed().as_millis() as u64),
+                ),
+                ("error", serde_json::json!(error_kind)),
+            ],
+        );
+    }
+}
+
+fn tool_name(command: &Command) -> &'static str {
+    match command {
+        Command::Hello { .. } => "hello",
+        Command::Status => "miv_status",
+        Command::SearchItems { .. } => "search_items",
+        Command::ListTags { .. } => "list_tags",
+        Command::ItemsByTag { .. } => "items_by_tag",
+        Command::ListCollections => "list_collections",
+        Command::Cancel { .. } => "cancel",
+    }
+}
+fn result_summary(result: &Result<Payload, AgentError>) -> (usize, &'static str) {
+    match result {
+        Ok(Payload::Items(p)) => (p.items.len(), "none"),
+        Ok(Payload::Tags(p)) => (p.tags.len(), "none"),
+        Ok(Payload::Collections(p)) => (p.collections.len(), "none"),
+        Ok(_) => (0, "none"),
+        Err(e) => (
+            0,
+            match e.code {
+                ErrorCode::Disabled => "disabled",
+                ErrorCode::NotReady => "not_ready",
+                ErrorCode::BadRequest => "bad_request",
+                ErrorCode::VersionMismatch => "version_mismatch",
+                ErrorCode::Busy => "busy",
+                ErrorCode::Cancelled => "cancelled",
+                ErrorCode::Internal => "internal",
+            },
+        ),
+    }
+}
+
+impl Handlers {
+    fn execute(
+        &self,
+        command: Command,
+        cancel: &Arc<AtomicBool>,
+    ) -> (Result<Payload, AgentError>, Option<JoinHandle<()>>) {
+        if let Command::SearchItems {
+            query,
+            kind,
+            limit,
+            cursor,
+        } = command
+        {
+            return self.search(query, kind, limit, cursor, cancel);
+        }
+        let result = (|| match command {
+            Command::Hello { version, .. } => {
+                check_version(version).map(|_| Payload::Hello { version })
+            }
+            Command::Status => Ok(Payload::Status(StatusPayload {
+                app_version: env!("CARGO_PKG_VERSION").into(),
+                agent_level: permission()?.0,
+                fts_ready: self.readers.fts.read().unwrap().is_some(),
+                remote_active: self.session.as_ref().is_some_and(|s| {
+                    s.snapshot().phase != crate::remote_ipc::session::RemoteControlPhase::Local
+                }),
+            })),
+            Command::ListTags { choice } => self.readers.agent_tags(choice).map(Payload::Tags),
+            Command::ItemsByTag {
+                tag,
+                kind,
+                limit,
+                cursor,
+            } => {
+                let tag = tag.trim();
+                validate_text(tag)?;
+                let args = serde_json::json!([tag, kind, "path"]);
+                let offset = decode_cursor(cursor.as_deref(), "items_by_tag", &args)?;
+                let limit = limit_value(limit)?;
+                let (items, truncated) =
+                    self.readers
+                        .agent_tag_items(tag, kind, offset + limit + 1, cancel)?;
+                page(items, offset, limit, truncated, "items_by_tag", args).map(Payload::Items)
+            }
+            Command::ListCollections => self.collections(cancel).map(Payload::Collections),
+            Command::Cancel { .. } | Command::SearchItems { .. } => unreachable!(),
+        })();
+        (result, None)
+    }
+
+    fn collections(&self, cancel: &AtomicBool) -> Result<CollectionPage, AgentError> {
+        let lease = self
+            .producer
+            .as_ref()
+            .and_then(|p| p.begin_request())
+            .ok_or_else(|| error(ErrorCode::NotReady, "コレクションを準備中です"))?;
+        let catalog = lease
+            .client()
+            .list_catalog()
+            .map_err(|_| internal())?
+            .recv()
+            .map_err(|_| internal())?
+            .map_err(|_| internal())?;
+        let mut page = CollectionPage {
+            collections: Vec::new(),
+            cursor: None,
+            truncated: false,
+        };
+        for definition in catalog.definitions.iter() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(cancelled());
+            }
+            let snapshot = lease
+                .client()
+                .load_collection(definition.id)
+                .map_err(|_| internal())?
+                .recv()
+                .map_err(|_| internal())?
+                .map_err(|_| internal())?;
+            page.collections.push(Collection {
+                name: definition.name.clone(),
+                count: snapshot.entries.len() as u64,
+            });
+            if page.collections.len() > MAX_LIMIT as usize || json_chars(&page) > MAX_PAGE_CHARS {
+                page.collections.pop();
+                page.truncated = true;
+                break;
+            }
+        }
+        Ok(page)
+    }
+
+    fn search(
+        &self,
+        query: String,
+        kind: Option<ItemKind>,
+        limit: Option<u32>,
+        cursor: Option<String>,
+        cancel: &Arc<AtomicBool>,
+    ) -> (Result<Payload, AgentError>, Option<JoinHandle<()>>) {
+        let setup = (|| {
+            let query = query.trim().to_owned();
+            validate_text(&query)?;
+            let args = serde_json::json!([query, kind, "relevance"]);
+            let offset = decode_cursor(cursor.as_deref(), "search_items", &args)?;
+            let limit = limit_value(limit)?;
+            let fts = self
+                .readers
+                .fts
+                .read()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| error(ErrorCode::NotReady, "検索索引を準備中です"))?;
+            let favorites = self.readers.favorites()?;
+            let ids: Vec<_> = favorites
+                .iter()
+                .filter(|f| f.auto_index_metadata)
+                .map(|f| f.id)
+                .collect();
+            let settings = crate::settings_db::with_db_result(|db| db.load_into_settings())
+                .map_err(|_| internal())?;
+            let scope = crate::global_search::SearchScope {
+                kinds: kind.map(|k| vec![index_kind(k)]),
+                ignore_epub: settings.epub_file_handling_ignores_epub(),
+                visibility: settings.file_type_visibility,
+                ..Default::default()
+            };
+            Ok((query, args, offset, limit, fts, ids, scope))
+        })();
+        let (query, args, offset, limit, fts, ids, scope) = match setup {
+            Ok(s) => s,
+            Err(e) => return (Err(e), None),
+        };
+        if kind == Some(ItemKind::Other) {
+            return (
+                Ok(Payload::Items(ItemPage {
+                    items: vec![],
+                    cursor: None,
+                    truncated: false,
+                })),
+                None,
+            );
+        }
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let search_cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = search_cancel.clone();
+        let worker = match std::thread::Builder::new()
+            .name("agent-search".into())
+            .spawn(move || {
+                crate::global_search::run(&query, &ids, &scope, &fts, &cancel_worker, &tx, None)
+            }) {
+            Ok(w) => w,
+            Err(_) => return (Err(internal()), None),
+        };
+        let collected = collect_search(
+            &rx,
+            cancel,
+            offset + limit,
+            Instant::now() + Duration::from_secs(20),
+            Instant::now,
+        );
+        search_cancel.store(true, Ordering::Release);
+        drop(rx);
+        (
+            collected.and_then(|(items, truncated)| {
+                page(items, offset, limit, truncated, "search_items", args).map(Payload::Items)
+            }),
+            Some(worker),
+        )
+    }
+}
+
+fn collect_search(
+    rx: &crossbeam_channel::Receiver<crate::global_search::SearchStreamEvent>,
+    cancel: &AtomicBool,
+    wanted: usize,
+    deadline: Instant,
+    now: impl Fn() -> Instant,
+) -> Result<(Vec<Item>, bool), AgentError> {
+    let mut items = Vec::new();
+    let mut truncated = false;
+    let outcome = loop {
+        if cancel.load(Ordering::Acquire) {
+            break Err(cancelled());
+        }
+        if now() >= deadline {
+            truncated = true;
+            break Ok(());
+        }
+        match rx.recv_timeout(
+            deadline
+                .saturating_duration_since(now())
+                .min(Duration::from_millis(25)),
+        ) {
+            Ok(crate::global_search::SearchStreamEvent::Batch { hits, .. }) => {
+                items.extend(hits.into_iter().map(|h| item_from_hit(&h.path)));
+                // Fetch only enough to establish whether another page exists.
+                if items.len() > wanted {
+                    truncated = true;
+                    break Ok(());
+                }
+            }
+            Ok(crate::global_search::SearchStreamEvent::Done {
+                truncated: capped,
+                reason,
+            }) => {
+                truncated = capped;
+                break if matches!(reason, crate::global_search::DoneReason::RejectedQuery(_)) {
+                    Err(error(ErrorCode::BadRequest, "検索条件を確認してください"))
+                } else {
+                    Ok(())
+                };
+            }
+            Ok(crate::global_search::SearchStreamEvent::Error(_)) => break Err(internal()),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(_) => break Err(internal()),
+        }
+    };
+    outcome.map(|_| (items, truncated))
+}
+
+fn index_kind(kind: ItemKind) -> crate::fts_index::IndexKind {
+    use crate::fts_index::IndexKind as K;
+    match kind {
+        ItemKind::Image => K::Image,
+        ItemKind::Pdf => K::Pdf,
+        ItemKind::Video => K::Video,
+        ItemKind::Audio => K::Audio,
+        ItemKind::Archive => K::Zip,
+        ItemKind::Folder | ItemKind::Other => K::Folder,
+    }
+}
+fn item_from_hit(path: &str) -> Item {
+    let (path, member) = path
+        .split_once(crate::search_norm::ZIP_ENTRY_SEP)
+        .map_or((path, None), |(p, m)| (p, Some(m)));
+    let leaf = member.unwrap_or(path);
+    let extension = leaf.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let kind = if member.is_some() || crate::folder_tree::is_recognized_image_ext(&extension) {
+        ItemKind::Image
+    } else if extension == "pdf" || extension == "epub" {
+        ItemKind::Pdf
+    } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&extension.as_str()) {
+        ItemKind::Video
+    } else if crate::folder_tree::is_audio_ext(&extension) {
+        ItemKind::Audio
+    } else if crate::folder_tree::is_zip_extension(&extension) {
+        ItemKind::Archive
+    } else if Path::new(path).is_dir() {
+        ItemKind::Folder
+    } else {
+        ItemKind::Other
+    };
+    Item {
+        path: path.to_owned(),
+        subresource: member.map(str::to_owned),
+        name: leaf.rsplit(['/', '\\']).next().unwrap_or(leaf).to_owned(),
+        kind,
+        tags: vec![],
+        rating: 0,
+    }
+}
+
+pub(crate) fn json_chars(value: &impl Serialize) -> usize {
+    serde_json::to_string(value).map_or(usize::MAX, |s| s.chars().count())
+}
+fn validate_text(text: &str) -> Result<(), AgentError> {
+    if text.is_empty() || text.chars().count() > 200 {
+        Err(error(
+            ErrorCode::BadRequest,
+            "条件は 1～200 文字で入力してください",
+        ))
+    } else {
+        Ok(())
+    }
+}
+fn limit_value(limit: Option<u32>) -> Result<usize, AgentError> {
+    match limit.unwrap_or(DEFAULT_LIMIT) {
+        n @ 1..=MAX_LIMIT => Ok(n as usize),
+        _ => Err(error(
+            ErrorCode::BadRequest,
+            "件数は 1～200 件で指定してください",
+        )),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Cursor {
+    version: u32,
+    tool: String,
+    args: serde_json::Value,
+    returned: usize,
+}
+fn encode_cursor(tool: &str, args: serde_json::Value, returned: usize) -> String {
+    // Hex JSON is opaque to clients and needs no dependency or process-local cursor state.
+    serde_json::to_vec(&Cursor {
+        version: 1,
+        tool: tool.into(),
+        args,
+        returned,
+    })
+    .unwrap()
+    .iter()
+    .map(|b| format!("{b:02x}"))
+    .collect()
+}
+fn decode_cursor(
+    cursor: Option<&str>,
+    tool: &str,
+    args: &serde_json::Value,
+) -> Result<usize, AgentError> {
+    let Some(cursor) = cursor else {
+        return Ok(0);
+    };
+    let bad = || error(ErrorCode::BadRequest, "最初からやり直してください");
+    if cursor.len() > 8192 || !cursor.len().is_multiple_of(2) || !cursor.is_ascii() {
+        return Err(bad());
+    }
+    let bytes = (0..cursor.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&cursor[i..i + 2], 16).map_err(|_| bad()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let decoded: Cursor = serde_json::from_slice(&bytes).map_err(|_| bad())?;
+    if decoded.version != 1
+        || decoded.tool != tool
+        || decoded.args != *args
+        || decoded.returned > 100_000
+    {
+        return Err(bad());
+    }
+    Ok(decoded.returned)
+}
+
+pub(crate) fn optional_tags(path: &Path) -> Result<Option<crate::tags_db::TagsDb>, AgentError> {
+    if !path.try_exists().map_err(|_| internal())? {
+        return Ok(None);
+    }
+    crate::tags_db::TagsDb::open_readonly(path)
+        .map(Some)
+        .map_err(|_| internal())
+}
+
+fn enrich(items: &mut [Item]) -> Result<(), AgentError> {
+    let tags = optional_tags(&crate::tags_db::TagsDb::db_path())?;
+    let rating_path = crate::rating_db::RatingDb::db_path();
+    let ratings = if rating_path.try_exists().map_err(|_| internal())? {
+        Some(crate::rating_db::RatingDb::open_readonly(rating_path).map_err(|_| internal())?)
+    } else {
+        None
+    };
+    for item in items {
+        let logical = item.subresource.as_ref().map_or_else(
+            || item.path.clone(),
+            |m| format!("{}{}{m}", item.path, crate::search_norm::ZIP_ENTRY_SEP),
+        );
+        let key = crate::global_search_ui::hit_rating_key(&logical);
+        item.rating = ratings.as_ref().map_or(0, |db| db.get(&key));
+        item.tags = tags.as_ref().map_or_else(Vec::new, |db| {
+            db.display_tags_for_item(&crate::tags_db::item_key_for_path(Path::new(&item.path)))
+        });
+    }
+    Ok(())
+}
+
+fn page(
+    items: Vec<Item>,
+    offset: usize,
+    limit: usize,
+    source_truncated: bool,
+    tool: &str,
+    args: serde_json::Value,
+) -> Result<ItemPage, AgentError> {
+    let total = items.len();
+    let mut page = ItemPage {
+        items: items.into_iter().skip(offset).take(limit).collect(),
+        cursor: None,
+        truncated: source_truncated || total > offset + limit,
+    };
+    enrich(&mut page.items)?;
+    loop {
+        page.cursor = (page.truncated && !page.items.is_empty())
+            .then(|| encode_cursor(tool, args.clone(), offset + page.items.len()));
+        if json_chars(&page) <= MAX_PAGE_CHARS {
+            return Ok(page);
+        }
+        page.items.pop();
+        page.truncated = true;
+        if page.items.is_empty() {
+            return Err(error(
+                ErrorCode::BadRequest,
+                "項目が応答の上限を超えています",
+            ));
+        }
+    }
+}
+
+impl crate::app::App {
+    pub(crate) fn install_agent_readers(&mut self, readers: Arc<crate::remote_ipc::SharedReaders>) {
+        self.agent_readers = Some(readers);
+        self.publish_agent_index();
+    }
+    pub(crate) fn publish_agent_index(&self) {
+        if let Some(readers) = &self.agent_readers {
+            *readers.fts.write().unwrap() = self
+                .indexer_init
+                .as_ref()
+                .map(|manager| manager.clone_fts_index());
+        }
+    }
+}

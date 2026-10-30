@@ -694,6 +694,7 @@ preferences_policy! {
         network_data_dir_notice_dismissed_for => "初回/学習/通知/保存版の内部記録";
         perf_log_enabled => "初回/学習/通知/保存版の内部記録";
         remote_service_enabled => "接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持";
+        agent_level => "AI 連携の許可は移行先を維持";
         remote_video_streaming_enabled => "接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持";
         remote_video_encoder => "接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持";
         remote_video_quality_default => "接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持";
@@ -2693,25 +2694,31 @@ mod tests {
         source.remote_service_enabled = true;
         source.remote_video_streaming_enabled = true;
         source.update_check_enabled = true;
+        source.agent_level = crate::settings::AgentLevel::ReadOnly;
         let exported = export_preferences(&source).unwrap();
         let document: Value = serde_json::from_str(&exported.json).unwrap();
         let preferences = document["preferences"].as_object().unwrap();
         assert!(!preferences.contains_key("remote_service_enabled"));
         assert!(!preferences.contains_key("remote_video_streaming_enabled"));
         assert!(!preferences.contains_key("update_check_enabled"));
+        assert!(!preferences.contains_key("agent_level"));
 
         let mut destination = Settings::default();
         destination.remote_service_enabled = false;
         destination.remote_video_streaming_enabled = false;
         destination.update_check_enabled = false;
         let parsed = parse_preferences(
-            r#"{"format":"mimageviewer.preferences","format_version":1,"preferences":{"remote_service_enabled":true,"remote_video_streaming_enabled":true,"update_check_enabled":true}}"#,
+            r#"{"format":"mimageviewer.preferences","format_version":1,"preferences":{"remote_service_enabled":true,"remote_video_streaming_enabled":true,"update_check_enabled":true,"agent_level":"read_only"}}"#,
         )
         .unwrap();
         parsed.apply_to(&mut destination);
         assert!(!destination.remote_service_enabled);
         assert!(!destination.remote_video_streaming_enabled);
         assert!(!destination.update_check_enabled);
+        assert_eq!(
+            destination.agent_level,
+            crate::settings::AgentLevel::Disabled
+        );
     }
 
     #[test]

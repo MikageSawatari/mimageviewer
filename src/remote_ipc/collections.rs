@@ -70,6 +70,127 @@ struct CollectionSpreadPayload {
 }
 
 impl CollectionEngine {
+    /// MCP projection deliberately stops before Remote's thumbnail/sidecar materializer.
+    pub(super) fn agent_tags(
+        &self,
+        choice: mimageviewer_agent_ipc::TagChoice,
+    ) -> Result<mimageviewer_agent_ipc::TagPage, mimageviewer_agent_ipc::AgentError> {
+        use mimageviewer_agent_ipc::{AgentError, ErrorCode, Tag, TagChoice, TagPage};
+        let settings = self
+            .settings
+            .load()
+            .map_err(|_| AgentError::new(ErrorCode::Busy, "設定を読み込めませんでした"))?;
+        let path = crate::tags_db::TagsDb::db_path();
+        let db = crate::agent_ipc::optional_tags(&path)?;
+        let Some(db) = db else {
+            return Ok(TagPage {
+                tags: vec![],
+                cursor: None,
+                truncated: false,
+            });
+        };
+        let summaries = db.tag_summaries();
+        let tags: Vec<Tag> = if choice == TagChoice::All {
+            summaries
+                .into_iter()
+                .map(|s| Tag {
+                    name: s.tag,
+                    count: s.count as u64,
+                })
+                .collect()
+        } else {
+            let (pinned, recent, frequent) =
+                crate::tag_view::tag_view_menu_sections(&summaries, &settings.tags);
+            let choices = match choice {
+                TagChoice::Pinned => pinned,
+                TagChoice::Recent => recent,
+                TagChoice::Frequent => frequent,
+                TagChoice::All => unreachable!(),
+            };
+            choices
+                .into_iter()
+                .map(|s| Tag {
+                    name: s.name,
+                    count: s.count as u64,
+                })
+                .collect()
+        };
+        let mut page = TagPage {
+            tags,
+            cursor: None,
+            truncated: false,
+        };
+        let original = page.tags.len();
+        page.tags
+            .truncate(mimageviewer_agent_ipc::MAX_LIMIT as usize);
+        while crate::agent_ipc::json_chars(&page) > mimageviewer_agent_ipc::MAX_PAGE_CHARS {
+            page.tags.pop();
+        }
+        page.truncated = page.tags.len() < original;
+        Ok(page)
+    }
+
+    pub(super) fn agent_tag_items(
+        &self,
+        tag: &str,
+        kind: Option<mimageviewer_agent_ipc::ItemKind>,
+        wanted: usize,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(Vec<mimageviewer_agent_ipc::Item>, bool), mimageviewer_agent_ipc::AgentError> {
+        use mimageviewer_agent_ipc::{AgentError, ErrorCode, Item};
+        let settings = self
+            .settings
+            .load()
+            .map_err(|_| AgentError::new(ErrorCode::Busy, "設定を読み込めませんでした"))?;
+        let Some(db) = crate::agent_ipc::optional_tags(&crate::tags_db::TagsDb::db_path())? else {
+            return Ok((vec![], false));
+        };
+        let scan_limit = crate::tag_view::key_scan_limit_for_projection(
+            kind.is_none(),
+            &settings.file_type_visibility,
+        );
+        let keys = crate::tag_view::select_tag_view_item_keys(&db, tag, scan_limit + 1);
+        let truncated = keys.len() > scan_limit;
+        let mut items = Vec::new();
+        for key in keys.into_iter().take(scan_limit) {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let Some(candidate) = candidate_from_tag_item_key(key, TagItemKind::All) else {
+                continue;
+            };
+            if !include_collection_candidate(&settings, &candidate) {
+                continue;
+            }
+            let item_kind = match candidate.kind {
+                RemoteEntryKind::Folder => mimageviewer_agent_ipc::ItemKind::Folder,
+                RemoteEntryKind::Image => mimageviewer_agent_ipc::ItemKind::Image,
+                RemoteEntryKind::Pdf => mimageviewer_agent_ipc::ItemKind::Pdf,
+                RemoteEntryKind::Video => mimageviewer_agent_ipc::ItemKind::Video,
+                RemoteEntryKind::Audio => mimageviewer_agent_ipc::ItemKind::Audio,
+                RemoteEntryKind::Zip | RemoteEntryKind::Archive => {
+                    mimageviewer_agent_ipc::ItemKind::Archive
+                }
+                _ => mimageviewer_agent_ipc::ItemKind::Other,
+            };
+            if kind.is_some_and(|filter| filter != item_kind) {
+                continue;
+            }
+            items.push(Item {
+                path: candidate.path.to_string_lossy().into_owned(),
+                subresource: None,
+                name: candidate.name,
+                kind: item_kind,
+                tags: Vec::new(),
+                rating: 0,
+            });
+            if items.len() >= wanted.min(MAX_REMOTE_COLLECTION_ENTRIES) {
+                return Ok((items, true));
+            }
+        }
+        Ok((items, truncated))
+    }
+
     #[cfg(test)]
     pub(super) fn new(settings: Settings) -> Self {
         let favorites = super::live_favorites::LiveFavorites::snapshot(settings.favorites.clone());
