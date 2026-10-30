@@ -133,6 +133,21 @@ v4.9.0自体で今回の追加テストは実行していない。上記のソ�
 
 v4.10.0の `accept_grid_container_open` は入力の共通化。フォルダ対照の入口に使用。v4.9.0へ移植する場合は従来のフォルダ入場handlerへの接続が必要。
 
+## >>661共通修正での受入（2026-10-30）
+
+設計担当が `scroll-661` へ `da7bd5aaa` で20試験を取り込んだ。
+旧offset／edge／reveal fieldと最後のgeometry参照だけを `GridScrollState` のaccessor／要求入口へ適合した。
+fixture、実worker、キー／close経路、全期待値とcase tableは維持し、独立reviewerも機械照合した。
+
+共通修正の最終focusedは **45 PASS**（27.192s）で、Collection **20件すべてPASS**。
+元の13件の(c)失敗はgreenとなり、7件の対照も維持した。
+さらに最終本体fullでも20件全件を含む **14,993 PASS / 0 FAIL**（536.504s）を確認した。
+ログは `target/scroll661-stage-c-final-focused-2.log`、case名／件数抽出は
+`target/scroll661-stage-c-focused-results.json`、fullは `target/scroll661-stage-c-test-lib-full-2.log`。
+共通原因の修正以外にCollectionの帰還先／DB／キー処理は変更していない。
+他gate・既存の特殊混在入力§1.487の切出しは [>>661最終台帳](scroll-661-investigation.md#stage-c-final-verification) を参照。
+実窓／投稿者環境では未確認で、上記の修正適用前の失敗記録と区別する。
+
 ## 未確認の範囲
 
 投稿者の使用版・具体的操作・素材・設定、実窓/実画面、OSのfocus、DPI/複数画面、Remote/F12、NAS、バックアップON、改名・削除・並べ替えを伴う復帰、filtered/grouped一覧は未確認。件数・ページ数の境界探索は行っていない。test-onlyの調査なので全体gate・verification binaryは作成しない。

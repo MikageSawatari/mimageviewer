@@ -2296,6 +2296,289 @@ mod tests {
         ]
     }
 
+    fn grid_viewport_frame(
+        ctx: &egui::Context,
+        child: egui::ViewportId,
+        viewport: egui::ViewportId,
+        expected_frame: u64,
+        events: Vec<Event>,
+        discard: bool,
+        mut drive: impl FnMut(&egui::Context),
+    ) {
+        let mut raw = egui::RawInput {
+            viewport_id: viewport,
+            screen_rect: Some(grid_geometry().surface),
+            time: Some((expected_frame + 1) as f64 * 0.1),
+            events,
+            ..Default::default()
+        };
+        raw.viewports.entry(child).or_default().parent = Some(egui::ViewportId::ROOT);
+        let mut passes = 0;
+        ctx.run_pass(raw, |ctx| {
+            assert_eq!(ctx.viewport_id(), viewport);
+            assert_eq!(ctx.cumulative_frame_nr(), expected_frame);
+            ctx.input(|input| {
+                assert_eq!(input.raw.viewport_id, viewport);
+                assert!(input.raw.viewports.contains_key(&egui::ViewportId::ROOT));
+                assert!(input.raw.viewports.contains_key(&child));
+            });
+            if viewport == egui::ViewportId::ROOT {
+                // Keep the real child viewport registered across ROOT passes.
+                // Dropping FullOutput below never creates a native window.
+                ctx.show_viewport_deferred(child, Default::default(), |_, _| {});
+            }
+            drive(ctx);
+            if discard && ctx.current_pass_index() == 0 {
+                ctx.request_discard("touch correlation viewport-frame regression");
+            }
+            passes += 1;
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(passes, if discard { 2 } else { 1 });
+        assert_eq!(ctx.cumulative_frame_nr_for(viewport), expected_frame + 1);
+    }
+
+    fn assert_grid_viewport_commands(
+        ctx: &egui::Context,
+        scope: egui::Id,
+        expected: &[TouchCommand],
+    ) {
+        let frame = drive_egui_grid_touch_input(ctx, grid_geometry(), scope, true);
+        assert_eq!(
+            frame.grid_commands(scope),
+            if ctx.current_pass_index() == 0 {
+                expected
+            } else {
+                &[]
+            }
+        );
+        assert_eq!(frame.owner(), TouchOwner::GridScroll);
+        assert!(frame.is_active());
+        let replay = drive_egui_grid_touch_input(ctx, grid_geometry(), scope, true);
+        assert!(replay.commands().is_empty());
+        assert_eq!(replay.owner(), frame.owner());
+        assert_eq!(replay.is_active(), frame.is_active());
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<DrivenSurface>(driven_surface_id(ctx.viewport_id()))),
+            Some(DrivenSurface {
+                frame: ctx.cumulative_frame_nr(),
+                outcome: FrameDrive::GridDriven(CommandScope::MainGrid(scope)),
+            })
+        );
+    }
+
+    #[test]
+    fn grid_viewports_keep_independent_frames_and_commands_across_discard() {
+        let root = egui::ViewportId::ROOT;
+        let child = egui::ViewportId::from_hash_of("touch-grid-independent-frames");
+        for fast in [root, child] {
+            let ctx = egui::Context::default();
+            ctx.set_embed_viewports(false);
+            install_main_grid_touch_transport_observer(&ctx);
+            // Use identical scope and contact IDs: only viewport ownership may
+            // separate these recognizers and their per-frame command markers.
+            let scope = egui::Id::unique("same-grid-scope-in-both-viewports");
+            for (viewport, x, delta) in [(root, 300.0, -30.0), (child, 700.0, -50.0)] {
+                let start = pos2(x, 400.0);
+                let moved = start + egui::vec2(0.0, delta);
+                let mut events = grid_start(1, start);
+                events.extend([
+                    touch(1, egui::TouchPhase::Move, moved),
+                    Event::PointerMoved(moved),
+                ]);
+                grid_viewport_frame(&ctx, child, viewport, 0, events, viewport == fast, |ctx| {
+                    assert_grid_viewport_commands(
+                        ctx,
+                        scope,
+                        &[TouchCommand::ScrollGrid { delta_y: delta }],
+                    );
+                });
+            }
+            assert_eq!(ctx.cumulative_frame_nr_for(root), 1);
+            assert_eq!(ctx.cumulative_frame_nr_for(child), 1);
+            let slow = if fast == root { child } else { root };
+            let slow_marker =
+                ctx.data(|data| data.get_temp::<DrivenSurface>(driven_surface_id(slow)));
+            let slow_replay = ctx.data(|data| {
+                data.get_temp::<TouchCorrelationState>(state_id(slow, TouchSurface::MainGrid))
+                    .unwrap()
+                    .repeatable_frame
+            });
+            let (fast_x, mut fast_y) = if fast == root {
+                (300.0, 370.0)
+            } else {
+                (700.0, 350.0)
+            };
+            for frame in 1..=3 {
+                fast_y -= 20.0;
+                let moved = pos2(fast_x, fast_y);
+                grid_viewport_frame(
+                    &ctx,
+                    child,
+                    fast,
+                    frame,
+                    vec![
+                        touch(1, egui::TouchPhase::Move, moved),
+                        Event::PointerMoved(moved),
+                    ],
+                    true,
+                    |ctx| {
+                        assert_grid_viewport_commands(
+                            ctx,
+                            scope,
+                            &[TouchCommand::ScrollGrid { delta_y: -20.0 }],
+                        );
+                    },
+                );
+                assert_eq!(ctx.cumulative_frame_nr_for(slow), 1);
+                assert_eq!(
+                    ctx.data(|data| data.get_temp::<DrivenSurface>(driven_surface_id(slow))),
+                    slow_marker
+                );
+                assert_eq!(
+                    ctx.data(|data| {
+                        data.get_temp::<TouchCorrelationState>(state_id(
+                            slow,
+                            TouchSurface::MainGrid,
+                        ))
+                        .unwrap()
+                        .repeatable_frame
+                    }),
+                    slow_replay
+                );
+            }
+            let slow_move = if slow == root {
+                pos2(300.0, 345.0)
+            } else {
+                pos2(700.0, 325.0)
+            };
+            grid_viewport_frame(
+                &ctx,
+                child,
+                slow,
+                1,
+                vec![
+                    touch(1, egui::TouchPhase::Move, slow_move),
+                    Event::PointerMoved(slow_move),
+                ],
+                false,
+                |ctx| {
+                    assert_eq!(ctx.cumulative_frame_nr_for(fast), 4);
+                    assert_grid_viewport_commands(
+                        ctx,
+                        scope,
+                        &[TouchCommand::ScrollGrid { delta_y: -25.0 }],
+                    );
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn grid_transport_only_and_replay_use_the_actual_viewport_frame() {
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        install_main_grid_touch_transport_observer(&ctx);
+        let root = egui::ViewportId::ROOT;
+        let child = egui::ViewportId::from_hash_of("touch-grid-independent-transport");
+        let scope = egui::Id::unique("same-transport-scope-in-both-viewports");
+        let pos = pos2(500.0, 400.0);
+        let mut events = grid_start(1, pos);
+        events.extend([
+            touch(1, egui::TouchPhase::Move, pos2(500.0, 370.0)),
+            Event::PointerMoved(pos2(500.0, 370.0)),
+        ]);
+        grid_viewport_frame(&ctx, child, root, 0, events, true, |ctx| {
+            // This is the same observer used by the installed end-pass hook.
+            // An attempted grid drive later in this frame must stay a replay.
+            observe_main_grid_transport(ctx);
+            let replay = drive_egui_grid_touch_input(ctx, grid_geometry(), scope, true);
+            assert!(replay.commands().is_empty());
+            assert!(!replay.is_active());
+            assert_eq!(
+                ctx.data(|data| data.get_temp::<DrivenSurface>(driven_surface_id(root))),
+                Some(DrivenSurface {
+                    frame: 0,
+                    outcome: FrameDrive::GridTransportOnly,
+                })
+            );
+        });
+        let mut events = grid_start(1, pos);
+        events.extend([
+            touch(1, egui::TouchPhase::Move, pos2(500.0, 350.0)),
+            Event::PointerMoved(pos2(500.0, 350.0)),
+        ]);
+        grid_viewport_frame(&ctx, child, child, 0, events, false, |ctx| {
+            assert_grid_viewport_commands(
+                ctx,
+                scope,
+                &[TouchCommand::ScrollGrid { delta_y: -50.0 }],
+            );
+        });
+        grid_viewport_frame(
+            &ctx,
+            child,
+            root,
+            1,
+            vec![
+                touch(1, egui::TouchPhase::End, pos2(500.0, 370.0)),
+                primary(pos2(500.0, 370.0), false),
+                Event::PointerGone,
+            ],
+            true,
+            |_| {
+                // No MainGrid drive: the real end-pass hook must observe this tail
+                // once, even though only ROOT runs two passes for viewport frame 1.
+            },
+        );
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<DrivenSurface>(driven_surface_id(root))),
+            Some(DrivenSurface {
+                frame: 1,
+                outcome: FrameDrive::GridTransportOnly,
+            })
+        );
+        let retired = ctx
+            .data(|data| {
+                data.get_temp::<TouchCorrelationState>(state_id(root, TouchSurface::MainGrid))
+            })
+            .unwrap();
+        assert!(retired.pointer_touch.is_none());
+        assert!(retired.pending.is_none());
+        assert_eq!(ctx.cumulative_frame_nr_for(child), 1);
+        grid_viewport_frame(
+            &ctx,
+            child,
+            child,
+            1,
+            vec![
+                touch(1, egui::TouchPhase::Move, pos2(500.0, 325.0)),
+                Event::PointerMoved(pos2(500.0, 325.0)),
+            ],
+            false,
+            |ctx| {
+                assert_grid_viewport_commands(
+                    ctx,
+                    scope,
+                    &[TouchCommand::ScrollGrid { delta_y: -25.0 }],
+                );
+            },
+        );
+        let mut events = grid_start(2, pos);
+        events.extend([
+            touch(2, egui::TouchPhase::Move, pos2(500.0, 360.0)),
+            Event::PointerMoved(pos2(500.0, 360.0)),
+        ]);
+        grid_viewport_frame(&ctx, child, root, 2, events, true, |ctx| {
+            assert_grid_viewport_commands(
+                ctx,
+                scope,
+                &[TouchCommand::ScrollGrid { delta_y: -40.0 }],
+            );
+        });
+        assert_eq!(ctx.cumulative_frame_nr_for(child), 2);
+    }
+
     #[test]
     fn grid_y_owner_covers_current_tap_lifetime_but_not_retired_or_mouse_input() {
         let ctx = egui::Context::default();

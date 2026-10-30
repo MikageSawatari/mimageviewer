@@ -6773,3 +6773,17 @@ pointer gateが空いた後、新mouse captureへ残る旧第二接点のsynthet
 実App／egui Context試験で確認し、追加の製品変更を停止した。viewer contextのsessionが正しくても、
 native pointerの各eventの由来が消費境界へ届かない問題であり、HWND／focus／viewport述語の
 条件追加では直さない。設計補足待ちで段C未受入・出荷不可。詳細は調査書の同日停止記録を参照。
+
+同日、設計担当の指示で基点v4.10.0 `b10dc7406` に同じ入力回帰を移植し、native offsetの
+756→800と次のmouse deltaの汚染が既存であることを実行確認した。基点は同frameの描画に
+反映せず、新契約では描画にも出る差を明記したうえで、利用者の条件付き判断に従い§1.487へ分離した。
+当該回帰を理由付きignoreで保持し、>>661の段C統合確認を再開する。HWND／focus／viewportの
+変更やresetを追加する必要はない。最終受入結果は調査書の同日再開後記録へ集約する。
+
+再開後、同一Contextの別viewport・独立frame／discard／transport-only／replayを直接検査する2件を追加した。
+本体全件14,993件、Collection20件、snapshot214件とaudit違反0まで確認した。
+最後の本体fullで見つかった13件の失敗は、実描画しない起動復元fixtureが旧cacheだけへgeometryを手設定する
+API適合漏れで、ownerへ実際に模したgeometryを記録する6setupへ変更し、期待値と操作を維持した。
+当該73件と本体fullの再実行は全成功。製品のdetachedロジックやviewport述語を追加変更していない。
+共通workspace fullはランチャー内包release exe3点不足でテスト開始前に停止し、出荷判定は保留。
+全command・source・ログは [>>661最終台帳](scroll-661-investigation.md#stage-c-final-verification) を正本とする。

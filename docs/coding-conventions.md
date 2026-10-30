@@ -23,8 +23,8 @@
   区別し、順序付きイベントとeguiの実保持先で新pressを受理する。Responseの集約flagだけに依存しない。
   同ownerのSync再passは、Appが半行未満のreadbackを採らなくても最初のnative移動・rubber-bandを保持する。
   Set／AppGesture／session交代は明示位置を優先する。pointer・touchとも旧入力を宛先へ再所属させない。
-  この入力所属の実装は段Cで検証中。旧touch由来Moveと新mouse captureの混在経路が未解決であり、
-  完了状況は調査書の停止記録を参照する。
+  旧touch由来Moveと新mouse captureを混在させる既存経路は、基点比較後の設計担当判断で
+  §1.487へ分離した。新契約では同frame描画にもその誤採用が出る差がある。範囲と完了状況は調査書を参照する。
 - **Mouse wheel**: `ctx.input_mut` で MouseWheel イベントを消費し、1行分に変換。
 - **Popup / menu wheel passthrough**: `menu_button` / `ComboBox` / popup 内に
   `ScrollArea` を置く場合、popup が開いている frame では `raw_scroll_delta` /

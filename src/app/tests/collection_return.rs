@@ -69,20 +69,20 @@ impl Driver {
             app.current_folder
                 .as_ref()
                 .and_then(|p| app.folder_history.get(p)),
-            app.pending_grid_scroll,
-            app.scroll_to_selected,
-            app.scroll_offset_y,
+            app.grid_scroll.pending_edge(),
+            app.grid_scroll.reveal_requested(),
+            app.grid_scroll.offset(),
             app.current_grid_order().len(),
             if app.settings.grid_view_mode == crate::settings::GridViewMode::Details {
                 app.current_grid_order().len() as f32 * 28.0
             } else {
                 app.current_grid_order()
                     .len()
-                    .div_ceil(app.last_grid_cols.max(1)) as f32
-                    * app.last_cell_h
+                    .div_ceil(app.grid_scroll.geometry().cols.max(1)) as f32
+                    * app.grid_scroll.geometry().row_h
             },
-            app.last_viewport_h,
-            app.last_cell_h,
+            app.grid_scroll.geometry().viewport_h,
+            app.grid_scroll.geometry().row_h,
             app.items_generation,
             app.details_image_dims_state,
             app.sidecar_restore_active(),
@@ -169,7 +169,7 @@ impl Driver {
     fn settled(&mut self, app: &mut App) {
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut quiet = 0;
-        let mut previous_scroll = app.scroll_offset_y;
+        let mut previous_scroll = app.grid_scroll.offset();
         loop {
             self.tick(app, None);
             if app.folder_pane_open_pending.is_none()
@@ -179,7 +179,7 @@ impl Driver {
                     app.details_image_dims_state,
                     LazyColumnState::Ready { .. } | LazyColumnState::Disabled
                 )
-                && (app.scroll_offset_y - previous_scroll).abs() < 0.1
+                && (app.grid_scroll.offset() - previous_scroll).abs() < 0.1
             {
                 quiet += 1;
                 if quiet == 4 {
@@ -188,7 +188,7 @@ impl Driver {
             } else {
                 quiet = 0;
             }
-            previous_scroll = app.scroll_offset_y;
+            previous_scroll = app.grid_scroll.offset();
             if Instant::now() >= deadline {
                 let writer_busy = app.metadata_transfer_writers_busy_for_sidecar_restore(false);
                 println!(
@@ -454,9 +454,9 @@ fn investigate(
         .position(|i| i.drag_source_path() == Some(child.as_path()))
         .unwrap();
     env.move_grid_cursor(Some(idx), GridCursorIntent::Automatic);
-    env.scroll_to_selected = true;
+    env.grid_scroll.set_reveal_requested(true);
     if !top {
-        env.pending_grid_scroll = Some(GridScrollIntent::Bottom);
+        env.grid_scroll.request_edge(GridScrollIntent::Bottom);
     }
     driver.settled(&mut env);
     assert_eq!(env.items.len(), 200, "long-list fixture");
@@ -468,7 +468,7 @@ fn investigate(
             "real details enumeration"
         );
     }
-    let saved = env.scroll_offset_y;
+    let saved = env.grid_scroll.offset();
     assert!(
         if top { saved == 0.0 } else { saved > 0.0 },
         "initial position top={top}: {saved}"
@@ -567,9 +567,11 @@ fn investigate(
     }
     println!(
         "COLRETURN_RESULT origin={origin:?} return={ret:?} details={details} top={top} kind={kind} early={early} fresh={fresh} saved={saved} actual={} selected={:?} gen={} collection={collection_id:?}",
-        env.scroll_offset_y, env.selected, env.items_generation
+        env.grid_scroll.offset(),
+        env.selected,
+        env.items_generation
     );
-    let actual = env.scroll_offset_y;
+    let actual = env.grid_scroll.offset();
     env.shutdown_collection_runtime_for_exit();
     assert!(
         (actual - saved).abs() < 1.0,

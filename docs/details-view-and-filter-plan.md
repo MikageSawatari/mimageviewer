@@ -25,7 +25,7 @@
 > gutter見積り用の高さを縦physicsへ渡さない。実列数1・行高28・viewportをcontextのscroll ownerへ記録し、
 > 保存／RowAnchor復元／revealで共有する。これによりサムネイルの旧列数を使って詳細の再読込・自動再走査後に
 > 選択行の画面内位置がずれる既存不具合も直す。現在geometryと明示更新をeguiのphysics前へ渡し、
-> 描画origin／viewportも同じ解決結果から作る。実装・検証状況は [調査書](scroll-661-investigation.md) を参照。
+> 描画origin／viewportも同じ解決結果から作る。実装済み・実機未確認。自動確認と共通workspace gateの前提不足は [最終台帳](scroll-661-investigation.md#stage-c-final-verification) を参照。
 > v2.0.0 追補レビュー後、複数選択型 facet メニュー (種類/拡張子/AIモデル/生成ツール/★/状態) は
 > タグ/場所/画像色と同じく外側クリックまで開いたままに統一し、絞り込みバー右端の件数は
 > `表示件数 / 全体件数 件` に変更。場所 facet の件数もタグ facet と同様に表示集合単位でキャッシュする。

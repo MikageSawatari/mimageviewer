@@ -753,3 +753,182 @@ core／feature check以降の変更はtest fixtureと文書に限る。
 `git diff --check` は成功し、vendorの変更ファイルは許可された `scroll_area.rs` と `PATCHES.md` だけである。
 backlogへの「実装済み・実機未確認」追記も未完了のため行っていない。
 再開時は設計補足を確認して当該redを通し、段C全体と最終gateを完了してから出荷可能とする。
+
+<a id="mixed-input-v410-baseline"></a>
+
+### 混在入力回帰のv4.10.0基点比較と範囲の確定（2026-10-30）
+
+上記停止後、ClaudeCodeがB/Cの途中差分を `910391359`（WIP）としてコミットし、
+Collection帰還の調査・20試験を `da7bd5aaa` で取り込んだ。再開時の作業ツリーはclean。
+設計担当は「まず同じ回帰を基点で実行し、新規退行なら段Cで扱う、既存なら別backlogへ分離する」
+と指示した。基点比較が終わるまで、追加の製品変更と他経路のテストは進めなかった。
+
+基点 **v4.10.0 `b10dc74060b9109220ffeae6d2266ba6721b7b0d`** を
+`target/scroll661-v410-baseline/` へ `git archive` で実ファイル展開した。
+worktree／stash／junctionは使わず、未追跡vendorを実体コピーして基点のtracked内容を重ねた。
+LFS filterのsandbox内エラーはarchiveコマンド限定のfilter無効化で回避し、永続Git設定は変更しなかった。
+使用素材は同じ一時生成JPGで、LFS画像やモデルを動作条件にしない。
+展開時のtracked4,248件をarchiveとbyte比較し、試験追加後も全tracked／vendorを再監査した。
+基点製品ロジックは変更せず、変更は `tests.rs` のmodule登録、`ui_main.rs` の `cfg(test)` witness、
+追加のtest moduleだけ。eguiの基点 `scroll_area.rs`／physicsはSHA-256一致を確認した。
+
+同じ回帰を旧fieldへ適合し、実フォルダ移動・worker／hydration・Context／renderer・
+正当なbackground captureを通した。存在しない新session APIはfolder／items世代／行数／選択／列数の
+不変条件に置き換えた。イベント順序と旧Moveなしの対照、viewport／origin／返却Stateの検査は維持した。
+基点はviewport／content originをphysics前に確定し、その位置で描画するので、同frameのStateと描画を別々に記録し、
+直後の本物mouse Moveとその描画が出る次frameも採取した。assertは全記録後へ移して失敗を残した。
+
+| 観測 | 旧Moveなしの対照 | 旧第二指Moveあり |
+| --- | ---: | ---: |
+| 直前のcanonical／native／viewport | 756／756／756 | 756／756／756 |
+| 当該frameの返却native offset | 756 | **800** |
+| 同frameのviewport／content origin | 756／-580 | 756／-580 |
+| 当該frameのcanonical／touch端数 | 756／0 | 756／0 |
+| 次の本物mouse +100後のnative offset | 656 | **576** |
+| 行丸め後canonicalと次frameのviewport | 630／630 | 630／630 |
+
+両分岐でfolder・items／世代・選択・列数・background captureは同じ。
+**旧synthetic Moveを新mouseの移動としてnativeが採用する不具合は、基点から存在する。**
+その80ptは次の本物mouse deltaにも混ざる。一方、基点のこのfixtureは行丸めで描画差を隠す。
+>>661の新契約はphysics後の位置でviewport／content originを確定するため、現行版では同frameのviewportも756→800となる。
+**同じ描画症状まで基点で出た／今回の変更の影響がない、とは扱わない。**
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo test --manifest-path target/scroll661-v410-baseline/Cargo.toml --target-dir target -p mimageviewer --lib retired_secondary_touch_move_cannot_drive_a_new_mouse_capture --locked --offline -- --test-threads=1 --nocapture
+```
+
+最終の凍結source実行は **0 PASS / 1 FAIL、exit101**、実行1.95s・compile込み107.13s。
+旧Moveなしの対照は不変、旧MoveありのState不変assert相当だけが失敗した。
+source開始／終了SHA一致とbinary／logのSHAを記録した。compile中にfixtureを補正した
+初回試行は最終証拠に数えず、補正完了後に再実行した結果だけを採用している。
+
+- ログと実行証拠: `target/scroll661-baseline-final.log`、`target/scroll661-baseline-final-evidence.json`。
+- 差分・source監査: `target/scroll661-baseline-fixture.diff`、`target/scroll661-baseline-source-audit.json`。
+- 生成・採取: `target/scroll661-prepare-baseline.py`、`target/scroll661-adapt-baseline.py`、
+  `target/scroll661-run-baseline-final.py`。基点test SHA-256は
+  `15d4c15ee3ea26b339b06353fa9f010dc81686d42d184f537592d28ac453bb27`。
+
+Sol / xhighの独立reviewerもsource・入力列・最終証拠を読み取り確認し、上記留保を含めて
+設計担当の条件付き除外指示を適用してよいと判断した。再実行・製品の実機配送はしていない。
+利用者判断に従い混在操作を **§1.487** へ起票し、元の追加回帰は
+`#[ignore = "known pre-existing: §1.487 (v4.10.0 native touch/mouse pointer mixing)"]` で保持する。
+これは既存の混在入力不具合の切出しで、通常一覧切替のbounds／速度／capture修正を取り消さない。
+承認済みAPIや製品ロジックを追加変更せず、段Cの残りのgateへ進む。
+
+<a id="stage-c-final-verification"></a>
+
+### 段C再開後の統合検証（2026-10-30）
+
+Collectionの20試験は、旧offset／edge／reveal fieldと最後のgeometryの読み出しを
+同じscroll ownerのaccessor／要求入口へ適合した。fixture、キー・worker・帰還経路、20件の期待値は変更しない。
+§1.487の理由付きignore以外に試験を除外していない。最終gateと20件の結果は本節の台帳に記録する。
+
+R2の最終棚卸しで、別viewportの実frame番号を直接比べる対照を追加した。
+`grid_viewports_keep_independent_frames_and_commands_across_discard` と
+`grid_transport_only_and_replay_use_the_actual_viewport_frame` は、同じegui ContextへROOT／childの
+実RawInputを交互に渡す。同じscopeとTouchId、同数frameの独立性、片側だけを先行する両方向、
+実discard／replayのcommand一回性、休止側のmarker／replay状態、実end-passでの旧End観測、
+新Startの再開まで検査する。viewport出力は適用せず実窓を作らない。
+追加は `touch_correlation.rs` のtest module内だけで、独立sourceレビューACCEPT。
+後述のfocused45件と最終本体fullで、追加2件も成功した。
+
+本再開の製品コードは `910391359` のまま。最初の現行focused compileは基点試験と共有した
+Cargo targetのegui成果物を再利用し、新APIがない19エラーで終了した（exit101）。
+基点eguiのAPIが現行には存在することをsourceで照合し、`cargo clean -p egui`（exit0）で
+当該packageのbuild cacheを除いた後に再検証する。製品修正やfixtureの期待値変更で解消していない。
+途中ログは `target/scroll661-stage-c-final-focused.log`、cache処理は `target/scroll661-main-egui-cache-clean.log`。
+`test-focused.ps1 -Base b10dc7406` は共有App／vendor／文書を含むためexit2。
+`test-lib-full.ps1` へ進む選択結果は `target/scroll661-stage-c-test-focused.log` に保存した。
+
+最終focusedはrun `f13a9edf-e189-423d-98c8-e8412f9f2449`、**45 PASS / 0 FAIL**（27.192s）。
+新viewport2件、R1〜R4・>>661、実pinch／tapと、取り込んだCollection **20件すべて**を含む。
+JUnitの実行case名と件数を機械照合した抽出は `target/scroll661-stage-c-focused-results.json`、
+ログは `target/scroll661-stage-c-final-focused-2.log`。Collectionの期待値を緩める変更はない。
+
+本体全件の初回はrun `4c4fe977-b5fa-47b7-a432-99acdd060c10`、
+**14,980 PASS / 13 FAIL / 66 skipped**（710.526s、exit100）。
+`target/scroll661-stage-c-test-lib-full.log` と
+`target/test-lib-full/runs/20261030T052514413Z-b2acac9d/` に記録した。
+失敗は `startup_restore_tests::section1335_*` の13件だけで、保存行位置Some(3)対期待Some(2)の同型だった。
+
+6箇所のhandler-only fixtureは旧cacheへcols3／行高40を直接設定してoffset80を作っていたが、
+位置保存の正本となったownerのgeometryは未設定で既定cols4／行高200のままだった。
+index12の計算が `12/4 - round(80/200) = 3` となる原因をsourceと全失敗から確認し、
+独立reviewerも製品経路の不整合ではなくfixture API適合漏れと判断した。
+両製品rendererは既に実geometryをownerへ記録する。full実行中にはsourceを変更せず完走後に、
+6箇所を `set_departure_grid_geometry` へ移した。
+このtest-only helperはcols3／行高40／viewport120（3可視行）と実itemsのnatural高を記録し、
+13項目でもoffset80が有効なmaxになることを検査する。旧cacheも同じ値へ揃える。
+RowAnchorや描画proofを作らず、期待Some(2)、入力、後段assertを一切変えない。
+当該module全件と本体fullを再検証する。製品コードは引き続き無変更。
+
+helperと6置換の独立レビューもACCEPT。旧試験の入力・期待値・後段assertが維持されていることを
+機械照合した。修正後の `cargo nextest run -p mimageviewer --lib -E 'test(/startup_restore_tests::/)' --no-fail-fast --retries 0 --no-tests fail` は
+run `d672fc97-61a0-4b11-a026-beebbff15287`、**73 PASS / 0 FAIL**（4.918s）。
+ログは `target/scroll661-stage-c-startup-fixture-regression.log`。初回13失敗の後段まで成功した。
+
+再度の本体fullはrun `24ae7d2c-998c-4f87-96c0-b402e9ecc393`、
+**14,993 PASS / 0 FAIL / 66 skipped**（536.504s、exit0）。
+当該sourceの成功receiptは `target/test-lib-full/76be7ef127a5122c711130ab56f53040e2d696ba72a662024ef0df583318f78e.json`、
+source IDは `e1ea5a9740eb328971ffc0f9335d119e6d5b1dc161d8f84562e24f20a6ed8241`。
+ログは `target/scroll661-stage-c-test-lib-full-2.log`、詳細／JUnitは
+`target/test-lib-full/runs/20261030T054149332Z-164a4b51/`。sourceは実行中固定し、
+その後の変更は本検証台帳等の文書だけで、製品・test source・条件は維持している。
+
+同じ最終sourceのcore checkはexit0（42.84s）、test-script付きlib／tests checkもexit0（1m53s）。
+`cargo test --test ui_snapshot` は **214 PASS / 0 FAIL**（32.00s、exit0）。
+snapshotの更新指定はせず、PNG差分はない。ログはそれぞれ
+`target/scroll661-stage-c-handoff-{core,feature}-check.log` と `target/scroll661-stage-c-ui-snapshot.log`。
+本体全件にはCollection20件を再び含み、後から取り込んだ全期待値が最終sourceでも成功した。
+
+最終workspace scriptの初回は、PowerShell内の出力リダイレクトにより
+`Compiling quote v1.0.47` という通常のstderrがNativeCommandErrorへ昇格してexit1となった。
+これは製品テスト失敗ではなく、`target/scroll661-stage-c-workspace-full.log` が途中試行の記録である。
+Pythonから別PowerShell processを起動してOSのstdout／stderrをfileへ捕捉し、
+script内部のnative stderrをPowerShellのerror streamへ合流させず再実行した。
+同じwrapper内のaudit終了コードが初回中断で保存できなかったため、auditも記録を取り直した。
+recorderは `target/scroll661-run-handoff-gates.py`、最終command・exitは
+`target/scroll661-stage-c-handoff-gates-native.json` にrunごとに保存する。
+
+取り直したauditは **exit0・違反0**（80.65s）、workspace fullは **exit101**（6.67s）。
+workspace fullは `mimageviewer-launcher` のbuild scriptが必要とする
+`target/release/mimageviewer-core.exe`／`mimageviewer-remote.exe`／`mimageviewer-epub-pdf.exe` の
+3ファイルが未配置のため、テスト開始前に停止した。fakeの入力やdebug exeへの置換はしない。
+確認用build不要の依頼に従い、これを埋めるためのrelease buildは行っていない。
+成功した本体全件とは区別し、**共通workspace／doc／後続vendor graphのfull gateは未完了**とする。
+本機能のvendor eguiは、製品sourceと同ファイル内testsが前回から無変更のため、
+変異復元後の最終 **161 PASS**（1.735s）を再利用する。`PATCHES.md` の参照もそのfinal logへ揃えた。
+
+| 最終コマンド・検証 | 結果 | 証跡 |
+| --- | --- | --- |
+| `cargo fmt`（引数なし）／`git diff --check` | 成功 | 最終sourceへ適用／差分確認 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit0、42.84s | `target/scroll661-stage-c-handoff-core-check.log` |
+| `cargo check -p mimageviewer --lib --tests --features test-script` | exit0、1m53s | `target/scroll661-stage-c-handoff-feature-check.log` |
+| `cargo nextest run --offline --manifest-path vendor/egui/Cargo.toml --lib` | 161 PASS、1.735s、同sourceの成功を再利用 | `target/scroll661-stage-c-vendor-final.log` |
+| `scripts/test-focused.ps1 -Base b10dc7406` | exit2、共有変更のためfullを選択 | `target/scroll661-stage-c-test-focused.log` |
+| `scripts/test-lib-full.ps1` | 最終14,993 PASS、66 skipped、exit0 | `target/scroll661-stage-c-test-lib-full-2.log`／上記receipt |
+| `cargo test --test ui_snapshot` | 214 PASS、exit0、PNG変更なし | `target/scroll661-stage-c-ui-snapshot.log` |
+| `cargo run --locked -p viewer_context_audit` | exit0、違反0 | `target/scroll661-stage-c-handoff-audit-native.log` |
+| `scripts/test-full.ps1` | exit101、release内包exe3点不足でcompile停止。テスト未実行 | `target/scroll661-stage-c-workspace-full-native.log` |
+
+| 段 | 最終作業ツリー・受入状態 |
+| --- | --- |
+| A | `a930891dd`で挙動不変（R3を除く）のcheckpoint済み |
+| B | 元4再現とR3／R4を含む15件・関連520件成功。`910391359`がBおよびC途中実装のWIPを保持 |
+| C | 入力／contextの実装と本体・focused・UI／auditの統合確認は完了。基点既存の混在入力は設計担当判断で§1.487へ分離。追加製品変更はなく、viewport試験2件、既存fixtureのAPI適合、理由付きignore、文書の差分を未コミットで保持。共通workspace full gateは上記前提不足のため未完了で、出荷判定は保留 |
+
+R1の実App folder切替と両renderer／bg・bar、R2の実App discard・無描画往復と追加viewport対照、
+R3の実reload／rescan／resume、R4の実geometry clampからnative motionと描画への接続を検査した。
+同path A/B・fork／park／move／swap・兄弟不変はApp／registry、異geometry／保存IDのcaptureはvendorの
+対照へ分担しており、全組合せを一つのApp end-to-endで実行したとは扱わない。
+独立コードレビューの追加指摘は解消済み。最終台帳もSol / xhighの読み取り照合でACCEPTとなった。
+reviewerはJUnitの本体14,993件・Collection20件・startup73件・追加viewport2件と理由付き除外、
+各check／snapshot／audit、workspace前提不足の記録を照合し、テストを重複実行していない。
+
+F12／複数窓の変更範囲と構造上の理由はdetached計画§11へ追記した。
+製品起動・desktop操作・実profile使用・確認用build・commitは行っていない。
+§1.488を「実装済み・実機未確認」として起票し、詳細の旧列数を使う行位置保存不具合も併記した。
+実機確認は利用者の事前承認を得る別枠で、今後は専用dataと200／100の有効ZIPによるツリー往復、
+Collectionの本からの各帰還、両renderer・通常wheel／drag・A/B／F12を確認する。予定は1枠約10〜15分＋準備。
+今回、実画面で確認済み／報告者のWindows10で改善済みとは報告しない。

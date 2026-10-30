@@ -19,9 +19,10 @@ MainGridの混在入力中断はrecognizerだけを終え、backendのgateを勝
 MainGrid非描画時は共通end-pass observerがtransportだけ観測し、discard後の再生ではcommandsを再配送しない。
 Appの更新counterをviewport frameの代用にしない。既存の方向settle・130 ms glide・列数pinchは維持する。
 自動回帰・独立レビュー・実機未確認の区別は [調査書](scroll-661-investigation.md) を参照。
-段Cは未完了。旧主接点のEnd後、新mouse captureへ旧第二接点のsynthetic Moveが流れる経路を
-実rendererの自動回帰で確認し、入力provenanceをnative消費境界へ渡す設計補足待ちで停止している。
-上記recognizer／commandの隔離だけでnative pointerの隔離も完了したとは扱わない。
+旧主接点のEnd後、新mouse captureへ旧第二接点のsynthetic Moveが流れる混在操作は、
+基点v4.10.0でも同じnative誤採用があると自動試験で確認し、設計担当判断で§1.487へ分離した。
+上記recognizer／commandの隔離だけで、このnative pointer混在まで解決したとは扱わない。
+新geometry契約ではphysics後の位置でviewport／content originを確定するため、この誤採用も同frame描画へ反映する差がある。
 
 > 状態: **調査完了 / 仕様確定 / Phase 1 Step 3b / 3c まで実装済み**。2026-08-08。
 > Step 0 診断プローブ、Step 1 純ロジック認識器、Step 2 egui 入力源相関、

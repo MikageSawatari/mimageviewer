@@ -76,6 +76,24 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 直し方: AI action を全画面の viewport (表示中の viewer の入力所有者) へ送る。製品の main focus guard は変えない。直したら AI / GPU 経路を変える次の版で `-IncludeFirstAi` 付きの ReleaseChecks を実行して採用する。
 - 関連: [release-check-automation-plan.md](release-check-automation-plan.md)、`src/test_script.rs` の `release_check_first_ai`。規模: Small。
 
+### 1.487 旧二指touchの第二指のMoveが、新しく始めたmouse dragへ混ざる — >>661の統合確認から (2026-10-30)
+
+- 状態: **未着手・>>661から分離（設計担当判断 2026-10-30）**。touchとmouseを同時に使う操作の既存不具合。通常の一覧移動で旧bounds・速度・captureを持ち越す>>661とは分けて扱う。
+- 再現: 旧一覧で二指touch → 別一覧へ移る → 主指を離す（第二指は保持）→ 新mouseで一覧背景をdrag → 旧第二指を動かす。backendの空いたpointer gateから出るsynthetic Moveを、新mouseのnative scrollが採る。
+- 基点検証: v4.10.0の `b10dc7406` をテスト用に展開し、同じ入力列・実worker・両入力の対照・実rendererを通す回帰が失敗。no-tailはnative offset756を維持、旧Moveありは756→800、直後のmouse移動も対照656に対し576となる。基点の同frame描画は756のまま、行丸め後は両方630となり、このfixtureでは差が見えない。>>661修正後はphysics後の位置でviewport／content originを確定するため同frameのviewportも800となる。この反映タイミングの差を「今回の影響なし」とは扱わない。
+- 根拠と証跡: [>>661調査書の基点比較](scroll-661-investigation.md#mixed-input-v410-baseline)。native pointer eventの由来を受理境界へつなぎ、本物mouseのcapture・慣性・直前位置を保って旧touch由来だけを隔離する設計が必要。修正案・規模は未確定。
+- 回帰は `src/app/tests/scroll_661.rs::retired_secondary_touch_move_cannot_drive_a_new_mouse_capture` を理由付きignoreで保持。基点でもState不変assertが失敗することを記録し、設計担当の指示に従って>>661の必須gateから除外する。実機イベント配送・製品画面は未確認。
+
+### 1.488 一覧へ戻ると保存した位置から上へ動く — 5ch >>661／コレクション帰還 (2026-10-30)
+
+- 状態: **実装済み・実機未確認（v4.11.0予定）**。ツリー等で長い一覧→短い一覧→元の一覧と移動した場合や、コレクションの本から戻った場合の共通修正。出荷・統合の判断は設計担当の検収と残るリリースgate後に行う。
+- 原因: 保存位置と選択は正しく復元されるが、同じegui ScrollAreaに残る旧一覧のmaxでphysicsが復元位置をoverscrollと判定し、上へ押し戻す。詳細／サムネイル共通。非同期の復元が最初の描画より早く終わる場合に決定的に再現する。
+- 修正: canonical位置・一回要求・未消費RowAnchor・描画geometryをcontextのscroll ownerへ集約。現在extentと明示更新の意味をphysics前、描画のviewport／originをその後の位置で確定するopt-in契約を両rendererへ接続した。可視一覧と入力の寿命を分け、旧一覧の慣性・capture・touch commandを引き継がず、同一覧の正当な操作とcontextのmove／swapを保つ。遅延や毎frameの強制復元は使わない。
+- **あわせて直した既存の不具合**: 詳細表示の再読み込み・自動再走査・resumeで、保存する行位置が以前のサムネイル列数を使い、選択行の画面内位置がずれる。実列数1・行高・body viewportを同じownerへ記録して保存／復元／revealで共有した。
+- 自動検証: 元の4再現、R1〜R4、入力／contextの回帰とCollection **20件すべて成功**。最終本体全件14,993件、UI snapshot214件、vendor egui161件成功。core／test-script check成功、audit違反0。共通workspace full gateはrelease内包exe3点未配置でビルド停止し未完了。出荷前に整った環境で完走する。[検証台帳](scroll-661-investigation.md#stage-c-final-verification)を参照。
+- 別件: touchとmouseを同時に使う旧第二指のsynthetic Move誤採用は基点からの既存不具合として§1.487へ分離し、理由付きignoreで保持した。新契約では同frameの描画にも出る差がある。Windows実機・報告者環境の製品確認は未実施。
+- 根拠: [>>661調査・設計・実装記録](scroll-661-investigation.md)、[Collection帰還の調査](collection-return-investigation.md)。DB/schema変更なし。F12／兄弟contextの所有境界は[detached §11](detached-rework-plan.md#11-リワーク外からの変更記録)に記録。規模: Medium。
+
 ### 1.472 フォルダツリーの幅が再起動するたびに狭くなる — 5ch >>643 (2026-10-29)
 
 - 状態: **未着手・修正対象として採用 (2026-10-29)**。修正時期は未指定。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、広げたツリー幅が再起動のたびに狭くなり、最後は一定幅になると報告。

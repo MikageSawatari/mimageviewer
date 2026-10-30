@@ -5,6 +5,20 @@ use super::*;
 use crate::app::StartupListIntent;
 use crate::settings::{ListCursorHint, StartupListRestore, StartupListTarget};
 
+fn set_departure_grid_geometry(app: &mut App) {
+    // These handler-only fixtures model a three-column, three-visible-row grid.
+    // Record the modeled layout with the scroll owner, as a renderer now does;
+    // the old cache fields alone no longer supply cursor-save row geometry.
+    app.last_grid_cols = 3;
+    app.last_cell_h = 40.0;
+    app.last_viewport_h = 120.0;
+    let natural_h = app.current_grid_order().len().div_ceil(3) as f32 * 40.0;
+    let geometry = GridScrollGeometry::new(3, 40.0, 120.0, natural_h);
+    assert!(geometry.max_offset >= 80.0);
+    app.grid_scroll.record_geometry(geometry);
+    app.grid_scroll.set_position(80.0);
+}
+
 fn png_bytes() -> Vec<u8> {
     let mut output = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
@@ -1180,9 +1194,7 @@ fn direct_tray_book_env() -> (phase_c_support::AppTestEnv, PathBuf, PathBuf) {
         .position(|item| matches!(item, GridItem::ZipFile(path) if path == &book))
         .unwrap();
     assert_eq!(index, 12);
-    env.last_grid_cols = 3;
-    env.last_cell_h = 40.0;
-    env.grid_scroll.set_position(80.0);
+    set_departure_grid_geometry(&mut env);
     env.selected = Some(index);
     // Accepted grid input owns the departing cursor capture and direct page open.
     let nav = env
@@ -2040,9 +2052,7 @@ fn section1335_departing_same_items_page_open_captures_list_cursor_before_page_n
             env.finish_page_identity_preparation_for_test();
             folder
         };
-        env.last_grid_cols = 3;
-        env.last_cell_h = 40.0;
-        env.grid_scroll.set_position(80.0);
+        set_departure_grid_geometry(&mut env);
         env.selected = Some(12);
         // No explicit capture/save is performed here: accepted grid input owns the departure.
         assert!(
@@ -2159,9 +2169,7 @@ fn section1335_synthetic_install_captures_changed_physical_departure_without_man
             .position(|item| item.name() == "page-12.png")
             .unwrap();
         env.selected = Some(selected);
-        env.last_grid_cols = 3;
-        env.last_cell_h = 40.0;
-        env.grid_scroll.set_position(80.0);
+        set_departure_grid_geometry(&mut env);
         let expected = Some(StartupListRestore::V1 {
             target: StartupListTarget::PhysicalList {
                 logical_path: folder.clone(),
@@ -2271,9 +2279,7 @@ fn section1335_similar_exact_page_move_preserves_accepted_departure_before_physi
     env.load_folder(source.clone());
     env.finish_page_identity_preparation_for_test();
     env.selected = Some(12);
-    env.last_grid_cols = 3;
-    env.last_cell_h = 40.0;
-    env.grid_scroll.set_position(80.0);
+    set_departure_grid_geometry(&mut env);
     let expected = Some(StartupListRestore::V1 {
         target: StartupListTarget::PhysicalList {
             logical_path: source.clone(),
@@ -2490,9 +2496,7 @@ fn section1335_cached_smart_root_return_captures_changed_child_cursor_without_ma
         .items
         .iter()
         .position(|item| item.name() == "page-12.png");
-    env.last_grid_cols = 3;
-    env.last_cell_h = 40.0;
-    env.grid_scroll.set_position(80.0);
+    set_departure_grid_geometry(&mut env);
     let expected = Some(StartupListRestore::V1 {
         target: StartupListTarget::PhysicalList {
             logical_path: child.clone(),
@@ -3454,9 +3458,7 @@ fn direct_tray_image_folder_book_env() -> (phase_c_support::AppTestEnv, PathBuf,
         .position(|item| matches!(item, GridItem::Folder(path) if path == &book))
         .unwrap();
     assert_eq!(index, 12);
-    env.last_grid_cols = 3;
-    env.last_cell_h = 40.0;
-    env.grid_scroll.set_position(80.0);
+    set_departure_grid_geometry(&mut env);
     env.selected = Some(index);
     // Finish startup's resume read before the fixture's timed navigation.
     // Later position writes still need their own receipt before DB assertions.

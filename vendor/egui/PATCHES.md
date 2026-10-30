@@ -355,4 +355,5 @@ The first origin assertion was corrected to use the existing physical-pixel/UI
 rounding contract for fractional native motion. The revised production boundary
 and tests received independent ACCEPT. Latest standalone egui lib nextest:
 161 passed / 0 failed / 0 skipped, with `MSBUILDDISABLENODEREUSE=1` and no product
-launch; log `target/scroll661-stage-c-vendor-full.log` in the repository root.
+launch; the run after restoring the mutation probe is recorded in
+`target/scroll661-stage-c-vendor-final.log` (1.735 s) in the repository root.
