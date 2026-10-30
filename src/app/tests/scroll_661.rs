@@ -154,6 +154,10 @@ impl Driver {
         loop {
             self.tick(app, None);
             if app.folder_pane_open_pending.is_none()
+                // Watch registration and notification follow-ups also own real scans.
+                // A quiet grid does not prove their replies/restarts were consumed:
+                // the next explicit rescan could otherwise reuse a pre-mutation worker.
+                && app.external_rescan_pending.is_none()
                 && !app.sidecar_restore_active()
                 && app.details_meta_pending.is_none()
                 && matches!(
