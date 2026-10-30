@@ -25637,11 +25637,9 @@ impl App {
         self.cancel_pending_folder_nav();
         match target {
             Some(target) => {
-                if matches!(
-                    self.folder_nav_current_target(),
-                    Some(FolderNavHistoryTarget::Path(current))
-                        if crate::folder_tree::path_eq(&current, &target)
-                ) && matches!(
+                if self.folder_nav_current_target().is_some_and(|current| {
+                    Self::folder_nav_targets_eq(&current, &FolderNavHistoryTarget::path(&target))
+                }) && matches!(
                     self.top_level_grid_view.surface(),
                     top_level_grid_view::TopLevelGridSurface::Folder
                 ) && self.rating_view_nav_stack.is_empty()
@@ -34689,7 +34687,16 @@ impl App {
             return;
         };
         let destination = self.main_list_requested_destination(&navigation, target, None);
-        self.retire_replaced_main_list_requests_with_startup_intent(None, true);
+        self.retire_replaced_main_list_requests_with_startup_intent(
+            None,
+            matches!(
+                &prepared,
+                PreparedSyntheticSurface::Reading {
+                    entrance: ReadingHistoryEntrance::Menu,
+                    ..
+                }
+            ),
+        );
         if self.main_folder_history_available() {
             let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
                 return;
@@ -37066,7 +37073,7 @@ impl App {
         {
             source.location.clone()
         } else if let PhysicalHistoryIntent::CollectionNavigation { owner } = &request.intent {
-            FolderNavHistoryTarget::CollectionPhysical(owner.destination())
+            FolderNavHistoryTarget::CollectionPhysical(owner.destination(&request.navigation))
         } else if let Some(rating) = rating_destination.as_ref() {
             FolderNavHistoryTarget::RatingPhysical(rating.clone())
         } else if let PhysicalHistoryIntent::CollectionGrid { owner } = &request.intent {
@@ -37145,6 +37152,12 @@ impl App {
                 prefix.as_deref(),
             ),
         };
+        let collection_return_to = match &destination.location {
+            FolderNavHistoryTarget::CollectionPhysical(restore) => {
+                restore.root.return_to.as_deref().cloned()
+            }
+            _ => None,
+        };
         let Some(mut adoption) = self.prepare_main_list_adoption(request.navigation, destination)
         else {
             return;
@@ -37191,7 +37204,7 @@ impl App {
                 app.pdf_password_pending_save = save.then(|| (path.clone(), password));
             }
             if let Some(native) = collection_navigation.as_mut() {
-                native.install(app);
+                native.install(app, collection_return_to);
             } else {
                 app.install_admitted_physical_surface(&path, &owner, rating_destination.as_ref());
             }

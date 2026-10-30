@@ -19,6 +19,12 @@ Rating自身の帰路はpath/展開restoreの対から単一のtyped originへ�
 完全originを通常の履歴identityへ投影する処理と、nativeな復元payloadの寿命を区別する。
 mutableなworker/sessionを共有せず、context/slotを越えた履歴変更やPDF等の失効は行わない。
 
+Snapshotからファイルメニューで入ったReadingHistory rootの退出は、既存dismissで固定を終了してから
+保存済canonical originへ通常のprepare/adoptionを通す。解除の副作用で消費された可視H ownerだけを
+既存replace_surfaceへ保持し直し、rows/path/routeを部分的な固定一覧へ戻さない。取消時も固定は解除済みとする。
+可視Snapshotのcanonical originがH1の場合は新しいH2 visitを作る。H2上でのMenu再押下は同visitを保つ。
+固定ownerと帰路の単一所有・固定一覧の完全な再採用は、別項目§1.486で扱う。
+
 詳細な契約・状態表・検証は[調査記録の修正設計](history-parent-1473-investigation.md#修正の設計)を参照する。
 
 ## Everything 検索のsourceと物理child（§1.374、未リリース）

@@ -186,7 +186,10 @@ impl App {
 
     pub(super) fn capture_reading_history_root(&self) -> ReadingHistoryRootRestore {
         let origin = self.capture_top_level_origin();
-        if let Some(TopLevelGridOrigin {
+        if !matches!(
+            self.top_level_grid_view.surface(),
+            TopLevelGridSurface::Snapshot
+        ) && let Some(TopLevelGridOrigin {
             restore: TopLevelGridRestore::ReadingHistory(root),
             ..
         }) = &origin
@@ -287,6 +290,14 @@ impl App {
             return;
         };
         let root = root.clone();
+        if self.is_snapshot_active() {
+            // End the fixed scope before ordinary navigation checks its destination.
+            // Dismiss consumes the shared return slot; the still-visible root remains
+            // owned here, and its captured exit is authoritative, not the dismiss result.
+            let _ = self.dismiss_snapshot_with_origin();
+            self.top_level_grid_view
+                .replace_surface(TopLevelGridSurface::ReadingHistory(root.clone()));
+        }
         let Some(current) = self.folder_nav_current_entry() else {
             return;
         };

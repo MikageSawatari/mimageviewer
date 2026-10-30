@@ -243,6 +243,7 @@ impl PreparedCollectionPhysicalNavigation {
 
     pub(in crate::app) fn destination(
         &self,
+        navigation: &super::MainListNavigation,
     ) -> super::top_level_grid_view::CollectionGridPhysicalRestore {
         super::top_level_grid_view::CollectionGridPhysicalRestore {
             root: super::top_level_grid_view::CollectionGridRestore {
@@ -254,25 +255,30 @@ impl PreparedCollectionPhysicalNavigation {
                     entry_id: self.target.entry_id,
                     source_key: self.target.source_key.clone(),
                 }),
-                return_to: None,
+                return_to: collection_navigation_return_origin(navigation).map(Box::new),
             },
             root_source_path: self.target.source_path.clone(),
             visible_path: self.target.source_path.clone(),
         }
     }
 
-    pub(in crate::app) fn install(&mut self, app: &mut App) {
+    pub(in crate::app) fn install(
+        &mut self,
+        app: &mut App,
+        return_to: Option<super::top_level_grid_view::TopLevelGridOrigin>,
+    ) {
         if !matches!(
             self.request.action,
             CollectionNavigationAction::OuterGrid { .. }
         ) {
             app.close_fullscreen_for_folder_nav_reopen();
         }
-        app.install_collection_navigation_root(
+        app.install_collection_navigation_root_with_origin(
             &mut self.request,
             Arc::clone(&self.root),
             &self.target,
             false,
+            return_to,
         )
         .expect("prepared immutable physical target cannot reject at install");
         app.commit_collection_grid_source_open(
@@ -374,6 +380,20 @@ struct PreparedCollectionOuterAdoption {
     listing: super::PreparedPhysicalListing,
     token: super::PreparedVisibleInstall,
     adoption: super::MainListAdoption,
+}
+
+/// The common request captured this native owner's complete entrance before work began.
+/// Only its return payload is inherited; destination revision and anchor come from preparation.
+fn collection_navigation_return_origin(
+    navigation: &super::MainListNavigation,
+) -> Option<super::top_level_grid_view::TopLevelGridOrigin> {
+    match &navigation.source_location.as_ref()?.location {
+        super::FolderNavHistoryTarget::Collection(root) => root.return_to.as_deref().cloned(),
+        super::FolderNavHistoryTarget::CollectionPhysical(child) => {
+            child.root.return_to.as_deref().cloned()
+        }
+        _ => None,
+    }
 }
 
 enum CollectionNavigationPreflightPayload {
@@ -3421,6 +3441,27 @@ impl App {
         target: &CollectionPreparedNavigationTarget,
         preserve_active_media: bool,
     ) -> Option<CollectionNavigationRootLanding> {
+        let return_to = request
+            .navigation
+            .as_ref()
+            .and_then(collection_navigation_return_origin);
+        self.install_collection_navigation_root_with_origin(
+            request,
+            prepared,
+            target,
+            preserve_active_media,
+            return_to,
+        )
+    }
+
+    fn install_collection_navigation_root_with_origin(
+        &mut self,
+        request: &mut CollectionNavigationRequest,
+        prepared: Arc<CollectionPreparedSnapshot>,
+        target: &CollectionPreparedNavigationTarget,
+        preserve_active_media: bool,
+        return_to: Option<super::top_level_grid_view::TopLevelGridOrigin>,
+    ) -> Option<CollectionNavigationRootLanding> {
         let page_identity_index =
             Arc::clone(&request.root_thumbnail_sources.as_ref()?.page_identity_index);
         let same_collection = self
@@ -3428,11 +3469,11 @@ impl App {
             .collection_session()
             .is_some_and(|session| session.identity.collection_id == request.origin.collection_id);
         if !same_collection {
-            self.top_level_grid_view.begin(
+            self.top_level_grid_view.begin_with_origin(
                 TopLevelGridSurface::Collection(CollectionGridIdentity {
                     collection_id: request.origin.collection_id,
                 }),
-                None,
+                return_to,
             );
         }
         let prepared_thumbnail_source_identity = request
@@ -3740,7 +3781,7 @@ impl App {
                 entry_id: target.entry_id,
                 source_key: target.source_key.clone(),
             }),
-            return_to: None,
+            return_to: collection_navigation_return_origin(&navigation).map(Box::new),
         };
         let location = super::FolderNavHistoryTarget::CollectionPhysical(
             super::top_level_grid_view::CollectionGridPhysicalRestore {
@@ -3787,12 +3828,20 @@ impl App {
         restore_intent: super::StartupListIntent,
         deferred: Option<super::DeferredFsReopen>,
     ) {
+        let return_to = match &prepared.adoption.destination.location {
+            super::FolderNavHistoryTarget::CollectionPhysical(child) => {
+                child.root.return_to.as_deref().cloned()
+            }
+            _ => unreachable!("native outer adoption has a prepared Collection destination"),
+        };
         self.adopt_main_list_navigation(prepared.adoption, |app| {
             if !matches!(request.action, CollectionNavigationAction::OuterGrid { .. }) {
                 app.close_fullscreen_for_folder_nav_reopen();
             }
-            app.install_collection_navigation_root(request, root, target, false)
-                .expect("prepared immutable outer target cannot reject at install");
+            app.install_collection_navigation_root_with_origin(
+                request, root, target, false, return_to,
+            )
+            .expect("prepared immutable outer target cannot reject at install");
             app.commit_collection_grid_source_open(
                 CollectionGridViewportAnchor {
                     entry_id: target.entry_id,

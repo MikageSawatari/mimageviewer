@@ -1475,35 +1475,187 @@ fn section1473_search_transfers_complete_canonical_origin() {
 #[test]
 fn section1473_snapshot_keeps_input_specific_admission_and_parent_owner() {
     for portable in [false, true] {
-        let mut app = setup(portable);
-        configure(&mut app);
-        let (book, kind) = fixture(&mut app, "zip");
-        let origin = book.parent().unwrap().to_owned();
-        app.load_folder(origin.clone());
-        settle(&mut app);
-        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
-        settle(&mut app);
-        assert!(app.is_snapshot_active());
-        let ctx = egui::Context::default();
-        assert!(
-            app.apply_ring_action(
-                &ctx,
-                RingShortcutContext::Grid,
-                RingActionId::OpenLocationReadingHistory,
-                "1473-snapshot"
-            )
-            .is_none()
-        );
-        assert!(app.is_snapshot_active());
-        assert_eq!(app.effective_folder(), Some(origin.clone()));
-        add_history(&app, &book, kind);
-        // The file menu does not impose the location-menu Snapshot prohibition.
-        enter(&mut app, Entrance::Menu);
-        assert!(app.is_snapshot_active());
-        parent_and_settle(&mut app, "backspace");
-        assert!(app.is_snapshot_active());
-        assert_eq!(app.effective_folder(), Some(origin));
-        assert!(!app.items_are_reading_history_view);
+        for route in ["backspace", "alt-up", "mouse", "ring"] {
+            let mut app = setup(portable);
+            configure(&mut app);
+            let (book, kind) = fixture(&mut app, "zip");
+            let origin = book.parent().unwrap().to_owned();
+            app.load_folder(origin.clone());
+            settle(&mut app);
+            let expected = app.capture_top_level_origin().unwrap();
+            app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+            settle(&mut app);
+            assert!(app.is_snapshot_active());
+            let ctx = egui::Context::default();
+            assert!(
+                app.apply_ring_action(
+                    &ctx,
+                    RingShortcutContext::Grid,
+                    RingActionId::OpenLocationReadingHistory,
+                    "1473-snapshot"
+                )
+                .is_none()
+            );
+            assert!(app.is_snapshot_active());
+            assert_eq!(app.effective_folder(), Some(origin.clone()));
+            add_history(&app, &book, kind);
+            // The file menu does not impose the location-menu Snapshot prohibition.
+            enter(&mut app, Entrance::Menu);
+            assert!(app.is_snapshot_active());
+            let visible = app.capture_top_level_origin().unwrap();
+            let history = app.folder_nav_history_snapshot();
+            assert!(root_parent_button(&mut app).is_none());
+            assert!(app.is_snapshot_active());
+            assert_eq!(app.capture_top_level_origin().unwrap(), visible);
+            assert_eq!(app.folder_nav_history_snapshot(), history);
+            settle(&mut app);
+            parent_and_settle(&mut app, route);
+            assert!(!app.is_snapshot_active());
+            assert_eq!(app.effective_folder(), Some(origin));
+            assert!(!app.items_are_reading_history_view);
+            assert!(matches!(
+                app.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Folder
+            ));
+            assert_eq!(app.capture_top_level_origin().unwrap(), expected);
+            assert!(app.projection_recipe.extracted_surface().is_none());
+        }
+    }
+}
+
+#[test]
+fn section1473_snapshot_same_path_history_has_distinct_root_and_exits_to_its_captured_visit() {
+    for portable in [false, true] {
+        for route in ["backspace", "alt-up", "mouse", "ring"] {
+            let mut app = setup(portable);
+            configure(&mut app);
+            let (book, kind) = fixture(&mut app, "zip");
+            let origin = book.parent().unwrap().to_owned();
+            app.load_folder(origin.clone());
+            settle(&mut app);
+            add_history(&app, &book, kind);
+            enter(&mut app, Entrance::Menu);
+            let h1 = app.capture_top_level_origin().unwrap();
+            let root1 = adopted_history_root(&app);
+            app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+            settle(&mut app);
+            assert!(app.is_snapshot_active());
+            enter(&mut app, Entrance::Menu);
+            let root2 = adopted_history_root(&app);
+            assert_ne!(root1.visit, root2.visit);
+            assert!(
+                matches!(&root2.exit, top_level_grid_view::ReadingHistoryExit::RecordedEntrance(entrance) if entrance.as_ref() == &h1)
+            );
+            assert_eq!(app.current_folder, Some(reading_history_synthetic_path()));
+            assert_eq!(
+                app.snapshot.as_ref().unwrap().origin,
+                reading_history_synthetic_path()
+            );
+            // Menu on the already visible H2 retains its visit even while fixed state exists.
+            enter(&mut app, Entrance::Menu);
+            assert_eq!(adopted_history_root(&app), root2);
+            assert!(root_parent_button(&mut app).is_none());
+            assert!(app.is_snapshot_active());
+            assert_eq!(adopted_history_root(&app), root2);
+            settle(&mut app);
+            parent_and_settle(&mut app, route);
+            assert!(!app.is_snapshot_active());
+            assert_eq!(app.capture_top_level_origin().unwrap(), h1);
+            assert_eq!(adopted_history_root(&app), root1);
+            assert!(app.items_are_reading_history_view);
+            parent_and_settle(&mut app, route);
+            assert_eq!(app.effective_folder(), Some(origin));
+            assert!(!app.items_are_reading_history_view);
+        }
+    }
+}
+
+#[test]
+fn section1473_snapshot_exit_cancel_keeps_visible_root_and_ends_fixed_scope() {
+    for portable in [false, true] {
+        for recorded in [false, true] {
+            let mut app = setup(portable);
+            configure(&mut app);
+            let (book, kind) = fixture(&mut app, "zip");
+            let origin = book.parent().unwrap().to_owned();
+            app.load_folder(origin.clone());
+            settle(&mut app);
+            app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+            settle(&mut app);
+            add_history(&app, &book, kind);
+            enter(&mut app, Entrance::Menu);
+            let root = app.capture_top_level_origin().unwrap();
+            if !recorded {
+                for number in 0..105 {
+                    let later = app.tmp.path().join(format!("later-{number}"));
+                    std::fs::create_dir_all(&later).unwrap();
+                    app.push_nav_history_entry(later);
+                }
+            }
+            let before = app.folder_nav_history_snapshot();
+            app.exit_reading_history_root();
+            assert!(!app.is_snapshot_active());
+            assert_eq!(app.capture_top_level_origin().unwrap(), root);
+            assert_eq!(app.folder_nav_history_snapshot(), before);
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_some()
+            );
+            app.retire_main_list_requests_for_surface_switch();
+            settle(&mut app);
+            assert!(!app.is_snapshot_active());
+            assert_eq!(app.capture_top_level_origin().unwrap(), root);
+            assert_eq!(app.folder_nav_history_snapshot(), before);
+            parent_and_settle(&mut app, "backspace");
+            assert_eq!(app.effective_folder(), Some(origin));
+            assert!(!app.items_are_reading_history_view);
+        }
+    }
+}
+
+#[test]
+fn section1473_snapshot_exit_restores_complete_native_canonical_owners() {
+    for portable in [false, true] {
+        for kind in [
+            "rating",
+            "bookmarks",
+            "subfolder-expansion",
+            "smart",
+            "collection",
+        ] {
+            let mut app = setup(portable);
+            configure(&mut app);
+            let (book, history_kind) = fixture(&mut app, "zip");
+            let origin = book.parent().unwrap().to_owned();
+            let folder = origin.join("owned-source");
+            std::fs::create_dir_all(folder.join("child")).unwrap();
+            app.rating_db
+                .as_ref()
+                .unwrap()
+                .set(&crate::adjustment_db::normalize_path(&folder), 3)
+                .unwrap();
+            let video = origin.join("marker.mp4");
+            std::fs::write(&video, []).unwrap();
+            app.video_bookmark_db
+                .as_ref()
+                .unwrap()
+                .add(&video, 1.0, None, &[])
+                .unwrap();
+            app.load_folder(origin.clone());
+            settle(&mut app);
+            enter_other_root(&mut app, kind, &origin);
+            let expected = app.capture_top_level_origin().unwrap();
+            app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+            settle(&mut app);
+            assert!(app.is_snapshot_active(), "{kind}");
+            add_history(&app, &book, history_kind);
+            enter(&mut app, Entrance::Menu);
+            parent_and_settle(&mut app, "backspace");
+            assert!(!app.is_snapshot_active());
+            assert!(!app.items_are_reading_history_view);
+            assert_eq!(app.capture_top_level_origin().unwrap(), expected, "{kind}");
+        }
     }
 }
 

@@ -358,6 +358,9 @@ enum GridParentPresentation {
 impl App {
     pub(crate) fn grid_parent_action(&self) -> GridParentAction {
         if self.is_snapshot_active()
+            // A history root uses its typed exit below, ending the fixed scope.
+            // Keep the other parent owners and their input restrictions in order.
+            && self.reading_history_root_exit_nav().is_none()
             && let Some(snapshot) = self.snapshot.as_ref()
             && !self.current_folder.as_ref().is_some_and(|current| {
                 crate::snapshot::snapshot_key_from_path(current)

@@ -1455,7 +1455,7 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
-### §1.473 合成一覧の親・typed帰路（2026-10-30、実装途中で停止）
+### §1.473 合成一覧の親・typed帰路（2026-10-30、実装済み・実機未確認）
 
 承認設計 `cae94fb27`（[調査・設計記録](history-parent-1473-investigation.md)）に対し、
 独立設計レビューとClaudeCode/Codexは、合成rootと帰路の所有を直す構造的修正である点に合意した。
@@ -1486,6 +1486,27 @@ SnapshotStateへの新slot、flagだけの修正、pathからの逆算は追加�
 HWND/viewport、park/promote/retireの述語、入力ごとの既存presentation cleanupは変えていない。
 2種類の指定cargo checkは成功、全library/最終gateと最終監査は未実行。補足設計を受領してから再開する。
 詳細と生ログは調査記録末尾の「再停止：Snapshotの固定ownerに関する設計前提不足」を参照。
+
+再開（同日、WIP `7916a1e97`の続き）: 設計担当決定でSnapshot所有全体は§1.486へ分離。
+既存の完全再採用経路がないため、H root退出受付で既存dismissにより固定を終了し、表示中のtyped H ownerを維持してから
+通常の履歴計画/source proofを捕捉する。新しいcontext field、Snapshot専用pending、scope判定の迂回は追加しない。
+可視SnapshotからのH1/H2を別visitとして扱い、親の共通resolverからH rootの部分的な固定一覧復帰を除く。
+限定設計・製品差分は独立レビューと設計担当指示により構造的修正と合意。新たなbundle/F12/viewport変更はない。
+既存のcontext回帰を含む全libraryの結果と最終監査は調査記録にまとめる。
+
+全libraryで見つかった型移行の補完：quick再選択の同値比較を既存helperへ揃え、ReadingHistoryのReturn再表示で
+Remote解除後の保留起動を明示取消しない旧契約を維持した。Collectionの一時ビュー経由NativeOuterでは、
+捕捉済main requestの完全帰路を、native root再構築とactual destinationへ明示配送する。
+同Collectionの有効なresident owner、`navigation=None`のdetached native ownerの既存契約は変更しない。
+PhysicalHistoryへのRAR等転送も同じpayloadを渡し、別contextのslotやliveなMain帰路を参照しない。
+ウィンドウ述語・HWND・viewport・fork/closeの条件の変更ではなく、型付きproducer/consumerの配送漏れを直す構造的補完として
+独立レビューと合意した。通常Folder/実RAR/CollectionPhysical起点の実caller回帰と既存sibling gateで検証する。
+
+最終結果：全library **14,965成功・失敗0・既存skip65**、うち§1.473 **53件全成功**。
+mount/swap/stash/fork/retireと、同じPDFを読むsiblingのticket/世代/queued work保持を含む。
+core/feature付きlib-tests check、fmt、glyph、最終context audit（違反0）も成功、独立最終レビューACCEPT。
+Snapshot本体の所有は§1.486へ残し、今回の限定解除は既存owner/通常navigationで完結した。
+製品起動・実機確認・コミットの完了は含めない。実行証拠は調査記録の最終節を参照。
 
 ### 2026-10-29 §1.480 Enterとdouble-clickの本open受付の共通化
 

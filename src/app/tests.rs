@@ -23349,13 +23349,19 @@ mod phase_c_folder_nav_history_tests {
             Some(GridSortLockReason::DetailsHeaderSort)
         );
 
-        app.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
-        crate::app::tests::install_reading_history_surface_for_test(&mut app);
-        app.current_folder = None;
+        app.current_folder = Some(std::path::PathBuf::from(r"C:\x\book.zip"));
         assert_eq!(
             app.grid_sort_lock_reason(),
             Some(GridSortLockReason::PageOrderFixed),
             "ページ順の固定が列ヘッダより優先する"
+        );
+
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
+        app.current_folder = None;
+        assert_eq!(
+            app.grid_sort_lock_reason(),
+            Some(GridSortLockReason::FixedOrder),
+            "正規の閲覧履歴一覧ではsurfaceが固定順を所有する"
         );
     }
 
@@ -93461,7 +93467,9 @@ mod rating_view_navigation_tests {
     fn rating_view_nav_open_dedupes_only_after_visible_adoption_and_close_clears_stack() {
         let mut app = setup_app();
         let path = app.tmp.path().join("rating-child");
+        let origin = app.tmp.path().join("before-rating");
         std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir_all(&origin).unwrap();
 
         assert!(app.rating_view_physical_load_owner(&path).is_none());
         assert!(
@@ -93473,7 +93481,7 @@ mod rating_view_navigation_tests {
         app.current_folder = Some(super::rating_view_synthetic_path());
         app.rating_view_stars = 4;
         app.rating_view_return_to = Some(crate::app::tests::grid_origin_for_test(
-            top_level_grid_view::TopLevelGridRestore::Folder(app.tmp.path().join("before-rating")),
+            top_level_grid_view::TopLevelGridRestore::Folder(origin.clone()),
         ));
         app.items_are_rating_view = true;
         app.top_level_grid_view.begin(
@@ -93527,11 +93535,26 @@ mod rating_view_navigation_tests {
                 .is_none()
         );
 
-        assert_eq!(app.rating_view_nav_stack, vec![path]);
+        assert_eq!(app.rating_view_nav_stack, vec![path.clone()]);
 
         app.finish_page_identity_preparation_for_test();
         app.close_rating_view();
 
+        assert_eq!(
+            app.rating_view_nav_stack,
+            vec![path.clone()],
+            "退出先の採用前は現在のレーティング物理子の帰路を保持する"
+        );
+        assert_eq!(app.current_folder.as_ref(), Some(&path));
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+
+        app.finish_history_restore_preparation_for_test();
+
+        assert_eq!(app.current_folder.as_ref(), Some(&origin));
         assert!(
             app.rating_view_nav_stack.is_empty(),
             "レーティング一覧を閉じたら仮想階層スタックも破棄する"

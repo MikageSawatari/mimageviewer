@@ -475,7 +475,7 @@ Rating rootで星数を切り替える既存操作は、現在のreturn_toを引
 | Collection root / 物理子 | `CollectionGridRestore`（ID、revision hint、entry anchor）または `CollectionGridPhysicalRestore` 全体に、同Collectionの `TopLevelGridView::return_origin` を対にしたrestore payloadを使う。rootの親はno-opだが、後の一時ビュー移譲/同Collection再入場に使うoriginまで失わない。actorのwatch/receiver/installed mutable sessionは保持せず、既存のlatest revision prepareで再構築する |
 | Smart root / scoped / container | `SmartFolderViewState`（定義ID、既存immutable navigation entries、position/back stack）に、捕捉時の `smart_folder_saved_folder` とそのsurfaceの `return_origin` を含むrestore payloadを使う。前者は定義消失時等の既存の保存元、後者は一時ビューとのorigin移譲であり役割が異なる。rootの親はno-op、子→rootの既存再構築を使い、resident sessionが残っていることを前提にしない。定義更新/削除への新しい回復規則は足さない |
 | 通常の実Folder/本、DriveList、本棚 | 普通の物理一覧は論理sourceから既存scan/preflightで復元し、DriveListも既存synthetic prepareを使う。本棚は実Folder。物理一覧にReadingHistory/Bookmark等の専用親ownerが付いている場合は、その既存帰路payloadも含めたtyped restoreにする。元cache pathだけを保存せず、独立した明示入場によってその帰路を消す既存条件は拡張しない |
-| Snapshot（★固定） | **固定一覧そのものを閲覧履歴の退出payloadへ複製する対象にはしない**。リング/場所メニューは既存のSnapshot場所ジャンプ拒否を維持する（`gamepad_input.rs::location_navigation_blocked`、`ui_main.rs:15326`）。ファイルメニューの閲覧履歴は別経路であり、一律に「Snapshot中は入れない」とはしない。現状この入口はSnapshotをdismissせず、固定ownerを同contextに保持する。親の優先順位は既存 `snapshot_return_to_list_view` が先で、固定一覧へ戻す。Snapshot解除を伴う既存の一時ビュー切替でcanonical originを受け渡す場合は、その元場所を完全なpayloadで引き継ぎ、Snapshotを新たに再作成しない |
+| Snapshot（★固定） | **固定一覧そのものを退出payloadへ複製しない**。場所メニュー/リングの既存拒否と、ファイルメニューからの閲覧履歴入場は維持する。完全な固定一覧再採用の既存経路がないため、rootの親は既存解除経路で固定を終え、入口payloadのcanonical originへ戻す。固定一覧の部分復帰は使わない。2026-10-30の範囲決定と契約は§3.1.1。Snapshot全体の所有の作り直しは§1.486へ分離 |
 
 Collection/Smartのlocation（履歴同値判定用）と、保存元を含むrestore payloadは分ける。
 `TopLevelGridRestore` 側を `CollectionRootRestore` / `CollectionPhysicalEntranceRestore` /
@@ -489,6 +489,33 @@ Bookmarksの位置は既存のstable-key read-modelへ渡す値であり、worke
 `take_origin_for_search_entry`、canonical/fallbackを作るview-return helper、Collection/Smartのorigin captureを
 同じ完全な `TopLevelGridRestore` のproducerへ揃える。未採用の要求の見込み値で可視入口を置換しない。
 通常の検索close等も同じ型を運ぶが、入場可否・検索結果を閉じる仕様・親の意味は変えない。
+
+#### 3.1.1 Snapshot入口の限定対応（2026-10-30、設計担当の範囲決定）
+
+固定owner/canonical originの作り直しは§1.473から外し、[§1.486](next-release-backlog.md#1486-snapshot固定の固定ownerとcanonical-origin--routeの単一所有)へ分離する。
+採るのは設計担当提示の**案2：既存の解除経路で固定を終え、捕捉済みcanonical originへ退出する**。
+`FolderNavHistoryTarget`にSnapshot entryはなく、`snapshot_return_to_list_view`もrows/path/recipeの部分復帰であり、
+surface・行provenance・canonical origin/routeまで一括採用する既存経路ではない。案1は成立しない。
+
+- 親の共有resolverは、固定が残っていても**可視ownerが型付きReadingHistory rootならRootExitを選ぶ**。
+  Snapshotのpath比較による部分復帰は使わない。ほかのSnapshot内の親操作の既存規則は変えない。
+  親ボタンは既存のSnapshot中disabledを維持し、無操作であることもheadlessクリックで検査する。
+  許可されているBS/Alt+↑/mouse/ringは共有resolverからこの退出へ進む。
+- root退出受付で実rootを捕捉し、実Snapshotがある場合は既存`dismiss_snapshot_with_origin`で固定を終了する。
+  その返り値を行先にせず、rootが既に所有する完全な入口payloadだけを使う。
+  この解除はTopLevelGridViewをFolderへ変えるので、既存`replace_surface`へ捕捉済みの**現在表示中のH root**を渡して
+  source ownerを保つ。rows/path/routeは変更せず、固定一覧を新しく復元する経路は作らない。
+- **解除は受付で即時確定**し、その後にcurrent entry・Back計画・MainListNavigation/source proofを捕捉する。
+  physical prepare/commitの既存Snapshot範囲判定を迂回せず、固定を終えた通常navigationへ揃える。
+  成功tailまで解除を遅らせる案は、入口O自身が固定membership外の場合にadmissionで拒否されるので採らない。
+  prepare取消/未採用ではHの表示と履歴を保持し、固定は解除済みのままにする。Snapshotの復活/rollbackは作らない。
+- 可視surfaceがSnapshotの場合、そのcanonical originがH1でもH1を現在rootとして再利用しない。
+  新しいH2 visitを作り、H2.exitに完全なH1を持つ。実H2上でMenuを押し直す既存のroot再利用は維持する。
+  `O → H1 → Snapshot → Menu H2 → 親 H1 → 親 O`では、同じpathを根拠に固定一覧とH2を同一視しない。
+- 新bool/並列Option/退出時の履歴検索/固定由来の逆算は追加しない。固定stateの複製、ファイルメニュー入場の禁止もしない。
+  通常の固定一覧を維持する案から、**この入口の親で固定を終える**仕様へ変えるのは設計担当の明示承認による。
+
+独立レビュー（GPT-6.1 Sol / xhigh）は、既存解除と表示中のtyped rootの保持であり症状guardではないとしてこの限定設計に合意した。
 
 #### 3.2 既存prepare/adoptionへの配送
 
@@ -718,6 +745,7 @@ BA-7に該当するApp側フラグの追加、時間窓、rect/HWND推測、再�
 | 入口を履歴entryだけにして、退出直前にRating/展開等のApp slotから補完 | 不採用（P2×2）。普通の本openがslotを消すため成立しない。path投影の前に完全なpayloadを捕捉し、同じnative ownerへ渡す |
 | 合成一覧の入れ子を禁止/平坦化する / 一覧の組ごとの専用帰路を増やす | 不採用（§3.0）。前者は出荷済みの戻りを失い、後者は組合せを増やす。共通のtyped originで表現を一本化し、Ratingの旧帰路対を置換する |
 | marker不在時の入場前prefix/脱落後suffixを識別し、Back/Forwardを組み直す | **不採用（2026-10-30補足）**。検索経由/上限超過の組合せを扱う境界状態を増やさず、どちらも既存Directへ揃える。完全な入口payloadで行先と位置を維持し、履歴操作だけ通常の前進規則を使う |
+| Snapshot固定とroot退出prepareを並存させ、成功時にだけ固定を解除 | **不採用（§3.1.1）**。固定のmembership外の入口へは既存admissionで進めない。受付で既存解除を完了してから通常navigationへ揃え、固定＋prepareの組合せと取消時の復活を作らない |
 | 通常Back/Forward全体で同値地点をskip、Return時にstackを全整理 | 不採用。親以外の1件移動や、別visit・facet routeの履歴まで変える。root退出だけの計画に限定する |
 | 本を閉じるたびにrootを新規Menuとして作り直す | 不採用。入口を本に上書きし、既存の行/scroll復元も失う。Returnは同じrootを再構築する |
 | 閲覧履歴中/退出中の操作を新しいmodalで止めて組合せを除く | 不採用。通常の親操作・履歴入力を制限する。長い変換等は既存modalが既に所有し、今回の退出は既存navigation transactionで処理できる |
@@ -780,7 +808,8 @@ BA-7に該当するApp側フラグの追加、時間窓、rect/HWND推測、再�
     Collection/Smartはroot/物理子の復元に加え、子→rootの親・保持originを使う一時ビュー往復も検査する。
     検索はファイルメニューの実受付からcanonical originへ退出し、queryを再実行しない。
     Snapshotは場所メニュー/リングの既存拒否と、ファイルメニューで受理される経路の固定owner保持を別々に検査する。
-    後者の親はSnapshotのlist復帰が先であり、固定stateを消す/複製することで試験を通さない。
+    後者のrootの親は§3.1.1に従い固定を終了し、捕捉済canonical originのsurface・行provenance・routeへ戻る。
+    同pathのH1起点、H2上のMenu再押下、退出prepare取消後もHを保ち固定は解除済みであることを検査する。
     native producerが未採用のときは元の可視ownerを入口として捕捉することも確認する。
 12. **再確認P2の必須受入**：通常/portable相当の両配置で、
     `入口O → 閲覧履歴H1 → ★一覧 → 閲覧履歴H2 → 親で★一覧 → 親でH1 → 親でO` を実処理で通す。
@@ -804,7 +833,8 @@ BA-7に該当するApp側フラグの追加、時間窓、rect/HWND推測、再�
 実装時の順序は、pure plan → `section1473` → 関連handler/owner試験 → gate。
 build/testでは必ず `MSBUILDDISABLENODEREUSE=1`。
 `.\scripts\test-focused.ps1` を実行し、広域変更等でexit 2なら `.\scripts\test-lib-full.ps1` へ進む。
-共有履歴型/入力ownerを変えるため最終は `.\scripts\test-full.ps1` の非対話gateも通す。
+共有履歴型/入力ownerの変更である。2026-10-30再開指示の今回の検証範囲は `.\scripts\test-lib-full.ps1` までとし、
+workspace/vendor/docの `.\scripts\test-full.ps1` は今回の開発実行へ追加しない。公開時のgateはリリース担当が扱う。
 `cargo fmt` / `cargo fmt --check` / `git diff --check` を行い、UI文言を変えた場合はglyph検査も行う。
 テストをignoreしたり、不変条件を弱めたりして緑にしない。製品修正後の確認用buildは既存方針に従うが、起動はしない。
 
@@ -1037,3 +1067,92 @@ portable相当を含むloopの最初の条件で止まるため、この失敗�
 
 Cargoはすべて`MSBUILDDISABLENODEREUSE=1`。製品起動・desktop操作・通常設定/実データの変更・
 確認用build・コミットは行っていない。以後の製品変更とgateは補足設計を受領するまで停止する。
+
+## Snapshotの限定解除方針による再開（2026-10-30、WIP `7916a1e97`の続き）
+
+設計担当は固定owner全体の作り直しを今回の範囲から外し、§1.486へ分離した。
+完全な固定一覧再採用の既存経路がないことをソース照合し、設計§3.1.1へ既存解除の案2を追記して再開した。
+限定設計と今回の小さい製品差分について独立レビュー（GPT-6.1 Sol / xhigh）はACCEPT。
+成功tailで解除する案がphysical admissionで拒否されることも確認し、受付で解除してから通常navigationを使う。
+
+今回の製品変更は`reading_history_origin.rs`と`grid_parent.rs`のみ。
+前者は可視Snapshotからの新visit生成と退出受付での既存解除、後者はH rootをSnapshot部分復帰から外す処理である。
+通常のSnapshot内の親、親ボタンdisabled、他の親ownerの優先順、scope guard、履歴vectorの規則は維持する。
+`section1473_snapshot_keeps_input_specific_admission_and_parent_owner`を固定解除の契約へ更新し、
+同pathのH1/H2・Menu再押下、Back/Direct退出の取消・再発行、完全なnative canonical originの復元を3試験追加した。
+Snapshotのsubset位置保護試験も維持し、通常/portable相当の一時data_dirで確かめる。
+この時点では実行結果待ちであり、WIPの44成功/1失敗を今回の成功証拠へ読み替えない。
+
+### 再開後の広域検証と同型経路の補完
+
+Snapshot関連5件は `target/section1473-snapshot-tests-3.log` で全成功（試験9.33s）。
+最初の全library gateは14,960実行・14,953成功・7失敗・65既存skip（581.400s、
+`target/section1473-lib-full-1.log`、詳細は`target/test-lib-full/runs/20261030T031924831Z-32b78e94/`）。
+失敗を抑止せず、以下のように型移行の実装/fixture不足を修正した。
+
+- `activate_quick_folder_slot`の同じ場所の再選択が`Path`だけを認識し、採用済みBookmarkの
+  `Physical`をreloadしていた。既存`folder_nav_targets_eq`で同値判定を統一し、Rating/Collection等の既存除外を維持。
+  ReadingHistoryのPhysical帰路でもCurrent・履歴・items世代が不変な試験を追加した。
+- ReadingHistoryのReturn再表示まで常に明示requestとして退役し、Remote解除で保留startup targetを消していた。
+  preparedが所有するMenu/Returnを使いMenuだけを明示操作とし、Return/reloadの旧契約を戻した。
+  検索中のMenuでも保留targetを取消す実受付の試験を追加した。
+- Collectionの3実体試験と通常Backのfixtureが下位primitiveへ`None`を直渡ししていたため、
+  実際のBack/Forward dispatcherを通す形へ移行し、帰路全文assertを保持・追加した。
+- sort試験の旧不整合surfaceは、物理ZIPのページ順優先と正規Hの固定順を分けて検査する形へ修正。
+  Rating close試験は実在する退出先を用意し、採用前の帰路保持と実poll後の場所/stack消去を検査する形へ移行した。
+
+修正後の絞り込み59件は58成功・1失敗（68.216s、`target/section1473-targeted-4.log`）。
+上記7件は全て解消し、同型監査で追加した
+`section1473_collection_native_outer_retains_complete_temporary_origin`だけが赤となった。
+実経路 `O → Collection C → 検索結果の画像fullscreen → Ctrl+↓でCの次source` で、
+非resident root再構築が`begin(Collection,None)`を使い、destinationも`return_to=None`のため、Cの帰路Oを失っていた。
+独立レビューもP2として確認した。
+
+このproducerは既存requestの`navigation.source_location`に完全なCollection/CollectionPhysical帰路を既に持つ。
+そこから帰路だけを取り、最新preparedのrevision/entry anchorと組み合わせてnative再構築とdestinationへ明示配送する。
+RAR/PDF失敗等のPhysicalHistory転送では、移譲後requestからdestinationを作り、その同じ帰路をinstallへ渡す。
+新field/現在App slotによる補完は追加しない。residentな同Collectionの有効requestは同じ帰路を保持し、
+`navigation=None`のdetached経路の従来契約も維持する。限定修正は独立レビューACCEPT。
+回帰は通常Folder・実RAR転送・CollectionPhysical起点の一時ビュー往復を実callerで通し、完全帰路とactual metadataを比較する。
+
+これらは承認済みの「完全payloadを既存native ownerへ渡す」境界と、入口のMenu/Returnの意味に揃える補完である。
+Snapshot所有全体の新設計や、出荷済みの操作制限を追加する変更は行っていない。
+
+### 実装・自動検証の完了（2026-10-30）
+
+**実装済み・実機未確認。** Snapshotは設計担当が許可した案2で完了し、固定一覧の完全再採用は§1.486へ分離した。
+独立レビュー（GPT-6.1 Sol / xhigh）の最終判定は**ACCEPT、未解決P1/P2なし**。
+構造的な所有境界の修正であり、症状guardではないことにも合意している。
+
+WIP `7916a1e97`からの製品差分は、`reading_history_origin.rs`（限定解除と同path visit）、
+`grid_parent.rs`（root退出の共通受付）、`app.rs`（同値判定/明示intent/native配送）、
+`collection_navigation.rs`（完全帰路のnative配送）。テストは`history_parent_1473.rs`、`startup_ops.rs`、
+`collection_grid.rs`、`tests.rs`を更新した。文書は本書、reading-history/top-level-grid/keymap/Snapshot設計、
+backlog、detached§11、マニュアルbooks/tut-readingの2ページを更新した。
+
+NativeOuter補完後の絞り込み61件は60成功・実RAR1失敗（66.660s、`target/section1473-targeted-5.log`）。
+このRARの15秒timeoutは新test helperのpoll不足で、既存RAR試験と同じheadlessの変換メッセージ回収/ZIP列挙を追加した。
+Confirm/Errorは失敗のままとし、conversion/ZIP ownerの終了も待つ。再試験は1成功・0失敗・0.44s
+（`target/section1473-rar-targeted-6.log`）。製品側の回復処理・待ち時間延長・テストignoreは追加していない。
+
+その後の最終全library gateは**14,965実行、14,965成功、失敗0、既存skip65**（574.348s）。
+JUnitから抽出した§1.473の**53件は全成功**。元のroot60条件/Tag4条件の赤2件に加え、
+§9.1〜15の各fixture、Snapshot限定解除、同path H1/H2、quick再選択/明示Menu、Collection native/RAR/物理子も含む。
+同じソースに対する再試行はなく、初回全libraryの7失敗と追加再現の赤は修正後に上記gateで解消した。
+
+| 最終コマンド（Cargoは全て`MSBUILDDISABLENODEREUSE=1`） | 結果・証拠 |
+| --- | --- |
+| `cargo fmt`（引数なし）/ `cargo fmt --check` | exit 0。最終test fixtureを含め全体整形、checkも成功 |
+| `cargo check -p mimageviewer --bin mimageviewer-core -j 1` | exit 0、`target/section1473-core-check-final-2.log` |
+| `cargo check -p mimageviewer --lib --tests --features test-script -j 1` | exit 0、`target/section1473-test-check-final-2.log` |
+| `scripts/test-focused.ps1` | 共通/文書変更としてexit 2、`target/section1473-focused-final.log`。指示どおり全libraryへ進んだ |
+| `scripts/test-lib-full.ps1` | **exit 0、14,965成功/65既存skip**、`target/section1473-lib-full-2.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険なUI glyphなし |
+| `cargo run --locked -p viewer_context_audit` | **exit 0・違反0**、`target/section1473-context-audit-final-2.log`。registryの公開API追加はなく、登録表の変更は不要 |
+| `git diff --check` | 成功。gate後の結果記録は文書のみで、Rust/Cargo/vendor/runtime入力は変更していない |
+
+最終nextest生ログとJUnitは `target/test-lib-full/runs/20261030T040411463Z-f7464765/`、
+実行時成功台帳は `target/test-lib-full/971db8bf344eed9573c78a7fac9cf437b6c553e2ec73246019dafc0ef0c5dc6e.json`。
+今回のユーザー指定範囲はtest-lib-fullまでであり、workspace/vendor/doc gateは追加実行していない。
+関連仕様・キー仕様・Snapshot設計の例外・マニュアル2ページ・backlog§1.473/§1.486・detached§11を更新した。
+製品起動・desktop操作・利用者の設定/実データの変更・確認用build・コミットは行っていない。

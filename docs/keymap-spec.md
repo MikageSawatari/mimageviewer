@@ -1260,6 +1260,10 @@ snapshot 中のキー操作は以下のように再定義される:
 | <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd> / <kbd>Ctrl</kbd>+<kbd>T</kbd> | snapshot 自動解除 + 検索 mode 起動 (= scope mutual exclusion) |
 | `[★固定]` ボタン再クリック | snapshot 解除 (= 元のフォルダ表示に戻る) |
 
+§1.473の例外：固定中にファイルメニューから開いた閲覧履歴rootでは、BS/Alt+↑およびマウス・リングの
+親操作が固定を終了し、入口payloadのcanonical originへ戻す。親ボタンは固定中disabledの既存制約を維持する。
+同pathでも固定一覧と新しい閲覧履歴visitを区別する。固定一覧の完全な再採用は§1.486の別課題とする。
+
 snapshot 末尾到達時は `FsBoundaryHint::NoImageFolder` で boundary hint を表示。
 
 ## 設計メモ

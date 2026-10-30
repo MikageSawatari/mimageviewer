@@ -85,10 +85,20 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 方針: ユーザーが選んだ幅と、起動途中・制約下の描画幅を区別し、画面サイズの変化だけで保存する希望値が書き換わらないようにする。比率 / 実幅のどちらを設定として持つか、手動リサイズと上下限の扱いを設計時に確定する。遅延や強制リセットで症状だけを抑えない。
 - 検証: 起動と終了を繰り返す幅復元、通常 → 最大化、同一サイズの対照、手動リサイズ、DPI / 作業領域の変更、最小・最大幅を回帰する。関連: [起動時のちらつき調査](section327-startup-window-flicker-investigation.md)、`vendor/egui/src/containers/panel.rs::outer_size`。規模 / 優先度: Small〜Medium の暫定見積り / P2。
 
+### 1.486 Snapshot（★固定）の固定ownerとcanonical origin / routeの単一所有
+
+- 状態: **未着手・§1.473から分離（設計担当決定 2026-10-30）**。根拠は[§1.473調査記録の再停止](history-parent-1473-investigation.md#再停止snapshotの固定ownerに関する設計前提不足2026-10-30)。`docs/`全体の`### 1.48`を検索し、1.486が未使用であることを確認して採番した。
+- 問題: 固定rowsはSnapshotState、canonical origin/routeはTopLevelGridViewが別々に持つ。一時的な別surfaceの採用で帰路が失われ、既存の固定list復帰はrows/path/recipeまででsurface・行provenance・routeを一括で再採用しない。同じpathの固定listと別surfaceもpath比較では区別できない。
+- 方針: 固定ownerと完全な帰路の単一所有、一時surfaceを採用しても失わない配送、固定listの再採用をsurface・行provenance・routeまで含むowner操作として設計する。解除/dismiss、Back/Forward、fork/close、同pathと異なるcontextの生命周期を揃え、新bool/並列Option/逆算guardで補わない。
+- §1.473の限定対応: 閲覧履歴rootからの親は既存の固定解除を終えて捕捉済canonical originへ戻す。固定listの完全な再採用機構は今回作らない。
+- 受入候補: 普通Folder/ReadingHistory/★/Bookmarks/検索由来の固定から別surfaceへ入り、固定listへの復帰・解除・一時ビュー移譲を確認する。特に同pathの別visit、行flag/来歴/route、行・scroll、未採用/取消、bundle/fork/closeとsibling不変を含める。設計時に通常利用の挙動を確定する。
+
 ### 1.473 閲覧履歴から開いたフォルダで親へ移動すると内部キャッシュへ入る — 5ch >>643・>>656 (2026-10-29)
 
-- 状態: **実装途中・Snapshotの所有境界の補足設計待ち (2026-10-30、対象 v4.11.0 予定)**。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、「履歴フォルダ」からフォルダを開いた後、親へ移動すると `mImageViewer_portable\data\cache` へ移ると報告。開発側では「本→親で閲覧履歴へ正常復帰→さらに親で実data_dir、cache選択→Enterで実cache」を再現した。報告者が同じ追加操作をしたかと、実アプリでの確認は未確認。
-- 実装の停止 (2026-10-30): 承認設計 `cae94fb27` とmarker不在時Directの補足に沿い、typed root/完全な帰路・親受付の集約・Tagを実装した途中差分を保存。`section1473` は**45件中44成功・1失敗**で、調査時の赤2件、marker3条件の行/scroll/履歴、展開/★/入れ子H1/H2/物理子、context/lifecycleは成功。残るSnapshotは、親で固定一覧のpath/rowsへ戻るが閲覧履歴flagが残る。ソースではSnapshotのcanonical originが共有TopLevelGridViewにしかなく、H採用で破棄され、既存list復帰もsurface/来歴/routeを再採用しない。同pathのReadingHistory由来固定では親のpath判定も区別できない。独立レビューも設計前提不足として停止に同意した。**「実装済み・実機未確認」にはまだ変更しない**。原因・未完gate・必要な補足は[調査記録](history-parent-1473-investigation.md)末尾を参照。
+- 状態: **実装済み・実機未確認 (2026-10-30、対象 v4.11.0 予定)**。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、「履歴フォルダ」からフォルダを開いた後、親へ移動すると `mImageViewer_portable\data\cache` へ移ると報告。開発側では「本→親で閲覧履歴へ正常復帰→さらに親で実data_dir、cache選択→Enterで実cache」を再現した。報告者が同じ追加操作をしたかと、実アプリでの確認は未確認。
+- 実装・検証: typed root/完全な帰路、親受付の共通化、Tagの漏れを修正。最終全libraryは**14,965成功・失敗0・既存skip65**、うち§1.473は**53件全成功**（元の赤2件を含む）。core/feature付きlib-tests check、fmt、glyph、context audit（違反0）も成功し、独立実装レビューACCEPT。通常/portable相当の一時data_dirで検証し、製品起動・コミットは行っていない。生ログ・補完した同型経路は[調査記録](history-parent-1473-investigation.md)末尾を参照。
+- 再開判断 (2026-10-30): Snapshot全体の所有を作り直す課題は§1.486へ分離。完全な固定一覧再採用の既存経路がないため、既存dismissで固定を終えて入口payloadのcanonical originへ戻す案を採った。固定の部分復帰や新field/逆算は追加せず、同pathのH1/H2と解除後取消も自動検証済み。固定中の親ボタンdisabledは維持し、許可されるBS/Alt+↑/mouse/ringを同じ退出へ通す。
+- 実装停止時の記録 (2026-10-30、WIP `7916a1e97`保存前): 承認設計 `cae94fb27` とmarker不在時Directの補足に沿う途中差分で、45件中44成功・Snapshot1失敗を確認した。Snapshot canonical originが共有TopLevelGridViewにしかなく、H採用で破棄され、list復帰もsurface/来歴/routeを再採用しないため停止。設計担当の限定解除方針を受領して再開し、現在は上記検証を完了した。Snapshot本体の所有問題は§1.486に残す。
 - 回答済みの条件 ([>>656](https://egg.5ch.io/test/read.cgi/software/1782419551/656)): 入口は**閲覧履歴**。主にマウスのサイドボタンへ割り当てて使い、ファイルメニューから閲覧履歴を開いても同じ。フォルダバーの「履歴▼」から開く場合は起きない。入口は再質問しない。
 - 期待する動作: 現在の一覧の論理的な場所と戻り元に従って移動する。閲覧履歴へ戻す仕様と実フォルダの親へ移る仕様は区別するが、内部キャッシュを利用者向けの親フォルダとして開くのは意図しない。
 - コード確認: `src/app.rs::effective_folder` は `archive_source_override` を優先し、`reading_history_back_nav` / `resolve_grid_parent_nav` は履歴等の戻り先を先に判定する。変換済み書庫から履歴へ戻る単体テスト (`reading_history_back_nav_handles_converted_archive`) もある。このため、単純にキャッシュ ZIP の親を見ていると断定せず、履歴からの open 完了時に論理パス・実体パス・戻り元が正しく渡るか調べる。`reading_history_synthetic_path` は `data/__reading_history__` であり、報告の `data/cache` と同一視しない。
