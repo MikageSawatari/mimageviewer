@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub mod checkpoint;
+mod clock;
 pub(crate) mod device_loss;
 pub(crate) mod fatal;
 use crate::gpu_info::diagnostic_sampler::{AdapterProbe, DiagnosticSampler, MemorySample};
@@ -53,6 +54,8 @@ struct Shared {
     device_loss: device_loss::Registry,
     #[cfg(test)]
     ready: (std::sync::Mutex<bool>, std::sync::Condvar),
+    #[cfg(test)]
+    after_panic_sink: OnceLock<Arc<std::sync::Barrier>>,
 }
 impl Shared {
     fn new() -> Self {
@@ -68,6 +71,8 @@ impl Shared {
             device_loss: device_loss::Registry::new(),
             #[cfg(test)]
             ready: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+            #[cfg(test)]
+            after_panic_sink: OnceLock::new(),
         }
     }
     fn wake(&self) {
@@ -767,25 +772,6 @@ fn writer_sampling_with_setup(
     }
     let run_directory = directory.join(identity.name());
     std::fs::create_dir(&run_directory)?;
-    // Previous immutable report is secured above, before native rotation/open.
-    // Global process-lifetime sinks are prepared only for real GUI admission;
-    // ordinary unit fixtures retain local/isolated recorders.
-    if let Some(logs) = setup_logs {
-        if let Err(error) = fatal::prepare(&run_directory, identity, shared.checkpoint.origin()) {
-            log::warn!("panic evidence unavailable: {error}");
-        }
-        crate::native_exception_log::report_install_result(
-            crate::native_exception_log::install_in(logs, Some(identity.process_identity())),
-        );
-    }
-    let mut device_writer = match device_loss::Writer::open(&run_directory) {
-        Ok(writer) => Some(writer),
-        Err(error) => {
-            log::warn!("device evidence unavailable: {error}");
-            None
-        }
-    };
-    observe_devices(shared, identity, &mut device_writer);
     let path = run_directory.join("state.json");
     let initial_boundary = shared.checkpoint.boundaries();
     let initial_active = shared.checkpoint.active();
@@ -812,6 +798,31 @@ fn writer_sampling_with_setup(
         previous: previous.map(|r| r.current),
     };
     replace(&directory.join("current.json"), &reference)?;
+    // Device evidence obeys the same reachability boundary as the fatal sink.
+    let mut device_writer = match device_loss::Writer::open(&run_directory) {
+        Ok(writer) => Some(writer),
+        Err(error) => {
+            log::warn!("device evidence unavailable: {error}");
+            None
+        }
+    };
+    observe_devices(shared, identity, &mut device_writer);
+    // A published fatal sink must never write an unreachable run. Both its
+    // Running record and current reference are saved before publishing it.
+    // Previous native evidence was secured above, before this rotation/open.
+    if let Some(logs) = setup_logs {
+        if let Err(error) = fatal::prepare(&run_directory, identity, shared.checkpoint.origin()) {
+            log::warn!("panic evidence unavailable: {error}");
+        }
+        #[cfg(test)]
+        if let Some(gate) = shared.after_panic_sink.get() {
+            gate.wait();
+            gate.wait();
+        }
+        crate::native_exception_log::report_install_result(
+            crate::native_exception_log::install_in(logs, Some(identity.process_identity())),
+        );
+    }
     retain_two(directory, &reference)?;
     shared.initialized();
     let mut schedule = Schedule::default();
@@ -1081,7 +1092,7 @@ pub(crate) mod test_support {
         fatal::prepare(
             directory,
             panic_identity(std::process::id()),
-            Instant::now(),
+            clock::RunClock::new(),
         )
         .unwrap();
     }
@@ -2015,6 +2026,108 @@ mod tests {
         assert!(
             previous_report_with_native(directory.path(), &reference, Some(logs.path())).is_none()
         );
+    }
+
+    /// Runs only as a single libtest child. Freeze the production initializer
+    /// immediately after the sink publication, before ready/retention/native.
+    #[test]
+    fn diagnostic_startup_panic_child() {
+        let Some(directory) = std::env::var_os("MIV_GUI_STARTUP_PANIC_DIR") else {
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        let _data_lock = crate::data_dir::test_override_lock();
+        crate::data_dir::set_test_override(Some(directory.join("fixture-data")));
+        crate::install_panic_log_hook();
+        let identity = test_support::identity();
+        let shared = Arc::new(Shared::new());
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        assert!(shared.after_panic_sink.set(gate.clone()).is_ok());
+        let worker_shared = shared.clone();
+        let worker_directory = directory.clone();
+        std::thread::spawn(move || {
+            writer_sampling_with_setup(
+                &worker_directory,
+                identity,
+                &worker_shared,
+                |_| {
+                    let stamp = worker_shared.checkpoint.stamp();
+                    (MemorySample::default(), stamp, stamp)
+                },
+                Some(&worker_directory.join("fixture-data/logs")),
+            )
+            .unwrap();
+        });
+        gate.wait();
+        assert!(!shared.initialized.load(Ordering::Acquire));
+        assert_eq!(read_reference(&directory).unwrap().current, identity);
+        assert_eq!(
+            test_support::record(&directory).unwrap().state,
+            RunState::Running
+        );
+        // The initializer cannot advance past the second gate. Libtest catches
+        // this panic and exits the isolated process without joining that worker.
+        panic!("injected GUI panic while production diagnostic initialization is gated");
+    }
+
+    #[test]
+    fn diagnostic_startup_panic_is_reachable_next_run_before_initialization_finishes() {
+        use std::process::{Command, Stdio};
+        for has_previous in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let old = if has_previous {
+                let mut owner = GuiRunDiagnostics::new();
+                test_support::admit(&mut owner, directory.path());
+                let old = read_reference(directory.path()).unwrap().current;
+                test_support::wait_abandoned(owner);
+                Some(old)
+            } else {
+                None
+            };
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "previous_run_diagnostics::tests::diagnostic_startup_panic_child",
+                    "--nocapture",
+                ])
+                .env("MIV_GUI_STARTUP_PANIC_DIR", directory.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("gated startup panic child timed out");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert!(!status.success());
+            let reference =
+                read_reference(directory.path()).expect("new run must already be published");
+            assert_eq!(reference.previous, old);
+            assert_eq!(
+                reference.current.core_pid, pid,
+                "must reach the crashing run, not the old reference"
+            );
+            let private = directory.path().join(reference.current.name());
+            let observations = fatal::read_observations(&private, reference.current).unwrap();
+            assert_eq!(observations.len(), 1);
+            assert_eq!(observations[0].kind, fatal::PanicKind::Rust);
+            let mut next = GuiRunDiagnostics::new();
+            test_support::admit(&mut next, directory.path());
+            let report = next.report_handle().unwrap().take_report().unwrap();
+            assert!(report.body().contains("Rust panic"));
+            assert!(report.body().contains(&reference.current.name()));
+            finish(&mut next, GuiRunOutcome::ReturnedOk);
+        }
     }
 
     #[test]

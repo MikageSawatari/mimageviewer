@@ -1,11 +1,12 @@
 //! Bounded, normal-thread-only diagnostic publication. This is not a fatal
 //! reader: producers attempt one lock, and activity ownership is atomic.
+use super::clock::RunClock;
 use super::{RUNNING, Shared, now_ms};
 use crate::gpu_info::diagnostic_sampler::{AdapterProbe, GpuMemorySample, MemorySample};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const JOB_SLOTS: usize = 6;
 pub(super) const PERIOD: Duration = Duration::from_secs(1);
@@ -153,7 +154,7 @@ struct Mailbox {
     jobs: [Option<JobSlot>; JOB_SLOTS],
 }
 pub(super) struct Publication {
-    origin: Instant,
+    origin: RunClock,
     active: AtomicU64,
     jobs: AtomicU64,
     next_token: AtomicU64,
@@ -170,7 +171,7 @@ pub(super) struct Publication {
 impl Publication {
     pub(super) fn new() -> Self {
         Self {
-            origin: Instant::now(),
+            origin: RunClock::new(),
             active: AtomicU64::new(0),
             jobs: AtomicU64::new(0),
             next_token: AtomicU64::new(1),
@@ -189,15 +190,11 @@ impl Publication {
             run_elapsed_ms: self.elapsed_ms(),
         }
     }
-    pub(super) fn origin(&self) -> Instant {
+    pub(super) fn origin(&self) -> RunClock {
         self.origin
     }
     pub(super) fn elapsed_ms(&self) -> u64 {
-        self.origin
-            .elapsed()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX)
+        self.origin.elapsed_ms()
     }
     pub(super) fn active(&self) -> u64 {
         self.active.load(Ordering::Acquire)

@@ -2,6 +2,7 @@
 //! Preparation and reading belong to a normal worker. The hook only attempts a
 //! bounded fixed-buffer raw append to an already-open process-lifetime handle.
 use super::checkpoint::Stamp;
+use super::clock::{QpcOrigin, RunClock};
 use super::{RunIdentity, RunRole};
 use core::cell::UnsafeCell;
 use serde::{Deserialize, Serialize};
@@ -12,12 +13,10 @@ use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Instant;
 use windows_sys::Win32::Foundation::FILETIME;
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_APPEND_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, WriteFile,
 };
-use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_sys::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 
@@ -64,7 +63,7 @@ pub(super) struct PanicObservation {
 
 /// Called once on the diagnostics worker, with this run's private directory.
 /// Once published, neither shutdown nor another prepare closes/replaces it.
-pub(super) fn prepare(directory: &Path, identity: RunIdentity, origin: Instant) -> io::Result<()> {
+pub(super) fn prepare(directory: &Path, identity: RunIdentity, origin: RunClock) -> io::Result<()> {
     if RECORDER.get().is_some() {
         return Ok(());
     }
@@ -93,46 +92,32 @@ fn record_if_ready<S: Sink>(recorder: Option<&Recorder<S>>, kind: PanicKind) {
 }
 
 struct Clock {
-    frequency: u64,
-    ticks_at_prepare: u64,
-    elapsed_at_prepare_ms: u64,
+    origin: QpcOrigin,
 }
 impl Clock {
-    fn prepare(origin: Instant) -> io::Result<Self> {
-        let mut frequency = 0;
-        let mut ticks = 0;
-        if unsafe { QueryPerformanceFrequency(&mut frequency) } == 0
-            || frequency <= 0
-            || unsafe { QueryPerformanceCounter(&mut ticks) } == 0
-            || ticks < 0
-        {
-            return Err(io::Error::other("panic evidence clock unavailable"));
-        }
-        // Windows Instant and raw QPC use the same monotonic source. Warm all
-        // clock paths here; no std clock/TLS initialization belongs in a hook.
-        let elapsed_at_prepare_ms = origin.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        let mut utc = FILETIME {
-            dwLowDateTime: 0,
-            dwHighDateTime: 0,
-        };
-        unsafe { GetSystemTimePreciseAsFileTime(&mut utc) };
-        let _ = unsafe { GetCurrentThreadId() };
-        Ok(Self {
-            frequency: frequency as u64,
-            ticks_at_prepare: ticks as u64,
-            elapsed_at_prepare_ms,
+    fn prepare(origin: RunClock) -> io::Result<Self> {
+        Self::prepare_with(origin, || {
+            let mut utc = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
+            unsafe { GetSystemTimePreciseAsFileTime(&mut utc) };
+            let _ = unsafe { GetCurrentThreadId() };
         })
     }
 
+    fn prepare_with(origin: RunClock, warm: impl FnOnce()) -> io::Result<Self> {
+        let origin = origin
+            .qpc()
+            .ok_or_else(|| io::Error::other("panic evidence clock unavailable"))?;
+        // Copy the normal publisher's original QPC base. Preparation may take
+        // arbitrarily long, but never samples/rebases a second monotonic clock.
+        warm();
+        Ok(Self { origin })
+    }
+
     fn sample(&self) -> Option<(Stamp, u32)> {
-        let mut ticks = 0;
-        if unsafe { QueryPerformanceCounter(&mut ticks) } == 0 || ticks < 0 {
-            return None;
-        }
-        let elapsed_ticks = (ticks as u64).checked_sub(self.ticks_at_prepare)?;
-        let elapsed_ms = (u128::from(elapsed_ticks) * 1000 / u128::from(self.frequency))
-            .min(u128::from(u64::MAX)) as u64;
-        let run_elapsed_ms = self.elapsed_at_prepare_ms.checked_add(elapsed_ms)?;
+        let run_elapsed_ms = self.origin.elapsed_ms()?;
         let mut utc = FILETIME {
             dwLowDateTime: 0,
             dwHighDateTime: 0,
@@ -393,7 +378,7 @@ mod tests {
                 ..Default::default()
             },
             identity(),
-            Clock::prepare(Instant::now()).unwrap(),
+            Clock::prepare(RunClock::new()).unwrap(),
         )
     }
     fn record(recorder: &Recorder<FakeSink>, kind: PanicKind) {
@@ -405,6 +390,39 @@ mod tests {
             .format(identity, observation)
             .unwrap()
             .to_vec()
+    }
+
+    #[test]
+    fn panic_clock_preparation_delay_keeps_the_common_checkpoint_origin() {
+        use std::cell::Cell;
+        let common = RunClock::from_ticks(10_000, 1_000);
+        let checkpoint_ticks = 11_000;
+        let checkpoint_ms = common.qpc().unwrap().elapsed_at(checkpoint_ticks).unwrap();
+        assert_eq!(checkpoint_ms, 1_000);
+        for delay in [0, 90_000] {
+            let ticks = Cell::new(checkpoint_ticks);
+            // Inject a nine-second scheduling delay inside the real preparation
+            // helper. It must not be counted again as a clock-domain offset.
+            let clock = Clock::prepare_with(common, || ticks.set(ticks.get() + delay)).unwrap();
+            ticks.set(ticks.get() + 2_500);
+            let panic_ms = clock.origin.elapsed_at(ticks.get()).unwrap();
+            assert_eq!(
+                panic_ms,
+                common.qpc().unwrap().elapsed_at(ticks.get()).unwrap()
+            );
+            assert_eq!(panic_ms - checkpoint_ms, delay / 10 + 250);
+        }
+        assert!(common.qpc().unwrap().elapsed_at(999).is_none());
+    }
+
+    #[test]
+    fn panic_clock_does_not_translate_an_unavailable_qpc_from_instant() {
+        assert!(
+            Clock::prepare_with(RunClock::Unavailable(std::time::Instant::now()), || {
+                panic!("unavailable clock must skip preparation")
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -549,7 +567,7 @@ mod tests {
             .append(true)
             .open(directory.path().join(FILE_NAME))
             .unwrap();
-        let recorder = Recorder::new(file, identity(), Clock::prepare(Instant::now()).unwrap());
+        let recorder = Recorder::new(file, identity(), Clock::prepare(RunClock::new()).unwrap());
         recorder.record_with(PanicKind::Rust, || {
             let event = observation(PanicKind::Rust);
             Some((event.stamp, event.thread))

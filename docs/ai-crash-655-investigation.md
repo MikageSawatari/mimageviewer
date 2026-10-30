@@ -474,6 +474,8 @@ panic hook の最初で、借用した payload を既知の固定分類へ変換
 
 安全契約は **通常 worker で事前 open、固定 buffer、再入/競合時 skip、件数上限（例16件/run）、1件につき単発 WriteFile、一般 logger/flush/再試行なし**。run identity は初期化済み不変値だけを使い、UTC・同じ run 内単調時刻・thread ID・既知分類と数値だけを固定長で書く。alloc、Rust lock 待ち、TLS 初期化、COM/DXGI、backtrace、worker/barrier 待ちを追加しない。未準備 sink は skip。製品用 handle/buffer は process 終了まで存続し、停止時に hook と close/reopen を競合させない。
 
+段C再レビューP2/P3により、初期化は**今回のRunningを`state.json`へ保存→`current.json`を今回identityへ公開→panic sinkを公開**する。sinkが未準備の間は既定どおりskipし、公開済みsinkが成功して書いたrunは次回の参照から辿れるようにする。初期化完了通知や保持整理を待ってからpanicが起きる前提にはしない。checkpointとpanicの単調時刻は、診断owner生成時に一度採った同じQPCのticks/frequencyから直接差を取る。別々に採ったQPCと`Instant::elapsed`を準備時に対応付けず、準備中の遅延を時刻へ二重加算しない。QPC初期化ができない場合は通常側のclockだけをfallbackし、別基準へ変換してfatal sinkを有効にしない。
+
 ただし単発の同期 [WriteFile](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-writefile) に**実行時間の上限はない**。best effort は保存成功や即時復帰の保証ではない。panic/既存 VEH の短い直接記録に限る割り切りで、通常 UI と device-lost callback の保存には使わない。
 
 OOM の確かな分類は描画用 wgpu の typed `Error::OutOfMemory` を観測できる境界に置く。必要な uncaptured handler の接続は既定の fatal 契約を保つ最小変更とする。**小資料には固定分類だけを保存し、既存の詳細 panic.log には元エラー本文を保持する**。固定文だけの payload へ置換して Validation/Internal の本文を失わせない。元本文を保持した panic へ進め、hook 前段で小資料の分類だけを別に記録する（再レビュー P3 対応）。Validation/Internal/一般 panic も分類を区別する。任意 payload に「memory」があるだけで OOM と断定しない。panic を握りつぶして描画継続する変更はしない。worker panic・捕捉 panic は process 終了と同義でなく、ReturnedOk なら次回異常終了通知を作らない。
@@ -751,3 +753,26 @@ backendはruntime/推論経路の選択値を記録・表示する。ORT内部�
 **検証用buildは未完了。** `MSBUILDDISABLENODEREUSE=1`で`.\scripts\build-dev.ps1 -PreserveRuntime`を実行したが、`turbojpeg-sys 1.2.0`のCMake/MSBuild工程でexit 1となった。初期の`[vcrt-pe] passed: runtime=4 pe=0`、CMakeのconfigure/generate完了、続く`cmake --build ... --target install --config RelWithDebInfo --parallel 24`の失敗、`cmake-0.1.58` build script panicを確認した。出力上は本体Rust変更のコンパイルエラーではないが、依存build失敗の根本原因は未確定であり環境/並行負荷とは断定しない。残った資料は`target/dev-runtime/build/turbojpeg-sys-ad9ab6b47bbc75e3/out/build/`。`target/dev-runtime/mimageviewer-core.exe`は生成されていない。前提不一致として停止し、依存物・build設定の変更や再実行はしていない。
 
 指定された非対話検査は上表のとおり成功したが、段Cの本体全件・workspace/vendor全件・独立レビュー・通常検証用build・実機確認の完了を意味しない。製品起動・実GPU OOM/TDR・実native fault・commit・追加独立レビュー・段Dの実装は行っていない。
+
+### 15. 段C再レビューP2/P3の修正（2026-10-31、未コミット）
+
+対象は段Cコミット`811365fb3`に対する再レビュー。回復処理・段D・新しい待機/再試行は追加しない。
+
+- **P2・初期化中の到達性**: 専用writerが今回の初回checkpointを採り、Runningの`state.json`を保存し、`current.json`を今回identityへ更新してからpanic sinkを公開する。device観測の初回保存も同じ参照公開後へ移した。保存済みpanicが旧current参照から辿れなくなる区間を除き、未準備sinkは従来どおりskipする。前回native本文を確保してから今回rotation/openする順序、単一writer/lease、終端の吸収性、mainの既存deadlineは維持する。
+- **P2回帰**: `diagnostic_startup_panic_is_reachable_next_run_before_initialization_finishes`は、同じlibtestの限定子processで本番`writer_sampling_with_setup`を起動し、sink公開直後、ready/保持整理/native初期化より前のtest専用gateで止める。その状態で実panic hookを通し、初回起動/旧Running参照ありの2条件とも、今回のstate/current/panicが残り、次回の実owner読取りが今回identityとRust panicを本文に出すことを検査する。fixtureが初期化完了後にsinkを用意する従来の子process検査とは別に追加した。gateは`cfg(test)`だけで、製品経路にbarrier待機を入れない。
+- **P3・共通時計基点**: `clock.rs`の不変QPC ticks/frequencyをowner生成時に一度取得し、checkpoint/通常活動とfatal recorderで同じ値を共有する。panic sink準備時のQPCと`Instant::elapsed()`の対応付けを削除し、両者とも同じ基点から直接差を取る。QPC初期化が不可なら通常側だけInstantへfallbackし、その別時計からfatal時刻を変換しない。fatalの採時はraw QPC/UTC/threadのみで、alloc・TLS・Rust lock・一般logger・flush・再試行を追加しない。
+- **P3回帰**: `panic_clock_preparation_delay_keeps_the_common_checkpoint_origin`は本番のprepare helperへ0秒/9秒相当の遅延を注入する。checkpoint→panicの間隔が準備遅延を一度だけ含むこと、通常側とfatal側の基点・換算結果が同じことを検査する。QPC unavailableをInstantから変換して有効化しない回帰も追加した。
+
+検証コマンド・結果は以下へ追記する。`MSBUILDDISABLENODEREUSE=1`。全件と確認用buildは今回の明示指示により設計担当が所有し、実装担当は実行しない。製品起動・commit・追加の独立レビューは行わない。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt` / `cargo fmt --check` | 成功 |
+| `cargo check -p mimageviewer --lib --tests --features test-script`（最終source） | exit 0、37.04秒。`target/ai-crash-655-stage-c-review-check-final.log`。既存warningあり |
+| `cargo test -p mimageviewer --lib diagnostic_startup_panic -- --nocapture` | 2成功・0失敗、実行2.36秒。初回/旧参照ありの2条件を限定子processで検査。`target/ai-crash-655-stage-c-review-startup.log` |
+| `cargo test -p mimageviewer --lib previous_run_diagnostics -- --nocapture` | 50成功・0失敗、実行2.36秒。P2回帰、P3遅延注入/時計不可の回帰、既存の終了境界・活動・保存・fatal sink・device観測を含む。`target/ai-crash-655-stage-c-review-diagnostic.log` |
+| `cargo test -p mimageviewer --lib render_failure_diagnostics -- --nocapture` | 3成功・0失敗、実行1.88秒。typed分類と限定子processによる小資料の個人情報非流出/既存詳細ログの元本文保持。`target/ai-crash-655-stage-c-review-render.log` |
+| `scripts/test-focused.ps1` | exit 2、文書をbroad/unmappedとして選択実行0件。全件へ自動で進めず、上記の明示filterで関連テストを検査。`target/ai-crash-655-stage-c-review-focused.log` |
+| `git diff --check` | 成功 |
+
+UI本文/schemaの変更はないため、今回のUI snapshot再生成・glyph検査は行っていない。全件/確認用buildは設計担当へ引き継ぐ。新しい製品の待機・再試行・回復処理、段D、製品起動、commit、追加独立レビューはない。
