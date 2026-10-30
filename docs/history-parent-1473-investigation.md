@@ -312,8 +312,10 @@ rootの入口を保持する場合も既存のtyped origin／session ownerを使
 **本作業は文書だけ。製品コード・テストは変更せず、ClaudeCodeの設計確認と別担当の
 GPT-6.1 Sol / xhighによる独立レビューを経てから実装する。**
 初版 `0b5c71e07` の独立レビューはREVISE（P2×2、P1/P3なし）。構造的修正という方向には同意を得た。
-本改訂では、展開一覧の復元state欠落と★一覧自身の帰路欠落を、完全な入口payloadの捕捉・配送で扱う。
-以下のソース監査は実行結果ではなく、**改訂版の再レビュー・実装・動作検証は未実施**。
+改訂 `bbed366ab` の再確認では、その2件は指摘経路について設計上解消したが、★一覧の戻り先が別の閲覧履歴visitを
+指す場合にpath投影で失われるP2×1が残りREVISEとなった。構造的修正という方向には改めて同意を得た。
+本改訂では、合成一覧間の戻り先を既存の共通型で運び、Rating自身の帰路を入場からcloseまで置換する。
+以下のソース監査は実行結果ではなく、**今回の改訂版の再レビュー・実装・動作検証は未実施**。
 
 ### 1. 決定する動作と不変条件
 
@@ -343,6 +345,8 @@ GPT-6.1 Sol / xhighによる独立レビューを経てから実装する。**
 10. 入口は入場時点のimmutableな型付き復元payloadとして所有する。一覧を再表示する情報だけでなく、
     復元した一覧自身の親・closeに必要な帰路も含める。退出時のAppの別restore slot、
     途中で開いた本の保存元、偶然残った旧view stateを補充元にしない。
+11. 合成一覧の帰路が別の合成一覧である場合も、同じ共通の型でその先の帰路まで保持する。
+    同じReadingHistory surface/pathでもH1とH2は別visitであり、★一覧からH1へ戻る際に新rootを作らない。
 
 ### 2. 現在の違反箇所と、変える所有境界
 
@@ -359,6 +363,7 @@ GPT-6.1 Sol / xhighによる独立レビューを経てから実装する。**
 | `src/app.rs:25304`付近 `adopt_main_list_navigation_with_completion` / `:26400`付近 `dispatch_folder_history_entry` | 既存の採用境界を再利用する。root退出のための別load、stackの先行pop、後からのrollbackを追加しない |
 | `src/app.rs:1431` `FolderNavHistoryTarget::from_restore`、`:42489`付近の展開state消去、`app/subfolder_expansion.rs:2443`付近の復元 | 履歴地点への投影で展開のroot/roots/snapshot等を失い、後の復元がApp slotを読む。入口payloadを投影前に保持し、既存prepareへ明示的に渡す |
 | `src/app.rs:26421`付近のRating dispatch、`:37320`付近の物理採用、`:37448` `close_rating_view` | 星数だけの地点からAppの保存元を読んでも、本の採用後には帰路がない。入口時の保存元/展開restoreをRatingの既存transitionへ渡し、一覧と帰路を同時採用する |
+| `src/app.rs:34867` `enter_rating_view`、`:37475`付近のRating close、`:26699`付近の合成path復元 | 入場の `legacy_path()` とcloseの `load_folder(saved)` の組は、戻り先H1のvisit/退出先を捨てる。Rating自身の帰路を共通の型付きoriginへ置換し、互換pathからの新root生成に流さない |
 
 原因は選択の先頭補正やconversionではなく、rootの親・入口を所有していないことと、入力ごとの意味の分散である。
 
@@ -415,7 +420,44 @@ rootへ復帰する場合の入口情報を保持することと、その復帰�
 root入場自身は同じrootを再利用するため自己参照を作らない。履歴内の複製はimmutableな場所snapshotであり、
 実行中要求のownerを共有しない。
 
-#### 3.1 完全な入口payloadの型と同型監査（REVISE P2×2への改訂）
+#### 3.0 合成一覧の入れ子を増やさない共通の帰路（再確認P2への改訂）
+
+CLAUDE.md「設計の簡素化」に従い、一覧ごとの組合せを個別に増やす前に、次を比較した。
+
+| 簡素化案 | 採否と理由 |
+| --- | --- |
+| 合成一覧から別の合成一覧を開けなくする / 全部modalにする | 不採用。`H1 → ★一覧 → H2` は現行の通常操作であり、入場禁止・追加の解除操作は利用を不便にする。短い場所切替のための新しいmodalも必要ない。長い変換等は既存modalを維持する |
+| 別一覧に入るたび、帰路を最初の実Folderまで平坦化する / 元一覧を閉じて忘れる | 不採用。★一覧からH1、H2から★一覧へという出荷済みの1段の戻りを失う。再構築は既存prepareで行えても、論理的な帰路を捨ててよい理由にはならない |
+| ReadingHistory用path、Rating用path＋展開state、Bookmark用の補助帰路を個別に相互変換する | 不採用。送り手×受け手ごとの対応が必要になり、今回のH1欠落を別の組合せへ持ち越す |
+| **合成一覧間の復元先を、拡張した `TopLevelGridOrigin` / `TopLevelGridRestore` に統一する** | **採用**。Rating、ReadingHistory、Bookmarks、検索、Collection等が同じ場所復元payloadを運び、受け手の既存ownerが自分のvariantを復元する。各一覧の親規則は保ったまま、帰路表現とcapture/dispatchの種類を減らす |
+
+利用者がたどる入れ子自体は禁止せず、実装が扱う「一覧Aから一覧Bへの専用帰路」の組合せを共通型に畳む。
+`TopLevelGridOrigin { restore, route }` を共通payloadとし、`restore` は§3.1の完全な型とする。
+戻り先なしは各ownerの**単一の** `Option<Box<TopLevelGridOrigin>>` のNoneで表せる。
+これは既存の帰路fieldを置換する値であり、pathを残して追加する補助Optionではない。
+ReadingHistoryの「入口なしはDriveList」、Ratingの「戻り先なしのclose」、Bookmarksの履歴Back等、
+行先/終了規則はそれぞれのownerが決める。共通型にしたことを理由に全rootへ同じ終了動作を適用しない。
+
+Rating rootは **`RatingRootRestore { stars, return_to: Option<Box<TopLevelGridOrigin>> }`** とする。
+物理子は **`RatingPhysicalRestore { visible_path, stars, nav_chain, return_to }`** とし、同じ帰路を運ぶ。
+前案の `saved_folder` / `subfolder_restore` の対は撤回する。Folderなら `Folder`、展開ならstate全体、
+H1なら `ReadingHistory(H1のroot restore)`、別の一覧ならその完全なvariantを一つのreturn_toに入れる。
+帰路のrouteも捕捉済みoriginに属し、close時の★一覧のrouteや現在の履歴から作り直さない。
+
+ReadingHistoryのexitも同じoriginを保持する。`ReadingHistoryBookReturn` は元コンテナとの対という制約を保ち、
+その一覧復帰先は共通originのReadingHistory variantとして運ぶ（root payloadとoriginの並列保存はしない）。
+Bookmarksのrootへの場所復元も同じ型を使う一方、項目openのstable row位置・seek・Opening/Detached等の
+nativeな状態は既存ownerが保持する。共通化のためにBookmark rootの親を保存originへ変えたり、
+worker/実行中viewerの状態を共通payloadへ入れたりしない。
+
+`O → H1 → ★一覧 → H2` のpayloadは、`H1.exit=O`、`Rating.return_to=H1`、
+`H2.exit=Rating(return_to=H1)` という有限のimmutableな値になる。
+H2は新規Menu入場なので新visitを持つ。H2から★一覧を復元するときは、内側のH1を再captureせずそのまま戻す。
+同じ表示pathを持つことによるvisit統合、現在のH2でH1を上書きする処理、退出時の履歴検索による補完は行わない。
+Box等で過去のsnapshotを所有し、liveな一覧相互の可変参照や循環を作らない。
+Rating rootで星数を切り替える既存操作は、現在のreturn_toを引き継ぎ、直前の★一覧自身を新しい帰路にしない。
+
+#### 3.1 完全な入口payloadの型と同型監査
 
 `TopLevelGridRestore` を入口の復元に必要な意味を持つ型へ拡張する。型名の目安と保持内容を以下に確定する。
 `TopLevelGridOrigin` の `route` はその一覧のfacet lineageであり、Appの現在routeを退出時に取り直さない。
@@ -426,8 +468,8 @@ root入場自身は同じrootを再利用するため自己参照を作らない
 | 入口 / 根拠となる所有者 | 入場時に所有するimmutable payload / 対象範囲 |
 | --- | --- |
 | サブフォルダ展開（P2-1） | 既存 `SubfolderExpansionRestoreState` 全体：`root`、`roots`、`saved_folder`、accepted `snapshot`、`removed_paths`。`TopLevelGridRestore::SubfolderExpansion(state)` をそのまま保持し、合成pathへの投影で捨てない。snapshotは既存のimmutableなデータ共有/所有移譲を使い、再scanを必須にしない |
-| ★一覧root（P2-2） | `RatingRootRestore { stars, saved_folder, subfolder_restore }` を `TopLevelGridRestore::Rating` のpayloadとする。後二者は捕捉時の `rating_view_saved_folder` / `rating_view_subfolder_restore` の値（Noneも含む）。既存の `RatingNavigationTransition` が受け取る帰路と同じ意味を保持し、復元後の `close_rating_view` が元Folder/DriveList/展開へ戻れるようにする |
-| ★一覧の物理子 | 既存 `RatingPhysicalRestore` の `visible_path`、stars、nav chain、saved folder、subfolder restoreをすべて保持する。子→★root→元場所までの帰路を維持し、pathだけの通常Folderにしない |
+| ★一覧root（前回P2-2 / 再確認P2） | §3.0の `RatingRootRestore { stars, return_to }` を `TopLevelGridRestore::Rating` のpayloadとする。Rating入場前に完全なoriginを捕捉し、H1のvisit/退出先を含める。Noneもそのまま保持する。前案のpath/展開restoreの対では代用しない |
+| ★一覧の物理子 | `visible_path`、stars、nav chainと、rootと同じtyped return_toを保持する。子→★root→H1→その入口、またはFolder/展開等への帰路全体を維持し、pathだけの通常Folderにしない |
 | Bookmarks root / 読込中 | DBから既存browser buildで再構築できるroot identityと、既存stable row keyによる一覧位置を保持する。位置は `BookmarkViewReturnGridState` のrow keys/selected key/scrollの復元規則を再利用する（項目openを伴わない入口で架空のopened keyを作らない）。rootの親はmain履歴を使うので別のsaved-folderは不要。`BookmarkViewState::Opening/Detached` のviewerやseek pendingをrootのworkerとして保存しない |
 | 検索 Ctrl+G/Everything・Ctrl+S・Tag | **検索結果自体は退出先の対象外**。既存のcanonical `TopLevelGridOrigin` を完全な型のまま移譲する。検索開始時のcaptureとcanonical/fallback生成も上記Rating/展開等のpayloadを保つよう揃える。既存fallback slotを読むのは元ownerが有効な捕捉時だけとし、退出時には読まない。query、dataset、drill workerを閲覧履歴へ保存/再起動しない。リング等の検索中場所ジャンプ拒否は維持し、許可されるファイルメニューからの入場を検査する |
 | Collection root / 物理子 | `CollectionGridRestore`（ID、revision hint、entry anchor）または `CollectionGridPhysicalRestore` 全体に、同Collectionの `TopLevelGridView::return_origin` を対にしたrestore payloadを使う。rootの親はno-opだが、後の一時ビュー移譲/同Collection再入場に使うoriginまで失わない。actorのwatch/receiver/installed mutable sessionは保持せず、既存のlatest revision prepareで再構築する |
@@ -464,10 +506,10 @@ Bookmarksの位置は既存のstable-key read-modelへ渡す値であり、worke
   root/roots/snapshotだけでなくsaved folder/removed pathsも既存の `SubfolderExpansionAdoption` の
   Return payloadに含め、成功installで元の展開stateを採用する。明示stateのある要求では
   `folder_nav_subfolder_restore` / 現在の展開stateへfallbackしない。新payloadを一度App slotへ書いてから読む経路も作らない。
-- ★rootは `start_rating_navigation_owned` に捕捉したstars/saved folder/subfolder restoreを渡し、
+- ★rootは `start_rating_navigation_owned` の既存path/展開restore引数をtyped return_toへ置換し、
   既存 `RatingNavigationTransition` → Rating build/prepare → adoptionを使う。
   今の `dispatch_folder_history_entry` にあるApp slotからの補充をこの退出に使わない。
-  saved folderがNoneならNoneを採用し、途中の本や無関係な★一覧の帰路を借りない。
+  return_toがNoneならNoneを採用し、途中の本や無関係な★一覧の帰路を借りない。Rating自身のcloseまでの配送範囲は§3.3。
 - Collectionは既存 `start_collection_history_transition_owned` の `return_to` に捕捉したoriginを渡す。
   物理子の既存session prepare/adoptionにも同じoriginを運ぶ。Smartは既存のstaged history/return要求で
   restore payloadを保持し、prepare後のinstallでstate・保存元・originを同時に採用する。
@@ -480,6 +522,34 @@ Bookmarksの位置は既存のstable-key read-modelへ渡す値であり、worke
 本のadoptionがAppのRating/展開等のfieldをclearしてもpayloadには影響しない。
 退出計画の仮currentが古い軽量entryを指しても、実際にdispatchする宛先はrootが保持した完全なoriginとする。
 通常Back/Forward全般の復元仕様の作り直しは本件に含めず、1件移動の規則を変えない。
+
+#### 3.3 Rating自身のtyped帰路を入場・物理子・closeまで運ぶ
+
+再確認P2の対応は、H2の退出payloadだけを増やす修正ではない。
+**Ratingが自身の帰路を最初に作る所有境界から置換する。** 変更範囲を次のとおりとする。
+
+| 境界 / 現在の箇所 | 型置換後の責務 |
+| --- | --- |
+| `enter_rating_view`（`app.rs:34867`）、Menu/ring/Pad等の共通入場 | 元ownerを退役させる前に、共通captureで完全な `TopLevelGridOrigin` を作る。`origin.legacy_path()` による帰路生成をやめる。検索からの入場は既存canonical originを移譲し、既に★rootなら既存return_toを継承する |
+| `start_rating_navigation` / `start_rating_navigation_owned`、`RatingNavigationTransition`（`:823,:37985,:38022`付近） | `saved_folder` と `subfolder_restore` の2引数/2fieldを、単一のtyped return_toへ置換する。prepare/reorder/membership更新も帰路を取り直さない。未採用要求は捕捉した値だけを所有し、失敗/取消で現在の帰路を変えない |
+| Ratingの可視採用（`:37738`付近）、`App`の現行Rating帰路2field | `rating_view_saved_folder` / `rating_view_subfolder_restore` を撤去し、`rating_view_return_to: Option<Box<TopLevelGridOrigin>>` の1本へ置換する。成功adoptionで一覧と同時に公開し、明示clearも全payload単位にする。汎用 `TopLevelGridView::return_origin` に同じ可変帰路を並設しない |
+| Rating installの展開state取り込み（`:38228,:38304`付近） | 元一覧の展開stateは入場captureでreturn_toのSubfolderExpansion variantへ移す。install時にsaved pathからAppの展開slotを再取得する処理を残さず、捕捉済みpayloadを保持する |
+| `RatingPhysicalLoadOwner`、`rating_view_physical_load_owner`、`rating_physical_destination`、通常/ZIP/PDF/変換書庫のphysical adoption | `RatingPhysicalLoadOwner.saved_folder` と、`RatingPhysicalRestore` のpath/展開restore対も同じreturn_toへ置換する。物理子へ入る際にrootの帰路を捕捉し、完了時にAppから展開restoreだけを追加取得しない。nav chainは既存の子→rootの階層を持ち、return_toはrootを閉じた先を持つ |
+| `rating_view_back`、`restore_rating_without_history`、replay/refresh helper、`current_top_level_restore_snapshot` | root/物理子の完全なpayloadを運ぶ。物理子からrootへ戻る際も元のreturn_toをそのままRating transitionへ渡す。sort/reloadでH1を現在地H2等に置換しない |
+| `FolderNavHistoryTarget::Rating` / `RatingPhysical`、from_restore、履歴dispatcher | Rating rootの履歴variantも星数だけではなく `RatingRootRestore` を保持し、物理子も上記のtyped restoreを保持する。履歴地点としてのroot同値判定は既存の星数による規則を維持し、帰路payloadの違いで別の履歴操作を増やさない。通常のBack/Forwardは既存どおり1件ずつ移動し、復元用データを履歴や現在のAppから探し直さない |
+| `close_rating_view`（`:37448–37488`）、親/既存closeの `RatingViewBack` consumer | 子の階層処理と未採用Rating要求の取消規則を維持する。rootを閉じる場合は保持したreturn_toを、§3.2の `MainListRestoreDestination::Origin` と既存navigationの履歴意図で配送する。`load_folder(saved)` の合成path復元や、引数なし `enter_reading_history()` へ流さない。宛先の成功adoptionで帰路を移譲し、単なる入力時点で元ownerを空にして補完待ちにしない |
+| `ViewerContextBundle`の構築/clone/move/swap/退役（`viewer_context_registry.rs`） | Rating帰路の2fieldも1本へ置換し、同contextのnative ownerと移す。既存の帰路継承/clearの条件を保ち、mainの履歴stackをfork先へ渡さない |
+
+H1への復帰は共通の既存synthetic prepare/adoptionへ **`ReadingHistory(H1)`** を配送し、Return目的で復元する。
+そのためH1のvisit、退出先O、routeは変化しない。Menu目的で新rootを作る互換path入口とは分ける。
+Folder/DriveList/展開等も同じtyped dispatcherからそれぞれの既存native prepareへ送る。
+closeに伴う履歴意図は各既存経路の意味を維持し、typed配送のために新たなBack skipや一括clearを足さない。
+return_to=Noneなら現行の「保存元なし」のclose結果を維持し、ReadingHistoryの入口なし規則をRatingへ転用しない。
+
+Rating root/物理子を検索・Snapshot等のcanonical originへ退避するproducerも、上記payloadをそのまま渡す。
+元のpath/展開fieldを残してtyped return_toを補助的に足す案や、close時に同pathのH1を履歴から検索する案は採らない。
+既存pathの互換routingが必要な他の呼出し元では、場所identityへの投影としてのみ使い、
+Ratingの入場・return・closeの型付き帰路をそこへ戻さない。
 
 ### 4. root退出、自己marker、forward履歴
 
@@ -577,7 +647,7 @@ mouse/ring全体へ広げない。逆にキーから削除もしない。input o
 | Tag root/子/ZIP内部 | 既存 `tag_view_back` へ一本化。root停止、子は1段、検索自体は閉じない |
 | Ctrl+G / Everything、Ctrl+S | 各検索ownerのroot停止/子戻り。Everythingの起点から結果への帰路と保持datasetはそのまま |
 | Bookmarks root/読込中/開いた本 | 履歴があれば戻り、なければno-op。専用本帰路を維持。今回のroot退出skipを流用して別仕様へ変えない |
-| ★一覧root/子/読込中 | `rating_view_parent_nav` とsaved origin/nav chainを維持。§3.1の捕捉値をRating採用時に戻し、さらに親で元場所へ閉じられることまで対象にする |
+| ★一覧root/子/読込中 | `rating_view_parent_nav` とnav chainを維持。§3.0/3.3の共通typed return_toをRating採用時に戻し、さらに親で元場所（別visitの閲覧履歴を含む）へ閉じられることまで対象にする |
 | DriveList、Collection root/子/Deleted、Smart root/scoped/container | 各ownerの停止・typed親・既存Deleted規則を維持。Collection/Smartは自身のorigin/保存元も§3.1のpayloadで戻す。root不成立を物理pathの親へ読み替えない |
 | サブフォルダ展開、Snapshot、本棚 | 展開はstate全体を復元し、その後の親も保存元へ。Snapshotは§3.1の受付差と同contextの固定ownerを維持し、退出先として再作成しない。本棚は実親を維持 |
 | main normal / quick slot A / B | root退出は発行元slotの履歴だけ。別slotへ切替後の旧要求は既存検証で退役し、他slotをpopしない |
@@ -601,8 +671,8 @@ mouse/ring全体へ広げない。逆にキーから削除もしない。input o
 
 ### 7. F12・複数ウィンドウとdetached憲法
 
-`reading_history_return_from` の型置換は `src/app/viewer_context_registry.rs` の
-`ViewerContextBundle` の同field、構築・swap・fork/moveにも機械的に波及する。
+`reading_history_return_from` の型置換とRating帰路2fieldの単一typed return_toへの置換は、
+`src/app/viewer_context_registry.rs` の `ViewerContextBundle` の同field、構築・swap・fork/moveにも機械的に波及する。
 このため「detachedと無関係」とは扱わない。ただし入力対象、HWND、viewport、placement、
 park/promote/retireの判定を変更する設計ではない。
 
@@ -617,7 +687,7 @@ park/promote/retireの判定を変更する設計ではない。
 
 `docs/detached-rework-plan.md` §2を読んだうえで、これは**帰路の意味を型付きownerへ集約する構造修正**と位置付ける。
 BA-7に該当するApp側フラグの追加、時間窓、rect/HWND推測、再生成は行わない。
-初版の独立レビューは構造修正という判断に同意した。完全な入口payloadを含む本改訂も再レビューを受け、
+初版と `bbed366ab` の独立レビューは構造修正という判断に同意した。共通typed帰路を含む今回の改訂も再レビューを受け、
 実装前にClaudeCodeとの合意を確認する。実装で触れたbundle/共通入口の範囲と
 理由を同計画§11へ記録する。今回の文書作業では同計画や製品コードは変更しない。
 
@@ -632,6 +702,7 @@ BA-7に該当するApp側フラグの追加、時間窓、rect/HWND推測、再�
 | 入力入口ごとにReadingHistory/Tag分岐をコピー | 不採用。今回のTag漏れを再生産する。親actionの意味を1か所へ減らす |
 | Appにroot originや戻り待ちのfieldを追加し、既存path帰路と並存 | 不採用。open/Return/replay/取消で不一致になる組合せを増やす。既存variantと帰路payloadの型置換で1つにする |
 | 入口を履歴entryだけにして、退出直前にRating/展開等のApp slotから補完 | 不採用（P2×2）。普通の本openがslotを消すため成立しない。path投影の前に完全なpayloadを捕捉し、同じnative ownerへ渡す |
+| 合成一覧の入れ子を禁止/平坦化する / 一覧の組ごとの専用帰路を増やす | 不採用（§3.0）。前者は出荷済みの戻りを失い、後者は組合せを増やす。共通のtyped originで表現を一本化し、Ratingの旧帰路対を置換する |
 | 通常Back/Forward全体で同値地点をskip、Return時にstackを全整理 | 不採用。親以外の1件移動や、別visit・facet routeの履歴まで変える。root退出だけの計画に限定する |
 | 本を閉じるたびにrootを新規Menuとして作り直す | 不採用。入口を本に上書きし、既存の行/scroll復元も失う。Returnは同じrootを再構築する |
 | 閲覧履歴中/退出中の操作を新しいmodalで止めて組合せを除く | 不採用。通常の親操作・履歴入力を制限する。長い変換等は既存modalが既に所有し、今回の退出は既存navigation transactionで処理できる |
@@ -681,11 +752,12 @@ BA-7に該当するApp側フラグの追加、時間窓、rect/HWND推測、再�
    復元したroot/roots/saved folder/accepted snapshotの所属行/removed pathsとrouteを検査し、さらに親で保存元へ戻る。
    複数roots・除外済み項目を含め、最後に使った別の展開のslotへ戻っていないことも確認する。
 9. **P2-2の必須受入**：`元Folder → ★一覧 → 閲覧履歴 → ZIP → 親で閲覧履歴 → 親で★一覧 → さらに親で元Folder`。
-   星数/routeだけで終えず、saved folder/subfolder restoreを含む帰路と最終到達先をassertする。
+   星数/routeだけで終えず、typed return_toに含む帰路と最終到達先をassertする。
    本往復なしの直接退出も検査する。元場所がDriveList/展開の場合、入口の★に保存元がない場合も検査し、
    Noneを別の本や別★一覧の帰路で埋めない。展開起点では★を閉じた後に展開へ戻り、そこからの親も確認する。
-10. **外部slot非依存の受入**：上記と、検索canonical originが★/展開の場合を、入場後にAppの旧restore slotを
-    空または別のfixtureの値にした条件でも実行する。通常ZIP採用によるclearを通す試験に加え、
+10. **外部slot非依存の受入**：上記と、検索canonical originが★/展開の場合を、入場後に現在のRating ownerの
+    typed帰路や汎用の展開restore slotを空または別のfixtureの値にした条件でも実行する。撤去する旧Rating fieldを試験用に残さない。
+    通常ZIP採用によるclearを通す試験に加え、
     明示的な値差替えはheadless fixture内だけで行う。退出中の未採用段階では旧可視stateとstackが不変、
     成功adoption後だけ捕捉payloadからnative fieldが戻ることをassertする。
     退出後にForwardで閲覧履歴へ戻って再び親退出しても同じpayloadが有効であることを検査する。
@@ -695,6 +767,20 @@ BA-7に該当するApp側フラグの追加、時間窓、rect/HWND推測、再�
     Snapshotは場所メニュー/リングの既存拒否と、ファイルメニューで受理される経路の固定owner保持を別々に検査する。
     後者の親はSnapshotのlist復帰が先であり、固定stateを消す/複製することで試験を通さない。
     native producerが未採用のときは元の可視ownerを入口として捕捉することも確認する。
+12. **再確認P2の必須受入**：通常/portable相当の両配置で、
+    `入口O → 閲覧履歴H1 → ★一覧 → 閲覧履歴H2 → 親で★一覧 → 親でH1 → 親でO` を実処理で通す。
+    同じ表示pathへ戻ったことだけでは成功にせず、H1/H2のvisitが異なり、H1の退出先/routeがOのまま、
+    Ratingのreturn_toがH1、H2の退出先がそのRating payloadであることを各段階でassertする。
+    各親入力の共有resolverと実ボタンpreviewを比較し、H1を入口なしの新rootへ作り直していないことも検査する。
+13. **H2の本往復を挟む必須受入**：上のH2からZIPを開き、親でH2へ戻ってから、★一覧→H1→Oの順を続ける。
+    物理採用が現在のRating帰路をclearしてもH2内のimmutable payloadがH1まで保持することを確認する。
+    ZIP内部階層では1段ずつ戻り、rootからだけH2へReturnする既存の試験も維持する。
+14. **Rating物理子と共通帰路の回帰**：`O → H1 → ★一覧 → Ratingの物理子 → H2` の後、
+    H2の親で同じ物理子へ、以後は既存nav chainで★rootへ、★rootの親でH1へ、H1の親でOへ戻す。
+    RatingPhysicalLoadOwnerとrestore/replayを経てもtyped return_toを失わないことを検査する。
+    ★rootでの星数切替・sort/reload・membership更新・準備取消でもH1の帰路を維持し、
+    戻り先なしの場合や、元場所が通常Folder/DriveList/展開/Bookmarksの場合の既存close結果を保つ。
+    代表的なnative owner間の往復と共通型の再帰payload試験を組み合わせ、一覧A×一覧Bごとの専用実装を前提にしない。
 
 実装時の順序は、pure plan → `section1473` → 関連handler/owner試験 → gate。
 build/testでは必ず `MSBUILDDISABLENODEREUSE=1`。
@@ -713,14 +799,18 @@ native HWND等の実機確認は別の了承済み検証枠に残し、headless�
 `collection_grid.rs`、`gamepad_input.rs`、`ui_main.rs`、`global_search_ui/everything.rs`、
 `viewer_context_registry.rs` に加え、`subfolder_expansion.rs`、`smart_folder.rs`、検索/Bookmarkのorigin producer。
 単純な2か所のif補充にはしない。
-初版の400〜800行/3〜5開発日は撤回する。§3.1でRating/Collection/Smart等の復元payload、
-§3.2で既存dispatcher/native ownerへの明示配送を定めたことから、製品差分は概算900〜1,500行、
-テスト追加/更新は概算600〜1,000行、実装・自動検証・指摘修正を合わせ**5〜8開発日**を改訂目安とする。
+初版の400〜800行/3〜5開発日は前改訂で撤回した。前改訂では§3.1の完全な復元payloadと
+§3.2の明示配送までを製品900〜1,500行/テスト600〜1,000行/5〜8開発日と見積もった。
+今回のRating帰路対の共通型への置換は、入場・transition・history variant・物理子・close・bundleまで含む。
+合成一覧間の専用相互変換は減らすが、型置換と回帰確認の下限には余裕が少ないため、
+製品差分は概算1,000〜1,700行、テスト追加/更新は概算700〜1,100行、
+実装・自動検証・指摘修正を合わせ**6〜8開発日**へ見直す。
 型置換に伴う既存match/fixture更新を含み、cold build待ち・実機確認・公開作業は除く。
 これはソース監査に基づく概算であり、改訂設計の採択後、実装差分で確認する。
 新規の全一覧session保存機構や通常履歴の全面再設計は含めない。
 
-実装は、(a) 完全な入口payloadとnative prepare/adoptionへの引渡し、(b) typed root/帰路と退出計画、
+実装は、(a) 共通のtyped originとRating帰路対の置換・完全な入口payloadのnative prepare/adoptionへの引渡し、
+(b) typed root/帰路と退出計画、
 (c) 親受付の集約とTag修正、(d) 同型監査・回帰・関連文書更新、
 の順で一つの機能として仕上げる。途中で旧帰路と新帰路を並存させた製品を出荷しない。
 実装完了時に `reading-history-plan.md`、`top-level-grid-view.md`、`keymap-spec.md`、
@@ -728,9 +818,10 @@ native HWND等の実機確認は別の了承済み検証枠に残し、headless�
 
 独立設計レビューでは、入口のtyped捕捉と検索透明性、visit境界/履歴truncation/forwardの表、
 通常Backとの分離、共有親の優先順とEverything再帰回避、入力ごとのpresentation契約、
-viewer/slotの所有分離に加え、**展開state全体の配送と、★へ戻った後の親までの帰路**を重点確認する。
+viewer/slotの所有分離に加え、**展開state全体の配送と、★→H1→Oまでの共通typed帰路**を重点確認する。
 通常利用の不便化が見つかったら実装へ進まず、ClaudeCodeから利用者へ相談する。
 
-本改訂でP2×2に対する設計上の対応を記載したが、実装済み/再レビュー承認済みとは扱わない。
+前回P2×2は `bbed366ab` の再確認で設計上解消と判定された。
+今回の改訂は残ったP2×1への対応であり、実装済み/今回の改訂の再レビュー承認済みとは扱わない。
 新しい利用制限・確認操作・待機を要する点は今回のソース監査では見つかっていない。
 製品コード変更・ビルド・テスト・製品起動・コミットは行わず、設計再レビューへ返す。
