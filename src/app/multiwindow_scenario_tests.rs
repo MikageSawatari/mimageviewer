@@ -2028,7 +2028,7 @@ fn collection_order_open(
         let main_items = app.items.clone();
         let main_generation = app.items_generation;
         let main_surface_generation = app.top_level_grid_view.generation();
-        let main_scroll = app.scroll_offset_y;
+        let main_scroll = app.grid_scroll.offset();
         let main_prepared = std::sync::Arc::clone(
             app.top_level_grid_view
                 .collection_session()
@@ -2050,7 +2050,7 @@ fn collection_order_open(
         assert_eq!(app.items, main_items, "opening must preserve the main list");
         assert_eq!(app.items_generation, main_generation);
         assert_eq!(app.selected, Some(index));
-        assert_eq!(app.scroll_offset_y, main_scroll);
+        assert_eq!(app.grid_scroll.offset(), main_scroll);
         assert_eq!(
             app.top_level_grid_view.generation(),
             main_surface_generation

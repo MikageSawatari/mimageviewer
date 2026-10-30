@@ -591,7 +591,9 @@ pub(crate) mod folder_scan;
 mod media_resume_meter_tests;
 pub(crate) use folder_scan::OmittedFolderEntryCounts;
 mod gamepad_input;
+mod grid_scroll;
 pub(crate) use gamepad_input::{RightDragGuide, draw_right_drag_guide};
+pub(crate) use grid_scroll::GridScrollState;
 mod grid_paint;
 mod media_metadata_mutation;
 pub(crate) mod metadata_import_refresh;
@@ -16270,8 +16272,8 @@ pub struct App {
     /// ワーカーの前後対称な距離ベース優先度計算に使う。
     pub(crate) visible_end_shared: Arc<AtomicUsize>,
 
-    /// スクロールオフセット（行境界にスナップ済み）。自前管理する
-    pub(crate) scroll_offset_y: f32,
+    /// Canonical row-snapped position and all grid scroll requests belong to this context.
+    pub(crate) grid_scroll: GridScrollState,
     /// 前フレームのセル幅（ = avail_w / cols）
     pub(crate) last_cell_size: f32,
     /// 前フレームのセル高さ（ = last_cell_size * effective_thumb_aspect().height_ratio()）
@@ -16280,11 +16282,6 @@ pub struct App {
     /// 直近フレームのグリッド列数。行高・ビューポート高と同じ「最後に描いた形」の一部で、
     /// 終了時にカーソルが上から何行目にいたかを出すのに要る (描画の外では列数が分からない)。
     pub(crate) last_grid_cols: usize,
-    /// 起動時のカーソル復元で、選択行を上から何行目に置くか。
-    ///
-    /// `select_after_load` と同じ寿命 — 次の `apply_scroll_to_selected` が取り出して使い切る。
-    /// 無いときは従来どおり「見える最小限だけ動かす」。
-    pub(crate) scroll_selected_to_rows_above: Option<u32>,
     /// 詳細表示で前フレームに描画した名前列の実効幅（ヘッダ右クリックで「固定幅へ」する際に使う）
     pub(crate) last_details_name_width: f32,
 
@@ -16298,12 +16295,6 @@ pub struct App {
         Option<crate::auto_aspect_cache::CollectionAutoAspectCache>,
     /// 前フレームのビューポート高さ（カーソルキースクロールに使用）
     pub(crate) last_viewport_h: f32,
-    /// true のとき選択セルが見えるようにオフセットを調整する
-    pub(crate) scroll_to_selected: bool,
-    /// 選択を変えず、現在レイアウトで確定した先頭 / 末尾 offset へ移す要求。
-    /// `render_grid` が同フレームの viewport と行高から max offset を求めて消費する。
-    pub(crate) pending_grid_scroll: Option<GridScrollIntent>,
-
     /// ウィンドウ状態保存用：最後に確認した outer_rect（最小化・最大化時は更新しない）
     ///
     /// **これは「元に戻すときの矩形」であって「いまどこに居るか」ではない。**
@@ -20760,19 +20751,16 @@ impl App {
             search_video_thread_cancel: None,
             scroll_hint: Arc::new(AtomicUsize::new(0)),
             visible_end_shared: Arc::new(AtomicUsize::new(0)),
-            scroll_offset_y: 0.0,
+            grid_scroll: GridScrollState::default(),
             last_cell_size: 200.0,
             last_cell_h: 200.0,
             grid_aspect_layout: GridAspectLayout::UnlaidOut,
             last_grid_cols: 4,
-            scroll_selected_to_rows_above: None,
             last_details_name_width: 140.0,
             auto_aspect: crate::auto_aspect::AutoAspectState::default(),
             auto_aspect_cache_db,
             collection_auto_aspect_cache,
             last_viewport_h: 600.0,
-            scroll_to_selected: false,
-            pending_grid_scroll: None,
             last_outer_rect: None,
             last_window_rect: None,
             last_inner_size: None,
@@ -23169,7 +23157,7 @@ impl App {
         &mut self,
         new_aspect: crate::settings::ThumbAspect,
     ) {
-        let before = self.scroll_offset_y;
+        let before = self.grid_scroll.offset();
         let context_id = self.projected_viewer_context_id();
         // Compatibility dimensions also predict thumbnail display size before first paint.
         // They do not prove that this list owns a laid-out scroll anchor.
@@ -23190,18 +23178,18 @@ impl App {
         {
             let new_cell_h = (*cell_width * new_aspect.height_ratio()).round().max(1.0);
             if (new_cell_h - *cell_height).abs() >= 0.5 {
-                let anchor_row = (self.scroll_offset_y / cell_height.max(1.0)).floor();
-                self.scroll_offset_y = anchor_row * new_cell_h;
+                let anchor_row = (self.grid_scroll.offset() / cell_height.max(1.0)).floor();
+                self.grid_scroll.set_position(anchor_row * new_cell_h);
                 // Consume the new height so a second fixup in this frame is a no-op.
                 *cell_height = new_cell_h;
             }
             self.last_cell_h = new_cell_h;
         }
-        if (before - self.scroll_offset_y).abs() > 0.5 {
+        if (before - self.grid_scroll.offset()).abs() > 0.5 {
             self.log_rating_grid_scroll(
                 "aspect-fixup",
                 before,
-                self.scroll_offset_y,
+                self.grid_scroll.offset(),
                 (
                     self.last_grid_cols,
                     self.last_cell_size,
@@ -25593,13 +25581,13 @@ impl App {
 
         // 「場所を忘れる」操作なので、現在表示中の一覧も同じ所有境界で先頭へ戻す。
         // current_grid_order は詳細表示の並べ替えも含む、画面上の実際の表示順。
-        self.scroll_offset_y = 0.0;
+        self.grid_scroll.set_position(0.0);
         self.move_grid_cursor(
             self.current_grid_order().first().copied(),
             GridCursorIntent::Explicit(GridCursorMove::Move),
         );
-        self.scroll_to_selected = false;
-        self.pending_grid_scroll = None;
+        self.grid_scroll.set_reveal_requested(false);
+        self.grid_scroll.clear_edge();
         self.update_last_selected_image();
         self.sync_quick_folder_settings();
 
@@ -28093,7 +28081,7 @@ impl App {
     /// Pin changes assets at the current ZIP level; explicit F5 still re-enumerates it.
     fn refresh_current_zip_level_preserving_position(&mut self) {
         let selected = self.selected;
-        let scroll = self.scroll_offset_y;
+        let scroll = self.grid_scroll.offset();
         let checked = self.checked.clone();
         let show_search_bar = self.show_search_bar;
         let query = self.search_query.clone();
@@ -28107,7 +28095,7 @@ impl App {
             selected.filter(|index| *index < self.items.len()),
             crate::app::GridCursorIntent::Automatic,
         );
-        self.scroll_offset_y = scroll;
+        self.grid_scroll.set_position(scroll);
         self.checked = checked;
         self.show_search_bar = show_search_bar;
         self.search_query = query;
@@ -28788,7 +28776,7 @@ impl App {
                 || is_synthetic_view_path(&cur);
             if !leaving_search_view && !self.items_are_drive_list {
                 self.folder_history
-                    .insert(cur, (self.scroll_offset_y, self.selected));
+                    .insert(cur, (self.grid_scroll.offset(), self.selected));
             }
         }
 
@@ -28836,9 +28824,9 @@ impl App {
         self.address.clear();
         self.settings.last_folder = Some(drive_list_last_folder_sentinel());
         self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
-        self.scroll_offset_y = 0.0;
-        self.scroll_to_selected = false;
-        self.pending_grid_scroll = None;
+        self.grid_scroll.set_position(0.0);
+        self.grid_scroll.set_reveal_requested(false);
+        self.grid_scroll.clear_edge();
         self.scroll_hint.store(0, Ordering::Relaxed);
         self.search_filter = None;
         self.search_filter_origin_folder = None;
@@ -28928,7 +28916,7 @@ impl App {
                 matches!(item, GridItem::Folder(path) if crate::folder_tree::path_eq(path, &origin))
             }), crate::app::GridCursorIntent::Automatic);
             if self.selected.is_some() {
-                self.scroll_to_selected = true;
+                self.grid_scroll.set_reveal_requested(true);
             }
         }
         if self.selected.is_none() {
@@ -34708,11 +34696,12 @@ impl App {
                 })
             });
         if restored.is_some() {
-            self.scroll_offset_y = position.unwrap().scroll_offset_y;
+            self.grid_scroll
+                .set_position(position.unwrap().scroll_offset_y);
         }
         let selected = restored.or_else(|| self.visible_indices.first().copied());
         self.move_grid_cursor(selected, GridCursorIntent::Automatic);
-        self.scroll_to_selected = selected.is_some();
+        self.grid_scroll.set_reveal_requested(selected.is_some());
         if !video_items.is_empty() {
             let pin_blobs = self
                 .video_pin_db
@@ -34853,7 +34842,7 @@ impl App {
             && let Some(&idx) = self.visible_indices.first()
         {
             self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-            self.scroll_to_selected = true;
+            self.grid_scroll.set_reveal_requested(true);
         }
         hydration
     }
@@ -37559,11 +37548,11 @@ impl App {
                 );
             if matches_path {
                 self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-                self.scroll_to_selected = true;
+                self.grid_scroll.set_reveal_requested(true);
                 self.log_rating_grid_scroll(
                     "opened-item-select",
-                    self.scroll_offset_y,
-                    self.scroll_offset_y,
+                    self.grid_scroll.offset(),
+                    self.grid_scroll.offset(),
                     (
                         self.last_grid_cols,
                         self.last_cell_size,
@@ -38360,9 +38349,9 @@ impl App {
         let position = self
             .top_level_grid_view
             .rating_grid_position(self.rating_view_stars);
-        let before_restore = self.scroll_offset_y;
+        let before_restore = self.grid_scroll.offset();
         if let Some(position) = position {
-            self.scroll_offset_y = position.scroll_offset_y;
+            self.grid_scroll.set_position(position.scroll_offset_y);
         }
         let selected = position
             .and_then(|position| position.selected_key.as_deref())
@@ -38387,12 +38376,12 @@ impl App {
         let saved_scroll_offset = position.map(|position| position.scroll_offset_y);
         if let Some(idx) = selected {
             self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-            self.scroll_to_selected = true;
+            self.grid_scroll.set_reveal_requested(true);
         }
         self.log_rating_grid_scroll(
             &format!("rating-position-restore saved={:?}", saved_scroll_offset),
             before_restore,
-            self.scroll_offset_y,
+            self.grid_scroll.offset(),
             (
                 self.last_grid_cols,
                 self.last_cell_size,
@@ -38670,8 +38659,8 @@ impl App {
         }
         self.details_image_dims_state = LazyColumnState::Disabled;
         self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
-        self.scroll_offset_y = 0.0;
-        self.pending_grid_scroll = None;
+        self.grid_scroll.set_position(0.0);
+        self.grid_scroll.clear_edge();
         // 変換キャッシュの override は「current_folder == そのキャッシュ ZIP」の間だけ
         // 有効なペア。**別の ZIP へ遷移するならここで同期的に破棄する** (キャッシュ経由で
         // 開く経路は open_archive_via_cache / 変換完了 pending_nav が load 後に再設定する)。
@@ -39624,9 +39613,9 @@ impl App {
         self.search_filter = None;
         self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
         self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
-        self.scroll_offset_y = 0.0;
-        self.scroll_to_selected = false;
-        self.pending_grid_scroll = None;
+        self.grid_scroll.set_position(0.0);
+        self.grid_scroll.set_reveal_requested(false);
+        self.grid_scroll.clear_edge();
         self.scroll_hint
             .store(0, std::sync::atomic::Ordering::Relaxed);
         // レーティングフィルタ有効時、rebuild_visible_indices が item ごとに get_rating で
@@ -39787,7 +39776,7 @@ impl App {
         });
         if let Some(idx) = target {
             self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-            self.scroll_to_selected = true;
+            self.grid_scroll.set_reveal_requested(true);
         }
         self.capture_main_list_restore_cursor();
         true
@@ -40820,7 +40809,7 @@ impl App {
             }
             self.open_fullscreen(new_idx, deferred.history_trigger);
             self.move_grid_cursor(Some(new_idx), crate::app::GridCursorIntent::Automatic);
-            self.scroll_to_selected = true;
+            self.grid_scroll.set_reveal_requested(true);
             self.update_last_selected_image();
             if deferred.resume_slideshow {
                 self.slideshow_playing = true;
@@ -42216,7 +42205,9 @@ impl App {
             || !(self.items_are_rating_view
                 || self.items_are_reading_history_view
                 || self.items_are_subfolder_expansion_view)
-            || (self.items.is_empty() && self.selected.is_none() && self.scroll_offset_y == 0.0)
+            || (self.items.is_empty()
+                && self.selected.is_none()
+                && self.grid_scroll.offset() == 0.0)
             || matches!(
                 self.projection_recipe,
                 book_materialization::ProjectionRecipe::ExtractedResult(
@@ -42241,7 +42232,7 @@ impl App {
                 eligible_total: self.auto_aspect_eligible_total(),
                 updated_at: 0, // Session-only; never persisted to SQLite.
             });
-        let scroll_offset_y = self.scroll_offset_y;
+        let scroll_offset_y = self.grid_scroll.offset();
         let position = |selected_key| SessionGridPosition {
             scroll_offset_y,
             selected_key,
@@ -42277,8 +42268,8 @@ impl App {
                         "rating-position-save stars={stars} saved={:.1}",
                         saved.scroll_offset_y
                     ),
-                    self.scroll_offset_y,
-                    self.scroll_offset_y,
+                    self.grid_scroll.offset(),
+                    self.grid_scroll.offset(),
                     (
                         self.last_grid_cols,
                         self.last_cell_size,
@@ -42315,11 +42306,12 @@ impl App {
                 || self.items_are_bookmark_view
                 || self.items_are_rating_view
                 || is_synthetic_view_path(&cur);
-            let has_grid_state_to_save =
-                !self.items.is_empty() || self.selected.is_some() || self.scroll_offset_y != 0.0;
+            let has_grid_state_to_save = !self.items.is_empty()
+                || self.selected.is_some()
+                || self.grid_scroll.offset() != 0.0;
             if !leaving_search_view && has_grid_state_to_save {
                 self.folder_history
-                    .insert(cur, (self.scroll_offset_y, self.selected));
+                    .insert(cur, (self.grid_scroll.offset(), self.selected));
             }
         }
     }
@@ -42750,9 +42742,9 @@ impl App {
             self.update_global_search_address();
         }
         self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
-        self.scroll_offset_y = 0.0;
-        self.scroll_to_selected = false;
-        self.pending_grid_scroll = None;
+        self.grid_scroll.set_position(0.0);
+        self.grid_scroll.set_reveal_requested(false);
+        self.grid_scroll.clear_edge();
         self.scroll_hint.store(0, Ordering::Relaxed);
 
         // `install_new_items_inner` は view flags と `self.items` を差し替えるため、今回の
@@ -43595,7 +43587,7 @@ impl App {
                         self.select_after_load = Some(cursor.name);
                         let restored = self.try_select_after_load();
                         if restored {
-                            self.scroll_selected_to_rows_above = cursor.rows_above;
+                            self.grid_scroll.set_row_anchor(cursor.rows_above);
                         }
                         restored
                     }))
@@ -43609,14 +43601,14 @@ impl App {
             // BS / direct-page close は select_after_load で選択対象を更新するが、
             // 視点は戻り先リストでユーザーが見ていたスクロール位置を先に復元する。
             // scroll_to_selected は残し、対象が範囲外になった場合だけ render_grid で補正する。
-            self.scroll_offset_y = scroll;
+            self.grid_scroll.set_position(scroll);
         }
         if !restored {
             if let Some((scroll, sel)) = history_state {
-                self.scroll_offset_y = scroll;
+                self.grid_scroll.set_position(scroll);
                 self.move_grid_cursor(sel, crate::app::GridCursorIntent::Automatic);
                 if sel.is_some() {
-                    self.scroll_to_selected = true;
+                    self.grid_scroll.set_reveal_requested(true);
                 }
                 // 前回保存時は可視だった sel が、現在のフィルタ状態では非可視かもしれない。
                 // `rebuild_visible_indices` 時点では selected が None だったので redirect が
@@ -43631,7 +43623,7 @@ impl App {
             let resume = self.resume_page_for_path(&source_path);
             if let Some(page) = resume {
                 self.move_grid_cursor(Some(page), crate::app::GridCursorIntent::Automatic);
-                self.scroll_to_selected = true;
+                self.grid_scroll.set_reveal_requested(true);
                 self.redirect_selected_to_visible();
             }
         }
@@ -43639,7 +43631,7 @@ impl App {
         // the previous grid. Scroll history has been restored by this point, so
         // restart the quiet window from the restored position.
         if !detached_physical {
-            self.last_scroll_offset_y_tracked = self.scroll_offset_y;
+            self.last_scroll_offset_y_tracked = self.grid_scroll.offset();
             self.last_scroll_change_time = std::time::Instant::now();
         }
         // 検索結果 / 閲覧履歴 / レーティング一覧用の合成パスは last_folder に記録しない (次回起動時に復元しないため)。
@@ -43711,7 +43703,7 @@ impl App {
                 }
                 self.open_fullscreen(new_idx, HistoryTrigger::UserChosen);
                 self.move_grid_cursor(Some(new_idx), crate::app::GridCursorIntent::Automatic);
-                self.scroll_to_selected = true;
+                self.grid_scroll.set_reveal_requested(true);
                 self.update_last_selected_image();
             } else {
                 #[cfg(windows)]
@@ -43770,7 +43762,7 @@ impl App {
             }
             MainListAfterHydration::StackSelection { select } => {
                 self.move_grid_cursor(Some(select), crate::app::GridCursorIntent::Automatic);
-                self.scroll_to_selected = true;
+                self.grid_scroll.set_reveal_requested(true);
             }
             MainListAfterHydration::DirectMedia(prepared) => {
                 if let Some(target) = self.install_direct_media_reader(prepared) {
@@ -52403,7 +52395,7 @@ impl App {
         let live_return_scroll = self
             .pending_return_to_parent
             .preserves_live_bookmark_grid()
-            .then_some(self.scroll_offset_y);
+            .then_some(self.grid_scroll.offset());
         let return_grid = self.take_bookmark_restore_grid();
         // Publication starts only after admission succeeds for the owning Bookmark surface.
         self.bookmark_browser_rows = rows;
@@ -52511,15 +52503,17 @@ impl App {
                 crate::app::GridCursorIntent::Automatic,
             );
             if let Some(scroll) = live_return_scroll {
-                self.scroll_offset_y = scroll;
-                self.pending_grid_scroll = None;
-                self.scroll_to_selected = previous_key.is_some_and(|key| {
-                    self.selected
-                        .and_then(|idx| self.bookmark_browser_rows.get(idx))
-                        .is_none_or(|row| row.stable_key() != key)
-                });
+                self.grid_scroll.set_position(scroll);
+                self.grid_scroll.clear_edge();
+                self.grid_scroll
+                    .set_reveal_requested(previous_key.is_some_and(|key| {
+                        self.selected
+                            .and_then(|idx| self.bookmark_browser_rows.get(idx))
+                            .is_none_or(|row| row.stable_key() != key)
+                    }));
             } else {
-                self.scroll_to_selected = self.selected.is_some();
+                self.grid_scroll
+                    .set_reveal_requested(self.selected.is_some());
             }
         }
         true
@@ -52546,11 +52540,12 @@ impl App {
                 .filter(|idx| self.visible_indices.contains(idx)),
             crate::app::GridCursorIntent::Automatic,
         );
-        self.scroll_offset_y = return_grid.scroll_offset_y;
-        self.pending_grid_scroll = None;
+        self.grid_scroll.set_position(return_grid.scroll_offset_y);
+        self.grid_scroll.clear_edge();
         // 同一一覧なら位置を一切動かさない。一覧が増減・並べ替えされた場合だけ、
         // 開いていた行が見切れていれば既存の ensure-visible 処理に任せる。
-        self.scroll_to_selected = rows_changed && self.selected.is_some();
+        self.grid_scroll
+            .set_reveal_requested(rows_changed && self.selected.is_some());
     }
 
     #[cfg(windows)]
@@ -52679,7 +52674,7 @@ impl App {
             &self.bookmark_browser_rows,
             self.selected,
             row.stable_key(),
-            self.scroll_offset_y,
+            self.grid_scroll.offset(),
         );
         self.bookmark_open_request_seq = self
             .bookmark_open_request_seq
@@ -55511,7 +55506,7 @@ impl App {
         let vis_count = self.visible_indices.len();
         // スクロール位置が vis_count を超えるとき (フィルタ直後の縮退ケース) は末尾に寄せる。
         // さらに vis_count=0 は冒頭で早期 return 済みなのでここでは 1 以上。
-        let vis_first_raw = (self.scroll_offset_y / cell_h) as usize * cols;
+        let vis_first_raw = (self.grid_scroll.offset() / cell_h) as usize * cols;
         let grid_vis_first = vis_first_raw.min(vis_count.saturating_sub(1));
         let vis_first = thumbnail_retention_anchor_position(
             &self.visible_indices,
@@ -55520,7 +55515,7 @@ impl App {
         );
         let fractional_drag_y = crate::ui_main::root_grid_touch_scroll_remainder(
             ctx,
-            self.scroll_offset_y,
+            self.grid_scroll.offset(),
             cell_h,
             self.items_generation,
         );
@@ -56947,9 +56942,9 @@ impl App {
         }
 
         // スクロール変化の検出
-        if (self.scroll_offset_y - self.last_scroll_offset_y_tracked).abs() > 0.5 {
+        if (self.grid_scroll.offset() - self.last_scroll_offset_y_tracked).abs() > 0.5 {
             self.last_scroll_change_time = std::time::Instant::now();
-            self.last_scroll_offset_y_tracked = self.scroll_offset_y;
+            self.last_scroll_offset_y_tracked = self.grid_scroll.offset();
         }
         let scroll_idle = self.last_scroll_change_time.elapsed().as_secs_f64() >= SCROLL_IDLE_SECS;
         if !scroll_idle {
@@ -57945,7 +57940,7 @@ impl App {
                 }
 
                 self.move_grid_cursor(Some(s), GridCursorIntent::Explicit(movement));
-                self.scroll_to_selected = true;
+                self.grid_scroll.set_reveal_requested(true);
                 self.update_last_selected_image();
                 // perf: グリッドのカーソル移動イベントを記録
                 self.bump_input_seq("grid_key", Some(&format!("sel={s}")));
@@ -59883,7 +59878,7 @@ impl App {
                 self.fs_open_intent_from_grid = true;
                 self.open_fullscreen(image_idx, crate::app::HistoryTrigger::UserChosen);
                 self.move_grid_cursor(Some(image_idx), crate::app::GridCursorIntent::Automatic);
-                self.scroll_to_selected = true;
+                self.grid_scroll.set_reveal_requested(true);
                 self.update_last_selected_image();
                 DetachedPhysicalFolderOpenPoll::Applied
             }
@@ -60223,7 +60218,7 @@ impl App {
 
             self.open_fullscreen(new_idx, history_trigger);
             self.move_grid_cursor(Some(new_idx), crate::app::GridCursorIntent::Automatic);
-            self.scroll_to_selected = true;
+            self.grid_scroll.set_reveal_requested(true);
             self.update_last_selected_image();
 
             // スライドショー NextFolder の着地: 静止画を開けたのでスライドショーを再開。
@@ -61079,17 +61074,18 @@ impl App {
                     }
                 } else {
                     // 上スクロール(delta>0) → オフセット減、下スクロール(delta<0) → オフセット増
-                    let prev_offset = self.scroll_offset_y;
-                    self.scroll_offset_y = crate::ui_main::grid_wheel_scroll_offset(
-                        self.scroll_offset_y,
-                        scroll_delta_y,
-                        cell_h,
-                    );
-                    if (self.scroll_offset_y - prev_offset).abs() > 0.5 {
+                    let prev_offset = self.grid_scroll.offset();
+                    self.grid_scroll
+                        .set_position(crate::ui_main::grid_wheel_scroll_offset(
+                            self.grid_scroll.offset(),
+                            scroll_delta_y,
+                            cell_h,
+                        ));
+                    if (self.grid_scroll.offset() - prev_offset).abs() > 0.5 {
                         self.log_rating_grid_scroll(
                             &format!("wheel delta={scroll_delta_y:.1}"),
                             prev_offset,
-                            self.scroll_offset_y,
+                            self.grid_scroll.offset(),
                             (
                                 self.last_grid_cols,
                                 self.last_cell_size,
@@ -61099,7 +61095,7 @@ impl App {
                         );
                         self.bump_input_seq(
                             "grid_wheel",
-                            Some(&format!("offset={:.0}", self.scroll_offset_y)),
+                            Some(&format!("offset={:.0}", self.grid_scroll.offset())),
                         );
                     }
                 }
@@ -61166,7 +61162,7 @@ impl App {
     }
     /// カーソルキー移動後、選択行がビューポートに収まるようオフセットを調整する
     pub(crate) fn apply_scroll_to_selected(&mut self, cols: usize, cell_h: f32) {
-        let before = self.scroll_offset_y;
+        let before = self.grid_scroll.offset();
         let sel = match self.selected {
             Some(s) => s,
             None => return,
@@ -61183,34 +61179,36 @@ impl App {
         // 起動時のカーソル復元だけは「見えるように最小限動かす」ではなく、**前回と同じ
         // 行位置に置く**。前回いた場所をそのまま開いたときに、選んでいた項目が画面の
         // 違う高さに現れると別の場所に見える (利用者報告 2026-08-30)。
-        if let Some(rows_above) = self.scroll_selected_to_rows_above.take() {
+        if let Some(rows_above) = self.grid_scroll.take_row_anchor() {
             let top_row = row.saturating_sub(rows_above as usize);
-            self.scroll_offset_y = top_row as f32 * cell_h;
+            self.grid_scroll.set_position(top_row as f32 * cell_h);
             self.log_rating_grid_scroll_at_position(
                 "startup-row-anchor",
                 before,
-                self.scroll_offset_y,
+                self.grid_scroll.offset(),
                 (cols, self.last_cell_size, cell_h, self.last_viewport_h),
                 Some(vis_pos),
             );
             return;
         }
-        let vp_top = self.scroll_offset_y;
-        let vp_bottom = self.scroll_offset_y + self.last_viewport_h;
+        let vp_top = self.grid_scroll.offset();
+        let vp_bottom = self.grid_scroll.offset() + self.last_viewport_h;
 
         if row_top < vp_top {
             // 選択行が上に隠れている → 選択行が最上行になるようスクロール
-            self.scroll_offset_y = row_top;
+            self.grid_scroll.set_position(row_top);
         } else if row_bottom > vp_bottom {
             // 選択行が下に隠れている → 選択行が最下行になるようスクロール
-            self.scroll_offset_y = (row_bottom - self.last_viewport_h).max(0.0);
+            self.grid_scroll
+                .set_position((row_bottom - self.last_viewport_h).max(0.0));
             // 行境界にスナップ
-            self.scroll_offset_y = (self.scroll_offset_y / cell_h).ceil() * cell_h;
+            self.grid_scroll
+                .set_position((self.grid_scroll.offset() / cell_h).ceil() * cell_h);
         }
         self.log_rating_grid_scroll_at_position(
             "ensure-visible",
             before,
-            self.scroll_offset_y,
+            self.grid_scroll.offset(),
             (cols, self.last_cell_size, cell_h, self.last_viewport_h),
             Some(vis_pos),
         );
@@ -62378,7 +62376,7 @@ impl App {
         if self.selected != Some(idx) {
             self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
         }
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
         self.update_last_selected_image();
         #[cfg(windows)]
         {
@@ -69371,7 +69369,7 @@ impl App {
             );
         }
         // The grid already owns this cursor; linked viewer sync is not a move.
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
         self.update_last_selected_image();
         self.last_viewer_sync_stamp = Some(stamp);
         ctx.request_repaint();
@@ -73787,7 +73785,7 @@ impl App {
                 self.viewer_navigation_caches.invalidate();
             }
         }
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
     }
 
     pub(crate) fn toggle_grid_details_view(&mut self) {
@@ -73982,7 +73980,7 @@ impl App {
             }
         }
         self.rebuild_details_order();
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
         self.settings.save();
     }
 
@@ -74283,7 +74281,7 @@ impl App {
     fn select_item_after_load(&mut self, idx: usize) {
         debug_assert!(idx < self.items.len());
         self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
         self.redirect_selected_to_visible();
     }
 
@@ -74436,7 +74434,7 @@ impl App {
         let next = vi.get(pos).copied();
         self.move_grid_cursor(prev.or(next), crate::app::GridCursorIntent::Automatic);
         if self.selected.is_some() {
-            self.scroll_to_selected = true;
+            self.grid_scroll.set_reveal_requested(true);
         }
     }
 
@@ -74450,7 +74448,7 @@ impl App {
         let first_selectable = self.visible_indices.first().copied();
         if let Some(idx) = first_selectable {
             self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-            self.scroll_to_selected = true;
+            self.grid_scroll.set_reveal_requested(true);
         }
     }
 
@@ -74656,8 +74654,8 @@ impl App {
                 self.search_filter_origin_folder = self.effective_folder();
                 self.rebuild_visible_indices();
                 self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
-                self.scroll_offset_y = 0.0;
-                self.pending_grid_scroll = None;
+                self.grid_scroll.set_position(0.0);
+                self.grid_scroll.clear_edge();
                 self.search_pending = None;
                 self.refresh_color_filter_for_scope_change(ctx);
             }
@@ -80648,7 +80646,7 @@ impl App {
             return;
         }
         self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
         self.update_last_selected_image();
         self.redirect_selected_to_visible();
     }
@@ -82784,7 +82782,7 @@ impl App {
             .position(|&idx| idx == selected)
             .unwrap_or(selected);
         let row = position / cols;
-        let top_row = (self.scroll_offset_y / cell_h).round().max(0.0) as usize;
+        let top_row = (self.grid_scroll.offset() / cell_h).round().max(0.0) as usize;
         row.saturating_sub(top_row).min(u32::MAX as usize) as u32
     }
 

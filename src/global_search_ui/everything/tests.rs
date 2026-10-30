@@ -789,7 +789,7 @@ fn physical_open_acceptance_keeps_logical_archive_identity_and_returns_exact_sel
     });
     assert!(Arc::ptr_eq(accepted_dataset(&app), &result));
     assert_eq!(app.items[app.selected.unwrap()], archive);
-    assert!(app.scroll_to_selected);
+    assert!(app.grid_scroll.reveal_requested());
     assert_eq!(app.global_search.last_executed, "book");
     assert_eq!(
         app.projection_recipe,
@@ -950,7 +950,7 @@ fn folder_activation_parent_chain_gamepad_return_research_and_close_keep_one_own
     });
     assert!(Arc::ptr_eq(accepted_dataset(&app), &result));
     assert_eq!(app.items[app.selected.unwrap()], row);
-    assert!(app.scroll_to_selected);
+    assert!(app.grid_scroll.reveal_requested());
     let next = dataset(vec![GridItem::Folder(app.tmp.path().join("replacement"))]);
     adopt(&mut app, &ctx, "replacement", Arc::clone(&next));
     assert!(Arc::ptr_eq(accepted_dataset(&app), &next));

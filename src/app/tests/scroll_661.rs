@@ -67,9 +67,9 @@ impl Driver {
             app.current_folder
                 .as_ref()
                 .and_then(|p| app.folder_history.get(p)),
-            app.pending_grid_scroll,
-            app.scroll_to_selected,
-            app.scroll_offset_y,
+            app.grid_scroll.pending_edge(),
+            app.grid_scroll.reveal_requested(),
+            app.grid_scroll.offset(),
             app.current_grid_order().len(),
             if app.settings.grid_view_mode == crate::settings::GridViewMode::Details {
                 app.current_grid_order().len() as f32 * 28.0
@@ -144,7 +144,7 @@ impl Driver {
     fn settled(&mut self, app: &mut App) {
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut quiet = 0;
-        let mut previous_scroll = app.scroll_offset_y;
+        let mut previous_scroll = app.grid_scroll.offset();
         loop {
             self.tick(app, None);
             if app.folder_pane_open_pending.is_none()
@@ -154,7 +154,7 @@ impl Driver {
                     app.details_image_dims_state,
                     LazyColumnState::Ready { .. } | LazyColumnState::Disabled
                 )
-                && (app.scroll_offset_y - previous_scroll).abs() < 0.1
+                && (app.grid_scroll.offset() - previous_scroll).abs() < 0.1
             {
                 quiet += 1;
                 if quiet == 4 {
@@ -163,7 +163,7 @@ impl Driver {
             } else {
                 quiet = 0;
             }
-            previous_scroll = app.scroll_offset_y;
+            previous_scroll = app.grid_scroll.offset();
             if Instant::now() >= deadline {
                 let writer_busy = app.metadata_transfer_writers_busy_for_sidecar_restore(false);
                 println!(
@@ -264,8 +264,8 @@ fn roundtrip_ordered(
     driver.open(&mut env, &source);
     let last = env.items.len() - 1;
     env.move_grid_cursor(Some(last), GridCursorIntent::Automatic);
-    env.scroll_to_selected = true;
-    env.pending_grid_scroll = Some(GridScrollIntent::Bottom);
+    env.grid_scroll.set_reveal_requested(true);
+    env.grid_scroll.request_edge(GridScrollIntent::Bottom);
     driver.settled(&mut env);
     if zip && details {
         assert_eq!(
@@ -275,7 +275,7 @@ fn roundtrip_ordered(
             "the real ZIP details worker must have read the image-containing archive"
         );
     }
-    let saved = env.scroll_offset_y;
+    let saved = env.grid_scroll.offset();
     let selected = env.selected;
     assert!(saved > 0.0);
     driver.checkpoint(&env, "before-leaving-source");
@@ -286,11 +286,13 @@ fn roundtrip_ordered(
     driver.open(&mut env, &source);
     println!(
         "SCROLL661 RESULT backup={backup} source_count={source_count} zip={zip} details={details} early={early} fresh_surface={fresh_surface}: saved={saved} actual={} selected_before={selected:?} selected_after={:?}",
-        env.scroll_offset_y, env.selected
+        env.grid_scroll.offset(),
+        env.selected
     );
     assert_eq!(env.selected, selected, "return must preserve the cursor");
     assert_eq!(
-        env.scroll_offset_y, saved,
+        env.grid_scroll.offset(),
+        saved,
         "return must preserve the bottom scroll position"
     );
 }
@@ -374,4 +376,148 @@ fn egui_explicit_offset_after_content_growth() {
 fn egui_explicit_offset_without_spring_control() {
     let (requested, actual) = egui_offset_after_growth(true);
     assert_eq!(actual, requested);
+}
+
+// Stage A's anchor contract is separate from the known old-bounds physics failure.
+// Use a middle row with ample room on both sides, and change earlier stable keys so
+// preserving an old index/absolute offset or merely revealing the row cannot pass.
+fn row_anchor_after_list_adoption(route: &str) {
+    #[cfg(windows)]
+    let _native_input = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    for details in [true, false] {
+        let mut env = setup_app();
+        env.initialized = true;
+        env.settings.update_check_enabled = false;
+        env.settings.minimize_to_tray_on_close = false;
+        env.indexer_init = IndexerInit::Unavailable;
+        env.last_main_focused = false;
+        env.settings.creative_luts.clear();
+        env.creative_lut_library = crate::creative_lut::CreativeLutLibrary::default();
+        env.settings.sidecar_backup_enabled = false;
+        env.settings.tag_sidecar_backup_enabled = false;
+        env.settings.grid_cols = 10;
+        env.settings.thumb_aspect_auto = false;
+        env.settings.grid_view_mode = if details {
+            crate::settings::GridViewMode::Details
+        } else {
+            crate::settings::GridViewMode::Thumbnail
+        };
+        let source = fixtures(env.tmp.path(), 200, false);
+        let mut driver = Driver::new();
+        driver.open(&mut env, &source);
+        let selected = env
+            .items
+            .iter()
+            .position(|item| item.name() == "0100.jpg")
+            .unwrap();
+        env.move_grid_cursor(Some(selected), GridCursorIntent::Automatic);
+        env.grid_scroll.set_row_anchor(Some(2));
+        env.grid_scroll.set_reveal_requested(true);
+        driver.settled(&mut env);
+        assert_eq!(env.selected_rows_below_view_top(selected), 2);
+        assert_eq!(env.grid_scroll.row_anchor(), None);
+        let initial_offset = env.grid_scroll.offset();
+        let image = std::fs::read(source.join("0000.jpg")).unwrap();
+        let inserted: Vec<_> = (0..20)
+            .map(|i| source.join(format!("-before-{i:02}.jpg")))
+            .collect();
+        for remove in [false, true] {
+            // Capture before mutation via the real cursor producer, not a test-only hint.
+            let resume = match env.current_list_refresh_intent() {
+                StartupListIntent::RefreshList { target, cursor, .. } => {
+                    assert_eq!(
+                        cursor.as_ref().and_then(|cursor| cursor.rows_above),
+                        Some(2)
+                    );
+                    StartupListIntent::ResumeList { target, cursor }
+                }
+                _ => unreachable!(),
+            };
+            for path in &inserted {
+                if remove {
+                    std::fs::remove_file(path).unwrap();
+                } else {
+                    std::fs::write(path, &image).unwrap();
+                }
+            }
+            let generation = env.items_generation;
+            match route {
+                "reload" => {
+                    env.reload_current_folder_preserving_override();
+                    super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut env);
+                }
+                "observation" => {
+                    env.start_external_rescan(
+                        &driver.ctx,
+                        source.clone(),
+                        std::time::SystemTime::now(),
+                    );
+                    assert!(env.external_rescan_pending.is_some());
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    while env.external_rescan_pending.is_some() {
+                        env.poll_external_rescan(&driver.ctx);
+                        assert!(
+                            Instant::now() < deadline,
+                            "real observation worker did not finish"
+                        );
+                        std::thread::yield_now();
+                    }
+                }
+                "resume" => {
+                    assert!(env.load_folder_with_scan_owned(
+                        source.clone(),
+                        None,
+                        OpenRequestOwner::Navigation,
+                        resume
+                    ));
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                env.items_generation != generation,
+                "must adopt changed rows"
+            );
+            // Exercise the production hydration and its selection-priority pass before layout.
+            assert!(
+                env.sidecar_restore_active(),
+                "must use the real hydration owner"
+            );
+            env.finish_page_identity_preparation_for_test();
+            assert!(!env.sidecar_restore_active());
+            let selected = env.selected.unwrap();
+            assert_eq!(env.items[selected].name(), "0100.jpg");
+            assert_eq!(env.grid_scroll.row_anchor(), Some(2));
+            assert_eq!(selected, if remove { 100 } else { 120 });
+            driver.settled(&mut env);
+            assert_eq!(env.items[env.selected.unwrap()].name(), "0100.jpg");
+            assert_eq!(
+                env.selected_rows_below_view_top(env.selected.unwrap()),
+                2,
+                "route={route} details={details} remove={remove}"
+            );
+            assert_eq!(env.grid_scroll.row_anchor(), None);
+            if remove {
+                assert_eq!(env.grid_scroll.offset(), initial_offset);
+            } else {
+                assert_ne!(env.grid_scroll.offset(), initial_offset);
+            }
+        }
+    }
+}
+
+#[test]
+fn row_anchor_reload_keeps_middle_selected_row_in_both_renderers() {
+    row_anchor_after_list_adoption("reload");
+}
+
+#[test]
+fn row_anchor_observation_keeps_middle_selected_row_in_both_renderers() {
+    row_anchor_after_list_adoption("observation");
+}
+
+#[test]
+fn row_anchor_resume_keeps_middle_selected_row_in_both_renderers() {
+    row_anchor_after_list_adoption("resume");
 }

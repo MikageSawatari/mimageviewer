@@ -822,7 +822,7 @@ fn assert_overview_select_permission_completion(hidden: bool) {
         env.reading_flow = flow;
         env.fullscreen_idx = Some(0);
         env.selected = Some(0);
-        env.scroll_to_selected = false;
+        env.grid_scroll.set_reveal_requested(false);
         let scope = crate::book_scope::BookScopeKey::document(&root).unwrap();
         let (service, process) =
             BookCompositionService::spawn_at(env.tmp.path().join("overview-permission-data"), None)
@@ -895,7 +895,7 @@ fn assert_overview_select_permission_completion(hidden: bool) {
         assert!(env.still_seek_thumbnail_pages.is_empty());
         assert_eq!(env.fullscreen_idx, Some(0));
         assert_eq!(env.selected, Some(0));
-        assert!(!env.scroll_to_selected);
+        assert!(!env.grid_scroll.reveal_requested());
         let state = std::mem::take(&mut env.book_composition_permission.open);
         let OpenPermission::Checking {
             intent,
@@ -943,7 +943,7 @@ fn assert_overview_select_permission_completion(hidden: bool) {
         if hidden {
             assert_eq!(env.fullscreen_idx, Some(0));
             assert_eq!(env.selected, Some(0));
-            assert!(!env.scroll_to_selected);
+            assert!(!env.grid_scroll.reveal_requested());
             assert_eq!(
                 env.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
                 Some("このページは本の構成で非表示になっています"),
@@ -951,7 +951,7 @@ fn assert_overview_select_permission_completion(hidden: bool) {
         } else {
             assert_eq!(env.fullscreen_idx, Some(1));
             assert_eq!(env.selected, Some(1));
-            assert!(env.scroll_to_selected);
+            assert!(env.grid_scroll.reveal_requested());
         }
         process.shutdown_and_join();
     }
@@ -1644,7 +1644,7 @@ fn slideshow_handler_preserves_selection_and_timer_while_hidden_target_is_qualif
         env.spread_mode = crate::settings::SpreadMode::Single;
         env.fullscreen_idx = Some(0);
         env.selected = Some(0);
-        env.scroll_to_selected = false;
+        env.grid_scroll.set_reveal_requested(false);
         env.slideshow_playing = true;
         env.slideshow_anchor_idx = Some(0);
         let old_timer = Instant::now()
@@ -1679,7 +1679,7 @@ fn slideshow_handler_preserves_selection_and_timer_while_hidden_target_is_qualif
             (
                 env.fullscreen_idx,
                 env.selected,
-                env.scroll_to_selected,
+                env.grid_scroll.reveal_requested(),
                 env.slideshow_anchor_idx,
                 env.slideshow_next_at
             ),
@@ -1737,7 +1737,7 @@ fn slideshow_handler_preserves_selection_and_timer_while_hidden_target_is_qualif
                 (
                     env.fullscreen_idx,
                     env.selected,
-                    env.scroll_to_selected,
+                    env.grid_scroll.reveal_requested(),
                     env.slideshow_anchor_idx,
                     env.slideshow_next_at
                 ),
@@ -1840,7 +1840,7 @@ fn same_page_slideshow_qualifies_requested_half_before_slice_and_timer_effects()
         env.fullscreen_idx = Some(0);
         env.fullscreen_page_slice = PageSlice::Left;
         env.selected = Some(0);
-        env.scroll_to_selected = false;
+        env.grid_scroll.set_reveal_requested(false);
         env.slideshow_playing = true;
         env.slideshow_anchor_idx = Some(0);
         let old_timer = Instant::now()
@@ -1890,7 +1890,7 @@ fn same_page_slideshow_qualifies_requested_half_before_slice_and_timer_effects()
             (
                 env.fullscreen_page_slice,
                 env.selected,
-                env.scroll_to_selected,
+                env.grid_scroll.reveal_requested(),
                 env.slideshow_anchor_idx,
                 env.slideshow_next_at
             ),
@@ -1985,7 +1985,7 @@ fn same_page_slideshow_qualifies_requested_half_before_slice_and_timer_effects()
             ));
             assert_eq!(env.spread_mode, crate::settings::SpreadMode::SplitLtr);
             assert_eq!(env.selected, Some(0));
-            assert!(env.scroll_to_selected);
+            assert!(env.grid_scroll.reveal_requested());
             assert!(env.slideshow_playing);
             assert!(env.slideshow_next_at > old_timer);
             assert!(!env.has_book_slideshow_continuation());

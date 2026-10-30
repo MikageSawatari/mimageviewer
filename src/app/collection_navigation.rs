@@ -7440,7 +7440,7 @@ mod tests {
         app.settings.thumb_aspect_auto = true;
         app.auto_aspect.current = Some(crate::settings::ThumbAspect::Landscape16x9);
         app.last_cell_h = 112.5;
-        app.scroll_offset_y = 480.0;
+        app.grid_scroll.set_position(480.0);
         app.selected = Some(0);
         app.checked.insert(1);
         app.requested.insert(0, true);
@@ -7478,7 +7478,7 @@ mod tests {
             Some(crate::settings::ThumbAspect::Landscape16x9)
         );
         assert_eq!(app.last_cell_h, 112.5);
-        assert_eq!(app.scroll_offset_y, 480.0);
+        assert_eq!(app.grid_scroll.offset(), 480.0);
         assert_eq!(app.selected, Some(0));
         assert_eq!(app.checked, std::collections::HashSet::from([1]));
         assert!(Arc::ptr_eq(&app.cancel_token, &cancel));
@@ -7538,7 +7538,7 @@ mod tests {
         app.settings.thumb_aspect_auto = true;
         app.auto_aspect.current = Some(crate::settings::ThumbAspect::Landscape16x9);
         app.last_cell_h = 109.0;
-        app.scroll_offset_y = 288.0;
+        app.grid_scroll.set_position(288.0);
         app.selected = Some(0);
         app.checked.insert(1);
         app.requested.insert(0, true);
@@ -7578,7 +7578,7 @@ mod tests {
                 Some(crate::settings::ThumbAspect::Landscape16x9)
             );
             assert_eq!(app.last_cell_h, 109.0);
-            assert_eq!(app.scroll_offset_y, 288.0);
+            assert_eq!(app.grid_scroll.offset(), 288.0);
             assert_eq!(
                 app.selected,
                 if app.fullscreen_idx == Some(1) {
@@ -7821,7 +7821,7 @@ mod tests {
         app.settings.thumb_aspect_auto = true;
         app.auto_aspect.current = Some(crate::settings::ThumbAspect::Landscape16x9);
         app.last_cell_h = 111.0;
-        app.scroll_offset_y = 360.0;
+        app.grid_scroll.set_position(360.0);
         app.selected = Some(0);
         app.checked.insert(1);
         app.requested.insert(0, true);
@@ -7865,7 +7865,7 @@ mod tests {
             Some(crate::settings::ThumbAspect::Landscape16x9)
         );
         assert_eq!(app.last_cell_h, 111.0);
-        assert_eq!(app.scroll_offset_y, 360.0);
+        assert_eq!(app.grid_scroll.offset(), 360.0);
         assert_eq!(app.selected, Some(0));
         assert_eq!(app.checked, std::collections::HashSet::from([1]));
         assert!(Arc::ptr_eq(&app.cancel_token, &main_cancel));
@@ -7892,7 +7892,7 @@ mod tests {
             app.auto_aspect.current,
             Some(crate::settings::ThumbAspect::Landscape16x9)
         );
-        assert_eq!(app.scroll_offset_y, 360.0);
+        assert_eq!(app.grid_scroll.offset(), 360.0);
         app.shutdown_collection_runtime_for_exit();
     }
 

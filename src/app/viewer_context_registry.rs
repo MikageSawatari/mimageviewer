@@ -1579,9 +1579,7 @@ pub(in crate::app) struct ViewerContextBundle {
     auto_aspect: crate::auto_aspect::AutoAspectState,
     selected: Option<usize>,
     grid_click_selection_anchor: Option<GridClickSelectionAnchor>,
-    scroll_offset_y: f32,
-    scroll_to_selected: bool,
-    pending_grid_scroll: Option<GridScrollIntent>,
+    grid_scroll: GridScrollState,
     requested: ThumbnailRequests,
     raw_thumb_develop: Arc<Mutex<ItemsGenerationMap<crate::thumb_loader::RawThumbPending>>>,
     idle_upgrade_cache_bypass_ineligible: std::collections::HashSet<usize>,
@@ -2879,9 +2877,7 @@ impl ViewerContextBundle {
             auto_aspect: crate::auto_aspect::AutoAspectState::default(),
             selected: None,
             grid_click_selection_anchor: None,
-            scroll_offset_y: 0.0,
-            scroll_to_selected: false,
-            pending_grid_scroll: None,
+            grid_scroll: GridScrollState::default(),
             requested: ThumbnailRequests::default(),
             raw_thumb_develop: Arc::new(Mutex::new(ItemsGenerationMap::new("raw_thumb_develop"))),
             idle_upgrade_cache_bypass_ineligible: std::collections::HashSet::new(),
@@ -3313,9 +3309,7 @@ impl App {
             auto_aspect,
             selected,
             grid_click_selection_anchor,
-            scroll_offset_y,
-            scroll_to_selected,
-            pending_grid_scroll,
+            grid_scroll,
             requested,
             raw_thumb_develop,
             idle_upgrade_cache_bypass_ineligible,
@@ -3638,9 +3632,7 @@ impl App {
         swap_field!(auto_aspect);
         swap_field!(selected);
         swap_field!(grid_click_selection_anchor);
-        swap_field!(scroll_offset_y);
-        swap_field!(scroll_to_selected);
-        swap_field!(pending_grid_scroll);
+        swap_field!(grid_scroll);
         swap_field!(requested);
         swap_field!(raw_thumb_develop);
         swap_field!(idle_upgrade_cache_bypass_ineligible);
@@ -4032,9 +4024,7 @@ impl App {
             auto_aspect,
             selected,
             grid_click_selection_anchor,
-            scroll_offset_y,
-            scroll_to_selected,
-            pending_grid_scroll,
+            grid_scroll,
             requested,
             raw_thumb_develop,
             metadata_import_refresh_index,
@@ -4321,9 +4311,6 @@ impl App {
             auto_aspect,
             selected,
             grid_click_selection_anchor,
-            scroll_offset_y,
-            scroll_to_selected,
-            pending_grid_scroll,
             keep_range,
             keep_set,
             still_seek_thumbnail_pages,
@@ -4361,6 +4348,8 @@ impl App {
             reading_history_return_from,
             bookmark_view_state,
         );
+
+        *grid_scroll = self.grid_scroll.fork();
 
         // 再生中 player / pending と fullscreen viewer の一時 UI だけを parked 所有へ移す。
         move_to_parked!(
@@ -4623,7 +4612,8 @@ impl App {
             self.visible_indices = std::mem::take(&mut snapshot.saved_visible_indices);
             self.page_identity_index = snapshot.saved_page_identity_index.clone();
             self.projection_recipe = snapshot.saved_projection_recipe.clone();
-            self.scroll_offset_y = snapshot.saved_scroll_offset_y;
+            self.grid_scroll
+                .set_position(snapshot.saved_scroll_offset_y);
             self.zip_nav = snapshot.saved_zip_nav.take();
             self.top_level_grid_view = top_level_grid_view::TopLevelGridView::default();
             // Appended target removal leaves every basis index stable. Retain its
@@ -6060,6 +6050,135 @@ mod tests {
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+
+    #[cfg(windows)]
+    fn seed_grid_scroll_owner_for_test(
+        app: &mut App,
+        offset: f32,
+        rows_above: u32,
+        reveal: bool,
+        edge: GridScrollIntent,
+    ) {
+        app.items = (0..20)
+            .map(|idx| GridItem::Image(PathBuf::from(format!("C:/scroll-owner/{idx:02}.png"))))
+            .collect();
+        app.thumbnails = vec![ThumbnailState::Failed; app.items.len()];
+        app.image_metas = vec![None; app.items.len()];
+        app.visible_indices = (0..app.items.len()).collect();
+        app.details_order = app.visible_indices.clone();
+        app.selected = Some(10);
+        app.grid_scroll.set_position(offset);
+        app.grid_scroll.set_row_anchor(Some(rows_above));
+        app.grid_scroll.set_reveal_requested(reveal);
+        app.grid_scroll.request_edge(edge);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn grid_scroll_registry_mount_deposit_consumes_only_owning_row_anchor() {
+        let mut app = crate::app::setup_app_for_test();
+        seed_grid_scroll_owner_for_test(&mut app, 84.0, 1, true, GridScrollIntent::Top);
+        let main = app.viewer_context_main();
+        let main_scroll = app.grid_scroll.clone();
+        let main_generation = app.items_generation;
+        let main_cancel = app.cancel_token.clone();
+        let first = app.build_window_context_for_test(96610, |owner| {
+            seed_grid_scroll_owner_for_test(owner, 140.0, 2, true, GridScrollIntent::Bottom);
+        });
+        let second = app.build_window_context_for_test(96611, |owner| {
+            seed_grid_scroll_owner_for_test(owner, 196.0, 4, false, GridScrollIntent::Top);
+        });
+        assert_eq!(app.grid_scroll, main_scroll);
+        let second_scroll = app
+            .with_viewer_context_state(second, |owner| owner.grid_scroll.clone())
+            .unwrap();
+        let consumed = app
+            .with_viewer_context_state(first, |owner| {
+                assert_eq!(owner.grid_scroll.row_anchor(), Some(2));
+                assert!(owner.grid_scroll.take_reveal());
+                owner.apply_scroll_to_selected(1, 28.0);
+                assert_eq!(owner.grid_scroll.offset(), 224.0);
+                assert_eq!(owner.grid_scroll.row_anchor(), None);
+                assert_eq!(
+                    owner.grid_scroll.take_layout_request().edge(),
+                    Some(GridScrollIntent::Bottom)
+                );
+                owner.grid_scroll.clone()
+            })
+            .unwrap();
+        assert_eq!(app.projected_viewer_context_id(), main);
+        assert_eq!(app.grid_scroll, main_scroll);
+        assert_eq!(app.items_generation, main_generation);
+        assert!(Arc::ptr_eq(&app.cancel_token, &main_cancel));
+        assert!(!main_cancel.load(Ordering::Relaxed));
+        // Actual remount/swap/deposit must retain both the consumed owner and the
+        // sibling's independent dormant anchor/reveal/edge, without replaying either.
+        app.with_viewer_context_state(second, |owner| {
+            assert_eq!(owner.grid_scroll, second_scroll);
+            assert!(!owner.grid_scroll.reveal_requested());
+            assert_eq!(
+                owner.grid_scroll.pending_edge(),
+                Some(GridScrollIntent::Top)
+            );
+            assert_eq!(owner.grid_scroll.row_anchor(), Some(4));
+        })
+        .unwrap();
+        app.with_viewer_context_state(first, |owner| {
+            assert_eq!(owner.grid_scroll, consumed);
+            assert_eq!(owner.grid_scroll.pending_edge(), None);
+        })
+        .unwrap();
+        assert_eq!(app.grid_scroll, main_scroll);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn grid_scroll_registry_real_forks_preserve_main_without_inheriting_row_anchor() {
+        for live in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            seed_grid_scroll_owner_for_test(&mut app, 140.0, 3, true, GridScrollIntent::Bottom);
+            let main = app.viewer_context_main();
+            let folder = app.tmp.path().join("scroll-owner-fork");
+            app.items = (0..20)
+                .map(|idx| GridItem::Image(folder.join(format!("{idx:02}.png"))))
+                .collect();
+            app.current_folder = Some(folder.clone());
+            app.fullscreen_idx = Some(10);
+            let main_scroll = app.grid_scroll.clone();
+            let child = if live {
+                app.bind_window(main, 96612).unwrap();
+                app.fork_mounted_live_media_context(96612)
+            } else {
+                app.fork_materialized_still_context(&folder, 10)
+            };
+            assert_ne!(child, main);
+            assert_eq!(app.grid_scroll, main_scroll);
+            let fork_scroll = main_scroll.fork();
+            app.with_viewer_context_state(child, |owner| {
+                assert_eq!(owner.grid_scroll, fork_scroll);
+                assert_eq!(owner.grid_scroll.row_anchor(), None);
+                assert!(owner.grid_scroll.reveal_requested());
+                assert_eq!(
+                    owner.grid_scroll.pending_edge(),
+                    Some(GridScrollIntent::Bottom)
+                );
+                // The child can acquire and consume its own later anchor independently.
+                owner.grid_scroll.set_row_anchor(Some(4));
+                assert!(owner.grid_scroll.take_reveal());
+                owner.apply_scroll_to_selected(1, 28.0);
+                assert_eq!(owner.grid_scroll.offset(), 168.0);
+                assert_eq!(owner.grid_scroll.row_anchor(), None);
+                assert_eq!(
+                    owner.grid_scroll.take_layout_request().edge(),
+                    Some(GridScrollIntent::Bottom)
+                );
+            })
+            .unwrap();
+            assert_eq!(app.projected_viewer_context_id(), main);
+            assert_eq!(app.grid_scroll, main_scroll);
+            assert_eq!(app.grid_scroll.row_anchor(), Some(3));
+        }
+    }
 
     #[cfg(windows)]
     fn list_order_snapshot_for_test(

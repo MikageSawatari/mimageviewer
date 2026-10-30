@@ -270,7 +270,7 @@ struct SmartFolderPreparedGridLayout {
     /// The offset and the auto-aspect state that determined its row height are one snapshot.
     /// `AutoAspectState::samples` is also index-keyed, so moving only the resolved aspect would
     /// leave the restored grid with another context's decision inputs.
-    scroll_offset_y: f32,
+    grid_scroll: super::GridScrollState,
     auto_aspect: crate::auto_aspect::AutoAspectState,
     /// This is comparison-only: changed user settings are never restored. A mismatch asks the
     /// ordinary folder-navigation scroll owner to keep `selected` visible in the new layout.
@@ -304,8 +304,6 @@ pub(crate) struct SmartFolderPreparedGrid {
     selected: Option<usize>,
     grid_click_selection_anchor_index: Option<usize>,
     layout: SmartFolderPreparedGridLayout,
-    scroll_to_selected: bool,
-    pending_grid_scroll: Option<super::GridScrollIntent>,
     checked: HashSet<usize>,
     visible_indices: Vec<usize>,
     details_order: Vec<usize>,
@@ -8351,13 +8349,11 @@ impl App {
             selected: self.selected.take(),
             grid_click_selection_anchor_index: anchor_index,
             layout: SmartFolderPreparedGridLayout {
-                scroll_offset_y: std::mem::take(&mut self.scroll_offset_y),
+                grid_scroll: std::mem::take(&mut self.grid_scroll),
                 auto_aspect: std::mem::take(&mut self.auto_aspect),
                 mode: SmartFolderPreparedGridMode::current(&self.settings),
                 window_inner_size: self.last_inner_size,
             },
-            scroll_to_selected: std::mem::take(&mut self.scroll_to_selected),
-            pending_grid_scroll: self.pending_grid_scroll.take(),
             checked: std::mem::take(&mut self.checked),
             visible_indices: std::mem::take(&mut self.visible_indices),
             details_order: std::mem::take(&mut self.details_order),
@@ -8498,8 +8494,6 @@ impl App {
             selected,
             grid_click_selection_anchor_index,
             layout,
-            scroll_to_selected,
-            pending_grid_scroll,
             checked,
             visible_indices,
             details_order,
@@ -8523,7 +8517,7 @@ impl App {
         } = grid;
         let layout_changed = !layout.matches_current_layout(self);
         let SmartFolderPreparedGridLayout {
-            scroll_offset_y,
+            grid_scroll,
             mut auto_aspect,
             ..
         } = layout;
@@ -8551,9 +8545,10 @@ impl App {
         self.selected = selected;
         self.grid_click_selection_anchor = grid_click_selection_anchor_index
             .map(|index| super::GridClickSelectionAnchor::new(index, self.items_generation));
-        self.scroll_offset_y = scroll_offset_y;
-        self.scroll_to_selected = scroll_to_selected || layout_changed;
-        self.pending_grid_scroll = pending_grid_scroll;
+        self.grid_scroll = grid_scroll;
+        if layout_changed {
+            self.grid_scroll.set_reveal_requested(true);
+        }
         self.checked = checked;
         self.visible_indices = visible_indices;
         self.details_order = details_order;
@@ -8636,7 +8631,7 @@ impl App {
             .map(|definition| definition.name.as_str())
             .unwrap_or("?");
         self.address = format!("スマートフォルダ: {definition_name}");
-        self.last_scroll_offset_y_tracked = self.scroll_offset_y;
+        self.last_scroll_offset_y_tracked = self.grid_scroll.offset();
         if let Some(returned_root_entry) = returned_root_entry {
             let returned_index = self.items.iter().position(|item| {
                 item.drag_source_path()
@@ -9421,7 +9416,7 @@ impl App {
         self.address = format!("スマートフォルダ: {definition_name}");
         if let Some(&index) = self.visible_indices.first() {
             self.move_grid_cursor(Some(index), crate::app::GridCursorIntent::Automatic);
-            self.scroll_to_selected = true;
+            self.grid_scroll.set_reveal_requested(true);
         }
         if let Some(SmartFolderOpenOrigin::ReturnReprepare {
             anchor: Some(path), ..
@@ -11899,6 +11894,41 @@ mod tests {
                 None,
                 app.settings.file_type_visibility.clone(),
             ),
+        );
+    }
+
+    #[test]
+    fn grid_scroll_smart_root_park_restore_keeps_own_row_anchor_and_request() {
+        let mut app = crate::app::setup_app_for_test();
+        let definition_id = install_smart_identity_test_root(&mut app, Default::default());
+        app.selected = Some(1);
+        app.grid_scroll.set_position(125.0);
+        app.grid_scroll.set_row_anchor(Some(2));
+        app.grid_scroll.set_reveal_requested(true);
+        app.grid_scroll
+            .request_edge(super::super::GridScrollIntent::Bottom);
+        let root_scroll = app.grid_scroll.clone();
+        let grid = app.take_visible_smart_folder_grid();
+        assert_eq!(grid.layout.grid_scroll, root_scroll);
+        assert_eq!(app.grid_scroll, super::super::GridScrollState::default());
+        park_smart_identity_test_root(&mut app, grid);
+        app.grid_scroll.set_position(77.0);
+        app.grid_scroll.set_row_anchor(Some(5));
+        app.grid_scroll
+            .request_edge(super::super::GridScrollIntent::Top);
+        assert!(!app.grid_scroll.take_reveal());
+        assert_eq!(
+            app.grid_scroll.take_layout_request().edge(),
+            Some(super::super::GridScrollIntent::Top)
+        );
+        assert_eq!(app.grid_scroll.row_anchor(), Some(5));
+        assert!(app.restore_prepared_smart_folder_session(definition_id, None));
+        assert_eq!(app.grid_scroll, root_scroll);
+        assert_eq!(app.grid_scroll.row_anchor(), Some(2));
+        assert!(app.grid_scroll.reveal_requested());
+        assert_eq!(
+            app.grid_scroll.pending_edge(),
+            Some(super::super::GridScrollIntent::Bottom)
         );
     }
 

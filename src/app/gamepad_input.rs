@@ -5877,7 +5877,7 @@ impl App {
             RingPickerRowId::GridColumns if self.settings.grid_cols != picker.grid_cols => {
                 self.set_grid_view_mode(GridViewMode::Thumbnail);
                 self.settings.grid_cols = picker.grid_cols;
-                self.scroll_to_selected = true;
+                self.grid_scroll.set_reveal_requested(true);
                 self.settings.save();
             }
             RingPickerRowId::GridSortOrder
@@ -7193,7 +7193,7 @@ impl App {
         {
             self.set_grid_view_mode(GridViewMode::Thumbnail);
             self.settings.grid_cols = picker.grid_cols;
-            self.scroll_to_selected = true;
+            self.grid_scroll.set_reveal_requested(true);
             self.bump_input_seq(
                 "ring_picker_grid_cols",
                 Some(&format!("cols={}", picker.grid_cols)),
@@ -7239,7 +7239,7 @@ impl App {
         self.settings.sort_order = sort_order;
         self.settings.save();
         self.apply_sort_change_reload();
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
     }
 
     fn apply_picker_thumb_aspect(&mut self, auto: bool, aspect: ThumbAspect) {
@@ -8691,7 +8691,7 @@ impl App {
         intent: GridScrollIntent,
         source: &'static str,
     ) {
-        self.pending_grid_scroll = Some(intent);
+        self.grid_scroll.request_edge(intent);
         self.bump_input_seq(
             source,
             Some(match intent {
@@ -8724,7 +8724,7 @@ impl App {
         if target.is_none() {
             return;
         }
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
         self.update_last_selected_image();
         self.bump_input_seq(
             source,
@@ -9106,7 +9106,7 @@ impl App {
                 Some(new_sel),
                 crate::app::GridCursorIntent::Explicit(GridCursorMove::Move),
             );
-            self.scroll_to_selected = true;
+            self.grid_scroll.set_reveal_requested(true);
             self.update_last_selected_image();
             self.bump_input_seq("gamepad_grid_nav", Some(&format!("sel={new_sel}")));
         }
@@ -9715,14 +9715,16 @@ impl App {
             return;
         }
         let cell_h = self.last_cell_h.max(1.0);
-        let prev_offset = self.scroll_offset_y;
-        self.scroll_offset_y = (self.scroll_offset_y + direction * cell_h * 2.0).max(0.0);
-        self.scroll_offset_y = (self.scroll_offset_y / cell_h).round() * cell_h;
-        if (self.scroll_offset_y - prev_offset).abs() > 0.5 {
+        let prev_offset = self.grid_scroll.offset();
+        self.grid_scroll
+            .set_position((self.grid_scroll.offset() + direction * cell_h * 2.0).max(0.0));
+        self.grid_scroll
+            .set_position((self.grid_scroll.offset() / cell_h).round() * cell_h);
+        if (self.grid_scroll.offset() - prev_offset).abs() > 0.5 {
             self.log_rating_grid_scroll(
                 &format!("gamepad direction={direction:.1}"),
                 prev_offset,
-                self.scroll_offset_y,
+                self.grid_scroll.offset(),
                 (
                     self.last_grid_cols,
                     self.last_cell_size,
@@ -9732,7 +9734,7 @@ impl App {
             );
             self.bump_input_seq(
                 "gamepad_grid_scroll",
-                Some(&format!("offset={:.0}", self.scroll_offset_y)),
+                Some(&format!("offset={:.0}", self.grid_scroll.offset())),
             );
         }
     }

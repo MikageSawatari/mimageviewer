@@ -2556,10 +2556,10 @@ impl App {
         // 復元できなかった (= 旧選択アイテムが消えた / 初回 install) ときは従来通り
         // 先頭にスクロール。
         if restored_selected.is_some() {
-            self.scroll_to_selected = true;
+            self.grid_scroll.set_reveal_requested(true);
         } else {
-            self.scroll_offset_y = 0.0;
-            self.scroll_to_selected = false;
+            self.grid_scroll.set_position(0.0);
+            self.grid_scroll.set_reveal_requested(false);
         }
         self.scroll_hint.store(0, Ordering::Relaxed);
         if let Some(keys) = detail_keys.as_ref() {
@@ -3093,7 +3093,7 @@ impl App {
         // early return する本関数の冒頭で 1 箇所だけ判定すれば足りる。
         if self.global_search.aggregate_auto
             && self.global_search.drill.is_none()
-            && (self.selected.is_some() || self.scroll_offset_y > 0.5)
+            && (self.selected.is_some() || self.grid_scroll.offset() > 0.5)
         {
             self.global_search.aggregate_auto = false;
         }
@@ -3749,7 +3749,7 @@ impl App {
                 .or_else(|| self.visible_indices.first().copied());
             if let Some(index) = index {
                 self.move_grid_cursor(Some(index), crate::app::GridCursorIntent::Automatic);
-                self.scroll_to_selected = true;
+                self.grid_scroll.set_reveal_requested(true);
             }
         }
     }
@@ -4051,7 +4051,7 @@ impl App {
                 .or_else(|| self.visible_indices.first().copied());
             if let Some(idx) = resolved {
                 self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-                self.scroll_to_selected = true;
+                self.grid_scroll.set_reveal_requested(true);
             }
         }
         self.update_global_search_address();
@@ -4246,7 +4246,7 @@ impl App {
                     crate::app::HistoryTrigger::UserChosen,
                 );
                 self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-                self.scroll_to_selected = true;
+                self.grid_scroll.set_reveal_requested(true);
                 self.update_last_selected_image();
                 return true;
             }
@@ -4818,7 +4818,7 @@ impl App {
         // 旧クエリ結果から作った items は直後の rebuild で全て無効化されるので、
         // selected / scroll もここで「ユーザー未操作」状態へ戻す。
         self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
-        self.scroll_offset_y = 0.0;
+        self.grid_scroll.set_position(0.0);
         // query == last_executed でも debounce → spawn を必ず再走させる。
         // そうしないと、Enter 2 連打で旧検索が cancel されたあと
         // poll_global_search_debounce が「クエリが変わっていない」と判定して

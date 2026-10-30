@@ -1987,10 +1987,11 @@ impl App {
             // 代入が無条件なのは、起動フォルダを開く時点で `select_after_load` に意見を
             // 持つ経路が他に無いため (BS 戻りも親フォルダボタンも、まだ 1 度も動いていない)。
             let previous_selection = self.select_after_load.clone();
-            let previous_scroll = self.scroll_selected_to_rows_above;
+            let previous_scroll = self.grid_scroll.row_anchor();
             let hint = crate::known_folders::startup_cursor_hint(&self.settings, &folder);
             self.select_after_load = hint.as_ref().map(|(name, _)| name.clone());
-            self.scroll_selected_to_rows_above = hint.and_then(|(_, rows)| rows);
+            self.grid_scroll
+                .set_row_anchor(hint.and_then(|(_, rows)| rows));
             let load = event_span(Lane::Navigation, Stage::InitialTargetScan, correlation)
                 .watched_optional(watch)
                 .detail("default-existing-loader-call-return");
@@ -2002,7 +2003,7 @@ impl App {
             load.finish(if refused { Outcome::Error } else { Outcome::Ok });
             if refused {
                 self.select_after_load = previous_selection;
-                self.scroll_selected_to_rows_above = previous_scroll;
+                self.grid_scroll.set_row_anchor(previous_scroll);
                 return Outcome::Error;
             }
         }
@@ -2039,7 +2040,7 @@ impl App {
         let saved_image_metas = self.image_metas.clone();
         let saved_visible_indices = self.visible_indices.clone();
         let mut reader_order = self.current_reader_order().to_vec();
-        let saved_scroll_offset_y = self.scroll_offset_y;
+        let saved_scroll_offset_y = self.grid_scroll.offset();
         let saved_selected = self.selected;
         let saved_zip_nav = self.zip_nav.clone();
         let mut reader_items = saved_items.clone();
@@ -2266,7 +2267,7 @@ impl App {
             ));
         }
         self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
         crate::logger::log(format!(
             "{input_reason}: opening requested file through the loaded-folder viewer path: {}",
             requested.display()

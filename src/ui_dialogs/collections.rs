@@ -7650,15 +7650,16 @@ mod tests {
         app.selected = Some(0);
         app.checked.insert(1);
         app.address = "source-folder".into();
-        app.scroll_offset_y = 417.5;
-        app.pending_grid_scroll = Some(crate::app::GridScrollIntent::Bottom);
+        app.grid_scroll.set_position(417.5);
+        app.grid_scroll
+            .request_edge(crate::app::GridScrollIntent::Bottom);
         let source_surface = app.top_level_grid_view.surface().clone();
         let source_address = app.address.clone();
         let source_generation = app.items_generation;
         let source_selected = app.selected;
         let source_checked = app.checked.clone();
-        let source_scroll = app.scroll_offset_y;
-        let source_pending_scroll = app.pending_grid_scroll;
+        let source_scroll = app.grid_scroll.offset();
+        let source_pending_scroll = app.grid_scroll.pending_edge();
         app.add_grid_selection_to_collection(target.collection_id());
         wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
 
@@ -7702,8 +7703,8 @@ mod tests {
         assert_eq!(app.items_generation, source_generation);
         assert_eq!(app.selected, source_selected);
         assert_eq!(app.checked, source_checked);
-        assert_eq!(app.scroll_offset_y, source_scroll);
-        assert_eq!(app.pending_grid_scroll, source_pending_scroll);
+        assert_eq!(app.grid_scroll.offset(), source_scroll);
+        assert_eq!(app.grid_scroll.pending_edge(), source_pending_scroll);
         assert_eq!(std::fs::read(&ignored).unwrap(), b"ignored-source");
         assert_eq!(std::fs::read(&checked).unwrap(), b"checked-source");
         assert_eq!(std::fs::read(&existing).unwrap(), b"existing-source");
@@ -7991,7 +7992,7 @@ mod tests {
         ];
         app.selected = Some(0);
         app.checked.insert(1);
-        app.scroll_offset_y = 93.0;
+        app.grid_scroll.set_position(93.0);
 
         app.add_grid_shortcut_to_collection_target();
         let CollectionDialogOperation::ToolbarAddSnapshot(request) = &app.collection_ui.operation
@@ -8022,7 +8023,7 @@ mod tests {
             .unwrap();
         assert!(untouched.entries.is_empty());
         assert_eq!(app.selected, Some(0));
-        assert_eq!(app.scroll_offset_y, 93.0);
+        assert_eq!(app.grid_scroll.offset(), 93.0);
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -8236,7 +8237,7 @@ mod tests {
             crate::grid_item::GridItem::Video(paths[2].clone()),
         ];
         app.selected = Some(0);
-        app.scroll_offset_y = 81.0;
+        app.grid_scroll.set_position(81.0);
         let ctx = egui::Context::default();
         for (context, fullscreen_idx) in [
             (crate::ring_shortcut::RingShortcutContext::Grid, None),
@@ -8261,7 +8262,7 @@ mod tests {
             );
             wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
             assert!(app.top_level_grid_view.collection_session().is_none());
-            assert_eq!(app.scroll_offset_y, 81.0);
+            assert_eq!(app.grid_scroll.offset(), 81.0);
         }
         let snapshot = client
             .load_collection(collection.collection_id())

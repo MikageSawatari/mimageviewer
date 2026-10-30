@@ -25435,7 +25435,7 @@ impl App {
         self.begin_normal_book_reading();
         self.fullscreen_idx = Some(target_idx);
         self.move_grid_cursor(Some(target_idx), crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
         self.fs_vertical_scroll = 0.0;
         self.update_last_selected_image();
         self.record_book_resume(target_idx);
@@ -41647,7 +41647,7 @@ impl App {
             return;
         }
         self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
         self.update_last_selected_image();
         if matches!(
             continuation,
@@ -42346,7 +42346,7 @@ impl App {
             }
         }
         self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
         self.slideshow_anchor_idx = None;
         // The accepted curl still owns presentation; arm the interval only after
         // its canonical flat is adopted, using the existing frame anchor owner.

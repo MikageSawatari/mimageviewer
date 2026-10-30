@@ -2801,11 +2801,12 @@ impl App {
                     .find(|&index| self.rating_path_key(index).as_deref() == Some(key))
             });
         if restored.is_some() {
-            self.scroll_offset_y = position.as_ref().unwrap().scroll_offset_y;
+            self.grid_scroll
+                .set_position(position.as_ref().unwrap().scroll_offset_y);
         }
         let selected = restored.or_else(|| self.visible_indices.first().copied());
         self.move_grid_cursor(selected, crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = selected.is_some();
+        self.grid_scroll.set_reveal_requested(selected.is_some());
         if perf_on {
             crate::perf::event(
                 "subfolder",

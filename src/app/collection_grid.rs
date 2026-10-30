@@ -3745,9 +3745,9 @@ impl App {
         self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
 
         self.move_grid_cursor(selected, crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = selected.is_some();
+        self.grid_scroll.set_reveal_requested(selected.is_some());
         if selected.is_none() {
-            self.scroll_offset_y = 0.0;
+            self.grid_scroll.set_position(0.0);
         }
         self.rebuild_visible_indices();
         self.prewarm_grid_tags();
@@ -5865,7 +5865,7 @@ mod tests {
         );
         app.rebuild_visible_indices();
         app.selected = Some(104);
-        app.scroll_to_selected = true;
+        app.grid_scroll.set_reveal_requested(true);
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         let draw = |app: &mut App| {
@@ -5885,19 +5885,21 @@ mod tests {
         };
         draw(&mut app);
         draw(&mut app);
-        let expected = (app.scroll_offset_y / app.last_cell_h).floor()
+        let expected = (app.grid_scroll.offset() / app.last_cell_h).floor()
             * (app.last_cell_size * ThumbAspect::Portrait3x4.height_ratio()).round();
         app.fixup_scroll_for_aspect_change(ThumbAspect::Portrait3x4);
-        assert_eq!(app.scroll_offset_y, expected);
+        assert_eq!(app.grid_scroll.offset(), expected);
         app.fixup_scroll_for_aspect_change(ThumbAspect::Portrait3x4);
         assert_eq!(
-            app.scroll_offset_y, expected,
+            app.grid_scroll.offset(),
+            expected,
             "same-frame double fixup is idempotent"
         );
         app.settings.grid_cols += 1;
         app.fixup_scroll_for_aspect_change(ThumbAspect::Square);
         assert_eq!(
-            app.scroll_offset_y, expected,
+            app.grid_scroll.offset(),
+            expected,
             "different columns do not own the old rows"
         );
         app.settings.grid_cols -= 1;
@@ -5909,7 +5911,8 @@ mod tests {
         }
         app.fixup_scroll_for_aspect_change(ThumbAspect::Square);
         assert_eq!(
-            app.scroll_offset_y, expected,
+            app.grid_scroll.offset(),
+            expected,
             "another context does not own this anchor"
         );
         if let super::super::GridAspectLayout::Thumbnail { context_id, .. } =
@@ -5920,16 +5923,18 @@ mod tests {
         app.bump_items_generation();
         app.fixup_scroll_for_aspect_change(ThumbAspect::Square);
         assert_eq!(
-            app.scroll_offset_y, expected,
+            app.grid_scroll.offset(),
+            expected,
             "different generation has not been laid out"
         );
         app.settings.grid_view_mode = GridViewMode::Details;
         draw(&mut app);
-        let details_offset = app.scroll_offset_y;
+        let details_offset = app.grid_scroll.offset();
         app.settings.grid_view_mode = GridViewMode::Thumbnail;
         app.fixup_scroll_for_aspect_change(ThumbAspect::Portrait3x4);
         assert_eq!(
-            app.scroll_offset_y, details_offset,
+            app.grid_scroll.offset(),
+            details_offset,
             "Details is not thumbnail geometry"
         );
         app.shutdown_collection_runtime_for_exit();
@@ -5951,7 +5956,7 @@ mod tests {
         );
         app.rebuild_visible_indices();
         app.selected = Some(104);
-        app.scroll_to_selected = true;
+        app.grid_scroll.set_reveal_requested(true);
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         let draw = |app: &mut App| {
@@ -5971,7 +5976,7 @@ mod tests {
         };
         draw(&mut app);
         draw(&mut app);
-        let offset = app.scroll_offset_y;
+        let offset = app.grid_scroll.offset();
         assert!(offset > 0.0);
         let old_generation = app.items_generation;
         app.settings.grid_cols = 10;
@@ -6045,9 +6050,10 @@ mod tests {
             app.auto_aspect.switches_done, 1,
             "warm seed must actually switch"
         );
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
         assert_eq!(
-            app.scroll_offset_y, offset,
+            app.grid_scroll.offset(),
+            offset,
             "unpainted list borrowed the prior grid's row height"
         );
         draw(&mut app);
@@ -6055,12 +6061,13 @@ mod tests {
         assert_eq!(app.selected, Some(104));
         let center = (104 / 10) as f32 * app.last_cell_h + app.last_cell_h / 2.0;
         assert!(
-            center >= app.scroll_offset_y && center <= app.scroll_offset_y + app.last_viewport_h
+            center >= app.grid_scroll.offset()
+                && center <= app.grid_scroll.offset() + app.last_viewport_h
         );
-        let settled = app.scroll_offset_y;
+        let settled = app.grid_scroll.offset();
         app.maybe_apply_auto_aspect(true);
         draw(&mut app);
-        assert_eq!(app.scroll_offset_y, settled);
+        assert_eq!(app.grid_scroll.offset(), settled);
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -7048,7 +7055,7 @@ mod tests {
             .expect("prepared collection");
         assert_eq!(prepared.entries[selected].source_key, anchor.source_key);
         assert!(
-            app.scroll_to_selected,
+            app.grid_scroll.reveal_requested(),
             "restored entry must be scrolled into view"
         );
         app.shutdown_collection_runtime_for_exit();
@@ -7157,7 +7164,7 @@ mod tests {
             .unwrap();
         assert_eq!(app.selected, Some(remapped));
         assert_eq!(app.checked, std::collections::HashSet::from([remapped]));
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
 
         let removed = recv(
             client
@@ -7312,8 +7319,8 @@ mod tests {
                 .position(|item| item.drag_source_path() == Some(source.as_path()))
                 .expect("collection container row");
             app.selected = Some(source_index);
-            app.scroll_offset_y = 360.0;
-            app.scroll_to_selected = false;
+            app.grid_scroll.set_position(360.0);
+            app.grid_scroll.set_reveal_requested(false);
             let anchor = app
                 .collection_grid_source_anchor(source_index, source)
                 .expect("stable collection source anchor");
@@ -7395,7 +7402,7 @@ mod tests {
                 prepared.entries[app.selected.expect("restored selection")].entry_id,
                 anchor.entry_id
             );
-            assert!(app.scroll_to_selected);
+            assert!(app.grid_scroll.reveal_requested());
         }
         app.shutdown_collection_runtime_for_exit();
     }
@@ -8018,7 +8025,7 @@ mod tests {
         app.selected = Some(0);
         app.note_session_grid_positions();
         app.selected = Some(4);
-        app.scroll_offset_y = 700.0;
+        app.grid_scroll.set_position(700.0);
         let selected_key = app.rating_path_key(4).unwrap();
         let restore = CollectionGridRestore {
             identity: CollectionGridIdentity {
@@ -9115,7 +9122,7 @@ mod tests {
             .items
             .iter()
             .position(|it| matches!(it, GridItem::Image(_)));
-        app.scroll_offset_y = 125.0;
+        app.grid_scroll.set_position(125.0);
         let selected_item = app.items[app.selected.unwrap()].clone();
         let location = app.folder_nav_current_target();
         let before = app.folder_nav_history_snapshot();
@@ -9123,7 +9130,7 @@ mod tests {
         let sibling = app.build_window_context_for_test(9_902, |sibling| {
             sibling.current_folder = Some(temp.path().join("sibling"));
             sibling.selected = Some(0);
-            sibling.scroll_offset_y = 77.0;
+            sibling.grid_scroll.set_position(77.0);
             sibling.items = vec![GridItem::Image(temp.path().join("sibling.png"))];
         });
         let sibling_state = app
@@ -9134,7 +9141,7 @@ mod tests {
                     sibling.cancel_token.clone(),
                     sibling.folder_nav_current_target(),
                     sibling.selected,
-                    sibling.scroll_offset_y,
+                    sibling.grid_scroll.offset(),
                 )
             })
             .unwrap();
@@ -9162,7 +9169,7 @@ mod tests {
             before.forward_stack
         );
         assert_eq!(app.items[app.selected.unwrap()], selected_item);
-        assert_eq!(app.scroll_offset_y, 125.0);
+        assert_eq!(app.grid_scroll.offset(), 125.0);
         let Some(crate::ui_main::AddressBarNav::Collection(parent)) =
             app.resolve_return_to_parent_nav()
         else {
@@ -9176,7 +9183,7 @@ mod tests {
             assert!(!sibling.cancel_token.load(Ordering::Relaxed));
             assert_eq!(sibling.folder_nav_current_target(), sibling_state.3);
             assert_eq!(sibling.selected, sibling_state.4);
-            assert_eq!(sibling.scroll_offset_y, sibling_state.5);
+            assert_eq!(sibling.grid_scroll.offset(), sibling_state.5);
         })
         .unwrap();
         app.shutdown_collection_runtime_for_exit();
@@ -9472,7 +9479,7 @@ mod tests {
         app.open_collection_grid(collection.collection_id(), None);
         wait_for_grid(&mut app, collection.collection_id());
         app.selected = Some(0);
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_reveal_requested(false);
         let anchor = app.collection_grid_source_anchor(0, &shelf).unwrap();
         let order: Vec<_> = app
             .top_level_grid_view
@@ -9769,7 +9776,7 @@ mod tests {
             order
         );
         assert!(
-            app.scroll_to_selected,
+            app.grid_scroll.reveal_requested(),
             "root return must keep the existing ensure-visible restoration"
         );
         app.shutdown_collection_runtime_for_exit();
@@ -10036,7 +10043,7 @@ mod tests {
             .collect::<Vec<_>>();
         let held_selected = app.selected;
         let held_checked = app.checked.clone();
-        let held_scroll = app.scroll_offset_y;
+        let held_scroll = app.grid_scroll.offset();
 
         let updated = recv(
             client
@@ -10068,7 +10075,7 @@ mod tests {
         );
         assert_eq!(app.selected, held_selected);
         assert_eq!(app.checked, held_checked);
-        assert_eq!(app.scroll_offset_y, held_scroll);
+        assert_eq!(app.grid_scroll.offset(), held_scroll);
         assert_eq!(app.current_folder.as_deref(), Some(physical.as_path()));
         app.shutdown_collection_runtime_for_exit();
     }
@@ -10155,7 +10162,7 @@ mod tests {
             .history
             .back_stack = sibling_history.iter().cloned().map(Into::into).collect();
         app.selected = Some(0);
-        app.scroll_offset_y = 107.0;
+        app.grid_scroll.set_position(107.0);
         let generation = app.items_generation;
         let address = app.address.clone();
         let request = collection_jump_request(&app, &source);
@@ -10163,7 +10170,7 @@ mod tests {
         assert!(app.context_folder_jump_pending());
         assert_eq!(app.items_generation, generation);
         assert_eq!(app.selected, Some(0));
-        assert_eq!(app.scroll_offset_y, 107.0);
+        assert_eq!(app.grid_scroll.offset(), 107.0);
         assert_eq!(app.address, address);
         assert!(matches!(
             app.top_level_grid_view.surface(),
@@ -10208,7 +10215,7 @@ mod tests {
                 .drag_source_path()
                 .is_some_and(|path| crate::folder_tree::path_eq(path, &source))
         }));
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
         assert!(matches!(
             app.folder_history_back_target(),
             Some(super::super::FolderNavHistoryTarget::Collection(restore))

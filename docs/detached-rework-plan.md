@@ -6715,3 +6715,40 @@ bundle退役にも接続した。記録するcontextは要求に捕捉したowne
 `prepared_edit_disposition`の項目と理由型はpage-turn計画§28.5.1に記録した。
 detachedの実表示入口と、通常mounted状態での既存の編集切替・Resumeを、Bの各未公開状態で直接通すheadless回帰を追加した。
 採否やpresentation述語は変更せず、既存所有境界の観測と回帰を足す修正であり、症状パッチではない。
+
+### 2026-10-30: 5ch >>661 一覧スクロールの所有境界（設計ACCEPT・実装着手）
+
+設計正本は [調査書「修正の設計」第3版](scroll-661-investigation.md#修正の設計)、
+`446a435f1`。独立設計レビュー（GPT-6.1 Sol / xhigh）は追加指摘なしでACCEPT、
+ClaudeCodeとCodexは、現在geometry・位置更新の意味・入力所属を各ownerで確定する
+構造的修正であり、症状パッチではないことに合意した。
+
+対象はApp投影と `ViewerContextBundle` の一覧offset / reveal / edge / RowAnchorの集約、
+既存move / swap / fork / 実parkの入力寿命、MainGridのtouch生成・受理である。
+一時mount / deposit、兄弟のread-only open / closeでは寿命を変えない。
+geometry / velocityのegui Stateはviewer contextごと、captureの所属は実表示面の
+安定transport IDと一覧sessionで分離する。ROOTのtouch端数参照はmain ownerを明示する。
+
+新しいdetached bool、HWND同定・配置・viewport生成 / 閉鎖の変更、時間窓、追加repaint、
+兄弟のcache / generation失効は加えない。段A（挙動不変の集約）→B（>>661のgeometry契約）→
+C（入力寿命・contextの統合）の受入を順に行い、C完了まで出荷しない。
+本記録は着手前の構造合意であり、実装完了・検証成功を示さない。
+段ごとの実施結果は調査書の実装・検証台帳へ記録する。製品binaryは起動しない。
+
+同日、段Aのsource前提監査で、既存の未消費RowAnchorとEdgeの同時保持を設計の排他的requestが
+表現できない相違を確認し、依頼の停止条件に従って製品編集前に停止した。
+bundle / park / touch / vendorの変更・自動テストはまだ行っていない。
+詳細なproducer / consumer・既存試験・設計担当へ返す論点は調査書の「実装・検証記録」を参照。
+
+その後、ClaudeCodeがEdge等の一回限りの要求とRowAnchorの配置指定は寿命が違うため、
+同じ `GridScrollState` の別枠へ移すと補足し、再開を指示した。
+既存2試験の保持条件と起動hintのload reset跨ぎを保つ。これは旧状態の集約であり、
+新たなdetached bool / pendingを追加するものではない。
+再開後も各段の受入結果を調査書へ記録し、段C完了前には出荷しない。
+
+再開後、段AでApp / bundle / SmartRootのスクロール所有者を集約した。
+実mount / deposit、両fork、Smart退避・復帰のRowAnchor回帰を含む関連458件とowner単体5件、
+core check・context audit（違反0）は成功した。row hintはmoveで保持し、forkでは非継承とする。
+一方、R3の詳細表示で既存の `last_grid_cols` 捕捉不整合を検出したため、設計担当判断へ返して停止。
+段Aの受入は未完了で、B/Cのvendor / session / capture / recognizer / 実park接続には未着手。
+viewport / HWND / native表示・入力の操作は行っていない。詳細とログは同じ調査書の再開後台帳を参照。

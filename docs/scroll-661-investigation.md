@@ -177,9 +177,31 @@ ClaudeCode が別途承認を得た場合の確認枠:
 
 ### 2. App 側の単一 owner と明示更新
 
+#### 設計担当補足: Edgeと未消費RowAnchor（2026-10-30、停止後の再開決定）
+
+以下はClaudeCodeの補足指示であり、初版〜第3版の「row anchorも排他的なrequestに含める」
+という記述を置き換える。Edge等の一回限りの要求と、未消費の行位置指定は寿命が異なり、互いに排他ではない。
+`GridScrollState` は同一owner内に次の二枠を持つ。
+
+1. その描画境界で一度だけ解決する要求枠（Position / RevealSelection / Edge）。
+   この枠内の優先順位は従来どおり、同一境界のedgeがensureより優先し、同一覧の新しいedgeは最後を採る。
+2. 未消費の `RowAnchor(rows_above)` 枠。選択が解決されてrevealが適用されるときだけ使う。
+   選択対象が見つからない、選択がない、Edgeを適用した、という理由だけでは消去しない。
+   `try_select_after_load` / `apply_scroll_to_selected` / Edgeのtakeの現在の消費規則を維持する。
+
+既存の要求とrow hintを同じownerへ移すもので、新しい状態の追加ではない。
+既存2試験 `grid_cursor_rating_grid_move_then_shift_click_uses_display_order_in_both_views` と
+`paired_identity_remap_keeps_checks_and_scroll_then_shift_click_uses_remapped_anchor` のassert条件は変更しない。
+「Edge適用時にrow anchorを取り消すべきか」は出荷済み挙動を変える別問題のため **今回は現状維持**。
+起動前hintが通常loadのresetを跨ぐ経路も維持する。`StartupListIntent` へ運ぶ変更を行う場合は
+挙動不変を先に検証し、変わるなら停止して報告する。
+
+段Aの前提監査による停止理由はこの補足で解消され、段A→B→Cの受入条件を保って実装を再開する。
+以下のrequest型の説明は、この補足に従いRowAnchorを独立した配置枠として読む。
+
 `GridScrollState` を App 投影と `ViewerContextBundle` に一つずつ保持する。既存の `scroll_offset_y`、`scroll_to_selected`、`pending_grid_scroll`、`scroll_selected_to_rows_above` の責任をここへ移す。最後の field は名前にかかわらず **起動専用ではなく、refresh / resume の選択行位置にも使う**。互換用の旧 field を併存させず、位置の読み手は owner の canonical accessor を使う。履歴・session snapshot の保存形式は従来の数値・選択のままとし、gesture identity や egui State を保存しない。
 
-- canonical offset と、一回だけ解決する `GridScrollRequest` を同じ owner に置く。request は `Keep` / `Position { placement }` / `RevealSelection` / `RowAnchor(rows_above)` / `Edge(Top|Bottom)` の排他的な型とする。`placement` は `KeepPosition | RevealSelection | RowAnchor(rows_above)`。復元位置を受け取る操作は canonical を更新して `Position { KeepPosition }` にする。復元は同値でも旧慣性を終える意味を持つ。
+- canonical offset、一回だけ解決する `GridScrollRequest`、未消費RowAnchorの配置枠を同じownerに置く。requestは `Keep` / `Position { placement }` / `RevealSelection` / `Edge(Top|Bottom)`、placementは `KeepPosition | RevealSelection` とし、RowAnchorはこのenumの外の配置枠に置く。復元位置を受け取る操作はcanonicalを更新して `Position { KeepPosition }` にする。復元は同値でも旧慣性を終える意味を持つ。
 - `RevealSelection` は既存の `current_grid_order` と `apply_scroll_to_selected` の計算を使い、既に見えていれば位置を変えない。`RowAnchor(rows_above)` は「選択項目を上から何行目へ」の共通要求。`startup_list_restore.rs::current_list_refresh_intent` → cursor 捕捉（:147付近）、`finish_main_list_open` の `ResumeList` / `RefreshList`（:531付近）、`resume_loading_items_after_sidecar` の refresh cursor 採用（`app.rs:43598`付近）を含め、旧 field の全 producer を移す。通常 reload / 自動観測 rescan でも行位置を保持し、単なる ensure-visible へ格下げしない。
 - fork へ process 起動時の未消費要求を複製しない規則は、起動 intent の fork / constructor policy として維持する。`RowAnchor` という要求種類自体を「main 起動だけ」に限定しない。context に所属する refresh / resume の要求はその bundle と一緒に move / swap し、fork の既存 copy policy と未採用要求の非継承を監査する。
 - `Edge` は選択・チェック・最後の画像を変更しない。現行どおり、同じ描画境界で競合する ensure より edge を優先する。復元後の reveal は `Position` の placement を更新して合成し、見えているため reveal が無移動でも復元の `Set` 権限を失わない。未消費の edge がある間の ensure / 同一覧の位置更新は edge を取り消さず、同一覧で新しい edge が来れば最後の edge を採る。別一覧の採用では旧一覧の request を移さず、宛先の restore / initial request に置換する。要求登録・合成の順序を単体テストで固定する。
@@ -405,3 +427,141 @@ App側で増える範囲は `touch_correlation.rs` のMainGrid sessionと既存t
 実装時の文書更新先は本書の実装・検証台帳、`coding-conventions.md`（App 正本と egui 入力候補の契約）、`details-view-and-filter-plan.md`、`touch-support-plan.md`、`folder-history-location-plan.md` / `top-level-grid-view.md`、前述の detached §11 と vendor 台帳。公開向けには内部型名を出さず、復元位置の不具合修正を通常の変更履歴へ記す。
 
 今回の成果物はこの設計節の改訂のみ。製品コード・既存の失敗テスト・vendor は未変更、commit / build / test / 製品起動 / デスクトップ操作なし。第2版の残P2・P3とsourceの照合・文書の整合確認を行った。通常の使い方を不便にする仕様変更は追加していない。本改訂の再レビューと実装着手可の判定は、ClaudeCode と次の reviewer へ引き継ぐ。
+
+## 実装・検証記録（2026-10-30）
+
+### 着手条件と段Aの前提監査での停止
+
+設計第3版 `446a435f1` は独立設計レビューで **ACCEPT（追加指摘なし）**。
+構造的修正であることへの独立reviewer・ClaudeCode・Codexの同意を受けて実装調査を開始した。
+上の設計本文の「ACCEPT未取得」は設計提出時の記録であり、この時点では解消している。
+ただし依頼の「設計の前提がコードと食い違ったら、設計を黙って変えずに止める」に該当する
+下記の相違を、段Aの製品編集前に確認したため停止した。設計本文は変更していない。
+
+**相違: 既存の未消費RowAnchorとEdgeの同時保持を、設計の排他的requestが表せない。**
+
+- `src/app/startup_list_restore.rs:544` / `:565` は `ResumeList` / `RefreshList` / 起動復元で
+  `scroll_selected_to_rows_above` を設定してから `try_select_after_load` を呼ぶ。
+- `src/app.rs::try_select_after_load`（:74406）は対象名が見つからないとfalseを返し、
+  row hintを消さない。`apply_scroll_to_selected`（:61168）も選択なしならhintをtakeする前にreturnする。
+- `render_grid`（`src/ui_main.rs:19467`）はrevealを一度取り出してfalseにするが、
+  row hintは別fieldに残る。`request_grid_scroll`（`src/app/gamepad_input.rs:8694`）はEdgeだけを設定し、
+  layout境界（`src/ui_main.rs:19745`付近）もEdgeだけをtakeする。
+  したがって旧stateには、Edge適用後もrow hintを保持し、後のrevealで消費できる組み合わせがある。
+- 既存 `grid_cursor_rating_grid_move_then_shift_click_uses_display_order_in_both_views`
+  （`src/ui_main.rs:28197`）と
+  `paired_identity_remap_keeps_checks_and_scroll_then_shift_click_uses_remapped_anchor`
+  （:28377）は、Edgeとrow hintの同時保持を明示的にassertしている。
+  前者はrevealも同時に要求し、後者はreveal=falseのままhintを保持する。
+
+これは「実機で利用者に新しい症状を再現した」という記録ではない。
+確認したのはproductionのproducer / consumerが許す状態と、その保持を明示する既存試験である。
+設計の `Edge(Top|Bottom)` は補助payloadを持たず、ownerに並行hintも置かないため、
+この組み合わせを失わず移管する仕様が不足している。
+hintを捨てる、既存assertを削る、Edgeに設計外payloadを加える、のいずれも行っていない。
+
+設計担当へ返す論点は、**単一ownerの中で、Edgeの即時適用と未消費の行位置指定をどう合成・保持するか**。
+保持する型と消費規則を設計へ補い、段Aの挙動不変条件に照合してから再開する。
+もし不要なhintとして破棄する仕様を選ぶなら、対象の出荷済み経路への影響と既存試験の変更根拠を
+先に設計担当が判断する。実装側で機能制限やtest期待値の緩和を選ばない。
+
+別途、起動前のhint設定（`startup_ops.rs:1990`付近）が通常loadのoffset / reveal / Edge resetを跨ぐ
+既存経路も確認した。集約時は未採用cursorを既存 `StartupListIntent` で運ぶ候補があるが、
+この案も今回まだ実装していない。
+
+| 段 | 作業ツリーと検証結果 |
+| --- | --- |
+| A | 編集前のsource監査で停止。製品コード・テスト変更なし、受入テスト未実行 |
+| B | 未着手。既知redをgreenにしたとは扱わない |
+| C | 未着手。入力・contextの統合確認、全体gate、auditは未実施 |
+
+この試行で更新したのは本記録と `detached-rework-plan.md` §11の構造合意・停止記録のみ。
+Cargo / fmt / test / audit / 確認build / 製品起動 / desktop操作 / commitは実行していない。
+未実装のためbacklogへ「実装済み」は登録せず、他の機能文書にも完成仕様として転記しない。
+文書差分の `git diff --check` と、製品source / vendor / 既存testの差分なしを確認する。
+
+### 設計担当補足後の再開
+
+上記の停止後、ClaudeCodeが「一回限りの要求」と「未消費RowAnchor」を同一ownerの別枠とする
+補足を確定した（設計§2に追記）。既存2試験のassert条件、Edgeだけではanchorを消さない規則、
+起動前hintが通常loadのresetを跨ぐ規則を維持して段Aから再開する。
+同じ描画で実revealとEdgeが両方ある場合は、旧来のreveal適用→Edge優先という順序も保持する。
+実装のrequestはEdge variantのplacement payloadでこの合成を表し、別のreveal boolを追加しない。
+ここから下は再開後の検証台帳とし、上の停止時点の未実施記録を成功結果へ読み替えない。
+
+### 再開後の段A: 所有者集約と、新たなgeometry前提の相違
+
+`src/app/grid_scroll.rs` にcanonical offset、型付き一回要求、独立RowAnchorを集約した。
+App / ViewerContextBundle / SmartRootの退避・復帰と、producer / reader / readbackを移管した。
+保存snapshotの形式は従来の数値のまま。起動hintはownerの独立RowAnchor枠としてload resetを跨ぎ、
+`StartupListIntent` を変更する必要はなかった。既存2試験のassert条件を維持した。
+egui・physics・capture・recognizer・一覧sessionの変更はまだ行っていない。
+
+独立Sol / xhighによる段Aのコード・テスト設計レビューはACCEPT。
+途中で見つかった「詳細ヘッダのsortがearly reveal claim後に積む要求の消失」は
+`take_layout_request` と実sort handler回帰で修正した。
+これは実行受入の完了とは別である。下記R3が失敗したため段Aの受入は未完了、B/Cへ進んでいない。
+
+全Cargo実行は指定の **`MSBUILDDISABLENODEREUSE=1`** を設定。
+通常feature、test / dev profile、一時data_dir、有効JPEG入りZIP / JPG、headlessの条件を維持した。
+
+| コマンド・条件 | 結果 | 証跡 |
+| --- | --- | --- |
+| `cargo fmt`（引数なし） | 実行、整形済み | 後続diff check成功 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 初回coldのturbojpeg-sys並列native build失敗 | `target/scroll661-stage-a-check.log` |
+| `cargo check -p turbojpeg-sys -j 1` | PASS、2m57s | `target/scroll661-native-j1.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core -j 1` | PASS、5m50s（native準備・lock待ちを含む） | `target/scroll661-stage-a-check-j1.log` |
+| `cargo run --locked -p viewer_context_audit --target-dir target/scroll661-audit` | exit 0、違反0 | `target/scroll661-stage-a-audit.log` |
+| `cargo test -p mimageviewer --lib app::grid_scroll::tests:: -j 1 -- --test-threads=1` | 初回lib test compileに移管上の3型エラー。保存用数値参照2箇所とfixtureの借用1箇所を修正後、**5 PASS**（compile 7m37s、実行0.00s） | `target/scroll661-stage-a-owner-tests.log` / `target/scroll661-stage-a-owner-tests-2.log` |
+| `cargo test -p mimageviewer --lib scroll_661:: -- --test-threads=1` | **5 PASS / 7 FAIL**、13.50s。内訳は既知red4件＋新R3の3件 | `target/scroll661-stage-a-reproduction-and-r3.log` |
+| 下記nextest filter | **458 PASS / 0 FAIL**、33.072s | `target/scroll661-stage-a-regression.log` |
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/details_header_sort_reveal|grid_cursor_rating_grid_move|paired_identity_remap|startup_restore::|section1328_session|phase_c_folder_nav_history_tests::|snapshot_ops::|viewer_context_registry::|smart_folder::|touch_correlation::|touch_input::|grid_scroll_ring/) - test(scroll_661::)' --no-fail-fast --retries 0 --no-tests fail
+```
+
+458件には実mount / deposit、live-media / materialized-stillの両fork、SmartRoot退避・復帰の
+新しいRowAnchor所有回帰3件と、既存2試験、late reveal回帰を含む。
+既知red4件は `egui_explicit_offset_after_content_growth`、ZIPのOFF詳細 / OFFサムネイル、
+fast hydration詳細で、段Aでは修正していないためredを保持した。
+
+#### R3で観測した既存の詳細表示の行位置捕捉不整合（停止理由）
+
+新しい `row_anchor_{reload,observation,resume}_keeps_middle_selected_row_in_both_renderers` は
+3件とも **詳細表示の初期配置直後、refresh / resumeに入る前**のassertで失敗した。
+選択index100、行高28、表示offset2744なので実際の行差は `100 - 2744/28 = 2`。
+ところが `selected_rows_below_view_top` は0を返した。
+各試験は詳細→サムネイルの順なので、失敗後のサムネイル側・再採用ループには到達していない。
+
+source確認（行番号は段A差分を含む時点）:
+
+- `src/app.rs:82776` の `selected_rows_below_view_top` は列数を常に `last_grid_cols` から取る。
+- 初期値は `last_grid_cols=4`（`src/app.rs:20758`付近）。
+  更新はサムネイル描画の `src/ui_main.rs:19730` だけで、詳細分岐はその前にreturnする。
+- 詳細は `render_details_list` で行高28と `GridAspectLayout::Details` を記録し、revealはcols=1で適用するが、
+  列数の最終描画記録を1へ更新しない。
+- このため上記例の保存用計算は `floor(100/4) - 98` を飽和減算して0になる。
+  `startup_list_restore.rs::current_main_list_cursor`（:348〜359付近）もこの値を使う。
+  単なるtest oracleだけの問題ではない。
+
+HEAD `446a435f1` のhelper / renderer / 初期値を照合し、同じ不整合が存在することを確認した。
+段Aの当該helper変更はoffset accessorへの移管だけで、列数計算は変更していない。
+独立reviewerもsourceと失敗値を再確認し、段Aの「挙動不変」とR3両renderer成功は
+この既存不具合のまま両立しないと判断した。
+修正前HEADの新R3テスト実行はしていないため、その実行結果を得たとは扱わない。
+
+依頼の「別の相違が見つかったら停止」に従い、**製品のgeometry計算は変更せず停止**した。
+fixtureに `last_grid_cols=1` を仕込む、期待値2を0へ変える、詳細側を省く、といった対応はしていない。
+設計担当へ返す判断は、詳細の実列数1を既存の最終描画geometryへ記録する修正を対象に含め、
+段Aに先行する小修正とするか、R3の受入段を見直すかである。
+設定上の現在モードだけを読んで補うguardではなく、保存・復元が参照する実際の描画geometryを揃える方向を推奨する。
+
+| 段 | 停止時の状態 |
+| --- | --- |
+| A | 所有者集約を実装し、core check・audit・owner5件・関連458件成功。新R3の3件が上記既存不整合で失敗し、受入未完了 |
+| B | 未着手。vendor無変更、>>661の既知red4件を保持 |
+| C | 未着手。session / capture / recognizer統合、新API、R1/R2/R4、最終feature check・full/focused gateは未実施 |
+
+作業差分は未コミットで保持する。製品binary / desktop操作 / 通常profileへのアクセスは行っていない。
+利用者指示により確認用buildも不要。未完成のためbacklogへ「実装済み」は追加しない。
+テスト・ビルドログはPowerShellのUTF-16 BOM付き出力で、機械読取時はBOMを尊重する。

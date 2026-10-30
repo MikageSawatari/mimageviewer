@@ -1116,9 +1116,9 @@ fn resolve_grid_scroll_offset(
 /// A ring / gesture action may enqueue another request later in the same frame; callers
 /// must not clear the field after drawing or that new request would be lost.
 fn take_grid_scroll_for_current_layout(
-    pending: &mut Option<GridScrollIntent>,
+    state: &mut crate::app::GridScrollState,
 ) -> Option<GridScrollIntent> {
-    pending.take()
+    state.take_layout_request().edge()
 }
 
 fn is_rating_solo(rf: &[bool; 6], idx: usize) -> bool {
@@ -17559,7 +17559,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
         let mut nav: Option<AddressBarNav> = None;
         let mut body_inner_rect = egui::Rect::NOTHING;
-        let mut egui_offset_y = self.scroll_offset_y;
+        let mut egui_offset_y = self.grid_scroll.offset();
         let mut hovered_preview: Option<(usize, egui::Rect)> = None;
         let mut vertical_scroll_debug = None;
         let primary_click_pos = (!suppress_primary_pointer)
@@ -17591,10 +17591,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     snapped_scroll_extent(natural_h, viewport_h, Self::DETAILS_ROW_H);
                 // このフレームで解決する要求だけを描画前に所有する。下でリング / ジェスチャが
                 // 新しく積んだ要求は次フレームまで残し、同フレーム末尾で消さない。
-                let pending_scroll =
-                    take_grid_scroll_for_current_layout(&mut self.pending_grid_scroll);
-                self.scroll_offset_y =
-                    resolve_grid_scroll_offset(self.scroll_offset_y, max_offset, pending_scroll);
+                let pending_scroll = take_grid_scroll_for_current_layout(&mut self.grid_scroll);
+                self.grid_scroll.adopt_offset(resolve_grid_scroll_offset(
+                    self.grid_scroll.offset(),
+                    max_offset,
+                    pending_scroll,
+                ));
 
                 let old_scroll_style = ui.spacing().scroll;
                 ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
@@ -17605,7 +17607,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     })
                     .id_salt("details_list_vertical")
                     .auto_shrink([false, false])
-                    .vertical_scroll_offset(self.scroll_offset_y)
+                    .vertical_scroll_offset(self.grid_scroll.offset())
                     .show_viewport(ui, |ui, viewport| {
                         self.last_viewport_h = viewport.height();
 
@@ -17730,9 +17732,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
         // Commit this list's ScrollArea result before background actions can
         // replace the list and establish the destination's own scroll position.
-        if (egui_offset_y - self.scroll_offset_y).abs() > Self::DETAILS_ROW_H * 0.5 {
-            self.scroll_offset_y =
-                (egui_offset_y / Self::DETAILS_ROW_H).round() * Self::DETAILS_ROW_H;
+        if (egui_offset_y - self.grid_scroll.offset()).abs() > Self::DETAILS_ROW_H * 0.5 {
+            self.grid_scroll
+                .adopt_offset((egui_offset_y / Self::DETAILS_ROW_H).round() * Self::DETAILS_ROW_H);
         }
 
         self.start_grid_background_mouse_ring_flick_if_pressed(ctx, body_inner_rect);
@@ -19464,8 +19466,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     pub(crate) fn render_grid(&mut self, root_ui: &mut egui::Ui) -> Option<AddressBarNav> {
         let ctx = &root_ui.ctx().clone();
         self.begin_grid_click_input_frame(ctx);
-        let scroll_to = self.scroll_to_selected;
-        self.scroll_to_selected = false;
+        let scroll_to = self.grid_scroll.take_reveal();
         if self.settings.grid_view_mode != GridViewMode::Details
             && self.details_hover_thumb_viewport_open
         {
@@ -19526,7 +19527,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 if self.items.is_empty() {
                     let collection_message = self.collection_grid_empty_message();
                     let staged_smart_message = self.staged_smart_loading_message();
-                    self.pending_grid_scroll = None;
+                    self.grid_scroll.clear_edge();
                     // ZIP / PDF 非同期列挙中は「読み込み中…」にして待ち状態を明示する。
                     // BS や Ctrl+↑↓ はこの間でも受理され、load_folder 側で pending が
                     // Drop されて worker が cancel する。
@@ -19618,7 +19619,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 }
 
                 if self.visible_indices.is_empty() {
-                    self.pending_grid_scroll = None;
+                    self.grid_scroll.clear_edge();
                     ui.centered_and_justified(|ui| {
                         let message = if self.items_are_bookmark_view {
                             "条件に一致するブックマークはありません".to_owned()
@@ -19713,9 +19714,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 if (cell_w - self.last_cell_size).abs() > 0.5
                     || (cell_h - self.last_cell_h).abs() > 0.5
                 {
-                    let before = self.scroll_offset_y;
-                    self.scroll_offset_y = (self.scroll_offset_y / cell_h).round() * cell_h;
-                    self.log_rating_grid_scroll("layout-row-snap", before, self.scroll_offset_y,
+                    let before = self.grid_scroll.offset();
+                    self.grid_scroll.set_position((self.grid_scroll.offset() / cell_h).round() * cell_h);
+                    self.log_rating_grid_scroll("layout-row-snap", before, self.grid_scroll.offset(),
                         (cols, cell_w, cell_h, ui.available_height().max(0.0)));
                     clear_grid_touch_scroll_remainder(ctx);
                     self.last_cell_size = cell_w;
@@ -19743,20 +19744,19 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 // セル寸法と最大 offset が確定した時点でだけ要求を所有する。これより後に
                 // リング / ジェスチャが積んだ要求は次フレームで処理する。
                 let pending_scroll =
-                    take_grid_scroll_for_current_layout(&mut self.pending_grid_scroll);
-                let before_clamp = self.scroll_offset_y;
-                self.scroll_offset_y =
-                    resolve_grid_scroll_offset(self.scroll_offset_y, max_offset, pending_scroll);
-                if scroll_to || (before_clamp - self.scroll_offset_y).abs() > 0.5 {
+                    take_grid_scroll_for_current_layout(&mut self.grid_scroll);
+                let before_clamp = self.grid_scroll.offset();
+                self.grid_scroll.adopt_offset(resolve_grid_scroll_offset(self.grid_scroll.offset(), max_offset, pending_scroll));
+                if scroll_to || (before_clamp - self.grid_scroll.offset()).abs() > 0.5 {
                     self.log_rating_grid_scroll(
                         &format!("layout-clamp intent={pending_scroll:?} max={max_offset:.1}"),
-                        before_clamp, self.scroll_offset_y, (cols, cell_w, cell_h, viewport_h));
+                        before_clamp, self.grid_scroll.offset(), (cols, cell_w, cell_h, viewport_h));
                 }
 
-                let before_touch = self.scroll_offset_y;
+                let before_touch = self.grid_scroll.offset();
                 let scroll_state = grid_touch_scroll_state(
                     ctx,
-                    self.scroll_offset_y,
+                    self.grid_scroll.offset(),
                     cell_h,
                     self.items_generation,
                 );
@@ -19772,7 +19772,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 {
                     let elapsed = snap_now.saturating_duration_since(started_at);
                     let position = grid_touch_snap_position_at(animation, elapsed);
-                    self.scroll_offset_y = position.anchor_y;
+                    self.grid_scroll.adopt_offset(position.anchor_y);
                     fractional_drag_y = position.remainder_y;
                     glide_advanced = true;
                     if elapsed >= GRID_TOUCH_SNAP_GLIDE_DURATION {
@@ -19807,12 +19807,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             {
                                 crate::logger::log(format!(
                                     "[TOUCH-DEBUG] grid_scroll_glide_interrupt cause=scroll anchor={:.2} remainder={fractional_drag_y:.2}",
-                                    self.scroll_offset_y
+                                    self.grid_scroll.offset()
                                 ));
                             }
-                            let before_y = self.scroll_offset_y + fractional_drag_y;
+                            let before_y = self.grid_scroll.offset() + fractional_drag_y;
                             let position = apply_grid_touch_scroll_delta(
-                                self.scroll_offset_y,
+                                self.grid_scroll.offset(),
                                 fractional_drag_y,
                                 delta_y,
                                 cell_h,
@@ -19824,20 +19824,20 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 after_y,
                                 previous_direction,
                             );
-                            self.scroll_offset_y = position.anchor_y;
+                            self.grid_scroll.adopt_offset(position.anchor_y);
                             fractional_drag_y = position.remainder_y;
                             touch_scroll_phase =
                                 GridTouchScrollPhase::Contact { direction };
                             touch_input_changed = true;
                         }
                         crate::touch_input::TouchCommand::ScrollGridEnd => {
-                            let before_y = self.scroll_offset_y + fractional_drag_y;
+                            let before_y = self.grid_scroll.offset() + fractional_drag_y;
                             let direction = match touch_scroll_phase {
                                 GridTouchScrollPhase::Contact { direction } => direction,
                                 GridTouchScrollPhase::Glide { .. } => None,
                             };
                             let plan = plan_grid_touch_snap(
-                                self.scroll_offset_y,
+                                self.grid_scroll.offset(),
                                 fractional_drag_y,
                                 cell_h,
                                 max_offset,
@@ -19853,7 +19853,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                             cell_h * GRID_TOUCH_SNAP_GLIDE_MIN_TRAVEL_RATIO
                                         ));
                                     }
-                                    self.scroll_offset_y = position.anchor_y;
+                                    self.grid_scroll.adopt_offset(position.anchor_y);
                                     fractional_drag_y = position.remainder_y;
                                     touch_scroll_phase =
                                         GridTouchScrollPhase::Contact { direction: None };
@@ -19868,7 +19868,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                             GRID_TOUCH_SNAP_GLIDE_DURATION.as_millis()
                                         ));
                                     }
-                                    self.scroll_offset_y = animation.start.anchor_y;
+                                    self.grid_scroll.adopt_offset(animation.start.anchor_y);
                                     fractional_drag_y = animation.start.remainder_y;
                                     touch_scroll_phase = GridTouchScrollPhase::Glide {
                                         animation,
@@ -19919,7 +19919,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         animation,
                         snap_now.saturating_duration_since(started_at),
                     );
-                    self.scroll_offset_y = position.anchor_y;
+                    self.grid_scroll.adopt_offset(position.anchor_y);
                     fractional_drag_y = position.remainder_y;
                     touch_scroll_phase = GridTouchScrollPhase::Contact { direction: None };
                     touch_input_changed = true;
@@ -19941,13 +19941,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         GridTouchScrollPhase::Glide { .. } => None,
                     };
                     let position = settle_grid_touch_scroll(
-                        self.scroll_offset_y,
+                        self.grid_scroll.offset(),
                         fractional_drag_y,
                         cell_h,
                         max_offset,
                         direction,
                     );
-                    self.scroll_offset_y = position.anchor_y;
+                    self.grid_scroll.adopt_offset(position.anchor_y);
                     fractional_drag_y = position.remainder_y;
                     touch_scroll_phase = GridTouchScrollPhase::Contact { direction: None };
                     touch_input_changed = true;
@@ -19966,20 +19966,20 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     && fractional_drag_y > GRID_TOUCH_REMAINDER_EPSILON
                 {
                     match plan_grid_touch_snap(
-                        self.scroll_offset_y,
+                        self.grid_scroll.offset(),
                         fractional_drag_y,
                         cell_h,
                         max_offset,
                         direction,
                     ) {
                         GridTouchSnapPlan::Immediate(position) => {
-                            self.scroll_offset_y = position.anchor_y;
+                            self.grid_scroll.adopt_offset(position.anchor_y);
                             fractional_drag_y = position.remainder_y;
                             touch_scroll_phase =
                                 GridTouchScrollPhase::Contact { direction: None };
                         }
                         GridTouchSnapPlan::Glide(animation) => {
-                            self.scroll_offset_y = animation.start.anchor_y;
+                            self.grid_scroll.adopt_offset(animation.start.anchor_y);
                             fractional_drag_y = animation.start.remainder_y;
                             touch_scroll_phase = GridTouchScrollPhase::Glide {
                                 animation,
@@ -19991,7 +19991,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 }
                 set_grid_touch_scroll_state(
                     ctx,
-                    self.scroll_offset_y,
+                    self.grid_scroll.offset(),
                     cell_h,
                     self.items_generation,
                     fractional_drag_y,
@@ -20017,13 +20017,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 } else if touch_input_changed {
                     ctx.request_repaint();
                 }
-                let display_scroll_offset_y = self.scroll_offset_y + fractional_drag_y;
+                let display_scroll_offset_y = self.grid_scroll.offset() + fractional_drag_y;
                 if grid_touch_scroll_diagnostic_changed(
-                    before_touch, self.scroll_offset_y, scroll_state.phase, touch_scroll_phase,
+                    before_touch, self.grid_scroll.offset(), scroll_state.phase, touch_scroll_phase,
                 ) {
                     self.log_rating_grid_scroll(
                         &format!("touch phase={touch_scroll_phase:?} remainder={fractional_drag_y:.1}"),
-                        before_touch, self.scroll_offset_y, (cols, cell_w, cell_h, viewport_h));
+                        before_touch, self.grid_scroll.offset(), (cols, cell_w, cell_h, viewport_h));
                 }
 
                 let mut nav: Option<AddressBarNav> = None;
@@ -20444,13 +20444,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     touch_derived_pointer_activity,
                     fractional_drag_y,
                     egui_offset,
-                    self.scroll_offset_y,
+                    self.grid_scroll.offset(),
                     cell_h,
                 ) {
-                    let before = self.scroll_offset_y;
-                    self.scroll_offset_y = (egui_offset / cell_h).round() * cell_h;
-                    if grid_scroll_diagnostic_changed(before, self.scroll_offset_y) {
-                        self.log_rating_grid_scroll("egui-readback", before, self.scroll_offset_y,
+                    let before = self.grid_scroll.offset();
+                    self.grid_scroll.adopt_offset((egui_offset / cell_h).round() * cell_h);
+                    if grid_scroll_diagnostic_changed(before, self.grid_scroll.offset()) {
+                        self.log_rating_grid_scroll("egui-readback", before, self.grid_scroll.offset(),
                             (cols, cell_w, cell_h, self.last_viewport_h));
                     }
                 }
@@ -26513,7 +26513,7 @@ mod compute_cell_size_tests {
     #[test]
     fn grid_touch_activity_updates_prefetch_settle_and_idle_clocks() {
         let mut app = setup_app_for_test();
-        app.scroll_offset_y = 300.0;
+        app.grid_scroll.set_position(300.0);
         let before = std::time::Instant::now();
 
         app.note_grid_touch_scroll_activity();
@@ -26543,14 +26543,61 @@ mod compute_cell_size_tests {
     }
 
     #[test]
-    fn grid_scroll_claim_does_not_clear_request_enqueued_later_in_same_frame() {
-        let mut pending = Some(GridScrollIntent::Top);
+    fn details_header_sort_reveal_survives_geometry_claim_until_next_layout() {
+        let mut app = setup_app_for_test();
+        app.items = (0..60)
+            .map(|i| GridItem::Folder(PathBuf::from(format!(r"C:\scroll-header\{i:03}"))))
+            .collect();
+        app.visible_indices = (0..app.items.len()).collect();
+        app.details_order = app.visible_indices.clone();
+        app.selected = Some(0);
+        app.items_are_drive_list = false;
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+        app.settings.details_sort_ascending = true;
+        app.grid_scroll.set_position(0.0);
+        app.grid_scroll.set_reveal_requested(false);
+        app.last_viewport_h = 4.0 * App::DETAILS_ROW_H;
 
-        let claimed = take_grid_scroll_for_current_layout(&mut pending);
-        pending = Some(GridScrollIntent::Bottom);
+        // render_grid claims reveal before draw_details_header invokes this handler.
+        assert!(!app.grid_scroll.take_reveal());
+        app.set_details_sort_key(crate::settings::DetailsSortKey::Name);
+        assert_eq!(app.details_order.last(), Some(&0));
+        assert!(app.grid_scroll.reveal_requested());
+        let (_, max_offset) = snapped_scroll_extent(
+            app.items.len() as f32 * App::DETAILS_ROW_H,
+            app.last_viewport_h,
+            App::DETAILS_ROW_H,
+        );
+        let pending = take_grid_scroll_for_current_layout(&mut app.grid_scroll);
+        let offset = resolve_grid_scroll_offset(app.grid_scroll.offset(), max_offset, pending);
+        app.grid_scroll.adopt_offset(offset);
+        assert_eq!(app.grid_scroll.offset(), 0.0);
+        assert!(
+            app.grid_scroll.reveal_requested(),
+            "the header action belongs to the next reveal pass"
+        );
+
+        assert!(app.grid_scroll.take_reveal());
+        app.apply_scroll_to_selected(1, App::DETAILS_ROW_H);
+        let pending = take_grid_scroll_for_current_layout(&mut app.grid_scroll);
+        let offset = resolve_grid_scroll_offset(app.grid_scroll.offset(), max_offset, pending);
+        app.grid_scroll.adopt_offset(offset);
+        assert_eq!(app.grid_scroll.offset(), max_offset);
+        assert!(!app.grid_scroll.reveal_requested());
+        assert_eq!(app.selected, Some(0));
+    }
+
+    #[test]
+    fn grid_scroll_claim_does_not_clear_request_enqueued_later_in_same_frame() {
+        let mut state = crate::app::GridScrollState::default();
+        state.request_edge(GridScrollIntent::Top);
+
+        let claimed = take_grid_scroll_for_current_layout(&mut state);
+        state.request_edge(GridScrollIntent::Bottom);
 
         assert_eq!(claimed, Some(GridScrollIntent::Top));
-        assert_eq!(pending, Some(GridScrollIntent::Bottom));
+        assert_eq!(state.pending_edge(), Some(GridScrollIntent::Bottom));
     }
 }
 
@@ -27166,14 +27213,14 @@ mod collection_toolbar_interaction_tests {
             .unwrap();
         app.selected = Some(video_index);
         app.checked.insert(video_index);
-        app.scroll_offset_y = 246.5;
+        app.grid_scroll.set_position(246.5);
         let held_surface = app.top_level_grid_view.surface().clone();
         let held_folder = app.current_folder.clone();
         let held_address = app.address.clone();
         let held_generation = app.items_generation;
         let held_selected = app.selected;
         let held_checked = app.checked.clone();
-        let held_scroll = app.scroll_offset_y;
+        let held_scroll = app.grid_scroll.offset();
         let held_history_back = app.folder_history_back_target().cloned();
         let held_history_forward = app.folder_history_forward_target().cloned();
 
@@ -27206,7 +27253,7 @@ mod collection_toolbar_interaction_tests {
         assert_eq!(app.items_generation, held_generation);
         assert_eq!(app.selected, held_selected);
         assert_eq!(app.checked, held_checked);
-        assert_eq!(app.scroll_offset_y, held_scroll);
+        assert_eq!(app.grid_scroll.offset(), held_scroll);
         assert_eq!(app.folder_history_back_target(), held_history_back.as_ref());
         assert_eq!(
             app.folder_history_forward_target(),
@@ -28112,7 +28159,7 @@ mod grid_reclick_open_tests {
             let mut harness = rating_selection_harness(view);
             let app = &mut harness.state_mut().app;
             app.checked.insert(0);
-            app.scroll_to_selected = false;
+            app.grid_scroll.set_reveal_requested(false);
             assert!(app.set_rating(1, 4));
             assert_eq!(app.fullscreen_idx, Some(2));
             assert_eq!(app.selected, Some(2));
@@ -28121,7 +28168,7 @@ mod grid_reclick_open_tests {
                 Some(GridClickSelectionAnchor::new(2, app.items_generation))
             );
             assert_eq!(app.checked, HashSet::from([0]));
-            assert!(app.scroll_to_selected);
+            assert!(app.grid_scroll.reveal_requested());
             click_cell(&mut harness, 0, egui::Modifiers::SHIFT);
             assert_eq!(harness.state().app.checked, HashSet::from([0, 2]));
             assert_eq!(harness.state().activations, 0);
@@ -28175,7 +28222,7 @@ mod grid_reclick_open_tests {
                 app.grid_click_selection_anchor,
                 Some(GridClickSelectionAnchor::new(1, app.items_generation))
             );
-            assert!(app.scroll_to_selected);
+            assert!(app.grid_scroll.reveal_requested());
             click_cell(&mut harness, 1, egui::Modifiers::SHIFT);
             assert_eq!(harness.state().app.checked, HashSet::from([1]));
             assert_eq!(harness.state().activations, 0);
@@ -28212,9 +28259,9 @@ mod grid_reclick_open_tests {
             };
             app.grid_click_selection_anchor =
                 Some(GridClickSelectionAnchor::new(click, app.items_generation));
-            app.scroll_to_selected = false;
-            app.pending_grid_scroll = Some(GridScrollIntent::Bottom);
-            app.scroll_selected_to_rows_above = Some(3);
+            app.grid_scroll.set_reveal_requested(false);
+            app.grid_scroll.request_edge(GridScrollIntent::Bottom);
+            app.grid_scroll.set_row_anchor(Some(3));
             assert!(app.set_rating(1, 4));
             assert_eq!(app.fullscreen_idx, None);
             assert_eq!(app.selected, Some(target));
@@ -28222,9 +28269,12 @@ mod grid_reclick_open_tests {
                 app.grid_click_selection_anchor,
                 Some(GridClickSelectionAnchor::new(target, app.items_generation))
             );
-            assert!(app.scroll_to_selected);
-            assert_eq!(app.pending_grid_scroll, Some(GridScrollIntent::Bottom));
-            assert_eq!(app.scroll_selected_to_rows_above, Some(3));
+            assert!(app.grid_scroll.reveal_requested());
+            assert_eq!(
+                app.grid_scroll.pending_edge(),
+                Some(GridScrollIntent::Bottom)
+            );
+            assert_eq!(app.grid_scroll.row_anchor(), Some(3));
             click_cell(&mut harness, click, egui::Modifiers::SHIFT);
             assert_eq!(harness.state().app.checked, HashSet::from([0, 2]));
             assert_eq!(harness.state().activations, 0);
@@ -28383,9 +28433,9 @@ mod grid_reclick_open_tests {
             let app = &mut harness.state_mut().app;
             app.selected = Some(2);
             app.checked = HashSet::from([1]);
-            app.scroll_to_selected = false;
-            app.pending_grid_scroll = Some(GridScrollIntent::Bottom);
-            app.scroll_selected_to_rows_above = Some(3);
+            app.grid_scroll.set_reveal_requested(false);
+            app.grid_scroll.request_edge(GridScrollIntent::Bottom);
+            app.grid_scroll.set_row_anchor(Some(3));
             let before = app.capture_rating_membership();
             app.items.swap(0, 2);
             app.bump_items_generation();
@@ -28398,9 +28448,12 @@ mod grid_reclick_open_tests {
             assert_eq!(app.fullscreen_idx, Some(1));
             assert_eq!(app.selected, Some(0));
             assert_eq!(app.checked, HashSet::from([1]));
-            assert!(!app.scroll_to_selected);
-            assert_eq!(app.pending_grid_scroll, Some(GridScrollIntent::Bottom));
-            assert_eq!(app.scroll_selected_to_rows_above, Some(3));
+            assert!(!app.grid_scroll.reveal_requested());
+            assert_eq!(
+                app.grid_scroll.pending_edge(),
+                Some(GridScrollIntent::Bottom)
+            );
+            assert_eq!(app.grid_scroll.row_anchor(), Some(3));
             click_cell(&mut harness, 1, egui::Modifiers::SHIFT);
             assert_eq!(harness.state().app.checked, HashSet::from([1, 2]));
             assert_eq!(harness.state().activations, 0);
@@ -28429,7 +28482,7 @@ mod grid_reclick_open_tests {
             );
             assert_eq!(app.fullscreen_idx, Some(0));
             assert_eq!(app.selected, Some(0));
-            assert!(app.scroll_to_selected);
+            assert!(app.grid_scroll.reveal_requested());
             click_cell(&mut harness, 0, egui::Modifiers::SHIFT);
             assert_eq!(harness.state().app.checked, HashSet::from([0]));
             assert_eq!(harness.state().activations, 0);
