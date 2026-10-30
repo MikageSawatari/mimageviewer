@@ -19,9 +19,12 @@ MainGridの混在入力中断はrecognizerだけを終え、backendのgateを勝
 Endのsynthetic releaseはraw End座標ではなくbackendの最後のcursor位置で厳密に照合し、
 cursorなしではGoneだけを待つ。旧scopeの正常なtailで現在接点を取り消さない。
 セルのclick／double-clickも実TouchFrameのrelease所属へ接続する。後続pressで変わるResponse座標に依存せず、
-frame-localなprimary-release ordinalで最後のclick-bearing releaseへ対応させ、
-曖昧Currentが除去されてもRetiredの序数を維持する。Stillの非click drag終端は最後のterminal releaseへ対応する。
-検証と制限は [再修正台帳](scroll-661-investigation.md#implementation-review-revise) を参照。
+frame-localなprimary-release ordinalでそのframeの全click-bearing releaseを照合する。
+旧touch由来のcell応答は全click-bearing releaseがRetiredの場合だけ抑止し、Mouseを含む混在frameは
+v4.10.0のpointer fallbackを維持する（設計担当判断 2026-10-30、§1.487）。曖昧Currentの除去後も序数は詰めず、
+所属不明をRetiredとは扱わない。既存Current gestureの抑止要求と、Stillの非click drag終端の最後のterminal
+releaseへの対応は維持する。press区間の推測やegui中核interactionの変更はしない。
+検証と制限は [再修正台帳](scroll-661-investigation.md#implementation-review-mixed-release) を参照。
 
 通常drive・StillFullscreen・transport-only・replayは当該viewportの `ctx.cumulative_frame_nr()` を使う。
 MainGrid非描画時は共通end-pass observerがtransportだけ観測し、discard後の再生ではcommandsを再配送しない。

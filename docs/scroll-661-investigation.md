@@ -324,6 +324,20 @@ touch の描画位置 = canonical + 既存の一時 remainder
 - `DrivenSurface` と replay result の既存フレーム印にも MainGrid の所属を含める。**通常drive・transport-only・replayは、すべて同じviewportの `ctx.cumulative_frame_nr()` を共有する。** 現 `ui_main.rs:19512` 付近の `self.frame_counter` を渡す経路はこのviewport番号へ接続する。`App::input_frame_diagnostics`（`update_phases.rs:1748`付近）はApp更新呼出しごとにcounterを増やすため、同一egui frameのdiscard / 複数passの再生判定には使わない。App全体のcounterとその既存用途は変更せず、touchの共有駆動印を使うStillFullscreen側も同じviewport番号で照合する。別viewportの値は混ぜない。
 - 同じ `ctx.cumulative_frame_nr()` の後続passでsessionが替わっても、既に駆動したイベントを新規Startとして再駆動しない。コマンドは再配送せず、Retiredの相関・抑止情報を保つ。描画前に採用した宛先へ初めてdriveする場合は、そのframeの新Startを宛先で受理する。次のviewport frameでは新規入力を通常受理する。
 
+**同frameのtouch／mouse混在についての設計補足（設計担当判断 2026-10-30）**:
+旧touch由来のセルclickは、そのframeのclick-bearing primary releaseがすべてRetiredの場合だけ抑止する。
+同frameにMouseのclick-bearing releaseが一つでもあれば抑止せず、v4.10.0のpointer fallbackを保つ。
+曖昧Currentの除去で所属を証明できないreleaseも、Retiredとはみなさない。判定は既存のframe-localな
+`PrimaryOwnership`とrelease ordinalで行い、press区間の推測、追加bool／pending／guardは使わない。
+非clickのmouse releaseはこの混在判定へ数えず、clickがないStill dragのterminal抑止と、
+既存Current gestureが要求する抑止は維持する。
+
+これにより、mouse click→旧第二指の孤立releaseでもmouse clickを受理する。一方、旧touchのcaptureを
+releaseした後にwidgetのない場所でmouseをpress→releaseする同frame列では、旧cell clickも適用される。
+この特殊な混在は§1.487に含め、今回の>>661で隔離完了とは扱わない。混在しない旧touch releaseは引き続き拒否する。
+eguiの`interaction.rs::interact`から実click発生元の序数をsnapshotへ記録する案は、egui中核への変更と
+上流更新時の保守負担が>>661の目的に対して大きいため不採用とした。vendorの許可範囲は広げない。
+
 入力のない A→B→A や同一 path の A/B でも session 自体が変わるため、この境界を通る。一時 mount / deposit で session は変えない。実 park では既存 lifecycle が MainGrid recognizer の実行権限を終了し、復帰で old contacts を再利用しない。MainGrid を描画しない区間に raw tail が配送される場合も、当該 viewport の frame 終端に、MainGrid の通常 drive がなかった場合だけ同じ transport tracker を観測継続する（コマンド生成はしない）。既存 frame 印を `Driven(owner) | TransportOnly` の一つの処理結果へ拡張し、**この終端観測も同じviewportの `ctx.cumulative_frame_nr()` で記録する**。観測・通常 drive・replay で同じイベントを二度相関させる別 queue / bool を作らない。transport-only の後に discard で表示先が変わっても、その frame の入力を新たな Start として再実行しない。StillFullscreen の command 駆動印を transport-only 観測で上書きせず、同 tracker の処理済み情報として記録する。StillFullscreen や兄弟 viewport の入力を消費・reset しないことも R2 の対照に含める。
 
 ### 5. 比較した別案と簡素化
@@ -338,6 +352,7 @@ touch の描画位置 = canonical + 既存の一時 remainder
 | interaction ID を session で交換 / 新 press を別 ID へ移送 | 一見簡単に旧 capture を分離できる | 初版の交換案は事前 hit-test 済みの新 press も失うため撤回。移送案は potential click / drag・snapshot・複数 pass の整合まで変更する必要がある。安定 ID と局所的な所属により、egui 全体の capture 再配送を不要にする |
 | hydration 完了を最初の描画後へ遅延 / 復元を毎 frame 再注入 | 観測順序を合わせやすい | 完了順序の組み合わせを温存し、新 pending や入力との競合を増やす。禁止された症状隠しなので不採用 |
 | フォルダ移動・詳細取得をモーダル化 / 一覧を閉じて開き直す | 非同期の組み合わせを減らせる | 普通の閲覧を待たせ、選択・scrollbar 操作を中断する。現在 geometry と位置更新を一つの同期境界へ揃えれば順序差そのものが問題にならず、閲覧の制限は不要 |
+| egui interactionへ実click発生元の序数を追加 | 同frame混在時もnativeの実captureとreleaseを厳密に対応できる | 不採用。中核interactionへのvendor差分と保守負担が今回の目的に対して大きい。同frameのtouch／mouse混在を§1.487へ集約し、Mouse click-bearing releaseを含む場合は既存pointer fallbackを維持することで状態の組み合わせを減らす |
 
 簡素化として採るのは、**geometry と位置の確定点を一つにし、request の owner を一つにすること**である。「復元済み×旧 bounds×ばね適用済み」を後から修復する状態を作らない。rare I/O failure の回復・retry 設計は対象外で、既定の割り切り方針に従う。
 
@@ -398,6 +413,12 @@ DB / sidecar / archive / 設定の schema・保存値の意味は変更せず mi
 **R1（P2-1と第2版の残P2、段Cの受入）**: 実 `Context` を前 frame から走らせ、background / bar の transport widget を登録する。宛先を採用する frame に実 `PointerButton::Pressed` を与え、その frame の egui capture が安定 ID に配送されたことを確認する。**切替＋press → 次 frame の move → release**を通し、宛先で drag / bar が動き、押し直しなしで完了することを両 renderer で検査する。さらに必須ケースとして、**旧background dragを成立させる → 宛先切替frameに旧release→同じbackground IDへの新press → 次frameのmove→release**を通す。切替frameのResponseでdown / dragged / started / stopped / clickの証拠が欠ける条件を確認しながら、実 `potential_drag_id` は当該background IDを保持し、新しいpress stampと宛先所属が記録されること、旧releaseから速度を引き継がず、新press以後の操作が押し直しなしで動くことを検査する。barの同様の再押下と、別widgetへ新pressが届く非横取り対照も追加する。旧一覧で既にpress → 切替＋move → releaseのまま新pressがない場合は、宛先の位置・release velocityが変わらないことを確認する。同contextのFolder、同path A/B、同viewportのcontext交代、詳細↔サムネイルで実施する。同一一覧のdrag継続、追加buttonで旧所属を再取得しないこと、discardで同じpressを宛先へ再所属させないことも含める。ID交換だけの変異、新pressの証明をResponseだけに戻す変異、所属検査を外す変異をそれぞれ検出する。
 
 **R2（P2-2、段Cの受入）**: `TouchRecognizer` だけへの偽 command 注入ではなく、実 `Touch` と egui-winit と同じ synthetic pointer 列 → `drive_egui_touch_input` → MainGrid command 消費 → 実 layout を通す。旧 Start / Move で GridScroll（別ケースで Pinch）を成立させ、一覧切替後の旧 Move / End / Cancel が `ScrollGrid` / `ScrollGridEnd` / `Zoom` / tap を宛先へ出さず、canonical・端数・列数を変えないことを確認する。旧接点がまだ down の間に別 TouchId の新 Start / Move を入れ、新 session の scroll が実際に動くこと、旧 Cancel がこの新接点を消さないことも検査する。同一 path の A/B、描画を挟まない A→B→A、driver 後に採用される旧 batch、切替 frame の新 Start、後続 pass の replay を含める。未描画 / park 区間で旧 tail を観測してから復帰し、新 Start が相関できること、旧 synthetic release が mouse click / native coast に化けないことを確認する。StillFullscreen・別 viewport・実 mouse の既存試験を対照とし、fraction の session 検査だけを残して recognizer 境界を戻す変異を検出する。
+
+R2のnative入力隔離には§1.487の混在例外を適用する（2026-10-30設計補足）。同frameのclick-bearing
+primary releaseがすべてRetiredなら旧cell応答を拒否し、Mouseを含む場合は抑止しない。
+両rendererのmouse click→旧第二指の孤立releaseの回帰は期待値を維持して通す。旧cell releaseのみの四件と
+異座標Endの二件も必須とする。旧touch release→capture先のないmouse clickという反例は、
+抑止しない許容挙動を実Contextで検査する。既存の旧第二指Move混入も§1.487の別枠として保持する。
 
 R2には第2版のP3に対する **実Appのdiscard回帰**も必須とする。固定frame番号を渡す局所試験だけで済ませず、Full-frame headlessの実App update / renderから `ctx.request_discard` を通す。同一viewportの複数passでAppの `frame_counter` が進んでも `ctx.cumulative_frame_nr()` は同じであること、通常drive / transport-only / replayが同じ番号を読み、同じraw入力からのcommand生成・適用が一度だけであることを検査する。pass間にsession / 表示先を変えたケースでも旧入力を新規Startとして再認識せず、相関・Retired抑止を維持する。次のviewport frameの新しい入力は受理する。別viewportの独立したframe番号・処理を混同しない対照も含める。touchの番号だけを `self.frame_counter` に戻す変異で、実Appの二重駆動または誤った再受理を検出する。
 
@@ -1106,3 +1127,77 @@ cargo nextest run -p mimageviewer --lib -E 'test(/mouse_click_before_retired_orp
 今回の未解決相違を直した実装としてのfeature check／focused→full／snapshot／auditは未完了であり、
 前節の成功を今回の修正完了の根拠にはしない。vendor・製品起動・desktop操作・実profile・commitは変更／実行していない。
 独立レビューはClaudeCodeが別に依頼する。本節に独立レビューの合格判断は含めない。
+
+<a id="implementation-review-mixed-release"></a>
+
+### 同frameのtouch／mouse混在を§1.487へ集約した再修正（2026-10-30）
+
+設計担当から、前節の`interaction.rs`案は採らず、同frameの混在入力を§1.487へ含める判断を受けた。
+中核interactionのvendor差分と上流更新時の保守負担が>>661の目的に対して大きいため、
+実clickのrelease発生元をAppで推測しない規則へ簡素化する。開始時HEADは `258cd57a1`、作業ツリーはclean。
+前節の停止記録とREDは当時の証跡として保持し、本節が現在の仕様・実装を示す。
+
+#### 所有境界と許容する挙動
+
+`TouchFrame::should_suppress_response` は既存release ordinalでframeの全click-bearing primary releaseを
+既存`PrimaryOwnership`へ対応させる。旧touch由来のセル応答は、すべてRetiredの場合だけ抑止する。
+Mouseが一つでもあれば抑止しない。曖昧Currentが除去されて所属を証明できないreleaseも抑止根拠にせず、
+ordinary pointer fallbackを維持する。クリックのない場合は、従来どおり最後のterminal releaseを用いる。
+共通helperを使うStillFullscreen等の既存Current gestureの`should_suppress`要求も保持する。
+状態field／bool／pending／guard／queueは増やさず、press区間の候補は使わない。
+新Held、一般のmouse混在によるrecognizer中断、transport照合、eguiのcapture配送を変更しない。
+
+- mouse click→旧第二指の孤立releaseでは本物mouseのcell clickを適用する。
+- 混在しない旧touch releaseは引き続きcellへ適用しない。
+- 旧touchのcell capture→session交代→同frameに旧End／release／Gone→widgetのない場所で
+  mouseのMoved／press／releaseでは、旧cellのnative clickも抑止しない。これは設計担当判断により
+  v4.10.0と同じ許容挙動として§1.487へ残す。基点で同列を再実行したという新しい検証記録ではない。
+  既知混在操作の隔離を完了したとは扱わない。
+
+#### 回帰と文書
+
+- 両rendererの `thumbnail_mouse_click_before_retired_orphan_release_is_applied`／
+  `details_mouse_click_before_retired_orphan_release_is_applied` は入力・assertを変えずに保持する。
+- 前節の反例は `mixed_retired_capture_and_uncaptured_mouse_click_keep_v410_pointer_fallback` と改名し、
+  native capture／clicked ID／release序数・所属のassertを保持したまま、承認された「抑止しない」を期待する。
+  §1.487の許容挙動であることをコメントに明記し、ignoreしない。
+- 既存の「除去Current→Retired→任意のnonclick mouse tail」のordinal試験も、全click-bearingの所属が
+  Retiredとは証明できないため抑止しない期待へ合わせた。序数の非圧縮、各clickの有無、replay同値のassertは
+  維持し、`ambiguous_click_release_ordinals_preserve_pointer_fallback_with_nonclick_tail` と改名した。
+- 旧cellの四件、raw End異座標の二件を含むtouch全件、>>661／R1〜R4、Collection20件を対象に確認する。
+  §1.487の既存Move回帰のignore・他の期待値は変更しない。
+- 設計§4／§5、touch-support-plan、backlog §1.487を更新した。vendor／F12／context lifecycleの変更はない。
+
+#### 検証台帳
+
+全Cargoは `MSBUILDDISABLENODEREUSE=1`。製品・test sourceを固定して検証し、結果確定後は文書だけを更新した。
+
+| コマンド | 結果 | 証跡 |
+| --- | --- | --- |
+| `cargo fmt`（引数なし）／`git diff --check` | 成功 | 最終差分を確認 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/touch_correlation::/) \| test(/scroll_661::/) \| test(/collection_return::/)' --no-fail-fast --retries 0 --no-tests fail` | **91 PASS / 0 FAIL**、15.124s、exit0 | `target/scroll661-mixed-release-focused.log` |
+| `cargo check -p mimageviewer --lib --tests --features test-script` | exit0、42.514s | `target/scroll661-mixed-release-gate-feature_check.log` |
+| `.\scripts\test-focused.ps1` | 文書を含む差分のためexit2、fullへ移行 | `target/scroll661-mixed-release-gate-test_focused.log` |
+| `.\scripts\test-lib-full.ps1` | **15,006 PASS / 0 FAIL / 66 skipped**、実行549.851s、全体555.266s、exit0 | `target/scroll661-mixed-release-gate-test_lib_full.log` |
+| `cargo test --test ui_snapshot` | **214 PASS**、実行34.59s、compile込み93.783s、exit0。PNG差分なし | `target/scroll661-mixed-release-gate-ui_snapshot.log` |
+| `cargo run --locked -p viewer_context_audit` | **違反0・exit0**、83.828s | `target/scroll661-mixed-release-gate-viewer_context_audit.log` |
+
+focus runは `b8c1ed08-ed7c-4502-8ee4-0753d902d197`、full runは `ca19989d-750f-4db5-8b63-86e74846047c`。
+元>>661の4再現、R1〜R4、Collection20件、旧cell四件・異座標End二件は期待値を変えずに成功した。
+§1.487の旧Move回帰と他のignoreは変更せず、全件の除外は従来どおり66件。
+今回の混在反例はignoreせず、上記の承認された許容挙動で成功している。
+
+full source IDは `48743471e4f281c951923ca8b68c97afa8b79329a1f9a2355b3a95c73306b145`、
+receiptは `target/test-lib-full/aed9d5e20c280e0e5f182bbae34eae5056395079c23a91031922876c0a729102.json`、
+JUnit／詳細ログは `target/test-lib-full/runs/20261030T081609453Z-1f458d45/`。
+変更した唯一のRust source `src/touch_correlation.rs` のSHA-256は検証中・終了後の照合で一致する
+`b0f9120fd2362468b86e19bc31039b11d95638cacfa550daa3560091965f6eeb`。
+各gateのcommand／exit／時間は `target/scroll661-mixed-release-gates.json`、recorderは
+`target/scroll661-mixed-release-run-gates.ps1`。auditは違反診断の出力がなくexit0であり、
+ログ内のPowerShell `NativeCommandError` 表示はCargoの進捗stderrを記録した書式である。
+
+vendorは無変更で再テストしていない。公開fnの追加はなく、登録表の追加も不要。
+F12／contextのmove・swap・fork・park、rendererのgeometry、一般のmouse混在中断には変更がない。
+共通workspace fullのrelease内包exe不足による前節の未完了は継続し、今回の本体lib全件成功とは区別する。
+実機未確認。独立レビューはClaudeCodeが別に依頼する。
+製品起動・desktop操作・実profile・確認用build・commitは行っていない。

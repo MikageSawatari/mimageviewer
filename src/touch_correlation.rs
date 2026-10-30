@@ -192,33 +192,32 @@ impl TouchFrame {
         })
     }
 
-    /// Follow the release that supplied egui's click, even if a later press
-    /// changed the response's aggregate pointer position. Release ordinals
-    /// preserve this association when ambiguous current events were discarded.
+    /// Suppress a click only when every click-bearing primary release permits
+    /// suppression. A mouse release in a mixed frame keeps ordinary pointer
+    /// fallback (§1.487); egui does not expose which release supplied its click.
+    /// Release ordinals survive discarded ambiguous current events, whose
+    /// ordinary pointer fallback must also remain available.
     /// With no click, retain terminal-release suppression for viewer drags.
     pub(crate) fn should_suppress_response(&self, response: &Response) -> bool {
-        let release_ordinal = response.ctx.input(|input| {
-            let mut last_release = None;
-            let mut last_click = None;
-            for (ordinal, (_, click)) in input
-                .pointer
-                .released_buttons_with_click_counts()
-                .filter(|(button, _)| *button == PointerButton::Primary)
-                .enumerate()
-            {
-                last_release = Some(ordinal);
-                if click.is_some() {
-                    last_click = Some(ordinal);
-                }
-            }
-            last_click.or(last_release)
-        });
-        release_ordinal.is_some_and(|ordinal| {
+        let suppress_release = |ordinal| {
             self.primary_events.iter().any(|event| {
                 event.phase == PrimaryPhase::Button(false)
                     && event.release_ordinal == ordinal
                     && (event.should_suppress || event.ownership == PrimaryOwnership::Retired)
             })
+        };
+        response.ctx.input(|input| {
+            let mut last_release = None;
+            input
+                .pointer
+                .released_buttons_with_click_counts()
+                .filter(|(button, _)| *button == PointerButton::Primary)
+                .enumerate()
+                .inspect(|(ordinal, _)| last_release = Some(*ordinal))
+                .filter(|(_, (_, click))| click.is_some())
+                .map(|(ordinal, _)| suppress_release(ordinal))
+                .reduce(|all, suppress| all && suppress)
+                .unwrap_or_else(|| last_release.is_some_and(suppress_release))
         })
     }
 }
@@ -2927,7 +2926,7 @@ mod tests {
     }
 
     #[test]
-    fn retired_capture_click_is_not_reassigned_to_later_uncaptured_mouse_interval() {
+    fn mixed_retired_capture_and_uncaptured_mouse_click_keep_v410_pointer_fallback() {
         let ctx = egui::Context::default();
         let mut state = TouchCorrelationState::default();
         let old_scope = egui::Id::unique("captured-click-old");
@@ -2996,14 +2995,13 @@ mod tests {
                 && event.release_ordinal == 1
                 && event.ownership == PrimaryOwnership::Mouse
         }));
-        assert!(
-            frame.should_suppress_response(&response),
-            "the native cell click closed the retired capture; the later mouse press hit no widget"
-        );
+        // §1.487: same-frame touch/mouse mixing keeps v4.10.0 pointer fallback,
+        // including a retired click followed by a mouse press with no capture.
+        assert!(!frame.should_suppress_response(&response));
     }
 
     #[test]
-    fn response_release_ordinal_survives_removed_current_and_later_nonclick_release() {
+    fn ambiguous_click_release_ordinals_preserve_pointer_fallback_with_nonclick_tail() {
         for nonclick_tail in [false, true] {
             let ctx = egui::Context::default();
             let mut state = TouchCorrelationState::default();
@@ -3062,9 +3060,11 @@ mod tests {
                     }
                     ctx.root_ui(|ui| {
                         let response = ui.allocate_rect(ui.max_rect(), egui::Sense::click());
-                        assert!(frame.should_suppress_response(&response));
+                        // The discarded ambiguous Current release is not proof
+                        // that every click-bearing release is Retired (§1.487).
+                        assert!(!frame.should_suppress_response(&response));
                         assert!(
-                            frame
+                            !frame
                                 .replay_for_later_passes()
                                 .should_suppress_response(&response)
                         );

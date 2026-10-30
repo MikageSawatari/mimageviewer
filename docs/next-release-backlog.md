@@ -83,6 +83,7 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 基点検証: v4.10.0の `b10dc7406` をテスト用に展開し、同じ入力列・実worker・両入力の対照・実rendererを通す回帰が失敗。no-tailはnative offset756を維持、旧Moveありは756→800、直後のmouse移動も対照656に対し576となる。基点の同frame描画は756のまま、行丸め後は両方630となり、このfixtureでは差が見えない。>>661修正後はphysics後の位置でviewport／content originを確定するため同frameのviewportも800となる。この反映タイミングの差を「今回の影響なし」とは扱わない。
 - 根拠と証跡: [>>661調査書の基点比較](scroll-661-investigation.md#mixed-input-v410-baseline)。native pointer eventの由来を受理境界へつなぎ、本物mouseのcapture・慣性・直前位置を保って旧touch由来だけを隔離する設計が必要。修正案・規模は未確定。
 - 回帰は `src/app/tests/scroll_661.rs::retired_secondary_touch_move_cannot_drive_a_new_mouse_capture` を理由付きignoreで保持。基点でもState不変assertが失敗することを記録し、設計担当の指示に従って>>661の必須gateから除外する。実機イベント配送・製品画面は未確認。
+- 同frameのrelease／click混在も本項の範囲（設計担当判断 2026-10-30）。旧touchのreleaseとMouseのclick-bearing releaseが同frameに入る場合は、v4.10.0と同じくセル応答を抑止しない。例: 旧touchでcellをpress→一覧session交代→同frameに旧End／release／Gone→widgetのない場所へmouseをMoved／press／release。この場合も旧cellのnative clickは適用される。混在しない旧touch releaseは>>661の修正で拒否する。`mixed_retired_capture_and_uncaptured_mouse_click_keep_v410_pointer_fallback` はこの許容挙動を自動検査し、ignoreしない。[設計補足・再修正台帳](scroll-661-investigation.md#implementation-review-mixed-release)を参照。egui中核interactionの変更案は保守負担から不採用。
 
 ### 1.488 一覧へ戻ると保存した位置から上へ動く — 5ch >>661／コレクション帰還 (2026-10-30)
 
@@ -90,7 +91,7 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 原因: 保存位置と選択は正しく復元されるが、同じegui ScrollAreaに残る旧一覧のmaxでphysicsが復元位置をoverscrollと判定し、上へ押し戻す。詳細／サムネイル共通。非同期の復元が最初の描画より早く終わる場合に決定的に再現する。
 - 修正: canonical位置・一回要求・未消費RowAnchor・描画geometryをcontextのscroll ownerへ集約。現在extentと明示更新の意味をphysics前、描画のviewport／originをその後の位置で確定するopt-in契約を両rendererへ接続した。可視一覧と入力の寿命を分け、旧一覧の慣性・capture・touch commandを引き継がず、同一覧の正当な操作とcontextのmove／swapを保つ。遅延や毎frameの強制復元は使わない。
 - **あわせて直した既存の不具合**: 詳細表示の再読み込み・自動再走査・resumeで、保存する行位置が以前のサムネイル列数を使い、選択行の画面内位置がずれる。実列数1・行高・body viewportを同じownerへ記録して保存／復元／revealで共有した。
-- 自動検証: 実装レビューのP2四件を再修正し、barの両方向の区間順、non-rubber描画、旧cell tap、異座標Endの回帰を追加。元の4再現、R1〜R4、Collection **20件すべて成功**。最終本体全件15,003件、UI snapshot214件、vendor egui165件成功。test-script check成功、audit違反0。共通workspace full gateはrelease内包exe3点未配置で未完了。出荷前に整った環境で完走する。[再修正台帳](scroll-661-investigation.md#implementation-review-revise)を参照。
+- 自動検証: 実装レビューのP2四件と再レビューのmouse click誤抑止を再修正。元の4再現、R1〜R4、Collection **20件すべて成功**。最新の本体全件 **15,006件成功・66件除外**、UI snapshot214件成功・PNG差分なし、test-script check成功、audit違反0。今回vendorは無変更（前回egui165件成功）。同frameのtouch／mouse click混在は設計担当判断で§1.487へ含め、抑止しない許容挙動も回帰で確認した。独立再レビュー待ち。共通workspace full gateはrelease内包exe3点未配置で未完了。出荷前に整った環境で完走する。[最新の再修正台帳](scroll-661-investigation.md#implementation-review-mixed-release)を参照。
 - 別件: touchとmouseを同時に使う旧第二指のsynthetic Move誤採用は基点からの既存不具合として§1.487へ分離し、理由付きignoreで保持した。新契約では同frameの描画にも出る差がある。Windows実機・報告者環境の製品確認は未実施。
 - 根拠: [>>661調査・設計・実装記録](scroll-661-investigation.md)、[Collection帰還の調査](collection-return-investigation.md)。DB/schema変更なし。F12／兄弟contextの所有境界は[detached §11](detached-rework-plan.md#11-リワーク外からの変更記録)に記録。規模: Medium。
 
