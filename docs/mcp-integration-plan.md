@@ -904,3 +904,19 @@ cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_lev
 19件全体を通常ユーザーの full-trust context で実行する。報告されたタグ2件、新規 mapping、
 idle reader shutdown、実 core handler を使う fixture への stdio adapter 接続を含む。
 今回変更のない crate tests は ClaudeCode の round 3 full-trust 成功を再利用できる。
+
+### Round 4 の sandbox 外検証と追加レビュー (ClaudeCode、基点 `0695e9cc4`)
+
+- ClaudeCode 実行: 焦点 core nextest (上のコマンド) を 5 回連続で実行し、毎回 19/19 成功 (exit 0)。
+- 実装レビュー担当 (gpt-6.1-sol / xhigh、thread `01a18ce7`) の追加確認: P2-1・P3-4・P3-5 は修正確認、
+  P2-2・P2-3 は通常条件で修正確認。cfg(test) の待機口は製品ビルドへ漏れない。
+- 残る指摘 [P2]: 入力 queue と出力 queue が両方満杯のまま AI アプリが stdout を読まなくなると、
+  stdin reader が止まり、その後の取消・stdin 切断に気づけない。
+  **判断: 既定の割り切り方針による (CLAUDE.md「まれな失敗は既定で割り切る」)**。成立には
+  AI アプリが stdout を読まないまま 32 件超の要求を送り続ける必要があり、通常の使い方では
+  起きない (AI アプリが止まった状態)。その場合も AI アプリは終了時に子プロセスを終了させる
+  (Claude Code は Windows で stdin を閉じた 300 ms 後に process tree を終了)。利用者のデータは失われない。
+  機構は足さない。
+- legacy 接続の 1 秒ごとの Status 照会は、待機中は core 接続・permit を保持せず UI を起こさない
+  (レビュー確認)。tool 実行中も照会する点と、有効時に 1 秒 2 要求分の worker 処理がある点は
+  段階 1 で push 通知へ置き換えるか再検討する。
