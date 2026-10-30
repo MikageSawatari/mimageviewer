@@ -381,3 +381,199 @@ device loss後に同じdeviceで通知UIを描ける保証もない。安全な�
 今回の追記は文書のみなのでbuild-devは作成せず、既存headless試験も再実行しない。実装承認や実画面再現の承認をこの設計調査から推定しない。報告者へは現段階で設定変更や追加の総当たり試験を頼まず、診断を導入できた版で自然に再発した際に「画面の報告文をコピーして貼る」1操作で資料を得られる構成を目指す。
 
 限定独立レビュー（`gpt-6.1-sol` / `xhigh`）でLostとpanicの区別、終了印のGUI process所有、fatal-safe記録順序を再確認した。指摘された `--play-test` の直接終了とsnapshotの複数thread整合性を上記へ反映。製品変更はなく、文書の `git diff --check` が成功。
+
+## 確定設計 (2026-10-30)
+
+対象は [backlog §1.482](next-release-backlog.md)。ClaudeCode の範囲決定と、独立設計レビュー REVISE の P2 4件を反映した設計の正本とする。**この節の確定は実装完了・独立レビューの再受入れを意味しない。製品コードはまだ変更しない。** >>655 の原因は引き続き未特定。
+
+前節の比較・調査記録は履歴として残すが、競合する提案は本節で置き換える。特に (c) の fatal reader 用 atomic snapshot publication、ring、seqlock、二重 buffer は作らず、fatal handler は最新の表示・job・GPU 状態を読まない。「直前」「採取0.8秒前」という旧例も鮮度の保証には使わない。
+
+### 1. 採用範囲と簡素化
+
+- (a) GUI core の終了印と、次回起動の消えない通知・詳細・コピーを追加する。
+- (c) 通常の背景 worker が必要な活動期間だけ、目標約1秒周期で小さな checkpoint を置換保存する。最新値へ coalesce し、イベント全履歴は持たない。panic/native の短い観測は別 sink、device loss は単一 atomic latch から通常 worker が保存する。
+- (b) Result として捕まえられる ORT 失敗は、現役 job の所有 context に既存 feedback で即時通知する。
+- device 再作成、再推論、再試行、AI 無効化、キャッシュ一括破棄、監視 process、dump/WER の自動収集を追加しない。既存の推論・先読み・取消・PDF orphan・表示・tray の挙動を維持する。
+
+簡素化の検討: 診断のために閲覧をモーダル化すると、AI 完了前のページ移動という既存機能を制限するため採用しない。代わりに、正常時の保存を単一 owner/writer に集約し、fatal 時との snapshot 受渡しをなくす。参考状態が古い・欠落することを仕様として表示する。パネルは前回1件の不変な表示モデルを描き、現在の閲覧状態への live 追従は作らない。
+
+まれな保存・置換・初期化の失敗は、今回の範囲決定に従い**通常経路でログのみ**とする。追加の通知・回復 UI、再試行、保存完了を待つ追加機構、設定や保存済みユーザーデータの削除・再作成は入れない。handler 内は失敗ログさえ出さない。保存失敗を別の原因分類に細分化しない。
+
+### 2. GUI run の所有・終了印・保存 worker の寿命（P2-4）
+
+#### admission と対象外
+
+`main` が未 admission の診断 owner（仮称 `GuiRunDiagnostics`）を作り、`lib::run` に明示的に渡す。owner 自体の作成には I/O を伴わせない。既存 startup run ID に **core role + core PID + core 開始時刻**を加えた組を GUI run の identity とする。launcher と run ID を共有しても別 process を混同せず、PID だけの一致を採用しない。startup crate から必要な identity/保存先だけを受け取る小 API を追加し、startup の terminal を clean 印の代用にしない。
+
+対象は data_dir が確定し、通常 single-instance の first admission に成功した GUI core のみ。二重起動 activation は admission 前に戻し、前回資料の読取り・消費・rotation・今回印の作成を一切しない。launcher、help/version、PDF worker、TensorRT build/infer worker、`--trt-smoke-test` も対象外とする。
+
+`--play-test`、実際に `--test-script` を実行する mode、`--dcomp-presenter-test` は、single-instance 迂回や直接 exit の有無にかかわらず**通常の終了印・前回通知から除外**する。test-script feature 付きでも通常起動なら対象。除外 mode は通常の終了印/checkpoint/前回通知資料を読まず書き換えず、既存 test evidence と詳細ログは維持する。診断自体の検証には後述の一時 data_dir 専用 fixture を使い、この除外を製品フラグで迂回しない。
+
+first admission の guard は run のローカル変数だけに置かず、main の診断 owner に移して最終化まで保持する。run が戻ってから clean 保存までに次の通常起動が割り込まないようにする。生存 lease がある run は未終了として扱い、異常終了通知を作らない。
+
+#### 起動と保存先
+
+admission 後、診断 worker を1本起動する。通常版は既存 startup と同じ保存先解決（LOCALAPPDATA）、portable/明示 data_dir/fixture はその data 配下を用い、namespace は解決済み data_dir ごとに分ける。設定 DB への bool 追加や既存詳細ログの全件読取りはしない。
+
+worker の初期化順序は **前回小資料・対応 native 区間を上限付きで読む → schema/run/lease を検査して前回表示モデルをメモリへ確保 → 今回の記録先を準備 → Running を一度保存 → 必要な古い診断資料を整理**。native recorder の今回 open/rotation/登録も、この前回資料確保より後へ移す。通常 logger の本文や旧 panic.log は今回要約の採用元にしない。UI は初期化完了を非blocking poll し、worker を待たず起動を続ける。事前 open が完了する前の異常は新しい小証拠を残せない限界として扱う。既存の詳細 panic hook はその間も維持する。
+
+保存は今回/前回の2 run 分だけ。run 固有の記録先と、今回を指す小さな参照を worker が管理する。checkpoint/終了印は同じ小ファイルを一時ファイル経由で置換する。run ごとの保存先にすることで、終了予算を超えて残った旧 worker の I/O が新 run のファイルや参照を上書きしない。終了開始後は参照の更新・世代整理を行わない。参照・各ファイルのサイズ、schema、件数、identity を検査し、不明・破損・欠落は不明として扱う。資料のない旧版からの初回起動では警告しない。
+
+#### main の最終境界
+
+終了状態は単一 enum `Running / ReturnedOk / ReturnedError` で所有する。最終化要求には結果と、既存の制御エラー通知の扱いを typed に添える。`ReturnedError` は異常消失とは区別し、既存 `run_native` Err 通知の対象は次回同じ警告を出さない。
+
+現状 `finish_run_native` は cleanup・terminal・`finish_logs()`・必要な native 通知を済ませてから main に戻る。**今回の writer は startup writer と別の、main owner 所有の writer** とし、`finish_logs()` では停止させない。既存 Err の「ログ排出後に通知」の順序は保持する。main は run の結果を受け取り、通常ログの最終処理など panic し得る終了作業を済ませた最後に、診断 owner へ一度だけ `ReturnedOk` または `ReturnedError` を確定する。App Drop、unwind 中の RAII Drop、window close、非表示、tray 移行では確定しない。main を抜ける直前の小さな処理まで終了理由を必ず取れる保証はしない。
+
+既存の合計2秒の終了 deadline を明示的に共有できる形へ接続する。前段の `finish_logs()` で既に費消した時間を取り戻す新しい2秒待ちは作らず、main 最終境界では残予算だけを使う。予算超過・writer 停止では join・flush・再試行を追加せず終了する。通常の状態でも UI frame 内では待たない。最終保存が失われると次回 Running のままになる可能性は明記する。
+
+最終要求は通常の coalesce データに紛れ込ませず、owner の吸収的な終端遷移として受理する。単一 writer が進行中の Running 書込みを終え、残る最新値を一度だけ組み込み、終端を最後に保存して停止する。終端確定後の producer 更新・遅着 checkpoint・device-loss latch は Running を復活させず、終端ファイルを置換しない。AI worker の detach は維持し、正常終了に AI 完了待ちを加えない。
+
+`exit_startup` / `exit_with_logs` と admission 後の直接 exit も実装時の接続対象。対象 GUI の意図した早期 exit は、終了コードに対応する同じ明示最終化へ接続してから exit し、未 admission/除外 mode では何もしない。現状の呼出元（GPU 引数エラー、起動前提エラー、試験終了等）を一覧化して取りこぼしを試験する。未知の直接 exit を RAII clean で隠さない。
+
+### 3. checkpoint の時刻・活動期間・受渡し（P2-1）
+
+**約1秒は保存の目標周期であり、「最大約1秒前」の保証ではない。** worker の遅延、採取元の更新停止、活動外の終了で資料はもっと古くなる。最後の checkpoint 以降のページ移動、job 交代、取消、メモリ変動は失われる。
+
+各レコードは run identity に加え、checkpoint 採取時刻、各表示状態・job 状態・CPU sample・GPU sample の採取時刻を持つ。UTC と run 内単調経過を使い、checkpoint の保存時刻を他項目の採取時刻に代用しない。GPU の前回成功値を残す場合も、その時刻と最新照会失敗を残す。未取得は unknown とし、0 bytes や現在時刻で補わない。
+
+表示の基準は「最終記録時刻: …／終了との間隔不明」。同じ run の panic 等の**対応する観測時刻**があり、同じ単調時計で前後関係を確認できる項目だけ「panic 観測の1.4秒前」などを出す。native の wall clock だけの値、時刻逆転、対応不明では間隔不明とする。device loss の callback では採時せず、worker が latch を確認した時刻を「保存 worker の観測時刻」として扱い、callback 発生時刻・終了時刻とは呼ばない。**次回起動時刻との差から終了何秒前かを計算しない。**
+
+活動判定は UI の pending 件数ではなく、以下の実所有を含めた run 全体の観測とする。
+
+| 期間 | 判定・終了の境界 |
+| --- | --- |
+| 受付・queue・実 worker | enqueue 済み未回収 job、既存 local activity lease、worker が保持する実 job。model load、scale detect Run、tile Run、blend を区別する |
+| 取消・PDF orphan | cancel 要求や pending 撤去で活動終了にしない。実 Run の帰還、worker 終端、結果の回収/破棄まで採る。PDF retained orphan の完走・retained store も含む |
+| AI 結果後 | 結果待ち/backlog、所有 context への採用、後段 final-effect 合成、表示用 GPU 登録要求から既存登録境界の復帰/破棄まで採る。texture 登録要求を GPU 実完了・present 成功と呼ばない |
+| 活動終了後 | 最後の完了/破棄状態を1回 checkpoint に含め、周期起床・DXGI 採取を止める。AI 結果が cache に残るだけでは活動扱いにしない。後の再表示で GPU 登録する期間は再開する |
+
+producer は既存所有境界で短命の診断活動 lease/件数を渡し、結果・後段要求へ必要な範囲だけ引き継ぐ。診断用 lease は画像や Session の寿命を延ばさず、処理を待たせない。UI の件数とは別に queue/worker/結果適用の活動を追跡し、main/退避 context/PDF orphan のどこでも実作業が残れば採取を維持する。Remote 等の別 producer が同じ runtime を使う場合も、実 worker 活動を含めるが表示ページは unknown/別 context とする。worker の異常終端は lease 解放と一般 panic 観測に落とし、未完了を成功に変えない。
+
+通常時の受渡しも、`run + context ID + items世代 + job ID + model/backend + 段階 + source/output/tile寸法 + tile番号 + 採取時刻` を一つの typed record にする。要求時の不変 metadata を job に添え、同じ実行 owner が段階と組にして更新する。cancel は同じ job ID の別観測として扱う。表示ページと実行ページを混ぜず、異なる job の ID と寸法を項目別に継ぎ合わせない。全ページや cache 本文を毎秒走査せず、既存カウンタ・更新点から queue 件数/所有入力 bytes、実行件数、CPU private bytes を採る。Arc 共有分を追加 RAM として単純加算しない。
+
+受渡しは通常 thread 用の有界 latest-value mailbox と通知で十分で、fatal reader 用の仕組みはない。短い保護区間で固定上限の record を複製し、**保護を解いてから serialize・DXGI・I/O**を行う。UI producer は一度の非待機更新を試みる方式とし、競合時は欠落を数えて諦める。活動の開始/終了は実所有のカウンタ/lease を正本として、metadata の欠落で誤って idle にしない。結果が多い場合は代表 job と合計・省略数を残し、保存上限に合わせて job を止めない。
+
+初回 Running、活動開始/終了、device-loss latch 確認、main 終端で保存要求を出し、通常の高頻度更新は最新へ coalesce する。idle 時も表示状態は既存の変更機会にメモリへ渡せるが、毎秒保存や定期 repaint を起こさない。device loss のための新しい常時 timer は作らず、既存 device 保守の通常 thread/イベント経路から latch 確認を促し、活動中なら周期でも確認する。完全 idle からそのまま即死して worker が確認できない場合は記録なしを許容する。
+
+### 4. GPU sample の意味と負荷
+
+DXGI sampler は背景側だけで、既に選択された adapter の LUID/node に相関して local/nonlocal Usage/Budget を照会する。既存 `gpu_info::query_dxgi_video_memory_snapshot` は最初の専用 VRAM 付き adapter を選ぶので、そのまま「AI の VRAM」に転用しない。描画 adapter と ORT/DirectML adapter は別に相関の可否を持ち、ORT 内部 device への直接照会や新しい device 作成を足さない。
+
+一致確認できた側だけ「描画 adapter」「AI と同一 adapter」と表記し、DML 側不明なら「AI adapter との一致未確認」。UMA を専用 VRAM 0 の理由で除外せず、local/nonlocal の区分をそのまま出す。LUID/照会不可は unknown。sample ごとに成功/未取得/古い値と採取時刻を持つ。PDH の毎回 open/列挙は常時経路に使わない。予算超過・古い sample だけで OOM/TDR/終了原因を断定せず、予算内でも失敗を否定しない。
+
+checkpoint は通常2～4 KiBを目標、schema 全体16 KiBを上限とする。活動中毎秒保存なら約7～14 MiB/時、上限16 KiBなら約56 MiB/時の論理書込み量になる（計算値であり実測ではない。置換に伴うファイルシステム等の追加書込みは別）。idle は周期起床なし。初期化・保存失敗時に UI の同期 fallback を作らない。
+
+### 5. panic/native/device-lost の安全契約（P2-2・P2-3）
+
+#### panic と描画エラー
+
+panic hook の最初で、借用した `&str` / `String::as_str()` を既知の固定分類へ変換して、小さな別 panic sink に直接記録する。既存 hook の payload 複製、location 整形、backtrace 構築、panic.log append、一般 logger より**前**に行う。新しい分類・書込みで任意の `Display` / `Debug` を呼ばない。長い payload は走査量にも上限を設け、未分類は「Rust panic（詳細は分類できませんでした）」だけとする。生 payload・source path は新しい小資料に残さない。
+
+安全契約は **通常 worker で事前 open、固定 buffer、再入/競合時 skip、件数上限（例16件/run）、1件につき単発 WriteFile、一般 logger/flush/再試行なし**。run identity は初期化済み不変値だけを使い、UTC・同じ run 内単調時刻・thread ID・既知分類と数値だけを固定長で書く。alloc、Rust lock 待ち、TLS 初期化、COM/DXGI、backtrace、worker/barrier 待ちを追加しない。未準備 sink は skip。製品用 handle/buffer は process 終了まで存続し、停止時に hook と close/reopen を競合させない。
+
+ただし単発の同期 [WriteFile](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-writefile) に**実行時間の上限はない**。best effort は保存成功や即時復帰の保証ではない。panic/既存 VEH の短い直接記録に限る割り切りで、通常 UI と device-lost callback の保存には使わない。
+
+OOM の確かな分類は描画用 wgpu の typed `Error::OutOfMemory` を観測できる境界に置く。必要な uncaptured handler の接続は既定の fatal 契約を保つ最小変更とし、固定分類の panic に進める。Validation/Internal/一般 panic も分類を区別する。任意 payload に「memory」があるだけで OOM と断定しない。panic を握りつぶして描画継続する変更はしない。worker panic・捕捉 panic は process 終了と同義でなく、ReturnedOk なら次回異常終了通知を作らない。
+
+#### native 例外の run 相関（P2-2）
+
+既存 `native-exception.log` は追記型で、従来行には run/PID がない。その末尾を今回の根拠として採用しない。今回から recorder 初期化時に `schema/run/core PID/core開始時刻/role` の境界 header を加え、**各例外行にも同じ不変 identity** を固定 buffer で付ける。GUI 以外や除外 mode の既存 recorder も自分の identity を付け、GUI の区間へ混入させない。header 準備に失敗したら新しい相関資料としては利用しない。
+
+前回 worker は今回の native rotation/open より前に、前回 GUI identity に一致する区間をメモリへ確保する。読取り対象は current/bak の固定上限内だけとし、別 run、identity のない旧行、header 不整合、途中で切れた行、相関できない資料は採用しない。該当なしを過去の末尾で補わない。コピーへ渡すのは例外 code・既知分類・観測時刻だけで、address/target/自由文を渡さない。
+
+既存 VEH の固定2048-byte buffer、再入時 skip、256件/run 上限、単発 raw append、`CONTINUE_SEARCH` を維持し、最新 checkpoint は読まない。first-chance は捕捉されて続行した例外も含むので、表示は「終了前に観測された例外（first-chance）」に留める。AV 等の記録があっても終了原因の確定にはしない。fast-fail/allocator abort/kill/電断は記録できない場合がある。
+
+#### device-lost callback は単一 atomic latch（P2-3）
+
+root 描画 device の生成境界で callback を登録する。callback が行うのは、reason enum を固定値へ写して**単一 atomic に最初の非正常理由を latch する1回の CAS**だけ。message の複製・文字列加工・ファイル書込み・logger・採時・通知 lock・wgpu 再入・resource 解放・device 再作成・UI 呼出しをしない。明示 destroy は異常観測に含めない。wgpu-core の callback は内部 lock 保持中にも呼ばれるため、同期 WriteFile を置かない。
+
+通常 worker が latch を読み、worker の観測時刻と固定文を保存する。callback の message は新資料に保存せず、`Unknown` は unknown のままで TDR/DEVICE_HUNG へ推定しない。詳細 HRESULT がその device の既存所有境界で取れないなら省略する。ORT 内部 device や別 adapter の removed reason を代用しない。既存 overlay device の latch/復旧経路は変更せず、root device と混同しない。
+
+device ごとの不変 identity を callback 登録時に結び付け、旧 device の callback を新 device の理由へ付け替えない。latch は「handler が snapshot を読む publication」ではない。即死して worker が読む前なら理由は失われる。それを救う fatal reader、callback 内 I/O、常駐監視 thread は追加しない。
+
+panic・native・通常 state/device-loss の sink は分離する。通常 writer が device-loss 観測を追記する小資料も件数/容量を制限し、checkpoint の置換対象に含めない。**後の観測・checkpoint が先の証拠を置換消去しない**。別 sink も同じ GUI identity でだけ結び付け、観測の存在を clean 状態より優先して「異常終了」に昇格しない。
+
+### 6. 次回通知、許可項目、表示とコピーの例
+
+前回 Running のままなら「前回の正常終了を確認できませんでした」を基準とする。情報なしでは「原因は記録されていません」。観測があれば「終了前に観測された情報」として添え、taskkill/OS終了/電断/記録失敗と crash の区別は保証しない。
+
+UI は通常 root の描画が可能で、起動 overlay を塞がずに出せる段階に、消えない小さな通知と詳細欄を一度表示する。tray/最小化中には表示済みを消費せず、復帰後に表示する。「報告用の文をコピー」「閉じる」は常時到達できる位置に置き、本文だけ scroll する。前回1件の提示済み/閉じるは診断 owner が管理し、通知を毎 frame 再生成しない。今回も描画不能なら既存の native エラー表示が限界。自動送信・自動 clipboard 更新はしない。
+
+**checkpoint とコピー文の両方を許可項目から組み立てる。** 許可するのは schema、製品/build/依存版、OS の数値版、短命 run/context/job/device ID と世代、時刻、既知 model/backend/API enum、ページ番号/総数、段階/取消/件数、寸法/bytes、照会結果/相関可否、既知の失敗分類と数値 code。adapter は vendor/device 数値 ID と役割で識別する。GPU 名・driver/ORT/panic の任意文字列は流し込まず、必要な版も数値/既知形式だけにする。
+
+ファイル名、ZIP 内名、絶対/相対パス、検索語、コマンドライン、ユーザー名、画像内容、任意の model 名、panic/ORT/driver の生 message、backtrace/source path は許可しない。パスらしい部分を除去する文字列加工で安全にしようとせず、未分類は固定の一般文へ落とす。既存詳細ログの記録方針は維持するが、自動で添付しない。worker が一度作った同じ本文を画面とコピーに使用し、コピーだけに隠れた追加項目を入れない。
+
+例1（架空値。typed OOM 分類と同一 run の panic 観測がある場合）:
+
+```text
+前回の正常終了を確認できませんでした。
+終了前に観測された情報: 描画用GPUメモリの確保失敗 / Rust panic
+panic観測時刻: 2026-10-30 12:34:56.400 UTC
+最終記録時刻: 2026-10-30 12:34:55.000 UTC（panic観測の1.4秒前）
+表示状態の採取時刻: 2026-10-30 12:34:54.800 UTC（panic観測の1.6秒前）
+表示: context3・世代7・11/30
+実行状態の採取時刻: 2026-10-30 12:34:54.900 UTC
+AI job42: 6/30・高速汎用・DirectML・tile Run中
+入力1440x1920 / 出力5760x7680 / tile512x512・3/20
+job42: 取消要求済み・Run終了未確認
+GPU採取時刻: 2026-10-30 12:34:54.600 UTC（panic観測の1.8秒前）
+描画adapter: vendor 0x10DE / device 0x2684 / DX12 / node0
+local使用量1700 MiB / 予算1900 MiB、nonlocal使用量80 MiB / 予算4096 MiB
+AI adapterとの一致未確認
+CPU採取時刻: 2026-10-30 12:34:54.700 UTC / private 2100 MiB
+mIV x.y.z / ORT 1.24.4 / 記録ID core-1234-5678
+各状態は最終記録以降に変わった可能性があります。
+観測された情報だけでは終了原因を確定できません。
+```
+
+例2（終了観測がなく、古い checkpoint だけの場合）:
+
+```text
+前回の正常終了を確認できませんでした。原因は記録されていません。
+最終記録時刻: 2026-10-30 10:00:00 UTC / 終了との間隔不明
+表示状態の採取時刻: 2026-10-30 09:59:59 UTC / 表示11/30
+GPU採取時刻: 2026-10-30 09:59:58 UTC / 描画adapter local使用量1700 MiB・予算1900 MiB
+AIの実行状態: 不明 / AI adapterとの一致未確認
+mIV x.y.z / 記録ID core-1234-5678
+使用量の値だけではメモリ不足を確定できません。
+```
+
+native の証拠があれば、例2へ「終了前に観測された例外（first-chance）: access violation / code 0xC0000005 / 観測時刻 …。終了原因かは不明」を添える。欠落項目は省略または不明を明示し、架空の値で補完しない。
+
+### 7. ORT の即時 feedback
+
+`AiError` → `FinalAiResult::Failed` → 所有 context への既存配送・採用境界で、現在の要求 key/job ID/世代が有効な現役 Display job だけ `FeedbackKind::Error` へ接続する。例:「AI処理に失敗しました（推論エラー）。」typed に分類できるメモリ確保失敗ならその固定文を使い、未分類 ORT 文字列は一般文にする。背景 Prefetch、取消済み/古い job、PDF retained orphan、別 context の結果は現在ページのエラーとして出さない。同一 key の既存失敗寿命で重複通知を防ぎ、結果の配送・失敗 key・repaint の契約は維持する。
+
+即時通知の詳細/コピーも許可項目から同じ本文を作り、既存 feedback から開ける診断詳細へ接続する。通知時間は既存 feedback ポリシーに従う。通常 Result の失敗を終了印にせず、device loss や native 例外の証明にも使わない。CPU fallback の追加や再試行は行わない。
+
+### 8. 実装段階と検証所有
+
+実装は後続の承認された依頼で開始する。各段は同じ設計 owner の範囲内で進め、担当実装者が focused 検証を所有し、独立 reviewer は同一 source/条件の成功証拠を再利用する。これは本追記で新たな実装・製品起動を許可するものではない。
+
+| 段 | 実装範囲 | 自動検証・受入条件 |
+| --- | --- | --- |
+| A 終了印＋次回通知 | main owner/admission、専用 writer、前回読取り、単一状態/終端、許可項目 formatter、通知/コピー | 一時 data_dir の純粋状態テストと限定子 process。正常 return/制御 Err/早期 exit、二重起動で資料不変、除外 mode 全種、tray は Running、App Drop/unwind は非clean、AI detach 正常終了。mainまでwriter生存、終端後の遅着Running拒否、終了予算でjoinしない、旧writerが新run不変。初回/生存lease/stale/schema不明/破損/書込み失敗。headless UI snapshot とコピー本文一致 |
+| B checkpoint＋GPU sampler | typed job/表示 record、実活動から後段登録までの lease、活動中の周期保存、時刻、adapter相関 | fake clock/sampler/sink で目標周期・coalesce・idle周期起床なし、遅延や古い採取元、間隔不明/時刻逆転、採取時刻の個別保持。取消後Run継続、pendingゼロのPDF orphan、結果backlog/退避context/後段登録、世代・job交代で寸法混在なし。adapter一致/不一致/UMA/unknown/照会失敗を注入。共有保護中にserialize/DXGI/I/Oしないことをfixtureで確認 |
+| C panic/native/device-lost | 事前openの短いpanic証拠、native run相関、root deviceのatomic reason latch、worker保存 | 同じtest exeの限定子 processでworker/main panic注入、worker panic後に正常終了、強制終了でRunning残留。hookの重い既存処理より先に固定記録、再入skip/上限/未準備sink/単発短書込みを注入。nativeは既存子process/固定formatter試験を拡張し、複数run/旧行/別mode/rotation前確保/不完全行の誤相関なし。callbackはfakeでCASのみ、重複理由・明示destroy・保存前終了・旧deviceを確認。panic/native/device観測が互い/遅いcheckpointで消えない |
+| D ORT 即時通知 | 現役DisplayのFailedをfeedback/詳細へ接続 | handler級試験で有効key/job/contextだけ1回通知、prefetch/取消/orphan/別context/staleは通知なし。正常Resultと終了印を混同しない。パス/ZIP名/検索語を埋めた未分類payloadを注入し、checkpointと表示/コピーの全出力に含まれないことを検査 |
+
+全試験は TempDir/明示 data_dir とローカル sink を使い、通常の settings/DB/ログに触れない。panic/native handler の process-global 状態は子 process ごとに隔離する。実 GPU OOM/TDR、通常製品 exe の起動、デスクトップ操作は自動 gate に含めない。過去20件の headless 成功は調査証拠として再利用するが、今回の診断機能・実描画の検証済み証拠には転用しない。
+
+将来の実装検証は focused → 必要な shared 回帰/full gate の順とし、[開発ビルドとテスト](development-build-and-test.md) に従う。UI snapshot は1093×614/1366×728、倍率100%/200%、長文/unknown/閉じる/コピー操作の到達性を含め、fmt/UI glyph検査も行う。native/device 接続は実機未確認を残し、実装後に検証バイナリを build して利用者へ渡す。agent の実画面検証は別途、具体的 suite の明示承認と使い捨て portable の準備が必要。本段階は文書のみなので build・テスト・製品起動は行わない。
+
+### 9. 変更ファイルの見込みと UI 応答性確認
+
+| ファイル/領域（実装時の見込み） | 責務 |
+| --- | --- |
+| 新規 `src/previous_run_diagnostics.rs` 等 | GUI owner/状態、専用 writer、checkpoint schema、許可項目 formatter、前回読取り・typed表示モデル、panic sink/device latch。必要なら小moduleに分割 |
+| `src/main.rs` / `src/lib.rs` | owner引渡し、first admission/guard寿命、除外mode、hook前段、早期exit/最終境界、共有deadline接続 |
+| `src/run_native_failure.rs` | 制御Err通知の扱いをownerへ渡す接続。既存ログ排出→native通知の順序を保持 |
+| `crates/startup-diagnostics/src/` | 既存identity/保存先/lease/deadlineの必要最小の公開。startup writerを診断writerの代用にしない |
+| `src/app.rs` / `src/app/` / `src/ai/{upscale,final_pipeline,runtime}.rs` 等 | job/実Run/取消/結果/後段登録の観測点、既存活動情報、現役Failedのfeedback。dead legacy producerへ主経路を誤接続しない |
+| `src/gpu_info.rs` / `src/native_exception_log.rs` | adapter指定sampler、native header/各行identityと読取りformatter試験 |
+| root device生成の `vendor/egui-wgpu` 接点等 | typed uncaptured errorのfatal契約とdevice-lost callback登録。最小のobserver接続でrenderer復旧を変更しない |
+| `src/ui_dialogs/` とそのmodule宣言、関連headless test/snapshot | 消えない前回通知、詳細、本文共有、明示コピー/閉じる |
+| 本書、backlog、startup/async/UI応答性/仕様の該当文書、manual/製品ページ/privacy | 実装段階で診断内容・保存範囲・限界を同期更新。本依頼で変更するのは本書だけ |
+
+[UI応答性 §4](ui-responsiveness.md#4-新機能追加時のチェックリスト) に照合した設計上の確認: **UIへ同期I/Oを追加しない**。前回資料の read/open/metadata/rotation、事前open、serialize/置換保存、DXGI/COM、CPUメモリ照会はすべて背景側。UIは固定上限の整数/enum record の非待機受渡し、表示モデルのpoll、既存texture登録点の観測、描画と明示clipboard操作だけを行う。診断のためのdecode、DB open/検索、全フォルダ/cache走査、追加GPU upload、session/queue待ち、sleep、周期repaintはない。main最終境界以外でbarrier待ちをせず、fatalの限定直接書込みは通常UI経路へ流用しない。detached述語/viewport所有/表示切替は変更対象に含めず、接続上それらへ入る必要が判明した場合はrework規則に従って別途設計合意を取る。
