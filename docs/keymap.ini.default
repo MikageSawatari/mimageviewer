@@ -341,7 +341,7 @@
 [FsCommon] ; フルスクリーン共通
 # FsToggleMetadata.1 = I ; 左右パネルの表示モードを切り替える
 # FsToggleMetadata.2 = Tab ; 左右パネルの表示モードを切り替える
-# FsPageOverviewToggle = O ; ページ一覧の表示を切り替える
+# FsPageOverviewToggle = O ; ページ一覧の表示切替
 # FsBackToList = Backspace ; フルスクリーンを閉じて一覧へ戻る
 # FsToggleWindowMode = F11 ; ウィンドウ表示と全画面表示を切り替える
 # FsJumpFirst = Home ; 先頭の項目へ移動する

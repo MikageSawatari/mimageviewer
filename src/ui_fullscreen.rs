@@ -65443,7 +65443,7 @@ mod tests {
                                 0,
                                 FsOverflowPanelRow {
                                     item: FullscreenOverflowItemId::PageOverview,
-                                    label: "本のページ一覧 [O]".into(),
+                                    label: "ページ一覧の表示切替 [O]".into(),
                                     status: String::new(),
                                     enabled: true,
                                     disabled_reason: None,

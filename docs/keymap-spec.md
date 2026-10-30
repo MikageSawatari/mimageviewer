@@ -43,7 +43,11 @@ Space だけではパン。消しゴムの `ErasePreviewHold` は押している
 面または `fs_zoom_owner()` が変わったら、値を書き戻さずに状態を破棄する。終了した primary は解放まで既存の抑止へ渡す。
 組合せを減らすため、chord 解放後の再開・パンへの切替は設けず、同じ primary の終端まで所有する。
 
-ページ一覧は `FsPageOverviewToggle`（FsCommon / Press、既定 O）で開閉する。
+ページ一覧は「ページ一覧の表示切替」`FsPageOverviewToggle`（FsCommon / Press、既定 O）で開閉する。
+操作カスタマイズの短い操作名、リング／ジェスチャ／マウスボタン／パッドの候補とガイド、HUDの案内も
+同じ名称を使う。詳細説明は「O キーと同じ操作。もう一度実行すると一覧を閉じる」と案内する。
+`image_page_overview` の保存IDと既存割り当ては維持する。「本をページ一覧で開く」や
+「フルスクリーンを閉じて一覧へ戻る」とは別操作で、一覧中のヘルプ文脈名「本のページ一覧」は変更しない。
 動画／音声／編集モードでは入場しない。S／Shift+S／Ctrl+S、Ctrl+O、編集の O は従来どおり。
 受理済み移動が未提示の間はanimationのON／OFFにかかわらずOによる新規入場を受け付けない。
 既存`fs_navigation_sequence_blocks_new_target()`と`page_turn_barrier_active()`を
