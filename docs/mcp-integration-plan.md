@@ -1706,3 +1706,69 @@ FFmpeg DLL は前回配置済みの worktree 内実ファイルを使用した�
 |---|---:|---|
 | `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 0 | IPC 10/10、MCP 43/43 成功 |
 | §16.8 の focused nextest | 0 | 102/102 成功 |
+
+### 16.11 修正 2 回目 (基点 `ef7148431`、未コミット差分)
+
+観測者の区別: ClaudeCode は sandbox 外で §16.10 の IPC 10/10、MCP 43/43、core 102/102 (各 exit 0) を観測した。
+正式な独立 reviewer は前回の3指摘 (生JSON漏えい、PermissionChanged、PDFのpathログ) の解消と
+UI/search の解釈維持を確認した一方、既知の生成情報の container を早く拒否し過ぎる P2 を追加した。
+ClaudeCode が採用し、この修正を実装担当へ依頼した。今回差分の実行結果は下記に別記する。
+
+- `src/png_metadata.rs`: 既知の model object の別名列、旧 prompt array の要素、v4 caption の構造を
+  既存 parser と共有してたどり、文字列として取り出す末端で scalar 制約を適用する。
+  未知の構造を stringify しない。数値を許可する既存の seed/steps 等の規則は変えない。
+- 旧 prompt array の末端がすべて不正でも、独立した model/生成条件を維持し、同居 Dream から
+  拒否済み prompt を再採用しない。既知 v4 でも不正な最後の caption だけを落とし、Seed/Steps は残す。
+  この認識維持は agent mode のみで、Display の認識条件・文字列化は従来どおり。
+- `src/agent_ipc/item_info_tests.rs`: 実 fixture `invokeai_new.png` と `invokeai_legacy_sdmeta.png` を
+  file/ZIP の両入口へ通す。v4 は既存 parser test と同じ caption/char_captions 形を使い、Description を置かない。
+  正常時の値と、末端が object/array/bool/number/null の場合に対象値だけが消えることを検査する。
+  複数 prompt/caption の一部だけ不正な場合と、最後の文字列が不正な場合も含め、他の列を全体比較で保護する。
+- この文書に判断と検証台帳を追記。新しい公開API・設定・wire形式・永続形式・UI は追加しない。
+  別の agent 専用 traversal を作る案より、既存の既知構造と leaf conversion を共有する方を選んだ。
+
+初回 focused 検査は exit 100、105件中102成功/3失敗 (`target/mcp-1a-fix2-focused.log`)。
+新3件は成功したが、前回の object/array 漏えい検査が v4 caption 配列中の任意文字列を検出した。
+その期待値を緩めず、agent mode の caption collection は既知 object をたどり、その名前付き leaf だけを読むよう補正した。
+Display mode の配列処理は変えない。正常 caption object と任意の文字列が混在する場合の検査も追加した。
+残る2失敗は既知の実 pipe OS 5。空の旧 prompt array は拒否した leaf を持たないため、従来の Dream fallback を維持する。
+新3件は既存の `/agent_ipc/` filter に含まれるため、§16.8 の filter を拡張する必要はない。
+ClaudeCode が sandbox 外の通常権限で再実行するコマンド (今回差分での外側の成功は未観測):
+
+```powershell
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_level/) or test(/agent_permission/) or test(=settings_db::tests::failed_permission_commit_preserves_snapshot_and_epoch) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(/png_metadata/) or test(=pdf_loader::tests::anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results) or test(=pdf_loader::tests::page_sizes_preserve_existing_ui_diagnostic_identity) or test(=pdf_loader::tests::page_sizes_round_trip_and_reject_a_truncated_reply)'
+```
+
+最終検証 (観測者: 実装担当、この sandbox 内、`ef7148431` + 今回差分、通常 dev/test profile):
+
+| コマンド | 実 exit code | 結果 / ログ |
+|---|---:|---|
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | 最終 parser 差分で再実行。`target/mcp-1a-fix2-core-final.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 101 | IPC 10成功、MCP 41成功/2失敗、ignore 0。`target/mcp-1a-fix2-crates.log` |
+| 上記 focused nextest | 100 | 105件中103成功/2失敗。`target/mcp-1a-fix2-focused-final.log` |
+| `cargo build -p mimageviewer-mcp --bin mimageviewer-mcp` | 0 | `target/mcp-1a-fix2-adapter.log` |
+| `cargo fmt` (workspace、引数なし) | 0 | 最終 source 差分を整形 |
+| `cargo fmt --check` | 0 | `target/mcp-1a-fix2-fmt.log` |
+| `git diff --check` | 0 | 最終差分を確認 |
+
+追加3件・前回の漏えい回帰・既存 PNG parser は全て成功。
+非ゼロは §16.6/§16.8 と同じ4件の実 pipe OS 5 だけであり、skip/ignore 化や DACL 変更はしない。
+core は idle-connected shutdown と stdio fixture、adapter は withheld-response cancel と blocked-stdout cancel。
+crate 検査・adapter build 後の変更は core の parser と fixture だけなので、それらの結果を再利用する。
+FFmpeg DLL は前回配置済みの worktree 内実ファイルを使用した。
+
+今回差分の正式な独立再レビュー・sandbox 外実 pipe の最終成功は未観測。
+製品 binary / UI / 通常 profile を起動せず、test-full、commit、snapshot 更新、公開文書更新は行っていない。
+この指摘について追加の設計判断を要する矛盾は見つからなかった。
+
+### 16.12 修正 2 回目の検収 (観測者: ClaudeCode、sandbox 外)
+
+独立レビュー 2 回目 (`ef7148431`) は元の 3 件の解消と UI・検索の解釈不変を確認し、新しく [P2] 1 件
+(型制限が早すぎて InvokeAI の model 名・NovelAI v4 caption・旧 InvokeAI の prompt 配列まで落ちる) を出した。
+妥当と判断し §16.11 で直した。
+
+| コマンド | exit code | 結果 |
+|---|---:|---|
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 0 | IPC 10/10、MCP 43/43 成功 |
+| §16.11 の focused nextest | 0 | 105/105 成功 |

@@ -216,6 +216,203 @@ fn nested_generation_seed_is_absent_for_file_and_same_png_in_zip() {
     }
 }
 
+fn generation_from_file_and_zip(bytes: &[u8]) -> [GenerationInfo; 2] {
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    let path = directory.path().join("structured.png");
+    let archive = directory.path().join("structured.zip");
+    std::fs::write(&path, bytes).unwrap();
+    std::fs::write(&archive, zip_bytes(&[("structured.png", bytes)])).unwrap();
+    [item(&path, None), item(&archive, Some("structured.png"))].map(|input| {
+        let output = read(&input, permission(false), &AtomicBool::new(false)).unwrap();
+        assert_no_nested_generation(&output.generation);
+        let InfoField::Present(generation) = output.generation else {
+            panic!("known generation structure must retain its independent fields");
+        };
+        generation
+    })
+}
+
+fn replace_json_chunk(
+    image: &[u8],
+    name: &str,
+    update: impl FnOnce(&mut serde_json::Value),
+) -> Vec<u8> {
+    let mut chunks = crate::png_metadata::read_png_text_chunks_from_bytes(image).unwrap();
+    let (_, text) = chunks.iter_mut().find(|(key, _)| key == name).unwrap();
+    let mut source = serde_json::from_str(text).unwrap();
+    update(&mut source);
+    *text = serde_json::to_string(&source).unwrap();
+    png(&chunks
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect::<Vec<_>>())
+}
+
+fn invalid_text_leaves() -> Vec<serde_json::Value> {
+    use serde_json::json;
+    vec![
+        json!({"gps":{"latitude":35.5},"workflow_json":{"secret":"x"}}),
+        json!(["secret"]),
+        json!(true),
+        json!(42),
+        json!(null),
+    ]
+}
+
+#[test]
+fn known_model_object_retains_scalar_name_for_file_and_zip() {
+    let image = include_bytes!("../../tests/fixtures/ai_metadata/invokeai_new.png");
+    let baseline = generation_from_file_and_zip(image);
+    assert_eq!(baseline[0], baseline[1]);
+    assert_eq!(baseline[0].model.as_deref(), Some("juggernautXL_v9"));
+    assert!(baseline[0].prompt.is_some());
+    assert!(baseline[0].negative_prompt.is_some());
+    for bad in invalid_text_leaves() {
+        let changed = replace_json_chunk(image, "invokeai_metadata", |value| {
+            value["model"]["model_name"] = bad;
+        });
+        let mut expected = baseline[0].clone();
+        expected.model = None;
+        for actual in generation_from_file_and_zip(&changed) {
+            assert_eq!(actual, expected, "only the non-scalar model name is absent");
+        }
+    }
+}
+
+#[test]
+fn known_legacy_prompt_array_retains_scalar_leaves_for_file_and_zip() {
+    let image = include_bytes!("../../tests/fixtures/ai_metadata/invokeai_legacy_sdmeta.png");
+    let baseline = generation_from_file_and_zip(image);
+    assert_eq!(baseline[0], baseline[1]);
+    assert_eq!(baseline[0].model.as_deref(), Some("deliberate_v2"));
+    assert_eq!(
+        baseline[0].prompt.as_ref().unwrap().text,
+        "a calico cat sitting on a windowsill, watercolor, soft morning light"
+    );
+    for bad in invalid_text_leaves() {
+        let changed = replace_json_chunk(image, "sd-metadata", |value| {
+            value["image"]["prompt"][0]["prompt"] = bad;
+        });
+        let mut expected = baseline[0].clone();
+        expected.prompt = None;
+        for actual in generation_from_file_and_zip(&changed) {
+            assert_eq!(
+                actual, expected,
+                "keep model/params and do not fall back to Dream"
+            );
+        }
+    }
+    let mixed = replace_json_chunk(image, "sd-metadata", |value| {
+        value["image"]["prompt"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"prompt":"second scene","weight":1}));
+    });
+    let mut expected = baseline[0].clone();
+    expected
+        .prompt
+        .as_mut()
+        .unwrap()
+        .text
+        .push_str("\nsecond scene");
+    for actual in generation_from_file_and_zip(&mixed) {
+        assert_eq!(actual, expected);
+    }
+    // With no prompt leaf at all, keep the display parser's ordinary fallback.
+    let empty = replace_json_chunk(image, "sd-metadata", |value| {
+        value["image"]["prompt"] = serde_json::json!([]);
+    });
+    let InfoField::Present(fallback) =
+        project_generation(crate::png_metadata::extract_metadata_from_bytes(&empty))
+    else {
+        panic!("empty legacy array should use the known Dream fallback");
+    };
+    assert!(fallback.prompt.is_some());
+    for actual in generation_from_file_and_zip(&empty) {
+        assert_eq!(actual, fallback);
+    }
+    let mixed = replace_json_chunk(&mixed, "sd-metadata", |value| {
+        value["image"]["prompt"][0]["prompt"] = serde_json::json!({"secret":"x"});
+    });
+    expected.prompt.as_mut().unwrap().text = "second scene".into();
+    for actual in generation_from_file_and_zip(&mixed) {
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn known_v4_caption_structure_retains_scalar_leaves_for_file_and_zip() {
+    let source = serde_json::json!({
+        "v4_prompt":{"caption":{"base_caption":"base scene",
+            "char_captions":[{"char_caption":"hero character"}]}},
+        "v4_negative_prompt":{"caption":{"base_caption":"bad scene"}},
+        "seed":45,"steps":20
+    });
+    // Same v4 shape as png_metadata::tests::test_detect_novelai_v4_caption_shape,
+    // with no Description fallback and no raw workflow in the projected fields.
+    let image = png(&[("Software", "NovelAI"), ("Comment", &source.to_string())]);
+    let baseline = generation_from_file_and_zip(&image);
+    assert_eq!(baseline[0], baseline[1]);
+    assert_eq!(
+        baseline[0].prompt.as_ref().unwrap().text,
+        "base scene\nhero character"
+    );
+    assert_eq!(
+        baseline[0].negative_prompt.as_ref().unwrap().text,
+        "bad scene"
+    );
+    let mixed = replace_json_chunk(&image, "Comment", |value| {
+        value["v4_prompt"]["caption"]["char_captions"] = serde_json::json!([
+            {"char_caption":"hero character"}, "secret", {"unknown":"secret"}
+        ]);
+    });
+    for actual in generation_from_file_and_zip(&mixed) {
+        assert_eq!(
+            actual, baseline[0],
+            "only named caption leaves contribute text"
+        );
+    }
+    for bad in invalid_text_leaves() {
+        for (pointer, remaining) in [
+            ("/v4_prompt/caption/base_caption", Some("hero character")),
+            (
+                "/v4_prompt/caption/char_captions/0/char_caption",
+                Some("base scene"),
+            ),
+            ("/v4_negative_prompt/caption/base_caption", None),
+        ] {
+            let changed = replace_json_chunk(&image, "Comment", |value| {
+                *value.pointer_mut(pointer).unwrap() = bad.clone();
+            });
+            let mut expected = baseline[0].clone();
+            if let Some(remaining) = remaining {
+                expected.prompt.as_mut().unwrap().text = remaining.into();
+            } else {
+                expected.negative_prompt = None;
+            }
+            for actual in generation_from_file_and_zip(&changed) {
+                assert_eq!(
+                    actual, expected,
+                    "only the rejected leaf at {pointer} is absent"
+                );
+            }
+        }
+        let changed = replace_json_chunk(&image, "Comment", |value| {
+            value["v4_prompt"]["caption"] = serde_json::json!({"base_caption":bad});
+            value.as_object_mut().unwrap().remove("v4_negative_prompt");
+        });
+        let mut expected = baseline[0].clone();
+        expected.prompt = None;
+        expected.negative_prompt = None;
+        for actual in generation_from_file_and_zip(&changed) {
+            assert_eq!(
+                actual, expected,
+                "rejected final text leaf must not hide seed/steps"
+            );
+        }
+    }
+}
+
 #[test]
 fn every_generation_field_rejects_original_json_objects_and_arrays() {
     use serde_json::json;

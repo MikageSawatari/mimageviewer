@@ -1155,15 +1155,13 @@ fn parse_invokeai_legacy_json(
     // 旧 sd-metadata の image.prompt は [{"prompt": "...", "weight": 1.0}] という
     // 配列のことがある。要素の prompt フィールドだけを取り出す (生 JSON を
     // prompt として扱わない)。
-    let array_prompt = (mode == JsonTextMode::Display)
-        .then(|| json_path(json, &["image", "prompt"]))
-        .flatten()
-        .and_then(|v| v.as_array())
+    let prompt_array = json_path(json, &["image", "prompt"]).and_then(|v| v.as_array());
+    let array_prompt = prompt_array
         .map(|arr| {
             arr.iter()
                 .filter_map(|e| {
                     e.get("prompt")
-                        .and_then(|value| json_value_to_text(mode, value))
+                        .and_then(|value| json_string_to_text(mode, value))
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -1199,7 +1197,15 @@ fn parse_invokeai_legacy_json(
         prompt = join_non_empty(&[before.trim(), after.trim()], " ");
         negative_prompt = inside.trim().to_string();
     }
-    if prompt.trim().is_empty() && negative_prompt.trim().is_empty() {
+    // A known prompt array remains recognized if only its text leaves were
+    // rejected. Preserve independent model/parameter fields instead of falling
+    // back to the co-located Dream chunk with the rejected prompt.
+    if prompt.trim().is_empty()
+        && negative_prompt.trim().is_empty()
+        && !(mode == JsonTextMode::ScalarOnly
+            && prompt_array
+                .is_some_and(|array| array.iter().any(|entry| entry.get("prompt").is_some())))
+    {
         return None;
     }
 
@@ -1257,8 +1263,7 @@ fn parse_novelai(mode: JsonTextMode, chunks: &[(String, String)]) -> Option<A111
 
     let prompt = comment
         .get("v4_prompt")
-        .filter(|value| mode == JsonTextMode::Display || value.is_string())
-        .and_then(novelai_v4_caption_text)
+        .and_then(|value| novelai_v4_caption_text(mode, value))
         .or_else(|| chunk_value(chunks, "Description").map(str::to_string))
         .or_else(|| {
             comment
@@ -1268,15 +1273,17 @@ fn parse_novelai(mode: JsonTextMode, chunks: &[(String, String)]) -> Option<A111
         .unwrap_or_default();
     let negative_prompt = comment
         .get("v4_negative_prompt")
-        .filter(|value| mode == JsonTextMode::Display || value.is_string())
-        .and_then(novelai_v4_caption_text)
+        .and_then(|value| novelai_v4_caption_text(mode, value))
         .or_else(|| {
             comment
                 .get("uc")
                 .and_then(|value| json_string_to_text(mode, value))
         })
         .unwrap_or_default();
-    if prompt.trim().is_empty() && negative_prompt.trim().is_empty() {
+    if mode == JsonTextMode::Display
+        && prompt.trim().is_empty()
+        && negative_prompt.trim().is_empty()
+    {
         return None;
     }
 
@@ -1554,9 +1561,6 @@ fn json_value_to_text(mode: JsonTextMode, value: &serde_json::Value) -> Option<S
 }
 
 fn model_json_value_to_text(mode: JsonTextMode, value: &serde_json::Value) -> Option<String> {
-    if mode == JsonTextMode::ScalarOnly {
-        return value.as_str().map(str::to_owned);
-    }
     match value {
         serde_json::Value::Object(_) => first_json_text(
             mode,
@@ -1572,7 +1576,7 @@ fn model_json_value_to_text(mode: JsonTextMode, value: &serde_json::Value) -> Op
                 &["base"],
             ],
         ),
-        _ => json_value_to_text(mode, value),
+        _ => json_string_to_text(mode, value),
     }
 }
 
@@ -1611,18 +1615,22 @@ fn join_non_empty(parts: &[&str], sep: &str) -> String {
         .join(sep)
 }
 
-fn novelai_v4_caption_text(value: &serde_json::Value) -> Option<String> {
+fn novelai_v4_caption_text(mode: JsonTextMode, value: &serde_json::Value) -> Option<String> {
     let mut parts = Vec::new();
-    collect_novelai_caption_parts(value, &mut parts);
+    collect_novelai_caption_parts(mode, value, &mut parts);
     (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
-fn collect_novelai_caption_parts(value: &serde_json::Value, out: &mut Vec<String>) {
+fn collect_novelai_caption_parts(
+    mode: JsonTextMode,
+    value: &serde_json::Value,
+    out: &mut Vec<String>,
+) {
     match value {
         serde_json::Value::String(s) if !s.trim().is_empty() => out.push(s.trim().to_string()),
         serde_json::Value::Object(obj) => {
             if let Some(caption) = obj.get("caption") {
-                collect_novelai_caption_parts(caption, out);
+                collect_novelai_caption_parts(mode, caption, out);
             }
             for key in ["base_caption", "char_caption"] {
                 if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
@@ -1632,16 +1640,18 @@ fn collect_novelai_caption_parts(value: &serde_json::Value, out: &mut Vec<String
                 }
             }
             for key in ["char_captions", "characters"] {
-                if let Some(arr) = obj.get(key).and_then(|v| v.as_array()) {
-                    for child in arr {
-                        collect_novelai_caption_parts(child, out);
-                    }
+                if let Some(array) = obj.get(key).filter(|value| value.is_array()) {
+                    collect_novelai_caption_parts(mode, array, out);
                 }
             }
         }
         serde_json::Value::Array(arr) => {
             for child in arr {
-                collect_novelai_caption_parts(child, out);
+                // These collections contain known caption objects. A free
+                // string in a container array is not a named text leaf.
+                if mode == JsonTextMode::Display || child.is_object() {
+                    collect_novelai_caption_parts(mode, child, out);
+                }
             }
         }
         _ => {}
