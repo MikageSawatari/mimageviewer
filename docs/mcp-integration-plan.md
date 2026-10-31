@@ -1122,8 +1122,8 @@ cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_lev
 | 区切り | 内容 | 新しく借りる所有者 |
 |---|---|---|
 | 1a | 権限 snapshot の拡張 (§15.2)、読み取り tool の拡充 (§15.3)、出力予算 (§15.4)、段階 0 の残り (§15.9) | なし (共有 reader の束と collection actor の借用だけ) |
-| 1b | フォルダ・ZIP/PDF の中の一覧と縮小画像 (§15.5) | agent 専用の一覧・縮小画像の入口。**実装 brief の前に別の設計とレビューを通す** |
-| 1c | mIV で開く (§15.6) | 既存の二重起動の受付経路 + agent 要求の 1 回限りの応答 |
+| 1b | フォルダ・ZIP/PDF の中の一覧と縮小画像 (§15.5) | 本の構成の service の snapshot (lock だけ)。一覧画面の純粋な関数と縮小画像の要求を作る関数を共有。Remote の engine は使わない |
+| 1c | mIV で開く (§15.6) | agent の「開く」専用の受付 (App) + 二重起動と共有する判定・resolver の入口 |
 | 1d | 設定画面・見せる範囲の表示・AI アプリへの登録 (§15.7) | なし (UI と設定) |
 | 1e | 配布の仕組み (launcher `--mcp`、portable、ビルド・署名・同梱) (§15.8) | なし |
 
@@ -1254,55 +1254,149 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 
 ### 15.5 フォルダ・ZIP/PDF の一覧と縮小画像 (1b)
 
+2026-10-31 にコードを調べ直し、1 巡目 P2-3 の「Remote の container を分けて使う」方針を改めた (理由は下の「所有者の方針」)。
+
 | tool | 内容 |
 |---|---|
-| `list_folder` | フォルダ・ZIP・PDF の中を、一覧画面と同じ規則 (表示する種類の設定・本の構成の順序と非表示) で返す |
-| `get_thumbnail` | 縮小画像 (WebP)。一辺は既定 256・最大 512。収まる件数だけ返し続きは cursor |
+| `list_folder` | フォルダ・ZIP・PDF の中を、一覧画面と同じ規則 (表示する種類・並び順・重複の畳み方・本の構成の順序と非表示) で返す |
+| `get_thumbnail` | 縮小画像 (WebP)。1 回 20 件まで、一辺は既定 256・最大 512。収まる件数だけ返し続きは cursor |
 
-- **所有者の方針** (独立レビュー P2-3): Remote の `ContainerEngine` / `ThumbnailEngine` を丸ごと共有も、
-  そのまま別 instance も不十分。`ContainerEngine` の列挙は読書位置を Remote の session 経由で UI へ問い合わせ、
-  session 無しの別 instance では本の構成の順序・非表示を失う。共有すると Remote が止める RAW 現像の寿命も
-  共有してしまう。よって **agent 専用の入口を作り、列挙と縮小画像の必要部分を session に依存しない形に分け、
-  本の構成の snapshot は既存の所有者から直接借りる**。
-  - 共有するもの: 設定の reader、既存の RAW 現像 executor、プロセス共通の I/O の上限、PDF worker pool。
-  - 分けるもの: 取消、要求の識別、lane 固有の cache。
-  - 守るもの: catalog DB への書き込みは既存のサムネイル生成と同じ admission と保存方針、表示状態に触れない、
-    Remote の cache 整合を壊さない。
-  - 受け入れ条件: Remote と同時に使える、片方の取消が他方に効かない、終了順 (agent → Remote → actor) で止まる。
-  - これは Remote の container のコードの分割を伴うので、**1b の実装 brief の前に別の設計とレビューを通す**。
-- **画像の予算** (独立レビュー P2-7): 画像は MCP の `content` の image block (`image/webp`) にだけ置き、
-  text と `structuredContent` には項目の識別と寸法だけを置く (段階 0 の「同じ JSON を text にも入れる」に
-  画像を含めない)。1 回の結果の画像の合計 (base64 にした後) に上限を設け、収まる件数で返して続きは cursor。
-  MCP exe の最終 JSON の文字数上限は text 部分にだけ掛け、agent IPC の frame 上限は画像の上限に合わせて決める。
-  WebP をそのまま返す (Claude・OpenAI とも WebP の画像入力を受ける。変換を足さない)。§5.4 の「JPEG」は WebP に改めた。
-- `get_thumbnail` は「AI に縮小画像を見せる」が ON の時だけ `tools/list` に出し、OFF なら拒否する。
+**所有者の方針**: Remote の `ContainerEngine` / `ThumbnailEngine` は使わず、分けもしない。Remote の一覧は
+一覧画面と規則が違うため (分けて共有すると、その違いを agent にも持ち込む):
+
+- 本の構成の範囲を、表示する種類で絞った後の木から決める (一覧画面は絞る前の木。`ZipNavLevel.raw`)。
+  種類の設定で畳み方が変わると、別の範囲の構成を引く。
+- ZIP の並びに一覧画面の並び順 (`grid_display_order`) を渡さず、ページを全部「在る」として扱う
+  (一覧画面の adapter は「方針で除外」「絞り込みで除外」を分ける)。
+- お気に入りごとの表示状態 (並び順等) を重ねない。
+- ZIP/PDF の一覧で見開き調整の reader を必ず引き、Remote の session が無いと失敗する。
+
+代わりに、**一覧画面が使う純粋な関数** (`book_materialization` の adapter、`folder_scan` の materializer、
+`ZipTree`) を agent の worker から直接呼ぶ。どれも `pub(crate)` で UI の状態に触れない。Remote のコードは変えない。
+
+`list_folder`:
+
+- 指定: `path` (絶対 path) と、ZIP の中のフォルダを指す任意の `subresource` (末尾 `/` の相対 path。
+  既存の `book_scope::validate_relative_reference` で検証)。
+- 一覧できるもの: 実フォルダ、ZIP (cbz 含む)、PDF。**RAR・7z 等の変換が要る書庫・EPUB・ZIP の中の ZIP の中は 1b では
+  一覧しない** (変換・cache・password の組み合わせを持ち込まないため)。項目としては一覧に出し (`kind` で区別)、
+  中を求められたら「この形式の中は一覧できません。mIV で開いてください」の tool error。
+- 経路:
+
+  | 対象 | 経路 |
+  |---|---|
+  | 実フォルダ | `scan_directory_with_settings` に取消を足した形 (既存の `scan_directory_with_visibility_cancel` と同じく途中で `Interrupted` を返す) → `materialize_local_folder_listing_with_order` |
+  | ZIP | `enumerate_image_entries_detailed_readonly_with_cancel` → `PreparedZipEnumeration::prepare` → 一覧画面と同じ raw / 表示の prefix → `materialize_archive_level(..., BOOK_READING_PAGE_ORDER, Some(grid_display_order))` → `project_archive_composition` |
+  | PDF | ページ数は catalog の `pdf_meta` を読み取り専用で引き、無ければ取消付きの `enumerate_pages_with_read_target` → `materialize_cached_document_rows` → `project_document_composition` |
+
+- 設定: 検索と同じく、その都度 `load_into_settings` で読んだ現在の設定。お気に入りの中のフォルダなら、
+  お気に入りごとの表示状態を DB から読み取り専用で読んで重ねる (一覧画面と同じ重ね方。DB への保存は 500 ms
+  遅れるので、変えた直後は最大でその分古い。読み取りの結果としてはそれで足りる)。
+  ファイル名 prefix スタックの畳み表示は UI の一時状態なので重ねない (畳まない一覧を返す)。
+- 本の構成: `BookCompositionService` の `snapshot()` (lock だけ、I/O なし) から、一覧画面と同じ範囲の key で引く。
+  agent server は service より前に起動するので、`install_agent_readers` で service の clone を共有 reader の束に入れる
+  (FTS の handle と同じ遅れた設置)。未設置の間は「起動処理中」の tool error (構成を黙って落とさない)。
+  保存中の構成の変更は snapshot に入っていないことがある (読み取りの時点の確定値を返す。変更の完了は待たない)。
+- 画像フォルダには本の構成が無い (一覧画面でも `ImageFolder` は対象外) ので、構成は ZIP/PDF だけに掛かる。
+- **書き込まない**: 一覧画面の ZIP の worker が行う `zip_key_migration`、Remote が行う `pdf_meta` の保存は agent ではしない。
+- 返す行: 項目の識別 (`path` + `subresource`)・名前・`kind` (`folder` / `image` / `video` / `audio` / `zip` / `pdf` /
+  `epub` / `archive` / `zip_folder` / `pdf_page` / `zip_entry`)・大きさ・更新日時 (分かるものだけ)。
+  本の構成で非表示のページは返さない。結果に `book_composition_applied` を付ける。
+- ページ: 全件を作ってから並びが決まる tool (§15.4)。`limit` は既定 100・最大 200。cursor には正規化した引数の
+  digest・位置と、**一覧全体の識別の列から作った digest** を入れる。続きを求められた時に作り直した一覧の digest が
+  違えば「一覧が変わりました。最初から取り直してください」の tool error (途中でフォルダが変わった時に、
+  抜けや重複を黙って返さない)。
+- 期限: 走査・列挙・PDF のページ数は取消を受ける。materializer と構成の投影は CPU だけの処理で、その前後で
+  取消を確かめる。期限が来たら §15.4 の「時間切れ」の tool error。
+
+`get_thumbnail`:
+
+- 「AI に縮小画像を見せる」が ON の時だけ `tools/list` に出し、OFF なら拒否する。
+- 対象: 画像・フォルダ・ZIP/PDF/書庫のファイル (代表の縮小画像)・ZIP の項目・PDF のページ。
+  **動画・音声は 1b では「縮小画像なし (未対応)」** として返す (動画は pin・sidecar・Windows Shell と経路が別で、
+  取消も受けない)。
+- 経路: 一覧画面の要求を作る関数 (`make_load_request_with_visibility` と `container_cache_base_key`。今は App の
+  private method) を、設定と項目だけを受ける `pub(crate)` の関数に取り出し (挙動は変えない)、一覧画面と agent の
+  両方がそれを使う。cache の key・代表の pin・種類の fingerprint は一覧画面と同じになる。
+  生成は既存の `process_load_request` に agent 自身の取消 (`Arc<AtomicBool>`) を渡す。
+- **RAW は現像しない**: Remote と同じ `RawThumbHandoff::RemotePreviewOnly` を使い、埋め込みの preview か
+  cache だけ。半分の現像が要るなら「縮小画像なし」。RAW 現像 executor を agent では使わないので、その寿命を
+  共有・停止する組み合わせが無い。
+- 返す画像: cache に当たっても、decode → 回転 (回転 DB の読み取り) → 要求の一辺 (cache の大きさを上限) で
+  WebP に encode し直す (Remote と同じ)。cache の bytes をそのまま返す近道は作らない (古い行に JPEG があり、
+  回転・pin の補正の有無で条件が分かれるため)。品質は設定の値。
+- **cache への保存**: 一覧画面と同じ admission (`CatalogAccess::admit`、cache 削除中は表示だけ) と保存方針
+  (`CacheDecision::from_settings`、RAW は縮小画像を上書きしない) で、生成した時だけ書く。
+  agent 専用の cache は持たない。
+- 予算 (§15.4): 画像は MCP の `content` の image block (`image/webp`) にだけ置き、text と `structuredContent` には
+  項目の識別・状態 (`ok` / `too_large` / `unavailable` / `unsupported`)・寸法だけを置く。1 件 256 KiB・合計 1 MiB。
+  agent IPC では画像の bytes を別の欄で運ぶ (版 2 は未リリースなので型を足す)。
+- 期限: 指定順に 1 件ずつ作るので prefix が確定する tool。期限に達したら確定済みの画像 + 進む cursor (入力の位置から
+  再開)。1 件もできなければ時間切れの error。
+- 共有するもの: 現在の設定の読み取り、プロセス共通の I/O の上限、PDF worker pool、catalog の admission。
+  分けるもの: 取消 (要求ごとの `Arc<AtomicBool>`)、要求の識別。agent 専用の cache は持たない。
+
+所有と終了 (受け入れ条件):
+
+- Remote と同時に使える: Remote の engine・session・cache を使わないので、片方の取消は他方に効かない。
+- 終了順: 外側の owner は agent server → Remote → collection actor → 本の構成の owner の順に止める
+  (`lib.rs` で確認済み)。agent server の停止は各 worker の終了を待つので、1b の重い読み取りはすべて取消で止まること。
+- `App::on_exit` は agent の worker が動いている間に走り、本の構成の service の受付を閉じる (`close_admission`)。
+  `snapshot()` はその後も読めるので、agent は `snapshot()` を使う (`current_candidate_snapshot()` は閉じた後
+  `None` を返すので使わない)。
 
 ### 15.6 mIV で開く (1c)
 
+2026-10-31 にコードで経路を確かめ、§15.6 の初版の方針 (二重起動と同じ受付・1 回限りの応答・保留しない) を具体化した。
+
 - `open_in_viewer(path)`: 許可の範囲が 3 以上の時だけ出す。annotation は実際の性質のまま
   (`readOnlyHint=false`・`destructiveHint=false`・`idempotentHint=true`)。確認を出さないのは登録側の設定で行う (U9)。
-- 経路は二重起動で開くのと同じ受付 (`activation_open_path_tx` → UI thread の `poll_activation_open_paths` →
-  `start_startup_open_path_resolve`)。**新しい open 経路は作らない** (§4.1)。detached viewer の述語・viewport 経路は
-  変えない (既存経路の中でそれらが使われるのはそのまま)。
-- **受付の結果を返す** (独立レビュー P2-8): 既存の受付は、本の構成 editor 中は破棄、文書を開くモーダル中は保留、
-  sidecar の復元中は破棄し、複数の要求は最後の 1 件だけを採る。どれも通常の使い方で起こる。よって agent 由来の
-  要求には **1 回限りの応答の口**を付け、UI thread が既存の判定をした時点で「受け付けた / 拒否 (理由)」を返してから
-  既存の resolver へ渡す。表示の完了は待たない。
-  - **受理の確定点**は、共通の受付が resolver へ実際に引き渡せると決めた時点 (独立レビュー 2 巡目 P2-1)。
-    その時点で 1 度だけ「受け付けた」を返す。受理の後に別の操作で表示が移っても、追加の応答はしない。
-  - 置き換え・取消・期限切れの対象は**未受理の要求だけ**。後から来た要求に置き換えられた未受理の agent 要求には
-    「別の要求で置き換えられました」を返す。
-  - 要求の状態は既存の「Pending → Claimed / Cancelled」と同じ形の受付 owner で持つ (Remote の session にある型を
-    再利用できるかを実装 brief で確かめる)。期限切れ・取消で Cancelled になった要求は、遅れて UI に届いても実行しない。
-  - agent 由来の要求は保留しない。モーダル中は保留ではなく拒否、resolver の入口が再 queue する場面 (EPUB の
-    cache 削除中など) も agent 要求は「いまは開けません」で拒否する (poll だけでなく resolver の入口も確かめる)。
-    保留が無いので、保留中の権限取消という組み合わせも無い。
-  - UI thread で受理する直前に権限 snapshot を再照合する。受理後は §15.4 の「受理済みの操作」の扱い。
-  - `ActivationOpenPath::received` の第 2 引数は Remote session の snapshot 取得用。二重起動と同じく
-    `Some(&session)` を渡し、取得世代を保つ (`None` は「Local 指定」の意味ではない)。
-  - 二重起動と同じく mIV の窓を前面に出す。
-  - 応答を待つ時間には上限を置き、超えたら「mIV が応答しません」を返す (まれな失敗、既定の割り切り)。
-- 受付前に分かる拒否 (Remote の phase が `Local` 以外、存在しない path) は UI へ送らずに返す。
+- **指定は path だけ**。二重起動の経路は path しか運ばず (ZIP の項目・PDF のページを指す口が無い)、
+  resolver は存在しない path を親のフォルダに読み替える。よって:
+  - `subresource` は 1c では受けない (schema に置かない)。ZIP/PDF はファイルとして開く (一覧画面と同じく中を開く)。
+  - 絶対 path・NUL なし・**存在すること**を worker で確かめる。存在しない path を親フォルダで「受け付けた」にしない。
+  - 画像・動画・音声のファイルは、そのフォルダを開いて選択し全画面にする (二重起動と同じ)。それ以外の
+    ファイルはそのファイルのあるフォルダを開く。tool の説明に書く。
+- **受付の owner**: 二重起動の channel (`activation_open_path_tx`) には混ぜず、**agent の「開く」専用の
+  受付**を App に持たせる。二重起動の channel は最後の 1 件だけを残して他を黙って捨て、モーダル中・Remote の
+  phase 中は再送で保留するので、agent の要求ごとに応答を返せない。
+  - 要求の状態は Remote の `UiRequestDispatch` (Pending → Claimed / Cancelled の CAS) と同じ形。今は private なので、
+    約 30 行の型を `pub(crate)` の共通の型に取り出し、Remote と agent の両方が使う (Remote の挙動は変えない)。
+    Remote session の UI queue そのものは、Local の phase では受付を閉じているので使わない。
+  - 同時に処理する「開く」は全体で 1 件。2 件目は Busy で返す (未受理の agent 要求どうしの置き換えが無くなる)。
+  - agent server は App より前に起動するので、App の作成時に受付の送り口と egui の `Context` を設置する
+    (`install_agent_readers` と同じ遅れた設置)。未設置の間は「mIV の起動処理中です」。
+- **worker 側** (UI へ送る前に分かる拒否): path の検証、Remote の phase が `Local` 以外。
+  二重起動と同じく `ActivationOpenPath::received(path, session)` で受信時の Remote の状態を取る
+  (`session` は App と同じ handle。Remote が起動していなければ両方 `None` で一致する)。
+- **窓を前に出す**: 二重起動は別の event で窓を戻してから (tray・最小化から復帰) 前面にする。agent の要求でも、
+  UI へ送る前に同じ処理 (`window_activation::activate_main_window`) を起こす。窓が隠れたままだと UI の pass が
+  回らず、受付まで届かないため。前面化は OS が拒むことがあり (失敗はログだけ。二重起動と同じ)、MCP exe は
+  要求の前に `AllowSetForegroundWindow` で core に前面化を許す (pipe の相手の PID から。効くかは未確認、
+  1d の実機確認で見る)。前面化の成否は応答に含めない。
+- **UI thread の判定** (`update_frame` の先頭、起動中の overlay で return するより前で受付を drain する):
+  1. Cancelled なら捨てる (期限切れで遅れて届いた要求は実行しない)。`try_claim` で Claimed にする。
+  2. 起動中の overlay が出ていれば拒否「mIV の起動処理中です」。
+  3. 許可の段を照合する (3 以上でなければ拒否)。open は縮小画像・撮影位置を使わないので、照合するのは段だけ。
+  4. `poll_activation_open_paths` の判定 (Remote・本の構成 editor・文書を開くモーダル・sidecar 復元) を、
+     理由を型で返す 1 つの関数に取り出し、二重起動と agent が共有する。二重起動はその理由で今と同じく
+     捨てる / 保留し、agent は理由つきの拒否を返す。
+  5. resolver の入口 (`start_startup_open_path_resolve`) に agent の source を足し、入口の判定の結果を返すようにする
+     (`Admitted` / `Requeued` / `Refused(理由)`)。二重起動では `Requeued` (モーダル・EPUB の cache 削除中の再送) を
+     今のまま行い、agent では再送せず「いまは開けません (理由)」を返す。
+  6. 入口が `Admitted` を返した時点が**受理の確定点**。その時 1 度だけ「受け付けた」を返す
+     (`ReplyPolicy::AcceptedOperation`。送信直前の権限の再照合で失敗に変えない)。
+- 同じ frame の順序: agent の受付を先、二重起動を後に処理する。両方来たら利用者自身の二重起動が後から置き換える
+  (agent 要求は受理済みなので追加の応答はしない)。
+- **受理の後に分かる失敗は応答しない**: resolver は受理の後にも、Remote の取得による取消・RAR の続きの巻・
+  開けない path などで拒否することがあり、mIV の画面に表示される (二重起動と同じ)。tool の結果の文は
+  「mIV で開く処理を始めました」とし、表示の完了を意味しない。
+- 応答の待ち: worker は 5 秒待ち、来なければ `cancel_pending` を試みる。取消に成功すれば「mIV が応答しません」、
+  既に Claimed なら同じ frame の中で応答が来るのでそれを待つ (まれな失敗は既定の割り切り)。
+- detached viewer: 述語・viewport 経路は変えない。resolver の中で agent の source は二重起動 (`Activation`) と
+  同じ分岐を通り、bookmark 専用の detached の分岐は通らない。触れる関数は `startup_ops.rs` の入口の戻り値と
+  source の追加、`poll_activation_open_paths` の判定の取り出しで、detached-rework-plan の憲法の対象
+  (detached の述語・viewport の routing) には入らない。この判断も独立レビューで確かめる。
 
 ### 15.7 設定画面・見せる範囲・AI アプリへの登録 (1d)
 
@@ -1388,6 +1482,13 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 | 未実装の段も設定画面に出す | 出さない。実装済みの段だけ |
 | 「接続中の AI アプリ」を表示する | しない。pipe は要求ごとに開き直すので「最近使った」にする |
 | cursor に引数を複製する | しない。正規化した引数の digest で照合する |
+| 1b で Remote の container を分けて使う | 使わない。一覧画面の純粋な関数を直接呼ぶ (Remote の一覧は一覧画面と規則が違う) |
+| 1b で RAR・7z・EPUB・ZIP の中の ZIP の中を一覧する | しない。変換・cache・password の組み合わせを持ち込まない |
+| 1b で RAW を現像して縮小画像を作る | しない。preview と cache だけ。RAW 現像 executor の寿命を共有しない |
+| 1b で cache の bytes をそのまま返す近道 | 作らない。常に decode → 回転 → encode |
+| 1b で動画・音声の縮小画像 | 返さない (経路が別で取消を受けない) |
+| 1c で二重起動の channel に agent 要求を混ぜる | 混ぜない。専用の受付で、同時に 1 件だけ |
+| 1c で ZIP の項目・PDF のページを指して開く | しない。path だけ |
 
 まれな失敗は既定の割り切り (ログ + tool error)。
 
