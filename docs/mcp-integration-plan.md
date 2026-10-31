@@ -1465,30 +1465,105 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 
 ### 15.7 設定画面・見せる範囲・AI アプリへの登録 (1d)
 
-- 環境設定の「AI 連携」ページ (§7.5.3) を本実装にする。段階 0 の 1 行の選択を置き換える。
-  - 許可の範囲 (§15.2、実装済みの段だけ)、縮小画像・撮影位置のチェック。
-  - 見せる範囲の 3 欄 (§5.6)。設定から生成し、変えるとその場で変わる。
-  - 許可の範囲の中の操作は確認なしで実行されることと、それが唯一の上限であることを書く (§5.5)。
-  - **「最近使った AI アプリ」** (独立レビュー P2-10): アプリ名・版と、最後に tool を実行した時刻 (保存しない)。
-    MCP exe は要求ごとに pipe を開き直すので「接続中」は表せない。内部の状態照会は時刻に数えない。
-    `clientInfo` は旧版では握手の値を接続の間保持し、2026-07-28 では各要求の `_meta` から取り、
-    どちらも agent IPC の各要求で core へ渡す (agent IPC の版を 2 に上げる。未リリースなので互換は持たない)。
-    自己申告の値なので長さを制限し、表示は参考情報と明記する。
-  - AI アプリごとの行 (Claude Desktop / ChatGPT): 検出・登録状態・「登録する」「登録を外す」「手順を見る」。
-- 登録の自動化 (§7.5.1 A / §7.5.2) に U9 と独立レビュー P2-11 を加える:
-  - **書き込む前に対象のアプリが終わっていることを確かめる**。Claude は `claude.exe`、ChatGPT は ChatGPT アプリと
-    同じ設定ファイルを使う Codex CLI・IDE 拡張も止めてもらう (共有の `config.toml` を他方と同時に書き換えると、
-    `.bak` と rename だけでは他方の変更を残せない)。動いていれば書かずに案内する。終了の待ち合わせ・自動終了はしない。
-    書く直前にファイルを読み直す。
-  - ChatGPT (Codex): `[mcp_servers.mimageviewer]` に `default_tools_approval_mode = "approve"` を書く
-    (公式の設定リファレンスに有効な値として載っている。「確認なしで許可」の意味は文書で明言されておらず、
-    1d で Codex CLI の実動作で確かめる。未確認)。
-  - Claude Desktop: 設定ファイルに tool ごとの許可を書く項目は文書で確認できない。初回の確認画面で
-    「常に許可」を選ぶよう案内の文に書く。
-  - 書き換えるファイルと書く内容を、押した時に表示して確認する (§7.5.3)。
-- 書く `command` は配布形態ごとに決める (§15.8)。1e までは開発用の位置 (portable smoke・`target`) を指す。
-- UI の規則 (coding-conventions): ダイアログ・配色・IME・UI thread で設定ファイルを読まない
-  (検出と登録状態の判定は worker)、スナップショット更新、`check_ui_glyphs.py`。
+2026-11-01 にコードを確かめて詳細化した (経路は実装 brief に file:line で書く)。
+
+**ページ**
+
+- 環境設定に「AI 連携」のページを新しく作り、「起動と連携」の下に置く。段階 0 で「全般」に置いた 1 行
+  (許可の範囲の ComboBox) はこのページへ移す。設定の検索の索引も移す (全 anchor に索引が要る既存のテストがある)。
+- ページの上から:
+  1. **許可の範囲** (§15.2): 実装済みの 3 段 (無効 / 読み取りのみ / 読み取りと、mIV で開く) の選択。
+  2. **縮小画像**・**撮影位置** のチェック (既定 OFF)。
+  3. **見せる範囲の 3 欄** (§5.6): 「AI に見せるもの」「見せないもの」「AI に許す操作」を、編集中の設定の値から
+     毎 frame 作る (固定文ではない)。選択やチェックを変えるとその場で欄が変わる。実際の許可は他の設定と同じく
+     OK で確定する。欄に含める文 (1b・1c で決まったもの):
+     - 縮小画像 ON の時「縮小画像 (補正・編集は反映しない。隠す編集をした画像は渡さない。動画・書庫の代表は渡さない)」。
+     - 撮影位置 OFF の時、撮影位置は「見せないもの」の欄。
+     - 「mIV で開く」の段では「AI に許す操作」に「mIV の画面で開く (表示が切り替わる)」。
+  4. 欄の下に固定の注意: 「この情報は、お使いの AI アプリ (Claude / ChatGPT) の提供元へ送られます。各社の
+     プライバシーポリシーに従って扱われます。mIV の開発者には送られません」「許可の範囲の中の操作は、AI アプリの
+     確認なしで実行されます。ここで選ぶ範囲が唯一の上限です」(§5.5)。
+  5. **最近使った AI アプリ** (下)。
+  6. **AI アプリごとの行** (Claude Desktop・ChatGPT) (下)。
+- 配色・文言・UI の規則は coding-conventions に従う (色は `ui.visuals()` の値、`check_ui_glyphs.py`、編集不可の長文は
+  選択できる label + コピーのボタン。生の `TextEdit` は使わない)。
+
+**最近使った AI アプリ**
+
+- 表示: AI アプリが名乗った名前・版と、最後に tool を実行した時刻。保存しない (mIV を閉じると消える)。最大 8 件、古い順に落とす。
+  自己申告の値なので、名前 128 文字・版 64 文字で切り、「AI アプリが名乗った名前です」と添える。
+- 運び方: agent IPC の `Hello` に、名前に加えて**版**と**要求の種類** (`tool` / `internal`) を足す (版 2 は未リリース、
+  互換は持たない)。MCP exe は、旧版の握手では `initialize` の `clientInfo` (名前・版) を接続の間持ち、2026-07-28 版では
+  各要求の `_meta` から取る。**5 秒ごとの状態の照会と `tools/list` から作る照会は `internal`**、AI が呼んだ tool
+  (`miv_status` を含む) は `tool`。
+- core は `Connection` に名前・版・種類を持ち、`tool` の要求の結果を記録する所 (既存の `record`) で、共有の
+  「最近の AI アプリ」の表 (`Arc<Mutex<..>>`) の時刻を更新する。拒否・時間切れも「実行した」に数える (呼ばれた事実を示す)。
+  `Hello`・`Cancel`・`internal` は数えない。表は既存の `install_agent_open` と同じ形で App に渡し、UI は表示の時に読むだけ。
+
+**AI アプリごとの行**
+
+各行に、検出・登録状態・「登録する」「登録を外す」「手順を見る」を置く。登録・解除は SendTo や TensorRT の pack と同じく
+**即時実行** (OK / キャンセルとは無関係) で、そう明記する。許可の範囲が「無効」のままなら「登録しても、許可の範囲を選ぶまで
+AI アプリからは使えません」と添える。
+
+- **登録する command** (§15.8 と同じ規則。どの配布形態でも**解決済みの絶対の `--data-dir` を必ず付ける**。状態を減らすため
+  「既定の data dir なら省く」を作らない):
+  - launcher から起動された時 (`MIV_LAUNCHER_EXE_PATH` がある): `<launcher の絶対 path> --mcp --data-dir <data dir>`。
+    launcher の `--mcp` は 1e で作る。それまでは開発中の launcher で使うことは無い。
+  - それ以外 (portable・開発の起動): `current_exe()` と同じフォルダの `mimageviewer-mcp.exe` に `--data-dir <data dir>`。
+    その exe が無ければ「登録する」を押せなくし、理由を出す。
+- **検出と登録状態の判定は worker** で行う (UI thread で設定ファイルを読まない)。ページを開いた時と「再確認」で走らせ、
+  結果を channel で受ける (preferences の外部ツールの確認と同じ形。`Disconnected` は「確認に失敗しました」と表示する)。
+  - 状態: 「見つからない」「未登録」「登録済み」「登録先が違う」(`mimageviewer` の項目があるが command・args が今の値と違う。
+    mIV を移した・data dir が違う) 「設定ファイルを読めない」(JSON・TOML として読めない。その時は書かない)。
+  - 「登録先が違う」の時は「登録し直す」を出す。起動時に黙って書き換えることはしない。
+- **登録・解除の流れ**:
+  1. 押すと確認の窓 (TensorRT の pack の削除と同じ形) に、書き換えるファイルの path と、足す / 消す内容を出す。
+  2. 「書き換える」で worker が次を順に行う: (a) 対象のアプリが動いていないことを確かめる。動いていれば書かずに
+     「<アプリ> を終了してから押してください」(終了の待ち合わせ・自動終了はしない)。(b) ファイルを読み直す。(c) 前の内容を
+     `<ファイル>.mimageviewer.bak` に上書きで 1 つ残す。(d) 一時ファイルに書いて既存の `replace_file_atomic` で置き換える。
+  3. 結果を行に出す。成功なら「<アプリ> を起動して、新しいチャットで mIV の tool が出るか確かめてください」。
+  - 失敗はまれな失敗の既定の割り切り (ログ + 表示、再試行しない)。ログに設定ファイルの中身は出さない。
+- **Claude Desktop**:
+  - 設定ファイル: `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json` のうち
+    最初に在るもの、無ければ `%APPDATA%\Claude\claude_desktop_config.json` (段階 0 の試験スクリプトと同じ)。
+    ファイルが無ければ `{"mcpServers": {...}}` だけの新しいファイルを作る。
+  - 検出: `%LOCALAPPDATA%\AnthropicClaude` か `Packages\Claude_*` のどちらかが在れば「入っている」。
+  - 動作中の判定: **実行ファイルの path で判定する** (`%LOCALAPPDATA%\AnthropicClaude\` の下、または
+    `WindowsApps\Claude_*` の下)。名前 `claude.exe` だけでは判定しない (Claude Code の CLI も `claude.exe`)。
+    process の列挙は既存の `runtime_cleanup.rs` の `K32EnumProcesses` + `QueryFullProcessImageNameW` を共有する。
+  - 書く内容: `mcpServers.mimageviewer = {"command": "...", "args": [...]}`。他の項目には触れない。**最上位と
+    `mcpServers` の key の順序を保ち、他の値を変えない** (`serde_json` の `preserve_order` を crate 全体で有効にする方法は
+    使わない。全体の JSON の挙動が変わるため)。整形 (字下げ 2) は変わってよい。
+  - Claude Desktop の設定ファイルに tool ごとの許可を書く項目は文書で確認できないので、手順の文に
+    「初回の確認画面で『常に許可』を選んでください」と書く (U9)。
+- **ChatGPT (Codex)**:
+  - 設定ファイル: `CODEX_HOME` があれば `%CODEX_HOME%\config.toml`、無ければ `%USERPROFILE%\.codex\config.toml`。無ければ作る。
+  - 検出: `Packages\OpenAI.Codex_*` か `%USERPROFILE%\.codex` が在れば「入っている」。
+  - 動作中の判定: `WindowsApps\OpenAI.Codex_*` の下の process、または名前が `codex.exe` の process (Codex CLI・IDE 拡張。
+    同じ `config.toml` を共有し、同時に書くと他方の変更を失う。§15.7 初版の独立レビュー P2-11)。
+  - 書く内容: `[mcp_servers.mimageviewer]` に `command`・`args`・`default_tools_approval_mode = "approve"`。
+    `toml_edit` (直接の依存に足す) で他の表・コメント・書式を残す。改行コード (CRLF / LF) はファイルのものを保つ。
+    `approve` が「確認なし」の意味かは文書で明言されていないので、1d の後の実機確認で見る (未確認)。
+  - 「設定を開く」ボタンで `codex://settings` を開く (既存の `open_url` は http(s) だけを通すので、この固定の 1 つだけを
+    `opener` で開く)。
+- **手順を見る**: 自動登録を使わない人向けに、設定ファイルの path、足す内容 (JSON / TOML、選択できる表示 + コピー)、
+  各アプリの画面での手順 (Claude: 終了 → 書く → 起動、ChatGPT: Settings > MCP servers > Add server > STDIO → 再起動) を出す。
+- 段階 0 の試験で使った `mimageviewer-trial` の項目は扱わない (利用者が手で消し済み)。
+- Grok は対象外で、行も置かない (§11.1 U5)。
+
+**テスト**
+
+- 見せる範囲の欄の生成 (段 × 縮小画像 × 撮影位置の全 12 通り) の単体テスト。
+- 設定ファイルの編集の単体テスト: JSON (無い・空・他の項目あり・key の順序・`mimageviewer` の置き換え・解除・壊れた JSON は
+  書かない)、TOML (コメント・他の表・CRLF の保持・置き換え・解除・壊れた TOML は書かない)。process の判定は注入した一覧で
+  (Claude Code の `claude.exe` を Desktop と誤認しないこと)。
+- 「最近使った AI アプリ」: `internal` の照会・`Hello`・`Cancel` を数えない、`tool` は拒否も数える、8 件で古い順に落ちる。
+- UI スナップショット: AI 連携のページを、無効・読み取りのみ (縮小画像 OFF)・mIV で開く (縮小画像・撮影位置 ON) の 3 状態 ×
+  light / dark。1093×614 でも操作が全部見えること (起動時のダイアログの規則に準じる)。
+- 登録・解除の実ファイル書き込みは、テスト用の一時フォルダの path を注入して確かめる。利用者の設定ファイルには触れない。
+- 実アプリでの確認 (§9.2): 1d の後に 1 回だけ利用者に頼む。登録 → 各アプリの再起動 → tool が出る・呼べる・確認が出ないか・
+  mIV で開く時に窓が前に出るか。
 
 ### 15.8 配布の仕組み (1e)
 
@@ -1496,7 +1571,7 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 
 | 配布形態 | AI アプリに登録する command | 理由 |
 |---|---|---|
-| インストーラ版・単体 exe 版 | `mimageviewer.exe --mcp` (launcher) | runtime フォルダが版ごとに変わるので、利用者が置いた launcher を指す |
+| インストーラ版・単体 exe 版 | `mimageviewer.exe --mcp --data-dir <解決済みの data dir>` (launcher。1d で `--data-dir` を常に付けると決めた) | runtime フォルダが版ごとに変わるので、利用者が置いた launcher を指す |
 | ポータブル版 (zip) | 同梱の `mimageviewer-mcp.exe` を直接、解決済みの `--data-dir` を必ず付ける | ポータブル版の `mimageviewer.exe` は core を改名したもので launcher ではない |
 
 コード上の差し込み位置 (2026-10-31 確認):
