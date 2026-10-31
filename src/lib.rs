@@ -1149,14 +1149,11 @@ pub fn finish_gui_run(prepared: PreparedRunExit, session: &mut GuiRunSession) ->
 pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
     #[cfg(windows)]
     match effetune::startup::handle_test_arguments() {
-        Ok(Some(code)) => {
-            finish_logs();
-            std::process::exit(code);
-        }
+        Ok(Some(code)) => exit_gui_startup(code, session),
         Ok(None) => {}
         Err(error) => {
             write_to_parent_console(&format!("error: {error}\n"));
-            std::process::exit(1);
+            exit_gui_startup(1, session);
         }
     }
     miv_startup::init_process(
