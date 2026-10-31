@@ -29,11 +29,11 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use music_core::{AnalysisConfig, analyze_stereo_waveform_cancellable};
 use musicvideo_core::{
-    AnalysisKey, AnalysisTimeline, Assets, AudioRef, Frame, FrameGrid, ImageAsset, ImageId,
-    ImageRef, LayerId, LayerKind, LrcParseReport, LyricLine, ModulatorCalibration,
-    ModulatorCalibrationRequest, ModulatorValue, Project, RenderReport, Smoothing, SpectrumFrame,
-    UnresolvedAsset, calibrate_modulators_view, evaluate, modulator_calibration_requests,
-    new_image_layer, parse_lrc, pcm_view, render_frame, write_lrc,
+    AnalysisKey, AnalysisTimeline, Animatable, Assets, AudioRef, Fit, Frame, FrameGrid, ImageAsset,
+    ImageId, ImageRef, LayerId, LayerKind, LrcParseReport, LyricLine, ModulatorCalibration,
+    ModulatorCalibrationRequest, ModulatorValue, NormRect, Project, RenderReport, Smoothing,
+    SpectrumFrame, UnresolvedAsset, calibrate_modulators_view, evaluate,
+    modulator_calibration_requests, new_image_layer, parse_lrc, pcm_view, render_frame, write_lrc,
 };
 use musicvideo_ui::{
     DocumentSession, DocumentSessionId, EditGeneration, EditTargetLifetime, EditorCommand,
@@ -1183,7 +1183,24 @@ impl MusicVideoLabApp {
             }
             ImageLoadTarget::AddLayer => {
                 let id = next_image_id(&self.project);
-                let layer = new_image_layer(&self.project, id.clone());
+                let mut layer = new_image_layer(&self.project, id.clone());
+                // Decoded dimensions are available here; keep placement in the
+                // same history/resource transaction as inserting the image.
+                let output_width = self.project.output.width as f32;
+                let output_height = self.project.output.height as f32;
+                let scale =
+                    (output_width / image.width as f32).min(output_height / image.height as f32);
+                let width = image.width as f32 * scale / output_width;
+                let height = image.height as f32 * scale / output_height;
+                layer.rect = Animatable::Const(NormRect::new(
+                    (1.0 - width) * 0.5,
+                    (1.0 - height) * 0.5,
+                    width,
+                    height,
+                ));
+                if let LayerKind::Image { fit, .. } = &mut layer.kind {
+                    *fit = Fit::Contain;
+                }
                 let insertion_index = image_layer_insertion_index(&self.project);
                 self.project.images.push(ImageRef {
                     id: id.clone(),

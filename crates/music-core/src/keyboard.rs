@@ -186,6 +186,8 @@ const MAX_KEYBOARD_LAYOUT_CACHE_ENTRIES: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct KeyboardLayoutCacheKey {
+    inset: u32,
+    min_octave: u32,
     left: u32,
     top: u32,
     right: u32,
@@ -195,8 +197,10 @@ struct KeyboardLayoutCacheKey {
 }
 
 impl KeyboardLayoutCacheKey {
-    fn new(frame: &KeyboardFrame, rect: KeyboardRect) -> Self {
+    fn new(frame: &KeyboardFrame, rect: KeyboardRect, inset: f32, min_octave: f32) -> Self {
         Self {
+            inset: inset.to_bits(),
+            min_octave: min_octave.to_bits(),
             left: rect.left.to_bits(),
             top: rect.top.to_bits(),
             right: rect.right.to_bits(),
@@ -361,6 +365,15 @@ fn update_level_trails(
 
 /// 鍵盤の座標と描画順を計算する。座標は `rect` と同じ座標系で返す。
 pub fn layout_keyboard(frame: &KeyboardFrame, rect: KeyboardRect) -> KeyboardLayout {
+    layout_keyboard_with_dimensions(frame, rect, 0.25, 1.0)
+}
+
+fn layout_keyboard_with_dimensions(
+    frame: &KeyboardFrame,
+    rect: KeyboardRect,
+    inset: f32,
+    min_octave: f32,
+) -> KeyboardLayout {
     let mut octave_guides_x = Vec::new();
     for c_midi in (KEYBOARD_DISPLAY_MIN_MIDI..=144_u8).step_by(12) {
         let x = shared_spectrum_axis_x_unclamped(rect, midi_to_hz(c_midi));
@@ -375,7 +388,9 @@ pub fn layout_keyboard(frame: &KeyboardFrame, rect: KeyboardRect) -> KeyboardLay
             if is_black_key(midi) != want_black {
                 continue;
             }
-            let Some(key_rect) = conventional_key_rect(rect, midi, want_black) else {
+            let Some(key_rect) =
+                conventional_key_rect_with_dimensions(rect, midi, want_black, inset, min_octave)
+            else {
                 continue;
             };
             let index = midi.checked_sub(frame.note_min_midi).map(usize::from);
@@ -407,7 +422,18 @@ pub fn layout_keyboard_cached<'a>(
     rect: KeyboardRect,
     cache: &'a mut KeyboardLayoutCache,
 ) -> &'a KeyboardLayout {
-    let key = KeyboardLayoutCacheKey::new(frame, rect);
+    layout_keyboard_cached_with_dimensions(frame, rect, 0.25, 1.0, cache)
+}
+
+/// Explicit pixel geometry for offline scene evaluation; the live viewer uses defaults.
+pub fn layout_keyboard_cached_with_dimensions<'a>(
+    frame: &KeyboardFrame,
+    rect: KeyboardRect,
+    inset: f32,
+    min_octave: f32,
+    cache: &'a mut KeyboardLayoutCache,
+) -> &'a KeyboardLayout {
+    let key = KeyboardLayoutCacheKey::new(frame, rect, inset, min_octave);
     let index = cache.entries.iter().position(|entry| entry.key == key);
     let mut entry = if let Some(index) = index {
         cache.entries.remove(index).expect("cache index is valid")
@@ -415,7 +441,7 @@ pub fn layout_keyboard_cached<'a>(
         cache.rebuilds = cache.rebuilds.saturating_add(1);
         KeyboardLayoutCacheEntry {
             key,
-            layout: layout_keyboard(frame, rect),
+            layout: layout_keyboard_with_dimensions(frame, rect, inset, min_octave),
         }
     };
     update_layout_levels(frame, &mut entry.layout);
@@ -727,9 +753,19 @@ fn harmonic_energies(notes: &[f32], idx: usize) -> (f32, f32) {
 }
 
 fn conventional_key_rect(rect: KeyboardRect, midi: u8, black: bool) -> Option<KeyboardRect> {
+    conventional_key_rect_with_dimensions(rect, midi, black, 0.25, 1.0)
+}
+
+fn conventional_key_rect_with_dimensions(
+    rect: KeyboardRect,
+    midi: u8,
+    black: bool,
+    inset: f32,
+    min_octave: f32,
+) -> Option<KeyboardRect> {
     let pc = midi % 12;
     let octave_c = midi - pc;
-    let (x0, white_w) = conventional_octave_geometry(rect, octave_c)?;
+    let (x0, white_w) = conventional_octave_geometry(rect, octave_c, min_octave)?;
     let (left, right, bottom) = if black {
         let r = KEY_BLACK_WIDTH_RATIO;
         let center = match pc {
@@ -763,8 +799,8 @@ fn conventional_key_rect(rect: KeyboardRect, midi: u8, black: bool) -> Option<Ke
             rect.bottom,
         )
     };
-    let left = left + 0.25;
-    let right = right - 0.25;
+    let left = left + inset;
+    let right = right - inset;
     if right <= left {
         return None;
     }
@@ -774,11 +810,15 @@ fn conventional_key_rect(rect: KeyboardRect, midi: u8, black: bool) -> Option<Ke
     Some(KeyboardRect::new(left, rect.top, right, bottom))
 }
 
-fn conventional_octave_geometry(rect: KeyboardRect, octave_c: u8) -> Option<(f32, f32)> {
+fn conventional_octave_geometry(
+    rect: KeyboardRect,
+    octave_c: u8,
+    min_octave: f32,
+) -> Option<(f32, f32)> {
     let c_x = shared_spectrum_axis_x_unclamped(rect, midi_to_hz(octave_c));
     let next_c_x = shared_spectrum_axis_x_unclamped(rect, midi_to_hz(octave_c.saturating_add(12)));
     let octave_w = next_c_x - c_x;
-    if octave_w <= 1.0 {
+    if octave_w <= min_octave {
         return None;
     }
     let white_w = octave_w / 7.0;

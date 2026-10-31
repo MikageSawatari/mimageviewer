@@ -75,6 +75,8 @@ pub enum SceneItemKind {
     Spectrum {
         values: Vec<f32>,
         miv_frame: MivSpectrumFrame,
+        miv_dimensions: music_core::MivSpectrumDimensions,
+        minimum_thickness_px: f32,
         point_count: usize,
         shape: SpectrumShape,
         color_mode: MusicColorMode,
@@ -83,6 +85,7 @@ pub enum SceneItemKind {
     },
     PitchKeyboard {
         keyboard: KeyboardFrame,
+        dimensions: KeyboardDimensions,
         background: Fill,
         color_mode: MusicColorMode,
         miv_brightness: f32,
@@ -114,6 +117,112 @@ pub enum SceneItemKind {
     },
 }
 
+/// Evaluated pixel dimensions; the rasterizer only consumes these values.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyboardDimensions {
+    pub key_inset_px: f32,
+    pub min_octave_width_px: f32,
+    pub black_corner_px: f32,
+    pub black_stroke_px: f32,
+    pub white_stroke_px: f32,
+    pub guide_half_width_px: f32,
+}
+
+impl Default for KeyboardDimensions {
+    fn default() -> Self {
+        Self {
+            key_inset_px: 0.25,
+            min_octave_width_px: 1.0,
+            black_corner_px: 1.0,
+            black_stroke_px: 0.75,
+            white_stroke_px: 0.8,
+            guide_half_width_px: 0.4,
+        }
+    }
+}
+
+/// One owner for whole-layer scaling, after animation and all unit additions.
+/// Ratios, angles, colors, times and counts deliberately remain unchanged.
+fn scale_item_dimensions(item: &mut SceneItem, scale: f32) {
+    if scale == 1.0 {
+        return;
+    }
+    item.corner_radius_px *= scale;
+    if let Some(glow) = &mut item.glow {
+        glow.radius_px *= scale;
+        glow.spread_px *= scale;
+    }
+    match &mut item.kind {
+        SceneItemKind::Text { size_px, style, .. }
+        | SceneItemKind::TimeText { size_px, style, .. } => {
+            *size_px *= scale;
+            if let Some(outline) = &mut style.outline {
+                outline.width_px *= scale;
+            }
+            for outline in &mut style.extra_outlines {
+                outline.width_px *= scale;
+            }
+            if let Some(shadow) = &mut style.shadow {
+                shadow.offset.0 *= scale;
+                shadow.offset.1 *= scale;
+                shadow.blur_px *= scale;
+                shadow.spread_px *= scale;
+            }
+            if let Some(echo) = &mut style.echo {
+                echo.offset.0 *= scale;
+                echo.offset.1 *= scale;
+            }
+            if let Some(background) = &mut style.background {
+                background.padding_px *= scale;
+                background.corner_px *= scale;
+            }
+            style.letter_gap *= scale;
+            style.line_gap *= scale;
+        }
+        SceneItemKind::Spectrum {
+            shape,
+            miv_dimensions,
+            minimum_thickness_px,
+            ..
+        } => {
+            *minimum_thickness_px *= scale;
+            match shape {
+                SpectrumShape::Bars {
+                    min_height_px,
+                    thickness_px,
+                    ..
+                } => {
+                    *min_height_px *= scale;
+                    *thickness_px *= scale;
+                }
+                SpectrumShape::Radial { thickness_px, .. } => *thickness_px *= scale,
+                SpectrumShape::MivHorizontal => {}
+            }
+            miv_dimensions.band_inset_px *= scale;
+            miv_dimensions.min_width_px *= scale;
+            miv_dimensions.corner_threshold_px *= scale;
+            miv_dimensions.corner_radius_px *= scale;
+            miv_dimensions.bottom_inset_px *= scale;
+            miv_dimensions.height_inset_px *= scale;
+            miv_dimensions.ghost_expand_px *= scale;
+            miv_dimensions.trail_expand_px *= scale;
+        }
+        SceneItemKind::PitchKeyboard { dimensions, .. } => {
+            dimensions.key_inset_px *= scale;
+            dimensions.min_octave_width_px *= scale;
+            dimensions.black_corner_px *= scale;
+            dimensions.black_stroke_px *= scale;
+            dimensions.white_stroke_px *= scale;
+            dimensions.guide_half_width_px *= scale;
+        }
+        SceneItemKind::ProgressBar {
+            border_thickness_px,
+            ..
+        } => *border_thickness_px *= scale,
+        SceneItemKind::Image { .. } | SceneItemKind::Solid { .. } => {}
+    }
+}
+
 /// Evaluates all animation and time-dependent values without touching assets.
 pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Scene {
     let (duration, time) = evaluation_time(project, t_secs);
@@ -137,7 +246,8 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
             glow,
             fill_brightness,
             spectrum_thickness_px,
-            spectrum_radius_px,
+            spectrum_inner_ratio,
+            scale,
         } = evaluate_layer_properties(layer, time, &spectrum.modulators);
         let active_lyric = match &layer.kind {
             LayerKind::Lyrics(lyrics) => {
@@ -177,7 +287,7 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
                 let shape = modulate_spectrum_shape(
                     sanitize_spectrum_shape(layer.shape),
                     spectrum_thickness_px,
-                    spectrum_radius_px,
+                    spectrum_inner_ratio,
                 );
                 let mut miv_frame = if shape == SpectrumShape::MivHorizontal {
                     spectrum.miv_spectrum.clone()
@@ -188,6 +298,8 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
                 SceneItemKind::Spectrum {
                     values,
                     miv_frame,
+                    miv_dimensions: music_core::MivSpectrumDimensions::default(),
+                    minimum_thickness_px: 1.0,
                     point_count: layer.point_count.max(1),
                     shape,
                     color_mode: layer.color_mode,
@@ -197,6 +309,7 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
             }
             LayerKind::PitchKeyboard(layer) => SceneItemKind::PitchKeyboard {
                 keyboard: spectrum.keyboard.clone(),
+                dimensions: KeyboardDimensions::default(),
                 background: brighten_fill(layer.background.evaluate(time), fill_brightness),
                 color_mode: layer.color_mode,
                 miv_brightness: fill_brightness,
@@ -239,14 +352,16 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
                 fill: brighten_fill(layer.fill.evaluate(time), fill_brightness),
             },
         };
-        items.push(SceneItem {
+        let mut item = SceneItem {
             rect,
             opacity,
             rotation_deg,
             corner_radius_px: corner_radius_px.max(0.0),
             glow,
             kind,
-        });
+        };
+        scale_item_dimensions(&mut item, scale);
+        items.push(item);
     }
 
     Scene {
@@ -267,7 +382,8 @@ struct EvaluatedLayer {
     glow: Option<Glow>,
     fill_brightness: f32,
     spectrum_thickness_px: f32,
-    spectrum_radius_px: f32,
+    spectrum_inner_ratio: f32,
+    scale: f32,
 }
 
 fn evaluation_time(project: &Project, t_secs: f64) -> (f64, f64) {
@@ -301,7 +417,7 @@ fn evaluate_layer_properties(
     let mut glow = layer.glow.evaluate(time).map(sanitize_glow);
     let mut fill_brightness = 0.0_f32;
     let mut spectrum_thickness_px = 0.0_f32;
-    let mut spectrum_radius_px = 0.0_f32;
+    let mut spectrum_inner_ratio = 0.0_f32;
     for binding in &layer.modulations {
         let amount = finite_or(binding.amount, 0.0)
             * binding
@@ -332,9 +448,10 @@ fn evaluate_layer_properties(
             ModulationTarget::SpectrumThickness => {
                 spectrum_thickness_px += amount;
             }
-            ModulationTarget::SpectrumRadius => spectrum_radius_px += amount,
+            ModulationTarget::SpectrumRadius => spectrum_inner_ratio += amount,
         }
     }
+    scale = finite_or(scale, 1.0).max(0.0);
     rect = scale_rect_from_center(rect, scale);
     EvaluatedLayer {
         opacity,
@@ -345,7 +462,8 @@ fn evaluate_layer_properties(
         glow,
         fill_brightness,
         spectrum_thickness_px,
-        spectrum_radius_px,
+        spectrum_inner_ratio,
+        scale,
     }
 }
 
@@ -431,7 +549,7 @@ fn scale_rect_from_center(rect: NormRect, scale: f32) -> NormRect {
 fn modulate_spectrum_shape(
     shape: SpectrumShape,
     thickness_delta: f32,
-    radius_delta: f32,
+    inner_delta: f32,
 ) -> SpectrumShape {
     match shape {
         SpectrumShape::Bars {
@@ -444,13 +562,13 @@ fn modulate_spectrum_shape(
             thickness_px: (thickness_px + thickness_delta).max(0.0),
         },
         SpectrumShape::Radial {
-            radius_px,
+            inner_ratio,
             thickness_px,
             start_angle_deg,
             sweep_deg,
             direction,
         } => SpectrumShape::Radial {
-            radius_px: (radius_px + radius_delta).max(0.0),
+            inner_ratio: (inner_ratio + inner_delta).clamp(0.0, 1.0),
             thickness_px: (thickness_px + thickness_delta).max(0.0),
             start_angle_deg,
             sweep_deg,
@@ -525,13 +643,13 @@ fn sanitize_spectrum_shape(shape: SpectrumShape) -> SpectrumShape {
             thickness_px: finite_or(thickness_px, 0.0).max(0.0),
         },
         SpectrumShape::Radial {
-            radius_px,
+            inner_ratio,
             thickness_px,
             start_angle_deg,
             sweep_deg,
             direction,
         } => SpectrumShape::Radial {
-            radius_px: finite_or(radius_px, 0.0).max(0.0),
+            inner_ratio: finite_or(inner_ratio, 0.0).clamp(0.0, 1.0),
             thickness_px: finite_or(thickness_px, 0.0).max(0.0),
             start_angle_deg: finite_or(start_angle_deg, -90.0),
             sweep_deg: finite_or(sweep_deg, 360.0),
@@ -642,7 +760,7 @@ mod tests {
             ModulationBinding {
                 target: ModulationTarget::SpectrumRadius,
                 modulator: ModulatorId(1),
-                amount: 40.0,
+                amount: 0.04,
                 curve: ModulationCurve::Linear,
             },
         ];
@@ -663,20 +781,20 @@ mod tests {
         assert!(
             (item.rect.y + item.rect.height * 0.5 - (base.y + base.height * 0.5)).abs() < 1.0e-6
         );
-        assert_eq!(item.glow.unwrap().radius_px, 30.0);
+        assert_eq!(item.glow.unwrap().radius_px, 33.0);
         let SceneItemKind::Spectrum { shape, .. } = item.kind else {
             panic!("expected spectrum")
         };
         let SpectrumShape::Radial {
-            radius_px,
+            inner_ratio,
             thickness_px,
             ..
         } = shape
         else {
             panic!("expected radial spectrum")
         };
-        assert_eq!(radius_px, 400.0);
-        assert_eq!(thickness_px, 7.0);
+        assert!((inner_ratio - (380.0 / 550.0 + 0.02)).abs() < 1.0e-6);
+        assert!((thickness_px - 7.7).abs() < 1.0e-6);
     }
 
     #[test]
@@ -794,7 +912,7 @@ mod tests {
         assert!((item.opacity - 0.4).abs() < 1.0e-5);
         assert!((item.rect.width - base_rect.width * 1.1).abs() < 1.0e-6);
         assert_eq!(item.rotation_deg, 12.0);
-        assert_eq!(item.glow.as_ref().unwrap().radius_px, 8.0);
+        assert_eq!(item.glow.as_ref().unwrap().radius_px, 8.8);
         let SceneItemKind::Text { text, fill, .. } = &item.kind else {
             panic!("lyrics must share the text rendering path");
         };

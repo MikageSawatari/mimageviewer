@@ -39,13 +39,15 @@ pub use keyboard::{
     KeyboardBassInput, KeyboardCenterInput, KeyboardFrame, KeyboardLayout, KeyboardLayoutCache,
     KeyboardLevels, KeyboardPoint, KeyboardRect, layout_bass_markers, layout_bass_markers_into,
     layout_bass_markers_with_input_into, layout_keyboard, layout_keyboard_cached,
-    prepare_keyboard_frame, prepare_keyboard_frame_into, prepare_keyboard_frame_with_input_into,
+    layout_keyboard_cached_with_dimensions, prepare_keyboard_frame, prepare_keyboard_frame_into,
+    prepare_keyboard_frame_with_input_into,
 };
 pub use playback::{PlaybackIntent, PlaybackSnapshot};
 pub use spectrum_visual::{
-    MIV_SPECTRUM_MAX_SEQUENTIAL_GAP_SECS, MivSpectrumBandFrame, MivSpectrumFrame, MivSpectrumPass,
-    MivSpectrumPrimitive, MivSpectrumState, SPECTRUM_AXIS_MAX_HZ, SPECTRUM_AXIS_MIN_HZ,
-    SpectrumVisualRect, midi_to_hz, spectrum_axis_hz, spectrum_axis_x, spectrum_axis_x_unclamped,
-    spectrum_band_hz, spectrum_band_hz_range, visit_miv_spectrum_primitives,
+    MIV_SPECTRUM_MAX_SEQUENTIAL_GAP_SECS, MivSpectrumBandFrame, MivSpectrumDimensions,
+    MivSpectrumFrame, MivSpectrumPass, MivSpectrumPrimitive, MivSpectrumState,
+    SPECTRUM_AXIS_MAX_HZ, SPECTRUM_AXIS_MIN_HZ, SpectrumVisualRect, midi_to_hz, spectrum_axis_hz,
+    spectrum_axis_x, spectrum_axis_x_unclamped, spectrum_band_hz, spectrum_band_hz_range,
+    visit_miv_spectrum_primitives, visit_miv_spectrum_primitives_with_dimensions,
 };
 pub use timeline::{MediaVisualMode, MusicBookmark, MusicModeSource, MusicTimelineLayout};

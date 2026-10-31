@@ -264,7 +264,8 @@ pub enum SpectrumShape {
         thickness_px: f32,
     },
     Radial {
-        radius_px: f32,
+        /// Inner radius as a fraction of half the layer box's shorter side.
+        inner_ratio: f32,
         thickness_px: f32,
         start_angle_deg: f32,
         sweep_deg: f32,

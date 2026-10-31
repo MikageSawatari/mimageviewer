@@ -19,6 +19,12 @@ mod text;
 #[cfg(test)]
 mod selection_tests;
 
+#[cfg(test)]
+mod p5a_tests;
+
+#[cfg(test)]
+mod clipping_tests;
+
 pub use anim::{Interpolate, easing_amount, evaluate_track};
 pub use assets::{
     AssetError, Assets, ImageAsset, MAX_SCALED_IMAGE_CACHE_ENTRIES, ScaledImageCacheStats,

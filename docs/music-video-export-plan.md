@@ -2935,6 +2935,14 @@ AI イラスト 3 枚・タイトルロゴで wav2bar 相当の試作を書き�
    - レイヤー一覧の操作ボタン（奥へ・手前へ・削除・追加）を一覧の上の固定位置に置き、一覧だけをスクロールさせる。
      レイヤーが増えるとボタンが下へずれ、設計担当が操作中に削除ボタンを誤って押した（確認で取り消し）。
 
+6. **形は画面で切り詰める前の矩形で計算し、画面での切り抜きは描画時だけにする**（2026-10-31、設計担当が決定。
+   P5a 実装担当の停止報告による）。従来は評価済み矩形を出力画面へ切り詰めた `PixelRect` から形を求めていたため、
+   画面をはみ出す矩形（既定の円形 1100×1100 は高さ 1080 をはみ出す）では外径が切り詰め後の短辺で決まり、
+   `Scale` で矩形を広げても輪が大きくならなかった（v3 の内径差 0px の実際の原因）。1 の「矩形＝中身の範囲」に合わせ、
+   全種別で幾何（円の外径・バー長・文字配置・画像の Fit 等）は切り詰め前の矩形から求め、出力画面の範囲は画素を書く
+   ときのクリップにだけ使う。画面内に収まる矩形の画素は変わらない。画面をはみ出す矩形の画素は意図して変わる
+   （未リリースなので互換は取らない。変わるテスト期待値は理由を添えて更新する）。既定の円形は内径 380px を保つ
+   `inner_ratio = 380 / 550` とし、バーの最大長は 160px から 170px になる。
 保存形式: 音楽ビデオのエディタは未リリースなので、`radius_px` → `inner_ratio` の変更に移行処理は作らない
 （CLAUDE.md「永続データ・スキーマ変更時の判断」）。
 
@@ -2973,7 +2981,7 @@ Layer {
     rect:     Animatable<Rect>,    // 正規化座標（UI は px 表示）
     rotation: Animatable<f32>,
     corner_radius: Animatable<f32>,
-    glow:     Animatable<Option<Glow>>,   // { blur_px, color }  ← §1.4 の box-shadow 相当
+    glow:     Animatable<Option<Glow>>,   // { radius_px, spread_px, color } ← §1.4 の box-shadow 相当
     modulations: Vec<ModulationBinding>,
     kind: LayerKind,
 }
@@ -2990,7 +2998,7 @@ LayerKind =
   | Image        { source: ImageRef, fit: Fit, zoom: Animatable<f32> }
   | Solid        { fill: Animatable<Fill> }
   | Spectrum     { axis: Semitone{..},          // v1 はこれだけ。Linear{min_hz,max_hz} は将来 (D5)
-                   shape: Bars{..} | Radial{ radius, .. },
+                   shape: Bars{..} | Radial{ inner_ratio: 0..1, thickness_px, .. },
                    point_count, thickness, smoothing: { kind, factor },
                    color_mode: Custom | Miv,
                    fill: Animatable<Fill> }
@@ -3012,7 +3020,9 @@ Fill          = Solid(Color) | LinearGradient{..} | RadialGradient{..} | BandGra
   検討する（未決 Q1）。
 - `BandGradient` は「バンド位置に応じて色を変える」用（高域ほど明るい等）。
 - 変調はスカラー対象だけに限定し、`Animatable<T>` 自体は汎用変調しない。最終値は
-  Const / Track の評価値へ binding を宣言順に加算する。Scale は矩形中心を固定して適用する。
+  Const / Track の評価値へ binding を宣言順に加算する。Scale は矩形中心を固定し、矩形と見た目の px 値へ同じ倍率を適用する。
+- 円形の `inner_ratio` は矩形の短辺 / 2 に対する内側の円の割合。範囲外は 0..1 に丸め、バーは枠の端まで伸ばす。
+  `SpectrumRadius` の加算単位も割合（UI は %）。太さは px。未リリースのため旧 `radius_px` からの移行は作らない。
 
 独立実装レビュー 2 回目（GPT-6.1 Sol / xhigh、設計担当が依頼）: 2 件とも解消、追加指摘なし、**ACCEPT**。
 
@@ -3280,7 +3290,7 @@ GUI起動・実機検収と対応後の独立再レビューは未実施。コ�
 | **P4d** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | Grid／Fullscreenの単一実Audioだけ。static ID／非表示設定、worker起動、絶対path引数、失敗通知、build-dev同梱を実装。既存保存順のstatic／動的枠を保つ末尾追加。追加8件の成功と各変異失敗、全対象14560 passed／0 failed／66 ignored、fmt／glyph0、通常featureの4exe確認build成功を記録済み。`261b10359`の独立レビューP2に対応し製品binのGUI属性／Subsystem gateを追加。製品GUI起動／実機検収／対応のcommitなし。詳細は「P4d実装記録」 |
 | **P4e** 実装完了（独立レビュー 4 回目で ACCEPT、2026-10-15。build-dist -NoSign の通しは修正前の版で成功、最終版での通しは統合前の最終確認で行う） | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | **実装・非対話検証済（2026-10-15）**。build-dist -NoSign の全段成功、全体 gate 14,562 passed / 0 failed / 66 ignored。editor 25,504,768 bytes、launcher 増分も同値。清掃は editor を含む fixture で検査し D10 の割り切りを維持。独立レビュー 1〜3 回目は REVISE。3 回目の指摘は OUT_DIR 導出で対応し、追加発見の build-dir 分離も設計回答に従い開始前に拒否する。指定検証・release 5 段は成功、独立再検収待ち。署名実行・GUI 検収は未実施。詳細は末尾「P4e 実装記録」 |
 | **P4f** 完了（独立レビュー 2 回目 ACCEPT with conditions、条件の文書修正済み `bf05ddb17`、2026-10-15。fps 選択は利用者決定で追加。サイトマップ再生成は統合時） | マニュアル新ページと通常33ページのサイドバー・目次、製品紹介カード、keymap-spec（固定ショートカットの理由）、privacy（通信なし・保存先） | **2026-10-15、未コミット**。カード50枚で上限違反0、glyph検査成功、33ページ各33リンクの数・順序・active一致、HTML構造とリンク検査成功。各記述のコード根拠・D11との差分は末尾「P4f 実施記録」。アプリ／エディタ未起動。独立レビュー1回目 REVISE の起動条件の P2 を修正し、利用者決定に基づきプロジェクトの fps 選択を追加。対応後の再レビュー・検収は未実施。追補記録を参照。サイトマップはhtdocsコミット後に生成するため今回は未実行 |
-| **P5a** 設計確定・実装待ち（2026-10-31） | 実操作で見つけた改善（D17）: 円形スペクトラムの内側の円を矩形に対する割合へ、`Scale` 変調をレイヤー全体の拡大縮小へ、割り当て量の初期値を単位に合わせる、画像の枠への合わせ方の設定と追加時の既定、レイヤー一覧の操作ボタンの固定 | 円形で `Scale` を割り当てると輪の内径も同じ比率で大きくなる（書き出し画素で確認）。文字・時刻・歌詞の `Scale` で文字が大きくなる。プレビューと書き出しの一致（H3b）を維持。独立レビュー ACCEPT |
+| **P5a** 実装・非対話検証・確認用build完了（2026-10-31、D17.6 対応を含む。独立レビュー・実機検収未実施） | 実操作で見つけた改善（D17）: 円形スペクトラムの内側の円を矩形に対する割合へ、`Scale` 変調をレイヤー全体の拡大縮小へ、割り当て量の初期値を単位に合わせる、画像の枠への合わせ方の設定と追加時の既定、レイヤー一覧の操作ボタンの固定 | 円形で `Scale` を割り当てると輪の内径も同じ比率で大きくなる（書き出し画素で確認）。文字・時刻・歌詞の `Scale` で文字が大きくなる。プレビューと書き出しの一致（H3b）を維持。独立レビュー ACCEPT |
 
 L1 自動検証記録（2026-10-09）:
 
@@ -4318,3 +4328,165 @@ rmeta／rlib／build 出力破損と CMake 並列失敗に遭遇し、既存統�
 テストの APPDATA は `target/background-image-test-appdata` に隔離した。
 ログは `target/background-image-verification/`。GUI 起動・実 APPDATA 操作・コミットは行わず、
 既存の未追跡 `out.mp4` を保持した。この記録は実装担当の検証であり、独立レビューではない。
+
+独立レビュー（2026-10-31、設計担当が依頼した別担当 GPT-6.1 Sol / xhigh、`7315d85f4` のみ対象）: **ACCEPT、P1〜P3 の指摘なし**。寿命の和集合・失効条件、H1 の session／寿命照合と H2 の checkpoint／manifest の順序、テストが修正前に落ちることを確認。テストは再実行せずコード読みで判断。
+
+### P5a 実施記録（2026-10-31、実装担当）
+
+D17 の 1〜6 の実装・非対話検証・確認用buildを完了した（すべて未コミット）。既定の円形矩形が描画前に切り詰められる問題を停止報告し、
+設計担当が D17.6 を確定した後、全種別で描画の幾何と出力クリップを分離して再開した。
+機能制限・非同期状態・回復処理は追加していない。独立レビューと GUI 検収は未実施であり、
+この実装担当の記録を独立レビュー ACCEPT と扱わない。
+
+変更ファイル（全 21 ファイル、すべて未コミット）:
+
+| 領域 | ファイル |
+| --- | --- |
+| `crates/music-core/src/` | `keyboard.rs`、`lib.rs`、`spectrum_visual.rs` |
+| `crates/musicvideo-core/src/` | `lib.rs`、`model.rs`、`preset.rs`、`raster.rs`、`scene.rs`、`selection_tests.rs`、新規 `p5a_tests.rs`／`raster_p5a_tests.rs`／`clipping_tests.rs` |
+| `crates/musicvideo-ui/src/` | `lib.rs`、`modulators.rs`、`layout_tests.rs` |
+| `crates/musicvideo-editor/src/` | `app.rs`、`app/image_request_tests.rs`、`app/parity_tests.rs` |
+| 文書 | `docs/music-video-export-plan.md`、`htdocs/mimageviewer/manual/music-video.html`、`htdocs/mimageviewer/index.html` |
+
+- `Radial` の保存値は `inner_ratio`（0..1）へ変更し、評価時に範囲外を丸める。
+  既定プロジェクト／UI の形切替は `380 / 550`、新規レイヤーは `0.24 / (0.64 / 2) = 0.75`。
+  `SpectrumRadius` の加算単位も割合へ変更し、UI の設定・割り当て量・現在の加算量を % で表示する。
+  バー端の丸いキャップを含めて枠に収める従来の `available` 計算は保持する。
+  未リリースなので `radius_px` からの保存形式移行は作らない（後続のコミットメッセージにも明記する）。
+- `Scale` は共通の矩形評価と scene の `scale_item_dimensions` で適用する。
+  renderer へ倍率を渡して種別別に乗算する経路は作らず、描画は評価済み寸法を読む。
+  割り当てなし／倍率 1.0 の寸法処理は即座に戻り、静的な幅・高さの編集は px 値に影響しない。
+- 割り当ての初期量は UI の一つの表へ集約。対象変更時は量が旧対象の既定値と同じ場合だけ追従し、
+  編集済みの異なる量を保持する。ImageZoom の初期量は Scale と同じ `0.05`。
+- 画像の Fit は既存 inspector の履歴境界で編集。AddLayer は decode 完了時の既存 resource/history
+  transaction 内で画像比率どおりの最大中央矩形と Contain を設定する。新しい pending は不要と判断し、
+  既存の完了採用をそのまま使う。Replace は既存の矩形・Fit を変更しないので、既定背景の Cover と
+  利用者が編集した Contain／Stretch の両方を保持する。
+- レイヤー見出し・説明・移動・削除・追加は一覧の上に置き、名前の一覧だけを scroll する。
+  マニュアルと製品ページの音楽ビデオ欄も更新した。
+- D17.6 は共通の signed `LayerPixelRect` で切り詰め前の pixel 幾何を解決し、全種別が既存の
+  `draw_item`／mask／合成処理を共有する。画面内の矩形は既存の直接描画を維持する。
+  はみ出す矩形は layer-local surface に元の寸法で描き、出力への合成時だけ crop する。
+  非回転の通常描画は出力の背景を surface に写してから描くため、半透明の重なりの丸めを二重にしない。
+  回転と Glow は元の矩形・mask origin を使い、矩形が完全に画面外でも回転・光が入る場合は描く。
+  回転・filter support を含む保守的な bounds で画面に届かない場合だけ省略する。
+  先頭の画像・単色の省略経路も、切り詰めた結果が全面かではなく元の矩形が正確に全面かで判定する。
+  各種別の描き手を増やす案は採らず、内包矩形と同じ描画関数を再利用した。
+
+倍率をかける寸法の棚卸し:
+
+| 対象 | scene で倍率をかける px 値 |
+| --- | --- |
+| 全種別 | 中心固定の矩形幅・高さ、レイヤー角丸、Glow の radius／spread |
+| Text／TimeText／Lyrics | size、主縁取りと追加縁取りの width、影の xy offset／blur／spread、echo の xy offset、背景の padding／corner、letter_gap／line_gap |
+| Bars | thickness、min_height、描画の最小厚さ（従来 1px の下限も評価して縮小可能にする） |
+| Radial | thickness、描画の最小厚さ。内側の円は inner_ratio と拡縮済み矩形から求める |
+| MivHorizontal | バンド両端余白、最小幅、角丸の閾値と半径、下余白と高さの控除、ghost／trail の横への広がり |
+| PitchKeyboard | 鍵の左右余白、最小 octave 幅、黒鍵の角丸、黒鍵／白鍵の枠線幅、octave guide の半幅 |
+| ProgressBar | border_thickness |
+| Image／Solid | 共通寸法以外に追加の px 値なし |
+
+倍率をかけない値は、inner_ratio／gap_ratio／gradient の center・radius／image zoom などの割合、
+色・alpha・音声値・明るさ、角度、帯域数・描画点数・echo count、時刻・歌詞 fade 時間、font／align／Fit。
+割合は拡縮済み矩形に従い、それ以外は距離の単位ではない。AA の 0.5px の coverage 計算や走査の padding は
+描画の数値処理なので拡縮しない。music-core の既存の鍵盤・横長スペクトラム API は従来の既定寸法を使い、
+音楽ビデオだけが評価済み寸法を渡す。鍵盤 layout cache の key に余白と最小 octave 幅を含める。
+
+回帰と変異検証:
+
+| 追加テスト | 意図的に壊す箇所 |
+| --- | --- |
+| `p5a_scale_text_time_and_lyrics_includes_every_decoration_dimension` | 文字サイズへの倍率を無効化 |
+| `p5a_scale_geometry_includes_keyboard_miv_and_preserves_ratios` | 鍵の左右余白への倍率を無効化 |
+| `p5a_inner_ratio_clamps_after_modulation_and_defaults_preserve_ring` | SpectrumRadius の加算を無効化 |
+| `p5a_radial_scale_changes_inner_diameter_in_export_rgba` | 半径の計算を固定サイズ基準に戻す |
+| `p5a_scale_one_keeps_all_layer_rgba_hashes` | 進捗バーの枠線幅を変更 |
+| `p5a_keyboard_cache_owns_evaluated_pixel_dimensions` | cache key から実際の鍵の余白を除く |
+| `p5a_radial_geometry_uses_ratio_and_available_cap_space` | 半径の計算を固定サイズ基準に戻す |
+| `binding_defaults_follow_target_units_and_keep_edited_amounts` | Scale 量の既定を 0.25 に戻す |
+| `image_fit_choices_use_project_history_and_dirty_tracking` | Fit の選択変更を破棄 |
+| `layer_list_controls_stay_fixed_when_layers_grow_and_list_scrolls` | 名前一覧を操作ボタンより前に戻す |
+| `radial_inner_circle_uses_percent_and_shape_switch_default` | % 入力の /100 を除去 |
+| `p5a_image_add_centers_maximum_aspect_rect_and_contain_through_history` | AddLayer の配置・Contain 設定を除去 |
+| `p5a_image_replace_preserves_existing_rect_and_fit_through_history` | Replace で矩形・Fit を FULL／Cover に上書き |
+| `p5a_h3b_scaled_radial_spectrum_preview_matches_export` | プレビュー用 snapshot からだけ Scale 割り当てを除く |
+
+画面内に収まる無変調の全 10 種類（Image／Solid／Radial／Bars／MivHorizontal／PitchKeyboard／ProgressBar／TimeText／Text／Lyrics）
+は変更前 HEAD の renderer で同じ fixture の FNV-1a RGBA hash を採り、今回版と全件一致。
+円形 fixture は同じ半径になる割合を指定する。はみ出す既存 selection fixture の hash は D17.6 に従って更新した（下記）。
+H3b は実 preview worker・adoption と MP4 書き出し直前の全フレーム RGBA SHA-256 を比較し、
+Scale 有無で画素差が出ることも検査する。
+
+検証は `MSBUILDDISABLENODEREUSE=1`。MSBuild の並列 native build が exit 1 になったため、
+CMake の直列 build 成功を確認し、以後 Cargo は `-j 1`（cmake crate に渡す NUM_JOBS も 1）で実行した。
+製品の build 設定・依存物は変更していない。テストの APPDATA／LOCALAPPDATA は
+  `target/p5a/d17-six/final/test-{appdata,localappdata}` に隔離した。新規 handler テストは headless Host・一時素材を使う。
+
+- 当初の追加 14 件に、D17.6 の回帰 16 件（下表）を加えた。core の当初 7 件も D17.6 対応後に
+  再度変異を確認し、各不正実装の対象 test が assertion で落ちることを確認した。
+  製品ソースは各実行後 bytes 単位で復元。証跡は `target/p5a/d17-six/core-mutations/`、
+  `target/p5a/d17-six/clipping-mutations/`、`target/p5a-ui-mutation-*.log`、`target/p5a/d17-six/editor-mutations/`。
+- 画像追加の復元後テストで画像参照 0 件による失敗が 1 度発生した。原因は未確定。
+  初期化・要求受理・読込結果を分ける status 付き assert を加え、同条件の 10 回と全件では再現しなかった。
+  再試行・回復処理を製品へ追加せず、原因解消とは扱わない。失敗ログは
+  `target/p5a/editor-mutations/restored-before-diagnostic-assert.log`、診断 10 回は `target/p5a/final/image-add-diagnostic-*.log`。
+
+#### D17.6 の回帰・画素変更と理由
+
+停止時は既定の 1100×1100 矩形が 1100×1080 に切り詰められ、Scale 0%→6% でも半径が変わらなかった。
+設計担当が D17.6 で幾何とクリップの分離、はみ出す矩形の旧画素を保持しないことを確定し、これを修正した。
+既定矩形の外側半径は **550px**、`inner_ratio = 380 / 550` による半径は **380px**。
+バーの上限はキャップ込み **170px**（中心線168px＋端の半径2px）で、旧クリップ時の160pxから意図して変わる。
+無音の4方向バーの RGBA を測る再現テストは、切り詰め前の中心 y=550 で内縁が
+**x=1338→1361（中心から378→401px）**となり、6% 拡大の許容1px以内で成功する。
+旧停止時の測定は `target/p5a/d17-blocker/` に履歴として保持するが、現在の成否として扱わない。
+
+| 追加回帰 | 検査内容／失敗確認の変異 |
+| --- | --- |
+| `p5a_default_project_radial_scale_preserves_proportional_inner_edge` | 既定のはみ出す円形をRGBAで測定。旧切り詰めを戻すと失敗 |
+| `p5a_offscreen_translucent_keyboard_preserves_underlying_canvas` | 色付き背景と半透明鍵盤の合成が、全体を描いた結果のcropと一致。旧切り詰めで失敗 |
+| `d17_clipping_*_local_crop`（10件） | 全10種別の負座標・右下はみ出しを、原寸canvasへ全体を描いて配置・cropしたRGBAと全byte厳密比較。Imageは全Fit・zoom1/1.5・全面を覆う矩形も含む。旧切り詰めで各件失敗 |
+| `d17_clipping_rotation_and_glow_match_translated_crop` | 回転＋Glowを拡大canvasからのcropと全byte比較。旧切り詰めで失敗 |
+| `d17_clipping_fully_outside_rect_can_rotate_into_canvas` | 完全画面外の矩形が回転で入る。旧切り詰めで失敗 |
+| `d17_clipping_fully_outside_rect_can_glow_into_canvas` | 完全画面外から光だけが入る。旧切り詰めで失敗 |
+| `d17_clipping_selection_keeps_unclipped_rect_and_rotated_corners` | 選択枠の元rect／回転cornersとsceneの一致、描画のcrop一致。旧切り詰めとbounds側のclampの両方で失敗 |
+
+通常のcrop参照は座標の原点をそろえて計算精度差を排除する。回転・Glowは余白のあるcanvasへ整数平行移動した
+参照を使う。±1byte等のRGBA許容は設けていない。プレビューの選択枠は既存の `evaluate_layer_bounds` の
+切り詰め前のrect／cornersを使い、overlayでだけclipするため、表示側の変更は不要だった。
+
+期待値・fixtureの変更一覧:
+
+| テスト／fixture | 変更した値と理由 |
+| --- | --- |
+| `selection_unmodulated_render_hash_is_unchanged` → `selection_render_hash_uses_unclipped_layer_geometry` | 160×90の既定円形が下端をはみ出し、t=0の回転した単色も左端をはみ出す。切り詰め前の矩形で幾何・回転中心を求め、縮小出力でも内側を割合で持つ現在の既定値を使うため、t=0/3/9のhashを `7673554586247693965 / 13406108200308214447 / 11219486302341893356` へ更新。元は `15498595806430728683 / 10394692129127540235 / 14301170444520341964`。旧固定px半径のclampへ合わせる一時fixture指定は除去 |
+| 既定円形の再現fixture | 測定行を切り詰めた中心y=540から元の中心y=550へ変更。描画幾何と選択枠の中心をそろえるため。拡縮を検証するassertは維持して失敗から成功へ |
+| 既存rasterの円形3 fixture | 旧px半径を同じ半径になる割合へ変換（24/48、32/64、380/540）。いずれも元から画面内の矩形で、D17.6による画素変更はない |
+| `p5a_scale_one_keeps_all_layer_rgba_hashes`／既存T1文字hash | 内包矩形のため期待hashは変更せず全件一致を維持 |
+
+最終のパッケージ全件・fmt・glyph・確認用buildの結果は以下に集約する。
+
+| 最終検証 | 結果／証跡 |
+| --- | --- |
+| `cargo test -j 1 -p music-core -p musicvideo-core -p musicvideo-ui -p musicvideo-editor` | exit 0、**531 passed / 0 failed / 0 ignored**。指定3パッケージはcore 138＋integration 2、UI 134、editor 188＝462件。共通music-coreはlib 49＋integration 20＝69件。`target/p5a/d17-six/final/packages.log` |
+| `cargo fmt`／`cargo fmt --check` | 整形適用後のcheck exit 0。`target/p5a/d17-six/final/fmt.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険glyph 0。`target/p5a/d17-six/final/glyphs.log` |
+| `python scripts/check_site_cards.py` | exit 0、50カード・超過0。`target/p5a/d17-six/final/site-cards.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0、757.439秒。本体core・remote・EPUB worker・音楽ビデオeditorを通常features／dev-runtimeで生成。VC runtime 4本／PE 4成果物の検査成功。`target/p5a/d17-six/final/build-dev.log`、`target/vcrt-pe-reports/dev-runtime.json` |
+
+集約コマンド・終了値・所要時間は同 `summary.json`、検証した未コミットRustソース18ファイルの
+SHA-256とbase commitは `source-sha256.json`。文書のみの追記で成功したソース検証を再実行しない。
+
+GUI起動、実 `%APPDATA%\mimageviewer` の読書き、コミットは行っていない。既存 `out.mp4` は保持。
+build時の環境は隔離したが、成果物は `portable` featureを使わない通常版なので、利用者の通常環境で引数なしで
+起動すると実 `%APPDATA%\mimageviewer` を使い、設定・データを更新し得る。単一インスタンスのmutexを共有するため、
+インストール版／トレイ常駐版を終了してから、リポジトリルートで次を実行する。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+音楽ビデオを開き、既定の円形で「全体の拡大縮小」を割り当てたとき輪とバーが連動して拡大すること、
+はみ出す画像や文字を動かしても枠全体を基準に表示されること、文字・時刻・歌詞の装飾も拡縮することを確認する。
+画像の「枠への合わせ方」と追加時の縦横比、レイヤーが増えても操作ボタンが固定される点も確認対象。
+これらのGUI確認と、設計担当が依頼する独立レビューは未実施であり、この自動検証と区別する。

@@ -549,19 +549,24 @@ pub(crate) fn draw_bindings(
             for (index, binding) in layer.modulations.iter_mut().enumerate() {
                 ui.push_id(index, |ui| {
                     ui.group(|ui| {
+                        let previous_target = binding.target;
+                        let mut target = previous_target;
                         egui::ComboBox::from_id_salt("target")
                             .selected_text(target_label(binding.target))
                             .show_ui(ui, |ui| {
-                                for target in &targets {
+                                for available_target in &targets {
                                     changed |= ui
                                         .selectable_value(
-                                            &mut binding.target,
-                                            *target,
-                                            target_label(*target),
+                                            &mut target,
+                                            *available_target,
+                                            target_label(*available_target),
                                         )
                                         .changed();
                                 }
                             });
+                        if target != previous_target {
+                            set_binding_target(binding, target);
+                        }
                         egui::ComboBox::from_id_salt("source")
                             .selected_text(modulator_name(modulators, binding.modulator))
                             .show_ui(ui, |ui| {
@@ -576,14 +581,20 @@ pub(crate) fn draw_bindings(
                                 }
                             });
                         ui.horizontal(|ui| {
-                            changed |= ui
+                            let display_scale = amount_display_scale(binding.target);
+                            let mut amount = binding.amount * display_scale;
+                            if ui
                                 .add(
-                                    egui::DragValue::new(&mut binding.amount)
+                                    egui::DragValue::new(&mut amount)
                                         .speed(amount_speed(binding.target))
                                         .prefix("量 ")
                                         .suffix(target_unit(binding.target)),
                                 )
-                                .changed();
+                                .changed()
+                            {
+                                binding.amount = amount / display_scale;
+                                changed = true;
+                            }
                             egui::ComboBox::from_id_salt("curve")
                                 .selected_text(curve_label(binding.curve))
                                 .show_ui(ui, |ui| {
@@ -613,7 +624,9 @@ pub(crate) fn draw_bindings(
                         let source = live_value(live_values, binding.modulator);
                         ui.small(format!(
                             "入力 {source:.3} / 加算 {:+.3}{}",
-                            binding.amount * binding.curve.apply(source),
+                            binding.amount
+                                * binding.curve.apply(source)
+                                * amount_display_scale(binding.target),
                             target_unit(binding.target)
                         ));
                         if ui.small_button("割り当てを削除").clicked() {
@@ -631,7 +644,7 @@ pub(crate) fn draw_bindings(
                 layer.modulations.push(ModulationBinding {
                     target: targets[0],
                     modulator: modulators[0].id,
-                    amount: 0.25,
+                    amount: default_binding_amount(targets[0]),
                     curve: ModulationCurve::Linear,
                 });
                 changed = true;
@@ -691,7 +704,7 @@ fn modulator_name(modulators: &[Modulator], id: ModulatorId) -> String {
 fn target_label(target: ModulationTarget) -> &'static str {
     match target {
         ModulationTarget::Opacity => "不透明度",
-        ModulationTarget::Scale => "レイヤー矩形の拡縮",
+        ModulationTarget::Scale => "全体の拡大縮小",
         ModulationTarget::ImageZoom => "絵そのものの拡大",
         ModulationTarget::Rotation => "回転",
         ModulationTarget::CornerRadius => "角丸",
@@ -699,7 +712,7 @@ fn target_label(target: ModulationTarget) -> &'static str {
         ModulationTarget::GlowAlpha => "グローの濃さ",
         ModulationTarget::FillBrightness => "塗りの明るさ",
         ModulationTarget::SpectrumThickness => "スペクトラムの太さ",
-        ModulationTarget::SpectrumRadius => "円形スペクトラムの半径",
+        ModulationTarget::SpectrumRadius => "円形スペクトラムの内側の円",
     }
 }
 
@@ -713,8 +726,36 @@ fn target_unit(target: ModulationTarget) -> &'static str {
         ModulationTarget::Rotation => "°",
         ModulationTarget::CornerRadius
         | ModulationTarget::GlowRadius
-        | ModulationTarget::SpectrumThickness
-        | ModulationTarget::SpectrumRadius => " px",
+        | ModulationTarget::SpectrumThickness => " px",
+        ModulationTarget::SpectrumRadius => " %",
+    }
+}
+
+// These amounts use model units; only the radius ratio is displayed as percent.
+fn default_binding_amount(target: ModulationTarget) -> f32 {
+    match target {
+        ModulationTarget::Opacity | ModulationTarget::GlowAlpha => 0.25,
+        ModulationTarget::Scale | ModulationTarget::ImageZoom => 0.05,
+        ModulationTarget::Rotation => 5.0,
+        ModulationTarget::CornerRadius | ModulationTarget::GlowRadius => 8.0,
+        ModulationTarget::FillBrightness => 0.2,
+        ModulationTarget::SpectrumThickness => 2.0,
+        ModulationTarget::SpectrumRadius => 0.03,
+    }
+}
+
+fn set_binding_target(binding: &mut ModulationBinding, target: ModulationTarget) {
+    if binding.amount == default_binding_amount(binding.target) {
+        binding.amount = default_binding_amount(target);
+    }
+    binding.target = target;
+}
+
+fn amount_display_scale(target: ModulationTarget) -> f32 {
+    if target == ModulationTarget::SpectrumRadius {
+        100.0
+    } else {
+        1.0
     }
 }
 
@@ -796,6 +837,96 @@ fn midi_edge_hz(midi: u8, half_step: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binding_defaults_follow_target_units_and_keep_edited_amounts() {
+        let defaults = [
+            (ModulationTarget::Opacity, 0.25),
+            (ModulationTarget::Scale, 0.05),
+            (ModulationTarget::ImageZoom, 0.05),
+            (ModulationTarget::Rotation, 5.0),
+            (ModulationTarget::CornerRadius, 8.0),
+            (ModulationTarget::GlowRadius, 8.0),
+            (ModulationTarget::GlowAlpha, 0.25),
+            (ModulationTarget::FillBrightness, 0.2),
+            (ModulationTarget::SpectrumThickness, 2.0),
+            (ModulationTarget::SpectrumRadius, 0.03),
+        ];
+        let project = musicvideo_core::default_project(10.0);
+        let mut binding = ModulationBinding {
+            target: ModulationTarget::Opacity,
+            modulator: new_band_energy_modulator(&project).id,
+            amount: 0.25,
+            curve: ModulationCurve::Linear,
+        };
+        for (target, expected) in defaults {
+            assert_eq!(default_binding_amount(target), expected);
+            set_binding_target(&mut binding, target);
+            assert_eq!(binding.target, target);
+            assert_eq!(binding.amount, expected);
+        }
+        binding.amount = -0.17;
+        for (target, _) in defaults {
+            set_binding_target(&mut binding, target);
+            assert_eq!(binding.target, target);
+            assert_eq!(binding.amount, -0.17, "edited amount belongs to the user");
+        }
+        assert_eq!(target_label(ModulationTarget::Scale), "全体の拡大縮小");
+        assert_eq!(
+            target_label(ModulationTarget::SpectrumRadius),
+            "円形スペクトラムの内側の円"
+        );
+        assert_eq!(target_unit(ModulationTarget::SpectrumRadius), " %");
+        assert_eq!(
+            amount_display_scale(ModulationTarget::SpectrumRadius),
+            100.0
+        );
+        assert_eq!(
+            amount_display_scale(ModulationTarget::SpectrumThickness),
+            1.0
+        );
+
+        let mut layer = musicvideo_core::new_radial_spectrum_layer(&project);
+        binding.target = ModulationTarget::SpectrumRadius;
+        binding.amount = 0.03;
+        layer.modulations.push(binding);
+        let modulator = new_band_energy_modulator(&project);
+        let context = crate::test_context();
+        let mut output = egui::FullOutput::default();
+        for _ in 0..2 {
+            output = crate::headless_paint_output(context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        assert!(!draw_bindings(
+                            ui,
+                            &mut layer,
+                            std::slice::from_ref(&modulator),
+                            &[]
+                        ));
+                    });
+                },
+            ));
+        }
+        for label in ["量 ", "3.0", " %"] {
+            assert!(
+                output.shapes.iter().any(|shape| matches!(&shape.shape,
+                    egui::Shape::Text(text) if text.galley.text() == label
+                )),
+                "the real binding widget must show the percent amount: {label}"
+            );
+        }
+        assert_eq!(
+            layer.modulations[0].amount, 0.03,
+            "drawing must not change the model amount"
+        );
+    }
 
     #[test]
     fn note_names_round_trip_and_accept_flats() {

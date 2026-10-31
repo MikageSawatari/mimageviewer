@@ -47,7 +47,7 @@ pub use resources::{EditTargetLifetime, ResourceLease, ResourceManifest, Resourc
 pub use timeline::{TimelineResponse, TimelineWaveform, draw_timeline};
 
 use musicvideo_core::{
-    Fill, Glow, GradientStop, GradientStops, ImageId, Layer, LayerId, LayerKind, LyricLine,
+    Fill, Fit, Glow, GradientStop, GradientStops, ImageId, Layer, LayerId, LayerKind, LyricLine,
     LyricsLayer, MIV_SPECTRUM_BANDS, ModulatorCalibration, ModulatorValue, MusicColorMode, Project,
     Rgba8, SpectrumDirection, SpectrumLayer, SpectrumShape, TextAlign, TextLayer, TimeFormat,
     TimeTextLayer, new_linear_spectrum_layer, new_lyrics_layer, new_miv_spectrum_keyboard_layers,
@@ -943,21 +943,12 @@ pub struct EditorFrame<'a> {
 
 impl EditorFrame<'_> {
     pub fn layer_list(&mut self, ui: &mut egui::Ui) {
-        panel_scroll(ui, "musicvideo-layer-list", |ui| {
+        ui.push_id("musicvideo-layer-controls", |ui| {
             let project = &mut *self.project;
             let state = &mut *self.state;
             let mut project_changed = false;
             ui.heading("レイヤー");
             ui.small("一覧の上が奥、下が手前です");
-            for (index, layer) in project.layers.iter().enumerate() {
-                if ui
-                    .selectable_label(state.selected_layer == Some(layer.id), &layer.name)
-                    .clicked()
-                {
-                    state.select_layer(project, index);
-                }
-            }
-
             let selected_index = state.selected_layer(project);
             let selected_layer = project.layers.get(selected_index).map(|layer| layer.id);
             let mut order_command = None;
@@ -1051,6 +1042,18 @@ impl EditorFrame<'_> {
                 state.inspector_tab = InspectorTab::Layer;
                 project_changed = true;
             }
+
+            ui.separator();
+            panel_scroll(ui, "musicvideo-layer-list", |ui| {
+                for (index, layer) in project.layers.iter().enumerate() {
+                    if ui
+                        .selectable_label(state.selected_layer == Some(layer.id), &layer.name)
+                        .clicked()
+                    {
+                        state.select_layer(project, index);
+                    }
+                }
+            });
 
             self.response.project_changed |= project_changed;
             self.response.add_image_layer_requested |= add_image_layer_requested;
@@ -1442,7 +1445,8 @@ fn edit_layer_properties(
     }
     ui.separator();
     changed |= match &mut layer.kind {
-        LayerKind::Solid { .. } | LayerKind::Image { .. } => false,
+        LayerKind::Solid { .. } => false,
+        LayerKind::Image { fit, .. } => edit_image_fit(ui, fit),
         LayerKind::Spectrum(spectrum) => edit_spectrum(ui, spectrum),
         LayerKind::PitchKeyboard(keyboard) => edit_music_color_mode(ui, &mut keyboard.color_mode),
         LayerKind::ProgressBar(progress) => ui
@@ -2099,6 +2103,26 @@ fn edit_color(ui: &mut egui::Ui, label: &str, color: &mut Rgba8) -> bool {
     changed
 }
 
+fn edit_image_fit(ui: &mut egui::Ui, fit: &mut Fit) -> bool {
+    let previous = *fit;
+    egui::ComboBox::from_label("枠への合わせ方")
+        .selected_text(image_fit_label(*fit))
+        .show_ui(ui, |ui| {
+            for value in [Fit::Cover, Fit::Contain, Fit::Stretch] {
+                ui.selectable_value(fit, value, image_fit_label(value));
+            }
+        });
+    *fit != previous
+}
+
+fn image_fit_label(fit: Fit) -> &'static str {
+    match fit {
+        Fit::Cover => "切り抜いて埋める",
+        Fit::Contain => "全体を収める",
+        Fit::Stretch => "引き伸ばす",
+    }
+}
+
 fn edit_spectrum(ui: &mut egui::Ui, spectrum: &mut SpectrumLayer) -> bool {
     let mut changed = ui
         .add(
@@ -2136,7 +2160,7 @@ fn edit_spectrum(ui: &mut egui::Ui, spectrum: &mut SpectrumLayer) -> bool {
     if mode != previous_mode {
         spectrum.shape = match mode {
             DisplayMode::Radial => SpectrumShape::Radial {
-                radius_px: 380.0,
+                inner_ratio: 380.0 / 550.0,
                 thickness_px: 4.0,
                 start_angle_deg: -90.0,
                 sweep_deg: 360.0,
@@ -2168,13 +2192,27 @@ fn edit_spectrum(ui: &mut egui::Ui, spectrum: &mut SpectrumLayer) -> bool {
             changed |= drag_pixels(ui, "太さ", thickness_px, 0.5..=200.0);
         }
         SpectrumShape::Radial {
-            radius_px,
+            inner_ratio,
             thickness_px,
             start_angle_deg,
             sweep_deg,
             direction,
         } => {
-            changed |= drag_pixels(ui, "半径", radius_px, 0.0..=2000.0);
+            let mut percent = *inner_ratio * 100.0;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut percent)
+                        .range(0.0..=100.0)
+                        .speed(0.5)
+                        .prefix("内側の円 ")
+                        .suffix(" %"),
+                )
+                .changed()
+            {
+                *inner_ratio = percent / 100.0;
+                changed = true;
+            }
+            ui.small("バーは枠の端まで伸びます");
             changed |= drag_pixels(ui, "太さ", thickness_px, 0.5..=200.0);
             changed |= ui
                 .add(egui::DragValue::new(start_angle_deg).suffix("° 開始"))

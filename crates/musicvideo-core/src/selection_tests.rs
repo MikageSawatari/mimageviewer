@@ -182,7 +182,10 @@ fn selection_zero_opacity_and_lyrics_gap_are_hidden() {
 }
 
 #[test]
-fn selection_unmodulated_render_hash_is_unchanged() {
+fn selection_render_hash_uses_unclipped_layer_geometry() {
+    // D17.6 intentionally changes this fixture: the default radial layer extends
+    // below the canvas and the first animated/rotated solid starts beyond its left.
+    // Their geometry now comes from the full boxes before the final canvas crop.
     let mut project = default_project(10.0);
     project.output.width = 160;
     project.output.height = 90;
@@ -235,9 +238,9 @@ fn selection_unmodulated_render_hash_is_unchanged() {
     assert_eq!(
         hashes,
         vec![
-            15498595806430728683,
-            10394692129127540235,
-            14301170444520341964
+            7673554586247693965,
+            13406108200308214447,
+            11219486302341893356
         ]
     );
 }

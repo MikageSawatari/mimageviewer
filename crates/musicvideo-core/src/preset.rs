@@ -91,7 +91,7 @@ pub fn default_project(duration_secs: f64) -> Project {
                     band_count: DEFAULT_SPECTRUM_BANDS,
                     point_count: 200,
                     shape: SpectrumShape::Radial {
-                        radius_px: 380.0,
+                        inner_ratio: 380.0 / 550.0,
                         thickness_px: 4.0,
                         start_angle_deg: -90.0,
                         sweep_deg: 360.0,
@@ -226,13 +226,14 @@ pub fn new_miv_spectrum_keyboard_layers(project: &Project) -> [Layer; 2] {
 }
 
 pub fn new_radial_spectrum_layer(project: &Project) -> Layer {
-    let radius_px = project.output.width.min(project.output.height) as f32 * 0.24;
+    // The new box occupies 64% of each output dimension; preserve the old ring.
+    let inner_ratio = 0.24 / (0.64 * 0.5);
     new_spectrum_layer(
         project,
         "円形スペクトラム",
         NormRect::new(0.18, 0.08, 0.64, 0.64),
         SpectrumShape::Radial {
-            radius_px,
+            inner_ratio,
             thickness_px: 4.0,
             start_angle_deg: -90.0,
             sweep_deg: 360.0,

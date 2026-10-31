@@ -5,8 +5,9 @@ use crate::mp4::{ExportSettings, export_snapshot, snapshot};
 use mimageviewer::video::mvexport::{EncoderPreference, ExportSummary};
 use musicvideo_core::{
     Animatable, BandCalibration, BandRange, BandWeighting, Fill, ImageRef, Interp, Keyframe,
-    ModulationBinding, ModulationCurve, ModulationTarget, ModulatorSource, NormRect, Rgba8, Track,
-    new_band_energy_modulator, new_linear_spectrum_layer, new_pitch_keyboard_layer, new_text_layer,
+    ModulationBinding, ModulationCurve, ModulationTarget, ModulatorSource, NormRect, Rgba8,
+    SpectrumShape, Track, new_band_energy_modulator, new_linear_spectrum_layer,
+    new_pitch_keyboard_layer, new_radial_spectrum_layer, new_text_layer,
 };
 use sha2::{Digest, Sha256};
 
@@ -299,6 +300,53 @@ fn h3b_forward_every_frame_matches_export() {
     let requests = (0..grid.frames())
         .map(|n| (grid.time(n), false))
         .collect::<Vec<_>>();
+    compare(&mut app, &ctx, &reference, &requests);
+}
+
+#[test]
+fn p5a_h3b_scaled_radial_spectrum_preview_matches_export() {
+    let mut app = fixture(0.4);
+    let ctx = egui::Context::default();
+    let mut radial = new_radial_spectrum_layer(&app.project);
+    radial.rect = Animatable::Const(NormRect::new(0.3, 0.15, 0.4, 0.7));
+    if let LayerKind::Spectrum(spectrum) = &mut radial.kind {
+        spectrum.band_count = 32;
+        if let SpectrumShape::Radial {
+            inner_ratio,
+            thickness_px,
+            ..
+        } = &mut spectrum.shape
+        {
+            *inner_ratio = 0.45;
+            *thickness_px = 2.5;
+        }
+    }
+    radial.modulations.push(ModulationBinding {
+        target: ModulationTarget::Scale,
+        modulator: app.project.modulators[1].id,
+        amount: 0.7,
+        curve: ModulationCurve::Linear,
+    });
+    app.project.layers = vec![radial];
+    let reference = hashes(&app);
+
+    // The assigned Scale must affect visible pixels, so identical unmodulated
+    // paths in preview and export cannot make this parity check vacuous.
+    let bindings = std::mem::take(&mut app.project.layers[0].modulations);
+    let unscaled = hashes(&app);
+    app.project.layers[0].modulations = bindings;
+    assert_ne!(reference, unscaled, "radial Scale must change export RGBA");
+    let changed_frame = reference
+        .iter()
+        .zip(&unscaled)
+        .position(|(scaled, unscaled)| scaled != unscaled)
+        .unwrap() as u64;
+    let grid = FrameGrid::new(app.project.output.fps, app.project.duration_secs).unwrap();
+    let mut requests = (0..grid.frames())
+        .map(|n| (grid.time(n), false))
+        .collect::<Vec<_>>();
+    requests
+        .extend([grid.frames() - 1, changed_frame, 0, changed_frame].map(|n| (grid.time(n), true)));
     compare(&mut app, &ctx, &reference, &requests);
 }
 

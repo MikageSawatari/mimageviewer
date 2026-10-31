@@ -6,11 +6,12 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use music_core::{
-    KeyPlacement, KeyboardFrame, KeyboardLayoutCache, KeyboardRect, MivSpectrumFrame,
-    MivSpectrumPrimitive, SpectrumVisualRect, VisualizationColor,
+    KeyPlacement, KeyboardFrame, KeyboardLayoutCache, KeyboardRect, MivSpectrumDimensions,
+    MivSpectrumFrame, MivSpectrumPrimitive, SpectrumVisualRect, VisualizationColor,
     brighten_color as brighten_visualization_color, key_fill as miv_key_fill,
-    layout_keyboard_cached, lerp_color as miv_lerp_color, spectrum_color as miv_spectrum_color,
-    unlit_key_base as miv_unlit_key_base, visit_miv_spectrum_primitives,
+    layout_keyboard_cached_with_dimensions, lerp_color as miv_lerp_color,
+    spectrum_color as miv_spectrum_color, unlit_key_base as miv_unlit_key_base,
+    visit_miv_spectrum_primitives_with_dimensions,
 };
 
 use crate::assets::{AssetError, Assets, ImageAsset};
@@ -18,7 +19,11 @@ use crate::model::{
     Fill, Fit, Glow, ImageId, MusicColorMode, NormRect, Rgba8, SpectrumDirection, SpectrumShape,
     TextAlign,
 };
-use crate::scene::{Scene, SceneItem, SceneItemKind, brighten_color};
+use crate::scene::{KeyboardDimensions, Scene, SceneItem, SceneItemKind, brighten_color};
+
+#[cfg(test)]
+#[path = "raster_p5a_tests.rs"]
+mod p5a_tests;
 
 thread_local! {
     static KEYBOARD_LAYOUT_CACHE: RefCell<KeyboardLayoutCache> =
@@ -77,6 +82,85 @@ pub fn norm_rect_to_pixels(rect: NormRect, width: u32, height: u32) -> PixelRect
     let x1 = edge(rect.x + rect.width.max(0.0), width).max(x0);
     let y1 = edge(rect.y + rect.height.max(0.0), height).max(y0);
     PixelRect { x0, y0, x1, y1 }
+}
+
+/// Layer geometry, before canvas clipping. Signed origins are needed for layers
+/// entering the canvas from the left/top; PixelRect remains an indexable clip.
+#[derive(Debug, Clone, Copy)]
+struct LayerPixelRect {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+}
+
+impl LayerPixelRect {
+    fn new(rect: NormRect, width: u32, height: u32) -> Result<Self, RasterError> {
+        let edge = |value: f32, extent: u32| {
+            let value = if value.is_finite() { value } else { 0.0 };
+            let pixel = f64::from((value * extent as f32).round());
+            if pixel < f64::from(i32::MIN) || pixel > f64::from(i32::MAX) {
+                return Err(RasterError::DimensionsOverflow);
+            }
+            Ok(pixel as i32)
+        };
+        let x0 = edge(rect.x, width)?;
+        let y0 = edge(rect.y, height)?;
+        Ok(Self {
+            x0,
+            y0,
+            x1: edge(rect.x + rect.width.max(0.0), width)?.max(x0),
+            y1: edge(rect.y + rect.height.max(0.0), height)?.max(y0),
+        })
+    }
+
+    fn local(self) -> PixelRect {
+        PixelRect {
+            x0: 0,
+            y0: 0,
+            x1: (i64::from(self.x1) - i64::from(self.x0)) as usize,
+            y1: (i64::from(self.y1) - i64::from(self.y0)) as usize,
+        }
+    }
+
+    fn inside(self, width: u32, height: u32) -> bool {
+        self.x0 >= 0
+            && self.y0 >= 0
+            && i64::from(self.x1) <= i64::from(width)
+            && i64::from(self.y1) <= i64::from(height)
+    }
+
+    fn is_canvas(self, width: u32, height: u32) -> bool {
+        self.x0 == 0
+            && self.y0 == 0
+            && i64::from(self.x1) == i64::from(width)
+            && i64::from(self.y1) == i64::from(height)
+    }
+
+    /// Cull only after rotation and glow expansion. An offscreen box can still
+    /// cast visible light, or rotate its body into the canvas.
+    fn can_reach_canvas(
+        self,
+        frame: &Frame,
+        rotation: f32,
+        glow: Option<Glow>,
+    ) -> Result<bool, RasterError> {
+        let center_x = (f64::from(self.x0) + f64::from(self.x1)) * 0.5;
+        let center_y = (f64::from(self.y0) + f64::from(self.y1)) * 0.5;
+        let (sin, cos) = f64::from(rotation).to_radians().sin_cos();
+        let half_width = (f64::from(self.x1) - f64::from(self.x0)) * 0.5;
+        let half_height = (f64::from(self.y1) - f64::from(self.y0)) * 0.5;
+        let padding = match glow {
+            Some(glow) => GlowRasterPlan::new(glow)?.pad as f64,
+            None => 0.0,
+        } + 1.0; // bilinear rotation coverage
+        let extent_x = half_width * cos.abs() + half_height * sin.abs() + padding;
+        let extent_y = half_width * sin.abs() + half_height * cos.abs() + padding;
+        Ok(center_x + extent_x > 0.0
+            && center_y + extent_y > 0.0
+            && center_x - extent_x < f64::from(frame.width)
+            && center_y - extent_y < f64::from(frame.height))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,20 +239,30 @@ pub fn render_frame(
     )?;
     let mut report = RenderReport::default();
     for (index, item) in scene.items.iter().enumerate() {
-        let rect = norm_rect_to_pixels(item.rect, scene.width, scene.height);
-        if rect.is_empty() {
-            continue;
-        }
-        if index == 0
-            && let Some(image) = &prepared_cover
-        {
-            draw_image(frame, rect, image, 1.0, 0.0, false, 1.0);
+        let geometry = LayerPixelRect::new(item.rect, scene.width, scene.height)?;
+        if geometry.local().is_empty() {
             continue;
         }
         let rotation = normalized_rotation(item.rotation_deg);
         let glow = item
             .glow
             .filter(|glow| glow.radius_px > 0.0 && glow.color.a > 0);
+        if !geometry.inside(scene.width, scene.height) {
+            draw_unclipped_item(frame, geometry, item, assets, &mut report, rotation, glow)?;
+            continue;
+        }
+        let rect = PixelRect {
+            x0: geometry.x0 as usize,
+            y0: geometry.y0 as usize,
+            x1: geometry.x1 as usize,
+            y1: geometry.y1 as usize,
+        };
+        if index == 0
+            && let Some(image) = &prepared_cover
+        {
+            draw_image(frame, rect, image, 1.0, 0.0, false, 1.0);
+            continue;
+        }
         if rotation.abs() > 1.0e-4 {
             draw_rotated_item(frame, rect, item, assets, &mut report, glow)?;
         } else {
@@ -185,6 +279,79 @@ pub fn render_frame(
     Ok(report)
 }
 
+/// Every kind uses the same layer-local drawing and global composition. The
+/// local dimensions are the complete evaluated box, never its canvas overlap.
+fn draw_unclipped_item(
+    frame: &mut Frame,
+    geometry: LayerPixelRect,
+    item: &SceneItem,
+    assets: &Assets,
+    report: &mut RenderReport,
+    rotation: f32,
+    glow: Option<Glow>,
+) -> Result<(), RasterError> {
+    if !geometry.can_reach_canvas(frame, rotation, glow)? {
+        return Ok(());
+    }
+    let local = geometry.local();
+    let width = u32::try_from(local.width()).map_err(|_| RasterError::DimensionsOverflow)?;
+    let height = u32::try_from(local.height()).map_err(|_| RasterError::DimensionsOverflow)?;
+    frame_len(width, height)?;
+    if rotation.abs() > 1.0e-4 {
+        let mut mask = render_item_mask(local, item, assets, report)?;
+        mask.origin_x = geometry.x0;
+        mask.origin_y = geometry.y0;
+        let rotated_mask = rotate_mask(&mask, rotation)?;
+        if let Some(glow) = glow {
+            draw_glow(frame, &rotated_mask, glow)?;
+        }
+        let mut body = Frame::new(width, height)?;
+        draw_item(&mut body, local, item, assets, report, false)?;
+        composite_rotated_body(frame, &body, &mask, &rotated_mask, rotation);
+    } else {
+        if let Some(glow) = glow {
+            let mut mask = render_item_mask(local, item, assets, report)?;
+            mask.origin_x = geometry.x0;
+            mask.origin_y = geometry.y0;
+            draw_glow(frame, &mask, glow)?;
+            if composite_solid_body(frame, &mask, item) {
+                return Ok(());
+            }
+        }
+        // Preserve per-primitive source-over rounding: seed the visible local
+        // pixels with the destination, paint normally, and copy them back.
+        // Flattening onto black and compositing a separate mask quantizes twice.
+        let x0 = i64::from(geometry.x0).clamp(0, i64::from(frame.width)) as usize;
+        let y0 = i64::from(geometry.y0).clamp(0, i64::from(frame.height)) as usize;
+        let x1 = i64::from(geometry.x1).clamp(0, i64::from(frame.width)) as usize;
+        let y1 = i64::from(geometry.y1).clamp(0, i64::from(frame.height)) as usize;
+        if x0 >= x1 || y0 >= y1 {
+            return Ok(());
+        }
+        let mut body = Frame::new(width, height)?;
+        let row_bytes = (x1 - x0) * 4;
+        let offsets = |y: usize| {
+            let destination = (y * frame.width as usize + x0) * 4;
+            let source = (((y as i64 - i64::from(geometry.y0)) as usize * width as usize)
+                + (x0 as i64 - i64::from(geometry.x0)) as usize)
+                * 4;
+            (destination, source)
+        };
+        for y in y0..y1 {
+            let (destination, source) = offsets(y);
+            body.rgba[source..source + row_bytes]
+                .copy_from_slice(&frame.rgba[destination..destination + row_bytes]);
+        }
+        draw_item(&mut body, local, item, assets, report, false)?;
+        for y in y0..y1 {
+            let (destination, source) = offsets(y);
+            frame.rgba[destination..destination + row_bytes]
+                .copy_from_slice(&body.rgba[source..source + row_bytes]);
+        }
+    }
+    Ok(())
+}
+
 fn opaque_cover_image(
     scene: &Scene,
     assets: &Assets,
@@ -192,19 +359,14 @@ fn opaque_cover_image(
     let Some(item) = scene.items.first() else {
         return Ok(None);
     };
+    let geometry = LayerPixelRect::new(item.rect, scene.width, scene.height)?;
     if item.opacity < 1.0
         || normalized_rotation(item.rotation_deg).abs() > 1.0e-4
         || item.corner_radius_px > 0.0
         || item
             .glow
             .is_some_and(|glow| glow.radius_px > 0.0 && glow.color.a > 0)
-        || norm_rect_to_pixels(item.rect, scene.width, scene.height)
-            != (PixelRect {
-                x0: 0,
-                y0: 0,
-                x1: scene.width as usize,
-                y1: scene.height as usize,
-            })
+        || !geometry.is_canvas(scene.width, scene.height)
     {
         return Ok(None);
     }
@@ -227,19 +389,16 @@ fn scene_starts_with_opaque_solid(scene: &Scene) -> bool {
     let Some(item) = scene.items.first() else {
         return false;
     };
+    let Ok(geometry) = LayerPixelRect::new(item.rect, scene.width, scene.height) else {
+        return false;
+    };
     if item.opacity < 1.0
         || normalized_rotation(item.rotation_deg).abs() > 1.0e-4
         || item.corner_radius_px > 0.0
         || item
             .glow
             .is_some_and(|glow| glow.radius_px > 0.0 && glow.color.a > 0)
-        || norm_rect_to_pixels(item.rect, scene.width, scene.height)
-            != (PixelRect {
-                x0: 0,
-                y0: 0,
-                x1: scene.width as usize,
-                y1: scene.height as usize,
-            })
+        || !geometry.is_canvas(scene.width, scene.height)
     {
         return false;
     }
@@ -348,6 +507,8 @@ fn draw_item(
         SceneItemKind::Spectrum {
             values,
             miv_frame,
+            miv_dimensions,
+            minimum_thickness_px,
             point_count,
             shape,
             color_mode,
@@ -358,6 +519,8 @@ fn draw_item(
             rect,
             values,
             miv_frame,
+            *miv_dimensions,
+            *minimum_thickness_px,
             *point_count,
             *shape,
             *color_mode,
@@ -369,6 +532,7 @@ fn draw_item(
         ),
         SceneItemKind::PitchKeyboard {
             keyboard,
+            dimensions,
             background,
             color_mode,
             miv_brightness,
@@ -377,6 +541,7 @@ fn draw_item(
             frame,
             rect,
             keyboard,
+            *dimensions,
             background,
             *color_mode,
             *miv_brightness,
@@ -754,6 +919,7 @@ fn spectrum_bars(
     values: &[f32],
     point_count: usize,
     shape: SpectrumShape,
+    minimum_thickness_px: f32,
 ) -> Vec<SpectrumBar> {
     let values = resample_spectrum(values, point_count);
     let count = values.len();
@@ -770,7 +936,7 @@ fn spectrum_bars(
             } else {
                 natural_width
             }
-            .max(1.0);
+            .max(minimum_thickness_px);
             let available = rect.height() as f32;
             let minimum = min_height_px.clamp(0.0, available);
             values
@@ -793,7 +959,7 @@ fn spectrum_bars(
                 .collect()
         }
         SpectrumShape::Radial {
-            radius_px,
+            inner_ratio,
             thickness_px,
             start_angle_deg,
             sweep_deg,
@@ -801,7 +967,8 @@ fn spectrum_bars(
         } => radial_spectrum_bars(
             rect,
             &values,
-            radius_px,
+            minimum_thickness_px,
+            inner_ratio,
             thickness_px,
             start_angle_deg,
             sweep_deg,
@@ -823,7 +990,8 @@ fn band_position(index: usize, count: usize) -> f32 {
 fn radial_spectrum_bars(
     rect: PixelRect,
     values: &[f32],
-    radius_px: f32,
+    minimum_thickness_px: f32,
+    inner_ratio: f32,
     thickness_px: f32,
     start_angle_deg: f32,
     sweep_deg: f32,
@@ -834,9 +1002,10 @@ fn radial_spectrum_bars(
         (rect.x0 + rect.x1) as f32 * 0.5,
         (rect.y0 + rect.y1) as f32 * 0.5,
     );
-    let thickness = thickness_px.max(1.0);
+    let thickness = thickness_px.max(minimum_thickness_px);
     let outer_radius = rect.width().min(rect.height()) as f32 * 0.5;
-    let radius = radius_px.clamp(0.0, (outer_radius - thickness * 0.5).max(0.0));
+    let radius = (outer_radius * inner_ratio.clamp(0.0, 1.0))
+        .clamp(0.0, (outer_radius - thickness * 0.5).max(0.0));
     let available = (outer_radius - radius - thickness * 0.5).max(0.0);
     let closed = sweep_deg.abs() >= 359.999;
     values
@@ -881,6 +1050,8 @@ fn draw_spectrum(
     rect: PixelRect,
     values: &[f32],
     miv_frame: &MivSpectrumFrame,
+    miv_dimensions: MivSpectrumDimensions,
+    minimum_thickness_px: f32,
     point_count: usize,
     shape: SpectrumShape,
     color_mode: MusicColorMode,
@@ -895,6 +1066,7 @@ fn draw_spectrum(
             frame,
             rect,
             miv_frame,
+            miv_dimensions,
             color_mode,
             miv_brightness,
             fill,
@@ -904,7 +1076,7 @@ fn draw_spectrum(
         );
         return;
     }
-    let bars = spectrum_bars(rect, values, point_count, shape);
+    let bars = spectrum_bars(rect, values, point_count, shape, minimum_thickness_px);
     let sampler = FillSampler::new(fill, rect);
     for bar in bars {
         draw_spectrum_bar(
@@ -926,6 +1098,7 @@ fn draw_miv_spectrum(
     frame: &mut Frame,
     clip_rect: PixelRect,
     visual: &MivSpectrumFrame,
+    dimensions: MivSpectrumDimensions,
     color_mode: MusicColorMode,
     miv_brightness: f32,
     fill: &Fill,
@@ -935,7 +1108,7 @@ fn draw_miv_spectrum(
 ) {
     let sampler = FillSampler::new(fill, clip_rect);
     let mut primitives = Vec::with_capacity(visual.bands.len() * 4);
-    visit_miv_spectrum_primitives(
+    visit_miv_spectrum_primitives_with_dimensions(
         visual,
         SpectrumVisualRect::new(
             clip_rect.x0 as f32,
@@ -943,6 +1116,7 @@ fn draw_miv_spectrum(
             clip_rect.x1 as f32,
             clip_rect.y1 as f32,
         ),
+        dimensions,
         |primitive| primitives.push(primitive),
     );
     let prepared_colors = primitives
@@ -1129,6 +1303,7 @@ fn draw_pitch_keyboard(
     frame: &mut Frame,
     rect: PixelRect,
     keyboard: &KeyboardFrame,
+    dimensions: KeyboardDimensions,
     background: &Fill,
     color_mode: MusicColorMode,
     miv_brightness: f32,
@@ -1149,7 +1324,7 @@ fn draw_pitch_keyboard(
     let sampler = FillSampler::new(fill, rect);
     KEYBOARD_LAYOUT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let layout = layout_keyboard_cached(
+        let layout = layout_keyboard_cached_with_dimensions(
             keyboard,
             KeyboardRect::new(
                 rect.x0 as f32,
@@ -1157,6 +1332,8 @@ fn draw_pitch_keyboard(
                 rect.x1 as f32,
                 rect.y1 as f32,
             ),
+            dimensions.key_inset_px,
+            dimensions.min_octave_width_px,
             &mut cache,
         );
         let clip_coverage = KeyboardClipCoverage::new(rect, corner_radius_px);
@@ -1164,6 +1341,7 @@ fn draw_pitch_keyboard(
             frame,
             rect,
             &layout.octave_guides_x,
+            dimensions.guide_half_width_px,
             opacity,
             mask_mode,
             &clip_coverage,
@@ -1172,6 +1350,7 @@ fn draw_pitch_keyboard(
             frame,
             rect,
             &layout.keys,
+            dimensions,
             &sampler,
             color_mode,
             miv_brightness,
@@ -1226,6 +1405,7 @@ fn draw_keyboard_guides(
     frame: &mut Frame,
     clip: PixelRect,
     guides: &[f32],
+    half_width_px: f32,
     opacity: f32,
     mask_mode: bool,
     clip_coverage: &KeyboardClipCoverage,
@@ -1243,11 +1423,12 @@ fn draw_keyboard_guides(
         .filter(|(y, _)| *y >= clip.y0 && *y < clip.y1)
         .for_each(|(y, row)| {
             for &guide_x in guides {
-                let min_x = (guide_x - 1.0).floor().max(clip.x0 as f32) as usize;
-                let max_x = (guide_x + 1.0).ceil().min(clip.x1 as f32) as usize;
+                let min_x = (guide_x - half_width_px - 0.5).floor().max(clip.x0 as f32) as usize;
+                let max_x = (guide_x + half_width_px + 0.5).ceil().min(clip.x1 as f32) as usize;
                 for pixel_x in min_x..max_x {
                     let px = pixel_x as f32 + 0.5;
-                    let line_coverage = (0.5 - ((px - guide_x).abs() - 0.4)).clamp(0.0, 1.0);
+                    let line_coverage =
+                        (0.5 - ((px - guide_x).abs() - half_width_px)).clamp(0.0, 1.0);
                     let clip_coverage = clip_coverage.at(pixel_x, y);
                     if line_coverage <= 0.0 || clip_coverage <= 0.0 {
                         continue;
@@ -1267,6 +1448,7 @@ fn draw_keyboard_keys(
     frame: &mut Frame,
     clip: PixelRect,
     keys: &[KeyPlacement],
+    dimensions: KeyboardDimensions,
     sampler: &FillSampler<'_>,
     color_mode: MusicColorMode,
     miv_brightness: f32,
@@ -1299,8 +1481,16 @@ fn draw_keyboard_keys(
                 }
                 let min_x = key.rect.left.floor().max(clip.x0 as f32) as usize;
                 let max_x = key.rect.right.ceil().min(clip.x1 as f32) as usize;
-                let key_corner = if key.black { 1.0 } else { 0.0 };
-                let stroke_width = if key.black { 0.75 } else { 0.8 };
+                let key_corner = if key.black {
+                    dimensions.black_corner_px
+                } else {
+                    0.0
+                };
+                let stroke_width = if key.black {
+                    dimensions.black_stroke_px
+                } else {
+                    dimensions.white_stroke_px
+                };
                 let stroke_color = if key.black {
                     Rgba8::new(255, 255, 255, 80)
                 } else {
@@ -1718,6 +1908,8 @@ fn render_item_mask(
         SceneItemKind::Spectrum {
             values,
             miv_frame,
+            miv_dimensions,
+            minimum_thickness_px,
             point_count,
             shape,
             color_mode,
@@ -1729,6 +1921,8 @@ fn render_item_mask(
             rect.height(),
             values,
             miv_frame,
+            *miv_dimensions,
+            *minimum_thickness_px,
             *point_count,
             *shape,
             *color_mode,
@@ -1862,6 +2056,8 @@ fn draw_spectrum_mask(
     height: usize,
     values: &[f32],
     miv_frame: &MivSpectrumFrame,
+    miv_dimensions: MivSpectrumDimensions,
+    minimum_thickness_px: f32,
     point_count: usize,
     shape: SpectrumShape,
     color_mode: MusicColorMode,
@@ -1880,6 +2076,7 @@ fn draw_spectrum_mask(
             alpha,
             rect,
             miv_frame,
+            miv_dimensions,
             color_mode,
             fill,
             opacity,
@@ -1887,7 +2084,7 @@ fn draw_spectrum_mask(
         );
         return;
     }
-    let bars = spectrum_bars(rect, values, point_count, shape);
+    let bars = spectrum_bars(rect, values, point_count, shape, minimum_thickness_px);
     let sampler = FillSampler::new(fill, rect);
     let solid_alpha = match fill {
         Fill::Solid(color) => Some(color.a),
@@ -1945,6 +2142,7 @@ fn draw_miv_spectrum_mask(
     alpha: &mut [u8],
     clip_rect: PixelRect,
     visual: &MivSpectrumFrame,
+    dimensions: MivSpectrumDimensions,
     color_mode: MusicColorMode,
     fill: &Fill,
     opacity: f32,
@@ -1953,7 +2151,7 @@ fn draw_miv_spectrum_mask(
     let sampler = FillSampler::new(fill, clip_rect);
     let width = clip_rect.width();
     let mut primitives = Vec::with_capacity(visual.bands.len() * 4);
-    visit_miv_spectrum_primitives(
+    visit_miv_spectrum_primitives_with_dimensions(
         visual,
         SpectrumVisualRect::new(
             0.0,
@@ -1961,6 +2159,7 @@ fn draw_miv_spectrum_mask(
             clip_rect.width() as f32,
             clip_rect.height() as f32,
         ),
+        dimensions,
         |primitive| primitives.push(primitive),
     );
     let prepared_alphas = primitives
@@ -2154,21 +2353,21 @@ fn draw_rotated_item(
     report: &mut RenderReport,
     glow: Option<Glow>,
 ) -> Result<(), RasterError> {
-    let mask = render_item_mask(rect, item, assets, report)?;
-    let rotated_mask = rotate_mask(&mask, item.rotation_deg)?;
-    if let Some(glow) = glow {
-        draw_glow(frame, &rotated_mask, glow)?;
-    }
-    let mut body = Frame::new(rect.width() as u32, rect.height() as u32)?;
-    let local_rect = PixelRect {
-        x0: 0,
-        y0: 0,
-        x1: rect.width(),
-        y1: rect.height(),
-    };
-    draw_item(&mut body, local_rect, item, assets, report, false)?;
-    composite_rotated_body(frame, &body, &mask, &rotated_mask, item.rotation_deg);
-    Ok(())
+    let coordinate = |value| i32::try_from(value).map_err(|_| RasterError::DimensionsOverflow);
+    draw_unclipped_item(
+        frame,
+        LayerPixelRect {
+            x0: coordinate(rect.x0)?,
+            y0: coordinate(rect.y0)?,
+            x1: coordinate(rect.x1)?,
+            y1: coordinate(rect.y1)?,
+        },
+        item,
+        assets,
+        report,
+        item.rotation_deg,
+        glow,
+    )
 }
 
 fn rotated_bounds(mask: &MaskSurface, angle_deg: f32) -> (i32, i32, usize, usize) {
@@ -2875,6 +3074,8 @@ mod tests {
                     kind: SceneItemKind::Spectrum {
                         values: bands,
                         miv_frame: visual,
+                        miv_dimensions: MivSpectrumDimensions::default(),
+                        minimum_thickness_px: 1.0,
                         point_count: SPECTRUM_BAND_COUNT,
                         shape: SpectrumShape::MivHorizontal,
                         color_mode: MusicColorMode::Miv,
@@ -2889,6 +3090,7 @@ mod tests {
                     corner_radius_px: 0.0,
                     glow: None,
                     kind: SceneItemKind::PitchKeyboard {
+                        dimensions: KeyboardDimensions::default(),
                         keyboard,
                         background: Fill::Solid(Rgba8::new(0, 0, 0, 0)),
                         color_mode: MusicColorMode::Miv,
@@ -2933,6 +3135,7 @@ mod tests {
             corner_radius_px: 6.0,
             glow,
             kind: SceneItemKind::PitchKeyboard {
+                dimensions: KeyboardDimensions::default(),
                 keyboard: keyboard.clone(),
                 background: Fill::Solid(Rgba8::BLACK),
                 color_mode: MusicColorMode::Custom,
@@ -3019,6 +3222,8 @@ mod tests {
                 item(SceneItemKind::Spectrum {
                     values: vec![0.1, 0.8, 0.3, 1.0],
                     miv_frame: MivSpectrumFrame::default(),
+                    miv_dimensions: MivSpectrumDimensions::default(),
+                    minimum_thickness_px: 1.0,
                     point_count: 24,
                     shape: SpectrumShape::Bars {
                         gap_ratio: 0.25,
@@ -3036,6 +3241,7 @@ mod tests {
                     corner_radius_px: 0.0,
                     glow: None,
                     kind: SceneItemKind::PitchKeyboard {
+                        dimensions: KeyboardDimensions::default(),
                         keyboard: keyboard.clone(),
                         background: Fill::Solid(Rgba8::new(0, 0, 0, 0)),
                         color_mode: MusicColorMode::Miv,
@@ -3112,6 +3318,7 @@ mod tests {
                     &mut parallel,
                     rect,
                     &keyboard,
+                    KeyboardDimensions::default(),
                     &background,
                     MusicColorMode::Custom,
                     0.0,
@@ -3196,6 +3403,7 @@ mod tests {
                         corner_radius_px: 0.0,
                         glow: None,
                         kind: SceneItemKind::PitchKeyboard {
+                            dimensions: KeyboardDimensions::default(),
                             keyboard: KeyboardFrame::default(),
                             background: Fill::Solid(background),
                             color_mode: MusicColorMode::Custom,
@@ -3274,9 +3482,11 @@ mod tests {
         let mut layer = item(SceneItemKind::Spectrum {
             values: vec![0.1, 0.8, 0.3, 1.0],
             miv_frame: MivSpectrumFrame::default(),
+            miv_dimensions: MivSpectrumDimensions::default(),
+            minimum_thickness_px: 1.0,
             point_count: 31,
             shape: SpectrumShape::Radial {
-                radius_px: 24.0,
+                inner_ratio: 24.0 / 48.0,
                 thickness_px: 3.0,
                 start_angle_deg: -90.0,
                 sweep_deg: 360.0,
@@ -3318,9 +3528,11 @@ mod tests {
         let layer = item(SceneItemKind::Spectrum {
             values: vec![0.2, 0.8, 0.4, 1.0],
             miv_frame: MivSpectrumFrame::default(),
+            miv_dimensions: MivSpectrumDimensions::default(),
+            minimum_thickness_px: 1.0,
             point_count: 37,
             shape: SpectrumShape::Radial {
-                radius_px: 32.0,
+                inner_ratio: 32.0 / 64.0,
                 thickness_px: 2.0,
                 start_angle_deg: -90.0,
                 sweep_deg: 360.0,
@@ -3368,9 +3580,11 @@ mod tests {
                 .map(|index| 0.2 + 0.8 * (index as f32 * 0.37).sin().abs())
                 .collect(),
             miv_frame: MivSpectrumFrame::default(),
+            miv_dimensions: MivSpectrumDimensions::default(),
+            minimum_thickness_px: 1.0,
             point_count: 200,
             shape: SpectrumShape::Radial {
-                radius_px: 380.0,
+                inner_ratio: 380.0 / 540.0,
                 thickness_px: 4.0,
                 start_angle_deg: -90.0,
                 sweep_deg: 360.0,

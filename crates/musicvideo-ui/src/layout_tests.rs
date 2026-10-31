@@ -14,6 +14,7 @@ struct Harness {
     timeline_entry: Project,
     properties_entry: Project,
     project_path: Option<PathBuf>,
+    screen_height: f32,
 }
 
 impl Harness {
@@ -32,6 +33,7 @@ impl Harness {
             response: EditorResponse::default(),
             panels: [Rect::NOTHING; 3],
             project_path: None,
+            screen_height: 1000.0,
         };
         harness.frame(vec![]);
         harness.frame(vec![]);
@@ -42,7 +44,10 @@ impl Harness {
         self.time += 0.1;
         self.output = crate::headless_paint_output(self.context.run_ui(
             egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 1000.0))),
+                screen_rect: Some(Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(1280.0, self.screen_height),
+                )),
                 time: Some(self.time),
                 events,
                 ..Default::default()
@@ -229,6 +234,205 @@ impl Harness {
             self.frame(vec![]);
         }
     }
+}
+
+#[test]
+fn image_fit_choices_use_project_history_and_dirty_tracking() {
+    for fit in [Fit::Contain, Fit::Stretch, Fit::Cover] {
+        let mut h = Harness::new();
+        let index = h
+            .project
+            .layers
+            .iter()
+            .position(|layer| matches!(layer.kind, LayerKind::Image { .. }))
+            .unwrap();
+        let LayerKind::Image { fit: initial, .. } = &mut h.project.layers[index].kind else {
+            unreachable!()
+        };
+        *initial = if fit == Fit::Cover {
+            Fit::Contain
+        } else {
+            Fit::Cover
+        };
+        h.state.reset_for_project(&h.project);
+        h.state.select_layer(&h.project, index);
+        let before = h.project.clone();
+        let mut document = DocumentSession::default();
+        document.replace_with_loaded("saved.mivmv.json".into(), &h.project);
+        h.frame(vec![]);
+        let LayerKind::Image { fit: initial, .. } = before.layers[index].kind else {
+            unreachable!()
+        };
+        h.click(image_fit_label(initial));
+        h.frame(vec![]);
+        h.frame(vec![]);
+        h.click(image_fit_label(fit));
+        assert!(h.response.project_changed);
+        h.frame(vec![]);
+        let mut expected = before.clone();
+        let LayerKind::Image { fit: result, .. } = &mut expected.layers[index].kind else {
+            unreachable!()
+        };
+        *result = fit;
+        assert_eq!(h.project, expected);
+        assert!(document.is_dirty(&h.project));
+        assert_eq!(h.state.history_depths(), (1, 0));
+        assert!(h.state.undo(&mut h.project));
+        assert_eq!(h.project, before);
+        assert!(!document.is_dirty(&h.project));
+        assert!(h.state.redo(&mut h.project));
+        assert_eq!(h.project, expected);
+        assert!(document.is_dirty(&h.project));
+    }
+}
+
+#[test]
+fn layer_list_controls_stay_fixed_when_layers_grow_and_list_scrolls() {
+    let mut h = Harness::new();
+    let labels = [
+        "レイヤー",
+        "一覧の上が奥、下が手前です",
+        "一覧の上へ（奥）",
+        "一覧の下へ（手前）",
+        "選択中のレイヤーを削除…",
+        "＋ レイヤーを追加",
+    ];
+    // The heading shares its text with an inspector tab; identify it in the left panel.
+    let list_rect = |h: &Harness, label: &str| {
+        let text_rect = h
+            .shapes()
+            .into_iter()
+            .find_map(|shape| match shape {
+                egui::Shape::Text(shape)
+                    if shape.galley.text() == label && h.panels[1].contains(shape.pos) =>
+                {
+                    Some(shape.galley.rect.translate(shape.pos.to_vec2()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing fixed list control: {label}"));
+        if labels[2..].contains(&label) {
+            h.shapes()
+                .into_iter()
+                .filter_map(|shape| match shape {
+                    egui::Shape::Rect(shape) if shape.rect.contains_rect(text_rect) => {
+                        Some(shape.rect)
+                    }
+                    _ => None,
+                })
+                .min_by(|a, b| a.area().total_cmp(&b.area()))
+                .expect("rendered button rectangle")
+        } else {
+            text_rect
+        }
+    };
+    let before: Vec<_> = labels.iter().map(|label| list_rect(&h, label)).collect();
+    let first_name = h.project.layers[0].name.clone();
+    let first_before = list_rect(&h, &first_name);
+    assert!(
+        first_before.top() > before.last().unwrap().bottom(),
+        "only the names belong below the fixed controls"
+    );
+    for index in 0..80 {
+        let mut layer = new_solid_layer(&h.project);
+        layer.name = format!("extra-{index}");
+        h.project.layers.push(layer);
+    }
+    h.frame(vec![]);
+    h.frame(vec![]);
+    for (label, expected) in labels.iter().zip(&before) {
+        assert_eq!(list_rect(&h, label), *expected);
+    }
+    let visible_names = |h: &Harness| {
+        h.shapes()
+            .into_iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Text(shape)
+                    if shape.galley.text().starts_with("extra-")
+                        && h.panels[1].contains(shape.pos) =>
+                {
+                    Some(shape.galley.text().to_owned())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let names_before_scroll = visible_names(&h);
+    h.frame(vec![
+        Event::PointerMoved(first_before.center()),
+        Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: Vec2::new(0.0, -600.0),
+            modifiers: Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
+        },
+    ]);
+    for _ in 0..8 {
+        h.frame(vec![]);
+    }
+    for (label, expected) in labels.iter().zip(&before) {
+        assert_eq!(
+            list_rect(&h, label),
+            *expected,
+            "fixed controls must not scroll"
+        );
+    }
+    assert_ne!(
+        visible_names(&h),
+        names_before_scroll,
+        "the list itself must scroll"
+    );
+}
+
+#[test]
+fn radial_inner_circle_uses_percent_and_shape_switch_default() {
+    let mut h = Harness::new();
+    h.screen_height = 1600.0;
+    let index = h
+        .project
+        .layers
+        .iter()
+        .position(|layer| matches!(layer.kind, LayerKind::Spectrum(_)))
+        .unwrap();
+    let LayerKind::Spectrum(spectrum) = &mut h.project.layers[index].kind else {
+        unreachable!()
+    };
+    spectrum.shape = SpectrumShape::Bars {
+        gap_ratio: 0.3,
+        min_height_px: 3.0,
+        thickness_px: 12.0,
+    };
+    h.state.reset_for_project(&h.project);
+    h.state.select_layer(&h.project, index);
+    h.frame(vec![]);
+    h.click("円形");
+    h.frame(vec![]);
+    let LayerKind::Spectrum(spectrum) = &h.project.layers[index].kind else {
+        unreachable!()
+    };
+    let SpectrumShape::Radial { inner_ratio, .. } = spectrum.shape else {
+        panic!("radial mode")
+    };
+    assert_eq!(inner_ratio, 380.0 / 550.0);
+    h.label("バーは枠の端まで伸びます");
+    let value = h.label("内側の円 ");
+    h.label(" %");
+    h.pointer(value.center(), true);
+    h.pointer(value.center(), false);
+    h.frame(vec![]);
+    h.replace_focused_text("40");
+    h.shortcut(egui::Key::Enter, Modifiers::NONE);
+    let LayerKind::Spectrum(spectrum) = &h.project.layers[index].kind else {
+        unreachable!()
+    };
+    let SpectrumShape::Radial { inner_ratio, .. } = spectrum.shape else {
+        unreachable!()
+    };
+    assert!(
+        (inner_ratio - 0.4).abs() < 1e-6,
+        "40 percent is stored as a ratio"
+    );
 }
 
 #[test]

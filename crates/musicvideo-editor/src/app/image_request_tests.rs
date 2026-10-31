@@ -69,6 +69,14 @@ fn musicvideo_image_default_background_request_creates_reference_and_restores_hi
     );
     settle(&mut app, &ctx);
     assert_image(&app, &id, &path, 12);
+    assert!(matches!(
+        initial.layers[0].kind,
+        LayerKind::Image {
+            fit: Fit::Cover,
+            ..
+        }
+    ));
+    assert_eq!(app.project.layers, initial.layers);
     assert_eq!(app.editor_state.history_depths(), (1, 0));
     let revision = app
         .editor_state
@@ -191,4 +199,144 @@ fn musicvideo_image_add_then_replace_keeps_one_reference_and_undoable_pixels() {
     history(&mut app, &ctx, true);
     history(&mut app, &ctx, true);
     assert_image(&app, &id, &path, 77);
+}
+
+#[test]
+fn p5a_image_add_centers_maximum_aspect_rect_and_contain_through_history() {
+    let ctx = crate::project::test_context();
+    let temp = tempfile::tempdir().unwrap();
+    for (width, height, expected) in [
+        (80, 160, NormRect::new(0.375, 0.0, 0.25, 1.0)),
+        (160, 40, NormRect::new(0.0, 0.25, 1.0, 0.5)),
+        (64, 64, NormRect::new(0.25, 0.0, 0.5, 1.0)),
+        (200, 100, NormRect::FULL),
+    ] {
+        let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
+        assert!(
+            app.resource_store.is_some(),
+            "initialization: {}",
+            app.status
+        );
+        assert!(
+            app.restore_worker.is_some(),
+            "initialization: {}",
+            app.status
+        );
+        app.project.output.width = 200;
+        app.project.output.height = 100;
+        let initial = app.project.clone();
+        let path = temp.path().join(format!("{width}x{height}.png"));
+        image::RgbaImage::from_pixel(width, height, image::Rgba([12, 34, 56, 255]))
+            .save(&path)
+            .unwrap();
+        app.start_image_request(ImageLoadTarget::AddLayer, path.clone(), &ctx);
+        assert!(app.image_pending.is_some(), "admission: {}", app.status);
+        assert_eq!(
+            app.project, initial,
+            "placement waits for decoded dimensions"
+        );
+        settle(&mut app, &ctx);
+
+        let added = app.project.clone();
+        assert_eq!(added.images.len(), 1, "{width}x{height}: {}", app.status);
+        let id = &added.images[0].id;
+        let layer = added
+            .layers
+            .iter()
+            .find(|layer| matches!(&layer.kind, LayerKind::Image { image, .. } if image == id))
+            .unwrap();
+        assert_eq!(layer.rect, Animatable::Const(expected), "{width}x{height}");
+        assert!(matches!(
+            layer.kind,
+            LayerKind::Image {
+                fit: Fit::Contain,
+                ..
+            }
+        ));
+        assert_eq!(app.editor_state.history_depths(), (1, 0));
+        let revision = app
+            .editor_state
+            .resource_manifest()
+            .image(id)
+            .unwrap()
+            .revision();
+        std::fs::remove_file(&path).unwrap();
+
+        history(&mut app, &ctx, false);
+        assert_eq!(app.project, initial);
+        assert!(!app.assets.has_image(id));
+        history(&mut app, &ctx, true);
+        assert_eq!(app.project, added);
+        assert_eq!(app.assets.image(id).unwrap().width, width);
+        assert_eq!(app.assets.image(id).unwrap().height, height);
+        assert_eq!(
+            app.editor_state
+                .resource_manifest()
+                .image(id)
+                .unwrap()
+                .revision(),
+            revision
+        );
+    }
+}
+
+#[test]
+fn p5a_image_replace_preserves_existing_rect_and_fit_through_history() {
+    let ctx = crate::project::test_context();
+    let temp = tempfile::tempdir().unwrap();
+    let original_path = temp.path().join("original.png");
+    let replacement_path = temp.path().join("replacement.png");
+    image::RgbaImage::from_pixel(1, 1, image::Rgba([12, 34, 56, 255]))
+        .save(&original_path)
+        .unwrap();
+    image::RgbaImage::from_pixel(1, 1, image::Rgba([77, 34, 56, 255]))
+        .save(&replacement_path)
+        .unwrap();
+    for expected_fit in [Fit::Cover, Fit::Contain, Fit::Stretch] {
+        let mut app = MusicVideoLabApp::new(Arc::new(Assets::default()));
+        let id = ImageId::new(BACKGROUND_ID);
+        app.start_image_load(id.clone(), original_path.clone(), &ctx);
+        settle(&mut app, &ctx);
+
+        let checkpoint = app.editor_state.begin_external_edit(&app.project);
+        let layer = &mut app.project.layers[0];
+        layer.rect = Animatable::Const(NormRect::new(0.1, 0.2, 0.6, 0.3));
+        if let LayerKind::Image { fit, .. } = &mut layer.kind {
+            *fit = expected_fit;
+        }
+        assert!(
+            app.editor_state
+                .finish_external_edit(&app.project, checkpoint)
+        );
+        let before = app.project.clone();
+
+        app.start_image_load(id.clone(), replacement_path.clone(), &ctx);
+        settle(&mut app, &ctx);
+        let replaced = app.project.clone();
+        assert_eq!(replaced.layers, before.layers);
+        assert_image(&app, &id, &replacement_path, 77);
+        history(&mut app, &ctx, false);
+        assert_eq!(app.project, before);
+        assert_image(&app, &id, &original_path, 12);
+        history(&mut app, &ctx, true);
+        assert_eq!(app.project, replaced);
+        assert_image(&app, &id, &replacement_path, 77);
+
+        // The pre-replacement Fit/rect edit remains its own undo unit.
+        history(&mut app, &ctx, false);
+        history(&mut app, &ctx, false);
+        assert_eq!(
+            app.project.layers[0].rect,
+            Animatable::Const(NormRect::FULL)
+        );
+        assert!(matches!(
+            app.project.layers[0].kind,
+            LayerKind::Image {
+                fit: Fit::Cover,
+                ..
+            }
+        ));
+        history(&mut app, &ctx, true);
+        assert_eq!(app.project, before);
+    }
 }

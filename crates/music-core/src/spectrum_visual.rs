@@ -190,6 +190,48 @@ pub struct MivSpectrumPrimitive {
 pub fn visit_miv_spectrum_primitives(
     frame: &MivSpectrumFrame,
     plot: SpectrumVisualRect,
+    visit: impl FnMut(MivSpectrumPrimitive),
+) {
+    visit_miv_spectrum_primitives_with_dimensions(
+        frame,
+        plot,
+        MivSpectrumDimensions::default(),
+        visit,
+    );
+}
+
+/// Pixel dimensions independent of signal levels and the normalized plot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MivSpectrumDimensions {
+    pub band_inset_px: f32,
+    pub min_width_px: f32,
+    pub corner_threshold_px: f32,
+    pub corner_radius_px: f32,
+    pub bottom_inset_px: f32,
+    pub height_inset_px: f32,
+    pub ghost_expand_px: f32,
+    pub trail_expand_px: f32,
+}
+
+impl Default for MivSpectrumDimensions {
+    fn default() -> Self {
+        Self {
+            band_inset_px: 0.25,
+            min_width_px: 0.75,
+            corner_threshold_px: 2.0,
+            corner_radius_px: 1.0,
+            bottom_inset_px: 2.0,
+            height_inset_px: 3.0,
+            ghost_expand_px: 0.45,
+            trail_expand_px: 0.2,
+        }
+    }
+}
+
+pub fn visit_miv_spectrum_primitives_with_dimensions(
+    frame: &MivSpectrumFrame,
+    plot: SpectrumVisualRect,
+    dimensions: MivSpectrumDimensions,
     mut visit: impl FnMut(MivSpectrumPrimitive),
 ) {
     let total = frame.bands.len();
@@ -198,13 +240,17 @@ pub fn visit_miv_spectrum_primitives(
     }
     for (index, band) in frame.bands.iter().copied().enumerate() {
         let (band_low_hz, band_high_hz) = spectrum_band_hz_range(index, total);
-        let x0 = (spectrum_axis_x(plot, band_low_hz) + 0.25).max(plot.left);
-        let x1 = (spectrum_axis_x(plot, band_high_hz) - 0.25)
-            .max(x0 + 0.75)
+        let x0 = (spectrum_axis_x(plot, band_low_hz) + dimensions.band_inset_px).max(plot.left);
+        let x1 = (spectrum_axis_x(plot, band_high_hz) - dimensions.band_inset_px)
+            .max(x0 + dimensions.min_width_px)
             .min(plot.right);
-        let corner_radius_px = if x1 - x0 < 2.0 { 0.0 } else { 1.0 };
-        let base_y = plot.bottom - 2.0;
-        let height = plot.height() - 3.0;
+        let corner_radius_px = if x1 - x0 < dimensions.corner_threshold_px {
+            0.0
+        } else {
+            dimensions.corner_radius_px
+        };
+        let base_y = plot.bottom - dimensions.bottom_inset_px;
+        let height = plot.height() - dimensions.height_inset_px;
         let mut emit = |pass,
                         x_expand: f32,
                         height_ratio: f32,
@@ -229,7 +275,7 @@ pub fn visit_miv_spectrum_primitives(
         };
         emit(
             MivSpectrumPass::Ghost,
-            0.45,
+            dimensions.ghost_expand_px,
             (band.trail * 0.72).max(0.012),
             band.trail,
             Some(48),
@@ -237,7 +283,7 @@ pub fn visit_miv_spectrum_primitives(
         );
         emit(
             MivSpectrumPass::Trail,
-            0.2,
+            dimensions.trail_expand_px,
             band.trail.max(0.015),
             band.trail,
             Some(100),
