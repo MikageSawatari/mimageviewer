@@ -1327,10 +1327,15 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 
   | 項目 | 読み方 |
   |---|---|
-  | 画像ファイル (`folder_tree::SUPPORTED_EXTENSIONS` の静止画。拡張子の判定は Susie の pool を起こす `is_recognized_image_ext` ではなく一覧を直接見る) | 取消を確かめながら 128 MiB まで読み (超えたら `too_large`)、JPEG は `decode_jpeg_turbo_scaled_from_bytes` (DCT の縮小 decode)、他は `image_decode::primary` (取消付き・Susie を呼ばない。AVIF・WIC の fallback を含む)。アニメーションは最初の 1 枚 |
+  | 画像ファイル (`folder_tree::SUPPORTED_EXTENSIONS` の静止画。拡張子の判定は Susie の pool を起こす `is_recognized_image_ext` ではなく一覧を直接見る) | 取消を確かめながら 128 MiB まで読み (超えたら `too_large`)、JPEG は `decode_jpeg_turbo_scaled_from_bytes` (DCT の縮小 decode)、他は `image_decode::primary` (取消付き・Susie を呼ばない。AVIF・WIC の fallback を含む)。closure は読み込み済みの bytes だけを decode し、Susie を呼ばないものに固定する。アニメーションは最初の 1 枚 |
   | RAW | `raw_decoder::preview_bounded` の埋め込み preview だけ。無ければ `unavailable` (現像はしない。RAW 現像 executor を使わない) |
+
+  **decode の memory の上限** (7 巡目 P2): 入力の大きさの上限とは別に、decode 後の buffer を 256 MiB までにする
+  (TurboJPEG の既存の出力上限と同じ値)。`image_decode::primary` の budget、closure の中の `ImageReader::limits`、
+  `preview_bounded` の `max_alloc` にこの値を渡し、超えたら `too_large`。budget を省くと AVIF・WIC が実質無制限に
+  なるので、省略しない。
   | ZIP (cbz 含む) の中の画像 | 1a の `read_zip` / `read_zip_member` (入れ子対応・64 MiB まで・取消付き) の bytes から上と同じ decode |
-  | PDF のページ | 取消付きの `render_page` に**path を perf key に入れない入口**を足して使う (1a の `get_page_sizes_anonymous` と同じ形)。取消の待ち方は、worker が実際に止まるまで待つ policy にし、同時実行の枠を先に離さない。password 付きの PDF は password を渡さないので `unavailable` |
+  | PDF のページ | 取消付きの `render_page` に**path を perf key に入れない入口**を足して使う (1a の `get_page_sizes_anonymous` と同じ形)。取消の待ち方は既存の `CancelWaitPolicy::HarvestOnCancel` (応答を待つだけで cache の保存は内蔵しない。用途のコメントを agent に広げる)。`AbortOnCancel` は早く return して同時実行の枠を先に離すので使わない。password 付きの PDF は password を渡さないので `unavailable` |
   | フォルダ・書庫のファイルの代表、動画・音声、Susie だけが読める形式、EPUB のページ、RAR の中 | `unsupported` (AI は `list_folder` で中の画像を指せる) |
 
 - 向き: EXIF の向きを掛ける (TurboJPEG の経路は向きを掛けないので明示的に掛ける。RAW の preview は掛け済み)。
@@ -1338,7 +1343,13 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
   table を作るので使わない)。
 - **編集の「隠す」**: その項目自身のページの key (実ファイルは path、ZIP の項目は `zip::entry`、PDF は `pdf::page_N`。
   既存の `edit_source` の key 関数) で `ConcealDb::open_readonly` の `get_full_checked` を引き、あれば画像を返さず
-  `hidden_by_edit`。代表を解決しないので、返す画素と判定の key は常に同じ項目 (6 巡目 P1)。DB の file が無ければ
+  `hidden_by_edit`。代表を解決しないので、返す画素と判定の key は常に同じ項目 (6 巡目 P1)。
+  **ZIP の項目は旧名の key も照合する** (7 巡目 P1): v1.3.x までの CP932 名の ZIP では、隠す編集が文字化けした名前の
+  key に残っていることがあり、移行 (`zip_key_migration`) は一覧画面で ZIP を開いた時にしか走らない (agent は移行しない)。
+  よって ZIP の項目では、読み取り専用で取消を受ける列挙 (`enumerate_image_entries_detailed_readonly_with_cancel`。
+  入れ子の名前も含む) の `legacy_renames` から、その項目の旧名を求め、新旧両方の key で照合する。列挙に失敗して
+  対応が決められなければ画像を返さない (`unavailable`)。回転も同じく新しい key を優先して旧 key を引く。
+  1a の `get_item_info` の ZIP の項目の★も同じ旧 key を引くよう 1b で揃える (読み取りだけ。移行はしない)。DB の file が無ければ
   「隠すなし」、file があって読めなければログ + その呼び出し全体を tool error にする (「隠すなし」に倒さない)。
   ほかの補正・編集は反映しない。1d の見せる範囲の説明に「補正・編集は反映しない。隠す編集をした画像は渡さない」と書く。
 - 大きさと品質: 要求の一辺 (256〜512) に `catalog::encode_thumb_webp` (純粋な resize + WebP encode。透明は落ちる) で
@@ -1593,6 +1604,17 @@ digest を入れた cursor、typed admission と判定の共有は妥当とさ�
 ClaudeCode の判断: 指摘はどれも、一覧画面の `process_load_request` (catalog・代表の解決・副作用を内側に持つ) を agent から
 使う前提から出ている。同じ前提の上で抑止を足し続けるのをやめ、`get_thumbnail` を「指定の 1 枚から cache を使わずに直接作る」
 形に組み直した (本の構成の編集画面の縮小画像と同じ考え方)。代表の縮小画像・変換書庫・password 付き PDF の cache は扱わない。
+
+### 15.17 独立レビュー 7 巡目 (2026-10-31、同じ担当、設計 `ebfcabbce`)
+
+判定は「1b: not ready」。6 巡目の 5 件は、一覧画面の縮小画像の経路を使わないことで解消と確認された。Susie を起こさない
+拡張子の判定、向きを 1 度だけ掛けること、各 DB の key の形、隠すの読み取りの失敗を tool error にすることも妥当とされた。
+
+| 指摘 | 判断 | 反映先 |
+|---|---|---|
+| P1 CP932 名の ZIP の旧 key に残った隠す編集を見落とす (agent は移行しない) | 妥当 (`zip_key_migration.rs` の対象に `conceal.db` がある) | §15.5 `get_thumbnail`「隠す」 |
+| P2 入力の上限だけでは decode の memory が決まらない (budget を省くと AVIF・WIC は無制限) | 妥当 | §15.5「decode の memory の上限」 |
+| 確認 PDF の取消の待ち方は既存の `HarvestOnCancel` | 採用 | §15.5 PDF のページ |
 
 ## 16. 段階 1a の実装記録 (2026-10-31、基点 `17c85bb3a`、未コミット差分)
 
