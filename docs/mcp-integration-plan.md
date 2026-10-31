@@ -1065,3 +1065,15 @@ cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_lev
 
 前者は IPC 6件 + MCP 37件、後者は core 19件。今回の ping 回帰と、実 core handler を使う
 使い捨て fixture への stdio adapter 接続を通常ユーザーの full-trust context で確認する。
+
+### クライアントからの呼び出し観測 (2026-10-31、製品 build 基点 `bcbbeb352`)
+
+- **Codex CLI 0.166.0 (gpt-6.1-sol、ChatGPT Windows アプリと同じ Codex エンジン)、観測者 ClaudeCode**:
+  `~/.codex/config.toml` は変えず、`codex exec -c mcp_servers.mivtrial.command=... -c mcp_servers.mivtrial.args=[--data-dir, <隔離 data>]`
+  で disposable portable mIV へ接続した。「タグ一覧と cat の付いた画像」を頼むと、モデルが
+  list_tags と items_by_tag を並行して呼び、最終回答は seed どおり (cat 2・dog 1・indoor 1・outdoor 2、
+  cat_garden.png / cat_sofa.png)。
+  最初の 1 回は両 tool とも `-32602 Invalid limit or cursor` で失敗し、モデルが引数を変えて再試行して成功した。
+  CLI の表示に引数が出ないので値は未確認 (adapter の検査から、limit が 0 か 200 超だったと推定)。
+  段階 1 で、範囲外の limit を上限へ丸めるか、エラー文に許容範囲 (1〜200) を書く。
+- ChatGPT Windows アプリ・Claude Desktop からの呼び出しは利用者の確認待ち。
