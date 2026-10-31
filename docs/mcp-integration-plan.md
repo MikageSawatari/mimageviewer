@@ -2743,3 +2743,26 @@ ClaudeCodeがsandbox外の通常権限で実行する正確なコマンド (今�
 cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
 cargo nextest run -p mimageviewer --lib -E '(test(/agent_ipc/) or test(/agent_level/) or test(/agent_permission/) or test(=settings_db::tests::failed_permission_commit_preserves_snapshot_and_epoch) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(/png_metadata/) or test(=pdf_loader::tests::anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results) or test(=pdf_loader::tests::page_sizes_preserve_existing_ui_diagnostic_identity) or test(=pdf_loader::tests::page_sizes_round_trip_and_reject_a_truncated_reply) or test(/app::folder_scan/) or test(/zip_loader/) or test(/conceal_db/) or test(=pdf_loader::tests::anonymous_agent_render_and_enumerate_omit_keys_and_harvest_actual_completion) or test(=pdf_loader::tests::cancelled_anonymous_render_does_not_enqueue) or test(/app::startup_ops/) or test(/single_instance/) or test(/remote_ipc::session/) or test(/ui_request_dispatch/) or test(/activation/) or test(/startup_open_path/)) and not test(/section1375_scan_perf_tests/)'
 ```
+
+### 18.6 クライアントからの呼び出し観測 (観測者: ClaudeCode、2026-11-01、コード `5565daa58`)
+
+PC の再起動で中断した portable の build は、`target-portable` の本体の成果物が壊れてリンクに失敗した
+(`finish_logs::DEADLINE` の未定義)。`cargo clean --release -p mimageviewer --target-dir target-portable` の後に
+`prepare-portable-smoke.ps1` で作り直した。seed は 1a・1b のもの + 許可の段 `read_and_open`。
+
+- `20261101-000950-codex.jsonl`: `open_in_viewer` を 3 回。`samplesook.zip` は受け付けた (「mIV で開く処理を始めました」)、
+  `samples
+o_such_file.png` は `bad_request`「指定のファイルまたはフォルダは存在しません」(UI へ送らずに拒否)、
+  `samples\solid_red.png` は受け付けた。
+- 直後に portable の窓を画像に撮ると (`PrintWindow`)、`solid_red.png` が全画面で表示されていた。閉じる操作で全画面を
+  抜けると、`samples` フォルダの一覧で `solid_red.png` が選択されていた (二重起動で画像を開いた時と同じ)。
+- 前面化 (`AllowSetForegroundWindow` と activation event) が利用者の画面で効くかは、1d の後の実機確認で見る (未確認)。
+
+### 18.7 検収 (観測者: ClaudeCode、2026-11-01)
+
+- 実装の独立レビュー (thread `01a18ce7`、gpt-6.1-sol / xhigh) は 1 巡で **1c impl: accept**、指摘なし。detached の述語・
+  viewport の routing に触れない構造的な変更であることに、設計レビュー (6 巡目)・実装レビュー・ClaudeCode の三者が同意
+  (`docs/detached-rework-plan.md` に記録済み)。
+- sandbox 外で crates (`--include-ignored`) 12/12・52/52、focused nextest 541/541、すべて exit 0。
+- 実装中の判断 1 件 (受付の lane は path をログに出さず、受理後は既存の open の診断のまま) は §15.6「ログ」に記録した。
+- 判定: **1c を受け入れる**。
