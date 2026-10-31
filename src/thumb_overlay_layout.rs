@@ -111,6 +111,7 @@ pub enum BadgeKind {
     FilterMatchCount,
     MediaDuration,
     BookmarkTime,
+    BookmarkTitle,
     UpscaledVideo,
     Edit(EditBadgeKind),
     EditOverflow,
@@ -120,8 +121,8 @@ pub enum BadgeKind {
     Filename,
 }
 
-/// Lower values reserve lane space first. The value is recorded in every placement so tests and
-/// callers can verify the policy without inferring it from coordinates.
+/// Lower values normally reserve lane space first. When filename width is prioritized, the name
+/// owns the bottom lane before its format badge. Values also identify semantic badge priorities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BadgePriority {
     StackCount,
@@ -129,6 +130,7 @@ pub enum BadgePriority {
     UpscaledVideo,
     EditState,
     Tag,
+    BookmarkTitle,
     BottomContainer,
     Filename,
     Rating,
@@ -193,6 +195,7 @@ impl BottomLeftOverlayLayout {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ThumbnailOverlayLayout {
+    pub bookmark_title: Option<BadgePlacement>,
     /// Shared saved-position slot for every cell while the display setting is on (historical name).
     /// Fixed to the inner bottom; only cells with a valid fraction actually paint a meter.
     pub book_resume_meter: Option<egui::Rect>,
@@ -208,6 +211,7 @@ impl ThumbnailOverlayLayout {
     pub fn badge_placements(&self) -> impl Iterator<Item = &BadgePlacement> {
         self.stack_count
             .iter()
+            .chain(self.bookmark_title.iter())
             .chain(self.top_left.placements())
             .chain(self.bottom_left.placements())
             .chain(self.filter_match_count.iter())
@@ -260,6 +264,7 @@ pub struct ThumbnailOverlayLayoutInput<'a> {
     pub filter_match_count: Option<u32>,
     pub media_duration: Option<&'a str>,
     pub bookmark_time: Option<&'a str>,
+    pub bookmark_title: Option<&'a str>,
     pub upscaled_video: bool,
     pub edit_badges: EditBadgeFlags,
     pub tags: &'a [String],
@@ -273,6 +278,8 @@ pub struct ThumbnailOverlayLayoutInput<'a> {
 pub struct ThumbnailNameStyle {
     pub font_scale: f32,
     pub max_lines: usize,
+    /// Give filenames the full bottom lane and place format badges immediately above them.
+    pub prioritize_width: bool,
 }
 
 impl Default for ThumbnailNameStyle {
@@ -280,11 +287,20 @@ impl Default for ThumbnailNameStyle {
         Self {
             font_scale: 1.0,
             max_lines: 1,
+            prioritize_width: false,
         }
     }
 }
 
 impl ThumbnailNameStyle {
+    pub fn from_settings(settings: &crate::settings::Settings) -> Self {
+        Self {
+            font_scale: settings.thumb_name_font_scale_percent as f32 / 100.0,
+            max_lines: settings.thumb_name_max_lines as usize,
+            prioritize_width: settings.thumb_name_prioritize_width,
+        }
+    }
+
     fn apply(self, mut style: BadgeTextStyle) -> BadgeTextStyle {
         style.font_size *= self.font_scale;
         style.padding.left *= self.font_scale;
@@ -488,6 +504,112 @@ pub fn layout_thumbnail_overlays(
     layout
 }
 
+fn layout_bookmark_title(
+    input: &ThumbnailOverlayLayoutInput<'_>,
+    top_left: &TopLeftOverlayLayout,
+    measure: &mut impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
+) -> Option<BadgePlacement> {
+    let title = input.bookmark_title?;
+    let style = BadgeTextStyle {
+        font_size: 13.0,
+        family: BadgeFontFamily::UserText,
+        padding: BadgePadding::symmetric(7.0, 4.0),
+    };
+    let max_text_width = (input.cell.width() - 28.0).max(0.0);
+    if max_text_width < 8.0 {
+        return None;
+    }
+    // Preserve the existing central-title fitting exactly, including the 36-character cap
+    // and yielding when even the shortest prefix plus ellipsis does not fit.
+    let chars: Vec<char> = title.chars().collect();
+    let mut text = if chars.len() > 36 {
+        chars[..35].iter().collect::<String>() + "…"
+    } else {
+        title.to_owned()
+    };
+    if measure(&text, style).x > max_text_width {
+        let chars: Vec<char> = text.chars().collect();
+        for take in (1..chars.len()).rev() {
+            let candidate = chars[..take].iter().collect::<String>() + "…";
+            if measure(&candidate, style).x <= max_text_width {
+                text = candidate;
+                break;
+            }
+        }
+    }
+    let size = measure(&text, style);
+    if size.x > max_text_width {
+        return None;
+    }
+    let centered = egui::Rect::from_center_size(input.cell.center(), size + style.padding.size());
+    let min_y = top_left.lane_bottom().unwrap_or(input.cell.min.y) + 4.0;
+    let rect = centered.translate(egui::vec2(0.0, (min_y - centered.min.y).max(0.0)));
+    (rect.max.y <= input.cell.max.y - 4.0).then_some(BadgePlacement {
+        kind: BadgeKind::BookmarkTitle,
+        priority: BadgePriority::BookmarkTitle,
+        text,
+        rect,
+        style,
+    })
+}
+
+fn layout_bottom_container(
+    input: &ThumbnailOverlayLayoutInput<'_>,
+    bottom_y: f32,
+    require_containment: bool,
+    mut measure: impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
+    blocked_by_top: impl Fn(egui::Rect) -> bool,
+) -> Option<BadgePlacement> {
+    let left_x = input.inner.min.x + BOTTOM_LEFT_OFFSET;
+    if let Some(container) = input.bottom_container {
+        let style = match container.kind {
+            BottomContainerKind::Folder => input.name_style.apply(folder_badge_style(input.inner)),
+            BottomContainerKind::Format(_) => file_badge_style(input.inner),
+        };
+        let max_badge_width = match container.kind {
+            BottomContainerKind::Folder => input.inner.width() * 0.80,
+            BottomContainerKind::Format(_) => input.inner.width() - BOTTOM_LEFT_OFFSET * 2.0,
+        };
+        let max_text_width = (max_badge_width - style.padding.left - style.padding.right).max(0.0);
+        let is_name = container.kind == BottomContainerKind::Folder;
+        let max_lines = if is_name {
+            input.name_style.max_lines.clamp(1, 4)
+        } else {
+            1
+        };
+        for lines in (1..=max_lines).rev() {
+            let Some(text) = fit_name(
+                container.label,
+                None,
+                max_text_width,
+                max_lines,
+                lines,
+                &mut measure,
+                style,
+            ) else {
+                continue;
+            };
+            let size = measured_badge_size(&text, style, &mut measure);
+            let placement = BadgePlacement {
+                kind: BadgeKind::BottomContainer(container.kind),
+                priority: BadgePriority::BottomContainer,
+                rect: egui::Rect::from_min_size(egui::pos2(left_x, bottom_y - size.y), size),
+                text,
+                style,
+            };
+            // Upper format badges must fit inside the cell. For the legacy bottom anchor only
+            // multi-line trials add containment; the meter keeps its existing containment rule.
+            if (!require_containment && lines == 1 || input.cell.contains_rect(placement.rect))
+                && !blocked_by_top(placement.rect)
+            {
+                return Some(placement);
+            }
+        }
+    }
+
+    None
+}
+
 fn layout_badges(
     input: &ThumbnailOverlayLayoutInput<'_>,
     mut measure: impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
@@ -628,6 +750,13 @@ fn layout_badges(
     }
 
     let mut bottom_left = BottomLeftOverlayLayout::default();
+    let bookmark_title = layout_bookmark_title(input, &top_left, &mut measure);
+    // Folder-name badges retain their entire legacy layout. For filenames, an enabled width
+    // preference also reserves the existing central title rather than painting through it.
+    let prioritize_filename = input.name_style.prioritize_width
+        && !input
+            .bottom_container
+            .is_some_and(|c| c.kind == BottomContainerKind::Folder);
     let bottom_reserve = if input.book_resume_meter {
         BOOK_RESUME_METER_RESERVE
     } else {
@@ -644,53 +773,19 @@ fn layout_badges(
             || top_left
                 .placements()
                 .any(|badge| badge.rect.intersects(rect))
+            || (prioritize_filename
+                && bookmark_title
+                    .as_ref()
+                    .is_some_and(|title| title.rect.intersects(rect)))
     };
 
-    if let Some(container) = input.bottom_container {
-        let style = match container.kind {
-            BottomContainerKind::Folder => input.name_style.apply(folder_badge_style(input.inner)),
-            BottomContainerKind::Format(_) => file_badge_style(input.inner),
-        };
-        let max_badge_width = match container.kind {
-            BottomContainerKind::Folder => input.inner.width() * 0.80,
-            BottomContainerKind::Format(_) => input.inner.width() - BOTTOM_LEFT_OFFSET * 2.0,
-        };
-        let max_text_width = (max_badge_width - style.padding.left - style.padding.right).max(0.0);
-        let is_name = container.kind == BottomContainerKind::Folder;
-        let max_lines = if is_name {
-            input.name_style.max_lines.clamp(1, 4)
-        } else {
-            1
-        };
-        for lines in (1..=max_lines).rev() {
-            let Some(text) = fit_name(
-                container.label,
-                None,
-                max_text_width,
-                max_lines,
-                lines,
-                &mut measure,
-                style,
-            ) else {
-                continue;
-            };
-            let size = measured_badge_size(&text, style, &mut measure);
-            let placement = BadgePlacement {
-                kind: BadgeKind::BottomContainer(container.kind),
-                priority: BadgePriority::BottomContainer,
-                rect: egui::Rect::from_min_size(egui::pos2(left_x, bottom_y - size.y), size),
-                text,
-                style,
-            };
-            // Only multi-line trials add containment. The final one-line trial keeps the legacy
-            // rejection rules, including the existing meter reservation in blocked_by_top.
-            if (lines == 1 || input.cell.contains_rect(placement.rect))
-                && !blocked_by_top(placement.rect)
-            {
-                bottom_left.container = Some(placement);
-                break;
-            }
-        }
+    let separate_format = prioritize_filename
+        && input
+            .bottom_container
+            .is_some_and(|container| matches!(container.kind, BottomContainerKind::Format(_)));
+    if !separate_format {
+        bottom_left.container =
+            layout_bottom_container(input, bottom_y, false, &mut measure, blocked_by_top);
     }
 
     if let Some(filename) = input.filename {
@@ -707,15 +802,20 @@ fn layout_badges(
             if max_text_width < 4.0 {
                 break;
             }
-            let Some(text) = fit_name(
-                filename,
-                Some(18),
-                max_text_width,
-                max_lines,
-                lines,
-                &mut measure,
-                style,
-            ) else {
+            let text = if prioritize_filename && max_lines == 1 {
+                fit_filename_width(filename, max_text_width, &mut measure, style)
+            } else {
+                fit_name(
+                    filename,
+                    (!prioritize_filename).then_some(18),
+                    max_text_width,
+                    max_lines,
+                    lines,
+                    &mut measure,
+                    style,
+                )
+            };
+            let Some(text) = text else {
                 continue;
             };
             let size = measured_badge_size(&text, style, &mut measure);
@@ -730,13 +830,29 @@ fn layout_badges(
                 text,
                 style,
             };
-            if (lines == 1 || input.cell.contains_rect(placement.rect))
+            if (!prioritize_filename && lines == 1 || input.cell.contains_rect(placement.rect))
                 && !blocked_by_top(placement.rect)
             {
                 bottom_left.filename = Some(placement);
                 break;
             }
         }
+    }
+
+    if separate_format {
+        // The name owns its full lane first. If it cannot be shown, keep the legacy bottom
+        // anchor. An upper format badge that cannot fit yields without narrowing the name.
+        let anchor = bottom_left
+            .filename
+            .as_ref()
+            .map_or(bottom_y, |filename| filename.rect.min.y - BOTTOM_ITEM_GAP);
+        bottom_left.container = layout_bottom_container(
+            input,
+            anchor,
+            bottom_left.filename.is_some(),
+            &mut measure,
+            blocked_by_top,
+        );
     }
 
     if let Some(rating_text) = input.rating_text {
@@ -801,6 +917,12 @@ fn layout_badges(
         .chain(stack_count.iter().map(|badge| badge.rect))
         .chain(top_left.placements().map(|badge| badge.rect))
         .chain(bottom_left.placements().map(|badge| badge.rect))
+        .chain(
+            bookmark_title
+                .iter()
+                .filter(|_| prioritize_filename)
+                .map(|title| title.rect),
+        )
         .collect();
     let filter_match_count = input
         .filter_match_count
@@ -848,6 +970,7 @@ fn layout_badges(
         });
 
     ThumbnailOverlayLayout {
+        bookmark_title,
         book_resume_meter: None,
         check,
         stack_count,
@@ -903,6 +1026,38 @@ fn measured_badge_size(
     measure: &mut impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
 ) -> egui::Vec2 {
     measure(text, style) + style.padding.size()
+}
+
+/// Width-only fitting for the opt-in one-line filename path. Keep font measurements logarithmic
+/// in name length; the legacy capped fitting below remains unchanged.
+fn fit_filename_width(
+    text: &str,
+    max_text_width: f32,
+    measure: &mut impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
+    style: BadgeTextStyle,
+) -> Option<String> {
+    if max_text_width <= 0.0 || text.is_empty() {
+        return None;
+    }
+    if measure(text, style).x <= max_text_width {
+        return Some(text.to_owned());
+    }
+    if measure("…", style).x > max_text_width {
+        return None;
+    }
+    let boundaries: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    let mut low = 0;
+    let mut high = boundaries.len() - 1;
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        let candidate = text[..boundaries[mid]].to_owned() + "…";
+        if measure(&candidate, style).x <= max_text_width {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Some(text[..boundaries[low]].to_owned() + "…")
 }
 
 fn fit_text(
@@ -1010,6 +1165,262 @@ fn fit_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn width_only_filename_measurements_are_logarithmic() {
+        for text in ["a".repeat(4096), "長".repeat(4096)] {
+            let mut calls = 0;
+            let style = filename_badge_style();
+            let fitted = fit_filename_width(
+                &text,
+                100.0,
+                &mut |s, style| {
+                    calls += 1;
+                    measure(s, style)
+                },
+                style,
+            )
+            .unwrap();
+            assert!(calls <= 16, "{calls} font measurements");
+            assert!(fitted.ends_with('…'));
+            assert!(measure(&fitted, style).x <= 100.0);
+        }
+    }
+
+    #[test]
+    fn bookmark_title_preserves_legacy_cap_and_center_without_name_scaling() {
+        let (cell, inner) = cell(600.0);
+        let mut input = duration_input(cell, inner);
+        input.bookmark_title = Some("abcdefghijklmnopqrstuvwxyz0123456789abcdef");
+        input.name_style.font_scale = 2.0;
+        input.name_style.max_lines = 4;
+        let layout = layout_thumbnail_overlays(input, measure);
+        let title = layout.bookmark_title.unwrap();
+        assert_eq!(title.text, "abcdefghijklmnopqrstuvwxyz012345678…");
+        assert_eq!(title.style.font_size, 13.0);
+        assert_eq!(title.rect.center(), cell.center());
+        assert_eq!(
+            title.rect.size(),
+            measure(&title.text, title.style) + egui::vec2(14.0, 8.0)
+        );
+    }
+
+    #[test]
+    fn width_priority_reserves_bookmark_title_and_keeps_folder_layout_unchanged() {
+        for height in [96.0, 100.0, 112.0, 128.0, 180.0] {
+            for width in [100.0, 180.0, 320.0] {
+                let cell =
+                    egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(width, height));
+                for reserve in [false, true] {
+                    for duration in [None, Some("12:34")] {
+                        for rating in [None, Some("★★★★★")] {
+                            for max_lines in 1..=4 {
+                                let mut input = duration_input(cell, cell.shrink(4.0));
+                                input.book_resume_meter = reserve;
+                                input.media_duration = duration;
+                                input.rating_text = rating;
+                                input.bookmark_title = Some(
+                                    "長いブックマークタイトルの名前_abcdefghijklmnopqrstuvwxyz",
+                                );
+                                input.bookmark_time = Some("0:07");
+                                input.filename =
+                                    Some("long-video-filename_abcdefghijklmnopqrstuvwxyz.mp4");
+                                input.bottom_container = Some(BottomContainerInput {
+                                    kind: BottomContainerKind::Format(FormatBadgeKind::Video),
+                                    label: "VIDEO",
+                                });
+                                input.name_style.max_lines = max_lines;
+                                let off = layout_thumbnail_overlays(input.clone(), measure);
+                                input.name_style.prioritize_width = true;
+                                let on = layout_thumbnail_overlays(input.clone(), measure);
+                                assert_eq!(on.bookmark_title, off.bookmark_title);
+                                assert!(on.bookmark_title.is_some());
+                                assert_placements_inside_cell(&on, cell);
+                                assert_pairwise_non_intersecting(on.badge_placements());
+                                for badge in on.badge_placements() {
+                                    assert!(
+                                        !on.book_resume_meter
+                                            .is_some_and(|r| r.intersects(badge.rect))
+                                    );
+                                }
+                                input.bottom_container = Some(BottomContainerInput {
+                                    kind: BottomContainerKind::Folder,
+                                    label: "長いフォルダ名の表示",
+                                });
+                                input.filename = None;
+                                let folder_on = layout_thumbnail_overlays(input.clone(), measure);
+                                input.name_style.prioritize_width = false;
+                                assert_eq!(folder_on, layout_thumbnail_overlays(input, measure));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prioritized_filename_uses_full_width_and_format_stacks_above_it() {
+        let (cell, inner) = cell(240.0);
+        let name = "abcdefghijklmnopqrstuvwx.zip";
+        let mut input = duration_input(cell, inner);
+        input.filename = Some(name);
+        input.bottom_container = Some(BottomContainerInput {
+            kind: BottomContainerKind::Format(FormatBadgeKind::Zip),
+            label: "ZIP",
+        });
+        input.rating_text = Some("★★★★★");
+        let off = layout_thumbnail_overlays(input.clone(), measure);
+        assert_eq!(
+            off.bottom_left.filename.as_ref().unwrap().text,
+            "abcdefghijklmnopq…"
+        );
+        input.name_style.prioritize_width = true;
+        let on = layout_thumbnail_overlays(input.clone(), measure);
+        let filename = on.bottom_left.filename.as_ref().unwrap();
+        let format = on.bottom_left.container.as_ref().unwrap();
+        assert_eq!(filename.text, name);
+        assert_eq!(filename.rect.center().x, inner.center().x);
+        assert_eq!(format.rect.min.x, inner.min.x + BOTTOM_LEFT_OFFSET);
+        assert_eq!(format.rect.max.y + BOTTOM_ITEM_GAP, filename.rect.min.y);
+        assert_eq!(
+            on.bottom_left.rating.as_ref().unwrap().rect.max.y + BOTTOM_ITEM_GAP,
+            format.rect.min.y
+        );
+        // An overlong name uses every available point, rather than the old 18-character cap.
+        input.filename = Some("abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz");
+        let wide = layout_thumbnail_overlays(input.clone(), measure);
+        let name = wide.bottom_left.filename.as_ref().unwrap();
+        assert!(name.text.chars().count() > 18);
+        let available = inner.width() - BOTTOM_LEFT_OFFSET * 2.0;
+        assert!(name.rect.width() <= available);
+        assert!(available - name.rect.width() < measure("a", name.style).x);
+        input.name_style.prioritize_width = false;
+        input.filename = Some("abcdefghijklmnopqrstuvwx.zip");
+        assert_eq!(layout_thumbnail_overlays(input, measure), off);
+    }
+
+    #[test]
+    fn prioritized_format_yields_above_name_and_falls_back_only_without_name() {
+        for height in [38.0, 48.0] {
+            let cell = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(160.0, height));
+            let mut input = duration_input(cell, cell.shrink(4.0));
+            input.media_duration = None;
+            input.bottom_container = Some(BottomContainerInput {
+                kind: BottomContainerKind::Format(FormatBadgeKind::Zip),
+                label: "ZIP",
+            });
+            input.name_style.prioritize_width = true;
+            input.filename = Some("abcdefghij.zip");
+            if height == 48.0 {
+                input.edit_badges.pin = true;
+            }
+            let on = layout_thumbnail_overlays(input.clone(), measure);
+            assert!(on.bottom_left.filename.is_some());
+            assert!(on.bottom_left.container.is_none());
+            input.filename = None;
+            let no_name = layout_thumbnail_overlays(input.clone(), measure);
+            input.name_style.prioritize_width = false;
+            assert_eq!(no_name, layout_thumbnail_overlays(input.clone(), measure));
+            assert!(no_name.bottom_left.container.is_some());
+            if height == 38.0 {
+                continue;
+            }
+            // A filename rejected by the upper lane also restores the bottom format anchor.
+            input.name_style.prioritize_width = true;
+            input.name_style.font_scale = 2.0;
+            input.filename = Some("abcdefghij.zip");
+            input.edit_badges.pin = true;
+            let rejected_name = layout_thumbnail_overlays(input, measure);
+            assert!(rejected_name.bottom_left.filename.is_none());
+            assert_eq!(
+                rejected_name.bottom_left.container,
+                no_name.bottom_left.container
+            );
+        }
+    }
+
+    #[test]
+    fn prioritized_names_keep_corners_disjoint_and_folder_names_unchanged() {
+        let tags = tags(&["#タグ", "分類"]);
+        for width in [32.0, 64.0, 100.0, 180.0, 320.0] {
+            for height in [48.0, 100.0, 180.0] {
+                let cell =
+                    egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(width, height));
+                for font_scale in [1.0, 2.0] {
+                    for max_lines in 1..=4 {
+                        for kind in [
+                            BottomContainerKind::Folder,
+                            BottomContainerKind::Format(FormatBadgeKind::Zip),
+                            BottomContainerKind::Format(FormatBadgeKind::Pdf),
+                            BottomContainerKind::Format(FormatBadgeKind::Archive),
+                            BottomContainerKind::Format(FormatBadgeKind::Video),
+                            BottomContainerKind::Format(FormatBadgeKind::Audio),
+                        ] {
+                            for reserve in [false, true] {
+                                for checked in [false, true] {
+                                    for name in [
+                                        "長い日本語のファイル名とフォルダ名を折り返す作品集の一覧",
+                                        "abcdefghijklmnopqrstuvwxyz0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZ.zip",
+                                    ] {
+                                        let mut input = duration_input(cell, cell.shrink(4.0));
+                                        input.name_style = ThumbnailNameStyle {
+                                            font_scale,
+                                            max_lines,
+                                            prioritize_width: true,
+                                        };
+                                        input.book_resume_meter = reserve;
+                                        input.checked = checked;
+                                        input.stack_count = Some(12);
+                                        input.filter_match_count = Some(42);
+                                        input.tags = &tags;
+                                        input.bookmark_time = Some("0:07");
+                                        input.upscaled_video = true;
+                                        input.edit_badges = EditBadgeFlags {
+                                            page_override: true,
+                                            crop: true,
+                                            pin: true,
+                                            ..Default::default()
+                                        };
+                                        input.rating_text = Some("★★★★★");
+                                        input.bottom_container = Some(BottomContainerInput {
+                                            kind,
+                                            label: if kind == BottomContainerKind::Folder {
+                                                name
+                                            } else {
+                                                "ZIP"
+                                            },
+                                        });
+                                        input.filename =
+                                            (kind != BottomContainerKind::Folder).then_some(name);
+                                        let on = layout_thumbnail_overlays(input.clone(), measure);
+                                        assert_placements_inside_cell(&on, cell);
+                                        assert_pairwise_non_intersecting(on.badge_placements());
+                                        for badge in on.badge_placements() {
+                                            assert!(
+                                                !on.check.is_some_and(|r| r.intersects(badge.rect))
+                                            );
+                                            assert!(
+                                                !on.book_resume_meter
+                                                    .is_some_and(|r| r.intersects(badge.rect))
+                                            );
+                                        }
+                                        if kind == BottomContainerKind::Folder {
+                                            input.name_style.prioritize_width = false;
+                                            assert_eq!(
+                                                on,
+                                                layout_thumbnail_overlays(input, measure)
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn default_names_match_legacy_placements_and_soft_cap() {
@@ -1387,6 +1798,7 @@ mod tests {
                 input.name_style = ThumbnailNameStyle {
                     font_scale,
                     max_lines: 3,
+                    prioritize_width: false,
                 };
                 let scaled = layout_thumbnail_overlays(input, measure);
                 for (before, after) in baseline.badge_placements().zip(scaled.badge_placements()) {
@@ -1399,6 +1811,7 @@ mod tests {
                         let expected = ThumbnailNameStyle {
                             font_scale,
                             max_lines: 3,
+                            prioritize_width: false,
                         }
                         .apply(before.style);
                         assert_eq!(after.style, expected);
@@ -1441,6 +1854,7 @@ mod tests {
                 input.name_style = ThumbnailNameStyle {
                     font_scale: 1.5,
                     max_lines: 4,
+                    prioritize_width: false,
                 };
                 input.media_duration = None;
                 input.bookmark_time = Some("0:07");
@@ -1500,6 +1914,7 @@ mod tests {
                                 input.name_style = ThumbnailNameStyle {
                                     font_scale,
                                     max_lines,
+                                    prioritize_width: false,
                                 };
                                 input.book_resume_meter = reserve;
                                 input.checked = true;
@@ -1800,6 +2215,7 @@ mod tests {
             filter_match_count: None,
             media_duration: Some("1:02:03"),
             bookmark_time: None,
+            bookmark_title: None,
             upscaled_video: false,
             edit_badges: EditBadgeFlags::default(),
             tags: &[],
@@ -1931,6 +2347,7 @@ mod tests {
                     filter_match_count: Some(123),
                     media_duration: None,
                     bookmark_time: None,
+                    bookmark_title: None,
                     upscaled_video: false,
                     edit_badges: EditBadgeFlags {
                         page_override: true,
@@ -1992,6 +2409,7 @@ mod tests {
                     filter_match_count: None,
                     media_duration: None,
                     bookmark_time: None,
+                    bookmark_title: None,
                     upscaled_video: false,
                     edit_badges: EditBadgeFlags {
                         page_override: true,
@@ -2028,6 +2446,7 @@ mod tests {
                 filter_match_count: Some(42),
                 media_duration: None,
                 bookmark_time: None,
+                bookmark_title: None,
                 upscaled_video: false,
                 edit_badges: EditBadgeFlags::default(),
                 tags: &[],
@@ -2058,6 +2477,7 @@ mod tests {
                     filter_match_count: None,
                     media_duration: None,
                     bookmark_time: None,
+                    bookmark_title: None,
                     upscaled_video: false,
                     edit_badges: EditBadgeFlags {
                         page_override: true,
@@ -2100,6 +2520,7 @@ mod tests {
                     filter_match_count: None,
                     media_duration: None,
                     bookmark_time: Some("12:34"),
+                    bookmark_title: None,
                     upscaled_video: true,
                     edit_badges: EditBadgeFlags {
                         page_override: true,
@@ -2161,6 +2582,7 @@ mod tests {
                 filter_match_count: None,
                 media_duration: None,
                 bookmark_time: Some("12:34"),
+                bookmark_title: None,
                 upscaled_video: true,
                 edit_badges: EditBadgeFlags {
                     page_override: true,
@@ -2197,6 +2619,7 @@ mod tests {
                 filter_match_count: None,
                 media_duration: None,
                 bookmark_time: Some("0:07"),
+                bookmark_title: None,
                 upscaled_video: true,
                 edit_badges: EditBadgeFlags {
                     page_override: true,
@@ -2243,6 +2666,7 @@ mod tests {
                 filter_match_count: None,
                 media_duration: None,
                 bookmark_time: Some("12:34"),
+                bookmark_title: None,
                 upscaled_video: true,
                 edit_badges: EditBadgeFlags {
                     page_override: true,
@@ -2277,6 +2701,7 @@ mod tests {
                 filter_match_count: None,
                 media_duration: None,
                 bookmark_time: None,
+                bookmark_title: None,
                 upscaled_video: true,
                 edit_badges: EditBadgeFlags {
                     page_override: true,
@@ -2315,6 +2740,7 @@ mod tests {
                 filter_match_count: None,
                 media_duration: None,
                 bookmark_time: None,
+                bookmark_title: None,
                 upscaled_video: false,
                 edit_badges: EditBadgeFlags::default(),
                 tags: &[],
@@ -2350,6 +2776,7 @@ mod tests {
                 filter_match_count: None,
                 media_duration: None,
                 bookmark_time: None,
+                bookmark_title: None,
                 upscaled_video: false,
                 edit_badges: EditBadgeFlags::default(),
                 tags: &[],
@@ -2385,6 +2812,7 @@ mod tests {
                 filter_match_count: None,
                 media_duration: None,
                 bookmark_time: None,
+                bookmark_title: None,
                 upscaled_video: false,
                 edit_badges: EditBadgeFlags::default(),
                 tags: &[],
@@ -2420,6 +2848,7 @@ mod tests {
                 filter_match_count: None,
                 media_duration: None,
                 bookmark_time: None,
+                bookmark_title: None,
                 upscaled_video: false,
                 edit_badges: EditBadgeFlags {
                     page_override: true,

@@ -5534,6 +5534,67 @@ mod tests {
     }
 
     #[test]
+    fn thumb_name_width_preferences_ok_reaches_grid_layout_and_cancel_preserves_it() {
+        use crate::thumb_overlay_layout::ThumbnailNameStyle;
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
+        harness.get_by_label("ファイル名の表示幅を優先する").click();
+        harness.run_steps(3);
+        assert!(!harness.state().settings.thumb_name_prioritize_width);
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(harness.state().settings.thumb_name_prioritize_width);
+        let db = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
+        assert!(db.load_into_settings().unwrap().thumb_name_prioritize_width);
+
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let output = ctx.run_ui(Default::default(), |root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                let cell =
+                    egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(300.0, 180.0));
+                let layout = crate::app::layout_cell_overlays(
+                    ui.painter(),
+                    cell,
+                    Default::default(),
+                    0,
+                    &crate::grid_item::GridItem::ZipFile("abcdefghijklmnopqrstuvwx.zip".into()),
+                    &crate::grid_item::ThumbnailState::Pending,
+                    &[],
+                    None,
+                    None,
+                    false,
+                    crate::settings::VideoThumbnailIndicator::default(),
+                    crate::settings::AudioThumbnailIndicator::default(),
+                    false,
+                    None,
+                    None,
+                    false,
+                    ThumbnailNameStyle::from_settings(&harness.state().settings),
+                );
+                let filename = layout.bottom_left.filename.unwrap();
+                assert_eq!(filename.text, "abcdefghijklmnopqrstuvwx.zip");
+                assert_eq!(filename.rect.center().x, cell.center().x);
+                assert!(layout.bottom_left.container.unwrap().rect.max.y < filename.rect.min.y);
+            });
+        });
+        let _ = crate::test_ui::headless_paint_output(output);
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Thumbnail);
+        harness.run_steps(3);
+        harness.get_by_label("ファイル名の表示幅を優先する").click();
+        harness.run_steps(3);
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run_steps(3);
+        assert!(harness.state().settings.thumb_name_prioritize_width);
+        assert!(db.load_into_settings().unwrap().thumb_name_prioritize_width);
+    }
+
+    #[test]
     fn thumb_name_preferences_combobox_ok_save_reload_and_cancel() {
         use egui_kittest::kittest::Queryable;
 

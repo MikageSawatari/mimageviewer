@@ -29,6 +29,17 @@ use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
 
 #[test]
+fn thumbnail_filename_width_dark() {
+    snapshot_with_theme_at_size(
+        "thumbnail_filename_width_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(460.0, 440.0),
+        None,
+        mimageviewer::draw_thumbnail_filename_width_snapshot_fixture,
+    );
+}
+
+#[test]
 fn thumbnail_name_style_multiline_dark() {
     snapshot_with_theme_at_size(
         "thumbnail_name_style_multiline_dark",
@@ -3162,6 +3173,7 @@ fn cell_filename_mixed_glyphs_dark() {
                     filter_match_count: None,
                     media_duration: None,
                     bookmark_time: None,
+                    bookmark_title: None,
                     upscaled_video: false,
                     edit_badges: Default::default(),
                     tags: &empty_tags,
@@ -3228,6 +3240,7 @@ fn compact_file_format_badges_light() {
                         filter_match_count: None,
                         media_duration: None,
                         bookmark_time: None,
+                        bookmark_title: None,
                         upscaled_video: false,
                         edit_badges: Default::default(),
                         tags: &empty_tags,
@@ -3344,6 +3357,7 @@ fn rating_shares_the_bottom_row_with_a_centred_filename_dark() {
                     filter_match_count: None,
                     media_duration: None,
                     bookmark_time: Some("0:25"),
+                    bookmark_title: None,
                     upscaled_video: false,
                     edit_badges: Default::default(),
                     tags: &empty_tags,
@@ -3404,6 +3418,7 @@ fn media_duration_badges_fixture(ui: &mut egui::Ui) {
                 filter_match_count: count,
                 media_duration: Some(duration),
                 bookmark_time: None,
+                bookmark_title: None,
                 upscaled_video: dense,
                 edit_badges: EditBadgeFlags {
                     crop: dense,
@@ -3527,6 +3542,7 @@ fn bookmark_time_and_tag_badges_dark() {
                     filter_match_count: None,
                     media_duration: None,
                     bookmark_time: Some("12:34"),
+                    bookmark_title: None,
                     upscaled_video: false,
                     edit_badges: mimageviewer::thumb_overlay_layout::EditBadgeFlags {
                         page_override: true,

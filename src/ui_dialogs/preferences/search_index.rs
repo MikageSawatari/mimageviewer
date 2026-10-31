@@ -229,6 +229,22 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
+        "thumbnail/name-prioritize-width",
+        Thumbnail,
+        "ファイル名の表示幅を優先する",
+        [
+            "サムネイル",
+            "一覧",
+            "形式",
+            "バッジ",
+            "ZIP",
+            "RAR",
+            "PDF",
+            "上の段",
+            "長い名前"
+        ]
+    ),
+    entry!(
         "thumbnail/name-max-lines",
         Thumbnail,
         "名前の最大行数:",
@@ -2046,6 +2062,9 @@ mod tests {
             ("名前 最大行数", "thumbnail/name-max-lines"),
             ("フォルダ名 折り返し", "thumbnail/name-max-lines"),
             ("長い名前 複数行", "thumbnail/name-max-lines"),
+            ("形式 上の段", "thumbnail/name-prioritize-width"),
+            ("ファイル名 表示幅", "thumbnail/name-prioritize-width"),
+            ("ZIP バッジ", "thumbnail/name-prioritize-width"),
         ] {
             assert!(
                 search_preferences(query, test_tree_position)

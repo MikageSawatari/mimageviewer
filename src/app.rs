@@ -764,6 +764,7 @@ pub(crate) use folder_scan::{ScannedDir, scan_directory_with_settings, signature
 pub use grid_paint::draw_audio_thumbnail_indicator_snapshot_fixture;
 #[doc(hidden)]
 pub use grid_paint::draw_collection_placeholder_snapshot_fixture;
+pub use grid_paint::draw_thumbnail_filename_width_snapshot_fixture;
 #[doc(hidden)]
 pub use grid_paint::draw_thumbnail_name_style_snapshot_fixture;
 #[doc(hidden)]
