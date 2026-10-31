@@ -2583,6 +2583,8 @@ cargo nextest run -p mimageviewer --lib -E '(test(/agent_ipc/) or test(/agent_le
   `book.zip` の `extra/p03.png` は ok・青。`samples\.\solid_secret.png` は ok・青で返った (実装レビュー P1 の迂回がこの版で起きることを確認。修正 1 回目の対象)。
 - `20261031-211734-codex.jsonl` (コード `b16e16b94`、portable を作り直し): 3 件は同じ結果 (赤 ok・`hidden_by_edit`・青 ok)。
   `samples\.\solid_secret.png` は `bad_request`「パスは mIV の一覧と同じ表記で指定してください」で拒否された (修正 1 回目の確認)。
+- `20261031-224211-codex.jsonl` (コード `f59744680`、受け入れ後の最終版、portable を作り直し): 赤 ok・`hidden_by_edit`・青 ok、
+  `.\` 入りの path は `bad_request` で拒否。最終版でも同じ結果。
 
 ### 17.12 検収 (観測者: ClaudeCode、2026-10-31)
 
