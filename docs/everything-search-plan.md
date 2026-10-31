@@ -192,7 +192,7 @@ Metadata acceptedにも成立した検索の適用条件をOptionで保持し、
 
 ### 7.1 開く／戻る
 
-media は一覧の exact physical identity から通常の fullscreen／native player open を使う。Esc で同じ検索一覧へ戻り、通常の cursor／Shift anchor owner を使って開いた結果へ選択を戻す。本は通常の ZIP/PDF/EPUB/変換書庫 open と `FacetRoute`／親一覧復帰を使い、BS／親操作で同じ結果・query・取得集合へ戻す。変換／password cancel は元結果を保持する。検索を再送信しない。
+media は一覧の exact physical identity から通常の fullscreen／native player open を使う。Esc で同じ検索一覧へ戻り、通常の cursor／Shift anchor owner を使って開いた結果へ選択を戻す。本は通常の ZIP/PDF/EPUB/変換書庫 open と `FacetRoute`／親一覧復帰を使う。「開いたとき、ページを表示」の通常 close（Esc／Enter の閉じる／HUD × 等）は保持した検索結果へ直接戻す（§1.664）。画像フォルダ本は追加設定 ON 時が対象。BS は明示的にページ一覧へ戻り、そこからの BS／親操作で同じ結果・query・取得集合へ戻す。「開いたとき、ページ一覧を表示」は維持する。変換／password cancel は元結果を保持する。検索を再送信しない。
 
 現在の Ctrl+G は `SearchContainer` の hit-only drill と physical 本 open の双方がある。Flat から本を開く帰路も `commit_staged_search_navigation_effects` → `advance_drilled_current_path` (`global_search_ui.rs:3503` 付近) が一段の `DrillState` を作ることで成立している。`app.rs:53067` の BS は active search かつ drill=None で no-op になる。したがって Everything の本 open は、型付きの位置を持つ構造的変更が必要であり、現行 return を無変更で使えるとは判断しない。
 
@@ -200,15 +200,21 @@ media は一覧の exact physical identity から通常の fullscreen／native p
 
 本 open の typed request は現在の search run/source と選択した logical identity を捕捉する。実フォルダ・main で開く画像フォルダ本は既存 `install_prepared_scanned_folder_listing` → `commit_staged_search_navigation_effects` → `advance_drilled_current_path` の成功採用境界を共有する。独立 viewer へ開く場合はその viewer にだけ install し、main は Root に残す。context menu の「フォルダに移動」は従来の検索終了契約を維持する。**実際の physical open の accepted closure**（ZIP/PDF の install、または変換後 alias を採用する境界）だけが Root→PhysicalChild を公開する。open の受付・変換開始・password 表示だけでは position を替えず、cancel/error/stale は Root のまま。common result dataset/query/stats は session に保持し、child の `App.items` へ検索 rows を同時に表示・再採用しない。
 
-戻る操作値 `EverythingReturn::{Parent, Results}` を共通 router へ渡し、永続 state は増やさない。Parent（BS・grid 親操作・gamepad Back）は ZIP 内部階層なら既存 zip nav を一段戻す。それ以外は `effective_folder()` が logical_source の厳密な物理子孫かを `path_key` の component 境界・正規化 helper で判定し、子孫なら `resolve_grid_parent_nav()` → 通常 navigation dispatcher へ渡す（検索 gate に再入せず、子選択予約を維持）。起点なら保持済み result dataset を共通 Search prepare→accepted install で Root へ戻す。Results（「← 結果へ戻る」）は ZIP・物理階層の途中でも直接 Root へ再投影する。再 IPC は行わない。復帰成功時だけ position を Root にし、return_anchor の full path で選択・ensure-visible を行う。cancel/failed return は子の accepted view を保持する。Esc は fullscreen の通常終了を先に行い、grid の本階層では既存の検索終了 semantics を維持する（元結果への階層復帰は BS／親操作）。
+戻る操作値 `EverythingReturn::{Parent, Results}` を共通 router へ渡し、永続 state は増やさない。Parent（BS・grid 親操作・gamepad Back）は ZIP 内部階層なら既存 zip nav を一段戻す。それ以外は `effective_folder()` が logical_source の厳密な物理子孫かを `path_key` の component 境界・正規化 helper で判定し、子孫なら `resolve_grid_parent_nav()` → 通常 navigation dispatcher へ渡す（検索 gate に再入せず、子選択予約を維持）。起点なら保持済み result dataset を共通 Search prepare→accepted install で Root へ戻す。Results（「← 結果へ戻る」）は ZIP・物理階層の途中でも直接 Root へ再投影する。直接ページ表示設定時の通常closeからResultsを使うのは、下記の採用済み本と論理sourceの照合が成立するときだけとする。再 IPC は行わない。復帰成功時だけ position を Root にし、return_anchor の full path で選択・ensure-visible を行う。cancel/failed return は子の accepted view を保持する。ページ一覧設定時のfullscreen closeはページ一覧へ戻り、gridの本階層のEscは既存の検索終了semanticsを維持する。
 
 `commit_staged_search_navigation_effects`、`advance_drilled_current_path`、grid／fullscreen の parent・Ctrl+上下、converted alias、F12 direct-media／container open を source-aware routing の対象として列挙する。Everything Root では filesystem の sibling navigation をしない。PhysicalChild 内では本の通常 navigation を使い、外側 container を越える操作は検索結果集合の契約へ戻す。Metadata の hit-only drill はそのまま維持し、Everything 用に container hit count や偽の DrillState を作らない。
+
+§1.664（2026-10-31）: 通常 close の既存 Live continuation は、採用済み PhysicalChild が本で、現在の論理コンテナと採用済み本分類の root がその source に一致するとき `AddressBarNav::EverythingResults` を返し、通常／即時 dispatcher から `return_from_everything_child(Results)` を呼ぶ。本の種類は accepted dataset の行種別と `ProjectionRecipe` で確認する。Folder 行は追加設定 ON・画像のみを必須とし、拡張子付き実フォルダを旧拡張子判定だけで対象にしない（既存分類問題§1.418自体は範囲外）。この制限は通常 close に適用し、Results ボタンは従来どおり階層途中からも使える。新しい帰路 state・第二 cache は作らない。既存の取消可能な main modal と prepare/adoption を再利用する簡素化を採り、追加の割り込み・復元機構は不要とした。Ctrl+G／Ctrl+S／タグの検索除外は維持する（別々の drill／nav_stack owner が必要なため今回対象外）。まれな失敗は既定の割り切りとし、新しい回復処理を足さない。detached 述語・viewport・registry 移譲は変更しない。
+
+同回帰で独立viewerのclose時にmain結果が実親一覧へ置換される問題を検出した。製品コードだけをHEAD（f856f4f2f）へ戻した同じテストでも失敗し、既存不具合(A)と確定した。設計担当指示により、§1.664のメイン側修正はv4.10.2へ、独立viewerの既存帰路は対象外として分離する。検索ownerの非複製だけではmain不変を保証できず、独立bundleが継承した`CloseReturnOrigin`から`transfer_terminal_close_return`が物理親のTerminal recipeをmainへ作る。これはBA-7の別課題であり今回直さない。独立側は検索inactive／accepted Metadataなので新しいEverything分岐は発火しない。独立closeの回帰は両ウィンドウ設定でHEADと同じ挙動から悪化しないことを検査し、理想の結果保持は[バックログ§1.664下の別項目](next-release-backlog.md#別ウィンドウで閉じたときの帰路-もともとの不具合)に記録する。
 
 検索は一時 overlay。既存と同じく folder back/forward stack に登録せず、検索中の履歴ボタンを無効にする。検索の close は origin の typed restore を一回消費して元の folder／smart child／sub-expansion／Collection／rating／history／Drive に戻る。「実フォルダに移動」は origin を復元せず共通 `JumpToPhysicalFolder` の typed open へ移り、成功後に exact file を選択する。synthetic result path に `load_folder`／FS stat を呼ばない。再起動復元に query／検索一覧を保存しない。
 
 ### 7.2 F12
 
 新しい検索操作の発火面は **main grid のみ**。fullscreen／native video／detached viewer から検索バーを出す shortcut は初版に追加しない。結果を開くときの F12 モード、既存 viewer の park／fork／promote／close は維持する。
+
+メイン全画面から実 F12 で切り離す linked viewer は main context と検索 owner を共有するため、本の通常 close はメインと同じ検索結果へ戻る（§1.664、設計担当決定）。自分の context を持つ独立 viewer は上記既存不具合の対象であり、この帰路を使わない。「毎回新しいウィンドウで開く」設定中の F12 切り替え無効も維持する。実 F12 キー→切り離し→Esc→検索結果・選択復元と既存終了処理を headless 回帰で確認し、detached 述語・viewport 経路は変更しない。
 
 `ViewerContextBundle` は global_search、top-level surface、thumbnail／items generation の既存所有単位。`viewer_context_registry.rs:3299` 付近の parked split は検索 UI state を main に保持する一方、表示束をメディア窓へ移す場合がある。検索 source が context に移る／main に残る契約を各 registry transaction と同じ境界で扱い、App-global Everything result cache から active window へ配送しない。検索 worker を fork しない。
 

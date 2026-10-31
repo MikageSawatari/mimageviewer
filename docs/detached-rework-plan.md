@@ -6847,3 +6847,14 @@ API適合漏れで、ownerへ実際に模したgeometryを記録する6setupへ�
 同一path A/Bの実cell captureから旧tapを拒否し、後続mouse保持／新touchを受理する回帰を両rendererへ追加した。
 本体15,003件・vendor165件・snapshot214件とaudit違反0。共通workspace fullの前提不足は継続している。
 理由・先行RED・最終証跡は [再修正台帳](scroll-661-investigation.md#implementation-review-revise) に記録した。
+
+### 2026-10-31 §1.664 独立レビューP2追補: Everythingの本closeと実F12
+
+設計担当が、メイン全画面からF12で切り離したlinked viewerはmain contextと検索ownerを
+共有するため、通常closeでメインと同じEverything結果へ戻ると決定した。独立contextの
+別ウィンドウは対象外とし、既存の物理親への帰路（バックログ§1.664下、BA-7）は維持する。
+変更範囲はSearchの採用済み行種別・本分類・論理sourceに基づくclose帰路の適用条件と、
+実F12キー→linked window binding→Esc→検索結果採用・既存終了処理のheadless回帰である。
+複数ウィンドウ設定中のF12切り替え無効も維持する。detached述語・viewport経路・registry移譲は
+変更していない。同じownerの既存帰路を使う判断であり、窓状態への症状guardは追加しない。
+検証結果は [バックログ§1.664](next-release-backlog.md#1664-everything検索から直接開いた本を閉じると検索結果ではなくページ一覧へ戻る--5ch-671-2026-10-31) に記録する。製品起動・実機確認は未実施。

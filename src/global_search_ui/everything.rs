@@ -546,7 +546,7 @@ impl App {
         true
     }
 
-    pub(super) fn return_from_everything_child(&mut self, operation: EverythingReturn) -> bool {
+    pub(crate) fn return_from_everything_child(&mut self, operation: EverythingReturn) -> bool {
         let SearchAccepted::Everything {
             dataset, position, ..
         } = &self.global_search.accepted

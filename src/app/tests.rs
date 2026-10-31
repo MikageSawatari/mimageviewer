@@ -8,6 +8,9 @@ mod ai_crash_655;
 #[path = "tests/diagnostic_lifecycle.rs"]
 mod diagnostic_lifecycle;
 
+#[path = "tests/everything_close_return.rs"]
+mod everything_close_return;
+
 // Legacy fixture paths now use the same immutable payload types as runtime navigation.
 pub(crate) fn reading_history_return_for_test(container: PathBuf) -> ReadingHistoryBookReturn {
     ReadingHistoryBookReturn::without_entrance(container)

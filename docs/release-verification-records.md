@@ -12,6 +12,20 @@
 
 ---
 
+## v4.10.2 (2026-11-01)
+
+- **対象**: ブランチ `release-4.10.2` の `68226ebc7` (配布ビルド)。v4.10.1 (`57e572874`) を基点に、修正 2 件だけを載せた修正版。master には v4.11.0 向けの未出荷の変更があるため、master からは出さなかった。修正は mimalloc を 3.3.2 から 3.5.3 へ更新 (§1.666、5ch >>655・657・672 の突然終了の対策。`libmimalloc-sys` 0.1.49 を vendor し、同梱の v3 を上流無改変の 3.5.3 に差し替え、`[patch.crates-io]` で選ぶ) と、Everything 検索結果から直接ページ表示した本の閉じる帰路 (§1.664、5ch >>671)。どちらも独立レビュー ACCEPT。ビルドは G: の worktree `G:\home\mimageviewer-everything-1664` で行った (本体の作業ツリーは別セッションが master へコミット中だったため)。
+- **mimalloc の確認**: 配布物の core (単体exe・portable) に、3.5.3 で増えた option 名 `collect_merges_stats` の文字列があり、v4.10.0 の配布物には無いことを確認。lib テスト `allocator_tests::linked_mimalloc_is_v3_5_3` がリンクされた `mi_version()` = 30503 を検査。落ちる箇所そのもの (スレッド終了後の再入) の再現試験は無く、利用者環境で終了が止まるかは未確認。
+- **自動テスト**: 配布ビルドの全体テストで workspace 16,481 件成功 (70 skip) と vendor・doc が成功。1 回目は `smart_folder_transition_tests::smart_zip_adoption_retires_*` の 2 件が補助関数の 10 秒期限 (`listing identity preparation did not settle`) で失敗した。同じ時間帯に別セッション (MCP 試験実装) のビルドが重なり、テスト自体が 23 秒かかっていた。単独では 3 回とも 1 秒未満で成功し、2 回目の配布ビルドでは全件成功。`test-script` feature の lib テストは 15,238 件成功 (66 skip)。既定 feature の lib 全件では、ページめくりのテスト 4 件が並列負荷で失敗 (単独・モジュール単位では成功、§1.447 に比較を記録: v4.10.1 でも 5 回中 2 回失敗する既知の不安定)。`cargo fmt --all --check` と `viewer_context_audit` は手元で成功 (リリースブランチは CI 対象外)。
+- **ReleaseChecks (ClaudeCode が実行、利用者了承)**: run `release-checks-20261031-100434-4e7887d3`、全項目 PASS。AI 経路の変更がないため `-IncludeFirstAi` なし。idle 5 ケース PASS (CPU 1 コア比 0.005〜0.009、測定区間の frame 0)。perf cached / uncached とも 256 folder load・Ctrl+Down 5・検索完了、描画 frame の 16ms 未満 99.67% / 99.67%、p95 11 / 12ms、pre_grid raw p95 0.092 / 0.090ms、100ms 超の間隔 0 件 (起動直後の frame 1→2 も 100ms 未満で、§1.667 の判定ずれは起きなかった)。アロケータ変更後も v4.10.1 と同じ水準。メモリ使用量の比較 (3.5.3 で purge の既定待ちが 1 秒→4 秒) は ReleaseChecks の対象外で未測定。
+- **依存**: mimalloc 以外は v4.10.1 と同じ (同日の v4.10.1 で `check-dependency-updates.ps1` 実施済み、再実行なし)。
+- **panic.log**: 53 件 16 種すべて disposition あり (`check-panic-log.ps1` exit 0)。製品ページのカード 49 件は上限内。更新履歴ページは生成スクリプトの出力と一致。既知の問題ページは変更なし。
+- **署名**: 単体exe / setup.exe / portable の mimageviewer.exe を `signtool verify /pa /v` で確認 (Open Source Developer Taku Sano、Certum の RFC3161 タイムスタンプ、exit 0)。全 PE / VC runtime gate 通過。
+- **portable smoke (ClaudeCode が実施)**: `D:\miv-portable-smoke-v4102` に展開して起動。exe の隣に `data\` を作成、`%APPDATA%\mimageviewer\settings.db` は変わらず。1 回目は初回設定のダイアログ (`first_setup`) が閉じる要求を保持して終了せず (v4.10.1 と同じ形)、強制終了した。2 回目は WM_CLOSE で終了コード 0。`native-exception.log` は空。
+- **実機確認**: §1.664・§1.666 とも自動テストとコード確認だけで、実アプリでは未確認。
+
+---
+
 ## v4.10.1 (2026-10-31)
 
 - **対象**: master `ae64ebc79` (配布ビルド)。修正は 5ch >>661 の一覧位置 (§1.488)、閲覧履歴の「親へ」(§1.473)、フォルダツリー幅 (§1.472)、ページ一覧の操作名 (§1.662)。依存物・検索・VST3・Susie の変更なし。

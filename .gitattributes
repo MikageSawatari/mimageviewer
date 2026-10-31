@@ -39,3 +39,6 @@ DAV1D-LICENSE.txt -text
 LIBYUV-LICENSE.txt -text
 # Preserve the original 0.26.2 index bytes, including JSON metadata.
 tests/fixtures/fts_tantivy_0262/index/** -text
+
+# Keep the mimalloc source snapshot byte-identical to upstream on Windows.
+vendor/libmimalloc-sys/c_src/** -text

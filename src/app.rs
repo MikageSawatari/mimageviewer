@@ -24661,6 +24661,12 @@ impl App {
                 self.rating_view_parent_nav();
                 true
             }
+            crate::ui_main::AddressBarNav::EverythingResults => {
+                self.return_from_everything_child(
+                    crate::global_search_ui::EverythingReturn::Results,
+                );
+                true
+            }
             crate::ui_main::AddressBarNav::BooksRoot => {
                 self.open_books_root();
                 true
@@ -60339,15 +60345,17 @@ impl App {
     /// 「ページを直接開く」設定の退出ルーティング
     /// (Esc/Enter/右クリック→親一覧 / Backspace→ページ一覧) を使うか判定する。
     ///
-    /// 検索 (Ctrl+S / Ctrl+G) 中は、Esc が検索を抜けて実親フォルダへ飛ぶ想定外挙動を
-    /// 避けるため適用しない。
+    /// 検索中は実親フォルダへ飛ばさない。Everything の採用済み PhysicalChild の本だけは
+    /// 既存 Search owner が検索結果への帰路を持つため、通常の閉じるからその帰路を使う。
     pub(crate) fn auto_open_for_current_container(&self) -> bool {
         if !self.settings.effective_auto_fullscreen_zip_pdf()
-            || self.global_search.active
             || self.favsearch.active
             || self.tag_view.active
         {
             return false;
+        }
+        if self.global_search.active {
+            return self.everything_book_close_return_available();
         }
         let Some(current_folder) = self.current_folder.as_deref() else {
             return false;
@@ -79875,9 +79883,10 @@ impl App {
     ///
     /// **「ページを直接開く」設定が ON で ZIP/PDF ページ、または追加設定 ON の画像のみ
     /// 通常フォルダを見ているとき**は、ページ一覧 (L2) を経由せずファイル一覧 (L1) まで戻る。
-    /// 判定は `auto_open_for_current_container()` (= 設定 ON & 対象コンテナ内 & 非検索) のみで、
+    /// 判定は `auto_open_for_current_container()` (= 設定 ON & 対象コンテナ内 & 帰路あり) のみで、
     /// 直接オープン由来かどうかは見ない。それ以外 (設定 OFF / 対象外の通常画像) は 1 段だけ閉じる
     /// (`close_fullscreen`: コンテナなら L2 ページ一覧、通常画像なら親フォルダグリッド)。
+    /// Everything の PhysicalChild では実親へ移らず、既存 Search owner が保持した結果へ戻る。
     ///
     /// L1 へ戻る経路は L2 を 1 フレームも見せないため、その場では close せず
     /// `pending_return_to_parent` を立てるだけにし、`App::update` の入力ナビ合流点が
