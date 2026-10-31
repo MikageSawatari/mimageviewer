@@ -16846,6 +16846,7 @@ pub struct App {
     // 起動時 DB オープンに失敗した場合は None (機能なしで動作継続)。
     pub(crate) indexer_init: IndexerInit,
     pub(crate) agent_readers: Option<Arc<crate::remote_ipc::SharedReaders>>,
+    pub(crate) agent_recent_apps: Option<crate::agent_ipc::SharedRecentApps>,
     pub(crate) agent_open_requests: Option<mpsc::Receiver<crate::agent_ipc::open::UiOpenRequest>>,
 
     // ── 別バージョン索引 ─────────────────────────────────────────
@@ -20963,6 +20964,7 @@ impl App {
             fav_add_auto_index_similar: false,
             indexer_init,
             agent_readers: None,
+            agent_recent_apps: None,
             agent_open_requests: None,
             similar_index,
             name_index_manager: None,
@@ -23713,6 +23715,10 @@ impl App {
         self.modal_dialog_block_reason().is_some()
     }
 
+    pub(crate) fn install_agent_recent_apps(&mut self, recent: crate::agent_ipc::SharedRecentApps) {
+        self.agent_recent_apps = Some(recent);
+    }
+
     pub(crate) fn everything_search_entry_availability(
         &self,
     ) -> crate::global_search_ui::EverythingSearchEntryAvailability {
@@ -23818,6 +23824,7 @@ impl App {
             self.file_organize_dialog_visible() => "file_organize",
             self.show_book_manager => "book_manager",
             self.book_reorder.is_some() => "book_reorder",
+            self.agent_registration_dialog_open() => "agent_registration",
             self.show_preferences => "preferences",
             self.show_preferences_discard_confirm => "preferences_discard_confirm",
             self.external_tool_operation.modal_reason() == Some("external_tool_preparing") => "external_tool_preparing",

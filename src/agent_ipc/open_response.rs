@@ -15,6 +15,7 @@ pub(super) fn respond(
     replies: crossbeam_channel::Sender<Reply>,
     started: Instant,
     id: u64,
+    client: Option<ClientRequest>,
 ) {
     let dispatch = Arc::new(UiRequestDispatch::pending());
     let worker_dispatch = dispatch.clone();
@@ -32,7 +33,7 @@ pub(super) fn respond(
     let Ok(worker) = worker else {
         drop(permit);
         let result = Err(failed());
-        record("open_in_viewer", started, &result);
+        connection.record(client.as_ref(), "open_in_viewer", started, &result);
         let _ = replies.send(Reply {
             response: Response { id, result },
             policy: ReplyPolicy::Rejected,
@@ -71,7 +72,7 @@ pub(super) fn respond(
             }
         }
     };
-    record("open_in_viewer", started, &value);
+    connection.record(client.as_ref(), "open_in_viewer", started, &value);
     let policy = if matches!(value, Ok(Payload::Opened(_))) {
         ReplyPolicy::AcceptedOperation
     } else {

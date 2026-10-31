@@ -43,11 +43,11 @@ enum Session {
     Fresh,
     LegacyPending {
         version: String,
-        client: String,
+        client: ClientIdentity,
     },
     LegacyReady {
         version: String,
-        client: String,
+        client: ClientIdentity,
         observer: PermissionObserver,
     },
 }
@@ -113,7 +113,11 @@ struct PermissionObserver {
     effective: Option<Vec<&'static str>>,
 }
 impl PermissionObserver {
-    fn start(backend: Arc<dyn Backend>, client: String, send: mpsc::SyncSender<Event>) -> Self {
+    fn start(
+        backend: Arc<dyn Backend>,
+        client: ClientIdentity,
+        send: mpsc::SyncSender<Event>,
+    ) -> Self {
         let (stop, recv) = mpsc::sync_channel(1);
         let revision = Arc::new(AtomicU64::new(0));
         let probe_revision = revision.clone();
@@ -123,8 +127,12 @@ impl PermissionObserver {
                 Err(mpsc::RecvTimeoutError::Timeout)
             ) {
                 let before = probe_revision.load(Ordering::Acquire);
-                let result =
-                    backend.call(Command::Status, &client, Arc::new(CallControl::default()));
+                let result = backend.call(
+                    Command::Status,
+                    &client,
+                    RequestKind::Internal,
+                    Arc::new(CallControl::default()),
+                );
                 if !matches!(recv.try_recv(), Err(mpsc::TryRecvError::Empty)) {
                     break;
                 }
@@ -475,7 +483,13 @@ fn handle_line(
                     };
                     *session = Session::LegacyPending {
                         version: version.into(),
-                        client: client.chars().take(128).collect(),
+                        client: ClientIdentity::new(
+                            client,
+                            params
+                                .pointer("/clientInfo/version")
+                                .and_then(Value::as_str)
+                                .unwrap(),
+                        ),
                     };
                     Some(success(
                         id,
@@ -530,11 +544,15 @@ fn handle_line(
                 Some(error)
             } else {
                 let client = if modern {
-                    metadata
+                    let name = metadata
                         .and_then(|m| m.pointer("/io.modelcontextprotocol~1clientInfo/name"))
                         .and_then(Value::as_str)
-                        .unwrap_or("MCP client")
-                        .to_owned()
+                        .unwrap_or("(名前なし)");
+                    let version = metadata
+                        .and_then(|m| m.pointer("/io.modelcontextprotocol~1clientInfo/version"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    ClientIdentity::new(name, version)
                 } else if let Session::LegacyReady {
                     client, version, ..
                 } = &session
@@ -578,7 +596,11 @@ fn handle_line(
                                 let backend = backend.clone();
                                 let send = send.clone();
                                 std::thread::spawn(move || {
-                                    let result = backend.call(command, &client, control);
+                                    let kind = match action {
+                                        Action::List => RequestKind::Internal,
+                                        Action::Tool(_) => RequestKind::Tool,
+                                    };
+                                    let result = backend.call(command, &client, kind, control);
                                     let _ = send.send(Event::Done(request_serial, result));
                                 });
                                 None

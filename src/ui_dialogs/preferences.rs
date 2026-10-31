@@ -120,7 +120,13 @@ pub(crate) fn draw_fullscreen_specified_scale_max_controls(
     pages::draw_fullscreen_specified_scale_max_controls(ui, max_tenths, dark_popup)
 }
 
+mod agent_integration;
 mod name_colors;
+
+#[doc(hidden)]
+pub fn draw_agent_integration_snapshot_fixture(ui: &mut egui::Ui, level: u8) {
+    agent_integration::snapshot(ui, level);
+}
 mod pages;
 mod search_index;
 mod transfer;
@@ -325,6 +331,7 @@ pub enum Vst3ScanMessage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PreferencesPage {
     General,
+    AgentIntegration,
     Font,
     Startup,
     ExternalTools,
@@ -532,6 +539,7 @@ impl PreferencesPage {
     #[cfg(test)]
     const ALL: &'static [Self] = &[
         Self::General,
+        Self::AgentIntegration,
         Self::Font,
         Self::Startup,
         Self::ExternalTools,
@@ -571,6 +579,7 @@ impl PreferencesPage {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::General => "全体設定",
+            Self::AgentIntegration => "AI 連携",
             Self::Font => "フォント",
             Self::Startup => "起動時の動作",
             Self::ExternalTools => "外部ツール",
@@ -804,6 +813,7 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::Startup,
             PreferencesPage::ExternalTools,
             PreferencesPage::ExplorerIntegration,
+            PreferencesPage::AgentIntegration,
             PreferencesPage::ClipboardCapture,
             PreferencesPage::TrayResidency,
             PreferencesPage::UpdateCheck,
@@ -1082,6 +1092,7 @@ pub fn draw_clipboard_capture_html_settings_snapshot_fixture(
 pub(crate) struct PreferencesState {
     /// 編集用の Settings 一時コピー
     pub settings: Settings,
+    agent_integration: agent_integration::AgentIntegrationState,
     transfer_feedback: Option<PreferencesTransferFeedback>,
     /// 保存済み位置と音声トラック選択を明示的にクリアした編集意図。
     video_media_memory_clear_requested: bool,
@@ -1680,6 +1691,7 @@ impl PreferencesState {
 
         Self {
             settings: s.preferences_snapshot(),
+            agent_integration: agent_integration::AgentIntegrationState::new(s),
             transfer_feedback: None,
             video_media_memory_clear_requested: false,
             initial_video_normal_wheel_action: s.ring_shortcuts.video_normal_wheel_action,
@@ -2511,6 +2523,9 @@ impl App {
     }
 
     pub(crate) fn open_preferences_request(&mut self, request: PreferencesOpenRequest) {
+        if self.agent_registration_dialog_open() {
+            return;
+        }
         if self.composition_editor_modal_active() {
             return;
         }
@@ -2559,6 +2574,9 @@ impl App {
     }
 
     fn request_close_preferences_dialog(&mut self) {
+        if self.agent_registration_dialog_open() {
+            return;
+        }
         if self.preferences_transfer_busy() || self.preferences_transfer_dialog_open() {
             return;
         }
@@ -2571,6 +2589,9 @@ impl App {
     }
 
     fn discard_preferences_dialog(&mut self) {
+        if self.agent_registration_dialog_open() {
+            return;
+        }
         self.pref_state = None;
         self.show_preferences = false;
         self.show_preferences_discard_confirm = false;
@@ -2693,6 +2714,9 @@ impl App {
     }
 
     pub(crate) fn apply_preferences_dialog(&mut self, ctx: &egui::Context) {
+        if self.agent_registration_dialog_open() {
+            return;
+        }
         if self.book_append_undo_in_progress()
             && let Some(state) = self.pref_state.as_ref()
         {
@@ -3183,25 +3207,29 @@ impl App {
                 .collect();
         }
 
+        self.prepare_agent_integration(ctx);
+        let registration_dialog_open = self.agent_registration_dialog_open();
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
 
         let transfer_dialog_open = self.preferences_transfer_dialog_open();
         let collection_reorder_open = self.collection_reorder_open();
-        if transfer_dialog_open {
+        if transfer_dialog_open || registration_dialog_open {
             // Popups use independent UI layers and do not inherit a disabled
             // parent. Remove that combination while the transfer modal is shown.
             egui::Popup::close_all(ctx);
         }
 
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-        let enter_pressed = !transfer_dialog_open && self.dialog_enter_pressed(ctx);
-        let escape_pressed = !transfer_dialog_open && self.dialog_escape_pressed(ctx);
+        let enter_pressed =
+            !transfer_dialog_open && !registration_dialog_open && self.dialog_enter_pressed(ctx);
+        let escape_pressed =
+            !transfer_dialog_open && !registration_dialog_open && self.dialog_escape_pressed(ctx);
 
         egui::Window::new("環境設定")
             .drag_area(egui::WindowDrag::Anywhere)
-            .enabled(!transfer_dialog_open)
+            .enabled(!transfer_dialog_open && !registration_dialog_open)
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -3318,6 +3346,12 @@ impl App {
                         draw_page(ui, state, enter_pressed);
                     }
                 });
+                #[cfg(test)]
+                if rendered_page == PreferencesPage::AgentIntegration {
+                    state.agent_integration.page_scroll = Some(
+                        crate::test_ui::scroll_layout::ScrollLayout::from_output(&output),
+                    );
+                }
                 // ScrollArea clamps its output against the current content and viewport.
                 // Capture before any close path drops the draft; never associate a result
                 // list's offset with the page selected by a click inside that list.
@@ -3431,6 +3465,14 @@ impl App {
             self.diagnostics_export.submit(ctx);
         }
 
+        // Opening confirmation owns the draft immediately, including the frame
+        // which created it; a title × / Enter / Escape may not close it meanwhile.
+        if self.agent_registration_dialog_open() {
+            apply = false;
+            cancel = false;
+            open = true;
+        }
+        self.show_agent_registration_dialog(ctx);
         if apply {
             self.apply_preferences_dialog(ctx);
         } else if cancel || !open {
@@ -4162,6 +4204,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 
     match state.selected {
         PreferencesPage::General => page_general(ui, state),
+        PreferencesPage::AgentIntegration => page_agent_integration(ui, state),
         PreferencesPage::Font => page_font(ui, state),
         PreferencesPage::Startup => page_startup(ui, state),
         PreferencesPage::ExternalTools => page_external_tools(ui, state),

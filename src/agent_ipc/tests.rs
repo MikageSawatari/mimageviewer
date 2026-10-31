@@ -40,6 +40,7 @@ impl Fixture {
             ),
             session: None,
             open: super::open::OpenController::new(None),
+            recent_apps: Arc::new(Mutex::new(RecentApps::default())),
             active: AtomicUsize::new(0),
             search_hooks: None,
             read_hooks: None,
@@ -75,7 +76,9 @@ impl Fixture {
                 0,
                 Command::Hello {
                     version: AGENT_PROTOCOL_VERSION,
-                    client_name: "test".into()
+                    client_name: "test".into(),
+                    client_version: "1".into(),
+                    request_kind: RequestKind::Tool,
                 }
             )
             .result
@@ -154,7 +157,9 @@ fn permission_is_live_and_handshake_is_strict() {
             2,
             Command::Hello {
                 version: 999,
-                client_name: "test".into()
+                client_name: "test".into(),
+                client_version: "1".into(),
+                request_kind: RequestKind::Tool,
             }
         )
         .result

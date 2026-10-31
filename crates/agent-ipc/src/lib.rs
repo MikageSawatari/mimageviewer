@@ -12,6 +12,29 @@ mod folder_types;
 pub use folder_types::*;
 
 pub const AGENT_PROTOCOL_VERSION: u32 = 2;
+pub const MAX_CLIENT_NAME_CHARS: usize = 128;
+pub const MAX_CLIENT_VERSION_CHARS: usize = 64;
+
+/// Self-reported MCP identity; never an authorization credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientIdentity {
+    pub name: String,
+    pub version: String,
+}
+impl ClientIdentity {
+    pub fn new(name: &str, version: &str) -> Self {
+        Self {
+            name: name.chars().take(MAX_CLIENT_NAME_CHARS).collect(),
+            version: version.chars().take(MAX_CLIENT_VERSION_CHARS).collect(),
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestKind {
+    Tool,
+    Internal,
+}
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_LIMIT: u32 = 50;
 pub const MAX_LIMIT: u32 = 200;
@@ -52,6 +75,8 @@ pub enum Command {
     Hello {
         version: u32,
         client_name: String,
+        client_version: String,
+        request_kind: RequestKind,
     },
     Status,
     SearchItems {
@@ -503,11 +528,40 @@ mod tests {
         );
     }
     #[test]
+    fn handshake_identity_and_request_kind_are_explicit_in_unreleased_v2() {
+        let hello = serde_json::json!({
+            "id": 1,
+            "command": {
+                "type": "hello", "version": AGENT_PROTOCOL_VERSION,
+                "client_name": "app", "client_version": "1.2", "request_kind": "internal"
+            }
+        });
+        let request: Request = serde_json::from_value(hello.clone()).unwrap();
+        assert_eq!(
+            request.command,
+            Command::Hello {
+                version: AGENT_PROTOCOL_VERSION,
+                client_name: "app".into(),
+                client_version: "1.2".into(),
+                request_kind: RequestKind::Internal,
+            }
+        );
+        for field in ["client_version", "request_kind"] {
+            let mut incomplete = hello.clone();
+            incomplete["command"].as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<Request>(incomplete).is_err());
+        }
+        assert_eq!(AGENT_PROTOCOL_VERSION, 2);
+    }
+
+    #[test]
     fn typed_wire_variants_roundtrip_and_malformed_json_is_rejected() {
         let commands = vec![
             Command::Hello {
                 version: AGENT_PROTOCOL_VERSION,
                 client_name: "fixture".into(),
+                client_version: "1".into(),
+                request_kind: RequestKind::Tool,
             },
             Command::Status,
             Command::ListTags {

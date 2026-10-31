@@ -2887,3 +2887,163 @@ PC の再起動で中断した portable の build は、`target-portable` の本
 - sandbox 外で crates (`--include-ignored`) 12/12・52/52、focused nextest 541/541、すべて exit 0。
 - 実装中の判断 1 件 (受付の lane は path をログに出さず、受理後は既存の open の診断のまま) は §15.6「ログ」に記録した。
 - 判定: **1c を受け入れる**。
+
+## 19. 段階 1d の実装記録
+
+### 19.1 前提照合と担当範囲
+
+観測者: 実装担当、2026-11-01、この sandbox 内。基点は `36885925a` (`mcp-trial`)。
+開始時の worktree は clean。§15.7、§15.21 の設計合意を読み、以下をコードで確認した。
+
+- 環境設定は `PreferencesState.settings` の下書きを OK で適用する既存経路を持つ。
+  旧 `general/agent-level` は全般の2択行で、tree/page/search anchor に新ページを追加できる。
+- `Hello` は現在、許可判定・同時実行 permit の内側にあり、名乗りは名前だけ。
+  core の `record` に tool の拒否も集約し、ここで非永続の recent-apps 表を更新する。
+- App は agent open controller を server から受け、構築後に install する入口を持つ。
+  recent-apps の共有表も同じ所有順で渡す。settings 接続を追加しない。
+- `runtime_cleanup` の `K32EnumProcesses` / `QueryFullProcessImageNameW` は portable cfg では
+  呼ばれない。列挙本体を全 Windows 構成の共通関数へ移し、cleanup の呼出条件は保つ。
+- 既存 `archive_converter::replace_file_atomic` を利用できる。
+  登録先の検出・読取・書込は worker に置き、テストは注入した一時パスだけを使う。
+
+製品・Claude Desktop・ChatGPT・Codex を起動せず、利用者の実際の Claude / Codex 設定には
+読取も書込もしない。launcher/distribution/public docs は変更しない。
+実装内の担当分担と確認は実装担当自身の確認であり、正式な独立レビューは別 thread で行う。
+
+### 19.2 実装の選択と所有境界
+
+- agent IPC は未リリースの版2のまま Hello に版付きの名乗りと `tool` / `internal` を追加する。
+  Hello は DB/許可/permit を使わず版と名乗りだけを受け取り、tool の結果の共通記録点で、
+  呼出受付時の名乗りを recent-apps に反映する。名前・版の長さは Unicode の文字数で制限する。
+  legacy は initialize の名乗りを保持し、stateless は要求ごとの `_meta` を使う。
+- recent-apps は core 所有の最大8件の共有表で、永続化しない。App の late install と描画時の
+  メモリ参照だけを追加し、Remote の reader/設定接続/動作は変更しない。
+  同一行の識別は名乗りの名前と版の組とし、呼出結果を記録した順に先頭へ移す。
+- 登録 worker の検出結果は環境と対象パスを一緒に保持する。登録の確認から書込結果までを
+  一つの `Option<RegistrationOperation>` が所有し、親の環境設定 Window 全体を無効にする。
+  編集中の AI 3設定との競合や、閉じた後の書込を扱う仕組みを増やさない。
+- JSON は登録 module 内だけの順序付き値で読み書きする。`serde_json/preserve_order` は使わない。
+  重複 key は解釈が曖昧なので、元のファイルを保って書込を拒否する。
+  TOML は既存 lock の `toml_edit` 0.25 を直接依存に加え、他の表・コメント・改行を保つ。
+  書込直前の process snapshot と再読取、単一バックアップ、同じフォルダの一時ファイルと既存の
+  atomic replace を使う。自動終了・待機・retry は追加しない。
+- launcher 環境変数があれば launcher の `--mcp`、無ければ sibling MCP exe を登録する。
+  解決済みの絶対 `--data-dir` は常に付ける。実環境の data dir の解決は agent-ipc 共通関数を使う。
+  MCP exe が無くても、既存登録の解除は可能にする。
+- UI のテストには検出・書込の両 worker 入口に注入結果を用意し、書込後の再確認も注入へ戻す。
+  snapshot は純粋描画だけで、実際の検出やプロセス・設定ファイルへ到達しない。
+  unit test build では注入なしで worker 入口へ来たら assertion で止め、実設定へ fall-through させない。
+
+### 19.3 変更ファイルと検査対象
+
+| 対象 | ファイル |
+|---|---|
+| 名乗りの wire / adapter | `crates/agent-ipc/src/lib.rs`, `crates/mcp-server/src/lib.rs`, `pipe.rs`, `tests.rs` |
+| recent-apps と要求結果の共通記録 | `src/agent_ipc/mod.rs`, `work.rs`, `open_response.rs`, `tests.rs`, 新規 `recent.rs`, `recent_tests.rs` |
+| 登録 backend | 新規 `src/agent_registration.rs`, `src/agent_registration/config.rs`, `tests.rs`, `Cargo.toml`, `Cargo.lock` |
+| Windows process 列挙の共通化 | 新規 `src/process_images.rs`, `src/runtime_cleanup.rs` |
+| App late install / modal 登録 | `src/app.rs`, `src/lib.rs` |
+| AI 連携ページ / modal / 検索 | `src/ui_dialogs/preferences.rs`, `preferences/pages.rs`, `search_index.rs`, 新規 `agent_integration.rs`, `agent_integration/tests.rs` |
+| snapshot 定義 | `tests/ui_snapshot.rs` (新規6状態のみ) |
+
+検査には、全12設定の欄、3設定の draft guard、確認中/書込中の背面入力、IME-safe Enter/Esc、
+切断/完了後の状態復帰、長い path/エラーと実環境設定の1093×614・100/200%の末尾到達を含める。
+登録 backend は Squirrel/MSIX/曖昧/無し、注入 process path、JSON の key 順と他の値、TOML の
+コメント・他の表・CRLF/LF、再読取・backup・atomic replace・解除・不正設定の非変更を検査する。
+core は Hello/Cancel/internal の除外、Disabled/Busy/時間切れの記録、8件LRU、文字数制限、
+受付時の名乗りの固定を検査する。正式な独立レビューはこれら自身の検査とは別に行う。
+
+### 19.4 途中の検査と修正 (観測者: 実装担当、この sandbox 内)
+
+- 初回 core check は exit 0 (`target/mcp-1d-core-initial.log`)。
+- narrow 初回は exit 100、22件中19成功/3失敗 (`target/mcp-1d-narrow-initial.log`)。
+  ComboBox に accessible name が無かったため、見出し label と response を `labelled_by` で結んだ。
+  検査を無効にはしていない。次の compile は新しい geometry test の iterator 呼出しの誤りで
+  exit 101 (`target/mcp-1d-narrow-round2.log`)、修正後は23件中21成功/2失敗、exit 100
+  (`target/mcp-1d-narrow-round3.log`)。2件は、背面のつもりの座標が前面の取消操作に重なったことと、
+  headless fixture に本番の IME input policy を登録していなかったことを直した。
+- 最初の広い focused は exit 100、775件中772成功/3失敗 (`target/mcp-1d-focused.log`)。
+  2件は既知の実 pipe の OS5、残りは backdrop fixture の × の座標が前面窓へ重なる検査前提の誤り。
+  backdrop 入力だけは1400×900で窓を実際に drag して分離し、無効状態・実入力・非交差を検査する。
+  別の実環境設定/確認窓の1093×614・100/200% geometry と末尾への wheel 検査は維持する。
+- 新規6枚だけの初回生成は exit 0 (`target/mcp-1d-snapshots-new.log`)。目視で recent-apps の
+  Grid 内から幅を取ったため数文字ずつ折り返す不具合を見つけ、ページ幅を使う3列の自然高に変更した。
+  通常名/時刻と128文字の名前・64文字の版、最大8件を900/360/180ptで検査する回帰を追加した。
+  snapshot fixture はエラー表示だけでなく、注入した登録済み/未登録の行と生成 command を描く。
+  これらは新規6枚の見直しであり、既存 baseline は更新しない。
+
+### 19.5 新規 PNG と目視確認
+
+観測者: 実装担当。この6枚だけを `UPDATE_SNAPSHOTS=1` の対象にし、再生成後に全6枚を
+`view_image` で目視した。3欄の本文・チェック状態・注意文、recent-apps の名前/版/時刻、
+登録済み/未登録の行と最下部の操作が切れずに見えることを確認した。
+サイズはすべて900×1050、合計1,185,717 bytes (約1.13 MiB)。既存 PNG は変更していない。
+
+| 追加ファイル (`tests/snapshots/`) | bytes |
+|---|---:|
+| `preferences_agent_disabled_light.png` | 188076 |
+| `preferences_agent_disabled_dark.png` | 186373 |
+| `preferences_agent_read_light.png` | 193610 |
+| `preferences_agent_read_dark.png` | 191942 |
+| `preferences_agent_open_light.png` | 213802 |
+| `preferences_agent_open_dark.png` | 211914 |
+
+### 19.6 最終検証と sandbox 外の再実行
+
+観測者はすべて実装担当、この sandbox 内。今回の差分について sandbox 外の成功は未観測。
+既存配置の FFmpeg DLL 実ファイルを使い、製品/AI アプリや実設定は使っていない。
+
+| コマンド | 実 exit code | 結果 / ログ |
+|---|---:|---|
+| `cargo fmt` (workspace、引数なし) | 0 | 最終ソースを整形。以後は文書だけを追記 |
+| `cargo fmt --check` | 0 | `target/mcp-1d-fmt-check.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | `target/mcp-1d-core-final.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 101 | IPC12/12成功、MCP52成功/2失敗、ignore0。実 pipe の OS5のみ。`target/mcp-1d-crates.log` |
+| 下記の広い focused nextest | 100 | 776件中774成功/2失敗。実 pipe の OS5のみ。`target/mcp-1d-focused-final.log` |
+| 下記 PowerShell での新規画像生成 | 0 | 新規6/6成功。`target/mcp-1d-snapshots-final-new.log`。既存画像を更新する filter は実行していない |
+| `cargo test --test ui_snapshot` (更新指定なし) | 0 | 220/220成功。`target/mcp-1d-snapshots-compare.log` |
+| `python scripts/check_ui_glyphs.py` | 0 | 危険なグリフ0。`target/mcp-1d-glyphs-final.log` |
+| `cargo build -p mimageviewer-mcp --bin mimageviewer-mcp` | 0 | `target/mcp-1d-adapter.log` |
+| `git diff --check` | 0 | `target/mcp-1d-diff-check.log` |
+
+crate テスト/adapter build 後に crate 側の変更は fmt だけなので、その結果を再利用した。
+UI の修正後は最終 focused、core check、画像再生成と通常比較を実行し直した。
+
+新規画像だけの生成:
+
+```powershell
+$env:UPDATE_SNAPSHOTS = '1'
+try {
+    cargo test --test ui_snapshot preferences_agent_
+} finally {
+    Remove-Item Env:UPDATE_SNAPSHOTS -ErrorAction SilentlyContinue
+}
+```
+
+広い focused の正確なコマンド (sandbox 外でもこのまま使える):
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E '(test(/agent_ipc/) or test(/agent_level/) or test(/agent_permission/) or test(=settings_db::tests::failed_permission_commit_preserves_snapshot_and_epoch) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(/png_metadata/) or test(=pdf_loader::tests::anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results) or test(=pdf_loader::tests::page_sizes_preserve_existing_ui_diagnostic_identity) or test(=pdf_loader::tests::page_sizes_round_trip_and_reject_a_truncated_reply) or test(/app::folder_scan/) or test(/zip_loader/) or test(/conceal_db/) or test(=pdf_loader::tests::anonymous_agent_render_and_enumerate_omit_keys_and_harvest_actual_completion) or test(=pdf_loader::tests::cancelled_anonymous_render_does_not_enqueue) or test(/app::startup_ops/) or test(/single_instance/) or test(/remote_ipc::session/) or test(/ui_request_dispatch/) or test(/activation/) or test(/startup_open_path/) or test(/ui_dialogs::preferences/) or test(/agent_registration/) or test(/process_images/) or test(/runtime_cleanup/)) and not test(/section1375_scan_perf_tests/)'
+```
+
+sandbox のため通らなかった実 pipe だけを、ClaudeCode が通常権限で再確認するコマンド:
+
+```powershell
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E 'test(=agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry) or test(=agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers)'
+```
+
+失敗は core の上記2件、adapter の
+`pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld` と
+`pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked`。
+すべて OS5 で、skip/ignore や DACL の変更はしていない。
+
+### 19.7 残る確認と引き渡し
+
+- 前提の矛盾は見つかっていない。今回の正式な独立実装レビューは別 thread の担当で、未実施。
+- 実際の Claude Desktop/ChatGPT の検出・登録・解除、再起動後の tool と確認の挙動、
+  `default_tools_approval_mode = "approve"` の意味、mIV の前面化は、§15.7 の利用者による
+  1回の実機確認に残す。実アプリや実設定へアクセスして確かめたとは主張しない。
+- 実 pipe の gate が sandbox 内で通らないため、通常 profile 用の core 確認 build は作らず、
+  依頼された MCP adapter を build した。`test-full` は実行していない。
+- launcher/distribution (1e)、公開文書には進んでいない。commit はしていない。

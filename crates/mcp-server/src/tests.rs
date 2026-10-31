@@ -448,7 +448,8 @@ fn stage1b_all_protocols_transport_folder_pages_and_webp_blocks() {
         fn call(
             &self,
             command: Command,
-            client: &str,
+            client: &ClientIdentity,
+            kind: RequestKind,
             control: Arc<CallControl>,
         ) -> Result<Payload, AgentError> {
             match command {
@@ -472,7 +473,7 @@ fn stage1b_all_protocols_transport_folder_pages_and_webp_blocks() {
                     &[ThumbnailStatus::HiddenByEdit, ThumbnailStatus::Ok],
                     MAX_THUMBNAIL_IMAGE_BYTES,
                 ))),
-                _ => Fixture { disabled: false }.call(command, client, control),
+                _ => Fixture { disabled: false }.call(command, client, kind, control),
             }
         }
     }
@@ -570,7 +571,13 @@ struct Fixture {
     disabled: bool,
 }
 impl Backend for Fixture {
-    fn call(&self, command: Command, _: &str, _: Arc<CallControl>) -> Result<Payload, AgentError> {
+    fn call(
+        &self,
+        command: Command,
+        _: &ClientIdentity,
+        _: RequestKind,
+        _: Arc<CallControl>,
+    ) -> Result<Payload, AgentError> {
         Ok(match command {
             Command::Status => Payload::Status(StatusPayload {
                 app_version: "test".into(),
@@ -730,6 +737,132 @@ fn modern(id: i64, method: &str, mut params: Value) -> Value {
     json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
 }
 
+struct IdentityProbe {
+    calls: mpsc::Sender<(Command, ClientIdentity, RequestKind)>,
+}
+impl Backend for IdentityProbe {
+    fn call(
+        &self,
+        command: Command,
+        client: &ClientIdentity,
+        kind: RequestKind,
+        control: Arc<CallControl>,
+    ) -> Result<Payload, AgentError> {
+        self.calls
+            .send((command.clone(), client.clone(), kind))
+            .unwrap();
+        Fixture { disabled: false }.call(command, client, kind, control)
+    }
+}
+
+#[test]
+fn legacy_identity_preserves_initialize_version_and_internal_poll_classification() {
+    for version in &VERSIONS[1..] {
+        let (send, calls) = mpsc::channel();
+        let mut h = Harness::new(Arc::new(IdentityProbe { calls: send }));
+        h.send(
+            json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{
+                "protocolVersion":version,"capabilities":{},
+                "clientInfo":{"name":"legacy app","version":"9.8.7"}
+            }}),
+        );
+        assert!(h.receive().get("error").is_none());
+        h.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+        h.send(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}));
+        assert!(h.receive()["result"]["tools"].is_array());
+        assert_eq!(
+            calls.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (
+                Command::Status,
+                ClientIdentity::new("legacy app", "9.8.7"),
+                RequestKind::Internal
+            )
+        );
+        h.send(
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name":"miv_status","arguments":{},
+                "_meta":{"io.modelcontextprotocol/clientInfo":{"name":"ignored","version":"0"}}
+            }}),
+        );
+        assert_eq!(h.receive()["result"]["isError"], false);
+        assert_eq!(
+            calls.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (
+                Command::Status,
+                ClientIdentity::new("legacy app", "9.8.7"),
+                RequestKind::Tool
+            )
+        );
+        // The real five-second observer uses internal attribution too.
+        assert_eq!(
+            calls.recv_timeout(Duration::from_secs(6)).unwrap(),
+            (
+                Command::Status,
+                ClientIdentity::new("legacy app", "9.8.7"),
+                RequestKind::Internal
+            )
+        );
+        h.close();
+    }
+}
+
+#[test]
+fn modern_identity_is_request_scoped_optional_and_bounded() {
+    let (send, calls) = mpsc::channel();
+    let mut h = Harness::new(Arc::new(IdentityProbe { calls: send }));
+    for (id, identity, expected) in [
+        (
+            1,
+            Some(json!({"name":"modern app","version":"3.2"})),
+            ClientIdentity::new("modern app", "3.2"),
+        ),
+        (2, None, ClientIdentity::new("(名前なし)", "")),
+        (
+            3,
+            Some(json!({"name":"名".repeat(140),"version":"版".repeat(80)})),
+            ClientIdentity::new(&"名".repeat(128), &"版".repeat(64)),
+        ),
+        (
+            4,
+            Some(json!({"version":"4"})),
+            ClientIdentity::new("(名前なし)", "4"),
+        ),
+    ] {
+        let mut request = modern(
+            id,
+            "tools/call",
+            json!({"name":"miv_status","arguments":{}}),
+        );
+        if let Some(identity) = identity {
+            request["params"]["_meta"]["io.modelcontextprotocol/clientInfo"] = identity;
+        }
+        h.send(request);
+        assert_eq!(h.receive()["result"]["isError"], false);
+        assert_eq!(
+            calls.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (Command::Status, expected, RequestKind::Tool)
+        );
+    }
+    h.send(modern(5, "tools/list", json!({})));
+    assert!(h.receive()["result"]["tools"].is_array());
+    assert_eq!(
+        calls.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (
+            Command::Status,
+            ClientIdentity::new("(名前なし)", ""),
+            RequestKind::Internal
+        )
+    );
+    h.send(modern(
+        6,
+        "tools/call",
+        json!({"name":"miv_status","arguments":{"unexpected":true}}),
+    ));
+    assert!(h.receive().get("error").is_some());
+    assert!(matches!(calls.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    h.close();
+}
+
 fn accepted_open() -> Payload {
     Payload::Opened(OpenResult {
         status: OpenStatus::Accepted,
@@ -861,7 +994,8 @@ fn stage1c_all_protocols_refresh_open_permission_and_transport_accepted_result()
         fn call(
             &self,
             command: Command,
-            _: &str,
+            _: &ClientIdentity,
+            _: RequestKind,
             _: Arc<CallControl>,
         ) -> Result<Payload, AgentError> {
             match command {
@@ -1052,7 +1186,13 @@ struct Blocked {
     release: Mutex<mpsc::Receiver<()>>,
 }
 impl Backend for Blocked {
-    fn call(&self, _: Command, _: &str, control: Arc<CallControl>) -> Result<Payload, AgentError> {
+    fn call(
+        &self,
+        _: Command,
+        _: &ClientIdentity,
+        _: RequestKind,
+        control: Arc<CallControl>,
+    ) -> Result<Payload, AgentError> {
         self.started.send(control).unwrap();
         self.release.lock().unwrap().recv().unwrap();
         Err(AgentError::new(ErrorCode::Cancelled, "Cancelled."))
@@ -1158,7 +1298,13 @@ fn tool_errors_remain_structured_and_match_error_schema_branch() {
 }
 struct Disabled;
 impl Backend for Disabled {
-    fn call(&self, _: Command, _: &str, _: Arc<CallControl>) -> Result<Payload, AgentError> {
+    fn call(
+        &self,
+        _: Command,
+        _: &ClientIdentity,
+        _: RequestKind,
+        _: Arc<CallControl>,
+    ) -> Result<Payload, AgentError> {
         Err(AgentError::new(
             ErrorCode::Disabled,
             "AI 連携 (MCP) は無効です",
@@ -1690,14 +1836,15 @@ impl Backend for SerialQueries {
     fn call(
         &self,
         command: Command,
-        client: &str,
+        client: &ClientIdentity,
+        kind: RequestKind,
         control: Arc<CallControl>,
     ) -> Result<Payload, AgentError> {
         // Legacy's independent permission observer also calls Status. In that
         // fixture only the two client queries are counted; initial list Status
         // completes before either query is admitted. Modern counts every call.
         if matches!(self.hold, HoldRequest::Search) && matches!(command, Command::Status) {
-            return Fixture { disabled: false }.call(command, client, control);
+            return Fixture { disabled: false }.call(command, client, kind, control);
         }
         let running = self.running.fetch_add(1, Ordering::AcqRel) + 1;
         self.maximum.fetch_max(running, Ordering::AcqRel);
@@ -1709,7 +1856,7 @@ impl Backend for SerialQueries {
         ) {
             self.release.lock().unwrap().recv().unwrap();
         }
-        let result = Fixture { disabled: false }.call(command, client, control);
+        let result = Fixture { disabled: false }.call(command, client, kind, control);
         self.running.fetch_sub(1, Ordering::AcqRel);
         result
     }
@@ -1910,7 +2057,13 @@ fn queued_cancel_has_no_backend_call_or_response_for_all_versions() {
 }
 struct CoreBusy;
 impl Backend for CoreBusy {
-    fn call(&self, _: Command, _: &str, _: Arc<CallControl>) -> Result<Payload, AgentError> {
+    fn call(
+        &self,
+        _: Command,
+        _: &ClientIdentity,
+        _: RequestKind,
+        _: Arc<CallControl>,
+    ) -> Result<Payload, AgentError> {
         Err(AgentError::new(ErrorCode::Busy, "core busy fixture"))
     }
 }
@@ -2046,7 +2199,13 @@ struct LiveStatus {
     calls: mpsc::Sender<bool>,
 }
 impl Backend for LiveStatus {
-    fn call(&self, command: Command, _: &str, _: Arc<CallControl>) -> Result<Payload, AgentError> {
+    fn call(
+        &self,
+        command: Command,
+        _: &ClientIdentity,
+        _: RequestKind,
+        _: Arc<CallControl>,
+    ) -> Result<Payload, AgentError> {
         assert_eq!(command, Command::Status);
         let enabled = self.enabled.load(Ordering::Acquire);
         let _ = self.calls.send(enabled);
@@ -2106,11 +2265,12 @@ fn revoked_read_does_not_advertise_disabled_tools_while_status_stays_enabled() {
         fn call(
             &self,
             command: Command,
-            client: &str,
+            client: &ClientIdentity,
+            kind: RequestKind,
             control: Arc<CallControl>,
         ) -> Result<Payload, AgentError> {
             if matches!(command, Command::Status) {
-                Fixture { disabled: false }.call(command, client, control)
+                Fixture { disabled: false }.call(command, client, kind, control)
             } else {
                 Err(AgentError::new(
                     ErrorCode::PermissionChanged,
@@ -2199,7 +2359,8 @@ fn stale_status_poll_and_tool_list_never_advertise_disabled_tools() {
         fn call(
             &self,
             command: Command,
-            client: &str,
+            client: &ClientIdentity,
+            kind: RequestKind,
             control: Arc<CallControl>,
         ) -> Result<Payload, AgentError> {
             assert_eq!(command, Command::Status);
@@ -2213,7 +2374,7 @@ fn stale_status_poll_and_tool_list_never_advertise_disabled_tools() {
                     "AI 連携の許可が変更されました。もう一度お試しください",
                 ))
             } else {
-                Fixture { disabled: false }.call(command, client, control)
+                Fixture { disabled: false }.call(command, client, kind, control)
             }
         }
     }
@@ -2556,7 +2717,12 @@ fn stage1a_schema_validates_serialized_payloads_and_explicit_absence_markers() {
         let (_, command) = parse_tool(&json!({"name":name,"arguments":args})).unwrap();
         let result = tool_result(
             name,
-            backend.call(command, "fixture", Arc::new(CallControl::default())),
+            backend.call(
+                command,
+                &ClientIdentity::new("fixture", "1"),
+                RequestKind::Tool,
+                Arc::new(CallControl::default()),
+            ),
         );
         assert_eq!(result["isError"], false);
         assert!(

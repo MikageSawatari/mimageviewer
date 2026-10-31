@@ -28,6 +28,61 @@
 use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
 
+fn agent_integration_snapshot(name: &str, theme: mimageviewer::os_theme::ResolvedTheme, level: u8) {
+    snapshot_with_theme_at_size(name, theme, egui::vec2(900.0, 1050.0), None, move |ui| {
+        mimageviewer::draw_agent_integration_snapshot_fixture(ui, level)
+    });
+}
+
+#[test]
+fn preferences_agent_disabled_light() {
+    agent_integration_snapshot(
+        "preferences_agent_disabled_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        0,
+    );
+}
+#[test]
+fn preferences_agent_disabled_dark() {
+    agent_integration_snapshot(
+        "preferences_agent_disabled_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        0,
+    );
+}
+#[test]
+fn preferences_agent_read_light() {
+    agent_integration_snapshot(
+        "preferences_agent_read_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        1,
+    );
+}
+#[test]
+fn preferences_agent_read_dark() {
+    agent_integration_snapshot(
+        "preferences_agent_read_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        1,
+    );
+}
+#[test]
+fn preferences_agent_open_light() {
+    agent_integration_snapshot(
+        "preferences_agent_open_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        2,
+    );
+}
+#[test]
+fn preferences_agent_open_dark() {
+    agent_integration_snapshot(
+        "preferences_agent_open_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        2,
+    );
+}
+
 #[test]
 fn thumbnail_name_style_multiline_dark() {
     snapshot_with_theme_at_size(

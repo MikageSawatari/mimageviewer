@@ -15,6 +15,8 @@ mod item_info;
 mod library;
 pub(crate) mod open;
 mod open_response;
+mod recent;
+pub(crate) use recent::{RecentApps, SharedRecentApps};
 mod thumbnail;
 mod work;
 use work::*;
@@ -28,10 +30,13 @@ mod pipe;
 #[cfg(test)]
 mod read_tests;
 #[cfg(test)]
+mod recent_tests;
+#[cfg(test)]
 mod tests;
 
 pub(crate) struct Server {
     open: Arc<open::OpenController>,
+    recent_apps: SharedRecentApps,
     #[cfg(windows)]
     pipe: pipe::Server,
 }
@@ -45,13 +50,16 @@ impl Server {
         #[cfg(windows)]
         {
             let open = open::OpenController::new(session.clone());
+            let recent_apps = Arc::new(Mutex::new(RecentApps::default()));
             Ok(Self {
                 open: open.clone(),
+                recent_apps: recent_apps.clone(),
                 pipe: pipe::Server::start(Arc::new(Handlers {
                     readers,
                     producer,
                     session,
                     open,
+                    recent_apps,
                     active: AtomicUsize::new(0),
                     #[cfg(test)]
                     search_hooks: None,
@@ -70,6 +78,10 @@ impl Server {
     pub(crate) fn open_controller(&self) -> Arc<open::OpenController> {
         self.open.clone()
     }
+
+    pub(crate) fn recent_apps(&self) -> SharedRecentApps {
+        self.recent_apps.clone()
+    }
 }
 
 struct Handlers {
@@ -77,6 +89,7 @@ struct Handlers {
     producer: Option<crate::collection_store::CollectionRemoteProducerControl>,
     session: Option<crate::remote_ipc::session::SessionHandle>,
     open: Arc<open::OpenController>,
+    recent_apps: SharedRecentApps,
     active: AtomicUsize,
     #[cfg(test)]
     search_hooks: Option<Arc<SearchHooks>>,
@@ -137,7 +150,13 @@ impl Reply {
 struct Connection {
     handlers: Arc<Handlers>,
     running: Mutex<Option<Running>>,
-    hello: AtomicBool,
+    client: Mutex<Option<ClientRequest>>,
+}
+
+#[derive(Clone)]
+struct ClientRequest {
+    identity: ClientIdentity,
+    kind: RequestKind,
 }
 
 struct Permit {
@@ -185,7 +204,7 @@ impl Connection {
         Arc::new(Self {
             handlers,
             running: Mutex::new(None),
-            hello: AtomicBool::new(false),
+            client: Mutex::new(None),
         })
     }
 
@@ -231,9 +250,38 @@ impl Connection {
     ) -> Option<JoinHandle<()>> {
         let started = Instant::now();
         let tool = tool_name(&request.command);
+        // Handshake has no permission lookup, worker, or admission slot. In
+        // particular, a disabled/busy tool still reaches core and is recorded.
+        if let Command::Hello {
+            version,
+            client_name,
+            client_version,
+            request_kind,
+        } = &request.command
+        {
+            let result = check_version(*version).map(|()| {
+                *self.client.lock().unwrap() = Some(ClientRequest {
+                    identity: ClientIdentity::new(client_name, client_version),
+                    kind: *request_kind,
+                });
+                Payload::Hello { version: *version }
+            });
+            record(tool, started, &result);
+            let _ = replies.send(Reply {
+                response: Response {
+                    id: request.id,
+                    result,
+                },
+                policy: ReplyPolicy::Rejected,
+            });
+            return None;
+        }
+        // Capture attribution at request admission. A later Hello on the same
+        // pipe cannot relabel an in-flight result.
+        let client = self.client.lock().unwrap().clone();
         let reject = |err| {
             let result = Err(err);
-            record(tool, started, &result);
+            self.record(client.as_ref(), tool, started, &result);
             let _ = replies.send(Reply {
                 response: Response {
                     id: request.id,
@@ -260,7 +308,7 @@ impl Connection {
                 running.cancel.store(true, Ordering::Release);
             }
             let result = permission().map(|_| Payload::Cancelled);
-            record(tool, started, &result);
+            self.record(client.as_ref(), tool, started, &result);
             let _ = replies.send(Reply {
                 response: Response {
                     id: request.id,
@@ -270,8 +318,7 @@ impl Connection {
             });
             return None;
         }
-        if !self.hello.load(Ordering::Acquire) && !matches!(request.command, Command::Hello { .. })
-        {
+        if client.is_none() {
             reject(error(
                 ErrorCode::BadRequest,
                 "先に接続の版を確認してください",
@@ -302,11 +349,14 @@ impl Connection {
         let fallback = replies.clone();
         let id = request.id;
         let context = ReadContext::new(&self.handlers, granted.0, cancel);
+        let record_client = client.clone();
         match std::thread::Builder::new()
             .name("agent-read".into())
             .spawn(move || {
                 if let Command::OpenInViewer { path } = request.command {
-                    open_response::respond(connection, path, permit, context, replies, started, id);
+                    open_response::respond(
+                        connection, path, permit, context, replies, started, id, client,
+                    );
                     return;
                 }
                 work::respond(
@@ -319,10 +369,14 @@ impl Connection {
                     started,
                     id,
                     tool,
+                    client,
                 );
             }) {
             Ok(worker) => Some(worker),
             Err(_) => {
+                // Spawn failure also completes a tool request. The closure's
+                // captured attribution was moved, so use the admission copy.
+                self.record(record_client.as_ref(), tool, started, &Err(internal()));
                 let _ = fallback.send(Reply {
                     response: Response {
                         id,
@@ -331,6 +385,25 @@ impl Connection {
                     policy: ReplyPolicy::Rejected,
                 });
                 None
+            }
+        }
+    }
+
+    fn record(
+        &self,
+        client: Option<&ClientRequest>,
+        tool: &'static str,
+        started: Instant,
+        result: &Result<Payload, AgentError>,
+    ) {
+        record(tool, started, result);
+        if tool != "hello" && tool != "cancel" {
+            if let Some(client) = client.filter(|client| client.kind == RequestKind::Tool) {
+                self.handlers
+                    .recent_apps
+                    .lock()
+                    .unwrap()
+                    .record(&client.identity);
             }
         }
     }

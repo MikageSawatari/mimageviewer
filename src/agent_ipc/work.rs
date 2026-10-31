@@ -83,6 +83,7 @@ pub(super) fn respond(
     started: Instant,
     id: u64,
     tool: &'static str,
+    client: Option<ClientRequest>,
 ) {
     let worker_context = ctx.clone();
     let handlers = connection.handlers.clone();
@@ -106,7 +107,7 @@ pub(super) fn respond(
     let Ok(worker) = worker else {
         drop(permit);
         let result = Err(internal());
-        record(tool, started, &result);
+        connection.record(client.as_ref(), tool, started, &result);
         let _ = replies.send(Reply {
             response: Response { id, result },
             policy: ReplyPolicy::Read(granted),
@@ -142,10 +143,7 @@ pub(super) fn respond(
             }
         }
     };
-    if matches!(value, Ok(Payload::Hello { .. })) {
-        connection.hello.store(true, Ordering::Release);
-    }
-    record(tool, started, &value);
+    connection.record(client.as_ref(), tool, started, &value);
     let reply = Reply {
         response: Response { id, result: value },
         policy: ReplyPolicy::Read(granted),

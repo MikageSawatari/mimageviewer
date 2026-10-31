@@ -80,17 +80,40 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
-        "general/agent-level",
-        General,
-        "AI 連携 (MCP)",
-        [
-            "読み取りのみ",
-            "無効",
-            "Claude",
-            "ChatGPT",
-            "MCP",
-            "AIアプリ"
-        ]
+        "agent/permission",
+        AgentIntegration,
+        "許可の範囲",
+        ["AI 連携", "MCP", "無効", "読み取りのみ", "mIV で開く"]
+    ),
+    entry!(
+        "agent/images",
+        AgentIntegration,
+        "縮小画像・撮影位置",
+        ["GPS", "サムネイル", "AI 連携"]
+    ),
+    entry!(
+        "agent/exposure",
+        AgentIntegration,
+        "AI に見せる範囲",
+        ["プライバシー", "AI に許す操作", "見せないもの"]
+    ),
+    entry!(
+        "agent/recent",
+        AgentIntegration,
+        "最近使った AI アプリ",
+        ["接続", "版", "時刻"]
+    ),
+    entry!(
+        "agent/claude",
+        AgentIntegration,
+        "Claude Desktop",
+        ["登録", "解除", "手順", "JSON"]
+    ),
+    entry!(
+        "agent/chatgpt",
+        AgentIntegration,
+        "ChatGPT (Codex)",
+        ["登録", "解除", "手順", "TOML"]
     ),
     entry!(
         "general/ai-processing",

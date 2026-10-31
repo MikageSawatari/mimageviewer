@@ -54,6 +54,7 @@ pub use app::draw_collection_placeholder_snapshot_fixture;
 pub use app::draw_thumbnail_name_style_snapshot_fixture;
 #[doc(hidden)]
 pub use app::draw_video_thumbnail_indicator_snapshot_fixture;
+pub use ui_dialogs::preferences::draw_agent_integration_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_book_resume_meter_settings_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_file_organize_destinations_settings_snapshot_fixture;
@@ -283,7 +284,9 @@ pub mod post_operation_selection;
 // `GetProcessMemoryInfo` の宣言を 1 つに保つためのテスト専用ヘルパー
 // (`clashing_extern_declarations` 対策)。
 mod agent_ipc;
+mod agent_registration;
 pub(crate) mod page_edit_write_epoch;
+mod process_images;
 #[cfg(all(test, windows))]
 mod process_memory_test_support;
 pub mod rar_loader;
@@ -1727,6 +1730,9 @@ pub fn run() -> eframe::Result {
     let agent_open_controller = agent_ipc_server
         .as_ref()
         .map(agent_ipc::Server::open_controller);
+    let agent_recent_apps = agent_ipc_server
+        .as_ref()
+        .map(agent_ipc::Server::recent_apps);
     // server より後に所有し、逆順 Drop で service を先に止めてから pipe を閉じる。
     let remote_data_dir = data_dir::get();
     let mut remote_service_manager = if remote_ipc_server.is_some() {
@@ -1897,6 +1903,9 @@ pub fn run() -> eframe::Result {
             }
             if let Some(controller) = agent_open_controller.as_ref() {
                 app.install_agent_open(controller.clone(), &cc.egui_ctx);
+            }
+            if let Some(recent) = agent_recent_apps.as_ref() {
+                app.install_agent_recent_apps(recent.clone());
             }
             if let Some(control) = app_remote_ipc_control.clone() {
                 app.set_remote_ipc_server_control(control);

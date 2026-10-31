@@ -60,7 +60,8 @@ pub trait Backend: Send + Sync + 'static {
     fn call(
         &self,
         command: Command,
-        client_name: &str,
+        client: &ClientIdentity,
+        kind: RequestKind,
         control: Arc<CallControl>,
     ) -> Result<Payload, AgentError>;
 }
@@ -176,7 +177,8 @@ impl Backend for PipeBackend {
     fn call(
         &self,
         command: Command,
-        client_name: &str,
+        client: &ClientIdentity,
+        kind: RequestKind,
         control: Arc<CallControl>,
     ) -> Result<Payload, AgentError> {
         let mut reader = PipeStream::connect(&self.pipe_name).map_err(connection_error)?;
@@ -195,7 +197,13 @@ impl Backend for PipeBackend {
                 id: 1,
                 command: Command::Hello {
                     version: AGENT_PROTOCOL_VERSION,
-                    client_name: client_name.chars().take(128).collect(),
+                    client_name: client.name.chars().take(MAX_CLIENT_NAME_CHARS).collect(),
+                    client_version: client
+                        .version
+                        .chars()
+                        .take(MAX_CLIENT_VERSION_CHARS)
+                        .collect(),
+                    request_kind: kind,
                 },
             },
         )
@@ -407,7 +415,20 @@ mod tests {
                     assert_eq!(unsafe { GetLastError() }, ERROR_PIPE_CONNECTED);
                 }
                 let hello: Request = read_frame(&mut server).unwrap().unwrap();
-                assert!(matches!(hello.command, Command::Hello { .. }));
+                assert_eq!(
+                    hello.command,
+                    Command::Hello {
+                        version: AGENT_PROTOCOL_VERSION,
+                        client_name: if blocked_stdout {
+                            "(名前なし)"
+                        } else {
+                            "fixture"
+                        }
+                        .into(),
+                        client_version: if blocked_stdout { "" } else { "1" }.into(),
+                        request_kind: RequestKind::Tool,
+                    }
+                );
                 let target = if cancel_hello {
                     hello.id
                 } else {
@@ -460,7 +481,12 @@ mod tests {
             let (done_send, done) = mpsc::channel();
             let worker = std::thread::spawn(move || {
                 done_send
-                    .send(backend.call(Command::Status, "fixture", worker_control))
+                    .send(backend.call(
+                        Command::Status,
+                        &ClientIdentity::new("fixture", "1"),
+                        RequestKind::Tool,
+                        worker_control,
+                    ))
                     .unwrap();
             });
             started
