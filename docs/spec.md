@@ -34,6 +34,9 @@ panic・backend再試行・依存ライブラリの保存ログ対象拡大は�
 - flat一覧は通常sort/詳細表示/★/tag/閲覧を共有する。Ctrl+Gの集約/hit-count sort/全文対象フィルタは出さない。
   ZIP内部entry/PDFページは検索せず外側本体を通常openする。成功した物理childからの帰路は保持datasetの
   共通prepareで作り、IPCを再送しない。検索を閉じると共通Searchのoriginへ戻る。
+  メインで「開いたとき、ページを表示」の本は通常の閉じる（Esc／Enterの閉じる／HUD × 等）でも保持結果へ戻り、
+  元の本を選択・可視化する。画像フォルダ本は追加設定ON時が対象。Backspaceはページ一覧へ戻る。
+  「開いたとき、ページ一覧を表示」は維持する。独立viewerのcloseでmainが物理親へ移る既存挙動は変更しない（§1.664下の別項目）。
 - 新しいSettings field/DB/schema/索引/Remote query endpoint/result共有は追加しない。
   query/result一覧を永続化・診断ログへ保存せず、通常open/tag/★/cacheの保存と既存F12 viewer機能は維持する。
   PDF prerequisiteは独立ACCEPT済み `4510346f5`（master `c1e66f589`）。Everything最新実装の独立レビュー、

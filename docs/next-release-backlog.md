@@ -63,12 +63,26 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.664 Everything検索から直接開いた本を閉じると、検索結果ではなくページ一覧へ戻る — 5ch >>671 (2026-10-31)
 
-- 状態: **未着手・不具合修正として採用 (利用者方針 2026-10-31)**。[>>671](https://egg.5ch.io/test/read.cgi/software/1782419551/671) は、本の表示モードを「開いたとき、ページを表示」にすると、Everything検索結果からは設定どおりページを開くが、本を閉じると検索結果ではなくページ一覧になるという報告。閉じる入力とビューワモードは報告に記載なし。コード上は通常の閉じるでも到達する経路を確認したが、実アプリ再現試験・修正は未実施。リリース時期は未指定。
+- 状態: **実装済み・実機未確認（2026-10-31、v4.10.2予定）**。[>>671](https://egg.5ch.io/test/read.cgi/software/1782419551/671) は、本の表示モードを「開いたとき、ページを表示」にすると、Everything検索結果からは設定どおりページを開くが、本を閉じると検索結果ではなくページ一覧になるという報告。閉じる入力とビューワモードは報告に記載なし。メインで開く場合を今回の修正対象とする（HEAD比較後の設計担当指示）。製品起動・実機再現試験は未実施。
 - 原因 (v4.10.0 と現行masterのコードを確認): `auto_open_for_current_container` は `global_search.active` / `favsearch.active` / `tag_view.active` の間 false を返す。検索から実フォルダの親へ飛ぶのを防ぐ既存の除外条件がEverythingにも適用され、`handle_fullscreen_close_request` が親一覧への復帰要求を立てず、画像表示だけを閉じて現在の本のページ一覧を残す。`resolve_close_return_navigation` にもEverythingの結果復帰先は含まれていない。
-- 期待する動作: Everything検索結果から本を直接ページ表示した場合、通常の閉じる（Esc・Enterの閉じる操作・HUDの×等）では元の検索結果へ戻す。Backspaceで明示的にページ一覧へ戻す操作、および「開いたとき、ページ一覧を表示」の動作は維持する。複数ウィンドウでメインの検索結果を残して独立閲覧している場合も、その一覧を不要に置き換えない。
+- 期待する動作: メインでEverything検索結果から本を直接ページ表示した場合、通常の閉じる（Esc・Enterの閉じる操作・HUDの×等）では元の検索結果へ戻す。Backspaceで明示的にページ一覧へ戻す操作、および「開いたとき、ページ一覧を表示」の動作は維持する。独立viewerのcloseは下の既存不具合として今回の修正対象から分離し、HEADから悪化させない。
 - 方針: 検索中の除外条件を外すだけの修正にはしない。既存 `SearchAccepted::Everything` の `PhysicalChild` と `EverythingReturn::Results` / `return_from_everything_child` が保持する論理的な本・戻り先・採用済みdatasetを、通常の閉じる要求から使う。検索語・取得済み結果・表示条件と並び・開いた本の選択とスクロールの復元を既存の検索ownerに揃え、再IPCを行わず、実親フォルダや変換キャッシュへ飛ばさない。新たな戻り先boolや検索結果の第二キャッシュは追加しない。
-- 調査・検証: ZIP / PDF / 変換書庫（元パスとキャッシュを区別）と、設定ON時の画像フォルダ本で、検索結果の採用→本openの成功採用→通常の閉じる→結果復帰までを通す回帰を追加する。Backspace・明示的なページ一覧表示、検索結果からの再open、キャンセル・失敗、同じ検索除外条件を使うCtrl+G / Ctrl+S / タグビューの兄弟経路を確認する。F12・独立viewerでは既存の所有境界とメインの選択・一覧を保つ。UI試験は事前承認と使い捨てポータブルの規則に従う。
+- 調査・検証: ZIP / PDF / 変換書庫（元パスとキャッシュを区別）と、設定ON時の画像フォルダ本で、検索結果の採用→本openの成功採用→通常の閉じる→結果復帰までを通す回帰を追加する。Backspace・明示的なページ一覧表示、検索結果からの再open、キャンセル・失敗、同じ検索除外条件を使うCtrl+G / Ctrl+S / タグビューの兄弟経路を確認する。F12・独立viewerではopen時のメインの選択・一覧を保ち、close時はHEADの帰路から悪化しないことを確認する。理想のclose時保持は下記の別項目で扱う。UI試験は事前承認と使い捨てポータブルの規則に従う。
 - 対象: `src/app.rs` の `auto_open_for_current_container` / `handle_fullscreen_close_request`、`src/app/close_return.rs`、`src/global_search_ui/everything.rs`、親移動dispatcher、関連マニュアル。[Everything検索計画 §7](everything-search-plan.md#7-openbackhistoryf12remote)、[ナビゲーション仕様](fullscreen-navigation-consistency.md)、detached経路に触る場合は[detached計画 §2](detached-rework-plan.md)を参照。対外返信は文案段階。規模 / 優先度: Small〜Medium（帰路の所有境界を調査して確定） / P2。
+
+- 修正: 採用済みEverything PhysicalChildだけを検索除外の例外とし、既存の閉じるcontinuation→`AddressBarNav::EverythingResults`→`return_from_everything_child(Results)`へ接続。保持datasetから元パスの本を選択・可視化する。新しいbool／pending／結果cache・再IPC・まれな失敗の回復処理は追加せず、detached述語／viewport経路も変更しない。
+- 兄弟経路: Ctrl+Gはdrill、Ctrl+S／タグはそれぞれnav_stackの別owner。同じ除外により通常closeではページ一覧に留まるコード経路がある。Everythingの修正では自然には直らないため、今回の範囲には含めない。
+- 初回検証（前回依頼時）: ZIP／PDF／変換書庫（元7zとcache ZIPを区別）／画像フォルダは、検索採用→open成功採用→通常closeの4件すべてで修正前REDを確認（`target/everything-close-red4.log`）。修正後の初回追加回帰は8成功／独立viewer1失敗、初回全libは15,193成功／2失敗／67 skipped（独立viewerと紙めくり）。これを受け、下記HEAD比較と続きの最終検証を実施した。環境はMSBUILDDISABLENODEREUSE=1、準備済みTurboJPEGを`target/everything-close-env.ps1`で再利用（初回CMake失敗、依存版・製品build設定は変更なし）。マニュアル・計画§7・ナビ仕様を同時更新。
+- HEAD比較（2026-10-31）: 追加テストを変更せず、srcの製品変更6ファイルだけを`f856f4f2f`へ一時復元（テスト専用exportは保持）して同じ独立viewer回帰を実行。同じmain rowsの置換で失敗（1件、exit 101）、**(A) もともとの不具合**と確定した。製品差分はfinallyでバイト単位復元・SHA-256照合済み。`target/1664-head-comparison/{manifest.json,head-detached.log,original-everything-close-return.rs}`に証跡を保持。設計担当指示により、この回帰は理想の未実装動作ではなくHEADと同じ帰路を検査する形へ変更した。最終結果は次項に記録する。
+- 最終検証（2026-10-31）: HEAD相当のclose回帰へ変更後、追加9件は全成功（`target/1664-final-regressions.log`）。複数ウィンドウ設定／F12設定の両ケースが完走し、main=Context(0)、reader=Context(1)、readerの検索inactive／accepted Metadata、close後の物理親一覧を確認した。紙めくりの同名テストは単独3回とも成功（5.57／5.71／5.66秒、`target/1664-paper-single-{1,2,3}.log`）。最終`cargo fmt`／`cargo fmt --check`／`cargo check -p mimageviewer --lib --tests --features test-script`成功（check 51.95秒、`target/1664-final-{fmt,check}.log`）。最終`test-lib-full.ps1`は750.405秒、15,195件実行・15,194成功（15 slow）・紙めくり1失敗・67 skipped、exit 100（`target/test-lib-full/runs/20261031T055543346Z-1edaa0ae/{stderr.log,junit.xml}`）。失敗は§1.447と同名で、421行・p=0.25・曲面数0／期待1も一致。単独成功／全件失敗という既存観測と整合するが原因自体は本件では未調査で、全件GREENとは扱わない。独立追補レビューACCEPT、製品コードの追加変更なし。コミット・製品起動はしない。
+- 確認用build: 関連9回帰・型check・fmt成功を根拠に、`scripts/build-dev.ps1 -PreserveRuntime`成功（normal feature set、portableなし）。core／remote service／EPUB PDF worker、FFmpeg・CRT・EffeTuneを`target/dev-runtime`へ配置し、PE検査も成功（runtime=4／pe=3、`target/1664-build-dev.log`）。起動はしていない。通常起動は`%APPDATA%\mimageviewer`の実設定・データを使い更新し得るため、利用者がinstalled／tray版を終了してから起動する。全libの紙めくり1失敗は上記のまま残す。
+
+#### 別ウィンドウで閉じたときの帰路 (もともとの不具合)
+
+- 状態: **未修正・今回のv4.10.2修正対象外**。上記HEAD比較で(A)を確認。独立viewerを閉じると、メインの検索結果が本の実親フォルダ一覧へ置換される。理想はメインの検索結果・選択・スクロールを保持すること。今回その理想を満たしたと扱わず、HEADからの非退行だけを回帰条件とする。
+- 原因・所有境界: `build_viewer_context`がmainの`CloseReturnOrigin`を独立bundleへ継承し、`transfer_terminal_close_return`が`with_viewer_context_state(id)`で閉じる側の独立contextをmountして、そこのauto-openから物理親のTerminal recipeをmainへ配送する。独立側の`global_search.active=false`／`accepted=Metadata`なので、今回の`auto_open_for_current_container`のEverything例外も`resolve_close_return_navigation`先頭のEverything分岐も発火しない。検索ownerはmainのままである。実際のFolderCandidate→loading context→scan成功採用でも同じoriginを継承する。
+- 分類: [detached計画§2](detached-rework-plan.md#2-憲法-全ステージ共通の不変条件禁止事項-️-最重要)の**BA-7（所有者と資源寿命・終了遷移の所有境界）**。別の構造的修正として、mainへの帰路を作るべきcontext／close操作を設計確認する。detached述語・viewport・registry移譲は今回変更しない。
+- 検証範囲: 複数ウィンドウ設定とF12設定の2ケースでHEADと同じ帰路を検査済み（両方成功）。実F12操作・HUDの実描画／クリック・実Everythingとの接続は未実施。
 
 ### 1.663 形式バッジをファイル名の一段上に置き、名前の表示幅を優先する — 5ch >>667 (2026-10-30)
 
@@ -341,6 +355,7 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
   (並列度を上げる・CPU 負荷を足す) を先に作る。待ちや再試行を足して隠さない。
 - 規模 / 優先度: 調査後に見積り / P3。
 - 追加の観測 (2026-10-28〜29): deps-update-1460 の全件 (421 行、p=0.25 で曲面 mesh 0) と、pageturn-1461-1457 の関連テスト群・単独 (462 行、p=0.75) でも落ちた。どちらもこのテストに触れていない変更の上で、単独の再実行では成功することもある。
+- 追加の観測 (2026-10-31、§1.664): `f856f4f2f`基点のEverything close差分の初回全libで、同じ`page_turn_mainwindow_submits_visible_vacant_leaf_both_directions`が421行・p=0.25の曲面数0／期待1で失敗。製品差分復元後の単独3回は3成功（5.57／5.71／5.66秒、`target/1664-paper-single-{1,2,3}.log`）。続く最終全lib（15,194成功／1失敗／67 skipped）でも同じ421行・p=0.25の失敗を観測（`target/test-lib-full/runs/20261031T055543346Z-1edaa0ae/stderr.log`）。既存観測と整合するが、負荷が原因と確定したものではない。描画コード・テストの期待値・待機時間は変更していない。
 
 ### 1.446 ffmpeg-sys のビルドスクリプトが、ときどきアクセス違反 (0xc0000005) で落ちる — v4.8.1・v4.8.2 のリリース作業で観測 (2026-10-26)
 

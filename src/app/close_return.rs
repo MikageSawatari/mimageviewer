@@ -303,6 +303,11 @@ impl App {
     pub(super) fn resolve_close_return_navigation(
         &self,
     ) -> Option<(crate::ui_main::AddressBarNav, Option<String>)> {
+        if self.global_search.active && self.everything_has_physical_child() {
+            // The accepted Search owner holds the logical source and full-path anchor,
+            // including converted books. Never infer this return from a cache's parent.
+            return Some((crate::ui_main::AddressBarNav::EverythingResults, None));
+        }
         if let Some(navigation) = self.collection_grid_parent_navigation() {
             return Some(navigation);
         }

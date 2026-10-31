@@ -838,7 +838,7 @@ fn zip_prefix_parent_stays_in_the_physical_child_before_returning_to_results() {
     ));
 }
 
-fn assert_return_only(app: &App) {
+pub(crate) fn assert_return_only(app: &App) {
     assert!(
         matches!(
             app.global_search.pending,
