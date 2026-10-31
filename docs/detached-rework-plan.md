@@ -1455,6 +1455,51 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-01 §1.670 独立viewer終端とmain帰路の所有分離（設計案・合意待ち）
+
+設計本文・source入口表・代案・受入条件は
+[バックログ§1.670の設計案](next-release-backlog.md#設計案2026-11-01codexによるsource調査実装前) を正本とする。
+`independent-close-1670` / `8eb8e4443` に対する文書のみの調査で、製品コード・テストコードは変更していない。
+製品起動・コミットは行っていない。
+
+**壊れた前提はBA-7**。`build_viewer_context` / `fork_mounted_context` がmainの `CloseReturnOrigin` を複製し、
+独立readerをmountした `transfer_terminal_close_return` が子のauto-openから作った物理親をmainへ配送する。
+mainを操作してよい要求の寿命と、子を閲覧/終了する寿命が同じoriginに混在している。
+Everything以外にも同型の入口がある。Ctrl+S/tagのApp-global activeによる偶然の抑止も所有契約とはしない。
+
+**推奨Bの予定範囲（未採択）**: 通常の独立build/forkへmain navigation originを渡さず、
+一般独立readerの終了をそのcontext内で完結させる。main/linkedはmainの既存帰路を維持する。
+ブックマークだけはmainの既存Opening/request ownerが契約・originを一元所有し、子は要求/対象/contextを相関する
+immutable ticketと終了summaryを返す。行先はmainで決定する。
+既存continuation/要求payloadを排他的な型へ整理する方向であり、新しいdetached bool/Option、第二cache、
+待機/retry、時間窓、sourceごとの症状guardは足さない。
+
+触る予定は `src/app/close_return.rs`、registryのbuild/forkにおける帰路権限の非複製とticket値移譲、
+bookmark要求発行/完了、`app.rs` と `viewport_retirement.rs` の既存terminal入口の配送である。
+context/window identityとregistry residence・park/promote/retire方策、detached窓状態述語、
+viewport生成/登録/retirement承認、HWND/rect捕捉、placementの保存先/同期は変更しない。
+viewport closeのcallbackに接続修正が必要でも既存の終了承認順序を維持する。
+fork/park時のticket移譲に触れるため「registry無変更」とは扱わない。
+
+**「症状パッチではなく構造的修正である」とするCodexの判断根拠（レビュー用下書き）**:
+検索結果が消えた後に戻すのではなく、誤ったmain変更権を独立contextへ作るproducer境界を廃止し、
+例外的な明示bookmark帰還だけをmain要求ownerへ集約する。全入口・全terminal consumerで同じ規則を使い、
+読み取り専用open/closeでsiblingを再採用/失効しない。憲法§2の3・5を守り、geometryや窓の現在表示から
+権限を推測しない。通常reader×main一覧種別の復元組合せを消す簡素化である。
+
+最小案A（独立終了でmainへ一切作用しない）も先に検討したが、既存bookmark refreshとmedia移動後の実folder帰還を
+削るため、そのままの採用は推奨しない。Bでも通常folder等からの独立closeでmainが物理親へ移る現挙動はなくなる。
+その使い方への依存は未確認なので、実装前に利用者へ変更と代案C（通常folderだけmain所有の明示帰還を残す、規模中〜大）を提示する。
+詳細は正本の「通常の使い方が変わる点」を参照。
+
+受入条件は通常/linked帰路維持、全入口のmain一覧/選択/scroll不変、同PDFを読むsiblingの世代・ticket・queue・cancel不変、
+bookmark要求相関と一回消費、loading/park/close/cancel/error/Remote/AppExitの終端である。
+憲法§2の8に従い既存試験は弱めず、既知不具合を期待するEverything試験の変更だけを採択時の指示書へ列挙する。
+
+**合意状況**: Codexは上記Bを構造的修正案として提示した。ClaudeCodeの同主張への合意、
+利用者の挙動変更の採択、独立設計レビューは未了。本記録は双方合意や実装許可・完了を意味しない。
+今回の試験結果はバックログ正本に記録し、実装前合意後に実変更範囲と検証証拠を追記する。
+
 ### §1.473 合成一覧の親・typed帰路（2026-10-30、実装済み・実機未確認）
 
 承認設計 `cae94fb27`（[調査・設計記録](history-parent-1473-investigation.md)）に対し、
