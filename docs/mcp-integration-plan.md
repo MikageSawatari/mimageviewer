@@ -581,7 +581,7 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
 確認された前提: Remote の通常データ要求は操作権必須、指定した reader は worker から使える、
 純粋な読み取りを全 Remote phase で受けても cache 整合を壊さない、data dir はプロセス内で固定。
 
-## 14. 段階 0 の実装記録 (2026-10-30、round 5 修正、基点 `64bba7220`)
+## 14. 段階 0 の実装記録 (2026-10-31、round 6 修正、基点 `f325b33a2`)
 
 作業先は `G:\home\mimageviewer-mcp` / `mcp-trial`。製品 core・launcher・インストール版は起動せず、
 通常の APPDATA をテストに使わない。MCP adapter だけは、設計担当の明示判断に従い使い捨て fixture
@@ -951,7 +951,8 @@ idle reader shutdown、実 core handler を使う fixture への stdio adapter �
   legacy も [2025-11-25 cancellation](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/cancellation)
   の取消後は応答しない指針に従う。initialize は取消対象にしない。
 - 重複 request ID は Active と最大32件の待機列を同じ lock 内で調べ、FIFO 内の型付き rejection とする。
-  同じ ID の要求を二度 core へ送らない。shutdown は FIFO を Closed にして待機要求を破棄し、
+  通常受付での重複を拒否する。stdout 待ちの窓の扱いは round 6 記録を参照。
+  shutdown は FIFO を Closed にして待機要求を破棄し、
   空きを待つ stdin owner も起こす。EOF は従来どおり child の終了を担当する。
 
 状態を減らす検討: 同じ adapter から複数の core request を並行実行せず、一つの FIFO と既存 Active に
@@ -962,7 +963,7 @@ idle reader shutdown、実 core handler を使う fixture への stdio adapter �
 close→Active cancel→InputError event に揃えて修正した。これらは EOF hook を呼ばない。
 最終 source review で追加の P1/P2 はなし。
 
-### Round 5 の sandbox 内検証 (実装担当実行、未コミット差分)
+### Round 5 の sandbox 内検証 (実装担当実行、のちに `f325b33a2` として commit)
 
 | コマンド | 実 exit code / 結果 | ログ |
 |---|---|---|
@@ -1005,3 +1006,62 @@ cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_lev
 
 前者は IPC 6件 + MCP 36件、後者は core 19件を通常ユーザーの full-trust context で実行する。
 新 FIFO の回帰と、実 core handler を使う使い捨て fixture への stdio adapter 接続を含む。
+
+### Round 6 の追加レビューと判断 (実装レビュー担当、thread `01a18ce7`)
+
+以下は実装 reviewer (gpt-6.1-sol / xhigh、thread `01a18ce7`) が round 5 を確認し、
+ClaudeCode が round 6 の依頼で伝達した指摘と設計担当の判断。
+
+1. **[P2] ping が長い tool の後ろで待つ**: 受理して修正する。core 要求の直列化へ ping まで含めたため、
+   legacy の疎通確認が tool 完了まで返らなくなっていた。
+2. **[P3] stdout 待ち中の重複 ID の窓**: **既定の割り切り方針による**。
+   client が in-flight の ID を再利用して JSON-RPC の規則に違反する必要があり、通常の利用では起きない。
+   追加の ID registry や待機・復旧の機構は作らない。既存の通常受付での重複検査は維持する。
+
+### Round 6 の修正
+
+- ping を local control request として core FIFO から分離する。同じ深さ32の入力 queue 内で ping を
+  先に取り出せるようにし、tool が Active の間も既存の protocol handler へ渡す。
+  core request 同士の順序、queue→Active の lock 境界、取消・backpressure の所有は変えない。
+- 対応する legacy 2版は空の result を即座に返す。版・params・request ID の検証は既存 handler に集約し、
+  modern に未対応の ping を追加しない。既存の modern Method not found と版検証も維持する。
+- held search と待機 collection の後から ping を送り、search を解放する前に legacy の空 result が
+  返ることを検査する。解放後は search→collection の順で応答し、core query の最大同時実行数は1件。
+  modern でも保留 tool 中に未対応 ping の error を返すことを確認する。
+
+状態を減らす検討: 新しい control thread や core worker、別の無制限 queue は作らず、
+既存の bounded input と一つの protocol handler を使う。両 queue 飽和の既決判断も変更しない。
+
+今回の限定差分は独立 reviewer (gpt-6.1-sol / xhigh、read-only) でも確認し、追加 P1/P2 はなし。
+上記 thread `01a18ce7` による round 5 の指摘記録とは区別する。
+
+### Round 6 の sandbox 内検証 (実装担当実行、未コミット差分)
+
+| コマンド | 実 exit code / 結果 | ログ |
+|---|---|---|
+| `cargo test -p mimageviewer-mcp --lib tests::ping_bypasses_held_tool_without_reordering_core_requests -- --exact` | 0。1/1成功 (3版を検査) | `target/mcp-r6-ping-test.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | `target/mcp-r6-core-check.log` |
+| `cargo check -p mimageviewer-mcp --bin mimageviewer-mcp` | 0 | `target/mcp-r6-mcp-check.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 101。IPC 6成功、MCP 35成功/2失敗、ignored 0 | `target/mcp-r6-crates.log` |
+| 上記の core 焦点 nextest | 100。19実行、17成功/2失敗 | `target/mcp-r6-focused.log` |
+| `cargo build -p mimageviewer-mcp --bin mimageviewer-mcp` | 0。`target/debug/mimageviewer-mcp.exe` 更新 | `target/mcp-r6-adapter-build.log` |
+| `cargo fmt` → `cargo fmt --check` | 各0。全 workspace | `target/mcp-r6-fmt-check.log` / tool 実行記録 |
+| `python scripts/check_ui_glyphs.py` / `git diff --check` | 各0 | tool 実行記録 |
+
+crate tests と焦点 nextest の失敗は round 5 と同じ実 pipe 4件で、いずれも既知の restricted-token
+環境の OS 5。stdio exe 結合検査は fixture pipe 作成時に拒否され、adapter 起動まで到達していない。
+ping 回帰と既存の初期化中 ping・版検証、FIFO・取消・背圧は成功した。
+skip/ignore や DACL 緩和、重複 ID の追加追跡機構は入れていない。
+製品 core/launcher の起動、通常 APPDATA 使用、snapshot 更新、test-full、commit は行っていない。
+製品 core は今回変更しておらず `build-dev.ps1` は未実施。console adapter は build 済み。
+
+### Round 6 の sandbox 外再検証コマンド (ClaudeCode 担当)
+
+```powershell
+Set-Location G:\home\mimageviewer-mcp
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_level/) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(=remote_ipc::pipe::tests::remote_pipe_dacl_has_one_current_user_ace)'
+```
+
+前者は IPC 6件 + MCP 37件、後者は core 19件。今回の ping 回帰と、実 core handler を使う
+使い捨て fixture への stdio adapter 接続を通常ユーザーの full-trust context で確認する。

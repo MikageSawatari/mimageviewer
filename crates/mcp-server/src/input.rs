@@ -81,13 +81,19 @@ impl InputQueue {
         dispatch: impl FnOnce(InputLine) -> T,
     ) -> Option<T> {
         let mut state = self.state.lock().unwrap();
-        if owner.lock().unwrap().is_some() {
-            return None;
-        }
         let State::Open(lines) = &mut *state else {
             return None;
         };
-        let line = lines.pop_front()?;
+        let line = if owner.lock().unwrap().is_some() {
+            // Ping is local control: keep core requests in FIFO order while
+            // letting the normal protocol handler answer/validate ping now.
+            let ping = lines.iter().position(
+                |line| matches!(line, InputLine::Request { method, .. } if method == "ping"),
+            )?;
+            lines.remove(ping)?
+        } else {
+            lines.pop_front()?
+        };
         let result = dispatch(line);
         self.space.notify_one();
         Some(result)

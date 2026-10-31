@@ -1019,6 +1019,49 @@ fn pipelined_list_and_calls_complete_successfully_in_fifo_for_all_versions() {
     }
 }
 #[test]
+fn ping_bypasses_held_tool_without_reordering_core_requests() {
+    for version in VERSIONS {
+        let (backend, calls, release) = serial_fixture(HoldRequest::Search);
+        let (mut h, reads) = tracked_runtime(backend.clone());
+        h.raw(pipeline_burst(version));
+        reads.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            calls.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Command::SearchItems { .. }
+        ));
+        if version != MODERN {
+            assert_eq!(h.receive()["id"], 0);
+        }
+        assert_eq!(h.receive()["id"], 10);
+
+        // Collection id=12 is already waiting behind held search id=11.
+        h.send(version_request(version, 20, "ping", json!({})));
+        let ping = h.receive();
+        assert_eq!(ping["id"], 20);
+        if version == MODERN {
+            // The stateless version has no ping; preserve method validation.
+            assert_eq!(ping["error"]["code"], -32601);
+        } else {
+            assert_eq!(ping["result"], json!({}));
+        }
+        assert_eq!(backend.running.load(Ordering::Acquire), 1);
+        assert!(
+            calls.try_recv().is_err(),
+            "queued core request must still wait"
+        );
+        release.send(()).unwrap();
+        assert_eq!(h.receive()["id"], 11);
+        assert_eq!(h.receive()["id"], 12);
+        assert!(matches!(
+            calls.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Command::ListCollections { .. }
+        ));
+        assert_eq!(backend.maximum.load(Ordering::Acquire), 1);
+        h.close();
+    }
+}
+
+#[test]
 fn modern_pipeline_holds_first_list_until_release_and_dispatches_one_backend_call() {
     let (backend, calls, release) = serial_fixture(HoldRequest::Status);
     let (mut h, reads) = tracked_runtime(backend.clone());
