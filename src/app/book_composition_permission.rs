@@ -122,6 +122,13 @@ struct OpenCandidate {
     candidate: CandidatePage,
     state: OpenCandidateState,
 }
+impl Drop for OpenCandidate {
+    fn drop(&mut self) {
+        // A missing complete event followed by retirement is cancellation or
+        // supersession, not a successful presentation wait.
+        self.correlation.perf_event("checking_retired");
+    }
+}
 enum OpenCandidateState {
     Checking(mpsc::Receiver<CandidatePermissionReply>),
     Complete(CandidatePermission),
@@ -139,7 +146,9 @@ impl OpenCandidate {
     fn is_allowed(&self) -> bool {
         matches!(
             &self.state,
-            OpenCandidateState::Complete(CandidatePermission::Allowed(_))
+            OpenCandidateState::Complete(
+                CandidatePermission::Allowed(_) | CandidatePermission::AbsentArchive(_)
+            )
         )
     }
 }
@@ -166,6 +175,7 @@ enum OccurrencePermission {
 pub(crate) struct ViewerPresentationPermission {
     binding: Option<(u64, u64)>,
     sequence: u64,
+    source_lifetime: std::sync::Arc<()>,
     occurrences: HashMap<PresentationOccurrence, OccurrencePermission>,
     open: OpenPermission,
 }
@@ -174,12 +184,14 @@ impl Clone for ViewerPresentationPermission {
         Self {
             binding: None,
             sequence: self.sequence,
+            source_lifetime: std::sync::Arc::new(()),
             occurrences: self
                 .occurrences
                 .iter()
                 .filter_map(|(occurrence, state)| match state {
                     OccurrencePermission::Complete(
-                        permission @ CandidatePermission::Allowed(_),
+                        permission @ (CandidatePermission::Allowed(_)
+                        | CandidatePermission::AbsentArchive(_)),
                     ) => Some((
                         *occurrence,
                         OccurrencePermission::Complete(permission.clone()),
@@ -342,6 +354,7 @@ impl ViewerPresentationPermission {
             .binding
             .is_some_and(|binding| binding != (context, generation))
         {
+            self.source_lifetime = std::sync::Arc::new(());
             self.occurrences.clear();
             self.open = OpenPermission::Idle;
         }
@@ -385,9 +398,9 @@ impl ViewerPresentationPermission {
         let mut allowed = Vec::with_capacity(demand.len());
         for occurrence in demand {
             match self.occurrences.get(occurrence) {
-                Some(OccurrencePermission::Complete(CandidatePermission::Allowed(_))) => {
-                    allowed.push(true)
-                }
+                Some(OccurrencePermission::Complete(
+                    CandidatePermission::Allowed(_) | CandidatePermission::AbsentArchive(_),
+                )) => allowed.push(true),
                 Some(OccurrencePermission::Complete(CandidatePermission::Hidden(_))) => {
                     allowed.push(false)
                 }
@@ -592,7 +605,11 @@ impl App {
                 let correlation = self
                     .book_composition_permission
                     .correlation(*occurrence, &candidate);
-                let receiver = service.check_candidate(correlation.clone(), candidate.clone());
+                let receiver = service.check_candidate_in(
+                    correlation.clone(),
+                    candidate.clone(),
+                    Some(&self.book_composition_permission.source_lifetime),
+                );
                 OccurrencePermission::Checking {
                     correlation,
                     candidate,
@@ -629,6 +646,33 @@ impl App {
     }
 
     fn book_presentation_decision(
+        &self,
+        demand: &[PresentationOccurrence],
+        missing_allowed: impl Fn(&PresentationOccurrence) -> bool,
+    ) -> PresentationDecision {
+        let decision = self.compute_book_presentation_decision(demand, missing_allowed);
+        if crate::perf::is_enabled() {
+            let kind = match &decision {
+                PresentationDecision::Checking => "presentation_checking",
+                PresentationDecision::Allowed(_) => "presentation_allowed",
+                PresentationDecision::Hidden => "presentation_hidden",
+            };
+            crate::perf::event(
+                "book_composition",
+                kind,
+                None,
+                self.input_seq,
+                &[
+                    ("context_id", self.spread_shift_context_id().serial().into()),
+                    ("items_generation", self.items_generation.into()),
+                    ("demand", format!("{demand:?}").into()),
+                ],
+            );
+        }
+        decision
+    }
+
+    fn compute_book_presentation_decision(
         &self,
         demand: &[PresentationOccurrence],
         missing_allowed: impl Fn(&PresentationOccurrence) -> bool,
@@ -903,7 +947,11 @@ impl App {
             let correlation = self
                 .book_composition_permission
                 .correlation_for(CandidateOccurrence::IdentityOnly, &candidate);
-            let receiver = service.check_candidate(correlation.clone(), candidate.clone());
+            let receiver = service.check_candidate_in(
+                correlation.clone(),
+                candidate.clone(),
+                Some(&self.book_composition_permission.source_lifetime),
+            );
             OpenPermission::IdentityChecking {
                 operation_id,
                 correlation,
@@ -932,7 +980,11 @@ impl App {
                     };
                     return result;
                 }
-                let receiver = service.check_candidate(correlation.clone(), candidate.clone());
+                let receiver = service.check_candidate_in(
+                    correlation.clone(),
+                    candidate.clone(),
+                    Some(&self.book_composition_permission.source_lifetime),
+                );
                 OpenPermission::IdentityChecking {
                     operation_id,
                     correlation,
@@ -967,12 +1019,14 @@ impl App {
                 return BookIdentityPermission::Checking;
             }
             Err(mpsc::TryRecvError::Disconnected) => CandidatePermissionReply {
+                trace: CompositionTrace::default(),
                 correlation: correlation.clone(),
                 status: Err(CandidatePermissionError::Unavailable(
                     "composition identity worker stopped".into(),
                 )),
             },
         };
+        reply.received();
         if reply.correlation != correlation {
             return BookIdentityPermission::Refused;
         }
@@ -989,7 +1043,11 @@ impl App {
                 (result, Some(permission))
             }
             Ok(_) => {
-                let receiver = service.check_candidate(correlation.clone(), candidate.clone());
+                let receiver = service.check_candidate_in(
+                    correlation.clone(),
+                    candidate.clone(),
+                    Some(&self.book_composition_permission.source_lifetime),
+                );
                 self.book_composition_permission.open = OpenPermission::IdentityChecking {
                     operation_id,
                     correlation,
@@ -1141,6 +1199,7 @@ impl App {
                     continue;
                 }
             };
+            reply.received();
             if reply.correlation != *correlation {
                 continue;
             }
@@ -1149,7 +1208,11 @@ impl App {
                     *state = OccurrencePermission::Complete(permission)
                 }
                 Ok(_) => {
-                    *receiver = service.check_candidate(correlation.clone(), candidate.clone())
+                    *receiver = service.check_candidate_in(
+                        correlation.clone(),
+                        candidate.clone(),
+                        Some(&self.book_composition_permission.source_lifetime),
+                    )
                 }
                 Err(CandidatePermissionError::UnsupportedSource(error)) => {
                     errors.push(CandidatePermissionError::UnsupportedSource(error));
@@ -1391,6 +1454,57 @@ impl App {
         use crate::book_resume_db::{PageIdentity, ReadingPosition};
         let service = self.book_composition_service.as_ref()?;
         let snapshot = service.current_candidate_snapshot()?;
+        // Book rows must still prove their accepted manifest, source and scope
+        // token below. Only unprojected result/ordinary lists use family absence
+        // directly; absence does not prove adoption of an in-flight Book reload.
+        let automatic_rows = matches!(self.book_composition, ViewerBookComposition::Automatic)
+            && !matches!(
+                self.projection_recipe,
+                super::book_materialization::ProjectionRecipe::Book(_)
+            );
+        let existing_decision = demand.iter().any(|occurrence| {
+            matches!(
+                self.book_composition_permission.occurrences.get(occurrence),
+                Some(
+                    OccurrencePermission::Checking { .. }
+                        | OccurrencePermission::Blocked
+                        | OccurrencePermission::Complete(
+                            CandidatePermission::Hidden(_) | CandidatePermission::Checking
+                        )
+                )
+            )
+        });
+        if automatic_rows
+            && !existing_decision
+            && intent.context_id == self.spread_shift_context_id().serial()
+            && intent.items_generation == self.items_generation
+        {
+            let qualified = demand
+                .iter()
+                .map(|occurrence| {
+                    let candidate = self.presentation_candidate(occurrence.item_index)?;
+                    let permission = permission_without_composition(&snapshot, &candidate)?;
+                    Some((*occurrence, candidate, permission))
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(qualified) = qualified.filter(|entries| !entries.is_empty()) {
+                return Some(
+                    qualified
+                        .into_iter()
+                        .map(|(occurrence, candidate, permission)| {
+                            let correlation = self
+                                .book_composition_permission
+                                .correlation(occurrence, &candidate);
+                            OpenCandidate {
+                                correlation,
+                                candidate,
+                                state: OpenCandidateState::Complete(permission),
+                            }
+                        })
+                        .collect(),
+                );
+            }
+        }
         let ViewerBookComposition::Accepted {
             scope,
             token,
@@ -1540,7 +1654,12 @@ impl App {
             let correlation = self
                 .book_composition_permission
                 .correlation(occurrence, &candidate);
-            let receiver = service.check_candidate(correlation.clone(), candidate.clone());
+            correlation.perf_event("checking_begin");
+            let receiver = service.check_candidate_in(
+                correlation.clone(),
+                candidate.clone(),
+                Some(&self.book_composition_permission.source_lifetime),
+            );
             candidates.push(OpenCandidate {
                 correlation,
                 candidate,
@@ -1740,9 +1859,10 @@ impl App {
             match &candidate.state {
                 OpenCandidateState::Complete(_) if candidate.is_current(&snapshot) => continue,
                 OpenCandidateState::Complete(_) => {
-                    candidate.state = OpenCandidateState::Checking(service.check_candidate(
+                    candidate.state = OpenCandidateState::Checking(service.check_candidate_in(
                         candidate.correlation.clone(),
                         candidate.candidate.clone(),
+                        Some(&self.book_composition_permission.source_lifetime),
                     ));
                     complete = false;
                     continue;
@@ -1767,15 +1887,17 @@ impl App {
                     return;
                 }
             };
+            reply.received();
             if reply.correlation != candidate.correlation {
                 return;
             }
             let permission = match reply.status {
                 Ok(permission) if permission.is_current(&snapshot) => permission,
                 Ok(_) => {
-                    candidate.state = OpenCandidateState::Checking(service.check_candidate(
+                    candidate.state = OpenCandidateState::Checking(service.check_candidate_in(
                         candidate.correlation.clone(),
                         candidate.candidate.clone(),
+                        Some(&self.book_composition_permission.source_lifetime),
                     ));
                     complete = false;
                     continue;
@@ -1815,6 +1937,9 @@ impl App {
             && self.composed_book_layout().is_none()
         {
             return;
+        }
+        for candidate in &candidates {
+            candidate.correlation.perf_event("checking_complete");
         }
         let target_allowed = candidates.iter().any(|candidate| {
             candidate.occurrence().item_index == intent.idx
