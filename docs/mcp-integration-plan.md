@@ -1593,25 +1593,61 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 
 ### 15.8 配布の仕組み (1e)
 
-§7 段階 1 の「配布」の契約に、配布形態ごとの登録先を加える (独立レビュー P2-9)。
+§7 段階 1 の「配布」の契約に、配布形態ごとの登録先を加える (独立レビュー P2-9)。2026-11-01 にコードを確かめて詳細化した。
 
 | 配布形態 | AI アプリに登録する command | 理由 |
 |---|---|---|
 | インストーラ版・単体 exe 版 | `mimageviewer.exe --mcp --data-dir <解決済みの data dir>` (launcher。1d で `--data-dir` を常に付けると決めた) | runtime フォルダが版ごとに変わるので、利用者が置いた launcher を指す |
 | ポータブル版 (zip) | 同梱の `mimageviewer-mcp.exe` を直接、解決済みの `--data-dir` を必ず付ける | ポータブル版の `mimageviewer.exe` は core を改名したもので launcher ではない |
 
-コード上の差し込み位置 (2026-10-31 確認):
+MCP の exe は console subsystem・CRT 静的リンク (DLL 不要)・引数は無しか `--data-dir <path>` だけ・標準入力の EOF で終わる。
 
-- launcher: `#![windows_subsystem = "windows"]` のまま。`--mcp` は既存 core の activate 判定
-  (`try_activate_existing`) より前で分岐する。内包対象の表 (`ASSETS`) と `build.rs` の
-  `target/release/*.exe` 読み込みに `mimageviewer-mcp.exe` を足す。
-- `scripts/build-release.ps1`: core → remote → EPUB worker → **MCP** → launcher。内側の exe の署名一覧と、
-  release 側の PE 検査一覧に MCP を足す。
-- `scripts/build-dist.ps1`: PE 一覧と、配布前の clean 対象に足す。
-- `scripts/build-portable.ps1`: portable 用 target での MCP のビルド、同梱一覧、署名一覧に足す。
-- `test-full.ps1` の前提 (CLAUDE.md の「`target\release` に 3 本」) が 4 本になる。CLAUDE.md・
-  development-build-and-test の記述も同時に直す。
-- 1e までは配布物に入れて作れるところまでで、公開しない (U10)。
+**launcher の `--mcp`** (`crates/launcher/src/main.rs`):
+
+- `#![windows_subsystem = "windows"]` のまま。引数の先頭が `--mcp` の時だけ、`--version`・`--help` の判定と、既存の core の activate
+  (`try_activate_existing`) より**前**で分岐する。`--mcp` の後ろの引数はそのまま MCP の exe に渡す (検証は MCP の exe が行う)。
+- runtime フォルダ (`%APPDATA%\mimageviewer\runtime\<版>`) の決め方・共有の利用 lease (`IN_USE`)・展開の lock は通常の起動と
+  同じものを使う。展開するのは **MCP の exe だけ** (core・EffeTune は要らない。起動を速くし、MCP の起動で他の asset を書かない)。
+  MCP の exe は小さいので、起動のたびに内容の hash を確かめる一覧 (`requires_content_hash_on_launch`) に入れる。
+- 起動: `Stdio::inherit()` で標準入出力・標準エラーを引き継ぎ、`CREATE_NO_WINDOW` を付ける (GUI の親から console の子を起動すると
+  新しい console の窓が出るため)。展開の lock は起動の直後に離し、**利用 lease は子が終わるまで持つ** (使用中の版の runtime を
+  古い版の掃除が消さない。掃除は動いている process の image がある木も残す既存の守りもある)。`Handoff` (core の起動完了の合図) は
+  使わない。
+- 子の終了コードをそのまま launcher の終了コードにする。`--mcp` の経路の失敗 (展開・起動の失敗) は**標準エラーに 1 行**出して
+  終了コード 1。通常の起動の失敗で出す MessageBox と `AttachConsole` は使わない (AI アプリの裏で窓を出さない)。
+- `crates/launcher/build.rs` の入力 (`target/release/*.exe`) と `ASSETS`・`include_bytes!` に MCP の exe を足す。入力が無い時の案内に
+  build の command を足す。
+
+**ビルド・配布のスクリプト**:
+
+| スクリプト | 変更 |
+|---|---|
+| `build-release.ps1` / `.sh` | 順序を core → remote → EPUB worker → **MCP** → launcher にする。内側の exe の署名の一覧・release の PE 検査の一覧・止める process の名前の一覧に MCP を足す |
+| `build-dist.ps1` | 配布前の clean (`target`・`target-portable` の両方) と最後の PE 検査の一覧に足す。**動いている process で build を拒む一覧には足さない** (AI アプリが登録した MCP は普段から動いているので、dist build を拒み続けることになる) |
+| `build-portable.ps1` | portable の target での MCP のビルド、同梱の一覧 (`mimageviewer-mcp.exe` の名前のまま)、署名の一覧、止める一覧に足す |
+| `build-dev.ps1` | `target\dev-runtime\` に MCP の exe も作る (1d の「登録する」が core の横の MCP の exe を使うため)。止める一覧・PE 検査に足す |
+| 安全性のテスト (`test-release-build-safety.ps1`・`test-build-dev-safety.ps1`) | 件数・順序の検査を 4 本に直し、MCP の検査を足す |
+
+- **止める process は既存の「名前 + build が書く path の下」の絞り込みに乗せる**。AI アプリが**インストール版の runtime から**起動した
+  MCP の exe (path が build の出力の外) は止めない。path を取れない process を止める既存の扱いが、普通の権限で動く AI アプリ由来の
+  MCP に及ばないことを確かめる。
+- インストーラ (`installer/mimageviewer.iss`) は launcher だけを入れているので中身は変えず、内包する exe を列挙したコメントを直す。
+  `installer/readme.txt`・`installer/readme_portable.txt` のファイル一覧に MCP の exe を足す。
+- `test-full.ps1` の前提 (`target\release` の exe) が 3 本から 4 本になる。CLAUDE.md・`development-build-and-test.md`・
+  `native-dependencies.md`・`release-checklist.md`・`release-operations.md`・`portable-build-plan.md` の該当の記述 (ビルドの順序・
+  前提の本数・署名の一覧・内包の木) を同時に直す。
+- MSIX・winget の manifest は無く、CI は release の exe を作らない (変更不要)。Store はインストーラの提出なので変更不要。
+- 1e までは配布物に入れて作れるところまでで、公開しない (U10)。公開文書 (§6) は段階 2 で直す。
+
+**確かめ方** (エージェントは製品の exe と `%APPDATA%\mimageviewer\runtime\*` を起動しない規則):
+
+- launcher の `--mcp` の分岐 (引数の受け渡し・lease を子の終了まで持つ・終了コード・失敗を標準エラーへ・MessageBox を出さない) を、
+  runtime フォルダと子の起動を注入できる形にして単体テストする。
+- 配布物の全体は、利用者のデータに触れない形で 1 回だけ確かめる: `build-release.ps1` で作った launcher を、`APPDATA` を一時フォルダに
+  向けた環境で `--mcp --data-dir <隔離の data>` で起動し (core は起動しない。runtime の展開先も一時フォルダの下になる)、
+  `scripts/mcp-client-smoke.ps1` 相当で Codex CLI から tool を呼ぶ。隔離した data dir の起動は許されている (利用者の設定・
+  runtime に触れない) という判断で行い、この判断も独立レビューで確かめる。
+- portable は `prepare-portable-smoke.ps1` で作り直し、同梱の `mimageviewer-mcp.exe` を `mcp_client_smoke.py --exe` で指して確かめる。
 
 ### 15.9 段階 0 の残り (1a で直す)
 
