@@ -213,6 +213,242 @@ fn image_folder_normal_close_returns_results() {
     close_returns_results(Book::Folder);
 }
 
+fn extension_named_directory_close(image_folder_book: bool) {
+    for name in ["photos.zip", "photos.pdf"] {
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = image_folder_book;
+        let root = app.tmp.path().to_path_buf();
+        app.current_folder = Some(root.clone());
+        let (folder, _) = fixture(&mut app, &root, Book::Folder);
+        let path = root.join(name);
+        std::fs::rename(folder.drag_source_path().unwrap(), &path).unwrap();
+        let row = GridItem::Folder(path.clone());
+        let results = dataset(vec![row.clone()]);
+        adopt(&mut app, &ctx, "photos", results);
+        open(&mut app, &ctx, &row, image_folder_book);
+        if !image_folder_book {
+            assert_eq!(app.fullscreen_idx, None);
+            app.open_fullscreen(0, HistoryTrigger::UserChosen);
+        }
+        key(&mut app, &ctx, egui::Key::Escape);
+        if let Some(nav) = app.take_pending_return_to_parent_nav() {
+            assert!(app.apply_fullscreen_close_nav_immediate(nav));
+        }
+        if image_folder_book {
+            finish_results_return(&mut app, &ctx);
+            assert_eq!(app.items[app.selected.unwrap()], row);
+            assert!(app.grid_scroll.reveal_requested());
+        } else {
+            assert!(
+                app.global_search.pending.is_none(),
+                "ordinary directory: {name}"
+            );
+            assert!(app.everything_has_physical_child());
+            assert_eq!(app.current_folder.as_ref(), Some(&path));
+            assert!(app.items_are_image_only_folder_pages());
+        }
+        assert_eq!(app.fullscreen_idx, None);
+    }
+}
+
+#[test]
+fn extension_named_ordinary_directory_close_keeps_its_list() {
+    extension_named_directory_close(false);
+}
+
+#[test]
+fn extension_named_image_folder_book_close_returns_results() {
+    extension_named_directory_close(true);
+}
+
+#[test]
+fn close_return_requires_the_accepted_book_and_logical_source() {
+    use crate::app::book_materialization::{BookScope, ProjectionRecipe};
+    for book in [Book::Zip, Book::Pdf, Book::Converted, Book::Folder] {
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        let root = app.tmp.path().to_path_buf();
+        app.current_folder = Some(root.clone());
+        let (row, _) = fixture(&mut app, &root, book);
+        adopt(&mut app, &ctx, "book", dataset(vec![row.clone()]));
+        open(&mut app, &ctx, &row, true);
+        let recipe = app.projection_recipe.clone();
+        let folder = app.current_folder.clone();
+        let logical_override = app.archive_source_override.clone();
+        assert!(app.everything_book_close_return_available());
+        app.projection_recipe = ProjectionRecipe::OrdinaryList;
+        assert!(!app.auto_open_for_current_container());
+        assert!(!matches!(
+            app.resolve_close_return_navigation(),
+            Some((crate::ui_main::AddressBarNav::EverythingResults, _))
+        ));
+        app.projection_recipe = ProjectionRecipe::Book(BookScope::ImageFolder(root.join("other")));
+        assert!(!app.everything_book_close_return_available());
+        app.projection_recipe = recipe;
+        // Current physical descendants and a conversion cache are not the accepted source.
+        app.archive_source_override = None;
+        app.current_folder = Some(row.drag_source_path().unwrap().join("nested.zip"));
+        assert!(!app.auto_open_for_current_container());
+        app.current_folder = folder;
+        if matches!(book, Book::Converted) {
+            assert!(!app.everything_book_close_return_available());
+        }
+        app.archive_source_override = logical_override;
+        assert!(app.everything_book_close_return_available());
+        if let ProjectionRecipe::Book(BookScope::Archive { prefix, .. }) =
+            &mut app.projection_recipe
+        {
+            prefix.push("inside".into());
+            assert!(
+                app.everything_book_close_return_available(),
+                "same archive, internal prefix"
+            );
+        }
+    }
+}
+
+fn finish_results_return(app: &mut App, ctx: &egui::Context) {
+    assert_everything_return_only_for_test(app);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while app.everything_has_physical_child() {
+        app.poll_search_page_edit_prepare(ctx);
+        assert!(Instant::now() < deadline, "results return did not adopt");
+        std::thread::yield_now();
+    }
+}
+
+// The detached viewport uses this same key/navigation pair. Unlike key(), this
+// helper does not overwrite the presentation selected by the real F12 handler.
+fn viewer_key(app: &mut App, ctx: &egui::Context, key: egui::Key) {
+    let viewport_id = app.fullscreen_viewport_id();
+    ctx.begin_pass(egui::RawInput {
+        viewport_id,
+        viewports: [
+            (egui::ViewportId::ROOT, egui::ViewportInfo::default()),
+            (
+                viewport_id,
+                egui::ViewportInfo {
+                    parent: Some(egui::ViewportId::ROOT),
+                    ..Default::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        events: vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        ..Default::default()
+    });
+    let idx = app.fullscreen_idx.expect("open viewer");
+    let action = app.handle_fs_key_input(ctx, idx, false);
+    if key == egui::Key::Escape {
+        assert!(action.close, "viewer Escape must request normal close");
+    }
+    app.handle_fs_navigation(
+        ctx,
+        action.close,
+        action.close_to_page_list,
+        action.ctrl_nav,
+        action.sibling_nav,
+        action.mouse_nav,
+        action.page_nav,
+        action.jump_to,
+        idx,
+    );
+    ctx.end_pass().drop_without_applying_deltas();
+}
+
+#[cfg(windows)]
+#[test]
+fn real_f12_linked_viewer_close_returns_results_in_main_context() {
+    for book in [Book::Zip, Book::Pdf, Book::Converted, Book::Folder] {
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.detached_viewer_enabled = false;
+        let root = app.tmp.path().to_path_buf();
+        app.current_folder = Some(root.clone());
+        let (row, _) = fixture(&mut app, &root, book);
+        adopt(
+            &mut app,
+            &ctx,
+            "book",
+            dataset(vec![row.clone(), GridItem::Image(root.join("other.png"))]),
+        );
+        let results = app.items.clone();
+        open(&mut app, &ctx, &row, true);
+        key(&mut app, &ctx, egui::Key::F12);
+        assert!(app.settings.detached_viewer_enabled);
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(!app.detached_viewer_independent_active);
+        let session = app.active_detached_session.expect("F12 session");
+        assert_eq!(
+            app.locate_window_context(session.window_id),
+            Some((app.viewer_context_main(), ContextResidence::Mounted))
+        );
+        // Emulate the existing render-completion notification without a native window.
+        let viewport_id = app.fullscreen_viewport_id();
+        ctx.begin_pass(egui::RawInput {
+            viewport_id,
+            viewports: [
+                (egui::ViewportId::ROOT, egui::ViewportInfo::default()),
+                (
+                    viewport_id,
+                    egui::ViewportInfo {
+                        parent: Some(egui::ViewportId::ROOT),
+                        ..Default::default()
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+        app.mark_active_detached_viewport_rendered(&ctx);
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        ctx.end_pass().drop_without_applying_deltas();
+        let main = app.viewer_context_main();
+        app.with_active_viewer_context(|viewer| {
+            assert_eq!(viewer.projected_viewer_context_id(), main);
+            assert!(viewer.global_search.active);
+            assert!(viewer.everything_has_physical_child());
+            viewer_key(viewer, &ctx, egui::Key::Escape);
+        })
+        .expect("linked viewer");
+        let nav = app
+            .take_pending_return_to_parent_nav()
+            .expect("linked close return");
+        assert!(app.apply_fullscreen_close_nav_immediate(nav));
+        finish_results_return(&mut app, &ctx);
+        assert_eq!(app.items, results);
+        assert_eq!(app.items[app.selected.unwrap()], row);
+        assert!(app.grid_scroll.reveal_requested());
+        assert_eq!(app.fullscreen_idx, None);
+        // Existing inactive-viewport cleanup owns the actual session/window retirement.
+        ctx.begin_pass(egui::RawInput::default());
+        app.keep_fullscreen_viewport_alive(&ctx);
+        ctx.end_pass().drop_without_applying_deltas();
+        assert!(app.active_detached_session.is_none());
+        assert_eq!(app.locate_window_context(session.window_id), None);
+        eprintln!(
+            "linked F12 close: book={book:?} main={main:?} session_before={session:?} session_after={:?}",
+            app.active_detached_session
+        );
+    }
+}
+
 fn key(app: &mut App, ctx: &egui::Context, key: egui::Key) {
     app.viewer_presentation = ViewerPresentation::Fullscreen;
     app.native_video_in_window_active = false;
@@ -396,6 +632,16 @@ fn detached_close_matches_head_return_in_both_window_modes() {
             assert!(!viewer.global_search.active);
             assert!(matches!(viewer.global_search.accepted, SearchAccepted::Metadata { .. }));
             assert!(!viewer.everything_has_physical_child());
+            if multi_window {
+                let enabled = viewer.settings.detached_viewer_enabled;
+                let presentation = viewer.viewer_presentation;
+                let idx = viewer.fullscreen_idx;
+                viewer_key(viewer, &ctx, egui::Key::F12);
+                assert_eq!(viewer.settings.detached_viewer_enabled, enabled);
+                assert_eq!(viewer.viewer_presentation, presentation);
+                assert_eq!(viewer.fullscreen_idx, idx);
+                assert_ne!(viewer.projected_viewer_context_id(), main_context);
+            }
             assert!(viewer.auto_open_for_current_container());
             assert!(matches!(viewer.resolve_close_return_navigation(),
                 Some((crate::ui_main::AddressBarNav::Direct(ref parent, _), _)) if parent == &root));

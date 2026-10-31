@@ -1,4 +1,4 @@
-﻿# 次リリース検討バックログ
+# 次リリース検討バックログ
 
 このファイルは、**いま着手できる**作業候補だけを置く恒久バックログ。
 完了した項目はコミット履歴・リリースノート・個別設計メモに任せ、このファイルからは削除する。
@@ -65,7 +65,7 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 - 状態: **実装済み・実機未確認（2026-10-31、v4.10.2予定）**。[>>671](https://egg.5ch.io/test/read.cgi/software/1782419551/671) は、本の表示モードを「開いたとき、ページを表示」にすると、Everything検索結果からは設定どおりページを開くが、本を閉じると検索結果ではなくページ一覧になるという報告。閉じる入力とビューワモードは報告に記載なし。メインで開く場合を今回の修正対象とする（HEAD比較後の設計担当指示）。製品起動・実機再現試験は未実施。
 - 原因 (v4.10.0 と現行masterのコードを確認): `auto_open_for_current_container` は `global_search.active` / `favsearch.active` / `tag_view.active` の間 false を返す。検索から実フォルダの親へ飛ぶのを防ぐ既存の除外条件がEverythingにも適用され、`handle_fullscreen_close_request` が親一覧への復帰要求を立てず、画像表示だけを閉じて現在の本のページ一覧を残す。`resolve_close_return_navigation` にもEverythingの結果復帰先は含まれていない。
-- 期待する動作: メインでEverything検索結果から本を直接ページ表示した場合、通常の閉じる（Esc・Enterの閉じる操作・HUDの×等）では元の検索結果へ戻す。Backspaceで明示的にページ一覧へ戻す操作、および「開いたとき、ページ一覧を表示」の動作は維持する。独立viewerのcloseは下の既存不具合として今回の修正対象から分離し、HEADから悪化させない。
+- 期待する動作: メインでEverything検索結果から本を直接ページ表示した場合、通常の閉じる（Esc・Enterの閉じる操作・HUDの×等）では元の検索結果へ戻す。メイン全画面からF12で切り離した窓も同じ検索ownerなので対象とする（設計担当決定）。Backspaceで明示的にページ一覧へ戻す操作、および「開いたとき、ページ一覧を表示」の動作は維持する。独立viewerのcloseは下の既存不具合として今回の修正対象から分離し、HEADから悪化させない。
 - 方針: 検索中の除外条件を外すだけの修正にはしない。既存 `SearchAccepted::Everything` の `PhysicalChild` と `EverythingReturn::Results` / `return_from_everything_child` が保持する論理的な本・戻り先・採用済みdatasetを、通常の閉じる要求から使う。検索語・取得済み結果・表示条件と並び・開いた本の選択とスクロールの復元を既存の検索ownerに揃え、再IPCを行わず、実親フォルダや変換キャッシュへ飛ばさない。新たな戻り先boolや検索結果の第二キャッシュは追加しない。
 - 調査・検証: ZIP / PDF / 変換書庫（元パスとキャッシュを区別）と、設定ON時の画像フォルダ本で、検索結果の採用→本openの成功採用→通常の閉じる→結果復帰までを通す回帰を追加する。Backspace・明示的なページ一覧表示、検索結果からの再open、キャンセル・失敗、同じ検索除外条件を使うCtrl+G / Ctrl+S / タグビューの兄弟経路を確認する。F12・独立viewerではopen時のメインの選択・一覧を保ち、close時はHEADの帰路から悪化しないことを確認する。理想のclose時保持は下記の別項目で扱う。UI試験は事前承認と使い捨てポータブルの規則に従う。
 - 対象: `src/app.rs` の `auto_open_for_current_container` / `handle_fullscreen_close_request`、`src/app/close_return.rs`、`src/global_search_ui/everything.rs`、親移動dispatcher、関連マニュアル。[Everything検索計画 §7](everything-search-plan.md#7-openbackhistoryf12remote)、[ナビゲーション仕様](fullscreen-navigation-consistency.md)、detached経路に触る場合は[detached計画 §2](detached-rework-plan.md)を参照。対外返信は文案段階。規模 / 優先度: Small〜Medium（帰路の所有境界を調査して確定） / P2。
@@ -77,12 +77,20 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 最終検証（2026-10-31）: HEAD相当のclose回帰へ変更後、追加9件は全成功（`target/1664-final-regressions.log`）。複数ウィンドウ設定／F12設定の両ケースが完走し、main=Context(0)、reader=Context(1)、readerの検索inactive／accepted Metadata、close後の物理親一覧を確認した。紙めくりの同名テストは単独3回とも成功（5.57／5.71／5.66秒、`target/1664-paper-single-{1,2,3}.log`）。最終`cargo fmt`／`cargo fmt --check`／`cargo check -p mimageviewer --lib --tests --features test-script`成功（check 51.95秒、`target/1664-final-{fmt,check}.log`）。最終`test-lib-full.ps1`は750.405秒、15,195件実行・15,194成功（15 slow）・紙めくり1失敗・67 skipped、exit 100（`target/test-lib-full/runs/20261031T055543346Z-1edaa0ae/{stderr.log,junit.xml}`）。失敗は§1.447と同名で、421行・p=0.25・曲面数0／期待1も一致。単独成功／全件失敗という既存観測と整合するが原因自体は本件では未調査で、全件GREENとは扱わない。独立追補レビューACCEPT、製品コードの追加変更なし。コミット・製品起動はしない。
 - 確認用build: 関連9回帰・型check・fmt成功を根拠に、`scripts/build-dev.ps1 -PreserveRuntime`成功（normal feature set、portableなし）。core／remote service／EPUB PDF worker、FFmpeg・CRT・EffeTuneを`target/dev-runtime`へ配置し、PE検査も成功（runtime=4／pe=3、`target/1664-build-dev.log`）。起動はしていない。通常起動は`%APPDATA%\mimageviewer`の実設定・データを使い更新し得るため、利用者がinstalled／tray版を終了してから起動する。全libの紙めくり1失敗は上記のまま残す。
 
+#### 独立レビューP2追補 (2026-10-31)
+
+- P2-1: 採用済み`PhysicalChild`だけでは本の証明にならず、`photos.zip`という実フォルダも旧拡張子判定を通っていた。追加設定OFF・検索採用→実フォルダopen→画像の手動表示→Escの回帰で修正前REDを確認（`target/1664-p2-red.log`）。帰路判定をaccepted datasetの行種別・採用済み`ProjectionRecipe`・現在の論理sourceの照合に統一し、Folderは追加設定ONかつ画像のみの場合に限定する。拡張子判定そのものの既知問題§1.418は変更しない。追加設定ONと`photos.pdf`の対照、別コンテナ・変換cache・別分類・書庫内prefixの境界も回帰に含める。
+- P2-2: 旧9件の「複数ウィンドウ設定／F12設定」回帰は両方とも独立contextを直接作っており、実F12の切り替え検証ではなかった。実F12はmain contextへlinked windowを結び付け、mainの`global_search.active`と`SearchAccepted::Everything` 内の `PhysicalChild`を読む。設計担当の決定どおり、メインと同じ検索結果へ戻す。実F12キー切替→viewer viewportのEsc→結果採用→開いた本の選択・reveal→既存viewport cleanupの回帰を追加する。独立viewerは別contextのMetadataのままであり、今回の分岐は発火しない。複数ウィンドウ設定でF12切り替えが無効な既存仕様も検査する。detached述語・viewport・registry移譲は変更せず、[detached計画§11](detached-rework-plan.md#11-リワーク外からの変更記録)へ判断を記録する。
+- 最終検証: 追加13回帰すべて成功（9.29秒、`target/1664-p2-regressions-final.log`）。実F12はZIP／PDF／変換書庫／画像フォルダでmain=Context(0)のまま検索結果・選択・revealを復元し、既存cleanup後にsession=None／window binding=Noneを確認。独立viewerの両設定と複数ウィンドウ設定中のF12無効も成功。`cargo fmt`／`cargo fmt --check`、`cargo check -p mimageviewer --lib --tests --features test-script`成功（明示exit 0、`target/1664-p2-{fmt,check-final}.log`）。独立追補レビュー（gpt-6.1-sol / xhigh）ACCEPT。
+- 最終全lib: `scripts/test-lib-full.ps1`は**15,199成功／0失敗／67 skipped、744.570秒、exit 0**（11 slow・1 leaky、`target/test-lib-full/runs/20261031T064224884Z-f1bf690d/{stderr.log,junit.xml}`）。紙めくり§1.447の同名テストも成功したため、条件付きの単独3回は実施していない。全件中に設計文書の通常closeとResultsボタンの説明を整理したため、inputs変更として成功receiptの再利用記録は作られなかった。全件開始後に`src`は変更しておらず、実行結果は上記のとおり有効。環境は`MSBUILDDISABLENODEREUSE=1`、既存の`target/everything-close-env.ps1`を使用。製品起動・実機確認・コミットは行わない。
+- 確認用build: `scripts/build-dev.ps1 -PreserveRuntime`成功（exit 0、`target/1664-p2-build-dev.log`）。通常feature set・portableなしでcore／remote service／EPUB PDF workerを作成し、runtime／PE検査も成功。製品は起動していない。利用者がinstalled／tray版を終了し、通常の実設定・データを使うことを確認してから`target/dev-runtime/mimageviewer-core.exe`を起動する。実機ではEverythingから本を直接表示→通常close、および全画面→F12→Escで結果・選択・可視位置と窓の終了を確認する。
+
 #### 別ウィンドウで閉じたときの帰路 (もともとの不具合)
 
 - 状態: **未修正・今回のv4.10.2修正対象外**。上記HEAD比較で(A)を確認。独立viewerを閉じると、メインの検索結果が本の実親フォルダ一覧へ置換される。理想はメインの検索結果・選択・スクロールを保持すること。今回その理想を満たしたと扱わず、HEADからの非退行だけを回帰条件とする。
 - 原因・所有境界: `build_viewer_context`がmainの`CloseReturnOrigin`を独立bundleへ継承し、`transfer_terminal_close_return`が`with_viewer_context_state(id)`で閉じる側の独立contextをmountして、そこのauto-openから物理親のTerminal recipeをmainへ配送する。独立側の`global_search.active=false`／`accepted=Metadata`なので、今回の`auto_open_for_current_container`のEverything例外も`resolve_close_return_navigation`先頭のEverything分岐も発火しない。検索ownerはmainのままである。実際のFolderCandidate→loading context→scan成功採用でも同じoriginを継承する。
 - 分類: [detached計画§2](detached-rework-plan.md#2-憲法-全ステージ共通の不変条件禁止事項-️-最重要)の**BA-7（所有者と資源寿命・終了遷移の所有境界）**。別の構造的修正として、mainへの帰路を作るべきcontext／close操作を設計確認する。detached述語・viewport・registry移譲は今回変更しない。
-- 検証範囲: 複数ウィンドウ設定とF12設定の2ケースでHEADと同じ帰路を検査済み（両方成功）。実F12操作・HUDの実描画／クリック・実Everythingとの接続は未実施。
+- 検証範囲: 従来回帰は複数ウィンドウ設定とF12設定の2ケースで独立contextを直接作り、HEADと同じ帰路を検査したもの。実F12でmainに結び付ける経路の検査ではなかった。今回追加の実F12キー経路はmain所有のため対象内であり、この独立viewerの既存不具合とは区別する。HUDの実描画／クリック・実Everythingとの接続・実ウィンドウの手動確認は未実施。
 
 ### 1.663 形式バッジをファイル名の一段上に置き、名前の表示幅を優先する — 5ch >>667 (2026-10-30)
 

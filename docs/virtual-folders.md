@@ -100,6 +100,7 @@ ParentはZIP内部なら通常zip navを使い、それ以外でeffective_folder
 同contextのitems/metasとthumbnail requestsは共通adoptionに従い、同pathを読むdetached兄弟の
 PDF ticket/queue/cacheを失効しない。先行PDF ownership改修 `4510346f5` / master `c1e66f589` を前提とする。
 F12は既存open/fork/park/promoteを維持し、Everything datasetを兄弟viewerの一覧ownerにしない。
+通常closeの検索帰路は、accepted行種別・本分類・現在の論理sourceが一致する本だけに適用する。画像フォルダ本は追加設定ON時のみ。メイン全画面からF12で切り離した窓は同じmain contextのため同じ検索結果へ戻る。独立contextの別ウィンドウは対象外で、既存帰路は維持する（§1.664）。
 この変更の自動gate・独立レビュー・実機確認は未完了。[台帳](everything-search-plan.md#14-実装記録2026-10-12検証待ち)。
 
 ## PDF render失効の所有（未リリース）

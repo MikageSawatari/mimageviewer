@@ -60312,15 +60312,17 @@ impl App {
     /// 「ページを直接開く」設定の退出ルーティング
     /// (Esc/Enter/右クリック→親一覧 / Backspace→ページ一覧) を使うか判定する。
     ///
-    /// 検索中は実親フォルダへ飛ばさない。Everything の採用済み PhysicalChild だけは
+    /// 検索中は実親フォルダへ飛ばさない。Everything の採用済み PhysicalChild の本だけは
     /// 既存 Search owner が検索結果への帰路を持つため、通常の閉じるからその帰路を使う。
     pub(crate) fn auto_open_for_current_container(&self) -> bool {
         if !self.settings.effective_auto_fullscreen_zip_pdf()
-            || (self.global_search.active && !self.everything_has_physical_child())
             || self.favsearch.active
             || self.tag_view.active
         {
             return false;
+        }
+        if self.global_search.active {
+            return self.everything_book_close_return_available();
         }
         let Some(current_folder) = self.current_folder.as_deref() else {
             return false;

@@ -299,11 +299,68 @@ impl App {
         }
     }
 
+    /// The accepted Search row owns the physical kind; the accepted book recipe
+    /// owns the currently viewed book. A filename extension cannot prove either.
+    pub(super) fn everything_book_close_return_available(&self) -> bool {
+        use crate::global_search_ui::{EverythingPosition, SearchAccepted};
+        use book_materialization::{BookScope, ProjectionRecipe};
+
+        if !self.global_search.active || !self.settings.effective_auto_fullscreen_zip_pdf() {
+            return false;
+        }
+        let SearchAccepted::Everything {
+            dataset,
+            position: EverythingPosition::PhysicalChild { logical_source, .. },
+            ..
+        } = &self.global_search.accepted
+        else {
+            return false;
+        };
+        if !self
+            .effective_folder()
+            .is_some_and(|current| crate::folder_tree::path_eq(&current, logical_source))
+        {
+            return false;
+        }
+        let ProjectionRecipe::Book(scope) = &self.projection_recipe else {
+            return false;
+        };
+        let root = match scope {
+            BookScope::Archive { logical_root, .. } => logical_root,
+            BookScope::Document(root)
+            | BookScope::ImageFolder(root)
+            | BookScope::CompiledFolder(root) => root,
+        };
+        if !crate::folder_tree::path_eq(root, logical_source) {
+            return false;
+        }
+        let Some(key) = crate::path_key::physical_path_spelling(logical_source) else {
+            return false;
+        };
+        let Some(row) = dataset.rows.iter().find(|row| row.physical_key == key) else {
+            return false;
+        };
+        match &row.item {
+            GridItem::ZipFile(_) | GridItem::ConvertibleArchive { .. } => {
+                matches!(scope, BookScope::Archive { .. })
+            }
+            GridItem::PdfFile(_) => matches!(scope, BookScope::Document(_)),
+            // Extension-named directories can have an Archive/Document recipe
+            // (known classification issue 1.418). Their accepted Folder kind
+            // still requires the opt-in image-folder book policy.
+            GridItem::Folder(_) => {
+                self.settings.auto_fullscreen_image_folders_enabled()
+                    && self.items_are_image_only_folder_pages()
+            }
+            _ => false,
+        }
+    }
+
     /// Resolve selection intent as a value, without loading/adopting a list.
     pub(super) fn resolve_close_return_navigation(
         &self,
     ) -> Option<(crate::ui_main::AddressBarNav, Option<String>)> {
-        if self.global_search.active && self.everything_has_physical_child() {
+        if self.everything_book_close_return_available() {
             // The accepted Search owner holds the logical source and full-path anchor,
             // including converted books. Never infer this return from a cache's parent.
             return Some((crate::ui_main::AddressBarNav::EverythingResults, None));
