@@ -16,6 +16,7 @@ pub mod render_limits;
 pub mod scene;
 pub mod spectrum;
 mod text;
+mod text_budget;
 
 #[cfg(test)]
 mod selection_tests;
@@ -72,3 +73,4 @@ pub use spectrum::{
 };
 
 pub use text::{MAX_TEXT_CACHE_BYTES, MAX_TEXT_RASTER_BYTES, TextCacheStats};
+pub use text_budget::MAX_TEXT_PREPARATION_BYTES;

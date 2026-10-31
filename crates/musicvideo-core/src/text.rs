@@ -1,4 +1,5 @@
 use crate::TextStyle;
+use crate::text_budget::{MAX_TEXT_PREPARATION_BYTES, preparation_bound};
 use comic_core::{
     AnnotationObject, FontSet, PreparedTextRaster, Rgba, TextBlock, bake_overlay, layout_text,
     prepare_text_regions, text_effect_padding,
@@ -10,8 +11,8 @@ pub const MAX_TEXT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 // A full-HD RGBA pair needs ~16 MiB; keep 24 MiB for static results.
 // Prepared multi-pass coverage is larger than the RGBA of a small text block,
 // so give it 32 MiB and preserve the original 8 MiB transient RGBA lane.
-const TRANSIENT_BYTES: usize = 40 * 1024 * 1024;
-const PREPARED_BYTES: usize = 32 * 1024 * 1024;
+const TRANSIENT_BYTES: usize = MAX_TEXT_PREPARATION_BYTES + MAX_TEXT_RASTER_BYTES;
+const PREPARED_BYTES: usize = MAX_TEXT_PREPARATION_BYTES;
 /// Maximum combined RGBA allocation per text bake (cache retention is separate).
 pub const MAX_TEXT_RASTER_BYTES: usize = 8 * 1024 * 1024;
 const TILE_EDGE: usize = 1024;
@@ -40,6 +41,34 @@ pub(crate) mod glyph_preparation_probe {
         (result, completed)
     }
 
+    thread_local! {
+        static PREPARATIONS: Cell<Option<(usize, bool)>> = const { Cell::new(None) };
+    }
+    pub(crate) fn with_preparations<R>(forbid: bool, run: impl FnOnce() -> R) -> (R, usize) {
+        struct Reset(Option<(usize, bool)>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                PREPARATIONS.with(|v| v.set(self.0));
+            }
+        }
+        let reset = Reset(PREPARATIONS.with(|v| v.replace(Some((0, forbid)))));
+        let result = run();
+        let count = PREPARATIONS.with(|v| v.take().unwrap().0);
+        drop(reset);
+        (result, count)
+    }
+    pub(super) fn record_preparation() {
+        PREPARATIONS.with(|v| {
+            if let Some((count, forbid)) = v.get() {
+                v.set(Some((count + 1, forbid)));
+                assert!(
+                    !forbid,
+                    "coverage preparation reached before budget rejection"
+                );
+            }
+        });
+    }
+
     pub(super) fn stop_after_checked_plan() -> bool {
         DRY_RUN.with(|probe| match probe.get() {
             Some(completed) => {
@@ -49,6 +78,15 @@ pub(crate) mod glyph_preparation_probe {
             None => false,
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TextPreparationError {
+    Unavailable,
+    Budget {
+        required_bytes: usize,
+        budget_bytes: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -335,6 +373,40 @@ impl TextCache {
         (bake.bytes() <= MAX_TEXT_RASTER_BYTES).then(|| self.bake(fonts, &bake, key, transient))
     }
 
+    pub(crate) fn check_preparation(
+        &self,
+        fonts: &FontSet,
+        text: &str,
+        font_key: &str,
+        size_px: f32,
+        style: &TextStyle,
+        transient: bool,
+    ) -> Result<(), TextPreparationError> {
+        let size_px = if size_px.is_finite() {
+            size_px.max(1.0)
+        } else {
+            1.0
+        };
+        let key = TextCacheKey::new(text, font_key, size_px, style);
+        if self.lookup(&key, transient).is_some() {
+            return Ok(());
+        }
+        if self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prepared
+            .get(&key)
+            .is_some()
+        {
+            return Ok(());
+        }
+        // The checked constructor rejects before coverage. Eligible sparse
+        // programs are published once here and reused by every later tile.
+        self.prepare_checked(fonts, text, font_key, size_px, style, &key)
+            .map(|_| ())
+    }
+
     fn prepare(
         &self,
         fonts: &FontSet,
@@ -344,6 +416,19 @@ impl TextCache {
         style: &TextStyle,
         key: &TextCacheKey,
     ) -> Option<Arc<TextBake>> {
+        self.prepare_checked(fonts, text, font_key, size_px, style, key)
+            .ok()
+    }
+
+    fn prepare_checked(
+        &self,
+        fonts: &FontSet,
+        text: &str,
+        font_key: &str,
+        size_px: f32,
+        style: &TextStyle,
+        key: &TextCacheKey,
+    ) -> Result<Arc<TextBake>, TextPreparationError> {
         if let Some(bake) = self
             .entries
             .lock()
@@ -351,26 +436,25 @@ impl TextCache {
             .prepared
             .get(key)
         {
-            return Some(bake);
+            return Ok(bake);
         }
         #[cfg(feature = "text-measure")]
         let start = std::time::Instant::now();
-        let bake = Arc::new(TextBake::new(fonts, text, font_key, size_px, style)?);
+        let bake = Arc::new(TextBake::try_new(fonts, text, font_key, size_px, style)?);
         #[cfg(feature = "text-measure")]
         self.preparation_ns.fetch_add(
             start.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
         if bake.painters.is_empty() {
-            return Some(bake);
+            return Ok(bake);
         }
-        Some(
-            self.entries
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .prepared
-                .publish(key.clone(), bake),
-        )
+        Ok(self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prepared
+            .publish(key.clone(), bake))
     }
 
     fn lookup(&self, key: &TextCacheKey, transient: bool) -> Option<Arc<TextBitmap>> {
@@ -530,6 +614,10 @@ impl TextCache {
         #[cfg(feature = "text-measure")]
         let start = std::time::Instant::now();
         let paint = |block: TextBlock, surface: usize| {
+            #[cfg(test)]
+            if matches!(key.area, TextRasterArea::Full) {
+                glyph_preparation_probe::record_preparation();
+            }
             let origin = (
                 prepared.origin_offset.0 as f32,
                 prepared.origin_offset.1 as f32,
@@ -587,6 +675,7 @@ struct TextBake {
     origin_offset: (usize, usize),
     painted: bool,
     painters: Vec<PreparedTextRaster>,
+    preparation_bytes: usize,
 }
 impl TextBake {
     fn with_regions(&self, fonts: &FontSet) -> Option<Self> {
@@ -597,7 +686,9 @@ impl TextBake {
         } else {
             vec![&self.glyph]
         };
-        Some(Self {
+        #[cfg(test)]
+        glyph_preparation_probe::record_preparation();
+        let result = Self {
             glyph: self.glyph.clone(),
             decoration: self.decoration.clone(),
             width: self.width,
@@ -606,13 +697,19 @@ impl TextBake {
             logical_height: self.logical_height,
             origin_offset: self.origin_offset,
             painted: self.painted,
+            preparation_bytes: self.preparation_bytes,
             painters: prepare_text_regions(
                 &layout,
                 font,
                 (self.origin_offset.0 as f32, self.origin_offset.1 as f32),
                 &blocks,
             ),
-        })
+        };
+        debug_assert!(
+            result.retained_bytes() <= result.preparation_bytes,
+            "text preparation exceeded its preflight bound"
+        );
+        Some(result)
     }
 
     fn retained_bytes(&self) -> usize {
@@ -641,6 +738,7 @@ impl TextBake {
             .and_then(|n| n.checked_mul(if self.painted { 8 } else { 4 }))
             .unwrap_or(usize::MAX)
     }
+    #[cfg(test)]
     fn new(
         fonts: &FontSet,
         text: &str,
@@ -648,7 +746,19 @@ impl TextBake {
         size_px: f32,
         style: &TextStyle,
     ) -> Option<Self> {
-        let font = fonts.get(font_key)?;
+        Self::try_new(fonts, text, font_key, size_px, style).ok()
+    }
+
+    fn try_new(
+        fonts: &FontSet,
+        text: &str,
+        font_key: &str,
+        size_px: f32,
+        style: &TextStyle,
+    ) -> Result<Self, TextPreparationError> {
+        let font = fonts
+            .get(font_key)
+            .ok_or(TextPreparationError::Unavailable)?;
         let glyph = TextBlock {
             text: text.to_owned(),
             font_key: font_key.to_owned(),
@@ -668,107 +778,143 @@ impl TextBake {
             ..glyph.clone()
         };
         let layout = layout_text(&glyph, font);
-        // Test-only preflight includes comic-core's intermediate glyph masks,
-        // which exist before the visible text tiles. Reject a mutation's huge
-        // glyph before prepare_text_regions or baking can allocate its coverage.
-        #[cfg(test)]
-        {
-            let outline = style
-                .extra_outlines
-                .iter()
-                .chain(style.outline.iter())
-                .map(|stroke| stroke.width_px.max(0.0))
-                .fold(0.0_f32, f32::max);
-            let shadow = style.shadow.map_or(0.0, |shadow| {
-                shadow.spread_px.max(0.0) + shadow.blur_px.clamp(0.0, 48.0)
+        let source_bytes = glyph
+            .text
+            .capacity()
+            .saturating_add(glyph.font_key.capacity())
+            .saturating_add(decoration.text.capacity())
+            .saturating_add(decoration.font_key.capacity())
+            .saturating_add(
+                decoration
+                    .extra_outlines
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<comic_core::StrokeStyle>()),
+            );
+        let preparation_bytes = preparation_bound(font, &layout, style)
+            .saturating_add(source_bytes.saturating_mul(2))
+            .saturating_add(TextCacheKey::new(text, font_key, size_px, style).bytes())
+            .saturating_add(std::mem::size_of::<Self>());
+        if preparation_bytes > MAX_TEXT_PREPARATION_BYTES {
+            return Err(TextPreparationError::Budget {
+                required_bytes: preparation_bytes,
+                budget_bytes: MAX_TEXT_PREPARATION_BYTES,
             });
-            let dilation = outline.max(shadow);
-            // font::dilate_coverage keeps one extra antialiasing pixel beyond
-            // ceil(dilate), while the undilated base has no padding.
-            let pad = if dilation > 0.0 {
-                (dilation.ceil() as u32).checked_add(1)?
-            } else {
-                0
-            };
-            for placement in &layout.glyphs {
-                if let Some((_, _, width, height)) =
-                    font.glyph_px_bounds_gid(placement.glyph_id, placement.size)
-                {
-                    let width = (width.ceil().max(0.0) as u32).checked_add(pad.checked_mul(2)?)?;
-                    let height =
-                        (height.ceil().max(0.0) as u32).checked_add(pad.checked_mul(2)?)?;
-                    crate::raster::frame_allocation_probe::check(width, height).ok()?;
+        }
+        // The Option closure retains legacy unsupported-coordinate handling and
+        // the test-only checked-plan stop, after the production budget gate.
+        (|| -> Option<Self> {
+            // Test-only preflight includes comic-core's intermediate glyph masks,
+            // which exist before the visible text tiles. Reject a mutation's huge
+            // glyph before prepare_text_regions or baking can allocate its coverage.
+            #[cfg(test)]
+            {
+                let outline = style
+                    .extra_outlines
+                    .iter()
+                    .chain(style.outline.iter())
+                    .map(|stroke| stroke.width_px.max(0.0))
+                    .fold(0.0_f32, f32::max);
+                let shadow = style.shadow.map_or(0.0, |shadow| {
+                    shadow.spread_px.max(0.0) + shadow.blur_px.clamp(0.0, 48.0)
+                });
+                let dilation = outline.max(shadow);
+                // font::dilate_coverage keeps one extra antialiasing pixel beyond
+                // ceil(dilate), while the undilated base has no padding.
+                let pad = if dilation > 0.0 {
+                    (dilation.ceil() as u32).checked_add(1)?
+                } else {
+                    0
+                };
+                for placement in &layout.glyphs {
+                    if let Some((_, _, width, height)) =
+                        font.glyph_px_bounds_gid(placement.glyph_id, placement.size)
+                    {
+                        let width =
+                            (width.ceil().max(0.0) as u32).checked_add(pad.checked_mul(2)?)?;
+                        let height =
+                            (height.ceil().max(0.0) as u32).checked_add(pad.checked_mul(2)?)?;
+                        crate::raster::frame_allocation_probe::check(width, height).ok()?;
+                    }
+                }
+                if glyph_preparation_probe::stop_after_checked_plan() {
+                    return None;
                 }
             }
-            if glyph_preparation_probe::stop_after_checked_plan() {
-                return None;
-            }
-        }
-        // Glyph overhang and negative spacing can extend ink beyond comic-core's
-        // advance-based logical bounds. Preserve the legacy undecorated,
-        // zero-spacing allocation exactly; styled text keeps the same logical
-        // alignment anchor but includes ink bounds in both paint surfaces.
-        // Track each side independently: a long run with negative letter gap
-        // must not enlarge the vertical allocation by its horizontal reach.
-        let mut ink_margins = [0.0_f32; 4];
-        if style.has_paint() || style.letter_gap != 0.0 || style.line_gap != 0.0 {
-            for g in &layout.glyphs {
-                if let Some((x, y, w, h)) = font.glyph_px_bounds_gid(g.glyph_id, g.size) {
-                    for (margin, reach) in ink_margins.iter_mut().zip([
-                        -(g.x + x),
-                        -(g.y + y),
-                        g.x + x + w - layout.bounds.0,
-                        g.y + y + h - layout.bounds.1,
-                    ]) {
-                        *margin = margin.max(reach);
+            // Glyph overhang and negative spacing can extend ink beyond comic-core's
+            // advance-based logical bounds. Preserve the legacy undecorated,
+            // zero-spacing allocation exactly; styled text keeps the same logical
+            // alignment anchor but includes ink bounds in both paint surfaces.
+            // Track each side independently: a long run with negative letter gap
+            // must not enlarge the vertical allocation by its horizontal reach.
+            let mut ink_margins = [0.0_f32; 4];
+            if style.has_paint() || style.letter_gap != 0.0 || style.line_gap != 0.0 {
+                for g in &layout.glyphs {
+                    if let Some((x, y, w, h)) = font.glyph_px_bounds_gid(g.glyph_id, g.size) {
+                        for (margin, reach) in ink_margins.iter_mut().zip([
+                            -(g.x + x),
+                            -(g.y + y),
+                            g.x + x + w - layout.bounds.0,
+                            g.y + y + h - layout.bounds.1,
+                        ]) {
+                            *margin = margin.max(reach);
+                        }
                     }
                 }
             }
-        }
-        let paint_padding = text_effect_padding(&decoration) + 1.0;
-        let margins = ink_margins.map(|ink| (paint_padding + ink).ceil() as usize);
-        let origin_offset = (margins[0], margins[1]);
-        let width = (layout.bounds.0.ceil().max(1.0) as usize)
-            .checked_add(margins[0].checked_add(margins[2])?)?;
-        let height = (layout.bounds.1.ceil().max(1.0) as usize)
-            .checked_add(margins[1].checked_add(margins[3])?)?;
-        // Pixel coordinates in comic-core are i32, even for a sparse region.
-        if width > i32::MAX as usize || height > i32::MAX as usize {
-            return None;
-        }
-        let painted = style.has_paint();
-        let bytes = width
-            .checked_mul(height)
-            .and_then(|n| n.checked_mul(if painted { 8 } else { 4 }))
-            .unwrap_or(usize::MAX);
-        let painters = if bytes > MAX_TEXT_RASTER_BYTES {
-            let blocks = if painted {
-                vec![&glyph, &decoration]
+            let paint_padding = text_effect_padding(&decoration) + 1.0;
+            let margins = ink_margins.map(|ink| (paint_padding + ink).ceil() as usize);
+            let origin_offset = (margins[0], margins[1]);
+            let width = (layout.bounds.0.ceil().max(1.0) as usize)
+                .checked_add(margins[0].checked_add(margins[2])?)?;
+            let height = (layout.bounds.1.ceil().max(1.0) as usize)
+                .checked_add(margins[1].checked_add(margins[3])?)?;
+            // Pixel coordinates in comic-core are i32, even for a sparse region.
+            if width > i32::MAX as usize || height > i32::MAX as usize {
+                return None;
+            }
+            let painted = style.has_paint();
+            let bytes = width
+                .checked_mul(height)
+                .and_then(|n| n.checked_mul(if painted { 8 } else { 4 }))
+                .unwrap_or(usize::MAX);
+            let painters = if bytes > MAX_TEXT_RASTER_BYTES {
+                let blocks = if painted {
+                    vec![&glyph, &decoration]
+                } else {
+                    vec![&glyph]
+                };
+                #[cfg(test)]
+                glyph_preparation_probe::record_preparation();
+                prepare_text_regions(
+                    &layout,
+                    font,
+                    (origin_offset.0 as f32, origin_offset.1 as f32),
+                    &blocks,
+                )
             } else {
-                vec![&glyph]
+                Vec::new()
             };
-            prepare_text_regions(
-                &layout,
-                font,
-                (origin_offset.0 as f32, origin_offset.1 as f32),
-                &blocks,
-            )
-        } else {
-            Vec::new()
-        };
-        Some(Self {
-            width,
-            height,
-            logical_width: layout.bounds.0,
-            logical_height: layout.bounds.1,
-            origin_offset,
-            glyph,
-            decoration,
-            painted,
-            painters,
-        })
+
+            Some(Self {
+                width,
+                height,
+                logical_width: layout.bounds.0,
+                logical_height: layout.bounds.1,
+                origin_offset,
+                glyph,
+                decoration,
+                painted,
+                painters,
+                preparation_bytes,
+            })
+        })()
+        .ok_or(TextPreparationError::Unavailable)
     }
 }
+#[cfg(test)]
+#[path = "text_budget_render_tests.rs"]
+mod budget_render_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,15 +1013,6 @@ mod tests {
             project.layers = vec![layer];
             // Fresh assets keep every route's first glyph preparation observable.
             let fonts = window_test_fonts();
-            let font = fonts.get("font").unwrap();
-            let (_, _, glyph_width, glyph_height) = font
-                .glyph_px_bounds(if index == 1 { '0' } else { 'H' }, MAX_TEXT_SIZE_PX)
-                .unwrap();
-            let aa_padding = 2 * ((MAX_TEXT_SHADOW_SPREAD_PX + 48.0).ceil() as u32 + 1);
-            let expected_coverage = (
-                glyph_width.ceil() as u32 + aa_padding,
-                glyph_height.ceil() as u32 + aa_padding,
-            );
             let assets = Assets::new(fonts);
             let scene = evaluate(&project, 1.0, &crate::p5a_tests::frame());
             assert_eq!(
@@ -892,20 +1029,18 @@ mod tests {
             let report = result.unwrap_or_else(|error| {
                 panic!("text kind {index}: {error:?}; requested {dimensions:?}")
             });
-            // The upper-bound fixture stops after the checked plan, before
-            // preparing the large 1000px multi-pass coverage. A cap mutation is
-            // rejected by the dimension check before it can complete this plan.
+            // D17.11 rejects aggregate coverage before even the per-glyph dry-run.
+            assert_eq!(completed_plans, 0, "text kind {index}");
             assert!(
-                completed_plans > 0,
-                "text kind {index}: no bounded glyph plan"
+                matches!(report.unresolved_assets.as_slice(),
+                [UnresolvedAsset::TextPreparationBudget { required_bytes, budget_bytes, .. }]
+                if *budget_bytes == MAX_TEXT_PREPARATION_BYTES && required_bytes > budget_bytes),
+                "text kind {index}: {report:?}"
             );
-            assert!(
-                !report.unresolved_assets.is_empty(),
-                "dry-run must stop before baking"
-            );
-            assert!(
-                dimensions.contains(&expected_coverage),
-                "glyph preparation missing for kind {index}: {expected_coverage:?} in {dimensions:?}"
+            assert_eq!(
+                dimensions,
+                vec![(1920, 1080)],
+                "only the output frame is allocated"
             );
             for &(width, height) in &dimensions {
                 assert!(u64::from(width) * u64::from(height) <= output_pixels * 3);

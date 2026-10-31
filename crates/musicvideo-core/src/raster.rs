@@ -71,6 +71,11 @@ impl PixelRect {
 pub enum UnresolvedAsset {
     Image(ImageId),
     Font(String),
+    TextPreparationBudget {
+        font_key: String,
+        required_bytes: usize,
+        budget_bytes: usize,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -357,6 +362,44 @@ pub fn render_frame(
         let glow = item
             .glow
             .filter(|glow| glow.radius_px > 0.0 && glow.color.a > 0);
+        if let SceneItemKind::Text {
+            text,
+            font_key,
+            size_px,
+            style,
+            transient_style,
+            ..
+        }
+        | SceneItemKind::TimeText {
+            text,
+            font_key,
+            size_px,
+            style,
+            transient_style,
+            ..
+        } = &item.kind
+            && geometry.can_reach_canvas(frame, rotation, glow)?
+            && let Err(error) =
+                assets.check_text_preparation(text, font_key, *size_px, style, *transient_style)
+        {
+            let issue = match error {
+                crate::text::TextPreparationError::Unavailable => {
+                    UnresolvedAsset::Font(font_key.clone())
+                }
+                crate::text::TextPreparationError::Budget {
+                    required_bytes,
+                    budget_bytes,
+                } => UnresolvedAsset::TextPreparationBudget {
+                    font_key: font_key.clone(),
+                    required_bytes,
+                    budget_bytes,
+                },
+            };
+            report.record_unresolved(issue);
+            // Reject the complete layer, including its Glow and background,
+            // before any tile can initiate coverage preparation.
+            continue;
+        }
         if !geometry.inside(scene.width, scene.height)
             || (glow.is_some()
                 && !WorkPlan::new(geometry, scene.width, scene.height, rotation)

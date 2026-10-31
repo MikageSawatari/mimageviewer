@@ -397,7 +397,7 @@ fn sample_frame_channel(frame: &Frame, x: f32, y: f32, channel: usize) -> u8 {
 /// Replays a continuous property drag against the real project and observes
 /// the completed CPU frames directly. This separates missing glyph output
 /// from preview scheduling: text rasterization is synchronous, so a completed
-/// frame must either contain pixels or report its font as unresolved.
+/// frame must either contain pixels or report why its text could not be prepared.
 pub fn run_project_text_drag_diagnostic(project_path: &Path) -> Result<(), String> {
     const FRAMES: usize = 360;
     const POSITION_SECS: f64 = 26.0;
@@ -720,7 +720,7 @@ fn summarize_timings(timings: &[f64]) -> TimingStats {
     }
 }
 
-fn ensure_resolved(report: &RenderReport, context: &str) -> Result<(), String> {
+pub(crate) fn ensure_resolved(report: &RenderReport, context: &str) -> Result<(), String> {
     if report.unresolved_assets.is_empty() {
         return Ok(());
     }
@@ -730,6 +730,13 @@ fn ensure_resolved(report: &RenderReport, context: &str) -> Result<(), String> {
         .map(|asset| match asset {
             UnresolvedAsset::Image(id) => format!("画像 {}", id.0),
             UnresolvedAsset::Font(key) => format!("フォント {key}"),
+            UnresolvedAsset::TextPreparationBudget {
+                font_key,
+                required_bytes,
+                budget_bytes,
+            } => format!(
+                "文字の描画準備が上限を超えました（フォント {font_key}、見積もり量 {required_bytes} / 上限 {budget_bytes} バイト）。文字のサイズ・文字数・装飾を減らしてください"
+            ),
         })
         .collect::<Vec<_>>()
         .join(", ");

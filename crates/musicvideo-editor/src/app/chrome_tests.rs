@@ -922,6 +922,120 @@ fn l3_missing_window_reports_the_original_image_replacement_request() {
 }
 
 #[test]
+fn d17_eleven_preview_budget_report_reaches_visible_notice_and_export_error() {
+    use musicvideo_core::{
+        Fill, Rgba8, StrokeStyle, TextAlign, TextLayer, TextShadowStyle, TextStyle,
+    };
+
+    let font = crate::project::load_default_font().expect("Windows Japanese test font");
+    let assets = crate::project::create_assets(Some(&font)).unwrap();
+    let mut h = Harness::unstarted(1400.0);
+    crate::project::setup_egui(&h.ctx, Some(&font));
+    h.app.assets = assets;
+    h.app.project.output.width = 1920;
+    h.app.project.output.height = 1080;
+    let mut text = h.app.project.layers[0].clone();
+    text.name = "budget text".into();
+    text.rect = Animatable::Const(NormRect::FULL);
+    text.glow = Animatable::Const(None);
+    text.kind = LayerKind::Text(TextLayer {
+        // Independent review 2's ordinary-input reproduction, without Scale.
+        text: "春夏秋冬東西南北天地山川海空風雨雪花鳥月".into(),
+        font_key: crate::project::DEFAULT_FONT_KEY.into(),
+        size_px: 1000.0,
+        align: TextAlign::Start,
+        style: Animatable::Const(TextStyle {
+            outline: Some(StrokeStyle {
+                width_px: 128.0,
+                ..Default::default()
+            }),
+            shadow: Some(TextShadowStyle {
+                spread_px: 128.0,
+                blur_px: 48.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        fill: Animatable::Const(Fill::Solid(Rgba8::WHITE)),
+    });
+    h.app.project.layers = vec![text];
+    h.app.editor_state.reset_for_project(&h.app.project);
+    h.app.start_preview_if_needed(&h.ctx);
+    let pending = h.app.preview_pending.take().expect("preview admitted");
+    let result = pending
+        .rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("preview worker")
+        .unwrap();
+    let [
+        UnresolvedAsset::TextPreparationBudget {
+            font_key,
+            required_bytes,
+            budget_bytes,
+        },
+    ] = result.report.unresolved_assets.as_slice()
+    else {
+        panic!(
+            "actual renderer must report the budget failure: {:?}",
+            result.report
+        );
+    };
+    assert!(required_bytes > budget_bytes);
+    let detail =
+        format!("フォント {font_key}、見積もり量 {required_bytes} / 上限 {budget_bytes} バイト");
+    let export_error = crate::export::ensure_resolved(&result.report, "フレーム 1").unwrap_err();
+    for expected in [
+        "フレーム 1",
+        "文字の描画準備が上限を超えました",
+        &detail,
+        "文字のサイズ・文字数・装飾を減らしてください",
+    ] {
+        assert!(export_error.contains(expected), "{export_error}");
+    }
+    let report = result.report.clone();
+    let (tx, rx) = mpsc::channel();
+    tx.send(Ok(result)).unwrap();
+    h.app.preview_pending = Some(PreviewPending { rx, ..pending });
+    h.app.poll_preview(&h.ctx);
+    assert!(
+        h.app.displayed_preview.is_some(),
+        "preview result was adopted"
+    );
+    assert_eq!(h.app.preview_report, report);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    // The real status control must advertise the otherwise omitted text.
+    status_button(&h, &["未解決の素材 1 件"]);
+    h.click("未解決の素材 1 件");
+    assert!(h.app.show_missing_resources);
+    h.frame(vec![]);
+    h.frame(vec![]);
+    let messages = h
+        .output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.text()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for expected in [
+        "文字の描画準備が上限を超えたため",
+        "この文字レイヤーは描画していません",
+        &detail,
+        "文字のサイズ・文字数・装飾を減らしてください",
+    ] {
+        assert!(
+            messages.contains(expected),
+            "missing {expected}: {messages}"
+        );
+    }
+    assert!(!messages.contains("未解決素材: フォント"));
+    assert!(!messages.contains("未解決の素材はありません"));
+}
+
+#[test]
 fn l3_completion_during_project_modal_preserves_lrc_payload_and_admission_order() {
     let mut h = Harness::new(1400.0);
     let id = add_lyrics(&mut h);

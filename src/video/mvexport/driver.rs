@@ -730,6 +730,13 @@ fn ensure_resolved(report: &RenderReport, frame_index: u64) -> Result<(), Export
         .map(|asset| match asset {
             UnresolvedAsset::Image(id) => format!("画像 {}", id.0),
             UnresolvedAsset::Font(key) => format!("フォント {key}"),
+            UnresolvedAsset::TextPreparationBudget {
+                font_key,
+                required_bytes,
+                budget_bytes,
+            } => format!(
+                "文字の描画準備が上限を超えました（フォント {font_key}、見積もり量 {required_bytes} / 上限 {budget_bytes} バイト）。文字のサイズ・文字数・装飾を減らしてください"
+            ),
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -1045,6 +1052,32 @@ mod tests {
         assert!(has_mp4_extension(Path::new("video.mp4")));
         assert!(has_mp4_extension(Path::new("video.MP4")));
         assert!(!has_mp4_extension(Path::new("video.mov")));
+    }
+
+    #[test]
+    fn d17_eleven_text_budget_is_a_fatal_frame_error_like_missing_assets() {
+        assert!(ensure_resolved(&RenderReport::default(), 7).is_ok());
+        let report = RenderReport {
+            unresolved_assets: vec![UnresolvedAsset::TextPreparationBudget {
+                font_key: "budget-font".into(),
+                required_bytes: 123_456_789,
+                budget_bytes: 67_108_864,
+            }],
+        };
+        let error = ensure_resolved(&report, 7).unwrap_err();
+        let ExportError::Render(message) = error else {
+            panic!("a text budget failure must stop frame rendering");
+        };
+        for expected in [
+            "フレーム 8",
+            "文字の描画準備が上限を超えました",
+            "budget-font",
+            "見積もり量 123456789 / 上限 67108864 バイト",
+            "文字のサイズ・文字数・装飾を減らしてください",
+        ] {
+            assert!(message.contains(expected), "missing {expected}: {message}");
+        }
+        assert!(!message.contains("未解決素材: フォント"));
     }
 
     #[test]

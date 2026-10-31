@@ -3313,7 +3313,7 @@ GUI起動・実機検収と対応後の独立再レビューは未実施。コ�
 | **P4d** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | Grid／Fullscreenの単一実Audioだけ。static ID／非表示設定、worker起動、絶対path引数、失敗通知、build-dev同梱を実装。既存保存順のstatic／動的枠を保つ末尾追加。追加8件の成功と各変異失敗、全対象14560 passed／0 failed／66 ignored、fmt／glyph0、通常featureの4exe確認build成功を記録済み。`261b10359`の独立レビューP2に対応し製品binのGUI属性／Subsystem gateを追加。製品GUI起動／実機検収／対応のcommitなし。詳細は「P4d実装記録」 |
 | **P4e** 実装完了（独立レビュー 4 回目で ACCEPT、2026-10-15。build-dist -NoSign の通しは修正前の版で成功、最終版での通しは統合前の最終確認で行う） | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | **実装・非対話検証済（2026-10-15）**。build-dist -NoSign の全段成功、全体 gate 14,562 passed / 0 failed / 66 ignored。editor 25,504,768 bytes、launcher 増分も同値。清掃は editor を含む fixture で検査し D10 の割り切りを維持。独立レビュー 1〜3 回目は REVISE。3 回目の指摘は OUT_DIR 導出で対応し、追加発見の build-dir 分離も設計回答に従い開始前に拒否する。指定検証・release 5 段は成功、独立再検収待ち。署名実行・GUI 検収は未実施。詳細は末尾「P4e 実装記録」 |
 | **P4f** 完了（独立レビュー 2 回目 ACCEPT with conditions、条件の文書修正済み `bf05ddb17`、2026-10-15。fps 選択は利用者決定で追加。サイトマップ再生成は統合時） | マニュアル新ページと通常33ページのサイドバー・目次、製品紹介カード、keymap-spec（固定ショートカットの理由）、privacy（通信なし・保存先） | **2026-10-15、未コミット**。カード50枚で上限違反0、glyph検査成功、33ページ各33リンクの数・順序・active一致、HTML構造とリンク検査成功。各記述のコード根拠・D11との差分は末尾「P4f 実施記録」。アプリ／エディタ未起動。独立レビュー1回目 REVISE の起動条件の P2 を修正し、利用者決定に基づきプロジェクトの fps 選択を追加。対応後の再レビュー・検収は未実施。追補記録を参照。サイトマップはhtdocsコミット後に生成するため今回は未実行 |
-| **P5a** 初版 `529045c72`、独立レビュー1回目 REVISEのP1／P2対応完了。D17.6〜10実装・非対話検証・確認用build完了。対応後の独立再レビュー／GUI検収待ち（末尾の追補記録） | 実操作で見つけた改善（D17）: 円形スペクトラムの内側の円を矩形に対する割合へ、`Scale` 変調をレイヤー全体の拡大縮小へ、割り当て量の初期値を単位に合わせる、画像の枠への合わせ方の設定と追加時の既定、レイヤー一覧の操作ボタンの固定 | 円形で `Scale` を割り当てると輪の内径も同じ比率で大きくなる（書き出し画素で確認）。文字・時刻・歌詞の `Scale` で文字が大きくなる。プレビューと書き出しの一致（H3b）を維持。独立レビュー ACCEPT |
+| **P5a** 初版 `529045c72`。独立レビュー2回目 REVISEのP1対応完了。D17.6〜11実装・非対話検証・確認用build完了。対応後の正式独立再レビュー／GUI検収待ち（末尾の追補記録） | 実操作で見つけた改善（D17）: 円形スペクトラムの内側の円を矩形に対する割合へ、`Scale` 変調をレイヤー全体の拡大縮小へ、割り当て量の初期値を単位に合わせる、画像の枠への合わせ方の設定と追加時の既定、レイヤー一覧の操作ボタンの固定 | 円形で `Scale` を割り当てると輪の内径も同じ比率で大きくなる（書き出し画素で確認）。文字・時刻・歌詞の `Scale` で文字が大きくなる。プレビューと書き出しの一致（H3b）を維持。独立レビュー ACCEPT |
 
 L1 自動検証記録（2026-10-09）:
 
@@ -4357,7 +4357,7 @@ rmeta／rlib／build 出力破損と CMake 並列失敗に遭遇し、既存統�
 ### P5a 実施記録（2026-10-31、実装担当）
 
 以下の初版はコミット前の検証記録。後に `529045c72` としてコミットされ、独立レビュー1回目は REVISE となった。
-現在の対応状況は末尾の「独立レビュー 1 回目 REVISE と対応」を参照する。
+現在の対応状況は末尾の「独立レビュー 2 回目 REVISE と対応」を参照する。
 
 D17 の 1〜6 の実装・非対話検証・確認用buildを完了した（すべて未コミット）。既定の円形矩形が描画前に切り詰められる問題を停止報告し、
 設計担当が D17.6 を確定した後、全種別で描画の幾何と出力クリップを分離して再開した。
@@ -4777,3 +4777,124 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 
 確認対象は、円形・画像・文字にグローを付けた状態で拡縮・回転・1px移動し、枠に沿う描画とグローの追従を確認すること。
 量99での確保寸法は上記の自動検査で検証しており、実GUIで巨大確保を試すことを利用者へ依頼するものではない。
+
+#### 独立レビュー 2 回目 REVISE と対応（2026-10-31、実装担当、未コミット）
+
+独立レビュー2回目は **REVISE（P1 1件）**。設計担当がD17.11を `a2c53c9a1` に記録した後の対応である。
+前節のD17.10までの完了記録は当時の検証を示す。個々の字形寸法だけでは文字列全体のcoverage合計を抑えられないという指摘に対し、
+準備前の合計予算判定を追加した。この実装担当の検証を独立レビューとは扱わない。
+
+変更ファイル（14ファイル）:
+
+| 領域 | ファイル |
+| --- | --- |
+| `crates/musicvideo-core/src/` | `assets.rs`、`lib.rs`、`raster.rs`、`text.rs`、`raster_glow_work_tests.rs`、新規 `text_budget.rs`／`text_budget_tests.rs`／`text_budget_render_tests.rs` |
+| `crates/musicvideo-editor/src/` | `app/chrome.rs`、`app/chrome_tests.rs`、`export.rs` |
+| 本体 | `src/video/mvexport/driver.rs` |
+| 文書 | 本設計書、`htdocs/mimageviewer/manual/music-video.html` |
+
+**原因と修正**
+
+- `TextCache::prepare` は可視タイルを決める前に `prepare_text_regions` へ進み、32 MiBの準備キャッシュ上限は生成後の保持判定にすぎなかった。
+  20字・1000px・多段の影では約1 GiBのcoverageを作り得た。
+- `text_budget.rs` で、ラスタ化しない `glyph_px_bounds_gid` からbaseのceil寸法とdilationのAA余白を求める。
+  **全glyph出現×全描画pass**を数え、同幅縁取りやechoの重複も省略しない。comic-coreのcache世代は全スレッド共通で、
+  別のbakeが準備途中でcacheを無効化し得るため、同じ字形が共有されることを上限保証の前提にしない。
+  各callのoutputと元baseをoutputの2倍で覆い、Sidewaysの回転coverage、最大float scratch、operation／Arc／cache項目／layout／文字列・keyの余白も加える。
+  非有限値、内部寸法の表現外、計算overflowは `usize::MAX` として安全側へ拒否する。
+- `MAX_TEXT_PREPARATION_BYTES` をcoreの1か所で **32 MiB** と定義し、準備前の判定と既存prepared保持枠が参照する。
+  T1の総保持枠64 MiBは静的RGBA24 MiB＋動的RGBA8 MiB＋prepared32 MiBのまま。
+  準備の判定32 MiBと各bakeのRGBA合計8 MiBは別の上限であり、総保持枠をプロセス全体のピーク使用量とは呼ばない。
+  対象はcoverageと描画準備領域であり、外枠から推定できない任意のフォントプログラム自体の複雑さの制限ではない。
+- public rendererはText／TimeText（評価済みLyricsを含む）の描画前に判定する。超過時はGlow・背景を含むレイヤー全体を描かず、
+  `RenderReport` の `UnresolvedAsset::TextPreparationBudget` にフォント・上限見積もり量・予算を記録する。
+  既存の画面外カリングは維持し、私有の準備入口にも同じ判定を置く。予算外はタイル列へ入る前に拒否するため、準備を繰り返さない。
+- 予算内の疎な描画programは既存prepared cacheへpublishし、mask／本体／後続タイル／次フレームで再利用する。
+  字形の準備前にcomic-core cacheの共有を仮定することと、準備後に所有するprogramを再利用することを区別する。
+  8 MiBのRGBA assertは内部不変条件として残した。
+- preview workerのレポート採用から既存の「詳細」→「未解決の素材」へ流し、描かなかった理由と
+  「文字のサイズ・文字数・装飾を減らしてください」を表示する。量は実使用量と誤解させず「見積もり量」と表記する。
+  editorの直接書き出しと本体mvexportの両方で、未解決素材と同じfatal errorにする。
+  フレームの変換・encoder送信より前に判定する既存の順序を維持し、partial出力の破棄／完成後の置換は変更しない。
+- comic-coreのコード、通常の字形生成方式、D17.10のGlow格子規則は変更しない。新たな描画ロックも追加しない。
+  マニュアルには大量・大きな文字の通知と調整方法、該当フレームで書き出しが止まることを追記した。
+
+**テストと期待値**
+
+- 推定器7件。ZenKurenaido／YuGothM TTC／Arialの3フォント×3サイズ×4装飾、計36条件で、本物のprepared保持量と、
+  実bitmap寸法から独立集計したcoverage＋ピークfloat scratchが見積もり以内であることを確認した。
+  最大blur・echo等を重ねた100pxの高負荷条件は32 MiB超となり得るため、予算内とは要求しない。
+  通常の歌詞・曲名は48／72px×2文言×3フォントの別fixtureで予算内（1,276,352〜5,609,472 B）と確認した。
+- 全callの直前にcacheをresetし、同じ字形でもすべて別の実bitmapを保持する決定的な反例を追加した。
+  上限5,295,664 Bが実coverage＋scratch＋headerの2,449,648 Bを覆う。実確保は4 MiB未満であり、巨大確保しない。
+  1px・5,462字・echo12のSidewaysでも、実prepared保持量＋回転bitmapのArc＋保持量集計の一時pointer setを見積もりが覆う。
+- renderer3件。レビュー指定の1920×1080／FULL／中央／20字／10px／縁2px／影spread2px・blur48px／Scale量99・入力1で、
+  準備呼出0、レポート記録、黒いフレーム、次フレームも同じ結果を確認した。呼出禁止hookはcoverageの確保直前に失敗するので、
+  判定を壊した検証でも巨大確保しない。予算内の長い反復文字は複数タイルと次フレームで準備1回。
+  利用者入力から届く大きな背景paddingでもRGBA合計8 MiB以下でタイル化し、内部assertに達しない。
+- 既存 `d17_nine_scale_99_all_text_kinds_bound_glyph_preparation_and_visible_work` と
+  `d17_ten_scale_99_max_glyph_glow_checks_coverage_before_preparation` の最大サイズ＋装飾fixtureは、従来の「字形計画dry-runまで進む」から、
+  D17.11の「総量超過を報告し、出力Frame以外を確保しない」へ期待値を変更した。Text／TimeText／Lyrics、Glow有無、回転0／23／90度を検査する。
+  旧textテストの初回はこの期待値差で12成功／1失敗となった（`target/p5a/d17-eleven/text-before-adapt.log`）。
+  小さい装飾を実際に描く量99の検査は維持する。通常の文字の画素・ハッシュ期待値は更新していない。
+- editor handlerは実preview worker→poll→未解決件数→詳細画面の通知をheadlessで検査し、同じレポートをeditor exportへ渡してfatalを確認する。
+  本体mvexportにもBudgetをfatalにするテストを追加した。既存のpartial出力削除・既存出力保護の回帰もfocusedに含む。
+
+**変異検証（正本は保守化後）**
+
+| テスト | 意図的に壊した箇所／検出 |
+| --- | --- |
+| `d17_eleven_preparation_bound_covers_measured_fonts_styles_and_sideways` | 影のpassを省略→実測保持量との比較で失敗 |
+| `d17_eleven_preparation_bound_rejects_scale_99_repro_without_rasterizing` | boundを0として返す→レビュー条件の予算超過assertで失敗 |
+| `d17_eleven_preparation_bound_counts_every_repeated_upright_occurrence` | 最初のglyphだけを計数→反復字形の予算超過assertで失敗 |
+| `d17_eleven_preparation_bound_covers_generation_reset_before_every_call` | 最初のglyphだけを計数→共有のない実coverage量との比較で失敗 |
+| `d17_eleven_ordinary_lyrics_and_titles_fit_without_assuming_shared_coverage` | 予算を1 Bへ変更→通常fixtureの予算内assertで失敗 |
+| `d17_eleven_preparation_bound_fails_closed_for_invalid_dimensions` | 非対応寸法を0として返す→安全側の拒否値比較で失敗 |
+| `d17_eleven_tiny_sideways_repetitions_include_bitmap_arc_metadata` | 管理領域の計上を除外→保持量＋Arc＋集計scratchとの比較で失敗 |
+| `d17_eleven_review_repro_rejects_before_any_coverage_and_reports` | admission判定を無効化→coverage直前の呼出禁止hookで失敗 |
+| `d17_eleven_eligible_program_is_prepared_once_across_visible_tiles` | prepared cacheの保持を無効化→複数回準備のassertで失敗 |
+| `d17_eleven_user_effect_canvas_uses_bounded_rgba_tiles_without_asserting` | tile辺1024を2048へ変更→確保前のRGBA上限assertで失敗 |
+| `d17_eleven_preview_budget_report_reaches_visible_notice_and_export_error` | UI件数からBudgetを除外→status buttonのassertで失敗 |
+| `d17_eleven_text_budget_is_a_fatal_frame_error_like_missing_assets` | Budgetだけ成功扱い→fatal errorのassertで失敗 |
+
+12件すべて実行時のassertion failure／FAILED／exit101を確認し、各変異は元のバイト列へ復元した。
+正本は `target/p5a/d17-eleven/conservative/`、`integration-verified/`、`notifications/` のログ・summary・SHAと、
+全12件のログを点検した `mutation-audit-verified.json`。復元後の推定器7件、renderer3件、既存text13件も成功した。
+通知担当の `mutation-driver.json` の全体 `restored=false` は、親による `TextBake::new` の `cfg(test)` 整理と重なったため。
+変異所有4ファイルは `owned_restored=true` であり、最終gateではRustソース12ファイル全体の一致を確認する。
+
+途中証跡は最終成功と区別する。初回 `integration/` と `tiny/` の変異は検査スクリプトのCRLF再変換によるcompile failureのため成功に数えず、
+バイト書込みへ直して再検査した。`tiny-final/` の弱い比較も採用せず、集計scratchを足して `tiny-verified/` で検出した。
+保守化後の `conservative/repro-unlimited-budget-*.log` も不採用のcompile failureで、正本summaryには安全な0返しの変異を採用した。
+また、最初のunique共有を仮定した見積もりはcache無効化の反例に対して上限にならないため破棄した。
+`gates/` の557件成功、`gates-final/` の558件・本体16件・build成功は補強前の途中証跡であり、最終結果は下記 `gates-verified/` を採用する。
+
+**最終検証**（全コマンド `MSBUILDDISABLENODEREUSE=1`、APPDATA／LOCALAPPDATA／TEMP／TMPは `target/p5a/d17-eleven/gates-verified/` 内へ隔離）:
+
+| 検証 | 結果／証跡 |
+| --- | --- |
+| `cargo test -j 8 -p music-core -p musicvideo-core -p musicvideo-ui -p musicvideo-editor` | **560 passed／0 failed／0 ignored**、524.89秒。`gates-verified/packages.log` |
+| `cargo test -j 8 -p mimageviewer --lib video::mvexport` | **16 passed／0 failed／0 ignored**、340.071秒。`gates-verified/mvexport.log` |
+| `cargo fmt`／`cargo fmt --check` | 整形適用済み、check exit0、23.788秒。`gates-verified/fmt.log` |
+| `python scripts/check_ui_glyphs.py` | exit0、不足0、5.531秒。`gates-verified/glyph.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit0、126.676秒。通常featuresのcore／remote／EPUB worker／音楽ビデオeditorを生成。VC runtime／PE検査成功。`gates-verified/build-dev.log` |
+
+ログ名は `target/p5a/d17-eleven/` からの相対パス。コマンド・終了値・件数・時間は `gates-verified/summary.json`。
+Rustソース12ファイルのSHA-256は同 `source-sha256.json`、4成果物のsize／時刻／SHA-256は同 `artifacts.json`。
+build後にもソース一致を確認した。通常の文字reference、倍率1.0の全種別のハッシュ、H3bは期待値を変更せず成功した。
+D17.11による既存fixture変更は前記2件の最大字形dry-runの期待するレポート／準備回数だけで、通常の画素ハッシュ更新はない。
+
+**完了状態**: 独立レビュー2回目REVISEのP1への実装対応、指定の非対話検証、確認用build、実施記録・マニュアル更新を完了した。
+準備前の上限見積もり、予算超過の非描画と利用者通知、両書き出し経路のfatal判定、予算内programの再利用を確認した。
+停止中の実装残件・追加の設計確認事項はない。対応後の正式な独立再レビュー／GUI検収は未実施であり、実装担当の検証を独立レビューと扱わない。
+GUI起動、実APPDATA操作、コミット、既存 `out.mp4` の操作は行っていない。
+
+利用者が確認する場合は、single-instance mutexを共有するインストール版／トレイ常駐版を先に終了し、本worktreeで次を実行する。
+このbuildは通常の実 `%APPDATA%\mimageviewer` profileを使い、起動すると設定・データを更新し得る。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+確認対象は、通常の曲名・歌詞のプレビューと書き出しが変わらないこと、大きな文字の予算超過時に「詳細」→「未解決の素材」へ理由と調整方法が出ること、
+サイズ・文字数・装飾を減らすと再び描画・書き出しできること。巨大なcoverageを実際に確保する試行は不要で、自動テストは確保前のhookで検査している。

@@ -395,16 +395,6 @@ fn d17_ten_scale_99_max_glyph_glow_checks_coverage_before_preparation() {
                 )
                 .unwrap(),
             );
-            let (_, _, glyph_width, glyph_height) = fonts
-                .get("font")
-                .unwrap()
-                .glyph_px_bounds(if kind == 1 { '0' } else { 'H' }, MAX_TEXT_SIZE_PX)
-                .unwrap();
-            let padding = 2 * ((MAX_TEXT_SHADOW_SPREAD_PX + 48.0).ceil() as u32 + 1);
-            let expected_coverage = (
-                glyph_width.ceil() as u32 + padding,
-                glyph_height.ceil() as u32 + padding,
-            );
             let assets = Assets::new(fonts);
             let scene = evaluate(&project, 1.0, &crate::p5a_tests::frame());
             let mut frame = Frame::new(1, 1).unwrap();
@@ -417,17 +407,18 @@ fn d17_ten_scale_99_max_glyph_glow_checks_coverage_before_preparation() {
             let report = result.unwrap_or_else(|error| {
                 panic!("kind {kind}, angle {angle}: {error:?}; requested {dimensions:?}")
             });
+            // D17.11 gates the whole layer, including Glow, before coverage preparation.
+            assert_eq!(completed, 0, "kind {kind}, angle {angle}");
             assert!(
-                completed > 0,
-                "no checked glyph plan for kind {kind}, angle {angle}"
+                matches!(report.unresolved_assets.as_slice(),
+                [UnresolvedAsset::TextPreparationBudget { required_bytes, budget_bytes, .. }]
+                if *budget_bytes == MAX_TEXT_PREPARATION_BYTES && required_bytes > budget_bytes),
+                "kind {kind}, angle {angle}: {report:?}"
             );
-            assert!(
-                !report.unresolved_assets.is_empty(),
-                "dry-run must stop before preparing coverage"
-            );
-            assert!(
-                dimensions.contains(&expected_coverage),
-                "missing glyph coverage {expected_coverage:?} for kind {kind}, angle {angle}"
+            assert_eq!(
+                dimensions,
+                vec![(1920, 1080)],
+                "no glyph or Glow intermediates"
             );
             for &(width, height) in &dimensions {
                 assert!(u64::from(width) * u64::from(height) <= output_pixels * 3);

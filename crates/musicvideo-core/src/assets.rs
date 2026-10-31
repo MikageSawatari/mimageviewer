@@ -460,6 +460,18 @@ impl Assets {
         self.text_cache.stats()
     }
 
+    pub(crate) fn check_text_preparation(
+        &self,
+        text: &str,
+        font_key: &str,
+        size_px: f32,
+        style: &crate::TextStyle,
+        transient: bool,
+    ) -> Result<(), crate::text::TextPreparationError> {
+        self.text_cache
+            .check_preparation(&self.fonts, text, font_key, size_px, style, transient)
+    }
+
     pub(crate) fn visit_rasterized_text(
         &self,
         text: &str,

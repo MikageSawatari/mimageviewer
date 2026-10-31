@@ -200,7 +200,12 @@ impl MusicVideoLabApp {
                 .preview_report
                 .unresolved_assets
                 .iter()
-                .filter(|a| matches!(a, UnresolvedAsset::Font(_)))
+                .filter(|a| {
+                    matches!(
+                        a,
+                        UnresolvedAsset::Font(_) | UnresolvedAsset::TextPreparationBudget { .. }
+                    )
+                })
                 .count()
             + usize::from(self.audio_error.is_some())
             + usize::from(matches!(
@@ -535,11 +540,26 @@ impl MusicVideoLabApp {
                                     actions.push(ChromeAction::ReplaceImage(id));
                                 }
                                 for asset in &self.preview_report.unresolved_assets {
-                                    if let UnresolvedAsset::Font(key) = asset {
-                                        ui.colored_label(
-                                            ui.visuals().error_fg_color,
-                                            format!("未解決素材: フォント {key}"),
-                                        );
+                                    match asset {
+                                        UnresolvedAsset::Font(key) => {
+                                            ui.colored_label(
+                                                ui.visuals().error_fg_color,
+                                                format!("未解決素材: フォント {key}"),
+                                            );
+                                        }
+                                        UnresolvedAsset::TextPreparationBudget {
+                                            font_key,
+                                            required_bytes,
+                                            budget_bytes,
+                                        } => {
+                                            ui.colored_label(
+                                                ui.visuals().error_fg_color,
+                                                format!(
+                                                    "文字の描画準備が上限を超えたため、この文字レイヤーは描画していません（フォント {font_key}、見積もり量 {required_bytes} / 上限 {budget_bytes} バイト）。文字のサイズ・文字数・装飾を減らしてください。"
+                                                ),
+                                            );
+                                        }
+                                        UnresolvedAsset::Image(_) => {}
                                     }
                                 }
                                 if let Some(error) = &self.audio_error {
