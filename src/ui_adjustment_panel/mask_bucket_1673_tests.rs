@@ -4,6 +4,94 @@ use local_adjust_core::{
     LocalAdjustmentLayer, LocalEffect, LocalMask, MaskShape, RasterVectorMask,
 };
 
+#[test]
+fn section1673_matching_seed_preserves_shared_alpha_before_any_copy_on_write() {
+    use crate::mask_db::{BucketFill, BucketFillOutcome, BucketRegion, BucketSource};
+    use local_adjust_core::ShapeOp;
+
+    let shape = |op| MaskShape::Rect {
+        op,
+        center: [16.5, 16.5],
+        half_w: 9.25,
+        half_h: 8.75,
+        rotation_rad: 0.37,
+    };
+    let source = egui::ColorImage::filled([32, 32], egui::Color32::WHITE);
+    for (base, value, shapes) in [
+        (0.25, false, vec![]),
+        (0.75, true, vec![]),
+        (0.25, true, vec![shape(ShapeOp::Add)]),
+        (0.75, false, vec![shape(ShapeOp::Subtract)]),
+        (
+            0.75,
+            false,
+            vec![shape(ShapeOp::Add), shape(ShapeOp::Subtract)],
+        ),
+        (
+            0.25,
+            true,
+            vec![shape(ShapeOp::Subtract), shape(ShapeOp::Add)],
+        ),
+    ] {
+        let mut alpha = local_adjust_core::MaskAlpha::new(vec![base; 32 * 32]);
+        let shared = alpha.clone();
+        let result = flood_fill_local_adjust_alpha_mask(
+            &mut alpha,
+            &source,
+            16,
+            16,
+            BucketFill {
+                tolerance: 0,
+                region: BucketRegion::Connected,
+                value,
+                leak_stop: 1.0,
+                outset: 1.0,
+                gap_tolerance: 10.0,
+            },
+            BucketSource::DrawnMask,
+            &shapes,
+        );
+        assert_eq!(result, BucketFillOutcome::SeedAlreadyValue);
+        assert!(
+            Arc::ptr_eq(&alpha, &shared),
+            "matching seed must not detach the shared alpha plane"
+        );
+        assert!(alpha.iter().all(|&v| v == base));
+    }
+}
+
+#[test]
+fn section1673_bucket_invalid_seed_does_not_copy_or_touch_alpha() {
+    let source = egui::ColorImage::filled([2, 2], egui::Color32::WHITE);
+    let mut alpha = local_adjust_core::MaskAlpha::new(vec![0.0; 4]);
+    let shared = alpha.clone();
+    for bucket_source in [
+        crate::mask_db::BucketSource::DrawnMask,
+        crate::mask_db::BucketSource::ImageColor,
+    ] {
+        assert_eq!(
+            flood_fill_local_adjust_alpha_mask(
+                &mut alpha,
+                &source,
+                2,
+                0,
+                crate::mask_db::BucketFill {
+                    tolerance: 0,
+                    region: crate::mask_db::BucketRegion::Connected,
+                    value: true,
+                    leak_stop: 0.0,
+                    outset: 0.0,
+                    gap_tolerance: 0.0,
+                },
+                bucket_source,
+                &[]
+            ),
+            crate::mask_db::BucketFillOutcome::Invalid
+        );
+        assert!(Arc::ptr_eq(&alpha, &shared));
+    }
+}
+
 fn target_ring() -> RasterVectorMask {
     let mut mask = RasterVectorMask::empty(9, 9);
     for (i, alpha) in mask.alpha_mut().iter_mut().enumerate() {

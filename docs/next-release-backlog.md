@@ -91,6 +91,39 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
   - `scripts/build-dev.ps1 -PreserveRuntime`: **成功、exit 0**。通常feature、portable無効。core 5分38秒、同protocolのremote 0.55秒 / EPUB worker 0.53秒。3実行体・DLL / EffeTune bundleを `target/dev-runtime/` へ配置し、VCRT / PE監査は runtime=4 / pe=3 で成功（`build-dev.log`、`target/vcrt-pe-reports/dev-runtime.json`）。エージェントから起動していない。workspace / vendor全体の `test-full.ps1` と実機操作は未実施。
 - 実機引継ぎ: worktree直下で `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。引数なしでは実利用中の `%APPDATA%\mimageviewer` を使い、設定・データを更新し得る。single-instance mutexを共有するため先にインストール版 / tray常駐版を終了する。確認対象は3ツールで筆の輪郭→「描いたマスク」「隣接のみ」で内側を塗る→Undo1手→保存・再開、補正レイヤーの追加 / 削除を編集中ならそのマスクだけを壁にすること、画像の色へ戻すと色差設定が再び使えること。図形自体は変更しない仕様上の限界は上記のとおり。
 
+#### §1.673 P2: 補正マスクの図形合成によるUI同期占有（2026-11-01）
+
+- 状態: **修正済み・実機未確認（確認用build済み）**。全件実行の3失敗は単独各3回成功し、下記に全件結果と分けて記録する。
+- 起点は設計担当の実装commit `06c6a964b`。その後の独立レビューは **REVISE**。前回の配列複製数の確認だけでは、coreの図形ラスタが外接矩形の全画素へ点内外判定を行う追加CPUコストを捉えていなかった。8000×6000を横切る細い斜線1本でも約4,800万画素を調べ、同値seedの判定より前に同期で合成していた。
+- 多角形／直線／矩形は、各行で旧f32式と同じ順序の交点を計算し、画素中心のstrict比較が変わる整数列を探して区間を塗る。旧inclusive bbox、水平辺／微小dyの除外、奇数交点、NaN比較の扱いも保持する。cornersは4頂点の配列にして1点判定にもheap確保を加えない。
+- 楕円は、旧f32の2座標がxに単調なことを使い、行区間端の値から旧powi和の上下界を求める。全域内は区間塗り、全域外はskip、曖昧な境界だけ整数幅を二分し、最後の1画素では旧式を使う。sqrtによる解析境界やepsilonで旧結果を近似しない。単に回転矩形の必要条件へ絞る案は、画像外の大円で実被覆0でも約4,200万候補が残るため採らない。有限geometryではbbox全面の画素判定を廃止し、nonfinite入力だけ既存判定との互換経路を保持する。
+- `rasterized_shapes_value_at` は書込み順を逆に辿り、クリックした1画素の合成値を旧bboxと点判定で求める。補正bucket helperは `&mut MaskAlpha` を受け、bounds確認→1点同値判定→bitmap生成／全体合成→変更時だけalphaのCOW、の順にする。handlerで先に原寸alphaを複製しない。新たな原寸配列・worker・pending・保存形式は加えない。
+- 検証用に旧geometry生成／bbox／predicateを独立したtest-only oracleとして保存。ランダム810図形＋90合成順、画素中心上の頂点・水平辺・回転・最小寸法・画像外・微小dy・非finite・接線・巨大／細い楕円を、全画素のf32 `to_bits`・bool・1点合成で比較する。下地のNaN payload／負の0も保存を確認する。UI helperには同値seed時のalpha Arc共有維持と無効seed不変の回帰を追加する。
+- 8000×6000のbefore/after計測（同じtest-only旧oracle、新旧bool全画素一致もassert、各条件1回、`dev-runtime` / opt-level=2、1 thread、テスト用カウンタ込みの参考値）:
+
+  | 図形 | 旧時間 | 修正後時間 | 旧bbox判定画素 | 新塗画素／1画素判定 | 新境界探索probe | 新区間判定 |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 細い斜線1本 | 295.6369ms | 1.0026ms | 48,000,000 | 9,999 | 155,690 | 0 |
+  | 細い斜線10本 | 3.1369541s | 10.5918ms | 478,704,000 | 99,896 | 1,552,241 | 0 |
+  | 画像外の大円（実被覆0） | 77.5871ms | 1.9539ms | 42,006,000 | 0 | 306,000 | 6,000 |
+  | 細い回転楕円 | 78.6521ms | 1.6566ms | 48,000,000 | 9,900 | 297,561 | 10,632 |
+
+  新しい画素数には区間探索を混ぜず、probe／区間判定を別列で示す。行の探索コストは残るため厳密な「被覆0なら仕事量0」とはしない。時間はraster部分だけで、bitmap生成・flood fill・Undo・texture更新を含むクリック全体の時間ではない。原寸配列の追加はなく、測定した追加図形合成の時間と仕事量からworker化は不要と判断した。command: `cargo test -p local-adjust-core --profile dev-runtime benchmark_8000x6000 -- --ignored --nocapture --test-threads=1`、**2/2成功**、exit 0、実行3.76秒（`benchmark-final.log`）。
+- 最終自動検証（起点 `06c6a964b` + このP2差分、検証担当Codex root、ログ `target/mask-bucket-1673-p2/`）:
+  - `cargo fmt` / `cargo fmt --check`: 成功、exit 0。
+  - `cargo test -p local-adjust-core`: **275/275成功・計測用ignored 2**、exit 0、実行2.45秒。doctest対象0件（`core-final.log`）。ignoredの2件も上記の明示計測で成功済み。
+  - 最適化時の同一性 `cargo test -p local-adjust-core --profile dev-runtime raster_scanline_tests`: **6/6成功・計測用ignored 2**、exit 0、実行0.03秒（`core-optimized-equivalence.log`）。通常testとopt-level=2の両方で旧実装とのf32ビット一致を確認した。
+  - `cargo check -p mimageviewer --lib --tests --features test-script`: 成功、exit 0、3分37秒（`check.log`）。既存warningは残る。
+  - `cargo test -p mimageviewer --lib bucket`: **46/46成功**、exit 0、実行2.71秒（`bucket-related.log`）。今回の2回帰、既存3ツールのUndo／保存再読込も含む。
+  - `cargo test --test ui_snapshot`: **216/216成功**、exit 0、実行38.68秒（`ui-snapshot.log`）。PNGは新規・更新ともなし。
+  - 独立レビュー（GPT-6.1 Sol / xhigh）: **ACCEPT、P1/P2なし**。旧f32式による区間上下界と1点判定／COW順を確認。検証コマンドはrootの結果を再利用する。
+  - `scripts/test-lib-full.ps1`: **15,344実行、15,341成功・3失敗・67 skipped**、exit 100、767.003秒。runは `target/test-lib-full/runs/20261031T195204402Z-2ac7bfbb/`、source IDは `cc7fcae3745dea51c7268e2f81df452c27611a4121e2877e622b539740ea65fe`。失敗runであり成功receipt／全件成功とは扱わない。
+  - 失敗3件は `startup_restore_tests::section1335_tray_direct_book_close_retires_pending_required_page_navigation`（ZIP identity準備10秒待機）、`still_window_mode_key_tests::remote_acquire_retires_startup_resolves_and_rejects_new_activations`（AcquiringRemote / RemoteActive）、`page_turn::draw_submit_tests::page_turn_mainwindow_submits_visible_vacant_leaf_both_directions`（既知不安定§1.447のprogressive uncover）。**それぞれ単独で3回すべて成功**、計9/9、exit 0。`isolated-cases.json` がcase indexの対応、`isolated-1-1.log`〜`isolated-3-3.log` が実行ログ。default nextest profile、test-threads=1、retry=0で、期待値・待機期限・製品コードは変更していない。
+  - 先の2失敗は今回追加で観測したもので、既知／負荷起因とは断定しない。独立reviewerのsource確認では両fixtureに補正マスク・Shape・バケツはなく、P2差分の直接到達経路は見つからなかった。Remoteはconstructorの非同期 `BookResumeWriter::read_all` もacquire fence対象だが、fixtureはlease破棄後poll1回でActiveを要求しており、初期Read未完は候補。ただし当該runのwatermark記録がないため原因確定ではない。navigation / sidecar / resume writer / Remote acquireは無差分。全件の3失敗は検証上の制約として残す。
+  - 指定のmain chrome／複数ウィンドウ3件／スマートフォルダZIP採用の失敗はなく、これらの単独3回条件は発動しなかった。§1.447の失敗1件には上記の3回を実施した。
+  - `scripts/build-dev.ps1 -PreserveRuntime`: **成功、exit 0**。通常feature・portable無効で、core 3分37秒、remote 0.53秒、EPUB worker 0.47秒。`target/dev-runtime/` に3実行体と必要なDLL／bundleを配置し、VCRT／PE監査は runtime=4 / pe=3 で成功（`build-dev.log`、`target/vcrt-pe-reports/dev-runtime.json`）。
+  - 後続は検証結果を記す文書だけを更新し、Rustソースは同一。製品起動・実入力・commitは行っていない。確認用coreの起動方法と実データ注意は上記の実機引継ぎと同じ。P2の確認対象は、図形を持つ補正マスクで同値の点をクリックしたときに理由を表示し、マスクとUndoを変えないこと。クリック全体の実機時間は未計測である。
+
 ### 1.672 論理的な「親へ」とは別に、実際の親フォルダへ移動する操作を追加する — 5ch >>691 (2026-11-01)
 
 - 状態: **未着手・追加の方針を採用 (利用者決定 2026-11-01)**。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643)・[>>656](https://egg.5ch.io/test/read.cgi/software/1782419551/656) の閲覧履歴からの親移動を v4.10.1 で修正した後、[>>691](https://egg.5ch.io/test/read.cgi/software/1782419551/691) でツリー幅と内部データフォルダへ移らなくなったことは確認された。一方、閲覧履歴から `C:\book\book1` を開いて親操作すると `C:\book` ではなく閲覧履歴、その次に履歴の入口へ戻るため、実際の親へ移りたい用途と合っていない。現在の動作は意図した仕様であり、実親へ移動できない技術的制約ではない。

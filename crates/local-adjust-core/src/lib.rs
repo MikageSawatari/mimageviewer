@@ -5345,6 +5345,94 @@ pub fn rasterize_shapes_into_bitmap(
     }
 }
 
+/// Evaluate one pixel of the rasterized shapes without allocating or composing a mask.
+/// Later covering shapes overwrite earlier shapes, exactly as in both raster renderers.
+/// Coordinates outside the image leave `base` unchanged.
+pub fn rasterized_shapes_value_at(
+    base: bool,
+    width: usize,
+    height: usize,
+    shapes: &[MaskShape],
+    x: usize,
+    y: usize,
+) -> bool {
+    if x >= width || y >= height {
+        return base;
+    }
+    for shape in shapes.iter().rev() {
+        let covers = match *shape {
+            MaskShape::Line {
+                p0, p1, thickness, ..
+            } => polygon_covers_pixel(
+                width,
+                height,
+                &line_corners(p0, p1, thickness.max(1.0)),
+                x,
+                y,
+            ),
+            MaskShape::Rect {
+                center,
+                half_w,
+                half_h,
+                rotation_rad,
+                ..
+            } => polygon_covers_pixel(
+                width,
+                height,
+                &rect_corners(center, half_w.max(0.5), half_h.max(0.5), rotation_rad),
+                x,
+                y,
+            ),
+            MaskShape::Ellipse {
+                center,
+                rx,
+                ry,
+                rotation_rad,
+                ..
+            } => {
+                let rx = rx.max(0.5);
+                let ry = ry.max(0.5);
+                let bounds = ellipse_raster_bounds(width, height, center, rx, ry);
+                if bounds.contains(x, y) {
+                    let (s, c) = (-rotation_rad).sin_cos();
+                    ellipse_contains_pixel(center, rx, ry, s, c, x, y)
+                } else {
+                    false
+                }
+            }
+        };
+        if covers {
+            return shape.op().is_add();
+        }
+    }
+    base
+}
+
+#[derive(Clone, Copy)]
+struct ShapeRasterBounds {
+    min_x: usize,
+    max_x: usize,
+    min_y: usize,
+    max_y: usize,
+}
+
+impl ShapeRasterBounds {
+    fn contains(self, x: usize, y: usize) -> bool {
+        x >= self.min_x && x <= self.max_x && y >= self.min_y && y <= self.max_y
+    }
+}
+
+fn polygon_covers_pixel(
+    width: usize,
+    height: usize,
+    points: &[[f32; 2]],
+    x: usize,
+    y: usize,
+) -> bool {
+    polygon_raster_bounds(width, height, points).contains(x, y)
+        && point_in_polygon(x as f32 + 0.5, y as f32 + 0.5, points)
+}
+
 fn rasterize_shape_into<T: Copy>(
     alpha: &mut [T],
     width: usize,
@@ -5390,14 +5478,14 @@ fn rasterize_shape_into<T: Copy>(
     }
 }
 
-fn line_corners(p0: [f32; 2], p1: [f32; 2], thickness: f32) -> Vec<[f32; 2]> {
+fn line_corners(p0: [f32; 2], p1: [f32; 2], thickness: f32) -> [[f32; 2]; 4] {
     let dx = p1[0] - p0[0];
     let dy = p1[1] - p0[1];
     let len = (dx * dx + dy * dy).sqrt().max(1e-6);
     let nx = -dy / len;
     let ny = dx / len;
     let half = thickness * 0.5;
-    vec![
+    [
         [p0[0] + nx * half, p0[1] + ny * half],
         [p1[0] + nx * half, p1[1] + ny * half],
         [p1[0] - nx * half, p1[1] - ny * half],
@@ -5405,30 +5493,18 @@ fn line_corners(p0: [f32; 2], p1: [f32; 2], thickness: f32) -> Vec<[f32; 2]> {
     ]
 }
 
-fn rect_corners(center: [f32; 2], half_w: f32, half_h: f32, rotation_rad: f32) -> Vec<[f32; 2]> {
+fn rect_corners(center: [f32; 2], half_w: f32, half_h: f32, rotation_rad: f32) -> [[f32; 2]; 4] {
     let (s, c) = rotation_rad.sin_cos();
-    let mut out = Vec::with_capacity(4);
-    for [x, y] in [
+    [
         [-half_w, -half_h],
         [half_w, -half_h],
         [half_w, half_h],
         [-half_w, half_h],
-    ] {
-        out.push([center[0] + x * c - y * s, center[1] + x * s + y * c]);
-    }
-    out
+    ]
+    .map(|[x, y]| [center[0] + x * c - y * s, center[1] + x * s + y * c])
 }
 
-fn fill_polygon_alpha<T: Copy>(
-    alpha: &mut [T],
-    width: usize,
-    height: usize,
-    points: &[[f32; 2]],
-    value: T,
-) {
-    if points.len() < 3 || width == 0 || height == 0 {
-        return;
-    }
+fn polygon_raster_bounds(width: usize, height: usize, points: &[[f32; 2]]) -> ShapeRasterBounds {
     let min_x = points
         .iter()
         .map(|p| p[0])
@@ -5453,13 +5529,192 @@ fn fill_polygon_alpha<T: Copy>(
         .fold(f32::NEG_INFINITY, f32::max)
         .ceil()
         .min(height as f32 - 1.0) as usize;
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            if point_in_polygon(x as f32 + 0.5, y as f32 + 0.5, points) {
-                alpha[y * width + x] = value;
-            }
+    ShapeRasterBounds {
+        min_x,
+        max_x,
+        min_y,
+        max_y,
+    }
+}
+
+/// First column where a monotonic predicate becomes true; `end` is exclusive.
+fn first_raster_column(
+    mut start: usize,
+    mut end: usize,
+    predicate: impl Fn(usize) -> bool,
+) -> usize {
+    while start < end {
+        let mid = start + (end - start) / 2;
+        #[cfg(test)]
+        raster_scanline_tests::record_boundary_probe();
+        if predicate(mid) {
+            end = mid;
+        } else {
+            start = mid + 1;
         }
     }
+    start
+}
+
+fn fill_polygon_alpha<T: Copy>(
+    alpha: &mut [T],
+    width: usize,
+    height: usize,
+    points: &[[f32; 2]; 4],
+    value: T,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let bounds = polygon_raster_bounds(width, height, points);
+    if bounds.min_x > bounds.max_x {
+        return;
+    }
+    let end = bounds.max_x + 1;
+    for y in bounds.min_y..=bounds.max_y {
+        let py = y as f32 + 0.5;
+        let mut transitions = [0; 4];
+        let mut count = 0;
+        let mut j = points.len() - 1;
+        for i in 0..points.len() {
+            let [xi, yi] = points[i];
+            let [xj, yj] = points[j];
+            let dy = yj - yi;
+            if ((yi > py) != (yj > py)) && dy.abs() > 1e-6 {
+                // Preserve the old f32 operation order and strict center comparison.
+                let crossing = (xj - xi) * (py - yi) / dy + xi;
+                transitions[count] =
+                    first_raster_column(bounds.min_x, end, |x| !(x as f32 + 0.5 < crossing));
+                count += 1;
+            }
+            j = i;
+        }
+        transitions[..count].sort_unstable();
+        // Do not assume an even number: the historical tiny-dy exclusion can leave one.
+        let mut inside = count % 2 != 0;
+        let mut start = bounds.min_x;
+        for &stop in &transitions[..count] {
+            if inside {
+                #[cfg(test)]
+                raster_scanline_tests::record_visited_pixels(stop - start);
+                alpha[y * width + start..y * width + stop].fill(value);
+            }
+            inside = !inside;
+            start = stop;
+        }
+        if inside {
+            #[cfg(test)]
+            raster_scanline_tests::record_visited_pixels(end - start);
+            alpha[y * width + start..y * width + end].fill(value);
+        }
+    }
+}
+
+fn ellipse_raster_bounds(
+    width: usize,
+    height: usize,
+    center: [f32; 2],
+    rx: f32,
+    ry: f32,
+) -> ShapeRasterBounds {
+    let radius = rx.max(ry);
+    ShapeRasterBounds {
+        min_x: (center[0] - radius).floor().max(0.0) as usize,
+        max_x: (center[0] + radius).ceil().min(width as f32 - 1.0) as usize,
+        min_y: (center[1] - radius).floor().max(0.0) as usize,
+        max_y: (center[1] + radius).ceil().min(height as f32 - 1.0) as usize,
+    }
+}
+
+fn ellipse_contains_pixel(
+    center: [f32; 2],
+    rx: f32,
+    ry: f32,
+    s: f32,
+    c: f32,
+    x: usize,
+    y: usize,
+) -> bool {
+    let dx = x as f32 + 0.5 - center[0];
+    let dy = y as f32 + 0.5 - center[1];
+    let lx = dx * c - dy * s;
+    let ly = dx * s + dy * c;
+    (lx / rx).powi(2) + (ly / ry).powi(2) <= 1.0
+}
+
+#[derive(Clone, Copy)]
+struct EllipseRasterRow {
+    center_x: f32,
+    dy: f32,
+    rx: f32,
+    ry: f32,
+    s: f32,
+    c: f32,
+}
+
+impl EllipseRasterRow {
+    fn coordinates(self, x: usize) -> [f32; 2] {
+        let dx = x as f32 + 0.5 - self.center_x;
+        let lx = dx * self.c - self.dy * self.s;
+        let ly = dx * self.s + self.dy * self.c;
+        [lx / self.rx, ly / self.ry]
+    }
+}
+
+fn fill_ellipse_row_interval<T: Copy>(
+    alpha: &mut [T],
+    row_offset: usize,
+    start: usize,
+    end: usize,
+    row: EllipseRasterRow,
+    value: T,
+) {
+    if start == end {
+        return;
+    }
+    #[cfg(test)]
+    raster_scanline_tests::record_interval_test();
+    let a = row.coordinates(start);
+    if end - start == 1 {
+        #[cfg(test)]
+        raster_scanline_tests::record_visited_pixels(1);
+        if a[0].powi(2) + a[1].powi(2) <= 1.0 {
+            alpha[row_offset + start] = value;
+        }
+        return;
+    }
+    let b = row.coordinates(end - 1);
+    if !a.iter().chain(&b).any(|q| q.is_nan()) {
+        let mut min_abs = [0.0_f32; 2];
+        let mut max_abs = [0.0_f32; 2];
+        for i in 0..2 {
+            let lo = a[i].min(b[i]);
+            let hi = a[i].max(b[i]);
+            min_abs[i] = if lo <= 0.0 && hi >= 0.0 {
+                0.0
+            } else {
+                lo.abs().min(hi.abs())
+            };
+            max_abs[i] = lo.abs().max(hi.abs());
+        }
+        // The old normalized coordinates are monotonic across the row. Squaring
+        // nonnegative values and adding are monotonic even with f32 rounding, so
+        // these bound the *old discrete predicate*, without an analytic epsilon.
+        if min_abs[0].powi(2) + min_abs[1].powi(2) > 1.0 {
+            return;
+        }
+        if max_abs[0].powi(2) + max_abs[1].powi(2) <= 1.0 {
+            #[cfg(test)]
+            raster_scanline_tests::record_visited_pixels(end - start);
+            alpha[row_offset + start..row_offset + end].fill(value);
+            return;
+        }
+    }
+    // Only ambiguous boundary intervals are split. Halving the integer width
+    // bounds stack depth by usize::BITS; no row-sized worklist is needed.
+    let mid = start + (end - start) / 2;
+    fill_ellipse_row_interval(alpha, row_offset, start, mid, row, value);
+    fill_ellipse_row_interval(alpha, row_offset, mid, end, row, value);
 }
 
 fn fill_ellipse_alpha<T: Copy>(
@@ -5475,20 +5730,61 @@ fn fill_ellipse_alpha<T: Copy>(
     if width == 0 || height == 0 {
         return;
     }
-    let radius = rx.max(ry);
-    let min_x = (center[0] - radius).floor().max(0.0) as usize;
-    let max_x = (center[0] + radius).ceil().min(width as f32 - 1.0) as usize;
-    let min_y = (center[1] - radius).floor().max(0.0) as usize;
-    let max_y = (center[1] + radius).ceil().min(height as f32 - 1.0) as usize;
+    let bounds = ellipse_raster_bounds(width, height, center, rx, ry);
+    if bounds.min_x > bounds.max_x {
+        return;
+    }
     let (s, c) = (-rotation_rad).sin_cos();
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let dx = x as f32 + 0.5 - center[0];
+    let finite = center.iter().all(|v| v.is_finite())
+        && rx.is_finite()
+        && ry.is_finite()
+        && s.is_finite()
+        && c.is_finite();
+    for y in bounds.min_y..=bounds.max_y {
+        let mut start = bounds.min_x;
+        let mut end = bounds.max_x + 1;
+        if finite {
             let dy = y as f32 + 0.5 - center[1];
-            let lx = dx * c - dy * s;
-            let ly = dx * s + dy * c;
-            if (lx / rx).powi(2) + (ly / ry).powi(2) <= 1.0 {
-                alpha[y * width + x] = value;
+            // Each old normalized local coordinate is monotonic across a row. Any
+            // accepted pixel must have both in [-1, 1]. Intersect those strips first,
+            // then classify intervals with exact bounds of the old f32 predicate.
+            for local_x in [true, false] {
+                let coefficient = if local_x { c } else { s };
+                let coordinate = |x: usize| {
+                    let dx = x as f32 + 0.5 - center[0];
+                    let q = if local_x {
+                        (dx * c - dy * s) / rx
+                    } else {
+                        (dx * s + dy * c) / ry
+                    };
+                    if coefficient < 0.0 { -q } else { q }
+                };
+                start = first_raster_column(start, end, |x| coordinate(x) >= -1.0);
+                end = first_raster_column(start, end, |x| coordinate(x) > 1.0);
+            }
+            fill_ellipse_row_interval(
+                alpha,
+                y * width,
+                start,
+                end,
+                EllipseRasterRow {
+                    center_x: center[0],
+                    dy,
+                    rx,
+                    ry,
+                    s,
+                    c,
+                },
+                value,
+            );
+        } else {
+            // Preserve malformed/nonfinite geometry's historical output too.
+            #[cfg(test)]
+            raster_scanline_tests::record_visited_pixels(end - start);
+            for x in start..end {
+                if ellipse_contains_pixel(center, rx, ry, s, c, x, y) {
+                    alpha[y * width + x] = value;
+                }
             }
         }
     }
@@ -5512,6 +5808,9 @@ fn point_in_polygon(x: f32, y: f32, points: &[[f32; 2]]) -> bool {
     }
     inside
 }
+
+#[cfg(test)]
+mod raster_scanline_tests;
 
 fn eval_linear_gradient(width: usize, height: usize, mask: LinearGradientMask) -> Vec<f32> {
     if !mask.initialized {

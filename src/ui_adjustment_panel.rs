@@ -1020,7 +1020,7 @@ mod local_adjust_segmentation_tests {
         let red = egui::Color32::from_rgb(180, 20, 20);
         let blue = egui::Color32::from_rgb(20, 20, 180);
         let source = egui::ColorImage::new([5, 1], vec![red, red, blue, red, red]);
-        let mut alpha = vec![0.0; 5];
+        let mut alpha = local_adjust_core::MaskAlpha::new(vec![0.0; 5]);
 
         let fill = crate::mask_db::BucketFill {
             tolerance: 0,
@@ -1044,7 +1044,7 @@ mod local_adjust_segmentation_tests {
             ),
             filled
         );
-        assert_eq!(alpha, vec![1.0, 1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(*alpha, vec![1.0, 1.0, 0.0, 0.0, 0.0]);
 
         assert_eq!(
             flood_fill_local_adjust_alpha_mask(
@@ -1061,7 +1061,7 @@ mod local_adjust_segmentation_tests {
             ),
             filled
         );
-        assert_eq!(alpha, vec![0.0; 5]);
+        assert_eq!(*alpha, vec![0.0; 5]);
 
         assert_eq!(
             flood_fill_local_adjust_alpha_mask(
@@ -1078,7 +1078,7 @@ mod local_adjust_segmentation_tests {
             ),
             filled
         );
-        assert_eq!(alpha, vec![1.0, 1.0, 0.0, 1.0, 1.0]);
+        assert_eq!(*alpha, vec![1.0, 1.0, 0.0, 1.0, 1.0]);
     }
 
     #[test]
@@ -2194,7 +2194,7 @@ fn local_adjust_morph_alpha_1px(
 }
 
 fn flood_fill_local_adjust_alpha_mask(
-    alpha: &mut [f32],
+    alpha: &mut local_adjust_core::MaskAlpha,
     source: &egui::ColorImage,
     seed_x: usize,
     seed_y: usize,
@@ -2202,9 +2202,29 @@ fn flood_fill_local_adjust_alpha_mask(
     bucket_source: crate::mask_db::BucketSource,
     shapes: &[local_adjust_core::MaskShape],
 ) -> crate::mask_db::BucketFillOutcome {
-    let expected_len = source.size[0].saturating_mul(source.size[1]);
-    if expected_len == 0 || alpha.len() < expected_len {
+    let [width, height] = source.size;
+    let expected_len = width.saturating_mul(height);
+    if width == 0
+        || height == 0
+        || seed_x >= width
+        || seed_y >= height
+        || alpha.len() < expected_len
+    {
         return crate::mask_db::BucketFillOutcome::Invalid;
+    }
+    // Reject matching seeds before bitmap allocation, full shape composition,
+    // or copy-on-write of the original alpha plane.
+    if bucket_source == crate::mask_db::BucketSource::DrawnMask
+        && local_adjust_core::rasterized_shapes_value_at(
+            alpha[seed_y * width + seed_x] >= 0.5,
+            width,
+            height,
+            shapes,
+            seed_x,
+            seed_y,
+        ) == fill.value
+    {
+        return crate::mask_db::BucketFillOutcome::SeedAlreadyValue;
     }
     let mut bitmap: Vec<bool> = alpha[..expected_len]
         .iter()
@@ -2235,6 +2255,7 @@ fn flood_fill_local_adjust_alpha_mask(
     if outcome != crate::mask_db::BucketFillOutcome::Filled {
         return outcome;
     }
+    let alpha = std::sync::Arc::make_mut(alpha);
     for (alpha, value) in alpha[..expected_len].iter_mut().zip(bitmap) {
         *alpha = if value { 1.0 } else { 0.0 };
     }
@@ -11675,7 +11696,7 @@ impl App {
                     return LocalAdjustCanvasEdit::prepared_only(preparation, target);
                 }
                 outcome = flood_fill_local_adjust_alpha_mask(
-                    std::sync::Arc::make_mut(&mut mask.alpha).as_mut_slice(),
+                    &mut mask.alpha,
                     source.as_ref(),
                     seed_x,
                     seed_y,
