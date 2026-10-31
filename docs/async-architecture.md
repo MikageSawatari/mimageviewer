@@ -1310,6 +1310,15 @@ RAII permit で、プロセス全体を総枠 6、Normal は最大 4 に制限�
 High (現在ページと表示中の見開き相方) 用で、表示判定は `App::page_is_displayed` に
 集約する。
 
+§1.674（2026-11-01）の連結表示は、許可済み layout consumer が厳密可視 source の
+High / Normal を共通 load owner へ明示する。初回 PDF target も同 consumer が先に登録し、
+現在ページ以外の可視 unit を待機中の取消から保護する。prepare/keep の通常先読み、
+animation 全フレーム昇格の現在 unit 寿命、非表示 AI / 出力用要求の既存優先度は維持する。
+結果・ticket・取消・upload backlog は既存 viewer context に所有させ、新しい要求 queue は作らない。
+連結 PDF の解像度更新は実 paint geometry 由来の需要を既存 source/target/lane の pending / failure
+owner へ調停し、完成 backlog 中は採用を待つ。画面外への取消後に同じ倍率へ戻っても、発行済み target
+の記憶だけで再入場を止めない。新しい retry state / timer / repaint は追加しない。
+
 要求自体は viewer context ごとの `fs_pending` が `FsPageLoadTicket` を所有する。
 context の破棄、世代切り替え、書庫移動、close は既存の discard hook を通じて ticket を
 cancel する。待機中なら permit を取らずに消え、実行中なら `Cancelling` のまま実終了まで

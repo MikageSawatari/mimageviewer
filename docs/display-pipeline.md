@@ -2708,6 +2708,23 @@ Q3 SetSpreadの成功公開・group cache失効はshift Clearのcommit結果を�
 スクロール位置から毎フレーム計算する。描画対象はマージン 0 の厳密可視ユニットだけに保ち、
 final pipeline の処理対象には前後 1 ユニットの準備帯も加える。準備帯は描画にも可視ページ数上限の
 判定にも含めない。GPU に保持するのは可視範囲と前後少数ページだけにする。
+
+§1.674（2026-11-01）: 許可済みの連結 layout が確定した consumer は、実画像領域と
+その context の ppp から `fs_pdf_display_target` を登録してから共通 source load owner を呼ぶ。
+初回 open が paged の描画を一度も通らなくても、PDF の読み込みを開始できる。
+表示優先度と取消保護は現在 unit だけでなく、許可済みの厳密可視 unit の全 source を使う。
+新規表示要求は scheduler High / PDF Critical、通常先読みが可視になったときは同じ ticket を
+High に昇格し、既存の pool 昇格 owner へ可視集合を渡す。canonical prepare/keep の Normal
+先読みは従来どおりで、提示許可との同一視や全ページの要求は行わない。
+
+初回 raster の採用後は、実際に描いた `layout_full_image_rect` の物理長辺を source ごとに
+最大集約し、既存の absolute PDF demand owner へ渡す。trim・split・回転・zoom・見開きの
+高さ揃えを反映した一つの需要とし、別の fit/zoom 要求で同じ pending を置き換えない。
+既に十分な raster は維持し、Original/縮小禁止の vector 4096 floor、raster native 上限、
+8192 上限は共通 PDF policy に従う。初回 raw pending/backlog 中に未発行の absolute 需要を
+記録しない。新しい状態・queue・timer・repaint は追加せず、paged の表示規則は維持する。
+modal 化は通常のスクロールを止めるため採らず、可視 consumer への需要集約で組合せを減らす。
+
 同時可視ページ数は最大 16 ページ程度、`fs_cache` の連結読み用 keep set は最大 20 ページ程度に
 抑え、推定総テクセル数でも追加の安全弁をかける。推定にはrawだけでなく、erase、local-adjust、
 conceal、edit、final composite、comic、補正の完全mip chainをTextureId重複排除つきで含め、

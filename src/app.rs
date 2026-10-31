@@ -8513,6 +8513,9 @@ use crate::canonical_image_loader::{
 use crate::fs_animation::{AnimationPlayback, FsCacheEntry, FsLoadResult, StaticAnimationState};
 
 #[cfg(test)]
+pub(crate) mod fs_load_test_probe;
+
+#[cfg(test)]
 thread_local! {
     static PDF_RERENDER_REQUEST_PROBE: std::cell::RefCell<Option<PdfRerenderProbeState>> = const { std::cell::RefCell::new(None) };
 }
@@ -78377,6 +78380,22 @@ impl App {
         contract: FsPageLoadContract,
         playback_origin: crate::video::PlaybackStartOrigin,
     ) {
+        let priority = if self.page_is_displayed_now(idx) {
+            FsPageLoadPriority::High
+        } else {
+            FsPageLoadPriority::Normal
+        };
+        self.start_fs_load_with_priority(idx, purpose, contract, playback_origin, priority);
+    }
+
+    fn start_fs_load_with_priority(
+        &mut self,
+        idx: usize,
+        purpose: FsLoadPurpose,
+        contract: FsPageLoadContract,
+        playback_origin: crate::video::PlaybackStartOrigin,
+        scheduler_priority: FsPageLoadPriority,
+    ) {
         if !matches!(purpose, FsLoadPurpose::Original { .. })
             && (self
                 .fs_pending
@@ -78681,13 +78700,7 @@ impl App {
 
         // フルスクリーン現在ページ (ユーザーが待っているもの) は Critical、
         // それ以外 (先読み) は Normal。Critical はプールの予約ワーカーで即処理される。
-        let displayed = self.page_is_displayed_now(idx);
-        let scheduler_priority = if displayed {
-            FsPageLoadPriority::High
-        } else {
-            FsPageLoadPriority::Normal
-        };
-        let pdf_priority = if displayed {
+        let pdf_priority = if scheduler_priority == FsPageLoadPriority::High {
             crate::pdf_loader::JobPriority::Critical
         } else {
             crate::pdf_loader::JobPriority::Normal
@@ -78706,7 +78719,6 @@ impl App {
             perf_seq,
         );
         let cancel = ticket.cancel_token();
-        let waiter = ticket.waiter();
         let pending = FsPendingValue::scheduled(ticket, rx, perf_seq, purpose);
         self.fs_pending.insert(idx, pending);
         // 360 度パノラマビュー Phase 2a: 通常画像 (= PDF / ZIP 除く) のみで
@@ -78763,6 +78775,19 @@ impl App {
         }
         let perf_key_worker = perf_key.clone();
 
+        #[cfg(test)]
+        if fs_load_test_probe::intercept(
+            self,
+            idx,
+            &tx,
+            pdf_display_request.map(|(target, _)| target),
+            None,
+            scheduler_priority,
+        ) {
+            return;
+        }
+
+        let waiter = self.fs_pending.get(&idx).unwrap().ticket.waiter();
         std::thread::spawn(move || {
             // スレッド出口で reason を記録する小ヘルパー (全 return 直前に呼ぶ)
             let emit_exit = |reason: &'static str| {
@@ -79373,6 +79398,33 @@ impl App {
         required_long_edge_px: f32,
         original_floor: bool,
     ) {
+        self.request_pdf_absolute_demand_inner(idx, required_long_edge_px, original_floor, false);
+    }
+
+    pub(crate) fn request_continuous_pdf_absolute_demand(
+        &mut self,
+        idx: usize,
+        required_long_edge_px: f32,
+        original_floor: bool,
+    ) {
+        self.request_pdf_absolute_demand_inner(idx, required_long_edge_px, original_floor, true);
+    }
+
+    fn request_pdf_absolute_demand_inner(
+        &mut self,
+        idx: usize,
+        required_long_edge_px: f32,
+        original_floor: bool,
+        continuous: bool,
+    ) {
+        if continuous
+            && (!matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Static { .. }))
+                || self.fs_upload_backlog_contains(idx))
+        {
+            // Initial raw pending/backlog owns the first raster. Do not record an
+            // unissued absolute demand and suppress its refinement after adoption.
+            return;
+        }
         // Do not mark an unissued display target as fulfilled while raw hydration owns this page.
         if self
             .fs_pending
@@ -79406,11 +79458,40 @@ impl App {
                     content_type,
                 )
             };
-        if self
-            .fs_pdf_rerender_demand
-            .note_absolute(idx, source, target)
+        if continuous
+            && let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx)
+            && (pixels.size[0].max(pixels.size[1]) as f32 >= target as f32 * 0.9
+                || self.pdf_raster_matches_target(
+                    idx,
+                    pixels.size[0].max(pixels.size[1]) as u32,
+                    target,
+                ))
         {
-            self.request_pdf_rerender_at_target(idx, target, true);
+            return;
+        }
+        // Continuous visibility can withdraw and re-enter with unchanged geometry.
+        // The pending/result/failure owner, rather than a remembered issued target,
+        // decides whether this demand is already covered after cancellation.
+        if continuous
+            || self
+                .fs_pdf_rerender_demand
+                .note_absolute(idx, source, target)
+        {
+            if continuous {
+                self.request_pdf_rerender_at_target_with_priority(
+                    idx,
+                    target,
+                    true,
+                    FsPageLoadPriority::High,
+                );
+                self.apply_fs_page_load_contract_with_priority(
+                    idx,
+                    FsPageLoadContract::Sequential,
+                    FsPageLoadPriority::High,
+                );
+            } else {
+                self.request_pdf_rerender_at_target(idx, target, true);
+            }
         }
     }
 
@@ -79519,6 +79600,26 @@ impl App {
     }
 
     fn request_pdf_rerender_at_target(&mut self, idx: usize, target_px: u32, priority: bool) {
+        let scheduler_priority = if self.page_is_displayed_now(idx) {
+            FsPageLoadPriority::High
+        } else {
+            FsPageLoadPriority::Normal
+        };
+        self.request_pdf_rerender_at_target_with_priority(
+            idx,
+            target_px,
+            priority,
+            scheduler_priority,
+        );
+    }
+
+    fn request_pdf_rerender_at_target_with_priority(
+        &mut self,
+        idx: usize,
+        target_px: u32,
+        priority: bool,
+        scheduler_priority: FsPageLoadPriority,
+    ) {
         if self.pdf_rerender_failed_for_target(idx, target_px) {
             return;
         }
@@ -79602,12 +79703,6 @@ impl App {
         let (fs_tx, fs_rx) = mpsc::channel::<FsLoadResult>();
         let perf_seq = self.input_seq;
         let perf_key = self.perf_item_key(idx);
-        let displayed = self.page_is_displayed_now(idx);
-        let scheduler_priority = if displayed {
-            FsPageLoadPriority::High
-        } else {
-            FsPageLoadPriority::Normal
-        };
         let ticket = self.fs_page_load_scheduler.request(
             self.fs_page_load_context_serial(),
             idx,
@@ -79643,6 +79738,17 @@ impl App {
             return;
         }
 
+        #[cfg(test)]
+        if fs_load_test_probe::intercept(
+            self,
+            idx,
+            &fs_tx,
+            None,
+            Some(target_px),
+            scheduler_priority,
+        ) {
+            return;
+        }
         let waiter = self.fs_pending.get(&idx).unwrap().ticket.waiter();
         std::thread::spawn(move || {
             let Some(_permit) = waiter.acquire_cancellable() else {
@@ -87116,8 +87222,15 @@ impl App {
         };
         let mut page_indices = vec![fs_idx];
         page_indices.extend(self.displayed_spread_partner(fs_idx));
-        let mut display_keys = HashSet::with_capacity(page_indices.len());
-        let mut pending_keys = HashSet::with_capacity(page_indices.len());
+        self.fullscreen_pdf_promotion_keys_for_pages(page_indices)
+    }
+
+    fn fullscreen_pdf_promotion_keys_for_pages(
+        &self,
+        page_indices: impl IntoIterator<Item = usize>,
+    ) -> (HashSet<String>, HashSet<String>) {
+        let mut display_keys = HashSet::new();
+        let mut pending_keys = HashSet::new();
         for idx in page_indices {
             let Some(GridItem::PdfPage {
                 pdf_path, page_num, ..
@@ -87139,6 +87252,15 @@ impl App {
         promote: impl FnOnce(&HashSet<String>) -> crate::pdf_loader::PromoteStats,
     ) -> Option<FullscreenPdfPromotionAttempt> {
         let (display_keys, pending_keys) = self.current_fullscreen_pdf_promotion_keys();
+        self.refresh_fullscreen_pdf_promotion_for_keys_with(display_keys, pending_keys, promote)
+    }
+
+    fn refresh_fullscreen_pdf_promotion_for_keys_with(
+        &mut self,
+        display_keys: HashSet<String>,
+        pending_keys: HashSet<String>,
+        promote: impl FnOnce(&HashSet<String>) -> crate::pdf_loader::PromoteStats,
+    ) -> Option<FullscreenPdfPromotionAttempt> {
         if display_keys.is_empty() {
             self.fullscreen_pdf_promotion = FullscreenPdfPromotionState::Idle;
             return None;
@@ -87249,6 +87371,25 @@ impl App {
         }) else {
             return;
         };
+        self.record_fullscreen_pdf_promotion(attempt);
+    }
+
+    pub(crate) fn refresh_continuous_pdf_promotion(&mut self, visible: &HashSet<usize>) {
+        let (display, pending) =
+            self.fullscreen_pdf_promotion_keys_for_pages(visible.iter().copied());
+        if let Some(attempt) =
+            self.refresh_fullscreen_pdf_promotion_for_keys_with(display, pending, |keys| {
+                crate::pdf_loader::promote_fullscreen_to_high_normal(
+                    keys,
+                    &crate::pdf_loader::PdfRenderValidity::Unscoped,
+                )
+            })
+        {
+            self.record_fullscreen_pdf_promotion(attempt);
+        }
+    }
+
+    fn record_fullscreen_pdf_promotion(&self, attempt: FullscreenPdfPromotionAttempt) {
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "pdf",
@@ -87324,30 +87465,67 @@ impl App {
         idx: usize,
         contract: FsPageLoadContract,
     ) -> FsPageLoadState {
-        // Every page that is about to be shown passes through here, which makes it the one place
-        // that sees each page before the user does.
-        self.verify_display_identity(idx);
-        let state = self.fs_page_load_state(idx);
-        self.apply_fs_page_load_contract(idx, contract);
-        if matches!(state, FsPageLoadState::DisplayReady(_)) {
-            self.start_animation_promotion_if_needed(idx);
-        }
-        let state = if state.needs_load_request() {
-            self.start_fs_load_with_contract(idx, contract);
-            self.fs_page_load_state(idx)
+        let priority = if self.page_is_displayed_now(idx) {
+            FsPageLoadPriority::High
         } else {
-            self.note_fs_page_load_skipped(idx, state);
-            state
+            FsPageLoadPriority::Normal
         };
+        let state = self.ensure_fs_page_load_with_priority(idx, contract, priority);
         if self.fullscreen_idx == Some(idx) {
             self.refresh_fullscreen_pdf_promotion();
         }
         state
     }
 
+    /// The continuous consumer supplies this frame's admitted visibility explicitly.
+    /// Pending, source results and cancellation remain with the ordinary page-load owner.
+    pub(crate) fn ensure_fs_page_load_with_priority(
+        &mut self,
+        idx: usize,
+        contract: FsPageLoadContract,
+        priority: FsPageLoadPriority,
+    ) -> FsPageLoadState {
+        // Every page that is about to be shown passes through here, which makes it the one place
+        // that sees each page before the user does.
+        self.verify_display_identity(idx);
+        let state = self.fs_page_load_state(idx);
+        self.apply_fs_page_load_contract_with_priority(idx, contract, priority);
+        if matches!(state, FsPageLoadState::DisplayReady(_)) {
+            self.start_animation_promotion_if_needed(idx);
+        }
+        let state = if state.needs_load_request() {
+            self.start_fs_load_with_priority(
+                idx,
+                FsLoadPurpose::for_page(self.fullscreen_idx == Some(idx)),
+                contract,
+                crate::video::PlaybackStartOrigin::NewSource,
+                priority,
+            );
+            self.fs_page_load_state(idx)
+        } else {
+            self.note_fs_page_load_skipped(idx, state);
+            state
+        };
+        state
+    }
+
     fn apply_fs_page_load_contract(&mut self, idx: usize, contract: FsPageLoadContract) {
+        let priority = if self.page_is_displayed_now(idx) {
+            FsPageLoadPriority::High
+        } else {
+            FsPageLoadPriority::Normal
+        };
+        self.apply_fs_page_load_contract_with_priority(idx, contract, priority);
+    }
+
+    fn apply_fs_page_load_contract_with_priority(
+        &mut self,
+        idx: usize,
+        contract: FsPageLoadContract,
+        priority: FsPageLoadPriority,
+    ) {
         if self.is_raw_page(idx) {
-            if self.page_is_displayed_now(idx) {
+            if priority == FsPageLoadPriority::High {
                 if let Some(page) = self.raw_pages.page(idx) {
                     page.develop.lock().unwrap().promote();
                 }
@@ -87364,7 +87542,7 @@ impl App {
             }
             return;
         }
-        let promoted_waiting = self.page_is_displayed_now(idx)
+        let promoted_waiting = priority == FsPageLoadPriority::High
             && self
                 .fs_pending
                 .get(&idx)

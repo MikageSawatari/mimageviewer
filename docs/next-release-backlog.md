@@ -54,16 +54,107 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.674 横連結読みで、画面に見えている隣の PDF ページが高画質にならず、一覧のサムネイルを拡大したままになる — 利用者報告 (2026-11-01)
 
-- 状態: **未着手・原因調査を実装担当へ (2026-11-01)**。利用者が v4.10.2 (インストール版) で PDF (`D:\home\scan\illust\20221030_010.pdf`、24 ページ) を全画面で閲覧中、2 枚並んだうち右はきれいで、左がサムネイル画質の拡大に見えると報告 (スクリーンショットあり)。利用者は「見開き」と認識していたが、ログ上の表示は連結読み。
+- 状態: **実装済み・実機未確認 (2026-11-01)**。利用者が v4.10.2 (インストール版) で PDF (`D:\home\scan\illust\20221030_010.pdf`、24 ページ) を全画面で閲覧中、2 枚並んだうち右はきれいで、左がサムネイル画質の拡大に見えると報告 (スクリーンショットあり)。利用者は「見開き」と認識していたが、ログ上の表示は連結読み。
 - 観測 (ClaudeCode が利用者の perf ログ `%APPDATA%\mimageviewer\logs\perf_events.jsonl` を読んだもの。アプリには触れていない。抜き出しは worktree `G:\home\mimageviewer-pdfq-1674\target\1674-evidence\`):
   - 一覧で PDF を開き、ページ一覧から idx 0 をダブルクリックで開いた (t=5349.9)。全画面の高画質要求は t=5355.638 から **idx 3 だけ** (`scheduler_enqueue` contract=sequential、`pool_send` target_px 7539 → 3163 → 5532 と 3 回作り直し)。
   - 画面に並んでいる **idx 4 は一度も全画面の要求が出ていない**。描画は `continuous_draw idx=4 texture=Managed(5940)` で、Managed(5940) は一覧のアイドル高画質化で作った長辺 561px のテクスチャ (`texture_delivery_submitted` t=5349.762、`page_0004` decode_end)。`final_prepare_native_lookup` も idx 4 は `native_key=null outcome=not_needed`。
   - `page_turn_decision` は `reason=reading_flow_not_paged` (`fs_page_turn_ordinary_context_blocker`、`reading_flow.is_paged()` が false = 縦 / 横連結読み)。
   - 先読みは `final_effect_prefetch_blocked reason=not_in_keep_set` が idx 7〜13 で毎秒出ている。idx 4 の blocked 記録は無い (要求の候補にすら上がっていない可能性)。
-  - 開いた直後 (t=5355.6〜5358.4) に `pool_promote_fullscreen trigger=not_found_retry not_found=1` が約 137 回、ほぼ毎フレーム出て止まった。同じ時間帯の idx 3 の要求とは別の、見つからない昇格対象がある。
+  - 開いた直後 (t=5355.6〜5358.4) に `pool_promote_fullscreen not_found=1` が 137 回、ほぼ毎フレーム出て止まった。内訳は `pending_job_queued` 3 回と `not_found_retry` 134 回。当初は別対象を疑ったが、後述の再解析では idx 3 自身の実行中要求と一致する。
   - 静止中も約 40 フレーム / 秒で描画が続いている (直近 9 秒で `begin` 377 件、`tail_repaint action=none reasons=[]`)。マウス操作によるものかは未確認。
 - 調べること: 連結読みで、画面に見えているページ (現在のページ以外) に全画面の高画質要求が出る経路と、それが idx 4 で出なかった理由。keep set の作り方 (`prefetch_policy.rs` の `continuous_keep_set`)、sequential contract で現在ページ以外が後回し・取りこぼしになっていないか、ページ一覧から開いた入口に固有の問題か。`not_found_retry` の連続と、静止中の描画継続も同じ原因か別件か切り分ける。いつから起きているか (v4.10.0 のページめくり・先読みの変更との関係) も git 履歴で確かめる。
 - 対象: `src/ui_fullscreen.rs` の連結読みの描画と要求、`src/app/prefetch_policy.rs`、PDF の worker pool (`src/pdf_loader.rs`)、[表示パイプライン](display-pipeline.md)。規模: 原因確認後 / 優先度: P2 (通常の閲覧で画質が落ちる)。
+
+#### 原因・実装記録（2026-11-01、Codex の source / headless 調査）
+
+- **確認済みの原因**: `render_fullscreen_viewport_with_root_input` の PDF target 登録は
+  `display_permission_allowed && !continuous` の内側にある。連結 consumer に登録の移設がなく、
+  cold open では `fs_pdf_display_target=None` のまま
+  `update_continuous_reading_prefetch_window → ensure_fs_page_load → start_fs_load` へ進み、
+  `start_fs_load` の「実 viewport 未確定」で無言 return する。一覧 texture は共通 load state の
+  Ready 判定には使われておらず、keep set / sequential / final-effect admission の欠落が主因ではない。
+  修正前の実 draw テストは `continuous PDF never registered its drawing target` で失敗した
+  （`target/1674-evidence/repro-before.log`）。利用者ログの `fs.load_begin` は 0 件、
+  scheduler enqueue / fs ready は idx 3 の別再レンダ 3 回だけで、この経路と整合する。
+  3 回それぞれの操作 trigger は既存ログに記録されていないため、個々の zoom 操作まで断定しない。
+- **いつからか**: `dda35f8189`（2026-10-11、G3 本の構成・表示許可）で `!continuous` を追加した。
+  親 revision と v4.6.0 では共通の target 登録を通り、v4.7.0 では除外される。
+  master への統合は `0d55918af`（2026-10-15）、最初の出荷は v4.7.0。
+  v4.10.0 の通常フォルダへの紙めくり拡張や編集先読みがこの登録漏れを作ったわけではない。
+  報告環境の過去版を実行した比較ではなく、git 差分による退行区間の特定。
+- **修正**: 許可済み連結 layout の確定後、実 image rect / ppp の typed PDF target を登録する。
+  全可視 unit の許可済 source 集合を共通 load owner へ明示し、新規要求・既存 ticket 昇格を
+  scheduler High とし、取消から保護する。通常 canonical prepare/keep の Normal 先読みと
+  既存 VRAM 水位・枚数制限は維持。現在 unit の読込中に別の可視 unit を取消す欠陥も修正。
+  初回 raster 採用後は実 paint の full-image rect の物理長辺を source ごとに最大集約し、
+  同じ pending / failure owner へ一つの absolute 需要を渡す。連結 zoom の別要求はこの consumer に
+  集約し、fit と zoom の相互取消を作らない。backlog は採用を待ち、取消後の同一倍率への再入場は
+  発行済 target の記憶で止めない。paged の既存 ledger と非表示 AI / 出力用 scheduler 優先度は維持。
+- **切り分け (a)**: 昇格処理は queued Critical / HighNormal / Normal は探すが in-flight は探さない。
+  idx 3 の 3 件は `pool_send` と同時刻に `pool_dispatch` され、fs pending が消えるまで
+  現行 Retry 状態が毎 frame 照会する。137 件はいずれも promoted=0 / already_high=0 / not_found=1。
+  これは idx 4 の要求漏れとは別件で、取消や追加 decode は発生していない。pool queue の lock / scan と
+  perf 出力の余分な仕事。今回、この昇格状態機械や pool の実行中追跡は変更しない。
+- **切り分け (b)**: tail 抜粋は 377 frame / 約 9 秒（41.75 fps）、median update 8.878ms、
+  `tail_repaint=none` 377 件。連結 consumer には素材不足の `Unresolved` / 未処理可視ページで
+  16ms 後の repaint を要求する経路があり、今回の永続 NeedsLoad はその継続条件を作る。
+  tail 記録は root 末尾の判定であり、子描画の repaint を否定しない。既存ログだけでは mouse / OS / 全 producer
+  の寄与は分離できず、利用者実機の 41.75fps すべてを断定しない。repaint 方針自体は今回変えない。
+- **追加回帰**: `continuous_quality_tests` 8 件成功。source worker dispatch だけを fake にし、
+  実際の連結 layout / 共通要求登録 / pending・取消 / poll・upload / paint resource を通す。
+  PDF / ZIP、縦・横、Single / LTR / RTL、複数可視ページの要求と高解像度描画、現在ページ読込中の
+  隣の要求保持、実 pointer のページ一覧ダブルクリック、直接 open の列挙完了 continuation、
+  ページ移動・scroll、refine 取消→同一倍率の再入場、refine 失敗時の旧画保持と再要求停止、
+  Hidden、旧 animation promotion の退出を検査。直接 open の列挙 I/O 自体は fixture で、実機試験ではない。
+  静止試験では全素材到着後に 16ms repaint が不要になることも成功した。
+  初回 6 成功 / 2 失敗は新しい試験フックが未使用 waiter を drop して要求を取消した不備で、
+  実 worker の spawn 直前だけ waiter を作る既存 PDF probe と同じ配置へ直し、8 / 8 成功を確認した。
+  関連 1,019 件の初回は 1,017 成功 / 2 失敗。1 件は §1.447 の既知試験（462 行、p=0.6）で、
+  単独 3 回は 3 成功。もう 1 件は既存の指定倍率・連結試験が 330px 要求の完成として実画素 8×8 を
+  返す fixture だった。対象試験だけ要求を満たす square sampler に変更し、page-box 2:3、
+  過大な source_dims、geometry 不変・追加要求 0 の全 assert を維持。手組 Continuous layout の
+  既存試験も現在の連結 demand consumer へ接続し、独立レビューで確認した。
+- **独立レビュー**: GPT-6.1 Sol / xhigh の source・設計レビューで条件付き ACCEPT。
+  取消後の同一需要、非可視 AI / 出力の優先度、animation 昇格の寿命の P2 3 件を修正し、再確認済み。
+  reviewer はテストを重複実行せず、親実装担当が自動検証を所有する。
+- **自動検証**: `cargo fmt` / `cargo fmt --check` 成功、
+  `cargo check -p mimageviewer --lib --tests --features test-script` 成功。
+  `specified_scale` を含む関連 1,079 件は 1,079 成功（nextest の leaky 報告 1 件）。
+  全 lib 初回は **15,324 成功 / 3 失敗 / 67 skipped**（823.828 秒、
+  `target/test-lib-full/runs/20261031T190804474Z-0844268c/`）。
+  共有述語の静的検査が、隣接する raw 要求の current-first sort の直接比較を検出したため、
+  sort も既存 `page_is_displayed(..., None)` に統一。同値の判定で、検査の assert は変更せず単独成功。
+  残る 2 件は Everything close の `listing identity preparation did not settle` と §1.447
+  （401 行、Started の期待に Finished）で、完走後の単独 **各 3 回は全成功**。
+  前者は既存 sidecar / spread-shift 再採用を待つ 10 秒 deadline であり、今回の連結 consumer を呼ばない。
+  負荷による超過の可能性はあるが、失敗した準備 phase が既存ログになく原因は未確定。
+  `main_chrome_folder_tree_clicks_follow_common_modal_ownership` の失敗はなかった。
+  最終 source の全 lib は **15,325 成功 / 2 失敗 / 67 skipped**（803.242 秒、12 slow / 2 leaky、
+  `target/test-lib-full/runs/20261031T192515641Z-31f246f0/`）。静的検査・Everything close は成功し、
+  残る失敗は §1.447（462 行、p=0.6）と、未変更の
+  `video::tests::real_decoder_eof_full_loop_preserves_single_tail_burst_per_epoch`
+  （tail10ms.mkv / 44100Hz / serial 2、callback burst 2 / 期待 1）。完走後の最終バイナリによる
+  単独 **各 3 回は全成功**（`target/1674-evidence/{audio-eof,page-turn-final}-single-{1,2,3}.log`）。
+  音声試験は `VideoPlayer` / decoder / device なし pump / 模擬 callback を直接使い、App と
+  今回の要求経路を通らない。2ms 超の gap も分割と数える assert のため、実音声の重複や今回の退行とは
+  断定しない。全件一括は完全成功ではなく、この 2 件の全件時の不安定さは未解決として設計担当へ返す。
+  いずれの試験も期待値・待ち時間・次回の選択対象を弱めていない。
+- **確認用 build**: `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`
+  成功 / exit 0（通常 feature、portable 無効、core 9分10秒 / remote 1分25秒 / EPUB worker 43.82秒）。
+  core / 同 protocol の companion と DLL / EffeTune bundle を配置し、VCRT / PE 監査も runtime=4 / pe=3 で成功。
+  初回の turbojpeg native 並列 build は失敗したため、同じ生成済み CMake tree の直列 install と
+  `cargo build --profile dev-runtime -p turbojpeg-sys --jobs 1`（11.64秒、exit 0）で依存を準備してから再開した。
+  先行 build の MSBuild 再利用 node が待機対象に残ったため待機 run を中止し、再実行時は
+  `MSBUILDDISABLENODEREUSE=1` と待機無効を使用。他の process の終了操作はしていない。
+  host transcript は `target/1674-evidence/build-dev.log`、native install は `turbojpeg-msbuild.log`。
+  製品は起動せず、利用者の通常 profile / 原本 perf log / 常駐 mIV は変更していない。コミットは設計担当へ引き継ぐ。
+- **実機確認の引き継ぎ**: worktree root で
+  `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+  通常 feature のため `%APPDATA%\mimageviewer` の実設定・データを更新し得る。
+  single-instance mutex を共有するインストール版 / tray 常駐版を先に終了してから、利用者が起動する。
+  元の PDF をページ一覧のダブルクリック / 直接 open から連結表示し、横・縦および左右の開き方で
+  idx 3 / 4 を含む複数可視ページが高画質になること、scroll で入る隣ページも収束することを確認する。
+  読込完了後の静止時の描画頻度も確認対象。実機の画質・idle 性能はまだ確認していない。
 
 ### 1.673 マスクの編集で、描いたマスクに囲まれた領域を塗りつぶす (マスクを壁にしたバケツ) — 利用者要望 (2026-11-01)
 
