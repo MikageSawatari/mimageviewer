@@ -46,6 +46,7 @@ pub use preview::{PreviewFrame, draw_preview};
 pub use resources::{EditTargetLifetime, ResourceLease, ResourceManifest, ResourceRevision};
 pub use timeline::{TimelineResponse, TimelineWaveform, draw_timeline};
 
+use musicvideo_core::render_limits::{MAX_GLOW_RADIUS_PX, MAX_GLOW_SPREAD_PX, MAX_TEXT_SIZE_PX};
 use musicvideo_core::{
     Fill, Fit, Glow, GradientStop, GradientStops, ImageId, Layer, LayerId, LayerKind, LyricLine,
     LyricsLayer, MIV_SPECTRUM_BANDS, ModulatorCalibration, ModulatorValue, MusicColorMode, Project,
@@ -2001,7 +2002,7 @@ fn edit_text_layout(ui: &mut egui::Ui, size_px: &mut f32, align: &mut TextAlign)
     let mut changed = ui
         .add(
             egui::DragValue::new(size_px)
-                .range(1.0..=1000.0)
+                .range(1.0..=MAX_TEXT_SIZE_PX)
                 .suffix(" px 文字サイズ"),
         )
         .changed();
@@ -2069,14 +2070,14 @@ fn edit_glow(ui: &mut egui::Ui, glow: &mut Option<Glow>) -> bool {
         changed |= ui
             .add(
                 egui::DragValue::new(&mut glow.radius_px)
-                    .range(0.0..=128.0)
+                    .range(0.0..=MAX_GLOW_RADIUS_PX)
                     .suffix(" px 半径"),
             )
             .changed();
         changed |= ui
             .add(
                 egui::DragValue::new(&mut glow.spread_px)
-                    .range(0.0..=128.0)
+                    .range(0.0..=MAX_GLOW_SPREAD_PX)
                     .suffix(" px 広がり"),
             )
             .changed();

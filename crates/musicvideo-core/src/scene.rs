@@ -5,6 +5,7 @@ use crate::model::{
     Fill, Fit, Glow, GradientStops, ImageId, LayerKind, ModulationTarget, ModulatorValue,
     MusicColorMode, NormRect, Project, Rgba8, SpectrumShape, TextAlign, TimeFormat,
 };
+use crate::render_limits::clamp_item_dimensions;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SpectrumFrame {
@@ -361,6 +362,7 @@ pub fn evaluate(project: &Project, t_secs: f64, spectrum: &SpectrumFrame) -> Sce
             kind,
         };
         scale_item_dimensions(&mut item, scale);
+        clamp_item_dimensions(&mut item);
         items.push(item);
     }
 

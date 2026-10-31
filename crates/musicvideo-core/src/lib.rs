@@ -12,6 +12,7 @@ pub mod lyrics;
 pub mod model;
 pub mod preset;
 pub mod raster;
+pub mod render_limits;
 pub mod scene;
 pub mod spectrum;
 mod text;
@@ -24,6 +25,9 @@ mod p5a_tests;
 
 #[cfg(test)]
 mod clipping_tests;
+
+#[cfg(test)]
+mod render_limits_tests;
 
 pub use anim::{Interpolate, easing_amount, evaluate_track};
 pub use assets::{

@@ -247,7 +247,7 @@ impl Frame {
 // allocation (including the full-layer preflight before mask construction).
 // It observes requested sizes, rather than claiming allocator-wide accounting.
 #[cfg(test)]
-mod frame_allocation_probe {
+pub(crate) mod frame_allocation_probe {
     use super::{RasterError, RefCell};
 
     struct Probe {
@@ -268,7 +268,7 @@ mod frame_allocation_probe {
         }
     }
 
-    pub(super) fn with_limits<R>(
+    pub(crate) fn with_limits<R>(
         max_pixels: u64,
         max_edge: u32,
         run: impl FnOnce() -> R,
@@ -287,7 +287,7 @@ mod frame_allocation_probe {
         (result, dimensions)
     }
 
-    pub(super) fn check(width: u32, height: u32) -> Result<(), RasterError> {
+    pub(crate) fn check(width: u32, height: u32) -> Result<(), RasterError> {
         ACTIVE.with(|active| {
             let mut active = active.borrow_mut();
             let Some(probe) = active.as_mut() else {
@@ -346,7 +346,9 @@ pub fn render_frame(
         prepared_cover.is_none() && !starts_with_opaque_solid,
     )?;
     let mut report = RenderReport::default();
-    for (index, item) in scene.items.iter().enumerate() {
+    for (index, unbounded_item) in scene.items.iter().enumerate() {
+        let item = crate::render_limits::bounded_item(unbounded_item);
+        let item = item.as_ref();
         let geometry = LayerPixelRect::new(item.rect, scene.width, scene.height)?;
         if geometry.local().is_empty() {
             continue;

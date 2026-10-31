@@ -1,4 +1,5 @@
 use egui::Ui;
+use musicvideo_core::render_limits::{MAX_TEXT_OUTLINE_PX, MAX_TEXT_SHADOW_SPREAD_PX};
 use musicvideo_core::{Rgba8, StrokeStyle, TextColor, TextStyle};
 
 pub(super) fn edit(ui: &mut Ui, style: &mut TextStyle) -> bool {
@@ -21,13 +22,14 @@ pub(super) fn edit(ui: &mut Ui, style: &mut TextStyle) -> bool {
         style.extra_outlines.remove(index);
     }
     if ui.button("縁取りを追加").clicked() {
-        let width = style
+        let width = (style
             .extra_outlines
             .iter()
             .map(|s| s.width_px)
             .chain(style.outline.map(|s| s.width_px))
             .fold(0.0, f32::max)
-            + 2.0;
+            + 2.0)
+            .min(MAX_TEXT_OUTLINE_PX);
         style.extra_outlines.push(StrokeStyle {
             width_px: width,
             ..Default::default()
@@ -38,7 +40,12 @@ pub(super) fn edit(ui: &mut Ui, style: &mut TextStyle) -> bool {
         color(ui, "影の色", &mut shadow.color);
         offset(ui, &mut shadow.offset);
         pixels(ui, "ぼかし", &mut shadow.blur_px, 0.0..=128.0);
-        pixels(ui, "広がり", &mut shadow.spread_px, 0.0..=128.0);
+        pixels(
+            ui,
+            "広がり",
+            &mut shadow.spread_px,
+            0.0..=MAX_TEXT_SHADOW_SPREAD_PX,
+        );
     }
     toggle(ui, "エコー", &mut style.echo);
     if let Some(echo) = &mut style.echo {
@@ -77,7 +84,7 @@ fn color(ui: &mut Ui, label: &str, color: &mut TextColor) {
 }
 fn edit_stroke(ui: &mut Ui, s: &mut StrokeStyle) {
     color(ui, "縁取り色", &mut s.color);
-    pixels(ui, "幅", &mut s.width_px, 0.0..=128.0);
+    pixels(ui, "幅", &mut s.width_px, 0.0..=MAX_TEXT_OUTLINE_PX);
 }
 fn offset(ui: &mut Ui, value: &mut (f32, f32)) {
     pixels(ui, "ずらし X", &mut value.0, -512.0..=512.0);
@@ -200,6 +207,57 @@ mod tests {
             collect(&s.shape, &mut result);
         }
         result
+    }
+    #[test]
+    fn d17_nine_add_outline_respects_the_shared_coverage_limit() {
+        let ctx = crate::test_context();
+        let mut style = TextStyle {
+            outline: Some(StrokeStyle {
+                width_px: MAX_TEXT_OUTLINE_PX,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let frame = |events, style: &mut TextStyle| {
+            crate::headless_paint_output(ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(360.0, 1800.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        edit(ui, style);
+                    });
+                },
+            ))
+        };
+        let output = frame(vec![], &mut style);
+        let pos = labels(&output)
+            .into_iter()
+            .find(|(text, _)| text == "縁取りを追加")
+            .unwrap()
+            .1
+            .center();
+        for pressed in [true, false] {
+            let _ = frame(
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                &mut style,
+            );
+        }
+        assert_eq!(style.extra_outlines.len(), 1);
+        assert_eq!(style.extra_outlines[0].width_px, MAX_TEXT_OUTLINE_PX);
     }
     #[test]
     fn t1_shared_style_ui_headless_layout_and_toggle_add_remove() {

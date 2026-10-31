@@ -16,6 +16,41 @@ const PREPARED_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_TEXT_RASTER_BYTES: usize = 8 * 1024 * 1024;
 const TILE_EDGE: usize = 1024;
 
+#[cfg(test)]
+mod glyph_preparation_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DRY_RUN: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    struct Restore(Option<usize>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DRY_RUN.with(|probe| probe.set(self.0));
+        }
+    }
+
+    pub(super) fn with_dry_run<R>(run: impl FnOnce() -> R) -> (R, usize) {
+        let restore = Restore(DRY_RUN.with(|probe| probe.replace(Some(0))));
+        let result = run();
+        let completed = DRY_RUN.with(|probe| probe.take().unwrap());
+        drop(restore);
+        (result, completed)
+    }
+
+    pub(super) fn stop_after_checked_plan() -> bool {
+        DRY_RUN.with(|probe| match probe.get() {
+            Some(completed) => {
+                probe.set(Some(completed + 1));
+                true
+            }
+            None => false,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum TextRasterArea {
     Full,
@@ -633,6 +668,42 @@ impl TextBake {
             ..glyph.clone()
         };
         let layout = layout_text(&glyph, font);
+        // Test-only preflight includes comic-core's intermediate glyph masks,
+        // which exist before the visible text tiles. Reject a mutation's huge
+        // glyph before prepare_text_regions or baking can allocate its coverage.
+        #[cfg(test)]
+        {
+            let outline = style
+                .extra_outlines
+                .iter()
+                .chain(style.outline.iter())
+                .map(|stroke| stroke.width_px.max(0.0))
+                .fold(0.0_f32, f32::max);
+            let shadow = style.shadow.map_or(0.0, |shadow| {
+                shadow.spread_px.max(0.0) + shadow.blur_px.clamp(0.0, 48.0)
+            });
+            let dilation = outline.max(shadow);
+            // font::dilate_coverage keeps one extra antialiasing pixel beyond
+            // ceil(dilate), while the undilated base has no padding.
+            let pad = if dilation > 0.0 {
+                (dilation.ceil() as u32).checked_add(1)?
+            } else {
+                0
+            };
+            for placement in &layout.glyphs {
+                if let Some((_, _, width, height)) =
+                    font.glyph_px_bounds_gid(placement.glyph_id, placement.size)
+                {
+                    let width = (width.ceil().max(0.0) as u32).checked_add(pad.checked_mul(2)?)?;
+                    let height =
+                        (height.ceil().max(0.0) as u32).checked_add(pad.checked_mul(2)?)?;
+                    crate::raster::frame_allocation_probe::check(width, height).ok()?;
+                }
+            }
+            if glyph_preparation_probe::stop_after_checked_plan() {
+                return None;
+            }
+        }
         // Glyph overhang and negative spacing can extend ink beyond comic-core's
         // advance-based logical bounds. Preserve the legacy undecorated,
         // zero-spacing allocation exactly; styled text keeps the same logical
@@ -716,6 +787,167 @@ mod tests {
             .unwrap(),
         );
         fonts
+    }
+
+    #[test]
+    fn d17_nine_scale_99_all_text_kinds_bound_glyph_preparation_and_visible_work() {
+        use crate::raster::frame_allocation_probe;
+        use crate::render_limits::*;
+        use crate::*;
+
+        let mut project = default_project(10.0);
+        project.output.width = 1920;
+        project.output.height = 1080;
+        let layers = [
+            new_text_layer(&project),
+            new_time_text_layer(&project),
+            new_lyrics_layer(&project),
+        ];
+        let output_pixels = u64::from(project.output.width) * u64::from(project.output.height);
+        let edge_limit = project.output.width.max(project.output.height) * 4;
+        for (index, mut layer) in layers.into_iter().enumerate() {
+            layer.rect = Animatable::Const(NormRect::FULL);
+            layer.glow = Animatable::Const(None);
+            layer.modulations = vec![ModulationBinding {
+                target: ModulationTarget::Scale,
+                amount: 99.0,
+                modulator: ModulatorId(1),
+                curve: ModulationCurve::Linear,
+            }];
+            let (font_key, size, align, style) = match &mut layer.kind {
+                LayerKind::Text(text) => {
+                    text.text = "H".into();
+                    (
+                        &mut text.font_key,
+                        &mut text.size_px,
+                        &mut text.align,
+                        &mut text.style,
+                    )
+                }
+                LayerKind::TimeText(text) => (
+                    &mut text.font_key,
+                    &mut text.size_px,
+                    &mut text.align,
+                    &mut text.style,
+                ),
+                LayerKind::Lyrics(text) => {
+                    text.lines = vec![LyricLine {
+                        text: "H".into(),
+                        time_secs: Some(0.0),
+                    }];
+                    (
+                        &mut text.font_key,
+                        &mut text.size_px,
+                        &mut text.align,
+                        &mut text.style,
+                    )
+                }
+                _ => unreachable!(),
+            };
+            *font_key = "font".into();
+            *size = MAX_TEXT_SIZE_PX;
+            *align = TextAlign::Center;
+            *style = Animatable::Const(TextStyle {
+                outline: Some(StrokeStyle {
+                    width_px: MAX_TEXT_OUTLINE_PX,
+                    ..Default::default()
+                }),
+                extra_outlines: vec![StrokeStyle {
+                    width_px: MAX_TEXT_OUTLINE_PX,
+                    ..Default::default()
+                }],
+                shadow: Some(TextShadowStyle {
+                    offset: (0.0, 0.0),
+                    spread_px: MAX_TEXT_SHADOW_SPREAD_PX,
+                    blur_px: 48.0,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            project.layers = vec![layer];
+            // Fresh assets keep every route's first glyph preparation observable.
+            let fonts = window_test_fonts();
+            let font = fonts.get("font").unwrap();
+            let (_, _, glyph_width, glyph_height) = font
+                .glyph_px_bounds(if index == 1 { '0' } else { 'H' }, MAX_TEXT_SIZE_PX)
+                .unwrap();
+            let aa_padding = 2 * ((MAX_TEXT_SHADOW_SPREAD_PX + 48.0).ceil() as u32 + 1);
+            let expected_coverage = (
+                glyph_width.ceil() as u32 + aa_padding,
+                glyph_height.ceil() as u32 + aa_padding,
+            );
+            let assets = Assets::new(fonts);
+            let scene = evaluate(&project, 1.0, &crate::p5a_tests::frame());
+            assert_eq!(
+                scene.items[0].rect,
+                NormRect::new(-49.5, -49.5, 100.0, 100.0)
+            );
+            let mut frame = Frame::new(1, 1).unwrap();
+            let ((result, completed_plans), dimensions) =
+                frame_allocation_probe::with_limits(output_pixels * 3, edge_limit, || {
+                    glyph_preparation_probe::with_dry_run(|| {
+                        render_frame(&scene, &assets, &mut frame)
+                    })
+                });
+            let report = result.unwrap_or_else(|error| {
+                panic!("text kind {index}: {error:?}; requested {dimensions:?}")
+            });
+            // The upper-bound fixture stops after the checked plan, before
+            // preparing the large 1000px multi-pass coverage. A cap mutation is
+            // rejected by the dimension check before it can complete this plan.
+            assert!(
+                completed_plans > 0,
+                "text kind {index}: no bounded glyph plan"
+            );
+            assert!(
+                !report.unresolved_assets.is_empty(),
+                "dry-run must stop before baking"
+            );
+            assert!(
+                dimensions.contains(&expected_coverage),
+                "glyph preparation missing for kind {index}: {expected_coverage:?} in {dimensions:?}"
+            );
+            for &(width, height) in &dimensions {
+                assert!(u64::from(width) * u64::from(height) <= output_pixels * 3);
+                assert!(width.max(height) <= edge_limit);
+            }
+            // Exercise the same production route with normal coverage sizes.
+            // Keeping Scale99 also keeps this on the no-Glow visible-tile path.
+            let (size, style) = match &mut project.layers[0].kind {
+                LayerKind::Text(text) => (&mut text.size_px, &mut text.style),
+                LayerKind::TimeText(text) => (&mut text.size_px, &mut text.style),
+                LayerKind::Lyrics(text) => (&mut text.size_px, &mut text.style),
+                _ => unreachable!(),
+            };
+            *size = 1.0;
+            *style = Animatable::Const(TextStyle {
+                outline: Some(StrokeStyle {
+                    width_px: 0.01,
+                    ..Default::default()
+                }),
+                shadow: Some(TextShadowStyle {
+                    offset: (0.0, 0.0),
+                    spread_px: 0.01,
+                    blur_px: 0.01,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            let scene = evaluate(&project, 1.0, &crate::p5a_tests::frame());
+            let (result, dimensions) =
+                frame_allocation_probe::with_limits(output_pixels * 3, edge_limit, || {
+                    render_frame(&scene, &assets, &mut frame)
+                });
+            let report = result.unwrap();
+            assert!(
+                report.unresolved_assets.is_empty(),
+                "text kind {index}: {report:?}"
+            );
+            for &(width, height) in &dimensions {
+                assert!(u64::from(width) * u64::from(height) <= output_pixels * 3);
+                assert!(width.max(height) <= edge_limit);
+            }
+        }
     }
 
     #[test]

@@ -2955,6 +2955,11 @@ AI イラスト 3 枚・タイトルロゴで wav2bar 相当の試作を書き�
    設計担当が決定）。8 と同じ扱いで、上限は各値の設定欄の入力上限と同じにする（設定欄に上限がない値は実装担当が決めて報告）。
    これでグローの余白と字形の大きさが定数で抑えられ、7 のタイル描画だけで確保量が出力画面に比例する上限内に収まる。
    扱う組み合わせを減らすための決定（CLAUDE.md「設計の簡素化」）。通常の使い方の画素は変わらない。
+10. **グローの縮小計算の格子の起点は、切り詰め前のレイヤー矩形の原点に固定する（全経路共通）**（2026-10-31、9 の実装中に
+    実装担当が示した反例による設計担当の決定）。従来は格子の起点がマスク全体の非透明範囲から決まり、出力から遠い画素ひとつで
+    可視部分のグローが変わる非局所依存があった。実装担当の案「巨大なタイル経路だけ起点を固定」は描き方が 2 通りに分かれるので採らず、
+    大きさに関係なく 1 つの規則にする。縮小率の決め方は従来のまま。起点がレイヤーと一緒に動くので、移動中のちらつきも増えない。
+    通常のグローの画素はわずかに変わり得る（未リリースなので互換は取らず、変わる期待値は理由を添えて更新する）。
 保存形式: 音楽ビデオのエディタは未リリースなので、`radius_px` → `inner_ratio` の変更に移行処理は作らない
 （CLAUDE.md「永続データ・スキーマ変更時の判断」）。
 
@@ -3302,7 +3307,7 @@ GUI起動・実機検収と対応後の独立再レビューは未実施。コ�
 | **P4d** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | Grid／Fullscreenの単一実Audioだけ。static ID／非表示設定、worker起動、絶対path引数、失敗通知、build-dev同梱を実装。既存保存順のstatic／動的枠を保つ末尾追加。追加8件の成功と各変異失敗、全対象14560 passed／0 failed／66 ignored、fmt／glyph0、通常featureの4exe確認build成功を記録済み。`261b10359`の独立レビューP2に対応し製品binのGUI属性／Subsystem gateを追加。製品GUI起動／実機検収／対応のcommitなし。詳細は「P4d実装記録」 |
 | **P4e** 実装完了（独立レビュー 4 回目で ACCEPT、2026-10-15。build-dist -NoSign の通しは修正前の版で成功、最終版での通しは統合前の最終確認で行う） | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | **実装・非対話検証済（2026-10-15）**。build-dist -NoSign の全段成功、全体 gate 14,562 passed / 0 failed / 66 ignored。editor 25,504,768 bytes、launcher 増分も同値。清掃は editor を含む fixture で検査し D10 の割り切りを維持。独立レビュー 1〜3 回目は REVISE。3 回目の指摘は OUT_DIR 導出で対応し、追加発見の build-dir 分離も設計回答に従い開始前に拒否する。指定検証・release 5 段は成功、独立再検収待ち。署名実行・GUI 検収は未実施。詳細は末尾「P4e 実装記録」 |
 | **P4f** 完了（独立レビュー 2 回目 ACCEPT with conditions、条件の文書修正済み `bf05ddb17`、2026-10-15。fps 選択は利用者決定で追加。サイトマップ再生成は統合時） | マニュアル新ページと通常33ページのサイドバー・目次、製品紹介カード、keymap-spec（固定ショートカットの理由）、privacy（通信なし・保存先） | **2026-10-15、未コミット**。カード50枚で上限違反0、glyph検査成功、33ページ各33リンクの数・順序・active一致、HTML構造とリンク検査成功。各記述のコード根拠・D11との差分は末尾「P4f 実施記録」。アプリ／エディタ未起動。独立レビュー1回目 REVISE の起動条件の P2 を修正し、利用者決定に基づきプロジェクトの fps 選択を追加。対応後の再レビュー・検収は未実施。追補記録を参照。サイトマップはhtdocsコミット後に生成するため今回は未実行 |
-| **P5a** 初版 `529045c72`、独立レビュー1回目 REVISE。P2対応済み。P1は一部実装・指定検証済み、巨大Glowと字形準備の設計確認待ち（末尾の追補記録） | 実操作で見つけた改善（D17）: 円形スペクトラムの内側の円を矩形に対する割合へ、`Scale` 変調をレイヤー全体の拡大縮小へ、割り当て量の初期値を単位に合わせる、画像の枠への合わせ方の設定と追加時の既定、レイヤー一覧の操作ボタンの固定 | 円形で `Scale` を割り当てると輪の内径も同じ比率で大きくなる（書き出し画素で確認）。文字・時刻・歌詞の `Scale` で文字が大きくなる。プレビューと書き出しの一致（H3b）を維持。独立レビュー ACCEPT |
+| **P5a** 初版 `529045c72`、独立レビュー1回目 REVISE。P2対応済み。P1部分実装 `6425e0c3f` 後、D17.9の上限を実装・字形準備を検査。Glow格子の全体範囲への依存が残る（末尾の追補記録） | 実操作で見つけた改善（D17）: 円形スペクトラムの内側の円を矩形に対する割合へ、`Scale` 変調をレイヤー全体の拡大縮小へ、割り当て量の初期値を単位に合わせる、画像の枠への合わせ方の設定と追加時の既定、レイヤー一覧の操作ボタンの固定 | 円形で `Scale` を割り当てると輪の内径も同じ比率で大きくなる（書き出し画素で確認）。文字・時刻・歌詞の `Scale` で文字が大きくなる。プレビューと書き出しの一致（H3b）を維持。独立レビュー ACCEPT |
 
 L1 自動検証記録（2026-10-09）:
 
@@ -4392,8 +4397,8 @@ D17 の 1〜6 の実装・非対話検証・確認用buildを完了した（す�
 
 | 対象 | scene で倍率をかける px 値 |
 | --- | --- |
-| 全種別 | 中心固定の矩形幅・高さ、レイヤー角丸、Glow の radius／spread |
-| Text／TimeText／Lyrics | size、主縁取りと追加縁取りの width、影の xy offset／blur／spread、echo の xy offset、背景の padding／corner、letter_gap／line_gap。影の blur は評価時に倍率をかけ、描画時は comic-core の既存 48px 上限で止まる（D17.8） |
+| 全種別 | 中心固定の矩形幅・高さ、レイヤー角丸、Glow の radius／spread（D17.9で倍率適用後それぞれ128pxまで） |
+| Text／TimeText／Lyrics | size、主縁取りと追加縁取りの width、影の xy offset／blur／spread、echo の xy offset、背景の padding／corner、letter_gap／line_gap。D17.9でsizeは1000px、縁取りと影spreadは128pxまで。影の blur は評価時に倍率をかけ、描画時は comic-core の既存 48px 上限で止まる（D17.8） |
 | Bars | thickness、min_height、描画の最小厚さ（従来 1px の下限も評価して縮小可能にする） |
 | Radial | thickness、描画の最小厚さ。内側の円は inner_ratio と拡縮済み矩形から求める |
 | MivHorizontal | バンド両端余白、最小幅、角丸の閾値と半径、下余白と高さの控除、ghost／trail の横への広がり |
@@ -4524,14 +4529,10 @@ P2 は影の blur が comic-core の 48px 上限で止まることと全体拡�
 - 画像は Fit の座標計算を共有した sampler で必要な画素を読む。巨大な Fit 後画像を確保せず、
   既存の Fit 後 u8 画素→zoom の2段階の丸めを維持する。
 - 文字は配置に使う完全な矩形と描画クリップを分離し、RGBA bake の予算を可視面積にも結び付ける。
-  既存の full bitmap は読み取りで再利用する。これは **字形 coverage の準備をまだ有界にしない**。
-- **未完了**: 巨大な Glow では、既存の最大8倍の縮小処理の前に全解像度の alpha を確保・走査している。
-  radius／spread 自体も拡縮されるため、単に可視タイルに切って余白を足すだけでは予算を保証できない。
-  巨大時だけ効果用の alpha を出力予算に合わせた解像度で直接評価する案は、旧全体確保版との画素の差を生むため設計担当へ確認中。
-  現在の本番経路のタイル化は Glow なしに限り、巨大 Glow の P1 は解消したと扱わない。
-- **未完了**: comic-core の `LoadedFont::rasterize_base`／字形 dilation は字形全体の coverage を確保する。
-  大きなフォントの準備を領域に限る追加 API は共有ライブラリへ及ぶため、「comic-core は変えない」の範囲と
-  D17.7 の有界化の優先について確認中。48px の影ぼかし上限は変更していない。
+  既存の full bitmap は読み取りで再利用する。D17.9で字形サイズとdilationを決める寸法も上限化し、準備前の寸法検査を追加した（追補参照）。
+- Glowのradius／spreadはD17.9でそれぞれ128pxまでにした。旧全体maskのtight bounds起点で縮小格子を決める依存が残り、
+  固定余白だけで局所化すると旧画素が変わることを実測した。現在の本番経路のタイル化はGlowなしに限り、
+  巨大GlowのP1は解消したと扱わない。追加の低解像度化とcomic-core変更は行わない。
 - 既存 Spectrum mask の画素操作列（`draw_spectrum_mask` の `operations`）も、太いバーの重なりで
   矩形面積より多くなるため除去した。バーごとの小さな描画記述だけを保持し、行ごとに並列で既存 mask へ直接描く。
   各バーの合成順・丸めは維持する。寸法probeは Frame だけを測るため、巨大 Glow／字形 coverage を含めた全中間領域の保証ではない。
@@ -4584,8 +4585,98 @@ Spectrum mask の追加1件は `spectrum-mutation.json`／`spectrum-mutation.log
 コマンド・終了値・時間・件数は同 `summary.json`、4成果物のsize／時刻／SHA-256は同 `artifacts.json`。
 build終了後にもソースSHA-256一致を確認した。成果物は起動していない。
 
-**現在の状態**: 実装済み部分の指定検証・確認用buildは完了。P1は巨大Glowと字形coverageの有界化が未完了であり、
-brief §5の設計判断が必要な場合の規則に従って停止する。設計確認は、巨大Glowの効果用alphaだけを予算に合わせた解像度で
-評価することを認めるか、字形coverageを領域に限る追加APIをcomic-coreへ導入してよいかの2点。
-後者の既存API・48px上限は保持する提案であり、未実装。対応後の独立再レビュー・GUI検収も未実施。
+上記は `6425e0c3f` のチェックポイントの記録。D17.9で上記2案はともに不採用と確定し、以下の上限実装へ進んだ。
+対応後の独立再レビュー・GUI検収は未実施。
 既存 fixture の期待画素・ハッシュは変更していない。GUI 起動・通常 APPDATA の操作・コミット・`out.mp4` の操作は行っていない。
+
+#### D17.9 の対応とGlow格子の残件（2026-10-31、`6425e0c3f` に対する未コミット差分）
+
+設計担当が追加の低解像度Glowとcomic-coreへの領域API追加をともに不採用としたため、どちらも実装していない。
+以下は実装担当の検証記録であり、独立レビューではない。
+
+**上限の実装・文字側の解消**
+
+`musicvideo-core::render_limits` に上限と共通適用関数を集約した。sceneでScale適用後に上限化し、
+公開Sceneを直接描画する入口も同じ関数を使う。通常の上限内Sceneは借用し、文字列やスペクトラムを複製しない。
+UIの入力範囲も同じ定数を参照する。
+
+| 値 | 上限 | 根拠 |
+| --- | --- | --- |
+| Glow radius／spread | それぞれ128px | 既存UIの入力上限 |
+| Text／TimeText／Lyrics size | 1000px | 同上 |
+| 主縁取り／各追加縁取り width | 各128px | 同上。「縁取りを追加」の生成値も128pxまでに修正 |
+| 文字の影 spread | 128px | 同上。coverageのdilationを増やすため対象に含む |
+
+上限がなく新たに数値を決めた項目はない。影blurは既存comic-coreの48px上限を維持する。
+offset、echo、背景padding／corner、letter／line gapは配置や疎な描画領域の寸法を変えるが、
+個々の字形coverageの大きさを増やさないため新たな上限を加えていない。
+
+字形準備の検査は、テスト時だけlayout直後でfontのglyph boundsと最大dilationから寸法を求める。
+最大dilationは `max(各outline, shadow.spread + min(shadow.blur, 48))`、AA余白は片側 `ceil(dilation)+1`。
+comic-coreのbase rasterizer／dilationのcoverage・距離場の最大寸法を準備前に記録する。
+量99の3種別で上限1000pxの計画を検査し、100pxの通常coverageでは同じタイル経路の実描画も確認した。
+大きい境界fixtureは計画dry-runで準備前に止め、上限を壊した変異でも巨大確保を試さない。
+これは個別中間bufferの寸法検査であり、任意の文字列長・フォントに対するcache総量の測定ではない。
+
+今回の変更ファイルはcoreの `lib.rs`、`scene.rs`、`raster.rs`、`text.rs`、新規 `render_limits.rs`、
+新規 `render_limits_tests.rs`、UIの `lib.rs`、`text_style.rs` と本設計書、マニュアルの10ファイル。
+マニュアルは「文字や一部の装飾は、描画の上限に達するとそれ以上大きくなりません」とし、内部の数値は記載しない。
+
+| 追加テスト | 失敗を確認した変異 |
+| --- | --- |
+| `d17_nine_scale_two_caps_glow_and_glyph_coverage_for_all_text_kinds` | sceneの共通上限適用を削除 |
+| `d17_nine_scale_one_still_bounds_out_of_range_project_values` | 同上 |
+| `d17_nine_add_outline_respects_the_shared_coverage_limit` | 追加縁取りの生成値の上限を削除 |
+| `d17_nine_scale_99_all_text_kinds_bound_glyph_preparation_and_visible_work` | 共通上限適用をno-op化。字形準備前の寸法検査で止まり、検査済み計画なしとして失敗 |
+
+各変異はexit101のassertion failureを確認して元のソースへ復元し、成功を再確認した。
+ログは `target/p5a/d17-nine/limits/` の `mutation-scene.log`、`mutation-ui.log`、`glyph-mutation.log` と
+`restored.log`、`glyph-restored.log`。既存のScale1全種別RGBA hashも変更していない。
+
+**Glowに残る、固定余白では解消しない依存**
+
+`draw_glow` は `mask_bounds(source)` で**全体の非zero範囲**を求め、
+`source.origin + bounds.min - pad` を縮小格子の起点にする。padはscaleの倍数なので、
+格子の位相は `(source.origin + bounds.min) mod scale` に依存する。
+そのため、出力とその余白へ寄与しない遠方画素でも、bounds.minを変えると可視画素が変わる。
+
+実装担当が次の小さな診断を実行した（巨大確保なし）。
+
+- maskは両方1024×64、originは(-800,0)。Aはlocal(784,32)だけalpha255。
+  Bはさらにlocal(1,32)、すなわちglobal(-799,32)へalpha255を加える。
+- Glowはradius16／spread0（どちらもD17.9上限内）。既存planはscale8／pad24。
+  上限128／128の最大padも264であり、**出力＋最大264px余白の入力はA/Bで完全に同じ**。
+- 16×64出力の同じ(0,32)が、AではRGBA(10,10,10,255)、Bでは(1,1,1,255)になった。
+  遠方画素自身のフィルタ到達範囲は出力へ届かない。
+
+診断の差分・コマンド・成功ログは `target/p5a/d17-nine/phase/{diagnostic.diff,summary.json,diagnostic.log}`。
+診断用テストは一時追加して実行後に元のバイト列へ復元した。既存の非局所挙動を望ましい仕様として固定する
+恒久テストにはしていない。この実測は実装担当自身の確認であり、独立レビューではない。
+
+したがって、**ROIと固定余白の入力だけでは旧全体確保版のGlow画素を再現できない**。
+既存の全体tight boundsを得る経路を残すと、巨大な原矩形のmask確保・走査が残る。
+厳密な全体boundsを生成元から有界に求める別設計がない限り、上限の導入だけではD17.7の走査範囲と旧画素一致を同時に満たさない。
+
+設計確認として、通常サイズの既存経路は維持し、タイルが必要な巨大経路だけ既存の縮小率を保って格子起点を固定する案を提示した。
+この案には巨大経路の旧全体確保版との厳密一致を緩める決定が必要なため、回答前には実装しない。
+現時点の本番タイル経路はGlowなしのまま。D17.9の「上限を置いてもなお有界にならない経路が残る場合」の規則に従い、
+この点は設計判断待ちとする。P1全体は完了としていない。
+
+**最新ソースの検証結果**（全て `MSBUILDDISABLENODEREUSE=1`、APPDATA／LOCALAPPDATAは `target/p5a/d17-nine/` 内へ隔離）:
+
+| 検証 | 結果／証跡 |
+| --- | --- |
+| `cargo test -j 8 -p music-core -p musicvideo-core -p musicvideo-ui -p musicvideo-editor` | exit0、**544 passed／0 failed／0 ignored**。music-core69、musicvideo-core150＋integration2、editor188、UI135。246.765秒。`target/p5a/d17-nine/gates/packages.log` |
+| `cargo fmt`／`cargo fmt --check` | 整形適用済み、check exit0、20.926秒。`target/p5a/d17-nine/gates/fmt.log` |
+| `python scripts/check_ui_glyphs.py` | exit0、不足0、2.773秒。`target/p5a/d17-nine/gates/glyph.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit0、49.645秒。通常featuresで4成果物生成、VC runtime／PE検査成功。`target/p5a/d17-nine/gates/build-dev.log` |
+
+ソース11ファイルのSHA-256は同 `source-sha256.json`、コマンド・終了値・時間は同 `summary.json`、
+4成果物のsize／時刻／SHA-256は同 `artifacts.json`。build完了後にもソースの一致を確認した。
+マニュアルの文言追記後もglyph検査を再実行してexit0だった。既存fixtureの期待画素・ハッシュは変更していない。
+通常サイズ・倍率1.0の既存RGBA hashを維持した。追加の低解像度化、comic-coreの変更、GUI起動、通常APPDATA操作、
+コミット、既存 `out.mp4` の操作は行っていない。対応後の独立再レビューとGUI検収は未実施。
+
+**現在の状態**: D17.9の上限、UI共用、文字の個別coverage準備前の検査は完了。
+Glowの全体tight boundsによる格子位相の依存が残り、D17.9末尾の停止条件に該当するため、この点を設計担当へ戻す。
+出力＋固定余白だけで旧全体版と画素一致するGlowタイル経路は未実装であり、P1全体は未完了。
