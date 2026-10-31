@@ -86,14 +86,16 @@ fn key(t: f64, value: TextStyle) -> Keyframe<TextStyle> {
     }
 }
 #[test]
-fn t1_undecorated_head_hashes_are_unchanged() {
+fn t1_undecorated_reference_hashes() {
     let assets = Assets::new(fonts());
     let mut p = project();
     for (mode, expected) in [
         0x6a2b0c1edf499979,
         0x56ed70d944cc42ad,
         0x30700679f8e3dc24,
-        0x241cf683b2786458,
+        // D17.10: rotated Glow now uses the layer-origin grid. Modes without
+        // Glow keep their original hashes; only this Glow baseline changes.
+        0x0d50f353a4a24161,
     ]
     .into_iter()
     .enumerate()

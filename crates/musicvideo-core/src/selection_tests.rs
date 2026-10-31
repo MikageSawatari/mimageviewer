@@ -186,6 +186,8 @@ fn selection_render_hash_uses_unclipped_layer_geometry() {
     // D17.6 intentionally changes this fixture: the default radial layer extends
     // below the canvas and the first animated/rotated solid starts beyond its left.
     // Their geometry now comes from the full boxes before the final canvas crop.
+    // D17.10: the default radial Glow uses the layer-origin reduction grid, so
+    // its pixels (and all three frame hashes) intentionally change again.
     let mut project = default_project(10.0);
     project.output.width = 160;
     project.output.height = 90;
@@ -238,9 +240,9 @@ fn selection_render_hash_uses_unclipped_layer_geometry() {
     assert_eq!(
         hashes,
         vec![
-            7673554586247693965,
-            13406108200308214447,
-            11219486302341893356
+            13641879415910243380,
+            10715488644826280209,
+            3898031118064054182
         ]
     );
 }

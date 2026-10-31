@@ -75,6 +75,15 @@ impl WorkPlan {
     }
 
     fn inverse_window(self, destination: PixelRect) -> PixelRect {
+        self.inverse_world_window(
+            destination.x0 as i64,
+            destination.y0 as i64,
+            destination.x1 as i64,
+            destination.y1 as i64,
+        )
+    }
+
+    fn inverse_world_window(self, left: i64, top: i64, right: i64, bottom: i64) -> PixelRect {
         let local = self.geometry.local();
         let (mut x0, mut y0, mut x1, mut y1) = (
             f64::INFINITY,
@@ -85,12 +94,7 @@ impl WorkPlan {
         let center_x = (f64::from(self.geometry.x0) + f64::from(self.geometry.x1)) * 0.5;
         let center_y = (f64::from(self.geometry.y0) + f64::from(self.geometry.y1)) * 0.5;
         let (sin, cos) = (-f64::from(self.rotation).to_radians()).sin_cos();
-        for (x, y) in [
-            (destination.x0, destination.y0),
-            (destination.x1, destination.y0),
-            (destination.x0, destination.y1),
-            (destination.x1, destination.y1),
-        ] {
+        for (x, y) in [(left, top), (right, top), (left, bottom), (right, bottom)] {
             let dx = x as f64 - center_x;
             let dy = y as f64 - center_y;
             let sx = center_x + dx * cos - dy * sin - f64::from(self.geometry.x0);
@@ -120,12 +124,38 @@ impl WorkPlan {
 
 /// Native-resolution body rendering. Storage coordinates retain their position
 /// in the complete local rectangle, including when only a small patch is stored.
+#[cfg(test)]
 pub(super) fn draw_tiled_body(
     frame: &mut Frame,
     plan: WorkPlan,
     item: &SceneItem,
     assets: &Assets,
     report: &mut RenderReport,
+) -> Result<(), RasterError> {
+    draw_tiled_body_impl(frame, plan, item, assets, report, false)
+}
+
+pub(super) fn draw_tiled_item(
+    frame: &mut Frame,
+    plan: WorkPlan,
+    item: &SceneItem,
+    assets: &Assets,
+    report: &mut RenderReport,
+    glow: Option<Glow>,
+) -> Result<(), RasterError> {
+    if let Some(glow) = glow {
+        draw_tiled_glow(frame, plan, item, assets, report, glow)?;
+    }
+    draw_tiled_body_impl(frame, plan, item, assets, report, glow.is_some())
+}
+
+fn draw_tiled_body_impl(
+    frame: &mut Frame,
+    plan: WorkPlan,
+    item: &SceneItem,
+    assets: &Assets,
+    report: &mut RenderReport,
+    flatten_solid: bool,
 ) -> Result<(), RasterError> {
     let local = plan.geometry.local();
     let rotated = plan.rotation.abs() > 1.0e-4;
@@ -137,6 +167,20 @@ pub(super) fn draw_tiled_body(
         alpha: Vec::new(),
     };
     for tile in plan.tiles().filter(|tile| !tile.source.is_empty()) {
+        if !rotated && flatten_solid && solid_body_color(item).is_some() {
+            let mut source = Frame::window(tile.source)?;
+            source.rgba.fill(0);
+            draw_item(&mut source, local, item, assets, report, true)?;
+            let mask = MaskSurface {
+                origin_x: (i64::from(plan.geometry.x0) + tile.source.x0 as i64) as i32,
+                origin_y: (i64::from(plan.geometry.y0) + tile.source.y0 as i64) as i32,
+                width: tile.source.width(),
+                height: tile.source.height(),
+                alpha: source.rgba.chunks_exact(4).map(|p| p[3]).collect(),
+            };
+            composite_solid_body(frame, &mask, item);
+            continue;
+        }
         let mut body = Frame::window(tile.source)?;
         if !rotated {
             for y in tile.source.y0..tile.source.y1 {
@@ -212,6 +256,128 @@ pub(super) fn draw_tiled_body(
     }
     Ok(())
 }
+
+/// Generate the post-rotation silhouette only for a native-resolution viewport
+/// window. Each source patch retains the full geometry and rotation center.
+fn render_world_mask(
+    plan: WorkPlan,
+    window: GlowRect,
+    item: &SceneItem,
+    assets: &Assets,
+    report: &mut RenderReport,
+) -> Result<MaskSurface, RasterError> {
+    let mut alpha = vec![0; alpha_len(window.width, window.height)?];
+    let local = plan.geometry.local();
+    let geometry_mask = MaskSurface {
+        origin_x: plan.geometry.x0,
+        origin_y: plan.geometry.y0,
+        width: local.width(),
+        height: local.height(),
+        alpha: Vec::new(),
+    };
+    let edge = (plan.width.min(plan.height) as usize).clamp(1, TILE_EDGE);
+    let bottom = i64::from(window.y0) + window.height as i64;
+    let right = i64::from(window.x0) + window.width as i64;
+    for top in (i64::from(window.y0)..bottom).step_by(edge) {
+        for left in (i64::from(window.x0)..right).step_by(edge) {
+            let tile_right = (left + edge as i64).min(right);
+            let tile_bottom = (top + edge as i64).min(bottom);
+            let source = plan.inverse_world_window(left, top, tile_right, tile_bottom);
+            if source.is_empty() {
+                continue;
+            }
+            let mut mask = Frame::window(source)?;
+            mask.rgba.fill(0);
+            draw_item(&mut mask, local, item, assets, report, true)?;
+            for y in top..tile_bottom {
+                for x in left..tile_right {
+                    let value = if plan.rotation.abs() <= 1.0e-4 {
+                        let sx = x - i64::from(plan.geometry.x0);
+                        let sy = y - i64::from(plan.geometry.y0);
+                        if sx < 0
+                            || sy < 0
+                            || sx >= local.width() as i64
+                            || sy >= local.height() as i64
+                        {
+                            0
+                        } else {
+                            mask.rgba[mask.offset(sx as usize, sy as usize) + 3]
+                        }
+                    } else {
+                        let (sx, sy) = inverse_rotated_source(
+                            &geometry_mask,
+                            x as f32 + 0.5,
+                            y as f32 + 0.5,
+                            plan.rotation,
+                        );
+                        if sx < -0.5
+                            || sy < -0.5
+                            || sx > local.width() as f32 - 0.5
+                            || sy > local.height() as f32 - 0.5
+                        {
+                            0
+                        } else {
+                            let sx = sx.clamp(0.0, local.width().saturating_sub(1) as f32)
+                                - source.x0 as f32;
+                            let sy = sy.clamp(0.0, local.height().saturating_sub(1) as f32)
+                                - source.y0 as f32;
+                            sample_bilinear_rgba_channel(
+                                &mask.rgba,
+                                mask.width as usize,
+                                mask.height as usize,
+                                sx,
+                                sy,
+                                3,
+                            )
+                        }
+                    };
+                    alpha[(y - i64::from(window.y0)) as usize * window.width
+                        + (x - i64::from(window.x0)) as usize] = value;
+                }
+            }
+        }
+    }
+    Ok(MaskSurface {
+        origin_x: window.x0,
+        origin_y: window.y0,
+        width: window.width,
+        height: window.height,
+        alpha,
+    })
+}
+
+fn draw_tiled_glow(
+    frame: &mut Frame,
+    plan: WorkPlan,
+    item: &SceneItem,
+    assets: &Assets,
+    report: &mut RenderReport,
+    glow: Glow,
+) -> Result<(), RasterError> {
+    let filter = GlowRasterPlan::new(glow)?;
+    // The next bilinear reduced cell and max-pool block both contribute to a
+    // destination pixel. Include their complete support, then align to the same
+    // layer-origin grid as the full allocation path.
+    let halo = (filter.pad + filter.scale) as i64;
+    let anchor = (plan.geometry.x0, plan.geometry.y0);
+    for tile in plan.tiles() {
+        let window = GlowRect::aligned(
+            tile.destination.x0 as i64 - halo,
+            tile.destination.y0 as i64 - halo,
+            tile.destination.x1 as i64 + halo,
+            tile.destination.y1 as i64 + halo,
+            anchor,
+            filter.scale,
+        )?;
+        let mask = render_world_mask(plan, window, item, assets, report)?;
+        filter_and_composite_glow(frame, mask, filter, glow.color, tile.destination)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "raster_glow_work_tests.rs"]
+mod glow_work_tests;
 
 #[cfg(test)]
 mod work_tests {

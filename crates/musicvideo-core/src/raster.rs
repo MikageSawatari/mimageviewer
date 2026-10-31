@@ -27,7 +27,7 @@ mod p5a_tests;
 
 #[path = "raster_work.rs"]
 mod work;
-use work::{WorkPlan, draw_tiled_body};
+use work::{WorkPlan, draw_tiled_item};
 
 thread_local! {
     static KEYBOARD_LAYOUT_CACHE: RefCell<KeyboardLayoutCache> =
@@ -357,7 +357,11 @@ pub fn render_frame(
         let glow = item
             .glow
             .filter(|glow| glow.radius_px > 0.0 && glow.color.a > 0);
-        if !geometry.inside(scene.width, scene.height) {
+        if !geometry.inside(scene.width, scene.height)
+            || (glow.is_some()
+                && !WorkPlan::new(geometry, scene.width, scene.height, rotation)
+                    .full_work_fits(glow)?)
+        {
             draw_unclipped_item(frame, geometry, item, assets, &mut report, rotation, glow)?;
             continue;
         }
@@ -404,8 +408,8 @@ fn draw_unclipped_item(
         return Ok(());
     }
     let plan = WorkPlan::new(geometry, frame.width, frame.height, rotation);
-    if glow.is_none() && !plan.full_work_fits(glow)? {
-        return draw_tiled_body(frame, plan, item, assets, report);
+    if !plan.full_work_fits(glow)? {
+        return draw_tiled_item(frame, plan, item, assets, report, glow);
     }
     draw_unclipped_item_full(frame, geometry, item, assets, report, rotation, glow)
 }
@@ -429,7 +433,7 @@ fn draw_unclipped_item_full(
         mask.origin_y = geometry.y0;
         let rotated_mask = rotate_mask(&mask, rotation)?;
         if let Some(glow) = glow {
-            draw_glow(frame, &rotated_mask, glow)?;
+            draw_glow_at_origin(frame, &rotated_mask, glow, (geometry.x0, geometry.y0))?;
         }
         let mut body = Frame::new(width, height)?;
         draw_item(&mut body, local, item, assets, report, false)?;
@@ -536,8 +540,8 @@ fn scene_starts_with_opaque_solid(scene: &Scene) -> bool {
     }
 }
 
-fn composite_solid_body(frame: &mut Frame, mask: &MaskSurface, item: &SceneItem) -> bool {
-    let color = match &item.kind {
+fn solid_body_color(item: &SceneItem) -> Option<Rgba8> {
+    Some(match &item.kind {
         SceneItemKind::Solid {
             fill: Fill::Solid(color),
         } => *color,
@@ -562,7 +566,13 @@ fn composite_solid_body(frame: &mut Frame, mask: &MaskSurface, item: &SceneItem)
             border_fill: Fill::Solid(border),
             ..
         } if fill == border => *fill,
-        _ => return false,
+        _ => return None,
+    })
+}
+
+fn composite_solid_body(frame: &mut Frame, mask: &MaskSurface, item: &SceneItem) -> bool {
+    let Some(color) = solid_body_color(item) else {
+        return false;
     };
     let frame_width = frame.width as usize;
     frame
@@ -2871,7 +2881,63 @@ impl GlowRasterPlan {
     }
 }
 
+/// A native-resolution window aligned to the full layer's Glow grid.
+#[derive(Clone, Copy, Debug)]
+struct GlowRect {
+    x0: i32,
+    y0: i32,
+    width: usize,
+    height: usize,
+}
+
+impl GlowRect {
+    fn aligned(
+        x0: i64,
+        y0: i64,
+        x1: i64,
+        y1: i64,
+        anchor: (i32, i32),
+        scale: usize,
+    ) -> Result<Self, RasterError> {
+        let scale = scale as i64;
+        let down = |v: i64, origin: i32| {
+            i64::from(origin) + (v - i64::from(origin)).div_euclid(scale) * scale
+        };
+        let up = |v: i64, origin: i32| down(v + scale - 1, origin);
+        let left = down(x0, anchor.0);
+        let top = down(y0, anchor.1);
+        Ok(Self {
+            x0: i32::try_from(left).map_err(|_| RasterError::DimensionsOverflow)?,
+            y0: i32::try_from(top).map_err(|_| RasterError::DimensionsOverflow)?,
+            width: usize::try_from(up(x1, anchor.0) - left)
+                .map_err(|_| RasterError::DimensionsOverflow)?,
+            height: usize::try_from(up(y1, anchor.1) - top)
+                .map_err(|_| RasterError::DimensionsOverflow)?,
+        })
+    }
+}
+
+fn alpha_len(width: usize, height: usize) -> Result<usize, RasterError> {
+    #[cfg(test)]
+    frame_allocation_probe::check(
+        u32::try_from(width).map_err(|_| RasterError::DimensionsOverflow)?,
+        u32::try_from(height).map_err(|_| RasterError::DimensionsOverflow)?,
+    )?;
+    width
+        .checked_mul(height)
+        .ok_or(RasterError::DimensionsOverflow)
+}
+
 fn draw_glow(frame: &mut Frame, source: &MaskSurface, glow: Glow) -> Result<(), RasterError> {
+    draw_glow_at_origin(frame, source, glow, (source.origin_x, source.origin_y))
+}
+
+fn draw_glow_at_origin(
+    frame: &mut Frame,
+    source: &MaskSurface,
+    glow: Glow,
+    anchor: (i32, i32),
+) -> Result<(), RasterError> {
     if glow.radius_px <= 0.0 || glow.color.a == 0 {
         return Ok(());
     }
@@ -2879,50 +2945,76 @@ fn draw_glow(frame: &mut Frame, source: &MaskSurface, glow: Glow) -> Result<(), 
         return Ok(());
     };
     let plan = GlowRasterPlan::new(glow)?;
-    let source_width = bounds.width();
-    let source_height = bounds.height();
-    let padding = plan
-        .pad
-        .checked_mul(2)
-        .ok_or(RasterError::DimensionsOverflow)?;
-    let width = source_width
-        .checked_add(padding)
-        .ok_or(RasterError::DimensionsOverflow)?;
-    let height = source_height
-        .checked_add(padding)
-        .ok_or(RasterError::DimensionsOverflow)?;
-    let len = width
-        .checked_mul(height)
-        .ok_or(RasterError::DimensionsOverflow)?;
-    let mut alpha = vec![0; len];
-    for y in 0..source_height {
-        let destination = (y + plan.pad) * width + plan.pad;
-        let source_offset = (bounds.y0 + y) * source.width + bounds.x0;
-        alpha[destination..destination + source_width]
-            .copy_from_slice(&source.alpha[source_offset..source_offset + source_width]);
+    let left = i64::from(source.origin_x) + bounds.x0 as i64;
+    let top = i64::from(source.origin_y) + bounds.y0 as i64;
+    let window = GlowRect::aligned(
+        left - plan.pad as i64,
+        top - plan.pad as i64,
+        left + bounds.width() as i64 + plan.pad as i64,
+        top + bounds.height() as i64 + plan.pad as i64,
+        anchor,
+        plan.scale,
+    )?;
+    let mut alpha = vec![0; alpha_len(window.width, window.height)?];
+    let offset_x = (left - i64::from(window.x0)) as usize;
+    let offset_y = (top - i64::from(window.y0)) as usize;
+    for y in 0..bounds.height() {
+        let destination = (offset_y + y) * window.width + offset_x;
+        let from = (bounds.y0 + y) * source.width + bounds.x0;
+        alpha[destination..destination + bounds.width()]
+            .copy_from_slice(&source.alpha[from..from + bounds.width()]);
     }
-    let (mut reduced, reduced_width, reduced_height) = if plan.scale > 1 {
-        downsample_max(&alpha, width, height, plan.scale)
+    filter_and_composite_glow(
+        frame,
+        MaskSurface {
+            origin_x: window.x0,
+            origin_y: window.y0,
+            width: window.width,
+            height: window.height,
+            alpha,
+        },
+        plan,
+        glow.color,
+        PixelRect {
+            x0: 0,
+            y0: 0,
+            x1: frame.width as usize,
+            y1: frame.height as usize,
+        },
+    )
+}
+
+/// Both full and viewport-tiled masks use this same reduction/filter pipeline.
+fn filter_and_composite_glow(
+    frame: &mut Frame,
+    source: MaskSurface,
+    plan: GlowRasterPlan,
+    color: Rgba8,
+    clip: PixelRect,
+) -> Result<(), RasterError> {
+    let (width, height) = (source.width, source.height);
+    alpha_len(width.div_ceil(plan.scale), height.div_ceil(plan.scale))?;
+    let (mut reduced, rw, rh) = if plan.scale > 1 {
+        downsample_max(&source.alpha, width, height, plan.scale)
     } else {
-        (alpha, width, height)
+        (source.alpha, width, height)
     };
     if plan.spread_radius > 0 {
-        reduced = max_filter(&reduced, reduced_width, reduced_height, plan.spread_radius);
+        reduced = max_filter(&reduced, rw, rh, plan.spread_radius);
     }
-    let blurred = box_blur(&reduced, reduced_width, reduced_height, plan.blur_radius);
-    let origin_x = source.origin_x + bounds.x0 as i32 - plan.pad as i32;
-    let origin_y = source.origin_y + bounds.y0 as i32 - plan.pad as i32;
+    let blurred = box_blur(&reduced, rw, rh, plan.blur_radius);
     composite_glow_mask(
         frame,
         &blurred,
-        reduced_width,
-        reduced_height,
+        rw,
+        rh,
         width,
         height,
-        origin_x,
-        origin_y,
+        source.origin_x,
+        source.origin_y,
         plan.scale,
-        glow.color,
+        color,
+        clip,
     );
     Ok(())
 }
@@ -2939,6 +3031,7 @@ fn composite_glow_mask(
     origin_y: i32,
     scale: usize,
     glow: Rgba8,
+    clip: PixelRect,
 ) {
     let frame_width = frame.width as usize;
     let row_bytes = frame_width * 4;
@@ -2947,14 +3040,17 @@ fn composite_glow_mask(
         .par_chunks_exact_mut(row_bytes)
         .enumerate()
         .for_each(|(global_y, row)| {
+            if global_y < clip.y0 || global_y >= clip.y1 {
+                return;
+            }
             let local_y = global_y as i32 - origin_y;
             if local_y < 0 || local_y >= height as i32 {
                 return;
             }
             let y = local_y as usize;
             if scale == 1 {
-                let x0 = (-origin_x).max(0) as usize;
-                let x1 = width.min((frame_width as i32 - origin_x).max(0) as usize);
+                let x0 = (clip.x0 as i64 - i64::from(origin_x)).max(0) as usize;
+                let x1 = width.min((clip.x1 as i64 - i64::from(origin_x)).max(0) as usize);
                 for x in x0..x1 {
                     blend_glow_row_pixel(row, origin_x + x as i32, glow, blurred[y * width + x]);
                 }
@@ -2962,7 +3058,11 @@ fn composite_glow_mask(
             }
             let reduced_y0 = (y / scale).min(blurred_height - 1);
             let reduced_y1 = (reduced_y0 + 1).min(blurred_height - 1);
-            for reduced_x in 0..blurred_width {
+            let visible_x0 = (clip.x0 as i64 - i64::from(origin_x)).max(0) as usize;
+            let visible_x1 = width.min((clip.x1 as i64 - i64::from(origin_x)).max(0) as usize);
+            for reduced_x in (visible_x0 / scale).min(blurred_width)
+                ..visible_x1.div_ceil(scale).min(blurred_width)
+            {
                 let next_x = (reduced_x + 1).min(blurred_width - 1);
                 if blurred[reduced_y0 * blurred_width + reduced_x] == 0
                     && blurred[reduced_y0 * blurred_width + next_x] == 0
@@ -2975,7 +3075,7 @@ fn composite_glow_mask(
                 let x1 = (x0 + scale).min(width);
                 for x in x0..x1 {
                     let global_x = origin_x + x as i32;
-                    if global_x < 0 || global_x >= frame_width as i32 {
+                    if global_x < clip.x0 as i32 || global_x >= clip.x1 as i32 {
                         continue;
                     }
                     let mask_alpha =

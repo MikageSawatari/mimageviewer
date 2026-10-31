@@ -17,7 +17,7 @@ pub const MAX_TEXT_RASTER_BYTES: usize = 8 * 1024 * 1024;
 const TILE_EDGE: usize = 1024;
 
 #[cfg(test)]
-mod glyph_preparation_probe {
+pub(crate) mod glyph_preparation_probe {
     use std::cell::Cell;
 
     thread_local! {
@@ -32,7 +32,7 @@ mod glyph_preparation_probe {
         }
     }
 
-    pub(super) fn with_dry_run<R>(run: impl FnOnce() -> R) -> (R, usize) {
+    pub(crate) fn with_dry_run<R>(run: impl FnOnce() -> R) -> (R, usize) {
         let restore = Restore(DRY_RUN.with(|probe| probe.replace(Some(0))));
         let result = run();
         let completed = DRY_RUN.with(|probe| probe.take().unwrap());
