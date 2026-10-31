@@ -67,14 +67,29 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.673 マスクの編集で、描いたマスクに囲まれた領域を塗りつぶす (マスクを壁にしたバケツ) — 利用者要望 (2026-11-01)
 
-- 状態: **未着手・追加の方針 (利用者要望 2026-11-01、規模が小さければ次の v4 系)**。消しゴムなどで、筆でマスクの輪郭を描いた後、その輪郭に囲まれた内側をまとめて塗りたい、という要望。製品コードの変更・実機確認は未実施。
-- 現状 (2026-11-01 ClaudeCode がコードで確認): 消しゴム (`EraseTool`)・隠蔽 (`ConcealTool`)・補正レイヤーの手描きマスク (`LocalAdjustMaskTool`) の 3 つとも、囲み・多角形 (投げ縄) とバケツを出荷済み。ただしバケツ (`mask_db::flood_fill_bitmap_mask`) の塗る範囲は**画像の色**とクリックした点の色の差 (`bucket_fillable_map`) で決まり、既存のマスクは壁にならない。そのため「筆で描いた輪郭の内側を塗る」はできない。筆は軌跡を残さず原寸のビットマップへ直接塗る (消しゴム・隠蔽は `Vec<bool>` + 図形、補正レイヤーは `RasterVectorMask` の alpha)。
-- 方針: 3 ツールのバケツに、範囲の決め方として「描いたマスクで囲まれた範囲」を追加する (従来の「画像の色」は既定のまま残す)。`flood_fill_bitmap_mask` の `fillable` を「合成マスク (ビットマップ + 図形) が無い画素」に差し替える形で、行単位の塗り広げ (`bucket_reach`)・漏れ止め・はみ出し・Undo 1 手・保存はすべて既存のまま使う。結果はビットマップに書くので保存形式は変わらない (図形の種類を足す案は、旧版で読めなくなるので採らない)。
-- 決めること: 補正レイヤーで、追加マスク・削除マスク・反転フラグのあるレイヤーで何を壁にするか (既存のバケツの 2 値化 `alpha >= 0.5` に合わせる案)。クリックした点が既にマスク上にあるときの扱い (何もしない + 理由の表示)。囲まれていない (画像の端まで抜ける) ときの扱い (既存の「全体」と同じく端まで塗る / 塗らずに知らせる)。筆の小さな切れ目からの漏れは既存の漏れ止めで防ぐ。
-- 別案 (採るなら別項目): 筆の軌跡が閉じたら自動で内側を塗る。ドラッグ中に軌跡を一時的に記録し、離したとき始点と終点が近ければ既存の `scanline_fill_polygon` で塗る。8 の字の交差で穴が開く、閉じた判定が筆の太さに依存するなどの弱点がある。
-- 注意: 処理は UI スレッドで同期に走る (既存のバケツと同じ)。8000x6000 の画像では、マスク 48MB・Undo の複製・テクスチャの作り直しが既存のバケツと同程度かかる。新しいコストを足さないこと。
-- 検証: 3 ツールで、閉じた輪郭の内側だけが塗られる / 切れ目があると漏れ止めの範囲で止まる / 囲まれていない場合 / 点がマスク上 / 図形マスクを壁に含む / Undo 1 手で戻る / 保存・再読み込み後も同じ、を純粋関数と handler のテストで確認。UI の選択肢の snapshot。マニュアルの消しゴム・隠蔽・補正レイヤーのバケツの説明。
-- 対象: `src/mask_db.rs` のバケツ、`src/ui_erase.rs`・`src/ui_conceal.rs`・`src/ui_adjustment_panel.rs` のバケツの適用と設定 UI、`src/app.rs` のバケツ設定。[補正レイヤー計画 §6.3](local-adjustment-layer-v1.1.0-plan.md)、[隠蔽の計画 §6](conceal-feature-plan.md)、[spec のバケツの節](spec.md)。規模: Small〜Medium / 優先度: P3。
+- 状態: **実装済み・実機未確認 (2026-11-01、確認用build済み。lib全件の3件timeoutは単独各3回成功)**。設計担当 ClaudeCode の依頼を受け `mask-bucket-1673`（基点 `fdb1fbbce`）で実装。製品起動・実入力・コミット・CHANGELOG更新は行っていない。
+- 消しゴム / 隠蔽加工 / 補正レイヤーのバケツに「範囲の基準: 画像の色 / 描いたマスク」を追加。既定は画像の色、3 ツールごとの `App` セッション内保持で保存しない。マスク基準では色差スライダーだけを無効化し、値は保持する。
+- 壁と書込み対象: 消しゴム / 隠蔽は bitmap + Shape の作成順 add/subtract 合成。補正レイヤーは手動ベース / 追加 / 削除のうち、編集中の書込み先の alpha `>= 0.5` + その Shape。反転フラグ・他の対象マスクは参照しない。書込値と異なる画素だけが塗れる。同値のクリックは `SeedAlreadyValue` を返し、マスク・履歴を変えず既存 warning で理由を表示する。
+- 領域決定後は既存 `BucketRegion` 全 5 種、漏れ止め / はみ出し / 隙間の許容と、既存 handler の Undo 1 手・texture失効・保存へ流す。閉じていない範囲は端まで到達し得る。保存形式・Shape の種類は変えない。
+- 配列と描画判定: 合成用 bool 配列を反転して `fillable` として消費するため、色のバケツより原寸配列の複製を増やさない。補正レイヤーの図形は `local-adjust-core` の既存 rasterizer を描画値の型だけ一般化し、既存 f32 と新 bool で画素判定と順序を共有する。消しゴム用 rasterizer への変換では小数位置の矩形の画素判定が異なるため採らない。
+- 簡素化: 新たな非同期処理・要求・pendingは作らず、既存の同期バケツに塗れる画素の判定だけを接続する。モーダル化や中断・復帰の状態追加は不要。まれな失敗は既定のログ・通知方針のまま。
+- 仕様上の限界: 書込みは既存 bitmap / alpha のみで、Shape は保持する。このため subtract 図形の内側へ塗っても合成時に再び抜け、add 図形自体をバケツで消すことはできない。図形の破壊的ラスタ化や型追加は範囲外。独立 reviewer（GPT-6.1 Sol / xhigh）は明示の既存書込み仕様による制約として確認し、UI tooltip・3 マニュアル・設計書にも明記する。
+- 回帰: 閉じた輪郭、小切れ目の漏れ止め有無、非閉鎖端到達、同値 seed 不変、図形の合成順と壁、消去の連結成分、5 region × はみ出し × 漏れ止め × 隙間の許容の色基準との一致。補正図形は小数位置 / 回転 / 最小寸法 / 線・矩形・楕円 / add-subtract 順について core f32 と bool の全画素一致を検査する。3 ツールの共通選択 UI →実 handler→Undo/Redo→DB 再読込、補正 Base/Add/Subtract ×反転有無・他 target 不変と既存 q8 保存の二値形状保持を追加する。製品の実ポインター・実パネル配置の実機確認とは区別する。
+- UI snapshot: `tests/snapshots/bucket_drawn_mask_options_dark.png`（250×300、27,771 bytes、lib headless fixture）を 1 枚追加し目視確認済み。色差の無効化と基準切替後の値保持も検査。既存画像は更新しない。
+- 文書: 3 マニュアル、`docs/spec.md` バケツ節、補正レイヤー計画 §6.3、隠蔽計画 §3.3 / §6、プリセット・補正 §5.1 を更新。既存のマニュアル比較図と `gen_bucket_figures` は色基準のままで、`BucketRegion` の variant は増やさない。全 match と `BucketFillOutcome` の consumer を監査する。
+- 検証条件: 基点 `fdb1fbbce` + 本節の未コミット差分、通常 feature / test profile。検証担当 Codex root。ログは `target/mask-bucket-1673/`。実機確認は未実施。
+  - `cargo fmt` / `cargo fmt --check` / `git diff --check`: 成功。`python scripts/check_ui_glyphs.py`: 危険グリフ0件、exit 0。
+  - 追加回帰 `cargo test -p mimageviewer --lib mask_bucket_1673`（初回の新規PNGのみ更新指定）: **17/17 成功**、exit 0、実行2.52秒 / コンパイル込み5分07秒（`focused.log`）。
+  - `cargo test -p local-adjust-core`: **269/269 成功**、exit 0、実行1.90秒。doctest対象0件（`local-core.log`）。
+  - `cargo check -p mimageviewer --lib --tests --features test-script`: 成功、exit 0、2分43秒（`check-pass.log`）。既存warningは残る。
+  - 関連 `cargo test -p mimageviewer --lib bucket`: **44/44 成功**、exit 0、実行3.66秒（`bucket-related.log`）。追加17件も含み、新規PNGは更新指定なしの通常比較も成功。
+  - `cargo test --test ui_snapshot`: **216/216 成功**、exit 0、実行37.68秒（`ui-snapshot.log`）。既存PNGは無差分。
+  - `scripts/test-lib-full.ps1`: **15,342実行、15,339成功・3失敗・67 skipped**、exit 100、747.967秒。runは `target/test-lib-full/runs/20261031T183916859Z-5168bc4e/`、source IDは `0c7f030a3caa867db7819c9d66944e5ed9e963765d9d9eca7d07fe3b1de25fc1`。失敗runのため成功receiptは作られず、全件成功とは扱わない。指定の既知不安定なページめくり §1.447 と `main_chrome_folder_tree_clicks_follow_common_modal_ownership` は成功し、その2系統の単独3回条件は発動しなかった。
+  - 全件失敗は `app::multiwindow_scenario_tests` の `multiwindow_scenario_a_zip_sidecar_restore_reaches_paint` / `multiwindow_scenario_a_folder_sidecar_restore_reaches_paint` / `multiwindow_rar_nav_cbr_backward_reaches_zip`。各26秒前後でfixture内部のwait_until期限に到達した（コマンドrunnerによる中断ではない）。それぞれ単独・直列・retry 0で**3回ずつすべて成功**、計9/9、exit 0（`isolated-1-1.log`〜`isolated-3-3.log`）。期待値・待機期限・製品コードは変えていない。
+  - 独立reviewerが3失敗のfixtureと呼出経路を確認。編集モード・バケツ・今回一般化した図形描画を使わず、navigation / sidecar / viewport / paintの製品コードは無差分。今回の変更が原因という根拠は見つからなかったが、負荷起因・既存不具合とは断定しない。全件の3失敗は未解明の検証上の制約として残す。後続の更新は検証結果を記す文書のみで、Rustソースは同じ。
+  - 独立 completion review（GPT-6.1 Sol / xhigh）: **ACCEPT、P1/P2なし**。検証コマンドは重複実行せず差分を確認した。
+  - `scripts/build-dev.ps1 -PreserveRuntime`: **成功、exit 0**。通常feature、portable無効。core 5分38秒、同protocolのremote 0.55秒 / EPUB worker 0.53秒。3実行体・DLL / EffeTune bundleを `target/dev-runtime/` へ配置し、VCRT / PE監査は runtime=4 / pe=3 で成功（`build-dev.log`、`target/vcrt-pe-reports/dev-runtime.json`）。エージェントから起動していない。workspace / vendor全体の `test-full.ps1` と実機操作は未実施。
+- 実機引継ぎ: worktree直下で `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。引数なしでは実利用中の `%APPDATA%\mimageviewer` を使い、設定・データを更新し得る。single-instance mutexを共有するため先にインストール版 / tray常駐版を終了する。確認対象は3ツールで筆の輪郭→「描いたマスク」「隣接のみ」で内側を塗る→Undo1手→保存・再開、補正レイヤーの追加 / 削除を編集中ならそのマスクだけを壁にすること、画像の色へ戻すと色差設定が再び使えること。図形自体は変更しない仕様上の限界は上記のとおり。
 
 ### 1.672 論理的な「親へ」とは別に、実際の親フォルダへ移動する操作を追加する — 5ch >>691 (2026-11-01)
 

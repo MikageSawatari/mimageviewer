@@ -741,7 +741,15 @@ pub(crate) fn squared_distance_map(seeds: &[bool], width: usize, height: usize) 
     buf
 }
 
-/// バケツで色の近い範囲を決める方法。
+/// バケツで範囲を決める基準。App のセッション内だけで保持する。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum BucketSource {
+    #[default]
+    ImageColor,
+    DrawnMask,
+}
+
+/// バケツの対象範囲と図形整形。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BucketRegion {
     /// 画像全体に散らばる近似色。
@@ -815,6 +823,8 @@ pub enum BucketFillOutcome {
     NoChange,
     /// seed が漏れ止めで消える細さの場所にある。マスクは変えていない。
     SeedTooThin,
+    /// マスク基準で seed が既に書き込む値。何も変更していない。
+    SeedAlreadyValue,
     /// 指定図形が退化して成立しない。整形前の領域は表示専用の縮小 mask で返す。
     ShapeFitFailed(BucketRegionPreview),
     /// 寸法 0 / seed が範囲外 / 配列長が足りない。
@@ -1013,6 +1023,66 @@ pub fn flood_fill_bitmap_mask(
     let seed = [seed_color.r(), seed_color.g(), seed_color.b()];
     let fillable = bucket_fillable_map(&image.pixels, expected_len, seed, fill.tolerance);
 
+    fill_bucket_region(mask, [width, height], seed_x, seed_y, fill, fillable)
+}
+
+/// 書き込み先と同じマスクの合成結果を壁にする。合成用配列は fillable に再利用し、
+/// 画像の色のバケツに比べて全画面配列の複製を増やさない。
+pub fn flood_fill_drawn_mask(
+    mask: &mut [bool],
+    shapes: &[Shape],
+    size: [usize; 2],
+    seed_x: usize,
+    seed_y: usize,
+    fill: BucketFill,
+) -> BucketFillOutcome {
+    let [width, height] = size;
+    let len = width.saturating_mul(height);
+    if width == 0 || height == 0 || seed_x >= width || seed_y >= height || mask.len() < len {
+        return BucketFillOutcome::Invalid;
+    }
+    let mut fillable = mask[..len].to_vec();
+    rasterize_shapes_into(&mut fillable, shapes, width, height);
+    flood_fill_composite_mask(mask, fillable, size, seed_x, seed_y, fill)
+}
+
+/// Consume a composite mask so callers can reuse their existing rasterizer without another clone.
+pub(crate) fn flood_fill_composite_mask(
+    mask: &mut [bool],
+    mut fillable: Vec<bool>,
+    size: [usize; 2],
+    seed_x: usize,
+    seed_y: usize,
+    fill: BucketFill,
+) -> BucketFillOutcome {
+    let [width, height] = size;
+    let len = width.saturating_mul(height);
+    if width == 0
+        || height == 0
+        || seed_x >= width
+        || seed_y >= height
+        || mask.len() < len
+        || fillable.len() != len
+    {
+        return BucketFillOutcome::Invalid;
+    }
+    if fillable[seed_y * width + seed_x] == fill.value {
+        return BucketFillOutcome::SeedAlreadyValue;
+    }
+    for value in &mut fillable {
+        *value = *value != fill.value;
+    }
+    fill_bucket_region(mask, size, seed_x, seed_y, fill, fillable)
+}
+
+fn fill_bucket_region(
+    mask: &mut [bool],
+    [width, height]: [usize; 2],
+    seed_x: usize,
+    seed_y: usize,
+    fill: BucketFill,
+    fillable: Vec<bool>,
+) -> BucketFillOutcome {
     let mut region = if fill.region == BucketRegion::Whole {
         fillable
     } else if !(fill.leak_stop > 0.0) {
@@ -3250,3 +3320,7 @@ mod tests {
         assert!(matches!(got_shapes[0], Shape::Line { .. }));
     }
 }
+
+#[cfg(test)]
+#[path = "mask_db/mask_bucket_1673_tests.rs"]
+mod mask_bucket_1673_tests;

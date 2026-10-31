@@ -5323,18 +5323,41 @@ fn eval_raster_vector_mask(
 
 pub fn rasterize_shapes_into(alpha: &mut [f32], width: usize, height: usize, shapes: &[MaskShape]) {
     for shape in shapes {
-        rasterize_shape_into(alpha, width, height, *shape);
+        rasterize_shape_into(
+            alpha,
+            width,
+            height,
+            *shape,
+            if shape.op().is_add() { 1.0 } else { 0.0 },
+        );
     }
 }
 
-fn rasterize_shape_into(alpha: &mut [f32], width: usize, height: usize, shape: MaskShape) {
-    let add = shape.op().is_add();
+/// Apply exactly the same shape coverage as the alpha renderer, without a full-size float buffer.
+pub fn rasterize_shapes_into_bitmap(
+    bitmap: &mut [bool],
+    width: usize,
+    height: usize,
+    shapes: &[MaskShape],
+) {
+    for shape in shapes {
+        rasterize_shape_into(bitmap, width, height, *shape, shape.op().is_add());
+    }
+}
+
+fn rasterize_shape_into<T: Copy>(
+    alpha: &mut [T],
+    width: usize,
+    height: usize,
+    shape: MaskShape,
+    value: T,
+) {
     match shape {
         MaskShape::Line {
             p0, p1, thickness, ..
         } => {
             let corners = line_corners(p0, p1, thickness.max(1.0));
-            fill_polygon_alpha(alpha, width, height, &corners, add);
+            fill_polygon_alpha(alpha, width, height, &corners, value);
         }
         MaskShape::Rect {
             center,
@@ -5344,7 +5367,7 @@ fn rasterize_shape_into(alpha: &mut [f32], width: usize, height: usize, shape: M
             ..
         } => {
             let corners = rect_corners(center, half_w.max(0.5), half_h.max(0.5), rotation_rad);
-            fill_polygon_alpha(alpha, width, height, &corners, add);
+            fill_polygon_alpha(alpha, width, height, &corners, value);
         }
         MaskShape::Ellipse {
             center,
@@ -5361,7 +5384,7 @@ fn rasterize_shape_into(alpha: &mut [f32], width: usize, height: usize, shape: M
                 rx.max(0.5),
                 ry.max(0.5),
                 rotation_rad,
-                add,
+                value,
             );
         }
     }
@@ -5396,12 +5419,12 @@ fn rect_corners(center: [f32; 2], half_w: f32, half_h: f32, rotation_rad: f32) -
     out
 }
 
-fn fill_polygon_alpha(
-    alpha: &mut [f32],
+fn fill_polygon_alpha<T: Copy>(
+    alpha: &mut [T],
     width: usize,
     height: usize,
     points: &[[f32; 2]],
-    add: bool,
+    value: T,
 ) {
     if points.len() < 3 || width == 0 || height == 0 {
         return;
@@ -5433,21 +5456,21 @@ fn fill_polygon_alpha(
     for y in min_y..=max_y {
         for x in min_x..=max_x {
             if point_in_polygon(x as f32 + 0.5, y as f32 + 0.5, points) {
-                alpha[y * width + x] = if add { 1.0 } else { 0.0 };
+                alpha[y * width + x] = value;
             }
         }
     }
 }
 
-fn fill_ellipse_alpha(
-    alpha: &mut [f32],
+fn fill_ellipse_alpha<T: Copy>(
+    alpha: &mut [T],
     width: usize,
     height: usize,
     center: [f32; 2],
     rx: f32,
     ry: f32,
     rotation_rad: f32,
-    add: bool,
+    value: T,
 ) {
     if width == 0 || height == 0 {
         return;
@@ -5465,7 +5488,7 @@ fn fill_ellipse_alpha(
             let lx = dx * c - dy * s;
             let ly = dx * s + dy * c;
             if (lx / rx).powi(2) + (ly / ry).powi(2) <= 1.0 {
-                alpha[y * width + x] = if add { 1.0 } else { 0.0 };
+                alpha[y * width + x] = value;
             }
         }
     }
