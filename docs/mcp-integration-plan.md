@@ -1671,7 +1671,8 @@ MCP の exe は console subsystem・CRT 静的リンク (DLL 不要)・引数は
     launcher 単独の試験も同じ client で行う。
   - 確かめる時に、launcher の起動の前後で利用者の `%APPDATA%\mimageviewer\runtime` が変わらないことを見る。
   - mutex のテスト: 2 つの launcher の `--mcp` が並んで動ける、片方が終わっても残りがある間は検出される、最後が終わると不在になる。
-- portable は `prepare-portable-smoke.ps1` で作り直し、同梱の `mimageviewer-mcp.exe` を `mcp_client_smoke.py --exe` で指して確かめる。
+- portable は `prepare-portable-smoke.ps1` で作り直し、同梱の `mimageviewer-mcp.exe` を `--mcp` なし・隔離の `--data-dir` 付きで、
+  上と同じ直接の stdio client から起動して確かめる (Codex CLI を起動する `mcp_client_smoke.py` は使わない。設計レビュー 17 巡目 P2)。
 
 ### 15.9 段階 0 の残り (1a で直す)
 
@@ -1877,6 +1878,9 @@ Susie の初期化の待ちを既存の枠の保持で扱うことは妥当と�
 別のユーザーの launcher が開けず、`OpenMutexW` の失敗は不在と拒否を区別しない → `SYNCHRONIZE` だけの共有と、不在は
 `ERROR_FILE_NOT_FOUND` だけにした。(2) Codex CLI は利用者の通常の登録を読み得る → 試験の client を launcher を直接起動する
 小さな MCP client にした。どちらも妥当と判断した (§15.8)。
+
+17 巡目: mutex の DACL・要求する権限・インストーラの失敗の判定は解消。新しい指摘 P2 1 件「portable の確認に Codex CLI の経路が
+残っている」は妥当で、直接の stdio client にそろえた (§15.8)。
 
 ## 16. 段階 1a の実装記録 (2026-10-31、基点 `17c85bb3a`、未コミット差分)
 
