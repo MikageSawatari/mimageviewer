@@ -21,6 +21,8 @@
 pub(crate) mod canonical_demand;
 mod compare_original;
 #[cfg(test)]
+mod continuous_quality_tests;
+#[cfg(test)]
 mod front_pointer_ownership_tests;
 #[cfg(test)]
 mod front_popup_input_tests;
@@ -15497,6 +15499,11 @@ impl App {
     /// 現在のフルスクリーン画像が PDF ページなら、指定ズームで再レンダリングを要求する。
     pub(crate) fn maybe_rerender_pdf(&mut self, zoom: f32) {
         if let Some(idx) = self.fullscreen_idx {
+            // Continuous geometry owns one absolute demand for every visible source.
+            // Issuing a second fit/zoom target here would supersede that same pending.
+            if self.continuous_reading_active_for_idx(idx) {
+                return;
+            }
             if matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
                 // 表示中ページのズーム由来再レンダなので priority レーン (即応)。
                 self.request_pdf_rerender(idx, zoom, true);
@@ -31966,9 +31973,18 @@ impl App {
     fn reconcile_specified_pdf_demand(&mut self, ctx: &egui::Context) {
         if self.effective_fullscreen_fit_mode() != FullscreenFitMode::SpecifiedScale
             || self.fs_holdover_tex.is_some()
+            || self.fullscreen_page_layout.kind() == FullscreenPageLayoutKind::Continuous
         {
             return;
         }
+        self.reconcile_pdf_layout_demand(ctx, false);
+    }
+
+    fn reconcile_continuous_pdf_demand(&mut self, ctx: &egui::Context) {
+        self.reconcile_pdf_layout_demand(ctx, true);
+    }
+
+    fn reconcile_pdf_layout_demand(&mut self, ctx: &egui::Context, continuous: bool) {
         let mut demands = HashMap::<usize, f32>::new();
         for page in self.fullscreen_page_layout.displayed_pages() {
             let idx = page.transform.page_idx;
@@ -31984,11 +32000,16 @@ impl App {
         }
         let single_z = self.fullscreen_page_layout.kind() == FullscreenPageLayoutKind::Single
             && self.fs_zoom_mode_engaged();
-        let original_floor = self.settings.fullscreen_fit_no_downscale && !single_z;
+        let original_floor = (self.settings.fullscreen_fit_no_downscale && !single_z)
+            || (continuous && self.effective_fullscreen_fit_mode() == FullscreenFitMode::Original);
         // A cover source can occur twice in continuous reading at different
         // matched heights. One source requests the greatest visible demand once.
         for (idx, required) in demands {
-            self.request_pdf_absolute_demand(idx, required, original_floor);
+            if continuous {
+                self.request_continuous_pdf_absolute_demand(idx, required, original_floor);
+            } else {
+                self.request_pdf_absolute_demand(idx, required, original_floor);
+            }
         }
     }
 
@@ -46762,6 +46783,22 @@ impl App {
         visible_positions: &[usize],
         prepare_positions: &[usize],
     ) {
+        let displayed = continuous_reading_source_set_for_positions(units, visible_positions);
+        self.update_continuous_reading_prefetch_window_for_visible(
+            units,
+            visible_positions,
+            prepare_positions,
+            &displayed,
+        );
+    }
+
+    fn update_continuous_reading_prefetch_window_for_visible(
+        &mut self,
+        units: &[ContinuousReadingUnitSpec],
+        visible_positions: &[usize],
+        prepare_positions: &[usize],
+        displayed_pages: &HashSet<usize>,
+    ) {
         if units.is_empty() {
             return;
         }
@@ -46916,10 +46953,7 @@ impl App {
         keep_positions_for_load.sort_unstable();
         keep_positions_for_load.dedup();
 
-        let raw_displayed = visible_positions
-            .iter()
-            .flat_map(|&pos| units[pos].source_indices())
-            .collect::<Vec<_>>();
+        let raw_displayed = displayed_pages.iter().copied().collect::<Vec<_>>();
         let raw_current = self.fullscreen_idx.unwrap_or(units[current_pos].anchor_idx);
         keep_set.extend(self.reconcile_raw_demand(raw_current, &raw_displayed));
         let raw_evicted = self
@@ -46942,12 +46976,12 @@ impl App {
         self.fs_lanczos_cache.retain_page_indices(&keep_set);
 
         let current_idx = self.fullscreen_idx.unwrap_or(units[current_pos].anchor_idx);
-        // Navigation stays anchored to `current_idx`, while every role occurrence in this unit
-        // is display-critical. This includes the repeated cover source in the final unit.
-        let displayed_pages = units[current_pos]
-            .source_indices()
-            .collect::<std::collections::HashSet<_>>();
-        let displayed_partner = displayed_pages
+        // Navigation stays anchored to `current_idx`; all admitted visible units are
+        // display-critical. Canonical prepare/keep sources remain ordinary prefetch.
+        // Animation expansion retains its released current-unit lifetime, shared
+        // with promotion admission and result adoption. Raw display demand is wider.
+        let animation_displayed = units[current_pos].source_indices().collect::<HashSet<_>>();
+        let displayed_partner = animation_displayed
             .iter()
             .copied()
             .find(|idx| *idx != current_idx);
@@ -46959,7 +46993,7 @@ impl App {
             .fs_pending
             .iter()
             .filter_map(|(&idx, pending)| {
-                (!displayed_pages.contains(&idx)
+                (!animation_displayed.contains(&idx)
                     && pending.purpose.promotion_started_at_for(idx).is_some())
                 .then_some(idx)
             })
@@ -46969,7 +47003,7 @@ impl App {
         }
         self.fs_upload_backlog.retain(|entry| {
             entry.purpose.promotion_started_at_for(entry.idx).is_none()
-                || displayed_pages.contains(&entry.idx)
+                || animation_displayed.contains(&entry.idx)
         });
         let current_loading = displayed_pages.iter().any(|idx| {
             keep_set.contains(idx) && self.fs_page_load_state(*idx).waiting_for_display()
@@ -46990,9 +47024,16 @@ impl App {
             self.cancel_fs_page_load(idx);
         }
         if current_loading {
-            for idx in displayed_pages {
-                self.ensure_fs_page_load(idx);
+            let mut displayed = displayed_pages.iter().copied().collect::<Vec<_>>();
+            displayed.sort_by_key(|idx| (!Self::page_is_displayed(*idx, current_idx, None), *idx));
+            for idx in displayed {
+                self.ensure_fs_page_load_with_priority(
+                    idx,
+                    crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                    crate::fs_page_load_scheduler::FsPageLoadPriority::High,
+                );
             }
+            self.refresh_continuous_pdf_promotion(displayed_pages);
             return;
         }
 
@@ -47016,9 +47057,19 @@ impl App {
         });
         for (_, idx) in targets {
             if keep_set.contains(&idx) {
-                self.ensure_fs_page_load(idx);
+                let priority = if displayed_pages.contains(&idx) {
+                    crate::fs_page_load_scheduler::FsPageLoadPriority::High
+                } else {
+                    crate::fs_page_load_scheduler::FsPageLoadPriority::Normal
+                };
+                self.ensure_fs_page_load_with_priority(
+                    idx,
+                    crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                    priority,
+                );
             }
         }
+        self.refresh_continuous_pdf_promotion(displayed_pages);
     }
 
     /// Gated: continuous reading adopts this result directly rather than through
@@ -47501,10 +47552,28 @@ impl App {
             &canonical_visible_positions,
             VERTICAL_READING_PREPARE_BAND_UNITS,
         );
-        self.update_continuous_reading_prefetch_window(
+        // Establish the actual drawing target before the common source owner is
+        // consulted. A cold continuous open must not silently wait for a paged pass.
+        let (pdf_size, pdf_fit_mode) =
+            if self.effective_fullscreen_fit_mode() == FullscreenFitMode::SpecifiedScale {
+                specified_pdf_provisional_target(
+                    image_rect.size(),
+                    self.settings.fullscreen_specified_scale,
+                )
+            } else {
+                (image_rect.size(), self.pdf_display_fit_mode())
+            };
+        self.fs_pdf_display_target = Some(crate::pdf_loader::PdfDisplayTarget::from_logical_size(
+            pdf_size.x,
+            pdf_size.y,
+            ctx.pixels_per_point(),
+            pdf_fit_mode,
+        ));
+        self.update_continuous_reading_prefetch_window_for_visible(
             &base_units,
             &canonical_visible_positions,
             &canonical_prepare_positions,
+            &admitted_sources,
         );
 
         let prepare_pages = self.continuous_reading_pages_for_positions(
@@ -47739,6 +47808,7 @@ impl App {
                 }
             }
         }
+        self.reconcile_continuous_pdf_demand(ctx);
         // 自動 / 手動の起点は scroll transition が所有し、再アンカーの記録地点まで
         // HistoryTrigger を値として渡す。スライドショーの現在状態からは推測しない。
         let reanchor_trigger = match self.continuous_reading_scroll_transition {
@@ -91573,8 +91643,18 @@ mod specified_scale_consumer_tests {
         let requests = probe.take_requests();
         assert!(!requests.is_empty());
         let generation = app.items_generation;
-        for (idx, _) in requests {
-            assert!(probe.complete(&mut app, generation, idx, completion(7138)));
+        for (idx, target) in requests {
+            // Keep the deliberately square sampler and oversized source metadata,
+            // but fulfill the actual quality demand as the real PDF worker does.
+            // An 8px fake cannot stand for a completed 330px display request.
+            let mut result = completion(7138);
+            if let FsLoadResult::StaticPdf { ci, .. } = &mut result {
+                *ci = egui::ColorImage::filled(
+                    [target as usize, target as usize],
+                    egui::Color32::WHITE,
+                );
+            }
+            assert!(probe.complete(&mut app, generation, idx, result));
         }
         app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
         assert_eq!(draw(&mut app), before);
@@ -91607,7 +91687,7 @@ mod specified_scale_consumer_tests {
             partner.page_idx = 1;
             app.fullscreen_page_layout
                 .push_occurrence(partner, SpreadPageOccurrence::navigation(1, 1));
-            app.reconcile_specified_pdf_demand(&ctx);
+            app.reconcile_continuous_pdf_demand(&ctx);
             let mut requests = probe.take_requests();
             requests.sort_unstable();
             if frame_no == 0 {
