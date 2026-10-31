@@ -2571,3 +2571,33 @@ ClaudeCode が sandbox 外の通常権限で実行するコマンド (今回の�
 cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
 cargo nextest run -p mimageviewer --lib -E '(test(/agent_ipc/) or test(/agent_level/) or test(/agent_permission/) or test(=settings_db::tests::failed_permission_commit_preserves_snapshot_and_epoch) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(/png_metadata/) or test(=pdf_loader::tests::anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results) or test(=pdf_loader::tests::page_sizes_preserve_existing_ui_diagnostic_identity) or test(=pdf_loader::tests::page_sizes_round_trip_and_reject_a_truncated_reply) or test(/app::folder_scan/) or test(/zip_loader/) or test(/conceal_db/) or test(=pdf_loader::tests::anonymous_agent_render_and_enumerate_omit_keys_and_harvest_actual_completion) or test(=pdf_loader::tests::cancelled_anonymous_render_does_not_enqueue)) and not test(/section1375_scan_perf_tests/)'
 ```
+
+### 17.11 クライアントからの呼び出し観測 (観測者: ClaudeCode、2026-10-31、コード `b66a63687`)
+
+使い捨て portable (`prepare-portable-smoke.ps1` で作り直し、seed は 1a のもの + `solid_red.png`・`solid_secret.png` (隠す編集あり)・
+`book.zip` (`p01.png`・`p02.png`・`extra/p03.png`)、縮小画像の許可 ON) に、`.\scripts\mcp-client-smoke.ps1` で Codex CLI から依頼した。
+
+- `20261031-205024-codex.jsonl`: `list_folder` 3 回 (samples、book.zip、book.zip の `extra/`) と `get_thumbnail` 1 回がすべて成功。
+  一覧の種類は `zip` / `image` / `zip_folder` / `zip_entry`。
+- `20261031-205106-codex.jsonl`: Codex の報告で、`solid_red.png` は ok・赤、`solid_secret.png` は `hidden_by_edit`、
+  `book.zip` の `extra/p03.png` は ok・青。`samples\.\solid_secret.png` は ok・青で返った (実装レビュー P1 の迂回がこの版で起きることを確認。修正 1 回目の対象)。
+- `20261031-211734-codex.jsonl` (コード `b16e16b94`、portable を作り直し): 3 件は同じ結果 (赤 ok・`hidden_by_edit`・青 ok)。
+  `samples\.\solid_secret.png` は `bad_request`「パスは mIV の一覧と同じ表記で指定してください」で拒否された (修正 1 回目の確認)。
+
+### 17.12 検収 (観測者: ClaudeCode、2026-10-31)
+
+- 実装の独立レビュー (thread `01a18ce7`、gpt-6.1-sol / xhigh、実装者とは別) は 5 巡。各指摘はコードで確かめて妥当と判断し、
+  修正させた。
+
+  | 巡 | 対象 | 指摘 | 対応 |
+  |---|---|---|---|
+  | 1 | `b66a63687` | P1 `.\` 等の別表記で隠す判定を迂回 (17.11 の portable でも観測)。P2 大きな JPEG を DCT の縮小前に元の寸法で拒否 | 共通の path 検査・JPEG は縮小 decode を先に (`b16e16b94`) |
+  | 2 | `b16e16b94` | P2 コレクションが返す 8.3 の短い名前を path 検査が拒否 | 短い名前を受け、3 表記で照合 (`e8f9de393`) |
+  | 3 | `e8f9de393` | P1 段ごとに混ざった短い名前の key を見落とす | 保存 key を長い名前に解決 (`b79b302d9`。ClaudeCode の判断、のちに誤りと判明) |
+  | 4 | `b79b302d9` | P1 小文字化した文字列を cache の key にして別のファイルを同一視。P1 保存 key は小文字化済みでファイルシステムに戻せない | 要求側の段ごとの長い名前・短い名前と保存 key の各段を照合、cache 撤去 (`f59744680`) |
+  | 5 | `f59744680` | 追加の指摘なし | **1b impl: accept** |
+
+- 各修正の後、sandbox 外で crates (`--include-ignored`) と focused nextest を再実行し、すべて exit 0 (最終 11/11・49/49・272/272)。
+- 実装中に実装担当が見つけた前提の食い違い 3 件 (PDF 列挙の perf key と取消の待ち方、入れ子の ZIP、WIC の上限超過) は
+  ClaudeCode が判断して §15.5 に書いた。
+- 判定: **1b を受け入れる**。最終の portable での呼び出し観測は 17.11 に追記する。
