@@ -2489,3 +2489,85 @@ ClaudeCode が sandbox 外の通常権限で実行するコマンド (今回の�
 cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
 cargo nextest run -p mimageviewer --lib -E '(test(/agent_ipc/) or test(/agent_level/) or test(/agent_permission/) or test(=settings_db::tests::failed_permission_commit_preserves_snapshot_and_epoch) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(/png_metadata/) or test(=pdf_loader::tests::anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results) or test(=pdf_loader::tests::page_sizes_preserve_existing_ui_diagnostic_identity) or test(=pdf_loader::tests::page_sizes_round_trip_and_reject_a_truncated_reply) or test(/app::folder_scan/) or test(/zip_loader/) or test(/conceal_db/) or test(=pdf_loader::tests::anonymous_agent_render_and_enumerate_omit_keys_and_harvest_actual_completion) or test(=pdf_loader::tests::cancelled_anonymous_render_does_not_enqueue)) and not test(/section1375_scan_perf_tests/)'
 ```
+
+### 17.10 修正 4 回目
+
+前回成果 `b79b302d9` の sandbox 外の観測者は ClaudeCode。両crate testsは11/11と49/49、
+focused nextestは272/272、すべてexit0と報告された。正式な独立レビューは、正規化済み文字列をkeyにする
+identity cacheの衝突と、保存keyをfilesystem pathとして解決する前提の誤りの2件(P1)を指摘した。
+ClaudeCodeが確認・採用し、`018d57e0a` で§15.5を更新した。§17.9の保存key解決/cacheの方式は撤去する。
+以下は実装担当自身による実装・確認であり、正式な独立再レビューの代替ではない。
+
+#### 前提と修正
+
+- 旧 `cached_identity` が `normalize_path` の結果をcache keyとしていたこと、通常のconceal keyが
+  同じ正規化を経て保存されることを確認した。`İ` と `i`+U+0307のような異なるfilenameが同じkeyになるため、
+  その文字列から元のfilesystem pathは復元できない。
+- `input_path::component_names` は元の要求pathだけに `GetLongPathNameW` と `GetShortPathNameW` を使い、
+  それぞれを既存の `adjustment_db::normalize_path` で正規化して成分ごとの2択にする。
+  drive/UNCのrootも含めて成分を保ち、結果の成分数が不整合ならInternalで閉じる。
+- `thumbnail.rs` の保存keyは、checked列挙した文字列をpath成分とentryへ投影するだけにした。
+  保存pathを持つPathBuf、`cached_identity`、`path_domain`、保存keyの名前解決、削除済みpathのskip処理は撤去。
+  成分数が等しく、すべての位置で保存成分が要求の長名/短名のどちらかに一致し、entry/pageも一致すれば隠す。
+  候補の直積は生成せず、各成分の2択だけを比較する。正規化で衝突した場合も隠す側に倒す。
+- **cacheは持たない**。1 call最大20項目で、要求pathについてだけの名前取得に限られるため、
+  元PathBufをkeyにするcacheも追加せず単純にした。不存在や成功の結果が別の要求項目へ流用される経路をなくす。
+  SQLiteのchecked key読取は引き続き1 callに1回、候補走査のcancel確認も維持する。
+- ZIPはcontainerの成分と現在名/旧CP932名、PDFはcontainer成分とpage keyで照合する。
+  回転の指定→長名→短名、各表記の現在名→旧名という既存の参照順は変更しない。
+  名前解決は要求pathのみ。不存在は各toolの既存扱い、その他の解決失敗とchecked read失敗はtool error。
+  入力検証、cursor、permission再検査、worker/permit/deadline、DB/schema/保存key、grid/UI、Remote、wireは変更しない。
+
+#### 回帰の更新
+
+- `thumbnail_identity_tests.rs` の9件を新方式へ整理した。保存keyはすべて
+  `normalize_path` / `zip_entry_key` / `edit_source::page_key_for_pdf` で作る。
+  通常の保存経路にない未正規化keyを直接保存した旧テストは削除した。
+- 親・子・fileの長名/短名が混ざる6通り × 全長名/全短名要求 × 実画像/ZIP現在名/ZIP旧名/PDFの48組を確認。
+  名前問い合わせのcallbackは元の要求Pathとの完全一致を要求し、保存keyのfilesystem不使用を検査する。
+- U+0130と`i`+U+0307の正規化衝突について、不存在項目とconceal済み項目を両順序で同じcallに渡す。
+  不存在はunavailable、存在する方はhidden_by_editで、画像は返さない。両方存在する場合も両方を隠す。
+- Unicodeの親/filenameを含む実経路で生成した正規化済みmixed keyが検出され、保存keyを問い合わせないことを確認。
+  成分数不一致、異なるdrive/UNC host/entryの非一致、UNC root/case/区切りの一致、要求の名前解決失敗、
+  有効なSQLiteのtable欠落がInternalとなることも含む。stored-key解決/cacheに依存した旧期待は取り除いた。
+- 既存alias、producer→consumer、rotation優先順、dot/prefix拒否、checked列挙の回帰を引き続き実行する。
+  mixedの名前関係は注入したhandler fixtureで、native 8.3 filesystemの実機確認としては扱わない。
+
+#### 実装担当の検証
+
+観測者: 実装担当、このsandbox内、`018d57e0a` + 本修正、通常dev/test profile。
+
+| コマンド | 実 exit code | 結果 / ログ |
+|---|---:|---|
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | `target/mcp-1b-fix4-core.log` |
+| 下記 narrow nextest | 0 | 43/43成功。`target/mcp-1b-fix4-narrow.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 101 | IPC11成功、MCP47成功/2失敗、ignore0。OS5のみ。`target/mcp-1b-fix4-crates.log` |
+| 下記 focused nextest | 100 | 272件中270成功/2失敗、OS5のみ。`target/mcp-1b-fix4-focused.log` |
+| `cargo build -p mimageviewer-mcp --bin mimageviewer-mcp` | 0 | `target/mcp-1b-fix4-adapter.log` |
+| `cargo fmt` (workspace、引数なし) | 0 | 最終sourceを整形 |
+| `cargo fmt --check` | 0 | `target/mcp-1b-fix4-fmt.log` |
+| `git diff --check` | 0 | 最終差分を確認 |
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc::input_path/) or test(/agent_ipc::thumbnail/) or test(/conceal_db/)'
+```
+
+失敗したcore2件は `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry` と
+`agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`、adapter2件は
+`pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld` と
+`pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked`。
+いずれもfixtureのnamed pipe作成/接続時のOS5。skip/ignore化、DACL変更はしていない。
+FFmpeg DLLは配置済みの実ファイルを使用。共有走査器/decoder未変更なので10万件走査・test-fullは行わない。
+
+変更ファイル: `src/agent_ipc/input_path.rs`, `thumbnail.rs`, `thumbnail_identity_tests.rs` と本台帳。
+旧テスト9件を置換し、総件数は変わらない。新方式の9件と既存alias/producer→consumer/rotation回帰はすべて成功。
+追加の設計矛盾はない。今回修正のsandbox外での実pipe成功と正式な独立再レビューは未観測。
+製品binary、UI、portable smokeを起動せず、commitもしていない。
+実pipe gateがこのsandboxでは通らないため通常profileのcore確認用buildは行わず、console adapterをbuildした。
+
+ClaudeCode が sandbox 外の通常権限で実行するコマンド (今回の修正後の成功は未観測):
+
+```powershell
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E '(test(/agent_ipc/) or test(/agent_level/) or test(/agent_permission/) or test(=settings_db::tests::failed_permission_commit_preserves_snapshot_and_epoch) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(/png_metadata/) or test(=pdf_loader::tests::anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results) or test(=pdf_loader::tests::page_sizes_preserve_existing_ui_diagnostic_identity) or test(=pdf_loader::tests::page_sizes_round_trip_and_reject_a_truncated_reply) or test(/app::folder_scan/) or test(/zip_loader/) or test(/conceal_db/) or test(=pdf_loader::tests::anonymous_agent_render_and_enumerate_omit_keys_and_harvest_actual_completion) or test(=pdf_loader::tests::cancelled_anonymous_render_does_not_enqueue)) and not test(/section1375_scan_perf_tests/)'
+```

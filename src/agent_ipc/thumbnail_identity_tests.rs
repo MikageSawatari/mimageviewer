@@ -1,10 +1,8 @@
 //! Conceal identity must survive independently shortened path components.
 use super::super::input_path::{self, NameForm};
 use super::*;
-use std::cell::Cell;
 use std::io::Write;
 use std::path::PathBuf;
-use std::rc::Rc;
 
 type Fixture = super::super::tests::Fixture;
 
@@ -67,7 +65,7 @@ fn cp932_zip(pixels: &[u8]) -> (Vec<u8>, String) {
         .unwrap();
     writer.write_all(pixels).unwrap();
     let mut bytes = writer.finish().unwrap().into_inner();
-    let encoded = encoding_rs::SHIFT_JIS.encode("日本.png").0;
+    let encoded = encoding_rs::SHIFT_JIS.encode("\u{65e5}\u{672c}.png").0;
     let offsets: Vec<_> = bytes
         .windows(8)
         .enumerate()
@@ -79,7 +77,7 @@ fn cp932_zip(pixels: &[u8]) -> (Vec<u8>, String) {
     }
     let mut archive = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
     let legacy = archive.by_index_raw(0).unwrap().name().to_owned();
-    assert_ne!(legacy, "日本.png");
+    assert_ne!(legacy, "\u{65e5}\u{672c}.png");
     (bytes, legacy)
 }
 
@@ -87,59 +85,57 @@ fn cp932_zip(pixels: &[u8]) -> (Vec<u8>, String) {
 struct Spellings {
     long: PathBuf,
     short: PathBuf,
-    mixed: [PathBuf; 2],
+    mixed: Vec<PathBuf>,
 }
 
 impl Spellings {
     fn new(root: &Path, extension: &str, bytes: &[u8]) -> Self {
-        let long = root
-            .join("Long parent directory")
-            .join("Long child directory")
-            .join(format!("Secret photograph.{extension}"));
-        let short = root
-            .join("PARENT~1")
-            .join("CHILD~1")
-            .join(format!("SECRET~1.{extension}"));
-        let mixed = [
-            root.join("PARENT~1")
-                .join("Long child directory")
-                .join(format!("Secret photograph.{extension}")),
-            root.join("Long parent directory")
-                .join("CHILD~1")
-                .join(format!("SECRET~1.{extension}")),
+        let names = [
+            ["Long parent directory".to_owned(), "PARENT~1".to_owned()],
+            ["Long child directory".to_owned(), "CHILD~1".to_owned()],
+            [
+                format!("Secret photograph.{extension}"),
+                format!("SECRET~1.{extension}"),
+            ],
         ];
-        // Real, distinct files let the handler read either request spelling.
-        // Only their name relationship is mocked; this is not native 8.3 QA.
-        for path in [&long, &short, &mixed[0], &mixed[1]] {
+        let spelling = |bits: usize| {
+            names
+                .iter()
+                .enumerate()
+                .fold(root.to_owned(), |path, (index, forms)| {
+                    path.join(&forms[(bits >> index) & 1])
+                })
+        };
+        let long = spelling(0);
+        let short = spelling(7);
+        let mixed = (1..7).map(spelling).collect();
+        // Only request spellings need files. Stored mixed keys are normalized
+        // identities, and must never be sent to a filesystem name lookup.
+        for path in [&long, &short] {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, bytes).unwrap();
         }
         Self { long, short, mixed }
     }
 
-    fn lookup(&self, path: &Path, form: NameForm) -> std::io::Result<Option<PathBuf>> {
-        assert!(
-            [&self.long, &self.short, &self.mixed[0], &self.mixed[1]]
-                .into_iter()
-                .any(|candidate| key(candidate) == key(path)),
-            "unexpected name lookup: {path:?}"
-        );
-        Ok(Some(match form {
+    fn name(&self, form: NameForm) -> PathBuf {
+        match form {
             NameForm::Long => self.long.clone(),
             NameForm::Short => self.short.clone(),
-        }))
+        }
     }
 }
 
 fn edit_key(path: &Path, member: Option<&str>) -> String {
     match member {
+        Some("page_0") => crate::edit_source::page_key_for_pdf(path, 0),
         Some(member) => crate::adjustment_db::zip_entry_key(path, member),
         None => key(path),
     }
 }
 
 #[test]
-fn conceal_mixed_component_aliases_hide_file_zip_current_legacy_and_pdf_pages() {
+fn conceal_all_mixed_component_keys_hide_long_and_short_file_zip_legacy_and_pdf_requests() {
     let fixture = Fixture::new();
     let pixels = png();
     let (archive, legacy) = cp932_zip(&pixels);
@@ -149,13 +145,13 @@ fn conceal_mixed_component_aliases_hide_file_zip_current_legacy_and_pdf_pages() 
         (
             "zip",
             archive.as_slice(),
-            Some("日本.png"),
-            Some("日本.png"),
+            Some("\u{65e5}\u{672c}.png"),
+            Some("\u{65e5}\u{672c}.png"),
         ),
         (
             "zip",
             archive.as_slice(),
-            Some("日本.png"),
+            Some("\u{65e5}\u{672c}.png"),
             Some(legacy.as_str()),
         ),
         // Hidden pages must be rejected before the PDF decoder is invoked.
@@ -167,14 +163,19 @@ fn conceal_mixed_component_aliases_hide_file_zip_current_legacy_and_pdf_pages() 
         ),
     ] {
         let paths = Spellings::new(fixture._dir.path(), extension, bytes);
+        assert_eq!(paths.mixed.len(), 6);
         for stored in &paths.mixed {
             let stored_key = edit_key(stored, stored_member);
             conceal.set(&stored_key, &[true], &[], 1, 1).unwrap();
             let before = std::fs::read(crate::conceal_db::ConcealDb::db_path()).unwrap();
             for requested in [&paths.long, &paths.short] {
+                let original = requested.clone();
                 let lookup_paths = paths.clone();
                 input_path::with_name_lookup(
-                    move |path, form| lookup_paths.lookup(path, form),
+                    move |path, form| {
+                        assert_eq!(path, original, "only the original request may be queried");
+                        Ok(Some(lookup_paths.name(form)))
+                    },
                     || {
                         let input = item(requested, member);
                         let response = call(&fixture, vec![input.clone()]).unwrap();
@@ -214,7 +215,7 @@ fn conceal_valid_sqlite_with_missing_table_rejects_thumbnail_request() {
     drop(crate::conceal_db::ConcealDb::open_readonly(&db_path).unwrap());
     let before = std::fs::read(&db_path).unwrap();
     input_path::with_name_lookup(
-        |path, _| Ok(Some(path.to_owned())),
+        |path, _| panic!("DB read must fail before filesystem lookup: {path:?}"),
         || {
             assert_eq!(
                 call(&fixture, vec![item(&path, None)]).unwrap_err().code,
@@ -226,113 +227,204 @@ fn conceal_valid_sqlite_with_missing_table_rejects_thumbnail_request() {
 }
 
 #[test]
-fn conceal_deleted_mixed_key_is_skipped_and_missing_identity_is_cached_per_call() {
+fn conceal_request_name_errors_fail_closed_with_readable_pixels() {
     let fixture = Fixture::new();
     let paths = Spellings::new(fixture._dir.path(), "png", &png());
-    let deleted = fixture._dir.path().join("DELETED~1").join("old.png");
-    let conceal = crate::conceal_db::ConcealDb::open().unwrap();
-    conceal.set(&key(&deleted), &[true], &[], 1, 1).unwrap();
-    let count = Rc::new(Cell::new(0));
-    let observed = count.clone();
     let requested = paths.long.clone();
-    input_path::with_name_lookup(
-        move |path, form| {
-            if key(path) == key(&deleted) {
-                assert_eq!(form, NameForm::Long);
-                observed.set(observed.get() + 1);
-                return Ok(None);
-            }
-            paths.lookup(path, form)
-        },
-        || {
-            for expected_count in [1, 2] {
-                let response = call(
-                    &fixture,
-                    vec![item(&requested, None), item(&requested, None)],
-                )
-                .unwrap();
-                assert_eq!(response.page.items.len(), 2);
-                assert_eq!(response.images.len(), 2);
-                for index in 0..2 {
-                    assert_eq!(row(&response, index).status, ThumbnailStatus::Ok);
+    let conceal = crate::conceal_db::ConcealDb::open().unwrap();
+    conceal
+        .set(&key(&paths.mixed[0]), &[true], &[], 1, 1)
+        .unwrap();
+    for failing_form in [NameForm::Long, NameForm::Short] {
+        let original = requested.clone();
+        let lookup_paths = paths.clone();
+        input_path::with_name_lookup(
+            move |path, form| {
+                assert_eq!(path, original);
+                if form == failing_form {
+                    Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                } else {
+                    Ok(Some(lookup_paths.name(form)))
                 }
-                assert_eq!(count.get(), expected_count);
-            }
-        },
-    );
+            },
+            || {
+                assert_eq!(
+                    call(&fixture, vec![item(&requested, None)])
+                        .unwrap_err()
+                        .code,
+                    ErrorCode::Internal
+                );
+            },
+        );
+    }
 }
 
 #[test]
-fn conceal_stored_mixed_identity_error_fails_closed_with_readable_pixels() {
+fn conceal_unicode_collision_missing_and_existing_requests_are_independent_in_both_orders() {
     let fixture = Fixture::new();
-    let pixels = png();
-    let paths = Spellings::new(fixture._dir.path(), "png", &pixels);
-    let stored = paths.mixed[0].clone();
-    let requested = paths.long.clone();
-    assert_eq!(std::fs::read(&requested).unwrap(), pixels);
+    let missing = fixture._dir.path().join("\u{0130}mage photograph.PNG");
+    let existing = fixture._dir.path().join("i\u{0307}mage photograph.PNG");
+    assert_ne!(missing, existing);
+    assert_eq!(key(&missing), key(&existing));
+    assert!(!missing.exists());
+    std::fs::write(&existing, png()).unwrap();
     let conceal = crate::conceal_db::ConcealDb::open().unwrap();
-    conceal.set(&key(&stored), &[true], &[], 1, 1).unwrap();
-    let count = Rc::new(Cell::new(0));
-    let observed = count.clone();
-    input_path::with_name_lookup(
-        move |path, form| {
-            if key(path) == key(&stored) {
-                assert_eq!(form, NameForm::Long);
-                observed.set(observed.get() + 1);
-                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-            }
-            paths.lookup(path, form)
-        },
-        || {
-            assert_eq!(
-                call(&fixture, vec![item(&requested, None)])
-                    .unwrap_err()
-                    .code,
-                ErrorCode::Internal
-            );
-            assert_eq!(count.get(), 1);
-        },
-    );
-}
-
-#[test]
-fn conceal_stored_mixed_identity_is_resolved_once_per_call_for_repeated_items() {
-    let fixture = Fixture::new();
-    let paths = Spellings::new(fixture._dir.path(), "png", &png());
-    let stored = paths.mixed[0].clone();
-    let requested = paths.short.clone();
-    let conceal = crate::conceal_db::ConcealDb::open().unwrap();
-    conceal.set(&key(&stored), &[true], &[], 1, 1).unwrap();
-    let count = Rc::new(Cell::new(0));
-    let observed = count.clone();
-    input_path::with_name_lookup(
-        move |path, form| {
-            if key(path) == key(&stored) {
-                assert_eq!(form, NameForm::Long);
-                observed.set(observed.get() + 1);
-            }
-            paths.lookup(path, form)
-        },
-        || {
-            for expected_count in [1, 2] {
-                let response = call(
-                    &fixture,
-                    vec![item(&requested, None), item(&requested, None)],
-                )
-                .unwrap();
+    conceal.set(&key(&existing), &[true], &[], 1, 1).unwrap();
+    for missing_first in [true, false] {
+        let lookup_missing = missing.clone();
+        let lookup_existing = existing.clone();
+        input_path::with_name_lookup(
+            move |path, _| {
+                // Comparison must be on the exact original Path: normalization
+                // intentionally maps these distinct filenames to the same key.
+                if path == lookup_missing {
+                    Ok(None)
+                } else {
+                    assert_eq!(
+                        path, lookup_existing,
+                        "stored keys are never filesystem paths"
+                    );
+                    Ok(Some(lookup_existing.clone()))
+                }
+            },
+            || {
+                let inputs = if missing_first {
+                    vec![item(&missing, None), item(&existing, None)]
+                } else {
+                    vec![item(&existing, None), item(&missing, None)]
+                };
+                let response = call(&fixture, inputs.clone()).unwrap();
                 assert_eq!(response.page.items.len(), 2);
                 assert!(response.images.is_empty());
-                for index in 0..2 {
-                    assert_eq!(row(&response, index).status, ThumbnailStatus::HiddenByEdit);
+                for (index, input) in inputs.iter().enumerate() {
+                    assert_eq!(&row(&response, index).item, input);
+                    assert_eq!(
+                        row(&response, index).status,
+                        if input.path == missing.to_string_lossy() {
+                            ThumbnailStatus::Unavailable
+                        } else {
+                            ThumbnailStatus::HiddenByEdit
+                        }
+                    );
                 }
-                assert_eq!(count.get(), expected_count);
+            },
+        );
+    }
+}
+
+#[test]
+fn conceal_unicode_collision_hides_both_existing_files() {
+    let fixture = Fixture::new();
+    let paths = [
+        fixture._dir.path().join("\u{0130}mage photograph.PNG"),
+        fixture._dir.path().join("i\u{0307}mage photograph.PNG"),
+    ];
+    assert_ne!(paths[0], paths[1]);
+    assert_eq!(key(&paths[0]), key(&paths[1]));
+    for path in &paths {
+        std::fs::write(path, png()).unwrap();
+    }
+    let conceal = crate::conceal_db::ConcealDb::open().unwrap();
+    conceal.set(&key(&paths[0]), &[true], &[], 1, 1).unwrap();
+    let originals = paths.clone();
+    input_path::with_name_lookup(
+        move |path, _| {
+            assert!(originals.iter().any(|original| original == path));
+            Ok(Some(path.to_owned()))
+        },
+        || {
+            let response = call(
+                &fixture,
+                paths.iter().map(|path| item(path, None)).collect(),
+            )
+            .unwrap();
+            assert_eq!(response.page.items.len(), 2);
+            for index in 0..2 {
+                assert_eq!(row(&response, index).status, ThumbnailStatus::HiddenByEdit);
             }
+            assert!(response.images.is_empty());
         },
     );
 }
 
 #[test]
-fn conceal_unrelated_drive_server_and_zip_member_keys_are_not_resolved() {
+fn conceal_normalized_mixed_unicode_parent_key_is_never_queried_as_a_path() {
+    let fixture = Fixture::new();
+    let root = fixture._dir.path();
+    let requested = root
+        .join("\u{0130}mage parent directory")
+        .join("\u{0130}mage photograph.PNG");
+    let short = root.join("PARENT~1").join("SECRET~1.PNG");
+    let stored_paths = [
+        root.join("\u{0130}mage parent directory")
+            .join("SECRET~1.PNG"),
+        root.join("PARENT~1").join("\u{0130}mage photograph.PNG"),
+    ];
+    std::fs::create_dir_all(requested.parent().unwrap()).unwrap();
+    std::fs::write(&requested, png()).unwrap();
+    let conceal = crate::conceal_db::ConcealDb::open().unwrap();
+    for stored in &stored_paths {
+        let stored_key = key(stored);
+        assert!(stored_key.contains("i\u{0307}mage"));
+        assert!(stored_key.contains('~'));
+        assert_ne!(Path::new(&stored_key), stored);
+        conceal.set(&stored_key, &[true], &[], 1, 1).unwrap();
+        let original = requested.clone();
+        let lookup_short = short.clone();
+        input_path::with_name_lookup(
+            move |path, form| {
+                assert_eq!(
+                    path, original,
+                    "a lossy stored key must never reach name lookup"
+                );
+                Ok(Some(match form {
+                    NameForm::Long => original.clone(),
+                    NameForm::Short => lookup_short.clone(),
+                }))
+            },
+            || {
+                let response = call(&fixture, vec![item(&requested, None)]).unwrap();
+                assert_eq!(row(&response, 0).status, ThumbnailStatus::HiddenByEdit);
+                assert!(response.images.is_empty());
+            },
+        );
+        conceal.delete(&stored_key).unwrap();
+    }
+}
+
+#[test]
+fn conceal_nonmatching_component_counts_do_not_hide_readable_file() {
+    let fixture = Fixture::new();
+    let paths = Spellings::new(fixture._dir.path(), "png", &png());
+    let requested = paths.long.clone();
+    let conceal = crate::conceal_db::ConcealDb::open().unwrap();
+    for stored in [
+        fixture._dir.path().join("PARENT~1").join("SECRET~1.png"),
+        paths
+            .short
+            .parent()
+            .unwrap()
+            .join("extra")
+            .join("SECRET~1.png"),
+    ] {
+        conceal.set(&key(&stored), &[true], &[], 1, 1).unwrap();
+    }
+    let original = requested.clone();
+    input_path::with_name_lookup(
+        move |path, form| {
+            assert_eq!(path, original);
+            Ok(Some(paths.name(form)))
+        },
+        || {
+            let response = call(&fixture, vec![item(&requested, None)]).unwrap();
+            assert_eq!(row(&response, 0).status, ThumbnailStatus::Ok);
+            assert_eq!(response.images.len(), 1);
+        },
+    );
+}
+
+#[test]
+fn conceal_unrelated_drive_server_and_zip_member_keys_do_not_hide_requested_entry() {
     let fixture = Fixture::new();
     let (archive, _) = cp932_zip(&png());
     let paths = Spellings::new(fixture._dir.path(), "zip", &archive);
@@ -344,25 +436,27 @@ fn conceal_unrelated_drive_server_and_zip_member_keys_are_not_resolved() {
         "Z:/UNRELA~1/book.zip"
     };
     for stored_key in [
-        edit_key(Path::new(other_drive), Some("日本.png")),
+        edit_key(Path::new(other_drive), Some("\u{65e5}\u{672c}.png")),
         edit_key(
             Path::new("//unrelated-host/share/UNRELA~1/book.zip"),
-            Some("日本.png"),
+            Some("\u{65e5}\u{672c}.png"),
         ),
         edit_key(&paths.mixed[0], Some("unrequested.png")),
     ] {
         conceal.set(&stored_key, &[true], &[], 1, 1).unwrap();
     }
+    let original = requested.clone();
     input_path::with_name_lookup(
         move |path, form| {
-            assert!(
-                key(path) == key(&paths.long) || key(path) == key(&paths.short),
-                "irrelevant conceal path must be filtered before name lookup: {path:?}"
-            );
-            paths.lookup(path, form)
+            assert_eq!(path, original);
+            Ok(Some(paths.name(form)))
         },
         || {
-            let response = call(&fixture, vec![item(&requested, Some("日本.png"))]).unwrap();
+            let response = call(
+                &fixture,
+                vec![item(&requested, Some("\u{65e5}\u{672c}.png"))],
+            )
+            .unwrap();
             assert_eq!(row(&response, 0).status, ThumbnailStatus::Ok);
             assert_eq!(response.images.len(), 1);
         },
@@ -370,9 +464,10 @@ fn conceal_unrelated_drive_server_and_zip_member_keys_are_not_resolved() {
 }
 
 #[test]
-fn conceal_unc_host_domain_is_case_insensitive_and_other_servers_are_not_resolved() {
+fn conceal_unc_component_names_preserve_root_and_match_case_insensitively() {
     let fixture = Fixture::new();
     let requested = PathBuf::from(r"\\PrimaryHost\Share\Long directory\Secret photograph.png");
+    let short = PathBuf::from(r"\\PrimaryHost\Share\LONGDI~1\SECRET~1.png");
     let stored = PathBuf::from(r"\\PRIMARYHOST\Share\LONGDI~1\Secret photograph.png");
     let conceal = crate::conceal_db::ConcealDb::open().unwrap();
     for path in [
@@ -382,75 +477,24 @@ fn conceal_unc_host_domain_is_case_insensitive_and_other_servers_are_not_resolve
     ] {
         conceal.set(&key(path), &[true], &[], 1, 1).unwrap();
     }
-    let long = requested.clone();
-    input_path::with_name_lookup(
-        move |path, _| {
-            assert!(
-                key(path) == key(&long) || key(path) == key(&stored),
-                "other server/drive must be filtered before name lookup: {path:?}"
-            );
-            // Different case and separators still denote the same edit key.
-            Ok(Some(PathBuf::from(
-                long.to_string_lossy().to_uppercase().replace('\\', "/"),
-            )))
-        },
-        || {
-            let response = call(&fixture, vec![item(&requested, None)]).unwrap();
-            assert_eq!(row(&response, 0).status, ThumbnailStatus::HiddenByEdit);
-            assert!(response.images.is_empty());
-        },
-    );
-}
-
-#[test]
-fn conceal_resolves_original_request_before_normalizing_its_identity() {
-    let fixture = Fixture::new();
-    let requested = fixture._dir.path().join("İmage photograph.PNG");
-    std::fs::write(&requested, png()).unwrap();
-    let conceal = crate::conceal_db::ConcealDb::open().unwrap();
-    conceal.set(&key(&requested), &[true], &[], 1, 1).unwrap();
-    let lookup_path = requested.clone();
-    input_path::with_name_lookup(
-        move |path, _| {
-            // The lowercase edit key expands capital dotted I into two code
-            // points. It is an identity, not a path to pass to a filesystem API.
-            assert_eq!(path, lookup_path);
-            Ok(Some(lookup_path.clone()))
-        },
-        || {
-            let response = call(&fixture, vec![item(&requested, None)]).unwrap();
-            assert_eq!(row(&response, 0).status, ThumbnailStatus::HiddenByEdit);
-            assert!(response.images.is_empty());
-        },
-    );
-}
-
-#[test]
-fn conceal_resolves_original_stored_mixed_spelling_before_normalization() {
-    let fixture = Fixture::new();
-    let requested = fixture._dir.path().join("Secret photograph.PNG");
-    std::fs::write(&requested, png()).unwrap();
-    let stored = fixture
-        ._dir
-        .path()
-        .join("MIXED~1")
-        .join("İmage photograph.PNG");
-    let conceal = crate::conceal_db::ConcealDb::open().unwrap();
-    // Keep the stored spelling verbatim to exercise resolution before folding.
-    conceal
-        .set(&stored.to_string_lossy(), &[true], &[], 1, 1)
-        .unwrap();
-    let lookup_requested = requested.clone();
+    let original = requested.clone();
     input_path::with_name_lookup(
         move |path, form| {
-            if path == stored {
-                assert_eq!(form, NameForm::Long);
-            } else {
-                assert_eq!(path, lookup_requested);
-            }
-            Ok(Some(lookup_requested.clone()))
+            assert_eq!(path, original);
+            Ok(Some(match form {
+                // Name results may use different case and separators. Both
+                // full results must be normalized before their components split.
+                NameForm::Long => {
+                    PathBuf::from(original.to_string_lossy().to_uppercase().replace('\\', "/"))
+                }
+                NameForm::Short => short.clone(),
+            }))
         },
         || {
+            let components = input_path::component_names(&requested).unwrap().unwrap();
+            assert_eq!(components[0], ["", ""]);
+            assert_eq!(components[1], ["", ""]);
+            assert_eq!(components[2], ["primaryhost", "primaryhost"]);
             let response = call(&fixture, vec![item(&requested, None)]).unwrap();
             assert_eq!(row(&response, 0).status, ThumbnailStatus::HiddenByEdit);
             assert!(response.images.is_empty());

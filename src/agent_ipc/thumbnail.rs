@@ -48,7 +48,7 @@ impl Handlers {
         ctx.checkpoint()?;
         let settings = crate::settings_db::with_db_result(|db| db.load_into_settings())
             .map_err(|_| internal())?;
-        let mut edits = EditReaders::open()?;
+        let edits = EditReaders::open()?;
         let io = crate::io_semaphore::GlobalIoSemaphore::process_shared(
             settings.indexer_speed_profile.io_permits(),
         );
@@ -56,7 +56,7 @@ impl Handlers {
         for item in items.iter().skip(offset) {
             ctx.checkpoint()?;
             let (row, image) =
-                read_thumbnail(item, side, settings.thumb_quality, ctx, &mut edits, &io)?;
+                read_thumbnail(item, side, settings.thumb_quality, ctx, &edits, &io)?;
             ctx.checkpoint()?;
             if !page.push(row, image)? {
                 break;
@@ -158,42 +158,12 @@ impl ThumbnailBuilder {
 
 struct EditReaders {
     conceal: Vec<ConcealKey>,
-    resolved: std::collections::HashMap<String, Option<String>>,
     rotation: Option<crate::rotation_db::RotationDb>,
 }
 
 struct ConcealKey {
-    path: std::path::PathBuf,
-    normalized: String,
+    components: Vec<String>,
     member: Option<String>,
-}
-
-/// Long/short expansion cannot change the drive or UNC host. Filter by that
-/// namespace before resolving stored aliases, never by a shortenable folder.
-fn path_domain(path: &str) -> Option<&str> {
-    if let Some(unc) = path.strip_prefix("//") {
-        let end = unc.find('/')?;
-        Some(&path[..end + 3])
-    } else if path.as_bytes().get(1) == Some(&b':') {
-        Some(&path[..2])
-    } else {
-        None
-    }
-}
-
-fn cached_identity(
-    resolved: &mut std::collections::HashMap<String, Option<String>>,
-    path: &Path,
-) -> Result<Option<String>, AgentError> {
-    let key = crate::adjustment_db::normalize_path(path);
-    if let Some(identity) = resolved.get(&key) {
-        return Ok(identity.clone());
-    }
-    // Resolve the original spelling before folding its identity. Unicode case
-    // folding need not itself produce a filename understood by the filesystem.
-    let identity = super::input_path::long_identity(path)?;
-    resolved.insert(key, identity.clone());
-    Ok(identity)
 }
 
 #[derive(Clone, Copy)]
@@ -206,7 +176,7 @@ enum EditItem<'a> {
 fn edit_keys(paths: &[std::path::PathBuf], item: EditItem<'_>) -> Result<Vec<String>, AgentError> {
     let mut keys = Vec::new();
     // Rotation priority is spelling first (given, long, short), then current
-    // before legacy. Conceal instead uses resolved long-name identity.
+    // before legacy. Conceal instead compares each request component.
     for path in paths {
         match item {
             EditItem::ZipEntry { current, legacy } => {
@@ -259,8 +229,10 @@ impl EditReaders {
                             (path, Some(member.to_lowercase()))
                         });
                     ConcealKey {
-                        path: path.into(),
-                        normalized: crate::adjustment_db::normalize_path(Path::new(path)),
+                        components: crate::adjustment_db::normalize_path(Path::new(path))
+                            .split('/')
+                            .map(str::to_owned)
+                            .collect(),
                         member,
                     }
                 })
@@ -276,15 +248,11 @@ impl EditReaders {
         } else {
             None
         };
-        Ok(Self {
-            conceal,
-            resolved: std::collections::HashMap::new(),
-            rotation,
-        })
+        Ok(Self { conceal, rotation })
     }
 
     fn hidden(
-        &mut self,
+        &self,
         path: &Path,
         item: EditItem<'_>,
         ctx: &ReadContext,
@@ -292,27 +260,29 @@ impl EditReaders {
         if self.conceal.is_empty() {
             return Ok(false);
         }
-        let Some(identity) = cached_identity(&mut self.resolved, path)? else {
+        let Some(components) = super::input_path::component_names(path)? else {
             return Ok(false);
         };
-        let keys = edit_keys(&[std::path::PathBuf::from(&identity)], item)?;
+        // Reuse the exact page/entry projection for member identity only.
+        // Stored path components remain strings throughout the comparison.
+        let keys = edit_keys(&[path.to_owned()], item)?;
         let members: Vec<_> = keys
             .iter()
             .map(|key| key.split_once("::").map(|(_, member)| member))
             .collect();
         for stored in &self.conceal {
             ctx.checkpoint()?;
-            if path_domain(&stored.normalized) != path_domain(&identity)
+            if stored.components.len() != components.len()
                 || !members.contains(&stored.member.as_deref())
             {
                 continue;
             }
-            let stored_identity = if stored.normalized.contains('~') {
-                cached_identity(&mut self.resolved, &stored.path)?
-            } else {
-                Some(stored.normalized.clone())
-            };
-            if stored_identity.as_deref() == Some(identity.as_str()) {
+            if stored
+                .components
+                .iter()
+                .zip(&components)
+                .all(|(stored, [long, short])| stored == long || stored == short)
+            {
                 return Ok(true);
             }
         }
@@ -355,7 +325,7 @@ fn read_thumbnail(
     side: u32,
     quality: u8,
     ctx: &ReadContext,
-    edits: &mut EditReaders,
+    edits: &EditReaders,
     io: &crate::io_semaphore::GlobalIoSemaphore,
 ) -> Result<(ThumbnailItem, Option<Vec<u8>>), AgentError> {
     let path = super::input_path::validate(&item.path)?;

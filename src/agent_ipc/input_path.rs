@@ -1,5 +1,5 @@
 //! Reject syntactic aliases, but retain producer-returned short names. Conceal
-//! uses long-name identity; rotation keeps spelling candidates. Neither resolves links.
+//! compares component names from the request; stored edit keys never become paths.
 use std::path::{Path, PathBuf};
 
 use super::{AgentError, ErrorCode, error, internal};
@@ -75,10 +75,28 @@ pub(super) fn edit_spellings(path: &Path) -> Result<Vec<PathBuf>, AgentError> {
     edit_spellings_with(path, lookup_name)
 }
 
-pub(super) fn long_identity(path: &Path) -> Result<Option<String>, AgentError> {
-    lookup_name(path, NameForm::Long)
-        .map(|name| name.map(|name| crate::adjustment_db::normalize_path(&name)))
-        .map_err(|_| internal())
+pub(super) fn component_names(path: &Path) -> Result<Option<Vec<[String; 2]>>, AgentError> {
+    // Only the original request is queried. A normalized edit key is lossy and
+    // cannot be used as a filesystem path, including as a lookup-cache key.
+    let Some(long) = lookup_name(path, NameForm::Long).map_err(|_| internal())? else {
+        return Ok(None);
+    };
+    let Some(short) = lookup_name(path, NameForm::Short).map_err(|_| internal())? else {
+        return Ok(None);
+    };
+    let long = crate::adjustment_db::normalize_path(&long);
+    let short = crate::adjustment_db::normalize_path(&short);
+    let long: Vec<_> = long.split('/').collect();
+    let short: Vec<_> = short.split('/').collect();
+    if long.len() != short.len() {
+        return Err(internal());
+    }
+    Ok(Some(
+        long.into_iter()
+            .zip(short)
+            .map(|(long, short)| [long.to_owned(), short.to_owned()])
+            .collect(),
+    ))
 }
 
 fn edit_spellings_with(
