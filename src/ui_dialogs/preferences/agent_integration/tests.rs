@@ -35,6 +35,7 @@ fn injected(settings: &Settings) -> AgentIntegrationState {
     state.mock_backend = Some(MockBackend {
         env,
         detection,
+        writes: 0,
         write_result: Ok("登録しました".into()),
     });
     state
@@ -99,14 +100,14 @@ fn agent_registration_draft_guard_all_three_fields_and_both_actions() {
                 _ => settings.agent_show_gps = true,
             }
             let mut state = injected(&live);
-            state.confirm(&settings, AppTarget::ClaudeDesktop, action);
+            state.confirm(&settings, AppTarget::ClaudeDesktop, action, 0);
             assert!(state.operation.is_none());
-            state.confirm(&live, AppTarget::ClaudeDesktop, action);
+            state.confirm(&live, AppTarget::ClaudeDesktop, action, 0);
             assert!(matches!(
                 state.operation,
                 Some(RegistrationOperation::Confirming { .. })
             ));
-            state.confirm(&live, AppTarget::ChatGpt, action);
+            state.confirm(&live, AppTarget::ChatGpt, action, 0);
             assert!(
                 matches!(state.operation, Some(RegistrationOperation::Confirming { ref request, .. }) if request.target == AppTarget::ClaudeDesktop)
             );
@@ -119,7 +120,7 @@ fn agent_registration_mock_completion_and_disconnection_release_single_owner() {
     let settings = Settings::default();
     let ctx = egui::Context::default();
     let mut state = injected(&settings);
-    state.confirm(&settings, AppTarget::ClaudeDesktop, Action::Register);
+    state.confirm(&settings, AppTarget::ClaudeDesktop, Action::Register, 0);
     state.submit(&ctx);
     assert!(matches!(
         state.operation,
@@ -163,9 +164,9 @@ fn agent_registration_remove_survives_missing_registration_executable() {
     if let DetectionState::Ready(_, detection) = &mut state.detection {
         detection.command = Err("exe missing".into());
     }
-    state.confirm(&settings, AppTarget::ClaudeDesktop, Action::Register);
+    state.confirm(&settings, AppTarget::ClaudeDesktop, Action::Register, 0);
     assert!(state.operation.is_none());
-    state.confirm(&settings, AppTarget::ClaudeDesktop, Action::Remove);
+    state.confirm(&settings, AppTarget::ClaudeDesktop, Action::Remove, 0);
     assert!(state.operation.is_some());
 }
 
@@ -212,6 +213,206 @@ fn app_harness_at_size(
         )
 }
 
+fn mock_writes(harness: &egui_kittest::Harness<'_, crate::app::AppTestEnvForTest>) -> usize {
+    harness
+        .state()
+        .pref_state
+        .as_ref()
+        .unwrap()
+        .agent_integration
+        .mock_backend
+        .as_ref()
+        .unwrap()
+        .writes
+}
+
+fn assert_confirming(harness: &egui_kittest::Harness<'_, crate::app::AppTestEnvForTest>) {
+    assert!(matches!(
+        harness
+            .state()
+            .pref_state
+            .as_ref()
+            .unwrap()
+            .agent_integration
+            .operation,
+        Some(RegistrationOperation::Confirming { .. })
+    ));
+    assert_eq!(mock_writes(harness), 0);
+}
+
+/// Activate the real app row, rather than assigning a confirmation directly.
+fn open_confirmation_with_enter(
+    label: &str,
+) -> egui_kittest::Harness<'static, crate::app::AppTestEnvForTest> {
+    let mut harness = app_harness();
+    harness.run_steps(5);
+    let scroll = harness
+        .state()
+        .pref_state
+        .as_ref()
+        .unwrap()
+        .agent_integration
+        .page_scroll
+        .unwrap();
+    harness.event(egui::Event::PointerMoved(scroll.inner.center()));
+    harness.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, -100000.0),
+        modifiers: egui::Modifiers::NONE,
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Unknown,
+    });
+    harness.run_steps(40);
+    let button = harness.get_all_by_label(label).next().unwrap();
+    assert!(
+        scroll.inner.contains_rect(button.rect()),
+        "real app-row button must be visible"
+    );
+    button.focus();
+    harness.run_steps(2);
+    assert!(harness.ctx.memory(|memory| memory.focused().is_some()));
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(3);
+    assert_confirming(&harness);
+    harness
+}
+
+fn begin_composition(harness: &mut egui_kittest::Harness<'_, crate::app::AppTestEnvForTest>) {
+    harness.event(egui::Event::Ime(egui::ImeEvent::Enabled));
+    harness.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+        text: "変換中".into(),
+        active_range_chars: None,
+    }));
+    harness.run_steps(1);
+    assert!(harness.state().ime_input_active(&harness.ctx));
+}
+
+#[test]
+fn agent_registration_real_row_enter_opens_confirmation_without_writing() {
+    for label in ["登録する", "登録を外す"] {
+        let harness = open_confirmation_with_enter(label);
+        let operation = &harness
+            .state()
+            .pref_state
+            .as_ref()
+            .unwrap()
+            .agent_integration
+            .operation;
+        assert!(
+            matches!(operation, Some(RegistrationOperation::Confirming { request, .. })
+            if request.target == AppTarget::ClaudeDesktop
+                && request.action == if label == "登録する" { Action::Register } else { Action::Remove })
+        );
+    }
+}
+
+#[test]
+fn agent_registration_focused_copy_enter_does_not_write() {
+    let mut harness = open_confirmation_with_enter("登録する");
+    for index in 0..2 {
+        harness
+            .get_all_by_label("コピー")
+            .nth(index)
+            .unwrap()
+            .focus();
+        harness.run_steps(2);
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(3);
+        assert_confirming(&harness);
+    }
+    // egui uses Escape to clear widget focus before drawing the dialog. It can
+    // then cancel the confirmation, but must never invoke a write.
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(3);
+    assert_eq!(mock_writes(&harness), 0);
+    assert!(!harness.state().agent_registration_dialog_open());
+    assert!(harness.state().show_preferences);
+}
+
+#[test]
+fn agent_registration_focused_action_buttons_ignore_ime_keyboard_clicks() {
+    for label in ["書き換える", "キャンセル"] {
+        for key in [egui::Key::Enter, egui::Key::Space] {
+            let mut harness = open_confirmation_with_enter("登録する");
+            // The parent has its own Cancel; choose the enabled foreground button.
+            harness
+                .get_all_by_label(label)
+                .find(|node| !node.accesskit_node().is_disabled())
+                .unwrap()
+                .focus();
+            harness.run_steps(2);
+            begin_composition(&mut harness);
+            harness.key_press(key);
+            harness.run_steps(3);
+            assert_confirming(&harness);
+        }
+    }
+}
+
+#[test]
+fn agent_registration_pointer_and_unfocused_dialog_enter_write() {
+    for (pointer, composing) in [(true, false), (true, true), (false, false)] {
+        let mut harness = open_confirmation_with_enter("登録する");
+        if composing {
+            begin_composition(&mut harness);
+        }
+        if pointer {
+            let position = harness.get_by_label("書き換える").rect().center();
+            click_at(&mut harness, position);
+        } else {
+            harness.ctx.memory_mut(|memory| {
+                if let Some(id) = memory.focused() {
+                    memory.surrender_focus(id);
+                }
+            });
+            assert!(harness.ctx.memory(|memory| memory.focused().is_none()));
+            harness.key_press(egui::Key::Enter);
+        }
+        harness.run_steps(3);
+        assert_eq!(mock_writes(&harness), 1);
+        assert!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .agent_integration
+                .feedback
+                .as_ref()
+                .unwrap()
+                .1
+                .is_ok()
+        );
+    }
+}
+
+#[test]
+fn agent_registration_cancel_button_enter_and_unfocused_escape_only_dismiss() {
+    for focused_cancel in [true, false] {
+        let mut harness = open_confirmation_with_enter("登録する");
+        if focused_cancel {
+            harness
+                .get_all_by_label("キャンセル")
+                .find(|node| !node.accesskit_node().is_disabled())
+                .unwrap()
+                .focus();
+            harness.run_steps(2);
+            harness.key_press(egui::Key::Enter);
+        } else {
+            harness.ctx.memory_mut(|memory| {
+                if let Some(id) = memory.focused() {
+                    memory.surrender_focus(id);
+                }
+            });
+            harness.key_press(egui::Key::Escape);
+        }
+        harness.run_steps(3);
+        assert_eq!(mock_writes(&harness), 0);
+        assert!(!harness.state().agent_registration_dialog_open());
+        assert!(harness.state().show_preferences);
+    }
+}
+
 #[test]
 fn agent_registration_confirmation_and_writing_block_backdrop_settings_ok_cancel_x() {
     // Extra horizontal space separates the two real windows for backdrop hits.
@@ -232,7 +433,7 @@ fn agent_registration_confirmation_and_writing_block_backdrop_settings_ok_cancel
         .as_mut()
         .unwrap()
         .agent_integration
-        .confirm(&settings, AppTarget::ClaudeDesktop, Action::Register);
+        .confirm(&settings, AppTarget::ClaudeDesktop, Action::Register, 0);
     harness.run_steps(3);
     // Move the foreground window through its real title drag. Its default
     // position covers some former backdrop button coordinates; clicking those
@@ -323,7 +524,7 @@ fn agent_registration_confirmation_ime_enter_escape_and_cancel_return() {
             .as_mut()
             .unwrap()
             .agent_integration
-            .confirm(&settings, AppTarget::ClaudeDesktop, Action::Register);
+            .confirm(&settings, AppTarget::ClaudeDesktop, Action::Register, 0);
         harness.run_steps(3);
         harness.input_mut().events.extend([
             egui::Event::Ime(egui::ImeEvent::Enabled),
@@ -367,7 +568,7 @@ fn agent_registration_long_confirmation_controls_and_scroll_small_200_percent() 
                 "長いフォルダ名\\".repeat(100)
             ))];
         }
-        state.confirm(&settings, AppTarget::ClaudeDesktop, Action::Register);
+        state.confirm(&settings, AppTarget::ClaudeDesktop, Action::Register, 0);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1093.0, 614.0))
             .with_context_setup(move |ctx| {
@@ -375,7 +576,7 @@ fn agent_registration_long_confirmation_controls_and_scroll_small_200_percent() 
                 crate::settings::apply_ui_scale_factor(ctx, scale);
             })
             .build_ui_state(
-                |root, state| draw_registration_dialog(root.ctx(), state, false, false),
+                |root, state| draw_registration_dialog(root.ctx(), state, false, false, false),
                 state,
             );
         harness.run_steps(8);

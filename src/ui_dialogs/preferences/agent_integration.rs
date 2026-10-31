@@ -34,6 +34,7 @@ enum RegistrationOperation {
     Confirming {
         env: backend::RegistrationEnvironment,
         request: backend::WriteRequest,
+        opened_frame: u64,
     },
     Writing {
         target: AppTarget,
@@ -46,6 +47,7 @@ struct MockBackend {
     env: backend::RegistrationEnvironment,
     detection: backend::Detection,
     write_result: Result<String, String>,
+    writes: usize,
 }
 
 pub(super) struct AgentIntegrationState {
@@ -147,7 +149,13 @@ impl AgentIntegrationState {
         }
     }
 
-    fn confirm(&mut self, settings: &Settings, target: AppTarget, action: Action) {
+    fn confirm(
+        &mut self,
+        settings: &Settings,
+        target: AppTarget,
+        action: Action,
+        opened_frame: u64,
+    ) {
         if self.draft_changed(settings) || self.operation.is_some() {
             return;
         }
@@ -169,6 +177,7 @@ impl AgentIntegrationState {
             self.operation = Some(RegistrationOperation::Confirming {
                 env: env.clone(),
                 request,
+                opened_frame,
             });
         }
     }
@@ -179,14 +188,16 @@ impl AgentIntegrationState {
             self.mock_backend.is_some(),
             "headless AI registration writes require an explicitly injected mock backend"
         );
-        let Some(RegistrationOperation::Confirming { env, request }) = self.operation.take() else {
+        let Some(RegistrationOperation::Confirming { env, request, .. }) = self.operation.take()
+        else {
             return;
         };
         let target = request.target;
         let (tx, rx) = mpsc::channel();
         self.operation = Some(RegistrationOperation::Writing { target, rx });
         #[cfg(test)]
-        if let Some(mock) = &self.mock_backend {
+        if let Some(mock) = &mut self.mock_backend {
+            mock.writes += 1;
             let _ = tx.send(mock.write_result.clone());
             ctx.request_repaint();
             return;
@@ -407,7 +418,7 @@ pub(super) fn draw_app(
                 if let Err(error) = opener::open("codex://settings") { state.feedback = Some((target, Err(format!("設定を開けませんでした: {error}")))); }
             }
         });
-        if let Some(action) = requested { state.confirm(settings, target, action); }
+        if let Some(action) = requested { state.confirm(settings, target, action, ui.ctx().cumulative_frame_nr()); }
         if let Some((owner, result)) = &state.feedback {
             if *owner == target { match result { Ok(message) => { ui.label(message); }, Err(error) => { ui.colored_label(ui.visuals().error_fg_color, error); } } }
         }
@@ -475,10 +486,11 @@ impl App {
     pub(super) fn show_agent_registration_dialog(&mut self, ctx: &egui::Context) {
         let enter = self.dialog_enter_pressed(ctx);
         let escape = self.dialog_escape_pressed(ctx);
+        let ime_active = self.ime_input_active(ctx);
         let Some(state) = &mut self.pref_state else {
             return;
         };
-        draw_registration_dialog(ctx, &mut state.agent_integration, enter, escape);
+        draw_registration_dialog(ctx, &mut state.agent_integration, enter, escape, ime_active);
     }
 }
 
@@ -487,12 +499,18 @@ fn draw_registration_dialog(
     state: &mut AgentIntegrationState,
     enter: bool,
     escape: bool,
+    ime_active: bool,
 ) {
     let Some(operation) = &state.operation else {
         return;
     };
     egui::Popup::close_all(ctx);
     let writing = matches!(operation, RegistrationOperation::Writing { .. });
+    // A sizing/layout pass can show the new window again within the opening
+    // frame. Its initiating key must never double as confirmation/cancellation.
+    let keyboard_allowed = matches!(operation,
+        RegistrationOperation::Confirming { opened_frame, .. }
+        if *opened_frame != ctx.cumulative_frame_nr());
     let mut open = true;
     let mut submit = false;
     let mut cancel = false;
@@ -552,10 +570,17 @@ fn draw_registration_dialog(
             let _ = output;
             ui.separator();
             ui.horizontal_wrapped(|ui| {
-                if ui.button("書き換える").clicked() || (!writing && enter) {
+                let confirm = ui.button("書き換える");
+                if registration_action_requested(&confirm, enter, keyboard_allowed, ime_active) {
                     submit = true;
                 }
-                if ui.button("キャンセル").clicked() || (!writing && escape) {
+                let cancel_button = ui.button("キャンセル");
+                if registration_action_requested(
+                    &cancel_button,
+                    escape,
+                    keyboard_allowed,
+                    ime_active,
+                ) {
                     cancel = true;
                 }
             });
@@ -569,6 +594,26 @@ fn draw_registration_dialog(
     } else if submit {
         state.submit(ctx);
     }
+}
+
+fn registration_action_requested(
+    response: &egui::Response,
+    dialog_key: bool,
+    keyboard_allowed: bool,
+    ime_active: bool,
+) -> bool {
+    let focus_allows_action = response
+        .ctx
+        .memory(|memory| memory.focused().is_none_or(|id| id == response.id));
+    // As in first_setup_should_confirm, preserve pointer/accessibility clicks
+    // while rejecting egui's synthesized Enter/Space click during composition.
+    let ime_keyboard_click = ime_active
+        && response.ctx.input(|input| {
+            input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+        });
+    response.clicked_by(egui::PointerButton::Primary)
+        || (keyboard_allowed && response.clicked() && !ime_keyboard_click)
+        || (keyboard_allowed && focus_allows_action && dialog_key)
 }
 
 /// No environment capture, filesystem access, process enumeration, or workers.

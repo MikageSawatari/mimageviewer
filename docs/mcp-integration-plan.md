@@ -3047,3 +3047,56 @@ cargo nextest run -p mimageviewer --lib -E 'test(=agent_ipc::pipe::tests::shutdo
 - 実 pipe の gate が sandbox 内で通らないため、通常 profile 用の core 確認 build は作らず、
   依頼された MCP adapter を build した。`test-full` は実行していない。
 - launcher/distribution (1e)、公開文書には進んでいない。commit はしていない。
+
+### 19.8 修正 1 回目
+
+基点は `6e38a4502`、開始時の worktree は clean。観測者: 実装担当、この sandbox 内。
+前回の sandbox 外検証は ClaudeCode の観測として、crates 13/13 + 54/54、focused 776/776、
+ui_snapshot 220/220、glyph/fmt check がすべて exit 0 と報告された。
+独立レビューでは以下の P2 以外は受け入れられ、ClaudeCode がコードで確認して修正を指示した。
+§19.7 の「レビュー未実施」はその時点の記録であり、この報告とは区別する。
+
+- 原因: 登録/解除を押した Enter を新しい確認窓も処理し、コピー等に focus があっても dialog の
+  Enter を採用していた。さらに egui の `clicked()` は Enter/Space の疑似 click も含むため、
+  IME helper の判定だけでは、focus した確定/取消ボタンの click を止められなかった。
+- `first_setup_should_confirm` を照合し、確認状態の既存 owner に開いた frame 番号を持たせた。
+  UI の同じ frame の再 pass でも、起動キーを確定/取消に使わない。別の pending/bool owner は追加しない。
+- 確定/取消に共通の判定で、dialog のキーは focus が無いか当該ボタンが focus を持つ時だけ採用する。
+  IME helper に加え、Enter/Space による疑似 click を IME 中は除外し、primary pointer click は採用する。
+  コピー等の focus はその widget が所有する。
+- 回帰は実際の App/ページの登録・解除ボタンを scroll/focus/Enter で起動する。モック書込の実行回数で、
+  起動 Enter は確認だけ、コピーの Enter は書かない（Esc は egui の focus 解除後に取消）、確定/取消ボタンの IME Enter/Space は実行しない、
+  通常 click・IME 中の pointer click・focus 無しの通常 Enter は1回書く、通常取消は書かずに閉じることを検査する。
+  検出・書込・書込後の再確認はすべて注入先を使い、実設定へ fall-through する assertion も維持した。
+- 変更は `src/ui_dialogs/preferences/agent_integration.rs`、同 `agent_integration/tests.rs` と本節。
+  描画の配置・文言・配色は変えず、PNG は更新しない。製品/AI アプリの起動、実設定へのアクセス、commit はしない。
+
+実装担当がこの sandbox 内で実行した結果:
+
+| コマンド | 実 exit code | 結果 / ログ |
+|---|---:|---|
+| `cargo fmt` (workspace、引数なし) | 0 | 最終 Rust ソースを整形 |
+| `cargo fmt --check` | 0 | `target/mcp-1d-fix1-fmt-check.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | `target/mcp-1d-fix1-core.log` |
+| §19.6 と同じ focused nextest (新規5件は既存の preferences filter 内) | 100 | 781件中779成功/2失敗。新規5件・対象ページ15件すべて成功。既知の実 pipe の OS5のみ。`target/mcp-1d-fix1-focused.log` |
+| `cargo test --test ui_snapshot` (更新指定なし) | 0 | 220/220成功。`target/mcp-1d-fix1-snapshots.log` |
+| `python scripts/check_ui_glyphs.py` | 0 | 危険なグリフ0。`target/mcp-1d-fix1-glyphs.log` |
+| `git diff --check` | 0 | `target/mcp-1d-fix1-diff-check.log` |
+
+初回の対象テストは15件中14成功/1失敗、exit 100 (`target/mcp-1d-fix1-narrow.log`)。
+backtrace 付きの1件診断も exit 100 (`target/mcp-1d-fix1-copy-diagnostic.log`)。
+失敗は追加したコピーの Esc の期待値であり、Enter の検査は成功していた。egui の
+`memory::Focus::begin_pass` が Esc で focus を外すことをコードで確認し、その後は通常の
+dialog 取消（書込0回）になる期待値に直した。独自の focus 復元状態は追加していない。
+その後、上記の広い focused で対象15件を含めて再確認した。
+
+PNG の再生成は実行しておらず、追跡 PNG の差分は0。今回の Rust 差分は UI の2ファイルだけなので、
+crates の検証は ClaudeCode による上記の前回成功を再利用し、今回再実行したとは記録しない。
+今回修正の独立レビューと sandbox 外の成功は未確認。実 pipe の2件は通常権限で次を実行する。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(=agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry) or test(=agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers)'
+```
+
+全781件を外側で再実行する場合は §19.6 の広い focused コマンドをそのまま使う。
+実 pipe gate が sandbox 内で通らないため、通常 profile 用の確認 build は行っていない。
