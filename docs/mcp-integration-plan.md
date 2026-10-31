@@ -3646,3 +3646,31 @@ cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
 launcher 内包物を更新してから §2.4 の隔離した stdio check を行う。本修正後の実 core 切断時の
 通信は sandbox 内では確認できていないが、実際の transport 変換を通した決定的 fixture で検証した。
 製品起動、実 client config の読書き、commit、build wrapper の通し実行は行っていない。
+
+### 20.12 配布物での観測 (観測者: ClaudeCode、2026-11-01、sandbox 外)
+
+- `test-release-build-safety.ps1`・`test-build-dev-safety.ps1`・`test-build-process-policy.ps1`: PASS (`d41520f7f`)。
+- `build-release.ps1 -PreserveRuntime`: exit 0、6 段。`target\release` に core・remote・EPUB worker・MCP・launcher の 5 本 (`d41520f7f`、
+  `fb40be225` でも再 build して exit 0)。
+- launcher だけ (`APPDATA` と data dir を `target\mcp-launcher-check` の下に向け、core なし。`scripts/mcp_stdio_check.py`):
+  - `d41520f7f`: `initialize` は成功、`tools/list` は JSON-RPC -32603 で、check script が打ち切って kill した (実装レビュー P2 の元)。
+  - `fb40be225`: `tools/list` は `[miv_status]`、`miv_status` は `not_ready`「mIV が起動していません…」の tool error、標準入力を
+    閉じると標準出力の EOF・終了コード 0。一時の `APPDATA` の下にできたのは lock と `mimageviewer-mcp.exe` (+ `.sha256`) だけ。
+- 使い捨ての portable の core を起動した状態で (`d41520f7f`)、launcher の `--mcp` (一時の `APPDATA`) と、portable に同梱した
+  `mimageviewer-mcp.exe` の両方から `list_folder` (samples) が 7 件を返し、標準入力を閉じると終了コード 0。
+- launcher の `--mcp` を 2 本同時に動かすと、2 本の間と 1 本目が終わった後は marker (`Global\mImageViewerMcp_v1`) が在り、
+  2 本目が終わると `ERROR_FILE_NOT_FOUND` になった。
+- 利用者の `%APPDATA%\mimageviewer\runtime` の一覧は、すべての確認の前後で変わらなかった。
+- 未確認: 署名、実際のインストーラでの拒否 (インストールが要る)、別のユーザーからの marker の共有。
+
+### 20.13 検収 (観測者: ClaudeCode、2026-11-01)
+
+- 実装の独立レビュー (thread `01a18ce7`) は 3 巡。1 巡目 (`d41520f7f`) は P2「check script が core の無い時の応答で EOF・終了の検査を
+  打ち切る」。あわせて、mIV が起動していない時の `tools/list` を error にする段階 0 からの仕様は公開前に見直す方がよい、との見解で、
+  ClaudeCode が判断して `miv_status` だけを返す形に変えた (§15.8、`6e00cb8c0`・`fb40be225`)。2 巡目は P2「overlapped の完了時の
+  切断が Win32 のコードを失い、繋がらないと判定できない」(`f122f1789` で修正)。3 巡目は **1e impl: accept**、指摘なし。
+- 実装中に実装担当が見つけた前提の食い違い 2 件 (release の出力先の指定・`--config`) は、ClaudeCode が「渡してよい引数を限る +
+  Cargo の生成物の path を確かめる」と判断した (§15.8)。
+- sandbox 外の最終: crates (`--include-ignored`) 13/13・58/58、fmt check、すべて exit 0 (`f122f1789`)。launcher のテスト 51 件・
+  Python 15 件は `fb40be225` で exit 0 (その後の変更は adapter の transport だけ)。
+- 判定: **1e を受け入れる**。段階 1 の 1a〜1e がそろった。公開 (§6 の公開文書・リリース) は段階 2 と一緒 (U10)。
