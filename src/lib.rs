@@ -22,6 +22,19 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(test)]
+mod allocator_tests {
+    #[test]
+    fn linked_mimalloc_is_v3_5_3() {
+        // Call the public C API in the same static library as GLOBAL. This
+        // checks the linked implementation, rather than just a source header.
+        unsafe extern "C" {
+            fn mi_version() -> std::ffi::c_int;
+        }
+        assert_eq!(unsafe { mi_version() }, 30503);
+    }
+}
+
+#[cfg(test)]
 mod egui037_stage4_gpu_tests;
 mod egui_output;
 mod gpu_startup_diagnostics;

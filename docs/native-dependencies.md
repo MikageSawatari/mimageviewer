@@ -4,7 +4,8 @@
 
 ## vendor/ 一括セットアップ (新規 clone / vendor/ 消失時の復旧)
 
-`vendor/` 配下は全て `.gitignore` 対象 (DLL / SDK / モデル等を git に入れないため)。
+`vendor/` の DLL / SDK / モデル等は `.gitignore` 対象。ローカル patch 用の Rust crate は
+ソースを git で追跡する（`libmimalloc-sys` 等）。
 新規 clone した直後や、誤って `vendor/` を消してしまった場合は、ビルド前に必要
 ファイルを揃え直す必要がある。`build.rs` が起動時に必須ファイルの存在を検証して
 復旧手順付きでエラーを出すので、**何が足りないかは cargo build のエラーで分かる**。
@@ -91,6 +92,16 @@ C:\home\mimageviewer_vendor_backup\
   管理」節に詳細)
 - `cmake` + Visual Studio 2026 (18) BuildTools + NASM — TurboJPEG / vst3-host ビルド
 - `unzip`, `tar`, `curl` — setup スクリプト群が使う
+
+## mimalloc の一時 vendor（§1.666）
+
+`mimalloc` 0.1.52 → `libmimalloc-sys` 0.1.49 の v3 C ソースだけを、上流無改変の
+mimalloc v3.5.3 に置き換える。root の `[patch.crates-io]` から
+`vendor/libmimalloc-sys` を参照し、アロケータの選択・feature・環境変数は変えない。
+取得元、checksum、FFI の調整、終了時不具合の根拠、検証の限界は
+[PATCHES.md](../vendor/libmimalloc-sys/PATCHES.md) を正本とする。
+公式ラッパーが mimalloc v3.4.1 以上を同梱したら、一時 vendor を撤去して公式版へ戻す。
+`scripts/check-dependency-updates.ps1` の自動表でラッパーの更新を確認する。
 
 ## PDFium 管理
 

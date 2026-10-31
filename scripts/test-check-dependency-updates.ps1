@@ -19,6 +19,14 @@ function Assert-Equal {
     if ($Actual -cne $Expected) { throw "$Label expected [$Expected], got [$Actual]" }
 }
 
+# Check the real manifest/record discovery before installing filesystem mocks.
+$sections = @(Get-TomlSections (Join-Path $repoRoot 'Cargo.toml'))
+$mimalloc = @(Get-LocalCrates $sections | Where-Object { $_.Name -eq 'libmimalloc-sys' })
+Assert-Equal $mimalloc.Count 1 'one mimalloc patch row'
+Assert-Equal $mimalloc[0].Path 'vendor/libmimalloc-sys' 'mimalloc patch path'
+Assert-Equal $mimalloc[0].Kind 'patch.crates-io' 'mimalloc patch kind'
+Assert-Equal (Get-PatchRecords $mimalloc[0].Path) 'vendor/libmimalloc-sys/PATCHES.md' 'mimalloc patch record'
+
 # Mock only process/network/filesystem inputs. Keep JSON decoding, enumeration,
 # version comparison, bash discovery, setup output parsing and table cells real.
 $useGh = $true

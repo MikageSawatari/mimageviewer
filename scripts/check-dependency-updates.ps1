@@ -221,6 +221,9 @@ try {
     try {
         $sections = @(Get-TomlSections (Join-Path $repoRoot 'Cargo.toml'))
         $seen = @{}
+        # Discover patched crates from Cargo.toml, including libmimalloc-sys.
+        # Its wrapper version is 0.1.49; the bundled C version and removal
+        # condition live in vendor/libmimalloc-sys/PATCHES.md.
         foreach ($crate in Get-LocalCrates $sections) {
             $current = 'unknown (no local manifest)'
             $name = $crate.Name

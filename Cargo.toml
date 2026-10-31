@@ -29,6 +29,7 @@ exclude = [
     "vendor/egui-wgpu",
     "vendor/egui-winit",
     "vendor/epaint",
+    "vendor/libmimalloc-sys",
     "vendor/tantivy",
 ]
 
@@ -38,6 +39,7 @@ egui = { path = "vendor/egui" }
 egui-wgpu = { path = "vendor/egui-wgpu" }
 egui-winit = { path = "vendor/egui-winit" }
 epaint = { path = "vendor/epaint" }
+libmimalloc-sys = { path = "vendor/libmimalloc-sys" }
 tantivy = { path = "vendor/tantivy" }
 
 # 配布バイナリ (本体 = `mimageviewer-core.exe` + remote service +
