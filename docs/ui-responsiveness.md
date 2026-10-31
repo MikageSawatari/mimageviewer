@@ -168,6 +168,8 @@ process memory の毎フレーム sample は追加していない（page-fault �
 
 ## 2. 非同期 I/O の実装テンプレ
 
+§1.482段Dの即時AI失敗通知は既存の結果poll内で現役jobを検証し、固定分類・数値だけから短い本文を一度作る。UIで詳細ログの読取り、ORT/DXGI照会、保存、worker待機を行わない。hover表示と明示コピーは既存toastのactionで処理し、新しいmodal、監視thread、再試行や周期起床を追加しない。
+
 ### FTS 起動整理と失敗表示 (§1.367)
 
 metadata manager worker の所有範囲 cleanup/Failed reconciliation は supervisor spawn 前に行うが、
@@ -470,6 +472,8 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 ---
 
 ## 4. 新機能追加時のチェックリスト
+
+§1.482 段A〜Cの前回終了通知は、資料のread/open/metadata/置換/整理・serialize・DXGI照会を専用writerで行う。Appは不変本文を非blockingで一度受け取り、起動overlay/非表示/最小化中に消費せず、表示と明示コピーだけを行う。AI等の実活動中はworker側だけで約1秒を目標にcheckpointを保存し、idleの周期起床・診断専用の周期repaintは追加しない。native前回資料の確保も今回のrotationより前にworkerで行う。device-lost callbackはdeviceごとの単一atomicへのCASだけで、通常root maintenance/活動/終端処理からworkerが観測・保存する。panicだけは既存hookの詳細処理より前に、事前open済みの専用sinkへ固定bufferで単発raw書込みを行う（同期WriteFileの完了時間は保証できず、通常UIへ流用しない）。main最終境界だけが共通終了deadlineまで保存完了を待ち、その後に制御エラーのnative通知を出す。
 
 注釈fontの先回り（§1.602）はNext頁の計画でメモリ上の需要だけを判断し、列挙・font読取・parseを`comic-font-load` workerへ置く。
 App共有ownerの受信口は1つ。root pollは非blockingで採用し、workerの完了時にroot再描画を要求する。

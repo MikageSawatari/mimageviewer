@@ -35,6 +35,8 @@ impl App {
             return Err(result);
         }
         self.retained_final_ai_orphans.remove(&key);
+        let diagnostic = result.diagnostic().clone();
+        diagnostic_stage(&diagnostic, JobStage::Adopting);
         match result {
             FinalAiResult::Ready {
                 canonical_dims,
@@ -55,6 +57,14 @@ impl App {
                         canonical_dims,
                     )
                 });
+                diagnostic_stage(
+                    &diagnostic,
+                    if retained_stored {
+                        JobStage::Completed
+                    } else {
+                        JobStage::Discarded
+                    },
+                );
                 let action = if retained_stored { "stored" } else { "skipped" };
                 crate::logger::log(format!(
                     "[AI] Final AI orphan result {action} for retained cache only idx={} \
@@ -62,8 +72,9 @@ impl App {
                     key.edit_key.idx, source_size[0], source_size[1]
                 ));
             }
-            FinalAiResult::Cancelled { .. } => {}
+            FinalAiResult::Cancelled { .. } => diagnostic_stage(&diagnostic, JobStage::Discarded),
             FinalAiResult::Failed { error, .. } => {
+                diagnostic_stage(&diagnostic, JobStage::Failed);
                 crate::logger::log(format!(
                     "[AI] Final AI orphan failed idx={} job_id={job_id} error={error}",
                     key.edit_key.idx
@@ -158,6 +169,7 @@ mod tests {
 
     fn pending(job_id: u64, cancelled: bool) -> FinalAiPending {
         FinalAiPending {
+            feedback_request: crate::app::FinalAiFeedbackRequest::default(),
             job_id,
             cancel: Arc::new(AtomicBool::new(cancelled)),
             retained_key: None,
@@ -169,6 +181,7 @@ mod tests {
 
     fn ready(key: FinalAiKey, job_id: u64) -> FinalAiResult {
         FinalAiResult::Ready {
+            diagnostic: None,
             job_id,
             key,
             canonical_dims: None,
@@ -315,6 +328,7 @@ mod tests {
         app.retained_final_ai_orphans.insert(key, 12);
         assert!(!app.local_ai_remote_barrier_snapshot().is_quiesced());
         tx.send(FinalAiResult::Ready {
+            diagnostic: None,
             job_id: 12,
             key,
             canonical_dims: None,

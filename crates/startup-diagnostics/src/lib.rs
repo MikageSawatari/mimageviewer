@@ -187,6 +187,8 @@ enum ProcessState {
 struct Owner {
     role: Role,
     run: u64,
+    process_started_utc_ms: u64,
+    process_started_ticks: u64,
     origin: u64,
     frequency: u64,
     version: String,
@@ -273,6 +275,58 @@ fn owner() -> Option<&'static Arc<Owner>> {
     OWNER.get()
 }
 
+/// Immutable process identity, distinct even when launcher and core share a run.
+/// No command line, path, or user-defined text is exposed by this API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub role: Role,
+    pub run: u64,
+    pub pid: u32,
+    pub started_utc_ms: u64,
+    pub started_ticks: u64,
+}
+
+pub fn process_identity() -> Option<ProcessIdentity> {
+    let owner = owner()?;
+    Some(ProcessIdentity {
+        role: owner.role,
+        run: owner.run,
+        pid: std::process::id(),
+        started_utc_ms: owner.process_started_utc_ms,
+        started_ticks: owner.process_started_ticks,
+    })
+}
+
+/// Reuse startup's normal/portable/explicit-data-dir selection, while keeping
+/// the GUI-run schema separate. The caller supplies the resolved data directory;
+/// its stable namespace hash is only a local filename, never report content.
+/// This function performs no filesystem I/O.
+pub fn gui_diagnostics_directory(resolved_data_dir: &Path) -> Option<PathBuf> {
+    let sink = owner()?.sink.as_ref()?;
+    Some(gui_directory_in(sink, resolved_data_dir))
+}
+
+fn gui_directory_in(sink: &Path, resolved_data_dir: &Path) -> PathBuf {
+    let mut hash = 0xcbf29ce484222325u64;
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in resolved_data_dir.as_os_str().encode_wide() {
+            for byte in unit.to_le_bytes() {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        for byte in resolved_data_dir.as_os_str().as_bytes() {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+        }
+    }
+    sink.join("gui-runs-v1").join(format!("{hash:016x}"))
+}
+
 /// Capture entry before even collecting command-line arguments.
 pub fn init_process(role: Role, version: &str, portable: bool) {
     let entry = clock::ticks();
@@ -307,6 +361,13 @@ fn initialize(role: Role, version: &str, args: &[String], portable: bool, entry:
     let o = Arc::new(Owner {
         role,
         run,
+        process_started_utc_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
+        process_started_ticks: entry,
         origin,
         frequency,
         version: version.chars().take(128).collect(),
@@ -873,10 +934,22 @@ fn decode_snapshot(s: &str, now: u64, frequency: u64) -> Option<(u64, u64, Vec<E
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gui_diagnostic_namespace_is_stable_and_scoped_to_resolved_data_dir() {
+        let sink = Path::new("fixture/startup-logs");
+        let first = gui_directory_in(sink, Path::new("fixture/data-one"));
+        assert_eq!(first, gui_directory_in(sink, Path::new("fixture/data-one")));
+        assert_ne!(first, gui_directory_in(sink, Path::new("fixture/data-two")));
+        assert_eq!(first.parent().unwrap(), sink.join("gui-runs-v1"));
+        assert!(!first.to_string_lossy().contains("data-one"));
+    }
     pub(crate) fn test_owner(role: Role) -> Owner {
         Owner {
             role,
             run: 1,
+            process_started_utc_ms: 1,
+            process_started_ticks: clock::ticks(),
             origin: clock::ticks(),
             frequency: clock::frequency(),
             version: "test".into(),

@@ -323,6 +323,12 @@ impl RenderState {
             }) => (instance, adapter, device, queue),
         };
 
+        // Observe successful creation before surface inspection or renderer resources.
+        // This also covers an externally supplied device, once per create call.
+        if let Some(callback) = &config.on_device_created {
+            callback(&device);
+        }
+
         log_adapter_info(&adapter.get_info());
 
         let surface_formats = {
@@ -402,6 +408,9 @@ pub enum SurfaceErrorAction {
 pub struct WgpuConfiguration {
     /// Optional nonblocking startup observation. It must not do I/O or render.
     pub startup_diagnostics: Option<StartupDiagnosticsCallback>,
+    /// Called after obtaining a device, before inspecting surfaces or creating renderer resources.
+    /// The callback must not block, perform I/O, or create GPU resources.
+    pub on_device_created: Option<Arc<dyn Fn(&wgpu::Device) + Send + Sync>>,
     /// Runtime-mutable configuration for the surface (present mode, frame latency).
     pub surface: SurfaceConfig,
 
@@ -442,6 +451,7 @@ impl core::fmt::Debug for WgpuConfiguration {
             wgpu_setup,
             on_surface_status: _,
             startup_diagnostics: _,
+            on_device_created: _,
         } = self;
         f.debug_struct("WgpuConfiguration")
             .field("surface", &surface)
@@ -476,6 +486,7 @@ impl Default for WgpuConfiguration {
     fn default() -> Self {
         Self {
             startup_diagnostics: None,
+            on_device_created: None,
             surface: SurfaceConfig::HIGH_THROUGHPUT,
 
             // No display handle available at this point — callers should replace this with
@@ -644,5 +655,60 @@ pub fn parse_vendor_id(vendor_id: u32) -> &'static str {
         wgpu::hal::auxil::db::nvidia::VENDOR => "NVIDIA",
         wgpu::hal::auxil::db::qualcomm::VENDOR => "Qualcomm",
         _ => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod device_creation_observer_tests {
+    use super::*;
+
+    #[test]
+    fn device_creation_observer_is_optional_and_shared_by_config_clones() {
+        let mut config = WgpuConfiguration::default();
+        assert!(config.on_device_created.is_none());
+        config.on_device_created = Some(Arc::new(|_| {}));
+        let cloned = config.clone();
+        assert!(Arc::ptr_eq(
+            config.on_device_created.as_ref().unwrap(),
+            cloned.on_device_created.as_ref().unwrap()
+        ));
+        // Debug must never invoke an application-supplied callback.
+        assert!(!format!("{config:?}").contains("on_device_created"));
+    }
+
+    #[test]
+    fn device_creation_observer_precedes_surface_and_renderer_work_for_both_setup_modes() {
+        // Headless source contract: creating a real GPU merely to test hook order
+        // would make this safety regression depend on the local driver.
+        let source = include_str!("lib.rs");
+        let create = source
+            .split_once("pub async fn create(")
+            .unwrap()
+            .1
+            .split_once("// On wasm, depending on feature flags")
+            .unwrap()
+            .0;
+        let existing = create
+            .find("WgpuSetup::Existing(WgpuSetupExisting {")
+            .unwrap();
+        let call = create.find("callback(&device);").unwrap();
+        assert_eq!(create.matches("callback(&device);").count(), 1);
+        assert!(
+            create
+                .find("adapter.request_device(&descriptor).await")
+                .unwrap()
+                < call
+        );
+        assert!(existing < call);
+        for later in [
+            "log_adapter_info(",
+            "s.get_capabilities(&adapter)",
+            "Renderer::new(&device,",
+        ] {
+            assert!(
+                call < create.find(later).unwrap(),
+                "must observe before {later}"
+            );
+        }
     }
 }

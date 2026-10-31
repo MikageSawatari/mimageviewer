@@ -490,6 +490,7 @@ fn paged_prefetch_reconcile_warm_and_poll_preserve_sibling_cache_and_channels() 
         owner.final_effect_pending.insert(
             effect_key,
             FinalEffectPending {
+                diagnostic: None,
                 pdf_metadata: None,
                 canonical_dims: None,
                 source_size: [4, 6],

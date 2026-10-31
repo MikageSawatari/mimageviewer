@@ -137,7 +137,7 @@ pub(crate) trait ExitEffects {
     fn suspend_watchdog(&mut self);
     fn record(&mut self, report: &FailureReport);
     fn terminal(&mut self, outcome: miv_startup::Outcome);
-    fn finish_logs(&mut self);
+    fn finish_logs(&mut self, deadline: std::time::Instant);
     fn show(&mut self, body: &str);
 }
 
@@ -153,12 +153,61 @@ impl ExitEffects for NativeExit {
     fn terminal(&mut self, outcome: miv_startup::Outcome) {
         miv_startup::terminal(outcome);
     }
-    fn finish_logs(&mut self) {
-        crate::finish_logs();
+    fn finish_logs(&mut self, deadline: std::time::Instant) {
+        crate::finish_logs_until(deadline);
     }
     fn show(&mut self, body: &str) {
         crate::data_dir::show_fatal_messagebox(body);
     }
+}
+
+/// Returned to main before any shutdown wait or user-response wait begins.
+pub struct PreparedRunExit {
+    result: eframe::Result,
+    notification: Option<String>,
+}
+
+impl PreparedRunExit {
+    pub(crate) fn from_result(result: eframe::Result) -> Self {
+        Self {
+            result,
+            notification: None,
+        }
+    }
+}
+
+/// One final boundary: drain logs and persist the terminal before showing a
+/// synchronous dialog. Time spent reading the dialog cannot consume the budget.
+pub(crate) fn finish_at_main(
+    prepared: PreparedRunExit,
+    mut effects: impl ExitEffects,
+    save_terminal: impl FnOnce(bool, std::time::Instant),
+) -> eframe::Result {
+    finish_at_main_until(
+        prepared,
+        &mut effects,
+        save_terminal,
+        crate::shutdown_deadline(),
+    )
+}
+
+fn finish_at_main_until(
+    prepared: PreparedRunExit,
+    effects: &mut impl ExitEffects,
+    save_terminal: impl FnOnce(bool, std::time::Instant),
+    deadline: std::time::Instant,
+) -> eframe::Result {
+    effects.terminal(if prepared.result.is_ok() {
+        miv_startup::Outcome::Ok
+    } else {
+        miv_startup::Outcome::Error
+    });
+    effects.finish_logs(deadline);
+    save_terminal(prepared.result.is_ok(), deadline);
+    if let Some(body) = prepared.notification {
+        effects.show(&body);
+    }
+    prepared.result
 }
 
 pub(crate) fn finish_run_native(
@@ -167,7 +216,7 @@ pub(crate) fn finish_run_native(
     data_dir: &Path,
     cleanup: impl FnOnce(),
     mut effects: impl ExitEffects,
-) -> eframe::Result {
+) -> PreparedRunExit {
     // Stop before cleanup can initialize/drop unrelated graphics resources.
     let gpu = crate::gpu_startup_diagnostics::stop_snapshot();
     let report = result.as_ref().err().map(|error| {
@@ -189,24 +238,54 @@ pub(crate) fn finish_run_native(
         report
     });
     cleanup();
-    effects.terminal(if result.is_ok() {
-        miv_startup::Outcome::Ok
-    } else {
-        miv_startup::Outcome::Error
-    });
-    effects.finish_logs();
-    if let Some(report) = report
-        && !scripted_run
-    {
-        effects.show(&report.dialog_body);
+    PreparedRunExit {
+        result,
+        notification: report
+            .filter(|_| !scripted_run)
+            .map(|report| report.dialog_body),
     }
-    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    impl<T: ExitEffects> ExitEffects for &mut T {
+        fn suspend_watchdog(&mut self) {
+            (**self).suspend_watchdog();
+        }
+        fn record(&mut self, report: &FailureReport) {
+            (**self).record(report);
+        }
+        fn terminal(&mut self, outcome: miv_startup::Outcome) {
+            (**self).terminal(outcome);
+        }
+        fn finish_logs(&mut self, deadline: std::time::Instant) {
+            (**self).finish_logs(deadline);
+        }
+        fn show(&mut self, body: &str) {
+            (**self).show(body);
+        }
+    }
+
+    // Existing shutdown regression scenarios now cross both product boundaries.
+    fn finish_run_native(
+        result: eframe::Result,
+        scripted_run: bool,
+        data_dir: &Path,
+        cleanup: impl FnOnce(),
+        mut effects: impl ExitEffects,
+    ) -> eframe::Result {
+        let prepared =
+            super::finish_run_native(result, scripted_run, data_dir, cleanup, &mut effects);
+        finish_at_main_until(
+            prepared,
+            &mut effects,
+            |_, _| {},
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+    }
 
     #[test]
     fn startup_surface_failure_is_saved_before_notification() {
@@ -263,8 +342,8 @@ mod tests {
                 NativeExit.terminal(outcome);
                 self.events.borrow_mut().push("terminal");
             }
-            fn finish_logs(&mut self) {
-                NativeExit.finish_logs();
+            fn finish_logs(&mut self, deadline: std::time::Instant) {
+                NativeExit.finish_logs(deadline);
                 self.events.borrow_mut().push("flushed");
             }
             fn show(&mut self, body: &str) {
@@ -383,7 +462,7 @@ mod tests {
         fn terminal(&mut self, outcome: miv_startup::Outcome) {
             self.0.borrow_mut().push(format!("terminal:{outcome:?}"));
         }
-        fn finish_logs(&mut self) {
+        fn finish_logs(&mut self, _deadline: std::time::Instant) {
             self.0.borrow_mut().push("flushed".into());
         }
         fn show(&mut self, body: &str) {
@@ -472,6 +551,124 @@ mod tests {
             .unwrap();
             assert_eq!(*events.borrow(), ["cleanup", "terminal:Ok", "flushed"]);
         }
+    }
+
+    #[test]
+    fn returned_error_is_persisted_before_a_slow_notification() {
+        use crate::previous_run_diagnostics::{GuiRunDiagnostics, GuiRunOutcome, test_support};
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut owner = GuiRunDiagnostics::new();
+        test_support::admit(&mut owner, directory.path());
+        let elapsed = Cell::new(Duration::ZERO);
+        let events = RefCell::new(Vec::new());
+        struct SlowNotice<'a> {
+            directory: &'a Path,
+            elapsed: &'a Cell<Duration>,
+            events: &'a RefCell<Vec<&'static str>>,
+        }
+        impl ExitEffects for SlowNotice<'_> {
+            fn suspend_watchdog(&mut self) {}
+            fn record(&mut self, _: &FailureReport) {}
+            fn terminal(&mut self, _: miv_startup::Outcome) {}
+            fn finish_logs(&mut self, _: Instant) {
+                self.events.borrow_mut().push("logs saved");
+            }
+            fn show(&mut self, _: &str) {
+                assert_eq!(
+                    test_support::terminal(self.directory),
+                    Some(GuiRunOutcome::ReturnedError)
+                );
+                assert_eq!(*self.events.borrow(), ["logs saved", "terminal saved"]);
+                // Simulate reading the native dialog for longer than the entire
+                // shutdown budget. No real UI or wall-clock sleep is involved.
+                self.elapsed
+                    .set(self.elapsed.get() + Duration::from_secs(3));
+                self.events.borrow_mut().push("notification returned");
+            }
+        }
+        let mut effects = SlowNotice {
+            directory: directory.path(),
+            elapsed: &elapsed,
+            events: &events,
+        };
+        let prepared = super::finish_run_native(
+            Err(eframe::Error::AppCreation(Box::new(std::io::Error::other(
+                "injected failure",
+            )))),
+            false,
+            directory.path(),
+            || {},
+            &mut effects,
+        );
+        assert!(
+            events.borrow().is_empty(),
+            "run_native must not wait or notify"
+        );
+        let result = finish_at_main_until(
+            prepared,
+            &mut effects,
+            |ok, deadline| {
+                assert!(!ok);
+                assert_eq!(elapsed.get(), Duration::ZERO);
+                assert!(owner.finish_until(GuiRunOutcome::ReturnedError, deadline));
+                events.borrow_mut().push("terminal saved");
+            },
+            Instant::now() + Duration::from_secs(2),
+        );
+        assert!(result.is_err());
+        assert!(elapsed.get() > Duration::from_secs(2));
+        drop(owner);
+        let mut next = GuiRunDiagnostics::new();
+        test_support::admit(&mut next, directory.path());
+        assert!(next.report_handle().unwrap().take_report().is_none());
+        assert!(next.finish_until(
+            GuiRunOutcome::ReturnedOk,
+            Instant::now() + Duration::from_secs(2)
+        ));
+    }
+
+    #[cfg(all(windows, not(feature = "portable")))]
+    #[test]
+    fn runtime_lease_remains_held_through_main_notification() {
+        let directory = tempfile::tempdir().unwrap();
+        let version = directory.path().join("runtime/4.10.0");
+        std::fs::create_dir_all(&version).unwrap();
+        let mut session = crate::GuiRunSession {
+            _runtime_lease: Some(crate::runtime_locks::shared(&version).unwrap()),
+            ..Default::default()
+        };
+        struct PinnedNotice<'a>(&'a Path);
+        impl ExitEffects for PinnedNotice<'_> {
+            fn suspend_watchdog(&mut self) {}
+            fn record(&mut self, _: &FailureReport) {}
+            fn terminal(&mut self, _: miv_startup::Outcome) {}
+            fn finish_logs(&mut self, _: std::time::Instant) {}
+            fn show(&mut self, _: &str) {
+                assert!(
+                    crate::runtime_locks::exclusive(self.0, crate::runtime_locks::IN_USE).is_err()
+                );
+            }
+        }
+        let prepared = PreparedRunExit {
+            result: Err(eframe::Error::AppCreation(Box::new(std::io::Error::other(
+                "fixture",
+            )))),
+            notification: Some("fixture".into()),
+        };
+        assert!(
+            finish_at_main_until(
+                prepared,
+                &mut PinnedNotice(&version),
+                |ok, deadline| session.finish_until(ok, deadline),
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .is_err()
+        );
+        drop(session);
+        assert!(crate::runtime_locks::exclusive(&version, crate::runtime_locks::IN_USE).is_ok());
     }
 
     #[derive(Debug)]

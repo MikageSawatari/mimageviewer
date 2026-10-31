@@ -53386,7 +53386,7 @@ impl App {
         let elapsed = start_time.elapsed().as_secs_f32();
         if elapsed > duration {
             self.fs_feedback_toast = None;
-            self.fs_feedback_toast_reveal_path = None;
+            self.fs_feedback_toast_action = None;
             self.fs_feedback_toast_surface = None;
             return;
         }
@@ -53401,6 +53401,9 @@ impl App {
         if let Some(surface) = self.fs_feedback_toast_surface
             && surface != drawing_surface
         {
+            return;
+        }
+        if !self.feedback_action_matches_mounted_context() {
             return;
         }
 
@@ -53457,19 +53460,12 @@ impl App {
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 255.0) as u8),
         );
 
-        if let Some(path) = self.fs_feedback_toast_reveal_path.clone() {
-            let resp = toast_ui
-                .interact(
-                    toast_rect,
-                    egui::Id::unique("feedback_toast_reveal_capture"),
-                    egui::Sense::click(),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .hover_tip_dark("クリックで保存ファイルを表示");
+        if let Some(action) = self.fs_feedback_toast_action.clone() {
+            let resp = action.response(&toast_ui, toast_rect);
             if resp.clicked() {
-                crate::capture::reveal_path_async(path);
+                action.activate(ctx);
                 self.fs_feedback_toast = None;
-                self.fs_feedback_toast_reveal_path = None;
+                self.fs_feedback_toast_action = None;
                 self.fs_feedback_toast_surface = None;
             }
         }
@@ -91703,6 +91699,7 @@ mod specified_scale_consumer_tests {
         app.final_ai_pending.insert(
             key,
             FinalAiPending {
+                feedback_request: crate::app::FinalAiFeedbackRequest::default(),
                 job_id: 77,
                 cancel: Arc::new(AtomicBool::new(false)),
                 retained_key: None,
@@ -91712,6 +91709,7 @@ mod specified_scale_consumer_tests {
             },
         );
         app.final_ai_result_backlog.push(FinalAiResult::Ready {
+            diagnostic: None,
             canonical_dims: None,
             job_id: 77,
             key,

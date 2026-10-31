@@ -1,3 +1,10 @@
+mod ai_failure_feedback;
+mod diagnostic_checkpoint;
+use crate::previous_run_diagnostics::checkpoint::{
+    ActivityLease, CheckpointPublisher, JobLease, JobMetadata, JobStage, JobUpdate,
+};
+pub(crate) use ai_failure_feedback::FinalAiFeedbackRequest;
+mod previous_run_notice;
 mod reading_history_origin;
 use reading_history_origin::MainListRestoreDestination;
 mod grid_parent;
@@ -10751,6 +10758,7 @@ pub(crate) struct RetainedFinalAiKey {
 
 #[derive(Clone)]
 pub(crate) struct FinalAiEntry {
+    pub(crate) diagnostic_metadata: Option<JobMetadata>,
     pub(crate) canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
     pub(crate) source_size: [usize; 2],
     pub(crate) pixels: Arc<egui::ColorImage>,
@@ -11021,6 +11029,7 @@ impl FsPageLoadState {
 const MAX_RETAINED_FINAL_AI_ORPHAN_JOBS: usize = 1;
 
 pub(crate) struct FinalAiPending {
+    pub(crate) feedback_request: FinalAiFeedbackRequest,
     pub(crate) job_id: u64,
     pub(crate) cancel: Arc<AtomicBool>,
     pub(crate) retained_key: Option<RetainedFinalAiKey>,
@@ -11039,6 +11048,7 @@ impl Drop for FinalAiPending {
 
 pub(crate) enum FinalAiResult {
     Ready {
+        diagnostic: Option<JobLease>,
         job_id: u64,
         key: FinalAiKey,
         canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
@@ -11049,14 +11059,26 @@ pub(crate) enum FinalAiResult {
         used_upscale: bool,
     },
     Cancelled {
+        diagnostic: Option<JobLease>,
         job_id: u64,
         key: FinalAiKey,
     },
     Failed {
+        diagnostic: Option<JobLease>,
         job_id: u64,
         key: FinalAiKey,
-        error: String,
+        error: crate::ai::failure::FinalAiFailure,
     },
+}
+
+impl FinalAiResult {
+    fn diagnostic(&self) -> &Option<JobLease> {
+        match self {
+            Self::Ready { diagnostic, .. }
+            | Self::Cancelled { diagnostic, .. }
+            | Self::Failed { diagnostic, .. } => diagnostic,
+        }
+    }
 }
 
 /// AI ジョブの優先度。表示中ページ (Display) を先読み (Prefetch) より先に処理する。
@@ -11073,6 +11095,7 @@ pub(crate) enum AiJobPriority {
 /// 「UI THREAD HANG (推論ロック飢餓)」の止血になる (旧 per-job spawn 設計では
 /// UI スレッドが `is_loaded` / `load_model` を呼んでロックを待っていた)。
 pub(crate) struct AiJob {
+    pub(crate) diagnostic: Option<JobLease>,
     pub(crate) canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
     pub(crate) job_id: u64,
     pub(crate) key: FinalAiKey,
@@ -11093,6 +11116,7 @@ pub(crate) struct AiJob {
 }
 
 pub struct LocalAiActivityLease {
+    diagnostic: Option<ActivityLease>,
     active: Arc<AtomicUsize>,
 }
 
@@ -11206,7 +11230,10 @@ impl LocalAiActivityLease {
     /// 開けないため、counter 無しの構築手段は用意しない。
     pub fn new(active: Arc<AtomicUsize>) -> Self {
         active.fetch_add(1, Ordering::AcqRel);
-        Self { active }
+        Self {
+            active,
+            diagnostic: None,
+        }
     }
 }
 
@@ -11319,7 +11346,9 @@ fn run_ai_worker(
         // pop 前に cancel された (= 高速ページ送りで keep_set から外れた等) ジョブは
         // 推論せずに Cancelled を返す。これにより無駄な GPU 推論が始まる前に止まる。
         if job.cancel.load(Ordering::Relaxed) {
+            diagnostic_stage(&job.diagnostic, JobStage::ResultWaiting);
             let _ = tx.send(FinalAiResult::Cancelled {
+                diagnostic: job.diagnostic.clone(),
                 job_id: job.job_id,
                 key: job.key,
             });
@@ -12913,6 +12942,7 @@ pub(crate) struct ColorizeMonoSummary {
 }
 
 pub(crate) struct FinalEffectPending {
+    diagnostic: Option<JobLease>,
     pub(crate) pdf_metadata: Option<PdfPageMetadataSnapshot>,
     canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
     source_size: [usize; 2],
@@ -16912,6 +16942,8 @@ pub struct App {
     // ── 統合環境設定ダイアログ ─────────────────────────────────────
     pub(crate) show_preferences: bool,
     pub(crate) diagnostics_export: crate::diagnostics::ExportOwner,
+    previous_run_notice: previous_run_notice::PreviousRunNotice,
+    diagnostic_checkpoint: Option<CheckpointPublisher>,
     /// 編集の保存・破棄とは独立した、プロセス内だけの環境設定表示位置。
     pub(crate) preferences_view_position: crate::ui_dialogs::preferences::PreferencesViewPosition,
     /// 右ペイン ScrollArea の id に使う、ダイアログを閉じても保持する単調増加値。
@@ -18767,9 +18799,8 @@ pub struct App {
     pub(crate) fs_feedback_toast: Option<(String, std::time::Instant, f32)>,
     #[cfg(test)]
     pub(crate) feedback_toasts_for_test: Vec<(String, crate::feedback::FeedbackKind)>,
-    /// フィードバックトーストをクリックしたときに Explorer で選択表示する対象。
-    /// 通常トーストでは None。キャプチャ保存成功時だけ Some にする。
-    pub(crate) fs_feedback_toast_reveal_path: Option<PathBuf>,
+    /// Mutually exclusive saved-file reveal or allowlisted diagnostic copy.
+    pub(crate) fs_feedback_toast_action: Option<crate::feedback::FeedbackAction>,
     /// 現在のトーストを描画する面。`Some` なら該当面の `draw_feedback_toast`
     /// だけが描く (detached 窓とグリッドの二重表示防止)。`None` は発火面不明の
     /// 従来トーストで、従来どおり全面に描く。
@@ -20983,6 +21014,8 @@ impl App {
             rename_migration_data_dir_override: None,
             show_preferences: false,
             diagnostics_export: crate::diagnostics::ExportOwner::Idle,
+            previous_run_notice: previous_run_notice::PreviousRunNotice::default(),
+            diagnostic_checkpoint: None,
             preferences_view_position: Default::default(),
             preferences_right_panel_scroll_sequence: 0,
             preferences_requested_page: None,
@@ -21680,7 +21713,7 @@ impl App {
             fs_feedback_toast: None,
             #[cfg(test)]
             feedback_toasts_for_test: Vec::new(),
-            fs_feedback_toast_reveal_path: None,
+            fs_feedback_toast_action: None,
             fs_feedback_toast_surface: None,
             stamp_embed_pending: None,
             cursor_last_activity: None,
@@ -81142,7 +81175,14 @@ impl App {
     }
 
     pub(crate) fn local_ai_activity_lease(&self) -> LocalAiActivityLease {
-        LocalAiActivityLease::new(Arc::clone(&self.local_ai_activity))
+        {
+            let mut lease = LocalAiActivityLease::new(Arc::clone(&self.local_ai_activity));
+            lease.diagnostic = self
+                .diagnostic_checkpoint
+                .as_ref()
+                .map(|publisher| publisher.activity());
+            lease
+        }
     }
 
     pub(crate) fn local_ai_remote_barrier_snapshot(&mut self) -> LocalAiRemoteBarrierSnapshot {
@@ -86522,6 +86562,7 @@ impl App {
         Some((
             final_key,
             FinalAiEntry {
+                diagnostic_metadata: None,
                 canonical_dims: self.canonical_source_dimensions(idx),
                 source_size: edit_size,
                 pixels,
@@ -86600,6 +86641,7 @@ impl App {
             self.retained_pdf_page_cache_bytes(),
         ));
         Some(FinalAiEntry {
+            diagnostic_metadata: None,
             canonical_dims: self.canonical_source_dimensions(idx),
             source_size: edit_size,
             pixels,
@@ -87572,6 +87614,7 @@ impl App {
         ));
         self.cancel_final_ai_pending_for_retained_key(&retained_key, "retained_hit");
         Some(FinalAiEntry {
+            diagnostic_metadata: None,
             canonical_dims: self.canonical_source_dimensions(idx),
             source_size: edit_size,
             pixels,
@@ -87976,6 +88019,10 @@ impl App {
         self.final_ai_pending.insert(
             key,
             FinalAiPending {
+                feedback_request: FinalAiFeedbackRequest {
+                    priority,
+                    source: source_image.size,
+                },
                 job_id,
                 cancel: Arc::clone(&cancel),
                 retained_key: retained_key.clone(),
@@ -87984,10 +88031,23 @@ impl App {
                 cancel_on_drop: true,
             },
         );
+        let diagnostic = self.diagnostic_checkpoint.as_ref().map(|publisher| {
+            publisher.begin_job(
+                self.diagnostic_job_metadata(
+                    job_id,
+                    key,
+                    source_image.size,
+                    upscale_model,
+                    denoise_model,
+                ),
+                Arc::clone(&cancel),
+            )
+        });
         if let Some(queue) = self.ai_job_queue.as_ref() {
             let adjust_before_ai =
                 (!source_is_color_adjusted && !params.is_color_identity()).then_some(params);
             queue.enqueue(AiJob {
+                diagnostic,
                 canonical_dims: self.canonical_source_dimensions(idx),
                 job_id,
                 key,
@@ -88301,6 +88361,7 @@ impl App {
                             clamp_started.elapsed().as_secs_f64() * 1000.0,
                         )
                     });
+                    diagnostic_stage(&pending.diagnostic, JobStage::GpuRegistration);
                     let load_texture_started = std::time::Instant::now();
                     let shared_registration = shared_texture.is_some();
                     if !speculative && shared_texture.is_none() {
@@ -88337,6 +88398,7 @@ impl App {
                         pending.pdf_metadata,
                         true,
                     );
+                    diagnostic_stage(&pending.diagnostic, JobStage::Completed);
                     self.final_composite_cache.insert(
                         key,
                         FinalCompositeEntry {
@@ -88664,10 +88726,15 @@ impl App {
         } else {
             format!("miv-final-effect-{}", key.edit_key.idx)
         };
+        let diagnostic = self.diagnostic_post_ai(key, source_size, Arc::clone(&cancel));
+        let worker_diagnostic = diagnostic.clone();
         let spawn_result = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                let _ = tx.send(execute_final_composite(source, plan, &worker_cancel));
+                let _diagnostic = DiagnosticEffectWorker::new(worker_diagnostic);
+                let result = execute_final_composite(source, plan, &worker_cancel);
+                diagnostic_stage(&_diagnostic.0, JobStage::FinalEffectPending);
+                let _ = tx.send(result);
             });
         match spawn_result {
             Ok(_) => {
@@ -88704,6 +88771,7 @@ impl App {
                 self.final_effect_pending.insert(
                     key,
                     FinalEffectPending {
+                        diagnostic,
                         pdf_metadata: self.current_pdf_page_metadata_snapshot(key.edit_key.idx),
                         canonical_dims: self.canonical_source_dimensions(key.edit_key.idx),
                         source_size,
@@ -88978,6 +89046,14 @@ impl App {
             }
         }
 
+        let diagnostic = ai_ready.as_ref().and_then(|_| {
+            self.diagnostic_post_ai(
+                final_key,
+                edit_pixels.size,
+                Arc::new(AtomicBool::new(false)),
+            )
+        });
+        diagnostic_stage(&diagnostic, JobStage::FinalEffect);
         let t_adjust0 = perf_on.then(std::time::Instant::now);
         let adjusted = if params.is_color_identity() {
             Arc::clone(&edit_pixels)
@@ -89081,6 +89157,7 @@ impl App {
             let fc_clamp_ms = t_clamp0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
             let t_up0 = perf_on.then(std::time::Instant::now);
             self.speculative_gpu_frame.note_ordinary_upload();
+            diagnostic_stage(&diagnostic, JobStage::GpuRegistration);
             let texture = ctx.load_texture(
                 format!(
                     "final_composite_{}_{}_{}_{}",
@@ -89095,6 +89172,7 @@ impl App {
             let fc_upload_ms = t_up0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
             (texture, fc_clamp_ms, fc_upload_ms)
         };
+        diagnostic_stage(&diagnostic, JobStage::Completed);
         let canonical_dims = self.canonical_source_dimensions(idx);
         let display_basis =
             self.accept_current_producer_display_basis(idx, texture.size(), edit_pixels.size, true);
@@ -89928,7 +90006,7 @@ impl App {
     fn final_ai_result_key_job(result: &FinalAiResult) -> (FinalAiKey, u64) {
         match result {
             FinalAiResult::Ready { key, job_id, .. }
-            | FinalAiResult::Cancelled { key, job_id }
+            | FinalAiResult::Cancelled { key, job_id, .. }
             | FinalAiResult::Failed { key, job_id, .. } => (*key, *job_id),
         }
     }
@@ -89992,14 +90070,20 @@ impl App {
                 }
                 continue;
             }
+            let failure_feedback = matches!(&result, FinalAiResult::Failed { .. })
+                .then(|| self.final_ai_failure_feedback_request(key, job_id))
+                .flatten();
             if live_pending {
                 self.final_ai_pending.remove(&key);
             }
             if retained_orphan {
                 self.retained_final_ai_orphans.remove(&key);
             }
+            let result_diagnostic = result.diagnostic().clone();
+            diagnostic_stage(&result_diagnostic, JobStage::Adopting);
             match result {
                 FinalAiResult::Ready {
+                    diagnostic,
                     job_id,
                     key,
                     canonical_dims,
@@ -90009,8 +90093,10 @@ impl App {
                     image,
                     used_upscale,
                 } => {
+                    diagnostic_stage(&diagnostic, JobStage::Adopting);
                     let pixels = Arc::new(image);
                     let entry = FinalAiEntry {
+                        diagnostic_metadata: diagnostic.as_ref().map(JobLease::metadata),
                         canonical_dims,
                         source_size,
                         pixels: Arc::clone(&pixels),
@@ -90046,6 +90132,14 @@ impl App {
                     } else {
                         false
                     };
+                    diagnostic_stage(
+                        &result_diagnostic,
+                        if live_pending || retained_stored {
+                            JobStage::Completed
+                        } else {
+                            JobStage::Discarded
+                        },
+                    );
                     if live_pending {
                         self.final_ai_cache.insert(key, entry);
                         self.cancel_final_effects_for_idx_with_reason(
@@ -90070,13 +90164,20 @@ impl App {
                     }
                 }
                 FinalAiResult::Cancelled { key, .. } => {
+                    diagnostic_stage(&result_diagnostic, JobStage::Discarded);
                     if live_pending {
                         self.final_ai_failed.remove(&key);
                     }
                 }
-                FinalAiResult::Failed { key, error, job_id } => {
+                FinalAiResult::Failed {
+                    key, error, job_id, ..
+                } => {
+                    diagnostic_stage(&result_diagnostic, JobStage::Failed);
                     if live_pending {
-                        self.final_ai_failed.insert(key);
+                        let first_failure = self.final_ai_failed.insert(key);
+                        if first_failure && let Some(request) = failure_feedback {
+                            self.notify_final_ai_failure(key, job_id, request, &error);
+                        }
                         crate::logger::log(format!(
                             "[AI] Final AI failed idx={} job_id={job_id} error={error}",
                             key.edit_key.idx
@@ -90873,13 +90974,13 @@ impl App {
             }
         }
         self.fs_feedback_toast = Some((text, std::time::Instant::now(), resolved.seconds));
-        self.fs_feedback_toast_reveal_path = None;
+        self.fs_feedback_toast_action = None;
         self.fs_feedback_toast_surface = surface;
     }
 
     pub(crate) fn clear_fullscreen_feedback_for_viewer_switch(&mut self) {
         self.fs_feedback_toast = None;
-        self.fs_feedback_toast_reveal_path = None;
+        self.fs_feedback_toast_action = None;
         self.fs_feedback_toast_surface = None;
         self.fs_boundary_hint = None;
     }
@@ -90964,7 +91065,7 @@ impl App {
             .unwrap_or("capture")
             .to_string();
         self.show_saved_output_feedback(format!("保存しました: {name}"));
-        self.fs_feedback_toast_reveal_path = Some(path);
+        self.fs_feedback_toast_action = Some(crate::feedback::FeedbackAction::RevealPath(path));
         self.fs_feedback_toast_surface = None;
     }
 
@@ -99367,6 +99468,7 @@ impl eframe::App for App {
         }
         self.speculative_gpu_frame
             .begin(ctx.cumulative_frame_nr_for(egui::ViewportId::ROOT));
+        self.publish_diagnostic_display();
         self.service_app_logic(ctx, frame);
     }
 
@@ -99430,6 +99532,7 @@ impl eframe::App for App {
         self.update_frame(ui, frame);
         self.render_update_after_frame(ctx);
         self.render_update_owner_dialogs(ctx);
+        self.show_previous_run_notice(ctx);
         // `update_frame` has several native/fullscreen early returns. Recovery polling belongs
         // outside it so worker completions, writer fences, and the terminal continuation cannot
         // stall behind a presentation path. Running it after the frame also keeps the modal/input
@@ -101413,6 +101516,8 @@ fn save_video_resume_position(
 /// 行う**。UI スレッドは種別決定 (`model_path` 存在チェック) までしかやらないので、
 /// 推論 backlog がロックを握っていても UI が固まらない。
 fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
+    let _diagnostic_scope = crate::ai::diagnostic_observation::enter(job.diagnostic.clone());
+    diagnostic_stage(&job.diagnostic, JobStage::ModelLoad);
     let job_id = job.job_id;
     let key = job.key;
     let runtime = &job.runtime;
@@ -101428,14 +101533,17 @@ fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
         upscale_kind: job.upscale_kind,
         background_mode: key.bg,
     };
-    match crate::ai::final_pipeline::execute_selected_final_ai(
+    let execution = crate::ai::final_pipeline::execute_selected_final_ai(
         runtime,
         manager,
         request,
         cancel,
-        &crate::ai::final_pipeline::NoFinalAiProgress,
-    ) {
+        &DiagnosticFinalAiProgress,
+    );
+    diagnostic_stage(&job.diagnostic, JobStage::ResultWaiting);
+    match execution {
         Ok(output) => FinalAiResult::Ready {
+            diagnostic: job.diagnostic.clone(),
             canonical_dims: job.canonical_dims,
             job_id,
             key,
@@ -101446,10 +101554,19 @@ fn run_final_ai_job(job: &AiJob) -> FinalAiResult {
             used_upscale: output.used_upscale,
         },
         Err(crate::ai::final_pipeline::FinalAiExecutionError::Cancelled) => {
-            FinalAiResult::Cancelled { job_id, key }
+            FinalAiResult::Cancelled {
+                diagnostic: job.diagnostic.clone(),
+                job_id,
+                key,
+            }
         }
         Err(crate::ai::final_pipeline::FinalAiExecutionError::Failed(error)) => {
-            FinalAiResult::Failed { job_id, key, error }
+            FinalAiResult::Failed {
+                diagnostic: job.diagnostic.clone(),
+                job_id,
+                key,
+                error,
+            }
         }
     }
 }
@@ -104669,5 +104786,33 @@ impl App {
     ) -> Option<egui::TextureHandle> {
         self.ensure_conceal_material(ctx, idx)
             .map(|resource| resource.source_texture().clone())
+    }
+}
+
+fn diagnostic_stage(lease: &Option<JobLease>, stage: JobStage) {
+    if let Some(lease) = lease {
+        lease.update(JobUpdate {
+            stage,
+            ..Default::default()
+        });
+    }
+}
+
+struct DiagnosticEffectWorker(Option<JobLease>);
+impl DiagnosticEffectWorker {
+    fn new(lease: Option<JobLease>) -> Self {
+        diagnostic_stage(&lease, JobStage::FinalEffect);
+        Self(lease)
+    }
+}
+
+struct DiagnosticFinalAiProgress;
+impl crate::ai::final_pipeline::FinalAiProgressSink for DiagnosticFinalAiProgress {
+    fn loading_model(&self, kind: crate::ai::ModelKind) {
+        crate::ai::diagnostic_observation::publish(JobUpdate {
+            stage: JobStage::ModelLoad,
+            model: Some(kind.into()),
+            ..Default::default()
+        });
     }
 }

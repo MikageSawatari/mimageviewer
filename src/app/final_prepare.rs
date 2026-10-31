@@ -912,9 +912,12 @@ impl App {
         let (tx, rx) = mpsc::channel();
         #[cfg(test)]
         let test_registration = tests::attach_worker(&worker_cancel);
+        let diagnostic = self.diagnostic_post_ai(key, source_size, Arc::clone(&cancel));
+        let worker_diagnostic = diagnostic.clone();
         let spawn = std::thread::Builder::new()
             .name(format!("miv-final-prepare-{}", key.edit_key.idx))
             .spawn(move || {
+                let _diagnostic = DiagnosticEffectWorker::new(worker_diagnostic);
                 struct Finished {
                     id: u64,
                     context: u64,
@@ -975,6 +978,7 @@ impl App {
                     if !worker_cancel.load(Ordering::Relaxed) {
                         let size = pixels.size;
                         let upload_size = upload.size;
+                        diagnostic_stage(&_diagnostic.0, JobStage::FinalEffectPending);
                         let sent = tx.send(PreparedFinalPixels {
                             pixels,
                             upload,
@@ -1036,6 +1040,7 @@ impl App {
                 self.final_effect_pending.insert(
                     key,
                     FinalEffectPending {
+                        diagnostic,
                         pdf_metadata: self.current_pdf_page_metadata_snapshot(key.edit_key.idx),
                         canonical_dims: self.canonical_source_dimensions(key.edit_key.idx),
                         source_size,

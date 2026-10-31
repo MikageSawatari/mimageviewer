@@ -22,10 +22,17 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(test)]
+mod diagnostic_entry_tests;
+mod diagnostic_time;
+#[cfg(test)]
 mod egui037_stage4_gpu_tests;
 mod egui_output;
 mod gpu_startup_diagnostics;
+mod previous_run_diagnostics;
+mod render_failure_diagnostics;
 mod run_native_failure;
+mod ui_previous_run_notice;
+pub use run_native_failure::PreparedRunExit;
 #[cfg(test)]
 mod test_native_focus;
 #[cfg(test)]
@@ -41,6 +48,8 @@ pub mod ai;
 mod app;
 pub mod detached_window_geometry;
 pub(crate) mod feedback;
+#[doc(hidden)]
+pub use feedback::draw_ai_failure_feedback_snapshot_fixture;
 #[cfg(feature = "dev-tools")]
 pub mod raw;
 #[cfg(not(feature = "dev-tools"))]
@@ -596,7 +605,16 @@ fn install_panic_log_hook() {
     // data_dir 初期化直後から panic.log に残す。ネイティブ DLL / driver の
     // access violation は Rust panic ではないので、この hook では捕捉できない。
     std::panic::set_hook(Box::new(|info| {
-        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+        previous_run_diagnostics::fatal::record_panic(render_failure_diagnostics::classify_panic(
+            info.payload(),
+        ));
+        let payload = if let Some(render_panic) =
+            info.payload()
+                .downcast_ref::<render_failure_diagnostics::RenderPanic>()
+        {
+            // Keep the default wgpu handler's detailed text, after the small record.
+            format!("wgpu error: {}\n", render_panic.error)
+        } else if let Some(s) = info.payload().downcast_ref::<&str>() {
             (*s).to_string()
         } else if let Some(s) = info.payload().downcast_ref::<String>() {
             s.clone()
@@ -1025,6 +1043,7 @@ pub(crate) fn startup_result<T, E>(
     result
 }
 
+// Non-GUI worker entrypoints retain their existing shutdown contract.
 fn exit_startup(code: i32) -> ! {
     miv_startup::terminal(if code == 0 {
         miv_startup::Outcome::Ok
@@ -1034,15 +1053,40 @@ fn exit_startup(code: i32) -> ! {
     exit_with_logs(code)
 }
 
+fn exit_gui_startup(code: i32, session: &mut GuiRunSession) -> ! {
+    exit_startup_with_notice(code, session, None)
+}
+
+fn exit_startup_with_notice(code: i32, session: &mut GuiRunSession, notice: Option<String>) -> ! {
+    miv_startup::terminal(if code == 0 {
+        miv_startup::Outcome::Ok
+    } else {
+        miv_startup::Outcome::Error
+    });
+    let deadline = shutdown_deadline();
+    finish_logs_until(deadline);
+    session.finish_until(code == 0, deadline);
+    if let Some(body) = notice {
+        data_dir::show_fatal_messagebox(&body);
+    }
+    std::process::exit(code)
+}
+
 /// Final boundary only: all runtime producers have already stopped. Both
 /// writers share one total deadline; blocked file owners are never joined.
-pub fn finish_logs() {
+fn shutdown_deadline() -> std::time::Instant {
     static DEADLINE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let deadline =
-        *DEADLINE.get_or_init(|| std::time::Instant::now() + std::time::Duration::from_secs(2));
+    *DEADLINE.get_or_init(|| std::time::Instant::now() + std::time::Duration::from_secs(2))
+}
+
+fn finish_logs_until(deadline: std::time::Instant) {
     logger::log("logging shutdown requested");
     let _ = log_writer::shutdown_until(deadline);
     let _ = miv_startup::shutdown_until(deadline);
+}
+
+pub fn finish_logs() {
+    finish_logs_until(shutdown_deadline());
 }
 
 pub(crate) fn exit_with_logs(code: i32) -> ! {
@@ -1050,7 +1094,56 @@ pub(crate) fn exit_with_logs(code: i32) -> ! {
     std::process::exit(code)
 }
 
-pub fn run() -> eframe::Result {
+/// Main owns admission until the explicit final diagnostic save completes.
+/// Drop (including unwinding) never declares a clean return.
+#[derive(Default)]
+pub struct GuiRunSession {
+    diagnostics: previous_run_diagnostics::GuiRunDiagnostics,
+    instance: Option<single_instance::SingleInstanceGuard>,
+    #[cfg(all(windows, not(feature = "portable")))]
+    _runtime_lease: Option<std::fs::File>,
+}
+
+impl GuiRunSession {
+    fn finish_until(&mut self, ok: bool, deadline: std::time::Instant) {
+        let outcome = if ok {
+            previous_run_diagnostics::GuiRunOutcome::ReturnedOk
+        } else {
+            previous_run_diagnostics::GuiRunOutcome::ReturnedError
+        };
+        self.diagnostics.finish_until(outcome, deadline);
+    }
+}
+
+fn gui_diagnostics_admitted(first: bool, play_test: bool, scripted: bool, bypass: bool) -> bool {
+    first && !play_test && !scripted && !bypass
+}
+
+#[cfg(test)]
+mod gui_run_admission_tests {
+    #[test]
+    fn only_admitted_normal_gui_records_previous_run() {
+        assert!(super::gui_diagnostics_admitted(true, false, false, false));
+        // Second instance, play-test, test-script and DComp's bypass each exclude
+        // the run without reading or consuming another GUI's diagnostic files.
+        for excluded in 0..4 {
+            let mut values = [true, false, false, false];
+            values[excluded] = !values[excluded];
+            assert!(!super::gui_diagnostics_admitted(
+                values[0], values[1], values[2], values[3]
+            ));
+        }
+    }
+}
+
+/// Called only at main's final return boundary, after run/cleanup have returned.
+pub fn finish_gui_run(prepared: PreparedRunExit, session: &mut GuiRunSession) -> eframe::Result {
+    run_native_failure::finish_at_main(prepared, run_native_failure::NativeExit, |ok, deadline| {
+        session.finish_until(ok, deadline);
+    })
+}
+
+pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
     miv_startup::init_process(
         miv_startup::Role::Core,
         env!("CARGO_PKG_VERSION"),
@@ -1060,17 +1153,21 @@ pub fn run() -> eframe::Result {
 
     // Executable ownership is independent of --data-dir and includes workers.
     #[cfg(all(windows, not(feature = "portable")))]
-    let _runtime_lease = match startup_result(
-        miv_startup::Stage::RuntimePin,
-        "RuntimePin",
-        runtime_cleanup::pin_running_version,
-    ) {
-        Ok(lease) => lease,
-        Err(error) => {
-            entry_trace.finish(miv_startup::Outcome::Error);
-            return Err(eframe::Error::AppCreation(Box::new(error)));
-        }
-    };
+    {
+        session._runtime_lease = match startup_result(
+            miv_startup::Stage::RuntimePin,
+            "RuntimePin",
+            runtime_cleanup::pin_running_version,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                entry_trace.finish(miv_startup::Outcome::Error);
+                return PreparedRunExit::from_result(Err(eframe::Error::AppCreation(Box::new(
+                    error,
+                ))));
+            }
+        };
+    }
     #[cfg(windows)]
     let _startup_windows_diagnostics = startup_windows_diag::start();
     // --version / -V / --help / -h: GUI を開かず版 / usage を表示して即終了。
@@ -1082,7 +1179,7 @@ pub fn run() -> eframe::Result {
     ) {
         miv_startup::record_detail("process.disposition", "help-or-version");
         entry_trace.finish(miv_startup::Outcome::Ok);
-        exit_startup(0);
+        exit_gui_startup(0, session);
     }
     #[cfg(any(not(feature = "test-script"), not(windows)))]
     let test_script_requested = std::env::args_os()
@@ -1095,13 +1192,13 @@ pub fn run() -> eframe::Result {
             "error: --test-script requires a build with the test-script feature\n",
         );
         entry_trace.finish(miv_startup::Outcome::Error);
-        exit_startup(2);
+        exit_gui_startup(2, session);
     }
     #[cfg(all(feature = "test-script", not(windows)))]
     if test_script_requested {
         write_to_parent_console("error: --test-script is only supported on Windows\n");
         entry_trace.finish(miv_startup::Outcome::Error);
-        exit_startup(2);
+        exit_gui_startup(2, session);
     }
     #[cfg(all(feature = "test-script", windows))]
     let (test_script_path, test_evidence_dir) = {
@@ -1114,7 +1211,7 @@ pub fn run() -> eframe::Result {
             (Err(error), _) | (_, Err(error)) => {
                 write_to_parent_console(&format!("error: {error}\n"));
                 entry_trace.finish(miv_startup::Outcome::Error);
-                exit_startup(2);
+                exit_gui_startup(2, session);
             }
         }
     };
@@ -1142,7 +1239,7 @@ pub fn run() -> eframe::Result {
         miv_startup::record_detail("process.disposition", "pdf-worker");
         pdf_loader::run_worker_process();
         entry_trace.finish(miv_startup::Outcome::Ok);
-        exit_startup(0);
+        exit_gui_startup(0, session);
     }
 
     // --tensorrt-build <model_kind> モード: TensorRT エンジンビルダーワーカー。
@@ -1227,7 +1324,7 @@ pub fn run() -> eframe::Result {
     };
     #[cfg(not(windows))]
     let skip_single_instance = false;
-    let _single_instance = if skip_single_instance {
+    session.instance = if skip_single_instance {
         None
     } else {
         let guard = startup_operation(
@@ -1253,10 +1350,22 @@ pub fn run() -> eframe::Result {
                 "mImageViewer is already running (path forwarded: {forwarded}, activate signaled: {signaled}). Exiting second instance."
             );
             entry_trace.finish(miv_startup::Outcome::Ok);
-            exit_startup(0);
+            exit_gui_startup(0, session);
         }
         Some(guard)
     };
+
+    if gui_diagnostics_admitted(
+        session
+            .instance
+            .as_ref()
+            .is_some_and(|guard| guard.is_first_instance()),
+        play_test_config.is_some(),
+        scripted_run,
+        skip_single_instance,
+    ) {
+        session.diagnostics.admit(&data_dir::get());
+    }
 
     let gpu_args: Vec<String> = std::env::args_os()
         .map(|s| s.to_string_lossy().into_owned())
@@ -1264,25 +1373,26 @@ pub fn run() -> eframe::Result {
     let gpu_request = match wgpu_backend_policy::GpuBackendRequest::parse_args(&gpu_args) {
         Ok(request) => request,
         Err(error) => {
-            data_dir::show_fatal_messagebox(&error.to_string());
             entry_trace.finish(miv_startup::Outcome::Error);
-            exit_startup(2);
+            exit_startup_with_notice(2, session, Some(error.to_string()));
         }
     };
     #[cfg(feature = "test-script")]
     let gpu_fail_dx12 = match wgpu_backend_policy::parse_fail_device_args(&gpu_args) {
         Ok(request) => request,
         Err(error) => {
-            data_dir::show_fatal_messagebox(&error.to_string());
             entry_trace.finish(miv_startup::Outcome::Error);
-            exit_startup(2);
+            exit_startup_with_notice(2, session, Some(error.to_string()));
         }
     };
 
     install_panic_log_hook();
     install_texture_delta_ledger();
     #[cfg(windows)]
-    let native_exception_log_result = native_exception_log::install();
+    if session.diagnostics.publisher().is_none() {
+        // Admitted GUI runs install only after their worker reads previous evidence.
+        native_exception_log::install_background();
+    }
 
     // 通常ログ (mimageviewer.log) は常時記録する。logger 側が 16MiB で
     // ローテーション (現行 + .bak の 2 世代) し、起動時に前回分を .prev へ
@@ -1291,8 +1401,6 @@ pub fn run() -> eframe::Result {
     // 前に有効化していないと痕跡が残らない」問題があったため常時 ON に変更。
     // `--log` 引数は後方互換のため受け付けるが現在は no-op。
     startup_operation(miv_startup::Stage::Logger, "Logger", || logger::init());
-    #[cfg(windows)]
-    native_exception_log::report_install_result(native_exception_log_result);
 
     #[cfg(all(windows, not(feature = "portable")))]
     {
@@ -1327,7 +1435,7 @@ pub fn run() -> eframe::Result {
             if let Err(error) = test_script::release_checks::arm_startup(directory) {
                 write_to_parent_console(&format!("error: {error}\n"));
                 entry_trace.finish(miv_startup::Outcome::Error);
-                exit_startup(2);
+                exit_gui_startup(2, session);
             }
         }
     }
@@ -1345,7 +1453,7 @@ pub fn run() -> eframe::Result {
                 config.path.display()
             ));
             entry_trace.finish(miv_startup::Outcome::Error);
-            exit_startup(2);
+            exit_gui_startup(2, session);
         }
         logger::log(format!(
             "play-test: path={} duration_ms={} mute={}",
@@ -1367,7 +1475,7 @@ pub fn run() -> eframe::Result {
                 config.path.display()
             ));
             entry_trace.finish(miv_startup::Outcome::Error);
-            exit_startup(2);
+            exit_gui_startup(2, session);
         }
         logger::log(format!(
             "dcomp-presenter-test: path={} duration_ms={} window={}x{} sync_interval={} force_sw={} pixel_probe_strict={}",
@@ -1383,11 +1491,11 @@ pub fn run() -> eframe::Result {
             eprintln!("dcomp-presenter-test failed: {e}");
             logger::log(format!("dcomp-presenter-test failed: {e}"));
             entry_trace.finish(miv_startup::Outcome::Error);
-            exit_startup(1);
+            exit_gui_startup(1, session);
         }
         perf::flush();
         entry_trace.finish(miv_startup::Outcome::Ok);
-        exit_startup(0);
+        exit_gui_startup(0, session);
     }
 
     // 起動時間計測: data_dir 初期化は先行ステップなので perf::init 後に後追いで打つ。
@@ -1461,7 +1569,7 @@ pub fn run() -> eframe::Result {
                     crate::logger::log(format!("[settings-override] FAILED: {error}"));
                     eprintln!("error: {error}");
                     entry_trace.finish(miv_startup::Outcome::Error);
-                    exit_startup(2);
+                    exit_gui_startup(2, session);
                 }
             }
         }
@@ -1551,6 +1659,10 @@ pub fn run() -> eframe::Result {
     // Finite root API selection completes before AppCreator runs.
     // Native video and its separate DX12 HUD remain independent.
     let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
+    let diagnostic_publisher = session.diagnostics.publisher();
+    wgpu_options.on_device_created = Some(Arc::new(move |device| {
+        render_failure_diagnostics::install_root_device(device, diagnostic_publisher.as_ref());
+    }));
     configure_wgpu_presentation(&mut wgpu_options);
     wgpu_options.startup_diagnostics = Some(Arc::new(|event| {
         gpu_startup_diagnostics::observe(&event);
@@ -1760,6 +1872,8 @@ pub fn run() -> eframe::Result {
     ));
     let creator_book_composition_owner = Arc::clone(&book_composition_owner);
     gpu_startup_diagnostics::begin(gpu_request);
+    let previous_run_report = session.diagnostics.report_handle();
+    let diagnostic_checkpoint = session.diagnostics.publisher();
     let run_result = eframe::run_native(
         "mimageviewer",
         options,
@@ -1822,6 +1936,8 @@ pub fn run() -> eframe::Result {
                     Arc::clone(&raw_develop_executor),
                 )
             });
+            app.install_previous_run_notice(previous_run_report, &cc.egui_ctx);
+            app.install_diagnostic_checkpoint(diagnostic_checkpoint, cc.wgpu_render_state.as_ref());
             match collection_install.clone() {
                 Ok((client, events)) => {
                     app.install_process_owned_collection_runtime(client, events)

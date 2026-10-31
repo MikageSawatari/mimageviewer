@@ -812,6 +812,7 @@ fn original_material_orphan_ai_carries_capture_dimensions_without_current_index_
     app.retained_final_ai_orphans.insert(key, 91);
     let retained_epoch = app.retained_final_ai_epoch;
     app.final_ai_result_backlog.push(FinalAiResult::Ready {
+        diagnostic: None,
         job_id: 91,
         key,
         canonical_dims: Some(captured),

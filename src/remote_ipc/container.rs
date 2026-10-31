@@ -2891,7 +2891,8 @@ impl ContainerEngine {
             .as_ref()
             .map(|resources| Arc::clone(&resources.runtime));
         let inpaint_manager = ai_resources
-            .map(|resources| resources.manager)
+            .as_ref()
+            .map(|resources| Arc::clone(&resources.manager))
             .unwrap_or_else(|| Arc::new(crate::ai::model_manager::ModelManager::new()));
         let erase = match edits.erase {
             Some(mask) => {
@@ -5311,6 +5312,13 @@ impl ContainerEngine {
             &AtomicBool,
         ) -> Option<super::session::RemoteAiResources>,
     ) -> Result<Vec<super::ai_job::RemoteAiPageExecutionOutcome>, RemoteAiRunError> {
+        // Own the entire worker operation, including inter-page gaps and the
+        // completion-time validation after per-page AI resources are dropped.
+        let _diagnostic_activity = self
+            .session
+            .as_ref()
+            .and_then(|session| session.ai_bridge())
+            .and_then(|bridge| bridge.diagnostic_activity());
         let catalog_admission = current_catalog_admission();
         let operation_settings = self
             .adjustment_render_settings()
@@ -5505,7 +5513,7 @@ impl ContainerEngine {
                             RemoteAiRunError::Failed("AI job was cancelled".to_owned())
                         }
                         crate::ai::final_pipeline::FinalAiExecutionError::Failed(error) => {
-                            RemoteAiRunError::Failed(error)
+                            RemoteAiRunError::Failed(error.to_string())
                         }
                     })?;
                     let pixels = Arc::new(output.image);
