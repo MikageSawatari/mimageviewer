@@ -2393,3 +2393,96 @@ ClaudeCode が sandbox 外の通常権限で実行するコマンド (今回の�
 cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
 cargo nextest run -p mimageviewer --lib -E '(test(/agent_ipc/) or test(/agent_level/) or test(/agent_permission/) or test(=settings_db::tests::failed_permission_commit_preserves_snapshot_and_epoch) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(/png_metadata/) or test(=pdf_loader::tests::anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results) or test(=pdf_loader::tests::page_sizes_preserve_existing_ui_diagnostic_identity) or test(=pdf_loader::tests::page_sizes_round_trip_and_reject_a_truncated_reply) or test(/app::folder_scan/) or test(/zip_loader/) or test(=pdf_loader::tests::anonymous_agent_render_and_enumerate_omit_keys_and_harvest_actual_completion) or test(=pdf_loader::tests::cancelled_anonymous_render_does_not_enqueue)) and not test(/section1375_scan_perf_tests/)'
 ```
+
+### 17.9 修正 3 回目
+
+前回成果 `e8f9de393` の sandbox 外の観測者は ClaudeCode。両crateのtestsは exit 0
+(11/11、49/49)、focused nextestは exit 0 (249/249) と報告された。
+正式な独立レビューはproducer→consumerの修正を受け入れたが、pathの成分ごとに長名/短名が混在する
+conceal keyを3候補では検出できないP1を指摘した。ClaudeCodeが採用し、`150a8f855` で
+§15.5を「concealは長名identityで比較」に更新した。以下は実装担当自身による実装・確認で、
+正式な独立再レビューの代替ではない。
+
+#### 前提・実装・絞り込み
+
+- `normalize_path` はcaseと区切りだけを揃え、長名への展開はしない。DB keyが
+  `path::entry` (PDFは`page_N`) であること、既存 `load_conceal_keys` がprepare/query/rowの
+  失敗を空集合または行の脱落として扱うことをコードで確認した。
+- `ConcealDb::load_conceal_keys_checked` を追加。同じprefix escapeと`__slot_`除外を使い、
+  SQLとrow型変換の失敗をResultで伝える。既存APIの本体とgrid/UIの呼び出しは変更していない。
+  agentは既存readonly接続でkey文字列だけを1回読み、bitmap/BLOBを展開しない。
+- 要求側は `input_path::long_identity` で `GetLongPathNameW` → `adjustment_db::normalize_path`。
+  保存側は最初の`::`でpath/entryを分け、pathに`~`がない場合は同じ正規化だけ、ある場合だけ長名解決する。
+  ZIPはcontainer identityと現在名/旧CP932名、PDFはcontainer identityとpage keyで照合する。
+- **絞り込みは名前解決前のdrive letter / UNC hostとentry/pageの一致**を選んだ。
+  checked readは全keyを1回読み、その後にこの条件で候補を絞る。短名化され得る親folderやfilenameを
+  prefix条件にしないため、成分ごとの混在を取りこぼさない。無関係なdrive/host/entryは解決しない。
+  解決結果は不存在(None)も含め、要求ごとのmapに保存。同じ保存pathに複数entryがある場合や複数の
+  要求項目で再照合する場合も、保存pathの解決は呼び出し内で1回。次の呼び出しへは持ち越さない。
+- 消された保存path(OS2/3)は飛ばし、それ以外の解決失敗とchecked read失敗はInternalのtool error。
+  privateなpath/OS error/SQL内容をログへ流さず、requestのerror種別と既存の固定診断だけを記録する。
+  候補走査では各keyでcancelを確認し、既存worker/deadline/permitの契約を維持する。
+- 回転は従来どおり指定→長名→短名、各表記で現在名→旧名の候補順。
+  構文上のdot/device/ADS等の拒否、cursorの指定表記、producer→consumerも維持。
+  DB/schema/保存key、grid、Remote、settings readerの所有、wireには変更を加えていない。
+
+#### 回帰
+
+- 新規 `thumbnail_identity_tests.rs` (9件): mixed表記2種を保存し、long/short要求で、実画像・ZIP現在名・
+  ZIP旧名・PDF pageの計16組が画像添付なしの`hidden_by_edit`になることを確認する。
+- 正常なSQLiteをreadonlyで開けるがtableがないfixtureがInternalになること、保存済み`~`pathの
+  不存在はskipすること、解決失敗は読める画素があってもInternalになることを検査する。
+- Some/Noneを呼び出し内で1回だけ解決し、次のcallでは再解決すること、無関係なdrive/UNC host/entryは
+  lookupに到達しないこと、UNC hostのcase/区切りの正規化を検査する。名前関係の注入を使うhandler回帰であり、
+  native 8.3 filesystemの実機確認としては扱わない。
+- `conceal_db` にchecked readのslot除外、table欠落、row型不正、readonly無書き込みの4件を追加。
+  既存のalias、producer→consumer、rotation、dot/prefix拒否も同じfocused suiteに含める。
+- 自己確認で名前解決の順序も固定した。要求と保存元の両方で、filesystem APIへ渡すのは元の表記で、
+  正規化した文字列はidentity/cache/filter用に限る。case foldで文字数が変わる`İ`を含む表記を使い、
+  名前解決より前にcase foldして別のfilenameを問い合わせないことを2件のhandler回帰で確認する。
+
+#### 実装担当の検証
+
+観測者: 実装担当、このsandbox内、`150a8f855` + 本修正、通常dev/test profile。
+
+| コマンド | 実 exit code | 結果 / ログ |
+|---|---:|---|
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | 最終production差分。`target/mcp-1b-fix3-core-verified.log` |
+| 下記 narrow nextest | 0 | 最終43/43成功。`target/mcp-1b-fix3-narrow-final.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 101 | IPC11成功、MCP47成功/2失敗、ignore0。OS5のみ。`target/mcp-1b-fix3-crates.log` |
+| 下記 focused nextest (`conceal_db`も追加) | 100 | 最終272件中270成功/2失敗、OS5のみ。`target/mcp-1b-fix3-focused-final.log` |
+| `cargo build -p mimageviewer-mcp --bin mimageviewer-mcp` | 0 | `target/mcp-1b-fix3-adapter.log` |
+| `cargo fmt` (workspace、引数なし) | 0 | 名前解決順序の最終修正後も実行 |
+| `cargo fmt --check` | 0 | `target/mcp-1b-fix3-fmt.log` |
+| `git diff --check` | 0 | 最終差分を確認 |
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc::input_path/) or test(/agent_ipc::thumbnail/) or test(/conceal_db/)'
+```
+
+途中のnarrowも41/41成功(exit0、`target/mcp-1b-fix3-narrow.log`)。
+最初のfocusedは271件中269成功/OS5の2失敗(exit100、`target/mcp-1b-fix3-focused.log`)。
+その後、保存元の表記も名前解決前に正規化しない形へ揃えて回帰を追加し、上表の最終sourceで再検証した。
+途中のcore check2回もexit0 (`target/mcp-1b-fix3-core.log`, `target/mcp-1b-fix3-core-final.log`)。
+crate/adapter sourceは途中のcore修正でも変えていないため、その成功/失敗結果は再利用する。
+
+失敗したcore2件は `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry` と
+`agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`、adapter2件は
+`pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld` と
+`pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked`。
+いずれもfixtureのnamed pipe作成/接続時のOS5。skip/ignore化やDACL変更は行っていない。
+FFmpeg DLLは配置済みの実ファイルを使用。共有走査器/decoder未変更なので10万件走査・test-fullは行わない。
+
+変更ファイル: `src/agent_ipc/input_path.rs`, `thumbnail.rs`, 新規 `thumbnail_identity_tests.rs`、
+`src/conceal_db.rs` と本台帳。新規13件 (handler9 + DB4) はすべて成功した。
+追加の設計矛盾はない。sandbox外の実pipe成功と正式な独立再レビューは今回修正では未観測。
+製品binary、UI、portable smokeを起動せず、commitも行っていない。
+実pipe gateがこのsandboxでは通らないため通常profileのcore確認用buildは行わず、
+依頼されたconsole adapterをbuildした。
+
+ClaudeCode が sandbox 外の通常権限で実行するコマンド (今回の修正後の成功は未観測):
+
+```powershell
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E '(test(/agent_ipc/) or test(/agent_level/) or test(/agent_permission/) or test(=settings_db::tests::failed_permission_commit_preserves_snapshot_and_epoch) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(/png_metadata/) or test(=pdf_loader::tests::anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results) or test(=pdf_loader::tests::page_sizes_preserve_existing_ui_diagnostic_identity) or test(=pdf_loader::tests::page_sizes_round_trip_and_reject_a_truncated_reply) or test(/app::folder_scan/) or test(/zip_loader/) or test(/conceal_db/) or test(=pdf_loader::tests::anonymous_agent_render_and_enumerate_omit_keys_and_harvest_actual_completion) or test(=pdf_loader::tests::cancelled_anonymous_render_does_not_enqueue)) and not test(/section1375_scan_perf_tests/)'
+```

@@ -1,5 +1,5 @@
-//! Reject syntactic aliases, but retain producer-returned short names. Edit
-//! readers also check long/short spellings, without resolving links.
+//! Reject syntactic aliases, but retain producer-returned short names. Conceal
+//! uses long-name identity; rotation keeps spelling candidates. Neither resolves links.
 use std::path::{Path, PathBuf};
 
 use super::{AgentError, ErrorCode, error, internal};
@@ -73,6 +73,12 @@ pub(super) enum NameForm {
 
 pub(super) fn edit_spellings(path: &Path) -> Result<Vec<PathBuf>, AgentError> {
     edit_spellings_with(path, lookup_name)
+}
+
+pub(super) fn long_identity(path: &Path) -> Result<Option<String>, AgentError> {
+    lookup_name(path, NameForm::Long)
+        .map(|name| name.map(|name| crate::adjustment_db::normalize_path(&name)))
+        .map_err(|_| internal())
 }
 
 fn edit_spellings_with(

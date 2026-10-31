@@ -376,6 +376,27 @@ impl ConcealDb {
         set
     }
 
+    /// `load_conceal_keys` と同じキー集合を返すが、読み取り失敗を空集合にしない。
+    /// 隠す編集の有無を確実に判定する読み取り専用の呼び出しで使う。
+    pub(crate) fn load_conceal_keys_checked(
+        &self,
+        prefix: &str,
+    ) -> rusqlite::Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT page_path FROM conceal_entries
+             WHERE page_path LIKE ?1 ESCAPE '\\'
+               AND page_path NOT LIKE '\\_\\_slot\\_%' ESCAPE '\\'",
+        )?;
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+            .replace('[', "\\[");
+        let pattern = format!("{escaped}%");
+        let rows = stmt.query_map([&pattern], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
     /// 指定ページキーのうち、隠蔽加工マスクを持つものだけを返す。
     pub fn load_existing_conceal_keys(
         &self,
@@ -673,6 +694,84 @@ mod tests {
         assert!(keys.contains("c:/foo/img2.png"));
         // スロットは除外
         assert!(!keys.iter().any(|k| k.starts_with("__slot_")));
+    }
+
+    #[test]
+    fn load_conceal_keys_checked_excludes_slots() {
+        let (_temp, db) = tmp_db();
+        for key in [
+            "c:/foo/img1.png",
+            "c:/foo/img2.png",
+            "c:/other/img.png",
+            "__slotX1",
+        ] {
+            db.set(key, &[true], &[], 1, 1).unwrap();
+        }
+        db.set_slot(1, &[true], &[], 1, 1).unwrap();
+        db.set_slot(2, &[true], &[], 1, 1).unwrap();
+
+        let all_keys = db.load_conceal_keys_checked("").unwrap();
+        assert_eq!(all_keys, db.load_conceal_keys(""));
+        assert_eq!(all_keys.len(), 4);
+        assert!(all_keys.contains("__slotX1"));
+        assert!(!all_keys.iter().any(|key| key.starts_with("__slot_")));
+        assert!(db.load_conceal_keys_checked("__slot_").unwrap().is_empty());
+        assert_eq!(
+            db.load_conceal_keys_checked("c:/foo/").unwrap(),
+            std::collections::HashSet::from([
+                "c:/foo/img1.png".to_string(),
+                "c:/foo/img2.png".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn load_conceal_keys_checked_propagates_read_failure() {
+        let (_temp, db) = tmp_db();
+        db.conn.execute("DROP TABLE conceal_entries", []).unwrap();
+
+        assert!(db.load_conceal_keys_checked("").is_err());
+        assert!(db.load_conceal_keys("").is_empty());
+    }
+
+    #[test]
+    fn load_conceal_keys_checked_propagates_row_type_failure() {
+        let (_temp, db) = tmp_db();
+        db.conn
+            .execute_batch(
+                "DROP TABLE conceal_entries;
+                 CREATE TABLE conceal_entries (page_path INTEGER);
+                 INSERT INTO conceal_entries (page_path) VALUES (123)",
+            )
+            .unwrap();
+
+        // SQLite LIKE matches the malformed numeric key, but row.get rejects its type.
+        assert!(db.load_conceal_keys_checked("").is_err());
+        assert!(db.load_conceal_keys("").is_empty());
+    }
+
+    #[test]
+    fn load_conceal_keys_checked_readonly_does_not_write() {
+        let (temp, db) = tmp_db();
+        db.set("c:/foo/img.png", &[true], &[], 1, 1).unwrap();
+        db.set_slot(1, &[true], &[], 1, 1).unwrap();
+        drop(db);
+        let path = temp.path().join("test.db");
+        let before = std::fs::read(&path).unwrap();
+
+        let readonly = ConcealDb::open_readonly(&path).unwrap();
+        assert_eq!(
+            readonly.load_conceal_keys_checked("").unwrap(),
+            std::collections::HashSet::from(["c:/foo/img.png".to_string()])
+        );
+        let changes: i64 = readonly
+            .conn
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(changes, 0);
+        drop(readonly);
+
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 
     #[test]

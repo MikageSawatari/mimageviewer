@@ -48,7 +48,7 @@ impl Handlers {
         ctx.checkpoint()?;
         let settings = crate::settings_db::with_db_result(|db| db.load_into_settings())
             .map_err(|_| internal())?;
-        let edits = EditReaders::open()?;
+        let mut edits = EditReaders::open()?;
         let io = crate::io_semaphore::GlobalIoSemaphore::process_shared(
             settings.indexer_speed_profile.io_permits(),
         );
@@ -56,7 +56,7 @@ impl Handlers {
         for item in items.iter().skip(offset) {
             ctx.checkpoint()?;
             let (row, image) =
-                read_thumbnail(item, side, settings.thumb_quality, ctx, &edits, &io)?;
+                read_thumbnail(item, side, settings.thumb_quality, ctx, &mut edits, &io)?;
             ctx.checkpoint()?;
             if !page.push(row, image)? {
                 break;
@@ -157,8 +157,43 @@ impl ThumbnailBuilder {
 }
 
 struct EditReaders {
-    conceal: Option<crate::conceal_db::ConcealDb>,
+    conceal: Vec<ConcealKey>,
+    resolved: std::collections::HashMap<String, Option<String>>,
     rotation: Option<crate::rotation_db::RotationDb>,
+}
+
+struct ConcealKey {
+    path: std::path::PathBuf,
+    normalized: String,
+    member: Option<String>,
+}
+
+/// Long/short expansion cannot change the drive or UNC host. Filter by that
+/// namespace before resolving stored aliases, never by a shortenable folder.
+fn path_domain(path: &str) -> Option<&str> {
+    if let Some(unc) = path.strip_prefix("//") {
+        let end = unc.find('/')?;
+        Some(&path[..end + 3])
+    } else if path.as_bytes().get(1) == Some(&b':') {
+        Some(&path[..2])
+    } else {
+        None
+    }
+}
+
+fn cached_identity(
+    resolved: &mut std::collections::HashMap<String, Option<String>>,
+    path: &Path,
+) -> Result<Option<String>, AgentError> {
+    let key = crate::adjustment_db::normalize_path(path);
+    if let Some(identity) = resolved.get(&key) {
+        return Ok(identity.clone());
+    }
+    // Resolve the original spelling before folding its identity. Unicode case
+    // folding need not itself produce a filename understood by the filesystem.
+    let identity = super::input_path::long_identity(path)?;
+    resolved.insert(key, identity.clone());
+    Ok(identity)
 }
 
 #[derive(Clone, Copy)]
@@ -171,7 +206,7 @@ enum EditItem<'a> {
 fn edit_keys(paths: &[std::path::PathBuf], item: EditItem<'_>) -> Result<Vec<String>, AgentError> {
     let mut keys = Vec::new();
     // Rotation priority is spelling first (given, long, short), then current
-    // before legacy. Conceal checks every key and any hit hides the pixels.
+    // before legacy. Conceal instead uses resolved long-name identity.
     for path in paths {
         match item {
             EditItem::ZipEntry { current, legacy } => {
@@ -213,12 +248,25 @@ impl EditReaders {
     fn open() -> Result<Self, AgentError> {
         let conceal_path = crate::conceal_db::ConcealDb::db_path();
         let conceal = if conceal_path.try_exists().map_err(|_| edit_read_error())? {
-            Some(
-                crate::conceal_db::ConcealDb::open_readonly(&conceal_path)
-                    .map_err(|_| edit_read_error())?,
-            )
+            crate::conceal_db::ConcealDb::open_readonly(&conceal_path)
+                .and_then(|db| db.load_conceal_keys_checked(""))
+                .map_err(|_| edit_read_error())?
+                .into_iter()
+                .map(|key| {
+                    let (path, member) = key
+                        .split_once("::")
+                        .map_or((key.as_str(), None), |(path, member)| {
+                            (path, Some(member.to_lowercase()))
+                        });
+                    ConcealKey {
+                        path: path.into(),
+                        normalized: crate::adjustment_db::normalize_path(Path::new(path)),
+                        member,
+                    }
+                })
+                .collect()
         } else {
-            None
+            Vec::new()
         };
         let rotation = if crate::rotation_db::RotationDb::db_path()
             .try_exists()
@@ -228,19 +276,44 @@ impl EditReaders {
         } else {
             None
         };
-        Ok(Self { conceal, rotation })
+        Ok(Self {
+            conceal,
+            resolved: std::collections::HashMap::new(),
+            rotation,
+        })
     }
 
-    fn hidden(&self, keys: &[String]) -> Result<bool, AgentError> {
-        if let Some(db) = &self.conceal {
-            for key in keys {
-                if db
-                    .get_full_checked(key)
-                    .map_err(|_| edit_read_error())?
-                    .is_some()
-                {
-                    return Ok(true);
-                }
+    fn hidden(
+        &mut self,
+        path: &Path,
+        item: EditItem<'_>,
+        ctx: &ReadContext,
+    ) -> Result<bool, AgentError> {
+        if self.conceal.is_empty() {
+            return Ok(false);
+        }
+        let Some(identity) = cached_identity(&mut self.resolved, path)? else {
+            return Ok(false);
+        };
+        let keys = edit_keys(&[std::path::PathBuf::from(&identity)], item)?;
+        let members: Vec<_> = keys
+            .iter()
+            .map(|key| key.split_once("::").map(|(_, member)| member))
+            .collect();
+        for stored in &self.conceal {
+            ctx.checkpoint()?;
+            if path_domain(&stored.normalized) != path_domain(&identity)
+                || !members.contains(&stored.member.as_deref())
+            {
+                continue;
+            }
+            let stored_identity = if stored.normalized.contains('~') {
+                cached_identity(&mut self.resolved, &stored.path)?
+            } else {
+                Some(stored.normalized.clone())
+            };
+            if stored_identity.as_deref() == Some(identity.as_str()) {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -282,7 +355,7 @@ fn read_thumbnail(
     side: u32,
     quality: u8,
     ctx: &ReadContext,
-    edits: &EditReaders,
+    edits: &mut EditReaders,
     io: &crate::io_semaphore::GlobalIoSemaphore,
 ) -> Result<(ThumbnailItem, Option<Vec<u8>>), AgentError> {
     let path = super::input_path::validate(&item.path)?;
@@ -302,7 +375,7 @@ fn read_thumbnail(
                 &super::input_path::edit_spellings(path)?,
                 EditItem::PdfPage(page),
             )?;
-            if edits.hidden(&keys)? {
+            if edits.hidden(path, EditItem::PdfPage(page), ctx)? {
                 return Ok(unavailable(&exact, ThumbnailStatus::HiddenByEdit));
             }
             pixels = crate::pdf_loader::render_page_anonymous(path, page, side, ctx.cancel.clone())
@@ -337,7 +410,14 @@ fn read_thumbnail(
                     legacy: &read.legacy_name,
                 },
             )?;
-            if edits.hidden(&keys)? {
+            if edits.hidden(
+                path,
+                EditItem::ZipEntry {
+                    current: &read.name,
+                    legacy: &read.legacy_name,
+                },
+                ctx,
+            )? {
                 return Ok(unavailable(&exact, ThumbnailStatus::HiddenByEdit));
             }
             pixels = match read.bytes {
@@ -352,7 +432,7 @@ fn read_thumbnail(
             return Ok(unavailable(item, ThumbnailStatus::Unsupported));
         }
         keys = edit_keys(&super::input_path::edit_spellings(path)?, EditItem::File)?;
-        if edits.hidden(&keys)? {
+        if edits.hidden(path, EditItem::File, ctx)? {
             return Ok(unavailable(item, ThumbnailStatus::HiddenByEdit));
         }
         let _permit = io
@@ -480,3 +560,7 @@ mod tests;
 #[cfg(test)]
 #[path = "thumbnail_alias_tests.rs"]
 mod alias_tests;
+
+#[cfg(test)]
+#[path = "thumbnail_identity_tests.rs"]
+mod identity_tests;
