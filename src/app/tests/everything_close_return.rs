@@ -1,4 +1,6 @@
 use super::*;
+#[path = "rating_filter_return_1671.rs"]
+mod rating1671;
 use crate::global_search_ui::{
     EverythingPosition, SearchAccepted, adopt_everything_for_test as adopt,
     assert_everything_return_only_for_test, everything_dataset_for_test as dataset,
@@ -602,6 +604,15 @@ fn detached_close_matches_head_return_in_both_window_modes() {
         let root = app.tmp.path().to_path_buf();
         app.current_folder = Some(root.clone());
         let (row, folder) = fixture(&mut app, &root, Book::Folder);
+        // §1.671: independent readers do not borrow main's filtered membership
+        // or establish suppression in main. Keep the §1.670 HEAD return contract.
+        let filter = [false, false, false, false, false, true];
+        app.settings.rating_filter = filter;
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set(&crate::adjustment_db::normalize_path(&folder), 5)
+            .unwrap();
         let result = dataset(vec![row.clone(), GridItem::Image(root.join("other.png"))]);
         adopt(&mut app, &ctx, "images", Arc::clone(&result));
         app.selected = Some(app.items.iter().position(|item| item == &row).unwrap());
@@ -624,10 +635,15 @@ fn detached_close_matches_head_return_in_both_window_modes() {
         assert_eq!(app.items_generation, generation);
         assert_eq!(app.grid_scroll.offset(), 240.0);
         assert!(epoch.is_current());
+        assert!(app.rating_filter_suppressed_at.is_none());
+        assert_eq!(app.effective_rating_filter(), filter);
         let main_context = app.viewer_context_main();
         app.with_active_viewer_context(|viewer| {
             viewer.finish_page_identity_preparation_for_test();
             assert!(viewer.fullscreen_idx.is_some());
+            assert!(viewer.rating_filter_suppressed_at.is_none());
+            assert_eq!(viewer.effective_rating_filter(), filter);
+            assert_eq!(viewer.visible_indices.len(), 1, "independent reader keeps the unrated page");
             assert_ne!(viewer.projected_viewer_context_id(), main_context);
             assert!(!viewer.global_search.active);
             assert!(matches!(viewer.global_search.accepted, SearchAccepted::Metadata { .. }));
@@ -661,6 +677,9 @@ fn detached_close_matches_head_return_in_both_window_modes() {
             "independent close must retain the observed HEAD parent-list behavior"
         );
         assert!(!app.pending_return_to_parent.is_pending());
+        assert!(app.rating_filter_suppressed_at.is_none());
+        assert_eq!(app.effective_rating_filter(), filter);
+        assert_eq!(app.settings.rating_filter, filter);
         assert!(app.global_search.pending.is_none());
         assert!(!app.everything_has_physical_child());
         assert!(

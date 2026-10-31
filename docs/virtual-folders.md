@@ -521,6 +521,31 @@ Windowsのpublishは捕捉済みHRESULTからWin32 codeを保持し、UIには
 (`open_archive_via_cache` が set、`effective_folder()` =
 `archive_source_override.or(current_folder)`)。
 
+一覧採用時の★フィルタ一時解除の範囲判定は、`install_loading_items_inner` で
+`current_folder` と `archive_source_override` の組を確定した後、項目の設置・可視列の生成より前に
+1 回行う。同じ backing の再読込では元書庫 alias を保持し、別の一覧では旧 alias を外し、
+StagedArchive / SmartPhysical の採用は行き先の論理 source を反映してから判定する。
+新しい backing と退場した本の alias を組み合わせて判定してはならない（§1.671）。
+本の内部・ページ一覧では同じ anchor の一時解除を保ち、範囲外では解除前の評価条件を使う。
+戻った親自身の★が条件に合う場合は、親を anchor とする新しい一時解除になる。
+保存済み `settings.rating_filter` は変えず、一時解除の所有者も既存の viewer context のまま。
+Everything の結果帰路は既存の明示復元を使い、synthetic surface の論理位置は
+`EverythingPosition` に従う（最後の物理 backing / alias は結果採用後も保持される）。
+簡素化として既存の採用境界の順序を揃え、追加状態・待機・再試行・帰路ごとの解除処理は作らない。
+操作の組み合わせを増やす変更ではないため、新たな modal も不要。まれな失敗は既定の
+ログ・通知の方針を維持し、未採用・取消・失敗のための回復機構を追加しない。
+
+ZIP 内の軽量階層移動は `install_loading_items_inner` を通らない。
+`install_zip_current_level` でも、移動先の `zip_nav` が確定した後、可視列を作る前に
+`maybe_restore_rating_filter_after_zip_level_change` を 1 回呼ぶ（§1.671 追加P2）。
+範囲判定は論理 archive root / 実効 prefix のキーだけを使い、後段のアドレス表示や
+見開き設定の読込には依存しない。解除後に二度目の可視列再構築を追加しない。
+Direct PDF のパスワード待ちは未採用なので、Cancel / Parked でも元の本の一時解除・
+可視列を保持する。既に PDF / 空の shell を採用した Legacy の終端解除は維持する。
+Everything 起点の入れ子階層は、通常mainで履歴sourceを得られず項目の採用が止まる
+別の未解決境界がある。今回の階層帰路修正の成功範囲には含めず、詳細と再現証拠は
+[§1.671追補](next-release-backlog.md) に記録する。
+
 直接閲覧 RAR/CBR は `current_folder` がheaderで確定した元アーカイブ（分割なら先頭volume）を指す。
 typedな履歴／一覧遷移ではクリックした論理pathを`archive_source_override`へ保持する経路もあるが、
 読込・ページ・読書位置keyは実際のRAR backingのままにする。現在開いているコンテナの判定には

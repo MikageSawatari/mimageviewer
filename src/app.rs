@@ -39851,8 +39851,10 @@ impl App {
         // SQLite を引くと UI スレッドが詰まる。start_loading_items と同じく事前に
         // バッチ prewarm しておく (Codex P3 perf parity)。
         self.prewarm_rating_cache();
-        // facet filter は visible_indices の構築に直接効くため、ZIP 階層で anchor 外へ
-        // 戻った場合は再構築前に親条件を復元しておく。
+        // zip_nav already owns the destination level. Restore its rating scope before
+        // building visibility, just as the adoption owner has restored the parent facet.
+        // Address and spread settings below do not participate in the scope identity.
+        self.maybe_restore_rating_filter_after_zip_level_change();
         // ★ visible_indices を再構築。これがないと旧レベルの stale index が
         // update_keep_range_and_requests で thumbnails[i] を範囲外参照して panic する (Codex P1)。
         self.rebuild_visible_indices();
@@ -39874,10 +39876,6 @@ impl App {
             }
             self.apply_view_trim_for_key_with_fallback(&key, fb.as_deref());
         }
-        // ★付きの本を開いて一時解除したフィルタを、本より上の階層へ戻ったら復元する
-        // (実フォルダの maybe_restore_rating_filter_if_out_of_scope に相当)。
-        self.maybe_restore_rating_filter_after_zip_level_change();
-
         self.prepare_current_listing_page_identity_index(
             visibility,
             self.archive_source_override.clone(),
@@ -41905,6 +41903,8 @@ impl App {
                 return true;
             }
             PdfPasswordRequestOwner::Direct(continuation) => {
+                // This request never adopted the destination. Its source rows and
+                // rating suppression still belong together, including on park.
                 self.restore_epub_open(continuation.restore);
             }
             PdfPasswordRequestOwner::Legacy(_) => {
@@ -41912,12 +41912,13 @@ impl App {
                     self.pdf_password_pending_save = None;
                     return true;
                 }
+                // Legacy verification already adopted this PDF (or its empty shell).
+                self.restore_rating_filter_suppression();
             }
         }
         self.pdf_password_pending_save = None;
         self.fs_nav_after_pdf_enumerate = None;
         self.finish_visible_container_fs_nav_failed();
-        self.restore_rating_filter_suppression();
         #[cfg(windows)]
         if exit == PdfPasswordExit::Cancel {
             self.terminate_active_detached_open_before_viewport("pdf_password_cancelled");
@@ -42948,24 +42949,9 @@ impl App {
         let assign_t0 = std::time::Instant::now();
         self.display_epub_source = display_epub_source;
         self.current_folder = Some(source_path.clone());
-        if let Some(logical_path) = smart_open_path.as_deref()
-            && !crate::folder_tree::path_eq(logical_path, &source_path)
-        {
-            // The visible generation is being adopted now. Source-scoped rating/pin decisions
-            // below must see the original archive, not its converted cache alias.
-            self.archive_source_override = Some(logical_path.to_path_buf());
-        }
         self.current_folder_rating_cache = None;
         if !detached_physical {
             self.reset_folder_rating_counts();
-        }
-        // ★フィルタ suppression scope の判定: anchor の subtree 外に出たら復元する。
-        // 判定は current_folder 反映直後に行うため、`effective_folder()` が最新値を返す。
-        // RAR/7z/LZH キャッシュ ZIP の async enumerate 完了時は、呼び出し元が設定した
-        // archive_source_override がまだ生きているため、ユーザー視点の元アーカイブ
-        // パスを基準に判定できる。
-        if !detached_physical {
-            self.maybe_restore_rating_filter_if_out_of_scope();
         }
         // 外部更新の自動反映で使う mtime。ディレクトリ実体のみ (ZIP / PDF / 検索合成は
         // 仮想フォルダなのでファイル追加イベントの対象外)。metadata 失敗時は None のまま。
@@ -42999,6 +42985,14 @@ impl App {
         {
             self.address = logical_path.to_string_lossy().to_string();
             self.archive_source_override = Some(logical_path.to_path_buf());
+        }
+        // Scope belongs to the adopted logical source/backing pair. Resolve both the
+        // retained/cleared old alias and the staged destination alias before testing
+        // it: a new current_folder combined with the departing archive's override
+        // would incorrectly keep that book's suppression on its parent or sibling.
+        // Keep this before item installation so visibility uses the resolved filter.
+        if !detached_physical {
+            self.maybe_restore_rating_filter_if_out_of_scope();
         }
         // Ctrl+G 絞り込みビュー中はブレッドクラム形式を維持する
         // (2026-04 ユーザー報告: PDF 開くと raw パスに戻ってしまうバグ)。

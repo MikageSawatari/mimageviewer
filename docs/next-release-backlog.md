@@ -65,15 +65,116 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.671 ★で絞った本から一覧へ戻っても「★一時解除中」が残る — 5ch >>687 (2026-10-31)
 
-- 状態: **未着手・開発側で再現と原因確認を行う (利用者依頼 2026-10-31)**。[>>687](https://egg.5ch.io/test/read.cgi/software/1782419551/687) は「サムネイル画面で星で絞って本を開くと『★フィルタ一時解除中 (親へ戻ると復元)』と出るが、サムネイルへ戻っても復元されず、★一時解除中のまま」という報告。本の形式・ウィンドウモード・閉じ方・戻った一覧が本のページ一覧か親の本一覧かは未記載。Everything 起点とも明記されていない。**今回の調査はソース確認のみで、実アプリでの再現・回帰テストの実行・製品コードの修正はしていない。報告者の原因は未確定。**
+- 状態: **実装済み・実機未確認 (2026-11-01、追加P2・独立レビュー対応済み。自動検証結果と未解決境界は追補参照)**。[>>687](https://egg.5ch.io/test/read.cgi/software/1782419551/687) は「サムネイル画面で星で絞って本を開くと『★フィルタ一時解除中 (親へ戻ると復元)』と出るが、サムネイルへ戻っても復元されず、★一時解除中のまま」という報告。本の形式・ウィンドウモード・閉じ方・戻った一覧が本のページ一覧か親の本一覧かは未記載。Everything 起点とも明記されていない。**下記は開発側の headless テストで確認した不具合であり、報告者が同じ経路を使った証拠はない。この修正で >>687 が直るとは断定しない。** 製品起動・実入力・commit は行っていない。
 - 守る動作: 本の未評価ページを消さないため、本の内部 (ページ一覧を含む) では一時解除を維持し、本の範囲を出て元の一覧へ戻ったら解除前の絞り込みを使う。保存済み `settings.rating_filter` は書き換えない。「サムネイルに戻る」が本のページ一覧への移動であれば、解除継続は現仕様の範囲となる。
-- 具体的な不具合候補 (v4.10.2 と現行 master のコードで確認): 変換した RAR / 7z / LZH 等では、内部 ZIP の `current_folder` とは別に元書庫の `archive_source_override` を持つ。`src/app.rs::install_loading_items_inner` は旧 override を clone して保持し、新しい `current_folder` を設定した後、**旧 override を外す前に** `maybe_restore_rating_filter_if_out_of_scope` を呼ぶ。`effective_folder` は override を優先するので、通常の親フォルダへ戻っても元書庫内にいると判定して復元を飛ばし、その後で override を消す順序になり得る。通常フォルダの走査結果の採用もこの経路を通る。復元漏れを起こし得る処理順だが、**>>687 が変換書庫を使った証拠はない**。
+- 確認した原因: 変換した RAR / 7z / LZH 等では、内部 ZIP の `current_folder` とは別に元書庫の `archive_source_override` を持つ。修正前の `src/app.rs::install_loading_items_inner` は、新しい `current_folder` を設定した後、**旧 override を外す前に** `maybe_restore_rating_filter_if_out_of_scope` を呼んでいた。`effective_folder` が旧 override を優先し、通常の親一覧へ戻っても元書庫内と判定して復元を飛ばし、その後で override だけ消す。7z の有効な変換 cache fixture を既存の受付・採用・帰路へ通し、この順序による旧 anchor の残留と実効条件の全 ON・未評価項目の表示まで確認した（バッジだけの問題ではない）。別 ZIP への通常の staged switch でも同じ残留を確認した。実 RAR/7z の変換器自体は実行していない。
 - 別の条件: `maybe_restore_rating_filter_if_out_of_scope` は範囲外で解除した後、戻ったフォルダ自体に条件を満たす★があれば、そのフォルダを起点に再び一時解除する。この場合は同じ anchor が残ったのではなく再発動なので、親の評価・anchor の前後を区別する。親の一覧でも解除するべきかは、実際の一覧と用途を確認してから判断する。
 - 複数ウィンドウとの関係: `rating_filter_suppressed_at` は `ViewerContextBundle` が所有し、独立した本の viewer は main の表示フィルタを使わない経路がある。モードだけで必ず壊れるとは確認していない。Everything の main / linked F12 の帰路は `return_from_everything_child` が明示的に解除する。独立 viewer の帰路が main の結果を置換する既知の問題 (§1.670) と、本報告を根拠なく同一原因にしない。
 - 開発側で行う確認: まず通常 ZIP と変換書庫で「★付きの本を絞った親一覧 → 本 → 元の親一覧」を同じ条件で比較し、親自身の★なし / 条件一致も分ける。本のページ一覧へ戻る場合と親へ戻る場合、Esc / HUD の×と Backspace、通常 main / linked F12 / 独立 viewer を既存の受付・採用・帰路処理で通す。Everything 起点も対照に含める。戻る前後の logical source / `current_folder` / override / suppression anchor / 実効フィルタ / 可視項目を検査し、バッジだけの問題か、実際に絞り込みが戻っていないかを切り分ける。まず開発側で調べ、報告者へ推測の確認を繰り返さない。
-- 修正方針は原因確認後に決める。候補経路では、一覧採用時の論理 source と backing path の組が確定した状態で scope を判定できる所有境界を確認する。表示だけ消す・閉じるたびに一括解除する・追加フラグで吸収する修正は避ける。本の内部での一時解除と sibling context の状態を保ち、open / switch / close / cancel / 採用失敗の同型経路も確認する。
-- 既存の検証材料 (今回は未実行): `src/app/tests.rs` の `rating_filter_suppression_is_owned_by_the_context_that_established_it`、`opening_starred_zip_book_under_filter_suppresses_then_restores`、`src/app/list_order_ratingnav649_tests.rs` の通常 ZIP / 画像フォルダの回帰。変換 alias と実際の親一覧の採用を通す回帰を追加し、修正前に失敗することを確かめる。`src/app/tests/everything_close_return.rs` の帰路にも評価の復元条件を検査する。実画面の確認が必要なら、事前承認と使い捨て portable の手順に従う。
-- 対象: `src/app.rs` の一覧採用・`effective_folder`・評価フィルタの一時解除と復元、`src/app/viewer_context_registry.rs`、`src/global_search_ui/everything.rs`、関連テスト。[仮想フォルダ](virtual-folders.md)、[一覧順の本移動](list-order-book-navigation-plan.md) を参照。detached の所有境界へ触れる場合は [リワーク計画 §2](detached-rework-plan.md#2-憲法-全ステージ共通の不変条件禁止事項-️-最重要) の構造的修正の合意と記録を行う。規模: 原因確認後に見積もる / 優先度: P2。
+- 修正: 同じ採用関数で、旧 alias の保持・解除と StagedArchive / SmartPhysical の行き先 alias を確定してから scope を 1 回判定する。項目の設置・可視列の生成より前であることを維持し、不要になった先行 alias 設定を除去した。新しい状態・待機・再試行・帰路ごとの一括解除は追加しない。独立 reviewer（GPT-6.1 Sol / xhigh）は実装前に採用境界の構造的修正として合意。detached の述語 / viewport、context registry、Everything の製品コードは無差分で、§1.670 は対象外。[仮想フォルダの契約](virtual-folders.md#変換アーカイブ閲覧中の-current_folder-とユーザー視点パスの二重化) を更新した。マニュアル・CHANGELOG は変更しない。
+- 回帰: `src/app/tests/rating_filter_return_1671.rs`（既存 `everything_close_return` の子 module）に、4形式 × main / 実 F12 handler の linked × 親自身★あり / なし × Esc / HUD相当のclose request / Backspace→ページ一覧→親 × 通常 / Everything の96通りを追加。PDF は列挙結果だけ注入し、他は一時画像・実 ZIP・変換 cache のfixtureで受付・走査・採用・帰路を通す。各段で論理 source / backing / override / anchor / 実効条件 / 可視行を検査し、設定の保存・再読込でも★条件が不変なことと、休眠 sibling の一覧・世代・PDF epoch・一時解除が不変なことを検査する。Everything の論理位置は `EverythingPosition` が所有し、結果採用後に最後の物理 backing / alias を保持する現行仕様も検査する。
+- 修正前の実行（通常feature、test profile、`MSBUILDDISABLENODEREUSE=1`）: 追加98件中85成功・13失敗、exit 100、実行5.349秒（`target/rating1671/before.log`）。通常一覧→7z cache→親の12通り（main / linked × 親★有無 × 3帰路）すべてが旧本 anchor 残留で失敗。他84通りは成功し、Backspace直後の本ページ一覧では全形式で同じ anchor の継続が仕様どおり成立した。追加の同backing reload→switchテストは、最初の別ZIPで旧 anchor 残留により失敗（残る3行き先は修正後に検査する）。PDF取消・列挙失敗の未採用状態保持は成功。初回のtest harness修正前のログは `harness-initial.log` として分離し、製品原因の証明には使わない。
+- 独立 viewer: 既存 `detached_close_matches_head_return_in_both_window_modes` に評価条件を加え、mainでは抑制なし・独立readerの未評価ページは可視・mainの絞り込みを継承しない所有境界と、既知の HEAD 相当の帰路を検査する。§1.670 の望ましい帰路へ直したとは扱わない。
+- 修正後の検証（基点 `81569d9c7` + 本節の未コミット差分、通常feature / test profile、`MSBUILDDISABLENODEREUSE=1`、検証担当 Codex root）:
+  - `cargo fmt` / `cargo fmt --check` / `git diff --check`: 成功 / exit 0。
+  - `cargo check -p mimageviewer --lib --tests --features test-script`: 成功 / exit 0、1分41秒（`target/rating1671/check.log`）。既存warningは残る。UI文言は無差分。
+  - focused nextest（`rating1671`、`ratingnav649`、`everything_close_return`、指定の既存所有境界 / ZIP一時解除テスト）: **130/130成功** / exit 0、12.300秒（`after-focused.log`）。修正前の13失敗も成功し、同backing reload後の4形式へのswitchを最後まで検査。PDFのEverything帰路1件に passed-with-leaked-handles の警告があったが、後続の全件runには同警告なし。
+  - `.\scripts\test-lib-full.ps1`: **15,298/15,298成功、既存ignored 67、失敗0** / exit 0、676.319秒。SLOWは9件、ページめくり §1.447 等を含む失敗はなく、失敗時の単独3回は不要。run: `target/test-lib-full/runs/20261031T152408132Z-ccff12a4/`、成功receipt: `target/test-lib-full/e4368571b052540f21bb6168c720a96efb9db06c275fc09b68566c08696e610f.json`。入口・採用拒否・古い完了・取消・errorの既存回帰もこの全件結果を再利用する。実行後に変更したのは検証結果を記録する文書だけで、Rustソースは同一。
+  - 独立 completion review（GPT-6.1 Sol / xhigh）: **ACCEPT、P1/P2なし**。reviewerはテストを重複実行せず、修正前ログと完成差分を確認した。
+  - workspace / vendor / doctest の `test-full.ps1`、実画面・実入力は未実施。詳細ログは `target/rating1671/`。
+- 確認用 build: coldな `turbojpeg-sys` を `CARGO_BUILD_JOBS=1` で準備（`cargo build --profile dev-runtime -p turbojpeg-sys`、exit 0、2分52秒）した後、`.\scripts\build-dev.ps1 -PreserveRuntime` が成功 / exit 0。core 5分47秒、remote 33.27秒、EPUB worker 20.03秒。`target/dev-runtime/mimageviewer-core.exe` と同protocolのcompanion、DLL / EffeTune bundleを配置し、VCRT / PE監査も runtime=4 / pe=3 で成功。通常featureでportableは無効。host transcriptは `target/rating1671/build-dev.log`、native準備ログは `dev-native-prerequisite.log`。エージェントから起動していない。
+- 実機引き継ぎ: worktree rootで `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。引数なしでは実利用中の `%APPDATA%\mimageviewer` を使い、設定・データを更新し得る。single-instance mutexを共有するため、先にインストール版 / tray常駐版を終了する。確認対象は、親自身に★がない一覧の★5絞り込みから★5の変換書庫を開き、Esc / HUD ×で親へ戻ると★5条件に復元すること、およびBackspaceでは本のページ一覧で一時解除が続き、さらに親へ戻ると復元すること。親自身が★5なら親anchorの再発動は既存仕様。実際の報告者の経路は引き続き不明であり、追加確認は求めない。
+
+#### §1.671 追加P2: ZIP階層の可視列と範囲復元の順序（2026-11-01）
+
+起点は設計担当が上記修正をコミットした `8ce63c047`。その後の外部独立レビューは **REVISE** で、
+上記の共通採用修正は妥当だが、ZIP内の軽量階層採用に同じ順序問題が残るとのP2を受けた。
+以下は開発側のheadless検査であり、>>687の利用経路が判明したものではない。
+
+- 再現: 実ZIP / 7z変換cache × 書庫内directory / 実際の入れ子ZIP × Backspace / grid Ctrl+↑の8通りで、
+  ★5のAだけ見える親→EnterでA→未評価ページをEnterで表示→Backspaceでページ一覧→ZIP親へ戻る操作を通した。
+  親ではanchorなし・実効条件★5なのに、未評価のBが可視列に残った。既存
+  `opening_starred_zip_book_under_filter_suppresses_then_restores` にも、入場前と復帰後の可視項目検査を加え、同じ失敗を確認した。
+- 修正: `install_zip_current_level` の `maybe_restore_rating_filter_after_zip_level_change` を、
+  行き先 `zip_nav` 確定後かつ唯一の `rebuild_visible_indices` より前へ移した。
+  helperは `current_container_rating_key_and_source` → `physical_container_rating_key` でarchive root / prefixを導出し、
+  後段の `update_zip_nav_address`、見開き / view-trim設定には依存しない。prewarmも実効filter非依存。
+  新しい状態、二度目のrebuild、待機・retryは追加しない。
+- 追加で確認した通常の取消問題: 一時解除中の本からcold PDFを開き、PasswordRequired後にDirect要求をCancel / Parkedすると、
+  未採用なのに `finish_pdf_password_request_in_mounted_context` が旧anchorだけを消し、旧未評価ページの可視列は残していた。
+  実際のPDF受付→列挙結果のPasswordRequired注入→typed Direct終端を通す2テストで修正前の失敗を確認した。
+  Directは旧sourceの一時解除を保持し、既にPDF / 空shellを採用しているLegacyだけ解除するよう責務を分けた。
+  共通terminal cleanup、context / viewportの述語・配送は変更しない。追加のbool / pendingやrebuildも不要。
+
+| 列挙した入口・所有境界 | 確認した順序・対応 |
+| --- | --- |
+| ZIP内 enter / back、grid DFS、fullscreen DFS、bookmark prefix、sort / pin再materialize | 同じ `install_zip_current_level` へ入る。今回の順序修正を共有する |
+| PDF / EPUB、変換書庫の外側採用、通常フォルダ、Ctrl+Shift+↑↓による本の切替 | 前回修正した `install_loading_items_inner` で論理source / backing確定→scope判定→items / 可視列。追加の逆順なし |
+| Backspace / 親へ、Esc / HUD close、通常main / linked F12 | 内側階層はZIP採用、外側は上記共通採用。別の復元口を追加しない |
+| Everything結果rootへの復帰、Ctrl+G drill-back-to-top | 明示restore→結果prepare / buildの順。逆順なし。Everything対照も実行 |
+| Direct PDF password Cancel / Parked | 未採用で旧sourceを保つのに共通の無条件restoreで旧anchorを破棄していた。今回、Direct保持 / Legacy解除へ修正 |
+| PDFの列挙cancel / error、Direct password retry拒否 / failure | 既存の旧source保持経路。追加clearなし。通常の成功adoptionだけがscopeを更新する |
+| Legacy PDF password cancel / retry拒否 | warm verificationは当該PDF / 空shellを採用済み。Collection preflightは専用ownerが先に消費する。旧sourceを保持するDirectとは異なり、既存処理を維持 |
+| toolbar badge / 明示filter編集 | 解除・設定反映→可視列再構築の順。逆順なし |
+| Smart Folderの採用時anchor設定 | child / rootとも確定先anchorを設定してから共通採用・可視列生成へ進む。逆順なし |
+| ★固定解除 / 固定一覧復帰 | restore自体は列採用より前。保存membershipとの所有境界は下記の別候補として区別し、今回未変更 |
+
+追加の未解決境界を成功扱いにしない:
+
+- **Everything内の入れ子階層は採用前に止まる（実経路で確認、未修正）**。
+  ZipDir Enterがanchor / `zip_nav.current` を更新しても、`zip_nav_show_current_level` の
+  `main_folder_history_available=true` → `folder_nav_current_entry=None`（Search surface）でreturnし、itemsは親A/Bのまま。
+  初回の探索4件は階層帰路へ達する前の可視項目検査で失敗した。完全な探索ソースは
+  `target/rating1671-p2/everything-unadopted-repro.rs`、失敗ログは下記 `before.log` に保持した。
+  最終suiteの4件は明確に `everything_results_after_level_request` と命名し、階層要求後にResults帰路で
+  anchor解除・★5条件・元datasetの可視行へ復帰する対照である。**入れ子への正常入場 / 帰路の成功証明ではない**。
+  履歴source / 採用ownerを見直す別の境界へ症状guardを足さず、設計担当へ引き継ぐ。
+  検索UI用gateのためscope helperがNoneになる候補もあるが、正常main入口でそこまで採用できる証拠が無いため、
+  今回 `physical_container_rating_key` へ直接置き換える変更は行わない。
+- **Snapshot保存列 / suppression所有の別候補（ソース確認のみ、未再現・未修正）**。
+  `deactivate_snapshot` のat-origin復帰は先に抑制を解除してから `saved_visible_indices` を復元する。
+  一時解除中に保存したmembershipと復元後の条件の整合には、保存列とsource suppressionをどちらが保持するかの仕様判断が必要。
+  固定列へ単純に再buildを足す修正は行わない。今回のZIP採用順序 / 未採用PDF終端の修正に、この所有境界の変更は不要。
+
+検証担当はCodex root、環境は `MSBUILDDISABLENODEREUSE=1`、通常feature / test profile。ログは `target/rating1671-p2/`。
+
+- 修正前 `before.log`: 13件中0成功・13失敗 / exit 100、0.862秒。うち9件は上記ZIP順序の失敗、
+  Everything探索4件は別の未採用境界での失敗であり、同じ原因とは扱わない。
+- ZIP修正後・PDF修正前 `zip-fixed-password-before.log`: 15件中13成功・Direct password Cancel / Parkedの2件失敗 / exit 100、0.930秒。
+  各PDFテストは先頭の通常ZIPからの取消で失敗して停止したため、変換cacheでのred実行証拠とは扱わない。
+- 修正後focused `after-focused.log`: **153/153成功** / exit 0、15.743秒。新規14件、可視項目を強化した既存1件、
+  前回の4形式帰路 / context所有境界 / 一覧順移動、ZIP nav / facet、Direct PDF password既存回帰を含む。
+  PDF Cancel / Parkedは通常ZIPと変換cacheの両方を完走。成功したテスト2件にleaked-handles警告あり。
+- `cargo fmt` / `cargo fmt --check` / `git diff --check`: 成功 / exit 0。
+- `cargo check -p mimageviewer --lib --tests --features test-script`: 成功 / exit 0、1分17秒（`check.log`）。既存warningは残る。
+- 独立追加設計 / completion review（GPT-6.1 Sol / xhigh）: **ACCEPT、今回差分に追加P1/P2なし**。
+  上記のEverything / Snapshot未解決境界を今回の成功範囲へ含めない切り分けにも合意。
+- `.\scripts\test-lib-full.ps1`: **15,310成功・2失敗・既存ignored 67** / exit 100、806.898秒（SLOW 11、成功testのleaked-handles警告1）。
+  全15,312件を実行して終了し、command runnerによる中断やtest timeoutは無い。runは
+  `target/test-lib-full/runs/20261031T161216615Z-39523b42/`、JUnit / stdout / stderrを保持。
+  **全件gateは失敗として扱い、成功receiptは無い**。失敗は次の2件で、当該製品・testコードや待機時間は変更しない。
+  - `ui_fullscreen::page_turn::draw_submit_tests::page_turn_mainwindow_submits_visible_vacant_leaf_both_directions`:
+    `draw_submit_tests.rs:462`、p=0.6、`old9 must remain visible outside the growing black leaf`。
+    §1.447の既存観測と同じtest / assert。単独exact選択・test-threads=1・retry=0で **3/3成功**
+    （3.126 / 3.025 / 3.441秒、各exit 0、`page-turn-single-{1,2,3}.log`）。
+  - `app::main_chrome::tests::main_chrome_folder_tree_clicks_follow_common_modal_ownership`:
+    `main_chrome.rs:364`、`Harness::run exceeded max_steps (4)`（folder pane / spinner repaintが未収束）。
+    [既存の全件検証記録](ai-crash-655-investigation.md) にも同じtest / Harness未settleの観測がある。
+    単独exact選択・test-threads=1・retry=0で **3/3成功**
+    （0.593 / 0.520 / 0.503秒、各exit 0、`main-chrome-single-{1,2,3}.log`）。
+  単独結果は `isolated-results.json` にも保存。既存観測との一致と単独成功を記録するに留め、
+  負荷が原因・製品には問題が無いと断定しない。全件の失敗を単独成功で上書きせず、再度の全件実行はしていない。
+- 確認用build: `.\scripts\build-dev.ps1 -PreserveRuntime` が成功 / exit 0（core 2分17秒、remote 0.50秒、EPUB worker 0.46秒）。
+  通常featureでportable無効、coreと同protocolのcompanionを配置し、VCRT / PE監査は runtime=4 / pe=3 成功。
+  host transcriptは `target/rating1671-p2/build-dev.log`。全件gateの上記2失敗は未解決のまま記録し、
+  compilation / 関係回帰・各単独3回の成功を確認してbuildした。全件成功とは扱わない。
+  全件run以後は文書の結果追記だけを行い、Rustソースは同一。エージェントは製品起動・実入力・commitをしていない。
+- 最新の実機引き継ぎ: worktree rootで `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+  引数なしでは通常の `%APPDATA%\mimageviewer` を使い、実設定・データを更新し得る。
+  single-instance mutexを共有するので先にインストール版 / tray常駐版を終了する。
+  対象は、ZIP内で★5の本A / 未評価の本Bを★5で絞り、A→ページ表示→Backspaceでページ一覧→さらにZIP親へ戻った際にAだけ見えること、
+  および一時解除中の本から別PDFのパスワード待ちを取消しても元のページ一覧の解除状態が保たれること。
+  実機は未確認であり、>>687の実際の利用経路も不明のまま。
 
 ### 1.668 コレクションの一覧がサムネイルのキャッシュを使わず、開くたびに作り直す — X @Rottytops (2026-10-31)
 
