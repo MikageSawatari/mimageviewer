@@ -125,6 +125,64 @@ fn open(app: &mut App, ctx: &egui::Context, row: &GridItem, auto: bool) {
     }
 }
 
+#[test]
+fn section1672_everything_physical_parent_selects_original_source_and_exits_results() {
+    for (book, ordinary_folder) in [
+        (Book::Folder, false),
+        (Book::Folder, true),
+        (Book::Zip, false),
+        (Book::Pdf, false),
+        (Book::Converted, false),
+    ] {
+        let mut app = setup_app_for_test();
+        app.active_quick_folder_slot = None;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.settings.auto_fullscreen_image_folders = false;
+        app.settings.detached_viewer_open_images_in_window = false;
+        let ctx = egui::Context::default();
+        let root = app.tmp.path().to_path_buf();
+        let (row, _) = fixture(&mut app, &root, book);
+        let source = row.drag_source_path().unwrap().to_owned();
+        if ordinary_folder {
+            std::fs::create_dir(source.join("child")).unwrap();
+        }
+        app.current_folder = Some(root.clone());
+        adopt(
+            &mut app,
+            &ctx,
+            "physical parent",
+            dataset(vec![row.clone()]),
+        );
+        assert!(!app.grid_physical_parent_action().available());
+        open(&mut app, &ctx, &row, false);
+        assert!(matches!(
+            app.grid_parent_action(),
+            crate::app::grid_parent::GridParentAction::GlobalSearchBack
+        ));
+        assert!(app.grid_physical_parent_action().available());
+        app.handle_grid_physical_parent_action();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.folder_pane_open_pending.is_some() || app.sidecar_restore_active() {
+            if let Some(ready) = app.poll_folder_pane_open(&ctx) {
+                assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+            }
+            app.poll_sidecar_restore(&ctx);
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(app.current_folder.as_ref(), Some(&root));
+        assert!(!app.global_search.active);
+        assert!(
+            app.selected
+                .is_some_and(|index| app.items[index].drag_source_path() == Some(source.as_path())),
+            "{book:?}/{ordinary_folder}"
+        );
+        assert!(
+            matches!(app.grid_parent_nav_target(), Some(crate::ui_main::AddressBarNav::Direct(ref parent, _)) if Some(parent.as_path()) == root.parent())
+        );
+    }
+}
+
 fn close_returns_results(book: Book) {
     let mut app = setup_app_for_test();
     let ctx = egui::Context::default();

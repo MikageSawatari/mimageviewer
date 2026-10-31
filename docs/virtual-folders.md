@@ -269,6 +269,29 @@ placeholder は採用後も同じ enumerate handle で検証する。取消・�
 
 ## 1. GridItem バリアント
 
+### 実際の親フォルダへの明示移動（§1.672）
+
+論理親とは別の `GridPhysicalParentFolder` は `app/grid_parent.rs` の副作用・同期 I/O のない
+`grid_physical_parent_action` で可否、実フォルダ、ExactPath の選択を一緒に解決する。
+表示中の合成 root（各 `items_are_*`、採用済み extracted recipe、Collection / Smart の root）を
+先に判定し、残っている current_folder や選択行から移動先を推測しない。
+合成 root から開いた物理子では、その context の採用済み状態から解決する。
+
+ZIP の prefix は実パスにしない。`archive_source_override`（変換元）を最優先し、なければ
+`zip_nav.tree.zip_path`（外側の実在書庫）、通常一覧では `current_folder` を使う。
+PDF / EPUB・画像フォルダ本も元の source の実親へ移り、元の source を選ぶ。
+変換キャッシュのパスは新操作の移動先／アドレス／tooltip へ出さない。
+各入力は既存 `JumpToFolderRequest { PhysicalDirectory, ExactPath }` の worker scan、
+adoption、選択復元へ載せる。新しい pending owner は作らない。
+成功時の `ExitTemporaryView` で検索・履歴／Bookmark・Smart の帰路を終え、Collection も
+既存の通常物理移動規則で退役する。ドライブルートだけは同じ ExitTemporaryView intent を
+既存のドライブ一覧 adoption へ渡す。固定一覧そのものは無効、固定一覧から開いた物理子は
+新操作の受付で既存 dismiss を使って固定を終える（移動失敗時も固定は復活しない）。
+
+簡素化は、既存の明示移動 owner と成功時採用を再利用すること。専用の選択待ち・rollback・
+帰路の第二所有者を増やさない。変換等の既存 modal admission を維持し、稀な失敗は既存の
+ログ＋通知に従う。論理親・Back / Forward・close と detached 述語／viewport は変更しない。
+
 ### 実パスの比較と入力表記 (§1.366)
 
 `folder_tree::path_eq` は既存の `path_key::eq_keep_drive` を再公開し、ドライブを保持した

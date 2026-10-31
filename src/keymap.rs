@@ -1640,6 +1640,7 @@ pub enum KeyAction {
     GridOpenSelectedAsList,
     GridOpenExternalPlayer,
     GridParentFolder,
+    GridPhysicalParentFolder,
     GridHistoryBack,
     GridHistoryForward,
     GridMoveFirst,
@@ -2249,6 +2250,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridOpenSelectedAsList,
     KeyAction::GridOpenExternalPlayer,
     KeyAction::GridParentFolder,
+    KeyAction::GridPhysicalParentFolder,
     KeyAction::GridHistoryBack,
     KeyAction::GridHistoryForward,
     KeyAction::GridMoveFirst,
@@ -4335,6 +4337,7 @@ impl KeyAction {
             GridOpenSelectedAsList => "GridOpenSelectedAsList",
             GridOpenExternalPlayer => "GridOpenExternalPlayer",
             GridParentFolder => "GridParentFolder",
+            GridPhysicalParentFolder => "GridPhysicalParentFolder",
             GridHistoryBack => "GridHistoryBack",
             GridHistoryForward => "GridHistoryForward",
             GridMoveFirst => "GridMoveFirst",
@@ -5107,6 +5110,7 @@ impl KeyAction {
             }
             GridOpenExternalPlayer => "選択中の動画を外部プレイヤーで開く",
             GridParentFolder => "親フォルダへ移動する",
+            GridPhysicalParentFolder => "実際の親フォルダへ移動する",
             GridHistoryBack => "フォルダ履歴を戻る",
             GridHistoryForward => "フォルダ履歴を進む",
             GridMoveFirst => "先頭の項目へ移動する",
@@ -5707,6 +5711,7 @@ impl KeyAction {
             | GridOpenSelectedAsList
             | GridOpenExternalPlayer
             | GridParentFolder
+            | GridPhysicalParentFolder
             | GridHistoryBack
             | GridHistoryForward
             | GridMoveFirst
@@ -6258,6 +6263,7 @@ impl KeyAction {
             | GridOpenSelectedAsList
             | GridOpenExternalPlayer
             | GridParentFolder
+            | GridPhysicalParentFolder
             | GridHistoryBack
             | GridHistoryForward
             | GridMoveFirst
@@ -6837,6 +6843,7 @@ impl KeyAction {
             GridOpenSelectedAsPage | GridOpenSelectedAsList => ChordList::EMPTY,
             GridOpenExternalPlayer => ChordList::one(Chord::shift(Enter)),
             GridParentFolder => ChordList::two(Chord::key(Backspace), Chord::alt(Up)),
+            GridPhysicalParentFolder => ChordList::EMPTY,
             GridHistoryBack => ChordList::one(Chord::alt(Left)),
             GridHistoryForward => ChordList::one(Chord::alt(Right)),
             GridMoveFirst => ChordList::one(Chord::key(Home)),
@@ -11285,6 +11292,7 @@ mod tests {
             "GridMoveFirst".to_string(),
             "GridMoveLast".to_string(),
             "GridParentFolder".to_string(),
+            "GridPhysicalParentFolder".to_string(),
             "TreeFolderPrev".to_string(),
             "TreeFolderNext".to_string(),
             "SiblingFolderPrev".to_string(),
@@ -12758,6 +12766,21 @@ mod tests {
 
     #[test]
     fn window_and_parent_actions_match_existing_default_shortcuts() {
+        assert_eq!(
+            KeyAction::GridPhysicalParentFolder.context(),
+            KeyContext::Grid
+        );
+        assert_eq!(
+            KeyAction::GridPhysicalParentFolder.trigger(),
+            KeyTrigger::Press
+        );
+        assert_eq!(
+            KeyAction::GridPhysicalParentFolder
+                .default_chords()
+                .iter()
+                .count(),
+            0
+        );
         assert_eq!(
             KeyAction::GridParentFolder
                 .default_chords()

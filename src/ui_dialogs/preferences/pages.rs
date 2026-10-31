@@ -2807,6 +2807,7 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
             RingActionId::CopyEditedImage
         }
         KeyAction::GridParentFolder => RingActionId::GridParentFolder,
+        KeyAction::GridPhysicalParentFolder => RingActionId::GridPhysicalParentFolder,
         KeyAction::GridTreeFolderPrev => RingActionId::TreeFolderPrev,
         KeyAction::GridTreeFolderNext => RingActionId::TreeFolderNext,
         KeyAction::GridSiblingFolderPrev => RingActionId::SiblingFolderPrev,
@@ -12458,6 +12459,17 @@ mod tests {
 
     #[test]
     fn settings_dialog_key_actions_map_to_grid_ring_actions() {
+        assert_eq!(
+            ring_bindings_for_key_action(KeyAction::GridPhysicalParentFolder),
+            vec![(
+                RingShortcutContext::Grid,
+                RingActionId::GridPhysicalParentFolder
+            )]
+        );
+        assert!(super::ring_action_has_key_action(
+            RingShortcutContext::Grid,
+            &RingActionId::GridPhysicalParentFolder
+        ));
         for action in [KeyAction::FsZoomIn, KeyAction::FsZoomOut] {
             assert!(ring_bindings_for_key_action(action).is_empty());
         }

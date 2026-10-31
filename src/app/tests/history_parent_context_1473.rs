@@ -93,6 +93,61 @@ fn install_physical(app: &mut App, pdf: &Path, return_to: Box<TopLevelGridOrigin
 }
 
 #[test]
+fn section1672_physical_parent_does_not_change_same_source_sibling() {
+    let mut app = setup_app();
+    app.active_quick_folder_slot = None;
+    let pdf = app.tmp.path().join("same.pdf");
+    std::fs::write(&pdf, b"fixture").unwrap();
+    let payload = nested_history_origin(app.tmp.path(), 16720);
+    install_physical(&mut app, &pdf, payload.clone(), false);
+    app.fullscreen_idx = None;
+    let sibling = app.build_window_context_for_test(16721, |owner| {
+        install_physical(owner, &pdf, payload, false);
+    });
+    let before = app
+        .with_viewer_context(sibling, |owner| {
+            (
+                returns(owner),
+                owner.items_generation,
+                owner.pdf_render_epoch.snapshot(),
+                owner.cancel_token.clone(),
+            )
+        })
+        .unwrap();
+    app.handle_grid_physical_parent_action();
+    let ctx = egui::Context::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while app.folder_pane_open_pending.is_some() || app.sidecar_restore_active() {
+        if let Some(ready) = app.poll_folder_pane_open(&ctx) {
+            assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+        }
+        app.poll_sidecar_restore(&ctx);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(app.current_folder.as_deref(), pdf.parent());
+    assert!(app.reading_history_return_from.is_none());
+    assert!(
+        app.selected
+            .is_some_and(|index| app.items[index].container_path() == Some(pdf.as_path()))
+    );
+    app.with_viewer_context(sibling, |owner| {
+        assert_eq!(returns(owner), before.0);
+        assert_eq!(owner.current_folder.as_ref(), Some(&pdf));
+        assert_eq!(owner.items_generation, before.1);
+        assert!(owner.pdf_render_epoch.snapshot().same_request(&before.2));
+        assert!(!before.2.is_stale());
+        assert!(std::sync::Arc::ptr_eq(&owner.cancel_token, &before.3));
+        assert!(
+            !owner
+                .cancel_token
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    })
+    .unwrap();
+}
+
+#[test]
 fn section1473_context_mount_swap_and_retire_keep_complete_return_owners_separate() {
     let mut app = setup_app();
     app.active_quick_folder_slot = None;

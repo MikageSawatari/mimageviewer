@@ -25397,7 +25397,11 @@ impl App {
         }
         match navigation.history {
             MainHistoryOperation::Direct(purpose) => {
-                self.record_folder_nav_entry_transition(destination, navigation.source_location);
+                self.record_folder_nav_entry_transition(
+                    destination,
+                    navigation.source_location,
+                    &purpose,
+                );
                 if let DirectNavigationPurpose::ExitTemporaryView { selection } = purpose {
                     if let Some((continuation, _)) = hydration.as_mut() {
                         continuation.navigation_after_hydration =
@@ -25431,6 +25435,13 @@ impl App {
 
     /// Prepared explicit Jump keeps its source mounted until this success-only memory tail.
     fn dismiss_transparent_view_for_admitted_jump(&mut self) {
+        // An explicit physical jump ends the logical return owner even when its
+        // destination happens to equal that owner's original book/container.
+        self.reading_history_return_from = None;
+        self.bookmark_view_state = None;
+        if self.top_level_grid_view.smart_folder().is_some() {
+            self.clear_smart_folder_view_state();
+        }
         if self.global_search.active {
             let _ = self.dismiss_global_search_without_restore();
         }
@@ -26176,13 +26187,18 @@ impl App {
             FolderNavHistoryEntry::new(location, self.facet_navigation.route().clone())
         });
         let target = self.main_list_destination_entry(target, current.as_ref(), None);
-        self.record_folder_nav_entry_transition(target, current);
+        self.record_folder_nav_entry_transition(
+            target,
+            current,
+            &DirectNavigationPurpose::Navigation,
+        );
     }
 
     fn record_folder_nav_entry_transition(
         &mut self,
         target: FolderNavHistoryEntry,
         current: Option<FolderNavHistoryEntry>,
+        purpose: &DirectNavigationPurpose,
     ) {
         if !self.main_folder_history_available() {
             return;
@@ -26218,7 +26234,10 @@ impl App {
                 crate::folder_tree::path_eq(current, &synthetic)
                     || state.contains_scoped_path(current)
             });
-            if current_in_scope && state.contains_scoped_path(target_path) {
+            if !matches!(purpose, DirectNavigationPurpose::ExitTemporaryView { .. })
+                && current_in_scope
+                && state.contains_scoped_path(target_path)
+            {
                 self.set_active_folder_nav_suppress_record_once(false);
                 return;
             }
@@ -26763,10 +26782,13 @@ impl App {
             history,
             MainHistoryOperation::Direct(_) | MainHistoryOperation::Replay(_)
         );
-        if self.global_search.active
+        if !matches!(
+            history,
+            MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView { .. })
+        ) && (self.global_search.active
             || self.favsearch.active
             || self.tag_view.active
-            || self.suppress_nav_record_for_search_restore
+            || self.suppress_nav_record_for_search_restore)
         {
             history = MainHistoryOperation::Restore { route: None };
         }
@@ -30269,6 +30291,12 @@ impl App {
             return self.report_pdf_open_refusal(&path, reason);
         }
         if matches!(owner, OpenRequestOwner::Navigation)
+            && !navigation.as_ref().is_some_and(|navigation| {
+                matches!(
+                    navigation.history,
+                    MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView { .. })
+                )
+            })
             && !self.navigation_scope.is_detached_physical()
             && let Some(kind) = self.smart_physical_target_kind(&path)
         {
@@ -30682,6 +30710,12 @@ impl App {
             return self.report_pdf_open_refusal(&path, reason);
         }
         if matches!(owner, OpenRequestOwner::Navigation)
+            && !navigation.as_ref().is_some_and(|navigation| {
+                matches!(
+                    navigation.history,
+                    MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView { .. })
+                )
+            })
             && !self.navigation_scope.is_detached_physical()
             && let Some(kind) = self.smart_physical_target_kind(&path)
             && kind != smart_folder::SmartChildKind::ConvertibleArchive
@@ -57615,6 +57649,12 @@ impl App {
         if self.keymap.consume_action(ctx, KeyAction::GridParentFolder) {
             return self.handle_stack_refresh_parent_action();
         }
+        if self
+            .keymap
+            .consume_action(ctx, KeyAction::GridPhysicalParentFolder)
+        {
+            return self.handle_grid_physical_parent_action();
+        }
         let history_shortcut_allowed = !self.global_search.active
             && !self.favsearch.active
             && !self.tag_view.active
@@ -58457,6 +58497,17 @@ impl App {
         if parent_key {
             crate::modifier_probe::record_modified_action(ctx, "GridParentFolder", "keymap");
             return self.handle_grid_parent_folder_action();
+        }
+        if self
+            .keymap
+            .consume_action(ctx, KeyAction::GridPhysicalParentFolder)
+        {
+            crate::modifier_probe::record_modified_action(
+                ctx,
+                "GridPhysicalParentFolder",
+                "keymap",
+            );
+            return self.handle_grid_physical_parent_action();
         }
 
         let history_shortcut_allowed = !self.global_search.active

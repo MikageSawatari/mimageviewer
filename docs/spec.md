@@ -325,6 +325,15 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
 
 ### 2.2 フォルダバー
 
+- **実際の親フォルダへ移動**: 既定非表示の独立したフォルダ＋上矢印ボタン。
+  バーの右クリック設定から表示を選ぶ。通常フォルダでは物理親へ移り元フォルダを選ぶ。
+  ZIP の内部階層・PDF・変換書庫では外側の元ファイルの実親へ移り元ファイルを選ぶ。
+  画像フォルダの本も元フォルダの親へ移る。結果一覧の root は無効、そこから開いた
+  実フォルダ・本は有効。ドライブルートはドライブ一覧へ移る。tooltip は行先／無効理由を示す。
+  明示移動の成功時に結果一覧の帰路を解消し、通常一覧へ移る。固定一覧の子からの新操作は
+  受付時に固定を解除する。既存の論理親・戻る／進む・全画面 close は変更しない。
+  `GridPhysicalParentFolder` は Grid / Press / 既定なしで、各種入力の割当候補にも含める。
+
 - テキストボックスにフォルダのフルパスを入力
 - **Enter** キーでそのフォルダを開く
 - フォルダ移動時に自動更新される
@@ -2659,6 +2668,7 @@ typed event の送信だけを行い、前面化しない。受付できない�
 | `show_address_bar_history_nav` | bool | true | フォルダバーに履歴の戻る/進む (←/→) を表示 |
 | `show_address_bar_quick_folders` | bool | true | フォルダバーに A/B クイックフォルダボタンを表示 |
 | `show_toolbar_parent_button` | bool | true | フォルダバーに親フォルダ (⬆) を表示 |
+| `show_toolbar_physical_parent_button` | bool | false | フォルダバーに実際の親フォルダへの移動ボタンを表示。欠落時も false。通常の設定保存・書き出し／取り込みの対象 |
 | `show_toolbar_prev_folder` / `show_toolbar_next_folder` | bool | true | フォルダバーにツリー順の前/次フォルダ (▲/▼) を表示。設定画面ではペアとして扱う |
 | `show_address_bar_favorite_button` | bool | true | フォルダバーにお気に入り追加/設定 (♡/♥) を表示 |
 | `show_address_bar_history_menu` | bool | true | フォルダバーに最近開いたフォルダ履歴メニューを表示 |

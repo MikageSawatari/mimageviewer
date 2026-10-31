@@ -518,6 +518,12 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 
 ## 10. 新しいキー操作を追加するとき (保守 runbook)
 
+§1.672: `GridPhysicalParentFolder` は Grid / Press / 既定未割り当て。
+リング系 `GridPhysicalParentFolder` と対応し、マウスボタン・リング・ジェスチャ・
+ゲームパッドの Grid 候補にも含む。各 dispatcher とフォルダバーは
+`App::grid_physical_parent_action` / `handle_grid_physical_parent_action` を使う。
+従来の `GridParentFolder` の既定・意味・固定入力は変更しない。
+
 §1.470: `FsZoomIn` / `FsZoomOut` は `FsImage` / `Press` のキーボード専用操作。
 既定は拡大 `Period`（`.`）/ `NumpadAdd`、縮小 `Comma`（`,`）/ `NumpadSubtract`。
 表示の `+` は settings.db / JSON 保存時には既存の `Shift+;` を維持する。chord 解析は既存の

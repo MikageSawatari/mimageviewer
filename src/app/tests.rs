@@ -100582,6 +100582,69 @@ mod smart_folder_transition_tests {
     }
 
     #[test]
+    fn section1672_smart_scoped_physical_parent_exits_session_on_success() {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let source = app.tmp.path().join("physical-parent-smart");
+        let entry = source.join("entry-a");
+        let child = entry.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("page.jpg"), []).unwrap();
+        let mut definition = definition("Physical Parent", source.clone());
+        definition.rules[0].filter.name_contains = "entry-a".into();
+        let id = definition.id;
+        app.settings.smart_folders = vec![definition];
+        let ctx = egui::Context::default();
+        app.open_smart_folder(id, false);
+        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        assert!(!app.grid_physical_parent_action().available());
+        app.open_staged_smart_folder_and_wait(&ctx, &entry);
+        assert!(app.start_smart_folder_scope_nav(true, false));
+        drain_smart_folder_nav(&mut app, &ctx);
+        assert_eq!(app.current_folder.as_ref(), Some(&child));
+        let old_back = app.folder_nav_back_stack.len();
+        app.folder_nav_forward_stack
+            .push(FolderNavHistoryTarget::Path(source.clone()).into());
+        app.handle_grid_physical_parent_action();
+        assert!(app.top_level_grid_view.smart_folder().is_some());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while app.folder_pane_open_pending.is_some() || app.sidecar_restore_active() {
+            if let Some(ready) = app.poll_folder_pane_open(&ctx) {
+                assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+            }
+            app.poll_sidecar_restore(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(app.current_folder.as_ref(), Some(&entry));
+        assert!(app.top_level_grid_view.smart_folder().is_none());
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            top_level_grid_view::TopLevelGridSurface::Folder
+        ));
+        assert!(
+            app.selected
+                .is_some_and(|index| app.items[index].container_path() == Some(child.as_path()))
+        );
+        assert!(
+            matches!(app.grid_parent_nav_target(), Some(crate::ui_main::AddressBarNav::Direct(ref path, _)) if path == &source)
+        );
+        assert_eq!(app.folder_nav_back_stack.len(), old_back + 1);
+        assert!(app.folder_nav_forward_stack.is_empty());
+        assert!(
+            matches!(app.folder_nav_back_stack.last().map(|entry| &entry.location), Some(FolderNavHistoryTarget::SmartFolder(state)) if state.scoped_current() == Some(child.as_path()))
+        );
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+        super::history_parent_1473::settle(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&child));
+        assert!(app.top_level_grid_view.smart_folder().is_some());
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
+        super::history_parent_1473::settle(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&entry));
+        assert!(app.top_level_grid_view.smart_folder().is_none());
+    }
+
+    #[test]
     fn smart_folder_nested_child_return_selects_its_containing_root_entry() {
         let mut app = setup_app();
         app.active_quick_folder_slot = None;

@@ -1824,6 +1824,7 @@ fn grid_ring_action_allowed_during_refresh(action: &RingActionId) -> bool {
                 | RingActionId::GridHistoryBack
                 | RingActionId::GridHistoryForward
                 | RingActionId::GridParentFolder
+                | RingActionId::GridPhysicalParentFolder
                 | RingActionId::TreeFolderPrev
                 | RingActionId::TreeFolderNext
                 | RingActionId::SiblingFolderPrev
@@ -8375,6 +8376,9 @@ impl App {
             RingActionId::GridHistoryForward => self.apply_folder_history_nav(true, source),
             RingActionId::GridParentFolder if context == RingShortcutContext::Grid => {
                 self.handle_gamepad_grid_back()
+            }
+            RingActionId::GridPhysicalParentFolder if context == RingShortcutContext::Grid => {
+                self.handle_grid_physical_parent_action()
             }
             RingActionId::TreeFolderPrev => {
                 self.apply_tree_folder_nav(ctx, false, source);
