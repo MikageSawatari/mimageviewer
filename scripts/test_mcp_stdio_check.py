@@ -140,7 +140,7 @@ class DirectClientTests(unittest.TestCase):
     def check_process(self, process, **kwargs):
         factory = mock.Mock(return_value=process)
         report = client.run_check(["FAKE_SERVER", "--data-dir", "FAKE_DATA"],
-                                  popen_factory=factory, timeout=0.5, **kwargs)
+                                  popen_factory=factory, timeout=5, **kwargs)
         factory.assert_called_once()
         return report, factory
 
@@ -165,6 +165,7 @@ class DirectClientTests(unittest.TestCase):
         self.assertEqual(options["stdin"], client.subprocess.PIPE)
         self.assertIn("隔離した応答", report["stdout"])
         self.assertGreaterEqual(report["duration_seconds"], 0)
+        self.assertFalse(process.killed.is_set())
 
     def test_list_only_with_notification_and_parallel_stderr(self):
         def handler(process, request):
@@ -172,7 +173,7 @@ class DirectClientTests(unittest.TestCase):
                 # This wait can finish only if the stderr reader runs while the
                 # protocol thread is awaiting its stdout response.
                 process.stderr.feed(b"diagnostic\n" * 1000)
-                deadline = time.monotonic() + 0.2
+                deadline = time.monotonic() + 2
                 while not process.stderr.queue.empty() and time.monotonic() < deadline:
                     time.sleep(0.001)
                 self.assertTrue(process.stderr.queue.empty())
@@ -192,13 +193,50 @@ class DirectClientTests(unittest.TestCase):
 
     def test_tool_is_error_remains_reported_as_valid_transport(self):
         def handler(process, request):
+            if request["method"] == "tools/list":
+                process.reply(request["id"], {"tools": [{"name": "miv_status"}]})
+                return True
             if request["method"] == "tools/call":
-                process.reply(request["id"], {"isError": True, "content": []})
+                process.reply(request["id"], {"isError": True, "content": [
+                    {"type": "text", "text": "mIV が起動していません"}]})
                 return True
             return False
-        report, _ = self.check_process(FakeProcess(handler=handler), tool_name="miv_status")
+        process = FakeProcess(handler=handler)
+        report, _ = self.check_process(process, tool_name="miv_status")
         self.assertEqual(report["errors"], [])
+        self.assertEqual(report["responses"][1]["result"]["tools"], [{"name": "miv_status"}])
         self.assertTrue(report["responses"][-1]["result"]["isError"])
+        self.assertEqual(report["exit_code"], 0)
+        self.assertTrue(report["stdin_closed"] and report["stdout_eof"] and report["stderr_eof"])
+        self.assertFalse(process.killed.is_set())
+
+    def test_rpc_error_keeps_response_and_checks_natural_exit_after_eof(self):
+        for method, request_id, exit_code in (("tools/list", 2, 0), ("tools/list", 2, 9),
+                                               ("initialize", 1, 0), ("tools/call", 3, 0)):
+            with self.subTest(method=method, exit_code=exit_code):
+                response = {"jsonrpc": "2.0", "id": request_id,
+                            "error": {"code": -32603, "message": "expected fixture error"}}
+                def handler(process, request):
+                    if request["method"] == method:
+                        process.stdout.feed((json.dumps(response) + "\n").encode())
+                        process.stderr.feed(b"natural shutdown diagnostic\n")
+                        return True
+                    return False
+                process = FakeProcess(handler=handler, normal_exit=exit_code)
+                report, _ = self.check_process(process, tool_name="miv_status")
+                # Assert cardinality before indexing, retaining the entire
+                # report (especially timeout/raw streams) if scheduling stalls.
+                self.assertEqual(len(report["responses"]), request_id, report)
+                self.assertEqual(report["responses"][-1], response, report)
+                self.assertTrue(report["errors"], report)
+                self.assertEqual(report["errors"][0], "JSON-RPC error for " + method, report)
+                self.assertEqual(report["exit_code"], exit_code, report)
+                self.assertTrue(report["stdin_closed"] and report["stdout_eof"] and report["stderr_eof"], report)
+                self.assertEqual(process.requests[-1]["method"], method, report)
+                self.assertIn("natural shutdown diagnostic", report["stderr"], report)
+                self.assertFalse(process.killed.is_set(), report)
+                if exit_code:
+                    self.assertIn("server exited with code 9", report["errors"], report)
 
     def test_early_eof_reports_exit_and_raw_diagnostics(self):
         def handler(process, request):
@@ -232,7 +270,6 @@ class DirectClientTests(unittest.TestCase):
         variants = [
             ({"jsonrpc": "2.0", "id": 9, "result": {}}, "unexpected response id"),
             ({"jsonrpc": "2.0", "id": True, "result": {}}, "unexpected response id"),
-            ({"jsonrpc": "2.0", "id": 1, "error": {"code": -1}}, "JSON-RPC error"),
             ({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "other"}}, "protocol version"),
             ({"jsonrpc": "2.0", "id": 1, "method": "ping"}, "unsupported"),
         ]
@@ -250,6 +287,24 @@ class DirectClientTests(unittest.TestCase):
             return False
         report, _ = self.check_process(FakeProcess(handler=missing_tools))
         self.assertIn("tools array", report["errors"][0])
+
+    def test_invalid_rpc_error_fields_are_protocol_violations(self):
+        for error in (None, [], {}, {"code": -1}, {"message": "missing code"},
+                      {"code": True, "message": "bool code"},
+                      {"code": -1.0, "message": "float code"},
+                      {"code": "-1", "message": "string code"},
+                      {"code": -1, "message": None}, {"code": -1, "message": 7}):
+            with self.subTest(error=error):
+                def handler(process, request):
+                    process.stdout.feed((json.dumps({"jsonrpc": "2.0", "id": 1,
+                                                     "error": error}) + "\n").encode())
+                    return True
+                process = FakeProcess(handler=handler)
+                report, _ = self.check_process(process)
+                self.assertTrue(report["errors"], report)
+                self.assertEqual(report["errors"][0], "invalid JSON-RPC error response", report)
+                self.assertFalse(report["responses"], report)
+                self.assertTrue(process.killed.is_set(), report)
 
     def test_nonzero_exit_after_eof(self):
         report, _ = self.check_process(FakeProcess(normal_exit=3))

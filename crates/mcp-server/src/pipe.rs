@@ -56,6 +56,27 @@ impl CallControl {
     }
 }
 
+/// Adapter-local transport state is distinct from a reachable core's NotReady.
+/// Keep this off the agent wire: readiness errors must not advertise tools.
+#[derive(Debug)]
+pub enum BackendError {
+    Unreachable,
+    Agent(AgentError),
+}
+pub type BackendResult = Result<Payload, BackendError>;
+impl From<AgentError> for BackendError {
+    fn from(error: AgentError) -> Self {
+        Self::Agent(error)
+    }
+}
+impl BackendError {
+    pub fn into_agent(self) -> AgentError {
+        match self {
+            Self::Unreachable => unavailable(),
+            Self::Agent(error) => error,
+        }
+    }
+}
 pub trait Backend: Send + Sync + 'static {
     fn call(
         &self,
@@ -63,7 +84,7 @@ pub trait Backend: Send + Sync + 'static {
         client: &ClientIdentity,
         kind: RequestKind,
         control: Arc<CallControl>,
-    ) -> Result<Payload, AgentError>;
+    ) -> BackendResult;
 }
 pub struct PipeBackend {
     pipe_name: String,
@@ -98,32 +119,51 @@ fn unavailable() -> AgentError {
 fn invalid_response() -> AgentError {
     AgentError::new(ErrorCode::Internal, "mIV からの応答を確認できませんでした")
 }
-fn connection_error(error: io::Error) -> AgentError {
+fn connection_error(error: io::Error) -> BackendError {
     match error.raw_os_error() {
-        Some(2) => unavailable(), // ERROR_FILE_NOT_FOUND
+        Some(2) => BackendError::Unreachable, // ERROR_FILE_NOT_FOUND only
         Some(231) => AgentError::new(
             ErrorCode::Busy,
             "mIV の AI 連携が混み合っています。少し待ってからもう一度お試しください",
-        ),
+        ).into(),
         Some(5) => AgentError::new(
             ErrorCode::Internal,
             "mIV への接続が拒否されました。mIV と AI アプリを同じユーザーの通常の権限で起動してください",
-        ),
+        ).into(),
         code => {
             // Diagnostics contain the OS code only, never the pipe/data path.
             eprintln!("mimageviewer-mcp: pipe connect failed; os_error={code:?}");
-            AgentError::new(ErrorCode::Internal, "mIV に接続できませんでした")
+            AgentError::new(ErrorCode::Internal, "mIV に接続できませんでした").into()
         }
     }
 }
-fn receive(file: &mut PipeStream, id: u64) -> Result<Payload, AgentError> {
-    let response: Response = read_frame(file)
-        .map_err(|_| unavailable())?
-        .ok_or_else(unavailable)?;
-    if response.id != id {
-        return Err(invalid_response());
+fn communication_error(error: io::Error) -> BackendError {
+    if matches!(error.raw_os_error(), Some(109 | 232 | 233))
+        || matches!(
+            error.kind(),
+            io::ErrorKind::BrokenPipe
+                | io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+        )
+    {
+        BackendError::Unreachable
+    } else {
+        eprintln!(
+            "mimageviewer-mcp: pipe communication failed; os_error={:?}",
+            error.raw_os_error()
+        );
+        invalid_response().into()
     }
-    response.result
+}
+fn receive(file: &mut PipeStream, id: u64) -> BackendResult {
+    let response: Response = read_frame(file)
+        .map_err(communication_error)?
+        .ok_or(BackendError::Unreachable)?;
+    if response.id != id {
+        return Err(invalid_response().into());
+    }
+    response.result.map_err(Into::into)
 }
 
 /// Only opens need foreground permission. Failure remains diagnostic-only and
@@ -180,12 +220,12 @@ impl Backend for PipeBackend {
         client: &ClientIdentity,
         kind: RequestKind,
         control: Arc<CallControl>,
-    ) -> Result<Payload, AgentError> {
+    ) -> BackendResult {
         let mut reader = PipeStream::connect(&self.pipe_name).map_err(connection_error)?;
         let _lease = WriterLease(control.clone());
         let mut writer = control.writer.lock().map_err(|_| invalid_response())?;
         if control.cancelled.load(Ordering::Acquire) {
-            return Err(AgentError::new(ErrorCode::Cancelled, "取り消しました"));
+            return Err(AgentError::new(ErrorCode::Cancelled, "取り消しました").into());
         }
         *writer = Some(InFlight {
             file: reader.clone(),
@@ -207,22 +247,22 @@ impl Backend for PipeBackend {
                 },
             },
         )
-        .map_err(|_| unavailable())?;
+        .map_err(communication_error)?;
         drop(writer);
         match receive(&mut reader, 1)? {
             Payload::Hello { version } => check_version(version)?,
-            _ => return Err(invalid_response()),
+            _ => return Err(invalid_response().into()),
         }
         {
             let mut writer = control.writer.lock().map_err(|_| invalid_response())?;
             if control.cancelled.load(Ordering::Acquire) {
-                return Err(AgentError::new(ErrorCode::Cancelled, "取り消しました"));
+                return Err(AgentError::new(ErrorCode::Cancelled, "取り消しました").into());
             }
             let writer = writer.as_mut().unwrap();
             writer.request_id = 2;
             best_effort_open_foreground(&command, &reader);
             write_frame(&mut writer.file, &Request { id: 2, command })
-                .map_err(|_| unavailable())?;
+                .map_err(communication_error)?;
         }
         // The only reader owns blocking I/O. Cancellation writes use its cloned handle.
         receive(&mut reader, 2)
@@ -285,20 +325,63 @@ mod tests {
         );
     }
     #[test]
+    fn only_missing_pipe_and_disconnected_transport_are_unreachable() {
+        for code in [109, 232, 233] {
+            assert!(matches!(
+                communication_error(io::Error::from_raw_os_error(code)),
+                BackendError::Unreachable
+            ));
+        }
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+        ] {
+            assert!(matches!(
+                communication_error(io::Error::from(kind)),
+                BackendError::Unreachable
+            ));
+        }
+        for code in [3, 5, 6, 121, 231] {
+            assert!(matches!(
+                connection_error(io::Error::from_raw_os_error(code)),
+                BackendError::Agent(_)
+            ));
+        }
+        assert!(matches!(
+            communication_error(io::Error::new(io::ErrorKind::InvalidData, "invalid frame")),
+            BackendError::Agent(AgentError {
+                code: ErrorCode::Internal,
+                ..
+            })
+        ));
+        let core_not_ready: BackendError = unavailable().into();
+        assert!(matches!(
+            core_not_ready,
+            BackendError::Agent(AgentError {
+                code: ErrorCode::NotReady,
+                ..
+            })
+        ));
+    }
+    #[test]
     fn connection_error_mapping_distinguishes_busy_missing_denied_and_other() {
         let missing = connection_error(io::Error::from_raw_os_error(2));
+        assert!(matches!(missing, BackendError::Unreachable));
+        let missing = missing.into_agent();
         assert_eq!(missing.code, ErrorCode::NotReady);
         assert_eq!(
             missing.message,
             "mIV が起動していません。mIV を起動してからもう一度お試しください"
         );
-        let busy = connection_error(io::Error::from_raw_os_error(231));
+        let busy = connection_error(io::Error::from_raw_os_error(231)).into_agent();
         assert_eq!(busy.code, ErrorCode::Busy);
         assert_eq!(
             busy.message,
             "mIV の AI 連携が混み合っています。少し待ってからもう一度お試しください"
         );
-        let denied = connection_error(io::Error::from_raw_os_error(5));
+        let denied = connection_error(io::Error::from_raw_os_error(5)).into_agent();
         assert_eq!(denied.code, ErrorCode::Internal);
         assert_eq!(
             denied.message,
@@ -308,7 +391,7 @@ mod tests {
             io::Error::from_raw_os_error(6),
             io::Error::other("private diagnostic path"),
         ] {
-            let error = connection_error(error);
+            let error = connection_error(error).into_agent();
             assert_eq!(error.code, ErrorCode::Internal);
             assert_eq!(error.message, "mIV に接続できませんでした");
         }
@@ -505,6 +588,7 @@ mod tests {
                 done.recv_timeout(Duration::from_secs(5))
                     .unwrap()
                     .unwrap_err()
+                    .into_agent()
                     .code,
                 ErrorCode::Cancelled
             );

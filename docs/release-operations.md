@@ -163,7 +163,13 @@ cargo build --release -p mimageviewer-launcher --bin mimageviewer
 閉じた後の終了コードと所要時間を JSON で報告する。エージェントは製品を起動しない。
 
 launcher 単独は APPDATA と data dir の両方を一時的な検証先へ向ける。core は起動しないので、
-`miv_status` が「mIV が起動していません」の tool error を返すのが期待結果 (通信検査自体は成功)。
+`initialize` が成功し、`tools/list` が `miv_status` だけを含む成功応答を返し、`miv_status` を呼ぶと
+「mIV が起動していません」の tool error を返すのが期待結果。その後、標準入力の EOF で標準出力・
+標準エラーも EOF となり、終了コード 0 で自然終了することまで確認する (通信検査自体は成功)。
+
+一般の JSON-RPC error 応答も応答一覧とエラー欄へ記録し、その時点で後続要求を止める。その場合も
+強制終了せず、標準入力を閉じて両出力の EOF と自然終了のコードを確認する (client の終了コードは 1)。
+期限超過や不正なプロトコルでは、検証対象を強制終了してその結果を報告する。
 
 ```powershell
 $mcpCheckRoot = Join-Path $PWD 'target\mcp-launcher-check'

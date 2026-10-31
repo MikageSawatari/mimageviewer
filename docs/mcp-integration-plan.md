@@ -3492,3 +3492,92 @@ cross-user marker・利用中の install/uninstall 拒否は、設計どおり s
 直接 stdio の具体的な PowerShell は `release-operations.md` §2.4。通常 APPDATA/runtime に
 変化がないことも外部担当が確認する。本 sandbox では未確認であり、配布成功は主張しない。
 追加判断後に未解決の設計矛盾は見つかっていない。commit はしていない。
+
+### 20.10 修正 1 回目 (2026-11-01)
+
+基点 `6e00cb8c0` (`d41520f7f` の実装と、その後の §15.8 の設計変更)。観測者を以下で区別する。
+
+**sandbox 外の受領済み証拠 (ClaudeCode が実行、修正前)**:
+
+- PowerShell safety 3本 PASS。`build-release.ps1 -PreserveRuntime` exit 0、5 exe を生成。
+- launcher test 51成功/1 ignored、agent-ipc 13/13、MCP 54/54。
+- 使い捨て portable core に対し、temp APPDATA の launcher `--mcp` と loose adapter の両方で
+  `list_folder` 7件、stdin close 後 exit 0。2 launcher の最後が閉じるまで marker が残り、
+  利用者の runtime dir は不変だった。
+- core 無しでは initialize は成功、tools/list は JSON-RPC -32603 となり、旧 client script は
+  そこで中断した。この観測と独立レビュー P2 を受けた修正である。以下の fixture 成功を実機成功とは扱わない。
+
+**変更と判断 (実装担当)**:
+
+1. `scripts/mcp_stdio_check.py` は、正常に完結した JSON-RPC error を protocol 違反と分けた。
+   応答を `responses` と診断へ残し、後続要求を止め、stdin を閉じ、stdout/stderr EOF と
+   自然終了の実 code まで確認する。その応答自体では kill しない。
+   汎用 JSON-RPC error があれば client は exit 1、server の実 exit code はそのまま report に残す。
+   `isError=true` の tool result は従来どおり通信成功である。error object の code (整数、bool 不可) と
+   message (文字列) も最小検査し、不正な応答は protocol 違反として扱う。
+2. `crates/mcp-server/src/pipe.rs` に adapter 内だけの `BackendError::{Unreachable, Agent}` を設けた。
+   core からの `NotReady` と transport の不在を message の文字列や bool で判別しない。
+   agent IPC wire/版は変更していない。
+   - connect: `ERROR_FILE_NOT_FOUND` (2) のみ Unreachable。busy (231、既存2秒待ち後) は Busy、
+     access denied (5) は従来の専用文の Internal、その他 (path not found 3、timeout 121 等も含む) は
+     Internal のまま。OS code だけを stderr に記録する既存方針を維持する。
+   - 接続後: clean EOF、broken pipe (109)、no data (232)、pipe not connected (233)、
+     `BrokenPipe` / `UnexpectedEof` / `ConnectionReset` / `ConnectionAborted` は Unreachable。
+     不正 frame/JSON、応答 id 不一致、その他 I/O は Internal。core のエラーと版不一致は Agent のまま。
+   - tool 応答へ変換する時だけ Unreachable を既存 NotReady と
+     「mIV が起動していません。mIV を起動してからもう一度お試しください」に戻す。
+3. `lib.rs` の discovery と5秒 observer は同じ `permission_tools` を使う。
+   Unreachable は `{miv_status}`、Disabled は空集合、PermissionChanged 等は不明のまま (集合を更新しない)。
+   旧版は offline の集合から許可済みの集合へ変わると list_changed を送る。
+   modern は同じ集合と `ttlMs=0` / `cacheScope=private` を返す。
+   `schema.rs` は既存 tool 定義を名前で選ぶ共通関数を足しただけで、annotation/schema は維持した。
+   core での要求ごとの permission 判定は変更していない。
+4. `docs/release-operations.md` §2.4 は実際の期待順を initialize 成功 → tools/list 成功
+   (`miv_status` のみ) → optional miv_status は tool error → stdin EOF → 両出力 EOF → 自然 exit 0
+   と記述した。汎用 JSON-RPC error 時も自然終了を観測する手順を記録した。
+
+**回帰テスト**:
+
+- `scripts/test_mcp_stdio_check.py`: tools/list error 後、stdin EOF で自然 exit 0/9、応答と診断・両出力 EOF・
+  kill 無しを確認。initialize/call の error、成功、no-core の最小 list + status tool error も確認。
+  不正な error object を protocol 違反とする fixture も追加した。
+- 正常 Python fixture を最初に実装担当が実行した時は exit 1 (14件中1 error、応答一覧が空の時に
+  assertion が IndexError となった)。元 report が失われ原因の断定はできないが、500ms budget は
+  負荷時の scheduling 遅延と整合した。正常 fixture は5秒、timeout 試験は明示的な短い期限に分離し、
+  assertion 失敗時は report 全体を残すようにした。retry は追加していない。
+- `pipe.rs` は transport と core error の分類を追加検証。
+- `tests.rs` の新規ケースは3版全てで最小 list/status error、起動後の許可 list、Disabled、
+  PermissionChanged 非更新を通す。旧2版は実際の5秒 poll で復帰通知を確認する。
+  既存 stale poll/observer revision の回帰も維持した。
+
+**実行結果 (以下は実装担当自身、sandbox 内)**:
+
+| コマンド | 実 exit | 結果 |
+|---|---:|---|
+| `cargo fmt` | 0 | workspace 全体 |
+| `cargo fmt --check` | 0 | `target/mcp-1e-fix1-fmt-check.log` |
+| `cargo check -p mimageviewer-mcp --tests` | 0 | `target/mcp-1e-fix1-check.log` |
+| `cargo test -p mimageviewer-mcp unreachable_core_discovery_and_recovery_for_all_protocols -- --nocapture` | 0 | 1件、3版の全経路。`target/mcp-1e-fix1-discovery-test.log` |
+| `cargo test -p mimageviewer-launcher` | 0 | 51成功/1 ignored、`target/mcp-1e-fix1-launcher-tests.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 101 | agent-ipc 13/13、MCP 54成功/2失敗。`target/mcp-1e-fix1-crate-tests.log` |
+| `python -I -m py_compile scripts/mcp_stdio_check.py scripts/test_mcp_stdio_check.py` | 0 | 最終 source の構文検査 |
+| `python -I scripts/test_mcp_stdio_check.py` (最終) | 0 | 15/15、`target/mcp-1e-fix1-python-tests-final.log` |
+| `git diff --check` | 0 | LF/CRLF warning のみ、`target/mcp-1e-fix1-diff-check.log` |
+
+失敗2件は従来と同じ `real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld` と
+`real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked`。fixture probe の pipe open で
+OS error 5。skip/ignore には変更していない。
+
+sandbox 外で必要なコマンド (ClaudeCode 担当):
+
+```powershell
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+.\scripts\build-release.ps1 -PreserveRuntime
+cargo test -p mimageviewer-launcher
+$mcpCheckRoot = Join-Path $PWD 'target\mcp-launcher-check'
+python -I .\scripts\mcp_stdio_check.py --env "APPDATA=$mcpCheckRoot\appdata" --call miv_status -- .\target\release\mimageviewer.exe --mcp --data-dir "$mcpCheckRoot\data"
+```
+
+release の再 build は変更した adapter を launcher に内包し直すため。最後は core のいない隔離 data dir で
+§2.4 の期待順と自然終了を確認する。修正後の実 launcher 通信はこの sandbox では未実施。
+製品/AI アプリの起動、実 client config の読書き、commit はしていない。追加の設計矛盾は無い。

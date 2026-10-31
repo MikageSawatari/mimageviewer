@@ -451,7 +451,7 @@ fn stage1b_all_protocols_transport_folder_pages_and_webp_blocks() {
             client: &ClientIdentity,
             kind: RequestKind,
             control: Arc<CallControl>,
-        ) -> Result<Payload, AgentError> {
+        ) -> BackendResult {
             match command {
                 Command::Status => Ok(Payload::Status(StatusPayload {
                     app_version: "fixture".into(),
@@ -577,7 +577,7 @@ impl Backend for Fixture {
         _: &ClientIdentity,
         _: RequestKind,
         _: Arc<CallControl>,
-    ) -> Result<Payload, AgentError> {
+    ) -> BackendResult {
         Ok(match command {
             Command::Status => Payload::Status(StatusPayload {
                 app_version: "test".into(),
@@ -747,7 +747,7 @@ impl Backend for IdentityProbe {
         client: &ClientIdentity,
         kind: RequestKind,
         control: Arc<CallControl>,
-    ) -> Result<Payload, AgentError> {
+    ) -> BackendResult {
         self.calls
             .send((command.clone(), client.clone(), kind))
             .unwrap();
@@ -997,7 +997,7 @@ fn stage1c_all_protocols_refresh_open_permission_and_transport_accepted_result()
             _: &ClientIdentity,
             _: RequestKind,
             _: Arc<CallControl>,
-        ) -> Result<Payload, AgentError> {
+        ) -> BackendResult {
             match command {
                 Command::Status => Ok(Payload::Status(StatusPayload {
                     app_version: "fixture".into(),
@@ -1192,10 +1192,10 @@ impl Backend for Blocked {
         _: &ClientIdentity,
         _: RequestKind,
         control: Arc<CallControl>,
-    ) -> Result<Payload, AgentError> {
+    ) -> BackendResult {
         self.started.send(control).unwrap();
         self.release.lock().unwrap().recv().unwrap();
-        Err(AgentError::new(ErrorCode::Cancelled, "Cancelled."))
+        Err(AgentError::new(ErrorCode::Cancelled, "Cancelled.").into())
     }
 }
 #[test]
@@ -1304,11 +1304,8 @@ impl Backend for Disabled {
         _: &ClientIdentity,
         _: RequestKind,
         _: Arc<CallControl>,
-    ) -> Result<Payload, AgentError> {
-        Err(AgentError::new(
-            ErrorCode::Disabled,
-            "AI 連携 (MCP) は無効です",
-        ))
+    ) -> BackendResult {
+        Err(AgentError::new(ErrorCode::Disabled, "AI 連携 (MCP) は無効です").into())
     }
 }
 #[test]
@@ -1839,7 +1836,7 @@ impl Backend for SerialQueries {
         client: &ClientIdentity,
         kind: RequestKind,
         control: Arc<CallControl>,
-    ) -> Result<Payload, AgentError> {
+    ) -> BackendResult {
         // Legacy's independent permission observer also calls Status. In that
         // fixture only the two client queries are counted; initial list Status
         // completes before either query is admitted. Modern counts every call.
@@ -2063,8 +2060,8 @@ impl Backend for CoreBusy {
         _: &ClientIdentity,
         _: RequestKind,
         _: Arc<CallControl>,
-    ) -> Result<Payload, AgentError> {
-        Err(AgentError::new(ErrorCode::Busy, "core busy fixture"))
+    ) -> BackendResult {
+        Err(AgentError::new(ErrorCode::Busy, "core busy fixture").into())
     }
 }
 #[test]
@@ -2205,7 +2202,7 @@ impl Backend for LiveStatus {
         _: &ClientIdentity,
         _: RequestKind,
         _: Arc<CallControl>,
-    ) -> Result<Payload, AgentError> {
+    ) -> BackendResult {
         assert_eq!(command, Command::Status);
         let enabled = self.enabled.load(Ordering::Acquire);
         let _ = self.calls.send(enabled);
@@ -2220,7 +2217,7 @@ impl Backend for LiveStatus {
                 remote_active: false,
             }))
         } else {
-            Err(AgentError::new(ErrorCode::Disabled, "disabled"))
+            Err(AgentError::new(ErrorCode::Disabled, "disabled").into())
         }
     }
 }
@@ -2268,14 +2265,15 @@ fn revoked_read_does_not_advertise_disabled_tools_while_status_stays_enabled() {
             client: &ClientIdentity,
             kind: RequestKind,
             control: Arc<CallControl>,
-        ) -> Result<Payload, AgentError> {
+        ) -> BackendResult {
             if matches!(command, Command::Status) {
                 Fixture { disabled: false }.call(command, client, kind, control)
             } else {
                 Err(AgentError::new(
                     ErrorCode::PermissionChanged,
                     "AI 連携の許可が変更されました。もう一度お試しください",
-                ))
+                )
+                .into())
             }
         }
     }
@@ -2343,7 +2341,7 @@ fn permission_observer_discards_old_poll_after_newer_actual_observations() {
         ErrorCode::PermissionChanged,
     ] {
         assert_eq!(
-            permission_tools(&Err(AgentError::new(code, "fixture"))),
+            permission_tools(&Err(AgentError::new(code, "fixture").into())),
             None
         );
     }
@@ -2362,7 +2360,7 @@ fn stale_status_poll_and_tool_list_never_advertise_disabled_tools() {
             client: &ClientIdentity,
             kind: RequestKind,
             control: Arc<CallControl>,
-        ) -> Result<Payload, AgentError> {
+        ) -> BackendResult {
             assert_eq!(command, Command::Status);
             let call = self.count.fetch_add(1, Ordering::AcqRel) as usize;
             self.calls.send(call).unwrap();
@@ -2372,7 +2370,8 @@ fn stale_status_poll_and_tool_list_never_advertise_disabled_tools() {
                 Err(AgentError::new(
                     ErrorCode::PermissionChanged,
                     "AI 連携の許可が変更されました。もう一度お試しください",
-                ))
+                )
+                .into())
             } else {
                 Fixture { disabled: false }.call(command, client, kind, control)
             }
@@ -2717,12 +2716,14 @@ fn stage1a_schema_validates_serialized_payloads_and_explicit_absence_markers() {
         let (_, command) = parse_tool(&json!({"name":name,"arguments":args})).unwrap();
         let result = tool_result(
             name,
-            backend.call(
-                command,
-                &ClientIdentity::new("fixture", "1"),
-                RequestKind::Tool,
-                Arc::new(CallControl::default()),
-            ),
+            backend
+                .call(
+                    command,
+                    &ClientIdentity::new("fixture", "1"),
+                    RequestKind::Tool,
+                    Arc::new(CallControl::default()),
+                )
+                .map_err(BackendError::into_agent),
         );
         assert_eq!(result["isError"], false);
         assert!(
@@ -2903,4 +2904,111 @@ fn permission_observer_compares_advertised_tools_rather_than_snapshot_bits() {
             .observe(schema::tool_names(PermissionSnapshot::default()), None)
             .is_some()
     );
+}
+
+#[test]
+fn unreachable_core_discovery_and_recovery_for_all_protocols() {
+    struct Reachability(AtomicU64);
+    impl Backend for Reachability {
+        fn call(
+            &self,
+            command: Command,
+            client: &ClientIdentity,
+            kind: RequestKind,
+            control: Arc<CallControl>,
+        ) -> BackendResult {
+            assert_eq!(command, Command::Status);
+            match self.0.load(Ordering::Acquire) {
+                0 => Err(BackendError::Unreachable),
+                1 => Fixture { disabled: false }.call(command, client, kind, control),
+                2 => Err(AgentError::new(ErrorCode::Disabled, "disabled").into()),
+                3 => Err(AgentError::new(ErrorCode::PermissionChanged, "changed").into()),
+                _ => unreachable!(),
+            }
+        }
+    }
+    fn send(h: &Harness, version: &str, id: i64, method: &str, params: Value) {
+        h.send(if version == MODERN {
+            modern(id, method, params)
+        } else {
+            json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+        });
+    }
+    fn names(response: &Value) -> Vec<&str> {
+        response["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect()
+    }
+    for version in VERSIONS {
+        let backend = Arc::new(Reachability(AtomicU64::new(0)));
+        let mut h = Harness::new(backend.clone());
+        if version != MODERN {
+            h.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}));
+            h.receive();
+            h.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+        }
+        send(&h, version, 1, "tools/list", json!({}));
+        let listed = h.receive();
+        assert_eq!(names(&listed), vec!["miv_status"]);
+        assert_eq!(
+            listed["result"]["tools"][0],
+            schema::tools_named(&["miv_status"])[0]
+        );
+        if version == MODERN {
+            assert_eq!(listed["result"]["ttlMs"], 0);
+            assert_eq!(listed["result"]["cacheScope"], "private");
+        }
+        send(
+            &h,
+            version,
+            2,
+            "tools/call",
+            json!({"name":"miv_status","arguments":{}}),
+        );
+        let status = h.receive();
+        assert_eq!(status["id"], 2);
+        assert_eq!(status["result"]["isError"], true);
+        assert_eq!(
+            status["result"]["structuredContent"]["error"]["code"],
+            "not_ready"
+        );
+        assert!(
+            status["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("mIV")
+        );
+        backend.0.store(1, Ordering::Release);
+        if version != MODERN {
+            // The real idle five-second probe establishes the permitted set.
+            let notice = h.output.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(notice["method"], "notifications/tools/list_changed");
+        }
+        send(&h, version, 3, "tools/list", json!({}));
+        assert_eq!(names(&h.receive()).len(), 9);
+        backend.0.store(3, Ordering::Release);
+        send(&h, version, 4, "tools/list", json!({}));
+        let stale = h.receive();
+        assert_eq!(stale["id"], 4, "staleness must not notify");
+        assert_eq!(stale["error"]["code"], -32603);
+        backend.0.store(1, Ordering::Release);
+        send(&h, version, 5, "tools/list", json!({}));
+        let unchanged = h.receive();
+        assert_eq!(unchanged["id"], 5, "staleness did not change the set");
+        assert_eq!(names(&unchanged).len(), 9);
+        backend.0.store(2, Ordering::Release);
+        send(&h, version, 6, "tools/list", json!({}));
+        if version != MODERN {
+            assert_eq!(h.receive()["method"], "notifications/tools/list_changed");
+        }
+        assert!(names(&h.receive()).is_empty());
+        send(&h, version, 7, "tools/list", json!({}));
+        let disabled = h.receive();
+        assert_eq!(disabled["id"], 7);
+        assert!(names(&disabled).is_empty());
+        h.close();
+    }
 }

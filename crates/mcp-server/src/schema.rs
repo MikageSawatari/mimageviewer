@@ -235,7 +235,9 @@ pub fn tool_names(permission: PermissionSnapshot) -> Vec<&'static str> {
     }
 }
 pub fn tools_for(permission: PermissionSnapshot) -> Vec<Value> {
-    let names = tool_names(permission);
+    tools_named(&tool_names(permission))
+}
+pub fn tools_named(names: &[&str]) -> Vec<Value> {
     tools()
         .into_iter()
         .filter(|tool| names.contains(&tool["name"].as_str().unwrap()))

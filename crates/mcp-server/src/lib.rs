@@ -7,7 +7,7 @@ mod tests;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use input::{InputLifetime, InputLine, InputQueue};
 use mimageviewer_agent_ipc::*;
-use pipe::{Backend, CallControl};
+use pipe::{Backend, BackendError, BackendResult, CallControl};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -56,7 +56,7 @@ enum Event {
     InputError,
     Eof,
     OutputError(io::Error),
-    Done(u64, Result<Payload, AgentError>),
+    Done(u64, BackendResult),
     Permission(u64, Vec<&'static str>),
 }
 #[derive(Clone, Copy)]
@@ -164,22 +164,20 @@ impl Drop for PermissionObserver {
         let _ = self.stop.try_send(());
     }
 }
-fn permission_tools(result: &Result<Payload, AgentError>) -> Option<Vec<&'static str>> {
+fn permission_tools(result: &BackendResult) -> Option<Vec<&'static str>> {
     // PermissionChanged is an invalidated read, not evidence of an empty tool
     // set. This also applies to Status used by discovery and the idle poll.
     match result {
         Ok(Payload::Status(status)) => Some(schema::tool_names(status.permission)),
-        Err(AgentError {
+        Err(BackendError::Unreachable) => Some(vec!["miv_status"]),
+        Err(BackendError::Agent(AgentError {
             code: ErrorCode::Disabled,
             ..
-        }) => Some(vec![]),
+        })) => Some(vec![]),
         _ => None,
     }
 }
-fn reply_permission_tools(
-    action: Action,
-    result: &Result<Payload, AgentError>,
-) -> Option<Vec<&'static str>> {
+fn reply_permission_tools(action: Action, result: &BackendResult) -> Option<Vec<&'static str>> {
     // Only discovery or a successful status snapshot establishes the tool set.
     match (action, result) {
         (Action::List, _) | (_, Ok(Payload::Status(_))) => permission_tools(result),
@@ -366,15 +364,11 @@ pub fn run_stdio_with_eof<
                     }
                 }
                 let value = match action {
-                    Action::List => match result {
-                        Ok(Payload::Status(_))
-                        | Err(AgentError {
-                            code: ErrorCode::Disabled,
-                            ..
-                        }) => {
+                    Action::List => match permission_tools(&result) {
+                        Some(names) => {
                             let tools = match &result {
                                 Ok(Payload::Status(status)) => schema::tools_for(status.permission),
-                                _ => vec![],
+                                _ => schema::tools_named(&names),
                             };
                             let mut value = json!({"tools":tools});
                             if modern {
@@ -389,7 +383,11 @@ pub fn run_stdio_with_eof<
                             "mIV に問い合わせできません。起動状態と AI 連携の設定を確認してください",
                         ),
                     },
-                    Action::Tool(name) => success(id, tool_result(name, result), modern),
+                    Action::Tool(name) => success(
+                        id,
+                        tool_result(name, result.map_err(BackendError::into_agent)),
+                        modern,
+                    ),
                 };
                 Some(Envelope {
                     value,

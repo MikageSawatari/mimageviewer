@@ -9,6 +9,8 @@ The caller owns isolation and any already-running disposable core. This script
 does not start a core, find executables, register servers, or read client configs.
 stdout is one JSON report; exit 0 means protocol/EOF/exit checks passed. A tool
 result with isError=true is retained as a valid response, not a transport failure.
+JSON-RPC error responses stop further requests and are reported as errors, but
+still close stdin and verify the server's natural exit before returning exit 1.
 """
 
 import argparse
@@ -31,6 +33,10 @@ MAX_MESSAGES = 10000
 
 class CheckFailure(Exception):
     pass
+
+
+class RpcResponseError(Exception):
+    """A completed request failed; the stream remains valid for EOF shutdown."""
 
 
 def strict_json(text):
@@ -165,6 +171,11 @@ def run_check(command, *, timeout=15.0, env_overrides=None, tool_name=None,
         if ("method" in message or "id" not in message or
                 ("result" in message) == ("error" in message)):
             raise CheckFailure("invalid or unsupported JSON-RPC response")
+        if "error" in message:
+            error = message["error"]
+            if (not isinstance(error, dict) or type(error.get("code")) is not int or
+                    not isinstance(error.get("message"), str)):
+                raise CheckFailure("invalid JSON-RPC error response")
         report["responses"].append(message)
         return message
 
@@ -185,7 +196,7 @@ def run_check(command, *, timeout=15.0, env_overrides=None, tool_name=None,
                 if type(message["id"]) is not int or message["id"] != request_id:
                     raise CheckFailure("unexpected response id (requests are FIFO)")
                 if "error" in message:
-                    raise CheckFailure("JSON-RPC error for " + method)
+                    raise RpcResponseError("JSON-RPC error for " + method)
                 return message["result"]
             if report["stdout_eof"]:
                 raise CheckFailure("stdout EOF before response to " + method)
@@ -204,18 +215,23 @@ def run_check(command, *, timeout=15.0, env_overrides=None, tool_name=None,
         thread = threading.Thread(target=writer, daemon=True)
         threads.append(thread)
         thread.start()
-        initialized = request(1, "initialize", {
-            "protocolVersion": PROTOCOL_VERSION, "capabilities": {},
-            "clientInfo": {"name": "miv-direct-stdio-check", "version": "1"}})
-        if (not isinstance(initialized, dict) or
-                initialized.get("protocolVersion") != PROTOCOL_VERSION):
-            raise CheckFailure("initialize negotiated an unexpected protocol version")
-        send({"jsonrpc": "2.0", "method": "notifications/initialized"}, "initialized")
-        listed = request(2, "tools/list", {})
-        if not isinstance(listed, dict) or not isinstance(listed.get("tools"), list):
-            raise CheckFailure("tools/list result has no tools array")
-        if tool_name is not None:
-            request(3, "tools/call", {"name": tool_name, "arguments": tool_arguments or {}})
+        try:
+            initialized = request(1, "initialize", {
+                "protocolVersion": PROTOCOL_VERSION, "capabilities": {},
+                "clientInfo": {"name": "miv-direct-stdio-check", "version": "1"}})
+            if (not isinstance(initialized, dict) or
+                    initialized.get("protocolVersion") != PROTOCOL_VERSION):
+                raise CheckFailure("initialize negotiated an unexpected protocol version")
+            send({"jsonrpc": "2.0", "method": "notifications/initialized"}, "initialized")
+            listed = request(2, "tools/list", {})
+            if not isinstance(listed, dict) or not isinstance(listed.get("tools"), list):
+                raise CheckFailure("tools/list result has no tools array")
+            if tool_name is not None:
+                request(3, "tools/call", {"name": tool_name, "arguments": tool_arguments or {}})
+        except RpcResponseError as error:
+            # The response completed normally. Do not turn a server-side request
+            # error into a forced-exit result and lose the EOF/exit evidence.
+            report["errors"].append(str(error))
         writes.put(None)
         while not (report["stdin_closed"] and report["stdout_eof"] and
                    report["stderr_eof"] and process.poll() is not None):
