@@ -1,10 +1,10 @@
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use musicvideo_core::{ImageId, LayerId, Project};
+use musicvideo_core::{ImageId, LayerId, LayerKind, Project};
 
 static NEXT_TARGET_LIFETIME: AtomicU64 = AtomicU64::new(1);
 static NEXT_RESOURCE_REVISION: AtomicU64 = AtomicU64::new(1);
@@ -37,18 +37,29 @@ impl EditTargetLifetimes {
     }
 
     pub(crate) fn reconcile(&mut self, project: &Project) {
+        // An unresolved layer-only slot is still a replacement target. Keep
+        // its lifetime until both the ImageRef and every layer reference end.
+        let image_ids = project
+            .images
+            .iter()
+            .map(|image| &image.id)
+            .chain(project.layers.iter().filter_map(|layer| match &layer.kind {
+                LayerKind::Image { image, .. } => Some(image),
+                _ => None,
+            }))
+            .cloned()
+            .collect::<HashSet<_>>();
         self.layers
             .retain(|id, _| project.layers.iter().any(|layer| layer.id == *id));
-        self.images
-            .retain(|id, _| project.images.iter().any(|image| image.id == *id));
+        self.images.retain(|id, _| image_ids.contains(id));
         for layer in &project.layers {
             self.layers
                 .entry(layer.id)
                 .or_insert_with(EditTargetLifetime::allocate);
         }
-        for image in &project.images {
+        for id in image_ids {
             self.images
-                .entry(image.id.clone())
+                .entry(id)
                 .or_insert_with(EditTargetLifetime::allocate);
         }
     }
@@ -170,6 +181,75 @@ mod tests {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn image_lifetime_tracks_the_union_of_references_and_all_layer_slots() {
+        let mut project = default_project(1.0);
+        let id = ImageId::new(musicvideo_core::DEFAULT_BACKGROUND_IMAGE_ID);
+        let mut lifetimes = EditTargetLifetimes::default();
+        lifetimes.reconcile(&project);
+        let lifetime = lifetimes
+            .image(&id)
+            .expect("layer-only slot is replaceable");
+
+        project.images.push(ImageRef {
+            id: id.clone(),
+            path: "background.png".into(),
+        });
+        lifetimes.reconcile(&project);
+        assert_eq!(lifetimes.image(&id), Some(lifetime));
+        let background = project.layers.remove(0);
+        lifetimes.reconcile(&project);
+        assert_eq!(
+            lifetimes.image(&id),
+            Some(lifetime),
+            "ImageRef alone keeps the slot alive"
+        );
+        let mut sibling = background.clone();
+        sibling.id = LayerId(100);
+        sibling.visible = musicvideo_core::Animatable::Const(false);
+        project.layers.extend([background.clone(), sibling]);
+        project.images.clear();
+        lifetimes.reconcile(&project);
+        assert_eq!(
+            lifetimes.image(&id),
+            Some(lifetime),
+            "removing ImageRef preserves a referenced slot"
+        );
+        project.layers.remove(project.layers.len() - 2);
+        lifetimes.reconcile(&project);
+        assert_eq!(
+            lifetimes.image(&id),
+            Some(lifetime),
+            "hidden sibling still owns the slot"
+        );
+        project.layers.pop();
+        lifetimes.reconcile(&project);
+        assert_eq!(lifetimes.image(&id), None);
+        project.layers.push(background);
+        lifetimes.reconcile(&project);
+        assert_ne!(
+            lifetimes.image(&id).unwrap(),
+            lifetime,
+            "recreated slot rejects old completions"
+        );
+    }
+
+    #[test]
+    fn image_lifetimes_are_local_to_each_editor_and_reset_on_project_switch() {
+        let project = default_project(1.0);
+        let id = ImageId::new(musicvideo_core::DEFAULT_BACKGROUND_IMAGE_ID);
+        let mut first = EditTargetLifetimes::default();
+        let mut sibling = EditTargetLifetimes::default();
+        first.reconcile(&project);
+        sibling.reconcile(&project);
+        let first_lifetime = first.image(&id).unwrap();
+        let sibling_lifetime = sibling.image(&id).unwrap();
+        assert_ne!(first_lifetime, sibling_lifetime);
+        first.reset(&project);
+        assert_ne!(first.image(&id).unwrap(), first_lifetime);
+        assert_eq!(sibling.image(&id), Some(sibling_lifetime));
     }
 
     #[test]

@@ -6,6 +6,8 @@ mod diagnostics_tests;
 mod document_intent;
 #[cfg(test)]
 mod document_intent_tests;
+#[cfg(test)]
+mod image_request_tests;
 mod mp4;
 #[cfg(test)]
 mod mp4_tests;
@@ -1171,6 +1173,11 @@ impl MusicVideoLabApp {
             ImageLoadTarget::Replace(id) => {
                 if let Some(reference) = self.project.images.iter_mut().find(|item| item.id == id) {
                     reference.path = path;
+                } else {
+                    self.project.images.push(ImageRef {
+                        id: id.clone(),
+                        path,
+                    });
                 }
                 id
             }

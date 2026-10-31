@@ -4243,3 +4243,38 @@ musicvideoへmaster `961e49372`を取り込み、editor / UIをegui・eframe 0.3
 UIパネル、文字位置型、headless出力とtexture更新列のAPI差分・回帰・検証条件は
 [統合検証記録](musicvideo-merge-egui037-verification.md)にまとめる。
 これは実装担当の自動検証であり、実機GUI検収や独立レビューの代替ではない。
+
+### 新規プロジェクトの背景画像差し替え修正（2026-10-31）
+
+設計担当の実アプリ観測では、新規プロジェクトの「背景画像を開く」が
+「画像の差替対象が見つかりません」で拒否された。既定背景はレイヤーの ImageId だけを持ち、
+ImageRef がなく、共有 UI がその画像対象の lifetime を登録しないことを実装担当もコードで確認した。
+対象寿命を ImageRef と全 Image レイヤー参照の ID の和集合で管理し、採用時に ImageRef が
+なければ作る。両方の参照が消えた時だけ寿命を失効させる。非同期状態は増やさず、既存の
+H1 の session／対象寿命照合と H2 の checkpoint／manifest／blob 復元をそのまま使う。
+
+追加は editor の実要求・decode worker を通る handler 4 件と共有 UI の寿命 2 件。
+新規背景、追加後の差し替え、未解決素材の通知 ID からの差し替え、Undo／Redo 後の差し替え、
+参照も ImageRef もない ID の拒否を検査する。元 PNG 削除後の Undo／Redo でも画素と
+ResourceRevision が戻る。寿命は複数レイヤー（非表示を含む）・最後の参照消失・同 ID 再作成・
+別 editor／project reset の境界を検査した。
+
+製品コード修正前に `cargo test -p musicvideo-editor musicvideo_image_ -- --nocapture` を実行し、
+新規背景と未解決レイヤーの 2 件が上記拒否文言で FAILED、追加と不明 ID 拒否の 2 件は成功した
+（test assertion による失敗。先行するキャッシュ破損／native build 失敗は再現証拠に含めない）。
+修正後の画像関連 focused は editor 13＋UI 7 件成功。
+
+最終 `cargo test -p musicvideo-core -p musicvideo-ui -p musicvideo-editor` は
+core 115＋integration 2、UI 130、editor 185、計 **432 passed／0 failed**。
+`cargo fmt` 適用後の `cargo fmt --check`、`python scripts/check_ui_glyphs.py`（危険 glyph 0）、
+`git diff --check` は成功。最後の `scripts/build-dev.ps1 -PreserveRuntime
+-WaitForOtherBuildsMinutes 0` も exit 0（16.012 秒）、core／remote／EPUB worker／editor と
+VC runtime／PE gate が成功した。既存 MSBuild ノードを待たない指定で、プロセス停止はしていない。
+確認用 editor は `target/dev-runtime/mimageviewer-musicvideo.exe`。GUI 検収は未実施。
+
+検証では `MSBUILDDISABLENODEREUSE=1`、Rust jobs 8 を設定。既存 debug キャッシュの
+rmeta／rlib／build 出力破損と CMake 並列失敗に遭遇し、既存統合検証と同じ
+`target/merge-egui037` と `target/merge-cmake-serial.exe` を再利用した。
+テストの APPDATA は `target/background-image-test-appdata` に隔離した。
+ログは `target/background-image-verification/`。GUI 起動・実 APPDATA 操作・コミットは行わず、
+既存の未追跡 `out.mp4` を保持した。この記録は実装担当の検証であり、独立レビューではない。
