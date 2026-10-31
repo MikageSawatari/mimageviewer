@@ -1437,3 +1437,158 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 | P2-3 期限までに新しい項目が 1 件もできない場合 | 妥当。時間切れの error。`get_item_info` は入力の位置から再開 | §15.4 |
 
 4 巡目 (設計 `f97b1ed74`): 追加の指摘なし。判定は「1a: ready」。最大の項目 + 最長の cursor で 28,474 文字 (ページ予算 38,000 以内)、envelope は 1,669 文字 (予約 2,000 以内) と計算で確認された。
+
+## 16. 段階 1a の実装記録 (2026-10-31、基点 `17c85bb3a`、未コミット差分)
+
+作業先は `G:\home\mimageviewer-mcp` / `mcp-trial`。1a の読み取り・権限・予算だけを変更し、
+1b の一覧/画像、1c の open、1d の登録/UI、配布・公開文書には進まない。
+
+### 16.1 コードで確認した前提
+
+- `remote_ipc::SharedReaders` は一つの `LiveFavorites` と collection reader を持つ。
+  `favorites()` と既存 `settings_db::with_db_result` を借り、第二の settings 接続は作らない。
+  3値の権限 snapshot は同じ SettingsDb mutex/connection から読み、成功 commit の変更時だけ epoch を進める。
+- `ReadingHistoryDb::open_readonly().list_recent` と `book_bookmarks::load_all_from_disk_readonly` は
+  readonly の既存入口。ブックマークはその DB 行を直接投影し、browser の stat/decode を呼ばない。
+- `books::list_books` は本ごとに `book_page_count` を実行するため使わず、
+  `list_book_paths_while` を追加した。直下ディレクトリの名前/path のみを取り、項目間で取消を確認する。
+- `RatingDb::list_by_stars` は完全一致。新しい `list_at_least_stars` は >= の SQL と
+  ★降順→rated_at_ms 降順→path の順を使い、行の読出し間で取消を確認する。
+- `prepare_collection_snapshot_while` は filesystem entry 間の predicate と UI 非依存の並び替えを持つ。
+  `get_collection` は actor の catalog/load とこの関数を使い、欠落参照も順序から消さない。
+  Remote の view cache を使わず、Remote の通常処理の本体は変えない。
+  名前はストアと同じ trim・非空判定で照合し、検索語用の200文字制限は掛けない。
+  ★の threshold は adapter/core とも >5 を拒否し、0 は保存済み★の最小値1へ正規化する。
+- 寸法は `remote_ipc::container::file_image_dims` の既存 header/RAW/AVIF 読み取りを visibility だけ広げて使用。
+  PDF は `pdf_loader::get_page_sizes(path, None)` の既存経路を使う。Remote の `catalog_free_dims` と同じく
+  points を丸め、wire に `unit=points` を明示する。画像は `unit=pixels`。
+- PDF の `AbortOnCancel(Some(cancel))` は呼出元が先に戻って実 IPC が残るため使わない。
+  既存の完了待ちを nested read worker 内に保ち、前後で協調取消を確認する。外側は20秒で応答できるが、
+  worker の join までは Permit を保持する。この点は独立した実装前レビューでも確認した。
+
+### 16.2 投影と型の選択
+
+- agent IPC を strict-equality の版2、frame を4MiBへ変更。pipe 名も共通関数で同じ版2から導出する。
+  v1との互換は設けない。`ReadAndOpen` / 新2設定は未リリースなので migration は追加しない。
+  設定 UI は既存2択だけ。追加の縮小画像/GPS設定に UI は付けない。
+- wire の `PermissionSnapshot` は level/thumbnails/gps の一つの値。
+  通常 read 結果には snapshot+epoch を持つ `ReplyPolicy::Read` を使い、送信直前に全体を再照合する。
+  将来の `AcceptedOperation` は型の区別だけを置き、操作の受付機構は作っていない。
+- legacy の監視は5秒、snapshotから導いた tool 名集合を比較する。1a は有効時8件なので、
+  GPS/縮小画像/ReadAndOpen の変更だけで集合が変わらない場合には通知を増やさない。
+  通常 tool の Disabled は snapshot の失効でも返るため、そこから集合を推定しない。
+  Status 成功・tools/list・既存 poll の観測を使い、実際の無効化の反映は承認済みの最大5秒待ちとする。
+- `InfoField` で「値あり」「対象外」「取得不能」「大きすぎる」を区別する。
+  送出 EXIF / AI生成情報は専用の既知列の型だけ。GPS は snapshot が許す時だけ、
+  生 JSON / UserComment / MakerNote / 未知チャンク / 外部 sidecar は投影しない。
+- 実ファイルは絶対 path と NUL を検査し、既存の DB key を変える fs canonicalize は行わない。
+  Remote LAN の network-path 拒否は agent に持ち込まず、UI と同じく UNC を読む範囲に含める。
+  ZIP は `book_scope::validate_relative_reference` と既存の解決関数を使う。
+  `ZipImage` と `PdfPage(page_N、0始まり)` の生成後、
+  `edit_source::page_key_for_grid_item` / `page_key_for_pdf` で UI と同じ★ keyを取得する。
+  仮想ページ自身のタグは対象外、container のタグは `container_tags` として区別する。
+- ZIP の literal/nested/CP932 解決は `resolve_entry_index` / `split_nested_zip_path` を visibility だけ広げて再利用。
+  宣言サイズを展開前に検査し、実読出しも64MiBで打ち切る。中間の nested ZIP も同じ上限で、超えたら
+  metadata を TooLarge とする。ZIP の DOS 時刻には timezone が無いため UTC calendar として明示的に換算する。
+- `PageRow<T>` は通常行の JSON 形を維持し、大きすぎる行だけ digest ID と `too_long` 印を返す。
+  path/subresource/id/cursor は切らない。説明用の生成文字列だけ `TextValue.truncated` を付けて切る。
+  全ページを共通 `mcp_content_chars` で測り、行12,000・cursor込みページ38,000・最終MCP40,000を守る。
+- cursor は版2・tool・正規化 args の SHA-256 digest・入力位置/実返却数だけを符号化する。
+  `get_item_info` は入力位置から読み始め、既出の metadata/ZIP を読み直さない。
+- 全読み取りを controller / 実 worker に分け、期限・取消後も実 worker 終了まで同時枠を保持する。
+  検索・item info・順序が設定から確定するお気に入りの prefix は進む cursor とともに返し、新規行0件なら Timeout。
+  その他の library / collection の並べ替え途中では部分成功を返さず Timeout にする。
+
+### 16.3 検証の担当と範囲
+
+実装担当がこの sandbox 内で compile・fixture 検査を担当する。実 pipe は既知の OS 5 制限を
+skip/ignore や DACL 緩和で回避せず、通常権限の full-trust context で ClaudeCode が最終確認する。
+実装担当は作業中に別の確認役 (実装担当の申告。ClaudeCode からは別担当かを確かめられない) に
+snapshot/epoch、予算、metadata 許可表、期限・Permit・PDF完了待ち・cursor継続の差分を見せ、追加 P1/P2 はなしとした。
+正式な独立レビューは ClaudeCode が別の担当へ依頼する (§16.7)。
+実行結果は後記の ledger に記録し、source review を実 pipe 成功の代わりにはしない。
+
+### 16.4 追加・変更ファイル
+
+| 範囲 | ファイル | 内容 |
+|---|---|---|
+| 共通 IPC | `crates/agent-ipc/src/lib.rs`, 新規 `read_types.rs` | snapshot・3 command・typed projection・予算・digest・v2 codec |
+| adapter | `crates/mcp-server/src/lib.rs`, `schema.rs`, `tests.rs` | 8 tool の parser/schema、集合比較、5秒照会、共通予算 |
+| core | `src/agent_ipc/mod.rs`, 新規 `work.rs`, `library.rs`, `item_info.rs` | 実 worker の期限/取消、read policy、各投影、共通ページ境界 |
+| core fixture | `src/agent_ipc/tests.rs`, 新規 `read_tests.rs`, `item_info_tests.rs` | 既存の wire 追従・実 controller・readonly DB・metadata fixture |
+| 設定 | `src/settings.rs`, `settings_db.rs`, `settings_transfer.rs` | 新2設定の保存・snapshot epoch・自動転送除外 |
+| UI の最小追従 | `src/ui_dialogs/preferences/pages.rs` | hidden な ReadAndOpen を既存の読取表示に含め、選択肢は2つのまま |
+| 専用の軽い読出し | `src/books.rs`, `rating_db.rs` | 本棚直下の名前/path、★以上の query |
+| 再利用境界 | `src/remote_ipc/container.rs`, `remote_ipc/mod.rs`, `zip_loader.rs` | 必要 helper の visibility/reexport のみ。本体は無変更 |
+| agent 専用の型追従 | `src/remote_ipc/collections.rs` | agent projection の tags/container_tags 型。Remote 通常処理は無変更 |
+| 実装記録 | `docs/mcp-integration-plan.md` | この §16 |
+
+### 16.5 途中の修正と検証記録
+
+初回 core check は exit 101 (favorites Arc の反復方法、hidden ReadAndOpen の match 不足) となり、修正した。
+最初の lib test compile も exit 101 (旧 Item fixture の Option tags/container_tags 追従不足) となり、修正した。
+その後の焦点35件は exit 100、32成功/3失敗。2件は既知の実 pipe OS 5、残る1件は PNG fixture の
+tEXt に Latin-1 外の文字を渡したため、metadata 検査より前に BadTextEncoding となった。
+有効な tEXt として長い escape を含む ASCII prompt に変更し、同じ切り詰め・許可表・ページ予算を検査する。
+PNG の exact 再検査は exit 0、1/1成功 (`target/mcp-1a-png-retest.log`)。
+続く最終結果を下記に記録する。途中の source review 後、名前/threshold 境界と PNG fixture の限定差分も
+同じ独立 reviewer が確認し、追加 P1/P2 はなし。
+お気に入りは順序が先に確定するため、全 library を Timeout のみとする初期実装も修正した。
+`favorite_page` は offset から取り出し、完成行ごとに共通予算を通して prefix を公開する。
+後続行で停止→期限→cursor=1 の部分応答→worker 解放まで枠保持、という実 controller 検査を追加した。
+この限定修正も独立 reviewer と構造を確認した。これらは設計の矛盾ではなく実装の境界修正である。
+通知の最終点検では、通常 tool の snapshot 失効を集合0件と誤認する余分な通知を補正した。
+wire error や追跡状態は増やさず、Status 成功・tools/list・poll だけで集合を更新する。
+legacy 2版の実 stdio runtime で、tool の失効 error と ping が list_changed なしで返る検査を追加した。
+
+### 16.6 最終検証 (観測者: 実装担当、この sandbox 内)
+
+| コマンド | 実 exit code | 結果 / ログ |
+|---|---:|---|
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | 最終 core 差分を検査。`target/mcp-1a-core-complete.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 101 | IPC 10/10成功、MCP 40成功/2失敗、ignore 0。失敗はいずれも下記の OS 5。`target/mcp-1a-crates-complete.log` |
+| 下記の focused nextest | 100 | 36件中34成功/2失敗。失敗はいずれも下記の OS 5。`target/mcp-1a-focused-complete.log` |
+| `cargo build -p mimageviewer-mcp --bin mimageviewer-mcp` | 0 | 最終 adapter 差分の console exe を生成。`target/mcp-1a-adapter-complete.log` |
+| `cargo fmt` (workspace、引数なし) | 0 | 最終 source 差分を整形 |
+| `cargo fmt --check` | 0 | `target/mcp-1a-fmt-check.log` |
+| `python scripts/check_ui_glyphs.py` | 0 | UI glyph 検査成功。snapshot の更新なし |
+
+core の focused 結果はその後の adapter 専用通知修正では取り直さず、同じ core source の成功結果を再利用した。
+通知修正の exact 回帰検査も exit 0 で、続く上記 crate 全体の再検査にも含めた。
+lib test 前に、この worktree の FFmpeg DLL 実ファイルを `target/debug/deps/` に配置済み。
+
+失敗は4件とも既知の restricted token による名前付き pipe の作成/接続時の `raw_os_error=5` であり、
+handler の assertion 失敗ではない。skip/ignore 化や DACL の変更はしていない。
+
+- core: `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`
+- core: `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers` (fixture pipe 作成時、adapter 起動前)
+- adapter: `pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld`
+- adapter: `pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked`
+
+ClaudeCode が通常権限の sandbox 外で実行するコマンド (この最終差分での成功は未観測):
+
+```powershell
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_level/) or test(/agent_permission/) or test(=settings_db::tests::failed_permission_commit_preserves_snapshot_and_epoch) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/)'
+```
+
+collection / history / bookshelf / bookmarks / ratings の fixture、JPEG EXIF/GPS、PNG tEXt の長い prompt、
+ZIP の通常/CP932/nested member、GPS の非公開、未知 metadata の非公開、全 snapshot の失効、
+50入力の短い cursor、limit 1000 の丸め、prefix/並べ替え型の期限と枠保持を上記の成功分で検査した。
+実 native PDF worker は起動せず、PDF page の寸法投影と page key は純粋 fixture 検査に留めた。
+PDF 実読出し・実 mIV との接続・実データを使う動作の確認は行っていない。
+製品 binary、通常 profile、UI を起動せず、test-full・commit・snapshot 更新も行っていない。
+依頼された検証用 binary は `target/debug/mimageviewer-mcp.exe` のみ生成し、core の検証起動は行わない。
+設計前提の矛盾は見つからず、未解決のコード上の指摘はない。1b/1c/1d は未実装のまま。
+
+### 16.7 検収 (観測者: ClaudeCode、2026-10-31)
+
+sandbox の外 (通常権限) で、実装担当が実 pipe の OS 5 で落とした 4 件を含めて再実行した。
+
+| コマンド | exit code | 結果 |
+|---|---:|---|
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 0 | IPC 10/10、MCP 42/42 成功 |
+| §16.6 の focused nextest | 0 | 36/36 成功 |
+| `cargo fmt` (workspace) | 0 | 差分なし |
+
+独立レビュー (別担当、gpt-6.1-sol / xhigh、read-only) の結果はこの下に追記する。

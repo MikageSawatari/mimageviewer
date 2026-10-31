@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use uuid::Uuid;
 
-pub use mimageviewer_agent_ipc::AgentLevel;
+pub use mimageviewer_agent_ipc::{AgentLevel, PermissionSnapshot};
 
 pub const MAX_FAVORITES: usize = 100;
 
@@ -5483,6 +5483,14 @@ pub struct Settings {
     #[serde(default)]
     pub agent_level: AgentLevel,
 
+    /// AI アプリへ縮小画像を送る許可。段階の許可とは別に既定 OFF。
+    #[serde(default)]
+    pub agent_show_thumbnails: bool,
+
+    /// AI アプリへ撮影位置 (GPS) を送る許可。既定 OFF。
+    #[serde(default)]
+    pub agent_show_gps: bool,
+
     /// ラベル、ボタン、メニュー、ダイアログ、フルスクリーン HUD の文字コントラスト。
     #[serde(default)]
     pub text_contrast: TextContrast,
@@ -7917,6 +7925,8 @@ impl Default for Settings {
             ui_theme: UiTheme::default(),
             preferences_restore_position: true,
             agent_level: AgentLevel::default(),
+            agent_show_thumbnails: false,
+            agent_show_gps: false,
             text_contrast: TextContrast::default(),
             notification_duration: NotificationDuration::default(),
             ui_scale_factor: default_ui_scale_factor(),

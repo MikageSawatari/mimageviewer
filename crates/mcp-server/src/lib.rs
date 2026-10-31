@@ -56,7 +56,7 @@ enum Event {
     Eof,
     OutputError(io::Error),
     Done(u64, Result<Payload, AgentError>),
-    Permission(u64, bool),
+    Permission(u64, Vec<&'static str>),
 }
 #[derive(Clone, Copy)]
 enum Action {
@@ -109,7 +109,7 @@ fn cancel_active(owner: &ActiveOwner) {
 struct PermissionObserver {
     stop: mpsc::SyncSender<()>,
     revision: Arc<AtomicU64>,
-    effective: Option<bool>,
+    effective: Option<Vec<&'static str>>,
 }
 impl PermissionObserver {
     fn start(backend: Arc<dyn Backend>, client: String, send: mpsc::SyncSender<Event>) -> Self {
@@ -118,7 +118,7 @@ impl PermissionObserver {
         let probe_revision = revision.clone();
         std::thread::spawn(move || {
             while matches!(
-                recv.recv_timeout(Duration::from_secs(1)),
+                recv.recv_timeout(Duration::from_secs(5)),
                 Err(mpsc::RecvTimeoutError::Timeout)
             ) {
                 let before = probe_revision.load(Ordering::Acquire);
@@ -127,8 +127,8 @@ impl PermissionObserver {
                 if !matches!(recv.try_recv(), Err(mpsc::TryRecvError::Empty)) {
                     break;
                 }
-                if let Some(enabled) = permission_bit(&result) {
-                    if send.send(Event::Permission(before, enabled)).is_err() {
+                if let Some(tools) = permission_tools(&result) {
+                    if send.send(Event::Permission(before, tools)).is_err() {
                         break;
                     }
                 }
@@ -140,15 +140,14 @@ impl PermissionObserver {
             effective: None,
         }
     }
-    fn observe(&mut self, enabled: bool, from_poll: Option<u64>) -> Option<Value> {
+    fn observe(&mut self, tools: Vec<&'static str>, from_poll: Option<u64>) -> Option<Value> {
         if from_poll.is_some_and(|old| old != self.revision.load(Ordering::Acquire)) {
             return None;
         }
         self.revision.fetch_add(1, Ordering::AcqRel);
-        let previous = self.effective.replace(enabled);
-        previous
-            .filter(|old| *old != enabled)
-            .map(|_| json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"}))
+        let changed = self.effective.as_ref().is_some_and(|old| old != &tools);
+        self.effective = Some(tools);
+        changed.then(|| json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"}))
     }
 }
 impl Drop for PermissionObserver {
@@ -156,19 +155,34 @@ impl Drop for PermissionObserver {
         let _ = self.stop.try_send(());
     }
 }
-fn permission_bit(result: &Result<Payload, AgentError>) -> Option<bool> {
+fn permission_tools(result: &Result<Payload, AgentError>) -> Option<Vec<&'static str>> {
     match result {
-        Ok(Payload::Status(status)) => Some(status.agent_level >= AgentLevel::ReadOnly),
+        Ok(Payload::Status(status)) => Some(schema::tool_names(status.permission)),
         Err(AgentError {
             code: ErrorCode::Disabled,
             ..
-        }) => Some(false),
+        }) => Some(vec![]),
         _ => None,
     }
 }
-fn observe_permission(session: &mut Session, enabled: bool, poll: Option<u64>) -> Option<Value> {
+fn reply_permission_tools(
+    action: Action,
+    result: &Result<Payload, AgentError>,
+) -> Option<Vec<&'static str>> {
+    // A rejected read can mean snapshot revocation while the level stays enabled.
+    // Only discovery or a successful status snapshot establishes the tool set.
+    match (action, result) {
+        (Action::List, _) | (_, Ok(Payload::Status(_))) => permission_tools(result),
+        _ => None,
+    }
+}
+fn observe_permission(
+    session: &mut Session,
+    tools: Vec<&'static str>,
+    poll: Option<u64>,
+) -> Option<Value> {
     if let Session::LegacyReady { observer, .. } = session {
-        observer.observe(enabled, poll)
+        observer.observe(tools, poll)
     } else {
         None
     }
@@ -312,8 +326,8 @@ pub fn run_stdio_with_eof<
                 cancel_active(&owner);
                 return Err(error);
             }
-            Event::Permission(revision, enabled) => {
-                observe_permission(&mut session, enabled, Some(revision)).map(Envelope::plain)
+            Event::Permission(revision, tools) => {
+                observe_permission(&mut session, tools, Some(revision)).map(Envelope::plain)
             }
             Event::Done(done_serial, result) => {
                 let (id, modern, action, control) = {
@@ -331,8 +345,8 @@ pub fn run_stdio_with_eof<
                     call.phase = ActivePhase::ReplyQueued;
                     (call.id.clone(), call.modern, action, call.control.clone())
                 };
-                if let Some(enabled) = permission_bit(&result) {
-                    if let Some(notice) = observe_permission(&mut session, enabled, None) {
+                if let Some(tools) = reply_permission_tools(action, &result) {
+                    if let Some(notice) = observe_permission(&mut session, tools, None) {
                         output_send(&output_send_queue, Envelope::plain(notice)).map_err(
                             |error| {
                                 cancel_active(&owner);
@@ -348,9 +362,11 @@ pub fn run_stdio_with_eof<
                             code: ErrorCode::Disabled,
                             ..
                         }) => {
-                            let enabled = matches!(result,Ok(Payload::Status(ref s)) if s.agent_level>=AgentLevel::ReadOnly);
-                            let mut value =
-                                json!({"tools":if enabled {schema::tools()} else {vec![]}});
+                            let tools = match &result {
+                                Ok(Payload::Status(status)) => schema::tools_for(status.permission),
+                                _ => vec![],
+                            };
+                            let mut value = json!({"tools":tools});
                             if modern {
                                 value["ttlMs"] = json!(0);
                                 value["cacheScope"] = json!("private");
@@ -627,6 +643,35 @@ struct PageArgs {
     limit: Option<u32>,
     cursor: Option<String>,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollectionArgs {
+    id: Option<String>,
+    name: Option<String>,
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LibraryArgs {
+    kind: LibraryKind,
+    stars: Option<u8>,
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InfoArgs {
+    items: Vec<InfoRefArgs>,
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InfoRefArgs {
+    path: String,
+    subresource: Option<String>,
+}
 fn parse_tool(params: &Value) -> Result<(Action, Command), &'static str> {
     let args = params
         .get("arguments")
@@ -644,7 +689,7 @@ fn parse_tool(params: &Value) -> Result<(Action, Command), &'static str> {
             (
                 "list_collections",
                 Command::ListCollections {
-                    limit: a.limit,
+                    limit: clamp_limit(a.limit),
                     cursor: a.cursor,
                 },
             )
@@ -656,7 +701,7 @@ fn parse_tool(params: &Value) -> Result<(Action, Command), &'static str> {
                 "list_tags",
                 Command::ListTags {
                     choice: a.choice,
-                    limit: a.limit,
+                    limit: clamp_limit(a.limit),
                     cursor: a.cursor,
                 },
             )
@@ -669,7 +714,7 @@ fn parse_tool(params: &Value) -> Result<(Action, Command), &'static str> {
                 Command::SearchItems {
                     query: a.query,
                     kind: a.kind,
-                    limit: a.limit,
+                    limit: clamp_limit(a.limit),
                     cursor: a.cursor,
                 },
             )
@@ -682,7 +727,67 @@ fn parse_tool(params: &Value) -> Result<(Action, Command), &'static str> {
                 Command::ItemsByTag {
                     tag: a.tag,
                     kind: a.kind,
-                    limit: a.limit,
+                    limit: clamp_limit(a.limit),
+                    cursor: a.cursor,
+                },
+            )
+        }
+        Some("get_collection") => {
+            let a: CollectionArgs = serde_json::from_value(args).map_err(bad)?;
+            if a.id.is_some() == a.name.is_some()
+                || a.id.as_ref().is_some_and(|s| s.trim().is_empty())
+                || a.name.as_ref().is_some_and(|s| s.trim().is_empty())
+            {
+                return Err("Specify exactly one nonempty collection id or name");
+            }
+            validate_paging(a.limit, a.cursor.as_deref())?;
+            (
+                "get_collection",
+                Command::GetCollection {
+                    id: a.id,
+                    name: a.name,
+                    limit: clamp_limit(a.limit),
+                    cursor: a.cursor,
+                },
+            )
+        }
+        Some("list_library") => {
+            let a: LibraryArgs = serde_json::from_value(args).map_err(bad)?;
+            validate_paging(a.limit, a.cursor.as_deref())?;
+            if a.stars.is_some_and(|stars| stars > 5) {
+                return Err("Invalid stars threshold");
+            }
+            (
+                "list_library",
+                Command::ListLibrary {
+                    kind: a.kind,
+                    stars: a.stars.map(|stars| stars.max(1)),
+                    limit: clamp_limit(a.limit),
+                    cursor: a.cursor,
+                },
+            )
+        }
+        Some("get_item_info") => {
+            let a: InfoArgs = serde_json::from_value(args).map_err(bad)?;
+            validate_paging(a.limit, a.cursor.as_deref())?;
+            if a.items.is_empty()
+                || a.items.len() > MAX_INFO_LIMIT as usize
+                || a.items.iter().any(|item| item.path.is_empty())
+            {
+                return Err("Specify between 1 and 50 items with nonempty paths");
+            }
+            (
+                "get_item_info",
+                Command::GetItemInfo {
+                    items: a
+                        .items
+                        .into_iter()
+                        .map(|item| ItemRef {
+                            path: item.path,
+                            subresource: item.subresource,
+                        })
+                        .collect(),
+                    limit: clamp_limit(a.limit),
                     cursor: a.cursor,
                 },
             )
@@ -690,6 +795,9 @@ fn parse_tool(params: &Value) -> Result<(Action, Command), &'static str> {
         _ => return Err("Unknown tool"),
     };
     Ok((Action::Tool(name), command))
+}
+fn clamp_limit(limit: Option<u32>) -> Option<u32> {
+    limit.map(|n| n.min(MAX_LIMIT))
 }
 fn validate_page(text: &str, limit: Option<u32>, cursor: Option<&str>) -> Result<(), &'static str> {
     if text.is_empty() || text.chars().count() > 200 {
@@ -699,7 +807,7 @@ fn validate_page(text: &str, limit: Option<u32>, cursor: Option<&str>) -> Result
     }
 }
 fn validate_paging(limit: Option<u32>, cursor: Option<&str>) -> Result<(), &'static str> {
-    if limit.is_some_and(|n| n == 0 || n > MAX_LIMIT) || cursor.is_some_and(|c| c.len() > 8_192) {
+    if limit == Some(0) || cursor.is_some_and(|c| c.len() > 8_192) {
         Err("Invalid limit or cursor")
     } else {
         Ok(())
@@ -709,9 +817,14 @@ fn tool_result(name: &str, result: Result<Payload, AgentError>) -> Value {
     let expected = matches!(
         (name, &result),
         ("miv_status", Ok(Payload::Status(_)))
-            | ("search_items" | "items_by_tag", Ok(Payload::Items(_)))
+            | (
+                "search_items" | "items_by_tag" | "get_collection",
+                Ok(Payload::Items(_))
+            )
             | ("list_tags", Ok(Payload::Tags(_)))
             | ("list_collections", Ok(Payload::Collections(_)))
+            | ("list_library", Ok(Payload::Library(_)))
+            | ("get_item_info", Ok(Payload::Info(_)))
     );
     let (value, is_error) = match result {
         Ok(payload) if expected => (
@@ -720,6 +833,8 @@ fn tool_result(name: &str, result: Result<Payload, AgentError>) -> Value {
                 Payload::Items(v) => json!(v),
                 Payload::Tags(v) => json!(v),
                 Payload::Collections(v) => json!(v),
+                Payload::Library(v) => json!(v),
+                Payload::Info(v) => json!(v),
                 _ => unreachable!(),
             },
             false,
@@ -729,6 +844,25 @@ fn tool_result(name: &str, result: Result<Payload, AgentError>) -> Value {
             json!({"error":{"code":"internal","message":"mIV からの応答を確認できませんでした"}}),
             true,
         ),
+    };
+    let rows_within_budget = value
+        .get("items")
+        .or_else(|| value.get("tags"))
+        .or_else(|| value.get("collections"))
+        .and_then(Value::as_array)
+        .is_none_or(|rows| {
+            rows.iter()
+                .all(|row| mcp_content_chars(row).is_ok_and(|chars| chars <= MAX_ITEM_CHARS))
+        });
+    let (value, is_error) = if rows_within_budget
+        && mcp_content_chars(&value).is_ok_and(|chars| chars <= MAX_PAGE_CHARS)
+    {
+        (value, is_error)
+    } else {
+        (
+            json!({"error":{"code":"internal","message":"mIV の応答が出力予算を超えました"}}),
+            true,
+        )
     };
     json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value,"isError":is_error})
 }

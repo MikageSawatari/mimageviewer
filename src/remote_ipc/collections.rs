@@ -165,7 +165,8 @@ impl CollectionEngine {
                 subresource: None,
                 name: candidate.name,
                 kind: item_kind,
-                tags: Vec::new(),
+                tags: Some(Vec::new()),
+                container_tags: None,
                 rating: 0,
             });
             if items.len() >= wanted.min(MAX_REMOTE_COLLECTION_ENTRIES) {

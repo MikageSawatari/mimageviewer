@@ -1,12 +1,19 @@
 use super::*;
 
-struct Fixture {
-    handlers: Arc<Handlers>,
-    runtime: Option<crate::collection_store::CollectionStoreRuntime>,
-    _dir: crate::settings_db::DataDirOverrideGuard,
+fn row<T>(value: &PageRow<T>) -> &T {
+    match value {
+        PageRow::Value(value) => value,
+        PageRow::TooLong(_) => panic!("fixture row must fit the item budget"),
+    }
+}
+
+pub(super) struct Fixture {
+    pub(super) handlers: Arc<Handlers>,
+    pub(super) runtime: Option<crate::collection_store::CollectionStoreRuntime>,
+    pub(super) _dir: crate::settings_db::DataDirOverrideGuard,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let dir = crate::settings_db::DataDirOverrideGuard::new();
         let settings = crate::settings::Settings {
             agent_level: AgentLevel::ReadOnly,
@@ -34,6 +41,7 @@ impl Fixture {
             session: None,
             active: AtomicUsize::new(0),
             search_hooks: None,
+            read_hooks: None,
         });
         Self {
             _dir: dir,
@@ -41,7 +49,7 @@ impl Fixture {
             handlers,
         }
     }
-    fn set_level(&self, agent_level: AgentLevel) {
+    pub(super) fn set_level(&self, agent_level: AgentLevel) {
         crate::settings_db::with_db_result(|db| {
             let mut s = db.load_into_settings()?;
             s.agent_level = agent_level;
@@ -49,7 +57,7 @@ impl Fixture {
         })
         .unwrap();
     }
-    fn call(&self, connection: &Arc<Connection>, id: u64, command: Command) -> Response {
+    pub(super) fn call(&self, connection: &Arc<Connection>, id: u64, command: Command) -> Response {
         let (tx, rx) = crossbeam_channel::unbounded();
         let worker = connection.request(Request { id, command }, tx);
         let response = rx.recv_timeout(Duration::from_secs(10)).unwrap().wire();
@@ -58,7 +66,7 @@ impl Fixture {
         }
         response
     }
-    fn connection(&self) -> Arc<Connection> {
+    pub(super) fn connection(&self) -> Arc<Connection> {
         let c = Connection::new(self.handlers.clone());
         assert!(
             self.call(
@@ -75,7 +83,7 @@ impl Fixture {
         c
     }
 
-    fn seed_index(&self) {
+    pub(super) fn seed_index(&self) {
         use crate::fts_index::{Container, FtsIndex, IndexDoc, IndexKind, upsert_doc};
         let favorite =
             crate::settings::FavoriteEntry::new("fixture".into(), crate::data_dir::get());
@@ -154,7 +162,17 @@ fn permission_is_live_and_handshake_is_strict() {
         ErrorCode::VersionMismatch
     );
     let c = f.connection();
-    assert!(f.call(&c, 3, Command::Status).result.is_ok());
+    let Payload::Status(status) = f.call(&c, 3, Command::Status).result.unwrap() else {
+        panic!("expected status")
+    };
+    assert_eq!(
+        status.permission,
+        PermissionSnapshot {
+            level: AgentLevel::ReadOnly,
+            thumbnails: false,
+            gps: false,
+        }
+    );
     f.set_level(AgentLevel::Disabled);
     for command in [
         Command::Status,
@@ -229,109 +247,6 @@ fn admission_cancel_disconnect_and_slot_lifetime() {
 }
 
 #[test]
-fn deadline_returns_partial_without_releasing_the_running_worker_slot() {
-    let mut f = Fixture::new();
-    f.seed_index();
-    let start = Instant::now();
-    let elapsed_seconds = Arc::new(AtomicUsize::new(0));
-    let clock_elapsed = elapsed_seconds.clone();
-    let (started, workers_started) = crossbeam_channel::unbounded();
-    let (release, worker_gate) = crossbeam_channel::unbounded();
-    Arc::get_mut(&mut f.handlers).unwrap().search_hooks = Some(Arc::new(SearchHooks {
-        now: Box::new(move || {
-            start + Duration::from_secs(clock_elapsed.load(Ordering::Acquire) as u64)
-        }),
-        worker: Box::new(move |query, favorite_ids, cancel, tx| {
-            assert_eq!(query, "cat");
-            assert_eq!(favorite_ids.len(), 1, "search must load live favorites");
-            tx.send(crate::global_search::SearchStreamEvent::Batch {
-                hits: vec![crate::global_search::GlobalHit {
-                    path: "C:/fixture/cat0.png".into(),
-                    score: 1.,
-                    stars: 0,
-                    mtime: 0,
-                    file_size: Some(0),
-                }],
-                scanned_candidates: 1,
-                valid_hits: 1,
-                visibility_notice: None,
-            })
-            .unwrap();
-            started.send(cancel.clone()).unwrap();
-            // Mimic an in-flight synchronous Tantivy page: cancellation is
-            // requested at the deadline, but the worker cannot return yet.
-            worker_gate.recv_timeout(Duration::from_secs(10)).unwrap();
-        }),
-    }));
-    let a = f.connection();
-    let b = f.connection();
-    let c = f.connection();
-    let (tx, rx) = crossbeam_channel::unbounded();
-    let controllers: Vec<_> = [&a, &b]
-        .into_iter()
-        .enumerate()
-        .map(|(index, connection)| {
-            connection
-                .request(
-                    Request {
-                        id: 10 + index as u64,
-                        command: Command::SearchItems {
-                            query: "cat".into(),
-                            kind: Some(ItemKind::Image),
-                            limit: Some(50),
-                            cursor: None,
-                        },
-                    },
-                    tx.clone(),
-                )
-                .expect("real request controller")
-        })
-        .collect();
-    let cancels: Vec<_> = (0..2)
-        .map(|_| {
-            workers_started
-                .recv_timeout(Duration::from_secs(10))
-                .unwrap()
-        })
-        .collect();
-    // Both deadlines were captured before these workers started. Whether their
-    // queued batches were consumed before the deadline does not affect slot ownership.
-    elapsed_seconds.store(20, Ordering::Release);
-    let mut response_ids = Vec::new();
-    for _ in 0..2 {
-        let response = rx.recv_timeout(Duration::from_secs(10)).unwrap().wire();
-        response_ids.push(response.id);
-        let Payload::Items(page) = response.result.unwrap() else {
-            panic!("expected a partial search response")
-        };
-        assert!(page.items.len() <= 1);
-        if let Some(item) = page.items.first() {
-            assert_eq!(item.path, "C:/fixture/cat0.png");
-        }
-        assert!(page.truncated);
-    }
-    response_ids.sort();
-    assert_eq!(response_ids, [10, 11]);
-    assert!(cancels.iter().all(|cancel| cancel.load(Ordering::Acquire)));
-    assert_eq!(f.handlers.active.load(Ordering::Acquire), 2);
-    assert!(controllers.iter().all(|worker| !worker.is_finished()));
-    assert_eq!(
-        f.call(&c, 12, Command::Status).result.unwrap_err().code,
-        ErrorCode::Busy
-    );
-    for _ in 0..2 {
-        release.send(()).unwrap();
-    }
-    for controller in controllers {
-        controller.join().unwrap();
-    }
-    assert_eq!(f.handlers.active.load(Ordering::Acquire), 0);
-    assert!(a.running.lock().unwrap().is_none());
-    assert!(b.running.lock().unwrap().is_none());
-    assert!(f.call(&c, 13, Command::Status).result.is_ok());
-}
-
-#[test]
 fn cursor_continuation_and_character_budget() {
     let f = Fixture::new();
     let items: Vec<_> = (0..8)
@@ -340,17 +255,18 @@ fn cursor_continuation_and_character_budget() {
             subresource: None,
             name: format!("{i}{}", "猫".repeat(5000)),
             kind: ItemKind::Image,
-            tags: vec![],
+            tags: Some(vec![]),
+            container_tags: None,
             rating: 0,
         })
         .collect();
     let args = serde_json::json!(["猫", null, "path"]);
     let one = page(items.clone(), 0, 5, false, "items_by_tag", args.clone()).unwrap();
     assert!(one.truncated);
-    assert!(json_chars(&one) <= MAX_PAGE_CHARS);
+    assert!(mcp_content_chars(&one).unwrap() <= MAX_PAGE_CHARS);
     let offset = decode_cursor(one.cursor.as_deref(), "items_by_tag", &args).unwrap();
     let two = page(items, offset, 5, false, "items_by_tag", args.clone()).unwrap();
-    assert_ne!(one.items[0].path, two.items[0].path);
+    assert_ne!(row(&one.items[0]).path, row(&two.items[0]).path);
     assert_eq!(
         decode_cursor(one.cursor.as_deref(), "search_items", &args)
             .unwrap_err()
@@ -365,7 +281,7 @@ fn cursor_continuation_and_character_budget() {
 #[test]
 fn queued_results_are_revoked_even_after_reenable_and_unrelated_saves_are_allowed() {
     let f = Fixture::new();
-    let (_, epoch) = permission().unwrap();
+    let grant = permission().unwrap();
     let reply = || Reply {
         response: Response {
             id: 1,
@@ -375,7 +291,7 @@ fn queued_results_are_revoked_even_after_reenable_and_unrelated_saves_are_allowe
                 truncated: false,
             })),
         },
-        permission_epoch: epoch,
+        policy: ReplyPolicy::Read(grant),
     };
     crate::settings_db::with_db_result(|db| {
         let mut s = db.load_into_settings()?;
@@ -387,7 +303,7 @@ fn queued_results_are_revoked_even_after_reenable_and_unrelated_saves_are_allowe
     f.set_level(AgentLevel::Disabled);
     f.set_level(AgentLevel::ReadOnly);
     assert_eq!(reply().wire().result.unwrap_err().code, ErrorCode::Disabled);
-    assert_ne!(epoch, permission().unwrap().1);
+    assert_ne!(grant.1, permission().unwrap().1);
 }
 
 #[test]
@@ -434,7 +350,7 @@ fn fts_fixture_search_uses_live_favorites_and_has_cursor() {
         first
             .items
             .iter()
-            .all(|a| second.items.iter().all(|b| a.path != b.path))
+            .all(|a| second.items.iter().all(|b| row(a).path != row(b).path))
     );
     let Payload::Items(other) = f
         .call(
@@ -704,8 +620,8 @@ fn tags_use_the_projection_and_real_rating_database() {
         panic!()
     };
     assert_eq!(page.items.len(), 1);
-    assert_eq!(page.items[0].rating, 4);
-    assert_eq!(page.items[0].tags, ["#cat"]);
+    assert_eq!(row(&page.items[0]).rating, 4);
+    assert_eq!(row(&page.items[0]).tags, Some(vec!["#cat".into()]));
     let Payload::Tags(page) = f
         .call(
             &c,
@@ -721,8 +637,8 @@ fn tags_use_the_projection_and_real_rating_database() {
     else {
         panic!()
     };
-    assert_eq!(page.tags[0].name, "cat");
-    assert_eq!(page.tags[0].count, 1);
+    assert_eq!(row(&page.tags[0]).name, "cat");
+    assert_eq!(row(&page.tags[0]).count, 1);
     let Payload::Collections(page) = f
         .call(
             &c,
@@ -737,8 +653,8 @@ fn tags_use_the_projection_and_real_rating_database() {
     else {
         panic!()
     };
-    assert_eq!(page.collections[0].name, "fixture collection");
-    assert_eq!(page.collections[0].count, 1);
+    assert_eq!(row(&page.collections[0]).name, "fixture collection");
+    assert_eq!(row(&page.collections[0]).count, 1);
 }
 
 #[test]
@@ -800,7 +716,7 @@ fn tag_and_collection_pages_continue_past_200_and_validate_cursors() {
         .tags
         .iter()
         .chain(&second.tags)
-        .map(|t| t.name.clone())
+        .map(|t| row(t).name.clone())
         .collect::<Vec<_>>();
     assert_eq!(
         names,
@@ -872,7 +788,7 @@ fn tag_and_collection_pages_continue_past_200_and_validate_cursors() {
         .collections
         .iter()
         .chain(&second.collections)
-        .map(|t| t.name.clone())
+        .map(|t| row(t).name.clone())
         .collect::<Vec<_>>();
     assert_eq!(
         names,
@@ -880,10 +796,10 @@ fn tag_and_collection_pages_continue_past_200_and_validate_cursors() {
             .map(|i| format!("collection-{i:03}"))
             .collect::<Vec<_>>()
     );
-    assert!(second.collections.iter().all(|row| row.count == 0));
+    assert!(second.collections.iter().all(|value| row(value).count == 0));
     assert!(!second.truncated);
     assert!(second.cursor.is_none());
-    for limit in [0, MAX_LIMIT + 1] {
+    for limit in [0] {
         for command in [
             Command::ListTags {
                 choice: TagChoice::All,
@@ -899,6 +815,24 @@ fn tag_and_collection_pages_continue_past_200_and_validate_cursors() {
                 f.call(&c, 7, command).result.unwrap_err().code,
                 ErrorCode::BadRequest
             );
+        }
+    }
+    for command in [
+        Command::ListTags {
+            choice: TagChoice::All,
+            limit: Some(MAX_LIMIT + 1),
+            cursor: None,
+        },
+        Command::ListCollections {
+            limit: Some(MAX_LIMIT + 1),
+            cursor: None,
+        },
+    ] {
+        let response = f.call(&c, 8, command);
+        match response.result.unwrap() {
+            Payload::Tags(page) => assert_eq!(page.tags.len(), MAX_LIMIT as usize),
+            Payload::Collections(page) => assert_eq!(page.collections.len(), MAX_LIMIT as usize),
+            _ => panic!("expected a clamped first page"),
         }
     }
 }
@@ -922,7 +856,7 @@ fn named_pages_use_actual_serialized_character_cap_and_returned_offset() {
         cursor,
         truncated,
     };
-    assert!(json_chars(&page) <= MAX_PAGE_CHARS);
+    assert!(mcp_content_chars(&page).unwrap() <= MAX_PAGE_CHARS);
     assert_eq!(
         decode_cursor(page.cursor.as_deref(), "list_tags", &args).unwrap(),
         50 + page.tags.len()
@@ -930,6 +864,7 @@ fn named_pages_use_actual_serialized_character_cap_and_returned_offset() {
     let args = serde_json::json!(["catalog_order"]);
     let rows = (0..20)
         .map(|i| Collection {
+            id: format!("collection-{i}"),
             name: format!("{i}{}", "猫\\\"".repeat(300)),
             count: 5,
         })
@@ -950,23 +885,27 @@ fn named_pages_use_actual_serialized_character_cap_and_returned_offset() {
     };
     assert!(page.truncated);
     assert!(!page.collections.is_empty());
-    assert!(json_chars(&page) <= MAX_PAGE_CHARS);
+    assert!(mcp_content_chars(&page).unwrap() <= MAX_PAGE_CHARS);
     assert_eq!(
         decode_cursor(page.cursor.as_deref(), "list_collections", &args).unwrap(),
         200 + page.collections.len()
     );
+    let (tags, cursor, _) = bounded_rows(
+        vec![Tag {
+            name: "猫".repeat(MAX_PAGE_CHARS),
+            count: 1,
+        }],
+        0,
+        false,
+        "list_tags",
+        serde_json::json!([]),
+        "tags",
+    )
+    .unwrap();
+    assert_eq!(tags.len(), 1);
+    assert!(matches!(&tags[0], PageRow::TooLong(_)));
     assert!(
-        bounded_rows(
-            vec![Tag {
-                name: "猫".repeat(MAX_PAGE_CHARS),
-                count: 1
-            }],
-            0,
-            false,
-            "list_tags",
-            serde_json::json!([]),
-            "tags"
-        )
-        .is_err()
+        cursor.is_none(),
+        "the omitted row consumed the final input position"
     );
 }

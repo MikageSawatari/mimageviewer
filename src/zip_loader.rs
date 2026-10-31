@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 // ── 外側 ZIP の中央目次キャッシュ ─────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ArchiveCacheKey {
+pub(crate) struct ArchiveCacheKey {
     path: PathBuf,
     mtime: Option<std::time::SystemTime>,
     len: u64,
@@ -1007,7 +1007,7 @@ fn find_nested_zip_boundaries(entry_name: &str) -> Vec<usize> {
 /// エントリ名をネスト ZIP 境界で分割する。
 /// 戻り値: 各セグメント。先頭 n-1 個が nested zip パス (末尾 ".zip")、最後が葉。
 /// 境界がなければ長さ 1 の単一セグメントを返す。
-fn split_nested_zip_path(entry_name: &str) -> Vec<&str> {
+pub(crate) fn split_nested_zip_path(entry_name: &str) -> Vec<&str> {
     let boundaries = find_nested_zip_boundaries(entry_name);
     if boundaries.is_empty() {
         return vec![entry_name];
@@ -2771,7 +2771,7 @@ fn read_entry_from_bytes(
 /// Shift-JIS の生名を持つことがあり、復号した名前では `index_for_name` が当たらない。
 /// 部分読みを別経路で書いたときにこの段を丸ごと落とし、**その書庫では寸法が 1 件も
 /// 取れなかった** (2026-08-26)。読み方が増えても、解決の順番は複製しないこと。
-fn resolve_entry_index<R: Read + Seek>(
+pub(crate) fn resolve_entry_index<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     entry_name: &str,
     cache_key: Option<ArchiveCacheKey>,

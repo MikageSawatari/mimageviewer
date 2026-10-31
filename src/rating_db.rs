@@ -659,6 +659,28 @@ impl RatingDb {
         rows.collect()
     }
 
+    /// Agent listing uses a threshold, with deterministic rating/time/path order.
+    pub(crate) fn list_at_least_stars(
+        &self,
+        stars: u8,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<RatingRow>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, stars, rated_at_ms, source_path, kind, entry_name, page_num,
+                    dir_prefix, archive_format, zipdir_is_archive, zipdir_representative
+             FROM ratings WHERE stars >= ?1
+             ORDER BY stars DESC, COALESCE(rated_at_ms, -1) DESC, path",
+        )?;
+        let mut result = Vec::new();
+        for row in stmt.query_map([stars.clamp(1, 5) as i64], row_from_sql)? {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
     /// ★0〜★5 の件数。index 0 は未評価ではなく常に 0 (DB 行が無いため)。
     pub fn count_by_stars(&self) -> Result<[usize; 6], rusqlite::Error> {
         #[cfg(test)]

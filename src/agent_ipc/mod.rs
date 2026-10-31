@@ -9,9 +9,15 @@ use std::time::{Duration, Instant};
 
 use mimageviewer_agent_ipc::*;
 use serde::{Deserialize, Serialize};
+mod item_info;
+mod library;
+mod work;
+use work::*;
 
 #[cfg(windows)]
 mod pipe;
+#[cfg(test)]
+mod read_tests;
 #[cfg(test)]
 mod tests;
 
@@ -36,6 +42,8 @@ impl Server {
                     active: AtomicUsize::new(0),
                     #[cfg(test)]
                     search_hooks: None,
+                    #[cfg(test)]
+                    read_hooks: None,
                 }))?,
             })
         }
@@ -54,6 +62,8 @@ struct Handlers {
     active: AtomicUsize,
     #[cfg(test)]
     search_hooks: Option<Arc<SearchHooks>>,
+    #[cfg(test)]
+    read_hooks: Option<Arc<ReadHooks>>,
 }
 
 #[cfg(test)]
@@ -77,13 +87,21 @@ struct Running {
 
 struct Reply {
     response: Response,
-    permission_epoch: u64,
+    policy: ReplyPolicy,
+}
+type PermissionGrant = (PermissionSnapshot, u64);
+enum ReplyPolicy {
+    Read(PermissionGrant),
+    Rejected,
+    // Future accepted operations retain their result after the acceptance point.
+    #[allow(dead_code)]
+    AcceptedOperation,
 }
 impl Reply {
     fn wire(mut self) -> Response {
-        if self.response.result.is_ok() {
-            self.response.result = permission().and_then(|(_, epoch)| {
-                if epoch != self.permission_epoch {
+        if let ReplyPolicy::Read(granted) = self.policy {
+            self.response.result = permission().and_then(|current| {
+                if current != granted {
                     Err(error(
                         ErrorCode::Disabled,
                         "AI 連携の許可が変更されました。もう一度お試しください",
@@ -135,13 +153,13 @@ fn collection_error(cause: crate::collection_store::CollectionStoreError) -> Age
 fn cancelled() -> AgentError {
     error(ErrorCode::Cancelled, "取り消しました")
 }
-fn permission() -> Result<(AgentLevel, u64), AgentError> {
-    let (level, epoch) = crate::settings_db::with_db_result(|db| db.load_agent_permission())
+fn permission() -> Result<PermissionGrant, AgentError> {
+    let (snapshot, epoch) = crate::settings_db::with_db_result(|db| db.load_agent_permission())
         .map_err(|_| error(ErrorCode::Busy, "設定を読み込めませんでした"))?;
-    if level == AgentLevel::Disabled {
+    if snapshot.level == AgentLevel::Disabled {
         Err(error(ErrorCode::Disabled, "AI 連携 (MCP) は無効です"))
     } else {
-        Ok((level, epoch))
+        Ok((snapshot, epoch))
     }
 }
 
@@ -204,7 +222,7 @@ impl Connection {
                     id: request.id,
                     result,
                 },
-                permission_epoch: 0,
+                policy: ReplyPolicy::Rejected,
             });
         };
         let granted = match permission() {
@@ -231,7 +249,7 @@ impl Connection {
                     id: request.id,
                     result,
                 },
-                permission_epoch: granted.1,
+                policy: ReplyPolicy::Read(granted),
             });
             return None;
         }
@@ -253,47 +271,21 @@ impl Connection {
         let connection = self.clone();
         let fallback = replies.clone();
         let id = request.id;
+        let context = ReadContext::new(&self.handlers, granted.0, cancel);
         match std::thread::Builder::new()
             .name("agent-read".into())
             .spawn(move || {
-                let (result, search_worker) = connection.handlers.execute(request.command, &cancel);
-                // Revocation is checked after the read and immediately before publication.
-                let result = permission().and_then(|current| {
-                    if current != granted {
-                        Err(error(
-                            ErrorCode::Disabled,
-                            "AI 連携の許可が変更されました。もう一度お試しください",
-                        ))
-                    } else if cancel.load(Ordering::Acquire) {
-                        Err(cancelled())
-                    } else {
-                        result
-                    }
-                });
-                if matches!(result, Ok(Payload::Hello { .. })) {
-                    connection.hello.store(true, Ordering::Release);
-                }
-                record(tool, started, &result);
-                let reply = Reply {
-                    response: Response { id, result },
-                    permission_epoch: granted.1,
-                };
-                if let Some(worker) = search_worker {
-                    if worker.is_finished() {
-                        let _ = worker.join();
-                        drop(permit);
-                        let _ = replies.send(reply);
-                        return;
-                    }
-                    let _ = replies.send(reply);
-                    let _ = worker.join();
-                    drop(permit);
-                } else {
-                    // All read work has ended. Release admission before exposing the
-                    // response so a client's immediately following request cannot race it.
-                    drop(permit);
-                    let _ = replies.send(reply);
-                }
+                work::respond(
+                    connection,
+                    request.command,
+                    granted,
+                    permit,
+                    context,
+                    replies,
+                    started,
+                    id,
+                    tool,
+                );
             }) {
             Ok(worker) => Some(worker),
             Err(_) => {
@@ -302,7 +294,7 @@ impl Connection {
                         id,
                         result: Err(internal()),
                     },
-                    permission_epoch: 0,
+                    policy: ReplyPolicy::Rejected,
                 });
                 None
             }
@@ -342,6 +334,9 @@ fn tool_name(command: &Command) -> &'static str {
         Command::ListTags { .. } => "list_tags",
         Command::ItemsByTag { .. } => "items_by_tag",
         Command::ListCollections { .. } => "list_collections",
+        Command::GetCollection { .. } => "get_collection",
+        Command::ListLibrary { .. } => "list_library",
+        Command::GetItemInfo { .. } => "get_item_info",
         Command::Cancel { .. } => "cancel",
     }
 }
@@ -350,6 +345,8 @@ fn result_summary(result: &Result<Payload, AgentError>) -> (usize, &'static str)
         Ok(Payload::Items(p)) => (p.items.len(), "none"),
         Ok(Payload::Tags(p)) => (p.tags.len(), "none"),
         Ok(Payload::Collections(p)) => (p.collections.len(), "none"),
+        Ok(Payload::Library(p)) => (p.items.len(), "none"),
+        Ok(Payload::Info(p)) => (p.items.len(), "none"),
         Ok(_) => (0, "none"),
         Err(e) => (
             0,
@@ -360,6 +357,7 @@ fn result_summary(result: &Result<Payload, AgentError>) -> (usize, &'static str)
                 ErrorCode::VersionMismatch => "version_mismatch",
                 ErrorCode::Busy => "busy",
                 ErrorCode::Cancelled => "cancelled",
+                ErrorCode::Timeout => "timeout",
                 ErrorCode::Internal => "internal",
             },
         ),
@@ -370,8 +368,9 @@ impl Handlers {
     fn execute(
         &self,
         command: Command,
-        cancel: &Arc<AtomicBool>,
+        ctx: &ReadContext,
     ) -> (Result<Payload, AgentError>, Option<JoinHandle<()>>) {
+        let cancel = &ctx.cancel;
         if let Command::SearchItems {
             query,
             kind,
@@ -379,7 +378,7 @@ impl Handlers {
             cursor,
         } = command
         {
-            return self.search(query, kind, limit, cursor, cancel);
+            return self.search(query, kind, limit, cursor, ctx);
         }
         let result = (|| match command {
             Command::Hello { version, .. } => {
@@ -387,7 +386,7 @@ impl Handlers {
             }
             Command::Status => Ok(Payload::Status(StatusPayload {
                 app_version: env!("CARGO_PKG_VERSION").into(),
-                agent_level: permission()?.0,
+                permission: ctx.permission,
                 fts_ready: self.readers.fts.read().unwrap().is_some(),
                 remote_active: self.session.as_ref().is_some_and(|s| {
                     s.snapshot().phase != crate::remote_ipc::session::RemoteControlPhase::Local
@@ -436,6 +435,27 @@ impl Handlers {
             Command::ListCollections { limit, cursor } => self
                 .collections(limit, cursor, cancel)
                 .map(Payload::Collections),
+            Command::GetCollection {
+                id,
+                name,
+                limit,
+                cursor,
+            } => self
+                .get_collection(id, name, limit, cursor, ctx)
+                .map(Payload::Items),
+            Command::ListLibrary {
+                kind,
+                stars,
+                limit,
+                cursor,
+            } => self
+                .library(kind, stars, limit, cursor, ctx)
+                .map(Payload::Library),
+            Command::GetItemInfo {
+                items,
+                limit,
+                cursor,
+            } => self.item_info(items, limit, cursor, ctx).map(Payload::Info),
             Command::Cancel { .. } | Command::SearchItems { .. } => unreachable!(),
         })();
         (result, None)
@@ -476,6 +496,7 @@ impl Handlers {
                 .map_err(|_| internal())?
                 .map_err(collection_error)?;
             collections.push(Collection {
+                id: definition.id.to_string(),
                 name: definition.name.clone(),
                 count: snapshot.entries.len() as u64,
             });
@@ -501,8 +522,9 @@ impl Handlers {
         kind: Option<ItemKind>,
         limit: Option<u32>,
         cursor: Option<String>,
-        cancel: &Arc<AtomicBool>,
+        ctx: &ReadContext,
     ) -> (Result<Payload, AgentError>, Option<JoinHandle<()>>) {
+        let cancel = &ctx.cancel;
         let setup = (|| {
             let query = query.trim().to_owned();
             validate_text(&query)?;
@@ -574,15 +596,97 @@ impl Handlers {
             Ok(w) => w,
             Err(_) => return (Err(internal()), None),
         };
-        let collected = collect_search(&rx, cancel, offset + limit, deadline, now);
+        let collected = collect_search(&rx, cancel, offset + limit, deadline, &now, |items| {
+            if items.len() > offset {
+                let page = page(
+                    items.to_vec(),
+                    offset,
+                    limit,
+                    true,
+                    "search_items",
+                    args.clone(),
+                )?;
+                ctx.publish(Payload::Items(page));
+            }
+            Ok(())
+        });
         search_cancel.store(true, Ordering::Release);
         drop(rx);
         (
             collected.and_then(|(items, truncated)| {
+                if truncated && items.len() <= offset && now() >= deadline {
+                    return Err(timeout());
+                }
                 page(items, offset, limit, truncated, "search_items", args).map(Payload::Items)
             }),
             Some(worker),
         )
+    }
+
+    fn item_info(
+        &self,
+        items: Vec<ItemRef>,
+        limit: Option<u32>,
+        cursor: Option<String>,
+        ctx: &ReadContext,
+    ) -> Result<InfoPage, AgentError> {
+        if items.is_empty() || items.len() > MAX_INFO_LIMIT as usize {
+            return Err(error(
+                ErrorCode::BadRequest,
+                "項目は1～50件で指定してください",
+            ));
+        }
+        let normalized = items
+            .iter()
+            .map(|item| {
+                let path = resolve_data_dir(Path::new(&item.path))
+                    .map_err(|_| error(ErrorCode::BadRequest, "絶対パスを指定してください"))?;
+                Ok(serde_json::json!([
+                    path.to_string_lossy().replace('/', "\\").to_lowercase(),
+                    item.subresource.as_ref().map(|s| s.replace('\\', "/"))
+                ]))
+            })
+            .collect::<Result<Vec<_>, AgentError>>()?;
+        let args = serde_json::json!([normalized, "input_order"]);
+        let offset = decode_cursor(cursor.as_deref(), "get_item_info", &args)?;
+        if offset > items.len() {
+            return Err(error(ErrorCode::BadRequest, "最初からやり直してください"));
+        }
+        let limit = limit_value(limit)?;
+        let mut rows = Vec::new();
+        for item in items.iter().skip(offset).take(limit) {
+            ctx.checkpoint()?;
+            rows.push(item_info::read(item, ctx.permission, &ctx.cancel)?);
+            let (page_rows, cursor, truncated) = bounded_rows(
+                rows.clone(),
+                offset,
+                true,
+                "get_item_info",
+                args.clone(),
+                "items",
+            )?;
+            let count = page_rows.len();
+            ctx.publish(Payload::Info(InfoPage {
+                items: page_rows,
+                cursor,
+                truncated,
+            }));
+            // Stop reading as soon as the page budget is full. Continuation
+            // starts at this input offset, never at the start of the array.
+            if count < rows.len() {
+                rows.truncate(count);
+                break;
+            }
+        }
+        ctx.checkpoint()?;
+        let more = offset + rows.len() < items.len();
+        let (items, cursor, truncated) =
+            bounded_rows(rows, offset, more, "get_item_info", args, "items")?;
+        Ok(InfoPage {
+            items,
+            cursor,
+            truncated,
+        })
     }
 }
 
@@ -592,6 +696,7 @@ fn collect_search(
     wanted: usize,
     deadline: Instant,
     now: impl Fn() -> Instant,
+    mut prefix: impl FnMut(&[Item]) -> Result<(), AgentError>,
 ) -> Result<(Vec<Item>, bool), AgentError> {
     let mut items = Vec::new();
     let mut truncated = false;
@@ -610,6 +715,9 @@ fn collect_search(
         ) {
             Ok(crate::global_search::SearchStreamEvent::Batch { hits, .. }) => {
                 items.extend(hits.into_iter().map(|h| item_from_hit(&h.path)));
+                if let Err(error) = prefix(&items) {
+                    break Err(error);
+                }
                 // Fetch only enough to establish whether another page exists.
                 if items.len() > wanted {
                     truncated = true;
@@ -672,7 +780,8 @@ fn item_from_hit(path: &str) -> Item {
         subresource: member.map(str::to_owned),
         name: leaf.rsplit(['/', '\\']).next().unwrap_or(leaf).to_owned(),
         kind,
-        tags: vec![],
+        tags: if member.is_some() { None } else { Some(vec![]) },
+        container_tags: None,
         rating: 0,
     }
 }
@@ -692,11 +801,11 @@ fn validate_text(text: &str) -> Result<(), AgentError> {
 }
 fn limit_value(limit: Option<u32>) -> Result<usize, AgentError> {
     match limit.unwrap_or(DEFAULT_LIMIT) {
-        n @ 1..=MAX_LIMIT => Ok(n as usize),
-        _ => Err(error(
+        0 => Err(error(
             ErrorCode::BadRequest,
             "件数は 1～200 件で指定してください",
         )),
+        n => Ok(n.min(MAX_LIMIT) as usize),
     }
 }
 
@@ -704,15 +813,15 @@ fn limit_value(limit: Option<u32>) -> Result<usize, AgentError> {
 struct Cursor {
     version: u32,
     tool: String,
-    args: serde_json::Value,
+    args_digest: String,
     returned: usize,
 }
 fn encode_cursor(tool: &str, args: serde_json::Value, returned: usize) -> String {
     // Hex JSON is opaque to clients and needs no dependency or process-local cursor state.
     serde_json::to_vec(&Cursor {
-        version: 1,
+        version: 2,
         tool: tool.into(),
-        args,
+        args_digest: wire_digest(&args).expect("serializable cursor arguments"),
         returned,
     })
     .unwrap()
@@ -737,9 +846,9 @@ fn decode_cursor(
         .map(|i| u8::from_str_radix(&cursor[i..i + 2], 16).map_err(|_| bad()))
         .collect::<Result<Vec<_>, _>>()?;
     let decoded: Cursor = serde_json::from_slice(&bytes).map_err(|_| bad())?;
-    if decoded.version != 1
+    if decoded.version != 2
         || decoded.tool != tool
-        || decoded.args != *args
+        || decoded.args_digest != wire_digest(args).map_err(|_| bad())?
         || decoded.returned > 100_000
     {
         return Err(bad());
@@ -771,9 +880,16 @@ fn enrich(items: &mut [Item]) -> Result<(), AgentError> {
         );
         let key = crate::global_search_ui::hit_rating_key(&logical);
         item.rating = ratings.as_ref().map_or(0, |db| db.get(&key));
-        item.tags = tags.as_ref().map_or_else(Vec::new, |db| {
+        let stored_tags = tags.as_ref().map_or_else(Vec::new, |db| {
             db.display_tags_for_item(&crate::tags_db::item_key_for_path(Path::new(&item.path)))
         });
+        if item.subresource.is_some() {
+            item.tags = None;
+            item.container_tags = Some(stored_tags);
+        } else {
+            item.tags = Some(stored_tags);
+            item.container_tags = None;
+        }
     }
     Ok(())
 }
@@ -811,19 +927,31 @@ fn page(
 /// One character/cursor boundary for every paginated projection. The cursor
 /// advances by the rows actually returned, including a character-limited page.
 fn bounded_rows<T: Serialize>(
-    mut rows: Vec<T>,
+    rows: Vec<T>,
     offset: usize,
     mut truncated: bool,
     tool: &str,
     args: serde_json::Value,
     field: &str,
-) -> Result<(Vec<T>, Option<String>, bool), AgentError> {
+) -> Result<(Vec<PageRow<T>>, Option<String>, bool), AgentError> {
+    let mut rows = rows
+        .into_iter()
+        .map(|row| {
+            if mcp_content_chars(&row).map_err(|_| internal())? > MAX_ITEM_CHARS {
+                PageRow::too_long(&row).map_err(|_| internal())
+            } else {
+                Ok(PageRow::Value(row))
+            }
+        })
+        .collect::<Result<Vec<_>, AgentError>>()?;
     loop {
         let cursor = (truncated && !rows.is_empty())
             .then(|| encode_cursor(tool, args.clone(), offset + rows.len()));
-        if json_chars(
+        if mcp_content_chars(
             &serde_json::json!({ (field): &rows, "cursor": &cursor, "truncated": truncated }),
-        ) <= MAX_PAGE_CHARS
+        )
+        .map_err(|_| internal())?
+            <= MAX_PAGE_CHARS
         {
             return Ok((rows, cursor, truncated));
         }

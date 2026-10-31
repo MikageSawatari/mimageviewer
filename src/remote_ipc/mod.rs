@@ -15,6 +15,8 @@ mod thumbnail;
 mod video_jump;
 mod video_stream;
 
+pub(crate) use container::file_image_dims;
+
 #[cfg(windows)]
 mod pipe;
 #[cfg(windows)]

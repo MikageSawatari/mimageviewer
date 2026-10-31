@@ -6,13 +6,32 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-pub const AGENT_PROTOCOL_VERSION: u32 = 1;
-pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+mod read_types;
+pub use read_types::*;
+
+pub const AGENT_PROTOCOL_VERSION: u32 = 2;
+pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_LIMIT: u32 = 50;
 pub const MAX_LIMIT: u32 = 200;
-/// Core page projection must leave room for the duplicated MCP text JSON.
-pub const MAX_PAGE_CHARS: usize = 8_000;
+pub const MAX_INFO_LIMIT: u32 = 50;
+/// All non-image budgets count the structured JSON and its escaped text copy.
+pub const MAX_ITEM_CHARS: usize = 12_000;
+pub const MCP_ENVELOPE_RESERVE_CHARS: usize = 2_000;
 pub const MAX_MCP_RESPONSE_CHARS: usize = 40_000;
+pub const MAX_PAGE_CHARS: usize = MAX_MCP_RESPONSE_CHARS - MCP_ENVELOPE_RESERVE_CHARS;
+
+/// The exact content contribution shared by core pagination and the MCP envelope.
+pub fn mcp_content_chars<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<usize> {
+    let serialized = serde_json::to_string(value)?;
+    Ok(serialized.chars().count() + serde_json::to_string(&serialized)?.chars().count())
+}
+
+/// Digest normalized arguments or an omitted row's identity without retaining
+/// long paths or argument arrays inside the cursor/marker.
+pub fn wire_digest<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<String> {
+    let digest = Sha256::digest(serde_json::to_vec(value)?);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Request {
@@ -48,6 +67,23 @@ pub enum Command {
         limit: Option<u32>,
         cursor: Option<String>,
     },
+    GetCollection {
+        id: Option<String>,
+        name: Option<String>,
+        limit: Option<u32>,
+        cursor: Option<String>,
+    },
+    ListLibrary {
+        kind: LibraryKind,
+        stars: Option<u8>,
+        limit: Option<u32>,
+        cursor: Option<String>,
+    },
+    GetItemInfo {
+        items: Vec<ItemRef>,
+        limit: Option<u32>,
+        cursor: Option<String>,
+    },
     Cancel {
         request_id: u64,
     },
@@ -65,6 +101,8 @@ pub enum Payload {
     Items(ItemPage),
     Tags(TagPage),
     Collections(CollectionPage),
+    Library(LibraryPage),
+    Info(InfoPage),
     Cancelled,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -84,6 +122,14 @@ pub enum AgentLevel {
     #[default]
     Disabled,
     ReadOnly,
+    ReadAndOpen,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PermissionSnapshot {
+    pub level: AgentLevel,
+    pub thumbnails: bool,
+    pub gps: bool,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -96,7 +142,7 @@ pub enum TagChoice {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StatusPayload {
     pub app_version: String,
-    pub agent_level: AgentLevel,
+    pub permission: PermissionSnapshot,
     pub fts_ready: bool,
     pub remote_active: bool,
 }
@@ -106,12 +152,13 @@ pub struct Item {
     pub subresource: Option<String>,
     pub name: String,
     pub kind: ItemKind,
-    pub tags: Vec<String>,
+    pub tags: Option<Vec<String>>,
+    pub container_tags: Option<Vec<String>>,
     pub rating: u8,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ItemPage {
-    pub items: Vec<Item>,
+    pub items: Vec<PageRow<Item>>,
     pub cursor: Option<String>,
     pub truncated: bool,
 }
@@ -122,18 +169,19 @@ pub struct Tag {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TagPage {
-    pub tags: Vec<Tag>,
+    pub tags: Vec<PageRow<Tag>>,
     pub cursor: Option<String>,
     pub truncated: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Collection {
+    pub id: String,
     pub name: String,
     pub count: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CollectionPage {
-    pub collections: Vec<Collection>,
+    pub collections: Vec<PageRow<Collection>>,
     pub cursor: Option<String>,
     pub truncated: bool,
 }
@@ -146,6 +194,7 @@ pub enum ErrorCode {
     VersionMismatch,
     Busy,
     Cancelled,
+    Timeout,
     Internal,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -258,7 +307,9 @@ pub fn derive_pipe_name(resolved_absolute_data_dir: &Path, user_sid: &str) -> io
     let normalized = path.trim_end_matches('\\');
     let digest = Sha256::digest(normalized.as_bytes());
     let hash: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
-    Ok(format!(r"\\.\pipe\mimageviewer-agent-v1-{user_sid}-{hash}"))
+    Ok(format!(
+        r"\\.\pipe\mimageviewer-agent-v{AGENT_PROTOCOL_VERSION}-{user_sid}-{hash}"
+    ))
 }
 
 #[cfg(windows)]
@@ -354,11 +405,22 @@ mod tests {
             assert!(read_frame::<_, Request>(&mut &bad[..]).is_err());
         }
         assert!(write_frame(&mut Vec::new(), &"x".repeat(MAX_FRAME_BYTES)).is_err());
+        let expanded = "猫".repeat(400_000);
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &expanded).unwrap();
+        assert!(bytes.len() > 1024 * 1024);
+        assert_eq!(
+            read_frame::<_, String>(&mut &bytes[..]).unwrap(),
+            Some(expanded)
+        );
     }
     #[test]
     fn namespace_is_normalized_and_isolated() {
         let sid = "S-1-5-21-123";
         let base = derive_pipe_name(Path::new(r"C:\Users\Test\data"), sid).unwrap();
+        assert!(base.starts_with(&format!(
+            r"\\.\pipe\mimageviewer-agent-v{AGENT_PROTOCOL_VERSION}-"
+        )));
         assert_eq!(
             base,
             derive_pipe_name(Path::new("c:/users/test/data/"), sid).unwrap()
@@ -427,6 +489,26 @@ mod tests {
                 limit: Some(23),
                 cursor: Some("collections-cursor".into()),
             },
+            Command::GetCollection {
+                id: Some("collection-id".into()),
+                name: None,
+                limit: Some(1),
+                cursor: None,
+            },
+            Command::ListLibrary {
+                kind: LibraryKind::Rated,
+                stars: Some(3),
+                limit: Some(2),
+                cursor: None,
+            },
+            Command::GetItemInfo {
+                items: vec![ItemRef {
+                    path: "C:/books/cat.zip".into(),
+                    subresource: Some("001.png".into()),
+                }],
+                limit: Some(MAX_INFO_LIMIT),
+                cursor: Some("info-cursor".into()),
+            },
             Command::Cancel { request_id: 2 },
         ];
         for command in commands {
@@ -448,6 +530,120 @@ mod tests {
         assert_eq!(
             read_frame::<_, Response>(&mut &bytes[..]).unwrap(),
             Some(response)
+        );
+    }
+
+    #[test]
+    fn permission_order_and_serde_include_read_and_open_without_enabling_defaults() {
+        assert!(AgentLevel::Disabled < AgentLevel::ReadOnly);
+        assert!(AgentLevel::ReadOnly < AgentLevel::ReadAndOpen);
+        assert_eq!(
+            serde_json::to_string(&AgentLevel::ReadAndOpen).unwrap(),
+            r#""read_and_open""#
+        );
+        assert_eq!(
+            PermissionSnapshot::default(),
+            PermissionSnapshot {
+                level: AgentLevel::Disabled,
+                thumbnails: false,
+                gps: false,
+            }
+        );
+    }
+
+    #[test]
+    fn content_budget_matches_actual_structured_and_escaped_text_envelope() {
+        for text in ["猫🦊", "a\"\\\n\r\t\u{0000}", "", "plain text"] {
+            let value = serde_json::json!({"prompt": text.repeat(1000)});
+            let structured = serde_json::to_string(&value).unwrap();
+            let text = serde_json::to_string(&structured).unwrap();
+            assert_eq!(
+                mcp_content_chars(&value).unwrap(),
+                structured.chars().count() + text.chars().count()
+            );
+            let empty = serde_json::to_string(&serde_json::json!({
+                "structuredContent": null,
+                "content": [{"type":"text","text": null}]
+            }))
+            .unwrap();
+            let envelope = serde_json::to_string(&serde_json::json!({
+                "structuredContent": value,
+                "content": [{"type":"text","text": structured}]
+            }))
+            .unwrap();
+            assert_eq!(
+                envelope.chars().count() - (empty.chars().count() - 8),
+                mcp_content_chars(&value).unwrap()
+            );
+        }
+        assert_eq!(MAX_ITEM_CHARS, 12_000);
+        assert_eq!(
+            MAX_PAGE_CHARS + MCP_ENVELOPE_RESERVE_CHARS,
+            MAX_MCP_RESPONSE_CHARS
+        );
+        assert_eq!(MAX_FRAME_BYTES, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn oversized_row_marker_has_stable_bounded_identity_and_preserves_position() {
+        let identity = ItemRef {
+            path: format!("C:/{}.png", "猫\\\"".repeat(15_000)),
+            subresource: Some("001.png".into()),
+        };
+        let omitted = PageRow::<Item>::too_long(&identity).unwrap();
+        let PageRow::TooLong(marker) = &omitted else {
+            panic!()
+        };
+        assert_eq!(marker.id.len(), 64);
+        assert_eq!(marker.id, wire_digest(&identity).unwrap());
+        assert!(mcp_content_chars(&omitted).unwrap() <= MAX_ITEM_CHARS);
+        let page = ItemPage {
+            items: vec![omitted],
+            cursor: Some("next-input-position".into()),
+            truncated: true,
+        };
+        let json = serde_json::to_value(&page).unwrap();
+        assert_eq!(json["items"][0]["error"], "too_long");
+        assert_eq!(json["cursor"], "next-input-position");
+        assert!(json["items"][0].get("path").is_none());
+        assert_eq!(serde_json::from_value::<ItemPage>(json).unwrap(), page);
+        let normal = Tag {
+            name: "猫".into(),
+            count: 1,
+        };
+        assert_eq!(
+            serde_json::to_value(PageRow::Value(normal.clone())).unwrap(),
+            serde_json::to_value(normal).unwrap()
+        );
+    }
+
+    #[test]
+    fn typed_metadata_discards_unknown_fields_and_distinguishes_unavailable_from_empty() {
+        let exif: ExifInfo = serde_json::from_value(serde_json::json!({
+            "make":"camera", "UserComment":"SECRET", "MakerNote":"SECRET", "unknown":"SECRET"
+        }))
+        .unwrap();
+        let json = serde_json::to_string(&exif).unwrap();
+        assert!(json.contains("camera"));
+        assert!(!json.contains("SECRET"));
+        let generation: GenerationInfo = serde_json::from_value(serde_json::json!({
+            "prompt":{"text":"cat", "truncated":true},
+            "raw":"SECRET", "prompt_json":{"secret":true}, "workflow_json":"SECRET"
+        }))
+        .unwrap();
+        let json = serde_json::to_string(&generation).unwrap();
+        assert!(!json.contains("SECRET"));
+        assert!(!json.contains("workflow_json"));
+        assert_eq!(
+            generation.prompt.unwrap(),
+            TextValue {
+                text: "cat".into(),
+                truncated: true
+            }
+        );
+        assert_ne!(
+            serde_json::to_value(InfoField::<Vec<String>>::NotApplicable).unwrap(),
+            serde_json::to_value(InfoField::Present(Vec::<String>::new())).unwrap()
         );
     }
     #[cfg(windows)]

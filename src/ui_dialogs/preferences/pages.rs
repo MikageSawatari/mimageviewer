@@ -137,7 +137,7 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
             egui::ComboBox::from_id_salt("agent_level")
                 .selected_text(match state.settings.agent_level {
                     AgentLevel::Disabled => "無効",
-                    AgentLevel::ReadOnly => "読み取りのみ",
+                    AgentLevel::ReadOnly | AgentLevel::ReadAndOpen => "読み取りのみ",
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(

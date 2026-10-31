@@ -42,8 +42,8 @@ use crate::external_tool::{
     SelectionPolicy, SpreadPolicy, VideoPolicy, classify_legacy_recent_launch,
 };
 use crate::settings::{
-    AgentLevel, FavoriteEntry, LegacyOpenWithApp, RecentApp, Settings, TagDef, Vst3ChainPresetSlot,
-    Vst3ChainPresetSlots, Vst3PluginEntry,
+    AgentLevel, FavoriteEntry, LegacyOpenWithApp, PermissionSnapshot, RecentApp, Settings, TagDef,
+    Vst3ChainPresetSlot, Vst3ChainPresetSlots, Vst3PluginEntry,
 };
 
 const SCHEMA_VERSION: &str = "1";
@@ -980,16 +980,17 @@ impl SettingsDb {
 
     /// Agent worker が各要求の受付・応答時に現在の許可範囲だけを読む。
     pub fn load_agent_level(&self) -> Result<AgentLevel, SettingsDbError> {
-        self.load_agent_permission().map(|(level, _)| level)
+        self.load_agent_permission()
+            .map(|(snapshot, _)| snapshot.level)
     }
 
     /// Read permission and its revocation epoch together. A worker must compare
     /// the admitted epoch before returning data, even when the level is ReadOnly
     /// again after an intervening disable. Unrelated settings saves keep the epoch.
-    pub fn load_agent_permission(&self) -> Result<(AgentLevel, u64), SettingsDbError> {
+    pub fn load_agent_permission(&self) -> Result<(PermissionSnapshot, u64), SettingsDbError> {
         let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
-        let level = read_settings_kv_typed(&inner.conn, "agent_level", AgentLevel::default)?;
-        Ok((level, inner.agent_permission_epoch))
+        let snapshot = read_agent_permission(&inner.conn)?;
+        Ok((snapshot, inner.agent_permission_epoch))
     }
 
     /// Remote の集約系 worker が現在の共有並び順だけを読む。
@@ -1017,9 +1018,12 @@ impl SettingsDb {
             }
             read_singleton_endpoint_settings(&inner.conn)?;
         }
-        let agent_level_changed =
-            read_settings_kv_typed(&inner.conn, "agent_level", AgentLevel::default)?
-                != settings.agent_level;
+        let agent_permission_changed = read_agent_permission(&inner.conn)?
+            != PermissionSnapshot {
+                level: settings.agent_level,
+                thumbnails: settings.agent_show_thumbnails,
+                gps: settings.agent_show_gps,
+            };
 
         // 1. 事前の差分判定 (transaction 外)。共有 `Arc` の同一性で見るので O(行数)。
         let chain_changed = inner
@@ -1143,7 +1147,7 @@ impl SettingsDb {
         tx.commit()?;
 
         // 4. commit 成功してから「直近保存した中身」を更新する。
-        if agent_level_changed {
+        if agent_permission_changed {
             inner.agent_permission_epoch = next_agent_permission_epoch();
         }
         // clone は `Arc` の参照カウント加算だけで、state chunk は複製されない。
@@ -3300,6 +3304,14 @@ fn apply_remote_listing_setting(
     Ok(())
 }
 
+fn read_agent_permission(conn: &Connection) -> Result<PermissionSnapshot, SettingsDbError> {
+    Ok(PermissionSnapshot {
+        level: read_settings_kv_typed(conn, "agent_level", AgentLevel::default)?,
+        thumbnails: read_settings_kv_typed(conn, "agent_show_thumbnails", || false)?,
+        gps: read_settings_kv_typed(conn, "agent_show_gps", || false)?,
+    })
+}
+
 fn read_settings_kv_typed<T>(
     conn: &Connection,
     key: &str,
@@ -4698,6 +4710,7 @@ mod tests {
         for (level, stored) in [
             (AgentLevel::ReadOnly, "read_only"),
             (AgentLevel::Disabled, "disabled"),
+            (AgentLevel::ReadAndOpen, "read_and_open"),
             (AgentLevel::ReadOnly, "read_only"),
         ] {
             let settings = Settings {
@@ -4715,6 +4728,111 @@ mod tests {
         drop(db);
         let db = SettingsDb::open(dir.path()).unwrap();
         assert_eq!(db.load_agent_level().unwrap(), AgentLevel::ReadOnly);
+    }
+
+    #[test]
+    fn agent_permission_snapshot_roundtrips_and_revokes_each_changed_permission() {
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!missing.agent_show_thumbnails);
+        assert!(!missing.agent_show_gps);
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        assert_eq!(
+            db.load_agent_permission().unwrap().0,
+            PermissionSnapshot::default()
+        );
+        let mut settings = Settings {
+            agent_level: AgentLevel::ReadAndOpen,
+            agent_show_thumbnails: true,
+            agent_show_gps: true,
+            ..Settings::default()
+        };
+        db.save_full(&settings).unwrap();
+        let admitted = db.load_agent_permission().unwrap();
+        assert_eq!(
+            admitted.0,
+            PermissionSnapshot {
+                level: AgentLevel::ReadAndOpen,
+                thumbnails: true,
+                gps: true,
+            }
+        );
+        db.save_full(&settings).unwrap();
+        assert_eq!(db.load_agent_permission().unwrap(), admitted);
+        settings.grid_cols += 1;
+        db.save_full(&settings).unwrap();
+        assert_eq!(db.load_agent_permission().unwrap(), admitted);
+
+        let mut previous = admitted;
+        for (level, thumbnails, gps) in [
+            (AgentLevel::ReadAndOpen, false, true),
+            (AgentLevel::ReadAndOpen, true, true),
+            (AgentLevel::ReadAndOpen, true, false),
+            (AgentLevel::ReadAndOpen, true, true),
+            (AgentLevel::ReadOnly, true, true),
+            (AgentLevel::ReadAndOpen, true, true),
+        ] {
+            settings.agent_level = level;
+            settings.agent_show_thumbnails = thumbnails;
+            settings.agent_show_gps = gps;
+            db.save_full(&settings).unwrap();
+            let current = db.load_agent_permission().unwrap();
+            assert_eq!(
+                current.0,
+                PermissionSnapshot {
+                    level,
+                    thumbnails,
+                    gps
+                }
+            );
+            assert_ne!(current.1, previous.1);
+            assert_eq!(db.load_agent_level().unwrap(), level);
+            previous = current;
+        }
+        drop(db);
+        let db = SettingsDb::open(dir.path()).unwrap();
+        let reopened = db.load_agent_permission().unwrap();
+        assert_eq!(reopened.0, previous.0);
+        assert_ne!(reopened.1, previous.1);
+        let loaded = db.load_into_settings().unwrap();
+        assert!(loaded.agent_show_thumbnails);
+        assert!(loaded.agent_show_gps);
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key IN ('agent_show_thumbnails', 'agent_show_gps')",
+                [],
+            )
+            .unwrap();
+        let missing = db.load_agent_permission().unwrap().0;
+        assert_eq!(missing.level, AgentLevel::ReadAndOpen);
+        assert!(!missing.thumbnails);
+        assert!(!missing.gps);
+    }
+
+    #[test]
+    fn failed_permission_commit_preserves_snapshot_and_epoch() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings {
+            agent_level: AgentLevel::ReadOnly,
+            ..Settings::default()
+        };
+        db.save_full(&settings).unwrap();
+        let admitted = db.load_agent_permission().unwrap();
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_agent_gps BEFORE INSERT ON settings_kv
+             WHEN NEW.key = 'agent_show_gps' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+            )
+            .unwrap();
+        settings.agent_show_gps = true;
+        assert!(db.save_full(&settings).is_err());
+        assert_eq!(db.load_agent_permission().unwrap(), admitted);
     }
 
     #[test]
