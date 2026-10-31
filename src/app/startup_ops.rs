@@ -50,6 +50,47 @@ impl Drop for InitialNavigationTrace {
 const STARTUP_OPEN_PATH_RESOLVE_TOAST_DELAY: std::time::Duration =
     std::time::Duration::from_millis(400);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActivationOpenRefusal {
+    Remote,
+    CompositionEditor,
+    DocumentModal,
+    SidecarRestore,
+    EpubDeleting,
+    Internal,
+}
+
+impl ActivationOpenRefusal {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::Remote => "リモート閲覧中です",
+            Self::CompositionEditor => "本の構成を編集中です",
+            Self::DocumentModal => "文書を開く処理中です",
+            Self::SidecarRestore => "sidecar を復元しています",
+            Self::EpubDeleting => "EPUB のキャッシュを削除しています",
+            Self::Internal => "開く処理を開始できません",
+        }
+    }
+
+    fn agent_error(self) -> mimageviewer_agent_ipc::AgentError {
+        mimageviewer_agent_ipc::AgentError::new(
+            if self == Self::Internal {
+                mimageviewer_agent_ipc::ErrorCode::Internal
+            } else {
+                mimageviewer_agent_ipc::ErrorCode::Busy
+            },
+            format!("いまは開けません ({})", self.message()),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartupOpenAdmission {
+    Admitted,
+    Requeued,
+    Refused(ActivationOpenRefusal),
+}
+
 #[must_use]
 enum StartupOpenApplyOutcome {
     Opened,
@@ -96,6 +137,97 @@ impl DirectMediaPrepared {
 }
 
 impl App {
+    pub(crate) fn install_agent_open(
+        &mut self,
+        controller: Arc<crate::agent_ipc::open::OpenController>,
+        ctx: &egui::Context,
+    ) {
+        self.agent_open_requests = Some(controller.install(ctx.clone()));
+    }
+
+    pub(crate) fn reject_agent_open_requests_during_startup(&mut self) {
+        if self.initialized && !self.indexer_init.overlay_active() {
+            return;
+        }
+        while let Some(request) = self
+            .agent_open_requests
+            .as_ref()
+            .and_then(|queue| queue.try_recv().ok())
+        {
+            if request.try_claim() {
+                request.complete(crate::agent_ipc::open::UiOpenOutcome::Refused(
+                    mimageviewer_agent_ipc::AgentError::new(
+                        mimageviewer_agent_ipc::ErrorCode::NotReady,
+                        "mIV の起動処理中です",
+                    ),
+                ));
+            }
+        }
+    }
+
+    pub(crate) fn poll_agent_open_requests(&mut self, ctx: &egui::Context) {
+        while let Some(request) = self
+            .agent_open_requests
+            .as_ref()
+            .and_then(|queue| queue.try_recv().ok())
+        {
+            if !request.try_claim() {
+                continue;
+            }
+            let outcome = if self.settings.agent_level
+                < mimageviewer_agent_ipc::AgentLevel::ReadAndOpen
+            {
+                Err(mimageviewer_agent_ipc::AgentError::new(
+                    mimageviewer_agent_ipc::ErrorCode::Disabled,
+                    "mIV で開く許可がありません",
+                ))
+            } else if let Some(reason) = self.activation_open_precheck(Some(&request.activation)) {
+                Err(reason.agent_error())
+            } else {
+                match self.start_startup_open_path_resolve(
+                    request.activation.path.clone(),
+                    StartupOpenPathSource::Agent,
+                    ctx,
+                ) {
+                    StartupOpenAdmission::Admitted => Ok(()),
+                    StartupOpenAdmission::Refused(reason) => Err(reason.agent_error()),
+                    StartupOpenAdmission::Requeued => {
+                        Err(ActivationOpenRefusal::Internal.agent_error())
+                    }
+                }
+            };
+            request.complete(match outcome {
+                Ok(()) => crate::agent_ipc::open::UiOpenOutcome::Admitted,
+                Err(error) => crate::agent_ipc::open::UiOpenOutcome::Refused(error),
+            });
+        }
+    }
+
+    pub(crate) fn activation_open_precheck(
+        &self,
+        request: Option<&crate::single_instance::ActivationOpenPath>,
+    ) -> Option<ActivationOpenRefusal> {
+        let snapshot = self.remote_session_handle().map(|handle| handle.snapshot());
+        let sequence = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.acquisition_sequence);
+        if snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.phase.blocks_local_control())
+            || request.is_some_and(|request| request.rejected_for_remote(sequence))
+        {
+            Some(ActivationOpenRefusal::Remote)
+        } else if self.composition_editor_modal_active() {
+            Some(ActivationOpenRefusal::CompositionEditor)
+        } else if self.document_open_modal_admission_blocked() {
+            Some(ActivationOpenRefusal::DocumentModal)
+        } else if self.sidecar_restore_active() {
+            Some(ActivationOpenRefusal::SidecarRestore)
+        } else {
+            None
+        }
+    }
+
     /// One admission for an explicit activation/bookmark, before any continuation starts.
     /// Retire projected main requests and process-wide open owners, keeping independent waits.
     pub(super) fn admit_explicit_main_open_request(&mut self) {
@@ -147,11 +279,12 @@ impl App {
 
     #[cfg(windows)]
     pub(super) fn poll_activation_open_paths(&mut self, ctx: &egui::Context) {
-        if self.remote_session_blocks_local_control() {
+        let precheck = self.activation_open_precheck(None);
+        if precheck == Some(ActivationOpenRefusal::Remote) {
             self.reject_activation_open_paths_for_remote(ctx);
             return;
         }
-        if self.composition_editor_modal_active() {
+        if precheck == Some(ActivationOpenRefusal::CompositionEditor) {
             let rejected = self.activation_open_path_rx.try_iter().count();
             if rejected != 0 {
                 crate::logger::log(format!(
@@ -163,7 +296,7 @@ impl App {
         }
         // Keep the channel queued while a document dialog owns local admission. Draining it
         // after terminal naturally applies the existing last-activation-wins rule.
-        if self.document_open_modal_admission_blocked() {
+        if precheck == Some(ActivationOpenRefusal::DocumentModal) {
             return;
         }
         let current_acquisition_sequence = self
@@ -179,7 +312,7 @@ impl App {
             .into_iter()
             .filter(|request| !request.rejected_for_remote(current_acquisition_sequence))
             .collect();
-        if self.sidecar_restore_active() {
+        if precheck == Some(ActivationOpenRefusal::SidecarRestore) {
             if !paths.is_empty() {
                 crate::logger::log(format!(
                     "single_instance: discarded {} activation open request(s) during sidecar restore",
@@ -236,8 +369,8 @@ impl App {
         requested: PathBuf,
         source: StartupOpenPathSource,
         ctx: &egui::Context,
-    ) {
-        self.start_startup_open_path_resolution_owned_with_navigation(requested, source, ctx, None);
+    ) -> StartupOpenAdmission {
+        self.start_startup_open_path_resolution_owned_with_navigation(requested, source, ctx, None)
     }
 
     pub(crate) fn start_startup_open_path_resolution_owned_with_navigation(
@@ -246,12 +379,15 @@ impl App {
         source: StartupOpenPathSource,
         ctx: &egui::Context,
         navigation: Option<MainListNavigation>,
-    ) {
+    ) -> StartupOpenAdmission {
         let requested = crate::path_key::normalize_input_path(&requested);
         if self.remote_session_blocks_local_control() {
             if matches!(source, StartupOpenPathSource::InitialStartup) {
                 self.startup_open_path = Some(requested);
-                return;
+                return StartupOpenAdmission::Requeued;
+            }
+            if matches!(source, StartupOpenPathSource::Agent) {
+                return StartupOpenAdmission::Refused(ActivationOpenRefusal::Remote);
             }
             crate::logger::log(format!(
                 "startup open: rejected resolve while Remote owns local control source={} requested={}",
@@ -263,15 +399,18 @@ impl App {
                     "リモート閲覧中のため、二重起動で渡されたパスを開けません".to_string(),
                 );
             }
-            return;
+            return StartupOpenAdmission::Refused(ActivationOpenRefusal::Remote);
         }
         if self.composition_editor_modal_active() {
             crate::logger::log("composition editor: rejected path open");
             self.show_feedback_warning("本の構成を編集中のため、別の本を開けません".into());
-            return;
+            return StartupOpenAdmission::Refused(ActivationOpenRefusal::CompositionEditor);
         }
         if self.document_open_modal_admission_blocked() {
             match source {
+                StartupOpenPathSource::Agent => {
+                    return StartupOpenAdmission::Refused(ActivationOpenRefusal::DocumentModal);
+                }
                 StartupOpenPathSource::Activation => {
                     #[cfg(windows)]
                     let request = crate::single_instance::ActivationOpenPath::received(
@@ -286,7 +425,11 @@ impl App {
                 StartupOpenPathSource::InitialStartup => self.startup_open_path = Some(requested),
                 StartupOpenPathSource::Bookmark => {}
             }
-            return;
+            return if matches!(source, StartupOpenPathSource::Bookmark) {
+                StartupOpenAdmission::Refused(ActivationOpenRefusal::DocumentModal)
+            } else {
+                StartupOpenAdmission::Requeued
+            };
         }
         let Some(owner) = self.startup_open_path_owner(source) else {
             crate::logger::log(format!(
@@ -294,7 +437,7 @@ impl App {
                 source.perf_tag(),
                 requested.display()
             ));
-            return;
+            return StartupOpenAdmission::Refused(ActivationOpenRefusal::Internal);
         };
         let navigation = navigation.or_else(|| match &owner {
             StartupOpenPathOwner::Bookmark(bookmark) if self.main_folder_history_available() => {
@@ -309,7 +452,7 @@ impl App {
             .as_ref()
             .is_some_and(|navigation| !self.main_list_navigation_is_current(navigation))
         {
-            return;
+            return StartupOpenAdmission::Refused(ActivationOpenRefusal::Internal);
         }
         // The suffix is known before the filesystem resolver runs. A directory ending in
         // `.epub` holds this provisional lease only until classification returns Directory.
@@ -317,6 +460,9 @@ impl App {
             Ok(owner) => owner,
             Err(reason) => {
                 match source {
+                    StartupOpenPathSource::Agent => {
+                        return StartupOpenAdmission::Refused(ActivationOpenRefusal::EpubDeleting);
+                    }
                     StartupOpenPathSource::Activation => {
                         #[cfg(windows)]
                         let request = crate::single_instance::ActivationOpenPath::received(
@@ -335,17 +481,20 @@ impl App {
                         self.show_open_admission_refusal(reason.into());
                     }
                 }
-                return;
+                return if matches!(source, StartupOpenPathSource::Bookmark) {
+                    StartupOpenAdmission::Refused(ActivationOpenRefusal::EpubDeleting)
+                } else {
+                    StartupOpenAdmission::Requeued
+                };
             }
         };
-        let defer_activation_supersede =
-            matches!(source, StartupOpenPathSource::Activation) && self.is_snapshot_active();
+        let defer_activation_supersede = source.is_activation() && self.is_snapshot_active();
         // A forwarded activation is a new navigation request as soon as it is received. Do not
         // let an archive conversion owned by the currently opening bookmark win the race while
         // the activation path is still being resolved on its worker. Snapshot lock is the one
         // exception: scope admission can still refuse the request, so its supersede is deferred
         // and completion-side consumers hold the prior owner's result instead.
-        if matches!(source, StartupOpenPathSource::Activation) && !defer_activation_supersede {
+        if source.is_activation() && !defer_activation_supersede {
             self.admit_explicit_main_open_request();
         }
         // BookmarkRow classification can finish after snapshot activation's provisional
@@ -471,6 +620,10 @@ impl App {
                 );
             }
             Err(e) => {
+                if matches!(source, StartupOpenPathSource::Agent) {
+                    crate::logger::log("agent_ipc: open_in_viewer refused worker_start");
+                    return StartupOpenAdmission::Refused(ActivationOpenRefusal::Internal);
+                }
                 crate::logger::log(format!(
                     "startup open: resolve worker spawn failed: {e}; running synchronously"
                 ));
@@ -507,7 +660,7 @@ impl App {
                         },
                         true,
                     );
-                    return;
+                    return StartupOpenAdmission::Admitted;
                 }
                 self.finish_startup_open_path_resolve_with_held(
                     owner,
@@ -521,6 +674,7 @@ impl App {
                 );
             }
         }
+        StartupOpenAdmission::Admitted
     }
 
     fn install_startup_open_path_resolve_pending(
@@ -955,7 +1109,9 @@ impl App {
     ) -> Option<StartupOpenPathOwner> {
         match source {
             StartupOpenPathSource::InitialStartup => Some(StartupOpenPathOwner::InitialStartup),
-            StartupOpenPathSource::Activation => Some(StartupOpenPathOwner::Activation),
+            StartupOpenPathSource::Activation | StartupOpenPathSource::Agent => {
+                Some(StartupOpenPathOwner::Activation)
+            }
             StartupOpenPathSource::Bookmark => {
                 let request_id = self.bookmark_open_pending.as_ref()?.request_id();
                 let target = self.bookmark_view_target()?.clone();
@@ -2494,6 +2650,10 @@ fn resolve_startup_open_path(
 }
 
 #[cfg(test)]
+#[path = "agent_open_tests.rs"]
+mod agent_open_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3946,7 +4106,9 @@ mod tests {
             let ctx = egui::Context::default();
             let owner = match source {
                 StartupOpenPathSource::InitialStartup => StartupOpenPathOwner::InitialStartup,
-                StartupOpenPathSource::Activation => StartupOpenPathOwner::Activation,
+                StartupOpenPathSource::Activation | StartupOpenPathSource::Agent => {
+                    StartupOpenPathOwner::Activation
+                }
                 StartupOpenPathSource::Bookmark => unreachable!(),
             };
             app.finish_startup_open_path_resolve(owner, result, &ctx);

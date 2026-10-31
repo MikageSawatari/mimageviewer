@@ -1449,6 +1449,10 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
      (`ReplyPolicy::AcceptedOperation`。送信直前の権限の再照合で失敗に変えない)。
 - 同じ frame の順序: agent の受付を先、二重起動を後に処理する。両方来たら利用者自身の二重起動が後から置き換える
   (agent 要求は受理済みなので追加の応答はしない)。
+- **ログ** (実装担当が着手前に指摘、ClaudeCode が判断): agent の受付 (worker・queue・UI の判定・拒否) では path を
+  記録しない。受理の後は二重起動と同じ通常の open なので、既存の open / load の診断ログ (要求 path・解決先を記録する)
+  はそのままにする。開いたフォルダは画面にも履歴にも残る通常の表示状態で、受理後まで秘匿するには非同期の open 経路へ
+  由来を伝える状態が要り、「新しい open 経路を作らない」に反するため。
 - **受理の後に分かる失敗は応答しない**: resolver は受理の後にも、Remote の取得による取消・RAR の続きの巻・
   開けない path などで拒否することがあり、mIV の画面に表示される (二重起動と同じ)。tool の結果の文は
   「mIV で開く処理を始めました」とし、表示の完了を意味しない。
@@ -2603,3 +2607,139 @@ cargo nextest run -p mimageviewer --lib -E '(test(/agent_ipc/) or test(/agent_le
 - 実装中に実装担当が見つけた前提の食い違い 3 件 (PDF 列挙の perf key と取消の待ち方、入れ子の ZIP、WIC の上限超過) は
   ClaudeCode が判断して §15.5 に書いた。
 - 判定: **1b を受け入れる**。最終の portable での呼び出し観測は 17.11 に追記する。
+
+## 18. 段階 1c の実装記録
+
+### 18.1 前提照合とログ要件の判断待ち
+
+観測者: 実装担当、`45667aa23`、このsandbox内。§15.6、§15.2、§15.4、§4.1と
+detached-rework-plan §2を読み、実装前に次をコードで照合した。
+
+- `UiRequestDispatch` はprivateなAtomicU8のPending→Claimed/Cancelled CASで、共通型として取り出せる。
+- `single_instance::signal_activate_existing` は既存eventをSetEventする関数として存在し、
+  新しいrestore/foreground経路を作らずにcoreから呼べる。
+- `ActivationOpenPath::received` は受信時のRemote phase/acquisition sequenceを捕捉する。
+  `lib.rs` のagent serverとAppには同じ `remote_session_handle` のcloneが渡されている。
+- `render_initial_open` の初期open後にactivation pollがあり、`update_frame` のoverlay early returnはその前にある。
+- activation pollのcomposition editor時drop、document modal時defer、acquisition sequence検査、
+  sidecar restore時drop、last-wins coalescingを確認。resolver入口のmodal/EPUB lease失敗時の再送も確認した。
+- `ReplyPolicy::AcceptedOperation` は既に型として存在する。detached述語/viewport routingの変更はまだない。
+
+**実装前の停止理由**: briefの「Logging: tool name, outcome kind, duration; never the path」の適用範囲が、
+既存open経路をそのまま使う方針と衝突する。正常なpathでも
+`startup_ops.rs::apply_startup_open_path_resolve_result` (基点の1430行) はrequested/resolvedの両pathを
+無条件で通常ログに出す。`open_loaded_file_fullscreen` (2272行) もpathを出す。
+resolverのcancel/refusal等にも同様の記録があり、後段の通常のfolder/open処理にもpath入り診断がある。
+agentの要求/受付ログを無記名にするだけでは、agentから開いたpathが既存UI診断へ出ることを防げない。
+
+設計担当へ返す選択肢:
+
+1. 1cの秘匿対象をagent要求/受付のログに限定し、受理後の既存UI open診断は従来どおりとする。
+2. 受理後も含む全経路のpath秘匿を求める。その場合は非同期の既存open/load経路へ由来を伝播する範囲を
+   別途定義し、UI/Remoteの診断とdetachedの凍結範囲を保つ設計判断を先に行う。
+
+どちらかを実装者の解釈で選ばず、briefの「前提の矛盾は停止・報告」に従いRustの編集前で停止した。
+変更はこの台帳のみ。cargo check/tests/build/fmtは未実行 (実装前の設計判断待ちでRust差分なし)。
+製品binary/UIの起動、commitはしていない。§17.12の1b成功結果はClaudeCodeの観測であり、今回実行した結果ではない。
+detached-rework-planへの変更記録は、実際に1cが触れた関数が確定した時点で追記する。
+
+### 18.2 ログ境界の判断を受けて再開
+
+観測者/判断者: ClaudeCode (同threadの追記指示、§15.6の作業tree更新)。選択肢1を採用。
+worker、queue、UI-thread precheck/refusal、replyというagent admission laneではpathを記録しない。
+Admitted後は通常の二重起動相当のopenとして既存UI/open/load診断を維持し、非同期後段へagent由来を伝播しない。
+§18.1はこの判断前の記録として保持する。
+
+### 18.3 実装と選択
+
+- wireへ `OpenInViewer { path }` / `Opened(OpenResult)` を追加。返すのはacceptedのstatusと開始した旨の文だけ。
+  v2は未リリースの同時開発中契約なので据え置き、core/adapterを同じsourceからbuildする。Remoteの版72は変えない。
+- MCPはReadAndOpen以上だけtoolを公開。pathのみ、指定された4 annotations、outputSchema、
+  structuredContentと同じtextを実装した。subresource/未知引数は拒否する。旧handshakeのlist_changedは
+  snapshot由来の実際のtool集合で更新し、GPS/縮小画像の無関係なbit変化はopen可否に使わない。
+- `UiRequestDispatch` の3値CASをshared moduleへ移し、Remoteは同じtype/atomic orderingのまま使う。
+  agentの外側期限と内側workerが同じCASを共有するため、readonlyのis_cancelledを追加した (新状態はない)。
+- agent専用 `OpenController` はsession cloneを保持し、App作成後にqueue senderとContextを設置する。
+  未設置はNotReady。workerで既存validator/存在確認を行い、Remote非Localを拒否して受信時のphase/sequenceを捕捉。
+  専用のatomic permitで未受理openを全体1件に制限し、既存activation eventを通知→enqueue→repaintする。
+- PendingはUI返信を5秒待ってCAS取消、Claimedはreplyを待つ。検証前からの共通20秒期限も、
+  PendingでだけCAS取消を許す。応答後も実worker終了まで既存global/connection permitとopen permitを保持する。
+  不完全なOS I/Oの打切りや新しいrecovery stateは作らない。headless試験ではevent通知を抑止し実利用中の窓を動かさない。
+- UIはupdate_frame先頭でoverlay/未初期化を拒否。通常は初期open後、二重起動poll直前にagent queueを処理する。
+  Claim→permission levelだけを照合→共通typed precheck→既存resolver入口、という順にした。
+  precheckは同じsession snapshotのphaseとsequenceを使い、Remote/editor/document modal/sidecarの理由を返す。
+  二重起動のdrop/defer/sequence-filter/last-winsの順序は維持する。
+- resolver入口はAdmitted/Requeued/Refusedを返す。Agentはmodal/EPUB削除で再queueせず理由つき拒否。
+  Agent sourceはActivation branchesを通り、受理後のownerは既存Activationになる。bookmark/detached条件は変更しない。
+  agentのworker spawn失敗はInternalで拒否し、既存の二重起動等の同期fallbackをagentへ新設しない。
+- Admittedの結果はReplyPolicy::AcceptedOperationで送り、後のpermission/cancelで失敗へ置換しない。
+  MCP client自身がcancel/EOFした時の既存transportの返信抑止は維持するが、受理済みUI操作の停止/rollbackはしない。
+- adapterはopen送信直前だけpipe server PIDへAllowSetForegroundWindowをbest effortで行う。
+  失敗はpathなし固定カテゴリをstderrへ記録し、要求結果は変えない。stdoutと既存cancel/EOF/pipe所有は変更しない。
+  test buildでは実Win32許可呼出しを抑止し、実機の前面化可否は未確認として残す。
+
+### 18.4 検証記録
+
+観測者: 実装担当、このsandbox内、`45667aa23` + §15.6のClaudeCode追記 + 本差分。
+独立設計レビューの合意は§15.15〜§15.16、今回の実装の独立レビューは別threadで行うもので、ここでは未観測。
+
+| コマンド | 実 exit code | 結果 / ログ |
+|---|---:|---|
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | 最終production差分。`target/mcp-1c-core-final.log` |
+| 下記 narrow nextest | 0 | 28/28成功。`target/mcp-1c-narrow-final.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 101 | IPC12成功、MCP50成功/2失敗、ignore0。実pipeのOS5のみ。`target/mcp-1c-crates-initial.log` |
+| 下記 focused nextest | 100 | 541件中539成功/2失敗、OS5のみ。`target/mcp-1c-focused-final.log` |
+| `cargo build -p mimageviewer-mcp --bin mimageviewer-mcp` | 0 | `target/mcp-1c-adapter.log` |
+| `cargo fmt` (workspace、引数なし) | 0 | 最終sourceを整形 |
+| `cargo fmt --check` | 0 | `target/mcp-1c-fmt-final.log` |
+| `git diff --check` | 0 | 最終差分を確認 |
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc::open/) or test(/app::startup_ops::agent_open_tests/) or test(/ui_request_dispatch/)'
+```
+
+途中のcore checkもexit0 (`target/mcp-1c-core-initial.log`)、初回narrowは25/25成功、exit0
+(`target/mcp-1c-narrow-initial.log`、初回のtest compileは8分26秒、runnerによる打切りはない)。
+その後、検証前から共通CASを持つ20秒controllerと、外側取消をClaimedと取り違えない処理/回帰を足し、
+最終sourceの28件と541件で再確認した。crate側はその間に実装を変えておらず、整形だけなので結果を再利用する。
+この台帳の成功は実装担当の確認で、独立レビューやsandbox外の成功を代替するものではない。
+
+### 18.5 回帰・残る確認・引き渡し
+
+- shared CASの3件、brokerの13件、実Connection/controllerの4件、App受付の8件が成功。
+  not-installed、path構文/存在、Remote3phase、global Busy、遅延Cancelled、5秒timeout/Claim後待機、
+  validation中の共通20秒期限と実workerまでのpermit保持、Claim後の期限/cancel/permission非置換を含む。
+  同じframeのagent→二重起動によるsupersede、startup overlay/未初期化、permission drop、
+  editor/document modal/sidecar/Remote拒否とresolver入口のEPUB削除をfixtureで検査した。
+- 既存のstartup_ops/activation/single_instance/Remote sessionをfocusedに加えた。
+  構成editorのactivation drop、modalのdefer→last-wins、Remote取得sequence拒否、resolver再queueの
+  回帰も成功。detached述語/viewport routingは変更せず、設計合意と変更接点をdetached-rework-plan §11へ記録した。
+- wireの新command/result往復、ReadAndOpenだけのtool公開、全3版のMCP呼出し、annotations/schema/予算、
+  list_changedのlevel遷移と無関係なsnapshot bitの安定、前面化許可の成功/失敗を注入で検査した。
+- coreの失敗は `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry` と
+  `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`。adapterは
+  `pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld` と
+  `pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked`。
+  いずれもfixture pipe作成/接続時のOS5で、skip/ignore化やDACL変更はしていない。
+- FFmpeg DLLはworktreeに配置済みの実ファイルを使用。test-full、10万件走査、UI/snapshot更新はしていない。
+  受理後の実画面遷移とOSのforeground許可、sandbox外の最終実pipe、今回実装の正式な独立レビューは未確認。
+  製品binary/UIは起動せず、commitしていない。実pipe gateがsandbox内で通らないため、通常profileの
+  core確認用buildは未実施で、依頼されたconsole adapterだけをbuildした。1d/1eへは進んでいない。
+
+変更ファイル:
+
+| 役割 | ファイル |
+|---|---|
+| wire/MCP | `crates/agent-ipc/src/lib.rs`, `crates/mcp-server/Cargo.toml`, `crates/mcp-server/src/lib.rs`, `crates/mcp-server/src/schema.rs`, `crates/mcp-server/src/tests.rs` |
+| 前面化のbest effort | `crates/mcp-server/src/pipe.rs`, `crates/mcp-server/src/pipe/transport.rs` (既存handleの借用のみ) |
+| agent worker/統合/回帰 | `src/agent_ipc/mod.rs`, `work.rs`, `tests.rs`, 新規 `open.rs`, `open_response.rs`, `open_tests.rs`, `open_connection_tests.rs` |
+| shared CAS | 新規 `src/ui_request_dispatch.rs`, `src/remote_ipc/session.rs` (型移設とimportのみ) |
+| App/起動hook | `src/app.rs`, `src/app/startup_ops.rs`, `update_phases.rs`, 新規 `src/app/agent_open_tests.rs`, `src/lib.rs` |
+| 記録 | `docs/mcp-integration-plan.md`, `docs/detached-rework-plan.md` |
+
+ClaudeCodeがsandbox外の通常権限で実行する正確なコマンド (今回sourceの外側成功は未観測):
+
+```powershell
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E '(test(/agent_ipc/) or test(/agent_level/) or test(/agent_permission/) or test(=settings_db::tests::failed_permission_commit_preserves_snapshot_and_epoch) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(/png_metadata/) or test(=pdf_loader::tests::anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results) or test(=pdf_loader::tests::page_sizes_preserve_existing_ui_diagnostic_identity) or test(=pdf_loader::tests::page_sizes_round_trip_and_reject_a_truncated_reply) or test(/app::folder_scan/) or test(/zip_loader/) or test(/conceal_db/) or test(=pdf_loader::tests::anonymous_agent_render_and_enumerate_omit_keys_and_harvest_actual_completion) or test(=pdf_loader::tests::cancelled_anonymous_render_does_not_enqueue) or test(/app::startup_ops/) or test(/single_instance/) or test(/remote_ipc::session/) or test(/ui_request_dispatch/) or test(/activation/) or test(/startup_open_path/)) and not test(/section1375_scan_perf_tests/)'
+```

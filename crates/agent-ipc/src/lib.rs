@@ -103,6 +103,9 @@ pub enum Command {
         long_side: Option<u32>,
         cursor: Option<String>,
     },
+    OpenInViewer {
+        path: String,
+    },
     Cancel {
         request_id: u64,
     },
@@ -124,7 +127,18 @@ pub enum Payload {
     Info(InfoPage),
     Folder(FolderPage),
     Thumbnails(ThumbnailResponse),
+    Opened(OpenResult),
     Cancelled,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenResult {
+    pub status: OpenStatus,
+    pub message: String,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenStatus {
+    Accepted,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -532,6 +546,9 @@ mod tests {
                 cursor: Some("info-cursor".into()),
             },
             Command::Cancel { request_id: 2 },
+            Command::OpenInViewer {
+                path: "C:/books/猫.zip".into(),
+            },
         ];
         for command in commands {
             let request = Request { id: 2, command };
@@ -577,6 +594,40 @@ mod tests {
                 thumbnails: false,
                 gps: false,
             }
+        );
+    }
+
+    #[test]
+    fn open_wire_uses_typed_accepted_result_without_changing_protocol_version() {
+        assert_eq!(AGENT_PROTOCOL_VERSION, 2);
+        assert_eq!(
+            serde_json::to_value(Command::OpenInViewer {
+                path: "C:/猫.png".into(),
+            })
+            .unwrap(),
+            serde_json::json!({"type":"open_in_viewer","path":"C:/猫.png"})
+        );
+        let response = Response {
+            id: 9,
+            result: Ok(Payload::Opened(OpenResult {
+                status: OpenStatus::Accepted,
+                message: "mIV で開く処理を始めました".into(),
+            })),
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["result"]["Ok"]["type"], "opened");
+        assert_eq!(value["result"]["Ok"]["data"]["status"], "accepted");
+        let mut bytes = vec![];
+        write_frame(&mut bytes, &response).unwrap();
+        assert_eq!(
+            read_frame::<_, Response>(&mut &bytes[..]).unwrap(),
+            Some(response)
+        );
+        assert!(
+            serde_json::from_value::<OpenResult>(serde_json::json!({
+                "status":"displayed", "message":"done"
+            }))
+            .is_err()
         );
     }
 

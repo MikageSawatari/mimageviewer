@@ -30,6 +30,12 @@ impl ReadContext {
             Ok(())
         }
     }
+    pub(super) fn expired(&self) -> bool {
+        (self.clock)() >= self.deadline
+    }
+    pub(super) fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since((self.clock)())
+    }
     pub(super) fn publish(&self, payload: Payload) {
         *self.progress.lock().unwrap() = Some(payload);
     }

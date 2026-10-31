@@ -39,6 +39,7 @@ impl Fixture {
                 crate::collection_store::CollectionRemoteProducerControl::new(runtime.client()),
             ),
             session: None,
+            open: super::open::OpenController::new(None),
             active: AtomicUsize::new(0),
             search_hooks: None,
             read_hooks: None,

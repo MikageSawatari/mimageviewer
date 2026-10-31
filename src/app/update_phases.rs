@@ -499,6 +499,7 @@ impl App {
 
         self.poll_deferred_startup_open_path(ctx);
 
+        self.poll_agent_open_requests(ctx);
         #[cfg(windows)]
         self.poll_activation_open_paths(ctx);
 

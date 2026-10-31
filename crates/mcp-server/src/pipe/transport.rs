@@ -55,6 +55,12 @@ pub(super) struct PipeStream {
     #[cfg(test)]
     regular_file: bool,
 }
+#[cfg(all(windows, not(test)))]
+impl std::os::windows::io::AsRawHandle for PipeStream {
+    fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
+        std::os::windows::io::AsRawHandle::as_raw_handle(self.file.as_ref())
+    }
+}
 impl PipeStream {
     pub(super) fn connect(name: &str) -> io::Result<Self> {
         let started = Instant::now();

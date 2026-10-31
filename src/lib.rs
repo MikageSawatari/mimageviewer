@@ -356,6 +356,7 @@ mod ui_analysis_panel;
 mod ui_conceal;
 mod ui_crop;
 mod ui_raw;
+mod ui_request_dispatch;
 #[doc(hidden)]
 pub use ui_raw::{
     draw_raw_blocked_preview_snapshot_fixture, draw_raw_progress_snapshot_fixture,
@@ -1723,6 +1724,9 @@ pub fn run() -> eframe::Result {
         .map_err(|_| logger::log("agent_ipc: startup failed"))
         .ok()
     });
+    let agent_open_controller = agent_ipc_server
+        .as_ref()
+        .map(agent_ipc::Server::open_controller);
     // server より後に所有し、逆順 Drop で service を先に止めてから pipe を閉じる。
     let remote_data_dir = data_dir::get();
     let mut remote_service_manager = if remote_ipc_server.is_some() {
@@ -1890,6 +1894,9 @@ pub fn run() -> eframe::Result {
             }
             if let Ok(readers) = shared_readers.as_ref() {
                 app.install_agent_readers(readers.clone());
+            }
+            if let Some(controller) = agent_open_controller.as_ref() {
+                app.install_agent_open(controller.clone(), &cc.egui_ctx);
             }
             if let Some(control) = app_remote_ipc_control.clone() {
                 app.set_remote_ipc_server_control(control);

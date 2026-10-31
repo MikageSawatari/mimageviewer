@@ -4951,6 +4951,7 @@ pub(crate) struct PendingRatingViewZipDirOpen {
 pub(crate) enum StartupOpenPathSource {
     InitialStartup,
     Activation,
+    Agent,
     Bookmark,
 }
 
@@ -4987,10 +4988,14 @@ impl StartupOpenPathOwner {
 }
 
 impl StartupOpenPathSource {
+    fn is_activation(self) -> bool {
+        matches!(self, Self::Activation | Self::Agent)
+    }
     fn perf_tag(self) -> &'static str {
         match self {
             Self::InitialStartup => "initial_startup",
             Self::Activation => "activation",
+            Self::Agent => "agent",
             Self::Bookmark => "bookmark",
         }
     }
@@ -16841,6 +16846,7 @@ pub struct App {
     // 起動時 DB オープンに失敗した場合は None (機能なしで動作継続)。
     pub(crate) indexer_init: IndexerInit,
     pub(crate) agent_readers: Option<Arc<crate::remote_ipc::SharedReaders>>,
+    pub(crate) agent_open_requests: Option<mpsc::Receiver<crate::agent_ipc::open::UiOpenRequest>>,
 
     // ── 別バージョン索引 ─────────────────────────────────────────
     // 別バージョン索引 service の runtime owner。`None` は UI と全 producer に共通の
@@ -20957,6 +20963,7 @@ impl App {
             fav_add_auto_index_similar: false,
             indexer_init,
             agent_readers: None,
+            agent_open_requests: None,
             similar_index,
             name_index_manager: None,
             activity_gate,
@@ -98122,6 +98129,7 @@ impl App {
     /// 呼び出し側 (`update`) へ置く。
     fn update_frame(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
+        self.reject_agent_open_requests_during_startup();
         let update_perf_on = crate::perf::is_enabled();
         let mut update_perf = update_perf_start_with(
             update_perf_on,

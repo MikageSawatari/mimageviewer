@@ -1,4 +1,4 @@
-//! Read-only agent lane. No display state, UI dispatch, or metadata writers.
+//! Agent reads and an admission-only bridge to the existing main-window open.
 use std::path::Path;
 use std::sync::{
     Arc, Mutex,
@@ -13,12 +13,16 @@ mod folder;
 mod input_path;
 mod item_info;
 mod library;
+pub(crate) mod open;
+mod open_response;
 mod thumbnail;
 mod work;
 use work::*;
 
 #[cfg(test)]
 mod media_read_tests;
+#[cfg(test)]
+mod open_connection_tests;
 #[cfg(windows)]
 mod pipe;
 #[cfg(test)]
@@ -27,6 +31,7 @@ mod read_tests;
 mod tests;
 
 pub(crate) struct Server {
+    open: Arc<open::OpenController>,
     #[cfg(windows)]
     pipe: pipe::Server,
 }
@@ -39,11 +44,14 @@ impl Server {
     ) -> std::io::Result<Self> {
         #[cfg(windows)]
         {
+            let open = open::OpenController::new(session.clone());
             Ok(Self {
+                open: open.clone(),
                 pipe: pipe::Server::start(Arc::new(Handlers {
                     readers,
                     producer,
                     session,
+                    open,
                     active: AtomicUsize::new(0),
                     #[cfg(test)]
                     search_hooks: None,
@@ -58,12 +66,17 @@ impl Server {
             Err(std::io::Error::other("Windows only"))
         }
     }
+
+    pub(crate) fn open_controller(&self) -> Arc<open::OpenController> {
+        self.open.clone()
+    }
 }
 
 struct Handlers {
     readers: Arc<crate::remote_ipc::SharedReaders>,
     producer: Option<crate::collection_store::CollectionRemoteProducerControl>,
     session: Option<crate::remote_ipc::session::SessionHandle>,
+    open: Arc<open::OpenController>,
     active: AtomicUsize,
     #[cfg(test)]
     search_hooks: Option<Arc<SearchHooks>>,
@@ -98,8 +111,7 @@ type PermissionGrant = (PermissionSnapshot, u64);
 enum ReplyPolicy {
     Read(PermissionGrant),
     Rejected,
-    // Future accepted operations retain their result after the acceptance point.
-    #[allow(dead_code)]
+    // Accepted operations retain their result after the UI acceptance point.
     AcceptedOperation,
 }
 impl Reply {
@@ -273,6 +285,12 @@ impl Connection {
             ));
             return None;
         }
+        if matches!(request.command, Command::OpenInViewer { .. })
+            && granted.0.level < AgentLevel::ReadAndOpen
+        {
+            reject(error(ErrorCode::Disabled, "mIV で開く許可がありません"));
+            return None;
+        }
         let (permit, cancel) = match self.acquire(request.id) {
             Ok(value) => value,
             Err(err) => {
@@ -287,6 +305,10 @@ impl Connection {
         match std::thread::Builder::new()
             .name("agent-read".into())
             .spawn(move || {
+                if let Command::OpenInViewer { path } = request.command {
+                    open_response::respond(connection, path, permit, context, replies, started, id);
+                    return;
+                }
                 work::respond(
                     connection,
                     request.command,
@@ -316,8 +338,13 @@ impl Connection {
 
 fn record(tool: &'static str, started: Instant, result: &Result<Payload, AgentError>) {
     let (count, error_kind) = result_summary(result);
+    let outcome = match result {
+        Ok(Payload::Opened(_)) => "accepted",
+        Err(_) => "refused",
+        _ => "ok",
+    };
     crate::logger::log(format!(
-        "agent_ipc: tool={tool} duration_ms={} count={count} error={error_kind}",
+        "agent_ipc: tool={tool} duration_ms={} count={count} error={error_kind} outcome={outcome}",
         started.elapsed().as_millis()
     ));
     if crate::perf::is_enabled() {
@@ -351,6 +378,7 @@ fn tool_name(command: &Command) -> &'static str {
         Command::GetItemInfo { .. } => "get_item_info",
         Command::ListFolder { .. } => "list_folder",
         Command::GetThumbnail { .. } => "get_thumbnail",
+        Command::OpenInViewer { .. } => "open_in_viewer",
         Command::Cancel { .. } => "cancel",
     }
 }
@@ -363,6 +391,7 @@ fn result_summary(result: &Result<Payload, AgentError>) -> (usize, &'static str)
         Ok(Payload::Info(p)) => (p.items.len(), "none"),
         Ok(Payload::Folder(p)) => (p.items.len(), "none"),
         Ok(Payload::Thumbnails(p)) => (p.page.items.len(), "none"),
+        Ok(Payload::Opened(_)) => (1, "none"),
         Ok(_) => (0, "none"),
         Err(e) => (
             0,
@@ -484,7 +513,9 @@ impl Handlers {
                 long_side,
                 cursor,
             } => self.get_thumbnail(items, long_side, cursor, ctx),
-            Command::Cancel { .. } | Command::SearchItems { .. } => unreachable!(),
+            Command::Cancel { .. } | Command::SearchItems { .. } | Command::OpenInViewer { .. } => {
+                unreachable!()
+            }
         })();
         (result, None)
     }

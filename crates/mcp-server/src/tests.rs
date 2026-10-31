@@ -415,6 +415,10 @@ fn stage1b_permission_tool_sets_and_thumbnail_changes() {
                 names.contains(&"get_thumbnail"),
                 level != AgentLevel::Disabled && thumbnails
             );
+            assert_eq!(
+                names.contains(&"open_in_viewer"),
+                level >= AgentLevel::ReadAndOpen
+            );
             assert_eq!(schema::tools_for(permission).len(), names.len());
         }
     }
@@ -724,6 +728,231 @@ impl Harness {
 fn modern(id: i64, method: &str, mut params: Value) -> Value {
     params["_meta"] = json!({"io.modelcontextprotocol/protocolVersion":MODERN,"io.modelcontextprotocol/clientCapabilities":{}});
     json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+}
+
+fn accepted_open() -> Payload {
+    Payload::Opened(OpenResult {
+        status: OpenStatus::Accepted,
+        message: "mIV で開く処理を始めました".into(),
+    })
+}
+
+#[test]
+fn stage1c_open_arguments_and_results_match_schema_and_budget() {
+    let tool = schema::tools()
+        .into_iter()
+        .find(|tool| tool["name"] == "open_in_viewer")
+        .unwrap();
+    let arguments = json!({"path":"C:/本/猫.zip"});
+    let (_, command) = parse_tool(&json!({"name":"open_in_viewer","arguments":arguments})).unwrap();
+    assert_eq!(
+        command,
+        Command::OpenInViewer {
+            path: "C:/本/猫.zip".into()
+        }
+    );
+    assert!(accepts_schema(&tool["inputSchema"], &arguments));
+    assert!(
+        tool["inputSchema"]["properties"]
+            .get("subresource")
+            .is_none()
+    );
+    for bad in [
+        json!({}),
+        json!({"path":null}),
+        json!({"path":1}),
+        json!({"path":""}),
+        json!({"path":"C:/book.zip","subresource":"001.png"}),
+        json!({"path":"C:/a.png","unknown":true}),
+    ] {
+        assert!(parse_tool(&json!({"name":"open_in_viewer","arguments":bad})).is_err());
+        assert!(!accepts_schema(&tool["inputSchema"], &bad));
+    }
+    assert_eq!(
+        tool["annotations"],
+        json!({
+            "readOnlyHint":false, "destructiveHint":false,
+            "idempotentHint":true, "openWorldHint":false
+        })
+    );
+    let description = tool["description"].as_str().unwrap();
+    for text in [
+        "main mIV viewer",
+        "fullscreen",
+        "Other files",
+        "ZIP/PDF",
+        "not that display completed",
+        "untrusted data",
+    ] {
+        assert!(description.contains(text), "{text}");
+    }
+    assert!(!description.contains("results per page"));
+    let result = tool_result("open_in_viewer", Ok(accepted_open()));
+    assert_eq!(result["isError"], false);
+    assert_eq!(
+        result["structuredContent"],
+        json!({
+            "status":"accepted", "message":"mIV で開く処理を始めました"
+        })
+    );
+    assert_eq!(result["content"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+        result["structuredContent"]
+    );
+    assert!(accepts_schema(
+        &tool["outputSchema"],
+        &result["structuredContent"]
+    ));
+    assert!(!accepts_schema(
+        &tool["outputSchema"],
+        &json!({"status":"displayed","message":"done"})
+    ));
+    let response = success(json!(1), result, true);
+    assert!(response_non_image_chars(&response) <= MAX_MCP_RESPONSE_CHARS);
+    assert!(
+        serde_json::from_str::<Value>(&serialize_response(&response))
+            .unwrap()
+            .get("error")
+            .is_none()
+    );
+    let oversized = tool_result(
+        "open_in_viewer",
+        Ok(Payload::Opened(OpenResult {
+            status: OpenStatus::Accepted,
+            message: "x".repeat(MAX_PAGE_CHARS),
+        })),
+    );
+    assert_eq!(oversized["isError"], true);
+    assert_eq!(oversized["structuredContent"]["error"]["code"], "internal");
+    for code in [
+        ErrorCode::Busy,
+        ErrorCode::BadRequest,
+        ErrorCode::Disabled,
+        ErrorCode::Timeout,
+    ] {
+        let result = tool_result(
+            "open_in_viewer",
+            Err(AgentError::new(code, "今は開けません")),
+        );
+        assert_eq!(result["isError"], true);
+        assert!(accepts_schema(
+            &tool["outputSchema"],
+            &result["structuredContent"]
+        ));
+    }
+    assert_eq!(
+        tool_result("miv_status", Ok(accepted_open()))["isError"],
+        true
+    );
+    assert_eq!(
+        tool_result("open_in_viewer", Ok(Payload::Cancelled))["isError"],
+        true
+    );
+}
+
+#[test]
+fn stage1c_all_protocols_refresh_open_permission_and_transport_accepted_result() {
+    struct OpenBackend {
+        permitted: std::sync::atomic::AtomicBool,
+        paths: Mutex<Vec<String>>,
+    }
+    impl Backend for OpenBackend {
+        fn call(
+            &self,
+            command: Command,
+            _: &str,
+            _: Arc<CallControl>,
+        ) -> Result<Payload, AgentError> {
+            match command {
+                Command::Status => Ok(Payload::Status(StatusPayload {
+                    app_version: "fixture".into(),
+                    permission: PermissionSnapshot {
+                        level: if self.permitted.load(Ordering::Acquire) {
+                            AgentLevel::ReadAndOpen
+                        } else {
+                            AgentLevel::ReadOnly
+                        },
+                        ..Default::default()
+                    },
+                    fts_ready: true,
+                    remote_active: false,
+                })),
+                Command::OpenInViewer { path } => {
+                    self.paths.lock().unwrap().push(path);
+                    Ok(accepted_open())
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+    for version in VERSIONS {
+        let modern_protocol = version == MODERN;
+        let backend = Arc::new(OpenBackend {
+            permitted: std::sync::atomic::AtomicBool::new(false),
+            paths: Mutex::new(vec![]),
+        });
+        let mut h = Harness::new(backend.clone());
+        if !modern_protocol {
+            h.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}));
+            h.receive();
+            h.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+        }
+        let request = |id, method, params| {
+            if modern_protocol {
+                modern(id, method, params)
+            } else {
+                json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+            }
+        };
+        for (id, permitted) in [(1, false), (2, true), (3, false)] {
+            backend.permitted.store(permitted, Ordering::Release);
+            h.send(request(id, "tools/list", json!({})));
+            if !modern_protocol && id > 1 {
+                assert_eq!(h.receive()["method"], "notifications/tools/list_changed");
+            }
+            let response = h.receive();
+            assert_eq!(response["id"], id);
+            let tools = response["result"]["tools"].as_array().unwrap();
+            assert_eq!(
+                tools.iter().any(|tool| tool["name"] == "open_in_viewer"),
+                permitted
+            );
+            assert_eq!(tools.len(), if permitted { 10 } else { 9 });
+        }
+        backend.permitted.store(true, Ordering::Release);
+        h.send(request(
+            4,
+            "tools/call",
+            json!({"name":"open_in_viewer","arguments":{"path":"C:/本/猫.pdf"}}),
+        ));
+        let response = h.receive();
+        assert_eq!(response["id"], 4);
+        assert_eq!(response["result"]["isError"], false);
+        assert_eq!(
+            response["result"]["structuredContent"]["status"],
+            "accepted"
+        );
+        assert_eq!(
+            response["result"]["structuredContent"]["message"],
+            "mIV で開く処理を始めました"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                response["result"]["content"][0]["text"].as_str().unwrap()
+            )
+            .unwrap(),
+            response["result"]["structuredContent"]
+        );
+        h.send(request(
+            5,
+            "tools/call",
+            json!({"name":"open_in_viewer","arguments":{"path":"C:/本/猫.pdf","subresource":"1"}}),
+        ));
+        assert_eq!(h.receive()["error"]["code"], -32602);
+        assert_eq!(*backend.paths.lock().unwrap(), vec!["C:/本/猫.pdf"]);
+        h.close();
+    }
 }
 #[test]
 fn modern_discovery_and_metadata_errors() {
@@ -2477,7 +2706,7 @@ fn permission_observer_compares_advertised_tools_rather_than_snapshot_bits() {
                 }),
                 None
             )
-            .is_none()
+            .is_some()
     );
     assert!(
         observer
@@ -2486,6 +2715,18 @@ fn permission_observer_compares_advertised_tools_rather_than_snapshot_bits() {
                     level: AgentLevel::ReadOnly,
                     thumbnails: false,
                     gps: true
+                }),
+                None
+            )
+            .is_some()
+    );
+    assert!(
+        observer
+            .observe(
+                schema::tool_names(PermissionSnapshot {
+                    level: AgentLevel::ReadOnly,
+                    thumbnails: false,
+                    gps: false
                 }),
                 None
             )

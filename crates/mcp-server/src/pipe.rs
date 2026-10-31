@@ -124,6 +124,54 @@ fn receive(file: &mut PipeStream, id: u64) -> Result<Payload, AgentError> {
     }
     response.result
 }
+
+/// Only opens need foreground permission. Failure remains diagnostic-only and
+/// never carries a path, pipe name, or OS error message into the log.
+#[cfg(any(test, windows))]
+fn open_foreground_warning(
+    command: &Command,
+    server_pid: impl FnOnce() -> Option<u32>,
+    allow_foreground: impl FnOnce(u32) -> bool,
+) -> Option<&'static str> {
+    if !matches!(command, Command::OpenInViewer { .. }) {
+        return None;
+    }
+    let Some(pid) = server_pid().filter(|pid| *pid != 0) else {
+        return Some("server_pid_unavailable");
+    };
+    if allow_foreground(pid) {
+        None
+    } else {
+        Some("permission_denied")
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+fn best_effort_open_foreground(command: &Command, pipe: &PipeStream) {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::{
+        Foundation::HANDLE, System::Pipes::GetNamedPipeServerProcessId,
+        UI::WindowsAndMessaging::AllowSetForegroundWindow,
+    };
+    let warning = open_foreground_warning(
+        command,
+        || {
+            let mut pid = 0;
+            unsafe { GetNamedPipeServerProcessId(HANDLE(pipe.as_raw_handle()), &mut pid) }
+                .ok()
+                .map(|()| pid)
+        },
+        |pid| unsafe { AllowSetForegroundWindow(pid) }.is_ok(),
+    );
+    if let Some(category) = warning {
+        eprintln!("mimageviewer-mcp: foreground grant failed; category={category}");
+    }
+}
+
+// Unit/pipe fixtures never call desktop-affecting Windows APIs.
+#[cfg(any(not(windows), test))]
+fn best_effort_open_foreground(_: &Command, _: &PipeStream) {}
+
 impl Backend for PipeBackend {
     fn call(
         &self,
@@ -164,6 +212,7 @@ impl Backend for PipeBackend {
             }
             let writer = writer.as_mut().unwrap();
             writer.request_id = 2;
+            best_effort_open_foreground(&command, &reader);
             write_frame(&mut writer.file, &Request { id: 2, command })
                 .map_err(|_| unavailable())?;
         }
@@ -175,6 +224,58 @@ impl Backend for PipeBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn foreground_grant_is_open_only_and_failure_is_a_path_free_warning() {
+        let open = Command::OpenInViewer {
+            path: "C:/private/path.png".into(),
+        };
+        assert_eq!(
+            open_foreground_warning(
+                &Command::Status,
+                || panic!("read must not query PID"),
+                |_| panic!("read must not grant foreground")
+            ),
+            None
+        );
+        assert_eq!(
+            open_foreground_warning(
+                &open,
+                || None,
+                |_| panic!("missing PID must not grant foreground")
+            ),
+            Some("server_pid_unavailable")
+        );
+        assert_eq!(
+            open_foreground_warning(
+                &open,
+                || Some(0),
+                |_| panic!("zero PID must not grant foreground")
+            ),
+            Some("server_pid_unavailable")
+        );
+        assert_eq!(
+            open_foreground_warning(
+                &open,
+                || Some(42),
+                |pid| {
+                    assert_eq!(pid, 42);
+                    false
+                }
+            ),
+            Some("permission_denied")
+        );
+        assert_eq!(
+            open_foreground_warning(
+                &open,
+                || Some(42),
+                |pid| {
+                    assert_eq!(pid, 42);
+                    true
+                }
+            ),
+            None
+        );
+    }
     #[test]
     fn connection_error_mapping_distinguishes_busy_missing_denied_and_other() {
         let missing = connection_error(io::Error::from_raw_os_error(2));
