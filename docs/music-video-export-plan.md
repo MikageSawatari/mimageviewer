@@ -4233,3 +4233,13 @@ PNG snapshot は追加せず、この既存 headless harness で表示・選択�
 `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe` で行う。
 通常の `%APPDATA%\mimageviewer` を使って実設定・データを更新し得るため、共有 single-instance mutex を
 使うインストール版／トレイ常駐の mImageViewer を先に終了する。GUI 検収は未実施のまま。
+
+
+### master / egui 0.37 の統合（2026-10-31）
+
+musicvideoへmaster `961e49372`を取り込み、editor / UIをegui・eframe 0.37へ適合した。
+共有の鍵盤・スペクトラムと書き出しRGBAの契約は維持する。無効なUIの入力遮断は
+エディタのTextEditへinteractiveとして渡し、IMEの周辺文字削除も既存の取消スナップショットへ通す。
+UIパネル、文字位置型、headless出力とtexture更新列のAPI差分・回帰・検証条件は
+[統合検証記録](musicvideo-merge-egui037-verification.md)にまとめる。
+これは実装担当の自動検証であり、実機GUI検収や独立レビューの代替ではない。

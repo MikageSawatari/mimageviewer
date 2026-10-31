@@ -20,6 +20,12 @@
 > 名前幅を含め実描画が 1 物理 px でも越える場合はバーを必ず表示して scroll extent を外向きに
 > 確保する。縦横スクロールバーは同じ solid style を使う。下部の選択情報バーも同じ判定・solid
 > 横バー・専用レーンを使い、濃い floating bar がファイル名へ重ならないようにする。
+>
+> 5ch >>661の位置契約では、縦一覧は外側横ScrollAreaのヘッダ後の実body高からextentを解決する。
+> gutter見積り用の高さを縦physicsへ渡さない。実列数1・行高28・viewportをcontextのscroll ownerへ記録し、
+> 保存／RowAnchor復元／revealで共有する。これによりサムネイルの旧列数を使って詳細の再読込・自動再走査後に
+> 選択行の画面内位置がずれる既存不具合も直す。現在geometryと明示更新をeguiのphysics前へ渡し、
+> 描画origin／viewportも同じ解決結果から作る。実装済み・実機未確認。自動確認と共通workspace gateの前提不足は [最終台帳](scroll-661-investigation.md#stage-c-final-verification) を参照。
 > v2.0.0 追補レビュー後、複数選択型 facet メニュー (種類/拡張子/AIモデル/生成ツール/★/状態) は
 > タグ/場所/画像色と同じく外側クリックまで開いたままに統一し、絞り込みバー右端の件数は
 > `表示件数 / 全体件数 件` に変更。場所 facet の件数もタグ facet と同様に表示集合単位でキャッシュする。

@@ -24,6 +24,7 @@ R2の前回5件とR3のring独立検索更新の指摘は解消。F12公開境�
 | --- | --- |
 | F1–F5 / F6、カスタム評価キー、StepUp/Down | `[Rating]` の `RatingItem*` → `consume_rating_action` → `apply_rating_edit_to_fullscreen_item` (`ui_fullscreen.rs:30603`)。一覧は `apply_rating_edit_to_selection` (`app.rs:53287,72082`)。同じ保存・公開へ統合し、上限 no-op は保存・Undo・移動なし。新 Action / 固定キーを足さない。 |
 | Shift+F1–F6、カスタム container/step キー | `apply_rating_edit_to_current_container` → `write_container_rating_for_target` (`app.rs:71316,71413`)。子ページの評価ではない。通常は子ページ集合不変なので移動なし。同じキーを持つ親一覧の行だけ membership が変わる。合成一覧は `current_container_rating_target` が拒否する既存契約を維持。 |
+| 「本を優先」のカスタム評価キー (§1.417) | 既定キーなしの `RatingBookPreferred1..5/Clear/StepUp/StepDown`。一覧は選択 / チェック項目 (本のページ一覧も選択ページ)。画像閲覧・native 動画 / 音声では入力を受けた mounted context の採用済み `ProjectionRecipe::Book` と物理状態から本の対象を値で確定し、既存コンテナ保存経路へ渡す。非本・抽出結果の閲覧は既存の表示アイテム経路へ渡す。本キーは親一覧の本セルと同じで、子ページの★は変えない。照合不能なら書かずに通知する。既存の公開・所属調停・Undo を共有し、評価後の index で対象を再解決しない。 |
 | 情報パネル・マウスの★、音楽パネル | `ui_metadata_panel.rs:2718` の `set_rating` / `set_current_folder_rating`、`ui_music_panels.rs:1232` の `set_rating`。表示ページの idx を保存対象として捕捉する。キーボードだけ直してこの入口を残さない。 |
 | メイン toolbar/右クリックの評価メニュー | `ui_main.rs:11227` の selection/container setter。同じ共通近傍規則。画像全画面 HUD の独立した★メニューは見当たらず、★操作は情報パネル・キー・リング。 |
 | native 動画キー / HUD の★ | `app/native_video.rs:12556` の共通 rating helper、`:6751` の `NativeVideoOutputEvent::SetRating` → `set_rating`。静止画 strip とは consumer が違うが、表示集合から外れる anchor の問題は同型。動画/音声を勝手に非対象にせず、既存 media open/close/presenter owner を使う回帰対象。 |

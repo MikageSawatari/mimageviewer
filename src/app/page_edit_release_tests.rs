@@ -112,14 +112,15 @@ fn frame(
     events: Vec<egui::Event>,
 ) {
     let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
-    let _ = ctx.run(
+    ctx.run_pass(
         egui::RawInput {
             screen_rect: Some(full_rect),
             events,
             ..Default::default()
         },
-        |ctx| app.handle_local_adjust_canvas_input(ctx, full_rect, transform),
-    );
+        |ctx| app.handle_local_adjust_canvas_input(ctx, full_rect, transform, Default::default()),
+    )
+    .drop_without_applying_deltas();
 }
 
 fn seed_pointer(app: &mut App, edit: PointerEdit, before: &LocalAdjustmentLayers) {
@@ -342,6 +343,8 @@ fn release_matches_baseline(edit: PointerEdit, reindex: bool) {
     app.fs_cache.insert(
         0,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
+            pdf_metadata: None,
             tex,
             pixels,
             source_dims: Some([1, 1]),
@@ -353,7 +356,7 @@ fn release_matches_baseline(edit: PointerEdit, reindex: bool) {
     let s1 = app.local_adjust_page_layers[&0].clone();
     assert_ne!(s0, s1);
     // Prime egui's held-pointer state without invoking the start handler.
-    let _ = ctx.run(
+    ctx.run_pass(
         egui::RawInput {
             events: vec![egui::Event::PointerButton {
                 pos: egui::pos2(600.0, 300.0),
@@ -364,7 +367,8 @@ fn release_matches_baseline(edit: PointerEdit, reindex: bool) {
             ..Default::default()
         },
         |_| {},
-    );
+    )
+    .drop_without_applying_deltas();
     seed_pointer(&mut app, edit, &s1);
     frame(
         &mut app,

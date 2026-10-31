@@ -105,14 +105,13 @@ fn render(state: &mut EditorState, project: &Project, ready: bool) -> egui::Full
     );
     let mut output = egui::FullOutput::default();
     for _ in 0..2 {
-        output = context.run(
+        output = crate::headless_paint_output(context.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 480.0))),
                 ..Default::default()
             },
             |ctx| {
-                egui::TopBottomPanel::top("preview-controls")
-                    .show(ctx, |ui| state.preview_controls(ui));
+                egui::Panel::top("preview-controls").show(ctx, |ui| state.preview_controls(ui));
                 egui::CentralPanel::default().show(ctx, |ui| {
                     draw_preview(
                         ui,
@@ -127,7 +126,7 @@ fn render(state: &mut EditorState, project: &Project, ready: bool) -> egui::Full
                     )
                 });
             },
-        );
+        ));
     }
     output
 }

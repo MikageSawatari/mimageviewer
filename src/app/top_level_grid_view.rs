@@ -344,12 +344,13 @@ pub(crate) enum TopLevelGridRestore {
     Unavailable,
     Folder(PathBuf),
     DriveList,
-    ReadingHistory,
-    Bookmarks,
-    Rating { stars: u8 },
+    ReadingHistory(ReadingHistoryRootRestore),
+    Bookmarks(BookmarkRootRestore),
+    Physical(PhysicalGridRestore),
+    Rating(RatingRootRestore),
     RatingPhysical(RatingPhysicalRestore),
     SubfolderExpansion(SubfolderExpansionRestoreState),
-    SmartFolder(SmartFolderViewState),
+    SmartFolder(SmartFolderRestore),
     Collection(CollectionGridRestore),
     CollectionPhysical(CollectionGridPhysicalRestore),
 }
@@ -359,17 +360,184 @@ pub(crate) struct RatingPhysicalRestore {
     pub(crate) visible_path: PathBuf,
     pub(crate) stars: u8,
     pub(crate) nav_chain: Vec<PathBuf>,
-    pub(crate) saved_folder: Option<PathBuf>,
-    pub(crate) subfolder_restore: Option<SubfolderExpansionRestoreState>,
+    pub(crate) return_to: Option<Box<TopLevelGridOrigin>>,
 }
 
-/// Session-only Rating position. Pixel offsets and their aspect dependency travel together.
-/// Rating rows are rebuilt, so retain the confirmed decision, not old index-keyed samples.
+/// Immutable identity of one explicit Reading History visit, scoped to its existing owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadingHistoryVisit {
+    pub(crate) context: u64,
+    pub(crate) surface_generation: u64,
+    pub(crate) switch_sequence: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReadingHistoryExit {
+    RecordedEntrance(Box<TopLevelGridOrigin>),
+    CanonicalOrigin(Box<TopLevelGridOrigin>),
+    DriveList,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadingHistoryRootRestore {
+    pub(crate) visit: ReadingHistoryVisit,
+    pub(crate) exit: ReadingHistoryExit,
+}
+
+impl ReadingHistoryRootRestore {
+    /// Legacy synthetic-path opens have no recorded entrance. This also makes small fixtures
+    /// deterministic; adopted user visits always use their context's generation identity.
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            visit: ReadingHistoryVisit {
+                context: 0,
+                surface_generation: 0,
+                switch_sequence: 0,
+            },
+            exit: ReadingHistoryExit::DriveList,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadingHistoryBookReturn {
+    pub(crate) container: PathBuf,
+    pub(crate) return_to: Box<TopLevelGridOrigin>,
+}
+
+impl ReadingHistoryBookReturn {
+    pub(crate) fn without_entrance(container: PathBuf) -> Self {
+        let restore = TopLevelGridRestore::ReadingHistory(ReadingHistoryRootRestore::unavailable());
+        let route = super::facet_navigation::FacetRoute::root(
+            super::App::facet_scope_for_location(&super::FolderNavHistoryTarget::ReadingHistory(
+                ReadingHistoryRootRestore::unavailable(),
+            )),
+        );
+        Self {
+            container,
+            return_to: Box::new(TopLevelGridOrigin { restore, route }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RatingRootRestore {
+    pub(crate) stars: u8,
+    pub(crate) return_to: Option<Box<TopLevelGridOrigin>>,
+}
+
+/// Immutable native Smart metadata. The live scope state keeps its original single owners.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SmartFolderRestore {
+    pub(crate) state: SmartFolderViewState,
+    pub(crate) saved_folder: Option<PathBuf>,
+    pub(crate) return_to: Option<Box<TopLevelGridOrigin>>,
+}
+impl std::ops::Deref for SmartFolderRestore {
+    type Target = SmartFolderViewState;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+impl From<SmartFolderViewState> for SmartFolderRestore {
+    fn from(state: SmartFolderViewState) -> Self {
+        Self {
+            state,
+            saved_folder: None,
+            return_to: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BookmarkRootRestore {
+    pub(crate) grid: Option<super::BookmarkViewReturnGridState>,
+}
+fn bookmark_grid_eq(
+    a: &super::BookmarkViewReturnGridState,
+    b: &super::BookmarkViewReturnGridState,
+) -> bool {
+    a.row_keys == b.row_keys
+        && a.selected_key == b.selected_key
+        && a.opened_key == b.opened_key
+        && a.scroll_offset_y.to_bits() == b.scroll_offset_y.to_bits()
+}
+impl PartialEq for BookmarkRootRestore {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.grid, &other.grid) {
+            (Some(a), Some(b)) => bookmark_grid_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+impl Eq for BookmarkRootRestore {}
+
 #[derive(Clone, Debug)]
-pub(crate) struct RatingGridPosition {
+pub(crate) enum PhysicalParentReturn {
+    ReadingHistory(ReadingHistoryBookReturn),
+    Bookmark(super::BookmarkViewState),
+}
+impl PartialEq for PhysicalParentReturn {
+    fn eq(&self, other: &Self) -> bool {
+        use super::BookmarkViewState;
+        match (self, other) {
+            (Self::ReadingHistory(a), Self::ReadingHistory(b)) => a == b,
+            (
+                Self::Bookmark(BookmarkViewState::Opening {
+                    target: a,
+                    grid: ag,
+                }),
+                Self::Bookmark(BookmarkViewState::Opening {
+                    target: b,
+                    grid: bg,
+                }),
+            ) => a == b && bookmark_grid_eq(ag, bg),
+            (
+                Self::Bookmark(BookmarkViewState::Restoring { grid: a }),
+                Self::Bookmark(BookmarkViewState::Restoring { grid: b }),
+            ) => bookmark_grid_eq(a, b),
+            (
+                Self::Bookmark(BookmarkViewState::Detached { target: a }),
+                Self::Bookmark(BookmarkViewState::Detached { target: b }),
+            ) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for PhysicalParentReturn {}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PhysicalGridRestore {
+    pub(crate) visible_path: PathBuf,
+    pub(crate) parent: PhysicalParentReturn,
+}
+
+/// Session-only grid position. Pixel offsets and their aspect dependency travel together.
+/// Synthetic rows are rebuilt, so retain the confirmed decision, not old index-keyed samples.
+#[derive(Clone, Debug)]
+pub(crate) struct SessionGridPosition {
     pub(crate) scroll_offset_y: f32,
     pub(crate) selected_key: Option<String>,
     pub(crate) aspect_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
+}
+
+/// Identity of the expansion whose rows own a saved position (no filesystem access).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SubfolderExpansionPositionKey {
+    root: String,
+    roots: Vec<String>,
+}
+
+impl SubfolderExpansionPositionKey {
+    pub(crate) fn new(root: &std::path::Path, roots: &[PathBuf]) -> Self {
+        Self {
+            root: crate::path_key::normalize_keep_drive(root),
+            roots: roots
+                .iter()
+                .map(|path| crate::path_key::normalize_keep_drive(path))
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -389,6 +557,7 @@ pub(crate) struct CollectionGridRestore {
     /// Minimum revision hint. The actor may return any newer revision.
     pub(crate) revision_at_open: u64,
     pub(crate) viewport_anchor: Option<CollectionGridViewportAnchor>,
+    pub(crate) return_to: Option<Box<TopLevelGridOrigin>>,
 }
 
 /// A visible physical child of a Collection root. The root restore keeps the stable collection
@@ -424,10 +593,8 @@ pub(crate) struct CollectionGridRequestStamp {
 /// the currently installed immutable binding still has `accepted_revision`.
 #[derive(Clone)]
 pub(crate) struct CollectionGridSourceOpenOwner {
-    pub(crate) stamp: CollectionGridRequestStamp,
-    pub(crate) accepted_revision: u64,
-    pub(crate) wanted_revision: u64,
-    pub(crate) anchor: CollectionGridViewportAnchor,
+    /// The same root/descendant load owner used by ordinary ZIP/PDF/folder opens.
+    pub(crate) physical: CollectionGridPhysicalLoadOwner,
     /// Exact immutable root selected by collection playback navigation. Ordinary grid opens leave
     /// this empty; delayed archive conversion carries it until the physical-source commit.
     pub(crate) navigation_prepared:
@@ -480,6 +647,7 @@ impl CollectionGridPhysicalLoadOwner {
             },
             revision_at_open: self.accepted_revision.max(wanted_revision),
             viewport_anchor: Some(self.anchor.clone()),
+            return_to: None,
         }
     }
 }
@@ -488,10 +656,7 @@ impl std::fmt::Debug for CollectionGridSourceOpenOwner {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("CollectionGridSourceOpenOwner")
-            .field("stamp", &self.stamp)
-            .field("accepted_revision", &self.accepted_revision)
-            .field("wanted_revision", &self.wanted_revision)
-            .field("anchor", &self.anchor)
+            .field("physical", &self.physical)
             .field(
                 "navigation_revision",
                 &self
@@ -508,10 +673,7 @@ impl std::fmt::Debug for CollectionGridSourceOpenOwner {
 
 impl PartialEq for CollectionGridSourceOpenOwner {
     fn eq(&self, other: &Self) -> bool {
-        self.stamp == other.stamp
-            && self.accepted_revision == other.accepted_revision
-            && self.wanted_revision == other.wanted_revision
-            && self.anchor == other.anchor
+        self.physical == other.physical
             && self.navigation_origin == other.navigation_origin
             && self.navigation_request == other.navigation_request
             && self.navigation_watch.is_some() == other.navigation_watch.is_some()
@@ -1199,13 +1361,18 @@ impl TopLevelGridRestore {
         if crate::folder_tree::path_eq(&path, &super::drive_list_synthetic_path()) {
             Self::DriveList
         } else if crate::folder_tree::path_eq(&path, &super::reading_history_synthetic_path()) {
-            Self::ReadingHistory
+            Self::ReadingHistory(ReadingHistoryRootRestore::unavailable())
         } else if crate::folder_tree::path_eq(&path, &super::bookmark_view_synthetic_path()) {
-            Self::Bookmarks
+            Self::Bookmarks(BookmarkRootRestore::default())
         } else if crate::folder_tree::path_eq(&path, &super::rating_view_synthetic_path()) {
             rating_view_stars
                 .filter(|stars| (1..=5).contains(stars))
-                .map(|stars| Self::Rating { stars })
+                .map(|stars| {
+                    Self::Rating(RatingRootRestore {
+                        stars,
+                        return_to: None,
+                    })
+                })
                 .unwrap_or(Self::Unavailable)
         } else if let Some(definition_id) =
             super::smart_folder::smart_folder_id_from_synthetic_path(&path)
@@ -1213,7 +1380,7 @@ impl TopLevelGridRestore {
             let state = smart_state
                 .filter(|state| state.definition_id == definition_id)
                 .unwrap_or_else(|| SmartFolderViewState::root(definition_id, Vec::new()));
-            Self::SmartFolder(state)
+            Self::SmartFolder(state.into())
         } else {
             Self::Folder(path)
         }
@@ -1224,9 +1391,10 @@ impl TopLevelGridRestore {
             Self::Unavailable => None,
             Self::Folder(path) => Some(path.clone()),
             Self::DriveList => Some(super::drive_list_synthetic_path()),
-            Self::ReadingHistory => Some(super::reading_history_synthetic_path()),
-            Self::Bookmarks => Some(super::bookmark_view_synthetic_path()),
-            Self::Rating { .. } => Some(super::rating_view_synthetic_path()),
+            Self::ReadingHistory(_) => Some(super::reading_history_synthetic_path()),
+            Self::Bookmarks(_) => Some(super::bookmark_view_synthetic_path()),
+            Self::Physical(restore) => Some(restore.visible_path.clone()),
+            Self::Rating(_) => Some(super::rating_view_synthetic_path()),
             Self::RatingPhysical(restore) => Some(restore.visible_path.clone()),
             Self::SubfolderExpansion(_) => Some(super::subfolder_expansion_synthetic_path()),
             Self::SmartFolder(state) => Some(super::smart_folder::smart_folder_synthetic_path(
@@ -1239,7 +1407,7 @@ impl TopLevelGridRestore {
 
     pub(crate) fn rating_stars(&self) -> Option<u8> {
         match self {
-            Self::Rating { stars } => Some(*stars),
+            Self::Rating(root) => Some(root.stars),
             _ => None,
         }
     }
@@ -1252,8 +1420,48 @@ impl TopLevelGridRestore {
     }
 }
 
+impl PartialEq for TopLevelGridRestore {
+    fn eq(&self, other: &Self) -> bool {
+        use TopLevelGridRestore::*;
+        match (self, other) {
+            (Unavailable, Unavailable) | (DriveList, DriveList) => true,
+            (Bookmarks(a), Bookmarks(b)) => a == b,
+            (Physical(a), Physical(b)) => a == b,
+            (Folder(a), Folder(b)) => a == b,
+            (ReadingHistory(a), ReadingHistory(b)) => a == b,
+            (Rating(a), Rating(b)) => a == b,
+            (RatingPhysical(a), RatingPhysical(b)) => {
+                a.visible_path == b.visible_path
+                    && a.stars == b.stars
+                    && a.nav_chain == b.nav_chain
+                    && a.return_to == b.return_to
+            }
+            (SubfolderExpansion(a), SubfolderExpansion(b)) => {
+                a.root == b.root
+                    && a.roots == b.roots
+                    && a.saved_folder == b.saved_folder
+                    && a.removed_paths == b.removed_paths
+                    && match (&a.snapshot, &b.snapshot) {
+                        (Some(a), Some(b)) => {
+                            a.root == b.root
+                                && a.roots == b.roots
+                                && Arc::ptr_eq(&a.entries, &b.entries)
+                        }
+                        (None, None) => true,
+                        _ => false,
+                    }
+            }
+            (SmartFolder(a), SmartFolder(b)) => a == b,
+            (Collection(a), Collection(b)) => a == b,
+            (CollectionPhysical(a), CollectionPhysical(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for TopLevelGridRestore {}
+
 /// Runtime return provenance; the route carries no historical filter values.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TopLevelGridOrigin {
     pub(crate) restore: TopLevelGridRestore,
     pub(crate) route: super::facet_navigation::FacetRoute,
@@ -1267,7 +1475,7 @@ pub(crate) enum TopLevelGridSurface {
     Snapshot,
     SubfolderExpansion,
     SmartFolder(SmartFolderViewState),
-    ReadingHistory,
+    ReadingHistory(ReadingHistoryRootRestore),
     Bookmarks,
     Rating { stars: u8 },
     Collection(CollectionGridIdentity),
@@ -1360,7 +1568,7 @@ impl super::App {
                 TopLevelGridSurface::Rating { .. } => {
                     self.reload_current_rating_view_preserving_sort()
                 }
-                TopLevelGridSurface::ReadingHistory => self.enter_reading_history(),
+                TopLevelGridSurface::ReadingHistory(_) => self.enter_reading_history(),
                 TopLevelGridSurface::Bookmarks => self.enter_bookmark_view(),
                 TopLevelGridSurface::DriveList => {
                     let origin = self.selected.and_then(|index| match self.items.get(index) {
@@ -1390,7 +1598,11 @@ pub(crate) struct TopLevelGridView {
     return_to: Option<TopLevelGridOrigin>,
     generation: u64,
     /// At most five star lists, owned by this viewer context's navigation session.
-    rating_grid_positions: std::collections::HashMap<u8, RatingGridPosition>,
+    rating_grid_positions: std::collections::HashMap<u8, SessionGridPosition>,
+    reading_history_position: Option<SessionGridPosition>,
+    subfolder_expansion_position: Option<(SubfolderExpansionPositionKey, SessionGridPosition)>,
+    /// A committed departure saves the original rows/presentation only once.
+    pub(crate) departed_items_generation: Option<u64>,
     /// The completed smart-folder result has exactly the same lifetime as this surface plus
     /// descendants opened from it. `begin` is an explicit top-level transition and always drops
     /// the old session; `replace_surface` preserves it only while the same smart-folder surface
@@ -1426,6 +1638,9 @@ impl Clone for TopLevelGridView {
             generation: self.generation,
             // A duplicated viewer does not inherit another context's navigation positions.
             rating_grid_positions: Default::default(),
+            reading_history_position: None,
+            subfolder_expansion_position: None,
+            departed_items_generation: None,
             // Context duplication may copy the visible grid identity for an independent viewer,
             // but the main smart-folder result remains owned by the main top-level surface.
             smart_folder_session: None,
@@ -1472,6 +1687,9 @@ impl Default for TopLevelGridView {
             return_to: None,
             generation: 0,
             rating_grid_positions: Default::default(),
+            reading_history_position: None,
+            subfolder_expansion_position: None,
+            departed_items_generation: None,
             smart_folder_session: None,
             collection_session: None,
             collection_navigation_pending: None,
@@ -1485,17 +1703,50 @@ impl Default for TopLevelGridView {
 }
 
 impl TopLevelGridView {
-    pub(crate) fn save_rating_grid_position(&mut self, stars: u8, position: RatingGridPosition) {
+    pub(crate) fn save_rating_grid_position(&mut self, stars: u8, position: SessionGridPosition) {
         self.rating_grid_positions
             .insert(stars.clamp(1, 5), position);
     }
 
-    pub(crate) fn rating_grid_position(&self, stars: u8) -> Option<&RatingGridPosition> {
+    pub(crate) fn rating_grid_position(&self, stars: u8) -> Option<&SessionGridPosition> {
         self.rating_grid_positions.get(&stars)
     }
 
-    pub(crate) fn clear_rating_grid_positions(&mut self) {
+    pub(crate) fn reading_history_position(&self) -> Option<&SessionGridPosition> {
+        self.reading_history_position.as_ref()
+    }
+
+    pub(crate) fn save_reading_history_position(&mut self, position: SessionGridPosition) {
+        self.reading_history_position = Some(position);
+    }
+
+    pub(crate) fn clear_reading_history_position(&mut self) {
+        self.reading_history_position = None;
+    }
+
+    pub(crate) fn subfolder_expansion_position(
+        &self,
+        key: &SubfolderExpansionPositionKey,
+    ) -> Option<&SessionGridPosition> {
+        self.subfolder_expansion_position
+            .as_ref()
+            .filter(|(saved_key, _)| saved_key == key)
+            .map(|(_, position)| position)
+    }
+
+    pub(crate) fn save_subfolder_expansion_position(
+        &mut self,
+        key: SubfolderExpansionPositionKey,
+        position: SessionGridPosition,
+    ) {
+        self.subfolder_expansion_position = Some((key, position));
+    }
+
+    pub(crate) fn clear_session_grid_positions(&mut self) {
         self.rating_grid_positions.clear();
+        self.reading_history_position = None;
+        self.subfolder_expansion_position = None;
+        self.departed_items_generation = None;
     }
 
     pub(crate) fn surface(&self) -> &TopLevelGridSurface {
@@ -1590,6 +1841,9 @@ impl TopLevelGridView {
                 TopLevelGridSurface::SmartFolder(state),
             ) if session.definition_id() == state.definition_id
         );
+        let keeps_smart_origin = matches!((&self.surface, &surface),
+            (TopLevelGridSurface::SmartFolder(old), TopLevelGridSurface::SmartFolder(new))
+                if old.definition_id == new.definition_id);
         self.generation = self.generation.wrapping_add(1);
         self.advance_collection_navigation_sequence();
         if !keeps_smart_folder_session {
@@ -1604,7 +1858,9 @@ impl TopLevelGridView {
             _ => None,
         };
         self.surface = surface;
-        self.return_to = None;
+        if !keeps_smart_origin {
+            self.return_to = None;
+        }
         self.generation
     }
 
@@ -1650,6 +1906,10 @@ impl TopLevelGridView {
         let origin = self.return_to.take();
         let _ = self.take_return_to();
         origin
+    }
+
+    pub(crate) fn replace_return_origin(&mut self, origin: Option<TopLevelGridOrigin>) {
+        self.return_to = origin;
     }
 
     pub(crate) fn install_return_origin(&mut self, origin: TopLevelGridOrigin) {
@@ -1742,17 +2002,24 @@ impl TopLevelGridView {
             .is_some_and(|pending| pending.accumulate_outer(fullscreen, forward))
     }
 
+    pub(crate) fn collection_outer_navigation_available(&self, fullscreen: bool) -> bool {
+        self.collection_navigation_pending
+            .as_ref()
+            .is_some_and(|pending| pending.accepts_outer(fullscreen))
+    }
+
     pub(in crate::app) fn accumulate_collection_manual_navigation(
         &mut self,
         delta: i32,
         landing: super::ManualMediaNavigationLanding,
         still_only: bool,
         display_unit_step: bool,
+        wrap: bool,
     ) -> bool {
         self.collection_navigation_pending
             .as_mut()
             .is_some_and(|pending| {
-                pending.accumulate_manual(delta, landing, still_only, display_unit_step)
+                pending.accumulate_manual(delta, landing, still_only, display_unit_step, wrap)
             })
     }
 
@@ -2011,6 +2278,7 @@ mod tests {
             },
             revision_at_open: 7,
             viewport_anchor: None,
+            return_to: None,
         };
         let child = PathBuf::from(r"C:\books\child");
         let collection = TopLevelGridRestore::CollectionPhysical(CollectionGridPhysicalRestore {
@@ -2024,8 +2292,10 @@ mod tests {
             visible_path: child.clone(),
             stars: 3,
             nav_chain: vec![child.clone()],
-            saved_folder: Some(PathBuf::from(r"C:\prior")),
-            subfolder_restore: None,
+            return_to: Some(Box::new(TopLevelGridOrigin {
+                restore: TopLevelGridRestore::Folder(PathBuf::from(r"C:\prior")),
+                route: Default::default(),
+            })),
         });
         assert_eq!(rating.legacy_path().as_deref(), Some(child.as_path()));
         assert_eq!(rating.rating_stars(), None);
@@ -2212,7 +2482,7 @@ mod tests {
             None,
             None,
         );
-        assert!(matches!(restore, TopLevelGridRestore::Bookmarks));
+        assert!(matches!(restore, TopLevelGridRestore::Bookmarks(_)));
         assert!(crate::folder_tree::path_eq(
             &restore.legacy_path().expect("bookmark path"),
             &super::super::bookmark_view_synthetic_path()

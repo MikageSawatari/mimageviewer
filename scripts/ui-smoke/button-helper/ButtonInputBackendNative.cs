@@ -262,16 +262,74 @@ namespace Miv.UiSmoke.ButtonHelperDraft
         }
     }
 
+    internal sealed class ButtonInputDiagnosticTrace
+    {
+        private readonly object traceGate = new object();
+        private readonly System.Collections.Generic.List<string> trace = new System.Collections.Generic.List<string>();
+        private int traceDropped;
+
+        internal void Record(string record)
+        {
+            lock (traceGate)
+            {
+                if (trace.Count < 8) trace.Add(record);
+                else traceDropped++;
+            }
+        }
+
+        internal string Snapshot()
+        {
+            lock (traceGate)
+                return "dropped=" + traceDropped + ";" + String.Join(" | ", trace.ToArray());
+        }
+    }
+
     internal sealed class NativeButtonEventInserter : IButtonNativeInserter
     {
         internal static readonly int InputSize = Marshal.SizeOf(typeof(ButtonInputNative.Input));
+        private readonly ButtonInputDiagnosticTrace trace;
+
+        internal NativeButtonEventInserter(ButtonInputDiagnosticTrace trace) { this.trace = trace; }
+
+        private static string DescribeTarget()
+        {
+            // Observational only. Failure here must not refuse input or certify release.
+            try
+            {
+                ButtonInputNative.Point point;
+                bool cursorOk = ButtonInputNative.GetCursorPos(out point);
+                IntPtr hit = cursorOk ? ButtonInputNative.WindowFromPoint(point) : IntPtr.Zero;
+                uint pid;
+                uint tid = ButtonObservationNative.GetWindowThreadProcessId(hit, out pid);
+                ButtonObservationNative.GuiThreadInfo info = new ButtonObservationNative.GuiThreadInfo();
+                info.Size = (uint)Marshal.SizeOf(typeof(ButtonObservationNative.GuiThreadInfo));
+                bool guiOk = tid != 0 && ButtonObservationNative.GetGUIThreadInfo(tid, ref info);
+                System.Text.StringBuilder name = new System.Text.StringBuilder(128);
+                int nameLength = ButtonInputNative.GetClassName(hit, name, name.Capacity);
+                return "cursor_ok=" + cursorOk + ",screen=(" + point.X + "," + point.Y
+                    + "),hit=0x" + hit.ToInt64().ToString("x") + ",pid=" + pid + ",tid=" + tid
+                    + ",class=" + (nameLength > 0 ? name.ToString() : "unavailable")
+                    + ",root=0x" + ButtonObservationNative.GetAncestor(hit, 2).ToInt64().ToString("x")
+                    + ",foreground=0x" + ButtonObservationNative.GetForegroundWindow().ToInt64().ToString("x")
+                    + ",gui_ok=" + guiOk + ",capture=0x" + info.Capture.ToInt64().ToString("x")
+                    + ",left_down=" + ((ButtonObservationNative.GetAsyncKeyState(1) & 0x8000) != 0);
+            }
+            catch (Exception error) { return "unavailable=" + error.GetType().Name; }
+        }
 
         public ButtonNativeInsertion SendOne(ButtonNormalSendEdge edge, uint tag)
         {
             ButtonInputNative.Input input = BuildInput(edge, tag);
             ButtonInputNative.Input[] one = new ButtonInputNative.Input[] { input };
+            string before = DescribeTarget();
+            ulong beforeTick = SystemButtonClock.ReadNow();
             uint inserted = ButtonInputNative.SendInput(1, one, InputSize);
             int residualLastError = Marshal.GetLastWin32Error();
+            ulong afterTick = SystemButtonClock.ReadNow();
+            trace.Record("edge=" + edge + ",tag=0x" + tag.ToString("x")
+                + ",before_tick_ms=" + beforeTick + ",after_tick_ms=" + afterTick
+                + ",inserted=" + inserted + ",last_error=" + residualLastError
+                + ",before={" + before + "},after={" + DescribeTarget() + "}");
             return new ButtonNativeInsertion(unchecked((int)inserted), residualLastError);
         }
 
@@ -345,6 +403,12 @@ namespace Miv.UiSmoke.ButtonHelperDraft
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool GetCursorPos(out Point point);
+
+        [DllImport("user32.dll")]
+        internal static extern IntPtr WindowFromPoint(Point point);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        internal static extern int GetClassName(IntPtr hwnd, System.Text.StringBuilder text, int capacity);
 
         [DllImport("user32.dll", SetLastError = true)]
         internal static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);

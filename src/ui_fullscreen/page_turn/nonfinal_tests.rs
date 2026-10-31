@@ -3,6 +3,77 @@
 use super::*;
 use crate::ui_fullscreen::page_turn_submission_tests::{draw_current, frame, ready_app};
 
+#[test]
+fn d3_first_offer_selects_registered_exact_finals_and_keeps_unregistered_pair_page_resident() {
+    for mode in [SpreadMode::Single, SpreadMode::Ltr, SpreadMode::Rtl] {
+        for registered_pair in [false, true] {
+            let ctx = egui::Context::default();
+            install(&ctx);
+            let mut app = ready_app(&ctx, mode);
+            app.settings.page_turn_animation_enabled = true;
+            app.settings.page_turn_animation_duration_ms = 600;
+            frame(&ctx, |ui, ctx| {
+                draw_current(&mut app, ui, ctx);
+            });
+            let target = if mode.is_spread() { 2 } else { 1 };
+            let key = crate::app::final_prepare_tests::queued_final(&mut app, target);
+            let other_key = (registered_pair && mode.is_spread())
+                .then(|| crate::app::final_prepare_tests::queued_final(&mut app, target + 1));
+            frame(&ctx, |_, ctx| {
+                // This common decision checkpoint must adopt before resolving
+                // navigation or capturing the first accepted resident material.
+                app.fs_page_turn_decision_for_frame(ctx, 0);
+                let operation = ViewerOperationId::Pad {
+                    batch: next_operation_batch(),
+                    ordinal: 0,
+                };
+                app.page_turn_external_operation(ctx, operation, OperationPhase::Press, "d3-final");
+                app.offer_page_turn_with_operation(ctx, target, true, Some(operation));
+                let PresentationState::Offered { offer, .. } = &app.page_turn_presentation.state
+                else {
+                    panic!("offer: {:?}", take_test_events());
+                };
+                let accepted = &offer.ready_sources.0;
+                let final_id = app.final_composite_cache.get(&key).unwrap().texture.id();
+                assert_eq!(
+                    accepted
+                        .iter()
+                        .find(|source| source.occurrence.idx == target)
+                        .unwrap()
+                        .resource
+                        .source_texture_id(),
+                    final_id
+                );
+                if let Some(key) = other_key {
+                    assert_eq!(
+                        accepted
+                            .iter()
+                            .find(|source| source.occurrence.idx == target + 1)
+                            .unwrap()
+                            .resource
+                            .source_texture_id(),
+                        app.final_composite_cache.get(&key).unwrap().texture.id()
+                    );
+                } else if mode.is_spread() {
+                    assert!(
+                        app.exact_complete_final_composite_texture(target + 1)
+                            .is_none()
+                    );
+                    assert_eq!(
+                        accepted
+                            .iter()
+                            .find(|source| source.occurrence.idx == target + 1)
+                            .unwrap()
+                            .resource
+                            .source_texture_id(),
+                        app.resolve_fs_display_tex(target + 1, false).unwrap().id()
+                    );
+                }
+            });
+        }
+    }
+}
+
 fn install_resident_thumbnail(
     app: &mut App,
     ctx: &egui::Context,
@@ -13,14 +84,15 @@ fn install_resident_thumbnail(
         egui::ColorImage::filled([8, 12], egui::Color32::from_rgb(180, 100, 40)),
         egui::TextureOptions::LINEAR,
     );
-    app.thumbnails[idx] = ThumbnailState::Loaded {
-        tex: texture.clone(),
-        origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-        from_edit_preview: false,
-        rendered_at_px: 12,
-        source_dims: Some((80, 120)),
-        layout_dims: None,
-    };
+    app.thumbnails[idx] = ThumbnailState::loaded_raster(
+        texture.clone(),
+        crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+        false,
+        12,
+        crate::source_coverage::SourceCoverage::FullSource,
+        Some((80, 120)),
+        None,
+    );
     texture
 }
 
@@ -268,6 +340,8 @@ fn publish_larger_raster_and_final_for_idx(
     app.fs_cache.insert(
         idx,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
+            pdf_metadata: None,
             tex: texture,
             pixels,
             source_dims: Some([160, 240]),
@@ -340,8 +414,10 @@ fn source_quality_publication_stays_frozen_until_canonical_flat_is_adopted() {
     });
     assert_eq!(tracker.status(), SubmissionStatus::Started);
 
-    if let PresentationState::Turning { offer, .. } = &mut app.page_turn_presentation.state {
-        offer.accepted_at -= offer.duration + Duration::from_millis(1);
+    if let PresentationState::Turning { clock, offer, .. } = &mut app.page_turn_presentation.state {
+        *clock = MotionClock::Running {
+            start_at: Instant::now() - offer.duration - Duration::from_millis(1),
+        };
     } else {
         panic!("a raster upgrade must preserve the turn until its deadline")
     }
@@ -418,11 +494,55 @@ fn interrupted_thumbnail_turn_submits_its_frozen_flat_before_next_navigation() {
         assert!(!app.commit_page_turn_continuation(ctx));
         assert_eq!(app.fullscreen_idx, Some(1));
     });
-    assert!(canonical.unwrap().was_accepted());
+    let canonical = canonical.unwrap();
+    assert!(canonical.was_accepted());
+    let canonical_pages = canonical.pages().to_vec();
+    let held_material = |app: &App| {
+        let PresentationState::Completing { incoming, .. } = &app.page_turn_presentation.state
+        else {
+            panic!("canonical incoming must remain held until continuation")
+        };
+        incoming
+            .pages
+            .iter()
+            .map(|page| {
+                (
+                    page.resource.source_texture_id(),
+                    page.resource.paint_texture_id(),
+                    page.transform.paint_quad(),
+                    page.transform.uv_rect,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let canonical_material = held_material(&app);
     assert_eq!(app.fullscreen_idx, Some(1));
+    // Both a quality publication for the held unit and the next landing final
+    // arrive after canonical submission. Neither may rewrite accepted evidence.
+    crate::app::final_prepare_tests::queued_final(&mut app, 1);
+    let next_key = crate::app::final_prepare_tests::queued_final(&mut app, 2);
     frame(&ctx, |_, ctx| {
-        assert!(app.commit_page_turn_continuation(ctx));
+        crate::app::final_prepare_tests::expect_adopted_before_lookup(next_key, || {
+            app.service_final_prepare_before_lookup(ctx);
+            assert_eq!(held_material(&app), canonical_material);
+            let PresentationState::Completing {
+                completion: FlatCompletion::Submitted(receipt),
+                ..
+            } = &app.page_turn_presentation.state
+            else {
+                panic!("service must retain the submitted canonical receipt")
+            };
+            assert!(receipt.was_accepted());
+            assert_eq!(receipt.pages(), canonical_pages.as_slice());
+            assert!(app.commit_page_turn_continuation(ctx));
+        });
         assert_eq!(app.fullscreen_idx, Some(2));
+        assert_eq!(canonical.pages(), canonical_pages.as_slice());
+        assert!(canonical.was_accepted());
+        assert!(
+            !app.page_turn_barrier_active(),
+            "continuation remains instant"
+        );
     });
 }
 
@@ -522,7 +642,7 @@ fn accepted_thumbnail_is_accounted_before_prepare_and_lease_released_after_cance
     app.page_turn_leases.account(&mut before);
     let before_bytes = before.finish().total_bytes();
     let mut incoming = VramAccountant::default();
-    incoming.add_texture(VramSubsystem::PageTurnPresentation, &accepted, true);
+    incoming.add_texture(VramSubsystem::PageTurnPresentation, &accepted, false);
     let incoming_bytes = incoming.finish().total_bytes();
     frame(&ctx, |_, ctx| {
         let operation = ViewerOperationId::Pad {
@@ -558,13 +678,18 @@ fn accepted_thumbnail_is_accounted_before_prepare_and_lease_released_after_cance
         // Ordinary owners and presentation owners share TextureIds. Outgoing
         // sources and the newly accepted incoming source must each count once.
         for page in &outgoing.pages {
-            deduplicated.add_texture(
-                VramSubsystem::FinalCompositeCache,
-                page.resource.source_texture(),
-                true,
-            );
+            let texture = page.resource.source_texture().unwrap();
+            let mipmapped = ctx
+                .tex_manager()
+                .read()
+                .meta(texture.id())
+                .unwrap()
+                .options
+                .mipmap_mode
+                .is_some();
+            deduplicated.add_texture(VramSubsystem::FinalCompositeCache, texture, mipmapped);
         }
-        deduplicated.add_texture(VramSubsystem::Thumbnails, &accepted, true);
+        deduplicated.add_texture(VramSubsystem::Thumbnails, &accepted, false);
         app.page_turn_leases.account(&mut deduplicated);
         assert_eq!(
             deduplicated.finish().total_bytes(),
@@ -684,9 +809,12 @@ fn resampleable_quality_upgrade_retains_single_and_spread_sources_and_accepts_he
                 }
             });
             assert_eq!(tracker.status(), SubmissionStatus::Started);
-            if let PresentationState::Turning { offer, .. } = &mut app.page_turn_presentation.state
+            if let PresentationState::Turning { clock, offer, .. } =
+                &mut app.page_turn_presentation.state
             {
-                offer.accepted_at -= offer.duration + Duration::from_millis(1);
+                *clock = MotionClock::Running {
+                    start_at: Instant::now() - offer.duration - Duration::from_millis(1),
+                };
             } else {
                 panic!("publication must keep the single/spread turn active")
             }
@@ -769,16 +897,15 @@ fn held_thumbnail_yields_to_original_preview_and_ineligible_editor_views() {
         accepted.id()
     );
 
-    let preview = app.resolve_fs_processed_texture(&ctx, 1, true).unwrap();
-    assert_eq!(preview.id(), original.id());
-    let preview_resource = app.fullscreen_paint_resource_for_texture(1, preview);
+    let preview_resource = app.resolve_fs_processed_material(&ctx, 1, true).unwrap();
+    assert_eq!(preview_resource.source_texture_id(), original.id());
     assert_eq!(preview_resource.source_texture_id(), original.id());
     assert!(preview_resource.source_generation().is_some());
     let mut preview_page = match &app.page_turn_presentation.state {
         PresentationState::Turning { incoming, .. } => incoming.pages[0].clone(),
         _ => panic!("original preview must not replace the presentation owner itself"),
     };
-    preview_page.resource = preview_resource;
+    preview_page.resource = preview_resource.into();
     preview_page.live = false;
     let prepared = app.page_turn_bind_prepared(preview_page);
     assert!(!prepared.live);

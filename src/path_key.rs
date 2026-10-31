@@ -142,6 +142,12 @@ pub(crate) fn physical_path_is_within(path: &Path, root: &Path) -> bool {
                 .is_some_and(|tail| root.ends_with('/') || tail.starts_with('/')))
 }
 
+/// Strict component-boundary descent using the same physical/logical source spellings.
+/// Container callers pass the logical source, never an archive conversion cache path.
+pub(crate) fn physical_path_is_strict_descendant(path: &Path, root: &Path) -> bool {
+    physical_path_is_within(path, root)
+        && physical_path_spelling(path) != physical_path_spelling(root)
+}
 /// 実在するパスの表示用表記を取得する。保存キーの大小文字と区切りは変えてよいが、
 /// symlink 解決などで別の論理パスになった場合は採用しない。
 ///
@@ -163,6 +169,34 @@ pub(crate) fn restore_existing_path_casing(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_descendant_uses_physical_source_spelling_and_component_boundaries() {
+        let root = Path::new(r"C:\shelf");
+        for child in [
+            r"C:\shelf\chapter",
+            r"c:/SHELF/book.zip",
+            r"\\?\C:\shelf\book.pdf",
+        ] {
+            assert!(
+                physical_path_is_strict_descendant(Path::new(child), root),
+                "{child}"
+            );
+        }
+        for other in [
+            r"C:\shelf",
+            r"c:/SHELF/",
+            r"\\?\C:\shelf",
+            r"C:\shelf-other\book.zip",
+            r"D:\shelf\book.zip",
+            r"C:\shelf\..\other",
+        ] {
+            assert!(
+                !physical_path_is_strict_descendant(Path::new(other), root),
+                "{other}"
+            );
+        }
+    }
 
     #[cfg(windows)]
     #[test]

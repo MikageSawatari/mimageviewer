@@ -348,8 +348,35 @@ fn check_transfer(kind: SourceKind) {
                 transfer::waiting_without_worker(&f.app),
                 "completed receipt must still be harvested"
             );
+            // Hold Record after its watermark publication, before pending--.
+            // A warm position reply is available here, but the actor is still busy.
+            let completion_pause = (!failure).then(|| {
+                f.app
+                    .book_resume_writer
+                    .as_ref()
+                    .unwrap()
+                    .pause_before_next_completion_for_test()
+            });
             f.app.poll_composition_editor_operations(&ctx);
+            if let Some((entered, _)) = &completion_pause {
+                entered.recv_timeout(WAIT).unwrap();
+            }
             assert_resume_once(&mut f, &ctx, failure);
+            if completion_pause.is_some() {
+                assert!(f.app.book_resume_writer.as_ref().unwrap().is_busy());
+                if !matches!(entry, transfer::Entry::Preview) {
+                    transfer::advance(&mut f.app);
+                    assert!(
+                        transfer::waiting_without_worker(&f.app),
+                        "{kind:?} {entry:?}: resume reply is not writer idle"
+                    );
+                }
+            }
+            // The resume assertions are complete. As in the Generic migration
+            // test, release and drain/join the actual FIFO to isolate ticket
+            // harvest from the independent writer-idle admission condition.
+            drop(completion_pause);
+            drop(f.app.book_resume_writer.take());
             assert_eq!(f.app.items, main_items);
             assert_eq!(f.app.items_generation, main_generation);
             assert!(matches!(
@@ -359,7 +386,8 @@ fn check_transfer(kind: SourceKind) {
             transfer::advance(&mut f.app);
             assert!(
                 !transfer::waiting_without_worker(&f.app),
-                "transfer admitted after harvest"
+                "{kind:?} {entry:?} failure={failure}: transfer admitted after harvest and resume drain; rename_writers_busy={}",
+                f.app.rename_migration_writers_busy()
             );
             transfer::finish_worker(&mut f.app);
             let stored = f

@@ -250,6 +250,7 @@ pub struct BottomContainerInput<'a> {
 
 #[derive(Clone, Debug)]
 pub struct ThumbnailOverlayLayoutInput<'a> {
+    pub name_style: ThumbnailNameStyle,
     pub cell: egui::Rect,
     pub inner: egui::Rect,
     /// Shared display setting: reserve the bottom band for every cell, regardless of saved values.
@@ -265,6 +266,33 @@ pub struct ThumbnailOverlayLayoutInput<'a> {
     pub bottom_container: Option<BottomContainerInput<'a>>,
     pub rating_text: Option<&'a str>,
     pub filename: Option<&'a str>,
+}
+
+/// Per-name multiplier, applied after the existing cell-dependent font calculation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThumbnailNameStyle {
+    pub font_scale: f32,
+    pub max_lines: usize,
+}
+
+impl Default for ThumbnailNameStyle {
+    fn default() -> Self {
+        Self {
+            font_scale: 1.0,
+            max_lines: 1,
+        }
+    }
+}
+
+impl ThumbnailNameStyle {
+    fn apply(self, mut style: BadgeTextStyle) -> BadgeTextStyle {
+        style.font_size *= self.font_scale;
+        style.padding.left *= self.font_scale;
+        style.padding.right *= self.font_scale;
+        style.padding.top *= self.font_scale;
+        style.padding.bottom *= self.font_scale;
+        style
+    }
 }
 
 pub fn bookmark_time_style() -> BadgeTextStyle {
@@ -620,7 +648,7 @@ fn layout_badges(
 
     if let Some(container) = input.bottom_container {
         let style = match container.kind {
-            BottomContainerKind::Folder => folder_badge_style(input.inner),
+            BottomContainerKind::Folder => input.name_style.apply(folder_badge_style(input.inner)),
             BottomContainerKind::Format(_) => file_badge_style(input.inner),
         };
         let max_badge_width = match container.kind {
@@ -628,7 +656,24 @@ fn layout_badges(
             BottomContainerKind::Format(_) => input.inner.width() - BOTTOM_LEFT_OFFSET * 2.0,
         };
         let max_text_width = (max_badge_width - style.padding.left - style.padding.right).max(0.0);
-        if let Some(text) = fit_text(container.label, None, max_text_width, &mut measure, style) {
+        let is_name = container.kind == BottomContainerKind::Folder;
+        let max_lines = if is_name {
+            input.name_style.max_lines.clamp(1, 4)
+        } else {
+            1
+        };
+        for lines in (1..=max_lines).rev() {
+            let Some(text) = fit_name(
+                container.label,
+                None,
+                max_text_width,
+                max_lines,
+                lines,
+                &mut measure,
+                style,
+            ) else {
+                continue;
+            };
             let size = measured_badge_size(&text, style, &mut measure);
             let placement = BadgePlacement {
                 kind: BadgeKind::BottomContainer(container.kind),
@@ -637,14 +682,19 @@ fn layout_badges(
                 text,
                 style,
             };
-            if !blocked_by_top(placement.rect) {
+            // Only multi-line trials add containment. The final one-line trial keeps the legacy
+            // rejection rules, including the existing meter reservation in blocked_by_top.
+            if (lines == 1 || input.cell.contains_rect(placement.rect))
+                && !blocked_by_top(placement.rect)
+            {
                 bottom_left.container = Some(placement);
+                break;
             }
         }
     }
 
     if let Some(filename) = input.filename {
-        let style = filename_badge_style();
+        let style = input.name_style.apply(filename_badge_style());
         let available_left = bottom_left
             .container
             .as_ref()
@@ -652,9 +702,22 @@ fn layout_badges(
         let available_right = input.inner.max.x - BOTTOM_LEFT_OFFSET;
         let max_text_width =
             available_right - available_left - style.padding.left - style.padding.right;
-        if max_text_width >= 4.0
-            && let Some(text) = fit_text(filename, Some(18), max_text_width, &mut measure, style)
-        {
+        let max_lines = input.name_style.max_lines.clamp(1, 4);
+        for lines in (1..=max_lines).rev() {
+            if max_text_width < 4.0 {
+                break;
+            }
+            let Some(text) = fit_name(
+                filename,
+                Some(18),
+                max_text_width,
+                max_lines,
+                lines,
+                &mut measure,
+                style,
+            ) else {
+                continue;
+            };
             let size = measured_badge_size(&text, style, &mut measure);
             let center_x = (available_left + available_right) * 0.5;
             let placement = BadgePlacement {
@@ -667,8 +730,11 @@ fn layout_badges(
                 text,
                 style,
             };
-            if !blocked_by_top(placement.rect) {
+            if (lines == 1 || input.cell.contains_rect(placement.rect))
+                && !blocked_by_top(placement.rect)
+            {
                 bottom_left.filename = Some(placement);
+                break;
             }
         }
     }
@@ -868,9 +934,624 @@ fn fit_text(
     (measure("…", style).x <= max_text_width).then(|| "…".to_owned())
 }
 
+/// A one-line setting deliberately retains the legacy soft cap and fitting algorithm.
+/// Multi-line names use at most O(lines * log(chars)) font measurements, including ellipsis.
+/// In that path, each source LF consumes a line (including interior empty lines). Trailing LFs
+/// are ignored; a name consisting only of LFs is empty. Never measure across a source LF, since
+/// no-wrap measurement returns the maximum row width rather than the width of the whole string.
+/// `line_budget` can shrink for vertical fit without switching a multi-line setting back to
+/// legacy fitting: its last one-line trial must still consume and truncate source newlines.
+fn fit_name(
+    text: &str,
+    soft_char_cap: Option<usize>,
+    max_text_width: f32,
+    max_lines: usize,
+    line_budget: usize,
+    measure: &mut impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
+    style: BadgeTextStyle,
+) -> Option<String> {
+    if max_lines == 1 {
+        return fit_text(text, soft_char_cap, max_text_width, measure, style);
+    }
+    let text = text.trim_end_matches('\n');
+    if max_text_width <= 0.0 || text.is_empty() {
+        return None;
+    }
+    let mut remaining = text;
+    let mut lines = Vec::with_capacity(line_budget);
+    for line in 0..line_budget {
+        let (segment, next_line) = remaining
+            .split_once('\n')
+            .map_or((remaining, None), |(head, tail)| (head, Some(tail)));
+        let last = line + 1 == line_budget;
+        if (!last || next_line.is_none()) && measure(segment, style).x <= max_text_width {
+            lines.push(segment.to_owned());
+            if let Some(next_line) = next_line {
+                remaining = next_line;
+                continue;
+            }
+            break;
+        }
+        if last && measure("…", style).x > max_text_width {
+            return None;
+        }
+        let boundaries: Vec<_> = segment
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain([segment.len()])
+            .collect();
+        let mut low = 0;
+        let mut high = boundaries.len() - 1;
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            let mut candidate = segment[..boundaries[mid]].to_owned();
+            if last {
+                candidate.push('…');
+            }
+            if measure(&candidate, style).x <= max_text_width {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        if !last && low == 0 {
+            return None;
+        }
+        let mut fitted = segment[..boundaries[low]].to_owned();
+        if last {
+            fitted.push('…');
+        }
+        lines.push(fitted);
+        remaining = &remaining[boundaries[low]..];
+    }
+    Some(lines.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_names_match_legacy_placements_and_soft_cap() {
+        let (cell, inner) = cell(320.0);
+        let bottom_y = inner.max.y - BOTTOM_LEFT_OFFSET;
+        let left_x = inner.min.x + BOTTOM_LEFT_OFFSET;
+        for kind in [
+            BottomContainerKind::Folder,
+            BottomContainerKind::Format(FormatBadgeKind::Zip),
+        ] {
+            let mut input = duration_input(cell, inner);
+            input.bottom_container = Some(BottomContainerInput {
+                kind,
+                label: "長いフォルダ名の代表的な表示テスト ZIP",
+            });
+            input.filename = Some("long-file-name-with-characters.zip");
+            let layout = layout_thumbnail_overlays(input.clone(), measure);
+            let style = if kind == BottomContainerKind::Folder {
+                folder_badge_style(inner)
+            } else {
+                file_badge_style(inner)
+            };
+            let width = if kind == BottomContainerKind::Folder {
+                inner.width() * 0.8
+            } else {
+                inner.width() - BOTTOM_LEFT_OFFSET * 2.0
+            };
+            let text = fit_text(
+                input.bottom_container.unwrap().label,
+                None,
+                width - style.padding.size().x,
+                &mut measure,
+                style,
+            )
+            .unwrap();
+            let size = measured_badge_size(&text, style, &mut measure);
+            let container = BadgePlacement {
+                kind: BadgeKind::BottomContainer(kind),
+                priority: BadgePriority::BottomContainer,
+                rect: egui::Rect::from_min_size(egui::pos2(left_x, bottom_y - size.y), size),
+                text,
+                style,
+            };
+            assert_eq!(layout.bottom_left.container.as_ref(), Some(&container));
+            let style = filename_badge_style();
+            let available_left = container.rect.max.x + BOTTOM_ITEM_GAP;
+            let available_right = inner.max.x - BOTTOM_LEFT_OFFSET;
+            let text = fit_text(
+                input.filename.unwrap(),
+                Some(18),
+                available_right - available_left - style.padding.size().x,
+                &mut measure,
+                style,
+            )
+            .unwrap();
+            let size = measured_badge_size(&text, style, &mut measure);
+            assert_eq!(
+                layout.bottom_left.filename,
+                Some(BadgePlacement {
+                    kind: BadgeKind::Filename,
+                    priority: BadgePriority::Filename,
+                    rect: egui::Rect::from_min_size(
+                        egui::pos2(
+                            (available_left + available_right) * 0.5 - size.x * 0.5,
+                            bottom_y - size.y
+                        ),
+                        size
+                    ),
+                    text,
+                    style,
+                })
+            );
+        }
+        assert_eq!(
+            fit_name(
+                "abcdefghijklmnopqrstuvwxyz",
+                Some(18),
+                1000.0,
+                1,
+                1,
+                &mut measure,
+                filename_badge_style()
+            )
+            .unwrap(),
+            "abcdefghijklmnopq…"
+        );
+    }
+
+    #[test]
+    fn multiline_names_wrap_and_ellipsize_only_the_last_line() {
+        for name in [
+            "長い日本語のフォルダ名とファイル名を複数行に表示するための十分に長い名前です",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+            "long filename with spaces and several separate words for wrapping",
+        ] {
+            for max_lines in 2..=4 {
+                let style = filename_badge_style();
+                let wrapped = fit_name(
+                    name,
+                    Some(18),
+                    80.0,
+                    max_lines,
+                    max_lines,
+                    &mut measure,
+                    style,
+                )
+                .unwrap();
+                let lines: Vec<_> = wrapped.lines().collect();
+                assert_eq!(lines.len(), max_lines, "{wrapped}");
+                assert!(lines.last().unwrap().ends_with('…'), "{wrapped}");
+                assert!(lines.iter().all(|line| measure(line, style).x <= 80.0));
+                assert!(
+                    lines[..max_lines - 1]
+                        .iter()
+                        .all(|line| !line.contains('…'))
+                );
+                // Nothing is discarded between lines, even at spaces/punctuation.
+                assert!(name.starts_with(&wrapped.replace('\n', "").trim_end_matches('…')));
+            }
+        }
+        let name = "123456789012345678901234567890";
+        let wrapped = fit_name(
+            name,
+            Some(18),
+            110.0,
+            3,
+            3,
+            &mut measure,
+            filename_badge_style(),
+        )
+        .unwrap();
+        assert_eq!(wrapped.replace('\n', ""), name);
+        assert!(!wrapped.ends_with('…'));
+        assert_eq!(
+            fit_name(
+                "短い名前",
+                None,
+                110.0,
+                4,
+                4,
+                &mut measure,
+                filename_badge_style()
+            )
+            .as_deref(),
+            Some("短い名前")
+        );
+    }
+
+    #[test]
+    fn source_newlines_and_empty_lines_consume_the_multiline_budget() {
+        let style = filename_badge_style();
+        for (name, expected) in [
+            ("A\nB\nC", ["A\nB…", "A\nB\nC", "A\nB\nC"]),
+            ("A\n\nB", ["A\n…", "A\n\nB", "A\n\nB"]),
+            ("\nA\nB", ["\nA…", "\nA\nB", "\nA\nB"]),
+            ("A\n\n\nB", ["A\n…", "A\n\n…", "A\n\n\nB"]),
+            ("A\nB\n", ["A\nB", "A\nB", "A\nB"]),
+            ("A\n\nB\n\n", ["A\n…", "A\n\nB", "A\n\nB"]),
+        ] {
+            for (max_lines, expected) in (2..=4).zip(expected) {
+                let text = fit_name(
+                    name,
+                    Some(18),
+                    100.0,
+                    max_lines,
+                    max_lines,
+                    &mut measure,
+                    style,
+                )
+                .unwrap();
+                assert_eq!(text, expected, "{name:?}, max_lines={max_lines}");
+                assert!(text.split('\n').count() <= max_lines);
+                assert!(text.split('\n').all(|line| measure(line, style).x <= 100.0));
+                assert_eq!(
+                    measure(&text, style).y,
+                    text.split('\n').count() as f32 * style.font_size * 1.25
+                );
+            }
+        }
+        assert_eq!(
+            fit_name("\n\n", None, 100.0, 2, 2, &mut measure, style),
+            None
+        );
+    }
+
+    #[test]
+    fn source_newlines_and_width_wrapping_share_one_budget_and_one_line_ellipsis() {
+        let style = filename_badge_style();
+        let width = measure("ABCD", style).x;
+        for (max_lines, expected) in [
+            (2, "ABCD\nEF…"),
+            (3, "ABCD\nEFGH\nIJ…"),
+            (4, "ABCD\nEFGH\nIJKL\nMN"),
+        ] {
+            let text = fit_name(
+                "ABCDEFGH\nIJKL\nMN\n",
+                None,
+                width,
+                max_lines,
+                max_lines,
+                &mut measure,
+                style,
+            )
+            .unwrap();
+            assert_eq!(text, expected);
+            assert!(text.split('\n').count() <= max_lines);
+            assert!(text.split('\n').all(|line| measure(line, style).x <= width));
+        }
+        // If no character plus the marker fits, the final source line is just the marker.
+        assert_eq!(
+            fit_name(
+                "A\nB\nC",
+                None,
+                measure("…", style).x,
+                2,
+                2,
+                &mut measure,
+                style
+            )
+            .as_deref(),
+            Some("A\n…")
+        );
+    }
+
+    #[test]
+    fn one_line_names_preserve_legacy_source_newline_handling() {
+        let style = filename_badge_style();
+        for text in ["A\nB\nC", "A\n\nB", "A\nB\n", "\n\n"] {
+            for cap in [None, Some(18)] {
+                for width in [10.0, 100.0] {
+                    assert_eq!(
+                        fit_name(text, cap, width, 1, 1, &mut measure, style),
+                        fit_text(text, cap, width, &mut measure, style),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_newline_names_reduce_lines_for_vertical_space() {
+        let name = "A\nB\nC\nD";
+        for folder in [false, true] {
+            for meter in [false, true] {
+                let heights = match (folder, meter) {
+                    (false, false) => [100.0, 70.0, 50.0, 40.0],
+                    (true, false) => [100.0, 60.0, 45.0, 40.0],
+                    (false, true) => [80.0, 60.0, 40.0, 30.0],
+                    (true, true) => [80.0, 50.0, 35.0, 30.0],
+                };
+                for (height, expected_lines) in heights.into_iter().zip([3, 2, 1, 0]) {
+                    let cell = egui::Rect::from_min_size(
+                        egui::pos2(10.0, 20.0),
+                        egui::vec2(180.0, height),
+                    );
+                    let mut input = duration_input(cell, cell.shrink(4.0));
+                    input.media_duration = None;
+                    input.name_style.max_lines = 3;
+                    input.book_resume_meter = meter;
+                    input.bookmark_time = (!meter).then_some("0:07 timestamp");
+                    if folder {
+                        input.bottom_container = Some(BottomContainerInput {
+                            kind: BottomContainerKind::Folder,
+                            label: name,
+                        });
+                    } else {
+                        input.filename = Some(name);
+                    }
+                    let layout = layout_thumbnail_overlays(input, measure);
+                    let badge = if folder {
+                        layout.bottom_left.container.as_ref()
+                    } else {
+                        layout.bottom_left.filename.as_ref()
+                    };
+                    assert_eq!(
+                        badge.map_or(0, |b| b.text.split('\n').count()),
+                        expected_lines,
+                        "folder={folder}, meter={meter}, height={height}: {badge:?}"
+                    );
+                    if let Some(badge) = badge {
+                        assert!(badge.text.ends_with('…'));
+                        assert!(cell.contains_rect(badge.rect));
+                    }
+                    assert_pairwise_non_intersecting(layout.badge_placements());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multiline_setting_keeps_newline_budget_when_falling_back_to_one_line() {
+        let cell = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(110.0, 8.0));
+        for folder in [false, true] {
+            for max_lines in 2..=4 {
+                let mut input = duration_input(cell, cell.shrink(4.0));
+                input.media_duration = None;
+                input.name_style.max_lines = max_lines;
+                if folder {
+                    input.bottom_container = Some(BottomContainerInput {
+                        kind: BottomContainerKind::Folder,
+                        label: "A\nB\nC\nD",
+                    });
+                } else {
+                    input.filename = Some("A\nB\nC\nD");
+                }
+                let layout = layout_thumbnail_overlays(input, measure);
+                let badge = if folder {
+                    layout.bottom_left.container.as_ref()
+                } else {
+                    layout.bottom_left.filename.as_ref()
+                }
+                .unwrap();
+                assert_eq!(badge.text, "A…");
+                assert!(!cell.contains_rect(badge.rect));
+            }
+        }
+    }
+
+    #[test]
+    fn one_line_trials_keep_legacy_placement_even_outside_a_tiny_cell() {
+        let cell = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(110.0, 8.0));
+        for folder in [false, true] {
+            let mut input = duration_input(cell, cell.shrink(4.0));
+            input.media_duration = None;
+            if folder {
+                input.bottom_container = Some(BottomContainerInput {
+                    kind: BottomContainerKind::Folder,
+                    label: "A",
+                });
+            } else {
+                input.filename = Some("A");
+            }
+            let legacy = layout_thumbnail_overlays(input.clone(), measure);
+            let badge = if folder {
+                legacy.bottom_left.container.as_ref()
+            } else {
+                legacy.bottom_left.filename.as_ref()
+            }
+            .unwrap();
+            assert!(!cell.contains_rect(badge.rect));
+            assert_eq!(badge.text, "A");
+            // Multi-line trials yield on containment, then the one-line fallback uses exactly
+            // the same legacy placement. The meter's pre-existing containment remains active.
+            input.name_style.max_lines = 4;
+            assert_eq!(layout_thumbnail_overlays(input.clone(), measure), legacy);
+            input.book_resume_meter = true;
+            assert!(
+                layout_thumbnail_overlays(input, measure)
+                    .bottom_left
+                    .placements()
+                    .next()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn name_scale_changes_only_name_styles_and_padding() {
+        let (cell, inner) = cell(600.0);
+        for font_scale in [1.25, 1.5, 1.75, 2.0] {
+            for kind in [
+                BottomContainerKind::Folder,
+                BottomContainerKind::Format(FormatBadgeKind::Pdf),
+            ] {
+                let mut input = duration_input(cell, inner);
+                input.bottom_container = Some(BottomContainerInput {
+                    kind,
+                    label: "name",
+                });
+                input.filename = Some("file.pdf");
+                input.rating_text = Some("★★★★★");
+                input.bookmark_time = Some("0:07");
+                input.filter_match_count = Some(42);
+                let baseline = layout_thumbnail_overlays(input.clone(), measure);
+                input.name_style = ThumbnailNameStyle {
+                    font_scale,
+                    max_lines: 3,
+                };
+                let scaled = layout_thumbnail_overlays(input, measure);
+                for (before, after) in baseline.badge_placements().zip(scaled.badge_placements()) {
+                    assert_eq!(before.kind, after.kind);
+                    if matches!(
+                        before.kind,
+                        BadgeKind::Filename
+                            | BadgeKind::BottomContainer(BottomContainerKind::Folder)
+                    ) {
+                        let expected = ThumbnailNameStyle {
+                            font_scale,
+                            max_lines: 3,
+                        }
+                        .apply(before.style);
+                        assert_eq!(after.style, expected);
+                        assert_eq!(after.style.font_size, before.style.font_size * font_scale);
+                        assert_eq!(
+                            after.style.padding.left,
+                            before.style.padding.left * font_scale
+                        );
+                        assert_eq!(
+                            after.style.padding.right,
+                            before.style.padding.right * font_scale
+                        );
+                        assert_eq!(
+                            after.style.padding.top,
+                            before.style.padding.top * font_scale
+                        );
+                        assert_eq!(
+                            after.style.padding.bottom,
+                            before.style.padding.bottom * font_scale
+                        );
+                    } else {
+                        assert_eq!(after.style, before.style);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn names_reduce_lines_for_cell_top_and_top_badges_or_yield() {
+        for folder in [false, true] {
+            let name = "とても長い日本語の名前を四行に折り返して上端とバッジとの干渉を確認する";
+            let mut last_lines = 0;
+            // Smaller cells may retain an out-of-cell one-line placement under the legacy rule;
+            // that compatibility case is covered separately above.
+            for height in [180.0, 60.0, 40.0, 20.0] {
+                let cell =
+                    egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(110.0, height));
+                let mut input = duration_input(cell, cell.shrink(4.0));
+                input.name_style = ThumbnailNameStyle {
+                    font_scale: 1.5,
+                    max_lines: 4,
+                };
+                input.media_duration = None;
+                input.bookmark_time = Some("0:07");
+                if folder {
+                    input.bottom_container = Some(BottomContainerInput {
+                        kind: BottomContainerKind::Folder,
+                        label: name,
+                    });
+                } else {
+                    input.filename = Some(name);
+                }
+                let layout = layout_thumbnail_overlays(input, measure);
+                let badge = if folder {
+                    layout.bottom_left.container.as_ref()
+                } else {
+                    layout.bottom_left.filename.as_ref()
+                };
+                let lines = badge.map_or(0, |b| b.text.lines().count());
+                if height == 180.0 {
+                    assert_eq!(lines, 4);
+                } else {
+                    assert!(lines <= last_lines);
+                }
+                if height == 60.0 {
+                    assert_eq!(lines, 1);
+                }
+                if height <= 40.0 {
+                    assert_eq!(lines, 0);
+                }
+                last_lines = lines;
+                for badge in layout.bottom_left.placements() {
+                    assert!(cell.contains_rect(badge.rect));
+                }
+                assert_pairwise_non_intersecting(layout.badge_placements());
+            }
+        }
+    }
+
+    #[test]
+    fn multiline_names_keep_all_corners_disjoint_for_every_format_and_setting() {
+        let tags = tags(&["#タグ", "分類"]);
+        for width in [32.0, 64.0, 100.0, 180.0, 320.0] {
+            for height in [48.0, 100.0, 180.0] {
+                let cell =
+                    egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(width, height));
+                for font_scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+                    for max_lines in 1..=4 {
+                        for kind in [
+                            BottomContainerKind::Folder,
+                            BottomContainerKind::Format(FormatBadgeKind::Zip),
+                            BottomContainerKind::Format(FormatBadgeKind::Pdf),
+                            BottomContainerKind::Format(FormatBadgeKind::Archive),
+                            BottomContainerKind::Format(FormatBadgeKind::Video),
+                        ] {
+                            for reserve in [false, true] {
+                                let mut input = duration_input(cell, cell.shrink(4.0));
+                                input.name_style = ThumbnailNameStyle {
+                                    font_scale,
+                                    max_lines,
+                                };
+                                input.book_resume_meter = reserve;
+                                input.checked = true;
+                                input.filter_match_count = Some(42);
+                                input.tags = &tags;
+                                input.bookmark_time = Some("0:07");
+                                input.edit_badges.crop = true;
+                                input.rating_text = Some("★★★★★");
+                                input.bottom_container = Some(BottomContainerInput {
+                                    kind,
+                                    label: if kind == BottomContainerKind::Folder {
+                                        "長い日本語のフォルダ名を折り返す"
+                                    } else {
+                                        "ZIP"
+                                    },
+                                });
+                                input.filename = (kind != BottomContainerKind::Folder)
+                                    .then_some("長いファイル名_abcdefghijklmnopqrstuvwxyz.pdf");
+                                let layout = layout_thumbnail_overlays(input, measure);
+                                assert_placements_inside_cell(&layout, cell);
+                                assert_pairwise_non_intersecting(layout.badge_placements());
+                                for badge in layout.badge_placements() {
+                                    assert!(!layout.check.unwrap().intersects(badge.rect));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multiline_measurement_count_is_logarithmic_in_name_length() {
+        let name = "a".repeat(4096);
+        let mut calls = 0;
+        let wrapped = fit_name(
+            &name,
+            None,
+            100.0,
+            4,
+            4,
+            &mut |text, style| {
+                calls += 1;
+                measure(text, style)
+            },
+            filename_badge_style(),
+        )
+        .unwrap();
+        assert!(wrapped.ends_with('…'));
+        assert!(calls <= 60, "{calls} measurements");
+    }
 
     #[test]
     fn saved_position_setting_reserves_the_same_slot_for_every_cell_content() {
@@ -1079,16 +1760,23 @@ mod tests {
 
     fn measure(text: &str, style: BadgeTextStyle) -> egui::Vec2 {
         let width = text
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii() {
-                    style.font_size * 0.58
-                } else {
-                    style.font_size
-                }
+            .split('\n')
+            .map(|line| {
+                line.chars()
+                    .map(|ch| {
+                        if ch.is_ascii() {
+                            style.font_size * 0.58
+                        } else {
+                            style.font_size
+                        }
+                    })
+                    .sum::<f32>()
             })
-            .sum();
-        egui::vec2(width, style.font_size * 1.25)
+            .fold(0.0, f32::max);
+        egui::vec2(
+            width,
+            style.font_size * 1.25 * text.split('\n').count() as f32,
+        )
     }
 
     fn cell(width: f32) -> (egui::Rect, egui::Rect) {
@@ -1105,6 +1793,7 @@ mod tests {
         ThumbnailOverlayLayoutInput {
             cell,
             inner,
+            name_style: ThumbnailNameStyle::default(),
             book_resume_meter: false,
             checked: false,
             stack_count: None,
@@ -1235,6 +1924,7 @@ mod tests {
                 ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    name_style: ThumbnailNameStyle::default(),
                     book_resume_meter: false,
                     checked: true,
                     stack_count: None,
@@ -1295,6 +1985,7 @@ mod tests {
                 ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    name_style: ThumbnailNameStyle::default(),
                     book_resume_meter: false,
                     checked: false,
                     stack_count: Some(120),
@@ -1330,6 +2021,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                name_style: ThumbnailNameStyle::default(),
                 book_resume_meter: false,
                 checked: false,
                 stack_count: None,
@@ -1359,6 +2051,7 @@ mod tests {
                 ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    name_style: ThumbnailNameStyle::default(),
                     book_resume_meter: false,
                     checked: false,
                     stack_count: None,
@@ -1400,6 +2093,7 @@ mod tests {
                 ThumbnailOverlayLayoutInput {
                     cell,
                     inner,
+                    name_style: ThumbnailNameStyle::default(),
                     book_resume_meter: false,
                     checked: false,
                     stack_count: None,
@@ -1460,6 +2154,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                name_style: ThumbnailNameStyle::default(),
                 book_resume_meter: false,
                 checked: false,
                 stack_count: None,
@@ -1495,6 +2190,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                name_style: ThumbnailNameStyle::default(),
                 book_resume_meter: false,
                 checked: false,
                 stack_count: None,
@@ -1540,6 +2236,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                name_style: ThumbnailNameStyle::default(),
                 book_resume_meter: false,
                 checked: false,
                 stack_count: None,
@@ -1573,6 +2270,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                name_style: ThumbnailNameStyle::default(),
                 book_resume_meter: false,
                 checked: false,
                 stack_count: None,
@@ -1610,6 +2308,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell: cell_rect,
                 inner,
+                name_style: ThumbnailNameStyle::default(),
                 book_resume_meter: false,
                 checked: false,
                 stack_count: None,
@@ -1644,6 +2343,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell: cell_rect,
                 inner,
+                name_style: ThumbnailNameStyle::default(),
                 book_resume_meter: false,
                 checked: false,
                 stack_count: None,
@@ -1678,6 +2378,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell: cell_rect,
                 inner,
+                name_style: ThumbnailNameStyle::default(),
                 book_resume_meter: false,
                 checked: false,
                 stack_count: None,
@@ -1712,6 +2413,7 @@ mod tests {
             ThumbnailOverlayLayoutInput {
                 cell,
                 inner,
+                name_style: ThumbnailNameStyle::default(),
                 book_resume_meter: false,
                 checked: false,
                 stack_count: None,

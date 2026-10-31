@@ -3,6 +3,11 @@ import assert from "node:assert/strict";
 import {
   FOREGROUND_ADMISSION_RETRY_LIMIT,
   ViewerGroupLoadOutcome,
+  CommandName,
+  commandFromKey,
+  inputAdvancesRightToLeft,
+  viewerPageButtonState,
+  viewerTapCommand,
   remoteAddressIdentity,
 } from "./command-core.mjs";
 
@@ -181,6 +186,7 @@ const {
   loadFolder,
   renderFolder,
   setViewerRating,
+  requestSpreadMode,
   normalizeRemoteAdjustmentValues,
   normalizeRemoteBookBookmarkList,
   normalizeRemoteColorizeParams,
@@ -822,7 +828,8 @@ test("PIN login uses a text-capable mobile keyboard without text correction", ()
 });
 
 const viewTrimState = () => ({
-  apply_mode: "book",
+  preference: "manual",
+  effective_apply_mode: "book",
   book_settings: {
     enabled: true,
     spread_separate: false,
@@ -845,6 +852,61 @@ test("view trim keeps the core book shape and switches spread controls without p
   ]);
   assert.deepEqual(separate.book_settings.spread_linked, normalized.book_settings.spread_linked);
   assert.equal("page_override" in separate, false);
+});
+
+test("view trim accepts four preferences and displays only the server effective mode", () => {
+  for (const preference of ["follow_global", "none", "auto", "manual"]) {
+    const value = { ...viewTrimState(), preference, effective_apply_mode: "none" };
+    const normalized = normalizeRemoteViewTrimState(value);
+    assert.equal(normalized.preference, preference);
+    assert.equal(normalized.effective_apply_mode, "none");
+  }
+  assert.equal(normalizeRemoteViewTrimState({ ...viewTrimState(), preference: "book" }), null);
+  assert.equal(normalizeRemoteViewTrimState({ ...viewTrimState(), effective_apply_mode: "page" }), null);
+  const { effective_apply_mode, ...withoutEffectiveMode } = viewTrimState();
+  assert.equal(normalizeRemoteViewTrimState(withoutEffectiveMode), null);
+});
+
+test("view trim mode changes retain manual values and wait for the server global readout", async () => {
+  const panel = new ViewerViewTrimPanel();
+  panel.root.querySelectorAll = () => [];
+  panel.serverState = normalizeRemoteViewTrimState({
+    ...viewTrimState(), effective_apply_mode: "auto",
+  });
+  panel.serverState.book_settings.enabled = false;
+  const before = structuredClone(panel.serverState.book_settings);
+  let commits = 0;
+  panel.commit = async () => { commits += 1; };
+  assert.deepEqual(panel.modeSelect.children.map((option) => option.value), [
+    "follow_global", "none", "auto", "manual",
+  ]);
+  for (const preference of ["follow_global", "none", "auto", "manual"]) {
+    panel.modeSelect.value = preference;
+    panel.modeSelect.dispatchEvent({ type: "change" });
+    assert.equal(panel.serverState.preference, preference);
+    const expected = preference === "manual" ? { ...before, enabled: true } : before;
+    assert.deepEqual(panel.serverState.book_settings, expected);
+    assert.equal(panel.enabledInput.checked, expected.enabled);
+    assert.equal(panel.modeSelect.children[0].textContent, "全体設定に従う");
+    assert.equal(panel.controls.hidden, preference !== "manual");
+  }
+  assert.equal(commits, 4);
+  for (const preference of ["follow_global", "none", "auto"]) {
+    panel.modeSelect.value = preference;
+    panel.modeSelect.dispatchEvent({ type: "change" });
+    assert.deepEqual(panel.serverState.book_settings, { ...before, enabled: true });
+  }
+  assert.equal(commits, 7);
+  for (const [effective_apply_mode, label] of [
+    ["auto", "全体設定に従う（現在: 自動余白カット）"],
+    ["none", "全体設定に従う（現在: トリムなし）"],
+  ]) {
+    panel.serverState = normalizeRemoteViewTrimState({
+      ...viewTrimState(), preference: "follow_global", effective_apply_mode,
+    });
+    panel.renderState();
+    assert.equal(panel.modeSelect.children[0].textContent, label);
+  }
 });
 
 test("sort state accepts only server-provided options and keeps a visible lock reason", () => {
@@ -5861,3 +5923,86 @@ test("G1 Remote return adoption restores the book response after temporary A2 sp
   assert.deepEqual(after.container,before.container);
   assert.deepEqual(after.pageGroups,before.pageGroups);
 });
+
+test("horizontal button labels follow configured mode across container and collection updates", () => {
+  const originalHistory = globalThis.history;
+  globalThis.history = { state: {}, replaceState() {} };
+  const address = { path: testPath("horizontal-input"), subresource: { kind: "file" } };
+  const entries = [1, 2].map((index) => ({ kind: "image", name: `${index}.jpg`,
+    address: { path: testPath(`horizontal-input/${index}.jpg`), subresource: { kind: "file" } } }));
+  const labels = {};
+  const viewer = {
+    destroy() {},
+    syncPagePositionFeedback() { ImageViewer.prototype.syncPagePositionFeedback.call(this); },
+    previous: { setAttribute: (name, value) => { labels.left = [name, value]; } },
+    next: { setAttribute: (name, value) => { labels.right = [name, value]; } },
+  };
+  try {
+    for (const kind of ["container", "collection"]) {
+      for (const [configuredMode, expectedRtl] of [["rtl", true], ["single", false], ["rtl_cover", true]]) {
+        const data = {
+          entries, image_count: entries.length,
+          configured_spread_mode: configuredMode, effective_spread_mode: "single", reading_direction: "rtl",
+          page_groups: entries.map((entry) => ({ anchor: entry.address, pages: [entry.address], slice: "full" })),
+        };
+        if (kind === "container") applyContainerData(address, data, true);
+        else applyCollectionData({ collectionKind: "rating", value: "4" }, data, true);
+        assert.equal(openViewerPagePositionForTest(viewer, 0), true);
+        viewer.syncPagePositionFeedback();
+        assert.deepEqual(labels.left, ["aria-label", expectedRtl ? "次の画像" : "前の画像"], kind);
+        assert.deepEqual(labels.right, ["aria-label", expectedRtl ? "前の画像" : "次の画像"], kind);
+        assert.equal(viewerPagePresentationForTest().seekState.direction, "rtl", kind);
+      }
+    }
+  } finally {
+    cleanupVideoViewerForTest(viewer);
+    globalThis.history = originalHistory;
+  }
+});
+
+for (const [selectedMode, expectedMode] of [["ltr", "rtl"], ["split_ltr", "split_rtl"]]) {
+  test(`mode-only ${selectedMode} keeps RTL input and labels before the response`, async () => {
+    const originalHistory = globalThis.history;
+    const originalFetch = globalThis.fetch;
+    const responseGate = deferred();
+    globalThis.history = { state: {}, replaceState() {} };
+    globalThis.fetch = async () => {
+      await responseGate.promise;
+      return new Response("{}", { status: 200 });
+    };
+    const address = { path: testPath("mode-only-input"), subresource: { kind: "file" } };
+    const entry = { kind: "image", name: "1.jpg",
+      address: { path: testPath("mode-only-input/1.jpg"), subresource: { kind: "file" } } };
+    const labels = {};
+    const viewer = {
+      destroy() {},
+      syncPagePositionFeedback() { ImageViewer.prototype.syncPagePositionFeedback.call(this); },
+      previous: { setAttribute: (_name, value) => { labels.left = value; } },
+      next: { setAttribute: (_name, value) => { labels.right = value; } },
+    };
+    try {
+      applyContainerData(address, {
+        entries: [entry], image_count: 1, composition_managed: true,
+        configured_spread_mode: "single", effective_spread_mode: "single", reading_direction: "rtl",
+        page_groups: [{ anchor: entry.address, pages: [entry.address], slice: "full" }],
+      }, false);
+      assert.equal(openViewerPagePositionForTest(viewer, 0), true);
+      assert.equal(requestSpreadMode(selectedMode, true), true);
+      // No response can have arrived: the write is still behind responseGate.
+      const snapshot = containerRuntimeStateForTest();
+      const rtl = inputAdvancesRightToLeft(snapshot.spreadMode);
+      assert.equal(commandFromKey({ key: "ArrowRight", rtl }, "viewer").name, CommandName.PREV_PAGE);
+      assert.equal(viewerTapCommand(290, 300, rtl).name, CommandName.PREV_PAGE);
+      assert.equal(viewerPageButtonState("right", rtl).commandName, CommandName.PREV_PAGE);
+      assert.deepEqual(labels, { left: "次の画像", right: "前の画像" });
+      assert.equal(snapshot.spreadMode, expectedMode);
+      assert.equal(snapshot.readingDirection, "rtl");
+    } finally {
+      cleanupVideoViewerForTest(viewer);
+      responseGate.resolve();
+      await new Promise((resolve) => setImmediate(resolve));
+      globalThis.fetch = originalFetch;
+      globalThis.history = originalHistory;
+    }
+  });
+}

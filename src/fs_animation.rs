@@ -104,6 +104,9 @@ pub enum FsCacheEntry {
     },
     /// 静止画。GPU テクスチャと CPU 側ピクセルデータ（分析パネル用）を保持する。
     Static {
+        pdf_metadata: Option<crate::app::PdfPageMetadataSnapshot>,
+        /// Failed enhancement belongs to these retained pixels, not a retry timer or global table.
+        pdf_rerender_failures: Vec<crate::app::PdfRerenderIdentity>,
         tex: egui::TextureHandle,
         pixels: std::sync::Arc<egui::ColorImage>,
         /// GPU 上限 clamp 前の原寸 (幅, 高さ)。`pixels.size` と一致しないとき
@@ -593,17 +596,14 @@ mod tests {
 
     #[test]
     fn decode_gif_static_returns_none() {
-        let dir = std::env::temp_dir().join("mimageviewer_test");
-        std::fs::create_dir_all(&dir).ok();
-        let path = dir.join("static_1frame.gif");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("static_1frame.gif");
 
         let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
         img.save(&path).unwrap();
 
         let result = decode_gif_frames(&path);
         assert!(result.is_none(), "single-frame GIF should return None");
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]

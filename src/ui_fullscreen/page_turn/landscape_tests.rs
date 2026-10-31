@@ -31,6 +31,8 @@ fn book(
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex: texture,
                 pixels: Arc::new(image),
                 source_dims: Some(dims),
@@ -121,6 +123,7 @@ fn started_and_finished(ctx: &egui::Context, app: &mut App, from: usize, to: usi
     });
     let tracker = match &mut app.page_turn_presentation.state {
         PresentationState::Turning {
+            clock,
             offer,
             projection,
             incoming,
@@ -148,7 +151,9 @@ fn started_and_finished(ctx: &egui::Context, app: &mut App, from: usize, to: usi
                     assert_eq!(ids[0], ids[1], "one texture shared by both halves");
                 }
             }
-            offer.accepted_at -= offer.duration + Duration::from_millis(1);
+            *clock = MotionClock::Running {
+                start_at: Instant::now() - offer.duration - Duration::from_millis(1),
+            };
             offer.submission.clone()
         }
         _ => panic!("started turn"),

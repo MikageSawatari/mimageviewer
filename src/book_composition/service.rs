@@ -111,9 +111,14 @@ enum Mutation {
     Remove,
 }
 enum MaintenanceAction {
-    Rename(String, String),
+    Rename(
+        String,
+        String,
+        crate::rename_key_migration::PathMigrationCollision,
+    ),
+    #[cfg(test)]
     Purge(String),
-    Pages(Vec<(PathBuf, PathBuf)>),
+    Pages(Vec<(PathBuf, PathBuf)>, store::OutsideScopePolicy),
 }
 enum Command {
     ViewTrim(
@@ -285,6 +290,16 @@ impl BookCompositionService {
     pub(crate) fn snapshot(&self) -> Arc<CompositionSnapshot> {
         Arc::clone(&self.shared.admission.lock().unwrap().snapshot)
     }
+    pub(crate) fn is_busy(&self) -> bool {
+        let admission = self.shared.admission.lock().unwrap();
+        !matches!(
+            admission.mode,
+            Mode::Running {
+                outstanding_mutations: 0
+            } | Mode::Closed
+        )
+    }
+
     /// A new presentation can consult this immutable snapshot only after every
     /// earlier mutation has completed. Reads retain the worker FIFO when unknown.
     /// This lock contains only admission/publication operations, never worker I/O.
@@ -494,22 +509,54 @@ impl BookCompositionService {
         self.write(scope, domain, Mutation::Remove)
     }
 
+    #[cfg(test)]
     pub(crate) fn rename_book_root(&self, source: &Path, target: &Path) -> Result<(), String> {
+        self.rename_book_root_with_collision(
+            source,
+            target,
+            crate::rename_key_migration::PathMigrationCollision::DestinationWins,
+        )
+    }
+
+    pub(crate) fn rename_book_root_with_collision(
+        &self,
+        source: &Path,
+        target: &Path,
+        collision: crate::rename_key_migration::PathMigrationCollision,
+    ) -> Result<(), String> {
         self.maintain(MaintenanceAction::Rename(
             BookScopeKey::folder(source)?.storage_key(),
             BookScopeKey::folder(target)?.storage_key(),
+            collision,
         ))
     }
+    #[cfg(test)]
     pub(crate) fn purge_book_root(&self, root: &Path) -> Result<(), String> {
         self.maintain(MaintenanceAction::Purge(
             BookScopeKey::folder(root)?.storage_key(),
         ))
     }
+    #[cfg(test)]
     pub(crate) fn migrate_page_paths(
         &self,
         mappings: Vec<(PathBuf, PathBuf)>,
     ) -> Result<(), String> {
-        self.maintain(MaintenanceAction::Pages(mappings))
+        self.maintain(MaintenanceAction::Pages(
+            mappings,
+            store::OutsideScopePolicy::PreserveMissing,
+        ))
+    }
+
+    /// Book transfers must remove references to pages that leave their source scope
+    /// before another page can reuse the vacated name.
+    pub(crate) fn migrate_book_page_paths(
+        &self,
+        mappings: Vec<(PathBuf, PathBuf)>,
+    ) -> Result<(), String> {
+        self.maintain(MaintenanceAction::Pages(
+            mappings,
+            store::OutsideScopePolicy::RemoveMovedOutside,
+        ))
     }
     fn maintain(&self, action: MaintenanceAction) -> Result<(), String> {
         let mut admission = self.shared.admission.lock().unwrap();
@@ -800,20 +847,13 @@ fn run_worker(
             Command::ViewTrimBook(key, mut value, admission, write, reply) => {
                 let result: Result<crate::view_trim::ViewTrimBookState, String> = (|| {
                     admission.validate(&state)?;
-                    value.apply_mode =
-                        crate::view_trim::view_trim_base_apply_mode(value.apply_mode);
                     value.book_settings = value.book_settings.clamped();
                     let db =
                         crate::view_trim_db::ViewTrimDb::open_at(&data_dir.join("view_trim.db"))
                             .map_err(|error| error.to_string())?;
                     let previous_separate = db
-                        .get_book_state(&key.exact)
-                        .or_else(|| {
-                            key.fallback
-                                .as_deref()
-                                .and_then(|fallback| db.get_book_state(fallback))
-                        })
-                        .unwrap_or_default()
+                        .load_book_preference_with_fallback(&key.exact, key.fallback.as_deref())
+                        .state_or_default()
                         .book_settings
                         .spread_separate;
                     if previous_separate != value.book_settings.spread_separate {
@@ -821,7 +861,7 @@ fn run_worker(
                         value.book_settings.spread_separate = previous_separate;
                         value.book_settings = value.book_settings.with_spread_separate(separate);
                     }
-                    db.set_book_state(&key.exact, value)
+                    db.set_book_state(&key.exact, key.fallback.as_deref(), value)
                         .map_err(|error| error.to_string())?;
                     Ok(value)
                 })(
@@ -936,19 +976,26 @@ fn run_worker(
                 let result = (|| {
                     state.status.clone()?;
                     match action {
-                        MaintenanceAction::Rename(source, target) => {
+                        MaintenanceAction::Rename(source, target, collision) => {
                             if let Some(connection) = connection.as_mut() {
-                                store::rename_book_root(connection, &source, &target)?;
+                                store::rename_book_root_with_collision(
+                                    connection, &source, &target, collision,
+                                )?;
                             }
                         }
+                        #[cfg(test)]
                         MaintenanceAction::Purge(root) => {
                             if let Some(connection) = connection.as_mut() {
                                 store::purge_book_root(connection, &root)?;
                             }
                         }
-                        MaintenanceAction::Pages(mappings) => {
+                        MaintenanceAction::Pages(mappings, outside_scope) => {
                             connection = None;
-                            store::migrate_page_paths_at(&data_dir, &mappings)?;
+                            store::migrate_page_paths_with_policy_at(
+                                &data_dir,
+                                &mappings,
+                                outside_scope,
+                            )?;
                         }
                     }
                     reload(&path, &mut connection, &mut state)

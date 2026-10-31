@@ -111,6 +111,8 @@ fn page_turn_merge_master_coverless_tail_builder_preserves_vacant_leaf_motion() 
                 app.fs_cache.insert(
                     idx,
                     FsCacheEntry::Static {
+                        pdf_rerender_failures: Vec::new(),
+                        pdf_metadata: None,
                         tex,
                         pixels: image,
                         source_dims: Some([80, 120]),
@@ -872,6 +874,7 @@ fn page_turn_merge_master_explicit_blank_turns_both_ways_with_only_real_receipts
                             );
                         });
                         let PresentationState::Turning {
+                            clock,
                             incoming,
                             offer,
                             projection,
@@ -897,7 +900,9 @@ fn page_turn_merge_master_explicit_blank_turns_both_ways_with_only_real_receipts
                         );
                         let tracker = offer.submission.clone();
                         assert_eq!(tracker.status(), SubmissionStatus::Started);
-                        offer.accepted_at -= offer.duration + Duration::from_millis(1);
+                        *clock = MotionClock::Running {
+                            start_at: Instant::now() - offer.duration - Duration::from_millis(1),
+                        };
                         frame(&ctx, |ui, ctx| {
                             app.begin_page_turn_viewer_frame(ctx, false, None);
                             let (composition, sources) = draw_current(&mut app, ui, ctx);
@@ -956,7 +961,7 @@ fn page_turn_merge_master_slideshow_barrier_commits_grid_and_deadline_once() {
         let mut app = ready_app(&ctx, SpreadMode::Single);
         seed_leaf(&ctx, &mut app);
         app.move_grid_cursor(Some(1), crate::app::GridCursorIntent::Automatic);
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_reveal_requested(false);
         app.slideshow_playing = true;
         app.settings.slideshow_interval_secs = 3.0;
         app.slideshow_anchor_idx = None;
@@ -973,7 +978,7 @@ fn page_turn_merge_master_slideshow_barrier_commits_grid_and_deadline_once() {
                 Some(purpose)
             );
             assert_eq!(app.selected, Some(1));
-            assert!(!app.scroll_to_selected);
+            assert!(!app.grid_scroll.reveal_requested());
             assert_eq!(app.slideshow_next_at, expired);
         });
         adopt_interrupted_target(&ctx, &mut app);
@@ -990,7 +995,7 @@ fn page_turn_merge_master_slideshow_barrier_commits_grid_and_deadline_once() {
                 .and_then(|anchor| anchor.index_for_generation(app.items_generation)),
             Some(2)
         );
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
         assert_eq!(app.slideshow_anchor_idx, Some(2));
         assert!(app.slideshow_next_at >= before + Duration::from_secs(3));
         assert!(app.slideshow_next_at <= after + Duration::from_secs(3));
@@ -1045,6 +1050,8 @@ fn saved_pdf_viewer(ctx: &egui::Context, book: &BookComposition) -> crate::app::
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels: image,
                 source_dims: Some([576, 816]),
@@ -1074,7 +1081,7 @@ fn paint_saved_pdf_viewport(
     ctx: &egui::Context,
 ) -> Vec<crate::app::paint_record_test_support::PaintRecord> {
     let output = crate::app::paint_record_test_support::with_capture(|| {
-        ctx.run(
+        crate::test_ui::headless_paint_output(ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -1082,8 +1089,8 @@ fn paint_saved_pdf_viewport(
                 )),
                 ..Default::default()
             },
-            |ctx| app.render_fullscreen_viewport(ctx),
-        )
+            |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+        ))
     });
     crate::app::paint_record_test_support::paint_records(egui::ViewportId::ROOT, &output)
 }
@@ -1108,6 +1115,8 @@ fn assert_saved_pdf_singleton_paint(
         app.fs_cache.insert(
             idx,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels,
                 source_dims: Some([576, 816]),
@@ -1309,6 +1318,8 @@ fn page_turn_saved_coverless_boundary_remainder_actual_viewport_matrix() {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex,
                     pixels,
                     source_dims: Some([816, 576]),

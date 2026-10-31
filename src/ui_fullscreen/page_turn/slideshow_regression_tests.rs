@@ -26,11 +26,15 @@ fn frame(
             ..Default::default()
         },
     );
-    let _ = ctx.run(raw, |ctx| {
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show(ctx, |ui| run(ui, ctx));
-    });
+    let _ = ctx
+        .run_pass(raw, |ctx| {
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(root_ui, |ui| run(ui, ctx))
+            });
+        })
+        .drop_without_applying_deltas();
 }
 
 fn draw_and_sync(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) -> SubmittedUnitReceipt {
@@ -58,6 +62,8 @@ fn slideshow_regression_expired_outgoing_deadline_turns_and_preserves_full_displ
     crate::key_input::clear_test_frame();
     for mode in [SpreadMode::Single, SpreadMode::Ltr, SpreadMode::Rtl] {
         for manual in [false, true] {
+            let accepted_at = Instant::now();
+            let motion_clock = super::clock_tests::TestClock::at(accepted_at);
             take_test_events();
             let ctx = egui::Context::default();
             install(&ctx);
@@ -81,6 +87,8 @@ fn slideshow_regression_expired_outgoing_deadline_turns_and_preserves_full_displ
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(0.0, -120.0),
                     modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
                 }]
             } else {
                 vec![]
@@ -111,6 +119,7 @@ fn slideshow_regression_expired_outgoing_deadline_turns_and_preserves_full_displ
                 } else {
                     app.advance_slideshow(ctx, 0);
                 }
+                motion_clock.set(accepted_at + Duration::from_secs(2));
                 assert!(draw_and_sync(&mut app, ui, ctx).curl);
                 assert_eq!(app.slideshow_anchor_idx, None);
                 assert_eq!(
@@ -132,12 +141,7 @@ fn slideshow_regression_expired_outgoing_deadline_turns_and_preserves_full_displ
                 assert!(draw_and_sync(&mut app, ui, ctx).curl);
                 assert_eq!(app.slideshow_anchor_idx, None);
             });
-            if let PresentationState::Turning { offer, .. } = &mut app.page_turn_presentation.state
-            {
-                offer.accepted_at -= offer.duration + Duration::from_millis(1);
-            } else {
-                panic!("turn persists")
-            }
+            motion_clock.set(accepted_at + Duration::from_millis(2601));
             frame(&ctx, viewport, vec![], |ui, ctx| {
                 app.begin_page_turn_viewer_frame(ctx, false, None);
                 assert!(!draw_and_sync(&mut app, ui, ctx).curl);

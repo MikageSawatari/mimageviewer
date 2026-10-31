@@ -127,6 +127,8 @@ pub(crate) enum CollectionNavigationTargetKind {
 pub(crate) enum CollectionNavigationTail {
     Stop,
     Loop,
+    /// Manual wrapping must not replay either source in the current display unit.
+    WrapExcludingCurrent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -211,7 +213,12 @@ pub(crate) fn resolve_prepared_collection_navigation(
         } else {
             primary.or(partner).unwrap().1
         };
-        Some((position, resolution))
+        Some((
+            position,
+            resolution,
+            primary.map(|value| value.0),
+            partner.map(|value| value.0),
+        ))
     });
 
     let (indices, anchor_resolution): (Vec<usize>, _) = match resolved_anchor {
@@ -219,18 +226,28 @@ pub(crate) fn resolve_prepared_collection_navigation(
             (0..prepared.entries.len()).collect(),
             CollectionNavigationAnchorResolution::Head,
         ),
-        Some((position, resolution)) => {
+        Some((position, resolution, primary, partner)) => {
             let mut indices = match direction {
                 CollectionNavigationDirection::Forward => {
                     ((position + 1)..prepared.entries.len()).collect::<Vec<_>>()
                 }
                 CollectionNavigationDirection::Backward => (0..position).rev().collect::<Vec<_>>(),
             };
-            if tail == CollectionNavigationTail::Loop {
+            if tail != CollectionNavigationTail::Stop {
                 match direction {
-                    CollectionNavigationDirection::Forward => indices.extend(0..=position),
+                    CollectionNavigationDirection::Forward => {
+                        indices.extend((0..=position).filter(|index| {
+                            tail == CollectionNavigationTail::Loop
+                                || (Some(*index) != primary && Some(*index) != partner)
+                        }))
+                    }
                     CollectionNavigationDirection::Backward => {
-                        indices.extend(((position + 1)..prepared.entries.len()).rev())
+                        indices.extend(((position + 1)..prepared.entries.len()).rev().filter(
+                            |index| {
+                                tail == CollectionNavigationTail::Loop
+                                    || (Some(*index) != primary && Some(*index) != partner)
+                            },
+                        ))
                     }
                 }
             }
@@ -854,6 +871,172 @@ mod tests {
         CollectionNavigationEntryIdentity {
             entry_id: entry.entry_id,
             source_key: entry.source_key.clone(),
+        }
+    }
+
+    #[test]
+    fn prepared_manual_wrap_follows_latest_order_and_excludes_the_display_unit() {
+        let original = navigation_snapshot(vec![
+            prepared_entry(Path::new(r"C:\wrap\a.jpg"), CollectionResolvedKind::Image),
+            prepared_entry(Path::new(r"C:\wrap\b.jpg"), CollectionResolvedKind::Image),
+            prepared_entry(Path::new(r"C:\wrap\c.mp4"), CollectionResolvedKind::Video),
+            prepared_entry(Path::new(r"C:\wrap\d.mp3"), CollectionResolvedKind::Audio),
+        ]);
+        let latest = navigation_snapshot(vec![
+            original.entries[2].clone(),
+            original.entries[0].clone(),
+            original.entries[3].clone(),
+            original.entries[1].clone(),
+        ]);
+        for (position, direction, expected) in [
+            (3, CollectionNavigationDirection::Forward, vec![0, 1, 2]),
+            (0, CollectionNavigationDirection::Backward, vec![3, 2, 1]),
+        ] {
+            let anchor = CollectionNavigationAnchor {
+                primary: identity(&latest.entries[position]),
+                partner: None,
+            };
+            let result = resolve_prepared_collection_navigation(
+                &latest,
+                Some(&anchor),
+                direction,
+                CollectionNavigationTargetKind::NavigableMedia,
+                CollectionNavigationTail::WrapExcludingCurrent,
+                &std::collections::HashSet::new(),
+            );
+            assert_eq!(
+                result
+                    .targets
+                    .iter()
+                    .map(|target| target.entry_id)
+                    .collect::<Vec<_>>(),
+                expected
+                    .into_iter()
+                    .map(|index| latest.entries[index].entry_id)
+                    .collect::<Vec<_>>()
+            );
+        }
+        // Source-key fallback for a re-registered partner must exclude it just like an ID match.
+        let anchor = CollectionNavigationAnchor {
+            primary: identity(&latest.entries[3]),
+            partner: Some(CollectionNavigationEntryIdentity {
+                entry_id: CollectionEntryId::new(),
+                source_key: latest.entries[0].source_key.clone(),
+            }),
+        };
+        for (direction, expected) in [
+            (CollectionNavigationDirection::Forward, vec![1, 2]),
+            (CollectionNavigationDirection::Backward, vec![2, 1]),
+        ] {
+            let result = resolve_prepared_collection_navigation(
+                &latest,
+                Some(&anchor),
+                direction,
+                CollectionNavigationTargetKind::NavigableMedia,
+                CollectionNavigationTail::WrapExcludingCurrent,
+                &std::collections::HashSet::new(),
+            );
+            assert_eq!(
+                result
+                    .targets
+                    .iter()
+                    .map(|target| target.entry_id)
+                    .collect::<Vec<_>>(),
+                expected
+                    .into_iter()
+                    .map(|index| latest.entries[index].entry_id)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_manual_wrap_cannot_revisit_single_media_or_a_single_spread() {
+        for kinds in [
+            vec![CollectionResolvedKind::Image],
+            vec![CollectionResolvedKind::Video],
+            vec![CollectionResolvedKind::Audio],
+            vec![CollectionResolvedKind::Image, CollectionResolvedKind::Image],
+        ] {
+            let prepared = navigation_snapshot(
+                kinds
+                    .iter()
+                    .enumerate()
+                    .map(|(index, kind)| {
+                        prepared_entry(&PathBuf::from(format!(r"C:\wrap\{index}.jpg")), *kind)
+                    })
+                    .collect(),
+            );
+            let anchor = CollectionNavigationAnchor {
+                primary: identity(&prepared.entries[0]),
+                partner: prepared.entries.get(1).map(identity),
+            };
+            for direction in [
+                CollectionNavigationDirection::Forward,
+                CollectionNavigationDirection::Backward,
+            ] {
+                let result = resolve_prepared_collection_navigation(
+                    &prepared,
+                    Some(&anchor),
+                    direction,
+                    CollectionNavigationTargetKind::NavigableMedia,
+                    CollectionNavigationTail::WrapExcludingCurrent,
+                    &std::collections::HashSet::new(),
+                );
+                assert!(result.targets.is_empty(), "{kinds:?}, {direction:?}");
+            }
+            // Automatic forward looping retains its existing replay-current contract.
+            assert!(
+                !resolve_prepared_collection_navigation(
+                    &prepared,
+                    Some(&anchor),
+                    CollectionNavigationDirection::Forward,
+                    CollectionNavigationTargetKind::NavigableMedia,
+                    CollectionNavigationTail::Loop,
+                    &std::collections::HashSet::new(),
+                )
+                .targets
+                .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_manual_wrap_exhausts_missing_and_rejected_candidates_without_revisiting_current() {
+        let mut unavailable = prepared_entry(
+            Path::new(r"C:\wrap\missing.jpg"),
+            CollectionResolvedKind::Image,
+        );
+        unavailable.availability = CollectionSourcePreparation::Missing;
+        let prepared = navigation_snapshot(vec![
+            unavailable,
+            prepared_entry(
+                Path::new(r"C:\wrap\current.jpg"),
+                CollectionResolvedKind::Image,
+            ),
+            prepared_entry(
+                Path::new(r"C:\wrap\rejected.mp4"),
+                CollectionResolvedKind::Video,
+            ),
+        ]);
+        let anchor = CollectionNavigationAnchor {
+            primary: identity(&prepared.entries[1]),
+            partner: None,
+        };
+        let tried = std::collections::HashSet::from([prepared.entries[2].entry_id]);
+        for direction in [
+            CollectionNavigationDirection::Forward,
+            CollectionNavigationDirection::Backward,
+        ] {
+            let result = resolve_prepared_collection_navigation(
+                &prepared,
+                Some(&anchor),
+                direction,
+                CollectionNavigationTargetKind::NavigableMedia,
+                CollectionNavigationTail::WrapExcludingCurrent,
+                &tried,
+            );
+            assert!(result.targets.is_empty());
         }
     }
 

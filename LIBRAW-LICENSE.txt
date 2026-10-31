@@ -1,4 +1,4 @@
-LibRaw 0.22.2 - distributed under CDDL-1.0
+LibRaw 0.22.3 - distributed under CDDL-1.0
 
 LICENSE.CDDL
 COMMON DEVELOPMENT AND DISTRIBUTION LICENSE (CDDL) Version 1.0

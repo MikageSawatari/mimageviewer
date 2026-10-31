@@ -82,6 +82,13 @@ pub struct ScanReport {
 }
 
 impl ScanReport {
+    #[allow(dead_code)] // The App cleanup dialog is bin-only.
+    pub(crate) fn candidate_keys(&self) -> impl Iterator<Item = &str> {
+        self.candidates
+            .iter()
+            .map(|candidate| candidate.key.as_str())
+    }
+
     pub fn orphan_total(&self) -> usize {
         self.orphan_by_store.iter().map(|row| row.rows).sum()
     }
@@ -201,13 +208,16 @@ pub(crate) fn journal_failed_delete_purge(
 }
 
 #[allow(dead_code)] // lib target では bin-only App poller が無い
-pub(crate) fn spawn_delete_purge_retry(data_dir: PathBuf) -> DeletePurgeRetryPending {
+pub(crate) fn spawn_delete_purge_retry(
+    data_dir: PathBuf,
+    xmp_tickets: crate::tag_prewarm::XmpRatingTickets,
+) -> DeletePurgeRetryPending {
     let (tx, rx) = mpsc::channel();
     let fallback_tx = tx.clone();
     let result = std::thread::Builder::new()
         .name("delete-purge-retry".into())
         .spawn(move || {
-            let report = retry_delete_purge_journal_at(&data_dir);
+            let report = retry_delete_purge_journal_at(&data_dir, &xmp_tickets);
             let _ = tx.send(report);
         });
     if let Err(error) = result {
@@ -221,7 +231,10 @@ pub(crate) fn spawn_delete_purge_retry(data_dir: PathBuf) -> DeletePurgeRetryPen
 }
 
 #[allow(dead_code)] // lib target では bin-only App poller が無い
-fn retry_delete_purge_journal_at(data_dir: &Path) -> DeletePurgeRetryReport {
+fn retry_delete_purge_journal_at(
+    data_dir: &Path,
+    xmp_tickets: &crate::tag_prewarm::XmpRatingTickets,
+) -> DeletePurgeRetryReport {
     let snapshot = {
         let _guard = DELETE_PURGE_JOURNAL_LOCK.lock().unwrap();
         match load_delete_purge_journal_unlocked(data_dir) {
@@ -264,6 +277,11 @@ fn retry_delete_purge_journal_at(data_dir: &Path) -> DeletePurgeRetryReport {
                 entry.path.display()
             ));
             continue;
+        }
+        for (key, ticket) in xmp_tickets {
+            if delete_root_contains(&entry.path, Path::new(key)) {
+                ticket.store(true, Ordering::Release);
+            }
         }
         report.removed_paths.push(entry.path.clone());
         let purge = crate::rename_key_migration::purge_removed_paths_guarded_at(
@@ -1515,6 +1533,48 @@ mod tests {
     }
 
     #[test]
+    fn delete_purge_retry_invalidates_only_confirmed_orphan_xmp_tickets() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let files = temp.path().join("files");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&files).unwrap();
+        let root = files.join("gone");
+        let kept = files.join("kept.png");
+        std::fs::write(&kept, b"present").unwrap();
+        let keys = [
+            root.clone(),
+            root.join("page.png"),
+            PathBuf::from(format!("{}::page.png", root.display())),
+            files.join("gone-other.png"),
+            kept.clone(),
+        ];
+        let mut hydration = crate::tag_prewarm::XmpRatingHydration::default();
+        let tickets = keys
+            .iter()
+            .map(|path| {
+                let key = crate::adjustment_db::normalize_path(path);
+                hydration.read_ticket(&key)
+            })
+            .collect::<Vec<_>>();
+        let snapshot = hydration.pending_tickets();
+        let empty = retry_delete_purge_journal_at(&data, &snapshot);
+        assert_eq!(empty.attempted, 0);
+        assert!(tickets.iter().all(|ticket| !ticket.load(Ordering::Acquire)));
+        assert!(journal_failed_delete_purge(
+            &data,
+            &[root.clone(), kept],
+            &[]
+        ));
+        let report = retry_delete_purge_journal_at(&data, &snapshot);
+        assert_eq!(report.removed_paths, vec![root]);
+        assert_eq!(report.purged, 1);
+        for (index, ticket) in tickets.iter().enumerate() {
+            assert_eq!(ticket.load(Ordering::Acquire), index < 3);
+        }
+    }
+
+    #[test]
     fn delete_purge_journal_retries_confirmed_orphan_and_clears_itself() {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().join("data");
@@ -1538,7 +1598,7 @@ mod tests {
             "journal enqueue itself must not mutate DB"
         );
 
-        let report = retry_delete_purge_journal_at(&data_dir);
+        let report = retry_delete_purge_journal_at(&data_dir, &Vec::new());
         assert_eq!(report.attempted, 1);
         assert_eq!(report.purged, 1);
         assert_eq!(report.removed_paths, vec![removed.clone()]);
@@ -1585,7 +1645,7 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
         let retry = std::thread::spawn(move || {
             done_tx
-                .send(retry_delete_purge_journal_at(&retry_data))
+                .send(retry_delete_purge_journal_at(&retry_data, &Vec::new()))
                 .unwrap();
         });
         let early_report = done_rx

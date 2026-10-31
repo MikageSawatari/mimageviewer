@@ -155,8 +155,8 @@ impl Lanczos3Resampler {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mIV Lanczos spike pipeline layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mIV Lanczos spike shader"),
@@ -294,6 +294,7 @@ impl Lanczos3Resampler {
     ) {
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                multiview_mask: None,
                 label: Some("mIV Lanczos spike vertical pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &job.intermediate_view,
@@ -320,6 +321,7 @@ impl Lanczos3Resampler {
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                multiview_mask: None,
                 label: Some("mIV Lanczos spike horizontal pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &job.output_view,
@@ -450,7 +452,7 @@ fn create_pipeline(
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }

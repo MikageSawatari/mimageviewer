@@ -211,15 +211,15 @@ impl MusicVideoLabApp {
 
     pub(super) fn draw_status_bar(
         &mut self,
-        ctx: &egui::Context,
+        root_ui: &mut egui::Ui,
         input_enabled: bool,
         actions: &mut Vec<ChromeAction>,
     ) {
         // Draw BEFORE timeline, so this is always the outermost (lowest) bottom panel.
-        egui::TopBottomPanel::bottom("musicvideo-status")
-            .exact_height(30.0)
+        egui::Panel::bottom("musicvideo-status")
+            .exact_size(30.0)
             .resizable(false)
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
                 ui.add_enabled_ui(input_enabled, |ui| {
                     self.draw_status_row(ui, actions);
@@ -315,7 +315,7 @@ impl MusicVideoLabApp {
             right = rect.left() - gap;
             let mut child = ui.new_child(
                 egui::UiBuilder::new()
-                    .id(salt)
+                    .scope_id(egui::Id::unique(salt))
                     .max_rect(rect)
                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
             );
@@ -361,7 +361,7 @@ impl MusicVideoLabApp {
             egui::Rect::from_min_size(egui::pos2(left, row.top()), egui::vec2(menu_width, height));
         let mut menu_ui = ui.new_child(
             egui::UiBuilder::new()
-                .id("musicvideo-status-details")
+                .scope_id(egui::Id::unique("musicvideo-status-details"))
                 .max_rect(menu_rect)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
@@ -396,7 +396,7 @@ impl MusicVideoLabApp {
             );
             let mut info = ui.new_child(
                 egui::UiBuilder::new()
-                    .id("musicvideo-status-info")
+                    .scope_id(egui::Id::unique("musicvideo-status-info"))
                     .max_rect(rect)
                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
             );

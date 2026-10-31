@@ -1209,7 +1209,11 @@ impl EditorFrame<'_> {
     }
 }
 
-fn panel_scroll(ui: &mut egui::Ui, id: impl std::hash::Hash, draw: impl FnOnce(&mut egui::Ui)) {
+fn panel_scroll(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    draw: impl FnOnce(&mut egui::Ui),
+) {
     let id = egui::Id::new(id);
     let size = ui.available_size().max(egui::Vec2::ZERO);
     ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::LEFT), |ui| {
@@ -1272,7 +1276,7 @@ fn apply_history_shortcut(
     project: &mut Project,
     state: &mut EditorState,
 ) -> bool {
-    let text_input_owned = context.wants_keyboard_input()
+    let text_input_owned = context.egui_wants_keyboard_input()
         || egui_ime::ime_input_active(context)
         || egui_ime::recovering_text_input(context).is_some();
     let requested = context.input(|input| {
@@ -1416,7 +1420,11 @@ fn edit_layer_properties(
     modulators: &[musicvideo_core::Modulator],
     modulator_values: &[ModulatorValue],
 ) -> LayerEditResult {
-    let mut changed = egui_ime::add_singleline(ui, &mut layer.name, None, |edit| edit).changed();
+    let input_enabled = ui.is_enabled();
+    let mut changed = egui_ime::add_singleline(ui, &mut layer.name, None, |edit| {
+        edit.interactive(input_enabled)
+    })
+    .changed();
     let mut commands = Vec::new();
     let mut import_lrc_requested = None;
     let mut export_lrc_requested = None;
@@ -1596,7 +1604,11 @@ fn edit_time_text(ui: &mut egui::Ui, text: &mut TimeTextLayer) -> bool {
 }
 
 fn edit_text(ui: &mut egui::Ui, text: &mut TextLayer) -> bool {
-    let mut changed = egui_ime::add_singleline(ui, &mut text.text, None, |edit| edit).changed();
+    let input_enabled = ui.is_enabled();
+    let mut changed = egui_ime::add_singleline(ui, &mut text.text, None, |edit| {
+        edit.interactive(input_enabled)
+    })
+    .changed();
     changed |= edit_text_layout(ui, &mut text.size_px, &mut text.align);
     changed
 }
@@ -1800,6 +1812,7 @@ fn edit_lyrics(
         "1 行ずつ貼り付け、再生しながら「次の行へ」で時刻を付けます。空行は歌詞を消す区間です。",
     );
 
+    let input_enabled = ui.is_enabled();
     let mut invalidation = None;
     let pass_result = {
         let editor = state
@@ -1819,6 +1832,7 @@ fn edit_lyrics(
             .expect("lyrics editor was synchronized before the text pass");
         ui.add(
             egui::TextEdit::multiline(editor)
+                .interactive(input_enabled)
                 .id(widget_id)
                 .desired_rows(7)
                 .desired_width(f32::INFINITY)
@@ -2393,8 +2407,8 @@ mod tests {
         state.reset_for_project(&project);
         let editor = state.lyrics_editors.get_mut(&id).unwrap();
         editor.begin_pass(&original, None).unwrap();
-        TextBuffer::delete_char_range(editor, 1..2);
-        TextBuffer::delete_char_range(editor, 4..5);
+        TextBuffer::delete_char_range(editor, egui::text::CharIndex(1)..egui::text::CharIndex(2));
+        TextBuffer::delete_char_range(editor, egui::text::CharIndex(4)..egui::text::CharIndex(5));
         assert!(matches!(
             editor.finish_pass(),
             LyricsPassResult::NeedsResolution(_)
@@ -2427,7 +2441,7 @@ mod tests {
         state.reset_for_project(&project);
         let editor = state.lyrics_editors.get_mut(&id).unwrap();
         editor.begin_pass(&original, None).unwrap();
-        TextBuffer::delete_char_range(editor, 1..2);
+        TextBuffer::delete_char_range(editor, egui::text::CharIndex(1)..egui::text::CharIndex(2));
         TextBuffer::replace_with(editor, "A\nB");
         assert!(matches!(
             editor.finish_pass(),
@@ -2502,7 +2516,7 @@ mod tests {
         time: f64,
         events: Vec<egui::Event>,
     ) {
-        let _ = context.run(
+        let _ = crate::headless_paint_output(context.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -2514,23 +2528,23 @@ mod tests {
             },
             |context| {
                 let mut prepared = state.begin_frame(context, project);
-                egui::TopBottomPanel::bottom("test-timeline").show(context, |ui| {
+                egui::Panel::bottom("test-timeline").show(context, |ui| {
                     prepared.timeline(ui, 0.0, None);
                 });
                 let mut frame = prepared.properties();
-                egui::SidePanel::left("test-layers")
-                    .default_width(220.0)
+                egui::Panel::left("test-layers")
+                    .default_size(220.0)
                     .show(context, |ui| {
                         frame.layer_list(ui);
                     });
-                egui::SidePanel::right("test-inspector")
-                    .default_width(360.0)
+                egui::Panel::right("test-inspector")
+                    .default_size(360.0)
                     .show(context, |ui| {
                         frame.inspector(ui, 0.0, &[], &[]);
                     });
                 frame.finish();
             },
-        );
+        ));
     }
 
     fn set_text_cursor(context: &egui::Context, id: egui::Id, range: CCursorRange) {
@@ -2612,7 +2626,10 @@ mod tests {
             &mut state,
             0.03,
             vec![
-                egui::Event::Ime(egui::ImeEvent::Preedit("新歌詞".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "新歌詞".to_owned(),
+                    active_range_chars: None,
+                }),
                 egui::Event::Ime(egui::ImeEvent::Commit("新歌詞".to_owned())),
             ],
         );
@@ -3692,25 +3709,27 @@ mod tests {
         let context = test_context();
         let text_id = egui::Id::new("undo-owned-by-text-edit");
         let mut text = "入力中".to_owned();
-        let _ = context.run(Default::default(), |context| {
+        let _ = crate::headless_paint_output(context.run_ui(Default::default(), |context| {
             egui::CentralPanel::default().show(context, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut text).id(text_id))
                     .request_focus();
             });
-        });
-        assert!(context.wants_keyboard_input());
+        }));
+        assert!(context.egui_wants_keyboard_input());
 
         let modifiers = egui::Modifiers::CTRL;
-        let output = context.run(
+        let output = crate::headless_paint_output(context.run_ui(
             egui::RawInput {
-                modifiers,
-                events: vec![egui::Event::Key {
-                    key: egui::Key::Z,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers,
-                }],
+                events: vec![
+                    egui::Event::ModifiersChanged(modifiers),
+                    egui::Event::Key {
+                        key: egui::Key::Z,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    },
+                ],
                 ..Default::default()
             },
             |context| {
@@ -3720,9 +3739,20 @@ mod tests {
                     ui.add(egui::TextEdit::singleline(&mut text).id(text_id));
                 });
             },
-        );
+        ));
         drop(output);
         assert_eq!(project, edited);
         assert_eq!(state.history_depths(), (1, 0));
     }
+}
+
+/// Keep paint/platform observations from tests that have no renderer.
+#[cfg(test)]
+pub(crate) fn headless_paint_output(mut output: egui::FullOutput) -> egui::FullOutput {
+    egui::FullOutput {
+        textures_delta: std::mem::take(&mut output.textures_delta),
+        ..Default::default()
+    }
+    .drop_without_applying_deltas();
+    output
 }

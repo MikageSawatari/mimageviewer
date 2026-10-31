@@ -270,7 +270,7 @@ struct SmartFolderPreparedGridLayout {
     /// The offset and the auto-aspect state that determined its row height are one snapshot.
     /// `AutoAspectState::samples` is also index-keyed, so moving only the resolved aspect would
     /// leave the restored grid with another context's decision inputs.
-    scroll_offset_y: f32,
+    grid_scroll: super::GridScrollState,
     auto_aspect: crate::auto_aspect::AutoAspectState,
     /// This is comparison-only: changed user settings are never restored. A mismatch asks the
     /// ordinary folder-navigation scroll owner to keep `selected` visible in the new layout.
@@ -304,13 +304,12 @@ pub(crate) struct SmartFolderPreparedGrid {
     selected: Option<usize>,
     grid_click_selection_anchor_index: Option<usize>,
     layout: SmartFolderPreparedGridLayout,
-    scroll_to_selected: bool,
-    pending_grid_scroll: Option<super::GridScrollIntent>,
     checked: HashSet<usize>,
     visible_indices: Vec<usize>,
     details_order: Vec<usize>,
     show_search_bar: bool,
-    search_query: String,
+    /// Pinned drafts belong to the input, never to this parked listing.
+    temporary_search_query: Option<String>,
     search_filter: Option<super::LocalSearchFilter>,
     search_filter_origin_folder: Option<PathBuf>,
     rating_cache: HashMap<usize, u8>,
@@ -979,10 +978,14 @@ pub(crate) enum StagedSmartHistoryAction {
 }
 
 enum SmartTransitionIntent {
-    Direct,
+    Direct {
+        origin: Option<Box<super::top_level_grid_view::TopLevelGridOrigin>>,
+    },
     Refresh,
     History,
-    Return { anchor: Option<PathBuf> },
+    Return {
+        anchor: Option<PathBuf>,
+    },
     FolderNav(SmartFolderNavContinuation),
 }
 
@@ -1545,7 +1548,7 @@ impl App {
                     });
                 }
             }
-            Err(error) => self.show_feedback_toast(format!(
+            Err(error) => self.show_feedback_warning(format!(
                 "スマートフォルダの評価更新を開始できませんでした: {error}"
             )),
         }
@@ -1607,7 +1610,9 @@ impl App {
             Ok(None) => {}
             Err(error) => {
                 crate::logger::log(format!("smart_folder: rating membership failed: {error}"));
-                self.show_feedback_toast("スマートフォルダの評価条件を更新できませんでした".into());
+                self.show_feedback_warning(
+                    "スマートフォルダの評価条件を更新できませんでした".into(),
+                );
             }
         }
     }
@@ -1987,6 +1992,9 @@ impl App {
     }
 
     pub(crate) fn accumulate_staged_smart_fullscreen_ctrl_step(&mut self, forward: bool) -> bool {
+        if !self.staged_smart_fullscreen_ctrl_step_available() {
+            return false;
+        }
         let mode = self
             .smart_folder_transition
             .as_ref()
@@ -2009,6 +2017,14 @@ impl App {
             return false;
         };
         self.accumulate_staged_smart_folder_dfs_step(forward, &mode)
+    }
+
+    pub(crate) fn staged_smart_fullscreen_ctrl_step_available(&self) -> bool {
+        self.smart_folder_transition.as_ref().is_some_and(|transition| {
+            self.main_list_navigation_is_current(&transition.navigation)
+                && matches!(&transition.intent, SmartTransitionIntent::FolderNav(nav)
+                    if matches!(&nav.mode, super::FolderNavMode::SmartFolder { fullscreen: true, .. }))
+        })
     }
 
     pub(crate) fn retire_staged_smart_fullscreen_nav_for_close(&mut self) {
@@ -2078,7 +2094,7 @@ impl App {
             crate::ui_dialogs::epub_convert::EpubConvertExit::Abort,
         );
         self.reprepare_visible_smart_root_after_staged_terminal();
-        self.show_feedback_toast("スマートフォルダ処理を中止しました".into());
+        self.show_feedback_warning("スマートフォルダ処理を中止しました".into());
         true
     }
 
@@ -2144,7 +2160,7 @@ impl App {
             TopLevelGridSurface::Search(view) => {
                 let (query, executed) = match view {
                     TopLevelSearchView::Global => (
-                        self.global_search.query.clone(),
+                        self.global_search.draft().to_owned(),
                         self.global_search.last_executed.clone(),
                     ),
                     TopLevelSearchView::Favorite => (
@@ -2196,7 +2212,7 @@ impl App {
         intent: &SmartTransitionIntent,
     ) -> Option<super::MainListNavigation> {
         let history = match intent {
-            SmartTransitionIntent::Direct | SmartTransitionIntent::FolderNav(_) => {
+            SmartTransitionIntent::Direct { .. } | SmartTransitionIntent::FolderNav(_) => {
                 super::MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation)
             }
             SmartTransitionIntent::Refresh => super::MainHistoryOperation::SameLocation,
@@ -2211,7 +2227,7 @@ impl App {
         );
         // Opening another Smart definition exits Search, rather than drilling within its
         // transparent overlay. Keep the original explicit Direct operation until adoption.
-        if matches!(intent, SmartTransitionIntent::Direct) {
+        if matches!(intent, SmartTransitionIntent::Direct { .. }) {
             navigation.history = history;
         }
         Some(navigation)
@@ -2260,7 +2276,10 @@ impl App {
             self.clear_smart_pdf_dialog_if_unclaimed();
         }
         self.smart_folder_transition_sequence = request_id;
-        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Smart));
+        self.retire_replaced_main_list_requests_with_startup_intent(
+            Some(super::MainListRequestOwner::Smart),
+            !matches!(intent, SmartTransitionIntent::Refresh),
+        );
         self.retire_smart_folder_transition(
             crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
         );
@@ -2278,6 +2297,18 @@ impl App {
             progress: SmartFolderProgress::default(),
             phase: SmartFolderTransitionPhase::RootScan(pending),
         });
+        #[cfg(all(windows, feature = "test-script"))]
+        if self
+            .smart_folder_transition
+            .as_ref()
+            .is_some_and(|request| {
+                matches!(request.target, SmartFolderTransitionTarget::Child { .. })
+                    && self.main_list_navigation_is_current(&request.navigation)
+            })
+        {
+            // A nonresident history child creates its owner before preparing its root.
+            self.test_script_record_folder_load_owner(&super::StartupListIntent::ExplicitList);
+        }
         Ok(request_id)
     }
 
@@ -2320,7 +2351,10 @@ impl App {
         )?;
         transition.phase = SmartFolderTransitionPhase::RootPrepare(pending);
         self.smart_folder_transition_sequence = request_id;
-        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Smart));
+        self.retire_replaced_main_list_requests_with_startup_intent(
+            Some(super::MainListRequestOwner::Smart),
+            !matches!(transition.intent, SmartTransitionIntent::Refresh),
+        );
         self.retire_smart_folder_transition(
             crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
         );
@@ -2395,6 +2429,7 @@ impl App {
             source_index,
             restore_intent,
             None,
+            MainListRequestStage::Admission,
         )
     }
 
@@ -2407,8 +2442,9 @@ impl App {
         source_index: Option<usize>,
         restore_intent: super::StartupListIntent,
         navigation: Option<super::MainListNavigation>,
+        stage: MainListRequestStage,
     ) -> Result<(), Option<ScannedDir>> {
-        self.begin_smart_physical_navigation_with_backing(
+        self.begin_smart_physical_navigation_with_backing_at_stage(
             path.clone(),
             path,
             kind,
@@ -2417,6 +2453,7 @@ impl App {
             source_index,
             restore_intent,
             navigation,
+            stage,
         )
     }
 
@@ -2430,6 +2467,31 @@ impl App {
         source_index: Option<usize>,
         restore_intent: super::StartupListIntent,
         navigation: Option<super::MainListNavigation>,
+    ) -> Result<(), Option<ScannedDir>> {
+        self.begin_smart_physical_navigation_with_backing_at_stage(
+            path,
+            backing,
+            kind,
+            auto_fullscreen,
+            pre_scan,
+            source_index,
+            restore_intent,
+            navigation,
+            MainListRequestStage::Admission,
+        )
+    }
+
+    pub(super) fn begin_smart_physical_navigation_with_backing_at_stage(
+        &mut self,
+        path: PathBuf,
+        backing: PathBuf,
+        kind: SmartChildKind,
+        auto_fullscreen: bool,
+        pre_scan: Option<ScannedDir>,
+        source_index: Option<usize>,
+        restore_intent: super::StartupListIntent,
+        navigation: Option<super::MainListNavigation>,
+        stage: MainListRequestStage,
     ) -> Result<(), Option<ScannedDir>> {
         let Some(mut state) = self.smart_physical_target_state(&path) else {
             return Err(pre_scan);
@@ -2532,7 +2594,11 @@ impl App {
             self.clear_smart_pdf_dialog_if_unclaimed();
         }
         self.smart_folder_transition_sequence = request_id;
-        self.retire_replaced_main_list_requests(Some(super::MainListRequestOwner::Smart));
+        self.retire_replaced_main_list_requests_with_startup_intent(
+            Some(super::MainListRequestOwner::Smart),
+            restore_intent.replaces_deferred_startup_open()
+                && stage == MainListRequestStage::Admission,
+        );
         self.retire_smart_folder_transition(
             crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
         );
@@ -2548,7 +2614,7 @@ impl App {
                     super::MainListSourceProof::Surface(source_lease),
                 )
             }),
-            intent: SmartTransitionIntent::Direct,
+            intent: SmartTransitionIntent::Direct { origin: None },
             target: SmartFolderTransitionTarget::Child {
                 state,
                 source,
@@ -2560,6 +2626,16 @@ impl App {
             progress: SmartFolderProgress::default(),
             phase,
         });
+        #[cfg(all(windows, feature = "test-script"))]
+        if self
+            .smart_folder_transition
+            .as_ref()
+            .is_some_and(|request| self.main_list_navigation_is_current(&request.navigation))
+        {
+            // Direct dispatcher entries delegate here; they do not count a second start.
+            // Prepared child adoption and conversion/password resumes keep this owner.
+            self.test_script_record_folder_load_owner(&restore_intent);
+        }
         // Archive conversion is a separate dialog/worker owner. Retire an older dialog only
         // after this request is admitted; its exact request ID prevents the old cancel callback
         // from retiring the newly staged Smart open, including a same-source re-open.
@@ -2581,13 +2657,15 @@ impl App {
         history_trigger: super::HistoryTrigger,
         restore_video_tile: bool,
     ) -> Result<(), Option<ScannedDir>> {
-        self.begin_smart_physical_navigation(
+        self.begin_smart_physical_navigation_with_navigation(
             path,
             kind,
             false,
             pre_scan,
             None,
             super::StartupListIntent::folder_navigation(&mode),
+            None,
+            MainListRequestStage::Continuation,
         )?;
         if let Some(transition) = self.smart_folder_transition.as_mut() {
             let request_id = transition.request_id;
@@ -2684,6 +2762,7 @@ impl App {
             None,
             restore_intent.clone(),
             None,
+            MainListRequestStage::Admission,
         )
     }
 
@@ -2697,6 +2776,7 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
         navigation: Option<super::MainListNavigation>,
+        stage: MainListRequestStage,
     ) -> bool {
         if self.top_level_grid_view.smart_folder_session().is_none() {
             return false;
@@ -2727,7 +2807,7 @@ impl App {
         if kind == SmartChildKind::ConvertibleArchive
             && self.settings.archive_file_handling_ignores_convertible()
         {
-            self.show_feedback_toast("設定により変換が必要な本を無視しています".into());
+            self.show_feedback_warning("設定により変換が必要な本を無視しています".into());
             return true;
         }
         if kind == SmartChildKind::Pdf
@@ -2737,7 +2817,7 @@ impl App {
                 .and_then(|ext| ext.to_str())
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
         {
-            self.show_feedback_toast("設定により EPUB を無視しています".into());
+            self.show_feedback_warning("設定により EPUB を無視しています".into());
             return true;
         }
         if self
@@ -2749,10 +2829,11 @@ impl App {
                 Some(index),
                 restore_intent.clone(),
                 navigation,
+                stage,
             )
             .is_err()
         {
-            self.show_feedback_toast("コンテナの読み取りを開始できませんでした".into());
+            self.show_feedback_warning("コンテナの読み取りを開始できませんでした".into());
             return true;
         }
         if kind == SmartChildKind::ConvertibleArchive {
@@ -2820,7 +2901,7 @@ impl App {
                 crate::ui_dialogs::epub_convert::EpubConvertExit::Abort,
             );
             self.reprepare_visible_smart_root_after_staged_terminal();
-            self.show_feedback_toast("アーカイブの読み取りを開始できませんでした".into());
+            self.show_feedback_warning("アーカイブの読み取りを開始できませんでした".into());
         }
     }
 
@@ -2930,7 +3011,7 @@ impl App {
                 true
             }
             Err(message) => {
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
                 false
             }
         }
@@ -2990,7 +3071,7 @@ impl App {
                 true
             }
             Err(message) => {
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
                 false
             }
         }
@@ -3051,7 +3132,7 @@ impl App {
                     child: SmartPhysicalPreflight::ArchiveConvert,
                 };
                 drop(transition);
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
                 self.reprepare_visible_smart_root_after_staged_terminal();
                 return false;
             }
@@ -3059,7 +3140,8 @@ impl App {
         let restore_reading_history = self
             .reading_history_return_from
             .as_ref()
-            .is_some_and(|from| crate::folder_tree::path_eq(from, source_path));
+            .filter(|from| crate::folder_tree::path_eq(&from.container, source_path))
+            .cloned();
         let restore_bookmark_view = self
             .bookmark_view_state
             .as_ref()
@@ -3106,22 +3188,26 @@ impl App {
             super::FolderHistoryDirection::Forward => self.folder_history_forward_entry(),
         }
         .cloned();
-        let target = super::FolderNavHistoryTarget::SmartFolder(state.clone());
+        let target = super::FolderNavHistoryTarget::SmartFolder(
+            self.smart_folder_restore_snapshot(state.clone()),
+        );
         let Some(candidate) =
             candidate.filter(|candidate| Self::folder_nav_targets_eq(&candidate.location, &target))
         else {
             return false;
         };
-        let Some(plan) = super::FolderHistoryPlan::capture(self, direction, candidate) else {
+        let Some(plan) = super::FolderHistoryPlan::capture(self, direction, candidate.clone())
+        else {
             return false;
         };
         let Some(lease) = self.smart_folder_source_lease() else {
             return false;
         };
-        let navigation = self.capture_main_list_navigation(
+        let mut navigation = self.capture_main_list_navigation(
             super::MainHistoryOperation::Replay(Box::new(plan)),
             super::MainListSourceProof::Surface(lease),
         );
+        navigation.destination = super::MainListRestoreDestination::Entry(candidate);
         self.begin_smart_history_navigation_request(state, navigation)
     }
 
@@ -3178,9 +3264,11 @@ impl App {
             return Some(StagedSmartHistoryAction::Handled);
         }
         navigation.history = super::MainHistoryOperation::Replay(next);
+        navigation.destination = super::MainListRestoreDestination::Entry(target.clone());
         match &target.location {
             super::FolderNavHistoryTarget::SmartFolder(state) => {
-                let _ = self.begin_smart_history_navigation_request(state.clone(), navigation);
+                let _ =
+                    self.begin_smart_history_navigation_request(state.state.clone(), navigation);
                 Some(StagedSmartHistoryAction::Handled)
             }
             _ => Some(StagedSmartHistoryAction::Dispatch { target, navigation }),
@@ -3190,12 +3278,30 @@ impl App {
     /// Search remains the visible owner until the saved Smart destination is adopted.
     pub(crate) fn begin_smart_search_return_navigation(
         &mut self,
-        state: super::top_level_grid_view::SmartFolderViewState,
+        restore: super::top_level_grid_view::SmartFolderRestore,
     ) -> bool {
+        let route = self
+            .top_level_grid_view
+            .return_origin()
+            .map(|origin| origin.route.clone())
+            .unwrap_or_else(|| self.facet_navigation.route().clone());
+        let Some(mut navigation) =
+            self.capture_smart_list_navigation(&SmartTransitionIntent::Return { anchor: None })
+        else {
+            return false;
+        };
+        navigation.destination = super::MainListRestoreDestination::Origin(Box::new(
+            super::top_level_grid_view::TopLevelGridOrigin {
+                restore: super::top_level_grid_view::TopLevelGridRestore::SmartFolder(
+                    restore.clone(),
+                ),
+                route,
+            },
+        ));
         self.begin_staged_smart_target_navigation(
-            state,
+            restore.state,
             SmartTransitionIntent::Return { anchor: None },
-            None,
+            Some(navigation),
         )
     }
 
@@ -3332,7 +3438,7 @@ impl App {
                 ) {
                     Ok(_) => true,
                     Err(message) => {
-                        self.show_feedback_toast(message);
+                        self.show_feedback_warning(message);
                         false
                     }
                 };
@@ -3353,7 +3459,7 @@ impl App {
         {
             Ok(_) => true,
             Err(message) => {
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
                 false
             }
         }
@@ -3364,23 +3470,11 @@ impl App {
         navigation: &super::MainListNavigation,
         state: super::top_level_grid_view::SmartFolderViewState,
     ) -> super::FolderNavHistoryEntry {
-        let location = super::FolderNavHistoryTarget::SmartFolder(state);
-        if let super::MainHistoryOperation::Replay(plan) = &navigation.history
-            && let Some(entry) = &plan.virtual_current
-        {
-            return super::FolderNavHistoryEntry::new(location, entry.route.clone());
-        }
-        if let super::MainHistoryOperation::Restore { route: Some(route) } = &navigation.history {
-            return super::FolderNavHistoryEntry::new(location, route.clone());
-        }
-        if matches!(
-            navigation.history,
-            super::MainHistoryOperation::SameLocation
-        ) && let Some(entry) = &navigation.source_location
-        {
-            return super::FolderNavHistoryEntry::new(location, entry.route.clone());
-        }
-        self.main_list_destination_entry(location, navigation.source_location.as_ref(), None)
+        self.main_list_requested_destination(
+            navigation,
+            super::FolderNavHistoryTarget::SmartFolder(self.smart_folder_restore_snapshot(state)),
+            None,
+        )
     }
 
     fn adopt_smart_transition_root(
@@ -3389,6 +3483,7 @@ impl App {
         prepared: PreparedSmartFolder,
         record_history: bool,
         anchor: Option<PathBuf>,
+        prior_origin: Option<super::top_level_grid_view::TopLevelGridOrigin>,
         navigation: super::MainListNavigation,
     ) -> bool {
         let definition_id = prepared.snapshot.definition.id;
@@ -3403,7 +3498,13 @@ impl App {
             return false;
         };
         self.adopt_main_list_navigation(adoption, |app| {
-            app.install_adopted_smart_transition_root(request_id, prepared, record_history, anchor);
+            app.install_adopted_smart_transition_root(
+                request_id,
+                prepared,
+                record_history,
+                anchor,
+                prior_origin,
+            );
             None
         })
     }
@@ -3414,6 +3515,7 @@ impl App {
         prepared: PreparedSmartFolder,
         record_history: bool,
         anchor: Option<PathBuf>,
+        prior_origin: Option<super::top_level_grid_view::TopLevelGridOrigin>,
     ) {
         let definition_id = prepared.snapshot.definition.id;
         // All fallible work is complete. This is the first point at which the prior viewer may
@@ -3422,7 +3524,11 @@ impl App {
         if self.smart_folder_local_search_reapply.is_some() && self.show_search_bar {
             self.smart_folder_local_search_reapply = Some(self.search_query.clone());
         }
-        let prior = self.close_transient_views_before_smart_folder();
+        let departed = self.close_transient_views_before_smart_folder();
+        let prior = prior_origin
+            .as_ref()
+            .map(|origin| origin.restore.clone())
+            .unwrap_or(departed);
         if self.smart_folder_pending.is_some()
             || self.smart_folder_prepare_pending.is_some()
             || self.smart_folder_confirm_pending.is_some()
@@ -3448,6 +3554,7 @@ impl App {
             ),
             Some(prior),
         );
+        self.top_level_grid_view.replace_return_origin(prior_origin);
         self.install_current_prepared_smart_folder(prepared);
         if let Some(session) = self.top_level_grid_view.smart_folder_session_mut() {
             session.adopted_request_id = Some(request_id);
@@ -3501,6 +3608,7 @@ impl App {
         let definition_id = target.definition_id;
         match root {
             SmartFolderTransitionRoot::Offscreen(prepared) => {
+                let prior_origin = self.capture_top_level_origin();
                 let prior = self.close_transient_views_before_smart_folder();
                 if self.smart_folder_pending.is_some()
                     || self.smart_folder_prepare_pending.is_some()
@@ -3515,6 +3623,7 @@ impl App {
                     super::top_level_grid_view::TopLevelGridSurface::SmartFolder(target),
                     Some(prior),
                 );
+                self.top_level_grid_view.replace_return_origin(prior_origin);
                 self.top_level_grid_view
                     .install_smart_folder_session(SmartFolderSession {
                         definition_id,
@@ -3619,7 +3728,7 @@ impl App {
         });
         if let SmartPhysicalReady::Error(reason) = &child {
             crate::logger::log(reason.log_line());
-            self.show_feedback_toast(reason.message().to_owned());
+            self.show_feedback_warning(reason.message().to_owned());
             self.retire_smart_folder_payloads([Box::new(child) as RetiredSmartFolderPayload]);
             return false;
         }
@@ -3630,7 +3739,7 @@ impl App {
                 && !self.smart_folder_navigation_target_current(&target, &source.logical_source))
         {
             self.retire_smart_folder_payloads([Box::new(child) as RetiredSmartFolderPayload]);
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "スマートフォルダの並びが変わりました。もう一度操作してください".into(),
             );
             return false;
@@ -4350,7 +4459,7 @@ impl App {
                         if result.snapshot.diag.source_failures
                             == active_rules(&result.snapshot.definition).len()
                         {
-                            self.show_feedback_toast(
+                            self.show_feedback_warning(
                                 "スマートフォルダの検索元を1件も読み込めませんでした".into(),
                             );
                             self.retire_smart_folder_payloads([
@@ -4370,7 +4479,7 @@ impl App {
                             ) {
                                 Ok(count) => Some(SmartFolderTransitionPhase::RootCount(count)),
                                 Err(message) => {
-                                    self.show_feedback_toast(message);
+                                    self.show_feedback_warning(message);
                                     None
                                 }
                             }
@@ -4399,7 +4508,7 @@ impl App {
                                     Some(SmartFolderTransitionPhase::RootPrepare(prepare))
                                 }
                                 Err(message) => {
-                                    self.show_feedback_toast(message);
+                                    self.show_feedback_warning(message);
                                     None
                                 }
                             }
@@ -4411,7 +4520,7 @@ impl App {
                     Some(SmartFolderTransitionPhase::RootScan(pending))
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.show_feedback_toast("スマートフォルダ走査が中断されました".into());
+                    self.show_feedback_warning("スマートフォルダ走査が中断されました".into());
                     None
                 }
             },
@@ -4445,7 +4554,7 @@ impl App {
                             ) {
                                 Ok(count) => Some(SmartFolderTransitionPhase::RootCount(count)),
                                 Err(message) => {
-                                    self.show_feedback_toast(message);
+                                    self.show_feedback_warning(message);
                                     None
                                 }
                             }
@@ -4473,7 +4582,7 @@ impl App {
                                     Some(SmartFolderTransitionPhase::RootPrepare(prepare))
                                 }
                                 Err(message) => {
-                                    self.show_feedback_toast(message);
+                                    self.show_feedback_warning(message);
                                     None
                                 }
                             }
@@ -4481,7 +4590,7 @@ impl App {
                     }
                 }
                 Ok(SmartFolderPrepareEvent::Error(message)) => {
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     None
                 }
                 Ok(SmartFolderPrepareEvent::Cancelled) => None,
@@ -4493,7 +4602,7 @@ impl App {
                     Some(SmartFolderTransitionPhase::RootCount(pending))
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.show_feedback_toast("スマートフォルダの件数確認が中断されました".into());
+                    self.show_feedback_warning("スマートフォルダの件数確認が中断されました".into());
                     None
                 }
             },
@@ -4511,7 +4620,7 @@ impl App {
                     }
                 }
                 Ok(SmartFolderPrepareEvent::Error(message)) => {
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     None
                 }
                 Ok(SmartFolderPrepareEvent::Cancelled) => None,
@@ -4523,7 +4632,7 @@ impl App {
                     Some(SmartFolderTransitionPhase::RootPrepare(pending))
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.show_feedback_toast("スマートフォルダの表示準備が中断されました".into());
+                    self.show_feedback_warning("スマートフォルダの表示準備が中断されました".into());
                     None
                 }
             },
@@ -4550,7 +4659,7 @@ impl App {
                         ) {
                             Ok(pending) => Some(SmartFolderTransitionPhase::RootScan(pending)),
                             Err(message) => {
-                                self.show_feedback_toast(message);
+                                self.show_feedback_warning(message);
                                 None
                             }
                         }
@@ -4611,7 +4720,7 @@ impl App {
                                     Some(SmartFolderTransitionPhase::RootPrepare(pending))
                                 }
                                 Err(message) => {
-                                    self.show_feedback_toast(message);
+                                    self.show_feedback_warning(message);
                                     None
                                 }
                             }
@@ -4623,7 +4732,7 @@ impl App {
                                     if history_ready {
                                         let record_history = matches!(
                                             transition.intent,
-                                            SmartTransitionIntent::Direct
+                                            SmartTransitionIntent::Direct { .. }
                                         );
                                         if self.adopt_smart_transition_root(
                                             transition.request_id,
@@ -4634,6 +4743,15 @@ impl App {
                                                     anchor.clone()
                                                 }
                                                 _ => None,
+                                            },
+                                            match &transition.intent {
+                                                SmartTransitionIntent::Direct { origin } => {
+                                                    origin.as_deref().cloned()
+                                                }
+                                                _ => self
+                                                    .top_level_grid_view
+                                                    .return_origin()
+                                                    .cloned(),
                                             },
                                             transition.navigation.clone(),
                                         ) {
@@ -4657,7 +4775,7 @@ impl App {
                                             })
                                         }
                                         Err(message) => {
-                                            self.show_feedback_toast(message);
+                                            self.show_feedback_warning(message);
                                             None
                                         }
                                     }
@@ -4666,7 +4784,7 @@ impl App {
                         }
                     }
                 } else {
-                    self.show_feedback_toast("スマートフォルダが見つかりません".into());
+                    self.show_feedback_warning("スマートフォルダが見つかりません".into());
                     None
                 }
             }
@@ -4727,7 +4845,7 @@ impl App {
                 }
                 SmartPhysicalPoll::Cancelled => None,
                 SmartPhysicalPoll::Failed(message) => {
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     None
                 }
             },
@@ -6054,14 +6172,14 @@ fn prepared_converted_archive_path(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(in crate::app) struct PreparedVideoFolderPinSeed {
-    pub(in crate::app) cache_key: String,
-    pub(in crate::app) video_path: PathBuf,
-    pub(in crate::app) mtime: i64,
-    pub(in crate::app) file_size: i64,
+pub(crate) struct PreparedVideoFolderPinSeed {
+    pub(crate) cache_key: String,
+    pub(crate) video_path: PathBuf,
+    pub(crate) mtime: i64,
+    pub(crate) file_size: i64,
 }
 
-pub(in crate::app) fn prepare_video_folder_pin_seeds(
+pub(crate) fn prepare_video_folder_pin_seeds(
     items: &[GridItem],
     folder_pin_map: &HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     folder_pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
@@ -7584,7 +7702,7 @@ impl App {
         }
         if self.show_search_bar {
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
@@ -7625,6 +7743,11 @@ impl App {
                     )
             })
             .map(|transition| {
+                if let super::MainListRestoreDestination::Origin(origin) =
+                    &transition.navigation.destination
+                {
+                    return (**origin).clone();
+                }
                 let state = match &transition.target {
                     SmartFolderTransitionTarget::Root(state)
                     | SmartFolderTransitionTarget::Child { state, .. } => state.clone(),
@@ -7634,7 +7757,9 @@ impl App {
                     _ => self.facet_navigation.route().clone(),
                 };
                 super::top_level_grid_view::TopLevelGridOrigin {
-                    restore: super::top_level_grid_view::TopLevelGridRestore::SmartFolder(state),
+                    restore: super::top_level_grid_view::TopLevelGridRestore::SmartFolder(
+                        self.smart_folder_restore_snapshot(state),
+                    ),
                     route,
                 }
             });
@@ -7733,7 +7858,9 @@ impl App {
         self.open_smart_folder_staged_with_intent(
             definition_id,
             refresh,
-            SmartTransitionIntent::Direct,
+            SmartTransitionIntent::Direct {
+                origin: self.capture_top_level_origin().map(Box::new),
+            },
         )
     }
 
@@ -7751,7 +7878,7 @@ impl App {
         refresh: bool,
         intent: SmartTransitionIntent,
     ) -> Option<u64> {
-        if matches!(&intent, SmartTransitionIntent::Direct)
+        if matches!(&intent, SmartTransitionIntent::Direct { .. })
             && self.document_open_modal_admission_blocked()
         {
             return None;
@@ -7763,11 +7890,11 @@ impl App {
             .find(|definition| definition.id == definition_id)
             .cloned()
         else {
-            self.show_feedback_toast("スマートフォルダが見つかりません".into());
+            self.show_feedback_warning("スマートフォルダが見つかりません".into());
             return None;
         };
         if active_rules(&definition).is_empty() {
-            self.show_feedback_toast("表示条件を追加してください".into());
+            self.show_feedback_warning("表示条件を追加してください".into());
             self.open_smart_folder_manager(Some(definition_id));
             return None;
         }
@@ -7788,7 +7915,7 @@ impl App {
                 Some(request_id)
             }
             Err(message) => {
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
                 None
             }
         }
@@ -7897,7 +8024,7 @@ impl App {
                 self.smart_folder_prepare_pending = Some(pending);
             }
             Err(message) => {
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
                 self.restore_pending_smart_folder_origin();
             }
         }
@@ -7994,7 +8121,7 @@ impl App {
                 });
                 self.smart_folder_prepare_pending = Some(pending);
             }
-            Err(message) => self.show_feedback_toast(message),
+            Err(message) => self.show_feedback_warning(message),
         }
     }
 
@@ -8060,8 +8187,13 @@ impl App {
                 && self.current_smart_folder_id == Some(state.definition_id)
             {
                 self.top_level_grid_view.replace_surface(
-                    super::top_level_grid_view::TopLevelGridSurface::SmartFolder(state.clone()),
+                    super::top_level_grid_view::TopLevelGridSurface::SmartFolder(
+                        state.state.clone(),
+                    ),
                 );
+                self.smart_folder_saved_folder = state.saved_folder.clone();
+                self.top_level_grid_view
+                    .replace_return_origin(state.return_to.as_deref().cloned());
                 return;
             }
 
@@ -8272,18 +8404,17 @@ impl App {
             selected: self.selected.take(),
             grid_click_selection_anchor_index: anchor_index,
             layout: SmartFolderPreparedGridLayout {
-                scroll_offset_y: std::mem::take(&mut self.scroll_offset_y),
+                grid_scroll: std::mem::take(&mut self.grid_scroll),
                 auto_aspect: std::mem::take(&mut self.auto_aspect),
                 mode: SmartFolderPreparedGridMode::current(&self.settings),
                 window_inner_size: self.last_inner_size,
             },
-            scroll_to_selected: std::mem::take(&mut self.scroll_to_selected),
-            pending_grid_scroll: self.pending_grid_scroll.take(),
             checked: std::mem::take(&mut self.checked),
             visible_indices: std::mem::take(&mut self.visible_indices),
             details_order: std::mem::take(&mut self.details_order),
             show_search_bar: std::mem::take(&mut self.show_search_bar),
-            search_query: std::mem::take(&mut self.search_query),
+            temporary_search_query: (!self.settings.show_toolbar_search_local)
+                .then(|| std::mem::take(&mut self.search_query)),
             search_filter: self.search_filter.take(),
             search_filter_origin_folder: self.search_filter_origin_folder.take(),
             rating_cache: std::mem::take(&mut self.rating_cache),
@@ -8367,7 +8498,12 @@ impl App {
     ) {
         self.smart_folder_open_origin = Some(SmartFolderOpenOrigin::ReturnReprepare {
             prior: super::top_level_grid_view::TopLevelGridRestore::SmartFolder(
-                super::top_level_grid_view::SmartFolderViewState::root(definition_id, Vec::new()),
+                self.smart_folder_restore_snapshot(
+                    super::top_level_grid_view::SmartFolderViewState::root(
+                        definition_id,
+                        Vec::new(),
+                    ),
+                ),
             ),
             anchor: returned_root_entry.map(Path::to_path_buf),
         });
@@ -8396,7 +8532,7 @@ impl App {
         self.cancel_media_navigation_pending_for_current_context(
             "restore_prepared_smart_folder_session",
         );
-        self.close_fullscreen();
+        self.close_fullscreen_content();
         self.bump_full_context_for_load();
         self.cancel_pending_folder_nav();
         self.pdf_enumerate_pending = None;
@@ -8418,13 +8554,11 @@ impl App {
             selected,
             grid_click_selection_anchor_index,
             layout,
-            scroll_to_selected,
-            pending_grid_scroll,
             checked,
             visible_indices,
             details_order,
             show_search_bar,
-            search_query,
+            temporary_search_query,
             search_filter,
             search_filter_origin_folder,
             rating_cache,
@@ -8443,7 +8577,7 @@ impl App {
         } = grid;
         let layout_changed = !layout.matches_current_layout(self);
         let SmartFolderPreparedGridLayout {
-            scroll_offset_y,
+            grid_scroll,
             mut auto_aspect,
             ..
         } = layout;
@@ -8471,14 +8605,20 @@ impl App {
         self.selected = selected;
         self.grid_click_selection_anchor = grid_click_selection_anchor_index
             .map(|index| super::GridClickSelectionAnchor::new(index, self.items_generation));
-        self.scroll_offset_y = scroll_offset_y;
-        self.scroll_to_selected = scroll_to_selected || layout_changed;
-        self.pending_grid_scroll = pending_grid_scroll;
+        self.grid_scroll = grid_scroll;
+        self.grid_scroll.renew_session();
+        if layout_changed {
+            self.grid_scroll.set_reveal_requested(true);
+        }
         self.checked = checked;
         self.visible_indices = visible_indices;
         self.details_order = details_order;
         self.show_search_bar = show_search_bar;
-        self.search_query = search_query;
+        if !self.settings.show_toolbar_search_local
+            && let Some(query) = temporary_search_query
+        {
+            self.search_query = query;
+        }
         self.search_filter = search_filter;
         self.search_filter_origin_folder = search_filter_origin_folder;
         self.rating_cache = rating_cache;
@@ -8552,7 +8692,7 @@ impl App {
             .map(|definition| definition.name.as_str())
             .unwrap_or("?");
         self.address = format!("スマートフォルダ: {definition_name}");
-        self.last_scroll_offset_y_tracked = self.scroll_offset_y;
+        self.last_scroll_offset_y_tracked = self.grid_scroll.offset();
         if let Some(returned_root_entry) = returned_root_entry {
             let returned_index = self.items.iter().position(|item| {
                 item.drag_source_path()
@@ -8694,7 +8834,7 @@ impl App {
         self.restore_smart_folder_for_synthetic_path_with_navigation(path, None)
     }
 
-    fn restore_smart_folder_for_synthetic_path_with_navigation(
+    pub(super) fn restore_smart_folder_for_synthetic_path_with_navigation(
         &mut self,
         path: &Path,
         navigation: Option<super::MainListNavigation>,
@@ -8714,8 +8854,9 @@ impl App {
         self.capture_main_list_restore_cursor();
         // BS/parent is Direct independently of resident/prepared cache availability.
         // Search exits and replay callers supply their already-captured operation.
-        let navigation = navigation
-            .or_else(|| self.capture_smart_list_navigation(&SmartTransitionIntent::Direct));
+        let navigation = navigation.or_else(|| {
+            self.capture_smart_list_navigation(&SmartTransitionIntent::Direct { origin: None })
+        });
         let Some(navigation) = navigation else {
             return false;
         };
@@ -8823,7 +8964,7 @@ impl App {
                         == active_rules(&result.snapshot.definition).len()
                     {
                         self.smart_folder_progress = None;
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "スマートフォルダの検索元を1件も読み込めませんでした".into(),
                         );
                         self.restore_pending_smart_folder_origin();
@@ -8884,7 +9025,7 @@ impl App {
                     );
                     self.retire_smart_folder_payloads(retired);
                     self.smart_folder_progress = None;
-                    self.show_feedback_toast("スマートフォルダ走査が中断されました".into());
+                    self.show_feedback_warning("スマートフォルダ走査が中断されました".into());
                     self.restore_pending_smart_folder_origin();
                     break;
                 }
@@ -9069,7 +9210,7 @@ impl App {
                     );
                     self.retire_smart_folder_payloads(retired);
                     self.smart_folder_progress = None;
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     self.restore_pending_smart_folder_origin();
                     break;
                 }
@@ -9082,7 +9223,7 @@ impl App {
                     );
                     self.retire_smart_folder_payloads(retired);
                     self.smart_folder_progress = None;
-                    self.show_feedback_toast("スマートフォルダの表示準備が中断されました".into());
+                    self.show_feedback_warning("スマートフォルダの表示準備が中断されました".into());
                     self.restore_pending_smart_folder_origin();
                     break;
                 }
@@ -9103,7 +9244,7 @@ impl App {
             self.smart_folder_local_search_reapply = Some(self.search_query.clone());
         }
         let PreparedSmartFolder {
-            mut snapshot,
+            snapshot,
             presentation,
             items,
             image_metas,
@@ -9203,7 +9344,9 @@ impl App {
             applied_tombstones,
         };
         let intent = match self.smart_folder_open_origin.as_ref() {
-            Some(SmartFolderOpenOrigin::Direct(_)) => SmartTransitionIntent::Direct,
+            Some(SmartFolderOpenOrigin::Direct(_)) => {
+                SmartTransitionIntent::Direct { origin: None }
+            }
             Some(SmartFolderOpenOrigin::ReturnReprepare { .. }) => {
                 SmartTransitionIntent::Return { anchor: None }
             }
@@ -9235,6 +9378,8 @@ impl App {
     /// Freshness was checked by the prepare owner before adoption. No worker or
     /// other UI event can interleave this install with that admission boundary.
     fn install_current_prepared_smart_folder(&mut self, prepared: PreparedSmartFolder) {
+        self.save_departing_session_grid_positions();
+        self.retire_rating_navigation_owner();
         let install_started = Instant::now();
         let PreparedSmartFolder {
             mut snapshot,
@@ -9337,7 +9482,7 @@ impl App {
         self.address = format!("スマートフォルダ: {definition_name}");
         if let Some(&index) = self.visible_indices.first() {
             self.move_grid_cursor(Some(index), crate::app::GridCursorIntent::Automatic);
-            self.scroll_to_selected = true;
+            self.grid_scroll.set_reveal_requested(true);
         }
         if let Some(SmartFolderOpenOrigin::ReturnReprepare {
             anchor: Some(path), ..
@@ -9368,14 +9513,14 @@ impl App {
                 .first()
                 .map(|(path, error)| format!(" / {}: {error}", path.display()))
                 .unwrap_or_default();
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "スマートフォルダを{prefix}: {qualifying_count}件 (読めなかった項目 {skipped}件){source_detail}"
             ));
         } else {
             self.show_feedback_toast(format!("スマートフォルダを{prefix}: {qualifying_count}件"));
         }
         if rating_sort_failed {
-            self.show_feedback_toast("評価順を読み込めなかったため名前順で表示しました".into());
+            self.show_feedback_warning("評価順を読み込めなかったため名前順で表示しました".into());
         }
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -9400,13 +9545,22 @@ impl App {
             return;
         };
         self.show_search_bar = true;
-        self.search_query = query;
+        if !self.settings.show_toolbar_search_local {
+            self.search_query = query.clone();
+        }
         self.search_filter = None;
         self.search_filter_origin_folder = self.effective_folder();
-        if self.search_query.trim().is_empty() {
+        if query.trim().is_empty() {
             self.rebuild_visible_indices();
         } else {
-            self.reexecute_search_for_installed_list(ctx);
+            self.execute_submitted_local_search(
+                ctx,
+                Arc::new(super::LocalSearchSubmission {
+                    query,
+                    target: self.search_target.clone(),
+                    or_mode: self.search_or_mode,
+                }),
+            );
         }
     }
 
@@ -9671,7 +9825,7 @@ impl App {
         if let Some(id) = reopen {
             let _ = self.refresh_smart_folder_staged(id);
         } else if retired_transition {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "名前変更でスマートフォルダの読み込みを中止しました。開き直してください".into(),
             );
         }
@@ -9692,7 +9846,7 @@ impl App {
             let scanning = matches!(transition.phase, SmartFolderTransitionPhase::RootScan(_));
             let counting = matches!(transition.phase, SmartFolderTransitionPhase::RootCount(_));
             let mut cancel = false;
-            egui::Modal::new(egui::Id::new("smart_folder_transition_progress_modal")).show(
+            egui::Modal::new(egui::Id::unique("smart_folder_transition_progress_modal")).show(
                 ctx,
                 |ui| {
                     ui.set_min_width(460.0);
@@ -9758,7 +9912,7 @@ impl App {
             let name = confirm.snapshot.definition.name.clone();
             let mut proceed = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::new("smart_folder_transition_large_confirm")).show(
+            egui::Modal::new(egui::Id::unique("smart_folder_transition_large_confirm")).show(
                 ctx,
                 |ui| {
                     ui.heading("スマートフォルダを表示");
@@ -9797,7 +9951,7 @@ impl App {
                             transition.phase = SmartFolderTransitionPhase::RootPrepare(pending);
                             self.smart_folder_transition = Some(transition);
                         }
-                        Err(message) => self.show_feedback_toast(message),
+                        Err(message) => self.show_feedback_warning(message),
                     }
                 }
             }
@@ -9807,7 +9961,7 @@ impl App {
             let name = confirm.snapshot.definition.name.clone();
             let mut proceed = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::new("smart_folder_large_confirm")).show(ctx, |ui| {
+            egui::Modal::new(egui::Id::unique("smart_folder_large_confirm")).show(ctx, |ui| {
                 ui.heading("スマートフォルダを表示");
                 ui.label(format!("「{name}」の結果は {count} 件です。"));
                 ui.label("一覧の準備に時間とメモリを使用する可能性があります。");
@@ -9856,7 +10010,7 @@ impl App {
             return;
         };
         let mut cancel = false;
-        egui::Modal::new(egui::Id::new("smart_folder_progress_modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("smart_folder_progress_modal")).show(ctx, |ui| {
             // サブ展開と同じ幅・構成にして、走査中は背面の一覧を操作できないことを
             // 見た目でも明示する。処理本体と cancel の所有境界は変更しない。
             ui.set_min_width(460.0);
@@ -9910,7 +10064,7 @@ impl App {
         });
         if cancel {
             self.cancel_smart_folder_pending_and_restore_origin();
-            self.show_feedback_toast("スマートフォルダ処理を中止しました".into());
+            self.show_feedback_warning("スマートフォルダ処理を中止しました".into());
         }
         ctx.request_repaint_after(Duration::from_millis(50));
     }
@@ -10139,6 +10293,7 @@ mod tests {
                 None,
                 super::super::StartupListIntent::ExplicitList,
                 None,
+                MainListRequestStage::Admission,
             ),
             "the native classified adapter must validate the captured row identity too"
         );
@@ -10165,7 +10320,7 @@ mod tests {
                 ),
                 super::MainListSourceProof::Surface(lease),
             ),
-            intent: SmartTransitionIntent::Direct,
+            intent: SmartTransitionIntent::Direct { origin: None },
             target: SmartFolderTransitionTarget::Child {
                 state: super::super::top_level_grid_view::SmartFolderViewState::root(
                     uuid::Uuid::new_v4(),
@@ -10268,7 +10423,9 @@ mod tests {
             .fake_published_sender_for_test();
         publish();
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(app.epub_convert.is_none());
         assert_eq!(app.fs_nav_locked_gen, None);
         assert!(
@@ -10342,6 +10499,7 @@ mod tests {
             None,
             crate::app::StartupListIntent::ExplicitList,
             None,
+            MainListRequestStage::Admission,
         ));
         let transition = app.smart_folder_transition.as_mut().unwrap();
         let request_id = transition.request_id;
@@ -10421,7 +10579,9 @@ mod tests {
         app.epub_convert.as_mut().unwrap().phase =
             crate::ui_dialogs::epub_convert::EpubConvertPhase::Error("test".into());
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(app.epub_convert.is_some());
         assert!(smart_epub_waiting(&app));
         let input = egui::RawInput {
@@ -10434,7 +10594,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        let _ = ctx.run(input, |ctx| app.show_epub_convert_dialog(ctx));
+        let _ = ctx
+            .run_pass(input, |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert!(app.epub_convert.is_none());
         assert!(app.smart_folder_transition.is_none());
     }
@@ -11119,7 +11281,7 @@ mod tests {
         assert_eq!(names(&app), ["a", "c.zip"]);
 
         app.show_search_bar = false;
-        app.search_query.clear();
+        app.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
         app.search_filter = None;
         app.rebuild_visible_indices();
         assert_eq!(
@@ -11802,6 +11964,46 @@ mod tests {
     }
 
     #[test]
+    fn grid_scroll_smart_root_park_restore_keeps_own_row_anchor_and_request() {
+        let mut app = crate::app::setup_app_for_test();
+        let definition_id = install_smart_identity_test_root(&mut app, Default::default());
+        app.selected = Some(1);
+        app.grid_scroll.set_position(125.0);
+        app.grid_scroll.set_row_anchor(Some(2));
+        app.grid_scroll.set_reveal_requested(true);
+        app.grid_scroll
+            .request_edge(super::super::GridScrollIntent::Bottom);
+        let root_scroll = app.grid_scroll.clone();
+        let grid = app.take_visible_smart_folder_grid();
+        assert_eq!(grid.layout.grid_scroll, root_scroll);
+        assert_eq!(app.grid_scroll.offset(), 0.0);
+        assert_eq!(app.grid_scroll.row_anchor(), None);
+        assert!(!app.grid_scroll.reveal_requested());
+        assert_eq!(app.grid_scroll.pending_edge(), None);
+        park_smart_identity_test_root(&mut app, grid);
+        app.grid_scroll.set_position(77.0);
+        app.grid_scroll.set_row_anchor(Some(5));
+        app.grid_scroll
+            .request_edge(super::super::GridScrollIntent::Top);
+        assert!(!app.grid_scroll.take_reveal());
+        assert_eq!(
+            app.grid_scroll.take_layout_request().edge(),
+            Some(super::super::GridScrollIntent::Top)
+        );
+        assert_eq!(app.grid_scroll.row_anchor(), Some(5));
+        assert!(app.restore_prepared_smart_folder_session(definition_id, None));
+        assert_ne!(app.grid_scroll.session(), root_scroll.session());
+        assert_eq!(app.grid_scroll.offset(), root_scroll.offset());
+        assert_eq!(app.grid_scroll.geometry(), root_scroll.geometry());
+        assert_eq!(app.grid_scroll.row_anchor(), Some(2));
+        assert!(app.grid_scroll.reveal_requested());
+        assert_eq!(
+            app.grid_scroll.pending_edge(),
+            Some(super::super::GridScrollIntent::Bottom)
+        );
+    }
+
+    #[test]
     fn prepared_smart_root_restores_accepted_identity_policy_after_different_child() {
         use super::super::file_type_resume::PositionResolution;
         let mut app = crate::app::setup_app_for_test();
@@ -11831,6 +12033,61 @@ mod tests {
         assert_eq!(
             saved_child.resolve(&position),
             PositionResolution::HiddenIdentity
+        );
+    }
+
+    #[test]
+    fn section1409_smart_park_restore_keeps_pinned_local_draft_outside_listing_payload() {
+        for (pin_at_park, pin_at_return) in
+            [(false, false), (true, true), (false, true), (true, false)]
+        {
+            let mut app = crate::app::setup_app_for_test();
+            let definition_id = install_smart_identity_test_root(&mut app, Default::default());
+            app.settings.show_toolbar_search_local = pin_at_park;
+            app.show_search_bar = true;
+            app.search_query = "root draft".into();
+            app.search_filter = Some(HashSet::from([0]).into());
+            let grid = app.take_visible_smart_folder_grid();
+            assert_eq!(
+                app.search_query,
+                if pin_at_park { "root draft" } else { "" }
+            );
+            assert_eq!(
+                grid.temporary_search_query.as_deref(),
+                (!pin_at_park).then_some("root draft")
+            );
+            park_smart_identity_test_root(&mut app, grid);
+            app.search_query = "child draft".into();
+            app.settings.show_toolbar_search_local = pin_at_return;
+            assert!(app.restore_prepared_smart_folder_session(definition_id, None));
+            assert_eq!(
+                app.search_query,
+                if !pin_at_park && !pin_at_return {
+                    "root draft"
+                } else {
+                    "child draft"
+                }
+            );
+            assert!(app.show_search_bar);
+            assert!(app.search_filter.as_ref().unwrap().contains(&0));
+        }
+    }
+
+    #[test]
+    fn section1409_smart_reapply_keeps_current_pinned_draft_and_submitted_query_separate() {
+        let mut app = crate::app::setup_app_for_test();
+        install_smart_identity_test_root(&mut app, Default::default());
+        app.settings.show_toolbar_search_local = true;
+        app.search_query = "new child draft".into();
+        app.smart_folder_local_search_reapply = Some("root submission".into());
+        app.search_target =
+            crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
+        let ctx = egui::Context::default();
+        app.reapply_local_search_after_smart_folder_prepare(&ctx);
+        assert_eq!(app.search_query, "new child draft");
+        assert_eq!(
+            app.search_pending.as_ref().unwrap().submitted.query,
+            "root submission"
         );
     }
 

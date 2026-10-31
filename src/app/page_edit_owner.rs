@@ -284,6 +284,11 @@ impl App {
     }
 
     pub(crate) fn begin_local_page_edit(&mut self, idx: usize) -> bool {
+        // This is new pointer/key/panel input. Accepted producers commit through
+        // the captured-owner save paths and do not enter here again.
+        if self.book_structural_op.is_some() {
+            return false;
+        }
         let Some(owner) = self.capture_page_edit_owner(idx) else {
             return false;
         };

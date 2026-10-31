@@ -1729,8 +1729,8 @@ mod tests {
     fn resolve_pin_target_image_returns_target_metadata() {
         use std::io::Write;
 
-        let tmp = std::env::temp_dir().join(format!("miv_pin_resolve_test_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let tmp = temp.path();
         let img = tmp.join("cover.jpg");
         let mut f = std::fs::File::create(&img).unwrap();
         f.write_all(b"fake-jpeg-bytes").unwrap();
@@ -1753,8 +1753,6 @@ mod tests {
                 .source_id
                 .ends_with(&format!("|{}", b"fake-jpeg-bytes".len()))
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1785,23 +1783,20 @@ mod tests {
 
     #[test]
     fn resolve_pin_target_missing_returns_none() {
-        let tmp =
-            std::env::temp_dir().join(format!("miv_pin_resolve_missing_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let tmp = temp.path();
         let source = FolderPinSource::File {
             rel: "nope.jpg".to_string(),
             kind: FileKind::Image,
         };
         assert!(resolve_pin_target(&tmp, &source).is_none());
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn resolve_pin_target_pdfpage_carries_page_number() {
         use std::io::Write;
-        let tmp =
-            std::env::temp_dir().join(format!("miv_pin_resolve_pdfpage_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let tmp = temp.path();
         let pdf = tmp.join("doc.pdf");
         std::fs::File::create(&pdf)
             .unwrap()
@@ -1815,15 +1810,13 @@ mod tests {
         assert_eq!(resolved.kind, ResolvedKind::PdfPage);
         assert_eq!(resolved.pdf_page, Some(7));
         assert!(resolved.source_id.contains("|7|"));
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn resolve_pin_target_zipentry_in_container_uses_container_path() {
         use std::io::Write;
-        let tmp =
-            std::env::temp_dir().join(format!("miv_pin_resolve_zipentry_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let tmp = temp.path();
         let zip = tmp.join("scans.zip");
         std::fs::File::create(&zip)
             .unwrap()
@@ -1839,15 +1832,13 @@ mod tests {
         assert_eq!(resolved.abs_path, zip);
         assert_eq!(resolved.zip_entry.as_deref(), Some("p01.png"));
         assert!(resolved.source_id.starts_with("zipentry||p01.png|-|"));
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn resolve_pin_target_zipdir_carries_prefix() {
         use std::io::Write;
-        let tmp =
-            std::env::temp_dir().join(format!("miv_pin_resolve_zipdir_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let tmp = temp.path();
         let zip = tmp.join("outer.zip");
         std::fs::File::create(&zip)
             .unwrap()
@@ -1863,16 +1854,13 @@ mod tests {
         assert_eq!(resolved.abs_path, zip);
         assert_eq!(resolved.zip_dir_prefix.as_deref(), Some("bookA/"));
         assert!(resolved.source_id.starts_with("zipdir||bookA/|-|"));
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn cascade_zipdir_follows_child_pin_like_folder() {
         use std::io::Write;
-        let tmp =
-            std::env::temp_dir().join(format!("miv_pin_cascade_zipdir_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let tmp = temp.path();
         let zip = tmp.join("outer.zip");
         std::fs::File::create(&zip)
             .unwrap()
@@ -1903,16 +1891,13 @@ mod tests {
         assert_eq!(resolved.kind, ResolvedKind::ZipEntry);
         assert_eq!(resolved.abs_path, zip);
         assert_eq!(resolved.zip_entry.as_deref(), Some("bookA/page01.jpg"));
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn cascade_zipfile_follows_its_own_page_pin_and_keeps_route_identity() {
         use std::io::Write;
-        let tmp =
-            std::env::temp_dir().join(format!("miv_pin_cascade_zipfile_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let tmp = temp.path();
         let zip_a = tmp.join("book-a.zip");
         let zip_b = tmp.join("book-b.zip");
         for zip in [&zip_a, &zip_b] {
@@ -1959,18 +1944,13 @@ mod tests {
         assert_eq!(depth_zero.kind, ResolvedKind::ZipFirstImage);
         assert_eq!(depth_zero.zip_entry, None);
         assert!(depth_zero.source_id.starts_with("zipfile|book-a.zip|"));
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn cascade_convertible_archive_follows_its_own_page_pin() {
         use std::io::Write;
-        let tmp = std::env::temp_dir().join(format!(
-            "miv_pin_cascade_convertible_archive_{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let tmp = temp.path();
         let archive = tmp.join("book.7z");
         std::fs::File::create(&archive)
             .unwrap()
@@ -2019,16 +1999,13 @@ mod tests {
         assert_eq!(incompatible.kind, ResolvedKind::ArchiveFirstImage);
         assert_eq!(incompatible.abs_path, archive);
         assert!(incompatible.source_id.starts_with("archive|book.7z|"));
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn cascade_pdffile_follows_its_own_page_pin() {
         use std::io::Write;
-        let tmp =
-            std::env::temp_dir().join(format!("miv_pin_cascade_pdffile_{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let tmp = temp.path();
         let pdf = tmp.join("book.pdf");
         std::fs::File::create(&pdf)
             .unwrap()
@@ -2057,8 +2034,6 @@ mod tests {
         assert_eq!(resolved.pdf_page, Some(7));
         assert!(resolved.source_id.starts_with("cascade:"));
         assert!(resolved.source_id.contains(":pdfpage||-|7|"));
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

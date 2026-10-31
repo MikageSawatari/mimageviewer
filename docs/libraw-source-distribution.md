@@ -1,6 +1,6 @@
 ﻿# LibRaw Corresponding Source Distribution
 
-mImageViewer statically links unmodified LibRaw 0.22.2 under CDDL-1.0,
+mImageViewer statically links unmodified LibRaw 0.22.3 under CDDL-1.0,
 with zlib 1.3.1 and the existing libjpeg-turbo static library. No additional
 DLL or executable is distributed. The C ABI shim in `crates/libraw-sys/shim/`
 is MIT-licensed repository code, published with the application source.
@@ -27,7 +27,7 @@ is MIT-licensed repository code, published with the application source.
   with `include_str!` from the tracked root files and viewable in full in About
   through collapsible scroll areas, including for launcher-only downloads.
   The required IJG attribution is visible without expanding a license section.
-- `htdocs/mimageviewer/libraw-0.22.2-source.tar.gz.sha256`: tracked checksum
+- `htdocs/mimageviewer/libraw-0.22.3-source.tar.gz.sha256`: tracked checksum
   of the unmodified official GitHub tag archive used by setup-libraw.sh.
 
 ## Fetch, verify, and stage
@@ -36,18 +36,18 @@ Run these commands in PowerShell from the repository root. They do not launch
 the application. Network access is needed only to fetch the source archive:
 
 ```powershell
-$sourceArchive = Join-Path $PWD 'vendor\libraw\LibRaw-0.22.2.tar.gz'
+$sourceArchive = Join-Path $PWD 'vendor\libraw\LibRaw-0.22.3.tar.gz'
 New-Item -ItemType Directory -Force (Split-Path $sourceArchive) | Out-Null
-Invoke-WebRequest -Uri 'https://github.com/LibRaw/LibRaw/archive/refs/tags/0.22.2.tar.gz' -OutFile $sourceArchive
-$checksumFile = 'htdocs\mimageviewer\libraw-0.22.2-source.tar.gz.sha256'
+Invoke-WebRequest -Uri 'https://github.com/LibRaw/LibRaw/archive/refs/tags/0.22.3.tar.gz' -OutFile $sourceArchive
+$checksumFile = 'htdocs\mimageviewer\libraw-0.22.3-source.tar.gz.sha256'
 $expectedHash = ((Get-Content -Encoding ASCII $checksumFile).Trim() -split '\s+')[0]
 $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceArchive).Hash
 if ($actualHash -ne $expectedHash) { throw 'LibRaw source checksum mismatch; do not publish.' }
-Copy-Item -LiteralPath $sourceArchive -Destination 'htdocs\mimageviewer\libraw-0.22.2-source.tar.gz'
+Copy-Item -LiteralPath $sourceArchive -Destination 'htdocs\mimageviewer\libraw-0.22.3-source.tar.gz'
 ```
 
 Expected SHA-256:
-`627928088300ecde6ca91ffd202e189203f04ad61ad12f0fe9dc57b9a7a0fb3c`.
+`7edf96c5b70cff88980a02ab0fc8af125cb6a4a377985573c654439d9d02355c`.
 An already downloaded setup archive can be reused: omit `Invoke-WebRequest`
 but still perform the checksum comparison before copying. Do not recompress,
 edit, or regenerate the archive. On a mismatch, investigate before changing
@@ -56,7 +56,7 @@ the pinned checksum; a checksum mismatch is not permission to accept new bytes.
 ## Publish and retain
 
 The release lead publishes the staged archive using the normal website
-deployment, at `https://mikage.to/mimageviewer/libraw-0.22.2-source.tar.gz`.
+deployment, at `https://mikage.to/mimageviewer/libraw-0.22.3-source.tar.gz`.
 Before release, download the published bytes and verify the same SHA-256.
 Keep the matching source available while that application build is distributed,
 including after a later LibRaw update. Preserve the exact published archive

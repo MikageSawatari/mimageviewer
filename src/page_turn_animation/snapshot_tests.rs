@@ -26,6 +26,7 @@ enum SceneGeometry {
     SpineEdge,
     FixedSingleSpine,
     ResidentQuality,
+    Crop,
 }
 
 impl SceneGeometry {
@@ -39,6 +40,7 @@ impl SceneGeometry {
             Self::SpineEdge => "spine_edge_",
             Self::FixedSingleSpine => "fixed_spine_",
             Self::ResidentQuality => "resident_quality_",
+            Self::Crop => "crop_",
         }
     }
 
@@ -266,6 +268,7 @@ fn units(textures: &SceneTextures, spread: bool, cell: Rect) -> (CanonicalUnit, 
             &textures.old[slot as usize]
         }),
         underlay: Some(material(&textures.checker)),
+        crop: None,
     };
     let unit = |incoming| CanonicalUnit {
         pixels_per_point: 1.0,
@@ -318,6 +321,13 @@ fn paint_canonical(painter: &egui::Painter, unit: &CanonicalUnit) {
                 Color32::WHITE,
             );
         }
+        if let Some(crop) = page.crop {
+            for draw in project_flat_crop(page.rect, page.clip_rect, &rectangle(page.rect), crop) {
+                painter
+                    .with_clip_rect(draw.clip_rect)
+                    .add(egui::Shape::mesh(draw.mesh));
+            }
+        }
     }
 }
 
@@ -344,7 +354,8 @@ fn snapshot_scene(
     // have been consumed. No texture lifetime is inferred from a texture id.
     let mut textures = None;
     let mut normal_textures = None;
-    let mut harness = crate::test_ui::builder().with_size(SIZE).build(move |ctx| {
+    let mut harness = crate::test_ui::builder().with_size(SIZE).build_ui(move |root_ui| {
+let ctx = &root_ui.ctx().clone();
         if textures.is_none() {
             crate::ui_fonts::configure_fonts(ctx);
             let opaque = matches!(geometry, SceneGeometry::OpaqueBlack | SceneGeometry::FixedSingleSpine);
@@ -411,9 +422,19 @@ fn snapshot_scene(
                         page.rect = Rect::from_center_size(center, vec2(page.rect.width(), 184.0));
                     }
                 }
-                SceneGeometry::Equal | SceneGeometry::PortraitPdf | SceneGeometry::OpaqueBlack | SceneGeometry::SpineEdge | SceneGeometry::FixedSingleSpine | SceneGeometry::ResidentQuality => {}
+                SceneGeometry::Equal | SceneGeometry::PortraitPdf | SceneGeometry::OpaqueBlack | SceneGeometry::SpineEdge | SceneGeometry::FixedSingleSpine | SceneGeometry::ResidentQuality | SceneGeometry::Crop => {}
             }
             let mut old = old;
+            if matches!(geometry, SceneGeometry::Crop) {
+                for unit in [&mut old, &mut new] {
+                    for page in &mut unit.pages {
+                        page.crop = Some(PageCropPaint {
+                            full: rectangle(unit_uv()).try_into().unwrap(),
+                            corners: rectangle(Rect::from_min_max(pos2(0.16, 0.21), pos2(0.82, 0.75))).try_into().unwrap(),
+                        });
+                    }
+                }
+            }
             if matches!(geometry, SceneGeometry::TallerIncoming) {
                 for page in &mut old.pages {
                     page.rect = Rect::from_center_size(page.rect.center(), vec2(page.rect.width(), 184.0 / 1.5));
@@ -474,7 +495,7 @@ fn snapshot_scene(
                 "One leaf rotates at the spine; checker stays under transparent print. Last pose = canonical incoming."
             },
             egui::FontId::monospace(12.0), Color32::from_rgb(206, 216, 228));
-    });
+     });
     harness.run();
     harness.snapshot(&name);
     let projected = harness.render().unwrap();
@@ -536,6 +557,7 @@ fn moving_spine_units(textures: &SceneTextures, cell: Rect) -> (CanonicalUnit, C
                         &textures.old[slot]
                     }),
                     underlay: Some(material(&textures.checker)),
+                    crop: None,
                 })
                 .collect(),
         }
@@ -558,7 +580,8 @@ fn snapshot_moving_spine(reading_rtl: bool, forward: bool) -> egui_kittest::Snap
     let mut textures = None;
     let mut harness = crate::test_ui::builder()
         .with_size(vec2(1324.0, 520.0))
-        .build(move |ctx| {
+        .build_ui(move |root_ui| {
+let ctx = &root_ui.ctx().clone();
             if textures.is_none() {
                 crate::ui_fonts::configure_fonts(ctx);
                 textures = Some(load_textures(ctx, false, false));
@@ -623,7 +646,7 @@ fn snapshot_moving_spine(reading_rtl: bool, forward: bool) -> egui_kittest::Snap
                 egui::FontId::monospace(12.0),
                 Color32::from_rgb(206, 216, 228),
             );
-        });
+         });
     harness.run();
     harness.snapshot(&name);
     let projected = harness.render().unwrap();
@@ -922,6 +945,7 @@ fn spread_window_fixture(
                         &pair.old[slot]
                     }),
                     underlay: Some(material(&pair.checker)),
+                    crop: None,
                 })
                 .collect(),
         };
@@ -973,6 +997,7 @@ fn spread_window_fixture(
                 },
                 material_rotation,
             )),
+            crop: None,
         }],
     }
 }
@@ -1001,7 +1026,8 @@ fn snapshot_single_portrait_landscape(
     let mut landscape_textures = None;
     let mut harness = crate::test_ui::builder()
         .with_size(vec2(1550.0, 302.0))
-        .build(move |ctx| {
+        .build_ui(move |root_ui| {
+let ctx = &root_ui.ctx().clone();
             if portrait_textures.is_none() {
                 crate::ui_fonts::configure_fonts(ctx);
                 portrait_textures = Some(load_textures(ctx, false, false));
@@ -1143,7 +1169,7 @@ fn snapshot_single_portrait_landscape(
                 egui::FontId::monospace(12.0),
                 Color32::from_rgb(206, 216, 228),
             );
-        });
+         });
     harness.run();
     harness.snapshot(&name);
     let projected = harness.render().unwrap();
@@ -1399,7 +1425,8 @@ fn snapshot_spread_windows(
     let mut landscape_textures = None;
     let mut harness = crate::test_ui::builder()
         .with_size(vec2(1550.0, 64.0 + rows as f32 * HEIGHT))
-        .build(move |ctx| {
+        .build_ui(move |root_ui| {
+            let ctx = &root_ui.ctx().clone();
             if pair_textures.is_none() {
                 crate::ui_fonts::configure_fonts(ctx);
                 pair_textures = Some(load_textures(ctx, false, false));
@@ -1603,7 +1630,8 @@ fn snapshot_white_paper(reading_rtl: bool, forward: bool) -> egui_kittest::Snaps
     let mut textures = None;
     let mut harness = crate::test_ui::builder()
         .with_size(vec2(SIZE.x, 530.0))
-        .build(move |ctx| {
+        .build_ui(move |root_ui| {
+            let ctx = &root_ui.ctx().clone();
             if textures.is_none() {
                 crate::ui_fonts::configure_fonts(ctx);
                 textures = Some(load_textures(ctx, true, false));
@@ -1767,3 +1795,11 @@ route_test!(
     true,
     false
 );
+
+#[test]
+fn page_turn_projection_snapshot_crop_flat_front_back_canonical() {
+    let mut snapshots = egui_kittest::SnapshotResults::default();
+    snapshots.extend(snapshot_scene(false, false, true, SceneGeometry::Crop));
+    snapshots.extend(snapshot_scene(true, true, true, SceneGeometry::Crop));
+    snapshots.unwrap();
+}

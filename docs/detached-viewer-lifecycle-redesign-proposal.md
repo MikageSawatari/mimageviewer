@@ -225,6 +225,8 @@ DPI 変化・多窓のすべてで滑る。`candidate=none` が 4 本のログ�
 **あるべき前提**: ある ViewportId の **OS 窓が初めて生成される builder では、必ず最終 placement を
 渡す**。生成と配置を別フレームに分けない。「未確定だから placement を渡さない」holdover/inactive
 builder が DetachedWindow に存在すること自体が誤り。
+§1.384 では物理外枠を正本とし、builder は対象 DPI での仮配置、HWND 登録時の適用を確定境界にする。
+passive は既存の可視化を保ち、採用時に適用する。
 
 ---
 
@@ -307,6 +309,7 @@ Phase B の `detached_passive_placement_update_looks_like_default_viewport`（80
 **あるべき前提**: placement の **single source of truth を window_id ごとに 1 つ**持つ
 (`WindowRuntime.placement`)。settings は「最後にユーザーが置いた位置」を永続するだけ、
 snapshot/active はその runtime を参照するだけ。ヒューリスティック拒否は不要にする。
+§1.384 の runtime・restore・新保存値の単位は物理外枠とし、登録時の適用を一か所へ集約する。
 
 ---
 

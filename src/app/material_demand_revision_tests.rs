@@ -150,6 +150,7 @@ fn material_demand_revision_existing_ai_outcomes_do_not_hydrate_input() {
                 app.final_ai_cache.insert(
                     key,
                     FinalAiEntry {
+                        diagnostic_metadata: None,
                         canonical_dims: Some(CanonicalPageDimensions::new(1200, 1800)),
                         source_size: [4, 6],
                         pixels: Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::WHITE)),
@@ -162,6 +163,7 @@ fn material_demand_revision_existing_ai_outcomes_do_not_hydrate_input() {
                 app.final_ai_pending.insert(
                     key,
                     FinalAiPending {
+                        feedback_request: crate::app::FinalAiFeedbackRequest::default(),
                         job_id: 9001,
                         cancel: Arc::new(AtomicBool::new(true)),
                         retained_key: None,
@@ -336,13 +338,15 @@ fn material_demand_revision_ready_local_stage_and_inactive_layers_need_no_origin
             );
             let key = app.current_local_adjust_key(0);
             app.local_adjust_cache
-                .insert(key, LocalAdjustCacheEntry { pixels, texture });
+                .insert(key, LocalAdjustCacheEntry::raster(pixels, texture));
         }
         app.settings.ai_feature_mode = crate::settings::AiFeatureMode::Disabled;
         app.settings.global_preset.upscale_model = None;
         app.comic_font_registry_loaded = true;
-        app.comic_fonts_loaded = true;
-        app.comic_fonts = Some(Arc::new(comic_core::FontSet::new()));
+        app.comic_fonts.seed_for_test(
+            Some(Arc::new(comic_core::FontSet::new())),
+            Default::default(),
+        );
         app.editing_addon_declined_session = true;
         app.show_whats_new = false;
         app.show_mouse_nav_migration_prompt = false;
@@ -412,6 +416,8 @@ fn material_demand_revision_native_pdf_ai_target_precedes_fit_size_rejection() {
     app.fs_cache.insert(
         0,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
+            pdf_metadata: None,
             tex: texture,
             pixels,
             source_dims: Some([1200, 1800]),
@@ -455,6 +461,7 @@ fn material_demand_revision_cached_ai_supplies_effect_without_edit_hydration() {
         app.final_ai_cache.insert(
             ai_key,
             FinalAiEntry {
+                diagnostic_metadata: None,
                 canonical_dims: Some(CanonicalPageDimensions::new(1200, 1800)),
                 source_size: [4, 6],
                 pixels: Arc::clone(&pixels),

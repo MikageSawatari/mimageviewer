@@ -45,7 +45,22 @@ namespace Miv.UiSmoke.ButtonHelperDraft
             Console.WriteLine("RUN MouseInputAbiIsOneExactTaggedEdge");
             MouseInputAbiIsOneExactTaggedEdge();
             passed++;
+            Console.WriteLine("RUN InputTraceIsBoundedAndIsolatedWithoutNativeInput");
+            InputTraceIsBoundedAndIsolatedWithoutNativeInput();
+            passed++;
             return passed;
+        }
+
+        private static void InputTraceIsBoundedAndIsolatedWithoutNativeInput()
+        {
+            ButtonInputDiagnosticTrace first = new ButtonInputDiagnosticTrace();
+            ButtonInputDiagnosticTrace sibling = new ButtonInputDiagnosticTrace();
+            for (int i = 0; i < 10; i++) first.Record("fake-" + i);
+            string text = first.Snapshot();
+            if (!text.StartsWith("dropped=2;") || !text.Contains("fake-7") || text.Contains("fake-8"))
+                throw new Exception("input diagnostic trace was not bounded");
+            if (sibling.Snapshot() != "dropped=0;")
+                throw new Exception("input diagnostic trace affected another helper");
         }
 
         private static void NormalPolicyRejectsOwnerReceiverAndStateMismatches()

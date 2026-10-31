@@ -83,8 +83,10 @@ fn composite_pixels_revision_final_pair_navigation_capture_survives_retained_cpu
 pub(crate) fn seed_annotation(app: &mut App, source_dims: [usize; 2]) {
     // A filled bubble needs no font or stamp I/O, but uses the real annotation compositor.
     app.comic_font_registry_loaded = true;
-    app.comic_fonts_loaded = true;
-    app.comic_fonts = Some(Arc::new(comic_core::FontSet::new()));
+    app.comic_fonts.seed_for_test(
+        Some(Arc::new(comic_core::FontSet::new())),
+        Default::default(),
+    );
     let bubble = comic_core::BubbleObject {
         shape: comic_core::BubbleShape::RoundRect {
             half_w: source_dims[0] as f32 / 4.0,
@@ -139,6 +141,8 @@ fn composite_pixels_revision_annotation_display_and_export_preserve_canonical_ba
         app.fs_cache.insert(
             0,
             FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels: raw,
                 source_dims: Some(source_dims),
@@ -265,6 +269,8 @@ fn composite_pixels_revision_animated_source_still_rejects_live_final_pixels() {
     app.fs_cache.insert(
         0,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
+            pdf_metadata: None,
             tex,
             pixels,
             source_dims: Some([4, 6]),
@@ -321,7 +327,7 @@ fn composite_pixels_revision_readers_consume_only_their_own_live_pixels() {
             Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::BLUE)),
         ));
         owner.prefetch_retained_paged_composites(&ctx, 19);
-        complete_pending_composites(owner, &ctx);
+        super::paged_prefetch_tests::complete_pending_composites_for_display(owner, &ctx);
         evict_pair_cpu(owner);
     });
     app.with_window_context_for_test(sibling, |owner| {

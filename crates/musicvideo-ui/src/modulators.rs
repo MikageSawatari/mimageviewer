@@ -55,9 +55,12 @@ pub(crate) fn draw_modulators(
                     .id_salt(modulator.id.0)
                     .default_open(index == 0)
                     .show(ui, |ui| {
+                        let input_enabled = ui.is_enabled();
                         changed |=
-                            egui_ime::add_singleline(ui, &mut modulator.name, None, |edit| edit)
-                                .changed();
+                            egui_ime::add_singleline(ui, &mut modulator.name, None, |edit| {
+                                edit.interactive(input_enabled)
+                            })
+                            .changed();
                         changed |= edit_source(ui, modulator, state, calibrations);
                         ui.add(
                             egui::ProgressBar::new(live)
@@ -213,15 +216,16 @@ fn edit_source(
                 *inputs = NoteInputs::new(*low_midi, *high_midi);
             }
             let mut text_changed = false;
+            let input_enabled = ui.is_enabled();
             ui.horizontal(|ui| {
                 ui.label("下限");
                 text_changed |= egui_ime::add_singleline(ui, &mut inputs.low, None, |edit| {
-                    edit.desired_width(56.0)
+                    edit.interactive(input_enabled).desired_width(56.0)
                 })
                 .changed();
                 ui.label("上限");
                 text_changed |= egui_ime::add_singleline(ui, &mut inputs.high, None, |edit| {
-                    edit.desired_width(56.0)
+                    edit.interactive(input_enabled).desired_width(56.0)
                 })
                 .changed();
                 ui.weak("例: C1–B1 / C#4");

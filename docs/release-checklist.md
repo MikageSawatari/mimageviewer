@@ -45,8 +45,8 @@
   保存済みセクション順は維持し、描画対象だけを除外する。通常版のbundle欠落は表示で隠さない。
   設計・保守方針 (CI guard 等) は [docs/portable-build-plan.md](portable-build-plan.md)。
   `portable` feature の cfg 分岐は `.git/hooks/pre-push` の `cargo check --features portable` が番人。
-- **EffeTune 配布境界**: 単体exe版／インストーラ版は承認済み v0.13.0 の VERSION と全448ファイルを
-  `third_party/effetune-mixwright/v0.13.0/manifest.sha256` に固定し、署名前とlauncher build時に欠落・追加・
+- **EffeTune 配布境界**: 単体exe版／インストーラ版は承認済み v0.14.0 の VERSION と全462ファイルを
+  `third_party/effetune-mixwright/v0.14.0/manifest.sha256` に固定し、署名前とlauncher build時に欠落・追加・
   改変を拒否する。署名stageは固定target配下だけ許可し、PEのchecksum／証明書以外は原本と同一、
   指定発行元の有効署名があることも検証する。未署名の開発buildはraw原本の完全一致が必要。
   launcherは `runtime/<version>/effetune/<hash12>-<generation>/EffeTune Mixwright.vst3/` に
@@ -67,7 +67,7 @@
   音響調整ボタンで既存load workerから再確認し、拒否世代とは別の公開済み世代だけ採用する。
   成功時も選択したgenerationをenvで渡し、coreはそのpathを一度解決して固定する。
   メタデータを保持した内容改変は既存asset shortcutと同様に検出範囲外。
-  通知原文とmanifestは `third_party/effetune-mixwright/v0.13.0/` に追跡し、`.gitattributes -text`で
+  通知原文とmanifestは `third_party/effetune-mixwright/v0.14.0/` に追跡し、`.gitattributes -text`で
   checkout時の改行変換を防ぐ。
 - **CRT 境界**: `.cargo/config.toml` で mIV 自身の x86_64 exe と Susie ワーカー (i686) は
   `+crt-static` を維持する。一方、Microsoft build の ONNX Runtime は動的 VC runtime を import
@@ -195,7 +195,9 @@
    (回避方法が変わっていないか)。**掲載が 0 件になったら「現時点で把握している不具合はありません。」
    と明記する** (見出しごと消さない。ページが空だと「更新が止まった」と読まれるため)。
    - 載せる基準: ①通常の操作で遭遇し得る ②不具合だと思う見た目をしている ③回避策があるか
-     「環境のせいではない」と言える ④次の版で直らない。backlog の大半は設計上の負債なので載せない。
+     「環境のせいではない」と言える。次の版で直す予定の不具合も、公開中の版で起きる間は載せ、
+     「次のバージョンで修正します。」と書く (版番号は書かない。直した版の公開時にこのステップで削除する)。
+     backlog の大半は設計上の負債なので載せない。
    - **このステップを飛ばすとページが腐る**。以前ページを置いたときに放置されて消えた経緯がある。
 6.6. **サイトマップを再生成** — htdocs の編集がすべて終わったら
    `python scripts/gen-sitemap-xml.py` を実行して `htdocs/sitemap.xml` を作り直し、
@@ -257,6 +259,10 @@
     リリース前に [docs/libraw-source-distribution.md](libraw-source-distribution.md) の SHA-256 と
     同梱版を照合し、LibRaw の対応ソースを mikage.to に配置する。installer / portable に
     `LIBRAW-LICENSE.txt` / `ZLIB-LICENSE.txt` / `LIBJPEG-TURBO-LICENSE.txt` が入ることも確認する。
+10.2. AVIF 依存更新確認（エージェント用 `bash scripts/setup-libavif.sh check`）。
+    `vendor/libavif/VERSION` と静的ライブラリの組合せを照合し、AVIF fixture gate を確認する。
+    installer / portable に `LIBAVIF-LICENSE.txt` / `DAV1D-LICENSE.txt` /
+    `LIBYUV-LICENSE.txt` の全文が入ることを確認する。
 11. VST3 host bridge の確認 (v0.9.0+):
     - `vendor/vst3sdk/` が配置済み (`bash scripts/setup-vst3-sdk.sh`)
     - `vendor/vst3-host/mimageviewer-vst3-host.exe` が最新の C++ ソースでビルド済み
@@ -268,11 +274,19 @@
     ※ `vendor/` 直下の必須ファイルは `build.rs` で起動時にチェックしており、
       不足していると `cargo build` が復旧手順付きで止まるようになっている。
 
-9.5. **bench 回帰チェック** (検索周りに変更を入れたリリースで実施):
+9.5. **bench 回帰チェック** (検索周りに変更を入れたリリース、または Rust toolchain (`rust-toolchain.toml`) や tantivy を上げたリリースで実施):
    ```bash
    cargo run --release --features dev-tools --bin bench_search -- --docs 50000 --json /tmp/bench_new.json
    python scripts/check_bench_regression.py vendor/bench_baseline.json /tmp/bench_new.json
    ```
+   - 経緯: backlog §1.424 (v4.8.1 で出荷後に削除。調査の全文は commit `94017f82e` の `docs/next-release-backlog.md`、要約は `vendor/tantivy/MIV-PATCH.md`) で Rust 1.95 以降の 2 語の AND の採点が遅くなったため、toolchain・tantivy 更新時も確認する。
+   - toolchain・tantivy を上げたときは、bench に加えて製品本体の生成コードも確かめる (bench の bin と製品 exe で展開のされ方が違い、bench だけでは見落とすため)。
+     `CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --bin mimageviewer-core --target-dir target/core-sym` の後、
+     `dumpbin /disasm:nobytes target/core-sym/release/mimageviewer-core.exe` で、`tantivy::query::intersection` の `Intersection` に対する `Scorer` 実装の `score` (型引数 `TermScorer` 版と `Box<dyn Scorer>` 版) と、MIV 改変の `score_out_of_line` を探し、
+     `unpcklps`/`addps`/`divps` (左右 2 語を SIMD でまとめた形) が無いことを確かめる。
+     `impl$N` の番号は上流の変更で変わる (0.26.2 は `impl$3`、0.27.0 は `impl$5`) ので、番号ではなく名前空間と型引数で探す。
+     0.27.0 での照合の手順と結果は [依存物の更新記録 2026-10-28](dependency-update-20261028.md) の段 C を参照。
+   - bench は、ほかの build / test が動いていない状態で測る。並行ビルドの負荷で、無関係の query まで +80% 以上ぶれた例がある (2026-10-28)。
    - 初回 (vendor/bench_baseline.json の queries が空) は `--save` で baseline を登録:
      `python scripts/check_bench_regression.py --save vendor/bench_baseline.json /tmp/bench_new.json`
    - 既存 baseline と比較して **+30% 超 かつ +1.0ms 超の劣化**で exit 1。原因を切り分けてから先に進む。
@@ -325,6 +339,8 @@
      最大 16 秒)。判定は**大きいギャップ 1 件ずつ、直前の `ui.tail_repaint.action`** を見る:
      - `none` = repaint を要求していない (= 入力待ちで就寝) → **正常**
      - `request_repaint_after_idle_upgrade` の遅延 wake → 予定遅延との一致を確認した場合は**正常**
+       （通常ビルドの手動 `perf_smoke` ログにはwait witnessがないため、予定より早い起床は `unexplained` のまま。
+       test-script診断版の `normal-proven-wait` は自動化計画§5の待機証跡が揃う場合だけ）
      - 上記以外で 100ms を超える → UI スレッド同期 I/O 退行の疑い
        (docs/ui-responsiveness.md §4)
    - 遅いupdate自体はtail=`none`でも検査する。既知startup gapを認める場合も、
@@ -404,11 +420,22 @@
    ```powershell
    .\scripts\test-full.ps1
    ```
-   - `cargo test --workspace --features pack-build-tools --no-fail-fast` で、workspace全体と
-     単体テストを持つ補助bin 2本を同じlib buildとして実行する。
+   - `cargo nextest run --workspace --features pack-build-tools` で、workspace全体のlib・bin・integrationと
+     単体テストを持つ補助bin 2本を同じlib buildとして実行する。workspace外のvendor 4 crateも
+     従来と同じgraph・featureで無filterのlib testを実行する。
+   - nextest対象外のdoctestは `cargo test --workspace --features pack-build-tools --doc --no-fail-fast`
+     を別段で必ず実行する。各段失敗で後段を止め、retryは0、既存ignored以外の全件を実行する。
+     nextest未導入時は `cargo install cargo-nextest --locked` を案内して非ゼロ終了する。
+     共通引数・vendor graphの詳細は [開発ビルドとテスト](development-build-and-test.md#リリースゲート) を参照。
    - `build-dist.ps1` が clean 前に自動実行するため、通常は配布ビルドとは別に実行不要。
    - `build-dist.ps1 -SkipRustTests` は、同一ソースが既にこのゲートを通過し、署名や
      packaging だけを再試行する場合に限る。ソース変更後の初回配布では使わない。
+   - **`test-script` feature の lib テストも回す** (上の全体ゲートは既定 feature だけで、この feature の
+     テストは入らない。2026-10 に 2 件が気づかれないまま落ちていた、backlog §1.392):
+     ```powershell
+     .\scripts\test-lib-full.ps1 -Features test-script
+     ```
+     同じソース・環境で成功済みなら記録を返して再実行しない。失敗したら公開前に直す。
 
 ### Phase 3: ビルド・配布成果物
 
@@ -430,8 +457,12 @@
       でないと APPDATA へ展開されたコピーが未署名になり、AV 誤検知
       ([docs/release-operations.md](release-operations.md) §7) が
       再発する。`onnxruntime*.dll` は Microsoft 署名済みなので**再署名しない**、`*.onnx` は PE でないので対象外。
-      **前提: 署名前に SimplySign Desktop を起動しログインしておく** (未ログインなら clean 前に `Assert-MivSignReady`
-      で即停止)。署名なしで配布物を作るなら `.\scripts\build-dist.ps1 -NoSign`。実装は `scripts\sign-files.ps1`
+      **前提: 署名前に SimplySign Desktop を起動しログインしておく**。clean／build前の `Assert-MivSignReady` は
+      証明書確認に加え、実行中のPowerShell host exeの一時コピーへ署名・タイムスタンプ取得・検証を行い、
+      鍵が使えない失敗とTSAへ到達できない失敗を区別して停止する。一時コピーは失敗時も削除する。
+      通常は数秒だがsigntoolが数分停止する場合もあり、build中のセッション切れまでは防げない
+      （[署名の注意点](release-operations.md#4-コード署名-v230-以降全配布-pe)）。
+      署名なしで配布物を作るなら `.\scripts\build-dist.ps1 -NoSign`。実装は `scripts\sign-files.ps1`
       (証明書選択は既定 subject `/n "Open Source Developer Taku Sano"`。証明書更新で拇印を固定したいときは
       `$env:MIV_SIGN_SHA1`、TS 変更は `$env:MIV_SIGN_TS`)。ポータブルの vst3-host は署名対応後も当面**非同梱据え置き**。
     - **通常の開発反復は `.\scripts\build-dev.ps1`**。通常feature set（portableなし）を

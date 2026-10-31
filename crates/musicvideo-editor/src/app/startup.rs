@@ -112,11 +112,11 @@ impl MusicVideoLabApp {
         }
     }
 
-    pub(super) fn draw_host_notices(&mut self, ctx: &egui::Context) {
+    pub(super) fn draw_host_notices(&mut self, root_ui: &mut egui::Ui) {
         if self.host.notices.is_empty() {
             return;
         }
-        egui::TopBottomPanel::top("musicvideo-startup-notices").show(ctx, |ui| {
+        egui::Panel::top("musicvideo-startup-notices").show(root_ui, |ui| {
             let mut dismiss = false;
             ui.horizontal(|ui| {
                 ui.label("音楽ビデオからのお知らせ");

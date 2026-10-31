@@ -22,6 +22,12 @@
 - **§1.328 の重複を解消 (2026-10-05)**。2026-10-04 に 2 セッションが同じ番号を取った。先に起票した
   master の「ZIP から戻ったときの選択復元」を §1.328 に残し、後から起票した next-file-ops の
   「動画・音声の再生位置バー」を §1.333 へ振り直した。2026-10-04〜05 の記録の §1.328 はどちらかを文脈で読む。
+- **§1.407 の重複を解消 (2026-10-20)**。2026-10-20 に 2 セッションが同じ番号を取った。master に先に入り利用者も
+  目にしていた「AVIF を専用ライブラリで内蔵デコードする」を §1.407 に残し、dpi-placement-1384 で起票した
+  「メインから開く全画面の窓の配置」を §1.408 へ振り直した。dpi-placement-1384 の 733624656〜0748b0879 の
+  コミットメッセージに残る §1.407 は §1.408 を指す。
+- **ファイルをまたぐ番号の重複 (2026-10-21 に確認、振り直していない)**: §1.334 (本ファイル = zip_loader テストの共有キャッシュ /
+  保留側 = MIDI 再生) と §1.252 (本ファイル = UI フォントプレビューの debounce / 保留側 = 動画字幕)。記録の §1.334 / §1.252 は文脈で読む。
 - **設計の正本を個別の plan へ移した項目も、バックログのどちらかに節を残す**。作業候補の
   一覧はこのファイルと [backlog-on-hold.md](backlog-on-hold.md) の 2 つだけで見ているので、
   plan にしか無い項目は存在ごと見落とす。plan が正本のときは、ここには現状と残りだけを
@@ -32,6 +38,372 @@
 
 ## 1. 優先候補
 
+### v4.10.0 で出荷した 5ch 由来の項目と、報告者への案内 (2026-10-30)
+
+v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち、5ch の報告・要望から来たもの。案内したら行を消す。
+- §1.470 キーで段階的に拡大・縮小 (>>639): 返信済み。ただし返信では「+ / − で拡大・縮小」と案内した。出荷した既定は `.` (拡大) / `,` (縮小) / テンキー + −。利用者の判断で日本語配列での位置を理由に変えたので、案内するときに既定キーを書く。
+- §1.461 通常フォルダの画像でもページめくり (>>571・>>637): >>638 で「次のリリースで対応」と回答済み。出荷の案内は未。
+- §1.456 一覧の名前の文字サイズ・最大行数 (>>629): 出荷の案内は未。
+- §1.480 画像フォルダを Enter で開くと自動表示が ON でもページ一覧で止まる (>>649 の調査中に開発側で発見、v4.2.0 から): >>649 の評価フィルタの件は開発側で再現しなかった。報告者へは未返信。
+
+### 1.666 v4.10.0でも突然終了する・読み取りアクセス違反の報告 — 5ch >>655・657・672 (2026-10-31)
+
+- 状態: **原因調査候補・詳細調査は開発用セッションへ引き継ぐ**。[>>672](https://egg.5ch.io/test/read.cgi/software/1782419551/672) は名前欄「655」で「最新版でも突然死がおきました」と報告し、v4.10.0のnative例外ログ1行を提供した。このセッションでは原文・既存調査・ログ出力実装の軽い確認のみ行い、配布exeの解析・再現試験・修正は行っていない。
+- 経緯: >>655は約30画像のZIPでAI「高速汎用」の完了前にホイールで約10ページ送ると砂時計になって終了するとの報告。「先読みバッファをオーバー」は報告者の仮説。>>657はv4.9.0のイベントログ（例外 `0xc0000005`、障害offset `0x540a947`、Windows 11 Home 25H2・RAM32GB）。>>672は同じ報告者の追加証拠だが、その回の操作・素材・設定は未記載で、同じ手順・原因だったと断定しない。
+- >>672の原文ログ（書き換えず保存）:
+
+  ```text
+  [SystemTime { intervals: 134378486407355883 }] NATIVE EXCEPTION chance=first code=0xC0000005 flags=0x00000000 address=0x7ff70fe3dbc7 thread=45376 access=read target=0x18 version=4.10.0 exe_base=0x7ff70a880000 ntdll_base=0x7ffb510a0000
+  ```
+
+- 軽い確認: `address - exe_base = 0x055bdbc7`。無効な低アドレス `0x18` の読み取りで、NULL近傍の参照は候補だが、解放済みメモリ・破損等を含め原因は未確定。`src/native_exception_log.rs` はfirst-chanceで記録して `EXCEPTION_CONTINUE_SEARCH` を返すため、この1行だけでは未処理の致命的例外や最終終了地点の証明にならない。以前のGPU / VRAM不足やAIキャンセル仮説を確定原因に格上げしない。[Microsoftのアクセス違反の説明](https://learn.microsoft.com/en-us/shows/inside/c0000005)も参照。
+- 調査の最初の作業: **実際に配布したv4.10.0のcore exeと一致するPDB**を開発側の保管物から探し、PEのイメージ範囲・PDBの識別情報を照合して `0x055bdbc7` を関数・ソース行・命令へ逆引きする。現在のビルドや別版のPDBは代用しない。v4.9.0の旧offsetとの比較も各版に一致するexe/PDBで行う。該当箇所の処理・所有期間・非同期完了や破棄の順序を調べ、手元に残る終了ログ／通常・性能ログがあれば時刻を照合する。追加の利用者確認は、その結果で調査方針が変わる最小限に限る。
+- 既存調査との関係: ブランチ `ai-crash-655` の `docs/ai-crash-655-investigation.md` に、v4.9.0と当時HEAD各10回のheadless試験で未再現という記録がある。実画面・GPU texture upload・VRAM競合を試した結果ではないため、その範囲を除外しない。再現・原因と修正案を分けて報告し、実画面試験には事前承認と使い捨てポータブルを使う。原因未確定のままAI無効化・先読み縮小等で出荷機能を削らない。
+- §1.482は「異常終了の理由を利用者に表示する」診断機能の項目で、この終了原因の調査とは分ける。関連: `src/native_exception_log.rs`、`src/ai/` とfinal AIの要求・取消・回収経路、[表示パイプライン](display-pipeline.md)。規模: 原因調査後に確定 / P2。担当セッションへの実依頼・対外返信は未実施。
+
+### 1.664 Everything検索から直接開いた本を閉じると、検索結果ではなくページ一覧へ戻る — 5ch >>671 (2026-10-31)
+
+- 状態: **未着手・不具合修正として採用 (利用者方針 2026-10-31)**。[>>671](https://egg.5ch.io/test/read.cgi/software/1782419551/671) は、本の表示モードを「開いたとき、ページを表示」にすると、Everything検索結果からは設定どおりページを開くが、本を閉じると検索結果ではなくページ一覧になるという報告。閉じる入力とビューワモードは報告に記載なし。コード上は通常の閉じるでも到達する経路を確認したが、実アプリ再現試験・修正は未実施。リリース時期は未指定。
+- 原因 (v4.10.0 と現行masterのコードを確認): `auto_open_for_current_container` は `global_search.active` / `favsearch.active` / `tag_view.active` の間 false を返す。検索から実フォルダの親へ飛ぶのを防ぐ既存の除外条件がEverythingにも適用され、`handle_fullscreen_close_request` が親一覧への復帰要求を立てず、画像表示だけを閉じて現在の本のページ一覧を残す。`resolve_close_return_navigation` にもEverythingの結果復帰先は含まれていない。
+- 期待する動作: Everything検索結果から本を直接ページ表示した場合、通常の閉じる（Esc・Enterの閉じる操作・HUDの×等）では元の検索結果へ戻す。Backspaceで明示的にページ一覧へ戻す操作、および「開いたとき、ページ一覧を表示」の動作は維持する。複数ウィンドウでメインの検索結果を残して独立閲覧している場合も、その一覧を不要に置き換えない。
+- 方針: 検索中の除外条件を外すだけの修正にはしない。既存 `SearchAccepted::Everything` の `PhysicalChild` と `EverythingReturn::Results` / `return_from_everything_child` が保持する論理的な本・戻り先・採用済みdatasetを、通常の閉じる要求から使う。検索語・取得済み結果・表示条件と並び・開いた本の選択とスクロールの復元を既存の検索ownerに揃え、再IPCを行わず、実親フォルダや変換キャッシュへ飛ばさない。新たな戻り先boolや検索結果の第二キャッシュは追加しない。
+- 調査・検証: ZIP / PDF / 変換書庫（元パスとキャッシュを区別）と、設定ON時の画像フォルダ本で、検索結果の採用→本openの成功採用→通常の閉じる→結果復帰までを通す回帰を追加する。Backspace・明示的なページ一覧表示、検索結果からの再open、キャンセル・失敗、同じ検索除外条件を使うCtrl+G / Ctrl+S / タグビューの兄弟経路を確認する。F12・独立viewerでは既存の所有境界とメインの選択・一覧を保つ。UI試験は事前承認と使い捨てポータブルの規則に従う。
+- 対象: `src/app.rs` の `auto_open_for_current_container` / `handle_fullscreen_close_request`、`src/app/close_return.rs`、`src/global_search_ui/everything.rs`、親移動dispatcher、関連マニュアル。[Everything検索計画 §7](everything-search-plan.md#7-openbackhistoryf12remote)、[ナビゲーション仕様](fullscreen-navigation-consistency.md)、detached経路に触る場合は[detached計画 §2](detached-rework-plan.md)を参照。対外返信は文案段階。規模 / 優先度: Small〜Medium（帰路の所有境界を調査して確定） / P2。
+
+### 1.663 形式バッジをファイル名の一段上に置き、名前の表示幅を優先する — 5ch >>667 (2026-10-30)
+
+- 状態: **未着手・オプション追加の方向で採用 (利用者方針 2026-10-30)**。[>>667](https://egg.5ch.io/test/read.cgi/software/1782419551/667) は、ZIP / RAR 等のバッジを上へ移し、ファイル名の表示幅を増やしたいという提案。利用者との検討で、画面上端ではなく「ファイル名の行の一段上」へ置く案として記録する。実装・実画面での検証は未着手、リリース時期は未指定。
+- 現状 (v4.10.0 と現行コードを確認): `layout_badges` は下段に形式バッジを先に置き、その右端から右側だけをファイル名に割り当てる。左上は時刻 / UP / 編集状態 / pin / タグ、右上はチェック / スタック枚数、右下は評価絞り込みの一致件数 / 動画・音声の長さが使うため、形式を単純に四隅へ移すのではなく、下段周辺の配置を整理する。
+- 方針: 環境設定の「表示 → サムネイル」に、仮称「ファイル名の表示幅を優先する」を追加する。**既定 OFF で従来配置を維持**し、ON では形式バッジをファイル名の一段上へ置き、名前はセル内の左右余白を除いた横幅を使う。フォルダ名バッジは名前そのものなので、形式バッジと同じ移動対象にしない。既存の名前の文字サイズ・最大行数を併用できるようにする。
+- 文字数: 現在のファイル名は1行設定時に `Some(18)` の省略上限があり、幅だけ広げても使い切れない場合がある。ON ではこの上限ではなく実測幅で省略し、複数行では既存の最大行数・折り返しを維持する。OFF の文字数・配置は変えない。
+- 重なり回避: 既存 `ThumbnailOverlayLayout` の単一の配置計算を拡張する。左下の★は下段の実測矩形に重なると上へ積み、右下の件数・長さは `place_bottom_right` で使用済み領域を避けて上へ移す実装がある。左上は横方向へ予約し、幅不足を省略等で処理しており、すべてのバッジが自動で縦移動するわけではない。新配置でも形式・名前・★・四隅・下端の前回位置メーターを同じ使用領域で扱い、描画とクリック / hover / 背景判定に同じ矩形を渡す。独自の座標ずらしや描画だけの位置変更を追加しない。
+- 検証: OFF の従来配置、ON の名前幅拡張、長い日本語 / 英数字名、文字サイズと1〜4行、狭いセル、形式 + 名前 + ★ + タグ / 編集 / pin、チェック / スタック枚数、右下の件数・長さ、前回位置メーター ON/OFF を純粋レイアウトの非交差・セル内判定と UI snapshot で確認する。動画・音声の文字バッジ、フォルダ名、ブックマーク一覧も回帰し、セル寸法・画像 fit・選択 / 開く操作・画像読み込み / キャッシュは変更しない。
+- 対象: `src/thumb_overlay_layout.rs`、`src/app/grid_paint.rs`、設定と環境設定のサムネイルページ、関連マニュアル。[表示パイプライン](display-pipeline.md)、本書 §2.2 の共通配置を参照。規模 / 優先度: Small〜Medium / P3。
+
+### 1.481 ゲームパッドの本openとEnter/ダブルクリックで、parkと拡張子付き実フォルダの受付が異なる — §1.480 の着手前調査で開発側が確認 (2026-10-29)
+
+- 状態: **未着手・§1.480から分離（設計担当決定 2026-10-29）**。報告者が観測した不具合ではなく、コード・履歴から確認した出荷済みの入口差。今回の修正ではゲームパッドをhelperへ移さず、両差を維持する。
+- park: `handle_gamepad_grid_accept` のFolder/ZIP/PDFには、Enter/double-clickがauto時に呼ぶ `park_active_detached_context_for_new_grid_open` がない。ゲームパッドの初期追加 `07eb006ce` からこの差があり、park導入 `5ba4d5373` もゲームパッドを変更していない。現在はmain前面ならrootの一覧へ配送されるため、active contextが有っても「常にviewerへ配送されるのでpark不要」とは説明できない。一方、下位ZIPには別のpreserve/promote処理もあるため、呼出しを足すだけで直ると断定しない。
+- 実フォルダの判別: double-clickは `GridItem::Folder` の型で履歴記録・評価解除・自動表示予約を行うが、ゲームパッドは `!is_virtual_folder(path)` という拡張子判定を使う。実directoryの名前が `A.zip` / `A.pdf` 等の場合、ゲームパッドだけこの副作用を実行しない。差は `77f9a346d` で入り、v4.9.0にも存在する。
+- 修正時: main/activeの配送と下位ZIPの退避・昇格を含めて所有境界を調査し、どの入力でどの本と窓を保持するか先に決める。[CLAUDE.md「Detached viewer リワーク中のルール」](../CLAUDE.md#detached-viewer-リワーク中のルール) と [detached計画 §2](detached-rework-plan.md#2-憲法-全ステージ共通の不変条件禁止事項-️-最重要) に従い、構造的修正の合意と§11の記録を行う。症状guardや新しいpendingで吸収しない。
+- 検証: 同じmain/active contextと本でEnter/double-click/gamepadを比較し、park先・窓の保持・本のowner・一覧記録・履歴を確認する。拡張子付き実Folderは型と物理実体に基づく採択仕様を直接検査する。§1.480の回帰には、ゲームパッドの拡張子付き実Folderの受付が従来のままである検査を追加する。
+
+### 1.482 異常終了の理由を、次回起動時に画面へ出してコピーできるようにする — 5ch >>655 の調査から (2026-10-29)
+
+- 状態: **段A〜D実装済み・master へ取り込み (2026-10-31、v4.10.1 のタグの後)・実機未確認**。段A〜Dと表示の作り直しは各段の独立レビュー ACCEPT、文言修正 `edbfc3565` の最終再レビューも ACCEPT。ブランチ上で本体 lib 15,172 件・UI snapshot 215 件成功。v4.11.0 に入れる (利用者判断 2026-10-29)。
+- 背景: >>655 (AI 処理中にホイールで約 10 ページ送ると、砂時計になってから終了) は、開発側の headless 試験 20 回 (v4.9.0 と v4.10.0 前の HEAD) では再現しなかった。コード調査で、描画用 texture の確保失敗が wgpu の既定 handler で panic し、画面に何も出さずに終了し得る経路を確認した。>>655 がこの経路だった証拠はない。panic hook はログに残すだけで、利用者は理由を知れず、ログの送付も負担が大きい。
+- 方針: 次回起動時は「前回の正常終了を確認できませんでした。」と短い要点を常時表示し、詳しい記録は「詳細（報告用）」へ畳む。終了前のエラー観測・最後のAI処理・描画用GPUの使用量と予算などを許可項目だけで示し、要点＋詳細の全文をコピーできる。日時はローカル日時と数値時差を使い、終了原因や「直前」の鮮度は断定しない。活動中の通常workerが目標約1秒周期で小資料を保存し、fatal時は固定分類だけを残す。捕まえられるORT失敗はその場で通知する。パス・ファイル名・生のエラー文はコピー文に入れず、回復処理（device再作成・再推論・AI無効化）は含めない。
+- 設計の正本: [調査書の確定設計 (2026-10-30)](ai-crash-655-investigation.md#確定設計-2026-10-30)。確定設計と各段の独立レビューを経て実装し、段Dの検証・受入を進める。検証結果は同書の実装記録を参照。規模: Medium (数日)。
+- 追加報告: v4.10.0のnativeアクセス違反ログがある>>672の原因調査は§1.666へ分けた。本項目の診断表示を追加しただけでクラッシュを修正済みとは扱わない。
+
+### 1.483 ReleaseChecks の first-ai が、全画面を開いた後にメイン窓へ focus して全画面を閉じてしまう (2026-10-30)
+
+- 状態: **未着手** (v4.10.0 の ReleaseChecks で判明。製品の不具合ではなくテスト台本の不具合)。
+- 内容: `ui-smoke.ps1 -Scenario ReleaseChecks -IncludeFirstAi` の first-ai case で、台本が全画面を開いた後に AI モデル切替の action (`FsAiModelRealEsrGeneralV3`) を `owner=root` (メイン窓) へ focus して送る。既存の main focus guard (`should_close_fullscreen_from_main_focus`、2026-07 から) が全画面を閉じ、AI ジョブが取り消されて「actual isolated AI inference did not complete」で FAIL になる。証跡: run `release-checks-20261029-161208-c3ed5627/first-ai/mimageviewer.log` の 2.081s `fullscreen: main focus guard closing session`。first-ai は 2026-10-09 の追加以降、実 suite で PASS した記録がない。
+- 直し方: AI action を全画面の viewport (表示中の viewer の入力所有者) へ送る。製品の main focus guard は変えない。直したら AI / GPU 経路を変える次の版で `-IncludeFirstAi` 付きの ReleaseChecks を実行して採用する。
+- 関連: [release-check-automation-plan.md](release-check-automation-plan.md)、`src/test_script.rs` の `release_check_first_ai`。規模: Small。
+
+### 1.667 ReleaseChecks の起動直後 frame 1→2 の判定が、ログ時刻の 1ms 丸めで成り立たないことがある (2026-10-31)
+
+- 状態: **未着手** (v4.10.1 の ReleaseChecks で判明。製品の不具合ではなく判定スクリプトの不具合)。
+- 内容: `scripts/release_check_analysis.py` の `startup_first_frame_gap` は、起動時の初期化 (`startup/indexer_manager_new`) の完了が frame 1 の update 終了より 1ms 以上後であることを、既知の起動直後の間隔の条件にしている。perf event の `t` は 1ms 単位に丸められるので、完了が update 終了の直後 (1ms 未満) だと順序を示せず、同じ形の間隔が `unexplained` で FAIL になる。証跡: run `release-checks-20261031-014232-5895a34d/perf-cached` で frame 1→2 が 112ms、update 終了 0.8235728、`indexer_manager_new` の `t`=0.824 (`ms`=3.46)。同じ run の perf-uncached は 120ms で既知と判定された (完了 0.811、update 終了 0.8076)。
+- 直し方: 判定に使う完了時刻を丸めない値で出す (例: `indexer_manager_new` に `end_t` を高精度で載せる) か、初期化が frame 1 の後まで未完了だったことを UI スレッド側の観測 (startup overlay の early return) で直接記録する。margin を広げて通すだけにはしない。
+- 関連: [release-check-automation-plan.md](release-check-automation-plan.md)、`scripts/test_release_check_analysis.py`。規模: Small。
+
+### 1.487 旧二指touchの第二指のMoveが、新しく始めたmouse dragへ混ざる — >>661の統合確認から (2026-10-30)
+
+- 状態: **未着手・>>661から分離（設計担当判断 2026-10-30）**。touchとmouseを同時に使う操作の既存不具合と、同frameの複数所属release混在に対する許容範囲。通常の一覧移動で旧bounds・速度・captureを持ち越す>>661とは分けて扱う。
+- 再現: 旧一覧で二指touch → 別一覧へ移る → 主指を離す（第二指は保持）→ 新mouseで一覧背景をdrag → 旧第二指を動かす。backendの空いたpointer gateから出るsynthetic Moveを、新mouseのnative scrollが採る。
+- 基点検証: v4.10.0の `b10dc7406` をテスト用に展開し、同じ入力列・実worker・両入力の対照・実rendererを通す回帰が失敗。no-tailはnative offset756を維持、旧Moveありは756→800、直後のmouse移動も対照656に対し576となる。基点の同frame描画は756のまま、行丸め後は両方630となり、このfixtureでは差が見えない。>>661修正後はphysics後の位置でviewport／content originを確定するため同frameのviewportも800となる。この反映タイミングの差を「今回の影響なし」とは扱わない。
+- 根拠と証跡: [>>661調査書の基点比較](scroll-661-investigation.md#mixed-input-v410-baseline)。native pointer eventの由来を受理境界へつなぎ、本物mouseのcapture・慣性・直前位置を保って旧touch由来だけを隔離する設計が必要。修正案・規模は未確定。
+- 回帰は `src/app/tests/scroll_661.rs::retired_secondary_touch_move_cannot_drive_a_new_mouse_capture` を理由付きignoreで保持。基点でもState不変assertが失敗することを記録し、設計担当の指示に従って>>661の必須gateから除外する。実機イベント配送・製品画面は未確認。
+- 同frameのrelease／click混在も本項の範囲（設計担当判断 2026-10-30）。旧touchのreleaseとMouseのclick-bearing releaseが同frameに入る場合は、v4.10.0と同じくセル応答を抑止しない。例: 旧touchでcellをpress→一覧session交代→同frameに旧End／release／Gone→widgetのない場所へmouseをMoved／press／release。この場合も旧cellのnative clickは適用される。混在しない旧touch releaseは>>661の修正で拒否する。`mixed_retired_capture_and_uncaptured_mouse_click_keep_v410_pointer_fallback` はこの許容挙動を自動検査し、ignoreしない。[設計補足・再修正台帳](scroll-661-investigation.md#implementation-review-mixed-release)を参照。egui中核interactionの変更案は保守負担から不採用。
+
+- 許容範囲はMouseの混在に限らない。抑止しないCurrent tapや所属不明のclick-bearing releaseが同frameに混ざる場合も、v4.10.0と同じpointer fallbackとする。純touchでCurrentとRetiredが共存する場合を含む「複数所属のreleaseが混在するframe」では、cell clickを完全に隔離したとは扱わない。すべてのclick-bearing releaseが抑止対象の場合だけ拒否する規則であり、既存Current gestureの抑止要求は維持する。
+
+### 1.486 Snapshot（★固定）の固定ownerとcanonical origin / routeの単一所有
+
+- 状態: **未着手・§1.473から分離（設計担当決定 2026-10-30）**。根拠は[§1.473調査記録の再停止](history-parent-1473-investigation.md#再停止snapshotの固定ownerに関する設計前提不足2026-10-30)。`docs/`全体の`### 1.48`を検索し、1.486が未使用であることを確認して採番した。
+- 問題: 固定rowsはSnapshotState、canonical origin/routeはTopLevelGridViewが別々に持つ。一時的な別surfaceの採用で帰路が失われ、既存の固定list復帰はrows/path/recipeまででsurface・行provenance・routeを一括で再採用しない。同じpathの固定listと別surfaceもpath比較では区別できない。
+- 方針: 固定ownerと完全な帰路の単一所有、一時surfaceを採用しても失わない配送、固定listの再採用をsurface・行provenance・routeまで含むowner操作として設計する。解除/dismiss、Back/Forward、fork/close、同pathと異なるcontextの生命周期を揃え、新bool/並列Option/逆算guardで補わない。
+- §1.473の限定対応: 閲覧履歴rootからの親は既存の固定解除を終えて捕捉済canonical originへ戻す。固定listの完全な再採用機構は今回作らない。
+- 受入候補: 普通Folder/ReadingHistory/★/Bookmarks/検索由来の固定から別surfaceへ入り、固定listへの復帰・解除・一時ビュー移譲を確認する。特に同pathの別visit、行flag/来歴/route、行・scroll、未採用/取消、bundle/fork/closeとsibling不変を含める。設計時に通常利用の挙動を確定する。
+
+### 1.475 コレクションの挙動が不安定・本を閉じたときの保存に時間がかかる — X の投稿 (2026-10-29)
+
+- 状態: **調査完了・調べた範囲では再現せず、対応はここで完了 (利用者判断 2026-10-29)**。出典は X で利用者が見かけた第三者の投稿で、報告者とはつながりがないため返信しない (利用者判断)。投稿の要旨は「コレクションの挙動がまだ怪しい。本を閉じたときに情報を保存するのに時間がかかることがかなりある。少し不安定になってきた」。報告者の環境 (置き場所・件数・本の形式・Remote の有無など) は不明。
+- コード確認 (ClaudeCode):
+  - 本を閉じたときに書くのは、読書位置 (`book_resume_writer`) と閲覧履歴 (`reading_history_writer`) だけ。どちらも裏の writer が書くので、UI は書き込みを待たない。
+  - コレクションへ戻ると、一覧を空にして「コレクションを読み込み中…」を出し、コレクションの所有スレッド (actor) から読み直す (`src/app/collection_grid.rs` の `open_collection_grid_after_context_change`)。
+  - 「保存中」を出す UI 文言は、本の開閉の経路には見当たらない。
+- 実アプリでの計測 (観測者: ClaudeCode、2026-10-29、利用者の許可を得て操作)。共通条件は次のとおり。
+  - ビルド: v4.9.0 とソースが同じ master の dev-runtime (`target\dev-runtime`、2026-10-27 作成。以降の差分は版番号の更新だけ)。
+  - データ: `--data-dir` で隔離したデータ。perf ログ ON。
+  - 素材: 利用者が選んだ 8 冊の PDF (319〜930 頁、各 230〜430 MB) のコピーと、生成した 3 頁の ZIP。
+  - 計測方法: 画面を一定間隔で取り込んで切り替わりの時刻を取り、perf ログと照合した。
+  1. 小さな ZIP 300 冊のコレクション (ローカル SSD): 本のページ一覧から Backspace でコレクションへ戻るまで約 0.2 秒。コレクションの読み直しは actor 約 2 ms + 準備 約 20 ms。
+  2. PDF 24 冊 + ZIP 9,976 冊 = 10,000 件 (登録上限) のコレクション (G: の SSD):
+     - 取り込みと最初の表示は数秒以内。
+     - PDF のページ一覧から戻るまで約 0.4〜0.5 秒。読み直しは actor 約 6 ms + 準備 約 120 ms + 反映 約 9 ms。
+     - PDF を全画面で数ページ読んで Esc でページ一覧へ戻るのは、取り込んだ画面で 1 秒以内。
+  3. HDD (E:、WD 8TB、読み 約 110 MB/s) に置いた PDF のコレクション。OS のキャッシュに乗らない書き込み (`FILE_FLAG_NO_BUFFERING`) で置き、初回はディスクから読む状態にした。サムネイルのキャッシュも空の新しい隔離データを使った。
+     - 10,000 件 (PDF 24 冊を含む) の一覧はすぐ出たが、PDF の表紙サムネイルは 1 枚に 5〜29 秒かかった。順番待ちのため、後ろの PDF ほど遅い。
+     - PDF 24 冊のコレクションで、サムネイルを作っている最中に先頭の PDF を開くと、ページ一覧は約 1.5 秒で出て、ページのサムネイルも約 0.5 秒で埋まった (開いた本が先に処理される)。Backspace でコレクションへ戻るのは直後。
+     - 別の PDF を全画面で 3 ページ送ってから Esc でページ一覧へ戻るまで 0.7 秒以内。
+     - perf ログの解析 (`scripts/analyze_perf.py ... hitches`) では、33 ms を超えた UI の更新は、ファイル選択ダイアログ (8.85 秒) と取り込みの確認ダイアログ (55 ms) の 2 件だけだった。
+- 結論: 調べた範囲 (件数 最大 10,000、ローカル SSD と HDD、ZIP と大きな PDF、ページ一覧と全画面からの閉じ方) では、本を閉じる操作に時間がかかる現象は見られなかった。
+  - 遅かったのは、HDD 上の大きな PDF の初回の表紙サムネイル作成だけ。報告の「本を閉じたとき」との関係は確かめられていない。
+  - 調べていないもの:
+    - ネットワークドライブ (NAS)。
+    - コレクションの数が多い場合。
+    - mIV Remote から開いた場合。
+    - 編集 (補正・消しゴム等) をした本を閉じる場合。
+    - F12 の別ウィンドウ。
+    - 製本・構成を変えた本。
+    - 長時間使い続けた後の状態。
+- 計測の素材: `G:\home\mivtest-collection` (約 6.5 GB) と `E:\mivtest-collection` (約 12.9 GB)。再調査の材料として残してある。不要になったら削除してよい。
+- 別症状の追補 (2026-10-30、Codexの非対話試験): Xの「本から戻ると違う場所が表示される」は [位置復元の調査](collection-return-investigation.md) を参照。v4.10.0相当の実collection/worker/egui経路で、帰り先・選択・アドレス・ツリーは正しいまま、スクロールだけが上へずれる条件を確認した。短い側のページ一覧もスクロール可能な32ページ本で、>>661と同じ旧bounds/速度の持越しを再現（20件中13件が(c)の回帰検出で失敗、7件の対照は成功）。投稿者本人の原因は未確定。製品コード変更なし、`scroll-661` の共通修正後に今回の経路を確認するテストを追加。本節の「保存が遅い」調査結果とは分けて扱う。
+
+### 1.476 タグビューで検索し直すと、開いていた画像が閉じる — §2.23 の実機確認で利用者が観測 (2026-10-29)
+
+- 状態: **未着手** (どのウィンドウ形態で観測したかは未記録。ClaudeCode はこの場面を実アプリで確かめていない)。
+- 内容 (利用者): §2.23 では「検索し直しても、結果に残る画像は開いたまま」としたが、検索し直した時点で閲覧が消えるように見えた。
+- コード確認 (ClaudeCode):
+  - 結果を受け取ったときに閲覧を保つ処理は `apply_tag_view_result` にある (`prepare_rating_membership_items_swap` → `finish_rating_membership_viewer_swap`)。これが働くのは、結果が届いた時点で閲覧が開いている場合だけ。
+  - 単一ウィンドウでは、閲覧中にタグビューのバーは見えない。検索語を変えるには一覧へ戻る必要がある。閲覧中に「このタグで探す」を選ぶと、`open_tag_view_for_tag` が検索の前に `close_fullscreen` で閲覧を閉じる (F12 の別ウィンドウ・切り替え中は閉じない)。どちらも出荷済みの挙動。
+  - そのため単一ウィンドウで「開いたまま」になるのは、「検索中...」の間に画像を開いた場合くらい。§2.23 の保持は、実質 F12 の別ウィンドウ・複数ウィンドウ向けの変更になっている。
+- 未確認: F12・複数ウィンドウで、検索語の変更・並べ替えの変更をしたときに閲覧が保たれるか (§2.23 の実機確認でも未確認の場面)。
+- 進め方:
+  - まず F12・複数ウィンドウで保持が働くかを確かめる。働かなければ、それが不具合の本体。
+  - 単一ウィンドウで「このタグで探す」でも閲覧を続けるか (結果一覧を後ろで入れ替える) は、出荷済みの挙動を変える判断になるので、利用者に相談する。
+  - リリースノートの「結果に残る画像は開いたまま」は、確かめた形態に合わせて書く。
+- 関連: §2.23、[タグ設計 §5.1](tag-catalog-redesign-plan.md#51-タグビュー-ctrlt--タグツールバーの検索ボタン)。規模 / 優先度: Small / 次の版のリリース前。
+
+### 1.650 連結読みでズームすると、画面の中央にあった内容がずれる — §1.470 の独立レビューで判明 (2026-10-29)
+
+- 状態: **未着手** (コード読み・独立レビューの指摘。実アプリでは未確認)。§1.470 のキー拡大・縮小の独立レビューで判明した。キーだけでなく、Ctrl+ホイール・ピンチ・ゲームパッドのズームも同じ構造なので、§1.470 では直さずに分けた。
+- 内容: 縦 / 横連結では、連結方向の位置を `fs_vertical_scroll` が持つが、どのズーム入力も `fs_pan` だけを拡縮する (`apply_touch_zoom_factor_about_pivot` / `apply_wheel_zoom`)。そのため、現在ページの中心から進んだ位置でズームすると、画面の中央 (キー) やマウス位置 (ホイール) にあった内容が連結方向へずれる。独立レビューの例: 縦連結で現在ページの中心から 200pt 進んだ状態で 1.25 倍にすると、中央の内容が 50pt 動く。
+- 進め方: 連結読みのズームの基準点を、連結方向のスクロール位置も含めて保つ処理を 1 か所に作り、キー・ホイール・ピンチ・ゲームパッドで共用する (`fs_zoom_owner` と同じく入力ごとに書かない)。ページ間の間隔・ページごとの fit を含めた座標の換算を確かめる。
+- 関連: §1.470、`src/ui_fullscreen.rs` の連結読みスクロール (`fs_vertical_scroll`)、[display-pipeline.md](display-pipeline.md)。規模 / 優先度: Small〜Medium / P3。
+
+### 1.630 開いておいた環境設定の OK と mIV Remote の接続が同じ frame に重なると、全体設定の変更が Remote session の境界をまたがない — §1.216 の独立設計レビューで判明 (2026-10-28)
+
+- 状態: **未着手**。コード上の競合経路で、実機での発生は未確認。
+- 内容: Remote は本体と排他で使い、本体側の設定変更は Remote の取得 (session の切り替わり) をまたぐ前提で、
+  画素を変える全体設定 (末尾に表紙を添える、§1.216 の「自動余白カットを標準で有効にする」など) を
+  generation に入れていない ([web-remote-plan.md](web-remote-plan.md) §12.16)。ところが Remote の取得完了
+  (`src/remote_ipc/ui.rs` ~1252) と環境設定の描画 (`src/app.rs` ~97907) は、Remote の modal 登録
+  (`src/app.rs` ~98484) より前に処理され、環境設定の OK と確定 (`src/ui_dialogs/preferences.rs` ~3363 / ~2693) には
+  Remote の受付 guard がない。同じ frame に重なると、取得後に設定が確定し得る。
+- 影響: その session で取得済みのページは旧設定の画素のまま端末の cache に残る。データは失われず、次の session で直る。
+- 直し方の案 (レビューの提案): 環境設定の確定を既存の `try_local_modal_lease` (`src/remote_ipc/session.rs` ~1473) で
+  Remote 取得と排他にし、取れなければ下書きを残して確定しない。phase の確認だけでは確認後の取得と競合する。
+  取得と OK の両方の順序を headless 回帰に足す。全体設定すべてに共通する修正なので、個別機能では閉じない。
+
+### 1.640 一覧で未表示のページを焼き込むと、旧形式の切り取りと PDF ページの注釈の基準寸法が表示時とずれることがある — §1.261 の設計レビューで判明 (2026-10-28)
+
+- 出典: §1.261 (編集を反映した画像のコピー) の設計を Codex Sol がレビューした際の指摘。コードで確認した。実機での観測は未確認。
+- 内容: 一括書き出し・製本・(§1.261 の) 一覧からのコピーは、未表示のページでは表示側の canonical 寸法 (`canonical_source_dimensions`) を持たないため、焼き込みの基準寸法を decode 後の寸法から決める。
+  - 旧形式 (基準寸法なし) の切り取りは、合成の最後に AI 拡大後の寸法を基準として採用する (`books.rs` の `compose_book_page_with_cancel`、`with_legacy_source_size(image.size)`)。表示済みページの Ctrl+E は AI 前の寸法で補完するので、AI 拡大を使うと切り出す範囲が変わる。さらに worker がその値を `crop_legacy_writeback` で DB へ書き戻す。
+  - 注釈は `comic_source_dims` が無いと decode 後・AI 前の寸法を基準にする。PDF ページは表示時の描画寸法と書き出しの長辺 4096 が違い得るため、注釈の位置・大きさが表示とずれる可能性がある。
+- 直し方の候補: 旧形式 crop の基準は AI 前の寸法で解決する。PDF 注釈は作成時の基準寸法を保存・復元する。表示キャッシュなし / ありの producer を通した比較テストを足す。
+- 規模 / 優先度: Small〜Medium / P3 (旧形式データ + AI 拡大、または PDF への注釈 + 一覧からの書き出しの組み合わせに限る)。
+
+### 1.641 焼き込み用の編集 snapshot の固定 (注釈フォント・補正レイヤー・マスク) が UI スレッドで同期に走る — §1.261 の実装レビューで判明 (2026-10-28)
+
+- 出典: §1.261 (編集を反映した画像のコピー) の実装を Codex Sol が独立レビューした際の指摘。コードで確認した。停止時間の実測はしていない。
+- 内容: `App::book_baked_edit_snapshot` (`src/ui_fullscreen.rs`) は、要求時の編集を固定するために UI スレッドで呼ばれる。未読み込みのページでは、その中で注釈フォントの読み込み・解析 (`ensure_comic_fonts_for` → `rebuild_comic_fontset`)、補正レイヤーの DB 読み込みと JSON 復元、消しゴム / 隠蔽マスクの展開が同期に走る。呼び出し元は Ctrl+E (`open_export_dialog` 系)、一括書き出し (`batch_export_item_for_idx`)、本の焼き込み、§1.261 のコピーの 4 つで、共通の性質。一括書き出しは 1 フレーム 6ms の予算で 1 件ずつ準備する (`advance_export_batch_preparation`) ので、1 回に止まるのは最大 1 ページ分。
+- 直し方の候補: UI では対象・設定・読み込み済み編集の参照だけを固定し、未読み込み素材の読み込み・マスク展開・フォント解析は worker 側で行う。要求時の編集を固定する契約と、共通の合成関数は保つ。4 つの呼び出し元を同時に移し、未読み込み素材を使う要求で UI が読み込み完了を待たない回帰テストを足す。
+- 規模 / 優先度: Medium / P3 (どの入口も 1 回に 1 ページ分 (見開きで 2 ページ) で、未読み込みの素材がある場合に限る)。
+
+### 1.459 複数ウィンドウで「本として扱う」が ON のとき、一覧から画像だけのフォルダをダブルクリックすると、中の画像が一覧に出ない — 利用者の報告 (X、2026-10-24)
+
+- 状態: **未着手・要調査**。利用者が今後直したいと決めた (2026-10-28)。仕様どおりか不具合かはまだ決めていない。
+- 報告 (X の @PokeSleep1234、2026-10-24 12:42、v4.7.1): 「複数ウィンドウ」で「画像のみのフォルダは、PDF/ZIP のように本として扱う」を ON にしたとき、ページ一覧を表示した状態と両立できたのは、ツリーからフォルダを選んだときだけだった。一覧からフォルダをダブルクリックしても、フォルダ内の画像が一覧に表示されない。報告者は、一覧で不要な画像を削除しながら見開きで読みたい (Leeyes からの移行)。
+- 経緯: 同じ報告者の §1.425 (通常フォルダにも既定のページ構成を使う) は v4.8.2 で出荷済み。この設定を ON にすれば「本として扱う」を ON にしなくても上の用途を満たせるので、報告者が困ることは減る。ただし、この節の挙動は残っている可能性がある (開発側では未確認)。報告者へは v4.8.2 の設定をまだ案内していない (2026-10-28 時点、利用者判断で保留)。
+- 調べること (コード未読): 複数ウィンドウ (`detached_viewer_open_images_in_window`) と「本として扱う」(`auto_fullscreen_image_folders`) が ON のとき、一覧でのダブルクリックは画像だけのフォルダを ZIP と同じく「本を開く」扱いにし、一覧はそのフォルダへ入らない見込み。ツリーで選んだときは一覧がそのフォルダへ移る。この差が意図した仕様か、一覧とビューアを両立させる経路の漏れかを、ZIP / PDF を一覧でダブルクリックしたときの挙動とあわせて確かめる。
+- 決めること: 本として扱うフォルダを一覧から開いたとき、一覧もそのフォルダ (ページ一覧) へ移すか。ZIP / PDF と揃えるか、ツリーと揃えるか。出荷済みの挙動を変えるなら、変更前に利用者へ相談する。
+- 規模 / 優先度: 調査次第 (Small〜Medium) / P3。
+
+### 1.600 先読みの画像受信時に、保存済みの消しゴムマスクを UI スレッドで同期に読んでいる — §1.457 の設計レビューで判明 (2026-10-28)
+
+- 状態: **未着手**。§1.457 では範囲外として残した (段階 A / B はこの経路を使うが変えていない)。
+- 内容 (コードの参照、未計測): `poll_prefetch` の画像受信 → `auto_apply_saved_mask` (`src/ui_erase.rs`) が、マスク DB の読み取り・rasterize・
+  入力の black flatten を UI スレッドで行ってから MI-GAN を起動する。表示時の `ensure_erase_result_texture_impl` も同じく同期でマスク DB を読む。
+  既存の `EraseInpaintMaskSource::Saved` (worker で DB を読む) と、`erase_from_saved_mask` (worker で black flatten) に寄せられる見込み。
+- 進め方: `docs/ui-responsiveness.md` §4 に沿って、まず perf で区間を測る。直すときは既存の inpaint owner の入口を 1 つにまとめ、二重起動を作らない。
+- 規模 / 優先度: Small〜Medium / P3。
+
+### 1.455 全件テストで、毎回違うテストが 1 件だけ落ちる (プロセスが終わらない / 音声ワーカーの終了待ち) — 3 ブランチ取り込み後の master で観測 (2026-10-27)
+
+- 状態: **未着手**。テストの問題か製品の問題かは未切り分け。§1.447・§1.449 と同じく、全件実行のときだけ起き、単独では起きない。
+- 観測 (ClaudeCode、2026-10-27、master `3dbd94a6e` = §1.340・§1.450/1.451・§1.454 の取り込み直後、`test-lib-full.ps1` 通常版):
+  - 1 回目: `app::close_return_tests::close_return_changed_bookmark_poll_preserves_live_main_position_before_consumer` が TIMEOUT (300 秒)。
+    テスト自体は 4.34 秒で `ok` を出しており、その後プロセスが終了しなかった。ログ `target/test-lib-full/runs/20261027T081520212Z-5ed0da0b/`。
+    単独で 5 回流すと 5 回とも約 1.2 秒で成功。
+  - 2 回目: 上のテストは成功し、`video::decoder::audio_track_fixture_tests::audio_only_failed_event_waits_for_full_engine_lane` が
+    `assertion failed: clock.audio_worker_exited()` (`src/video/decoder.rs:10803`、10 秒の待ち) で失敗。ログ `target/test-lib-full/runs/20261027T084434669Z-f2d7c431/`。
+    単独で 3 回流すと 3 回とも成功。
+  - 同じ master の test-script 版全件 (14,692 件) と ui_snapshot (213 件) は成功。どちらのテストも今回の 3 本では変更していない
+    (`close_return.rs` は §1.454 で 6 行変えたが、コレクションの親移動の部分)。各ブランチ単体の全件実行はすべて成功していた。
+- 調べること: 1 件目はテスト成功後にプロセスが終わらない (終了時に残るスレッド・join・静的破棄の待ち)。2 件目は音声ワーカーの終了を 10 秒の期限で待つ箇所。
+  負荷をかけて再現させる手段を先に作る (§1.447・§1.449 と共通化できるか)。待ちや再試行を足して隠さない。
+- 規模 / 優先度: 調査後に見積り / P3 (リリース前の全件確認の手戻りになる)。
+
+### 1.452 本のサムネイルキャッシュを先頭・代表画像に絞るオプションを検討する — 5ch >>623・627 (2026-10-27)
+
+- 状態: **未着手・用途確認済み、オプション追加を検討 (2026-10-27)**。[>>623](https://egg.5ch.io/test/read.cgi/software/1782419551/623) で Leeyes の「先頭の画像のみ保存する」に相当する機能を質問され、[>>624](https://egg.5ch.io/test/read.cgi/software/1782419551/624) で容量削減が目的か確認。[>>627](https://egg.5ch.io/test/read.cgi/software/1782419551/627) で、少ない容量でできるだけ多くの表紙サムネイルを残したい用途と分かった。利用者は、この用途に向けたオプション追加を検討すると返信する方針を採択した。
+- 現状: `CachePolicy` の Off / Auto / Always と形式別の保存条件はあるが、本の先頭・指定した代表画像だけを継続的に保存する設定はない。一括作成の「ZIP ファイルの中身もキャッシュ」「PDF ファイルの中身もキャッシュ」を OFF にすれば一括作成時は先頭だけになるが、その後の通常閲覧で途中ページの保存を抑える設定ではない。
+- 検討方針: 本の先頭ページや明示指定した代表サムネイルに保存対象を絞り、途中ページの通常サムネイルをディスクへ保存しないオプションを検討する。対象はサムネイルの永続化であり、閲覧できるページ数やサムネイル表示を制限する機能にはしない。未設定・既定では従来の動作を維持する。
+- 互換性・費用: 保存しないページも必要時に生成・メモリ保持し、既存キャッシュの読み取りは維持する。設定変更だけで既存キャッシュやユーザー指定の代表画像を自動削除しない。途中ページの再表示・再起動後の一覧表示では再生成が増え得るため、容量と速度のトレードオフを設定画面・マニュアルで説明する。
+- 実装前に整理: `CachePolicy` や ZIP/PDF の常時保存設定との優先関係、一括作成・通常閲覧・Remote の各保存入口、ZIP/PDF・直読み RAR・変換書庫・入れ子・本扱い画像フォルダの対象範囲と先頭の定義を確認する。代表画像の変更後も新しい代表を保存できること。ZIP/PDF 変換キャッシュ、フルサイズ・AI の先読み、編集内容の保存は別物として変更しない。
+- 検証: ON 時は先頭・代表を再起動後にも表示でき、途中ページの新規永続化を抑えられること。途中ページの表示・シーク用サムネイル・先読みは引き続き利用できること。OFF 時の従来動作、既存キャッシュの読み取り、代表変更、一括作成との組み合わせを回帰確認する。
+- 関連: [サムネイルカタログ設計](catalog-design.md)、[サムネイル要求のライフサイクル](thumbnail-request-lifecycle-plan.md)。規模 / 優先度: 保存入口の棚卸し後に見積り / P3。
+
+### 1.449 リモート取得と初回表示のテストが、全件実行の高負荷時だけ落ちる — §1.445 の全件テストで観測 (2026-10-26)
+
+- 状態: **未着手**。テストの問題か製品の問題かは未切り分け。
+- 観測 (ClaudeCode): 2026-10-26、`gpuslider-1445` (v4.8.2 + §1.445) の `test-lib-full.ps1` で
+  `app::tests::still_window_mode_key_tests::remote_acquire_before_initial_display_opens_startup_path_after_local_return` が 1 回失敗。
+  同時に別の作業ツリーで Codex がビルドしていて負荷が高かった。単独で 3 回流すと 3 回とも通った。同じ実行で §1.447 のページめくりのテストも落ちた。
+  ログは `G:\home\mimageviewer-gpuslider\target\c1445\lib.log` (作業ツリーを撤去する前に必要なら写す)。
+- 調べること: 失敗時の assert の内容、時刻や待ち時間に依存する箇所。負荷をかけて再現させる手段を先に作る。待ちや再試行を足して隠さない。
+- 規模 / 優先度: 調査後に見積り / P3。
+
+### 1.447 ページめくりの描画テストが、全件実行の高負荷時だけ落ちる — master の全件テストで観測 (2026-10-26)
+
+- 状態: **未着手**。テストの問題か製品の問題かは未切り分け。
+- 観測 (ClaudeCode): 2026-10-26、master (`7dfc52b2f` 時点) の `test-lib-full.ps1` で
+  `ui_fullscreen::page_turn::draw_submit_tests::page_turn_mainwindow_submits_visible_vacant_leaf_both_directions` が 1 回失敗
+  (`draw_submit_tests.rs:462`「old9 must remain visible outside the growing black leaf」、p=0.75)。
+  同じ日の `-Features test-script` の全件では通り、単独で 5 回流すと 5 回とも通った。
+  失敗時の描画には、単独実行では出ない画面中央の暗い矩形 (fill 18,18,18,230 と文字) と右下の小さな表示が混ざり、
+  黒い裏面の mesh が old9 の矩形 (73..638) をほぼ覆っていた。ログは `target/merge-482/lib.log`。
+- 見立て (未検証): テストは準備完了を `Instant` の期限つきループで待ってから `time` を進めて描くが、負荷で別の表示 (準備中など) が
+  割り込み、めくりの状態が単独時と変わった可能性がある。製品側でも同じ割り込みで vacant 面の描き方が変わるなら製品の不具合。
+- 調べること: 失敗時の中央の表示が何か (どの描き手か)、そのフレームの page_turn の状態。負荷をかけて再現させる手段
+  (並列度を上げる・CPU 負荷を足す) を先に作る。待ちや再試行を足して隠さない。
+- 規模 / 優先度: 調査後に見積り / P3。
+- 追加の観測 (2026-10-28〜29): deps-update-1460 の全件 (421 行、p=0.25 で曲面 mesh 0) と、pageturn-1461-1457 の関連テスト群・単独 (462 行、p=0.75) でも落ちた。どちらもこのテストに触れていない変更の上で、単独の再実行では成功することもある。
+
+### 1.446 ffmpeg-sys のビルドスクリプトが、ときどきアクセス違反 (0xc0000005) で落ちる — v4.8.1・v4.8.2 のリリース作業で観測 (2026-10-26)
+
+- 状態: **未着手**。開発環境の問題で、製品の動きには関係しない。
+- 観測 (ClaudeCode): `ffmpeg-sys-the-third v3.0.1+ffmpeg-7.1` の build script (`build-script-build`) が `STATUS_ACCESS_VIOLATION` で終了し、ビルドが止まる。
+  2026-10-24 の push 前検査 (`STATUS_ILLEGAL_INSTRUCTION`)、2026-10-25 の基盤セッションの診断ビルド、2026-10-26 の `build-dev.ps1` と ReleaseChecks の診断 portable ビルドで計 4 回以上。
+  どれも同じ条件で流し直すと通った。C: と G: の両方の作業ツリーで起きている。並行ビルドや画像生成で負荷の高い時間帯に多い。
+- 調べること: build script 内の bindgen / libclang (`LIBCLANG_PATH`) の読み込みで落ちているか、ダンプを取る (WER の LocalDumps を build script の exe 名に設定)。
+  libclang の版、並列度 (`CARGO_BUILD_JOBS`) を下げたときの再現率、メモリの逼迫との関係。リトライや待ちを足して隠さない。
+- 規模 / 優先度: 調査後に見積り / P3 (リリース作業の手戻りになる)。
+
+### 1.432 フォルダのサムネイル要求を作るとき、代表画像のピン解決が UI スレッドでファイル・DB を読む — §1.410 の独立レビューで判明 (2026-10-25)
+
+- 状態: **未着手・起票 (2026-10-25)**。通常のフォルダ一覧から元々ある共通経路の課題で、§1.410 で Everything のフォルダ行も同じ経路を通るようになった (費用は通常一覧と同じ)。
+- 根拠 (コード読みのみ。実機・perf ログでは未確認): `make_load_request_with_visibility` → `apply_folder_thumb_pin` (`src/app.rs` 99031・99367 行付近、`8f4fdf02c` 時点) が、要求の生成時に cascade 解決の `fs::metadata`・ピン DB の照会・`VideoPinDb::lookup` (動画ピンの WebP を 1 件ずつ取得、99492 行付近) を UI スレッドで行う。要求は保持範囲・要求中判定で絞られるので一度に全件ではないが、UNC 上のピンでは止まり得る。
+- 直し方の方向: ピンの解決結果を worker 側 (一覧の準備、または thumbnail worker) で求めて要求に渡し、UI スレッドからは参照だけにする。`docs/ui-responsiveness.md` §4 のチェックリストを通し、区間に `perf::event` を入れて実測してから判断する。
+- 規模 / 優先度: Medium / P3。
+
+### 1.430 本でない通常フォルダが、メタ情報の取り込み後に既定のページ構成へ変わり得る — §1.425 の独立レビューで判明 (2026-10-25)
+
+- 状態: **未着手・起票 (2026-10-25)**。§1.425 では直さず、取り込み後の経路は「通常フォルダにも既定のページ構成を使う」が ON の通常フォルダだけを新しい解決に通した (OFF と本は従来の計算のまま)。
+- 根拠 (コード読みのみ。実機では未確認): `App::apply_current_metadata_import_terminal_result` (`src/app.rs`、§1.425 前の HEAD `94017f82e` で 48144 行付近) は、spread の保存行が無くても worker が container state を返すと (`src/app/metadata_import_refresh.rs` 565 行付近)、`settings.default_spread_mode` / `default_reading_flow` / `default_reading_direction` をそのまま既定にする。通常 open は本でないフォルダを `SpreadRestoreDefaults::NON_BOOK` (単ページ・ページ単位・左→右) で開くため、設定 OFF の通常フォルダでも、トリムなどの取り込みの後に既定の見開き・連結方式へ変わり得る。本扱いのフォルダでも、方向の解決が通常 open (`resolve_reading`) と取り込み後 (`resolve_mode` + 既定方向) で違い、例えば既定 `RtlCover`・方向 `Ltr` では通常 open が `RtlCover`、取り込み後が `LtrCover` になり得る (§1.425 の独立コードレビューの指摘)。
+- 直し方の方向: 取り込み後の既定を、通常 open と同じ `SpreadRestoreDefaults::for_physical_folder` の解決に揃える。リリース済みの挙動の変更なので、変わる組み合わせ (OFF の通常フォルダ、本扱いのフォルダの方向) を一覧にして利用者に確認してから行う。
+- 検証: 保存行なしの通常フォルダ (OFF/ON)・本扱いのフォルダ・ZIP/PDF で、通常 open の直後と取り込み後の構成・連結方式・方向が一致すること。兄弟 context が変わらないこと。
+- 規模 / 優先度: Small / P3。
+
+### 1.423 画像を WIC が開いている最中にごみ箱へ送ると、削除が一時的に失敗し得る — テスト基盤の作業中のコード調査 (2026-10-23)
+
+- 出どころ: テスト基盤 (§1.420 / §1.389) のセッションのコード調査。実際の失敗は観測されていない (未確認)。
+- 内容: WIC はファイル名を渡して画像を開くので、デコード中はファイルが開いたままになる。その間に同じファイルをごみ箱へ送ると、共有違反で削除が一時的に失敗し得る。
+- 対応の方向: 削除経路が失敗をどう扱っているか (通知・再試行の有無) と、WIC へ渡す前にストリームで開く・デコードを取り消してから削除するなどの手を比べる。
+  まれな失敗なので、CLAUDE.md の「まれな失敗は既定で割り切る」に沿い、黙って失敗しない (ログと通知) ことを最低線にする。
+- 規模 / 優先度: 調査後に見積り / P3。
+
+### 1.422 全件テストで、nextest 自体が集計を出した後に終了しないことがある — §1.420 の作業中に 1 回観測 (2026-10-23)
+
+- 観測 (テスト基盤のセッション、1 回): nextest が結果の集計を出した後、プロセスが終了しなかった (記録は作業ツリーの `target/nextest-post-summary-spin.json` で、作業ツリーと一緒に消えた)。
+  §1.420 の打ち切りはテスト単位なので、この止まり方には効かない。1 日止まった件の原因の候補の 1 つ。
+- 対応の方向: `scripts/test-lib-full.ps1` / `test-full.ps1` に、実行全体の上限時間を超えたら nextest を止めて「集計後に終了しなかった」と記録する見張りを付ける。
+  再現したら、そのときのプロセスの状態 (子プロセス・ハンドル) を残し、nextest 側の不具合か mIV のテストが残したものかを切り分ける。
+- 規模 / 優先度: Small / P3。
+
+### 1.421 検索の結果待ちの間に別の場所へ移ると、遅れて届いた検索結果で一覧が置き換わる — §1.419 の調査で判明 (2026-10-23)
+
+- 出どころ: §1.419 の調査と独立レビュー (コード参照)。実行時の観測報告は無い。
+- 現状 (コード確認): お気に入り検索 (`poll_favsearch` → `apply_prepared_favsearch_results`、`src/app.rs:33807`) とタグ検索
+  (`poll_tag_view`、`src/app.rs:33434`) は、結果を受け取ると移動後の一覧や世代を確かめずに一覧を差し替える。
+  `retire_replaced_main_list_requests` などの受付境界も `favsearch_pending` / `tag_view_pending` を取り消さない。
+  Everything は Activation を延期させず (`document_open_modal_admission_blocked` に含まれない、`src/app.rs:40959`)、
+  結果の採用が accepted source を変えて、後発の ZIP preflight の証明を古くし得る (`src/global_search_ui/everything.rs:437`)。
+  結果待ちの間に利用者が別の場所をクリックした場合も、二重起動の転送を受けた場合も同じ。
+- §1.419 で扱わなかった理由: 検索は「検索を保ったまま結果の中を移動する」一覧で (`commit_staged_search_navigation_effects`)、
+  結果待ちを取り消すだけでは、取消後の表示・`last_executed` と同じ query の再実行・件数表示の後始末が検索ごとに要る
+  (§1.419 独立レビュー第 2 回 P2)。入口も後始末も §1.419 と別。
+- 対応: 検索の受付と終端を設計する。新しい main 要求が受理されたときの検索 3 種の扱い (結果待ちの退役、検索モードを保つか終えるか、
+  入力欄・件数・同じ query の再実行) を 1 つの規則にし、記憶クリア (`clear_quick_folder_slots`) のような同一覧の失効では止めない。
+  「設計の簡素化」に従い、新しい main 要求の受理で検索モード自体を既存の終了経路 (`dismiss_*_without_restore`) で閉じる案を先に検討する。
+- 規模 / 優先度: 未見積もり (設計時に精査) / P3。
+
+### 1.418 名前に拡張子を含む実フォルダを、本の分類が書庫 / 文書として扱う — §1.417 のコードレビューで発見 (2026-10-23)
+
+- 状態: **未着手**。コード調査 (Codex 独立レビュー、§1.417 第 1 回コードレビュー P2)。実行時の観測は未確認。
+- 現状 (コード確認): 開く処理は分類済みの種類 (`OpenPathKind::Directory`) で実フォルダ `book.zip` / `book.pdf` を
+  フォルダとして開くが、採用時の `ProjectionRecipe::for_physical()` (src/app/book_materialization.rs) と
+  `physical_page_order_locked()` (src/app.rs、Remote の src/remote_ipc/container.rs と共有) は名前の拡張子
+  (`is_paged_document_path` / `is_open_as_container`) で `Book(Archive)` / `Book(Document)` に分類する。
+  そのため、そのフォルダは「画像のみのフォルダを本として扱う」設定に関係なく本の既定 (見開き・ページ順固定) で開き得る。
+- §1.417 ([本を優先するレーティング操作](book-preferred-rating-plan.md)、master 統合済み) への影響: 本を優先する評価は、照合 (`zip_nav` / 文書ローダーの状態) で実フォルダを本として扱わず
+  「この本は評価できません」と通知して書かない。根本の分類が直れば、そのまま正しい対象に解決される。
+- 対応案: 列挙・preflight が確定した物理種別 (ディレクトリ / コンテナファイル) を recipe 採用と
+  `physical_page_order_locked` へ型で渡し、実フォルダを拡張子で書庫 / 文書に分類しない。採用時のファイル照会は足さない。
+  Remote の 3 か所も同じ値を使う。
+- 検証: 実フォルダ `x.zip` / `x.cbz` / `x.pdf` / `x.epub` / `x.rar` を、設定オン / オフで開いたときの recipe・見開きの既定・
+  Remote のページ順、本物の書庫 / 文書との区別。規模 / 優先度: Small〜Medium / P3。
+
+### 1.416 画像フォルダ ZIP 化のテストが `no such table: book_bookmarks` で一度だけ落ちる — §1.165 の作業中に遭遇 (2026-10-22)
+
+- 出典: §1.165 の実装担当 (Codex) が `test-lib-full.ps1` を回した 1 回目に、
+  `app::image_folder_zip_operation::tests::image_folder_zip_real_parent_scan_has_one_owner_with_watcher_and_suffix_directory` が
+  `no such table: book_bookmarks` で失敗した。同じテストの単独実行と全件の再実行では成功。§1.165 の変更とは無関係の経路。
+- 見立て (実装担当、未確認): テスト用 DB の schema 初期化と、別スレッドからの `book_bookmarks` 参照の順序の競合。失敗時の実行順は記録されていない。
+- 方針: 推測で待ちや再試行を足さない。まず再現の手段を作る (同テストの反復実行、`book_bookmarks` の schema 初期化を遅らせる注入など) ことから。
+- 規模 / 優先度: Small / P3 (製品の不具合ではないが、全件テストの再実行を招く)。
+- 追加の観測 (2026-10-28): pageturn-1461-1457 の全件で、`book_composition_editor::metadata_transfer_tests::epub_save_retired_owner_precedes_metadata_preview_import_and_export` が同じ `no such table: book_bookmarks` で 1 回失敗し、単独では成功した (fixture の最初の export が、別 thread の schema 作成より先に SELECT し得る構造)。
+
+### 1.406 連動した別ウィンドウ中の検索受付と結果採用の所有を揃える — §1.386 の独立設計レビューで分離 (2026-10-19)
+
+- 利用者決定: §1.386 は理由表示だけとし、Ctrl+R の条件拡大と Ctrl+G の同型欠陥を本項へ分離する。今回は未修正。
+- コード上の欠陥（実機未確認）: Ctrl+G は linked detached 中も開始できる。初回結果の `adopt_prepared_search_view` → `replace_search_view_items_with_ratings` (`src/global_search_ui.rs:3697,2176`、調査時 HEAD `be318299f`) が `invalidate_idx_state_and_queues` (`src/app.rs:44289`) で `fs_cache.clear()` し、連動中の VideoPlayer を Drop し得る。Everything は入口だけ広げても source切替／送信／採用前の `finish_everything_edit_boundary` が viewer を閉じる。
+- 後続設計: source交換時の main保持fork、同一結果の streaming/sort/rating の既存identity remap、detachedへ／からの表示切替と結果採用の直列化、forkのrating publicationの採用中再入防止を一緒に設計する。一律fork・追加guard・時間待ち・機能制限で代替しない。
+- C1は独立化／promote後の受動更新だけを止める。最初の移管とSearch producer/return originのmain所有、通常open／closeのpromote／parkを維持し、main以外からの二度目のpromoteを作らない。
+- 調査とレビュー申し送り: [Everything計画 §20.3](everything-search-plan.md#203-今回やらないこと後続-1406-への申し送り)。BA-7/BA-5の構造設計としてClaudeCodeと独立Codexの合意後に着手。Ctrl+G/Rのlinked動画／音声、切替途中、再投影、cancel/error/close/remountを回帰対象にする。
+- 規模 / 優先度: Medium / P2。
+
+### 1.387 サブモニターの動画全画面で HUD の点滅が残る — 5ch >>557〜570 (2026-10-16)
+
+- 状態更新 (2026-10-24): **v4.8.0 で先行対策 A1〜A3 と描画基盤の更新を出荷し、報告者が UI の点滅解消を確認 (5ch >>610)**。開発側では元の点滅は未再現で、どの変更が解消に寄与したかは未確定。残り候補の実施要否はこの結果を踏まえて再判定する。以下は当初の段階的な対策候補と受入条件であり、すべてが未着手の必須修正という意味ではない。実装・検証の正本は [点滅調査 §8](video-secondary-monitor-flicker-investigation.md) を参照。新規に報告されたタスクバーの前面表示は §1.426 として v4.8.1 で修正した。
+- 既知条件 (報告者): F11 / F12→F11 の両方、拡張表示の FHD 側だけ、同一 GPU の DVI-D / HDMI、100% / 60Hz。カーソル位置に関係なく UI 全体が点滅し、一時停止・上 HUD 固定で収まるが下固定は無効。720p は OS 拡大で収まるが 1080p は収まらない。これらを再質問しない。
+- v4.7.0 の `27fa289ee` は自前 raise の `SWP_NOSENDCHANGING` と NOZORDER 通知の除外を実装済み。>>570 は「完全な解消は難しかったよう」との返信で、未解消の趣旨だが改善量・再試験条件は不明。修正漏れやドライバー原因と断定せず、自己循環の修正を未着手へ戻さない。
+
+**先に進める改善・計測**
+
+- [ ] **定常再生中の軽い診断**: raise の要求元・適用/不適用数、geometry 要求/実変更数、region の hash と実描画状態、DComp attach/detach/Commit、動画/HUD の Present と surface 更新を window epoch・時刻で関連付ける。source/SAR/回転、映像/各 HWND の矩形、実効ロック、モニター/DPI、D3D11/DX12 の adapter identity も変化時に記録する。1秒程度の集約とし、同期 I/O や新しい常時 tick は追加しない。既存 observer は遷移外を記録しないため、それだけで完了にしない。
+- [ ] **HUD geometry の冪等化**: 同一位置・サイズへの `SetWindowPos` を owner 境界で省く。Resize / GeometryChanged / DPI / F11 / monitor 移動 / 再生成を同じ境界で確認し、外部変更後の再適用を落とさない。上流の z-order-only 通知除外や renderer の同サイズ判定だけでは HWND 操作は抑制されていない。ただし定常再生での反復と点滅への因果は未確認。
+- [ ] **HUD の attach/detach を最終描画境界へ集約**: 1 input batch 内の複数 logical pass の途中で非表示になっても、その時点で実 DComp detach を発行しない設計を確認する。最終表示結果に一度だけ適用し、最終表示なのに中間で detach/再attach/Commit する経路を除く。最終非表示・無描画・close/cancel・device/surface 終端と delta 完結は維持する。入力のない常時点滅の原因とまでは扱わない。
+- [ ] **必要な場合だけ前面化する所有規則**: 実 z-order と正規要求の由来を確認し、既に正しい順序なら不要な操作を減らす案を検討・検証する。VST editor/popup の非同期変更後の復旧、0/16/50ms burst、foreground/epoch/transition permit を維持し、予約時点の一度の判定だけで後続復旧を消さない。§1.385 と整合させ、EffeTune を無条件に VST allowlist へ加えない。
+- [ ] **§1.382 の egui/wgpu 更新前後比較**: 0.37 更新計画 (作業ツリー `G:\home\mimageviewer-egui036\docs\egui-0.37-update-plan.md` §4.9) と連携する。HUD の renderer/present と余分な repaint の本家修正は関係し得るが、動画 D3D11・分離 HWND・基本 Present 方式は維持する計画であり、更新だけで点滅が解消するとは告知しない。透明 alpha、色空間、VSync/latency、実矩形・実効ロックを照合し、前後比較用ログを残す。
+
+**開発側の診断比較と、その結果による追加対策**
+
+- [ ] **映像の寸法と位置・重なりを分離**: 同一1080p動画で、映像寸法を固定して Y 位置/上 HUD との重なりだけを変える診断を行う。上/下固定の差を「縮小したから」だけで説明しない。720p/1080p・4:3/16:9・OS/アプリ拡大も既知結果と照合する。
+- [ ] **分離 HUD の有無**: `MIV_HUD_OVERLAY=0` の既存 fallback と通常経路を比較する。fallback は VST editor 裏へ HUD が潜り得るため、比較結果だけで製品の既定へ変更せず、必要なら z-order/入力を保つ合成構成の再設計へ進む。
+- [ ] **透明カバーの有無・合成経路**: 既存 `MIV_DISABLE_MPO_COVER` の有無を個別比較し、透明カバーの実効性を測る。同じカバーの重複追加や、完全透明だから MPO を抑止できるという決め付けをしない。位置・カバー・swap chain 属性が関係すると分かったら、既存画素・拡大品質・操作を保つ局所変更を設計する。
+- [ ] **PresentMon/ETW の確認**: アプリの配置・region・attach・raise が安定しているなら、動画/HUD swap chain 別の PresentMode・表示時刻をアプリ時刻と突き合わせる。Present 成功や画面キャプチャに映らないことを、物理表示が正常な証拠にしない。
+- [ ] **必要な場合の表示同期・合成構成の設計**: 上の証拠に応じて submit/present の順序・同期、surface 寿命/色空間/alpha/latency、HUD と動画の同一 DComp tree 等を検討する。単一 HWND 化や Present 方式の交換は独立した大きい設計単位。遅延・GPU負荷増、VST前面操作や既存機能の縮小を伴う案は、具体的な費用と代案を示して利用者判断を取る。
+- 今は採らない回避策も調査 §7 に保持する: 上固定/1px余白/微小な不透明面の強制、OS拡大の強制、等倍でも全件shader化、WINDOWPOS由来raiseの全廃、Windows全体のMPO無効化やdriver変更の報告者への依頼。`CreateSwapChainForComposition` に合わない bitblt / `DXGI_SCALING_NONE` への属性だけの変更は行わない。
+- 受入: 改善ごとに独立した差分・回帰と実施結果を残し、設定/画質/表示領域、VST/EffeTune、上下HUD/パネル/ストリップ、IME/focus、最前面、F11/F12・park/promote・複数窓を維持する。detached へ触れる変更は構造的修正の合意を取る。実画面試験は隔離portableと当該runの承認が必要。報告者へ思い付きの試験や既回答の質問を重ねず、追加依頼が必要なら通常操作1回と診断ZIP程度へ集約する。
+- 規模 / 優先度: 先行改善・診断 Small〜Medium / P2。合成構成の再設計は証拠次第で Medium〜Large。次版への一括収録や点滅解消を確約しない。
+
 ### 1.385 動画フルスクリーンで、VST の窓に重なった下 HUD が前に戻らない — 利用者の実機観測 (2026-10-15)
 - 観測 (利用者、v4.7.0 候補 = HUD 前面化の自己循環を止める修正の前): 動画フルスクリーンで VST の窓を下 HUD に重ねると、下 HUD は VST の窓の後ろのまま。カーソルを下端にしばらく乗せても手前に来ない。上 HUD を出すと、VST の窓が上 HUD に重ならない位置へ移動する。
 - 設計 (docs/vst3-integration.md の Z-order ポリシー) では、VST の z-order 変更時の raise burst と、上下端の hover polling (cursor が activation zone にあり 200ms 以上経過) で HUD を戻すことになっている。独立レビュー (2026-10-15) の読み: VST の窓が帯を覆うとマウス入力が VST に届き、polling の `cursor_input_owned` を満たせない。presenter→登録 editor の移動では app-active が変わらず hook も発火しない。
@@ -39,13 +411,18 @@
 - 対応: 下 HUD の帯に VST の窓が重なったときの復帰経路を、所有境界 (どの窓が前に来たかの通知) で設計する。delay や繰り返しの raise を足さない。サブモニターの点滅調査 (docs/video-secondary-monitor-flicker-investigation.md) の診断と合わせて扱う。
 - 規模 / 優先度: Medium / P3。
 
-### 1.384 倍率の違うモニターで、別ウィンドウの動画が画面の外に出て戻せなくなる — 利用者の実機報告 (2026-10-15)
-- 観測 (利用者の実機 + ClaudeCode の読み取り専用の窓情報): モニターの倍率が DISPLAY1/2 = 150%、DISPLAY3 = 100%。動画は別ウィンドウで開く設定。別ウィンドウの動画を DISPLAY3 へ移して F11、メインのフォルダ変更で promote、メインで別の動画をダブルクリック → 新しい動画の窓が物理 9000,2270〜11880,4070 (DISPLAY3 の矩形の 1.5 倍、画面外) に作られ見えなくなった。Win+Shift+← と F11 では戻せず、ClaudeCode が SetWindowPos で DISPLAY1 へ移して回復。
-- 原因 (読み取り調査、コード参照、実機の同一手順での再現は未実施): 保存する配置はその窓の DPI だけで論理化し、元のモニター・DPI を持たない。全画面の新規作成では選んだモニターの DPI で論理化した矩形を、作成直後の HWND の DPI (150%) で物理化するため倍率がずれる。F11 解除の restore も同じ境界。**v4.6.0 から同じ経路があり、v4.7.0 の退行ではない** (関数単位の比較と依存版の一致)。連続再生では HWND を再利用し、F12 往復で再生成すると再発する。
-- 直し方の方向: 窓ごとの geometry owner が通常配置・全画面対象・restore・座標変換をまとめて持ち、デスクトップ位置は物理座標、全画面は対象モニターの物理 rcMonitor を直接使う。新規作成・F11・F12・promote を同じ変換境界へ通す。画面外を見つけて戻す後付けの補正を主修正にしない。既存の保存値は元 DPI を持たないので移行も設計する。BA-6 / R2c (主)、BA-7 / R2b、BA-2。中規模。detached のルールに従い双方レビューで構造的修正の合意を取る。
-- 再現: 150% と 100% の 2 台で、100% 側を右へ離して配置。別ウィンドウ動画を 100% 側で F11 → promote → メインから別動画、または F11 → F12 → F12。自動テストは異なる初期 DPI の HWND に適用した後の物理矩形を検証する。
-- 調査全文: ClaudeCode の 2026-10-15 セッションの OFFSCR1 (scratchpad、要点はこの節)。
-- 規模 / 優先度: Medium / P2 (見えない窓から製品内で回収する手段がない)。
+### 1.408 倍率の違うモニターで、メインから開く全画面の窓の配置が §1.384 と同じ境界を通る — §1.384 の設計で判明 (2026-10-20)
+- 内容 (コードの参照。利用者の報告は無く、実機での発生は未確認): メインから開く全画面 viewport
+  (`ui_fullscreen.rs` の `fullscreen_viewport_geometry` と builder) は、対象モニターの矩形をそのモニターの DPI で論理化し、
+  builder の位置・大きさとして渡す。egui-winit / winit はそれを作成直後の HWND の DPI で物理化するので、
+  作成直後の窓の DPI と対象モニターの DPI が違うと、§1.384 と同じく倍率がずれうる。
+- §1.384 で直さない理由: 物理座標で配置してから見せるには、その viewport の HWND を生存世代と対応付けて得る境界が要る
+  (今は detached の HWND registry ではなく command binding で扱っている。rect 一致探索の拡張は不可)。
+  設計と経緯は [detached-dpi-placement-plan.md](detached-dpi-placement-plan.md) §3.8。
+  同じ箇所の全画面の背景 (`fullscreen_backdrop_physical_rect`) は §1.384 で物理の `rcMonitor` に直した
+  (§1.384 は 2026-10-21 に master へ取り込み済み、7d664b275。別ウィンドウ側の変換境界は `src/detached_window_geometry.rs`)。
+- 着手時: まず倍率の違う 2 台で、メイン窓を 100% 側に置いて静止画・動画を全画面で開き、窓の矩形を確かめる。
+- 規模 / 優先度: 未見積もり / P3。
 
 ### 1.383 parked-live の音楽ウィンドウで Norm のゲインが鍵盤の明るさに反映されない — HarmNet 鍵盤の設計レビューで判明 (2026-10-12)
 
@@ -57,12 +434,6 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 - 直し方の案: parked-live でも既存の `info.normalize_ui_state.applied_gain_db()` を渡す。detached の描画経路に触れるので、
   凍結ルールの手続き (双方の合意と `docs/detached-rework-plan.md` §11 への記録) が要る。
 - 経緯: `docs/music-keyboard-harmnet-plan.md` §10 / §12 (P4)。
-
-### 1.382 egui / eframe / egui-wgpu を 0.33.3 から 0.36 系へ上げる — 次の版の次の最初の作業 (2026-10-14 利用者決定)
-
-依存物の更新確認で 3 段階遅れと判明。本家の更新履歴で見た主な差: 0.34 で文字描画の仕組みの交換 (ab_glyph から Skrifa + vello_cpu)、`App::update` から `App::ui`、`Panel` への統一、Area/Window/ScrollArea がフォーカスを取らない、MSRV 1.92。0.35 で非推奨 API の削除、IME の下線・カーソル表示と `owns_ime_events`、harfrust のシェーピング、Window はタイトルバーだけで移動。0.36 で `Modifiers` が入力イベント化、MSRV 1.95 (開発機は 1.94.1)。
-- 影響の見込み: UI snapshot (約 350 枚) の描き直し、`ui_fonts` の baseline 補正 (ab_glyph の外形計測) と `ime_focus` の作り直し、vendor の egui/eframe/egui-wgpu の変更の付け直し、wgpu 27 から上がる場合の動画表示部分。
-- 別セッションの日本語入力修正 (次の版に入る) は、`vendor/egui-winit` を本家 0.34 以降と同じ形に揃えてあり、上げるときは `vendor/egui-winit` を消すだけで済む見込み。
 
 ### 1.381 自動テストが一時フォルダーを消せずに %TEMP% へ大量に残す — Everything が応答しなくなった件の調査で判明 (2026-10-14)
 
@@ -84,173 +455,6 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 - 内容 (コードの参照、実機での再現の主張ではない): 補正レイヤー (ローカル調整) の図形をポインタで操作している最中に、キーで移動・回転すると、(1) 履歴に別操作が混ざる (key entry が S0→S2、pointer entry が S1→S2)、(2) 次のポインタ更新が開始時の DragState.base から結果を作るのでキーの変更が上書きされる、(3) Esc で確定済みのキー変更が画面だけ消える、が起こり得る。経路: `ui_adjustment_panel.rs` の `update_selected_local_adjust_shape` / `apply_local_adjust_shape_drag_from_canvas` / Esc 処理、`undo_ops.rs` の `set_local_adjust_layers_for_idx_with_undo`。
 - 案 (worktree mimageviewer-nextfix の docs/page-adjustment-owner-plan.md §9 に根拠と候補): ポインタを押したままでもキーを受け付け、別操作の受理の境界でそれまでのポインタ変更を確定して継続の基準を更新する。判断点は交互入力の Undo の粒度と Esc の取消範囲。ポインタ中のキーを拒否する案は、できる操作が減るので採らない方向。
 
-### 1.378 音響調整 (EffeTune) の窓をタスクバーに表示する設定 — 利用者要望 (2026-10-12)
-- **次の版に入れる (利用者 2026-10-12)**: 案 A = 窓にタスクバー表示の印を付ける (mIV のグループとは別のアイコン)。**ON/OFF の設定、既定 ON**。案 B (AppUserModelID で mIV のグループに入れる) は既存のピン留め・ジャンプリストへ影響し得るので今回は対象外。
-- 現状: EffeTune の窓は mimageviewer-vst3-host.exe が作る **owner なし**の窓 (mIV を最小化しても表示を続けるため。main HWND は参照用) で、タスクバーに出ない。音響調整ボタンは背面なら前面化、前面なら隠す (利用者が 1 回で前面化を確認)。
-- 作業: worktree mimageviewer-nexteffetune で設計・実装中。
-
-### 1.377 PDF のサムネイル要求の取り消しが、別ウィンドウの同じ PDF の要求まで取り消す — Everything 設計の調査 (2026-10-12)
-- **master 統合済み (420b38a14、2026-10-12)**。`4510346f5`、計画 `docs/pdf-render-epoch-ownership-plan.md`。
-- 内容 (コードの参照、実機での再現の主張ではない): 一覧の失効で PDF レンダの世代 (`CURRENT_CONTEXT_EPOCH`) をプロセス全体で進めるため、別の viewer context の同じ PDF / ページの要求も古いとみなされて取り消され得る。優先昇格もパスとページだけで照合していた。修正は世代を所有する viewer context ごとにした。
-
-### 1.376 起動記録 (startup-logs) が 0 バイトのまま残る起動がある — v4.6.0 でも残る (2026-10-12)
-- **次の版に入れる (利用者 2026-10-12)**。
-- 内容: `%LOCALAPPDATA%\mimageviewer\startup-logs` の core / launcher の記録が 0 バイトの起動がある (v4.4.0 で 10 件すべて、v4.6.0 の開発機でも一部)。実装担当がテストで OS error 33 (共有ロック中の書き込み) を再現している。**訂正 (2026-10-12、実装担当の確認)**: Store 用の切り分け版 (next-alloc の `90a8a9353`) の書き込み修正は、`642ed1ee5` で master に移植済み (v4.6.0 に入っている、`crates/startup-diagnostics/src/output.rs`、`docs/startup-diagnostics-plan.md` §10.4)。開発機で 0 バイトだったのは 10-11 19:25 と 10-12 00:22 の 2 組だけで、00:22 は v4.6.0 の配布ビルド中。ビルドやテストの短時間起動かを確認中 (worktree mimageviewer-nextfix)。
-- 対応: 短時間起動による空ファイルなら仕様として記録する。そうでなければ原因を調べる。Store の起動停止の調査 ([MS Store の記録] の v4.1.0 / v4.3.0 却下) で、止まったときの手がかりになる。
-
-### 1.375 フォルダで Delete キーで削除すると、正しく消えた一覧がもう一度丸ごと読み直されてちらつく — 利用者の実機報告 (2026-10-12)
-- **次の版に入れる (利用者 2026-10-12)**。
-- 独立設計レビュー `001a0dabf`: **REVISE**、指摘をR2/R3へ反映しR3はACCEPT。第一段Delete／第二段改名・move・copyの受入範囲を分ける。
-- 状態 (2026-10-14、next-list): **R10はLISTrev13独立設計レビューACCEPT・実装／独立コードレビュー／自動検証完了（2026-10-14）、実機確認待ち**（targeted406実行／391件、fmt・通常／portable check・最新dev成功、full最終13,531成功／0失敗／ignored63）。[設計書](section375-operation-reconcile-plan.md)のとおり、前回／今回の走査の行signature（名前・種類・サイズ・更新日時・投影後順序）一致時だけinstall・世代・thumb再要求を省く。記録不明は通常reload。sidecar stampと別context／RemoteのDB反映資格は判定外、自動sidecar取込は行差分reloadでもしない。未反映のDB値・外部sidecarは明示GridReload／開き直しで反映する利用者許容。代表保持・cache変更／移行・共有表示storage・自己操作ID／provenanceは撤回。§1.314、context別購読・dirty／cutoff、forkの記録継承と独立購読、§1.373のAppend／Undo契約を維持。LISTrev13 P3のdefer→一覧復帰／restart／Resumedの自動取込0回と、その直後の明示GridReload／通常openで設定どおり取込む対照、実Delete handler、1万／10万行perf、描画／scrollの同期DB query数を検証済み。最初のfullの3失敗は原因修正と元assert維持で補完し、最終gateを完走。過去の方式の試験をR10の受入証拠に流用しない。
-- 観測 (利用者): 一覧で Delete キーでファイルを削除すると、削除した項目がすぐ消えた一覧になるが、その後にもう一度一覧全体が再表示される。遅れて起きるのでちらついて見える。
-- 見込み (利用者・未確認): mIV 自身の削除をフォルダ監視が外部の変更として検知し、読み直している。自分で削除して既に正しい状態なので、余分な読み直しになっている。
-- 調査済みの経路: 削除（ごみ箱／完全削除、通常フォルダ／ZIP・PDF本体／検索結果／Collection）と監視→再走査→一覧採用、改名・move・copyの同型を設計書へ列挙。R10は自己由来を判定せず、走査層の行signatureだけで比較する。元owner・source・世代・投影条件と前回記録の有効性を採用直前に照合し、時間窓で通知を握りつぶさない。
-
-### 1.374 Everything IPC を使う任意のファイル名検索を試験的に検討する — mIV スレ >>546 (2026-10-11)
-- **master 統合済み (420b38a14、2026-10-12)**。既定キー Ctrl+R、計画 `docs/everything-search-plan.md`。coordinator が隔離データで実機確認 (案内 3 種・取消・取得 10,000 件・開いて戻る)。
-- 状態: **未着手。実現性を検証してから採否を決める**。USN 変更ジャーナルを mIV に直接組み込む案 (§1.374 の対象外) の代替候補。
-- 目的: Everything が既に索引したファイル名を mIV から素早く探し、結果を mIV の一覧・サムネイル・閲覧操作で扱えるか試す。既存の Ctrl+S/Ctrl+G、タグ・レーティング等の mIV 索引は置き換えない。
-- 試験案: 新しいキー割り当て可能な操作とメニュー導線から検索を開き、ローカルで起動中の Everything へ IPC / 公式 SDK で問い合わせる。返った実ファイルのパスを mIV 対応形式に絞り、既存の仮想検索結果一覧へ渡してサムネイルを非同期生成する。まずは問い合わせ時点の結果を表示する単発検索に限定し、常時追従は対象外。既定キーは競合を確認して決める。
-- 確認事項: Everything 未導入・未起動・索引未完了時の案内、複数ドライブとお気に入り外のパス、削除済みファイル、大量ヒットの件数制限/段階表示、検索中の取消と UI 応答、結果から開く/戻る、既存検索結果ビューの所有状態との分離、SDK の同梱要否とライセンス。Everything の検索範囲・索引更新は Everything 側の設定に従い、mIV の索引やメタデータ検索と同一の結果は保証しない。
-- 規模 / 優先度: 試作は Small〜Medium、本実装は既存検索 UI との統合・回帰確認次第 / P3。
-
-### 1.373 本棚ツールバーの右クリックで本棚へ追加した操作を Ctrl+Z で取り消す — 利用者の要望 (2026-10-11)
-- **次の版に入れる (利用者 2026-10-12)**。
-- 状態 (2026-10-13、next-list): [設計書](section373-book-append-undo-plan.md) **R7実装・通常rescan退行修正済み、独立実装レビューACCEPT（§7.7–7.10）、最終full gate成功**。各destinationの八store初期化を同じAppend workerで画像作成前に同期完了し、ファイルの出現を公開点にする。stagingなし。独立metadata worker／後着copy reportの値採用を撤去し、global存在集合は既存receiverの現在DB再取得へ接続する。初期化後の作成失敗のorphan行はログ・通知で割り切り、rollbackを追加しない。R4自動観測配送、ごみ箱実移動確認・UndoAppend限定排他は維持。§1.373のRefreshList導入が操作／明示選択を後から旧cursorへ戻す退行を起こしたため、既存hydrationで一度だけ優先解決する。★固定の物理子はstartup資格と分離してsource／prefixを照合する。回帰4件追加、最終targeted279実行／237件、fmt・通常／portable check・確認用build成功。追加findingによるfull中断一回を別記録にし、最終完走一回でworkspace 13,439件＋vendor 54件＝13,493成功・0失敗・既存ignored63件。§1.375設計・manualは変更していない。詳細・証跡は§7.10。先のDB時間計測／release buildの履歴は§7.9に残す。瞬間的な同bytes差し替えは既定の割り切り方針による。membership DB／登録済みバッジは今回追加しない。
-- 要望 (利用者): 本棚ツールバーで項目を右クリックして本棚 (製本) へ追加したとき、たまに違う本棚に入れてしまう。今は本棚を開いてファイルを消すしかないので、Ctrl+Z で取り消したい。実ファイルの削除を伴うので、状態管理が大変なら「間違えた直後の 1 回だけ」の取り消しでもよい。
-- 着手時の調査範囲: 追加は本のフォルダへの番号付きページのコピー (必要なら焼き込み・再エンコード) ([compile-book-plan.md](compile-book-plan.md)、`src/bake_stage.rs` / `src/books.rs`)。登録済みバッジ (`book_membership_db`) の更新という起票時の前提は、現基点では未実装と確認済み。今回追加したコピーだけを直後一回の既存Ctrl+Z経路でごみ箱へ移す (利用者決定済み)。その後に本の中身が変わっていたら取り消さずに案内する。番号の詰め直しは行わない。複数ページ、並べ替えdraft、後続編集、外部変更、途中失敗とmetadata Undoの扱いは設計書を正本とする (まれな失敗は既定で割り切る)。
-- 規模 / 優先度: Small〜Medium / P3。
-
-### 1.372 検索結果の更新で並びが変わると、画像補正の取り消し・編集途中の内容が別の画像に書かれる恐れ — §1.371 の実装中に判明・コード調査 (2026-10-11)
-- **次の版に入れる (利用者 2026-10-12)**。
-- 状態: **未着手 (時期未定、利用者へ報告済み)**。実機で起きたという報告はまだない。
-- 内容 (Codex のコード調査、v4.5.0 = `1ff9d07df` の行番号): 検索 (Ctrl+G) の結果が届き続けている間に結果の画像 A を補正し、取り消し (Undo) を残したあと、新しい結果の追加で A の位置 (idx) が変わると、取り消しが**その位置に今ある別の画像**へ書かれる。結果の採用 → 一覧の入れ替え (`src/global_search_ui.rs:2672` → `:1860`) は読込済みの編集 map を消すが (`:1921`)、表示中の閲覧の close や `clear_meta_undo` を呼ばない。補正の Undo は idx だけを記録し (`src/undo_ops.rs:544`)、適用時もその idx を使い (`:433`)、保存先のキーは現在その idx にいる画像から求める (`src/app.rs:75911`)。形状キーの編集途中が入れ替え後まで残ると、確定時に古い `fs_idx` へ書く (`src/ui_adjustment_panel.rs:11792` / `:11804`)。通常フォルダの★絞り込みの作り直しは idx を変えないので該当しない。
-- 直し方の候補 (§1.371 の実装担当の案 A): 補正の Undo と各編集途中の記録に、所有する viewer context・ページの安定したキー (既存の `PageAdjustmentTarget` / `AdjustUndoScope::PageKey`)・世代を持たせ、保存と取り消しを元の画像へ配送する。製品 8〜12 ファイル。より単純な代替: 一覧の入れ替え時に、編集途中を確定し補正の Undo を消す既存の終了処理 (★再採用と同じ境界) を通す。どちらが良いかは設計時に比べる。
-- 規模 / 優先度: Medium / P2 (利用者のデータを別の画像へ書く恐れがあるため)。
-
-### 1.368 mIV Remote で大きい本を区切って送ると、見開きの組が PC とずれる — §1.364 の D3 で確認 (2026-10-11)
-- **次の版の後で検討 (利用者 2026-10-12)**。
-- 状態: **未着手 (時期未定)**。§1.364 では既存の動きを変えず、リリース済みの制限として記録した。
-- 内容 (コードの参照・テスト上の確認。実機での再現はまだ誰もしていない): Remote の一覧応答は件数の上限で区切ってから見開きの組を作り、区切られた応答では `complete_book_eligible=false` になって表紙の次の単独表示や末尾の扱いが外れる (`src/remote_ipc/container.rs` の `ContainerEntryBudget` / `enumerate_*` / `spread_payload_with_read`、`src/ui_fullscreen.rs` の `build_remote_spread_page_groups_with_shift`)。例: 左開き・表紙単独・表紙の次を単独にする設定で、PC は `[0], [1], [2,3]` だが、先頭 4 件で区切った応答では `[0], [1,2], [3]`。左開き 4 ページの `[2,3]` は 3 件で区切ると `[2]` だけの単独になる。Web 側の `normalizeContainerPageGroups` (`crates/remote-web/web/app.js`) は応答に無い相方を含む組を拒否する。master (dd511eea、ずらし無し) で同じ。
-- 直し方の検討事項: 組を意識した区切りか、省いた相方を表す / 取りに行く契約。いま開けるページを減らさず、省いたページの寸法を全部読む走査を避ける。上限の意味、開く・操作のコスト、Web の正規化と描画キー、IPC / アセットの版。ずらし有無、左右開き、表紙、強制単独、横長の境界を試験する。§1.364 の上限や変換書庫の base キーはこの項目では変えない。
-- 規模 / 優先度: Medium / P3。
-
-### 1.369 名前/コンテナ索引 (Ctrl+S) の書込失敗が通知・再構築へ揃っていない — §1.367からの引き継ぎ・コード調査 (2026-10-11)
-- **次の版に入れる (利用者 2026-10-12)**。v4.6.0 公開直前の索引 merge 誤通知 (bb6ca0c66) と同じ系統。
-
-- 現状: FullのDB更新/削除失敗はFailed結果になるが、通知と名前索引の既存rebuild markerへ接続されない。watcherのdelete_subtree、parent refresh、subtree upsert/prune失敗もlog等のみで、削除失敗でもupdates_appliedが増える入口がある。実機再現を主張する項目ではなく、コードで確認した同型経路の残件。
-- 境界: §1.367では共通UIのFull失敗表示だけを合わせる。本件は`search_index.db`の書込failureを扱い、FTS reporterや`fts_meta.db`のpendingを流用しない。入口/出口の棚卸しとcode refsは[fts-integrity-plan.md §6.2](fts-integrity-plan.md)を参照。
-- 対応: DB書込failureをlog+通知+既存`SearchIndexDb::request_rebuild_on_next_start` (`src/search_index_db.rs:472`)へ揃え、次回writable openの`rebuild_names_if_requested` (`:944`)を再利用する。watcherの成功件数を訂正し、Full完走印のwrite失敗 (`src/name_index_supervisor.rs:553`) も通知を棚卸しする (それだけで再構築が必要とは決めない)。
-- 維持する条件: FS観測不完全/cancelとDB書込failureを区別し、不完全観測時のprune抑止と既存clear失敗のmarker経路を維持する。追加retry/回復workerや回復失敗の再回復は作らない。類似索引はSQLite正本から派生配列を再生成し、Failed/Degradedも表示するため、このFTSの破棄順序対策を機械的に適用しない。
-- 回帰: Full DB failure、watcher削除/upsert/prune failureの通知・名前索引marker・成功件数、正常Full/watchと不完全FS観測時のprune抑止。着手/リリース優先度は別件として管理担当が決める。
-
-### 1.242 本の構成 — ZIP / PDF / 本フォルダごとにページの並びを非破壊で編集する (2026-09-15)
-- **次の版の柱 (利用者 2026-10-12)**: G1〜G4 (ZIP/PDF/EPUB) は独立レビュー済み。**G4F (画像だけの本フォルダ) は切り離し** (画像だけのフォルダでは「ZIP に変換してから」と案内)。新規 = **画像フォルダを ZIP に変換する機能** (フォルダと同じ場所に作る / 同名 ZIP があればエラーで止める / タグ・★・ページ補正などを最初から引き継ぐ / 変換中はモーダル / 同名の ZIP があるフォルダは一覧と Ctrl+↑↓ で飛ばす設定を「同名ファイル」に追加し既定 ON)。
-
-- **利用者追記 (2026-10-12)**: G4Fを切り離し、ZIP/PDF/EPUBのG1〜G4を維持する。次段は画像だけのfolderを同じ場所の`フォルダ名.zip`へStoredで変換し、元folderと元データを保持して利用者データを最初からZIP側へ複製する独立機能。同名ZIPなら停止、変換中はmodal。folder右クリックと構成対象外案内に入口を置く。同名folder省略の当初2フラグ案は後続の案Bへ置換（次項）。[設計案](image-folder-to-zip-plan.md)は独立レビュー前で、実装は未着手。出荷は2026-10-11利用者決定の次々回release向けであり、下の2026-10-10時点の「次の版」は履歴。
-- **同名設定の後続決定 (2026-10-12・案B)**: releasedの`skip_zip_if_folder_exists`を「本を表示 / フォルダを表示 / 両方表示」の1つの3択へ置換し、新既定は「本を表示」。ZIP/PDF/EPUB/RAR/7z/LZHを通常一覧・Ctrl+↑↓/DFS・Smart・subfolder expansion・Remoteで同じpure policyへ通す。新しい反対向きboolは作らない。移行も2026-10-12利用者決定済み: 旧ON（既定・明示選択とも）→「本を表示」、旧OFF→「両方表示」。旧DB/旧preferences/portableに同じ読み替えを適用し、CHANGELOGと`src/version_highlights.rs`の重要な変更点で告知する。元のフォルダ優先の見え方に戻す場所は環境設定「同名ファイル」の「フォルダを表示」。詳細は[設計§8](image-folder-to-zip-plan.md)。
-- 出典: §1.240 (>>402) の検討から利用者が発展させた構想。スキャンミスで入れ替わったページの補正、
-  複数の本を 1 ファイルにまとめた本の左右合わせなど、本ごとに違う崩れを直したい。
-  マンガミーヤにも同種の機能 (ページ編集での白紙挿入・削除・切り取り / 貼り付け。書庫は書き換えず
-  リスト情報として保存) があった。
-- **次の版の決定 (利用者 2026-10-10)**: §1.364 の要望を受けて次の版で進める。ライン G (worktree mimageviewer-nextbook) を新設し、設計と独立設計レビューを先行する。実装で見開きの組み立て・items の生成に入るのは、同じ経路を触る §1.342 (ライン E) を master へ取り込んでから。§1.364 とは上の方針で分離する。
-- 着手条件: §1.239 と §1.240 のリリース後 (v4.1.0 で出荷済み)。
-- 利用者向け仕様 (2026-09-15 利用者決定):
-  - 構成は ZIP・PDF・本フォルダに個別に作る。入れ子の ZIP は閲覧と同じく**階層ごと**に作る。
-    **製本は対象外**。変換して読む RAR 等は**元の書庫側**に付ける。
-  - 構成がある本は、通常の表示設定より構成に従う。**見開き設定 (表紙あり / なし、右開き / 左開き) も
-    構成に含める**。**2026-10-10 利用者方針**: 構成がある本では一時ページずらし (Ctrl+←/→ と §1.364 の本ごとの記憶) を使えない。見開きの組を変えたいときは構成の編集で行う。構成を作る前に保存したずらしの扱い (例: 構成の初期値に反映して消す) は設計時に決める。見開き設定切替の扱いは未変更。
-  - 構成の編集でできること: ページの並べ替え / この本での非表示 (ファイルは消さない) /
-    任意の位置への白紙の挿入 (表紙裏、話数の途中、まとめた本の境目など) / 見開きの組の変更 /
-    単ページの配置。
-  - 編集を始めた時点で、そのときの自動の規則 (表紙の単独表示、横長の単独表示、末尾表紙、
-    単ページの片側配置、§1.239・§1.240 の設定など) を当てた並びを初期値にし、以降は手動で編集する。
-  - **一覧 (サムネイル) も構成の順**にし、非表示ページは出さない。非表示ページなど元の状態は
-    構成の編集画面でだけ見える。
-  - 非表示ページをしおり・検索・評価一覧・読書位置などから開こうとしたら、エラーのトーストを出して
-    開かない。
-  - 構成に無いページ (本フォルダに後から増えたファイル) は末尾に追加する。
-  - 一覧での一括書き出し・製本への追加は、構成の順に並んだ一覧で選んだものを対象にし、非表示ページは
-    対象にしない。出力順は構成の順が望ましいが、元の順でも許容する。
-  - **横長画像の分割は構成に含めない**。閲覧時のモードとして独立させる (mIV Remote の端末ごとの設定
-    「縦長画面では見開きを解除する」`crates/remote-web/web/app.js:11536` と同じく、本のデータではなく
-    見方の設定として扱う)。
-  - 非表示は「削除」と呼ばない。既存の削除は実ファイルをごみ箱へ送る。
-- 設計前提 (2026-09-15 のコード調査。未実装・設計レビュー前):
-  - **構成は本のアイテム列を作る時点で適用する** ([§1.14 の本の読み順](archive/folders-archives/book-page-order-plan.md)
-    を名前順固定から構成順へ広げる形)。一覧・読み順・見開き・シーク・連結読み・F12 別ウィンドウ・
-    一括書き出し (`grid_selection_indices` は items の番号順に並べる、`src/ui_fullscreen.rs:42759`) が
-    すべて items に従うので、揃えて変わる。非表示ページは items に存在しないので、到達時にトーストを出す
-    だけで済む。
-    - 読み順のレイヤーだけで適用すると、読み順を独自に作り直している箇所 (単ページの次 / 前、
-      スライドショーの先頭戻り、Ctrl+↑↓ の着地、閲覧履歴の位置、F12 の表示列、mIV Remote) と食い違う。
-    - `visible_indices` は昇順前提の `binary_search` で使われている (`src/app.rs:112` ほか)。items 自体を
-      構成順に作れば昇順のまま保たれる。
-    - 末尾表紙・片側配置の適用条件は「読み順の枚数 = items の数」(`spread_complete_page_permutation`、
-      `src/ui_fullscreen.rs:15596`)。非表示ページが items に無ければ成立したままになる。
-  - **下準備: 本のアイテム列を作る処理の一本化**。ZIP 系 (`finalize_zip_enumerate` /
-    `zip_nav_show_current_level` / `zip_nav_handle_ctrl_updown` / `zip_nav_dfs_fullscreen`)、画像だけの
-    フォルダ、PDF 列挙に加え、しおりとスナップショットのジャンプ (共通の `resolve_archive_bookmark_target`
-    が階層を作り直す、`src/book_bookmarks.rs:1554`、`src/app/snapshot_ops.rs:1775`) と mIV Remote
-    (`src/remote_ipc/container.rs` の列挙) が別に列を作っている。Remote の `enumerate_zip`
-    (`container.rs:4605`) は本体と同じ並び順の定数で階層を作るが `arrange_grid_items` は通らない。
-    これで本体と並びに差が出るかは未確認。
-  - 構成の編集画面は items を触らずに元の並びを別に作って構成を重ねる。保存したら本を読み込み直し
-    (items の世代を進める)、表示中のページへ `PageIdentity` で戻る。items をその場で並べ替えないので、
-    items の番号をキーにしたメモリ上の編集状態はずれない。
-  - **白紙は構成の要素として持ち、`GridItem` や偽のパスにしない** (§1.240 と同じ)。構成は「ページ /
-    白紙」の並びとし、白紙と組んだページは「1 枚 + 空き側」として描いて `SpreadPair::Single` へ
-    解決する (§1.218 の片側配置と同じ扱い)。こうすると編集・書き出し・取り込み・外部ツールは白紙を
-    一切見ない。
-    - 白紙を見開きの片側の「ページ」として持つと壊れる箇所: 見開きの型が実在ページの番号 2 つを要求
-      (`SpreadPair::Double`、`SpreadPageOccurrence.idx`)、編集ツールの入口は見開きなら左ページを選んで
-      単ページへ切り替える (`plan_page_edit_pivot`、`src/app.rs:9303`)、見開きの描画は片側のテクスチャが
-      無いと両側とも出さない (`src/ui_fullscreen.rs:38470`)、書き出し・取り込み・外部ツールの合成。
-    - 白紙は一覧と単ページ表示には出ない。見開きの組とページ送りの単位にだけ効く。
-  - 見開きの組み立て (`build_spread_display_units_with_predicates`) は「隣接 + 横長判定 + セッション限りの
-    ずらしアンカー 1 個」しか表現できない。構成の組と白紙を入力に取れるようにする。見開き単位の
-    キャッシュの token と読み順キャッシュの鍵 (`items_generation`, `reading_flow`) に構成が入っていない。
-  - 読書位置 (`book_resume.db`) は items の番号で保存しているので、構成を保存したら識別子で解決し直す。
-  - 保存先は本ごとの独立ストア。`rename_key_migration` の `STORES`、削除時の purge、メタ情報エクスポート
-    (`metadata_transfer` の版上げ)、内容 ID による復元、F12 のバンドル、mIV Remote に登録する。構成の中の
-    ページ識別子は 1 ファイルのリネームでは書き換わらないので、しおりと同様の個別移行
-    (`src/book_bookmarks.rs:1479`) か、解決時に欠落を許容する。
-  - 変換した書庫のキーはストアによって割れている (ページ単位の編集と `spread.db` はキャッシュ ZIP 側、
-    しおり・表紙ピンは元の書庫側)。構成は元の書庫側に付ける前提で、対応付けを設計で確定する。
-  - 表示トリムの本単位の見開き左右別設定 (`ViewTrimBookSettings.spread_separate`、`src/view_trim.rs:163`)
-    が、組を変えたときにどのページへ掛かるかを設計で確認する。
-- 規模 / 優先度: Large / P2 (次の版)。本のアイテム列の一本化と mIV Remote の列挙統合が工数の本体。
-
-### 1.363 操作のスクリプト (複数機能の連続実行・状況に応じた動作の切り替え) — 利用者要望 (2026-10-10)
-- **次の版の後で検討 (利用者 2026-10-12)**。
-- **利用者決定 (2026-10-10)**: 次のリリースの後に検討する。
-- 経緯: 利用者が別セッションで NeeView のスクリプト機能 (`.nvjs`、JavaScript) の使われ方を調べた。出どころはその会話の要約で、ClaudeCode は NeeView 側を確認していない。挙がった実例: 最終ページでもう一度押すと次の本へ、全画面なら解除・通常なら終了確認、決まったフォルダへのワンタッチ保存、パス名で開き方向を自動設定、PNG なら市松背景、閲覧中の本を移動して次の本へ、画像と動画で操作を切り替え。キー・マウス・ジェスチャへの割り当てと、起動時・本を開いたとき・ページ変更時などのイベントで動く。NeeView は外部プログラム実行 (`system()`) やファイル操作の API も公開しており、第三者のスクリプトを入れる危険がある、という整理だった。
-- mIV の既存の仕組み (コードの参照): ファイル名スタックの分割ルールを Rhai スクリプトで変えられる (`src/filename_stack_script.rs`、設計 `docs/filename-stack-scripting-plan.md`)。純関数で I/O なし、`io` / `os` / `eval` を公開しない deny-by-default、操作数・呼び出し深さ・文字列 / 配列の上限、キャンセル付き、失敗時は内蔵ルールへ戻す。ほかに開発用の UI 自動操作スクリプトも Rhai (`src/test_script.rs`、`test-script` feature 限定)。
-- 検討の方向 (利用者と別セッションで話した案、未決定): スタックスクリプトと同じく mIV の中だけで安全に動く範囲に限る。公開するのは許可リストの mIV API だけ (表示中の画像・ページ・本・フォルダの情報、閲覧・表示コマンドの実行、表示設定の一時変更、短い通知)。任意のファイル操作・外部プログラム起動・ネットワークは公開しない。既存コマンドを全部そのまま呼べるようにしない (削除・外部ツール起動などが抜け道になる)。実行時間・操作数・メモリの上限、イベントの連鎖の防止、API の版管理。段階案: (1) 複数コマンドの連続実行 (マクロ) → (2) 条件付き実行 → (3) 内部状態を参照するスクリプト。キー割り当て (`KeyAction` / keymap) や右クリック・ジェスチャへの割り当ては既存の入力カスタマイズに乗せる。
-- 着手時に決めること: 対象の操作とイベントの範囲、許可リストの中身 (レーティング・タグ変更やファイル移動を含めるか)、第三者のスクリプトを入れるときの説明、Rhai を使い続けるか。
-- 規模 / 優先度: Large / P3 (次のリリースの後)。
-
-### 1.362 一括エクスポート (Ctrl+E) を XnView MP の一括変換に近づける — 利用者要望 (2026-10-10)
-- **次の版の後で検討 (利用者 2026-10-12)**。
-- **利用者決定 (2026-10-10)**: 対象は下の「範囲」の 3 つまで。実装は次のリリースの後 (次の版には入れない)。
-- 経緯: 利用者が XnView MP の一括変換 (Ctrl+U) との機能差を埋めたいと依頼。調査報告 = `internal/batch-convert-2026-10/report.md` (XnView 側は公式ガイド https://www.xnview.com/en/how-to-batch-convert-and-batch-process/ で確認した分と未確認の分を区別している)。
-- mIV の現状 (コードの参照、報告書に file:line): 対象は一覧で選んだ画像・ZIP 内画像・PDF ページのみ。形式は PNG / JPEG 95・85・75 だけ (WebP は 1 枚の書き出しのみ、`src/capture.rs:7`)。リサイズは そのまま / 1/2 / 1/4 / 長辺 N px 以下 (縮小のみ)、Lanczos3 固定 (`src/export_dialog.rs:349`)。ファイル名の置換子は `<filename>` `<dirname>` `<num>`、同名は常に連番 (`src/export_batch.rs:58-101`)。一括では EXIF・XMP・AI プロンプト・ICC・元の日付を捨てる (`src/books.rs:1948`)。前回の設定を 1 組だけ記憶。画像ごとに保存した編集 (補正・AI・消しゴム・隠蔽・注釈など) を焼き込めるのは mIV の強み。
-- 範囲:
-  1. **出力の基本**: リサイズ方式の追加 (幅・高さ・短辺・% 指定・枠に収める、拡大の許可、リサンプル方式の選択)、一括での WebP、JPEG 品質の任意指定、「元と同じ形式」、「元と同じフォルダ」とサブフォルダ構造の維持、メタデータ・AI プロンプト・ICC・元の日付を残すかの選択、上書きの扱いの選択、ファイル名の置換子の追加。
-  2. **透かし**: 文字と画像の透かし (位置・大きさ・不透明度)。全件に同じものを掛け、画像ごとの保存済み編集のあとに重ねる。
-  3. **保存形式のプリセット**: 形式・品質・リサイズ・出力先・名前・メタデータ・透かしの設定に名前を付けて保存・呼び出し。
-- 範囲外 (今回は扱わない): 全件共通の一時的なアクション連鎖 (切り抜き・回転・色調など)、複数サイズの同時出力 (XnView MP 1.10.4 の新機能、二次資料で確認)、並列処理、AVIF / JXL / TIFF の書き出し、一括リネーム、コマンドライン。§1.177 (一括の準備で UI が止まる) は関連として着手時に扱いを決める。
-- 規模 / 優先度: Medium〜Large / P2 (次のリリースの後)。
-
-### 1.358 回転＋トリムの入力が描画・capture・PDF要求で異なる — §1.342の設計照合で確認 (2026-10-09)
-- **次の版の後で検討 (利用者 2026-10-12)**。
-- **状態: 別件として起票 (利用者決定 2026-10-09)**。今版の§1.342には含めない。
-- 出典: §1.342の独立設計レビューP2を受けたsource inspection。製品を起動した観測ではない。
-- 現状: [指定サイズ計画 §5.1の例外表](fullscreen-specified-scale-plan.md#51-回転trim-現行例外を新方式でも維持q7決定2026-10-09)。通常単ページliveは回転ページにもtrimを渡すが、見開き・縦横連結unit・capture生成・通常PDF要求のbbox取得は回転ページのtrimを落とす。未回転の相方・分割優先にも経路別条件がある。
-- **利用者決定 (2026-10-09、Q7)**: 今版の指定サイズも既存入力経路と例外を維持する。回転＋トリムの全方式統一は本項で別途扱い、§1.342で新方式だけを統一しない。
-- 着手時: 単ページ / 見開き / 連結 / capture→replay / PDF初回・Z・再要求を棚卸しし、trim・分割・保存回転を一度だけ解決する入力ownerを設計する。既存4方式まで表示範囲が変わる費用と互換性を判断してから実装する。detached経路へ触れる場合は計画§2の構造合意・§11記録も必要。
-- 規模 / 優先度: 未見積もり / P3。
-
 ### 1.354 既存の画像経路の EXIF 読み取りで、小さい入力から大量のメモリを確保しうる — 次の版の音声ジャケット (§1.347) の独立レビューで発見 (2026-10-08)
 - **状態: 今後検討 (利用者 2026-10-08)**。
 - 出典: §1.347 (音楽のジャケット画像) の独立実装レビュー P1。音声の埋め込み画像の経路は、専用の有界な Orientation 読み取りに置き換えて対処済み (next-audio-art、`docs/audio-album-art-plan.md` §20.1)。既存の画像経路は同じ parser を使ったまま残っている。
@@ -260,45 +464,55 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 - 方針候補: Orientation だけが要る経路は §1.347 の有界な読み取り (IFD0 の inline SHORT だけを読み、参照を追わない) を共通化して使う。EXIF の全項目を表示する経路は、entry 数・展開深さに上限のある読み取りへ置き換えるか、`rexif` の更新・差し替えを検討する。
 - 規模 / 優先度: Medium / P3。
 
-### 1.353 ZIP の中の階層で「最新の情報に更新」(Ctrl+F5) すると、ZIP の最上位の階層に戻る — 利用者の実機確認 (2026-10-08)
-- **次の版に入れる (利用者 2026-10-12)**。
-- 独立設計レビュー `001a0dabf` の **REVISE** を反映し、R2設計はACCEPT。`3bfbf1989` 実装レビューのfacet帰路P2二件と、今回のSmart／Collection synthetic rootの追加P2を修正。follow-upコードレビューACCEPT。
-- **状態 (2026-10-12、next-list): [設計書](section353-zip-refresh-location-plan.md) は R2 ACCEPT、facet帰路・起動復元を修正、追加回帰9件、独立最終ACCEPT。targeted618実行／596件・vendor54件・fmt・通常／portable check・最新dev成功。release入力四段成功、full一回exit101の失敗48件を全補完、再実行なし**。全再読込要求に現在 ZIP prefix が入らず root で materialize する。承認設計に従い RefreshList で現在位置を要求・準備・採用まで保持する。現基点の既定 F5 は★5、GridReload は既定キーなしで、Ctrl+F5 専用経路はない。
-- 出典: 利用者が次の版 (next-nav) の §1.339 の実機確認で観測。確認用 ZIP (`表紙.jpg`、`A/01.jpg`〜`A/04.png`、`A/sub/05.jpg`、`B/06.jpg`・`B/07.png`) を使った確認手順の途中で、ZIP 内の階層 (`A`) を表示した状態から Ctrl+F5 で最新の情報に更新すると、ZIP の最上位の階層に戻ったように見えた (スクリーンショットあり)。続く手順は、`A` に入り直してやり直すと意図どおりに動いた。
-- リリース済みの版での実機比較は未確認。next-list 基点で現在階層が要求から欠落する原因をコードで特定 (上記設計書)。
-- 期待: 再読み込みの後も、同じ ZIP 内の階層と絞り込みを保つ。階層が消えた (ZIP が書き換えられた) 場合だけ、残っている最も近い階層へ戻る。
-- 着手時の確認: F5 と Ctrl+F5 の経路の違い、PDF / 変換済み書庫 / ZIP in ZIP の中の階層でも同じかどうか、`docs/virtual-folders.md` の現在位置の扱い。
-- 規模 / 優先度: Small〜Medium / P3。
+### 1.395 窓が大きすぎると Surface::configure の寸法超過で落ちる — 残りは動画 overlay の同型 1 件 (2026-10-18)
 
-### 1.340 複数ウィンドウの画像ウィンドウ内に本のページをタイル表示する — mIV スレ >>509、>>519 (2026-10-07)
-- **次の版の後で出す。準備は別 worktree で並行して進める (利用者 2026-10-12)** (要望対応)。複数ウィンドウの境界のため、実装前に設計と独立レビュー。
-- **次の版の決定 (利用者 2026-10-07)**: ライン E (4 番目)。
+- 状態: **本体・別ウィンドウの修正は master に取り込み済み** (`0f290c222`、設計担当の隔離 data-dir での画面操作確認は `57217ad0a`、2026-10-20 に節を整理)。
+  `vendor/egui-wgpu` の `Painter` が surface を付ける全 viewport の HWND に device 上限 (8192) の外寸制約を持たせ、超えた窓は縮めてから configure する。
+  詳細は `vendor/egui-wgpu/PATCHES.md`・[detached リワーク §11](detached-rework-plan.md)、発端の観測の訂正は [段7検証記録](egui-0.37-stage7-verification.md)。
+  仮想デスクトップが物理 8192 を超える多画面は開発機に無く、その環境での実機確認はできていない。
+- 残り (同型の候補、コード上の判断・未再現): 動画 native presenter の overlay (`src/video/native_presenter/overlay_gpu.rs` が既定上限 8192 の
+  別 device を作り、`NativeEguiOverlay::configure` は寸法の上限を見ない) も、窓が 8192 を超えれば同じ検査に当たり得る。`Painter` を通らないので
+  今回の制約は効かない。通常は本体窓・モニター寸法に従うので優先度は低い。
+- 見送り: device 上限を adapter の実上限 (DX12 で 16384) まで上げる案は、egui の `max_texture_side` (font atlas・画像 texture) も変わるため採らない。
+- 規模 / 優先度: Small / P3 (残りの overlay 分)。
 
-- 複数ウィンドウモードの「一覧を開く」はメイン画面側をページ一覧に切り替える操作なので現在は無効。要望者は、代案の「メイン画面を変えず、画像ウィンドウ内へ動画の S キーに似たページ一覧を出す」方式にも前向き。
-- 本の全ページを見渡し、選んだページへ戻れる表示を検討する。現行サムネイルストリップは前後の確認用で、全ページ一覧の代わりにはならない。
-- 複数ウィンドウの表示・入力所有をまたぐため、実装前に detached rework の境界を確認する。時期は未定。
-- 規模 / 優先度: 未見積もり / P3。
+### 1.389 全件テストを別の重い処理と並行すると、変更と無関係なテストが毎回違う組み合わせで落ちる — v4.7.1 作業中の記録 (2026-10-16)
 
-### 1.341 ページめくりのアニメーションを追加する — mIV スレ >>520 (2026-10-07)
+- 観測 (このセッションの全件実行の記録。単独で再実行するとどれも成功):
+  - ページめくり D2 のブランチで本体 lib 全件を 3 回回したとき、3 / 2 / 1 件が落ちた。別の作業ツリー (§1.387) でも
+    同時に全件テストが走っていた時間帯。落ちたのは `detached_native_video_navigation_syncs_main_selection` (worker 未完了)、
+    `streaming_drain_and_reacquire_between_frames_do_not_restore_local_view` (AcquiringRemote のまま)、
+    `abort_on_cancel_returns_interrupted_immediately` (218ms で時間上限)、
+    `finite_source_reaches_end_after_filling_the_live_window_without_a_next_fetch` (producer 完了待ち timeout)、
+    `startup_configuration_away_back_then_normal_stop_cannot_reuse_old_marker` (scan marker 不一致)、
+    `incremental_reconcile_uses_existing_supervisor_watcher_without_new_fulls` (similar array の base publish の `MoveFileExW` がアクセス拒否 → 120 秒で timeout)。
+    記録の正本は [page-turn 計画 §27](page-turn-animation-plan.md) の D2 検証記録。
+  - §1.387 を master へ取り込んだ直後 (`578c0bced`) の全件で 5 件が落ちた。別の作業ツリーで Codex がビルド中だった。
+    すべてページめくりの実時計を使うテスト: `page_turn_mainwindow_submits_visible_vacant_leaf_both_directions`、
+    `permission_service_handlers_pdf_zip_automatic_and_composed_turn_on_receipt`、
+    `page_turn_permission_service_vacant_composed_handler_starts_and_completes_both_ways`、
+    `page_turn_gap_setting_change_before_repaint_skips_stale_outgoing_at_acceptance`、
+    `page_turn_actual_native_roi_roundoff_starts_and_completes_ltr_rtl_forward_backward`。
+  - 何も並行しない状態の全体テスト (master `f69942205`・`76aebc18f` の test-full) では全件成功している。
+- 見込み (コードの読み): worker 待ち・時間上限・producer 待ち・ページめくりの 5 件は、実時間の上限や実時計の進み具合に
+  依存していて負荷で外れる、で説明が付く (ページめくりは `draw_current` が実時計を読むので、遅いフレームで途中の状態を飛ばす)。
+  **scan marker 不一致と `MoveFileExW` のアクセス拒否の 2 件は、負荷だけでは説明できない** (独立レビューの指摘)。
+- 方針: 実時計に依存するテストは fake clock / 明示的な時刻注入へ移す (ページめくり D4 で時計を型に分けるのに合わせる)。
+  時間上限は負荷で変わらない検査 (完了の通知・状態) に置き換える。上の 2 件は、テスト同士が同じファイル・同じ marker を
+  共有していないかを先に調べる。assert を弱めない、retry を足さない。§1.321 / §1.334 と同じ系統。
+- 2026-10-18 追記 (ClaudeCode、master `155b8dabf` の全件実行): `startup_configuration_away_back_then_normal_stop_cannot_reuse_old_marker` が
+  `db.scanned_once_matches(&fingerprint)` の assertion (`src/similar_index.rs` 11083 行) で 1 件だけ落ちた。直前の全件では成功。
+  **単独実行でも 13 回中 1 回落ちた** (並行負荷が無くても起きる)。マージは similar_index に触れていない (master との差分なし)。
+  「並行負荷のときだけ」という見立てはこのテストには当てはまらない可能性があり、時刻・ファイル時刻の粒度など単独で起きる原因を先に調べる。
+- 規模 / 優先度: Small〜Medium / P2 (全件テストの偽失敗でリリース判断が止まる)。
 
-- **2026-10-13 末尾・UI追補**: 共通黒paperの実機観測は「アニメーションよさそう」。local paged/演出ON中は先頭・末尾を実効ON、環境設定とpaged本別HUDの両端指定は実効表示で無効化する。保存値・OFF復帰・連結/Remoteを保持。末尾Navigation＋FrontCoverSupplementの二実画像Pairは通常素材/lease/receiptを再利用して前後にめくり、白companionの拒否は維持する。末尾補助の既存適格条件は変更しない。関連182件・singleton11件・設定181件・UI163件とfmt/glyph/check/context監査、normal確認buildが成功し、独立最終レビューACCEPT。最後の全体gate一回は未変更の音声テスト1件の3秒待機失敗でexit101（単独一回は成功）、全体PASSとは扱わない。現行仕様と検証記録は[plan §26](page-turn-animation-plan.md)、台帳は`target/A-1341-terminal-msg.txt`。以下の先頭のみ実効ONという記録は先行実装時点の履歴。
-- **2026-10-13 検証完了**: 下記採用改訂は独立レビューACCEPT。`test-full`はjobs1で一回PASS（本体12,379件・57ignored・失敗0、UI snapshot162件、vendor54件）。通常build-devはcore/remote/EPUBとruntime/PE検査まで成功し、隔離環境で確認できる。コミット・アプリ起動・実データ変更は行わず、motion/性能の実機採択をcoordinator/利用者へ残す。
-- **2026-10-13 採用改訂**: 単頁の案A/Moving比較を撤去し、前後画像を覆う固定サイズの黒い紙と固定背へ統一した。画像rect/UVと静止下頁を保持する。local paged見開きは演出ONの間だけ先頭配置を実効ONにし、全体/本別保存値・連結・Remote・末尾を維持する。表紙は中央/sideの双方が旧cover guardで拒否されていたため、実builderが側を確定した表紙を許可した。実builderの表紙/末尾/設定切替、dense pose・黒余白・会計の回帰と独立レビューを実施。関連179件・設定転送26件・normal/portable check・fmt/glyph・context監査成功、全体gate/buildは今回の記録へ追記する。実機採択はcoordinator/利用者へ残す。[plan §26](page-turn-animation-plan.md)、`target/A-1341-black-paper-msg.txt`。
-- **2026-10-12 実装追補**: `787b4bf74`の横長見開き中央折りに加え、`a7155f674`で設定gap変更後の古いoutgoingの受理拒否、native ROI端の浮動小数丸め修正、単頁の静止下頁と綴じ目移動の暫定比較設定を実装。案A（自身の綴じ目）が既定で、両案とも動くのは一leaf、下頁は最終rect全体で静止する。master `d357fd5ae`取り込みの6競合を解消し、ratingのClosed/Rebased・grid cursor・spread shift・PDF/Everything所有を維持。独立レビューACCEPT、取り込み後focused167件・関連回帰・normal/portable check・fmt/glyph・viewer_context_audit成功。full初回のscroll thumb golden差を対象1枚の更新で解消し、jobs1の再実行は本体12,367件・UI snapshot162件・vendor54件を含めPASS。normalのbuild-dev（core/remote/EPUB・PE検査）成功、git add/commit・アプリ起動は未実施。実機motion/性能と最終案/時間の採択は未了。[plan §24–25](page-turn-animation-plan.md)、`target/A-1341-merge-msg.txt`。
-- **2026-10-12 利用者決定: 次の版を目指してこのworktreeで継続し、進捗から採用判断**。2026-10-11の次の次の版への延期を改訂した。A0（`next-viewer` / `532635fdd`〜`e3a328ff6`）は利用者のnormal profile実機評価で不合格。PDF scanの数px差で`page_placement_changed`となる、画像では黒い帯に見える、spread全体を一枚として動かすように見える、という評価を受けた。本のように一枚の頁を背から返す動きが必要（RTL forwardは旧左頁だけを右へ返す）。
-- **設計改訂（2026-10-11）**: R4 `afc474d8d`、R5 `c73f0d857`、R6 `29291d496`の独立設計レビューはREVISE、R7 `fa5119c19`はACCEPT。[page-turn-animation-plan.md §19](page-turn-animation-plan.md)のStage 1は実装・自動検証・normal確認用build済、利用者の実機motion評価待ち。通常単頁・Pair間の背回転、頁ごとの異寸法、紙・陰影・影を先に評価できる形へ接続した。取消targetのcanonical flat採用、close→継続commit→fresh snapshot、commit後の描画owner再判定を維持する。cover/中央単頁/横長splitはこの段階では理由付きinstant、継続操作もflat採用後instant。F12 independent stillの既存動画拒否を維持する。R7の別source Half/Full最小対応（全landscape N頁で2N−1操作中N−1が候補）は後続stage。Stage 1ではsplit候補率0%であり、通常scanの実開始率・motion品質・性能受入れは未了。
-- **Stage 1実機追補（2026-10-11）**: `0d1b1f99f`では利用者が演出を確認できなかった。初回key観測のkeyboard owner未確定による候補消失と、入力ゼロgamepad pollが作る偽Continuousによる初回描画後取消を修正した。実handlerで初回key/click→開始→完了、neutral poll保持、理由付きskip一回の回帰を追加（[plan §20](page-turn-animation-plan.md)）。focused回帰・normal/portable check・ui_snapshot・normal確認用build済。修正後の実機motion評価と独立完了レビューは未了。
-- **Stage 1評価追補（2026-10-11）**: `52cd5a15f`の見開き・単頁motionは利用者から良いとの評価。単頁の固定背（LTR左／RTL右、戻りは前頁のarrival）を再確認し、固定端を明示した4枚のgoldenと連続pose回帰を追加する。実機ログの背は既に往復で同じ位置のため、見え方の症状は未再現。missing fact 18件はchild→ROOT受理時に別viewportのframe counterを比較して元factを消した問題で、元ID/source/phaseを保持する構造修正を行う。取消3件は終了直前の別native矢印入力で既存flat-first規則に従っていた（[plan §21](page-turn-animation-plan.md)）。最終受入れ・独立レビューは未了。
-- **2026-10-11 利用者決定（readiness）**: final-onlyを撤回。受理時のresident非AI画像・preview・thumbnailなど表示可能素材で即演出し、演出後は通常品質更新へ戻す。無素材は理由付き省略、受理時の待機・追加decode/uploadは禁止。[plan §22](page-turn-animation-plan.md)に素材・pin・取消・回帰を記録。実機と独立完了レビューは未了。
-- **2026-10-11 利用者評価とoption A**: `49e2b0911`で開始率が改善し単頁の背も良好。異寸法Pairは背と静止頁を同じleaf progressで平行移動し、canonical incomingへsnap無しで着地させる（[plan §23](page-turn-animation-plan.md)）。trim有無のpainter clip差は同canvasとして扱う。pin_budget 11件はbyte合計に余剰無しで固定128 MiB capが原因、実測737.47 MiB/準備後推計756.02 MiBに基づき有限fullscreen10%枠を維持してcapを撤去。独立完了レビュー・実機評価は未了。
-- PC/F12限定・Remote不要、既定OFF、slideshow、Preferencesとfullscreen HUD overflowの同じ全体設定は維持。時間は実際の動きを見てから利用者が決めるため、100〜600ms・既定200msは引き続き仮設定。過去の自動検証成功はmotion品質の合格を意味しない。最終時間・実機/性能受入れは未了。
-- 旧予定（利用者2026-10-07）: 次版ラインE（3番目）。2026-10-11の延期決定で置換済み。他アプリでも対応が多いので実装したい、という要求は維持。
-
-- 返信済み: まずはシンプルなアニメーションから実装を試す。方式・長さ・ON/OFF は設計時に決める。
-- 連続ページ送り、見開き、連結表示、複数ウィンドウで既存の表示速度や入力応答を落とさないことを先に確認する。
-- 規模 / 優先度: R7再実装概算14〜21作業日（約3〜5週）+独立レビュー・修正・実機枠、別sourceの最小half対応を含む / P3。
-
-- 2026-10-12利用者決定: 次の版を目指してこのworktreeで継続し、進捗から採用判断。見開きの横長一画像を中央の背で片側めくりにする（単頁表示は従来一枚）。Pair↔横長・末尾単独・回転素材の対応/検証はpage-turn-animation-plan §24。
+- 2026-10-23 追記分 (`app::section375_tests` の負荷時 15 回中 5 回、`metadata_transfer` と `pdf_loader` の時間依存) は、テスト側の原因を直して
+  master に取り込んだ (`751804637`、負荷をかけた繰り返し実行で全部成功)。止まったテストを打ち切って名前を残す §1.420 も同じ取り込みで済んだ。
+  上の 2026-10-16 の記録のうち `pdf_loader` の `abort_on_cancel_returns_interrupted_immediately` (218ms) は、この取り込みで直したテストと同じもの。
+  D2 ブランチの他の失敗と、2026-10-18 の similar_index (単独 13 回中 1 回) は残っている。
+- 同じ負荷試験で、範囲外として残したもの (テスト基盤セッションの報告、2026-10-23。名前と失敗内容は [テスト速度の記録](test-speed-report.md) の負荷試験の節):
+  `book_structural_op` 系 2 件、`close_return` 1 件、`still_window_mode_key_tests` の AcquiringRemote 系 17 件 (`left: AcquiringRemote` のまま)、
+  clipboard の deadline テスト (300 秒で打ち切り)。どれも負荷をかけたときだけ落ち、負荷の無い実行では成功。
 
 ### 1.334 `zip_loader::tests::shared_directory_cache_reparses_when_the_archive_identity_changes` が全体実行でまれに落ちる — テスト側の共有キャッシュ (2026-10-05)
 
@@ -382,77 +596,6 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
   2. 大文字小文字だけが違う ZIP 名を Windows へ展開すると同じファイルになるが、衝突を検出していない。
   3. 生成する `_miv_print_*` / `_miv_reflow_*` が既存メンバーと同名だと上書きする。
 
-### 1.288 多数のファイルをエクスプローラへドラッグしてコピーすると、コピーが終わるまで mIV が操作できない — コード調査 + 通常ログ (2026-09-27)
-
-- 出典: 利用者 (開発者本人) の報告。mIV で多数のファイルを選んでエクスプローラへドラッグ＆ドロップでコピーすると、
-  その間 mIV が固まって操作できない。
-- ログ (利用者環境の `%APPDATA%\mimageviewer\logs\mimageviewer.log`、同日のセッション): UI スレッドが
-  `SHDoDragDrop` から戻るまでの時間が、2606 件で約 108 秒、6220 件で約 324 秒。どちらも `effect=1` (COPY)
-  で、ドロップ自体は成立している。
-  ```
-  [2329.148s][t26584] file_drag: SHDoDragDrop start (2606 item(s))
-  [2437.527s][t26584] file_drag: SHDoDragDrop done effect=1
-  [2638.509s][t26584] file_drag: SHDoDragDrop start (6220 item(s))
-  [2962.340s][t26584] file_drag: SHDoDragDrop done effect=1
-  ```
-- コードから確定したこと: `App::update` の末尾で `file_drag::start_file_drag` を UI スレッドから同期で呼び
-  (`src/app.rs` の「native ファイル D&D の実行」)、その中の `SHDoDragDrop` (`src/file_drag.rs`) が戻るまで
-  UI スレッドが止まる。`SHDoDragDrop` は受け取り側の `IDropTarget::Drop` が戻るまで戻らない。ログの時間から、
-  エクスプローラはコピーを `Drop` の中で最後まで行っている。`src/file_drag.rs` 冒頭のコメントは
-  「モーダルブロックは不可避」としているが、不可避なのは**ドラッグ中** (マウスボタン押下中) の部分だけで、
-  **ドロップ後のコピー中**の部分は Windows の非同期ドロップで外せる。
-- 方針候補: データオブジェクトを `IDataObjectAsyncCapability` 対応にし、`GetAsyncMode` が TRUE を返すようにする
-  (Microsoft の文書「Dragging and Dropping Shell Objects Asynchronously」)。受け取り側はデータを取り出したあと
-  自分のバックグラウンドスレッドで処理し、`Drop` をすぐ返すので、mIV は `SHDoDragDrop` からすぐ戻る。
-  1. 現在は Shell の `IDataObject` (`BHID_DataObject`) を借りている。まずこれを `IDataObjectAsyncCapability` へ
-     `QueryInterface` できるか確かめ、できれば `SetAsyncMode(TRUE)` してから渡す。Shell のデータオブジェクトが
-     対応しているかはコードからは分からない (未確認)。
-  2. 対応していなければ、`IDataObject` の 9 メソッドを Shell の実体へ委譲し、`IDataObjectAsyncCapability`
-     (SetAsyncMode / GetAsyncMode / StartOperation / InOperation / EndOperation) を足した薄いラッパーを
-     windows-rs の `#[implement]` で作る。
-  - 非同期では、`SHDoDragDrop` が戻った後もエクスプローラが mIV のデータオブジェクトを呼ぶ (プロセス間呼び出しは
-    UI スレッドの STA に届く)。winit のメッセージループが回り続けるので受けられる見込みだが、未確認。
-  - ドラッグ中の固まり (押下中の OLE モーダルループ) はこの修正では残る。
-- 回帰確認 (利用者の実機): 数千件をエクスプローラへドロップ中に mIV を操作できる、同名ファイルがあるときの
-  エクスプローラの確認ダイアログ、エクスプローラ側のコピーのキャンセル、mIV 自身へのドロップ
-  (`internal_drop_pending` の判定)、1 件だけのドラッグ、Esc でのドラッグ中止。
-  `docs/file-drag-drop-design.md` §6.2 と `docs/ui-responsiveness.md` の「native D&D のモーダルブロックは
-  意図的な例外」の記述も、残る範囲 (ドラッグ中のみ) に合わせて直す。
-- 回避策 (コード上の見込み、未確認): mIV でコピー (Ctrl+C / 右クリックのコピー、`OleSetClipboard` 経路) して
-  エクスプローラで貼り付ければ、コピーはエクスプローラ側で進み mIV は止まらないはず。
-- 規模 / 優先度: Small〜Medium / P2 (大量コピーのたびに数分操作できなくなる)。
-
-### 1.287 常に最前面 ON で、VST プラグイン画面にフォーカスがある状態で VST ボタンを押すと中途半端な状態になる — §1.250 の追補 (2026-09-27) — v4.2.0 で出荷、残り: VST ボタン 1 回で閉じるかの将来検討
-
-- 出典: 利用者 (開発者本人) が §1.250 の実機確認で観測。常に最前面 ON で HUD の VST ボタンからプラグイン画面を開き
-  (動画は右上 1/4、プラグイン一覧パネル表示)、プラグイン画面をクリックしてから VST ボタンを押すと、プラグイン画面だけが
-  消え、動画は右上 1/4 のまま、一覧パネルも出たままになる。OFF では 1 回目のクリックで mIV にフォーカスが戻り、
-  2 回目で正常に切り替わる。
-- 調査 (読み取り専用の Sol、コードから): presenter の復帰処理が、ブリッジ (`mimageviewer-vst3-host.exe`) のプラグイン
-  画面を「外部の前面ウィンドウ」と判定し、HUD の mouse-down で presenter の focus / raise を要求する。VST 側の前面判定は
-  ブリッジを mIV の一部として扱っており、2 か所で判定が食い違う。プラグイン画面が「裏に回った」のか「隠れた」のか、
-  OFF で起きない理由は未確定 (実機の HWND 記録が必要)。
-- 対応: 判定を 1 か所に集約して修正し、VST ボタン操作時の HWND 状態を通常ログに記録する (実装中、2026-09-27)。
-  VST ブリッジは portable smoke に同梱しないため、確認は利用者の実機で行う。
-- **進捗 (2026-09-27)**: 修正済み (VST プラグイン画面を mIV の UI の一部として 1 か所で判定)。**利用者が実機で確認** (ON/OFF とも)。
-  残る違和感: プラグイン画面にフォーカスがあるとき、VST ボタンは 1 回目で mIV にフォーカスが戻り 2 回目で閉じる。
-  従来からの動きなので利用者判断で現状維持 (1 回で閉じるかは将来の検討)。
-- 規模 / 優先度: Small〜Medium / P2 (常に最前面と VST を併用すると操作できなくなる)。
-
-### 1.285 起動直後にコレクションを開くと、起動時のフォルダ読み込みがあとから画面を置き換える (2026-09-26)
-
-- 出典: §1.237B の実アプリ smoke `RatingSortCollection` の初回 2 回の失敗 (2026-09-26 17:51 / 17:54)。
-  perf ログで、コレクションを開いた直後 (0.788 s / 0.723 s) に起動引数のフォルダが開かれて
-  (0.831 s / 0.772 s) 画面を置き換えていた。観測は perf ログから。利用者の操作での再現は未確認。
-- コード上の経路 (独立 Sol レビュー): 通常のコレクションを開く操作は `open_collection_grid_from_navigation`
-  (`src/app/collection_grid.rs`) に届くが、保留中の起動時 resolve を取り消さない。起動の完了
-  (`src/app/startup_ops.rs`) はその初回要求を現在の要求として扱う。そのため起動直後の短い間に利用者が
-  コレクションを開くと、あとから完了した起動フォルダで置き換わりうる。
-- 方針候補: 起動時のフォルダ要求も通常の navigation と同じ「後の要求が勝つ」所有者に載せ、利用者の操作が
-  来たら起動時の resolve を取り消す (コレクション以外の入口 (お気に入り・履歴・検索等) も同じ形か列挙する)。
-  smoke 側は起動フォルダの確定を待ってから開くよう回避済み (`scripts/ui-smoke/rating-sort-collection.rhai`)。
-- 規模 / 優先度: Small / P3。
-
 ### 1.284 同じフォルダにある同一内容のコピーへ「編集内容の復元」確認が出てわかりにくい (2026-09-26)
 
 - 出典: 利用者 (開発者本人) が §1.237B R4 の実機確認中に観測。`011_0.png` に★4 を付けてからソート横の更新を押すと、
@@ -487,6 +630,8 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 - 規模 / 優先度: 各 Small〜Medium / P3。
 
 ### 1.279 フルスクリーンで最初に高画質縮小を使うフレームが UI スレッドで約 0.6 秒止まる (2026-09-25)
+
+- 重複: §1.87 (セッション最初の拡大で 0.5 秒止まる) と同じ現象。着手するときは 2 つをまとめて扱う (2026-10-21 整理で確認)。
 
 - 出典: v4.1.0 公開前の perf smoke (`perf_events.1.jsonl`、2026-09-25 20:15)。観測は perf ログから。
 - 内容: そのセッションで最初の `gpu/lanczos_regenerate` (t=6.65) と同じフレームで、`fs_viewport_breakdown.media_ms`
@@ -542,16 +687,6 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
   portable feature 下で「既定 data_dir でも suffix が付く」「別 exe_dir の既定同士は別名になる」を足す。
 - 規模 / 優先度: Small / P3。
 
-### 1.261 編集・焼き込みを反映した画像をクリップボードへコピーする — 利用者要望 (2026-09-21)
-
-- 要望: 右クリックメニューなどから、mIV の編集内容を焼き込んだ画像をクリップボードへコピーし、他のアプリへ画像として貼り付けたい。今回はバックログ登録のみ。実装時期は未決定。
-- 現状確認: 既存の「画像をクリップボードにコピー」はあるが、実ファイルの経路は元画像のデコード後に EXIF 向きと回転を適用する方式で、編集結果の焼き込み経路ではない (`src/ui_dialogs/context_menu.rs` の `copy_image_to_clipboard`)。既存のファイルコピー・編集設定のコピーとは用途を区別する。
-- 目標: 「編集を反映した画像をコピー」等の項目から、補正・切り取り・消しゴム・隠蔽・テキスト注釈などを反映した画像を取得する。元ファイルや保存済み編集設定は変更しない。HUD・パネル・選択枠を含む画面キャプチャにはしない。
-- 着手時の設計: 既存の画像書き出し・焼き込み処理を確認して共用し、適用順や出力結果を揃える。AI 処理・表示トリム・出力解像度・透過の扱い、通常画像 / ZIP・PDF 内ページ、一覧 / フルスクリーン / 別ウィンドウでの対象の決め方を整理する。既存コピーを置き換えるか別項目にするかも、その段階で決める。
-- 焼き込み段階の設定 (利用者要望 2026-09-23): どの段階まで処理して焼き込むかを、Ctrl+E などと同様に環境設定で選べるようにする。[docs/bake-stage-unification-plan.md](bake-stage-unification-plan.md) の `BakeStage` (編集 / AI 処理 / 表示用補正) をそのまま使い、同計画 §3 の「機能 × 段」の表に「クリップボードへコピー」の行を 1 つ足す (設定は機能ごとに 1 つ、行ごとに radio、個別 ON/OFF は作らない)。合成は単枚 Ctrl+E と同じ `CompositeSource` + `BakedEditSnapshot` の worker 経路を使い、コピー専用の合成経路を作らない。既定値は未決定 (候補: 単枚 Ctrl+E と同じ「表示用補正まで」)。着手時に利用者へ確認する。
-- 不変条件: 重いデコード・合成は UI スレッドを止めず実行し、操作時の対象と編集状態を保持する。後から行ったコピーを遅い処理が上書きしないよう既存のクリップボード世代管理と統合する。
-- 完了条件: 編集の焼き込み結果が同条件 (同じ段) の書き出し結果と一致し、他アプリへ画像として貼り付けられる。段ごとに出力が変わること、設定を変えて環境設定を開き直しても値が保たれることをテストする。元データ非変更、失敗時の通知、対象切替・連続コピー時の競合を検証する。
-
 ### 1.260 画像を敷き詰めて表示し、タイル素材の継ぎ目を確認する — 利用者要望 (2026-09-20)
 
 - 出典: 利用者から GrpView (<https://tools.grape-vine.jp/grp_view/index.html>) の「リピート表示」の
@@ -590,45 +725,6 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
   - v3.8.0 の余白色は、敷き詰め中は余白が無くなるので見えなくなる。
 - 規模 / 優先度: Small〜Medium / P3 (利用者要望。閲覧の不具合より後)。
 
-### 1.259 リモート: 1ページ表示の左右入力が本体と逆になり得る — コード調査 (2026-09-20)
-
-- きっかけは「横長分割を試すとページを送るボタンが逆になる」という X 上の投稿。投稿者へは
-  確認しておらず、どの画面・設定を指すかは**未確認**。以下はコードと設計文書の読解で、
-  実行時の観測は無い。
-- 差: 本体は入力の左右反転を**表示モード**から決める (`SpreadMode::advances_right_to_left`)。
-  `Single` は読み順を持たないので、保存済みの読み方向が RTL でも → / 右半分クリック = 次。
-  Remote は**読み方向だけ**で決める (`isRtlReadingDirection(state.readingDirection)` を
-  `‹` `›` ボタン / tap zone / swipe / `ArrowLeft` `ArrowRight` の全部が読む)。`Single` では
-  本体が保存済み方向をそのまま応答し (`resolve_spread_state`)、Web の
-  `readingDirectionForSpreadMode` も Single では現在の方向を引き継ぐ。
-- 結果: Remote で「横長分割 右→左」や「見開き 右→左」を一度選んでから「1ページ表示」へ
-  戻すと、`‹` = 次のまま残る。本体で同じ本を 1ページ表示で開くと → = 次。Remote には
-  読み方向だけを切り替える操作が無く (本体の <kbd>7</kbd> 相当)、戻すには左→右系のモードを
-  経由するしかない。画面下部の送りボタンは Remote にしか無いので、投稿の表現とも合う。
-- これは偶然の差ではなく [web-remote-plan.md](web-remote-plan.md) の明示の決定
-  (「Single は保存済み方向を維持する」「RTL の横方向入力は画面上の方向を反転し…」の段落)。
-  直すときは同じ変更でその段落を改定する。
-- 方針 (利用者決定 2026-09-20): **Remote を本体に合わせる。** 入力の左右は表示モードから
-  導き、1ページ表示は保存済み方向が RTL でも反転しない。
-- 着手時に決めること:
-  - 縦持ちの表示限定 Single (`force_single_page`)。保存は RTL 見開きのまま表示だけ Single に
-    なる。本体に対応物が無い。`effective_spread_mode` ではなく `configured_spread_mode` から
-    導けば、縦持ちでも本の綴じ方向どおりに反転が続く (推奨)。
-  - シークバーの向きは別の問い。本体は `fullscreen_seek_direction` が読み方向から決め、
-    入力とは独立している。Remote の `viewerSeekState` も読み方向を読むので、**入力用の
-    述語へ一緒に付け替えない。**
-  - 左右反転の述語を Web 側にも 1 つだけ置く (本体の `advances_right_to_left` と対)。
-    `isRtlReadingDirection(state.readingDirection)` を入力の左右に使っている箇所を
-    個別に直さず、全部そこへ寄せる。応答の形は変えない見込み (Web 側で閉じる)。
-  - `‹` / `›` の `aria-label` (「前の画像」「次の画像」) は RTL で実際の動作と逆になる。
-    同じ変更で動作に合わせる。
-  - 同じ段落は RTL の swipe を「左 swipe = 次」と書くが、`app.js` は左 swipe = 前
-    (ページを指で送る向き) になっている。どちらが意図かを確かめて文書と実装を揃える。
-- 回帰: `command-core.test.mjs` に、Single + 保存済み RTL で `ArrowRight` / 右 tap / `›` = 次、
-  見開き RTL / 横長分割 右→左 は従来どおり反転、縦持ちの表示限定 Single、を追加する。
-  RTL → Single → 反転が解ける、の遷移も 1 本入れる。
-- 規模 / 優先度: Small / P2。
-
 ### 1.252 `request_repaint_after` 同型残件: UI フォントプレビューの debounce 起床再武装 — 未実装 (2026-09-19)
 
 - 出典: Ctrl+G 進捗表示の実装時監査。正本は
@@ -640,12 +736,6 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
   プレビュー生成が次の外部入力まで止まる可能性がある。deadline owner が pending 中は毎パス残り時間を
   再要求する形へ直し、deadline 前の別パスを挟む回帰テストを追加する。
 - 規模 / 優先度: Small / P2。Ctrl+G 本体や検索 worker は触らない。
-
-### 1.251 動画の複数音声トラックを選択できるようにする — v4.3.0 で出荷、残りは Remote 確認 1 件 — >>429 (2026-09-17)
-
-- 出典: >>429。設計の正本は [音声トラック選択計画](audio-track-selection-plan.md)。v4.3.0 (2026-10-04) で出荷。
-- 実アプリの `AudioTracks` シナリオは smoke 側の修正後、使い捨て portable で全体 PASS (2026-10-05、`20261004T160257945Z-104608-AudioTracks-4752a5b6`、dd9678010)。経緯は [smoke 計画](ui-smoke-automation-plan.md#audiotracks-の入力対象契約-1319)。
-- 残り: Remote の実機確認 (PC で選んだトラックからの開始、端末での切り替えと位置の引き継ぎ) は未実施。ローカルの再生と切り替えは利用者がサブPCで確認済み (2026-10-03)。
 
 ### 1.243 TensorRT ワーカーの決定的な起動失敗の後も、AI 処理のたびに起動をやり直す — 修正済み、残りは確認 (2026-09-15) — v4.0.0 で出荷、残り: 通知の「ワーカーを再起動」無反応の調査・Remote AI 再確認
 
@@ -710,155 +800,6 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
   - §1.231 と共通の、初回起動の live 確認が保留。
 - 規模 / 優先度: Small / P2 (復旧経路が全部塞がる P1 の症状は解消済み)。
 
-### 1.232 更新後の「重要な変更点」が、ビューアの裏に隠れたまま入力を止める — 利用者が v3.10.0 で再現手順を確定、方針合意 (2026-09-13)
-
-- 出典: 利用者報告 (2026-09-12)。**更新後の初回起動で、コマンドライン引数に画像パスを渡して
-  起動した**ところ、「重要な変更点」ダイアログが画像表示の裏にあって操作できず、
-  **画像表示を閉じないとダイアログを閉じられなかった**。
-- 当初は版もモードも不明だったが、**2026-09-15 に利用者が v3.10.0 で再現手順を確定**した
-  (以下はすべて利用者の報告。開発機では未再現):
-  - 手順: ソフト更新後の最初の起動で、**コマンドライン引数に画像パスを渡して起動**する
-  - **全画面 / ウィンドウ内表示 / 別ウィンドウのどのモードでも起きる**
-  - 画像は表示されるが、**右クリックとキーボード入力が効かない**。**HUD の × のクリックは効き**、
-    それで画像表示を閉じられる
-  - 別ウィンドウのときは更新ウィンドウが裏に見えるので気づける。それ以外のモードでは、
-    入力が効かない理由が画面から分からない
-  - 利用者の希望: 更新ウィンドウを画像表示より前面に出してくれれば、気づけるので問題ない
-
-#### コードから確認できたこと
-
-- [`show_whats_new_dialog`](../src/app.rs:72462) は **main viewport でしか描いていない**。
-  fullscreen viewport 側 (`ui_fullscreen.rs`) に描画は無い。
-- **同じ形の不具合が既知で、このダイアログだけガードが無い。** すぐ上の編集用追加パックの
-  ダイアログには `if !main_viewer_blocked` が付いていて、理由がコメントに残っている
-  ([app.rs:72442](../src/app.rs:72442)):
-
-  > ⚠️ フルスクリーン中はフルスクリーンビューポート側で描画する … ここで描くと背後
-  > (メインビューポート) に隠れて「DL ボタンを押しても何も起きない」状態になる (実機 FB 2026-06-06)
-
-- `show_whats_new` は [`common_modal_dialog_open`](../src/app.rs:18223) に入っているので、
-  **見えていない間も入力は止まる**。「思うように操作できなかった」という報告と整合する。
-
-#### 報告から言えること / まだ言えないこと
-
-- **ウィンドウ内表示 (`ViewerPresentation::MainWindow`、[app.rs:460](../src/app.rs:460)) でも
-  起きる**ので、「別 viewport の裏に隠れる」だけの問題ではない。**同一 viewport 内で
-  ビューアの下に描かれている**経路も同時に存在する。上の追加パックの前例と同じく
-  `if !main_viewer_blocked` で描く場所を分けるだけでは、**ウィンドウ内表示は直らない**
-  (移す先の別 viewport が無い)。
-- 別ウィンドウでは「見えるが入力が止まる」、それ以外では「見えずに入力が止まる」。
-  **入力を止めているのは `common_modal_dialog_open` で共通、違うのは見えるかどうかだけ**、
-  と読むのが素直だが、**確かめていない**。
-- 「HUD の × は効くが右クリックとキーは効かない」は、モーダル判定が shortcut と
-  コンテキストメニューを止め、egui のボタンクリックは止めていない、という形と整合する。
-  **これもコードからの推論で未確認。**
-- 開発機で再現するには、`last_seen_version` を 1 つ前の版へ戻してから、引数に画像パスを
-  付けて起動する。
-
-#### 利用者への回答状況
-
-- **2026-09-15 に「見えない状態で操作を止めないように直す」と回答済み。**
-- **v4.3.0 (2026-10-04) の公開連絡では、まだ入っていないことに触れなかった**
-  (利用者判断: 実装はもう少し先になるため)。次に触れるときは、前回の回答から
-  時間が空いている点を踏まえる。
-
-#### 対応方針 (2026-09-15 開発者と合意)
-
-**ビューアを開いている間は表示を保留し、閉じたら出す。既読は「表示したとき」ではなく
-「利用者が閉じたとき」に記録する。**
-
-##### 1. 表示の保留 — 描画と入力停止を同じ述語で決める
-
-- `whats_new_visible() = show_whats_new && ビューアを開いていない` を 1 つ用意し、
-  **描画 ([`show_whats_new_dialog`](../src/ui_dialogs/whats_new.rs) の早期 return) と
-  モーダル判定 ([`common_modal_dialog_open`](../src/app.rs:18334)) の両方をこれで決める。**
-  いまのモーダル判定は `self.show_whats_new` そのものを見ているので、**描画だけ保留にすると
-  3 モードすべてで「見えないのに操作が止まる」状態になり、今より悪化する。**
-- 「ビューアを開いていない」は**全画面・ウィンドウ内・別ウィンドウの 3 モードとも**含める。
-  `viewer_session_blocks_main_window()` ([app.rs:40468](../src/app.rs:40468) 付近) は
-  detached を除外しているので、そのままでは使えない。別ウィンドウ中はメインが操作できるが、
-  モーダル判定はアプリ全体に効くので、例外を作らず揃える。
-- **毎フレーム評価し、「最初にメインへ戻ったら」の一回きりの latch にしない。** 表示待ちの間に
-  別の経路でビューアが開いても自然に隠れ、閉じれば出る (引数起動以外の経路が実在するかは未確認)。
-- 手本: 隣の [`network_data_dir_notice_visible()`](../src/ui_dialogs/network_data_dir_notice.rs:71)
-  は 1 つの helper を描画とモーダル判定の両方に使っている。CLAUDE.md「state が存在しても
-  Window を描かない phase がある処理は、state の有無ではなく『現在表示されるか』を返す helper を
-  登録すること」。
-- **閉じる操作の検出も visible のときだけ。** ウィンドウ内表示ではビューアとダイアログが同じ
-  イベントキューなので、表示保留中に押した Esc (ビューアを閉じるつもり) で見えないダイアログを
-  閉じてはならない。描画関数が visible で早期 return すれば、閉じる判定もその内側に入る。
-
-##### 2. 既読の記録 — 閉じたときに書く
-
-**いまは既読が起動時に消費されている。** 表示するかは起動時に前回の版から決め
-([app.rs:15559](../src/app.rs:15559))、`last_seen_version` は設定読み込みの時点で新しい版へ
-書き換わる ([settings.rs:8275](../src/settings.rs:8275))。そのため**ビューアから戻らずに
-アプリを終了すると、重要な変更点は二度と出ない** (保留にしなくても今と同じ)。
-
-- **別の永続項目 (例: `whats_new_acknowledged_version`) を足し、表示範囲はこちらから決める**:
-  `highlights_to_show(acknowledged, current)`。`last_seen_version` は流用しない
-  (マイグレーション判定と preupgrade snapshot にも使っている)。
-- **書くのは閉じたときだけ。** 閉じる経路は [whats_new.rs](../src/ui_dialogs/whats_new.rs) の
-  `close || !open || escape_pressed` の 1 箇所に集まっている (「すべての変更を見る」は閉じない)。
-  そこで `acknowledged = current` にして保存する。前例の
-  `network_data_dir_notice_dismissed_for` も閉じたその場で `settings.save()` している
-  ([network_data_dir_notice.rs:108](../src/ui_dialogs/network_data_dir_notice.rs:108))。
-- **版を飛ばしても取りこぼさない。** `highlights_to_show` は `prev < v <= current` を累積する
-  ([version_highlights.rs:67](../src/version_highlights.rs:67)) ので、3.10.0 で閉じずに
-  3.11.0 へ上げた利用者には両方の分が出る。
-
-##### 3. 初期値 — リリース済みの設定に項目を足すので移行が要る
-
-- 項目が無いとき (**既存利用者がこの版を初めて起動したとき**と clean install) は、
-  `previous_last_seen_version.unwrap_or(current)` で初期化する。
-  - 既存利用者: 前回の版が入るので、**今と同じ範囲**が出る
-  - clean install: `highlights_to_show(None, ..)` は空を返す作りなので、`current` を入れて
-    今後の更新から正しく出るようにする
-- **初期値はその起動のうちに保存する。** 保存しないまま閉じずに終了すると、次回は
-  `last_seen_version` が既に新しい版になっているので、項目なし → `current` で初期化 →
-  **一度も出ないまま消える。** `last_seen_version` を読み込み時に書くのと同じ場所で書く。
-
-##### 4. 触らないもの
-
-- [`prepare_test_script_run`](../src/app.rs) はメモリ上で `show_whats_new = false` にするだけで、
-  **既読を保存しない** (隔離 profile に選択を書かない、というコメントどおり)。
-- 設定の起動時に問題があって保存が抑止されている起動 (`settings_boot_problem_source` あり) では
-  今もダイアログを出していない。既読も書けないが、挙動は変わらない。
-- 開発用 `--whatsnew-from` は表示の強制だけにする。閉じたときの記録は通常どおり `current`。
-
-##### 5. 同じ形の通知
-
-ネットワーク上のデータフォルダ通知も、同じ main viewport の描画ブロックで描かれ、同じく
-モーダル判定に入っている。重要な変更点の後に出る順番 (`!self.show_whats_new` を待つ) なので
-保留しても順番は保たれるが、**通知そのものがビューア表示中に待ちになれば同じ症状になる。**
-同じ「ビューアを開いていない」条件を visible に足す。マウス操作の移行案内
-(`show_mouse_nav_migration_prompt`) は未確認。
-
-##### 採らない案
-
-- **表示モードごとにビューアの上へ描く** — 全画面の viewport・同じ viewport の最前面・
-  別ウィンドウの viewport と描き手が 3 つに増える。ウィンドウ内表示では描画順の調整も要る。
-- **モーダルをやめる** — ビューアの下に、見えないのに操作を受け付けるウィンドウが残る。
-- **描く場所を `main_viewer_blocked` で分けるだけ** — ウィンドウ内表示には移す先の viewport が無い。
-
-##### 回帰確認
-
-- 通常起動: 従来どおりすぐ出る。閉じると次回以降は出ない
-- 引数起動 × 3 モード: ビューア表示中は出ず、**キー・右クリックが効く**。閉じると出る
-- 引数起動でビューアを見たまま、ダイアログを閉じずにアプリ終了 → **次回起動で出る**
-- ウィンドウ内表示で、保留中に Esc でビューアを閉じても、ダイアログは閉じない (出てくる)
-- 版を 2 つ飛ばした更新で、両方の版の項目が出る
-- 既存利用者の初回 (項目なし): 今と同じ範囲が出る。clean install: 何も出ない
-- ネットワーク通知が保留され、ダイアログの後に出る順番が保たれる
-- 「すべての変更を見る」で閉じず、既読にもならない
-
-#### 範囲と優先度
-
-- **届く範囲は狭い (2026-09-14 利用者判断)。mIV は既定で画像の関連付けをしない**ので、
-  引数にパスを渡す起動は、他のソフトから意図的に mIV を呼ぶ構成に限られる。通常の起動では
-  この経路に入らない。**v3.10.0 は必読 2 件を出すがこの理由で公開を止めず、直さずに出した。**
-- 規模 / 優先度: Small〜Medium (永続項目の追加と既存利用者向けの初期値移行を含む) / P2。
-
 ### 1.231 設定の復元で、来歴用のファイル名 version が「開けるか」の判定を上書きする — 修正済み、残り 2 件 (2026-09-13)
 
 - 正本: [設定復旧の設計](settings-recovery-234-231-plan.md)。修正は `8319a1225` (未リリース)。clean install では preupgrade
@@ -868,78 +809,6 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
   - **全世代が利用不可のときに、初期化導線が読めるか**を確かめていない。偽の行が消えたので誤りダイアログ自体が出なくなる見込みだが、
     結果表示は今も背景を覆う Modal で、この状態を固定するテストも記録も無い。
   - clean install の初回起動の live 確認が保留 (§1.234 と共通。正本の検証記録の末尾)。
-- 規模 / 優先度: Small / P2。
-
-### 1.229 Ctrl+G が、短い英数字語 1 つで検索全体を止める — 長い語と一緒でも (2026-09-12)
-
-- 出典: 利用者質問 (2026-09-12)。「Ctrl+G で EXIF のカメラ機種名を検索したいが出てこない」。
-  回答のためにコードを確認して見つけた。**利用者の件は、アイテム索引が未作成だったのが原因で、
-  この欠陥ではなかった** (2026-09-14 利用者報告: お気に入りに登録したら検索できた)。
-  下記はコードから確定した独立の欠陥として残る。
-- 症状: `EOS R5` のように **3 文字未満の英数字語を 1 語でも含むと、検索そのものが実行されない**。
-  クエリ全体では 6 文字あるため、出るメッセージ (「検索キーワードが短すぎます」) と原因が
-  結びつかない。
-
-#### コードから確定したこと
-
-- `parse` は空白区切りでトークン化する。`"..."` で囲めば 1 語にできる
-  ([search_query.rs:59](../src/search_query.rs:59))。よって `EOS R5` は `eos` と `r5` の 2 語。
-- `validate_query` は **include 語ごとに** 最小長を見て、1 語でも満たさなければ `TooShort` で
-  return する ([global_search.rs:288](../src/global_search.rs:288))。
-  **同じクエリに十分な長さの語があっても救われない。**
-- しきい値は `has_sufficient_length`: CJK を 1 文字でも含めば 2、英数字のみなら 3
-  ([global_search.rs:300](../src/global_search.rs:300))。
-- メッセージは 1 種類だけで、**どの語が短かったのかを出さない**
-  ([global_search.rs:337](../src/global_search.rs:337))。
-- **Ctrl+F にはこの検査が無い** ([app.rs:51031](../src/app.rs:51031) は `tokens.is_empty()` のみ)。
-  同じ `EOS R5` が Ctrl+F では通り Ctrl+G では通らない。
-
-#### 文書化された根拠と、それが実際に効く範囲
-
-- [search-architecture.md](search-architecture.md) §1.2 は「英数字のみ → 3 文字以上
-  (bigram の爆発的ヒット回避)」と書いている。**候補数の爆発を避けるための規則**であって、
-  索引に載らないからではない。
-- bigram 索引に載せられないのは **1 文字語だけ**。2 文字語は bigram をちょうど 1 個作れる。
-  `build_bigram_and_query` が失敗するのは bigram が 0 個の語が来たときに限る
-  ([fts_index.rs:509](../src/fts_index.rs:509))。
-- AND モードでは各語が `Occur::Must` になる ([fts_index.rs:495](../src/fts_index.rs:495)) ので、
-  長い語が既に候補を絞っている状態へ 2 文字語が加わっても**候補は増えない**。
-  爆発が実際に起きるのは「短い語だけで検索したとき」と「OR モードで短い語を足したとき」。
-- つまり現在の「全語へ一律」は、**書かれている根拠より広く効いている**。
-
-#### 方針 (2026-09-15 開発者判断、利用者へ回答済み) と残る論点
-
-1. **1 文字語 — 未決**: bigram を作れないので**索引の照会には載せられない**。ただし最終判定の
-   post-filter は全語を保存原文への部分一致で見ているので、AND モードで他の語が候補を
-   絞っているなら、**索引照会から外して post-filter だけで判定する**ことはできる。許すかどうかは
-   2 と同じく決めること (候補内でもほぼ全件に当たるので絞り込み効果は小さい)。
-   **「構造的に不可」ではない** (2026-09-15 訂正)。
-2. **2 文字の英数字語 — 確定**: **AND モードでは、長さを満たす語が 1 つ以上あれば短い語も通す。**
-   **OR モードは語ごとの検査を維持する** (1 語が候補を広げる側なので)。利用者へは
-   「長い語で絞り込んだうえで短い語でさらに絞る、つまり両方を含む条件で動くように見直す」と
-   回答済み (2026-09-15)。
-   - 意味は**語ごとの部分一致の AND**で、隣接は要求しない。`EOS R5` は「`eos` を含み、かつ
-     `r5` を含む」なので、別の項目や別の位置にある `r5` でもヒットする。隣接が欲しいときは
-     従来どおり `"EOS R5"` (フレーズ) を使う。
-   - **この 1 と 2 は別の問いなので、同じしきい値で表さない。**
-3. **メッセージ — 確定**: 短かった語を出す (例: 「"r5" が短すぎます」)。利用者へは
-   「メッセージがどの語のことか示していなかった。直す」と回答済み (2026-09-13)。
-
-- **やらないこと**: しきい値の数字だけ下げる変更。爆発の根拠は消えていないので、
-  モードごとに意味を分けずに数字を動かさない。
-
-#### 回帰確認
-
-- `EOS R5` と `"EOS R5"` の両方で、JPEG の `Model` にヒットする (AND モード)。
-- `r5` 単独は従来どおり拒否され、**メッセージに該当語が出る**。
-- AND モードの `EOS R5` が実行され、**`eos` と `r5` の両方を含む項目だけ**が出る。
-- **短い語だけの AND (`sd ai`) は従来どおり拒否**され、メッセージに該当語が出る。
-- **OR モードの `EOS R5` は従来どおり拒否**され、メッセージに `r5` が出る。
-- 1 文字語を含むクエリは、1 を決めるまでは拒否される (`build_bigram_and_query` の `None` へ落ちない)。
-- OR モードで短い語を足したときの候補数が、変更前から増えていない。
-- 日本語 2 文字 (`夕焼け` 等) の既存動作が変わらない。`夕 海` は従来どおり拒否。
-- Ctrl+F の挙動が変わらない (この検査は Ctrl+G 専用)。
-
 - 規模 / 優先度: Small / P2。
 
 ### 1.224 一時表示ナビゲーターの未開始クリックが、同passのfocus lossで消える (2026-09-08)
@@ -1424,19 +1293,6 @@ rayon の既定プールで並べた。**答えは 1 つも変えていない** 
   シェル rename 実行中の「変更中...」表示を復帰した。モーダル構造は変更していない。
 - 規模 / 優先度: Medium / P2 (§1.31 に合流)。残るのはモーダル span の構造だけ。
 
-### 1.39 `fs_page_load_state` が PDF ページで毎フレーム String を作る (`9590b661` の続き)
-
-- 出典: v2.9.1 出荷後の他セッションレビュー (2026-08-01、ClaudeCode)。source inspection で確認済み。
-- 機構: `has_retained_pdf_final_ai_for_current_params` → `retained_pdf_page_key_for` →
-  `metadata_cache_key(idx)` が String を生成し、HashMap を引く。
-  ⚠ **レビュー報告より実コストは小さい**: `effective_params` / `final_ai_key_for_pixels` は
-  retained cache に**該当エントリがあるときだけ**走る (無ければ `?` で抜ける)。
-  非 PDF は `items.get` + `matches!` で即 return なので無コスト。
-  とはいえ PDF フルスクリーンでは `update_prefetch_window` の current、prefetch ターゲット
-  全件、連結読み keep 範囲ループ全件、見開きパートナーから毎フレーム走るため、
-  key を 1 回作って使い回す形にできるかは見ておく。
-- 規模 / 優先度: Small / P3。
-
 ### 1.69 変換対象アーカイブのキャッシュパスが未解決のとき、ZipDir タイルだけ黙って失敗し得る
 
 - 出典: §1.66 の修正 (`ff56abea`) の周辺を洗って見つけた。**利用者報告ではなく、
@@ -1456,39 +1312,6 @@ rayon の既定プールで並べた。**答えは 1 つも変えていない** 
   (`pin_archive_dependencies`) を ZipDir にも広げる。**確認前に直さないこと。**
 - 規模 / 優先度: Small / P3。
 
-### 1.79 比較表示中の元画像表示 (押している間だけ両側を元画像にする) — 利用者要望
-
-- 出典: 利用者実機確認 2026-08-13。比較 (ワイプ) 表示中に元画像表示 (`FsOriginalPreviewHold`、
-  既定 RightCtrl) が効かない、という報告。**期待する挙動は「ワイプはそのままに、ワイプ元と
-  比較対象の両方が元画像になる」** (利用者判断)。片側だけ元画像にしたり、比較をやめて
-  元画像 1 枚を出すのは求められていない。
-- **現状 (source inspection、2026-08-13)**: 比較表示中は**全モードで**元画像表示が効かない。
-  `compare_requested` は `compare_view_mode != Off` だけで決まり、
-  `CompareFramePrimaryDraw::resolve` は元画像表示を入力に取らない
-  ([ui_fullscreen.rs:11708](../src/ui_fullscreen.rs:11708))。今回の Ctrl まわりの変更以前からこう。
-- **実装コストは Medium。小さくない。** 比較の合成は加工済みピクセルから作られており、
-  「元画像版の対」を新たに用意する必要がある。
-  1. **prepared pair は非同期 worker が作る**。identity は
-     `(current_idx, pinned_source_idx, output)` なので、**加工済み / 元画像の次元を足す**必要がある。
-  2. **比較対象 (pin した側) は、pin した時点の加工済みピクセルの snapshot** (`slot.pixels`) で
-     保持している ([ui_fullscreen.rs:22982](../src/ui_fullscreen.rs:22982))。元画像版は存在しないので、
-     **pin 時に未加工の snapshot も持つ (メモリ倍) か、押された時点で再デコードする (遅延)** かの
-     選択が要る。再デコード対象は現在ページとは限らず、`fs_cache` に無いこともある。
-- 方針の案:
-  - 元画像版の対は**押されたときに遅延生成**し、準備できるまでは**加工済みの比較を出したまま**にする
-    (途中で別の絵に切り替わるちらつきを作らない)。既存の `WaitingForSource` / 「比較表示を準備中」
-    の枠組みに乗る。
-  - 一度作った元画像版は、対の identity が変わるまで保持して 2 回目以降を即時にする。
-- 着手時に読む: 上記 `ensure_compare_prepared_pair` / `ComparePrepareOutput` / `pinned_compare_slot`。
-- 関連: 線を消す修飾は左 Ctrl 限定にしてあるので (`88b028e1`)、既定 RightCtrl の元画像表示とは
-  物理的に競合しない。この項目を入れても修飾キーの整理は不要。
-- **当面の決着 (2026-08-13、利用者判断、`42212e9d`)**: 実装コストが高いので、
-  **比較表示中は元画像表示を明示的に無効**にした。有効なままだと画面は変わらないのに
-  「比較表示を準備中」トーストが出るなど副作用だけが起きるため、`original_preview_active`
-  の入口で断っている。本項目を実装するときはこの早期 return を外す。
-- 規模 / 優先度: Medium / P3 (比較表示は加工結果を見比べる機能で、元画像表示が効かないことが
-  データを壊すわけではない)。
-
 ### 1.95 OS 側でコピー・移動したファイルへ編集内容を引き継ぐ — 残りは同計画の未着手分
 
 - 正本: [edit-content-identity-plan.md](edit-content-identity-plan.md)。
@@ -1496,21 +1319,6 @@ rayon の既定プールで並べた。**答えは 1 つも変えていない** 
 - **残り**: 同計画の「未着手」節 — アプリ内コピー / ページ移動の同じ失効漏れ、
   復元を通っていないファイルの注釈サムネイル。
 - 規模 / 優先度: 小〜中 / P3 (実害は余計な確認ダイアログ。データは失われない)。
-
-### 1.105 動画のフルスクリーン上部バーにも「…」オーバーフローを出す — 利用者要望
-
-- 出典: 利用者要望 (2026-08)。静止画のフルスクリーン右上に「…」を追加したので、動画にも
-  同じものがあると UI として揃う、という指摘。
-- 現状: [ui_fullscreen.rs](../src/ui_fullscreen.rs) の `overflow_available` が
-  `!state.is_video && !is_music_view && !panorama_mode_active_now && ...` で、
-  **画像のときだけ**「…」を出す。動画・音楽・パノラマでは出ない。
-- 仕様の論点: 動画の上部バーには既に動画専用ボタン (タイル一覧 / Perf グラフ 等) が並ぶ。
-  「…」に何を入れるかを決める必要がある。
-- **1.104 とは切り離す (2026-08-20 決定)**。「ズレ許容」をフルスクリーン中から変えられると
-  体感を確かめながら調整できるが、動画側の上部バーへ overflow を通す修正量が大きい。
-  1.104 の初回リリースには**含めない**。設定は環境設定からのみ変更できる形で出す。
-  報告者へもこの件は伝えていないので、実施を約束したものとして扱わない。
-- 規模 / 優先度: Medium / P3。
 
 ### 1.108 開くときは黒地、切り替えるときは前の画像 — 表示先の占有を routing 境界で判定する
 
@@ -1562,38 +1370,6 @@ rayon の既定プールで並べた。**答えは 1 つも変えていない** 
   挙動は穏当だが、**ギャップの表し方を揃えるなら一緒に見る**。
 - 規模 / 優先度: 小 / P3 (実害は一瞬の見た目。所有権の方が先)。
 
-### 1.114 PDF の表示解像度合わせが毎フレーム自分を殺し合ってライブロックする
-
-- 出典: 2026-08-21 の実機確認中に遭遇 (別ウィンドウで PDF の先頭 / 末尾へジャンプ)。
-  症状は左下の「PDF 再レンダリング中...」が消えず、そのページの高解像度化が永久に完了しない。
-- **今回の detached 修正が原因ではない。** 同じループが `mimageviewer.log.bak`
-  (2026-08-20 12:09、detached 作業の着手前) に **2051 回**記録されている。
-  別の PDF / 別の日 / 同じ機構。今日のログでは 93 秒間で **15883 回**。
-- **機構 (ログで確定)**:
-  1. ページを読み込み、保持ページキャッシュへ `long=1179` で格納する
-  2. 表示解像度合わせが `target_px=1702` を要求 → キャッシュは 1179 なので
-     `reason=request_pdf_rerender/resolution_mismatch` で miss
-  3. [`request_pdf_rerender_at_target`](../src/app.rs:51535) が
-     **進行中の再レンダを無条件にキャンセルして**新しいリクエストを投げる
-     (「既に同じ (idx, target_px) が飛んでいるか」を見ていない)
-  4. 呼び出し元の `ensure_pdf_display_resolution`
-     ([ui_fullscreen.rs:13897](../src/ui_fullscreen.rs:13897) / [:13906](../src/ui_fullscreen.rs:13906)) は
-     **毎フレーム**評価される
-- PDF のレンダは数百 ms かかるのに、リクエストは約 6ms ごとに投げ直される。
-  **どのリクエストも完了する前に次に殺される。**
-  ログの裏付け: `pdf rerender done` が **1 回も出ておらず**、
-  spawn された全スレッドが `pdf rerender: cancelled (channel closed)` で終わっている。
-- **修正方針**: 「同じ `(idx, target_px)` のリクエストが既に in-flight なら投げ直さない」判定を入れる。
-  時間窓ではなく、**進行中リクエストの identity** で判定する。
-  in-flight を無条件に潰す現在の実装 ([app.rs:51535](../src/app.rs:51535) 付近) がライブロックの直接原因。
-  - 副次的に確認すること: 1 回でも再レンダが完了すれば miss が解消するのか。
-    今回は一度も完了していないため、要求解像度 1702 を満たす結果が返るかは**未確認**。
-    dedup を入れた後に、完了した結果の long がまだ target を下回るなら別の原因が残っている。
-- **⚠ 着手前に調整が要る**: 2026-08-20〜21 に master 側で PDF 周辺が活発に動いている
-  (`f2c88357` 同時 open 数の上限 / `c817a0d3` 列挙の相乗り / §2.13〜§2.16)。
-  同じ領域を触る別作業と衝突しないか確認してから着手する。
-- 規模 / 優先度: Small / P1 (利用者の目に見える固着)。**別の PDF 修正が落ち着いた後に再確認する** (利用者判断 2026-08-21)。
-
 ### 1.122 F12 で動画をメイン ⇄ 別ウィンドウへ往復させると重い — 主因は解消、残り 1 件
 
 - 主因 2 つ (16ms pump のイベント駆動化、`egui_overlay` の wgpu device 共有) は
@@ -1607,7 +1383,9 @@ rayon の既定プールで並べた。**答えは 1 つも変えていない** 
 - ⚠ **guard / delay / retry で待ち時間を隠さない。**
 - 規模 / 優先度: Medium / P3 (残りは体感上実用域)。
 
-### 1.123 スレッド終了中の heap 例外を、例外ハンドラ自身が二次クラッシュで握り潰す — 実機クラッシュ
+### 1.123 スレッド終了中の heap 例外を、例外ハンドラ自身が二次クラッシュで握り潰す — (B) 実装済み、(A) 原因未確定
+
+- 状態 (2026-10-26): **(B) は v4.8.2 で出荷** (例外ハンドラは起動時に開いた `logs/native-exception.log` へ、ヒープ・TLS を使わずに記録する)。残りは (A) 元の例外の原因で、当時のダンプとログが無いため未確定。
 
 - 出典: 2026-08-25、R2e ステージ④の smoke 準備中。タグを付けて上のフォルダへ移動した直後に
   `mimageviewer-core.exe` が **0xc0000005 で異常終了**。`panic.log` に記録なし
@@ -1644,65 +1422,36 @@ rayon の既定プールで並べた。**答えは 1 つも変えていない** 
 
 - ⚠ **(B) を直しても (A) は直らない。だが (B) を直さないと (A) は永久に見えない。**
   例外ハンドラが証拠ごと消していたため、**(B) を先に直した。**
-- **(B) は修正済み** (2026-08-25、`7e16fadde`、v3.3.0)。`logger::current_thread_id_num()` は
-  Windows では `GetCurrentThreadId()` を直接呼ぶ (`std::thread::current()` は非 Windows 枝だけ)。
-  ハンドラが TLS に触れて自分で死ぬことはなくなり、(A) が起きればログに残る。
-- **(B) の残り**: ハンドラ経路はまだヒープを使う。[lib.rs](../src/lib.rs) の
-  `native_exception_handler` は `format!` と `append_panic_log_entry` を通り、同ファイルの
-  コメントがこれを残存リスクとして自認している。ヒープ破損の最中に走る以上、
-  **固定バッファ + `write!` + 起動時に開いた handle へ書く**のが本来の姿。
-- (A) の手掛かり: 一次例外は `RtlFreeHeap` の中。`Application Verifier` の page heap か
-  `_NT_GLOBAL_FLAG` の heap tail checking を有効にして再現すると、壊した側が特定できる。
-  ダンプは `C:\Users\<user>\AppData\Local\CrashDumps\` に残る (今回は 59.6 GB)。
+- **(B) の TLS 依存は修正済み** (2026-08-25、`7e16fadde`、v3.3.0)。`logger::current_thread_id_num()` は
+  Windows では `GetCurrentThreadId()` を直接呼ぶ。この変更だけでは、ハンドラ内の String 整形や
+  panic.log のパス生成・open・ローテーションによるヒープ使用は残っていた。
+- **(B) の残りを実装 (2026-10-25、branch claude/bugs-328-135-123-192-86051c、未 merge)**:
+  [native_exception_log.rs](../src/native_exception_log.rs) が起動時に専用 `logs/native-exception.log` を開き、
+  ハンドラは CAS・飽和カウンタ・固定 2048 byte バッファ・core の整形と raw `WriteFile` 1 回だけで記録を試みる。
+  ヒープ・Rust TLS・ロック・スタック取得は使わない。起動時のみ 1 MiB **超**で `.bak` に置換し、
+  セッション中は 256 行で停止 (最終行に注記)。sink 初期化・VEH 登録失敗は logger 初期化後にログへ出し、
+  既存 log writer の一度だけの診断ログ失敗トーストへ渡す。再試行・代替出力・回復処理の回復は加えない。
+  Rust panic・UI HANG・watchdog は従来どおり `panic.log`。診断 ZIP には専用ログと `.bak` も既存経路で入る。
+- **記録の限界**: `chance=first` は SEH で処理される例外も含む。常に `CONTINUE_SEARCH` を返し、
+  OS 側の既定処理を変更しないが、記録・WER dump は保証しない。STACK_OVERFLOW は best-effort
+  (外部 DLL 作成スレッドのスタック余裕は保証されない)。code/address/thread/version/exe・ntdll base が残れば、
+  exe/ntdll 内のアドレスの RVA を求められる。スタックは残さず、(A) と同じ原因での再発と断定はできない。
+- **(A) の設計時の調査結果**: 当時のフルダンプと直前の通常ログは残っていない。設計担当の調査では、
+  TLS 修正後の既定 data dir の `panic.log` に `NATIVE EXCEPTION` は 0 件 (最後の書込み 2026-10-19)。
+  唯一の記録は修正前の 2026-07-15 で、別件の可能性がある。ヒープ破損時に記録自体が失敗した可能性は排除できない。
+  保存されたスタックから分かるのはスレッド終了処理中の `RtlFreeHeap` での例外までで、
+  解放対象・破壊したスレッド・特定 FFI は分からない。二重解放や use-after-free も残るため、(A) は今回修正しない。
+- **(A) の次の手**: 再現調査を行うなら、使い捨ての**専用名**コピー (例: `miv-pageheap.exe`) にだけ
+  Application Verifier / full page heap を設定する。page heap はイメージ名に対する永続設定なので、通常版と同名には掛けない。
+  既存設定の確認・試験後の解除を含め、対象・時間・desktop 使用範囲について利用者の明示了承が必要。
+  書き込み位置で全ての破壊を捕まえられるとは限らない。今回この実機試験は行っていない。
+- **(B) の検証 (2026-10-25)**: 実装担当 (Codex) のコミット前検証で、焦点テスト
+  (`cargo nextest run -p mimageviewer --lib -E 'test(/native_exception|panic_log|log_writer/)'`) が成功した。
+  新規テストは整形・recorder・起動時ローテーション・共有モード・初期化失敗・診断失敗通知と、子プロセスで実際に
+  AV (終了 `0xC0000005`) と stack overflow (終了 `0xC00000FD`) を起こして専用ログに 1 行残ることを見る試験。
+  独立レビュー (`8c366103e`) は ACCEPT WITH CHANGES で、長い `--data-dir` で sink を開けない P2 を受けて
+  起動時の open を std 経由に直した。実アプリでの確認・page heap は未実施。
 - 規模 / 優先度: Small (B) / Medium (A)。**P2** — 通常操作 (タグ付け → フォルダ移動) で落ちた。
-
-### 1.135 動画レンダースレッドがパニックすると、以後どの動画も再生できなくなる
-
-- 出典: 2026-08-27 実機。シークバーのストリップを開いた直後に
-  `native video render fault: native video render thread panicked` が出て、**以後どの動画を
-  開いても同じエラー**になった。アプリを再起動するまで戻らない。
-- **直接の原因になったパニックは §1.112 の作業中に直した** (波形テクスチャ幅が GPU 上限を
-  超えていた。`WaveSpanRequest::pixel_width` に上限が無く 4K 幅 × 3 = 11520px を要求していた)。
-  **本項はその先の構造の話**: パニックの原因が何であれ、一度死んだら復旧しないこと。
-- 観測できた事実:
-  - panic.log に**同じ形の `Device::create_texture` パニックが 2026-08-10 (8320px) と
-    08-14 (9000px) にも残っている**。つまり以前から起きており、そのたびに再生不能に
-    なっていたはず。利用者が「動画が再生できない」と気付いた時点では、原因のストリップ
-    操作から離れているので、結び付けにくい。
-  - スレッドは `catch_unwind` で包まれており ([video/mod.rs:1922](../src/video/mod.rs))、
-    パニック自体は捕まえてログに残る。しかし**その後スレッドを作り直さない**ので、
-    presenter が居ないまま `native video render fault` を返し続ける。
-- 判断が要る点:
-  1. **作り直してよいのか。** パニックの原因が GPU リソースの不整合だと、作り直しても
-    同じ場所で落ちてループする。無条件の再生成は「症状パッチ」になり得る。
-  2. 作り直すなら**回数を制限し、理由を型で持つ**必要がある (`VideoScaleFallbackReason` と
-    同じ作法)。何度目で諦めるか、諦めたら何を見せるかを決める。
-  3. **少なくとも利用者への見せ方は変えられる。** 現在の「動画を再生できません:
-    native video render fault」は内部語で、再起動すれば直ることが伝わらない。
-- 参考: 静止画側には同種の「GPU 経路が死んだら次のフレームで作り直す」機構が無いので、
-  前例として使えるものは無い。
-- 規模 / 優先度: Medium / P2 (実害はデータ喪失ではないが、**再起動するまで動画機能が
-  丸ごと死ぬ**。原因側を潰しても別のパニックで再発し得る)。
-
-### 1.134 common modal がツールバー / メニューバーのポインターナビを止めていない — 未対応
-
-- 出典: 2026-08-27、§1.133 の調査中に Codex が発見。**archive convert 固有ではなく、
-  全 common-modal window に関わる入力ゲートの不統一**。
-
-`common_modal_dialog_open` に登録された window は、キーボードショートカット /
-グリッド open / 背面 wheel / フルスクリーン入力を止めるが、**ツールバーの
-お気に入りボタンなどのポインターナビは止まらない** (`any_dialog_open()` で
-無効化されていない)。
-
-変換進捗ウィンドウ表示中でもお気に入りクリックでナビできるのはこれが原因。
-これ自体は §1.133 の修正対象ではない (preflight が拒否するので安全) が、
-**モーダルの意味が入力種別で違う**のは設計として不揃い。
-
-⚠ `archive_convert` を `archive_convert.is_some()` で一括登録するのは**誤り**。
-意図的に非表示にしている `Scanning` 中まで操作不能になる。現行の
-`archive_convert_dialog_visible()` 経由の登録が正しい。
-
-- 規模 \\ 優先度: Medium / P3 (出荷ブロッカーではない)。
 
 ### 1.136 detached placement のテストが、実機のモニター配置に依存して揺れる — 未対応
 
@@ -1800,91 +1549,6 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
 
 規模 / 優先度: 小〜中 / P3。ヘルプが出ないわけではなく、出る場所が違う。
 
-### 1.165 切り取り済みの編集プレビューを代役に使うと、寸法の説明と絵が食い違う
-
-**利用者報告 2 件 (2026-08-31 / 2026-09-02) と、こちらで見つけた連結読みの症状は
-すべてこの 1 つが原因。** 症状ごとに対症で塞がない。
-
-#### 症状
-
-1. **単ページ**: 切り取り済みのページをフルスクリーンで開くと、本画像が来るまでの間に
-   切り取り枠と暗転が**切り取り済みのサムネイル**の上へ乗り、二重に切り取ったように見える
-   (利用者報告)。
-2. **連結読み**: 切り替えた直後、ページ全体フィットのはずが**少し拡大して見える**ページと、
-   **切り取られた絵のまま出る**ページが混在する (こちらで確認)。
-3. 本テクスチャが届いた瞬間に絵が**広がる**。
-
-#### 原因 (確定)
-
-**切り取りがピクセルへ適用されているのは編集プレビューキャッシュ (= 一覧のサムネイル) だけ**で、
-表示用テクスチャ (raw / processed / final composite) には入っていない
-([edit_preview_cache.rs:1023](../src/edit_preview_cache.rs:1023)、サムネ側は
-[thumb_loader.rs:1061](../src/thumb_loader.rs:1061) が `source_dims` へ**切り取り後の寸法**を
-入れる)。crop を変えても表示 cache は保持され、失効するのは編集プレビュー WebP だけ。
-
-そのうえで、表示側は**代役としてこのサムネイルを使う**。
-
-- 単ページ / 見開き: [fs_display_texture_choice](../src/ui_fullscreen.rs:25985) の
-  `tex.or(thumb_tex)`
-- 連結読み: [ui_fullscreen.rs:27873](../src/ui_fullscreen.rs:27873) の
-  `fs_thumbnail_texture_for_display`
-
-さらに連結読みでは、**ページの大きさを決める処理と、貼るテクスチャを選ぶ処理が別**である。
-
-- 大きさ: [vertical_reading_base_size](../src/ui_fullscreen.rs:26917) →
-  [choose_continuous_page_layout_size](../src/ui_fullscreen.rs:4657)。
-  解決順は fs_cache → `fs_early_dims` → **サムネイルの `source_dims` (切り取り後)**
-- 貼る絵: そのあとの `page_textures` ループ ([ui_fullscreen.rs:27803](../src/ui_fullscreen.rs:27803) 以降)
-- 流し込みは [from_resolved_rect](../src/displayed_image_transform.rs:195)。**矩形をそのまま
-  使い倍率を逆算する**ので、2 つが別の絵を指していれば差がそのまま拡大 / 変形として出る
-
-`fs_early_dims` は**フル解像度の読み込みを開始したページにだけ**入る
-([app.rs:64579](../src/app.rs:64579)、worker の `DimsOnly`)。したがって連結読みへ入った直後は
-次の 2 状態が同居する。
-
-| ページの状態 | 大きさの出どころ | 貼る絵 | 見え方 |
-| --- | --- | --- | --- |
-| 読み込み開始済み・未到着 | 元画像の寸法 | 切り取り済みサムネ | **拡大して見える** |
-| 読み込み未開始 | 切り取り後の寸法 | 切り取り済みサムネ | 大きさは合うが**切り取られた絵** |
-| 本テクスチャ到着後 | 元画像の寸法 | 元画像 | 正しい (ここで広がる) |
-
-**普段この食い違いが出ないのは、サムネイルと元画像の縦横比が同じだから**である。代役にしても
-解像度が落ちるだけで大きさの意味は変わらない。**切り取りはその前提を壊す唯一の編集**で、
-だから切り取り済みページでだけ現れる。
-
-同じ教訓が隣に既に書かれている ([ui_fullscreen.rs:27803](../src/ui_fullscreen.rs:27803)
-「貼るテクスチャは描画より前に 1 回だけ決める … 最初の実装が実際にそれで、連結読みだけ
-直っていなかった」)。見開きの間隔合わせでは直したが、**基準寸法の解決はまだ選んだ
-テクスチャと別経路**で、同型が 1 段上に残っている。
-
-#### 対応
-
-**(a) 即時 — 枠と暗転を、代役を貼っている間は描かない。** overlay の条件
-([ui_fullscreen.rs:15510](../src/ui_fullscreen.rs:15510)) は `!original_preview_active` は
-見ているが、**本画像が来ているかを見ていない**。呼び出し地点に `state.tex` があるのでそこで塞ぐ。
-利用者へ「次で直す」と回答済み (2026-09-02)。**症状 1 の枠だけが消え、絵の食い違いは残る**
-ことを承知のうえで先に出す。
-
-**(b) 構造 — 寸法の説明と貼る絵の出どころを 1 つにする。** 基準寸法を、実際に選んだ
-テクスチャから引く。`ThumbnailState::Loaded` は既に **`from_edit_preview: bool`** を持つ
-([grid_item.rs:487](../src/grid_item.rs:487)) のに、代役を返す
-[fs_thumbnail_texture_for_display](../src/app.rs:14993) はそれを見ていない。所有を 1 つにすれば
-切り取り以外の代役でも構造的に安全になる。**(a) の後に (b) を入れ、(a) の条件を見直す。**
-
-**(c) 代替案 (採らない場合の比較用)**: 切り取り済みプレビューを代役に使わない
-(`from_edit_preview` を見て断る)。実装は最小だが代役が減り「絵が出るまでが遅い」方向へ振れる。
-1.166 で表示へ反映する方針を採る場合、食い違いはそちらで消えるので (b) の形が変わる。
-
-#### 回帰確認
-
-- 切り取り済みページを一覧から開き、本画像到着の前後で**絵の大きさと位置が動かない**。
-- 連結読みへ切り替えた直後、ページ全体フィットで**拡大されて見えるページが無い**。
-- 連結読みを速くスクロールして戻ったとき、ページが「広がる」瞬間が無い。
-- 見開き、分割、回転、表示トリム、AI アップスケール併用でレイアウトが変わらない。
-- 切り取りの無いページの表示と代役の出方が従来どおり (代役を減らしていない)。
-
-- 規模 / 優先度: (a) Small / (b) Small〜Medium。**P1** (見えている絵が正しくない)。
-
 ### 1.177 一括書き出しの準備が、1 件でも重ければその間 UI が止まる (v3.5.0 レビュー R08)
 
 - Ctrl+E の準備はフレーム予算 (6ms) で分割したが、**予算を見るのは 1 件を終えた後**。
@@ -1926,51 +1590,6 @@ V キーと同じ入口・同じ後始末を通るので、こちらとは別の
   無くなり、正本 (DB) はそのページへ正しく戻る**。ただし、そのページを開いている窓の
   `adjustment_page_params` は変更後のまま残るので、その窓が読み直すまで表示に反映されない。
   ここで場当たりの通知を足すと本項の設計と二重になるため、**本項でまとめて配送する**。
-
-### 1.176 一括補正の適用と取り消しで、ページ数ぶんの DB 書き込みが UI を数秒止める
-
-- **症状**: 一覧で多数チェックして <kbd>Ctrl</kbd>+<kbd>1</kbd>〜<kbd>0</kbd> のスロット一括適用、
-  および その <kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd> で、UI が数秒固まる
-  (利用者確認 2026-09-03)。
-- **v3.5.0 の退行ではない。** v3.4.0 の `apply_slot_to_grid_selection` と
-  `apply_adjustment_change_to_app` も同じく 1 ページずつ `set_page_params` を呼んでいる
-  (`git show v3.4.0:src/app.rs` / `:src/undo_ops.rs` で確認)。v3.5.0 の U01 で直したのは
-  復元先の**検索**コストで、こちらは元からある**書き込み**コスト。
-
-**計測** (`cargo test -p mimageviewer --lib bulk_adjust_cost -- --ignored --nocapture`、
-2,000 ページ、開発機 / 一時フォルダの DB):
-
-| 区間 | 時間 |
-|---|---:|
-| 適用 (`capture_adjust_full` + `set_page_params` × N) | 5,584 ms |
-| 取り消し (`apply_meta_undo`) | 4,139 ms |
-| やり直し (`apply_meta_redo`) | 3,770 ms |
-| — DB を 1 行ずつ (いまの発行のしかた) | 3,367 ms |
-| — DB を 1 トランザクション (既存 `set_page_params_bulk`) | **11 ms** |
-| — 復元先の解決 (U01 で直した部分) | 5 ms |
-
-- **分かっていること**: `set_page_params` は 1 ページごとに `conn.execute` を呼ぶので、
-  **ページ数ぶんの暗黙トランザクション**になる。同じ 2,000 行を 1 トランザクションで書くと
-  11 ms なので、**約 300 倍**の差。U01 で直した検索はもう支配的ではない (5 ms)。
-- **分かっていないこと**: 適用 5,584 ms のうち DB が 3,367 ms として、**残り約 2,200 ms の
-  行き先はまだ特定していない** (キャッシュ無効化 / `effective_params` / サイドカー /
-  `capture_adjust_full` の差分取り、のどれか)。**先にここを内訳へ落としてから**設計する。
-  DB だけ直して「半分速くなりました」で終わらせない。
-
-**直し方の候補** (内訳が出てから決める):
-
-- 既に `AdjustmentDb::set_page_params_bulk` / `remove_page_params_bulk` があり、
-  「全画像に適用」(`app.rs` の 1 箇所) だけが使っている。スロット一括適用と Undo / Redo の
-  復元も、**同じページ集合をまとめて 1 トランザクションで書く**経路へ寄せる。
-- ただし現状の書き込みは 1 ページごとに「標準と一致するなら行を消す」判定 (`matches_default`)
-  と sidecar 反映を挟むので、単純に bulk API へ差し替えるだけでは意味が変わる。
-  **set と remove の 2 群へ振り分けてから**それぞれ 1 トランザクションにする形になる。
-- キャッシュ無効化 (`clear_caches_for_param_change` / `bump_adjustment_generation`) を
-  ページごとに回している分も、まとめて 1 回にできるか見る。
-
-- 計測用の道具は `src/app/tests.rs` の `bulk_adjust_cost_tests` に置いてある
-  (`#[ignore]`、合否判定はしない)。直したら同じ道具で前後を比べる。
-- 規模 / 優先度: Medium / P2。
 
 ### 1.175 `ui_snapshot` のテスト実行体が、たまにアクセス違反で落ちる / 進まなくなる
 
@@ -2071,25 +1690,55 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
 
 - 規模 / 優先度: Medium / P2 (v3.6.0 で 1 度は時間を取る)。
 
-### 1.192 動画のシークとストリップ close が、離すフレームの最後の移動を取りこぼす (2026-09-07)
+### 1.440 動画・音楽 HUD の音量スライダーが、離すフレームの位置を使わない (2026-10-24)
 
-- 出典: v3.6.0 出荷前レビュー ([review-v3.6.0/seek-strip-findings.md](review-v3.6.0/seek-strip-findings.md) F3)
-  で静止画側に見つかった問題。**同じ形が動画側にもある**ことを、その修正
-  (`99593e029`) の実施中に確認した。**動画は今回変更していない。**
-- 症状 (コードから確定、実機未確認):
-  - 横シークが既にスクラブに決まった状態で、「最後の移動 + 離す」が同じフレームに届くと、
-    **最後の位置へシークしない**
-  - シークストリップの下方向 close も同じで、**最後の移動で境界を越えて離すと閉じず、
-    その位置で commit される**
-- 機構: egui の release フレームは `drag_stopped=true` / `dragged=false` になる。
-  判定が `dragged()` の間だけを見ていると、そのフレームのポインタ位置が使われない。
-- 静止画側の直し方が参考になる: release フレームでもそのフレームの座標で
-  Seek / close を判定する (`src/ui_fullscreen.rs` の
-  `handle_still_seek_track_response` / `handle_still_seek_strip_response`)。
-  **押下原点を XY で保持する**必要がある点も同じ。
-- **今回入れなかった理由**: 動画は現在正常に動いており、静止画の修正に動画を巻き込むと
-  1 つの変更で 2 つの面を触ることになる。分けて扱う。
-- 規模 / 優先度: 小 / P2。
+- 状態: **未着手 (v4.9.0 で試作して撤回、2026-10-27)**。
+- 出典: §1.192の調査で見つけた同型 (コード読み、当初は実機未確認)。共有の `draw_overlay_volume_slider` は
+  最後のドラッグ値で終了し、releaseフレームの位置を採用しない。nativeの合成release座標と実releaseを区別する必要もある。
+- 規模 / 優先度: Small / P3 (再着手時は所有の設計・レビューを先行する)。
+
+経緯と撤回:
+
+1. releaseフレームの位置を採用する修正を実装した。
+2. ClaudeCodeが隔離data-dirの実アプリで退行を発見。音楽HUDの音量をクリックして-0.8dBにし、再生/一時停止クリックでは変わらないことを確認する。
+   続いてドラッグで+9dB付近へ動かしたままEscでビューを閉じ、一覧でボタンを離す。
+   開き直すと+9dBだが、最初にHUDの再生ボタンをクリックすると音量が最小になる。
+   2回再現し、修正前masterでは同じ手順で起きなかった。
+3. 所有をdrag開始Id・viewport・連続描画へ限定したが、独立レビューP2で速い短ドラッグの取りこぼしと、
+   nativeシークの押下のみの状態がsource/モードreset後も残る経路を指摘された。
+4. press〜releaseの単一所有 `OverlayPress` に統一したが、3回目の独立レビューP2で、音量ドラッグ中にNormスキャンで操作不能になっても
+   所有が残り `SetVolume` を出し続ける経路を指摘された。
+5. 3回連続で「ドラッグの終わらせ忘れ」に関するP2が続いたため、利用者判断で§1.440/§1.441をv4.9.0から外し、
+   製品コードをmaster `7a8a25b06` の内容へ差し戻した。§1.429は残す。
+
+学び / 再着手条件:
+
+- 「離した位置を採用する」には、所有が必ず正しく終わることが前提。実装前にドラッグの所有者と終了条件を設計書へ列挙し、
+  独立レビューを通してから実装する。
+- 終了条件の棚卸し: release / Escape / ビューを閉じる / source・モード切替 / 非表示・自動非表示 /
+  操作不能化 (disabled、Normスキャンを含む) / capture喪失 / タッチ終端。動画nativeと音楽egui-winitの別入口も確認する。
+- 上の隔離実アプリの再現手順を回帰テストにする。表示だけでなく再生側の値と、取消/閉鎖/disabled後に値変更を出さないことを検査する。
+- 残件: 音楽HUDのタッチ終端座標。egui-winitのTouch Endがポインターを終端座標へ更新せず、Move=A / End=Bで音楽側はAを採用する
+  (native動画側はB)。全eguiタッチへの影響を検討する必要があり、v4.9.0では未対応。
+- 試作: ブランチ `hud-1440-1441-trial` (`f65cc515c`) に最終形 (`Option<OverlayPress<T>>`、`overlay_press_update`、
+  動画音量/音楽音量/音楽seek/native seek rowの4経路) を保存済み。未解決P2を含む試作であり、そのまま再投入しない。
+
+### 1.441 音楽 HUD のシークが、離すフレームの最後の移動を取りこぼす (2026-10-24)
+
+- 状態: **未着手 (v4.9.0 で試作して撤回、2026-10-27)**。
+- 出典: §1.192の調査で見つけた同型 (コード読み、実機未確認)。音楽HUDのseek行は `clicked || dragged` のときだけSeekを出し、
+  releaseフレームの最後の移動を採用しない。
+- 規模 / 優先度: Small / P3。
+- §1.440と同時にv4.9.0向けの試作を撤回し、master `7a8a25b06` の内容へ差し戻した。
+  経緯、再着手前の所有/終了条件の設計・独立レビュー、実機回帰、タッチ終端座標の残件、保存した試作は§1.440を参照。
+
+### 1.442 HUD の減光中に終わったドラッグに、終わりが届かない (2026-10-24)
+
+- 出典: §1.192 の調査 (コード読み、実機未確認)。HUD の減光中は native の MouseButton をすべて捨てる
+  (`src/video/native_presenter/render_core.rs` の減光時の入力処理。cleanup の release も)。減光をまたいで終わったドラッグには
+  egui にも §1.192 の終わり方の型にも終端が届かず、シーク行・ストリップの所有が残り得る。
+- 直す方向: 減光で入力の所有を外すときに、押下状態と所有中のジェスチャを明示的に `Cancelled` で終わらせる遷移を置く。
+- 規模 / 優先度: Small / P3。
 
 ### 1.199 native 動画の同一batchで領域を跨ぐと、先のwheel操作が失われる可能性 (2026-09-07)
 
@@ -2286,365 +1935,7 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
   作り直すときは、上の表を再現するところから始めると判断が早い。
 - **これは退行ではない。** リリース済みの版でもスタックへは集約していない。
 
-### 1.194 入れ子 ZIP のキャッシュヒットが、外側 ZIP の更新を検証しない (2026-09-07)
-
-- 出典: v3.6.0 リリース差分レビュー (Codex Astra) の指摘 8。
-  **レビュー自身が「v3.5.0 にも存在し、今回の退行ではない」と明記している。**
-- 症状: 内側 ZIP bytes のキー (`src/zip_loader.rs:510` 付近) は
-  **外側 path と内部 path だけ**で、mtime / サイズを持たない。キャッシュヒットの経路
-  (`src/zip_loader.rs:1113` 付近) は目次キャッシュにも到達しないため、
-  **外側 ZIP を同じ path で差し替えても、`clear_nested_cache()` が走るまで旧内容を返す。**
-- v3.6.0 で目次キャッシュ側は `(path, mtime, len)` で検証するようになった
-  (レビュー指摘 5 の修正、`436109a62`) が、**内側 bytes の identity は揃っていない**。
-  同じ修正で `clear_nested_cache()` の全消去も無くなっていないので、
-  ナビゲーションで消える現状の逃げ道は残っている。
-- 直す方向: 内側 bytes のキーも `ArchiveCacheKey` と同じ identity へ揃える。
-  そうすれば「外側を切り替えたら全部消す」に頼らずに済む。
-- 規模 / 優先度: 小 / P2 (差し替えは頻度が低いが、返る内容が古いのは静かな誤りである)。
-
-### 1.191 X 予約投稿 — **見送り (2026-09-24 利用者の判断、再提案しない)**
-
-- **見送りの理由**: X の開発者規約 (Restricted use cases「Multiple applications」) は、ツールの利用者に
-  自分の開発者アプリを登録させることを措置の対象になり得ると明記する。mIV と同じ構成
-  (無料・Windows でローカル実行・各自が開発者アプリを作成・キーは各自の PC にだけ保存し作者と共有しない)
-  について、X Staff が 2026-08-19 に「distributing a completed kit that other people run by creating their own
-  Developer App isn't permitted ... register one app and have users authorize it with OAuth instead」と回答した
-  (https://devcommunity.x.com/t/273564、設計担当が原文を確認)。1 つのアプリで OAuth 認可を取る方式では
-  全利用者の API 料金を作者が負担することになり、利用者の判断で見送った。作者個人の利用は別プロジェクトで
-  実現済み。調査の詳細は `x-scheduled-post` ブランチの `docs/x-post-api-account-research-2026-09.md`。
-- ブランチ `x-scheduled-post` (worktree `C:\home\mimageviewer-xpost`) は master へマージしない。
-  途中で見つかった既存製品の不具合は §1.272〜§1.274 に切り出した。
-- 以下は見送り前の記録。
-
-**正本は [x-scheduled-post-plan.md](x-scheduled-post-plan.md)。**ここには現状と残りだけ書く。
-
-mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_posts.db`、投稿は Windows
-タスクスケジューラが 5 分ごとに起こす `mimageviewer.exe --x-post-worker` の一発プロセス
-だけが行う (mIV を一度も起動しなくても投稿される)。外部ツールからの予約は投函フォルダ
-(`<data_dir>/x_inbox` へ JSON manifest を置く)。作成 UI・プレビュー・費用警告・
-課金台帳・OS 起動時の最小化自動起動を含む。
-
-- 状態: 設計合意済み・**未着手**。別 worktree (branch `x-scheduled-post`) で進める。
-- 利用者判断 (2026-09-06): 既定 OFF の上級者向けとして配布 / タスクスケジューラ主体で
-  常駐は前提にしない / v1 は画像 1〜4・動画・GIF・長文 (連投は入れない) / 予約の受け口は
-  投函フォルダ (ローカル HTTP API は作らない) / pixiv は対象外 / 実装順は任せ。
-- **有料 API を使うので at-most-once が最優先**。結果不明の送信は自動再送せず、
-  X へ照合してから人に判断させる。plan §6 が中心で、P2 がその実装。
-- 失敗・期限切れは**定期実行時にポップアップで知らせる** (plan §6.7)。mIV を起動
-  しない運用が前提なので、一覧の印だけにしない。worker はブロックさせない。
-- 未決は plan §14 (プロフィール取得 / `needs_review` の気付き方 / 動画の先行アップロード)。
-- pixiv は規約を読んだうえで見送り。理由は plan §11.1 に記録済み (再提案しない)。
-
-- 規模 / 優先度: Large / P2 (利用者本人の運用要望。閲覧機能の不具合より後)。
-
 ## 2. 一覧 / サムネイル / フォルダ走査
-
-### 1.328 ZIP を開いてから ← で戻ると、開いていた ZIP が選択されない (通常フォルダ・レーティング一覧) — v4.4.0 で出荷、残り: 閲覧履歴・サブフォルダ展開の同型 (別原因)。報告者へは連絡済み。★一覧 → フォルダ → ← は利用者が実機で確認済み (2026-10-07) (2026-10-07)
-- **次の版の決定 (利用者 2026-10-07)**: ライン A。残り (閲覧履歴・サブフォルダ展開)。
-
-- `6b2c1c9d8`追補 (2026-10-07):
-  - touch診断がcanonical offsetと端数付き描画offsetを比較し、20pxの静止端数でも毎frame
-    loggerへ出力していた。canonical anchor変更/glide境界へ限定し、eguiの端数差による反復診断と
-    layout前の反復queue診断を除いた。wheel/gamepad/readbackも実位置変更だけ。診断専用のO(N)
-    選択探索は削除し、ensure ownerで既に計算した表示位置からだけ行矩形を記録する。
-  - RatingFolderBackの最新runは★3・600件・10列に到達していた。`item_names`の先頭16件上限に対し
-    600名の完全一致待ちをしていたことがtimeout原因。起動load待ちのcoordinator変更を保持し、
-    全件数は`items_len`、対象は世代+container keyで実セルへ解決する。復帰後のkey/name・可視性・
-    実表示行/列数/geometryを検査し、全件順序やraw indexに依存しない。snapshot上限は維持する。
-    fixture/overrideは600行・10列、子6列/2:3のまま。実アプリは起動せず再runへ引き継ぐ。
-    実gridの未focus pointer回帰で、reveal animation途中の座標ACKが別行（310→320）を開く
-    診断経路の問題も確認。test-script targetの可視化だけを既存ScrollAreaで即時に行い、
-    実セルのclick/double-click producerは維持する。通常scrollのanimationは変更しない。
-  - 利用者がdev-runtimeを実機確認中のため、指示どおりbuild-devは実行しない。
-    非対話検証はtest-script 143件・scroll診断2件・1.328回帰35件、計180件成功。
-    全libは10933 passed / 0 failed / 52 ignored（pipeなし、exit 0）。fixture Python 7件、
-    PowerShell AST、fmt、通常/portable core check、glyph（危険文字0件）も成功。
-    `prepare-portable-smoke.ps1 -TestScript`はexit 0、runtime 4 / PE 17の検証も成功。
-    package/isolated smoke treeの準備完了。dev-runtimeのSHA256は作業開始時と一致。
-    実アプリは未起動、修正scenarioの実runはcoordinator待ち。文案は`target/1328-msg-6.txt`。
-
-- 600項目の実機追補 (`983d68272`後、2026-10-07):
-  - toolbar ←で開いたfolderが選択される一方、3:4復元後にSwitchなしでも画面が末尾へ
-    移るとの再報告。Rating採用が宛先favorite遷移を通らず、子の表示設定が初回描画まで
-    残るcode経路を確認した。共通10列・子favorite6列では、初回ensure-visibleが6列で
-    大きいoffsetを作り、frame末尾に10列へ戻った次描画で短い一覧の末尾へclampされる。
-    利用者の実設定がこのoverlayを使うか、各実ログ数値が同経路かは診断付きbuildで確認する。
-    遅延、追加repaint、再ensure loop、共有egui State resetは加えない。
-  - `[queue] vis`は初描画前に旧セル高/viewportを使える予測で、offsetを変更しない。
-    render_gridは現在frameの列数・セル高・viewportを公開してからensure-visibleし、行snapと
-    max-offset clampを行う。寸法計算そのものは現frameだが、設定ownerの採用が一frame遅い。
-    main ScrollAreaの共有IDで保持された速度/target、rawなしのsmooth wheel残量、egui offsetの
-    無条件差分読み戻しは移動可能な経路だが、実機の入力/Stateの証拠はまだない。
-    通常thumbnailのscroll target producerは見つからず、旧touch glideは世代照合で失効する。
-  - normal loggerの`[grid-scroll]`に保存/復元・queue予測・ensure・snap・clamp・touch・aspect・
-    wheel/gamepad・egui readbackのsourceと世代を記録。offset、選択index/行矩形、セル幅/高、
-    列数、viewport、描画owner、egui State前後と直前入力を採取する。パス/項目名は出さない。
-    次の実機runで実経路を確認する。共有StateのresetやID変更は行わない。
-  - 回帰条件を600行、10列、約70可視セル、row30のfolder選択、Rating 3:4/子2:3へ拡張。
-    実menubar/toolbar/facet/footer/folder pane/gridに加え、favoriteの6列overlayと実update末尾の
-    reconcileを通す。旧テストの復帰前の手動10列設定を除いた。`983d68272`製品コード+
-    診断ログでbuild成功後0成功/4失敗、実exit101。←/→→←/BSの3件はindex309を維持したまま
-    offset2925→9604→6318となり不可視。子の異なるカテゴリ順の1件はindex11へ並べ替わった。
-    証跡`target/1328-red-5.txt`。初期のviewport前提違反や手動列数の成功はvalid redに数えない。
-  - 修正は既存の位置保存→可視context採用→favorite表示遷移→seed/初回layoutの順へ統一。
-    prepared/legacyのRating採用が同じownerを通る。workerは復帰先favoriteのカテゴリ順を
-    pureに投影し、既存requestに保持・採用前に再検証する。準備中の子の設定は変更しない。
-    deepest stored ancestor、新規favorite継承、未保存live値、記憶OFFも既存resolverに合わせる。
-    表示mode/比率も一緒に確定し、列数だけの症状補正はしない。Collection/detached/BS入口や
-    StartupListIntentは変更しない。Smart Folderの既存投影/採用原則に沿う局所修正。
-  - RatingFolderBackも600行 (585直接画像+12folder+3ZIP)、900×1000/10列へ変更し、
-    index309/310の中間rowを使う。対象folder/ZIPはUUID付きfavorite保存表示6列、共通10列。
-    rootの31以上の3:4 sample、子の6列/8 sample/2:3/第4画像を待ち、
-    実viewportが6〜8行、viewport以後も10行以上残ることを検査する。戻りの再選択はしない。
-    focus不要のtoolbar4ケースとfocus時だけの18ケースは維持。実アプリは起動しない。
-    詳細: [auto-thumb-aspect-plan.md §6](auto-thumb-aspect-plan.md)、
-    [ui-smoke-automation-plan.md §1.328](ui-smoke-automation-plan.md)。
-  - 同型の表示設定採用調査: 通常folder/ZIP/PDF/convertedは既存のopen owner、Smart Folderは
-    destination projectionと採用境界で表示設定を確定する。Bookmarks/検索/Tag/閲覧履歴は
-    空loading installまたは独自のsnapshot復帰、Drive/サブ展開も専用ownerで、Ratingと同じ
-    prepared replayは通らない。検索/Snapshot等の比率・位置復帰の残件は下表のまま維持。
-    Collection/A/Bは既存のcontext採用を変更せず、Ratingの共通installだけ今回の対象にする。
-  - 修正後の対象35件は全成功 (exit0)。新規の6件は600行の可視往復4件、favorite投影と
-    実遷移の6条件比較、準備中の宛先カテゴリ順変更/退出元非変更を検査する。
-    全libはpipeなしで10,931成功・0失敗・52無視、911.19秒、実exit0。fmt確認とglyph0件、
-    fixture生成7件・PowerShell構文検査も成功。test-script非対話140件、通常/portable core check
-    もexit0。build結果は以下に記録する。文案は`target/1328-msg-5.txt`。
-    実アプリの起動はcoordinator/利用者へ引き継ぐ。
-  - portable test-script build: `prepare-portable-smoke.ps1 -TestScript` exit0。
-    core最適化22分42秒、PE検査runtime4/pe17成功。source fingerprintの前後一致を確認し、
-    `target/portable-smoke/mimageviewer.exe`と隔離dataを更新した。Suiteは実行していない。
-  - dev-runtime build: `build-dev.ps1 -PreserveRuntime` exit0。通常featureのcore8分06秒、
-    remote/EPUB同梱、PE検査runtime4/pe3成功。実行中coreによる拒否はなく、プロセス停止も
-    製品起動も行っていない。CRLF・bounded numstat・diff check確認済み、未commit。
-    次の確認は600行のRatingFolderBack Suiteと、利用者の★3中間folder→第4画像→toolbar ←/
-    →→←の選択・可視性。新しい`[grid-scroll]`行で実機経路を照合する。
-
-- 保存/描画ownerの追補 (2026-10-07、`68a3200f7`後の調査):
-  - saved Rating位置の優先により、Aを保存→B選択→検索結果B→検索closeで古いAに戻る
-    経路を確認。検索entryと結果採用、Rating→Collectionのaccepted openで、旧itemsを
-    消す前に既存Rating保存helperを呼ぶ。検索結果到着前の選択変更も採用境界で捕捉する。
-    Rating保存の優先順位、Collection自身のanchor、StartupListIntentは変更しない。
-    prepared/legacy共通採用で表示rowsの★段stampも確定し、検索surfaceへ変更後も
-    結果到着まで操作できる旧Rating rowsの保存先を特定する。
-    stamp公開は共通採用ownerへ一本化する。検索結果待ちの★3→★5で、worker結果到着時に
-    新★段stampを先に公開すると旧itemsを★5へ誤保存するため、その早期更新を削除した。
-  - 共通aspect fixupが別一覧の`last_cell_h`を使えることを確認。単一描画paneの
-    `GridAspectLayout`にcontext・世代・列数・実寸法を記録し、一致したThumbnailだけ
-    再anchorする。新installやDetailsには借用できる旧寸法がない。適用時に記録高を
-    進め、二重補正を防ぐ。待機・追加repaint・再ensure-visibleは加えない。
-  - 実機warmログの直接原因は未断定。通常SLIはseed前にoffsetを0にし、Rating位置は
-    seed後に復元するため、旧fixupの`floor(0 / old_h)`だけでは0→120→220行の跳躍を
-    説明できない。Collection install直後の即時判定も、presentation公開前は母数0で
-    切替を通らない。共通seed ownerの境界回帰とRating実catalogのHold往復を分けて検証する。
-  - 詳細: [auto-thumb-aspect-plan.md §5.3/§6](auto-thumb-aspect-plan.md)。縦長Auto fixtureの
-    実アプリ確認はcoordinatorへ引き継ぎ、今回も製品バイナリは起動しない。
-  - valid red: `68a3200f7`の製品コード + 新回帰4件はbuild成功後に0成功/4失敗、exit 1。
-    検索往復、検索結果採用前の選択変更、Collection退出で古いAへ戻り、24 cache samplesによる
-    即時Switchでは新世代の初描画前にoffsetが旧寸法で変わった。証跡 `target/1328-red-4.txt`。
-    warm SwitchはCollection sessionを束縛しない共通seed ownerの境界検査であり、実機再現とは
-    区別する。実catalogを保存したRating toolbar往復/BSでは3:4復元後に24 seedがHoldとなり、
-    異なる2:3の移動元gridでも選択行が可視・offset一致を維持した。
-    検索待ち中の★段切替回帰は追補の暫定修正上で1失敗/exit 1を確認し、早期stamp更新削除で
-    修正する。この追加redはpristine `68a3200f7`での4件とは区別して同証跡に記録した。
-  - 修正後: 対象29成功/0失敗、全lib(pipeなし)は10,925成功/0失敗/52 ignored、実exit 0 (906秒)。
-    同一覧補正の二重呼び出し、context/世代/列数/Details不一致、legacy stamp、検索3種、
-    Collectionの直接open/履歴adoption、検索待ち中の★段切替を含む。test-script 123件、fixture Python 5件、fmt、
-    glyph 0件、PowerShell AST、通常/portable core checkも成功。7ファイルの局所差分でCRLF維持。
-    portable/test-script buildも成功 (23分22秒、runtime=4/PE=17)。SkipBuild再準備の
-    source fingerprint/binary hash検査も成功。suiteは起動せず、coordinator再実行待ち。
-    dev-runtimeもPreserveRuntimeで成功 (14分05秒、runtime=4/PE=3)。core/remote/EPUBを
-    再構築した。製品起動・プロセス終了・commitは行っていない。文案は `target/1328-msg-4.txt`。
-
-- Auto比率の追加調査・修正 (2026-10-07、以下の旧経過を更新):
-  - 実機の入力はtoolbar ←。画像のみフォルダを本として開く設定はOFF、サムネ比率はAuto。
-    実ログをread-onlyで確認し、★3一覧の各復帰でseed後に1:1→3:4へ切り替わることを確認した。
-    私的パスは記録・fixture・commit messageへ転記していない。
-  - コード上、Ratingは永続aspect cache対象外で、位置保存からも除外され、replayは
-    scroll/比率状態をresetしていた。選択pathの復元自体は既存修正で正しい。
-    十分なwarm seedの初回切替は選択復元より前なので、そのログだけでは実機症状の直接原因を
-    断定できない。一方、cold catalog + 後着sampleの描画回帰では、戻った直後は正しく選択・可視でも、
-    1:1→3:4切替の先頭行anchorで選択行が画面外へ出ることを確認した。
-  - 「見つからない項目を N 件除外しました」は、Rating workerが解決できない登録行を
-    結果から除外した件数の通知。選択を消す処理ではないが、行集合/indexが変わる可能性はあるため、
-    保存にはstable keyを使い、古いindex sampleを持ち越さない。
-  - `RatingGridPosition` に選択キー・scroll・確定aspect/sample数をまとめ、context-ownedな
-    `TopLevelGridView` の★段別mapで保持する。既存共通保存ownerを使い、ZIP列挙待ちの空一覧は
-    元位置を上書きしない。明示退出/Driveも同じhelperへ接続。別contextへのcloneでは複製しない。
-    prepared/legacy installの `VisibleInstallAuthority::Rating` →既存のsidecar hydration continuationへ
-    seedを運び、初回描画前に既存cache gateで比率を復元する。replay/Backspaceは同じ位置ownerを使い、
-    opened-path選択の優先順位を維持する。新generationのsamples/streak/切替予算は新しく作り、
-    代表画像の変更・欠落登録行・★段変更でも再評価可能にする。手動比率/Collection/detached/
-    StartupListIntentの既存挙動は維持。待機・追加repaint・再ensure-visibleは追加しない。
-  - 同型のaspect調査 (code判定):
-
-    | 一覧 | 比率・位置のowner / 残件 |
-    | --- | --- |
-    | Rating | 今回★段別session位置として一緒に保存・復元 |
-    | Smart Folder | resident prepared layoutがoffsetとAutoAspectStateを保持 (既存正常) |
-    | Bookmarks | stable synthetic pathのcacheを空installより前に復元 (既存正常) |
-    | Collection | ID別prepared aspect seedとentry anchor (変更なし) |
-    | 検索(Ctrl+S/G/★固定)・Tag | aspect cache対象外。←/→は既存仕様で拒否、BSでは結果を再構築。検索/Tagの戻りownerにlayout保持をまとめる必要があり、今回範囲外 |
-    | 検索由来Snapshot | items/selected/pixel scrollを戻すがAutoAspectStateを保存しない。同じ依存欠落だがSnapshotの保存・復元owner整備が必要で今回未修正 |
-    | 閲覧履歴・サブ展開 | aspect cache対象外。下記のopened-row anchor欠落もあり、別の復帰owner整備が残る |
-    | Drive | 通常はiconだがpin代表画像はAuto sampleになり得る。cache対象外・専用installで比率/位置を組として保存しない。Driveの復帰owner整備が必要で今回未修正 |
-    | A/B | 通常一覧は既存path cache、★一覧は今回のcontext位置owner |
-
-    - 上記の追補でRating→Collectionと検索の軽量退出も同じ保存helperへ接続した。
-      検索/Snapshot等が自身の比率・位置を組として保存しない残件は別件として維持する。
-
-  - valid red: 修正前 `ce12c2fb7` の製品コード + 新回帰3件はbuild成功後に0成功/3失敗、exit 1。
-    下方の120フォルダ一覧から開いて第4画像を選び、toolbar ←相当handler、→後の←、Backspaceの
-    全件でsettle後の不可視を確認。証跡 `target/1328-red-3.txt`。これはcold/late経路の確認で、
-    実機のwarm経路と同一原因だという証拠ではない。
-  - RatingFolderBack fixtureを96×128の縦長画像 + Auto ONへ更新。focus不要の必須toolbar経路、
-    focus時だけ実行する18キー等のケースは維持し、初回と各復帰の3:4/sample採用を観測する。
-    実アプリ/scenarioは実行せず、coordinatorへ引き継ぐ。warm実機報告の最終確認は再実行待ち。
-  - 修正後の対象検証: `cargo test -p mimageviewer --lib section1328 -- --nocapture` は
-    20成功/0失敗、exit 0。新しい描画3件に加え、ZIP空pending、★段別保存、新samplesでの再評価、
-    context cloneでの位置非継承、「場所を忘れる」、手動比率の対照を含む。
-    全libは `cargo test -p mimageviewer --lib` (pipeなし) で10,916成功/0失敗/52 ignored、
-    exit 0。test-script付き123件も成功。fixtureのPython 5件、fmt check、glyph 0件、
-    PowerShell ASTも成功。通常/portable core checkもexit 0、変更17ファイルはCRLFを維持し、
-    `git diff --check` と `git diff --numstat` で局所差分を確認。
-    `prepare-portable-smoke.ps1 -TestScript` はexit 0、runtime=4/PE=17の検査とcore/remote/EPUBの
-    manifest SHA-256照合も成功。隔離dataに配置済み。通常dev-runtimeのbuildは後続で確認する。
-
-- 出典: 利用者メール (§1.280 / §1.307 と同じ報告者、v4.3.0)。報告者の観測:
-  - 通常フォルダ: ZIP を開く → ← → 一番左上の項目が選択され、一覧の先頭までスクロールする (時々違う挙動もする)。
-  - レーティング一覧: ZIP を開く → ZIP 内で 4 番目の項目を選ぶ → ← → 一覧の 4 番目の項目が選択され、そこまでスクロールする。
-  - コレクション: ZIP を開く → ← → 開いた ZIP が選択され画面内に収まる (報告者はこの動きを望んでいる)。
-  - 他の画面は報告者も未確認。
-  - **開発者本人が通常フォルダで、← で戻るとカーソルが先頭に戻ることを確認** (2026-10-05)。
-    レーティング一覧の件はコード調査のみ。
-  - 報告者へ「今後の版で修正する。ほかの画面から開いた場合も確認する」と返信済み (2026-10-05)。
-  - 報告者へ v4.4.0 での修正を連絡し、閲覧履歴・サブフォルダ展開は「コードを確認したところ同じく先頭が選ばれる作りで、引き続き対応する」と伝えた (2026-10-07)。
-  - **報告者が v4.4.0 で期待どおりの動き (通常フォルダ・レーティング一覧) になったことを確認** (2026-10-08、報告者のメール)。
-- 望ましい動き: ← で戻ったとき、開いていた ZIP を選択し、画面内に収める (BS で戻ったときと同じ)。
-- 原因 (コード調査、行番号は §1.335 統合後の修正前 `f18de061e` で再照合):
-  - **通常フォルダ**: フォルダを離れるときの位置 (`folder_history` の scroll / selected) は `start_loading_items_inner`
-    (`src/app.rs` 35345、保存自体は 35616) で保存し、戻ったときに 36452 付近で復元する。ところが ZIP を開く
-    `load_zip_as_folder_with_prepared_enumeration` (32143) は、その保存より前に `selected = None` /
-    `scroll_offset_y = 0` にし、`current_folder` を ZIP に書き換える。このため元フォルダの位置が保存されず、
-    ← で戻ると履歴が無い扱い (先頭選択・先頭スクロール) になる。以前の保存が残っていればそれに戻るので
-    「時々違う挙動」になる (推測)。BS は `select_after_load` に ZIP 名を渡すので正しく選ばれる。
-      PDF の open (`load_pdf_as_folder_with_prepared_pages`) は `start_loading_items` の保存を通るので同じ問題は無い
-      (prepared open の対照回帰で確認)。変換済み書庫 (RAR / 7z / LZH) は同じ ZIP の経路を通り、
-      元パス採用後の履歴復帰の回帰でも同じ保存欠落を確認した。外部変換ツールの実行は今回の自動テスト対象外。
-  - **レーティング一覧**: BS (`rating_view_back`、31339) は `select_opened_path` に開いていた ZIP を渡すが、
-    ← の replay (`start_rating_navigation`、31723) は `None`。一覧の install (`finish_rating_view_install`、
-    31972) は直前の `selected` を key → 同じ index の順で引き継ぐため、ZIP 内の 4 番目の画像の index が
-    一覧の 4 番目の行として使われる。index での引き継ぎは同じ一覧の並べ直し用で、別の画面から戻るときに使うのが誤り。
-  - **コレクション**: 戻り先に開いていた entry の anchor を持つ (§1.282) ので正しく動く。
-- 実装 (2026-10-07、Codex の source inspection / 自動テスト。実アプリ起動は未実施):
-  - 通常フォルダ: `save_leaving_folder_grid_position` に既存の位置保存を集約。
-    ZIP が旧一覧を消す直前と通常 install が同じ owner を呼ぶ。列挙完了時の空一覧は保存しない。
-    ZIP / 直接閲覧 RAR / RAR・7z・LZH の変換済み ZIP で共通。PDF の既存 install 保存は維持。
-  - レーティング一覧: ← / → replay の `select_opened_path` に発行時の `effective_folder()` を渡し、
-    成功採用後に開いていたコンテナを選択して ensure-visible。変換書庫は元 source を照合。
-    index fallback は同じ ★一覧の rebuild だけ。key による追従は維持。
-  - Backspace / Collection / detached の経路は変更しない。新規の入力操作・manual 更新は不要。
-  - 簡素化: 新しい保存 state / rollback / modal は足さず、既存 owner と採用境界へ揃えた。
-    §1.335 の `StartupListIntent` の運搬・採用は維持し、session 内履歴の保存から起動復元先を採用しない。
-- 同型調査 (コードからの判定、実アプリの観測ではない。今回と異なる原因の修正は範囲外):
-
-  | 一覧 | ZIP / PDF / 変換書庫 / フォルダを開いた後の ← | 根拠・残件 |
-  | --- | --- | --- |
-  | 通常フォルダ | ZIP・直読み RAR・変換 ZIP は今回修正。PDF・実フォルダは既存保存経路 | `start_loading_items_inner` と ZIP 即応表示の保存時点差を解消 |
-  | レーティング | 対象 container の元パスを今回 replay に追加 | prepared / 通常 install の index fallback を同じ ★一覧に限定 |
-  | スマートフォルダ | root entry の選択と退避 scroll を復元する既存経路 | `restore_smart_folder_prepared_grid` の returned-root-entry と resident session。物理子の通常 ZIP 一覧位置は共通保存の修正対象 |
-  | 検索結果 (Ctrl+S/G/T、ローカル検索、★固定) | 検索・snapshot 所有中の ← / → は既存仕様で拒否 | `history_input_nav_allowed`。検索の Backspace 帰路は今回変更しない |
-  | ブックマーク | 元の bookmark row の stable key / scroll を復元する既存経路 | `BookmarkViewReturnGridState` / `restore_bookmark_view_grid`。本のページを開く一覧で、実フォルダ行は対象外 |
-  | 閲覧履歴 | 開いた本の選択は保証しない (残件) | replay は `enter_reading_history` へ再入場し、一覧 install が先頭を選ぶ。返り先に opened-row anchor を持たない。ZIP 専用の保存欠落 / rating index 継承とは別原因。実フォルダ本も同じ |
-  | サブフォルダ展開 | 開いた項目の選択は保証しない (残件) | restore state は root / snapshot / tombstone を保持するが selection anchor / scroll を持たず、prepare 完了時に先頭を選ぶ。ZIP/PDF/変換書庫/本フォルダに共通する別の owner 設計課題 |
-  | ドライブ一覧 | ← dispatch が離れるドライブルートを origin として選ぶ既存経路 | `enter_drive_list(effective_folder())`。一覧行はドライブルートのみで、ZIP/PDF/変換書庫は直接開けない |
-  | コレクション | §1.282 の entry anchor を保持する既存経路 | 今回変更なし |
-  | A/B クイックフォルダ | 通常フォルダと同じ保存処理、各 slot の履歴 dispatch | A/B 両方を通常 ZIP 回帰に含める。slot 所有・切替仕様は変更しない |
-
-  - 検証 (2026-10-07):
-    - 修正前 `f18de061e`、fixture / §1.335 intent 引数を揃えた追加 10 件は 6 件失敗 / 4 件成功、exit 1。
-      失敗は通常 ZIP、変換 ZIP、rating ← / →、異なる一覧の index 継承、PageContinuation の位置保存。
-      Backspace 2 件・PDF・同じ ★一覧 rebuild の対照は成功。証跡: `target/1328-red.txt`。
-    - 修正後: 追加 10/10、履歴群 106/106、起動復元群 73/73 が成功。
-      `cargo test -p mimageviewer --lib` (pipe なし) は 10900 成功 / 0 失敗 / 52 ignored、exit 0。
-    - `cargo fmt --all -- --check`、normal / portable の `cargo check -p mimageviewer --bin mimageviewer-core`
-      (`portable` は `--features portable`) は exit 0。`python scripts/check_ui_glyphs.py` は危険 glyph 0 / exit 0。
-    - `.\scripts\build-dev.ps1 -PreserveRuntime` は exit 0。normal 機能構成の core / remote service / EPUB PDF worker と
-      FFmpeg / VCRT DLL / EffeTune bundle を配置、VCRT PE 検査は runtime=4 / pe=3 で成功。
-      初回 native 構築の並列競合を避け、`CARGO_BUILD_JOBS=1`、`MSBUILDDISABLENODEREUSE=1` で実行。
-      製品バイナリは起動していない。既存 CRLF を維持し、`git diff --numstat` / `git diff --check` で全ファイル EOL 差分が無いことを確認。
-- 追加調査 (2026-10-07、`d72808b03` の実機報告):
-  - 利用者は ZIP → ← の修正を確認。★3 → 実フォルダ → 画像一覧 → ← では選択を失うと報告。
-    この追加報告は未解決。製品コードの追加修正は原因・red が確認できるまで保留する。
-  - 採取用Suiteを追加: `ui-smoke.ps1 -Suite RatingFolderBack`。隔離した12フォルダ／3 ZIPの
-    ★3一覧を場所▼の実メニューから開き、下方の項目を実セルのdouble-clickで開いて第4画像をクリックする。
-    ツールバー←、Alt+Left、BrowserBack、WM_APPCOMMAND、X1、Backspaceを独立openで検査し、
-    前5入口は → then ← も検査する (22ケース／32戻り観測)。選択key/name/index、一覧identity、
-    実scroll offset／セル矩形／viewportと画面を残し、不一致でも残りを採取する。
-    test-script限定の読取観測／Windows入力APIを使い、製品の履歴ownerや選択挙動は変更しない。
-    portable/test-script版の準備後にcoordinatorへ実行を引き継ぐ。再現・PASSは実行結果待ち。
-    範囲と観測契約は [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) の§1.328参照。
-    非対話確認: `cargo test -p mimageviewer --lib --features test-script test_script::` は
-    118成功／0失敗、fixtureのPythonテストは5成功。normal／portable core check、fmt check、
-    glyph checkはexit 0。今回の実アプリの結果は未採取で、前回のfull libと混同しない。
-    `prepare-portable-smoke.ps1 -TestScript` はexit 0。隔離markerとcore／remote／EPUB workerの
-    manifest SHA256一致を確認。実アプリ／scenarioは起動していない。
-    coordinatorの初回run `20261006T190934152Z-160208-RatingFolderBack-b2cb5320` は
-    入力対象の登録待ちがなく、全22ケースが最初のEscapeで失敗 (exit 1、★3一覧へ未到達)。
-    scenarioで登録・focus・ROOTと各遷移の一覧種別／パス／項目名／世代の採用を待ち、
-    第4画像選択を確認してから戻るよう修正。撮影名の「.」／長さと64枚上限も修正。
-    製品の履歴／選択ownerは変更せず、選択喪失の再現結果は修正版の再実行待ち。
-    修正版の非対話確認: test-script 120成功／0失敗 (採用条件・撮影契約の追加2件を含む)、
-    fixture 5成功。normal／portable core check、fmt／glyph／PowerShell ASTは成功。
-    起動前のRhai変数生成もheadlessで実行し、libraryを保持した★一覧パス、15行／8画像を確認。
-    Rhaiの `replace` は値を返さないため、libraryのコピーへ適用する。実アプリは起動していない。
-    修正版の `prepare-portable-smoke.ps1 -TestScript` はexit 0 (VCRT runtime=4 / pe=17)。
-    隔離marker、core／remote／EPUB workerのmanifest SHA256一致、CRLFと局所差分を確認。
-    2回目run `20261006T193735951Z-178504-RatingFolderBack-9ce99859` は
-    background launchのforeground lockで `target_registered=false focused=false` のまま
-    起動時待ちがtimeout。これも選択喪失の再現ではない。必須toolbar経路はfocus不要の
-    widget pointerへ変更し、画面外セルは世代／index／名前を照合して既存scroll ownerで表示、
-    実double-clickでopenする。戻りの選択／scrollには介入しない。
-    toolbarの4ケース／6戻り観測は必須。他の18ケースは1秒以内のfocus確認ができなければ
-    `SKIPPED no-focus` とし、実行／skip／失敗数を区別する。キーguardやfocus取得処理は変更しない。
-    今回の実アプリ実行はcoordinatorへ引き継ぎ、原因確認・製品の追加修正は引き続き保留。
-    無人実行向け変更の非対話確認: test-script 122成功／0失敗 (未focusのdouble-click／hoverと
-    行identityの追加2件を含む)、fixture 5成功。normal／portable core check、fmt／glyph／
-    PowerShell AST、起動前Rhai変数生成も成功。
-    実Rhaiのケースループもwidget setupをmockしてheadless評価し、未focus時はtoolbar 4実行／
-    18 skip／0失敗になることを確認。これは実アプリの選択復元の証拠ではない。
-    今回の `prepare-portable-smoke.ps1 -TestScript` もexit 0 (core 22分48秒、VCRT runtime=4 / pe=17)。
-    新しいsource fingerprint、隔離marker、core／remote／EPUB workerのmanifest SHA256一致を確認。
-    全変更ファイルはCRLF、numstatは局所差分。実アプリは起動せず、未コミットで引き継ぐ。
-  - コードの追跡: Folder の double-click / Enter は `grid_physical_navigation` → `RatingSource` →
-    `start_rating_physical_open`。採用時に `commit_rating_physical_load_owner` が履歴の ★3 と
-    `rating_view_nav_stack` の opened path を記録し、通常 install がその path を `current_folder` に採用する。
-    `folder_history` は画像一覧の位置用で、rating synthetic 一覧には保存しない。
-    ← / → replay は発行前の `effective_folder()` を `select_opened_path` に運び、
-    `finish_rating_view_install` と publication 後に `select_rating_view_row_for_opened_path` で照合する。
-    Folder も `container_path()` の照合対象。Backspace は既存の nav stack の path を渡す。
-  - 追加した handler / state 回帰 4 件は `d72808b03` の製品コードで全件成功 (valid red 未取得)。
-    フォルダ → ←、→後の←、Backspace の対照、PDF → ← / →後の← / Backspace の対照。
-    各ケースは通常 / A / B の履歴と sidecar 有効で実行し、opened path の運搬・履歴 owner・
-    4 枚目を選択した後の一覧行の選択 / ensure-visible を確認。
-    PDF は prepared pages の採用を検証し、外部 decoder 実行は対象外。
-  - 実フォルダの同型経路を再照合: 通常 / A / B は同じ `start_loading_items_inner` の位置保存、
-    smart root は returned root entry、collection は既存 entry anchor、bookmark の本フォルダは
-    stable row key の帰路を使う。検索 / snapshot 所有中の ← は拒否される。
-    閲覧履歴・サブ展開は上表の別原因の anchor 未保持が残る。これらの owner は変更していない。
-  - 利用者セッションの既存ログを読み取り、rating synthetic 一覧から実フォルダへの直接 activation と
-    rating 一覧の再 install を確認した。選択値の記録は無く、このログだけでは喪失箇所を確定できない。
-    実データの書換え・製品バイナリ起動は行わない。実操作 / grid・詳細表示 / 選択と scroll の差を追加確認中。
-  - 追加調査時の検証: §1.328 は 14/14 (追加 4 件を含む)、full lib は pipe なしで
-    10904 成功 / 0 失敗 / 52 ignored、exit 0。fmt、normal / portable core check、glyph (危険 glyph 0)
-    は全て exit 0。既存 CRLF を維持し、`git diff --numstat` / `git diff --check` で局所差分を確認。
-    成功の証跡は `target/1328-followup-baseline.txt`。追加報告の red / 修正完了を意味しない。
-    `.\scripts\build-dev.ps1 -PreserveRuntime` も exit 0 (core / remote / EPUB PDF worker、VCRT PE: runtime=4 / pe=3)。
-    製品バイナリは起動していない。コミット文案は `target/1328-msg-2.txt`、未コミット。
-- 残る検収: `983d68272`実機の連続跳躍が今回再現したfavorite列数の採用順と同じ経路か、
-  新しい診断ログで照合する。独立レビューと600行Suite、利用者による実アプリの
-  レーティング / 変換書庫 / PDF / BS 確認も引き継ぐ。
-  閲覧履歴・サブ展開の anchor を含む構造変更はこの bounded fix では実装しない。
-- 規模 / 優先度: Small〜Medium / P2 (利用者報告あり)。
 
 ### 1.318 起動時の索引走査を HDD ごとに 1 本ずつ順に回す (D2) — 実測から保留 (2026-10-03)
 
@@ -2805,7 +2096,6 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
   cascade identity、full-path key、seed availability、コンテナ変換、generation / cancel / viewer-context 所有を保持する。
 - 規模 / 優先度: Medium / P3。全一覧に共通の変更なので独立設計レビューと回帰を行う。今回の §1.307 では実装しない。
 
-
 ### 1.300 通常版とポータブル版に同じ --data-dir を指定すると同じデータフォルダを同時に使えてしまう (2026-09-28)
 
 - 出典: EPUB D15 (キャッシュの即時削除) の設計中に実装担当がコードで発見。独立レビューも確認。
@@ -2901,34 +2191,13 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
 - 次回以降の案: 可視セルの補正生成に 1 フレーム予算を設ける。その際、予算待ちのセルに未補正画像を一瞬見せない表示方針（保持画像・プレースホルダー等）を合わせて設計し、利用者が選ぶ。今回のリリースでは予算を入れず、一時的な重さを許容する。データと最終的な表示の正しさには影響しない。
 - 規模 / 優先度: Medium / P2（次回以降、利用者判断待ち）。
 
-### 1.272 本の並べ替え・移動・改名で、一部の編集情報が新しいページ名へ付いて来ない — コード調査 (2026-09-24)
+### 1.415 別ウィンドウ・固定の一覧が、本の構造変更の後も旧い path のキーで編集情報を読み直す — コード調査 (2026-10-21)
 
-- 出典: X 投稿予約 R2 の変更入口調査 (`x-scheduled-post` ブランチの `docs/x-post-r2-mutation-inventory.md`
-  B 表と「§5 表との差異」)。**コードを読んで見つけたもので、実行して確かめてはいない** (観測者なし)。
-- 構造 (コードから): 製本の並べ替え・別本への移動・本の改名で編集情報を付け替える製本専用の列
-  (`src/app.rs` の `copy_book_page_edit_key` 周辺、調査時点 36104-36212) は、補正・ローカル調整・切り取り・
-  マスク・隠蔽・注釈・★・タグだけを扱う。汎用の改名が使う `rename_key_migration` の store 表
-  (`src/rename_key_migration.rs` の STORES) より狭い。表示トリム (ページ・本)、見開き/表紙 (spread)、
-  読書位置 (book_resume)、フォルダサムネイル pin (container と `source_rel`)、内容同一性 (edit_origin)、
-  編集プレビューの cache は付け替えられない。並べ替えで番号が変わると、これらが旧名のまま残り、
-  詰め直し後に同じ名前になった別ページへ付き得る。
-- 付け替えは FS の journal 完了後に UI 側で行うので、途中で落ちると FS は移動済みで編集情報が旧 path に
-  残る (bookmark だけは journal と同じ transaction で付け替える)。
-- 直し方の方向: 製本の付け替えも `rename_key_migration` の表を唯一の対象表にし、ストアごとに方針
-  (移す / 破棄して作り直す / 本単位のキーだけ / bookmark のように残す) を持たせる。付け替えを journal の
-  段階に入れて、再実行で逆に戻らない冪等な一括適用にする。R2 の設計 (`x-scheduled-post` ブランチの
-  `docs/x-post-r2-design.md` §4) に検討済みの形がある (関所の部分は不要)。
-- 確認方法: 本のページに表示トリムを付け、並べ替えで番号を変えてから開き直し、トリムがどのページに付くかを見る。
-- 規模 / 優先度: Medium / P2 (製本を並べ替える人の編集が別ページへ移り得る)。
-
-### 1.273 製本管理から本を削除しても、その本のページの編集情報が DB に残る — コード調査 (2026-09-24)
-
-- 出典: 同上 (調査の A03 / B22)。コードを読んで見つけたもので、実行して確かめてはいない。
-- 構造: 製本管理の本削除 (`books::delete_book`) は本フォルダを `remove_dir_all` するだけで、path キー DB の
-  purge を呼ばない。汎用削除 (`delete_worker`) は Shell 削除の後に `rename_key_migration` の広い store 表で
-  purge する。同じ名前で本を作り直すと、旧ページの編集情報が新しいページに付き得る。
-- 直し方の方向: 本削除も汎用削除と同じ purge を通す (bookmark は missing 行を残す既存仕様のまま)。
-- 規模 / 優先度: Small / P2。
+- 出典: §1.272 (本の構造変更での path キー DB の付け替え。e0d096601 で取り込み済み、記録は [book-key-migration-plan.md](book-key-migration-plan.md)) の独立コードレビュー (Codex gpt-6.1-sol / xhigh) の指摘。**コードを読んで見つけたもので、実アプリでは確かめていない** (観測者なし)。
+- 構造: 本の並べ替え・移動・改名の後、別ウィンドウ (F12) と Snapshot・検索/コレクション由来の固定一覧は、リリース済みの仕様どおり旧い path・旧い items を保つ ([spread-shift-memory-plan.md](spread-shift-memory-plan.md) §11.6、[book-key-migration-plan.md](book-key-migration-plan.md) §3.10)。ところが編集の全体通知 (`PAGE_EDIT_WRITES`) を受けた通常の再照合 (`poll_page_edit_reconciliation`) は、それらの context でも旧い path のキーで DB を読み直す。旧キーが空になれば編集表示 (補正・表示トリム等) が消え、詰め直しで旧キーが別の画像の行になれば、旧い画素にその画像の編集が重なる。
+- 退行ではない: §1.272 の修正より前の 8 種 (補正・ローカル調整・切り取り・マスク・隠蔽・注釈・★・タグ) の付け替えも同じ全体通知を出していた。§1.272 の修正で付け替え対象に加えたストア (表示トリム・内容同一性・編集プレビュー等) は、変更前は旧キーに残っていたので、固定一覧では「偶然そのまま見えていた」ものが見えなくなる、という表示上の差はある。
+- 直し方の方向: 「保持している窓が持つ path キーと、キーの所有画像が変わる操作」の契約を決める (旧キーを読み直さない / 窓を作り直す / 閉じる)。detached viewer リワークの範囲 ([detached-rework-plan.md](detached-rework-plan.md)) で扱う。症状パッチは入れない。
+- 規模 / 優先度: Medium / P3 (本の構造変更をしたとき、同じ本を別ウィンドウ・固定一覧で開いている場合だけ)。
 
 ### 1.274 一括加工の途中で本を並べ替えると、詰め直し後に同じ名前になった別ページへ編集が付き得る — コード調査 (2026-09-24)
 
@@ -3007,51 +2276,6 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
   着手時は先に Mutex の保持時間を perf 計装で測る。
 - 利用者判断 (2026-09-23): 重大ではない。一時的な負荷の影響として**優先度は低め**、他の要望を先に実装する。
 - 規模 / 優先度: 中 / P3。
-
-### 1.244 詳細表示の列ソートが、ZIP・PDF などの本の中でも一覧と読み順を並べ替える疑い — 未確認 (2026-09-15)
-
-- 出典: §1.242 (本の構成) の影響調査中に**コードを読んで見つけた疑い**。実行して確かめてはいない
-  (観測者なし)。
-- 構造 (コードから):
-  - 本の中では列ヘッダのクリック自体は無効 (`src/ui_main.rs:15345` 付近の `sort_enabled = !book_sort_locked`、
-    `book_sort_locked = self.page_order_locked_for_current_view()`)。
-  - ところが並びを決める `App::details_header_sort_active` (`src/app.rs:51321`) は、除外条件が
-    `current_folder_is_book_folder()` (**製本だけ**) と閲覧履歴だけで、`page_order_locked_for_current_view()`
-    (ZIP / PDF / 直接閲覧 RAR / 変換キャッシュ / 画像だけのフォルダを含む) を見ていない。
-  - `settings.details_sort_key` は全フォルダ共通の永続設定 (`reset_details_sort_to_toolbar` の doc コメント)。
-    戻すのはレーティング / ブックマーク一覧などに入るときだけ (`src/app.rs:19960, 19966, 23973, 33624`)。
-  - したがって、通常フォルダで列ヘッダを押して並べ替えたまま ZIP / PDF を開くと、`rebuild_details_order`
-    (`src/app.rs:51454`) がその列で `details_order` を作り、`current_grid_order()` (`src/app.rs:51271`) が
-    それを返す。フルスクリーンの読み順 `get_nav_indices` / `get_still_image_indices`
-    (`src/ui_fullscreen.rs:25869` 付近) も `current_grid_order()` から作るので、**本のページ順
-    (§1.14 の名前順固定) が列ソートで崩れる**はず。本の中では列ヘッダが押せないので、そこで戻す手段も無い。
-  - `grid_sort_lock_reason` (`src/app.rs:51333`) は本の中を `PageOrderFixed` と判定するので、表示上は
-    「ページ順固定」なのに実際の並びは列ソート、という食い違いにもなる。
-- 確認方法: 詳細表示で通常フォルダを開き、サイズ列などで並べ替える → 画像が名前順でない ZIP を開く →
-  一覧の並びと、フルスクリーンでのページ送りの順を見る。製本・閲覧履歴では起きない想定。
-- 直し方の方向 (確認できたら): 「一覧の並びを列ヘッダが持つか」の判定を `page_order_locked_for_current_view()`
-  と 1 つの述語にまとめる (§1.143(a) と同じく、UI の無効化と並びの所有者を同じ述語から導く)。
-- 規模 / 優先度: Small / P2 (確認できた場合。本の読み順が崩れる)。
-
-### 1.245 しおり一覧の「P.N」「N ページ」表示が、本の中のページ番号ではなく一覧上の番号になっている疑い — 未確認 (2026-09-15)
-
-- 出典: §1.242 の影響調査中に**コードを読んで見つけた疑い**。実行して確かめてはいない (観測者なし)。
-- 構造 (コードから):
-  - しおりを作るとき `page_index_hint: idx` は `items` の生の番号 (`src/app.rs:32997`)。
-  - 表示は `bookmark_browser.rs` の `format!("{} / {} ページ", …, page_index_hint + 1)` と
-    `format!("P.{}", page_index_hint + 1)` (`src/bookmark_browser.rs:381, 395`)。
-  - 一覧の `items` は行配置設定に従い、既定ではフォルダ・書庫の行が画像より前に並ぶ。**サブフォルダや動画を
-    含む本フォルダ / サブフォルダのある ZIP** では、先頭の画像でも番号が 1 にならず、表示がずれるはず。
-    PDF はページだけなので一致する想定。
-  - ジャンプ先の正本は `PageIdentity` なので、**移動先は正しく、表示される数字だけがずれる**想定。
-  - 同じ hint を並べ替えにも使っている (`src/app.rs:33116-33117`)。本の中の順序としては単調なので、
-    並び順への実害は無い想定。
-- 確認方法: サブフォルダを 2 つ含む画像フォルダ (または ZIP) の 1 ページ目にしおりを付け、しおり一覧の表示が
-  「P.1」か「P.3」かを見る。
-- 直し方の方向 (確認できたら): 保存時に「本の読み順での位置」を hint にするか、表示時に `PageIdentity` から
-  読み順の位置を解決する。mIV Remote のしおり表示 (`src/remote_ipc/collections.rs:592` 付近) も同じ hint を
-  使っているかを合わせて確認する。
-- 規模 / 優先度: Small / P3 (表示の数字だけ)。
 
 ### 1.246 mIV Remote の ZIP 一覧が本体と違う並べ方をしていて、読書位置がずれる疑い — 未確認 (2026-09-15)
 
@@ -3176,69 +2400,6 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
   通るため本項の対象外。着手時は一律のピクセル閾値を足さず、各 consumer の意味単位 (同じ
   handle / navigator / canvas / slider など) と、別 widget クリックで pair を切る owner を決める。
 - 優先度: P2。latent 誤操作の棚卸し項目で、実害報告が出た consumer から個別に再現確認する。
-
-### 2.18 リモート: サムネイルカタログが開けないだけでページ表示が失敗する — 利用者報告
-
-- 出典: 利用者報告 (2026-08-23、v3.2.0 出荷前の実機確認)。リモートで PDF を開いたとき、
-  端末に「ページ表示グループの読み込みに失敗しました。」が出た。前後ページ移動で復帰。
-- **v3.2.0 の退行ではない。** この経路は `732420e3` (2026-07-31) 由来で v3.1.3 以前から出荷済み。
-- **サーバ側ログで確定** (`%APPDATA%\mimageviewer-remote
-emote-web-log.jsonl`):
-
-  ```
-  /api/page  status=500  page.ipc_status="miv_media_internal"
-  → client: spread_load_error 「ページ表示グループの読み込みに失敗しました。」
-  ```
-
-  本体ログ (`mimageviewer.log`) の同時刻:
-
-  ```
-  [216.063s] remote_ipc: container catalog open failed: disk I/O error
-  [216.063s] media_operation operation=page source_kind=pdf outcome=error
-  ```
-
-- 機構: [container.rs:5222](../src/remote_ipc/container.rs:5222) が**ページ要求のたびに
-  `CatalogDb::open` し、失敗するとページ全体を `MediaErrorCode::Internal` で落とす**。
-  しかしこのカタログは `decode_remote_source` に渡す**キャッシュの高速化用**で、
-  ページ描画には必須ではない。**「速くするための仕組みが開けなかった」だけで表示が失敗している。**
-- 発生条件: 直前の 214.28〜214.34s に PDF サムネイル要求が十数件同時にカタログを読んでおり、
-  その混雑中に 1 回だけ SQLite が `disk I/O error` (`SQLITE_IOERR`) を返した。
-  ログ全体でこの失敗は 1 回だけ。次の要求では成功しており、利用者の「前後移動で復帰」と一致する。
-- **同時刻の `/api/page` 503 は別物**。`admission_busy` = IPC 同時実行上限 (heavy 4/4、
-  prefetch 3/3) による正常な背圧なので、500 と混同しない。
-- 直す方向: この経路でカタログを**省略可能にする** (`Option<Arc<CatalogDb>>`)。
-  開けなければログを残してキャッシュ無しで続行する。表示は遅くなるが成功する。
-  - **リトライ・待ち時間・閾値調整で吸収しない。**問題は「任意の加速機構の失敗を
-    致命的に扱っていること」であって、開けなかったこと自体ではない。
-  - 同じ形が他の remote 経路にもないか確認する (`CatalogDb::open` の `?` 伝播)。
-  - ついでに、ページ要求ごとに開き直す構造自体も見直す価値がある (§2.13 と同型)。
-- 規模 / 優先度: 小 / P2 (頻度は低いが、体験は「表示できない」なので重い)。
-
-### 2.12 サムネイルキャッシュのクリアが `-wal` / `-shm` を残す — 実測 1.4 GB
-
-- 出典: 2026-08-20、利用者がキャッシュクリア後に計測しようとして発見。
-- **実測** (`%APPDATA%\mimageviewer\cache` 配下、クリア + 再起動後):
-
-  | 種別 | 件数 | サイズ |
-  | --- | ---: | ---: |
-  | `.db` (本体) | 2 | 0.2 MB |
-  | `.db-wal` | 1,410 | **1,394.8 MB** |
-  | `.db-shm` | 1,410 | 44.1 MB |
-
-  サンプルした `-wal` はすべて**対応する `.db` が存在しない孤児**だった。
-- 機構: カタログは `cache/<hash 先頭 2 桁>/<hash>.db` (`catalog.rs` の `db_path_for`)。
-  クリアが**その `.db` だけ**を消していると思われる。SQLite は正常な close で `-wal` / `-shm` を
-  自分で削除するので、**閉じずにファイルを消すと残る**。
-- 実害:
-  1. **容量が解放されない。**「クリアしたのにディスクが空かない」= クリアがほぼ無意味に見える。
-  2. 同じフォルダを再訪すると、その path に新しい `.db` が作られる一方、古い `-wal` が残っている。
-     SQLite は salt 不一致の WAL を無視するので即座の破損は起きにくいが、**消したはずの物が残った
-     状態で新規 DB を作る**のは設計として健全でない。
-- 直す方向: **削除前に接続を確実に閉じる**のが構造的に正しい (閉じれば SQLite が自分で消す)。
-  閉じられない経路があるなら、その理由を確認してから `-wal` / `-shm` の明示削除を足す。
-  **どの経路が `.db` を掴んだまま消しているのかを先に特定する** (症状として `-wal` を消して回らない)。
-- 既存の 1.4 GB は、アプリ終了後に `cache` 配下の孤児 `*.db-wal` / `*.db-shm` を削除すれば安全に回収できる。
-- 規模 / 優先度: 小〜中 / P2 (実害は容量。利用者が明示的に「クリア」を選んだのに効いていない)。
 
 ### 2.14 PDF のフルスクリーンが PDFium 経路を 2 本持っている
 
@@ -3463,40 +2624,6 @@ emote-web-log.jsonl`):
   [docs/detached-rework-plan.md](detached-rework-plan.md) §2 (憲法) / BA-7、
   findings-12 D3 (同型の App-global 汚染)。
 
-### 2.23 タグの付与時刻で並べる / 見せる — 利用者要望 (2026-08-30)
-
-**背景**: 「間違えて付けたタグを取り消したい」ときに、付けた順で見たい。レーティングの
-★設定時刻まわり (旧 §1.142 / §1.143、v3.5.0 で実装済み) の調査中に、同じ話がタグにもあると
-分かった。
-
-**データはもうある**: `tags.db` の `item_tags.applied_at` (item×tag 単位、NOT NULL) と
-`tag_item_state.decided_at` (item 単位) — [tags_db.rs](../src/tags_db.rs)。スキーマ変更は
-要らない。
-
-**無いのは並べ替えと表示**: タグビューの結果は [tag_view.rs](../src/tag_view.rs) で
-`entries.sort_by(|a, b| a.path.cmp(&b.path))` とパス昇順に固定されていて、付与時刻ソートも
-詳細表示の列もツールチップ行も無い。
-
-**着手前に決める論点**:
-
-- 複数タグを持つ項目で、どの `applied_at` を出すか。**そのビューで検索対象になっている
-  タグの `applied_at`** (AND / OR なら最大値) が自然。「全タグの最大値」にすると、無関係な
-  タグを後から足しただけで先頭へ来てしまう。
-- タグビューにビュー固有ソート (レーティングの `RatingViewSort` 相当) を持たせるかどうか。
-  持たせるなら**レーティング一覧と同じ構造をなぞる**。実装は v3.5.0 で入っているので、
-  設計を起こさずコードを読めばよい:
-  - 時刻ソート中はカテゴリ再配置を通さない — `RatingViewSort::arranges_by_category` と
-    [grid_item.rs](../src/grid_item.rs) `materialize_view_rows`
-  - 詳細列と sort key はビュー限定 — `DetailsColumnId::RatedAt` /
-    `DetailsSortKey::RatedAt` と `App::details_sort_key_visible`
-  - ビューへ入るとき列ソートの所有権を返す — `App::reset_details_sort_to_toolbar`
-    (メニュー経路と履歴で戻る経路の両方に置く)
-  - **新しい enum variant を settings.db へ書かない** — `stash_details_rated_at_for_persist`
-    と同じ退避が要る (released 版が読めなくなるため。[settings.rs](../src/settings.rs))
-- タグビューの対象は実ファイルのみ (ZipImage / PdfPage は入らない) — 既存仕様。
-
-**優先度**: P3 / 余裕があるとき。
-
 ## 3. 補正 / AI
 
 ### 3.3 ページ送り中の AI アップスケールを待たない / 打ち切る
@@ -3560,26 +2687,6 @@ v3.6.0 の `TABLE` はダイアログを短く保つため新機能 3 件に絞�
 - 撮り方は [screenshot-howto.md](screenshot-howto.md)。実ファイルを右クリックした状態で撮る。
 - 規模 / 優先度: 小 / リリース前。
 
-### 5.12 署名の事前チェックが、鍵の使えなさを検出できない
-
-- 出典: v3.2.0 の配布ビルド (2026-08-23)。`Assert-MivSignReady` を通過したのに、
-  実署名の 1 本目 (`vendor/pdfium/bin/pdfium.dll`) が
-  `SignTool Error: No certificates were found that met all the given criteria.` で失敗した。
-- 機構: SimplySign のクラウド鍵セッションが切れると、**証明書の公開情報は
-  `CurrentUser\My` に残ったまま秘密鍵だけが外れる**。`Assert-MivSignReady` は
-  証明書の存在を見るだけなので通過してしまう。
-- 実害: `build-dist.ps1` は clean からビルドしてから署名するので、
-  **40 分ビルドしてから落ちる**。しかも中途半端な成果物は残らないので、
-  丸ごとやり直しになる。
-- 直す方向: 事前チェックを「証明書が見えるか」から「**実際に署名できるか**」へ変える。
-  使い捨ての小さな PE を 1 本コピーして `Invoke-MivSign` し、成功したら消す。
-  数秒で済み、セッション切れならビルド前に分かる。
-  - 署名対象を汚さないよう、必ず一時ディレクトリのコピーに対して行う。
-  - タイムスタンプ取得でネットワークへ出るので、失敗理由を
-    「鍵が使えない」「TS サーバに届かない」で区別できると望ましい。
-- 回避策 (現状): 配布ビルドの前に手で 1 本署名してみる。
-- 規模 / 優先度: 小 / P2 (リリースのたびに 40 分を失うリスク)。
-
 ### 5.1 ネイティブ依存
 
 | 対象 | 現状 / 次の確認 | 注意点 |
@@ -3607,6 +2714,8 @@ v3.6.0 の `TABLE` はダイアログを短く保つため新機能 3 件に絞�
   - `scripts/check-vcrt-pe-dependencies.ps1` (全配布 PE の import と app-local VC runtime の gate。`build-dist.ps1` が必須実行する)
 
 ### 5.9 リリース手順: 配布ビルド前に core / remote の存在が要る
+
+- 重複: §5.3 の 2 件目の P2 (クリーン環境での test-full) と同じ問題。着手するときはまとめて扱う (2026-10-21 整理で確認)。
 
 - 出典: v3.0.0 リリース前確認 (2026-08-14)。`scripts/test-full.ps1` が
   **テストを 1 件も実行しないままビルドエラーで落ちた**。
@@ -3675,6 +2784,8 @@ v3.6.0 の `TABLE` はダイアログを短く保つため新機能 3 件に絞�
 - 規模 / 優先度: 中 / P2。リリース直前に触る範囲ではない。
 
 ### 1.87 セッション最初の拡大で UI スレッドが 0.5 秒止まる (拡大パイプラインの初回作成)
+
+- 重複: §1.279 (2026-09-25) と同じ現象 (最初の高画質縮小で UI スレッドが止まる)。着手するときは 2 つをまとめて扱う (2026-10-21 整理で確認)。
 
 - 出典: v3.0.0 リリース前の perf smoke (2026-08-15)。
 - 実測: `gpu/lanczos_regenerate` は同セッション 16 回のうち **1 回目だけ

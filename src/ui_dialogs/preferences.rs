@@ -59,6 +59,13 @@ pub fn draw_fullscreen_fit_cycle_settings_snapshot_fixture(ui: &mut egui::Ui) {
 }
 
 #[doc(hidden)]
+pub fn draw_notification_duration_snapshot_fixture(
+    ui: &mut egui::Ui,
+    mut value: crate::settings::NotificationDuration,
+) {
+    pages::draw_notification_duration_setting(ui, &mut value);
+}
+
 pub fn draw_preferences_restore_position_snapshot_fixture(ui: &mut egui::Ui, enabled: bool) {
     let mut settings = Settings::default();
     settings.preferences_restore_position = enabled;
@@ -101,8 +108,8 @@ pub(crate) fn draw_fullscreen_specified_scale_axis_controls(
     ui: &mut egui::Ui,
     axis: &mut crate::settings::SpecifiedScaleAxisSetting,
     label: &str,
-) {
-    pages::draw_fullscreen_specified_scale_axis_controls(ui, axis, label, true);
+) -> Option<egui::Rect> {
+    pages::draw_fullscreen_specified_scale_axis_controls(ui, axis, label, true)
 }
 
 pub(crate) fn draw_fullscreen_specified_scale_max_controls(
@@ -274,7 +281,7 @@ fn draw_discard_changes_confirm(
 ) -> Option<bool> {
     let mut discard = false;
     let mut keep_editing = false;
-    let response = egui::Modal::new(egui::Id::new(id)).show(ctx, |ui| {
+    let response = egui::Modal::new(egui::Id::unique(id)).show(ctx, |ui| {
         ui.set_min_width(420.0);
         ui.heading(title);
         ui.add_space(8.0);
@@ -1335,9 +1342,7 @@ pub(crate) struct PreferencesState {
 impl PreferencesState {
     fn clear_video_media_memory(&mut self) {
         self.video_media_memory_clear_requested = true;
-        self.settings.video_resume_positions.clear();
-        self.settings.video_watched_to_end.clear();
-        self.settings.video_audio_track_choices.clear();
+        self.settings.clear_video_media_memory();
     }
     pub(super) fn select_external_tool(
         &mut self,
@@ -2155,6 +2160,7 @@ fn preferences_change_book_append_write_settings(live: &Settings, edited: &Setti
             live.default_reading_direction,
             live.follow_document_reading_direction,
             live.final_cover_spread_enabled,
+            live.auto_view_trim_default_enabled,
             live.singleton_spread_first_enabled,
             live.singleton_spread_last_enabled,
             live.page_after_cover_alone_enabled,
@@ -2166,6 +2172,7 @@ fn preferences_change_book_append_write_settings(live: &Settings, edited: &Setti
             edited.default_reading_direction,
             edited.follow_document_reading_direction,
             edited.final_cover_spread_enabled,
+            edited.auto_view_trim_default_enabled,
             edited.singleton_spread_first_enabled,
             edited.singleton_spread_last_enabled,
             edited.page_after_cover_alone_enabled,
@@ -2410,9 +2417,7 @@ fn merge_video_media_memory_for_preferences(
     clear_requested: bool,
 ) {
     if clear_requested {
-        edited.video_resume_positions.clear();
-        edited.video_watched_to_end.clear();
-        edited.video_audio_track_choices.clear();
+        edited.clear_video_media_memory();
     } else {
         // 再生位置・視聴済みの保存と選択の確定・削除・リネームは表示中も live を更新する。
         // 環境設定側の編集意図はクリアだけなので、OK 時には最新の利用記録を移す。
@@ -2449,7 +2454,7 @@ impl App {
                 .set_parallelism(requested_raw_parallelism as usize)
             {
                 settings.raw_develop_parallelism = self.settings.raw_develop_parallelism;
-                self.show_feedback_toast(format!(
+                self.show_feedback_warning(format!(
                     "RAW の同時現像数を変更できませんでした: {error}"
                 ));
             } else {
@@ -2701,7 +2706,7 @@ impl App {
                 &mut live,
             );
             if preferences_change_book_append_write_settings(&self.settings, &edited) {
-                self.show_feedback_toast("本への追加を取り消しています".into());
+                self.show_feedback_warning("本への追加を取り消しています".into());
                 return;
             }
         }
@@ -2744,6 +2749,7 @@ impl App {
             let old_fullscreen_side_panel_mode =
                 self.settings.fullscreen_side_panel_mode.normalized();
             let old_final_cover_spread_enabled = self.settings.final_cover_spread_enabled;
+            let old_auto_view_trim_default_enabled = self.settings.auto_view_trim_default_enabled;
             let old_singleton_spread_placement_enabled = (
                 self.settings.singleton_spread_first_enabled,
                 self.settings.singleton_spread_last_enabled,
@@ -2812,8 +2818,25 @@ impl App {
             // 対策: 環境設定が管理しないフィールドを self.settings の最新値で state に
             // 移送してから全体差し替えする。新しく「環境設定 UI から触らない」フィールドを
             // Settings に追加した場合はここにも追記が必要。
+            // Only accepted OK clears invalidate captured media updates. Draft edits,
+            // unsaved-change comparisons and Cancel leave the live generation alone.
+            if state.video_media_memory_clear_requested {
+                self.advance_media_memory_clear_generation();
+            }
             prepare_preferences_state_settings_for_commit(&mut state, &mut self.settings);
             self.install_preferences_settings(state.settings);
+            if old_auto_view_trim_default_enabled != self.settings.auto_view_trim_default_enabled {
+                #[cfg(windows)]
+                self.invalidate_auto_view_trim_display_in_parked_contexts();
+                if self.view_trim_book_preference
+                    == crate::view_trim::ViewTrimBookPreference::FollowGlobal
+                {
+                    if let Some(idx) = self.fullscreen_idx {
+                        self.reanchor_continuous_reading_after_view_trim_change(idx);
+                    }
+                    ctx.request_repaint();
+                }
+            }
             if old_final_cover_spread_enabled != self.settings.final_cover_spread_enabled {
                 #[cfg(windows)]
                 self.invalidate_final_cover_spread_display_in_parked_contexts();
@@ -2895,7 +2918,9 @@ impl App {
                 }
                 self.creative_lut_library
                     .reload(&self.settings.creative_luts);
-                self.clear_all_final_pipeline_caches();
+                self.clear_all_final_pipeline_caches(
+                    crate::app::FinalPipelineInvalidation::CreativeLutSettingsChanged,
+                );
                 #[cfg(windows)]
                 self.sync_native_video_grade();
             }
@@ -2905,11 +2930,11 @@ impl App {
                     // detached viewer / native HUD はそれぞれ独立した egui Context を
                     // 持つため、表示倍率変更と同じ正規 teardown 経路で閉じる。
                     // 再度開いた時点で新しいフォント設定を使って生成される。
-                    let closed_detached = self
-                        .close_all_detached_viewers_for_mode_change(ctx)
-                        .unwrap_or(true);
-                    if !closed_detached && self.fullscreen_idx.is_some() {
-                        self.close_fullscreen();
+                    if let Err(error) = self.close_all_viewer_sessions_with_cause(
+                        ctx,
+                        crate::app::ViewerCloseCause::Replaced,
+                    ) {
+                        crate::logger::log(format!("ui_font_viewer_close_failed: {error:?}"));
                     }
                     self.request_main_font_update();
                 }
@@ -2937,7 +2962,7 @@ impl App {
                     .close_all_detached_viewers_for_mode_change(ctx)
                     .unwrap_or(true)
             {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "別ウィンドウの表示モードを変更したため、開いていた別ウィンドウを閉じました"
                         .to_string(),
                 );
@@ -2957,7 +2982,7 @@ impl App {
                 }
             }
             if !self.settings.save_checked() {
-                self.show_feedback_toast("設定を保存できませんでした。再起動すると今回の変更が残らない可能性があります。".to_owned());
+                self.show_feedback_warning("設定を保存できませんでした。再起動すると今回の変更が残らない可能性があります。".to_owned());
             }
             creative_lut_transaction.commit();
 
@@ -3175,6 +3200,7 @@ impl App {
         let escape_pressed = !transfer_dialog_open && self.dialog_escape_pressed(ctx);
 
         egui::Window::new("環境設定")
+            .drag_area(egui::WindowDrag::Anywhere)
             .enabled(!transfer_dialog_open)
             .open(&mut open)
             .resizable(true)
@@ -3217,6 +3243,10 @@ impl App {
                 draw_preference_search(&mut left_ui, state);
                 let tree_height = left_ui.available_height().max(0.0);
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .id_salt("pref_tree")
                     .max_height(tree_height)
                     .auto_shrink([false, false])
@@ -3263,6 +3293,10 @@ impl App {
                 let rendered_generation = state.right_panel_scroll_generation;
                 let rendered_results = state.showing_results;
                 let mut scroll = egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .id_salt(("pref_panel", state.right_panel_scroll_generation))
                     .scroll_bar_visibility(
                         egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible,
@@ -3293,7 +3327,7 @@ impl App {
                     && rendered_generation == state.right_panel_scroll_generation
                 {
                     self.preferences_view_position.page = rendered_page;
-                    self.preferences_view_position.scroll_y = output.state.offset.y;
+                    self.preferences_view_position.scroll_y = output.state.clamped_offset().y;
                 }
                 if self.settings.preferences_restore_position {
                     let rendered_page = (!rendered_results
@@ -3614,7 +3648,8 @@ impl App {
         let dialog_rect = egui::Rect::from_center_size(safe_rect.center(), dialog_size);
 
         egui::Window::new("操作カスタマイズ")
-            .id(egui::Id::new("operation_customize_dialog_v2"))
+            .drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("operation_customize_dialog_v2"))
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
@@ -3640,6 +3675,10 @@ impl App {
                         ui.set_max_size(panel_size);
                         ui.spacing_mut().scroll = pref_panel_scroll_style();
                         egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
                             .id_salt("operation_customize_panel")
                             .scroll_bar_visibility(
                                 egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible,
@@ -3746,10 +3785,7 @@ impl App {
         let _ = std::fs::remove_file(crate::editing_addon::active_pointer_path());
         // 2. フォント / 被写体マットキャッシュ無効化。
         //    active pointer を外した後なので refresh は None になり、被写体マスク生成が即 disabled になる。
-        self.comic_fonts = None;
-        self.comic_fonts_loaded = false;
-        self.comic_loaded_font_keys.clear();
-        self.comic_font_registry_loaded = false; // pack フォントを一覧から外す
+        self.invalidate_comic_fonts(crate::app::comic_fonts::FontInvalidation::SourcesChanged);
         // フォントソースが変わったので見本 / オノマトペプレビュー + 焼き済み注釈
         // (comic_cache) も無効化する (Codex P2)。
         self.font_sample_cache.clear();
@@ -3973,7 +4009,7 @@ fn draw_operation_context_filter(ui: &mut egui::Ui, state: &mut PreferencesState
     ];
 
     ui.horizontal(|ui| {
-        ui.label("場所:");
+        let field_label = ui.label("場所:");
         let selected = operation_keyboard_context_filter_label(state.operation_keyboard_context);
         egui::ComboBox::from_id_salt("operation_context_filter")
             .selected_text(selected)
@@ -3990,7 +4026,9 @@ fn draw_operation_context_filter(ui: &mut egui::Ui, state: &mut PreferencesState
                         state.command_edit_notice = None;
                     }
                 }
-            });
+            })
+            .response
+            .labelled_by(field_label.id);
     });
 }
 
@@ -4207,6 +4245,157 @@ pub fn draw_file_type_visibility_snapshot_fixture(ui: &mut egui::Ui) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn section1445_cache_text_survives_direct_tree_switch_and_ok() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.cache_policy = crate::settings::CachePolicy::Auto;
+        app.settings.cache_threshold_ms = 60;
+        app.open_preferences_page(PreferencesPage::Cache);
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1093.0, 900.0))
+            .build_ui_state(
+                |root_ui, app| app.show_preferences_dialog(&root_ui.ctx().clone()),
+                app,
+            );
+        harness.run_steps(3);
+        let label = "時間しきい値 (decode + display の合計がこれ以上ならキャッシュ):";
+        let slider_rect = harness
+            .get_by_role_and_label(egui::accesskit::Role::Slider, label)
+            .rect();
+        let editor = harness
+            .query_by_role_and_label(egui::accesskit::Role::SpinButton, label)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Auto cache time editor missing; slider={slider_rect:?}; numeric nodes={:#?}",
+                    harness
+                        .get_all_by_role(egui::accesskit::Role::SpinButton)
+                        .collect::<Vec<_>>()
+                )
+            });
+        let editor_rect = editor.rect();
+        assert!(
+            editor_rect.left() >= slider_rect.right()
+                && editor_rect.top() <= slider_rect.bottom()
+                && slider_rect.top() <= editor_rect.bottom(),
+            "named editor must be beside its slider: slider={slider_rect:?}, editor={editor_rect:?}"
+        );
+        editor.click();
+        harness.run_steps(2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.event(egui::Event::Text("2".into()));
+        harness.run_steps(2);
+        harness.event(egui::Event::Text("5".into()));
+        harness.run_steps(2);
+
+        // draw_tree switches the page before the old numeric editor is drawn.
+        harness.get_by_label("全体設定").click();
+        harness.run_steps(3);
+        assert_eq!(
+            harness.state().pref_state.as_ref().unwrap().selected,
+            PreferencesPage::General
+        );
+        harness.get_by_label("    キャッシュ").click();
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .cache_threshold_ms,
+            25
+        );
+        assert_eq!(harness.state().settings.cache_threshold_ms, 60);
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+        assert!(harness.state().pref_state.is_none());
+        assert_eq!(harness.state().settings.cache_threshold_ms, 25);
+    }
+
+    #[test]
+    fn section1445_gpu_partial_text_changes_only_draft_until_ok_and_cancel_discards() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.gpu_memory_percent = 50;
+        app.open_preferences_page(PreferencesPage::GpuMemory);
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1093.0, 900.0))
+            .build_ui_state(
+                |root_ui, app| app.show_preferences_dialog(&root_ui.ctx().clone()),
+                app,
+            );
+        harness.run_steps(3);
+        let live_budget = harness.state().vram_pool_budget();
+        harness
+            .get_by_role(egui::accesskit::Role::SpinButton)
+            .click();
+        harness.run_steps(2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.event(egui::Event::Text("2".into()));
+        harness.run_steps(2);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .gpu_memory_percent,
+            0,
+            "the first digit follows the released live-rounding behavior in the draft"
+        );
+        assert_eq!(harness.state().settings.gpu_memory_percent, 50);
+        assert_eq!(harness.state().vram_pool_budget(), live_budget);
+        harness.event(egui::Event::Text("5".into()));
+        harness.run_steps(2);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .gpu_memory_percent,
+            25
+        );
+        assert_eq!(harness.state().vram_pool_budget(), live_budget);
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(2);
+        assert!(harness.state().show_preferences_discard_confirm);
+        // The existing confirmed-discard handler owns dropping the draft.
+        harness.state_mut().discard_preferences_dialog();
+        assert!(harness.state().pref_state.is_none());
+        assert_eq!(harness.state().settings.gpu_memory_percent, 50);
+        assert_eq!(harness.state().vram_pool_budget(), live_budget);
+
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::GpuMemory);
+        harness.run_steps(3);
+        harness
+            .get_by_role(egui::accesskit::Role::SpinButton)
+            .click();
+        harness.run_steps(2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.event(egui::Event::Text("25".into()));
+        harness.run_steps(2);
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert_eq!(harness.state().settings.gpu_memory_percent, 25);
+        assert_eq!(
+            harness.state().vram_pool_budget(),
+            crate::vram_budget::VramPoolBudget::from_percent(
+                25,
+                harness.state().vram_budget_mode(),
+            )
+        );
+    }
+
     fn preferences_append_receipt(
         app: &crate::app::AppTestEnvForTest,
     ) -> crate::book_append_undo::BookAppendUndoReceipt {
@@ -4293,10 +4482,11 @@ mod tests {
         let mut state = preferences_state_for_test(&live);
         state.selected = PreferencesPage::FileTypeVisibility;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(700.0, 650.0))
-            .build_state(
-                |ctx, state| {
-                    egui::CentralPanel::default().show(ctx, |ui| draw_page(ui, state, false));
+            .build_ui_state(
+                |root_ui, state| {
+                    egui::CentralPanel::default().show(root_ui, |ui| draw_page(ui, state, false));
                 },
                 state,
             );
@@ -4348,13 +4538,110 @@ mod tests {
     }
 
     #[test]
+    fn auto_view_trim_default_is_a_preferences_book_append_write_setting() {
+        let live = Settings::default();
+        let mut edited = live.clone();
+        assert!(!preferences_change_book_append_write_settings(
+            &live, &edited
+        ));
+        edited.auto_view_trim_default_enabled = true;
+        assert!(preferences_change_book_append_write_settings(
+            &live, &edited
+        ));
+        assert!(preferences_change_book_append_write_settings(
+            &edited, &live
+        ));
+    }
+
+    #[test]
+    fn auto_view_trim_default_preferences_cancel_ok_save_and_reopen() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        assert!(!app.settings.auto_view_trim_default_enabled);
+        app.open_preferences_request(PreferencesOpenRequest::anchored(
+            PreferencesPage::SpreadMode,
+            "spread/auto-view-trim",
+        ));
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1100.0, 850.0))
+            .build_ui_state(
+                |root_ui, app| app.show_preferences_dialog(&root_ui.ctx().clone()),
+                app,
+            );
+        for (cancel, expected) in [(true, false), (false, true), (false, false)] {
+            if !harness.state().show_preferences {
+                harness
+                    .state_mut()
+                    .open_preferences_request(PreferencesOpenRequest::anchored(
+                        PreferencesPage::SpreadMode,
+                        "spread/auto-view-trim",
+                    ));
+            }
+            harness.run_steps(5);
+            assert!(!harness.state().preferences_dialog_has_unsaved_changes());
+            harness
+                .get_by_label("自動余白カットを標準で有効にする")
+                .click();
+            harness.run();
+            assert!(harness.state().preferences_dialog_has_unsaved_changes());
+            // The live value changes only at OK, never while editing a draft.
+            let before = harness.state().settings.auto_view_trim_default_enabled;
+            harness
+                .get_by_label(if cancel { "キャンセル" } else { "  OK  " })
+                .click();
+            harness.run();
+            if cancel {
+                assert!(harness.state().show_preferences_discard_confirm);
+                assert_eq!(
+                    harness.state().settings.auto_view_trim_default_enabled,
+                    before
+                );
+                harness.get_by_label("破棄して閉じる").click();
+                harness.run();
+            }
+            assert!(!harness.state().show_preferences);
+            assert_eq!(
+                harness.state().settings.auto_view_trim_default_enabled,
+                expected
+            );
+            assert_eq!(Settings::load().auto_view_trim_default_enabled, expected);
+            harness
+                .state_mut()
+                .open_preferences_request(PreferencesOpenRequest::anchored(
+                    PreferencesPage::SpreadMode,
+                    "spread/auto-view-trim",
+                ));
+            harness.run_steps(5);
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .auto_view_trim_default_enabled,
+                expected
+            );
+            assert!(!harness.state().preferences_dialog_has_unsaved_changes());
+        }
+    }
+
+    #[test]
     fn file_type_visibility_preferences_cancel_ok_save_and_reopen() {
         use egui_kittest::kittest::Queryable;
         let mut app = crate::app::setup_app_for_test();
         app.open_preferences_request(PreferencesOpenRequest::FILE_TYPE_VISIBILITY);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         harness.get_by_label("RAW").click();
         harness.run();
@@ -4409,8 +4696,15 @@ mod tests {
         let old = app.settings.details_name_colors.clone();
         app.open_preferences_page(PreferencesPage::General);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         harness
             .state_mut()
@@ -4521,6 +4815,8 @@ mod tests {
             app.fs_cache.insert(
                 0,
                 crate::fs_animation::FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex,
                     pixels: image,
                     source_dims: Some([12000, 8000]),
@@ -4545,8 +4841,15 @@ mod tests {
             }
             app.open_preferences_page(PreferencesPage::RawDevelop);
             let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
                 .with_size(egui::vec2(1100.0, 850.0))
-                .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+                .build_ui_state(
+                    |root_ui, app| {
+                        let ctx = &root_ui.ctx().clone();
+                        app.show_preferences_dialog(ctx)
+                    },
+                    app,
+                );
             harness.run();
             harness.get_by_label("補正しない").click();
             harness.run();
@@ -4716,13 +5019,14 @@ mod tests {
             let fonts = Cell::new(false);
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(500.0, 650.0))
-                .build(move |ctx| {
+                .build_ui(move |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
                     if !fonts.replace(true) {
                         crate::ui_fonts::configure_fonts(ctx);
                         ctx.request_repaint();
                         return;
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         render
                             .borrow_mut()
                             .draw_toolbar_visibility_menu(ui, false, false)
@@ -4783,13 +5087,14 @@ mod tests {
             let fonts = Cell::new(false);
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(600.0, 1050.0))
-                .build(move |ctx| {
+                .build_ui(move |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
                     if !fonts.replace(true) {
                         crate::ui_fonts::configure_fonts(ctx);
                         ctx.request_repaint();
                         return;
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         render
                             .borrow_mut()
                             .draw_section_settings_menu(ui, TS::Folder);
@@ -4828,6 +5133,76 @@ mod tests {
             assert!(reopened.settings.toolbar_folder_section_migrated);
             assert!(reopened.settings.show_facet_sort);
             assert!(!reopened.settings.show_toolbar_sort);
+        }
+    }
+
+    #[test]
+    fn section1409_pins_survive_toolbar_ui_preferences_ok_save_reload() {
+        use crate::ui_pinned_search::PinnedSearchKind as Kind;
+        use egui_kittest::kittest::Queryable;
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
+        let env = crate::app::setup_app_for_test();
+        assert!(
+            crate::settings_db::boot_settings_db(env.tmp.path())
+                .db
+                .is_some()
+        );
+        let app = Rc::new(RefCell::new(env));
+        for expected in [true, false] {
+            let mut state = preferences_state_for_test(&app.borrow().settings);
+            app.borrow_mut().settings.toolbar_section_order =
+                Kind::ALL.into_iter().map(Kind::section).rev().collect();
+            app.borrow_mut().settings.toolbar_section_new_row = vec![Kind::Metadata.section()];
+            let order = app.borrow().settings.toolbar_section_order.clone();
+            let render = app.clone();
+            let fonts = Cell::new(false);
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(500.0, 800.0))
+                .build_ui(move |root| {
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(root.ctx());
+                        root.ctx().request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root, |ui| {
+                        render
+                            .borrow_mut()
+                            .draw_toolbar_visibility_menu(ui, false, false)
+                    });
+                });
+            harness.run();
+            for label in [
+                "コンテナ検索欄",
+                "現在地の絞り込み欄",
+                "アイテム検索欄",
+                "Everything 検索欄",
+            ] {
+                harness.get_by_label(label).click();
+                harness.run();
+            }
+            let mut app = app.borrow_mut();
+            assert!(
+                Kind::ALL
+                    .into_iter()
+                    .all(|kind| kind.pinned(&app.settings) == expected)
+            );
+            prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+            app.settings = state.settings;
+            app.settings.save();
+            let loaded = crate::settings_db::SettingsDb::open(app.tmp.path())
+                .unwrap()
+                .load_into_settings()
+                .unwrap();
+            assert!(
+                Kind::ALL
+                    .into_iter()
+                    .all(|kind| kind.pinned(&loaded) == expected)
+            );
+            assert_eq!(loaded.toolbar_section_order, order);
+            assert_eq!(loaded.toolbar_section_new_row, [Kind::Metadata.section()]);
         }
     }
 
@@ -4980,8 +5355,15 @@ mod tests {
 
         app.open_preferences_page(PreferencesPage::Folder);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         harness
             .state_mut()
@@ -5127,6 +5509,84 @@ mod tests {
         assert!(reopened.settings.video_watched_to_end.is_empty());
         assert!(reopened.settings.video_resume_positions.is_empty());
         assert!(reopened.settings.video_audio_track_choices.is_empty());
+    }
+
+    #[test]
+    fn saved_position_preferences_only_accepted_ok_advances_media_clear_generation() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let generation = app.media_memory_clear_generation;
+        let mut state = preferences_state_for_test(&app.settings);
+        state.clear_video_media_memory();
+        app.pref_state = Some(Box::new(state));
+        let _ = app.preferences_dialog_has_unsaved_changes(); // Preview must not advance it.
+        assert_eq!(app.media_memory_clear_generation, generation);
+        app.discard_preferences_dialog();
+        assert_eq!(app.media_memory_clear_generation, generation);
+        let mut state = preferences_state_for_test(&app.settings);
+        state.clear_video_media_memory();
+        app.pref_state = Some(Box::new(state));
+        app.apply_preferences_dialog(&ctx);
+        assert_eq!(app.media_memory_clear_generation, generation + 1);
+        app.pref_state = Some(Box::new(preferences_state_for_test(&app.settings)));
+        app.apply_preferences_dialog(&ctx);
+        assert_eq!(app.media_memory_clear_generation, generation + 1);
+    }
+
+    #[test]
+    fn thumb_name_preferences_combobox_ok_save_reload_and_cancel() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
+        assert!(!harness.state().preferences_dialog_has_unsaved_changes());
+        let scale = harness.state().settings.ui_scale_factor;
+        harness.get_by_label("名前の文字サイズ:").click();
+        harness.run_steps(3);
+        harness.get_by_label("175%").click();
+        harness.run_steps(3);
+        harness.get_by_label("名前の最大行数:").click();
+        harness.run_steps(3);
+        harness.get_by_label("4 行").click();
+        harness.run_steps(3);
+        assert!(harness.state().preferences_dialog_has_unsaved_changes());
+        assert_eq!(harness.state().settings.thumb_name_font_scale_percent, 100);
+        assert_eq!(harness.state().settings.thumb_name_max_lines, 1);
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+        assert_eq!(harness.state().settings.thumb_name_font_scale_percent, 175);
+        assert_eq!(harness.state().settings.thumb_name_max_lines, 4);
+        assert_eq!(harness.state().settings.ui_scale_factor, scale);
+
+        let db = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
+        let persisted = db.load_into_settings().unwrap();
+        assert_eq!(persisted.thumb_name_font_scale_percent, 175);
+        assert_eq!(persisted.thumb_name_max_lines, 4);
+        assert_eq!(persisted.ui_scale_factor, scale);
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Thumbnail);
+        harness.run_steps(3);
+        assert!(!harness.state().preferences_dialog_has_unsaved_changes());
+        harness.get_by_label("名前の文字サイズ:").click();
+        harness.run_steps(3);
+        harness.get_by_label("125%").click();
+        harness.run_steps(3);
+        harness.get_by_label("名前の最大行数:").click();
+        harness.run_steps(3);
+        harness.get_by_label("2 行").click();
+        harness.run_steps(3);
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        assert!(harness.state().show_preferences_discard_confirm);
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+        assert_eq!(harness.state().settings.thumb_name_font_scale_percent, 175);
+        assert_eq!(harness.state().settings.thumb_name_max_lines, 4);
+        let after_cancel = db.load_into_settings().unwrap();
+        assert_eq!(after_cancel.thumb_name_font_scale_percent, 175);
+        assert_eq!(after_cancel.thumb_name_max_lines, 4);
     }
 
     #[test]
@@ -5383,6 +5843,40 @@ mod tests {
                 app.discard_preferences_dialog();
             }
             assert_eq!(app.settings.video_resume_positions.get(&key), Some(&18.0));
+        }
+    }
+
+    #[test]
+    fn preferences_ok_and_cancel_do_not_restore_media_memory_cleared_live() {
+        for commit in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let key = "media/cleared-live.mkv".to_owned();
+            app.settings
+                .video_resume_positions
+                .insert(key.clone(), 18.0);
+            app.settings.video_watched_to_end.insert(key.clone());
+            app.settings
+                .video_audio_track_choices
+                .insert(key, saved_audio_choice_for_preferences_test(2));
+            let mut state = preferences_state_for_test(&app.settings);
+            app.execute_saved_position_clear(
+                crate::keymap::KeyAction::ClearVideoMediaMemory,
+                crate::app::ActionSurface::MainWindow,
+            );
+            assert!(
+                !state.settings.video_resume_positions.is_empty(),
+                "draft is stale"
+            );
+            if commit {
+                prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+                app.install_preferences_settings(state.settings);
+            } else {
+                app.pref_state = Some(Box::new(state));
+                app.discard_preferences_dialog();
+            }
+            assert!(app.settings.video_resume_positions.is_empty());
+            assert!(app.settings.video_watched_to_end.is_empty());
+            assert!(app.settings.video_audio_track_choices.is_empty());
         }
     }
 
@@ -5916,17 +6410,20 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(560.0, 320.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.set_width(ui.available_width());
-                    let _ = draw_preference_search_results(ui, "GPU");
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        let _ = draw_preference_search_results(ui, "GPU");
+                    });
                 });
             });
         harness.run();
@@ -5948,24 +6445,32 @@ mod tests {
         let mut expanded = HashMap::new();
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 700.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        draw_context_menu_layout_settings(
-                            ui,
-                            &mut layout,
-                            &mut scenario,
-                            &mut expanded,
-                            0,
-                        );
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                draw_context_menu_layout_settings(
+                                    ui,
+                                    &mut layout,
+                                    &mut scenario,
+                                    &mut expanded,
+                                    0,
+                                );
+                            });
                     });
                 });
             });
@@ -5992,14 +6497,20 @@ mod tests {
         state.selected = PreferencesPage::ContextMenuLayout;
         let expected = serde_json::to_value(&state.settings).unwrap();
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(700.0, 520.0))
-            .build_state(
-                |ctx, state| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            page_context_menu_layout(ui, state);
-                        });
+            .build_ui_state(
+                |root_ui, state| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                page_context_menu_layout(ui, state);
+                            });
                     });
                 },
                 state,
@@ -6056,17 +6567,20 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(560.0, 340.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.set_width(ui.available_width());
-                    page_parallelism(ui, &mut state);
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        page_parallelism(ui, &mut state);
+                    });
                 });
             });
         harness.run();
@@ -6108,17 +6622,20 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(780.0, 300.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.set_width(ui.available_width());
-                    page_duplicate_files(ui, &mut state);
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        page_duplicate_files(ui, &mut state);
+                    });
                 });
             });
         harness.run();
@@ -6131,17 +6648,20 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(560.0, 230.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.set_width(ui.available_width());
-                    draw_recycle_bin_delete_confirmation_setting(ui, &mut settings);
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        draw_recycle_bin_delete_confirmation_setting(ui, &mut settings);
+                    });
                 });
             });
         harness.run();
@@ -6163,18 +6683,26 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 680.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        page_folder(ui, &mut state);
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                page_folder(ui, &mut state);
+                            });
                     });
                 });
             });
@@ -6197,18 +6725,26 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(560.0, 360.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        page_spread_mode(ui, &mut state);
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                page_spread_mode(ui, &mut state);
+                            });
                     });
                 });
             });
@@ -6217,22 +6753,63 @@ mod tests {
     }
 
     #[test]
+    fn auto_view_trim_default_setting_snapshot_light_off() {
+        auto_view_trim_default_setting_snapshot(
+            "preferences_auto_view_trim_default_light_off",
+            crate::os_theme::ResolvedTheme::Light,
+            false,
+        );
+    }
+
+    #[test]
+    fn auto_view_trim_default_setting_snapshot_dark_on() {
+        auto_view_trim_default_setting_snapshot(
+            "preferences_auto_view_trim_default_dark_on",
+            crate::os_theme::ResolvedTheme::Dark,
+            true,
+        );
+    }
+
+    fn auto_view_trim_default_setting_snapshot(
+        name: &str,
+        theme: crate::os_theme::ResolvedTheme,
+        mut enabled: bool,
+    ) {
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(400.0, 100.0))
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    crate::os_theme::apply_resolved(root_ui.ctx(), theme);
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        draw_auto_view_trim_default_setting(ui, &mut enabled);
+                    });
+                });
+            });
+        harness.run();
+        harness.snapshot(name);
+    }
+
+    #[test]
     fn spread_page_supplement_setting_snapshot() {
         let mut enabled = true;
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(540.0, 100.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.set_width(ui.available_width());
-                    draw_final_cover_spread_setting(ui, &mut enabled);
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        draw_final_cover_spread_setting(ui, &mut enabled);
+                    });
                 });
             });
         harness.run();
@@ -6249,22 +6826,25 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(540.0, 180.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, theme);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.set_width(ui.available_width());
-                    draw_singleton_spread_placement_setting(
-                        ui,
-                        &mut first_enabled,
-                        &mut last_enabled,
-                        animation_enabled,
-                    );
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, theme);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        draw_singleton_spread_placement_setting(
+                            ui,
+                            &mut first_enabled,
+                            &mut last_enabled,
+                            animation_enabled,
+                        );
+                    });
                 });
             });
         harness.run();
@@ -6313,24 +6893,33 @@ mod tests {
             ..crate::settings::Settings::default()
         };
         let mut fonts_ready = false;
-        let mut harness = crate::test_ui::builder().with_size(size).build(move |ctx| {
-            crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-            if !fonts_ready {
-                crate::ui_fonts::configure_fonts(ctx);
-                fonts_ready = true;
-                ctx.request_repaint();
-                return;
-            }
-            egui::CentralPanel::default().show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        draw_still_seek_strip_settings(ui, &mut settings);
-                        draw_still_seek_preview_size_settings(ui, &mut settings);
+        let mut harness = crate::test_ui::builder()
+            .with_size(size)
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                draw_still_seek_strip_settings(ui, &mut settings);
+                                draw_still_seek_preview_size_settings(ui, &mut settings);
+                            });
                     });
+                });
             });
-        });
         harness.run();
         harness.snapshot(name);
     }
@@ -6353,22 +6942,26 @@ mod tests {
 
     fn video_seek_strip_height_settings_snapshot(size: egui::Vec2, name: &str) {
         let mut settings = crate::settings::Settings::default();
-        let mut fonts_ready = false;
-        let mut harness = crate::test_ui::builder().with_size(size).build_ui(|ui| {
-            if !fonts_ready {
-                crate::ui_fonts::configure_fonts(ui.ctx());
-                fonts_ready = true;
-            }
-            egui::CentralPanel::default().show(ui.ctx(), |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        draw_video_seek_strip_height_settings(ui, &mut settings);
-                        draw_video_seek_preview_size_settings(ui, &mut settings);
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(size)
+            .build_ui(|root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                draw_video_seek_strip_height_settings(ui, &mut settings);
+                                draw_video_seek_preview_size_settings(ui, &mut settings);
+                            });
                     });
+                });
             });
-        });
         harness.run();
         harness.snapshot(name);
     }
@@ -6440,8 +7033,15 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         app.open_preferences_page(PreferencesPage::Cache);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1093.0, 614.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         harness.get_by_label("確認せず変換する").scroll_to_me();
         harness.run();
@@ -6462,8 +7062,15 @@ mod tests {
             .collect();
         app.open_preferences_page(page);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1093.0, 614.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         // External-tool path checks repaint while their worker is pending.
         // These navigation tests need rendered transitions, not worker quiescence.
         harness.run_steps(3);
@@ -7177,8 +7784,15 @@ mod tests {
             .collect();
         app.open_preferences_page(PreferencesPage::Vst3);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1093.0, 614.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         harness.get_by_label("Effect 39").scroll_to_me();
         harness.run();
@@ -7364,14 +7978,115 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_bake_stage_ui_ok_save_and_reload_preserves_selected_stage() {
+        use crate::bake_stage::BakeStage;
+        use egui_kittest::kittest::Queryable;
+
+        let mut app = crate::app::setup_app_for_test();
+        assert!(
+            crate::settings_db::boot_settings_db(app.tmp.path())
+                .db
+                .is_some()
+        );
+        app.open_preferences_page(PreferencesPage::BakeStage);
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_ui_state(
+                |root_ui, app| app.show_preferences_dialog(&root_ui.ctx().clone()),
+                app,
+            );
+        harness.run();
+        for stage in BakeStage::ALL {
+            harness
+                .get_by_label(&format!("クリップボードへコピー / {}", stage.label()))
+                .click();
+            harness.run();
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .bake_stage_clipboard,
+                stage
+            );
+            harness.get_by_label("  OK  ").click();
+            harness.run();
+            assert!(!harness.state().show_preferences);
+            assert_eq!(harness.state().settings.bake_stage_clipboard, stage);
+            let loaded = crate::settings_db::SettingsDb::open(harness.state().tmp.path())
+                .unwrap()
+                .load_into_settings()
+                .unwrap();
+            assert_eq!(loaded.bake_stage_clipboard, stage);
+            harness.state_mut().settings.bake_stage_clipboard = loaded.bake_stage_clipboard;
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::BakeStage);
+            harness.run();
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .bake_stage_clipboard,
+                stage
+            );
+        }
+    }
+
+    #[test]
+    fn clipboard_bake_stage_preferences_snapshot() {
+        use egui_kittest::kittest::Queryable;
+
+        let state = preferences_state_for_test(&crate::settings::Settings::default());
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(590.0, 365.0))
+            .build_ui_state(
+                |root_ui, state| {
+                    crate::os_theme::apply_resolved(
+                        root_ui.ctx(),
+                        crate::os_theme::ResolvedTheme::Dark,
+                    );
+                    egui::CentralPanel::default().show(root_ui, |ui| page_bake_stage(ui, state));
+                },
+                state,
+            );
+        harness.run();
+        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(590.0, 365.0));
+        for stage in crate::bake_stage::BakeStage::ALL {
+            assert!(
+                bounds.contains_rect(
+                    harness
+                        .get_by_label(&format!("クリップボードへコピー / {}", stage.label()))
+                        .rect()
+                )
+            );
+        }
+        harness.snapshot("clipboard_bake_stage_preferences");
+    }
+
+    #[test]
     fn preferences_position_setting_off_explicit_anchor_and_search_override() {
         use egui_kittest::kittest::Queryable;
         let mut app = crate::app::setup_app_for_test();
         app.settings.preferences_restore_position = false;
         app.show_preferences = true;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1093.0, 614.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         assert_preferences_position(&harness, PreferencesPage::General, 0.0);
         harness
@@ -7473,8 +8188,15 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         app.show_preferences = true;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1093.0, 614.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         assert_preferences_position(&harness, PreferencesPage::General, 0.0);
     }
@@ -7629,9 +8351,11 @@ mod tests {
         };
         app.show_preferences = true;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 900.0))
-            .build_state(
-                |ctx, (app, saved_ctx)| {
+            .build_ui_state(
+                |root_ui, (app, saved_ctx)| {
+                    let ctx = &root_ui.ctx().clone();
                     *saved_ctx = ctx.clone();
                     app.show_preferences_dialog(ctx);
                 },
@@ -7639,7 +8363,7 @@ mod tests {
             );
         harness.run();
         let before_y = harness.state().0.preferences_view_position.scroll_y;
-        let window_id = egui::Id::new("環境設定");
+        let window_id = egui::Id::unique(Some("環境設定"));
         let before_rect = harness
             .state()
             .1
@@ -7702,10 +8426,11 @@ mod tests {
         let mut state = preferences_state_for_test(&Settings::default());
         state.selected = PreferencesPage::Thumbnail;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(600.0, 2400.0))
-            .build_state(
-                |ctx, state| {
-                    egui::CentralPanel::default().show(ctx, |ui| draw_page(ui, state, false));
+            .build_ui_state(
+                |root_ui, state| {
+                    egui::CentralPanel::default().show(root_ui, |ui| draw_page(ui, state, false));
                 },
                 state,
             );
@@ -7741,10 +8466,11 @@ mod tests {
         let mut state = preferences_state_for_test(&Settings::default());
         state.selected = PreferencesPage::Parallelism;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(600.0, 400.0))
-            .build_state(
-                |ctx, state| {
-                    egui::CentralPanel::default().show(ctx, |ui| draw_page(ui, state, false));
+            .build_ui_state(
+                |root_ui, state| {
+                    egui::CentralPanel::default().show(root_ui, |ui| draw_page(ui, state, false));
                 },
                 state,
             );
@@ -8101,6 +8827,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn specified_scale_preferences_numeric_editor_ime_enter_escape_keeps_dialog_open() {
         use crate::settings::{FullscreenSpecifiedScale, SpecifiedScaleAxis};
         use egui_kittest::kittest::Queryable;
@@ -8126,9 +8856,11 @@ mod tests {
                 "spread/specified-scale",
             ));
             let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
                 .with_size(egui::vec2(1100.0, 850.0))
-                .build_state(
-                    |ctx, app| {
+                .build_ui_state(
+                    |root_ui, app| {
+                        let ctx = &root_ui.ctx().clone();
                         crate::ime_focus::install_ime_input_policy(ctx);
                         app.show_preferences_dialog(ctx);
                     },
@@ -8163,7 +8895,10 @@ mod tests {
             );
             harness.input_mut().events.extend([
                 egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("１２".into())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "１２".into(),
+                    active_range_chars: None,
+                }),
             ]);
             harness.run();
             harness.key_press(key);
@@ -8270,8 +9005,15 @@ mod tests {
             "video/effetune-input-limit",
         ));
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         // The search anchor intentionally animates a highlight; settle the scroll
         // then stop that animation before querying controls in this headless test.
         harness.run_steps(5);
@@ -8353,8 +9095,15 @@ mod tests {
             "video/effetune-auto-open",
         ));
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         for cancel in [true, false] {
             if !harness.state().show_preferences {
                 harness
@@ -8433,8 +9182,15 @@ mod tests {
             "video/effetune-taskbar",
         ));
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         for (cancel, enabled) in [(true, false), (false, false), (false, true)] {
             if !harness.state().show_preferences {
                 harness
@@ -8503,9 +9259,10 @@ mod tests {
         state.selected = PreferencesPage::Video;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(600.0, 2400.0))
-            .build_state(
-                |ctx, state| {
-                    egui::CentralPanel::default().show(ctx, |ui| draw_page(ui, state, false));
+            .build_ui_state(
+                |root_ui, state| {
+                    let ctx = &root_ui.ctx().clone();
+                    egui::CentralPanel::default().show(root_ui, |ui| draw_page(ui, state, false));
                 },
                 state,
             );
@@ -8527,8 +9284,15 @@ mod tests {
         let app = crate::app::App::new_from_settings(app.settings.clone());
         assert!(app.effetune.keep_visible_when_minimized());
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         for enabled in [false, true] {
             harness
                 .state_mut()
@@ -8593,8 +9357,15 @@ mod tests {
 
         app.open_preferences_page(PreferencesPage::Cache);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         harness
             .state_mut()
@@ -8693,8 +9464,15 @@ mod tests {
         app.open_preferences_page(PreferencesPage::Cache);
 
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         harness.run();
         harness
             .state_mut()
@@ -8764,8 +9542,15 @@ mod tests {
 
             app.open_preferences_page(PreferencesPage::Cache);
             let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
                 .with_size(egui::vec2(1100.0, 850.0))
-                .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+                .build_ui_state(
+                    |root_ui, app| {
+                        let ctx = &root_ui.ctx().clone();
+                        app.show_preferences_dialog(ctx)
+                    },
+                    app,
+                );
             harness.run();
             let settings = &mut harness.state_mut().pref_state.as_mut().unwrap().settings;
             if change_epub {
@@ -8798,13 +9583,19 @@ mod tests {
         let mut state = preferences_state_for_test(&crate::settings::Settings::default());
         state.selected = PreferencesPage::Cache;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(760.0, 950.0))
-            .build_state(
-                |ctx, state| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            pages::page_cache(ui, state);
-                        });
+            .build_ui_state(
+                |root_ui, state| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
+                            .show(ui, |ui| {
+                                pages::page_cache(ui, state);
+                            });
                     });
                 },
                 state,
@@ -8874,8 +9665,15 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         app.open_preferences_page(PreferencesPage::ClipboardCapture);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1100.0, 850.0))
-            .build_state(|ctx, app| app.show_preferences_dialog(ctx), app);
+            .build_ui_state(
+                |root_ui, app| {
+                    let ctx = &root_ui.ctx().clone();
+                    app.show_preferences_dialog(ctx)
+                },
+                app,
+            );
         // Opening requests the page; the first dialog frame creates its draft.
         harness.run();
         let (tx, rx) = mpsc::channel();

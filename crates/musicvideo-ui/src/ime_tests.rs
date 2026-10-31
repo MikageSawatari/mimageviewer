@@ -130,8 +130,12 @@ impl Harness {
     }
 
     fn frame(&mut self, events: Vec<Event>) {
+        self.frame_with_input_enabled(events, true);
+    }
+
+    fn frame_with_input_enabled(&mut self, events: Vec<Event>, input_enabled: bool) {
         self.time += 0.1;
-        self.output = self.context.run(
+        self.output = crate::headless_paint_output(self.context.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 1600.0))),
                 time: Some(self.time),
@@ -139,31 +143,37 @@ impl Harness {
                 ..Default::default()
             },
             |ctx| {
-                self.wants_keyboard_before_shortcut = ctx.wants_keyboard_input();
+                self.wants_keyboard_before_shortcut = ctx.egui_wants_keyboard_input();
                 self.recovery_before_shortcut = egui_ime::recovering_text_input(ctx);
-                let mut prepared = self.state.begin_frame(ctx, &mut self.project);
+                if !input_enabled {
+                    ctx.disable();
+                }
+                let mut prepared = self.state.begin_frame_with_input_enabled(
+                    ctx,
+                    &mut self.project,
+                    input_enabled,
+                );
                 // Observe before widgets can consume native Undo events.
                 self.events_after_shortcut = ctx.input(|input| input.events.clone());
-                egui::TopBottomPanel::top("ime-history")
-                    .show(ctx, |ui| prepared.history_controls(ui));
-                egui::TopBottomPanel::bottom("ime-timeline")
-                    .default_height(250.0)
+                egui::Panel::top("ime-history").show(ctx, |ui| prepared.history_controls(ui));
+                egui::Panel::bottom("ime-timeline")
+                    .default_size(250.0)
                     .show(ctx, |ui| {
                         prepared.timeline(ui, 0.0, None);
                     });
                 let mut frame = prepared.properties();
-                egui::SidePanel::left("ime-layers")
-                    .default_width(220.0)
+                egui::Panel::left("ime-layers")
+                    .default_size(220.0)
                     .show(ctx, |ui| frame.layer_list(ui));
-                self.inspector = egui::SidePanel::right("ime-inspector")
-                    .default_width(450.0)
+                self.inspector = egui::Panel::right("ime-inspector")
+                    .default_size(450.0)
                     .show(ctx, |ui| frame.inspector(ui, 0.0, &[], &[]))
                     .response
                     .rect;
                 self.response = frame.finish();
                 egui::CentralPanel::default().show(ctx, |_| {});
             },
-        );
+        ));
     }
 
     fn text_rect(&self, text: &str) -> Rect {
@@ -303,7 +313,10 @@ fn ime(event: egui::ImeEvent) -> Event {
 fn start_preedit() -> Vec<Event> {
     vec![
         ime(egui::ImeEvent::Enabled),
-        ime(egui::ImeEvent::Preedit("未確定".into())),
+        ime(egui::ImeEvent::Preedit {
+            text: "未確定".into(),
+            active_range_chars: None,
+        }),
     ]
 }
 
@@ -322,7 +335,10 @@ fn editable_names_keep_focus_and_native_state_across_each_input_pass() {
         let prefix = h.body();
         h.frame(vec![ime(egui::ImeEvent::Enabled)]);
         for preedit in ["に", "にほ", "にほん"] {
-            h.frame(vec![ime(egui::ImeEvent::Preedit(preedit.into()))]);
+            h.frame(vec![ime(egui::ImeEvent::Preedit {
+                text: preedit.into(),
+                active_range_chars: None,
+            })]);
             h.frame(vec![]);
             h.assert_focus(id);
             assert_eq!(h.body(), format!("{prefix}{preedit}"));
@@ -670,4 +686,59 @@ fn lyrics_cancel_keeps_widget_identity_cues_and_native_undo_ownership() {
     assert!(!h.response.history_changed);
     assert!(!h.state.has_pending_lyrics_edit());
     h.assert_focus(id);
+}
+
+#[test]
+fn ime_surrounding_deletion_conflict_cancel_restores_native_cursor_and_lyrics() {
+    let mut h = Harness::new(Field::Lyrics);
+    let id = h.focus();
+    let original = h.project.clone();
+    let identities = h.state.lyrics_editors[&h.layer].identity_snapshot();
+    let cursor = egui::text::CCursorRange::one(egui::text::CCursor::new(10));
+    let mut native = egui::text_edit::TextEditState::load(&h.context, id).unwrap();
+    native.cursor.set_char_range(Some(cursor));
+    native.store(&h.context, id);
+    // Remove the two newlines between differently timed lines through the real TextEdit.
+    h.frame(vec![Event::Ime(egui::ImeEvent::DeleteSurrounding {
+        before_chars: 2,
+        after_chars: 0,
+    })]);
+    assert!(h.state.has_pending_lyrics_edit());
+    assert_eq!(h.project, original);
+    assert_ne!(
+        egui::text_edit::TextEditState::load(&h.context, id)
+            .unwrap()
+            .cursor
+            .char_range(),
+        Some(cursor),
+    );
+    let editor = h.state.lyrics_editors.get_mut(&h.layer).unwrap();
+    let cancelled = editor.cancel_pending().unwrap();
+    cancelled.restore_text_edit(&h.context, id);
+    assert_eq!(editor.as_str(), Field::Lyrics.initial_text());
+    assert_eq!(editor.identity_snapshot(), identities);
+    assert_eq!(
+        egui::text_edit::TextEditState::load(&h.context, id)
+            .unwrap()
+            .cursor
+            .char_range(),
+        Some(cursor),
+    );
+}
+
+#[test]
+fn disabled_editor_regions_keep_all_focused_text_fields_unchanged() {
+    for field in SINGLELINES.into_iter().chain([Field::Lyrics]) {
+        let mut h = Harness::new(field);
+        h.focus();
+        let original = h.project.clone();
+        h.frame_with_input_enabled(
+            vec![
+                key(Key::A, Modifiers::CTRL | Modifiers::COMMAND, true, false),
+                Event::Text("blocked".into()),
+            ],
+            false,
+        );
+        assert_eq!(h.project, original, "field={field:?}");
+    }
 }

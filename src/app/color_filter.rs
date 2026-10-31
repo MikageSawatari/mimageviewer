@@ -184,7 +184,7 @@ impl App {
         // 画像色フィルタは未対応。スウォッチから有効化しても何も絞れず、不活性な
         // チップだけ残るので、案内トーストを出して有効化しない。
         if !self.color_filter_available_in_current_view() {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "このビューでは画像色フィルタを使えません (通常フォルダ / サブ展開 / ZIP / PDF で利用できます)"
                     .to_string(),
             );
@@ -468,7 +468,7 @@ impl App {
             self.color_filter.applied_scope_signature = None;
             self.rebuild_visible_indices();
             if !same_confirmation {
-                self.show_feedback_toast(format!(
+                self.show_feedback_warning(format!(
                     "画像色: {} 件のスキャン確認が必要です (画像色メニュー)",
                     work_items.len()
                 ));

@@ -239,22 +239,30 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
 
 - **前提**: 署名前に SimplySign Desktop を起動しログインしておく (クラウド鍵を仮想カードで
   提供、セッション期限あり)。証明書は Certum Open Source Code Signing。
-- **落とし穴**: SimplySign の**セッション認証が切れていると、証明書ストアに証明書が見えて
-  いても (`Assert-MivSignReady` は通っても) `signtool sign` が「No certificates were found」で
-  落ちる**。→ **ビルド前に捨て PE へ試し署名して鍵の利用可否を確認**してから本ビルドに入る。
+- **自動事前チェック (2026-10-24)**: SimplySign のセッション認証が切れていても、証明書の公開情報は
+  ストアに残ることがある。`Assert-MivSignReady` は証明書の存在確認に続き、**実行中の PowerShell host exe を
+  毎回新しい一時ディレクトリへコピーして試し署名**する。原本や配布成果物は変更しない。
+  タイムスタンプなしの署名を1回、RFC3161タイムスタンプ取得を最大3回（失敗間隔3秒）、`verify /pa` を行い、
+  成否にかかわらず一時ディレクトリを削除する。
+  鍵の署名失敗は `signing key is not usable`（SimplySignのログイン／セッション、SCardSvr／CSP、実行host・権限を確認）、
+  タイムスタンプ失敗は `timestamp server not reachable`（表示URLのネットワーク／TSAを確認、変更は `MIV_SIGN_TS`）として、
+  signtoolの診断出力とともに区別する。検証失敗も停止する。
+  `build-dist.ps1`、`build-release.ps1 -Sign`、`build-portable.ps1 -Sign` は各入口でclean／build前に自動実行する。
+  単独で事前確認する場合も、次の呼び出しだけでよい。
 
   ```powershell
   . (Join-Path (Resolve-Path 'scripts').Path 'sign-files.ps1')
   Assert-MivSignReady
-  $tmp = Join-Path $env:TEMP 'miv-sign-probe.exe'
-  Copy-Item 'vendor\susie-worker\mimageviewer-susie32.exe' $tmp -Force
-  Invoke-MivSign -Files @($tmp) -Verify
-  Remove-Item $tmp -Force
   ```
+
+  通常は数秒だが、過去にはsigntoolが5分以上進まなかった記録もあり、時間上限は保証しない
+  （[v3.7.0の記録](v3.7.0-release-preparation.md)）。開始時に使える鍵が長時間のbuild中に使えなくなる場合は
+  防げない。最終成果物の署名・検証は従来どおり必須で、証明書選択条件も変更しない。
 
 - **落とし穴 2: `SCardSvr` と SimplySign の鶏卵問題** (v2.9.1 で 30 分溶かした)。症状は
   「No certificates」ではなく **`SignTool Error: The specified CSP could not be found.`**。
-  証明書は前セッションのぶんがストアに残るので `Assert-MivSignReady` は通ってしまう。
+  証明書は前セッションのぶんがストアに残るので、以前の存在確認だけの事前チェックは通ってしまった。
+  現在の `Assert-MivSignReady` は試し署名でこの失敗も検出する。
   - 原因: SimplySign の仮想リーダーは**ユーザーモードで `SCardSvr` に登録する**方式だが、
     `SCardSvr` の起動トリガーは「**物理**リーダーの DEVICE INTERFACE ARRIVAL」しかない。
     サービスが止まっていると登録できず、登録が無いのでサービスも起動しない。しかも
@@ -277,7 +285,7 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
   EffeTune は `vendor/effetune-mixwright/` を target staging にコピーしてから全 PE を署名する
   (plugin binary の `.vst3` も PE)。vendor 原本を変更せず、`MIMV_EFFETUNE_DIR` を staging に向け、
   `build-release.ps1` の launcher build と dependency gate が同じ署名済み実体を使う。
-  署名前にtracked manifestの全449ファイル名・SHA256を照合し、署名後stageは有効な指定発行元署名と
+  署名前に `third_party/effetune-mixwright/v0.14.0/manifest.sha256` の全463ファイル名・SHA256を照合し、署名後stageは有効な指定発行元署名と
   PEのchecksum／証明書以外の一致を検査する。VERSIONと3通知原文も照合し、更新時は
   `third_party/effetune-mixwright/<version>/` と about の include_str! を一体で更新する。
 - **`onnxruntime*.dll` と app-local VC runtime 4本は Microsoft 署名済みなので再署名しない**。
@@ -356,7 +364,7 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
   Chrome での実ダウンロード確認を通してから行う。単体exe / インストーラ版は埋め込みなので
   VST3 は従来通り動く。EffeTune も portable には同梱しない (利用者決定、
   [effetune-integration-plan.md](effetune-integration-plan.md) §10.1)。単体exe／インストーラでは
-  launcher が VERSION を記録した全 bundle (v0.13.0 は448ファイル、VERSION込み入力449ファイル) を
+  launcher が VERSION を記録した全 bundle (v0.14.0 は462ファイル、VERSION込み入力463ファイル) を
   `runtime/<version>/effetune/<hash12>-<generation>/` へ全hash検証して公開し、
   atomic更新するのは小さなcurrent pointerだけ。既存・使用中treeは移動／削除／修復せず残す。
   hash12はcontent SHA256先頭12桁でstampにはfull hashを使う。最深fileのUTF-16長260以上は理由付きで拒否する。

@@ -518,6 +518,8 @@ enum Command {
     Clear(mpsc::Sender<Result<usize, String>>),
     #[cfg(test)]
     Pause(mpsc::Sender<()>, mpsc::Receiver<()>),
+    #[cfg(test)]
+    PauseBeforeNextCompletion(mpsc::Sender<()>, mpsc::Receiver<()>),
 }
 
 struct QueuedCommand {
@@ -584,6 +586,8 @@ impl BookResumeWriter {
                 }));
                 // tx が全て drop されるまで (= App 終了まで) 受信し続ける。channel に
                 // 溜まっている分は Disconnected 前に drain されるので取りこぼしは無い。
+                #[cfg(test)]
+                let mut completion_pause = None;
                 while let Ok(QueuedCommand {
                     position_fence_seq,
                     command,
@@ -726,10 +730,21 @@ impl BookResumeWriter {
                             let _ = tx.send(result);
                         }
                         #[cfg(test)]
+                        Command::PauseBeforeNextCompletion(entered, resume) => {
+                            assert!(completion_pause.replace((entered, resume)).is_none());
+                            worker_pending.fetch_sub(1, Ordering::Release);
+                            continue; // Arm only; pause the following command's completion.
+                        }
+                        #[cfg(test)]
                         Command::Pause(entered, resume) => {
                             let _ = entered.send(());
                             let _ = resume.recv();
                         }
+                    }
+                    #[cfg(test)]
+                    if let Some((entered, resume)) = completion_pause.take() {
+                        let _ = entered.send(());
+                        let _ = resume.recv();
                     }
                     worker_pending.fetch_sub(1, Ordering::Release);
                 }
@@ -918,6 +933,18 @@ impl BookResumeWriter {
             .as_ref()
             .is_some_and(|handle| !handle.is_finished())
             && self.pending.load(Ordering::Acquire) > 0
+    }
+
+    /// Hold the next FIFO command after publication/reply but before pending--.
+    /// Dropping the release sender also unblocks it, including assertion unwinds.
+    #[cfg(test)]
+    pub(crate) fn pause_before_next_completion_for_test(
+        &self,
+    ) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        assert!(self.send(Command::PauseBeforeNextCompletion(entered_tx, resume_rx)));
+        (entered_rx, resume_tx)
     }
 
     #[cfg(test)]
@@ -1135,6 +1162,46 @@ mod tests {
             .read_position_after(&normalize_path(book), cutoff)
             .recv_timeout(Duration::from_secs(10))
             .unwrap()
+    }
+
+    #[test]
+    fn position_reply_does_not_prove_writer_idle() {
+        for warm in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let writer = BookResumeWriter::spawn_at(tmp.path().join("resume.db")).unwrap();
+            let book = Path::new("C:/book.zip");
+            let key = normalize_path(book);
+            let start = writer.pause_for_test();
+            if !warm {
+                assert!(writer.record(book, 3, None));
+            }
+            let (entered, release) = writer.pause_before_next_completion_for_test();
+            if warm {
+                assert!(writer.record(book, 3, None));
+            }
+            // Queue the cold read before Record can publish its watermark.
+            let queued = (!warm).then(|| writer.read_position_after(&key, 1));
+            start.send(()).unwrap();
+            entered.recv_timeout(Duration::from_secs(10)).unwrap();
+            let reply = queued
+                .unwrap_or_else(|| writer.read_position_after(&key, 1))
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            assert!(reply.status.is_ok(), "{:?}", reply.status);
+            assert_eq!(reply.cutoff, 1);
+            assert_eq!(reply.completed_through, 1);
+            assert_eq!(reply.position.unwrap().page, 3);
+            assert_eq!(writer.watermarks().admitted, 1);
+            assert_eq!(writer.watermarks().completed_through, 1);
+            assert!(
+                writer.is_busy(),
+                "warm={warm}: reply precedes pending decrement"
+            );
+            let pending = Arc::clone(&writer.pending);
+            drop(release);
+            drop(writer); // FIFO drain/join, rather than a reply or time window.
+            assert_eq!(pending.load(Ordering::Acquire), 0);
+        }
     }
 
     #[test]

@@ -848,11 +848,25 @@ pub fn import_at<F>(
 where
     F: FnMut(TransferProgress),
 {
+    import_at_with_clock(data_dir, root, cancel, progress, std::time::Instant::now)
+}
+
+fn import_at_with_clock<F, C>(
+    data_dir: &Path,
+    root: &Path,
+    cancel: &AtomicBool,
+    progress: F,
+    batch_now: C,
+) -> Result<ImportSummary, TransferError>
+where
+    F: FnMut(TransferProgress),
+    C: Fn() -> std::time::Instant,
+{
     let started = std::time::Instant::now();
     if crate::perf::is_enabled() {
         crate::perf::event("metadata_import", "begin", None, 0, &[]);
     }
-    let result = import_at_batched(data_dir, root, cancel, progress);
+    let result = import_at_batched(data_dir, root, cancel, progress, batch_now);
     let outcome = match &result {
         Ok(summary) if summary.cancelled => "cancelled",
         Ok(summary) if summary.incomplete_error.is_some() || summary.failed_entries > 0 => {
@@ -885,14 +899,16 @@ where
     result
 }
 
-fn import_at_batched<F>(
+fn import_at_batched<F, C>(
     data_dir: &Path,
     root: &Path,
     cancel: &AtomicBool,
     mut progress: F,
+    batch_now: C,
 ) -> Result<ImportSummary, TransferError>
 where
     F: FnMut(TransferProgress),
+    C: Fn() -> std::time::Instant,
 {
     validate_root(root)?;
     let manifest_started = std::time::Instant::now();
@@ -936,7 +952,7 @@ where
     let mut batch_folder_pin_changes = 0usize;
     let mut batch_spread_shift_changes = SpreadShiftFamilyChanges::default();
     let mut batch_composition_changes = CompositionFamilyChanges::default();
-    let mut batch_started = std::time::Instant::now();
+    let mut batch_started = batch_now();
     let mut batch_active = false;
     let apply_started = std::time::Instant::now();
     let mut target_verify_ms = 0.0_f64;
@@ -979,7 +995,7 @@ where
                         }
                         begin_import_batch(&conn)?;
                         batch_active = true;
-                        batch_started = std::time::Instant::now();
+                        batch_started = batch_now();
                     }
                     let discovered_sidecar_sync = automatic_sidecar_sync_cached(
                         &mut automatic_sidecar_sync_cache,
@@ -1091,7 +1107,7 @@ where
             if batch_entries > 0
                 && (batch_entries >= IMPORT_TRANSACTION_BATCH_ENTRIES
                     || batch_bytes >= IMPORT_TRANSACTION_BATCH_BYTES
-                    || batch_started.elapsed() >= IMPORT_TRANSACTION_BATCH_TIME)
+                    || batch_now().duration_since(batch_started) >= IMPORT_TRANSACTION_BATCH_TIME)
             {
                 let commit_started = std::time::Instant::now();
                 commit_import_batch(&conn)?;
@@ -1144,7 +1160,7 @@ where
                 batch_applied = 0;
                 batch_video_pin_changes = 0;
                 batch_folder_pin_changes = 0;
-                batch_started = std::time::Instant::now();
+                batch_started = batch_now();
             }
             progress(TransferProgress {
                 phase: TransferPhase::Importing,
@@ -5604,11 +5620,12 @@ fn apply_entry(
             container_cache_key.as_deref(),
             include_nested,
         )?;
-        insert_container_state(tx, &container_target_key, &entry.container_state)?;
+        insert_container_state(tx, &container_target_key, false, &entry.container_state)?;
         for container in &entry.nested_containers {
             insert_container_state(
                 tx,
                 &join_container_key(&container_target_key, &container.member_key),
+                true,
                 &container.state,
             )?;
         }
@@ -5872,6 +5889,7 @@ fn insert_mask(
 fn insert_container_state(
     tx: &Connection,
     stripped_key: &str,
+    has_fallback: bool,
     state: &PortableContainerState,
 ) -> Result<(), TransferError> {
     if let Some(spread) = state.spread {
@@ -5920,14 +5938,12 @@ fn insert_container_state(
         .map_err(db_error)?;
     }
     if let Some(view_trim) = state.view_trim {
-        let json = serde_json::to_string(&view_trim)
-            .map_err(|error| TransferError::Invalid(format!("表示トリム: {error}")))?;
-        tx.prepare_cached(
-            "INSERT INTO view_trim.view_trim_books (book_key, state_json, updated_at)
-             VALUES (?1, ?2, unixepoch())",
+        crate::view_trim_db::write_transferred_book_state(
+            tx,
+            stripped_key,
+            has_fallback,
+            view_trim,
         )
-        .map_err(db_error)?
-        .execute(params![stripped_key, json])
         .map_err(db_error)?;
     }
     Ok(())
@@ -6842,6 +6858,130 @@ impl<W: Write> Write for CancelWriter<'_, W> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn view_trim_packages_share_versioned_codec_and_preserve_nested_markers() {
+        use super::*;
+        use crate::view_trim::{
+            ViewTrimBookPreference, ViewTrimBookSettings, ViewTrimBookState, ViewTrimMargins,
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("ATTACH DATABASE ':memory:' AS view_trim;
+            CREATE TABLE view_trim.view_trim_books(book_key TEXT PRIMARY KEY,state_json TEXT NOT NULL,updated_at INTEGER);").unwrap();
+        let settings = ViewTrimBookSettings {
+            enabled: true,
+            single: ViewTrimMargins {
+                left: 0.09,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for preference in [
+            ViewTrimBookPreference::FollowGlobal,
+            ViewTrimBookPreference::None,
+            ViewTrimBookPreference::Auto,
+            ViewTrimBookPreference::Manual,
+        ] {
+            let state = ViewTrimBookState {
+                preference,
+                book_settings: settings,
+            };
+            let package = PortableContainerState {
+                view_trim: Some(state),
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&package).unwrap();
+            assert!(json.contains("\"version\":2"));
+            let restored: PortableContainerState = serde_json::from_str(&json).unwrap();
+            validate_container_state(&restored, "book.zip").unwrap();
+            // Explicit import replaces even an unreadable destination row.
+            conn.execute(
+                "INSERT OR REPLACE INTO view_trim.view_trim_books VALUES('book.zip','invalid',0)",
+                [],
+            )
+            .unwrap();
+            insert_container_state(&conn, "book.zip", false, &restored).unwrap();
+            let stored: String = conn
+                .query_row(
+                    "SELECT state_json FROM view_trim.view_trim_books WHERE book_key='book.zip'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<ViewTrimBookState>(&stored).unwrap(),
+                state
+            );
+        }
+        let marker = PortableContainerState {
+            view_trim: Some(ViewTrimBookState::default()),
+            ..Default::default()
+        };
+        let marker: PortableContainerState =
+            serde_json::from_slice(&serde_json::to_vec(&marker).unwrap()).unwrap();
+        insert_container_state(&conn, "book.zip/nested", true, &marker).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT state_json FROM view_trim.view_trim_books WHERE book_key='book.zip/nested'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<ViewTrimBookState>(&stored).unwrap(),
+            ViewTrimBookState::default()
+        );
+        insert_container_state(&conn, "book.zip", false, &marker).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM view_trim.view_trim_books WHERE book_key='book.zip'",
+                [],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            0
+        );
+
+        for (mode, expected) in [
+            ("none", ViewTrimBookPreference::None),
+            ("auto", ViewTrimBookPreference::Auto),
+            ("book", ViewTrimBookPreference::Manual),
+        ] {
+            let json =
+                serde_json::json!({"view_trim":{"apply_mode":mode,"book_settings":settings}});
+            let old_package: PortableContainerState = serde_json::from_value(json).unwrap();
+            assert_eq!(old_package.view_trim.unwrap().preference, expected);
+            insert_container_state(&conn, "book.zip", false, &old_package).unwrap();
+            let stored: String = conn
+                .query_row(
+                    "SELECT state_json FROM view_trim.view_trim_books WHERE book_key='book.zip'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&stored).unwrap()["version"],
+                2
+            );
+            assert_eq!(
+                serde_json::from_str::<ViewTrimBookState>(&stored)
+                    .unwrap()
+                    .book_settings,
+                settings
+            );
+        }
+        for invalid in [
+            serde_json::json!({"version":3,"preference":"auto"}),
+            serde_json::json!({"version":2,"apply_mode":"auto"}),
+        ] {
+            assert!(
+                serde_json::from_value::<PortableContainerState>(
+                    serde_json::json!({"view_trim":invalid})
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn composition_view_mode_transfer_preserves_exact_codec_and_dormant_binding() {
         use super::*;
         let conn = Connection::open_in_memory().unwrap();
@@ -6868,7 +7008,7 @@ mod tests {
             let restored: PortableContainerState = serde_json::from_slice(&json).unwrap();
             validate_container_state(&restored, "book.pdf").unwrap();
             let key = format!("book-{mode}.pdf");
-            insert_container_state(&conn, &key, &restored).unwrap();
+            insert_container_state(&conn, &key, false, &restored).unwrap();
             let stored: (i32, i32, i32) = conn
                 .query_row(
                     "SELECT mode,flow,direction FROM spread.spreads WHERE path=?1",
@@ -9099,7 +9239,7 @@ mod tests {
         );
         let source_nested_key = join_container_key(&source_cache_key, "vol01");
         let trim = crate::view_trim::ViewTrimBookState {
-            apply_mode: crate::view_trim::ViewTrimApplyMode::Book,
+            preference: crate::view_trim::ViewTrimBookPreference::Manual,
             book_settings: crate::view_trim::ViewTrimBookSettings {
                 enabled: true,
                 single: crate::view_trim::ViewTrimMargins {
@@ -9356,8 +9496,11 @@ mod tests {
                 params![source_folder_key, source_zip_key],
             )
             .unwrap();
-        let trim_json =
-            serde_json::to_string(&crate::view_trim::ViewTrimBookState::default()).unwrap();
+        let trim_json = serde_json::to_string(&crate::view_trim::ViewTrimBookState {
+            preference: crate::view_trim::ViewTrimBookPreference::None,
+            ..Default::default()
+        })
+        .unwrap();
         Connection::open(source_data.join("view_trim.db"))
             .unwrap()
             .execute(
@@ -10577,7 +10720,7 @@ mod tests {
                 .unwrap();
         }
         let book_trim = crate::view_trim::ViewTrimBookState {
-            apply_mode: crate::view_trim::ViewTrimApplyMode::Book,
+            preference: crate::view_trim::ViewTrimBookPreference::Manual,
             book_settings: crate::view_trim::ViewTrimBookSettings {
                 enabled: true,
                 single: crate::view_trim::ViewTrimMargins {
@@ -11369,6 +11512,26 @@ mod tests {
         );
     }
 
+    struct TestImportClock {
+        now: std::cell::Cell<std::time::Instant>,
+    }
+
+    impl TestImportClock {
+        fn new() -> Self {
+            Self {
+                now: std::cell::Cell::new(std::time::Instant::now()),
+            }
+        }
+
+        fn now(&self) -> std::time::Instant {
+            self.now.get()
+        }
+
+        fn advance(&self, duration: std::time::Duration) {
+            self.now.set(self.now.get() + duration);
+        }
+    }
+
     #[test]
     fn import_uses_bounded_outer_transactions_instead_of_per_item_commits() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -11389,9 +11552,107 @@ mod tests {
         export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
         copy_sidecar_bundle(&source, &destination);
 
-        let summary = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        let clock = TestImportClock::new();
+        let summary = import_at_with_clock(
+            &destination_data,
+            &destination,
+            &cancel,
+            no_progress,
+            || clock.now(),
+        )
+        .unwrap();
         assert_eq!(summary.applied_entries, 601);
         assert_eq!(summary.transaction_batches, 3);
+    }
+
+    #[test]
+    fn import_time_boundary_commits_at_deadline_and_resets_for_next_batch() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        set_rating(&source_data, &source, 4);
+        Connection::open(source_data.join("rating.db"))
+            .unwrap()
+            .execute("UPDATE ratings SET kind = 2", [])
+            .unwrap();
+        for name in ["a.jpg", "b.jpg", "c.jpg", "d.jpg"] {
+            fs::write(source.join(name), b"x").unwrap();
+            fs::write(destination.join(name), b"x").unwrap();
+            set_rating(&source_data, &source.join(name), 4);
+        }
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        copy_sidecar_bundle(&source, &destination);
+        let clock = TestImportClock::new();
+        let mut seen = HashSet::new();
+        let mut paths: Vec<PathBuf> = Vec::new();
+        let summary = import_at_with_clock(
+            &destination_data,
+            &destination,
+            &cancel,
+            |progress| {
+                if progress.phase != TransferPhase::Importing {
+                    return;
+                }
+                let relative = progress.current_path.unwrap();
+                if !seen.insert(relative.clone()) {
+                    return; // The post-item callback repeats this path.
+                }
+                let path = if relative == "." {
+                    destination.clone()
+                } else {
+                    destination.join(relative)
+                };
+                match paths.len() {
+                    1 => clock.advance(
+                        IMPORT_TRANSACTION_BATCH_TIME - std::time::Duration::from_millis(1),
+                    ),
+                    2 => {
+                        assert_eq!(
+                            rating(&destination_data, &paths[0]),
+                            None,
+                            "499ms must leave the first batch uncommitted"
+                        );
+                        clock.advance(std::time::Duration::from_millis(1));
+                    }
+                    3 => {
+                        for previous in &paths {
+                            assert_eq!(
+                                rating(&destination_data, previous),
+                                Some(4),
+                                "500ms must publish the first three items"
+                            );
+                        }
+                    }
+                    4 => {
+                        clock.advance(
+                            IMPORT_TRANSACTION_BATCH_TIME - std::time::Duration::from_millis(1),
+                        );
+                        assert_eq!(
+                            rating(&destination_data, &paths[3]),
+                            None,
+                            "the next batch gets a fresh deadline"
+                        );
+                    }
+                    _ => {}
+                }
+                paths.push(path);
+            },
+            || clock.now(),
+        )
+        .unwrap();
+        assert_eq!(paths.len(), 5);
+        assert_eq!(summary.applied_entries, 5);
+        assert_eq!(summary.transaction_batches, 2);
+        for path in paths {
+            assert_eq!(rating(&destination_data, &path), Some(4));
+        }
     }
 
     #[test]
@@ -11836,7 +12097,8 @@ mod tests {
         export_at(&source_data, &source, false, &export_cancel, no_progress).unwrap();
         copy_sidecar_bundle(&source, &destination);
         let import_cancel = AtomicBool::new(false);
-        let summary = import_at(
+        let clock = TestImportClock::new();
+        let summary = import_at_with_clock(
             &destination_data,
             &destination,
             &import_cancel,
@@ -11847,6 +12109,7 @@ mod tests {
                     import_cancel.store(true, Ordering::Relaxed);
                 }
             },
+            || clock.now(),
         )
         .unwrap();
 

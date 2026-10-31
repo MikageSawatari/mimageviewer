@@ -48,6 +48,7 @@ impl App {
             // ビューポートを越えて下部ボタンが見切れる。
             let scroll_max_h = (ctx.content_rect().height() - 160.0).min(720.0).max(80.0);
             egui::Window::new("統計")
+                .drag_area(egui::WindowDrag::Anywhere)
                 .open(&mut open)
                 .resizable(false)
                 .collapsible(false)
@@ -55,6 +56,10 @@ impl App {
                 .show(ctx, |ui| {
                     ui.set_min_width(520.0);
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .id_salt("stats_scroll")
                         .max_height(scroll_max_h)
                         .auto_shrink([false, true])
@@ -117,20 +122,23 @@ impl App {
                             ui.heading("デコーダ経路");
                             ui.add_space(4.0);
                             let total_imgs = snapshot.total_images();
-                            let count_native = total_imgs
-                                .saturating_sub(snapshot.count_wic + snapshot.count_susie);
+                            let count_native = total_imgs.saturating_sub(
+                                snapshot.count_wic + snapshot.count_susie + snapshot.count_libavif,
+                            );
                             let time_native = (snapshot.time_jpg
                                 + snapshot.time_png
                                 + snapshot.time_webp
                                 + snapshot.time_gif
                                 + snapshot.time_bmp
                                 + snapshot.time_other
+                                - snapshot.time_libavif
                                 - snapshot.time_wic
                                 - snapshot.time_susie)
                                 .max(0.0);
-                            let decoder_rows: [(&str, u64, f64); 3] = [
+                            let decoder_rows: [(&str, u64, f64); 4] = [
                                 ("Native", count_native, time_native),
-                                ("WIC   ", snapshot.count_wic, snapshot.time_wic),
+                                ("libavif", snapshot.count_libavif, snapshot.time_libavif),
+                                ("Windows の表示機能", snapshot.count_wic, snapshot.time_wic),
                                 ("Susie ", snapshot.count_susie, snapshot.time_susie),
                             ];
                             draw_format_rows(ui, &decoder_rows);

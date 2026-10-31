@@ -1,0 +1,18 @@
+{
+  "page_turn_animation_enabled": true,
+  "page_turn_animation_duration_ms": 200,
+  "default_spread_mode": "LtrCover",
+  "video_in_window_mode": true,
+  "detached_viewer_open_images_in_window": false,
+  "fullscreen_manual_nav_wrap": false,
+  "global_preset": {
+    "brightness": 15.0,
+    "contrast": 10.0,
+    "gamma": 1.0,
+    "saturation": 0.0,
+    "temperature": 0.0,
+    "black_point": 0,
+    "white_point": 255,
+    "midtone": 1.0
+  }
+}

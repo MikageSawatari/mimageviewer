@@ -29,12 +29,13 @@ impl RawLoadingStatus {
 
 pub(crate) fn draw_settings(ui: &mut egui::Ui, settings: &mut crate::settings::Settings) {
     ui.horizontal(|ui| {
-        ui.label("同時現像数:");
+        let label = ui.label("同時現像数:");
         ui.add(
             egui::DragValue::new(&mut settings.raw_develop_parallelism)
                 .range(1..=10)
                 .suffix(" 枚"),
-        );
+        )
+        .labelled_by(label.id);
     });
     ui.horizontal(|ui| {
         ui.label("明るさ:");

@@ -1,13 +1,19 @@
-#![allow(clippy::needless_range_loop)]
+//! See [`ScrollArea`] for docs.
 
-use std::ops::{Add, AddAssign, BitOr, BitOrAssign};
+#![expect(clippy::needless_range_loop)]
+
+use core::ops::{Add, AddAssign, BitOr, BitOrAssign};
 
 use emath::GuiRounding as _;
+use epaint::{Color32, Direction, Margin, Shape};
 
 use crate::{
-    Context, CursorIcon, Id, NumExt as _, Pos2, Rangef, Rect, Response, Sense, Ui, UiBuilder,
-    UiKind, UiStackInfo, Vec2, Vec2b, emath, epaint, lerp, pass_state, pos2, remap, remap_clamp,
+    AsIdSalt, Context, CursorIcon, Id, IdSalt, MouseWheelSource, NumExt as _, Pos2, Rangef, Rect,
+    Response, Role, Sense, Ui, UiBuilder, UiKind, UiStackInfo, Vec2, Vec2b, WidgetInfo, emath,
+    epaint, lerp, pass_state, pos2, remap, remap_clamp, style::KineticScrollStyle,
 };
+
+use super::scroll_physics::{AxisPhysics, WheelScroll, scroll_bounds};
 
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -20,8 +26,17 @@ struct ScrollingToTarget {
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(default))]
 pub struct State {
-    /// Positive offset means scrolling down/right
-    pub offset: Vec2,
+    /// Positive offset means scrolling down/right.
+    ///
+    /// This can be outside of the valid range while the user is
+    /// rubber-banding past the edge of the content (see [`crate::style::KineticScrollStyle::rubber_band`]).
+    /// See [`Self::clamped_offset`] and [`Self::unclamped_offset`].
+    offset: Vec2,
+
+    /// The largest valid offset, as of last frame: `content_size - viewport_size`.
+    ///
+    /// Can be negative if the content is smaller than the viewport.
+    max_offset: Vec2,
 
     /// If set, quickly but smoothly scroll to this target offset.
     offset_target: [Option<ScrollingToTarget>; 2],
@@ -35,7 +50,9 @@ pub struct State {
     /// Did the user interact (hover or drag) the scroll bars last frame?
     scroll_bar_interaction: Vec2b,
 
-    /// Momentum, used for kinetic scrolling
+    /// Velocity of the offset, used for kinetic scrolling and rubber-banding.
+    ///
+    /// Positive means the offset is increasing, i.e. the content is scrolling down/right.
     #[cfg_attr(feature = "serde", serde(skip))]
     vel: Vec2,
 
@@ -49,12 +66,34 @@ pub struct State {
 
     /// Area that can be dragged. This is the size of the content from the last frame.
     interact_rect: Option<Rect>,
+
+    /// Did we already bounce off the edge during the current momentum scroll?
+    ///
+    /// On macOS, after a quick trackpad swipe the OS keeps sending scroll events
+    /// long after the fingers have left the trackpad, with decaying speed.
+    /// That is how kinetic scrolling works there (see [`crate::MouseWheelSource::Momentum`]).
+    /// When those reach the edge we bounce once, and then ignore the rest of them,
+    /// so they don't keep pushing the content out.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    bounced_this_momentum: Vec2b,
+
+    /// Runtime association only; saved geometry does not restore input authority.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    association: ScrollAssociation,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ScrollAssociation {
+    #[default]
+    Native,
+    ExternalVertical(Id),
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
             offset: Vec2::ZERO,
+            max_offset: Vec2::ZERO,
             offset_target: Default::default(),
             show_scroll: Vec2b::FALSE,
             content_is_too_large: Vec2b::FALSE,
@@ -63,6 +102,8 @@ impl Default for State {
             scroll_start_offset_from_top_left: [None; 2],
             scroll_stuck_to_end: Vec2b::TRUE,
             interact_rect: None,
+            bounced_this_momentum: Vec2b::FALSE,
+            association: ScrollAssociation::Native,
         }
     }
 }
@@ -76,10 +117,55 @@ impl State {
         ctx.data_mut(|d| d.insert_persisted(id, self));
     }
 
-    /// Get the current kinetic scrolling velocity.
+    /// The current kinetic scrolling velocity of the offset, in ui points per second.
+    ///
+    /// Positive means the offset is increasing, i.e. the content is scrolling down/right.
     pub fn velocity(&self) -> Vec2 {
         self.vel
     }
+
+    /// The scroll offset, clamped to the valid range `0..=max_offset`.
+    ///
+    /// Positive means scrolled down/right.
+    ///
+    /// This differs from [`Self::unclamped_offset`] only while the user is rubber-banding
+    /// past the edge of the content.
+    pub fn clamped_offset(&self) -> Vec2 {
+        Vec2::new(
+            scroll_bounds(self.max_offset.x).clamp(self.offset.x),
+            scroll_bounds(self.max_offset.y).clamp(self.offset.y),
+        )
+    }
+
+    /// The scroll offset, which can be outside of the valid range while the user is
+    /// rubber-banding past the edge of the content
+    /// (see [`crate::style::KineticScrollStyle::rubber_band`]).
+    ///
+    /// Positive means scrolled down/right.
+    /// This is where the content is actually drawn.
+    pub fn unclamped_offset(&self) -> Vec2 {
+        self.offset
+    }
+
+    /// How far past the edge of the content we are, in ui points.
+    ///
+    /// Negative means past the start (top/left), positive means past the end (bottom/right).
+    /// Zero when not rubber-banding.
+    pub fn overscroll(&self) -> Vec2 {
+        self.offset - self.clamped_offset()
+    }
+
+    #[deprecated = "Use `clamped_offset()` or `unclamped_offset()`"]
+    pub fn offset(&self) -> Vec2 {
+        self.clamped_offset()
+    }
+}
+
+/// Is `ui` inside another [`ScrollArea`]?
+fn has_scrolling_ancestor(ui: &Ui) -> bool {
+    ui.stack()
+        .iter()
+        .any(|stack| stack.kind() == Some(UiKind::ScrollArea))
 }
 
 pub struct ScrollAreaOutput<R> {
@@ -137,6 +223,51 @@ impl ScrollBarVisibility {
     ];
 }
 
+/// When [`ScrollArea`] should let the user scroll by dragging the content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub enum DragScroll {
+    /// Never scroll on pointer drag.
+    Never,
+
+    /// Only allow drag-to-scroll when a touch screen is detected
+    /// (see [`crate::InputState::has_touch_screen`]). The recommended default.
+    #[default]
+    OnTouch,
+
+    /// Always allow drag-to-scroll, even with a mouse.
+    Always,
+}
+
+impl DragScroll {
+    /// Whether drag-to-scroll is currently active.
+    ///
+    /// Checks if we have a touch screen (via [`crate::InputState::has_touch_screen`])
+    /// when `self` is [`Self::OnTouch`].
+    pub fn enabled(self, ctx: &Context) -> bool {
+        match self {
+            Self::Never => false,
+            Self::OnTouch => ctx.input(|i| i.has_touch_screen()),
+            Self::Always => true,
+        }
+    }
+}
+
+impl BitOr for DragScroll {
+    type Output = Self;
+
+    /// Combine two settings, picking the more permissive one.
+    /// `Always > OnTouch > Never`.
+    #[inline]
+    fn bitor(self, rhs: Self) -> Self::Output {
+        match (self, rhs) {
+            (Self::Always, _) | (_, Self::Always) => Self::Always,
+            (Self::OnTouch, _) | (_, Self::OnTouch) => Self::OnTouch,
+            (Self::Never, Self::Never) => Self::Never,
+        }
+    }
+}
+
 /// What is the source of scrolling for a [`ScrollArea`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -148,7 +279,11 @@ pub struct ScrollSource {
     pub scroll_bar: bool,
 
     /// Scroll the area by dragging the contents.
-    pub drag: bool,
+    ///
+    /// Defaults to [`DragScroll::OnTouch`]: only active when a touch screen is
+    /// detected. Set to [`DragScroll::Always`] to force it on, or
+    /// [`DragScroll::Never`] to disable.
+    pub drag: DragScroll,
 
     /// Scroll the area by scrolling (or shift scrolling) the mouse wheel with
     /// the mouse cursor over the [`ScrollArea`].
@@ -156,35 +291,40 @@ pub struct ScrollSource {
 }
 
 impl Default for ScrollSource {
+    /// `scroll_bar` and `mouse_wheel` enabled; `drag` set to [`DragScroll::OnTouch`].
     fn default() -> Self {
-        Self::ALL
+        Self {
+            scroll_bar: true,
+            drag: DragScroll::OnTouch,
+            mouse_wheel: true,
+        }
     }
 }
 
 impl ScrollSource {
     pub const NONE: Self = Self {
         scroll_bar: false,
-        drag: false,
+        drag: DragScroll::Never,
         mouse_wheel: false,
     };
     pub const ALL: Self = Self {
         scroll_bar: true,
-        drag: true,
+        drag: DragScroll::Always,
         mouse_wheel: true,
     };
     pub const SCROLL_BAR: Self = Self {
         scroll_bar: true,
-        drag: false,
+        drag: DragScroll::Never,
         mouse_wheel: false,
     };
     pub const DRAG: Self = Self {
         scroll_bar: false,
-        drag: true,
+        drag: DragScroll::Always,
         mouse_wheel: false,
     };
     pub const MOUSE_WHEEL: Self = Self {
         scroll_bar: false,
-        drag: false,
+        drag: DragScroll::Never,
         mouse_wheel: true,
     };
 
@@ -197,13 +337,13 @@ impl ScrollSource {
     /// Is anything enabled?
     #[inline]
     pub fn any(&self) -> bool {
-        self.scroll_bar | self.drag | self.mouse_wheel
+        self.scroll_bar || self.drag != DragScroll::Never || self.mouse_wheel
     }
 
     /// Is everything enabled?
     #[inline]
     pub fn is_all(&self) -> bool {
-        self.scroll_bar & self.drag & self.mouse_wheel
+        self.scroll_bar && self.drag == DragScroll::Always && self.mouse_wheel
     }
 }
 
@@ -244,6 +384,33 @@ impl AddAssign for ScrollSource {
     }
 }
 
+/// Meaning of an application-supplied vertical position.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ExternalScrollPosition {
+    /// Synchronize the position while preserving native drag, coast and animation.
+    Sync(f32),
+    /// Set the position and terminate previous vertical velocity and animation.
+    Set(f32),
+    /// An application gesture owns vertical motion, including fractional positions.
+    AppGesture(f32),
+}
+
+/// Current geometry and position supplied by an application-owned vertical list.
+///
+/// The height must equal the measured content height, including content margins.
+/// This opt-in contract does not change ordinary [`ScrollArea`] behavior.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExternalVerticalScroll {
+    /// Full content height, including margins, in logical points.
+    pub content_height: f32,
+    /// The position and its priority over previously accumulated native motion.
+    pub position: ExternalScrollPosition,
+    /// Logical input lifetime, distinct from the geometry State identity.
+    pub interaction_session: Id,
+    /// Stable transport for this viewport's vertical list across logical owners.
+    pub interaction_id: Id,
+}
+
 /// Add vertical and/or horizontal scrolling to a contained [`Ui`].
 ///
 /// By default, scroll bars only show up when needed, i.e. when the contents
@@ -258,7 +425,7 @@ impl AddAssign for ScrollSource {
 /// ### Coordinate system
 /// * content: size of contents (generally large; that's why we want scroll bars)
 /// * outer: size of scroll area including scroll bar(s)
-/// * inner: excluding scroll bar(s). The area we clip the contents to.
+/// * inner: excluding scroll bar(s). The area we clip the contents to. Includes `content_margin`.
 ///
 /// If the floating scroll bars settings is turned on then `inner == outer`.
 ///
@@ -286,13 +453,16 @@ pub struct ScrollArea {
     min_scrolled_size: Vec2,
     scroll_bar_visibility: ScrollBarVisibility,
     scroll_bar_rect: Option<Rect>,
-    id_salt: Option<Id>,
+    id_salt: Option<IdSalt>,
     offset_x: Option<f32>,
     offset_y: Option<f32>,
+    external_vertical_scroll: Option<ExternalVerticalScroll>,
     on_hover_cursor: Option<CursorIcon>,
     on_drag_cursor: Option<CursorIcon>,
     scroll_source: ScrollSource,
     wheel_scroll_multiplier: Vec2,
+
+    content_margin: Option<Margin>,
 
     /// If true for vertical or horizontal the scroll wheel will stick to the
     /// end position until user manually changes position. It will become true
@@ -342,10 +512,12 @@ impl ScrollArea {
             id_salt: None,
             offset_x: None,
             offset_y: None,
+            external_vertical_scroll: None,
             on_hover_cursor: None,
             on_drag_cursor: None,
             scroll_source: ScrollSource::default(),
             wheel_scroll_multiplier: Vec2::splat(1.0),
+            content_margin: None,
             stick_to_end: Vec2b::FALSE,
             animated: true,
         }
@@ -416,17 +588,10 @@ impl ScrollArea {
         self
     }
 
-    /// A source for the unique [`Id`], e.g. `.id_source("second_scroll_area")` or `.id_source(loop_index)`.
-    #[inline]
-    #[deprecated = "Renamed id_salt"]
-    pub fn id_source(self, id_salt: impl std::hash::Hash) -> Self {
-        self.id_salt(id_salt)
-    }
-
     /// A source for the unique [`Id`], e.g. `.id_salt("second_scroll_area")` or `.id_salt(loop_index)`.
     #[inline]
-    pub fn id_salt(mut self, id_salt: impl std::hash::Hash) -> Self {
-        self.id_salt = Some(Id::new(id_salt));
+    pub fn id_salt(mut self, id_salt: impl AsIdSalt) -> Self {
+        self.id_salt = Some(IdSalt::new(id_salt));
         self
     }
 
@@ -453,6 +618,17 @@ impl ScrollArea {
     #[inline]
     pub fn vertical_scroll_offset(mut self, offset: f32) -> Self {
         self.offset_y = Some(offset);
+        self
+    }
+
+    /// Supply the current height and application-owned position of a vertical list.
+    ///
+    /// Use a vertical-only area with `auto_shrink([false, false])`. The caller must
+    /// use the same minimum viewport height and margins in its geometry calculation.
+    /// Explicit application clamp/snap corrections must use [`ExternalScrollPosition::Set`],
+    /// even when the corrected position is already inside the current bounds.
+    pub fn external_vertical_scroll(mut self, scroll: ExternalVerticalScroll) -> Self {
+        self.external_vertical_scroll = Some(scroll);
         self
     }
 
@@ -523,32 +699,6 @@ impl ScrollArea {
     /// This can be used, for example, to optionally freeze scrolling while the user
     /// is typing text in a [`crate::TextEdit`] widget contained within the scroll area.
     ///
-    /// This controls both scrolling directions.
-    #[deprecated = "Use `ScrollArea::scroll_source()"]
-    #[inline]
-    pub fn enable_scrolling(mut self, enable: bool) -> Self {
-        self.scroll_source = if enable {
-            ScrollSource::ALL
-        } else {
-            ScrollSource::NONE
-        };
-        self
-    }
-
-    /// Can the user drag the scroll area to scroll?
-    ///
-    /// This is useful for touch screens.
-    ///
-    /// If `true`, the [`ScrollArea`] will sense drags.
-    ///
-    /// Default: `true`.
-    #[deprecated = "Use `ScrollArea::scroll_source()"]
-    #[inline]
-    pub fn drag_to_scroll(mut self, drag_to_scroll: bool) -> Self {
-        self.scroll_source.drag = drag_to_scroll;
-        self
-    }
-
     /// What sources does the [`ScrollArea`] use for scrolling the contents.
     #[inline]
     pub fn scroll_source(mut self, scroll_source: ScrollSource) -> Self {
@@ -593,6 +743,18 @@ impl ScrollArea {
         self.direction_enabled[0] || self.direction_enabled[1]
     }
 
+    /// Extra margin added around the contents.
+    ///
+    /// The scroll bars will be either on top of this margin, or outside of it,
+    /// depending on the value of [`crate::style::ScrollStyle::floating`].
+    ///
+    /// Default: [`crate::style::ScrollStyle::content_margin`].
+    #[inline]
+    pub fn content_margin(mut self, margin: impl Into<Margin>) -> Self {
+        self.content_margin = Some(margin.into());
+        self
+    }
+
     /// The scroll handle will stick to the rightmost position even while the content size
     /// changes dynamically. This can be useful to simulate text scrollers coming in from right
     /// hand side. The scroll handle remains stuck until user manually changes position. Once "unstuck"
@@ -616,6 +778,382 @@ impl ScrollArea {
         self.stick_to_end[1] = stick;
         self
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExternalPressStamp {
+    frame: u64,
+    ordinal: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalCaptureRole {
+    Background,
+    VerticalBar,
+}
+
+/// The existing processed-frame stamp belongs to the displayed owner, which
+/// can differ from a held press's original owner after a list switch.
+#[derive(Clone, Copy, Debug)]
+struct ExternalProcessedFrame {
+    number: u64,
+    session: Id,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ExternalCapturePhase {
+    Held {
+        position: Pos2,
+        frame: ExternalProcessedFrame,
+    },
+    Released {
+        frame: ExternalProcessedFrame,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ExternalScrollCapture {
+    Idle {
+        frame: Option<ExternalProcessedFrame>,
+    },
+    Sequence {
+        press_stamp: ExternalPressStamp,
+        session: Id,
+        role: ExternalCaptureRole,
+        button: crate::PointerButton,
+        phase: ExternalCapturePhase,
+    },
+}
+
+impl Default for ExternalScrollCapture {
+    fn default() -> Self {
+        Self::Idle { frame: None }
+    }
+}
+
+impl ExternalScrollCapture {
+    fn processed_frame(self) -> Option<ExternalProcessedFrame> {
+        match self {
+            Self::Idle { frame } => frame,
+            Self::Sequence { phase, .. } => Some(match phase {
+                ExternalCapturePhase::Held { frame, .. }
+                | ExternalCapturePhase::Released { frame } => frame,
+            }),
+        }
+    }
+
+    fn frame(self) -> Option<u64> {
+        self.processed_frame().map(|frame| frame.number)
+    }
+
+    fn processed_for(self, frame: u64, session: Id) -> bool {
+        self.processed_frame()
+            .is_some_and(|processed| processed.number == frame && processed.session == session)
+    }
+
+    fn contains_stamp(self, candidate: ExternalPressStamp) -> bool {
+        matches!(self, Self::Sequence { press_stamp, .. }
+            if press_stamp.frame == candidate.frame && candidate.ordinal <= press_stamp.ordinal)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExternalPress {
+    stamp: ExternalPressStamp,
+    position: Pos2,
+    button: crate::PointerButton,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ExternalCaptureInput {
+    background_delta: Option<Vec2>,
+    background_released: bool,
+    // The stamp identifies whether this is an earlier owner's release or the
+    // final held interval, relative to a completed short click in the batch.
+    bar_position: Option<ExternalPress>,
+    new_press: Option<(ExternalCaptureRole, ExternalPress)>,
+    short_press: Option<ExternalPress>,
+    replay: bool,
+}
+
+fn external_capture_id(transport: Id) -> Id {
+    transport.with("external_scroll_capture")
+}
+
+fn external_press_in_rect(ui: &Ui, rect: Rect, position: Pos2) -> bool {
+    // Match egui's near-widget hit radius as well as its clipped interaction
+    // rectangle. Final Memory holding remains mandatory; proximity alone
+    // never authorizes a press belonging to another widget.
+    rect.intersect(ui.clip_rect()).distance_to_pos(position)
+        <= ui.style().interaction.interact_radius
+}
+
+/// Observe each viewport input once. Final egui holding proves only the last
+/// unfinished press; completed intervals are never assigned from that evidence.
+fn external_capture_input(
+    ui: &Ui,
+    external: ExternalVerticalScroll,
+    background_rect: Rect,
+    background_enabled: bool,
+) -> ExternalCaptureInput {
+    use crate::PointerButton::{Extra1, Extra2, Middle, Primary, Secondary};
+    use crate::input_state::PointerEvent;
+
+    let ctx = ui.ctx();
+    let frame = ctx.cumulative_frame_nr();
+    let processed_frame = ExternalProcessedFrame {
+        number: frame,
+        session: external.interaction_session,
+    };
+    let capture_id = external_capture_id(external.interaction_id);
+    let mut capture = ctx
+        .data(|data| data.get_temp::<ExternalScrollCapture>(capture_id))
+        .unwrap_or_default();
+    if capture.frame() == Some(frame) {
+        return ExternalCaptureInput {
+            replay: true,
+            ..Default::default()
+        };
+    }
+    let (events, mut down) = ctx.input(|input| {
+        (
+            input.pointer.pointer_events.clone(),
+            [Primary, Secondary, Middle, Extra1, Extra2]
+                .map(|button| input.pointer.button_down(button)),
+        )
+    });
+    // Recover button levels at the beginning of the ordered batch. An
+    // additional button while another is down cannot acquire a new lifetime.
+    for event in events.iter().rev() {
+        match event {
+            PointerEvent::Pressed { button, .. } => down[*button as usize] = false,
+            PointerEvent::Released { button, .. } => down[*button as usize] = true,
+            PointerEvent::Moved(_) => {}
+        }
+    }
+    if let ExternalScrollCapture::Sequence {
+        button,
+        phase: ExternalCapturePhase::Held { .. },
+        ..
+    } = capture
+    {
+        down[button as usize] = true;
+    }
+    let initial_down = down;
+    let mut ordinal = 0;
+    let mut tail = None;
+    let mut short_press = None;
+    for event in &events {
+        match *event {
+            PointerEvent::Pressed { position, button } => {
+                if !down.iter().any(|down| *down) {
+                    tail = Some(ExternalPress {
+                        stamp: ExternalPressStamp { frame, ordinal },
+                        position,
+                        button,
+                    });
+                }
+                down[button as usize] = true;
+                ordinal += 1;
+            }
+            PointerEvent::Released { button, .. } => {
+                if tail.is_some_and(|press| press.button == button) {
+                    short_press = tail.take();
+                }
+                down[button as usize] = false;
+            }
+            PointerEvent::Moved(_) => {}
+        }
+    }
+    let holding = ctx.memory(|memory| {
+        let interaction = memory.interaction();
+        let bar = external.interaction_id.with(1_usize);
+        if interaction.potential_click_id == Some(bar) || interaction.potential_drag_id == Some(bar)
+        {
+            Some(ExternalCaptureRole::VerticalBar)
+        } else if interaction.potential_drag_id == Some(external.interaction_id.with("area")) {
+            Some(ExternalCaptureRole::Background)
+        } else {
+            None
+        }
+    });
+    let mut result = ExternalCaptureInput {
+        short_press,
+        ..Default::default()
+    };
+    down = initial_down;
+    ordinal = 0;
+    for event in &events {
+        match *event {
+            PointerEvent::Pressed { position, button } => {
+                if tail.is_some_and(|press| press.stamp.ordinal == ordinal)
+                    && !capture.contains_stamp(tail.unwrap().stamp)
+                    && let Some(role) = holding
+                    && ui.is_enabled()
+                    && (role == ExternalCaptureRole::VerticalBar
+                        || (background_enabled
+                            && external_press_in_rect(ui, background_rect, position)))
+                {
+                    let press = tail.unwrap();
+                    capture = ExternalScrollCapture::Sequence {
+                        press_stamp: press.stamp,
+                        session: external.interaction_session,
+                        role,
+                        button,
+                        phase: ExternalCapturePhase::Held {
+                            position,
+                            frame: processed_frame,
+                        },
+                    };
+                    result.new_press = Some((role, press));
+                    // A new sequence cannot inherit the old release velocity.
+                    result.background_released = false;
+                    result.bar_position = None;
+                    result.background_delta =
+                        (role == ExternalCaptureRole::Background).then_some(Vec2::ZERO);
+                }
+                down[button as usize] = true;
+                ordinal += 1;
+            }
+            PointerEvent::Moved(position) => {
+                if let ExternalScrollCapture::Sequence {
+                    session,
+                    role,
+                    button,
+                    phase:
+                        ExternalCapturePhase::Held {
+                            position: previous, ..
+                        },
+                    ..
+                } = &mut capture
+                {
+                    if down[*button as usize]
+                        && *session == external.interaction_session
+                        && *role == ExternalCaptureRole::Background
+                    {
+                        *result.background_delta.get_or_insert(Vec2::ZERO) += position - *previous;
+                    }
+                    *previous = position;
+                }
+            }
+            PointerEvent::Released { button, .. } => {
+                if let ExternalScrollCapture::Sequence {
+                    press_stamp,
+                    session,
+                    role,
+                    button: owner_button,
+                    phase,
+                    ..
+                } = &mut capture
+                    && *owner_button == button
+                    && matches!(phase, ExternalCapturePhase::Held { .. })
+                {
+                    result.background_released = *session == external.interaction_session
+                        && *role == ExternalCaptureRole::Background;
+                    if *session == external.interaction_session
+                        && *role == ExternalCaptureRole::VerticalBar
+                        && let ExternalCapturePhase::Held { position, .. } = *phase
+                    {
+                        result.bar_position = Some(ExternalPress {
+                            stamp: *press_stamp,
+                            position,
+                            button,
+                        });
+                    }
+                    result.background_delta = None;
+                    *phase = ExternalCapturePhase::Released {
+                        frame: processed_frame,
+                    };
+                }
+                down[button as usize] = false;
+            }
+        }
+    }
+    if let ExternalScrollCapture::Sequence { role, phase, .. } = &mut capture
+        && matches!(phase, ExternalCapturePhase::Held { .. })
+        && holding != Some(*role)
+    {
+        // Escape, pointer loss, or another egui capture ends this sequence's
+        // authority. A later move cannot revive a still-held old press.
+        *phase = ExternalCapturePhase::Released {
+            frame: processed_frame,
+        };
+        result.background_delta = None;
+        result.background_released = false;
+        result.bar_position = None;
+    }
+    match &mut capture {
+        ExternalScrollCapture::Idle { frame: processed } => *processed = Some(processed_frame),
+        ExternalScrollCapture::Sequence {
+            press_stamp,
+            session,
+            role,
+            button,
+            phase,
+            ..
+        } => match phase {
+            ExternalCapturePhase::Held {
+                position,
+                frame: processed,
+            } => {
+                *processed = processed_frame;
+                if down[*button as usize] && *session == external.interaction_session {
+                    if *role == ExternalCaptureRole::Background {
+                        result.background_delta.get_or_insert(Vec2::ZERO);
+                    } else {
+                        result.bar_position = Some(ExternalPress {
+                            stamp: *press_stamp,
+                            position: *position,
+                            button: *button,
+                        });
+                    }
+                }
+            }
+            ExternalCapturePhase::Released { frame: processed } => *processed = processed_frame,
+        },
+    }
+    if !background_enabled {
+        result.background_delta = None;
+        result.background_released = false;
+    }
+    ctx.data_mut(|data| data.insert_temp(capture_id, capture));
+    result
+}
+
+fn finish_external_bar_press(
+    ctx: &Context,
+    external: ExternalVerticalScroll,
+    press: ExternalPress,
+) {
+    let frame = ctx.cumulative_frame_nr();
+    let processed_frame = ExternalProcessedFrame {
+        number: frame,
+        session: external.interaction_session,
+    };
+    ctx.data_mut(|data| {
+        // A completed interval can precede the final held press in this same
+        // batch. Publishing its terminal phase must not replace that owner.
+        if let Some(ExternalScrollCapture::Sequence { press_stamp, .. }) =
+            data.get_temp(external_capture_id(external.interaction_id))
+            && (press_stamp.frame > press.stamp.frame
+                || (press_stamp.frame == press.stamp.frame
+                    && press_stamp.ordinal > press.stamp.ordinal))
+        {
+            return;
+        }
+        data.insert_temp(
+            external_capture_id(external.interaction_id),
+            ExternalScrollCapture::Sequence {
+                press_stamp: press.stamp,
+                session: external.interaction_session,
+                role: ExternalCaptureRole::VerticalBar,
+                button: press.button,
+                phase: ExternalCapturePhase::Released {
+                    frame: processed_frame,
+                },
+            },
+        );
+    });
 }
 
 struct Prepared {
@@ -644,7 +1182,7 @@ struct Prepared {
     scroll_bar_visibility: ScrollBarVisibility,
     scroll_bar_rect: Option<Rect>,
 
-    /// Where on the screen the content is (excludes scroll bars).
+    /// Where on the screen the content is (excludes scroll bars; includes `content_margin`).
     inner_rect: Rect,
 
     content_ui: Ui,
@@ -665,6 +1203,48 @@ struct Prepared {
     background_drag_response: Option<Response>,
 
     animated: bool,
+
+    /// Along which axes the offset is deliberately outside the valid range this frame
+    /// (rubber-banding), and so should not be clamped.
+    rubber_banding: Vec2b,
+
+    /// Is there an enclosing [`ScrollArea`]?
+    has_scrolling_ancestor: bool,
+
+    /// Per axis. Y bounds are current for externally controlled vertical lists.
+    axis_physics: [AxisPhysics; 2],
+
+    external_vertical_scroll: Option<ExternalVerticalScroll>,
+    external_capture_input: ExternalCaptureInput,
+}
+
+fn scroll_content_ui(
+    ui: &mut Ui,
+    inner_rect: Rect,
+    offset: Vec2,
+    current_bar_use: Vec2,
+    direction_enabled: Vec2b,
+) -> Ui {
+    // Try to fit the content within the viewport before enabling scrolling.
+    let content_max_rect = Rect::from_min_size(inner_rect.min - offset, inner_rect.size())
+        .round_to_pixels(ui.pixels_per_point())
+        .round_ui();
+    let mut content_ui = ui.new_child(
+        UiBuilder::new()
+            .ui_stack_info(UiStackInfo::new(UiKind::ScrollArea))
+            .max_rect(content_max_rect),
+    );
+    let mut content_clip_rect = ui.clip_rect();
+    for d in 0..2 {
+        if direction_enabled[d] {
+            content_clip_rect.min[d] = inner_rect.min[d];
+            content_clip_rect.max[d] = inner_rect.max[d];
+        } else {
+            content_clip_rect.max[d] = ui.clip_rect().max[d] - current_bar_use[d];
+        }
+    }
+    content_ui.set_clip_rect(content_clip_rect.intersect(ui.clip_rect()));
+    content_ui
 }
 
 impl ScrollArea {
@@ -679,17 +1259,19 @@ impl ScrollArea {
             id_salt,
             offset_x,
             offset_y,
+            external_vertical_scroll,
             on_hover_cursor,
             on_drag_cursor,
             scroll_source,
             wheel_scroll_multiplier,
+            content_margin: _, // Used elsewhere
             stick_to_end,
             animated,
         } = self;
 
         let ctx = ui.ctx().clone();
 
-        let id_salt = id_salt.unwrap_or_else(|| Id::new("scroll_area"));
+        let id_salt = id_salt.unwrap_or_else(|| IdSalt::new("scroll_area"));
         let id = ui.make_persistent_id(id_salt);
         ctx.check_for_id_clash(
             id,
@@ -697,6 +1279,18 @@ impl ScrollArea {
             "ScrollArea",
         );
         let mut state = State::load(&ctx, id).unwrap_or_default();
+
+        let association = external_vertical_scroll.map_or(ScrollAssociation::Native, |external| {
+            ScrollAssociation::ExternalVertical(external.interaction_session)
+        });
+        let association_changed = state.association != association;
+        if association_changed {
+            state.vel.y = 0.0;
+            state.offset_target[1] = None;
+            state.scroll_start_offset_from_top_left[1] = None;
+            state.bounced_this_momentum.y = false;
+            state.association = association;
+        }
 
         state.offset.x = offset_x.unwrap_or(state.offset.x);
         state.offset.y = offset_y.unwrap_or(state.offset.y);
@@ -712,7 +1306,12 @@ impl ScrollArea {
             ctx.animate_bool_responsive(id.with("v"), show_bars[1]),
         );
 
-        let current_bar_use = show_bars_factor.yx() * ui.spacing().scroll.allocated_width();
+        let scroll_style = ui.spacing().scroll;
+        let current_bar_use = if scroll_style.floating {
+            show_bars.to_vec2().yx() * scroll_style.allocated_width()
+        } else {
+            show_bars_factor.yx() * scroll_style.allocated_width()
+        };
 
         let available_outer = ui.available_rect_before_wrap();
 
@@ -735,124 +1334,204 @@ impl ScrollArea {
 
         let inner_rect = Rect::from_min_size(available_outer.min, inner_size);
 
-        let mut content_max_size = inner_size;
-
-        if true {
-            // Tell the inner Ui to *try* to fit the content without needing to scroll,
-            // i.e. better to wrap text and shrink images than showing a horizontal scrollbar!
-        } else {
-            // Tell the inner Ui to use as much space as possible, we can scroll to see it!
-            for d in 0..2 {
-                if direction_enabled[d] {
-                    content_max_size[d] = f32::INFINITY;
+        if let Some(external) = external_vertical_scroll {
+            debug_assert!(direction_enabled == Vec2b::new(false, true));
+            debug_assert!(!auto_shrink.y);
+            debug_assert!(external.content_height.is_finite() && external.content_height >= 0.0);
+            let previous_max_offset = state.max_offset.y;
+            state.max_offset.y = external.content_height - inner_size.y;
+            state.content_is_too_large.y = inner_size.y.ceil() < external.content_height;
+            let (position, end_previous_motion) = match external.position {
+                ExternalScrollPosition::Sync(position) => (position, false),
+                ExternalScrollPosition::Set(position)
+                | ExternalScrollPosition::AppGesture(position) => (position, true),
+            };
+            debug_assert!(position.is_finite());
+            // App readback intentionally ignores sub-row native movement. On
+            // a same-owner retry Sync must retain the first pass's result;
+            // injecting that older canonical value would erase valid motion
+            // before the capture owner skips the already-processed input.
+            let sync_replay = !end_previous_motion
+                && !association_changed
+                && ctx
+                    .data(|data| {
+                        data.get_temp::<ExternalScrollCapture>(external_capture_id(
+                            external.interaction_id,
+                        ))
+                    })
+                    .is_some_and(|capture| {
+                        capture
+                            .processed_for(ctx.cumulative_frame_nr(), external.interaction_session)
+                    });
+            let position = if sync_replay {
+                // Retain legitimate first-pass rubber-band displacement too.
+                // Only a changed extent may clamp that native result here.
+                (previous_max_offset != state.max_offset.y).then_some(state.offset.y)
+            } else {
+                Some(position)
+            };
+            if let Some(position) = position {
+                state.offset.y = scroll_bounds(state.max_offset.y).clamp(position);
+                if end_previous_motion || state.offset.y != position {
+                    state.vel.y = 0.0;
+                    state.offset_target[1] = None;
                 }
             }
         }
+        let app_gesture = external_vertical_scroll.is_some_and(|external| {
+            matches!(external.position, ExternalScrollPosition::AppGesture(_))
+        });
 
-        let content_max_rect = Rect::from_min_size(inner_rect.min - state.offset, content_max_size);
+        // The native path keeps its original pre-physics content placement. Only
+        // the opt-in path constructs content from the position after physics.
+        let native_content = external_vertical_scroll.is_none().then(|| {
+            (
+                scroll_content_ui(
+                    ui,
+                    inner_rect,
+                    state.offset,
+                    current_bar_use,
+                    direction_enabled,
+                ),
+                Rect::from_min_size(Pos2::ZERO + state.offset, inner_size),
+            )
+        });
 
-        // Round to pixels to avoid widgets appearing to "float" when scrolling fractional amounts:
-        let content_max_rect = content_max_rect
-            .round_to_pixels(ui.pixels_per_point())
-            .round_ui();
+        // Is there an enclosing scroll area? If so, we let the scroll wheel chain to it
+        // when we're at the edge.
+        let has_scrolling_ancestor = has_scrolling_ancestor(ui);
 
-        let mut content_ui = ui.new_child(
-            UiBuilder::new()
-                .ui_stack_info(UiStackInfo::new(UiKind::ScrollArea))
-                .max_rect(content_max_rect),
-        );
-
-        {
-            // Clip the content, but only when we really need to:
-            let clip_rect_margin = ui.visuals().clip_rect_margin;
-            let mut content_clip_rect = ui.clip_rect();
-            for d in 0..2 {
-                if direction_enabled[d] {
-                    content_clip_rect.min[d] = inner_rect.min[d] - clip_rect_margin;
-                    content_clip_rect.max[d] = inner_rect.max[d] + clip_rect_margin;
-                } else {
-                    // Nice handling of forced resizing beyond the possible:
-                    content_clip_rect.max[d] = ui.clip_rect().max[d] - current_bar_use[d];
-                }
-            }
-            // Make sure we didn't accidentally expand the clip rect
-            content_clip_rect = content_clip_rect.intersect(ui.clip_rect());
-            content_ui.set_clip_rect(content_clip_rect);
-        }
-
-        let viewport = Rect::from_min_size(Pos2::ZERO + state.offset, inner_size);
         let dt = ui.input(|i| i.stable_dt).at_most(0.1);
 
-        let background_drag_response =
-            if scroll_source.drag && ui.is_enabled() && state.content_is_too_large.any() {
-                // Drag contents to scroll (for touch screens mostly).
-                // We must do this BEFORE adding content to the `ScrollArea`,
-                // or we will steal input from the widgets we contain.
-                let content_response_option = state
-                    .interact_rect
-                    .map(|rect| ui.interact(rect, id.with("area"), Sense::drag()));
+        let kinetic_style = ui.spacing().scroll.kinetic;
+        let mut rubber_banding = Vec2b::FALSE;
 
-                if content_response_option
-                    .as_ref()
-                    .is_some_and(|response| response.dragged())
+        let axis_physics: [AxisPhysics; 2] = core::array::from_fn(|d| AxisPhysics {
+            bounds: scroll_bounds(state.max_offset[d]),
+            viewport_extent: inner_size[d],
+            style: KineticScrollStyle {
+                // Only rubber-band along axes that actually have something to scroll:
+                rubber_band: kinetic_style.rubber_band
+                    && direction_enabled[d]
+                    && state.content_is_too_large[d],
+                ..kinetic_style
+            },
+        });
+
+        let background_drag_response = if scroll_source.drag.enabled(ui.ctx())
+            && ui.is_enabled()
+            && state.content_is_too_large.any()
+        {
+            // Drag contents to scroll (for touch screens mostly).
+            // We must do this BEFORE adding content to the `ScrollArea`,
+            // or we will steal input from the widgets we contain.
+            let content_response_option = external_vertical_scroll
+                .map_or(state.interact_rect, |_| Some(inner_rect))
+                .map(|rect| {
+                    ui.interact(
+                        rect,
+                        external_vertical_scroll
+                            .map_or(id, |external| external.interaction_id)
+                            .with("area"),
+                        Sense::DRAG,
+                    )
+                });
+
+            // Set the desired mouse cursors.
+            if let Some(response) = &content_response_option {
+                if response.dragged()
+                    && let Some(cursor) = on_drag_cursor
                 {
-                    for d in 0..2 {
-                        if direction_enabled[d] {
-                            ui.input(|input| {
-                                state.offset[d] -= input.pointer.delta()[d];
-                            });
-                            state.scroll_stuck_to_end[d] = false;
-                            state.offset_target[d] = None;
-                        }
-                    }
-                } else {
-                    // Apply the cursor velocity to the scroll area when the user releases the drag.
-                    if content_response_option
-                        .as_ref()
-                        .is_some_and(|response| response.drag_stopped())
-                    {
-                        state.vel = direction_enabled.to_vec2()
-                            * ui.input(|input| input.pointer.velocity());
-                    }
-                    for d in 0..2 {
-                        // Kinetic scrolling
-                        let stop_speed = 20.0; // Pixels per second.
-                        let friction_coeff = 1000.0; // Pixels per second squared.
-
-                        let friction = friction_coeff * dt;
-                        if friction > state.vel[d].abs() || state.vel[d].abs() < stop_speed {
-                            state.vel[d] = 0.0;
-                        } else {
-                            state.vel[d] -= friction * state.vel[d].signum();
-                            // Offset has an inverted coordinate system compared to
-                            // the velocity, so we subtract it instead of adding it
-                            state.offset[d] -= state.vel[d] * dt;
-                            ctx.request_repaint();
-                        }
-                    }
+                    ui.set_cursor_icon(cursor);
+                } else if response.hovered()
+                    && let Some(cursor) = on_hover_cursor
+                {
+                    ui.set_cursor_icon(cursor);
                 }
+            }
 
-                // Set the desired mouse cursors.
-                if let Some(response) = &content_response_option {
-                    if response.dragged()
-                        && let Some(cursor) = on_drag_cursor
-                    {
-                        ui.ctx().set_cursor_icon(cursor);
-                    } else if response.hovered()
-                        && let Some(cursor) = on_hover_cursor
-                    {
-                        ui.ctx().set_cursor_icon(cursor);
-                    }
+            content_response_option
+        } else {
+            None
+        };
+
+        let external_capture_input =
+            external_vertical_scroll.map_or_else(ExternalCaptureInput::default, |external| {
+                external_capture_input(ui, external, inner_rect, background_drag_response.is_some())
+            });
+        let skip_native_y = app_gesture || external_capture_input.replay;
+        if skip_native_y {
+            // No second physics step is needed, but end must still preserve a
+            // legitimate first-pass rubber-band result instead of clamping it.
+            rubber_banding.y = axis_physics[1].is_rubber_banding(state.offset.y);
+        }
+        if external_capture_input.new_press.is_some() {
+            state.vel.y = 0.0;
+            state.offset_target[1] = None;
+            state.scroll_start_offset_from_top_left[1] = None;
+        }
+
+        let background_delta = if external_vertical_scroll.is_some() {
+            external_capture_input.background_delta
+        } else {
+            background_drag_response
+                .as_ref()
+                .filter(|response| response.dragged())
+                .map(|_| ui.input(|input| input.pointer.delta()))
+        };
+        if let Some(pointer_delta) = background_delta {
+            for d in 0..2 {
+                if direction_enabled[d] && !(skip_native_y && d == 1) {
+                    let physics = &axis_physics[d];
+                    // Offset has an inverted coordinate system compared to the pointer:
+                    state.offset[d] = physics.drag(state.offset[d], -pointer_delta[d]);
+                    rubber_banding[d] = physics.is_rubber_banding(state.offset[d]);
+                    state.scroll_stuck_to_end[d] = false;
+                    state.offset_target[d] = None;
                 }
-
-                content_response_option
+            }
+        } else {
+            // Apply the cursor velocity to the scroll area when the user releases the drag.
+            if if external_vertical_scroll.is_some() {
+                external_capture_input.background_released
             } else {
-                None
-            };
+                background_drag_response
+                    .as_ref()
+                    .is_some_and(|response| response.drag_stopped())
+            } {
+                // Offset has an inverted coordinate system compared to the pointer:
+                state.vel =
+                    -(direction_enabled.to_vec2() * ui.input(|input| input.pointer.velocity()));
+                if skip_native_y {
+                    state.vel.y = 0.0;
+                }
+            }
+
+            // While the fingers are still on the trackpad,
+            // hold the overscroll instead of springing back, like macOS does.
+            // The wheel events are applied in `end`.
+            let fingers_on_trackpad =
+                ui.input(|i| i.scroll_source()) == Some(MouseWheelSource::Trackpad);
+            let hold_overscroll = fingers_on_trackpad && ui.rect_contains_pointer(inner_rect);
+
+            for d in 0..2 {
+                if skip_native_y && d == 1 {
+                    continue;
+                }
+                let physics = &axis_physics[d];
+                if physics.step(&mut state.offset[d], &mut state.vel[d], dt, hold_overscroll) {
+                    ctx.request_repaint();
+                }
+                rubber_banding[d] = physics.is_rubber_banding(state.offset[d]);
+            }
+        }
 
         // Scroll with an animation if we have a target offset (that hasn't been cleared by the code
         // above).
         for d in 0..2 {
+            if skip_native_y && d == 1 {
+                continue;
+            }
             if let Some(scroll_target) = state.offset_target[d] {
                 state.vel[d] = 0.0;
 
@@ -881,9 +1560,33 @@ impl ScrollArea {
             }
         }
 
+        if external_vertical_scroll.is_some() && !rubber_banding.y {
+            // AxisPhysics leaves non-rubber edge correction to its caller.
+            // The opt-in contract places content now, so finalize that result
+            // before deriving either the viewport or the content origin.
+            let unbounded_offset = state.offset.y;
+            state.offset.y = axis_physics[1].clamp(unbounded_offset);
+            if state.offset.y != unbounded_offset {
+                state.vel.y = 0.0;
+            }
+        }
+
+        let (content_ui, viewport) = native_content.unwrap_or_else(|| {
+            (
+                scroll_content_ui(
+                    ui,
+                    inner_rect,
+                    state.offset,
+                    current_bar_use,
+                    direction_enabled,
+                ),
+                Rect::from_min_size(Pos2::ZERO + state.offset, inner_size),
+            )
+        });
+
         let saved_scroll_target = content_ui
             .ctx()
-            .pass_state_mut(|state| std::mem::take(&mut state.scroll_target));
+            .pass_state_mut(|state| core::mem::take(&mut state.scroll_target));
 
         Prepared {
             id,
@@ -903,6 +1606,11 @@ impl ScrollArea {
             saved_scroll_target,
             background_drag_response,
             animated,
+            rubber_banding,
+            has_scrolling_ancestor,
+            axis_physics,
+            external_vertical_scroll,
+            external_capture_input,
         }
     }
 
@@ -938,7 +1646,7 @@ impl ScrollArea {
         ui: &mut Ui,
         row_height_sans_spacing: f32,
         total_rows: usize,
-        add_contents: impl FnOnce(&mut Ui, std::ops::Range<usize>) -> R,
+        add_contents: impl FnOnce(&mut Ui, core::ops::Range<usize>) -> R,
     ) -> ScrollAreaOutput<R> {
         let spacing = ui.spacing().item_spacing;
         let row_height_with_spacing = row_height_sans_spacing + spacing.y;
@@ -983,10 +1691,21 @@ impl ScrollArea {
         ui: &mut Ui,
         add_contents: Box<dyn FnOnce(&mut Ui, Rect) -> R + 'c>,
     ) -> ScrollAreaOutput<R> {
+        let margin = self
+            .content_margin
+            .unwrap_or_else(|| ui.spacing().scroll.content_margin);
+
         let mut prepared = self.begin(ui);
         let id = prepared.id;
         let inner_rect = prepared.inner_rect;
-        let inner = add_contents(&mut prepared.content_ui, prepared.viewport);
+
+        let inner = crate::Frame::NONE
+            .inner_margin(margin)
+            .show(&mut prepared.content_ui, |ui| {
+                add_contents(ui, prepared.viewport)
+            })
+            .inner;
+
         let (content_size, state) = prepared.end(ui);
         ScrollAreaOutput {
             inner,
@@ -1019,19 +1738,39 @@ impl Prepared {
             saved_scroll_target,
             background_drag_response,
             animated,
+            mut rubber_banding,
+            has_scrolling_ancestor,
+            axis_physics,
+            external_vertical_scroll,
+            external_capture_input,
         } = self;
 
         let content_size = content_ui.min_size();
+        if let Some(external) = external_vertical_scroll {
+            // Content placement is pixel-rounded; tolerate only arithmetic
+            // noise in the measured extent, not an omitted margin or row.
+            debug_assert!(
+                (content_size.y - external.content_height).abs()
+                    <= 0.01_f32.max(external.content_height.abs() * f32::EPSILON * 4.0),
+                "external vertical content height differs: declared={}, measured={}",
+                external.content_height,
+                content_size.y,
+            );
+        }
+        let app_gesture = external_vertical_scroll.is_some_and(|external| {
+            matches!(external.position, ExternalScrollPosition::AppGesture(_))
+        });
 
-        let scroll_delta = content_ui
-            .ctx()
-            .pass_state_mut(|state| std::mem::take(&mut state.scroll_delta));
+        let skip_native_y = app_gesture || external_capture_input.replay;
+
+        let mut had_explicit_scroll_adjustment = Vec2b::new(
+            false,
+            external_vertical_scroll.is_some_and(|external| {
+                !matches!(external.position, ExternalScrollPosition::Sync(_))
+            }),
+        );
 
         for d in 0..2 {
-            // PassState::scroll_delta is inverted from the way we apply the delta, so we need to negate it.
-            let mut delta = -scroll_delta.0[d];
-            let mut animation = scroll_delta.1;
-
             // We always take both scroll targets regardless of which scroll axes are enabled. This
             // is to avoid them leaking to other scroll areas.
             let scroll_target = content_ui
@@ -1039,6 +1778,20 @@ impl Prepared {
                 .pass_state_mut(|state| state.scroll_target[d].take());
 
             if direction_enabled[d] {
+                let (scroll_delta, scroll_animation) = content_ui.ctx().pass_state_mut(|state| {
+                    (
+                        core::mem::take(&mut state.scroll_delta.0[d]),
+                        state.scroll_delta.1,
+                    )
+                });
+                if skip_native_y && d == 1 {
+                    continue;
+                }
+
+                // PassState::scroll_delta is inverted from the way we apply the delta, so we need to negate it.
+                let mut delta = -scroll_delta;
+                let mut animation = scroll_animation;
+
                 if let Some(target) = scroll_target {
                     let pass_state::ScrollTarget {
                         range,
@@ -1072,8 +1825,8 @@ impl Prepared {
                         0.0
                     };
 
-                    delta += delta_update;
                     animation = animation_update;
+                    delta += delta_update;
                 }
 
                 if delta != 0.0 {
@@ -1095,7 +1848,11 @@ impl Prepared {
                             target_offset,
                         });
                     }
-                    ui.ctx().request_repaint();
+                    ui.request_repaint();
+                }
+
+                if delta != 0.0 {
+                    had_explicit_scroll_adjustment[d] = true;
                 }
             }
         }
@@ -1127,9 +1884,15 @@ impl Prepared {
 
         let outer_rect = Rect::from_min_size(inner_rect.min, inner_rect.size() + current_bar_use);
 
+        let limit_rect = if ui.spacing().scroll.floating {
+            outer_rect
+        } else {
+            inner_rect
+        };
+
         let content_is_too_large = Vec2b::new(
-            direction_enabled[0] && inner_rect.width() < content_size.x,
-            direction_enabled[1] && inner_rect.height() < content_size.y,
+            direction_enabled[0] && (limit_rect.width().ceil() < content_size.x),
+            direction_enabled[1] && (limit_rect.height().ceil() < content_size.y),
         );
 
         let max_offset = content_size - inner_rect.size();
@@ -1143,32 +1906,51 @@ impl Prepared {
             && ui.ctx().dragged_id().is_none()
             || is_dragging_background;
 
-        if scroll_source.mouse_wheel && ui.is_enabled() && is_hovering_outer_rect {
+        if scroll_source.mouse_wheel
+            && ui.is_enabled()
+            && (ui.rect_contains_pointer(outer_rect) || is_dragging_background)
+        {
             let always_scroll_enabled_direction = ui.style().always_scroll_the_only_direction
                 && direction_enabled[0] != direction_enabled[1];
+            let scroll_source = ui.input(|i| i.scroll_source());
+
             for d in 0..2 {
-                if direction_enabled[d] {
-                    let scroll_delta = ui.ctx().input(|input| {
+                if direction_enabled[d] && !(skip_native_y && d == 1) {
+                    let scroll_delta = ui.input(|input| {
                         if always_scroll_enabled_direction {
                             // no bidirectional scrolling; allow horizontal scrolling without pressing shift
-                            input.smooth_scroll_delta[0] + input.smooth_scroll_delta[1]
+                            input.smooth_scroll_delta()[0] + input.smooth_scroll_delta()[1]
                         } else {
-                            input.smooth_scroll_delta[d]
+                            input.smooth_scroll_delta()[d]
                         }
                     });
                     let scroll_delta = scroll_delta * wheel_scroll_multiplier[d];
 
-                    let scrolling_up = state.offset[d] > 0.0 && scroll_delta > 0.0;
-                    let scrolling_down = state.offset[d] < max_offset[d] && scroll_delta < 0.0;
+                    let physics = AxisPhysics {
+                        bounds: scroll_bounds(max_offset[d]), // We know this frame's bounds now
+                        ..axis_physics[d]
+                    };
 
-                    if scrolling_up || scrolling_down {
-                        state.offset[d] -= scroll_delta;
+                    let consumed = physics.wheel(
+                        &mut state.offset[d],
+                        &mut state.vel[d],
+                        WheelScroll {
+                            // Offset has an inverted coordinate system compared to the scroll delta:
+                            delta: -scroll_delta,
+                            source: scroll_source,
+                            can_chain_to_parent: has_scrolling_ancestor,
+                            dt: ui.input(|i| i.stable_dt).at_most(0.1),
+                        },
+                        &mut state.bounced_this_momentum[d],
+                    );
+
+                    if consumed {
+                        rubber_banding[d] = physics.is_rubber_banding(state.offset[d]);
 
                         // Clear scroll delta so no parent scroll will use it:
-                        ui.ctx().input_mut(|input| {
+                        ui.input_mut(|input| {
                             if always_scroll_enabled_direction {
-                                input.smooth_scroll_delta[0] = 0.0;
-                                input.smooth_scroll_delta[1] = 0.0;
+                                input.smooth_scroll_delta = Vec2::ZERO;
                             } else {
                                 input.smooth_scroll_delta[d] = 0.0;
                             }
@@ -1197,11 +1979,18 @@ impl Prepared {
 
         let scroll_style = ui.spacing().scroll;
 
+        // Reserve the scroll area before painting fades, because fade painting uses ui.min_rect().
+        ui.advance_cursor_after_rect(outer_rect);
+
+        paint_fade_areas_impl(ui, inner_rect, content_size, state.offset);
+
         // Paint the bars:
         let scroll_bar_rect = scroll_bar_rect.unwrap_or(inner_rect);
         for d in 0..2 {
-            // maybe force increase in offset to keep scroll stuck to end position
-            if stick_to_end[d] && state.scroll_stuck_to_end[d] {
+            // maybe force increase in offset to keep scroll stuck to end position,
+            // unless this axis had an explicit scroll adjustment.
+            if stick_to_end[d] && state.scroll_stuck_to_end[d] && !had_explicit_scroll_adjustment[d]
+            {
                 state.offset[d] = content_size[d] - inner_rect.size()[d];
             }
 
@@ -1211,46 +2000,23 @@ impl Prepared {
                 continue;
             }
 
+            let interact_id = if d == 1 {
+                external_vertical_scroll
+                    .map_or(id, |external| external.interaction_id)
+                    .with(d)
+            } else {
+                id.with(d)
+            };
+
             // Margin on either side of the scroll bar:
             let inner_margin = show_factor * scroll_style.bar_inner_margin;
             let outer_margin = show_factor * scroll_style.bar_outer_margin;
 
-            // top/bottom of a horizontal scroll (d==0).
-            // left/rigth of a vertical scroll (d==1).
-            let mut cross = if scroll_style.floating {
-                // The bounding rect of a fully visible bar.
-                // When we hover this area, we should show the full bar:
-                let max_bar_rect = if d == 0 {
-                    outer_rect.with_min_y(outer_rect.max.y - outer_margin - scroll_style.bar_width)
-                } else {
-                    outer_rect.with_min_x(outer_rect.max.x - outer_margin - scroll_style.bar_width)
-                };
+            // bottom of a horizontal scroll (d==0).
+            // right of a vertical scroll (d==1).
+            let mut max_cross = outer_rect.max[1 - d] - outer_margin;
 
-                let is_hovering_bar_area = is_hovering_outer_rect
-                    && ui.rect_contains_pointer(max_bar_rect)
-                    && !is_dragging_background
-                    || state.scroll_bar_interaction[d];
-
-                let is_hovering_bar_area_t = ui
-                    .ctx()
-                    .animate_bool_responsive(id.with((d, "bar_hover")), is_hovering_bar_area);
-
-                let width = show_factor
-                    * lerp(
-                        scroll_style.floating_width..=scroll_style.bar_width,
-                        is_hovering_bar_area_t,
-                    );
-
-                let max_cross = outer_rect.max[1 - d] - outer_margin;
-                let min_cross = max_cross - width;
-                Rangef::new(min_cross, max_cross)
-            } else {
-                let min_cross = inner_rect.max[1 - d] + inner_margin;
-                let max_cross = outer_rect.max[1 - d] - outer_margin;
-                Rangef::new(min_cross, max_cross)
-            };
-
-            if ui.clip_rect().max[1 - d] < cross.max + outer_margin {
+            if ui.clip_rect().max[1 - d] - outer_margin < max_cross {
                 // Move the scrollbar so it is visible. This is needed in some cases.
                 // For instance:
                 // * When we have a vertical-only scroll area in a top level panel,
@@ -1258,23 +2024,69 @@ impl Prepared {
                 // * When one ScrollArea is nested inside another, and the outer
                 //   is scrolled so that the scroll-bars of the inner ScrollArea (us)
                 //   is outside the clip rectangle.
-                // Really this should use the tighter clip_rect that ignores clip_rect_margin, but we don't store that.
-                // clip_rect_margin is quite a hack. It would be nice to get rid of it.
-                let width = cross.max - cross.min;
-                cross.max = ui.clip_rect().max[1 - d] - outer_margin;
-                cross.min = cross.max - width;
+                max_cross = ui.clip_rect().max[1 - d] - outer_margin;
             }
 
-            let outer_scroll_bar_rect = if d == 0 {
-                Rect::from_min_max(
-                    pos2(scroll_bar_rect.left(), cross.min),
-                    pos2(scroll_bar_rect.right(), cross.max),
+            let full_width = scroll_style.bar_width;
+
+            // The bounding rect of a fully visible bar.
+            // When we hover this area, we should show the full bar.
+            // The interaction rect must match where the scroll bar is drawn (outer_scroll_bar_rect),
+            // i.e. use `scroll_bar_rect` along the scrolling axis. Otherwise a press in a region
+            // where no scrollbar is drawn is sensed as a scrollbar press, creating a dead zone
+            // and snapping the offset to the minimum (see issue #8495).
+            let max_bar_rect = if d == 0 {
+                Rect::from_x_y_ranges(
+                    scroll_bar_rect.x_range(),
+                    Rangef::new(max_cross - full_width, max_cross),
                 )
             } else {
-                Rect::from_min_max(
-                    pos2(cross.min, scroll_bar_rect.top()),
-                    pos2(cross.max, scroll_bar_rect.bottom()),
+                Rect::from_x_y_ranges(
+                    Rangef::new(max_cross - full_width, max_cross),
+                    scroll_bar_rect.y_range(),
                 )
+            };
+
+            let sense = if scroll_source.scroll_bar && ui.is_enabled() {
+                Sense::CLICK | Sense::DRAG
+            } else {
+                Sense::hover()
+            };
+
+            // We always sense interaction with the full width, even if we antimate it growing/shrinking.
+            // This is to present a more consistent target for our hit test code,
+            // and to avoid producing jitter in "thin widget" heuristics there.
+            // Also: it make sense to detect any hover where the scroll bar _will_ be.
+            let response = ui.interact(max_bar_rect, interact_id, sense);
+
+            response.widget_info(|| WidgetInfo::new(Role::ScrollBar));
+
+            // top/bottom of a horizontal scroll (d==0).
+            // left/rigth of a vertical scroll (d==1).
+            let cross = if scroll_style.floating {
+                let is_hovering_bar_area = response.hovered() || state.scroll_bar_interaction[d];
+
+                let is_hovering_bar_area_t = ui
+                    .ctx()
+                    .animate_bool_responsive(id.with((d, "bar_hover")), is_hovering_bar_area);
+
+                let width = show_factor
+                    * lerp(
+                        scroll_style.floating_width..=full_width,
+                        is_hovering_bar_area_t,
+                    );
+
+                let min_cross = max_cross - width;
+                Rangef::new(min_cross, max_cross)
+            } else {
+                let min_cross = inner_rect.max[1 - d] + inner_margin;
+                Rangef::new(min_cross, max_cross)
+            };
+
+            let outer_scroll_bar_rect = if d == 0 {
+                Rect::from_x_y_ranges(scroll_bar_rect.x_range(), cross)
+            } else {
+                Rect::from_x_y_ranges(cross, scroll_bar_rect.y_range())
             };
 
             let from_content = |content| {
@@ -1312,55 +2124,121 @@ impl Prepared {
                 }
             };
 
-            let handle_rect = calculate_handle_rect(d, &state.offset);
-
-            let interact_id = id.with(d);
-            let sense = if scroll_source.scroll_bar && ui.is_enabled() {
-                Sense::click_and_drag()
-            } else {
-                Sense::hover()
-            };
-            let response = ui.interact(outer_scroll_bar_rect, interact_id, sense);
-
             state.scroll_bar_interaction[d] = response.hovered() || response.dragged();
 
-            if let Some(pointer_pos) = response.interact_pointer_pos() {
-                let scroll_start_offset_from_top_left = state.scroll_start_offset_from_top_left[d]
-                    .get_or_insert_with(|| {
-                        if handle_rect.contains(pointer_pos) {
-                            pointer_pos[d] - handle_rect.min[d]
-                        } else {
-                            let handle_top_pos_at_bottom =
-                                scroll_bar_rect.max[d] - handle_rect.size()[d];
-                            // Calculate the new handle top position, centering the handle on the mouse.
-                            let new_handle_top_pos = (pointer_pos[d] - handle_rect.size()[d] / 2.0)
-                                .clamp(scroll_bar_rect.min[d], handle_top_pos_at_bottom);
-                            pointer_pos[d] - new_handle_top_pos
-                        }
+            let external_short_bar_press = if d == 1 {
+                external_vertical_scroll.and_then(|external| {
+                    external_capture_input
+                        .short_press
+                        .filter(|press| {
+                            response.clicked_by(press.button)
+                                && scroll_source.scroll_bar
+                                && ui.is_enabled()
+                                && external_press_in_rect(ui, max_bar_rect, press.position)
+                        })
+                        .inspect(|press| {
+                            finish_external_bar_press(ui.ctx(), external, *press);
+                            state.vel.y = 0.0;
+                            state.offset_target[1] = None;
+                        })
+                })
+            } else {
+                None
+            };
+            let external_bar_position = if d == 1 {
+                external_vertical_scroll.and_then(|external| {
+                    if let Some((ExternalCaptureRole::VerticalBar, press)) =
+                        external_capture_input.new_press
+                        && !(scroll_source.scroll_bar
+                            && ui.is_enabled()
+                            && external_press_in_rect(ui, max_bar_rect, press.position))
+                    {
+                        finish_external_bar_press(ui.ctx(), external, press);
+                        return None;
+                    }
+                    (scroll_source.scroll_bar && ui.is_enabled())
+                        .then_some(external_capture_input.bar_position)
+                        .flatten()
+                })
+            } else {
+                None
+            };
+            // The owner position can be its old release or the final held
+            // interval. Its press stamp orders it relative to a completed click,
+            // so each new grab uses the handle after all earlier input.
+            let pointer_positions = if d == 1 && external_vertical_scroll.is_some() {
+                let mut intervals = [
+                    external_short_bar_press.map(|press| (press, Some(press))),
+                    external_bar_position.map(|press| {
+                        (
+                            press,
+                            external_capture_input.new_press.and_then(|(role, press)| {
+                                (role == ExternalCaptureRole::VerticalBar).then_some(press)
+                            }),
+                        )
+                    }),
+                ];
+                intervals.sort_by_key(|interval| {
+                    interval.map(|(press, _)| (press.stamp.frame, press.stamp.ordinal))
+                });
+                intervals.map(|interval| interval.map(|(press, grab)| (press.position, grab)))
+            } else {
+                [
+                    None,
+                    response
+                        .interact_pointer_pos()
+                        .map(|position| (position, None)),
+                ]
+            };
+            if skip_native_y && d == 1 {
+                // Application gestures and replayed input are already applied.
+                // Keep the transport and grab anchor without moving it twice.
+            } else if pointer_positions.iter().any(Option::is_some) {
+                for (pointer_pos, press) in pointer_positions.into_iter().flatten() {
+                    let handle_rect = calculate_handle_rect(d, &state.offset);
+                    let grab_position = press.map_or(pointer_pos, |press| {
+                        state.scroll_start_offset_from_top_left[d] = None;
+                        press.position
                     });
+                    let scroll_start_offset_from_top_left =
+                        state.scroll_start_offset_from_top_left[d].get_or_insert_with(|| {
+                            if handle_rect.contains(grab_position) {
+                                grab_position[d] - handle_rect.min[d]
+                            } else {
+                                let handle_top_pos_at_bottom =
+                                    scroll_bar_rect.max[d] - handle_rect.size()[d];
+                                // Calculate the new handle top position, centering the handle on the mouse.
+                                let new_handle_top_pos = (grab_position[d]
+                                    - handle_rect.size()[d] * 0.5)
+                                    .clamp(scroll_bar_rect.min[d], handle_top_pos_at_bottom);
+                                grab_position[d] - new_handle_top_pos
+                            }
+                        });
 
-                let new_handle_top = pointer_pos[d] - *scroll_start_offset_from_top_left;
-                let handle_travel =
-                    scroll_bar_rect.min[d]..=(scroll_bar_rect.max[d] - handle_rect.size()[d]);
-                state.offset[d] = if handle_travel.start() == handle_travel.end() {
-                    0.0
-                } else {
-                    remap(new_handle_top, handle_travel, 0.0..=max_offset[d])
-                };
+                    let new_handle_top = pointer_pos[d] - *scroll_start_offset_from_top_left;
+                    let handle_travel =
+                        scroll_bar_rect.min[d]..=(scroll_bar_rect.max[d] - handle_rect.size()[d]);
+                    state.offset[d] = if handle_travel.start() == handle_travel.end() {
+                        0.0
+                    } else {
+                        remap(new_handle_top, handle_travel, 0.0..=max_offset[d])
+                    };
 
-                // some manual action taken, scroll not stuck
-                state.scroll_stuck_to_end[d] = false;
-                state.offset_target[d] = None;
+                    // some manual action taken, scroll not stuck
+                    state.scroll_stuck_to_end[d] = false;
+                    state.offset_target[d] = None;
+                }
             } else {
                 state.scroll_start_offset_from_top_left[d] = None;
             }
 
-            let unbounded_offset = state.offset[d];
-            state.offset[d] = state.offset[d].max(0.0);
-            state.offset[d] = state.offset[d].min(max_offset[d]);
+            if !rubber_banding[d] {
+                let unbounded_offset = state.offset[d];
+                state.offset[d] = scroll_bounds(max_offset[d]).clamp(state.offset[d]);
 
-            if state.offset[d] != unbounded_offset {
-                state.vel[d] = 0.0;
+                if state.offset[d] != unbounded_offset {
+                    state.vel[d] = 0.0;
+                }
             }
 
             if ui.is_rect_visible(outer_scroll_bar_rect) {
@@ -1442,26 +2320,37 @@ impl Prepared {
             }
         }
 
-        ui.advance_cursor_after_rect(outer_rect);
-
         if show_scroll_this_frame != state.show_scroll {
-            ui.ctx().request_repaint();
+            ui.request_repaint();
         }
 
         let available_offset = content_size - inner_rect.size();
-        state.offset = state.offset.min(available_offset);
-        state.offset = state.offset.max(Vec2::ZERO);
+        for d in 0..2 {
+            if !rubber_banding[d] {
+                state.offset[d] = scroll_bounds(available_offset[d]).clamp(state.offset[d]);
+            }
+        }
+        state.max_offset = available_offset;
+
+        let suppress_stuck_recompute = Vec2b::new(
+            had_explicit_scroll_adjustment[0] && state.offset_target[0].is_some(),
+            had_explicit_scroll_adjustment[1] && state.offset_target[1].is_some(),
+        );
 
         // Is scroll handle at end of content, or is there no scrollbar
         // yet (not enough content), but sticking is requested? If so, enter sticky mode.
         // Only has an effect if stick_to_end is enabled but we save in
         // state anyway so that entering sticky mode at an arbitrary time
         // has appropriate effect.
+        // Keep explicit target requests from being reclassified as "still stuck" in the same
+        // frame, otherwise animated scroll-to requests never get a chance to pull away from the end.
         state.scroll_stuck_to_end = Vec2b::new(
-            (state.offset[0] == available_offset[0])
-                || (self.stick_to_end[0] && available_offset[0] < 0.0),
-            (state.offset[1] == available_offset[1])
-                || (self.stick_to_end[1] && available_offset[1] < 0.0),
+            !suppress_stuck_recompute[0]
+                && ((state.offset[0] == available_offset[0])
+                    || (stick_to_end[0] && available_offset[0] < 0.0)),
+            !suppress_stuck_recompute[1]
+                && ((state.offset[1] == available_offset[1])
+                    || (stick_to_end[1] && available_offset[1] < 0.0)),
         );
 
         state.show_scroll = show_scroll_this_frame;
@@ -1471,5 +2360,1789 @@ impl Prepared {
         state.store(ui.ctx(), id);
 
         (content_size, state)
+    }
+}
+
+/// Paint fade-out gradients at the top and/or bottom of a scroll area to
+/// indicate that more content is available beyond the visible region.
+fn paint_fade_areas_impl(ui: &Ui, inner_rect: Rect, content_size: Vec2, offset: Vec2) {
+    let crate::style::ScrollFadeStyle {
+        strength,
+        size: fade_size,
+    } = ui.spacing().scroll.fade;
+
+    if strength <= 0.0 {
+        return;
+    }
+
+    let bg = ui.stack().bg_color();
+
+    let overflow = content_size - inner_rect.size();
+
+    let paint_rect = inner_rect.intersect(ui.min_rect());
+
+    // Top fade: animate opacity based on how far we've scrolled down.
+    if 0.0 < offset.y {
+        let t = (offset.y / fade_size).clamp(0.0, 1.0) * strength;
+        let bg_faded = bg.gamma_multiply(t);
+        let rect = Rect::from_min_max(
+            paint_rect.left_top(),
+            pos2(paint_rect.right(), paint_rect.top() + fade_size),
+        );
+        ui.painter().add(Shape::gradient_rect(
+            rect,
+            Direction::TopDown,
+            [bg_faded, Color32::TRANSPARENT],
+        ));
+    }
+
+    // Bottom fade: animate opacity based on distance from the bottom.
+    let distance_from_bottom = overflow.y - offset.y;
+    if 0.0 < distance_from_bottom {
+        let t = (distance_from_bottom / fade_size).clamp(0.0, 1.0) * strength;
+        let bg_faded = bg.gamma_multiply(t);
+        let rect = Rect::from_min_max(
+            pos2(paint_rect.left(), paint_rect.bottom() - fade_size),
+            paint_rect.right_bottom(),
+        );
+        ui.painter().add(Shape::gradient_rect(
+            rect,
+            Direction::BottomUp,
+            [bg_faded, Color32::TRANSPARENT],
+        ));
+    }
+
+    // Left fade: animate opacity based on how far we've scrolled right.
+    if 0.0 < offset.x {
+        let t = (offset.x / fade_size).clamp(0.0, 1.0) * strength;
+        let bg_faded = bg.gamma_multiply(t);
+        let rect = Rect::from_min_max(
+            paint_rect.left_top(),
+            pos2(paint_rect.left() + fade_size, paint_rect.bottom()),
+        );
+        ui.painter().add(Shape::gradient_rect(
+            rect,
+            Direction::LeftToRight,
+            [bg_faded, Color32::TRANSPARENT],
+        ));
+    }
+
+    // Right fade: animate opacity based on distance from the right edge.
+    let distance_from_right = overflow.x - offset.x;
+    if 0.0 < distance_from_right {
+        let t = (distance_from_right / fade_size).clamp(0.0, 1.0) * strength;
+        let bg_faded = bg.gamma_multiply(t);
+        let rect = Rect::from_min_max(
+            pos2(paint_rect.right() - fade_size, paint_rect.top()),
+            paint_rect.right_bottom(),
+        );
+        ui.painter().add(Shape::gradient_rect(
+            rect,
+            Direction::RightToLeft,
+            [bg_faded, Color32::TRANSPARENT],
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ScrollSample {
+        id: Id,
+        state: State,
+        inner_rect: Rect,
+        viewport: Rect,
+        origin: Pos2,
+        content_size: Vec2,
+    }
+
+    fn external_frame(
+        ctx: &Context,
+        content_height: f32,
+        viewport_height: f32,
+        position: ExternalScrollPosition,
+        events: Vec<crate::Event>,
+    ) -> ScrollSample {
+        sample_frame(ctx, content_height, viewport_height, Some(position), events)
+    }
+
+    fn sample_frame(
+        ctx: &Context,
+        content_height: f32,
+        viewport_height: f32,
+        position: Option<ExternalScrollPosition>,
+        events: Vec<crate::Event>,
+    ) -> ScrollSample {
+        owner_frame(
+            ctx,
+            content_height,
+            viewport_height,
+            position,
+            Id::unique("external-test-session"),
+            Id::unique("external-test-geometry"),
+            events,
+        )
+    }
+
+    fn owner_frame(
+        ctx: &Context,
+        content_height: f32,
+        viewport_height: f32,
+        position: Option<ExternalScrollPosition>,
+        session: Id,
+        geometry: Id,
+        events: Vec<crate::Event>,
+    ) -> ScrollSample {
+        owner_frame_with_other(
+            ctx,
+            content_height,
+            viewport_height,
+            position,
+            session,
+            geometry,
+            events,
+            None,
+        )
+    }
+
+    fn owner_frame_with_other(
+        ctx: &Context,
+        content_height: f32,
+        viewport_height: f32,
+        position: Option<ExternalScrollPosition>,
+        session: Id,
+        geometry: Id,
+        events: Vec<crate::Event>,
+        other: Option<(Id, Rect)>,
+    ) -> ScrollSample {
+        let mut sample = None;
+        ctx.run_pass(
+            crate::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0))),
+                time: Some((ctx.cumulative_frame_nr() + 1) as f64 / 60.0),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    crate::CentralPanel::default().show(ui, |ui| {
+                        ui.spacing_mut().scroll = crate::style::ScrollStyle::solid();
+                        ui.spacing_mut().scroll.kinetic = ctx.global_style().spacing.scroll.kinetic;
+                        let mut area = ScrollArea::vertical()
+                            .id_salt(geometry)
+                            .auto_shrink([false, false])
+                            .min_scrolled_height(64.0)
+                            .max_height(viewport_height)
+                            .content_margin(Margin::ZERO)
+                            .scroll_source(ScrollSource::ALL);
+                        if let Some(position) = position {
+                            area = area.external_vertical_scroll(ExternalVerticalScroll {
+                                content_height,
+                                position,
+                                interaction_session: session,
+                                interaction_id: Id::unique("external-test-transport"),
+                            });
+                        }
+                        let output = area.show_viewport(ui, |ui, viewport| {
+                            let (rect, _) = ui.allocate_exact_size(
+                                Vec2::new(200.0, content_height),
+                                Sense::hover(),
+                            );
+                            (viewport, rect.min)
+                        });
+                        sample = Some(ScrollSample {
+                            id: output.id,
+                            state: output.state,
+                            inner_rect: output.inner_rect,
+                            viewport: output.inner.0,
+                            origin: output.inner.1,
+                            content_size: output.content_size,
+                        });
+                        if let Some((id, rect)) = other {
+                            ui.interact(rect, id, Sense::drag());
+                        }
+                    });
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        sample.unwrap()
+    }
+
+    fn pointer_button(pos: Pos2, pressed: bool) -> crate::Event {
+        crate::Event::PointerButton {
+            pos,
+            button: crate::PointerButton::Primary,
+            pressed,
+            modifiers: crate::Modifiers::NONE,
+        }
+    }
+
+    fn assert_draw_position(sample: &ScrollSample, expected: f32) {
+        assert_eq!(sample.viewport.min.y, expected);
+        assert!(
+            (sample.origin.y - (sample.inner_rect.min.y - expected)).abs() <= 1.0,
+            "content origin {:?}, viewport {:?}, offset {expected}",
+            sample.origin,
+            sample.inner_rect,
+        );
+    }
+
+    #[test]
+    fn external_vertical_current_geometry_precedes_physics_and_first_draw() {
+        let ctx = Context::default();
+        let old = external_frame(&ctx, 400.0, 200.0, ExternalScrollPosition::Set(0.0), vec![]);
+        assert_eq!(old.state.max_offset.y, 200.0);
+        let grown = external_frame(
+            &ctx,
+            1000.0,
+            200.0,
+            ExternalScrollPosition::Set(800.0),
+            vec![],
+        );
+        assert_eq!(grown.state.offset.y, 800.0);
+        assert_eq!(grown.state.max_offset.y, 800.0);
+        assert_draw_position(&grown, 800.0);
+        let shrunk = external_frame(
+            &ctx,
+            600.0,
+            300.0,
+            ExternalScrollPosition::Set(300.0),
+            vec![],
+        );
+        assert_eq!(shrunk.state.max_offset.y, 300.0);
+        assert_eq!(shrunk.state.offset.y, 300.0);
+        assert_draw_position(&shrunk, 300.0);
+        let short = external_frame(&ctx, 20.0, 10.0, ExternalScrollPosition::Set(0.0), vec![]);
+        assert_eq!(short.inner_rect.height(), 64.0);
+        assert_eq!(short.content_size.y, 20.0);
+        assert!(!short.state.content_is_too_large.y);
+        assert_draw_position(&short, 0.0);
+    }
+
+    #[test]
+    fn external_vertical_set_ends_velocity_and_target_before_drawing() {
+        for velocity in [0.0, 900.0] {
+            for target in [false, true] {
+                for (height, viewport) in [(760.0, 200.0), (1000.0, 440.0)] {
+                    let ctx = Context::default();
+                    let first = external_frame(
+                        &ctx,
+                        1200.0,
+                        200.0,
+                        ExternalScrollPosition::Set(840.0),
+                        vec![],
+                    );
+                    let mut state = first.state;
+                    state.vel.y = velocity;
+                    state.offset_target[1] = target.then_some(ScrollingToTarget {
+                        animation_time_span: (0.0, 1.0),
+                        target_offset: 950.0,
+                    });
+                    state.store(&ctx, first.id);
+                    let set = external_frame(
+                        &ctx,
+                        height,
+                        viewport,
+                        ExternalScrollPosition::Set(560.0),
+                        vec![],
+                    );
+                    assert_eq!(set.state.offset.y, 560.0);
+                    assert_eq!(set.state.vel.y, 0.0);
+                    assert!(set.state.offset_target[1].is_none());
+                    assert_draw_position(&set, 560.0);
+                    let next = external_frame(
+                        &ctx,
+                        height,
+                        viewport,
+                        ExternalScrollPosition::Sync(560.0),
+                        vec![],
+                    );
+                    assert_eq!(next.state.offset.y, 560.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn external_vertical_sync_keeps_motion_and_draws_its_result() {
+        for animation in [false, true] {
+            let ctx = Context::default();
+            let first = external_frame(
+                &ctx,
+                1200.0,
+                200.0,
+                ExternalScrollPosition::Set(200.0),
+                vec![],
+            );
+            let mut state = first.state;
+            state.vel.y = if animation { 0.0 } else { 500.0 };
+            state.offset_target[1] = animation.then_some(ScrollingToTarget {
+                animation_time_span: (0.0, 1.0),
+                target_offset: 800.0,
+            });
+            state.store(&ctx, first.id);
+            let sync = external_frame(
+                &ctx,
+                1200.0,
+                200.0,
+                ExternalScrollPosition::Sync(200.0),
+                vec![],
+            );
+            assert!(sync.state.offset.y > 200.0);
+            if animation {
+                assert!(sync.state.offset_target[1].is_some());
+            } else {
+                assert!(sync.state.vel.y > 0.0);
+            }
+            assert_draw_position(&sync, sync.state.offset.y);
+        }
+    }
+
+    #[test]
+    fn external_vertical_out_of_range_sync_terminates_old_motion() {
+        let ctx = Context::default();
+        let first = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Set(840.0),
+            vec![],
+        );
+        let mut state = first.state;
+        state.vel.y = 500.0;
+        state.offset_target[1] = Some(ScrollingToTarget {
+            animation_time_span: (0.0, 1.0),
+            target_offset: 950.0,
+        });
+        state.store(&ctx, first.id);
+        let sync = external_frame(
+            &ctx,
+            760.0,
+            200.0,
+            ExternalScrollPosition::Sync(840.0),
+            vec![],
+        );
+        assert_eq!(sync.state.offset.y, 560.0);
+        assert_eq!(sync.state.vel.y, 0.0);
+        assert!(sync.state.offset_target[1].is_none());
+        assert_draw_position(&sync, 560.0);
+    }
+
+    #[test]
+    fn external_vertical_app_gesture_does_not_apply_background_drag_twice() {
+        let ctx = Context::default();
+        let first = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Set(300.0),
+            vec![],
+        );
+        let start = first.inner_rect.center();
+        // Stage B retains the native previous-frame interaction rectangle.
+        external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(300.0),
+            vec![],
+        );
+        external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(300.0),
+            vec![pointer_button(start, true)],
+        );
+        let moved = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::AppGesture(337.5),
+            vec![crate::Event::PointerMoved(start - Vec2::new(0.0, 40.0))],
+        );
+        assert_eq!(
+            ctx.memory(|m| m.interaction().potential_drag_id),
+            Some(Id::unique("external-test-transport").with("area"))
+        );
+        assert_eq!(moved.state.offset.y, 337.5);
+        assert_eq!(moved.state.vel.y, 0.0);
+        assert_draw_position(&moved, 337.5);
+        let released = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::AppGesture(350.0),
+            vec![pointer_button(start - Vec2::new(0.0, 40.0), false)],
+        );
+        assert_eq!(released.state.offset.y, 350.0);
+        assert_eq!(released.state.vel.y, 0.0);
+    }
+
+    #[test]
+    fn external_vertical_set_preserves_held_bar_and_app_gesture_owns_it() {
+        let ctx = Context::default();
+        external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Set(0.0),
+            vec![],
+        );
+        let first = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![],
+        );
+        let bar = pos2(first.inner_rect.right() + 6.0, first.inner_rect.top() + 8.0);
+        let held = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![pointer_button(bar, true)],
+        );
+        assert_eq!(
+            ctx.memory(|m| m.interaction().potential_drag_id),
+            Some(Id::unique("external-test-transport").with(1_usize))
+        );
+        let anchor =
+            held.state.scroll_start_offset_from_top_left[1].unwrap_or_else(|| {
+                panic!(
+                    "bar is held: first={:?}, held={:?}, pointer={bar:?}, capture={:?}",
+                    first.inner_rect,
+                    held.inner_rect,
+                    ctx.data(|d| d.get_temp::<ExternalScrollCapture>(external_capture_id(
+                        Id::unique("external-test-transport")
+                    )))
+                )
+            });
+        let moved = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Set(200.0),
+            vec![crate::Event::PointerMoved(bar + Vec2::new(0.0, 40.0))],
+        );
+        assert_eq!(
+            moved.state.scroll_start_offset_from_top_left[1],
+            Some(anchor)
+        );
+        assert!(
+            moved.state.offset.y > 200.0,
+            "current bar input must follow Set"
+        );
+        let app = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::AppGesture(237.5),
+            vec![crate::Event::PointerMoved(bar + Vec2::new(0.0, 60.0))],
+        );
+        assert_eq!(app.state.offset.y, 237.5);
+    }
+
+    #[test]
+    fn native_scroll_keeps_pre_physics_placement_and_coast() {
+        let ctx = Context::default();
+        let first = sample_frame(&ctx, 1200.0, 200.0, None, vec![]);
+        let mut state = first.state;
+        state.offset.y = 200.0;
+        state.vel.y = 500.0;
+        state.store(&ctx, first.id);
+        let native = sample_frame(&ctx, 1200.0, 200.0, None, vec![]);
+        assert!(native.state.offset.y > 200.0);
+        assert!(native.state.vel.y > 0.0);
+        assert_draw_position(&native, 200.0);
+    }
+
+    #[test]
+    fn external_vertical_equal_value_set_still_ends_previous_motion() {
+        let ctx = Context::default();
+        let first = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Set(200.0),
+            vec![],
+        );
+        let mut state = first.state;
+        state.vel.y = 500.0;
+        state.offset_target[1] = Some(ScrollingToTarget {
+            animation_time_span: (0.0, 1.0),
+            target_offset: 800.0,
+        });
+        state.store(&ctx, first.id);
+        let set = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Set(200.0),
+            vec![],
+        );
+        assert_eq!(set.state.offset.y, 200.0);
+        assert_eq!(set.state.vel.y, 0.0);
+        assert!(set.state.offset_target[1].is_none());
+        assert_draw_position(&set, 200.0);
+    }
+
+    #[test]
+    fn native_nested_both_axes_stick_and_scroll_to_controls() {
+        let ctx = Context::default();
+        for pass in 0..3 {
+            ctx.run_pass(crate::RawInput::default(), |ctx| {
+                ctx.root_ui(|ui| {
+                    crate::CentralPanel::default().show(ui, |ui| {
+                        let outer = ScrollArea::both()
+                            .max_width(200.0)
+                            .max_height(200.0)
+                            .auto_shrink([false, false])
+                            .scroll_offset(Vec2::new(40.0, 50.0))
+                            .animated(false)
+                            .show(ui, |ui| {
+                                ui.set_min_size(Vec2::splat(600.0));
+                                let inner = ScrollArea::vertical()
+                                    .id_salt("nested-native")
+                                    .max_height(100.0)
+                                    .auto_shrink([false, false])
+                                    .stick_to_bottom(true)
+                                    .show(ui, |ui| {
+                                        ui.allocate_exact_size(
+                                            Vec2::new(100.0, 300.0),
+                                            Sense::hover(),
+                                        );
+                                    });
+                                assert_eq!(inner.state.offset.y, 200.0);
+                                if pass == 2 {
+                                    ui.scroll_to_rect_animation(
+                                        Rect::from_min_size(
+                                            ui.min_rect().min + Vec2::splat(350.0),
+                                            Vec2::splat(20.0),
+                                        ),
+                                        Some(crate::Align::Center),
+                                        crate::style::ScrollAnimation::none(),
+                                    );
+                                }
+                            });
+                        assert!(outer.state.max_offset.x > 0.0);
+                        assert!(outer.state.max_offset.y > 0.0);
+                        if pass == 1 {
+                            assert_eq!(outer.state.offset, Vec2::new(40.0, 50.0));
+                        } else if pass == 2 {
+                            assert!(outer.state.offset.x > 200.0);
+                            assert!(outer.state.offset.y > 200.0);
+                        }
+                    });
+                });
+            })
+            .drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn native_nested_short_content_chains_wheel_to_parent() {
+        let ctx = Context::default();
+        let mut pointer = Pos2::ZERO;
+        for pass in 0..3 {
+            let events = if pass == 2 {
+                vec![
+                    crate::Event::PointerMoved(pointer),
+                    crate::Event::MouseWheel {
+                        unit: crate::MouseWheelUnit::Point,
+                        delta: Vec2::new(0.0, -60.0),
+                        phase: crate::TouchPhase::Move,
+                        source: MouseWheelSource::Unknown,
+                        modifiers: crate::Modifiers::NONE,
+                    },
+                ]
+            } else {
+                vec![]
+            };
+            ctx.run_pass(
+                crate::RawInput {
+                    time: Some((pass + 1) as f64 / 60.0),
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|ui| {
+                        crate::CentralPanel::default().show(ui, |ui| {
+                            let outer = ScrollArea::vertical()
+                                .max_height(200.0)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.set_min_height(1000.0);
+                                    let inner = ScrollArea::vertical()
+                                        .id_salt("short-nested-native")
+                                        .max_height(100.0)
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            ui.allocate_exact_size(
+                                                Vec2::new(100.0, 20.0),
+                                                Sense::hover(),
+                                            );
+                                        });
+                                    pointer = inner.inner_rect.center();
+                                    assert_eq!(inner.state.offset.y, 0.0);
+                                });
+                            if pass == 2 {
+                                assert!(outer.state.offset.y > 0.0);
+                                assert_eq!(ctx.input(|input| input.smooth_scroll_delta.y), 0.0);
+                            }
+                        });
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+    }
+
+    fn capture(ctx: &Context) -> ExternalScrollCapture {
+        ctx.data(|data| {
+            data.get_temp::<ExternalScrollCapture>(external_capture_id(Id::unique(
+                "external-test-transport",
+            )))
+        })
+        .expect("transport was observed")
+    }
+
+    #[test]
+    fn external_capture_old_bar_release_then_short_click_keeps_input_order() {
+        let ctx = Context::default();
+        external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![],
+        );
+        let first = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![],
+        );
+        let start = pos2(first.inner_rect.right() + 3.0, first.inner_rect.top() + 8.0);
+        external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![pointer_button(start, true)],
+        );
+        let old_position = start + Vec2::new(0.0, 30.0);
+        let dragged = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![crate::Event::PointerMoved(old_position)],
+        );
+        assert!(dragged.state.offset.y > 100.0);
+        assert!(dragged.state.scroll_start_offset_from_top_left[1].is_some());
+        assert!(matches!(
+            capture(&ctx),
+            ExternalScrollCapture::Sequence {
+                phase: ExternalCapturePhase::Held { .. },
+                ..
+            }
+        ));
+        let click = pos2(start.x, first.inner_rect.top() + 120.0);
+        let frame = ctx.cumulative_frame_nr();
+        let clicked = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(dragged.state.offset.y),
+            vec![
+                pointer_button(old_position, false),
+                pointer_button(click, true),
+                pointer_button(click, false),
+            ],
+        );
+        assert!(
+            ctx.read_response(Id::unique("external-test-transport").with(1_usize))
+                .unwrap()
+                .clicked()
+        );
+        assert!(!ctx.input(|input| input.pointer.primary_down()));
+        assert!(matches!(capture(&ctx), ExternalScrollCapture::Sequence {
+            press_stamp: ExternalPressStamp { frame: stamp_frame, ordinal: 0 },
+            phase: ExternalCapturePhase::Released { .. }, ..
+        } if stamp_frame == frame));
+        let next = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(clicked.state.offset.y),
+            vec![],
+        );
+        assert!(
+            (clicked.state.offset.y - 620.0).abs() < 0.001,
+            "new completed click must follow old release: {}",
+            clicked.state.offset.y
+        );
+        assert_eq!(clicked.state.vel.y, 0.0);
+        assert!((next.state.offset.y - 620.0).abs() < 0.001);
+        assert_draw_position(&next, next.state.offset.y);
+    }
+
+    #[test]
+    fn external_capture_completed_bar_click_then_held_press_keeps_latest_sequence() {
+        let ctx = Context::default();
+        external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![],
+        );
+        let first = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![],
+        );
+        let click = pos2(
+            first.inner_rect.right() + 3.0,
+            first.inner_rect.top() + 80.0,
+        );
+        let held = click + Vec2::new(0.0, 40.0);
+        let stamp_frame = ctx.cumulative_frame_nr();
+        let pressed = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![
+                pointer_button(click, true),
+                pointer_button(click, false),
+                pointer_button(held, true),
+            ],
+        );
+        assert!(
+            ctx.read_response(Id::unique("external-test-transport").with(1_usize))
+                .unwrap()
+                .clicked()
+        );
+        assert_eq!(
+            ctx.memory(|m| m.interaction().potential_drag_id),
+            Some(Id::unique("external-test-transport").with(1_usize))
+        );
+        let new_capture = capture(&ctx);
+        let moved = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(pressed.state.offset.y),
+            vec![crate::Event::PointerMoved(held + Vec2::new(0.0, 25.0))],
+        );
+        let move_capture = capture(&ctx);
+        let released = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(moved.state.offset.y),
+            vec![pointer_button(held + Vec2::new(0.0, 25.0), false)],
+        );
+        assert!(
+            matches!(new_capture, ExternalScrollCapture::Sequence {
+            press_stamp: ExternalPressStamp { frame, ordinal: 1 },
+            role: ExternalCaptureRole::VerticalBar,
+            phase: ExternalCapturePhase::Held { position, .. }, ..
+        } if frame == stamp_frame && position == held),
+            "latest press must own capture: {new_capture:?}"
+        );
+        assert!(matches!(
+            move_capture,
+            ExternalScrollCapture::Sequence {
+                phase: ExternalCapturePhase::Held { .. },
+                ..
+            }
+        ));
+        assert!(
+            pressed.state.offset.y > 0.0,
+            "completed click must still move the bar"
+        );
+        assert!(
+            (pressed.state.offset.y - 620.0).abs() < 0.001,
+            "completed click then new track press must apply in input order"
+        );
+        assert!(pressed.state.scroll_start_offset_from_top_left[1].is_some());
+        assert!(
+            moved.state.offset.y > pressed.state.offset.y + 100.0,
+            "held drag must continue: {} -> {}",
+            pressed.state.offset.y,
+            moved.state.offset.y
+        );
+        assert!((released.state.offset.y - moved.state.offset.y).abs() < 0.001);
+        assert_eq!(released.state.vel.y, 0.0);
+        assert!(matches!(capture(&ctx), ExternalScrollCapture::Sequence {
+            press_stamp: ExternalPressStamp { frame, ordinal: 1 },
+            phase: ExternalCapturePhase::Released { .. }, ..
+        } if frame == stamp_frame));
+    }
+
+    #[test]
+    fn external_vertical_edge_crossing_draws_final_drag_and_coast_position() {
+        for rubber_band in [false, true] {
+            for drag in [false, true] {
+                let ctx = Context::default();
+                ctx.global_style_mut(|style| {
+                    style.spacing.scroll.kinetic.rubber_band = rubber_band
+                });
+                let first = external_frame(
+                    &ctx,
+                    1200.0,
+                    200.0,
+                    ExternalScrollPosition::Sync(990.0),
+                    vec![],
+                );
+                let start = first.inner_rect.center();
+                if drag {
+                    external_frame(
+                        &ctx,
+                        1200.0,
+                        200.0,
+                        ExternalScrollPosition::Sync(990.0),
+                        vec![pointer_button(start, true)],
+                    );
+                } else {
+                    let mut state = first.state;
+                    state.vel.y = 2400.0;
+                    state.store(&ctx, first.id);
+                }
+                let moved = external_frame(
+                    &ctx,
+                    1200.0,
+                    200.0,
+                    ExternalScrollPosition::Sync(990.0),
+                    if drag {
+                        vec![crate::Event::PointerMoved(start - Vec2::new(0.0, 40.0))]
+                    } else {
+                        vec![]
+                    },
+                );
+                assert_eq!(moved.state.max_offset.y, 1000.0);
+                if rubber_band {
+                    assert!(
+                        moved.state.offset.y > 1000.0,
+                        "legal rubber-band must remain"
+                    );
+                } else {
+                    assert_eq!(moved.state.offset.y, 1000.0);
+                    assert_eq!(moved.state.vel.y, 0.0);
+                }
+                assert_draw_position(&moved, moved.state.offset.y);
+            }
+        }
+    }
+
+    #[test]
+    fn external_vertical_extent_shrink_to_fitting_content_draws_clamped_coast() {
+        for rubber_band in [false, true] {
+            let ctx = Context::default();
+            ctx.global_style_mut(|style| style.spacing.scroll.kinetic.rubber_band = rubber_band);
+            let first = external_frame(
+                &ctx,
+                1200.0,
+                200.0,
+                ExternalScrollPosition::Sync(0.0),
+                vec![],
+            );
+            let mut state = first.state;
+            state.vel.y = 2400.0;
+            state.store(&ctx, first.id);
+            let shrunk = external_frame(
+                &ctx,
+                100.0,
+                200.0,
+                ExternalScrollPosition::Sync(0.0),
+                vec![],
+            );
+            assert_eq!(shrunk.state.max_offset.y, -100.0);
+            assert_eq!(shrunk.state.offset.y, 0.0);
+            assert_eq!(shrunk.state.vel.y, 0.0);
+            assert_draw_position(&shrunk, 0.0);
+        }
+    }
+
+    #[test]
+    fn external_capture_old_background_release_then_new_press_survives_response_aggregation() {
+        for (height, viewport) in [(1200.0, 200.0), (2100.0, 240.0)] {
+            for switch_geometry in [false, true] {
+                let ctx = Context::default();
+                let a = Id::unique("owner-a");
+                let b = Id::unique("owner-b");
+                let geometry_a = Id::unique("geometry-a");
+                let geometry_b = if switch_geometry {
+                    Id::unique("geometry-b")
+                } else {
+                    geometry_a
+                };
+                let first = owner_frame(
+                    &ctx,
+                    height,
+                    viewport,
+                    Some(ExternalScrollPosition::Sync(300.0)),
+                    a,
+                    geometry_a,
+                    vec![],
+                );
+                let start = first.inner_rect.center();
+                owner_frame(
+                    &ctx,
+                    height,
+                    viewport,
+                    Some(ExternalScrollPosition::Sync(300.0)),
+                    a,
+                    geometry_a,
+                    vec![pointer_button(start, true)],
+                );
+                let dragged = owner_frame(
+                    &ctx,
+                    height,
+                    viewport,
+                    Some(ExternalScrollPosition::Sync(300.0)),
+                    a,
+                    geometry_a,
+                    vec![crate::Event::PointerMoved(start - Vec2::new(0.0, 30.0))],
+                );
+                assert_eq!(dragged.state.offset.y, 330.0);
+                let stamp_frame = ctx.cumulative_frame_nr();
+                let switched = owner_frame(
+                    &ctx,
+                    height,
+                    viewport,
+                    Some(ExternalScrollPosition::Sync(500.0)),
+                    b,
+                    geometry_b,
+                    vec![
+                        pointer_button(start - Vec2::new(0.0, 30.0), false),
+                        pointer_button(start, true),
+                    ],
+                );
+                let response = ctx
+                    .read_response(Id::unique("external-test-transport").with("area"))
+                    .unwrap();
+                assert!(
+                    !response.dragged() && !response.drag_started() && !response.drag_stopped()
+                );
+                assert!(!response.is_pointer_button_down_on() && !response.clicked());
+                assert_eq!(
+                    ctx.memory(|m| m.interaction().potential_drag_id),
+                    Some(Id::unique("external-test-transport").with("area"))
+                );
+                assert!(matches!(capture(&ctx), ExternalScrollCapture::Sequence {
+                    press_stamp: ExternalPressStamp { frame, ordinal: 0 }, session, role: ExternalCaptureRole::Background,
+                    phase: ExternalCapturePhase::Held { .. }, ..
+                } if frame == stamp_frame && session == b));
+                assert_eq!(switched.state.offset.y, 500.0);
+                assert_eq!(switched.state.vel.y, 0.0);
+                let moved = owner_frame(
+                    &ctx,
+                    height,
+                    viewport,
+                    Some(ExternalScrollPosition::Sync(500.0)),
+                    b,
+                    geometry_b,
+                    vec![crate::Event::PointerMoved(start - Vec2::new(0.0, 40.0))],
+                );
+                assert_eq!(moved.state.offset.y, 540.0);
+                let released = owner_frame(
+                    &ctx,
+                    height,
+                    viewport,
+                    Some(ExternalScrollPosition::Sync(540.0)),
+                    b,
+                    geometry_b,
+                    vec![pointer_button(start - Vec2::new(0.0, 40.0), false)],
+                );
+                assert!(released.state.vel.y > 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn external_capture_old_held_and_added_button_do_not_acquire_destination() {
+        let ctx = Context::default();
+        let a = Id::unique("owner-a");
+        let b = Id::unique("owner-b");
+        let geometry = Id::unique("geometry");
+        let first = owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(300.0)),
+            a,
+            geometry,
+            vec![],
+        );
+        let start = first.inner_rect.center();
+        owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(300.0)),
+            a,
+            geometry,
+            vec![pointer_button(start, true)],
+        );
+        let mut added = pointer_button(start, true);
+        if let crate::Event::PointerButton { button, .. } = &mut added {
+            *button = crate::PointerButton::Secondary;
+        }
+        let switched = owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(500.0)),
+            b,
+            geometry,
+            vec![
+                added,
+                crate::Event::PointerMoved(start - Vec2::new(0.0, 50.0)),
+            ],
+        );
+        assert_eq!(switched.state.offset.y, 500.0);
+        assert_eq!(switched.state.vel.y, 0.0);
+        assert!(
+            matches!(capture(&ctx), ExternalScrollCapture::Sequence { session, .. } if session == a)
+        );
+        let released = owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(500.0)),
+            b,
+            geometry,
+            vec![pointer_button(start, false)],
+        );
+        assert_eq!(released.state.offset.y, 500.0);
+        assert_eq!(released.state.vel.y, 0.0);
+    }
+
+    #[test]
+    fn external_capture_bar_repress_uses_new_session_and_new_grab_anchor() {
+        for (height, viewport) in [(1200.0, 200.0), (2100.0, 240.0)] {
+            let ctx = Context::default();
+            let a = Id::unique("owner-a");
+            let b = Id::unique("owner-b");
+            let geometry_a = Id::unique("geometry-a");
+            let geometry_b = Id::unique("geometry-b");
+            owner_frame(
+                &ctx,
+                height,
+                viewport,
+                Some(ExternalScrollPosition::Sync(0.0)),
+                a,
+                geometry_a,
+                vec![],
+            );
+            let first = owner_frame(
+                &ctx,
+                height,
+                viewport,
+                Some(ExternalScrollPosition::Sync(0.0)),
+                a,
+                geometry_a,
+                vec![],
+            );
+            let start = pos2(first.inner_rect.right() + 3.0, first.inner_rect.top() + 8.0);
+            owner_frame(
+                &ctx,
+                height,
+                viewport,
+                Some(ExternalScrollPosition::Sync(0.0)),
+                a,
+                geometry_a,
+                vec![pointer_button(start, true)],
+            );
+            let old = owner_frame(
+                &ctx,
+                height,
+                viewport,
+                Some(ExternalScrollPosition::Sync(0.0)),
+                a,
+                geometry_a,
+                vec![crate::Event::PointerMoved(start + Vec2::new(0.0, 30.0))],
+            );
+            assert!(old.state.offset.y > 0.0);
+            let switched = owner_frame(
+                &ctx,
+                height,
+                viewport,
+                Some(ExternalScrollPosition::Sync(0.0)),
+                b,
+                geometry_b,
+                vec![
+                    pointer_button(start + Vec2::new(0.0, 30.0), false),
+                    pointer_button(start, true),
+                ],
+            );
+            let response = ctx
+                .read_response(Id::unique("external-test-transport").with(1_usize))
+                .unwrap();
+            assert!(!response.is_pointer_button_down_on() && !response.dragged());
+            assert!(switched.state.scroll_start_offset_from_top_left[1].is_some());
+            assert!(
+                matches!(capture(&ctx), ExternalScrollCapture::Sequence { session, role: ExternalCaptureRole::VerticalBar, phase: ExternalCapturePhase::Held { .. }, .. } if session == b)
+            );
+            let moved = owner_frame(
+                &ctx,
+                height,
+                viewport,
+                Some(ExternalScrollPosition::Sync(switched.state.offset.y)),
+                b,
+                geometry_b,
+                vec![crate::Event::PointerMoved(start + Vec2::new(0.0, 45.0))],
+            );
+            assert!(moved.state.offset.y > switched.state.offset.y + 100.0);
+            let released = owner_frame(
+                &ctx,
+                height,
+                viewport,
+                Some(ExternalScrollPosition::Sync(moved.state.offset.y)),
+                b,
+                geometry_b,
+                vec![pointer_button(start + Vec2::new(0.0, 45.0), false)],
+            );
+            assert_eq!(released.state.vel.y, 0.0);
+            assert!(matches!(
+                capture(&ctx),
+                ExternalScrollCapture::Sequence {
+                    phase: ExternalCapturePhase::Released { .. },
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn external_capture_session_ends_only_own_motion_and_preserves_other_geometry() {
+        let ctx = Context::default();
+        let a = Id::unique("owner-a");
+        let b = Id::unique("owner-b");
+        let geometry = Id::unique("geometry");
+        let first = owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(300.0)),
+            a,
+            geometry,
+            vec![],
+        );
+        let mut state = first.state;
+        state.vel.y = 700.0;
+        state.offset_target[1] = Some(ScrollingToTarget {
+            animation_time_span: (0.0, 1.0),
+            target_offset: 900.0,
+        });
+        state.scroll_start_offset_from_top_left[1] = Some(12.0);
+        state.bounced_this_momentum.y = true;
+        state.store(&ctx, first.id);
+        let sibling_id = Id::unique("sibling-geometry");
+        state.store(&ctx, sibling_id);
+        let switched = owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(300.0)),
+            b,
+            geometry,
+            vec![],
+        );
+        assert_eq!(switched.state.offset.y, 300.0);
+        assert_eq!(switched.state.vel.y, 0.0);
+        assert!(switched.state.offset_target[1].is_none());
+        assert!(switched.state.scroll_start_offset_from_top_left[1].is_none());
+        assert!(!switched.state.bounced_this_momentum.y);
+        let sibling = State::load(&ctx, sibling_id).unwrap();
+        assert_eq!(sibling.vel.y, 700.0);
+        assert_eq!(sibling.offset_target[1].unwrap().target_offset, 900.0);
+        assert!(sibling.bounced_this_momentum.y);
+    }
+
+    #[test]
+    fn external_capture_discard_does_not_move_twice_or_reassign_press() {
+        let ctx = Context::default();
+        let a = Id::unique("owner-a");
+        let b = Id::unique("owner-b");
+        let geometry = Id::unique("geometry-a");
+        let first = owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(300.0)),
+            a,
+            geometry,
+            vec![],
+        );
+        let start = first.inner_rect.center();
+        let frame = ctx.cumulative_frame_nr();
+        let mut canonical = 300.0;
+        let mut observations = Vec::new();
+        ctx.run_pass(
+            crate::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0))),
+                time: Some((frame + 1) as f64 / 60.0),
+                events: vec![
+                    pointer_button(start, true),
+                    crate::Event::PointerMoved(start - Vec2::new(0.0, 40.0)),
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    crate::CentralPanel::default().show(ui, |ui| {
+                        ui.spacing_mut().scroll = crate::style::ScrollStyle::solid();
+                        let session = if ctx.current_pass_index() == 0 { a } else { b };
+                        let output = ScrollArea::vertical()
+                            .id_salt(geometry)
+                            .auto_shrink([false, false])
+                            .min_scrolled_height(64.0)
+                            .max_height(200.0)
+                            .scroll_source(ScrollSource::ALL)
+                            .content_margin(Margin::ZERO)
+                            .external_vertical_scroll(ExternalVerticalScroll {
+                                content_height: 1200.0,
+                                position: ExternalScrollPosition::Sync(canonical),
+                                interaction_session: session,
+                                interaction_id: Id::unique("external-test-transport"),
+                            })
+                            .show(ui, |ui| {
+                                ui.allocate_exact_size(Vec2::new(200.0, 1200.0), Sense::hover());
+                            });
+                        canonical = output.state.offset.y;
+                        observations.push((ctx.cumulative_frame_nr(), canonical));
+                        if ctx.current_pass_index() == 0 {
+                            ctx.request_discard("external capture replay fixture");
+                        }
+                    });
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(observations, vec![(frame, 340.0), (frame, 340.0)]);
+        assert!(matches!(capture(&ctx), ExternalScrollCapture::Sequence {
+            press_stamp: ExternalPressStamp { frame: stamp_frame, ordinal: 0 }, session, ..
+        } if stamp_frame == frame && session == a));
+        let old_move = owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(canonical)),
+            b,
+            geometry,
+            vec![crate::Event::PointerMoved(start - Vec2::new(0.0, 70.0))],
+        );
+        assert_eq!(old_move.state.offset.y, 340.0);
+    }
+
+    #[test]
+    fn external_sync_discard_keeps_subrow_drag_coast_and_target_before_paint() {
+        // mIV deliberately does not adopt less than half a row. A replay must
+        // retain native motion even though canonical remains at 280, rather
+        // than adopting State.offset without App's row quantization.
+        for motion in [0, 1, 2] {
+            for replay_kind in [0, 1, 2, 3] {
+                let ctx = Context::default();
+                let session = Id::unique("subrow-owner");
+                let geometry = Id::unique("subrow-geometry");
+                let transport = Id::unique("external-test-transport");
+                let initial = owner_frame(
+                    &ctx,
+                    1200.0,
+                    200.0,
+                    Some(ExternalScrollPosition::Sync(280.0)),
+                    session,
+                    geometry,
+                    vec![],
+                );
+                let start = initial.inner_rect.center();
+                if motion == 0 {
+                    owner_frame(
+                        &ctx,
+                        1200.0,
+                        200.0,
+                        Some(ExternalScrollPosition::Sync(280.0)),
+                        session,
+                        geometry,
+                        vec![pointer_button(start, true)],
+                    );
+                } else {
+                    let mut state = State::load(&ctx, initial.id).unwrap();
+                    if motion == 1 {
+                        state.vel.y = 300.0;
+                    } else {
+                        let now = ctx.input(|input| input.time);
+                        state.offset_target[1] = Some(ScrollingToTarget {
+                            animation_time_span: (now - 0.5, now + 0.5),
+                            target_offset: 320.0,
+                        });
+                    }
+                    state.store(&ctx, initial.id);
+                }
+                let frame = ctx.cumulative_frame_nr();
+                let mut canonical = 280.0;
+                let mut observations = Vec::new();
+                ctx.run_pass(
+                    crate::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0))),
+                        time: Some((frame + 1) as f64 / 60.0),
+                        events: if motion == 0 {
+                            vec![crate::Event::PointerMoved(start - Vec2::new(0.0, 10.0))]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.root_ui(|ui| {
+                            crate::CentralPanel::default().show(ui, |ui| {
+                                ui.spacing_mut().scroll = crate::style::ScrollStyle::solid();
+                                let replay = ctx.current_pass_index() != 0;
+                                let position = if replay {
+                                    match replay_kind {
+                                        1 => ExternalScrollPosition::Set(196.0),
+                                        2 => ExternalScrollPosition::AppGesture(285.5),
+                                        3 => ExternalScrollPosition::Sync(140.0),
+                                        _ => ExternalScrollPosition::Sync(canonical),
+                                    }
+                                } else {
+                                    ExternalScrollPosition::Sync(canonical)
+                                };
+                                let mut viewport = Rect::NOTHING;
+                                let mut origin = Pos2::ZERO;
+                                let output = ScrollArea::vertical()
+                                    .id_salt(geometry)
+                                    .auto_shrink([false, false])
+                                    .min_scrolled_height(64.0)
+                                    .max_height(200.0)
+                                    .scroll_source(ScrollSource::ALL)
+                                    .content_margin(Margin::ZERO)
+                                    .external_vertical_scroll(ExternalVerticalScroll {
+                                        content_height: 1200.0,
+                                        position,
+                                        interaction_session: if replay && replay_kind == 3 {
+                                            session.with("new")
+                                        } else {
+                                            session
+                                        },
+                                        interaction_id: transport,
+                                    })
+                                    .show_viewport(ui, |ui, actual_viewport| {
+                                        viewport = actual_viewport;
+                                        origin = ui.max_rect().min;
+                                        ui.allocate_exact_size(
+                                            Vec2::new(200.0, 1200.0),
+                                            Sense::hover(),
+                                        );
+                                    });
+                                if (output.state.clamped_offset().y - canonical).abs() > 14.0 {
+                                    canonical =
+                                        (output.state.clamped_offset().y / 28.0).round() * 28.0;
+                                }
+                                let expected_origin = pos2(
+                                    output.inner_rect.left(),
+                                    output.inner_rect.top() - viewport.min.y,
+                                )
+                                .round_to_pixels(ctx.pixels_per_point())
+                                .round_ui();
+                                assert_eq!(origin.y, expected_origin.y);
+                                observations.push((output.state, viewport.min.y));
+                                if !replay {
+                                    ctx.request_discard("subrow native motion");
+                                }
+                            });
+                        });
+                    },
+                )
+                .drop_without_applying_deltas();
+                assert_eq!(observations.len(), 2);
+                let first = observations[0];
+                let second = observations[1];
+                assert!(
+                    first.0.offset.y > 280.0 && first.0.offset.y < 294.0,
+                    "must establish sub-half-row motion: {first:?}"
+                );
+                let expected = match replay_kind {
+                    1 => 196.0,
+                    2 => 285.5,
+                    3 => 140.0,
+                    _ => first.0.offset.y,
+                };
+                assert_eq!(
+                    second.0.offset.y, expected,
+                    "motion={motion} replay_kind={replay_kind}"
+                );
+                assert_eq!(
+                    second.1, expected,
+                    "the final content must use the retained or explicit position"
+                );
+                if replay_kind == 0 {
+                    assert_eq!(second.0.vel.y, first.0.vel.y);
+                    assert_eq!(
+                        second.0.offset_target[1].is_some(),
+                        first.0.offset_target[1].is_some()
+                    );
+                    assert_eq!(canonical, 280.0);
+                } else {
+                    assert_eq!(second.0.vel.y, 0.0);
+                    assert!(second.0.offset_target[1].is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn external_sync_discard_keeps_rubber_band_but_resolves_changed_extent() {
+        for shrink in [false, true] {
+            let ctx = Context::default();
+            let session = Id::unique("rubber-owner");
+            let geometry = Id::unique("rubber-geometry");
+            let first = owner_frame(
+                &ctx,
+                1200.0,
+                200.0,
+                Some(ExternalScrollPosition::Sync(1000.0)),
+                session,
+                geometry,
+                vec![],
+            );
+            let start = first.inner_rect.center();
+            owner_frame(
+                &ctx,
+                1200.0,
+                200.0,
+                Some(ExternalScrollPosition::Sync(1000.0)),
+                session,
+                geometry,
+                vec![pointer_button(start, true)],
+            );
+            let frame = ctx.cumulative_frame_nr();
+            let mut offsets = Vec::new();
+            ctx.run_pass(
+                crate::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0))),
+                    time: Some((frame + 1) as f64 / 60.0),
+                    events: vec![crate::Event::PointerMoved(start - Vec2::new(0.0, 10.0))],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|ui| {
+                        crate::CentralPanel::default().show(ui, |ui| {
+                            ui.spacing_mut().scroll = crate::style::ScrollStyle::solid();
+                            let replay = ctx.current_pass_index() != 0;
+                            let mut viewport_y = 0.0;
+                            let output = ScrollArea::vertical()
+                                .id_salt(geometry)
+                                .auto_shrink([false, false])
+                                .max_height(200.0)
+                                .content_margin(Margin::ZERO)
+                                .scroll_source(ScrollSource::ALL)
+                                .external_vertical_scroll(ExternalVerticalScroll {
+                                    content_height: if replay && shrink { 1000.0 } else { 1200.0 },
+                                    position: ExternalScrollPosition::Sync(1000.0),
+                                    interaction_id: Id::unique("external-test-transport"),
+                                    interaction_session: session,
+                                })
+                                .show_viewport(ui, |ui, viewport| {
+                                    viewport_y = viewport.min.y;
+                                    ui.allocate_exact_size(
+                                        Vec2::new(
+                                            200.0,
+                                            if replay && shrink { 1000.0 } else { 1200.0 },
+                                        ),
+                                        Sense::hover(),
+                                    );
+                                });
+                            offsets.push((output.state.offset.y, viewport_y, output.state.vel.y));
+                            if !replay {
+                                ctx.request_discard("rubber-band retry");
+                            }
+                        });
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
+            assert_eq!(offsets.len(), 2);
+            assert!(
+                offsets[0].0 > 1000.0,
+                "must establish a real native overscroll"
+            );
+            if shrink {
+                assert_eq!(offsets[1], (800.0, 800.0, 0.0));
+            } else {
+                assert_eq!(
+                    offsets[1], offsets[0],
+                    "replay must preserve both drawn and stored rubber-band result"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn external_capture_does_not_take_press_delivered_to_another_widget() {
+        let ctx = Context::default();
+        let other = Id::unique("other-widget");
+        let a = Id::unique("owner-a");
+        let b = Id::unique("owner-b");
+        let geometry = Id::unique("geometry");
+        owner_frame_with_other(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(300.0)),
+            a,
+            geometry,
+            vec![],
+            Some((
+                other,
+                Rect::from_min_size(pos2(40.0, 40.0), Vec2::splat(100.0)),
+            )),
+        );
+        owner_frame_with_other(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(300.0)),
+            a,
+            geometry,
+            vec![],
+            Some((
+                other,
+                Rect::from_min_size(pos2(40.0, 40.0), Vec2::splat(100.0)),
+            )),
+        );
+        let press = pos2(70.0, 70.0);
+        let switched = owner_frame_with_other(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(500.0)),
+            b,
+            geometry,
+            vec![pointer_button(press, true)],
+            Some((
+                other,
+                Rect::from_min_size(pos2(40.0, 40.0), Vec2::splat(100.0)),
+            )),
+        );
+        assert_eq!(
+            ctx.memory(|m| m.interaction().potential_drag_id),
+            Some(other)
+        );
+        assert_eq!(switched.state.offset.y, 500.0);
+        assert!(matches!(capture(&ctx), ExternalScrollCapture::Idle { .. }));
+        let moved = owner_frame_with_other(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(500.0)),
+            b,
+            geometry,
+            vec![crate::Event::PointerMoved(press - Vec2::new(0.0, 30.0))],
+            Some((
+                other,
+                Rect::from_min_size(pos2(40.0, 40.0), Vec2::splat(100.0)),
+            )),
+        );
+        assert_eq!(moved.state.offset.y, 500.0);
+    }
+
+    #[test]
+    fn external_capture_short_bar_click_retains_native_click_evidence() {
+        let ctx = Context::default();
+        external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![],
+        );
+        let first = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![],
+        );
+        let press = pos2(
+            first.inner_rect.right() + 3.0,
+            first.inner_rect.top() + 130.0,
+        );
+        let clicked = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![pointer_button(press, true), pointer_button(press, false)],
+        );
+        assert!(
+            ctx.read_response(Id::unique("external-test-transport").with(1_usize))
+                .unwrap()
+                .clicked()
+        );
+        assert!(clicked.state.offset.y > 500.0);
+        assert!(matches!(
+            capture(&ctx),
+            ExternalScrollCapture::Sequence {
+                phase: ExternalCapturePhase::Released { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn external_capture_first_destination_press_keeps_normal_drag_release_and_coast() {
+        let ctx = Context::default();
+        let a = Id::unique("owner-a");
+        let b = Id::unique("owner-b");
+        let geometry = Id::unique("geometry");
+        let first = owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(300.0)),
+            a,
+            geometry,
+            vec![],
+        );
+        let start = first.inner_rect.center();
+        let pressed = owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(500.0)),
+            b,
+            geometry,
+            vec![pointer_button(start, true)],
+        );
+        assert_eq!(pressed.state.offset.y, 500.0);
+        assert!(
+            matches!(capture(&ctx), ExternalScrollCapture::Sequence { session, .. } if session == b)
+        );
+        let moved = owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(500.0)),
+            b,
+            geometry,
+            vec![crate::Event::PointerMoved(start - Vec2::new(0.0, 40.0))],
+        );
+        assert_eq!(moved.state.offset.y, 540.0);
+        let released = owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(540.0)),
+            b,
+            geometry,
+            vec![pointer_button(start - Vec2::new(0.0, 40.0), false)],
+        );
+        assert!(released.state.vel.y > 0.0);
+        let coast = owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(released.state.offset.y)),
+            b,
+            geometry,
+            vec![],
+        );
+        assert!(coast.state.offset.y > released.state.offset.y);
+    }
+
+    #[test]
+    fn external_capture_duplicate_press_and_escape_do_not_revive_old_hold() {
+        let ctx = Context::default();
+        let a = Id::unique("owner-a");
+        let b = Id::unique("owner-b");
+        let geometry = Id::unique("geometry");
+        let first = owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(300.0)),
+            a,
+            geometry,
+            vec![],
+        );
+        let start = first.inner_rect.center();
+        owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(300.0)),
+            a,
+            geometry,
+            vec![pointer_button(start, true)],
+        );
+        let repeated = owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(500.0)),
+            b,
+            geometry,
+            vec![pointer_button(start, true)],
+        );
+        assert_eq!(repeated.state.offset.y, 500.0);
+        assert!(
+            matches!(capture(&ctx), ExternalScrollCapture::Sequence { session, .. } if session == a)
+        );
+        owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(500.0)),
+            b,
+            geometry,
+            vec![crate::Event::Key {
+                key: crate::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: crate::Modifiers::NONE,
+            }],
+        );
+        assert!(matches!(
+            capture(&ctx),
+            ExternalScrollCapture::Sequence {
+                phase: ExternalCapturePhase::Released { .. },
+                ..
+            }
+        ));
+        let moved = owner_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            Some(ExternalScrollPosition::Sync(500.0)),
+            a,
+            geometry,
+            vec![crate::Event::PointerMoved(start - Vec2::new(0.0, 80.0))],
+        );
+        assert_eq!(moved.state.offset.y, 500.0);
+    }
+
+    #[test]
+    fn clamped_offset() {
+        let state = State {
+            offset: Vec2::new(-10.0, 150.0),
+            max_offset: Vec2::new(-20.0, 100.0),
+            ..Default::default()
+        };
+        assert_eq!(state.clamped_offset(), Vec2::new(0.0, 100.0));
+        assert_eq!(state.overscroll(), Vec2::new(-10.0, 50.0));
     }
 }

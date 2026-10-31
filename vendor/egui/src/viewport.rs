@@ -33,7 +33,9 @@
 //! In short: immediate viewports are simpler to use, but can waste a lot of CPU time.
 //!
 //! ### Embedded viewports
-//! These are not real, independent viewports, but is a fallback mode for when the integration does not support real viewports. In your callback is called with [`ViewportClass::Embedded`] it means you need to create a [`crate::Window`] to wrap your ui in, which will then be embedded in the parent viewport, unable to escape it.
+//! These are not real, independent viewports, but is a fallback mode for when the integration does not support real viewports.
+//! In your callback is called with [`ViewportClass::EmbeddedWindow`] it means the viewport is embedded inside of
+//! a regular [`crate::Window`], trapped in the parent viewport.
 //!
 //!
 //! ## Using the viewports
@@ -67,11 +69,10 @@
 //! There are several more things related to viewports that we want to add.
 //! Read more at <https://github.com/emilk/egui/issues/3556>.
 
-use std::sync::Arc;
+use alloc::sync::Arc;
 
+use crate::{Context, Id, Ui};
 use epaint::{Pos2, Vec2};
-
-use crate::{Context, Id};
 
 // ----------------------------------------------------------------------------
 
@@ -101,7 +102,10 @@ pub enum ViewportClass {
 
     /// The fallback, when the egui integration doesn't support viewports,
     /// or [`crate::Context::embed_viewports`] is set to `true`.
-    Embedded,
+    ///
+    /// If you get this, it is because you are already wrapped in a [`crate::Window`]
+    /// inside of the parent viewport.
+    EmbeddedWindow,
 }
 
 // ----------------------------------------------------------------------------
@@ -116,13 +120,13 @@ pub struct ViewportId(pub Id);
 // We implement `PartialOrd` and `Ord` so we can use `ViewportId` in a `BTreeMap`,
 // which allows predicatable iteration order, frame-to-frame.
 impl PartialOrd for ViewportId {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for ViewportId {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         self.0.value().cmp(&other.0.value())
     }
 }
@@ -134,8 +138,8 @@ impl Default for ViewportId {
     }
 }
 
-impl std::fmt::Debug for ViewportId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for ViewportId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         self.0.short_debug_format().fmt(f)
     }
 }
@@ -145,8 +149,14 @@ impl ViewportId {
     pub const ROOT: Self = Self(Id::NULL);
 
     #[inline]
-    pub fn from_hash_of(source: impl std::hash::Hash) -> Self {
-        Self(Id::new(source))
+    pub fn from_hash_of(source: impl core::hash::Hash + core::fmt::Debug) -> Self {
+        Self(Id::unique(source))
+    }
+
+    /// The [`Id`] of the root [`crate::Ui`] of this viewport,
+    /// i.e. the `Ui` passed to the closure of [`crate::Context::run_ui`].
+    pub fn root_ui_id(&self) -> Id {
+        Id::unique((*self, "__top_ui"))
     }
 }
 
@@ -166,7 +176,7 @@ pub type ViewportIdSet = nohash_hasher::IntSet<ViewportId>;
 pub type ViewportIdMap<T> = nohash_hasher::IntMap<ViewportId, T>;
 
 /// An order map from [`ViewportId`] to `T`.
-pub type OrderedViewportIdMap<T> = std::collections::BTreeMap<ViewportId, T>;
+pub type OrderedViewportIdMap<T> = alloc::collections::BTreeMap<ViewportId, T>;
 
 // ----------------------------------------------------------------------------
 
@@ -194,8 +204,8 @@ impl IconData {
     }
 }
 
-impl std::fmt::Debug for IconData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for IconData {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("IconData")
             .field("width", &self.width)
             .field("height", &self.height)
@@ -258,7 +268,7 @@ impl ViewportIdPair {
 }
 
 /// The user-code that shows the ui in the viewport, used for deferred viewports.
-pub type DeferredViewportUiCallback = dyn Fn(&Context) + Sync + Send;
+pub type DeferredViewportUiCallback = dyn Fn(&mut Ui) + Sync + Send;
 
 /// Render the given viewport, calling the given ui callback.
 pub type ImmediateViewportRendererCallback = dyn for<'a> Fn(&Context, ImmediateViewport<'a>);
@@ -327,6 +337,20 @@ pub struct ViewportBuilder {
 
     // X11
     pub window_type: Option<X11WindowType>,
+    pub override_redirect: Option<bool>,
+
+    /// Target monitor index for borderless fullscreen.
+    ///
+    /// When set, the window is placed in borderless fullscreen on the monitor at
+    /// the given index in `available_monitors()` order (same order returned by
+    /// winit). Works on Windows, macOS, and Linux (X11 + Wayland).
+    ///
+    /// If the index is out of range, it is ignored and a warning is logged.
+    ///
+    /// Takes precedence over [`Self::with_position`] / [`Self::with_fullscreen`]
+    /// for monitor selection: if both are set, the window will be fullscreen on
+    /// the chosen monitor.
+    pub monitor: Option<usize>,
 }
 
 impl ViewportBuilder {
@@ -658,10 +682,33 @@ impl ViewportBuilder {
 
     /// ### On X11
     /// This sets the window type.
-    /// Maps directly to [`_NET_WM_WINDOW_TYPE`](https://specifications.freedesktop.org/wm-spec/wm-spec-1.5.html).
+    /// Maps directly to [`_NET_WM_WINDOW_TYPE`](https://specifications.freedesktop.org/wm/1.5/ar01s05.html#id-1.6.7).
     #[inline]
     pub fn with_window_type(mut self, value: X11WindowType) -> Self {
         self.window_type = Some(value);
+        self
+    }
+
+    /// ### On X11
+    /// This sets the override-redirect flag. When this is set to true the window type should be specified.
+    /// Maps directly to [`Override-redirect windows`](https://specifications.freedesktop.org/wm/1.5/ar01s02.html#id-1.3.13).
+    #[inline]
+    pub fn with_override_redirect(mut self, value: bool) -> Self {
+        self.override_redirect = Some(value);
+        self
+    }
+
+    /// Place the window in borderless fullscreen on the monitor at `index`.
+    ///
+    /// The index refers to the order returned by winit's `available_monitors()`.
+    /// Works cross-platform (Windows, macOS, Linux X11 + Wayland). On Wayland
+    /// this is the only reliable way to target a specific output, since
+    /// absolute window positions are not exposed.
+    ///
+    /// If the index is out of range, the flag is ignored at window creation time.
+    #[inline]
+    pub fn with_monitor(mut self, index: usize) -> Self {
+        self.monitor = Some(index);
         self
     }
 
@@ -701,6 +748,8 @@ impl ViewportBuilder {
             mouse_passthrough: new_mouse_passthrough,
             taskbar: new_taskbar,
             window_type: new_window_type,
+            override_redirect: new_override_redirect,
+            monitor: new_monitor,
         } = new_vp_builder;
 
         let mut commands = Vec::new();
@@ -782,7 +831,7 @@ impl ViewportBuilder {
             };
 
             if is_new {
-                commands.push(ViewportCommand::Icon(Some(new_icon.clone())));
+                commands.push(ViewportCommand::Icon(Some(Arc::clone(&new_icon))));
                 self.icon = Some(new_icon);
             }
         }
@@ -896,6 +945,18 @@ impl ViewportBuilder {
         if new_window_type.is_some() && self.window_type != new_window_type {
             self.window_type = new_window_type;
             recreate_window = true;
+        }
+
+        if new_override_redirect.is_some() && self.override_redirect != new_override_redirect {
+            self.override_redirect = new_override_redirect;
+            recreate_window = true;
+        }
+
+        if let Some(new_monitor) = new_monitor
+            && Some(new_monitor) != self.monitor
+        {
+            self.monitor = Some(new_monitor);
+            commands.push(ViewportCommand::SetMonitor(new_monitor));
         }
 
         (commands, recreate_window)
@@ -1022,6 +1083,9 @@ pub enum ResizeDirection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub enum ViewportCommand {
+    /// Finish already approved child lifetimes, outside all UI passes.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    RetireApproved(ApprovedViewportRetirement),
     /// Request this viewport to be closed.
     ///
     /// For the root viewport, this usually results in the application shutting down.
@@ -1084,6 +1148,12 @@ pub enum ViewportCommand {
     /// Turn borderless fullscreen on/off.
     Fullscreen(bool),
 
+    /// Move the window to borderless fullscreen on the monitor at the given index.
+    ///
+    /// Index refers to winit's `available_monitors()` order. If out of range, the
+    /// command is ignored (logged as a warning).
+    SetMonitor(usize),
+
     /// Show window decorations, i.e. the chrome around the content
     /// with the title bar, close buttons, resize handles, etc.
     Decorations(bool),
@@ -1132,10 +1202,10 @@ pub enum ViewportCommand {
     /// Enable mouse pass-through: mouse clicks pass through the window, used for non-interactable overlays.
     MousePassthrough(bool),
 
-    /// Take a screenshot of the next frame after this.
+    /// Take a screenshot of the next frame after this and pass it to a callback.
     ///
-    /// The results are returned in [`crate::Event::Screenshot`].
-    Screenshot(crate::UserData),
+    /// Use [`crate::Context::request_screenshot`] for a convenient way to send this command.
+    Screenshot(crate::ScreenshotCallback),
 
     /// Request cut of the current selection
     ///
@@ -1151,6 +1221,25 @@ pub enum ViewportCommand {
     ///
     /// This is equivalent to the system keyboard shortcut for paste (e.g. CTRL + V).
     RequestPaste,
+
+    /// Run `eframe::App::ui` and paint a frame, even though this window is hidden.
+    ///
+    /// Integrations run no pass at all while a window is minimized or occluded
+    /// (see [`crate::ViewportInfo::visible`]), since nothing would be shown: they run only the
+    /// app logic, via [`crate::Context::run_logic`]. This asks for the full thing — ui and
+    /// paint — with nothing on screen to show for it.
+    ///
+    /// This is what lets a tool drive an app that sits in the background. `egui_inspection`
+    /// (and the `egui_mcp` server on top of it) sends this with every request it serves,
+    /// because each of them needs the ui to run: a screenshot needs the painted pixels, the
+    /// widget tree is what the pass produces, and injected clicks and keystrokes are only
+    /// *applied* by a pass. Without it an inspector attached to a backgrounded app can only
+    /// time out until a human brings the window up again.
+    ///
+    /// A pending [`Self::Screenshot`] asks for the same thing, so it needs no company.
+    ///
+    /// Holds for one frame; send it again for another.
+    RequestPaintWhileHidden,
 }
 
 impl ViewportCommand {
@@ -1161,8 +1250,8 @@ impl ViewportCommand {
             let size = outer_rect.size();
             let monitor_size = i.viewport().monitor_size?;
             if 1.0 < monitor_size.x && 1.0 < monitor_size.y {
-                let x = (monitor_size.x - size.x) / 2.0;
-                let y = (monitor_size.y - size.y) / 2.0;
+                let x = (monitor_size.x - size.x) * 0.5;
+                let y = (monitor_size.y - size.y) * 0.5;
                 Some(Self::OuterPosition([x, y].into()))
             } else {
                 None
@@ -1178,18 +1267,84 @@ impl ViewportCommand {
 
 // ----------------------------------------------------------------------------
 
+/// Opaque identity of one live viewport registration. Reopening an ID gets a
+/// different identity. This is not a persistent widget ID or a surface generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ViewportRegistration {
+    pub(crate) id: ViewportId,
+    pub(crate) lifetime: ViewportLifetime,
+}
+
+impl ViewportRegistration {
+    /// The viewport ID for this particular registration lifetime.
+    pub fn viewport_id(self) -> ViewportId {
+        self.id
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ViewportLifetime(u64);
+
+impl Default for ViewportLifetime {
+    fn default() -> Self {
+        static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// Authority transferred by an application owner after its close decision.
+/// Contains only exact registration lifetimes, never a request to ask again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovedViewportRetirement {
+    pub(crate) registrations: Vec<ViewportRegistration>,
+}
+
+impl ApprovedViewportRetirement {
+    /// Registrations captured at approval. Native adapters extend this through
+    /// their retained exact parent registrations if Context GC ran first.
+    pub fn registrations(&self) -> &[ViewportRegistration] {
+        &self.registrations
+    }
+
+    /// Add live descendants whose exact parent lifetime is already approved.
+    pub fn include_descendants(
+        &mut self,
+        owners: &[(ViewportRegistration, Option<ViewportRegistration>)],
+    ) {
+        loop {
+            let count = self.registrations.len();
+            for &(registration, parent) in owners {
+                if registration.id != ViewportId::ROOT
+                    && parent.is_some_and(|parent| self.registrations.contains(&parent))
+                    && !self.registrations.contains(&registration)
+                {
+                    self.registrations.push(registration);
+                }
+            }
+            if count == self.registrations.len() {
+                break;
+            }
+        }
+    }
+}
+
 /// Describes a viewport, i.e. a native window.
 ///
-/// This is returned by [`crate::Context::run`] on each frame, and should be applied
+/// This is returned by [`crate::Context::run_ui`] on each frame, and should be applied
 /// by the integration.
 #[derive(Clone)]
 pub struct ViewportOutput {
+    /// Exact Context registration that produced this output.
+    pub registration: ViewportRegistration,
+
+    /// Exact registration of the owning parent, if registered.
+    pub parent_registration: Option<ViewportRegistration>,
     /// Id of our parent viewport.
     pub parent: ViewportId,
 
     /// What type of viewport are we?
     ///
-    /// This will never be [`ViewportClass::Embedded`],
+    /// This will never be [`ViewportClass::EmbeddedWindow`],
     /// since those don't result in real viewports.
     pub class: ViewportClass,
 
@@ -1214,13 +1369,36 @@ pub struct ViewportOutput {
     /// but if you haven't, you can use this instead.
     ///
     /// If the duration is zero, schedule a repaint immediately.
-    pub repaint_delay: std::time::Duration,
+    pub repaint_delay: core::time::Duration,
 }
 
 impl ViewportOutput {
     /// Add on new output.
     pub fn append(&mut self, newer: Self) {
+        if self.registration != newer.registration {
+            if newer.registration.lifetime.0 < self.registration.lifetime.0 {
+                self.commands.extend(
+                    newer
+                        .commands
+                        .into_iter()
+                        .filter(|command| matches!(command, ViewportCommand::RetireApproved(_))),
+                );
+                return;
+            }
+            // Never mix builders, callbacks or ordinary commands across lifetimes.
+            // RetireApproved normally travels on the never-replaced root owner.
+            let approvals: Vec<_> = self
+                .commands
+                .drain(..)
+                .filter(|command| matches!(command, ViewportCommand::RetireApproved(_)))
+                .collect();
+            *self = newer;
+            self.commands.extend(approvals);
+            return;
+        }
         let Self {
+            registration: _,
+            parent_registration,
             parent,
             class,
             builder,
@@ -1230,6 +1408,7 @@ impl ViewportOutput {
         } = newer;
 
         self.parent = parent;
+        self.parent_registration = parent_registration;
         self.class = class;
         let _ = self.builder.patch(builder); // we ignore the returned command, because `self.builder` will be the basis of a new patch
         self.viewport_ui_cb = viewport_ui_cb;
@@ -1246,5 +1425,5 @@ pub struct ImmediateViewport<'a> {
     pub builder: ViewportBuilder,
 
     /// The user-code that shows the GUI.
-    pub viewport_ui_cb: Box<dyn FnMut(&Context) + 'a>,
+    pub viewport_ui_cb: Box<dyn FnMut(&mut Ui) + 'a>,
 }

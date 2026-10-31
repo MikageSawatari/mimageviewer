@@ -19,9 +19,10 @@ pub(crate) use permission::*;
 pub(crate) use projection::*;
 pub use resolve::*;
 pub(crate) use service::*;
+#[cfg(test)]
+pub(crate) use store::initialize_database_at;
 pub(crate) use store::{
-    StoredComposition, initialize_database_at, migrate_page_paths_at, validate_database_rows,
-    validate_database_schema,
+    StoredComposition, migrate_page_paths_at, validate_database_rows, validate_database_schema,
 };
 
 #[cfg(test)]

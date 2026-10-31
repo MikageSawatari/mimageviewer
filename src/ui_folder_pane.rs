@@ -10,9 +10,59 @@ const FOLDER_PANE_MIN_WIDTH: f32 = 180.0;
 const FOLDER_PANE_MAX_WIDTH: f32 = 900.0;
 const FOLDER_PANE_MIN_RATIO: f32 = 0.12;
 const FOLDER_PANE_MAX_RATIO: f32 = 0.45;
+const FOLDER_PANE_PANEL_ID: &str = "folder_tree_pane";
 const FOLDER_PANE_ROW_HEIGHT: f32 = 24.0;
 const FOLDER_PANE_INDENT_WIDTH: f32 = 14.0;
 const FOLDER_PANE_ARROW_WIDTH: f32 = 24.0;
+
+fn show_folder_pane_panel<R>(
+    root_ui: &mut egui::Ui,
+    saved_ratio: f32,
+    resizable: bool,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> (egui::InnerResponse<R>, Option<f32>) {
+    let content_width = root_ui.ctx().content_rect().width().max(1.0);
+    let max_width = FOLDER_PANE_MAX_WIDTH.min((content_width - 240.0).max(FOLDER_PANE_MIN_WIDTH));
+    let default_width = (saved_ratio * content_width).clamp(FOLDER_PANE_MIN_WIDTH, max_width);
+    // Panel's returned response belongs to its frame, not its resize handle.
+    // Match vendor/egui/src/containers/panel.rs::resize_widget_id, using the
+    // parent scope just as Panel::id does. The input tests exercise the actual
+    // handle so an egui ID change cannot silently disable width persistence.
+    let resize_id = root_ui
+        .make_persistent_id(FOLDER_PANE_PANEL_ID)
+        .with("__resize");
+    // Match Panel::accesskit_resize_request: opposing steps cancel, and only
+    // numeric SetValue requests are accepted. Read before drawing contents,
+    // at the same input boundary where Panel applies these requests.
+    let accesskit_resize_requested = root_ui.input(|input| {
+        use egui::accesskit::{Action, ActionData};
+        input.num_accesskit_action_requests(resize_id, Action::Increment)
+            != input.num_accesskit_action_requests(resize_id, Action::Decrement)
+            || input
+                .accesskit_action_requests(resize_id, Action::SetValue)
+                .any(|request| matches!(request.data, Some(ActionData::NumericValue(_))))
+    });
+    let panel = egui::Panel::left(FOLDER_PANE_PANEL_ID)
+        .resizable(resizable)
+        .default_size(default_width)
+        .size_range(FOLDER_PANE_MIN_WIDTH..=max_width)
+        .show(root_ui, add_contents);
+    // Layout constraints and startup/window size changes must not overwrite
+    // the user's preferred ratio. Include the release frame: Panel also uses
+    // its final pointer position there when committing the resized width.
+    let resized_by_user = resizable
+        && (accesskit_resize_requested
+            || root_ui
+                .ctx()
+                .read_response(resize_id)
+                .is_some_and(|response| response.dragged() || response.drag_stopped()));
+    let width_ratio = (panel.response.rect.width() / content_width)
+        .clamp(FOLDER_PANE_MIN_RATIO, FOLDER_PANE_MAX_RATIO);
+    let changed_ratio =
+        (resized_by_user && width_ratio.is_finite() && (saved_ratio - width_ratio).abs() > 0.0005)
+            .then_some(width_ratio);
+    (panel, changed_ratio)
+}
 
 pub(crate) fn folder_pane_hover_blocks_grid_scroll(
     pane_visible: bool,
@@ -67,6 +117,103 @@ fn show_bounded_folder_pane_body<R>(
     );
     body_ui.set_clip_rect(body_rect.intersect(ui.clip_rect()));
     add_contents(&mut body_ui)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FolderPaneRowBackground {
+    None,
+    ActiveLocation,
+    FocusedCursor,
+}
+
+fn folder_pane_row_background(
+    is_active: bool,
+    is_cursor: bool,
+    has_focus: bool,
+) -> FolderPaneRowBackground {
+    if is_cursor && has_focus {
+        FolderPaneRowBackground::FocusedCursor
+    } else if is_active {
+        FolderPaneRowBackground::ActiveLocation
+    } else {
+        FolderPaneRowBackground::None
+    }
+}
+
+fn folder_pane_row_fill(
+    visuals: &egui::Visuals,
+    background: FolderPaneRowBackground,
+) -> Option<egui::Color32> {
+    match background {
+        FolderPaneRowBackground::None => None,
+        FolderPaneRowBackground::ActiveLocation => {
+            Some(visuals.selection.bg_fill.gamma_multiply(0.35))
+        }
+        FolderPaneRowBackground::FocusedCursor => Some(visuals.selection.bg_fill),
+    }
+}
+
+/// Pure row drawing shared by the live tree and snapshots. Commands remain with the pane owner.
+fn draw_folder_pane_row(
+    ui: &mut egui::Ui,
+    row: &folder_pane::FolderPaneRow,
+    has_focus: bool,
+) -> (egui::Response, egui::Response) {
+    ui.horizontal(|ui| {
+        ui.set_height(FOLDER_PANE_ROW_HEIGHT);
+        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.add_space(row.depth as f32 * FOLDER_PANE_INDENT_WIDTH);
+        let arrow = if row.has_children_or_unknown {
+            if row.expanded { "▼" } else { "▶" }
+        } else {
+            " "
+        };
+        let arrow_resp = ui.add_sized(
+            egui::vec2(FOLDER_PANE_ARROW_WIDTH, FOLDER_PANE_ROW_HEIGHT),
+            egui::Button::new(egui::RichText::new(arrow).size(16.0).strong()).frame(false),
+        );
+
+        let label = folder_pane::folder_label(&row.path);
+        let mut text = egui::RichText::new(label);
+        if row.is_active {
+            text = text.strong();
+        }
+        if row.error.is_some() {
+            text = text.color(ui.visuals().warn_fg_color);
+        }
+        let background = folder_pane_row_background(row.is_active, row.is_cursor, has_focus);
+        let trailing_width = folder_pane_trailing_width(ui, row.loading || row.error.is_some());
+        let label_width = (ui.available_width() - trailing_width).max(16.0);
+        let (label_rect, label_resp) = ui.allocate_exact_size(
+            egui::vec2(label_width, FOLDER_PANE_ROW_HEIGHT),
+            egui::Sense::click(),
+        );
+        if let Some(fill) = folder_pane_row_fill(ui.visuals(), background) {
+            ui.painter()
+                .rect_filled(label_rect, ui.visuals().widgets.active.corner_radius, fill);
+        }
+        let mut label_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(label_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        label_ui.set_clip_rect(label_rect.intersect(ui.clip_rect()));
+        label_ui.add(
+            egui::Label::new(text)
+                .truncate()
+                .selectable(false)
+                .halign(egui::Align::Min),
+        );
+        let resp = label_resp.on_hover_text(row.path.display().to_string());
+
+        if row.loading {
+            ui.spinner();
+        } else if row.error.is_some() {
+            ui.label(egui::RichText::new("!").color(ui.visuals().warn_fg_color));
+        }
+        (arrow_resp, resp)
+    })
+    .inner
 }
 
 impl App {
@@ -197,8 +344,9 @@ impl App {
 
     pub(crate) fn render_folder_pane(
         &mut self,
-        ctx: &egui::Context,
+        root_ui: &mut egui::Ui,
     ) -> (Option<std::path::PathBuf>, Option<egui::Rect>) {
+        let ctx = &root_ui.ctx().clone();
         if !self.settings.folder_tree_pane_visible {
             return (None, None);
         }
@@ -210,27 +358,20 @@ impl App {
         }
 
         let mut nav = None;
-        let content_width = ctx.content_rect().width().max(1.0);
-        let max_width =
-            FOLDER_PANE_MAX_WIDTH.min((content_width - 240.0).max(FOLDER_PANE_MIN_WIDTH));
-        let default_width = (self.settings.folder_tree_pane_width_ratio * content_width)
-            .clamp(FOLDER_PANE_MIN_WIDTH, max_width);
-        let panel = egui::SidePanel::left("folder_tree_pane")
-            .resizable(true)
-            .default_width(default_width)
-            .width_range(FOLDER_PANE_MIN_WIDTH..=max_width)
-            .show(ctx, |ui| {
+        let (panel, changed_ratio) = show_folder_pane_panel(
+            root_ui,
+            self.settings.folder_tree_pane_width_ratio,
+            !self.main_chrome_pointer_blocked(),
+            |ui| {
+                self.gate_main_chrome(ui);
                 ui.add_enabled_ui(!disabled, |ui| {
                     self.render_folder_pane_header(ui);
                     ui.separator();
                     nav = show_bounded_folder_pane_body(ui, |ui| self.render_folder_pane_tree(ui));
                 });
-            });
-        let width_ratio = (panel.response.rect.width() / content_width)
-            .clamp(FOLDER_PANE_MIN_RATIO, FOLDER_PANE_MAX_RATIO);
-        if width_ratio.is_finite()
-            && (self.settings.folder_tree_pane_width_ratio - width_ratio).abs() > 0.0005
-        {
+            },
+        );
+        if let Some(width_ratio) = changed_ratio {
             self.settings.folder_tree_pane_width_ratio = width_ratio;
         }
         (nav, Some(panel.response.rect))
@@ -245,7 +386,7 @@ impl App {
                 .unwrap_or_else(|| "Drive".to_string());
             let mut next_drive = selected_drive.clone();
             let drives = self.folder_pane.drives().to_vec();
-            egui::ComboBox::from_id_salt("folder_pane_drive_combo")
+            let named_combo = egui::ComboBox::from_id_salt("folder_pane_drive_combo")
                 .width(54.0)
                 .selected_text(selected_text)
                 .show_ui(ui, |ui| {
@@ -259,6 +400,7 @@ impl App {
                         }
                     }
                 });
+            crate::ui_helpers::set_accessibility_label(&named_combo.response, "Drive");
             if let Some(drive) = next_drive
                 && selected_drive
                     .as_ref()
@@ -309,94 +451,39 @@ impl App {
         let scroll_to_cursor = self.folder_pane.scroll_to_cursor;
         let mut cursor_scrolled = false;
         egui::ScrollArea::vertical()
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Always,
+                ..Default::default()
+            })
             .id_salt("folder_pane_tree_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 for row in rows {
-                    let mut row_response = None;
-                    ui.horizontal(|ui| {
-                        ui.set_height(FOLDER_PANE_ROW_HEIGHT);
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        ui.add_space(row.depth as f32 * FOLDER_PANE_INDENT_WIDTH);
-                        let arrow = if row.has_children_or_unknown {
-                            if row.expanded { "▼" } else { "▶" }
+                    let (arrow_resp, resp) =
+                        draw_folder_pane_row(ui, &row, self.folder_pane.has_focus);
+                    if row.has_children_or_unknown && arrow_resp.clicked() {
+                        self.folder_pane.set_focus_tree();
+                        self.folder_pane.set_cursor(row.path.clone());
+                        let key = if row.expanded {
+                            FolderPaneTreeKey::Left
                         } else {
-                            " "
+                            FolderPaneTreeKey::Right
                         };
-                        let arrow_resp = ui.add_sized(
-                            egui::vec2(FOLDER_PANE_ARROW_WIDTH, FOLDER_PANE_ROW_HEIGHT),
-                            egui::Button::new(egui::RichText::new(arrow).size(16.0).strong())
-                                .frame(false),
-                        );
-                        if row.has_children_or_unknown && arrow_resp.clicked() {
-                            self.folder_pane.set_focus_tree();
-                            self.folder_pane.set_cursor(row.path.clone());
-                            let key = if row.expanded {
-                                FolderPaneTreeKey::Left
-                            } else {
-                                FolderPaneTreeKey::Right
-                            };
-                            let _ = self.folder_pane.handle_tree_key(key);
+                        let _ = self.folder_pane.handle_tree_key(key);
+                    }
+                    if resp.clicked() {
+                        self.folder_pane.set_focus_tree();
+                        self.folder_pane.set_cursor(row.path.clone());
+                        if self
+                            .folder_pane
+                            .active_path()
+                            .is_none_or(|active| !crate::folder_tree::path_eq(active, &row.path))
+                        {
+                            nav = Some(row.path.clone());
                         }
-
-                        let label = folder_pane::folder_label(&row.path);
-                        let mut text = egui::RichText::new(label);
-                        if row.is_active {
-                            text = text.strong();
-                        }
-                        if row.error.is_some() {
-                            text = text.color(ui.visuals().warn_fg_color);
-                        }
-                        let selected = row.is_cursor && self.folder_pane.has_focus;
-                        let trailing_width =
-                            folder_pane_trailing_width(ui, row.loading || row.error.is_some());
-                        let label_width = (ui.available_width() - trailing_width).max(16.0);
-                        let (label_rect, label_resp) = ui.allocate_exact_size(
-                            egui::vec2(label_width, FOLDER_PANE_ROW_HEIGHT),
-                            egui::Sense::click(),
-                        );
-                        if selected {
-                            ui.painter().rect_filled(
-                                label_rect,
-                                ui.visuals().widgets.active.corner_radius,
-                                ui.visuals().selection.bg_fill,
-                            );
-                        }
-                        let mut label_ui = ui.new_child(
-                            egui::UiBuilder::new()
-                                .max_rect(label_rect)
-                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                        );
-                        label_ui.set_clip_rect(label_rect.intersect(ui.clip_rect()));
-                        label_ui.add(
-                            egui::Label::new(text)
-                                .truncate()
-                                .selectable(false)
-                                .halign(egui::Align::Min),
-                        );
-                        let resp = label_resp.on_hover_text(row.path.display().to_string());
-                        if resp.clicked() {
-                            self.folder_pane.set_focus_tree();
-                            self.folder_pane.set_cursor(row.path.clone());
-                            if self.folder_pane.active_path().is_none_or(|active| {
-                                !crate::folder_tree::path_eq(active, &row.path)
-                            }) {
-                                nav = Some(row.path.clone());
-                            }
-                        }
-                        if row.loading {
-                            ui.spinner();
-                        } else if row.error.is_some() {
-                            ui.label(egui::RichText::new("!").color(ui.visuals().warn_fg_color));
-                        }
-                        row_response = Some(resp);
-                    });
-
-                    if scroll_to_cursor
-                        && row.is_cursor
-                        && let Some(resp) = row_response
-                    {
+                    }
+                    if scroll_to_cursor && row.is_cursor {
                         resp.scroll_to_me(Some(egui::Align::Center));
                         cursor_scrolled = true;
                     }
@@ -409,9 +496,327 @@ impl App {
     }
 }
 
+#[doc(hidden)]
+pub fn draw_folder_pane_location_snapshot_fixture(ui: &mut egui::Ui) {
+    for (title, has_focus, cursor) in [
+        ("現在地のみ（フォーカスなし）", false, 1),
+        ("操作カーソル ≠ 現在地（フォーカスあり）", true, 2),
+        ("同じ行（フォーカスあり）", true, 1),
+    ] {
+        ui.push_id(title, |ui| {
+            ui.label(title);
+            for (index, path) in [
+                r"C:\Pictures",
+                r"C:\Pictures\現在のフォルダ",
+                r"C:\Pictures\次のフォルダ",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let row = folder_pane::FolderPaneRow {
+                    path: path.into(),
+                    depth: usize::from(index != 0),
+                    expanded: index == 0,
+                    loading: false,
+                    // Unloaded branches have a named disclosure arrow, like the live tree.
+                    has_children_or_unknown: true,
+                    is_active: index == 1,
+                    is_cursor: index == cursor,
+                    error: None,
+                };
+                draw_folder_pane_row(ui, &row, has_focus);
+            }
+        });
+        ui.separator();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct WidthTest {
+        ctx: egui::Context,
+        saved_ratio: f32,
+        resizable: bool,
+        resize_node: Option<egui::accesskit::NodeId>,
+    }
+
+    impl WidthTest {
+        fn new(saved_ratio: f32) -> Self {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            Self {
+                ctx,
+                saved_ratio,
+                resizable: true,
+                resize_node: None,
+            }
+        }
+
+        fn frame(&mut self, width: f32, events: Vec<egui::Event>) -> egui::Rect {
+            let mut rect = egui::Rect::NOTHING;
+            let mut output = self.ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 800.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |root_ui| {
+                    let (panel, changed_ratio) =
+                        show_folder_pane_panel(root_ui, self.saved_ratio, self.resizable, |ui| {
+                            // Exercise another drag target as well as the resize handle.
+                            ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
+                        });
+                    rect = panel.response.rect;
+                    if let Some(ratio) = changed_ratio {
+                        self.saved_ratio = ratio;
+                    }
+                },
+            );
+            // Target the splitter egui actually exposes, without reproducing its ID rule.
+            self.resize_node = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .expect("AccessKit tree update")
+                .nodes
+                .iter()
+                .find_map(|(id, node)| (node.role() == egui::Role::Splitter).then_some(*id));
+            // No renderer is used by these geometry/input tests.
+            output.textures_delta.clear();
+            rect
+        }
+
+        fn drag(&mut self, width: f32, start: egui::Pos2, end: egui::Pos2) -> egui::Rect {
+            self.frame(width, vec![egui::Event::PointerMoved(start)]);
+            self.frame(width, vec![pointer_button(start, true)]);
+            self.frame(width, vec![egui::Event::PointerMoved(end)]);
+            self.frame(width, vec![pointer_button(end, false)])
+        }
+    }
+
+    fn pointer_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn accesskit_resize_event(
+        target_node: egui::accesskit::NodeId,
+        action: egui::accesskit::Action,
+        data: Option<egui::accesskit::ActionData>,
+    ) -> egui::Event {
+        egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+            action,
+            target_tree: egui::accesskit::TreeId::ROOT,
+            target_node,
+            data,
+        })
+    }
+
+    fn assert_accesskit_resize_persists(action: egui::accesskit::Action, fraction: Option<f64>) {
+        let mut pane = WidthTest::new(0.25);
+        let initial = pane.frame(1920.0, vec![]);
+        let step = pane.ctx.global_style().spacing.interact_size.x;
+        let expected_width = match action {
+            egui::accesskit::Action::Increment => initial.width() + step,
+            egui::accesskit::Action::Decrement => initial.width() - step,
+            egui::accesskit::Action::SetValue => fraction.unwrap() as f32 * 1920.0,
+            _ => unreachable!(),
+        };
+        let request = accesskit_resize_event(
+            pane.resize_node.expect("real panel splitter"),
+            action,
+            fraction.map(egui::accesskit::ActionData::NumericValue),
+        );
+        let resized = pane.frame(1920.0, vec![request]);
+        assert!((resized.width() - expected_width).abs() < 1.0);
+        assert!((pane.saved_ratio - expected_width / 1920.0).abs() < 0.0001);
+        let ratio = pane.saved_ratio;
+        pane.frame(2560.0, vec![]);
+        assert_eq!(pane.saved_ratio, ratio);
+        let mut restarted = WidthTest::new(ratio);
+        assert!((restarted.frame(1920.0, vec![]).width() - resized.width()).abs() < 1.0);
+        assert_eq!(restarted.saved_ratio, ratio);
+    }
+
+    #[test]
+    fn section1472_accesskit_increment_persists_across_restart() {
+        assert_accesskit_resize_persists(egui::accesskit::Action::Increment, None);
+    }
+
+    #[test]
+    fn section1472_accesskit_decrement_persists_across_restart() {
+        assert_accesskit_resize_persists(egui::accesskit::Action::Decrement, None);
+    }
+
+    #[test]
+    fn section1472_accesskit_set_value_persists_across_restart() {
+        assert_accesskit_resize_persists(egui::accesskit::Action::SetValue, Some(0.4));
+    }
+
+    #[test]
+    fn section1472_accesskit_unapplied_requests_do_not_save_constrained_width() {
+        use egui::accesskit::Action;
+        let mut pane = WidthTest::new(0.12);
+        pane.frame(1280.0, vec![]);
+        let target = pane.resize_node.unwrap();
+        for requests in [
+            vec![accesskit_resize_event(
+                egui::accesskit_root_id().accesskit_id(),
+                Action::Increment,
+                None,
+            )],
+            vec![accesskit_resize_event(target, Action::SetValue, None)],
+            vec![
+                accesskit_resize_event(target, Action::Increment, None),
+                accesskit_resize_event(target, Action::Decrement, None),
+            ],
+        ] {
+            let rect = pane.frame(1280.0, requests);
+            assert!((rect.width() - FOLDER_PANE_MIN_WIDTH).abs() < 1.0);
+            assert_eq!(pane.saved_ratio, 0.12);
+        }
+    }
+
+    #[test]
+    fn section1472_accesskit_blocked_resize_does_not_change_width_or_ratio() {
+        let mut pane = WidthTest::new(0.12);
+        let initial = pane.frame(1280.0, vec![]);
+        let target = pane.resize_node.unwrap();
+        pane.resizable = false;
+        let resized = pane.frame(
+            1280.0,
+            vec![accesskit_resize_event(
+                target,
+                egui::accesskit::Action::Increment,
+                None,
+            )],
+        );
+        assert_eq!(resized.width(), initial.width());
+        assert_eq!(pane.saved_ratio, 0.12);
+    }
+
+    #[test]
+    fn section1472_startup_growth_preserves_ratio_across_restarts() {
+        let mut ratio = 0.35;
+        let mut widths = Vec::new();
+        for _ in 0..5 {
+            let mut pane = WidthTest::new(ratio);
+            let initial = pane.frame(1280.0, vec![]);
+            let grown = pane.frame(1920.0, vec![]);
+            widths.push(initial.width());
+            assert!((grown.width() - initial.width()).abs() < 1.0);
+            ratio = pane.saved_ratio;
+        }
+        assert_eq!(ratio, 0.35, "startup widths: {widths:?}");
+        assert!(widths.iter().all(|width| (*width - 448.0).abs() < 1.0));
+    }
+
+    #[test]
+    fn section1472_same_size_startup_preserves_ratio() {
+        let mut ratio = 0.35;
+        for _ in 0..5 {
+            let mut pane = WidthTest::new(ratio);
+            pane.frame(1920.0, vec![]);
+            let rect = pane.frame(1920.0, vec![]);
+            assert!((rect.width() - 672.0).abs() < 1.0);
+            ratio = pane.saved_ratio;
+        }
+        assert_eq!(ratio, 0.35);
+    }
+
+    #[test]
+    fn section1472_window_and_initial_width_limits_do_not_change_ratio() {
+        for (ratio, width, expected) in [(0.12, 1280.0, 180.0), (0.45, 3840.0, 900.0)] {
+            let mut pane = WidthTest::new(ratio);
+            assert!((pane.frame(width, vec![]).width() - expected).abs() < 1.0);
+            assert_eq!(pane.saved_ratio, ratio);
+        }
+        let mut pane = WidthTest::new(0.35);
+        pane.frame(1920.0, vec![]);
+        let shrunk = pane.frame(640.0, vec![]);
+        assert!((shrunk.width() - 400.0).abs() < 1.0);
+        pane.frame(1920.0, vec![]);
+        assert_eq!(pane.saved_ratio, 0.35);
+    }
+
+    #[test]
+    fn section1472_handle_drag_updates_ratio_with_existing_limits() {
+        for (width, target, expected_width, expected_ratio) in [
+            (1920.0, 600.0, 600.0, 600.0 / 1920.0),
+            (1920.0, 100.0, 180.0, FOLDER_PANE_MIN_RATIO),
+            (1920.0, 1100.0, 900.0, FOLDER_PANE_MAX_RATIO),
+            (640.0, 600.0, 400.0, FOLDER_PANE_MAX_RATIO),
+        ] {
+            let mut pane = WidthTest::new(0.25);
+            let initial = pane.frame(width, vec![]);
+            let start = egui::pos2(initial.right(), initial.center().y);
+            let end = egui::pos2(target, start.y);
+            let resized = pane.drag(width, start, end);
+            assert!(
+                (resized.width() - expected_width).abs() < 1.0,
+                "{resized:?}"
+            );
+            assert!((pane.saved_ratio - expected_ratio).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn section1472_handle_release_uses_final_pointer_position() {
+        let mut pane = WidthTest::new(0.25);
+        let initial = pane.frame(1920.0, vec![]);
+        let start = egui::pos2(initial.right(), initial.center().y);
+        pane.frame(1920.0, vec![egui::Event::PointerMoved(start)]);
+        pane.frame(1920.0, vec![pointer_button(start, true)]);
+        pane.frame(
+            1920.0,
+            vec![egui::Event::PointerMoved(egui::pos2(550.0, start.y))],
+        );
+        let end = egui::pos2(630.0, start.y);
+        let released = pane.frame(
+            1920.0,
+            vec![egui::Event::PointerMoved(end), pointer_button(end, false)],
+        );
+        assert!((released.width() - 630.0).abs() < 1.0);
+        assert!((pane.saved_ratio - 630.0 / 1920.0).abs() < 0.0001);
+        pane.frame(2560.0, vec![]);
+        assert!((pane.saved_ratio - 630.0 / 1920.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn section1472_body_drag_does_not_save_constrained_width() {
+        let mut pane = WidthTest::new(0.12);
+        let initial = pane.frame(1280.0, vec![]);
+        let start = initial.center();
+        let end = start + egui::vec2(40.0, 0.0);
+        pane.drag(1280.0, start, end);
+        assert_eq!(pane.saved_ratio, 0.12);
+    }
+
+    #[test]
+    fn section1451_current_location_and_focused_cursor_backgrounds() {
+        use FolderPaneRowBackground::*;
+        for (active, cursor, focus, expected) in [
+            (false, false, false, None),
+            (false, false, true, None),
+            (false, true, false, None),
+            (false, true, true, FocusedCursor),
+            (true, false, false, ActiveLocation),
+            (true, false, true, ActiveLocation),
+            (true, true, false, ActiveLocation),
+            (true, true, true, FocusedCursor),
+        ] {
+            assert_eq!(folder_pane_row_background(active, cursor, focus), expected);
+        }
+    }
 
     #[test]
     fn sort_control_and_reload_fit_the_minimum_folder_pane_width() {
@@ -422,36 +827,44 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 240.0))
-            .build(move |ctx| {
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                let panel = egui::SidePanel::left("folder_tree_pane_sort_min_width_test")
-                    .resizable(false)
-                    .exact_width(FOLDER_PANE_MIN_WIDTH)
-                    .show(ctx, |ui| {
-                        ui.horizontal(|ui| {
-                            egui::ComboBox::from_id_salt("folder_pane_drive_combo_test")
-                                .width(54.0)
-                                .selected_text("C:")
-                                .show_ui(ui, |_| {});
-                            let selected = folder_tree_sort_combo(
-                                ui,
-                                crate::settings::FolderTreeSortOrder::NameAsc,
-                            );
-                            assert_eq!(selected, crate::settings::FolderTreeSortOrder::NameAsc);
-                            ui.small_button("↻")
-                        })
-                        .inner
-                        .rect
-                    });
-                captured
-                    .lock()
-                    .unwrap()
-                    .push((panel.response.rect, panel.inner));
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    let panel = egui::Panel::left("folder_tree_pane_sort_min_width_test")
+                        .resizable(false)
+                        .exact_size(FOLDER_PANE_MIN_WIDTH)
+                        .show(root_ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let drive =
+                                    egui::ComboBox::from_id_salt("folder_pane_drive_combo_test")
+                                        .width(54.0)
+                                        .selected_text("C:")
+                                        .show_ui(ui, |_| {});
+                                crate::ui_helpers::set_accessibility_label(
+                                    &drive.response,
+                                    "Drive",
+                                );
+                                let selected = folder_tree_sort_combo(
+                                    ui,
+                                    crate::settings::FolderTreeSortOrder::NameAsc,
+                                );
+                                assert_eq!(selected, crate::settings::FolderTreeSortOrder::NameAsc);
+                                ui.small_button("↻")
+                            })
+                            .inner
+                            .rect
+                        });
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push((panel.response.rect, panel.inner));
+                });
             });
 
         harness.run_steps(3);
@@ -473,11 +886,11 @@ mod tests {
         let captured = Arc::clone(&widths);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(800.0, 480.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
                 captured
                     .lock()
                     .unwrap()
-                    .push(draw_loading_width_test_panel(ctx));
+                    .push(draw_loading_width_test_panel(root_ui));
             });
         harness.run_steps(8);
         assert_loading_width_stable(&widths.lock().unwrap());
@@ -489,37 +902,44 @@ mod tests {
         assert!(widths.iter().all(|width| (*width - first).abs() <= 0.1));
     }
 
-    fn draw_loading_width_test_panel(ctx: &egui::Context) -> f32 {
-        egui::SidePanel::left("folder_tree_pane_loading_width_test")
-            .resizable(true)
-            .default_width(240.0)
-            .width_range(FOLDER_PANE_MIN_WIDTH..=FOLDER_PANE_MAX_WIDTH)
-            .show(ctx, |ui| {
-                ui.label("Folder");
-                ui.separator();
-                show_bounded_folder_pane_body(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.set_height(FOLDER_PANE_ROW_HEIGHT);
-                                ui.spacing_mut().item_spacing.x = 2.0;
-                                ui.add_space(FOLDER_PANE_ARROW_WIDTH);
-                                let trailing_width = folder_pane_trailing_width(ui, true);
-                                let label_width = (ui.available_width() - trailing_width).max(16.0);
-                                ui.allocate_exact_size(
-                                    egui::vec2(label_width, FOLDER_PANE_ROW_HEIGHT),
-                                    egui::Sense::hover(),
-                                );
-                                ui.spinner();
+    fn draw_loading_width_test_panel(root_ui: &mut egui::Ui) -> f32 {
+        {
+            egui::Panel::left("folder_tree_pane_loading_width_test")
+                .resizable(true)
+                .default_size(240.0)
+                .size_range(FOLDER_PANE_MIN_WIDTH..=FOLDER_PANE_MAX_WIDTH)
+                .show(root_ui, |ui| {
+                    ui.label("Folder");
+                    ui.separator();
+                    show_bounded_folder_pane_body(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.set_height(FOLDER_PANE_ROW_HEIGHT);
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    ui.add_space(FOLDER_PANE_ARROW_WIDTH);
+                                    let trailing_width = folder_pane_trailing_width(ui, true);
+                                    let label_width =
+                                        (ui.available_width() - trailing_width).max(16.0);
+                                    ui.allocate_exact_size(
+                                        egui::vec2(label_width, FOLDER_PANE_ROW_HEIGHT),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.spinner();
+                                });
                             });
-                        });
-                });
-            })
-            .response
-            .rect
-            .width()
+                    });
+                })
+        }
+        .response
+        .rect
+        .width()
     }
 
     #[test]

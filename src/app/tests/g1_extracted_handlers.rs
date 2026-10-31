@@ -36,6 +36,7 @@ impl Entrance {
                     kind_filter: crate::tag_view::TagViewKindFilter::All,
                     summaries: Vec::new(),
                     entries: vec![crate::tag_view::TagViewEntry {
+                        applied_at_ms: None,
                         path: page.to_path_buf(),
                         kind: crate::tag_view::TagViewItemKind::Image,
                         mtime: 1,
@@ -60,7 +61,9 @@ impl Entrance {
             }
             Self::Rating => {
                 app.rating_view_stars = 3;
-                app.rating_view_saved_folder = Some(book.to_path_buf());
+                app.rating_view_return_to = Some(crate::app::tests::grid_origin_for_test(
+                    top_level_grid_view::TopLevelGridRestore::Folder(book.to_path_buf()),
+                ));
                 app.apply_rating_view_result(crate::rating_view::RatingViewBuildResult {
                     stars: 3,
                     rows: vec![crate::rating_view::RatingViewRow {

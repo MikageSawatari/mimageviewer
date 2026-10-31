@@ -354,7 +354,7 @@ impl ScenarioDriver {
             let id = viewport.ids.this;
             child_known.borrow_mut().insert(id);
             let input = Self::input(id, *child_focus.borrow(), CHILD_SIZE, &child_known.borrow());
-            let output = ctx.run(input, |ctx| (viewport.viewport_ui_cb)(ctx));
+            let output = ctx.run_ui(input, |ui| (viewport.viewport_ui_cb)(ui));
             capture.borrow_mut().push((id, output));
         });
         Self {
@@ -413,7 +413,9 @@ impl ScenarioDriver {
 
     fn root_with_events(&mut self, app: &mut App, events: Vec<egui::Event>) -> ScenarioFrame {
         self.number += 1;
-        self.child_outputs.borrow_mut().clear();
+        for (_, output) in self.child_outputs.borrow_mut().drain(..) {
+            output.drop_without_applying_deltas();
+        }
         let mut input = Self::input(
             egui::ViewportId::ROOT,
             *self.focused.borrow(),
@@ -422,8 +424,9 @@ impl ScenarioDriver {
         );
         input.events = events;
         let output = with_capture(|| {
-            self.ctx.run(input, |ctx| {
-                <App as eframe::App>::update(app, ctx, &mut self.frame);
+            self.ctx.run_ui(input, |ui| {
+                <App as eframe::App>::logic(app, ui.ctx(), &mut self.frame);
+                <App as eframe::App>::ui(app, ui, &mut self.frame);
             })
         });
         let mut records = HashMap::new();
@@ -442,6 +445,7 @@ impl ScenarioDriver {
             records.insert(id, paint_records(id, &output));
             white.insert(id, white_companion_paint_records(id, &output));
             errors.insert(id, error_messages(&output));
+            output.drop_without_applying_deltas();
         }
         let registered = output
             .viewport_output
@@ -452,11 +456,12 @@ impl ScenarioDriver {
         let mut known = registered;
         known.insert(egui::ViewportId::ROOT);
         *self.known.borrow_mut() = known;
-        for (id, viewport) in output.viewport_output {
-            if let Some(callback) = viewport.viewport_ui_cb {
-                self.callbacks.insert(id, callback);
+        for (&id, viewport) in &output.viewport_output {
+            if let Some(callback) = &viewport.viewport_ui_cb {
+                self.callbacks.insert(id, Arc::clone(callback));
             }
         }
+        output.drop_without_applying_deltas();
         ScenarioFrame {
             number: self.number,
             records,
@@ -471,13 +476,14 @@ impl ScenarioDriver {
         self.number += 1;
         let callback = Arc::clone(self.callbacks.get(&id).expect("ROOT registered child"));
         let input = Self::input(id, *self.focused.borrow(), CHILD_SIZE, &self.known.borrow());
-        let output = with_capture(|| self.ctx.run(input, |ctx| callback(ctx)));
+        let output = with_capture(|| self.ctx.run_ui(input, |ui| callback(ui)));
         let mut records = HashMap::new();
         let mut white = HashMap::new();
         let mut errors = HashMap::new();
         records.insert(id, paint_records(id, &output));
         white.insert(id, white_companion_paint_records(id, &output));
         errors.insert(id, error_messages(&output));
+        output.drop_without_applying_deltas();
         ScenarioFrame {
             number: self.number,
             records,
@@ -731,6 +737,8 @@ fn configure_active_still_pages(
     app.fs_cache.insert(
         page,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
+            pdf_metadata: None,
             tex: texture,
             pixels: Arc::new(pixels),
             source_dims: Some([600, 900]),
@@ -750,14 +758,8 @@ fn page_alone_white_companion_is_drawn_in_active_and_parked_window() {
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.page_after_cover_alone_enabled = true;
         app.settings.final_cover_spread_enabled = false;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: CHILD_SIZE.x,
-                h: CHILD_SIZE.y,
-                maximized: false,
-            });
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::app::tests::detached_placement_with_logical_client_for_test(CHILD_SIZE));
         let folder = app.tmp.path().join("page-alone-paint");
         let first = folder.join("first");
         let second = folder.join("second");
@@ -933,14 +935,8 @@ fn page_alone_white_companion_does_not_paint_as_a_failed_real_texture() {
         app.indexer_init.mark_unavailable_if_not_ready();
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.page_after_cover_alone_enabled = true;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: CHILD_SIZE.x,
-                h: CHILD_SIZE.y,
-                maximized: false,
-            });
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::app::tests::detached_placement_with_logical_client_for_test(CHILD_SIZE));
         let paths = (0..3)
             .map(|i| app.tmp.path().join(format!("missing-{i}.png")))
             .collect::<Vec<_>>();
@@ -989,14 +985,8 @@ fn multiwindow_scenario_b_activation_keeps_singleton_paint() {
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.singleton_spread_first_enabled = true;
         app.settings.singleton_spread_last_enabled = false;
-        app.settings.detached_viewer_window_placement =
-            Some(crate::settings::DetachedViewerWindowPlacement {
-                x: 80.0,
-                y: 80.0,
-                w: CHILD_SIZE.x,
-                h: CHILD_SIZE.y,
-                maximized: false,
-            });
+        app.settings.detached_viewer_window_physical_placement =
+            Some(crate::app::tests::detached_placement_with_logical_client_for_test(CHILD_SIZE));
         let folder = app.tmp.path().join("scenario-b");
         std::fs::create_dir(&folder).unwrap();
         let first_path = folder.join("portrait-a.png");
@@ -1088,14 +1078,8 @@ fn scenario_b_endpoint_paint_center(
     app.settings.singleton_spread_first_enabled = global_first;
     app.settings.singleton_spread_last_enabled = global_last;
     app.settings.final_cover_spread_enabled = false;
-    app.settings.detached_viewer_window_placement =
-        Some(crate::settings::DetachedViewerWindowPlacement {
-            x: 80.0,
-            y: 80.0,
-            w: CHILD_SIZE.x,
-            h: CHILD_SIZE.y,
-            maximized: false,
-        });
+    app.settings.detached_viewer_window_physical_placement =
+        Some(crate::app::tests::detached_placement_with_logical_client_for_test(CHILD_SIZE));
     let folder = app.tmp.path().join(label);
     let first_folder = folder.join("first");
     let second_folder = folder.join("second");
@@ -2044,7 +2028,7 @@ fn collection_order_open(
         let main_items = app.items.clone();
         let main_generation = app.items_generation;
         let main_surface_generation = app.top_level_grid_view.generation();
-        let main_scroll = app.scroll_offset_y;
+        let main_scroll = app.grid_scroll.offset();
         let main_prepared = std::sync::Arc::clone(
             app.top_level_grid_view
                 .collection_session()
@@ -2066,7 +2050,7 @@ fn collection_order_open(
         assert_eq!(app.items, main_items, "opening must preserve the main list");
         assert_eq!(app.items_generation, main_generation);
         assert_eq!(app.selected, Some(index));
-        assert_eq!(app.scroll_offset_y, main_scroll);
+        assert_eq!(app.grid_scroll.offset(), main_scroll);
         assert_eq!(
             app.top_level_grid_view.generation(),
             main_surface_generation
@@ -3085,7 +3069,7 @@ fn multiwindow_scenario_noncollection_image_controls_remain_physical() {
     for surface in [
         TopLevelGridSurface::Search(TopLevelSearchView::Global),
         TopLevelGridSurface::Rating { stars: 5 },
-        TopLevelGridSurface::ReadingHistory,
+        TopLevelGridSurface::ReadingHistory(ReadingHistoryRootRestore::unavailable()),
     ] {
         let mut app = setup_app_for_test();
         let ctx = egui::Context::default();
@@ -3101,7 +3085,8 @@ fn multiwindow_scenario_noncollection_image_controls_remain_physical() {
         app.selected = Some(0);
         app.items_are_global_search_view = matches!(surface, TopLevelGridSurface::Search(_));
         app.items_are_rating_view = matches!(surface, TopLevelGridSurface::Rating { .. });
-        app.items_are_reading_history_view = matches!(surface, TopLevelGridSurface::ReadingHistory);
+        app.items_are_reading_history_view =
+            matches!(surface, TopLevelGridSurface::ReadingHistory(_));
         assert!(matches!(
             app.detached_grid_item_open_plan(0, false),
             DetachedBuild::Built(DetachedGridItemOpenPlan::Descriptor {
@@ -3211,13 +3196,13 @@ fn multiwindow_scenario_collection_parked_live_eof_owner_poll() {
             owner.fullscreen_idx = Some(0);
             owner.viewer_presentation = ViewerPresentation::DetachedWindow;
             owner.video_continuous_mode = crate::video::VideoContinuousMode::Continuous;
-            owner.video_continuous_last_eof = Some((0, 1));
+            let player = crate::video::VideoPlayer::disconnected_for_test(source, 3.0);
+            // The EOF request must own the player's actual transport generation.
+            owner.video_continuous_last_eof = Some((0, player.current_seek_serial()));
             owner.fs_cache.insert(
                 0,
                 FsCacheEntry::Video {
-                    player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
-                        source, 3.0,
-                    )),
+                    player: Box::new(player),
                     load_seq: 0,
                 },
             );
@@ -3230,10 +3215,11 @@ fn multiwindow_scenario_collection_parked_live_eof_owner_poll() {
         );
         assert!(
             app.with_window_viewer_context(window_id, |owner| {
+                let (_, seek_serial) = owner.video_continuous_last_eof.unwrap();
                 if is_audio {
-                    owner.start_collection_music_eof_navigation(&ctx, 0, 1)
+                    owner.start_collection_music_eof_navigation(&ctx, 0, seek_serial)
                 } else {
-                    owner.start_collection_video_eof_navigation(&ctx, 0, 1)
+                    owner.start_collection_video_eof_navigation(&ctx, 0, seek_serial)
                 }
             })
             .unwrap()

@@ -46,9 +46,10 @@ fn g3_hidden_extracted_candidate_terminates_initial_detached_permission_open() {
     })
     .unwrap();
     let ctx = egui::Context::default();
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
-        env.update_active_viewer_context(ctx, None);
-    });
+    ctx.run_pass(egui::RawInput::default(), |ctx| {
+        ctx.root_ui(|ui| env.update_active_viewer_context(ui, None));
+    })
+    .drop_without_applying_deltas();
     assert!(env.active_viewer_context_id().is_none());
     assert!(env.active_detached_session.is_none());
     assert_eq!(env.detached_window_state(window), None);
@@ -144,9 +145,10 @@ fn g3_hidden_required_detached_open_terminates_session_runtime_and_preserves_sib
         })
         .expect("hidden open must finish in its owning context");
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            env.update_active_viewer_context(ctx, None);
-        });
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            ctx.root_ui(|ui| env.update_active_viewer_context(ui, None));
+        })
+        .drop_without_applying_deltas();
         assert!(env.active_viewer_context_id().is_none());
         assert!(env.active_detached_session.is_none());
         assert_eq!(env.detached_window_state(window), None);

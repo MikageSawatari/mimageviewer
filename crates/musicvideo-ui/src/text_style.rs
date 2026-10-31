@@ -208,7 +208,7 @@ mod tests {
         let mut time = 0.0;
         let mut frame = |events: Vec<egui::Event>, style: &mut TextStyle| {
             time += 0.1;
-            ctx.run(
+            crate::headless_paint_output(ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -223,7 +223,7 @@ mod tests {
                         edit(ui, style);
                     });
                 },
-            )
+            ))
         };
         let mut output = frame(vec![], &mut style);
         // Exercise actual headless pointer routing and controls, not a mirrored model mutation.

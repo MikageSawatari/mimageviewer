@@ -14,17 +14,23 @@
     "reason": "Do not claim standalone power-saving/display-only DSP policy for native VST processing."
   },
   {
-    "operation": "replace_paragraph",
+    "operation": "replace_inline",
     "scope_heading_id": "rhythm-analyzer",
-    "anchor": "**ファイルを処理する前にクリックを切る**：**Metronome Click** がオンのままだと、処理したファイルにクリック音が書き込まれます。先にオフにしてください。",
+    "anchor": "**拍の位置を耳で確かめる**：**Metronome Click** をオンにすると、検出した拍ごとにクリック音が鳴ります。クリックを聴くときは Rhythm Analyzer をエフェクトチェーンの最後に置き、処理した音声ファイルを書き出す前には **Metronome Click** をオフにしてください。",
     "replacement": "**クリック音も再生・配信される**：**Metronome Click** がオンのときはクリック音が mImageViewer の再生音とリモート配信にも加わります。解析結果を見るだけならオフにしてください。",
     "reason": "mIV has no EffeTune offline file processor; generated clicks enter its playback/Remote DSP path."
   },
   {
     "operation": "replace_inline",
     "scope_heading_id": "rhythm-analyzer",
-    "anchor": "EffeTune のプレーヤーで新しい曲の再生が始まると、曲の頭から解析が自動でやり直されます。それまでの表示は消えずに残ります。**Reset** ボタンを押すと表示を消去して解析を最初からやり直します。ほかのアプリで曲を切り替えたときなどに使います。",
+    "anchor": "**Reset**：他のアプリで曲を切り替えたときなどは、表示の下にある **Reset** ボタンで表示を消し、解析をやり直します。EffeTune のプレイヤーで新しい曲が始まると、解析は自動的にやり直されます。",
     "replacement": "曲の切り替えによる自動再解析は独立版 EffeTune のプレーヤー向けの説明です。mImageViewer の同梱版では、曲を切り替えて解析をやり直したいときに **Reset** ボタンを押してください。表示を消去して解析を最初からやり直します。",
     "reason": "Do not promise standalone-player track-change reanalysis for the bundled VST; direct mIV users to Reset."
+  },
+  {
+    "operation": "move_section_before_heading",
+    "heading_id": "これらのツールの楽しい使い方",
+    "before_heading_id": "プラグイン一覧",
+    "reason": "New upstream category-wide examples belong to the category introduction; preserve the complete section and its anchor rather than attaching it to Stereo Meter or dropping it."
   }
 ]

@@ -78,7 +78,7 @@ pub fn apply(ctx: &egui::Context, theme: UiTheme) {
 }
 
 fn text_contrast_id() -> egui::Id {
-    egui::Id::new("miv_text_contrast")
+    egui::Id::unique("miv_text_contrast")
 }
 
 /// Context に最後に適用した文字コントラストを返す。独立したテスト Context や
@@ -202,7 +202,7 @@ pub(crate) fn dark_popup_style(ctx: &egui::Context) -> StyleModifier {
 
 /// 暗色固定 popup / tooltip の背景枠。
 pub(crate) fn dark_popup_frame(ctx: &egui::Context) -> egui::Frame {
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     style.visuals = dark_visuals(current_text_contrast(ctx));
     egui::Frame::popup(&style)
 }
@@ -273,6 +273,8 @@ fn apply_scrollbar_visibility_style(ctx: &egui::Context) {
     for theme in [egui::Theme::Light, egui::Theme::Dark] {
         let mut style = (*ctx.style_of(theme)).clone();
         let scroll = &mut style.spacing.scroll;
+        // Keep the pre-0.37 ScrollArea edge appearance in both themes.
+        scroll.fade.strength = 0.0;
         scroll.bar_width = 10.0;
         scroll.floating_width = 8.0;
         scroll.floating_allocated_width = 0.0;
@@ -544,7 +546,7 @@ mod tests {
     fn dark_menu_popup_keeps_egui_menu_spacing_and_strokes() {
         let ctx = egui::Context::default();
         apply_resolved_with_contrast(&ctx, ResolvedTheme::Light, TextContrast::Strong);
-        let mut style = (*ctx.style()).clone();
+        let mut style = (*ctx.global_style()).clone();
 
         dark_menu_popup_style(&ctx).apply(&mut style);
 
@@ -575,7 +577,7 @@ mod tests {
                 ctx.options(|options| options.theme_preference),
                 egui::ThemePreference::Dark
             );
-            assert!(ctx.style().visuals.dark_mode);
+            assert!(ctx.global_style().visuals.dark_mode);
         });
 
         assert_eq!(
@@ -584,7 +586,7 @@ mod tests {
         );
         assert_eq!(ctx.style_of(egui::Theme::Light), light_before);
         assert_eq!(ctx.style_of(egui::Theme::Dark), dark_before);
-        assert!(!ctx.style().visuals.dark_mode);
+        assert!(!ctx.global_style().visuals.dark_mode);
     }
 
     // ハイパーリンク色は mimageviewer では使用していないため検証対象外。

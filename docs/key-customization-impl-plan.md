@@ -1,5 +1,54 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+§1.662 (2026-10-30): `FsPageOverviewToggle` と `ImagePageOverview` の短い操作名を
+「ページ一覧の表示切替」に統一する。コマンド一覧・割り当て編集・候補・ガイドで使い、
+短縮後も「表示切替」を残す。詳細欄には標準Oキーとの対応と再実行で一覧を閉じる説明を出す。
+保存ID（`FsPageOverviewToggle` / `image_page_overview`）、既定O、文脈・受付・開閉処理は維持する。
+一覧中のヘルプ題名「本のページ一覧」と、本を一覧で開く／閲覧を閉じて一覧へ戻る別操作は変更しない。
+
+§1.477 (2026-10-29、実装済み・実機未確認): 一覧と画像フルスクリーンのコピー5種を
+キー / リング / ジェスチャ / マウスボタン / Xリングへ揃える。
+`GridCopyFiles` / `FsCopyFiles`、`GridCopyPath` / `FsCopyPath`、
+`GridCopyFileName` / `FsCopyFileName`、`GridCopyImage` / `FsCopyImage`、
+`GridCopyEditedImage` / `FsCopyEditedImage` をそれぞれ `Grid` / `FsImage` の `Press` とする。
+既存 `GridCopyFiles` のCtrl+Cを維持し、他はすべて既定なし。
+ring対応は `CopyFiles` / `ImageCopyPath` / `ImageCopyFileName` / `ImageCopyToClipboard` /
+`CopyEditedImage`。旧image系の保存IDは変更せず、新IDは `copy_files` / `copy_edited_image`。
+共通modelの `item_copy_command` がメニューと割り当て操作の適格性を所有する。
+対象targetは `copy_subject` に通常項目 / ブックマークsource1件 / 利用不可を捕捉する。
+ブックマークのパスは専用メニューと同じ本のsourceをコピーし、チェックを無視する（利用者判断2026-10-29）。
+他の新規3操作はブックマークで、新規4操作はドライブ項目で何もしない。既存 `GridCopyFiles` は変更しない。
+対象・チェック集合・見開き・非対応項目の扱いは [キー仕様](keymap-spec.md#コピー操作の割り当て1477) を正とする。
+コマンド一覧のキー列は実フォントの最長chord幅を予約し、1 chordを1行で表示する。
+親のwrap継承と幅の未実測による途中改行を解消し、既存の縦スクロールと狭幅の横clipを維持する。
+
+左右ドラッグズームの `Fs/Erase/Conceal/Crop/Text/LaScrubZoomHold` は各既存 context の
+KeyHold（既定 Ctrl+Space）。この6 action だけ action 別の `FullChord` policy を選び、
+INI・設定復元・GUI 入力／capture が共有する action 検証へ通す。従来の KeyHold の
+`SinglePlainKey` は維持する。Windows の held 判定は既存の完全一致 OS level をそのまま使い、
+非 Windows も chord の修飾を完全一致させる。native 動画の対象 scope は拡張しない。
+共通 overlay helper が Crop の Ctrl 併用 Space パンより scrubby を優先する。
+元画像の右 Ctrl ホールドは変更しない。[入力所有と倍率制限](keymap-spec.md#左右ドラッグによる連続ズーム)。
+
+2026-10-26 §1.444: `FsListOrderPrev` / `FsListOrderNext` は `FsCommon` / Press、
+既定 `Ctrl+Shift+Up` / `Ctrl+Shift+Down`。説明は「一覧の表示順で前 / 次の本を開く」。
+`EachPhysicalPress` で物理押下を数えるが、移動の準備中は既存 gate で拒否し累積しない。
+egui の repeat-only フレームは既存 Ctrl+↑↓ と同じく最大 1 回へまとめ、native は既存 Ctrl+↑↓ と同じく repeat を無視する。
+egui と native 動画の resolver / dispatcher、双方の動画ヘルプへ登録する。
+通常フォルダ一覧から最後に本を開く操作を受け付けた時点の列を使い、DFS / 兄弟移動は維持する。
+詳細は [一覧順ナビゲーション設計](list-order-book-navigation-plan.md) を参照。
+
+2026-10-22: crop / SNS 分割の固定 Escape は、ドラッグ中なら開始前の状態へ戻してドラッグだけを取り消し、
+ドラッグが無ければ従来どおりモードを終了する。消しゴム / 補正レイヤーと同じモード内の取消優先であり、
+キー割当や新しい KeyAction は追加しない。通常 release（窓外で離した OS level の確認を含む）の確定と
+取消の二終端を既存 editor 所有者で扱う。詳細は `preset-and-adjustment.md` の crop 節。
+
+2026-10-17 §1.394: `ClearVideoMediaMemory` / `ClearBookResumePositions` を Global / Press、
+既定キーなしで追加。既存の常に最前面と同じ各入力受付から、保存済み位置の管理処理へ渡す。
+環境設定と消去対象を共通化し、動画は live のみ変更、本は既存 writer の非同期 clear を使う。
+完了・空・失敗は既存トーストへ出す。保存・Remote・入力所有の契約は
+[keymap-spec.md](keymap-spec.md#保存済み位置の全件クリア1394) を参照。
+
 2026-10-11 §1.242 G3: `FsViewSpread` / `FsViewLandscapeSplit`を通常のfullscreen Action登録へ追加。
 既定キーなし、保存済みbindingの移行なし。構成本/A2では閲覧mode-only、通常本では既存表示ownerへ渡す。
 
@@ -100,7 +149,7 @@ Remoteの旧`SetSpread`は型付き受付で最新構成との一致を検証し
 - **入力パターンは 3 種、差し替え方向は固定** (design doc §8.6):
   - **Press** (通常キー押下、M=ルーペ・ロックトグル含む): キー↔通常キー / 修飾↔修飾 自由
   - **Modifier-hold** (Shift ルーペ): 修飾↔修飾のみ
-  - **Key-hold** (Space パン): キー↔通常キー
+  - **Key-hold** (Space パン): キー↔通常キー。左右ドラッグズームの6操作だけ修飾付き chord も許可
   - 不可能な方向: 「通常キーを修飾として振る舞わせる」(`i.modifiers` に現れないため)
 - つまり簡易版では **Shift ルーペを M 長押しへ置き換えることはしない**。M は Press の
   ルーペ・ロックトグルとしてなら再割当できる。
@@ -410,9 +459,15 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
     Win32 クリップボード paste、ファイル D&D は keyboard keymap の範囲外。対象にするなら
     Grid の別フェーズで明示的に設計する。
 11. **レーティング F1-F6** は `[Rating]` コンテキストの `RatingItem1..5/Clear/StepUp/StepDown` と
-   `RatingContainer1..5/Clear/StepUp/StepDown` に集約する。StepUp/StepDown は既定キーなし。グリッド / 画像フルスクリーン / native 動画の
+   `RatingContainer1..5/Clear/StepUp/StepDown` に集約する。§1.417で `RatingBookPreferred1..5/Clear/StepUp/StepDown` を追加し、8操作とも既定キーなしとする。既存2系統のStepUp/StepDownも既定キーなし。グリッド / 画像フルスクリーン / native 動画の
    入口は `Keymap::consume_rating_action` / `native_video_rating_action` を使い、保存処理は既存の
    `set_rating` / `set_current_folder_rating` 経路を共有する。
+   入力の対象系統は `RatingTargetFamily::{Item, Container, BookPreferred}` で表し、
+   `consume_rating_action(ctx, family)` と `RatingKey.family` に渡す。nativeの照合順は
+   Container → Item → BookPreferredとし、既存2系統の優先を保つ。表示用の
+   `rating_key_action` / `first_rating_chord_label` / `rating_chord_summary_label` は既存のbool引数のまま、
+   アイテム / コンテナ用だけを扱う。本を優先する入力は一覧ではアイテム用へ、閲覧中は採用済みrecipeに
+   基づく単一resolverへ渡す。対象解決・保存の詳細は [§1.417 の設計](book-preferred-rating-plan.md) を参照。
 12. **生 Event::Key / OS 状態参照経路** (pipeline debug=pipeline_debug.rs:104 など) は特殊。
     元画像表示は `FsOriginalPreviewHold` へ昇格し、Windows では割り当てた修飾キーの OS 状態を読む。
     旧 F11 window mode 経路は `FsToggleWindowMode` へ昇格済みで、native 動画 presenter も
@@ -462,6 +517,18 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 ---
 
 ## 10. 新しいキー操作を追加するとき (保守 runbook)
+
+§1.470: `FsZoomIn` / `FsZoomOut` は `FsImage` / `Press` のキーボード専用操作。
+既定は拡大 `Period`（`.`）/ `NumpadAdd`、縮小 `Comma`（`,`）/ `NumpadSubtract`。
+表示の `+` は settings.db / JSON 保存時には既存の `Shift+;` を維持する。chord 解析は既存の
+`Shift+;` / `Shift+Semicolon` に加えて表示形の `+` / `Ctrl++` 等も受理する。
+末尾の `++` は通常の `+` 区切りと区別して Shift+Semicolon のキーを表し、編集欄初期値・
+キャプチャ結果の表示形を再解析して保存できる。既定 chord の表示往復には右修飾キーの表示名も含める。
+ini 出力のみ `;` / `#` を含む表記を KeySlot の別名に置換し、`Shift+Semicolon` /
+`Semicolon` と書く。旧 ini 取り込みでもコメントに切られず、その別名を受理する。
+既存の全 Action 列挙でヘルプ / キーカスタマイズへ表示し、リング系の対応表は増やさない。
+欠けた override は通常の既定へ解決するため、新しい移行処理は不要。
+詳細は [キー仕様](keymap-spec.md#キーによる段階ズーム1470) を参照。
 
 2026-10-07 §1.349 / §1.343: 操作カスタマイズの対応表は
 `GridOrganizeFiles` → `RingActionId::GridOrganizeFiles` (Grid)、
@@ -550,9 +617,11 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - GridApplyErase1/2 `F7/F8` / GridApplyConceal1/2 `F9/F10` /
   GridDeleteEraseMask `Shift+F7/F8` / GridDeleteConcealMask `Shift+F9/F10` (P)
 - RatingItem1..5/Clear `F1-F6` / RatingContainer1..5/Clear `Shift+F1-F6`。
-  RatingItemStepUp/StepDown・RatingContainerStepUp/StepDown は `none`
+  RatingItemStepUp/StepDown・RatingContainerStepUp/StepDown は `none`。
+  RatingBookPreferred1..5/Clear/StepUp/StepDownも全操作 `none`
   (専用 `[Rating]` グループ。グリッド / 画像フルスクリーン / 動画フルスクリーンで共有)
 - GridCopyFiles / GridCutFiles は Shell clipboard 実行経路を保ったまま keymap 化済み。
+  GridCopyPath / GridCopyFileName / GridCopyImage / GridCopyEditedImage は既定なしのPress（§1.477）。
   Paste `Ctrl+V`、D&D、右クリック操作そのものは OS/clipboard/マウス経路を含むため固定。
 - Shift+矢印の範囲選択は GridCursor の派生動作として固定。
 
@@ -560,9 +629,10 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsClose `Enter` (画像のみ P) / FsBackToList `Backspace` (P) / `Esc` (固定)
 - FsJumpFirst/Last `Home/End` (P)
 - FsCtrlNavPrev/Next `Ctrl+↑/↓` (P) / FsSiblingPrev/Next `Ctrl+PageUp/Down` (P)
+- FsListOrderPrev/Next `Ctrl+Shift+↑/↓` (P): 最後に通常フォルダ一覧から本を開いたときの一覧順。準備中は受付拒否、累積なし
 - FsToggleWindowMode `F11` (P)。native 動画経路では App 側 keymap の effective chord を
   presenter へ転送する global snapshot に載せる。
-- レーティングは専用 `[Rating]` グループの `RatingItem*` / `RatingContainer*` を共有する。
+- レーティングは専用 `[Rating]` グループの `RatingItem*` / `RatingContainer*` / `RatingBookPreferred*` を共有する。
 - BrowserBack/Forward、マウス戻る/進むは
   `Settings.ring_shortcuts` の固定入力レイヤーで扱う。戻る/進むは環境設定「マウスボタン」で
   コンテキスト別に個別割り当て。動画・音声の修飾なしホイールは前後ファイル移動（既定）/
@@ -615,6 +685,10 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 - FsOriginalPreviewHold `RightCtrl` (MH。Windows は右側限定、egui fallback は Ctrl に縮退)
 - FsEraseMode `E` ★ / FsLocalAdjustMode `Ctrl+G` ★ / FsConcealMode `Ctrl+M` ★ / FsBgCycle `B` ★
 - FsExport `Ctrl+E` ★ / FsCapture `Ctrl+S` ★
+- FsCopyEditedImage (P、既定未割り当て): フルスクリーンの「編集を反映した画像をコピー」と共通の受付。
+  Ctrl+E と同じページ／見開き対象に、`bake_stage_clipboard` の段までを原寸で反映する。
+- FsCopyFiles / FsCopyPath / FsCopyFileName / FsCopyImage は既定なしのPress（§1.477）。
+  コピー5種は画像FSとGridのring候補にも対応し、動画・音声FSには追加しない。
 - FsCompareToggle `X` ★ / FsCompareCycle `C` ★ / FsCompareWipe `Shift+C` ★ / FsCompareDiff `Alt+C` ★
 - FsSpreadSingle/L/LCover/R/RCover `1`..`5` (P) ★
 - FsReadingFlowCycle `6` (P) ★ / FsReadingDirectionToggle `7` (P) ★ / FsFitModeCycle `0` (P) ★
@@ -653,6 +727,8 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   Line `I` / Rect `R` / Ellipse `O`
 - ErasePaintMode `D` / EraseEraseMode `F`
 - EraseSpacePan `Space` (KH, Ph6) / EraseNudge 矢印 (固定候補) / EraseRotate `[`,`]`
+- ErasePreviewHold `Tab` (KH): 目のボタンと同じ保存なし結果プレビュー。保持中だけ表示し、描画中の押下は離すまで拒否する。入力所有・実割り当て表示は既存 helper を使う。
+- ConcealPreviewHold `Tab` (KH): 隠蔽加工の同じ結果プレビュー。保持受付・ボタン合成・描画抑止は消しゴムと共通。pipeline 前の同期に受付済み保持を渡す。操作カスタマイズで変更・解除可。
 - EraseSwallowNumbers `0`..`9` は旧スロット誤動作防止の no-op 消費なので固定。
 
 ### Conceal (Ph3) ★
@@ -670,6 +746,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   CropForceCreateHold `Ctrl` (MH) / CropSpacePan `Space` (KH)
 - Crop の pointer-down 分類だけは、実効 `CropSpacePan` と実効
   `CropForceCreateHold` の組合せを解決し、両方が押されていれば Pan を優先する。
+  ただし `CropScrubZoomHold` が成立する押下は共通 overlay helper が先に所有する。
   汎用 KeyHold の完全一致規則は変更せず、余分な modifier group は拒否する。
   pointer-down 後は既存の Pan / Create / Edit owner に保持し、修飾キー変化で再分類しない。
 
@@ -697,7 +774,7 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
   右ドラッグ、戻る/進む、動画・音声の修飾なし通常ホイールは `Settings.ring_shortcuts` で限定カスタマイズ。
   その他の通常ホイールは固定で、マウス入力全般は引き続き keymap.ini の対象外。
 - Clipboard/delete files: `Event::Copy` / `Event::Cut`、Win32 クリップボード paste、
-  ファイル削除ワーカー起動。
+  ファイル削除ワーカー起動。イベント自体の固定扱いと、§1.477のコピー離散コマンドは区別する。
 - OS 状態参照: native presenter の一部 routing。元画像表示の OS 状態参照は
   `FsOriginalPreviewHold` の ModifierHold helper 内で扱う。
 

@@ -176,6 +176,8 @@ pub(crate) fn execute_final_composite(
         source
     };
     timing.adjust_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
+    #[cfg(test)]
+    crate::app::final_prepare::tests::worker_checkpoint(cancel);
     if cancel.load(Ordering::Relaxed) {
         return FinalCompositeResult::Cancelled;
     }

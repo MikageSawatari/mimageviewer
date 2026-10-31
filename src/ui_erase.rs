@@ -29,6 +29,9 @@ use crate::ui_fullscreen::FsKeyAction;
 use crate::ui_fullscreen::draw_icons::{PanelToggleColors, panel_toggle_button};
 use crate::vector_edit;
 
+#[cfg(test)]
+use crate::edit_preview::EditPreviewHoldState;
+
 /// 消しゴム MI-GAN ジョブの用途。
 ///
 /// preview と commit は同じ idx でも独立に走れる必要がある。旧実装は idx だけを
@@ -221,6 +224,7 @@ pub(crate) enum ApplyInpaintOutcome {
 /// 推論本体は worker thread で走り、結果は `rx`、途中経過は `progress_rx` 経由で
 /// UI スレッドへ届ける。
 pub(crate) struct EraseInpaintPending {
+    pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     /// 結果を反映する fs_cache のキー (= フルスクリーン idx)。
     pub idx: usize,
     /// 投入時の `App.items_generation`。`poll` 時に世代が進んでいれば結果は捨てる
@@ -304,7 +308,7 @@ impl App {
     /// 消しゴムモードに入る。DB にマスクがあればロードする。
     ///
     /// 見開きモード中に呼ばれた場合は spread_mode を一時的に Single へ落とし、
-    /// `fullscreen_idx` を見開きペアの左ページに固定する (消しゴムは単一ページ前提のため)。
+    /// `fullscreen_idx` を見開きの読む順の最初のページに固定する (消しゴムは単一ページ前提のため)。
     /// 終了時に `reset_erase_mode` が元の spread_mode を復元する。ペアの右ページへは
     /// パネルの「右ページ」ボタンで `switch_erase_target_in_spread` 経由で切り替える。
     /// 透明部を含む画像を「黒の不透明背景に合成」して全面不透明にする。
@@ -320,7 +324,7 @@ impl App {
         if !self.fullscreen_edit_mode_entry_allowed(fs_idx) {
             return;
         }
-        // 見開きから入った場合は左ページへピボット。Single 起動 / 片側のみのページ
+        // 見開きから入った場合は読む順の最初のページへピボット。Single 起動 / 片側のみのページ
         // (表紙・末尾奇数・横長画像) ではピボットは要らない。
         let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
         if !self.raw_edit_target_entry_allowed(target_idx) {
@@ -354,8 +358,8 @@ impl App {
             Some(flat) => Arc::new(flat),
             None => p,
         };
-        self.erase_base_cache
-            .insert(target_idx, Arc::clone(&pixels));
+        let base = self.capture_erase_base_source(target_idx, Arc::clone(&pixels));
+        self.erase_base_cache.insert(target_idx, base);
         // ピクセル取得成功 → ここから state mutation。
         if let Some(pivot) = pivot {
             self.erase_spread_ctx = Some(pivot);
@@ -389,6 +393,7 @@ impl App {
         self.erase_line_tilt = 0.0;
         self.erase_paint_mode = true;
         self.erase_preview_active = false;
+        self.erase_preview_hold = Default::default();
         // base texture cache は前回の state を引き継ぐ可能性があるので毎回 clear
         // (例: 別ページからの再入場で同 idx のテクスチャが残ると bad cross-talk)。
         self.erase_base_tex_cache.clear();
@@ -462,6 +467,7 @@ impl App {
         self.erase_line_end = None;
         self.erase_line_tilt = 0.0;
         self.erase_preview_active = false;
+        self.erase_preview_hold = Default::default();
         self.erase_base_tex_cache.clear();
         self.erase_undo_stack.clear();
         self.erase_redo_stack.clear();
@@ -653,7 +659,7 @@ impl App {
         if saved {
             self.show_feedback_toast(format!("[消しゴムスロット{}に保存]", slot));
         } else {
-            self.show_feedback_toast(format!("[消しゴムスロット{}保存失敗]", slot));
+            self.show_feedback_error(format!("[消しゴムスロット{}保存失敗]", slot));
         }
     }
 
@@ -667,11 +673,11 @@ impl App {
             .as_ref()
             .and_then(|db| db.get_slot_full(slot, w, h));
         let Some((slot_mask, slot_vectors)) = slot_data else {
-            self.show_feedback_toast(format!("[消しゴムスロット{}は空です]", slot));
+            self.show_feedback_warning(format!("[消しゴムスロット{}は空です]", slot));
             return;
         };
         if !slot_mask.iter().any(|&m| m) && slot_vectors.is_empty() {
-            self.show_feedback_toast(format!("[消しゴムスロット{}は空です]", slot));
+            self.show_feedback_warning(format!("[消しゴムスロット{}は空です]", slot));
             return;
         }
         if !self.admit_book_append_followup_mutation() {
@@ -694,12 +700,23 @@ impl App {
     /// 消しゴムモード中のキー入力を処理する。
     /// 通常のフルスクリーンショートカットをブロックし、消しゴム専用キーのみ有効にする。
     pub(crate) fn handle_erase_keys(&mut self, ctx: &egui::Context, fs_idx: usize) -> FsKeyAction {
+        let drawing_in_progress = self.erase_drawing_in_progress();
+        self.erase_preview_hold.read_before_keys(
+            ctx,
+            &self.keymap,
+            KeyAction::ErasePreviewHold,
+            drawing_in_progress,
+        );
+        if self.book_structural_op.is_some() {
+            return Default::default();
+        }
         let action = FsKeyAction {
             page_transition: Default::default(),
             close: false,
             close_to_page_list: false,
             page_nav: crate::ui_fullscreen::FsPageNav::None,
             ctrl_nav: None,
+            list_order_nav: None,
             sibling_nav: None,
             mouse_nav: None,
             jump_to: None,
@@ -762,7 +779,7 @@ impl App {
             if self.redo_erase() {
                 self.show_feedback_toast("[やり直す]".to_string());
             } else {
-                self.show_feedback_toast("[履歴なし]".to_string());
+                self.show_feedback_warning("[履歴なし]".to_string());
             }
         }
 
@@ -780,7 +797,7 @@ impl App {
             if self.undo_erase() {
                 self.show_feedback_toast("[元に戻す]".to_string());
             } else {
-                self.show_feedback_toast("[履歴なし]".to_string());
+                self.show_feedback_warning("[履歴なし]".to_string());
             }
         }
 
@@ -1195,7 +1212,7 @@ impl App {
         seed_y: usize,
     ) {
         let Some(source) = self.erase_base_cache.get(&fs_idx).cloned() else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使う画像を準備中です。少し待ってからもう一度クリックしてください。"
                     .to_string(),
             );
@@ -1203,14 +1220,14 @@ impl App {
         };
         let [w, h] = self.erase_mask_size;
         if source.size != [w, h] {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使う画像の準備が完了していません。もう一度クリックしてください。"
                     .to_string(),
             );
             return;
         }
         let Some(mask) = self.erase_mask.as_ref() else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "バケツに使うマスクを準備中です。少し待ってからもう一度クリックしてください。"
                     .to_string(),
             );
@@ -1235,7 +1252,7 @@ impl App {
         match outcome {
             crate::mask_db::BucketFillOutcome::Filled => {}
             crate::mask_db::BucketFillOutcome::SeedTooThin => {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "漏れ止めより細い場所です。漏れ止めを小さくしてください。".to_string(),
                 );
                 return;
@@ -1245,7 +1262,7 @@ impl App {
                 if let Some(message) =
                     crate::ui_helpers::bucket_shape_fit_failed_message(self.erase_bucket_region)
                 {
-                    self.show_feedback_toast(message.to_string());
+                    self.show_feedback_warning(message.to_string());
                 }
                 return;
             }
@@ -1612,22 +1629,53 @@ impl App {
 
     // ── 入力処理 ──────────────────────────────────────────────────
 
+    fn erase_drawing_in_progress(&self) -> bool {
+        self.erase_last_paint_pos.is_some()
+            || self.erase_line_start.is_some()
+            || self.erase_shape_drag_start.is_some()
+            || self.erase_drag.is_some()
+            || !self.erase_lasso_points.is_empty()
+    }
+
+    fn update_erase_preview_hold(&mut self, ctx: &egui::Context) {
+        let drawing_in_progress = self.erase_drawing_in_progress();
+        self.erase_preview_hold.read(
+            ctx,
+            &self.keymap,
+            KeyAction::ErasePreviewHold,
+            drawing_in_progress,
+        );
+    }
+
     /// ドラッグ入力を処理する（ツール別分岐）。
     pub(crate) fn handle_erase_paint(
         &mut self,
         ctx: &egui::Context,
         transform: &DisplayedImageTransform,
+        overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
+        // パネル描画やポインタ入力の可否によらず読む。release 処理が描画状態を
+        // 消す前に判定し、描画中の押下をドラッグ終了後へ持ち越さない。
+        self.update_erase_preview_hold(ctx);
+        if self.book_structural_op.is_some() {
+            return;
+        }
+        let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
+        let secondary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Secondary);
         let full_rect = transform.viewport_rect;
         // フォーカス復帰クリック中は塗り・選択操作を一切発生させない
         // (handle_fs_wheel_and_click で検出・セットされる)
         if self.fs_primary_suppression.is_active() {
             return;
         }
-        let primary_down = ctx.input(|i| i.pointer.primary_down());
-        let primary_pressed = ctx.input(|i| i.pointer.primary_pressed());
-        let primary_released = ctx.input(|i| i.pointer.primary_released());
-        let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed())
+        let primary_down = ctx.input(|i| primary_allowed && i.pointer.primary_down());
+        let primary_pressed = ctx.input(|i| primary_allowed && i.pointer.primary_pressed());
+        let primary_released = ctx.input(|i| {
+            primary_allowed
+                && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
+                && i.pointer.primary_released()
+        });
+        let secondary_pressed = ctx.input(|i| secondary_allowed && i.pointer.secondary_pressed())
             && self
                 .settings
                 .ring_shortcuts
@@ -1654,16 +1702,17 @@ impl App {
         let panel_rect = self.erase_panel_rect(full_rect);
         // 描画ドラッグ進行中は Space を無視し、現在の描画を最後まで完結させる。
         // (途中で Space 検知 → パンに切替するとマスクが中途半端に確定するため)
-        let drawing_in_progress = self.erase_last_paint_pos.is_some()
-            || self.erase_line_start.is_some()
-            || self.erase_shape_drag_start.is_some()
-            || self.erase_drag.is_some()
-            || !self.erase_lasso_points.is_empty();
+        let drawing_in_progress = self.erase_drawing_in_progress();
         let pointer_over_panel = pointer_pos.is_some_and(|pos| panel_rect.contains(pos));
         if !drawing_in_progress
             && self.handle_overlay_space_pan_drag(
                 ctx,
                 space_held,
+                crate::keyboard_input::focused_key_state_permit(ctx).is_some_and(|permit| {
+                    self.keymap
+                        .key_held_action(ctx, permit, KeyAction::EraseScrubZoomHold)
+                }),
+                full_rect.center(),
                 !pointer_over_panel,
                 primary_pressed,
                 primary_down,
@@ -1671,6 +1720,10 @@ impl App {
                 pointer_pos,
             )
         {
+            return;
+        }
+
+        if self.edit_preview_owns_canvas(self.erase_preview_active, primary_down) {
             return;
         }
 
@@ -1746,7 +1799,7 @@ impl App {
                         img_pos.1.floor() as usize,
                     );
                 } else {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "バケツの対象画像を確認できません。画像を開き直してからもう一度クリックしてください。"
                             .to_string(),
                     );
@@ -2405,17 +2458,18 @@ impl App {
         let mut mask_delete_clicked = false;
         let mut persist_inpaint_tone_tolerance = false;
 
-        egui::Area::new(egui::Id::new("erase_tool_panel"))
+        egui::Area::new(egui::Id::unique("erase_tool_panel"))
             .fixed_pos(panel_pos)
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
+                if self.book_structural_op.is_some() { ui.disable(); }
                 // 1. クリック吸収 sink を widget より先に登録 (= egui の hit test
                 //    "同じ rect の Response は後勝ち" ルールで widget の click を
                 //    優先しつつ、widget 外の隙間/Frame 外周は sink が拾う)。
                 ui.interact(
                     sink_rect,
-                    egui::Id::new("erase_panel_click_sink"),
+                    egui::Id::unique("erase_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
                 let frame_response = egui::Frame::popup(ui.style())
@@ -2498,7 +2552,10 @@ impl App {
                                         preview_pressed = true;
                                     }
                                     eye_resp.on_hover_text(
-                                        "押している間: 消しゴム適用後の結果プレビュー (モザイクは除外)",
+                                        self.keymap.chord_list_bracket_label(
+                                            "押している間: 消しゴム適用後の結果プレビュー (モザイクは除外)",
+                                            KeyAction::ErasePreviewHold,
+                                        ),
                                     );
                                 },
                             );
@@ -2527,7 +2584,7 @@ impl App {
                                 ui.set_min_width(PANEL_W);
                                 ui.set_max_width(PANEL_W);
                                 ui.set_min_height(body_height);
-                                let scroll_output = egui::ScrollArea::vertical()
+                                let scroll_output = egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                                     .max_height(body_height)
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
@@ -2889,28 +2946,7 @@ impl App {
             }
             self.bump_all_input_generations();
         }
-        // プレビューボタンの **押下 transition** (false → true) を検出して、
-        // MI-GAN inpaint を **保存なしで** 投入する。これにより、新規に shape を
-        // 描いた直後にプレビュー押下するだけで現在のマスク全体に対する inpaint
-        // 結果が見える (= 隠蔽の preview と同じ UX、実機 FB R4)。
-        //
-        // 注意:
-        // - MI-GAN は async (= worker thread)。1-3 秒かかる間は通常レイヤが見える。
-        //   完了次第 `erase_preview_cache` が更新され、毎フレ repaint で reflect される
-        // - 既に走っている job は `run_inpaint_and_cache` 内で cancel + restart
-        // - 連続 press は許容 (= 押すたびに最新マスクで再投入される)
-        // - 空マスクなら何も起きない (run_inpaint_for_preview が false を返す)
-        let preview_just_pressed = !self.erase_preview_active && preview_pressed;
-        self.erase_preview_active = preview_pressed;
-        if preview_just_pressed && let Some(fs_idx) = self.fullscreen_idx {
-            if self.run_inpaint_for_preview(ctx, fs_idx) {
-                self.show_feedback_toast("[プレビュー計算中…]".to_string());
-            } else {
-                // 入力未読込 / サイズ不一致などで投入できなかった場合は、マスクだけ
-                // 消えたように見える preview 状態へ入らない。
-                self.erase_preview_active = self.erase_preview_cache.contains_key(&fs_idx);
-            }
-        }
+        self.update_erase_preview(ctx, preview_pressed);
         if let Some(target) = switch_to {
             self.switch_erase_target_in_spread(ctx, target);
         }
@@ -2960,6 +2996,28 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// ボタンとキーを合成した一つの押下遷移で、保存なしプレビューを投入する。
+    fn update_erase_preview(&mut self, ctx: &egui::Context, pointer_pressed: bool) {
+        let drawing_in_progress = self.erase_drawing_in_progress();
+        let preview_pressed = self.erase_preview_hold.merge(
+            pointer_pressed,
+            self.erase_preview_active,
+            drawing_in_progress,
+        );
+        // MI-GAN は既存の非同期経路を使い、合成した false → true でだけ投入する。
+        let preview_just_pressed = !self.erase_preview_active && preview_pressed;
+        self.erase_preview_active = preview_pressed;
+        if preview_just_pressed && let Some(fs_idx) = self.fullscreen_idx {
+            if self.run_inpaint_for_preview(ctx, fs_idx) {
+                self.show_feedback_warning("[プレビュー計算中…]".to_string());
+            } else {
+                // 入力未読込 / サイズ不一致などで投入できなかった場合は、マスクだけ
+                // 消えたように見える preview 状態へ入らない。
+                self.erase_preview_active = self.erase_preview_cache.contains_key(&fs_idx);
+            }
+        }
+    }
+
     // ── Inpaint 実行 ──────────────────────────────────────────────
 
     fn erase_working_size(&self, fs_idx: usize, raw_size: [usize; 2]) -> [usize; 2] {
@@ -2969,32 +3027,31 @@ impl App {
         raw_size
     }
 
-    fn resolve_erase_input_pixels(&self, fs_idx: usize) -> Option<Arc<egui::ColorImage>> {
-        self.resolve_erase_input_pixels_matching(fs_idx, None)
-            .map(|(pixels, _)| pixels)
+    fn resolve_erase_input_source(&self, fs_idx: usize) -> Option<crate::app::EraseBaseSource> {
+        self.resolve_erase_input_source_matching(fs_idx, None)
+            .map(|(source, _)| source)
     }
-
-    fn resolve_erase_input_pixels_matching(
+    fn resolve_erase_input_source_matching(
         &self,
         fs_idx: usize,
         expected_size: Option<[usize; 2]>,
-    ) -> Option<(Arc<egui::ColorImage>, &'static str)> {
+    ) -> Option<(crate::app::EraseBaseSource, &'static str)> {
         let size_ok =
             |pixels: &Arc<egui::ColorImage>| expected_size.map_or(true, |size| pixels.size == size);
-        let source = self
-            .current_raw_source_pixels(fs_idx)
-            .filter(size_ok)
-            .or_else(|| {
+        let mut source =
+            if let Some(pixels) = self.current_raw_source_pixels(fs_idx).filter(size_ok) {
+                self.capture_erase_base_source(fs_idx, pixels)
+            } else {
                 self.erase_base_cache
                     .get(&fs_idx)
-                    .filter(|pixels| size_ok(pixels))
-                    .map(Arc::clone)
-            })?;
-        let source = self.black_flatten_erase_source_if_needed(fs_idx, source);
+                    .filter(|source| size_ok(&source.pixels))
+                    .cloned()?
+            };
+        source.pixels = self.black_flatten_erase_source_if_needed(fs_idx, source.pixels);
         Some((source, "source"))
     }
 
-    fn commit_pending_matches_current_erase_key(&self, fs_idx: usize) -> bool {
+    pub(crate) fn commit_pending_matches_current_erase_key(&self, fs_idx: usize) -> bool {
         let key = self.current_erase_result_key(fs_idx);
         let pending_key = EraseInpaintPendingKey {
             idx: fs_idx,
@@ -3013,7 +3070,7 @@ impl App {
 
     /// 表示パイプライン用: 保存済み消しゴムマスクがあり、現在世代の確定結果が無ければ
     /// MI-GAN を非同期起動する。結果が既にあれば texture を返す。
-    pub(crate) fn ensure_erase_result_texture(
+    fn ensure_erase_result_texture_impl(
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
@@ -3038,7 +3095,7 @@ impl App {
             );
         }
 
-        let source = self.resolve_erase_input_pixels(fs_idx)?;
+        let source = self.resolve_erase_input_source(fs_idx)?;
         let [w, h] = source.size;
         if w == 0 || h == 0 {
             return None;
@@ -3082,14 +3139,27 @@ impl App {
             .erase_preview_cache
             .get(&fs_idx)
             .filter(|entry| entry.pixels.size == [w, h])
-            .map(|entry| (Arc::clone(&entry.pixels), entry.texture.clone()));
+            .map(|entry| {
+                (
+                    Arc::clone(&entry.pixels),
+                    entry.texture.clone(),
+                    entry.display_basis,
+                )
+            });
         // ビットマップとベクタを別々に永続化することで、再編集時に両者を分離して読み直せる。
         let vectors_snapshot = self.erase_shapes.clone();
         self.save_mask_with_sidecar(fs_idx, &bitmap, &vectors_snapshot, w, h);
-        if let Some((pixels, texture)) = preview_result {
+        if let Some((pixels, texture, display_basis)) = preview_result {
             let key = self.current_erase_result_key(fs_idx);
-            self.erase_result_cache
-                .insert(key, crate::app::EraseResultCacheEntry { pixels, texture });
+            self.erase_result_cache.insert(
+                key,
+                crate::app::EraseResultCacheEntry {
+                    texture_options: Self::resident_texture_options(ctx, &texture),
+                    display_basis,
+                    pixels,
+                    texture,
+                },
+            );
             self.invalidate_compare_prepared_for_idx(fs_idx);
             self.clear_conceal_caches(fs_idx);
             crate::logger::log(format!(
@@ -3097,7 +3167,7 @@ impl App {
             ));
             return ApplyInpaintOutcome::CompletedFromPreview;
         }
-        let Some(original) = self.resolve_erase_input_pixels(fs_idx) else {
+        let Some(original) = self.resolve_erase_input_source(fs_idx) else {
             return ApplyInpaintOutcome::Deferred;
         };
         if original.size != [w, h] {
@@ -3156,7 +3226,7 @@ impl App {
         };
         let [w, h] = self.erase_mask_size;
         let Some((adjusted, source_name)) =
-            self.resolve_erase_input_pixels_matching(fs_idx, Some([w, h]))
+            self.resolve_erase_input_source_matching(fs_idx, Some([w, h]))
         else {
             crate::logger::log(format!(
                 "erase: preview skipped (no matching source for mask={}x{})",
@@ -3176,10 +3246,10 @@ impl App {
     pub(crate) fn execute_erase_inpaint(&mut self, ctx: &egui::Context, fs_idx: usize) {
         match self.apply_inpaint_only(ctx, fs_idx) {
             ApplyInpaintOutcome::Launched => {
-                self.show_feedback_toast("[補完中…]".to_string());
+                self.show_feedback_warning("[補完中…]".to_string());
             }
             ApplyInpaintOutcome::Deferred => {
-                self.show_feedback_toast("[補完待機中…]".to_string());
+                self.show_feedback_warning("[補完待機中…]".to_string());
             }
             ApplyInpaintOutcome::CompletedFromPreview => {
                 self.show_feedback_toast("[補完適用]".to_string());
@@ -3204,7 +3274,7 @@ impl App {
 
         // DB にマスクがあるか確認。入力は raw 固定ではなく、現在の pre-erase 表示レイヤ
         // (補正 > AI > raw) を使う。
-        let Some(pixels) = self.resolve_erase_input_pixels(idx) else {
+        let Some(pixels) = self.resolve_erase_input_source(idx) else {
             return;
         };
         let [w, h] = pixels.size;
@@ -3232,7 +3302,7 @@ impl App {
             .map(|old| old.size != pixels.size)
             .unwrap_or(true);
         if need_update {
-            self.erase_base_cache.insert(idx, Arc::clone(&pixels));
+            self.erase_base_cache.insert(idx, pixels.clone());
         }
 
         self.run_inpaint_and_cache(ctx, idx, pixels, composite, w, h, "auto-apply", false);
@@ -3260,10 +3330,10 @@ impl App {
             return;
         }
 
-        let pixels = match self.resolve_erase_input_pixels(fs_idx) {
+        let pixels = match self.resolve_erase_input_source(fs_idx) {
             Some(pixels) => pixels,
             None => {
-                self.show_feedback_toast("[画像読込中]".to_string());
+                self.show_feedback_warning("[画像読込中]".to_string());
                 return;
             }
         };
@@ -3275,11 +3345,11 @@ impl App {
             .as_ref()
             .and_then(|db| db.get_slot_full(slot, w, h));
         let Some((new_mask, new_vectors)) = slot_data else {
-            self.show_feedback_toast(format!("[消しゴムスロット{slot}は空です]"));
+            self.show_feedback_warning(format!("[消しゴムスロット{slot}は空です]"));
             return;
         };
         if !new_mask.iter().any(|&m| m) && new_vectors.is_empty() {
-            self.show_feedback_toast(format!("[消しゴムスロット{slot}は空です]"));
+            self.show_feedback_warning(format!("[消しゴムスロット{slot}は空です]"));
             return;
         }
 
@@ -3291,7 +3361,7 @@ impl App {
             .map(|old| old.size != pixels.size)
             .unwrap_or(true);
         if need_update {
-            self.erase_base_cache.insert(fs_idx, Arc::clone(&pixels));
+            self.erase_base_cache.insert(fs_idx, pixels.clone());
         }
 
         let mut composite = new_mask.clone();
@@ -3320,7 +3390,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         idx: usize,
-        original: Arc<egui::ColorImage>,
+        original: crate::app::EraseBaseSource,
         composite: Vec<bool>,
         w: usize,
         h: usize,
@@ -3367,7 +3437,7 @@ impl App {
             }
             return false;
         }
-        let Some(source) = self.resolve_erase_input_pixels(idx) else {
+        let Some(source) = self.resolve_erase_input_source(idx) else {
             self.ensure_original_material_for_entry(idx, entry);
             return false;
         };
@@ -3394,7 +3464,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         idx: usize,
-        original: Arc<egui::ColorImage>,
+        original: crate::app::EraseBaseSource,
         mask_source: EraseInpaintMaskSource,
         w: usize,
         h: usize,
@@ -3402,6 +3472,8 @@ impl App {
     ) {
         let log_prefix = purpose.origin();
         let is_preview = purpose.is_preview();
+        let display_basis = original.display_basis;
+        let original = original.pixels;
         if self.remote_session_blocks_local_control() {
             return;
         }
@@ -3520,7 +3592,7 @@ impl App {
             // rx 側 disconnect、ここでは pending 未挿入なので poll もされない)
             // (v1.0.0 安定性レビュー P3-9)。
             crate::logger::log(format!("erase: inpaint worker spawn FAILED: {e}"));
-            self.show_feedback_toast("[補完失敗]".to_string());
+            self.show_feedback_error("[補完失敗]".to_string());
             return;
         }
 
@@ -3531,6 +3603,7 @@ impl App {
         self.erase_inpaint_pending.insert(
             pending_key,
             EraseInpaintPending {
+                display_basis,
                 idx,
                 items_generation,
                 path_key,
@@ -3587,7 +3660,7 @@ impl App {
             }
         }
         if worker_failed {
-            self.show_feedback_toast("[補完失敗]".to_string());
+            self.show_feedback_error("[補完失敗]".to_string());
         }
         let Some((target_key, result)) = completed else {
             return;
@@ -3653,6 +3726,8 @@ impl App {
             egui::ImageData::Color(Arc::clone(&pixels)),
             self.display_texture_options(idx),
         );
+        let display_basis =
+            Self::accept_comic_material_display_basis(pending.display_basis, tex.size());
         if pending.purpose.is_preview() {
             // **Preview 経路**: fs_cache を一切触らず、preview_cache だけを更新する
             // (Codex P1 R4 #1)。ESC / 全削除 / mask 変更で preview_cache を捨てれば
@@ -3660,6 +3735,7 @@ impl App {
             self.erase_preview_cache.insert(
                 idx,
                 crate::app::ErasePreviewCacheEntry {
+                    display_basis,
                     pixels,
                     texture: tex,
                 },
@@ -3683,6 +3759,8 @@ impl App {
             self.erase_result_cache.insert(
                 key,
                 crate::app::EraseResultCacheEntry {
+                    texture_options: Self::resident_texture_options(ctx, &tex),
+                    display_basis,
                     pixels,
                     texture: tex,
                 },
@@ -4703,6 +4781,306 @@ pub(crate) fn draw_dashed_circle(painter: &egui::Painter, center: egui::Pos2, ra
 mod book_erase_tests {
     use super::*;
 
+    fn preview_hold_app() -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        let path = app.tmp.path().join("preview-hold.png");
+        app.items = vec![crate::grid_item::GridItem::Image(path)];
+        app.fullscreen_idx = Some(0);
+        app.erase_mode = true;
+        app.erase_mask_size = [3, 3];
+        app.erase_mask = Some(vec![
+            false, false, false, false, true, false, false, false, false,
+        ]);
+        app.erase_base_cache.insert(
+            0,
+            crate::app::EraseBaseSource::raster(Arc::new(egui::ColorImage::filled(
+                [3, 3],
+                egui::Color32::WHITE,
+            ))),
+        );
+        app.ai_runtime_init =
+            crate::ai::runtime::AiRuntimeInitOwner::failed_for_test("preview hold test");
+        app
+    }
+
+    fn preview_job_cancel(app: &App) -> Arc<AtomicBool> {
+        Arc::clone(
+            &app.erase_inpaint_pending[&EraseInpaintPendingKey {
+                idx: 0,
+                kind: EraseInpaintKind::Preview,
+            }]
+                .cancel,
+        )
+    }
+
+    #[cfg(windows)]
+    fn preview_key_level(key: crate::key_input::SyntheticNavigationKey, down: bool) {
+        let now = std::time::Instant::now();
+        let command = if down {
+            crate::key_input::SyntheticKeyCommand::down(now, key, Default::default())
+        } else {
+            crate::key_input::SyntheticKeyCommand::up(now, key)
+        };
+        crate::key_input::enqueue_test_synthetic_command(command);
+        crate::key_input::advance_test_synthetic_input(now);
+    }
+
+    #[cfg(windows)]
+    fn preview_hold_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
+        ctx
+    }
+
+    #[cfg(windows)]
+    fn preview_hold_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        key: egui::Key,
+        repeat: bool,
+        pointer_pressed: bool,
+        focused: bool,
+        owner: Option<crate::keyboard_input::KeyboardOwner>,
+    ) {
+        let mut input = egui::RawInput {
+            focused,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .focused = Some(focused);
+        ctx.run_ui(input, |ui| {
+            // Production's keyboard owner is captured before edit-mode dispatch.
+            app.keyboard_owner_for_pass(ctx);
+            if let Some(owner) = owner {
+                crate::keyboard_input::cache_keyboard_owner(ctx, owner);
+            }
+            let blocked = crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx)
+                || crate::keyboard_input::cached_keyboard_owner(ctx)
+                    == Some(crate::keyboard_input::KeyboardOwner::Modal);
+            if !blocked {
+                app.handle_erase_keys(ctx, 0);
+            }
+            // The erase handler already swallowed Tab (including repeats). The hold
+            // must still follow the synthetic OS level, even when egui says key-down.
+            assert!(
+                !ctx.input(|input| input.events.iter().any(|event| matches!(event,
+                egui::Event::Key { key: event_key, .. } if *event_key == key)))
+                    || blocked
+            );
+            app.update_erase_preview_hold(ctx);
+            if pointer_pressed {
+                app.update_erase_preview(ctx, true);
+            } else {
+                // Use the real panel merge and transition, not a parallel test model.
+                app.draw_erase_panel(
+                    ui,
+                    ctx,
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0)),
+                );
+            }
+        })
+        .drop_without_applying_deltas();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_preview_hold_tab_survives_consumption_repeat_and_release_without_reinpaint() {
+        let _input = crate::key_input::lock_test_input();
+        crate::key_input::arm_test_synthetic_input(0xE001, egui::ViewportId::ROOT);
+        let mut app = preview_hold_app();
+        let ctx = preview_hold_context();
+        let key = crate::key_input::SyntheticNavigationKey::Tab;
+        preview_key_level(key, true);
+        preview_hold_frame(&mut app, &ctx, egui::Key::Tab, false, false, true, None);
+        assert!(app.erase_preview_active);
+        let first = preview_job_cancel(&app);
+        for _ in 0..3 {
+            preview_hold_frame(&mut app, &ctx, egui::Key::Tab, true, false, true, None);
+            assert!(app.erase_preview_active);
+            assert!(Arc::ptr_eq(&first, &preview_job_cancel(&app)));
+        }
+        // Pressing the eye while the key is held shares the same request.
+        preview_hold_frame(&mut app, &ctx, egui::Key::Tab, true, true, true, None);
+        assert!(Arc::ptr_eq(&first, &preview_job_cancel(&app)));
+        preview_key_level(key, false);
+        preview_hold_frame(&mut app, &ctx, egui::Key::Tab, true, true, true, None);
+        assert!(app.erase_preview_active, "eye still holds the preview");
+        preview_hold_frame(&mut app, &ctx, egui::Key::Tab, true, false, true, None);
+        assert!(
+            !app.erase_preview_active,
+            "OS release wins over stale egui key-down"
+        );
+        preview_key_level(key, true);
+        preview_hold_frame(&mut app, &ctx, egui::Key::Tab, false, true, true, None);
+        assert!(app.erase_preview_active);
+        assert!(first.load(Ordering::Relaxed));
+        let second = preview_job_cancel(&app);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a new combined press starts exactly one new request"
+        );
+        preview_hold_frame(&mut app, &ctx, egui::Key::Tab, true, false, true, None);
+        assert!(Arc::ptr_eq(&second, &preview_job_cancel(&app)));
+        app.reset_erase_mode();
+        assert_eq!(app.erase_preview_hold, EditPreviewHoldState::Released);
+        assert!(!app.erase_preview_active);
+        assert!(second.load(Ordering::Relaxed));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_preview_hold_rebound_key_respects_keyboard_owners_and_focus() {
+        use crate::keyboard_input::{KeyboardOwner, TextInputPhase};
+        let _input = crate::key_input::lock_test_input();
+        crate::key_input::arm_test_synthetic_input(0xE002, egui::ViewportId::ROOT);
+        let mut app = preview_hold_app();
+        app.keymap = crate::keymap::Keymap::from_ini_str("[Erase]\nErasePreviewHold = G\n");
+        let ctx = preview_hold_context();
+        preview_key_level(crate::key_input::SyntheticNavigationKey::Tab, true);
+        preview_hold_frame(&mut app, &ctx, egui::Key::Tab, false, false, true, None);
+        assert!(!app.erase_preview_active);
+        preview_key_level(crate::key_input::SyntheticNavigationKey::Tab, false);
+        preview_key_level(crate::key_input::SyntheticNavigationKey::G, true);
+        for owner in [
+            KeyboardOwner::Modal,
+            KeyboardOwner::TextInput {
+                viewport: egui::ViewportId::ROOT,
+                widget_id: egui::Id::unique("preview-text"),
+                phase: TextInputPhase::Focused,
+            },
+            KeyboardOwner::TextInput {
+                viewport: egui::ViewportId::ROOT,
+                widget_id: egui::Id::unique("preview-ime"),
+                phase: TextInputPhase::ImeComposing,
+            },
+        ] {
+            preview_hold_frame(&mut app, &ctx, egui::Key::G, true, false, true, Some(owner));
+            assert!(!app.erase_preview_active);
+            assert!(app.erase_inpaint_pending.is_empty());
+        }
+        preview_hold_frame(&mut app, &ctx, egui::Key::G, true, false, false, None);
+        assert!(!app.erase_preview_active);
+        preview_hold_frame(&mut app, &ctx, egui::Key::G, true, false, true, None);
+        assert!(app.erase_preview_active);
+        let job = preview_job_cancel(&app);
+        preview_hold_frame(&mut app, &ctx, egui::Key::G, true, false, false, None);
+        assert!(
+            !app.erase_preview_active,
+            "losing focus ends keyboard preview"
+        );
+        assert!(Arc::ptr_eq(&job, &preview_job_cancel(&app)));
+        app.reset_erase_mode();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_preview_hold_during_each_drawing_kind_requires_a_new_press() {
+        let _input = crate::key_input::lock_test_input();
+        for kind in 0..10 {
+            crate::key_input::arm_test_synthetic_input(0xE003, egui::ViewportId::ROOT);
+            let mut app = preview_hold_app();
+            match kind % 5 {
+                0 => app.erase_last_paint_pos = Some(egui::Pos2::ZERO),
+                1 => app.erase_line_start = Some((0.0, 0.0)),
+                2 => app.erase_shape_drag_start = Some((0.0, 0.0)),
+                3 => app.erase_lasso_points.push((0.0, 0.0)),
+                _ => {
+                    let shape = erase_test_shape(0);
+                    app.erase_drag = Some(vector_edit::begin_drag(
+                        vector_edit::HoverTarget::Body,
+                        0,
+                        shape,
+                        (0.0, 0.0),
+                    ));
+                }
+            }
+            let ctx = preview_hold_context();
+            let key = crate::key_input::SyntheticNavigationKey::Tab;
+            if kind >= 5 {
+                let now = std::time::Instant::now();
+                crate::key_input::enqueue_test_synthetic_command(
+                    crate::key_input::SyntheticKeyCommand::down(
+                        now,
+                        crate::key_input::SyntheticNavigationKey::G,
+                        crate::key_input::SyntheticModifiers {
+                            shift: true,
+                            ..Default::default()
+                        },
+                    ),
+                );
+                crate::key_input::advance_test_synthetic_input(now);
+            }
+            preview_key_level(key, true);
+            preview_hold_frame(&mut app, &ctx, egui::Key::Tab, false, false, true, None);
+            assert_eq!(
+                app.erase_preview_hold,
+                EditPreviewHoldState::BlockedUntilRelease,
+                "kind={kind}"
+            );
+            assert!(!app.erase_preview_active);
+            app.erase_last_paint_pos = None;
+            app.erase_line_start = None;
+            app.erase_shape_drag_start = None;
+            app.erase_lasso_points.clear();
+            app.erase_drag = None;
+            // Shift is an ordinary angle/shape constraint during drawing. It must
+            // not turn a rejected physical hold into a fresh press after the drag.
+            let now = std::time::Instant::now();
+            crate::key_input::enqueue_test_synthetic_command(
+                crate::key_input::SyntheticKeyCommand::down(
+                    now,
+                    crate::key_input::SyntheticNavigationKey::G,
+                    crate::key_input::SyntheticModifiers {
+                        shift: true,
+                        ..Default::default()
+                    },
+                ),
+            );
+            crate::key_input::advance_test_synthetic_input(now);
+            preview_hold_frame(&mut app, &ctx, egui::Key::Tab, true, false, true, None);
+            assert_eq!(
+                app.erase_preview_hold,
+                EditPreviewHoldState::BlockedUntilRelease
+            );
+            preview_key_level(crate::key_input::SyntheticNavigationKey::G, false);
+            preview_hold_frame(&mut app, &ctx, egui::Key::Tab, true, false, true, None);
+            assert!(!app.erase_preview_active);
+            assert!(app.erase_inpaint_pending.is_empty());
+            preview_hold_frame(
+                &mut app,
+                &ctx,
+                egui::Key::Tab,
+                true,
+                false,
+                true,
+                Some(crate::keyboard_input::KeyboardOwner::Modal),
+            );
+            preview_hold_frame(&mut app, &ctx, egui::Key::Tab, true, false, false, None);
+            preview_hold_frame(&mut app, &ctx, egui::Key::Tab, true, false, true, None);
+            assert_eq!(
+                app.erase_preview_hold,
+                EditPreviewHoldState::BlockedUntilRelease
+            );
+            assert!(!app.erase_preview_active);
+            preview_key_level(key, false);
+            preview_hold_frame(&mut app, &ctx, egui::Key::Tab, true, false, true, None);
+            preview_key_level(key, true);
+            preview_hold_frame(&mut app, &ctx, egui::Key::Tab, false, false, true, None);
+            assert!(app.erase_preview_active, "kind={kind}");
+            app.reset_erase_mode();
+        }
+    }
+
     #[test]
     fn section1373_erase_draft_changes_invalidate_but_noop_and_history_capture_do_not() {
         let mut app = crate::app::setup_app_for_test();
@@ -4908,6 +5286,10 @@ mod book_erase_tests {
                 },
             },
             EraseInpaintPending {
+                display_basis: crate::material_display_basis::MaterialDisplayBasis::from_sampler(
+                    [1, 1],
+                    crate::source_coverage::SourceCoverage::FullSource,
+                ),
                 idx,
                 items_generation: app.items_generation,
                 path_key: app.page_path_key(idx),
@@ -5439,5 +5821,317 @@ mod book_erase_tests {
         assert_ne!(result.image.pixels[1], base.pixels[1]);
         assert_eq!(result.image.pixels[0], base.pixels[0]);
         assert_eq!(result.image.pixels[2], base.pixels[2]);
+    }
+}
+
+impl App {
+    pub(crate) fn ensure_erase_result_material(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
+        let _ = self.ensure_erase_result_texture_impl(ctx, idx)?;
+        self.current_erase_result_material(idx)
+    }
+    pub(crate) fn ensure_erase_result_texture(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        self.ensure_erase_result_material(ctx, idx)
+            .map(|material| material.source_texture().clone())
+    }
+}
+
+#[cfg(test)]
+mod section1445_slider_tests {
+    use super::*;
+    use crate::displayed_image_transform::{
+        DisplayedImageTransformInput, FullscreenFitScaleLimits, RectPixelFit,
+        ResolvedDisplayPlacement,
+    };
+    use egui_kittest::kittest::Queryable;
+
+    fn erase_slider_harness(
+        tool: EraseTool,
+    ) -> egui_kittest::Harness<'static, crate::app::AppTestEnvForTest> {
+        let mut app = crate::app::setup_app_for_test();
+        let path = app.tmp.path().join("erase-slider.png");
+        app.items = vec![crate::grid_item::GridItem::Image(path)];
+        app.fullscreen_idx = Some(0);
+        app.erase_mode = true;
+        app.erase_tool = tool;
+        app.erase_paint_mode = true;
+        app.erase_mask_size = [200, 200];
+        app.erase_mask = Some(vec![false; 200 * 200]);
+        app.erase_brush_radius = 1.0;
+        app.erase_bucket_tolerance = 5.0;
+        app.erase_bucket_leak_stop = 0.0;
+        app.erase_bucket_outset = 0.0;
+        app.erase_bucket_region = crate::mask_db::BucketRegion::Connected;
+        let pixels = (0..200 * 200)
+            .map(|i| egui::Color32::from_gray(if i % 200 < 100 { 100 } else { 120 }))
+            .collect();
+        app.erase_base_cache.insert(
+            0,
+            crate::app::EraseBaseSource::raster(Arc::new(egui::ColorImage::new(
+                [200, 200],
+                pixels,
+            ))),
+        );
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(|ctx| {
+                crate::ui_fonts::configure_fonts(ctx);
+                crate::egui_focus_policy::install_tab_shortcut_focus_policy(ctx);
+            })
+            .with_size(egui::vec2(1200.0, 1100.0))
+            .build_ui_state(
+                |root_ui, app| {
+                    crate::test_ui::full_viewport_ui(root_ui, |ui| {
+                        let ctx = ui.ctx().clone();
+                        let full_rect = ctx.content_rect();
+                        let transform = DisplayedImageTransform::from_resolved_rect(
+                            DisplayedImageTransformInput {
+                                page_idx: 0,
+                                viewport_rect: full_rect,
+                                source_size: egui::vec2(200.0, 200.0),
+                                texture_size: egui::vec2(200.0, 200.0),
+                                rotation: crate::rotation_db::Rotation::None,
+                                free_rotation_rad: 0.0,
+                                content_bbox: None,
+                                fit_mode:
+                                    crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                                        crate::settings::FullscreenFitMode::Page,
+                                    ),
+                                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                                pixels_per_point: 1.0,
+                                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                                pixel_fit: RectPixelFit::Texels,
+                            },
+                            egui::Rect::from_min_size(
+                                egui::pos2(600.0, 100.0),
+                                egui::vec2(200.0, 200.0),
+                            ),
+                        )
+                        .unwrap();
+                        // Keep fullscreen's production order: canvas input precedes
+                        // the actual panel. No pre-commit or test-only setting copy.
+                        app.keyboard_owner_for_pass(&ctx);
+                        app.handle_erase_paint(&ctx, &transform, Default::default());
+                        app.draw_erase_panel(ui, &ctx, full_rect);
+                    });
+                },
+                app,
+            );
+        harness.run_steps(3);
+        harness
+    }
+
+    fn type_erase_setting(
+        harness: &mut egui_kittest::Harness<'_, crate::app::AppTestEnvForTest>,
+        label: &str,
+        digits: &[&str],
+    ) {
+        let slider_rect = harness
+            .get_by_role_and_label(egui::accesskit::Role::Slider, label)
+            .rect();
+        let editor = harness
+            .query_by_role_and_label(egui::accesskit::Role::SpinButton, label)
+            .unwrap_or_else(|| {
+                panic!(
+                    "tool setting editor {label:?} missing; slider={slider_rect:?}; numeric nodes={:#?}",
+                    harness.get_all_by_role(egui::accesskit::Role::SpinButton).collect::<Vec<_>>()
+                )
+            });
+        let editor_rect = editor.rect();
+        assert!(
+            editor_rect.left() >= slider_rect.right()
+                && editor_rect.top() <= slider_rect.bottom()
+                && slider_rect.top() <= editor_rect.bottom(),
+            "named editor must be beside its slider: slider={slider_rect:?}, editor={editor_rect:?}"
+        );
+        editor.click();
+        harness.run_steps(2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        for digit in digits {
+            harness.event(egui::Event::Text((*digit).into()));
+            harness.run_steps(2);
+        }
+        assert!(
+            harness
+                .get_all_by_role(egui::accesskit::Role::SpinButton)
+                .any(|node| node.is_focused()),
+            "numeric editing must still own focus before the first canvas press"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_preview_hold_and_brush_press_in_the_same_frame_keep_the_drawing_owner() {
+        let _input = crate::key_input::lock_test_input();
+        crate::key_input::arm_test_synthetic_input(0xE014, egui::ViewportId::ROOT);
+        let mut harness = erase_slider_harness(EraseTool::Brush);
+        harness.state_mut().ai_runtime_init =
+            crate::ai::runtime::AiRuntimeInitOwner::failed_for_test(
+                "preview simultaneous press test",
+            );
+        let now = std::time::Instant::now();
+        crate::key_input::enqueue_test_synthetic_command(
+            crate::key_input::SyntheticKeyCommand::down(
+                now,
+                crate::key_input::SyntheticNavigationKey::Tab,
+                Default::default(),
+            ),
+        );
+        crate::key_input::advance_test_synthetic_input(now);
+        harness.event(egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: Some(egui::Key::Tab),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let seed = egui::pos2(700.0, 200.0);
+        harness.hover_at(seed);
+        harness.drag_at(seed);
+        harness.run_steps(1);
+        assert!(
+            harness
+                .state()
+                .erase_mask
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|pixel| *pixel)
+        );
+        assert_eq!(
+            harness.state().erase_preview_hold,
+            EditPreviewHoldState::BlockedUntilRelease
+        );
+        assert!(!harness.state().erase_preview_active);
+        assert!(harness.state().erase_inpaint_pending.is_empty());
+        let moved = seed + egui::vec2(30.0, 0.0);
+        harness.event(egui::Event::PointerMoved(moved));
+        harness.run_steps(1);
+        assert_eq!(harness.state().erase_last_paint_pos, Some(moved));
+        harness.event(egui::Event::PointerButton {
+            pos: moved,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(2);
+        assert!(harness.state().erase_last_paint_pos.is_none());
+        assert!(!harness.state().erase_preview_active);
+        assert!(harness.state().erase_inpaint_pending.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn erase_preview_hold_on_brush_release_frame_is_rejected_before_canvas_finishes_drag() {
+        let _input = crate::key_input::lock_test_input();
+        crate::key_input::arm_test_synthetic_input(0xE004, egui::ViewportId::ROOT);
+        let mut harness = erase_slider_harness(EraseTool::Brush);
+        harness.state_mut().ai_runtime_init =
+            crate::ai::runtime::AiRuntimeInitOwner::failed_for_test("preview release order test");
+        let seed = egui::pos2(700.0, 200.0);
+        harness.hover_at(seed);
+        harness.drag_at(seed);
+        harness.run_steps(1);
+        assert!(harness.state().erase_last_paint_pos.is_some());
+        let now = std::time::Instant::now();
+        crate::key_input::enqueue_test_synthetic_command(
+            crate::key_input::SyntheticKeyCommand::down(
+                now,
+                crate::key_input::SyntheticNavigationKey::Tab,
+                Default::default(),
+            ),
+        );
+        crate::key_input::advance_test_synthetic_input(now);
+        harness.event(egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: Some(egui::Key::Tab),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.event(egui::Event::PointerButton {
+            pos: seed,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(1);
+        assert!(
+            harness.state().erase_last_paint_pos.is_none(),
+            "the real brush handler completed the drag"
+        );
+        assert_eq!(
+            harness.state().erase_preview_hold,
+            EditPreviewHoldState::BlockedUntilRelease
+        );
+        harness.run_steps(2);
+        assert!(!harness.state().erase_preview_active);
+        assert!(harness.state().erase_inpaint_pending.is_empty());
+    }
+
+    #[test]
+    fn section1445_bucket_text_is_used_by_first_canvas_press_before_panel_draw() {
+        let mut harness = erase_slider_harness(EraseTool::Bucket);
+        type_erase_setting(&mut harness, "色差の許容値", &["2", "5"]);
+        assert!(
+            harness
+                .state()
+                .erase_mask
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|p| !*p)
+        );
+        let seed = egui::pos2(650.0, 200.0);
+        harness.hover_at(seed);
+        harness.drag_at(seed);
+        harness.run_steps(1);
+        let mask = harness.state().erase_mask.as_ref().unwrap();
+        assert!(
+            mask[100 * 200 + 50],
+            "the first canvas press reached the bucket handler"
+        );
+        assert!(
+            mask[100 * 200 + 150],
+            "the first fill must cross the 20-level color difference using new tolerance 25"
+        );
+    }
+
+    #[test]
+    fn section1445_brush_size_text_is_used_by_first_canvas_press_before_panel_draw() {
+        let mut harness = erase_slider_harness(EraseTool::Brush);
+        type_erase_setting(&mut harness, "サイズ", &["8"]);
+        assert!(
+            harness
+                .state()
+                .erase_mask
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|p| !*p)
+        );
+        let seed = egui::pos2(700.0, 200.0);
+        harness.hover_at(seed);
+        harness.drag_at(seed);
+        harness.run_steps(1);
+        let mask = harness.state().erase_mask.as_ref().unwrap();
+        assert!(
+            mask[100 * 200 + 100],
+            "the first canvas press reached the brush handler"
+        );
+        assert!(
+            mask[100 * 200 + 106],
+            "the first stroke must already use radius 8 rather than the old radius 1"
+        );
+        assert!(
+            !mask[100 * 200 + 110],
+            "the stroke must remain bounded by the new radius"
+        );
     }
 }

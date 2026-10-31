@@ -106,11 +106,11 @@ impl Default for TextInputKeyDiagnostic {
 }
 
 fn text_input_key_diagnostic_id(viewport_id: egui::ViewportId) -> egui::Id {
-    egui::Id::new((TEXT_INPUT_KEY_DIAGNOSTIC_ID, viewport_id))
+    egui::Id::unique((TEXT_INPUT_KEY_DIAGNOSTIC_ID, viewport_id))
 }
 
 fn text_input_key_diagnostic_started_id(viewport_id: egui::ViewportId) -> egui::Id {
-    egui::Id::new((TEXT_INPUT_KEY_DIAGNOSTIC_STARTED_ID, viewport_id))
+    egui::Id::unique((TEXT_INPUT_KEY_DIAGNOSTIC_STARTED_ID, viewport_id))
 }
 
 fn diagnostic_owner_phase(owner: Option<crate::keyboard_input::KeyboardOwner>) -> &'static str {
@@ -222,7 +222,7 @@ fn diagnostic_is_anomalous(
 
 fn reserve_routine_diagnostic_bytes(line_bytes: usize) -> bool {
     TEXT_INPUT_KEY_DIAGNOSTIC_ROUTINE_BYTES
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
             routine_diagnostic_bytes_after(used, line_bytes)
         })
         .is_ok()
@@ -578,7 +578,7 @@ mod tests {
 
     #[test]
     fn key_diagnostic_reports_identity_focus_owner_and_close_site_per_press() {
-        let field_id = egui::Id::new("diagnostic-field");
+        let field_id = egui::Id::unique("diagnostic-field");
         let diagnostic = TextInputKeyDiagnostic {
             pass: 7,
             viewport: egui::ViewportId::ROOT,
@@ -695,29 +695,34 @@ mod tests {
     #[test]
     fn sensitive_field_redacts_key_details_even_on_anomalous_focus_loss() {
         let ctx = egui::Context::default();
-        let field_id = egui::Id::new("sensitive-diagnostic-field");
+        let field_id = egui::Id::unique("sensitive-diagnostic-field");
         let mut password = String::new();
         let mut request_focus = true;
 
         ctx.begin_pass(Default::default());
-        egui::CentralPanel::default().show(&ctx, |ui| {
-            let _ = add_singleline_sensitive(ui, &mut password, Some(&mut request_focus), |edit| {
-                edit.id(field_id).password(true)
-            });
+        ctx.root_ui(|root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                let _ =
+                    add_singleline_sensitive(ui, &mut password, Some(&mut request_focus), |edit| {
+                        edit.id(field_id).password(true)
+                    });
+            })
         });
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
 
         let modifiers = egui::Modifiers::SHIFT;
         ctx.begin_pass(egui::RawInput {
-            modifiers,
-            events: vec![egui::Event::Key {
-                key: egui::Key::A,
-                physical_key: Some(egui::Key::A),
-                pressed: true,
-                repeat: false,
-                modifiers,
-            }],
+            events: vec![
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: Some(egui::Key::A),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+            ],
             ..Default::default()
         });
         begin_pass_diagnostics(&ctx);
@@ -736,7 +741,7 @@ mod tests {
             ctx.data(|data| data.get_temp(diagnostic_id).unwrap_or_default());
         assert!(diagnostic_is_anomalous(&diagnostic, None));
         let lines = format_key_diagnostic(&diagnostic, None);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
 
         assert_eq!(lines.len(), 1);
         let line = &lines[0];
@@ -768,14 +773,14 @@ mod tests {
     }
 
     fn draw_text_fields(
-        ctx: &egui::Context,
+        ui: &mut egui::Ui,
         first_id: egui::Id,
         second_id: egui::Id,
         first: &mut String,
         second: &mut String,
         first_focus_request: &mut bool,
     ) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             let _ = show_singleline(ui, first, Some(first_focus_request), |edit| {
                 edit.id(first_id)
             });
@@ -784,42 +789,46 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn tab_without_ime_keeps_editing_field_focus_and_input_working() {
         let ctx = test_context();
         crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
-        let first_id = egui::Id::new("plain_tab_first");
-        let second_id = egui::Id::new("plain_tab_second");
+        let first_id = egui::Id::unique("plain_tab_first");
+        let second_id = egui::Id::unique("plain_tab_second");
         let mut first = String::new();
         let mut second = String::new();
         let mut focus_request = true;
-        let _ = ctx.run(Default::default(), |ctx| {
+        crate::egui_output::discard_headless_output(ctx.run_ui(Default::default(), |ui| {
             draw_text_fields(
-                ctx,
+                ui,
                 first_id,
                 second_id,
                 &mut first,
                 &mut second,
                 &mut focus_request,
             );
-        });
-        let _ = ctx.run(Default::default(), |ctx| {
+        }));
+        crate::egui_output::discard_headless_output(ctx.run_ui(Default::default(), |ui| {
             draw_text_fields(
-                ctx,
+                ui,
                 first_id,
                 second_id,
                 &mut first,
                 &mut second,
                 &mut focus_request,
             );
-        });
-        let _ = ctx.run(
+        }));
+        crate::egui_output::discard_headless_output(ctx.run_ui(
             egui::RawInput {
                 events: vec![key_event(egui::Key::Tab)],
                 ..Default::default()
             },
-            |ctx| {
+            |ui| {
                 draw_text_fields(
-                    ctx,
+                    ui,
                     first_id,
                     second_id,
                     &mut first,
@@ -827,23 +836,26 @@ mod tests {
                     &mut focus_request,
                 );
             },
-        );
+        ));
 
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
 
-        let _ = ctx.run(
+        crate::egui_output::discard_headless_output(ctx.run_ui(
             egui::RawInput {
                 events: vec![
                     egui::Event::Text("x".to_owned()),
                     egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "あ".to_owned(),
+                        active_range_chars: None,
+                    }),
                     egui::Event::Ime(egui::ImeEvent::Commit("あ".to_owned())),
                 ],
                 ..Default::default()
             },
-            |ctx| {
+            |ui| {
                 draw_text_fields(
-                    ctx,
+                    ui,
                     first_id,
                     second_id,
                     &mut first,
@@ -851,7 +863,7 @@ mod tests {
                     &mut focus_request,
                 );
             },
-        );
+        ));
 
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(first_id));
         assert_eq!(first, "xあ");
@@ -878,7 +890,7 @@ mod tests {
         for variant in 0..4 {
             // Existing diagnostic-only Contexts do not install the input plugin.
             let ctx = egui::Context::default();
-            let field_id = egui::Id::new(("facade-helper", variant));
+            let field_id = egui::Id::unique(("facade-helper", variant));
             let mut text = "abc".to_owned();
             let mut request_focus = true;
             let policy = if variant == 2 {
@@ -887,7 +899,7 @@ mod tests {
                 TextInputDiagnosticKeyPolicy::Standard
             };
             for keyed_pass in [false, true] {
-                let _ = ctx.run(
+                ctx.run_ui(
                     viewport_raw_input(
                         egui::ViewportId::ROOT,
                         if keyed_pass {
@@ -896,8 +908,9 @@ mod tests {
                             Vec::new()
                         },
                     ),
-                    |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                    |ui| {
+                        let ctx = &ui.ctx().clone();
+                        egui::CentralPanel::default().show(ui, |ui| {
                             let assert_before_drawing = || {
                                 if keyed_pass {
                                     let diagnostic = diagnostic_for_pass(ctx).unwrap();
@@ -919,6 +932,7 @@ mod tests {
                                             edit.id(field_id)
                                         },
                                     )
+                                    .response
                                     .response
                                 }
                                 1 => add_singleline(
@@ -977,35 +991,38 @@ mod tests {
                             }
                         }
                     },
-                );
+                )
+                .drop_without_applying_deltas();
             }
             // Finalize the previous record once, after egui's end-pass validation.
             ctx.begin_pass(Default::default());
             assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
             assert!(!ime_input_active(&ctx));
             assert!(diagnostic_for_pass(&ctx).is_none());
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
         }
     }
 
     #[test]
     fn facade_observes_the_field_even_after_the_shared_helper_forgets_its_contract() {
         let ctx = test_context();
-        let field_id = egui::Id::new("facade-forget-contract");
+        let field_id = egui::Id::unique("facade-forget-contract");
         let mut text = "abc".to_owned();
         let mut request_focus = true;
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        ctx.run_ui(Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 add_singleline(ui, &mut text, Some(&mut request_focus), |edit| {
                     edit.id(field_id)
                 });
             });
-        });
-        let _ = ctx.run(
+        })
+        .drop_without_applying_deltas();
+        ctx.run_ui(
             viewport_raw_input(egui::ViewportId::ROOT, vec![key_event(egui::Key::Escape)]),
-            |ctx| {
+            |ui| {
+                let ctx = &ui.ctx().clone();
                 assert_eq!(ctx.memory(|memory| memory.focused()), None);
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     add_singleline(ui, &mut text, None, |edit| edit.id(field_id));
                 });
                 assert!(egui_ime::text_focus_contract_snapshot(ctx).is_none());
@@ -1014,40 +1031,52 @@ mod tests {
                 assert_eq!(diagnostic.field_id_after, Some(field_id));
                 assert!(diagnostic_is_anomalous(&diagnostic, None));
             },
-        );
-        let _ = ctx.run(Default::default(), |ctx| {
+        )
+        .drop_without_applying_deltas();
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             begin_pass_diagnostics(ctx);
             assert!(diagnostic_for_pass(ctx).is_none());
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn facade_observes_ime_restoration_after_the_shared_contract_is_refreshed() {
         for external_latch in [false, true] {
             let ctx = test_context();
-            let field_id = egui::Id::new(("facade-restored-contract", external_latch));
+            let field_id = egui::Id::unique(("facade-restored-contract", external_latch));
             let mut text = String::new();
             let mut request_focus = true;
-            let _ = ctx.run(Default::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            ctx.run_ui(Default::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     show_singleline(ui, &mut text, Some(&mut request_focus), |edit| {
                         edit.id(field_id)
                     });
                 });
-            });
-            let _ = ctx.run(
+            })
+            .drop_without_applying_deltas();
+            ctx.run_ui(
                 viewport_raw_input(
                     egui::ViewportId::ROOT,
                     vec![
                         egui::Event::Ime(egui::ImeEvent::Enabled),
-                        egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                        egui::Event::Ime(egui::ImeEvent::Preedit {
+                            text: "あ".to_owned(),
+                            active_range_chars: None,
+                        }),
                         // An ordinary Enter while still composing exercises restoration.
                         // IME-handled Process presses never reach this event queue.
                         key_event(egui::Key::Enter),
                     ],
                 ),
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                |ui| {
+                    let ctx = &ui.ctx().clone();
+                    egui::CentralPanel::default().show(ui, |ui| {
                         let focus_request = external_latch.then_some(&mut request_focus);
                         let output =
                             show_singleline(ui, &mut text, focus_request, |edit| edit.id(field_id));
@@ -1073,37 +1102,55 @@ mod tests {
                     assert_eq!(diagnostic.field_id_after, Some(field_id));
                     assert!(!diagnostic_is_anomalous(&diagnostic, Some(field_id)));
                 },
-            );
+            )
+            .drop_without_applying_deltas();
         }
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn facade_explicit_viewport_and_pending_reads_do_not_start_diagnostics() {
         let ctx = test_context();
+        ctx.set_embed_viewports(false);
         let child = egui::ViewportId::from_hash_of("facade-child");
+        // RawInput metadata alone does not keep a child registered after root
+        // end-pass GC. Declare the native child before its first input pass and
+        // on every parent pass, as the real viewport owner does.
+        ctx.run_ui(Default::default(), |ui| {
+            ui.ctx()
+                .show_viewport_deferred(child, Default::default(), |_, _| {});
+        })
+        .drop_without_applying_deltas();
         ctx.begin_pass(viewport_raw_input(
             child,
             vec![egui::Event::Ime(egui::ImeEvent::Enabled)],
         ));
-        let _ = ctx.end_pass();
-        let field_id = egui::Id::new("facade-root-field");
+        ctx.end_pass().drop_without_applying_deltas();
+        let field_id = egui::Id::unique("facade-root-field");
         let mut text = "abc".to_owned();
         let mut request_focus = true;
         let mut root_input = viewport_raw_input(egui::ViewportId::ROOT, vec![]);
         root_input.viewports.insert(child, Default::default());
-        let _ = ctx.run(root_input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        ctx.run_ui(root_input, |ui| {
+            let ctx = &ui.ctx().clone();
+            ctx.show_viewport_deferred(child, Default::default(), |_, _| {});
+            egui::CentralPanel::default().show(ui, |ui| {
                 add_singleline(ui, &mut text, Some(&mut request_focus), |edit| {
                     edit.id(field_id)
                 });
             });
-        });
+        })
+        .drop_without_applying_deltas();
         let mut root_input = viewport_raw_input(
             egui::ViewportId::ROOT,
             vec![key_event(egui::Key::ArrowLeft)],
         );
         root_input.viewports.insert(child, Default::default());
         ctx.begin_pass(root_input);
+        ctx.show_viewport_deferred(child, Default::default(), |_, _| {});
         let pass = ctx.cumulative_pass_nr();
         let events_before = ctx.input(|input| input.events.clone());
         let contract_before = egui_ime::text_focus_contract_snapshot(&ctx);
@@ -1135,29 +1182,45 @@ mod tests {
             ctx.data(|data| data.get_temp::<u64>(text_input_key_diagnostic_started_id(child))),
             Some(pass)
         );
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
+
+        // Stale metadata must not preserve policy once the actual registration
+        // ends. This is a different owner lifetime, not a visibility change.
+        let mut retired_input = viewport_raw_input(egui::ViewportId::ROOT, vec![]);
+        retired_input.viewports.insert(child, Default::default());
+        ctx.run_ui(retired_input, |_| {})
+            .drop_without_applying_deltas();
+        assert!(!ime_input_active_in_viewport(&ctx, child));
     }
 
     #[test]
+    #[expect(
+        deprecated,
+        reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+    )]
     fn facade_plugin_reregistration_preserves_composition_and_cancellation() {
         let ctx = test_context();
-        let field_id = egui::Id::new("facade-plugin-reregister");
+        let field_id = egui::Id::unique("facade-plugin-reregister");
         let mut text = String::new();
         let mut request_focus = true;
         for events in [
             Vec::new(),
             vec![
                 egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("あ".to_owned())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "あ".to_owned(),
+                    active_range_chars: None,
+                }),
             ],
         ] {
-            let _ = ctx.run(viewport_raw_input(egui::ViewportId::ROOT, events), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            ctx.run_ui(viewport_raw_input(egui::ViewportId::ROOT, events), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     add_singleline(ui, &mut text, Some(&mut request_focus), |edit| {
                         edit.id(field_id)
                     });
                 });
-            });
+            })
+            .drop_without_applying_deltas();
         }
         assert_eq!(text, "あ");
         install_ime_input_policy(&ctx);
@@ -1166,7 +1229,7 @@ mod tests {
             egui::ViewportId::ROOT,
             &[]
         ));
-        let _ = ctx.run(
+        ctx.run_ui(
             viewport_raw_input(
                 egui::ViewportId::ROOT,
                 vec![
@@ -1180,12 +1243,13 @@ mod tests {
                     },
                 ],
             ),
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     add_singleline(ui, &mut text, None, |edit| edit.id(field_id));
                 });
             },
-        );
+        )
+        .drop_without_applying_deltas();
         assert!(text.is_empty());
         assert_eq!(ctx.memory(|memory| memory.focused()), Some(field_id));
         assert!(!ime_composing_with_pending_events(
@@ -1280,6 +1344,30 @@ mod tests {
             line_anchor: "multiline(&mut state.textarea)",
             expected_occurrences: 1,
             reason: "時刻付き行の paste と独自 focus lifecycle を持つ複数行 editor",
+        },
+        RawTextEditExemption {
+            path: "src/video/native_presenter/render_core.rs",
+            line_anchor: "singleline(&mut text).id(id)",
+            expected_occurrences: 4,
+            reason: "native_ime_interrupt の2つの低レベル headless fixture。実eguiのcaret移動・focus要求から生成されるIME出力を測り、アプリのfocus復元policyを介在させない",
+        },
+        RawTextEditExemption {
+            path: "src/video/native_window_pump.rs",
+            line_anchor: "singleline(&mut text).id(id)",
+            expected_occurrences: 2,
+            reason: "native_ime_interrupt のheadless fixture。実eguiの旧focus ownerが生成する出力をcontrol配送へ渡す",
+        },
+        RawTextEditExemption {
+            path: "src/video/native_window_pump.rs",
+            line_anchor: "singleline(&mut String::new()).id(destination)",
+            expected_occurrences: 1,
+            reason: "同じnative_ime_interrupt fixtureのfocus移譲先。実eguiのfocus変更によるinterrupt pulseを直接生成する",
+        },
+        RawTextEditExemption {
+            path: "src/video/native_window_pump.rs",
+            line_anchor: "singleline(&mut text).id(destination)",
+            expected_occurrences: 1,
+            reason: "同じnative_ime_interrupt fixtureの配送後pass。実eguiがinterrupt pulseを再発行しないことを直接観測する",
         },
     ];
 

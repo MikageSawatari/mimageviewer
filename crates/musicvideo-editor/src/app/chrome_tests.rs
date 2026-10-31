@@ -27,7 +27,7 @@ impl Harness {
     }
 
     fn frame(&mut self, events: Vec<egui::Event>) {
-        self.output = self.ctx.run(
+        self.output = crate::project::headless_paint_output(self.ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -39,13 +39,16 @@ impl Harness {
             |ctx| {
                 self.app.process_editor_frame(ctx);
             },
-        );
+        ));
     }
 
     fn panel(&self, name: &str) -> egui::Rect {
-        egui::containers::panel::PanelState::load(&self.ctx, egui::Id::new(name))
-            .unwrap()
-            .rect
+        egui::containers::panel::PanelState::load(
+            &self.ctx,
+            self.ctx.viewport_id().root_ui_id().with(name),
+        )
+        .unwrap()
+        .outer_rect
     }
 
     fn heights(&self) -> (f32, f32) {
@@ -685,7 +688,7 @@ fn l3_play_pause_button_and_seek_digits_do_not_change_toolbar_geometry() {
             toolbar.position_secs = position;
             toolbar.duration_secs = 36000.0;
             for _ in 0..2 {
-                let _ = ctx.run(
+                let _ = crate::project::headless_paint_output(ctx.run_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,
@@ -694,7 +697,7 @@ fn l3_play_pause_button_and_seek_digits_do_not_change_toolbar_geometry() {
                         ..Default::default()
                     },
                     |ctx| {
-                        let height = egui::TopBottomPanel::top("toolbar")
+                        let height = egui::Panel::top("toolbar")
                             .show(ctx, |ui| {
                                 ui.horizontal_wrapped(|ui| toolbar.draw(ui, &mut vec![]));
                             })
@@ -707,7 +710,7 @@ fn l3_play_pause_button_and_seek_digits_do_not_change_toolbar_geometry() {
                             baseline = Some(height);
                         }
                     },
-                );
+                ));
             }
         }
     }
@@ -899,7 +902,7 @@ fn l3_missing_window_reports_the_original_image_replacement_request() {
     // Render the production window, inspect the request before its native file dialog.
     let mut actions = Vec::new();
     for pressed in [true, false] {
-        let _ = h.ctx.run(
+        let _ = crate::project::headless_paint_output(h.ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -909,7 +912,7 @@ fn l3_missing_window_reports_the_original_image_replacement_request() {
                 ..Default::default()
             },
             |ctx| h.app.draw_tool_windows(ctx, true, &mut actions),
-        );
+        ));
     }
     assert!(
         actions

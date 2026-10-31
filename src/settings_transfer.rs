@@ -264,6 +264,7 @@ macro_rules! preferences_policy {
 preferences_policy! {
     export {
         ui_theme: UiTheme => ("テーマ", |v, _raw| matches!(v, UiTheme::System | UiTheme::Light | UiTheme::Dark), plain, plain);
+        notification_duration: NotificationDuration => ("通知の表示時間", |v, _raw| !matches!(v, NotificationDuration::Unknown), plain, plain);
         preferences_restore_position: bool => ("環境設定の前回位置を復元", |_, _| true, plain, plain);
         text_contrast: TextContrast => ("文字コントラスト", |v, _raw| matches!(v, TextContrast::Standard | TextContrast::Strong), plain, plain);
         raw_brightness: crate::raw::RawBrightness => ("RAW の明るさ", |v, _raw| matches!(v, crate::raw::RawBrightness::MatchPreview | crate::raw::RawBrightness::None), plain, plain);
@@ -285,6 +286,8 @@ preferences_policy! {
         audio_thumbnail_indicator: AudioThumbnailIndicator => ("音声サムネイルの表示", |v, _raw| !matches!(v, AudioThumbnailIndicator::Unknown), plain, plain);
         thumb_show_media_duration: bool => ("サムネイルの再生時間表示", |_, _| true, plain, plain);
         thumb_show_resume_meter: bool => ("サムネイルの読書・再生位置表示", |_, _| true, plain, plain);
+        thumb_name_font_scale_percent: u32 => ("サムネイル一覧の名前の文字サイズ", |v, _raw| (THUMB_NAME_FONT_SCALE_PERCENT_MIN..=THUMB_NAME_FONT_SCALE_PERCENT_MAX).contains(v), plain, plain);
+        thumb_name_max_lines: u32 => ("サムネイル一覧の名前の最大行数", |v, _raw| (THUMB_NAME_MAX_LINES_MIN..=THUMB_NAME_MAX_LINES_MAX).contains(v), plain, plain);
         selection_info_display_mode: SelectionInfoDisplayMode => ("選択項目の情報表示", |v, _raw| !matches!(v, SelectionInfoDisplayMode::Unknown), plain, plain);
         thumb_tooltip_show_filename: bool => ("サムネイルツールチップ：ファイル名", |_, _| true, plain, plain);
         thumb_tooltip_show_image_dimensions: bool => ("サムネイルツールチップ：画像サイズ", |_, _| true, plain, plain);
@@ -313,6 +316,7 @@ preferences_policy! {
         bake_stage_export: crate::bake_stage::BakeStage => ("書き出しの焼き込み", |_, _| true, plain, plain);
         bake_stage_export_batch: crate::bake_stage::BakeStage => ("一括書き出しの焼き込み", |_, _| true, plain, plain);
         bake_stage_external_tool: crate::bake_stage::BakeStage => ("外部ツールへの焼き込み", |_, _| true, plain, plain);
+        bake_stage_clipboard: crate::bake_stage::BakeStage => ("クリップボードへの焼き込み", |_, _| true, plain, plain);
         archive_file_handling: ArchiveFileHandling => ("アーカイブファイルの扱い", |v, _raw| matches!(v, ArchiveFileHandling::Ask | ArchiveFileHandling::Convert | ArchiveFileHandling::Ignore), archive, archive);
         epub_file_handling: EpubFileHandling => ("EPUBファイルの扱い", |_, _| true, plain, plain);
         show_hidden_files: bool => ("隠しファイルを表示", |_, _| true, plain, plain);
@@ -337,6 +341,7 @@ preferences_policy! {
         write_rating_to_xmp: bool => ("評価をXMPに保存", |_, _| true, plain, plain);
         reading_history_enabled: bool => ("閲覧履歴を記録", |_, _| true, plain, plain);
         default_spread_mode: SpreadMode => ("標準の見開き設定", |v, _| SpreadMode::all().contains(v), plain, plain);
+        apply_default_spread_to_plain_folders: bool => ("通常フォルダにも既定のページ構成を使う", |_, _| true, plain, plain);
         follow_document_reading_direction: bool => ("文書の綴じ方向に従う", |_, _| true, plain, plain);
         remember_spread_shift_per_book: bool => ("見開きの調整を本ごとに記憶する", |_, _| true, plain, plain);
         page_turn_animation_enabled: bool => ("ページめくりアニメーション", |_, _| true, plain, plain);
@@ -344,6 +349,7 @@ preferences_policy! {
         default_reading_flow: ReadingFlow => ("標準の読書フロー", |_, _| true, plain, plain);
         default_reading_direction: ReadingDirection => ("標準の読み方向", |_, _| true, plain, plain);
         final_cover_spread_enabled: bool => ("裏表紙の見開き", |_, _| true, plain, plain);
+        auto_view_trim_default_enabled: bool => ("自動余白カットを標準で有効にする", |_, _| true, plain, plain);
         singleton_spread_first_enabled: bool => ("最初のページを単独表示", |_, _| true, plain, plain);
         singleton_spread_last_enabled: bool => ("最後のページを単独表示", |_, _| true, plain, plain);
         page_after_cover_alone_enabled: bool => ("表紙の次を単独表示", |_, _| true, plain, plain);
@@ -359,6 +365,7 @@ preferences_policy! {
         fullscreen_fit_no_downscale: bool => ("フィットで縮小しない", |_, _| true, plain, plain);
         fullscreen_side_panel_mode: FsSidePanelMode => ("閲覧表示の左右パネル", |v, _raw| FsSidePanelMode::all().contains(v), plain, plain);
         fullscreen_chrome_suppression: FullscreenChromeSuppression => ("全画面中の固定表示の一時抑制", |_, _| true, plain, plain);
+        fullscreen_manual_nav_wrap: bool => ("閲覧表示の手動前後移動ループ", |_, _| true, plain, plain);
         fullscreen_boundary_notice_visible: bool => ("閲覧表示の境界通知", |_, _| true, plain, plain);
         fullscreen_processing_status_visible: bool => ("閲覧表示の処理状況", |_, _| true, plain, plain);
         fullscreen_prefetch_status_visible: bool => ("閲覧表示の先読み状況", |_, _| true, plain, plain);
@@ -429,6 +436,7 @@ preferences_policy! {
         details_column_order => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_column_widths => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_rated_at_width => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        details_applied_at_width => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_page_count_column_index_stash => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_page_count_column_width_stash => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_place_column_index_stash => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -438,6 +446,7 @@ preferences_policy! {
         details_show_preview => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_show_rating => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_show_rated_at => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        details_show_applied_at => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_show_tags => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_show_kind => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_show_page_count => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -456,9 +465,11 @@ preferences_policy! {
         details_selection_bar_column_order => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_column_widths => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_rated_at_width => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        details_selection_bar_applied_at_width => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_show_preview => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_show_rating => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_show_rated_at => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        details_selection_bar_show_applied_at => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_show_tags => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_show_kind => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_show_page_count => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -500,6 +511,7 @@ preferences_policy! {
         prefetch_forward => "CPU/GPU/メモリ/ドライバ/速度の tuning";
         sort_order => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         rating_view_sort => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        tag_view_sort => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         subfolder_expansion_order => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         subfolder_expansion_max_depth => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         subfolder_expansion_filter_kinds => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -537,6 +549,10 @@ preferences_policy! {
         folder_tree_pane_visible => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         folder_tree_sort_order => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         folder_tree_pane_width_ratio => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        show_toolbar_search_container => "環境設定外のツールバー検索欄";
+        show_toolbar_search_local => "環境設定外のツールバー検索欄";
+        show_toolbar_search_metadata => "環境設定外のツールバー検索欄";
+        show_toolbar_search_everything => "環境設定外のツールバー検索欄";
         show_toolbar_folder => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_toolbar_folder_tree_button => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_toolbar_effetune => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -711,6 +727,7 @@ preferences_policy! {
         video_in_window_mode => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         detached_viewer_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         detached_viewer_window_placement => "runtime overlay / PC のウィンドウ配置";
+        detached_viewer_window_physical_placement => "runtime overlay / PC のウィンドウ配置";
         vst3_enabled => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
         vst3_plugins => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
         vst3_plugin_path => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
@@ -724,6 +741,7 @@ preferences_policy! {
         audio_normalize_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         audio_normalize_target_lufs_milli => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         last_seen_version => "初回/学習/通知/保存版の内部記録";
+        whats_new_acknowledged_version => "初回/学習/通知/保存版の内部記録";
     }
 }
 
@@ -929,6 +947,7 @@ mod tests {
     }
     fn nondefault_source() -> Settings {
         let mut settings = Settings::default();
+        settings.apply_default_spread_to_plain_folders = true;
         settings
             .file_type_visibility
             .excluded_categories
@@ -972,6 +991,7 @@ mod tests {
         settings.fullfeature_media_window = !settings.fullfeature_media_window;
         settings.restore_last_cursor = !settings.restore_last_cursor;
         settings.preferences_restore_position = !settings.preferences_restore_position;
+        settings.notification_duration = NotificationDuration::Long;
         settings.startup_window_state = different_enum(
             &settings.startup_window_state,
             &[
@@ -1015,6 +1035,16 @@ mod tests {
         );
         settings.thumb_show_media_duration = !settings.thumb_show_media_duration;
         settings.thumb_show_resume_meter = !settings.thumb_show_resume_meter;
+        settings.thumb_name_font_scale_percent = if settings.thumb_name_font_scale_percent == 200 {
+            100
+        } else {
+            200
+        };
+        settings.thumb_name_max_lines = if settings.thumb_name_max_lines == 4 {
+            1
+        } else {
+            4
+        };
         settings.selection_info_display_mode = different_enum(
             &settings.selection_info_display_mode,
             &[
@@ -1125,6 +1155,14 @@ mod tests {
             ],
         );
         settings.clipboard_capture_min_short_side_px = 240;
+        settings.bake_stage_clipboard = different_enum(
+            &settings.bake_stage_clipboard,
+            &[
+                crate::bake_stage::BakeStage::Edits,
+                crate::bake_stage::BakeStage::Ai,
+                crate::bake_stage::BakeStage::DisplayAdjust,
+            ],
+        );
         settings.archive_file_handling = different_enum(
             &settings.archive_file_handling,
             &[
@@ -1204,6 +1242,7 @@ mod tests {
             &[ReadingDirection::Ltr, ReadingDirection::Rtl],
         );
         settings.final_cover_spread_enabled = !settings.final_cover_spread_enabled;
+        settings.auto_view_trim_default_enabled = !settings.auto_view_trim_default_enabled;
         settings.singleton_spread_first_enabled = !settings.singleton_spread_first_enabled;
         settings.singleton_spread_last_enabled = !settings.singleton_spread_last_enabled;
         settings.page_after_cover_alone_enabled = !settings.page_after_cover_alone_enabled;
@@ -1236,6 +1275,7 @@ mod tests {
             &[FsSidePanelMode::Hover, FsSidePanelMode::ClickToShow],
         );
         settings.fullscreen_boundary_notice_visible = !settings.fullscreen_boundary_notice_visible;
+        settings.fullscreen_manual_nav_wrap = !settings.fullscreen_manual_nav_wrap;
         settings.fullscreen_processing_status_visible =
             !settings.fullscreen_processing_status_visible;
         settings.fullscreen_prefetch_status_visible = !settings.fullscreen_prefetch_status_visible;
@@ -1909,32 +1949,78 @@ mod tests {
     }
 
     #[test]
+    fn auto_view_trim_default_transfer_roundtrip_missing_and_invalid_values() {
+        for enabled in [true, false] {
+            let source = Settings {
+                auto_view_trim_default_enabled: enabled,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            let mut destination = Settings {
+                auto_view_trim_default_enabled: !enabled,
+                ..Settings::default()
+            };
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.auto_view_trim_default_enabled, enabled);
+            parse_preferences(&document(json!({})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.auto_view_trim_default_enabled, enabled);
+            for invalid in [json!("true"), json!(1), Value::Null] {
+                let report = parse_preferences(&document(
+                    json!({"auto_view_trim_default_enabled": invalid}),
+                ))
+                .unwrap()
+                .apply_to(&mut destination);
+                assert_eq!(report.issues.len(), 1);
+                assert_eq!(destination.auto_view_trim_default_enabled, enabled);
+            }
+        }
+    }
+
+    #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 461);
+        assert_eq!(entries.len(), 479);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            146
+            153
         );
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            315
+            326
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
+        for key in [
+            "show_toolbar_search_container",
+            "show_toolbar_search_local",
+            "show_toolbar_search_metadata",
+            "show_toolbar_search_everything",
+        ] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|(field, reason)| *field == key && reason.is_some()),
+                "toolbar state must remain classified outside Preferences: {key}"
+            );
+        }
         assert!(
             entries
                 .iter()
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 144);
+        assert_eq!(wire.len(), 151);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -1949,6 +2035,58 @@ mod tests {
                 .collect::<HashSet<_>>(),
             wire.into_iter().collect()
         );
+    }
+
+    #[test]
+    fn thumb_name_settings_transfer_roundtrip_missing_and_invalid_values() {
+        let source = Settings {
+            thumb_name_font_scale_percent: 175,
+            thumb_name_max_lines: 4,
+            ..Settings::default()
+        };
+        let exported = export_preferences(&source).unwrap();
+        let mut destination = Settings::default();
+        let report = parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(report.issues.is_empty());
+        assert_eq!(destination.thumb_name_font_scale_percent, 175);
+        assert_eq!(destination.thumb_name_max_lines, 4);
+        assert!(
+            report
+                .changed_fields
+                .iter()
+                .any(|field| field == "サムネイル一覧の名前の文字サイズ")
+        );
+        assert!(
+            report
+                .changed_fields
+                .iter()
+                .any(|field| field == "サムネイル一覧の名前の最大行数")
+        );
+        parse_preferences(INITIAL_V1)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert_eq!(destination.thumb_name_font_scale_percent, 175);
+        assert_eq!(destination.thumb_name_max_lines, 4);
+
+        for (field, invalid) in [
+            ("thumb_name_font_scale_percent", json!(99)),
+            ("thumb_name_font_scale_percent", json!(201)),
+            ("thumb_name_font_scale_percent", json!(-1)),
+            ("thumb_name_font_scale_percent", json!(150.5)),
+            ("thumb_name_max_lines", json!(0)),
+            ("thumb_name_max_lines", json!(5)),
+            ("thumb_name_max_lines", json!("2")),
+            ("thumb_name_max_lines", Value::Null),
+        ] {
+            let report = parse_preferences(&document(json!({field: invalid})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(report.issues.len(), 1, "{field}");
+            assert_eq!(destination.thumb_name_font_scale_percent, 175);
+            assert_eq!(destination.thumb_name_max_lines, 4);
+        }
     }
 
     #[test]
@@ -2001,6 +2139,34 @@ mod tests {
             .apply_to(&mut destination);
             assert!(report.issues.is_empty());
             assert_eq!(destination.page_turn_animation_duration_ms, duration);
+        }
+    }
+
+    #[test]
+    fn clipboard_bake_stage_transfer_roundtrips_and_preserves_on_missing_or_invalid() {
+        use crate::bake_stage::BakeStage;
+
+        for stage in BakeStage::ALL {
+            let source = Settings {
+                bake_stage_clipboard: stage,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            let mut destination = Settings::default();
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.bake_stage_clipboard, stage);
+            parse_preferences(INITIAL_V1)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.bake_stage_clipboard, stage);
+            let report = parse_preferences(&document(json!({"bake_stage_clipboard": "Unknown"})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(report.issues.len(), 1);
+            assert_eq!(destination.bake_stage_clipboard, stage);
         }
     }
 
@@ -2061,6 +2227,39 @@ mod tests {
             assert_eq!(parsed.issues.len(), 1);
             parsed.apply_to(&mut destination);
             assert_eq!(destination.preferences_restore_position, enabled);
+        }
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_transfer_roundtrip_missing_and_invalid_values() {
+        for enabled in [false, true] {
+            let source = Settings {
+                fullscreen_manual_nav_wrap: enabled,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            assert!(exported.issues.is_empty());
+            let mut destination = Settings {
+                fullscreen_manual_nav_wrap: !enabled,
+                ..Settings::default()
+            };
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.fullscreen_manual_nav_wrap, enabled);
+            parse_preferences(INITIAL_V1)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.fullscreen_manual_nav_wrap, enabled);
+            for invalid in [json!("true"), json!(1), Value::Null] {
+                let parsed =
+                    parse_preferences(&document(json!({"fullscreen_manual_nav_wrap": invalid})))
+                        .unwrap();
+                assert_eq!(parsed.issues.len(), 1);
+                parsed.apply_to(&mut destination);
+                assert_eq!(destination.fullscreen_manual_nav_wrap, enabled);
+            }
         }
     }
 
@@ -2179,6 +2378,40 @@ mod tests {
                 .iter()
                 .all(|label| label.chars().any(|c| !c.is_ascii()))
         );
+    }
+
+    #[test]
+    fn tag_sort_and_applied_at_columns_remain_local_view_settings() {
+        let mut destination = Settings {
+            tag_view_sort: crate::tag_view::TagViewSort::AppliedAtAsc,
+            details_show_applied_at: false,
+            details_applied_at_width: Some(177.0),
+            details_selection_bar_show_applied_at: false,
+            details_selection_bar_applied_at_width: Some(233.0),
+            ..Settings::default()
+        };
+        let exported = export_preferences(&destination).unwrap();
+        let preferences: Value = serde_json::from_str(&exported.json).unwrap();
+        for key in [
+            "tag_view_sort",
+            "details_show_applied_at",
+            "details_applied_at_width",
+            "details_selection_bar_show_applied_at",
+            "details_selection_bar_applied_at_width",
+        ] {
+            assert!(preferences["preferences"].get(key).is_none(), "{key}");
+        }
+        let before = destination.clone();
+        parse_preferences(&document(json!({
+            "tag_view_sort": "PathOrder",
+            "details_show_applied_at": true,
+            "details_applied_at_width": 300.0,
+            "details_selection_bar_show_applied_at": true,
+            "details_selection_bar_applied_at_width": 400.0
+        })))
+        .unwrap()
+        .apply_to(&mut destination);
+        assert_excluded_unchanged(&before, &destination);
     }
 
     fn private_destination() -> Settings {
@@ -2360,6 +2593,67 @@ mod tests {
         let report = parsed.apply_to(&mut destination);
         assert_eq!(report.issues.len(), 1);
         assert_eq!(destination.raw_brightness, crate::raw::RawBrightness::None);
+        assert_excluded_unchanged(&before, &destination);
+    }
+
+    #[test]
+    fn detached_placement_transfer_excludes_both_formats_and_keeps_destination() {
+        use crate::detached_window_geometry::{PhysicalRect, PhysicalWindowPlacement};
+        use crate::settings::DetachedViewerWindowPlacement;
+
+        let source = Settings {
+            detached_viewer_window_placement: Some(DetachedViewerWindowPlacement {
+                x: 4000.0,
+                y: 100.0,
+                w: 960.0,
+                h: 720.0,
+                maximized: false,
+            }),
+            detached_viewer_window_physical_placement: Some(PhysicalWindowPlacement {
+                outer: PhysicalRect {
+                    left: 6000,
+                    top: 150,
+                    right: 7440,
+                    bottom: 1230,
+                },
+                maximized: true,
+            }),
+            ..Settings::default()
+        };
+        let exported = export_preferences(&source).unwrap();
+        let mut document: Value = serde_json::from_str(&exported.json).unwrap();
+        for key in [
+            "detached_viewer_window_placement",
+            "detached_viewer_window_physical_placement",
+        ] {
+            assert!(document["preferences"].get(key).is_none(), "{key}");
+            document["preferences"][key] = serde_json::to_value(&source).unwrap()[key].clone();
+        }
+        let mut destination = Settings {
+            detached_viewer_window_physical_placement: Some(PhysicalWindowPlacement {
+                outer: PhysicalRect {
+                    left: -1920,
+                    top: 0,
+                    right: -960,
+                    bottom: 720,
+                },
+                maximized: false,
+            }),
+            ..Settings::default()
+        };
+        let before = destination.clone();
+        let report = parse_preferences(&document.to_string())
+            .unwrap()
+            .apply_to(&mut destination);
+        assert_eq!(report.unknown_count, 2);
+        assert_eq!(
+            destination.detached_viewer_window_placement,
+            before.detached_viewer_window_placement
+        );
+        assert_eq!(
+            destination.detached_viewer_window_physical_placement,
+            before.detached_viewer_window_physical_placement
+        );
         assert_excluded_unchanged(&before, &destination);
     }
 

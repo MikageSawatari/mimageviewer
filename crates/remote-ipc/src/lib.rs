@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 // client / server の両版を観測可能な形で拒否する。
 pub const PIPE_NAME: &str = r"\\.\pipe\mimageviewer-remote-thumbnail";
 /// 片側だけ変更されたバイナリを接続しないためのプロトコル版数。
-pub const PROTOCOL_VERSION: u32 = 71;
+pub const PROTOCOL_VERSION: u32 = 72;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 128 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// One wall-clock budget for the complete remote video start path, from core IPC queueing
@@ -707,8 +707,9 @@ pub enum RemoteWriteRequest {
     GetAdjustmentState {
         address: RemoteAddress,
     },
-    /// `state` は本体の `ViewTrimBookState` の serde 表現そのもの。
-    /// IPC 専用のトリムモデルや既定値を持たず、本体 UI thread で型検証・clamp する。
+    /// `state` は `preference` と `book_settings` を持つ Remote 用 JSON。
+    /// 応答の `effective_apply_mode` は読取専用で、入力に含まれていても解決に使わない。
+    /// 本体で型検証・clamp し、保存用 JSON の version / apply_mode とは分離する。
     SetViewTrim {
         address: RemoteAddress,
         context_address: RemoteAddress,
@@ -3309,7 +3310,7 @@ mod tests {
 
     #[test]
     fn protocol_v67_registered_collection_total_round_trips_and_defaults() {
-        assert_eq!(PROTOCOL_VERSION, 71);
+        assert_eq!(PROTOCOL_VERSION, 72);
         let payload = PersistentCollectionSnapshotPayload {
             registered_total: 12,
             thumbnail_presentation: ThumbnailPresentation::default(),
@@ -3383,7 +3384,7 @@ mod tests {
             serde_json::from_str::<ThumbnailPresentation>("{}").unwrap(),
             ThumbnailPresentation::default()
         );
-        assert_eq!(PROTOCOL_VERSION, 71);
+        assert_eq!(PROTOCOL_VERSION, 72);
     }
 
     #[test]
@@ -3439,7 +3440,7 @@ mod tests {
 
     #[test]
     fn protocol_v63_audio_track_control_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 71);
+        assert_eq!(PROTOCOL_VERSION, 72);
         let action = VideoStreamControlAction::AudioTrack {
             stream_index: 3,
             position_secs: 42.5,
@@ -3589,7 +3590,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_connection_info_round_trips_with_tailnet_prerequisites_without_credentials() {
-        assert_eq!(PROTOCOL_VERSION, 71);
+        assert_eq!(PROTOCOL_VERSION, 72);
         let expected = ClientMessage::RemoteWebConnectionInfo {
             id: 10,
             info: RemoteWebConnectionInfo {
@@ -3632,7 +3633,7 @@ mod tests {
 
     #[test]
     fn protocol_v62_raw_error_codes_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 71);
+        assert_eq!(PROTOCOL_VERSION, 72);
         for (code, wire) in [
             (MediaErrorCode::RawPrefetchSkipped, "raw_prefetch_skipped"),
             (MediaErrorCode::RawCapacity, "raw_capacity"),
@@ -3654,7 +3655,7 @@ mod tests {
 
     #[test]
     fn protocol_v65_raw_window_request_and_all_ack_outcomes_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 71);
+        assert_eq!(PROTOCOL_VERSION, 72);
         let expected = ClientMessage::RawPrefetchWindow {
             id: 65,
             owner: test_owner("window-client"),
@@ -3855,7 +3856,7 @@ mod tests {
 
     #[test]
     fn protocol_v55_remote_video_thumbnail_shape_round_trips() {
-        assert_eq!(PROTOCOL_VERSION, 71);
+        assert_eq!(PROTOCOL_VERSION, 72);
         let requests = [
             ClientMessage::VideoStreamStart {
                 id: 50,
@@ -4302,7 +4303,7 @@ mod tests {
                 address: page.clone(),
                 context_address: RemoteAddress::file("C:/Books/book.pdf"),
                 state: serde_json::json!({
-                    "apply_mode": "book",
+                    "preference": "manual",
                     "book_settings": {
                         "enabled": true,
                         "spread_separate": false,
@@ -4798,7 +4799,7 @@ mod tests {
         assert_eq!(json["places"][0]["entries"][0]["name"], "保管");
         assert_eq!(json["places"][0]["entries"][1]["path"], "Z:/absent");
         assert_eq!(json["places"][0]["entries"][1]["kind"], "folder");
-        assert_eq!(PROTOCOL_VERSION, 71);
+        assert_eq!(PROTOCOL_VERSION, 72);
     }
 
     #[test]
@@ -4996,7 +4997,7 @@ mod tests {
 
     #[test]
     fn persistent_collection_shuffle_order_round_trips_on_protocol_59() {
-        assert_eq!(PROTOCOL_VERSION, 71);
+        assert_eq!(PROTOCOL_VERSION, 72);
         let encoded = serde_json::to_value(PersistentCollectionOrderSummary::Shuffle).unwrap();
         assert_eq!(encoded, serde_json::json!({ "kind": "shuffle" }));
         let decoded: PersistentCollectionOrderSummary = serde_json::from_value(encoded).unwrap();

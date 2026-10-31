@@ -23,7 +23,8 @@
 
 $ErrorActionPreference = 'Stop'
 
-# Pinned versions (ort 2.0.0-rc.12 -> ORT 1.24.2 / CUDA 12.x / cuDNN 9.x / TRT 10.x)
+# Pinned versions (ORT GPU 1.24.2 / CUDA 12.x / cuDNN 9.x / TRT 10.x)
+# ort 2.0.0-rc.15 uses default-features=false + api-24; this pack stays compatible and unchanged.
 $ORT_GPU_VERSION = '1.24.2'
 $CUDA_CUDART_VERSION = '12.9.79'
 $CUDA_CUBLAS_VERSION = '12.9.1.4'

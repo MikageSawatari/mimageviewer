@@ -61,7 +61,7 @@ pub(super) fn draw_update_notice_dialog(
 ) -> UpdateNoticeResponse {
     let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
     let mut response = UpdateNoticeResponse::default();
-    egui::Window::new("バージョン情報")
+    egui::Window::new("バージョン情報").drag_area(egui::WindowDrag::Anywhere)
             .open(open)
             .collapsible(false)
             .resizable(true)

@@ -197,10 +197,25 @@ pub(crate) fn clear_all(connection: &mut Connection) -> Result<usize, String> {
 
 /// Completed book-folder operations retain payload spelling and affect only that root family.
 /// The caller is the single shift worker, with its existing writable connection.
+#[cfg(test)]
 pub(crate) fn rename_book_root(
     connection: &mut Connection,
     source: &str,
     target: &str,
+) -> Result<usize, String> {
+    rename_book_root_with_collision(
+        connection,
+        source,
+        target,
+        crate::rename_key_migration::PathMigrationCollision::DestinationWins,
+    )
+}
+
+pub(crate) fn rename_book_root_with_collision(
+    connection: &mut Connection,
+    source: &str,
+    target: &str,
+    collision: crate::rename_key_migration::PathMigrationCollision,
 ) -> Result<usize, String> {
     validate_storage_key(source)?;
     validate_storage_key(target)?;
@@ -212,6 +227,15 @@ pub(crate) fn rename_book_root(
         .map_err(|error| error.to_string())?;
     let rows = load_rows(&transaction)?;
     let prefix = format!("{}/", source.trim_end_matches('/'));
+    if collision == crate::rename_key_migration::PathMigrationCollision::SourceWins {
+        let target_prefix = format!("{}/", target.trim_end_matches('/'));
+        transaction
+            .execute(
+                "DELETE FROM spread_shifts WHERE path = ?1 OR substr(path, 1, length(?2)) = ?2",
+                rusqlite::params![target, target_prefix],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     let mut moved = 0;
     for (key, reference) in rows {
         let destination = if key == source {
@@ -239,6 +263,7 @@ pub(crate) fn rename_book_root(
 }
 
 /// A deleted book root clears its scopes; deleting a page does not match its parent scope.
+#[cfg(test)]
 pub(crate) fn purge_book_root(connection: &mut Connection, root: &str) -> Result<usize, String> {
     validate_storage_key(root)?;
     let transaction = connection
@@ -259,6 +284,11 @@ pub(crate) fn purge_book_root(connection: &mut Connection, root: &str) -> Result
     Ok(removed)
 }
 
+enum RelativeMapping {
+    Within(String),
+    Outside,
+}
+
 struct PathMappingIndex {
     by_from: HashMap<String, (usize, PathBuf)>,
 }
@@ -274,7 +304,7 @@ impl PathMappingIndex {
         Self { by_from }
     }
 
-    fn map_relative(&self, scope: &str, relative: &str) -> Option<String> {
+    fn map_relative(&self, scope: &str, relative: &str) -> Option<RelativeMapping> {
         let root = Path::new(scope);
         let original = root.join(relative.replace(['/', '\\'], std::path::MAIN_SEPARATOR_STR));
         let scope_prefix = format!("{}/", scope.trim_end_matches('/'));
@@ -284,7 +314,7 @@ impl PathMappingIndex {
                 continue;
             };
             // Root/ancestor moves are handled by generic key migration. A relative payload
-            // does not change, and moving a page to a sibling book leaves the old anchor Missing.
+            // does not change. Page moves outside the scope follow the request policy.
             if !candidate_key.starts_with(&scope_prefix) {
                 return None;
             }
@@ -294,25 +324,40 @@ impl PathMappingIndex {
                 .collect::<PathBuf>();
             let mapped = destination.join(suffix);
             if !crate::path_key::normalize_keep_drive(&mapped).starts_with(&scope_prefix) {
-                return None;
+                return Some(RelativeMapping::Outside);
             }
-            return Some(
+            return Some(RelativeMapping::Within(
                 mapped
                     .components()
                     .skip(root.components().count())
                     .collect::<PathBuf>()
                     .to_string_lossy()
                     .replace('\\', "/"),
-            );
+            ));
         }
         None
     }
 }
 
-/// Apply original-to-final maps simultaneously; no newly updated reference is mapped twice.
+/// Generic moves retain Missing refs; book transfers explicitly remove them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutsideScopePolicy {
+    PreserveMissing,
+    RemoveMovedOutside,
+}
+
 pub(crate) fn migrate_page_paths_at(
     data_dir: &Path,
     mappings: &[(PathBuf, PathBuf)],
+) -> Result<usize, String> {
+    migrate_page_paths_with_policy_at(data_dir, mappings, OutsideScopePolicy::PreserveMissing)
+}
+
+/// Apply original-to-final maps simultaneously; no newly updated reference is mapped twice.
+pub(crate) fn migrate_page_paths_with_policy_at(
+    data_dir: &Path,
+    mappings: &[(PathBuf, PathBuf)],
+    outside_scope: OutsideScopePolicy,
 ) -> Result<usize, String> {
     if mappings.is_empty() {
         return Ok(0);
@@ -342,6 +387,17 @@ pub(crate) fn migrate_page_paths_at(
         };
         let Some(mapped) = mappings.map_relative(&key, relative) else {
             continue;
+        };
+        let mapped = match mapped {
+            RelativeMapping::Within(mapped) => mapped,
+            RelativeMapping::Outside => {
+                if outside_scope == OutsideScopePolicy::RemoveMovedOutside {
+                    changed += transaction
+                        .execute("DELETE FROM spread_shifts WHERE path = ?1", [&key])
+                        .map_err(|error| error.to_string())?;
+                }
+                continue;
+            }
         };
         let replacement = SpreadShiftPageRef::RelativePath(mapped);
         replacement.validate()?;
@@ -419,6 +475,36 @@ mod tests {
         );
         assert_eq!(purge_book_root(&mut connection, target).unwrap(), 2);
         assert_eq!(load_rows(&connection).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn book_root_source_priority_replaces_destination_family_even_when_source_is_absent() {
+        let (_temp, mut connection) = database();
+        let source = "c:/books/source";
+        let target = "c:/books/target";
+        let old = SpreadShiftPageRef::RelativePath("source.jpg".into());
+        let stale = SpreadShiftPageRef::RelativePath("stale.jpg".into());
+        set(&mut connection, source, &old).unwrap();
+        set(&mut connection, target, &stale).unwrap();
+        set(&mut connection, &format!("{target}/orphan"), &stale).unwrap();
+        rename_book_root_with_collision(
+            &mut connection,
+            source,
+            target,
+            crate::rename_key_migration::PathMigrationCollision::SourceWins,
+        )
+        .unwrap();
+        let rows = load_rows(&connection).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[target], old);
+        rename_book_root_with_collision(
+            &mut connection,
+            source,
+            target,
+            crate::rename_key_migration::PathMigrationCollision::SourceWins,
+        )
+        .unwrap();
+        assert!(load_rows(&connection).unwrap().is_empty());
     }
 
     fn database() -> (tempfile::TempDir, Connection) {

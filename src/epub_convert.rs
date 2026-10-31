@@ -2339,7 +2339,8 @@ mod tests {
             ),
         );
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert_eq!(app.pdf_enumerate_pending.as_ref().unwrap().0, destination);
         assert_eq!(
             crate::rating_db::RatingDb::open_at(tmp.path().join("rating.db"))

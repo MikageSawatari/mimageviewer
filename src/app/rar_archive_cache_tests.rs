@@ -129,9 +129,10 @@ fn tick(app: &mut App, ctx: &egui::Context) {
     app.poll_collection_history_transition(ctx);
     app.poll_smart_folder(ctx);
     app.poll_rating_view();
-    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+    ctx.run_pass(egui::RawInput::default(), |ctx| {
         app.show_archive_convert_dialog(ctx);
-    });
+    })
+    .drop_without_applying_deltas();
     if let Some(state) = &app.archive_convert {
         if let ArchiveConvertPhase::Error { message } = &state.phase {
             panic!("RAR open failed: {message}");

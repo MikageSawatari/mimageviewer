@@ -36,7 +36,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     GA_ROOT, GetAncestor, GetClientRect, GetForegroundWindow, GetMessageExtraInfo,
     GetSystemMetrics, GetWindowThreadProcessId, IsWindow, IsWindowVisible, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WM_CANCELMODE, WM_CAPTURECHANGED,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
 };
 
 use super::NativeVideoPlacement;
@@ -48,7 +49,8 @@ const DISPOSABLE_DATA_MARKER: &str = "mimageviewer-disposable-smoke-v1;test-scri
 const TARGET_WAIT_POLL: Duration = Duration::from_millis(20);
 const TARGET_DIAGNOSTIC_RECORD_LIMIT: usize = 4;
 const TARGET_DIAGNOSTIC_PAIR_LIMIT: usize = 8;
-const WNDPROC_TRACE_RECORD_LIMIT: usize = 8;
+const WNDPROC_TRACE_RECORD_LIMIT: usize = 32;
+const WNDPROC_TRACE_MOVE_LIMIT: usize = 8;
 const STEP_TOKEN_PREFIX: usize = 0x4d49_0000;
 const STEP_TOKEN_SERIAL_MIN: u32 = 1;
 const STEP_TOKEN_SERIAL_MAX: u32 = u16::MAX as u32;
@@ -69,10 +71,15 @@ static WNDPROC_TRACE_UNAVAILABLE_TOTAL: AtomicUsize = AtomicUsize::new(0);
 pub(crate) struct NativeUiSmokeMessageEntry {
     active_token: usize,
     extra_info: usize,
+    message: u32,
+    stage: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WndProcTraceRecord {
+    message: u32,
+    stage: &'static str,
+    tick_ms: u64,
     entry_active_token: usize,
     match_active_token: usize,
     receiver_hwnd: u64,
@@ -613,6 +620,7 @@ struct RenderSnapshot {
 enum PreparedTargetKind {
     Canvas,
     TopHoverActivation,
+    NamedTopPanoramaMove,
     NamedTopPanorama,
 }
 
@@ -690,7 +698,7 @@ impl PreparedTarget {
                         }
                     }
             }
-            PreparedTargetKind::NamedTopPanorama => {
+            PreparedTargetKind::NamedTopPanoramaMove | PreparedTargetKind::NamedTopPanorama => {
                 let Some(expected_token) = self.named_token else {
                     return false;
                 };
@@ -704,7 +712,22 @@ impl PreparedTarget {
                     && named.classification == NativeUiSmokePanoramaClassification::NonPanorama
                     && !named.panorama_pose_present
                     && !named.video_zoom_present
-                    && render.inventory.target_version == self.render.inventory.target_version
+                    && match (self.kind, phase) {
+                        (
+                            PreparedTargetKind::NamedTopPanoramaMove,
+                            PreparedTargetValidationPhase::ReceiptCompletion,
+                        ) => {
+                            // Hover may change other entries in the inventory. The actual
+                            // button token, Response and area must survive the move unchanged,
+                            // and a new presented inventory must precede its render receipt.
+                            render.inventory.target_version >= self.render.inventory.target_version
+                                && render.inventory.commit_serial
+                                    > self.render.inventory.commit_serial
+                        }
+                        _ => {
+                            render.inventory.target_version == self.render.inventory.target_version
+                        }
+                    }
             }
         }
     }
@@ -715,7 +738,7 @@ impl PreparedTarget {
             PreparedTargetKind::TopHoverActivation => {
                 self.render.inventory.native_top_panorama.is_none()
             }
-            PreparedTargetKind::NamedTopPanorama => true,
+            PreparedTargetKind::NamedTopPanoramaMove | PreparedTargetKind::NamedTopPanorama => true,
         }
     }
 }
@@ -1159,12 +1182,39 @@ fn receipt_kind_matches(step: &PendingStep, actual: NativeUiSmokeInputKind) -> b
     )
 }
 
-pub(crate) fn capture_message_entry() -> Option<NativeUiSmokeMessageEntry> {
+pub(crate) fn capture_message_entry(
+    hwnd: HWND,
+    message: u32,
+    lparam: isize,
+) -> Option<NativeUiSmokeMessageEntry> {
     let active_token = ACTIVE_STEP_TOKEN.load(Ordering::Acquire);
-    (active_token != 0).then(|| NativeUiSmokeMessageEntry {
+    let entry = (active_token != 0).then(|| NativeUiSmokeMessageEntry {
         active_token,
         extra_info: unsafe { GetMessageExtraInfo().0 as usize },
-    })
+        message,
+        stage: "entry",
+    })?;
+    record_message_disposition(hwnd, Some(entry), lparam, "entry");
+    Some(entry)
+}
+
+pub(crate) fn record_message_disposition(
+    hwnd: HWND,
+    entry: Option<NativeUiSmokeMessageEntry>,
+    lparam: isize,
+    stage: &'static str,
+) {
+    if let Some(mut entry) = entry {
+        entry.stage = stage;
+        record_wndproc_trace(
+            entry,
+            ACTIVE_STEP_TOKEN.load(Ordering::Acquire),
+            unsafe { GetMessageExtraInfo().0 as usize },
+            hwnd_value(hwnd),
+            lparam as i16 as i32,
+            (lparam >> 16) as i16 as i32,
+        );
+    }
 }
 
 pub(crate) fn message_metadata(
@@ -1179,17 +1229,20 @@ pub(crate) fn message_metadata(
         return None;
     }
     let observed = unsafe { GetMessageExtraInfo().0 as usize };
-    if let (Some(entry), super::native_window::NativeVideoWindowEvent::MouseMove(mouse)) =
-        (entry, event)
-    {
-        record_wndproc_trace(
-            entry,
-            active,
-            observed,
-            hwnd_value(receiver_hwnd),
-            mouse.x,
-            mouse.y,
-        );
+    if let Some(mut entry) = entry {
+        entry.stage = "match";
+        let point = match event {
+            super::native_window::NativeVideoWindowEvent::MouseMove(mouse) => {
+                Some([mouse.x, mouse.y])
+            }
+            super::native_window::NativeVideoWindowEvent::MouseButton(button) => {
+                Some([button.x, button.y])
+            }
+            _ => None,
+        };
+        if let Some([x, y]) = point {
+            record_wndproc_trace(entry, active, observed, hwnd_value(receiver_hwnd), x, y);
+        }
     }
     message_metadata_from_values(active, observed, hwnd_value(receiver_hwnd))
 }
@@ -1369,12 +1422,25 @@ fn record_wndproc_trace_in(
     if state.owner_token != entry.active_token {
         return;
     }
-    if state.len == WNDPROC_TRACE_RECORD_LIMIT {
+    // Reserve space for button/activation/capture evidence even after a flood of
+    // ordinary untagged moves. Overflow never silently turns into "no Down".
+    if state.len == WNDPROC_TRACE_RECORD_LIMIT
+        || (entry.message == WM_MOUSEMOVE
+            && state.records[..state.len]
+                .iter()
+                .flatten()
+                .filter(|record| record.message == WM_MOUSEMOVE)
+                .count()
+                >= WNDPROC_TRACE_MOVE_LIMIT)
+    {
         state.overflow = state.overflow.saturating_add(1);
         return;
     }
     let index = state.len;
     state.records[index] = Some(WndProcTraceRecord {
+        message: entry.message,
+        stage: entry.stage,
+        tick_ms: unsafe { GetTickCount64() },
         entry_active_token: entry.active_token,
         match_active_token,
         receiver_hwnd,
@@ -1448,6 +1514,12 @@ fn record_render_receipt_in(
         broker.changed.notify_all();
         return;
     };
+    let named_move_inventory_matches = state.pending.as_ref().is_none_or(|step| {
+        step.target.kind != PreparedTargetKind::NamedTopPanoramaMove
+            || step
+                .target
+                .still_matches(&state, PreparedTargetValidationPhase::ReceiptCompletion)
+    });
     let Some(step) = state.pending.as_mut() else {
         return;
     };
@@ -1468,7 +1540,9 @@ fn record_render_receipt_in(
             receipt.geometry == target.render.geometry
                 && receipt.geometry_version == target.render.geometry_version
         }
-        PreparedTargetKind::TopHoverActivation | PreparedTargetKind::NamedTopPanorama => true,
+        PreparedTargetKind::TopHoverActivation
+        | PreparedTargetKind::NamedTopPanoramaMove
+        | PreparedTargetKind::NamedTopPanorama => true,
     };
     let mismatch = metadata.receiver_hwnd != target.render.presenter_hwnd
         || !receipt_kind_matches(step, receipt.input_kind)
@@ -1500,7 +1574,7 @@ fn record_render_receipt_in(
                 || !receipt.drag_latches_released
         }
     };
-    if mismatch || semantic_mismatch {
+    if mismatch || semantic_mismatch || !named_move_inventory_matches {
         if step.failure.is_none() {
             step.failure = Some(
                 "native mouse render receipt did not match the prepared target or point".into(),
@@ -1609,8 +1683,22 @@ pub(crate) fn prepare_real_mouse_in_top_hover_activation(
 pub(crate) fn send_prepared_real_mouse_move(
     prepared: NativeUiSmokePreparedMove,
     deadline: Instant,
-    mut validate_owner_and_interrupt: impl FnMut() -> Result<(), String>,
+    validate_owner_and_interrupt: impl FnMut() -> Result<(), String>,
 ) -> Result<NativeUiSmokeMoveReceipt, String> {
+    send_prepared_real_mouse_move_with_completion(
+        prepared,
+        deadline,
+        validate_owner_and_interrupt,
+        |_, mouse| Ok(mouse),
+    )
+}
+
+fn send_prepared_real_mouse_move_with_completion<T>(
+    prepared: NativeUiSmokePreparedMove,
+    deadline: Instant,
+    mut validate_owner_and_interrupt: impl FnMut() -> Result<(), String>,
+    complete: impl FnOnce(&BrokerState, NativeUiSmokeMoveReceipt) -> Result<T, String>,
+) -> Result<T, String> {
     validate_disposable_runtime()?;
     require_unexpired_deadline(deadline, "sending native mouse input")?;
     validate_owner_for_phase(
@@ -1691,7 +1779,7 @@ pub(crate) fn send_prepared_real_mouse_move(
             deadline,
             &mut validate_owner_and_interrupt,
         )?;
-        Ok(NativeUiSmokeMoveReceipt {
+        let mouse = NativeUiSmokeMoveReceipt {
             token: token as u64,
             owner_hwnd: prepared.target.host.owner_hwnd,
             presenter_hwnd: prepared.target.render.presenter_hwnd,
@@ -1704,8 +1792,64 @@ pub(crate) fn send_prepared_real_mouse_move(
             host_publisher: prepared.target.host.publisher,
             render_publisher: prepared.target.render.publisher,
             overlay_owner_nonce: prepared.target.render.inventory.owner_nonce,
-        })
+        };
+        // Take any named observation under the same lock as the final receipt
+        // validation, before retiring the move. Do not reuse the pre-hover version.
+        let state = lock_broker_state(broker)?;
+        completed_actual_point(&state, token, &prepared)?.ok_or_else(|| {
+            "native mouse receipt completion was revoked before observation".to_string()
+        })?;
+        let result = complete(&state, mouse);
+        drop(state);
+        if result.is_ok() {
+            crate::logger::log(format!(
+                "[native-smoke] move_complete tick_ms={} token=0x{:x} hwnd=0x{:x} requested=({},{}) actual=({},{})",
+                unsafe { GetTickCount64() },
+                mouse.token,
+                mouse.presenter_hwnd,
+                mouse.requested_client_x,
+                mouse.requested_client_y,
+                mouse.actual_client_x,
+                mouse.actual_client_y,
+            ));
+        }
+        result
     })
+}
+
+pub(crate) fn move_to_native_top_panorama(
+    observed: &NativeUiSmokeNamedControlReceipt,
+    deadline: Instant,
+    mut validate_owner_and_interrupt: impl FnMut() -> Result<(), String>,
+) -> Result<(NativeUiSmokeMoveReceipt, NativeUiSmokeNamedControlReceipt), String> {
+    validate_disposable_runtime()?;
+    require_unexpired_deadline(deadline, "preparing native_top_panorama mouse move")?;
+    validate_owner_for_phase(
+        &mut validate_owner_and_interrupt,
+        "prepare_named_move_before_snapshot",
+    )?;
+    let target = {
+        let state = lock_broker_state(broker())?;
+        let mut target = named_top_panorama_target_from_observation(&state, observed)?;
+        target.kind = PreparedTargetKind::NamedTopPanoramaMove;
+        target
+    };
+    let prepared = NativeUiSmokePreparedMove {
+        target,
+        normalized: [0.5, 0.5],
+        coordinate_tolerance: virtual_desktop_coordinate_tolerance()?,
+    };
+    send_prepared_real_mouse_move_with_completion(
+        prepared,
+        deadline,
+        validate_owner_and_interrupt,
+        |state, mouse| {
+            let named = named_control_after_move(state, &mouse)?.ok_or_else(|| {
+                "native_top_panorama disappeared after its control-center move".to_string()
+            })?;
+            Ok((mouse, named))
+        },
+    )
 }
 
 pub(crate) fn wait_for_native_top_panorama_after_move(
@@ -2010,8 +2154,29 @@ pub(crate) fn prepare_native_top_panorama_click(
     )?;
     let broker = broker();
     let state = lock_broker_state(broker)?;
+    let target = named_top_panorama_target_from_observation(&state, observed)?;
+    let prepared = NativeUiSmokePreparedButtonClick {
+        target,
+        coordinate_tolerance: virtual_desktop_coordinate_tolerance()?,
+        host_incarnation,
+        backend_token,
+    };
+    drop(state);
+    validate_os_target(&prepared.target)?;
+    validate_owner_for_phase(
+        &mut validate_owner_and_interrupt,
+        "prepare_button_after_os_target_validation",
+    )?;
+    validate_prepared_button_target(broker, &prepared)?;
+    Ok(prepared)
+}
+
+fn named_top_panorama_target_from_observation(
+    state: &BrokerState,
+    observed: &NativeUiSmokeNamedControlReceipt,
+) -> Result<PreparedTarget, String> {
     let candidates =
-        coherent_named_top_panorama_targets(&state, observed.owner_hwnd, observed.token)?;
+        coherent_named_top_panorama_targets(state, observed.owner_hwnd, observed.token)?;
     let [target] = candidates.as_slice() else {
         return Err(format!(
             "native_top_panorama target was not unique while preparing click (candidates={})",
@@ -2044,20 +2209,7 @@ pub(crate) fn prepare_native_top_panorama_click(
     if !receipt_matches {
         return Err("native_top_panorama observation changed before click preparation".into());
     }
-    let prepared = NativeUiSmokePreparedButtonClick {
-        target: target.clone(),
-        coordinate_tolerance: virtual_desktop_coordinate_tolerance()?,
-        host_incarnation,
-        backend_token,
-    };
-    drop(state);
-    validate_os_target(&prepared.target)?;
-    validate_owner_for_phase(
-        &mut validate_owner_and_interrupt,
-        "prepare_button_after_os_target_validation",
-    )?;
-    validate_prepared_button_target(broker, &prepared)?;
-    Ok(prepared)
+    Ok(target.clone())
 }
 
 const BUTTON_WIRE_REQUEST_MAGIC: u32 = 0x4256_494d;
@@ -2194,9 +2346,30 @@ impl ButtonPipeClient {
         terminal: bool,
     ) -> Result<(), String> {
         let payload = encode_button_request(&self.gesture, kind, step, flags, delivery);
+        crate::logger::log(format!(
+            "[native-smoke] helper_request tick_ms={} kind={kind} step={step} gesture={} down=0x{:x} up=0x{:x} input=0x{:x} parent=0x{:x} screen=({},{}) deadline_tick={}",
+            unsafe { GetTickCount64() },
+            self.gesture.gesture_id,
+            self.gesture.down_tag,
+            self.gesture.up_tag,
+            self.gesture.input_hwnd,
+            self.gesture.parent_hwnd,
+            self.gesture.screen_x,
+            self.gesture.screen_y,
+            self.gesture.deadline_tick,
+        ));
         write_button_frame(&mut self.file, &payload)?;
         loop {
             let reply = read_button_reply(&mut self.file)?;
+            crate::logger::log(format!(
+                "[native-smoke] helper_reply tick_ms={} kind={} step={} gesture={} phase={} detail={}",
+                unsafe { GetTickCount64() },
+                reply.kind,
+                reply.step,
+                reply.gesture_id,
+                reply.phase,
+                reply.detail,
+            ));
             if reply.session != self.gesture.session
                 || reply.gesture_id != self.gesture.gesture_id
                 || reply.step != step
@@ -2355,6 +2528,7 @@ fn run_external_button_step(
             deadline,
             validate_owner_and_interrupt,
         )
+        .map_err(|error| receipt_wait_failure(broker(), token, error))
     })
 }
 
@@ -2655,7 +2829,7 @@ fn wait_for_target(
                 PreparedTargetKind::TopHoverActivation => {
                     coherent_top_hover_targets(&state, owner_hwnd)
                 }
-                PreparedTargetKind::NamedTopPanorama => {
+                PreparedTargetKind::NamedTopPanoramaMove | PreparedTargetKind::NamedTopPanorama => {
                     return Err("named native controls are prepared from an observed token".into());
                 }
             };
@@ -3185,14 +3359,16 @@ fn prepared_target_is_unique(
         PreparedTargetKind::TopHoverActivation => {
             coherent_top_hover_targets(state, prepared.target.host.owner_hwnd)?
         }
-        PreparedTargetKind::NamedTopPanorama => coherent_named_top_panorama_targets(
-            state,
-            prepared.target.host.owner_hwnd,
-            prepared
-                .target
-                .named_token
-                .ok_or_else(|| "named native target has no token".to_string())?,
-        )?,
+        PreparedTargetKind::NamedTopPanoramaMove | PreparedTargetKind::NamedTopPanorama => {
+            coherent_named_top_panorama_targets(
+                state,
+                prepared.target.host.owner_hwnd,
+                prepared
+                    .target
+                    .named_token
+                    .ok_or_else(|| "named native target has no token".to_string())?,
+            )?
+        }
     };
     Ok(matches!(candidates.as_slice(), [candidate]
         if candidate.host.publisher == prepared.target.host.publisher
@@ -3300,14 +3476,18 @@ fn receipt_wait_failure(broker: &Broker, expected_token: usize, error: String) -
     match lock_broker_state(broker) {
         Ok(state) => match state.pending.as_ref() {
             Some(step) => format!(
-                "{error}; receipt_snapshot={{expected_token=0x{expected_token:x},pending_token=0x{:x},requested=({},{}),tolerance=({},{}),pump_actual={},render_actual={},failure={}}}",
+                "{error}; receipt_snapshot={{expected_token=0x{expected_token:x},pending_token=0x{:x},kind={:?},presenter=0x{:x},requested=({},{}),tolerance=({},{}),pump_actual={},render_actual={},wndproc_identity={:?},capture_confirmed={},failure={}}}",
                 step.token,
+                step.kind,
+                step.target.render.presenter_hwnd,
                 step.target.client_point.x,
                 step.target.client_point.y,
                 step.coordinate_tolerance[0],
                 step.coordinate_tolerance[1],
                 format_receipt_point(step.pump_actual_point),
                 format_receipt_point(step.render_actual_point),
+                step.metadata,
+                step.wndproc_state_confirmed,
                 step.failure
                     .as_deref()
                     .map(bounded_diagnostic_text)
@@ -3399,7 +3579,10 @@ fn format_wndproc_trace(
                     && record.match_extra_info == record.match_active_token;
                 let _ = write!(
                     text,
-                    "kind=mouse_move,entry_active=0x{:x},match_active=0x{:x},hwnd=0x{:x},client=({},{}),entry_extra=0x{:x},match_extra=0x{:x},matched={matched}",
+                    "kind={},stage={},tick_ms={},entry_active=0x{:x},match_active=0x{:x},hwnd=0x{:x},point_or_lparam=({},{}),entry_extra=0x{:x},match_extra=0x{:x},matched={matched}",
+                    wndproc_message_name(record.message),
+                    record.stage,
+                    record.tick_ms,
                     record.entry_active_token,
                     record.match_active_token,
                     record.receiver_hwnd,
@@ -3426,6 +3609,19 @@ fn format_wndproc_trace(
         WndProcTraceSnapshot::Poisoned => format!(
             "unavailable(reason=poisoned,process_unavailable_total={process_unavailable_total})"
         ),
+    }
+}
+
+fn wndproc_message_name(message: u32) -> &'static str {
+    match message {
+        WM_MOUSEMOVE => "mouse_move",
+        WM_LBUTTONDOWN => "left_down",
+        WM_LBUTTONUP => "left_up",
+        WM_LBUTTONDBLCLK => "left_double_click",
+        WM_MOUSEACTIVATE => "mouse_activate",
+        WM_CAPTURECHANGED => "capture_changed",
+        WM_CANCELMODE => "cancel_mode",
+        _ => "other",
     }
 }
 
@@ -3941,7 +4137,7 @@ fn virtual_desktop_coordinate_tolerance() -> Result<[i32; 2], String> {
 
 fn allocate_step_token_in(next_serial: &AtomicU32) -> Result<usize, String> {
     let serial = next_serial
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |serial| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |serial| {
             if (STEP_TOKEN_SERIAL_MIN..STEP_TOKEN_SERIAL_MAX).contains(&serial) {
                 Some(serial + 1)
             } else if serial == STEP_TOKEN_SERIAL_MAX {
@@ -4070,7 +4266,7 @@ mod tests {
             clip_rect: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(400.0, 64.0)),
             layer_id: egui::LayerId::new(
                 egui::Order::Foreground,
-                egui::Id::new("native_video_top_bar"),
+                egui::Id::unique("native_video_top_bar"),
             ),
             sense: if enabled {
                 egui::Sense::click()
@@ -4121,7 +4317,7 @@ mod tests {
             clip_rect: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(200.0, 36.0)),
             layer_id: egui::LayerId::new(
                 egui::Order::Foreground,
-                egui::Id::new("native_video_top_bar"),
+                egui::Id::unique("native_video_top_bar"),
             ),
             sense: if enabled {
                 egui::Sense::click()
@@ -4558,6 +4754,172 @@ mod tests {
     }
 
     #[test]
+    fn panorama_center_move_uses_response_center_and_reobserves_before_click() {
+        let mut fixture = ReceiptFixture::new();
+        let before = fixture.prepare_panorama_move();
+        let point = fixture.prepared.target.client_point;
+        assert_eq!([point.x, point.y], [before.client_x, before.client_y]);
+        let activation = fixture
+            .prepared
+            .target
+            .render
+            .inventory
+            .top_hover_activation
+            .unwrap();
+        let activation_center = activation.client_point([0.5, 0.5]).unwrap();
+        assert_ne!(
+            [point.x, point.y],
+            [activation_center.x, activation_center.y]
+        );
+        fixture.begin();
+        fixture.commit_panorama_move_inventory(|logical| {
+            // A hover-induced change outside the button advances the inventory
+            // version without replacing the actual button Response/token.
+            logical
+                .top_hover_activation
+                .as_mut()
+                .unwrap()
+                .rect_points
+                .max
+                .y += 1.0;
+        });
+        record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+        record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
+        assert_eq!(fixture.completion().unwrap(), Some([point.x, point.y]));
+
+        let state = lock_broker_state(&fixture.broker).unwrap();
+        let after = named_control_after_move(&state, &fixture.mouse_receipt())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.token, before.token);
+        assert_eq!(after.area, before.area);
+        assert!(after.inventory_target_version > before.inventory_target_version);
+        assert!(named_top_panorama_target_from_observation(&state, &before).is_err());
+        let click = named_top_panorama_target_from_observation(&state, &after).unwrap();
+        assert_eq!(click.kind, PreparedTargetKind::NamedTopPanorama);
+        assert_eq!(
+            click.render.inventory.target_version,
+            after.inventory_target_version
+        );
+        assert!(click.still_matches(&state, PreparedTargetValidationPhase::BeforeInput));
+        assert!(
+            !fixture
+                .prepared
+                .target
+                .still_matches(&state, PreparedTargetValidationPhase::BeforeInput,)
+        );
+    }
+
+    #[test]
+    fn panorama_center_move_requires_a_new_present_even_when_targets_are_unchanged() {
+        let mut fixture = ReceiptFixture::new();
+        let before = fixture.prepare_panorama_move();
+        fixture.begin();
+        record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+        assert_eq!(fixture.completion().unwrap(), None);
+        fixture.commit_panorama_move_inventory(|_| {});
+        assert_eq!(fixture.completion().unwrap(), None);
+        record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
+        assert!(fixture.completion().unwrap().is_some());
+        let state = lock_broker_state(&fixture.broker).unwrap();
+        assert_eq!(
+            named_control_after_move(&state, &fixture.mouse_receipt())
+                .unwrap()
+                .unwrap()
+                .inventory_target_version,
+            before.inventory_target_version,
+        );
+    }
+
+    #[test]
+    fn panorama_center_move_rejects_a_render_without_a_new_inventory() {
+        let mut fixture = ReceiptFixture::new();
+        fixture.prepare_panorama_move();
+        fixture.begin();
+        record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+        record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
+        assert!(fixture.completion().is_err());
+        // A later unrelated present cannot repair the failed tagged render.
+        fixture.commit_panorama_move_inventory(|_| {});
+        assert!(fixture.completion().is_err());
+    }
+
+    #[test]
+    fn panorama_center_move_rejects_changed_or_missing_controls_without_retry() {
+        for change in [
+            "hidden",
+            "disabled",
+            "moved",
+            "layer",
+            "clip",
+            "sense",
+            "zoom",
+            "pose",
+            "classification",
+            "scale",
+        ] {
+            let mut fixture = ReceiptFixture::new();
+            fixture.prepare_panorama_move();
+            fixture.begin();
+            fixture.commit_panorama_move_inventory(|logical| {
+                let control = logical.native_top_panorama.as_mut().unwrap();
+                match change {
+                    "hidden" => logical.native_top_panorama = None,
+                    "disabled" => control.enabled = false,
+                    "moved" => {
+                        control.rect = control.rect.translate(egui::vec2(1.0, 0.0));
+                        control.interact_rect = control.rect;
+                    }
+                    "layer" => {
+                        control.layer_id = egui::LayerId::new(
+                            egui::Order::Foreground,
+                            egui::Id::new("replacement"),
+                        )
+                    }
+                    "clip" => control.clip_rect.max.x -= 1.0,
+                    "sense" => control.sense = egui::Sense::hover(),
+                    "zoom" => logical.video_zoom_present = true,
+                    "pose" => logical.panorama_pose_present = true,
+                    "classification" => {
+                        logical.panorama_classification =
+                            NativeUiSmokePanoramaClassification::Panorama
+                    }
+                    "scale" => logical.pixels_per_point += 0.25,
+                    _ => unreachable!(),
+                }
+            });
+            record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
+            record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+            assert!(fixture.completion().is_err(), "{change}");
+            fixture.commit_panorama_move_inventory(|_| {});
+            assert!(fixture.completion().is_err(), "{change} must not recover");
+        }
+    }
+
+    #[test]
+    fn panorama_center_move_rejects_target_changes_after_delivery_before_click() {
+        let mut fixture = ReceiptFixture::new();
+        fixture.prepare_panorama_move();
+        fixture.begin();
+        fixture.commit_panorama_move_inventory(|_| {});
+        record_render_receipt_in(&fixture.broker, fixture.metadata, fixture.render);
+        record_pump_receipt_in(&fixture.broker, fixture.metadata, fixture.pump);
+        assert!(fixture.completion().unwrap().is_some());
+        let after = {
+            let state = lock_broker_state(&fixture.broker).unwrap();
+            named_control_after_move(&state, &fixture.mouse_receipt())
+                .unwrap()
+                .unwrap()
+        };
+        fixture.commit_panorama_move_inventory(|logical| {
+            logical.native_top_panorama.as_mut().unwrap().rect.min.x += 1.0;
+        });
+        assert!(fixture.completion().is_err());
+        let state = lock_broker_state(&fixture.broker).unwrap();
+        assert!(named_top_panorama_target_from_observation(&state, &after).is_err());
+    }
+
+    #[test]
     fn named_target_waits_for_enabled_click_response_and_rotates_after_hide() {
         let owner = allocate_overlay_owner();
         let disabled = NativeUiSmokeCommittedInventory::commit(
@@ -4892,6 +5254,65 @@ mod tests {
             let state = lock_broker_state(&self.broker).unwrap();
             completed_actual_point(&state, self.metadata.token, &self.prepared)
         }
+
+        fn mouse_receipt(&self) -> NativeUiSmokeMoveReceipt {
+            let target = &self.prepared.target;
+            NativeUiSmokeMoveReceipt {
+                token: self.metadata.token as u64,
+                owner_hwnd: target.host.owner_hwnd,
+                presenter_hwnd: target.render.presenter_hwnd,
+                source_epoch: target.render.actual_source_epoch,
+                generation: target.render.generation,
+                requested_client_x: target.client_point.x,
+                requested_client_y: target.client_point.y,
+                actual_client_x: self.pump.event_x,
+                actual_client_y: self.pump.event_y,
+                host_publisher: target.host.publisher,
+                render_publisher: target.render.publisher,
+                overlay_owner_nonce: target.render.inventory.owner_nonce,
+            }
+        }
+
+        fn commit_panorama_move_inventory(
+            &self,
+            mutate: impl FnOnce(&mut NativeUiSmokeLogicalInventory),
+        ) {
+            let mut state = lock_broker_state(&self.broker).unwrap();
+            let render = state
+                .renders
+                .get_mut(&self.prepared.target.render.publisher)
+                .unwrap();
+            let mut logical = test_fixture_panorama_logical(
+                &self._ui_smoke_owner,
+                self.prepared
+                    .target
+                    .render
+                    .inventory
+                    .top_hover_activation
+                    .unwrap(),
+                Some(test_fixture_panorama_observation(true)),
+            );
+            mutate(&mut logical);
+            render.inventory =
+                NativeUiSmokeCommittedInventory::commit(Some(&render.inventory), logical);
+        }
+
+        fn prepare_panorama_move(&mut self) -> NativeUiSmokeNamedControlReceipt {
+            self.commit_panorama_move_inventory(|_| {});
+            let state = lock_broker_state(&self.broker).unwrap();
+            let observed = named_control_after_move(&state, &self.mouse_receipt())
+                .unwrap()
+                .unwrap();
+            let mut target = named_top_panorama_target_from_observation(&state, &observed).unwrap();
+            target.kind = PreparedTargetKind::NamedTopPanoramaMove;
+            let point = target.client_point;
+            self.prepared.target = target;
+            self.pump.event_x = point.x;
+            self.pump.event_y = point.y;
+            self.render.event_x = point.x;
+            self.render.event_y = point.y;
+            observed
+        }
     }
 
     fn audio_test_logical(owner: &Arc<NativeUiSmokeOverlayOwner>) -> NativeUiSmokeLogicalInventory {
@@ -4997,7 +5418,7 @@ mod tests {
                     observation.interact_rect = observation.rect;
                 }
                 "clip" => observation.clip_rect = observation.clip_rect.shrink(1.0),
-                "layer" => observation.layer_id.id = egui::Id::new("replacement_layer"),
+                "layer" => observation.layer_id.id = egui::Id::unique("replacement_layer"),
                 "sense" => observation.sense = egui::Sense::hover(),
                 "disabled" | "disabled_reenabled" => observation.enabled = false,
                 "hidden_reappeared" => logical.audio_controls.clear(),
@@ -6268,6 +6689,8 @@ mod tests {
             &active,
             &unavailable,
             NativeUiSmokeMessageEntry {
+                message: WM_MOUSEMOVE,
+                stage: "match",
                 active_token: token,
                 extra_info: token,
             },
@@ -6292,6 +6715,9 @@ mod tests {
         assert_eq!(
             records[0],
             Some(WndProcTraceRecord {
+                message: WM_MOUSEMOVE,
+                stage: "match",
+                tick_ms: records[0].unwrap().tick_ms,
                 entry_active_token: token,
                 match_active_token: token,
                 receiver_hwnd: 0x200,
@@ -6314,12 +6740,14 @@ mod tests {
         let active = AtomicUsize::new(token);
         let unavailable = AtomicUsize::new(0);
         begin_wndproc_trace_in(&trace, &unavailable, token);
-        for x in 0..(WNDPROC_TRACE_RECORD_LIMIT + 2) {
+        for x in 0..(WNDPROC_TRACE_MOVE_LIMIT + 2) {
             record_wndproc_trace_in(
                 &trace,
                 &active,
                 &unavailable,
                 NativeUiSmokeMessageEntry {
+                    message: WM_MOUSEMOVE,
+                    stage: "match",
                     active_token: token,
                     extra_info: token,
                 },
@@ -6334,7 +6762,7 @@ mod tests {
         assert!(matches!(
             snapshot,
             WndProcTraceSnapshot::Available {
-                len: WNDPROC_TRACE_RECORD_LIMIT,
+                len: WNDPROC_TRACE_MOVE_LIMIT,
                 overflow: 2,
                 ..
             }
@@ -6354,6 +6782,8 @@ mod tests {
             &active,
             &unavailable,
             NativeUiSmokeMessageEntry {
+                message: WM_MOUSEMOVE,
+                stage: "match",
                 active_token: token,
                 extra_info: token,
             },
@@ -6371,6 +6801,91 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn wndproc_trace_keeps_button_entry_and_match_after_untagged_move_overflow() {
+        let token = STEP_TOKEN_PREFIX | 3;
+        let trace = Mutex::new(WndProcTraceState::default());
+        let active = AtomicUsize::new(token);
+        let unavailable = AtomicUsize::new(0);
+        begin_wndproc_trace_in(&trace, &unavailable, token);
+        for _ in 0..20 {
+            record_wndproc_trace_in(
+                &trace,
+                &active,
+                &unavailable,
+                NativeUiSmokeMessageEntry {
+                    active_token: token,
+                    extra_info: 0,
+                    message: WM_MOUSEMOVE,
+                    stage: "entry",
+                },
+                token,
+                0,
+                0x200,
+                1239,
+                41,
+            );
+        }
+        for (message, stage, observed) in [
+            (WM_LBUTTONDOWN, "entry", token),
+            (WM_LBUTTONDOWN, "match", 0),
+            (WM_LBUTTONUP, "entry", token + 1),
+            (WM_MOUSEACTIVATE, "activate_and_eat", 0),
+        ] {
+            record_wndproc_trace_in(
+                &trace,
+                &active,
+                &unavailable,
+                NativeUiSmokeMessageEntry {
+                    active_token: token,
+                    extra_info: token,
+                    message,
+                    stage,
+                },
+                token,
+                observed,
+                0x200,
+                1239,
+                41,
+            );
+        }
+        let text = format_wndproc_trace(snapshot_wndproc_trace_in(&trace, token, || token), 0);
+        assert!(text.contains("overflow=12"), "{text}");
+        assert!(
+            text.contains("kind=left_down,stage=entry,tick_ms="),
+            "{text}"
+        );
+        assert!(
+            text.contains("kind=left_down,stage=match,tick_ms="),
+            "{text}"
+        );
+        assert!(text.contains("kind=left_up,stage=entry"), "{text}");
+        assert!(
+            text.contains("kind=mouse_activate,stage=activate_and_eat"),
+            "{text}"
+        );
+        assert!(message_metadata_from_values(token, 0, 0x200).is_none());
+        assert!(message_metadata_from_values(token, token, 0x200).is_some());
+    }
+
+    #[test]
+    fn button_receipt_failure_snapshot_preserves_the_missing_stage_and_primary_error() {
+        let fixture = ButtonReceiptFixture::new();
+        fixture.begin_up_before_wndproc(17);
+        let text = receipt_wait_failure(
+            &fixture.broker,
+            fixture.metadata.token,
+            "owner validation timed out".into(),
+        );
+        assert!(text.starts_with("owner validation timed out; receipt_snapshot="));
+        assert!(text.contains("kind=ButtonUp { gesture_id: 17 }"), "{text}");
+        assert!(
+            text.contains("wndproc_identity=None,capture_confirmed=false"),
+            "{text}"
+        );
+        assert!(text.contains("presenter=0x2200"), "{text}");
     }
 
     #[test]
@@ -6393,6 +6908,8 @@ mod tests {
             &active,
             &unavailable,
             NativeUiSmokeMessageEntry {
+                message: WM_MOUSEMOVE,
+                stage: "match",
                 active_token: token,
                 extra_info: token,
             },

@@ -1331,10 +1331,11 @@ impl MusicVideoLabApp {
 
     /// Shared production frame boundary: all input and note_edit calls must
     /// precede completion admission. Headless input tests use this same entry.
-    fn process_editor_frame(&mut self, ctx: &egui::Context) -> bool {
+    fn process_editor_frame(&mut self, ui: &mut egui::Ui) -> bool {
+        let ctx = &ui.ctx().clone();
         self.poll_host();
         if !self.editing_admitted() {
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 if let crate::startup::RuntimeAdmission::Blocked(error) = &*self.host.runtime {
                     ui.heading("音楽ビデオエディタを開始できません");
                     ui.colored_label(ui.visuals().error_fg_color, error);
@@ -1342,7 +1343,7 @@ impl MusicVideoLabApp {
             });
             return false;
         }
-        self.draw_host_notices(ctx);
+        self.draw_host_notices(ui);
         self.handle_close_request(ctx);
         let input_enabled = !self.load_choice_open()
             && !self.intent_pending()
@@ -1350,8 +1351,8 @@ impl MusicVideoLabApp {
             && !self.mp4_export_running()
             && !self.export_state.setup_open();
         let mut actions = Vec::new();
-        self.draw_status_bar(ctx, input_enabled, &mut actions);
-        let (response, toolbar_actions) = self.draw_editing_panels(ctx, input_enabled);
+        self.draw_status_bar(ui, input_enabled, &mut actions);
+        let (response, toolbar_actions) = self.draw_editing_panels(ui, input_enabled);
         actions.extend(toolbar_actions);
         self.draw_tool_windows(ctx, input_enabled, &mut actions);
         actions.extend(self.draw_load_choice(ctx));
@@ -1388,7 +1389,7 @@ impl MusicVideoLabApp {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.add_enabled_ui(
                     !self.mp4_export_running()
                         && !self.export_state.setup_open()
@@ -1421,15 +1422,16 @@ impl MusicVideoLabApp {
     /// All editor input and generation updates precede asynchronous completion admission.
     fn draw_editing_panels(
         &mut self,
-        ctx: &egui::Context,
+        ui: &mut egui::Ui,
         input_enabled: bool,
     ) -> (EditorResponse, Vec<ChromeAction>) {
+        let ctx = &ui.ctx().clone();
         let toolbar = ToolbarState::from_app(self);
         let mut actions = Vec::new();
         let mut prepared =
             self.editor_state
                 .begin_frame_with_input_enabled(ctx, &mut self.project, input_enabled);
-        egui::TopBottomPanel::top("musicvideo-controls").show(ctx, |ui| {
+        egui::Panel::top("musicvideo-controls").show(ui, |ui| {
             ui.add_enabled_ui(input_enabled, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     toolbar.draw(ui, &mut actions);
@@ -1451,11 +1453,11 @@ impl MusicVideoLabApp {
                 }
             })
             .unwrap_or(self.position_secs);
-        let timeline_response = egui::TopBottomPanel::bottom("musicvideo-timeline")
+        let timeline_response = egui::Panel::bottom("musicvideo-timeline")
             .resizable(true)
-            .default_height(320.0)
-            .min_height(150.0)
-            .show(ctx, |ui| {
+            .default_size(320.0)
+            .min_size(150.0)
+            .show(ui, |ui| {
                 ui.add_enabled_ui(input_enabled, |ui| {
                     prepared.timeline(ui, input_position_secs, self.waveform.as_ref())
                 })
@@ -1463,18 +1465,18 @@ impl MusicVideoLabApp {
             })
             .inner;
         let mut frame = prepared.properties();
-        egui::SidePanel::left("musicvideo-layers")
+        egui::Panel::left("musicvideo-layers")
             .resizable(true)
-            .default_width(220.0)
-            .min_width(180.0)
-            .show(ctx, |ui| {
+            .default_size(220.0)
+            .min_size(180.0)
+            .show(ui, |ui| {
                 ui.add_enabled_ui(input_enabled, |ui| frame.layer_list(ui));
             });
-        egui::SidePanel::right("musicvideo-properties")
+        egui::Panel::right("musicvideo-properties")
             .resizable(true)
-            .default_width(360.0)
-            .min_width(300.0)
-            .show(ctx, |ui| {
+            .default_size(360.0)
+            .min_size(300.0)
+            .show(ui, |ui| {
                 ui.add_enabled_ui(input_enabled, |ui| {
                     frame.inspector_with_project_path(
                         ui,
@@ -2635,9 +2637,10 @@ fn unresolved_image_notices(
 }
 
 impl eframe::App for MusicVideoLabApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
         if !self.editing_admitted() {
-            self.process_editor_frame(ctx);
+            self.process_editor_frame(ui);
             return;
         }
         let update_started = Instant::now();
@@ -2658,7 +2661,7 @@ impl eframe::App for MusicVideoLabApp {
         }
         let audio_sync_ms = audio_sync_started.elapsed().as_secs_f64() * 1000.0;
         let egui_layout_started = Instant::now();
-        let reset_preview_perf = self.process_editor_frame(ctx);
+        let reset_preview_perf = self.process_editor_frame(ui);
 
         let egui_layout_ms = egui_layout_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -3673,16 +3676,19 @@ mod tests {
     }
 
     fn selection_assert_texture_color(
-        delta: &egui::TexturesDelta,
+        delta: &mut egui::TexturesDelta,
         texture: egui::TextureId,
         color: egui::Color32,
     ) {
-        let updates: Vec<_> = delta.set.iter().filter(|(id, _)| *id == texture).collect();
+        let updates = delta.set.get(&texture).cloned();
+        let freed = delta.free.contains(&texture);
+        delta.clear();
+        let updates = updates.expect("texture upload");
         assert_eq!(updates.len(), 1);
-        let egui::ImageData::Color(image) = &updates[0].1.image;
+        let egui::ImageData::Color(image) = &updates[0].image;
         assert_eq!(image.size, [160, 90]);
         assert!(image.pixels.iter().all(|pixel| *pixel == color));
-        assert!(!delta.free.contains(&texture));
+        assert!(!freed);
     }
 
     #[test]
@@ -3702,8 +3708,8 @@ mod tests {
         let texture_id = app.displayed_preview.as_ref().unwrap().texture.id();
         // Consume the initial upload before examining whether a rejected result
         // publishes another upload. TextureHandle::set preserves the same ID.
-        let initial_delta = ctx.tex_manager().write().take_delta();
-        selection_assert_texture_color(&initial_delta, texture_id, egui::Color32::BLACK);
+        let mut initial_delta = ctx.tex_manager().write().take_delta();
+        selection_assert_texture_color(&mut initial_delta, texture_id, egui::Color32::BLACK);
         app.mark_preview_dirty();
         let mut stale = selection_result(
             &app,
@@ -3714,12 +3720,15 @@ mod tests {
         );
         stale.modulator_values[0].value = 0.9;
         selection_deliver(&mut app, &ctx, stale);
-        let stale_delta = ctx.tex_manager().write().take_delta();
+        let mut stale_delta = ctx.tex_manager().write().take_delta();
+        let stale_upload = stale_delta.set.contains_key(&texture_id);
+        let stale_free = stale_delta.free.contains(&texture_id);
+        stale_delta.clear();
         assert!(
-            !stale_delta.set.iter().any(|(id, _)| *id == texture_id),
+            !stale_upload,
             "stale result uploaded pixels to the displayed texture"
         );
-        assert!(!stale_delta.free.contains(&texture_id));
+        assert!(!stale_free);
         let displayed = app.displayed_preview.as_ref().unwrap();
         assert_eq!(displayed.texture.id(), texture_id);
         assert_eq!(displayed.time_secs, 2.0);
@@ -3734,8 +3743,8 @@ mod tests {
             egui::Color32::GREEN,
         );
         selection_deliver(&mut app, &ctx, latest);
-        let latest_delta = ctx.tex_manager().write().take_delta();
-        selection_assert_texture_color(&latest_delta, texture_id, egui::Color32::GREEN);
+        let mut latest_delta = ctx.tex_manager().write().take_delta();
+        selection_assert_texture_color(&mut latest_delta, texture_id, egui::Color32::GREEN);
         let displayed = app.displayed_preview.as_ref().unwrap();
         assert_eq!(displayed.time_secs, 4.0);
         assert_eq!(displayed.project.duration_secs, 30.0);
@@ -3798,7 +3807,7 @@ mod tests {
     fn selection_draw_output(app: &mut MusicVideoLabApp, ctx: &egui::Context) -> egui::FullOutput {
         let mut output = egui::FullOutput::default();
         for _ in 0..2 {
-            output = ctx.run(
+            output = crate::project::headless_paint_output(ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -3807,11 +3816,11 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    egui::TopBottomPanel::top("preview-controls")
+                    egui::Panel::top("preview-controls")
                         .show(ctx, |ui| app.editor_state.preview_controls(ui));
                     egui::CentralPanel::default().show(ctx, |ui| app.draw_preview(ui));
                 },
-            );
+            ));
         }
         output
     }
@@ -4191,7 +4200,7 @@ mod tests {
         context: &egui::Context,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
-        context.run(
+        crate::project::headless_paint_output(context.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -4203,7 +4212,7 @@ mod tests {
             |ctx| {
                 app.process_editor_frame(ctx);
             },
-        )
+        ))
     }
 
     pub(super) fn pointer_input(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
@@ -4263,7 +4272,7 @@ mod tests {
         editor_input(&mut app, &ctx, pointer_input(item, true));
         // Release adds through the real menu. As in update, create the request
         // after process_editor_frame in THIS pass, before another begin_frame.
-        let _ = ctx.run(
+        let _ = crate::project::headless_paint_output(ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -4277,7 +4286,7 @@ mod tests {
                 app.start_calibration_if_needed(ctx);
                 app.start_preview_if_needed(ctx);
             },
-        );
+        ));
         assert_eq!(app.project.layers.len(), before.layers.len() + added_count);
         assert_eq!(app.editor_state.history_depths(), (1, 0));
         assert_eq!(app.position_secs, 0.0);
@@ -4374,9 +4383,12 @@ mod tests {
             editor_input(&mut app, &context, vec![]);
             let output = editor_input(&mut app, &context, vec![]);
             let panel = |id| {
-                egui::containers::panel::PanelState::load(&context, egui::Id::new(id))
-                    .unwrap()
-                    .rect
+                egui::containers::panel::PanelState::load(
+                    &context,
+                    context.viewport_id().root_ui_id().with(id),
+                )
+                .unwrap()
+                .outer_rect
             };
             let timeline = panel("musicvideo-timeline");
             let left = panel("musicvideo-layers");

@@ -5,7 +5,7 @@
 ## stdin/stdout の制御プロトコルと shared memory 経由で音声データを受け渡す。
 ##
 ## ビルド前提:
-##   - bash scripts/setup-vst3-sdk.sh で vendor/vst3sdk/ に SDK 3.8.0+ を配置
+##   - bash scripts/setup-vst3-sdk.sh で vendor/vst3sdk/ に SDK 3.8.0+ (verified: v3.8.1_build_84) を配置
 ##   - CMake 3.20+ (PDFium / FFmpeg と同じく Visual Studio 同梱で OK)
 ##   - MSVC 2026 (Visual Studio 18 BuildTools, C++ デスクトップ開発ワークロード)
 ##

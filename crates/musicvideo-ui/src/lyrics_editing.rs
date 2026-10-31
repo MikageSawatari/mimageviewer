@@ -881,13 +881,13 @@ impl TextBuffer for LyricsTextBuffer {
         &self.text
     }
 
-    fn insert_text(&mut self, text: &str, char_index: usize) -> usize {
+    fn insert_text(&mut self, text: &str, char_index: egui::text::CharIndex) -> usize {
         if self.pending.is_some() {
             return 0;
         }
         let text = normalize_newlines(text);
         let inserted_chars = text.chars().count();
-        let char_index = char_index.min(self.text.chars().count());
+        let char_index = char_index.0.min(self.text.chars().count());
         let byte_index = byte_index(&self.text, char_index);
         self.text.insert_str(byte_index, &text);
         self.ensure_pass().mutations.push(Mutation::Insert {
@@ -897,13 +897,13 @@ impl TextBuffer for LyricsTextBuffer {
         inserted_chars
     }
 
-    fn delete_char_range(&mut self, char_range: Range<usize>) {
+    fn delete_char_range(&mut self, char_range: Range<egui::text::CharIndex>) {
         if self.pending.is_some() {
             return;
         }
         assert!(char_range.start <= char_range.end);
         let char_count = self.text.chars().count();
-        let char_range = char_range.start.min(char_count)..char_range.end.min(char_count);
+        let char_range = char_range.start.0.min(char_count)..char_range.end.0.min(char_count);
         let byte_start = byte_index(&self.text, char_range.start);
         let byte_end = byte_index(&self.text, char_range.end);
         self.text.replace_range(byte_start..byte_end, "");
@@ -914,7 +914,7 @@ impl TextBuffer for LyricsTextBuffer {
 
     fn clear(&mut self) {
         let char_count = self.text.chars().count();
-        self.delete_char_range(0..char_count);
+        self.delete_char_range(egui::text::CharIndex(0)..egui::text::CharIndex(char_count));
     }
 
     fn replace_with(&mut self, text: &str) {
@@ -1345,7 +1345,9 @@ fn next_unused_line_id(lines: &[TrackedLine], minimum: u64) -> u64 {
 fn event_may_mutate_text(event: &Event) -> bool {
     match event {
         Event::Cut | Event::Paste(_) | Event::Text(_) => true,
-        Event::Ime(ImeEvent::Preedit(_) | ImeEvent::Commit(_)) => true,
+        Event::Ime(
+            ImeEvent::Preedit { .. } | ImeEvent::Commit(_) | ImeEvent::DeleteSurrounding { .. },
+        ) => true,
         Event::Key {
             key:
                 Key::Backspace
@@ -1507,8 +1509,11 @@ mod tests {
         let original_ids = buffer.identity_snapshot().line_ids;
 
         let edited = applied(edit(&mut buffer, &original, |buffer| {
-            TextBuffer::delete_char_range(buffer, 0..0);
-            TextBuffer::insert_text(buffer, "X\n", 0);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(0)..egui::text::CharIndex(0),
+            );
+            TextBuffer::insert_text(buffer, "X\n", egui::text::CharIndex(0));
         }));
 
         assert_eq!(
@@ -1526,8 +1531,11 @@ mod tests {
         let original_id = buffer.lines[0].id;
 
         let edited = applied(edit(&mut buffer, &original, |buffer| {
-            TextBuffer::delete_char_range(buffer, 2..2);
-            TextBuffer::insert_text(buffer, "\n", 2);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(2)..egui::text::CharIndex(2),
+            );
+            TextBuffer::insert_text(buffer, "\n", egui::text::CharIndex(2));
         }));
 
         assert_eq!(edited, vec![line("あ🙂", Some(3.0)), line("い", None)]);
@@ -1541,8 +1549,11 @@ mod tests {
         let original_id = buffer.lines[0].id;
 
         let edited = applied(edit(&mut buffer, &original, |buffer| {
-            TextBuffer::delete_char_range(buffer, 0..3);
-            TextBuffer::insert_text(buffer, "new", 0);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(0)..egui::text::CharIndex(3),
+            );
+            TextBuffer::insert_text(buffer, "new", egui::text::CharIndex(0));
         }));
 
         assert_eq!(edited, vec![line("new", Some(4.0))]);
@@ -1555,7 +1566,10 @@ mod tests {
         let mut buffer = LyricsTextBuffer::new(&original, 1);
 
         let edited = applied(edit(&mut buffer, &original, |buffer| {
-            TextBuffer::delete_char_range(buffer, 0..3);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(0)..egui::text::CharIndex(3),
+            );
         }));
 
         assert_eq!(edited, vec![line("", Some(5.0))]);
@@ -1570,7 +1584,10 @@ mod tests {
         let deleted_id = buffer.lines[0].id;
 
         let edited = applied(edit(&mut buffer, &original, |buffer| {
-            TextBuffer::delete_char_range(buffer, 0..2);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(0)..egui::text::CharIndex(2),
+            );
         }));
 
         assert_eq!(edited, vec![line("B", Some(2.0))]);
@@ -1589,9 +1606,12 @@ mod tests {
         let c_id = buffer.lines[2].id;
 
         let edited = applied(edit(&mut buffer, &original, |buffer| {
-            TextBuffer::delete_char_range(buffer, 0..3);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(0)..egui::text::CharIndex(3),
+            );
             assert_eq!(buffer.as_str(), "\nC");
-            TextBuffer::insert_text(buffer, "X", 2);
+            TextBuffer::insert_text(buffer, "X", egui::text::CharIndex(2));
         }));
 
         assert_eq!(edited, vec![line("", None), line("CX", Some(3.0))]);
@@ -1606,7 +1626,10 @@ mod tests {
         let timed_id = buffer.lines[1].id;
 
         let edited = applied(edit(&mut buffer, &original, |buffer| {
-            TextBuffer::delete_char_range(buffer, 1..2);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(1)..egui::text::CharIndex(2),
+            );
         }));
 
         assert_eq!(edited, vec![line("AB", Some(2.0))]);
@@ -1620,7 +1643,10 @@ mod tests {
         let second_id = buffer.lines[1].id;
 
         let result = edit(&mut buffer, &original, |buffer| {
-            TextBuffer::delete_char_range(buffer, 1..2);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(1)..egui::text::CharIndex(2),
+            );
         });
         assert!(matches!(result, LyricsPassResult::NeedsResolution(_)));
         assert_eq!(buffer.committed_lines(), original);
@@ -1639,7 +1665,10 @@ mod tests {
         let original = vec![line("A", Some(1.0)), line("B", Some(1.0))];
         let mut buffer = LyricsTextBuffer::new(&original, 1);
         let edited = applied(edit(&mut buffer, &original, |buffer| {
-            TextBuffer::delete_char_range(buffer, 1..2);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(1)..egui::text::CharIndex(2),
+            );
         }));
         assert_eq!(edited, vec![line("AB", Some(1.0))]);
     }
@@ -1649,8 +1678,11 @@ mod tests {
         let original = vec![line("A", Some(1.0))];
         let mut buffer = LyricsTextBuffer::new(&original, 1);
         let edited = applied(edit(&mut buffer, &original, |buffer| {
-            TextBuffer::delete_char_range(buffer, 0..1);
-            TextBuffer::insert_text(buffer, "B", 0);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(0)..egui::text::CharIndex(1),
+            );
+            TextBuffer::insert_text(buffer, "B", egui::text::CharIndex(0));
         }));
         let latest = vec![line("B", Some(8.0))];
         assert_eq!(edited, vec![line("B", Some(1.0))]);
@@ -1666,7 +1698,10 @@ mod tests {
         let original = vec![line("A", Some(1.0)), line("B", Some(2.0))];
         let mut buffer = LyricsTextBuffer::new(&original, 1);
         let edited = applied(edit(&mut buffer, &original, |buffer| {
-            TextBuffer::delete_char_range(buffer, 0..2);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(0)..egui::text::CharIndex(2),
+            );
         }));
         let latest = vec![line("B", Some(7.0))];
         assert_eq!(edited, vec![line("B", Some(2.0))]);
@@ -1703,16 +1738,25 @@ mod tests {
         let original = vec![line("A", Some(1.0))];
         let mut buffer = LyricsTextBuffer::new(&original, 1);
         let b = applied(edit(&mut buffer, &original, |buffer| {
-            TextBuffer::delete_char_range(buffer, 0..1);
-            TextBuffer::insert_text(buffer, "B", 0);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(0)..egui::text::CharIndex(1),
+            );
+            TextBuffer::insert_text(buffer, "B", egui::text::CharIndex(0));
         }));
         let a = applied(edit(&mut buffer, &b, |buffer| {
-            TextBuffer::delete_char_range(buffer, 0..1);
-            TextBuffer::insert_text(buffer, "A", 0);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(0)..egui::text::CharIndex(1),
+            );
+            TextBuffer::insert_text(buffer, "A", egui::text::CharIndex(0));
         }));
         let c = applied(edit(&mut buffer, &a, |buffer| {
-            TextBuffer::delete_char_range(buffer, 0..1);
-            TextBuffer::insert_text(buffer, "C", 0);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(0)..egui::text::CharIndex(1),
+            );
+            TextBuffer::insert_text(buffer, "C", egui::text::CharIndex(0));
         }));
 
         let restored = edit(&mut buffer, &c, |buffer| {
@@ -1730,8 +1774,11 @@ mod tests {
             let next = format!("revision-{index}");
             project = applied(edit(&mut buffer, &project, |buffer| {
                 let len = buffer.as_str().chars().count();
-                TextBuffer::delete_char_range(buffer, 0..len);
-                TextBuffer::insert_text(buffer, &next, 0);
+                TextBuffer::delete_char_range(
+                    buffer,
+                    egui::text::CharIndex(0)..egui::text::CharIndex(len),
+                );
+                TextBuffer::insert_text(buffer, &next, egui::text::CharIndex(0));
             }));
         }
 
@@ -1756,8 +1803,11 @@ mod tests {
             let next = format!("revision-{index}");
             project = applied(edit(&mut buffer, &project, |buffer| {
                 let len = buffer.as_str().chars().count();
-                TextBuffer::delete_char_range(buffer, 0..len);
-                TextBuffer::insert_text(buffer, &next, 0);
+                TextBuffer::delete_char_range(
+                    buffer,
+                    egui::text::CharIndex(0)..egui::text::CharIndex(len),
+                );
+                TextBuffer::insert_text(buffer, &next, egui::text::CharIndex(0));
             }));
         }
         buffer.replace_external(&[line("same", Some(9.0))]);
@@ -1794,8 +1844,15 @@ mod tests {
             let rollback = TextEditRollback::capture(&context, id, buffer.as_str()).unwrap();
             buffer.begin_pass(&project, Some(rollback)).unwrap();
             let len = buffer.as_str().chars().count();
-            TextBuffer::delete_char_range(&mut buffer, 0..len);
-            TextBuffer::insert_text(&mut buffer, &format!("revision-{index}"), 0);
+            TextBuffer::delete_char_range(
+                &mut buffer,
+                egui::text::CharIndex(0)..egui::text::CharIndex(len),
+            );
+            TextBuffer::insert_text(
+                &mut buffer,
+                &format!("revision-{index}"),
+                egui::text::CharIndex(0),
+            );
             project = applied(buffer.finish_pass());
 
             let mut state = TextEditState::load(&context, id).unwrap();
@@ -1884,8 +1941,15 @@ mod tests {
             let rollback = TextEditRollback::capture(&context, id, buffer.as_str()).unwrap();
             buffer.begin_pass(&project, Some(rollback)).unwrap();
             let len = buffer.as_str().chars().count();
-            TextBuffer::delete_char_range(&mut buffer, 0..len);
-            TextBuffer::insert_text(&mut buffer, &format!("入力中-{index}"), 0);
+            TextBuffer::delete_char_range(
+                &mut buffer,
+                egui::text::CharIndex(0)..egui::text::CharIndex(len),
+            );
+            TextBuffer::insert_text(
+                &mut buffer,
+                &format!("入力中-{index}"),
+                egui::text::CharIndex(0),
+            );
             project = applied(buffer.finish_pass());
 
             let mut state = TextEditState::load(&context, id).unwrap();
@@ -1916,8 +1980,11 @@ mod tests {
             let next = format!("revision-{index}");
             project = applied(edit(&mut buffer, &project, |buffer| {
                 let len = buffer.as_str().chars().count();
-                TextBuffer::delete_char_range(buffer, 0..len);
-                TextBuffer::insert_text(buffer, &next, 0);
+                TextBuffer::delete_char_range(
+                    buffer,
+                    egui::text::CharIndex(0)..egui::text::CharIndex(len),
+                );
+                TextBuffer::insert_text(buffer, &next, egui::text::CharIndex(0));
             }));
         }
         assert!(buffer.evicted_text_hashes.contains(&text_hash("same")));
@@ -1943,13 +2010,19 @@ mod tests {
         let mut buffer = LyricsTextBuffer::new(&original, 1);
         let second_id = buffer.lines[1].id;
         let changed = applied(edit(&mut buffer, &original, |buffer| {
-            TextBuffer::delete_char_range(buffer, 0..1);
-            TextBuffer::insert_text(buffer, "X", 0);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(0)..egui::text::CharIndex(1),
+            );
+            TextBuffer::insert_text(buffer, "X", egui::text::CharIndex(0));
         }));
 
         let result = edit(&mut buffer, &changed, |buffer| {
             TextBuffer::replace_with(buffer, "A\nB");
-            TextBuffer::delete_char_range(buffer, 1..2);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(1)..egui::text::CharIndex(2),
+            );
         });
         assert!(matches!(result, LyricsPassResult::NeedsResolution(_)));
 
@@ -1970,8 +2043,11 @@ mod tests {
 
         let result = edit(&mut buffer, &[line("現在", Some(1.0))], |buffer| {
             let len = buffer.as_str().chars().count();
-            TextBuffer::delete_char_range(buffer, 0..len);
-            TextBuffer::insert_text(buffer, "同じ", 0);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(0)..egui::text::CharIndex(len),
+            );
+            TextBuffer::insert_text(buffer, "同じ", egui::text::CharIndex(0));
             TextBuffer::replace_with(buffer, "現在");
             TextBuffer::replace_with(buffer, "同じ");
         });
@@ -2108,8 +2184,11 @@ mod tests {
             let next = format!("revision-{index}");
             project = applied(edit(&mut buffer, &project, |buffer| {
                 let len = buffer.as_str().chars().count();
-                TextBuffer::delete_char_range(buffer, 0..len);
-                TextBuffer::insert_text(buffer, &next, 0);
+                TextBuffer::delete_char_range(
+                    buffer,
+                    egui::text::CharIndex(0)..egui::text::CharIndex(len),
+                );
+                TextBuffer::insert_text(buffer, &next, egui::text::CharIndex(0));
             }));
         }
         assert!(buffer.evicted_text_hashes.contains(&text_hash("戻る本文")));
@@ -2122,7 +2201,10 @@ mod tests {
             text_hash("戻る本文"),
         ])));
         buffer.begin_pass(&current, None).unwrap();
-        TextBuffer::delete_char_range(&mut buffer, 1..2);
+        TextBuffer::delete_char_range(
+            &mut buffer,
+            egui::text::CharIndex(1)..egui::text::CharIndex(2),
+        );
         buffer.ensure_pass().post_reachability =
             Some(NativeHistoryReachability::Known(HashSet::from([
                 text_hash("AB"),
@@ -2152,7 +2234,10 @@ mod tests {
         let mut buffer = LyricsTextBuffer::new(&original, 1);
         let deleted_id = buffer.lines[0].id;
         let mut project = applied(edit(&mut buffer, &original, |buffer| {
-            TextBuffer::delete_char_range(buffer, 0..2);
+            TextBuffer::delete_char_range(
+                buffer,
+                egui::text::CharIndex(0)..egui::text::CharIndex(2),
+            );
         }));
         assert!(buffer.tombstones.contains_key(&deleted_id));
 
@@ -2160,8 +2245,11 @@ mod tests {
             let next = format!("B-{index}");
             project = applied(edit(&mut buffer, &project, |buffer| {
                 let len = buffer.as_str().chars().count();
-                TextBuffer::delete_char_range(buffer, 0..len);
-                TextBuffer::insert_text(buffer, &next, 0);
+                TextBuffer::delete_char_range(
+                    buffer,
+                    egui::text::CharIndex(0)..egui::text::CharIndex(len),
+                );
+                TextBuffer::insert_text(buffer, &next, egui::text::CharIndex(0));
             }));
         }
         assert!(!buffer.tombstones.contains_key(&deleted_id));

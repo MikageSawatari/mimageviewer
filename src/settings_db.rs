@@ -327,10 +327,15 @@ pub(crate) struct RemoteListingSettings {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RemoteReadingSettings {
     pub(crate) remember_spread_shift_per_book: bool,
+    pub(crate) apply_default_spread_to_plain_folders: bool,
     pub(crate) default_spread_mode: crate::settings::SpreadMode,
+    pub(crate) default_reading_flow: crate::settings::ReadingFlow,
     pub(crate) default_reading_direction: crate::settings::ReadingDirection,
     pub(crate) follow_document_reading_direction: bool,
     pub(crate) final_cover_spread_enabled: bool,
+    pub(crate) auto_view_trim_default_enabled: bool,
+    pub(crate) margin_fit_enabled: bool,
+    pub(crate) fullscreen_fit_mode: crate::settings::FullscreenFitMode,
     pub(crate) singleton_spread_first_enabled: bool,
     pub(crate) singleton_spread_last_enabled: bool,
     pub(crate) page_after_cover_alone_enabled: bool,
@@ -342,10 +347,15 @@ impl RemoteReadingSettings {
     pub(crate) fn from_settings(settings: &Settings) -> Self {
         Self {
             remember_spread_shift_per_book: settings.remember_spread_shift_per_book,
+            apply_default_spread_to_plain_folders: settings.apply_default_spread_to_plain_folders,
             default_spread_mode: settings.default_spread_mode,
+            default_reading_flow: settings.default_reading_flow,
             default_reading_direction: settings.default_reading_direction,
             follow_document_reading_direction: settings.follow_document_reading_direction,
             final_cover_spread_enabled: settings.final_cover_spread_enabled,
+            auto_view_trim_default_enabled: settings.auto_view_trim_default_enabled,
+            margin_fit_enabled: settings.margin_fit_enabled,
+            fullscreen_fit_mode: settings.fullscreen_fit_mode,
             singleton_spread_first_enabled: settings.singleton_spread_first_enabled,
             singleton_spread_last_enabled: settings.singleton_spread_last_enabled,
             page_after_cover_alone_enabled: settings.page_after_cover_alone_enabled,
@@ -879,7 +889,8 @@ impl SettingsDb {
     /// Read only the scalar settings that determine one Remote book layout.
     ///
     /// Missing keys in an older DB use the startup snapshot, matching the
-    /// serde/default compatibility of a full settings load. The shared DB lock
+    /// serde/default compatibility of a full settings load. The plain-folder opt-in
+    /// always defaults to false when absent. The shared DB lock
     /// is held once so the layout values form one request snapshot.
     pub(crate) fn load_remote_reading_settings(
         &self,
@@ -888,6 +899,16 @@ impl SettingsDb {
         let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
         let endpoints = read_singleton_endpoint_settings(&inner.conn)?;
         Ok(RemoteReadingSettings {
+            apply_default_spread_to_plain_folders: read_settings_kv_typed(
+                &inner.conn,
+                "apply_default_spread_to_plain_folders",
+                || false,
+            )?,
+            default_reading_flow: read_settings_kv_typed(
+                &inner.conn,
+                "default_reading_flow",
+                || fallback.default_reading_flow,
+            )?,
             remember_spread_shift_per_book: read_settings_kv_typed(
                 &inner.conn,
                 "remember_spread_shift_per_book",
@@ -912,6 +933,19 @@ impl SettingsDb {
                 &inner.conn,
                 "final_cover_spread_enabled",
                 || fallback.final_cover_spread_enabled,
+            )?,
+            auto_view_trim_default_enabled: read_settings_kv_typed(
+                &inner.conn,
+                "auto_view_trim_default_enabled",
+                || false,
+            )?,
+            margin_fit_enabled: read_settings_kv_typed(&inner.conn, "margin_fit_enabled", || {
+                fallback.margin_fit_enabled
+            })?,
+            fullscreen_fit_mode: read_settings_kv_typed(
+                &inner.conn,
+                "fullscreen_fit_mode",
+                || fallback.fullscreen_fit_mode,
             )?,
             singleton_spread_first_enabled: endpoints.first,
             singleton_spread_last_enabled: endpoints.last,
@@ -4619,6 +4653,49 @@ impl Drop for DataDirOverrideGuard {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn plain_folder_spread_settings_roundtrip_and_missing_key_default() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings::default();
+        assert!(!settings.apply_default_spread_to_plain_folders);
+        settings.apply_default_spread_to_plain_folders = true;
+        db.save_full(&settings).unwrap();
+        assert!(
+            db.load_into_settings()
+                .unwrap()
+                .apply_default_spread_to_plain_folders
+        );
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'apply_default_spread_to_plain_folders'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !db.load_into_settings()
+                .unwrap()
+                .apply_default_spread_to_plain_folders
+        );
+        let mut json = serde_json::to_value(&settings).unwrap();
+        // Even a stale ON startup snapshot must not enable a missing, default-OFF live key.
+        assert!(
+            !db.load_remote_reading_settings(&settings)
+                .unwrap()
+                .apply_default_spread_to_plain_folders
+        );
+        json.as_object_mut()
+            .unwrap()
+            .remove("apply_default_spread_to_plain_folders");
+        assert!(
+            !serde_json::from_value::<Settings>(json)
+                .unwrap()
+                .apply_default_spread_to_plain_folders
+        );
+    }
+
+    #[test]
     fn page_turn_animation_roundtrip_and_missing_keys() {
         let dir = TempDir::new().unwrap();
         let db = SettingsDb::create_new(dir.path()).unwrap();
@@ -4942,6 +5019,7 @@ mod tests {
         s.grid_click_selection_mode = crate::settings::GridClickSelectionMode::Explorer;
         s.grid_open_selected_item_on_click = true;
         s.grid_cursor_wrap = true;
+        s.fullscreen_manual_nav_wrap = true;
         s.ui_scale_factor = 1.5;
         s.thumb_quality = 88;
         s.last_folder = Some(PathBuf::from(r"C:\Users\test\Pictures"));
@@ -6230,12 +6308,64 @@ mod tests {
     }
 
     #[test]
+    fn auto_view_trim_default_kv_roundtrip_and_missing_key_are_off() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        for enabled in [true, false] {
+            let settings = Settings {
+                auto_view_trim_default_enabled: enabled,
+                ..Settings::default()
+            };
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings()
+                    .unwrap()
+                    .auto_view_trim_default_enabled,
+                enabled
+            );
+            assert_eq!(
+                db.load_remote_reading_settings(&Settings::default())
+                    .unwrap()
+                    .auto_view_trim_default_enabled,
+                enabled
+            );
+        }
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'auto_view_trim_default_enabled'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !db.load_into_settings()
+                .unwrap()
+                .auto_view_trim_default_enabled
+        );
+        let fallback = Settings {
+            auto_view_trim_default_enabled: true,
+            ..Settings::default()
+        };
+        assert!(
+            !db.load_remote_reading_settings(&fallback)
+                .unwrap()
+                .auto_view_trim_default_enabled
+        );
+    }
+
+    #[test]
     fn remote_reading_settings_are_live_and_keep_missing_old_key_defaults() {
         let db = SettingsDb::open_in_memory_for_test().unwrap();
         let mut live = Settings::default();
         live.default_spread_mode = crate::settings::SpreadMode::RtlCover;
+        live.apply_default_spread_to_plain_folders = true;
+        live.default_reading_flow = crate::settings::ReadingFlow::Horizontal;
         live.default_reading_direction = crate::settings::ReadingDirection::Rtl;
         live.final_cover_spread_enabled = false;
+        live.auto_view_trim_default_enabled = true;
+        live.margin_fit_enabled = true;
+        live.fullscreen_fit_mode = crate::settings::FullscreenFitMode::MarginFit;
         live.singleton_spread_first_enabled = true;
         live.singleton_spread_last_enabled = true;
         live.spread_page_gap_px = 19;
@@ -6397,6 +6527,7 @@ mod tests {
         );
         assert!(loaded.grid_open_selected_item_on_click);
         assert!(loaded.grid_cursor_wrap);
+        assert!(loaded.fullscreen_manual_nav_wrap);
         let video_slot = loaded.video_preset_slots.slots[0]
             .as_ref()
             .expect("video preset slot restored from settings_kv");

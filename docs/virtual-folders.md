@@ -90,14 +90,13 @@ Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ
 F12の複製はaccepted sessionだけを受け取り、保存要求・復元receiverを共有しない。
 ## Everything 検索からの本open/back（§1.374、実装中・検証待ち）
 
-Everythingは外側の実ファイルだけを検索し、ZIP内部entry/PDFページを列挙しない。
+Everythingは外側の実ファイル・実フォルダを検索し、ZIP内部entry/PDFページを列挙しない。
 対応・表示設定に合うZIP/CBZ、PDF/EPUB、変換対象書庫をworkerで分類・statしてSearchのflat行へ採用する。
 元EPUB/変換書庫のidentityを維持し、検索時に変換や内部probeを先行実行しない。
 本openは既存通常open/enumerate/password/convert経路へ渡す。取消/失敗はaccepted位置を変更せず、
 物理表示の成功adoptionだけが `EverythingPosition::PhysicalChild` にlogical source/return anchor/routeを記録する。
 
-ZIP内部の親移動は通常zip navを使い、本の外側では保持したimmutable検索datasetを
-既存Search prepareで再投影してRootへ戻る。IPCを再送せず、表示中本の合成pathから物理parentを推測しない。
+ParentはZIP内部なら通常zip navを使い、それ以外でeffective_folderがlogical_sourceの厳密な物理子孫なら通常の物理親へ戻る。起点からは保持したimmutable検索datasetを既存Search prepareで再投影してRootへ戻る。Resultsボタンは階層を飛ばしてRootへ直帰する。IPCを再送せず、表示中本の合成pathから物理parentを推測しない。
 同contextのitems/metasとthumbnail requestsは共通adoptionに従い、同pathを読むdetached兄弟の
 PDF ticket/queue/cacheを失効しない。先行PDF ownership改修 `4510346f5` / master `c1e66f589` を前提とする。
 F12は既存open/fork/park/promoteを維持し、Everything datasetを兄弟viewerの一覧ownerにしない。
@@ -163,6 +162,12 @@ ZIPの全再読込で準備済みprefixが変わる場合はSameLocationでもro
 同階層の再読込は手動復元済みの値を維持し、外側の履歴cursorはどちらも進めない。
 場所条件は移動時にactive/frame双方から除く。folder/PDF/ZIPのinstall後は履歴とfacetを確定してから
 sidecar hydrationへ進み、metadata復元後のfirst-displayを既存continuationが担当する。
+DFS の fullscreen 継続と RequiredFullscreen の after-hydration 再オープン予約は、その sidecar
+continuation が所有する。待機述語も同じ live な context／世代／source／items数と取消状態から答え、
+viewport と旧ページの holdover を hydration 中も維持する。true close はこの予約を消費し、
+hydration 完了で勝手に再オープンしない。ZIP と EPUB／RAR 等の変換 cache にも同じ規則を適用する。
+`56c11e621`（v4.5.0）の採用後 hydration への移行で待機判定が追従せず、v4.7.0 で PDF 間
+Ctrl+↑↓ のちらつきが報告された。再オープンを採用直後へ戻さず、予約所有者からの判定で修正する。
 failed/cancel/staleの未採用移動は表示、履歴、退避状態を変更しない。
 この段階では設定項目や保存・読書位置keyは変えず、§1.345のファイル種類除外を対象外とした。
 後続の§1.345は `FileTypeVisibility` を共通の一覧投影 owner とし、実 entry のネスト書庫来歴と
@@ -325,10 +330,11 @@ mtime / size と画像認識 fingerprint を identity に catalog cache へ保�
 コレクションでは同名ファイルが異なる親に存在し得るため正規化した full path をキーにする。
 root の準備は worker が行い、source を開いて子へ入った後も root の戻り先と現在 entry を
 viewer context が保持する。別の実フォルダへの明示移動は読込成功時だけその owner を退役し、
-取消・失敗では元の root を保つ。コレクションから開いた PDF / ZIP のページを Esc / Enter /
+取消・失敗では元の root を保つ。コレクションに直接登録した PDF / ZIP のページを Esc / Enter /
 右クリックで閉じる場合も、実ファイルの親フォルダではなく、collection ID・revision・entry ID・
-source key を持つ typed restore で同じ root へ戻る。ネストした ZIP 内の子から直接閉じる場合も
-同じ root entry を選択し、コレクションの順序とスクロール復元を維持する。
+source key を持つ typed restore で同じ root へ戻る。
+登録項目の厳密な子孫からの親移動は通常の物理／論理の親へ戻り、登録項目そのものからの親移動で
+同じ root entry を選択する。全画面から親一覧へ直帰する場合も同じ判定を使い、変換書庫は論理元パスで扱い、コレクションの順序とスクロール復元を維持する。
 
 サムネイルの full-path cache key を使うかどうかの正本は
 `App::use_full_path_cache_keys()`。検索結果（Ctrl+S / Ctrl+G）、タグ一覧、閲覧履歴、
@@ -601,6 +607,11 @@ importは選択originへ復元する前に対象ページ区分のsource/cache�
 
 #### 親一覧の位置保存と履歴復帰 (§1.328)
 
+スマートフォルダの結果から直接開いたZIP / PDFの最上位では、BS・「上へ」・設定に従う全画面の
+親一覧への直帰が同じSmart root復元を使い、開いた本を選択する。合成pathは通常open dispatcherで
+復元ownerへ配送し、実directoryとして走査しない。ZIP内の子階層は従来どおりZIP navで一段ずつ戻る。
+実Folder entry配下の本はそのFolderへ戻ってからSmart rootへ戻る。←の型付き履歴復元も維持する。
+
 通常 item install と ZIP の先出し表示は `folder_history` (scroll / selected) の保存処理を
 `save_leaving_folder_grid_position` に集約する。通常 install は `start_loading_items_inner` から呼び、
 ZIP / 直接閲覧 RAR / 変換キャッシュ ZIP は、列挙待ち表示のために旧 items・選択・scroll・
@@ -695,6 +706,19 @@ Auto比率の★一覧では、同じ保存helperが `TopLevelGridView` の★�
 純ロジックなので受信後に UI スレッドで行う。内側 ZIP バイト列は zip_loader 内の LRU
 キャッシュに保持され、後続の read_entry_bytes / 深い階層のサムネ読み込みで再展開せず参照される。
 
+内側 ZIP bytes のキーは、ローカルの内部名と Remote の物理 index chain のどちらも、
+外側 ZIP の `ArchiveCacheKey` (path + 精密な mtime + len) を必ず含む。同じ path の外側 ZIP が
+更新された場合は古い identity にヒットしない。列挙・先頭画像名・先頭画像 bytes・個別ページ取得・
+Remote 候補の探索/解決/取得は、`open_archive_with_key` で外側の request reader と、その reader が
+使う目次 template の slot key を一緒に取得する。その key を全階層の内側 bytes の lookup / insert と、
+外側の CP932 復号名 index に使い、別途 path を stat して世代を取り直さない。stat / open に失敗した
+場合は従来のエラー処理に任せる。mtime と長さが両方同じ差し替えは目次キャッシュと同様に検出できない。
+目次 cache 内部の stat と file open の間の競合は既存の限界とし、再試行や二重 stat の照合は追加しない。
+個別ページ取得は内側 bytes のヒット時も先に外側 template を取得する。warm 時は metadata / slot の照合と
+reader clone だけで目次を再解析しないが、内側 bytes が残っていても目次が8書庫 LRU から退避していれば
+外側目次を一度再解析する。先頭画像名取得も共有 template 経由とし、既存の毎回の目次解析を再利用可能にする。
+ナビゲーション時の `clear_nested_cache()` はメモリ解放のために残し、更新検証の根拠にはしない。
+
 ### 2.2 PDF を開く (`App::load_pdf_as_folder`)
 
 PDF は **非同期**で開く:
@@ -731,6 +755,12 @@ mtime / size を含むキーのいずれかが変わった差し替えやパス�
 context epoch による解放は行わない。
 
 ### 2.3 自動 1 ページ目フルスクリーン (`auto_fullscreen_zip_pdf`)
+
+「通常フォルダにも既定のページ構成を使う」(`apply_default_spread_to_plain_folders`、既定 OFF) は
+この直接表示・本扱い設定と独立する。ON でも `ProjectionRecipe`、ページ順固定、自動 fullscreen、
+一覧/ツリー/アドレス指定・F12/複数窓の開き方と帰路は変えない。走査済みの実フォルダに保存された
+ページ構成がないときだけ実効 `default_spread_mode` を使い、非本の flow は Paged のまま。
+保存値を優先し、既定を DB に書き込まない。抽出一覧・ZIP/PDF/EPUB の規則は維持する。
 
 環境設定のフル機能ウィンドウで「本をページ表示で開く」が ON、または複数ウィンドウモードが
 ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く、または
@@ -1045,7 +1075,7 @@ fullscreen viewport、detached window、in-window がそれぞれの実 inner si
 - ZIP 内 WIC 系の Orientation 読み取り (bytes 版は rexif で読める EXIF のみ。JPEG などは自動回転される)
 
 WIC デコードは `wic_decoder::decode_to_dynamic_image_from_bytes` でバイト列から
-直接デコードできるため、ZIP 内の HEIC/AVIF/JXL/TIFF も開ける
+直接デコードできるため、ZIP 内の HEIC/JXL/TIFF も開ける（AVIF は内蔵を先に試す）
 (対応コーデックがインストールされていれば)。サムネイル・フルスクリーン両方の
 非 RAW ZIP エントリ経路で `image::load_from_memory` 失敗時のフォールバックとして使われる。
 ZIP 内 RAW は拡張子で先に LibRaw へ分岐し、entry bytes から preview または現像結果と
@@ -1153,3 +1183,10 @@ ZIP/PDF 用の相対キーは **ZIP/PDF ファイルの親フォルダ** に置�
 bufferは初回small readでのみ確保し、miss時は領域を再利用する。request/templateのcloneは空のbufferで開始し、可変bufferや取消tokenを兄弟request間で共有しない。cache hit前にも取消を確認し、大きなreadは直接読み、EOF/short read/seekの位置契約を維持する。書庫のfreshness判定、entry列挙、CP932/UTF-8正規化、legacy rename、入れ子ZIP、復号や失敗の扱いを省略しない。
 
 局所比較と検証結果は [類似索引の増分照合と収束](similar-index-incremental-reconcile-plan.md) の起動Full短縮節に記録する。small readのOS呼出しは減るがread-aheadによる読み取りbytesは増え得るため、局所fixtureの速度を実機全体の起動時間に読み替えない。
+
+### ZIP 内 AVIF（§1.407）
+
+entry bytes は通常ファイルと同じ `image_decode` 境界を通し、内蔵 libavif → WIC → Susie。
+canonical・thumbnail・本への追加・clipboard・類似検索・Remote で共有する。
+内蔵 AVIF の clap/irot/imir 適用済み情報は `Orientation::Applied` で運び、ZIP の
+EXIF bytes 補正を重ねない。native source_dims も表示変換後の寸法とする。

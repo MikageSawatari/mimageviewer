@@ -1215,6 +1215,9 @@ pub(crate) struct RemoteAiResources {
     pub(crate) runtime: Arc<crate::ai::runtime::AiRuntime>,
     pub(crate) manager: Arc<crate::ai::model_manager::ModelManager>,
     pub(crate) background_mode: u8,
+    // Keep the whole resource bundle alive through inference/materialization;
+    // moving out only its manager/runtime would shorten diagnostic activity.
+    _activity: Option<crate::previous_run_diagnostics::checkpoint::ActivityLease>,
 }
 
 impl RemoteAiExecutionBridge {
@@ -1242,10 +1245,17 @@ impl RemoteAiExecutionBridge {
     pub(crate) fn resources_for_remote(&self, cancel: &AtomicBool) -> Option<RemoteAiResources> {
         self.resources_for_remote_inner(cancel)
     }
+
+    pub(crate) fn diagnostic_activity(
+        &self,
+    ) -> Option<crate::previous_run_diagnostics::checkpoint::ActivityLease> {
+        self.runtime.diagnostic_activity()
+    }
 }
 
 impl RemoteAiExecutionBridge {
     fn resources_for_remote_inner(&self, cancel: &AtomicBool) -> Option<RemoteAiResources> {
+        let activity = self.runtime.diagnostic_activity();
         match self
             .runtime
             .wait_terminal_while(|| !cancel.load(Ordering::Acquire))
@@ -1254,6 +1264,7 @@ impl RemoteAiExecutionBridge {
                 runtime,
                 manager: Arc::clone(&self.manager),
                 background_mode: self.background_mode.load(Ordering::Acquire),
+                _activity: activity,
             }),
             crate::ai::runtime::AiRuntimeInitWait::Failed(error) => {
                 crate::logger::log(format!(

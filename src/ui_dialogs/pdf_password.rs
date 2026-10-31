@@ -20,6 +20,7 @@ impl crate::app::App {
         let escape_pressed = self.dialog_escape_pressed(ctx);
 
         egui::Window::new("PDF パスワード入力")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .resizable(false)
             .collapsible(false)

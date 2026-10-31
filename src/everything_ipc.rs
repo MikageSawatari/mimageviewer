@@ -44,6 +44,10 @@ pub struct EverythingRow {
 }
 
 impl EverythingRow {
+    pub fn is_folder(&self) -> bool {
+        self.flags & ITEM_ROOT == 0 && self.flags & ITEM_FOLDER != 0
+    }
+
     /// Indexed file claims only. The prepare worker still validates physical identity
     /// and stats the supported candidate; this must never authorize metadata purges.
     pub fn is_file(&self) -> bool {
@@ -223,7 +227,7 @@ static NEXT_REPLY_ID: AtomicU32 = AtomicU32::new(1);
 fn next_reply_id() -> Result<u32, EverythingError> {
     // Never wrap: destroyed HWND reuse cannot alias any earlier run's correlation ID.
     NEXT_REPLY_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .map_err(|_| EverythingError::RequestIdsExhausted)
 }
 

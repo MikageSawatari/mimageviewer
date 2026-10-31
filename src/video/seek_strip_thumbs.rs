@@ -1236,7 +1236,7 @@ pub(crate) struct SeekStripThumbnailTestScriptObservation {
 #[cfg(feature = "test-script")]
 fn allocate_test_script_worker_instance_id() -> u64 {
     NEXT_TEST_SCRIPT_WORKER_INSTANCE_ID
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current.checked_add(1)
         })
         .expect("test-script seek-strip worker instance ids exhausted")

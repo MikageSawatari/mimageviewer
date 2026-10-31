@@ -83,11 +83,15 @@ fn viewer_frame_with_focus(
             ..Default::default()
         },
     );
-    let _ = ctx.run(raw, |ctx| {
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show(ctx, |ui| run(ui, ctx));
-    });
+    let _ = ctx
+        .run_pass(raw, |ctx| {
+            ctx.root_ui(|root_ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(root_ui, |ui| run(ui, ctx))
+            });
+        })
+        .drop_without_applying_deltas();
 }
 
 fn neutral_gamepad_poll(app: &mut App, ctx: &egui::Context) {
@@ -178,7 +182,7 @@ fn keyboard_turn_with_resident_quality(route: InputRoute, mode: SpreadMode, thum
     let ctx = egui::Context::default();
     install(&ctx);
     crate::key_input::install_operation_input_plugin(&ctx);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), true));
     let mut app = ready_app(&ctx, mode);
     app.settings.page_turn_animation_enabled = true;
     app.settings.page_turn_animation_duration_ms = 600;
@@ -218,18 +222,19 @@ fn keyboard_turn_with_resident_quality(route: InputRoute, mode: SpreadMode, thum
         app.edit_result_cache.retain(|key, _| key.idx < target);
         for idx in target..target + if mode.is_spread() { 2 } else { 1 } {
             app.fs_cache.remove(&idx);
-            app.thumbnails[idx] = ThumbnailState::Loaded {
-                tex: ctx.load_texture(
+            app.thumbnails[idx] = ThumbnailState::loaded_raster(
+                ctx.load_texture(
                     format!("input-resident-thumb-{idx}"),
                     egui::ColorImage::filled([8, 12], egui::Color32::WHITE),
                     egui::TextureOptions::LINEAR,
                 ),
-                origin: crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
-                from_edit_preview: false,
-                rendered_at_px: 12,
-                source_dims: Some((80, 120)),
-                layout_dims: None,
-            };
+                crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache,
+                false,
+                12,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((80, 120)),
+                None,
+            );
         }
     }
 
@@ -315,9 +320,11 @@ fn keyboard_turn_with_resident_quality(route: InputRoute, mode: SpreadMode, thum
         _ => panic!("adopted keyboard curl must be Turning"),
     };
     assert_neutral_polls_preserve_turn(&mut app, &ctx, viewport, &tracker);
-    if let PresentationState::Turning { offer, .. } = &mut app.page_turn_presentation.state {
+    if let PresentationState::Turning { clock, offer, .. } = &mut app.page_turn_presentation.state {
         // Advance only this test's clock origin; no wall-clock wait or production hook.
-        offer.accepted_at -= offer.duration + Duration::from_millis(1);
+        *clock = MotionClock::Running {
+            start_at: Instant::now() - offer.duration - Duration::from_millis(1),
+        };
     } else {
         panic!("neutral polls must preserve Turning");
     }
@@ -403,7 +410,7 @@ fn first_pointer_click_reaches_started_and_finished(root: bool, mode: SpreadMode
     let ctx = egui::Context::default();
     install(&ctx);
     install_fs_navigator_input_tracking(&ctx);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), true));
     let mut app = ready_app(&ctx, mode);
     app.settings.page_turn_animation_enabled = true;
     app.settings.page_turn_animation_duration_ms = 600;
@@ -512,8 +519,10 @@ fn first_pointer_click_reaches_started_and_finished(root: bool, mode: SpreadMode
         _ => panic!("real click must submit a turn"),
     };
     assert_neutral_polls_preserve_turn(&mut app, &ctx, viewport, &tracker);
-    if let PresentationState::Turning { offer, .. } = &mut app.page_turn_presentation.state {
-        offer.accepted_at -= offer.duration + Duration::from_millis(1);
+    if let PresentationState::Turning { clock, offer, .. } = &mut app.page_turn_presentation.state {
+        *clock = MotionClock::Running {
+            start_at: Instant::now() - offer.duration - Duration::from_millis(1),
+        };
     } else {
         panic!("neutral poll canceled the real click");
     }
@@ -550,7 +559,7 @@ fn ready_single_viewer(ctx: &egui::Context) -> (crate::app::AppTestEnvForTest, e
     install(ctx);
     install_fs_navigator_input_tracking(ctx);
     crate::key_input::install_operation_input_plugin(ctx);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), true));
     let mut app = ready_app(ctx, SpreadMode::Single);
     app.settings.page_turn_animation_enabled = true;
     let viewport = app.fullscreen_viewport_id();
@@ -819,6 +828,8 @@ fn child_key_and_wheel_navigation_start_and_complete_after_outer_root_acceptance
                     unit: egui::MouseWheelUnit::Point,
                     delta: egui::vec2(0.0, -120.0),
                     modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
                 },
             ]
         } else {
@@ -869,10 +880,12 @@ fn child_key_and_wheel_navigation_start_and_complete_after_outer_root_acceptance
             assert!(receipt.curl);
         });
         let tracker = match &mut app.page_turn_presentation.state {
-            PresentationState::Turning { offer, .. } => {
+            PresentationState::Turning { clock, offer, .. } => {
                 assert!(same_operation(&offer.fact, &original));
                 assert_eq!(offer.submission.status(), SubmissionStatus::Started);
-                offer.accepted_at -= offer.duration + Duration::from_millis(1);
+                *clock = MotionClock::Running {
+                    start_at: Instant::now() - offer.duration - Duration::from_millis(1),
+                };
                 offer.submission.clone()
             }
             _ => panic!("the child input must start its own turn after ROOT acceptance"),
@@ -906,6 +919,8 @@ fn mixed_key_and_wheel_batch_skips_once_for_the_actual_accepted_key_navigation()
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(0.0, -1.0),
             modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
         },
     ];
     let mut accepted_operation = None;
@@ -1020,6 +1035,8 @@ fn raw_wheel(delta: egui::Vec2) -> Vec<egui::Event> {
             unit: egui::MouseWheelUnit::Point,
             delta,
             modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
         },
     ]
 }
@@ -1032,7 +1049,7 @@ fn ready_wheel_viewer(
     install(ctx);
     install_fs_navigator_input_tracking(ctx);
     crate::key_input::install_operation_input_plugin(ctx);
-    ctx.data_mut(|data| data.insert_temp(egui::Id::new("page_turn_input_enabled"), true));
+    ctx.data_mut(|data| data.insert_temp(egui::Id::unique("page_turn_input_enabled"), true));
     let mut app = ready_app(ctx, mode);
     app.settings.page_turn_animation_enabled = true;
     app.settings.page_turn_animation_duration_ms = 600;
@@ -1138,9 +1155,12 @@ fn unfocused_viewer_and_root_wheels_start_and_finish_without_focus_level_cancell
                 });
                 assert_eq!(tracker.status(), SubmissionStatus::Started);
             }
-            if let PresentationState::Turning { offer, .. } = &mut app.page_turn_presentation.state
+            if let PresentationState::Turning { clock, offer, .. } =
+                &mut app.page_turn_presentation.state
             {
-                offer.accepted_at -= offer.duration + Duration::from_millis(1);
+                *clock = MotionClock::Running {
+                    start_at: Instant::now() - offer.duration - Duration::from_millis(1),
+                };
             } else {
                 panic!("an unfocused level without a loss edge must preserve the turn");
             }
@@ -1383,7 +1403,7 @@ fn horizontal_wheel_and_sibling_delivery_do_not_turn_the_owner_page() {
         raw_wheel(egui::vec2(0.0, -120.0)),
         |_, ctx| {
             observe_pointer_transaction(ctx);
-            let id = egui::Id::new(("page_turn_pointer_transaction", sibling));
+            let id = egui::Id::unique(("page_turn_pointer_transaction", sibling));
             let transaction = ctx
                 .data(|data| data.get_temp::<PointerTransaction>(id))
                 .unwrap();
@@ -1537,6 +1557,8 @@ fn root_focus_loss_forwarding_cannot_cancel_the_child_turn() {
 fn mounted_sibling_focus_loss_cancels_only_its_own_turn() {
     let _serial = crate::key_input::lock_test_input();
     crate::key_input::clear_test_frame();
+    let origin = Instant::now();
+    let motion_clock = super::clock_tests::TestClock::at(origin);
     take_test_events();
     let ctx = egui::Context::default();
     let (mut app, main_viewport) = ready_wheel_viewer(&ctx, true, SpreadMode::Single);
@@ -1557,6 +1579,8 @@ fn mounted_sibling_focus_loss_cancels_only_its_own_turn() {
         _ => panic!("main started turn"),
     };
     let main_context = app.page_turn_destination().context;
+    assert_eq!(main_tracker.started_at(), Some(origin));
+    motion_clock.set(origin + Duration::from_millis(50));
     let items = app.items.clone();
     let sibling = app.build_window_context_for_test(13419, |owner| {
         owner.items = items;
@@ -1581,6 +1605,8 @@ fn mounted_sibling_focus_loss_cancels_only_its_own_turn() {
             owner.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex,
                     pixels: Arc::new(image),
                     source_dims: Some([80, 120]),
@@ -1620,6 +1646,11 @@ fn mounted_sibling_focus_loss_cancels_only_its_own_turn() {
             PresentationState::Turning { offer, .. } => offer.submission.clone(),
             _ => panic!("sibling started turn"),
         };
+        assert_eq!(
+            tracker.started_at(),
+            Some(origin + Duration::from_millis(50))
+        );
+        assert_eq!(main_tracker.started_at(), Some(origin));
         viewer_frame_with_focus(
             &ctx,
             viewport,
@@ -1636,6 +1667,16 @@ fn mounted_sibling_focus_loss_cancels_only_its_own_turn() {
     assert_eq!(app.page_turn_destination().context, main_context);
     assert_eq!(app.fullscreen_idx, Some(1));
     assert_eq!(main_tracker.status(), SubmissionStatus::Started);
+    motion_clock.set(origin + Duration::from_millis(100));
+    viewer_frame(&ctx, main_viewport, Vec::new(), |ui, ctx| {
+        app.begin_page_turn_viewer_frame(ctx, true, None);
+        draw_current(&mut app, ui, ctx);
+    });
+    let PresentationState::Turning { clock, .. } = &app.page_turn_presentation.state else {
+        panic!("main turn survives sibling mount/deposit");
+    };
+    assert_eq!(*clock, MotionClock::Running { start_at: origin });
+    assert_eq!(main_tracker.started_at(), Some(origin));
     let events = take_test_events();
     assert_eq!(
         events

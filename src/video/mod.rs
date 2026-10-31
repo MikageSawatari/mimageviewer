@@ -49,6 +49,8 @@ pub mod mvexport;
 #[cfg(windows)]
 pub(crate) mod native_cursor;
 #[cfg(windows)]
+pub(crate) mod native_diagnostics;
+#[cfg(windows)]
 pub mod native_presenter;
 pub(crate) mod native_touch;
 #[cfg(all(windows, feature = "test-script"))]
@@ -110,6 +112,13 @@ use engine::actor::{EngineActor, OpenOptions};
 pub use engine::actor::{
     InternalContinuation, PlaybackStartContext, PlaybackStartOrigin, PlaybackSuccess,
 };
+
+/// Every seek caller classifies its transport request; there is no inferred user default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeekOrigin {
+    User,
+    Internal(InternalContinuation),
+}
 
 /// Worker/native-window notifications share one root-viewport wake owner per player.
 ///
@@ -303,9 +312,47 @@ enum LocalDspAcquisition {
 
 static NEXT_MEDIA_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
+/// One video's transient mode; the immutable opening value also defines manual status.
+pub(crate) struct DeinterlaceControl {
+    current: AtomicU8,
+    opened: crate::settings::VideoDeinterlaceMode,
+}
+
+impl DeinterlaceControl {
+    pub(crate) fn new(mode: crate::settings::VideoDeinterlaceMode) -> Self {
+        Self {
+            current: AtomicU8::new(Self::encode(mode)),
+            opened: mode,
+        }
+    }
+
+    fn encode(mode: crate::settings::VideoDeinterlaceMode) -> u8 {
+        use crate::settings::VideoDeinterlaceMode;
+        match mode {
+            VideoDeinterlaceMode::Auto => 0,
+            VideoDeinterlaceMode::On => 1,
+            VideoDeinterlaceMode::Off => 2,
+        }
+    }
+
+    pub(crate) fn mode(&self) -> crate::settings::VideoDeinterlaceMode {
+        use crate::settings::VideoDeinterlaceMode;
+        match self.current.load(Ordering::Relaxed) {
+            1 => VideoDeinterlaceMode::On,
+            2 => VideoDeinterlaceMode::Off,
+            _ => VideoDeinterlaceMode::Auto,
+        }
+    }
+
+    fn set(&self, mode: crate::settings::VideoDeinterlaceMode) -> bool {
+        self.current.swap(Self::encode(mode), Ordering::Relaxed) != Self::encode(mode)
+    }
+}
+
 pub struct VideoPlayer {
     /// Lifetime identity travels with the player across viewer-context moves.
     media_identity: u64,
+    deinterlace_control: Arc<DeinterlaceControl>,
     path: PathBuf,
     /// All player-owned workers and the native event funnel wake the same egui root.
     ui_wake: Arc<VideoUiWake>,
@@ -550,6 +597,7 @@ pub struct NativeChromePolicy {
     pub(crate) info_open: crate::ui_helpers::MetadataPanelOpenState,
     pub info_locked: bool,
     pub suppression: crate::settings::FullscreenChromeSuppression,
+    pub notification_duration: crate::settings::NotificationDuration,
 }
 
 /// Exact existing window lease/host incarnation, carried across the prepare boundary.
@@ -646,6 +694,7 @@ mod chrome_suppression_transport_tests {
                 ..Default::default()
             },
             info_locked: true,
+            notification_duration: crate::settings::NotificationDuration::Long,
             suppression: FullscreenChromeSuppression {
                 top: true,
                 bottom: true,
@@ -1024,6 +1073,9 @@ fn video_scale_feedback_toast(
 #[cfg(windows)]
 #[derive(Clone, Debug)]
 pub enum NativeVideoOutputEvent {
+    SetDeinterlaceMode {
+        mode: crate::settings::VideoDeinterlaceMode,
+    },
     SelectAudioTrack {
         stream_index: usize,
     },
@@ -1629,11 +1681,11 @@ enum NativeVideoOutputCommand {
     },
     ShowToast {
         text: String,
+        kind: crate::feedback::FeedbackKind,
         centered: bool,
-        /// 表示維持時間。`None` のとき presenter 側が `centered` から既定値
-        /// (centered: 2.5s / それ以外: 1.8s) を導く。←→ ホットキーの境界トーストの
-        /// ように「キーを離したら早めに消したい」用途では `Some(短い値)` を渡す。
-        linger: Option<std::time::Duration>,
+        /// App-resolved lifetime/fade, or None for native-origin default timing.
+        /// Immediate seek feedback carries resolved timing without preference scaling.
+        linger: Option<crate::feedback::ResolvedFeedbackTiming>,
     },
     SetTileOverlay {
         tile_overlay: Option<native_presenter::NativeOverlayTileOverlay>,
@@ -1701,7 +1753,9 @@ enum NativeVideoOutputCommand {
     /// `WM_WINDOWPOSCHANGING` などから発火される。pump が pop して
     /// 即時 → 16ms → 64ms の short retry burst で `SetWindowPos(hud, HWND_TOPMOST, ...)`
     /// を呼ぶ (VST IPC が非同期で z-order を動かしても拾えるように)。
-    RaiseHudToTop,
+    RaiseHudToTop {
+        diagnostic: Option<native_window::NativeRaiseSample>,
+    },
     /// native presenter HWND を pump thread 側で前面・foreground に戻す。
     ///
     /// PrintScreen / Snipping Tool などで一度 foreground が外部プロセスへ移ったあと、
@@ -2068,7 +2122,7 @@ fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usiz
         NativeVideoOutputCommand::MarkCursorActivity => Some(22),
         NativeVideoOutputCommand::RequestOverlayRender => Some(23),
         NativeVideoOutputCommand::SetNormalizeOverlayState { .. } => Some(24),
-        NativeVideoOutputCommand::RaiseHudToTop => Some(25),
+        NativeVideoOutputCommand::RaiseHudToTop { .. } => Some(25),
         NativeVideoOutputCommand::RaisePresenterToFront => Some(26),
         NativeVideoOutputCommand::RequestVideoScaleSettings { .. } => Some(27),
         NativeVideoOutputCommand::SetAnime4kState { .. } => Some(28),
@@ -2097,9 +2151,25 @@ struct SequencedNativeCommand {
 
 #[cfg(windows)]
 struct NativeCommandBusShared {
+    raise_diagnostics: Option<NativeRaiseCommandDiagnostics>,
     next_sequence: AtomicU64,
     latest: Mutex<Vec<Option<SequencedNativeCommand>>>,
     overflow_fault: Arc<AtomicBool>,
+}
+
+#[cfg(windows)]
+struct NativeRaiseCommandDiagnostics {
+    tx: crossbeam_channel::Sender<(native_window::NativeRaiseSample, bool)>,
+    rx: crossbeam_channel::Receiver<(native_window::NativeRaiseSample, bool)>,
+    dropped: AtomicU64,
+}
+#[cfg(windows)]
+impl NativeRaiseCommandDiagnostics {
+    fn record(&self, sample: native_window::NativeRaiseSample, replaced: bool) {
+        if self.tx.try_send((sample, replaced)).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -2132,6 +2202,15 @@ pub(crate) enum NativeUiCommandForTest {
 #[cfg(all(windows, test))]
 impl NativeUiProbeForTest {
     pub(crate) fn drain_toasts(&self) -> Vec<(String, Option<std::time::Duration>)> {
+        self.drain_toast_timings()
+            .into_iter()
+            .map(|(text, timing)| (text, timing.map(|timing| timing.native_linger())))
+            .collect()
+    }
+
+    pub(crate) fn drain_toast_timings(
+        &self,
+    ) -> Vec<(String, Option<crate::feedback::ResolvedFeedbackTiming>)> {
         self.command_rx
             .drain()
             .into_iter()
@@ -2175,8 +2254,25 @@ fn native_command_bus(
     capacity: usize,
     overflow_fault: Arc<AtomicBool>,
 ) -> (NativeCommandSender, NativeCommandReceiver) {
+    native_command_bus_with_diagnostics(capacity, overflow_fault, crate::perf::is_enabled())
+}
+
+#[cfg(windows)]
+fn native_command_bus_with_diagnostics(
+    capacity: usize,
+    overflow_fault: Arc<AtomicBool>,
+    diagnostics_enabled: bool,
+) -> (NativeCommandSender, NativeCommandReceiver) {
     let (lossless_tx, lossless_rx) = crossbeam_channel::bounded(capacity);
     let shared = Arc::new(NativeCommandBusShared {
+        raise_diagnostics: diagnostics_enabled.then(|| {
+            let (tx, rx) = crossbeam_channel::bounded(256);
+            NativeRaiseCommandDiagnostics {
+                tx,
+                rx,
+                dropped: AtomicU64::new(0),
+            }
+        }),
         next_sequence: AtomicU64::new(1),
         latest: Mutex::new((0..NATIVE_COMMAND_LATEST_SLOTS).map(|_| None).collect()),
         overflow_fault,
@@ -2195,12 +2291,34 @@ fn native_command_bus(
 
 #[cfg(windows)]
 impl NativeCommandSender {
-    fn send(&self, command: NativeVideoOutputCommand) -> Result<(), ()> {
+    fn send(&self, mut command: NativeVideoOutputCommand) -> Result<(), ()> {
         let sequence = self.shared.next_sequence.fetch_add(1, Ordering::Relaxed);
+        if let NativeVideoOutputCommand::RaiseHudToTop {
+            diagnostic: Some(sample),
+        } = &mut command
+        {
+            sample.sequence = sequence;
+            if let Some(diagnostics) = &self.shared.raise_diagnostics {
+                diagnostics.record(*sample, false);
+            }
+        }
         let queued = SequencedNativeCommand { sequence, command };
         if let Some(slot) = native_command_latest_slot(&queued.command) {
             match self.shared.latest.lock() {
-                Ok(mut latest) => latest[slot] = Some(queued),
+                Ok(mut latest) => {
+                    if let Some(SequencedNativeCommand {
+                        command:
+                            NativeVideoOutputCommand::RaiseHudToTop {
+                                diagnostic: Some(sample),
+                            },
+                        ..
+                    }) = &latest[slot]
+                        && let Some(diagnostics) = &self.shared.raise_diagnostics
+                    {
+                        diagnostics.record(*sample, true);
+                    }
+                    latest[slot] = Some(queued);
+                }
                 Err(_) => self.shared.overflow_fault.store(true, Ordering::Release),
             }
             return Ok(());
@@ -2218,6 +2336,18 @@ impl NativeCommandSender {
 
 #[cfg(windows)]
 impl NativeCommandReceiver {
+    fn publish_raise_diagnostics(&self, pump: &native_window_pump::NativeWindowPumpRenderClient) {
+        if let Some(diagnostics) = &self.shared.raise_diagnostics {
+            for (sample, replaced) in diagnostics.rx.try_iter() {
+                pump.record_upstream_hud_raise(sample, replaced);
+            }
+            let dropped = diagnostics.dropped.swap(0, Ordering::Relaxed);
+            if dropped != 0 {
+                pump.record_upstream_hud_raise_dropped(dropped);
+            }
+        }
+    }
+
     fn drain(&self) -> Vec<NativeVideoOutputCommand> {
         let mut commands: Vec<_> = self.lossless_rx.try_iter().collect();
         match self.shared.latest.lock() {
@@ -2569,6 +2699,79 @@ fn unpack_native_video_canvas_color(packed: u32) -> [u8; 3] {
 }
 
 #[cfg(windows)]
+const NATIVE_VIDEO_FAULT_MESSAGE: &str = "動画の表示処理でエラーが起きました。もう一度開くと再生できる場合があります。繰り返すときは mIV を再起動してください。";
+
+#[cfg(windows)]
+fn native_video_panic_detail(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "non-string panic payload"
+    }
+}
+
+#[cfg(all(test, windows))]
+thread_local! {
+    // App lifecycle tests record the real open arguments without starting decoder/audio/HWNDs.
+    static DISCONNECTED_VIDEO_OPENS: std::cell::RefCell<Option<Vec<bool>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, windows))]
+mod native_video_fault_tests {
+    use super::*;
+
+    #[test]
+    fn native_video_panic_payload_preserves_str_string_and_handles_other_payloads() {
+        assert_eq!(
+            native_video_panic_detail(&"borrowed panic detail"),
+            "borrowed panic detail"
+        );
+        assert_eq!(
+            native_video_panic_detail(&String::from("owned panic detail")),
+            "owned panic detail"
+        );
+        assert_eq!(
+            native_video_panic_detail(&42_u32),
+            "non-string panic payload"
+        );
+    }
+
+    #[test]
+    fn native_video_swap_reuse_requires_live_unfaulted_output_and_survives_error_take() {
+        let output = NativeVideoOutput::disconnected_for_test();
+        assert!(output.reusable_for_swap());
+        output.mark_faulted_for_test();
+        *output.init_error.lock().unwrap() = Some(NATIVE_VIDEO_FAULT_MESSAGE.to_string());
+        assert!(!output.is_closed());
+        assert!(!output.reusable_for_swap());
+        assert_eq!(
+            output.take_init_error().as_deref(),
+            Some(NATIVE_VIDEO_FAULT_MESSAGE)
+        );
+        assert!(output.take_init_error().is_none());
+        assert!(output.faulted.load(Ordering::Acquire));
+        assert!(!output.reusable_for_swap());
+
+        let closed = NativeVideoOutput::disconnected_for_test();
+        closed.mark_closed_for_test();
+        assert!(!closed.faulted.load(Ordering::Acquire));
+        assert!(!closed.reusable_for_swap());
+        assert!(closed.take_init_error().is_none());
+    }
+
+    #[test]
+    fn native_video_fault_message_contains_no_internal_fault_detail() {
+        for internal in ["native", "render", "panic", "quarantin", "thread"] {
+            assert!(!NATIVE_VIDEO_FAULT_MESSAGE.contains(internal));
+        }
+        assert!(NATIVE_VIDEO_FAULT_MESSAGE.contains("もう一度開く"));
+        assert!(NATIVE_VIDEO_FAULT_MESSAGE.contains("再起動"));
+    }
+}
+
+#[cfg(windows)]
 pub(crate) struct NativeVideoOutput {
     #[cfg(feature = "test-script")]
     ui_smoke_output_id: native_ui_smoke::NativeUiSmokeOutputId,
@@ -2581,6 +2784,9 @@ pub(crate) struct NativeVideoOutput {
     hud_hwnd: Arc<AtomicU64>,
     first_presented: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
+    /// Output-lifetime latch: faults forbid source reuse before shutdown publishes closed.
+    /// Taking the one-shot init_error never clears this flag.
+    faulted: Arc<AtomicBool>,
     /// Inc 7 hidden presenter: pump の typed `WindowHostState` が所有する実際の可視状態を
     /// output lifetime で公開する projection。render の consume policy と App
     /// (`exit_video_audio_mode` の async 待ち) は同じ値を読み、source switch では交換しない。
@@ -2696,6 +2902,7 @@ impl NativeVideoOutput {
             hud_hwnd: Arc::new(AtomicU64::new(0)),
             first_presented: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
+            faulted: Arc::new(AtomicBool::new(false)),
             presenter_visibility: NativePresenterVisibility::new(
                 NativeVideoInitialVisibility::Visible,
             ),
@@ -2725,6 +2932,16 @@ impl NativeVideoOutput {
         self.closed.store(true, Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub(crate) fn mark_faulted_for_test(&self) {
+        self.faulted.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn identity_for_test(&self) -> usize {
+        Arc::as_ptr(&self.faulted) as usize
+    }
+
     fn spawn(
         video_rx: crossbeam_channel::Receiver<VideoFrame>,
         clock: Arc<AvClock>,
@@ -2743,6 +2960,7 @@ impl NativeVideoOutput {
         let hud_hwnd = Arc::new(AtomicU64::new(0));
         let first_presented = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(AtomicBool::new(false));
+        let faulted = Arc::new(AtomicBool::new(false));
         let presenter_visibility = NativePresenterVisibility::new(config.initial_visibility);
         let perf_overlay_visible = Arc::new(AtomicBool::new(config.perf_overlay_visible));
         let source_epoch = Arc::new(AtomicU64::new(0));
@@ -2770,6 +2988,7 @@ impl NativeVideoOutput {
         let thread_first_presented = Arc::clone(&first_presented);
         let thread_perf_overlay_visible = Arc::clone(&perf_overlay_visible);
         let thread_init_error = Arc::clone(&init_error);
+        let thread_faulted = Arc::clone(&faulted);
         let thread_presenter_visibility = presenter_visibility.clone();
         let thread_health = Arc::clone(&health);
         let pump = match native_window_pump::spawn_native_window_pump(
@@ -2779,6 +2998,7 @@ impl NativeVideoOutput {
                 hwnd_out: Arc::clone(&hwnd),
                 hud_hwnd_out: Arc::clone(&hud_hwnd),
                 closed: Arc::clone(&closed),
+                faulted: Arc::clone(&faulted),
                 presenter_visibility: presenter_visibility.clone(),
                 source_epoch: Arc::clone(&source_epoch),
                 ui_event_tx: event_tx.clone(),
@@ -2830,15 +3050,24 @@ impl NativeVideoOutput {
                 }));
                 let error = match result {
                     Ok(Ok(())) => return,
-                    Ok(Err(err)) => err,
-                    Err(_) => "native video render thread panicked".to_string(),
+                    Ok(Err(err)) => {
+                        thread_faulted.store(true, Ordering::Release);
+                        err
+                    }
+                    Err(payload) => {
+                        thread_faulted.store(true, Ordering::Release);
+                        format!(
+                            "native video render thread panicked: {}",
+                            native_video_panic_detail(payload.as_ref())
+                        )
+                    }
                 };
                 {
                     let err = error;
                     crate::logger::log(format!("[native-video] presenter stopped: {err}"));
                     if let Ok(mut slot) = thread_init_error.lock() {
                         if slot.is_none() {
-                            *slot = Some(format!("native video render fault: {err}"));
+                            *slot = Some(NATIVE_VIDEO_FAULT_MESSAGE.to_string());
                         }
                     }
                     pump_render.render_fault(u64::MAX - 1, err);
@@ -2861,6 +3090,7 @@ impl NativeVideoOutput {
             hud_hwnd,
             first_presented,
             closed,
+            faulted,
             presenter_visibility,
             perf_overlay_visible,
             source_epoch,
@@ -2904,6 +3134,10 @@ impl NativeVideoOutput {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn reusable_for_swap(&self) -> bool {
+        !self.is_closed() && !self.faulted.load(Ordering::Acquire)
     }
 
     /// Hidden presenter lifecycle: presenter ウィンドウ (+ HUD overlay) の表示 / 非表示を
@@ -3051,7 +3285,7 @@ impl NativeVideoOutput {
         if let Some(toast) =
             video_scale_feedback_toast(origin, VideoScaleFeedbackTransition::Requested)
         {
-            self.show_toast(toast, false, None);
+            self.show_toast(toast, false, crate::feedback::FeedbackKind::Info, None);
         }
         let revision = self
             .video_scale_request_revision
@@ -3305,9 +3539,16 @@ impl NativeVideoOutput {
             });
     }
 
-    fn show_toast(&self, text: String, centered: bool, linger: Option<std::time::Duration>) {
+    fn show_toast(
+        &self,
+        text: String,
+        centered: bool,
+        kind: crate::feedback::FeedbackKind,
+        linger: Option<crate::feedback::ResolvedFeedbackTiming>,
+    ) {
         let _ = self.command_tx.send(NativeVideoOutputCommand::ShowToast {
             text,
+            kind,
             centered,
             linger,
         });
@@ -3331,7 +3572,15 @@ impl NativeVideoOutput {
     fn request_hud_raise(&self) {
         let _ = self
             .command_tx
-            .send(NativeVideoOutputCommand::RaiseHudToTop);
+            .send(NativeVideoOutputCommand::RaiseHudToTop {
+                diagnostic: crate::perf::is_enabled().then(|| native_window::NativeRaiseSample {
+                    epoch: self.committed_generation.load(Ordering::Acquire),
+                    observed_us: crate::perf::program_start().map_or(0, |start| {
+                        start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+                    }),
+                    ..Default::default()
+                }),
+            });
     }
 
     pub(crate) fn request_presenter_raise(&self) {
@@ -3722,6 +3971,22 @@ impl HeadlessReadyState {
     }
 }
 
+/// The producer publishes Decoded only after its last enqueue. Read that
+/// publication before testing both consumer-owned and channel-owned queues.
+fn complete_video_output_tail(
+    clock: &AvClock,
+    video_rx: &crossbeam_channel::Receiver<VideoFrame>,
+    queued_frames: usize,
+    frame_in_flight: bool,
+) -> bool {
+    let serial = clock.current_seek_serial();
+    clock.video_decoded_eos(serial)
+        && queued_frames == 0
+        && !frame_in_flight
+        && video_rx.is_empty()
+        && clock.complete_video_tail(serial)
+}
+
 fn run_headless_video_output(
     video_rx: crossbeam_channel::Receiver<VideoFrame>,
     stop: Arc<AtomicBool>,
@@ -3775,6 +4040,9 @@ fn run_headless_video_output(
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+        if complete_video_output_tail(&clock, &video_rx, 0, false) {
+            engine_event_tx.wake_ui();
         }
     }
 
@@ -4287,7 +4555,7 @@ fn show_rejected_video_scale_toast(
 ) {
     if let Some(toast) = video_scale_feedback_toast(origin, VideoScaleFeedbackTransition::Rejected)
     {
-        presenter.show_overlay_toast(toast, false, None);
+        presenter.show_overlay_toast(toast, false, crate::feedback::FeedbackKind::Warning, None);
     }
 }
 
@@ -4601,6 +4869,7 @@ fn send_native_overlay_command(
 ) {
     use crate::video::native_presenter::NativeOverlayCommand as Command;
     let event = match command {
+        Command::SetDeinterlaceMode { mode } => NativeVideoOutputEvent::SetDeinterlaceMode { mode },
         Command::SelectAudioTrack { stream_index } => {
             NativeVideoOutputEvent::SelectAudioTrack { stream_index }
         }
@@ -5220,9 +5489,11 @@ fn run_native_video_output(
             clock.current_seek_serial(),
         ) {
             Ok(outcome) => sync_hud_regions(&window_pump, cur_generation, &presenter, &outcome),
-            Err(err) => crate::logger::log(format!(
-                "[native-video] initial tile overlay render failed: {err}"
-            )),
+            Err(err) => {
+                return Err(format!(
+                    "[native-video] initial tile overlay render failed: {err}"
+                ));
+            }
         }
     }
     // Publish the native window as soon as the overlay can draw its center status.
@@ -5245,9 +5516,11 @@ fn run_native_video_output(
             clock.current_seek_serial(),
         ) {
             Ok(outcome) => sync_hud_regions(&window_pump, cur_generation, &presenter, &outcome),
-            Err(err) => crate::logger::log(format!(
-                "[native-video] initial preparing overlay render failed: {err}"
-            )),
+            Err(err) => {
+                return Err(format!(
+                    "[native-video] initial preparing overlay render failed: {err}"
+                ));
+            }
         }
     }
     window_pump.target_ready(
@@ -5453,6 +5726,12 @@ fn run_native_video_output(
             }
         }
         let now = Instant::now();
+        presenter.diagnostic_boundary(
+            now,
+            source.source_epoch,
+            source.clock.is_playing(),
+            presenter_visibility.is_hidden(),
+        );
         if crate::perf::is_enabled() {
             if now.duration_since(last_vram_trace) >= Duration::from_secs(1) {
                 emit_native_vram_trace(
@@ -5581,6 +5860,7 @@ fn run_native_video_output(
         // `deferred_transition_commands` は「次の frame へ送る分」専用に残す。
         let mut pending_commands: std::collections::VecDeque<_> =
             std::mem::take(&mut deferred_transition_commands);
+        command_rx.publish_raise_diagnostics(window_pump);
         pending_commands.extend(command_rx.drain());
         while let Some(command) = pending_commands.pop_front() {
             match command {
@@ -5909,10 +6189,11 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::ShowToast {
                     text,
+                    kind,
                     centered,
                     linger,
                 } => {
-                    presenter.show_overlay_toast(text, centered, linger);
+                    presenter.show_overlay_toast(text, centered, kind, linger);
                 }
                 NativeVideoOutputCommand::SetTileOverlay { tile_overlay } => {
                     presenter.set_overlay_tile_overlay(tile_overlay);
@@ -5959,8 +6240,8 @@ fn run_native_video_output(
                 NativeVideoOutputCommand::SetNormalizeOverlayState { state } => {
                     presenter.set_overlay_normalize_state(state);
                 }
-                NativeVideoOutputCommand::RaiseHudToTop => {
-                    window_pump.raise_hud(cur_generation)?;
+                NativeVideoOutputCommand::RaiseHudToTop { diagnostic } => {
+                    window_pump.raise_hud_from_upstream(cur_generation, diagnostic)?;
                 }
                 NativeVideoOutputCommand::RaisePresenterToFront => {
                     window_pump.raise_presenter(cur_generation)?;
@@ -6092,6 +6373,12 @@ fn run_native_video_output(
                     let show_preparing_overlay = payload.show_preparing_overlay;
                     cur_fallback_file_name = payload.fallback_file_name.clone();
                     source = PresenterSourceState::new(*payload);
+                    presenter.diagnostic_boundary(
+                        now,
+                        source.source_epoch,
+                        source.clock.is_playing(),
+                        presenter_visibility.is_hidden(),
+                    );
                     health.record_source_generation(source.source_epoch);
                     emit_native_vram_trace(
                         "switch_source_attached",
@@ -6260,9 +6547,11 @@ fn run_native_video_output(
                                     desired_scale_apply_due = true;
                                 }
                             }
-                            Err(err) => crate::logger::log(format!(
-                                "[native-video] same placement resize failed: {err}"
-                            )),
+                            Err(err) => {
+                                return Err(format!(
+                                    "[native-video] same placement resize failed: {err}"
+                                ));
+                            }
                         }
                         if visible && presenter_visibility.is_hidden() {
                             if frame_output.is_hidden() && source.video_scale_state.has_desired() {
@@ -6789,9 +7078,11 @@ fn run_native_video_output(
                             desired_scale_apply_due = true;
                         }
                     }
-                    Err(err) => crate::logger::log(format!(
-                        "[native-video] GeometryChanged resize_to({w}x{h}) failed: {err}"
-                    )),
+                    Err(err) => {
+                        return Err(format!(
+                            "[native-video] GeometryChanged resize_to({w}x{h}) failed: {err}"
+                        ));
+                    }
                 },
                 NEvt::DpiChanged {
                     dpi,
@@ -6822,9 +7113,11 @@ fn run_native_video_output(
                                 debug_description: None,
                             },
                         ),
-                        Err(err) => crate::logger::log(format!(
-                            "[native-video] DpiChanged overlay resize failed: {err}"
-                        )),
+                        Err(err) => {
+                            return Err(format!(
+                                "[native-video] DpiChanged overlay resize failed: {err}"
+                            ));
+                        }
                     }
                 }
                 _ => {}
@@ -6862,7 +7155,7 @@ fn run_native_video_output(
             let raise_needed =
                 presenter.cursor_polling_tick(last_native_mouse_at, &mut pointer_present_synthetic);
             if raise_needed {
-                window_pump.raise_hud(cur_generation)?;
+                window_pump.raise_hud(cur_generation, native_window_pump::HudRaiseOrigin::Hover)?;
             }
         }
         if !native_events.is_empty() {
@@ -6940,6 +7233,13 @@ fn run_native_video_output(
                         let _ = command_index;
                         let event_epoch = source.source_epoch;
                         match command {
+                            crate::video::native_presenter::NativeOverlayCommand::SetDeinterlaceMode { mode } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetDeinterlaceMode { mode },
+                                );
+                            }
                             crate::video::native_presenter::NativeOverlayCommand::SelectAudioTrack { stream_index } => {
                                 send_native_output_event(
                                     &ui_event_tx,
@@ -7687,7 +7987,7 @@ fn run_native_video_output(
                             );
                         }
                     }
-                    None
+                    return Err(err);
                 }
             };
             let overlay_routing = overlay_outcome
@@ -7842,7 +8142,7 @@ fn run_native_video_output(
                     }
                 }
                 Err(err) => {
-                    crate::logger::log(format!("[native-video] overlay tick render failed: {err}"));
+                    return Err(format!("[native-video] overlay tick render failed: {err}"));
                 }
             }
             last_overlay_tick = Instant::now();
@@ -7912,6 +8212,9 @@ fn run_native_video_output(
             debug_assert!(presenter_hidden);
             debug_assert!(source.queue.is_empty());
             source.queue.push_back(frame);
+        }
+        if complete_video_output_tail(&source.clock, &source.video_rx, source.queue.len(), false) {
+            source.engine_event_tx.wake_ui();
         }
 
         // 音声のみ native シェル (Inc 6 ②-1): 待つべき映像 first frame が存在しないので
@@ -8133,7 +8436,16 @@ fn run_native_video_output(
                     source.clock.clear_seek_target_override(serial);
                 }
                 // 最新フレームを typed Hidden state が 1 枚だけ所有する。
+                presenter.diagnostic_hidden_hold(&frame, source.source_epoch);
                 frame_output.hold_hidden(frame);
+                if complete_video_output_tail(
+                    &source.clock,
+                    &source.video_rx,
+                    source.queue.len(),
+                    false,
+                ) {
+                    source.engine_event_tx.wake_ui();
+                }
                 continue;
             }
             let (present_result, present_t0) = match desired_scale_present {
@@ -8467,6 +8779,9 @@ fn run_native_video_output(
             // 即起床し、presenter ループが素早く WM を処理できるようにする。
             std::thread::sleep(Duration::from_millis(wait_ms));
         }
+        if complete_video_output_tail(&source.clock, &source.video_rx, source.queue.len(), false) {
+            source.engine_event_tx.wake_ui();
+        }
     }
 
     frame_output.clear_current();
@@ -8666,6 +8981,51 @@ fn eof_freeze_position(known_duration_secs: Option<f64>, current_secs: f64) -> f
 }
 
 impl VideoPlayer {
+    #[cfg(all(test, windows))]
+    pub(crate) fn with_disconnected_opens_for_test<T>(f: impl FnOnce() -> T) -> (T, Vec<bool>) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                DISCONNECTED_VIDEO_OPENS.with(|opens| *opens.borrow_mut() = None);
+            }
+        }
+        DISCONNECTED_VIDEO_OPENS.with(|opens| {
+            assert!(opens.borrow().is_none(), "nested disconnected open scope");
+            *opens.borrow_mut() = Some(Vec::new());
+        });
+        let _reset = Reset;
+        let result = f();
+        let opens = DISCONNECTED_VIDEO_OPENS.with(|opens| opens.borrow_mut().take().unwrap());
+        (result, opens)
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn mark_native_presenter_closed_for_test(&self) {
+        self.native_output
+            .as_ref()
+            .expect("fixture native output")
+            .mark_closed_for_test();
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn mark_native_output_faulted_for_test(&self) {
+        self.native_output
+            .as_ref()
+            .expect("fixture native output")
+            .mark_faulted_for_test();
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn native_output_identity_for_test(&self) -> Option<usize> {
+        self.native_output
+            .as_ref()
+            .map(NativeVideoOutput::identity_for_test)
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn native_output_lifetime_for_test(&self) -> std::sync::Weak<AtomicBool> {
+        Arc::downgrade(&self.native_output.as_ref().expect("fixture output").faulted)
+    }
     /// ParkedLive teardown の resume 保存テスト用。worker / native HWND を起動しない。
     #[cfg(test)]
     pub(crate) fn disconnected_for_test(path: PathBuf, position_secs: f64) -> Self {
@@ -8687,6 +9047,9 @@ impl VideoPlayer {
         let engine_event_tx = EngineEventSender::new(raw_engine_event_tx, Arc::clone(&ui_wake));
         Self {
             media_identity: NEXT_MEDIA_IDENTITY.fetch_add(1, Ordering::Relaxed),
+            deinterlace_control: Arc::new(DeinterlaceControl::new(
+                crate::settings::VideoDeinterlaceMode::Auto,
+            )),
             path,
             ui_wake,
             clock,
@@ -8789,7 +9152,6 @@ impl VideoPlayer {
             has_video: true,
             hw_decode_active: false,
             gpu_path_active: false,
-            effective_deinterlace_mode: crate::settings::VideoDeinterlaceMode::Off,
             dynamic: Arc::new(crate::video::decoder::VideoDynamicState::default()),
             title: None,
             album: None,
@@ -8947,6 +9309,25 @@ impl VideoPlayer {
         });
     }
 
+    #[cfg(test)]
+    pub(crate) fn complete_seek_for_test(&self, target_secs: f64) {
+        let mut actor = self.engine.lock().unwrap();
+        let epoch = actor.current_seek_epoch();
+        actor.handle_decoder_event(engine::state::DecoderEvent::SeekCompleted {
+            epoch,
+            actual_pts: target_secs,
+        });
+        actor.handle_decoder_event(engine::state::DecoderEvent::FirstFrameReady {
+            epoch,
+            pts: target_secs,
+        });
+        actor.handle_audio_event(engine::state::AudioEvent::BufferReady {
+            epoch,
+            pts: target_secs,
+            wall_now: std::time::Instant::now(),
+        });
+    }
+
     #[cfg(all(test, windows))]
     pub(crate) fn configure_native_timing_for_test(
         &mut self,
@@ -9027,6 +9408,8 @@ impl VideoPlayer {
         self.clock.note_audio_decoded_eos(serial);
         self.clock.begin_audio_tail(serial);
         self.clock.complete_audio_tail(serial);
+        self.clock.note_video_decoded_eos(serial);
+        self.clock.complete_video_tail(serial);
     }
 
     #[cfg(all(test, windows))]
@@ -9124,6 +9507,24 @@ impl VideoPlayer {
             VideoOutputConsumer::Presentation => native_output_config,
             VideoOutputConsumer::RemoteHeadless => None,
         };
+        #[cfg(all(test, windows))]
+        if DISCONNECTED_VIDEO_OPENS.with(|opens| {
+            let mut opens = opens.borrow_mut();
+            if let Some(opens) = opens.as_mut() {
+                opens.push(native_output_config.is_some());
+                true
+            } else {
+                false
+            }
+        }) {
+            let mut player = Self::stream_ready_disconnected_for_test(path);
+            player.deinterlace_control = Arc::new(DeinterlaceControl::new(deinterlace));
+            if native_output_config.is_none() {
+                player.native_output = None;
+            }
+            return player;
+        }
+        let deinterlace_control = Arc::new(DeinterlaceControl::new(deinterlace));
         // FFmpeg DLL ロード (1 回目のみ実時間の I/O。以降は OnceLock で即返り)
         if let Err(e) = ffmpeg_loader::init() {
             // open 失敗時の dummy engine (Idle のまま)。実 decoder は起きないので、
@@ -9155,6 +9556,7 @@ impl VideoPlayer {
                 Arc::new(AtomicU8::new(crate::video::engine::actor::state_code::IDLE));
             return Self {
                 media_identity: NEXT_MEDIA_IDENTITY.fetch_add(1, Ordering::Relaxed),
+                deinterlace_control,
                 path,
                 ui_wake,
                 clock: dummy_clock,
@@ -9290,7 +9692,7 @@ impl VideoPlayer {
             cancel.clone(),
             target_rate,
             hw_decode,
-            deinterlace,
+            Arc::clone(&deinterlace_control),
             #[cfg(windows)]
             gpu_video_device,
             engine_state_handle.clone(),
@@ -9421,6 +9823,7 @@ impl VideoPlayer {
 
         let mut player = Self {
             media_identity: NEXT_MEDIA_IDENTITY.fetch_add(1, Ordering::Relaxed),
+            deinterlace_control,
             path,
             ui_wake,
             clock,
@@ -9749,11 +10152,14 @@ impl VideoPlayer {
         self.media_identity
     }
 
-    /// Pause, seek, buffering, and an enabled loop keep the current snapshot.
+    /// Lifetime termination only. App's EOF policy owner decides whether EOF is final:
+    /// continuous navigation can still be resolving a same-source loop asynchronously.
     pub(crate) fn local_now_playing_finished(&self) -> bool {
-        self.cancel.load(Ordering::Acquire)
-            || self.error.is_some()
-            || (self.is_at_eof() && !self.loop_enabled.load(Ordering::Acquire))
+        self.cancel.load(Ordering::Acquire) || self.error.is_some()
+    }
+
+    pub(crate) fn is_at_non_loop_eof(&self) -> bool {
+        self.is_at_eof() && !self.loop_enabled.load(Ordering::Acquire)
     }
 
     pub fn info(&self) -> Option<&VideoInfo> {
@@ -9862,40 +10268,13 @@ impl VideoPlayer {
             }
             AudioTrackRequestOutcome::Accepted => {}
         }
-        // The DSP handoff deliberately pauses the engine. Keep the original play
-        // request when a track switch supersedes that handoff.
-        let should_play = self.intent_playing() || {
-            #[cfg(windows)]
-            {
-                !matches!(
-                    &*self.dsp_handoff.lock().unwrap(),
-                    LocalDspAcquisition::Idle
-                )
-            }
-            #[cfg(not(windows))]
-            {
-                false
-            }
-        };
         if self.engine_state_code() == engine::actor::state_code::EOF {
             return AudioTrackSelectResult {
                 outcome: AudioTrackSelectOutcome::Deferred,
                 normalize_unresolved: self.clock.normalize_gain_for_stream(stream_index).is_none(),
             };
         }
-        let mut base = self.audio_track_seek_base_secs();
-        #[cfg(windows)]
-        {
-            let handoff = self.dsp_handoff.lock().unwrap();
-            let requested = match &*handoff {
-                LocalDspAcquisition::AwaitingMetadata(position) => Some(*position),
-                LocalDspAcquisition::Waiting(pending) => Some(pending.requested_position),
-                LocalDspAcquisition::Idle => None,
-            };
-            if let Some(requested) = requested {
-                base = requested.resolve(self.position());
-            }
-        }
+        let (base, should_play) = self.configuration_seek_position_and_intent();
         let track = self.info.as_ref().and_then(|info| {
             info.audio_tracks
                 .iter()
@@ -9909,11 +10288,40 @@ impl VideoPlayer {
                 normalize_unresolved: self.clock.normalize_gain_for_stream(stream_index).is_none(),
             };
         }
-        self.seek_with_play_state(base, should_play);
+        self.seek_with_play_state(
+            base,
+            should_play,
+            SeekOrigin::Internal(InternalContinuation::AudioTrack),
+        );
         AudioTrackSelectResult {
             outcome: AudioTrackSelectOutcome::Requested,
             normalize_unresolved: self.clock.normalize_gain_for_stream(stream_index).is_none(),
         }
+    }
+
+    pub fn deinterlace_mode(&self) -> crate::settings::VideoDeinterlaceMode {
+        self.deinterlace_control.mode()
+    }
+
+    pub fn deinterlace_manual(&self) -> bool {
+        self.deinterlace_mode() != self.deinterlace_control.opened
+    }
+
+    /// Refresh the same position through the normal seek owner without changing play intent.
+    /// EOF only changes the value: replay must retain its existing restart-at-zero behavior.
+    pub fn set_deinterlace_mode(&self, mode: crate::settings::VideoDeinterlaceMode) -> bool {
+        if !self.deinterlace_control.set(mode) {
+            return false;
+        }
+        if self.engine_state_code() != engine::actor::state_code::EOF {
+            let (position, should_play) = self.configuration_seek_position_and_intent();
+            self.seek_with_play_state(
+                position,
+                should_play,
+                SeekOrigin::Internal(InternalContinuation::Seek),
+            );
+        }
+        true
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -10042,7 +10450,11 @@ impl VideoPlayer {
                 // seek again for a worker that cannot be started.
                 audio.note_dsp_activation_handled();
                 crate::logger::log(format!("local DSP handoff start failed: {error}"));
-                self.seek_with_play_state(position_secs, false);
+                self.seek_with_play_state(
+                    position_secs,
+                    false,
+                    SeekOrigin::Internal(InternalContinuation::Dsp),
+                );
                 if audio.local_dry_resume_allowed() {
                     self.engine
                         .lock()
@@ -10095,7 +10507,11 @@ impl VideoPlayer {
             if !self.begin_dsp_acquisition(position) {
                 // Pausing for metadata cleared autoplay intent. A failed acquisition
                 // must restore that intent and the requested position for dry playback.
-                self.seek_with_play_state(position.resolve(self.position()), false);
+                self.seek_with_play_state(
+                    position.resolve(self.position()),
+                    false,
+                    SeekOrigin::Internal(InternalContinuation::Dsp),
+                );
                 if self
                     .audio
                     .as_ref()
@@ -10144,7 +10560,11 @@ impl VideoPlayer {
                 && coordinator.is_latest_request(request))
         {
             if coordinator.local_dry_resume_allowed() {
-                self.seek_with_play_state(requested_position_secs, false);
+                self.seek_with_play_state(
+                    requested_position_secs,
+                    false,
+                    SeekOrigin::Internal(InternalContinuation::Dsp),
+                );
                 self.engine
                     .lock()
                     .unwrap()
@@ -10154,7 +10574,11 @@ impl VideoPlayer {
         }
         match result {
             audio::LocalDspHandoffResult::Ready(handoff) => {
-                self.seek_with_play_state(requested_position_secs, false);
+                self.seek_with_play_state(
+                    requested_position_secs,
+                    false,
+                    SeekOrigin::Internal(InternalContinuation::Dsp),
+                );
                 if handoff.grant() {
                     self.engine
                         .lock()
@@ -10171,7 +10595,11 @@ impl VideoPlayer {
                 if matches!(result, audio::LocalDspHandoffResult::TimedOut) {
                     crate::logger::log("local DSP handoff timeout; resuming without DSP");
                 }
-                self.seek_with_play_state(requested_position_secs, false);
+                self.seek_with_play_state(
+                    requested_position_secs,
+                    false,
+                    SeekOrigin::Internal(InternalContinuation::Dsp),
+                );
                 coordinator.cancel(request);
                 if coordinator.local_dry_resume_allowed() {
                     self.engine
@@ -10418,10 +10846,32 @@ impl VideoPlayer {
             .unwrap_or_else(|| self.position())
     }
 
+    /// A configuration seek supersedes a DSP handoff while preserving its original
+    /// play request and position. The engine is deliberately paused during handoff,
+    /// so its autoplay intent and the last displayed frame are not the request owner.
+    fn configuration_seek_position_and_intent(&self) -> (f64, bool) {
+        let should_play = self.intent_playing();
+        #[cfg(windows)]
+        {
+            let requested = {
+                let handoff = self.dsp_handoff.lock().unwrap();
+                match &*handoff {
+                    LocalDspAcquisition::AwaitingMetadata(position) => Some(*position),
+                    LocalDspAcquisition::Waiting(pending) => Some(pending.requested_position),
+                    LocalDspAcquisition::Idle => None,
+                }
+            };
+            if let Some(requested) = requested {
+                return (requested.resolve(self.position()), true);
+            }
+        }
+        (self.configuration_seek_base_secs(), should_play)
+    }
+
     /// The seek target wins only while it has not produced a displayed frame.
     /// Otherwise use the last real frame, including during demux EOF drain:
     /// the clock can already be beyond the last decodable video frame then.
-    fn audio_track_seek_base_secs(&self) -> f64 {
+    fn configuration_seek_base_secs(&self) -> f64 {
         if self.is_frame_step_active() {
             return self
                 .last_displayed_pts_secs()
@@ -10545,7 +10995,8 @@ impl VideoPlayer {
     /// target は `[0, duration - 0.1s)` にクランプされる。
     /// 一時停止中なら自動的に再生再開する (post-EOF / pause からの seek を
     /// ユーザー操作 1 回で完結させる)。
-    pub fn seek(&self, target_secs: f64) {
+    pub fn seek(&self, target_secs: f64, origin: SeekOrigin) {
+        self.register_seek_playback_start(origin);
         self.clear_frame_step_target();
         let clamped = self.clamp_seek_target(target_secs);
         #[cfg(windows)]
@@ -10576,7 +11027,10 @@ impl VideoPlayer {
 
     /// シークストリップの確定用。シーク前の再生意図を保ったまま、coalescing を挟まず
     /// 指定位置への 1 回の precise seek を発行する。
-    pub fn seek_with_play_state(&self, target_secs: f64, should_play: bool) {
+    pub fn seek_with_play_state(&self, target_secs: f64, should_play: bool, origin: SeekOrigin) {
+        if should_play {
+            self.register_seek_playback_start(origin);
+        }
         self.clear_frame_step_target();
         let clamped = self.clamp_seek_target(target_secs);
         #[cfg(windows)]
@@ -10777,7 +11231,7 @@ impl VideoPlayer {
     /// 明示クリアする。直前の相対シークが末尾付近を target にして「シーク中...」
     /// 固着 (= override が通常経路で解除されないまま) になっているケースを、
     /// この境界判定のタイミングで回収して HUD 表示を正常化するため。
-    pub fn seek_relative(&self, delta_secs: f64) -> RelativeSeekOutcome {
+    pub fn seek_relative(&self, delta_secs: f64, origin: SeekOrigin) -> RelativeSeekOutcome {
         self.clear_frame_step_target();
         let cur = self.user_seek_base_secs();
         let raw = (cur + delta_secs).max(0.0);
@@ -10803,6 +11257,7 @@ impl VideoPlayer {
         } else if delta_secs < 0.0 && cur <= SEEK_START_BOUNDARY_TOLERANCE_SECS {
             RelativeSeekOutcome::AtStart
         } else {
+            self.register_seek_playback_start(origin);
             self.request_user_seek(target);
             return RelativeSeekOutcome::Seeked;
         };
@@ -10833,6 +11288,14 @@ impl VideoPlayer {
                 .clear_seek_target_override(self.clock.current_seek_serial());
         }
         outcome
+    }
+
+    /// Same eligibility as toggle_play, before DSP/normalization can pause or seek the actor.
+    /// The actor owns the final decision (including an already-pending autoplay start).
+    fn register_seek_playback_start(&self, origin: SeekOrigin) {
+        if origin == SeekOrigin::User && (self.is_at_eof() || !self.intent_playing()) {
+            self.register_playback_start(PlaybackStartOrigin::UserPlay);
+        }
     }
 
     /// フレーム送り用の精密シーク。到着後は必ず一時停止状態に保つ。
@@ -11341,6 +11804,14 @@ impl VideoPlayer {
             .map(NativeVideoOutput::committed_generation)
     }
 
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn reusable_for_swap(&self) -> bool {
+        self.native_output
+            .as_ref()
+            .is_some_and(NativeVideoOutput::reusable_for_swap)
+    }
+
     /// `PlacementSwitched` 受信時に committed 世代を進める (単調非減少)。
     #[cfg(windows)]
     #[allow(dead_code)]
@@ -11822,17 +12293,18 @@ impl VideoPlayer {
         }
     }
 
-    /// native overlay にトーストを表示する。`linger` が `Some` のときその時間だけ
-    /// 表示を維持し、`None` のとき presenter が `centered` から既定値を導く。
+    /// Send resolved native lifetime/fade, or let native-origin notices resolve the default.
+    /// A resolved payload is never scaled again by the presenter.
     #[cfg(windows)]
-    pub fn show_native_overlay_toast(
+    pub(crate) fn show_native_overlay_toast(
         &self,
         text: String,
         centered: bool,
-        linger: Option<std::time::Duration>,
+        kind: crate::feedback::FeedbackKind,
+        linger: Option<crate::feedback::ResolvedFeedbackTiming>,
     ) {
         if let Some(output) = self.native_output.as_ref() {
-            output.show_toast(text, centered, linger);
+            output.show_toast(text, centered, kind, linger);
         }
     }
 
@@ -11922,7 +12394,12 @@ impl VideoPlayer {
                         ) {
                             // info_rx は動画を開くごとに 1 回だけ取り込まれる。ここを通知の
                             // 所有境界にして、毎 frame やストリップ操作では繰り返さない。
-                            self.show_native_overlay_toast(notice.to_string(), true, None);
+                            self.show_native_overlay_toast(
+                                notice.to_string(),
+                                true,
+                                crate::feedback::FeedbackKind::Warning,
+                                None,
+                            );
                         }
                         // SAR (= sample aspect ratio) を native presenter に伝える。
                         // anamorphic 動画 (NTSC DVD など) で表示比を補正するために
@@ -12191,6 +12668,8 @@ impl VideoPlayer {
             // drain 完了を待つ)。発火後のアクションだけ loop_enabled で分岐する。
             let loop_enabled = self.loop_enabled.load(std::sync::atomic::Ordering::Acquire);
             let quiet_now = self.clock.is_demux_exhausted()
+                && (!self.info.as_ref().is_some_and(|info| info.has_video)
+                    || self.clock.video_tail_complete())
                 && !self.clock.is_seeking()
                 && self.is_playing()
                 && channels_drained
@@ -12388,6 +12867,19 @@ impl VideoPlayer {
             break;
         }
 
+        // Only the presentation fallback consumes this receiver here. RemoteHeadless
+        // owns the real receiver on its worker; our empty dummy cannot prove its tail.
+        if matches!(&self.video_output, VideoOutputState::Presentation)
+            && complete_video_output_tail(
+                &self.clock,
+                &self.decode.video_rx,
+                self.future_frames.len(),
+                latest_renderable.is_some(),
+            )
+        {
+            self.ui_wake.wake();
+        }
+
         // EOF 処理: clock.is_demux_exhausted() (= decoder が EOF wait に入った)
         // + queue 空 + 今 tick 表示なし + 進行中の seek なし → 本当に最後と判定。
         // 「seek 進行中」は seek_target_override が立っている時。
@@ -12413,6 +12905,8 @@ impl VideoPlayer {
                 && self.audio_rx_len() == 0);
         let seek_in_flight = self.clock.is_seeking();
         let eof_ready_now = self.clock.is_demux_exhausted()
+            && (!self.info.as_ref().is_some_and(|info| info.has_video)
+                || self.clock.video_tail_complete())
             && self.future_frames.is_empty()
             && latest_renderable.is_none()
             && !seek_in_flight
@@ -12971,6 +13465,230 @@ fn dummy_video_rx() -> crossbeam_channel::Receiver<VideoFrame> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn playback_start_user_seek_from_eof_emits_one_new_success_for_each_api() {
+        use super::{PlaybackStartOrigin, SeekOrigin};
+        for route in ["absolute", "relative", "strip"] {
+            let player = playback_start_test_player();
+            player.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+            let first = player.take_playback_success().unwrap();
+            player.mark_eof_for_test(30.0);
+            match route {
+                "absolute" => player.seek(0.0, SeekOrigin::User),
+                "relative" => assert_eq!(
+                    player.seek_relative(-10.0, SeekOrigin::User),
+                    super::RelativeSeekOutcome::Seeked
+                ),
+                "strip" => player.seek_with_play_state(5.0, true, SeekOrigin::User),
+                _ => unreachable!(),
+            }
+            assert!(player.intent_playing());
+            assert!(player.take_playback_success().is_none());
+            player.complete_seek_for_test(player.position());
+            let replay = player.take_playback_success().expect(route);
+            assert_ne!(replay.id, first.id);
+            assert_eq!(replay.origin, PlaybackStartOrigin::UserPlay);
+            player.complete_seek_for_test(player.position());
+            assert!(player.take_playback_success().is_none());
+        }
+    }
+
+    #[test]
+    fn playback_start_seek_preserves_autoplay_and_internal_loop_start() {
+        use super::{InternalContinuation, PlaybackStartOrigin, SeekOrigin};
+        for eof in [false, true] {
+            let player = playback_start_test_player();
+            player.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+            let first = player.take_playback_success().unwrap();
+            if eof {
+                player.mark_eof_for_test(30.0);
+                player.seek(0.0, SeekOrigin::Internal(InternalContinuation::Loop));
+            } else {
+                player.seek(5.0, SeekOrigin::User);
+                // A second user request while autoplay is waiting for seek readiness.
+                assert!(!player.is_playing());
+                assert!(player.intent_playing());
+                player.seek_with_play_state(8.0, true, SeekOrigin::User);
+            }
+            player.complete_seek_for_test(player.position());
+            assert!(player.take_playback_success().is_none());
+            assert!(player.playback_success_is_current(first.id));
+        }
+    }
+
+    #[test]
+    fn playback_start_seek_before_autoplay_readiness_keeps_initial_success() {
+        use super::{PlaybackStartOrigin, SeekOrigin};
+        let player = playback_start_test_player();
+        {
+            let mut actor = player.engine.lock().unwrap();
+            actor.begin_loading();
+            actor.register_playback_start(PlaybackStartOrigin::NewSource);
+            actor.apply_internal_continuation(true, super::InternalContinuation::Transport);
+            actor.handle_decoder_event(super::engine::state::DecoderEvent::InfoReceived {
+                epoch: 0,
+                duration_secs: 30.0,
+                has_audio: false,
+                has_video: true,
+            });
+        }
+        assert!(!player.is_playing());
+        player.seek(5.0, SeekOrigin::User);
+        player.complete_seek_for_test(5.0);
+        assert_eq!(
+            player.take_playback_success().unwrap().origin,
+            PlaybackStartOrigin::NewSource
+        );
+        assert!(player.take_playback_success().is_none());
+    }
+
+    #[test]
+    fn playback_start_user_seek_after_user_pause_is_a_new_play() {
+        use super::{PlaybackStartOrigin, SeekOrigin};
+        let player = playback_start_test_player();
+        player.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+        let first = player.take_playback_success().unwrap();
+        player.set_playing_with_origin(false, PlaybackStartOrigin::UserPlay);
+        player.seek(5.0, SeekOrigin::User);
+        player.complete_seek_for_test(5.0);
+        let next = player.take_playback_success().unwrap();
+        assert_eq!(next.origin, PlaybackStartOrigin::UserPlay);
+        assert_ne!(first.id, next.id);
+    }
+
+    #[test]
+    fn playback_start_user_seek_and_play_during_normalize_preserve_established_start() {
+        use super::{InternalContinuation, PlaybackStartOrigin, SeekOrigin};
+        for route in [
+            "seek",
+            "relative",
+            "with_play_state",
+            "toggle",
+            "explicit_play",
+        ] {
+            let player = playback_start_test_player();
+            player.confirm_playback_start_for_test(PlaybackStartOrigin::UserPlay);
+            let first = player.take_playback_success().unwrap();
+            player.set_playing_internal(false, InternalContinuation::Normalize);
+            assert!(!player.intent_playing());
+            match route {
+                "seek" => player.seek(5.0, SeekOrigin::User),
+                "relative" => {
+                    player.seek_relative(5.0, SeekOrigin::User);
+                }
+                "with_play_state" => player.seek_with_play_state(5.0, true, SeekOrigin::User),
+                "toggle" => player.toggle_play(),
+                "explicit_play" => {
+                    player.set_playing_with_origin(true, PlaybackStartOrigin::UserPlay)
+                }
+                _ => unreachable!(),
+            }
+            player.complete_seek_for_test(5.0);
+            player.set_playing_internal(true, InternalContinuation::Normalize);
+            assert!(player.take_playback_success().is_none(), "{route}");
+            assert!(player.playback_success_is_current(first.id), "{route}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn playback_start_established_dsp_wait_user_seek_has_no_new_success() {
+        use super::{PlaybackStartOrigin, SeekOrigin};
+        for from_eof in [false, true] {
+            let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+                "dsp-established.mp4".into(),
+            );
+            player.confirm_playback_start_for_test(PlaybackStartOrigin::UserPlay);
+            let first = player.take_playback_success().unwrap();
+            if from_eof {
+                player.mark_eof_for_test(30.0);
+            }
+            player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
+                super::audio::AudioDspChain {
+                    user: None,
+                    effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                    coordinator: std::sync::Arc::new(
+                        super::dsp::coordinator::DspProcessingCoordinator::default(),
+                    ),
+                },
+                true,
+            ));
+            // First seek starts acquisition; the second arrives while its internal Pause is active.
+            player.seek(0.0, SeekOrigin::User);
+            assert!(matches!(
+                &*player.dsp_handoff.lock().unwrap(),
+                super::LocalDspAcquisition::Waiting(_)
+            ));
+            assert!(!player.intent_playing());
+            player.seek(5.0, SeekOrigin::User);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !player.audio.as_ref().unwrap().has_dsp_token()
+                && std::time::Instant::now() < deadline
+            {
+                player.poll_dsp_acquisition();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(player.audio.as_ref().unwrap().has_dsp_token());
+            player.complete_seek_for_test(5.0);
+            if from_eof {
+                let replay = player.take_playback_success().unwrap();
+                assert_eq!(replay.origin, PlaybackStartOrigin::UserPlay);
+                assert_ne!(replay.id, first.id);
+            } else {
+                assert!(player.take_playback_success().is_none());
+                assert!(player.playback_success_is_current(first.id));
+            }
+            assert!(player.take_playback_success().is_none());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn playback_start_eof_user_seek_survives_dsp_wait_and_normalize_once() {
+        use super::{InternalContinuation, PlaybackStartOrigin, SeekOrigin};
+        let mut player =
+            super::VideoPlayer::stream_ready_disconnected_for_test("dsp-eof.mp4".into());
+        player.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+        let first = player.take_playback_success().unwrap();
+        player.mark_eof_for_test(30.0);
+        player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
+            super::audio::AudioDspChain {
+                user: None,
+                effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                coordinator: std::sync::Arc::new(
+                    super::dsp::coordinator::DspProcessingCoordinator::default(),
+                ),
+            },
+            true,
+        ));
+        player.seek(4.0, SeekOrigin::User);
+        assert!(matches!(
+            &*player.dsp_handoff.lock().unwrap(),
+            super::LocalDspAcquisition::Waiting(_)
+        ));
+        assert!(player.take_playback_success().is_none());
+        // A newer seek during acquisition must keep the same pending logical start.
+        player.seek(6.0, SeekOrigin::User);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !player.audio.as_ref().unwrap().has_dsp_token()
+            && std::time::Instant::now() < deadline
+        {
+            player.poll_dsp_acquisition();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(player.audio.as_ref().unwrap().has_dsp_token());
+        player.set_playing_internal(false, InternalContinuation::Normalize);
+        player.complete_seek_for_test(6.0);
+        assert!(player.take_playback_success().is_none());
+        player.set_playing_internal(true, InternalContinuation::Normalize);
+        let replay = player.take_playback_success().unwrap();
+        assert_eq!(replay.origin, PlaybackStartOrigin::UserPlay);
+        assert_ne!(first.id, replay.id);
+        player.set_playing_internal(false, InternalContinuation::Normalize);
+        player.set_playing_internal(true, InternalContinuation::Normalize);
+        assert!(player.take_playback_success().is_none());
+    }
+
     fn playback_start_test_player() -> super::VideoPlayer {
         use crate::effetune::gui_gate::{AutoSuppression, GuiGate};
         let player = super::VideoPlayer::disconnected_for_test("logical-start.mp4".into(), 0.0);
@@ -13074,6 +13792,9 @@ mod tests {
             Arc::clone(&player.decoder_dropped_full_count),
             Arc::clone(&player.dynamic),
         );
+        // A real decoder uses the same presentation ownership as a normal open,
+        // whether the fixture consumes frames in tick or a simulated presenter.
+        player.video_output = super::VideoOutputState::Presentation;
         let info = player
             .decode
             .info_rx
@@ -13352,6 +14073,16 @@ mod tests {
                         }
                     }
                 }
+            }
+            if player.native_output.is_some() {
+                // The simulated presenter shares production's decode/output EOS
+                // boundary, as well as its frame selection and readiness path.
+                super::complete_video_output_tail(
+                    &player.clock,
+                    &player.decode.video_rx,
+                    presenter_frames.len(),
+                    false,
+                );
             }
             // Only production tick creates each Full-loop seek serial. Device time
             // has already advanced, as it would on the independent cpal callback thread.
@@ -13665,6 +14396,88 @@ mod tests {
         assert_eq!(player.current_seek_serial(), 0);
     }
 
+    #[test]
+    fn deinterlace_player_mode_is_transient_and_manual_is_derived() {
+        use crate::settings::VideoDeinterlaceMode::{Auto, Off, On};
+        let player = selection_player(false);
+        let next_player = selection_player(false);
+        assert_eq!(player.deinterlace_mode(), Auto);
+        assert!(!player.deinterlace_manual());
+        assert!(player.set_deinterlace_mode(On));
+        assert_eq!(player.deinterlace_mode(), On);
+        assert!(player.deinterlace_manual());
+        let serial = player.current_seek_serial();
+        assert!(!player.set_deinterlace_mode(On));
+        assert_eq!(player.current_seek_serial(), serial);
+        assert!(player.set_deinterlace_mode(Off));
+        assert!(player.deinterlace_manual());
+        assert!(player.set_deinterlace_mode(Auto));
+        assert!(!player.deinterlace_manual());
+        assert_eq!(next_player.deinterlace_mode(), Auto);
+        assert!(!next_player.deinterlace_manual());
+        for mode in [Auto, On, Off] {
+            let control = super::DeinterlaceControl::new(mode);
+            assert_eq!(control.mode(), mode);
+            assert_eq!(control.opened, mode);
+        }
+    }
+
+    #[test]
+    fn deinterlace_switch_preserves_paused_position_and_frame_step_display() {
+        use crate::settings::VideoDeinterlaceMode::On;
+        let player = selection_player(false);
+        player.set_last_displayed_pts_for_test(5.0);
+        assert!(player.set_deinterlace_mode(On));
+        assert_eq!(player.clock.take_seek_request().unwrap().target_secs, 5.0);
+        assert!(!player.intent_playing());
+        let player = selection_player(false);
+        player.set_last_displayed_pts_for_test(7.0);
+        player.step_frame(1);
+        player.set_last_displayed_pts_for_test(7.2);
+        assert!(player.set_deinterlace_mode(On));
+        assert_eq!(player.clock.take_seek_request().unwrap().target_secs, 7.2);
+        assert!(!player.intent_playing());
+    }
+
+    #[test]
+    fn deinterlace_switch_preserves_pending_seek_and_play_intent_while_seeking() {
+        use crate::settings::VideoDeinterlaceMode::On;
+        for pending in [None, Some(10.0)] {
+            let player = selection_player(true);
+            player.set_last_displayed_pts_for_test(5.0);
+            player.seek_with_play_state(8.0, true, super::SeekOrigin::User);
+            assert!(player.intent_playing());
+            assert!(!player.is_playing());
+            player
+                .user_seek_coalesce
+                .lock()
+                .unwrap()
+                .pending_target_secs = pending;
+            assert!(player.set_deinterlace_mode(On));
+            assert_eq!(
+                player.clock.take_seek_request().unwrap().target_secs,
+                pending.unwrap_or(8.0)
+            );
+            assert!(player.intent_playing());
+        }
+    }
+
+    #[test]
+    fn deinterlace_switch_at_eof_only_updates_mode_then_replay_starts_at_zero() {
+        use crate::settings::VideoDeinterlaceMode::On;
+        let player = selection_player(false);
+        player.mark_eof_for_test(30.0);
+        let serial = player.current_seek_serial();
+        assert!(player.set_deinterlace_mode(On));
+        assert_eq!(player.current_seek_serial(), serial);
+        assert!(player.clock.take_seek_request().is_none());
+        assert!(player.is_at_eof());
+        assert_eq!(player.deinterlace_mode(), On);
+        assert!(player.deinterlace_manual());
+        player.set_playing(true);
+        assert_eq!(player.clock.take_seek_request().unwrap().target_secs, 0.0);
+    }
+
     fn selection_player(playing: bool) -> super::VideoPlayer {
         use super::engine::state::{AudioEvent, DecoderEvent};
         let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
@@ -13742,6 +14555,8 @@ mod tests {
             #[cfg(not(windows))]
             std::sync::Arc::new(super::decoder::VideoDynamicState::default()),
         );
+        // tick (or the fixture's simulated presenter) consumes this real receiver.
+        player.video_output = super::VideoOutputState::Presentation;
         let info = player
             .decode
             .info_rx
@@ -13932,6 +14747,94 @@ mod tests {
         assert!((player.position() - 4.0).abs() < 0.001);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn deinterlace_switch_during_dsp_handoff_keeps_play_request_and_requested_position() {
+        use crate::video::audio::AudioDspChain;
+        use crate::video::dsp::coordinator::{DspOwner, DspProcessingCoordinator};
+
+        let coordinator = std::sync::Arc::new(DspProcessingCoordinator::default());
+        let remote = coordinator
+            .reserve(DspOwner::Remote {
+                session: 42,
+                generation: 1,
+            })
+            .unwrap();
+        assert!(
+            coordinator
+                .wait_handoff(
+                    remote,
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    &std::sync::atomic::AtomicBool::new(false),
+                )
+                .unwrap()
+                .grant()
+        );
+        let mut player = selection_player(true);
+        player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
+            AudioDspChain {
+                user: None,
+                effetune: std::sync::Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                coordinator: std::sync::Arc::clone(&coordinator),
+            },
+            true,
+        ));
+        player.set_last_displayed_pts_for_test(1.0);
+        assert!(player.begin_dsp_acquisition(super::LocalDspPosition::Exact(4.0)));
+        assert!(!player.intent_playing());
+        assert!(player.set_deinterlace_mode(crate::settings::VideoDeinterlaceMode::On));
+        assert_eq!(
+            player.deinterlace_mode(),
+            crate::settings::VideoDeinterlaceMode::On
+        );
+        assert!(player.deinterlace_manual());
+        {
+            let handoff = player.dsp_handoff.lock().unwrap();
+            let super::LocalDspAcquisition::Waiting(pending) = &*handoff else {
+                panic!("deinterlace switch cancelled the original play request");
+            };
+            assert_eq!(pending.requested_position.resolve(0.0), 4.0);
+        }
+        assert!(matches!(
+            &*player.dsp_handoff.lock().unwrap(),
+            super::LocalDspAcquisition::Waiting(_)
+        ));
+        assert_eq!(
+            player.current_seek_serial(),
+            0,
+            "handoff still owns the seek"
+        );
+        coordinator.cancel(remote);
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !player.audio.as_ref().unwrap().has_dsp_token()
+            && std::time::Instant::now() < deadline
+        {
+            player.tick(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(player.audio.as_ref().unwrap().has_dsp_token());
+        assert!(player.current_seek_serial() > 0);
+        assert!(player.intent_playing());
+        assert!((player.position() - 4.0).abs() < 0.001);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn configuration_seek_keeps_dsp_play_request_while_awaiting_metadata() {
+        let player = selection_player(false);
+        player.set_last_displayed_pts_for_test(1.0);
+        *player.dsp_handoff.lock().unwrap() =
+            super::LocalDspAcquisition::AwaitingMetadata(super::LocalDspPosition::Exact(4.0));
+        assert!(!player.intent_playing());
+        assert_eq!(player.configuration_seek_position_and_intent(), (4.0, true));
+        *player.dsp_handoff.lock().unwrap() = super::LocalDspAcquisition::AwaitingMetadata(
+            super::LocalDspPosition::CurrentAfterMetadata,
+        );
+        player.clock.set_paused_position(6.0);
+        assert_eq!(player.configuration_seek_position_and_intent(), (6.0, true));
+    }
+
     #[test]
     fn confirmed_choice_is_harvested_once_but_pending_and_failed_are_not() {
         use super::AudioTrackSelectOutcome as Outcome;
@@ -13990,7 +14893,7 @@ mod tests {
         use super::AudioTrackSelectOutcome as Outcome;
         let player = selection_player(true);
         player.set_last_displayed_pts_for_test(5.0);
-        player.seek(10.0);
+        player.seek(10.0, crate::video::SeekOrigin::User);
         let old_serial = player.clock.current_seek_serial();
         player.clock.clear_seek_target_override(old_serial);
         assert!(!player.clock.is_seeking());
@@ -14003,12 +14906,12 @@ mod tests {
         use super::AudioTrackSelectOutcome as Outcome;
         let player = selection_player(true);
         player.set_last_displayed_pts_for_test(5.0);
-        player.seek(10.0);
+        player.seek(10.0, crate::video::SeekOrigin::User);
         let serial = player.clock.current_seek_serial();
         player.clock.clear_seek_target_override(serial); // normal audio consumption
-        assert!((player.audio_track_seek_base_secs() - 10.0).abs() < 1e-9);
+        assert!((player.configuration_seek_base_secs() - 10.0).abs() < 1e-9);
         player.clock.mark_seek_interrupted(serial); // demux abort/EOF insurance
-        assert!((player.audio_track_seek_base_secs() - 5.0).abs() < 1e-9);
+        assert!((player.configuration_seek_base_secs() - 5.0).abs() < 1e-9);
         assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
         assert!((player.clock.take_seek_request().unwrap().target_secs - 5.0).abs() < 1e-9);
     }
@@ -14018,10 +14921,13 @@ mod tests {
         use super::{AudioTrackSelectOutcome as Outcome, RelativeSeekOutcome};
         let player = selection_player(true);
         player.set_last_displayed_pts_for_test(5.0);
-        player.seek(29.9);
+        player.seek(29.9, crate::video::SeekOrigin::User);
         let serial = player.clock.current_seek_serial();
         player.clock.notify_demux_exhausted();
-        assert_eq!(player.seek_relative(1.0), RelativeSeekOutcome::AtEnd);
+        assert_eq!(
+            player.seek_relative(1.0, crate::video::SeekOrigin::User),
+            RelativeSeekOutcome::AtEnd
+        );
         assert!(player.clock.seek_was_interrupted(serial));
         assert_eq!(player.select_audio_track(2).outcome, Outcome::Requested);
         assert!((player.clock.take_seek_request().unwrap().target_secs - 5.0).abs() < 1e-9);
@@ -14035,14 +14941,14 @@ mod tests {
             player.native_output = None;
         }
         player.set_last_displayed_pts_for_test(5.0);
-        player.seek(29.9);
+        player.seek(29.9, crate::video::SeekOrigin::User);
         let serial = player.clock.current_seek_serial();
         player.clock.notify_demux_exhausted();
         player.seek_eof_stuck_since =
             Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
         player.tick(&egui::Context::default());
         assert!(player.clock.seek_was_interrupted(serial));
-        assert!((player.audio_track_seek_base_secs() - 5.0).abs() < 1e-9);
+        assert!((player.configuration_seek_base_secs() - 5.0).abs() < 1e-9);
     }
 
     #[test]
@@ -14051,7 +14957,7 @@ mod tests {
         let player = selection_player_with_demux_at_eof();
         player.set_last_displayed_pts_for_test(4.0);
         player.clock.fail_next_demux_seek_for_test();
-        player.seek(5.0);
+        player.seek(5.0, crate::video::SeekOrigin::User);
         let aborted_serial = player.clock.current_seek_serial();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !player.clock.seek_was_interrupted(aborted_serial)
@@ -14093,7 +14999,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         let player = selection_player(true);
         player.set_last_displayed_pts_for_test(5.0);
-        player.seek(10.0);
+        player.seek(10.0, crate::video::SeekOrigin::User);
         player.set_last_displayed_pts_for_test(10.1);
         player.displayed_frame_seq.fetch_add(1, Ordering::Release);
         assert!(player.clock.is_seeking());
@@ -14842,6 +15748,7 @@ mod tests {
             epoch,
             generation,
             source: NativeVideoWindowSource::Presenter,
+            raise_diagnostic: None,
             event: NativeVideoWindowEvent::KeyDown(NativeVideoKeyEvent {
                 receipt: crate::mouse_seek_debug::test_receipt(1),
                 virtual_key: 0x7B,
@@ -15120,6 +16027,102 @@ mod tests {
                 },
             ),
             Some("[T: アニメ塗り拡大]\n(再生の余裕を確保するため「標準」で表示します)".to_string())
+        );
+    }
+
+    #[test]
+    fn video_tail_completion_waits_for_decode_channel_queue_and_in_flight_frame() {
+        let clock = super::AvClock::new(
+            1.0,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        assert!(!super::complete_video_output_tail(&clock, &rx, 0, false));
+        tx.send(test_video_frame(0, 1.0)).unwrap();
+        clock.note_video_decoded_eos(0);
+        assert!(!super::complete_video_output_tail(&clock, &rx, 0, false));
+        let frame = rx.try_recv().unwrap();
+        assert!(!super::complete_video_output_tail(&clock, &rx, 1, false));
+        assert!(!super::complete_video_output_tail(&clock, &rx, 0, true));
+        drop(frame);
+        assert!(super::complete_video_output_tail(&clock, &rx, 0, false));
+        assert!(clock.video_tail_complete());
+        clock.request_seek(0.0);
+        assert!(!super::complete_video_output_tail(&clock, &rx, 0, false));
+    }
+
+    #[test]
+    fn headless_video_tail_completes_after_real_consumer_drains_last_frame() {
+        let (tx, _route, _events, clock, displayed) =
+            test_video_output_route(super::VideoOutputConsumer::RemoteHeadless, 2);
+        tx.send(test_video_frame(0, 1.0)).unwrap();
+        clock.note_video_decoded_eos(0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !clock.video_tail_complete() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(clock.video_tail_complete());
+        assert_eq!(displayed.load(std::sync::atomic::Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn headless_video_tail_tick_cannot_ack_while_real_consumer_is_held() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let mut player = super::VideoPlayer::disconnected_for_test("headless-eos.mp4".into(), 0.0);
+        let (video_tx, video_rx) = crossbeam_channel::bounded(1);
+        // Hold the actual headless consumer before it receives the final frame.
+        // Dropping the release sender also unblocks the worker if an assertion fails.
+        let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let clock = Arc::clone(&player.clock);
+        let events = player.engine_event_tx.clone();
+        let displayed = Arc::clone(&player.displayed_frame_seq);
+        let last_pts = Arc::clone(&player.last_displayed_pts_bits);
+        let worker = std::thread::spawn(move || {
+            if release_rx.recv().is_ok() {
+                super::run_headless_video_output(
+                    video_rx,
+                    worker_stop,
+                    Arc::new(AtomicBool::new(false)),
+                    clock,
+                    events,
+                    displayed,
+                    last_pts,
+                );
+            }
+        });
+        player.decode.video_rx = super::dummy_video_rx();
+        player.video_output = super::VideoOutputState::RemoteHeadless(super::HeadlessVideoOutput {
+            stop,
+            worker: Some(worker),
+        });
+        video_tx.send(test_video_frame(0, 1.0)).unwrap();
+        player.clock.note_video_decoded_eos(0);
+
+        player.tick(&egui::Context::default());
+        assert!(player.decode.video_rx.is_empty());
+        assert_eq!(
+            video_tx.len(),
+            1,
+            "real consumer still owns the final frame"
+        );
+        assert_eq!(player.displayed_frame_seq.load(Ordering::Acquire), 0);
+        assert!(!player.clock.video_tail_complete());
+
+        release_tx.send_timeout((), Duration::from_secs(5)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !player.clock.video_tail_complete() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(player.clock.video_tail_complete());
+        assert_eq!(player.displayed_frame_seq.load(Ordering::Acquire), 1);
+        assert_eq!(
+            player.last_displayed_pts_bits.load(Ordering::Acquire),
+            1.0_f64.to_bits()
         );
     }
 
@@ -15673,6 +16676,74 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn hud_raise_command_records_issued_replaced_and_exact_epoch_before_coalesce() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let fault = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = super::native_command_bus_with_diagnostics(4, Arc::clone(&fault), true);
+        for epoch in [7, 8, 8] {
+            tx.send(super::NativeVideoOutputCommand::RaiseHudToTop {
+                diagnostic: Some(super::native_window::NativeRaiseSample {
+                    epoch,
+                    observed_us: epoch * 100,
+                    ..Default::default()
+                }),
+            })
+            .unwrap();
+        }
+        let records: Vec<_> = tx
+            .shared
+            .raise_diagnostics
+            .as_ref()
+            .unwrap()
+            .rx
+            .try_iter()
+            .collect();
+        assert_eq!(records.iter().filter(|(_, replaced)| !replaced).count(), 3);
+        assert_eq!(records.iter().filter(|(_, replaced)| *replaced).count(), 2);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|(_, replaced)| *replaced)
+                .map(|(sample, _)| sample.epoch)
+                .collect::<Vec<_>>(),
+            [7, 8]
+        );
+        let commands = rx.drain();
+        assert_eq!(commands.len(), 1);
+        assert!(
+            matches!(&commands[0],super::NativeVideoOutputCommand::RaiseHudToTop {diagnostic:Some(sample)} if sample.epoch==8 && sample.sequence==3 && sample.observed_us==800)
+        );
+        for _ in 0..300 {
+            tx.send(super::NativeVideoOutputCommand::RaiseHudToTop {
+                diagnostic: Some(Default::default()),
+            })
+            .unwrap();
+        }
+        assert!(
+            tx.shared
+                .raise_diagnostics
+                .as_ref()
+                .unwrap()
+                .dropped
+                .load(Ordering::Relaxed)
+                > 0
+        );
+        assert!(
+            !fault.load(Ordering::Relaxed),
+            "diagnostic loss cannot quarantine a product session"
+        );
+        let (off, _) = super::native_command_bus_with_diagnostics(4, fault, false);
+        assert!(
+            off.shared.raise_diagnostics.is_none(),
+            "OFF must allocate no diagnostic channel"
+        );
+    }
+
+    #[test]
     fn native_command_bus_coalesces_hud_state_and_keeps_actions_lossless() {
         let fault = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tx, rx) = super::native_command_bus(8, std::sync::Arc::clone(&fault));
@@ -15680,6 +16751,7 @@ mod tests {
             .unwrap();
         tx.send(super::NativeVideoOutputCommand::ShowToast {
             text: "first".to_string(),
+            kind: crate::feedback::FeedbackKind::Info,
             centered: false,
             linger: None,
         })
@@ -15688,6 +16760,7 @@ mod tests {
             .unwrap();
         tx.send(super::NativeVideoOutputCommand::ShowToast {
             text: "second".to_string(),
+            kind: crate::feedback::FeedbackKind::Info,
             centered: false,
             linger: None,
         })
@@ -16282,7 +17355,7 @@ mod tests {
         let mut player =
             super::VideoPlayer::disconnected_for_test(std::path::PathBuf::from("stuck.mp4"), 29.0);
         player.configure_native_timing_for_test(29.0, 30.0, true, false);
-        player.seek(29.9);
+        player.seek(29.9, crate::video::SeekOrigin::User);
         player.notify_demux_exhausted_for_test();
 
         let due = player.tick(&egui::Context::default()).unwrap();
@@ -16298,8 +17371,8 @@ mod tests {
             5.0,
         );
         player.configure_native_timing_for_test(5.0, 30.0, true, false);
-        player.seek(10.0);
-        player.seek(12.0);
+        player.seek(10.0, crate::video::SeekOrigin::User);
+        player.seek(12.0, crate::video::SeekOrigin::User);
 
         let due = player.tick(&egui::Context::default()).unwrap();
         assert!(due > std::time::Duration::from_millis(240), "due={due:?}");
@@ -16327,6 +17400,55 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn eos_tick_waits_for_video_decode_and_output_before_loop_or_stop() {
+        for native in [false, true] {
+            for looping in [false, true] {
+                let mut player =
+                    super::VideoPlayer::stream_ready_disconnected_for_test("video-eos.mp4".into());
+                player.configure_native_timing_for_test(30.0, 30.0, true, false);
+                player.info.as_mut().unwrap().has_audio = false;
+                if !native {
+                    player.native_output = None;
+                    player.video_output = super::VideoOutputState::Presentation;
+                }
+                player.set_loop_enabled(looping);
+                let serial = player.current_seek_serial();
+                player.clock.notify_demux_exhausted();
+                let ctx = egui::Context::default();
+                player.backdate_eof_quiet_for_test(std::time::Duration::from_secs(1));
+                player.tick(&ctx);
+                assert!(player.is_playing());
+                assert_eq!(player.current_seek_serial(), serial);
+                assert!(player.eof_loop_quiet_since.is_none());
+                player.clock.note_video_decoded_eos(serial);
+                if native {
+                    // Decoded still does not prove that the native output queue / present finished.
+                    player.backdate_eof_quiet_for_test(std::time::Duration::from_secs(1));
+                    player.tick(&ctx);
+                    assert!(player.is_playing());
+                    assert!(player.eof_loop_quiet_since.is_none());
+                    assert!(super::complete_video_output_tail(
+                        &player.clock,
+                        &player.decode.video_rx,
+                        0,
+                        false
+                    ));
+                }
+                player.tick(&ctx);
+                assert!(player.eof_loop_quiet_since.is_some());
+                player.backdate_eof_quiet_for_test(std::time::Duration::from_millis(49));
+                player.tick(&ctx);
+                if looping {
+                    assert!(player.current_seek_serial() > serial);
+                } else {
+                    assert!(!player.is_playing());
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn eos_tick_waits_for_in_flight_audio_tail_on_native_and_headless_paths() {
         for native in [false, true] {
             let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
@@ -16339,6 +17461,8 @@ mod tests {
             player.set_loop_enabled(true);
             let serial = player.current_seek_serial();
             player.clock.notify_demux_exhausted();
+            player.clock.note_video_decoded_eos(serial);
+            player.clock.complete_video_tail(serial);
             player.clock.note_audio_decoded_eos(serial);
             assert!(player.clock.begin_audio_tail(serial));
             // All counters/channels are quiet, and the old quiet interval has
@@ -16396,6 +17520,8 @@ mod tests {
         let serial = player.current_seek_serial();
         player.clock.clear_seek_target_override(serial);
         player.clock.notify_demux_exhausted();
+        player.clock.note_video_decoded_eos(serial);
+        player.clock.complete_video_tail(serial);
         player.clock.note_audio_decoded_eos(serial);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while !player.clock.audio_tail_complete() && std::time::Instant::now() < deadline {

@@ -1,0 +1,205 @@
+{
+  "index_settings": {
+    "docstore_compression": "lz4",
+    "docstore_blocksize": 16384
+  },
+  "segments": [
+    {
+      "segment_id": "3921747e-abea-4711-8f46-a3eaca1d8513",
+      "max_doc": 3,
+      "deletes": null
+    }
+  ],
+  "schema": [
+    {
+      "name": "path",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "basic",
+          "fieldnorms": true,
+          "tokenizer": "raw"
+        },
+        "stored": true,
+        "fast": false
+      }
+    },
+    {
+      "name": "container",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "basic",
+          "fieldnorms": true,
+          "tokenizer": "raw"
+        },
+        "stored": true,
+        "fast": false
+      }
+    },
+    {
+      "name": "zip_entry",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "basic",
+          "fieldnorms": true,
+          "tokenizer": "raw"
+        },
+        "stored": true,
+        "fast": false
+      }
+    },
+    {
+      "name": "favorite_id",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "basic",
+          "fieldnorms": true,
+          "tokenizer": "raw"
+        },
+        "stored": true,
+        "fast": false
+      }
+    },
+    {
+      "name": "kind",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "basic",
+          "fieldnorms": true,
+          "tokenizer": "raw"
+        },
+        "stored": true,
+        "fast": false
+      }
+    },
+    {
+      "name": "mtime",
+      "type": "i64",
+      "options": {
+        "indexed": true,
+        "fieldnorms": true,
+        "fast": false,
+        "stored": true
+      }
+    },
+    {
+      "name": "file_size",
+      "type": "i64",
+      "options": {
+        "indexed": false,
+        "fieldnorms": false,
+        "fast": false,
+        "stored": true
+      }
+    },
+    {
+      "name": "name",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "freq",
+          "fieldnorms": true,
+          "tokenizer": "mimv_bigram"
+        },
+        "stored": true,
+        "fast": false
+      }
+    },
+    {
+      "name": "exif_text",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "freq",
+          "fieldnorms": true,
+          "tokenizer": "mimv_bigram"
+        },
+        "stored": true,
+        "fast": false
+      }
+    },
+    {
+      "name": "xmp_tweet_text",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "freq",
+          "fieldnorms": true,
+          "tokenizer": "mimv_bigram"
+        },
+        "stored": true,
+        "fast": false
+      }
+    },
+    {
+      "name": "png_prompt_text",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "freq",
+          "fieldnorms": true,
+          "tokenizer": "mimv_bigram"
+        },
+        "stored": true,
+        "fast": false
+      }
+    },
+    {
+      "name": "pdf_meta_text",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "freq",
+          "fieldnorms": true,
+          "tokenizer": "mimv_bigram"
+        },
+        "stored": true,
+        "fast": false
+      }
+    },
+    {
+      "name": "video_meta_text",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "freq",
+          "fieldnorms": true,
+          "tokenizer": "mimv_bigram"
+        },
+        "stored": true,
+        "fast": false
+      }
+    },
+    {
+      "name": "sidecar_text",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "freq",
+          "fieldnorms": true,
+          "tokenizer": "mimv_bigram"
+        },
+        "stored": true,
+        "fast": false
+      }
+    },
+    {
+      "name": "tags",
+      "type": "text",
+      "options": {
+        "indexing": {
+          "record": "freq",
+          "fieldnorms": true,
+          "tokenizer": "mimv_bigram"
+        },
+        "stored": true,
+        "fast": false
+      }
+    }
+  ],
+  "opstamp": 4
+}

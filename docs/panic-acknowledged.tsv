@@ -30,3 +30,4 @@ C:\Users\mikag\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\wgpu-27.0.1\
 C:\Users\mikag\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-wgpu-0.33.3\src\renderer.rs:615:17	assertion `left == right` failed: Mismatch between texture size and texel count	filed	backlog 1.196; 2026-05
 C:\Users\mikag\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\egui-0.33.3\src\ui.rs:2569:9	You can only indent vertical layouts, found Layout { main_dir: LeftToRight, main_wrap: false, main_align: Center, main_justify: false, cross_align: Min, cross_justify: false }	filed	backlog 1.196; 2026-04
 /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library\core\src\num\f32.rs:1434:9	min > max, or either was NaN. min = #.#, max = -#.#	filed	backlog 1.196; clamp with inverted bounds, 2026-05
+src\app\viewer_context_registry.rs:590:9	assertion `left == right` failed	filed	backlog-on-hold 1.388; 2026-10-15, trigger unknown

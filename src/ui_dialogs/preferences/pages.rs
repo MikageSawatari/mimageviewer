@@ -37,6 +37,29 @@ pub(super) fn draw_preferences_restore_position_setting(
     );
 }
 
+pub(super) fn draw_notification_duration_setting(
+    ui: &mut egui::Ui,
+    value: &mut crate::settings::NotificationDuration,
+) {
+    use crate::settings::NotificationDuration;
+    ui.label(egui::RichText::new("通知の表示時間").strong());
+    ui.horizontal_wrapped(|ui| {
+        for choice in [
+            NotificationDuration::Short,
+            NotificationDuration::Standard,
+            NotificationDuration::Long,
+        ] {
+            ui.radio_value(value, choice, choice.label());
+        }
+    });
+    ui.label(
+        egui::RichText::new(
+            "警告・エラーは「短い」でも標準の時間を確保します。進捗表示には適用しません。",
+        )
+        .weak(),
+    );
+}
+
 pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
     if state.transfer_feedback.is_some() {
         super::transfer::render_transfer_feedback(ui, state.transfer_feedback.as_ref());
@@ -87,6 +110,10 @@ pub(super) fn page_general(ui: &mut egui::Ui, state: &mut PreferencesState) {
             )
             .weak(),
         );
+    });
+    ui.add_space(12.0);
+    anchored(ui, state, "general/notification-duration", |ui, state| {
+        draw_notification_duration_setting(ui, &mut state.settings.notification_duration);
     });
     ui.add_space(12.0);
     anchored(ui, state, "general/restore-position", |ui, state| {
@@ -269,7 +296,7 @@ pub(super) fn page_font(ui: &mut egui::Ui, state: &mut PreferencesState) {
         let selected_label = selected.display_name().to_string();
         let filter = state.ui_font_filter.trim().to_lowercase();
         ui.horizontal(|ui| {
-            ui.label("フォント:");
+            let label = ui.label("フォント:");
             egui::ComboBox::from_id_salt("ui_font_face")
                 .selected_text(selected_label)
                 .width(270.0)
@@ -284,6 +311,10 @@ pub(super) fn page_font(ui: &mut egui::Ui, state: &mut PreferencesState) {
                         ui.label(egui::RichText::new("システムフォントを読み込み中…").weak());
                     }
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: egui::scroll_area::DragScroll::Always,
+                            ..Default::default()
+                        })
                         .id_salt("ui_font_face_list")
                         .max_height(260.0)
                         .show(ui, |ui| {
@@ -299,7 +330,9 @@ pub(super) fn page_font(ui: &mut egui::Ui, state: &mut PreferencesState) {
                                 );
                             }
                         });
-                });
+                })
+                .response
+                .labelled_by(label.id);
         });
         ui.horizontal(|ui| {
             ui.label("絞り込み:");
@@ -328,15 +361,17 @@ pub(super) fn page_font(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(4.0);
     anchored(ui, state, "font/vertical-adjust", |ui, state| {
         ui.horizontal(|ui| {
-            ui.label("縦位置の微調整:");
-            let response = ui.add(
-                egui::Slider::new(
-                    &mut state.settings.ui_font.vertical_adjust,
-                    UI_FONT_VERTICAL_ADJUST_MIN..=UI_FONT_VERTICAL_ADJUST_MAX,
+            let label = ui.label("縦位置の微調整:");
+            let response = ui
+                .add(
+                    egui::Slider::new(
+                        &mut state.settings.ui_font.vertical_adjust,
+                        UI_FONT_VERTICAL_ADJUST_MIN..=UI_FONT_VERTICAL_ADJUST_MAX,
+                    )
+                    .suffix(" pt")
+                    .step_by(0.25),
                 )
-                .suffix(" pt")
-                .step_by(0.25),
-            );
+                .labelled_by(label.id);
             if response.changed() {
                 state.mark_ui_font_changed(&ctx);
             }
@@ -584,7 +619,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
         // 裏の一覧の選択で変わるのは他のどのページとも違い、分かりづらい
         // (2026-08-31 利用者報告)。環境設定の中だけで完結させる。
         ui.horizontal_wrapped(|ui| {
-            ui.label("拡張子");
+            let label = ui.label("拡張子");
             egui::ComboBox::from_id_salt("external_tool_association_ext")
                 .selected_text(format!(".{}", state.external_tool_association_ext))
                 .show_ui(ui, |ui| {
@@ -598,7 +633,9 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                             );
                         }
                     }
-                });
+                })
+                .response
+                .labelled_by(label.id);
             if ui.button("この拡張子の関連付けアプリから追加").clicked() {
                 state.external_tool_add_source = Some(ExternalToolAddSource::Associated);
             }
@@ -691,13 +728,13 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
         .num_columns(2)
         .spacing([10.0, 6.0])
         .show(ui, |ui| {
-            ui.label("名前");
+            let field_label = ui.label("名前");
             crate::ime_focus::add_singleline(ui, &mut tool.name, None, |edit| {
                 edit.desired_width(360.0)
-            });
+            }).labelled_by(field_label.id);
             ui.end_row();
 
-            ui.label("プログラム / スクリプト");
+            let field_label = ui.label("プログラム / スクリプト");
             if tool.launch.uses_process_options() {
                 let mut output = crate::ime_focus::show_singleline(
                     ui,
@@ -705,6 +742,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                     None,
                     |edit| edit.desired_width(360.0),
                 );
+                output.response.response = output.response.response.labelled_by(field_label.id);
                 let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,
@@ -721,15 +759,15 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             }
             ui.end_row();
 
-            ui.label("引数");
+            let field_label = ui.label("引数");
             ui.add_enabled_ui(tool.launch.uses_process_options(), |ui| {
                 crate::ime_focus::add_singleline(ui, &mut tool.arguments, None, |edit| {
                     edit.desired_width(360.0)
-                });
+                }).labelled_by(field_label.id);
             });
             ui.end_row();
 
-            ui.label("作業フォルダー");
+            let field_label = ui.label("作業フォルダー");
             ui.add_enabled_ui(tool.launch.uses_process_options(), |ui| {
                 let mut output = crate::ime_focus::show_singleline(
                     ui,
@@ -737,6 +775,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                     None,
                     |edit| edit.desired_width(360.0),
                 );
+                output.response.response = output.response.response.labelled_by(field_label.id);
                 let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,
@@ -772,7 +811,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             );
             ui.end_row();
 
-            ui.label("渡すもの");
+            let field_label = ui.label("渡すもの");
             let payload_options = [
                 (
                     crate::external_tool::PayloadPolicy::TempEdited,
@@ -787,7 +826,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                     "元のファイル",
                 ),
             ];
-            enum_combo(ui, "external_tool_payload", &mut tool.payload, &payload_options);
+            enum_combo(ui, "external_tool_payload", &mut tool.payload, &payload_options).labelled_by(field_label.id);
             ui.end_row();
 
             let passes_real_file =
@@ -826,7 +865,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
             );
             ui.end_row();
 
-            ui.label("動画");
+            let field_label = ui.label("動画");
             ui.add_enabled_ui(!passes_real_file, |ui| {
                 enum_combo(
                     ui,
@@ -839,7 +878,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                             "表示中のフレーム",
                         ),
                     ],
-                );
+                ).labelled_by(field_label.id);
             })
             .response
             .on_disabled_hover_text(
@@ -863,7 +902,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                 ui.end_row();
             }
 
-            ui.label("見開き");
+            let field_label = ui.label("見開き");
             enum_combo(
                 ui,
                 "external_tool_spread",
@@ -887,7 +926,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                         ),
                     ][..]
                 },
-            );
+            ).labelled_by(field_label.id);
             ui.end_row();
 
             if tool.spread == crate::external_tool::SpreadPolicy::Merged {
@@ -905,7 +944,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                 ui.end_row();
             }
 
-            ui.label("複数選択");
+            let field_label = ui.label("複数選択");
             enum_combo(
                 ui,
                 "external_tool_selection",
@@ -915,7 +954,7 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                     (crate::external_tool::SelectionPolicy::Each, "1 件ずつ起動"),
                     (crate::external_tool::SelectionPolicy::Batch, "まとめて渡す"),
                 ],
-            );
+            ).labelled_by(field_label.id);
             ui.end_row();
 
             match tool.selection {
@@ -979,13 +1018,13 @@ pub(super) fn page_external_tools(ui: &mut egui::Ui, state: &mut PreferencesStat
                 ui.end_row();
             }
 
-            ui.label("PDF レンダリング長辺");
+            let field_label = ui.label("PDF レンダリング長辺");
             enum_combo(
                 ui,
                 "external_tool_pdf_edge",
                 &mut tool.pdf_render_long_edge,
                 &[(2048, "2048"), (4096, "4096"), (8192, "8192")],
-            );
+            ).labelled_by(field_label.id);
             ui.end_row();
         });
 
@@ -1065,7 +1104,7 @@ fn enum_combo<T: Copy + PartialEq>(
     id: &'static str,
     value: &mut T,
     options: &[(T, &'static str)],
-) {
+) -> egui::Response {
     let selected = options
         .iter()
         .find_map(|(candidate, label)| (*candidate == *value).then_some(*label))
@@ -1076,7 +1115,8 @@ fn enum_combo<T: Copy + PartialEq>(
             for (candidate, label) in options {
                 ui.selectable_value(value, *candidate, *label);
             }
-        });
+        })
+        .response
 }
 
 fn external_tool_key_slot_label(index: usize) -> String {
@@ -1367,6 +1407,47 @@ fn favorite_standard_settings_notice(ui: &mut egui::Ui, state: &PreferencesState
 }
 
 pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "thumbnail/name-font-scale", |ui, state| {
+        ui.horizontal_wrapped(|ui| {
+            let label = ui.label("名前の文字サイズ:");
+            egui::ComboBox::from_id_salt("thumb_name_font_scale_percent")
+                .selected_text(format!("{}%", state.settings.thumb_name_font_scale_percent))
+                .show_ui(ui, |ui| {
+                    for percent in settings::THUMB_NAME_FONT_SCALE_PERCENT_OPTIONS {
+                        ui.selectable_value(
+                            &mut state.settings.thumb_name_font_scale_percent,
+                            percent,
+                            format!("{percent}%"),
+                        );
+                    }
+                })
+                .response
+                .labelled_by(label.id);
+        });
+        ui.small("全体の「スケーリング」とは別に、サムネイル一覧のファイル名・フォルダ名だけを大きくします。");
+    });
+    anchored(ui, state, "thumbnail/name-max-lines", |ui, state| {
+        ui.horizontal_wrapped(|ui| {
+            let label = ui.label("名前の最大行数:");
+            egui::ComboBox::from_id_salt("thumb_name_max_lines")
+                .selected_text(format!("{} 行", state.settings.thumb_name_max_lines))
+                .show_ui(ui, |ui| {
+                    for lines in
+                        settings::THUMB_NAME_MAX_LINES_MIN..=settings::THUMB_NAME_MAX_LINES_MAX
+                    {
+                        ui.selectable_value(
+                            &mut state.settings.thumb_name_max_lines,
+                            lines,
+                            format!("{lines} 行"),
+                        );
+                    }
+                })
+                .response
+                .labelled_by(label.id);
+        });
+        ui.small("行数を増やすと長い名前を折り返して表示します。収まらない部分は省略します。");
+    });
+    ui.add_space(12.0);
     anchored(ui, state, "thumbnail/favorite-view-state", |ui, state| {
         ui.checkbox(
             &mut state.settings.remember_favorite_view_state,
@@ -1402,9 +1483,8 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     if state.favorite_view_state_clear_confirm_open {
         let mut clear = false;
         let mut cancel = false;
-        let response = egui::Modal::new(egui::Id::new("favorite_view_state_clear_confirm")).show(
-            ui.ctx(),
-            |ui| {
+        let response = egui::Modal::new(egui::Id::unique("favorite_view_state_clear_confirm"))
+            .show(ui.ctx(), |ui| {
                 ui.set_min_width(420.0);
                 ui.heading("お気に入りの表示状態をすべてクリアしますか？");
                 ui.label("お気に入り本体は削除されません。次回入ったときに改めて記憶します。");
@@ -1417,8 +1497,7 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
                         cancel = true;
                     }
                 });
-            },
-        );
+            });
         if clear {
             state.favorite_view_state_clear_requested = true;
             state.favorite_view_state_clear_confirm_open = false;
@@ -1475,7 +1554,11 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
                     ui.label(format!("{}", row + 1));
                     for kind in GridItemDisplayKind::ALL {
                         let selected = s.grid_display_order.row_for(kind) == row;
-                        if ui.radio(selected, "").clicked() {
+                        let response = ui.radio(selected, "");
+                        crate::ui_helpers::set_accessibility_label_with(&response, || {
+                            format!("{} / {}", kind.label(), row + 1)
+                        });
+                        if response.clicked() {
                             s.grid_display_order.assign(kind, row);
                         }
                     }
@@ -1531,14 +1614,16 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         let s = &mut state.settings;
         ui.label(egui::RichText::new("一覧のクリック選択").strong());
         ui.horizontal(|ui| {
-            ui.label("選択方式:");
+            let label = ui.label("選択方式:");
             egui::ComboBox::from_id_salt("grid_click_selection_mode")
                 .selected_text(s.grid_click_selection_mode.label())
                 .show_ui(ui, |ui| {
                     for &mode in crate::settings::GridClickSelectionMode::all() {
                         ui.selectable_value(&mut s.grid_click_selection_mode, mode, mode.label());
                     }
-                });
+                })
+                .response
+                .labelled_by(label.id);
         });
         ui.label(
         "チェック方式は通常クリックや空白クリックで既存チェックを維持します。\n\
@@ -1565,14 +1650,16 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         let s = &mut state.settings;
         ui.label(egui::RichText::new("選択情報の表示").strong());
         ui.horizontal(|ui| {
-            ui.label("表示方法:");
+            let label = ui.label("表示方法:");
             egui::ComboBox::from_id_salt("selection_info_display_mode")
                 .selected_text(s.selection_info_display_mode.label())
                 .show_ui(ui, |ui| {
                     for &mode in crate::settings::SelectionInfoDisplayMode::all() {
                         ui.selectable_value(&mut s.selection_info_display_mode, mode, mode.label());
                     }
-                });
+                })
+                .response
+                .labelled_by(label.id);
         });
         ui.label(
         "ツールチップは選択行の下に表示します。下部情報バーはヘッダと選択中の 1 行をウィンドウ下部に表示します。",
@@ -1581,14 +1668,16 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "thumbnail/details-selection-bar", |ui, state| {
         let s = &mut state.settings;
         ui.horizontal_wrapped(|ui| {
-            ui.label("詳細表示時の下部情報バー:");
+            let label = ui.label("詳細表示時の下部情報バー:");
             egui::ComboBox::from_id_salt("details_selection_bar_mode")
                 .selected_text(s.details_selection_bar_mode.label())
                 .show_ui(ui, |ui| {
                     for &mode in crate::settings::DetailsSelectionBarMode::all() {
                         ui.selectable_value(&mut s.details_selection_bar_mode, mode, mode.label());
                     }
-                });
+                })
+                .response
+                .labelled_by(label.id);
         });
         ui.small(
         "サムネイル表示では一覧と同じ列設定を使います。詳細表示では、一覧と同じ設定・専用の設定・表示しないを選べます。",
@@ -1647,7 +1736,7 @@ pub(super) fn draw_video_thumbnail_indicator_settings(
 ) {
     ui.label(egui::RichText::new("動画サムネイルの目印").strong());
     ui.horizontal(|ui| {
-        ui.label("表示:");
+        let label = ui.label("表示:");
         egui::ComboBox::from_id_salt("video_thumbnail_indicator")
             .selected_text(settings.video_thumbnail_indicator.label())
             .show_ui(ui, |ui| {
@@ -1658,7 +1747,9 @@ pub(super) fn draw_video_thumbnail_indicator_settings(
                         indicator.label(),
                     );
                 }
-            });
+            })
+            .response
+            .labelled_by(label.id);
     });
     ui.small(
         "動画の代表画像に重ねる再生アイコンを、左下の小さなバッジへ替えるか、非表示にできます。音声の音楽アイコンには影響しません。",
@@ -1691,7 +1782,7 @@ pub(super) fn draw_audio_thumbnail_indicator_settings(
 ) {
     ui.label(egui::RichText::new("音声サムネイルの目印").strong());
     ui.horizontal(|ui| {
-        ui.label("表示:");
+        let label = ui.label("表示:");
         egui::ComboBox::from_id_salt("audio_thumbnail_indicator")
             .selected_text(settings.audio_thumbnail_indicator.label())
             .show_ui(ui, |ui| {
@@ -1702,7 +1793,9 @@ pub(super) fn draw_audio_thumbnail_indicator_settings(
                         indicator.label(),
                     );
                 }
-            });
+            })
+            .response
+            .labelled_by(label.id);
     });
     ui.small("同名画像・埋め込み画像に重ねる音楽アイコンを、左下の文字バッジへ替えるか、非表示にできます。画像がない場合の音楽アイコンは常に表示します。");
 }
@@ -1719,12 +1812,13 @@ pub(super) fn draw_media_duration_settings(ui: &mut egui::Ui, settings: &mut set
 pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "slideshow/interval", |ui, state| {
         ui.horizontal(|ui| {
-            ui.label("ページ送り間隔:");
+            let label = ui.label("ページ送り間隔:");
             ui.add(
                 egui::Slider::new(&mut state.settings.slideshow_interval_secs, 0.5..=30.0)
                     .suffix(" 秒")
                     .fixed_decimals(1),
-            );
+            )
+            .labelled_by(label.id);
         });
     });
 
@@ -1732,7 +1826,7 @@ pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "slideshow/continuous", |ui, state| {
         ui.label("連結読みスライドショー:");
         ui.horizontal(|ui| {
-            ui.label("待機時間:");
+            let label = ui.label("待機時間:");
             ui.add(
                 egui::Slider::new(
                     &mut state.settings.slideshow_continuous_wait_secs,
@@ -1740,10 +1834,11 @@ pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 )
                 .suffix(" 秒")
                 .fixed_decimals(1),
-            );
+            )
+            .labelled_by(label.id);
         });
         ui.horizontal(|ui| {
-            ui.label("スクロール時間:");
+            let label = ui.label("スクロール時間:");
             ui.add(
                 egui::Slider::new(
                     &mut state.settings.slideshow_continuous_scroll_secs,
@@ -1751,17 +1846,19 @@ pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 )
                 .suffix(" 秒")
                 .fixed_decimals(1),
-            );
+            )
+            .labelled_by(label.id);
         });
         ui.horizontal(|ui| {
-            ui.label("1回のスクロール量:");
+            let label = ui.label("1回のスクロール量:");
             ui.add(
                 egui::Slider::new(
                     &mut state.settings.slideshow_continuous_scroll_percent,
                     1..=100,
                 )
                 .suffix(" %"),
-            );
+            )
+            .labelled_by(label.id);
         });
     });
 
@@ -1800,7 +1897,7 @@ pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
         ui.add_space(6.0);
         ui.label(
-            egui::RichText::new("フルスクリーンで S キーまたは ▶ ボタンで開始 / 停止")
+            egui::RichText::new("フルスクリーンで S キーまたは ▶ ボタンで開始 / 停止。上部の「…」からも設定を変更できます")
                 .size(11.0)
                 .color(hint),
         );
@@ -1820,7 +1917,7 @@ pub(super) fn page_bake_stage(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
 type BakeStageField = fn(&mut crate::settings::Settings) -> &mut crate::bake_stage::BakeStage;
 
-fn bake_stage_rows() -> [(&'static str, BakeStageField, &'static str); 4] {
+fn bake_stage_rows() -> [(&'static str, BakeStageField, &'static str); 5] {
     [
         ("製本", |s| &mut s.bake_stage_book, "本棚へ追加するページ"),
         (
@@ -1838,6 +1935,11 @@ fn bake_stage_rows() -> [(&'static str, BakeStageField, &'static str); 4] {
             |s| &mut s.bake_stage_external_tool,
             "別のアプリへ渡す一時ファイル",
         ),
+        (
+            "クリップボードへコピー",
+            |s| &mut s.bake_stage_clipboard,
+            "右クリックの編集を反映した画像をコピー",
+        ),
     ]
 }
 
@@ -1847,7 +1949,7 @@ fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.heading("書き出しの焼き込み");
     ui.add(
         egui::Label::new(concat!(
-            "画像をファイルへ出すとき、どこまで反映するかを出力ごとに選びます。",
+            "画像をファイルやクリップボードへ出すとき、どこまで反映するかを出力ごとに選びます。",
             "右の段ほど多くを焼き込みます。",
         ))
         .wrap(),
@@ -1874,7 +1976,11 @@ fn page_bake_stage_body(ui: &mut egui::Ui, state: &mut PreferencesState) {
                     // 選んだ段「まで」が入るので、手前の段も塗る。どこまで進むかが読める。
                     let included = stage <= current;
                     let mut selected = included;
-                    if ui.checkbox(&mut selected, "").clicked() {
+                    let response = ui.checkbox(&mut selected, "");
+                    crate::ui_helpers::set_accessibility_label_with(&response, || {
+                        format!("{name} / {}", stage.label())
+                    });
+                    if response.clicked() {
                         *field(&mut state.settings) = stage;
                     }
                 }
@@ -2270,7 +2376,7 @@ pub(super) fn draw_video_normal_wheel_action_settings(
     ui: &mut egui::Ui,
     settings: &mut crate::settings::Settings,
 ) {
-    ui.label(egui::RichText::new("動画・音声の通常ホイール").strong());
+    let label = ui.label(egui::RichText::new("動画・音声の通常ホイール").strong());
     let wheel_action = &mut settings.ring_shortcuts.video_normal_wheel_action;
     egui::ComboBox::from_id_salt("video_normal_wheel_action")
         .width(260.0)
@@ -2279,7 +2385,9 @@ pub(super) fn draw_video_normal_wheel_action_settings(
             for candidate in crate::ring_shortcut::VideoNormalWheelActionId::available() {
                 ui.selectable_value(wheel_action, *candidate, candidate.label());
             }
-        });
+        })
+        .response
+        .labelled_by(label.id);
     ui.small("端パネル、シークストリップ、360度表示、拡大表示、タイル表示が使うホイールはこの割り当ての対象外です。");
 }
 
@@ -2329,6 +2437,10 @@ pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesSt
     ui.add_space(12.0);
     let conflicted = conflicted_actions(&conflicts);
     let rows = command_overview_rows(state, &keymap, &conflicted);
+    let assignment_width = rows
+        .iter()
+        .map(|row| assignment_summary_width(ui, &row.assignments))
+        .fold(0.0_f32, f32::max);
     egui::Grid::new("operation_command_overview_actions")
         .num_columns(5)
         .spacing([10.0, 4.0])
@@ -2362,7 +2474,7 @@ pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesSt
                 }
                 ui.label(row.label).on_hover_text(row.hover);
                 ui.label(row.context);
-                assignment_summary(ui, &row.assignments);
+                assignment_summary(ui, &row.assignments, assignment_width);
                 if row.status.is_empty() {
                     ui.label(egui::RichText::new("既定").weak());
                 } else {
@@ -2480,7 +2592,7 @@ fn command_overview_rows(
             assignments,
             status: status.join(" / "),
             conflicted: is_conflicted,
-            hover: action.description().to_owned(),
+            hover: key_action_detail_label(action).to_owned(),
             target: OperationOverviewTarget::Key(action),
         });
     }
@@ -2567,6 +2679,8 @@ fn compact_key_action_label(action: KeyAction) -> String {
         KeyAction::GlobalFavSearch => "コンテナ検索",
         KeyAction::GlobalMetadataSearch => "アイテム検索",
         KeyAction::GlobalOpenFolder => "フォルダを開く",
+        KeyAction::ClearVideoMediaMemory => "再生位置・視聴済み・音声トラック選択を全件クリア",
+        KeyAction::ClearBookResumePositions => "本の読書位置を全件クリア",
         KeyAction::ToggleDetachedViewerMode => "別ウィンドウ",
         KeyAction::HelpShowContextShortcuts => "ショートカット一覧",
         KeyAction::GridSelectAll => "表示中を全チェック",
@@ -2581,8 +2695,18 @@ fn key_action_context_label(action: KeyAction) -> &'static str {
     ))
 }
 
+fn key_action_detail_label(action: KeyAction) -> &'static str {
+    match action {
+        KeyAction::FsPageOverviewToggle => {
+            "ページ一覧の表示切替。O キーと同じ操作。もう一度実行すると一覧を閉じ、元のページ表示に戻ります。"
+        }
+        _ => action.description(),
+    }
+}
+
 fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext) -> &'static str {
     match action {
+        RingActionId::ImagePageOverview => key_action_detail_label(KeyAction::FsPageOverviewToggle),
         RingActionId::GridSelectAll => "表示中のチェック可能な項目をすべてチェックする",
         RingActionId::ImageSpreadShiftLeft => {
             "見開きを画面左方向へ1ページずらす。右→左の見開きでは前/次の意味を反転します"
@@ -2618,6 +2742,14 @@ fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext)
 
 fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, RingActionId)> {
     let mut out = Vec::new();
+    if action == KeyAction::FsPageOverviewToggle {
+        push_ring_binding_if_available(
+            &mut out,
+            RingShortcutContext::ImageFullscreen,
+            RingActionId::ImagePageOverview,
+        );
+        return out;
+    }
     if let Some(slot) = action.favorite_slot_number()
         && let Some(ring_action) = RingActionId::favorite_slot_action(slot)
     {
@@ -2660,6 +2792,13 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
         _ => return out,
     };
     let ring_action = match action {
+        KeyAction::GridCopyFiles | KeyAction::FsCopyFiles => RingActionId::CopyFiles,
+        KeyAction::GridCopyPath | KeyAction::FsCopyPath => RingActionId::ImageCopyPath,
+        KeyAction::GridCopyFileName | KeyAction::FsCopyFileName => RingActionId::ImageCopyFileName,
+        KeyAction::GridCopyImage | KeyAction::FsCopyImage => RingActionId::ImageCopyToClipboard,
+        KeyAction::GridCopyEditedImage | KeyAction::FsCopyEditedImage => {
+            RingActionId::CopyEditedImage
+        }
         KeyAction::GridParentFolder => RingActionId::GridParentFolder,
         KeyAction::GridTreeFolderPrev => RingActionId::TreeFolderPrev,
         KeyAction::GridTreeFolderNext => RingActionId::TreeFolderNext,
@@ -2849,18 +2988,52 @@ fn compact_operation_label_with_suffixes(label: &str, suffixes: &[&str]) -> Stri
     }
 }
 
-fn assignment_summary(ui: &mut egui::Ui, groups: &[(&str, Vec<String>)]) {
+fn assignment_text_width(ui: &egui::Ui, text: impl Into<egui::WidgetText>) -> f32 {
+    text.into()
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            egui::FontSelection::Default,
+        )
+        .size()
+        .x
+}
+
+fn assignment_values_width(ui: &egui::Ui, values: &[String]) -> f32 {
+    values
+        .iter()
+        .map(|value| assignment_text_width(ui, egui::RichText::new(value).monospace()))
+        .fold(0.0_f32, f32::max)
+}
+
+fn assignment_summary_width(ui: &egui::Ui, groups: &[(&str, Vec<String>)]) -> f32 {
+    groups
+        .iter()
+        .filter(|(_, values)| !values.is_empty())
+        .map(|(label, values)| {
+            assignment_text_width(ui, format!("{label}:"))
+                + ui.spacing().item_spacing.x
+                + assignment_values_width(ui, values)
+        })
+        .fold(0.0_f32, f32::max)
+}
+
+fn assignment_summary(ui: &mut egui::Ui, groups: &[(&str, Vec<String>)], column_width: f32) {
     if groups.iter().all(|(_, values)| values.is_empty()) {
         ui.label(egui::RichText::new("なし").weak());
         return;
     }
 
     ui.vertical(|ui| {
+        ui.set_min_width(column_width.max(assignment_summary_width(ui, groups)));
         for (label, values) in groups {
             for value in values {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("{label}:")).weak());
-                    ui.monospace(value);
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(format!("{label}:")).weak()).extend(),
+                    );
+                    ui.add(egui::Label::new(egui::RichText::new(value).monospace()).extend());
                 });
             }
         }
@@ -2915,6 +3088,7 @@ pub(super) fn draw_operation_assignment_editor_dialog(
     let default_size = egui::vec2(680.0, 620.0).min(safe_size);
     let min_size = egui::vec2(520.0, 360.0).min(safe_size);
     egui::Window::new(title)
+        .drag_area(egui::WindowDrag::Anywhere)
         .open(&mut open)
         .resizable(true)
         .collapsible(false)
@@ -2941,6 +3115,10 @@ pub(super) fn draw_operation_assignment_editor_dialog(
             } else {
                 let available_h = ui.available_height().max(120.0);
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .id_salt("operation_assignment_editor_body")
                     .max_height(available_h)
                     .auto_shrink([false, false])
@@ -2978,7 +3156,7 @@ pub(super) fn draw_mouse_gesture_recorder_dialog(
     } else {
         format!("マウスジェスチャ追加: {}", recorder.context.label())
     };
-    egui::Window::new(title)
+    egui::Window::new(title).drag_area(egui::WindowDrag::Anywhere)
         .open(&mut open)
         .resizable(true)
         .movable(false)
@@ -3204,7 +3382,7 @@ fn operation_assignment_editor_header(ui: &mut egui::Ui, target: &OperationAssig
     match target {
         OperationAssignmentTarget::Key(action) => {
             ui.label(egui::RichText::new(compact_key_action_label(*action)).strong());
-            ui.small(action.description());
+            ui.small(key_action_detail_label(*action));
             if let Some((context, ring_action)) = ring_binding_for_key_action(*action) {
                 ui.small(format!(
                     "この操作は {} のリング / マウス / パッドにも割り当てられます: {}",
@@ -3423,7 +3601,7 @@ fn command_editor_source_chord_section(
 
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label("場所:");
+            let label = ui.label("場所:");
             let selected = operation_keyboard_context_filter_label(
                 state.operation_assignment_keyboard_context,
             );
@@ -3442,7 +3620,9 @@ fn command_editor_source_chord_section(
                         label,
                     );
                 }
-            });
+            })
+            .response
+            .labelled_by(label.id);
         });
 
         let matches = actions_for_chord(keymap, chord, state.operation_assignment_keyboard_context);
@@ -3494,7 +3674,7 @@ fn command_editor_source_chord_section(
         let filter = state.command_filter.trim().to_string();
         let key_filter = state.command_key_filter.trim().to_string();
         let candidate_height = ui.available_height().max(180.0);
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
             .id_salt(("command_editor_chord_assign_list", chord_label))
             .max_height(candidate_height)
             .auto_shrink([false, false])
@@ -3531,7 +3711,7 @@ fn command_editor_source_chord_section(
                             }
                             ui.label(compact_key_action_label(action))
                                 .on_hover_text(action.description());
-                            assignment_values(ui, &labels);
+                            assignment_values(ui, &labels, 0.0);
                             ui.label(chord_assignment_candidate_status(keymap, action, chord))
                                 .on_hover_text(
                                     "空きあり: 未使用のキー欄へ自動入力します。\n置換が必要: 編集ダイアログで置き換える行を選びます。",
@@ -3543,12 +3723,13 @@ fn command_editor_source_chord_section(
     });
 }
 
-fn key_assignment_context_filters() -> [Option<KeyContext>; 8] {
+fn key_assignment_context_filters() -> [Option<KeyContext>; 9] {
     [
         None,
         Some(KeyContext::Global),
         Some(KeyContext::Grid),
         Some(KeyContext::FsCommon),
+        Some(KeyContext::FsPageOverview),
         Some(KeyContext::Rating),
         Some(KeyContext::FsImage),
         Some(KeyContext::FsVideo),
@@ -4187,6 +4368,24 @@ fn command_list(
     let filter = state.command_filter.trim().to_string();
     let key_filter = state.command_key_filter.trim().to_string();
     let conflicted = conflicted_actions(conflicts);
+    let rows: Vec<_> = KeyAction::all()
+        .iter()
+        .copied()
+        .filter(|action| {
+            action.is_user_facing()
+                && operation_keyboard_context_filter_matches(
+                    state.operation_keyboard_context,
+                    action.context(),
+                )
+                && command_action_matches_filter(*action, &filter)
+        })
+        .map(|action| (action, keymap.chord_labels(action)))
+        .filter(|(_, labels)| command_key_labels_match_filter(labels, &key_filter))
+        .collect();
+    let key_column_width = rows
+        .iter()
+        .map(|(_, labels)| assignment_values_width(ui, labels))
+        .fold(0.0_f32, f32::max);
     ui.label(egui::RichText::new("コマンド一覧").strong());
 
     egui::Grid::new("command_settings_actions")
@@ -4201,22 +4400,7 @@ fn command_list(
             ui.strong("状態");
             ui.end_row();
 
-            for &action in KeyAction::all()
-                .iter()
-                .filter(|action| action.is_user_facing())
-            {
-                if !operation_keyboard_context_filter_matches(
-                    state.operation_keyboard_context,
-                    action.context(),
-                ) {
-                    continue;
-                }
-                let labels = keymap.chord_labels(action);
-                if !command_action_matches_filter(action, &filter)
-                    || !command_key_labels_match_filter(&labels, &key_filter)
-                {
-                    continue;
-                }
+            for (action, labels) in rows {
                 let selected = state.command_selected == Some(action);
                 if ui
                     .selectable_label(selected, if selected { "選択中" } else { "編集" })
@@ -4228,7 +4412,7 @@ fn command_list(
                 ui.label(compact_key_action_label(action))
                     .on_hover_text(action.description());
 
-                assignment_values(ui, &labels);
+                assignment_values(ui, &labels, key_column_width);
 
                 ui.label(key_action_context_label(action));
 
@@ -4304,7 +4488,7 @@ fn command_editor_for_action(
 
     let effective_labels = keymap.chord_labels(action);
     ui.small("現在有効なキー:");
-    assignment_summary(ui, &[("キー", effective_labels)]);
+    assignment_summary(ui, &[("キー", effective_labels)], 0.0);
 
     let assignment_state = match state.settings.keymap.override_chord_labels(action) {
         Some(labels) if labels.is_empty() => "状態: キー割り当て解除を保存済み",
@@ -4327,7 +4511,7 @@ fn command_editor_for_action(
         let preview_conflicts = preview_command_editor_conflicts(state, action, conflicts);
         for idx in 0..state.command_chord_inputs.len() {
             ui.horizontal(|ui| {
-                ui.add_sized(
+                let key_label = ui.add_sized(
                     [48.0, ui.spacing().interact_size.y],
                     egui::Label::new(format!("キー {}", idx + 1)),
                 );
@@ -4340,7 +4524,8 @@ fn command_editor_for_action(
                         } else {
                             ""
                         }),
-                    );
+                    )
+                    .labelled_by(key_label.id);
                 }
                 let capture_active = state.command_capture_slot == Some(idx);
                 let capture_label = if capture_active {
@@ -4595,13 +4780,16 @@ fn set_single_command_chord_input(state: &mut PreferencesState, label: &str) {
     state.command_edit_error = None;
 }
 
-fn assignment_values(ui: &mut egui::Ui, values: &[String]) {
+fn assignment_values(ui: &mut egui::Ui, values: &[String], column_width: f32) {
     if values.is_empty() {
         ui.label(egui::RichText::new("未設定").weak());
     } else {
         ui.vertical(|ui| {
+            // A chord is one unit; only separate bindings start a new line.
+            // Reserve its measured font width before Grid lays out later columns.
+            ui.set_min_width(column_width.max(assignment_values_width(ui, values)));
             for value in values {
-                ui.monospace(value);
+                ui.add(egui::Label::new(egui::RichText::new(value).monospace()).extend());
             }
         });
     }
@@ -4754,7 +4942,7 @@ fn is_win32_modifier_key(virtual_key: u32) -> bool {
 fn command_action_matches_filter(action: KeyAction, filter: &str) -> bool {
     operation_text_matches_filter(
         &compact_key_action_label(action),
-        action.description(),
+        key_action_detail_label(action),
         key_action_context_label(action),
         filter,
     )
@@ -5123,7 +5311,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                                 );
                                                 status.widget_info(|| {
                                                     egui::WidgetInfo::labeled(
-                                                        egui::WidgetType::Label,
+                                                        egui::Role::Label,
                                                         true,
                                                         format!(
                                                             "{}はこの場面で対象外",
@@ -5144,7 +5332,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                                 );
                                                 status.widget_info(|| {
                                                     egui::WidgetInfo::labeled(
-                                                        egui::WidgetType::Label,
+                                                        egui::Role::Label,
                                                         true,
                                                         format!("{}は項目非表示中", item.label()),
                                                     )
@@ -5162,7 +5350,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                                 );
                                                 status.widget_info(|| {
                                                     egui::WidgetInfo::labeled(
-                                                        egui::WidgetType::Label,
+                                                        egui::Role::Label,
                                                         true,
                                                         format!("{}はこの場面で先頭", item.label()),
                                                     )
@@ -5192,7 +5380,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                     .on_hover_text("上へ");
                                 up.widget_info(|| {
                                     egui::WidgetInfo::labeled(
-                                        egui::WidgetType::Button,
+                                        egui::Role::Button,
                                         up_enabled,
                                         format!("{}を上へ", item.label()),
                                     )
@@ -5211,7 +5399,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                     .on_hover_text("下へ");
                                 down.widget_info(|| {
                                     egui::WidgetInfo::labeled(
-                                        egui::WidgetType::Button,
+                                        egui::Role::Button,
                                         down_enabled,
                                         format!("{}を下へ", item.label()),
                                     )
@@ -5259,7 +5447,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                         });
                                         combo.response.widget_info(|| {
                                             egui::WidgetInfo::labeled(
-                                                egui::WidgetType::ComboBox,
+                                                egui::Role::ComboBox,
                                                 true,
                                                 format!("{}の前の区切り線", item.label()),
                                             )
@@ -5281,7 +5469,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                             );
                                         response.widget_info(|| {
                                             egui::WidgetInfo::labeled(
-                                                egui::WidgetType::Button,
+                                                egui::Role::Button,
                                                 false,
                                                 format!(
                                                     "{}の前の区切り線（先頭のため非表示）",
@@ -5300,7 +5488,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                         );
                                         response.widget_info(|| {
                                             egui::WidgetInfo::labeled(
-                                                egui::WidgetType::Button,
+                                                egui::Role::Button,
                                                 false,
                                                 format!(
                                                     "{}の前の区切り線（項目が非表示）",
@@ -5318,7 +5506,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                             ui.add_enabled(false, egui::Button::new("対象外"));
                                         response.widget_info(|| {
                                             egui::WidgetInfo::labeled(
-                                                egui::WidgetType::Button,
+                                                egui::Role::Button,
                                                 false,
                                                 format!(
                                                     "{}の前の区切り線（この場面では対象外）",
@@ -5338,7 +5526,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                         .on_hover_text("この項目の区切り線を既定に戻す");
                                     reset.widget_info(|| {
                                         egui::WidgetInfo::labeled(
-                                            egui::WidgetType::Button,
+                                            egui::Role::Button,
                                             true,
                                             format!(
                                                 "{}の区切り線を既定に戻す",
@@ -5570,7 +5758,7 @@ fn right_drag_mode_combo(
     if context.ring_context().is_none() && mode == RightDragMode::RingShortcut {
         mode = RightDragMode::Disabled;
     }
-    egui::ComboBox::from_id_salt(("right_drag_mode", context))
+    let response = egui::ComboBox::from_id_salt(("right_drag_mode", context))
         .width(220.0)
         .selected_text(mode.label())
         .show_ui(ui, |ui| {
@@ -5596,7 +5784,11 @@ fn right_drag_mode_combo(
                 RightDragMode::MouseGesture,
                 RightDragMode::MouseGesture.label(),
             );
-        });
+        })
+        .response;
+    crate::ui_helpers::set_accessibility_label_with(&response, || {
+        format!("{} / 右ドラッグ", context.label())
+    });
     settings.set_right_drag_mode(context, mode);
 }
 
@@ -5608,7 +5800,7 @@ fn viewer_short_right_click_combo(
     let Some(mut action) = settings.viewer_short_right_click_action(context) else {
         return;
     };
-    egui::ComboBox::from_id_salt(("viewer_short_right_click", context))
+    let response = egui::ComboBox::from_id_salt(("viewer_short_right_click", context))
         .width(230.0)
         .selected_text(action.label())
         .show_ui(ui, |ui| {
@@ -5620,7 +5812,11 @@ fn viewer_short_right_click_combo(
                 let label = candidate.label();
                 ui.selectable_value(&mut action, candidate, label);
             }
-        });
+        })
+        .response;
+    crate::ui_helpers::set_accessibility_label_with(&response, || {
+        format!("{} / 右クリック短押し", context.label())
+    });
     settings.set_viewer_short_right_click_action(context, action);
 }
 fn mouse_button_context_editor(
@@ -5688,7 +5884,8 @@ fn mouse_button_assignment_editor(
 ) {
     let mut close_requested = false;
     ui.group(|ui| {
-        ui.label(egui::RichText::new(format!("{} / {}", context.label(), slot.label())).strong());
+        let assignment_label = ui
+            .label(egui::RichText::new(format!("{} / {}", context.label(), slot.label())).strong());
         ui.small("なしを選ぶとこのボタン単体では何もしません。");
         ui.add_space(6.0);
 
@@ -5714,7 +5911,9 @@ fn mouse_button_assignment_editor(
                     ui.selectable_value(value, action.clone(), action.label_for_context(context))
                         .on_hover_text(ring_action_detail_label(action, context));
                 }
-            });
+            })
+            .response
+            .labelled_by(assignment_label.id);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button("割り当て解除").clicked() {
@@ -5861,7 +6060,7 @@ fn mouse_gesture_assignment_editor(
     let mut delete_requested = false;
     let mut rerecord_requested = false;
     ui.group(|ui| {
-        ui.label(
+        let assignment_label = ui.label(
             egui::RichText::new(format!(
                 "{} / {}",
                 context.label(),
@@ -5884,7 +6083,9 @@ fn mouse_gesture_assignment_editor(
                     )
                     .on_hover_text(ring_action_detail_label(&candidate, action_context));
                 }
-            });
+            })
+            .response
+            .labelled_by(assignment_label.id);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button("再記録").clicked() {
@@ -6107,7 +6308,7 @@ fn ring_slot_assignment_editor(
 ) {
     let mut close_requested = false;
     ui.group(|ui| {
-        ui.label(
+        let assignment_label = ui.label(
             egui::RichText::new(format!("X+{} / {}", direction.label(), context.label()))
                 .strong(),
         );
@@ -6130,7 +6331,7 @@ fn ring_slot_assignment_editor(
                     )
                     .on_hover_text(ring_action_detail_label(action, context));
                 }
-            });
+            }).response.labelled_by(assignment_label.id);
         ui.add_space(8.0);
         if ui.button("閉じる").clicked() {
             close_requested = true;
@@ -6537,7 +6738,7 @@ fn ring_shortcut_context_editor_impl(
                 .show(ui, |ui| {
                     for &direction in RingDirection::all() {
                         let idx = direction.slot_index();
-                        ui.label(direction.label());
+                        let label = ui.label(direction.label());
                         let selected = profile.slots[idx].label_for_context(context);
                         egui::ComboBox::from_id_salt(("ring_shortcut_slot", context, direction))
                             .width(190.0)
@@ -6550,7 +6751,9 @@ fn ring_shortcut_context_editor_impl(
                                         action.label_for_context(context),
                                     );
                                 }
-                            });
+                            })
+                            .response
+                            .labelled_by(label.id);
                         ui.end_row();
                     }
                 });
@@ -6706,7 +6909,8 @@ pub(super) fn page_parallelism(ui: &mut egui::Ui, state: &mut PreferencesState) 
         }
 
         ui.horizontal(|ui| {
-            if ui.radio(!current_auto, "手動").clicked() {
+            let manual = ui.radio(!current_auto, "手動");
+            if manual.clicked() {
                 s.parallelism = Parallelism::Manual(state.manual_threads);
             }
             ui.add_enabled(
@@ -6714,7 +6918,8 @@ pub(super) fn page_parallelism(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 egui::DragValue::new(&mut state.manual_threads)
                     .range(1..=64)
                     .suffix(" スレッド"),
-            );
+            )
+            .labelled_by(manual.id);
             if !current_auto {
                 s.parallelism = Parallelism::Manual(state.manual_threads);
             }
@@ -6731,7 +6936,7 @@ pub(super) fn page_parallelism(ui: &mut egui::Ui, state: &mut PreferencesState) 
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
-            ui.label("同時処理数:");
+            let label = ui.label("同時処理数:");
             let mut count = settings::clamp_pdf_worker_count(s.pdf_worker_count) as u32;
             if ui
                 .add(
@@ -6739,6 +6944,7 @@ pub(super) fn page_parallelism(ui: &mut egui::Ui, state: &mut PreferencesState) 
                         .range(settings::PDF_WORKER_COUNT_MIN..=settings::PDF_WORKER_COUNT_MAX)
                         .suffix(" 個"),
                 )
+                .labelled_by(label.id)
                 .changed()
             {
                 s.pdf_worker_count = count;
@@ -6771,20 +6977,22 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
-            ui.label("後方（前の画像）:");
+            let label = ui.label("後方（前の画像）:");
             ui.add(
                 egui::DragValue::new(&mut s.prefetch_back)
                     .range(0..=50usize)
                     .suffix(" 枚"),
-            );
+            )
+            .labelled_by(label.id);
         });
         ui.horizontal(|ui| {
-            ui.label("前方（次の画像）:");
+            let label = ui.label("前方（次の画像）:");
             ui.add(
                 egui::DragValue::new(&mut s.prefetch_forward)
                     .range(0..=50usize)
                     .suffix(" 枚"),
-            );
+            )
+            .labelled_by(label.id);
         });
     });
 
@@ -6800,20 +7008,22 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
-            ui.label("後方（前のページ）:");
+            let label = ui.label("後方（前のページ）:");
             ui.add(
                 egui::DragValue::new(&mut s.thumb_prev_pages)
                     .range(0..=20u32)
                     .suffix(" ページ"),
-            );
+            )
+            .labelled_by(label.id);
         });
         ui.horizontal(|ui| {
-            ui.label("前方（次のページ）:");
+            let label = ui.label("前方（次のページ）:");
             ui.add(
                 egui::DragValue::new(&mut s.thumb_next_pages)
                     .range(0..=20u32)
                     .suffix(" ページ"),
-            );
+            )
+            .labelled_by(label.id);
         });
     });
 
@@ -6826,20 +7036,22 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
-            ui.label("後方（前の画像）:");
+            let label = ui.label("後方（前の画像）:");
             ui.add(
                 egui::DragValue::new(&mut s.ai_upscale_prefetch_back)
                     .range(0..=10usize)
                     .suffix(" 枚"),
-            );
+            )
+            .labelled_by(label.id);
         });
         ui.horizontal(|ui| {
-            ui.label("前方（次の画像）:");
+            let label = ui.label("前方（次の画像）:");
             ui.add(
                 egui::DragValue::new(&mut s.ai_upscale_prefetch_forward)
                     .range(0..=10usize)
                     .suffix(" 枚"),
-            );
+            )
+            .labelled_by(label.id);
         });
     });
 
@@ -6855,7 +7067,7 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "prefetch/retained-ai-count", |ui, state| {
         let s = &mut state.settings;
         ui.horizontal(|ui| {
-            ui.label("最大枚数:");
+            let label = ui.label("最大枚数:");
             ui.add(
                 egui::DragValue::new(&mut s.retained_final_ai_cache_max_entries)
                     .range(
@@ -6863,13 +7075,14 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
                             ..=settings::RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MAX,
                     )
                     .suffix(" 枚"),
-            );
+            )
+            .labelled_by(label.id);
         });
     });
     anchored(ui, state, "prefetch/retained-ai-memory", |ui, state| {
         let s = &mut state.settings;
         ui.horizontal(|ui| {
-            ui.label("最大 CPU メモリ (RAM):");
+            let label = ui.label("最大 CPU メモリ (RAM):");
             ui.add(
                 egui::DragValue::new(&mut s.retained_final_ai_cache_max_mib)
                     .range(
@@ -6877,7 +7090,8 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
                             ..=settings::RETAINED_FINAL_AI_CACHE_MAX_MIB_MAX,
                     )
                     .suffix(" MB"),
-            );
+            )
+            .labelled_by(label.id);
         });
     });
 
@@ -6890,18 +7104,24 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "prefetch/ai-size-limit", |ui, state| {
         let s = &mut state.settings;
         ui.horizontal(|ui| {
-            ui.label("アップスケール:");
-            if let Some(new_limit) =
-                ai_size_limit_combo(ui, "pref_ai_upscale_size_limit", s.ai_upscale_limit())
-            {
+            let label = ui.label("アップスケール:");
+            if let Some(new_limit) = ai_size_limit_combo(
+                ui,
+                "pref_ai_upscale_size_limit",
+                s.ai_upscale_limit(),
+                label.id,
+            ) {
                 s.ai_upscale_size_limit = Some(new_limit);
             }
         });
         ui.horizontal(|ui| {
-            ui.label("ノイズ除去:");
-            if let Some(new_limit) =
-                ai_size_limit_combo(ui, "pref_ai_denoise_size_limit", s.ai_denoise_limit())
-            {
+            let label = ui.label("ノイズ除去:");
+            if let Some(new_limit) = ai_size_limit_combo(
+                ui,
+                "pref_ai_denoise_size_limit",
+                s.ai_denoise_limit(),
+                label.id,
+            ) {
                 s.ai_denoise_size_limit = Some(new_limit);
             }
         });
@@ -6942,6 +7162,7 @@ fn ai_size_limit_combo(
     ui: &mut egui::Ui,
     id: &str,
     current: crate::ai::upscale::AiProcessSizeLimit,
+    label: egui::Id,
 ) -> Option<crate::ai::upscale::AiProcessSizeLimit> {
     let selected_label = AI_SIZE_LIMIT_OPTIONS
         .iter()
@@ -6962,7 +7183,9 @@ fn ai_size_limit_combo(
                     });
                 }
             }
-        });
+        })
+        .response
+        .labelled_by(label);
     picked
 }
 
@@ -6982,12 +7205,13 @@ pub(super) fn page_gpu_memory(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ));
 
         ui.horizontal(|ui| {
-            ui.label("上限:");
+            let label = ui.label("上限:");
             ui.add(
                 egui::Slider::new(&mut s.gpu_memory_percent, 0..=100u32)
                     .step_by(5.0)
                     .suffix(" %"),
-            );
+            )
+            .labelled_by(label.id);
         });
 
         let pct = s.gpu_memory_percent;
@@ -7199,6 +7423,7 @@ pub(super) fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 let mut window_open = state.trt_cache_delete_confirm_open;
                 let pack_total_mib = state.trt_pack_size_mib + state.trt_engine_cache_size_mib;
                 egui::Window::new("TensorRT パック削除の確認")
+                    .drag_area(egui::WindowDrag::Anywhere)
                     .collapsible(false)
                     .resizable(false)
                     .open(&mut window_open)
@@ -7323,6 +7548,7 @@ pub(super) fn page_editing_addon(ui: &mut egui::Ui, state: &mut PreferencesState
                     let mut do_cancel = false;
                     let mut window_open = state.editing_addon_delete_confirm_open;
                     egui::Window::new("編集用追加ファイル削除の確認")
+                        .drag_area(egui::WindowDrag::Anywhere)
                         .collapsible(false)
                         .resizable(false)
                         .open(&mut window_open)
@@ -7445,12 +7671,13 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
             ui.label(egui::RichText::new("Auto モードのしきい値").strong());
             ui.add_space(4.0);
 
-            ui.label("時間しきい値 (decode + display の合計がこれ以上ならキャッシュ):");
+            let label = ui.label("時間しきい値 (decode + display の合計がこれ以上ならキャッシュ):");
             ui.add(
                 egui::Slider::new(&mut s.cache_threshold_ms, 10..=100)
                     .step_by(5.0)
                     .suffix(" ms"),
-            );
+            )
+            .labelled_by(label.id);
             ui.label("  小さいほど多くキャッシュ。25 ms 推奨。");
         });
 
@@ -7458,7 +7685,7 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
         anchored(ui, state, "cache/auto-size", |ui, state| {
             let s = &mut state.settings;
-            ui.label("サイズしきい値 (このサイズ以上は無条件キャッシュ):");
+            let label = ui.label("サイズしきい値 (このサイズ以上は無条件キャッシュ):");
             let mut size_mb = (s.cache_size_threshold_bytes as f64) / 1_000_000.0;
             if ui
                 .add(
@@ -7466,6 +7693,7 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
                         .step_by(0.5)
                         .suffix(" MB"),
                 )
+                .labelled_by(label.id)
                 .changed()
             {
                 s.cache_size_threshold_bytes = (size_mb * 1_000_000.0) as u64;
@@ -7521,13 +7749,14 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.add_enabled_ui(s.edit_preview_cache_enabled, |ui| {
             if ui
                 .horizontal(|ui| {
-                    ui.label("容量上限:");
+                    let label = ui.label("容量上限:");
                     ui.add(
                         egui::DragValue::new(&mut edit_preview_limit_mb)
                             .range(100..=100_000u64)
                             .speed(100.0)
                             .suffix(" MB"),
                     )
+                    .labelled_by(label.id)
                 })
                 .inner
                 .changed()
@@ -7618,13 +7847,14 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 .max(1);
             if ui
                 .horizontal(|ui| {
-                    ui.label("上限:");
+                    let label = ui.label("上限:");
                     ui.add(
                         egui::DragValue::new(&mut limit_mb)
                             .range(1..=1_000_000u64)
                             .speed(100.0)
                             .suffix(" MB"),
                     )
+                    .labelled_by(label.id)
                 })
                 .inner
                 .changed()
@@ -7978,7 +8208,7 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
                     ("中", &mut s.video_seek_medium_secs),
                     ("大", &mut s.video_seek_large_secs),
                 ] {
-                    ui.label(label);
+                    let label = ui.label(label);
                     ui.add(
                         egui::DragValue::new(value)
                             .range(
@@ -7986,7 +8216,8 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
                                     ..=crate::settings::VIDEO_SEEK_SECONDS_MAX,
                             )
                             .suffix(" 秒"),
-                    );
+                    )
+                    .labelled_by(label.id);
                 }
             });
             ui.small("キー、リング、マウスジェスチャ、ゲームパッド、動画の左右タップで選んだ小・中・大シークに共通です。");
@@ -7999,7 +8230,7 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         anchored(ui, state, "video/loop", |ui, state| {
             let s = &mut state.settings;
             ui.horizontal(|ui| {
-                ui.label("ループ再生:");
+                let label = ui.label("ループ再生:");
                 let mut current = s.video_loop_mode;
                 egui::ComboBox::from_id_salt("video_loop_mode")
                     .selected_text(current.label())
@@ -8007,7 +8238,9 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
                         for mode in crate::settings::VideoLoopMode::all() {
                             ui.selectable_value(&mut current, *mode, mode.label());
                         }
-                    });
+                    })
+                    .response
+                    .labelled_by(label.id);
                 if current != s.video_loop_mode {
                     s.video_loop_mode = current;
                     // 旧 bool 設定も新モードと矛盾しないよう同期 (古いコード誤読対策)。
@@ -8042,7 +8275,7 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         anchored(ui, state, "video/seek-thumbnail-tolerance", |ui, state| {
             let s = &mut state.settings;
             ui.horizontal(|ui| {
-                ui.label("シーク時のズレ許容 (秒)");
+                let label = ui.label("シーク時のズレ許容 (秒)");
                 ui.add(
                     egui::DragValue::new(&mut s.video_seek_thumbnail_tolerance_secs)
                         .range(
@@ -8051,7 +8284,8 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
                         )
                         .speed(0.1)
                         .fixed_decimals(1),
-                );
+                )
+                .labelled_by(label.id);
             });
             ui.label(
                 egui::RichText::new(
@@ -8097,7 +8331,7 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         anchored(ui, state, "video/seek-strip-interval", |ui, state| {
             let s = &mut state.settings;
             ui.horizontal(|ui| {
-                ui.label("シークストリップの画像間隔");
+                let label = ui.label("シークストリップの画像間隔");
                 egui::ComboBox::from_id_salt("video_seek_strip_min_interval")
                     .selected_text(crate::video::seek_strip::format_seek_strip_range_value(
                         crate::settings::VideoSeekStripMode::Thumbnails,
@@ -8114,7 +8348,9 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
                                 ),
                             );
                         }
-                    });
+                    })
+                    .response
+                    .labelled_by(label.id);
             });
             ui.label(
                 egui::RichText::new(
@@ -8128,7 +8364,7 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         anchored(ui, state, "video/seek-strip-waveform-span", |ui, state| {
             let s = &mut state.settings;
             ui.horizontal(|ui| {
-                ui.label("音声波形で見渡す範囲");
+                let label = ui.label("音声波形で見渡す範囲");
                 egui::ComboBox::from_id_salt("video_seek_strip_waveform_span")
                     .selected_text(crate::video::seek_strip::format_seek_strip_range_value(
                         crate::settings::VideoSeekStripMode::Waveform,
@@ -8145,7 +8381,9 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
                                 ),
                             );
                         }
-                    });
+                    })
+                    .response
+                    .labelled_by(label.id);
             });
             ui.label(
                 egui::RichText::new(
@@ -8405,6 +8643,7 @@ fn draw_audio_normalize_cache_controls(ui: &mut egui::Ui, state: &mut Preference
         let mut open = true;
         let entry_count = state.audio_normalize_entry_count;
         egui::Window::new("音量ノーマライズ測定値のクリア")
+            .drag_area(egui::WindowDrag::Anywhere)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -8825,7 +9064,7 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
         .collect();
     let available_height = ui.available_height().max(120.0);
     let mut clicked_add: Option<String> = None;
-    let output = egui::ScrollArea::vertical()
+    let output = egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
         .id_salt("vst3-pref-page-picker-scroll")
         .vertical_scroll_offset(state.vst3_picker_scroll_y)
         .max_height(available_height)
@@ -8873,7 +9112,7 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 }
             }
         });
-    state.vst3_picker_scroll_y = output.state.offset.y;
+    state.vst3_picker_scroll_y = output.state.clamped_offset().y;
     if let Some(path) = clicked_add {
         if state.settings.vst3_plugins.len() < MAX_CHAIN_LEN
             && !state.settings.vst3_plugins.iter().any(|e| e.path == path)
@@ -8909,11 +9148,12 @@ pub(super) fn draw_file_organize_destinations_settings(ui: &mut egui::Ui, settin
             ui.group(|ui| {
                 // 狭い右ペインでも編集欄と操作列を上下に分け、パスを隠さない。
                 ui.horizontal(|ui| {
-                    ui.label("表示名");
+                    let field_label = ui.label("表示名");
                     let width = ui.available_width().max(80.0);
                     crate::ime_focus::add_singleline(ui, &mut destination.name, None, |edit| {
                         edit.desired_width(width)
-                    });
+                    })
+                    .labelled_by(field_label.id);
                 });
                 ui.horizontal(|ui| {
                     ui.label("パス");
@@ -9015,12 +9255,13 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label("サブフォルダ探索階層:");
+            let label = ui.label("サブフォルダ探索階層:");
             ui.add(
                 egui::DragValue::new(&mut s.folder_thumb_depth)
                     .range(0..=10u32)
                     .suffix(" 階層"),
-            );
+            )
+            .labelled_by(label.id);
         });
 
         ui.add_space(12.0);
@@ -9032,12 +9273,13 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.label("Ctrl+↑↓ で移動先フォルダに画像がない場合、自動でスキップする最大回数。");
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label("空フォルダのスキップ上限:");
+            let label = ui.label("空フォルダのスキップ上限:");
             ui.add(
                 egui::DragValue::new(&mut s.folder_skip_limit)
                     .range(1..=30usize)
                     .suffix(" 回"),
-            );
+            )
+            .labelled_by(label.id);
         });
 
         ui.add_space(12.0);
@@ -9308,6 +9550,10 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
                 let len = state.settings.image_ext_priority.len();
 
                 let output = egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
                     .max_height(200.0)
                     .id_salt("dup_ext_scroll")
                     .vertical_scroll_offset(state.duplicate_priority_scroll_y)
@@ -9350,7 +9596,7 @@ pub(super) fn page_duplicate_files(ui: &mut egui::Ui, state: &mut PreferencesSta
                         }
                     });
 
-                state.duplicate_priority_scroll_y = output.state.offset.y;
+                state.duplicate_priority_scroll_y = output.state.clamped_offset().y;
                 if let Some((a, b)) = swap {
                     state.settings.image_ext_priority.swap(a, b);
                 }
@@ -9407,8 +9653,10 @@ pub(super) fn page_exif_display(
 
     anchored(ui, state, "exif/custom-tag", |ui, state| {
         ui.horizontal(|ui| {
-            ui.label("カスタム追加:");
-            let response = ui.text_edit_singleline(&mut state.exif_add_tag_input);
+            let field_label = ui.label("カスタム追加:");
+            let response = ui
+                .text_edit_singleline(&mut state.exif_add_tag_input)
+                .labelled_by(field_label.id);
             if (ui.button("追加").clicked() || (response.lost_focus() && enter_pressed))
                 && !state.exif_add_tag_input.trim().is_empty()
             {
@@ -9597,7 +9845,7 @@ pub(super) fn draw_video_seek_strip_height_settings(
     settings: &mut crate::settings::Settings,
 ) {
     ui.horizontal_wrapped(|ui| {
-        ui.label("シークストリップの高さ");
+        let label = ui.label("シークストリップの高さ");
         egui::ComboBox::from_id_salt("video_seek_strip_height")
             .selected_text(settings.video_seek_strip_height.label())
             .show_ui(ui, |ui| {
@@ -9608,7 +9856,9 @@ pub(super) fn draw_video_seek_strip_height_settings(
                         preset.label(),
                     );
                 }
-            });
+            })
+            .response
+            .labelled_by(label.id);
     });
     ui.label(
         egui::RichText::new(
@@ -9642,7 +9892,7 @@ pub(super) fn draw_video_seek_strip_height_settings(
         ),
     ] {
         ui.horizontal_wrapped(|ui| {
-            ui.label(preset.label());
+            let label = ui.label(preset.label());
             ui.add(
                 egui::DragValue::new(value)
                     .range(
@@ -9650,7 +9900,8 @@ pub(super) fn draw_video_seek_strip_height_settings(
                             ..=crate::video::seek_strip_layout::VIDEO_SEEK_STRIP_HEIGHT_MAX_POINTS,
                     )
                     .suffix(" px"),
-            );
+            )
+            .labelled_by(label.id);
         });
     }
     ui.small(
@@ -9664,14 +9915,16 @@ pub(super) fn draw_video_seek_preview_size_settings(
 ) {
     let size = &mut settings.video_seek_preview_size;
     let draw = |ui: &mut egui::Ui| {
-        ui.label("シーク位置プレビューの大きさ");
+        let label = ui.label("シーク位置プレビューの大きさ");
         egui::ComboBox::from_id_salt("video_seek_preview_size")
             .selected_text(size.label())
             .show_ui(ui, |ui| {
                 for step in crate::settings::VideoSeekPreviewSize::ALL {
                     ui.selectable_value(size, step, step.label());
                 }
-            });
+            })
+            .response
+            .labelled_by(label.id);
     };
     if ui.available_width() < 320.0 {
         ui.vertical(draw);
@@ -9703,7 +9956,7 @@ pub(super) fn draw_video_seek_preview_size_settings(
         ),
     ] {
         ui.horizontal(|ui| {
-            ui.label(preset.label());
+            let label = ui.label(preset.label());
             ui.add(
                 egui::DragValue::new(value)
                     .range(
@@ -9711,7 +9964,8 @@ pub(super) fn draw_video_seek_preview_size_settings(
                             ..=crate::settings::VIDEO_SEEK_PREVIEW_WIDTH_MAX_POINTS,
                     )
                     .suffix(" px"),
-            );
+            )
+            .labelled_by(label.id);
         });
     }
     ui.small("各段階は個別に変更でき、シークストリップの高さや静止画の値には影響しません。画面が狭いときは収まる大きさに縮みます。");
@@ -9723,14 +9977,16 @@ pub(super) fn draw_still_seek_preview_size_settings(
 ) {
     let size = &mut settings.still_seek_preview_size;
     let draw = |ui: &mut egui::Ui| {
-        ui.label("シーク位置プレビューの大きさ");
+        let label = ui.label("シーク位置プレビューの大きさ");
         egui::ComboBox::from_id_salt("still_seek_preview_size")
             .selected_text(size.label())
             .show_ui(ui, |ui| {
                 for step in crate::settings::StillSeekPreviewSize::ALL {
                     ui.selectable_value(size, step, step.label());
                 }
-            });
+            })
+            .response
+            .labelled_by(label.id);
     };
     if ui.available_width() < 320.0 {
         ui.vertical(draw);
@@ -9762,7 +10018,7 @@ pub(super) fn draw_still_seek_preview_size_settings(
         ),
     ] {
         ui.horizontal(|ui| {
-            ui.label(preset.label());
+            let label = ui.label(preset.label());
             ui.add(
                 egui::DragValue::new(value)
                     .range(
@@ -9770,7 +10026,8 @@ pub(super) fn draw_still_seek_preview_size_settings(
                             ..=crate::settings::STILL_SEEK_PREVIEW_HEIGHT_MAX_POINTS,
                     )
                     .suffix(" px"),
-            );
+            )
+            .labelled_by(label.id);
         });
     }
     ui.small("各段階は個別に変更でき、サムネイル列の高さや動画の値には影響しません。画面が狭いときは収まる大きさに縮みます。");
@@ -9797,7 +10054,7 @@ pub(super) fn draw_still_seek_strip_settings(
 
     ui.add_enabled_ui(settings.still_seek_strip_visible, |ui| {
         ui.horizontal(|ui| {
-            ui.label("サムネイル列の高さ");
+            let label = ui.label("サムネイル列の高さ");
             egui::ComboBox::from_id_salt("still_seek_strip_height")
                 .selected_text(settings.still_seek_strip_height.label())
                 .show_ui(ui, |ui| {
@@ -9808,7 +10065,9 @@ pub(super) fn draw_still_seek_strip_settings(
                             preset.label(),
                         );
                     }
-                });
+                })
+                .response
+                .labelled_by(label.id);
         });
 
         ui.add_space(4.0);
@@ -9837,7 +10096,7 @@ pub(super) fn draw_still_seek_strip_settings(
             ),
         ] {
             ui.horizontal(|ui| {
-                ui.label(preset.label());
+                let label = ui.label(preset.label());
                 ui.add(
                     egui::DragValue::new(value)
                         .range(
@@ -9845,7 +10104,8 @@ pub(super) fn draw_still_seek_strip_settings(
                                 ..=crate::settings::STILL_SEEK_STRIP_HEIGHT_MAX_POINTS,
                         )
                         .suffix(" px"),
-                );
+                )
+                .labelled_by(label.id);
             });
         }
         ui.small(
@@ -9891,7 +10151,7 @@ pub(super) fn draw_fullscreen_specified_scale_axis_controls(
     axis: &mut crate::settings::SpecifiedScaleAxisSetting,
     label: &str,
     dark_popup: bool,
-) {
+) -> Option<egui::Rect> {
     use crate::settings::SpecifiedScaleAxis;
     let current = axis.value;
     let (mut number, mut pixels) = match current {
@@ -9914,6 +10174,7 @@ pub(super) fn draw_fullscreen_specified_scale_axis_controls(
     } else {
         ui.add(drag)
     };
+    crate::ui_helpers::set_accessibility_label(&response, label);
     if response.changed() {
         axis.value = if pixels {
             SpecifiedScaleAxis::LogicalPixels(number.round() as u32)
@@ -9967,16 +10228,23 @@ pub(super) fn draw_fullscreen_specified_scale_axis_controls(
             },
         )
         .inner;
+    crate::ui_helpers::set_accessibility_label_with(&_unit_response.response, || {
+        format!("{label} / 単位")
+    });
     #[cfg(test)]
     ui.ctx().data_mut(|data| {
         data.insert_temp(
-            egui::Id::new(("specified_scale_unit_response", label)),
+            egui::Id::unique(("specified_scale_unit_response", label)),
             _unit_response.response.rect,
         );
     });
     if pixels != matches!(current, SpecifiedScaleAxis::LogicalPixels(_)) {
         axis.value = axis.value.with_pixel_unit(pixels);
     }
+    let popup_id = _unit_response.response.id.with("popup");
+    egui::Popup::is_id_open(ui.ctx(), popup_id)
+        .then(|| egui::AreaState::load(ui.ctx(), popup_id).map(|area| area.rect()))
+        .flatten()
 }
 
 pub(super) fn draw_fullscreen_specified_scale_max_controls(
@@ -10003,9 +10271,13 @@ pub(super) fn draw_fullscreen_specified_scale_max_controls(
     } else {
         ui.add(drag)
     };
+    crate::ui_helpers::set_accessibility_label(&response, "自動フィットの最大倍率（共通）");
     #[cfg(test)]
     ui.ctx().data_mut(|data| {
-        data.insert_temp(egui::Id::new("specified_scale_max_response"), response.rect);
+        data.insert_temp(
+            egui::Id::unique("specified_scale_max_response"),
+            response.rect,
+        );
     });
     if response.changed() {
         *max_tenths = ((number * 10.0).round() as u32).clamp(
@@ -10033,7 +10305,7 @@ pub(super) fn draw_fullscreen_specified_scale_settings(
                 if !axis.enabled {
                     ui.disable();
                 }
-                draw_fullscreen_specified_scale_axis_controls(ui, axis, label, false);
+                let _ = draw_fullscreen_specified_scale_axis_controls(ui, axis, label, false);
             });
         });
     }
@@ -10053,6 +10325,57 @@ pub(super) fn draw_fullscreen_specified_scale_settings(
     ui.small("指定サイズの自動フィットで、元画像を拡大する倍率の上限です。1.0〜20.0倍で指定でき、初期値は5.0倍です。すべての本で共通です。");
     ui.small("AI拡大前の元画像サイズを基準にします。「縮小しない」は指定枠より優先します。手動ズーム・Zにはこの上限を適用しません。");
     *value != before || max_changed
+}
+
+fn draw_plain_folder_spread_setting(ui: &mut egui::Ui, enabled: &mut bool) {
+    ui.checkbox(enabled, "通常フォルダにも既定のページ構成を使う");
+    ui.small("本として扱わないフォルダで、そのフォルダに保存したページ構成がないときに使います。フォルダの開き方（一覧表示・直接ページ表示）と連結方式は変わりません。");
+}
+
+#[cfg(test)]
+mod plain_folder_spread_tests {
+    use super::*;
+    use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn plain_folder_spread_preference_snapshots_and_toggle() {
+        let mut snapshots = egui_kittest::SnapshotResults::default();
+        for (name, theme, enabled) in [
+            (
+                "preferences_plain_folder_spread_light_off",
+                crate::os_theme::ResolvedTheme::Light,
+                false,
+            ),
+            (
+                "preferences_plain_folder_spread_dark_on",
+                crate::os_theme::ResolvedTheme::Dark,
+                true,
+            ),
+        ] {
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(400.0, 140.0))
+                .build_ui_state(
+                    move |root_ui, enabled| {
+                        crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                            crate::os_theme::apply_resolved(root_ui.ctx(), theme);
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                draw_plain_folder_spread_setting(ui, enabled);
+                            });
+                        });
+                    },
+                    enabled,
+                );
+            harness.run();
+            harness.snapshot(name);
+            harness
+                .get_by_label("通常フォルダにも既定のページ構成を使う")
+                .click();
+            harness.run();
+            assert_eq!(*harness.state(), !enabled);
+            snapshots.extend(harness.take_snapshot_results());
+        }
+    }
 }
 
 pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -10089,10 +10412,15 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 }
             }
             ui.separator();
-            ui.label("任意の色");
-            ui.color_edit_button_srgb(color);
+            let color_label = ui.label("任意の色");
+            ui.color_edit_button_srgb(color).labelled_by(color_label.id);
         });
         ui.small("静止画・本の画像外、静止画サムネイル列の空欄、動画の映像外に共通で使います。透過画像内の黒 / 白 / 市松、音声画面、操作パネルは変わりません。");
+    });
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("前後移動").strong());
+    anchored(ui, state, "spread/manual-nav-wrap", |ui, state| {
+        draw_fullscreen_manual_nav_wrap_setting(ui, &mut state.settings.fullscreen_manual_nav_wrap);
     });
     ui.add_space(8.0);
     ui.label(egui::RichText::new("案内と状況表示").strong());
@@ -10132,6 +10460,17 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 }
             });
     });
+    anchored(
+        ui,
+        state,
+        "spread/page-layout-plain-folders",
+        |ui, state| {
+            draw_plain_folder_spread_setting(
+                ui,
+                &mut state.settings.apply_default_spread_to_plain_folders,
+            );
+        },
+    );
     anchored(ui, state, "spread/document-direction", |ui, state| {
         ui.checkbox(
             &mut state.settings.follow_document_reading_direction,
@@ -10148,6 +10487,9 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     });
     anchored(ui, state, "spread/final-cover", |ui, state| {
         draw_final_cover_spread_setting(ui, &mut state.settings.final_cover_spread_enabled);
+    });
+    anchored(ui, state, "spread/auto-view-trim", |ui, state| {
+        draw_auto_view_trim_default_setting(ui, &mut state.settings.auto_view_trim_default_enabled);
     });
     anchored(ui, state, "spread/page-turn-animation", |ui, state| {
         draw_page_turn_animation_setting(
@@ -10326,13 +10668,14 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     anchored(ui, state, "spread/bar-gap", |ui, state| {
         let s = &mut state.settings;
         ui.horizontal(|ui| {
-            ui.label("固定バーと表示内容の間隔");
+            let label = ui.label("固定バーと表示内容の間隔");
             ui.add(
                 egui::DragValue::new(&mut s.fullscreen_fixed_bar_gap_px)
                     .range(0..=crate::settings::FULLSCREEN_FIXED_BAR_GAP_MAX_PX)
                     .speed(1)
                     .suffix(" px"),
-            );
+            )
+            .labelled_by(label.id);
         });
         ui.small("静止画と動画の固定表示中の上部情報バー / 下部シークバーに共通で適用します。0 px ではバーの直後まで画像・映像領域として使います。");
     });
@@ -10355,7 +10698,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     anchored(ui, state, "spread/cursor-hide", |ui, state| {
         let s = &mut state.settings;
         ui.horizontal(|ui| {
-            ui.label("マウスカーソルを隠すまで");
+            let label = ui.label("マウスカーソルを隠すまで");
             ui.add(
                 egui::DragValue::new(&mut s.fullscreen_cursor_hide_delay_secs)
                     .range(
@@ -10365,7 +10708,8 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                     .speed(0.1)
                     .fixed_decimals(1)
                     .suffix(" 秒"),
-            );
+            )
+            .labelled_by(label.id);
         });
         s.fullscreen_cursor_hide_delay_secs =
             crate::settings::clamp_fullscreen_cursor_hide_delay_secs(
@@ -10375,14 +10719,16 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     anchored(ui, state, "spread/page-jump", |ui, state| {
         let s = &mut state.settings;
         ui.horizontal(|ui| {
-            ui.label("ページジャンプ量");
+            let label = ui.label("ページジャンプ量");
             egui::ComboBox::from_id_salt("fullscreen_jump_mode")
                 .selected_text(s.fullscreen_jump_mode.label())
                 .show_ui(ui, |ui| {
                     for &mode in FullscreenJumpMode::all() {
                         ui.selectable_value(&mut s.fullscreen_jump_mode, mode, mode.label());
                     }
-                });
+                })
+                .response
+                .labelled_by(label.id);
             match s.fullscreen_jump_mode {
                 FullscreenJumpMode::Percent => {
                     ui.add(
@@ -10393,7 +10739,8 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                             )
                             .speed(1)
                             .suffix(" %"),
-                    );
+                    )
+                    .labelled_by(label.id);
                 }
                 FullscreenJumpMode::FixedPages => {
                     ui.add(
@@ -10404,7 +10751,8 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
                             )
                             .speed(1)
                             .suffix(" ページ"),
-                    );
+                    )
+                    .labelled_by(label.id);
                 }
             }
         });
@@ -10422,25 +10770,27 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     anchored(ui, state, "spread/spread-gap", |ui, state| {
         let s = &mut state.settings;
         ui.horizontal(|ui| {
-            ui.label("見開きのページ間隔");
+            let label = ui.label("見開きのページ間隔");
             ui.add(
                 egui::DragValue::new(&mut s.spread_page_gap_px)
                     .range(0..=200u32)
                     .speed(1)
                     .suffix(" px"),
-            );
+            )
+            .labelled_by(label.id);
         });
     });
     anchored(ui, state, "spread/continuous-gap", |ui, state| {
         let s = &mut state.settings;
         ui.horizontal(|ui| {
-            ui.label("連結読みのページ間隔");
+            let label = ui.label("連結読みのページ間隔");
             ui.add(
                 egui::DragValue::new(&mut s.continuous_reading_gap_px)
                     .range(0..=200u32)
                     .speed(1)
                     .suffix(" px"),
-            );
+            )
+            .labelled_by(label.id);
         });
     });
     ui.add_space(8.0);
@@ -10448,31 +10798,34 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         let s = &mut state.settings;
         ui.label("連結読みのスクロール量 (画面サイズ基準)");
         ui.horizontal(|ui| {
-            ui.label("ホイール 1 ノッチ");
+            let label = ui.label("ホイール 1 ノッチ");
             ui.add(
                 egui::DragValue::new(&mut s.continuous_reading_wheel_scroll_percent)
                     .range(1..=100u32)
                     .speed(1)
                     .suffix(" %"),
-            );
+            )
+            .labelled_by(label.id);
         });
         ui.horizontal(|ui| {
-            ui.label("矢印キー / D-pad 1 回");
+            let label = ui.label("矢印キー / D-pad 1 回");
             ui.add(
                 egui::DragValue::new(&mut s.continuous_reading_key_scroll_percent)
                     .range(1..=100u32)
                     .speed(1)
                     .suffix(" %"),
-            );
+            )
+            .labelled_by(label.id);
         });
         ui.horizontal(|ui| {
-            ui.label("左スティック最大");
+            let label = ui.label("左スティック最大");
             ui.add(
                 egui::DragValue::new(&mut s.continuous_reading_gamepad_scroll_percent_per_sec)
                     .range(10..=300u32)
                     .speed(1)
                     .suffix(" %/秒"),
-            );
+            )
+            .labelled_by(label.id);
         });
     });
     ui.add_space(8.0);
@@ -10495,9 +10848,114 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     });
 }
 
+pub(super) fn draw_fullscreen_manual_nav_wrap_setting(ui: &mut egui::Ui, enabled: &mut bool) {
+    ui.checkbox(enabled, "先頭 / 末尾で反対側の端へ移る (ループ)");
+    ui.small(
+        "手動の前後移動を、現在の閲覧順の中で折り返します。別フォルダや別の本へは移りません。",
+    );
+    ui.small("一覧のカーソル移動、スライドショー、動画・音声の連続再生のループとは別の設定です。");
+}
+
+#[cfg(test)]
+mod fullscreen_manual_nav_wrap_setting_tests {
+    use super::*;
+
+    fn snapshot(name: &str, theme: crate::os_theme::ResolvedTheme, enabled: bool) {
+        let mut fonts_ready = false;
+        let mut enabled = enabled;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(400.0, 150.0))
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, theme);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.label(egui::RichText::new("前後移動").strong());
+                        draw_fullscreen_manual_nav_wrap_setting(ui, &mut enabled);
+                    });
+                });
+            });
+        harness.run();
+        harness.snapshot(name);
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_setting_snapshot_light_off() {
+        snapshot(
+            "fullscreen_manual_nav_wrap_setting_light_off",
+            crate::os_theme::ResolvedTheme::Light,
+            false,
+        );
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_setting_snapshot_dark_on() {
+        snapshot(
+            "fullscreen_manual_nav_wrap_setting_dark_on",
+            crate::os_theme::ResolvedTheme::Dark,
+            true,
+        );
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_setting_toggle_preserves_other_policies() {
+        use egui_kittest::kittest::Queryable;
+
+        let settings = Settings::default();
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(400.0, 150.0))
+            .build_ui_state(
+                |root_ui, (settings, fonts_ready)| {
+                    let ctx = &root_ui.ctx().clone();
+                    if !*fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        *fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        draw_fullscreen_manual_nav_wrap_setting(
+                            ui,
+                            &mut settings.fullscreen_manual_nav_wrap,
+                        );
+                    });
+                },
+                (settings, false),
+            );
+        harness.run();
+        let original = harness.state().0.clone();
+        for enabled in [true, false] {
+            harness
+                .get_by_label("先頭 / 末尾で反対側の端へ移る (ループ)")
+                .click();
+            harness.run();
+            let current = &harness.state().0;
+            assert_eq!(current.fullscreen_manual_nav_wrap, enabled);
+            assert_eq!(current.grid_cursor_wrap, original.grid_cursor_wrap);
+            assert_eq!(current.slideshow_end_action, original.slideshow_end_action);
+            assert_eq!(current.video_loop_mode, original.video_loop_mode);
+            assert_eq!(
+                current.fullscreen_boundary_notice_visible,
+                original.fullscreen_boundary_notice_visible
+            );
+        }
+    }
+}
+
 pub(super) fn draw_final_cover_spread_setting(ui: &mut egui::Ui, enabled: &mut bool) {
     ui.checkbox(enabled, "末尾に表紙を添える");
     ui.small("表紙あり見開きで末尾が単ページになる本に適用します。本ごとの設定が優先されます。");
+}
+
+pub(super) fn draw_auto_view_trim_default_setting(ui: &mut egui::Ui, enabled: &mut bool) {
+    ui.checkbox(enabled, "自動余白カットを標準で有効にする");
+    ui.small("本ごとの設定が優先されます。回転したページには適用しません。");
 }
 
 pub(super) fn draw_page_turn_animation_setting(
@@ -10516,7 +10974,8 @@ pub(super) fn draw_page_turn_animation_setting(
             ui.spacing_mut().slider_width =
                 (row_width - label.rect.width() - ui.spacing().item_spacing.x - 80.0)
                     .clamp(40.0, 200.0);
-            ui.add(egui::Slider::new(duration_ms, 100..=600).suffix(" ms"));
+            ui.add(egui::Slider::new(duration_ms, 100..=600).suffix(" ms"))
+                .labelled_by(label.id);
         });
     });
 }
@@ -10531,16 +10990,19 @@ mod page_turn_animation_settings_tests {
         let mut duration_ms = 200;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(320.0, 320.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, theme);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    draw_page_turn_animation_setting(ui, &mut enabled, &mut duration_ms);
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, theme);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        draw_page_turn_animation_setting(ui, &mut enabled, &mut duration_ms);
+                    });
                 });
             });
         harness.run();
@@ -10575,15 +11037,16 @@ mod page_turn_animation_settings_tests {
         };
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(540.0, 320.0))
-            .build_state(
-                |ctx, (settings, fonts_ready)| {
+            .build_ui_state(
+                |root_ui, (settings, fonts_ready)| {
+                    let ctx = &root_ui.ctx().clone();
                     if !*fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         *fonts_ready = true;
                         ctx.request_repaint();
                         return;
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         draw_page_turn_animation_setting(
                             ui,
                             &mut settings.page_turn_animation_enabled,
@@ -10738,16 +11201,18 @@ mod context_menu_layout_settings_tests {
         ];
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(480.0, 300.0))
-            .build_state(
-                |ctx, (settings, fonts_ready)| {
+            .build_ui_state(
+                |root_ui, (settings, fonts_ready)| {
+                    let ctx = &root_ui.ctx().clone();
                     if !*fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         *fonts_ready = true;
                         ctx.request_repaint();
                         return;
                     }
-                    egui::CentralPanel::default()
-                        .show(ctx, |ui| draw_fullscreen_fit_cycle_settings(ui, settings));
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        draw_fullscreen_fit_cycle_settings(ui, settings)
+                    });
                 },
                 (settings, false),
             );
@@ -10791,19 +11256,27 @@ mod context_menu_layout_settings_tests {
         );
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(620.0, 420.0))
-            .build_state(
-                |ctx, (layout, scenario, fonts_ready, expanded)| {
+            .build_ui_state(
+                |root_ui, (layout, scenario, fonts_ready, expanded)| {
+                    let ctx = &root_ui.ctx().clone();
                     if !*fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         *fonts_ready = true;
                         ctx.request_repaint();
                         return;
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            draw_context_menu_layout_settings(ui, layout, scenario, expanded, 0);
-                        });
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                draw_context_menu_layout_settings(
+                                    ui, layout, scenario, expanded, 0,
+                                );
+                            });
                     });
                 },
                 state,
@@ -10953,7 +11426,8 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
                     for &m in ResumeMode::all() {
                         ui.selectable_value(val, m, m.label());
                     }
-                });
+                })
+                .response
         };
 
         egui::Grid::new("playback_resume_grid")
@@ -10961,23 +11435,35 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
             .spacing([24.0, 10.0])
             .show(ui, |ui| {
                 ui.label("");
-                ui.strong("一覧から開く");
-                ui.strong("移動 (↓↑ / ホイール / Ctrl+↑↓)");
+                let open_label = ui.strong("一覧から開く");
+                let nav_label = ui.strong("移動 (↓↑ / ホイール / Ctrl+↑↓)");
                 ui.end_row();
 
-                ui.strong("動画");
-                combo(ui, "pr_video_open", &mut video_open);
-                combo(ui, "pr_video_nav", &mut video_nav);
+                let row_label = ui.strong("動画");
+                combo(ui, "pr_video_open", &mut video_open)
+                    .labelled_by(row_label.id)
+                    .labelled_by(open_label.id);
+                combo(ui, "pr_video_nav", &mut video_nav)
+                    .labelled_by(row_label.id)
+                    .labelled_by(nav_label.id);
                 ui.end_row();
 
-                ui.strong("ZIP / PDF (本)");
-                combo(ui, "pr_book_open", &mut book_open);
-                combo(ui, "pr_book_nav", &mut book_nav);
+                let row_label = ui.strong("ZIP / PDF (本)");
+                combo(ui, "pr_book_open", &mut book_open)
+                    .labelled_by(row_label.id)
+                    .labelled_by(open_label.id);
+                combo(ui, "pr_book_nav", &mut book_nav)
+                    .labelled_by(row_label.id)
+                    .labelled_by(nav_label.id);
                 ui.end_row();
 
-                ui.strong("音声");
-                combo(ui, "pr_music_open", &mut music_open);
-                combo(ui, "pr_music_nav", &mut music_nav);
+                let row_label = ui.strong("音声");
+                combo(ui, "pr_music_open", &mut music_open)
+                    .labelled_by(row_label.id)
+                    .labelled_by(open_label.id);
+                combo(ui, "pr_music_nav", &mut music_nav)
+                    .labelled_by(row_label.id)
+                    .labelled_by(nav_label.id);
                 ui.end_row();
             });
 
@@ -11059,12 +11545,13 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
     });
     anchored(ui, state, "resume/history-limit", |ui, state| {
         ui.horizontal(|ui| {
-            ui.label("保持件数:");
+            let label = ui.label("保持件数:");
             ui.add(
                 egui::DragValue::new(&mut state.settings.reading_history_limit)
                     .range(1..=crate::reading_history_db::READING_HISTORY_LIMIT_MAX)
                     .speed(10),
-            );
+            )
+            .labelled_by(label.id);
             ui.label(format!(
                 "/ 最大 {}",
                 crate::reading_history_db::READING_HISTORY_LIMIT_MAX
@@ -11334,15 +11821,16 @@ mod tests {
 
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(300.0, 540.0))
-            .build_state(
-                |ctx, (value, changed, fonts_ready)| {
+            .build_ui_state(
+                |root_ui, (value, changed, fonts_ready)| {
+                    let ctx = &root_ui.ctx().clone();
                     if !*fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         *fonts_ready = true;
                         ctx.request_repaint();
                         return;
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         let mut max_tenths = 50;
                         *changed = super::draw_fullscreen_specified_scale_settings(
                             ui,
@@ -11413,15 +11901,16 @@ mod tests {
 
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(400.0, 540.0))
-            .build_state(
-                |ctx, (value, fonts_ready)| {
+            .build_ui_state(
+                |root_ui, (value, fonts_ready)| {
+                    let ctx = &root_ui.ctx().clone();
                     if !*fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         *fonts_ready = true;
                         ctx.request_repaint();
                         return;
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         let mut max_tenths = 50;
                         super::draw_fullscreen_specified_scale_settings(ui, value, &mut max_tenths);
                     });
@@ -11502,15 +11991,16 @@ mod tests {
             let pixels = matches!(axis, SpecifiedScaleAxis::LogicalPixels(_));
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(400.0, 520.0))
-                .build_state(
-                    |ctx, (value, fonts_ready)| {
+                .build_ui_state(
+                    |root_ui, (value, fonts_ready)| {
+                        let ctx = &root_ui.ctx().clone();
                         if !*fonts_ready {
                             crate::ui_fonts::configure_fonts(ctx);
                             *fonts_ready = true;
                             ctx.request_repaint();
                             return;
                         }
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
                             let mut max_tenths = 50;
                             super::draw_fullscreen_specified_scale_settings(
                                 ui,
@@ -11573,8 +12063,9 @@ mod tests {
         for (text, expected) in [("2.5", 25), ("0", 10), ("20.1", 200), ("1.14", 11)] {
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(500.0, 560.0))
-                .build_state(
-                    |ctx, (value, max_tenths, changed, fonts_ready)| {
+                .build_ui_state(
+                    |root_ui, (value, max_tenths, changed, fonts_ready)| {
+                        let ctx = &root_ui.ctx().clone();
                         crate::ime_focus::install_ime_input_policy(ctx);
                         if !*fonts_ready {
                             crate::ui_fonts::configure_fonts(ctx);
@@ -11582,7 +12073,7 @@ mod tests {
                             ctx.request_repaint();
                             return;
                         }
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
                             *changed |= super::draw_fullscreen_specified_scale_settings(
                                 ui, value, max_tenths,
                             );
@@ -11624,17 +12115,22 @@ mod tests {
 
         for width in [220.0, 280.0] {
             let size = egui::vec2(width, 640.0);
-            let mut harness = crate::test_ui::builder().with_size(size).build_state(
-                |ctx, (value, fonts_ready)| {
+            let mut harness = crate::test_ui::builder().with_size(size).build_ui_state(
+                |root_ui, (value, fonts_ready)| {
+                    let ctx = &root_ui.ctx().clone();
                     if !*fonts_ready {
                         crate::ui_fonts::configure_fonts(ctx);
                         *fonts_ready = true;
                         ctx.request_repaint();
                         return;
                     }
-                    egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
                         ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                         egui::ScrollArea::vertical()
+                            .scroll_source(egui::scroll_area::ScrollSource {
+                                drag: egui::scroll_area::DragScroll::Always,
+                                ..Default::default()
+                            })
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 let mut max_tenths = 50;
@@ -11705,7 +12201,7 @@ mod tests {
             settings.bake_stage_export,
             crate::bake_stage::BakeStage::Edits
         );
-        assert_eq!(bake_stage_rows().len(), 4);
+        assert_eq!(bake_stage_rows().len(), 5);
     }
 
     #[test]
@@ -11831,6 +12327,57 @@ mod tests {
     }
 
     #[test]
+    fn page_overview_toggle_name_survives_compaction_and_selects_the_shared_operation() {
+        let action = KeyAction::FsPageOverviewToggle;
+        let context = RingShortcutContext::ImageFullscreen;
+        let ring = RingActionId::ImagePageOverview;
+        let label = "ページ一覧の表示切替";
+        assert_eq!(compact_key_action_label(action), label);
+        assert_eq!(compact_operation_label(action.description()), label);
+        assert_eq!(
+            compact_operation_label(ring.label_for_context(context)),
+            label
+        );
+        assert_eq!(
+            super::key_action_detail_label(action),
+            super::ring_action_detail_label(&ring, context)
+        );
+        assert!(super::key_action_detail_label(action).contains("O キーと同じ操作"));
+        assert!(super::key_action_detail_label(action).contains("もう一度実行すると一覧を閉じ"));
+
+        let mut state = zoom_key_editor_state();
+        let keymap = crate::keymap::Keymap::default();
+        for filter in [label, "表示切替", "O キーと同じ操作"] {
+            state.command_filter = filter.to_string();
+            let rows = super::command_overview_rows(&state, &keymap, &Default::default());
+            assert_eq!(rows.len(), 1, "{filter}");
+            assert_eq!(rows[0].label, label);
+            assert!(
+                matches!(rows[0].target, super::OperationOverviewTarget::Key(found) if found == action)
+            );
+        }
+        open_operation_assignment_editor(
+            &mut state,
+            OperationAssignmentTarget::Key(action),
+            OperationAssignmentTab::Keyboard,
+        );
+        assert_eq!(
+            super::operation_assignment_editor_title(&OperationAssignmentTarget::Key(action)),
+            format!("操作割り当て編集: {label}")
+        );
+        assert_eq!(
+            ring_bindings_for_key_action(action),
+            vec![(context, ring.clone())]
+        );
+        assert!(RingActionId::available_for_context(context).contains(&ring));
+        assert!(RingActionId::available_for_mouse_button_context(context).contains(&ring));
+        assert!(
+            RingActionId::available_for_right_drag_context(RightDragContext::ImageFullscreen)
+                .contains(&ring)
+        );
+    }
+
+    #[test]
     fn operation_labels_keep_drive_commands_contiguous_with_zip_pdf_commands() {
         let mut rows: Vec<(KeyAction, String)> = KeyAction::all()
             .iter()
@@ -11904,6 +12451,16 @@ mod tests {
 
     #[test]
     fn settings_dialog_key_actions_map_to_grid_ring_actions() {
+        for action in [KeyAction::FsZoomIn, KeyAction::FsZoomOut] {
+            assert!(ring_bindings_for_key_action(action).is_empty());
+        }
+        assert_eq!(
+            ring_bindings_for_key_action(KeyAction::FsPageOverviewToggle),
+            vec![(
+                RingShortcutContext::ImageFullscreen,
+                RingActionId::ImagePageOverview
+            )]
+        );
         assert_eq!(
             ring_bindings_for_key_action(KeyAction::GridOrganizeFiles),
             vec![(RingShortcutContext::Grid, RingActionId::GridOrganizeFiles)]
@@ -11926,6 +12483,195 @@ mod tests {
                 RingActionId::OpenOperationCustomize,
             )]
         );
+    }
+
+    #[test]
+    fn copy_key_actions_map_to_matching_ring_contexts() {
+        for (grid, image, ring) in [
+            (
+                KeyAction::GridCopyFiles,
+                KeyAction::FsCopyFiles,
+                RingActionId::CopyFiles,
+            ),
+            (
+                KeyAction::GridCopyPath,
+                KeyAction::FsCopyPath,
+                RingActionId::ImageCopyPath,
+            ),
+            (
+                KeyAction::GridCopyFileName,
+                KeyAction::FsCopyFileName,
+                RingActionId::ImageCopyFileName,
+            ),
+            (
+                KeyAction::GridCopyImage,
+                KeyAction::FsCopyImage,
+                RingActionId::ImageCopyToClipboard,
+            ),
+            (
+                KeyAction::GridCopyEditedImage,
+                KeyAction::FsCopyEditedImage,
+                RingActionId::CopyEditedImage,
+            ),
+        ] {
+            for (action, context) in [
+                (grid, RingShortcutContext::Grid),
+                (image, RingShortcutContext::ImageFullscreen),
+            ] {
+                assert_eq!(
+                    ring_bindings_for_key_action(action),
+                    vec![(context, ring.clone())]
+                );
+                assert!(operation_assignment_tab_enabled(
+                    &OperationAssignmentTarget::Key(action),
+                    OperationAssignmentTab::RingPad,
+                ));
+                assert!(operation_assignment_tab_enabled(
+                    &OperationAssignmentTarget::Key(action),
+                    OperationAssignmentTab::MouseButtons,
+                ));
+            }
+        }
+    }
+
+    fn command_chord_layout_state() -> PreferencesState {
+        let mut state = zoom_key_editor_state();
+        state.command_filter = "コピー".into();
+        state.command_key_filter = "Ctrl+".into();
+        state.operation_keyboard_context = Some(crate::keymap::KeyContext::Grid);
+        for &action in KeyAction::all() {
+            state.settings.keymap.set_override_chords(action, vec![]);
+        }
+        for (action, labels) in command_chord_layout_bindings() {
+            let chords = labels
+                .iter()
+                .map(|label| {
+                    crate::keymap::parse_chord_for_action(action, label)
+                        .unwrap()
+                        .unwrap()
+                })
+                .collect();
+            state.settings.keymap.set_override_chords(action, chords);
+        }
+        state
+    }
+
+    fn command_chord_layout_bindings() -> [(KeyAction, Vec<&'static str>); 2] {
+        [
+            (
+                KeyAction::GridCopyFiles,
+                vec!["Ctrl+Alt+NumpadSubtract", "Ctrl+Alt+-"],
+            ),
+            (
+                KeyAction::GridCopyPath,
+                vec!["Ctrl+Shift+PageUp", "Alt+Home", "Ctrl+Shift+F24"],
+            ),
+        ]
+    }
+
+    #[test]
+    fn command_chords_keep_one_line_and_reserve_measured_column_width() {
+        use egui_kittest::kittest::Queryable;
+
+        for (width, zoom, font_size) in [(760.0, 1.0, 13.0), (300.0, 1.0, 20.0), (760.0, 2.0, 17.0)]
+        {
+            let state = command_chord_layout_state();
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(width, 720.0))
+                .build_ui_state(
+                    move |ui, (state, expected, fonts_ready)| {
+                        if !*fonts_ready {
+                            crate::ui_fonts::configure_fonts(ui.ctx());
+                            ui.ctx().set_zoom_factor(zoom);
+                            *fonts_ready = true;
+                            ui.ctx().request_repaint();
+                            return;
+                        }
+                        ui.style_mut().text_styles.insert(
+                            egui::TextStyle::Monospace,
+                            egui::FontId::monospace(font_size),
+                        );
+                        let keymap = crate::keymap::Keymap::from_settings(&state.settings.keymap);
+                        expected.clear();
+                        for (action, _) in command_chord_layout_bindings() {
+                            for value in keymap.chord_labels(action) {
+                                let galley =
+                                    egui::WidgetText::from(egui::RichText::new(&value).monospace())
+                                        .into_galley(
+                                            ui,
+                                            Some(egui::TextWrapMode::Extend),
+                                            f32::INFINITY,
+                                            egui::FontSelection::Default,
+                                        );
+                                expected.push((value, galley.size()));
+                            }
+                        }
+                        super::command_list(ui, state, &keymap, &[]);
+                    },
+                    (state, Vec::<(String, egui::Vec2)>::new(), false),
+                );
+            harness.run();
+            let expected = &harness.state().1;
+            assert_eq!(expected.len(), 5);
+            let key_left = harness.get_by_label(&expected[0].0).rect().left();
+            let mut key_right = key_left;
+            for (value, size) in expected {
+                let rect = harness.get_by_label(value).rect();
+                assert!(
+                    (rect.width() - size.x).abs() <= 1.0,
+                    "{value}: {rect:?} vs {size:?}"
+                );
+                assert!(
+                    (rect.height() - size.y).abs() <= 1.0,
+                    "chord wrapped: {value}"
+                );
+                assert!(
+                    (rect.left() - key_left).abs() <= 1.0,
+                    "key column must align"
+                );
+                key_right = key_right.max(rect.right());
+            }
+            let path_chords: Vec<_> = expected[2..]
+                .iter()
+                .map(|(label, _)| harness.get_by_label(label).rect())
+                .collect();
+            assert!(
+                path_chords
+                    .windows(2)
+                    .all(|pair| pair[0].bottom() <= pair[1].top())
+            );
+            let contexts: Vec<_> = harness
+                .get_all_by_label(super::key_action_context_label(KeyAction::GridCopyFiles))
+                .collect();
+            assert!(!contexts.is_empty());
+            for context in contexts {
+                assert!(
+                    context.rect().left() + 1.0 >= key_right,
+                    "next column overlaps chord"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn command_chords_catalog_snapshot_dark() {
+        let mut state = command_chord_layout_state();
+        let mut fonts_ready = false;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(900.0, 300.0))
+            .build_ui(move |ui| {
+                crate::os_theme::apply_resolved(ui.ctx(), crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ui.ctx());
+                    fonts_ready = true;
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                let keymap = crate::keymap::Keymap::from_settings(&state.settings.keymap);
+                super::command_list(ui, &mut state, &keymap, &[]);
+            });
+        harness.run();
+        harness.snapshot("command_chords_catalog_dark");
     }
 
     #[test]
@@ -12036,6 +12782,88 @@ mod tests {
                 RingActionId::ClearQuickFolderSlots,
             )]
         );
+    }
+
+    #[test]
+    fn zoom_key_editor_keeps_plus_when_only_another_row_changes() {
+        let mut state = zoom_key_editor_state();
+        let keymap = crate::keymap::Keymap::from_ini_str(
+            "[FsImage]\nFsZoomIn.1 = +\nFsZoomIn.2 = Semicolon\nFsZoomIn.3 = NumpadAdd\n",
+        );
+        let action = KeyAction::FsZoomIn;
+        open_operation_assignment_editor(
+            &mut state,
+            OperationAssignmentTarget::Key(action),
+            OperationAssignmentTab::Keyboard,
+        );
+        super::ensure_command_editor_loaded(&mut state, &keymap, action);
+        assert_eq!(state.command_chord_inputs[0], "+");
+        state.command_chord_inputs[2] = "F24".into();
+        apply_command_editor(&mut state, action);
+        assert_eq!(state.command_edit_error, None);
+        let restored = crate::keymap::Keymap::from_settings(&state.settings.keymap);
+        assert_eq!(
+            restored.effective_chords(action),
+            vec![
+                crate::keymap::Chord::shift(KeyName::Semicolon),
+                crate::keymap::Chord::key(KeyName::Semicolon),
+                crate::keymap::Chord::key(KeyName::F24)
+            ]
+        );
+    }
+
+    fn zoom_key_editor_state() -> PreferencesState {
+        PreferencesState::from_settings(
+            &crate::settings::Settings::default(),
+            crate::external_tool::LaunchTarget::None,
+            None,
+            crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot(),
+            false,
+            0,
+            0,
+            0,
+        )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zoom_key_capture_display_can_be_saved() {
+        let _guard = crate::key_input::lock_test_input();
+        for (ctrl, alt) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut state = zoom_key_editor_state();
+            let keymap = crate::keymap::Keymap::empty();
+            let action = KeyAction::FsZoomIn;
+            super::ensure_command_editor_loaded(&mut state, &keymap, action);
+            let ctx = eframe::egui::Context::default();
+            let _ = ctx
+                .run_pass(Default::default(), |ctx| {
+                    crate::key_input::set_test_frame(vec![crate::key_input::KeyEdge {
+                        operation_id: crate::key_input::KeyOperationId::unassigned(),
+                        source_hwnd: 1,
+                        source_viewport: ctx.viewport_id(),
+                        virtual_key: 0xBB,
+                        scan_code: 0,
+                        extended: false,
+                        pressed: true,
+                        repeat: false,
+                        ctrl,
+                        shift: true,
+                        alt,
+                    }]);
+                    let expected = crate::keymap::Chord::new(ctrl, true, alt, KeyName::Semicolon);
+                    let captured = super::poll_command_chord_capture(ctx, action, false)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(captured, expected.display_name());
+                    state.command_chord_inputs[0] = captured;
+                    apply_command_editor(&mut state, action);
+                    assert_eq!(state.command_edit_error, None);
+                    let restored = crate::keymap::Keymap::from_settings(&state.settings.keymap);
+                    assert_eq!(restored.effective_chords(action)[0], expected);
+                    crate::key_input::clear_test_frame();
+                })
+                .drop_without_applying_deltas();
+        }
     }
 
     #[test]

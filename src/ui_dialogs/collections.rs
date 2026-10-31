@@ -1891,8 +1891,13 @@ impl App {
     ) -> String {
         match target {
             crate::app::FolderNavHistoryTarget::Path(path) => path.to_string_lossy().into_owned(),
-            crate::app::FolderNavHistoryTarget::Rating { stars } => {
-                format!("レーティング: {}", "★".repeat(usize::from(*stars)))
+            crate::app::FolderNavHistoryTarget::ReadingHistory(_) => "閲覧履歴".to_owned(),
+            crate::app::FolderNavHistoryTarget::Bookmarks(_) => "ブックマーク一覧".to_owned(),
+            crate::app::FolderNavHistoryTarget::Physical(restore) => {
+                restore.visible_path.to_string_lossy().into_owned()
+            }
+            crate::app::FolderNavHistoryTarget::Rating(restore) => {
+                format!("レーティング: {}", "★".repeat(usize::from(restore.stars)))
             }
             crate::app::FolderNavHistoryTarget::RatingPhysical(restore) => {
                 restore.visible_path.to_string_lossy().into_owned()
@@ -2267,22 +2272,22 @@ impl App {
     /// add uses the target collection's latest revision rather than a possibly stale manager copy.
     pub(crate) fn add_grid_selection_to_collection(&mut self, collection_id: CollectionId) {
         if !self.collection_ui.can_edit() {
-            self.show_feedback_toast("コレクションを現在編集できません。".into());
+            self.show_feedback_warning("コレクションを現在編集できません。".into());
             return;
         }
         if !self.collection_ui.operation.is_idle() {
-            self.show_feedback_toast("別のコレクション処理が進行中です。".into());
+            self.show_feedback_warning("別のコレクション処理が進行中です。".into());
             return;
         }
         let indices = self.grid_selection_indices();
         if indices.is_empty() {
-            self.show_feedback_toast("コレクションに追加する項目を選択してください。".into());
+            self.show_feedback_warning("コレクションに追加する項目を選択してください。".into());
             return;
         }
         let mut paths = Vec::with_capacity(indices.len());
         for index in indices {
             let Some(item) = self.items.get(index) else {
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     "選択内容が更新されたため、コレクションに追加できません。".into(),
                 );
                 return;
@@ -2292,7 +2297,7 @@ impl App {
                     || "この項目はコレクションに追加できません".to_owned(),
                     |reason| reason.message("コレクションに追加"),
                 );
-                self.show_feedback_toast(message);
+                self.show_feedback_warning(message);
                 return;
             };
             paths.push(path.to_path_buf());
@@ -2323,11 +2328,11 @@ impl App {
             return;
         };
         if self.fullscreen_idx != Some(fs_idx) {
-            self.show_feedback_toast("表示中の項目が変わったため、追加できません。".into());
+            self.show_feedback_warning("表示中の項目が変わったため、追加できません。".into());
             return;
         }
         let Some(item) = self.items.get(fs_idx) else {
-            self.show_feedback_toast("表示中の項目が変わったため、追加できません。".into());
+            self.show_feedback_warning("表示中の項目が変わったため、追加できません。".into());
             return;
         };
         let path = match item {
@@ -2337,7 +2342,7 @@ impl App {
                     || "現在の実画像だけをコレクションに追加できます。".to_owned(),
                     |refusal| refusal.message("コレクションに追加"),
                 );
-                self.show_feedback_toast(reason);
+                self.show_feedback_warning(reason);
                 return;
             }
         };
@@ -2349,7 +2354,7 @@ impl App {
             return;
         };
         if self.fullscreen_idx != Some(fs_idx) {
-            self.show_feedback_toast("表示中の項目が変わったため、追加できません。".into());
+            self.show_feedback_warning("表示中の項目が変わったため、追加できません。".into());
             return;
         }
         let path = match self.items.get(fs_idx) {
@@ -2357,7 +2362,7 @@ impl App {
                 crate::grid_item::GridItem::Video(path) | crate::grid_item::GridItem::Audio(path),
             ) => path.clone(),
             _ => {
-                self.show_feedback_toast("現在の動画・音声ファイルを追加できません。".into());
+                self.show_feedback_warning("現在の動画・音声ファイルを追加できません。".into());
                 return;
             }
         };
@@ -2370,7 +2375,7 @@ impl App {
             .toolbar_collection_target_id
             .map(CollectionId::from_uuid);
         if target.is_none() {
-            self.show_feedback_toast("追加先のコレクションを選択してください。".into());
+            self.show_feedback_warning("追加先のコレクションを選択してください。".into());
         }
         target
     }
@@ -2382,11 +2387,11 @@ impl App {
         paths: Vec<std::path::PathBuf>,
     ) {
         if !self.collection_ui.can_edit() {
-            self.show_feedback_toast("コレクションを現在編集できません。".into());
+            self.show_feedback_warning("コレクションを現在編集できません。".into());
             return;
         }
         if !self.collection_ui.operation.is_idle() {
-            self.show_feedback_toast("別のコレクション処理が進行中です。".into());
+            self.show_feedback_warning("別のコレクション処理が進行中です。".into());
             return;
         }
         let Some(collection_name) = self
@@ -2403,12 +2408,12 @@ impl App {
         else {
             self.collection_ui
                 .request_catalog(self.collection_ui.wanted_catalog_revision);
-            self.show_feedback_toast("追加先のコレクションが見つかりません。".into());
+            self.show_feedback_warning("追加先のコレクションが見つかりません。".into());
             return;
         };
 
         let Some(client) = self.collection_ui.client.clone() else {
-            self.show_feedback_toast("コレクションを利用できません。".into());
+            self.show_feedback_warning("コレクションを利用できません。".into());
             return;
         };
         match client.load_collection(collection_id) {
@@ -2428,7 +2433,7 @@ impl App {
             Err(error) => {
                 let message = collection_error_message(&error);
                 self.collection_ui.message = Some((true, message.clone()));
-                self.show_feedback_toast(format!(
+                self.show_feedback_warning(format!(
                     "「{collection_name}」へ追加できませんでした: {message}"
                 ));
             }
@@ -2905,7 +2910,7 @@ impl App {
                     Ok(Ok(_)) => {
                         let message = "追加先のコレクション応答が一致しませんでした。".to_owned();
                         self.collection_ui.message = Some((true, message.clone()));
-                        self.show_feedback_toast(format!(
+                        self.show_feedback_warning(format!(
                             "「{}」へ追加できませんでした: {message}",
                             request.collection_name
                         ));
@@ -2914,7 +2919,7 @@ impl App {
                     Ok(Err(error)) => {
                         let message = collection_error_message(&error);
                         self.collection_ui.message = Some((true, message.clone()));
-                        self.show_feedback_toast(format!(
+                        self.show_feedback_warning(format!(
                             "「{}」へ追加できませんでした: {message}",
                             request.collection_name
                         ));
@@ -2926,7 +2931,7 @@ impl App {
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
                         let message = "追加先のコレクション応答が失われました。".to_owned();
                         self.collection_ui.message = Some((true, message.clone()));
-                        self.show_feedback_toast(format!(
+                        self.show_feedback_warning(format!(
                             "「{}」へ追加できませんでした: {message}",
                             request.collection_name
                         ));
@@ -2948,14 +2953,14 @@ impl App {
                     self.continue_collection_grid_snapshot(request.target, request.action, snapshot)
                 }
                 Ok(Ok(_)) => {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "表示が切り替わったため、コレクション操作を取り消しました。".into(),
                     );
                     CollectionDialogOperation::Idle
                 }
                 Ok(Err(error)) => {
                     let message = collection_error_message(&error);
-                    self.show_feedback_toast(message.clone());
+                    self.show_feedback_warning(message.clone());
                     self.collection_ui.message = Some((true, message));
                     CollectionDialogOperation::Idle
                 }
@@ -2963,7 +2968,7 @@ impl App {
                     CollectionDialogOperation::GridSnapshot(request)
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    self.show_feedback_toast("コレクション内容の応答が失われました。".into());
+                    self.show_feedback_warning("コレクション内容の応答が失われました。".into());
                     CollectionDialogOperation::Idle
                 }
             },
@@ -3074,7 +3079,7 @@ impl App {
                         Ok(task) => CollectionDialogOperation::ExportAllWriting { progress, task },
                         Err(error) => {
                             self.collection_ui.message = Some((true, error.clone()));
-                            self.show_feedback_toast(error);
+                            self.show_feedback_error(error);
                             CollectionDialogOperation::Idle
                         }
                     }
@@ -3088,7 +3093,7 @@ impl App {
                 Ok(Err(error)) => {
                     let message = collection_error_message(&error);
                     self.collection_ui.message = Some((true, message.clone()));
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     CollectionDialogOperation::Idle
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
@@ -3103,7 +3108,7 @@ impl App {
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     let message = "一括書き出し用一覧の応答が失われました。".to_owned();
                     self.collection_ui.message = Some((true, message.clone()));
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     CollectionDialogOperation::Idle
                 }
             },
@@ -3124,12 +3129,12 @@ impl App {
                     let cancelled = matches!(error, CollectionAllExportFailure::Cancelled { .. });
                     let message = error.message();
                     self.collection_ui.message = Some((!cancelled, message.clone()));
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     CollectionDialogOperation::Idle
                 }
                 Some(Err(error)) => {
                     self.collection_ui.message = Some((true, error.clone()));
-                    self.show_feedback_toast(error);
+                    self.show_feedback_error(error);
                     CollectionDialogOperation::Idle
                 }
             },
@@ -3143,15 +3148,15 @@ impl App {
         action: CollectionGridSnapshotAction,
     ) {
         if !self.collection_ui.operation.is_idle() {
-            self.show_feedback_toast("別のコレクション処理が進行中です。".into());
+            self.show_feedback_warning("別のコレクション処理が進行中です。".into());
             return;
         }
         if action.requires_edit_admission() && !self.collection_ui.can_edit() {
-            self.show_feedback_toast("コレクションを現在編集できません。".into());
+            self.show_feedback_warning("コレクションを現在編集できません。".into());
             return;
         }
         if !self.collection_grid_request_stamp_is_current(target.stamp) {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "現在のコレクション一覧を更新してから操作してください。".into(),
             );
             return;
@@ -3159,11 +3164,11 @@ impl App {
         let client = match self.collection_store_client_for_read() {
             Ok(Some(client)) => client,
             Ok(None) => {
-                self.show_feedback_toast("コレクションを利用できません。".into());
+                self.show_feedback_warning("コレクションを利用できません。".into());
                 return;
             }
             Err(error) => {
-                self.show_feedback_toast(collection_error_message(&error));
+                self.show_feedback_warning(collection_error_message(&error));
                 return;
             }
         };
@@ -3176,7 +3181,7 @@ impl App {
                         receiver,
                     });
             }
-            Err(error) => self.show_feedback_toast(collection_error_message(&error)),
+            Err(error) => self.show_feedback_warning(collection_error_message(&error)),
         }
     }
 
@@ -3201,7 +3206,7 @@ impl App {
             }
             CollectionGridSnapshotAction::SetOrder(intent) => {
                 if intent.content != target {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "表示が切り替わったため、並び順の変更を取り消しました。".into(),
                     );
                     return CollectionDialogOperation::Idle;
@@ -3220,18 +3225,20 @@ impl App {
                         receiver,
                     }),
                     Err(error) => {
-                        self.show_feedback_toast(collection_error_message(&error));
+                        self.show_feedback_warning(collection_error_message(&error));
                         CollectionDialogOperation::Idle
                     }
                 }
             }
             CollectionGridSnapshotAction::OpenReorder => {
                 if snapshot.definition.order_mode != CollectionOrderMode::Manual {
-                    self.show_feedback_toast("手動順のコレクションだけを並べ替えられます。".into());
+                    self.show_feedback_warning(
+                        "手動順のコレクションだけを並べ替えられます。".into(),
+                    );
                     return CollectionDialogOperation::Idle;
                 }
                 if snapshot.entries.is_empty() {
-                    self.show_feedback_toast("並べ替える参照がありません。".into());
+                    self.show_feedback_warning("並べ替える参照がありません。".into());
                     return CollectionDialogOperation::Idle;
                 }
                 self.open_collection_reorder(snapshot, target.selected_entry_id);
@@ -3407,7 +3414,7 @@ impl App {
                 }
                 Ok(Err(error)) => {
                     if matches!(origin, CollectionOperationOrigin::Grid(_)) {
-                        self.show_feedback_toast(collection_error_message(&error));
+                        self.show_feedback_warning(collection_error_message(&error));
                     }
                     self.finish_actor_error(error)
                 }
@@ -3420,7 +3427,7 @@ impl App {
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     if matches!(origin, CollectionOperationOrigin::Grid(_)) {
-                        self.show_feedback_toast("コレクション保存の応答が失われました。".into());
+                        self.show_feedback_warning("コレクション保存の応答が失われました。".into());
                     }
                     self.finish_actor_disconnect()
                 }
@@ -3439,14 +3446,14 @@ impl App {
                     CollectionDialogOperation::Idle
                 }
                 Ok(Err(error)) => {
-                    self.show_feedback_toast(collection_error_message(&error));
+                    self.show_feedback_warning(collection_error_message(&error));
                     self.finish_actor_error(error)
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     CollectionDialogOperation::Submitting(ActorTask::SetOrder { intent, receiver })
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    self.show_feedback_toast("コレクション保存の応答が失われました。".into());
+                    self.show_feedback_warning("コレクション保存の応答が失われました。".into());
                     self.finish_actor_disconnect()
                 }
             },
@@ -3480,7 +3487,7 @@ impl App {
                 }
                 Ok(Err(error)) => {
                     let message = collection_error_message(&error);
-                    self.show_feedback_toast(message);
+                    self.show_feedback_warning(message);
                     self.finish_actor_error(error)
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
@@ -3492,7 +3499,7 @@ impl App {
                     })
                 }
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    self.show_feedback_toast("コレクション保存の応答が失われました。".into());
+                    self.show_feedback_warning("コレクション保存の応答が失われました。".into());
                     self.finish_actor_disconnect()
                 }
             },
@@ -3599,9 +3606,12 @@ impl App {
             } else {
                 format!("「{collection_name}」")
             };
-            self.show_feedback_toast(format!("{prefix}: {message}"));
+            self.show_feedback_result(
+                format!("{prefix}: {message}"),
+                crate::feedback::FeedbackKind::result(is_error),
+            );
         } else if matches!(origin, CollectionAddOrigin::Grid(_)) {
-            self.show_feedback_toast(message);
+            self.show_feedback_result(message, crate::feedback::FeedbackKind::result(is_error));
         }
     }
 
@@ -3613,7 +3623,7 @@ impl App {
     ) {
         self.collection_ui.message = Some((is_error, message.clone()));
         if origin.grid_stamp().is_some() {
-            self.show_feedback_toast(message);
+            self.show_feedback_result(message, crate::feedback::FeedbackKind::result(is_error));
         }
     }
 
@@ -3754,17 +3764,17 @@ impl App {
 
     pub(crate) fn start_collection_export_all(&mut self, parent: PathBuf) {
         if !self.collection_export_all_available() {
-            self.show_feedback_toast("別のコレクション処理が進行中です。".into());
+            self.show_feedback_warning("別のコレクション処理が進行中です。".into());
             return;
         }
         let client = match self.collection_store_client_for_read() {
             Ok(Some(client)) => client,
             Ok(None) => {
-                self.show_feedback_toast("コレクションを利用できません。".into());
+                self.show_feedback_warning("コレクションを利用できません。".into());
                 return;
             }
             Err(error) => {
-                self.show_feedback_toast(collection_error_message(&error));
+                self.show_feedback_warning(collection_error_message(&error));
                 return;
             }
         };
@@ -3780,7 +3790,7 @@ impl App {
                     receiver,
                 };
             }
-            Err(error) => self.show_feedback_toast(collection_error_message(&error)),
+            Err(error) => self.show_feedback_warning(collection_error_message(&error)),
         }
     }
 
@@ -3810,8 +3820,8 @@ impl App {
         let mut open = true;
         let mut action = None;
         let mut cancel_worker = false;
-        egui::Window::new("コレクションの管理")
-            .id(egui::Id::new("collection_manager"))
+        egui::Window::new("コレクションの管理").drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("collection_manager"))
             .open(&mut open)
             .default_size(egui::vec2(720.0, 440.0))
             .min_size(egui::vec2(620.0, 320.0))
@@ -3850,13 +3860,13 @@ impl App {
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("新しいコレクション");
+                    let field_label = ui.label("新しいコレクション");
                     crate::ime_focus::add_singleline(
                         ui,
                         &mut self.collection_ui.manager_new_name,
                         None,
                         |edit| edit.desired_width(220.0),
-                    );
+                    ).labelled_by(field_label.id);
                     let name = self.collection_ui.manager_new_name.trim().to_owned();
                     if ui
                         .add_enabled(
@@ -3879,7 +3889,7 @@ impl App {
                         ui.label(egui::RichText::new("処理中…").weak());
                     }
                 });
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                     .id_salt("collection_definitions")
                     .max_height(300.0)
                     .auto_shrink([false, false])
@@ -3936,9 +3946,10 @@ impl App {
                                         .manager_rename_inputs
                                         .entry(definition.id)
                                         .or_insert_with(|| definition.name.clone());
-                                    crate::ime_focus::add_singleline(ui, input, None, |edit| {
+                                    let name_response = crate::ime_focus::add_singleline(ui, input, None, |edit| {
                                         edit.desired_width(220.0)
                                     });
+                                    crate::ui_helpers::set_accessibility_label(&name_response, "コレクション名を変更");
                                     let new_name = input.trim().to_owned();
                                     let can_rename = !new_name.is_empty()
                                         && new_name != definition.name
@@ -4082,7 +4093,8 @@ impl App {
         }
         let mut cancel = false;
         egui::Window::new("コレクション処理")
-            .id(egui::Id::new("collection_detached_operation_status"))
+            .drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("collection_detached_operation_status"))
             .collapsible(false)
             .resizable(false)
             .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
@@ -4100,7 +4112,7 @@ impl App {
             if let Some(origin) = add_origin {
                 self.report_collection_add_result(&origin, false, "追加を取り消しました。".into());
             } else {
-                self.show_feedback_toast("コレクション処理を取り消しました。".into());
+                self.show_feedback_warning("コレクション処理を取り消しました。".into());
             }
         }
     }
@@ -4367,13 +4379,14 @@ impl App {
             CollectionDialogOperation::Name { action, mut draft } => {
                 let mut keep = true;
                 let mut submit = false;
-                egui::Modal::new(egui::Id::new("collection_name_modal")).show(ctx, |ui| {
-                    ui.heading(match action {
+                egui::Modal::new(egui::Id::unique("collection_name_modal")).show(ctx, |ui| {
+                    let field_label = ui.heading(match action {
                         NameAction::Create => "コレクションを作成",
                         NameAction::Rename { .. } => "コレクション名を変更",
                     });
                     let response =
-                        crate::ime_focus::add_singleline(ui, &mut draft, None, |edit| edit);
+                        crate::ime_focus::add_singleline(ui, &mut draft, None, |edit| edit)
+                            .labelled_by(field_label.id);
                     response.request_focus();
                     ui.horizontal(|ui| {
                         if ui
@@ -4401,7 +4414,7 @@ impl App {
                 name,
             } => {
                 let mut decision = None;
-                egui::Modal::new(egui::Id::new("collection_delete_modal")).show(ctx, |ui| {
+                egui::Modal::new(egui::Id::unique("collection_delete_modal")).show(ctx, |ui| {
                     ui.heading("コレクションを削除");
                     ui.label(format!("「{name}」の定義と参照を削除します。"));
                     ui.label("元のファイルやフォルダは削除しません。");
@@ -4431,7 +4444,7 @@ impl App {
                 origin,
             } => {
                 let mut decision = None;
-                egui::Modal::new(egui::Id::new("collection_remove_modal")).show(ctx, |ui| {
+                egui::Modal::new(egui::Id::unique("collection_remove_modal")).show(ctx, |ui| {
                     ui.heading("コレクションから外す");
                     ui.label(format!(
                         "{} 件の参照をコレクションから外します。",
@@ -4483,7 +4496,7 @@ impl App {
                     return;
                 }
                 let mut decision = None;
-                egui::Modal::new(egui::Id::new("collection_import_preview_modal")).show(ctx, |ui| {
+                egui::Modal::new(egui::Id::unique("collection_import_preview_modal")).show(ctx, |ui| {
                     ui.heading("インポート内容の確認");
                     ui.label(format!("追加先: {}", self.collection_ui.catalog.as_ref().and_then(|catalog| catalog.definitions.iter().find(|item| item.id == collection_id)).map(|item| item.name.as_str()).unwrap_or("不明")));
                     ui.weak("この確認までは対象ファイルやフォルダへアクセスしていません。確認後に存在と種類を調べます。");
@@ -4495,7 +4508,7 @@ impl App {
                         ));
                     }
                     let row_height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
-                    egui::ScrollArea::vertical().max_height(320.0).show_rows(ui, row_height, preview.lines().len(), |ui, row_range| {
+                    egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() }).max_height(320.0).show_rows(ui, row_height, preview.lines().len(), |ui, row_range| {
                         for line in &preview.lines()[row_range] {
                             let is_network = line.source_key.as_ref().is_some_and(|key| {
                                 key.normalized_path().starts_with("//")
@@ -4653,7 +4666,8 @@ impl App {
         let mut refresh = false;
         let mut discard = false;
         egui::Window::new(title)
-            .id(egui::Id::new("collection_reorder_window"))
+            .drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("collection_reorder_window"))
             .open(&mut window_open)
             .collapsible(false)
             .resizable(true)
@@ -4837,6 +4851,10 @@ impl App {
                         let scroll_output = crate::ui_helpers::show_fixed_slot_rows(
                             ui,
                             egui::ScrollArea::vertical()
+                                .scroll_source(egui::scroll_area::ScrollSource {
+                                    drag: egui::scroll_area::DragScroll::Always,
+                                    ..Default::default()
+                                })
                                 .id_salt("collection_reorder_thumb_scroll")
                                 .vertical_scroll_offset(state.scroll_offset_y)
                                 .max_height(scroll_height)
@@ -5032,7 +5050,7 @@ impl App {
                                     });
                             },
                         );
-                        state.scroll_offset_y = scroll_output.state.offset.y;
+                        state.scroll_offset_y = scroll_output.state.clamped_offset().y;
                         if !busy
                             && !pointer_released
                             && state.dragging.is_some()
@@ -5093,7 +5111,7 @@ impl App {
         request: crate::app::collection_grid::CollectionGridRemoveTarget,
     ) {
         if !self.collection_ui.can_edit() || !self.collection_ui.operation.is_idle() {
-            self.show_feedback_toast("コレクションを現在編集できません。".to_string());
+            self.show_feedback_warning("コレクションを現在編集できません。".to_string());
             return;
         }
         self.collection_ui.operation = CollectionDialogOperation::ConfirmRemove {
@@ -5406,7 +5424,7 @@ mod tests {
         });
         let _owner = app.keyboard_owner_for_pass(&ctx);
         app.handle_delete_key(&ctx);
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -6305,8 +6323,12 @@ mod tests {
         let ui_app = std::rc::Rc::new(std::cell::RefCell::new(app));
         let render_app = std::rc::Rc::clone(&ui_app);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1040.0, 760.0))
-            .build(move |ctx| render_app.borrow_mut().show_collection_manager(ctx));
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                render_app.borrow_mut().show_collection_manager(ctx)
+            });
         harness.step();
         harness.get_by_label("コレクションから外す");
         harness.get_by_label("キャンセル").click();
@@ -6412,6 +6434,7 @@ mod tests {
                 },
                 revision_at_open: deleted.revision(),
                 viewport_anchor: None,
+                return_to: None,
             },
         );
         let retained_target = crate::app::FolderNavHistoryTarget::Collection(
@@ -6421,6 +6444,7 @@ mod tests {
                 },
                 revision_at_open: retained.revision(),
                 viewport_anchor: None,
+                return_to: None,
             },
         );
         app.folder_nav_back_stack = vec![
@@ -6604,19 +6628,22 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, theme);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.heading("画像一覧");
-                    ui.label("コレクション管理は独立したウィンドウで表示されます。");
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, theme);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.heading("画像一覧");
+                        ui.label("コレクション管理は独立したウィンドウで表示されます。");
+                    });
+                    ui_app.borrow_mut().show_collection_manager(ctx);
                 });
-                ui_app.borrow_mut().show_collection_manager(ctx);
             });
         harness.step();
         if preview {
@@ -6664,19 +6691,22 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.heading("画像一覧");
-                    ui.label("コレクションの項目を選択しています。");
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.heading("画像一覧");
+                        ui.label("コレクションの項目を選択しています。");
+                    });
+                    app.show_collection_manager(ctx);
                 });
-                app.show_collection_manager(ctx);
             });
         harness.run();
         harness.get_by_label("コレクションから外す");
@@ -6697,19 +6727,22 @@ mod tests {
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(1040.0, 760.0))
-            .build(move |ctx| {
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                if !fonts_ready {
-                    crate::ui_fonts::configure_fonts(ctx);
-                    fonts_ready = true;
-                    ctx.request_repaint();
-                    return;
-                }
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.heading("画像一覧");
-                    ui.label("コレクションの参照順を編集中です。");
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.heading("画像一覧");
+                        ui.label("コレクションの参照順を編集中です。");
+                    });
+                    app.draw_collection_reorder(ctx);
                 });
-                app.draw_collection_reorder(ctx);
             });
         harness.run();
         harness.get_by_label("閉じる");
@@ -7476,8 +7509,12 @@ mod tests {
         let ui_app = std::rc::Rc::new(std::cell::RefCell::new(app));
         let render_app = std::rc::Rc::clone(&ui_app);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1040.0, 760.0))
-            .build(move |ctx| render_app.borrow_mut().draw_collection_reorder(ctx));
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                render_app.borrow_mut().draw_collection_reorder(ctx)
+            });
         harness.step();
         harness.get_by_label("変更を破棄して閉じる").click();
         harness.step();
@@ -7531,8 +7568,12 @@ mod tests {
         let ui_app = std::rc::Rc::new(std::cell::RefCell::new(app));
         let render_app = std::rc::Rc::clone(&ui_app);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1040.0, 760.0))
-            .build(move |ctx| render_app.borrow_mut().draw_collection_reorder(ctx));
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                render_app.borrow_mut().draw_collection_reorder(ctx)
+            });
         harness.step();
         harness.get_by_label("閉じる").click();
         harness.step();
@@ -7616,15 +7657,16 @@ mod tests {
         app.selected = Some(0);
         app.checked.insert(1);
         app.address = "source-folder".into();
-        app.scroll_offset_y = 417.5;
-        app.pending_grid_scroll = Some(crate::app::GridScrollIntent::Bottom);
+        app.grid_scroll.set_position(417.5);
+        app.grid_scroll
+            .request_edge(crate::app::GridScrollIntent::Bottom);
         let source_surface = app.top_level_grid_view.surface().clone();
         let source_address = app.address.clone();
         let source_generation = app.items_generation;
         let source_selected = app.selected;
         let source_checked = app.checked.clone();
-        let source_scroll = app.scroll_offset_y;
-        let source_pending_scroll = app.pending_grid_scroll;
+        let source_scroll = app.grid_scroll.offset();
+        let source_pending_scroll = app.grid_scroll.pending_edge();
         app.add_grid_selection_to_collection(target.collection_id());
         wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
 
@@ -7668,8 +7710,8 @@ mod tests {
         assert_eq!(app.items_generation, source_generation);
         assert_eq!(app.selected, source_selected);
         assert_eq!(app.checked, source_checked);
-        assert_eq!(app.scroll_offset_y, source_scroll);
-        assert_eq!(app.pending_grid_scroll, source_pending_scroll);
+        assert_eq!(app.grid_scroll.offset(), source_scroll);
+        assert_eq!(app.grid_scroll.pending_edge(), source_pending_scroll);
         assert_eq!(std::fs::read(&ignored).unwrap(), b"ignored-source");
         assert_eq!(std::fs::read(&checked).unwrap(), b"checked-source");
         assert_eq!(std::fs::read(&existing).unwrap(), b"existing-source");
@@ -7957,7 +7999,7 @@ mod tests {
         ];
         app.selected = Some(0);
         app.checked.insert(1);
-        app.scroll_offset_y = 93.0;
+        app.grid_scroll.set_position(93.0);
 
         app.add_grid_shortcut_to_collection_target();
         let CollectionDialogOperation::ToolbarAddSnapshot(request) = &app.collection_ui.operation
@@ -7988,7 +8030,7 @@ mod tests {
             .unwrap();
         assert!(untouched.entries.is_empty());
         assert_eq!(app.selected, Some(0));
-        assert_eq!(app.scroll_offset_y, 93.0);
+        assert_eq!(app.grid_scroll.offset(), 93.0);
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -8202,7 +8244,7 @@ mod tests {
             crate::grid_item::GridItem::Video(paths[2].clone()),
         ];
         app.selected = Some(0);
-        app.scroll_offset_y = 81.0;
+        app.grid_scroll.set_position(81.0);
         let ctx = egui::Context::default();
         for (context, fullscreen_idx) in [
             (crate::ring_shortcut::RingShortcutContext::Grid, None),
@@ -8227,7 +8269,7 @@ mod tests {
             );
             wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
             assert!(app.top_level_grid_view.collection_session().is_none());
-            assert_eq!(app.scroll_offset_y, 81.0);
+            assert_eq!(app.grid_scroll.offset(), 81.0);
         }
         let snapshot = client
             .load_collection(collection.collection_id())
@@ -8274,7 +8316,7 @@ mod tests {
             app.fs_feedback_toast.is_none(),
             "same key press must not be reused"
         );
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
 
         app.fullscreen_idx = Some(0);
         ctx.begin_pass(egui::RawInput {
@@ -8287,7 +8329,7 @@ mod tests {
             app.fs_feedback_toast.is_none(),
             "Grid action must not run in FS"
         );
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
     }
 
     #[test]
@@ -8826,7 +8868,17 @@ mod tests {
         assert!(app.collection_export_all_available());
         app.start_collection_export_all(temp.path().to_path_buf());
         assert!(!app.collection_export_all_available());
-        app.start_collection_export_all(temp.path().join("must-not-start"));
+        for (setting, factor) in [
+            (crate::settings::NotificationDuration::Short, 1.0),
+            (crate::settings::NotificationDuration::Standard, 1.0),
+            (crate::settings::NotificationDuration::Long, 1.5),
+        ] {
+            app.settings.notification_duration = setting;
+            app.start_collection_export_all(temp.path().join("must-not-start"));
+            let (text, _, seconds) = app.fs_feedback_toast.as_ref().unwrap();
+            assert_eq!(text, "別のコレクション処理が進行中です。");
+            assert_eq!(*seconds, 1.2 * factor);
+        }
         assert!(matches!(
             app.collection_ui.operation,
             CollectionDialogOperation::ExportAllSnapshot { .. }
@@ -8942,8 +8994,12 @@ mod tests {
         };
         let ui_app = std::rc::Rc::clone(&app);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1040.0, 760.0))
-            .build(move |ctx| ui_app.borrow_mut().show_collection_manager(ctx));
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                ui_app.borrow_mut().show_collection_manager(ctx)
+            });
         harness.step();
         harness.get_by_label("取り消す").click();
         harness.step();
@@ -8993,8 +9049,12 @@ mod tests {
         };
         let ui_app = std::rc::Rc::clone(&app);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1040.0, 760.0))
-            .build(move |ctx| ui_app.borrow_mut().show_collection_manager(ctx));
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                ui_app.borrow_mut().show_collection_manager(ctx)
+            });
         harness.step();
         harness.get_by_label("取り消す").click();
         harness.step();

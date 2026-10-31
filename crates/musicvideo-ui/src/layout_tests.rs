@@ -40,7 +40,7 @@ impl Harness {
 
     fn frame(&mut self, events: Vec<Event>) {
         self.time += 0.1;
-        self.output = self.context.run(
+        self.output = crate::headless_paint_output(self.context.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 1000.0))),
                 time: Some(self.time),
@@ -51,21 +51,21 @@ impl Harness {
                 let mut prepared = self.state.begin_frame(ctx, &mut self.project);
                 // Capture what the FIRST input region sees, not just final state.
                 self.timeline_entry = prepared.project.clone();
-                egui::TopBottomPanel::top("history").show(ctx, |ui| prepared.history_controls(ui));
-                self.panels[0] = egui::TopBottomPanel::bottom("timeline")
-                    .default_height(300.0)
+                egui::Panel::top("history").show(ctx, |ui| prepared.history_controls(ui));
+                self.panels[0] = egui::Panel::bottom("timeline")
+                    .default_size(300.0)
                     .show(ctx, |ui| prepared.timeline(ui, 0.0, None))
                     .response
                     .rect;
                 let mut frame = prepared.properties();
                 self.properties_entry = frame.checkpoint.0.project.clone();
-                self.panels[1] = egui::SidePanel::left("layers")
-                    .default_width(220.0)
+                self.panels[1] = egui::Panel::left("layers")
+                    .default_size(220.0)
                     .show(ctx, |ui| frame.layer_list(ui))
                     .response
                     .rect;
-                self.panels[2] = egui::SidePanel::right("inspector")
-                    .default_width(360.0)
+                self.panels[2] = egui::Panel::right("inspector")
+                    .default_size(360.0)
                     .show(ctx, |ui| {
                         frame.inspector_with_project_path(
                             ui,
@@ -80,7 +80,7 @@ impl Harness {
                 self.response = frame.finish();
                 egui::CentralPanel::default().show(ctx, |_| {});
             },
-        );
+        ));
     }
 
     fn label(&self, text: &str) -> Rect {
@@ -414,16 +414,12 @@ fn split_layout_tab_round_trip_preserves_each_fields_native_undo() {
     assert_eq!(h.project.layers[index].name, original_name);
     assert_eq!(h.project.display_gain_db, 12.0);
     h.click("プロジェクト");
-    let gain_id = h.focus_gain_text();
+    h.focus_gain_text();
     for _ in 0..3 {
         h.shortcut(egui::Key::Z, Modifiers::CTRL | Modifiers::COMMAND);
-        let text = h
-            .context
-            .data(|data| data.get_temp::<String>(gain_id))
-            .unwrap();
-        let value = text
-            .parse::<f32>()
-            .expect("gain Undo must only restore numeric text");
+        // egui 0.37 keeps DragValue's edit text in a private typed state.
+        // Observe the actual numeric edit through the production model instead.
+        let value = h.project.display_gain_db;
         if value == 0.0 {
             break;
         }

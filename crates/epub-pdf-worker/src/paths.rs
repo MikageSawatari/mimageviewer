@@ -166,17 +166,17 @@ impl Drop for OutputTemp {
 mod tests {
     use super::*;
 
-    fn test_root(label: &str) -> PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+    fn test_root(label: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("epub-pdf-{label}-"))
+            .tempdir()
             .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("epub-pdf-{label}-{}-{nonce}", std::process::id()))
     }
 
     #[test]
     fn output_temp_is_sibling_and_removed_on_failure() {
-        let root = test_root("path-test");
+        let temp = test_root("path-test");
+        let root = temp.path().join("root");
         let out = root.join("book.pdf.part");
         {
             let temp = OutputTemp::new(&out, 123, 2).unwrap();
@@ -195,12 +195,12 @@ mod tests {
             output_temp_path(Path::new("book.pdf"), 123, 1).unwrap(),
             Path::new(".").join("book.pdf.tmp-123-1")
         );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn rejects_user_data_ancestors() {
-        let root = test_root("validation");
+        let temp = test_root("validation");
+        let root = temp.path().join("root");
         let input = root.join("input/book.epub");
         let out = root.join("output/book.pdf.part");
         let work = root.join("work");
@@ -234,7 +234,8 @@ mod tests {
 
     #[test]
     fn compares_user_data_by_directory_identity() {
-        let root = test_root("file-id");
+        let temp = test_root("file-id");
+        let root = temp.path().join("root");
         let first = root.join("first");
         let second = root.join("second");
         fs::create_dir_all(&first).unwrap();
@@ -242,6 +243,5 @@ mod tests {
         assert!(same_directory_identity(&first, &root.join("first/.")).unwrap());
         assert!(!same_directory_identity(&first, &second).unwrap());
         assert!(same_directory_identity(&first, &root.join("missing")).is_err());
-        fs::remove_dir_all(root).unwrap();
     }
 }

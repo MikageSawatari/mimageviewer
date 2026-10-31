@@ -8,6 +8,11 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
+| [list-order-book-navigation-plan.md](list-order-book-navigation-plan.md) | §1.444 一覧の表示順で前後の本へ移る操作。凍結列の context 所有・都度位置解決・既存 fullscreen 採用経路・検証記録 |
+| [section445-stepped-slider-input.md](section445-stepped-slider-input.md) | §1.445、GPUメモリ上限などの手入力。eguiの編集状態とstep丸めの原因、共通修正、兄弟欄とheadless回帰・検証記録 |
+| [section443-font-color-fix.md](section443-font-color-fix.md) | §1.443、単色 EBDT 字形のカラー誤判定。epaint 0.37 の vendor 差分、実フォント・mesh 回帰と検証記録 |
+| [gpu-init-fallback-plan.md](gpu-init-fallback-plan.md) | §1.448 GPU 初期化と§12の§1.429 surface設定失敗。`--gpu-backend`、DX12 の FXC 固定、初回 device 作成だけの DX12 → Vulkan 有限選択、試行別診断と起動中だけの Error 保存。報告環境の原因や改善は未確認 |
+| [render-init-failure-report-plan.md](render-init-failure-report-plan.md) | §1.428 run_nativeのErr終了。watchdog休止・原因連鎖の記録・cleanup・終了flush後のnative通知、script自動実行時の表示抑止と検証記録。初回rootのsurface設定失敗は§1.429でErrへ接続し、起動後のsurface失敗とuncaptured-error handlerは従来のpanicを維持 |
 | [detached-snapshot-reader-plan.md](detached-snapshot-reader-plan.md) | 2026-10-15利用者採択はC1だけ。独立reader／promote後の受動更新を停止、能動Operation／BookAppend系の由来は要求・保留・完了・restartまで既存cause型で保持。整理完了もOperationへ接続。関連970件成功、fmt・通常／portable check成功。full一回は音声pumpの1件失敗・単独では成功、vendor gate未実施。実装・検証記録は§9。linked中は変更なし。案Aは履歴・source／main-owner境界だけ参照、C2／C3は今回対象外 |
 | [coding-conventions.md](coding-conventions.md) | CLAUDE.md から分けたコーディング規約の全文。UI・ダイアログ・パネル・IME・スクロール・配色・並行処理・UI スレッドの I/O・グリフ・外部ツール向けテキストを触るとき |
 | [native-dependencies.md](native-dependencies.md) | CLAUDE.md から分けたネイティブ依存物の管理。vendor/ の復旧、PDFium・ONNX Runtime・Susie・FFmpeg・LibRaw・VST3 bridge の更新やビルド |
@@ -29,11 +34,14 @@
 | [libraw-source-distribution.md](libraw-source-distribution.md) | LibRaw の対応ソース・checksum・notice の準備と公開手順 |
 | [ime-process-keys-plan.md](ime-process-keys-plan.md) | IME 処理済みキーの根本修正。I1 共有化、I2 の経緯・Google / MS-IME の先行実機記録、300ms grace 撤去、focus 所有、egui 本家 #7967 との整合と移植検証 |
 | [architecture-overview.md](architecture-overview.md) | 全体像の把握。レイヤー構造・モジュールマップ・永続化ストア一覧 |
+| [book-key-migration-plan.md](book-key-migration-plan.md) | §1.272/§1.273 本の並べ替え・移動/コピー・改名・削除と中央 DB の追従、§1.245 しおり番号の正本。設計 v4、§3.10 で実装中の判断を決定。単一 owner、FS 前の静止、STORES 方針列、移行元優先、service 内の本移動参照解除。別窓・Snapshot は作り直さず、旧 path 再照合の限界は §3.10。全件テスト・レビュー追補は §8.7、D2c は §8.8、削除 purge と XMP ★ import の取消境界は §8.9 |
 | [book-composition-plan.md](book-composition-plan.md) | §1.242 本の構成。B1採択設計とB2実装・検証の正本。方向・表紙・順序・hidden・ページ指定を保存し、通常builderで組を自動生成。旧units移行なし。Remoteの制限範囲・表示許可・位置・転送・出力・editor行高の受入条件を含む。旧G履歴は保持。画像folderは対象外でStored ZIPへ変換する。次のリリース向けnext-bookで開発 |
 | [image-folder-to-zip-plan.md](image-folder-to-zip-plan.md) | §1.242 の独立した画像folder→Stored ZIP変換の設計R3（対象7346683c6、独立レビューACCEPTは利用者報告）、実装中。画像タグのZIP本体集約、XMP評価補充、favorite表示状態FIFO、取消/完了選択、既存再帰範囲。2026-10-12利用者決定でCollectionは元参照を保持し、型拡張・容量検査・複製を除外。同名3択と旧ON→本表示/旧OFF→両方表示は決定済み |
 | [thumbnail-request-lifecycle-plan.md](thumbnail-request-lifecycle-plan.md) | §1.360 サムネイル要求とCPU画像の単一owner、保存/画像両終端、request ID相関、動画のidle/repaint/進捗投影、tray両測定、回帰・検証証拠 |
 | [section327-startup-window-flicker-investigation.md](section327-startup-window-flicker-investigation.md) | §1.327 起動時の白窓、native診断の採取・観測限界、利用者ログで確認した最大化起動の原因、採用したnormal表示後の一度だけの最大化 (§8)。大規模backend案 (§7) は将来候補 |
+| [notification-duration-policy.md](notification-duration-policy.md) | §1.402 成功通知の簡潔化と時間の全体設定。単一時間ポリシー、typedな種類、固定秒数/nativeの適用・例外と呼出元棚卸し |
 | [display-pipeline.md](display-pipeline.md) | サムネイル表示・フルスクリーン描画を触るとき。**補正/AI/回転の適用順の決定版** |
+| [section403-front-popup-input-investigation.md](section403-front-popup-input-investigation.md) | §1.403 予定の調査。静止画の前面 UI / layer / input gate と raw consumer の到達表、3件の実描画再現テスト、所有単位の所見。未修正 |
 | [audio-album-art-plan.md](audio-album-art-plan.md) | **§1.347 利用者実機確認の成功記録、共有設定を「表示 → サムネイル」へ移設・動画と音声の画像省略一致を確認 (§22)、Remote受付証明/ZIP RAW継続の修正・検証と取消保証の文書訂正 (§21)、bounded Rust gateの受入証拠 (§20)、前実装検証 (§19)、FFmpeg gate失敗履歴 (§15)**。動画と共通の同名 sidecar と MP3 埋め込み画像を本体・Remote の一覧に表示する仕様・実装と検証記録。既存設定・画像行省略・出所と更新、3 択の音声表示マーク、Rust APIC 読取の依存比較・割当前上限と新 gate、再生時割当の別観測、終端状態、catalog、IPC 版、2026-10-08 利用者訂正 (手動 pin は範囲外) |
 | [final-cover-spread-plan.md](final-cover-spread-plan.md) | 末尾に表紙を添える見開きの実装・検証記録。本体・連結読み・Remoteで共有する描画構成、読書位置と表示役割の分離、全体/本別設定 |
 | [spread-shift-memory-plan.md](spread-shift-memory-plan.md) | §1.364 R3、D2/D2bの履歴と§11.6の2026-10-11利用者決定。D1の永続root/相対payload移行は維持し、D2cでopen-contextのroot追従・同本pending-open直列化を撤去。§11.7で独立resume fence、§11.8でretained調整保持とscope epoch、§11.9で書込み前import取消の変更なしleaseを規定。D3はRemoteのfull-scope保存基点解決・完全応答parity・acquire/SetSpread fenceと共有C1–C12 fixture。masterで確認した既存budget制限と変換書庫のlogical base keyを保持。検証記録は§11.10、G3 consumerは未統合 |
@@ -42,6 +50,8 @@
 | [spread-endpoint-and-blank-pages-plan.md](spread-endpoint-and-blank-pages-plan.md) | §1.239先頭/末尾の配置分離と§1.240端近くの実ページ単独表示。旧設定移行、白い空き slot の描画、Remote・多窓検証、将来の本構成との境界 |
 | [async-architecture.md](async-architecture.md) | 並列処理・キャンセル・キャッシュ競合を触るとき。ワーカー一覧とテンプレ。動画 packet/control channel、bridge 内 per-slot VST GUI thread、Normalize scan lifecycle を含む |
 | [similar-index-incremental-reconcile-plan.md](similar-index-incremental-reconcile-plan.md) | 類似索引の全件反復を解消する独立ブランチの設計・実装計画。watch 差分、収束条件、scope prune、検索 snapshot 公開と synthetic 検証 |
+| [similar-index-flaky-startup-marker-investigation.md](similar-index-flaky-startup-marker-investigation.md) | startup marker テストの負荷時失敗。base 公開の error 5 を自然再現し、同一 manager の構成変更による loader 競合も決定的に確認。調査時点の方針候補・証跡を記録。修正は後継owner計画の実装記録を参照 |
+| [similar-index-array-owner-plan.md](similar-index-array-owner-plan.md) | §1.404 の採択設計と実装・検証記録。store ごとの単一配列 owner、load/refresh/compaction/prune の直列化、ack・query scope・shutdown と再オープン、回復入口・診断・受入条件。実装済み、gate結果は§16 |
 | [similar-index-startup-and-delta-optimization-plan.md](similar-index-startup-and-delta-optimization-plan.md) | 起動FS確認の分類別計測と、更新時DB整理のscope限定化・メモリ案比較。実装・性能検証記録 |
 | [similar-book-query-limit-plan.md](similar-book-query-limit-plan.md) | **完了 (2026-09-19、利用者が実機で確認)**。ページ数上限 3,000 / 候補の総ページ予算 10,000。旧 §1.254 「この本と重なる本」が大きな画像フォルダで終わらない件の正本。perf ログ・索引 DB・読み取り専用ベンチの実測 (所要時間は候補の本の総ページ数で決まる)、対称のページ数上限 + 仕事量の予算、「索引を更新中です」表示の削除、再測定手順 |
 | [section228-similar-container-preopen-plan.md](section228-similar-container-preopen-plan.md) | §1.228 起動時と「今すぐ確認」で変更がないZIP/PDFの再列挙を省略する条件。Initial / UserCheck の再利用、修復Full・差分更新の維持と検証記録 |
@@ -53,6 +63,7 @@
 | [container-index-startup-optimization-plan.md](container-index-startup-optimization-plan.md) | コンテナ索引の起動・watch更新に共通するDB直下置換SQLの範囲限定。小規模修正の設計・検証記録 |
 | [ui-responsiveness.md](ui-responsiveness.md) | UI スレッド同期 I/O で UI を止めないための設計方針。**新機能追加前にチェックリスト §4 を必ず見る** |
 | [startup-diagnostics-plan.md](startup-diagnostics-plan.md) | §1.241 常時起動timeline、実PRESENT、5秒Indexer overlay、単一採用、狭いwatchdog。Phase Aと§1.335統合後の初期フォルダPhase Bの境界は§10 |
+| [ai-crash-655-investigation.md](ai-crash-655-investigation.md) | §1.482の調査・確定設計・段階実装。終了印/次回通知、活動中checkpoint、panic/native/device-lost、現役ORT失敗の即時通知と安全なコピー。段A〜D実装済み・実機未確認。段A〜Cは独立ACCEPT、段Dは検証・受入中 |
 | [preferences-layout-guidelines.md](preferences-layout-guidelines.md) | 環境設定 UI のページ構成、配置、レスポンシブレイアウトを触るとき |
 | [v3.7.0-input-and-still-seek-plan.md](v3.7.0-input-and-still-seek-plan.md) | v3.7.0 の動画ホイール・マウスボタン割り当て、段階別シーク秒数、詳細表示起点の不具合と静止画サムネイル列5段階の実装計画 |
 | [release-check-automation-plan.md](release-check-automation-plan.md) | **2026-10-11利用者採用**。毎リリースのReleaseChecks suite（隔離seed、5 idle、cached／uncached perf）、証拠・既知startup gapの上限500ms・foreground条件・採用run記録。手動／実データ確認の範囲も維持 |
@@ -66,6 +77,7 @@
 | [folder-tree-sort-plan.md](folder-tree-sort-plan.md) | §2.25 ツリー専用の並び順と、展開・現在位置を保持するworker再列挙の設計。§2.24の一覧サイズ順に先行 |
 | [collection-spec-proposal.md](collection-spec-proposal.md) | §1.118 名前付きコレクションの初期仕様案と、その後の利用者判断の記録。現在の操作仕様はマニュアル、実装状態は実装計画 §23 を参照 |
 | [collection-implementation-plan.md](collection-implementation-plan.md) | コレクションの保存・管理UI・一覧・再生・Remoteを触るとき。actorと各画面の所有境界、出荷前修正の実装・検収台帳 |
+| [collection-return-investigation.md](collection-return-investigation.md) | 2026-10-30 X投稿の「本から戻ると違う場所」。v4.10.0相当のheadless試験で帰り先・選択を保ったスクロールずれを再現。>>661との関係と20件の証跡 |
 | [folder-history-location-plan.md](folder-history-location-plan.md) | **Stage B 実装・自動 gate 完了**。§1.280 / §1.281 / §1.282 の Rating・Collection子の表示位置とフォルダ履歴、A/B・detached の所有境界、Rating 一覧ソート保存の設計・検証台帳。実アプリ smoke は未実行 |
 | [file-type-visibility-plan.md](file-type-visibility-plan.md) | **実装済み・独立レビュー指摘修正と自動検証済み（利用者決定2026-10-08/09、実機確認待ち）**。§1.345の全体ファイル種類設定、全一覧producer・代表画像・本判定・Remoteの共通ポリシー、旧変換cache通知、本内ブックマークのcontext所有と検証記録。§1.339の履歴再入場facet退避の独立した根治設計。bf509352dの独立レビュー承認を記録 |
 | [startup-restore-target-plan.md](startup-restore-target-plan.md) | §1.335「前回終了した場所」の明示一覧所有、物理／本／Drive の復元範囲、旧データの初回移行、ZIP 内階層、一覧復帰要求の受理境界と回帰検証。実機確認は未実施 |
@@ -75,6 +87,7 @@
 | [collection-remote-plan.md](collection-remote-plan.md) | Phase 5の認証済みRemote一覧・閲覧、server-side latest navigation、session / route owner、path・budget・終了順の実装・検収記録 |
 | [post-v3.9.0-sequential-work.md](post-v3.9.0-sequential-work.md) | v3.9.0後の直列開発。§1.115再確認から依存更新・UI改善を経て§1.220までの順序と完了管理 |
 | [dependency-update-20260912.md](dependency-update-20260912.md) | PDFium 8044更新とFFmpeg現行維持の理由、ライセンス、非対話試験、確認buildの内包照合 |
+| [dependency-update-20261028.md](dependency-update-20261028.md) | 依存物更新 段A/B/C。Rust・通常crate・PDFium 8125・LibRaw 0.22.3、ort rc.15 / ORT DirectML 1.24.4、tantivy 0.27.0の版・資産照合・旧索引互換・検証と保留事項 |
 | [msstore-startup-hang-vcrt-investigation-20260915.md](msstore-startup-hang-vcrt-investigation-20260915.md) | §1.241 VC++ ランタイムの無い Windows で起動が終わらない (Store 審査却下) の原因。onnxruntime.dll の依存、ort の失敗経路のデッドロック、Sandbox での陽性対照と修正候補 |
 | [section241-ort-vcrt-startup-fix-plan.md](section241-ort-vcrt-startup-fix-plan.md) | §1.241 の修正設計と検収記録。upstream ort backport、process 共通 AI runtime owner、app-local Microsoft VC runtime、TensorRT typed failure、全 PE 配布 gate |
 | [sidecar-first-visit-investigation-20260912.md](sidecar-first-visit-investigation-20260912.md) | §1.226 初訪問の旧XMPタグ読み取り待ちの調査と自動取り込み廃止。現在のタグDB・一般XMP・サイドカー復元を維持する境界 |
@@ -85,6 +98,7 @@
 | [tray-residency-cpu-spin-investigation.md](tray-residency-cpu-spin-investigation.md) | v2.10.0 のトレイ格納後 main-thread CPU spin の計装結果、producer / consumer、eframe scheduler 根本修正 |
 | [virtual-folders.md](virtual-folders.md) | ZIP/PDF 関連を触るとき。**通常画像との分岐チェックリスト** |
 | [folder-representative-plan.md](folder-representative-plan.md) | §1.275/§1.276 のフォルダ自動代表。候補順、ZIP/PDF の既存 cache 再利用、catalog revision と選定 proof、pin key の互換性 |
+| [folder-representative-idle-archive-plan.md](folder-representative-idle-archive-plan.md) | **§1.398 設計案・独立レビュー前・未実装**。表示周辺の ZIP/PDF idle 作成、優先・取消・context 所有、確定否定の永続化と再探索、移行・回帰・性能検証 |
 | [archive-page-load-scheduler-plan.md](archive-page-load-scheduler-plan.md) | **設計合意済み・未実装**。書庫の高速ページ送りが詰まる問題 (§1.174) の正本。ページ読み込みの受付・待機・実行・取消中・終了を上限つきで所有する `FsPageLoadScheduler`、ZIP 中央目次の再利用、アニメーション通知の分離 |
 | [pdf-page-count-cache-plan.md](pdf-page-count-cache-plan.md) | PDF ページ数キャッシュ、worker 境界、失敗時の扱いを触るとき |
 | [preset-and-adjustment.md](preset-and-adjustment.md) | 補正・プリセット・AI キャッシュを触るとき。**無効化ルールの早見表** |
@@ -94,6 +108,7 @@
 | [web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md) | リモートの動画 / 音声。PC 側トランスコード + HLS 配信、画質 mode、seek と再接続 |
 | [web-remote-left-panel-plan.md](web-remote-left-panel-plan.md) | リモートの左パネル (場所 / 検索 / タグ / お気に入り / 本棚) の範囲と、本体一覧との差 |
 | [web-remote-ai-plan.md](web-remote-ai-plan.md) | **段 3b-0〜3b-2 実装・実機確認済み。JPEG 転送 / 端末別画質 mode は実装済み・実機確認待ち**。remote AI アップスケール / デノイズの PC modal 排他、共有 canonical decoder、接続取得 / 切断 drain barrier、App 所有 singleton Runtime、stable remote key、HTTP job、Web UI、画面消灯復帰、VRAM、撤退条件 |
+| [mcp-integration-plan.md](mcp-integration-plan.md) | **設計検討中 (2026-10-30)**。AI 連携 (MCP)。stdio の別 exe と本体の agent lane (Remote IPC とは別の pipe・版)、Remote 操作権との関係、安全性、公開文書への影響、tool の段階分けと試験実装 |
 | [local-adjust-testing.md](local-adjust-testing.md) | 部分補正レイヤーの回帰テスト、合成順、キャッシュ無効化を検証するとき |
 | [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグを触るとき。**Ctrl+S/F/G/R の経路、Everythingの共通Search ownership、インデクサパイプライン + DB 責任分離** |
 | [name-index-write-failure-plan.md](name-index-write-failure-plan.md) | §1.369 名前／コンテナ索引の書込失敗。レビュー反映・実装と検証記録。同じDBの起動中1回の通知／予約、通常UIへの配送、Full/watch/clearの共通出口、無害なno-opの維持 |
@@ -132,6 +147,7 @@
 | [detached-viewer-keepalive-design.md](detached-viewer-keepalive-design.md) | keep-alive の不変条件、target 設計、K0〜K3 の現況。K0 完了、K1 未完、K2/K3 部分完了で、single render entry は未実装 |
 | [detached-viewer-smoke-checklist.md](detached-viewer-smoke-checklist.md) | K0 詳細 smoke の補助チェックリスト。現行 registry ログ (`registered host` / `hwnd_adopted_*`) に対応。リリース全体は ship checklist を正とする |
 | [detached-rework-plan.md](detached-rework-plan.md) | **detached viewport リワーク正本**。§9 が唯一の現況表。R2b は部分完了、R3 は実質完了、R4 は未完 |
+| [detached-book-page-overview-plan.md](detached-book-page-overview-plan.md) | **§1.340 R5双方合意、PDF／EPUB接続と最終修正は独立ACCEPT、自動検証補完済み**。既定Oの通常fullscreen／メイン内／detachedページ一覧、通常ページ移動・Grid同期、active／passive所有、bounded demandと取消。§1.377の既存owner-scoped APIへ接続。full 1回の環境／fixture／回帰修正と補完実数、確認buildは§20。構成白紙adapterは§1.242未統合、実機受入は未完了。先行履歴は§17／§19 |
 | [detached-rework-ship-checklist.md](detached-rework-ship-checklist.md) | 現行リワーク出荷前 smoke matrix (F/W/V/P/R 系)。独立静止画窓の Ctrl 物理フォルダ移動と configurable 右クリックを含む |
 | [details-view-and-filter-plan.md](details-view-and-filter-plan.md) | **Ph1〜Ph4 + Ph5 画像/動画/作成日時遅延列まで実装済み**。ファイル選択画面の詳細表示モード (サムネ無しで名前/サイズ/日付＋★/タグ/編集フラグを行表示) ＋ Excel オートフィルタ風スマートフィルタの設計。現状は列セクションの詳細切替、右クリック列表示メニュー、`details_order` による列ヘッダ 3 トグルソート、種類/拡張子/場所/★/タグ/日付/サイズ/状態の共通 `FacetFilter`、遅延列 worker / 進捗表示、作成日時列、画像解像度列、長さ/動画解像度/コーデック列まで実装済み (長さ・コーデックは音声も対応)。場所は元ファイル/元コンテナの親フォルダで、製本フォルダは `本棚 > 本名` 表記。場所条件は移動で解除される非永続の一時条件。EXIF/PDF/アーカイブ系の追加遅延列は後続 |
 | [file-organize-destinations-plan.md](file-organize-destinations-plan.md) | **実装済み (レビュー前)**。固定整理先の登録、Shell によるコピー・移動と実機確認 |
@@ -142,7 +158,7 @@
 | [key-command-catalog-plan.md](key-command-catalog-plan.md) | **Phase 6 menu layout editor まで実装済み / ClaudeCode レビュー済み。native 動画 overlay ヘルプ重なり補正もレビュー済み。v2.2.0 重要変更点 entry 追加済み / ClaudeCode レビュー済み。旧 `keymap.ini` → `Settings.keymap` 一回移行済み。設定メニュー「操作カスタマイズ」独立ダイアログ移設 + 統合割り当て編集ダイアログ改善、場所系 / ページジャンプ KeyAction 追加済み、Enter / Backspace / Home / End / PageUp / PageDown の閲覧ナビ KeyAction 化スライス実装中**。簡易 keymap の次段階として、デフォルト未割り当て操作もコマンド設定から割り当て可能にする計画。Phase 1〜4 で既定未割り当て、競合 warning、グリッド F7-F10、フルスクリーン縦方向 resolver を段階実装。Phase 5 でツール / メニュー / hover / native 動画 overlay / ★ tooltip の shortcut 表記を keymap 追従に変更。Phase 7 では active scope から実 shortcut label を取り出す基盤と、各文脈のコンテキストヘルプ、`HelpShowContextShortcuts` によるヘルプキー自体の keymap 化まで実装済み。Phase 6 では `MenuCommandId` / `MenuCommandSpec` / `TopMenuId` の基盤、全 top menu の固定ラベル leaf 項目 catalog 化、parent 別 catalog iterator、enum ⇄ `ALL` drift テスト、stable name 文字列ベースの `MenuLayoutSettings` と resolver、`Settings.menu_layout` 永続化、固定 leaf 項目 / 空 top menu の表示 ON/OFF、top menu order とメニュー内 command order の描画接続、環境設定「表示 → メニュー構成」での固定 leaf 項目の表示 / 非表示と順序編集まで実装済み。動的ブロックは既存アンカーに残す。Esc / 修飾なし矢印は予約警告 |
 | [ring-keyaction-parity.md](ring-keyaction-parity.md) | RingActionId と KeyAction の対応棚卸し。リング / パッド / ジェスチャ側だけに操作を足してキーボード側の KeyAction 化を忘れないための恒久チェック表。`src/keymap.rs` の parity テストと合わせて更新する |
 | [operation-customize-share-plan.md](operation-customize-share-plan.md) | **実装済み** (バックログ §4.6 の正本)。操作カスタマイズ (keymap / ring_shortcuts / menu_layout の 3 点セット) を `.mivkeys.json` にエクスポート / インポート (置換のみ) して共有し、標準 / 現在 / 前世代との差分を表表示し、`settings.db` 世代 (bak1..bak10) から操作カスタマイズだけを再起動なしでライブ取り込みする機能。既存「設定の復元」ダイアログをタブ化 (`設定の復元` / `操作カスタマイズ`) して集約。スキーマ非変更 (世代を読むだけ + ファイル入出力 + 純関数差分) |
-| [file-drag-drop-design.md](file-drag-drop-design.md) | グリッドからエクスプローラ等へファイルをドラッグ送出 (コピー) する機能の実装設計＋実装メモ。シェル `IDataObject` + `SHDoDragDrop` 方式。実装済み (2026-05、`src/file_drag.rs`)、残るは §8.2 の実機検証 |
+| [file-drag-drop-design.md](file-drag-drop-design.md) | グリッドから外部へのファイル D&D コピー。§12 は §1.288 の非同期転送 (Shell 委譲ラッパー / STA / 寿命 / 終了時の仕様)、設計レビュー条件と検証記録。従来の送出・受け取りは §1〜11 |
 | [subfolder-expansion-view-plan.md](subfolder-expansion-view-plan.md) | **実装済み (2026-07-20 更新)**。現在フォルダ以下の画像/動画、ZIP/PDF 本体、設定上の画像フォルダ本を snapshot 一覧化する `サブ展開` ビュー。全体/フォルダ単位ソート、10万件以上の続行確認、キャンセル可能な非同期表示準備、既存の詳細表示/★/タグ/場所 facet との連携を記載。ZIP/PDF/変換アーカイブ内部は対象外 |
 | [ring-shortcut-plan.md](ring-shortcut-plan.md) | マウス右ドラッグ (リング / ジェスチャ) / ゲームパッド X リングショートカット + パッド専用ピッカーパネルの設計。右ドラッグ mode は 4 文脈ごとに `未使用` / `リングショートカット` / `マウスジェスチャ` を保存し、設定メニュー「操作カスタマイズ」から右ドラッグ mode / リング / マウスジェスチャ / マウス進む・戻る / ゲームパッド X+方向リングを編集する。ゲームパッド固定ボタン単体は既定動作固定。マウスジェスチャ追加は実際の右ドラッグ軌跡を記録する |
 | [auto-thumb-aspect-plan.md](auto-thumb-aspect-plan.md) | サムネイル比率の自動選択 (`thumb_aspect_auto`) の設計と実装計画。`log(ratio)` の中央値 → 最近接バケット方式 + 6 段ゲート (min_samples / 連勝継続 / cooldown / 切替上限 / 入力 idle / log 距離マージン)。実装済み (2026-05、`src/auto_aspect.rs`) |
@@ -160,7 +176,7 @@
 | [music-lab-validation-checklist.md](music-lab-validation-checklist.md) | `tools/music_lab` / `crates/music-core` の実機検証チェックリスト。長尺ロード、自動再生、timeline 部分描画、spectrum analyzer、音切れ計測、本体統合時の置き換え境界を整理 |
 | [compile-book-plan.md](compile-book-plan.md) | **v1.7.0 初期実装済み / 操作感調整前**。「製本」機能 = 複数の本/フォルダからページだけを集めて任意順に並べた束を作る。NeeView の参照型プレイリストと違いコピー型スナップショット (元削除に強い)。確定事項: 束=番号付き画像だけの純フォルダ (マーカー/サイドカー無し)・ページ順はゼロ埋め4桁連番ファイル名が正本 (Explorer/zip で順序自明)、1冊上限9999ページ、編集中はメモリ順序・専用モード退出時に遅延リネームフラッシュ (1000ページ最悪0.6秒実測)、置き場所は全ビルド `Pictures\mimageviewer\books` 既定・設定可 (portable も Pictures、capture既定は不変)、本の識別=場所ベース (ルート直下フォルダ)、**本フォルダは索引対象外+お気に入り登録対象外+ソート番号順固定** (大量リネーム時の索引チャーン回避、中はCtrl+F/ツールバーでin-memory絞り込み)、**本ページは焼き込み済み画像を正本にしつつ mIV 内部DBのタグ/★/補正/消しゴム/補正レイヤー/隠蔽/注釈/切り取りは後段で許可** (外部サイドカー無し、グローバル/お気に入り補正は継承しない、回転は抑制)、**並べ替えは専用モード** (小サムネ+ホバー拡大、shell ドラッグアウト回避)。複製は無加工コピー最優先 (グリッド追加では無補正なら通常画像/ZIP 内画像を再エンコードしない。PDF/動画/焼き込みのみエンコード)。追加トリガはグリッド(カーソル/選択)・画像・動画フレーム・クリップボード画像を追加先の本へ。既存 export/capture/コピー/グリッド流用。**追補 (2026-06-19, §11, 設計のみ): クイック追加=本のピン留め (`show_shortcut` 流用)・重複 skip+トースト / 登録済みバッジ (`book_membership_db`, パスベース provenance) / ツールバー本棚の折りたたみ・プルダウン表示。** |
 | [toolbar-customization-plan.md](toolbar-customization-plan.md) | **実装済み (v2.0.0)**。ツールバーのセクション統一モデル + カスタマイズ refactor。全セクション (お気に入り/タグ/本棚/列/比率/ソート…) を 1 コンポーネントに揃え、**項目 左クリック=副作用なし (開く/ビュー) / 右クリック=副作用あり (追加/付与)**、表示形式 (展開/折りたたみ/プルダウン) を一般化、セクションの表示ON/OFF・順序 (ドラッグ並べ替え)・設定を**右クリック/⚙ に集約**して環境設定のツールバーページを撤去。順序はデータ駆動 (`ToolbarSectionId` の永続 Vec、`details_column_order` と同型)。詳細ヘッダー右クリックの idiom 流用。**①②整理機能より先行**。一度に完成形を目指す |
-| [version-highlights-plan.md](version-highlights-plan.md) | **実装済み (v2.0.0) / v2.2.0 entry 追加済み / ClaudeCode レビュー済み**。更新後 初回起動に「重要な変更点 (主要部分)」を 1 画面で表示する汎用の仕組み。標準動作の変更 (例: ツールバー左右クリック) を**個別ダイアログを増やさず display-only** で告知。`update_check` (更新前・ネットワーク・全文) とは別で、**更新後・オフライン・操作/既定の変更中心**。既存の `last_seen_version`/`previous_last_seen_version`/`version_changed` を流用。複数バージョンまたぎは累積表示。ヘルプメニュー再表示は現行版以下の最新 entry にフォールバックするため、次リリース entry を先に埋め込んでも開発版で未来の告知を出さない。テストは**選択純関数の unit test + egui_kittest スナップショット + `--whatsnew-from` 強制表示**で実機最小。無効化設定なし |
+| [version-highlights-plan.md](version-highlights-plan.md) | 更新後の「重要な変更点」をオフラインの埋め込みデータから累積表示する仕組み。§1.232では `whats_new_acknowledged_version` から未読を選び、利用者が閉じたときだけ保存する。起動時に欠落項目を移行・保存。3モードのビューア表示中は、初回設定・マウス移行案内・ネットワーク通知とともに描画とモーダル判定を保留する。ヘルプ再表示は現行版以下の最新 entry。選択純関数・状態遷移・実DB・snapshot・`--whatsnew-from` で検証。無効化設定なし |
 | [filename-stack-plan.md](filename-stack-plan.md) | **実装済み (v2.0.0)**。ファイル名 prefix (末尾の区切り文字の前、既定 `_`) でフォルダ内画像を仮想スタックに畳む表示モード。pixiv/danbooru の「1 投稿=複数ファイル」を 1 サムネにまとめる。全グループを仮想スタック化 (単独=1 ページ) し、Ctrl+↑↓=スタック間 / ↑↓=スタック内のフルスクリーン二段ナビ。`ZipDir`/`SearchContainer` 仮想アイテム・Ctrl+G ドリル・`materialize` 見開きリセット・`start_loading_items` を流用、非破壊。②製本のピン本へスタック単位コピーと連携 |
 | [filename-stack-scripting-plan.md](filename-stack-scripting-plan.md) | **実装済み (2026-06-21)**。スタックの分類ルールをユーザー定義 Rhai スクリプトで書ける拡張。契約 = メンバー列→同長キー配列の純関数 `group(files)` (**画像のみ**を渡す。各要素は `name/stem/ext/mtime/size`。動画は常に単独なので渡さず `is_video` も非公開)。`regex_is_match`/`regex_capture`/`regex_replace`/`argsort_int` を公開、操作上限つきサンドボックス。既定は内蔵カスケード (mXD/末尾連番/先頭連番/連写、all-match + 汎用は distinct≥2)。`<data_dir>/stack_rules.rhai` で上書き可、失敗時は組み込み既定へフォールバック。設定 `stack_script_enabled`、UI = 環境設定「フォルダ・ファイル」、ヘルプ = manual/stack.html |
 | [rating-list-view-plan.md](rating-list-view-plan.md) | **Phase 1 実装済み (2026-06-23)、戻る導線追加済み (2026-07-05)**。場所▼ と ファイル メニューに ★1〜★5 を足し、選んだ★の付いたアイテム/コンテナを場所横断でフラット一覧する仮想ビュー。閲覧履歴/タグビューを雛形に `items_are_rating_view` を追加。**時刻ソートのため `rating.db` に `rated_at_ms` + `source_path` + `kind` + 仮想アイテム復元メタを後方互換追加** (リリース済み DB)。★設定時刻ソートはビュー固有 (表示中だけソートに追加、グローバル SortOrder は不変)。キー→GridItem 復元は新規行は kind/meta 直読み・旧行は parse+stat 推定。結果から開いたコンテナは `rating_view_nav_stack` でレーティング一覧へ戻る |
@@ -170,6 +186,7 @@
 | [external-tool-launch-plan.md](external-tool-launch-plan.md) | **P0/P1/P2a/P2b/P2c/P3 実装済み (2026-09-01、P3 は実機確認待ち)、P4 以降は未実装**。backlog §1.117 の正本。導線は登録した全ツールを平坦に出す右クリックと、既定キーなしの Grid 専用固定スロット / ピッカーの 2 つ。ツールバーとメニューバーの直接起動は一度実装後に撤去した。フォルダー背景・コンテナー項目から現在のフォルダー / 本 1 件を渡す入口を持ち、複数対象は既定 `Each`、ツール別の確認 5 件 / 上限 10 件で扱う。変換アーカイブは元パスを使い、1 コンテナーに定まらない集約ビュー背景と仮想ページは拒否する。外部ツール起動を引数テンプレート / 作業フォルダー / 複数選択 / **ZIP・PDF 内ページの一時実体化** / **動画の現在フレーム**まで広げる設計で、**仮想パスをそのまま渡す方針は採らない**。一時ファイルは NeeView 同型のプロセス単位ディレクトリ + 終了時削除 + 起動時の孤児回収 |
 | [external-tool-file-list-plan.md](external-tool-file-list-plan.md) | §1.329 の決定済み仕様。起動ごとの UTF-8 BOM なし / CRLF リスト、実体化 worker と一時成果物の所有、index を保持したフレーム分割準備、取消・限界・検証 |
 | [sns-split-export-plan.md](sns-split-export-plan.md) | **P1〜P6 実装済み (2026-09-01)**。1 枚の絵を X / Instagram のカルーセル投稿用に 2〜4 枚へ切り分けて書き出す。`CropSettings` / `export_crop.db` には保存しない**一度きりのモード**として分離し、グループ矩形の操作だけを既存の `CropRect` と共有する。比率固定リサイズは反対辺 / 反対角を固定する共通挙動。**X の隙間を実測** (PC ブラウザ 1.588% / iOS アプリ 1.869% / モバイル Web 2.652%、隙間の絶対値は環境ごとに違う) し、枠幅比 **1.7% 固定**を採用。投稿先は X (3:4 / 1.7%) と Instagram (4:5 / 0%) の 2 択のみ。書き出しはパネルボタンから `ExportEntry` に crop を足し、既存の 1 スナップショット→N ファイル経路へ載せる。2x2 グリッドと縦並びは非対象 |
+| [clipboard-edited-copy-plan.md](clipboard-edited-copy-plan.md) | **§1.261 実装済み・レビュー前 (2026-10-28)**。右クリック「編集を反映した画像をコピー」。Ctrl+E と同じ source + 編集 snapshot の worker 合成を、焼き込み段の設定 (`bake_stage_clipboard`) まで通して CF_DIB へ置く。既存の「画像をクリップボードにコピー」は残す。job は 1 本、mIV 世代と OS のクリップボード世代で後のコピーを上書きしない |
 
 ## 設計メモ (特定領域の詳細)
 
@@ -217,6 +234,7 @@
 | [video-engine-redesign.md](video-engine-redesign.md) | エンジンの現行仕様 + 初期設計案 / 採否履歴。現行は `Arc<Mutex<EngineActor>>` + UI tick drain。未採用の `TransportController` / 専用 actor thread は将来候補として隔離 |
 | [audio-normalize-scan-bench.md](audio-normalize-scan-bench.md) | 音量ノーマライズ初回スキャン待ち時間の実測用 CLI (`normalize_scan_bench`) と、HDD 上の動画で逐次 / 並列スキャンを比較するときの読み方 |
 | [effetune-integration-plan.md](effetune-integration-plan.md) | 音響調整 (EffeTune Mixwright) の独立DSP段・GUI・状態保存・Remote共有と配布契約。§10は全bundle同梱・署名・CRT配置とportable非同梱、§17はタスクバー表示設定・native caption・通常矩形配送。§17.10は実機確認後の専用音符icon、ボタン入力の寿命、OFFでも通常captionを維持するShell登録と検証台帳。§17.11は最小化中のplugin allocation禁止とprotocol v7互換性判定、§17.12は利用者決定の表示・前面化専用ボタンと前面判定/Hide経路の撤去 |
+| [effetune-lyrics-trial-plan.md](effetune-lyrics-trial-plan.md) | 音響調整の Visualizer 歌詞 (Lyrics) をホストから渡す試作。同期方式の比較 (再生時計の通知 / ProcessContext)、mIV と Mixwright 試作ブランチの変更、確認手順。作者への相談前の検証用で配布しない |
 | [music-integration-plan.md](music-integration-plan.md) | **主要 Inc 実装完了**。`VideoPlayer` 再利用による音声再生、音楽ビュー、ブックマーク、VST3、動画→音声モードの統合契約と継続保守事項 |
 | [vst3-integration.md](vst3-integration.md) | VST3 統合 — 1 chain = 1 C++ bridge、音声 IPC 1 roundtrip、bridge 内 per-slot STA editor、Rust chain/GUI/persistence/audio hot-path ownership と現行負債 |
 | [settings-sqlite-migration.md](settings-sqlite-migration.md) | 設定永続化を `settings.json` から `settings.db` (SQLite) に移行する spec。transient NotFound による設定消失事故の構造的解消、将来版の未知設定値を `Incompatible` として無変更・save 抑止にする downgrade 保護、VST3 BLOB の dirty-skip による I/O 浪費解消。4 ラウンドの Codex review 反映済み |

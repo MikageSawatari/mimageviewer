@@ -519,7 +519,8 @@ pub enum ThumbnailState {
     /// され、source 出力は同じ表示要求を重複評価しないための coverage を保持する。
     /// `rendered_at_px` は生成時の長辺ピクセル数で、現在のセルサイズと比較して
     /// 著しく小さい場合 (列数変更後など) もアップグレード対象になる。
-    /// `source_dims` は元画像 / PDF raster のピクセル寸法 (旧カタログ由来は None)。
+    /// `source_dims` は一覧素材のピクセル寸法 (編集プレビューは crop 後、旧カタログは None)。
+    /// `source_coverage` は素材の生成時に収録した範囲と crop 前の座標寸法を保持する。
     /// `layout_dims` は PDF page box の 1/1000 point 寸法で、raster の丸めと独立する。
     Loaded {
         tex: egui::TextureHandle,
@@ -528,8 +529,10 @@ pub enum ThumbnailState {
         /// 元画像で上書きする idle quality-upgrade の対象にしない。
         from_edit_preview: bool,
         rendered_at_px: u32,
+        source_coverage: crate::source_coverage::SourceCoverage,
         source_dims: Option<(u32, u32)>,
         layout_dims: Option<(u32, u32)>,
+        display_basis: crate::material_display_basis::MaterialDisplayBasis,
     },
     /// 調査済みで表紙がない。再読込まで再要求しない。
     NoArt,
@@ -541,6 +544,110 @@ pub enum ThumbnailState {
 }
 
 impl ThumbnailState {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn loaded_raster(
+        tex: egui::TextureHandle,
+        origin: crate::thumb_loader::ThumbLoadOrigin,
+        from_edit_preview: bool,
+        rendered_at_px: u32,
+        source_coverage: crate::source_coverage::SourceCoverage,
+        source_dims: Option<(u32, u32)>,
+        layout_dims: Option<(u32, u32)>,
+    ) -> Self {
+        let display_basis =
+            Self::raster_thumbnail_display_basis(tex.size(), source_coverage, source_dims);
+        Self::Loaded {
+            tex,
+            origin,
+            from_edit_preview,
+            rendered_at_px,
+            source_coverage,
+            source_dims,
+            layout_dims,
+            display_basis,
+        }
+    }
+
+    /// Accepted ordinary thumbnail facts. A sampler represents itself in Single,
+    /// the forthcoming GPU raster in Spread, and source layout in Continuous.
+    pub(crate) fn raster_thumbnail_display_basis(
+        sampler: [usize; 2],
+        coverage: crate::source_coverage::SourceCoverage,
+        source_dims: Option<(u32, u32)>,
+    ) -> crate::material_display_basis::MaterialDisplayBasis {
+        use crate::material_display_basis::{
+            MaterialBasisUnavailable as U, MaterialDisplayBasis as B, MaterialDisplayView as V,
+            MaterialLegacyBasis as L,
+        };
+        // Legacy coverage permission remains dynamic. The sampler facts must
+        // survive accepting an old row while crop currently makes it invisible.
+        let coverage = match coverage {
+            crate::source_coverage::SourceCoverage::Unknown => {
+                crate::source_coverage::SourceCoverage::FullSource
+            }
+            coverage => coverage,
+        };
+        if sampler[0] == 0 || sampler[1] == 0 || source_dims.is_some_and(|(w, h)| w == 0 || h == 0)
+        {
+            return B::unavailable(U::InvalidDimensions);
+        }
+        let sampled = B::from_sampler(sampler, coverage);
+        let coordinate = coverage.coordinate_dims().or_else(|| {
+            source_dims
+                .filter(|(w, h)| *w > 0 && *h > 0)
+                .map(|(w, h)| crate::page_dims::CanonicalPageDimensions::new(w, h))
+        });
+        let Some(coordinate) = coordinate else {
+            // A valid legacy whole-source row can lack source dimensions. Its
+            // selected sampler was displayable in every fit mode; accept that
+            // explicit stand-in contract now, without inventing source pixels
+            // or looking the dimensions up again at paint time.
+            return B::new(
+                sampled.legacy(V::Single),
+                sampled.legacy(V::Spread),
+                L::SourceLayout {
+                    basis: crate::fullscreen_specified_scale::LegacySourceLayoutBasis {
+                        layout_size: egui::vec2(sampler[0] as f32, sampler[1] as f32),
+                        reference_size: egui::vec2(sampler[0] as f32, sampler[1] as f32),
+                    },
+                },
+                sampled.specified(),
+            );
+        };
+        let (w, h) = coordinate.as_tuple();
+        let layout_size = egui::vec2(w as f32, h as f32);
+        let raster = coverage
+            .uncropped_raster_dimensions()
+            .unwrap_or_else(|| crate::canonical_image_loader::gpu_raster_dimensions(coordinate));
+        let spread = L::Raster {
+            layout_size: raster.as_vec2(),
+            original: raster,
+        };
+        let specified = if coverage.is_partial() {
+            crate::fullscreen_specified_scale::FullscreenFitBasis::new(
+                layout_size,
+                raster.as_vec2(),
+            )
+        } else {
+            crate::fullscreen_specified_scale::FullscreenFitBasis::new(
+                raster.as_vec2(),
+                raster.as_vec2(),
+            )
+        }
+        .ok_or(U::InvalidDimensions);
+        B::new(
+            sampled.legacy(V::Single),
+            spread,
+            L::SourceLayout {
+                basis: crate::fullscreen_specified_scale::LegacySourceLayoutBasis {
+                    layout_size,
+                    reference_size: layout_size,
+                },
+            },
+            specified,
+        )
+    }
+
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Loaded { .. } | Self::NoArt | Self::Failed)
     }

@@ -263,8 +263,11 @@ fn editor_harness(
     let mut fonts_ready = false;
     let h = crate::test_ui::builder()
         .with_size(egui::vec2(1093.0, 614.0))
-        .build(move |ctx| {
-            ctx.style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+        .build_ui(move |root_ui| {
+            let ctx = &root_ui.ctx().clone();
+            ctx.global_style_mut(|style| {
+                style.scroll_animation = egui::style::ScrollAnimation::none()
+            });
             if !fonts_ready {
                 crate::ui_fonts::configure_fonts(ctx);
                 crate::ime_focus::install_ime_input_policy(ctx);
@@ -277,6 +280,89 @@ fn editor_harness(
             f.app.show_local_composition_editor(ctx);
         });
     (fixture, h)
+}
+
+#[cfg(windows)]
+#[test]
+fn egui037_continuation_context_state_real_logic_receipt_keeps_sibling_ui_unadopted() {
+    use crate::app::context_state_tests::Fixture as ContextFixture;
+    let ContextFixture {
+        mut env,
+        main,
+        other,
+        old_stamp,
+        ..
+    } = ContextFixture::new();
+    env.book_resume_writer = Some(
+        crate::book_resume_db::BookResumeWriter::spawn_at(
+            env.tmp.path().join("real-logic-receipt.db"),
+        )
+        .unwrap(),
+    );
+    let owner = CompositionEditorOwner {
+        context_id: other,
+        scope: BookScopeKey::document(&env.tmp.path().join("authoritative.cbz")).unwrap(),
+        request_id: 702,
+    };
+    env.composition_editor_operations.owner = Some(owner.clone());
+    let path = owner.scope.logical_root.clone();
+    let (worker, receiver) = mpsc::channel();
+    env.composition_editor_operations
+        .tickets
+        .push(SentSaveTicket { owner, receiver });
+    worker
+        .send(SaveCompletion {
+            status: Ok(Some(ResumeCommit {
+                key: path.clone(),
+                position: ReadingPosition {
+                    page: 2,
+                    identity: None,
+                },
+                meter: ReadingMeterValue::new(2, 4).unwrap(),
+            })),
+        })
+        .unwrap();
+    let ctx = egui::Context::default();
+    let mut integration = eframe::HeadlessEpiIntegration::new(ctx.clone());
+    let generation = env.items_generation;
+    let publications = env.rating_publication_count;
+    App::start_rating_boundary_trace_for_test();
+    for _ in 0..3 {
+        integration.update_logic_only(&mut env.app, egui::RawInput::default());
+        assert_eq!(ctx.cumulative_frame_nr(), 0);
+        assert_eq!(env.projected_viewer_context_id(), main);
+        assert_eq!(env.items_generation, generation);
+        assert_eq!(env.rating_publication_count, publications);
+        for id in [main, other] {
+            env.with_viewer_context_state(id, |app| {
+                ContextFixture::assert_pending(app, id, if id == main { 4 } else { 7 }, old_stamp);
+                assert_eq!(
+                    matches!(app.composition_editor, CompositionEditorState::Reloading),
+                    id == other
+                );
+            })
+            .unwrap();
+        }
+        assert!(App::take_rating_boundary_trace_for_test().is_empty());
+        assert!(!env.composition_editor_writes_pending());
+        assert_eq!(
+            env.book_resume_writer
+                .as_ref()
+                .unwrap()
+                .watermarks()
+                .admitted,
+            1
+        );
+    }
+    App::stop_rating_boundary_trace_for_test();
+    let reply = env
+        .book_resume_writer
+        .as_ref()
+        .unwrap()
+        .read_position_after(&crate::path_key::normalize(&path), 1)
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .unwrap();
+    assert_eq!(reply.position.unwrap().page, 2);
 }
 
 fn draft_record(f: &Fixture) -> BookComposition {
@@ -348,6 +434,10 @@ fn real_escape_cancels_direct_draft_without_a_second_confirmation_phase() {
 }
 
 #[test]
+#[expect(
+    deprecated,
+    reason = "Exercise retained IME compatibility notifications and cancellation ordering"
+)]
 fn confirmation_keyboard_uses_ime_helpers_and_escape_only_dismisses_the_front_dialog() {
     for confirmation in [
         ui::EditorConfirmation::Remove,
@@ -364,7 +454,7 @@ fn confirmation_keyboard_uses_ime_helpers_and_escape_only_dismisses_the_front_di
         };
         session.ui.confirmation = confirmation;
         let frame = |f: &mut Fixture, events| {
-            let _ = ctx.run(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -377,7 +467,8 @@ fn confirmation_keyboard_uses_ime_helpers_and_escape_only_dismisses_the_front_di
                     f.app.update_ime_state(ctx);
                     f.app.show_local_composition_editor(ctx);
                 },
-            );
+            )
+            .drop_without_applying_deltas();
         };
         frame(&mut f, vec![]);
         frame(&mut f, vec![]);
@@ -386,7 +477,10 @@ fn confirmation_keyboard_uses_ime_helpers_and_escape_only_dismisses_the_front_di
                 &mut f,
                 vec![
                     egui::Event::Ime(egui::ImeEvent::Enabled),
-                    egui::Event::Ime(egui::ImeEvent::Preedit("未確定".into())),
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "未確定".into(),
+                        active_range_chars: None,
+                    }),
                     egui::Event::Key {
                         key,
                         physical_key: None,
@@ -589,7 +683,7 @@ fn hidden_cover_is_not_presented_or_requested_while_latest_result_is_delayed() {
     }));
     let mut actions = Vec::new();
     for _ in 0..3 {
-        let _ = ctx.run(
+        ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -598,14 +692,17 @@ fn hidden_cover_is_not_presented_or_requested_while_latest_result_is_delayed() {
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    // The result tab isolates right-side thumbnail demand. Hidden
-                    // pages remain valid thumbnail sources in the left list.
-                    session.ui.panel = ui::EditorPanel::Units;
-                    actions = ui::render(ui, &session.view, &mut session.ui);
+                ctx.root_ui(|ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        // The result tab isolates right-side thumbnail demand. Hidden
+                        // pages remain valid thumbnail sources in the left list.
+                        session.ui.panel = ui::EditorPanel::Units;
+                        actions = ui::render(ui, &session.view, &mut session.ui);
+                    })
                 });
             },
-        );
+        )
+        .drop_without_applying_deltas();
         assert!(
             actions.iter().all(|action| !matches!(action,
                 ui::EditorUiAction::RequestThumbnails(ids) if ids.contains(&cover_id)
@@ -646,14 +743,15 @@ fn modal_editor_disables_real_backing_menus_and_pauses_slideshow_handlers() {
     let mut fonts_ready = false;
     let mut h = crate::test_ui::builder()
         .with_size(egui::vec2(1093.0, 614.0))
-        .build(move |ctx| {
+        .build_ui(move |root_ui| {
+            let ctx = &root_ui.ctx().clone();
             if !fonts_ready {
                 crate::ui_fonts::configure_fonts(ctx);
                 fonts_ready = true;
                 ctx.request_repaint();
                 return;
             }
-            renderer.borrow_mut().app.render_menubar(ctx);
+            renderer.borrow_mut().app.render_menubar(root_ui);
         });
     h.run();
     assert!(h.get_by_label("設定").accesskit_node().is_disabled());
@@ -1252,7 +1350,8 @@ fn corrupt_saved_record_blocks_save_remove_and_ignore_is_this_open_only() {
         let mut fonts_ready = false;
         let mut h = crate::test_ui::builder()
             .with_size(egui::vec2(1093.0, 614.0))
-            .build(|ctx| {
+            .build_ui(|root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
                     fonts_ready = true;
@@ -1923,10 +2022,31 @@ fn retired_owner_save_receipt_records_once_without_reviving_owner_or_touching_ma
             f.app.composition_editor,
             CompositionEditorState::Closed
         ));
-        assert!(
-            f.app.last_book_resume.is_none(),
-            "retired receipt uses global writer, not main's dedup owner"
-        );
+        if failure {
+            assert!(f.app.last_book_resume.is_none());
+        } else {
+            // The dedup mirror belongs to the shared writer, not the mounted viewer.
+            let (path, page, meter, identity) = f.app.last_book_resume.clone().unwrap();
+            let position = reply.position.as_ref().unwrap();
+            assert_eq!(
+                crate::path_key::normalize(&path),
+                crate::path_key::normalize(&f.scope.logical_root)
+            );
+            assert_eq!(page, position.page);
+            assert_eq!(identity, position.identity);
+            assert!(meter.is_some());
+            f.app
+                .persist_book_resume_with_identity(path, page, meter, identity);
+            assert_eq!(
+                f.app
+                    .book_resume_writer
+                    .as_ref()
+                    .unwrap()
+                    .watermarks()
+                    .admitted,
+                cutoff
+            );
+        }
         assert_eq!(f.app.items, main_items);
         assert_eq!(f.app.items_generation, main_generation);
         if failure {

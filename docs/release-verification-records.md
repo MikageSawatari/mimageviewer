@@ -12,6 +12,38 @@
 
 ---
 
+## v4.10.1 (2026-10-31)
+
+- **対象**: master `ae64ebc79` (配布ビルド)。修正は 5ch >>661 の一覧位置 (§1.488)、閲覧履歴の「親へ」(§1.473)、フォルダツリー幅 (§1.472)、ページ一覧の操作名 (§1.662)。依存物・検索・VST3・Susie の変更なし。
+- **自動テスト**: 配布ビルドの全体テストで workspace 16,467 件成功 (70 skip) と vendor egui 系・doc が成功。`test-script` feature の lib テストは 15,224 件成功 (66 skip。実行中に別セッションが文書をコミットしたため成功記録の再利用登録はなし)。
+- **ReleaseChecks (ClaudeCode が実行、利用者了承)**: 1 回目 `release-checks-20261031-013001-1965e4d8` は seed の起動で mIV の窓を前面にできず停止 (環境不成立、各ケース未実行)。利用者の再了承で 2 回目 `release-checks-20261031-014232-5895a34d` を実行。AI 経路の変更がないため `-IncludeFirstAi` なし。
+  idle 5 ケース PASS (CPU 1 コア比 0.006〜0.009、測定区間の frame 0)。perf uncached は PASS_WITH_WARNINGS: 256 folder load・Ctrl+Down 5・検索完了、描画 frame の 16ms 未満 99.67%、pre_grid raw p95 0.087ms、100ms 超は既知の起動直後 frame 1→2 (120ms、上限 500ms、2026-10-11 利用者了承済みの警告) だけ。
+  **perf cached は FAIL (判定スクリプトの不具合、利用者判断で理由つき FAIL として記録し配布へ進めた)**: 数値は描画 frame の 16ms 未満 99.67%、pre_grid raw p95 0.089ms、100ms 超は起動直後の frame 1→2 (112ms) の 1 件だけ。これが既知の形と判定されなかったのは、初期化完了 (`indexer_manager_new`、`t`=0.824) が frame 1 の update 終了 (0.8235728) の 1ms 以内で、1ms 丸めの perf 時刻では順序を示せなかったため。最初の測定操作より前で、今回の修正経路とは関係しない。判定の修正は §1.667。
+- **依存**: `check-dependency-updates.ps1` は FFmpeg の従来どおりの誤検知 (同梱 n7.1.5-16 の方が新しい)、EffeTune Mixwright v0.16.0 の公開、一般クレート 12 件の小更新。修正版のため上げずに出荷。PDFium 8125・ONNX Runtime 1.24.4・LibRaw 0.22.3・VST3 SDK・Rust 1.99.1 は最新。
+- **panic.log**: 53 件 16 種すべて disposition あり (`check-panic-log.ps1` exit 0)。CI は直近 push 分まで緑。
+- **署名**: 単体exe / setup.exe / portable の mimageviewer.exe を `signtool verify /pa` で確認 (Open Source Developer Taku Sano、Certum の RFC3161 タイムスタンプ、exit 0)。全 PE / VC runtime gate 通過。
+- **portable smoke (ClaudeCode が実施)**: `D:\miv-portable-smoke-v4101` に展開して起動。exe の隣に `data\` を作成、`%APPDATA%\mimageviewer\settings.db` は変わらず。展開直後の 1 回目は画面の準備に約 12 秒 (ログの 2.99s→12.14s が無音、原因未確認) かかり、最初の WM_CLOSE では終了せず 2 回目で終了。2 回目の起動は約 1 秒で応答し、WM_CLOSE で終了コード 0。
+- **実機確認**: §1.488 (一覧位置) は master 取り込み後に ClaudeCode が隔離データの dev-runtime を操作して確認 (マウス・キー・合成タッチ。記録はバックログ §1.488)。§1.473・§1.472・§1.662 は自動テストとコード確認だけで、実アプリでは未確認。
+
+---
+
+## v4.10.0 (2026-10-30)
+
+- **対象**: master `e127d9a23` (配布ビルド)。ReleaseChecks は `c95205fce` (その後の差分は起動時の「重要な変更点」の snapshot 更新だけ)。
+- **自動テスト**: 配布ビルドの全体テストで workspace 16,301 件成功 (69 skip) と vendor egui 系・doc が成功。1 回目は起動時の「重要な変更点」の snapshot 更新漏れ 1 件で停止 (`e127d9a23` で更新)。`test-script` feature の lib テストは 15,047 件成功 (1 回目は §1.652 の test-only キー Tab / Space の match 漏れでコンパイル失敗、`45366aff5` で修正)。
+  事前の test-full では AI 結合テスト 5 件が `onnxruntime.dll extract: アクセスが拒否されました` で失敗した。原因は起動中のインストール版 v4.9.0 が `%APPDATA%\mimageviewer\onnxruntime.dll` (1.24.2) を使用中で、テストが 1.24.4 で上書きできなかったこと (製品の不具合ではない)。インストール版を終了した配布ビルドでは成功。
+- **ReleaseChecks (ClaudeCode が実行、利用者了承)**: run `release-checks-20261029-161208-c3ed5627`、`-IncludeFirstAi` 付き。1 回目は利用者の操作で前面が外れ SKIPPED (環境不成立) のため `-SkipBuild` でやり直した。
+  idle 5 ケース PASS (CPU 1 コア比 0.005〜0.016、測定区間の frame 0)。perf cached / uncached とも 256 folder load・Ctrl+Down 5・検索完了で PASS_WITH_WARNINGS: 描画 frame の 16ms 未満 99.67% / 99.33%、pre_grid raw p95 0.10 / 0.10ms、100ms 超は既知の起動直後の frame 1→2 だけ (124 / 116ms、上限 500ms、2026-10-11 利用者了承済みの警告)。
+  **first-ai は FAIL (テスト台本の不具合、AI 未計測)**: 台本が全画面を開いた後に AI モデル切替の action を root (メイン窓) へ focus して送るため、既存の main focus guard (2026-07 から) が全画面を閉じ、AI ジョブが取り消されて「推論が完了しない」になった。ポータブル版は ORT 1.24.4 の DirectML でモデルを読み込めている。初回 AI 中のフレームの滑らかさは未計測。代わりの根拠: 5ch >>655 の調査で ORT 1.24.4 の実 GPU 推論 10 回が正常終了、依存物更新時と今回の配布ビルドの AI 結合テストが成功。台本の修正は §1.483。
+- **依存**: ONNX Runtime 1.24.4 (ort rc.15)、PDFium 8125、LibRaw 0.22.3、tantivy 0.27.0 (score 収集を 0.26 の buffer 方式へ戻す MIV 改変)、EffeTune Mixwright v0.15.0、VST3 SDK 3.8.1、Rust 1.99.1 (§1.460、記録は [依存物の更新 2026-10-28](dependency-update-20261028.md))。検索 bench は依存物更新時に profile をそろえて測定済み (0.26 比 +5%、baseline 比較成功)、その後に検索コードの変更なし。`check-dependency-updates.ps1` は FFmpeg の従来どおりの誤検知 (同梱 n7.1.5-16 の方が新しい) と一般クレート 1 件だけ。
+- **panic.log**: 53 件 16 種すべて disposition あり (`check-panic-log.ps1` exit 0)。
+- **CI 相当**: `viewer_context_audit` を手元で実行し、§1.216 の public fn の登録漏れ 1 件を修正 (`e7f17e16c`)、違反 0。
+- **署名**: 単体exe / setup.exe / portable の mimageviewer.exe を `signtool verify /pa /v` で確認 (Open Source Developer Taku Sano、RFC3161)。全 PE / VC runtime gate 通過。
+- **portable smoke (ClaudeCode が実施)**: `D:\miv-portable-smoke-v4100` に展開して起動。応答あり、exe の隣に `data\` を作成、`%APPDATA%\mimageviewer\settings.db` は変わらず、WM_CLOSE で正常終了。
+- **当日の実機確認 (利用者)**: ワイプ比較、問題の動画でのデインターレース、Ctrl+Space ズームの感度、消しゴムの Tab プレビュー、キーズーム (テンキーは利用者の割り当てが優先)、ページめくり中の編集反映 (素早い連打では着地後に反映、仕様)。
+
+---
+
 ## v4.7.0 (2026-10-15)
 
 - **対象**: 最終の配布ビルドは master `bf6b36993` (2026-10-15 23:55)。ReleaseChecks は `ad36b5606` で実施。その後に入った製品コードは、公開前に利用者実機で見つかったクラッシュの修正 C1 (`6c6c27fc8`、検索結果から別窓再生中に検索を閉じると plan_promote の assert で終了。§1.375 由来の v4.7.0 退行)、HUD 前面化の自己循環を止める修正 (`812ae722d`)、裏で準備中のページの AI 補完通知を出さない修正 (`b726eba70`)、空いた側を黒い紙でめくるページめくり (`ad36b5606` 以前)。ReleaseChecks は C1・HUD の後に `a00f863cf` で再実施 (run `release-checks-20261015-150147-c2c64337`、**PASS_WITH_WARNINGS**): idle 5 ケース PASS (CPU 1 コア比 0.003〜0.006)、perf cached / uncached とも 16ms 未満 99.67%、pre_grid raw p95 0.077ms、100ms 超は既知の起動直後の frame 1→2 だけ (222 / 225ms、上限 500ms、測定操作前、2026-10-11 利用者了承済みの警告)。

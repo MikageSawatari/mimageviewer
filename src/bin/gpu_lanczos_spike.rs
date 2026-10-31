@@ -28,7 +28,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     let output_dir = PathBuf::from("target").join("lanczos-spike");
     std::fs::create_dir_all(&output_dir)?;
 
-    let source_image = image::open(&source_path)?;
+    let source_image = mimageviewer::image_decode::decode(
+        mimageviewer::image_decode::Source::Path(&source_path),
+        mimageviewer::avif_decoder::Workload::Background,
+        false,
+        None,
+    )
+    .map(|decoded| decoded.image)?;
     let (source_width, source_height) = source_image.dimensions();
     let source_rgba = source_image.to_rgba8();
     let source_size = [source_width, source_height];

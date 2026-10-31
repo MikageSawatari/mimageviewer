@@ -59,6 +59,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["文字色", "見やすさ", "contrast"]
     ),
     entry!(
+        "general/notification-duration",
+        General,
+        "通知の表示時間",
+        ["短い", "標準", "長い", "トースト", "メッセージ", "通知時間"]
+    ),
+    entry!(
         "general/restore-position",
         General,
         "環境設定を開き直したときに前回の位置を復元する",
@@ -206,6 +212,36 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ExplorerIntegration,
         "SendTo",
         ["送る", "エクスプローラー", "Explorer", "登録"]
+    ),
+    entry!(
+        "thumbnail/name-font-scale",
+        Thumbnail,
+        "名前の文字サイズ:",
+        [
+            "サムネイル",
+            "一覧",
+            "ファイル名",
+            "フォルダ名",
+            "拡大",
+            "倍率",
+            "フォント",
+            "スケーリング"
+        ]
+    ),
+    entry!(
+        "thumbnail/name-max-lines",
+        Thumbnail,
+        "名前の最大行数:",
+        [
+            "サムネイル",
+            "一覧",
+            "ファイル名",
+            "フォルダ名",
+            "長い名前",
+            "折り返し",
+            "複数行",
+            "省略"
+        ]
     ),
     entry!(
         "thumbnail/favorite-view-state",
@@ -779,6 +815,20 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
+        "spread/manual-nav-wrap",
+        SpreadMode,
+        "先頭 / 末尾で反対側の端へ移る (ループ)",
+        [
+            "前後移動",
+            "手動",
+            "折り返し",
+            "画像",
+            "動画",
+            "音声",
+            "wrap"
+        ]
+    ),
+    entry!(
         "spread/boundary-notice",
         SpreadMode,
         "先頭 / 末尾の案内を表示",
@@ -803,6 +853,18 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["単ページ", "見開き", "比較", "構成"]
     ),
     entry!(
+        "spread/page-layout-plain-folders",
+        SpreadMode,
+        "通常フォルダにも既定のページ構成を使う",
+        [
+            "通常フォルダ",
+            "見開き",
+            "既定",
+            "ページ構成",
+            "本として扱わない"
+        ]
+    ),
+    entry!(
         "spread/document-direction",
         SpreadMode,
         "PDF / EPUB の右開き指定に従う",
@@ -819,6 +881,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         SpreadMode,
         "末尾に表紙を添える",
         ["表紙", "末尾", "見開き", "本ごとの設定"]
+    ),
+    entry!(
+        "spread/auto-view-trim",
+        SpreadMode,
+        "自動余白カットを標準で有効にする",
+        ["トリム", "余白", "自動", "既定", "本ごとの設定", "回転"]
     ),
     entry!(
         "spread/page-turn-animation",
@@ -1690,6 +1758,30 @@ mod tests {
     }
 
     #[test]
+    fn auto_view_trim_default_search_reaches_its_anchor() {
+        for query in ["自動余白カット", "トリム 既定", "余白 回転"] {
+            assert!(
+                search_preferences(query, test_tree_position)
+                    .iter()
+                    .any(|entry| entry.anchor == "spread/auto-view-trim"
+                        && entry.page == PreferencesPage::SpreadMode)
+            );
+        }
+    }
+
+    #[test]
+    fn plain_folder_spread_search_reaches_its_anchor() {
+        for query in ["通常フォルダ", "見開き 既定", "ページ構成"] {
+            assert!(
+                search_preferences(query, test_tree_position)
+                    .iter()
+                    .any(|entry| entry.anchor == "spread/page-layout-plain-folders"
+                        && entry.page == PreferencesPage::SpreadMode)
+            );
+        }
+    }
+
+    #[test]
     fn effetune_taskbar_search_matches_the_build_flavor() {
         let result = search_preferences("EffeTune タスクバー", test_tree_position);
         #[cfg(not(feature = "portable"))]
@@ -1890,6 +1982,17 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_manual_nav_wrap_setting_is_searchable() {
+        for query in ["手動 ループ", "前後移動 折り返し", "動画 wrap"] {
+            let entry = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == "spread/manual-nav-wrap")
+                .expect("手動の前後移動ループ設定が検索できる");
+            assert_eq!(entry.page, PreferencesPage::SpreadMode);
+        }
+    }
+
+    #[test]
     fn clipboard_capture_search_finds_monitor_and_output_folder() {
         for (query, anchor) in [
             ("clipboard 自動保存", "clipboard-capture/image"),
@@ -1932,6 +2035,24 @@ mod tests {
                 .expect("audio thumbnail setting is searchable");
             assert_eq!(entry.page, page);
             assert!(PAGES_SOURCE.contains(&format!("anchored(ui, state, \"{anchor}\"")));
+        }
+    }
+
+    #[test]
+    fn thumb_name_settings_search_finds_font_scale_and_wrapping() {
+        for (query, anchor) in [
+            ("名前 文字サイズ", "thumbnail/name-font-scale"),
+            ("フォント スケーリング", "thumbnail/name-font-scale"),
+            ("名前 最大行数", "thumbnail/name-max-lines"),
+            ("フォルダ名 折り返し", "thumbnail/name-max-lines"),
+            ("長い名前 複数行", "thumbnail/name-max-lines"),
+        ] {
+            assert!(
+                search_preferences(query, test_tree_position)
+                    .iter()
+                    .any(|entry| entry.page == PreferencesPage::Thumbnail && entry.anchor == anchor),
+                "missing thumbnail-name result: {query}"
+            );
         }
     }
 

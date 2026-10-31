@@ -4795,6 +4795,9 @@ mod tests {
                         "zero-start.mp4".into(),
                     );
                     player.configure_native_timing_for_test(0.0, duration, true, false);
+                    // This pump fixture has no video producer or presenter frames.
+                    // Exercise audio EOS without inventing a pending video tail.
+                    player.info.as_mut().unwrap().has_video = false;
                     if !native {
                         player.native_output = None;
                     }
@@ -4909,7 +4912,7 @@ mod tests {
                                 "real EOF loop must seek to zero"
                             );
                         } else if phase == 1 {
-                            player.seek(0.0);
+                            player.seek(0.0, crate::video::SeekOrigin::User);
                             assert!(
                                 player.current_seek_serial() > serial,
                                 "user seek to zero must be issued"

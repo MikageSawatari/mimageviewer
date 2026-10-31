@@ -9,6 +9,6 @@ name = "musicvideo_ui"
 path = "src/lib.rs"
 
 [dependencies]
-egui = "0.33"
+egui = "0.37.0"
 egui-ime = { path = "../egui-ime" }
 musicvideo-core = { path = "../musicvideo-core" }

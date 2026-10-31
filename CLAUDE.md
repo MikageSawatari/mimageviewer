@@ -226,7 +226,7 @@ A Windows 11 native image viewer built in Rust. Inspired by ViX (legacy 32-bit v
 modernized with GPU acceleration and AI upscaling. Single-window design replacing ViX's
 dual-window approach.
 
-Rust (edition 2024、MSVC) + eframe / egui 0.33 (wgpu)。画像は `image` crate・TurboJPEG・WIC・LibRaw、
+Rust (edition 2024、MSVC) + eframe / egui 0.37 (wgpu 30)。画像は `image` crate・TurboJPEG・WIC・LibRaw、
 キャッシュは SQLite + WebP、動画は FFmpeg LGPL shared DLL (launcher が内包して展開)、PDF は PDFium の
 マルチプロセスワーカー、AI は ONNX Runtime (DirectML / TensorRT)。詳細とファイル構成は
 [docs/project-reference.md](docs/project-reference.md)。
@@ -274,7 +274,7 @@ Rust (edition 2024、MSVC) + eframe / egui 0.33 (wgpu)。画像は `image` crate
   launcher は `-p mimageviewer-launcher --bin mimageviewer` が必要。配布物は必ず `scripts/build-dist.ps1`。
 - FFmpeg は **LGPL shared build だけを使い、GPL build を絶対に使わない**。DLL のファイル名を変えない。
   ビルドには `LIBCLANG_PATH` が必要。
-- ONNX Runtime DLL の版は `ort` crate の C API 版と揃える (ort 2.0.0-rc.12 ↔ 1.24.2)。
+- ONNX Runtime DLL は `ort` の選択 C API 版を満たすものを使う (ort 2.0.0-rc.15、既定feature無効 + `api-24` ↔ DirectML 1.24.4 / TensorRT pack GPU 1.24.2)。
 - VST3 host bridge は、**古い別 worktree の exe を流用しない** (IPC がずれて動画再生が激重になる)。
   C++ ソースを変えたら CMake で再ビルドする。
 
@@ -334,7 +334,8 @@ cargo test -p mimageviewer --test <integration-test-name>
 `cargo install cargo-nextest --locked` で入れる。経緯と計測は
 [docs/test-speed-report.md](docs/test-speed-report.md)。
 
-全workspace・統合・doc・pack builderテストは `.\scripts\test-full.ps1` に集約する。
+全workspace・統合・doc・pack builderテストは `.\scripts\test-full.ps1` に集約する
+(2026-10-16 から nextest で実行し、doctest だけ `cargo test --doc`。約 8 分、以前の cargo test では約 45〜51 分)。
 これは共有基盤を横断する変更の最終確認、リリース前、または明示的に全体確認を求められた
 場合に実行する。機能追加中の試行錯誤ごとには実行しない。詳細と判断表は
 [docs/development-build-and-test.md](docs/development-build-and-test.md) を参照。

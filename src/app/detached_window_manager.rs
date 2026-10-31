@@ -50,6 +50,90 @@ pub(crate) struct DetachedHostClaim {
     pub(crate) hwnd: u64,
 }
 
+/// Root-side visibility, maximization and focus are committed together only after
+/// this host has received its physical placement.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ShowRequest {
+    pub(crate) maximized: Option<bool>,
+    pub(crate) focus: bool,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlacementOutcome {
+    Exact,
+    Mismatch,
+}
+
+/// Backend geometry is a change notification, never the persisted placement.
+/// Focus/title changes deliberately do not cause an HWND sample.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct GeometryNotification {
+    outer: Option<egui::Rect>,
+    inner: Option<egui::Rect>,
+    native_pixels_per_point: Option<f32>,
+    pub(super) minimized: bool,
+    maximized: bool,
+}
+
+#[cfg(windows)]
+impl GeometryNotification {
+    pub(super) fn from_viewport(viewport: &egui::ViewportInfo) -> Option<Self> {
+        (viewport.outer_rect.is_some() || viewport.minimized == Some(true)).then_some(Self {
+            outer: viewport.outer_rect,
+            inner: viewport.inner_rect,
+            native_pixels_per_point: viewport.native_pixels_per_point,
+            minimized: viewport.minimized.unwrap_or(false),
+            maximized: viewport.maximized.unwrap_or(false),
+        })
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostPlacement {
+    Unplaced {
+        show_request: Option<ShowRequest>,
+        awaiting_unzoom: bool,
+        pending_mode: Option<bool>,
+    },
+    Placed {
+        incarnation: u64,
+        outcome: PlacementOutcome,
+        pending_mode: Option<bool>,
+    },
+}
+
+#[cfg(windows)]
+impl HostPlacement {
+    fn pending_mode(&self) -> Option<bool> {
+        match self {
+            Self::Unplaced { pending_mode, .. } | Self::Placed { pending_mode, .. } => {
+                *pending_mode
+            }
+        }
+    }
+
+    fn pending_mode_mut(&mut self) -> &mut Option<bool> {
+        match self {
+            Self::Unplaced { pending_mode, .. } | Self::Placed { pending_mode, .. } => pending_mode,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Default for HostPlacement {
+    fn default() -> Self {
+        Self::Unplaced {
+            show_request: None,
+            awaiting_unzoom: false,
+            pending_mode: None,
+        }
+    }
+}
+
 /// Progress of a right-drag command recognized by a passive detached window.
 /// The command remains owned by that window until its viewer bundle is mounted.
 #[cfg(windows)]
@@ -61,10 +145,30 @@ pub(crate) struct IdentifiedRightDragCommand {
 
 #[cfg(windows)]
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum PendingRightDragCommand {
-    Recognized { command: IdentifiedRightDragCommand },
-    Activating { command: IdentifiedRightDragCommand },
-    PendingExecution { command: IdentifiedRightDragCommand },
+pub(crate) enum PendingDetachedCommand<T> {
+    Recognized { command: T },
+    Activating { command: T },
+    PendingExecution { command: T },
+}
+
+#[cfg(windows)]
+pub(crate) type PendingRightDragCommand = PendingDetachedCommand<IdentifiedRightDragCommand>;
+#[cfg(windows)]
+pub(crate) type PendingPageOverviewCommand =
+    PendingDetachedCommand<super::detached_page_overview::IdentifiedPageOverviewCommand>;
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DetachedWindowCommand {
+    RightDrag(IdentifiedRightDragCommand),
+    PageOverview(super::detached_page_overview::IdentifiedPageOverviewCommand),
+}
+
+#[cfg(windows)]
+impl From<IdentifiedRightDragCommand> for DetachedWindowCommand {
+    fn from(command: IdentifiedRightDragCommand) -> Self {
+        Self::RightDrag(command)
+    }
 }
 
 #[cfg(windows)]
@@ -72,13 +176,14 @@ pub(crate) enum PendingRightDragCommand {
 pub(crate) enum DetachedActivationIntent {
     ActivateOnly,
     RightDrag(PendingRightDragCommand),
+    PageOverview(PendingPageOverviewCommand),
 }
 
 #[cfg(windows)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DetachedActivationDispatch {
     pub(crate) window_id: u64,
-    pub(crate) command: Option<IdentifiedRightDragCommand>,
+    pub(crate) command: Option<DetachedWindowCommand>,
 }
 
 #[cfg(windows)]
@@ -465,8 +570,12 @@ pub(crate) struct DetachedWindowRuntime {
     pub(crate) state: DetachedWindowState,
     pub(crate) hwnd: u64,
     pub(crate) host_incarnation: u64,
-    pub(crate) placement: Option<crate::settings::DetachedViewerWindowPlacement>,
-    pub(crate) builder_placement_latch: Option<crate::settings::DetachedViewerWindowPlacement>,
+    viewport_binding: Option<super::viewport_retirement::ViewportCommandBinding>,
+    pub(crate) placement: Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
+    pub(crate) builder_placement_latch:
+        Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
+    pub(crate) host_placement: HostPlacement,
+    last_geometry_notification: Option<GeometryNotification>,
     pub(crate) trim_bboxes: std::collections::HashMap<usize, DetachedTrimBBoxEntry>,
     pub(crate) linked: bool,
     pub(crate) activation_intent: Option<DetachedActivationIntent>,
@@ -480,8 +589,11 @@ impl DetachedWindowRuntime {
             state: DetachedWindowState::Opening,
             hwnd: 0,
             host_incarnation: 0,
+            viewport_binding: None,
             placement: None,
             builder_placement_latch: None,
+            host_placement: HostPlacement::default(),
+            last_geometry_notification: None,
             trim_bboxes: std::collections::HashMap::new(),
             linked,
             activation_intent: None,
@@ -534,10 +646,39 @@ impl DetachedWindowManager {
         self.runtimes.get(&window_id)
     }
 
+    /// Bind the real Context registration, together with its command sink.
+    /// No registration is created for an owner that has not shown a viewport.
+    pub(super) fn capture_viewport_registration(
+        &mut self,
+        window_id: u64,
+        context: &egui::Context,
+    ) {
+        let viewport_id = super::App::detached_image_window_viewport_id(window_id);
+        let Some(binding) =
+            super::viewport_retirement::ViewportCommandBinding::capture(context, viewport_id)
+        else {
+            return;
+        };
+        if let Some(runtime) = self.runtimes.get_mut(&window_id) {
+            runtime.viewport_binding = Some(binding);
+        }
+    }
+
+    /// Move approval before the existing owner removes its runtime or binding.
+    pub(super) fn transfer_viewport_retirement(&mut self, window_id: u64) {
+        if let Some(binding) = self
+            .runtimes
+            .get_mut(&window_id)
+            .and_then(|runtime| runtime.viewport_binding.take())
+        {
+            binding.transfer_retirement();
+        }
+    }
+
     pub(super) fn placement(
         &self,
         window_id: u64,
-    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+    ) -> Option<crate::detached_window_geometry::PhysicalWindowPlacement> {
         self.runtime(window_id)
             .and_then(|runtime| runtime.placement)
     }
@@ -545,9 +686,9 @@ impl DetachedWindowManager {
     pub(super) fn set_placement(
         &mut self,
         window_id: u64,
-        placement: crate::settings::DetachedViewerWindowPlacement,
+        placement: crate::detached_window_geometry::PhysicalWindowPlacement,
         default_linked: bool,
-    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+    ) -> Option<crate::detached_window_geometry::PhysicalWindowPlacement> {
         let runtime = self.entry_mut(window_id, default_linked);
         let previous = runtime.placement;
         runtime.placement = Some(placement);
@@ -582,7 +723,7 @@ impl DetachedWindowManager {
     pub(super) fn builder_placement_latch(
         &self,
         window_id: u64,
-    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+    ) -> Option<crate::detached_window_geometry::PhysicalWindowPlacement> {
         self.runtime(window_id)
             .and_then(|runtime| runtime.builder_placement_latch)
     }
@@ -590,9 +731,9 @@ impl DetachedWindowManager {
     pub(super) fn set_builder_placement_latch(
         &mut self,
         window_id: u64,
-        placement: crate::settings::DetachedViewerWindowPlacement,
+        placement: crate::detached_window_geometry::PhysicalWindowPlacement,
         default_linked: bool,
-    ) -> Option<crate::settings::DetachedViewerWindowPlacement> {
+    ) -> Option<crate::detached_window_geometry::PhysicalWindowPlacement> {
         let runtime = self.entry_mut(window_id, default_linked);
         let previous = runtime.builder_placement_latch;
         runtime.builder_placement_latch = Some(placement);
@@ -603,6 +744,191 @@ impl DetachedWindowManager {
         self.runtime(window_id)
             .map(|runtime| runtime.hwnd)
             .filter(|hwnd| *hwnd != 0)
+    }
+
+    pub(super) fn host_placement(&self, window_id: u64) -> Option<HostPlacement> {
+        let runtime = self.runtime(window_id)?;
+        Some(match runtime.host_placement {
+            HostPlacement::Placed { incarnation, .. }
+                if runtime.hwnd == 0 || incarnation != runtime.host_incarnation =>
+            {
+                HostPlacement::default()
+            }
+            placement => placement,
+        })
+    }
+
+    /// The last command in this root output transaction owns the mode until
+    /// native observation agrees or the backend has consumed the transaction.
+    /// This metadata boundary deliberately performs no native liveness query.
+    pub(super) fn note_mode_command(&mut self, window_id: u64, maximized: bool) -> bool {
+        let Some(runtime) = self.runtimes.get_mut(&window_id) else {
+            return false;
+        };
+        if runtime.state == DetachedWindowState::Closing {
+            return false;
+        }
+        *runtime.host_placement.pending_mode_mut() = Some(maximized);
+        runtime.last_geometry_notification = None;
+        true
+    }
+
+    pub(super) fn pending_mode(&self, window_id: u64) -> Option<bool> {
+        let runtime = self.runtime(window_id)?;
+        if runtime.state == DetachedWindowState::Closing {
+            return None;
+        }
+        self.host_placement(window_id)?.pending_mode()
+    }
+
+    pub(super) fn resolve_host_mode(&mut self, window_id: u64, zoomed: bool) -> bool {
+        let Some(pending) = self.pending_mode(window_id) else {
+            return zoomed;
+        };
+        if zoomed == pending {
+            *self
+                .runtimes
+                .get_mut(&window_id)
+                .unwrap()
+                .host_placement
+                .pending_mode_mut() = None;
+        }
+        pending
+    }
+
+    /// A native lifecycle delivery follows backend output processing without
+    /// necessarily passing through another root input. Retire only its host.
+    pub(super) fn retire_mode_command_after_output(&mut self, window_id: u64) {
+        if let Some(runtime) = self.runtimes.get_mut(&window_id)
+            && runtime.host_placement.pending_mode_mut().take().is_some()
+        {
+            runtime.last_geometry_notification = None;
+        }
+    }
+
+    /// Called once by the root raw-input hook after previous output has reached
+    /// the backend, before any full/logic-only or repeated/discard logic pass.
+    pub(super) fn retire_mode_commands_before_root_pass(&mut self) {
+        for runtime in self.runtimes.values_mut() {
+            if runtime.host_placement.pending_mode_mut().take().is_some() {
+                runtime.last_geometry_notification = None;
+            }
+        }
+    }
+
+    pub(super) fn geometry_notification_changed(
+        &self,
+        window_id: u64,
+        notification: GeometryNotification,
+    ) -> bool {
+        self.runtime(window_id)
+            .is_some_and(|runtime| runtime.last_geometry_notification != Some(notification))
+    }
+
+    pub(super) fn record_geometry_notification(
+        &mut self,
+        window_id: u64,
+        notification: GeometryNotification,
+    ) {
+        if let Some(runtime) = self.runtimes.get_mut(&window_id) {
+            runtime.last_geometry_notification = Some(notification);
+        }
+    }
+
+    pub(super) fn invalidate_geometry_notification(&mut self, window_id: u64) {
+        if let Some(runtime) = self.runtimes.get_mut(&window_id) {
+            runtime.last_geometry_notification = None;
+        }
+    }
+
+    /// Returns a request only when it can be dispatched immediately. Missing
+    /// runtimes retain their existing caller-owned dispatch path.
+    pub(super) fn request_show(
+        &mut self,
+        window_id: u64,
+        request: ShowRequest,
+    ) -> Option<ShowRequest> {
+        let Some(placement) = self.host_placement(window_id) else {
+            return Some(request);
+        };
+        match placement {
+            HostPlacement::Placed { .. } => Some(request),
+            HostPlacement::Unplaced {
+                show_request,
+                awaiting_unzoom,
+                pending_mode,
+            } => {
+                // A later focus-only request must not erase an earlier maximize
+                // intent while placement is waiting for the host to unzoom.
+                let combined = ShowRequest {
+                    maximized: request
+                        .maximized
+                        .or(show_request.and_then(|old| old.maximized)),
+                    focus: request.focus || show_request.is_some_and(|old| old.focus),
+                };
+                self.runtimes.get_mut(&window_id).unwrap().host_placement =
+                    HostPlacement::Unplaced {
+                        show_request: Some(combined),
+                        awaiting_unzoom,
+                        pending_mode,
+                    };
+                None
+            }
+        }
+    }
+
+    pub(super) fn clear_show_request(&mut self, window_id: u64) {
+        if let Some(runtime) = self.runtimes.get_mut(&window_id) {
+            if let HostPlacement::Unplaced { show_request, .. } = &mut runtime.host_placement {
+                *show_request = None;
+            }
+        }
+    }
+
+    /// Re-enter the same typed placement owner for an intentional geometry
+    /// transition, preserving a root-side request already waiting on this host.
+    pub(super) fn mark_host_unplaced(&mut self, window_id: u64, awaiting_unzoom: bool) {
+        if let Some(runtime) = self.runtimes.get_mut(&window_id) {
+            runtime.last_geometry_notification = None;
+            let pending_mode = runtime.host_placement.pending_mode();
+            let show_request = match runtime.host_placement {
+                HostPlacement::Unplaced { show_request, .. } => show_request,
+                HostPlacement::Placed { .. } => None,
+            };
+            runtime.host_placement = HostPlacement::Unplaced {
+                show_request,
+                awaiting_unzoom,
+                pending_mode,
+            };
+        }
+    }
+
+    pub(super) fn set_host_awaiting_unzoom(&mut self, window_id: u64, awaiting_unzoom: bool) {
+        self.mark_host_unplaced(window_id, awaiting_unzoom);
+    }
+
+    /// A stale apply completion cannot mark a replacement host placed or take
+    /// its pending visibility request. Mismatch still permits visibility.
+    pub(super) fn mark_host_placed(
+        &mut self,
+        claim: DetachedHostClaim,
+        outcome: PlacementOutcome,
+    ) -> Option<ShowRequest> {
+        if !self.host_claim_is_alive(claim) {
+            return None;
+        }
+        let runtime = self.runtimes.get_mut(&claim.lease.window_id)?;
+        let pending_mode = runtime.host_placement.pending_mode();
+        let show_request = match runtime.host_placement {
+            HostPlacement::Unplaced { show_request, .. } => show_request,
+            HostPlacement::Placed { .. } => None,
+        };
+        runtime.host_placement = HostPlacement::Placed {
+            incarnation: claim.incarnation,
+            outcome,
+            pending_mode,
+        };
+        show_request
     }
 
     pub(super) fn hwnd_is_alive(&self, hwnd: u64) -> bool {
@@ -645,6 +971,8 @@ impl DetachedWindowManager {
     pub(super) fn clear_hwnd(&mut self, window_id: u64) -> Option<u64> {
         let runtime = self.runtimes.get_mut(&window_id)?;
         let hwnd = std::mem::take(&mut runtime.hwnd);
+        runtime.host_placement = HostPlacement::default();
+        runtime.last_geometry_notification = None;
         (hwnd != 0).then_some(hwnd)
     }
 
@@ -677,6 +1005,19 @@ impl DetachedWindowManager {
         let previous = (runtime.hwnd != 0).then_some(runtime.hwnd);
         runtime.hwnd = hwnd;
         if let Some(incarnation) = new_incarnation {
+            runtime.last_geometry_notification = None;
+            if runtime.host_incarnation != 0 {
+                // A callback can issue a new command after clear_hwnd and
+                // before its replacement host is adopted. Only that command
+                // survives adoption; direct host replacement discards it.
+                let pending_mode = if previous.is_none() {
+                    runtime.host_placement.pending_mode()
+                } else {
+                    None
+                };
+                runtime.host_placement = HostPlacement::default();
+                *runtime.host_placement.pending_mode_mut() = pending_mode;
+            }
             runtime.host_incarnation = incarnation;
         }
         previous
@@ -753,6 +1094,15 @@ impl DetachedWindowManager {
         (was_pending, runtime.state)
     }
 
+    pub(super) fn pending_activation_is_activate_only(&self, window_id: u64) -> bool {
+        self.runtime(window_id).is_some_and(|runtime| {
+            matches!(
+                runtime.activation_intent,
+                Some(DetachedActivationIntent::ActivateOnly)
+            )
+        })
+    }
+
     /// Read-only arbitration probe used before a test-script activation joins the
     /// production intent queue. Closing and in-flight right-drag states count too:
     /// none of them may be overtaken by an automation request.
@@ -769,9 +1119,9 @@ impl DetachedWindowManager {
         default_linked: bool,
     ) -> (bool, DetachedWindowState) {
         let runtime = self.entry_mut(window_id, default_linked);
-        let accepted = !matches!(
+        let accepted = matches!(
             runtime.activation_intent,
-            Some(DetachedActivationIntent::RightDrag(_))
+            None | Some(DetachedActivationIntent::ActivateOnly)
         );
         if accepted {
             runtime.activation_intent = Some(DetachedActivationIntent::RightDrag(
@@ -807,6 +1157,9 @@ impl DetachedWindowManager {
                             | Some(DetachedActivationIntent::RightDrag(
                                 PendingRightDragCommand::Recognized { .. }
                             ))
+                            | Some(DetachedActivationIntent::PageOverview(
+                                PendingPageOverviewCommand::Recognized { .. }
+                            ))
                     )
             })
             .map(|(&id, _)| id)
@@ -824,7 +1177,17 @@ impl DetachedWindowManager {
                         command: command.clone(),
                     },
                 ));
-                Some(command)
+                Some(DetachedWindowCommand::RightDrag(command))
+            }
+            DetachedActivationIntent::PageOverview(PendingPageOverviewCommand::Recognized {
+                command,
+            }) => {
+                runtime.activation_intent = Some(DetachedActivationIntent::PageOverview(
+                    PendingPageOverviewCommand::Activating {
+                        command: command.clone(),
+                    },
+                ));
+                Some(DetachedWindowCommand::PageOverview(command))
             }
             other => {
                 runtime.activation_intent = Some(other);
@@ -837,11 +1200,142 @@ impl DetachedWindowManager {
         })
     }
 
+    /// One runtime owns either activation-only, a right-drag command, or a bounded
+    /// overview batch. Repeated wheel/column input joins that batch without a second owner.
+    pub(super) fn queue_page_overview_command(
+        &mut self,
+        window_id: u64,
+        command: super::page_overview::PageOverviewCommand,
+        activate: bool,
+        default_linked: bool,
+    ) -> bool {
+        use super::detached_page_overview::IdentifiedPageOverviewCommand;
+        let runtime = self.entry_mut(window_id, default_linked);
+        if runtime.state == DetachedWindowState::Closing {
+            return false;
+        }
+        match runtime.activation_intent.as_mut() {
+            Some(DetachedActivationIntent::PageOverview(pending)) => {
+                match pending {
+                    PendingPageOverviewCommand::Recognized { command: batch }
+                    | PendingPageOverviewCommand::PendingExecution { command: batch } => {
+                        batch.push(command)
+                    }
+                    // The synchronous activation dispatch already owns its exact payload.
+                    PendingPageOverviewCommand::Activating { .. } => false,
+                }
+            }
+            None | Some(DetachedActivationIntent::ActivateOnly) => {
+                let batch = IdentifiedPageOverviewCommand::new(command);
+                runtime.activation_intent =
+                    Some(DetachedActivationIntent::PageOverview(if activate {
+                        PendingPageOverviewCommand::Recognized { command: batch }
+                    } else {
+                        PendingPageOverviewCommand::PendingExecution { command: batch }
+                    }));
+                true
+            }
+            Some(DetachedActivationIntent::RightDrag(_)) => false,
+        }
+    }
+
+    pub(super) fn mark_detached_command_pending_execution(
+        &mut self,
+        window_id: u64,
+        command: DetachedWindowCommand,
+    ) -> bool {
+        match command {
+            DetachedWindowCommand::RightDrag(command) => {
+                self.mark_right_drag_pending_execution(window_id, command)
+            }
+            DetachedWindowCommand::PageOverview(command) => {
+                let Some(runtime) = self.runtimes.get_mut(&window_id) else {
+                    return false;
+                };
+                let Some(pending) = runtime.activation_intent.take() else {
+                    return false;
+                };
+                match pending {
+                    DetachedActivationIntent::PageOverview(
+                        PendingPageOverviewCommand::Activating {
+                            command: activating,
+                        },
+                    ) if activating == command => {
+                        runtime.activation_intent = Some(DetachedActivationIntent::PageOverview(
+                            PendingPageOverviewCommand::PendingExecution { command },
+                        ));
+                        true
+                    }
+                    other => {
+                        runtime.activation_intent = Some(other);
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn pending_page_overview_execution_window_ids(&self) -> Vec<u64> {
+        self.runtimes
+            .iter()
+            .filter_map(|(&id, runtime)| {
+                matches!(
+                    runtime.activation_intent,
+                    Some(DetachedActivationIntent::PageOverview(
+                        PendingPageOverviewCommand::PendingExecution { .. }
+                    ))
+                )
+                .then_some(id)
+            })
+            .collect()
+    }
+
+    pub(super) fn take_pending_page_overview_execution(
+        &mut self,
+        window_id: u64,
+    ) -> Option<super::detached_page_overview::IdentifiedPageOverviewCommand> {
+        let runtime = self.runtimes.get_mut(&window_id)?;
+        match runtime.activation_intent.take()? {
+            DetachedActivationIntent::PageOverview(
+                PendingPageOverviewCommand::PendingExecution { command },
+            ) => Some(command),
+            other => {
+                runtime.activation_intent = Some(other);
+                None
+            }
+        }
+    }
+
+    /// Activation failure/modal/terminal retirement drops the single command owner.
+    pub(super) fn discard_detached_command(&mut self, window_id: u64) -> bool {
+        self.runtimes
+            .get_mut(&window_id)
+            .is_some_and(|runtime| runtime.activation_intent.take().is_some())
+    }
+
+    pub(super) fn discard_page_overview_command(&mut self, window_id: u64) -> bool {
+        let Some(runtime) = self.runtimes.get_mut(&window_id) else {
+            return false;
+        };
+        if matches!(
+            runtime.activation_intent,
+            Some(DetachedActivationIntent::PageOverview(_))
+        ) {
+            runtime.activation_intent = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub(super) fn mark_right_drag_pending_execution(
         &mut self,
         window_id: u64,
-        command: IdentifiedRightDragCommand,
+        command: impl Into<DetachedWindowCommand>,
     ) -> bool {
+        let DetachedWindowCommand::RightDrag(command) = command.into() else {
+            return false;
+        };
         let Some(runtime) = self.runtimes.get_mut(&window_id) else {
             return false;
         };
@@ -1082,7 +1576,10 @@ mod tests {
         let dispatch = manager
             .take_pending_deferred_activation()
             .expect("recognized dispatch");
-        assert_eq!(dispatch.command, Some(command.clone()));
+        assert_eq!(
+            dispatch.command,
+            Some(DetachedWindowCommand::RightDrag(command.clone()))
+        );
         assert!(matches!(
             manager.activation_intent(9),
             Some(DetachedActivationIntent::RightDrag(
@@ -1100,6 +1597,129 @@ mod tests {
         assert_eq!(manager.take_pending_right_drag_execution(9), Some(command));
         assert!(manager.activation_intent(9).is_none());
         assert!(!manager.has_activation_intent());
+    }
+
+    fn overview_scroll(delta: isize) -> super::super::page_overview::PageOverviewCommand {
+        super::super::page_overview::PageOverviewCommand::ScrollRows {
+            stamp: crate::page_overview::PageOverviewStamp {
+                context_serial: 17,
+                items_generation: 18,
+                reader_order_revision: 19,
+                incarnation: 20,
+            },
+            delta,
+        }
+    }
+
+    #[test]
+    fn overview_pointer_joins_native_activation_and_executes_exactly_once() {
+        let mut manager = DetachedWindowManager::new();
+        manager.transition_state(30, DetachedWindowState::Parked, false);
+        manager.queue_deferred_activation(30, false);
+        assert!(manager.pending_activation_is_activate_only(30));
+        assert!(manager.queue_page_overview_command(30, overview_scroll(2), true, false));
+        assert!(!manager.pending_activation_is_activate_only(30));
+        assert!(manager.queue_page_overview_command(30, overview_scroll(3), true, false));
+        let dispatch = manager
+            .take_pending_deferred_activation()
+            .expect("overview activation");
+        let command = dispatch
+            .command
+            .expect("typed command survives native ActivateOnly");
+        assert!(
+            matches!(&command, DetachedWindowCommand::PageOverview(batch)
+            if batch.commands() == &[overview_scroll(5)])
+        );
+        assert!(manager.take_pending_deferred_activation().is_none());
+        assert!(manager.take_pending_page_overview_execution(30).is_none());
+        assert!(manager.mark_detached_command_pending_execution(30, command));
+        assert_eq!(
+            manager.pending_page_overview_execution_window_ids(),
+            vec![30]
+        );
+        assert_eq!(
+            manager
+                .take_pending_page_overview_execution(30)
+                .unwrap()
+                .commands(),
+            &[overview_scroll(5)]
+        );
+        assert!(manager.take_pending_page_overview_execution(30).is_none());
+        assert!(!manager.has_activation_intent());
+    }
+
+    #[test]
+    fn overview_already_active_input_never_dispatches_a_second_activation() {
+        let mut manager = DetachedWindowManager::new();
+        manager.transition_state(31, DetachedWindowState::Active, false);
+        assert!(manager.queue_page_overview_command(31, overview_scroll(1), false, false));
+        assert!(manager.take_pending_deferred_activation().is_none());
+        assert!(manager.queue_page_overview_command(31, overview_scroll(2), false, false));
+        assert_eq!(
+            manager
+                .take_pending_page_overview_execution(31)
+                .unwrap()
+                .commands(),
+            &[overview_scroll(3)]
+        );
+        assert!(manager.take_pending_deferred_activation().is_none());
+    }
+
+    #[test]
+    fn overview_and_right_drag_share_one_exclusive_runtime_owner() {
+        let mut manager = DetachedWindowManager::new();
+        manager.queue_right_drag_command(32, identified(short_click_command()), false);
+        assert!(!manager.queue_page_overview_command(32, overview_scroll(1), true, false));
+        assert!(!manager.discard_page_overview_command(32));
+        assert!(matches!(
+            manager.activation_intent(32),
+            Some(DetachedActivationIntent::RightDrag(_))
+        ));
+        manager.discard_detached_command(32);
+        assert!(manager.queue_page_overview_command(32, overview_scroll(1), true, false));
+        assert!(
+            !manager
+                .queue_right_drag_command(32, identified(short_click_command()), false)
+                .0
+        );
+        assert!(matches!(
+            manager.activation_intent(32),
+            Some(DetachedActivationIntent::PageOverview(_))
+        ));
+    }
+
+    #[test]
+    fn overview_stale_pending_execution_is_discarded_without_activation_or_replay() {
+        let mut manager = DetachedWindowManager::new();
+        assert!(manager.queue_page_overview_command(33, overview_scroll(1), false, false));
+        assert!(manager.discard_page_overview_command(33));
+        assert!(!manager.discard_page_overview_command(33));
+        assert!(manager.take_pending_page_overview_execution(33).is_none());
+        assert!(manager.take_pending_deferred_activation().is_none());
+        manager.transition_state(33, DetachedWindowState::Closing, false);
+        assert!(!manager.queue_page_overview_command(33, overview_scroll(1), true, false));
+    }
+
+    #[test]
+    fn overview_wrong_activation_payload_does_not_advance_the_intent() {
+        let mut manager = DetachedWindowManager::new();
+        assert!(manager.queue_page_overview_command(34, overview_scroll(1), true, false));
+        let dispatch = manager.take_pending_deferred_activation().unwrap();
+        let wrong = DetachedWindowCommand::PageOverview(
+            super::super::detached_page_overview::IdentifiedPageOverviewCommand::new(
+                overview_scroll(2),
+            ),
+        );
+        assert!(!manager.mark_detached_command_pending_execution(34, wrong));
+        assert!(!manager.queue_page_overview_command(34, overview_scroll(2), true, false));
+        assert!(manager.mark_detached_command_pending_execution(34, dispatch.command.unwrap()));
+        assert_eq!(
+            manager
+                .take_pending_page_overview_execution(34)
+                .unwrap()
+                .commands(),
+            &[overview_scroll(1)]
+        );
     }
 
     #[test]
@@ -1153,6 +1773,464 @@ mod tests {
 
         manager.remove(WINDOW_ID);
         assert!(!manager.reusable_session_lease(WINDOW_ID));
+    }
+
+    #[test]
+    fn mode_commands_require_existing_non_closing_runtime() {
+        let mut manager = DetachedWindowManager::new();
+        assert!(!manager.note_mode_command(7, true));
+        assert!(manager.runtime(7).is_none());
+        assert_eq!(manager.pending_mode(7), None);
+        assert!(manager.resolve_host_mode(7, true));
+
+        manager.transition_state(7, DetachedWindowState::Opening, false);
+        assert!(manager.note_mode_command(7, true));
+        assert_eq!(manager.pending_mode(7), Some(true));
+        manager.set_hwnd(7, 0x7000, false);
+        // No fake native liveness is registered: metadata tracking must not
+        // perform an IsWindow query on every root pass or command observation.
+        assert!(manager.note_mode_command(7, true));
+        assert!(manager.resolve_host_mode(7, false));
+        manager.transition_state(7, DetachedWindowState::Closing, false);
+        assert!(!manager.note_mode_command(7, false));
+        assert_eq!(manager.pending_mode(7), None);
+        assert!(!manager.resolve_host_mode(7, false));
+    }
+
+    #[test]
+    fn pending_mode_survives_show_placement_and_unplacement() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_live_hwnds_for_test([0x7000]);
+        manager.set_hwnd(7, 0x7000, false);
+        let pending = true;
+        assert!(manager.note_mode_command(7, pending));
+        let request = ShowRequest {
+            maximized: Some(true),
+            focus: true,
+        };
+        assert_eq!(manager.request_show(7, request), None);
+        assert_eq!(manager.pending_mode(7), Some(pending));
+        let claim = manager.host_claim_alive(7).unwrap();
+        assert_eq!(
+            manager.mark_host_placed(claim, PlacementOutcome::Exact),
+            Some(request)
+        );
+        assert_eq!(manager.pending_mode(7), Some(pending));
+        assert_eq!(manager.request_show(7, request), Some(request));
+        manager.mark_host_unplaced(7, true);
+        assert_eq!(manager.request_show(7, request), None);
+        manager.clear_show_request(7);
+        manager.set_hwnd(7, 0x7000, false);
+        assert_eq!(
+            manager.host_placement(7),
+            Some(HostPlacement::Unplaced {
+                show_request: None,
+                awaiting_unzoom: true,
+                pending_mode: Some(pending),
+            })
+        );
+        manager.mark_host_placed(claim, PlacementOutcome::Mismatch);
+        assert_eq!(manager.pending_mode(7), Some(pending));
+    }
+
+    #[test]
+    fn host_replacement_clear_and_runtime_removal_discard_pending_mode() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_hwnd(7, 0x7000, false);
+        assert!(manager.note_mode_command(7, true));
+        manager.set_hwnd(7, 0x8000, false);
+        assert_eq!(manager.pending_mode(7), None);
+        assert_eq!(manager.host_placement(7), Some(HostPlacement::default()));
+
+        assert!(manager.note_mode_command(7, false));
+        manager.clear_hwnd(7);
+        assert_eq!(manager.pending_mode(7), None);
+        manager.set_hwnd(7, 0x8000, false);
+        assert_eq!(manager.pending_mode(7), None);
+        assert!(manager.note_mode_command(7, true));
+        manager.remove(7);
+        manager.set_hwnd(7, 0x8000, false);
+        assert_eq!(manager.pending_mode(7), None);
+    }
+
+    #[test]
+    fn mode_command_before_initial_host_adoption_survives_registration() {
+        let mut manager = DetachedWindowManager::new();
+        manager.transition_state(7, DetachedWindowState::Opening, false);
+        let request = ShowRequest {
+            maximized: Some(true),
+            focus: true,
+        };
+        manager.request_show(7, request);
+        assert!(manager.note_mode_command(7, true));
+        assert_eq!(manager.pending_mode(7), Some(true));
+        assert!(manager.resolve_host_mode(7, false));
+
+        manager.set_hwnd(7, 0x7000, false);
+        assert_eq!(manager.pending_mode(7), Some(true));
+        assert_eq!(
+            manager.host_placement(7),
+            Some(HostPlacement::Unplaced {
+                show_request: Some(request),
+                awaiting_unzoom: false,
+                pending_mode: Some(true),
+            })
+        );
+        assert!(manager.resolve_host_mode(7, false));
+    }
+
+    #[test]
+    fn new_mode_command_after_clear_survives_recreated_host_adoption() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_hwnd(7, 0x7000, false);
+        let first_incarnation = manager.runtime(7).unwrap().host_incarnation;
+        assert!(manager.note_mode_command(7, false));
+        manager.clear_hwnd(7);
+        assert_eq!(manager.pending_mode(7), None);
+        assert!(manager.note_mode_command(7, true));
+        assert_eq!(manager.pending_mode(7), Some(true));
+        manager.request_show(
+            7,
+            ShowRequest {
+                maximized: Some(true),
+                focus: true,
+            },
+        );
+        manager.mark_host_unplaced(7, true);
+
+        manager.set_hwnd(7, 0x8000, false);
+        assert_ne!(
+            manager.runtime(7).unwrap().host_incarnation,
+            first_incarnation
+        );
+        assert_eq!(
+            manager.host_placement(7),
+            Some(HostPlacement::Unplaced {
+                show_request: None,
+                awaiting_unzoom: false,
+                pending_mode: Some(true),
+            }),
+            "recreated adoption preserves only the new command, retaining existing placement reset semantics"
+        );
+        assert!(manager.resolve_host_mode(7, false));
+        manager.clear_hwnd(7);
+        assert_eq!(manager.pending_mode(7), None);
+    }
+
+    #[test]
+    fn latest_mode_command_wins_until_matching_native_fact() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_hwnd(7, 0x7000, false);
+        manager.set_hwnd(8, 0x8000, false);
+        manager.note_mode_command(8, true);
+        let sibling = manager.host_placement(8);
+        assert!(manager.note_mode_command(7, true));
+        assert!(manager.resolve_host_mode(7, false));
+        assert!(manager.note_mode_command(7, false));
+        assert!(!manager.resolve_host_mode(7, true));
+        assert_eq!(manager.pending_mode(7), Some(false));
+        assert!(!manager.resolve_host_mode(7, false));
+        assert_eq!(manager.pending_mode(7), None);
+        assert!(manager.resolve_host_mode(7, true));
+        assert_eq!(manager.host_placement(8), sibling);
+
+        manager.note_mode_command(7, true);
+        assert!(manager.resolve_host_mode(7, true));
+        assert_eq!(manager.pending_mode(7), None);
+    }
+
+    #[test]
+    fn mode_commands_retire_at_root_output_boundary_and_invalidate_geometry() {
+        let mut manager = DetachedWindowManager::new();
+        let notification = GeometryNotification::from_viewport(&egui::ViewportInfo {
+            outer_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(960.0, 720.0),
+            )),
+            ..Default::default()
+        })
+        .unwrap();
+        for id in [7, 8, 9, 10] {
+            manager.set_hwnd(id, id * 0x1000, false);
+            manager.record_geometry_notification(id, notification);
+        }
+        manager.note_mode_command(7, true);
+        assert!(manager.geometry_notification_changed(7, notification));
+        assert!(!manager.geometry_notification_changed(8, notification));
+        manager.note_mode_command(8, false);
+        manager.note_mode_command(10, true);
+        manager.record_geometry_notification(7, notification);
+        manager.record_geometry_notification(8, notification);
+        manager.record_geometry_notification(10, notification);
+
+        // Logic and discard passes inside one output transaction retain the
+        // command until the next root raw-input hook calls the boundary.
+        assert!(manager.resolve_host_mode(7, false));
+        assert!(manager.resolve_host_mode(7, false));
+        assert_eq!(manager.pending_mode(7), Some(true));
+        assert!(!manager.geometry_notification_changed(7, notification));
+        assert!(manager.pending_mode(8).is_some());
+        assert!(!manager.geometry_notification_changed(8, notification));
+        assert!(!manager.geometry_notification_changed(9, notification));
+        assert!(!manager.resolve_host_mode(8, false));
+        assert_eq!(manager.pending_mode(8), None);
+
+        // The next root output boundary retires even an unmatched command.
+        manager.retire_mode_commands_before_root_pass();
+        assert_eq!(manager.pending_mode(7), None);
+        assert_eq!(manager.pending_mode(10), None);
+        assert!(manager.geometry_notification_changed(7, notification));
+        assert!(manager.geometry_notification_changed(10, notification));
+        assert!(!manager.resolve_host_mode(7, false));
+        assert!(!manager.geometry_notification_changed(8, notification));
+        assert!(!manager.geometry_notification_changed(9, notification));
+
+        manager.record_geometry_notification(7, notification);
+        manager.retire_mode_commands_before_root_pass();
+        assert!(!manager.geometry_notification_changed(7, notification));
+    }
+
+    #[test]
+    fn native_lifecycle_boundary_retires_only_its_host_and_invalidates_observation() {
+        let mut manager = DetachedWindowManager::new();
+        let notification = GeometryNotification::from_viewport(&egui::ViewportInfo {
+            outer_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(960.0, 720.0),
+            )),
+            ..Default::default()
+        })
+        .unwrap();
+        for id in [7, 8, 9] {
+            manager.set_hwnd(id, id * 0x1000, false);
+            manager.note_mode_command(id, id != 8);
+            manager.record_geometry_notification(id, notification);
+        }
+        let sibling = manager.host_placement(8);
+        manager.retire_mode_command_after_output(7);
+        assert_eq!(manager.pending_mode(7), None);
+        assert!(!manager.resolve_host_mode(7, false));
+        assert!(manager.geometry_notification_changed(7, notification));
+        assert_eq!(manager.host_placement(8), sibling);
+        assert!(!manager.geometry_notification_changed(8, notification));
+        assert_eq!(manager.pending_mode(9), Some(true));
+        manager.record_geometry_notification(7, notification);
+        manager.retire_mode_command_after_output(7);
+        assert!(!manager.geometry_notification_changed(7, notification));
+        manager.retire_mode_command_after_output(10);
+        assert!(manager.runtime(10).is_none());
+    }
+
+    #[test]
+    fn unplaced_host_retains_and_merges_show_until_physical_placement() {
+        let mut manager = DetachedWindowManager::new();
+        manager.transition_state(7, DetachedWindowState::Opening, false);
+        let maximize = ShowRequest {
+            maximized: Some(true),
+            focus: false,
+        };
+        let focus = ShowRequest {
+            maximized: None,
+            focus: true,
+        };
+        assert_eq!(manager.request_show(7, maximize), None);
+        assert_eq!(manager.request_show(7, focus), None);
+        let combined = ShowRequest {
+            maximized: Some(true),
+            focus: true,
+        };
+        assert_eq!(
+            manager.host_placement(7),
+            Some(HostPlacement::Unplaced {
+                show_request: Some(combined),
+                awaiting_unzoom: false,
+                pending_mode: None,
+            })
+        );
+
+        manager.set_live_hwnds_for_test([0x7000]);
+        manager.set_hwnd(7, 0x7000, false);
+        let claim = manager.host_claim_alive(7).unwrap();
+        assert_eq!(
+            manager.mark_host_placed(claim, PlacementOutcome::Exact),
+            Some(combined)
+        );
+        assert_eq!(
+            manager.host_placement(7),
+            Some(HostPlacement::Placed {
+                incarnation: claim.incarnation,
+                outcome: PlacementOutcome::Exact,
+                pending_mode: None,
+            })
+        );
+        assert_eq!(manager.request_show(7, focus), Some(focus));
+        assert_eq!(
+            manager.mark_host_placed(claim, PlacementOutcome::Exact),
+            None
+        );
+        assert_eq!(manager.request_show(999, focus), Some(focus));
+        assert!(
+            manager.runtime(999).is_none(),
+            "missing runtime must not create a pending owner"
+        );
+    }
+
+    #[test]
+    fn geometry_notifications_are_scoped_to_host_incarnation_and_leave_siblings_unchanged() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_live_hwnds_for_test([0x7000, 0x8000]);
+        manager.set_hwnd(7, 0x7000, false);
+        manager.set_hwnd(8, 0x8000, false);
+        let info = egui::ViewportInfo {
+            outer_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(960.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let notification = GeometryNotification::from_viewport(&info).unwrap();
+        for id in [7, 8] {
+            assert!(manager.geometry_notification_changed(id, notification));
+            manager.record_geometry_notification(id, notification);
+        }
+        manager.set_hwnd(7, 0x7000, false);
+        assert!(!manager.geometry_notification_changed(7, notification));
+        manager.invalidate_geometry_notification(7);
+        assert!(manager.geometry_notification_changed(7, notification));
+        assert!(!manager.geometry_notification_changed(8, notification));
+        manager.record_geometry_notification(7, notification);
+        manager.clear_hwnd(7);
+        manager.set_hwnd(7, 0x7000, false);
+        assert!(manager.geometry_notification_changed(7, notification));
+        assert!(!manager.geometry_notification_changed(8, notification));
+    }
+
+    #[test]
+    fn hide_cancels_pending_show_without_losing_unzoom_wait() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_live_hwnds_for_test([0x7000]);
+        manager.set_hwnd(7, 0x7000, false);
+        manager.mark_host_unplaced(7, true);
+        manager.request_show(
+            7,
+            ShowRequest {
+                maximized: Some(true),
+                focus: true,
+            },
+        );
+        manager.clear_show_request(7);
+        assert_eq!(
+            manager.host_placement(7),
+            Some(HostPlacement::Unplaced {
+                show_request: None,
+                awaiting_unzoom: true,
+                pending_mode: None,
+            })
+        );
+        let claim = manager.host_claim_alive(7).unwrap();
+        assert_eq!(
+            manager.mark_host_placed(claim, PlacementOutcome::Exact),
+            None
+        );
+    }
+
+    #[test]
+    fn host_replacement_discards_old_show_and_rejects_old_placement_completion() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_live_hwnds_for_test([0x7000, 0x8000]);
+        manager.set_hwnd(7, 0x7000, false);
+        let old = manager.host_claim_alive(7).unwrap();
+        let request = ShowRequest {
+            maximized: Some(true),
+            focus: true,
+        };
+        manager.request_show(7, request);
+        manager.set_hwnd(7, 0x8000, false);
+        assert_eq!(manager.host_placement(7), Some(HostPlacement::default()));
+        manager.request_show(7, request);
+        assert_eq!(manager.mark_host_placed(old, PlacementOutcome::Exact), None);
+        let current = manager.host_claim_alive(7).unwrap();
+        assert_eq!(
+            manager.mark_host_placed(current, PlacementOutcome::Mismatch),
+            Some(request)
+        );
+        assert_eq!(
+            manager.host_placement(7),
+            Some(HostPlacement::Placed {
+                incarnation: current.incarnation,
+                outcome: PlacementOutcome::Mismatch,
+                pending_mode: None,
+            })
+        );
+        assert_eq!(
+            manager.request_show(7, request),
+            Some(request),
+            "mismatch must still allow visibility"
+        );
+    }
+
+    #[test]
+    fn duplicate_registration_preserves_placement_and_clear_reuse_requires_new_apply() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_live_hwnds_for_test([0x7000]);
+        manager.set_hwnd(7, 0x7000, false);
+        let first = manager.host_claim_alive(7).unwrap();
+        manager.mark_host_placed(first, PlacementOutcome::Exact);
+        let placed = manager.host_placement(7);
+        manager.set_hwnd(7, 0x7000, false);
+        assert_eq!(manager.host_placement(7), placed);
+
+        manager.mark_host_unplaced(7, true);
+        let request = ShowRequest {
+            maximized: Some(false),
+            focus: true,
+        };
+        manager.request_show(7, request);
+        manager.set_hwnd(7, 0x7000, false);
+        assert_eq!(
+            manager.host_placement(7),
+            Some(HostPlacement::Unplaced {
+                show_request: Some(request),
+                awaiting_unzoom: true,
+                pending_mode: None,
+            })
+        );
+        manager.clear_hwnd(7);
+        manager.set_hwnd(7, 0x7000, false);
+        let second = manager.host_claim_alive(7).unwrap();
+        assert_ne!(first.incarnation, second.incarnation);
+        assert_eq!(manager.host_placement(7), Some(HostPlacement::default()));
+        assert_eq!(
+            manager.mark_host_placed(first, PlacementOutcome::Exact),
+            None
+        );
+        assert_eq!(manager.host_placement(7), Some(HostPlacement::default()));
+    }
+
+    #[test]
+    fn placement_requests_and_completion_do_not_change_sibling_runtime() {
+        let mut manager = DetachedWindowManager::new();
+        manager.set_live_hwnds_for_test([0x7000, 0x8000]);
+        manager.set_hwnd(7, 0x7000, false);
+        manager.set_hwnd(8, 0x8000, false);
+        let request = ShowRequest {
+            maximized: Some(true),
+            focus: true,
+        };
+        manager.request_show(8, request);
+        manager.mark_host_unplaced(8, true);
+        let sibling = manager.host_placement(8);
+        let first = manager.host_claim_alive(7).unwrap();
+        manager.mark_host_placed(first, PlacementOutcome::Exact);
+        manager.clear_hwnd(7);
+        assert_eq!(manager.host_placement(8), sibling);
+        assert_eq!(
+            manager.mark_host_placed(
+                manager.host_claim_alive(8).unwrap(),
+                PlacementOutcome::Exact
+            ),
+            Some(request)
+        );
     }
 
     #[test]

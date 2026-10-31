@@ -27,6 +27,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use ort::session::Session;
 
 use super::{AiBackend, AiError, ModelKind};
+use crate::previous_run_diagnostics::checkpoint::{ActivityLease, CheckpointPublisher};
 
 /// GUI process 全体の DirectML runtime 初期化を一度だけ所有する。
 ///
@@ -36,6 +37,7 @@ pub struct AiRuntimeInitOwner {
     state: Mutex<AiRuntimeInitState>,
     changed: Condvar,
     trt_worker_lifecycle: Arc<super::trt_worker_lifecycle::TrtWorkerLifecycleOwner>,
+    diagnostic_checkpoint: OnceLock<CheckpointPublisher>,
 }
 
 enum AiRuntimeInitState {
@@ -65,7 +67,20 @@ impl AiRuntimeInitOwner {
             state: Mutex::new(AiRuntimeInitState::Dormant),
             changed: Condvar::new(),
             trt_worker_lifecycle: crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new(),
+            diagnostic_checkpoint: OnceLock::new(),
         })
+    }
+
+    /// Installed by the admitted GUI before runtime initialization/Remote work.
+    /// This adds no initialization, native query, or wait to the caller.
+    pub(crate) fn install_diagnostic_checkpoint(&self, publisher: CheckpointPublisher) {
+        let _ = self.diagnostic_checkpoint.set(publisher);
+    }
+
+    pub(crate) fn diagnostic_activity(&self) -> Option<ActivityLease> {
+        self.diagnostic_checkpoint
+            .get()
+            .map(CheckpointPublisher::activity)
     }
 
     pub fn trt_worker_lifecycle(
@@ -158,7 +173,11 @@ impl AiRuntimeInitOwner {
         let owner = Arc::clone(self);
         let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(repaint);
         let repaint_worker = Arc::clone(&repaint);
+        let activity = self.diagnostic_activity();
         let task: Box<dyn FnOnce() + Send> = Box::new(move || {
+            // Retained through init, terminal publication, and repaint; a spawn
+            // failure drops the unexecuted closure and releases this lease.
+            let _activity = activity;
             let memory = crate::perf::memory::span("ai_runtime_init");
             let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(initialize))
                 .unwrap_or_else(|_| {
@@ -245,7 +264,13 @@ static ORT_PROVIDERS_SHARED_BYTES: &[u8] =
 
 /// ort::init_from() の結果。プロセス内 1 回限りなので OnceLock で保持。
 /// バックエンド切り替え時は再起動が必要。
-static ORT_INIT: OnceLock<Result<ActiveBackend, String>> = OnceLock::new();
+static ORT_INIT: OnceLock<Result<InitializedOrt, String>> = OnceLock::new();
+
+/// rc.15 は環境を暗黙に保持しないため、DLL 選択と同じ process lifetime で所有する。
+struct InitializedOrt {
+    backend: ActiveBackend,
+    environment: ort::environment::Environment,
+}
 
 /// 指定ディレクトリを Windows の DLL 検索パスの **先頭** に固定する。
 ///
@@ -355,8 +380,8 @@ pub struct ActiveBackend {
 /// `requested` がユーザー選択バックエンド。TensorRt が選択されたが pack 不在/破損なら
 /// DirectMl にフォールバック。CPU は DirectML 版 DLL のままセッション側で EP 登録なし
 /// にする (CPU EP は両方の ORT DLL に内蔵)。
-fn ensure_ort_initialized(requested: AiBackend) -> Result<ActiveBackend, AiError> {
-    let result = ORT_INIT.get_or_init(|| -> Result<ActiveBackend, String> {
+fn ensure_ort_initialized(requested: AiBackend) -> Result<&'static InitializedOrt, AiError> {
+    let result = ORT_INIT.get_or_init(|| -> Result<InitializedOrt, String> {
         let dir = crate::data_dir::get();
         std::fs::create_dir_all(&dir).map_err(|e| format!("data_dir create failed: {e}"))?;
         let mut trt_fallback_reason = None;
@@ -375,16 +400,22 @@ fn ensure_ort_initialized(requested: AiBackend) -> Result<ActiveBackend, AiError
 
                 match ort::init_from(&pack_dll) {
                     Ok(env_builder) => {
-                        env_builder.commit();
+                        // init_from 成功後は DLL が固定済み。環境生成の失敗は再試行しない。
+                        let environment = env_builder
+                            .build()
+                            .map_err(|e| format!("TensorRT pack の ORT environment build: {e}"))?;
                         crate::logger::log(format!(
                             "[AI] ORT initialized with TensorRT pack: {}",
                             pack_dll.display()
                         ));
-                        return Ok(ActiveBackend {
-                            requested: AiBackend::TensorRt,
-                            effective: AiBackend::TensorRt,
-                            dll_path: pack_dll,
-                            fallback_reason: None,
+                        return Ok(InitializedOrt {
+                            backend: ActiveBackend {
+                                requested: AiBackend::TensorRt,
+                                effective: AiBackend::TensorRt,
+                                dll_path: pack_dll,
+                                fallback_reason: None,
+                            },
+                            environment,
                         });
                     }
                     Err(e) => {
@@ -427,9 +458,10 @@ fn ensure_ort_initialized(requested: AiBackend) -> Result<ActiveBackend, AiError
             dll_path
         };
 
-        ort::init_from(&dll_path)
+        let environment = ort::init_from(&dll_path)
             .map_err(|e| format!("ort::init_from: {e}"))?
-            .commit();
+            .build()
+            .map_err(|e| format!("ORT environment build: {e}"))?;
 
         let fallback_reason = if requested == AiBackend::TensorRt {
             Some(trt_fallback_reason.unwrap_or_else(|| {
@@ -442,15 +474,18 @@ fn ensure_ort_initialized(requested: AiBackend) -> Result<ActiveBackend, AiError
             AiBackend::TensorRt => AiBackend::DirectMl, // フォールバック
             other => other,
         };
-        Ok(ActiveBackend {
-            requested,
-            effective,
-            dll_path,
-            fallback_reason,
+        Ok(InitializedOrt {
+            backend: ActiveBackend {
+                requested,
+                effective,
+                dll_path,
+                fallback_reason,
+            },
+            environment,
         })
     });
     match result {
-        Ok(active) => Ok(active.clone()),
+        Ok(initialized) => Ok(initialized),
         Err(e) => Err(AiError::Ort(e.clone())),
     }
 }
@@ -479,6 +514,21 @@ pub struct AiRuntime {
 }
 
 impl AiRuntime {
+    /// Empty test fixture: no ORT environment, DLL, device, or model is loaded.
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            backend: ActiveBackend {
+                requested: AiBackend::DirectMl,
+                effective: AiBackend::DirectMl,
+                dll_path: PathBuf::from("fake-onnxruntime.dll"),
+                fallback_reason: None,
+            },
+            trt_worker_lifecycle: super::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new(),
+        }
+    }
+
     /// 新しい AiRuntime を作成する (DirectML バックエンド、互換 API)。
     ///
     /// テスト・ベンチなど独立process用のショートハンド。GUI process は
@@ -523,7 +573,7 @@ impl AiRuntime {
         let active = ensure_ort_initialized(backend)?;
         Ok(AiRuntime {
             sessions: Mutex::new(HashMap::new()),
-            backend: active,
+            backend: active.backend.clone(),
             trt_worker_lifecycle,
         })
     }
@@ -602,24 +652,26 @@ impl AiRuntime {
             backend_label
         ));
 
-        let mut builder =
-            Session::builder().map_err(|e| AiError::Ort(format!("Session::builder: {e}")))?;
+        // constructor が確定した同じ環境を使う。後着の呼び出しは cached 参照取得だけ。
+        let initialized = ensure_ort_initialized(self.backend.effective)?;
+        let mut builder = Session::builder(&initialized.environment)
+            .map_err(|e| AiError::ort_status(&e, format!("Session::builder: {e}")))?;
 
         builder = builder
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-            .map_err(|e| AiError::Ort(format!("optimization_level: {e}")))?;
+            .map_err(|e| AiError::ort_status(&e, format!("optimization_level: {e}")))?;
 
         builder = builder
             .with_intra_threads(4)
-            .map_err(|e| AiError::Ort(format!("intra_threads: {e}")))?;
+            .map_err(|e| AiError::ort_status(&e, format!("intra_threads: {e}")))?;
 
         if !force_cpu {
             builder = self.register_eps(builder, kind);
         }
 
-        let session = builder
-            .commit_from_file(model_path)
-            .map_err(|e| AiError::Ort(format!("Failed to load {}: {e}", model_path.display())))?;
+        let session = builder.commit_from_file(model_path).map_err(|e| {
+            AiError::ort_status(&e, format!("Failed to load {}: {e}", model_path.display()))
+        })?;
 
         crate::logger::log(format!("[AI] Model {:?} loaded successfully", kind));
         sessions.insert(kind, session);
@@ -774,16 +826,99 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn fake_runtime() -> AiRuntime {
-        AiRuntime {
-            sessions: Mutex::new(HashMap::new()),
-            backend: ActiveBackend {
-                requested: AiBackend::DirectMl,
-                effective: AiBackend::DirectMl,
-                dll_path: PathBuf::from("fake-onnxruntime.dll"),
-                fallback_reason: None,
-            },
-            trt_worker_lifecycle: crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new(),
+        AiRuntime::empty_for_test()
+    }
+
+    fn wait_activity(publisher: &CheckpointPublisher, expected: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while publisher.active_count_for_test() != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "diagnostic activity did not reach {expected}"
+            );
+            std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn diagnostic_activity_follows_real_initialization_task_not_app_owner_lifetime() {
+        let publisher = crate::previous_run_diagnostics::test_support::publisher();
+        let owner = AiRuntimeInitOwner::new();
+        owner.install_diagnostic_checkpoint(publisher.clone());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        assert!(owner.start_with(
+            "ai-init-diagnostic-lifetime-test",
+            move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(fake_runtime())
+            },
+            || {},
+        ));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .unwrap();
+        assert_eq!(publisher.active_count_for_test(), 1);
+        drop(owner);
+        assert_eq!(publisher.active_count_for_test(), 1);
+        release_tx.send(()).unwrap();
+        wait_activity(&publisher, 0);
+    }
+
+    #[test]
+    fn remote_diagnostic_activity_spans_runtime_wait_and_returned_resources() {
+        let publisher = crate::previous_run_diagnostics::test_support::publisher();
+        let owner = AiRuntimeInitOwner::new();
+        owner.install_diagnostic_checkpoint(publisher.clone());
+        let bridge = crate::remote_ipc::session::RemoteAiExecutionBridge::new(
+            owner.clone(),
+            Arc::new(crate::ai::model_manager::ModelManager::new()),
+            0,
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = cancel.clone();
+        let waiting_bridge = bridge.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiting = std::thread::spawn(move || {
+            let resources = waiting_bridge.resources_for_remote(&cancel_worker);
+            done_tx.send(resources.is_none()).unwrap();
+        });
+        wait_activity(&publisher, 1);
+        cancel.store(true, Ordering::Release);
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap()
+        );
+        waiting.join().unwrap();
+        assert_eq!(publisher.active_count_for_test(), 0);
+
+        assert!(owner.start_with(
+            "ai-init-remote-diagnostic-test",
+            || Ok(fake_runtime()),
+            || {}
+        ));
+        assert!(matches!(
+            owner.wait_terminal_while(|| true),
+            AiRuntimeInitWait::Ready(_)
+        ));
+        wait_activity(&publisher, 0);
+        let operation = bridge.diagnostic_activity();
+        assert_eq!(publisher.active_count_for_test(), 1);
+        let resources = bridge
+            .resources_for_remote(&AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(publisher.active_count_for_test(), 2);
+        let runtime = resources.runtime.clone();
+        let manager = resources.manager.clone();
+        assert_eq!(publisher.active_count_for_test(), 2);
+        drop(resources);
+        assert_eq!(publisher.active_count_for_test(), 1);
+        drop((runtime, manager));
+        assert_eq!(publisher.active_count_for_test(), 1);
+        drop(operation);
+        assert_eq!(publisher.active_count_for_test(), 0);
     }
 
     #[test]
@@ -950,10 +1085,8 @@ mod tests {
         if let Some(case) = std::env::var_os(CHILD_ENV) {
             match case.to_string_lossy().as_ref() {
                 "missing" => {
-                    let missing = std::env::temp_dir().join(format!(
-                        "miv-missing-onnxruntime-{}.dll",
-                        std::process::id()
-                    ));
+                    let temp = tempfile::tempdir().unwrap();
+                    let missing = temp.path().join("missing-onnxruntime.dll");
                     let error = match ort::init_from(&missing) {
                         Ok(_) => panic!("missing DLL must fail"),
                         Err(error) => error,
@@ -978,20 +1111,65 @@ mod tests {
             return;
         }
 
-        let exe = std::env::current_exe().expect("test executable");
         let cases: &[&str] = if cfg!(windows) {
             &["missing", "missing-api"]
         } else {
             &["missing"]
         };
+        run_isolated_ort_cases(
+            "ai::runtime::tests::dynamic_load_failures_return_without_reentering_once_lock",
+            CHILD_ENV,
+            cases,
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vendor_ort_loads_api24_environment_session_and_f32_tensor() {
+        const CHILD_ENV: &str = "MIV_ORT_VENDOR_LOAD_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // 製品の data_dir / ORT_INIT を使わず、取得済み vendor を直接検査する。
+            assert_eq!(ort::MINOR_VERSION, 24);
+            let dll = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/ort/onnxruntime.dll");
+            let environment = ort::init_from(dll)
+                .expect("vendor DLL must load with api-24")
+                .with_telemetry(false)
+                .build()
+                .expect("vendor environment must build");
+            // Build info は版番号を含むとは限らない（公式DLLも git-branch=HEAD）。
+            // DLL の版・同一性は更新時の nupkg / SHA-256 照合で確認する。
+            let build_info = ort::info();
+            assert!(!build_info.is_empty());
+            println!("{build_info}");
+            let builder = Session::builder(&environment).expect("API 24 session builder");
+            drop(environment); // builder は環境の強参照を保持する。
+            let tensor = ort::value::Tensor::from_array(
+                ndarray::Array4::from_shape_vec((1, 1, 1, 2), vec![0.25_f32, 0.75]).unwrap(),
+            )
+            .expect("owned ndarray f32 tensor");
+            let (shape, values) = tensor.try_extract_tensor::<f32>().unwrap();
+            assert_eq!(shape.as_ref(), &[1, 1, 1, 2]);
+            assert_eq!(values, &[0.25, 0.75]);
+            assert!(tensor.try_extract_tensor::<i64>().is_err());
+            drop(tensor);
+            drop(builder);
+            return;
+        }
+        run_isolated_ort_cases(
+            "ai::runtime::tests::vendor_ort_loads_api24_environment_session_and_f32_tensor",
+            CHILD_ENV,
+            &["vendor"],
+        );
+    }
+
+    fn run_isolated_ort_cases(test_name: &str, child_env: &str, cases: &[&str]) {
+        let exe = std::env::current_exe().expect("test executable");
         for case in cases {
             let mut child = std::process::Command::new(&exe)
                 .arg("--exact")
-                .arg(
-                    "ai::runtime::tests::dynamic_load_failures_return_without_reentering_once_lock",
-                )
+                .arg(test_name)
                 .arg("--nocapture")
-                .env(CHILD_ENV, case)
+                .env(child_env, case)
                 .spawn()
                 .expect("spawn isolated load failure test");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

@@ -474,11 +474,11 @@ impl App {
         }) {
             super::file_type_resume::PositionResolution::Restored(index) => Some(index),
             super::file_type_resume::PositionResolution::HiddenIdentity => {
-                self.show_feedback_toast("このページは本の構成で非表示になっています".into());
+                self.show_feedback_warning("このページは本の構成で非表示になっています".into());
                 None
             }
             _ => {
-                self.show_feedback_toast("このページは見つかりません".into());
+                self.show_feedback_warning("このページは見つかりません".into());
                 None
             }
         }
@@ -740,7 +740,7 @@ impl App {
         };
         for error in service.drain_errors() {
             crate::logger::log(format!("book_composition: {error}"));
-            self.show_feedback_toast(format!(
+            self.show_feedback_warning(format!(
                 "本の構成の保存データを処理できませんでした: {error}"
             ));
             ctx.request_repaint();
@@ -808,7 +808,7 @@ impl App {
                     "book_composition: unsupported archive level {}: {reason}",
                     logical_root.display()
                 ));
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     crate::book_composition::UNSUPPORTED_COMPOSITION_NOTICE.into(),
                 );
                 self.book_composition = ViewerBookComposition::Accepted {
@@ -969,7 +969,7 @@ impl App {
                                 crate::logger::log(format!(
                                     "book_composition: read failed: {error}"
                                 ));
-                                self.show_feedback_toast(format!(
+                                self.show_feedback_warning(format!(
                                     "本の構成を読み込めませんでした: {error}"
                                 ));
                             }
@@ -987,7 +987,7 @@ impl App {
             Err(mpsc::TryRecvError::Disconnected) => {
                 let error = "構成読込workerが終了しました".to_owned();
                 crate::logger::log(format!("book_composition: {error}"));
-                self.show_feedback_toast(error.clone());
+                self.show_feedback_error(error.clone());
                 self.book_composition = ViewerBookComposition::Blocked {
                     scope,
                     token,
@@ -1023,7 +1023,7 @@ impl App {
             "book_composition: projection failed {}: {error}",
             scope.storage_key()
         ));
-        self.show_feedback_toast(format!("本の構成を準備できませんでした: {error}"));
+        self.show_feedback_warning(format!("本の構成を準備できませんでした: {error}"));
         self.book_composition = ViewerBookComposition::Blocked {
             scope,
             token,
@@ -1178,7 +1178,7 @@ impl App {
                     "book_composition: unsupported source {}: {reason}",
                     scope.storage_key()
                 ));
-                self.show_feedback_toast(
+                self.show_feedback_warning(
                     crate::book_composition::UNSUPPORTED_COMPOSITION_NOTICE.into(),
                 );
                 // The existing source rows, selection and cache remain untouched.

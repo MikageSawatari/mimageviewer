@@ -97,7 +97,7 @@ pub(crate) struct RemoteSessionUiState {
     remote_service_control: Option<super::RemoteServiceControl>,
     last_acquisition_sequence: u64,
     last_control_return_sequence: u64,
-    pending_fullscreen_restore: Option<PendingFullscreenRestore>,
+    pending_local_display: Option<PendingLocalDisplay>,
     paused_animation_restore_key: Option<String>,
     pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
     pending_reading_writes: Vec<PendingRemoteReadingWrite>,
@@ -136,7 +136,7 @@ impl Drop for RemoteSessionUiState {
             pending_ui: handle.close_ui_request_admission_and_take_pending(),
             video_stream: self.video_stream.take(),
             pending_bookmark_writes: std::mem::take(&mut self.pending_bookmark_writes),
-            pending_fullscreen_restore: self.pending_fullscreen_restore.take(),
+            pending_local_display: self.pending_local_display.take(),
             pending_reading_writes: std::mem::take(&mut self.pending_reading_writes),
             pending_resume_reads: std::mem::take(&mut self.pending_resume_reads),
             handle,
@@ -741,11 +741,21 @@ enum RemoteBookmarkRequestAction {
     Remove { id: i64 },
 }
 
-struct PendingFullscreenRestore {
-    item_key: String,
+/// The existing Remote presentation slot, owned by the return that requested it.
+/// It never restores a closed viewer and is not part of the Remote drain barrier.
+struct PendingLocalDisplay {
+    acquisition_sequence: u64,
+    control_return_sequence: u64,
     view: ReloadedView,
-    smart_request_id: Option<u64>,
-    wait_frames: u8,
+}
+
+/// Values already captured by one old-position poll, not retained App state.
+struct RemoteSessionPoll {
+    handle: Option<SessionHandle>,
+    snapshot: Option<super::session::SessionSnapshot>,
+    remote_phase: super::session::RemoteControlPhase,
+    acquisition_changed: bool,
+    blocks_local_control: bool,
 }
 
 /// Final-exit bundle for every App-owned resource that can keep a Remote operation alive.
@@ -758,7 +768,7 @@ struct RemoteAppDrainLease {
     pending_ui: Vec<ClaimedRemoteUiRequest>,
     video_stream: Option<AppRemoteVideoStreamState>,
     pending_bookmark_writes: std::collections::HashMap<u64, PendingRemoteBookmarkWrite>,
-    pending_fullscreen_restore: Option<PendingFullscreenRestore>,
+    pending_local_display: Option<PendingLocalDisplay>,
     pending_reading_writes: Vec<PendingRemoteReadingWrite>,
     pending_resume_reads: Vec<PendingRemoteResumeRead>,
 }
@@ -845,7 +855,7 @@ impl Drop for RemoteAppDrainLease {
                 }
             }
         }
-        self.pending_fullscreen_restore = None;
+        self.pending_local_display = None;
         let _ = self.handle.complete_app_drain(self.generation);
     }
 }
@@ -971,7 +981,7 @@ impl crate::app::App {
             pending_bookmark_writes: std::mem::take(
                 &mut self.remote_session_ui.pending_bookmark_writes,
             ),
-            pending_fullscreen_restore: self.remote_session_ui.pending_fullscreen_restore.take(),
+            pending_local_display: self.remote_session_ui.pending_local_display.take(),
             pending_reading_writes: std::mem::take(
                 &mut self.remote_session_ui.pending_reading_writes,
             ),
@@ -1065,7 +1075,26 @@ impl crate::app::App {
             })
     }
 
+    /// Old 0.33.3 coordinator. Keep both display checkpoints at the former
+    /// direct reload positions; stage 3 connects service and display separately.
     pub(crate) fn poll_remote_session(&mut self, ctx: &egui::Context) {
+        let poll = self.service_remote_session_begin(ctx);
+        self.continue_remote_local_display();
+        self.service_remote_session_requests(ctx, &poll);
+        self.continue_remote_local_display();
+        self.service_remote_session_finish(ctx, &poll);
+    }
+
+    /// Remote progress without consuming the PC display continuation.
+    /// App logic owns shared receipts, cancellation and approved retirement;
+    /// the existing UI checkpoint alone consumes display continuation.
+    pub(crate) fn service_remote_session(&mut self, ctx: &egui::Context) {
+        let poll = self.service_remote_session_begin(ctx);
+        self.service_remote_session_requests(ctx, &poll);
+        self.service_remote_session_finish(ctx, &poll);
+    }
+
+    fn service_remote_session_begin(&mut self, ctx: &egui::Context) -> RemoteSessionPoll {
         let handle = self.remote_session_ui.handle.clone();
         if let Some(handle) = handle.as_ref() {
             handle.install_repaint_context(ctx);
@@ -1099,6 +1128,7 @@ impl crate::app::App {
         // existing acquire/release path pauses or reloads media; that path remains the one source
         // of truth for playback state transitions.
         if acquisition_changed || control_returned {
+            self.remote_session_ui.pending_local_display = None;
             self.cancel_remote_video_stream_state(
                 VideoStreamErrorCode::SessionMismatch,
                 "リモートセッションの操作権が移動しました",
@@ -1122,9 +1152,23 @@ impl crate::app::App {
                 if let Some(lease) = self.remote_session_ui.local_ai_lease.take() {
                     self.release_local_ai_remote_barrier(lease.resume_video_upscale);
                 }
-                self.reload_after_remote_session_release();
+                self.queue_local_display_after_remote_release(snapshot);
             }
         }
+        RemoteSessionPoll {
+            handle,
+            snapshot,
+            remote_phase,
+            acquisition_changed,
+            blocks_local_control,
+        }
+    }
+
+    fn service_remote_session_requests(&mut self, ctx: &egui::Context, poll: &RemoteSessionPoll) {
+        let handle = &poll.handle;
+        let snapshot = &poll.snapshot;
+        let remote_phase = poll.remote_phase;
+        let acquisition_changed = poll.acquisition_changed;
         if let Some(snapshot) = snapshot.as_ref()
             && acquisition_changed
         {
@@ -1161,31 +1205,25 @@ impl crate::app::App {
             self.close_local_composition_editor(
                 crate::app::CompositionEditorCloseReason::RemoteAcquire,
             );
-            self.remote_session_ui.pending_fullscreen_restore = None;
+            self.remote_session_ui.pending_local_display = None;
             self.remote_session_ui.paused_animation_restore_key = None;
             self.invalidate_local_viewer_open_intents_for_remote();
             #[cfg(windows)]
             let close_failure = {
-                let detached_failure = self.close_all_detached_viewers_for_mode_change(ctx).err();
-                let fullscreen_failure = if self.fullscreen_idx.is_some()
-                    || self.fs_cache.len() != 0
-                    || self.video_presentation_transition.is_transitioning()
-                    || self.video_presentation_transition.has_pending_effects()
-                {
-                    self.close_fullscreen_to_completion(ctx).err()
-                } else {
-                    None
-                };
-                detached_failure.or(fullscreen_failure)
+                self.close_all_viewer_sessions_with_cause(
+                    ctx,
+                    crate::app::ViewerCloseCause::RemoteAcquire,
+                )
+                .err()
             };
             #[cfg(not(windows))]
             let close_failure = {
-                if self.fullscreen_idx.is_some() {
+                if self.projected_viewer_session_open() {
                     self.close_fullscreen();
                 }
                 None
             };
-            let close_state = self.local_viewer_close_state(close_failure);
+            let close_state = self.local_viewer_close_state(ctx, close_failure);
             let barrier = self.local_ai_remote_barrier_snapshot();
             let elapsed = snapshot
                 .active
@@ -1261,9 +1299,6 @@ impl crate::app::App {
             self.apply_pending_remote_ui_requests(handle, ctx);
         }
         self.poll_remote_resume_reads(ctx);
-        if remote_phase == super::session::RemoteControlPhase::Local {
-            self.poll_remote_fullscreen_restore();
-        }
         if remote_phase == super::session::RemoteControlPhase::DrainingRemote
             && let (Some(handle), Some(snapshot)) = (handle.as_ref(), snapshot.as_ref())
             && handle.complete_app_drain(snapshot.generation)
@@ -1273,8 +1308,11 @@ impl crate::app::App {
             if let Some(lease) = self.remote_session_ui.local_ai_lease.take() {
                 self.release_local_ai_remote_barrier(lease.resume_video_upscale);
             }
-            self.reload_after_remote_session_release();
+            self.queue_local_display_after_remote_release(&released);
         }
+    }
+
+    fn service_remote_session_finish(&mut self, ctx: &egui::Context, poll: &RemoteSessionPoll) {
         // The App frame poll drains Clear replies. Keep the existing Remote
         // tick prompt until its claimed request consumes the completion.
         self.poll_remote_reading_writes();
@@ -1285,9 +1323,7 @@ impl crate::app::App {
             Some(AppRemoteVideoStreamState::Opening(_) | AppRemoteVideoStreamState::Starting(_))
         ) {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
-        } else if blocks_local_control
-            || self.remote_session_ui.pending_fullscreen_restore.is_some()
-        {
+        } else if poll.blocks_local_control {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
     }
@@ -2169,7 +2205,7 @@ impl crate::app::App {
             }
             Err(error) => {
                 crate::logger::log(format!("remote_ipc: shift reset failed: {error}"));
-                self.show_feedback_toast(format!("見開き調整を保存できませんでした: {error}"));
+                self.show_feedback_warning(format!("見開き調整を保存できませんでした: {error}"));
                 write_error(
                     RemoteWriteErrorCode::PersistenceFailed,
                     "見開き調整の解除を保存できませんでした",
@@ -2520,6 +2556,24 @@ impl crate::app::App {
             pending.complete(UiWriteOutcome::Session(ownership));
             return;
         }
+        // This is request acceptance, before bookmark or any other mutation is
+        // submitted. Existing asynchronous write completions bypass this entry.
+        if self.book_structural_op.is_some()
+            && !matches!(
+                pending.request(),
+                RemoteWriteRequest::GetItemState { .. }
+                    | RemoteWriteRequest::GetAdjustmentState { .. }
+                    | RemoteWriteRequest::GetViewTrimState { .. }
+                    | RemoteWriteRequest::ListBookBookmarks { .. }
+            )
+        {
+            pending.complete(UiWriteOutcome::Write(write_error(
+                RemoteWriteErrorCode::Busy,
+                "製本処理中です",
+            )));
+            ctx.request_repaint();
+            return;
+        }
         // Include the bookmark early route in the same UndoAppend-only gate.
         // Read-only requests do not create a follow-up mutation.
         if !matches!(
@@ -2604,14 +2658,12 @@ impl crate::app::App {
             } = pending.request()
         {
             let result = (|| {
-                let state =
-                    serde_json::from_value::<crate::view_trim::ViewTrimBookState>(state.clone())
-                        .map_err(|_| {
-                            RemoteWriteError::new(
-                                RemoteWriteErrorCode::BadRequest,
-                                "表示トリム設定が正しくありません",
-                            )
-                        })?;
+                let state = super::normalize_remote_view_trim_state(state).map_err(|_| {
+                    RemoteWriteError::new(
+                        RemoteWriteErrorCode::BadRequest,
+                        "表示トリム設定が正しくありません",
+                    )
+                })?;
                 let key = remote_spread_key(context_address)?;
                 if self.view_trim_db.is_none() {
                     return Err(RemoteWriteError::new(
@@ -3523,7 +3575,7 @@ impl crate::app::App {
     }
 
     fn remote_view_trim_state(
-        &self,
+        &mut self,
         context_address: &mimageviewer_ipc::RemoteAddress,
     ) -> RemoteWriteResponse {
         let key = match remote_spread_key(context_address) {
@@ -3536,35 +3588,29 @@ impl crate::app::App {
                 "view_trim.db を利用できません",
             );
         };
-        let mut state = db
-            .get_book_state(&key.exact)
-            .or_else(|| {
-                key.fallback
-                    .as_deref()
-                    .and_then(|fallback| db.get_book_state(fallback))
-            })
-            .unwrap_or_default();
-        let legacy_margin_fit = matches!(
-            self.settings.fullscreen_fit_mode,
-            crate::settings::FullscreenFitMode::MarginFit
-        ) || self.settings.margin_fit_enabled;
-        state.apply_mode = crate::view_trim::effective_view_trim_base_apply_mode(
-            state.apply_mode,
-            legacy_margin_fit,
-        );
-        state.book_settings = state.book_settings.clamped();
-        match serde_json::to_value(state) {
-            Ok(state) => RemoteWriteResponse::Success(RemoteWriteResult::view_trim_state(state)),
-            Err(error) => {
-                crate::logger::log(format!(
-                    "remote_ipc: view trim state serialization failed: {error}"
-                ));
-                write_error(
-                    RemoteWriteErrorCode::Internal,
-                    "表示トリム設定を返せませんでした",
-                )
-            }
+        let loaded = db.load_book_preference_with_fallback(&key.exact, key.fallback.as_deref());
+        let legacy_auto = loaded.allows_legacy_margin_fit_migration()
+            && (matches!(
+                self.settings.fullscreen_fit_mode,
+                crate::settings::FullscreenFitMode::MarginFit
+            ) || self.settings.margin_fit_enabled);
+        if matches!(
+            loaded,
+            crate::view_trim_db::ViewTrimBookLoad::Invalid(_)
+                | crate::view_trim_db::ViewTrimBookLoad::Error(_)
+        ) {
+            crate::logger::log(format!("remote_ipc: view trim read failed: {loaded:?}"));
+            self.show_feedback_toast(
+                "表示トリムの設定を読み込めないため、トリムなしで表示しています".into(),
+            );
         }
+        RemoteWriteResponse::Success(RemoteWriteResult::view_trim_state(
+            super::remote_view_trim_wire_state(
+                loaded.state_or_default(),
+                self.settings.auto_view_trim_default_enabled,
+                legacy_auto,
+            ),
+        ))
     }
 
     fn persist_remote_view_trim(
@@ -3590,13 +3636,8 @@ impl crate::app::App {
             );
         };
         let previous_separate = db
-            .get_book_state(&key.exact)
-            .or_else(|| {
-                key.fallback
-                    .as_deref()
-                    .and_then(|fallback| db.get_book_state(fallback))
-            })
-            .unwrap_or_default()
+            .load_book_preference_with_fallback(&key.exact, key.fallback.as_deref())
+            .state_or_default()
             .book_settings
             .spread_separate;
         if previous_separate != state.book_settings.spread_separate {
@@ -3604,7 +3645,7 @@ impl crate::app::App {
             state.book_settings.spread_separate = previous_separate;
             state.book_settings = state.book_settings.with_spread_separate(separate);
         }
-        if let Err(error) = db.set_book_state(&key.exact, state) {
+        if let Err(error) = db.set_book_state(&key.exact, key.fallback.as_deref(), state) {
             crate::logger::log(format!("remote_ipc: view trim write failed: {error}"));
             return write_error(
                 RemoteWriteErrorCode::PersistenceFailed,
@@ -3632,18 +3673,13 @@ impl crate::app::App {
                 );
             }
         }
-        match serde_json::to_value(state) {
-            Ok(state) => RemoteWriteResponse::Success(RemoteWriteResult::view_trim_state(state)),
-            Err(error) => {
-                crate::logger::log(format!(
-                    "remote_ipc: persisted view trim state serialization failed: {error}"
-                ));
-                write_error(
-                    RemoteWriteErrorCode::Internal,
-                    "保存した表示トリム設定を返せませんでした",
-                )
-            }
-        }
+        RemoteWriteResponse::Success(RemoteWriteResult::view_trim_state(
+            super::remote_view_trim_wire_state(
+                state,
+                self.settings.auto_view_trim_default_enabled,
+                false,
+            ),
+        ))
     }
 
     fn persist_remote_sort_order(&mut self, value: &str) -> RemoteWriteResponse {
@@ -3827,7 +3863,7 @@ impl crate::app::App {
                     }
                 });
         let mut disconnect = false;
-        egui::Modal::new(egui::Id::new("remote_session_modal")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("remote_session_modal")).show(ctx, |ui| {
             ui.heading(match phase {
                 super::session::RemoteControlPhase::AcquiringRemote => "リモート接続の準備中",
                 super::session::RemoteControlPhase::DrainingRemote => {
@@ -4057,7 +4093,8 @@ impl crate::app::App {
         let mut begin_tailscale_serve_setup = false;
         let mut begin_session_logout = false;
         egui::Window::new("リモート接続")
-            .id(egui::Id::new("remote_connection_dialog"))
+            .drag_area(egui::WindowDrag::Anywhere)
+            .id(egui::Id::unique("remote_connection_dialog"))
             .collapsible(false)
             .resizable(false)
             .default_width(560.0)
@@ -4236,7 +4273,7 @@ impl crate::app::App {
                                     edit.password(true)
                                         .desired_width(260.0)
                                         .hint_text("6文字以上（半角英数字・記号、空白なし）")
-                                        .id(egui::Id::new("remote_connection_pin"))
+                                        .id(egui::Id::unique("remote_connection_pin"))
                                 },
                             );
                             if *request_focus {
@@ -4428,7 +4465,7 @@ impl crate::app::App {
         if logout_confirmation_open {
             let mut confirm = false;
             let mut cancel = escape_pressed;
-            let response = egui::Modal::new(egui::Id::new("remote_logout_all_confirm")).show(
+            let response = egui::Modal::new(egui::Id::unique("remote_logout_all_confirm")).show(
                 ctx,
                 |ui| {
                     ui.set_min_width(420.0);
@@ -4531,8 +4568,10 @@ impl crate::app::App {
         }
     }
 
-    fn reload_after_remote_session_release(&mut self) {
-        self.remote_session_ui.pending_fullscreen_restore = None;
+    fn queue_local_display_after_remote_release(
+        &mut self,
+        snapshot: &super::session::SessionSnapshot,
+    ) {
         self.remote_session_ui.paused_animation_restore_key = None;
         let view = if self.items_are_reading_history_view {
             ReloadedView::ReadingHistory
@@ -4547,9 +4586,34 @@ impl crate::app::App {
         } else {
             ReloadedView::Other
         };
+        self.remote_session_ui.pending_local_display = Some(PendingLocalDisplay {
+            acquisition_sequence: snapshot.acquisition_sequence,
+            control_return_sequence: snapshot.control_return_sequence,
+            view,
+        });
+    }
+
+    /// UI consumes the one return-owned slot. A later acquire invalidates that
+    /// return even when no UI ran between return and reacquire.
+    pub(crate) fn continue_remote_local_display(&mut self) {
+        let Some(pending) = self.remote_session_ui.pending_local_display.take() else {
+            return;
+        };
+        let current = self
+            .remote_session_ui
+            .handle
+            .as_ref()
+            .map(SessionHandle::snapshot);
+        if !current.as_ref().is_some_and(|current| {
+            current.phase == super::session::RemoteControlPhase::Local
+                && current.acquisition_sequence == pending.acquisition_sequence
+                && current.control_return_sequence == pending.control_return_sequence
+        }) {
+            return;
+        }
 
         // Remote が所有中に書いた履歴と一覧を読み直す。閲覧窓は再作成しない。
-        match view {
+        match pending.view {
             ReloadedView::ReadingHistory => {
                 self.enter_reading_history();
             }
@@ -4582,58 +4646,6 @@ impl crate::app::App {
             }
         }
         crate::logger::log("remote_ipc: local control restored; current view reload requested");
-    }
-
-    fn poll_remote_fullscreen_restore(&mut self) {
-        let Some(mut pending) = self.remote_session_ui.pending_fullscreen_restore.take() else {
-            return;
-        };
-        pending.wait_frames = pending.wait_frames.saturating_add(1);
-        let ready = match pending.view {
-            ReloadedView::ReadingHistory => true,
-            ReloadedView::Rating => self.rating_view_pending.is_none(),
-            ReloadedView::Bookmarks => self.bookmark_browser_pending.is_none(),
-            ReloadedView::SmartFolder(id) => {
-                let Some(request_id) = pending.smart_request_id else {
-                    return;
-                };
-                match self.smart_folder_request_status(id, request_id) {
-                    crate::app::smart_folder::SmartFolderRequestStatus::Pending => false,
-                    crate::app::smart_folder::SmartFolderRequestStatus::Adopted => true,
-                    crate::app::smart_folder::SmartFolderRequestStatus::Retired => return,
-                }
-            }
-            // 通常フォルダの同期/非同期差を吸収し、旧 items を同フレームに拾わない。
-            ReloadedView::Other => pending.wait_frames >= 2,
-        };
-        if ready {
-            if let Some(index) = self
-                .items
-                .iter()
-                .position(|item| item.perf_key() == pending.item_key)
-            {
-                self.move_grid_cursor(Some(index), crate::app::GridCursorIntent::Automatic);
-                if matches!(
-                    self.items.get(index),
-                    Some(crate::grid_item::GridItem::Video(_))
-                ) {
-                    self.fs_video_open_autoplay_override = Some(false);
-                }
-                // Re-establish the viewer that existed before the remote session. This is an
-                // automatic restoration, not a new item chosen by the local user.
-                self.open_fullscreen(index, crate::app::HistoryTrigger::AutoAdvance);
-                crate::logger::log(
-                    "remote_ipc: fullscreen position restored after session release",
-                );
-                return;
-            }
-            // 非同期一覧の install が直後のフレームに来る場合だけ有界に待つ。
-            if pending.wait_frames < 120 {
-                self.remote_session_ui.pending_fullscreen_restore = Some(pending);
-            }
-        } else {
-            self.remote_session_ui.pending_fullscreen_restore = Some(pending);
-        }
     }
 }
 
@@ -5245,6 +5257,65 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    use eframe::egui;
+
+    #[test]
+    fn egui037_remote_connection_body_mouse_drag_moves_window() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.remote_session_ui.connection_dialog = Some(RemoteConnectionDialogState::new(true));
+        let id = egui::Id::unique("remote_connection_dialog");
+        let draw = |app: &mut crate::app::App, events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 760.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |_| app.show_remote_connection_dialog(&ctx),
+            )
+            .drop_without_applying_deltas();
+        };
+        for _ in 0..4 {
+            draw(&mut app, vec![]);
+        }
+        let before = ctx
+            .memory(|memory| memory.area_rect(id))
+            .expect("production Window");
+        // Label/body padding, below the title bar and away from buttons and resize edges.
+        let start = egui::pos2(before.right() - 28.0, before.top() + 60.0);
+        let delta = egui::vec2(65.0, 45.0);
+        draw(&mut app, vec![egui::Event::PointerMoved(start)]);
+        draw(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        draw(&mut app, vec![egui::Event::PointerMoved(start + delta)]);
+        draw(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: start + delta,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        draw(&mut app, vec![]);
+        let after = ctx.memory(|memory| memory.area_rect(id)).unwrap();
+        assert!(
+            (after.min - before.min - delta).length() < 2.0,
+            "body mouse drag must move the actual movable Window: before={before:?}, after={after:?}"
+        );
+    }
+
     use super::*;
 
     include!("spread_shift_ui_tests.rs");
@@ -6128,8 +6199,11 @@ mod tests {
                     RemoteWriteRequest::SetViewTrim {
                         address: address.clone(),
                         context_address: address,
-                        state: serde_json::to_value(crate::view_trim::ViewTrimBookState::default())
-                            .unwrap(),
+                        state: crate::remote_ipc::remote_view_trim_wire_state(
+                            crate::view_trim::ViewTrimBookState::default(),
+                            false,
+                            false,
+                        ),
                     }
                 } else {
                     RemoteWriteRequest::SetViewMode {
@@ -6478,7 +6552,8 @@ mod tests {
     }
 
     #[test]
-    fn app_drain_lease_drop_terminals_every_representative_resource_before_one_ack() {
+    fn egui037_continuation_app_drain_lease_drop_terminals_every_representative_resource_before_one_ack()
+     {
         let (handle, owner, generation) = active_session();
 
         let (pending_read, read_rx) = super::super::session::ClaimedBookResumeRead::for_test(
@@ -6535,11 +6610,10 @@ mod tests {
             pending_bookmark_writes,
             pending_reading_writes: Default::default(),
             pending_resume_reads: Default::default(),
-            pending_fullscreen_restore: Some(PendingFullscreenRestore {
-                item_key: "resume".to_owned(),
+            pending_local_display: Some(PendingLocalDisplay {
+                acquisition_sequence: 1,
+                control_return_sequence: 1,
                 view: ReloadedView::Other,
-                smart_request_id: None,
-                wait_frames: 1,
             }),
         });
 
@@ -7782,3 +7856,7 @@ fn format_local_unix_ms(unix_ms: u64) -> String {
 fn format_local_unix_ms(unix_ms: u64) -> String {
     format!("unix-ms {unix_ms}")
 }
+
+#[cfg(test)]
+#[path = "ui/continuation_tests.rs"]
+mod continuation_tests;

@@ -142,14 +142,25 @@ fn main() {
             let mut buf = Vec::with_capacity(e.size() as usize);
             e.read_to_end(&mut buf).unwrap();
             let t = Instant::now();
-            let img = image::load_from_memory(&buf).unwrap();
+            let source = mimageviewer::image_decode::Source::Bytes {
+                bytes: &buf,
+                hint: name,
+            };
+            let img = mimageviewer::image_decode::decode(
+                source,
+                mimageviewer::avif_decoder::Workload::Background,
+                false,
+                None,
+            )
+            .unwrap()
+            .image;
             dec.push(ms(t.elapsed()));
             if dec.len() == 1 {
                 println!("\n[4] 画像デコード  ({}x{})", img.width(), img.height());
             }
         }
     }
-    stat("image::load_from_memory", &dec);
+    stat("shared image decode", &dec);
 
     // --- 5. 並列競合: cold cache から本番経路を N 本同時に走らせる ---
     println!(
@@ -182,7 +193,17 @@ fn main() {
                     let t = Instant::now();
                     let buf = mimageviewer::zip_loader::read_entry_bytes(&p, &name).unwrap();
                     let t_read = t.elapsed();
-                    let _ = image::load_from_memory(&buf).unwrap();
+                    let source = mimageviewer::image_decode::Source::Bytes {
+                        bytes: &buf,
+                        hint: &name,
+                    };
+                    let _ = mimageviewer::image_decode::decode(
+                        source,
+                        mimageviewer::avif_decoder::Workload::Background,
+                        false,
+                        None,
+                    )
+                    .unwrap();
                     (ms(t_read), ms(t.elapsed() - t_read), ms(t.elapsed()))
                 })
             })

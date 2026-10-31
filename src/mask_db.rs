@@ -3228,11 +3228,8 @@ mod tests {
     fn set_raw_preserves_legacy_string_then_read_as_shape() {
         // サイドカー復元経路: 旧 LineObject の素 JSON を set_raw でそのまま DB に貼る。
         // get_full は LineObject を返すが、新しい shapes_from_json でも読めることを確認。
-        let tmp = std::env::temp_dir().join(format!(
-            "mimageviewer_mask_db_set_raw_legacy_{}.db",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&tmp);
+        let temp = tempfile::tempdir().unwrap();
+        let tmp = temp.path().join("test.db");
         let db = MaskDb::open_at(&tmp).expect("open db");
         let w = 100;
         let h = 100;
@@ -3251,6 +3248,5 @@ mod tests {
         let got_shapes = shapes_from_json(legacy_json);
         assert_eq!(got_shapes.len(), 1);
         assert!(matches!(got_shapes[0], Shape::Line { .. }));
-        let _ = std::fs::remove_file(&tmp);
     }
 }

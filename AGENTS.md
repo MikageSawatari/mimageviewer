@@ -245,7 +245,8 @@ always-active guidance.
   Run the unfiltered main-library suite through `scripts/test-lib-full.ps1`
   (nextest), not direct unfiltered `cargo test -p mimageviewer --lib`.
   Reviewers reuse a successful ledger entry for the same source and conditions;
-  do not rerun it. The final `scripts/test-full.ps1` cargo-test gate is unchanged.
+  do not rerun it. The final `scripts/test-full.ps1` gate also uses nextest
+  (workspace and vendor graphs) and runs doctests separately with `cargo test --doc`.
 - During ordinary edit/test iteration, do not default to
   `cargo test --workspace`. Prefer `cargo check -p mimageviewer --bin
   mimageviewer-core`, `cargo test -p mimageviewer --lib <filter>`, or a

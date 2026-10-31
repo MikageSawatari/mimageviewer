@@ -92,7 +92,7 @@ mod input_policy_tests {
         let mut first = "original".to_owned();
         let mut second = String::new();
         let mut frame = |events: Vec<egui::Event>, request_focus: bool| {
-            let _ = context.run(
+            let _ = crate::project::headless_paint_output(context.run_ui(
                 egui::RawInput {
                     events,
                     ..Default::default()
@@ -106,7 +106,7 @@ mod input_policy_tests {
                         }
                     });
                 },
-            );
+            ));
             assert_eq!(context.memory(|memory| memory.focused()), Some(first_id));
         };
         frame(vec![], true);
@@ -125,7 +125,10 @@ mod input_policy_tests {
         frame(
             vec![
                 egui::Event::Ime(egui::ImeEvent::Enabled),
-                egui::Event::Ime(egui::ImeEvent::Preedit("unconfirmed".into())),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "unconfirmed".into(),
+                    active_range_chars: None,
+                }),
             ],
             false,
         );
@@ -159,4 +162,15 @@ pub fn synthetic_background(width: u32, height: u32) -> ImageAsset {
         }
     }
     ImageAsset::new(width, height, rgba).expect("fixed synthetic image dimensions")
+}
+
+/// Keep paint/platform observations from tests that have no renderer.
+#[cfg(test)]
+pub(crate) fn headless_paint_output(mut output: egui::FullOutput) -> egui::FullOutput {
+    egui::FullOutput {
+        textures_delta: std::mem::take(&mut output.textures_delta),
+        ..Default::default()
+    }
+    .drop_without_applying_deltas();
+    output
 }

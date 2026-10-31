@@ -25,6 +25,11 @@ use crate::collection_store::{
     CollectionPreparedSnapshot, CollectionStoreError, prepare_collection_snapshot,
 };
 
+#[cfg(test)]
+thread_local! {
+    static GRID_CONTAINER_OPEN_ACCEPT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Offscreen Collection history preparation. The currently mounted surface and rows are owned
 /// by the caller until `Ready` has been validated and explicitly adopted.
 pub(crate) struct CollectionHistoryPrepare {
@@ -135,6 +140,7 @@ pub(crate) fn resolve_collection_history_child(
                 entry_id: entry.entry_id,
                 source_key: entry.source_key.clone(),
             }),
+            return_to: None,
         },
         root_source_path: entry.source_path.clone(),
         visible_path: saved.visible_path.clone(),
@@ -711,11 +717,11 @@ impl App {
     ) {
         let origin_context = origin.stamp.context_id;
         if self.collection_grid_context_id() == origin_context {
-            self.show_feedback_toast(message);
+            self.show_feedback_warning(message);
             return;
         }
         if self
-            .with_viewer_context(origin_context, |app| app.show_feedback_toast(message))
+            .with_viewer_context(origin_context, |app| app.show_feedback_warning(message))
             .is_err()
         {
             crate::logger::log(format!(
@@ -1173,6 +1179,11 @@ impl App {
             identity: session.identity,
             revision_at_open: session.accepted_revision.max(session.wanted_revision),
             viewport_anchor,
+            return_to: self
+                .top_level_grid_view
+                .return_origin()
+                .cloned()
+                .map(Box::new),
         }))
     }
 
@@ -1200,6 +1211,14 @@ impl App {
     }
 
     pub(crate) fn collection_grid_parent_nav(&self) -> Option<crate::ui_main::AddressBarNav> {
+        self.collection_grid_parent_navigation().map(|(nav, _)| nav)
+    }
+
+    /// Resolve the destination and child selection together for every parent/close entry point.
+    /// Descendants keep the mounted Collection owner; only its registered source returns to root.
+    pub(crate) fn collection_grid_parent_navigation(
+        &self,
+    ) -> Option<(crate::ui_main::AddressBarNav, Option<String>)> {
         let session = self.top_level_grid_view.collection_session()?;
         if matches!(session.load, CollectionGridLoadState::Deleted { .. }) {
             return None;
@@ -1207,20 +1226,44 @@ impl App {
         let CollectionGridPosition::PhysicalSource {
             entry_id,
             source_key,
-            ..
+            path,
         } = &session.position
         else {
             return None;
         };
-        Some(crate::ui_main::AddressBarNav::Collection(
-            CollectionGridRestore {
+        if let Some(current) = self.effective_folder()
+            && crate::path_key::physical_path_is_strict_descendant(&current, path)
+        {
+            let parent = current.parent()?.to_path_buf();
+            let owner =
+                self.collection_grid_physical_load_owner(self.selected.unwrap_or(0), &parent)?;
+            return Some((
+                crate::ui_main::AddressBarNav::CollectionSource {
+                    path: parent,
+                    owner,
+                    restore_intent: super::StartupListIntent::ExplicitList,
+                },
+                current
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned),
+            ));
+        }
+        Some((
+            crate::ui_main::AddressBarNav::Collection(CollectionGridRestore {
                 identity: session.identity,
                 revision_at_open: session.accepted_revision.max(session.wanted_revision),
                 viewport_anchor: Some(CollectionGridViewportAnchor {
                     entry_id: *entry_id,
                     source_key: source_key.clone(),
                 }),
-            },
+                return_to: self
+                    .top_level_grid_view
+                    .return_origin()
+                    .cloned()
+                    .map(Box::new),
+            }),
+            None,
         ))
     }
 
@@ -1255,17 +1298,8 @@ impl App {
         index: usize,
         path: &std::path::Path,
     ) -> Option<CollectionGridSourceOpenOwner> {
-        let stamp = self.collection_grid_stamp()?;
-        let session = self.top_level_grid_view.collection_session()?;
-        if matches!(session.load, CollectionGridLoadState::Deleted { .. }) {
-            return None;
-        }
-        let anchor = self.collection_grid_source_anchor(index, path)?;
         Some(CollectionGridSourceOpenOwner {
-            stamp,
-            accepted_revision: session.accepted_revision,
-            wanted_revision: session.wanted_revision,
-            anchor,
+            physical: self.collection_grid_physical_load_owner(index, path)?,
             navigation_prepared: None,
             navigation_origin: None,
             navigation_request: None,
@@ -1352,12 +1386,56 @@ impl App {
             })
     }
 
+    /// Enter and pointer activation share the main-grid container admission effects.
+    /// Callers retain their input guards, stack/detached-book routing and pointer-only drill-in.
+    /// ZIP/PDF effects remain owned by GridVirtual and commit at visible adoption.
+    pub(crate) fn accept_grid_container_open(
+        &mut self,
+        ctx: &egui::Context,
+        index: usize,
+    ) -> Option<crate::ui_main::AddressBarNav> {
+        let (path, folder) = match self.items.get(index)? {
+            GridItem::Folder(path) => (path.clone(), true),
+            GridItem::ZipFile(path) | GridItem::PdfFile(path) => (path.clone(), false),
+            _ => return None,
+        };
+        #[cfg(test)]
+        GRID_CONTAINER_OPEN_ACCEPT_COUNT.with(|count| count.set(count.get() + 1));
+        let auto_fullscreen = self.should_auto_fullscreen_grid_container(index);
+        #[cfg(windows)]
+        if auto_fullscreen && !self.park_active_detached_context_for_new_grid_open(ctx, index) {
+            return None;
+        }
+        if self.begin_smart_grid_container_navigation(
+            index,
+            path.clone(),
+            auto_fullscreen,
+            super::StartupListIntent::container_open(auto_fullscreen),
+        ) {
+            return None;
+        }
+        if folder {
+            self.note_reading_history_open(index);
+            self.maybe_suppress_rating_filter_for_opened_container(index);
+            if auto_fullscreen {
+                self.pending_auto_fs_open = true;
+            }
+        }
+        Some(self.grid_physical_navigation(index, path, auto_fullscreen))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_grid_container_open_accept_count_for_test(&self) -> usize {
+        GRID_CONTAINER_OPEN_ACCEPT_COUNT.with(|count| count.replace(0))
+    }
+
     pub(crate) fn grid_physical_navigation(
-        &self,
+        &mut self,
         index: usize,
         path: std::path::PathBuf,
         auto_fullscreen: bool,
     ) -> crate::ui_main::AddressBarNav {
+        self.capture_main_folder_list_order(index);
         let virtual_container = self.items.get(index).is_some_and(|item| match item {
             GridItem::ZipFile(item_path) | GridItem::PdfFile(item_path) => {
                 crate::folder_tree::path_eq(item_path, &path)
@@ -1376,9 +1454,7 @@ impl App {
                 path: path.clone(),
                 source,
                 effects: super::GridVirtualOpenEffects {
-                    reading_history_return_from: self
-                        .items_are_reading_history_view
-                        .then_some(path),
+                    reading_history_return_from: self.capture_reading_history_book_return(&path),
                     suppress_rating_filter: true,
                     // Grid activation only exposes rows accepted by the current facet filter.
                     suppress_facet_filter: self.facet_filter_active(),
@@ -1546,7 +1622,10 @@ impl App {
         owner: &CollectionGridSourceOpenOwner,
         path: &std::path::Path,
     ) -> bool {
-        if !self.collection_grid_stamp_is_current(owner.stamp) {
+        if owner.physical.intent != CollectionGridPhysicalLoadIntent::Playback {
+            return self.collection_grid_physical_load_owner_is_current(&owner.physical, path);
+        }
+        if !self.collection_grid_stamp_is_current(owner.physical.stamp) {
             return false;
         }
         let Some(session) = self.top_level_grid_view.collection_session() else {
@@ -1563,8 +1642,8 @@ impl App {
             if session.wanted_revision > prepared.collection_revision {
                 return false;
             }
-        } else if session.accepted_revision != owner.accepted_revision
-            || session.wanted_revision != owner.wanted_revision
+        } else if session.accepted_revision != owner.physical.accepted_revision
+            || session.wanted_revision != owner.physical.wanted_revision
         {
             return false;
         }
@@ -1595,10 +1674,10 @@ impl App {
             .or_else(|| session.prepared())
             .is_some_and(|prepared| {
                 (owner.navigation_prepared.is_some()
-                    || prepared.collection_revision == owner.accepted_revision)
+                    || prepared.collection_revision == owner.physical.accepted_revision)
                     && prepared.entries.iter().any(|entry| {
-                        entry.entry_id == owner.anchor.entry_id
-                            && entry.source_key == owner.anchor.source_key
+                        entry.entry_id == owner.physical.anchor.entry_id
+                            && entry.source_key == owner.physical.anchor.source_key
                             && crate::folder_tree::path_eq(&entry.source_path, path)
                     })
             })
@@ -1609,25 +1688,11 @@ impl App {
         owner: &CollectionGridSourceOpenOwner,
         path: std::path::PathBuf,
     ) -> bool {
+        if owner.physical.intent != CollectionGridPhysicalLoadIntent::Playback {
+            return self.commit_collection_grid_physical_load(&owner.physical, &path);
+        }
         if !self.collection_grid_source_open_owner_landed_is_current(owner, &path) {
             return false;
-        }
-        if owner.navigation_request.is_none() {
-            let root = CollectionGridRestore {
-                identity: CollectionGridIdentity {
-                    collection_id: owner.stamp.collection_id,
-                },
-                revision_at_open: owner.accepted_revision.max(owner.wanted_revision),
-                viewport_anchor: Some(owner.anchor.clone()),
-            };
-            self.record_collection_physical_nav_transition(
-                TopLevelGridRestore::Collection(root.clone()),
-                CollectionGridPhysicalRestore {
-                    root,
-                    root_source_path: path.clone(),
-                    visible_path: path.clone(),
-                },
-            );
         }
         self.install_collection_grid_source_open_owned(owner, path);
         true
@@ -1639,6 +1704,10 @@ impl App {
         owner: &CollectionGridSourceOpenOwner,
         path: std::path::PathBuf,
     ) {
+        if owner.physical.intent != CollectionGridPhysicalLoadIntent::Playback {
+            self.install_collection_grid_physical_load(&owner.physical, &path);
+            return;
+        }
         if let Some(prepared) = owner.navigation_prepared.clone() {
             let previous_edit_snapshot = self
                 .top_level_grid_view
@@ -1696,8 +1765,8 @@ impl App {
                             CollectionGridThumbnailSourceIdentity::default(),
                         ),
                         self.collection_grid_prepare_reuse_key(
-                            owner.stamp.collection_id,
-                            owner.accepted_revision,
+                            owner.physical.stamp.collection_id,
+                            owner.physical.accepted_revision,
                         ),
                         page_identity_index,
                     );
@@ -1718,7 +1787,7 @@ impl App {
                 session.installed_items_generation = None;
             }
         }
-        self.commit_collection_grid_source_open(owner.anchor.clone(), path);
+        self.commit_collection_grid_source_open(owner.physical.anchor.clone(), path);
     }
 
     pub(crate) fn collection_grid_source_open_owner_landed_is_current(
@@ -1726,10 +1795,10 @@ impl App {
         owner: &CollectionGridSourceOpenOwner,
         path: &std::path::Path,
     ) -> bool {
-        if owner.navigation_request.is_none() {
+        if owner.physical.intent != CollectionGridPhysicalLoadIntent::Playback {
             return self.collection_grid_source_open_owner_is_current(owner, path);
         }
-        if !self.collection_grid_stamp_is_current(owner.stamp)
+        if !self.collection_grid_stamp_is_current(owner.physical.stamp)
             || !self.collection_navigation_source_owner_landed_is_current(owner)
             || !self
                 .effective_folder()
@@ -1741,7 +1810,7 @@ impl App {
         let Some(session) = self.top_level_grid_view.collection_session() else {
             return false;
         };
-        session.identity.collection_id == owner.stamp.collection_id
+        session.identity.collection_id == owner.physical.stamp.collection_id
             && owner
                 .navigation_prepared
                 .as_ref()
@@ -1777,6 +1846,7 @@ impl App {
             identity: session.identity,
             revision_at_open: session.accepted_revision.max(session.wanted_revision),
             viewport_anchor: Some(anchor),
+            return_to: None,
         })
     }
 
@@ -1793,7 +1863,7 @@ impl App {
         }
         if self.show_search_bar {
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_has_focus = false;
@@ -1888,7 +1958,7 @@ impl App {
         restore: Option<CollectionGridRestore>,
         return_to: Option<TopLevelGridRestore>,
     ) {
-        self.save_leaving_rating_grid_position();
+        self.note_session_grid_positions();
         let perf_start = crate::perf::is_enabled().then(Instant::now);
         let restoring = restore.is_some();
         let retaining_binding = self.collection_root_installed_binding_matches(collection_id);
@@ -1931,6 +2001,7 @@ impl App {
                 .as_ref()
                 .and_then(|cache| cache.cached(collection_id));
             self.install_collection_grid_items(Vec::new(), Vec::new(), None, collection_seed);
+            self.grid_scroll.renew_session();
         }
         // A header choice belongs to the prior root. A collection open, including history and
         // same-root reopen, starts from its installed collection order.
@@ -2014,6 +2085,7 @@ impl App {
                 identity: CollectionGridIdentity { collection_id },
                 revision_at_open: self.collection_catalog_revision(collection_id).unwrap_or(0),
                 viewport_anchor: None,
+                return_to: origin.clone().map(Box::new),
             },
         ));
         let destination =
@@ -2267,7 +2339,7 @@ impl App {
         self.adopt_main_list_navigation(adoption, |app| {
             // The read-only admission above makes this native transfer non-rejecting.
             let _ = app.prepare_collection_main_context_change(identity.collection_id);
-            app.save_leaving_rating_grid_position();
+            app.save_departing_session_grid_positions();
             if !retaining_binding {
                 app.top_level_grid_view
                     .begin_with_origin(TopLevelGridSurface::Collection(identity), return_to);
@@ -2497,11 +2569,11 @@ impl App {
             .current_folder
             .as_ref()
             .is_none_or(|current| !crate::folder_tree::path_eq(current, load_path));
-        let restore_reading_history = aliased
-            && self
-                .reading_history_return_from
-                .as_ref()
-                .is_some_and(|from| crate::folder_tree::path_eq(from, &path));
+        let restore_reading_history = self
+            .reading_history_return_from
+            .as_ref()
+            .filter(|from| aliased && crate::folder_tree::path_eq(&from.container, &path))
+            .cloned();
         let restore_bookmark_view = aliased
             .then(|| {
                 self.bookmark_view_state
@@ -2559,7 +2631,7 @@ impl App {
         }
         self.adopt_main_list_navigation(adoption, |app| {
             let _ = app.prepare_collection_main_context_change(session.identity.collection_id);
-            app.save_leaving_rating_grid_position();
+            app.save_departing_session_grid_positions();
             app.install_collection_history_child_session(session);
             app.pending_auto_fs_open = false;
             app.cancel_folder_pane_open(super::PaneOpenRestoreExit::Adopted);
@@ -2568,7 +2640,7 @@ impl App {
             if app
                 .reading_history_return_from
                 .as_ref()
-                .is_some_and(|from| !crate::folder_tree::path_eq(from, &path))
+                .is_some_and(|from| !crate::folder_tree::path_eq(&from.container, &path))
             {
                 app.reading_history_return_from = None;
             }
@@ -2606,8 +2678,8 @@ impl App {
                 app.update_active_quick_folder_target(&path);
                 app.archive_source_override = Some(path.clone());
                 app.transition_favorite_view_for_path(Some(&path));
-                if restore_reading_history {
-                    app.reading_history_return_from = Some(path);
+                if let Some(return_to) = restore_reading_history {
+                    app.reading_history_return_from = Some(return_to);
                 }
                 if let Some(state) = restore_bookmark_view {
                     app.bookmark_view_state = Some(state);
@@ -3622,6 +3694,8 @@ impl App {
         )>,
         page_identity_index: Arc<super::file_type_resume::PreparedPageIdentityIndex>,
     ) {
+        self.save_departing_session_grid_positions();
+        self.retire_rating_navigation_owner();
         // A grid menu owns the old item generation. Do not let its saved row index operate on
         // the newly installed collection; a menu owned by another viewer context is untouched.
         if self
@@ -3682,12 +3756,12 @@ impl App {
         self.initialize_converted_archive_cache_paths();
         self.video_thumb_overrides = video_sidecars;
         self.search_filter = None;
-        self.search_query.clear();
+        self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
 
         self.move_grid_cursor(selected, crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = selected.is_some();
+        self.grid_scroll.set_reveal_requested(selected.is_some());
         if selected.is_none() {
-            self.scroll_offset_y = 0.0;
+            self.grid_scroll.set_position(0.0);
         }
         self.rebuild_visible_indices();
         self.prewarm_grid_tags();
@@ -4499,7 +4573,7 @@ mod tests {
             ..Default::default()
         });
         let nav = app.handle_keyboard(&ctx);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         nav
     }
 
@@ -4973,29 +5047,10 @@ mod tests {
         } else {
             super::super::FolderHistoryDirection::Forward
         };
-        let started = match &target {
-            super::super::FolderNavHistoryTarget::Collection(_)
-            | super::super::FolderNavHistoryTarget::CollectionPhysical(_) => app
-                .start_collection_history_transition(
-                    target.clone(),
-                    super::super::CollectionHistoryIntent::Replay {
-                        direction,
-                        target: target.clone(),
-                    },
-                    None,
-                ),
-            super::super::FolderNavHistoryTarget::Rating { stars } => {
-                app.start_rating_history_replay(direction, *stars)
-            }
-            super::super::FolderNavHistoryTarget::RatingPhysical(restore) => app
-                .start_rating_physical_restore(
-                    restore.clone(),
-                    Some((direction, target.clone())),
-                    super::super::RatingPhysicalLoadIntent::Restore,
-                ),
-            _ => panic!("unexpected virtual book history target: {target:?}"),
-        };
-        assert!(started, "history replay did not start: {target:?}");
+        assert!(
+            app.dispatch_main_folder_history_input(direction).is_none(),
+            "typed history consumes the command without a Direct fallback: {target:?}"
+        );
         poll_real_history_load(app, expected, pdf_pages);
         assert_eq!(app.folder_nav_current_target(), Some(target));
     }
@@ -5805,11 +5860,11 @@ mod tests {
         );
         app.rebuild_visible_indices();
         app.selected = Some(104);
-        app.scroll_to_selected = true;
+        app.grid_scroll.set_reveal_requested(true);
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         let draw = |app: &mut App| {
-            let _ = ctx.run(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -5818,57 +5873,63 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    assert!(app.render_grid(ctx).is_none());
+                    assert!(ctx.root_ui(|ui| app.render_grid(ui)).is_none());
                 },
-            );
+            )
+            .drop_without_applying_deltas();
         };
         draw(&mut app);
         draw(&mut app);
-        let expected = (app.scroll_offset_y / app.last_cell_h).floor()
+        let expected = (app.grid_scroll.offset() / app.last_cell_h).floor()
             * (app.last_cell_size * ThumbAspect::Portrait3x4.height_ratio()).round();
         app.fixup_scroll_for_aspect_change(ThumbAspect::Portrait3x4);
-        assert_eq!(app.scroll_offset_y, expected);
+        assert_eq!(app.grid_scroll.offset(), expected);
         app.fixup_scroll_for_aspect_change(ThumbAspect::Portrait3x4);
         assert_eq!(
-            app.scroll_offset_y, expected,
+            app.grid_scroll.offset(),
+            expected,
             "same-frame double fixup is idempotent"
         );
         app.settings.grid_cols += 1;
         app.fixup_scroll_for_aspect_change(ThumbAspect::Square);
         assert_eq!(
-            app.scroll_offset_y, expected,
+            app.grid_scroll.offset(),
+            expected,
             "different columns do not own the old rows"
         );
         app.settings.grid_cols -= 1;
         let owner = app.projected_viewer_context_id();
         if let super::super::GridAspectLayout::Thumbnail { context_id, .. } =
-            &mut app.grid_aspect_layout
+            app.grid_scroll.aspect_layout_mut_for_test()
         {
             *context_id = super::super::ViewerContextId::for_test(u64::MAX);
         }
         app.fixup_scroll_for_aspect_change(ThumbAspect::Square);
         assert_eq!(
-            app.scroll_offset_y, expected,
+            app.grid_scroll.offset(),
+            expected,
             "another context does not own this anchor"
         );
         if let super::super::GridAspectLayout::Thumbnail { context_id, .. } =
-            &mut app.grid_aspect_layout
+            app.grid_scroll.aspect_layout_mut_for_test()
         {
             *context_id = owner;
         }
         app.bump_items_generation();
         app.fixup_scroll_for_aspect_change(ThumbAspect::Square);
         assert_eq!(
-            app.scroll_offset_y, expected,
+            app.grid_scroll.offset(),
+            expected,
             "different generation has not been laid out"
         );
         app.settings.grid_view_mode = GridViewMode::Details;
         draw(&mut app);
-        let details_offset = app.scroll_offset_y;
+        let details_offset = app.grid_scroll.offset();
         app.settings.grid_view_mode = GridViewMode::Thumbnail;
         app.fixup_scroll_for_aspect_change(ThumbAspect::Portrait3x4);
         assert_eq!(
-            app.scroll_offset_y, details_offset,
+            app.grid_scroll.offset(),
+            details_offset,
             "Details is not thumbnail geometry"
         );
         app.shutdown_collection_runtime_for_exit();
@@ -5890,11 +5951,11 @@ mod tests {
         );
         app.rebuild_visible_indices();
         app.selected = Some(104);
-        app.scroll_to_selected = true;
+        app.grid_scroll.set_reveal_requested(true);
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         let draw = |app: &mut App| {
-            let _ = ctx.run(
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -5903,13 +5964,14 @@ mod tests {
                     ..Default::default()
                 },
                 |ctx| {
-                    assert!(app.render_grid(ctx).is_none());
+                    assert!(ctx.root_ui(|ui| app.render_grid(ui)).is_none());
                 },
-            );
+            )
+            .drop_without_applying_deltas();
         };
         draw(&mut app);
         draw(&mut app);
-        let offset = app.scroll_offset_y;
+        let offset = app.grid_scroll.offset();
         assert!(offset > 0.0);
         let old_generation = app.items_generation;
         app.settings.grid_cols = 10;
@@ -5983,9 +6045,10 @@ mod tests {
             app.auto_aspect.switches_done, 1,
             "warm seed must actually switch"
         );
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
         assert_eq!(
-            app.scroll_offset_y, offset,
+            app.grid_scroll.offset(),
+            offset,
             "unpainted list borrowed the prior grid's row height"
         );
         draw(&mut app);
@@ -5993,12 +6056,13 @@ mod tests {
         assert_eq!(app.selected, Some(104));
         let center = (104 / 10) as f32 * app.last_cell_h + app.last_cell_h / 2.0;
         assert!(
-            center >= app.scroll_offset_y && center <= app.scroll_offset_y + app.last_viewport_h
+            center >= app.grid_scroll.offset()
+                && center <= app.grid_scroll.offset() + app.last_viewport_h
         );
-        let settled = app.scroll_offset_y;
+        let settled = app.grid_scroll.offset();
         app.maybe_apply_auto_aspect(true);
         draw(&mut app);
-        assert_eq!(app.scroll_offset_y, settled);
+        assert_eq!(app.grid_scroll.offset(), settled);
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -6611,15 +6675,19 @@ mod tests {
             .folder_history_back_target()
             .cloned()
             .expect("back to first");
-        assert!(app.start_collection_history_transition(
-            back.clone(),
-            super::super::CollectionHistoryIntent::Replay {
-                direction: super::super::FolderHistoryDirection::Back,
-                target: back,
-            },
-            None,
-        ));
+        assert!(
+            app.dispatch_main_folder_history_input(super::super::FolderHistoryDirection::Back,)
+                .is_none()
+        );
         wait_for_grid(&mut app, first.collection_id());
+        let expected_return_to = match &back {
+            super::super::FolderNavHistoryTarget::Collection(root) => root.return_to.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            app.top_level_grid_view.return_origin(),
+            expected_return_to.as_deref(),
+        );
         assert_eq!(
             app.top_level_grid_view
                 .collection_session()
@@ -6658,20 +6726,210 @@ mod tests {
             .folder_history_back_target()
             .cloned()
             .expect("back to first again");
-        assert!(app.start_collection_history_transition(
-            back.clone(),
-            super::super::CollectionHistoryIntent::Replay {
-                direction: super::super::FolderHistoryDirection::Back,
-                target: back,
-            },
-            None,
-        ));
+        assert!(
+            app.dispatch_main_folder_history_input(super::super::FolderHistoryDirection::Back,)
+                .is_none()
+        );
         wait_for_grid(&mut app, first.collection_id());
+        let expected_return_to = match &back {
+            super::super::FolderNavHistoryTarget::Collection(root) => root.return_to.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            app.top_level_grid_view.return_origin(),
+            expected_return_to.as_deref(),
+        );
         assert!(matches!(
             app.folder_history_forward_target(),
             Some(super::super::FolderNavHistoryTarget::Path(path))
                 if crate::folder_tree::path_eq(path, &physical_b)
         ));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn section1473_collection_native_outer_retains_complete_temporary_origin() {
+        assert_collection_native_outer_complete_temporary_origin(false, false);
+    }
+
+    #[test]
+    fn section1473_collection_native_rar_transfer_retains_complete_temporary_origin() {
+        assert_collection_native_outer_complete_temporary_origin(true, false);
+    }
+
+    #[test]
+    fn section1473_collection_native_outer_from_physical_preserves_complete_origin() {
+        assert_collection_native_outer_complete_temporary_origin(false, true);
+    }
+
+    fn assert_collection_native_outer_complete_temporary_origin(
+        direct_rar: bool,
+        physical_source: bool,
+    ) {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let origin = temp.path().join("before-collection");
+        std::fs::create_dir(&origin).unwrap();
+        let sources = [
+            temp.path().join("first"),
+            temp.path()
+                .join(if direct_rar { "second.rar" } else { "second" }),
+        ];
+        for (index, source) in sources.iter().enumerate() {
+            if direct_rar && index == 1 {
+                std::fs::copy(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("testdata/archives/multiwindow-rar-nav/01-direct.rar"),
+                    source,
+                )
+                .unwrap();
+            } else {
+                std::fs::create_dir(source).unwrap();
+                image::RgbImage::from_pixel(2, 2, image::Rgb([255, 0, 0]))
+                    .save(source.join("page.png"))
+                    .unwrap();
+            }
+        }
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.tag_sidecar_backup_enabled = false;
+        app.load_folder(origin.clone());
+        poll_real_history_load(&mut app, Some(&origin), None);
+        let entrance = app.capture_top_level_origin().unwrap();
+        let collection = collection_with_sources(
+            &client,
+            &sources
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, path)| {
+                    (
+                        path,
+                        if direct_rar && index == 1 {
+                            CollectionResolvedKind::ConvertibleArchive
+                        } else {
+                            CollectionResolvedKind::Folder
+                        },
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        app.open_collection_grid_from_navigation(collection.collection_id());
+        wait_for_grid(&mut app, collection.collection_id());
+        app.selected = Some(0);
+        let root = app.current_top_level_restore_snapshot().unwrap();
+        assert_eq!(app.top_level_grid_view.return_origin(), Some(&entrance));
+
+        // The ordinary typed return installs the complete Collection payload after native
+        // preparation. Check that path before exercising the independent native outer route.
+        app.open_global_search();
+        app.replace_search_view_items(Vec::new(), Vec::new());
+        assert_eq!(app.capture_top_level_origin().unwrap().restore, root);
+        app.close_global_search();
+        wait_for_grid(&mut app, collection.collection_id());
+        assert_eq!(app.current_top_level_restore_snapshot().unwrap(), root);
+        assert_eq!(app.top_level_grid_view.return_origin(), Some(&entrance));
+
+        if physical_source {
+            let owner = app
+                .collection_grid_physical_load_owner(0, &sources[0])
+                .unwrap();
+            assert!(app.load_folder_with_scan_owned(
+                sources[0].clone(),
+                None,
+                super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+                super::super::StartupListIntent::ExplicitList,
+            ));
+            poll_real_history_load(&mut app, Some(&sources[0]), None);
+            let physical = app.current_top_level_restore_snapshot().unwrap();
+            app.open_global_search();
+            app.replace_search_view_items(Vec::new(), Vec::new());
+            app.close_global_search();
+            poll_real_history_load(&mut app, Some(&sources[0]), None);
+            assert_eq!(app.current_top_level_restore_snapshot().unwrap(), physical);
+            assert_eq!(app.top_level_grid_view.return_origin(), Some(&entrance));
+        } else {
+            app.open_global_search();
+            app.replace_search_view_items(
+                vec![GridItem::Image(sources[0].join("page.png"))],
+                vec![None],
+            );
+            app.finish_page_identity_preparation_for_test();
+            assert!(app.top_level_grid_view.collection_session().is_none());
+            let Some(TopLevelGridRestore::Collection(saved)) = app.top_level_grid_view.return_to()
+            else {
+                panic!("temporary view must own its complete Collection origin");
+            };
+            assert_eq!(saved.return_to.as_deref(), Some(&entrance));
+        }
+        app.open_fullscreen(0, super::super::HistoryTrigger::UserChosen);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        let ctx = egui::Context::default();
+        app.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
+        assert!(
+            app.top_level_grid_view.collection_navigation_pending(),
+            "the production fullscreen caller must enter the native Collection route"
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            app.settle_open_path_classification_for_test();
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_navigation(&ctx);
+            app.poll_collection_grid(&ctx);
+            app.poll_collection_history_transition(&ctx);
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.show_archive_convert_dialog(ctx)
+            })
+            .drop_without_applying_deltas();
+            if let Some(state) = &app.archive_convert {
+                assert!(
+                    !matches!(
+                        state.phase,
+                        crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Confirm { .. }
+                            | crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Error { .. }
+                    ),
+                    "direct RAR fixture unexpectedly needs confirmation or failed"
+                );
+            }
+            app.poll_zip_enumerate();
+            app.poll_sidecar_restore(&ctx);
+            if app.effective_folder().as_ref() == Some(&sources[1])
+                && !app.top_level_grid_view.collection_navigation_pending()
+                && app
+                    .top_level_grid_view
+                    .history_navigation_transition()
+                    .is_none()
+                && app.archive_convert.is_none()
+                && app.zip_enumerate_pending.is_none()
+                && !app.sidecar_restore_active()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native outer destination did not adopt"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            app.top_level_grid_view.return_origin(),
+            Some(&entrance),
+            "native session reconstruction must retain the captured Collection entrance"
+        );
+        let TopLevelGridRestore::CollectionPhysical(physical) =
+            app.current_top_level_restore_snapshot().unwrap()
+        else {
+            panic!("native outer must publish the actual Collection physical destination");
+        };
+        assert_eq!(physical.root.return_to.as_deref(), Some(&entrance));
+        assert_eq!(physical.root.revision_at_open, collection.revision());
+        assert_eq!(
+            physical.root.viewport_anchor.as_ref().unwrap().entry_id,
+            collection.entries[1].id
+        );
+        assert_eq!(physical.root_source_path, sources[1]);
+        assert_eq!(physical.visible_path, sources[1]);
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -6986,7 +7244,7 @@ mod tests {
             .expect("prepared collection");
         assert_eq!(prepared.entries[selected].source_key, anchor.source_key);
         assert!(
-            app.scroll_to_selected,
+            app.grid_scroll.reveal_requested(),
             "restored entry must be scrolled into view"
         );
         app.shutdown_collection_runtime_for_exit();
@@ -7095,7 +7353,7 @@ mod tests {
             .unwrap();
         assert_eq!(app.selected, Some(remapped));
         assert_eq!(app.checked, std::collections::HashSet::from([remapped]));
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
 
         let removed = recv(
             client
@@ -7250,8 +7508,8 @@ mod tests {
                 .position(|item| item.drag_source_path() == Some(source.as_path()))
                 .expect("collection container row");
             app.selected = Some(source_index);
-            app.scroll_offset_y = 360.0;
-            app.scroll_to_selected = false;
+            app.grid_scroll.set_position(360.0);
+            app.grid_scroll.set_reveal_requested(false);
             let anchor = app
                 .collection_grid_source_anchor(source_index, source)
                 .expect("stable collection source anchor");
@@ -7274,17 +7532,17 @@ mod tests {
             app.visible_indices = vec![0];
             app.items_generation = app.items_generation.wrapping_add(1);
             app.fullscreen_idx = Some(0);
-            app.pending_return_to_parent = false;
+            app.pending_return_to_parent.clear();
 
             app.handle_fullscreen_close_request();
-            assert!(app.pending_return_to_parent);
+            assert!(app.pending_return_to_parent.is_pending());
             assert_eq!(app.fullscreen_idx, Some(0));
             let close_consumed_before_render = source == &pdf;
             let nav = if close_consumed_before_render {
                 let ctx = egui::Context::default();
                 ctx.begin_pass(egui::RawInput::default());
                 let nav = app.handle_keyboard(&ctx);
-                let _ = ctx.end_pass();
+                ctx.end_pass().drop_without_applying_deltas();
                 nav.expect("frame-start keyboard handling must consume the close request")
             } else {
                 app.take_pending_return_to_parent_nav()
@@ -7333,7 +7591,7 @@ mod tests {
                 prepared.entries[app.selected.expect("restored selection")].entry_id,
                 anchor.entry_id
             );
-            assert!(app.scroll_to_selected);
+            assert!(app.grid_scroll.reveal_requested());
         }
         app.shutdown_collection_runtime_for_exit();
     }
@@ -7572,6 +7830,7 @@ mod tests {
             },
             revision_at_open: next.revision(),
             viewport_anchor: None,
+            return_to: None,
         };
         let mut pending = app
             .start_collection_history_prepare(restore.clone())
@@ -7630,6 +7889,7 @@ mod tests {
                 },
                 revision_at_open: target.revision(),
                 viewport_anchor: None,
+                return_to: None,
             };
             let history_target = super::super::FolderNavHistoryTarget::Collection(restore);
             app.folder_nav_back_stack
@@ -7749,6 +8009,8 @@ mod tests {
             app.fs_cache.insert(
                 0,
                 super::super::FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex,
                     pixels: Arc::new(pixels),
                     source_dims: Some([2, 1]),
@@ -7903,6 +8165,7 @@ mod tests {
             },
             revision_at_open: snapshot.revision(),
             viewport_anchor: None,
+            return_to: None,
         };
         let old_surface = app.top_level_grid_view.surface().clone();
         let old_items = app.items.clone();
@@ -7952,9 +8215,9 @@ mod tests {
         app.top_level_grid_view
             .replace_surface(TopLevelGridSurface::Rating { stars: 3 });
         app.selected = Some(0);
-        app.save_leaving_rating_grid_position();
+        app.note_session_grid_positions();
         app.selected = Some(4);
-        app.scroll_offset_y = 700.0;
+        app.grid_scroll.set_position(700.0);
         let selected_key = app.rating_path_key(4).unwrap();
         let restore = CollectionGridRestore {
             identity: CollectionGridIdentity {
@@ -7962,6 +8225,7 @@ mod tests {
             },
             revision_at_open: snapshot.revision(),
             viewport_anchor: None,
+            return_to: None,
         };
         let mut pending = app
             .start_collection_history_prepare(restore.clone())
@@ -8691,7 +8955,8 @@ mod tests {
         app.epub_convert = Some(saved);
         drop(original);
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |ctx| app.show_epub_convert_dialog(ctx));
+        ctx.run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
         assert_eq!(app.folder_nav_current_target(), root);
         assert_eq!(app.items, before_rows);
         let Some(mut transition) = app.top_level_grid_view.take_history_navigation_transition()
@@ -9050,7 +9315,7 @@ mod tests {
             .items
             .iter()
             .position(|it| matches!(it, GridItem::Image(_)));
-        app.scroll_offset_y = 125.0;
+        app.grid_scroll.set_position(125.0);
         let selected_item = app.items[app.selected.unwrap()].clone();
         let location = app.folder_nav_current_target();
         let before = app.folder_nav_history_snapshot();
@@ -9058,7 +9323,7 @@ mod tests {
         let sibling = app.build_window_context_for_test(9_902, |sibling| {
             sibling.current_folder = Some(temp.path().join("sibling"));
             sibling.selected = Some(0);
-            sibling.scroll_offset_y = 77.0;
+            sibling.grid_scroll.set_position(77.0);
             sibling.items = vec![GridItem::Image(temp.path().join("sibling.png"))];
         });
         let sibling_state = app
@@ -9069,7 +9334,7 @@ mod tests {
                     sibling.cancel_token.clone(),
                     sibling.folder_nav_current_target(),
                     sibling.selected,
-                    sibling.scroll_offset_y,
+                    sibling.grid_scroll.offset(),
                 )
             })
             .unwrap();
@@ -9097,7 +9362,7 @@ mod tests {
             before.forward_stack
         );
         assert_eq!(app.items[app.selected.unwrap()], selected_item);
-        assert_eq!(app.scroll_offset_y, 125.0);
+        assert_eq!(app.grid_scroll.offset(), 125.0);
         let Some(crate::ui_main::AddressBarNav::Collection(parent)) =
             app.resolve_return_to_parent_nav()
         else {
@@ -9111,7 +9376,7 @@ mod tests {
             assert!(!sibling.cancel_token.load(Ordering::Relaxed));
             assert_eq!(sibling.folder_nav_current_target(), sibling_state.3);
             assert_eq!(sibling.selected, sibling_state.4);
-            assert_eq!(sibling.scroll_offset_y, sibling_state.5);
+            assert_eq!(sibling.grid_scroll.offset(), sibling_state.5);
         })
         .unwrap();
         app.shutdown_collection_runtime_for_exit();
@@ -9285,6 +9550,580 @@ mod tests {
         app.shutdown_collection_runtime_for_exit();
     }
 
+    #[derive(Clone, Copy)]
+    enum CollectionOpenInput {
+        Enter,
+        Gamepad,
+        ContextList,
+        GamepadTree,
+    }
+
+    fn assert_collection_descendant_parent_round_trip(kind: &str, auto_fullscreen: bool) {
+        assert_collection_descendant_open_round_trip(
+            kind,
+            auto_fullscreen,
+            CollectionOpenInput::Enter,
+            crate::settings::ArchiveFileHandling::Ask,
+            true,
+            false,
+        );
+    }
+
+    fn assert_collection_descendant_open_round_trip(
+        kind: &str,
+        auto_fullscreen: bool,
+        input: CollectionOpenInput,
+        handling: crate::settings::ArchiveFileHandling,
+        cached: bool,
+        cancel_once: bool,
+    ) {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let shelf = temp.path().join("shelf");
+        std::fs::create_dir(&shelf).unwrap();
+        let direct_rar = kind == "direct-rar";
+        let converted = kind.starts_with("converted") || direct_rar;
+        let archive_extension = if direct_rar {
+            "rar"
+        } else {
+            kind.strip_prefix("converted-").unwrap_or("7z")
+        };
+        let child = shelf.join(if converted {
+            format!("book.{archive_extension}")
+        } else {
+            (match kind {
+                "folder" => "chapter",
+                "pdf" => "book.pdf",
+                "converted" => "book.7z",
+                "epub" => "book.epub",
+                _ => "book.zip",
+            })
+            .to_owned()
+        });
+        let mut epub_fixture = None;
+        let pdf_pages = match kind {
+            "folder" => {
+                std::fs::create_dir(&child).unwrap();
+                std::fs::write(child.join("page.png"), b"page").unwrap();
+                None
+            }
+            "pdf" => {
+                write_two_page_history_pdf(&child);
+                Some(read_real_pdf_pages_for_history(&child).into())
+            }
+            _ if converted => {
+                if matches!(archive_extension, "rar" | "cbr") {
+                    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("testdata/archives/multiwindow-rar-nav")
+                        .join(if direct_rar {
+                            "01-direct.rar"
+                        } else {
+                            "02-solid.rar"
+                        });
+                    std::fs::copy(fixture, &child).unwrap();
+                } else if !cached {
+                    let mut archive = sevenz_rust2::ArchiveWriter::create(&child).unwrap();
+                    archive
+                        .push_archive_entry(
+                            sevenz_rust2::ArchiveEntry::new_file("page.jpg"),
+                            Some(std::io::Cursor::new(b"page".to_vec())),
+                        )
+                        .unwrap();
+                    archive.finish().unwrap();
+                } else {
+                    std::fs::write(&child, b"cache source").unwrap();
+                }
+                None
+            }
+            "epub" => {
+                epub_fixture = Some(real_cached_epub_history_fixture(&child, temp.path()));
+                None
+            }
+            "zipdir" => {
+                write_nested_history_zip(&child);
+                None
+            }
+            "nested" => {
+                let inner = temp.path().join("inner.zip");
+                write_single_page_zip(&inner);
+                let mut zip = zip::ZipWriter::new(std::fs::File::create(&child).unwrap());
+                zip.start_file("root.png", zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                std::io::Write::write_all(&mut zip, b"page").unwrap();
+                zip.start_file("inner.zip", zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                std::io::Write::write_all(&mut zip, &std::fs::read(inner).unwrap()).unwrap();
+                zip.finish().unwrap();
+                None
+            }
+            _ => {
+                write_single_page_zip(&child);
+                None
+            }
+        };
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.tag_sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.settings.detached_viewer_open_images_in_window = false;
+        let collection =
+            collection_with_sources(&client, &[(shelf.clone(), CollectionResolvedKind::Folder)]);
+        app.open_collection_grid(collection.collection_id(), None);
+        wait_for_grid(&mut app, collection.collection_id());
+        app.selected = Some(0);
+        app.grid_scroll.set_reveal_requested(false);
+        let anchor = app.collection_grid_source_anchor(0, &shelf).unwrap();
+        let order: Vec<_> = app
+            .top_level_grid_view
+            .collection_session()
+            .unwrap()
+            .prepared()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| entry.entry_id)
+            .collect();
+        let owner = app.collection_grid_physical_load_owner(0, &shelf).unwrap();
+        let scan =
+            super::super::folder_scan::scan_directory_with_settings(&shelf, &app.settings).unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            shelf.clone(),
+            Some(scan),
+            super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+            crate::app::StartupListIntent::ExplicitList,
+        ));
+        poll_until(&mut app, "shelf hydration", |_| true);
+        let child_index = app
+            .items
+            .iter()
+            .position(|item| item.drag_source_path() == Some(child.as_path()))
+            .unwrap();
+        app.selected = Some(child_index);
+        if matches!(input, CollectionOpenInput::GamepadTree) {
+            let before_sequence = app.top_level_grid_view.collection_navigation_sequence();
+            app.handle_gamepad_folder_nav_for_test(&egui::Context::default(), true);
+            assert!(
+                app.folder_nav_pending.is_none(),
+                "Collection shoulder input must use collection navigation, not filesystem DFS"
+            );
+            // A one-entry Collection can finish synchronously at its boundary.
+            assert_ne!(
+                app.top_level_grid_view.collection_navigation_sequence(),
+                before_sequence
+            );
+            assert_eq!(app.effective_folder().as_deref(), Some(shelf.as_path()));
+            app.cancel_collection_navigation_intent();
+        }
+        if converted {
+            let cache = temp.path().join("archive-cache.zip");
+            if cached && !direct_rar {
+                write_single_page_zip(&cache);
+                let meta = std::fs::metadata(&child).unwrap();
+                let format =
+                    crate::archive_converter::ArchiveFormat::from_extension(archive_extension)
+                        .unwrap();
+                app.archive_cache_db
+                    .as_ref()
+                    .unwrap()
+                    .record(
+                        &child,
+                        crate::ui_helpers::mtime_secs(&meta),
+                        meta.len() as i64,
+                        format,
+                        &cache,
+                        std::fs::metadata(&cache).unwrap().len() as i64,
+                        1,
+                        false,
+                    )
+                    .unwrap();
+            }
+            app.settings.set_archive_file_handling(handling);
+            let ctx = egui::Context::default();
+            let open = |app: &mut App| {
+                let nav = match input {
+                    CollectionOpenInput::Gamepad => app.handle_gamepad_grid_accept(&ctx),
+                    CollectionOpenInput::ContextList => app.open_grid_container_with_mode(
+                        &ctx,
+                        child_index,
+                        crate::app::GridContainerOpenMode::PageList,
+                        "collection-archive-regression",
+                    ),
+                    _ => history_grid_key(app, egui::Key::Enter),
+                };
+                if let Some(nav) = nav {
+                    assert!(app.apply_fullscreen_close_nav_immediate(nav));
+                }
+            };
+            open(&mut app);
+            let mut confirmed = false;
+            let mut cancelled = false;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                app.settle_open_path_classification_for_test();
+                app.poll_collection_history_transition(&ctx);
+                ctx.run_pass(egui::RawInput::default(), |ctx| {
+                    app.show_archive_convert_dialog(ctx)
+                })
+                .drop_without_applying_deltas();
+                if app.archive_convert.as_ref().is_some_and(|state| {
+                    matches!(
+                        state.phase,
+                        crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Confirm { .. }
+                    )
+                }) {
+                    assert_eq!(app.current_folder.as_deref(), Some(shelf.as_path()));
+                    assert!(
+                        matches!(app.collection_grid_restore_snapshot(), Some(TopLevelGridRestore::Collection(ref root)) if root.viewport_anchor.as_ref() == Some(&anchor))
+                    );
+                    if cancel_once && !cancelled {
+                        assert!(
+                            app.cancel_archive_convert_for_navigation(
+                                "collection regression cancel"
+                            )
+                        );
+                        assert_eq!(app.current_folder.as_deref(), Some(shelf.as_path()));
+                        assert!(app.top_level_grid_view.collection_session().is_some());
+                        cancelled = true;
+                        // The next UI frame retires the cancelled modal request before accepting input.
+                        app.poll_collection_history_transition(&ctx);
+                        assert!(
+                            app.top_level_grid_view
+                                .history_navigation_transition()
+                                .is_none()
+                        );
+                        open(&mut app);
+                    } else {
+                        app.confirm_archive_convert_for_test();
+                        confirmed = true;
+                    }
+                }
+                if let Some(state) = &app.archive_convert {
+                    if let crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Error {
+                        message,
+                    } = &state.phase
+                    {
+                        panic!("archive handler failed: {message}");
+                    }
+                }
+                app.poll_zip_enumerate();
+                app.poll_sidecar_restore(&ctx);
+                if app.effective_folder().as_deref() == Some(child.as_path())
+                    && app.archive_convert.is_none()
+                    && !app.sidecar_restore_active()
+                    && app
+                        .top_level_grid_view
+                        .history_navigation_transition()
+                        .is_none()
+                    && app.zip_enumerate_pending.is_none()
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "archive handler did not adopt: current={:?} logical={:?}",
+                    app.current_folder,
+                    app.archive_source_override
+                );
+                std::thread::yield_now();
+            }
+            if !cached && !direct_rar && handling == crate::settings::ArchiveFileHandling::Ask {
+                assert!(confirmed);
+            }
+            assert_eq!(cancelled, cancel_once);
+            if direct_rar {
+                assert_eq!(app.current_folder.as_deref(), Some(child.as_path()));
+            } else {
+                if cached {
+                    assert_eq!(app.current_folder.as_deref(), Some(cache.as_path()));
+                }
+                assert_ne!(app.current_folder.as_deref(), Some(child.as_path()));
+                assert_eq!(
+                    app.archive_source_override.as_deref(),
+                    Some(child.as_path())
+                );
+            }
+        } else {
+            if matches!(input, CollectionOpenInput::Gamepad) {
+                let nav = app
+                    .handle_gamepad_grid_accept(&egui::Context::default())
+                    .unwrap();
+                assert!(matches!(
+                    &nav,
+                    crate::ui_main::AddressBarNav::CollectionSource { .. }
+                ));
+                assert!(app.apply_fullscreen_close_nav_immediate(nav));
+            } else {
+                let owner = app
+                    .collection_grid_physical_load_owner(child_index, &child)
+                    .unwrap();
+                let scan = (kind == "folder").then(|| {
+                    super::super::folder_scan::scan_directory_with_settings(&child, &app.settings)
+                        .unwrap()
+                });
+                assert!(app.load_folder_with_scan_owned(
+                    child.clone(),
+                    scan,
+                    super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+                    crate::app::StartupListIntent::ExplicitList
+                ));
+            }
+            poll_real_history_load(&mut app, Some(&child), pdf_pages.as_ref());
+        }
+        if matches!(kind, "nested" | "zipdir") {
+            let prefix = if kind == "nested" {
+                "inner.zip/"
+            } else {
+                "chapter/"
+            };
+            app.zip_nav_enter(prefix);
+            assert!(!app.zip_nav.as_ref().unwrap().at_root());
+            assert!(history_grid_key(&mut app, egui::Key::Backspace).is_none());
+            assert!(app.zip_nav.as_ref().unwrap().at_root());
+            assert!(
+                matches!(&app.items[app.selected.unwrap()], GridItem::ZipDir { dir_prefix, .. } if dir_prefix == prefix)
+            );
+            assert!(
+                matches!(app.collection_grid_restore_snapshot(), Some(TopLevelGridRestore::Collection(restore)) if restore.viewport_anchor.as_ref() == Some(&anchor))
+            );
+        }
+        if kind == "zip" && !auto_fullscreen {
+            let child_location = app.folder_nav_current_target();
+            let alt = egui::Modifiers {
+                alt: true,
+                ..Default::default()
+            };
+            assert!(matches!(
+                history_grid_key_with_modifiers(&mut app, egui::Key::ArrowLeft, alt),
+                Some(crate::ui_main::AddressBarNav::HistoryBack)
+            ));
+            assert!(
+                app.dispatch_main_folder_history_input(super::super::FolderHistoryDirection::Back)
+                    .is_none()
+            );
+            poll_real_history_load(&mut app, Some(&shelf), None);
+            replay_real_history(&mut app, false, Some(&child), None);
+            assert_eq!(app.folder_nav_current_target(), child_location);
+        }
+        // The toolbar's read-only target, BS and fullscreen-close resolve the same owned parent.
+        let assert_parent = |nav: &crate::ui_main::AddressBarNav| {
+            let crate::ui_main::AddressBarNav::CollectionSource { path, owner, .. } = nav else {
+                panic!("descendant must return to its physical parent with Collection ownership");
+            };
+            assert_eq!(path, &shelf);
+            assert_eq!(owner.root_source_path, shelf);
+            assert_eq!(owner.anchor, anchor);
+            assert_eq!(owner.stamp.collection_id, collection.collection_id());
+        };
+        assert_parent(&app.grid_parent_nav_target().unwrap());
+        let (close_nav, selection) = app.resolve_close_return_navigation().unwrap();
+        assert_parent(&close_nav);
+        assert_eq!(
+            selection.as_deref(),
+            child.file_name().and_then(|name| name.to_str())
+        );
+        let nav = if auto_fullscreen {
+            app.settings.auto_fullscreen_zip_pdf = true;
+            app.fullscreen_idx = Some(0);
+            app.pending_return_to_parent.clear();
+            // Esc/Enter/right click share this close request and continuation.
+            app.handle_fullscreen_close_request();
+            assert!(app.pending_return_to_parent.is_pending());
+            app.take_pending_return_to_parent_nav().unwrap()
+        } else {
+            history_grid_key(&mut app, egui::Key::Backspace).unwrap()
+        };
+        assert_parent(&nav);
+        assert!(app.apply_fullscreen_close_nav_immediate(nav));
+        poll_real_history_load(&mut app, Some(&shelf), None);
+        assert!(app.archive_source_override.is_none());
+        assert_eq!(
+            app.items[app.selected.unwrap()].drag_source_path(),
+            Some(child.as_path())
+        );
+        let Some(crate::ui_main::AddressBarNav::Collection(restore)) =
+            history_grid_key(&mut app, egui::Key::Backspace)
+        else {
+            panic!("registered source must return to Collection root");
+        };
+        assert_eq!(restore.viewport_anchor.as_ref(), Some(&anchor));
+        app.apply_collection_input_nav(restore, false);
+        poll_real_history_load(&mut app, None, None);
+        wait_for_grid(&mut app, collection.collection_id());
+        let prepared = app
+            .top_level_grid_view
+            .collection_session()
+            .unwrap()
+            .prepared()
+            .unwrap();
+        assert_eq!(
+            prepared.entries[app.selected.unwrap()].entry_id,
+            anchor.entry_id
+        );
+        assert_eq!(
+            prepared
+                .entries
+                .iter()
+                .map(|entry| entry.entry_id)
+                .collect::<Vec<_>>(),
+            order
+        );
+        assert!(
+            app.grid_scroll.reveal_requested(),
+            "root return must keep the existing ensure-visible restoration"
+        );
+        app.shutdown_collection_runtime_for_exit();
+        drop(epub_fixture);
+    }
+
+    #[test]
+    fn collection_descendant_zip_parent_round_trip_and_history() {
+        assert_collection_descendant_parent_round_trip("zip", false);
+    }
+
+    #[test]
+    fn collection_descendant_subfolder_parent_round_trip() {
+        assert_collection_descendant_parent_round_trip("folder", false);
+    }
+
+    #[test]
+    fn collection_descendant_pdf_parent_round_trip() {
+        assert_collection_descendant_parent_round_trip("pdf", false);
+    }
+
+    #[test]
+    fn collection_descendant_converted_parent_uses_logical_source() {
+        assert_collection_descendant_parent_round_trip("converted", false);
+    }
+
+    #[test]
+    fn collection_descendant_epub_parent_round_trip() {
+        assert_collection_descendant_parent_round_trip("epub", false);
+    }
+
+    #[test]
+    fn collection_descendant_auto_fullscreen_close_returns_to_shelf() {
+        assert_collection_descendant_parent_round_trip("zip", true);
+    }
+
+    #[test]
+    fn collection_descendant_nested_zip_keeps_internal_parent_and_root_return() {
+        assert_collection_descendant_parent_round_trip("nested", false);
+    }
+
+    #[test]
+    fn collection_descendant_zip_subfolder_keeps_internal_parent_and_root_return() {
+        assert_collection_descendant_parent_round_trip("zipdir", false);
+    }
+
+    #[test]
+    fn collection_descendant_archive_cache_handlers_keep_registered_root_for_all_formats() {
+        for ext in ["rar", "cbr", "7z", "cb7", "lzh"] {
+            for handling in [
+                crate::settings::ArchiveFileHandling::Ask,
+                crate::settings::ArchiveFileHandling::Convert,
+            ] {
+                assert_collection_descendant_open_round_trip(
+                    &format!("converted-{ext}"),
+                    false,
+                    CollectionOpenInput::Enter,
+                    handling,
+                    true,
+                    false,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn collection_descendant_archive_ask_confirm_and_conversion_keep_registered_root() {
+        assert_collection_descendant_open_round_trip(
+            "converted-7z",
+            false,
+            CollectionOpenInput::Enter,
+            crate::settings::ArchiveFileHandling::Ask,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn collection_descendant_archive_automatic_conversion_keeps_registered_root() {
+        assert_collection_descendant_open_round_trip(
+            "converted-cb7",
+            false,
+            CollectionOpenInput::Gamepad,
+            crate::settings::ArchiveFileHandling::Convert,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn collection_descendant_archive_confirmation_cancel_preserves_owner_for_reopen() {
+        assert_collection_descendant_open_round_trip(
+            "converted-7z",
+            false,
+            CollectionOpenInput::Enter,
+            crate::settings::ArchiveFileHandling::Ask,
+            false,
+            true,
+        );
+    }
+
+    #[test]
+    fn collection_descendant_archive_context_open_and_gamepad_open_keep_registered_root() {
+        for input in [
+            CollectionOpenInput::ContextList,
+            CollectionOpenInput::Gamepad,
+        ] {
+            assert_collection_descendant_open_round_trip(
+                "converted-7z",
+                false,
+                input,
+                crate::settings::ArchiveFileHandling::Ask,
+                true,
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn collection_descendant_direct_rar_handler_keeps_registered_root() {
+        assert_collection_descendant_open_round_trip(
+            "direct-rar",
+            false,
+            CollectionOpenInput::Enter,
+            crate::settings::ArchiveFileHandling::Ask,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn collection_descendant_gamepad_folder_open_keeps_registered_root() {
+        assert_collection_descendant_open_round_trip(
+            "folder",
+            false,
+            CollectionOpenInput::Gamepad,
+            crate::settings::ArchiveFileHandling::Ask,
+            true,
+            false,
+        );
+    }
+
+    #[test]
+    fn collection_descendant_gamepad_tree_navigation_uses_collection_owner() {
+        assert_collection_descendant_open_round_trip(
+            "folder",
+            false,
+            CollectionOpenInput::GamepadTree,
+            crate::settings::ArchiveFileHandling::Ask,
+            true,
+            false,
+        );
+    }
+
     #[test]
     fn collection_parent_resolution_is_owned_by_the_mounted_viewer_context() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
@@ -9320,13 +10159,15 @@ mod tests {
             Some(TopLevelGridRestore::Collection(_))
         ));
 
-        let crate::ui_main::AddressBarNav::Collection(descendant_restore) = app
+        let crate::ui_main::AddressBarNav::CollectionSource { path, owner, .. } = app
             .resolve_return_to_parent_nav()
-            .expect("collection descendant keeps its root parent")
+            .expect("collection descendant keeps its source owner")
         else {
-            panic!("collection descendant must not fall through to its physical parent")
+            panic!("collection descendant must return through its physical owner")
         };
-        assert_eq!(descendant_restore.viewport_anchor.as_ref(), Some(&anchor));
+        assert_eq!(path, folder);
+        assert_eq!(owner.anchor, anchor);
+        assert_eq!(app.select_after_load.as_deref(), Some("chapter"));
 
         let sibling_book = temp.path().join("sibling").join("other.pdf");
         let sibling_parent = sibling_book.parent().unwrap().to_path_buf();
@@ -9343,14 +10184,16 @@ mod tests {
         })
         .expect("mount sibling context");
 
-        let crate::ui_main::AddressBarNav::Collection(restore) = app
+        let crate::ui_main::AddressBarNav::CollectionSource { path, owner, .. } = app
             .resolve_return_to_parent_nav()
             .expect("mounted collection context owns its parent")
         else {
             panic!("mounted collection context must resolve independently of its sibling")
         };
-        assert_eq!(restore.identity.collection_id, snapshot.collection_id());
-        assert_eq!(restore.viewport_anchor.as_ref(), Some(&anchor));
+        assert_eq!(path, folder);
+        assert_eq!(owner.stamp.collection_id, snapshot.collection_id());
+        assert_eq!(owner.anchor, anchor);
+        assert_eq!(app.select_after_load.as_deref(), Some("chapter"));
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -9393,7 +10236,7 @@ mod tests {
             .collect::<Vec<_>>();
         let held_selected = app.selected;
         let held_checked = app.checked.clone();
-        let held_scroll = app.scroll_offset_y;
+        let held_scroll = app.grid_scroll.offset();
 
         let updated = recv(
             client
@@ -9425,7 +10268,7 @@ mod tests {
         );
         assert_eq!(app.selected, held_selected);
         assert_eq!(app.checked, held_checked);
-        assert_eq!(app.scroll_offset_y, held_scroll);
+        assert_eq!(app.grid_scroll.offset(), held_scroll);
         assert_eq!(app.current_folder.as_deref(), Some(physical.as_path()));
         app.shutdown_collection_runtime_for_exit();
     }
@@ -9512,7 +10355,7 @@ mod tests {
             .history
             .back_stack = sibling_history.iter().cloned().map(Into::into).collect();
         app.selected = Some(0);
-        app.scroll_offset_y = 107.0;
+        app.grid_scroll.set_position(107.0);
         let generation = app.items_generation;
         let address = app.address.clone();
         let request = collection_jump_request(&app, &source);
@@ -9520,7 +10363,7 @@ mod tests {
         assert!(app.context_folder_jump_pending());
         assert_eq!(app.items_generation, generation);
         assert_eq!(app.selected, Some(0));
-        assert_eq!(app.scroll_offset_y, 107.0);
+        assert_eq!(app.grid_scroll.offset(), 107.0);
         assert_eq!(app.address, address);
         assert!(matches!(
             app.top_level_grid_view.surface(),
@@ -9565,7 +10408,7 @@ mod tests {
                 .drag_source_path()
                 .is_some_and(|path| crate::folder_tree::path_eq(path, &source))
         }));
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
         assert!(matches!(
             app.folder_history_back_target(),
             Some(super::super::FolderNavHistoryTarget::Collection(restore))
@@ -10082,7 +10925,7 @@ mod tests {
         poll_until(&mut app, "nested child hydration did not finish", |_| true);
         assert!(matches!(
             app.collection_grid_parent_nav(),
-            Some(crate::ui_main::AddressBarNav::Collection(_))
+            Some(crate::ui_main::AddressBarNav::CollectionSource { .. })
         ));
         let reload_owner = app
             .collection_grid_physical_reload_owner(&nested)

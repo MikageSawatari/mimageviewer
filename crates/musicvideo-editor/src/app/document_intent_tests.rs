@@ -110,9 +110,9 @@ fn p4b4_lrc_ready_during_lyrics_confirmation_returns_after_intent_cancel() {
             .unwrap()
             .events
             .push(egui::ViewportEvent::Close);
-        let _ = ctx.run(input, |ctx| {
+        let _ = crate::project::headless_paint_output(ctx.run_ui(input, |ctx| {
             app.process_editor_frame(ctx);
-        });
+        }));
         assert!(app.intent_pending());
         assert!(app.editor_state.has_pending_lyrics_edit());
         tx.send(Ok((
@@ -588,9 +588,9 @@ fn p4b4_close_request_cancelclose_and_approved_close_is_terminal() {
             .unwrap()
             .events
             .push(egui::ViewportEvent::Close);
-        ctx.run(input, |ctx| {
+        crate::project::headless_paint_output(ctx.run_ui(input, |ctx| {
             app.process_editor_frame(ctx);
-        })
+        }))
     };
     app.accept_document_intent(DocumentIntent::New);
     let first = close_frame(&mut app);
@@ -606,9 +606,10 @@ fn p4b4_close_request_cancelclose_and_approved_close_is_terminal() {
             ..
         }
     ));
-    let output = ctx.run(egui::RawInput::default(), |ctx| {
-        app.apply_chrome_actions(ctx, vec![ChromeAction::DiscardIntent]);
-    });
+    let output =
+        crate::project::headless_paint_output(ctx.run_ui(egui::RawInput::default(), |ctx| {
+            app.apply_chrome_actions(ctx, vec![ChromeAction::DiscardIntent]);
+        }));
     assert!(
         output.viewport_output[&egui::ViewportId::ROOT]
             .commands

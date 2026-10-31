@@ -219,6 +219,12 @@ pub fn probe_dims(path: &std::path::Path) -> Option<[usize; 2]> {
             .developed_dims;
         return Some([dims[0] as usize, dims[1] as usize]);
     }
+    if let Some(result) = crate::image_decode::avif_dimensions(
+        crate::image_decode::Source::Path(path),
+        crate::avif_decoder::Workload::Background,
+    ) {
+        return result.ok().map(|(w, h)| [w as usize, h as usize]);
+    }
     let reader = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
@@ -234,6 +240,13 @@ pub fn probe_dims_from_bytes(bytes: &[u8], extension: &str) -> Option<[usize; 2]
             .ok()?
             .developed_dims;
         return Some([dims[0] as usize, dims[1] as usize]);
+    }
+    let hint = format!("page.{extension}");
+    if let Some(result) = crate::image_decode::avif_dimensions(
+        crate::image_decode::Source::Bytes { bytes, hint: &hint },
+        crate::avif_decoder::Workload::Background,
+    ) {
+        return result.ok().map(|(w, h)| [w as usize, h as usize]);
     }
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()

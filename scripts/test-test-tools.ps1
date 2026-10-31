@@ -1,7 +1,7 @@
 # Behavioral regression suite using real Git/nextest and a disposable tiny crate.
 # No commits, application launches, normal profile data, or tool installations.
 [CmdletBinding()]
-param()
+param([switch] $Benchmark)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'test-tools-common.ps1')
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -22,6 +22,92 @@ function Run-Script {
 }
 function Count-Runs { return @(Get-ChildItem (Join-Path $fixture 'target/test-lib-full/runs') -Directory -ErrorAction SilentlyContinue).Count }
 Assert-That ((Get-MivTextHash 'abc') -eq 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad') 'SHA-256 known vector mismatch'
+# Observe both flushed pipes before allowing the child to exit, then check capture.
+$streamProbe = Join-Path $fixture 'target/stream-probe'
+[void] [IO.Directory]::CreateDirectory($streamProbe)
+$streamRelease = Join-Path $streamProbe 'release'
+$streamChild = Join-Path $streamProbe 'child.ps1'
+$streamRunner = Join-Path $streamProbe 'runner.ps1'
+[IO.File]::WriteAllText($streamChild, @'
+param([string] $Release)
+[Console]::Out.Write("stdout before exit`n")
+[Console]::Error.Write("SLOW stderr before exit`n")
+[Console]::Out.Write('stdout partial')
+[Console]::Error.Write('stderr partial')
+while (-not [IO.File]::Exists($Release)) { Start-Sleep -Milliseconds 10 }
+[Console]::Out.WriteLine('stdout terminal')
+[Console]::Error.WriteLine('stderr terminal')
+exit 7
+'@, $utf8)
+$commonPath = (Join-Path $PSScriptRoot 'test-tools-common.ps1').Replace("'", "''")
+[IO.File]::WriteAllText($streamRunner, @"
+param([string] `$Directory, [string] `$RepoRoot)
+. '$commonPath'
+`$result = Invoke-MivTool 'powershell.exe' @('-NoProfile', '-NonInteractive', '-File', (Join-Path `$Directory 'child.ps1'), '-Release', (Join-Path `$Directory 'release')) `$RepoRoot -LogDirectory `$Directory
+[IO.File]::WriteAllText((Join-Path `$Directory 'result.json'), (`$result | ConvertTo-Json))
+"@, $utf8)
+$streamArgs = @('-NoProfile', '-NonInteractive', '-File', $streamRunner, '-Directory', $streamProbe, '-RepoRoot', $repo)
+$streamProcess = Start-Process -FilePath 'powershell.exe' -ArgumentList (($streamArgs | ForEach-Object { ConvertTo-MivNativeArgument $_ }) -join ' ') -WindowStyle Hidden -PassThru
+try {
+    $streamDeadline = [DateTime]::UtcNow.AddSeconds(20)
+    do {
+        $visible = $true
+        foreach ($name in @('stdout', 'stderr')) {
+            $path = Join-Path $streamProbe ($name + '.log')
+            if (-not [IO.File]::Exists($path)) { $visible = $false; continue }
+            $reader = New-Object IO.StreamReader([IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite))
+            try {
+                $text = $reader.ReadToEnd()
+                if (-not $text.Contains($name + ' before exit') -or -not $text.Contains($name + ' partial')) { $visible = $false }
+                if ($name -eq 'stderr' -and -not $text.Contains("SLOW stderr before exit`n")) { $visible = $false }
+            }
+            finally { $reader.Dispose() }
+        }
+        if ($visible) { break }
+        Assert-That (-not $streamProcess.HasExited) 'stream runner exited before releasing the child'
+        Assert-That ([DateTime]::UtcNow -lt $streamDeadline) 'both pipes were not flushed while the child was running'
+        Start-Sleep -Milliseconds 10
+    } while ($true)
+    Assert-That (-not $streamProcess.HasExited) 'streamed logs were only available after exit'
+} finally {
+    [IO.File]::WriteAllText($streamRelease, 'release')
+    Assert-That ($streamProcess.WaitForExit(20000)) 'stream runner did not finish after release'
+    $streamProcess.Dispose()
+}
+$streamResult = ConvertFrom-Json ([IO.File]::ReadAllText((Join-Path $streamProbe 'result.json')))
+Assert-That ($streamResult.ExitCode -eq 7) 'streaming changed the child exit code'
+Assert-That ($streamResult.StdOut -ceq "stdout before exit`nstdout partialstdout terminal`r`n") 'streaming changed captured stdout'
+Assert-That ($streamResult.StdErr -ceq "SLOW stderr before exit`nstderr partialstderr terminal`r`n") 'streaming changed captured stderr'
+foreach ($name in @('StdOut', 'StdErr')) {
+    Assert-That ([IO.File]::ReadAllText((Join-Path $streamProbe ($name.ToLowerInvariant() + '.log'))) -eq $streamResult.$name) "streamed $name differs from captured output"
+}
+Write-Host '[test-test-tools] concurrent stdout/stderr: pre-exit flush, capture and exit code PASS'
+# Compare the streaming path with the original ReadToEndAsync path and explicit
+# expected strings. Separate pipes preserve their own order, not a merged order.
+$outputCases = @(
+    @{ Name = 'unterminated'; Script = "[Console]::Out.Write('out'); [Console]::Error.Write('err')"; StdOut = 'out'; StdErr = 'err' },
+    @{ Name = 'lf'; Script = '[Console]::Out.Write("out-1`nout-2`n"); [Console]::Error.Write("err-1`nerr-2`n")'; StdOut = "out-1`nout-2`n"; StdErr = "err-1`nerr-2`n" },
+    @{ Name = 'crlf'; Script = '[Console]::Out.Write("out-1`r`nout-2`r`n"); [Console]::Error.Write("err-1`r`nerr-2`r`n")'; StdOut = "out-1`r`nout-2`r`n"; StdErr = "err-1`r`nerr-2`r`n" },
+    @{ Name = 'alternating'; Script = '[Console]::Out.Write("out-1`n"); [Console]::Error.Write("err-1`r`n"); [Console]::Out.Write("out-2`r`n"); [Console]::Error.Write("err-2`n"); [Console]::Out.Write("out-3"); [Console]::Error.Write("err-3")'; StdOut = "out-1`nout-2`r`nout-3"; StdErr = "err-1`r`nerr-2`nerr-3" },
+    @{ Name = 'multi-buffer'; Script = '$out = ("x" * 4095) + [char]0x8A66 + "`n"; $err = ("y" * 4095) + [char]0x9A13 + "`r`n"; foreach ($i in 1..20) { [Console]::Out.Write($out); [Console]::Error.Write($err) }; [Console]::Out.Write("tail"); [Console]::Error.Write("tail")'; StdOut = (((('x' * 4095) + [char]0x8A66 + "`n") * 20) + 'tail'); StdErr = (((('y' * 4095) + [char]0x9A13 + "`r`n") * 20) + 'tail') }
+)
+foreach ($case in $outputCases) {
+    $directory = Join-Path $streamProbe $case.Name
+    [void] [IO.Directory]::CreateDirectory($directory)
+    $child = Join-Path $directory 'child.ps1'
+    [IO.File]::WriteAllText($child, "[Console]::OutputEncoding = New-Object Text.UTF8Encoding(`$false)`n" + $case.Script + "`nexit 7`n", $utf8)
+    $childArgs = @('-NoProfile', '-NonInteractive', '-File', $child)
+    $original = Invoke-MivTool 'powershell.exe' $childArgs $repo
+    $streamed = Invoke-MivTool 'powershell.exe' $childArgs $repo -LogDirectory $directory
+    Assert-That ($original.ExitCode -eq 7 -and $streamed.ExitCode -eq $original.ExitCode) "$($case.Name): exit code differs"
+    foreach ($name in @('StdOut', 'StdErr')) {
+        $log = [IO.File]::ReadAllText((Join-Path $directory ($name.ToLowerInvariant() + '.log')))
+        Assert-That ($original.$name -ceq $case[$name]) "$($case.Name): original $name differs from expected output"
+        Assert-That ($streamed.$name -ceq $original.$name) "$($case.Name): streamed $name differs from ReadToEndAsync"
+        Assert-That ($log -ceq $original.$name) "$($case.Name): logged $name differs from ReadToEndAsync"
+    }
+    Write-Host "[test-test-tools] exact output $($case.Name): ReadToEndAsync, streaming and disk PASS"
+}
 $caseFeatures = @(Get-MivFeatureArguments @('extra', 'EXTRA', 'extra'))
 Assert-That (($caseFeatures -join ' ') -eq '--features EXTRA,extra') 'case-sensitive Cargo features were merged'
 # Every TOML spelling of the Cargo env table must yield its names, or refuse reuse.
@@ -102,6 +188,34 @@ Write-Fixture 'vendor/raw-samples/input.raw' 'fixture-v1'
 $rawId = Get-MivSourceId $fixture
 Write-Fixture 'vendor/raw-samples/input.raw' 'fixture-v2'
 Assert-That ((Get-MivSourceId $fixture) -ne $rawId) 'ignored real fixture was not detected'
+# A cloned reference repository under an ignored fixture dir is listed by git as one
+# directory entry; its files (not its .git) must be fingerprinted.
+$nestedRoot = Join-Path $fixture 'vendor/nested-ref'
+[void] [IO.Directory]::CreateDirectory((Join-Path $nestedRoot 'sub'))
+[void] (Invoke-MivGit $nestedRoot @('init', '-q'))
+Write-Fixture 'vendor/nested-ref/sub/data.txt' 'nested-v1'
+$nestedId = Get-MivSourceId $fixture
+Write-Fixture 'vendor/nested-ref/sub/data.txt' 'nested-v2'
+Assert-That ((Get-MivSourceId $fixture) -ne $nestedId) 'file inside a nested repository was not detected'
+$nestedId = Get-MivSourceId $fixture
+Write-Fixture 'vendor/nested-ref/.git/description' 'git metadata only'
+Assert-That ((Get-MivSourceId $fixture) -eq $nestedId) 'nested .git metadata changed the source identity'
+[void] [IO.Directory]::CreateDirectory((Join-Path $nestedRoot 'sub/__pycache__'))
+Write-Fixture 'vendor/nested-ref/sub/__pycache__/mod.pyc' 'generated'
+Assert-That ((Get-MivSourceId $fixture) -eq $nestedId) 'generated output inside a nested repository changed the source identity'
+$linkCreated = $false
+try {
+    [void] (New-Item -ItemType SymbolicLink -Path (Join-Path $nestedRoot 'sub/link.txt') -Target (Join-Path $nestedRoot 'sub/data.txt') -ErrorAction Stop)
+    $linkCreated = $true
+} catch { Write-Host "[test-test-tools] file symlink not creatable here; skipped the nested file-link check" }
+if ($linkCreated) {
+    $linkRefused = $false
+    try { [void] (Get-MivSourceId $fixture) } catch { $linkRefused = $true }
+    Assert-That $linkRefused 'a file symlink inside a nested repository was followed'
+    Remove-Item -LiteralPath (Join-Path $nestedRoot 'sub/link.txt') -Force
+}
+Assert-That ([IO.Path]::GetFullPath($nestedRoot).StartsWith($fixture + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) 'nested cleanup escaped disposable fixture'
+Remove-Item -LiteralPath $nestedRoot -Recurse -Force
 $beforeDelete = Get-MivSourceId $fixture
 Remove-Item -LiteralPath (Join-Path $fixture 'src/foo.rs')
 Assert-That ((Get-MivSourceId $fixture) -ne $beforeDelete) 'tracked deletion was not detected'
@@ -118,6 +232,97 @@ Assert-That ((Get-MivSourceId $fixture) -eq $beforeOutput) 'generated snapshot o
 Write-Fixture 'tests/target-fixture/source.txt' 'real fixture, not a target directory'
 Assert-That ((Get-MivSourceId $fixture) -ne $beforeOutput) 'a target-prefixed source fixture was excluded'
 Assert-That ((Get-FileHash -LiteralPath $index).Hash -eq $indexBefore) 'source fingerprint changed the index'
+
+# Isolate stat-cache transitions from the source/routing fixture above.
+$statRoot = Join-Path $fixture 'target/stat-cache-probe'
+[void] [IO.Directory]::CreateDirectory($statRoot)
+[void] (Invoke-MivGit $statRoot @('init', '-q'))
+[IO.File]::WriteAllText((Join-Path $statRoot '.gitignore'), "target/`n", $utf8)
+$statFile = Join-Path $statRoot ('input-' + [char]0x8A66 + '.txt')
+$statCachePath = Join-Path $statRoot 'target/test-lib-full/source-hashes-v1.tsv'
+$statRelative = [IO.Path]::GetFileName($statFile)
+$oldTime = [DateTime]::UtcNow.AddDays(-1)
+[IO.File]::WriteAllText($statFile, 'first', $utf8)
+[IO.File]::SetLastWriteTimeUtc($statFile, $oldTime)
+[IO.File]::SetCreationTimeUtc($statFile, $oldTime.AddDays(-1))
+$statId = Get-MivSourceId $statRoot -NoCache
+Assert-That ((Get-MivSourceId $statRoot) -eq $statId) 'cold cache changed source identity'
+Assert-That ((Get-MivSourceId $statRoot) -eq $statId) 'warm cache changed source identity'
+$locked = [IO.File]::Open($statFile, 'Open', 'ReadWrite', 'None')
+try {
+    Assert-That ((Get-MivSourceId $statRoot) -eq $statId) 'warm hit read unchanged file contents'
+    $forceRead = $false
+    try { [void] (Get-MivSourceId $statRoot -ForceHash) } catch { $forceRead = $true }
+    Assert-That $forceRead 'ForceHash reused cached contents'
+} finally { $locked.Dispose() }
+[IO.File]::WriteAllText($statFile, 'changed-size', $utf8)
+$sizeId = Get-MivSourceId $statRoot
+Assert-That ($sizeId -ne $statId -and $sizeId -eq (Get-MivSourceId $statRoot -NoCache)) 'content/size change was not detected'
+# Restore a timestamp older than the observation; size must still invalidate it.
+[IO.File]::SetLastWriteTimeUtc($statFile, $oldTime)
+[void] (Get-MivSourceId $statRoot)
+[IO.File]::WriteAllText($statFile, 'another-size-change', $utf8)
+[IO.File]::SetLastWriteTimeUtc($statFile, $oldTime)
+$restoredId = Get-MivSourceId $statRoot
+Assert-That ($restoredId -ne $sizeId -and $restoredId -eq (Get-MivSourceId $statRoot -NoCache)) 'size change with restored old mtime was not detected'
+# Poison only the cached digest to prove a creation-time-only change rehashes.
+$statEntries = Read-MivSourceHashCache $statCachePath $statRoot
+$statEntries[$statRelative][3] = 'A' * 64
+Write-MivSourceHashCache $statCachePath $statRoot $statEntries
+[IO.File]::SetCreationTimeUtc($statFile, $oldTime.AddDays(-2))
+Assert-That ((Get-MivSourceId $statRoot) -eq $restoredId) 'creation-time-only change reused a stale hash'
+Assert-That ((Read-MivSourceHashCache $statCachePath $statRoot)[$statRelative][3] -ne ('A' * 64)) 'creation time did not refresh the cache entry'
+# An entry recorded at mtime is racy, even if all three stat values still match.
+[IO.File]::SetLastWriteTimeUtc($statFile, [DateTime]::UtcNow)
+[void] (Get-MivSourceId $statRoot)
+[IO.File]::WriteAllText($statFile, 'same-length-change!', $utf8)
+$racyEntries = Read-MivSourceHashCache $statCachePath $statRoot
+Assert-That (([IO.FileInfo] $statFile).Length -eq $racyEntries[$statRelative][0]) 'racy fixture changed file size'
+[IO.File]::SetLastWriteTimeUtc($statFile, [DateTime]::new($racyEntries[$statRelative][1], [DateTimeKind]::Utc))
+$racyId = Get-MivSourceId $statRoot
+Assert-That ($racyId -ne $restoredId -and $racyId -eq (Get-MivSourceId $statRoot -NoCache)) 'racy same-size update was not rehashed'
+# Re-reading a racy entry must not promote it to a trusted old observation.
+$racyEntries = Read-MivSourceHashCache $statCachePath $statRoot
+$racyEntries[$statRelative][3] = 'B' * 64
+Write-MivSourceHashCache $statCachePath $statRoot $racyEntries
+Assert-That ((Get-MivSourceId $statRoot) -eq $racyId) 'racy entry became trusted after reuse'
+# Force also repairs deliberate same-stat edits outside the detection contract.
+[IO.File]::SetLastWriteTimeUtc($statFile, $oldTime)
+[void] (Get-MivSourceId $statRoot)
+$creationBefore = [IO.File]::GetCreationTimeUtc($statFile)
+[IO.File]::WriteAllText($statFile, 'same-length-edited!', $utf8)
+[IO.File]::SetLastWriteTimeUtc($statFile, $oldTime)
+[IO.File]::SetCreationTimeUtc($statFile, $creationBefore)
+Assert-That ((Get-MivSourceId $statRoot) -eq $racyId) 'same-stat fixture did not exercise a cache hit'
+$forceId = Get-MivSourceId $statRoot -ForceHash
+Assert-That ($forceId -ne $racyId -and $forceId -eq (Get-MivSourceId $statRoot -NoCache)) 'ForceHash did not repair a same-stat edit'
+foreach ($broken in @('corrupt', "miv-stat-cache-v2 $(Get-MivTextHash $statRoot)`ntruncated`n")) {
+    [IO.File]::WriteAllText($statCachePath, $broken, $utf8)
+    $cacheWarnings = @()
+    $brokenId = Get-MivSourceId $statRoot -WarningVariable cacheWarnings -WarningAction SilentlyContinue
+    Assert-That ($brokenId -eq $forceId -and $cacheWarnings.Count -gt 0) 'broken cache did not warn and hash correctly'
+}
+# A well-formed row whose digest differs by one hex digit must not be trusted.
+[void] (Get-MivSourceId $statRoot -ForceHash)
+$cacheLines = [IO.File]::ReadAllLines($statCachePath, [Text.Encoding]::UTF8)
+$rowFields = $cacheLines[1].Split([char]9)
+$rowFields[4] = $(if ($rowFields[4][0] -eq 'A') { 'B' } else { 'A' }) + $rowFields[4].Substring(1)
+$cacheLines[1] = $rowFields -join "`t"
+[IO.File]::WriteAllText($statCachePath, (($cacheLines -join "`n") + "`n"), $utf8)
+$cacheWarnings = @()
+$alteredId = Get-MivSourceId $statRoot -WarningVariable cacheWarnings -WarningAction SilentlyContinue
+Assert-That ($alteredId -eq $forceId -and $cacheWarnings.Count -gt 0) 'an altered but well-formed cache row was trusted'
+# A locked cache also fails closed on both reading and writing.
+[void] (Get-MivSourceId $statRoot -ForceHash)
+$locked = [IO.File]::Open($statCachePath, 'Open', 'ReadWrite', 'None')
+try {
+    foreach ($forceHash in @($false, $true)) {
+        $cacheWarnings = @()
+        $lockedId = Get-MivSourceId $statRoot -ForceHash:$forceHash -WarningVariable cacheWarnings -WarningAction SilentlyContinue
+        Assert-That ($lockedId -eq $forceId -and $cacheWarnings.Count -gt 0) 'cache I/O failure did not warn and hash correctly'
+    }
+} finally { $locked.Dispose() }
+Write-Host '[test-test-tools] stat cache: identity, warm read avoidance, size/mtime/creation/racy changes, ForceHash, corruption and I/O failures PASS'
 
 $run1 = Run-Script 'test-lib-full.ps1' @('-MinimumTests', '3')
 Assert-That ($run1.ExitCode -eq 0 -and $run1.StdOut.Contains('MISS')) "initial miss failed: $($run1.StdOut) $($run1.StdErr)"
@@ -168,6 +373,21 @@ $run3 = Run-Script 'test-lib-full.ps1' @('-MinimumTests', '3')
 Assert-That ($run3.ExitCode -eq 0 -and $run3.StdOut.Contains('MISS') -and (Count-Runs) -eq ($count1 + 1)) "dirty source did not rerun: $($run3.StdOut)"
 $forced = Run-Script 'test-lib-full.ps1' @('-MinimumTests', '3', '-Force')
 Assert-That ($forced.ExitCode -eq 0 -and $forced.StdOut.Contains('MISS')) 'Force did not run tests'
+# Exercise the public -Force route with an edit outside the stat contract.
+$forceFile = Join-Path $fixture 'vendor/raw-samples/input.raw'
+[IO.File]::SetLastWriteTimeUtc($forceFile, $oldTime)
+$forceBaseline = Run-Script 'test-lib-full.ps1' @('-MinimumTests', '3')
+Assert-That ($forceBaseline.ExitCode -eq 0) 'cannot prepare same-stat Force fixture'
+$forceSourceBefore = Get-MivSourceId $fixture
+$forceCreated = [IO.File]::GetCreationTimeUtc($forceFile)
+Write-Fixture 'vendor/raw-samples/input.raw' 'fixture-v3'
+[IO.File]::SetLastWriteTimeUtc($forceFile, $oldTime)
+[IO.File]::SetCreationTimeUtc($forceFile, $forceCreated)
+$sameStatHit = Run-Script 'test-lib-full.ps1' @('-MinimumTests', '3')
+Assert-That ($sameStatHit.ExitCode -eq 0 -and $sameStatHit.StdOut.Contains('HIT') -and $sameStatHit.StdOut.Contains("source=$forceSourceBefore")) 'same-stat edit did not exercise a ledger hit'
+$forceSourceAfter = Get-MivSourceId $fixture -NoCache
+$sameStatForced = Run-Script 'test-lib-full.ps1' @('-MinimumTests', '3', '-Force')
+Assert-That ($forceSourceAfter -ne $forceSourceBefore -and $sameStatForced.ExitCode -eq 0 -and $sameStatForced.StdOut.Contains('MISS') -and $sameStatForced.StdOut.Contains("source=$forceSourceAfter")) 'public Force did not rehash same-stat input'
 $externalBefore = [Environment]::GetEnvironmentVariable('TEST_EXTERNAL_FAILURE')
 try {
     # Model an external condition, deliberately outside the documented hash.
@@ -213,7 +433,7 @@ Assert-That ($docs.ExitCode -eq 2 -and $docs.StdOut.Contains('docs/example.md'))
 # Use a PS entry script for array arguments (powershell.exe -File does not bind
 # a multi-element string[] reliably). Mix one selectable and one unsupported path.
 $focusedRunsBefore = @(Get-ChildItem (Join-Path $fixture 'target/test-focused/runs') -Directory).Count
-foreach ($unsupported in @('testdata/input.wav', 'scripts/tool.ps1', 'crates/ort-patched/src/lib.rs', 'vendor/egui/src/lib.rs', '.config/nextest.toml', 'build.rs', 'Cargo.toml', 'Cargo.lock', 'helper/build.rs', 'helper/Cargo.toml', 'helper/fixture.bin', 'docs/example.md')) {
+foreach ($unsupported in @('testdata/input.wav', 'scripts/tool.ps1', 'crates/unsupported-patch/src/lib.rs', 'vendor/egui/src/lib.rs', '.config/nextest.toml', 'build.rs', 'Cargo.toml', 'Cargo.lock', 'helper/build.rs', 'helper/Cargo.toml', 'helper/fixture.bin', 'docs/example.md')) {
     $mixedPlan = Get-MivFocusedPlan $fixture @('src/foo.rs', $unsupported)
     Assert-That ($mixedPlan.Entries.Count -eq 1 -and $mixedPlan.BroadPaths -contains $unsupported) "mixed plan omitted unsupported path: $unsupported"
     $entryScript = Join-Path $fixture 'target/mixed-focused.ps1'
@@ -228,4 +448,53 @@ foreach ($unsupported in @('testdata/input.wav', 'scripts/tool.ps1', 'crates/ort
 $escape = Run-Script 'test-focused.ps1' @('-Path', '../outside.rs')
 Assert-That ($escape.ExitCode -ne 0) 'outside path was accepted'
 Assert-That ((Get-FileHash -LiteralPath $index).Hash -eq $indexBefore) 'test tools changed the index'
+if ($Benchmark) {
+    # Optional reproducible scale check; no application or main crate is built.
+    $benchRoot = Join-Path $fixture 'target/stat-cache-benchmark'
+    foreach ($dir in @('src', 'testimage/flat', 'testimage/nested/sub')) {
+        [void] [IO.Directory]::CreateDirectory((Join-Path $benchRoot $dir))
+    }
+    [void] (Invoke-MivGit $benchRoot @('init', '-q'))
+    [void] (Invoke-MivGit (Join-Path $benchRoot 'testimage/nested') @('init', '-q'))
+    [IO.File]::WriteAllText((Join-Path $benchRoot '.gitignore'), "target/`ntestimage/`n", $utf8)
+    [IO.File]::WriteAllText((Join-Path $benchRoot 'Cargo.toml'), "[package]`nname = `"mimageviewer`"`nversion = `"0.0.0`"`nedition = `"2021`"`n[workspace]`n", $utf8)
+    [IO.File]::WriteAllText((Join-Path $benchRoot 'src/lib.rs'), '#[test] fn benchmark_fixture() { assert_eq!(2 + 2, 4); }', $utf8)
+    $benchLock = Invoke-MivTool 'cargo' @('generate-lockfile', '--offline') $benchRoot
+    Assert-That ($benchLock.ExitCode -eq 0) 'cannot prepare benchmark lockfile'
+    $bytes = New-Object byte[] 65536
+    $random = New-Object Random 20261016
+    $random.NextBytes($bytes)
+    for ($i = 0; $i -lt 21247; $i++) {
+        $dir = if ($i -lt 20000) { 'testimage/flat' } else { 'testimage/nested/sub' }
+        $path = Join-Path $benchRoot ($dir + '/' + $i.ToString('D5') + '.bin')
+        [IO.File]::WriteAllBytes($path, $bytes)
+        [IO.File]::SetLastWriteTimeUtc($path, $oldTime)
+    }
+    $measurements = New-Object 'System.Collections.Generic.List[object]'
+    $benchId = $null
+    foreach ($mode in @('uncached', 'populate', 'warm-1', 'warm-2', 'warm-3')) {
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $id = Get-MivSourceId $benchRoot -NoCache:($mode -eq 'uncached') -ForceHash:($mode -eq 'populate')
+        $seconds = $watch.Elapsed.TotalSeconds
+        if ($null -eq $benchId) { $benchId = $id }
+        Assert-That ($id -eq $benchId) "benchmark identity mismatch: $mode"
+        $measurements.Add([pscustomobject]@{ Mode = $mode; Seconds = $seconds; Source = $id })
+    }
+    $benchArgs = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'test-lib-full.ps1'), '-RepoRoot', $benchRoot, '-MinimumTests', '1')
+    $prime = Invoke-MivTool 'powershell.exe' $benchArgs $repo
+    Assert-That ($prime.ExitCode -eq 0 -and $prime.StdOut.Contains('PASS: 1 passed')) "benchmark receipt preparation failed: $($prime.StdOut) $($prime.StdErr)"
+    $benchRuns = @(Get-ChildItem (Join-Path $benchRoot 'target/test-lib-full/runs') -Directory).Count
+    foreach ($iteration in 1..3) {
+        $hit = Invoke-MivTool 'powershell.exe' $benchArgs $repo
+        Assert-That ($hit.ExitCode -eq 0 -and $hit.StdOut.Contains('HIT') -and $hit.StdOut.Contains("source=$benchId")) 'benchmark did not reuse the receipt'
+        Assert-That (@(Get-ChildItem (Join-Path $benchRoot 'target/test-lib-full/runs') -Directory).Count -eq $benchRuns) 'benchmark HIT created a test run'
+        [IO.File]::WriteAllText((Join-Path $benchRoot "target/hit-$iteration.log"), $hit.StdOut + $hit.StdErr, $utf8)
+        $measurements.Add([pscustomobject]@{ Mode = "ledger-hit-$iteration"; Seconds = $hit.Seconds; Source = $benchId })
+    }
+    $resultPath = Join-Path $benchRoot 'target/measurements.json'
+    [IO.File]::WriteAllText($resultPath, ($measurements | ConvertTo-Json), $utf8)
+    Write-Host '[test-test-tools] benchmark: 21,247 binary fixtures, 1,392,443,392 bytes; 1,247 files in a nested repository'
+    Write-Host ($measurements | Format-Table -AutoSize | Out-String)
+    Write-Host "[test-test-tools] benchmark results: $resultPath"
+}
 Write-Host "[test-test-tools] PASS; disposable fixtures/logs retained at $fixture"

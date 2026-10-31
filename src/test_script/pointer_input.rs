@@ -1561,7 +1561,7 @@ mod tests {
             revision: 0,
             regions: vec![NamedRegion {
                 id: RegionId::StillSeekTrack,
-                widget_id: egui::Id::new("pointer-track"),
+                widget_id: egui::Id::unique("pointer-track"),
                 rect,
                 coordinate_frame: rect,
                 geometry_token: 0,
@@ -1639,7 +1639,7 @@ mod tests {
                 region_geometry_token: 6,
                 press_page_index: 2,
                 press_item_identity: "page-2".to_string(),
-                widget_id: egui::Id::new("pointer-track"),
+                widget_id: egui::Id::unique("pointer-track"),
                 press_rect: egui::Rect::from_min_max(
                     egui::pos2(10.0, 20.0),
                     egui::pos2(110.0, 40.0),
@@ -1699,7 +1699,7 @@ mod tests {
         // `begin_pass` must keep the run-local handler receipt from the actual delivery pass.
         begin_pass(&ctx, 7, 2, "page-2".to_string(), mode_proof());
         let output = show.finish();
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(matches!(output.receipt, ReceiptAccumulator::Valid(_)));
     }
 
@@ -1738,7 +1738,7 @@ mod tests {
         finish_pass(&ctx);
         let mut output = show.finish();
         let joined = output.take_joined_region_frame(&identity, 7);
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(joined.is_ok());
     }
 
@@ -1867,7 +1867,7 @@ mod tests {
         finish_pass(&ctx);
         let mut output = show.finish();
         let error = output.take_joined_region_frame(&identity, 7).unwrap_err();
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(error.contains("delivery did not join"), "{error}");
     }
 
@@ -1896,14 +1896,16 @@ mod tests {
             time: Some(1.0),
             ..Default::default()
         });
-        egui::CentralPanel::default().show(&ctx, |ui| {
-            let _ = ui.interact(
-                rect,
-                egui::Id::new("pointer-track"),
-                egui::Sense::click_and_drag(),
-            );
+        ctx.root_ui(|ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let _ = ui.interact(
+                    rect,
+                    egui::Id::unique("pointer-track"),
+                    egui::Sense::click_and_drag(),
+                );
+            })
         });
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         let child_input = egui::RawInput {
             viewport_id: viewport,
             time: Some(1.005),
@@ -1931,22 +1933,24 @@ mod tests {
             callback_item.to_string(),
             callback_mode,
         );
-        egui::CentralPanel::default().show(&ctx, |ui| {
-            let response = ui.interact(
-                rect,
-                egui::Id::new("pointer-track"),
-                egui::Sense::click_and_drag(),
-            );
-            assert!(
-                response.is_pointer_button_down_on(),
-                "test precondition: egui must hit the actual response"
-            );
-            record_region(RegionId::StillSeekTrack, &response, rect, None);
-            observe_region_handler(&response, RegionId::StillSeekTrack, None);
+        ctx.root_ui(|ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let response = ui.interact(
+                    rect,
+                    egui::Id::unique("pointer-track"),
+                    egui::Sense::click_and_drag(),
+                );
+                assert!(
+                    response.is_pointer_button_down_on(),
+                    "test precondition: egui must hit the actual response"
+                );
+                record_region(RegionId::StillSeekTrack, &response, rect, None);
+                observe_region_handler(&response, RegionId::StillSeekTrack, None);
+            })
         });
         finish_pass(&ctx);
         let output = show.finish();
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         assert!(matches!(output.delivery, DeliveryAccumulator::Exact(_)));
         assert_eq!(
             matches!(output.receipt, ReceiptAccumulator::Valid(_)),
@@ -2163,7 +2167,7 @@ mod tests {
             egui::Rect::from_min_max(egui::pos2(10.0, 60.0), egui::pos2(210.0, 104.0));
         let mut frame = region_frame(&owner, 2, "page-2", press_rect);
         frame.regions[0].id = RegionId::StillSeekStripRow;
-        frame.regions[0].widget_id = egui::Id::new("pointer-strip");
+        frame.regions[0].widget_id = egui::Id::unique("pointer-strip");
         frame.regions[0].coordinate_frame = coordinate_frame;
         let mut latch = prepared_step(
             &owner,
@@ -2175,7 +2179,7 @@ mod tests {
         .step
         .latch;
         latch.region = SyntheticPointerRegion::StillSeekStripRow;
-        latch.widget_id = egui::Id::new("pointer-strip");
+        latch.widget_id = egui::Id::unique("pointer-strip");
         latch.press_rect = press_rect;
         latch.coordinate_frame = coordinate_frame;
 

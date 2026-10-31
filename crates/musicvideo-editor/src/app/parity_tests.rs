@@ -239,13 +239,12 @@ fn preview(app: &mut MusicVideoLabApp, ctx: &egui::Context, position: f64, seek:
     let displayed = app.displayed_preview.as_ref().expect("result adopted");
     assert_eq!(displayed.time_secs.to_bits(), expected_time.to_bits());
     assert_eq!(displayed.project, app.project);
-    let delta = ctx.tex_manager().write().take_delta();
-    let (_, upload) = delta
-        .set
-        .iter()
-        .find(|(id, _)| *id == displayed.texture.id())
-        .expect("texture upload");
-    let egui::ImageData::Color(image) = &upload.image;
+    let mut delta = ctx.tex_manager().write().take_delta();
+    let uploads = delta.set.get(&displayed.texture.id()).cloned();
+    delta.clear();
+    let uploads = uploads.expect("texture upload");
+    assert_eq!(uploads.len(), 1);
+    let egui::ImageData::Color(image) = &uploads[0].image;
     assert_eq!(
         image.pixels, expected_pixels,
         "adoption only uploads the worker image"
@@ -569,7 +568,7 @@ fn h3b_preview_texture_only_converts_rgba_and_downscales() {
     app.editor_state
         .select_layer(&app.project, app.project.layers.len());
     let texture_id = app.displayed_preview.as_ref().unwrap().texture.id();
-    let output = ctx.run(
+    let output = crate::project::headless_paint_output(ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -580,7 +579,7 @@ fn h3b_preview_texture_only_converts_rgba_and_downscales() {
         |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| app.draw_preview(ui));
         },
-    );
+    ));
     let meshes = output
         .shapes
         .iter()

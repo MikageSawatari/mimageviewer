@@ -761,8 +761,8 @@ impl App {
         }
         // Ctrl+G dirty (= query が last_executed と異なる、入力中で結果未確定)
         if self.global_search.active
-            && !self.global_search.query.is_empty()
-            && self.global_search.query != self.global_search.last_executed
+            && !self.global_search.draft().is_empty()
+            && self.global_search.draft() != self.global_search.last_executed
         {
             return Some("検索結果の確定後にお試しください (Ctrl+G)");
         }
@@ -921,7 +921,7 @@ impl App {
                     .and_then(snapshot_key_from_grid_item)
                     .is_some()
         }) {
-            self.show_feedback_toast("固定する items がありません".into());
+            self.show_feedback_warning("固定する items がありません".into());
             return;
         }
         self.normalize_direct_media_basis_for_snapshot();
@@ -936,7 +936,7 @@ impl App {
             .collect();
         if captured_entries.is_empty() {
             // 0 件の snapshot は意味がない (= scope なし)。toast で警告して早期 return。
-            self.show_feedback_toast("固定する items がありません".into());
+            self.show_feedback_warning("固定する items がありません".into());
             return;
         }
         self.capture_main_list_restore_cursor();
@@ -991,6 +991,8 @@ impl App {
             self.global_search.saved_folder.clone()
         } else if self.favsearch.active {
             self.favsearch.saved_folder.clone()
+        } else if self.tag_view.active {
+            self.tag_view.saved_folder.clone()
         } else {
             None
         };
@@ -998,12 +1000,14 @@ impl App {
         // 旧 state / テスト補助経路などで検索 active flag と TopLevelGridView の同期前に
         // snapshot が開始されても、結果一覧の合成 path を戻り先にしない。通常経路では
         // return_to が既に完全な SmartFolder state 等を持つため、その値を優先する。
-        if self.global_search.active || self.favsearch.active {
+        if self.global_search.active || self.favsearch.active || self.tag_view.active {
             top_level_return = self.top_level_grid_view.return_to().cloned().or_else(|| {
                 let subfolder_restore = if self.global_search.active {
                     self.global_search_subfolder_restore.clone()
-                } else {
+                } else if self.favsearch.active {
                     self.favsearch_subfolder_restore.clone()
+                } else {
+                    self.tag_view_subfolder_restore.clone()
                 };
                 Some(self.view_return_context_from_parts(
                     pre_snapshot_search_origin.clone(),
@@ -1012,6 +1016,19 @@ impl App {
                 ))
             });
         }
+        // Tagの終了処理はreturn originも消費するので、戻り先とrouteを終了前に対で確定する。
+        let top_level_return = top_level_return.map(|restore| {
+            let route = self
+                .top_level_grid_view
+                .return_origin()
+                .filter(|origin| {
+                    super::FolderNavHistoryTarget::from_restore(&origin.restore)
+                        == super::FolderNavHistoryTarget::from_restore(&restore)
+                })
+                .map(|origin| origin.route.clone())
+                .unwrap_or_else(|| self.facet_navigation.route().clone());
+            super::top_level_grid_view::TopLevelGridOrigin { restore, route }
+        });
         let mut membership: std::collections::HashMap<SnapshotKey, usize> =
             std::collections::HashMap::with_capacity(captured_entries.len());
         for (idx, entry) in captured_entries.iter().enumerate() {
@@ -1030,6 +1047,8 @@ impl App {
 
         // Step 2: close search (= mutual exclusion)
         let search_was_active = self.close_searches_for_snapshot();
+
+        self.save_departing_session_grid_positions();
 
         // Step 3: activate
         let generation_id = self.snapshot_next_generation_id;
@@ -1053,6 +1072,10 @@ impl App {
         let list_view_thumbnails = captured_thumbnails.clone();
         let list_view_image_metas = captured_image_metas.clone();
         let saved_page_identity_index = self.page_identity_index.clone();
+        // Fixing this list is an explicit display request; late initial opens must retire.
+        if self.main_folder_history_available() {
+            self.cancel_unresolved_open_for_navigation(true);
+        }
         let saved_projection_recipe = std::mem::replace(
             &mut self.projection_recipe,
             super::book_materialization::ProjectionRecipe::ExtractedResult(
@@ -1064,7 +1087,9 @@ impl App {
         let saved_image_metas = std::mem::replace(&mut self.image_metas, captured_image_metas);
         let saved_visible_indices =
             std::mem::replace(&mut self.visible_indices, snapshot_visible_indices);
-        let saved_scroll_offset_y = std::mem::replace(&mut self.scroll_offset_y, 0.0);
+        self.grid_scroll.renew_session();
+        let saved_scroll_offset_y = self.grid_scroll.offset();
+        self.grid_scroll.set_position(0.0);
         let saved_selected = std::mem::replace(&mut self.selected, new_selected);
         // snapshot は別の item 配列なので、元一覧の index アンカーを持ち込まない。
         // 次の Shift+クリックは snapshot 側の selected を起点に再確立する。
@@ -1079,7 +1104,7 @@ impl App {
         // 画面外にあるとユーザー視認できないため)。new_selected が None なら scroll_offset_y
         // = 0.0 のままで先頭表示。
         if new_selected.is_some() {
-            self.scroll_to_selected = true;
+            self.grid_scroll.set_reveal_requested(true);
         }
         // ★情報 / 回転 / タグ / EXIF 等の idx-based cache を全 clear する。
         // items を入れ替えたので idx の意味が変わる (= 旧 idx → stars の対応が壊れ、
@@ -1121,21 +1146,9 @@ impl App {
         });
         // The original shift owner is parked above; the extracted list has no Book scope.
         self.spread_shift.detach_book_scope_for_ordinary_list();
-        let return_origin = top_level_return.map(|restore| {
-            let route = self
-                .top_level_grid_view
-                .return_origin()
-                .filter(|origin| {
-                    super::FolderNavHistoryTarget::from_restore(&origin.restore)
-                        == super::FolderNavHistoryTarget::from_restore(&restore)
-                })
-                .map(|origin| origin.route.clone())
-                .unwrap_or_else(|| self.facet_navigation.route().clone());
-            super::top_level_grid_view::TopLevelGridOrigin { restore, route }
-        });
         self.top_level_grid_view.begin_with_origin(
             super::top_level_grid_view::TopLevelGridSurface::Snapshot,
-            return_origin,
+            top_level_return,
         );
 
         // ★items_generation bump + invalidate_idx_state_and_queues (= Codex P1-1):
@@ -1320,6 +1333,10 @@ impl App {
         let Some(snap) = self.snapshot.take() else {
             return;
         };
+        // Unfixing explicitly chooses the retained/current list, before any restore branch.
+        if self.main_folder_history_available() {
+            self.cancel_unresolved_open_for_navigation(true);
+        }
         let top_level_origin = self.top_level_grid_view.take_return_origin();
         let top_level_return = top_level_origin
             .as_ref()
@@ -1340,9 +1357,9 @@ impl App {
         {
             let current_in_scope = self.current_folder.as_deref().is_some_and(|current| {
                 if state.contains_scoped_path(current) {
-                    state.move_to(current)
+                    state.state.move_to(current)
                 } else {
-                    state.enter_containing_path(current)
+                    state.state.enter_containing_path(current)
                 }
             });
             if at_origin || current_in_scope {
@@ -1460,13 +1477,14 @@ impl App {
                     }
                 }
             }
+            self.grid_scroll.renew_session();
             self.items = snap.saved_items;
             self.page_identity_index = snap.saved_page_identity_index;
             self.projection_recipe = snap.saved_projection_recipe;
             self.thumbnails = merged_thumbnails;
             self.image_metas = snap.saved_image_metas;
             self.visible_indices = snap.saved_visible_indices;
-            self.scroll_offset_y = snap.saved_scroll_offset_y;
+            self.grid_scroll.set_position(snap.saved_scroll_offset_y);
             // ネスト ZIP 由来の snapshot: saved_items (= ZIP 階層の items) と対で
             // ナビ状態も復元する。これをしないと「ZIP items なのに nav なし」になり、
             // BS が階層を戻らず ZIP ごと抜ける / ZipDir セルの Enter が無反応になる。
@@ -1580,8 +1598,8 @@ impl App {
         let n = list_items.len();
         // filter suppress 解除 (= snapshot list view は filter 通常適用)
         let _ = self.restore_rating_filter_suppression();
-        // fullscreen 中なら閉じる
-        if self.fullscreen_idx.is_some() {
+        // A pending reader also ends here; list-only preparation is not a reader.
+        if self.projected_viewer_session_open() {
             self.close_fullscreen();
         }
         // snapshot 内から ZipFile を開いていた場合、その子 ZIP の zip_nav が残っている。
@@ -1592,6 +1610,7 @@ impl App {
             crate::zip_loader::clear_nested_cache();
         }
         // items 入れ替え (= 保存したサムネ付き state を復帰)
+        self.grid_scroll.renew_session();
         self.items = list_items;
         self.page_identity_index = list_identity_index;
         self.projection_recipe = list_recipe;
@@ -1601,8 +1620,8 @@ impl App {
         self.display_epub_source = display_epub_source;
         self.current_folder = Some(snap_origin.clone());
         self.address = snap_origin.display().to_string();
-        self.scroll_offset_y = 0.0;
-        self.pending_grid_scroll = None;
+        self.grid_scroll.set_position(0.0);
+        self.grid_scroll.clear_edge();
         self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
         // items_generation bump + invalidate (= Codex P1-1)
         self.bump_items_generation();
@@ -1627,17 +1646,24 @@ impl App {
         true
     }
 
-    /// 検索系 (Ctrl+F / Ctrl+S / Ctrl+G) を全部 close する (= snapshot ON 時に呼ぶ)。
+    /// 検索系を全部 close する (= snapshot ON 時に呼ぶ)。
     ///
     /// 戻り値: いずれかの検索が active だったか (= toast 文面の分岐用)。
     fn close_searches_for_snapshot(&mut self) -> bool {
         let mut had_active = false;
 
+        // 戻り先は activate_snapshot で保存済み。固定一覧へ検索結果を遅着させず、
+        // タグ専用列・選択情報も同じ検索の終了境界で退役させる。
+        if self.tag_view.active || self.items_are_tag_view || self.tag_view_pending.is_some() {
+            had_active = true;
+            let _ = self.dismiss_tag_view_without_restore();
+        }
+
         // Ctrl+F (= text search): search bar を閉じる + pending cancel + query クリア
         if self.show_search_bar {
             had_active = true;
             self.show_search_bar = false;
-            self.search_query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
             self.cancel_search_pending();
         }
 
@@ -1645,7 +1671,7 @@ impl App {
         if self.favsearch.active {
             had_active = true;
             self.favsearch.active = false;
-            self.favsearch.query.clear();
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Container);
             self.favsearch.last_executed.clear();
             // FavSearchPending は take すれば drop で rx 閉じる (= cancel field は private、
             // 既存パターンも take で済ませている)
@@ -1656,7 +1682,9 @@ impl App {
         if self.global_search.active {
             had_active = true;
             self.global_search.active = false;
-            self.global_search.query.clear();
+            self.global_search.last_change_at = None;
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Metadata);
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Everything);
             self.global_search.last_executed.clear();
             self.global_search.containers.clear();
             self.global_search.all_hits.clear();
@@ -1838,7 +1866,7 @@ impl App {
         // The classification worker has proved this is not a subsequent RAR volume.
         // This route remains cache-only: a miss never opens a conversion dialog.
         let Some(cached) = self.try_archive_cache_lookup(&path) else {
-            self.show_feedback_toast(
+            self.show_feedback_warning(
                 "変換対応アーカイブは★固定範囲内で開けません (解除してから開いてください)".into(),
             );
             return;
@@ -2036,7 +2064,7 @@ impl App {
                 };
                 let _ = format; // 変換 dialog は snapshot scope 外、cache hit 時のみ自動 open
                 if self.settings.archive_file_handling_ignores_convertible() {
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                     );
                     return false;
@@ -2058,7 +2086,7 @@ impl App {
                 } else {
                     // cache 無し: snapshot 中は変換 dialog を出さず skip (= 次 entry に進む
                     // 想定だが、ユーザーの代表 use case ではないので MVP として false)
-                    self.show_feedback_toast(
+                    self.show_feedback_warning(
                         "変換対応アーカイブは★固定範囲内で開けません (解除してから開いてください)"
                             .into(),
                     );
@@ -2087,7 +2115,7 @@ impl App {
         let was_fs = self.fullscreen_idx.is_some();
         // 現在 fullscreen を閉じる (= items が入れ替わるので)
         if was_fs {
-            self.close_fullscreen();
+            self.close_fullscreen_content();
         }
         // guard bypass
         self.snapshot_internal_nav = true;
@@ -2227,6 +2255,10 @@ impl App {
     }
 
     pub(crate) fn finish_fullscreen_navigation_for_true_close(&mut self) {
+        // A live return can defer content teardown until the main UI dispatcher.
+        // Its accepted Close already ends this viewer's automatic navigation owner.
+        self.stop_projected_slideshow_playback();
+        self.cancel_sidecar_restore_fullscreen_reopen();
         self.cancel_required_fullscreen_folder_open();
         self.cancel_inflight_order_dependent_folder_nav();
         if self.fs_nav_after_pdf_enumerate.is_some() || self.pdf_password_request.is_some() {
@@ -2234,12 +2266,73 @@ impl App {
             self.zip_enumerate_pending = None;
             self.pdf_password_request = None;
             self.pdf_password_pending_save = None;
-            self.pdf_password_input.clear();
-            self.pdf_password_error = None;
-            self.pdf_password_save = false;
+            // The request is bundle-owned, but the dialog editor is App-global.
+            // A sibling's surviving prompt still owns its current input/error.
+            if self.pdf_password_dialog_path().is_none() {
+                self.pdf_password_input.clear();
+                self.pdf_password_error = None;
+                self.pdf_password_save = false;
+            }
             self.fs_nav_after_pdf_enumerate = None;
         }
         self.finish_fs_navigation_sequence(crate::app::FsNavigationSequenceFinish::ViewerExited);
+        self.retire_viewer_reopen_requests(self.projected_viewer_context_id());
+    }
+
+    /// Check the owner after list adoption, immediately before either completion reopens.
+    /// Adoption itself may retire a context; an earlier take/check is not sufficient.
+    pub(crate) fn resume_archive_convert_viewer_after_load(
+        &mut self,
+        ctx: &egui::Context,
+        deferred: crate::ui_dialogs::archive_convert::ArchiveConvertDeferredFullscreen,
+    ) {
+        if !matches!(
+            self.viewer_context_residence(deferred.owner_context),
+            crate::app::ContextResidence::Mounted | crate::app::ContextResidence::AtRest
+        ) {
+            return;
+        }
+        let reason = self.reopen_fullscreen_after_folder_nav_load(
+            ctx,
+            deferred.restore_video_tile,
+            deferred.reopen.resume_slideshow,
+            deferred.reopen.history_trigger,
+        );
+        if reason == "enumerate_defer" {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Capture the requesting viewer here, inside App's context ownership boundary.
+    pub(crate) fn attach_archive_convert_deferred_fullscreen(
+        &mut self,
+        restore_video_tile: bool,
+        resume_slideshow: bool,
+        history_trigger: crate::app::HistoryTrigger,
+    ) -> bool {
+        let owner_context = self.projected_viewer_context_id();
+        let resume_to_last_page = self.settings.book_nav_resume.resumes();
+        let Some(state) = self.archive_convert.as_mut() else {
+            return false;
+        };
+        if !state.suppress_confirm && !state.allow_direct_read {
+            return false;
+        }
+        state.deferred_fullscreen = Some(
+            crate::ui_dialogs::archive_convert::ArchiveConvertDeferredFullscreen {
+                owner_context,
+                restore_video_tile,
+                reopen: crate::app::DeferredFsReopen {
+                    history_trigger,
+                    resume_slideshow,
+                    target: crate::app::DeferredFsTarget::None,
+                    resume_to_last_page,
+                    from_explicit_open: false,
+                    preserve_after_password_prompt: false,
+                },
+            },
+        );
+        true
     }
 
     pub(super) fn prepare_required_fullscreen_navigation(
@@ -2321,12 +2414,12 @@ impl App {
                 );
             self.snapshot_internal_nav = false;
             if !started {
-                self.show_feedback_toast("画像の場所を開けません".to_string());
+                self.show_feedback_warning("画像の場所を開けません".to_string());
             }
             return;
         }
         if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose) {
-            self.show_feedback_toast("画像の場所を開けません".to_string());
+            self.show_feedback_warning("画像の場所を開けません".to_string());
             return;
         }
         self.snapshot_internal_nav = true;
@@ -2354,7 +2447,7 @@ impl App {
             // Transfer the scan's proof to the existing prepared Physical owner. Its adoption
             // validates the source BEFORE fullscreen preparation dismisses a snapshot.
             self.snapshot_internal_nav = true;
-            let started = self.start_physical_history_transition_classified(
+            let started = self.start_physical_history_transition_classified_at_stage(
                 super::PhysicalHistoryIntent::RequiredFullscreen {
                     target,
                     history_trigger,
@@ -2366,6 +2459,7 @@ impl App {
                 super::StartupListIntent::PageContinuation,
                 navigation,
                 Some(scan),
+                super::MainListRequestStage::Continuation,
             );
             if started {
                 self.poll_collection_history_transition(ctx);
@@ -2374,7 +2468,7 @@ impl App {
             return;
         }
         if !self.prepare_required_fullscreen_navigation(ctx, navigation_purpose) {
-            self.show_feedback_toast("画像の場所を開けません".to_string());
+            self.show_feedback_warning("画像の場所を開けません".to_string());
             return;
         }
         self.snapshot_internal_nav = true;
@@ -2716,7 +2810,7 @@ impl App {
                 SnapshotTarget::Fs(p) => p.clone(),
                 SnapshotTarget::ConvertibleArchive { path, .. } => {
                     if self.settings.archive_file_handling_ignores_convertible() {
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "設定により RAR / 7z / LZH アーカイブを無視しています".into(),
                         );
                         return false;
@@ -2731,7 +2825,7 @@ impl App {
                     if let Some(cached) = self.try_archive_cache_lookup(path) {
                         cached
                     } else {
-                        self.show_feedback_toast(
+                        self.show_feedback_warning(
                             "変換対応アーカイブは★固定範囲内で開けません".into(),
                         );
                         return false;
@@ -3034,7 +3128,19 @@ mod tests {
         let (source, cached) = legacy_standalone_rar_cache_fixture(&app);
         app.current_folder = Some(app.tmp.path().to_path_buf());
         activate_single_archive_snapshot(&mut app, source.clone());
+        #[cfg(all(windows, feature = "test-script"))]
+        let before = app.test_script_folder_load_requests;
         assert!(app.snapshot_navigate_grid(true));
+        #[cfg(all(windows, feature = "test-script"))]
+        {
+            drain_snapshot_archive_classification(&mut app);
+            assert_eq!(app.test_script_folder_load_requests, before + 1);
+            assert!(
+                matches!(app.top_level_grid_view.history_navigation_transition(),
+                Some(crate::app::HistoryNavigationTransition::Physical(request))
+                    if matches!(request.phase, crate::app::PhysicalHistoryPhase::ArchivePreflighting { .. }))
+            );
+        }
         drain_snapshot_archive_adoption(&mut app);
         assert_eq!(app.current_folder, Some(cached.clone()));
         assert_eq!(app.archive_source_override, Some(source));
@@ -3045,6 +3151,8 @@ mod tests {
                 if zip_path == &cached && entry_name == "page.png"
         ));
         assert!(app.archive_convert.is_none());
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, before + 1);
     }
 
     #[test]
@@ -3295,6 +3403,47 @@ mod tests {
     }
 
     #[test]
+    fn grid_scroll_session_snapshot_entry_exit_are_fresh_without_changing_saved_offset() {
+        let mut app = test_app_with_items(vec![
+            GridItem::Image(PathBuf::from(r"E:\test\a.png")),
+            GridItem::Image(PathBuf::from(r"E:\test\b.png")),
+        ]);
+        let session = app.grid_scroll.session();
+        app.grid_scroll.set_position(140.0);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        assert!(app.is_snapshot_active());
+        assert_ne!(app.grid_scroll.session(), session);
+        let snapshot_session = app.grid_scroll.session();
+        app.deactivate_snapshot();
+        assert!(!app.is_snapshot_active());
+        assert_ne!(app.grid_scroll.session(), snapshot_session);
+        assert_ne!(app.grid_scroll.session(), session);
+        assert_eq!(app.grid_scroll.offset(), 140.0);
+    }
+
+    #[test]
+    fn grid_scroll_session_snapshot_dismiss_and_child_unfix_keep_visible_rows_lifetime() {
+        for dismiss in [false, true] {
+            let mut app =
+                test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\test\a.png"))]);
+            app.activate_snapshot(SnapshotSourceLabel::Mixed);
+            assert!(app.is_snapshot_active());
+            app.current_folder = Some(PathBuf::from(r"E:\test\child"));
+            app.items = vec![GridItem::Image(PathBuf::from(r"E:\test\child\b.png"))];
+            let child = app.grid_scroll.session();
+            let rows = app.items.clone();
+            if dismiss {
+                assert!(app.dismiss_snapshot_with_origin().is_some());
+            } else {
+                app.deactivate_snapshot();
+            }
+            assert!(!app.is_snapshot_active());
+            assert_eq!(app.grid_scroll.session(), child);
+            assert_eq!(app.items, rows);
+        }
+    }
+
+    #[test]
     fn snapshot_inactive_by_default() {
         let app = setup_app_for_test();
         assert!(!app.is_snapshot_active());
@@ -3318,6 +3467,8 @@ mod tests {
         app.fs_cache.insert(
             1,
             crate::app::FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
                 tex,
                 pixels: pixels.clone(),
                 source_dims: Some([2, 3]),
@@ -3785,22 +3936,24 @@ mod tests {
             content_type: None,
         }];
         let ctx = egui::Context::default();
-        let _ = ctx.run(
-            egui::RawInput {
-                focused: true,
-                events: vec![egui::Event::Key {
-                    key: egui::Key::Backspace,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-                ..Default::default()
-            },
-            |ctx| {
-                assert!(app.handle_keyboard(ctx).is_none());
-            },
-        );
+        let _ = ctx
+            .run_pass(
+                egui::RawInput {
+                    focused: true,
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert!(app.handle_keyboard(ctx).is_none());
+                },
+            )
+            .drop_without_applying_deltas();
         assert_eq!(app.projection_recipe, fixed);
         assert_eq!(app.items, items);
         app.deactivate_snapshot();
@@ -3852,17 +4005,17 @@ mod tests {
             GridItem::Image(PathBuf::from(r"E:\img.png")),
         ];
         let mut app = test_app_with_items(original_items.clone());
-        app.scroll_offset_y = 123.0;
+        app.grid_scroll.set_position(123.0);
         app.selected = Some(1);
 
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
         assert!(app.is_snapshot_active());
         // snapshot 中は scroll はリセット、selected は snapshot 内対応 idx に変換される
         // (= 両 items とも snapshot 対象なので元 idx=1 → 新 idx=1)
-        assert_eq!(app.scroll_offset_y, 0.0);
+        assert_eq!(app.grid_scroll.offset(), 0.0);
         assert_eq!(app.selected, Some(1));
         assert!(
-            app.scroll_to_selected,
+            app.grid_scroll.reveal_requested(),
             "保持した selected が画面外に居る可能性があるので scroll_to_selected を立てる"
         );
 
@@ -3870,7 +4023,7 @@ mod tests {
         assert!(!app.is_snapshot_active());
         // 復元
         assert_eq!(app.items.len(), 2);
-        assert_eq!(app.scroll_offset_y, 123.0);
+        assert_eq!(app.grid_scroll.offset(), 123.0);
         assert_eq!(app.selected, Some(1));
     }
 
@@ -3969,7 +4122,7 @@ mod tests {
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
         assert_eq!(app.selected, None);
         // scroll_to_selected は new_selected が None なので立たない
-        assert!(!app.scroll_to_selected);
+        assert!(!app.grid_scroll.reveal_requested());
     }
 
     #[test]

@@ -450,3 +450,526 @@ commit・masterへのmerge・pushは実行しない。以下の論理単位で�
 | `src/app/similar_navigation_tests.rs`（test moduleのみ） | `test: Settle isolated startup before similar navigation input` |
 | `scripts/test-tools-common.ps1`, `scripts/test-lib-full.ps1`, `scripts/test-focused.ps1`, `scripts/test-test-tools.ps1` | `test: Harden success identities and reject incomplete focused selections` |
 | `docs/development-build-and-test.md`, `docs/test-speed-report.md` | `docs: Record review fixes and test identity boundaries` |
+
+## 全体ゲートのnextest移行（2026-10-16）
+
+**状態: 完了。依存不足を解消して通常Cargo homeで再開し、旧／新gateとも完走。全graphの名前・実行・成功・ignoredが一致。**
+
+対象は `full-nextest` worktree（基準 `21673c767`、HEAD `9b4299c13` はbrief追加のみ）。製品コード・CLAUDE.md・依存バージョンは
+変更しない。`test-full.ps1` のworkspace（`pack-build-tools`）とvendor 4 graphをnextestへ移し、
+workspace doctestは同じfeatureの `cargo test --doc --no-fail-fast` として独立段に残す。
+standalone vendorもルートの `.config/nextest.toml` を明示指定する。
+各nextest段はdefault filterを無視し、既存ignored以外の全件、retry 0、段内no-fail-fast、
+0件は失敗とする。各段の非ゼロ終了で後続を止め、未導入時はinstall方法を案内して終了する。
+
+### 完走時間と測定条件
+
+| gate | exit | 全体の壁時計時間 | 成功 / 失敗 / ignored |
+| --- | ---: | ---: | ---: |
+| 旧cargo test gate（再開後の完走1回） | 0 | **2,678.144秒（44分38.144秒）** | 14,596 / 0 / 66 |
+| 新nextest + doc gate（最終1回） | 0 | **491.718秒（8分11.718秒）** | 14,596 / 0 / 66 |
+
+今回の実測は **81.64%短縮、約5.45倍**。同じソース・通常test profile・`pack-build-tools`、
+logical CPU 24、テスト並列数の環境変数上書きなし。buildだけ `CARGO_BUILD_JOBS=1`。
+`CARGO_HOME`／`CARGO_TARGET_DIR` は未設定で、通常のCargo homeと各graphの既定targetを使った。
+全体時間はbuild／metadata／出力を含む。旧gateは並行した一覧準備のegui-winit初回build
+（Cargo表示1分23秒）によるartifact lock待ちも含む（待ち時間のみは未計測）。新gateは
+準備済みcacheを使うため、厳密な同一cache条件の
+benchmarkではない。負荷・cacheで絶対値は変わるが、全検査範囲を維持した実際のgate時間である。
+旧本体libは13,217成功／59 ignored、2,316.08秒。新workspace全体は14,513成功／63 ignored、
+464.048秒だった（対象範囲が異なるため、この2値だけの速度比は出さない）。
+
+コマンドは旧script保存版／新 `scripts/test-full.ps1` をそれぞれ
+`powershell -NoProfile -NonInteractive -File <script> -SuppressCrashDialogs` で実行。
+新gateだけ結果保存のため `NEXTEST_FINAL_STATUS_LEVEL=all` を指定した。
+通常のslow警告・重い5件の先行実行・retry 0は維持する。
+両gateともPASS・error mode復元を記録し、強制再試行や個別失敗の成功扱いはない。
+実行体隣のnative DLL識別子も実行前後で同じ
+`7731f6994704e03105591acdee5e6e0c2f19a804a02e1b1e576cd69c3be72262`。
+ログ／時間: `target/full-nextest-evidence/before-complete.log`・同summary、
+`after.log`・同summary。graph別JUnitは同directoryの `after-*.junit.xml` に保存した。
+
+### error modeとスクリプトの回帰
+
+PowerShell 5.1.26100.9711 / cargo-nextest 0.9.148の専用・非対話probeで、
+親の `GetErrorMode()` と、実nextestテスト子、その子が起動するhelperの値を照合した。
+
+| 条件 | PowerShell親 | nextestテスト子 | helper |
+| --- | --- | --- | --- |
+| 通常 | `0x8001` | `0x8001` | `0x8001` |
+| 必須bit `0x3`を除く対照 | `0x8000` | `0x8000` | `0x8000` |
+| suppression | `0x8003` | `0x8003` | `0x8003` |
+
+各条件2件、合計6件成功、exit 0。finally後の親も元の `0x8001` に一致した。
+必須bitの継承を直接検査したもので、実クラッシュやダイアログを発生させる検査ではない。
+現行のSetErrorMode／復元処理を維持でき、追加wrapperやWER設定変更は不要。
+ローカルのnextest-runner 0.126.0ソースでも、通常のCommand→Tokio spawnを使用し、
+Windowsのerror modeをリセットするcreation flagやAPI呼び出しはない。
+証跡と再現用crate／scriptは `target/full-nextest-evidence/error-mode-probe/`。
+
+`powershell -NoProfile -File scripts/test-release-build-safety.ps1` はPASS、exit 0。
+native cargo stubで通常成功・suppression成功と、version確認／workspace／doc／vendor 4段の
+全7か所の失敗を検査した。失敗コード37の維持、retry／後段実行なし、子への必須bit継承、
+親mode復元、未導入時の `cargo install cargo-nextest --locked` 案内を確認した。
+共通の `test-tools-common.ps1` は変更しない。
+
+### 測定の準備
+
+初回の旧gate起動はTurboJPEGのMSBuild `--parallel 24` でコンパイル失敗し、テストは未実行
+（exit 101、97.013秒）。以前の測定と同じく、生成済みnative buildを
+`cmake --build target/debug/build/turbojpeg-sys-b95e4463f170e2a1/out/build --target install --config Debug -- /m:1 /nr:false`
+で準備した。ツール導入や製品・依存ソースの修正は行わない。
+ログ: `target/full-nextest-evidence/before-build-failed.log` と同summary。
+以後の比較はbuild並列数だけ `CARGO_BUILD_JOBS=1` とし、テスト並列数の既定24は維持する。
+
+### 一覧・実行結果の突合
+
+`compare_inventory.py` は旧scriptの各selectorを確認し、`cargo test --no-run --message-format json`
+のtest artifactから各実行体の `--list` と `--ignored --list` を採取する。nextest側は同じselectorの
+`cargo nextest list --message-format json --ignore-default-filter` を使い、package ID・target種別・
+binary名・テスト名・ignored指定を比較する。空のtest binaryも対象に含める。
+nextest一覧の `mismatch: ignored` は既存ignoredの正常な除外として照合し、それ以外の除外は失敗とする。
+
+| graph | 旧: 実行 / 成功 / ignored | 新: 実行 / 成功 / ignored | 名前・指定・結果の照合 |
+| --- | ---: | ---: | --- |
+| workspace（54実行体） | 14,513 / 14,513 / 63 | 14,513 / 14,513 / 63 | 全14,576件・空実行体を含め完全一致 |
+| vendor/egui | 25 / 25 / 0 | 25 / 25 / 0 | 完全一致 |
+| root graph egui-winit | 29 / 29 / 0 | 29 / 29 / 0 | 完全一致 |
+| vendor/egui-wgpu | 11 / 11 / 0 | 11 / 11 / 0 | 完全一致 |
+| vendor/eframe | 18 / 18 / 0 | 18 / 18 / 0 | 完全一致 |
+| workspace doc（12 package） | 0 / 0 / 3 | 0 / 0 / 3 | 空packageを含め完全一致 |
+| 合計 | **14,596 / 14,596 / 66** | **14,596 / 14,596 / 66** | 差分0件、全graph失敗0件 |
+
+証跡: `target/full-nextest-evidence/inventory/workspace/comparison.json`、同directoryの
+旧／新inventoryとraw一覧、`inventory-resumed/summary.json` と各graphの旧／新inventory・raw一覧。
+一覧比較はテスト本体を実行せず、成功件数の証明には使わない。
+
+実行結果は `compare_execution.py` で旧gateの各Cargo実行体の最終libtest集計と、新gateの
+graph別JUnit／doc出力を照合した。子helperがstdoutへ出す集計や同名testは二重計上しない。
+libtestの表示用 ` - should panic` だけを実名へ戻し、テスト名・成功／ignoredを全件照合する。
+空binaryのnextest JUnit省略は一覧の一致で補い、testを含むbinaryの欠落は認めない。
+`python target/full-nextest-evidence/compare_execution.py` はexit 0、`match: true`、errors 0。
+再現用script、raw入力のhash、各binaryの最終集計・名前／状態は同directoryの
+`execution-comparison.json` に保存。二重登録解消・新しいignore・説明できない差は0件。
+
+### 依存不足による中断と再開の経緯
+
+nextest 0.9.148は実行対象の列挙前に `cargo metadata --all-features` を呼ぶ。
+vendor/eguiでは既存の通常featureのlibtest build／一覧は成功したが、metadata用の
+`backtrace 0.3.76` のglobal Cargo sourceへの展開がsandboxの書込み制限で失敗した（nextest exit 102）。
+registryのsrc／index／cacheだけを、reparse point 0件・日時保持で作業ツリー内の
+`target/full-nextest-evidence/cargo-home/` へ実コピーして調べたところ、同lockfileの24版本の
+sourceが未展開、うち21版本はarchiveもなかった。既存Cargoで取得を試みても
+`addr2line 0.25.1` の `static.crates.io` 取得が `127.0.0.1:9` への接続失敗となった
+（`CARGO_NET_OFFLINE=false`、`CARGO_NET_RETRY=0`、exit 101）。
+ツールのinstall・lockfile／依存バージョンの変更・global cacheへの書込みは行っていない。
+
+不足一覧: `target/full-nextest-evidence/cargo-home-egui-missing-sources.json`。
+取得失敗: 同directoryの `cargo-home-egui-network-enabled-metadata.stderr.log` とsummary。
+local Cargo homeで通常featureのegui `--lib --no-run` は14.06秒で成功したが、28 artifactsが
+すべて再buildされたため、rootの測定条件へこの環境変更を広げていない。
+別案の `--cargo-metadata` 明示経路は対象graphの等価性を別途検証する設計変更となるため未採用・未検証。
+
+この停止条件の確定後、進行中の旧gateは所有するCargo→本体test executableの親子関係と
+worktree内の実行パスを確認して終了させた。経過 **1,401.028秒（23分21.0秒、中断）**、
+PowerShell exit `4294967295`。終了時の親error modeは元の `0x1` へ復元された。
+`before.log`／`before-summary.json` は中断記録であり、製品テストの失敗や全件成功として扱わない。
+停止時点では旧gateの完走はなく、移行後 `test-full.ps1` の最終一回は未実施だった。
+前回の **3,053.825秒（50分53.8秒）** は履歴値として残し、今回の速度比には再開後に
+完走した旧gateの2,678.144秒を使う。中断分や初回compile失敗をその時間へ加算しない。
+
+その後、Opusがsandbox外でrootとstandalone vendor 3 graphに `cargo fetch --locked` を実行し、
+各graphの `cargo metadata --locked --all-features` がexit 0になったと報告した。
+lockfile・依存バージョンは変更なし。エージェントは**通常のCargo home**で再開し、
+local Cargo homeは使用しない。再開後は全graphの一覧・実行結果が一致し、
+旧／新gateとも各1回の完走でPASSとなった。
+
+プロセス分離に伴うテスト修正は0件。製品／テスト本体の変更も0件。
+独立Sol/xhighの最終レビューも **ACCEPT、修正必須指摘なし**。
+ログ・JUnit・27入力のhash・比較処理を確認し、成功したgateの再実行は行っていない。
+PowerShell構文parse・ASCII検査・fmt check・diff checkは成功。
+共通部品は未変更のため `test-test-tools.ps1` の再実行は行っていない。
+スクリプト・文書のみの変更であり、アプリ検証build・UI起動は行わない。
+このbriefの実装・検証に未解決事項はない。
+
+### 引き継ぐ論理コミット単位
+
+commit／merge／pushは行わず、6ファイルを作業ツリーに残す。
+
+| ファイル | commitメッセージ案 |
+| --- | --- |
+| `scripts/test-full.ps1`, `scripts/test-release-build-safety.ps1`, `.config/nextest.toml` | `test: Move complete release gate to cargo-nextest with separate doctests` |
+| `docs/development-build-and-test.md`, `docs/release-checklist.md`, `docs/test-speed-report.md` | `docs: Record complete nextest gate coverage and timings` |
+
+CLAUDE.mdの必須変更は見つからず未編集。AGENTS.md:248の「最終gateはcargo testのまま」という
+旧記述は設計担当側で更新が必要（今回のbriefを優先し、同ファイルは未編集）。
+
+## ファイルstatによるハッシュキャッシュ（2026-10-16）
+
+対象: `ledger-stat-cache` worktree、製品コード・依存関係は変更なし。
+本体worktreeでの既存測定は台帳HIT 63秒、うちsource計算49.9秒・21,247件・59.1 GB
+（設計担当からの報告）。ignored `testimage/` を照合対象に残し、変更のないファイルの
+SHA-256再計算を省く。DLL識別子・成功台帳の形式・source manifestの形式は維持した。
+
+相対パス→サイズ・更新日時UTC ticks・作成日時UTC ticks・SHA-256・記録時刻を
+`target/test-lib-full/source-hashes-v1.tsv` に保存する。PowerShell 5.1向けに
+タブ区切りとDictionaryを使用し、パスはUnicodeやタブを壊さないBase64とした。
+サイズ/更新日時/作成日時が一致し、更新日時が記録時刻より2秒超古い場合だけ再利用する。
+記録時刻は内容を読む直前に採り、再利用時には更新しない。読み取り中にstatが変わった
+エントリは保存しない。入れ子repositoryも同じ経路を通る。
+通常ファイルのreparse pointはキャッシュせず従来どおり内容を読む。
+
+まれな失敗は既定の割り切り方針: キャッシュの読み書き・形式検証に失敗したら警告し、
+そのsource照合をキャッシュなしの全ハッシュで行う。自動再試行や回復状態は追加しない。
+壊れた原本は失敗処理で削除・再作成しない。`-Force` の明示実行は、キャッシュを読まず
+実行前後を全ハッシュし、正常に書ける場合は新しいキャッシュを保存する。
+
+### 再現用fixtureと検証
+
+```powershell
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/test-test-tools.ps1 -Benchmark
+```
+
+Windows PowerShell 5.1.26100.9711、使い捨てrepositoryに21,247ファイル×64 KiBを実生成。
+総量1,392,443,392 bytes（約1.39 GB）、20,000件はignored `testimage/flat/`、
+1,247件はignored `testimage/nested/` 内の入れ子repository。Cargo等の入力4件を合わせ
+source照合は21,251件。更新日時は1日前へ設定し、初回から非racy条件を満たす。
+OSのファイルキャッシュは消去していない。「キャッシュなし」は今回のSHA-256キャッシュを
+使わない意味であり、cold diskの測定ではない。台帳HITはPowerShell子プロセスの起動、
+source/env/native識別子、JUnit照合を含むwall時間を計測する。準備用の1件テスト実行は別枠。
+HIT各回はexit 0・同じsource・新規run directoryなしをassertする。
+
+最終測定（リンク非キャッシュ化・公開`-Force`回帰を含む未コミット差分）:
+
+| 対象 | 秒 |
+| --- | ---: |
+| source、キャッシュなし | 4.787 |
+| source、キャッシュ初回作成 | 5.096 |
+| source、キャッシュあり3回 | 2.993 / 2.975 / 2.980 |
+| 台帳HIT全体3回 | **3.770 / 3.736 / 3.752** |
+
+台帳HITは3回とも目標5秒以内。全条件でsource識別子は
+`cf1ae86b8b66ff0fe644a6668b6444de755b4ddca686d119de86be406e9f17b5`。
+最終コマンドは **exit 0、回帰全体PASS**。
+ログ: `target/stat-cache-regression-final.log`。
+fixture: `target/test-tools-regression-4e78bea217454978bac6c452d7f43dd1/target/stat-cache-benchmark/`。
+その`target/measurements.json`と`target/hit-{1,2,3}.log`に数値・source・HIT結果を保存した。
+初回も回帰PASS・台帳HIT 3.741〜3.842秒（`target/stat-cache-regression.log`）。
+上記2点のスクリプト追補によって検証条件が変わったため最終版で再実行した。
+
+回帰はキャッシュ有無の識別子一致、温まった入力の内容を読まないこと（排他ロックで検査）、
+内容/サイズ変更、古い更新日時へ戻したサイズ変更、作成日時のみの変更、racyな同サイズ編集、
+racyエントリの再照合、`ForceHash`、破損/切り詰め・キャッシュ読込/書込失敗を検査する。
+既存のGit index無変更、ignored/nested入力、削除、新規Unicodeパス、台帳HIT/MISS、
+native DLL追加/差替え/削除、環境、feature、失敗台帳、0件、focused選択の回帰も維持する。
+シンボリックリンク作成はこのsandboxでは権限不足のため、既存のnested file-link実検査はskip。
+変更した3本の`.ps1`はASCII以外0バイト、PowerShell 5.1の構文parseエラー0。
+`git diff --check`も成功。
+実装者とは別のGPT-6.1 Sol / xhighが3スクリプト・文書2本を独立レビューし、
+**P1/P2指摘なし**。最終ログ・source一致・測定値を突合し、テストは重複実行していない。
+
+### 検知範囲と引き継ぎ
+
+サイズ・更新日時・作成日時をすべて保った内容変更は、非racyなエントリでは検知できない。
+statを信頼するgitと同様の前提で、疑わしければ `test-lib-full.ps1 -Force` を使う。
+公開`-Force`経路にも、同stat編集が通常HITした後で全ハッシュしてMISSになる回帰を追加した。
+本体の59.1 GB・実画像での最終測定は利用者側の担当であり、この約1.39 GBのfixture値から
+本体の絶対時間は断定しない。スクリプトと文書だけの変更のため製品全体gate・確認用build・
+アプリ起動は行わない。
+
+コミットは行わず、次の論理単位で作業ツリーに残す。
+
+| 対象 | commitメッセージ案 |
+| --- | --- |
+| `scripts/test-tools-common.ps1`, `scripts/test-lib-full.ps1`, `scripts/test-test-tools.ps1` | `test: Cache source hashes by file stat for faster ledger hits` |
+| `docs/development-build-and-test.md`, `docs/test-speed-report.md` | `docs: Document stat-cache limits and ledger hit benchmarks` |
+
+
+## 停止テストの打ち切りと逐次ログ（§1.420、2026-10-23）
+
+nextest 0.9.148で、通常は`period = "60s", terminate-after = 5`（300秒）、
+priority 100の長い枠は`period = "120s", terminate-after = 5`（600秒）とする。
+初回ddcaf460aでは直近6回の本体libだけを根拠に5件を選んだが、これはfull gate全体の根拠として不十分だった。
+独立レビュー後にworkspace全targetとstandalone vendor 5実行、過去の本体lib JUnitを棚卸しし、
+成功実行で60秒超を確認した12件へ割当を修正した。[追補の表](#review1420)に秒数・graph・選定根拠を示す。
+通常300秒／長い枠600秒は維持し、grace-period等は変更しない。
+打ち切られたテストの原因は別に扱い、上限の延長やretryで成功させない。
+
+`Invoke-MivNextest`はstdout/stderrを同時に読み、受信した文字列をrun directoryへchunkごとにflushする。
+初回の行読みを独立レビュー後に文字読みへ変更し、LF／CRLF／末尾改行なしをそのまま保存する。
+終了前からSLOW行と名前を読める。終了時の末尾20行・exit code・JUnit集計・receipt条件は維持する。
+Gitの呼び出しは従来どおり全文のStdOut/StdErrを返す。
+
+
+### 初回ddcaf460aの変更ファイル
+
+| ファイル | 要点 |
+| --- | --- |
+| `.config/nextest.toml` | 通常300秒／既存の長い5件600秒の打ち切り、根拠コメント。priority等は維持 |
+| `scripts/test-tools-common.ps1` | nextestのstdout/stderrを同時に行読みし、runのlogへ逐次flush。Gitの全文戻り値を維持 |
+| `scripts/test-test-tools.ps1` | 終了前の両stream flush、終了後の全文・exit codeを実子processで検査 |
+| `src/pdf_loader.rs` | 製品の待ちループを受信1回の注入へ切り出し、3テストを回数の検査へ移行 |
+| `src/metadata_transfer.rs` | 内部batch時計を注入、既存2件の時計固定、499/500msと次batchのcommit検査を追加 |
+| `src/app/section375_tests.rs` | 製品と同じstack採用条件、自身のread完了待ち、監視通知の遅着を決定的に検査 |
+| `docs/development-build-and-test.md` | 警告のみの記述を打ち切り方針へ変更、時間・完了検査の方針を追記 |
+| `docs/test-speed-report.md` | 根拠、診断、実測、検証台帳、対象外失敗を記録 |
+
+### 実装と原因（§1.389の2026-10-23追記）
+
+- PDF: `src/pdf_loader.rs`の`wait_for_pool_reply`へ製品の50ms受信ループを移し、1回の受信だけを注入する。
+  Abortは未取消timeoutの次にcancelを立てたtimeoutで受信を打ち切ることを回数で検査する。
+  Harvestは取消後の複数timeout→reply、取消後timeout→disconnectを検査する。
+  従来の複製`mock_recv_loop`、別threadの30/50ms sleep、`<200ms`／`>=70ms`のassertは除去した。
+  製品のperfイベント、初回だけのharvest通知、reply優先、disconnectのエラーは従来どおり。
+- Metadata: 公開の`import_at`を維持し、内部の`import_at_with_clock`→`import_at_batched`へ
+  バッチ判定用時計を渡す。製品は`Instant::now`、2つのバッチ件数テストは固定した手動時計を使う。
+  新テストは499msでは未commit、500msで最初の3項目が別接続から見えることと、次batchの499msでは
+  まだcommitされないことを検査する。perfの`*_ms`は実時計のまま。
+  同ファイルの実時間によるバッチ判定はこの1か所で、直接`transaction_batches`を固定件数と比較する
+  既存テストは依頼の2件だけ。他の取消／途中読取り失敗は完了項目をterminalでcommitする結果を検査している。
+- Stack欠落: **テスト側**。変更前stress 15回で、通知競合・共有違反・Stack欠落が各1回、計3回失敗。
+  一時計測で欠落時に`start_loading_stack_items`の`prepare_visible_install`が`DocumentOpenBusy`を返すことを確認した。
+  製品の`render_other_worker_results`はsidecar復旧中のstack採用を止めているが、テストの`settle`は
+  その条件を省いていた。`settle`を同じ条件に揃えた。製品の一覧受付・退役は変更していない。
+- 共有違反: **外部削除を模擬するテストの同期不足**。通常の読取り記録だけでは再現せず、
+  WICの`CreateDecoderFromFilename`直前にパス別の記録を置き、同パスの読取り開始まで待って削除を重ねた。
+  30回×2件の60ケース中55ケースでos error 32を再現し、同時点の`active WIC reads=[decode_to_dynamic_image]`と
+  `FsPageLoadSchedulerStats { waiting: 0, running: 1, cancelling: 0 }`を確認した。
+  診断: `target/section375-delete-aligned-diag.log`（exit 100、意図的に競合を重ねた診断結果）。
+  本修正では2つの外部削除の直前に、既存schedulerのwaiting/running/cancellingが全て0になるまで待つ。
+  期限は既存の20秒、未到達は失敗。結果の採用やviewerの終了は行わない。
+- 製品削除での同型: WICのfilename読取りが削除共有なしで開く間、Shell削除でも一時的な共有違反は起こり得る。
+  `delete_worker.rs`の既存`recycle_chunk_with_retry`と`is_retryable_shell_failure`は共有違反／lockを扱う。
+  今回は製品のWIC・Shell削除・retryの挙動を変更していない。実UIで恒常的な削除失敗を観測したという意味ではない。
+- 監視通知: 実watcherの登録後に合成イベントを送って期限を現在へ戻しても、次pollの`collect()`に実OS通知が
+  遅着すると700msのdebounceを再設定する。テストは登録確認後の合成通知を別channelへ分離した。
+  実watcherの登録成功のassertと、戻った後の最初の物理変更が反映されるassertは保持した。
+  期限を現在へ戻した直後に2つ目の合成通知を入れ、debounce再設定で走査が始まらない状態も
+  明示的に検査する。最後の通知を受けた後に期限を進めるため、OSの配送時刻に依存しない。
+
+一時プローブと診断は除去済み。`src/lib.rs`、`src/app.rs`、`src/wic_decoder.rs`はHEADと内容差分0。
+起動／main一覧要求の受付・退役（§1.419）とdetached経路への製品修正はない。
+アプリ挙動を変更しないテスト・検証基盤の作業なので、アプリ検証用binaryのbuild／起動は行わない。
+commit・stage・merge・pushは行わない。
+
+### 打ち切りの実測（nextest 0.9.148）
+
+| 実行 | プローブの結果 | exit／後段 |
+| --- | --- | --- |
+| `test-lib-full.ps1 -Force`、生成`miv-tool`→`default`継承 | `zz_probe_terminate_after_hang`が300.417秒でTIMEOUT、JUnitに`failure type="test timeout"` | exit 100、receipt 0件 |
+| `test-full.ps1`、default | 同プローブが300.329秒でTIMEOUT、JUnitに同じfailure | exit 100、第1段で停止、doctest／vendor段は開始せず |
+| 小規模crate、生成`miv-tool`→defaultの長い5件override継承 | F4と同じ完全名のhangテストが600.039秒でTIMEOUT | exit 100、priority 100節のtimeout継承を実測 |
+
+本体libプローブのrunは`target/test-lib-full/runs/20261023T100432185Z-e078bdcb/`。
+`stderr.log` 1582行からSLOW、1586行にTERMINATING、1587行にTIMEOUTと名前を記録。
+`target/timeout-lib-live-observation.json`は終了前・JUnit未作成の時点で、当該SLOW行を読めた証拠。
+`target/timeout-lib-probe-evidence.json`はexit・JUnit失敗項目・receiptなしの照合結果。
+終了後の末尾20行表示も同じrunで確認した。
+全件は14,193成功／2失敗／1 TIMEOUT／64 skipped、830.674秒。
+2失敗は変更対象外のclipboard deadline（744.6247ms）とpage-turnの途中geometry assertionだった。
+
+full gateの証拠は`target/timeout-full-probe-j1.log`、
+`target/timeout-full-probe-j1.junit.xml`、`target/timeout-full-probe-j1-evidence.json`。
+15,500成功／21失敗／2 TIMEOUT／68 skipped、1,202.695秒。
+プローブの他にclipboard deadlineテストが300秒でTIMEOUTになった。
+この実行には途中から72本のCPU負荷と別のstress実行が重なっており、通常条件の全件成功とは扱わない。
+最初のfull gateはビルド並列時のos error 1455（mmap時のページングファイル不足、E0786）でテスト前に終了した。
+`CARGO_BUILD_JOBS=1`で準備を再開し、その後のgateも同じビルド並列数を使う。
+launcherの埋込み入力に必要なreleaseの3本は既存成果物を実コピーし、出所とSHA-256を
+`target/launcher-test-inputs.json`へ記録した。古い成果物の製品動作の検証や、起動はしていない。
+
+小規模overrideプローブの証拠は`target/timeout-override-probe/result.json`と
+同`target/test-lib-full/runs/20261023T094651535Z-019924b5/`のstderr／JUnit。
+長い5件の既存override、defaultのterminate-afterが`miv-tool`へ継承されたので、生成側の変更は不要だった。
+
+### スクリプト検証と別件
+
+`scripts/test-test-tools.ps1`に、子processがstdout/stderrへ書いてから親の通知を待つ検査を追加した。
+終了させる前に両logの内容を読み、終了後に戻り値の全文とexit 7を照合する。
+PowerShell 5.1 parse／ASCII検査は成功。既存Git／本物のnextestを使う回帰一式も成功
+（`target/test-tools-1420-final3.log`）。
+
+途中の同回帰では、3テストPASS・JUnit出力後のnextestが終了せず、子processなし・1 threadでCPUを
+使い続ける例を観測した。当該nextestだけを特定して停止した。記録は
+`target/nextest-post-summary-spin.json`と`target/test-tools-1420-final2.log`。
+テスト単位のtimeoutはnextest自身の終了後処理には適用されない。この現象の原因は未確定で、
+新しいwatchdogやretryは追加していない。次の回帰一式は同じコードで完走した。
+
+追加で実行した`test-release-build-safety.ps1`は、baseに既にあるegui-winitのstandaloneコマンドと、
+検査側の旧`-p egui-winit --lib`期待文字列の不一致で失敗した
+（`target/test-release-safety-1420.log`）。今回その2スクリプトは変更していない。
+
+<details>
+<summary>負荷中のfull gateで失敗／TIMEOUTした対象外22件</summary>
+
+- `mimageviewer app::tests::remote_video_opening_accepts_paused_metadata_player_with_clock_seek_pending`: assertion failed: app.remote_video_opening_for_test()
+- `mimageviewer app::tests::remote_video_stream_keeps_remote_dialog_without_entering_fullscreen`: assertion failed: app.remote_video_opening_for_test()
+- `mimageviewer app::tests::smart_folder_transition_tests::no_resident_smart_pdf_missing_root_row_rolls_back_history`: test failure with exit code 101
+- `mimageviewer app::tests::still_window_mode_key_tests::activation_received_after_return_before_ui_poll_opens_in_local`: assertion `left == right` failed / left: AcquiringRemote / right: RemoteActive
+- `mimageviewer app::tests::still_window_mode_key_tests::remote_acquire_cancels_archive_open_before_direct_or_converted_completion`: assertion `left == right` failed / left: AcquiringRemote / right: RemoteActive
+- `mimageviewer app::tests::still_window_mode_key_tests::remote_acquire_cancels_main_epub_modal_before_published_completion`: assertion `left == right` failed / left: AcquiringRemote / right: RemoteActive
+- `mimageviewer app::tests::still_window_mode_key_tests::remote_acquire_retires_main_path_classification_before_its_result_can_open`: assertion `left == right` failed / left: AcquiringRemote / right: RemoteActive
+- `mimageviewer app::tests::still_window_mode_key_tests::remote_acquire_retires_startup_resolves_and_rejects_new_activations`: assertion `left == right` failed / left: AcquiringRemote / right: RemoteActive
+- `mimageviewer app::tests::still_window_mode_key_tests::remote_acquire_closes_local_viewer_before_admitting_work_and_blocks_reopen`: assertion `left == right` failed / left: AcquiringRemote / right: RemoteActive
+- `mimageviewer app::tests::still_window_mode_key_tests::remote_session_acquire_closes_mounted_active_and_parked_live_media_at_position`: assertion `left == right` failed / left: AcquiringRemote / right: RemoteActive
+- `mimageviewer app::tests::still_window_mode_key_tests::remote_acquire_before_initial_display_opens_startup_path_after_local_return`: assertion `left == right` failed / left: AcquiringRemote / right: RemoteActive
+- `mimageviewer app::tests::still_window_mode_key_tests::remote_session_acquire_closes_local_progress_without_auto_resume`: assertion `left == right` failed / left: AcquiringRemote / right: RemoteActive
+- `mimageviewer app::tests::still_window_mode_key_tests::rename_migration_queue_runs_fifo_and_lands_on_final_path`: test failure with exit code 101
+- `mimageviewer app::tests::still_window_mode_key_tests::streaming_drain_and_reacquire_between_frames_do_not_restore_local_view`: assertion `left == right` failed / left: AcquiringRemote / right: RemoteActive
+- `mimageviewer app::viewport_retirement_tests::egui037_continuation_viewport_retirement_remote_close_retains_pin_dirty_for_grid_ui`: assertion `left == right` failed / left: AcquiringRemote / right: RemoteActive
+- `mimageviewer app::viewport_retirement_tests::viewport_retirement_remote_logic_waits_for_command_delivery_and_existing_save_ack`: assertion `left == right` failed / left: AcquiringRemote / right: RemoteActive
+- `mimageviewer app::viewport_retirement_tests::viewport_retirement_remote_full_and_discard_wait_for_outer_delivery`: assertion `left == right` failed / left: AcquiringRemote / right: RemoteActive
+- `mimageviewer filename_stack_ui::tests::a2_stack_failed_reads_reuse_grouping_with_bounded_wakes`: a later successful read converges without another write
+- `mimageviewer remote_ipc::ui::tests::section1373_remote_acquire_first_blocks_undo_then_expires_ready_receipt`: assertion `left == right` failed / left: AcquiringRemote / right: RemoteActive
+- `mimageviewer clipboard_capture::fetch::tests::total_deadline_covers_slow_headers_drip_bodies_and_redirect_remaining_time`: called `Result::unwrap()` on an `Err` value: Os { code: 10053, kind: ConnectionAborted, message: "確立された接続がホスト コンピューターのソウトウェアによって中止されました。" }
+- `mimageviewer ui_fullscreen::retained_material_entry_tests::retained_material_entry_conceal_uses_current_edit_stage_without_original_reload`: assertion failed: app.conceal_mode
+- `mimageviewer::archive_conversion_failure_diagnostics locked_zip_publish_reports_plain_message_and_native_error_without_overwrite`: called `Result::unwrap()` on an `Err` value: Os { code: 3, kind: NotFound, message: "指定されたパスが見つかりません。" }
+
+
+</details>
+
+依頼で範囲外とされたbook_structural_opの2件とclose_returnの1件は、このプローブの失敗一覧には無い。
+その他の対象外失敗もassertを弱めたりretryを追加したりせず、上記JSONに名前・元のstderrを保存した。
+
+
+### 最終コードの検証台帳（実装担当の検証完了）
+
+| 対象 | 結果 | 証拠 |
+| --- | --- | --- |
+| section375全体30件＋PDF/metadata対象6件、stress 50回 | 1,800実行成功、338.294秒、exit 0 | `target/final-focused-stress50.log`／`.exit` |
+| 監視通知テストに遅着イベントの状態検査を追加後、stress 50回 | 50成功、16.371秒、exit 0 | `target/final-watch-stress50.log`／`.exit` |
+| プローブなし`test-lib-full.ps1` | 14,195成功、0失敗、64 skipped、449.539秒、exit 0 | `target/test-lib-full/runs/20261023T105711758Z-3bf9521e/` |
+| プローブなし`test-full.ps1` | nextest計15,831成功、doctest段exit 0（実行対象0、既存ignored 3）、全段exit 0 | `target/final-test-full.log`／`target/final-test-full-evidence.json` |
+| CPU負荷72本＋Idle優先度の対象6件 | 各70回、計420実行成功。10 runner全てnextest exit 0 | `target/lowstress-final-test-completion-evidence.json` |
+
+本体libの成功receiptは`target/test-lib-full/4db513d4643b9b0d545b4b0e14f8e8e557257e73d92e56bc1df58d48fd25be0c.json`。
+source=`8dbfce82e97d7bf643cab933d1fb7cdd8f55d49a6a67505d30812723b3845d27`、
+featureなし／Cargo profile test／NextestProfile default（実行miv-tool継承）／`CARGO_BUILD_JOBS=1`。
+`cargo fmt`（引数なし）、`cargo fmt --check`、`git diff --check`は成功。
+一時コード除去のblob照合は`target/probe-removal-proof.json`。
+
+負荷確認の準備試行も保存した。指定の`lowrun.cmd`は72本負荷中にCargo metadata／列挙準備が
+Idleで進まず、test開始前に停止した（`target/lowstress-1420-preparation-aborted.txt`）。
+次の65回試行では準備をNormal、最初のiteration開始後にnextestをIdleへ下げ、子testのIdle継承を観測した。
+6件×65回は全て成功（`target/lowstress-1420b.log`、nextest exit 0）したが、別gateのI/O負荷も重なり
+metadataの最初の2回が93.302秒／74.705秒を要したため負荷を途中停止した。
+全期間の72本負荷を満たさず、必要な60回の負荷下成功には数えない。
+`target/lowstress-1420b.json`の`hog_alive_at_completion=false`もその区別を示す。
+停止した2組のhogは所有PIDを照合し、残存Python process 0件を確認した。
+
+
+### 最終負荷確認の条件と測定補助の訂正
+
+通常ゲート完了後、72本×900秒のbusy loopを先に起動し、対象6件を10 runner×`--stress-count 8`で実行した。
+最初のiterationの開始を観測して各nextestをIdleへ下げ、以降の子testがIdle（Windows priority class 64）を
+継承することをPID付きで記録した。各runnerの先頭1回は準備時の優先度が混ざるため除外した。
+残りは各テスト70回、計420実行で失敗0。先頭を含む全480実行も成功し、10 runner全てnextest exit 0。
+最長testは110.360秒。300秒のnextest上限・test内assert・retry設定は変更していない。
+ログは`target/lowstress-final-00.log`〜`09.log`、実行条件とpriority観測は`target/lowstress-final.json`。
+
+測定補助の初版は、**test終了ではなくnextestの後処理終了まで**hogが生きていることを要求していたため、
+補助scriptがexit 1・適合0回と誤判定した。各nextest自身は全てexit 0で、assert失敗はない。
+元の判定記録は書き換えず保存した。別集計
+`target/lowstress-final-test-completion-evidence.json`で、次の保守的な時刻の境界を照合した。
+
+- supervisor logの作成はhog起動より前なので、その作成時刻＋900秒はhog終了の最も早い境界になる。
+- Idleへ下げた観測時刻は最初のiteration開始より後なので、その時刻＋全8回のnextest実行時間は
+  最終test終了時刻の上限になる。
+- 全10 runnerの終了時刻上限が、最も早いhog終了境界より141.887秒以上早い。
+  途中の停止markerもなく、全testが900秒の負荷期間内に終わったことを確認した。
+
+負荷中のnextest表示では、適合420実行のうち79件が`leaky`として成功扱いになった。
+既定の判定値を変更・抑止していない。原因は切り分けておらず、通常条件の最終両ゲートにはこの表示はない。
+全hogの所有PIDを照合し、残存Python process 0件を確認した。
+
+`section1375_stack_self_delete_equal_opens_remaining_stack_after_image_or_folder`は、手元の変更前15回、
+修正後50回と全件のいずれでも失敗しなかった。元報告のfailure内容が無いため、その1件が
+Stack欠落と同じ原因だったかは確定していない。同じfixture／settle経路は修正対象だが、推定として区別する。
+
+最終の本体lib成功receiptは、vendor段と負荷確認の後にもsource／環境／native runtimeの全てが一致した
+（`target/final-receipt-validity.json`）。同じ条件の独立レビューではこの成功結果を再利用できる。
+独立レビュー／ClaudeCodeによる検収は別担当。追加の既存release script検査の不一致と、nextest自身の
+終了後停止の観測は上記の別件として残し、今回のテスト修正で解消したとは扱わない。
+
+<a id="review1420"></a>
+
+## 独立レビュー追補：full gateの全graphと出力文字列（2026-10-23）
+
+ddcaf460aからの修正。P2の棚卸し漏れを補い、長い枠は5件から12件へ変更した。
+設定は`.config/nextest.toml` 1本とし、1つのoverride節に`test(=<完全なテスト名>)`のORだけを書く。
+通常300秒／長い枠600秒とretry 0を維持し、12件はpriority 100で先行実行する。
+設計担当の指示でpackage／binary IDの限定とvendor設定の分割・drift検査を外した。
+同名テストにも600秒・priority 100が適用されることは許容する。全nextest段はルートの同じ設定を使う。
+`scripts/test-full.ps1`はddcaf460aと内容差分0に戻した。
+
+### 長時間テストの棚卸し
+
+対象はworkspaceの全package・補助bin・integrationと、standalone vendorのegui／egui-winit／
+egui-wgpu／eframe（wgpu・glow）。前回通常fullのworkspace JUnitは15,522実行・48非空binary、
+vendorは順に117／43／37／55／57成功だった。過去lib 21 JUnitと保存nextestログ2本、負荷が
+重なったfullも照合し、成功時に60秒を超えた次の12件を選んだ。
+
+| テスト（完全名） | graph／binary ID（観測時） | 選定時の最大実測秒数 | 割当 |
+| --- | --- | ---: | --- |
+| `app::folder_scan::section1375_scan_perf_tests::section1375_large_physical_scan_10k_100k` | workspace／mimageviewer | 429.813（過去lib） | 600秒・priority 100（既存） |
+| `raw::tests::all_cc0_samples_info_develop_and_preview_orientation` | workspace／mimageviewer | 296.577（過去lib） | 同上（既存） |
+| `ui_music_timeline::tests::key_synthetic_harmonic_major_minor_progressions_and_percussion_comparison` | workspace／mimageviewer | 232.435（過去lib） | 同上（既存） |
+| `ui_fullscreen::tests::still_seek_f4_screen_last_pixel_closes_strip_with_real_geometry` | workspace／mimageviewer | 135.884（過去lib） | 同上（既存） |
+| `video::tests::real_decoder_eof_full_loop_preserves_single_tail_burst_per_epoch` | workspace／mimageviewer | 81.017（過去lib） | 同上（既存） |
+| `tests::all_cc0_sample_dimensions_match` | workspace／libraw-sys | 187.755（負荷が重なったfull） | 同上（追加） |
+| `ui_fullscreen::canonical_demand::tests::canonical_native_demand_matches_actual_single_and_pair_draw_geometry` | workspace／mimageviewer | 66.370（libプローブ時） | 同上（追加） |
+| `book_append_undo::tests::section1373_metadata_database_cold_and_warm_per_file_benchmark` | workspace／mimageviewer | 112.430（過去lib） | 同上（追加） |
+| `app::music_bass::tests::music_bass_decode_success_orders_final_before_bass_and_lru_hit_still_computes` | workspace／mimageviewer | 86.688（過去lib） | 同上（追加） |
+| `app::rating_membership_tests::rating_undo_grid_keys_cancel_held_restore_on_moves_edges_and_empty_sets` | workspace／mimageviewer | 77.208（過去lib） | 同上（追加） |
+| `fts_writer_dispatcher::tests::dropping_the_dispatcher_always_returns` | workspace／mimageviewer | 96.089（負荷が重なったfull） | 同上（追加） |
+| `restart_warmup_preserves_correct_active_keys_for_four_signal_cases` | workspace／music-core::harmnet（integration） | 66.945（負荷が重なったfull） | 同上（追加） |
+
+原本・全binaryの件数／最長test・45秒超の記録は`target/review1420/duration-inventory.json`と
+`before-*.junit.xml`、過去ログのpath・SHA-256・行は`past-log-inventory.json`に保存した。
+選定時のvendor最長はegui 0.445秒、egui-winit 2.339秒、egui-wgpu 2.829秒、
+eframe/wgpuは全段1.312秒以下、eframe/glow 0.135秒で、長い枠の追加は無い。
+12件以外は過去libを含め成功時の最長58.490秒。負荷fullでTIMEOUTしたclipboard deadline等は
+成功時の長い処理とは扱わず、既報の失敗として別に扱う。上限延長・retry・ignoreで通さない。
+
+### 出力の文字列を保持する逐次保存
+
+P3はReadLineAsyncが落とした改行をAppendLine／WriteLineで付け直したことが原因だった。
+`scripts/test-tools-common.ps1`は両streamを専用char bufferへReadAsyncし、受信chunkをそのまま
+戻り値のbufferとlogへ書いてflushする。Git等のReadToEndAsync経路、exit code、末尾20行表示は維持する。
+`scripts/test-test-tools.ps1`で末尾改行なし・LF・CRLF・交互出力・約80KBのbuffer境界を、
+明示した期待値／ReadToEndAsync／逐次戻り値／disk logで照合する。終了前のSLOW行と部分出力も検査する。
+実nextestの終了前SLOW保存の証拠は`target/review1420/streaming-live-observation.json`。
+
+### 単一設定へ戻した最終検証
+
+証拠の保存先は`target/simplify1420/`。製品Rustコードの追加差分は0。
+`scripts/test-release-build-safety.ps1`は既存の古い期待値を現行のegui-winit manifest指定・
+eframe両backend・Cargo 8呼出しへ更新し、全nextest段がルート設定を使うことと各段失敗時の停止を検査する。
+
+全graphに同じルート設定と同じoverride式を渡す`cargo nextest list`がexit 0。
+workspaceでは観測上12件だけに一致し、vendorは各0件だった。
+
+| graph | list全件 | override一致 | full成功 | nextest秒数 |
+| --- | ---: | ---: | ---: | ---: |
+| workspace | 15,522 | 12 | 15,522 | 532.222 |
+| egui | 117 | 0 | 117 | 0.724 |
+| egui-winit | 43 | 0 | 43 | 2.321 |
+| egui-wgpu | 37 | 0 | 37 | 2.657 |
+| eframe-wgpu | 55 | 0 | 55 | 1.265 |
+| eframe-glow | 57 | 0 | 57 | 0.221 |
+
+- `test-release-build-safety.ps1`と`test-test-tools.ps1`は一式exit 0。同名のlog／exitファイルを保存。
+  出力5caseの文字列一致・終了前flush、全nextest段のルート設定使用と8呼出しの失敗時停止を含む。
+- PS 4本のPowerShell 5.1 parse／ASCII、`cargo fmt`（引数なし）、`cargo fmt --check`、`git diff --check`は成功。
+- `test-lib-full.ps1`は設定／script差分でMISSとなり、14,195成功／失敗0／64 skipped、443.102秒、exit 0。
+  全段後は同じ成功receiptのHITでexit 0（`receipt-hit.log`）。sourceとreceiptの完全ID・commandは`test-lib-full.log`。
+- `test-full.ps1`は全段exit 0、nextest計15,831成功／失敗0、全体の壁時計554.751秒。
+  doctest段もexit 0（実行対象0、既存ignored 3）。全graphでoverride外の60秒超成功は
+  0件だった。
+
+全出力は`test-full.log`、graph別JUnitは上書き前に`gate-*.junit.xml`へ保存した。
+列挙のcommand・一致した完全名は`override-matches.json`と`list-*.json`、集計は`final-evidence.json`。
+両gateはCARGO_BUILD_JOBS=1で順に実行し、fullだけNEXTEST_FINAL_STATUS_LEVEL=allで名前・時間を保存した。
+負荷用processは起動していない。20秒間隔のprocess観測は`gate-load-samples.json`に保存した。
+製品Rustコードの変更が無い設定／script／文書の修正なのでアプリ検証用binaryのbuild／起動は行わない。
+commit・stageはしていない。

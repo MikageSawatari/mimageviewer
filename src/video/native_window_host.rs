@@ -14,8 +14,8 @@ use windows::Win32::Graphics::DirectComposition::{IDCompositionDevice, IDComposi
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::Ime::{
-    CANDIDATEFORM, COMPOSITIONFORM, ImmGetContext, ImmReleaseContext, ImmSetCandidateWindow,
-    ImmSetCompositionWindow,
+    CANDIDATEFORM, COMPOSITIONFORM, CPS_CANCEL, ImmGetContext, ImmNotifyIME, ImmReleaseContext,
+    ImmSetCandidateWindow, ImmSetCompositionWindow, NI_COMPOSITIONSTR,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetCapture, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -25,6 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::NativeVideoPlacement;
+use super::native_diagnostics::{DiagnosticOutputId, DiagnosticSample, NativeDiagnostics};
 use super::native_window::{
     ForegroundClaimReport, NativeVideoWindow, NativeVideoWindowConfig, NativeVideoWindowEventSink,
     NativeVideoWindowSource,
@@ -34,6 +35,14 @@ use super::window_host_contract::{
 };
 
 mod hud_window;
+
+fn diagnostic_rect(rect: RECT) -> [i32; 4] {
+    [rect.left, rect.top, rect.right, rect.bottom]
+}
+
+pub(crate) fn hash_hud_regions(regions: &[RECT]) -> u64 {
+    hud_window::hash_regions_for_debug(regions)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum NativeHudWindowRequest {
@@ -148,6 +157,7 @@ pub(crate) enum NativeCursorIcon {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum NativeWindowIntent {
     ClaimTextInputFocus,
+    InterruptImeComposition,
     UpdateImeCursorArea {
         x: i32,
         y: i32,
@@ -158,6 +168,32 @@ pub(crate) enum NativeWindowIntent {
         icon: NativeCursorIcon,
         auto_hide_allowed: bool,
     },
+}
+
+fn native_ime_window_forms(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (COMPOSITIONFORM, CANDIDATEFORM) {
+    let area = RECT {
+        left: x,
+        top: y,
+        right: x + width.max(1),
+        bottom: y + height.max(1),
+    };
+    let candidate_form = CANDIDATEFORM {
+        dwIndex: 0,
+        dwStyle: windows::Win32::UI::Input::Ime::CFS_EXCLUDE,
+        ptCurrentPos: POINT { x, y },
+        rcArea: area,
+    };
+    let composition_form = COMPOSITIONFORM {
+        dwStyle: windows::Win32::UI::Input::Ime::CFS_POINT,
+        ptCurrentPos: POINT { x, y: area.bottom },
+        rcArea: area,
+    };
+    (composition_form, candidate_form)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -261,12 +297,106 @@ pub(crate) struct NativeWindowHost {
     last_logged_region_hash: Option<u64>,
     last_region_hash: Option<u64>,
     last_regions_empty: bool,
+    diagnostics: NativeDiagnostics,
     #[cfg(test)]
     focus_claim_probe: Option<Arc<std::sync::atomic::AtomicUsize>>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 impl NativeWindowHost {
+    /// Production HWNDs without either ShowWindow path. Used only by pump
+    /// handler regressions; no DComp targets or application profile are opened.
+    #[cfg(test)]
+    pub(crate) fn create_hidden_for_geometry_test(
+        epoch: u64,
+        presenter_sink: NativeVideoWindowEventSink,
+        hud_sink: NativeVideoWindowEventSink,
+        with_hud: bool,
+    ) -> Self {
+        let rect = RECT {
+            left: -2000,
+            top: -2000,
+            right: -1680,
+            bottom: -1820,
+        };
+        let presenter = NativeVideoWindow::create(NativeVideoWindowConfig {
+            mode: super::native_window::NativeVideoWindowMode::Borderless { rect },
+            owner_hwnd: 0,
+            initially_visible: false,
+            activate_on_show: false,
+            close_on_escape: false,
+            event_sink: Some(presenter_sink),
+            generation: epoch,
+        })
+        .expect("hidden production presenter");
+        let windows = if with_hud {
+            let regions = Arc::new(std::sync::Mutex::new(
+                hud_window::HudInteractiveRegions::default(),
+            ));
+            let hud = hud_window::HudOverlayWindow::create_hidden_for_test(
+                hud_window::HudOverlayConfig {
+                    owner_hwnd: presenter.hwnd(),
+                    x: rect.left,
+                    y: rect.top,
+                    width: 320,
+                    height: 180,
+                    event_sink: hud_sink,
+                    regions: Arc::clone(&regions),
+                },
+            )
+            .expect("hidden production HUD");
+            NativeOwnedWindows::PresenterAndHud {
+                presenter,
+                hud,
+                regions,
+            }
+        } else {
+            NativeOwnedWindows::PresenterOnly { presenter }
+        };
+        Self {
+            windows,
+            affinity: WindowThreadAffinity::current(),
+            editor_ui_snapshot: None,
+            main_hwnd_for_raise: 0,
+            last_logged_region_hash: None,
+            last_region_hash: None,
+            last_regions_empty: true,
+            diagnostics: NativeDiagnostics::new(
+                DiagnosticOutputId::default(),
+                epoch,
+                "hud",
+                "pump",
+            ),
+            focus_claim_probe: None,
+            _not_send_or_sync: PhantomData,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hud_geometry_attempts_for_test(&self) -> usize {
+        match &self.windows {
+            NativeOwnedWindows::PresenterAndHud { hud, .. } => hud.geometry_probe_for_test(),
+            _ => 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hud_position_notifications_for_test(&self) -> usize {
+        match &self.windows {
+            NativeOwnedWindows::PresenterAndHud { hud, .. } => {
+                hud.position_notifications_for_test()
+            }
+            _ => 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_hud_geometry_failure_for_test(&self, query: bool, apply: bool) {
+        if let NativeOwnedWindows::PresenterAndHud { hud, .. } = &self.windows {
+            hud.inject_geometry_failure_for_test(query, apply);
+        }
+    }
+
     pub(crate) fn create(config: NativeWindowHostConfig) -> Result<Self, String> {
         let affinity = WindowThreadAffinity::current();
         let generation = config.window.generation;
@@ -318,6 +448,12 @@ impl NativeWindowHost {
             last_logged_region_hash: None,
             last_region_hash: None,
             last_regions_empty: true,
+            diagnostics: NativeDiagnostics::new(
+                DiagnosticOutputId::default(),
+                generation,
+                "hud",
+                "pump",
+            ),
             #[cfg(test)]
             focus_claim_probe: None,
             _not_send_or_sync: PhantomData,
@@ -329,6 +465,123 @@ impl NativeWindowHost {
     #[track_caller]
     fn assert_owner_thread(&self) {
         self.affinity.assert_current();
+    }
+
+    pub(crate) fn bind_diagnostics(&mut self, output: DiagnosticOutputId, epoch: u64) {
+        self.diagnostics = NativeDiagnostics::new(output, epoch, "hud", "pump");
+        self.diagnostics.snapshot("host", || {
+            let sample = DiagnosticSample::new()
+                .u64("presenter_hwnd", self.hwnd().0 as usize as u64)
+                .u64("hud_hwnd", self.hud_hwnd())
+                .bool("has_hud", self.has_hud())
+                .text(
+                    "topology",
+                    if self.has_hud() {
+                        "presenter_and_hud"
+                    } else {
+                        "presenter_only"
+                    },
+                )
+                .bool(
+                    "presenter_visible",
+                    unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.hwnd())
+                    }
+                    .as_bool(),
+                );
+            if let NativeOwnedWindows::PresenterAndHud { hud, .. } = &self.windows {
+                sample
+                    .bool(
+                        "hud_visible",
+                        unsafe {
+                            windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hud.hwnd())
+                        }
+                        .as_bool(),
+                    )
+                    .bool(
+                        "initial_region_applied",
+                        hud.applied_regions_hash().is_some(),
+                    )
+                    .u64(
+                        "initial_region_hash",
+                        hud.applied_regions_hash().unwrap_or(0),
+                    )
+            } else {
+                sample
+            }
+        });
+        self.sample_diagnostic_windows();
+    }
+
+    pub(crate) fn diagnostics(&self) -> &NativeDiagnostics {
+        &self.diagnostics
+    }
+
+    pub(crate) fn sample_diagnostic_windows(&self) {
+        self.sample_diagnostic_windows_with_hud_rect(None);
+    }
+
+    // Outer None requests a fresh periodic/create observation; Some(None)
+    // preserves a known query failure without querying again for diagnostics.
+    fn sample_diagnostic_windows_with_hud_rect(&self, hud_rect: Option<Option<RECT>>) {
+        if !self.diagnostics.is_enabled() {
+            return;
+        }
+        for (role, hwnd) in [
+            ("presenter_window", self.hwnd()),
+            ("hud_window", HWND(self.hud_hwnd() as *mut _)),
+        ] {
+            if hwnd.0.is_null() {
+                self.diagnostics.snapshot(role, || {
+                    DiagnosticSample::new()
+                        .u64("hwnd", 0)
+                        .bool("present", false)
+                        .bool("visible", false)
+                });
+                continue;
+            }
+            self.diagnostics.snapshot(role, || unsafe {
+                use windows::Win32::Graphics::Gdi::{
+                    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, MonitorFromWindow,
+                };
+                let mut window = RECT::default();
+                let mut client = RECT::default();
+                let window_ok = if role == "hud_window" {
+                    match hud_rect {
+                        Some(Some(rect)) => {
+                            window = rect;
+                            true
+                        }
+                        Some(None) => false,
+                        None => GetWindowRect(hwnd, &mut window).is_ok(),
+                    }
+                } else {
+                    GetWindowRect(hwnd, &mut window).is_ok()
+                };
+                let client_ok = GetClientRect(hwnd, &mut client).is_ok();
+                let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                let mut info = MONITORINFOEXW::default();
+                info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+                let monitor_ok = GetMonitorInfoW(monitor, &mut info.monitorInfo).as_bool();
+                DiagnosticSample::new()
+                    .u64("hwnd", hwnd.0 as usize as u64)
+                    .bool("present", true)
+                    .bool(
+                        "visible",
+                        windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool(),
+                    )
+                    .bool("window_query_ok", window_ok)
+                    .rect("window_rect", diagnostic_rect(window))
+                    .bool("client_query_ok", client_ok)
+                    .rect("client_rect", diagnostic_rect(client))
+                    .u64("dpi", u64::from(GetDpiForWindow(hwnd)))
+                    .u64("monitor", monitor.0 as usize as u64)
+                    .bool("monitor_query_ok", monitor_ok)
+                    .rect("monitor_rect", diagnostic_rect(info.monitorInfo.rcMonitor))
+                    .rect("work_rect", diagnostic_rect(info.monitorInfo.rcWork))
+                    .wide("monitor_device", info.szDevice)
+            });
+        }
     }
 
     fn presenter(&self) -> &NativeVideoWindow {
@@ -450,6 +703,7 @@ impl NativeWindowHost {
             last_logged_region_hash,
             last_region_hash,
             last_regions_empty,
+            diagnostics,
             #[cfg(test)]
             focus_claim_probe,
             _not_send_or_sync,
@@ -461,11 +715,18 @@ impl NativeWindowHost {
                 HostWindowTopology::PresenterAndHud,
             ) => windows,
             (
-                NativeOwnedWindows::PresenterAndHud { presenter, .. },
+                NativeOwnedWindows::PresenterAndHud { presenter, hud, .. },
                 HostWindowTopology::PresenterOnly,
-            ) => NativeOwnedWindows::PresenterOnly { presenter },
+            ) => {
+                diagnostics.event("hud_window_retired", || {
+                    DiagnosticSample::new()
+                        .u64("hwnd", hud.hwnd().0 as usize as u64)
+                        .text("reason", "topology_removed")
+                });
+                NativeOwnedWindows::PresenterOnly { presenter }
+            }
         };
-        Self {
+        let this = Self {
             windows,
             affinity,
             editor_ui_snapshot,
@@ -473,10 +734,27 @@ impl NativeWindowHost {
             last_logged_region_hash,
             last_region_hash,
             last_regions_empty,
+            diagnostics,
             #[cfg(test)]
             focus_claim_probe,
             _not_send_or_sync,
-        }
+        };
+        this.diagnostics.snapshot("host", || {
+            DiagnosticSample::new()
+                .u64("presenter_hwnd", this.hwnd().0 as usize as u64)
+                .u64("hud_hwnd", this.hud_hwnd())
+                .bool("has_hud", this.has_hud())
+                .text(
+                    "topology",
+                    if this.has_hud() {
+                        "presenter_and_hud"
+                    } else {
+                        "presenter_only"
+                    },
+                )
+        });
+        this.sample_diagnostic_windows();
+        this
     }
 
     pub(crate) fn hwnd(&self) -> HWND {
@@ -615,40 +893,45 @@ impl NativeWindowHost {
                         ],
                     );
                 }
+                NativeWindowIntent::InterruptImeComposition => self.interrupt_ime_composition(),
                 NativeWindowIntent::UpdateImeCursorArea {
                     x,
                     y,
                     width,
                     height,
                 } => {
-                    let area = RECT {
-                        left: x,
-                        top: y,
-                        right: x + width.max(1),
-                        bottom: y + height.max(1),
-                    };
-                    let candidate_form = CANDIDATEFORM {
-                        dwIndex: 0,
-                        dwStyle: windows::Win32::UI::Input::Ime::CFS_EXCLUDE,
-                        ptCurrentPos: POINT { x, y },
-                        rcArea: area,
-                    };
-                    let composition_form = COMPOSITIONFORM {
-                        dwStyle: windows::Win32::UI::Input::Ime::CFS_POINT,
-                        ptCurrentPos: POINT { x, y: area.bottom },
-                        rcArea: area,
-                    };
-                    unsafe {
-                        let hwnd = self.hwnd();
-                        let himc = ImmGetContext(hwnd);
-                        if !himc.0.is_null() {
-                            let _ = ImmSetCompositionWindow(himc, &composition_form);
-                            let _ = ImmSetCandidateWindow(himc, &candidate_form);
-                            let _ = ImmReleaseContext(hwnd, himc);
-                        }
-                    }
+                    self.update_ime_cursor_area(x, y, width, height);
                 }
                 NativeWindowIntent::SetCursorPolicy { .. } => {}
+            }
+        }
+    }
+
+    fn interrupt_ime_composition(&self) {
+        self.assert_owner_thread();
+        // The same presenter HWND owns keyboard/IME input and cursor updates.
+        // Cancelling the current HIMC does not disable subsequent composition.
+        unsafe {
+            let hwnd = self.hwnd();
+            let himc = ImmGetContext(hwnd);
+            if !himc.0.is_null() {
+                if !ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0).as_bool() {
+                    crate::logger::log("native IME composition interrupt failed");
+                }
+                let _ = ImmReleaseContext(hwnd, himc);
+            }
+        }
+    }
+
+    fn update_ime_cursor_area(&self, x: i32, y: i32, width: i32, height: i32) {
+        let (composition_form, candidate_form) = native_ime_window_forms(x, y, width, height);
+        unsafe {
+            let hwnd = self.hwnd();
+            let himc = ImmGetContext(hwnd);
+            if !himc.0.is_null() {
+                let _ = ImmSetCompositionWindow(himc, &composition_form);
+                let _ = ImmSetCandidateWindow(himc, &candidate_form);
+                let _ = ImmReleaseContext(hwnd, himc);
             }
         }
     }
@@ -711,14 +994,78 @@ impl NativeWindowHost {
         self.assert_owner_thread();
         if let NativeOwnedWindows::PresenterAndHud { hud, .. } = &self.windows {
             hud.set_visible(visible);
+            self.diagnostics.count("hud_hwnd_visibility_requested", 1);
+            self.diagnostics.snapshot("hwnd_visibility", || {
+                DiagnosticSample::new().bool("requested", visible).bool(
+                    "actual",
+                    unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hud.hwnd()) }
+                        .as_bool(),
+                )
+            });
         }
     }
 
-    pub(crate) fn set_hud_geometry(&self, x: i32, y: i32, width: u32, height: u32) {
+    pub(crate) fn set_hud_geometry(
+        &self,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        origin: &'static str,
+    ) {
         self.assert_owner_thread();
+        self.diagnostics.count(origin, 1);
+        let mut sampled_hud_rect = None;
         if let NativeOwnedWindows::PresenterAndHud { hud, .. } = &self.windows {
-            hud.set_geometry(x, y, width, height);
+            let result = hud.set_geometry(x, y, width, height);
+            self.diagnostics.count("geometry_requested", 1);
+            self.diagnostics.count(result.outcome, 1);
+            self.diagnostics.count(
+                "geometry_query_failed",
+                u64::from(result.before.is_none() && result.outcome != "no_hwnd"),
+            );
+            self.diagnostics.count(
+                "geometry_apply_attempt",
+                u64::from(matches!(result.outcome, "applied" | "apply_failed")),
+            );
+            if self.diagnostics.is_enabled() {
+                let mut after = RECT::default();
+                let after_ok = if matches!(result.outcome, "applied" | "apply_failed") {
+                    unsafe { GetWindowRect(hud.hwnd(), &mut after) }.is_ok()
+                } else if let Some(before) = result.before {
+                    after = before;
+                    true
+                } else {
+                    false
+                };
+                self.diagnostics.count(
+                    "geometry_actual_changed",
+                    u64::from(after_ok && result.before.is_some_and(|before| before != after)),
+                );
+                self.diagnostics.count(
+                    "geometry_actual_unchanged",
+                    u64::from(after_ok && result.before == Some(after)),
+                );
+                self.diagnostics.count(
+                    "geometry_actual_unknown",
+                    u64::from(!after_ok || result.before.is_none()),
+                );
+                sampled_hud_rect = Some(after_ok.then_some(after));
+                self.diagnostics.event("geometry", || {
+                    DiagnosticSample::new()
+                        .text("origin", origin)
+                        .text("outcome", result.outcome)
+                        .rect("requested", diagnostic_rect(result.requested))
+                        .bool("before_known", result.before.is_some())
+                        .rect("before", diagnostic_rect(result.before.unwrap_or_default()))
+                        .bool("after_known", after_ok)
+                        .rect("after", diagnostic_rect(after))
+                });
+            }
+        } else {
+            self.diagnostics.count("geometry_no_hud", 1);
         }
+        self.sample_diagnostic_windows_with_hud_rect(sampled_hud_rect);
     }
 
     pub(crate) fn set_editor_ui_snapshot(
@@ -735,16 +1082,34 @@ impl NativeWindowHost {
     }
 
     pub(crate) fn foreground_allows_hud_raise(&self, require_editor_snapshot: bool) -> bool {
+        self.hud_raise_foreground_decision(require_editor_snapshot)
+            .allowed
+    }
+
+    fn hud_raise_foreground_decision(
+        &self,
+        require_editor_snapshot: bool,
+    ) -> super::dsp::HudRaiseForegroundDecision {
         self.assert_owner_thread();
         if !self.has_hud() {
-            return false;
+            return super::dsp::HudRaiseForegroundDecision {
+                allowed: false,
+                foreground_hwnd: 0,
+                classification: "no_hud",
+            };
         }
         let editor_snapshot = match self.editor_ui_snapshot.as_ref() {
             Some(snapshot) => super::dsp::read_editor_ui_snapshot(snapshot),
-            None if require_editor_snapshot => return false,
+            None if require_editor_snapshot => {
+                return super::dsp::HudRaiseForegroundDecision {
+                    allowed: false,
+                    foreground_hwnd: 0,
+                    classification: "no_editor_snapshot",
+                };
+            }
             None => Arc::new(super::dsp::EditorUiSnapshot::default()),
         };
-        crate::video::dsp::foreground_allows_hud_raise(
+        crate::video::dsp::hud_raise_foreground_decision(
             self.hwnd().0 as usize as u64,
             self.hud_hwnd(),
             self.main_hwnd_for_raise,
@@ -779,16 +1144,30 @@ impl NativeWindowHost {
         probe
     }
 
-    pub(crate) fn try_raise_hud_to_top(&self) -> bool {
+    pub(crate) fn try_raise_hud_to_top(&self) -> &'static str {
         self.assert_owner_thread();
-        if !self.foreground_allows_hud_raise(true) {
-            return false;
+        let decision = self.hud_raise_foreground_decision(true);
+        self.diagnostics.snapshot("raise_foreground", || {
+            DiagnosticSample::new()
+                .bool("allowed", decision.allowed)
+                .u64("foreground_hwnd", decision.foreground_hwnd)
+                .text("classification", decision.classification)
+        });
+        if !decision.allowed {
+            return match decision.classification {
+                "no_hud" => "raise_no_hud",
+                "no_editor_snapshot" => "raise_no_snapshot",
+                _ => "raise_foreground_denied",
+            };
         }
         if let NativeOwnedWindows::PresenterAndHud { hud, .. } = &self.windows {
-            hud.raise_to_top();
-            return true;
+            return if hud.raise_to_top() {
+                "raise_applied"
+            } else {
+                "raise_apply_failed"
+            };
         }
-        false
+        "raise_no_hud"
     }
 
     pub(crate) fn apply_hud_regions(
@@ -816,27 +1195,50 @@ impl NativeWindowHost {
         if let Ok(mut guard) = shared_regions.lock() {
             guard.regions = regions.to_vec();
         }
-        hud.apply_regions(regions);
+        let before = hud.applied_regions_hash();
+        let outcome = hud.apply_regions(regions);
+        self.diagnostics.count("region_published", 1);
+        self.diagnostics.count(outcome, 1);
+        self.diagnostics.count(
+            "region_apply_attempt",
+            u64::from(matches!(outcome, "region_applied" | "region_apply_failed")),
+        );
+        self.diagnostics.snapshot("region_applied", || {
+            DiagnosticSample::new()
+                .u64("published_hash", new_hash)
+                .u64("count", regions.len() as u64)
+                .bool("empty", regions.is_empty())
+                .text("outcome", outcome)
+                .bool("before_hash_known", before.is_some())
+                .u64("before_hash", before.unwrap_or(0))
+                .bool("applied_hash_known", hud.applied_regions_hash().is_some())
+                .u64("applied_hash", hud.applied_regions_hash().unwrap_or(0))
+        });
         if self.last_region_hash != Some(new_hash) {
-            crate::perf::event(
-                "native_presenter",
-                "hud_region_publish",
-                None,
-                0,
-                &[
-                    ("region_hash", serde_json::Value::from(new_hash)),
-                    (
-                        "region_count",
-                        serde_json::Value::from(regions.len() as i64),
-                    ),
-                    ("regions_empty", serde_json::Value::from(regions.is_empty())),
-                    (
-                        "was_empty",
-                        serde_json::Value::from(self.last_regions_empty),
-                    ),
-                    ("toast_active", serde_json::Value::from(toast_active)),
-                ],
-            );
+            if crate::perf::is_enabled() {
+                let (output_id, window_epoch) = self.diagnostics.correlation_key();
+                crate::perf::event(
+                    "native_presenter",
+                    "hud_region_publish",
+                    None,
+                    0,
+                    &[
+                        ("output_id", serde_json::Value::from(output_id)),
+                        ("window_epoch", serde_json::Value::from(window_epoch)),
+                        ("region_hash", serde_json::Value::from(new_hash)),
+                        (
+                            "region_count",
+                            serde_json::Value::from(regions.len() as i64),
+                        ),
+                        ("regions_empty", serde_json::Value::from(regions.is_empty())),
+                        (
+                            "was_empty",
+                            serde_json::Value::from(self.last_regions_empty),
+                        ),
+                        ("toast_active", serde_json::Value::from(toast_active)),
+                    ],
+                );
+            }
             self.last_region_hash = Some(new_hash);
             self.last_regions_empty = regions.is_empty();
         }
@@ -962,6 +1364,49 @@ fn log_detached_native_set_window_pos(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_ime_forms_keep_cursor_exclusion_and_composition_below_the_cursor() {
+        let (composition, candidate) = native_ime_window_forms(-3, 9, 4, 18);
+        assert_eq!(
+            composition.dwStyle,
+            windows::Win32::UI::Input::Ime::CFS_POINT
+        );
+        assert_eq!(
+            (composition.ptCurrentPos.x, composition.ptCurrentPos.y),
+            (-3, 27)
+        );
+        assert_eq!(candidate.dwIndex, 0);
+        assert_eq!(
+            candidate.dwStyle,
+            windows::Win32::UI::Input::Ime::CFS_EXCLUDE
+        );
+        assert_eq!(
+            (candidate.ptCurrentPos.x, candidate.ptCurrentPos.y),
+            (-3, 9)
+        );
+        for area in [composition.rcArea, candidate.rcArea] {
+            assert_eq!(
+                (area.left, area.top, area.right, area.bottom),
+                (-3, 9, 1, 27)
+            );
+        }
+    }
+
+    #[test]
+    fn native_ime_forms_keep_the_existing_one_physical_pixel_minimum() {
+        let (composition, candidate) = native_ime_window_forms(10, 20, 0, -2);
+        assert_eq!(
+            (composition.ptCurrentPos.x, composition.ptCurrentPos.y),
+            (10, 21)
+        );
+        for area in [composition.rcArea, candidate.rcArea] {
+            assert_eq!(
+                (area.left, area.top, area.right, area.bottom),
+                (10, 20, 11, 21)
+            );
+        }
+    }
 
     macro_rules! assert_not_impl_any {
         ($ty:ty: $trait:path) => {

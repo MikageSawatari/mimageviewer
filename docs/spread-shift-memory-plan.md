@@ -536,7 +536,7 @@ Web の rendition key には既存の partner/slot と受入済み layout identi
 | writer / 終了 / maintenance | App所有service一つ。通常は専用worker、共通保守期間だけ §4.1 のleaseを渡す。`rename_migration_writers_busy`（`src/app.rs:45417`）にも未完了command/未消費成功結果を登録し、旧key write後の移行を保証。通常close/forkでは閉じない。正常process終了は §6.1 のdrain→接続close→process側join。未消費成功reply/内容ID観測も保守開始前に完了 |
 | `rename_key_migration::STORES`（`src/rename_key_migration.rs:939`） | `spread_shift.db / spread_shifts / path / unique=true / KeepDrive / OptionalInLegacySchema` を登録（constructorは `:914`）。未作成ファイル/保守probeの欠落tableは正常不在。serviceが検出した不正DBは §4.4。対象descriptorのlogical slash-family capabilityも登録 |
 | root 改名・アプリ内 folder 移動 / copy | 永続storeのexact + `/` + `::` の既存 family 処理。相対 payload は root 改名では不変。destination があれば既存 conflict 規則を守る。rootの永続移行は開いているcontextの参照元・items・shift scopeを移さない（2026-10-11決定、§11.6） |
-| 個別画像の改名 / 製本順替え | key だけでなく payload の RelativePath を同じ旧→最終 path mapping で変換。しおりの mapping（`src/book_bookmarks.rs:1102`）を共有。scope 内だけ更新、scope 外移動は旧本の Missing を保持し、新本へ shift を勝手にコピーしない |
+| 個別画像の改名 / 製本順替え | key だけでなく payload の RelativePath を同じ旧→最終 path mapping で変換。しおりの mapping（`src/book_bookmarks.rs:1102`）を共有。scope 内だけ更新。汎用の scope 外移動は旧本の Missing を保持する。製本の別本移動だけは本操作の service 要求内で元本の anchor row を外す（2026-10-21 決定、[本のキー移行計画 §3.10](book-key-migration-plan.md)）。新本へ shift はコピーしない |
 | 外部 folder move / rename | Folder は内容 ID 非対応（`src/content_identity.rs:62`）。shift の新 sidecar を作らず、既存 per-book spread と同じく明示 metadata export/import を案内。旧 DB 行は保持。アプリ内移動との違いを明記 |
 | 書庫/PDF/EPUB 外部移動・内容 ID restore | 論理元 root の observation と既存 copy/probe に参加。成功Setとimportのcommit済追加/置換が捕捉rootへEditを送る（下記）。destination既存値は上書きしない。shiftは元rootのexact/slash-familyだけをコピーし、cacheの物理base spreadや既存source/cache四面mappingは別descriptorのまま |
 | 本/root の実削除・明示 purge | STORES の同じ hard purge に参加。ページ一枚の削除では親 shift を削らず Missing とする。cache の容量回収は元本の shift を purge しない |
@@ -877,6 +877,10 @@ snapshot test processだけを終了し、全155件を直列で成功確認し�
 commit・製品起動・実機受入・修正後の独立レビュー合格は行っていない／主張しない。
 
 ### 11.6 D2c: root追従と同本pending-open直列化の撤去（2026-10-11利用者決定）
+
+2026-10-21 の §1.272 追補では、[本のキー移行計画](book-key-migration-plan.md) §3.10
+により未採用 open 中の構造要求を同本・別本とも拒否する契約へ変更した。実装・検証は同計画 §8.8。
+下記は当時の撤去記録であり、root 追従・live reopen を追加しない境界は引き続き維持する。
 
 利用者は、名前変更後に開いている窓を追従させる機能を§1.364へ含めないと決定した。
 source inspectionの比較基点はmaster `02079f95d`。製本root改名後、main一覧は旧pathを再読込し、

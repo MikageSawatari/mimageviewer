@@ -448,7 +448,7 @@ impl NowPlaying {
             return;
         }
         self.core.active.store(active, Ordering::Release);
-        let mut state = self.core.state.lock().unwrap();
+        let state = self.core.state.lock().unwrap();
         if !active {
             state.cancel();
             self.core.queue.0.lock().unwrap().pending = None;

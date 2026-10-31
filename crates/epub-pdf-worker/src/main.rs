@@ -819,14 +819,8 @@ mod tests {
 
     #[test]
     fn redirected_cleanup_leaves_nonempty_requested_folder() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let folder = std::env::temp_dir().join(format!(
-            "miv-epub-cleanup-test-{}-{unique}",
-            std::process::id()
-        ));
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("user-data");
         fs::create_dir(&folder).unwrap();
         let content = folder.join("nested");
         fs::create_dir(&content).unwrap();

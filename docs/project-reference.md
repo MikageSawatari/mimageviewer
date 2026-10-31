@@ -5,8 +5,8 @@
 ## Tech Stack
 
 - **Language**: Rust (edition 2024, stable MSVC toolchain)
-- **GUI**: eframe 0.33 + egui 0.33 (wgpu backend)
-- **Image decoding**: `image` crate (PNG, GIF, WebP, BMP) + `turbojpeg` (JPEG, libjpeg-turbo SIMD) + WIC (HEIC, AVIF, JXL, TIFF) + LibRaw (RAW、CDDL-1.0、静的リンク)
+- **GUI**: eframe 0.37 + egui 0.37 (wgpu 30 backend)。Rust 1.99 を `rust-toolchain.toml` で固定 (MSRV 1.95)
+- **Image decoding**: `image` crate (PNG, GIF, WebP, BMP) + `turbojpeg` (JPEG, libjpeg-turbo SIMD) + libavif + dav1d + libyuv (AVIF、静的リンク) + WIC (HEIC, JXL, TIFF) + LibRaw (RAW、CDDL-1.0、静的リンク)
 - **JPEG 高速デコード**: `turbojpeg` クレート (libjpeg-turbo スタティックリンク、SIMD 最適化)。サムネ生成時は **DCT スケール (1/8〜1/1)** で decode して 5-30MB カメラ JPEG を 2.5-6× 高速化 ([docs/dct-scale-plan.md](dct-scale-plan.md))。圧縮入力 128MB 超は image クレート / WIC chain にフォールバック (並列ワーカー × 圧縮 buffer の積算メモリ圧迫を回避)。ビルドに cmake + NASM が必要。
 - **Parallel loading**: `rayon` (dedicated thread pool per folder load)
 - **Thumbnail cache**: SQLite via `rusqlite` (bundled), WebP encoding via `webp` crate
@@ -17,8 +17,8 @@
 - **EPUB conversion**: `crates/epub-pdf-worker` が WebView2 で DRM のない EPUB を PDF 化する。配布ビルドでは `mimageviewer-epub-pdf.exe` を署名後に launcher へ内包し、core と同じ versioned runtime へ展開する。portable 版は core exe の隣に loose 同梱する
 - **Music-video editor**: `crates/musicvideo-editor` の `mimageviewer-musicvideo.exe` も署名後に launcher へ内包し、core の隣へ展開する。portable は専用 target でビルドして loose 同梱する。未保存の編集を保護するため、build スクリプトはエディタを停止せず、出力先のエディタが稼働中なら保存・終了を求めて中止する
 - **PDF password**: `windows-dpapi` crate (DPAPI 暗号化でパスワード永続保存)
-- **AI upscaling**: `ort` crate (ONNX Runtime v2、`load-dynamic` モード、`directml` + `cuda` + `tensorrt` features)。Real-ESRGAN / Real-CUGAN / NMKD-Siax ONNX モデルでタイル分割 4x アップスケール。バックエンドは Settings の `ai_backend` で DirectML / TensorRT を切替 (TRT は NVIDIA 専用)
-- **ONNX Runtime DLL**: `onnxruntime.dll` / `onnxruntime_providers_shared.dll` (Microsoft.ML.OnnxRuntime.DirectML NuGet v1.24.2) を exe に `include_bytes!` で埋め込み、AI runtime 初期化 worker が `%APPDATA%/mimageviewer/` に展開して `ort::init_from()` で動的ロードする。Microsoft 公式 app-local VC runtime 4 本も全配布 exe の隣へ同梱するため、利用者による VC++ 再頒布可能パッケージの追加インストールは不要
+- **AI upscaling**: `ort` crate 2.0.0-rc.15 (既定feature無効、`api-24` + `load-dynamic` + `std` + `ndarray` + `tracing` + `directml` + `cuda` + `tensorrt`)。Real-ESRGAN / Real-CUGAN / NMKD-Siax ONNX モデルでタイル分割 4x アップスケール。バックエンドは Settings の `ai_backend` で DirectML / TensorRT を切替 (TRT は NVIDIA 専用)
+- **ONNX Runtime DLL**: `onnxruntime.dll` / `onnxruntime_providers_shared.dll` (Microsoft.ML.OnnxRuntime.DirectML NuGet v1.24.4) を exe に `include_bytes!` で埋め込み、AI runtime 初期化 worker が `%APPDATA%/mimageviewer/` に展開して `ort::init_from()` で動的ロードする。Microsoft 公式 app-local VC runtime 4 本も全配布 exe の隣へ同梱するため、利用者による VC++ 再頒布可能パッケージの追加インストールは不要。TensorRT pack の GPU 1.24.2 も C API 24 のまま利用する
 - **TensorRT 対応 (NVIDIA GPU 高速化、オプション)**: `Microsoft.ML.OnnxRuntime.Gpu.Windows` + NVIDIA CUDA Runtime / cuBLAS / cuFFT / cuRAND / cuSOLVER / cuSPARSE / NVRTC / nvJitLink / cuDNN / TensorRT (合計 ~6.8 GB) を `%APPDATA%/mimageviewer/tensorrt/` に展開して使用。pack DL は `scripts/setup-tensorrt-pack.ps1` (PoC 版、アプリ内 DL UI は将来実装)。実測 1.4-3.4x (アップスケール) / 4.5x (デノイズ) 高速化。エンジンビルダーは `mimageviewer.exe --tensorrt-build <model>` 子プロセス。詳細は [docs/archive/ai/tensorrt-batching-feasibility.md](archive/ai/tensorrt-batching-feasibility.md)
 - **AI image classification**: ヒューリスティクスでイラスト/漫画/CG/写真を自動判別
 - **AI inpainting**: MI-GAN (ONNX, DirectML) を消しゴムツールから利用してマスク領域を補完
@@ -96,7 +96,7 @@ mimageviewer/
 │   ├── filename_stack.rs    # ファイル名 prefix スタック（v2.0.0）の純ロジック（StackGroup/StackView/group_media/materialize_*）
 │   ├── filename_stack_ui.rs # 上記の App グルー（トグル・集約⇔フラット切替・Shift+↓↑ ジャンプ）
 │   ├── thumb_loader.rs      # サムネイル並列ロード
-│   ├── wic_decoder.rs       # WIC 画像デコード（HEIC/AVIF/JXL/TIFF。RAW は src/raw/）
+│   ├── wic_decoder.rs       # WIC 画像デコード（HEIC/JXL/TIFF と AVIF fallback。RAW は src/raw/）
 │   ├── susie_loader.rs      # Susie プラグイン 32bit ワーカープール + IPC（v0.7.0、PI/MAG/Q0/PIC/MAKI…）
 │   ├── os_theme.rs          # UI テーマ（System/Light/Dark）Windows レジストリ連携（v0.7.0）
 │   ├── video/               # 動画インライン再生 (FFmpeg LGPL DLL)
@@ -165,7 +165,8 @@ mimageviewer/
 - **内蔵**: JPEG, PNG, GIF, WebP, BMP
 - **RAW（内蔵 LibRaw）**: DNG, CR2, CR3, NEF, NRW, ARW, SRF, SR2, RAF, ORF, RW2, PEF, PTX, RWL, IIQ, CRW, SRW, 3FR, ERF, KDC, DCR, MRW, MOS
   - Nikon HE/HE* と JPEG XL 圧縮 DNG は現像非対応。使える埋め込みプレビューは表示可能。
-- **WIC 経由**: HEIC, HEIF, AVIF, JXL, TIFF, TIF
+- **AVIF 内蔵**: libavif + dav1d + libyuv。RGBA8・clap/irot/imir 適用済み。失敗時は WIC → Susie
+- **WIC 経由**: HEIC, HEIF, JXL, TIFF, TIF
 - **動画（サムネイルのみ）**: MP4, AVI, MOV, MKV, WMV, MPG, MPEG
 
 ## Performance Notes

@@ -50,6 +50,8 @@ pub fn denoise_with_progress(
     }
     crate::logger::log(format!("[AI] Denoise {}x{} with {:?}", w, h, model_kind));
 
+    // The shared pipeline publishes this model's scale-detect/tile Run at the
+    // actual execution boundary when the caller adopted a diagnostic job scope.
     let result =
         super::upscale::upscale_with_progress(runtime, model_kind, input, cancel, progress)?;
 

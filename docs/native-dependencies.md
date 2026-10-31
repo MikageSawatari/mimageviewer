@@ -20,13 +20,14 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
 このスクリプトは以下を順に実行する:
 
 1. `setup-pdfium.sh` — `vendor/pdfium/bin/pdfium.dll` を取得
-2. `setup-libraw.sh` — `vendor/libraw/` に LibRaw 0.22.2 と zlib 1.3.1 のソース、`VERSION` を取得
-3. `setup-ort.sh` — `vendor/ort/onnxruntime*.dll` を取得
-4. `setup-ffmpeg.sh` — `vendor/ffmpeg/{bin,include,lib}/` を取得
-5. `setup-susie-worker.sh` — `vendor/susie-worker/mimageviewer-susie32.exe` を再ビルド
-6. `setup-twemoji.sh` — `vendor/twemoji/svg/*.svg` を取得 (注釈スタンプの絵文字。
+2. `setup-libraw.sh` — `vendor/libraw/` に LibRaw 0.22.3 と zlib 1.3.1 のソース、`VERSION` を取得
+3. `setup-libavif.sh` — `vendor/libavif/` に libavif / dav1d / libyuv の静的ライブラリ・ヘッダ・notice・`VERSION` を作成
+4. `setup-ort.sh` — `vendor/ort/onnxruntime*.dll` を取得
+5. `setup-ffmpeg.sh` — `vendor/ffmpeg/{bin,include,lib}/` を取得
+6. `setup-susie-worker.sh` — `vendor/susie-worker/mimageviewer-susie32.exe` を再ビルド
+7. `setup-twemoji.sh` — `vendor/twemoji/svg/*.svg` を取得 (注釈スタンプの絵文字。
    build.rs が exe へ `include_bytes!` で同梱。未配置でもビルドは通るがスタンプは無効)
-7. `vendor/models/*.onnx` を `%APPDATA%/mimageviewer/models/` から自動 copy
+8. `vendor/models/*.onnx` を `%APPDATA%/mimageviewer/models/` から自動 copy
    (= 一度 mIV をインストール / 起動して APPDATA に展開させた後でないと取れない)
 
 ### bootstrap で取れないもの
@@ -116,7 +117,8 @@ bash scripts/setup-pdfium.sh check  # 新しいバージョンの有無を確認
 - **ソース**: [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)
   (毎週月曜に Chromium 最新版から自動ビルド)
 - **アセット**: `pdfium-win-x64.tgz` (V8 なし版、軽量)
-- **現在のバージョン**: `vendor/pdfium/VERSION` を参照
+- **現在のバージョン**: `chromium/8125` (`158.0.8125.0`、2026-10-28 更新)。
+  `vendor/pdfium/VERSION` と資産照合は [更新記録](dependency-update-20261028.md) を参照
 
 ### リリース前チェック (必須)
 
@@ -142,14 +144,16 @@ portable / 開発 build は exe 隣へ loose 配置する。利用者による�
 
 GUI process の ORT constructor は process 共通 `AiRuntimeInitOwner` だけが worker 上で一度実行する。
 App / Remote / materializer は同じ Ready / Failed terminal snapshot を使い、UI thread は待たない。
-`ort` 2.0.0-rc.12 は upstream `17ed727` を `crates/ort-patched` へ backport し、dynamic load / export /
-C API version の初期化失敗を ORT API に再入せず `LoadDynamicError` として返す。
+`ort` 2.0.0-rc.15 は upstream `17ed727` 相当の修正を含むため、ローカルforkは使用しない。
+dynamic load / export / C API version の初期化失敗を ORT API に再入せず
+`LoadDynamicError` として返す。環境は `build()` で生成し、同じprocess共通の初期化結果に
+保持して各 `Session::builder(&environment)` へ渡す。
 
 ### セットアップ
 
 ```bash
-bash scripts/setup-ort.sh           # 既定バージョン (1.24.2) をダウンロード
-bash scripts/setup-ort.sh 1.24.5    # バージョン指定
+bash scripts/setup-ort.sh           # 既定バージョン (1.24.4) をダウンロード
+bash scripts/setup-ort.sh 1.24.4     # バージョン指定
 ```
 
 - **ソース**: NuGet `Microsoft.ML.OnnxRuntime.DirectML` (Microsoft 公式ビルド)
@@ -158,12 +162,16 @@ bash scripts/setup-ort.sh 1.24.5    # バージョン指定
 
 ### バージョン互換性
 
-`ort` クレートの C API バージョンと一致する ONNX Runtime DLL を使う必要がある。
-`ort-sys` の `build/download/dist.txt` に `ms@X.Y.Z` というタグが入っており、これが
-対応する ONNX Runtime バージョン。ort クレートをアップデートしたら、このバージョンを
-確認して `setup-ort.sh` のデフォルトバージョン (`VERSION` 変数) を揃えること。
+`ort-sys::ORT_API_VERSION`（`ort::MINOR_VERSION`）は選択した `api-*` featureで決まる。
+`load-dynamic` は DLL のminor版がこの値より小さいと `BadVersion` で拒否する。
+ort更新時は既定featureだけで判断せず、workspace全体のfeature統合とDLLのAPI互換性を確認する。
 
-- ort 2.0.0-rc.12 ↔ onnxruntime 1.24.2
+- ort 2.0.0-rc.15: 全consumerで `default-features = false` と `api-24` を指定。
+  DirectML 1.24.4 と TensorRT pack の GPU 1.24.2 はともに API 24 を満たす。
+- rc.15既定の `api-31` は入れない。`api-25` 以上と `download-binaries` が
+  `cargo tree -e features -i ort --workspace --locked --offline` に入らないことを確認する。
+- `download-binaries` / `tls-native` / `copy-dylibs` は使用せず、DLLは既存のvendor管理を続ける。
+  2026-10-28 の入力hash・検証結果は [依存物更新記録の段B](dependency-update-20261028.md#dependency-stage-b) を参照。
 
 ### DirectML.dll について
 
@@ -216,7 +224,7 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 │   ├── mimageviewer-remote.exe (本体と remote-ipc protocol version を共有、Web UI 資産も内包)
 │   ├── mimageviewer-epub-pdf.exe (EPUB → PDF 変換器)
 │   ├── mimageviewer-musicvideo.exe (音楽ビデオエディタ)
-│   ├── effetune/EffeTune Mixwright.vst3/ (全448ファイル、v0.13.0。入力は別の VERSION と計449ファイル)
+│   ├── effetune/EffeTune Mixwright.vst3/ (全469ファイル、v0.15.0。入力は別の VERSION と計470ファイル)
 │   ├── app-local VC runtime 4 DLL (Microsoft 署名を保持)
 │   ├── avcodec-61.dll
 │   ├── avformat-61.dll
@@ -268,6 +276,7 @@ release link 時に未解決になることがあるため、配布ビルドは�
 ランチャー側 build.rs は Cargo の `OUT_DIR` の形を検査し、その profile と同じ出力 tree の `release` から core / remote / EPUB worker / editor の 4 本を参照する（debug の launcher テストも release 4 本を使う）。子へ差し込まれた `CARGO_TARGET_DIR` や既定値の推測は使わず、想定外の `OUT_DIR` は明示的に失敗する。通常構成では `target/release` となる。wrapper は metadata の `target_directory` と `build_directory` を固定出力先と照合し、`build.build-dir` による分離も開始前に拒否する。
 無ければ復旧手順付きで止まる。EffeTune も `vendor/effetune-mixwright/VERSION` と
 `EffeTune Mixwright.vst3/` を必須検証する。`MIMV_EFFETUNE_DIR` で staging root を指定できる。
+承認済み入力は `third_party/effetune-mixwright/v0.15.0/manifest.sha256` の全470エントリと照合する。
 配布署名時は build-dist.ps1 が bundle を target にコピーして PE を署名し、埋め込み元を指定する
 (vendor 原本は変更しない)。
 
@@ -397,7 +406,7 @@ x264 / x265 (エンコーダ) は GPL なので含まれない (mIV はデコー
 
 ## LibRaw ソース・ライセンス管理
 
-RAW は LibRaw 0.22.2 を CDDL-1.0 で静的リンクする。zlib 1.3.1 と既存の
+RAW は LibRaw 0.22.3 を CDDL-1.0 で静的リンクする。zlib 1.3.1 と既存の
 libjpeg-turbo 静的ライブラリを使い、新しい DLL / exe は追加しない。
 エージェント用セットアップは `bash scripts/setup-libraw.sh`（bootstrap に含む）、
 更新確認は `bash scripts/setup-libraw.sh check`。この bash 手順は利用者には渡さない。
@@ -412,7 +421,7 @@ libjpeg-turbo 静的ライブラリを使い、新しい DLL / exe は追加し�
 - 対応ソースは [docs/libraw-source-distribution.md](libraw-source-distribution.md) に従って
   SHA-256 を照合し、mikage.to へ配置する。tarball は git に入れず、`.sha256` を追跡する。
 - LibRaw 更新時はソース・checksum・notice・製品ページの同梱版とリンクを同時に更新し、
-  古い配布版の対応ソースも残す。
+  古い配布版の対応ソースと追跡済み `.sha256`、製品ページの旧版リンクも残す。
 
 ## VST3 host bridge 管理 (v0.9.0+)
 
@@ -462,7 +471,9 @@ cmake --build crates/vst3-host/build --config Release
 - 前提:
   - Visual Studio 2026 (18) BuildTools (MSVC C++ デスクトップ開発ワークロード)
   - CMake 3.20+
-  - 一度ビルドしたら、identity対象のソース・RC・共有iconを変更しない限り再ビルド不要
+  - 採用 SDK は `v3.8.1_build_84`。最低互換条件は MIT 化された 3.8.0 のまま。
+  - identity対象のソース・RC・共有iconの変更時、およびSDK更新時に再ビルドする。
+    SDK自体はsource identityに含まれないため、marker一致だけでSDK版を判別しない
 - CMakeは `vendor/vcrt/` の公式 `vcruntime140.dll` / `vcruntime140_1.dll` /
   `msvcp140.dll` / `msvcp140_1.dll` を `vendor/vst3-host/vcrt/` へcopy-if-differentで配置する。
   hostが再リンク不要でも配置targetは実行される。正本が欠けた場合は復旧案内付きでbuildを停止する。
@@ -491,3 +502,27 @@ This software supports VST3 plugins via the Steinberg VST3 SDK
 VST のロゴは使用しない。名称の文字表記も商標ガイドラインの対象となり得るため、
 文字表記によってガイドラインを回避できるとは扱わない。この記録は採用した表記方針を
 示すもので、ガイドラインへの適合や商標侵害の有無を断定するものではない。
+
+## libavif / dav1d / libyuv の静的リンク（§1.407）
+
+AVIF は libavif 1.4.2、dav1d 1.5.3、libyuv
+`644251f252a84bf8ce91ff0aca86a9b16b069ab8` を使用する。
+libavif 自身の LocalDav1d / LocalLibyuv の固定組合せで、ライセンスは順に
+BSD-2-Clause（同梱第三者 notice も全文を保持）、BSD-2-Clause、BSD-3-Clause。
+
+エージェント用 `bash scripts/setup-libavif.sh` が checksum / commit を照合し、
+MSVC x64・static CRT `/MT` で `vendor/libavif/{include,lib,licenses,VERSION}` を生成する。
+bootstrap は毎回setupを呼び、`--force`も伝える。setupはVERSION一致と出力7ファイル
+（header・lib3本・license3本）すべての存在でskipを判定する。meson / ninja / NASM は
+vendor 内の専用 tools に配置し、システムへは追加しない。
+Cargo は依存の C ビルドを行わず、`crates/libavif-sys` の小さな C shim だけを cc でビルドする。
+欠落・版違いは復旧コマンドを付けて停止する。新しい DLL / exe は追加しない。
+ソースとツールは再取得できるため、ツリー外バックアップは不要。
+
+更新時は `bash scripts/setup-libavif.sh check` で上流を確認し、setup の版・hash・
+組合せ、libavif-sys の期待 VERSION、設計書を合わせて更新する。
+`--force` で再構築し、AVIF fixture テストと decode / link 検査を行う。
+ルートの `LIBAVIF-LICENSE.txt` / `DAV1D-LICENSE.txt` / `LIBYUV-LICENSE.txt` は
+vendor/licenses のバイトをそのままコピーし、`.gitattributes -text` で保持する。
+about の全文表示と同梱版、installer / portable の配布リストも更新する。
+ソース再配布義務はない。

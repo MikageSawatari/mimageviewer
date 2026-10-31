@@ -64,6 +64,39 @@ pub const UI_SCALE_FACTOR_MAX: f32 = 2.0;
 pub const UI_SCALE_FACTOR_STEP: f32 = 0.1;
 pub const UI_SCALE_FACTOR_STEP_COUNT: usize = 16;
 
+pub const THUMB_NAME_FONT_SCALE_PERCENT_MIN: u32 = 100;
+pub const THUMB_NAME_FONT_SCALE_PERCENT_MAX: u32 = 200;
+pub const THUMB_NAME_FONT_SCALE_PERCENT_OPTIONS: [u32; 5] = [100, 125, 150, 175, 200];
+pub const THUMB_NAME_MAX_LINES_MIN: u32 = 1;
+pub const THUMB_NAME_MAX_LINES_MAX: u32 = 4;
+
+fn default_thumb_name_font_scale_percent() -> u32 {
+    THUMB_NAME_FONT_SCALE_PERCENT_MIN
+}
+
+fn default_thumb_name_max_lines() -> u32 {
+    THUMB_NAME_MAX_LINES_MIN
+}
+
+fn deserialize_thumb_name_font_scale_percent<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <u32 as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.clamp(
+        THUMB_NAME_FONT_SCALE_PERCENT_MIN,
+        THUMB_NAME_FONT_SCALE_PERCENT_MAX,
+    ))
+}
+
+fn deserialize_thumb_name_max_lines<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <u32 as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.clamp(THUMB_NAME_MAX_LINES_MIN, THUMB_NAME_MAX_LINES_MAX))
+}
+
 pub const PDF_WORKER_COUNT_MIN: u32 = 3;
 pub const PDF_WORKER_COUNT_MAX: u32 = 10;
 pub const PDF_WORKER_COUNT_DEFAULT: u32 = 5;
@@ -886,10 +919,12 @@ impl FullscreenNavigatorCorner {
 /// このパネルだけ表示項目を変更できるのは不自然で過剰なため、並びは固定する。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FullscreenOverflowItemId {
+    PageOverview,
     SpreadAdjustment,
     NavigatorToggle,
     NavigatorPosition,
     PageTurnAnimationToggle,
+    SlideshowSettings,
     ImageAnalysis,
     PixelGrid,
     LoupeLock,
@@ -898,10 +933,12 @@ pub enum FullscreenOverflowItemId {
 impl FullscreenOverflowItemId {
     pub fn fixed_order() -> &'static [Self] {
         &[
+            Self::PageOverview,
             Self::SpreadAdjustment,
             Self::NavigatorToggle,
             Self::NavigatorPosition,
             Self::PageTurnAnimationToggle,
+            Self::SlideshowSettings,
             Self::ImageAnalysis,
             Self::PixelGrid,
             Self::LoupeLock,
@@ -910,10 +947,12 @@ impl FullscreenOverflowItemId {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::PageOverview => crate::keymap::KeyAction::FsPageOverviewToggle.description(),
             Self::SpreadAdjustment => "見開きの調整",
             Self::NavigatorToggle => "ナビゲータ",
             Self::NavigatorPosition => "ナビゲータ位置",
             Self::PageTurnAnimationToggle => "ページめくりアニメーション",
+            Self::SlideshowSettings => "スライドショー",
             Self::ImageAnalysis => "分析ツール",
             Self::PixelGrid => "ピクセルグリッド",
             Self::LoupeLock => "ルーペ固定",
@@ -932,6 +971,7 @@ pub enum DetailsSortKey {
     Name,
     Rating,
     RatedAt,
+    AppliedAt,
     Tags,
     Kind,
     PageCount,
@@ -953,6 +993,7 @@ impl DetailsSortKey {
             Self::Name => "名前",
             Self::Rating => "★",
             Self::RatedAt => "★設定時刻",
+            Self::AppliedAt => "タグ付与時刻",
             Self::Tags => "タグ",
             Self::Kind => "種類",
             Self::PageCount => "ページ数",
@@ -1043,6 +1084,7 @@ pub enum DetailsColumnId {
     Name,
     Rating,
     RatedAt,
+    AppliedAt,
     Tags,
     Kind,
     PageCount,
@@ -1064,6 +1106,7 @@ impl DetailsColumnId {
             Self::Name,
             Self::Rating,
             Self::RatedAt,
+            Self::AppliedAt,
             Self::Tags,
             Self::Kind,
             Self::PageCount,
@@ -1825,6 +1868,10 @@ pub enum ToolbarSectionId {
     SmartFolders,
     Tags,
     Folder,
+    SearchContainer,
+    SearchLocal,
+    SearchMetadata,
+    SearchEverything,
     /// 未知のセクション (将来バージョンが書いた変種を旧バイナリが読んだ場合)。
     /// `#[serde(other)]` でデシリアライズをエラーにせずここへ落とし、
     /// `ordered_with_fallback` が描画前に除外する (ダウングレード時の settings 全損を防ぐ)。
@@ -1867,6 +1914,10 @@ impl ToolbarSectionId {
             Self::SmartFolders,
             Self::Tags,
             Self::Folder,
+            Self::SearchContainer,
+            Self::SearchLocal,
+            Self::SearchMetadata,
+            Self::SearchEverything,
         ]
     }
 
@@ -2810,6 +2861,28 @@ impl TextContrast {
         match self {
             Self::Unknown => Self::Standard,
             value => value,
+        }
+    }
+}
+
+/// 通常の一時通知の表示時間。旧設定の項目欠落は Standard に移行する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationDuration {
+    Short,
+    #[default]
+    Standard,
+    Long,
+    #[serde(other)]
+    Unknown,
+}
+
+impl NotificationDuration {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Short => "短い",
+            Self::Long => "長い",
+            Self::Standard | Self::Unknown => "標準",
         }
     }
 }
@@ -4403,6 +4476,8 @@ pub struct Settings {
     /// 専用キャリア。追加フィールドは旧版に無視されるので、列幅だけを安全に保持できる。
     #[serde(default)]
     pub details_rated_at_width: Option<f32>,
+    #[serde(default)]
+    pub details_applied_at_width: Option<f32>,
     /// v2.5.0 が知らないページ数列の位置・幅を、旧版が無視できる未知フィールドへ退避する。
     #[serde(default)]
     pub(crate) details_page_count_column_index_stash: Option<usize>,
@@ -4423,6 +4498,8 @@ pub struct Settings {
     pub details_show_rating: bool,
     #[serde(default = "default_true")]
     pub details_show_rated_at: bool,
+    #[serde(default = "default_true")]
+    pub details_show_applied_at: bool,
     #[serde(default = "default_true")]
     pub details_show_tags: bool,
     #[serde(default = "default_true")]
@@ -4466,12 +4543,16 @@ pub struct Settings {
     /// 下部情報バー側の ★設定時刻列幅も、v3.4.0 が読む既存配列から分離して保存する。
     #[serde(default)]
     pub details_selection_bar_rated_at_width: Option<f32>,
+    #[serde(default)]
+    pub details_selection_bar_applied_at_width: Option<f32>,
     #[serde(default = "default_true")]
     pub details_selection_bar_show_preview: bool,
     #[serde(default = "default_true")]
     pub details_selection_bar_show_rating: bool,
     #[serde(default = "default_true")]
     pub details_selection_bar_show_rated_at: bool,
+    #[serde(default = "default_true")]
+    pub details_selection_bar_show_applied_at: bool,
     #[serde(default = "default_true")]
     pub details_selection_bar_show_tags: bool,
     #[serde(default = "default_true")]
@@ -4619,6 +4700,9 @@ pub struct Settings {
     /// ★1〜★5 のレーティング一覧で共通に使うソート順。
     #[serde(default)]
     pub rating_view_sort: crate::rating_view::RatingViewSort,
+    /// タグ検索結果だけに適用する並び順。通常一覧とは独立して保存する。
+    #[serde(default)]
+    pub tag_view_sort: crate::tag_view::TagViewSort,
     #[serde(default)]
     pub rating_sort_unrated_position: crate::rating_sort::RatingSortUnratedPosition,
     /// サブフォルダ展開ビューでフォルダ境界を優先するか。
@@ -4755,6 +4839,18 @@ pub struct Settings {
     /// `On` : スクロール停止 + 他の要求が全て完了した後、visible 範囲から順次再デコード
     #[serde(default = "default_true")]
     pub thumb_idle_upgrade: bool,
+    /// 一覧のファイル名・フォルダ名だけに適用する文字サイズの倍率 (%)。
+    #[serde(
+        default = "default_thumb_name_font_scale_percent",
+        deserialize_with = "deserialize_thumb_name_font_scale_percent"
+    )]
+    pub thumb_name_font_scale_percent: u32,
+    /// 一覧のファイル名・フォルダ名を折り返して表示する最大行数。
+    #[serde(
+        default = "default_thumb_name_max_lines",
+        deserialize_with = "deserialize_thumb_name_max_lines"
+    )]
+    pub thumb_name_max_lines: u32,
     /// サムネイル右下に動画・音声の長さを表示する。
     #[serde(default = "default_true")]
     pub thumb_show_media_duration: bool,
@@ -4834,6 +4930,14 @@ pub struct Settings {
     /// フォルダバー (フォルダ入力行) を表示する
     #[serde(default = "default_true")]
     pub show_toolbar_folder: bool,
+    #[serde(default)]
+    pub show_toolbar_search_container: bool,
+    #[serde(default)]
+    pub show_toolbar_search_local: bool,
+    #[serde(default)]
+    pub show_toolbar_search_metadata: bool,
+    #[serde(default)]
+    pub show_toolbar_search_everything: bool,
     /// ツールバーに「ツリー」ボタンを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_folder_tree_button: bool,
@@ -5029,6 +5133,9 @@ pub struct Settings {
     pub bake_stage_export_batch: crate::bake_stage::BakeStage,
     #[serde(default)]
     pub bake_stage_external_tool: crate::bake_stage::BakeStage,
+    /// 編集を反映したクリップボード画像の段。単枚 Ctrl+E と同じ段を既定とする。
+    #[serde(default = "default_bake_stage_clipboard")]
+    pub bake_stage_clipboard: crate::bake_stage::BakeStage,
     /// 製本の本棚ルート。None のときは OS の Pictures/mimageviewer/books を使う。
     #[serde(default)]
     pub book_root: Option<PathBuf>,
@@ -5138,6 +5245,9 @@ pub struct Settings {
     /// デフォルトのページ構成
     #[serde(default)]
     pub default_spread_mode: SpreadMode,
+    /// 通常フォルダでも未保存のページ構成に既定を使う。連結方式・本扱いは変えない。
+    #[serde(default)]
+    pub apply_default_spread_to_plain_folders: bool,
     /// 本に保存した見開きモードがない場合、PDF / EPUB の右開き指定に従う。
     #[serde(default)]
     pub follow_document_reading_direction: bool,
@@ -5159,6 +5269,9 @@ pub struct Settings {
     /// 表紙あり見開きで、末尾の単ページへ表紙を添える全体既定。各本の明示設定が優先する。
     #[serde(default = "default_true")]
     pub final_cover_spread_enabled: bool,
+    /// 本別設定が「全体設定に従う」のとき、自動余白カットを有効にする。
+    #[serde(default)]
+    pub auto_view_trim_default_enabled: bool,
     /// 見開き先頭の単ページを本来の側へ置く全体既定。
     #[serde(default)]
     pub singleton_spread_first_enabled: bool,
@@ -5221,6 +5334,9 @@ pub struct Settings {
     /// Targets whose fixed display becomes automatic only on the current F11 surface.
     #[serde(default)]
     pub fullscreen_chrome_suppression: FullscreenChromeSuppression,
+    /// 手動の前後移動を現在の閲覧順の先頭 / 末尾で折り返す。
+    #[serde(default)]
+    pub fullscreen_manual_nav_wrap: bool,
     /// フルスクリーンで先頭 / 末尾に達したときの案内を表示する。
     #[serde(default = "default_true")]
     pub fullscreen_boundary_notice_visible: bool,
@@ -5364,6 +5480,10 @@ pub struct Settings {
     /// ラベル、ボタン、メニュー、ダイアログ、フルスクリーン HUD の文字コントラスト。
     #[serde(default)]
     pub text_contrast: TextContrast,
+
+    /// 一時通知の全体設定。警告・エラーは短い設定でも標準時間を確保する。
+    #[serde(default)]
+    pub notification_duration: NotificationDuration,
 
     /// OS DPI とは独立したアプリ内 UI 表示倍率 (50%..=200%、10% 刻み)。
     #[serde(default = "default_ui_scale_factor")]
@@ -5957,10 +6077,13 @@ pub struct Settings {
     /// (複数ウィンドウモードでは常にメディア窓なので、このフラグは見ない)。
     #[serde(default)]
     pub fullfeature_media_window: bool,
-    /// 別ウィンドウビューアの前回位置・サイズ。静止画 egui viewport と native 動画
-    /// top-level window の両方で共有する。
+    /// 旧版の論理配置。物理配置への移行用に読み取り、以後は書き換えない。
     #[serde(default)]
     pub detached_viewer_window_placement: Option<DetachedViewerWindowPlacement>,
+    /// 別ウィンドウビューアの通常時の物理外枠配置。旧値より優先して読み込む。
+    #[serde(default)]
+    pub detached_viewer_window_physical_placement:
+        Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
 
     // ── VST3 プラグイン処理 (v0.9.0+) ──
     //
@@ -6038,6 +6161,10 @@ pub struct Settings {
     /// 新規 (= 過去に保存履歴なし) や旧コードで保存された JSON では None。
     #[serde(default)]
     pub last_seen_version: Option<String>,
+    /// 最後に利用者が「重要な変更点」を閉じた版。起動しただけでは進めない。
+    /// 旧設定の欠落値は load 時に前回起動版 (新規なら現行版) へ移行・保存する。
+    #[serde(default)]
+    pub whats_new_acknowledged_version: Option<String>,
 }
 
 /// VST3 プラグインチェーンの 1 エントリ。
@@ -7225,6 +7352,10 @@ fn default_bake_stage_export() -> crate::bake_stage::BakeStage {
     crate::bake_stage::BakeStage::DisplayAdjust
 }
 
+fn default_bake_stage_clipboard() -> crate::bake_stage::BakeStage {
+    crate::bake_stage::BakeStage::DisplayAdjust
+}
+
 fn default_active_book_name() -> String {
     crate::books::DEFAULT_BOOK_NAME.to_string()
 }
@@ -7545,6 +7676,7 @@ impl Default for Settings {
             details_column_order: Vec::new(),
             details_column_widths: Vec::new(),
             details_rated_at_width: None,
+            details_applied_at_width: None,
             details_page_count_column_index_stash: None,
             details_page_count_column_width_stash: None,
             details_place_column_index_stash: None,
@@ -7556,6 +7688,7 @@ impl Default for Settings {
             details_show_preview: true,
             details_show_rating: true,
             details_show_rated_at: true,
+            details_show_applied_at: true,
             details_show_tags: true,
             details_show_kind: true,
             details_show_page_count: true,
@@ -7572,9 +7705,11 @@ impl Default for Settings {
             details_selection_bar_column_order: Vec::new(),
             details_selection_bar_column_widths: Vec::new(),
             details_selection_bar_rated_at_width: None,
+            details_selection_bar_applied_at_width: None,
             details_selection_bar_show_preview: true,
             details_selection_bar_show_rating: true,
             details_selection_bar_show_rated_at: true,
+            details_selection_bar_show_applied_at: true,
             details_selection_bar_show_tags: true,
             details_selection_bar_show_kind: true,
             details_selection_bar_show_page_count: true,
@@ -7624,6 +7759,7 @@ impl Default for Settings {
             show_hidden_files: false,
             sort_order: SortOrder::default(),
             rating_view_sort: crate::rating_view::RatingViewSort::default(),
+            tag_view_sort: crate::tag_view::TagViewSort::default(),
             rating_sort_unrated_position: Default::default(),
             subfolder_expansion_order: SubfolderExpansionOrder::default(),
             subfolder_expansion_max_depth: default_subfolder_expansion_max_depth(),
@@ -7658,6 +7794,8 @@ impl Default for Settings {
             thumb_next_pages: default_thumb_next_pages(),
             gpu_memory_percent: default_gpu_memory_percent(),
             thumb_idle_upgrade: true,
+            thumb_name_font_scale_percent: default_thumb_name_font_scale_percent(),
+            thumb_name_max_lines: default_thumb_name_max_lines(),
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
             thumb_show_media_duration: true,
             thumb_show_resume_meter: true,
@@ -7698,10 +7836,12 @@ impl Default for Settings {
             bake_stage_export: default_bake_stage_export(),
             bake_stage_export_batch: default_bake_stage_export(),
             bake_stage_external_tool: crate::bake_stage::BakeStage::default(),
+            bake_stage_clipboard: default_bake_stage_clipboard(),
             book_root: None,
             active_book_name: default_active_book_name(),
             pinned_books: Vec::new(),
             default_spread_mode: SpreadMode::default(),
+            apply_default_spread_to_plain_folders: false,
             follow_document_reading_direction: false,
             remember_spread_shift_per_book: true,
             page_turn_animation_enabled: false,
@@ -7709,6 +7849,7 @@ impl Default for Settings {
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
             final_cover_spread_enabled: true,
+            auto_view_trim_default_enabled: false,
             singleton_spread_first_enabled: false,
             singleton_spread_last_enabled: false,
             page_after_cover_alone_enabled: false,
@@ -7729,6 +7870,7 @@ impl Default for Settings {
             creative_luts: crate::creative_lut::builtin_creative_lut_entries(),
             fullscreen_side_panel_mode: FsSidePanelMode::default(),
             fullscreen_chrome_suppression: FullscreenChromeSuppression::default(),
+            fullscreen_manual_nav_wrap: false,
             fullscreen_boundary_notice_visible: true,
             fullscreen_processing_status_visible: true,
             fullscreen_prefetch_status_visible: true,
@@ -7769,6 +7911,7 @@ impl Default for Settings {
             ui_theme: UiTheme::default(),
             preferences_restore_position: true,
             text_contrast: TextContrast::default(),
+            notification_duration: NotificationDuration::default(),
             ui_scale_factor: default_ui_scale_factor(),
             ui_font: UiFontSettings::default(),
             first_setup_completed: false,
@@ -7781,6 +7924,10 @@ impl Default for Settings {
             folder_tree_sort_order: FolderTreeSortOrder::default(),
             folder_tree_pane_width_ratio: default_folder_tree_pane_width_ratio(),
             show_toolbar_folder: true,
+            show_toolbar_search_container: false,
+            show_toolbar_search_local: false,
+            show_toolbar_search_metadata: false,
+            show_toolbar_search_everything: false,
             show_toolbar_folder_tree_button: true,
             show_toolbar_effetune: true,
             show_toolbar_bookshelf: true,
@@ -7957,6 +8104,7 @@ impl Default for Settings {
             detached_viewer_open_images_in_window: false,
             fullfeature_media_window: false,
             detached_viewer_window_placement: None,
+            detached_viewer_window_physical_placement: None,
             vst3_enabled: false,
             vst3_plugins: Vec::new(),
             vst3_plugin_path: None,
@@ -7974,6 +8122,7 @@ impl Default for Settings {
             audio_normalize_enabled: false,
             audio_normalize_target_lufs_milli: default_audio_normalize_target_lufs_milli(),
             last_seen_version: None,
+            whats_new_acknowledged_version: None,
             // ── 隠蔽加工 (Phase 1) ────────────────────────────
             conceal_type: crate::conceal::ConcealType::default(),
             conceal_mosaic_tile_mode: crate::conceal::TileSizeMode::default(),
@@ -9015,6 +9164,20 @@ impl Settings {
 
     /// 位置復元マトリクス「動画 × 一覧から開く」セル。保存先は互換維持のため既存 bool
     /// `video_grid_open_starts_from_beginning`。FromStart = 先頭から開く。
+    /// Clear only saved media memory. Runtime playback continues to record normally.
+    /// Persistence follows the caller's existing settings-save boundary.
+    pub(crate) fn clear_video_media_memory(&mut self) -> (usize, usize, usize) {
+        let counts = (
+            self.video_resume_positions.len(),
+            self.video_watched_to_end.len(),
+            self.video_audio_track_choices.len(),
+        );
+        self.video_resume_positions.clear();
+        self.video_watched_to_end.clear();
+        self.video_audio_track_choices.clear();
+        counts
+    }
+
     pub fn video_open_resume(&self) -> ResumeMode {
         if self.video_grid_open_starts_from_beginning {
             ResumeMode::FromStart
@@ -9383,6 +9546,15 @@ impl Settings {
                 }
             }
         }
+        let whats_new_acknowledgement_migrated = settings.whats_new_acknowledged_version.is_none();
+        if whats_new_acknowledgement_migrated && db_loaded {
+            settings.whats_new_acknowledged_version = Some(
+                previous_last_seen_version
+                    .as_deref()
+                    .unwrap_or(current_version)
+                    .to_owned(),
+            );
+        }
         if version_marker_changed && db_loaded {
             // Clean install has no previous version to snapshot. Record the current marker through
             // the bootstrap save so later launches can distinguish a real version transition.
@@ -9422,7 +9594,8 @@ impl Settings {
             || toolbar_sort_rating_options_migrated
             || toolbar_folder_section_migrated
             || legacy_keymap_import.changed
-            || version_marker_changed;
+            || version_marker_changed
+            || whats_new_acknowledgement_migrated;
         let bootstrap_saved = if bootstrap_save_needed {
             settings.save_internal_no_rotation()
         } else {
@@ -9588,6 +9761,7 @@ impl Settings {
     /// 幅だけは旧版が無視できる専用フィールドへ移す。下部情報バーの既存配列にも
     /// 未知 variant を残せないため、同じ境界で除去する。
     pub(crate) fn stash_details_rated_at_for_persist(&mut self) {
+        self.stash_details_applied_at_for_persist();
         if matches!(self.details_sort_key, DetailsSortKey::RatedAt) {
             self.details_sort_key = DetailsSortKey::Toolbar;
         }
@@ -9617,6 +9791,39 @@ impl Settings {
         }
         self.details_selection_bar_column_widths
             .retain(|entry| entry.column != DetailsColumnId::RatedAt);
+    }
+
+    /// タグ付与時刻列も旧版が読む列順・幅・ソートへ未知 variant を残さない。
+    pub(crate) fn stash_details_applied_at_for_persist(&mut self) {
+        if matches!(self.details_sort_key, DetailsSortKey::AppliedAt) {
+            self.details_sort_key = DetailsSortKey::Toolbar;
+        }
+
+        self.details_column_order
+            .retain(|column| *column != DetailsColumnId::AppliedAt);
+        if let Some(width) = self
+            .details_column_widths
+            .iter()
+            .find(|entry| entry.column == DetailsColumnId::AppliedAt)
+            .map(|entry| entry.width)
+        {
+            self.details_applied_at_width = Some(width);
+        }
+        self.details_column_widths
+            .retain(|entry| entry.column != DetailsColumnId::AppliedAt);
+
+        self.details_selection_bar_column_order
+            .retain(|column| *column != DetailsColumnId::AppliedAt);
+        if let Some(width) = self
+            .details_selection_bar_column_widths
+            .iter()
+            .find(|entry| entry.column == DetailsColumnId::AppliedAt)
+            .map(|entry| entry.width)
+        {
+            self.details_selection_bar_applied_at_width = Some(width);
+        }
+        self.details_selection_bar_column_widths
+            .retain(|entry| entry.column != DetailsColumnId::AppliedAt);
     }
 
     /// v2.6.0 で追加したページ数列を、v2.5.0 が deserialize できる形へ退避する。
@@ -9777,9 +9984,11 @@ impl Settings {
         self.details_selection_bar_column_order = self.details_column_order.clone();
         self.details_selection_bar_column_widths = self.details_column_widths.clone();
         self.details_selection_bar_rated_at_width = self.details_rated_at_width;
+        self.details_selection_bar_applied_at_width = self.details_applied_at_width;
         self.details_selection_bar_show_preview = self.details_show_preview;
         self.details_selection_bar_show_rating = self.details_show_rating;
         self.details_selection_bar_show_rated_at = self.details_show_rated_at;
+        self.details_selection_bar_show_applied_at = self.details_show_applied_at;
         self.details_selection_bar_show_tags = self.details_show_tags;
         self.details_selection_bar_show_kind = self.details_show_kind;
         self.details_selection_bar_show_page_count = self.details_show_page_count;
@@ -9838,7 +10047,17 @@ impl Settings {
         self.restore_toolbar_name_filter_after_load();
         self.folder_thumb_sort = self.folder_thumb_sort.sanitized_for_folder_thumb();
         self.text_contrast = self.text_contrast.normalized();
+        if self.notification_duration == NotificationDuration::Unknown {
+            self.notification_duration = NotificationDuration::Standard;
+        }
         self.ui_scale_factor = normalize_ui_scale_factor(self.ui_scale_factor);
+        self.thumb_name_font_scale_percent = self.thumb_name_font_scale_percent.clamp(
+            THUMB_NAME_FONT_SCALE_PERCENT_MIN,
+            THUMB_NAME_FONT_SCALE_PERCENT_MAX,
+        );
+        self.thumb_name_max_lines = self
+            .thumb_name_max_lines
+            .clamp(THUMB_NAME_MAX_LINES_MIN, THUMB_NAME_MAX_LINES_MAX);
         self.ui_font.sanitize();
         self.pdf_worker_count = clamp_pdf_worker_count(self.pdf_worker_count) as u32;
         let sns_split_target = crate::sns_split::SnsTarget::from_stable_key(
@@ -10133,9 +10352,11 @@ impl Settings {
         sanitize_details_column_order(&mut self.details_column_order);
         sanitize_details_column_widths(&mut self.details_column_widths);
         sanitize_optional_details_column_width(&mut self.details_rated_at_width);
+        sanitize_optional_details_column_width(&mut self.details_applied_at_width);
         sanitize_details_column_order(&mut self.details_selection_bar_column_order);
         sanitize_details_column_widths(&mut self.details_selection_bar_column_widths);
         sanitize_optional_details_column_width(&mut self.details_selection_bar_rated_at_width);
+        sanitize_optional_details_column_width(&mut self.details_selection_bar_applied_at_width);
         self.toolbar_facet_filter_items =
             ToolbarFacetFilterItem::visible_order(&self.toolbar_facet_filter_items);
         self.facet_name_filter_width = self.facet_name_filter_width.normalized();
@@ -10243,6 +10464,9 @@ impl Settings {
     /// `src` 側は Vec / String など大きいフィールドは `std::mem::take` で奪うので、
     /// 呼出後は空の既定値になる (呼出元はすぐ `*self = state.settings` で捨てる想定)。
     pub fn overwrite_non_preferences_from(&mut self, src: &mut Settings) {
+        // 通知を閉じる前の環境設定 draft で既読を巻き戻さない。
+        self.whats_new_acknowledged_version
+            .clone_from(&src.whats_new_acknowledged_version);
         // ── グリッド / ツールバー runtime 状態 ──
         self.grid_cols = src.grid_cols;
         self.grid_view_mode = src.grid_view_mode;
@@ -10254,11 +10478,13 @@ impl Settings {
         self.details_column_order = src.details_column_order.clone();
         self.details_column_widths = src.details_column_widths.clone();
         self.details_rated_at_width = src.details_rated_at_width;
+        self.details_applied_at_width = src.details_applied_at_width;
         self.details_name_width_auto = src.details_name_width_auto;
         self.details_name_width = src.details_name_width;
         self.details_show_preview = src.details_show_preview;
         self.details_show_rating = src.details_show_rating;
         self.details_show_rated_at = src.details_show_rated_at;
+        self.details_show_applied_at = src.details_show_applied_at;
         self.details_show_tags = src.details_show_tags;
         self.details_show_kind = src.details_show_kind;
         self.details_show_page_count = src.details_show_page_count;
@@ -10274,11 +10500,13 @@ impl Settings {
         self.details_selection_bar_column_order = src.details_selection_bar_column_order.clone();
         self.details_selection_bar_column_widths = src.details_selection_bar_column_widths.clone();
         self.details_selection_bar_rated_at_width = src.details_selection_bar_rated_at_width;
+        self.details_selection_bar_applied_at_width = src.details_selection_bar_applied_at_width;
         self.details_selection_bar_name_width_auto = src.details_selection_bar_name_width_auto;
         self.details_selection_bar_name_width = src.details_selection_bar_name_width;
         self.details_selection_bar_show_preview = src.details_selection_bar_show_preview;
         self.details_selection_bar_show_rating = src.details_selection_bar_show_rating;
         self.details_selection_bar_show_rated_at = src.details_selection_bar_show_rated_at;
+        self.details_selection_bar_show_applied_at = src.details_selection_bar_show_applied_at;
         self.details_selection_bar_show_tags = src.details_selection_bar_show_tags;
         self.details_selection_bar_show_kind = src.details_selection_bar_show_kind;
         self.details_selection_bar_show_page_count = src.details_selection_bar_show_page_count;
@@ -10299,6 +10527,7 @@ impl Settings {
         self.thumb_aspect_auto = src.thumb_aspect_auto;
         self.sort_order = src.sort_order;
         self.rating_view_sort = src.rating_view_sort;
+        self.tag_view_sort = src.tag_view_sort;
         self.subfolder_expansion_order = src.subfolder_expansion_order;
         self.subfolder_expansion_max_depth = src.subfolder_expansion_max_depth;
         self.subfolder_expansion_filter_kinds = src.subfolder_expansion_filter_kinds.clone();
@@ -10377,6 +10606,10 @@ impl Settings {
         // フォルダバー (アドレス行) の表示設定も v2.0.0 で右クリックメニューへ移したため、
         // 環境設定を開いている間の変更が OK で巻き戻らないよう live 値を引き継ぐ (Codex P2)。
         self.show_toolbar_folder = src.show_toolbar_folder;
+        self.show_toolbar_search_container = src.show_toolbar_search_container;
+        self.show_toolbar_search_local = src.show_toolbar_search_local;
+        self.show_toolbar_search_metadata = src.show_toolbar_search_metadata;
+        self.show_toolbar_search_everything = src.show_toolbar_search_everything;
         self.show_address_bar_history_nav = src.show_address_bar_history_nav;
         self.show_address_bar_quick_folders = src.show_address_bar_quick_folders;
         self.show_toolbar_parent_button = src.show_toolbar_parent_button;
@@ -10437,6 +10670,8 @@ impl Settings {
         self.always_on_top = src.always_on_top;
         self.detached_viewer_enabled = src.detached_viewer_enabled;
         self.detached_viewer_window_placement = src.detached_viewer_window_placement;
+        self.detached_viewer_window_physical_placement =
+            src.detached_viewer_window_physical_placement;
         // お気に入り表示 overlay は runtime 状態。環境設定を開いている間に viewer context
         // が切り替わっても、古い snapshot の overlay へ巻き戻さない。
         self.favorite_view_overlay = src.favorite_view_overlay.clone();
@@ -10650,6 +10885,60 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn notification_duration_defaults_and_sqlite_roundtrip() {
+        assert_eq!(
+            Settings::default().notification_duration,
+            NotificationDuration::Standard
+        );
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            missing.notification_duration,
+            NotificationDuration::Standard
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(tmp.path()).unwrap();
+        for value in [
+            NotificationDuration::Short,
+            NotificationDuration::Standard,
+            NotificationDuration::Long,
+        ] {
+            let mut settings = Settings::default();
+            settings.notification_duration = value;
+            settings.grid_cols = 9;
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings().unwrap().notification_duration,
+                value
+            );
+        }
+        drop(db);
+        let conn = rusqlite::Connection::open(tmp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'notification_duration'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(tmp.path()).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.notification_duration, NotificationDuration::Standard);
+        assert_eq!(
+            loaded.grid_cols, 9,
+            "old settings survive the additive migration"
+        );
+    }
+
+    #[test]
+    fn notification_duration_unknown_value_is_forward_compatible() {
+        let mut loaded: Settings =
+            serde_json::from_str(r#"{"notification_duration":"future"}"#).unwrap();
+        assert_eq!(loaded.notification_duration, NotificationDuration::Unknown);
+        assert_eq!(loaded.notification_duration.label(), "標準");
+        loaded.sanitize();
+        assert_eq!(loaded.notification_duration, NotificationDuration::Standard);
+    }
+
+    #[test]
     fn preferences_restore_position_defaults_on_and_sqlite_roundtrip() {
         assert!(Settings::default().preferences_restore_position);
         let missing: Settings = serde_json::from_str("{}").unwrap();
@@ -10719,6 +11008,88 @@ mod tests {
     }
 
     #[test]
+    fn thumb_name_settings_serde_defaults_choices_and_clamps_ranges() {
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        for defaults in [Settings::default(), missing] {
+            assert_eq!(defaults.thumb_name_font_scale_percent, 100);
+            assert_eq!(defaults.thumb_name_max_lines, 1);
+        }
+        for percent in THUMB_NAME_FONT_SCALE_PERCENT_OPTIONS {
+            for lines in THUMB_NAME_MAX_LINES_MIN..=THUMB_NAME_MAX_LINES_MAX {
+                let settings = Settings {
+                    thumb_name_font_scale_percent: percent,
+                    thumb_name_max_lines: lines,
+                    ..Settings::default()
+                };
+                let restored: Settings =
+                    serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+                assert_eq!(restored.thumb_name_font_scale_percent, percent);
+                assert_eq!(restored.thumb_name_max_lines, lines);
+            }
+        }
+        for (percent, lines, expected_percent, expected_lines) in [
+            (0, 0, 100, 1),
+            (99, 1, 100, 1),
+            (133, 3, 133, 3),
+            (201, 5, 200, 4),
+            (u32::MAX, u32::MAX, 200, 4),
+        ] {
+            let restored: Settings = serde_json::from_value(serde_json::json!({
+                "thumb_name_font_scale_percent": percent,
+                "thumb_name_max_lines": lines,
+            }))
+            .unwrap();
+            assert_eq!(restored.thumb_name_font_scale_percent, expected_percent);
+            assert_eq!(restored.thumb_name_max_lines, expected_lines);
+            let mut direct = Settings {
+                thumb_name_font_scale_percent: percent,
+                thumb_name_max_lines: lines,
+                ..Settings::default()
+            };
+            direct.sanitize();
+            assert_eq!(direct.thumb_name_font_scale_percent, expected_percent);
+            assert_eq!(direct.thumb_name_max_lines, expected_lines);
+        }
+    }
+
+    #[test]
+    fn thumb_name_settings_db_missing_keys_clamp_and_roundtrip() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key IN ('thumb_name_font_scale_percent', 'thumb_name_max_lines')",
+            [],
+        )
+        .unwrap();
+        let missing = db.load_into_settings().unwrap();
+        assert_eq!(missing.thumb_name_font_scale_percent, 100);
+        assert_eq!(missing.thumb_name_max_lines, 1);
+        for (percent, lines, expected_percent, expected_lines) in
+            [(0, 0, 100, 1), (201, 5, 200, 4), (175, 3, 175, 3)]
+        {
+            for (key, value) in [
+                ("thumb_name_font_scale_percent", percent),
+                ("thumb_name_max_lines", lines),
+            ] {
+                conn.execute(
+                    "INSERT OR REPLACE INTO settings_kv (key, value) VALUES (?1, ?2)",
+                    rusqlite::params![key, value.to_string()],
+                )
+                .unwrap();
+            }
+            let loaded = db.load_into_settings().unwrap();
+            assert_eq!(loaded.thumb_name_font_scale_percent, expected_percent);
+            assert_eq!(loaded.thumb_name_max_lines, expected_lines);
+            db.save_full(&loaded).unwrap();
+            let reread = db.load_into_settings().unwrap();
+            assert_eq!(reread.thumb_name_font_scale_percent, expected_percent);
+            assert_eq!(reread.thumb_name_max_lines, expected_lines);
+        }
+    }
+
+    #[test]
     fn thumb_show_resume_meter_defaults_on_and_preserves_disabled_setting() {
         assert!(Settings::default().thumb_show_resume_meter);
         let missing: Settings = serde_json::from_str("{}").unwrap();
@@ -10728,6 +11099,27 @@ mod tests {
         let restored: Settings =
             serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
         assert!(!restored.thumb_show_resume_meter);
+    }
+
+    #[test]
+    fn clipboard_bake_stage_defaults_to_display_adjust_and_roundtrips_each_stage() {
+        use crate::bake_stage::BakeStage;
+
+        assert_eq!(
+            Settings::default().bake_stage_clipboard,
+            BakeStage::DisplayAdjust
+        );
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.bake_stage_clipboard, BakeStage::DisplayAdjust);
+        for stage in BakeStage::ALL {
+            let settings = Settings {
+                bake_stage_clipboard: stage,
+                ..Settings::default()
+            };
+            let restored: Settings =
+                serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(restored.bake_stage_clipboard, stage);
+        }
     }
 
     #[test]
@@ -10998,6 +11390,52 @@ mod tests {
             stale_draft.rating_view_sort,
             RatingViewSort::Normal(SortOrder::DateAsc)
         );
+    }
+
+    #[test]
+    fn tag_view_sort_defaults_roundtrips_and_survives_preferences_merge() {
+        use crate::tag_view::TagViewSort;
+
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.tag_view_sort, TagViewSort::PathOrder);
+        assert_eq!(Settings::default().tag_view_sort, TagViewSort::PathOrder);
+        assert!(missing.details_show_applied_at);
+        assert!(missing.details_selection_bar_show_applied_at);
+        assert_eq!(missing.details_applied_at_width, None);
+        assert_eq!(missing.details_selection_bar_applied_at_width, None);
+
+        for sort in [
+            TagViewSort::PathOrder,
+            TagViewSort::AppliedAtDesc,
+            TagViewSort::AppliedAtAsc,
+        ] {
+            let mut live = Settings {
+                sort_order: SortOrder::DateAsc,
+                tag_view_sort: sort,
+                details_applied_at_width: Some(171.0),
+                details_show_applied_at: false,
+                details_selection_bar_applied_at_width: Some(219.0),
+                details_selection_bar_show_applied_at: false,
+                ..Settings::default()
+            };
+            let restored: Settings =
+                serde_json::from_value(serde_json::to_value(&live).unwrap()).unwrap();
+            assert_eq!(restored.tag_view_sort, sort);
+            assert_eq!(restored.sort_order, SortOrder::DateAsc);
+
+            let mut draft = Settings::default();
+            draft.overwrite_non_preferences_from(&mut live);
+            assert_eq!(draft.tag_view_sort, sort);
+            assert_eq!(draft.sort_order, SortOrder::DateAsc);
+            assert_eq!(draft.details_applied_at_width, Some(171.0));
+            assert!(!draft.details_show_applied_at);
+            assert_eq!(draft.details_selection_bar_applied_at_width, Some(219.0));
+            assert!(!draft.details_selection_bar_show_applied_at);
+            assert_eq!(
+                live.thumbnail_source_discovery_snapshot().tag_view_sort,
+                sort
+            );
+        }
     }
 
     #[test]
@@ -11728,6 +12166,14 @@ mod tests {
             settings.details_rated_at_width
         );
         assert_eq!(
+            settings.details_selection_bar_applied_at_width,
+            settings.details_applied_at_width
+        );
+        assert_eq!(
+            settings.details_selection_bar_show_applied_at,
+            settings.details_show_applied_at
+        );
+        assert_eq!(
             settings.details_selection_bar_show_preview,
             settings.details_show_preview
         );
@@ -11918,7 +12364,7 @@ mod tests {
         let applied = apply_ui_scale_factor(&ctx, 1.46);
         assert_f32_close(applied, 1.5);
         ctx.begin_pass(egui::RawInput::default());
-        let _ = ctx.end_pass();
+        let _ = ctx.end_pass().drop_without_applying_deltas();
         assert_f32_close(ctx.zoom_factor(), 1.5);
     }
 
@@ -12266,6 +12712,125 @@ mod tests {
     }
 
     #[test]
+    fn whats_new_acknowledgement_migrates_missing_released_field_and_persists_before_dismissal() {
+        for current in ["3.9.0", "3.10.0"] {
+            let env = setup_backup_env();
+            let mut old = Settings::load_with_meta_for_version("3.9.0").settings;
+            old.whats_new_acknowledged_version = None;
+            old.save();
+            // Model a released DB that has no key, rather than just a JSON null value.
+            let conn = rusqlite::Connection::open(env._tmp.path().join("settings.db")).unwrap();
+            conn.execute(
+                "DELETE FROM settings_kv WHERE key = 'whats_new_acknowledged_version'",
+                [],
+            )
+            .unwrap();
+            drop(conn);
+            reset_backup_state_for_test();
+            let loaded = Settings::load_with_meta_for_version(current);
+            assert_eq!(
+                loaded.settings.whats_new_acknowledged_version.as_deref(),
+                Some("3.9.0")
+            );
+            assert_eq!(loaded.settings.last_seen_version.as_deref(), Some(current));
+            let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+            assert_eq!(
+                stored.whats_new_acknowledged_version.as_deref(),
+                Some("3.9.0")
+            );
+            // No dialog dismissal/save: a second launch must retain the original range even
+            // though the startup/version marker has already advanced. Also covers same-version
+            // migration, where the acknowledgement alone must cause bootstrap writeback.
+            reset_backup_state_for_test();
+            let next = Settings::load_with_meta_for_version(current);
+            assert_eq!(
+                next.settings.whats_new_acknowledged_version.as_deref(),
+                Some("3.9.0")
+            );
+            let versions = |previous| {
+                crate::version_highlights::highlights_to_show(
+                    previous,
+                    current,
+                    crate::version_highlights::table(),
+                )
+                .iter()
+                .map(|entry| entry.version)
+                .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                versions(next.settings.whats_new_acknowledged_version.as_deref()),
+                versions(Some("3.9.0"))
+            );
+        }
+    }
+
+    #[test]
+    fn whats_new_acknowledgement_clean_install_is_current_and_has_no_highlights() {
+        let _env = setup_backup_env();
+        let loaded = Settings::load_with_meta_for_version("3.10.0");
+        assert_eq!(loaded.meta.previous_last_seen_version, None);
+        assert_eq!(
+            loaded.settings.whats_new_acknowledged_version.as_deref(),
+            Some("3.10.0")
+        );
+        let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+        assert_eq!(
+            stored.whats_new_acknowledged_version,
+            loaded.settings.whats_new_acknowledged_version
+        );
+        assert!(
+            crate::version_highlights::highlights_to_show(
+                stored.whats_new_acknowledged_version.as_deref(),
+                "3.10.0",
+                crate::version_highlights::table(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn whats_new_acknowledgement_survives_stale_preferences_draft() {
+        let mut live = Settings::default();
+        live.whats_new_acknowledged_version = Some("3.9.0".to_owned());
+        let mut draft = live.clone();
+        live.whats_new_acknowledged_version = Some("3.11.0".to_owned());
+        draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(
+            draft.whats_new_acknowledged_version.as_deref(),
+            Some("3.11.0")
+        );
+    }
+
+    #[test]
+    fn whats_new_acknowledgement_survives_undismissed_relaunch_and_skipped_upgrades() {
+        let _env = setup_backup_env();
+        let mut old = Settings::load_with_meta_for_version("3.8.0").settings;
+        old.whats_new_acknowledged_version = Some("3.8.0".to_owned());
+        old.save();
+        for current in ["3.9.0", "3.9.0", "3.10.0"] {
+            reset_backup_state_for_test();
+            let loaded = Settings::load_with_meta_for_version(current);
+            assert_eq!(
+                loaded.settings.whats_new_acknowledged_version.as_deref(),
+                Some("3.8.0")
+            );
+            let versions: Vec<_> = crate::version_highlights::highlights_to_show(
+                loaded.settings.whats_new_acknowledged_version.as_deref(),
+                current,
+                crate::version_highlights::table(),
+            )
+            .iter()
+            .map(|entry| entry.version)
+            .collect();
+            if current == "3.9.0" {
+                assert_eq!(versions, ["3.9.0"]);
+            } else {
+                assert_eq!(versions, ["3.9.0", "3.10.0"]);
+            }
+        }
+    }
+
+    #[test]
     fn grid_selection_upgrade_runs_only_once_after_user_restores_check_mode() {
         let mut settings = Settings::default();
         settings.grid_click_selection_mode = GridClickSelectionMode::Check;
@@ -12390,6 +12955,33 @@ mod tests {
         let mut loaded: Settings = serde_json::from_value(value).unwrap();
         loaded.sanitize();
         assert!(loaded.grid_cursor_wrap);
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_defaults_off_and_survives_sanitize() {
+        assert!(!Settings::default().fullscreen_manual_nav_wrap);
+        let mut legacy: Settings = serde_json::from_str("{}").unwrap();
+        legacy.sanitize();
+        assert!(!legacy.fullscreen_manual_nav_wrap);
+        let mut enabled: Settings =
+            serde_json::from_str(r#"{"fullscreen_manual_nav_wrap":true}"#).unwrap();
+        enabled.sanitize();
+        assert!(enabled.fullscreen_manual_nav_wrap);
+    }
+
+    #[test]
+    fn fullscreen_manual_nav_wrap_roundtrips_json() {
+        for enabled in [false, true] {
+            let original = Settings {
+                fullscreen_manual_nav_wrap: enabled,
+                ..Settings::default()
+            };
+            let value = serde_json::to_value(&original).unwrap();
+            assert_eq!(value["fullscreen_manual_nav_wrap"], enabled);
+            let mut loaded: Settings = serde_json::from_value(value).unwrap();
+            loaded.sanitize();
+            assert_eq!(loaded.fullscreen_manual_nav_wrap, enabled);
+        }
     }
 
     #[test]
@@ -12545,6 +13137,8 @@ mod tests {
             width: 177.0,
         }];
         settings.details_rated_at_width = Some(166.0);
+        settings.details_applied_at_width = Some(188.0);
+        settings.details_show_applied_at = false;
         settings.details_show_preview = false;
         settings.details_show_rating = false;
         settings.details_show_rated_at = false;
@@ -13790,13 +14384,23 @@ mod tests {
             .details_column_order
             .iter()
             .copied()
-            .filter(|column| *column != DetailsColumnId::RatedAt)
+            .filter(|column| {
+                !matches!(
+                    column,
+                    DetailsColumnId::RatedAt | DetailsColumnId::AppliedAt
+                )
+            })
             .collect::<Vec<_>>();
         let expected_selection_bar_without_rated_at = settings
             .details_selection_bar_column_order
             .iter()
             .copied()
-            .filter(|column| *column != DetailsColumnId::RatedAt)
+            .filter(|column| {
+                !matches!(
+                    column,
+                    DetailsColumnId::RatedAt | DetailsColumnId::AppliedAt
+                )
+            })
             .collect::<Vec<_>>();
 
         let mut persisted = settings.clone();
@@ -13826,13 +14430,23 @@ mod tests {
             .details_column_order
             .iter()
             .copied()
-            .filter(|column| *column != DetailsColumnId::RatedAt)
+            .filter(|column| {
+                !matches!(
+                    column,
+                    DetailsColumnId::RatedAt | DetailsColumnId::AppliedAt
+                )
+            })
             .collect::<Vec<_>>();
         let loaded_selection_bar_without_rated_at = loaded
             .details_selection_bar_column_order
             .iter()
             .copied()
-            .filter(|column| *column != DetailsColumnId::RatedAt)
+            .filter(|column| {
+                !matches!(
+                    column,
+                    DetailsColumnId::RatedAt | DetailsColumnId::AppliedAt
+                )
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             loaded_details_without_rated_at,
@@ -13844,15 +14458,123 @@ mod tests {
         );
         assert_eq!(
             loaded.details_column_order.last(),
-            Some(&DetailsColumnId::RatedAt)
+            Some(&DetailsColumnId::AppliedAt)
         );
         assert_eq!(
             loaded.details_selection_bar_column_order.last(),
-            Some(&DetailsColumnId::RatedAt)
+            Some(&DetailsColumnId::AppliedAt)
         );
         assert_eq!(loaded.details_rated_at_width, Some(154.0));
         assert_eq!(loaded.details_selection_bar_rated_at_width, Some(176.0));
         assert_eq!(loaded.details_sort_key, DetailsSortKey::Toolbar);
+    }
+
+    #[test]
+    fn applied_at_details_stash_keeps_old_fields_readable_and_preserves_column_settings() {
+        // A previous reader knows neither AppliedAt nor the added dedicated fields.
+        #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
+        enum PreviousColumn {
+            Name,
+            Size,
+        }
+        #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
+        enum PreviousSort {
+            Toolbar,
+        }
+        #[derive(serde::Deserialize)]
+        struct PreviousWidth {
+            column: PreviousColumn,
+            width: f32,
+        }
+        #[derive(serde::Deserialize)]
+        struct PreviousSettings {
+            sort_order: SortOrder,
+            details_sort_key: PreviousSort,
+            details_column_order: Vec<PreviousColumn>,
+            details_column_widths: Vec<PreviousWidth>,
+            details_selection_bar_column_order: Vec<PreviousColumn>,
+            details_selection_bar_column_widths: Vec<PreviousWidth>,
+        }
+
+        let mut live = Settings {
+            sort_order: SortOrder::DateDesc,
+            tag_view_sort: crate::tag_view::TagViewSort::AppliedAtAsc,
+            details_sort_key: DetailsSortKey::AppliedAt,
+            details_column_order: vec![
+                DetailsColumnId::Name,
+                DetailsColumnId::AppliedAt,
+                DetailsColumnId::Size,
+            ],
+            details_column_widths: vec![
+                DetailsColumnWidth {
+                    column: DetailsColumnId::AppliedAt,
+                    width: 177.0,
+                },
+                DetailsColumnWidth {
+                    column: DetailsColumnId::Size,
+                    width: 120.0,
+                },
+            ],
+            details_show_applied_at: false,
+            details_selection_bar_column_order: vec![
+                DetailsColumnId::AppliedAt,
+                DetailsColumnId::Name,
+            ],
+            details_selection_bar_column_widths: vec![DetailsColumnWidth {
+                column: DetailsColumnId::AppliedAt,
+                width: 233.0,
+            }],
+            details_selection_bar_show_applied_at: false,
+            ..Settings::default()
+        };
+        live.stash_details_rated_at_for_persist();
+        let value = serde_json::to_value(&live).unwrap();
+        let previous: PreviousSettings = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(previous.sort_order, SortOrder::DateDesc);
+        assert_eq!(previous.details_sort_key, PreviousSort::Toolbar);
+        assert_eq!(
+            previous.details_column_order,
+            [PreviousColumn::Name, PreviousColumn::Size]
+        );
+        assert_eq!(previous.details_column_widths.len(), 1);
+        assert_eq!(
+            previous.details_column_widths[0].column,
+            PreviousColumn::Size
+        );
+        assert_eq!(previous.details_column_widths[0].width, 120.0);
+        assert_eq!(
+            previous.details_selection_bar_column_order,
+            [PreviousColumn::Name]
+        );
+        assert!(previous.details_selection_bar_column_widths.is_empty());
+
+        let mut loaded: Settings = serde_json::from_value(value).unwrap();
+        loaded.sanitize();
+        assert_eq!(
+            loaded.tag_view_sort,
+            crate::tag_view::TagViewSort::AppliedAtAsc
+        );
+        assert_eq!(loaded.details_sort_key, DetailsSortKey::Toolbar);
+        assert_eq!(loaded.details_applied_at_width, Some(177.0));
+        assert_eq!(loaded.details_selection_bar_applied_at_width, Some(233.0));
+        assert!(!loaded.details_show_applied_at);
+        assert!(!loaded.details_selection_bar_show_applied_at);
+        assert!(
+            loaded
+                .details_column_order
+                .contains(&DetailsColumnId::AppliedAt)
+        );
+        assert!(
+            loaded
+                .details_selection_bar_column_order
+                .contains(&DetailsColumnId::AppliedAt)
+        );
+
+        loaded.details_applied_at_width = Some(f32::NAN);
+        loaded.details_selection_bar_applied_at_width = Some(900.0);
+        loaded.sanitize();
+        assert_eq!(loaded.details_applied_at_width, None);
+        assert_eq!(loaded.details_selection_bar_applied_at_width, Some(800.0));
     }
 
     #[test]
@@ -14594,6 +15316,88 @@ mod tests {
     }
 
     #[test]
+    fn detached_physical_placement_preserves_legacy_only_settings() {
+        let legacy = DetachedViewerWindowPlacement {
+            x: 4000.0,
+            y: 100.0,
+            w: 960.0,
+            h: 720.0,
+            maximized: true,
+        };
+        let mut stored = serde_json::to_value(Settings::default()).unwrap();
+        stored
+            .as_object_mut()
+            .unwrap()
+            .remove("detached_viewer_window_physical_placement");
+        stored["detached_viewer_window_placement"] = serde_json::to_value(legacy).unwrap();
+
+        let loaded: Settings = serde_json::from_value(stored).unwrap();
+        assert_eq!(loaded.detached_viewer_window_placement, Some(legacy));
+        assert_eq!(loaded.detached_viewer_window_physical_placement, None);
+    }
+
+    #[test]
+    fn detached_physical_placement_roundtrips_without_changing_legacy_value() {
+        use crate::detached_window_geometry::{PhysicalRect, PhysicalWindowPlacement};
+
+        let legacy = DetachedViewerWindowPlacement {
+            x: 4000.0,
+            y: 100.0,
+            w: 960.0,
+            h: 720.0,
+            maximized: false,
+        };
+        let physical = PhysicalWindowPlacement {
+            outer: PhysicalRect {
+                left: -1920,
+                top: -200,
+                right: -720,
+                bottom: 700,
+            },
+            maximized: true,
+        };
+        let settings = Settings {
+            detached_viewer_window_placement: Some(legacy),
+            detached_viewer_window_physical_placement: Some(physical),
+            ..Settings::default()
+        };
+        let loaded: Settings =
+            serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.detached_viewer_window_placement, Some(legacy));
+        assert_eq!(
+            loaded.detached_viewer_window_physical_placement,
+            Some(physical)
+        );
+    }
+
+    #[test]
+    fn detached_physical_placement_live_copy_keeps_latest_physical_rect() {
+        use crate::detached_window_geometry::{PhysicalRect, PhysicalWindowPlacement};
+
+        let mut draft = Settings::default();
+        let mut live = Settings::default();
+        let physical = PhysicalWindowPlacement {
+            outer: PhysicalRect {
+                left: 6000,
+                top: 2270,
+                right: 6960,
+                bottom: 2990,
+            },
+            maximized: false,
+        };
+        live.detached_viewer_window_physical_placement = Some(physical);
+        draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(
+            draft.detached_viewer_window_physical_placement,
+            Some(physical)
+        );
+
+        live.detached_viewer_window_physical_placement = None;
+        draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(draft.detached_viewer_window_physical_placement, None);
+    }
+
+    #[test]
     fn overwrite_non_preferences_keeps_detached_image_window_preference() {
         let mut edited = Settings::default();
         let mut live = Settings::default();
@@ -14830,6 +15634,16 @@ mod tests {
             assert!(settings.page_turn_animation_enabled);
             assert_eq!(settings.page_turn_animation_duration_ms, expected);
         }
+    }
+
+    #[test]
+    fn auto_view_trim_global_default_is_off_for_new_and_legacy_settings() {
+        assert!(!Settings::default().auto_view_trim_default_enabled);
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.auto_view_trim_default_enabled);
+        let enabled: Settings =
+            serde_json::from_str(r#"{"auto_view_trim_default_enabled":true}"#).unwrap();
+        assert!(enabled.auto_view_trim_default_enabled);
     }
 
     #[test]
@@ -17143,7 +17957,10 @@ mod tests {
         assert!(!old.toolbar_folder_section_migrated);
         assert!(old.migrate_toolbar_folder_section());
         assert_eq!(&old.toolbar_section_order[..2], &[TS::Tags, TS::Cols]);
-        assert_eq!(old.toolbar_section_order.last(), Some(&TS::Folder));
+        assert_eq!(
+            old.toolbar_section_order.last(),
+            Some(&TS::SearchEverything)
+        );
         assert_eq!(
             old.toolbar_section_order
                 .iter()
@@ -17262,7 +18079,7 @@ mod tests {
         );
         assert_eq!(
             loaded.settings.toolbar_section_order.last(),
-            Some(&ToolbarSectionId::Folder)
+            Some(&ToolbarSectionId::SearchEverything)
         );
         assert_eq!(
             loaded.settings.toolbar_section_new_row,
@@ -18207,6 +19024,74 @@ mod tests {
             assert_eq!(loaded.sort_order, SortOrder::DateDesc);
             assert_eq!(loaded.rating_view_sort, RatingViewSort::RatedAtAsc);
         }
+
+        #[test]
+        fn tag_view_sort_db_roundtrip_and_missing_key_preserve_normal_sort() {
+            use crate::tag_view::TagViewSort;
+
+            let env = setup_backup_env();
+            let _initial = Settings::load();
+            for sort in [
+                TagViewSort::AppliedAtAsc,
+                TagViewSort::AppliedAtDesc,
+                TagViewSort::PathOrder,
+            ] {
+                let settings = Settings {
+                    sort_order: SortOrder::DateDesc,
+                    tag_view_sort: sort,
+                    details_sort_key: DetailsSortKey::AppliedAt,
+                    details_column_order: vec![DetailsColumnId::Name, DetailsColumnId::AppliedAt],
+                    details_applied_at_width: Some(177.0),
+                    details_show_applied_at: false,
+                    details_selection_bar_applied_at_width: Some(233.0),
+                    details_selection_bar_show_applied_at: false,
+                    ..Settings::default()
+                };
+                settings.save();
+                reset_backup_state_for_test();
+                let loaded = Settings::load();
+                assert_eq!(loaded.sort_order, SortOrder::DateDesc);
+                assert_eq!(loaded.tag_view_sort, sort);
+                assert_eq!(loaded.details_sort_key, DetailsSortKey::Toolbar);
+                assert_eq!(loaded.details_applied_at_width, Some(177.0));
+                assert!(!loaded.details_show_applied_at);
+                assert_eq!(loaded.details_selection_bar_applied_at_width, Some(233.0));
+                assert!(!loaded.details_selection_bar_show_applied_at);
+
+                let conn = rusqlite::Connection::open(data_db_path(&env)).unwrap();
+                let raw: String = conn
+                    .query_row(
+                        "SELECT value FROM settings_kv WHERE key='tag_view_sort'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(serde_json::from_str::<TagViewSort>(&raw).unwrap(), sort);
+                for key in [
+                    "details_sort_key",
+                    "details_column_order",
+                    "details_column_widths",
+                    "details_selection_bar_column_order",
+                    "details_selection_bar_column_widths",
+                ] {
+                    let raw: String = conn
+                        .query_row("SELECT value FROM settings_kv WHERE key=?1", [key], |row| {
+                            row.get(0)
+                        })
+                        .unwrap();
+                    assert!(!raw.contains("AppliedAt"), "legacy field {key}: {raw}");
+                }
+            }
+
+            let conn = rusqlite::Connection::open(data_db_path(&env)).unwrap();
+            conn.execute("DELETE FROM settings_kv WHERE key='tag_view_sort'", [])
+                .unwrap();
+            drop(conn);
+            reset_backup_state_for_test();
+            let missing = Settings::load();
+            assert_eq!(missing.tag_view_sort, TagViewSort::PathOrder);
+            assert_eq!(missing.sort_order, SortOrder::DateDesc);
+        }
         fn db_bak_path(env: &BackupTestEnv, n: usize) -> PathBuf {
             let _ = env;
             crate::data_dir::get().join(format!("settings.db.bak{n}"))
@@ -18525,10 +19410,15 @@ mod tests {
             // 末尾へ補完する。ほかの下部情報バー設定は従来どおり完全に往復する。
             expected
                 .details_selection_bar_column_order
-                .retain(|column| *column != DetailsColumnId::RatedAt);
+                .retain(|column| {
+                    !matches!(
+                        column,
+                        DetailsColumnId::RatedAt | DetailsColumnId::AppliedAt
+                    )
+                });
             expected
                 .details_selection_bar_column_order
-                .push(DetailsColumnId::RatedAt);
+                .extend([DetailsColumnId::RatedAt, DetailsColumnId::AppliedAt]);
             let expected_data = selection_bar_data_value(&expected);
 
             settings.save();
@@ -19465,6 +20355,7 @@ impl Settings {
     /// A lightweight immutable scan snapshot, without copying histories, preset rows or VST state.
     pub(crate) fn thumbnail_source_discovery_snapshot(&self) -> Self {
         Self {
+            tag_view_sort: self.tag_view_sort,
             file_type_visibility: self.file_type_visibility.clone(),
             skip_image_if_video_exists: self.skip_image_if_video_exists,
             video_thumb_use_sidecar_image: self.video_thumb_use_sidecar_image,
@@ -19492,5 +20383,55 @@ impl<'de> serde::Deserialize<'de> for Settings {
             crate::same_name_folder_book::canonicalize(map).map_err(serde::de::Error::custom)?;
         }
         Settings::deserialize(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod pinned_search_settings_tests {
+    use super::*;
+    use crate::ui_pinned_search::PinnedSearchKind as Kind;
+    #[test]
+    fn section1409_settings_default_roundtrip_unknown_and_live_carry() {
+        let defaults = Settings::default();
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        for settings in [&defaults, &missing] {
+            assert!(Kind::ALL.into_iter().all(|kind| !kind.pinned(settings)));
+            assert!(
+                Kind::ALL
+                    .into_iter()
+                    .all(|kind| !settings.toolbar_section_new_row.contains(&kind.section()))
+            );
+        }
+        let order = ToolbarSectionId::default_order();
+        let folder = order
+            .iter()
+            .position(|id| *id == ToolbarSectionId::Folder)
+            .unwrap();
+        assert_eq!(&order[folder + 1..], &Kind::ALL.map(Kind::section));
+        let mut live = Settings::default();
+        live.show_toolbar_search_local = true;
+        live.show_toolbar_search_everything = true;
+        live.toolbar_section_order = Kind::ALL.map(Kind::section).into_iter().rev().collect();
+        live.toolbar_section_new_row = vec![ToolbarSectionId::SearchEverything];
+        let mut edited = defaults.preferences_snapshot();
+        edited.overwrite_non_preferences_from(&mut live);
+        let value = serde_json::to_value(&edited).unwrap();
+        let loaded: Settings = serde_json::from_value(value).unwrap();
+        assert!(loaded.show_toolbar_search_local && loaded.show_toolbar_search_everything);
+        assert!(!loaded.show_toolbar_search_container && !loaded.show_toolbar_search_metadata);
+        let future: Vec<ToolbarSectionId> = serde_json::from_str(
+            r#"["SearchLocal", "FutureSearch", "SearchEverything", "SearchLocal"]"#,
+        )
+        .unwrap();
+        assert_eq!(future[1], ToolbarSectionId::Unknown);
+        let complete = ToolbarSectionId::ordered_with_fallback(&future);
+        assert_eq!(
+            &complete[..2],
+            &[
+                ToolbarSectionId::SearchLocal,
+                ToolbarSectionId::SearchEverything
+            ]
+        );
+        assert_eq!(complete.len(), order.len());
     }
 }

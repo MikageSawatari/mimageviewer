@@ -259,7 +259,7 @@ fn p4b3_modal_blocks_host_actions_and_editor_undo_input() {
             ChromeAction::CancelResources,
         ],
     );
-    let _ = ctx.run(
+    let _ = crate::project::headless_paint_output(ctx.run_ui(
         egui::RawInput {
             events: vec![egui::Event::Key {
                 key: egui::Key::Z,
@@ -273,7 +273,7 @@ fn p4b3_modal_blocks_host_actions_and_editor_undo_input() {
         |ctx| {
             app.process_editor_frame(ctx);
         },
-    );
+    ));
     assert_eq!(app.project, expected);
     assert_eq!(app.position_secs, 0.0);
     assert!(!app.export_state.setup_open());
@@ -301,7 +301,7 @@ fn p4b3_choosing_is_modal_and_cancellation_returns_to_idle_without_export() {
         &ctx,
         vec![ChromeAction::TogglePlayback, ChromeAction::Seek(0.3)],
     );
-    let _ = ctx.run(
+    let _ = crate::project::headless_paint_output(ctx.run_ui(
         egui::RawInput {
             events: vec![egui::Event::Key {
                 key: egui::Key::Z,
@@ -315,7 +315,7 @@ fn p4b3_choosing_is_modal_and_cancellation_returns_to_idle_without_export() {
         |ctx| {
             app.process_editor_frame(ctx);
         },
-    );
+    ));
     assert_eq!(app.project, expected);
     assert_eq!(app.position_secs, 0.0);
     assert!(app.export_state.setup_open());
@@ -361,9 +361,10 @@ fn p4b3_modal_draws_all_stages_and_exposes_only_cancel_action() {
     let ctx = crate::project::test_context();
     let tx = pending(&mut app);
     for _ in 0..2 {
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            app.draw_mp4_dialogs(ctx, &mut vec![])
-        });
+        let _ =
+            crate::project::headless_paint_output(ctx.run_ui(egui::RawInput::default(), |ctx| {
+                app.draw_mp4_dialogs(ctx, &mut vec![])
+            }));
     }
     for (index, label) in [
         "反応範囲の計算",
@@ -377,11 +378,12 @@ fn p4b3_modal_draws_all_stages_and_exposes_only_cancel_action() {
         if let ExportKind::Mp4 { stage, .. } = &app.export_state.pending().unwrap().kind {
             stage.store(index, Ordering::Relaxed);
         }
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            let mut actions = vec![];
-            app.draw_mp4_dialogs(ctx, &mut actions);
-            assert!(actions.is_empty());
-        });
+        let output =
+            crate::project::headless_paint_output(ctx.run_ui(egui::RawInput::default(), |ctx| {
+                let mut actions = vec![];
+                app.draw_mp4_dialogs(ctx, &mut actions);
+                assert!(actions.is_empty());
+            }));
         let text = output
             .shapes
             .iter()

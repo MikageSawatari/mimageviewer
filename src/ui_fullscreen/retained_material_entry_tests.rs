@@ -221,18 +221,19 @@ fn final_only_page(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
     let item_count = app.items.len();
     app.thumbnails
         .resize_with(item_count, || ThumbnailState::Pending);
-    app.thumbnails[0] = ThumbnailState::Loaded {
-        tex: ctx.load_texture(
+    app.thumbnails[0] = ThumbnailState::loaded_raster(
+        ctx.load_texture(
             "retained-entry-thumbnail",
             egui::ColorImage::filled([160, 240], egui::Color32::GRAY),
             egui::TextureOptions::LINEAR,
         ),
-        origin: crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
-        from_edit_preview: false,
-        rendered_at_px: 240,
-        source_dims: Some((160, 240)),
-        layout_dims: Some((600_000, 900_000)),
-    };
+        crate::thumb_loader::ThumbLoadOrigin::SourceIntrinsic,
+        false,
+        240,
+        crate::source_coverage::SourceCoverage::FullSource,
+        Some((160, 240)),
+        Some((600_000, 900_000)),
+    );
     app.page_dims_cache
         .record(generation, 0, PagePixelDimensions::Thumbnail((160, 240)));
     evict_pair_cpu(&mut app);
@@ -243,8 +244,10 @@ fn final_only_page(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
         .insert(0, crate::rotation_db::Rotation::None);
     // Avoid font discovery and optional add-on prompts in entry-only tests.
     app.comic_font_registry_loaded = true;
-    app.comic_fonts_loaded = true;
-    app.comic_fonts = Some(Arc::new(comic_core::FontSet::new()));
+    app.comic_fonts.seed_for_test(
+        Some(Arc::new(comic_core::FontSet::new())),
+        Default::default(),
+    );
     app.editing_addon_declined_session = true;
     app.show_whats_new = false;
     app.show_mouse_nav_migration_prompt = false;
@@ -370,6 +373,7 @@ fn retained_material_entry_comparison_and_rotation_keep_completed_pixels() {
     let mut app = final_only_page(&ctx);
     let pinned = Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::BLUE));
     app.pinned_compare_slot = Some(crate::app::PinnedCompareSlot {
+        original_source: crate::app::PinnedOriginalSource::SameAsProcessed,
         pixels: Arc::clone(&pinned),
         indicator_pixels: pinned,
         indicator_texture: None,
@@ -537,10 +541,7 @@ fn seed_current_erase_stage(app: &mut App, ctx: &egui::Context) -> Arc<egui::Col
     );
     app.erase_result_cache.insert(
         key,
-        crate::app::EraseResultCacheEntry {
-            pixels: Arc::clone(&pixels),
-            texture,
-        },
+        crate::app::EraseResultCacheEntry::raster(Arc::clone(&pixels), texture),
     );
     app.mask_pages.insert(0);
     pixels
@@ -633,6 +634,7 @@ fn retained_material_entry_original_completion_resumes_the_requested_erase_entry
     assert_eq!(base.size, [4, 6]);
     assert!(
         base.pixels
+            .pixels
             .iter()
             .all(|&pixel| pixel == egui::Color32::GREEN)
     );
@@ -721,11 +723,11 @@ fn retained_material_entry_original_preview_selects_only_the_requested_original(
 
 #[test]
 fn retained_material_entry_saved_manual_trim_uses_final_while_auto_trim_requests_original() {
-    use crate::view_trim::{ViewTrimApplyMode, ViewTrimMargins, ViewTrimPageOverride};
+    use crate::view_trim::{ViewTrimMargins, ViewTrimPageOverride};
 
     let ctx = egui::Context::default();
     let mut app = final_only_page(&ctx);
-    app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+    app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
     app.view_trim_page_overrides.insert(
         0,
         ViewTrimPageOverride::from_margins(ViewTrimMargins {
@@ -744,7 +746,7 @@ fn retained_material_entry_saved_manual_trim_uses_final_while_auto_trim_requests
     );
     assert_final_only(&app);
     app.view_trim_page_overrides.clear();
-    app.view_trim_apply_mode = ViewTrimApplyMode::Auto;
+    app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Auto;
     let (sender, cancel) = pending_original(&mut app);
     assert!(app.view_trim_single_content_bbox(0).is_none());
     assert_original_continuation(
@@ -909,7 +911,7 @@ fn original_with_margins(margin: usize) -> crate::fs_animation::FsLoadResult {
 #[test]
 fn retained_material_entry_view_trim_single_detect_and_seed_wait_for_original() {
     use crate::ui_view_trim::OriginalViewTrimAction;
-    use crate::view_trim::{ViewTrimApplyMode, ViewTrimMargins};
+    use crate::view_trim::ViewTrimMargins;
 
     let ctx = egui::Context::default();
     for action in [
@@ -918,14 +920,14 @@ fn retained_material_entry_view_trim_single_detect_and_seed_wait_for_original() 
     ] {
         let mut app = final_only_page(&ctx);
         app.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
-        app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         app.view_trim_book_settings.enabled = true;
         app.view_trim_book_settings.single = ViewTrimMargins {
             left: 0.03,
             ..Default::default()
         };
         let before = app.view_trim_book_settings;
-        let seed_id = egui::Id::new(("view_trim_auto_page_seed_pending", 0usize));
+        let seed_id = egui::Id::unique(("view_trim_auto_page_seed_pending", 0usize));
         ctx.data_mut(|data| data.insert_temp(seed_id, true));
         let (sender, cancel) = pending_original(&mut app);
         app.request_view_trim_original_action(&ctx, 0, SpreadPair::Single, action);
@@ -967,7 +969,6 @@ fn retained_material_entry_view_trim_single_detect_and_seed_wait_for_original() 
 #[test]
 fn retained_material_entry_view_trim_spread_keeps_one_action_until_both_originals_arrive() {
     use crate::ui_view_trim::OriginalViewTrimAction;
-    use crate::view_trim::ViewTrimApplyMode;
 
     let ctx = egui::Context::default();
     for action in [
@@ -984,7 +985,7 @@ fn retained_material_entry_view_trim_spread_keeps_one_action_until_both_original
                 panic!("final cover must be a displayed pair");
             };
             assert!(!app.fs_cache.contains_key(&left) && !app.fs_cache.contains_key(&right));
-            app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+            app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
             app.view_trim_book_settings.enabled = true;
             let before = app.view_trim_book_settings;
             let (left_sender, _) = pending_original_at(&mut app, left);
@@ -1052,12 +1053,12 @@ fn retained_material_entry_view_trim_spread_keeps_one_action_until_both_original
 #[test]
 fn retained_material_entry_view_trim_scope_or_settings_change_cancels_deferred_detection() {
     use crate::ui_view_trim::OriginalViewTrimAction;
-    use crate::view_trim::{ViewTrimApplyMode, ViewTrimMargins, ViewTrimPageOverride};
+    use crate::view_trim::{ViewTrimMargins, ViewTrimPageOverride};
 
     let ctx = egui::Context::default();
     for change_scope in [false, true] {
         let mut app = final_only_page(&ctx);
-        app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
         let (sender, _) = pending_original(&mut app);
         app.request_view_trim_original_action(
             &ctx,
@@ -1089,7 +1090,6 @@ fn retained_material_entry_view_trim_scope_or_settings_change_cancels_deferred_d
 #[test]
 fn retained_material_entry_view_trim_simultaneous_spread_sources_commit_without_another_load() {
     use crate::ui_view_trim::OriginalViewTrimAction;
-    use crate::view_trim::ViewTrimApplyMode;
 
     let ctx = egui::Context::default();
     let mut app = final_only_page(&ctx);
@@ -1100,7 +1100,7 @@ fn retained_material_entry_view_trim_simultaneous_spread_sources_commit_without_
     let SpreadPair::Double { left, right } = pair else {
         panic!("final cover displayed pair");
     };
-    app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+    app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
     let (left_sender, _) = pending_original_at(&mut app, left);
     let (right_sender, _) = pending_original_at(&mut app, right);
     app.request_view_trim_original_action(&ctx, 21, pair, OriginalViewTrimAction::DetectBook);
@@ -1115,7 +1115,6 @@ fn retained_material_entry_view_trim_simultaneous_spread_sources_commit_without_
 #[test]
 fn retained_material_entry_view_trim_failed_partner_terminates_the_accepted_action() {
     use crate::ui_view_trim::OriginalViewTrimAction;
-    use crate::view_trim::ViewTrimApplyMode;
 
     let ctx = egui::Context::default();
     let mut app = final_only_page(&ctx);
@@ -1126,7 +1125,7 @@ fn retained_material_entry_view_trim_failed_partner_terminates_the_accepted_acti
     let SpreadPair::Double { left, right } = pair else {
         panic!("final cover displayed pair");
     };
-    app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+    app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
     let before = app.view_trim_book_settings;
     let (left_sender, _) = pending_original_at(&mut app, left);
     let (right_sender, _) = pending_original_at(&mut app, right);
@@ -1152,11 +1151,11 @@ fn retained_material_entry_view_trim_failed_partner_terminates_the_accepted_acti
 #[test]
 fn retained_material_entry_view_trim_page_detection_preserves_page_scope() {
     use crate::ui_view_trim::OriginalViewTrimAction;
-    use crate::view_trim::{ViewTrimApplyMode, ViewTrimMargins, ViewTrimPageOverride};
+    use crate::view_trim::{ViewTrimMargins, ViewTrimPageOverride};
 
     let ctx = egui::Context::default();
     let mut app = final_only_page(&ctx);
-    app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+    app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
     app.view_trim_page_overrides.insert(
         0,
         ViewTrimPageOverride::from_margins(ViewTrimMargins {
@@ -1175,7 +1174,10 @@ fn retained_material_entry_view_trim_page_detection_preserves_page_scope() {
     sender.send(original_with_margins(20)).unwrap();
     app.poll_prefetch(&ctx, crate::app::PollPrefetchOrigin::TopLevel);
     assert!(app.view_trim_page_overrides.get(&0).unwrap().margins.left > 0.1);
-    assert_eq!(app.view_trim_apply_mode, ViewTrimApplyMode::Book);
+    assert_eq!(
+        app.view_trim_book_preference,
+        crate::view_trim::ViewTrimBookPreference::Manual
+    );
     assert_eq!(app.view_trim_book_settings, before_book);
 }
 
@@ -1238,14 +1240,13 @@ fn retained_material_entry_legacy_crop_is_preserved_by_capture_and_ctrl_e() {
 #[test]
 fn retained_material_entry_view_trim_accepts_existing_raw_preview_pixels() {
     use crate::ui_view_trim::OriginalViewTrimAction;
-    use crate::view_trim::ViewTrimApplyMode;
 
     let ctx = egui::Context::default();
     let mut app = final_only_page(&ctx);
     app.items[0] = GridItem::Image(app.tmp.path().join("margin-preview.nef"));
     app.final_composite_cache.clear();
     app.viewer_navigation_caches.invalidate();
-    app.view_trim_apply_mode = ViewTrimApplyMode::Book;
+    app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
     let crate::fs_animation::FsLoadResult::Static { ci, .. } = original_with_margins(20) else {
         unreachable!();
     };

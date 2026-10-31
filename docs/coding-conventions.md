@@ -9,8 +9,25 @@
   スクロールオフセットは App が自前管理（egui の自動スクロールは使わない）。
 - **Row snapping**: オフセットは常に `cell_size` の整数倍。最大オフセットも
   `ceil((total_h - viewport_h) / cell_size) * cell_size` で行境界に揃える。
-  一覧の touch drag も `scroll_offset_y` 自体は anchor として行境界に保ち、1 行未満の
+  一覧の touch drag も `GridScrollState` のcanonical offset自体はanchorとして行境界に保ち、1 行未満の
   描画端数だけを viewport の一時データに分離する。端数を canonical offset へ混ぜない。
+- **一覧の位置とgeometryの契約（5ch >>661）**: offset・一回要求・未消費RowAnchor・描画geometryは
+  context所有の `GridScrollState` に集約する。詳細は実列数1／行高28、サムネイルは実列数／cell_hを記録する。
+  現在body高と全content高から一度だけextentを解決し、確保高とegui opt-in APIへ同じ結果を渡す。
+  viewport最小64 pt・margin 0を両者で揃える。復元／Edge／実移動／先行clamp・snapは `Set`、
+  通常同期は `Sync`、App所有touchの描画位置は `AppGesture`。native readbackは候補値を行丸め・clampして
+  採用し、明示要求を再発行しない。比率変更も描画proofに基づきgeometryとcanonicalを同時変換する。
+  実装段と検証状況は [調査書](scroll-661-investigation.md#修正の設計) を正本とする。
+- **一覧入力の寿命と再pass**: geometry／native慣性のStateはviewer context＋rendererで分け、
+  pointer transport IDは実viewportの一覧に安定させる。pressの所属と処理済frameの所属は同じcapture ownerで
+  区別し、順序付きイベントとeguiの実保持先で新pressを受理する。Responseの集約flagだけに依存しない。
+  同ownerのSync再passは、Appが半行未満のreadbackを採らなくても最初のnative移動・rubber-bandを保持する。
+  Set／AppGesture／session交代は明示位置を優先する。pointer・touchとも旧入力を宛先へ再所属させない。
+  旧touch由来Moveと新mouse captureを混在させる既存経路は、基点比較後の設計担当判断で
+  §1.487へ分離した。新契約では同frame描画にもその誤採用が出る差がある。範囲と完了状況は調査書を参照する。
+  セルのrelease受理も実TouchFrameへ接続し、後続pressのaggregate座標で旧clickの所属を上書きしない。
+  backend Endはraw Touch座標ではなく最後のcursor位置で相関する。barの完了click／保持区間はpress stamp順、
+  non-rubber位置はopt-inのcontent配置前に確定する。[再修正・検証](scroll-661-investigation.md#implementation-review-revise)を参照。
 - **Mouse wheel**: `ctx.input_mut` で MouseWheel イベントを消費し、1行分に変換。
 - **Popup / menu wheel passthrough**: `menu_button` / `ComboBox` / popup 内に
   `ScrollArea` を置く場合、popup が開いている frame では `raw_scroll_delta` /
@@ -40,6 +57,10 @@
   止めるため、モデルレス Window と将来の登録漏れにも安全側で動く。state が存在しても
   Window を描かない phase がある処理は、state の有無ではなく「現在表示されるか」を返す
   helper を登録すること。
+- **メイン枠のポインター操作**: 各バーとフォルダーツリーは `gate_main_chrome` で停止する。
+  グリッドの右クリックメニューだけは除外し、modal への遷移時に既存 popup と submenu 状態を閉じる。
+  遷移判定は root の worker 採用・入力処理後、ウィンドウ描画前に1回だけ行い、
+  その後 dialog 自身が開いた popup は閉じない。無効化時の枠全体の配色は維持する。
 - 数十分以上続く取得・管理 UI (TensorRT パック等) はモデルレス tool window とし、
   `common_modal_dialog_open` へ含めて閲覧全体を停止しない。Window 上の入力だけは floating-layer
   guard で背面へ漏らさない。
@@ -69,7 +90,7 @@
 ### パネル (Area + Frame::popup)
 - フルスクリーン上の固定パネルで `egui::Area::fixed_pos` + `Frame::popup` +
   `ScrollArea` を組み合わせる場合、`ScrollArea::max_height` だけに頼らない。
-  egui 0.33 は親 `Ui` の `available_rect_before_wrap()` を上限にするため、自動サイズの
+  egui は親 `Ui` の `available_rect_before_wrap()` を上限にするため (0.33 で確認)、自動サイズの
   `Area` / `Frame::popup` 内ではコンテンツ高に縮むことがある。
 - 下端近くまで伸ばしたいパネルは、ScrollArea の前に
   `ui.allocate_ui_with_layout(egui::vec2(width, body_height), ...)` で親領域を明示確保し、
@@ -337,7 +358,8 @@ UI 同期なら、worker 化・キャンセル・結果適用時の世代/idx �
   ├ perf_events.jsonl       # 直近の perf-log (--perf-log の既定出力先)
   ├ perf_*.jsonl            # 任意名で取った過去ログ
   ├ mimageviewer.log        # 通常の logger 出力
-  └ panic.log               # クラッシュログ
+  ├ panic.log               # Rust panic・UI hang
+  └ native-exception.log    # Windows first-chance 例外 (記録は best-effort)
 ```
 
 (Windows の絶対パス: `C:\Users\<user>\AppData\Roaming\mimageviewer\logs\`)。
@@ -410,9 +432,10 @@ TTF/OTF/TTC/OTC の日本語 upright face を選べる。日本語なし / Itali
 `miv-user-text` family を別途登録する。この family は text-presentation 記号、
 数学英字、絵文字の fallback を明示し、ttf-parser で選択 face / Yu Gothic の代表 glyph と
 Segoe UI Emoji の代表 glyph の中心を読んで
-baseline 補正を計算する。egui 0.33 は `ab_glyph` の outline 描画を使うため、
-計測も outline bbox を優先し、raster image bounds は bbox が取れない場合の fallback
-とする。動画・音声 HUD の固定サイズ control label は選択 face ではなく `miv-hud-text`
+baseline 補正を計算する。計測は egui 0.33 の `ab_glyph` outline 描画に合わせて
+outline bbox を優先し、raster image bounds は bbox が取れない場合の fallback とする。
+egui 0.37 (Skrifa + vello_cpu) への更新後もこの計測を使い、文字の見え方は 2026-10-17 に
+利用者が旧版と比較して採択した ([egui 0.37 更新計画 §5](egui-0.37-update-plan.md))。動画・音声 HUD の固定サイズ control label は選択 face ではなく `miv-hud-text`
 (無補正の既定日本語フォント) を使い、VST 等の固定 glyph はベクター描画する。
 複数サンプルは中央値で扱う。ツールバーは既定 Yu Gothic の実測補正値に
 選択 face との差分を加え、環境設定の ±4pt 微調整を最後に加える。`✉` / `⋈` のような text-presentation 記号は

@@ -249,7 +249,7 @@ fn emit(fields: impl std::fmt::Display) {
     if !is_enabled() || TRACE_CAP_REPORTED.load(Ordering::Acquire) {
         return;
     }
-    match TRACE_DATA_LINES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+    match TRACE_DATA_LINES.try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
         (count < TRACE_DATA_LINE_LIMIT).then_some(count + 1)
     }) {
         Ok(_) => crate::logger::log(format!("[mouse-seek-input] {fields}")),

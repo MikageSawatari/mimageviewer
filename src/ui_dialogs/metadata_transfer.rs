@@ -282,7 +282,7 @@ impl App {
 
     pub(crate) fn open_metadata_export_dialog(&mut self) {
         let Some(root) = self.metadata_transfer_target() else {
-            self.show_feedback_toast("実フォルダを表示しているときに使用できます".to_string());
+            self.show_feedback_warning("実フォルダを表示しているときに使用できます".to_string());
             return;
         };
         self.metadata_transfer = Some(MetadataTransferState::export(root, &self.settings));
@@ -290,7 +290,7 @@ impl App {
 
     pub(crate) fn open_metadata_import_dialog(&mut self) {
         let Some(root) = self.metadata_transfer_target() else {
-            self.show_feedback_toast("実フォルダを表示しているときに使用できます".to_string());
+            self.show_feedback_warning("実フォルダを表示しているときに使用できます".to_string());
             return;
         };
         self.metadata_transfer = Some(MetadataTransferState::import(root));
@@ -875,7 +875,7 @@ fn draw_dialog(
     let mut action = DialogAction::None;
     let mut export_recursive_changed = None;
     let recursive = state.recursive;
-    egui::Modal::new(egui::Id::new("metadata_transfer_modal")).show(ctx, |ui| {
+    egui::Modal::new(egui::Id::unique("metadata_transfer_modal")).show(ctx, |ui| {
         ui.set_min_width(430.0);
         ui.heading(match state.operation {
             Operation::Export => "メタ情報をエクスポート",
@@ -1096,9 +1096,10 @@ fn progress_widget_height(progress: TransferProgress) -> f32 {
     let height = Arc::new(Mutex::new(None));
     let captured_height = Arc::clone(&height);
     let mut harness = crate::test_ui::builder()
+        .with_context_setup(crate::ui_fonts::configure_fonts)
         .with_size(egui::vec2(430.0, 240.0))
-        .build(move |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        .build_ui(move |root_ui| {
+            egui::CentralPanel::default().show(root_ui, |ui| {
                 let top = ui.cursor().top();
                 draw_progress(ui, Some(&progress));
                 *captured_height.lock().unwrap() = Some(ui.cursor().top() - top);
@@ -1720,8 +1721,10 @@ mod tests {
         });
         let render_state = std::rc::Rc::clone(&state);
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1093.0, 614.0))
-            .build(move |ctx| {
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
                 let _ = draw_dialog(ctx, &mut render_state.borrow_mut(), false);
             });
         harness.run();
@@ -1813,14 +1816,14 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let book = temp.path().join("book");
         let state = crate::view_trim::ViewTrimBookState {
-            apply_mode: crate::view_trim::ViewTrimApplyMode::Book,
+            preference: crate::view_trim::ViewTrimBookPreference::Manual,
             book_settings: crate::view_trim::ViewTrimBookSettings {
                 enabled: true,
                 ..Default::default()
             },
         };
         let batch = crate::view_trim_db::ViewTrimWriteBatch {
-            book: Some((book.clone(), state)),
+            book: Some((book.clone(), None, state)),
             pages: Vec::new(),
         };
         let data_dir = temp.path().to_path_buf();
@@ -1834,7 +1837,11 @@ mod tests {
 
         let db =
             crate::view_trim_db::ViewTrimDb::open_at(&temp.path().join("view_trim.db")).unwrap();
-        assert_eq!(db.get_book_state(&book), Some(state));
+        assert_eq!(
+            db.load_book_preference_with_fallback(&book, None)
+                .state_or_default(),
+            state
+        );
     }
 
     #[test]

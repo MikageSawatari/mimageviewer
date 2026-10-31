@@ -2437,7 +2437,7 @@ pub fn delete_all_cache(cache_dir: &Path) -> usize {
 pub(crate) fn delete_old_cache_under_delete(cache_dir: &Path, days: u64) -> CatalogDeleteReport {
     let now = std::time::SystemTime::now();
     let threshold = std::time::Duration::from_secs(days.saturating_mul(24 * 3600));
-    delete_catalog_files(cache_dir, |meta| {
+    delete_catalog_files(cache_dir, false, |meta| {
         let age = meta
             .modified()
             .ok()
@@ -2448,11 +2448,37 @@ pub(crate) fn delete_old_cache_under_delete(cache_dir: &Path, days: u64) -> Cata
 }
 
 pub(crate) fn delete_all_cache_under_delete(cache_dir: &Path) -> CatalogDeleteReport {
-    delete_catalog_files(cache_dir, |_| true)
+    delete_catalog_files(cache_dir, true, |_| true)
+}
+
+/// Only call after CatalogDeletion has drained and closed all catalog connections.
+/// Never erase sidecars if deleting the DB failed: it may still have a live reader.
+fn delete_catalog_unit(path: &Path) -> std::io::Result<()> {
+    remove_cache_file_if_present(path)?;
+    delete_catalog_sidecars(path)?;
+    Ok(())
+}
+
+fn remove_cache_file_if_present(path: &Path) -> std::io::Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn delete_catalog_sidecars(path: &Path) -> std::io::Result<()> {
+    for suffix in ["-wal", "-shm"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        remove_cache_file_if_present(Path::new(&name))?;
+    }
+    Ok(())
 }
 
 fn delete_catalog_files(
     cache_dir: &Path,
+    clear_legacy_orphans: bool,
     select: impl Fn(&std::fs::Metadata) -> bool,
 ) -> CatalogDeleteReport {
     let mut report = CatalogDeleteReport {
@@ -2481,7 +2507,21 @@ fn delete_catalog_files(
         };
         let sub = entry.path();
         match entry.file_type() {
-            Ok(kind) if kind.is_dir() => {}
+            // Do not follow symlinks/junctions outside the cache during cleanup.
+            Ok(kind) if kind.is_dir() && !kind.is_symlink() => {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    match entry.metadata() {
+                        Ok(metadata) if metadata.file_attributes() & 0x400 == 0 => {}
+                        Ok(_) => continue,
+                        Err(error) => {
+                            report.failures.push((sub, error.to_string()));
+                            continue;
+                        }
+                    }
+                }
+            }
             Ok(_) => continue,
             Err(error) => {
                 report.failures.push((sub, error.to_string()));
@@ -2505,6 +2545,26 @@ fn delete_catalog_files(
             };
             let path = entry.path();
             if path.extension().and_then(|extension| extension.to_str()) != Some("db") {
+                if clear_legacy_orphans {
+                    // A surviving DB (including one whose deletion failed) owns
+                    // its sidecars. Admission stays closed throughout this scan.
+                    let name = entry.file_name();
+                    if let Some(db_name) = name.to_str().and_then(|name| {
+                        name.strip_suffix(".db-wal")
+                            .or_else(|| name.strip_suffix(".db-shm"))
+                    }) {
+                        let db_path = path.with_file_name(format!("{db_name}.db"));
+                        let result = db_path.try_exists().and_then(|exists| {
+                            if !exists {
+                                remove_cache_file_if_present(&path)?;
+                            }
+                            Ok(())
+                        });
+                        if let Err(error) = result {
+                            report.failures.push((path, error.to_string()));
+                        }
+                    }
+                }
                 continue;
             }
             let metadata = match entry.metadata() {
@@ -2517,11 +2577,12 @@ fn delete_catalog_files(
             if !select(&metadata) {
                 continue;
             }
-            match std::fs::remove_file(&path) {
-                Ok(()) => report.deleted += 1,
-                Err(error) => {
-                    report.failures.push((path, error.to_string()));
-                }
+            let result = remove_cache_file_if_present(&path).and_then(|removed| {
+                report.deleted += usize::from(removed);
+                delete_catalog_sidecars(&path)
+            });
+            if let Err(error) = result {
+                report.failures.push((path, error.to_string()));
             }
         }
     }
@@ -2542,6 +2603,8 @@ pub(crate) fn delete_folder_cache_under_delete(
 ) -> rusqlite::Result<bool> {
     let path = db_path_for(cache_dir, parent);
     if !catalog_file_exists(&path)? {
+        delete_catalog_sidecars(&path)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         return Ok(false);
     }
     let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
@@ -2577,7 +2640,7 @@ pub(crate) fn delete_folder_cache_under_delete(
     };
     drop(connection);
     if remaining == 0 && remaining_absence == 0 {
-        std::fs::remove_file(path)
+        delete_catalog_unit(&path)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     }
     Ok(true)
@@ -3335,6 +3398,178 @@ mod tests {
             drop(CatalogWork::capture(temp.path()).open(&unvisited).unwrap());
             assert!(db_path_for(temp.path(), &unvisited).exists());
         }
+    }
+
+    fn catalog_test_sidecar(path: &Path, suffix: &str) -> PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    }
+
+    fn assert_catalog_unit_absent(path: &Path) {
+        for member in [
+            path.to_owned(),
+            catalog_test_sidecar(path, "-wal"),
+            catalog_test_sidecar(path, "-shm"),
+        ] {
+            assert!(
+                !member.exists(),
+                "remaining cache file: {}",
+                member.display()
+            );
+        }
+    }
+
+    fn persist_catalog_wal_after_close(db: &CatalogDb) {
+        let phase = db.phase().unwrap();
+        let mut persist = 1_i32;
+        // SQLite's supported persistent-WAL mode deterministically leaves real
+        // sidecars after close, without corrupting a DB or leaking a connection.
+        let result = unsafe {
+            rusqlite::ffi::sqlite3_file_control(
+                phase.handle(),
+                c"main".as_ptr(),
+                rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
+                (&mut persist as *mut i32).cast(),
+            )
+        };
+        assert_eq!(result, rusqlite::ffi::SQLITE_OK);
+    }
+
+    #[test]
+    fn catalog_clear_closes_live_wal_connections_for_every_delete_route() {
+        for operation in [
+            CatalogDeleteOperation::All,
+            CatalogDeleteOperation::OlderThan(0),
+            CatalogDeleteOperation::Folder(PathBuf::from(r"C:\clear-wal")),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let parent = Path::new(r"C:\clear-wal");
+            let path = db_path_for(temp.path(), parent);
+            let db = CatalogDb::open(temp.path(), parent).unwrap();
+            db.save("photo.jpg", 1, 2, 1, 1, None, b"cached").unwrap();
+            let reader = CatalogDb::open_existing_read_only(temp.path(), parent)
+                .unwrap()
+                .unwrap();
+            persist_catalog_wal_after_close(&db);
+            persist_catalog_wal_after_close(&reader);
+            assert!(
+                catalog_test_sidecar(&path, "-wal")
+                    .metadata()
+                    .unwrap()
+                    .len()
+                    > 0
+            );
+            assert!(catalog_test_sidecar(&path, "-shm").exists());
+
+            match operation {
+                CatalogDeleteOperation::All => assert_eq!(delete_all_cache(temp.path()), 1),
+                CatalogDeleteOperation::OlderThan(days) => {
+                    assert_eq!(delete_old_cache(temp.path(), days), 1);
+                }
+                CatalogDeleteOperation::Folder(folder) => {
+                    let deletion = CatalogAccess::for_cache_dir(temp.path())
+                        .begin_delete(CatalogDeleteOperation::Folder(folder.clone()))
+                        .unwrap();
+                    deletion.retire_connections();
+                    assert!(delete_folder_cache_under_delete(temp.path(), &folder).unwrap());
+                }
+            }
+            // Arc holders can survive clearing, but the physical connections cannot.
+            assert!(db.load_one("photo.jpg").is_err());
+            assert!(reader.load_one("photo.jpg").is_err());
+            assert_catalog_unit_absent(&path);
+        }
+    }
+
+    #[test]
+    fn catalog_clear_recovers_legacy_orphans_only_in_the_selected_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = Path::new(r"C:\orphan-first");
+        let second = Path::new(r"C:\orphan-second");
+        for folder in [first, second] {
+            let path = db_path_for(temp.path(), folder);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            for suffix in ["-wal", "-shm"] {
+                std::fs::write(catalog_test_sidecar(&path, suffix), b"legacy orphan").unwrap();
+            }
+        }
+        let first_path = db_path_for(temp.path(), first);
+        let second_path = db_path_for(temp.path(), second);
+        let deletion = CatalogAccess::for_cache_dir(temp.path())
+            .begin_delete(CatalogDeleteOperation::Folder(first.to_owned()))
+            .unwrap();
+        deletion.retire_connections();
+        delete_folder_cache_under_delete(temp.path(), first).unwrap();
+        drop(deletion);
+        assert_catalog_unit_absent(&first_path);
+        assert!(catalog_test_sidecar(&second_path, "-wal").exists());
+        // Age-based deletion cannot infer the missing DB's age.
+        assert_eq!(delete_old_cache(temp.path(), 0), 0);
+        assert!(catalog_test_sidecar(&second_path, "-wal").exists());
+        assert_eq!(delete_all_cache(temp.path()), 0);
+        assert_catalog_unit_absent(&second_path);
+    }
+
+    #[test]
+    fn catalog_clear_does_not_close_or_delete_another_cache_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let cleared_cache = temp.path().join("cleared");
+        let other_cache = temp.path().join("other");
+        let parent = Path::new(r"C:\same-folder");
+        let cleared = CatalogDb::open(&cleared_cache, parent).unwrap();
+        let other = CatalogDb::open(&other_cache, parent).unwrap();
+        other.save("keep.jpg", 1, 2, 1, 1, None, b"keep").unwrap();
+        let other_path = db_path_for(&other_cache, parent);
+        let wal = catalog_test_sidecar(&other_path, "-wal");
+        let before = std::fs::read(&wal).unwrap();
+        assert_eq!(delete_all_cache(&cleared_cache), 1);
+        assert!(cleared.is_retired());
+        assert_catalog_unit_absent(&db_path_for(&cleared_cache, parent));
+        assert!(!other.is_retired());
+        assert_eq!(std::fs::read(&wal).unwrap(), before);
+        assert!(catalog_test_sidecar(&other_path, "-shm").exists());
+        assert_eq!(
+            other.load_one("keep.jpg").unwrap().unwrap().jpeg_data,
+            b"keep"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn catalog_clear_keeps_wal_of_externally_open_database_when_db_delete_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = db_path_for(temp.path(), Path::new(r"C:\external"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A connection outside CatalogAccess models another process holding the DB.
+        let external = Connection::open(&path).unwrap();
+        external
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; CREATE TABLE keep(value); INSERT INTO keep VALUES(42);",
+            )
+            .unwrap();
+        let wal = catalog_test_sidecar(&path, "-wal");
+        let before = std::fs::read(&wal).unwrap();
+        let orphan = path.parent().unwrap().join("legacy.db-wal");
+        std::fs::write(&orphan, b"old").unwrap();
+        let deletion = CatalogAccess::for_cache_dir(temp.path())
+            .begin_delete(CatalogDeleteOperation::All)
+            .unwrap();
+        deletion.retire_connections();
+        let report = delete_all_cache_under_delete(temp.path());
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(std::fs::read(&wal).unwrap(), before);
+        assert!(catalog_test_sidecar(&path, "-shm").exists());
+        assert!(!orphan.exists());
+        assert_eq!(
+            external
+                .query_row("SELECT value FROM keep", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            42
+        );
+        drop(deletion);
+        drop(external);
     }
 
     #[test]

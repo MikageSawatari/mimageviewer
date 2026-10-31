@@ -24,6 +24,33 @@ impl CanonicalPageDimensions {
     }
 }
 
+/// 通常表示の物理 100% を決める、回転前・crop 前の表示 raster 寸法。
+/// GPU 上限による縮小や AI 完成後の実 texture 寸法を反映する。
+/// 注釈座標の CanonicalPageDimensions や PDF page-box の単位には使わない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayOriginalDimensions {
+    width: u32,
+    height: u32,
+}
+
+impl DisplayOriginalDimensions {
+    pub const fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+
+    pub const fn as_tuple(self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    pub const fn as_size(self) -> [usize; 2] {
+        [self.width as usize, self.height as usize]
+    }
+
+    pub fn as_vec2(self) -> egui::Vec2 {
+        egui::vec2(self.width as f32, self.height as f32)
+    }
+}
+
 /// ピクセル寸法の出所。小さい PDF サムネイルも形状判定には使えるが、
 /// 正規ページ座標として公開してはいけない。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

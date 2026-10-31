@@ -2,6 +2,10 @@
 //! has contributed a complete canonical flat to an adopted output.
 use super::*;
 
+#[cfg(test)]
+#[path = "manual_nav_wrap_tests.rs"]
+mod manual_nav_wrap_tests;
+
 pub(super) enum FlatCompletion {
     NeedFlat,
     Submitted(SubmittedUnitReceipt),
@@ -51,6 +55,25 @@ impl PageTurnPresentation {
 }
 
 impl App {
+    pub(crate) fn page_turn_wheel_navigation_operation(
+        &self,
+        ctx: &egui::Context,
+        raw_ordinal: Option<u32>,
+    ) -> Option<ViewerOperationId> {
+        let ordinal = raw_ordinal?;
+        self.page_turn_presentation
+            .transaction
+            .facts
+            .iter()
+            .find(|fact| {
+                fact.destination == self.page_turn_destination()
+                    && fact.source == ctx.viewport_id()
+                    && fact.cause == "wheel"
+                    && matches!(fact.operation_id, ViewerOperationId::Pointer { ordinal: actual, .. } if actual == ordinal)
+            })
+            .map(|fact| fact.operation_id)
+    }
+
     pub(crate) fn page_turn_pointer_navigation_operation(
         &self,
         ctx: &egui::Context,
@@ -117,6 +140,7 @@ impl App {
             return;
         }
         *completion = FlatCompletion::Submitted(receipt.clone());
+        self.note_page_turn_gpu_activity();
     }
 
     pub(crate) fn page_turn_completion_active(&self) -> bool {
@@ -337,6 +361,7 @@ impl App {
         if !ready {
             return None;
         }
+        self.service_final_prepare_before_lookup(ctx);
         self.flush_submitted_page_turn_ready(ctx);
         // Presentation adoption precedes ordinary navigation completion. Keep
         // the same typed command if its matching observer has not retired yet.
@@ -402,7 +427,7 @@ impl App {
             if !self.set_live_spread_shift(anchor) {
                 return true;
             }
-            self.adjust_spread_target = crate::app::AdjustSpreadTarget::Left;
+            self.adjust_spread_target = None;
         }
         if let ResolvedNavigationIntent::Slideshow { slice, purpose } = command.intent {
             self.complete_book_slideshow_target(ctx, command.target_idx, slice, purpose);

@@ -26,7 +26,7 @@ fn capture(
     viewport.focused = Some(true);
     viewport.native_pixels_per_point = Some(1.5);
     let mut before_render = Some(before_render);
-    let output = ctx.run(input, |ctx| {
+    let output = crate::test_ui::headless_paint_output(ctx.run_pass(input, |ctx| {
         // A real input is consumed once; a sizing/discard pass must not issue
         // the navigation handler again merely because egui re-runs painting.
         if let Some(before_render) = before_render.take() {
@@ -34,8 +34,8 @@ fn capture(
         }
         // Deliberately do not use page_turn_submission_tests::draw_current:
         // a later normal-page draw or background can hide a valid curl receipt.
-        app.render_fullscreen_viewport(ctx);
-    });
+        ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
+    }));
     let meshes = ctx
         .tessellate(output.shapes.clone(), output.pixels_per_point)
         .into_iter()
@@ -44,10 +44,12 @@ fn capture(
             egui::epaint::Primitive::Callback(_) => None,
         })
         .collect();
-    CapturedFrame {
-        shapes: output.shapes,
+    let frame = CapturedFrame {
+        shapes: output.shapes.clone(),
         meshes,
-    }
+    };
+    output.drop_without_applying_deltas();
+    frame
 }
 
 fn bounds(mesh: &egui::Mesh) -> egui::Rect {
@@ -249,6 +251,8 @@ fn page_turn_mainwindow_submits_visible_vacant_leaf_both_directions() {
             app.fs_cache.insert(
                 idx,
                 FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
                     tex,
                     pixels,
                     source_dims: Some([932, 1320]),
@@ -384,12 +388,14 @@ fn page_turn_mainwindow_submits_visible_vacant_leaf_both_directions() {
             assert_ne!(page10, page11);
             let mut black_counts = Vec::new();
             for progress in [0.1, 0.25, 0.6, 0.75] {
-                let PresentationState::Turning { offer, .. } =
+                let PresentationState::Turning { clock, offer, .. } =
                     &mut app.page_turn_presentation.state
                 else {
                     panic!("effect must remain active at {progress}");
                 };
-                offer.accepted_at = Instant::now() - offer.duration.mul_f32(progress);
+                *clock = MotionClock::Running {
+                    start_at: Instant::now() - offer.duration.mul_f32(progress),
+                };
                 time += 0.01;
                 let frame = capture(&mut app, &ctx, time, |_, _| {});
                 assert_eq!(tracker.status(), SubmissionStatus::Started);
@@ -483,11 +489,14 @@ fn page_turn_mainwindow_submits_visible_vacant_leaf_both_directions() {
                     "black front must uncover new9 progressively: {black_counts:?}"
                 );
             }
-            let PresentationState::Turning { offer, .. } = &mut app.page_turn_presentation.state
+            let PresentationState::Turning { clock, offer, .. } =
+                &mut app.page_turn_presentation.state
             else {
                 panic!("turn must survive middle frames");
             };
-            offer.accepted_at -= offer.duration + Duration::from_millis(1);
+            *clock = MotionClock::Running {
+                start_at: Instant::now() - offer.duration - Duration::from_millis(1),
+            };
             time += 0.01;
             capture(&mut app, &ctx, time, |_, _| {});
             time += 0.01;

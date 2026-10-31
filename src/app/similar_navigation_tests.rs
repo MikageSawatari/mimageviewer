@@ -285,16 +285,17 @@ fn loaded_thumbnail(ctx: &egui::Context, label: &str) -> ThumbnailState {
         egui::ColorImage::filled([2, 3], egui::Color32::WHITE),
         egui::TextureOptions::LINEAR,
     );
-    ThumbnailState::Loaded {
-        tex: texture,
-        origin: crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+    ThumbnailState::loaded_raster(
+        texture,
+        crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
             evaluated_display_px: 64,
         },
-        from_edit_preview: false,
-        rendered_at_px: 64,
-        source_dims: Some((2, 3)),
-        layout_dims: None,
-    }
+        false,
+        64,
+        crate::source_coverage::SourceCoverage::FullSource,
+        Some((2, 3)),
+        None,
+    )
 }
 
 fn similar_query_hit(
@@ -422,9 +423,10 @@ fn run_root_app_update(
     frame: &mut eframe::Frame,
     input: egui::RawInput,
 ) -> egui::FullOutput {
-    ctx.run(input, |ctx| {
-        <App as eframe::App>::update(app, ctx, frame);
-    })
+    crate::test_ui::headless_paint_output(ctx.run_pass(input, |ctx| {
+        <App as eframe::App>::logic(app, ctx, frame);
+        ctx.root_ui(|ui| <App as eframe::App>::ui(app, ui, frame));
+    }))
 }
 
 #[cfg(windows)]
@@ -485,6 +487,8 @@ fn install_embedded_update_scene(app: &mut App, ctx: &egui::Context, pages: &[Pa
     app.fs_cache.insert(
         0,
         FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
+            pdf_metadata: None,
             tex: texture,
             pixels,
             source_dims: Some([4, 6]),
@@ -1031,7 +1035,10 @@ fn failed_physical_scan_keeps_existing_snapshot_page_and_panel_but_retires_old_d
     app.capture_fs_nav_holdover(0);
     assert!(matches!(
         app.fs_holdover_tex,
-        Some(FsHoldover::FolderNavigation(None))
+        Some(FsHoldover::FolderNavigation(
+            None,
+            crate::app::FsFolderNavigationOrigin::Ordinary
+        ))
     ));
     let current = SimilarBookLocation::from_grid_item(&app.items[0]).unwrap();
     app.similar_panel
@@ -1311,7 +1318,7 @@ fn page_handler_supersedes_a_pending_required_scan_and_preserves_panel_lock() {
     assert!(app.fs_info_panel.locked);
     assert!(!matches!(
         app.fs_holdover_tex,
-        Some(FsHoldover::FolderNavigation(_))
+        Some(FsHoldover::FolderNavigation(_, _))
     ));
 }
 
@@ -1855,20 +1862,20 @@ fn presentation_switch_exposes_and_expires_its_asset_without_overwriting_navigat
     app.capture_fs_nav_holdover(0);
     assert!(matches!(
         app.fs_holdover_tex,
-        Some(FsHoldover::FolderNavigation(Some(_)))
+        Some(FsHoldover::FolderNavigation(Some(_), _))
     ));
     app.settings.video_in_window_mode = true;
     app.toggle_still_window_mode();
     assert!(matches!(
         app.fs_holdover_tex,
-        Some(FsHoldover::FolderNavigation(Some(_)))
+        Some(FsHoldover::FolderNavigation(Some(_), _))
     ));
     app.still_fullscreen_viewport_enter_suppress_until =
         Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
     assert!(!app.still_fullscreen_viewport_enter_suppressed());
     assert!(matches!(
         app.fs_holdover_tex,
-        Some(FsHoldover::FolderNavigation(Some(_)))
+        Some(FsHoldover::FolderNavigation(Some(_), _))
     ));
 }
 
