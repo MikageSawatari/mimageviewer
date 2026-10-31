@@ -27,6 +27,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+. (Join-Path $PSScriptRoot 'build-process-policy.ps1')
 
 if ($SmokeTestScript -and $Sign) {
     throw '[portable-smoke-build] -Sign is not supported for diagnostic smoke artifacts'
@@ -192,7 +193,8 @@ function Write-SmokeBuildManifest {
         [string] $SourceFingerprint,
         [string] $CorePath,
         [string] $RemotePath,
-        [string] $EpubWorkerPath
+        [string] $EpubWorkerPath,
+        [string] $McpPath
     )
     $head = (& git -C $repoRoot rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0 -or -not $head) {
@@ -208,6 +210,7 @@ function Write-SmokeBuildManifest {
         core_sha256 = (Get-FileHash -LiteralPath $CorePath -Algorithm SHA256).Hash.ToLowerInvariant()
         remote_sha256 = (Get-FileHash -LiteralPath $RemotePath -Algorithm SHA256).Hash.ToLowerInvariant()
         epub_worker_sha256 = (Get-FileHash -LiteralPath $EpubWorkerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        mcp_sha256 = (Get-FileHash -LiteralPath $McpPath -Algorithm SHA256).Hash.ToLowerInvariant()
     }
     $json = $manifest | ConvertTo-Json -Depth 3
     [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
@@ -219,7 +222,8 @@ function Assert-SmokeBuildManifest {
         [string] $ExpectedSourceFingerprint,
         [string] $CorePath,
         [string] $RemotePath,
-        [string] $EpubWorkerPath
+        [string] $EpubWorkerPath,
+        [string] $McpPath
     )
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "[portable-smoke-build] diagnostic build manifest not found: $Path"
@@ -245,8 +249,9 @@ function Assert-SmokeBuildManifest {
     $coreHash = (Get-FileHash -LiteralPath $CorePath -Algorithm SHA256).Hash.ToLowerInvariant()
     $remoteHash = (Get-FileHash -LiteralPath $RemotePath -Algorithm SHA256).Hash.ToLowerInvariant()
     $epubWorkerHash = (Get-FileHash -LiteralPath $EpubWorkerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $mcpHash = (Get-FileHash -LiteralPath $McpPath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($manifest.core_sha256 -ne $coreHash -or $manifest.remote_sha256 -ne $remoteHash -or
-        $manifest.epub_worker_sha256 -ne $epubWorkerHash) {
+        $manifest.epub_worker_sha256 -ne $epubWorkerHash -or $manifest.mcp_sha256 -ne $mcpHash) {
         throw '[portable-smoke-build] diagnostic artifact hash does not match its build manifest'
     }
 }
@@ -288,6 +293,25 @@ foreach ($line in $cargoToml) {
 if (-not $version) { throw "[portable] could not parse version from Cargo.toml" }
 Write-Host "[portable] version = $version"
 
+# Resolve every build/package output before deciding which processes may lock it.
+# --target-dir below deliberately overrides CARGO_TARGET_DIR for portable flavor isolation.
+$portableTargetName = if ($SmokeTestScript) { 'target-portable-test-script' } else { 'target-portable' }
+$portableTargetDir = Join-Path $repoRoot $portableTargetName
+$coreExe = Join-Path $portableTargetDir 'release\mimageviewer-core.exe'
+$remoteExe = Join-Path $portableTargetDir 'release\mimageviewer-remote.exe'
+$epubWorkerExe = Join-Path $portableTargetDir 'release\mimageviewer-epub-pdf.exe'
+$mcpExe = Join-Path $portableTargetDir 'release\mimageviewer-mcp.exe'
+$pkgName = "mImageViewer_portable_v$version"
+$distRoot = Join-Path $repoRoot 'dist'
+$pkgDir = if ($SmokeTestScript) {
+    Join-Path $repoRoot 'target\portable-smoke-package'
+} else {
+    Join-Path $distRoot $pkgName
+}
+$exactBuildProcessNames = @('mimageviewer', 'mimageviewer-mcp')
+$exactBuildOutputPaths = @((Join-Path $pkgDir 'mimageviewer.exe'), (Join-Path $pkgDir 'mimageviewer-mcp.exe'))
+if (-not $SkipBuild) { $exactBuildOutputPaths += $mcpExe }
+
 # ---------------------------------------------------------------------------
 # Stop any running core/portable instances that may lock the exe.
 # Only repo-built ones (path under repo root) are touched.
@@ -300,6 +324,7 @@ $repoPrefix = ($repoRoot.TrimEnd('\') + '\').ToLower()
 # the path check - stopping those killed another session's `cargo test` (backlog 5.3).
 $stoppableProcessNames = @(
     'mimageviewer',
+    'mimageviewer-mcp',
     'mimageviewer-core',
     'mimageviewer-remote',
     'mimageviewer-epub-pdf',
@@ -310,7 +335,11 @@ if ($KeepRunning) {
     Write-Host "[portable] leaving repo-built app processes running"
 } elseif ($PreserveRuntime) {
     $running = @(Get-Process -ErrorAction SilentlyContinue |
-        Where-Object { $stoppableProcessNames -contains $_.Name })
+        Where-Object {
+            ($stoppableProcessNames -contains $_.Name) -and
+            (($exactBuildProcessNames -notcontains $_.Name) -or
+                (Test-MivExactBuildProcess -Process $_ -OutputPaths $exactBuildOutputPaths))
+        })
     if ($running.Count -gt 0) {
         $list = ($running | ForEach-Object { "{0}({1})" -f $_.Name, $_.Id }) -join ', '
         throw ("[portable] mImageViewer is running: {0}. -PreserveRuntime refuses to stop it; close it and retry." -f $list)
@@ -319,6 +348,13 @@ if ($KeepRunning) {
     Get-Process -ErrorAction SilentlyContinue |
         Where-Object { $stoppableProcessNames -contains $_.Name } |
         ForEach-Object {
+            if ($exactBuildProcessNames -contains $_.Name) {
+                if (Test-MivExactBuildProcess -Process $_ -OutputPaths $exactBuildOutputPaths) {
+                    Write-Host "[portable] stopping $($_.Name) (PID=$($_.Id))"
+                    try { Stop-Process -Id $_.Id -Force -ErrorAction Stop } catch {}
+                }
+                return
+            }
             $p = $null
             try { $p = $_.Path } catch { $p = $null }
             if ($p -and $p.ToLower().StartsWith($repoPrefix)) {
@@ -336,11 +372,6 @@ if ($KeepRunning) {
 # output path let cargo hand back a stale core of the other feature flavor
 # (0.5s "Finished", no Compiling line). target-* is already gitignored.
 # ---------------------------------------------------------------------------
-$portableTargetName = if ($SmokeTestScript) { 'target-portable-test-script' } else { 'target-portable' }
-$portableTargetDir = Join-Path $repoRoot $portableTargetName
-$coreExe = Join-Path $portableTargetDir 'release\mimageviewer-core.exe'
-$remoteExe = Join-Path $portableTargetDir 'release\mimageviewer-remote.exe'
-$epubWorkerExe = Join-Path $portableTargetDir 'release\mimageviewer-epub-pdf.exe'
 $smokeBuildManifest = Join-Path $portableTargetDir 'release\mimageviewer-core.build-manifest.json'
 Assert-NoReparsePath $portableTargetDir $repoRoot 'portable-target'
 $sourceFingerprint = $null
@@ -370,6 +401,11 @@ if (-not $SkipBuild) {
             & cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf --target-dir $portableTargetDir
             $cargoExit = $LASTEXITCODE
         }
+        if ($cargoExit -eq 0) {
+            Write-Host "[portable] cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp --target-dir $portableTargetName"
+            & cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp --target-dir $portableTargetDir
+            $cargoExit = $LASTEXITCODE
+        }
     }
     finally {
         Pop-Location
@@ -385,27 +421,22 @@ if (-not $SkipBuild) {
 if (-not (Test-Path $coreExe)) { throw "[portable] core exe not found: $coreExe" }
 if (-not (Test-Path $remoteExe)) { throw "[portable] remote service exe not found: $remoteExe" }
 if (-not (Test-Path $epubWorkerExe)) { throw "[portable] EPUB worker exe not found: $epubWorkerExe" }
+if (-not (Test-Path $mcpExe)) { throw "[portable] MCP exe not found: $mcpExe" }
 Assert-NoReparsePath $coreExe $repoRoot 'portable-core'
 Assert-NoReparsePath $remoteExe $repoRoot 'portable-remote'
 Assert-NoReparsePath $epubWorkerExe $repoRoot 'portable-epub-worker'
+Assert-NoReparsePath $mcpExe $repoRoot 'portable-mcp'
 if ($SmokeTestScript) {
     if ($SkipBuild) {
-        Assert-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe $epubWorkerExe
+        Assert-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe $epubWorkerExe $mcpExe
     } else {
-        Write-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe $epubWorkerExe
+        Write-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe $epubWorkerExe $mcpExe
     }
 }
 
 # ---------------------------------------------------------------------------
 # Assemble the distribution folder.
 # ---------------------------------------------------------------------------
-$pkgName = "mImageViewer_portable_v$version"
-$distRoot = Join-Path $repoRoot 'dist'
-$pkgDir = if ($SmokeTestScript) {
-    Join-Path $repoRoot 'target\portable-smoke-package'
-} else {
-    Join-Path $distRoot $pkgName
-}
 $expectedPackagePath = if ($SmokeTestScript) {
     Join-Path $repoRoot 'target\portable-smoke-package'
 } else {
@@ -425,6 +456,7 @@ $copies = @(
     @{ src = $coreExe; dst = 'mimageviewer.exe' }
     @{ src = $remoteExe; dst = 'mimageviewer-remote.exe' }
     @{ src = $epubWorkerExe; dst = 'mimageviewer-epub-pdf.exe' }
+    @{ src = $mcpExe; dst = 'mimageviewer-mcp.exe' }
     @{ src = 'vendor\ffmpeg\bin\avcodec-61.dll';     dst = 'avcodec-61.dll' }
     @{ src = 'vendor\ffmpeg\bin\avformat-61.dll';    dst = 'avformat-61.dll' }
     @{ src = 'vendor\ffmpeg\bin\avutil-59.dll';      dst = 'avutil-59.dll' }
@@ -519,6 +551,7 @@ if ($Sign) {
         'mimageviewer.exe',
         'mimageviewer-remote.exe',
         'mimageviewer-epub-pdf.exe',
+        'mimageviewer-mcp.exe',
         'pdfium.dll',
         'mimageviewer-susie32.exe',
         'avcodec-61.dll', 'avformat-61.dll', 'avutil-59.dll',

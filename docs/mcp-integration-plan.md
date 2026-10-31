@@ -1635,6 +1635,17 @@ MCP の exe は console subsystem・CRT 静的リンク (DLL 不要)・引数は
 | `build-dev.ps1` | `target\dev-runtime\` に MCP の exe も作る (1d の「登録する」が core の横の MCP の exe を使うため)。止める一覧・PE 検査に足す |
 | 安全性のテスト (`test-release-build-safety.ps1`・`test-build-dev-safety.ps1`) | 件数・順序の検査を 4 本に直し、MCP の検査を足す |
 
+- **release の出力先は `<repo>\target\release` に固定する** (実装担当が着手前に 2 度指摘、ClaudeCode が判断): `build-release.ps1` /
+  `.sh` は追加の引数を Cargo に渡すが、launcher の埋め込みの入力・止める対象・署名・インストーラの入力は既定の出力先しか見ない。
+  出力先は引数 (`--target-dir`・`--target`・`--profile`・`--config` 等)・環境変数・利用者の Cargo の設定ファイルの層のどれでも
+  変わり得るので、拒否する一覧では閉じない。次の 2 つで閉じる:
+  1. **渡してよい追加の引数を限る**: `--features <x>` / `--features=<x>`・`--all-features`・`--no-default-features`・`--locked`・
+     `--frozen`・`--offline`・`-v` / `--verbose`・`-j <n>` / `--jobs <n>` だけを通し、それ以外は process を止める前・build の前に理由を
+     出して拒否する。
+  2. **実際の出力先を確かめる**: 各 `cargo build` を `--message-format=json-render-diagnostics` で走らせ、Cargo が報告する生成物
+     (`compiler-artifact` の `executable`) の path が固定の `<repo>\target\release\<名前>.exe` と一致することを確かめる (更新の
+     無い build でも報告される)。一致しなければ、署名・launcher の build・埋め込みの前に止める。
+  使っている手順は無い (今の手順は引数なし、または `--features`)。
 - **launcher と MCP の exe を止める・build を拒む対象は、その build が書き換える出力の path と一致する process だけ**
   (設計レビュー 15 巡目 P2-1)。AI アプリがインストール版から起動した launcher (`--mcp` で常駐) と MCP の exe は、path が build の
   出力の外なので対象にしない。この 2 つについては **path を取れない process は止めない・拒まない** (既存の「path 不明なら止める」は
@@ -3195,3 +3206,277 @@ cargo nextest run -p mimageviewer --lib -E 'test(=agent_ipc::pipe::tests::shutdo
 - 未確認: 実際の Claude Desktop・ChatGPT への登録、確認が出ないこと (`approve`・「常に許可」)、mIV で開く時の前面化。
   利用者の実機確認で見る (§9.2、§15.7 テスト)。
 - 判定: **1d を受け入れる**。
+
+## 20. 段階 1e の実装記録
+
+### 20.1 前提照合と中断点
+
+観測者: 実装担当、2026-11-01、この sandbox 内。基点 `ff7ba0a86`、branch `mcp-trial`。
+開始時の worktree は clean。§15.8 全文と §15.22 の15〜18巡目を照合した。
+
+- 通常 launcher は version directory を作る前に共有 `IN_USE`、展開時に排他 `EXTRACTION` を取得する。
+  MCP にも同じ lock identity を使える。通常 route の `Handoff` と EffeTune 準備を MCP へ持ち込む必要は無い。
+- core の `SingleInstanceGuard` は既定 DACL の `CreateMutexW` であり、cross-user の marker 契約は
+  解決していない。MCP 専用の DACL と `CreateMutexExW(SYNCHRONIZE)` が必要。
+- `target/release/mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe` は
+  いずれも存在しなかった。別 flavor の成果物や仮 exe を入力として補わない。
+- 途中で、下記の出力先の前提の矛盾を確認したため、指示どおり実装を停止した。部分差分は保ち、commit していない。
+
+### 20.2 設計担当へ返す矛盾
+
+`build-release.ps1` の `CargoArgs` と `.sh` の `"$@"` は、全ての Cargo build へ引数をそのまま渡す。
+基点のコードにもこの動作がある。一方、launcher の `build.rs` は `CARGO_TARGET_DIR` (無ければ
+workspace の `target`) に固定の `release/<exe>` を足し、wrapper の停止・署名・PE 検査も独自に
+path を作る。CLI の `--target-dir` や `--target` で変わる実出力と一致しない。
+さらに installer の入力は `../target/release/mimageviewer.exe` に固定されている。
+
+製品を使わない最小 Cargo fixture を `target/mcp-1e-cargo-probe` に作り、実際の Cargo で確認した:
+
+```powershell
+Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
+cargo check --release --manifest-path target/mcp-1e-cargo-probe/Cargo.toml --target-dir target/mcp-1e-probe-output --target x86_64-pc-windows-msvc
+```
+
+実 exit 0 (`target/mcp-1e-cargo-probe.log`)。build script が観測した値は:
+
+```text
+CARGO_TARGET_DIR=None
+OUT_DIR=.../target/mcp-1e-probe-output/x86_64-pc-windows-msvc/release/build/<probe>/out
+PROFILE=release
+TARGET=x86_64-pc-windows-msvc
+```
+
+したがって Cargo が CLI の出力指定を環境変数へ自動反映するという前提にはできない。
+新しい「その build が実際に書き換える launcher/MCP exe のみ停止・拒否する」契約と、
+埋込・署名・配布の入力を満たすには、出力先の決定を揃える必要がある。
+既存の引数を黙って拒否する変更も、既知の出力変更を無視する回避も入れていない。
+
+設計担当の選択肢:
+
+1. 出力変更引数を維持し、launcher の入力探索・wrapper の停止/署名/PE 検査・配布入力を
+   実際の Cargo 出力へ統一する修正を1eへ含める (既存の引数を保つ案)。
+2. release/distribution wrapper の出力を規定 path に固定し、出力変更指定を build 前に拒否する。
+   CargoArgs だけでなく `CARGO_TARGET_DIR` 等の許可範囲も明記する
+   (現在の引数受渡し等の制限を伴うため、設計担当の決定が必要)。
+
+### 20.3 安全な途中差分と未検証範囲
+
+- launcher: `crates/launcher/Cargo.toml`、`build.rs`、`src/main.rs`、新規 `mcp_launch.rs`、
+  `mcp_marker.rs`、`mcp_launch_tests.rs`。MCP 分岐・内包・lease/marker・注入テストを記述した段階。
+- scripts: `build-release.ps1`、`build-dev.ps1`、`build-dist.ps1`、`build-portable.ps1` と新規
+  `build-process-policy.ps1`。MCP の build/copy/sign/PE と process selection を編集中。
+  `.sh` と safety test の更新は未完了。portable smoke manifest の MCP hash と consumer の照合も未完了。
+- installer/readme: `installer/mimageviewer.iss`、`readme.txt`、`readme_portable.txt`。
+  marker の install/uninstall check と交換前の AI アプリ終了を記述した段階。
+  Inno の外部 DLL 呼出後エラー取得の最終確認/修正は未完了。
+- client: 新規 `scripts/mcp_stdio_check.py`。直接1 command を起動する CLI を記述した段階。
+  fake-Popen の単体テスト、capture 上限到達後の処理等の仕上げは未完了。製品に対して実行していない。
+- 必須6文書の build order 等の更新は未実施。本節は停止位置の記録であり、実装完了や検証成功を表さない。
+
+実行した検証は上記 Cargo probe (exit 0) と `git diff --check` (exit 0、
+`target/mcp-1e-checkpoint-diff.log`) と差分の読取だけ。
+本体 check、release MCP build、launcher/crate test、PowerShell safety test、client の py_compile/unit test、
+workspace fmt は、矛盾確認後の停止のため未実施。製品・AI アプリは起動せず、実設定にも触れていない。
+`build-release.ps1` / `build-dist.ps1` / `build-portable.ps1` の通し実行はしていない。
+
+不足している launcher 入力の作成コマンド (記載のみ、実行していない):
+
+```powershell
+cargo build --release -p mimageviewer --bin mimageviewer-core
+cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets
+cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf
+cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp
+```
+
+矛盾の解消後に上記4本を揃え、`cargo test -p mimageviewer-launcher` と残りの必須検証へ戻る。
+実製品の build/launcher stdio check は ClaudeCode の sandbox 外の担当であり、ここでは成功を主張しない。
+
+### 20.4 出力先固定の決定を受けた再開
+
+観測者: 実装担当、2026-11-01、この sandbox 内。
+ClaudeCode は出力先を `<repo>/target/release` に固定する案2を選択した。
+release PS/.sh は process 停止・build より前に `--target-dir`、`--target`、`--profile`、
+`--out-dir`、`--artifact-dir` (別引数/equal 形式) と `CARGO_TARGET_DIR`、
+`CARGO_BUILD_TARGET`、`CARGO_BUILD_TARGET_DIR` を拒否する。その他の引数は受け渡す。
+この決定に合わせて途中差分を更新したが、次節の追加矛盾で再び停止している。
+
+- launcher の埋込入力を `<repo>/target/release` に固定。MCP 専用分岐と marker/lease の
+  注入テストを追加した。通常起動を実行せずに、実装サブエージェントが Local marker の単体
+  harness (2/2) と実コードを使った MCP lane harness (8/8) を実行し、いずれも exit 0。
+  Cargo の launcher crate test の代わりではなく、独立レビューの証拠でもない。
+- release/dist/portable/dev と safety test に MCP、固定出力、path 限定 process 選択を記述した。
+  未完: `--config` 方針、portable smoke manifest consumer の MCP path、manifest 改変拒否と
+  portable path の追加検査、`.sh` の古い段数コメント、scripts の実行/ASCII/構文検査。
+- installer は marker の install/uninstall 検査と `DLLGetLastError`、readme は MCP の同梱と
+  AI アプリ終了の注意を追加した。Inno compile、実 install/uninstall は未実施。
+- stdio client と fake-Popen テストを追加し、実装担当が下記13件を確認した。
+- `CLAUDE.md` と `development-build-and-test.md`、`native-dependencies.md`、
+  `release-checklist.md`、`release-operations.md`、`portable-build-plan.md` の build order、
+  MCP の配布、固定出力、process 選択等を更新した。公開文書は変更していない。
+
+### 20.5 追加の前提矛盾: Cargo の --config
+
+指定された拒否対象以外に、既存の引数受渡しで許される `--config <file>` でも Cargo の
+出力先と target を変更できる。非製品の同じ最小 Cargo fixture で実際に再現した。
+`target/mcp-1e-cargo-probe/output-override.toml` の内容:
+
+```toml
+[build]
+target-dir = "G:/home/mimageviewer-mcp/target/mcp-1e-config-output"
+target = "x86_64-pc-windows-msvc"
+```
+
+```powershell
+cargo check --release --manifest-path target/mcp-1e-cargo-probe/Cargo.toml --config target/mcp-1e-cargo-probe/output-override.toml
+```
+
+実 exit 0 (`target/mcp-1e-config-probe.log`)。
+`CARGO_TARGET_DIR=None` のまま、build script の `OUT_DIR` は
+`target/mcp-1e-config-output/x86_64-pc-windows-msvc/release/build/.../out` になった。
+現状の5引数・3環境変数の拒否ではこれを通してしまい、停止対象・埋込・署名の固定 path と
+実際の出力が再び不一致になる。inline の `--config build.target-dir=...` も同じ入口である。
+
+「その他の引数は通す」との境界を実装担当だけで狭めず、指示どおり追加の設計判断待ちで停止した。
+選択肢は (1) release wrapper では `--config` 自体も拒否する、または (2) 無関係な設定を
+維持し、inline/file 両形式の設定から出力変更を識別して拒否する仕組みを範囲に含める。
+後者は config file の読取・解析方針も必要。どちらも未実装。
+
+### 20.6 再開後の実行結果と残り
+
+観測者: 実装担当 (上記 harness のみ実装サブエージェント)。
+
+| コマンド | 実 exit | 結果 |
+|---|---:|---|
+| `cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp` | 0 | `target/mcp-1e-mcp-release.log`。build のみ、起動なし |
+| `python -I -m py_compile scripts/mcp_stdio_check.py scripts/test_mcp_stdio_check.py` | 0 | 構文検査 |
+| `python -I scripts/test_mcp_stdio_check.py` | 0 | 13/13。fake-Popen のみ、`target/mcp-1e-client-tests.log` |
+| 上記 `--config` の非製品 Cargo probe | 0 | 指定された拒否対象の外から出力変更を再現 |
+| `git diff --check` | 0 | 途中差分。文書の LF/CRLF warning のみ |
+
+workspace fmt、core check、launcher crate test、agent-ipc/MCP crate test、PowerShell safety test は
+この再中断までに実行していない。release core/remote/EPUB の3入力は依然不足しており、
+sandbox 内では作っていない。§20.3 の4 build と `cargo test -p mimageviewer-launcher` は
+ClaudeCode の sandbox 外で必要。通し build、実 launcher/adapter の stdio、marker の
+実 cross-user 動作も未確認。製品起動、実プロセス停止、実 client config の読書き、commit は無い。
+
+### 20.7 allow-list と実生成物の照合で再開
+
+ClaudeCode の追加決定 (§15.8) により、拒否対象を列挙する方式を廃した。
+追加引数は `--features <x>` / `--features=<x>`、`--all-features`、`--no-default-features`、
+`--locked`、`--frozen`、`--offline`、`-v` / `--verbose`、`-j <n>` / `--jobs <n>` だけを
+process 停止/build 前に許可する。それ以外、値なし、jobs の不正値は拒否する。
+各 release build は `--message-format=json-render-diagnostics` で Cargo を走らせ、
+`compiler-artifact.executable` を固定の `<repo>/target/release/<exe>` と照合する。
+fresh の場合も必須で、不一致/生成物の報告なし/不正な JSON は次の build と内側 exe の署名へ進めない。
+
+実装担当の範囲内の選択:
+
+- 環境変数3種の deny check は削除。環境変数・ユーザー Cargo config による変更は実 artifact で
+  検出する。release の既存 `PreserveRuntime` にある target 検査はその契約のまま保持した。
+- PowerShell は共通 `Assert-MivReleaseOutputContract` と `Assert-MivCargoArtifact` を用いる。
+  Cargo の stderr は merge せず人が読める診断を残す。stdout の UTF-8 捕捉用に
+  `Console.OutputEncoding` を一時設定して復元し、日本語 path も照合する。
+- Bash は同じ allow-list と各5 build の artifact 照合を行う。JSON の解析は小さな
+  `scripts/check-cargo-build-output.py` に任せ、`pipefail` で Cargo/検査の両失敗を止める。
+- portable は追加 Cargo 引数の受渡し自体がないことを source で確認した。4 build は明示的な
+  portable target のままで、MCP の loose 同梱・署名・PE・manifest hash/consumer を追加した。
+- launcher は通常 GUI 経路と診断初期化の前に MCP を分岐する。共通 lock identity を使い、
+  注入可能な child/runtime 境界で lease/marker の寿命を表した。core の mutex には同等の DACL が
+  無かったので専用実装にした。Everyone は SYNCHRONIZE のみ、creator は full access。
+- installer の失敗した DLL 呼出しの error は Inno の `DLLGetLastError` で受け、file-not-found
+  以外を不在扱いしない。既存 core shutdown の後に検査する。再試行/強制終了は足していない。
+
+追加/変更した実装ファイル:
+
+- `crates/launcher/{Cargo.toml,build.rs,src/main.rs}`、新規
+  `src/{mcp_launch.rs,mcp_launch_tests.rs,mcp_marker.rs}`。
+- `scripts/build-{release.ps1,release.sh,dist.ps1,portable.ps1,dev.ps1}`、
+  `test-release-build-safety.ps1`、`test-build-dev-safety.ps1`、
+  `ui-smoke/release-checks/Support.ps1`。新規 `build-process-policy.ps1`、
+  `test-build-process-policy.ps1`、`check-cargo-build-output.py`、`test_check_cargo_build_output.py`。
+- `installer/{mimageviewer.iss,readme.txt,readme_portable.txt}`。新規
+  `scripts/{mcp_stdio_check.py,test_mcp_stdio_check.py}` (client config を読まない直接 stdio client)。
+- §20.4 の6文書と本計画。`release-operations.md` に隔離 APPDATA/data-dir を使う直接 client の手順を追加。
+
+実装担当自身の code/test 照合であり、独立レビューや配布物の実機確認を代替しない。
+
+### 20.8 最終検証 (sandbox 内)
+
+観測者: 実装担当、2026-11-01。§20.6 の MCP release build と Python client は source が
+変わっていないので有効な結果を再利用した。以下は再開後に実行したもの。
+
+| コマンド | 実 exit | 結果 |
+|---|---:|---|
+| `cargo fmt` | 0 | workspace 全体。PNG/UI snapshot の変更なし |
+| `cargo fmt --check` | 0 | `target/mcp-1e-fmt-check.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | `target/mcp-1e-core-check.log` |
+| `cargo test -p mimageviewer-launcher` | 101 | release core/remote/EPUB の3入力不足の banner で build 中断。テスト未実行、`target/mcp-1e-launcher-tests.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 101 | agent-ipc 13/13、MCP 52成功/2失敗。2件とも既知の pipe open OS error 5、`target/mcp-1e-crate-tests.log` |
+| `python -I -m py_compile scripts/mcp_stdio_check.py scripts/test_mcp_stdio_check.py scripts/check-cargo-build-output.py` | 0 | 3 script の構文検査 |
+| `git diff --check` | 0 | LF/CRLF の warning のみ、`target/mcp-1e-final-diff.log` |
+
+launcher の入力不足を迂回する仮 release exe は作らず、source を使った非製品の注入 harness
+(`target/mcp-1e-lane-harness-generate.py` → `rustc --test` →
+`target/mcp-1e-lane-tests.exe mcp_launch:: --nocapture`) も実装担当自身が再実行した。
+generator/compile/test は exit 0、8/8 成功 (`target/mcp-1e-lane-tests.log`)。
+MCP lane の6件と Local marker の2件で、引数・MCP-only 展開・内容 hash・extraction lock の
+spawn 後解放・lease/marker の child 終了までの保持・exit/error と実 DACL を確認した。
+runtime は temp、child は fake、asset は非実行の fixture bytes。実 launcher の起動でも、
+launcher crate 全体の成功でもない。
+
+sandbox 内で失敗した2件 (無視/skip にしていない):
+
+- `pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld`
+- `pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked`
+
+製品の起動、実プロセス停止、AI アプリ/実 client config の読書き、build wrapper の通し実行、
+test-full の本物の gate は行っていない (安全性テストの fake Cargo による gate 検査とは別)。
+
+### 20.9 scripts の検証と sandbox 外への引継ぎ
+
+実装サブエージェントが担当 scripts の以下を実行し、実装担当が source と保存ログを確認した。
+独立レビューではない。
+
+| コマンド | 実 exit | 結果 |
+|---|---:|---|
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-release-build-safety.ps1 -PowerShellOnly` | 0 | `target/mcp-1e-script-safety-ps.log` |
+| 同コマンドの `-PowerShellOnly` なし | 1 | `target/mcp-1e-script-safety-default.log`。Git Bash 起動自体が CreateFileMapping / Win32 error 5、native exit 256 |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-build-dev-safety.ps1` | 0 | `target/mcp-1e-dev-script-safety.log` |
+| `python scripts/test_check_cargo_build_output.py` | 0 | 3/3、`target/mcp-1e-cargo-artifact-python.log` |
+| Git Bash による `-n scripts/build-release.sh` | 256 | 同じ OS error 5 で構文検査前に中断、`target/mcp-1e-bash-syntax.log` |
+| 変更した `.ps1` 9本の ASCII/PowerShell parse | 0 | 全件成功。最終 source を実装担当も確認 |
+
+PowerShell-only では、許可/拒否引数、各5本の artifact の一致/不一致と fresh、報告欠落、
+Cargo の失敗コード維持、日本語 path の native UTF-8 stdout と CP932 からの encoding 復元、
+インストール先/別出力先/path 不明/取得例外の launcher/MCP を止めないこと、実出力だけの
+停止/拒否、portable の出力構築と MCP manifest hash の改変拒否/consumer を確認した。
+dev は4 exe の build/stop/PE の検査を確認した。停止のログは全て mock process である。
+既存 release safety の gate stub は、現行 `test-full.ps1` に epaint 段があるのに8段を期待して
+最初 exit 1 だったため、テストの順序/件数/失敗注入を現行9段に揃えた。gate 自体は変更していない。
+
+`-PowerShellOnly` は検証範囲を明示する追加スイッチであり、既定では Bash を省略しない。
+Bash の失敗を引数拒否成功と誤認しないよう、最初に Bash 起動を確認する。最終 source では
+その直後に全 `build-release.sh` の `bash -n` も追加した。sandbox では追加行へ到達できないため
+この追加後の全体再実行はしていない。PowerShell parse は追加後も exit 0。
+
+実装担当自身も `python -I scripts/test_check_cargo_build_output.py` (3/3、exit 0、
+`target/mcp-1e-artifact-python-tests.log`) と `python -I scripts/test_mcp_stdio_check.py`
+(13/13、exit 0、`target/mcp-1e-client-tests-final.log`) を確認した。
+
+残る sandbox 外の自動検証 (repo root の PowerShell、実行担当 ClaudeCode):
+
+```powershell
+powershell -NoProfile -File scripts\test-release-build-safety.ps1
+powershell -NoProfile -File scripts\test-build-dev-safety.ps1
+.\scripts\build-release.ps1 -PreserveRuntime
+cargo test -p mimageviewer-launcher
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+```
+
+最初の safety test に Bash の構文/allow-list/artifact の検査も含むので、利用者向けに別の Bash
+コマンドは要らない。release wrapper は不足3入力と MCP/launcher を正しい順で作る。
+通し dist/portable/署名/PE/installer と、隔離した直接 stdio client・2 launcher の marker 寿命・
+cross-user marker・利用中の install/uninstall 拒否は、設計どおり sandbox 外で確認する。
+直接 stdio の具体的な PowerShell は `release-operations.md` §2.4。通常 APPDATA/runtime に
+変化がないことも外部担当が確認する。本 sandbox では未確認であり、配布成功は主張しない。
+追加判断後に未解決の設計矛盾は見つかっていない。commit はしていない。

@@ -54,6 +54,9 @@ Windows 向け 高速サムネイル画像ビューワー（ポータブル版�
   3. 初回起動時に、このフォルダの中に data\ フォルダが作られ、
      設定・サムネイルキャッシュ・AI モデル等がそこに保存されます。
 
+更新時は、mImageViewer と、mImageViewer を使っている AI アプリ
+(Claude・ChatGPT など) を終了してからファイルを置き換えてください。
+
 
 ----------------------------------------------------------------
  3. フォルダの構成
@@ -62,6 +65,7 @@ Windows 向け 高速サムネイル画像ビューワー（ポータブル版�
   mimageviewer.exe                本体
   mimageviewer-remote.exe         リモート閲覧用プログラム
   mimageviewer-epub-pdf.exe       EPUB 変換用プログラム
+  mimageviewer-mcp.exe            AI アプリとの連携用プログラム
   *.dll                           動画再生 / PDF / AI 用ライブラリ
   mimageviewer-susie32.exe        Susie プラグイン用 32bit ワーカー
   models\                         AI 用モデル

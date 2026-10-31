@@ -215,7 +215,7 @@ HEVC / AV1 を再生する) のために、FFmpeg の **LGPL shared build** を 
 直接の本体には適用できない (ローダの解決タイミングに間に合わない)。`/DELAYLOAD` も
 rustc 経由の link.exe で機能しない (Delay Import Directory が空のまま、原因未解明)。
 
-そこで **launcher が core・remote service・EPUB converter・FFmpeg DLL・VC runtime・EffeTune Mixwright bundle を内包する構成**で「単体 exe 配布」を実現している:
+そこで **launcher が core・remote service・EPUB converter・MCP adapter・FFmpeg DLL・VC runtime・EffeTune Mixwright bundle を内包する構成**で「単体 exe 配布」を実現している:
 
 ```
 配布する mimageviewer.exe (= ランチャー、crates/launcher/ が生成)
@@ -223,6 +223,7 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 │   ├── mimageviewer-core.exe   (本体、ffmpeg-the-third を import library リンク)
 │   ├── mimageviewer-remote.exe (本体と remote-ipc protocol version を共有、Web UI 資産も内包)
 │   ├── mimageviewer-epub-pdf.exe (EPUB → PDF 変換器)
+│   ├── mimageviewer-mcp.exe     (AI 連携の stdio adapter、console subsystem / CRT 静的リンク)
 │   ├── effetune/EffeTune Mixwright.vst3/ (全469ファイル、v0.15.0。入力は別の VERSION と計470ファイル)
 │   ├── app-local VC runtime 4 DLL (Microsoft 署名を保持)
 │   ├── avcodec-61.dll
@@ -244,8 +245,11 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 直撃しない。core を spawn する時点で展開済み DLL が同じディレクトリにあるので、
 Windows の DLL 検索順 (exe 同居が最優先) で確実に解決される。
 
+先頭引数が `--mcp` の時は MCP exe だけを展開し、標準入出力を継承して起動する。
+core/EffeTune の準備や activate はせず、子の終了まで runtime lease と MCP marker を保持する。
+
 **バージョン別 runtime ディレクトリ**: `runtime\<version>\` のように分けることで、
-古い core / remote / EPUB worker が走行中に新ランチャーが上書きしようとして file lock で失敗する事象を回避
+古い core / remote / EPUB worker / MCP が走行中に新ランチャーが上書きしようとして file lock で失敗する事象を回避
 (Codex レビュー助言)。core の起動完了・初回描画後、短命の背景 worker が現在実行中の
 `CARGO_PKG_VERSION` と使用中lockで保護された版を残し、他の版を best-effort 削除する。
 coreはexeの版directoryと固定EffeTune世代のshared leaseを寿命中保持し、launcherもcoreへの
@@ -258,28 +262,37 @@ workerが実行中process画像を一度だけ列挙し、候補内の画像が�
 その版を再び起動すると launcher が再展開する。portable は清掃しない。
 
 **ビルド順序**: cargo は同一ワークスペース内 bin の依存順序を表現できないので
-`scripts/build-release.{sh,ps1}` が 4 段階に分けて呼ぶ:
+`scripts/build-release.{sh,ps1}` が 5 段階に分けて呼ぶ:
 1. `cargo build --release --bin mimageviewer-core` → 本体生成 (package `mimageviewer` 内の bin なので `-p` 不要)
 2. `cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets`
    → Web UI 資産を内包した remote service 生成
 3. `cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf` → EPUB converter 生成
-4. `cargo build --release -p mimageviewer-launcher --bin mimageviewer` → ランチャー生成 (core + remote + EPUB worker + EffeTune bundle 等を include_bytes!)。**bare `cargo build --release --bin mimageviewer` は失敗する** (`no bin target named mimageviewer in default-run packages`。`mimageviewer` bin は package `mimageviewer-launcher` にあり workspace default-members 外なので `-p` 必須)
+4. `cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp` → MCP adapter 生成
+5. `cargo build --release -p mimageviewer-launcher --bin mimageviewer` → ランチャー生成 (core + remote + EPUB worker + MCP + EffeTune bundle 等を include_bytes!)。**bare `cargo build --release --bin mimageviewer` は失敗する** (`no bin target named mimageviewer in default-run packages`。`mimageviewer` bin は package `mimageviewer-launcher` にあり workspace default-members 外なので `-p` 必須)
 
-ラッパーは 4 つの cargo 呼び出しすべてで `CARGO_INCREMENTAL=0` を明示する。`Cargo.toml` の
+ラッパーは 5 つの cargo 呼び出しすべてで `CARGO_INCREMENTAL=0` を明示する。`Cargo.toml` の
 release profile はローカル rebuild 高速化のため `incremental = true` だが、ThinLTO +
 rust-lld で stale incremental object が残ると `fast_image_resize` などの SIMD symbol が
 release link 時に未解決になることがあるため、配布ビルドは安定優先で incremental を切る。
 
-`cargo build --release` を直接打つ場合は ① → ② → ③ → ④ の順で 4 回打つこと。
-ランチャー側 build.rs が `target/release` の core / remote / EPUB worker の存在をチェックし、
+`cargo build --release` を直接打つ場合は ① → ② → ③ → ④ → ⑤ の順で 5 回打つこと。
+ランチャー側 build.rs が `target/release` の core / remote / EPUB worker / MCP の存在をチェックし、
 無ければ復旧手順付きで止まる。EffeTune も `vendor/effetune-mixwright/VERSION` と
 `EffeTune Mixwright.vst3/` を必須検証する。`MIMV_EFFETUNE_DIR` で staging root を指定できる。
 承認済み入力は `third_party/effetune-mixwright/v0.15.0/manifest.sha256` の全470エントリと照合する。
 配布署名時は build-dist.ps1 が bundle を target にコピーして PE を署名し、埋め込み元を指定する
 (vendor 原本は変更しない)。
 
+release wrapper の出力先と launcher の埋込入力は `<repo>\target\release` の4本に固定する。
+追加 Cargo 引数は停止/build 前に allow-list で検査する (`--features`、feature/lock/offline の指定、
+verbose/jobs の指定だけ。正確な一覧は `mcp-integration-plan.md` §15.8)。
+各 build の `compiler-artifact.executable` も固定出力と照合し、環境変数や Cargo 設定で出力が
+変わった場合は署名/launcher build/内包へ進めない。診断は `json-render-diagnostics` で人が読める形を保つ。
+Bash 版の artifact JSON 検査は Python 3 (`scripts/check-cargo-build-output.py`、標準ライブラリのみ) を使う。
+PowerShell 版は `ConvertFrom-Json` を使う。
+
 **配布物**:
-- 単体 exe 版: `mimageviewer.exe` 1 ファイル (内包する core + remote + EPUB worker + DLL + EffeTune bundle を含む)
+- 単体 exe 版: `mimageviewer.exe` 1 ファイル (内包する core + remote + EPUB worker + MCP + DLL + EffeTune bundle を含む)
 - インストーラ版: `mImageViewer_setup.exe` (Inno Setup が同じランチャーを配置)
 - どちらも初回起動時に APPDATA に展開、2 回目以降は展開済みなのでスキップして高速
 
