@@ -12,7 +12,7 @@
 
 ---
 
-## v4.10.2 (2026-11-01)
+## v4.10.2 (2026-10-31)
 
 - **対象**: ブランチ `release-4.10.2` の `68226ebc7` (配布ビルド)。v4.10.1 (`57e572874`) を基点に、修正 2 件だけを載せた修正版。master には v4.11.0 向けの未出荷の変更があるため、master からは出さなかった。修正は mimalloc を 3.3.2 から 3.5.3 へ更新 (§1.666、5ch >>655・657・672 の突然終了の対策。`libmimalloc-sys` 0.1.49 を vendor し、同梱の v3 を上流無改変の 3.5.3 に差し替え、`[patch.crates-io]` で選ぶ) と、Everything 検索結果から直接ページ表示した本の閉じる帰路 (§1.664、5ch >>671)。どちらも独立レビュー ACCEPT。ビルドは G: の worktree `G:\home\mimageviewer-everything-1664` で行った (本体の作業ツリーは別セッションが master へコミット中だったため)。
 - **mimalloc の確認**: 配布物の core (単体exe・portable) に、3.5.3 で増えた option 名 `collect_merges_stats` の文字列があり、v4.10.0 の配布物には無いことを確認。lib テスト `allocator_tests::linked_mimalloc_is_v3_5_3` がリンクされた `mi_version()` = 30503 を検査。落ちる箇所そのもの (スレッド終了後の再入) の再現試験は無く、利用者環境で終了が止まるかは未確認。
