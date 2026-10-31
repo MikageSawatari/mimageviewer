@@ -54,8 +54,8 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.674 横連結読みで、画面に見えている隣の PDF ページが高画質にならず、一覧のサムネイルを拡大したままになる — 利用者報告 (2026-11-01)
 
-- 状態: **未着手・原因調査を実装担当へ (2026-11-01)**。利用者が v4.10.2 (インストール版) で PDF (`D:\home\scan\illust21030_010.pdf`、24 ページ) を全画面で閲覧中、2 枚並んだうち右はきれいで、左がサムネイル画質の拡大に見えると報告 (スクリーンショットあり)。利用者は「見開き」と認識していたが、ログ上の表示は連結読み。
-- 観測 (ClaudeCode が利用者の perf ログ `%APPDATA%\mimageviewer\logs\perf_events.jsonl` を読んだもの。アプリには触れていない。抜き出しは worktree `G:\home\mimageviewer-pdfq-1674	argetw4-evidence\`):
+- 状態: **未着手・原因調査を実装担当へ (2026-11-01)**。利用者が v4.10.2 (インストール版) で PDF (`D:\home\scan\illust\20221030_010.pdf`、24 ページ) を全画面で閲覧中、2 枚並んだうち右はきれいで、左がサムネイル画質の拡大に見えると報告 (スクリーンショットあり)。利用者は「見開き」と認識していたが、ログ上の表示は連結読み。
+- 観測 (ClaudeCode が利用者の perf ログ `%APPDATA%\mimageviewer\logs\perf_events.jsonl` を読んだもの。アプリには触れていない。抜き出しは worktree `G:\home\mimageviewer-pdfq-1674\target\1674-evidence\`):
   - 一覧で PDF を開き、ページ一覧から idx 0 をダブルクリックで開いた (t=5349.9)。全画面の高画質要求は t=5355.638 から **idx 3 だけ** (`scheduler_enqueue` contract=sequential、`pool_send` target_px 7539 → 3163 → 5532 と 3 回作り直し)。
   - 画面に並んでいる **idx 4 は一度も全画面の要求が出ていない**。描画は `continuous_draw idx=4 texture=Managed(5940)` で、Managed(5940) は一覧のアイドル高画質化で作った長辺 561px のテクスチャ (`texture_delivery_submitted` t=5349.762、`page_0004` decode_end)。`final_prepare_native_lookup` も idx 4 は `native_key=null outcome=not_needed`。
   - `page_turn_decision` は `reason=reading_flow_not_paged` (`fs_page_turn_ordinary_context_blocker`、`reading_flow.is_paged()` が false = 縦 / 横連結読み)。
