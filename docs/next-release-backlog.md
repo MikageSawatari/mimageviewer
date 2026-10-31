@@ -52,6 +52,18 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - §1.456 一覧の名前の文字サイズ・最大行数 (>>629): 出荷の案内は未。
 - §1.480 画像フォルダを Enter で開くと自動表示が ON でもページ一覧で止まる (>>649 の調査中に開発側で発見、v4.2.0 から): >>649 の評価フィルタの件は開発側で再現しなかった。報告者へは未返信。
 
+### 1.671 ★で絞った本から一覧へ戻っても「★一時解除中」が残る — 5ch >>687 (2026-10-31)
+
+- 状態: **未着手・開発側で再現と原因確認を行う (利用者依頼 2026-10-31)**。[>>687](https://egg.5ch.io/test/read.cgi/software/1782419551/687) は「サムネイル画面で星で絞って本を開くと『★フィルタ一時解除中 (親へ戻ると復元)』と出るが、サムネイルへ戻っても復元されず、★一時解除中のまま」という報告。本の形式・ウィンドウモード・閉じ方・戻った一覧が本のページ一覧か親の本一覧かは未記載。Everything 起点とも明記されていない。**今回の調査はソース確認のみで、実アプリでの再現・回帰テストの実行・製品コードの修正はしていない。報告者の原因は未確定。**
+- 守る動作: 本の未評価ページを消さないため、本の内部 (ページ一覧を含む) では一時解除を維持し、本の範囲を出て元の一覧へ戻ったら解除前の絞り込みを使う。保存済み `settings.rating_filter` は書き換えない。「サムネイルに戻る」が本のページ一覧への移動であれば、解除継続は現仕様の範囲となる。
+- 具体的な不具合候補 (v4.10.2 と現行 master のコードで確認): 変換した RAR / 7z / LZH 等では、内部 ZIP の `current_folder` とは別に元書庫の `archive_source_override` を持つ。`src/app.rs::install_loading_items_inner` は旧 override を clone して保持し、新しい `current_folder` を設定した後、**旧 override を外す前に** `maybe_restore_rating_filter_if_out_of_scope` を呼ぶ。`effective_folder` は override を優先するので、通常の親フォルダへ戻っても元書庫内にいると判定して復元を飛ばし、その後で override を消す順序になり得る。通常フォルダの走査結果の採用もこの経路を通る。復元漏れを起こし得る処理順だが、**>>687 が変換書庫を使った証拠はない**。
+- 別の条件: `maybe_restore_rating_filter_if_out_of_scope` は範囲外で解除した後、戻ったフォルダ自体に条件を満たす★があれば、そのフォルダを起点に再び一時解除する。この場合は同じ anchor が残ったのではなく再発動なので、親の評価・anchor の前後を区別する。親の一覧でも解除するべきかは、実際の一覧と用途を確認してから判断する。
+- 複数ウィンドウとの関係: `rating_filter_suppressed_at` は `ViewerContextBundle` が所有し、独立した本の viewer は main の表示フィルタを使わない経路がある。モードだけで必ず壊れるとは確認していない。Everything の main / linked F12 の帰路は `return_from_everything_child` が明示的に解除する。独立 viewer の帰路が main の結果を置換する既知の問題 (§1.670) と、本報告を根拠なく同一原因にしない。
+- 開発側で行う確認: まず通常 ZIP と変換書庫で「★付きの本を絞った親一覧 → 本 → 元の親一覧」を同じ条件で比較し、親自身の★なし / 条件一致も分ける。本のページ一覧へ戻る場合と親へ戻る場合、Esc / HUD の×と Backspace、通常 main / linked F12 / 独立 viewer を既存の受付・採用・帰路処理で通す。Everything 起点も対照に含める。戻る前後の logical source / `current_folder` / override / suppression anchor / 実効フィルタ / 可視項目を検査し、バッジだけの問題か、実際に絞り込みが戻っていないかを切り分ける。まず開発側で調べ、報告者へ推測の確認を繰り返さない。
+- 修正方針は原因確認後に決める。候補経路では、一覧採用時の論理 source と backing path の組が確定した状態で scope を判定できる所有境界を確認する。表示だけ消す・閉じるたびに一括解除する・追加フラグで吸収する修正は避ける。本の内部での一時解除と sibling context の状態を保ち、open / switch / close / cancel / 採用失敗の同型経路も確認する。
+- 既存の検証材料 (今回は未実行): `src/app/tests.rs` の `rating_filter_suppression_is_owned_by_the_context_that_established_it`、`opening_starred_zip_book_under_filter_suppresses_then_restores`、`src/app/list_order_ratingnav649_tests.rs` の通常 ZIP / 画像フォルダの回帰。変換 alias と実際の親一覧の採用を通す回帰を追加し、修正前に失敗することを確かめる。`src/app/tests/everything_close_return.rs` の帰路にも評価の復元条件を検査する。実画面の確認が必要なら、事前承認と使い捨て portable の手順に従う。
+- 対象: `src/app.rs` の一覧採用・`effective_folder`・評価フィルタの一時解除と復元、`src/app/viewer_context_registry.rs`、`src/global_search_ui/everything.rs`、関連テスト。[仮想フォルダ](virtual-folders.md)、[一覧順の本移動](list-order-book-navigation-plan.md) を参照。detached の所有境界へ触れる場合は [リワーク計画 §2](detached-rework-plan.md#2-憲法-全ステージ共通の不変条件禁止事項-️-最重要) の構造的修正の合意と記録を行う。規模: 原因確認後に見積もる / 優先度: P2。
+
 ### 1.668 コレクションの一覧がサムネイルのキャッシュを使わず、開くたびに作り直す — X @Rottytops (2026-10-31)
 
 - 状態: **未着手 (v4.11.0 候補)**。[X の投稿](https://x.com/Rottytops) (2026-10-31) は「2000 件のコレクションで毎回サムネイルを読みに行くのがしんどい。コレクションのサムネイルキャッシュを検討してほしい」という要望。報告者の素材の置き場所 (SSD / HDD / NAS)・本と画像の割合は未記載。開発側は実測していない。
