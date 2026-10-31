@@ -1076,4 +1076,5 @@ cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_lev
   最初の 1 回は両 tool とも `-32602 Invalid limit or cursor` で失敗し、モデルが引数を変えて再試行して成功した。
   CLI の表示に引数が出ないので値は未確認 (adapter の検査から、limit が 0 か 200 超だったと推定)。
   段階 1 で、範囲外の limit を上限へ丸めるか、エラー文に許容範囲 (1〜200) を書く。
-- ChatGPT Windows アプリ・Claude Desktop からの呼び出しは利用者の確認待ち。
+- **ChatGPT Windows アプリ (OpenAI.Codex 26.1027.3384.0)、観測者 利用者**: `target\mcp-trial\chatgpt-trial.ps1 add` で `~/.codex/config.toml` に `mimageviewer-trial` を足して起動し、同じ依頼をした。回答はタグ 4 種と件数、cat の 2 枚 (cat_garden.png = cat・outdoor、cat_sofa.png = cat・indoor) で seed と一致した。
+- Claude Desktop からの呼び出しは未確認 (利用者の他の作業のため再起動を見送り)。
