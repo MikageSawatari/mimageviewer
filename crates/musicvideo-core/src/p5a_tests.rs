@@ -1,7 +1,7 @@
 use crate::*;
 use comic_core::{FontSet, LoadedFont};
 
-fn frame() -> SpectrumFrame {
+pub(crate) fn frame() -> SpectrumFrame {
     let mut frame = SpectrumFrame::new(vec![0.6; 96]);
     frame.modulators.push(ModulatorValue {
         id: ModulatorId(1),
@@ -19,7 +19,7 @@ fn binding(target: ModulationTarget, amount: f32) -> ModulationBinding {
     }
 }
 
-fn decorated_style() -> TextStyle {
+pub(crate) fn decorated_style() -> TextStyle {
     TextStyle {
         outline: Some(StrokeStyle {
             width_px: 2.0,
@@ -320,7 +320,7 @@ fn p5a_radial_scale_changes_inner_diameter_in_export_rgba() {
     }
 }
 
-fn assets() -> Assets {
+pub(crate) fn assets() -> Assets {
     let mut fonts = FontSet::new();
     fonts.insert(
         LoadedFont::from_bytes(

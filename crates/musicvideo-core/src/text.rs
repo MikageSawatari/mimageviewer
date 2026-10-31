@@ -163,7 +163,13 @@ impl PreparedLane {
     }
     fn publish(&mut self, key: TextCacheKey, bake: Arc<TextBake>) -> Arc<TextBake> {
         if let Some(existing) = self.get(&key) {
-            return existing;
+            if bake.painters.is_empty() || !existing.painters.is_empty() {
+                return existing;
+            }
+            // A small full bitmap may later be requested through a tiny visible
+            // window. Replace its layout-only preparation with region painters,
+            // accounting their coverage in the same prepared-cache budget.
+            self.bytes -= self.entries.remove(&key).unwrap().2;
         }
         let bytes = key.bytes()
             + bake.retained_bytes()
@@ -349,8 +355,37 @@ impl TextCache {
         transient: bool,
         align: crate::TextAlign,
         rect: crate::raster::PixelRect,
+        visit: impl FnMut(&TextBitmap, i32, i32),
+    ) -> Option<()> {
+        self.visit_window(
+            fonts, text, font_key, size_px, style, transient, align, rect, rect, visit,
+        )
+    }
+
+    /// Align against the logical layer rectangle, but only rasterize the visible
+    /// window. The window is in the same full-canvas coordinates as `rect`.
+    pub fn visit_window(
+        &self,
+        fonts: &FontSet,
+        text: &str,
+        font_key: &str,
+        size_px: f32,
+        style: &TextStyle,
+        transient: bool,
+        align: crate::TextAlign,
+        rect: crate::raster::PixelRect,
+        clip: crate::raster::PixelRect,
         mut visit: impl FnMut(&TextBitmap, i32, i32),
     ) -> Option<()> {
+        let clip = crate::raster::PixelRect {
+            x0: rect.x0.max(clip.x0),
+            y0: rect.y0.max(clip.y0),
+            x1: rect.x1.min(clip.x1),
+            y1: rect.y1.min(clip.y1),
+        };
+        if clip.is_empty() {
+            return Some(());
+        }
         let size_px = if size_px.is_finite() {
             size_px.max(1.0)
         } else {
@@ -382,16 +417,34 @@ impl TextCache {
         }
         let bake = self.prepare(fonts, text, font_key, size_px, style, &key)?;
         let (dx, dy) = destination(bake.logical_width, bake.logical_height, bake.origin_offset);
-        if bake.bytes() <= MAX_TEXT_RASTER_BYTES {
+        let visible_budget = clip
+            .width()
+            .saturating_mul(clip.height())
+            .saturating_mul(if bake.painted { 8 } else { 4 })
+            .saturating_mul(4);
+        if bake.bytes() <= MAX_TEXT_RASTER_BYTES.min(visible_budget) {
             let bitmap = self.bake(fonts, &bake, key, transient);
             visit(&bitmap, dx, dy);
         } else {
-            // Intersect in the original full-canvas coordinates. Keep that origin
-            // for comic-core's floating-point calculations and integer rounding.
-            let x0 = (rect.x0 as i64 - dx as i64).clamp(0, bake.width as i64) as usize;
-            let y0 = (rect.y0 as i64 - dy as i64).clamp(0, bake.height as i64) as usize;
-            let x1 = (rect.x1 as i64 - dx as i64).clamp(0, bake.width as i64) as usize;
-            let y1 = (rect.y1 as i64 - dy as i64).clamp(0, bake.height as i64) as usize;
+            // Intersect before preparing painters or visiting tiles: even an
+            // enormous logical text canvas must not enumerate invisible tiles.
+            let x0 = (clip.x0 as i64 - dx as i64).clamp(0, bake.width as i64) as usize;
+            let y0 = (clip.y0 as i64 - dy as i64).clamp(0, bake.height as i64) as usize;
+            let x1 = (clip.x1 as i64 - dx as i64).clamp(0, bake.width as i64) as usize;
+            let y1 = (clip.y1 as i64 - dy as i64).clamp(0, bake.height as i64) as usize;
+            if x0 >= x1 || y0 >= y1 {
+                return Some(());
+            }
+            let bake = if bake.painters.is_empty() {
+                let regions = Arc::new(bake.with_regions(fonts)?);
+                self.entries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .prepared
+                    .publish(key.clone(), regions)
+            } else {
+                bake
+            };
             for y in (y0..y1).step_by(TILE_EDGE) {
                 for x in (x0..x1).step_by(TILE_EDGE) {
                     let mut key = key.clone();
@@ -501,6 +554,32 @@ struct TextBake {
     painters: Vec<PreparedTextRaster>,
 }
 impl TextBake {
+    fn with_regions(&self, fonts: &FontSet) -> Option<Self> {
+        let font = fonts.get(&self.glyph.font_key)?;
+        let layout = layout_text(&self.glyph, font);
+        let blocks = if self.painted {
+            vec![&self.glyph, &self.decoration]
+        } else {
+            vec![&self.glyph]
+        };
+        Some(Self {
+            glyph: self.glyph.clone(),
+            decoration: self.decoration.clone(),
+            width: self.width,
+            height: self.height,
+            logical_width: self.logical_width,
+            logical_height: self.logical_height,
+            origin_offset: self.origin_offset,
+            painted: self.painted,
+            painters: prepare_text_regions(
+                &layout,
+                font,
+                (self.origin_offset.0 as f32, self.origin_offset.1 as f32),
+                &blocks,
+            ),
+        })
+    }
+
     fn retained_bytes(&self) -> usize {
         let blocks = [&self.glyph, &self.decoration];
         std::mem::size_of::<Self>()
@@ -626,6 +705,335 @@ mod tests {
     fn assert_eviction_rgba(expected: &[u8], actual: &[u8]) {
         assert_eq!(actual, expected, "eviction must preserve glyph RGBA");
     }
+    fn window_test_fonts() -> FontSet {
+        let mut fonts = FontSet::new();
+        fonts.insert(
+            comic_core::LoadedFont::from_bytes(
+                "font",
+                include_bytes!("../../../tools/comic_lab/assets/fonts/ZenKurenaido-Regular.ttf")
+                    .to_vec(),
+            )
+            .unwrap(),
+        );
+        fonts
+    }
+
+    #[test]
+    fn p5a_text_window_preserves_full_alignment_and_clips_below_fixed_budget() {
+        let fonts = window_test_fonts();
+        let rect = crate::raster::PixelRect {
+            x0: 100,
+            y0: 200,
+            x1: 192_100,
+            y1: 108_200,
+        };
+        for painted in [false, true] {
+            let style = TextStyle {
+                outline: painted.then_some(crate::StrokeStyle {
+                    width_px: 7.0,
+                    ..Default::default()
+                }),
+                shadow: painted.then_some(crate::TextShadowStyle {
+                    offset: (13.0, -9.0),
+                    blur_px: 8.0,
+                    spread_px: 2.0,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let reference = TextCache::default()
+                .get_or_rasterize(
+                    &fonts,
+                    "\u{65e5}\u{672c}\u{8a9e} Ag",
+                    "font",
+                    128.0,
+                    &style,
+                    false,
+                )
+                .unwrap();
+            let ink = reference
+                .rgba
+                .chunks_exact(4)
+                .enumerate()
+                .find(|(n, pixel)| {
+                    pixel[3] != 0
+                        && n % reference.width >= reference.origin_offset.0
+                        && n / reference.width >= reference.origin_offset.1
+                })
+                .unwrap()
+                .0;
+            let source_x = ink % reference.width;
+            let source_y = ink / reference.width;
+            assert!(reference.rgba.len() < MAX_TEXT_RASTER_BYTES);
+            for align in [
+                crate::TextAlign::Start,
+                crate::TextAlign::Center,
+                crate::TextAlign::End,
+            ] {
+                let dx = match align {
+                    crate::TextAlign::Start => rect.x0 as f32,
+                    crate::TextAlign::Center => {
+                        rect.x0 as f32 + (rect.width() as f32 - reference.logical_width) * 0.5
+                    }
+                    crate::TextAlign::End => rect.x1 as f32 - reference.logical_width,
+                }
+                .round() as i32
+                    - reference.origin_offset.0 as i32;
+                let dy = (rect.y0 as f32 + (rect.height() as f32 - reference.logical_height) * 0.5)
+                    .round() as i32
+                    - reference.origin_offset.1 as i32;
+                let clip = crate::raster::PixelRect {
+                    x0: (dx + source_x as i32) as usize,
+                    y0: (dy + source_y as i32) as usize,
+                    x1: (dx + source_x as i32) as usize + 19,
+                    y1: (dy + source_y as i32) as usize + 17,
+                };
+                let cache = TextCache::default();
+                let key = TextCacheKey::new("\u{65e5}\u{672c}\u{8a9e} Ag", "font", 128.0, &style);
+                let first = cache
+                    .prepare(
+                        &fonts,
+                        "\u{65e5}\u{672c}\u{8a9e} Ag",
+                        "font",
+                        128.0,
+                        &style,
+                        &key,
+                    )
+                    .unwrap();
+                assert!(first.painters.is_empty());
+                let mut visited = 0;
+                cache
+                    .visit_window(
+                        &fonts,
+                        "\u{65e5}\u{672c}\u{8a9e} Ag",
+                        "font",
+                        128.0,
+                        &style,
+                        false,
+                        align,
+                        rect,
+                        clip,
+                        |bitmap, x, y| {
+                            visited += 1;
+                            assert!(bitmap.width <= clip.width() && bitmap.height <= clip.height());
+                            assert!(x >= clip.x0 as i32 && y >= clip.y0 as i32);
+                            assert!(x as usize + bitmap.width <= clip.x1);
+                            assert!(y as usize + bitmap.height <= clip.y1);
+                            for by in 0..bitmap.height {
+                                for bx in 0..bitmap.width {
+                                    let expected = (((y - dy) as usize + by) * reference.width
+                                        + (x - dx) as usize
+                                        + bx)
+                                        * 4;
+                                    let actual = (by * bitmap.width + bx) * 4;
+                                    assert_eq!(
+                                        bitmap.rgba[actual..actual + 4],
+                                        reference.rgba[expected..expected + 4]
+                                    );
+                                    if painted {
+                                        assert_eq!(
+                                            bitmap.decoration.as_ref().unwrap()[actual..actual + 4],
+                                            reference.decoration.as_ref().unwrap()
+                                                [expected..expected + 4]
+                                        );
+                                    }
+                                }
+                            }
+                            assert!(bitmap.rgba.chunks_exact(4).any(|p| p[3] != 0));
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(visited, 1);
+                let again = cache
+                    .prepare(
+                        &fonts,
+                        "\u{65e5}\u{672c}\u{8a9e} Ag",
+                        "font",
+                        128.0,
+                        &style,
+                        &key,
+                    )
+                    .unwrap();
+                assert!(!again.painters.is_empty());
+                assert!(!Arc::ptr_eq(&first, &again));
+                let state = cache.entries.lock().unwrap();
+                assert_eq!(
+                    state.prepared.bytes,
+                    state
+                        .prepared
+                        .entries
+                        .iter()
+                        .map(|(key, (bake, _, _))| {
+                            key.bytes()
+                                + bake.retained_bytes()
+                                + std::mem::size_of::<(Arc<TextBake>, u64, usize)>()
+                        })
+                        .sum::<usize>()
+                );
+                assert!(state.prepared.bytes <= PREPARED_BYTES);
+                assert!(
+                    state
+                        .stable
+                        .entries
+                        .keys()
+                        .all(|k| k.area != TextRasterArea::Full)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn p5a_text_window_huge_effect_canvas_only_bakes_visible_tile() {
+        let fonts = window_test_fonts();
+        let style = TextStyle {
+            echo: Some(crate::TextEchoStyle {
+                offset: (50_000.0, -50_000.0),
+                count: 12,
+                ..Default::default()
+            }),
+            outline: Some(Default::default()),
+            ..Default::default()
+        };
+        let prepared = TextBake::new(&fonts, "A", "font", 64.0, &style).unwrap();
+        assert!(prepared.width > 1_000_000 && prepared.height > 1_000_000);
+        let rect = crate::raster::PixelRect {
+            x0: 0,
+            y0: 0,
+            x1: 192_000,
+            y1: 108_000,
+        };
+        let dx = -(prepared.origin_offset.0 as i32);
+        let dy = ((rect.height() as f32 - prepared.logical_height) * 0.5).round() as i32
+            - prepared.origin_offset.1 as i32;
+        let clip = crate::raster::PixelRect {
+            x0: 0,
+            y0: 53_990,
+            x1: 64,
+            y1: 54_054,
+        };
+        let region = (clip.x0 as i32 - dx, clip.y0 as i32 - dy);
+        let origin = (
+            prepared.origin_offset.0 as f32,
+            prepared.origin_offset.1 as f32,
+        );
+        let glyph = bake_text_region(
+            &prepared.glyph,
+            origin,
+            region,
+            clip.width(),
+            clip.height(),
+            &fonts,
+        )
+        .pixels;
+        let decoration = bake_text_region(
+            &prepared.decoration,
+            origin,
+            region,
+            clip.width(),
+            clip.height(),
+            &fonts,
+        )
+        .pixels;
+        assert!(glyph.chunks_exact(4).any(|p| p[3] != 0));
+        let mut count = 0;
+        TextCache::default()
+            .visit_window(
+                &fonts,
+                "A",
+                "font",
+                64.0,
+                &style,
+                false,
+                crate::TextAlign::Start,
+                rect,
+                clip,
+                |bitmap, x, y| {
+                    count += 1;
+                    assert_eq!((x, y), (clip.x0 as i32, clip.y0 as i32));
+                    assert_eq!((bitmap.width, bitmap.height), (clip.width(), clip.height()));
+                    assert_eq!(bitmap.rgba, glyph);
+                    assert_eq!(bitmap.decoration.as_ref().unwrap(), &decoration);
+                    assert!(
+                        bitmap.rgba.capacity() + bitmap.decoration.as_ref().unwrap().capacity()
+                            <= clip.width() * clip.height() * 8
+                    );
+                },
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn p5a_text_window_reuses_existing_full_bitmap_without_rebaking() {
+        let fonts = window_test_fonts();
+        let cache = TextCache::default();
+        let style = TextStyle::default();
+        let full = cache
+            .get_or_rasterize(&fonts, "ABC", "font", 32.0, &style, false)
+            .unwrap();
+        let rect = crate::raster::PixelRect {
+            x0: 0,
+            y0: 0,
+            x1: 640,
+            y1: 320,
+        };
+        let clip = crate::raster::PixelRect {
+            x0: 1,
+            y0: 155,
+            x1: 2,
+            y1: 156,
+        };
+        let mut count = 0;
+        cache
+            .visit_window(
+                &fonts,
+                "ABC",
+                "font",
+                32.0,
+                &style,
+                false,
+                crate::TextAlign::Start,
+                rect,
+                clip,
+                |bitmap, _, _| {
+                    count += 1;
+                    assert!(std::ptr::eq(bitmap, full.as_ref()));
+                },
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let mut via_legacy = Vec::new();
+        let mut via_window = Vec::new();
+        cache
+            .visit(
+                &fonts,
+                "ABC",
+                "font",
+                32.0,
+                &style,
+                false,
+                crate::TextAlign::Center,
+                rect,
+                |bitmap, x, y| via_legacy.push((bitmap.rgba.clone(), x, y)),
+            )
+            .unwrap();
+        cache
+            .visit_window(
+                &fonts,
+                "ABC",
+                "font",
+                32.0,
+                &style,
+                false,
+                crate::TextAlign::Center,
+                rect,
+                rect,
+                |bitmap, x, y| via_window.push((bitmap.rgba.clone(), x, y)),
+            )
+            .unwrap();
+        assert_eq!(via_legacy, via_window);
+    }
+
     #[test]
     fn t1_prepared_tiles_reuse_one_logical_bake_across_mask_body_and_keep_total_budget() {
         let mut fonts = FontSet::new();

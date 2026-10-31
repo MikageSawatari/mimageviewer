@@ -88,6 +88,151 @@ struct ScaleGeometry {
     scale_y: f32,
 }
 
+impl ScaleGeometry {
+    fn new(source: &ImageAsset, width: u32, height: u32, fit: Fit) -> Self {
+        let destination_w = width as f32;
+        let destination_h = height as f32;
+        let source_w = source.width as f32;
+        let source_h = source.height as f32;
+        match fit {
+            Fit::Stretch => ScaleGeometry {
+                x0: 0,
+                y0: 0,
+                x1: width as usize,
+                y1: height as usize,
+                origin_x: 0.0,
+                origin_y: 0.0,
+                scale_x: destination_w / source_w,
+                scale_y: destination_h / source_h,
+            },
+            Fit::Contain => {
+                let scale = (destination_w / source_w).min(destination_h / source_h);
+                let draw_w = (source_w * scale).round().max(1.0) as usize;
+                let draw_h = (source_h * scale).round().max(1.0) as usize;
+                let x0 = (width as usize).saturating_sub(draw_w) / 2;
+                let y0 = (height as usize).saturating_sub(draw_h) / 2;
+                let x1 = (x0 + draw_w).min(width as usize);
+                let y1 = (y0 + draw_h).min(height as usize);
+                ScaleGeometry {
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    origin_x: x0 as f32,
+                    origin_y: y0 as f32,
+                    scale_x: (x1 - x0) as f32 / source_w,
+                    scale_y: (y1 - y0) as f32 / source_h,
+                }
+            }
+            Fit::Cover => {
+                let scale = (destination_w / source_w).max(destination_h / source_h);
+                ScaleGeometry {
+                    x0: 0,
+                    y0: 0,
+                    x1: width as usize,
+                    y1: height as usize,
+                    origin_x: (destination_w - source_w * scale) * 0.5,
+                    origin_y: (destination_h - source_h * scale) * 0.5,
+                    scale_x: scale,
+                    scale_y: scale,
+                }
+            }
+        }
+    }
+}
+
+/// Reads the same rounded pixels as `prepare_image` without materializing its
+/// logical destination. Zoom deliberately resamples those u8 pixels in a second
+/// pass, preserving the existing fit-then-zoom rounding and transparent edges.
+pub(crate) struct ScaledImageSampler<'a> {
+    source: &'a ImageAsset,
+    width: usize,
+    height: usize,
+    geometry: ScaleGeometry,
+    same_size: bool,
+}
+
+impl<'a> ScaledImageSampler<'a> {
+    pub(crate) fn new(
+        source: &'a ImageAsset,
+        width: u32,
+        height: u32,
+        fit: Fit,
+    ) -> Result<Self, AssetError> {
+        if width == 0 || height == 0 {
+            return Err(AssetError::InvalidImageBuffer {
+                expected: 1,
+                actual: 0,
+            });
+        }
+        Ok(Self {
+            source,
+            width: width as usize,
+            height: height as usize,
+            geometry: ScaleGeometry::new(source, width, height, fit),
+            same_size: source.width == width && source.height == height,
+        })
+    }
+
+    pub(crate) fn sample(&self, x: usize, y: usize) -> [u8; 4] {
+        if x >= self.width || y >= self.height {
+            return [0; 4];
+        }
+        if self.same_size {
+            let offset = (y * self.width + x) * 4;
+            return self.source.rgba[offset..offset + 4].try_into().unwrap();
+        }
+        let g = self.geometry;
+        if x < g.x0 || x >= g.x1 || y < g.y0 || y >= g.y1 {
+            return [0; 4];
+        }
+        sample_bilinear(
+            self.source,
+            (x as f32 + 0.5 - g.origin_x) / g.scale_x - 0.5,
+            (y as f32 + 0.5 - g.origin_y) / g.scale_y - 0.5,
+        )
+    }
+
+    pub(crate) fn sample_zoomed(&self, local_x: usize, local_y: usize, zoom: f32) -> [u8; 4] {
+        let zoom = if zoom.is_finite() {
+            zoom.max(0.01)
+        } else {
+            1.0
+        };
+        if (zoom - 1.0).abs() <= f32::EPSILON {
+            return self.sample(local_x, local_y);
+        }
+        let x =
+            (local_x as f32 + 0.5 - self.width as f32 * 0.5) / zoom + self.width as f32 * 0.5 - 0.5;
+        let y = (local_y as f32 + 0.5 - self.height as f32 * 0.5) / zoom + self.height as f32 * 0.5
+            - 0.5;
+        if x < -0.5 || y < -0.5 || x > self.width as f32 - 0.5 || y > self.height as f32 - 0.5 {
+            return [0; 4];
+        }
+        let x = x.clamp(0.0, self.width.saturating_sub(1) as f32);
+        let y = y.clamp(0.0, self.height.saturating_sub(1) as f32);
+        let x0 = x.floor() as usize;
+        let y0 = y.floor() as usize;
+        let x1 = (x0 + 1).min(self.width - 1);
+        let y1 = (y0 + 1).min(self.height - 1);
+        let tx = x - x0 as f32;
+        let ty = y - y0 as f32;
+        let pixels = [
+            self.sample(x0, y0),
+            self.sample(x1, y0),
+            self.sample(x0, y1),
+            self.sample(x1, y1),
+        ];
+        let mut result = [0; 4];
+        for (channel, output) in result.iter_mut().enumerate() {
+            let top = pixels[0][channel] as f32 * (1.0 - tx) + pixels[1][channel] as f32 * tx;
+            let bottom = pixels[2][channel] as f32 * (1.0 - tx) + pixels[3][channel] as f32 * tx;
+            *output = (top * (1.0 - ty) + bottom * ty).round().clamp(0.0, 255.0) as u8;
+        }
+        result
+    }
+}
+
 #[derive(Default)]
 struct ScaledImageCache {
     entries: VecDeque<ScaledImageCacheEntry>,
@@ -339,6 +484,32 @@ impl Assets {
         )
     }
 
+    pub(crate) fn visit_rasterized_text_window(
+        &self,
+        text: &str,
+        font_key: &str,
+        size_px: f32,
+        style: &crate::TextStyle,
+        transient: bool,
+        align: crate::TextAlign,
+        rect: crate::raster::PixelRect,
+        clip: crate::raster::PixelRect,
+        visit: impl FnMut(&TextBitmap, i32, i32),
+    ) -> Option<()> {
+        self.text_cache.visit_window(
+            &self.fonts,
+            text,
+            font_key,
+            size_px,
+            style,
+            transient,
+            align,
+            rect,
+            clip,
+            visit,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn rasterized_text(
         &self,
@@ -373,54 +544,7 @@ fn prepare_image(
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or(AssetError::DimensionsOverflow)?;
     let mut rgba = vec![0; len];
-    let destination_w = width as f32;
-    let destination_h = height as f32;
-    let source_w = source.width as f32;
-    let source_h = source.height as f32;
-    let geometry = match fit {
-        Fit::Stretch => ScaleGeometry {
-            x0: 0,
-            y0: 0,
-            x1: width as usize,
-            y1: height as usize,
-            origin_x: 0.0,
-            origin_y: 0.0,
-            scale_x: destination_w / source_w,
-            scale_y: destination_h / source_h,
-        },
-        Fit::Contain => {
-            let scale = (destination_w / source_w).min(destination_h / source_h);
-            let draw_w = (source_w * scale).round().max(1.0) as usize;
-            let draw_h = (source_h * scale).round().max(1.0) as usize;
-            let x0 = (width as usize).saturating_sub(draw_w) / 2;
-            let y0 = (height as usize).saturating_sub(draw_h) / 2;
-            let x1 = (x0 + draw_w).min(width as usize);
-            let y1 = (y0 + draw_h).min(height as usize);
-            ScaleGeometry {
-                x0,
-                y0,
-                x1,
-                y1,
-                origin_x: x0 as f32,
-                origin_y: y0 as f32,
-                scale_x: (x1 - x0) as f32 / source_w,
-                scale_y: (y1 - y0) as f32 / source_h,
-            }
-        }
-        Fit::Cover => {
-            let scale = (destination_w / source_w).max(destination_h / source_h);
-            ScaleGeometry {
-                x0: 0,
-                y0: 0,
-                x1: width as usize,
-                y1: height as usize,
-                origin_x: (destination_w - source_w * scale) * 0.5,
-                origin_y: (destination_h - source_h * scale) * 0.5,
-                scale_x: scale,
-                scale_y: scale,
-            }
-        }
-    };
+    let geometry = ScaleGeometry::new(source, width, height, fit);
     let row_bytes = width as usize * 4;
     rgba.par_chunks_exact_mut(row_bytes)
         .enumerate()
@@ -495,6 +619,111 @@ mod tests {
 
     fn pixel(value: u8) -> ImageAsset {
         ImageAsset::new(1, 1, vec![value, value, value, 255]).unwrap()
+    }
+
+    // Frozen draw_image zoom reference: first materialize prepare_image's u8
+    // output, then bilinearly sample it, including its half-pixel edge rule.
+    fn prepared_zoom_reference(
+        image: &ImageAsset,
+        local_x: usize,
+        local_y: usize,
+        zoom: f32,
+    ) -> [u8; 4] {
+        let zoom = if zoom.is_finite() {
+            zoom.max(0.01)
+        } else {
+            1.0
+        };
+        if (zoom - 1.0).abs() <= f32::EPSILON {
+            let offset = (local_y * image.width as usize + local_x) * 4;
+            return image.rgba[offset..offset + 4].try_into().unwrap();
+        }
+        let x = (local_x as f32 + 0.5 - image.width as f32 * 0.5) / zoom + image.width as f32 * 0.5
+            - 0.5;
+        let y = (local_y as f32 + 0.5 - image.height as f32 * 0.5) / zoom
+            + image.height as f32 * 0.5
+            - 0.5;
+        if x < -0.5 || y < -0.5 || x > image.width as f32 - 0.5 || y > image.height as f32 - 0.5 {
+            return [0; 4];
+        }
+        sample_bilinear(image, x, y)
+    }
+
+    #[test]
+    fn p5a_window_sampler_matches_materialized_fit_and_two_stage_zoom() {
+        for opaque in [false, true] {
+            for (sw, sh) in [(3, 2), (2, 5), (1, 1), (7, 3)] {
+                let source = Arc::new(
+                    ImageAsset::new(
+                        sw,
+                        sh,
+                        (0..sw * sh)
+                            .flat_map(|n| {
+                                [
+                                    (n * 71 + 19) as u8,
+                                    (n * 137 + 11) as u8,
+                                    (n * 29 + 213) as u8,
+                                    if opaque {
+                                        255
+                                    } else {
+                                        [0, 48, 128, 255][n as usize % 4]
+                                    },
+                                ]
+                            })
+                            .collect(),
+                    )
+                    .unwrap(),
+                );
+                for (width, height) in [(sw, sh), (9, 7), (7, 9), (1, 8), (8, 1)] {
+                    for fit in [Fit::Stretch, Fit::Contain, Fit::Cover] {
+                        let sampler = ScaledImageSampler::new(&source, width, height, fit).unwrap();
+                        let (prepared, scaled) =
+                            prepare_image(&source, width, height, fit).unwrap();
+                        if (width, height) == (sw, sh) {
+                            assert!(!scaled);
+                            assert!(Arc::ptr_eq(&source, &prepared));
+                        }
+                        for y in 0..height as usize {
+                            for x in 0..width as usize {
+                                let offset = (y * width as usize + x) * 4;
+                                assert_eq!(sampler.sample(x, y), prepared.rgba[offset..offset + 4]);
+                                for zoom in [1.0, 1.5, 0.5, 0.01, 0.0, f32::NAN] {
+                                    assert_eq!(
+                                        sampler.sample_zoomed(x, y, zoom),
+                                        prepared_zoom_reference(&prepared, x, y, zoom),
+                                        "source={sw}x{sh}, dest={width}x{height}, fit={fit:?}, opaque={opaque}, zoom={zoom}, pixel={x},{y}"
+                                    );
+                                }
+                            }
+                        }
+                        assert_eq!(sampler.sample(width as usize, 0), [0; 4]);
+                        assert_eq!(sampler.sample(0, height as usize), [0; 4]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn p5a_window_sampler_huge_logical_image_only_reads_requested_probes() {
+        let color = [31, 97, 211, 123];
+        let source = ImageAsset::new(2, 1, color.repeat(2)).unwrap();
+        for fit in [Fit::Stretch, Fit::Contain, Fit::Cover] {
+            let sampler = ScaledImageSampler::new(&source, 192_000, 108_000, fit).unwrap();
+            assert!(std::mem::size_of_val(&sampler) <= 128);
+            assert!(std::ptr::eq(sampler.source, &source));
+            assert_eq!(sampler.sample(96_000, 54_000), color);
+            assert_eq!(sampler.sample_zoomed(96_000, 54_000, 0.01), color);
+            assert_eq!(sampler.sample_zoomed(0, 0, 0.5), [0; 4]);
+            assert_eq!(
+                sampler.sample(0, 0),
+                if fit == Fit::Contain { [0; 4] } else { color }
+            );
+            let probes: Vec<_> = (0..256)
+                .map(|n| sampler.sample_zoomed(95_992 + n % 16, 53_992 + n / 16, 1.5))
+                .collect();
+            assert_eq!(probes, vec![color; 256]);
+        }
     }
 
     #[test]

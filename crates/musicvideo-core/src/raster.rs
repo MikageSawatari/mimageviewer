@@ -25,6 +25,10 @@ use crate::scene::{KeyboardDimensions, Scene, SceneItem, SceneItemKind, brighten
 #[path = "raster_p5a_tests.rs"]
 mod p5a_tests;
 
+#[path = "raster_work.rs"]
+mod work;
+use work::{WorkPlan, draw_tiled_body};
+
 thread_local! {
     static KEYBOARD_LAYOUT_CACHE: RefCell<KeyboardLayoutCache> =
         RefCell::new(KeyboardLayoutCache::default());
@@ -49,6 +53,17 @@ impl PixelRect {
 
     pub fn is_empty(self) -> bool {
         self.x0 >= self.x1 || self.y0 >= self.y1
+    }
+
+    fn intersect(self, other: Self) -> Self {
+        let x0 = self.x0.max(other.x0);
+        let y0 = self.y0.max(other.y0);
+        Self {
+            x0,
+            y0,
+            x1: self.x1.min(other.x1).max(x0),
+            y1: self.y1.min(other.y1).max(y0),
+        }
     }
 }
 
@@ -168,6 +183,8 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    origin_x: usize,
+    origin_y: usize,
 }
 
 impl Frame {
@@ -176,6 +193,8 @@ impl Frame {
             width,
             height,
             rgba: vec![0; frame_len(width, height)?],
+            origin_x: 0,
+            origin_y: 0,
         };
         frame.clear_black();
         Ok(frame)
@@ -184,6 +203,8 @@ impl Frame {
     fn prepare(&mut self, width: u32, height: u32, clear: bool) -> Result<(), RasterError> {
         self.width = width;
         self.height = height;
+        self.origin_x = 0;
+        self.origin_y = 0;
         self.rgba.resize(frame_len(width, height)?, 0);
         if clear {
             self.clear_black();
@@ -196,9 +217,96 @@ impl Frame {
             pixel.copy_from_slice(&[0, 0, 0, 255]);
         });
     }
+
+    fn window(rect: PixelRect) -> Result<Self, RasterError> {
+        let mut frame = Self::new(rect.width() as u32, rect.height() as u32)?;
+        frame.origin_x = rect.x0;
+        frame.origin_y = rect.y0;
+        Ok(frame)
+    }
+
+    fn bounds(&self) -> PixelRect {
+        PixelRect {
+            x0: self.origin_x,
+            y0: self.origin_y,
+            x1: self.origin_x + self.width as usize,
+            y1: self.origin_y + self.height as usize,
+        }
+    }
+
+    fn clip(&self, geometry: PixelRect) -> PixelRect {
+        geometry.intersect(self.bounds())
+    }
+
+    fn offset(&self, x: usize, y: usize) -> usize {
+        ((y - self.origin_y) * self.width as usize + x - self.origin_x) * 4
+    }
+}
+
+// This scoped test probe rejects oversized dimensions before any Frame buffer
+// allocation (including the full-layer preflight before mask construction).
+// It observes requested sizes, rather than claiming allocator-wide accounting.
+#[cfg(test)]
+mod frame_allocation_probe {
+    use super::{RasterError, RefCell};
+
+    struct Probe {
+        max_pixels: u64,
+        max_edge: u32,
+        dimensions: Vec<(u32, u32)>,
+    }
+
+    thread_local! {
+        static ACTIVE: RefCell<Option<Probe>> = const { RefCell::new(None) };
+    }
+
+    struct Restore(Option<Probe>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| *active.borrow_mut() = self.0.take());
+        }
+    }
+
+    pub(super) fn with_limits<R>(
+        max_pixels: u64,
+        max_edge: u32,
+        run: impl FnOnce() -> R,
+    ) -> (R, Vec<(u32, u32)>) {
+        let previous = ACTIVE.with(|active| {
+            active.replace(Some(Probe {
+                max_pixels,
+                max_edge,
+                dimensions: Vec::new(),
+            }))
+        });
+        let restore = Restore(previous);
+        let result = run();
+        let dimensions = ACTIVE.with(|active| active.borrow_mut().take().unwrap().dimensions);
+        drop(restore);
+        (result, dimensions)
+    }
+
+    pub(super) fn check(width: u32, height: u32) -> Result<(), RasterError> {
+        ACTIVE.with(|active| {
+            let mut active = active.borrow_mut();
+            let Some(probe) = active.as_mut() else {
+                return Ok(());
+            };
+            probe.dimensions.push((width, height));
+            if u64::from(width) * u64::from(height) > probe.max_pixels
+                || width.max(height) > probe.max_edge
+            {
+                return Err(RasterError::DimensionsOverflow);
+            }
+            Ok(())
+        })
+    }
 }
 
 fn frame_len(width: u32, height: u32) -> Result<usize, RasterError> {
+    #[cfg(test)]
+    frame_allocation_probe::check(width, height)?;
     (width as usize)
         .checked_mul(height as usize)
         .and_then(|pixels| pixels.checked_mul(4))
@@ -293,6 +401,22 @@ fn draw_unclipped_item(
     if !geometry.can_reach_canvas(frame, rotation, glow)? {
         return Ok(());
     }
+    let plan = WorkPlan::new(geometry, frame.width, frame.height, rotation);
+    if glow.is_none() && !plan.full_work_fits(glow)? {
+        return draw_tiled_body(frame, plan, item, assets, report);
+    }
+    draw_unclipped_item_full(frame, geometry, item, assets, report, rotation, glow)
+}
+
+fn draw_unclipped_item_full(
+    frame: &mut Frame,
+    geometry: LayerPixelRect,
+    item: &SceneItem,
+    assets: &Assets,
+    report: &mut RenderReport,
+    rotation: f32,
+    glow: Option<Glow>,
+) -> Result<(), RasterError> {
     let local = geometry.local();
     let width = u32::try_from(local.width()).map_err(|_| RasterError::DimensionsOverflow)?;
     let height = u32::try_from(local.height()).map_err(|_| RasterError::DimensionsOverflow)?;
@@ -488,6 +612,23 @@ fn draw_item(
             mask_mode,
         ),
         SceneItemKind::Image { image, fit, zoom } => {
+            if frame.clip(rect) != rect {
+                if let Some(source) = assets.image(image) {
+                    draw_image_window(
+                        frame,
+                        rect,
+                        &source,
+                        *fit,
+                        *zoom,
+                        item.opacity,
+                        item.corner_radius_px,
+                        mask_mode,
+                    )?;
+                } else {
+                    report.record_unresolved(UnresolvedAsset::Image(image.clone()));
+                }
+                return Ok(());
+            }
             if let Some(image_asset) =
                 assets.scaled_image(image, rect.width() as u32, rect.height() as u32, *fit)?
             {
@@ -624,6 +765,50 @@ fn draw_item(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn draw_image_window(
+    frame: &mut Frame,
+    rect: PixelRect,
+    source: &ImageAsset,
+    fit: Fit,
+    zoom: f32,
+    opacity: f32,
+    corner_radius_px: f32,
+    mask_mode: bool,
+) -> Result<(), RasterError> {
+    let sampler = crate::assets::ScaledImageSampler::new(
+        source,
+        rect.width() as u32,
+        rect.height() as u32,
+        fit,
+    )?;
+    let window = frame.clip(rect);
+    let origin_x = frame.origin_x;
+    let origin_y = frame.origin_y;
+    let stride = frame.width as usize * 4;
+    frame
+        .rgba
+        .par_chunks_exact_mut(stride)
+        .enumerate()
+        .filter(|(y, _)| y + origin_y >= window.y0 && y + origin_y < window.y1)
+        .for_each(|(row_y, row)| {
+            let y = row_y + origin_y;
+            for x in window.x0..window.x1 {
+                let pixel = sampler.sample_zoomed(x - rect.x0, y - rect.y0, zoom);
+                let color = if mask_mode {
+                    Rgba8::new(255, 255, 255, pixel[3])
+                } else {
+                    Rgba8::new(pixel[0], pixel[1], pixel[2], pixel[3])
+                };
+                let coverage =
+                    rounded_rect_coverage(x as f32 + 0.5, y as f32 + 0.5, rect, corner_radius_px);
+                let offset = (x - origin_x) * 4;
+                blend_pixel(&mut row[offset..offset + 4], color, opacity * coverage);
+            }
+        });
+    Ok(())
+}
+
 fn blend_pixel(destination: &mut [u8], source: Rgba8, opacity: f32) {
     let alpha = (source.a as f32 * opacity.clamp(0.0, 1.0)).round() as u32;
     if alpha == 0 {
@@ -640,7 +825,7 @@ fn blend_pixel(destination: &mut [u8], source: Rgba8, opacity: f32) {
     {
         *channel = ((source_channel as u32 * alpha + *channel as u32 * inverse + 127) / 255) as u8;
     }
-    destination[3] = 255;
+    destination[3] = (alpha + (destination[3] as u32 * inverse + 127) / 255) as u8;
 }
 
 struct FillSampler<'a> {
@@ -697,15 +882,22 @@ fn fill_rect(frame: &mut Frame, rect: PixelRect, color: Rgba8, opacity: f32) {
     if color.a == 0 || opacity <= 0.0 || rect.is_empty() {
         return;
     }
+    let window = frame.clip(rect);
+    let origin_x = frame.origin_x;
+    let origin_y = frame.origin_y;
     let row_bytes = frame.width as usize * 4;
     frame
         .rgba
         .par_chunks_exact_mut(row_bytes)
         .enumerate()
-        .filter(|(y, _)| *y >= rect.y0 && *y < rect.y1)
+        .filter(|(y, _)| *y + origin_y >= window.y0 && *y + origin_y < window.y1)
         .for_each(|(_, row)| {
-            for x in rect.x0..rect.x1 {
-                blend_pixel(&mut row[x * 4..x * 4 + 4], color, opacity);
+            for x in window.x0..window.x1 {
+                blend_pixel(
+                    &mut row[(x - origin_x) * 4..(x - origin_x) * 4 + 4],
+                    color,
+                    opacity,
+                );
             }
         });
 }
@@ -730,19 +922,27 @@ fn draw_filled_rect(
         return;
     }
     let sampler = FillSampler::new(fill, rect);
+    let window = frame.clip(rect);
+    let origin_x = frame.origin_x;
+    let origin_y = frame.origin_y;
     let row_bytes = frame.width as usize * 4;
     frame
         .rgba
         .par_chunks_exact_mut(row_bytes)
         .enumerate()
-        .filter(|(y, _)| *y >= rect.y0 && *y < rect.y1)
-        .for_each(|(y, row)| {
-            for x in rect.x0..rect.x1 {
+        .filter(|(y, _)| *y + origin_y >= window.y0 && *y + origin_y < window.y1)
+        .for_each(|(row_y, row)| {
+            let y = row_y + origin_y;
+            for x in window.x0..window.x1 {
                 let coverage =
                     rounded_rect_coverage(x as f32 + 0.5, y as f32 + 0.5, rect, corner_radius_px);
                 if coverage > 0.0 {
                     let color = sampler.sample(x as f32 + 0.5, y as f32 + 0.5, None, mask_mode);
-                    blend_pixel(&mut row[x * 4..x * 4 + 4], color, opacity * coverage);
+                    blend_pixel(
+                        &mut row[(x - origin_x) * 4..(x - origin_x) * 4 + 4],
+                        color,
+                        opacity * coverage,
+                    );
                 }
             }
         });
@@ -1123,20 +1323,24 @@ fn draw_miv_spectrum(
         .iter()
         .map(|primitive| prepare_miv_color(*primitive, color_mode, miv_brightness, mask_mode))
         .collect::<Vec<_>>();
+    let window = frame.clip(clip_rect);
+    let origin_x = frame.origin_x;
+    let origin_y = frame.origin_y;
     let row_bytes = frame.width as usize * 4;
     frame
         .rgba
         .par_chunks_exact_mut(row_bytes)
         .enumerate()
-        .filter(|(y, _)| *y >= clip_rect.y0 && *y < clip_rect.y1)
-        .for_each(|(y, row)| {
+        .filter(|(y, _)| *y + origin_y >= window.y0 && *y + origin_y < window.y1)
+        .for_each(|(row_y, row)| {
+            let y = row_y + origin_y;
             let py = y as f32 + 0.5;
             for (primitive, prepared_color) in primitives.iter().zip(&prepared_colors) {
                 if py < primitive.rect.top || py >= primitive.rect.bottom {
                     continue;
                 }
-                let min_x = primitive.rect.left.floor().max(clip_rect.x0 as f32) as usize;
-                let max_x = primitive.rect.right.ceil().min(clip_rect.x1 as f32) as usize;
+                let min_x = primitive.rect.left.floor().max(window.x0 as f32) as usize;
+                let max_x = primitive.rect.right.ceil().min(window.x1 as f32) as usize;
                 let band_position = band_position(primitive.band_index, primitive.band_count);
                 for x in min_x..max_x {
                     let px = x as f32 + 0.5;
@@ -1154,7 +1358,11 @@ fn draw_miv_spectrum(
                     if let Some(alpha) = primitive.alpha_override {
                         color.a = alpha;
                     }
-                    blend_pixel(&mut row[x * 4..x * 4 + 4], color, opacity * coverage);
+                    blend_pixel(
+                        &mut row[(x - origin_x) * 4..(x - origin_x) * 4 + 4],
+                        color,
+                        opacity * coverage,
+                    );
                 }
             }
         });
@@ -1223,20 +1431,20 @@ fn draw_spectrum_bar(
             miv_brightness,
         )
     });
+    let window = frame.clip(clip_rect);
     let pad = bar.thickness * 0.5 + 1.0;
     let min_x = (bar.start.0.min(bar.end.0) - pad)
         .floor()
-        .max(clip_rect.x0 as f32) as usize;
+        .max(window.x0 as f32) as usize;
     let min_y = (bar.start.1.min(bar.end.1) - pad)
         .floor()
-        .max(clip_rect.y0 as f32) as usize;
+        .max(window.y0 as f32) as usize;
     let max_x = (bar.start.0.max(bar.end.0) + pad)
         .ceil()
-        .min(clip_rect.x1 as f32) as usize;
+        .min(window.x1 as f32) as usize;
     let max_y = (bar.start.1.max(bar.end.1) + pad)
         .ceil()
-        .min(clip_rect.y1 as f32) as usize;
-    let width = frame.width as usize;
+        .min(window.y1 as f32) as usize;
     for y in min_y..max_y {
         for x in min_x..max_x {
             let px = x as f32 + 0.5;
@@ -1251,7 +1459,7 @@ fn draw_spectrum_bar(
                 Some(color) if mask_mode => Rgba8::new(255, 255, 255, color.a),
                 Some(color) => color,
             };
-            let offset = (y * width + x) * 4;
+            let offset = frame.offset(x, y);
             blend_pixel(
                 &mut frame.rgba[offset..offset + 4],
                 color,
@@ -1336,7 +1544,7 @@ fn draw_pitch_keyboard(
             dimensions.min_octave_width_px,
             &mut cache,
         );
-        let clip_coverage = KeyboardClipCoverage::new(rect, corner_radius_px);
+        let clip_coverage = KeyboardClipCoverage::new(rect, frame.clip(rect), corner_radius_px);
         draw_keyboard_guides(
             frame,
             rect,
@@ -1367,7 +1575,7 @@ struct KeyboardClipCoverage {
 }
 
 impl KeyboardClipCoverage {
-    fn new(rect: PixelRect, corner_radius_px: f32) -> Self {
+    fn new(geometry: PixelRect, rect: PixelRect, corner_radius_px: f32) -> Self {
         if corner_radius_px <= 0.0 || rect.is_empty() {
             return Self { rect, values: None };
         }
@@ -1383,7 +1591,7 @@ impl KeyboardClipCoverage {
                     *value = rounded_rect_coverage(
                         x as f32 + 0.5,
                         y as f32 + 0.5,
-                        rect,
+                        geometry,
                         corner_radius_px,
                     );
                 }
@@ -1415,16 +1623,22 @@ fn draw_keyboard_guides(
     } else {
         Rgba8::new(120, 134, 148, 82)
     };
+    let window = frame.clip(clip);
+    let origin_x = frame.origin_x;
+    let origin_y = frame.origin_y;
     let row_bytes = frame.width as usize * 4;
     frame
         .rgba
         .par_chunks_exact_mut(row_bytes)
         .enumerate()
-        .filter(|(y, _)| *y >= clip.y0 && *y < clip.y1)
-        .for_each(|(y, row)| {
+        .filter(|(y, _)| *y + origin_y >= window.y0 && *y + origin_y < window.y1)
+        .for_each(|(row_y, row)| {
+            let y = row_y + origin_y;
             for &guide_x in guides {
-                let min_x = (guide_x - half_width_px - 0.5).floor().max(clip.x0 as f32) as usize;
-                let max_x = (guide_x + half_width_px + 0.5).ceil().min(clip.x1 as f32) as usize;
+                let min_x = (guide_x - half_width_px - 0.5)
+                    .floor()
+                    .max(window.x0 as f32) as usize;
+                let max_x = (guide_x + half_width_px + 0.5).ceil().min(window.x1 as f32) as usize;
                 for pixel_x in min_x..max_x {
                     let px = pixel_x as f32 + 0.5;
                     let line_coverage =
@@ -1433,7 +1647,7 @@ fn draw_keyboard_guides(
                     if line_coverage <= 0.0 || clip_coverage <= 0.0 {
                         continue;
                     }
-                    let offset = pixel_x * 4;
+                    let offset = (pixel_x - origin_x) * 4;
                     blend_pixel(
                         &mut row[offset..offset + 4],
                         color,
@@ -1465,22 +1679,26 @@ fn draw_keyboard_keys(
             })
             .collect::<Vec<_>>()
     });
+    let window = frame.clip(clip);
+    let origin_x = frame.origin_x;
+    let origin_y = frame.origin_y;
     let row_bytes = frame.width as usize * 4;
     frame
         .rgba
         .par_chunks_exact_mut(row_bytes)
         .enumerate()
-        .filter(|(y, _)| *y >= clip.y0 && *y < clip.y1)
-        .for_each(|(y, row)| {
+        .filter(|(y, _)| *y + origin_y >= window.y0 && *y + origin_y < window.y1)
+        .for_each(|(row_y, row)| {
+            let y = row_y + origin_y;
             let py = y as f32 + 0.5;
             for (key_index, &key) in keys.iter().enumerate() {
-                let min_y = key.rect.top.floor().max(clip.y0 as f32) as usize;
-                let max_y = key.rect.bottom.ceil().min(clip.y1 as f32) as usize;
+                let min_y = key.rect.top.floor().max(window.y0 as f32) as usize;
+                let max_y = key.rect.bottom.ceil().min(window.y1 as f32) as usize;
                 if y < min_y || y >= max_y {
                     continue;
                 }
-                let min_x = key.rect.left.floor().max(clip.x0 as f32) as usize;
-                let max_x = key.rect.right.ceil().min(clip.x1 as f32) as usize;
+                let min_x = key.rect.left.floor().max(window.x0 as f32) as usize;
+                let max_x = key.rect.right.ceil().min(window.x1 as f32) as usize;
                 let key_corner = if key.black {
                     dimensions.black_corner_px
                 } else {
@@ -1531,7 +1749,7 @@ fn draw_keyboard_keys(
                     } else {
                         base
                     };
-                    let offset = x * 4;
+                    let offset = (x - origin_x) * 4;
                     blend_pixel(&mut row[offset..offset + 4], color, opacity * coverage);
 
                     if mask_mode {
@@ -1773,14 +1991,18 @@ fn draw_progress_bar(
     let fill_edge = inner.x0 as f32 + inner.width() as f32 * progress.clamp(0.0, 1.0);
     let fill_sampler = FillSampler::new(fill, rect);
     let border_sampler = FillSampler::new(border_fill, rect);
+    let window = frame.clip(rect);
+    let origin_x = frame.origin_x;
+    let origin_y = frame.origin_y;
     let row_bytes = frame.width as usize * 4;
     frame
         .rgba
         .par_chunks_exact_mut(row_bytes)
         .enumerate()
-        .filter(|(y, _)| *y >= rect.y0 && *y < rect.y1)
-        .for_each(|(y, row)| {
-            for x in rect.x0..rect.x1 {
+        .filter(|(y, _)| *y + origin_y >= window.y0 && *y + origin_y < window.y1)
+        .for_each(|(row_y, row)| {
+            let y = row_y + origin_y;
+            for x in window.x0..window.x1 {
                 let px = x as f32 + 0.5;
                 let py = y as f32 + 0.5;
                 let outer = rounded_rect_coverage(px, py, rect, corner_radius_px);
@@ -1792,7 +2014,7 @@ fn draw_progress_bar(
                 } else {
                     outer
                 };
-                let offset = x * 4;
+                let offset = (x - origin_x) * 4;
                 let border_coverage = (outer - inner_coverage).max(0.0);
                 if border_coverage > 0.0 {
                     let color = border_sampler.sample(px, py, None, mask_mode);
@@ -1829,9 +2051,9 @@ fn draw_text(
     mask_mode: bool,
 ) -> bool {
     let sampler = FillSampler::new(fill, rect);
-    let frame_width = frame.width as usize;
+    let window = frame.clip(rect);
     assets
-        .visit_rasterized_text(
+        .visit_rasterized_text_window(
             text,
             font_key,
             size_px,
@@ -1839,13 +2061,22 @@ fn draw_text(
             transient_style,
             align,
             rect,
+            window,
             |bitmap, destination_x, destination_y| {
-                for source_y in 0..bitmap.height {
+                let sx0 = (window.x0 as i64 - destination_x as i64).clamp(0, bitmap.width as i64)
+                    as usize;
+                let sx1 = (window.x1 as i64 - destination_x as i64).clamp(0, bitmap.width as i64)
+                    as usize;
+                let sy0 = (window.y0 as i64 - destination_y as i64).clamp(0, bitmap.height as i64)
+                    as usize;
+                let sy1 = (window.y1 as i64 - destination_y as i64).clamp(0, bitmap.height as i64)
+                    as usize;
+                for source_y in sy0..sy1 {
                     let y = destination_y + source_y as i32;
                     if y < rect.y0 as i32 || y >= rect.y1 as i32 {
                         continue;
                     }
-                    for source_x in 0..bitmap.width {
+                    for source_x in sx0..sx1 {
                         let x = destination_x + source_x as i32;
                         if x < rect.x0 as i32 || x >= rect.x1 as i32 {
                             continue;
@@ -1864,7 +2095,26 @@ fn draw_text(
                         let py = y as f32 + 0.5;
                         let clip = rounded_rect_coverage(px, py, rect, corner_radius_px);
                         let color = sampler.sample(px, py, None, mask_mode);
-                        let destination_offset = (y as usize * frame_width + x as usize) * 4;
+                        let destination_offset = frame.offset(x as usize, y as usize);
+                        if mask_mode {
+                            let source_alpha = if let Some(decoration) = &bitmap.decoration {
+                                composite_text_pixel(
+                                    &decoration[source_offset..source_offset + 4],
+                                    Rgba8::new(255, 255, 255, color.a),
+                                    bitmap.rgba[source_offset + 3],
+                                )
+                                .a
+                            } else {
+                                ((bitmap.rgba[source_offset + 3] as u32 * color.a as u32 + 127)
+                                    / 255) as u8
+                            };
+                            blend_pixel(
+                                &mut frame.rgba[destination_offset..destination_offset + 4],
+                                Rgba8::new(255, 255, 255, source_alpha),
+                                opacity * clip,
+                            );
+                            continue;
+                        }
                         let (color, coverage) = if let Some(decoration) = &bitmap.decoration {
                             (
                                 composite_text_pixel(
@@ -2065,6 +2315,9 @@ fn draw_spectrum_mask(
     opacity: f32,
     corner_radius_px: f32,
 ) {
+    if width == 0 || height == 0 {
+        return;
+    }
     let rect = PixelRect {
         x0: 0,
         y0: 0,
@@ -2090,20 +2343,35 @@ fn draw_spectrum_mask(
         Fill::Solid(color) => Some(color.a),
         _ => None,
     };
-    let operations = bars
-        .par_iter()
+    // Retain one small description per bar, never one operation per covered
+    // pixel. Thick/overlapping scaled bars must not multiply working memory.
+    let prepared = bars
+        .into_iter()
         .map(|bar| {
-            let bar = *bar;
-            let miv_alpha = (color_mode == MusicColorMode::Miv)
-                .then(|| miv_spectrum_color(bar.index, bar.total, bar.value).a);
-            let mut operations = Vec::new();
             let pad = bar.thickness * 0.5 + 1.0;
-            let min_x = (bar.start.0.min(bar.end.0) - pad).floor().max(0.0) as usize;
-            let min_y = (bar.start.1.min(bar.end.1) - pad).floor().max(0.0) as usize;
-            let max_x = (bar.start.0.max(bar.end.0) + pad).ceil().min(width as f32) as usize;
-            let max_y = (bar.start.1.max(bar.end.1) + pad).ceil().min(height as f32) as usize;
-            for y in min_y..max_y {
-                for x in min_x..max_x {
+            let bounds = PixelRect {
+                x0: (bar.start.0.min(bar.end.0) - pad).floor().max(0.0) as usize,
+                y0: (bar.start.1.min(bar.end.1) - pad).floor().max(0.0) as usize,
+                x1: (bar.start.0.max(bar.end.0) + pad).ceil().min(width as f32) as usize,
+                y1: (bar.start.1.max(bar.end.1) + pad).ceil().min(height as f32) as usize,
+            };
+            let source_alpha = if color_mode == MusicColorMode::Miv {
+                Some(miv_spectrum_color(bar.index, bar.total, bar.value).a)
+            } else {
+                solid_alpha
+            };
+            (bar, bounds, source_alpha)
+        })
+        .collect::<Vec<_>>();
+    alpha
+        .par_chunks_exact_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for &(bar, bounds, source_alpha) in &prepared {
+                if y < bounds.y0 || y >= bounds.y1 {
+                    continue;
+                }
+                for x in bounds.x0..bounds.x1 {
                     let px = x as f32 + 0.5;
                     let py = y as f32 + 0.5;
                     let coverage = bar_coverage(px, py, bar)
@@ -2111,30 +2379,17 @@ fn draw_spectrum_mask(
                     if coverage <= 0.0 {
                         continue;
                     }
-                    let source_alpha = match miv_alpha {
-                        None => solid_alpha.unwrap_or_else(|| {
-                            sampler.sample(px, py, Some(bar.band_position), true).a
-                        }),
-                        Some(alpha) => alpha,
-                    };
-                    let alpha = (source_alpha as f32 * opacity * coverage)
+                    let source_alpha = source_alpha
+                        .unwrap_or_else(|| sampler.sample(px, py, Some(bar.band_position), true).a);
+                    // Keep the original per-bar quantization and compositing order.
+                    let source = (source_alpha as f32 * opacity * coverage)
                         .round()
-                        .clamp(0.0, 255.0) as u8;
-                    if alpha > 0 {
-                        operations.push((y * width + x, alpha));
-                    }
+                        .clamp(0.0, 255.0) as u32;
+                    let destination = row[x] as u32;
+                    row[x] = (source + (destination * (255 - source) + 127) / 255).min(255) as u8;
                 }
             }
-            operations
-        })
-        .collect::<Vec<_>>();
-    for bar_operations in operations {
-        for (offset, source) in bar_operations {
-            let destination = alpha[offset] as u32;
-            alpha[offset] =
-                (source as u32 + (destination * (255 - source as u32) + 127) / 255).min(255) as u8;
-        }
-    }
+        });
 }
 
 #[allow(clippy::too_many_arguments)]

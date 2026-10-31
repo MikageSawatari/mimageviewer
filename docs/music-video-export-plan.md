@@ -2943,6 +2943,18 @@ AI イラスト 3 枚・タイトルロゴで wav2bar 相当の試作を書き�
    ときのクリップにだけ使う。画面内に収まる矩形の画素は変わらない。画面をはみ出す矩形の画素は意図して変わる
    （未リリースなので互換は取らない。変わるテスト期待値は理由を添えて更新する）。既定の円形は内径 380px を保つ
    `inner_ratio = 380 / 550` とし、バーの最大長は 160px から 170px になる。
+7. **作業バッファは見える範囲に限る**（2026-10-31、P5a 独立レビュー 1 回目 P1 による設計担当の決定）。6 で幾何を切り詰め前の
+   矩形から求めても、レイヤーの作業バッファ・走査範囲は「矩形 ∩ 出力画面の逆像（回転の逆変換と、グロー・影の広がりの余白を含む）」
+   に限り、出力画面の大きさに比例する上限を持つ。極端な `Scale`（例: 量 99）でも確保量が出力画面の数倍を超えない。
+   値の上限で丸める guard ではなく、確保の範囲そのものを可視範囲に結びつける。
+8. **描画側に上限がある値は、拡大後も上限で止まる**（同 P2 による決定）。文字の影のぼかしは comic-core の描画が 48px で丸める。
+   comic-core は本体の漫画機能と共有しており、その上限を変えないため、`Scale` で 48px を超える分は 48px で止まる。
+   実用の拡大量（数%〜数十%）ではほぼ影響しない。
+9. **グローの半径・広がりと文字の大きさにも描画の上限を置き、拡大後もそこで止める**（2026-10-31、P5a の 7 の実装中に
+   実装担当が挙げた 2 案〔巨大グローの効果用 alpha の低解像度化／comic-core へ領域限定の字形描画 API の追加〕を採らず、
+   設計担当が決定）。8 と同じ扱いで、上限は各値の設定欄の入力上限と同じにする（設定欄に上限がない値は実装担当が決めて報告）。
+   これでグローの余白と字形の大きさが定数で抑えられ、7 のタイル描画だけで確保量が出力画面に比例する上限内に収まる。
+   扱う組み合わせを減らすための決定（CLAUDE.md「設計の簡素化」）。通常の使い方の画素は変わらない。
 保存形式: 音楽ビデオのエディタは未リリースなので、`radius_px` → `inner_ratio` の変更に移行処理は作らない
 （CLAUDE.md「永続データ・スキーマ変更時の判断」）。
 
@@ -3290,7 +3302,7 @@ GUI起動・実機検収と対応後の独立再レビューは未実施。コ�
 | **P4d** 実装完了・実機確認待ち（独立レビュー ACCEPT、2026-10-15） | mIV 側の入口: 音楽ビュー・音声ファイルの右クリックから「音楽ビデオを作成」でエディタを起動 | Grid／Fullscreenの単一実Audioだけ。static ID／非表示設定、worker起動、絶対path引数、失敗通知、build-dev同梱を実装。既存保存順のstatic／動的枠を保つ末尾追加。追加8件の成功と各変異失敗、全対象14560 passed／0 failed／66 ignored、fmt／glyph0、通常featureの4exe確認build成功を記録済み。`261b10359`の独立レビューP2に対応し製品binのGUI属性／Subsystem gateを追加。製品GUI起動／実機検収／対応のcommitなし。詳細は「P4d実装記録」 |
 | **P4e** 実装完了（独立レビュー 4 回目で ACCEPT、2026-10-15。build-dist -NoSign の通しは修正前の版で成功、最終版での通しは統合前の最終確認で行う） | 配布（下の表）: launcher 内包・runtime 展開・署名・portable 同梱・全 PE / VC runtime gate・build スクリプト・test-full 前提 | **実装・非対話検証済（2026-10-15）**。build-dist -NoSign の全段成功、全体 gate 14,562 passed / 0 failed / 66 ignored。editor 25,504,768 bytes、launcher 増分も同値。清掃は editor を含む fixture で検査し D10 の割り切りを維持。独立レビュー 1〜3 回目は REVISE。3 回目の指摘は OUT_DIR 導出で対応し、追加発見の build-dir 分離も設計回答に従い開始前に拒否する。指定検証・release 5 段は成功、独立再検収待ち。署名実行・GUI 検収は未実施。詳細は末尾「P4e 実装記録」 |
 | **P4f** 完了（独立レビュー 2 回目 ACCEPT with conditions、条件の文書修正済み `bf05ddb17`、2026-10-15。fps 選択は利用者決定で追加。サイトマップ再生成は統合時） | マニュアル新ページと通常33ページのサイドバー・目次、製品紹介カード、keymap-spec（固定ショートカットの理由）、privacy（通信なし・保存先） | **2026-10-15、未コミット**。カード50枚で上限違反0、glyph検査成功、33ページ各33リンクの数・順序・active一致、HTML構造とリンク検査成功。各記述のコード根拠・D11との差分は末尾「P4f 実施記録」。アプリ／エディタ未起動。独立レビュー1回目 REVISE の起動条件の P2 を修正し、利用者決定に基づきプロジェクトの fps 選択を追加。対応後の再レビュー・検収は未実施。追補記録を参照。サイトマップはhtdocsコミット後に生成するため今回は未実行 |
-| **P5a** 実装・非対話検証・確認用build完了（2026-10-31、D17.6 対応を含む。独立レビュー・実機検収未実施） | 実操作で見つけた改善（D17）: 円形スペクトラムの内側の円を矩形に対する割合へ、`Scale` 変調をレイヤー全体の拡大縮小へ、割り当て量の初期値を単位に合わせる、画像の枠への合わせ方の設定と追加時の既定、レイヤー一覧の操作ボタンの固定 | 円形で `Scale` を割り当てると輪の内径も同じ比率で大きくなる（書き出し画素で確認）。文字・時刻・歌詞の `Scale` で文字が大きくなる。プレビューと書き出しの一致（H3b）を維持。独立レビュー ACCEPT |
+| **P5a** 初版 `529045c72`、独立レビュー1回目 REVISE。P2対応済み。P1は一部実装・指定検証済み、巨大Glowと字形準備の設計確認待ち（末尾の追補記録） | 実操作で見つけた改善（D17）: 円形スペクトラムの内側の円を矩形に対する割合へ、`Scale` 変調をレイヤー全体の拡大縮小へ、割り当て量の初期値を単位に合わせる、画像の枠への合わせ方の設定と追加時の既定、レイヤー一覧の操作ボタンの固定 | 円形で `Scale` を割り当てると輪の内径も同じ比率で大きくなる（書き出し画素で確認）。文字・時刻・歌詞の `Scale` で文字が大きくなる。プレビューと書き出しの一致（H3b）を維持。独立レビュー ACCEPT |
 
 L1 自動検証記録（2026-10-09）:
 
@@ -4333,6 +4345,9 @@ rmeta／rlib／build 出力破損と CMake 並列失敗に遭遇し、既存統�
 
 ### P5a 実施記録（2026-10-31、実装担当）
 
+以下の初版はコミット前の検証記録。後に `529045c72` としてコミットされ、独立レビュー1回目は REVISE となった。
+現在の対応状況は末尾の「独立レビュー 1 回目 REVISE と対応」を参照する。
+
 D17 の 1〜6 の実装・非対話検証・確認用buildを完了した（すべて未コミット）。既定の円形矩形が描画前に切り詰められる問題を停止報告し、
 設計担当が D17.6 を確定した後、全種別で描画の幾何と出力クリップを分離して再開した。
 機能制限・非同期状態・回復処理は追加していない。独立レビューと GUI 検収は未実施であり、
@@ -4378,7 +4393,7 @@ D17 の 1〜6 の実装・非対話検証・確認用buildを完了した（す�
 | 対象 | scene で倍率をかける px 値 |
 | --- | --- |
 | 全種別 | 中心固定の矩形幅・高さ、レイヤー角丸、Glow の radius／spread |
-| Text／TimeText／Lyrics | size、主縁取りと追加縁取りの width、影の xy offset／blur／spread、echo の xy offset、背景の padding／corner、letter_gap／line_gap |
+| Text／TimeText／Lyrics | size、主縁取りと追加縁取りの width、影の xy offset／blur／spread、echo の xy offset、背景の padding／corner、letter_gap／line_gap。影の blur は評価時に倍率をかけ、描画時は comic-core の既存 48px 上限で止まる（D17.8） |
 | Bars | thickness、min_height、描画の最小厚さ（従来 1px の下限も評価して縮小可能にする） |
 | Radial | thickness、描画の最小厚さ。内側の円は inner_ratio と拡縮済み矩形から求める |
 | MivHorizontal | バンド両端余白、最小幅、角丸の閾値と半径、下余白と高さの控除、ghost／trail の横への広がり |
@@ -4490,3 +4505,87 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 はみ出す画像や文字を動かしても枠全体を基準に表示されること、文字・時刻・歌詞の装飾も拡縮することを確認する。
 画像の「枠への合わせ方」と追加時の縦横比、レイヤーが増えても操作ボタンが固定される点も確認対象。
 これらのGUI確認と、設計担当が依頼する独立レビューは未実施であり、この自動検証と区別する。
+
+#### 独立レビュー 1 回目 REVISE と対応（2026-10-31、`529045c72` に対する未コミット差分）
+
+設計担当から提示された独立レビューは **REVISE**。P1 は巨大な評価済み矩形全体の作業領域確保、
+P2 は影の blur が comic-core の 48px 上限で止まることと全体拡縮の説明の不一致。
+以下は実装担当の作業・検証記録であり、新たな独立レビューではない。
+
+変更ファイルは `crates/musicvideo-core/src/` の `raster.rs`、新規 `raster_work.rs`、`assets.rs`、`text.rs`、
+`p5a_tests.rs` と、本設計書、`htdocs/mimageviewer/manual/music-video.html` の7ファイル。
+
+**P1 の実装済み部分と残る設計確認**
+
+- 幾何と回転の中心は D17.6 の完全な矩形のまま保持する。巨大な body は出力を小さなタイルに分け、
+  各タイルの逆回転像と補間余白だけを layer-local な作業 `Frame` に確保して描く。
+  鍵盤の角丸 coverage も同じ保存領域に限り、各種別の走査は保存領域との交差に限る。
+  通常サイズの既存経路は出力に比例する予算内で維持し、画面内・倍率1.0のハッシュを保持する。
+- 画像は Fit の座標計算を共有した sampler で必要な画素を読む。巨大な Fit 後画像を確保せず、
+  既存の Fit 後 u8 画素→zoom の2段階の丸めを維持する。
+- 文字は配置に使う完全な矩形と描画クリップを分離し、RGBA bake の予算を可視面積にも結び付ける。
+  既存の full bitmap は読み取りで再利用する。これは **字形 coverage の準備をまだ有界にしない**。
+- **未完了**: 巨大な Glow では、既存の最大8倍の縮小処理の前に全解像度の alpha を確保・走査している。
+  radius／spread 自体も拡縮されるため、単に可視タイルに切って余白を足すだけでは予算を保証できない。
+  巨大時だけ効果用の alpha を出力予算に合わせた解像度で直接評価する案は、旧全体確保版との画素の差を生むため設計担当へ確認中。
+  現在の本番経路のタイル化は Glow なしに限り、巨大 Glow の P1 は解消したと扱わない。
+- **未完了**: comic-core の `LoadedFont::rasterize_base`／字形 dilation は字形全体の coverage を確保する。
+  大きなフォントの準備を領域に限る追加 API は共有ライブラリへ及ぶため、「comic-core は変えない」の範囲と
+  D17.7 の有界化の優先について確認中。48px の影ぼかし上限は変更していない。
+- 既存 Spectrum mask の画素操作列（`draw_spectrum_mask` の `operations`）も、太いバーの重なりで
+  矩形面積より多くなるため除去した。バーごとの小さな描画記述だけを保持し、行ごとに並列で既存 mask へ直接描く。
+  各バーの合成順・丸めは維持する。寸法probeは Frame だけを測るため、巨大 Glow／字形 coverage を含めた全中間領域の保証ではない。
+
+**P2 の対応**
+
+コードの倍率処理と comic-core の48px上限は維持した。「倍率をかける寸法の棚卸し」へ描画上限を注記し、
+マニュアルはレイヤーの大きさを変える説明と効果には描画範囲の上限がある説明に直した。内部の上限値は公開説明へ記載しない。
+
+新規9件は成功し、各テストで意図的な変更による assertion failure／exit 101 と元のバイト列への復元を確認した。
+これらは上記の実装済み部分の回帰であり、巨大 Glow／巨大字形準備の未完了を補う証拠ではない。
+
+| 新規テスト | 検査／失敗を確認した変異 |
+| --- | --- |
+| `p5a_window_sampler_matches_materialized_fit_and_two_stage_zoom` | 3種類の Fit とzoomを全体画像版と比較／zoom補間の tx を0固定 |
+| `p5a_window_sampler_huge_logical_image_only_reads_requested_probes` | 192000×108000 の論理画像を作らず画素を検査／幅を10000へ制限 |
+| `p5a_text_window_preserves_full_alignment_and_clips_below_fixed_budget` | 元の配置と小さな可視領域のRGBA予算／可視予算を無効化 |
+| `p5a_text_window_huge_effect_canvas_only_bakes_visible_tile` | 大きな装飾canvasでも可視tileだけをbake／tileを右へ1px移動 |
+| `p5a_text_window_reuses_existing_full_bitmap_without_rebaking` | 既存bitmapの読み取り再利用／full bitmap lookupを無効化 |
+| `p5a_inverse_viewport_bounds_scale_99_work_without_allocating_layer` | 横長・縦長の出力と回転0／17／45／90度、Glowありの全体確保予算超過判定、bodyの領域・走査量上限／逆像の代わりに矩形全体を返す |
+| `p5a_tiled_body_matches_full_unclipped_geometry_all_kinds` | 全10種別×回転0／23／90度、色付き背景上で旧全体確保版とRGBA一致／合成時の逆回転を0度固定 |
+| `p5a_render_frame_scale_99_no_glow_limits_frame_dimensions` | 実際の評価→描画経路で量99・回転0／23／90度のFrame寸法と画素を検査／タイル経路を無効化。test専用probeが巨大確保前にErrで止めることを確認 |
+| `p5a_streamed_overlapping_spectrum_mask_matches_painted_reference` | 太いバー／円形×Custom／Miv×単色／alpha gradientの8条件で別の描画経路とmask一致／合成時に既存のalphaを捨てる |
+
+画像・文字5件の変異は `target/p5a/review1/assets-text/mutation-summary.json`、
+body2件は `body-mutations.json`、確保経路1件は `frame-probe/routing-disabled-summary.json` と各ログに保存した。
+Spectrum mask の追加1件は `spectrum-mutation.json`／`spectrum-mutation.log`、復元後の成功は `spectrum-restored.log`。
+寸法probeは `cfg(test)` のthread-local scopeでのみ有効であり、製品へ値のguardを足したものではない。
+別threadに干渉しないこととscope後の復元も検査した。
+
+| 今回のチェックポイントの検証 | 結果／証跡 |
+| --- | --- |
+| `cargo test -j 1 -p music-core -p musicvideo-core -p musicvideo-ui -p musicvideo-editor` | exit 0、**539 passed / 0 failed / 0 ignored**（music-core 69、musicvideo-core 146＋integration 2、UI 134、editor 188）。539.610秒。`target/p5a/review1/gates/packages.log` |
+| `cargo fmt`／`cargo fmt --check` | 整形適用後check exit 0（40.729秒）。`target/p5a/review1/gates/fmt.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、不足0（5.101秒）。`target/p5a/review1/gates/glyph.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0、657.062秒。通常featuresの4成果物とVC runtime／PE検査成功。`target/p5a/review1/gates/build-dev.log`。この後Spectrum maskの操作列除去を加えたため、最新ソースで再検証する |
+
+全コマンドに `MSBUILDDISABLENODEREUSE=1` を設定し、APPDATA／LOCALAPPDATA は `target/p5a/review1/` 下へ隔離した。
+**Spectrum mask 修正後の最新ソースの検証**（MSBuild node再利用なし、Rust jobs 8）:
+
+| 検証 | 結果／証跡 |
+| --- | --- |
+| `cargo test -j 8 -p music-core -p musicvideo-core -p musicvideo-ui -p musicvideo-editor` | exit 0、**540 passed / 0 failed / 0 ignored**。music-core 69、musicvideo-core 147＋integration 2、UI 134、editor 188。279.296秒。`target/p5a/review1/gates-final/packages.log` |
+| `cargo fmt --check` | exit 0、23.843秒。`target/p5a/review1/gates-final/fmt.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、不足0、3.248秒。`target/p5a/review1/gates-final/glyph.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0、50.628秒。通常featuresでcore／remote／EPUB worker／音楽ビデオeditorの4成果物を生成。`runtime=4 pe=4`成功。`target/p5a/review1/gates-final/build-dev.log`、`target/vcrt-pe-reports/dev-runtime.json` |
+
+ここでテストが成功しても、上記 P1 の未完了を解消したとは扱わない。
+検証したRustソース5ファイルのSHA-256は `target/p5a/review1/gates-final/source-sha256.json`、
+コマンド・終了値・時間・件数は同 `summary.json`、4成果物のsize／時刻／SHA-256は同 `artifacts.json`。
+build終了後にもソースSHA-256一致を確認した。成果物は起動していない。
+
+**現在の状態**: 実装済み部分の指定検証・確認用buildは完了。P1は巨大Glowと字形coverageの有界化が未完了であり、
+brief §5の設計判断が必要な場合の規則に従って停止する。設計確認は、巨大Glowの効果用alphaだけを予算に合わせた解像度で
+評価することを認めるか、字形coverageを領域に限る追加APIをcomic-coreへ導入してよいかの2点。
+後者の既存API・48px上限は保持する提案であり、未実装。対応後の独立再レビュー・GUI検収も未実施。
+既存 fixture の期待画素・ハッシュは変更していない。GUI 起動・通常 APPDATA の操作・コミット・`out.mp4` の操作は行っていない。
