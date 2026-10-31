@@ -3100,3 +3100,16 @@ cargo nextest run -p mimageviewer --lib -E 'test(=agent_ipc::pipe::tests::shutdo
 
 全781件を外側で再実行する場合は §19.6 の広い focused コマンドをそのまま使う。
 実 pipe gate が sandbox 内で通らないため、通常 profile 用の確認 build は行っていない。
+
+### 19.9 検収 (観測者: ClaudeCode、2026-11-01)
+
+- 実装の独立レビュー (thread `01a18ce7`、gpt-6.1-sol / xhigh) は 2 巡。1 巡目 (`6e38a4502`) は P2 1 件「確認の窓の Enter が
+  widget ごとに所有されず、確認を飛ばして書き込める (開いた frame の Enter・コピーへの Enter・IME 中の合成クリック)」。
+  コードで確かめて妥当と判断し、`first_setup.rs` と同じ規則に直させた (`c6c02547c`)。2 巡目は **1d impl: accept**、指摘なし。
+- sandbox 外で crates (`--include-ignored`) 13/13・54/54 (`6e38a4502`)、focused nextest (§19.6 の filter) 781/781・
+  `ui_snapshot` 220/220・PNG の変化なし・fmt check (`c6c02547c`)、すべて exit 0。
+- 新しいスナップショット 6 枚のうち `preferences_agent_open_light.png` と `preferences_agent_disabled_dark.png` を ClaudeCode が
+  目で見た。許可の段に応じて 3 欄・登録の行の注意が切り替わり、明暗とも読める。
+- 未確認: 実際の Claude Desktop・ChatGPT への登録、確認が出ないこと (`approve`・「常に許可」)、mIV で開く時の前面化。
+  利用者の実機確認で見る (§9.2、§15.7 テスト)。
+- 判定: **1d を受け入れる**。
