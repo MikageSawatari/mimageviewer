@@ -1772,3 +1772,6 @@ FFmpeg DLL は前回配置済みの worktree 内実ファイルを使用した�
 |---|---:|---|
 | `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 0 | IPC 10/10、MCP 43/43 成功 |
 | §16.11 の focused nextest | 0 | 105/105 成功 |
+
+独立レビュー 3 回目 (`d7d54c78a`) は追加指摘なし、判定「1a impl: accept」。段階 1a はこれで検収とする
+(観測者: ClaudeCode。実機の AI アプリでの確認は 1d の後に利用者へまとめて依頼する)。
