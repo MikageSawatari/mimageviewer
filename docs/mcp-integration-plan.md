@@ -1615,6 +1615,11 @@ MCP の exe は console subsystem・CRT 静的リンク (DLL 不要)・引数は
   使わない。
 - **`--mcp` の間は名前付き mutex `Global\mImageViewerMcp_v1` を持つ** (子が終わるまで。設計レビュー 15 巡目 P2-2)。AI アプリが MCP を
   使っている間は launcher も動き続け、インストール先の `mimageviewer.exe` が使用中になる。インストーラはこの mutex で検出する (下)。
+  **権限** (設計レビュー 16 巡目 P2-1): 生きていることの印として使うだけなので、DACL は「Everyone に `SYNCHRONIZE`、作った人に全権」に
+  し、作る時も既存を開く時も `SYNCHRONIZE` だけを求める (`CreateMutexExW`)。こうすると別のユーザーの launcher も同じ object に
+  handle を足せ、最後の handle が閉じるまで検出される。core の既存の `Global\mImageViewerInstance_v1` が同じ問題を解いていれば
+  その作り方に合わせる。mutex を作れなかった時は標準エラーに 1 行出して MCP は続ける (まれな失敗の割り切り。印が無いだけで
+  機能は変わらない)。
 - 子の終了コードをそのまま launcher の終了コードにする。`--mcp` の経路の失敗 (展開・起動の失敗) は**標準エラーに 1 行**出して
   終了コード 1。通常の起動の失敗で出す MessageBox と `AttachConsole` は使わない (AI アプリの裏で窓を出さない)。
 - `crates/launcher/build.rs` の入力 (`target/release/*.exe`) と `ASSETS`・`include_bytes!` に MCP の exe を足す。入力が無い時の案内に
@@ -1637,8 +1642,10 @@ MCP の exe は console subsystem・CRT 静的リンク (DLL 不要)・引数は
   一覧を見ている)、`build-dist.ps1` の拒む一覧も同じ規則にそろえる。テスト: インストール先の launcher・MCP の親子は対象外、
   build の出力の exe は対象、path 不明は対象外、を mock の process 一覧で確かめる。
 - **インストーラ** (`installer/mimageviewer.iss`): 既存の独自の確認 (core の mutex を開いて終了を頼む) の後に、
-  `Global\mImageViewerMcp_v1` を `OpenMutexW` で確かめ、在れば「AI アプリ (Claude・ChatGPT など) が mImageViewer を使っています。
-  AI アプリを終了してから、もう一度実行してください」と出して中止する (更新とアンインストールの両方。自動の終了・再接続は作らない。
+  `Global\mImageViewerMcp_v1` を `OpenMutexW(SYNCHRONIZE)` で確かめる。開けたら「AI アプリ (Claude・ChatGPT など) が
+  mImageViewer を使っています。AI アプリを終了してから、もう一度実行してください」と出して中止する。**不在と扱うのは
+  `ERROR_FILE_NOT_FOUND` の時だけ**で、それ以外の失敗 (アクセス拒否など) は「確認できませんでした。AI アプリを終了してから、
+  もう一度実行してください」と出して中止する (設計レビュー 16 巡目 P2-1) (更新とアンインストールの両方。自動の終了・再接続は作らない。
   通常の操作で起こる組み合わせを、終了してもらう契約で無くす)。内包する exe を列挙したコメントも直す。
   単体 exe 版を手で置き換える時と portable を置き換える時も同じ契約で、`installer/readme.txt`・`installer/readme_portable.txt` に
   「AI アプリを終了してから置き換えてください」と書き、ファイル一覧に MCP の exe を足す。
@@ -1658,11 +1665,12 @@ MCP の exe は console subsystem・CRT 静的リンク (DLL 不要)・引数は
     起動し、標準入出力の握手・core が無い時の応答 (起動していない旨)・標準入力の EOF での終了・終了コードを確かめる
     (runtime の展開先・lock は一時フォルダの下、named pipe は data dir と SID から決まるので既存の core と分かれる)。
   - tool の成功: 使い捨ての portable の core を `--data-dir` 付きで起動しておき、上の launcher をその data dir で `--mcp` 起動して
-    Codex CLI から tool を呼ぶ (adapter は起動済みの core に繋ぐだけなので、core が要る)。`mcp_client_smoke.py` に、exe の前に置く
-    引数 (`--mcp`) を渡す口を足す。
-  - Codex CLI は**利用者の通常の MCP の登録を読まない**構成で使う (`mcp_servers` の表全体を上書きする等。他の登録済みの server を
-    起動しない)。その方法を確かめられなければ、利用者の `config.toml` に mIV 以外の MCP の登録が無いことを確かめてから使う。
+    tool を呼ぶ (adapter は起動済みの core に繋ぐだけなので、core が要る)。
+  - **client は launcher を 1 つだけ直接起動する小さな MCP client** (stdio で `initialize`・`tools/list`・`tools/call` を送る script) にする。
+    Codex CLI は使わない (利用者の通常の登録や他の設定層を読み、実データを指す mIV の登録まで起動し得る。設計レビュー 16 巡目 P2-2)。
+    launcher 単独の試験も同じ client で行う。
   - 確かめる時に、launcher の起動の前後で利用者の `%APPDATA%\mimageviewer\runtime` が変わらないことを見る。
+  - mutex のテスト: 2 つの launcher の `--mcp` が並んで動ける、片方が終わっても残りがある間は検出される、最後が終わると不在になる。
 - portable は `prepare-portable-smoke.ps1` で作り直し、同梱の `mimageviewer-mcp.exe` を `mcp_client_smoke.py --exe` で指して確かめる。
 
 ### 15.9 段階 0 の残り (1a で直す)
@@ -1864,6 +1872,11 @@ Susie の初期化の待ちを既存の枠の保持で扱うことは妥当と�
 | P2-1 止める・拒む一覧が名前だけの経路 (`.sh`・`PreserveRuntime`・build-dist) を含み、常駐の launcher も拒まれる | 妥当。launcher と MCP は出力の path と一致するものだけ、path 不明は対象外 | §15.8 スクリプト |
 | P2-2 常駐の launcher で更新・アンインストールの時にファイルが使用中 | 妥当。`--mcp` の間 mutex を持ち、インストーラが検出して「AI アプリを終了して」と中止 | §15.8 launcher・インストーラ |
 | P2-3 core を起動しない検証では tool の成功を確かめられない | 妥当。launcher 単独と、起動済みの portable の core への接続に分ける。通常の登録を読まない | §15.8 確かめ方 |
+
+16 巡目: 15 巡目の P2-1・P2-2・P2-3 は解消 (P2-2 は契約として)。新しい指摘 P2 2 件: (1) 固定名の Global の mutex の既定の DACL では
+別のユーザーの launcher が開けず、`OpenMutexW` の失敗は不在と拒否を区別しない → `SYNCHRONIZE` だけの共有と、不在は
+`ERROR_FILE_NOT_FOUND` だけにした。(2) Codex CLI は利用者の通常の登録を読み得る → 試験の client を launcher を直接起動する
+小さな MCP client にした。どちらも妥当と判断した (§15.8)。
 
 ## 16. 段階 1a の実装記録 (2026-10-31、基点 `17c85bb3a`、未コミット差分)
 
