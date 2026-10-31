@@ -3012,3 +3012,53 @@ fn unreachable_core_discovery_and_recovery_for_all_protocols() {
         h.close();
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn pending_disconnect_completion_returns_status_only_for_all_protocols() {
+    struct CompletedFailure(u32);
+    impl Backend for CompletedFailure {
+        fn call(
+            &self,
+            command: Command,
+            _: &ClientIdentity,
+            _: RequestKind,
+            _: Arc<CallControl>,
+        ) -> BackendResult {
+            assert_eq!(command, Command::Status);
+            // Use exactly the transport's IO_PENDING -> completion conversion,
+            // rather than constructing an io::Error in this backend fixture.
+            Err(pipe::pending_completion_failure_for_test(self.0))
+        }
+    }
+    for code in [109, 233, 5] {
+        for version in VERSIONS {
+            let mut h = Harness::new(Arc::new(CompletedFailure(code)));
+            if version != MODERN {
+                h.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}));
+                h.receive();
+                h.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+            }
+            h.send(if version == MODERN {
+                modern(1, "tools/list", json!({}))
+            } else {
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})
+            });
+            let reply = h.receive();
+            assert_eq!(reply["id"], 1);
+            if code == 5 {
+                assert_eq!(
+                    reply["error"]["code"], -32603,
+                    "access denied is not an absent core"
+                );
+            } else {
+                assert!(reply.get("error").is_none(), "{version}: {reply}");
+                assert_eq!(
+                    reply["result"]["tools"],
+                    json!(schema::tools_named(&["miv_status"]))
+                );
+            }
+            h.close();
+        }
+    }
+}

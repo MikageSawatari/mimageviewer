@@ -3581,3 +3581,68 @@ python -I .\scripts\mcp_stdio_check.py --env "APPDATA=$mcpCheckRoot\appdata" --c
 release の再 build は変更した adapter を launcher に内包し直すため。最後は core のいない隔離 data dir で
 §2.4 の期待順と自然終了を確認する。修正後の実 launcher 通信はこの sandbox では未実施。
 製品/AI アプリの起動、実 client config の読書き、commit はしていない。追加の設計矛盾は無い。
+
+### 20.11 修正 2 回目 (2026-11-01)
+
+基点 `fb40be225`、branch `mcp-trial`。開始時 clean。以下の変更と fixture 検査の観測者は実装担当自身。
+
+受領済みの sandbox 外の証拠 (ClaudeCode が修正1後に実行): agent-ipc 13/13・MCP 56/56、
+release build、launcher 51成功/1 ignored、Python 15/15、すべて exit 0。
+core 無しの launcher 単独も tools/list = `[miv_status]`、miv_status = not_ready、stdin EOF 後 exit 0。
+独立レビューは stdio client 修正を受け入れ、overlapped completion の Win32 code 喪失を P2 として指摘した。
+
+原因と修正:
+
+- `crates/mcp-server/src/pipe/transport.rs` の read/write 共通 `operation` が
+  `GetOverlappedResult` の Windows error を `io::Error::other` へ包んでいた。
+  IO_PENDING の後の切断が raw code 無しの Other となり、`communication_error` で Internal になった。
+- Win32 HRESULT (`0x8007xxxx`) から元の OS code を `from_raw_os_error` へ渡す変換を1か所に置いた。
+  非 Win32 HRESULT は Other のままであり、下位16bitを Win32 code と誤認しない。
+- 開始結果と完了結果を同じ `complete_operation` へ通す。開始 error は windows-rs が捕捉した
+  code から判定し、後から `GetLastError` を取り直さない。IO_PENDING のみ完了を待ち、
+  `GetOverlappedResult` と `CreateEventW` の error も同じ変換を使う。
+  read/write の OVERLAPPED・buffer・event の寿命、cancel writer の独立性は変えていない。
+- connect も source を照合した。adapter は `OpenOptions` (CreateFile) と `WaitNamedPipeW` で接続し、
+  overlapped ConnectNamedPipe は使わない。前者は std の OS error、後者は直後の GetLastError を
+  `from_raw_os_error` へ渡しており、既に code を保持していたため変更していない。
+  core/Remote、wire format、エラーの分類規則自体は変更していない。
+
+テスト:
+
+- `transport.rs` の新規 unit は即時失敗、開始成功/IO_PENDING 後の完了失敗について
+  access denied (5)・broken pipe (109)・pipe not connected (233) の raw code 保持を確認する。
+  IO_PENDING 後の成功と、非 Win32 HRESULT の下位codeを誤認しないことも確認する。
+- `pipe.rs` に test-only の接続口を設け、上記の実際の transport 処理へ Windows error の
+  IO_PENDING と完了 error を渡す。手製の `io::Error` を backend fixture に直接渡していない。
+- `tests.rs` の `pending_disconnect_completion_returns_status_only_for_all_protocols` は、この結果を
+  実際の stdio event loop へ返し、109/233 → Unreachable → tools/list = `[miv_status]` を
+  対応3版で確認する。同じ経路の5は従来どおり JSON-RPC error となり、不在扱いしない。
+  runtime/child/core は起動せず、sleep や retry は追加していない。
+
+変更ファイルは上記 Rust 3ファイルと本 ledger のみ。設計矛盾は見つかっていない。
+
+実行結果 (実装担当、sandbox 内):
+
+| コマンド | 実 exit | 結果 |
+|---|---:|---|
+| `cargo test -p mimageviewer-mcp pending_disconnect_completion_returns_status_only_for_all_protocols -- --nocapture` | 0 | 1件、対応3版×切断2種/拒否1種。`target/mcp-1e-fix2-pending-discovery.log` |
+| `cargo fmt` | 0 | workspace 全体、`target/mcp-1e-fix2-fmt.log` |
+| `cargo fmt --check` | 0 | `target/mcp-1e-fix2-fmt-check.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 101 | agent-ipc 13/13、MCP 56成功/2失敗。`target/mcp-1e-fix2-crate-tests.log` |
+| `git diff --check` | 0 | LF/CRLF warning のみ、`target/mcp-1e-fix2-diff-check.log` |
+
+追加した transport unit と stdio regression はどちらも成功。失敗は既知の
+`pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked` と
+`pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld` の2件のみ。
+fixture probe の pipe open が sandbox の OS error 5 となる。skip/ignore は追加していない。
+
+sandbox 外で ClaudeCode が実行するコマンド:
+
+```powershell
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+```
+
+実配布経路を再検証する場合は、`.\scripts\build-release.ps1 -PreserveRuntime` で adapter と
+launcher 内包物を更新してから §2.4 の隔離した stdio check を行う。本修正後の実 core 切断時の
+通信は sandbox 内では確認できていないが、実際の transport 変換を通した決定的 fixture で検証した。
+製品起動、実 client config の読書き、commit、build wrapper の通し実行は行っていない。

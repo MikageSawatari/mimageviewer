@@ -156,6 +156,16 @@ fn communication_error(error: io::Error) -> BackendError {
         invalid_response().into()
     }
 }
+#[cfg(all(test, windows))]
+pub(crate) fn pending_completion_failure_for_test(code: u32) -> BackendError {
+    use windows::Win32::Foundation::{ERROR_IO_PENDING, WIN32_ERROR};
+    let error = transport::complete_operation(Err(ERROR_IO_PENDING.into()), || {
+        Err(WIN32_ERROR(code).into())
+    })
+    .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(code as i32));
+    communication_error(error)
+}
 fn receive(file: &mut PipeStream, id: u64) -> BackendResult {
     let response: Response = read_frame(file)
         .map_err(communication_error)?

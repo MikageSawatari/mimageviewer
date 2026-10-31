@@ -11,6 +11,31 @@ const CONNECT_BUDGET: Duration = Duration::from_secs(2);
 const ERROR_PIPE_BUSY_CODE: i32 = 231;
 const ERROR_SEM_TIMEOUT_CODE: i32 = 121;
 
+#[cfg(windows)]
+fn windows_io_error(error: windows::core::Error) -> io::Error {
+    let code = error.code().0 as u32;
+    // BOOL Win32 APIs return HRESULT_FROM_WIN32 through windows-rs. Retain
+    // the original OS code so the backend can distinguish a disconnected pipe.
+    if code & 0xffff_0000 == 0x8007_0000 {
+        io::Error::from_raw_os_error((code & 0xffff) as i32)
+    } else {
+        io::Error::other(error)
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn complete_operation(
+    started: windows::core::Result<()>,
+    complete: impl FnOnce() -> windows::core::Result<()>,
+) -> io::Result<()> {
+    if let Err(error) = started {
+        if error.code() != windows::Win32::Foundation::ERROR_IO_PENDING.to_hresult() {
+            return Err(windows_io_error(error));
+        }
+    }
+    complete().map_err(windows_io_error)
+}
+
 /// Busy is an ordinary listener-reuse race. The caller's single total budget
 /// covers every WaitNamedPipe/open attempt, including contention after a wake.
 fn connect_with_budget<T>(
@@ -122,7 +147,7 @@ mod win {
     use std::os::windows::io::AsRawHandle;
     use windows::{
         Win32::{
-            Foundation::{CloseHandle, ERROR_IO_PENDING, GetLastError, HANDLE},
+            Foundation::{CloseHandle, HANDLE},
             Storage::FileSystem::{ReadFile, WriteFile},
             System::{
                 IO::{GetOverlappedResult, OVERLAPPED},
@@ -143,7 +168,7 @@ mod win {
         fn operation(&self, read: Option<&mut [u8]>, write: Option<&[u8]>) -> io::Result<usize> {
             let event = Event(
                 unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
-                    .map_err(io::Error::other)?,
+                    .map_err(windows_io_error)?,
             );
             let mut op = OVERLAPPED {
                 hEvent: event.0,
@@ -156,18 +181,13 @@ mod win {
                     None => WriteFile(handle, write, None, Some(&mut op)),
                 }
             };
-            if started.is_err() {
-                let error = unsafe { GetLastError() };
-                if error != ERROR_IO_PENDING {
-                    return Err(io::Error::from_raw_os_error(error.0 as i32));
-                }
-            }
             // Wait only for this operation's event; a simultaneous cancel write has
             // its own OVERLAPPED/event and is never serialized behind this read.
             // Both the buffer and OVERLAPPED remain alive until completion.
             let mut transferred = 0;
-            unsafe { GetOverlappedResult(handle, &op, &mut transferred, true) }
-                .map_err(io::Error::other)?;
+            complete_operation(started, || unsafe {
+                GetOverlappedResult(handle, &op, &mut transferred, true)
+            })?;
             Ok(transferred as usize)
         }
     }
@@ -213,6 +233,30 @@ impl Write for PipeStream {
 mod tests {
     use super::*;
     use std::{cell::Cell, collections::VecDeque};
+
+    #[cfg(windows)]
+    #[test]
+    fn overlapped_errors_retain_win32_codes_at_start_and_completion() {
+        use windows::Win32::Foundation::{ERROR_IO_PENDING, WIN32_ERROR};
+        for code in [5, 109, 233] {
+            let error = complete_operation(Err(WIN32_ERROR(code).into()), || {
+                panic!("a failed start must not wait for completion")
+            })
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code as i32));
+            for started in [Ok(()), Err(ERROR_IO_PENDING.into())] {
+                let error =
+                    complete_operation(started, || Err(WIN32_ERROR(code).into())).unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(code as i32));
+            }
+        }
+        assert!(complete_operation(Err(ERROR_IO_PENDING.into()), || Ok(())).is_ok());
+        // A non-Win32 HRESULT must not be mistaken for its low 16-bit value.
+        let error = windows_io_error(windows::core::Error::from_hresult(windows::core::HRESULT(
+            0x8004_006d_u32 as i32,
+        )));
+        assert_eq!(error.raw_os_error(), None);
+    }
 
     #[test]
     fn busy_connect_reuses_one_total_budget_when_another_client_wins() {
