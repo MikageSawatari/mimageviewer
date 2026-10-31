@@ -490,15 +490,25 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
 - 結合 (実 core): 実アプリの起動は検証規約 (AGENTS.md / CLAUDE.md「実機検証と設定データの保護」)
   に従い、`.\scripts\prepare-portable-smoke.ps1` で作る使い捨て portable を使う
   (データは `target\portable-smoke\data`、利用者の設定はコピーしない。独立レビュー P2-12)。
-  その core へ、Claude Code の非対話実行 (`claude -p --mcp-config <一時ファイル>`) から tool を呼ぶ。
-  利用者の Claude / Codex の設定ファイルは書き換えない。通常データでは起動しない。
+  その core へ、AI クライアントの非対話実行から tool を呼ぶ。利用者の Claude / Codex の設定ファイルは
+  書き換えない (登録はその回の実行だけに渡す)。通常データでは起動しない。
+  - 通常の確認は `.\scripts\mcp-client-smoke.ps1` (2026-10-31 追加、`mcp-trial` 側)。
+    Codex CLI (`codex exec --json -c mcp_servers.<名前>...`) が既定で、tool ごとに渡した引数・成否・
+    最終回答を表示し、生ログを `target\mcp-client-smoke\` に残す。ChatGPT Windows アプリと同じ Codex エンジンで、
+    設計担当・実装担当が段階ごとに何度でも回せる。
+  - `-Client claude` は Claude Code CLI (`claude -p --mcp-config ... --strict-mcp-config`)。
+    この PC の CLI のログインが切れている間は、接続までしか確かめられない。
+  - Claude Desktop と ChatGPT アプリの実機確認は、段階の区切り (配布前など) だけ利用者に頼む。
+    CLI と実アプリで差が出得るのは、旧版の握手・許可の UI・時間切れ・結果の見せ方。
 - 利用者の確認: Claude Desktop と ChatGPT デスクトップアプリ (Codex) への登録手順を渡し、
   利用者の環境で呼べるかを見てもらう (観測者は利用者)。
 
 ### 9.3 完了の目安
 
-本書の §11 が合意済み、独立レビュー済み、段階 0 の tool を Claude Code から隔離起動の本体へ
+本書の §11 が合意済み、独立レビュー済み、段階 0 の tool を AI クライアントから隔離起動の本体へ
 呼べたログがある、利用者の Claude Desktop での確認結果 (成否) が記録されている。
+2026-10-31 時点: Codex CLI からの呼び出しログあり、ChatGPT アプリは利用者が確認済み、
+Claude Desktop は利用者の再起動待ち。
 
 ## 10. 状態を減らす検討の記録
 
