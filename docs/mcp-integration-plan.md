@@ -1122,7 +1122,7 @@ cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_lev
 | 区切り | 内容 | 新しく借りる所有者 |
 |---|---|---|
 | 1a | 権限 snapshot の拡張 (§15.2)、読み取り tool の拡充 (§15.3)、出力予算 (§15.4)、段階 0 の残り (§15.9) | なし (共有 reader の束と collection actor の借用だけ) |
-| 1b | フォルダ・ZIP/PDF の中の一覧と縮小画像 (§15.5) | 本の構成の service の snapshot (lock だけ)。一覧画面の純粋な関数と縮小画像の要求を作る関数を共有。Remote の engine は使わない |
+| 1b | フォルダ・ZIP/PDF の中の一覧と縮小画像 (§15.5) | 本の構成の service の snapshot (lock だけ)。一覧画面の純粋な関数を共有。縮小画像は catalog を使わず 1 枚から直接作る。Remote の engine は使わない |
 | 1c | mIV で開く (§15.6) | agent の「開く」専用の受付 (App) + 二重起動と共有する判定・resolver の入口 |
 | 1d | 設定画面・見せる範囲の表示・AI アプリへの登録 (§15.7) | なし (UI と設定) |
 | 1e | 配布の仕組み (launcher `--mcp`、portable、ビルド・署名・同梱) (§15.8) | なし |
@@ -1314,55 +1314,43 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 - 期限: 走査・列挙・PDF のページ数は取消を受ける。materializer と構成の投影は CPU だけの処理で、その前後で
   取消を確かめる。期限が来たら §15.4 の「時間切れ」の tool error。
 
-`get_thumbnail`:
+`get_thumbnail` (独立レビュー 6 巡目で組み直した。一覧画面の `process_load_request` は catalog・代表の解決・
+類似索引の prefill・`pdf_meta` の更新・Susie などの副作用と取消を受けない読み取りを内側に持ち、agent 用に抑止する
+箇所が巡ごとに増えたため、使わない):
 
 - 「AI に縮小画像を見せる」が ON の時だけ `tools/list` に出し、OFF なら拒否する。
-- 対象: 画像・フォルダ・ZIP/PDF/書庫のファイル (代表の縮小画像)・ZIP の項目・PDF のページ。
-  **動画・音声は 1b では「縮小画像なし (未対応)」** として返す (動画は pin・sidecar・Windows Shell と経路が別で、
-  取消も受けない)。
-- 経路: 一覧画面の要求を作る関数 (`app.rs` の自由関数 `make_load_request_with_visibility` と、App の method の
-  `container_cache_base_key`) を `pub(crate)` で共有し、cache の key・代表の pin・種類の fingerprint を一覧画面と
-  同じにする (一覧画面の挙動は変えない)。この関数が受ける入力は、agent では worker が読み取り専用で用意する
-  (独立レビュー 5 巡目 P2-2):
+- **指定された 1 枚から直接作る。thumbnail cache (catalog) は読みも書きもしない。** 本の構成の編集画面の縮小画像
+  (`app/book_composition_editor_thumbnails.rs` の `decode_thumbnail`。cache なし・取消付き・回転 DB を読み取り専用) と
+  同じ考え方。これで代表の解決、ドライブの違う同名フォルダの cache の取り違え、cache の保存方針との整合、
+  DB への書き込みが agent の経路から無くなる。
+- 対象 (それ以外は `unsupported`):
 
-  | 入力 | agent での取得元・値 |
+  | 項目 | 読み方 |
   |---|---|
-  | 項目・mtime・大きさ | `list_folder` と同じ経路で作った `GridItem` と `metadata` |
-  | 設定・種類の表示 | その都度読む現在の設定 |
-  | 代表の pin (`pin_map`・`pin_db`) | folder pin の DB を読み取り専用で開いて引く (Remote の `WorkerContext` と同じ DB) |
-  | 変換済み書庫 (`converted_archive_cache_paths`) | 渡さない。RAR・7z 等の書庫のファイルは **cache だけ** (`CacheOnly`) で、cache が無ければ `unavailable` |
-  | PDF の password | 渡さない。password 付き PDF は cache だけで、cache が無ければ `unavailable` |
-  | `archive_source_override`・full path の key | 渡さない (通常の閲覧と同じ key) |
-  | 動画の pin | 使わない (動画は 1b の対象外) |
+  | 画像ファイル (`folder_tree::SUPPORTED_EXTENSIONS` の静止画。拡張子の判定は Susie の pool を起こす `is_recognized_image_ext` ではなく一覧を直接見る) | 取消を確かめながら 128 MiB まで読み (超えたら `too_large`)、JPEG は `decode_jpeg_turbo_scaled_from_bytes` (DCT の縮小 decode)、他は `image_decode::primary` (取消付き・Susie を呼ばない。AVIF・WIC の fallback を含む)。アニメーションは最初の 1 枚 |
+  | RAW | `raw_decoder::preview_bounded` の埋め込み preview だけ。無ければ `unavailable` (現像はしない。RAW 現像 executor を使わない) |
+  | ZIP (cbz 含む) の中の画像 | 1a の `read_zip` / `read_zip_member` (入れ子対応・64 MiB まで・取消付き) の bytes から上と同じ decode |
+  | PDF のページ | 取消付きの `render_page` に**path を perf key に入れない入口**を足して使う (1a の `get_page_sizes_anonymous` と同じ形)。取消の待ち方は、worker が実際に止まるまで待つ policy にし、同時実行の枠を先に離さない。password 付きの PDF は password を渡さないので `unavailable` |
+  | フォルダ・書庫のファイルの代表、動画・音声、Susie だけが読める形式、EPUB のページ、RAR の中 | `unsupported` (AI は `list_folder` で中の画像を指せる) |
 
-  生成は既存の `process_load_request` に agent 自身の取消 (`Arc<AtomicBool>`) を渡す。
-- **agent の呼び出しは副作用を持たない** (独立レビュー 5 巡目 P2-1): 要求に「agent の読み取り」の印を足し、
-  その時は次をしない。一覧画面の挙動は変えない。
-  - ZIP のフォルダ代表を決める時の `zip_key_migration` (★・補正などの利用者の DB を書き換える)。代表を決める
-    ZIP の列挙は読み取り専用で取消を受ける `enumerate_image_entries_detailed_readonly_with_cancel` にする。
-  - PDF の cache に当たった時の `pdf_meta` の補完の予約 (agent とは別の取消で動く)。
-  - 書くのは下の「cache への保存」だけ。
-- **補正・編集**: 縮小画像は元の画像から作り、mIV の補正・編集は反映しない (一覧画面でも編集の preview は
-  `edit_preview_cache_enabled` の時だけ)。ただし **編集の「隠す」がある項目は画像を返さず `hidden_by_edit`** にする
-  (隠した部分を AI に渡さないため)。判定は「隠す」の DB の読み取り (Remote の `WorkerContext` と同じ DB)。
-  1d の見せる範囲の説明に「補正・編集は反映しない。隠す編集をした画像は渡さない」と書く。
-- **RAW は現像しない**: Remote と同じ `RawThumbHandoff::RemotePreviewOnly` を使い、埋め込みの preview か
-  cache だけ。半分の現像が要るなら「縮小画像なし」。pin・代表の解決の後の**実際の元の画像**が RAW の時も同じにし、
-  保存方針に `without_thumbnail()` を掛ける (小さな preview で PC の現像済みの行を上書きしない。5 巡目の回答 3)。RAW 現像 executor を agent では使わないので、その寿命を
-  共有・停止する組み合わせが無い。
-- 返す画像: cache に当たっても、decode → 回転 (回転 DB の読み取り) → 要求の一辺 (cache の大きさを上限) で
-  WebP に encode し直す (Remote と同じ)。cache の bytes をそのまま返す近道は作らない (古い行に JPEG があり、
-  回転・pin の補正の有無で条件が分かれるため)。品質は設定の値。
-- **cache への保存**: 一覧画面と同じ admission (`CatalogAccess::admit`、cache 削除中は表示だけ) と保存方針
-  (`CacheDecision::from_settings`、RAW は縮小画像を上書きしない) で、生成した時だけ書く。
-  agent 専用の cache は持たない。
+- 向き: EXIF の向きを掛ける (TurboJPEG の経路は向きを掛けないので明示的に掛ける。RAW の preview は掛け済み)。
+  利用者が mIV で付けた回転は `RotationDb::open_readonly` で読み、画像に焼き込む (Remote と同じ。`RotationDb::open()` は
+  table を作るので使わない)。
+- **編集の「隠す」**: その項目自身のページの key (実ファイルは path、ZIP の項目は `zip::entry`、PDF は `pdf::page_N`。
+  既存の `edit_source` の key 関数) で `ConcealDb::open_readonly` の `get_full_checked` を引き、あれば画像を返さず
+  `hidden_by_edit`。代表を解決しないので、返す画素と判定の key は常に同じ項目 (6 巡目 P1)。DB の file が無ければ
+  「隠すなし」、file があって読めなければログ + その呼び出し全体を tool error にする (「隠すなし」に倒さない)。
+  ほかの補正・編集は反映しない。1d の見せる範囲の説明に「補正・編集は反映しない。隠す編集をした画像は渡さない」と書く。
+- 大きさと品質: 要求の一辺 (256〜512) に `catalog::encode_thumb_webp` (純粋な resize + WebP encode。透明は落ちる) で
+  縮める。品質は設定の縮小画像の品質。
+- cache を使わないので、毎回 decode する (JPEG は DCT の縮小 decode で軽い)。AI の用途では一覧画面ほどの速さは要らない。
 - 予算 (§15.4): 画像は MCP の `content` の image block (`image/webp`) にだけ置き、text と `structuredContent` には
   項目の識別・状態 (`ok` / `too_large` / `unavailable` / `unsupported` / `hidden_by_edit`)・寸法だけを置く。1 件 256 KiB・合計 1 MiB。
   agent IPC では画像の bytes を別の欄で運ぶ (版 2 は未リリースなので型を足す)。
 - 期限: 指定順に 1 件ずつ作るので prefix が確定する tool。期限に達したら確定済みの画像 + 進む cursor (入力の位置から
   再開)。1 件もできなければ時間切れの error。
-- 共有するもの: 現在の設定の読み取り、プロセス共通の I/O の上限、PDF worker pool、catalog の admission。
-  分けるもの: 取消 (要求ごとの `Arc<AtomicBool>`)、要求の識別。agent 専用の cache は持たない。
+- 共有するもの: 現在の設定の読み取り、プロセス共通の I/O の上限、PDF worker pool。分けるもの: 取消 (要求ごとの
+  `Arc<AtomicBool>`)、要求の識別。agent 専用の cache は持たない。書き込みは無い。
 
 所有と終了 (受け入れ条件):
 
@@ -1517,9 +1505,10 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 | cursor に引数を複製する | しない。正規化した引数の digest で照合する |
 | 1b で Remote の container を分けて使う | 使わない。一覧画面の純粋な関数を直接呼ぶ (Remote の一覧は一覧画面と規則が違う) |
 | 1b で RAR・7z・EPUB・ZIP の中の ZIP の中を一覧する | しない。変換・cache・password の組み合わせを持ち込まない |
-| 1b で RAW を現像して縮小画像を作る | しない。preview と cache だけ。RAW 現像 executor の寿命を共有しない |
-| 1b で cache の bytes をそのまま返す近道 | 作らない。常に decode → 回転 → encode |
-| 1b で動画・音声の縮小画像 | 返さない (経路が別で取消を受けない) |
+| 1b で RAW を現像して縮小画像を作る | しない。埋め込みの preview だけ。RAW 現像 executor の寿命を共有しない |
+| 1b で一覧画面の縮小画像の処理 (`process_load_request`・catalog) を使う | 使わない。指定の 1 枚から直接作る (代表の解決・cache の取り違え・保存方針・副作用の抑止が要らなくなる) |
+| 1b でフォルダ・書庫の代表の縮小画像 | 返さない。AI は `list_folder` で中の画像を指す |
+| 1b で動画・音声・Susie だけの形式・EPUB・RAR の中の縮小画像 | 返さない (経路が別で、取消を受けないか共有の worker を起こす) |
 | 1c で二重起動の channel に agent 要求を混ぜる | 混ぜない。専用の受付で、同時に 1 件だけ |
 | 1c で ZIP の項目・PDF のページを指して開く | しない。path だけ |
 
@@ -1588,6 +1577,22 @@ digest を入れた cursor、typed admission と判定の共有は妥当とさ�
 | P3 お気に入りの表示状態の保存は「最大 500 ms」ではない (変更のたびに延びる) | 妥当 (`favorite_view_state.rs` で確認) | §15.5「設定」 |
 | 回答 3 RAW の保存抑止は解決後の実際の元の画像にも要る | 妥当 | §15.5「RAW」 |
 | 回答 6 窓の復帰は既存の activation event を通知すれば足りる。`AllowSetForegroundWindow` は保証されない | 妥当。event の通知にし、前者は best effort | §15.6「窓を前に出す」 |
+
+### 15.16 独立レビュー 6 巡目 (2026-10-31、同じ担当、設計 `8f2cf9203`)
+
+判定は「1b: not ready」「1c: ready」。5 巡目の P2-3〜P2-5・P3、RAW の保存抑止、activation event の再利用は解消と確認された。
+
+| 指摘 | 判断 | 反映先 |
+|---|---|---|
+| P1 「隠す」の判定が、代表の画像の実際のページまで定義されていない (代表の選択は loader の中、cache hit では選択を通らない) | 妥当 | §15.5 `get_thumbnail` |
+| P2 抑止する副作用が足りない (類似索引の prefill、fallback の再入、PDF の描画後の `pdf_meta` 更新) | 妥当 | 同上 |
+| P2 変換書庫の CacheOnly 要求を作る経路が無い。password 付き PDF の判定元も無い | 妥当 | 同上 |
+| P2 ZIP の代表・項目の bytes の読み取り、RAW の事前判定に取消が無い | 妥当 | 同上 |
+| P2 full path の key を使わないと、ドライブの違う同名フォルダで cache を取り違える | 妥当 (`catalog.rs` はドライブ文字を落とす) | 同上 |
+
+ClaudeCode の判断: 指摘はどれも、一覧画面の `process_load_request` (catalog・代表の解決・副作用を内側に持つ) を agent から
+使う前提から出ている。同じ前提の上で抑止を足し続けるのをやめ、`get_thumbnail` を「指定の 1 枚から cache を使わずに直接作る」
+形に組み直した (本の構成の編集画面の縮小画像と同じ考え方)。代表の縮小画像・変換書庫・password 付き PDF の cache は扱わない。
 
 ## 16. 段階 1a の実装記録 (2026-10-31、基点 `17c85bb3a`、未コミット差分)
 
