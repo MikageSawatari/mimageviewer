@@ -1426,6 +1426,13 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         });
         ui.small("全体の「スケーリング」とは別に、サムネイル一覧のファイル名・フォルダ名だけを大きくします。");
     });
+    anchored(ui, state, "thumbnail/name-prioritize-width", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.thumb_name_prioritize_width,
+            "ファイル名の表示幅を優先する",
+        );
+        ui.small("形式の表示をファイル名のすぐ上の段に移します。");
+    });
     anchored(ui, state, "thumbnail/name-max-lines", |ui, state| {
         ui.horizontal_wrapped(|ui| {
             let label = ui.label("名前の最大行数:");

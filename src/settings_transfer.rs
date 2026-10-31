@@ -288,6 +288,7 @@ preferences_policy! {
         thumb_show_resume_meter: bool => ("サムネイルの読書・再生位置表示", |_, _| true, plain, plain);
         thumb_name_font_scale_percent: u32 => ("サムネイル一覧の名前の文字サイズ", |v, _raw| (THUMB_NAME_FONT_SCALE_PERCENT_MIN..=THUMB_NAME_FONT_SCALE_PERCENT_MAX).contains(v), plain, plain);
         thumb_name_max_lines: u32 => ("サムネイル一覧の名前の最大行数", |v, _raw| (THUMB_NAME_MAX_LINES_MIN..=THUMB_NAME_MAX_LINES_MAX).contains(v), plain, plain);
+        thumb_name_prioritize_width: bool => ("ファイル名の表示幅を優先する", |_, _raw| true, plain, plain);
         selection_info_display_mode: SelectionInfoDisplayMode => ("選択項目の情報表示", |v, _raw| !matches!(v, SelectionInfoDisplayMode::Unknown), plain, plain);
         thumb_tooltip_show_filename: bool => ("サムネイルツールチップ：ファイル名", |_, _| true, plain, plain);
         thumb_tooltip_show_image_dimensions: bool => ("サムネイルツールチップ：画像サイズ", |_, _| true, plain, plain);
@@ -1035,6 +1036,7 @@ mod tests {
         );
         settings.thumb_show_media_duration = !settings.thumb_show_media_duration;
         settings.thumb_show_resume_meter = !settings.thumb_show_resume_meter;
+        settings.thumb_name_prioritize_width = !settings.thumb_name_prioritize_width;
         settings.thumb_name_font_scale_percent = if settings.thumb_name_font_scale_percent == 200 {
             100
         } else {
@@ -1984,13 +1986,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 479);
+        assert_eq!(entries.len(), 480);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            153
+            154
         );
         assert_eq!(
             entries
@@ -2001,6 +2003,11 @@ mod tests {
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
+        assert!(
+            entries
+                .iter()
+                .any(|(key, reason)| *key == "thumb_name_prioritize_width" && reason.is_none())
+        );
         for key in [
             "show_toolbar_search_container",
             "show_toolbar_search_local",
@@ -2020,7 +2027,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 151);
+        assert_eq!(wire.len(), 152);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -2042,6 +2049,7 @@ mod tests {
         let source = Settings {
             thumb_name_font_scale_percent: 175,
             thumb_name_max_lines: 4,
+            thumb_name_prioritize_width: true,
             ..Settings::default()
         };
         let exported = export_preferences(&source).unwrap();
@@ -2052,6 +2060,13 @@ mod tests {
         assert!(report.issues.is_empty());
         assert_eq!(destination.thumb_name_font_scale_percent, 175);
         assert_eq!(destination.thumb_name_max_lines, 4);
+        assert!(destination.thumb_name_prioritize_width);
+        assert!(
+            report
+                .changed_fields
+                .iter()
+                .any(|field| field == "ファイル名の表示幅を優先する")
+        );
         assert!(
             report
                 .changed_fields
@@ -2069,6 +2084,7 @@ mod tests {
             .apply_to(&mut destination);
         assert_eq!(destination.thumb_name_font_scale_percent, 175);
         assert_eq!(destination.thumb_name_max_lines, 4);
+        assert!(destination.thumb_name_prioritize_width);
 
         for (field, invalid) in [
             ("thumb_name_font_scale_percent", json!(99)),
@@ -2079,6 +2095,9 @@ mod tests {
             ("thumb_name_max_lines", json!(5)),
             ("thumb_name_max_lines", json!("2")),
             ("thumb_name_max_lines", Value::Null),
+            ("thumb_name_prioritize_width", json!("true")),
+            ("thumb_name_prioritize_width", json!(1)),
+            ("thumb_name_prioritize_width", Value::Null),
         ] {
             let report = parse_preferences(&document(json!({field: invalid})))
                 .unwrap()
@@ -2086,7 +2105,12 @@ mod tests {
             assert_eq!(report.issues.len(), 1, "{field}");
             assert_eq!(destination.thumb_name_font_scale_percent, 175);
             assert_eq!(destination.thumb_name_max_lines, 4);
+            assert!(destination.thumb_name_prioritize_width);
         }
+        parse_preferences(&document(json!({"thumb_name_prioritize_width": false})))
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(!destination.thumb_name_prioritize_width);
     }
 
     #[test]

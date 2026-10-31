@@ -73,6 +73,7 @@ pub mod raw_format;
 pub use app::LocalAiActivityLease;
 pub use app::draw_audio_thumbnail_indicator_snapshot_fixture;
 pub use app::draw_collection_placeholder_snapshot_fixture;
+pub use app::draw_thumbnail_filename_width_snapshot_fixture;
 #[doc(hidden)]
 pub use app::draw_thumbnail_name_style_snapshot_fixture;
 #[doc(hidden)]

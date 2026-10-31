@@ -5283,6 +5283,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 thumbnail,
                 &["切り取り".to_owned()],
                 None,
+                None,
                 false,
                 VideoThumbnailIndicator::PlayIcon,
                 crate::settings::AudioThumbnailIndicator::default(),
@@ -18186,57 +18187,19 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 row.missing,
             );
         }
-        if let Some(title) = row.title() {
-            let font = crate::ui_fonts::user_text_font(13.0);
-            let max_text_width = (rect.width() - 28.0).max(0.0);
-            if max_text_width >= 8.0 {
-                let initial = crate::ui_helpers::truncate_name(title, 36);
-                let mut galley = ui.painter().layout_no_wrap(
-                    initial.clone(),
-                    font.clone(),
-                    egui::Color32::WHITE,
-                );
-                if galley.size().x > max_text_width {
-                    let chars: Vec<char> = initial.chars().collect();
-                    for take in (1..chars.len()).rev() {
-                        let candidate = chars[..take].iter().collect::<String>() + "…";
-                        let candidate_galley = ui.painter().layout_no_wrap(
-                            candidate,
-                            font.clone(),
-                            egui::Color32::WHITE,
-                        );
-                        if candidate_galley.size().x <= max_text_width {
-                            galley = candidate_galley;
-                            break;
-                        }
-                    }
-                }
-                if galley.size().x <= max_text_width {
-                    let centered_rect = egui::Rect::from_center_size(
-                        rect.center(),
-                        galley.size() + egui::vec2(14.0, 8.0),
-                    );
-                    let lane_bottom = overlay_layout.top_left.lane_bottom().unwrap_or(rect.min.y);
-                    let min_title_y = lane_bottom + 4.0;
-                    let plate_rect = centered_rect.translate(egui::vec2(
-                        0.0,
-                        (min_title_y - centered_rect.min.y).max(0.0),
-                    ));
-                    if plate_rect.max.y <= rect.max.y - 4.0 {
-                        title_area = Some(plate_rect.intersect(rect).intersect(ui.clip_rect()));
-                        content_painter.rect_filled(
-                            plate_rect,
-                            4.0,
-                            egui::Color32::from_black_alpha(190),
-                        );
-                        content_painter.galley(
-                            plate_rect.center() - galley.size() * 0.5,
-                            galley,
-                            egui::Color32::WHITE,
-                        );
-                    }
-                }
-            }
+        if let Some(title) = overlay_layout.bookmark_title.as_ref() {
+            let galley = content_painter.layout_no_wrap(
+                title.text.clone(),
+                crate::ui_helpers::thumbnail_badge_font(title.style),
+                egui::Color32::WHITE,
+            );
+            title_area = Some(title.rect.intersect(rect).intersect(ui.clip_rect()));
+            content_painter.rect_filled(title.rect, 4.0, egui::Color32::from_black_alpha(190));
+            content_painter.galley(
+                title.rect.center() - galley.size() * 0.5,
+                galley,
+                egui::Color32::WHITE,
+            );
         }
         let source = row.source_path().display().to_string();
         let position = row.position_label();
@@ -20313,6 +20276,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         row.badge_label()
                                     }
                                 });
+                                let bookmark_title = self.bookmark_view_row(idx)
+                                    .and_then(|row| row.title())
+                                    .map(str::to_owned);
                                 let media_duration = self.thumbnail_media_duration_text(idx);
                                 let is_checked = self.checked.contains(&idx);
                                 let filter_match = if self.items_are_drive_list {
@@ -20339,6 +20305,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     &self.thumbnails[idx],
                                     &tags,
                                     bookmark_time.as_deref(),
+                                    bookmark_title.as_deref(),
                                     self.items_are_drive_list,
                                     self.settings.video_thumbnail_indicator,
                                     self.settings.audio_thumbnail_indicator,
@@ -20346,7 +20313,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     filter_match_count,
                                     media_duration.as_deref(),
                                     self.settings.thumb_show_resume_meter,
-                                    crate::thumb_overlay_layout::ThumbnailNameStyle { font_scale: self.settings.thumb_name_font_scale_percent as f32 / 100.0, max_lines: self.settings.thumb_name_max_lines as usize },
+                                    crate::thumb_overlay_layout::ThumbnailNameStyle::from_settings(&self.settings),
                                 );
 
                                 let selected_before = self.selected == Some(idx);
@@ -20450,6 +20417,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         &self.thumbnails[idx],
                                         &tags,
                                         bookmark_time.as_deref(),
+                                        bookmark_title.as_deref(),
                                         self.items_are_drive_list,
                                         self.settings.video_thumbnail_indicator,
                                         self.settings.audio_thumbnail_indicator,
@@ -20457,7 +20425,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         filter_match_count,
                                         media_duration.as_deref(),
                                         self.settings.thumb_show_resume_meter,
-                                        crate::thumb_overlay_layout::ThumbnailNameStyle { font_scale: self.settings.thumb_name_font_scale_percent as f32 / 100.0, max_lines: self.settings.thumb_name_max_lines as usize },
+                                        crate::thumb_overlay_layout::ThumbnailNameStyle::from_settings(&self.settings),
                                     );
                                 }
 

@@ -346,6 +346,7 @@ pub(crate) fn layout_cell_overlays(
     thumb: &ThumbnailState,
     tags: &[String],
     bookmark_time: Option<&str>,
+    bookmark_title: Option<&str>,
     is_drive_list: bool,
     video_indicator: VideoThumbnailIndicator,
     audio_indicator: AudioThumbnailIndicator,
@@ -412,6 +413,7 @@ pub(crate) fn layout_cell_overlays(
             filter_match_count: filter_match_count.filter(|_| item.is_container_ratable()),
             media_duration,
             bookmark_time,
+            bookmark_title,
             upscaled_video,
             edit_badges,
             tags,
@@ -1564,6 +1566,16 @@ mod thumbnail_name_style_tests {
                         ThumbnailNameStyle {
                             font_scale: 1.5,
                             max_lines: 3,
+                            prioritize_width: false,
+                        },
+                        ThumbnailNameStyle {
+                            prioritize_width: true,
+                            ..Default::default()
+                        },
+                        ThumbnailNameStyle {
+                            font_scale: 1.5,
+                            max_lines: 3,
+                            prioritize_width: true,
                         },
                     ] {
                         let mut output = None;
@@ -1592,7 +1604,7 @@ mod thumbnail_name_style_tests {
                                                     |name_style| {
                                                         layout_cell_overlays(
                                                 ui.painter(), cell, EditBadgeFlags::default(), 4,
-                                                &item, &thumb, &tags, None, false,
+                                                &item, &thumb, &tags, None, None, false,
                                                 VideoThumbnailIndicator::BottomLeftBadge,
                                                 AudioThumbnailIndicator::default(), false, None,
                                                 None, true, name_style,
@@ -1776,7 +1788,7 @@ mod book_resume_meter_tests {
                         for _ in 0..2 {
                             output=Some(crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(),|ctx| {ctx.root_ui(|root_ui| egui::CentralPanel::default().show(root_ui,|ui| {
                             let cell=egui::Rect::from_min_size(egui::pos2(20.3,20.7),egui::vec2(width,width));
-                            let layout=layout_cell_overlays(ui.painter(),cell,EditBadgeFlags::default(),4,&item,&ThumbnailState::Pending,&[],None,false,
+                            let layout=layout_cell_overlays(ui.painter(),cell,EditBadgeFlags::default(),4,&item,&ThumbnailState::Pending,&[],None, None,false,
                                 VideoThumbnailIndicator::PlayIcon,AudioThumbnailIndicator::default(), false,None,Some("22:35"),true,
                                 crate::thumb_overlay_layout::ThumbnailNameStyle::default(),);
                             let raw=layout.book_resume_meter.unwrap(); let meter=thumbnail_resume_meter_rect(ui.painter(),&layout).unwrap();
@@ -1852,7 +1864,7 @@ mod book_resume_meter_tests {
                                             &item,
                                             &thumb,
                                             &[],
-                                            None,
+                                            None, None,
                                             false,
                                             VideoThumbnailIndicator::Hidden,
                                             AudioThumbnailIndicator::default(),
@@ -1965,6 +1977,7 @@ mod book_resume_meter_tests {
                                     &ThumbnailState::Pending,
                                     &[],
                                     None,
+                                    None,
                                     false,
                                     VideoThumbnailIndicator::Hidden,
                                     AudioThumbnailIndicator::default(),
@@ -2055,6 +2068,7 @@ mod book_resume_meter_tests {
                                         &item,
                                         &thumb,
                                         &[],
+                                        None,
                                         None,
                                         false,
                                         VideoThumbnailIndicator::Hidden,
@@ -2279,7 +2293,7 @@ mod book_resume_meter_tests {
                                                     item,
                                                     &thumb,
                                                     &[],
-                                                    None,
+                                                    None, None,
                                                     false,
                                                     VideoThumbnailIndicator::PlayIcon,
                                                     AudioThumbnailIndicator::default(),
@@ -2398,6 +2412,7 @@ mod book_resume_meter_tests {
                                     &thumb,
                                     &[],
                                     None,
+                                    None,
                                     false,
                                     VideoThumbnailIndicator::PlayIcon,
                                     AudioThumbnailIndicator::default(),
@@ -2478,6 +2493,7 @@ mod book_resume_meter_tests {
                                 &item,
                                 &ThumbnailState::Pending,
                                 &[],
+                                None,
                                 None,
                                 false,
                                 VideoThumbnailIndicator::default(),
@@ -2742,6 +2758,7 @@ mod book_resume_meter_tests {
             item,
             &thumb,
             &tags,
+            None,
             None,
             false,
             VideoThumbnailIndicator::default(),
@@ -3018,6 +3035,7 @@ mod book_resume_meter_tests {
                         &item,
                         &thumb,
                         &[],
+                        None,
                         None,
                         false,
                         VideoThumbnailIndicator::PlayIcon,
@@ -3553,6 +3571,7 @@ fn draw_video_indicator_snapshot_cell(
         thumb,
         tags,
         None,
+        None,
         false,
         indicator,
         audio_indicator,
@@ -3623,8 +3642,26 @@ fn snapshot_thumbnail(ctx: &egui::Context, name: &str) -> ThumbnailState {
 /// Fixed in-memory cells using the same name layout, drawing and hit areas as the grid.
 #[doc(hidden)]
 pub fn draw_thumbnail_name_style_snapshot_fixture(ui: &mut egui::Ui) {
+    draw_thumbnail_name_settings_snapshot(ui, false);
+}
+
+#[doc(hidden)]
+pub fn draw_thumbnail_filename_width_snapshot_fixture(ui: &mut egui::Ui) {
+    draw_thumbnail_name_settings_snapshot(ui, true);
+}
+
+fn draw_thumbnail_name_settings_snapshot(ui: &mut egui::Ui, prioritize_width: bool) {
     ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
-    ui.label("名前の文字サイズ 150% / 最大3行");
+    ui.label(if prioritize_width {
+        "ファイル名の表示幅を優先する: ON / 100% / 1行"
+    } else {
+        "名前の文字サイズ 150% / 最大3行"
+    });
+    let video_indicator = if prioritize_width {
+        VideoThumbnailIndicator::BottomLeftBadge
+    } else {
+        VideoThumbnailIndicator::PlayIcon
+    };
     let loaded = snapshot_thumbnail(ui.ctx(), "thumbnail-name-style-snapshot");
     let tags = vec!["#旅行".to_owned()];
     let cases = [
@@ -3675,16 +3712,18 @@ pub fn draw_thumbnail_name_style_snapshot_fixture(ui: &mut egui::Ui) {
                         thumb,
                         &tags,
                         None,
+                        None,
                         false,
-                        VideoThumbnailIndicator::PlayIcon,
+                        video_indicator,
                         AudioThumbnailIndicator::default(),
                         false,
                         None,
                         duration,
                         true,
                         crate::thumb_overlay_layout::ThumbnailNameStyle {
-                            font_scale: 1.5,
-                            max_lines: 3,
+                            font_scale: if prioritize_width { 1.0 } else { 1.5 },
+                            max_lines: if prioritize_width { 1 } else { 3 },
+                            prioritize_width,
                         },
                     );
                     draw_cell_with_hit_areas(
@@ -3699,7 +3738,7 @@ pub fn draw_thumbnail_name_style_snapshot_fixture(ui: &mut egui::Ui) {
                         crate::rotation_db::Rotation::None,
                         None,
                         false,
-                        VideoThumbnailIndicator::PlayIcon,
+                        video_indicator,
                         AudioThumbnailIndicator::default(),
                         false,
                         Some(0.4),
@@ -4132,6 +4171,7 @@ pub fn draw_audio_thumbnail_indicator_snapshot_fixture(ui: &mut egui::Ui) {
                     &audio,
                     &loaded,
                     &tags,
+                    None,
                     None,
                     false,
                     VideoThumbnailIndicator::Hidden,

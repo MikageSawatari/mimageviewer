@@ -4851,6 +4851,9 @@ pub struct Settings {
         deserialize_with = "deserialize_thumb_name_max_lines"
     )]
     pub thumb_name_max_lines: u32,
+    /// 形式表示を名前の直上に置き、ファイル名に全幅を使う。
+    #[serde(default)]
+    pub thumb_name_prioritize_width: bool,
     /// サムネイル右下に動画・音声の長さを表示する。
     #[serde(default = "default_true")]
     pub thumb_show_media_duration: bool,
@@ -7796,6 +7799,7 @@ impl Default for Settings {
             thumb_idle_upgrade: true,
             thumb_name_font_scale_percent: default_thumb_name_font_scale_percent(),
             thumb_name_max_lines: default_thumb_name_max_lines(),
+            thumb_name_prioritize_width: false,
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
             thumb_show_media_duration: true,
             thumb_show_resume_meter: true,
@@ -11013,18 +11017,21 @@ mod tests {
         for defaults in [Settings::default(), missing] {
             assert_eq!(defaults.thumb_name_font_scale_percent, 100);
             assert_eq!(defaults.thumb_name_max_lines, 1);
+            assert!(!defaults.thumb_name_prioritize_width);
         }
         for percent in THUMB_NAME_FONT_SCALE_PERCENT_OPTIONS {
             for lines in THUMB_NAME_MAX_LINES_MIN..=THUMB_NAME_MAX_LINES_MAX {
                 let settings = Settings {
                     thumb_name_font_scale_percent: percent,
                     thumb_name_max_lines: lines,
+                    thumb_name_prioritize_width: true,
                     ..Settings::default()
                 };
                 let restored: Settings =
                     serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
                 assert_eq!(restored.thumb_name_font_scale_percent, percent);
                 assert_eq!(restored.thumb_name_max_lines, lines);
+                assert!(restored.thumb_name_prioritize_width);
             }
         }
         for (percent, lines, expected_percent, expected_lines) in [
@@ -11059,13 +11066,14 @@ mod tests {
         db.save_full(&Settings::default()).unwrap();
         let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
         conn.execute(
-            "DELETE FROM settings_kv WHERE key IN ('thumb_name_font_scale_percent', 'thumb_name_max_lines')",
+            "DELETE FROM settings_kv WHERE key IN ('thumb_name_font_scale_percent', 'thumb_name_max_lines', 'thumb_name_prioritize_width')",
             [],
         )
         .unwrap();
         let missing = db.load_into_settings().unwrap();
         assert_eq!(missing.thumb_name_font_scale_percent, 100);
         assert_eq!(missing.thumb_name_max_lines, 1);
+        assert!(!missing.thumb_name_prioritize_width);
         for (percent, lines, expected_percent, expected_lines) in
             [(0, 0, 100, 1), (201, 5, 200, 4), (175, 3, 175, 3)]
         {
@@ -11086,6 +11094,17 @@ mod tests {
             let reread = db.load_into_settings().unwrap();
             assert_eq!(reread.thumb_name_font_scale_percent, expected_percent);
             assert_eq!(reread.thumb_name_max_lines, expected_lines);
+        }
+        for value in [true, false] {
+            let settings = Settings {
+                thumb_name_prioritize_width: value,
+                ..Settings::default()
+            };
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings().unwrap().thumb_name_prioritize_width,
+                value
+            );
         }
     }
 
