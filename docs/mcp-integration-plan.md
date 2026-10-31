@@ -2,7 +2,7 @@
 
 状態: **方針合意済み (2026-10-30、§11.1)。独立レビュー済み (§13)。段階 0 の試験実装は `mcp-trial` に
 あり (2026-10-31、独立レビュー 3 巡済み)。ChatGPT Windows アプリと Claude Desktop から tool を呼べることを利用者が確認した (段階 0 完了)。
-実装記録は `mcp-trial` 側の本書 §14。段階 1 の詳細設計は §15 (2026-10-31、独立レビュー前)。公開は段階 2 と一緒 (§11.2 U10)。**
+実装記録は `mcp-trial` 側の本書 §14。段階 1 の詳細設計は §15 (2026-10-31、独立レビュー 1 巡を反映)。公開は段階 2 と一緒 (§11.2 U10)。**
 試験実装は §11 の合意と独立レビューの後に、別 worktree (`G:\home\mimageviewer-mcp`、
 branch `mcp-trial`) で行う。master のコードには触れない。
 
@@ -274,7 +274,10 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
 - 読み取りだけでも、検索で情報を集めて AI アプリの別の tool (Web 検索・送信など) へ渡させる
   情報流出型の誘導は残る (独立レビュー P2-11)。読み取り専用は対策の保証ではない。返す列と
   error 文言を必要最小限にする。
-- 対策: 段階 0〜1 は読み取りのみ。段階 2 以降は (1) 利用者が事前に選んだ許可の範囲を超えない、
+- **許可の範囲の中の操作は確認なしで実行される** (U9)。tool の annotation も、同じユーザーだけが開ける
+  pipe も、プロンプトインジェクションによる「許可の範囲の中の操作」は防がない。利用者が選ぶ許可の範囲が
+  唯一の上限で、設定画面と案内にそう書く (段階 1 の独立レビュー P3-12)。
+- 対策: 段階 0〜1 は読み取り (段階 1c から「mIV で開く」も)。段階 2 以降は (1) 利用者が事前に選んだ許可の範囲を超えない、
   (2) 1 回の呼び出しで変えられる件数に上限 (例 500)、(3) 変更 tool の annotation は正しく
   `readOnlyHint=false` にする。呼び出しごとの確認は出さない方針で、mIV の登録も確認なしで行う
   (2026-10-31 利用者決定 U9、§11.2。確認の有無は AI アプリの設定次第)、
@@ -349,7 +352,7 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
 - AI アプリへの登録の案内と自動化は §7.5。
 - 公開文書 (§6)。
 
-### 段階 2 — 確認つきの変更
+### 段階 2 — 変更 (タグ・★・コレクション)
 
 - `add_tags` / `remove_tags` (複数項目・複数タグ)、`set_rating`、`create_collection`、
   `rename_collection`、`add_to_collection`、`remove_from_collection` (登録を外すだけ。元ファイルは
@@ -431,7 +434,7 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
   [mcp_servers.mimageviewer]
   command = 'C:\...\mimageviewer.exe'
   args = ["--mcp"]
-  default_tools_approval_mode = "writes"   # 変更 tool だけ毎回確認 (段階 2 以降で意味を持つ)
+  default_tools_approval_mode = "approve"  # 確認なし (2026-10-31 U9 で "writes" から変更、§15.6)
   ```
 - 書いた後は「ChatGPT アプリを再起動してください」と案内し、`codex://settings` を開くボタンを置く。
 - **注意 (利用者へ伝える)**: 公式文書は「ローカルで動くスレッド」で使えると書く。通常のチャットから
@@ -522,7 +525,7 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
 | tool ごとの許可設定 | 置かない。順序のある 5 段の選択 1 つ + 縮小画像の ON/OFF と、AI アプリ側の確認画面 |
 | 許可を独立したチェック欄にする | しない。上の段が下の段を含む 1 つの選択にして組み合わせを 5 通りに抑える |
 | pipe を設定に合わせて作り直す | しない。pipe は常設し、許可は要求の受付ごとに現在の設定で判定する |
-| 移動・名前変更・削除に AI 専用の確認画面や取り消し機能を作る | 作らない。事前の許可範囲 + AI アプリの確認画面 + 既存の操作経路 (ごみ箱) に任せる。完全削除は出さない |
+| 移動・名前変更・削除に AI 専用の確認画面や取り消し機能を作る | 作らない。事前の許可範囲 + 既存の操作経路 (ごみ箱) に任せる (AI アプリの確認は U9 で出さない)。完全削除は出さない |
 | まれな失敗 | 既定の割り切り (ログ + tool error) |
 
 ## 11. 利用者の判断が要る点
@@ -605,10 +608,11 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
 確認された前提: Remote の通常データ要求は操作権必須、指定した reader は worker から使える、
 純粋な読み取りを全 Remote phase で受けても cache 整合を壊さない、data dir はプロセス内で固定。
 
-## 15. 段階 1 の詳細設計 (2026-10-31 初版、独立レビュー前)
+## 15. 段階 1 の詳細設計 (2026-10-31、独立レビュー 1 巡を反映)
 
 段階 0 (`mcp-trial` の `bcbbeb352` 以降) の上に足す。利用者決定は §11.2 (U8〜U10)。
 コードの経路は 2026-10-31 に `mcp-trial` で確認した (file:line は実装 brief に書く)。
+独立レビュー 1 巡 (§15.12) の指摘を反映済み。
 
 ### 15.1 区切り
 
@@ -617,15 +621,15 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
 
 | 区切り | 内容 | 新しく借りる所有者 |
 |---|---|---|
-| 1a | 読み取り tool の拡充 (§15.3)、段階 0 の残り (§15.8) | なし (共有 reader の束と collection actor の借用だけ) |
-| 1b | フォルダ・ZIP/PDF の中の一覧と縮小画像 (§15.4) | 一覧・縮小画像の engine (§15.4) |
-| 1c | mIV で開く (§15.5) | 既存の二重起動の受付経路 |
-| 1d | 設定画面・見せる範囲の表示・AI アプリへの登録 (§15.6) | なし (UI と設定) |
-| 1e | 配布の仕組み (launcher `--mcp`、ビルド・署名・同梱) (§15.7) | なし |
+| 1a | 権限 snapshot の拡張 (§15.2)、読み取り tool の拡充 (§15.3)、出力予算 (§15.4)、段階 0 の残り (§15.9) | なし (共有 reader の束と collection actor の借用だけ) |
+| 1b | フォルダ・ZIP/PDF の中の一覧と縮小画像 (§15.5) | agent 専用の一覧・縮小画像の入口。**実装 brief の前に別の設計とレビューを通す** |
+| 1c | mIV で開く (§15.6) | 既存の二重起動の受付経路 + agent 要求の 1 回限りの応答 |
+| 1d | 設定画面・見せる範囲の表示・AI アプリへの登録 (§15.7) | なし (UI と設定) |
+| 1e | 配布の仕組み (launcher `--mcp`、portable、ビルド・署名・同梱) (§15.8) | なし |
 
 公開文書 (§6) と製品への同梱 (リリース) は段階 2 と一緒に行う (U10)。
 
-### 15.2 許可の範囲 (§5.2 の改訂)
+### 15.2 許可の範囲と権限 snapshot (§5.2 の改訂)
 
 U8 で 1 段足して 6 段にする。順序のある 1 つの選択のまま (上の段は下の段をすべて含む)。
 
@@ -636,121 +640,221 @@ U8 で 1 段足して 6 段にする。順序のある 1 つの選択のまま (
 5. 移動・名前変更まで (段階 2b)
 6. ごみ箱への削除まで (段階 2b)
 
-- 設定画面には、実装済みの段だけを出す (段階 1 では 1〜3)。設定値は未リリースなので
-  移行は要らない (`AgentLevel` に `ReadAndOpen` を足し、保存値は `"read_and_open"`)。
+- 設定画面には実装済みの段だけを出す (段階 1 では 1〜3)。設定値は未リリース (2026-10-31 時点で
+  `v4.10.1` までのタグに `agent_level` は無い、独立レビューで確認) なので移行は要らない。
+  `AgentLevel` に `ReadAndOpen` を足し、保存値は `"read_and_open"`。
 - 縮小画像 (既定 OFF) と撮影位置 (既定 OFF) のチェックは段とは別に置く (U2・U6)。
-  どちらも「読み取りのみ」以上で意味を持つ。
+- **権限 snapshot**: 段・縮小画像・撮影位置の 3 つを 1 つの値として読み、どれが変わっても epoch を進める。
+  段階 0 の「受付ごとの判定」と「送信直前の再照合」はこの snapshot 全体で行う。生成中に縮小画像や
+  撮影位置を OFF にしたら、その結果は送らず拒否に置き換える (独立レビュー P1-1)。
+- 旧版の握手の通知監視は、有効/無効の bool ではなく「その snapshot で出す tool の集合」を比べ、
+  変わったら `notifications/tools/list_changed` を送る。
+- 設定の自動転送では、新しい 2 つのチェックも `agent_level` と同じく移行対象外にする。
 
 ### 15.3 読み取り tool の拡充 (1a)
 
 tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び間違いも増える)。似た一覧は `kind` 引数で 1 つにまとめる。
 
-| tool | 内容 | 本体側の既存経路 |
+| tool | 内容 | 本体側の経路 |
 |---|---|---|
-| `get_collection` | コレクションの中身 (`id` か名前)。並びは一覧画面と同じ | collection actor の `load_collection` + `prepare_collection_snapshot_while`。Remote の view cache (`PersistentCollectionEngine::snapshot`) は使わない |
-| `list_library` | `kind` = `favorites` (お気に入りの閲覧起点) / `reading_history` (閲覧履歴) / `bookshelf` (本棚) / `bookmarks` (ブックマーク) / `rated` (★`stars` 以上) | `SharedReaders::favorites()`、`ReadingHistoryDb::list_recent`、`books::list_books`、`bookmark_browser::build_rows_readonly_*`、`RatingDb::list_by_stars`。Remote の `CollectionEngine::collection` の payload (縮小画像・横長判定の付加) は通さず、各 reader の段で投影する |
-| `get_item_info` | 1 回 50 件まで。名前・種類・大きさ・更新日時・寸法・★・タグ・EXIF・AI 生成情報 | `app::metadata_ops::run_metadata_load` (ZIP の中も扱う。可視性を `pub(crate)` に広げる)、`RatingDb` / `TagsDb` の読み取り |
+| `get_collection` | コレクションの中身 (`id` か名前)。並びは一覧画面と同じ | collection actor の `load_collection` + `prepare_collection_snapshot_while` (全項目の stat を伴うが画像の decode はしない)。Remote の view cache (`PersistentCollectionEngine::snapshot`) は使わない |
+| `list_library` | `kind` = `favorites` / `reading_history` / `bookshelf` / `bookmarks` / `rated` | 下の表 |
+| `get_item_info` | 1 回 50 件まで。名前・種類・大きさ・更新日時・寸法・★・タグ・撮影情報・AI 生成情報 | 列ごとの専用の読み取り (下) |
 
-- 本棚は本ごとのページ数を返さない (Remote は本ごとにフォルダ走査をしていて重い)。必要なら
-  AI は `list_folder` (1b) で中を見る。
-- `get_item_info` の EXIF は撮影位置の設定が OFF なら GPS の項目を落とす (本体側で落とし、MCP exe へ送らない)。
-  AI 生成情報は生成ツール名・モデル名・プロンプト・ネガティブプロンプト・主な生成条件だけを返し、
-  ComfyUI の workflow JSON そのものは返さない。プロンプトは 1 件 4,000 文字で切り、切ったことを示す。
-  UI と同じく、AI 生成情報の形式名は内部だけで使い、結果のキーは一般名にする (公開文書の規則)。
-- 全 tool で `readOnlyHint=true`。応答の文字数上限・cursor は段階 0 と同じ契約。
+`list_library` の各 kind (独立レビュー P2-4):
 
-### 15.4 フォルダ・ZIP/PDF の一覧と縮小画像 (1b)
-
-| tool | 内容 | 本体側の既存経路 |
+| kind | 経路 | 注意 |
 |---|---|---|
-| `list_folder` | フォルダ・ZIP・PDF の中を、一覧画面と同じ規則 (表示する種類の設定・並び) で返す | Remote の `ContainerEngine::folder_list` と同じ処理 (`scan_directory_with_settings` → `materialize_local_folder_listing`、ZIP/PDF は container の経路) |
-| `get_thumbnail` | 縮小画像 (WebP)。1 回 8 件まで、一辺は既定 256・最大 512 | Remote の `ThumbnailEngine::handle` と同じ処理 (ZIP/PDF の中は `ContainerEngine::thumbnail_admitted`) |
+| `favorites` | `SharedReaders::favorites()` | — |
+| `reading_history` | `ReadingHistoryDb::open_readonly().list_recent` | — |
+| `bookshelf` | **本棚の直下の本の名前と path だけを列挙する新しい関数** | 既存の `books::list_books` は本ごとに `book_page_count` を呼ぶので使わない。ページ数は返さない |
+| `bookmarks` | **ブックマーク DB の行の投影** (path・ページ・名前・登録日時) | 既存の `bookmark_browser::build_rows_readonly_*` は全件の存在確認・metadata 取得・保存画像の decode をし、取消もできないので使わない |
+| `rated` | `RatingDb` の読み取り。`stars` **以上**を返す | 既存の `list_by_stars` は完全一致。並びは「★の多い順 → 付けた日時の新しい順 → path」で固定 |
 
+`get_item_info` は `app::metadata_ops::run_metadata_load` を**使わない** (独立レビュー P2-5。XMP で
+ファイル全体を読み、ZIP の中の画像を全展開し、大きさ・寸法を揃える関数でもない)。列ごとに必要な読み取りだけをする:
+
+| 列 | 経路 |
+|---|---|
+| 名前・種類・大きさ・更新日時 | `std::fs::metadata` (ZIP/PDF の中の項目は container の情報) |
+| 寸法 | 画像の header を読む既存関数 (`file_image_dims`。RAW は既存の `raw_decoder::info`) |
+| ★・タグ | `RatingDb` / `TagsDb` の読み取り (段階 0 の `enrich` と同じ) |
+| 撮影情報 | `exif_reader::read_exif` (JPEG は先頭の範囲だけ読む) を下の許可表で投影 |
+| AI 生成情報 | `png_metadata::extract_metadata` を下の許可表で投影 |
+| XMP・外部 sidecar | 段階 1 では読まない |
+
+- 項目の指定は path と任意の subresource (ZIP の中の項目・PDF のページ)。core はそれを検証してから
+  内部の項目 (`GridItem`) を作る。規則は実装 brief で既存の `GridItem` 生成経路から決める。
+- **送出列の許可表** (独立レビュー P2-2): core は既知の一般項目だけを投影し、それ以外は送らない。
+  - 撮影情報: 機種・メーカー・レンズ・撮影日時・露出時間・F 値・ISO・焦点距離・向き。
+    撮影位置 (緯度・経度・高度) は撮影位置の設定が ON の時だけ。`UserComment`・MakerNote・未知のタグは送らない。
+  - AI 生成情報: 生成ツール名・モデル名・プロンプト・ネガティブプロンプト・主な生成条件 (seed・steps・
+    sampler・CFG・寸法)。生の JSON (`raw` / `prompt_json` / `workflow_json`)・未知のチャンク・生の
+    `UserComment` は送らない。結果のキーは一般名にし、生成ツール固有の形式名は出さない (公開文書の規則)。
+- 全 tool で `readOnlyHint=true`。
+
+### 15.4 出力予算・期限・取消 (1a、全 tool 共通)
+
+- **文字の予算** (独立レビュー P2-6): 段階 0 の 1 ページ 8,000 文字 (core) では、プロンプトの長い項目 1 件で
+  上限を超える。1 ページの予算を定め直し、項目ごとにも予算を持つ。長いフィールド (プロンプト等) は
+  項目の予算に収まるよう切り、切ったことを示す。1 項目が予算を超えても error にせず切って返す。
+  続きは実際に返した件数で cursor を作る。
+- cursor は大きな引数 (50 件の path 等) を中に複製せず、正規化した引数の digest で照合する
+  (cursor の 8,192 文字上限に収まり、exe 側に状態を持たない)。
+- 期限と取消: 段階 0 では 20 秒の応答期限は検索だけだった。**全 tool に応答期限と協調取消を付け**、
+  worker が実際に止まるまで同時実行枠を保持する。フォルダ走査など取消を受け取らない既存関数は、
+  取消を受ける形にしてから使う (1b)。
+
+### 15.5 フォルダ・ZIP/PDF の一覧と縮小画像 (1b)
+
+| tool | 内容 |
+|---|---|
+| `list_folder` | フォルダ・ZIP・PDF の中を、一覧画面と同じ規則 (表示する種類の設定・本の構成の順序と非表示) で返す |
+| `get_thumbnail` | 縮小画像 (WebP)。一辺は既定 256・最大 512。収まる件数だけ返し続きは cursor |
+
+- **所有者の方針** (独立レビュー P2-3): Remote の `ContainerEngine` / `ThumbnailEngine` を丸ごと共有も、
+  そのまま別 instance も不十分。`ContainerEngine` の列挙は読書位置を Remote の session 経由で UI へ問い合わせ、
+  session 無しの別 instance では本の構成の順序・非表示を失う。共有すると Remote が止める RAW 現像の寿命も
+  共有してしまう。よって **agent 専用の入口を作り、列挙と縮小画像の必要部分を session に依存しない形に分け、
+  本の構成の snapshot は既存の所有者から直接借りる**。
+  - 共有するもの: 設定の reader、既存の RAW 現像 executor、プロセス共通の I/O の上限、PDF worker pool。
+  - 分けるもの: 取消、要求の識別、lane 固有の cache。
+  - 守るもの: catalog DB への書き込みは既存のサムネイル生成と同じ admission と保存方針、表示状態に触れない、
+    Remote の cache 整合を壊さない。
+  - 受け入れ条件: Remote と同時に使える、片方の取消が他方に効かない、終了順 (agent → Remote → actor) で止まる。
+  - これは Remote の container のコードの分割を伴うので、**1b の実装 brief の前に別の設計とレビューを通す**。
+- **画像の予算** (独立レビュー P2-7): 画像は MCP の `content` の image block (`image/webp`) にだけ置き、
+  text と `structuredContent` には項目の識別と寸法だけを置く (段階 0 の「同じ JSON を text にも入れる」に
+  画像を含めない)。1 回の結果の画像の合計 (base64 にした後) に上限を設け、収まる件数で返して続きは cursor。
+  MCP exe の最終 JSON の文字数上限は text 部分にだけ掛け、agent IPC の frame 上限は画像の上限に合わせて決める。
+  WebP をそのまま返す (Claude・OpenAI とも WebP の画像入力を受ける。変換を足さない)。§5.4 の「JPEG」は WebP に改めた。
 - `get_thumbnail` は「AI に縮小画像を見せる」が ON の時だけ `tools/list` に出し、OFF なら拒否する。
-  結果は MCP の image content (`image/webp`)。§5.4 の「JPEG」は WebP に改める (本体のキャッシュが WebP で、
-  Claude・OpenAI とも WebP の画像入力を受ける。変換を足さない)。
-- 所有者: `ContainerEngine` と `ThumbnailEngine` は今は Remote の server 起動時 (`ServerGuard::start`) にだけ作られ、
-  Remote の session 識別子と取消を前提にしている。**agent 用に同じ型の instance を別に作るか、
-  Remote と共有する束へ移すかは、1b の実装 brief を書く前にコードで確かめ、独立レビューで決める**。
-  どちらでも次を守る: catalog DB への書き込みは本体のサムネイル生成と同じ経路だけ、
-  PDF worker・RAW 現像の同時実行は既存の上限に従う、表示状態に触れない、Remote の cache 整合を壊さない。
-- 縮小画像の生成は重い。同時実行枠 (接続ごと 1・全体 2) と 20 秒の期限は段階 0 と同じ。
 
-### 15.5 mIV で開く (1c)
+### 15.6 mIV で開く (1c)
 
-- `open_in_viewer(path)`: 許可の範囲が 3 以上の時だけ出す。`readOnlyHint=false`・`destructiveHint=false`・
-  `idempotentHint=true` (annotation は実際の性質のまま。確認を出さないのは登録側の設定で行う、U9)。
-- 経路は二重起動で開くのと同じ: agent worker が `ActivationOpenPath` を App の
-  `activation_open_path_tx` へ送り repaint を要求する。UI thread の `poll_activation_open_paths` が
-  既存の判定 (Remote 所有中・モーダル中・sidecar) をして `start_startup_open_path_resolve` を呼ぶ。
-  **新しい open 経路は作らない** (§4.1)。detached viewer の述語・viewport 経路には触れない。
-- 結果は「開くよう依頼した」だけを返す (UI での判定結果は待たない。待つための相関 id や完了通知を作らない)。
-  ただし受付前に Remote の phase が `Local` 以外なら、送らずに「リモート接続中のため開けません」を返す。
-  存在しない path は送る前に拒否する。
-- `ActivationOpenPath` の作り方 (`received(path, remote_session)`) の第 2 引数の意味をコードで確かめてから
-  brief に書く。
+- `open_in_viewer(path)`: 許可の範囲が 3 以上の時だけ出す。annotation は実際の性質のまま
+  (`readOnlyHint=false`・`destructiveHint=false`・`idempotentHint=true`)。確認を出さないのは登録側の設定で行う (U9)。
+- 経路は二重起動で開くのと同じ受付 (`activation_open_path_tx` → UI thread の `poll_activation_open_paths` →
+  `start_startup_open_path_resolve`)。**新しい open 経路は作らない** (§4.1)。detached viewer の述語・viewport 経路は
+  変えない (既存経路の中でそれらが使われるのはそのまま)。
+- **受付の結果を返す** (独立レビュー P2-8): 既存の受付は、本の構成 editor 中は破棄、文書を開くモーダル中は保留、
+  sidecar の復元中は破棄し、複数の要求は最後の 1 件だけを採る。どれも通常の使い方で起こる。よって agent 由来の
+  要求には **1 回限りの応答の口**を付け、UI thread が既存の判定をした時点で「受け付けた / 拒否 (理由)」を返してから
+  既存の resolver へ渡す。表示の完了は待たない。
+  - agent 由来の要求は保留しない (モーダル中は保留ではなく拒否)。保留が無いので、保留中の権限取消という組み合わせも無い。
+  - UI thread での受付時に権限 snapshot を再照合する。
+  - 後から来た要求に置き換えられた agent 要求には「別の要求で置き換えられました」を返す。
+  - `ActivationOpenPath::received` の第 2 引数は Remote session の snapshot 取得用。二重起動と同じく
+    `Some(&session)` を渡し、取得世代を保つ (`None` は「Local 指定」の意味ではない)。
+  - 二重起動と同じく mIV の窓を前面に出す。
+  - 応答を待つ時間には上限を置き、超えたら「mIV が応答しません」を返す (まれな失敗、既定の割り切り)。
+- 受付前に分かる拒否 (Remote の phase が `Local` 以外、存在しない path) は UI へ送らずに返す。
 
-### 15.6 設定画面・見せる範囲・AI アプリへの登録 (1d)
+### 15.7 設定画面・見せる範囲・AI アプリへの登録 (1d)
 
 - 環境設定の「AI 連携」ページ (§7.5.3) を本実装にする。段階 0 の 1 行の選択を置き換える。
   - 許可の範囲 (§15.2、実装済みの段だけ)、縮小画像・撮影位置のチェック。
   - 見せる範囲の 3 欄 (§5.6)。設定から生成し、変えるとその場で変わる。
-  - 接続中の AI アプリ名 (MCP の `clientInfo`) と最後に使われた時刻 (保存しない)。
-    MCP exe が握手で受けた `clientInfo.name` / `version` を agent IPC の握手で core へ渡す
-    (agent IPC の版を 2 に上げる。未リリースなので旧版との互換は持たない)。
+  - 許可の範囲の中の操作は確認なしで実行されることと、それが唯一の上限であることを書く (§5.5)。
+  - **「最近使った AI アプリ」** (独立レビュー P2-10): アプリ名・版と、最後に tool を実行した時刻 (保存しない)。
+    MCP exe は要求ごとに pipe を開き直すので「接続中」は表せない。内部の状態照会は時刻に数えない。
+    `clientInfo` は旧版では握手の値を接続の間保持し、2026-07-28 では各要求の `_meta` から取り、
+    どちらも agent IPC の各要求で core へ渡す (agent IPC の版を 2 に上げる。未リリースなので互換は持たない)。
+    自己申告の値なので長さを制限し、表示は参考情報と明記する。
   - AI アプリごとの行 (Claude Desktop / ChatGPT): 検出・登録状態・「登録する」「登録を外す」「手順を見る」。
-- 登録の自動化 (§7.5.1 A / §7.5.2 の手順どおり) に U9 を加える:
+- 登録の自動化 (§7.5.1 A / §7.5.2) に U9 と独立レビュー P2-11 を加える:
+  - **書き込む前に対象のアプリが終わっていることを確かめる**。Claude は `claude.exe`、ChatGPT は ChatGPT アプリと
+    同じ設定ファイルを使う Codex CLI・IDE 拡張も止めてもらう (共有の `config.toml` を他方と同時に書き換えると、
+    `.bak` と rename だけでは他方の変更を残せない)。動いていれば書かずに案内する。終了の待ち合わせ・自動終了はしない。
+    書く直前にファイルを読み直す。
   - ChatGPT (Codex): `[mcp_servers.mimageviewer]` に `default_tools_approval_mode = "approve"` を書く
-    (公式文書は値として `auto` / `prompt` / `writes` / `approve` を挙げ、`approve` を tool 単位で使う例がある。
-    `approve` が「確認なしで許可」であることは文書で明言されておらず、1d で Codex CLI の実動作で確かめる。未確認)。
-  - Claude Desktop: 設定ファイルに tool ごとの許可を書く項目は無い (文書で確認できない)。初回の確認画面で
-    「常に許可」を選ぶよう、案内の文に書く。
+    (公式の設定リファレンスに有効な値として載っている。「確認なしで許可」の意味は文書で明言されておらず、
+    1d で Codex CLI の実動作で確かめる。未確認)。
+  - Claude Desktop: 設定ファイルに tool ごとの許可を書く項目は文書で確認できない。初回の確認画面で
+    「常に許可」を選ぶよう案内の文に書く。
   - 書き換えるファイルと書く内容を、押した時に表示して確認する (§7.5.3)。
-- 書く `command` は段階 1 では開発用の位置 (portable smoke・`target`) を指せればよく、配布物の位置
-  (`mimageviewer.exe --mcp`) は 1e の後に切り替える。
+- 書く `command` は配布形態ごとに決める (§15.8)。1e までは開発用の位置 (portable smoke・`target`) を指す。
 - UI の規則 (coding-conventions): ダイアログ・配色・IME・UI thread で設定ファイルを読まない
   (検出と登録状態の判定は worker)、スナップショット更新、`check_ui_glyphs.py`。
 
-### 15.7 配布の仕組み (1e)
+### 15.8 配布の仕組み (1e)
 
-§7 段階 1 の「配布」の契約どおり。コード上の差し込み位置 (2026-10-31 確認):
+§7 段階 1 の「配布」の契約に、配布形態ごとの登録先を加える (独立レビュー P2-9)。
+
+| 配布形態 | AI アプリに登録する command | 理由 |
+|---|---|---|
+| インストーラ版・単体 exe 版 | `mimageviewer.exe --mcp` (launcher) | runtime フォルダが版ごとに変わるので、利用者が置いた launcher を指す |
+| ポータブル版 (zip) | 同梱の `mimageviewer-mcp.exe` を直接、解決済みの `--data-dir` を必ず付ける | ポータブル版の `mimageviewer.exe` は core を改名したもので launcher ではない |
+
+コード上の差し込み位置 (2026-10-31 確認):
 
 - launcher: `#![windows_subsystem = "windows"]` のまま。`--mcp` は既存 core の activate 判定
   (`try_activate_existing`) より前で分岐する。内包対象の表 (`ASSETS`) と `build.rs` の
   `target/release/*.exe` 読み込みに `mimageviewer-mcp.exe` を足す。
-- `scripts/build-release.ps1`: core → remote → EPUB worker → **MCP** → launcher。内側の exe の署名一覧に MCP を足す。
-- `scripts/build-dist.ps1` の PE 一覧、`scripts/build-portable.ps1` の同梱一覧と署名一覧に足す。
+- `scripts/build-release.ps1`: core → remote → EPUB worker → **MCP** → launcher。内側の exe の署名一覧と、
+  release 側の PE 検査一覧に MCP を足す。
+- `scripts/build-dist.ps1`: PE 一覧と、配布前の clean 対象に足す。
+- `scripts/build-portable.ps1`: portable 用 target での MCP のビルド、同梱一覧、署名一覧に足す。
 - `test-full.ps1` の前提 (CLAUDE.md の「`target\release` に 3 本」) が 4 本になる。CLAUDE.md・
   development-build-and-test の記述も同時に直す。
 - 1e までは配布物に入れて作れるところまでで、公開しない (U10)。
 
-### 15.8 段階 0 の残り (1a で直す)
+### 15.9 段階 0 の残り (1a で直す)
 
 - 範囲外の `limit`: 0 は拒否のまま、200 を超える値は 200 に丸める (Codex のモデルが `limit: 1000` を送った、§14)。
   schema の `maximum` は残し、説明文に「最大 200」と書く。core 側の `limit_value` も同じ規則にする。
 - 旧版の握手で接続したクライアント向けの 1 秒ごとの状態照会: **5 秒に延ばすだけにする**。push 通知
   (core から MCP exe へ設定変更を知らせる口) は作らない。許可は要求ごとに core が判定するので、
   `tools/list` の表示が数秒遅れても許可外の操作はできない。照会の間隔は短くするほど負荷が増え、
-  push は接続・取消・終了の組み合わせを増やすため (状態を減らす)。
+  push は接続・取消・終了の組み合わせを増やすため (状態を減らす)。比べる対象は §15.2 の tool の集合。
 
-### 15.9 検証
+### 15.10 検証
 
 - 自動テスト: 段階 0 と同じ構成 (版ごとの JSON-RPC、schema、codec、fixture の handler、stdio 結合)。
   新しい tool ごとに fixture を足す (コレクション・閲覧履歴・本棚・ブックマーク・★・PNG の tEXt と
-  JPEG の EXIF (GPS 付き)・ZIP の本)。GPS は設定 OFF で落ちること、縮小画像は OFF で出ないことを検査する。
+  JPEG の EXIF (GPS 付き)・ZIP の本)。次を検査する:
+  - 撮影位置が設定 OFF で落ちること、生 JSON・`UserComment`・未知のチャンクが出ないこと。
+  - 生成中に縮小画像・撮影位置を OFF にした結果が送られないこと (権限 snapshot)。
+  - 長いプロンプトでも 1 ページに収まり、切ったことが示されること。cursor が上限に収まること。
+  - `open_in_viewer` が本の構成 editor 中・モーダル中・sidecar 復元中に拒否を返し、置き換えにも応答が返ること。
 - 実 core: `.\scripts\prepare-portable-smoke.ps1` で作り直した使い捨て portable と
   `.\scripts\mcp-client-smoke.ps1` (tool ごとの依頼文を `-PromptFile` で渡す)。core を変えたら portable を作り直す。
 - 実アプリ (Claude Desktop / ChatGPT) の確認は 1d (登録の自動化) の後に 1 回だけ利用者に頼む (§9.2)。
 
-### 15.10 状態を減らす検討
+### 15.11 状態を減らす検討
 
 | 検討 | 結論 |
 |---|---|
 | 一覧ごとに tool を分ける | 分けない。`list_library` の `kind` にまとめる |
-| 「mIV で開く」の結果を UI の判定まで待って返す | 待たない。相関 id と完了通知が要り、Remote・モーダルとの組み合わせが増える。受付前に分かる拒否 (Remote・存在しない path) だけ返す |
+| 「mIV で開く」の表示完了まで待って返す | 待たない。UI の受付の判定だけを 1 回限りの応答で返す |
+| 「mIV で開く」をモーダル中は保留する (二重起動と同じ) | しない。agent 要求は拒否で返す。保留中の権限取消という組み合わせが消える |
 | 設定変更を MCP exe へ push で知らせる | しない。照会を 5 秒にする |
 | 縮小画像を JPEG に変換して返す | しない。キャッシュの WebP をそのまま返す |
-| 「mIV で開く」を独立したチェックにする | しない。許可の範囲の 1 段にする (組み合わせが増えない) |
+| 「mIV で開く」を独立したチェックにする | しない。許可の範囲の 1 段にする |
 | 未実装の段も設定画面に出す | 出さない。実装済みの段だけ |
+| 「接続中の AI アプリ」を表示する | しない。pipe は要求ごとに開き直すので「最近使った」にする |
+| cursor に引数を複製する | しない。正規化した引数の digest で照合する |
 
 まれな失敗は既定の割り切り (ログ + tool error)。
+
+### 15.12 独立レビュー (2026-10-31、gpt-6.1-sol / xhigh、設計 `c2d77e49c`・実装 `0916f0452`)
+
+| 指摘 | 判断 | 反映先 |
+|---|---|---|
+| P1-1 追加の 2 つの許可が失効判定に入っていない | 妥当 (`settings_db.rs` の snapshot と epoch は `agent_level` だけ) | §15.2 |
+| P2-2 GPS 除去・workflow 非公開は全メタ情報の許可表が要る | 妥当 (sidecar の生 JSON、`raw` / `workflow_json`、`UserComment`) | §15.3 |
+| P2-3 1b は engine の丸ごと共有でも別 instance でも足りない | 妥当。agent 専用の入口 + 本の構成 snapshot の借用。1b は別に設計 | §15.5 |
+| P2-4 `list_books` はページ数を数え、ブックマークの行構築は画像を decode する。`list_by_stars` は完全一致 | 妥当 (コードで確認) | §15.3 |
+| P2-5 `run_metadata_load` は重く、期限は検索だけ、フォルダ走査は取消を受けない | 妥当。列ごとの読み取り、全 tool に期限と取消 | §15.3、§15.4 |
+| P2-6 4,000 文字のプロンプトと 8,000 文字のページ、cursor の上限 | 妥当。項目の予算・切り詰め・digest | §15.4 |
+| P2-7 画像に別の予算が要る | 妥当 | §15.5 |
+| P2-8 `open_in_viewer` は通常の拒否も返す必要 | 妥当 (本の構成 editor・モーダル・sidecar 復元・最後の 1 件。コードで確認) | §15.6 |
+| P2-9 portable 版では launcher の `--mcp` が無い | 妥当。配布形態ごとの登録先、portable のビルド・clean・PE 検査 | §15.8 |
+| P2-10 「接続中」は今の pipe の寿命では表せない | 妥当。「最近使った AI アプリ」 | §15.7 |
+| P2-11 Codex の共有設定も書き込み主体を 1 つに | 妥当。登録前に関係するアプリを止めてもらう | §15.7 |
+| P3-12 U9 後も旧記述が残る | 妥当 | §5.5、§7 段階 2 の見出し、§7.5.2、§10 |
+
+確認された前提: 共有 reader の束・readonly の閲覧履歴・★・タグ・collection actor の借用は worker から使え、
+第二の settings 接続は要らない。6 段の許可と実装済みの段だけの表示は妥当。`agent_level` は未リリース。
+既存の activation の入口の再利用は新しい detached 述語・viewport 分岐を要しない。`approve` は有効な設定値。
+ビルド順・内包前の署名は妥当。`limit` の丸めと 5 秒の照会は妥当。
