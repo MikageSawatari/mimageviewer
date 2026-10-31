@@ -1,8 +1,8 @@
 # AI 連携 (MCP) 計画書
 
 状態: **方針合意済み (2026-10-30、§11.1)。独立レビュー済み (§13)。段階 0 の試験実装は `mcp-trial` に
-あり (2026-10-31、独立レビュー 3 巡済み)。ChatGPT Windows アプリから tool を呼べることを利用者が確認した。
-Claude Desktop からは未確認。実装記録は `mcp-trial` 側の本書 §14。**
+あり (2026-10-31、独立レビュー 3 巡済み)。ChatGPT Windows アプリと Claude Desktop から tool を呼べることを利用者が確認した (段階 0 完了)。
+実装記録は `mcp-trial` 側の本書 §14。**
 試験実装は §11 の合意と独立レビューの後に、別 worktree (`G:\home\mimageviewer-mcp`、
 branch `mcp-trial`) で行う。master のコードには触れない。
 
@@ -507,8 +507,8 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
 
 本書の §11 が合意済み、独立レビュー済み、段階 0 の tool を AI クライアントから隔離起動の本体へ
 呼べたログがある、利用者の Claude Desktop での確認結果 (成否) が記録されている。
-2026-10-31 時点: Codex CLI からの呼び出しログあり、ChatGPT アプリは利用者が確認済み、
-Claude Desktop は利用者の再起動待ち。
+2026-10-31 時点: Codex CLI からの呼び出しログあり、ChatGPT アプリと Claude Desktop は利用者が確認済み
+(段階 0 の完了条件を満たした)。
 
 ## 10. 状態を減らす検討の記録
 
