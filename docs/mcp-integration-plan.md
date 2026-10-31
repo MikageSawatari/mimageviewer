@@ -1613,6 +1613,8 @@ MCP の exe は console subsystem・CRT 静的リンク (DLL 不要)・引数は
   新しい console の窓が出るため)。展開の lock は起動の直後に離し、**利用 lease は子が終わるまで持つ** (使用中の版の runtime を
   古い版の掃除が消さない。掃除は動いている process の image がある木も残す既存の守りもある)。`Handoff` (core の起動完了の合図) は
   使わない。
+- **`--mcp` の間は名前付き mutex `Global\mImageViewerMcp_v1` を持つ** (子が終わるまで。設計レビュー 15 巡目 P2-2)。AI アプリが MCP を
+  使っている間は launcher も動き続け、インストール先の `mimageviewer.exe` が使用中になる。インストーラはこの mutex で検出する (下)。
 - 子の終了コードをそのまま launcher の終了コードにする。`--mcp` の経路の失敗 (展開・起動の失敗) は**標準エラーに 1 行**出して
   終了コード 1。通常の起動の失敗で出す MessageBox と `AttachConsole` は使わない (AI アプリの裏で窓を出さない)。
 - `crates/launcher/build.rs` の入力 (`target/release/*.exe`) と `ASSETS`・`include_bytes!` に MCP の exe を足す。入力が無い時の案内に
@@ -1623,16 +1625,23 @@ MCP の exe は console subsystem・CRT 静的リンク (DLL 不要)・引数は
 | スクリプト | 変更 |
 |---|---|
 | `build-release.ps1` / `.sh` | 順序を core → remote → EPUB worker → **MCP** → launcher にする。内側の exe の署名の一覧・release の PE 検査の一覧・止める process の名前の一覧に MCP を足す |
-| `build-dist.ps1` | 配布前の clean (`target`・`target-portable` の両方) と最後の PE 検査の一覧に足す。**動いている process で build を拒む一覧には足さない** (AI アプリが登録した MCP は普段から動いているので、dist build を拒み続けることになる) |
+| `build-dist.ps1` | 配布前の clean (`target`・`target-portable` の両方) と最後の PE 検査の一覧に足す。動いている process で build を拒む判定は、下の path の規則に従う |
 | `build-portable.ps1` | portable の target での MCP のビルド、同梱の一覧 (`mimageviewer-mcp.exe` の名前のまま)、署名の一覧、止める一覧に足す |
 | `build-dev.ps1` | `target\dev-runtime\` に MCP の exe も作る (1d の「登録する」が core の横の MCP の exe を使うため)。止める一覧・PE 検査に足す |
 | 安全性のテスト (`test-release-build-safety.ps1`・`test-build-dev-safety.ps1`) | 件数・順序の検査を 4 本に直し、MCP の検査を足す |
 
-- **止める process は既存の「名前 + build が書く path の下」の絞り込みに乗せる**。AI アプリが**インストール版の runtime から**起動した
-  MCP の exe (path が build の出力の外) は止めない。path を取れない process を止める既存の扱いが、普通の権限で動く AI アプリ由来の
-  MCP に及ばないことを確かめる。
-- インストーラ (`installer/mimageviewer.iss`) は launcher だけを入れているので中身は変えず、内包する exe を列挙したコメントを直す。
-  `installer/readme.txt`・`installer/readme_portable.txt` のファイル一覧に MCP の exe を足す。
+- **launcher と MCP の exe を止める・build を拒む対象は、その build が書き換える出力の path と一致する process だけ**
+  (設計レビュー 15 巡目 P2-1)。AI アプリがインストール版から起動した launcher (`--mcp` で常駐) と MCP の exe は、path が build の
+  出力の外なので対象にしない。この 2 つについては **path を取れない process は止めない・拒まない** (既存の「path 不明なら止める」は
+  他の名前だけに残す)。`build-release.sh` の名前だけの `taskkill`、release・portable の `PreserveRuntime` の判定 (今は path で絞る前の
+  一覧を見ている)、`build-dist.ps1` の拒む一覧も同じ規則にそろえる。テスト: インストール先の launcher・MCP の親子は対象外、
+  build の出力の exe は対象、path 不明は対象外、を mock の process 一覧で確かめる。
+- **インストーラ** (`installer/mimageviewer.iss`): 既存の独自の確認 (core の mutex を開いて終了を頼む) の後に、
+  `Global\mImageViewerMcp_v1` を `OpenMutexW` で確かめ、在れば「AI アプリ (Claude・ChatGPT など) が mImageViewer を使っています。
+  AI アプリを終了してから、もう一度実行してください」と出して中止する (更新とアンインストールの両方。自動の終了・再接続は作らない。
+  通常の操作で起こる組み合わせを、終了してもらう契約で無くす)。内包する exe を列挙したコメントも直す。
+  単体 exe 版を手で置き換える時と portable を置き換える時も同じ契約で、`installer/readme.txt`・`installer/readme_portable.txt` に
+  「AI アプリを終了してから置き換えてください」と書き、ファイル一覧に MCP の exe を足す。
 - `test-full.ps1` の前提 (`target\release` の exe) が 3 本から 4 本になる。CLAUDE.md・`development-build-and-test.md`・
   `native-dependencies.md`・`release-checklist.md`・`release-operations.md`・`portable-build-plan.md` の該当の記述 (ビルドの順序・
   前提の本数・署名の一覧・内包の木) を同時に直す。
@@ -1643,10 +1652,17 @@ MCP の exe は console subsystem・CRT 静的リンク (DLL 不要)・引数は
 
 - launcher の `--mcp` の分岐 (引数の受け渡し・lease を子の終了まで持つ・終了コード・失敗を標準エラーへ・MessageBox を出さない) を、
   runtime フォルダと子の起動を注入できる形にして単体テストする。
-- 配布物の全体は、利用者のデータに触れない形で 1 回だけ確かめる: `build-release.ps1` で作った launcher を、`APPDATA` を一時フォルダに
-  向けた環境で `--mcp --data-dir <隔離の data>` で起動し (core は起動しない。runtime の展開先も一時フォルダの下になる)、
-  `scripts/mcp-client-smoke.ps1` 相当で Codex CLI から tool を呼ぶ。隔離した data dir の起動は許されている (利用者の設定・
-  runtime に触れない) という判断で行い、この判断も独立レビューで確かめる。
+- 配布物の全体は、利用者のデータに触れない形で確かめる (UI を伴わない `--mcp` の通信試験として、下の隔離の条件を固定する。
+  設計レビュー 15 巡目で妥当と確認):
+  - launcher だけ: `build-release.ps1` で作った launcher を、`APPDATA` を一時フォルダに向けた環境で `--mcp --data-dir <隔離の data>` で
+    起動し、標準入出力の握手・core が無い時の応答 (起動していない旨)・標準入力の EOF での終了・終了コードを確かめる
+    (runtime の展開先・lock は一時フォルダの下、named pipe は data dir と SID から決まるので既存の core と分かれる)。
+  - tool の成功: 使い捨ての portable の core を `--data-dir` 付きで起動しておき、上の launcher をその data dir で `--mcp` 起動して
+    Codex CLI から tool を呼ぶ (adapter は起動済みの core に繋ぐだけなので、core が要る)。`mcp_client_smoke.py` に、exe の前に置く
+    引数 (`--mcp`) を渡す口を足す。
+  - Codex CLI は**利用者の通常の MCP の登録を読まない**構成で使う (`mcp_servers` の表全体を上書きする等。他の登録済みの server を
+    起動しない)。その方法を確かめられなければ、利用者の `config.toml` に mIV 以外の MCP の登録が無いことを確かめてから使う。
+  - 確かめる時に、launcher の起動の前後で利用者の `%APPDATA%\mimageviewer\runtime` が変わらないことを見る。
 - portable は `prepare-portable-smoke.ps1` で作り直し、同梱の `mimageviewer-mcp.exe` を `mcp_client_smoke.py --exe` で指して確かめる。
 
 ### 15.9 段階 0 の残り (1a で直す)
@@ -1837,6 +1853,17 @@ Susie の初期化の待ちを既存の枠の保持で扱うことは妥当と�
 `Hello` の応答は IPC の版だけで、内部の状態の照会には許可の判定が残るので、無効の時の `tools/list` の挙動は変わらない、と確認された。
 
 14 巡目 (設計 `3286c8090`): 追加の指摘なし。判定は「1d: ready」。
+
+### 15.22 独立レビュー 15 巡目 (2026-11-01、同じ担当、1e)
+
+判定は「1e: not ready」。launcher の `--mcp` の分岐の位置・MCP だけの展開・lock の順序・子の終了までの lease・`Stdio::inherit()` +
+`CREATE_NO_WINDOW`・終了コード・標準エラーだけの失敗は妥当、隔離した `APPDATA` での `--mcp` の通信試験も規則の対象外として妥当とされた。
+
+| 指摘 | 判断 | 反映先 |
+|---|---|---|
+| P2-1 止める・拒む一覧が名前だけの経路 (`.sh`・`PreserveRuntime`・build-dist) を含み、常駐の launcher も拒まれる | 妥当。launcher と MCP は出力の path と一致するものだけ、path 不明は対象外 | §15.8 スクリプト |
+| P2-2 常駐の launcher で更新・アンインストールの時にファイルが使用中 | 妥当。`--mcp` の間 mutex を持ち、インストーラが検出して「AI アプリを終了して」と中止 | §15.8 launcher・インストーラ |
+| P2-3 core を起動しない検証では tool の成功を確かめられない | 妥当。launcher 単独と、起動済みの portable の core への接続に分ける。通常の登録を読まない | §15.8 確かめ方 |
 
 ## 16. 段階 1a の実装記録 (2026-10-31、基点 `17c85bb3a`、未コミット差分)
 
