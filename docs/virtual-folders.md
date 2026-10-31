@@ -535,6 +535,17 @@ Everything の結果帰路は既存の明示復元を使い、synthetic surface 
 操作の組み合わせを増やす変更ではないため、新たな modal も不要。まれな失敗は既定の
 ログ・通知の方針を維持し、未採用・取消・失敗のための回復機構を追加しない。
 
+ZIP 内の軽量階層移動は `install_loading_items_inner` を通らない。
+`install_zip_current_level` でも、移動先の `zip_nav` が確定した後、可視列を作る前に
+`maybe_restore_rating_filter_after_zip_level_change` を 1 回呼ぶ（§1.671 追加P2）。
+範囲判定は論理 archive root / 実効 prefix のキーだけを使い、後段のアドレス表示や
+見開き設定の読込には依存しない。解除後に二度目の可視列再構築を追加しない。
+Direct PDF のパスワード待ちは未採用なので、Cancel / Parked でも元の本の一時解除・
+可視列を保持する。既に PDF / 空の shell を採用した Legacy の終端解除は維持する。
+Everything 起点の入れ子階層は、通常mainで履歴sourceを得られず項目の採用が止まる
+別の未解決境界がある。今回の階層帰路修正の成功範囲には含めず、詳細と再現証拠は
+[§1.671追補](next-release-backlog.md) に記録する。
+
 直接閲覧 RAR/CBR は `current_folder` がheaderで確定した元アーカイブ（分割なら先頭volume）を指す。
 typedな履歴／一覧遷移ではクリックした論理pathを`archive_source_override`へ保持する経路もあるが、
 読込・ページ・読書位置keyは実際のRAR backingのままにする。現在開いているコンテナの判定には

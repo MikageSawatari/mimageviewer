@@ -4,6 +4,229 @@ use super::*;
 
 const FIVE: [bool; 6] = [false, false, false, false, false, true];
 
+fn grid_key(app: &mut App, key: egui::Key, modifiers: egui::Modifiers) {
+    let ctx = egui::Context::default();
+    ctx.begin_pass(egui::RawInput {
+        events: vec![
+            egui::Event::ModifiersChanged(modifiers),
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            },
+        ],
+        ..Default::default()
+    });
+    assert!(
+        app.handle_keyboard(&ctx).is_none(),
+        "ZIP hierarchy navigation is consumed by its owner"
+    );
+    ctx.end_pass().drop_without_applying_deltas();
+}
+
+fn zip_level_return(converted: bool, nested: bool, everything: bool, dfs: bool) {
+    use std::io::Write as _;
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    app.active_quick_folder_slot = None;
+    app.settings.detached_viewer_open_images_in_window = false;
+    app.settings.auto_fullscreen_zip_pdf = false;
+    app.settings.sort_order = crate::settings::SortOrder::FileName;
+    let root = app.tmp.path().join("zip-level-return");
+    std::fs::create_dir(&root).unwrap();
+    let (row, backing) = fixture(
+        &mut app,
+        &root,
+        if converted {
+            Book::Converted
+        } else {
+            Book::Zip
+        },
+    );
+    let source = row.drag_source_path().unwrap().to_path_buf();
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbImage::new(2, 2)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let mut inner = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    inner
+        .start_file("001.png", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    inner.write_all(png.get_ref()).unwrap();
+    let inner = inner.finish().unwrap().into_inner();
+    let mut outer = zip::ZipWriter::new(std::fs::File::create(&backing).unwrap());
+    for name in ["A", "B"] {
+        outer
+            .start_file(
+                if nested {
+                    format!("{name}.zip")
+                } else {
+                    format!("{name}/001.png")
+                },
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        outer
+            .write_all(if nested { &inner } else { png.get_ref() })
+            .unwrap();
+    }
+    outer.finish().unwrap();
+    if converted {
+        let stamp = std::fs::metadata(&source).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &source,
+                crate::ui_helpers::mtime_secs(&stamp),
+                stamp.len() as i64,
+                crate::archive_converter::ArchiveFormat::SevenZ,
+                &backing,
+                std::fs::metadata(&backing).unwrap().len() as i64,
+                2,
+                false,
+            )
+            .unwrap();
+    }
+    let a = if nested { "A.zip" } else { "A" };
+    app.rating_db
+        .as_ref()
+        .unwrap()
+        .set(&crate::adjustment_db::normalize_path(&source.join(a)), 5)
+        .unwrap();
+    app.settings.rating_filter = FIVE;
+    if everything {
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set(&crate::adjustment_db::normalize_path(&source), 5)
+            .unwrap();
+        adopt(&mut app, &ctx, "outer book", dataset(vec![row.clone()]));
+        open(&mut app, &ctx, &row, false);
+        assert!(
+            app.restore_rating_filter_suppression(),
+            "same action as the suppression badge"
+        );
+        app.rebuild_visible_indices();
+    } else {
+        let outcome = app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+            source.clone(),
+            false,
+            OpenRequestOwner::Navigation,
+            StartupListIntent::ExplicitList,
+        );
+        assert!(matches!(
+            outcome,
+            FolderOpenOutcome::Loaded | FolderOpenOutcome::Classifying
+        ));
+        settle(&mut app, &ctx, None);
+    }
+    let a_row = app
+        .items
+        .iter()
+        .find(|item| {
+            matches!(item,
+        GridItem::ZipDir { dir_prefix, .. } if dir_prefix == &format!("{a}/"))
+        })
+        .unwrap()
+        .clone();
+    assert_eq!(app.items.len(), 2, "both rated A and unrated B exist");
+    assert_eq!(visible(&app), vec![a_row.clone()]);
+    trace(&app, "ZIP parent filtered");
+    app.selected = app.items.iter().position(|item| item == &a_row);
+    grid_key(&mut app, egui::Key::Enter, egui::Modifiers::NONE);
+    settle(&mut app, &ctx, None);
+    if everything {
+        // Existing boundary: Search has no folder-history current entry, so this
+        // child-level request does not install its rows. Do not claim a successful
+        // nested-book round trip or patch that separate adoption owner here.
+        trace(&app, "Everything results control after level request");
+        assert!(app.apply_fullscreen_close_nav_immediate(
+            crate::ui_main::AddressBarNav::EverythingResults
+        ));
+        settle(&mut app, &ctx, None);
+        assert!(matches!(
+            &app.global_search.accepted,
+            SearchAccepted::Everything {
+                position: EverythingPosition::Root,
+                ..
+            }
+        ));
+        assert!(app.rating_filter_suppressed_at.is_none());
+        assert_eq!(app.effective_rating_filter(), FIVE);
+        assert_eq!(visible(&app), vec![row]);
+        return;
+    }
+    assert_eq!(
+        app.rating_filter_suppressed_at.as_ref().map(|(p, _)| p),
+        Some(&source.join(a))
+    );
+    assert_eq!(app.effective_rating_filter(), [true; 6]);
+    assert_eq!(visible(&app), app.items);
+    assert_eq!(app.items.len(), 1);
+    app.selected = Some(0);
+    grid_key(&mut app, egui::Key::Enter, egui::Modifiers::NONE);
+    settle(&mut app, &ctx, None);
+    assert!(app.fullscreen_idx.is_some());
+    key(&mut app, &ctx, egui::Key::Backspace);
+    assert!(app.fullscreen_idx.is_none());
+    assert!(
+        app.rating_filter_suppressed_at.is_some(),
+        "page list stays inside A"
+    );
+    assert_eq!(visible(&app), app.items);
+    if dfs {
+        grid_key(&mut app, egui::Key::ArrowUp, egui::Modifiers::CTRL);
+    } else {
+        grid_key(&mut app, egui::Key::Backspace, egui::Modifiers::NONE);
+    }
+    settle(&mut app, &ctx, None);
+    trace(
+        &app,
+        &format!(
+            "ZIP parent returned converted={converted} nested={nested} everything={everything} dfs={dfs}"
+        ),
+    );
+    assert!(app.zip_nav.as_ref().unwrap().at_root());
+    assert_eq!(app.effective_folder(), Some(source));
+    assert_eq!(app.current_folder, Some(backing));
+    assert_eq!(app.items.len(), 2, "B remains in the source rows");
+    assert_eq!(
+        visible(&app),
+        vec![a_row],
+        "unrated B must not remain visible after leaving A"
+    );
+    assert!(app.rating_filter_suppressed_at.is_none());
+    assert_eq!(app.effective_rating_filter(), FIVE);
+    assert_eq!(app.settings.rating_filter, FIVE);
+}
+
+macro_rules! zip_level_cases {
+    ($name:ident, $converted:expr, $nested:expr) => {
+        mod $name {
+            use super::*;
+            #[test]
+            fn backspace() {
+                zip_level_return($converted, $nested, false, false);
+            }
+            #[test]
+            fn grid_dfs_back() {
+                zip_level_return($converted, $nested, false, true);
+            }
+            #[test]
+            fn everything_results_after_level_request() {
+                zip_level_return($converted, $nested, true, false);
+            }
+        }
+    };
+}
+zip_level_cases!(zip_level_directory, false, false);
+zip_level_cases!(zip_level_nested_archive, false, true);
+zip_level_cases!(converted_zip_level_directory, true, false);
+zip_level_cases!(converted_zip_level_nested_archive, true, true);
+
 #[derive(Clone, Copy, Debug)]
 enum Return {
     Escape,
@@ -529,4 +752,103 @@ fn unadopted_canceled_and_failed_pdf_leave_the_converted_book_unchanged() {
             },
         );
     }
+}
+
+fn unadopted_pdf_password_terminal(pause: bool) {
+    for book in [Book::Zip, Book::Converted] {
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.active_quick_folder_slot = None;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.detached_viewer_open_images_in_window = false;
+        let root = app.tmp.path().join("password-source");
+        std::fs::create_dir(&root).unwrap();
+        let (row, _) = fixture(&mut app, &root, book);
+        let source = row.drag_source_path().unwrap().to_path_buf();
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set(&crate::adjustment_db::normalize_path(&source), 5)
+            .unwrap();
+        app.settings.rating_filter = FIVE;
+        app.load_folder(root.clone());
+        admit(&mut app, &ctx, &row);
+        app.close_fullscreen();
+        let before = (
+            app.current_folder.clone(),
+            app.archive_source_override.clone(),
+            app.rating_filter_suppressed_at.clone(),
+            app.items.clone(),
+            app.items_generation,
+            visible(&app),
+            app.effective_rating_filter(),
+        );
+        let pdf = root.join("password.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+        assert_eq!(
+            app.load_pdf_as_folder_owned(
+                pdf.clone(),
+                OpenRequestOwner::Navigation,
+                StartupListIntent::ExplicitList
+            ),
+            FolderOpenOutcome::Loaded
+        );
+        app.pdf_enumerate_pending.as_mut().unwrap().2 =
+            crate::pdf_loader::completed_enumerate_result_handle(
+                &pdf,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    crate::pdf_loader::PdfReadError::PasswordRequired,
+                )),
+            );
+        app.poll_pdf_enumerate();
+        assert!(app.pdf_enumerate_pending.is_none());
+        assert!(matches!(
+            app.pdf_password_request.as_ref().map(|r| &r.owner),
+            Some(PdfPasswordRequestOwner::Direct(_))
+        ));
+        assert_eq!(
+            app.rating_filter_suppressed_at, before.2,
+            "prompt has not adopted the PDF"
+        );
+        if pause {
+            // Shared terminal used when the owning context is parked; no viewport
+            // or native window is created by this owner-level regression.
+            assert!(app.finish_pdf_password_request_in_mounted_context(PdfPasswordExit::Parked));
+        } else {
+            assert!(app.cancel_pdf_password_dialog_request());
+        }
+        assert!(app.pdf_password_request.is_none());
+        trace(
+            &app,
+            if pause {
+                "unadopted password parked"
+            } else {
+                "unadopted password canceled"
+            },
+        );
+        assert_eq!(
+            (
+                app.current_folder.clone(),
+                app.archive_source_override.clone(),
+                app.rating_filter_suppressed_at.clone(),
+                app.items.clone(),
+                app.items_generation,
+                visible(&app),
+                app.effective_rating_filter()
+            ),
+            before,
+            "unadopted password terminal must preserve the source filter and visible rows"
+        );
+    }
+}
+
+#[test]
+fn unadopted_pdf_password_cancel_preserves_source_suppression_and_visible_rows() {
+    unadopted_pdf_password_terminal(false);
+}
+
+#[test]
+fn unadopted_pdf_password_park_preserves_source_suppression_and_visible_rows() {
+    unadopted_pdf_password_terminal(true);
 }

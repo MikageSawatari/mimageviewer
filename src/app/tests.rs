@@ -48207,6 +48207,7 @@ mod favorite_adjustment_defaults_tests {
         let mut rf = [false; 6];
         rf[5] = true;
         app.settings.rating_filter = rf;
+        app.rebuild_visible_indices();
 
         let idx = app
             .items
@@ -48215,6 +48216,7 @@ mod favorite_adjustment_defaults_tests {
                 |it| matches!(it, GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "bookA/"),
             )
             .expect("root level should contain bookA ZipDir");
+        assert_eq!(app.visible_indices, vec![idx]);
 
         // 本を開く → 抑制起動。
         app.maybe_suppress_rating_filter_for_opened_zip_book(idx);
@@ -48229,6 +48231,12 @@ mod favorite_adjustment_defaults_tests {
         assert!(
             app.rating_filter_suppressed_at.is_none(),
             "本より上の階層へ戻ったらフィルタは復元されるべき"
+        );
+        assert_eq!(app.effective_rating_filter(), rf);
+        assert_eq!(
+            app.visible_indices,
+            vec![idx],
+            "未評価のbookBは親の可視列へ戻さない"
         );
     }
 
