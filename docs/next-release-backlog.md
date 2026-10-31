@@ -46,6 +46,15 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - §1.456 一覧の名前の文字サイズ・最大行数 (>>629): 出荷の案内は未。
 - §1.480 画像フォルダを Enter で開くと自動表示が ON でもページ一覧で止まる (>>649 の調査中に開発側で発見、v4.2.0 から): >>649 の評価フィルタの件は開発側で再現しなかった。報告者へは未返信。
 
+### 1.664 Everything検索から直接開いた本を閉じると、検索結果ではなくページ一覧へ戻る — 5ch >>671 (2026-10-31)
+
+- 状態: **未着手・不具合修正として採用 (利用者方針 2026-10-31)**。[>>671](https://egg.5ch.io/test/read.cgi/software/1782419551/671) は、本の表示モードを「開いたとき、ページを表示」にすると、Everything検索結果からは設定どおりページを開くが、本を閉じると検索結果ではなくページ一覧になるという報告。閉じる入力とビューワモードは報告に記載なし。コード上は通常の閉じるでも到達する経路を確認したが、実アプリ再現試験・修正は未実施。リリース時期は未指定。
+- 原因 (v4.10.0 と現行masterのコードを確認): `auto_open_for_current_container` は `global_search.active` / `favsearch.active` / `tag_view.active` の間 false を返す。検索から実フォルダの親へ飛ぶのを防ぐ既存の除外条件がEverythingにも適用され、`handle_fullscreen_close_request` が親一覧への復帰要求を立てず、画像表示だけを閉じて現在の本のページ一覧を残す。`resolve_close_return_navigation` にもEverythingの結果復帰先は含まれていない。
+- 期待する動作: Everything検索結果から本を直接ページ表示した場合、通常の閉じる（Esc・Enterの閉じる操作・HUDの×等）では元の検索結果へ戻す。Backspaceで明示的にページ一覧へ戻す操作、および「開いたとき、ページ一覧を表示」の動作は維持する。複数ウィンドウでメインの検索結果を残して独立閲覧している場合も、その一覧を不要に置き換えない。
+- 方針: 検索中の除外条件を外すだけの修正にはしない。既存 `SearchAccepted::Everything` の `PhysicalChild` と `EverythingReturn::Results` / `return_from_everything_child` が保持する論理的な本・戻り先・採用済みdatasetを、通常の閉じる要求から使う。検索語・取得済み結果・表示条件と並び・開いた本の選択とスクロールの復元を既存の検索ownerに揃え、再IPCを行わず、実親フォルダや変換キャッシュへ飛ばさない。新たな戻り先boolや検索結果の第二キャッシュは追加しない。
+- 調査・検証: ZIP / PDF / 変換書庫（元パスとキャッシュを区別）と、設定ON時の画像フォルダ本で、検索結果の採用→本openの成功採用→通常の閉じる→結果復帰までを通す回帰を追加する。Backspace・明示的なページ一覧表示、検索結果からの再open、キャンセル・失敗、同じ検索除外条件を使うCtrl+G / Ctrl+S / タグビューの兄弟経路を確認する。F12・独立viewerでは既存の所有境界とメインの選択・一覧を保つ。UI試験は事前承認と使い捨てポータブルの規則に従う。
+- 対象: `src/app.rs` の `auto_open_for_current_container` / `handle_fullscreen_close_request`、`src/app/close_return.rs`、`src/global_search_ui/everything.rs`、親移動dispatcher、関連マニュアル。[Everything検索計画 §7](everything-search-plan.md#7-openbackhistoryf12remote)、[ナビゲーション仕様](fullscreen-navigation-consistency.md)、detached経路に触る場合は[detached計画 §2](detached-rework-plan.md)を参照。対外返信は文案段階。規模 / 優先度: Small〜Medium（帰路の所有境界を調査して確定） / P2。
+
 ### 1.663 形式バッジをファイル名の一段上に置き、名前の表示幅を優先する — 5ch >>667 (2026-10-30)
 
 - 状態: **未着手・オプション追加の方向で採用 (利用者方針 2026-10-30)**。[>>667](https://egg.5ch.io/test/read.cgi/software/1782419551/667) は、ZIP / RAR 等のバッジを上へ移し、ファイル名の表示幅を増やしたいという提案。利用者との検討で、画面上端ではなく「ファイル名の行の一段上」へ置く案として記録する。実装・実画面での検証は未着手、リリース時期は未指定。
