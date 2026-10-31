@@ -64,6 +64,7 @@ impl ProjectionOrigin {
 }
 
 pub(crate) struct BookProjectionReply {
+    pub(crate) trace: crate::book_composition::CompositionTrace,
     pub(crate) rows: super::book_materialization::MaterializedBookRows,
     pub(crate) landing: Option<usize>,
     /// Complete, including unrotated pages, in the prepared rows' index domain.
@@ -875,6 +876,9 @@ impl App {
             } else {
                 match receiver.try_recv() {
                     Ok(Ok(reply)) => {
+                        reply
+                            .trace
+                            .event("projection_received", || scope.storage_key());
                         self.adopt_book_projection(
                             scope.clone(),
                             token,
@@ -926,6 +930,19 @@ impl App {
             } if requested == &scope => {}
             _ => {
                 let origin = self.composition_origin(&scope);
+                if let Some(snapshot) = service.current_candidate_snapshot()
+                    && !snapshot.rows.contains_key(&scope.storage_key())
+                {
+                    self.begin_book_projection(
+                        scope.clone(),
+                        snapshot.token_for(&scope),
+                        None,
+                        origin,
+                        ctx,
+                    );
+                    self.spread_shift.availability = self.pairing_edit_availability();
+                    return;
+                }
                 self.book_composition = ViewerBookComposition::Preparing {
                     scope: scope.clone(),
                     receiver: service.prepare(scope.clone(), domain.clone()),
@@ -938,6 +955,9 @@ impl App {
         };
         match receiver.try_recv() {
             Ok(reply) if reply.scope == scope => {
+                reply
+                    .trace
+                    .event("prepare_received", || scope.storage_key());
                 let ViewerBookComposition::Preparing { origin, .. } =
                     std::mem::take(&mut self.book_composition)
                 else {
@@ -1056,7 +1076,6 @@ impl App {
         if record.is_none()
             && !restores_automatic
             && !matches!(origin, ProjectionOrigin::IgnoreThisOpen { .. })
-            && !matches!(source, BookCompositionSource::Archive { .. })
         {
             self.book_composition = ViewerBookComposition::Accepted {
                 scope,
@@ -1096,13 +1115,17 @@ impl App {
         #[cfg(test)]
         let epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
         let (sender, receiver) = mpsc::channel();
+        let trace = crate::book_composition::CompositionTrace::start("projection_send", || {
+            scope.storage_key()
+        });
         let spawn = std::thread::Builder::new()
             .name("book-composition-projection".into())
             .spawn(move || {
                 #[cfg(test)]
                 let _epoch_scope =
                     epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
-                let result = prepare_book_projection(
+                let _perf = crate::book_composition::CompositionPerf::start("projection_worker");
+                let mut result = prepare_book_projection(
                     &worker_scope,
                     token,
                     worker_record.as_deref(),
@@ -1119,6 +1142,10 @@ impl App {
                     follow_document_direction,
                     document_password.as_deref(),
                 );
+                trace.event("projection_end", || worker_scope.storage_key());
+                if let Ok(reply) = &mut result {
+                    reply.trace = trace;
+                }
                 // The existing ROOT pending-wake contract collects this completion without input.
                 let _ = sender.send(result);
             });
@@ -1770,6 +1797,7 @@ fn prepare_book_projection(
         None
     };
     Ok(BookProjectionReply {
+        trace: crate::book_composition::CompositionTrace::default(),
         rows,
         landing,
         rotations,

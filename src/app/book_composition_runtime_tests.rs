@@ -13,6 +13,129 @@ use std::time::Duration;
 
 const WAIT: Duration = Duration::from_secs(30);
 
+#[test]
+fn composition1669_absent_zip_open_is_immediate_but_remove_restores_composed_rows_in_worker() {
+    use crate::book_composition::{
+        BookComposition, CompositionPageRef, CompositionProjectionOutcome,
+    };
+    let mut env = setup_app();
+    let root = env.tmp.path().join("absent.zip");
+    let tree = Arc::new(crate::zip_tree::ZipTree::build(
+        root.clone(),
+        ["a.jpg", "b.jpg", "c.jpg"]
+            .into_iter()
+            .map(|name| crate::zip_loader::ZipImageEntry {
+                entry_name: name.into(),
+                uncompressed_size: 0,
+                mtime: 0,
+                container_ancestry: vec![],
+            })
+            .collect(),
+    ));
+    let nav = crate::zip_tree::ZipNavState::new(tree);
+    let (items, metas) = nav.materialize_current(crate::settings::SortOrder::FileName);
+    env.current_folder = Some(root.clone());
+    env.items = items;
+    env.image_metas = metas;
+    env.thumbnails = vec![ThumbnailState::Pending; 3];
+    env.visible_indices = vec![0, 1, 2];
+    env.zip_nav = Some(nav);
+    env.projection_recipe =
+        book_materialization::ProjectionRecipe::Book(book_materialization::BookScope::Archive {
+            logical_root: root.clone(),
+            prefix: vec![],
+        });
+    let scope = BookScopeKey::archive(&root, &[]).unwrap();
+    let domain = PageDomain::ArchiveLevel {
+        prefix: String::new(),
+    };
+    let data = env.tmp.path().join("data");
+    let (service, owner) = runtime(&mut env, &data);
+    service
+        .prepare(scope.clone(), domain.clone())
+        .recv_timeout(WAIT)
+        .unwrap()
+        .status
+        .unwrap();
+    let (entered, release) = service.hold_worker_for_test();
+    entered.recv_timeout(WAIT).unwrap();
+    let original = env.items.clone();
+    let ctx = egui::Context::default();
+    env.poll_book_composition_read(&ctx);
+    assert!(matches!(
+        &env.book_composition,
+        ViewerBookComposition::Accepted {
+            record: None,
+            layout: CompositionProjectionOutcome::Automatic,
+            ..
+        }
+    ));
+    assert!(!env.book_composition.is_pending());
+    assert_eq!(env.items, original);
+    assert!(!data.join("book_composition.db").exists());
+    release.send(()).unwrap();
+    let pages = ["c.jpg", "a.jpg", "b.jpg"]
+        .into_iter()
+        .map(|entry_name| CompositionPageRef::ArchiveEntry {
+            entry_name: entry_name.into(),
+        })
+        .collect();
+    let mut record = BookComposition::new(ReadingDirection::Ltr, pages);
+    record.hidden_pages.push(CompositionPageRef::ArchiveEntry {
+        entry_name: "b.jpg".into(),
+    });
+    service
+        .save(scope.clone(), domain.clone(), record)
+        .recv_timeout(WAIT)
+        .unwrap()
+        .status
+        .unwrap();
+    env.poll_book_composition_read(&ctx);
+    service
+        .prepare(scope.clone(), domain.clone())
+        .recv_timeout(WAIT)
+        .unwrap()
+        .status
+        .unwrap();
+    env.poll_book_composition_read(&ctx);
+    settle_projection(&mut env);
+    assert!(env.composed_book_layout().is_some());
+    assert_eq!(env.items.len(), 2);
+    assert!(!env.items.iter().any(
+        |item| matches!(item, GridItem::ZipImage { entry_name, .. } if entry_name == "b.jpg")
+    ));
+    service
+        .remove(scope, domain)
+        .recv_timeout(WAIT)
+        .unwrap()
+        .status
+        .unwrap();
+    // Old Composed rows cannot authorize a new synchronous open just because
+    // the publication now proves absence. They must first restore raw order.
+    assert!(env.defer_book_composition_fullscreen_open(
+        0,
+        HistoryTrigger::UserChosen,
+        FsOpenMaterialization::Eager,
+        FsPageLoadContract::Sequential,
+        book_composition_permission::BookTargetPurpose::Explicit
+    ));
+    env.poll_book_composition_read(&ctx);
+    assert!(env.book_composition.is_pending());
+    assert!(env.defer_book_composition_fullscreen_open(
+        0,
+        HistoryTrigger::UserChosen,
+        FsOpenMaterialization::Eager,
+        FsPageLoadContract::Sequential,
+        book_composition_permission::BookTargetPurpose::Explicit
+    ));
+    // Retire this synthetic open; this test owns projection, not image decoding.
+    env.retire_book_presentation_permission();
+    settle_projection(&mut env);
+    assert_eq!(env.items, original);
+    assert!(env.composed_book_layout().is_none());
+    owner.shutdown_and_join();
+}
+
 fn install_document(app: &mut App, root: &Path) -> BookScopeKey {
     app.current_folder = Some(root.to_path_buf());
     app.zip_nav = None;

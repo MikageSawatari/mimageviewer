@@ -1780,9 +1780,12 @@ fn g3_continuous_visible_occurrences_keep_permission_through_scroll_reanchor_and
     let (service, owner) =
         BookCompositionService::spawn_at(data.path().to_path_buf(), None).unwrap();
     service
-        .prepare(
+        // Keep this a worker-owned re-entry check, independent of the new
+        // snapshot-only fast read for books with no stored composition.
+        .save(
             crate::book_scope::BookScopeKey::document("c:/g3-display.pdf").unwrap(),
             PageDomain::Document,
+            fixtures::four_page_book(CompositionDirection::Ltr),
         )
         .recv_timeout(std::time::Duration::from_secs(30))
         .unwrap()

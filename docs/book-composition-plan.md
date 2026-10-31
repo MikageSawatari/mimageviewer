@@ -357,6 +357,8 @@ modeを共有できるが、その列へ次に新規openする時/固定一覧�
 次に提示する時だけ、そのidentityのscopeをworkerで解決しhiddenを照合する (§6)。
 見開きなら実際に出す二つの候補を一つずつ照合する。全結果/全本の構成を先読みしない。
 保存直後の表示中ページはそのままでもよく、以後の新規提示で非表示を迂回できないことを保証する。
+§1.669の追補（§13）では、最新の受付可能snapshotで構成行不在を証明できる候補について、
+scope解決workerを省く。不在の証明も既存の提示許可ownerで世代を再確認する。
 
 本扱いOFF/混在のOrdinaryListではlayoutを適用せず、適格Bookへ戻れば再適用する（Q12/13）。
 構成が有効な書庫/PDF/EPUBのscopeのrecord bindingは§9.1で保護する。
@@ -780,7 +782,8 @@ source投影と現在のscope token・identity index・context／世代を証明
 初期化済み・Running・先行mutationなしのsnapshotから同じowner内で新しい許可を確定する。
 新しい要求IDと全occurrenceをatomicに公開し、旧episodeやtextureの保持を許可証として流用しない。
 不明source／旧token／Checking／Hiddenは従来のFIFO workerへ渡し、後着で紙めくりを再offerしない。
-identity-only／初回可視候補／preview／Remoteのworker照合は維持する（紙めくり計画§26.18）。
+identity-only／初回可視候補／preview／Remoteの必要なworker照合は維持する（紙めくり計画§26.18）。
+§1.669の行不在証明が成立する場合だけ、既存の世代検証へ載せてworker照合を省略できる（§13追補）。
 
 責務と確定順:
 
@@ -2290,6 +2293,90 @@ detached §11の追記案は `target/G-1242-g0-msg.txt`。次レビュー/設計
 | R5 P2-1 旧sidecar消費 | 自動復元の実disk token、独立構成familyのreceipt。タグ更新はroot witnessで同じ消費済みbackupと判定 | G0/G4F |
 | R5 P2-2 連結の新入場 | continuous可視候補ownerが許可要求を作り、texture選択前/paintまで同じ許可済みprojection。cached Hidden/新相方の試験 | G0/G3/G5 |
 | R5 P3 root snapshot | 全snapshot ArcをPendingWriter/flush予約/reuseへ。構成だけ/最後の編集消去/旧flush後着を検証 | G0/G4F |
+
+### §1.669 構成なし本の照合・投影と索引の反復（2026-11-01）
+
+修正前の計測は backlog §1.669 に記録した。実ZIPの画像50／500／2,000件（半数は
+一段の入れ子ZIP）のroot・nested各候補で、構成行なしでも毎回index作成1回・全N件走査、
+別treeの抽出一覧なら書庫列挙も毎回1回だった。test profile（非最適化）の参考時間は
+2,000件で通常4.092–4.121ms／抽出9.687–9.914ms。製品を起動した測定ではなく、
+報告された体感の原因を確定した結果とは区別する。
+この回数・時間はworker候補照合の実関数を直接呼んだ原価である。既存の§6.2の
+採用済み投影から同期許可できるindexed open／navigation等もあるため、
+すべてのページ送りでこの時間が掛かっていたという測定にはしない。
+
+§3.1／§6.2の「新規提示候補だけ照合する」境界を維持し、次の省略を加える。
+
+- 初期化済み・Running・先行mutationなしのsnapshotだけで省略を決める。
+  Documentは正確なscopeの行不在を既存`Allowed(Some(ScopePermissionToken))`で証明する。
+  ZIPはscopeを親文字列から推測せず、論理書庫root配下全体の行不在をBTreeMapのrangeで確認する。
+  `AbsentArchive`は既存snapshotのepoch／sequenceを持ち、改訂後は旧許可として失効する。
+  子scopeの初回保存・削除・他contextの保存も同じ新規要求の再検証へ通り、
+  無期限の`Allowed(None)`へ置き換えない。表示済みepisodeを保存通知で回収しないQ16は維持する。
+  採用済みBookは従来のtoken・identity index・physical/raw source・domainの証明を引き続き使う。
+  新しいfamily不在による同期受付は未投影のOrdinaryList／ExtractedResultに限定し、
+  Preparing／Projecting／解除直後の旧Composed列のadoptionを迂回しない。
+- 通常openでscope行なしならPrepare往復を省き、既存Accepted Automaticを採用する。
+  FreshのZIPも投影workerを起こさない。構成解除の`Refresh { previous: Some(_) }`と
+  `IgnoreThisOpen`は元列・trim・回転・設定／shift復元が必要なので既存workerを維持する。
+  新しい待機state／bool／UIのI/Oは追加しない。構成ありの既存50ms pending wakeは変更しない。
+- 行ありの提示照合は既存単一worker FIFOを使う。索引だけをcontext／items世代の小さな
+  Arc leaseへ結び付け、workerがWeak leaseとlogical／physical source／raw tree identityで保持する。
+  clone／bind／retireは各contextのleaseだけを交代し、dead leaseの索引はworkerで回収する。
+  大きい索引の解放もUIでは行わない。木なしの実ZIPはworkerでfileのlen／mtimeとpublicationを
+  確認し、同じ書庫の列挙を繰り返さず、source変更時に作り直す。失敗は保持しない。
+  liveな抽出一覧で全書庫分を累積しないよう、leaseあたり最近使った16source／65,536entryを
+  上限とする（上限を超える1冊は単独で保持する）。容量内の同source／木世代は1回準備し、
+  eviction後の再入場は再準備する。行なし本の照合はこの容量と無関係に常に索引・列挙0回。
+  単一fileのstampを持たない変換directoryは従来のresolverを使う。
+  immutable raw treeの索引を再利用しても、hidden／許可は最新snapshotで毎回確定する。
+
+簡素化は「行不在なら非同期の組み合わせそのものを作らない」を採用した。
+ページ送りをモーダル化して止める案や、保存後に抽出一覧をreloadする案は既存の閲覧／Q16を
+変更するため採らない。稀な失敗は既定のログ＋通知、保存済みデータを消す回復は追加しない。
+独立設計レビュー（GPT-6.1 Sol／xhigh）は上のtoken・cache失効・解除時復元の条件で合意。
+
+計装は`cat=book_composition`。candidateのsend／begin／end／receivedはcontext／request／items世代、
+FIFOとRTTは受付時の`trace_id`で対応する。Prepare／projectionも同じ固定traceをreplyまで渡す。
+`candidate_permission`、`candidate_scope`、`scope_index`は入れ子の経過時間であり合算しない。
+`candidate_enumerate`は列挙だけを測る。`checking_begin`→`checking_complete`はprojection待ちも含む。
+`checking_begin`が記録された要求で、`checking_retired`までにcompleteがなければ取消・置換であり、
+許可待ち成功時間へ含めない（同期許可のretiredだけでは取消と判定しない）。
+`presentation_checking`／`presentation_allowed`／`presentation_hidden`はcontext／世代／demand単位の
+実際の評価列で、Checking保留から次の評価までを追える。終端のない途中ログを成功扱いしない。
+時間値による間引きはなく、perf無効時は時計・動的keyを作らない。
+
+回数回帰は50／500／2,000件すべてで、無行のindex作成／走査／列挙が0になった。
+行ありも初回の1回／N件（抽出は列挙1回）を、続く2候補では0回／0件／0回へ削減した。
+無行2,000件の初回参考値は通常0.014–0.021ms／抽出0.009–0.011ms。
+行ありの再利用時は通常0.026–0.048ms／抽出0.185–0.210ms。
+前後の全サイズ・条件・初回ログはbacklog §1.669と`target/1669-{baseline,focused}.log`を参照する。
+
+自動検証（2026-11-01、未コミット差分、Codex担当）:
+
+- `book_composition | permission_service_ | similar_preview`、`test-script`付きの関連294件。
+  293成功＋最後のfixture修正後の対象1件再試験成功。製品コードはその間不変。
+  worker待ちの2 fixtureは非hidden構成を保存して非同期所有を引き続き検査し、
+  unsupported previewのfixtureは行ありの従来通知と行なしの省略を両方検査する。
+- 回数に加え、子scopeの初回保存／削除、先行mutationのFIFO、raw tree／物理file更新、
+  working set上限、実serviceの兄弟lease不変／退役後のworker側解放、
+  ZIPの無行即採用と旧Composed解除待ち、抽出一覧の保存後再検証が成功。
+  既存の非表示ページ・見開き・出力・複数contextの回帰も再利用した。
+- `test-lib-full.ps1`: **15,325成功、0失敗、67 skipped**、nextest 935.379秒。
+  §1.447／main chromeの既知不安定試験の失敗はなく、条件付き単独3回は実施していない。
+  JUnitとログは`target/test-lib-full/runs/20261031T173100809Z-374b7c94/`。
+  実行中の文書追記により成功台帳は自動登録されなかった。コード／fixture変更はなく、
+  上記JUnitは当該差分の有効な実行証拠である。文書だけの更新を理由に再実行しない。
+- 独立completion再レビューはGPT-6.1 Sol／xhighがACCEPT（コード確認）。
+- `cargo fmt`／`cargo fmt --check` と `cargo check -p mimageviewer --lib --tests --features test-script` は成功。
+  最終checkのログは`target/1669-check-final.log`（exit 0、1分23秒）。既存warningのみ。
+- `.\scripts\build-dev.ps1 -PreserveRuntime`は成功（exit 0、normal feature、core 6分01秒）。
+  `target/dev-runtime/`のcore／Remote service／EPUB workerを揃え、PE依存確認も成功
+  （`target/vcrt-pe-reports/dev-runtime.json`、runtime=4／pe=3）。成果物は起動していない。
+
+製品起動・実機の体感測定・コミット・CHANGELOG更新は行わない。
+手動の起動コマンド／実profileの注意と具体的な確認箇所はbacklog §1.669に記録した。
+行ありの50ms wake／writer FIFOは今回変更していない。
 
 ## 14. 利用者の決定 (番号固定)
 

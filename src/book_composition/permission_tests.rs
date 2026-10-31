@@ -3,6 +3,153 @@
 use super::*;
 use std::sync::Arc;
 
+#[test]
+fn candidate_scope_work_scales_without_composition() {
+    use std::{
+        io::{Cursor, Write},
+        time::Instant,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let (service, owner) =
+        BookCompositionService::spawn_at(temp.path().join("data"), None).unwrap();
+    service
+        .prepare(
+            crate::book_scope::BookScopeKey::document("C:/barrier.pdf").unwrap(),
+            PageDomain::Document,
+        )
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    for count in [50, 500, 2000] {
+        let root = temp.path().join(format!("{count}.zip"));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let mut inner = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for page in count / 2..count {
+            inner
+                .start_file(format!("pages/{page:04}.jpg"), options)
+                .unwrap();
+            inner.write_all(b"fixture").unwrap();
+        }
+        let inner = inner.finish().unwrap().into_inner();
+        let mut outer = zip::ZipWriter::new(std::fs::File::create(&root).unwrap());
+        for page in 0..count / 2 {
+            outer.start_file(format!("{page:04}.jpg"), options).unwrap();
+            outer.write_all(b"fixture").unwrap();
+        }
+        outer.start_file("nested.zip", options).unwrap();
+        outer.write_all(&inner).unwrap();
+        outer.finish().unwrap();
+        let entries =
+            crate::zip_loader::enumerate_image_entries_detailed_readonly_with_cancel(&root, None)
+                .unwrap()
+                .entries;
+        assert_eq!(entries.len(), count);
+        let names = [
+            entries[0].entry_name.clone(),
+            entries[count - 1].entry_name.clone(),
+        ];
+        let tree = Arc::new(crate::zip_tree::ZipTree::build(root.clone(), entries));
+        let foreign = Arc::new(crate::zip_tree::ZipTree::build(
+            temp.path().join("other.zip"),
+            vec![],
+        ));
+        for extracted in [false, true] {
+            for name in &names {
+                let candidate = CandidatePage {
+                    identity: crate::book_resume_db::PageIdentity::Archive {
+                        container: root.to_string_lossy().into_owned(),
+                        entry_name: name.clone(),
+                    },
+                    physical_archive: Some(root.clone()),
+                    raw_tree: Some(if extracted {
+                        foreign.clone()
+                    } else {
+                        tree.clone()
+                    }),
+                };
+                take_scope_work();
+                let started = Instant::now();
+                let permission = candidate_permission(&service.snapshot(), &candidate).unwrap();
+                let elapsed = started.elapsed();
+                let work = take_scope_work();
+                eprintln!(
+                    "composition1669 after count={count} extracted={extracted} page={name} work={work:?} elapsed_ms={:.3}",
+                    elapsed.as_secs_f64() * 1000.0
+                );
+                assert!(matches!(permission, CandidatePermission::AbsentArchive(_)));
+                assert_eq!(work, ScopeWork::default());
+            }
+        }
+        let nested = &names[1];
+        let scope =
+            crate::book_scope::BookScopeKey::archive(&root, &["nested.zip".into(), "pages".into()])
+                .unwrap();
+        let domain = PageDomain::ArchiveLevel {
+            prefix: scope.level_prefix.clone(),
+        };
+        let page = CompositionPageRef::ArchiveEntry {
+            entry_name: nested.clone(),
+        };
+        let mut record = BookComposition::new(ReadingDirection::Ltr, vec![page.clone()]);
+        record.hidden_pages.push(page);
+        service
+            .save(scope.clone(), domain.clone(), record)
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        for extracted in [false, true] {
+            let mut cache = CandidateScopeCache::default();
+            for turn in 0..3 {
+                let candidate = CandidatePage {
+                    identity: crate::book_resume_db::PageIdentity::Archive {
+                        container: root.to_string_lossy().into_owned(),
+                        entry_name: nested.clone(),
+                    },
+                    physical_archive: Some(root.clone()),
+                    raw_tree: Some(if extracted {
+                        foreign.clone()
+                    } else {
+                        tree.clone()
+                    }),
+                };
+                take_scope_work();
+                let started = Instant::now();
+                assert!(matches!(
+                    cache.permission(&service.snapshot(), &candidate).unwrap(),
+                    CandidatePermission::Hidden(_)
+                ));
+                let work = take_scope_work();
+                eprintln!(
+                    "composition1669 composed count={count} extracted={extracted} turn={turn} work={work:?} elapsed_ms={:.3}",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+                assert_eq!(
+                    work,
+                    if turn == 0 {
+                        ScopeWork {
+                            builds: 1,
+                            visited: count,
+                            enumerations: usize::from(extracted),
+                        }
+                    } else {
+                        ScopeWork::default()
+                    }
+                );
+            }
+        }
+        service
+            .remove(scope, domain)
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+    }
+    owner.shutdown_and_join();
+}
+
 fn occurrence() -> PresentationOccurrence {
     PresentationOccurrence {
         item_index: 2,
@@ -11,6 +158,305 @@ fn occurrence() -> PresentationOccurrence {
         slice: PresentationSlice::Full,
         slot: PresentationSlot::Center,
     }
+}
+
+#[test]
+fn absent_archive_receipt_expires_on_nested_save_and_remove_and_preserves_fifo() {
+    use std::time::Duration;
+    let temp = tempfile::tempdir().unwrap();
+    let (service, owner) =
+        BookCompositionService::spawn_at(temp.path().join("data"), None).unwrap();
+    let root = temp.path().join("source.zip");
+    let scope = crate::book_scope::BookScopeKey::archive(&root, &["chapter".into()]).unwrap();
+    let domain = PageDomain::ArchiveLevel {
+        prefix: "chapter".into(),
+    };
+    service
+        .prepare(scope.clone(), domain.clone())
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    let page = CompositionPageRef::ArchiveEntry {
+        entry_name: "chapter/a.jpg".into(),
+    };
+    let tree = Arc::new(crate::zip_tree::ZipTree::build(
+        root.clone(),
+        vec![crate::zip_loader::ZipImageEntry {
+            entry_name: "chapter/a.jpg".into(),
+            uncompressed_size: 0,
+            mtime: 0,
+            container_ancestry: vec![],
+        }],
+    ));
+    let candidate = CandidatePage {
+        identity: page.resume_identity(&root),
+        physical_archive: Some(root.clone()),
+        raw_tree: Some(tree),
+    };
+    let correlation = |context_id| CandidateCorrelation {
+        context_id,
+        request_id: 1,
+        items_generation: 1,
+        occurrence: CandidateOccurrence::Presented(occurrence()),
+        identity: candidate.identity.clone(),
+    };
+    let (entered, release) = service.hold_worker_for_test();
+    entered.recv_timeout(Duration::from_secs(30)).unwrap();
+    // Absence needs neither the FIFO nor a source enumeration, even while a
+    // non-mutating test gate occupies the worker.
+    let absent = service
+        .check_candidate(correlation(1), candidate.clone())
+        .try_recv()
+        .unwrap()
+        .status
+        .unwrap();
+    assert!(matches!(absent, CandidatePermission::AbsentArchive(_)));
+    let mut record = BookComposition::new(ReadingDirection::Ltr, vec![page.clone()]);
+    record.hidden_pages.push(page);
+    let sibling = service.clone();
+    let save = sibling.save(scope.clone(), domain.clone(), record);
+    assert!(service.current_candidate_snapshot().is_none());
+    let queued = service.check_candidate(correlation(2), candidate.clone());
+    assert!(matches!(
+        queued.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    release.send(()).unwrap();
+    save.recv_timeout(Duration::from_secs(30))
+        .unwrap()
+        .status
+        .unwrap();
+    assert!(!absent.is_current(&service.snapshot()));
+    let hidden = queued
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap()
+        .status
+        .unwrap();
+    assert!(matches!(hidden, CandidatePermission::Hidden(_)));
+    let mut resolver = CandidateScopeCache::default();
+    assert!(matches!(
+        resolver
+            .permission(&service.snapshot(), &candidate)
+            .unwrap(),
+        CandidatePermission::Hidden(_)
+    ));
+    sibling
+        .remove(scope, domain)
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    assert!(!hidden.is_current(&service.snapshot()));
+    take_scope_work();
+    let removed = resolver
+        .permission(&service.snapshot(), &candidate)
+        .unwrap();
+    assert!(matches!(removed, CandidatePermission::AbsentArchive(_)));
+    assert!(removed.is_current(&service.snapshot()));
+    assert_eq!(take_scope_work(), ScopeWork::default());
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn candidate_cache_rebuilds_for_new_raw_tree_and_physical_file_and_bounds_working_set() {
+    use std::io::Write;
+    let temp = tempfile::tempdir().unwrap();
+    let (service, owner) =
+        BookCompositionService::spawn_at(temp.path().join("data"), None).unwrap();
+    let root = temp.path().join("source.zip");
+    let scope = crate::book_scope::BookScopeKey::archive(&root, &[]).unwrap();
+    let domain = PageDomain::ArchiveLevel {
+        prefix: String::new(),
+    };
+    let page = CompositionPageRef::ArchiveEntry {
+        entry_name: "a.jpg".into(),
+    };
+    let mut record = BookComposition::new(ReadingDirection::Ltr, vec![page.clone()]);
+    record.hidden_pages.push(page.clone());
+    service
+        .save(scope.clone(), domain.clone(), record)
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    let write_zip = |names: &[&str]| {
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&root).unwrap());
+        for name in names {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"fixture").unwrap();
+        }
+        writer.finish().unwrap();
+    };
+    write_zip(&["a.jpg"]);
+    let mut candidate = CandidatePage {
+        identity: page.resume_identity(&root),
+        physical_archive: Some(root.clone()),
+        raw_tree: None,
+    };
+    let mut resolver = CandidateScopeCache::default();
+    for expected in [1, 0] {
+        take_scope_work();
+        assert!(matches!(
+            resolver
+                .permission(&service.snapshot(), &candidate)
+                .unwrap(),
+            CandidatePermission::Hidden(_)
+        ));
+        assert_eq!(take_scope_work().enumerations, expected);
+    }
+    write_zip(&["a.jpg", "b.jpg"]); // deterministic size change, no mtime granularity assumptions
+    take_scope_work();
+    assert!(matches!(
+        resolver
+            .permission(&service.snapshot(), &candidate)
+            .unwrap(),
+        CandidatePermission::Hidden(_)
+    ));
+    assert_eq!(
+        take_scope_work(),
+        ScopeWork {
+            builds: 1,
+            visited: 2,
+            enumerations: 1
+        }
+    );
+    let tree = |names: &[&str]| {
+        Arc::new(crate::zip_tree::ZipTree::build(
+            root.clone(),
+            names
+                .iter()
+                .map(|name| crate::zip_loader::ZipImageEntry {
+                    entry_name: (*name).into(),
+                    uncompressed_size: 0,
+                    mtime: 0,
+                    container_ancestry: vec![],
+                })
+                .collect(),
+        ))
+    };
+    candidate.raw_tree = Some(tree(&["a.jpg"]));
+    take_scope_work();
+    assert!(matches!(
+        resolver
+            .permission(&service.snapshot(), &candidate)
+            .unwrap(),
+        CandidatePermission::Hidden(_)
+    ));
+    assert_eq!(take_scope_work().builds, 1);
+    candidate.raw_tree = Some(tree(&["b.jpg"]));
+    assert!(
+        resolver
+            .permission(&service.snapshot(), &candidate)
+            .is_err(),
+        "another tree cannot reuse the first tree's membership"
+    );
+    // Successful source preparation is bounded even if one result-list lease
+    // stays live and visits many immutable source generations.
+    for _ in 0..32 {
+        candidate.raw_tree = Some(tree(&["a.jpg"]));
+        assert!(matches!(
+            resolver
+                .permission(&service.snapshot(), &candidate)
+                .unwrap(),
+            CandidatePermission::Hidden(_)
+        ));
+    }
+    assert!(resolver.source_count_for_test() <= 16);
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn candidate_service_leases_keep_sibling_indexes_independent_and_retire_on_worker() {
+    let temp = tempfile::tempdir().unwrap();
+    let (service, owner) =
+        BookCompositionService::spawn_at(temp.path().join("data"), None).unwrap();
+    let root = temp.path().join("source.zip");
+    let scope = crate::book_scope::BookScopeKey::archive(&root, &[]).unwrap();
+    let domain = PageDomain::ArchiveLevel {
+        prefix: String::new(),
+    };
+    let page = CompositionPageRef::ArchiveEntry {
+        entry_name: "a.jpg".into(),
+    };
+    service
+        .save(
+            scope.clone(),
+            domain.clone(),
+            BookComposition::new(ReadingDirection::Ltr, vec![page.clone()]),
+        )
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    let candidate = || CandidatePage {
+        identity: page.resume_identity(&root),
+        physical_archive: Some(root.clone()),
+        raw_tree: Some(Arc::new(crate::zip_tree::ZipTree::build(
+            root.clone(),
+            vec![crate::zip_loader::ZipImageEntry {
+                entry_name: "a.jpg".into(),
+                uncompressed_size: 0,
+                mtime: 0,
+                container_ancestry: vec![],
+            }],
+        ))),
+    };
+    let read = |source: CandidatePage, lease: Option<&Arc<()>>, context_id| {
+        let correlation = CandidateCorrelation {
+            context_id,
+            request_id: 1,
+            items_generation: 1,
+            occurrence: CandidateOccurrence::Presented(occurrence()),
+            identity: source.identity.clone(),
+        };
+        assert!(matches!(
+            service
+                .check_candidate_in(correlation, source, lease)
+                .recv()
+                .unwrap()
+                .status
+                .unwrap(),
+            CandidatePermission::Allowed(Some(_))
+        ));
+        // Fence the previous command's drop as well as its reply publication.
+        service
+            .prepare(scope.clone(), domain.clone())
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+    };
+    let first = candidate();
+    let first_tree = Arc::downgrade(first.raw_tree.as_ref().unwrap());
+    let first_lease = Arc::new(());
+    read(first, Some(&first_lease), 1);
+    assert_eq!(
+        first_tree.strong_count(),
+        1,
+        "only the worker cache retains the raw tree"
+    );
+    let second = candidate();
+    let second_tree = Arc::downgrade(second.raw_tree.as_ref().unwrap());
+    let second_lease = Arc::new(());
+    read(second.clone(), Some(&second_lease), 2);
+    assert!(
+        first_tree.upgrade().is_some(),
+        "a sibling read must not reset a live owner"
+    );
+    drop(first_lease);
+    read(second.clone(), Some(&second_lease), 2);
+    assert!(
+        first_tree.upgrade().is_none(),
+        "retired source is released by the next worker command"
+    );
+    drop(second);
+    drop(second_lease);
+    read(candidate(), None, 3);
+    assert!(second_tree.upgrade().is_none());
+    owner.shutdown_and_join();
 }
 fn document(root: &str, page_num: usize) -> CandidatePage {
     CandidatePage {

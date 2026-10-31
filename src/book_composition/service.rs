@@ -28,6 +28,22 @@ pub(crate) struct CompositionSnapshot {
 }
 
 impl CompositionSnapshot {
+    pub(crate) fn publication_token(&self) -> CompositionToken {
+        CompositionToken {
+            service_epoch: self.epoch,
+            publication_sequence: self.sequence,
+        }
+    }
+
+    pub(crate) fn archive_has_rows(&self, root: &str) -> bool {
+        let prefix = format!("{root}/");
+        self.rows.contains_key(root)
+            || self
+                .rows
+                .range(prefix.clone()..)
+                .next()
+                .is_some_and(|(key, _)| key.starts_with(&prefix))
+    }
     pub(crate) fn token_for(&self, scope: &BookScopeKey) -> CompositionToken {
         CompositionToken {
             service_epoch: self.epoch,
@@ -45,6 +61,7 @@ impl CompositionSnapshot {
 
 #[derive(Debug)]
 pub(crate) struct CompositionPrepareReply {
+    pub(crate) trace: super::CompositionTrace,
     pub(crate) scope: BookScopeKey,
     pub(crate) domain: PageDomain,
     pub(crate) token: CompositionToken,
@@ -152,11 +169,14 @@ enum Command {
         mpsc::Sender<Result<(), String>>,
     ),
     Candidate(
+        super::CompositionTrace,
+        Option<Weak<()>>,
         super::CandidateCorrelation,
         super::CandidatePage,
         mpsc::Sender<super::CandidatePermissionReply>,
     ),
     Prepare(
+        super::CompositionTrace,
         BookScopeKey,
         PageDomain,
         mpsc::Sender<CompositionPrepareReply>,
@@ -325,11 +345,13 @@ impl BookCompositionService {
         scope: BookScopeKey,
         domain: PageDomain,
     ) -> mpsc::Receiver<CompositionPrepareReply> {
+        let trace = super::CompositionTrace::start("prepare_send", || scope.storage_key());
         let (reply, rx) = mpsc::channel();
         let admission = self.shared.admission.lock().unwrap();
         let sent = admission.mode != Mode::Closed
             && admission.tx.as_ref().is_some_and(|tx| {
                 tx.send(Command::Prepare(
+                    trace.clone(),
                     scope.clone(),
                     domain.clone(),
                     reply.clone(),
@@ -338,6 +360,7 @@ impl BookCompositionService {
             });
         if !sent {
             let _ = reply.send(CompositionPrepareReply {
+                trace,
                 token: admission.snapshot.token_for(&scope),
                 scope,
                 domain,
@@ -352,11 +375,41 @@ impl BookCompositionService {
         correlation: super::CandidateCorrelation,
         candidate: super::CandidatePage,
     ) -> mpsc::Receiver<super::CandidatePermissionReply> {
+        self.check_candidate_in(correlation, candidate, None)
+    }
+
+    pub(crate) fn check_candidate_in(
+        &self,
+        correlation: super::CandidateCorrelation,
+        candidate: super::CandidatePage,
+        source_lifetime: Option<&Arc<()>>,
+    ) -> mpsc::Receiver<super::CandidatePermissionReply> {
+        correlation.perf_event("candidate_send");
+        let trace = super::CompositionTrace::start("candidate_request", || {
+            format!("{}:{}", correlation.context_id, correlation.request_id)
+        });
         let (reply, rx) = mpsc::channel();
         let admission = self.shared.admission.lock().unwrap();
+        if matches!(
+            admission.mode,
+            Mode::Running {
+                outstanding_mutations: 0
+            }
+        ) && let Some(permission) =
+            super::permission_without_composition(&admission.snapshot, &candidate)
+        {
+            let _ = reply.send(super::CandidatePermissionReply {
+                trace,
+                correlation,
+                status: Ok(permission),
+            });
+            return rx;
+        }
         if admission.mode == Mode::Closed
             || !admission.tx.as_ref().is_some_and(|tx| {
                 tx.send(Command::Candidate(
+                    trace.clone(),
+                    source_lifetime.map(Arc::downgrade),
                     correlation.clone(),
                     candidate,
                     reply.clone(),
@@ -365,6 +418,7 @@ impl BookCompositionService {
             })
         {
             let _ = reply.send(super::CandidatePermissionReply {
+                trace,
                 correlation,
                 status: Err(super::CandidatePermissionError::Unavailable(
                     "composition service is closing".into(),
@@ -805,6 +859,8 @@ fn run_worker(
     }
     let mut maintenance = false;
     let mut deferred = VecDeque::new();
+    // Only this worker owns and drops the indexes. UI owners hold a tiny lease.
+    let mut candidate_scopes: Vec<(Weak<()>, super::CandidateScopeCache)> = Vec::new();
     loop {
         let command = if !maintenance && !deferred.is_empty() {
             deferred.pop_front().unwrap()
@@ -943,14 +999,36 @@ fn run_worker(
             }
             command @ Command::Prepare(..) if maintenance => deferred.push_back(command),
             command @ Command::Candidate(..) if maintenance => deferred.push_back(command),
-            Command::Candidate(correlation, candidate, reply) => {
-                let status = super::candidate_permission(&state, &candidate);
+            Command::Candidate(trace, lifetime, correlation, candidate, reply) => {
+                correlation.perf_event("candidate_begin");
+                trace.event("candidate_fifo", || {
+                    format!("{}:{}", correlation.context_id, correlation.request_id)
+                });
+                candidate_scopes.retain(|(lease, _)| lease.strong_count() != 0);
+                let status =
+                    if let Some(lifetime) = lifetime.filter(|lease| lease.strong_count() != 0) {
+                        let index = candidate_scopes
+                            .iter()
+                            .position(|(lease, _)| lease.ptr_eq(&lifetime))
+                            .unwrap_or_else(|| {
+                                candidate_scopes
+                                    .push((lifetime, super::CandidateScopeCache::default()));
+                                candidate_scopes.len() - 1
+                            });
+                        candidate_scopes[index].1.permission(&state, &candidate)
+                    } else {
+                        super::candidate_permission(&state, &candidate)
+                    };
+                correlation.perf_event("candidate_end");
                 let _ = reply.send(super::CandidatePermissionReply {
+                    trace,
                     correlation,
                     status,
                 });
             }
-            Command::Prepare(scope, mut domain, reply) => {
+            Command::Prepare(trace, scope, mut domain, reply) => {
+                trace.event("prepare_fifo", || scope.storage_key());
+                let _perf = super::CompositionPerf::start("prepare_worker");
                 let status = (|| {
                     state.status.clone()?;
                     domain = store::canonical_domain(&domain)?;
@@ -966,6 +1044,7 @@ fn run_worker(
                     }
                 })();
                 let _ = reply.send(CompositionPrepareReply {
+                    trace,
                     token: state.token_for(&scope),
                     scope,
                     domain,

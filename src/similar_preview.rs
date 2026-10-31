@@ -493,6 +493,7 @@ impl SimilarPreviewCompositionProof {
         matches!(
             self.permission,
             crate::book_composition::CandidatePermission::Allowed(_)
+                | crate::book_composition::CandidatePermission::AbsentArchive(_)
         ) && self.permission.is_current(&self.service.snapshot())
     }
 }
@@ -1599,6 +1600,7 @@ fn validate_or_prepare_similar_preview_with(
                     )
                 })
                 .and_then(|reply| {
+                    reply.received();
                     if reply.correlation != correlation {
                         Err(CandidatePermissionError::Unavailable(
                             "preview permission correlation changed".into(),
@@ -1608,9 +1610,10 @@ fn validate_or_prepare_similar_preview_with(
                     }
                 });
             match permission {
-                Ok(CandidatePermission::Allowed(proof)) => {
-                    Ok((CandidatePermission::Allowed(proof), None))
-                }
+                Ok(
+                    permission @ (CandidatePermission::Allowed(_)
+                    | CandidatePermission::AbsentArchive(_)),
+                ) => Ok((permission, None)),
                 Ok(CandidatePermission::Hidden(proof)) => {
                     return Err(SimilarPreviewWorkerResult::Hidden { proof });
                 }
@@ -3093,71 +3096,108 @@ mod tests {
 
     #[test]
     fn similar_preview_unsupported_archive_keeps_legacy_admission_with_plain_notice() {
-        let temp = tempfile::tempdir().unwrap();
-        let archive = temp.path().join("candidate.zip");
-        std::fs::write(&archive, b"source metadata fixture").unwrap();
-        let (service, owner) = crate::book_composition::BookCompositionService::spawn_at(
-            temp.path().join("data"),
-            None,
-        )
-        .unwrap();
-        let ctx = egui::Context::default();
-        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
-        let candidate = SimilarPreviewCandidate {
-            item_key: format!(
-                "{}{}../page.png",
-                archive.display(),
-                crate::search_norm::ZIP_ENTRY_SEP
-            ),
-            target: crate::similar_index::SimilarItemTarget::ZipPage {
-                zip_path: archive,
-                entry_name: "../page.png".into(),
-            },
-            indexed_mtime: 0,
-            indexed_file_size: 0,
-        };
-        let mut state = SimilarPreviewState::default();
-        let sender = state.queue_test_worker();
-        state.begin_candidate_press_inner(
-            &ctx,
-            &candidate,
-            &passwords,
-            viewport(),
-            session(0),
-            None,
-            Some(service),
-        );
-        let SimilarPreviewPreparation::Running(pending) = &state.preparation else {
-            panic!("press owns preparation")
-        };
-        let completion = validate_or_prepare_similar_preview_with(
-            &pending.request,
-            Arc::new(AtomicBool::new(false)),
-            |_, _| {
-                Ok(SimilarPreviewPixels {
-                    display_name: "legacy candidate".into(),
-                    pixels: Arc::new(egui::ColorImage::filled([2, 1], egui::Color32::WHITE)),
-                    source_dims: [20, 10],
-                    layout_dims: None,
-                })
-            },
-        )
-        .unwrap();
-        assert!(
-            matches!(&completion, SimilarPreviewWorkerResult::Qualified { permission: crate::book_composition::CandidatePermission::Allowed(None), notice: Some(notice), .. } if notice == crate::book_composition::UNSUPPORTED_COMPOSITION_NOTICE)
-        );
-        sender.send(Ok(completion)).unwrap();
-        assert_eq!(
-            state.poll_background(&ctx, &passwords).as_deref(),
-            Some(crate::book_composition::UNSUPPORTED_COMPOSITION_NOTICE)
-        );
-        assert!(
-            state
-                .presentation_for_frame(&ctx, session(0), input(true), &passwords)
-                .is_some(),
-            "unsupported composition cannot remove legacy preview"
-        );
-        owner.shutdown_and_join();
+        for has_composition in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let archive = temp.path().join("candidate.zip");
+            std::fs::write(&archive, b"source metadata fixture").unwrap();
+            let (service, owner) = crate::book_composition::BookCompositionService::spawn_at(
+                temp.path().join("data"),
+                None,
+            )
+            .unwrap();
+            if has_composition {
+                use crate::book_composition::{
+                    BookComposition, CompositionPageRef, PageDomain, ReadingDirection,
+                };
+                // Unsupported-source fallback is relevant when a stored row exists.
+                // Row-free archives now skip scope resolution without a notice.
+                service
+                    .save(
+                        crate::book_scope::BookScopeKey::archive(&archive, &[]).unwrap(),
+                        PageDomain::ArchiveLevel {
+                            prefix: String::new(),
+                        },
+                        BookComposition::new(
+                            ReadingDirection::Ltr,
+                            vec![CompositionPageRef::ArchiveEntry {
+                                entry_name: "page.png".into(),
+                            }],
+                        ),
+                    )
+                    .recv()
+                    .unwrap()
+                    .status
+                    .unwrap();
+            }
+            let ctx = egui::Context::default();
+            let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+            let candidate = SimilarPreviewCandidate {
+                item_key: format!(
+                    "{}{}../page.png",
+                    archive.display(),
+                    crate::search_norm::ZIP_ENTRY_SEP
+                ),
+                target: crate::similar_index::SimilarItemTarget::ZipPage {
+                    zip_path: archive,
+                    entry_name: "../page.png".into(),
+                },
+                indexed_mtime: 0,
+                indexed_file_size: 0,
+            };
+            let mut state = SimilarPreviewState::default();
+            let sender = state.queue_test_worker();
+            state.begin_candidate_press_inner(
+                &ctx,
+                &candidate,
+                &passwords,
+                viewport(),
+                session(0),
+                None,
+                Some(service),
+            );
+            let SimilarPreviewPreparation::Running(pending) = &state.preparation else {
+                panic!("press owns preparation")
+            };
+            let completion = validate_or_prepare_similar_preview_with(
+                &pending.request,
+                Arc::new(AtomicBool::new(false)),
+                |_, _| {
+                    Ok(SimilarPreviewPixels {
+                        display_name: "legacy candidate".into(),
+                        pixels: Arc::new(egui::ColorImage::filled([2, 1], egui::Color32::WHITE)),
+                        source_dims: [20, 10],
+                        layout_dims: None,
+                    })
+                },
+            )
+            .unwrap();
+            if has_composition {
+                assert!(
+                    matches!(&completion, SimilarPreviewWorkerResult::Qualified { permission: crate::book_composition::CandidatePermission::Allowed(None), notice: Some(notice), .. } if notice == crate::book_composition::UNSUPPORTED_COMPOSITION_NOTICE)
+                );
+            } else {
+                assert!(matches!(
+                    &completion,
+                    SimilarPreviewWorkerResult::Qualified {
+                        permission: crate::book_composition::CandidatePermission::AbsentArchive(_),
+                        notice: None,
+                        ..
+                    }
+                ));
+            }
+            sender.send(Ok(completion)).unwrap();
+            assert_eq!(
+                state.poll_background(&ctx, &passwords).as_deref(),
+                has_composition.then_some(crate::book_composition::UNSUPPORTED_COMPOSITION_NOTICE)
+            );
+            assert!(
+                state
+                    .presentation_for_frame(&ctx, session(0), input(true), &passwords)
+                    .is_some(),
+                "unsupported composition cannot remove legacy preview"
+            );
+            owner.shutdown_and_join();
+        }
     }
 
     #[test]

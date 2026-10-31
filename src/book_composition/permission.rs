@@ -4,6 +4,91 @@ use std::{path::PathBuf, sync::Arc};
 use super::{CompositionPageRef, CompositionSnapshot, CompositionToken, PageDomain};
 use crate::{book_resume_db::PageIdentity, book_scope::BookScopeKey, zip_tree::ZipTree};
 
+/// Timings are opt-in, and never filtered by the measured duration.
+pub(crate) struct CompositionPerf {
+    kind: &'static str,
+    started: Option<std::time::Instant>,
+}
+impl CompositionPerf {
+    pub(crate) fn start(kind: &'static str) -> Self {
+        Self {
+            kind,
+            started: crate::perf::is_enabled().then(std::time::Instant::now),
+        }
+    }
+}
+impl Drop for CompositionPerf {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            crate::perf::event(
+                "book_composition",
+                self.kind,
+                None,
+                0,
+                &[(
+                    "elapsed_ms",
+                    started.elapsed().as_secs_f64().mul_add(1000.0, 0.0).into(),
+                )],
+            );
+        }
+    }
+}
+
+/// Diagnostic-only request stamp: the captured id/clock survive FIFO and UI polls.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CompositionTrace {
+    stamp: Option<(std::time::Instant, u64)>,
+}
+impl CompositionTrace {
+    pub(crate) fn start(kind: &str, key: impl FnOnce() -> String) -> Self {
+        if !crate::perf::is_enabled() {
+            return Self::default();
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let trace = Self {
+            stamp: Some((
+                std::time::Instant::now(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )),
+        };
+        trace.event(kind, key);
+        trace
+    }
+    pub(crate) fn event(&self, kind: &str, key: impl FnOnce() -> String) {
+        if let Some((started, id)) = self.stamp {
+            crate::perf::event(
+                "book_composition",
+                kind,
+                Some(&key()),
+                0,
+                &[
+                    ("trace_id", id.into()),
+                    (
+                        "elapsed_ms",
+                        (started.elapsed().as_secs_f64() * 1000.0).into(),
+                    ),
+                ],
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScopeWork {
+    pub(crate) builds: usize,
+    pub(crate) visited: usize,
+    pub(crate) enumerations: usize,
+}
+#[cfg(test)]
+thread_local! {
+    static SCOPE_WORK: std::cell::Cell<ScopeWork> = const { std::cell::Cell::new(ScopeWork { builds: 0, visited: 0, enumerations: 0 }) };
+}
+#[cfg(test)]
+pub(crate) fn take_scope_work() -> ScopeWork {
+    SCOPE_WORK.with(|work| work.replace(ScopeWork::default()))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PresentationRole {
     Navigation,
@@ -64,6 +149,24 @@ pub(crate) struct CandidateCorrelation {
     pub(crate) occurrence: CandidateOccurrence,
     pub(crate) identity: PageIdentity,
 }
+impl CandidateCorrelation {
+    pub(crate) fn perf_event(&self, kind: &str) {
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "book_composition",
+                kind,
+                None,
+                0,
+                &[
+                    ("context_id", self.context_id.into()),
+                    ("request_id", self.request_id.into()),
+                    ("items_generation", self.items_generation.into()),
+                ],
+            );
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScopePermissionToken {
     pub(crate) scope: BookScopeKey,
@@ -73,12 +176,27 @@ pub(crate) struct ScopePermissionToken {
 pub(crate) enum CandidatePermission {
     Checking,
     Allowed(Option<ScopePermissionToken>),
+    /// No owning level was inferred. This publication proves absence throughout
+    /// the archive family, and expires on any composition publication.
+    AbsentArchive(CompositionToken),
     Hidden(ScopePermissionToken),
 }
 #[derive(Debug)]
 pub(crate) struct CandidatePermissionReply {
+    pub(crate) trace: CompositionTrace,
     pub(crate) correlation: CandidateCorrelation,
     pub(crate) status: Result<CandidatePermission, CandidatePermissionError>,
+}
+impl CandidatePermissionReply {
+    pub(crate) fn received(&self) {
+        self.correlation.perf_event("candidate_received");
+        self.trace.event("candidate_rtt", || {
+            format!(
+                "{}:{}",
+                self.correlation.context_id, self.correlation.request_id
+            )
+        });
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CandidatePermissionError {
@@ -283,10 +401,171 @@ impl CandidatePermission {
         match self {
             Self::Checking => false,
             Self::Allowed(None) => true,
+            Self::AbsentArchive(token) => {
+                snapshot.status.is_ok() && snapshot.publication_token() == *token
+            }
             Self::Allowed(Some(proof)) | Self::Hidden(proof) => {
                 snapshot.status.is_ok() && snapshot.token_for(&proof.scope) == proof.token
             }
         }
+    }
+}
+
+/// Pure, bounded snapshot lookup. Never infer a ZIP's effective owning level
+/// from the textual parent; only the entire family's absence can bypass it.
+pub(crate) fn permission_without_composition(
+    snapshot: &CompositionSnapshot,
+    candidate: &CandidatePage,
+) -> Option<CandidatePermission> {
+    snapshot.status.as_ref().ok()?;
+    match &candidate.identity {
+        PageIdentity::Archive { container, .. } => {
+            let root = BookScopeKey::archive(container, &[]).ok()?.storage_key();
+            (!snapshot.archive_has_rows(&root))
+                .then(|| CandidatePermission::AbsentArchive(snapshot.publication_token()))
+        }
+        PageIdentity::Document { .. } => {
+            let (scope, _, _) = resolve_candidate_scope(candidate).ok()?;
+            (!snapshot.rows.contains_key(&scope.storage_key())).then(|| {
+                CandidatePermission::Allowed(Some(ScopePermissionToken {
+                    token: snapshot.token_for(&scope),
+                    scope,
+                }))
+            })
+        }
+        PageIdentity::Image { .. } => None,
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct CandidateScopeCache {
+    archives: std::collections::VecDeque<((String, String, usize), CachedCandidateArchive)>,
+}
+struct CachedCandidateArchive {
+    _tree: Option<Arc<ZipTree>>,
+    // Physical result-list sources have no immutable tree. Recheck file identity
+    // and publications in the worker; errors are never retained in this cache.
+    stamp: Option<(u64, std::time::SystemTime, CompositionToken)>,
+    index: ArchiveScopeIndex,
+}
+impl CandidateScopeCache {
+    #[cfg(test)]
+    pub(crate) fn source_count_for_test(&self) -> usize {
+        self.archives.len()
+    }
+    fn resolve(
+        &mut self,
+        snapshot: &CompositionSnapshot,
+        candidate: &CandidatePage,
+    ) -> Result<(BookScopeKey, PageDomain, CompositionPageRef), CandidatePermissionError> {
+        let PageIdentity::Archive {
+            container,
+            entry_name,
+        } = &candidate.identity
+        else {
+            return resolve_candidate_scope(candidate);
+        };
+        let _perf = CompositionPerf::start("candidate_scope");
+        crate::book_scope::validate_relative_reference(entry_name)?;
+        let physical = candidate
+            .physical_archive
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new(container));
+        let physical_key = crate::path_key::normalize_keep_drive(physical);
+        let tree = candidate
+            .raw_tree
+            .as_ref()
+            .filter(|tree| crate::path_key::normalize_keep_drive(&tree.zip_path) == physical_key);
+        let pointer = tree.map_or(0, |tree| Arc::as_ptr(tree) as usize);
+        let stamp = if tree.is_some() {
+            None
+        } else {
+            let meta = std::fs::metadata(physical)
+                .map_err(|error| CandidatePermissionError::Unavailable(error.to_string()))?;
+            // Converted directory trees have no single immutable file stamp.
+            if !meta.is_file() {
+                return resolve_candidate_scope(candidate);
+            }
+            Some((
+                meta.len(),
+                meta.modified()
+                    .map_err(|error| CandidatePermissionError::Unavailable(error.to_string()))?,
+                snapshot.publication_token(),
+            ))
+        };
+        let root = BookScopeKey::archive(container, &[])?.storage_key();
+        let key = (root, physical_key, pointer);
+        let existing = self
+            .archives
+            .iter()
+            .position(|(cached_key, _)| *cached_key == key);
+        if let Some(position) = existing {
+            let entry = self.archives.remove(position).unwrap();
+            if entry.1.stamp == stamp {
+                self.archives.push_back(entry);
+            }
+        }
+        if self
+            .archives
+            .back()
+            .is_none_or(|(cached_key, cached)| *cached_key != key || cached.stamp != stamp)
+        {
+            let index = prepare_archive_scope_index(candidate, container, physical)?;
+            // A result list can traverse arbitrarily many books in one lease.
+            // Bound its working set; retain one oversized book so its next page
+            // still reuses the index. All eviction/destruction stays here.
+            while !self.archives.is_empty()
+                && (self.archives.len() >= 16
+                    || self
+                        .archives
+                        .iter()
+                        .map(|(_, entry)| entry.index.entries.len())
+                        .sum::<usize>()
+                        .saturating_add(index.entries.len())
+                        > 65_536)
+            {
+                self.archives.pop_front();
+            }
+            self.archives.push_back((
+                key.clone(),
+                CachedCandidateArchive {
+                    _tree: tree.cloned(),
+                    stamp,
+                    index,
+                },
+            ));
+        }
+        let (scope, domain) = self
+            .archives
+            .back()
+            .unwrap()
+            .1
+            .index
+            .scope_for(entry_name)?;
+        let page = CompositionPageRef::ArchiveEntry {
+            entry_name: entry_name.clone(),
+        };
+        domain
+            .validate_page(&page)
+            .map_err(|error| error.to_string())?;
+        Ok((scope, domain, page))
+    }
+
+    pub(crate) fn permission(
+        &mut self,
+        snapshot: &CompositionSnapshot,
+        candidate: &CandidatePage,
+    ) -> Result<CandidatePermission, CandidatePermissionError> {
+        let _perf = CompositionPerf::start("candidate_permission");
+        snapshot
+            .status
+            .clone()
+            .map_err(CandidatePermissionError::Unavailable)?;
+        if let Some(permission) = permission_without_composition(snapshot, candidate) {
+            return Ok(permission);
+        }
+        let resolved = self.resolve(snapshot, candidate)?;
+        permission_for_scope(snapshot, resolved)
     }
 }
 
@@ -295,6 +574,7 @@ impl CandidatePermission {
 pub(crate) fn resolve_candidate_scope(
     candidate: &CandidatePage,
 ) -> Result<(BookScopeKey, PageDomain, CompositionPageRef), CandidatePermissionError> {
+    let _perf = CompositionPerf::start("candidate_scope");
     match &candidate.identity {
         PageIdentity::Document {
             container,
@@ -355,6 +635,13 @@ struct ArchiveScopeIndex {
 
 impl ArchiveScopeIndex {
     fn prepare(container: &str, tree: &ZipTree) -> Self {
+        let _perf = CompositionPerf::start("scope_index");
+        #[cfg(test)]
+        SCOPE_WORK.with(|work| {
+            let mut next = work.get();
+            next.builds += 1;
+            work.set(next);
+        });
         fn walk(
             index: &mut ArchiveScopeIndex,
             container: &str,
@@ -394,6 +681,11 @@ impl ArchiveScopeIndex {
                 #[cfg(test)]
                 {
                     index.visited_pages += 1;
+                    SCOPE_WORK.with(|work| {
+                        let mut next = work.get();
+                        next.visited += 1;
+                        work.set(next);
+                    });
                 }
                 let key = crate::book_bookmarks::normalize_page_path(&entry.entry_name);
                 index
@@ -466,6 +758,13 @@ fn prepare_archive_scope_index(
     }) {
         return Ok(ArchiveScopeIndex::prepare(container, tree));
     }
+    let perf = CompositionPerf::start("candidate_enumerate");
+    #[cfg(test)]
+    SCOPE_WORK.with(|work| {
+        let mut next = work.get();
+        next.enumerations += 1;
+        work.set(next);
+    });
     let entries = if physical.is_dir()
         && crate::path_key::normalize_keep_drive(physical)
             != crate::path_key::normalize_keep_drive(std::path::Path::new(container))
@@ -477,6 +776,7 @@ fn prepare_archive_scope_index(
         crate::zip_loader::enumerate_image_entries_detailed_readonly_with_cancel(physical, None)
     }
     .map_err(|error| CandidatePermissionError::Unavailable(error.to_string()))?;
+    drop(perf);
     Ok(ArchiveScopeIndex::prepare(
         container,
         &ZipTree::build(physical.to_owned(), entries.entries),
@@ -487,11 +787,13 @@ pub(crate) fn candidate_permission(
     snapshot: &CompositionSnapshot,
     candidate: &CandidatePage,
 ) -> Result<CandidatePermission, CandidatePermissionError> {
-    snapshot
-        .status
-        .clone()
-        .map_err(CandidatePermissionError::Unavailable)?;
-    let (scope, domain, page) = resolve_candidate_scope(candidate)?;
+    CandidateScopeCache::default().permission(snapshot, candidate)
+}
+
+fn permission_for_scope(
+    snapshot: &CompositionSnapshot,
+    (scope, domain, page): (BookScopeKey, PageDomain, CompositionPageRef),
+) -> Result<CandidatePermission, CandidatePermissionError> {
     let proof = ScopePermissionToken {
         token: snapshot.token_for(&scope),
         scope,

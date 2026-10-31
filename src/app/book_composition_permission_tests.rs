@@ -3,6 +3,125 @@
 use super::*;
 
 #[test]
+fn composition1669_extracted_absence_is_rechecked_after_sibling_save_and_remove() {
+    let mut env = crate::app::tests::phase_c_support::setup_app();
+    let root = env.tmp.path().join("extracted.zip");
+    let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(
+        root.clone(),
+        vec![crate::zip_loader::ZipImageEntry {
+            entry_name: "chapter/a.jpg".into(),
+            uncompressed_size: 0,
+            mtime: 0,
+            container_ancestry: vec![],
+        }],
+    ));
+    env.items = vec![crate::grid_item::GridItem::ZipImage {
+        zip_path: root.clone(),
+        entry_name: "chapter/a.jpg".into(),
+    }];
+    env.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+    env.image_metas = vec![None];
+    env.visible_indices = vec![0];
+    env.items_generation += 1;
+    env.zip_nav = Some(crate::zip_tree::ZipNavState::new(tree));
+    env.current_folder = None;
+    env.fullscreen_idx = None;
+    env.projection_recipe = crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+        crate::app::book_materialization::ExtractedSurface::Rating,
+    );
+    let scope = crate::book_scope::BookScopeKey::archive(&root, &["chapter".into()]).unwrap();
+    let domain = PageDomain::ArchiveLevel {
+        prefix: "chapter".into(),
+    };
+    let (service, owner) =
+        BookCompositionService::spawn_at(env.tmp.path().join("data"), None).unwrap();
+    service
+        .prepare(scope.clone(), domain.clone())
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    env.install_book_composition_runtime(service.clone());
+    env.bind_book_presentation_demand();
+    let intent = OpenIntent {
+        context_id: env.spread_shift_context_id().serial(),
+        items_generation: env.items_generation,
+        idx: 0,
+        history_trigger: HistoryTrigger::UserChosen,
+        materialization: FsOpenMaterialization::Eager,
+        contract: FsPageLoadContract::Sequential,
+        purpose: BookTargetPurpose::Explicit,
+        route: BookTargetRoute::FullscreenOpen(FsMetadataBoundary::Manual),
+        navigation_origin: Vec::new(),
+    };
+    let candidates = env
+        .qualify_book_unit_from_current_projection(&intent, &[occurrence(0)])
+        .unwrap();
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.is_current(&service.snapshot()) && candidate.is_allowed())
+    );
+    // A separate service handle models the other context's publication. A Ready
+    // continuation has not presented anything and must reject its stale receipt.
+    let sibling = service.clone();
+    let page = CompositionPageRef::ArchiveEntry {
+        entry_name: "chapter/a.jpg".into(),
+    };
+    let mut record = BookComposition::new(ReadingDirection::Ltr, vec![page.clone()]);
+    record.hidden_pages.push(page);
+    sibling
+        .save(scope.clone(), domain.clone(), record)
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| !candidate.is_current(&service.snapshot()))
+    );
+    env.book_composition_permission.open = OpenPermission::Ready {
+        intent: intent.clone(),
+        candidates,
+    };
+    assert!(env.defer_book_composition_fullscreen_open(
+        0,
+        HistoryTrigger::UserChosen,
+        FsOpenMaterialization::Eager,
+        FsPageLoadContract::Sequential,
+        BookTargetPurpose::Explicit
+    ));
+    service
+        .prepare(scope.clone(), domain.clone())
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    env.poll_book_presentation_permission(&egui::Context::default());
+    assert!(env.fullscreen_idx.is_none());
+    assert_ne!(
+        env.book_presentation_current(&[occurrence(0)]),
+        PresentationDecision::Allowed(vec![true])
+    );
+    sibling
+        .remove(scope, domain)
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    let candidates = env
+        .qualify_book_unit_from_current_projection(&intent, &[occurrence(0)])
+        .unwrap();
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.is_current(&service.snapshot()) && candidate.is_allowed())
+    );
+    owner.shutdown_and_join();
+}
+
+#[test]
 fn permission_free_target_only_resolves_missing_occurrences() {
     use crate::app::book_composition_runtime::{BookCompositionSource, ViewerBookComposition};
     let mut env = crate::app::setup_app_for_test();
@@ -665,6 +784,7 @@ fn retired_receiver_reply_cannot_grant_a_reentered_episode_or_sibling() {
     owner.occurrences.clear();
     assert!(
         tx.send(CandidatePermissionReply {
+            trace: CompositionTrace::default(),
             correlation: old.clone(),
             status: Ok(CandidatePermission::Allowed(None))
         })
@@ -742,6 +862,7 @@ fn navigation_open_waits_for_atomic_unit_then_requalifies_same_unit_survivor() {
     deliveries[0]
         .0
         .send(CandidatePermissionReply {
+            trace: CompositionTrace::default(),
             correlation: deliveries[0].1.clone(),
             status: Ok(CandidatePermission::Hidden(proof.clone())),
         })
@@ -755,6 +876,7 @@ fn navigation_open_waits_for_atomic_unit_then_requalifies_same_unit_survivor() {
     deliveries[1]
         .0
         .send(CandidatePermissionReply {
+            trace: CompositionTrace::default(),
             correlation: deliveries[1].1.clone(),
             status: Ok(CandidatePermission::Allowed(Some(proof))),
         })
@@ -1509,6 +1631,7 @@ fn all_hidden_zip_level_keeps_dfs_continuation_for_manual_and_slideshow() {
         assert!(
             deliver
                 .send(Ok(BookProjectionReply {
+                    trace: CompositionTrace::default(),
                     rows,
                     landing: None,
                     rotations: HashMap::new(),
@@ -1851,8 +1974,17 @@ fn same_page_slideshow_qualifies_requested_half_before_slice_and_timer_effects()
         let (service, process) =
             BookCompositionService::spawn_at(env.tmp.path().join("slideshow-split-data"), None)
                 .unwrap();
+        // This regression exercises the asynchronous requested-half owner.
+        // A row-free book now qualifies immediately from the snapshot instead.
         service
-            .prepare(scope, PageDomain::Document)
+            .save(
+                scope,
+                PageDomain::Document,
+                BookComposition::new(
+                    ReadingDirection::Ltr,
+                    vec![CompositionPageRef::PdfPage { page_num: 0 }],
+                ),
+            )
             .recv_timeout(Duration::from_secs(30))
             .unwrap()
             .status
