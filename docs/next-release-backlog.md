@@ -38,6 +38,12 @@
 
 ## 1. 優先候補
 
+### v4.10.2 で出荷した 5ch 由来の項目と、報告者への案内 (2026-10-31)
+
+v4.10.2 (2026-10-31 公開) で出荷し、本書から外した項目。案内したら行を消す。経緯は git 履歴 (`a074dafe0` 以前の本書) と [リリース記録](release-verification-records.md) にある。
+- §1.666 突然終了・読み取りアクセス違反 (>>655・657・672): v4.9.0・v4.10.0 の例外位置が mimalloc 3.3.2 の既知の競合と一致したため、mimalloc を 3.5.3 へ更新した。**報告者の環境で終了が止まるかは未確認**。報告者へは未返信。返信では「同じ箇所で落ちる既知の不具合を直した版の部品に更新した」までを書き、直ったとは断定しない。>>657 の障害モジュールが core かは原文で未確認のまま。
+- §1.664 Everything 検索結果から直接ページ表示した本を閉じるとページ一覧になる (>>671): メインと F12 で切り離した窓で、検索結果へ戻るように直した。出荷の案内は未。独立した別ウィンドウの場合は §1.670 に残る。
+
 ### v4.10.0 で出荷した 5ch 由来の項目と、報告者への案内 (2026-10-30)
 
 v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち、5ch の報告・要望から来たもの。案内したら行を消す。
@@ -64,57 +70,10 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 方針: 設定で機能を切る前に、**構成の無い本では照合と projection を省く**構造にする (行の有無はメモリ上の snapshot で分かる)。省けない場合も、書庫の scope index は本 1 冊につき 1 回作って使い回す。§1.447 などのページめくりの提示待ちと同じ区間なので、着手前にページめくり・本を開く区間へ `perf::event` を入れて、照合待ちの時間を測ってから直し方を決める。非表示ページのある本の挙動 (非表示を出さない、出力の許可) は変えない。
 - 対象: `src/book_composition/{permission,service}.rs`、`src/app/{book_composition_runtime,book_composition_permission,book_materialization}.rs`、[本の構成の計画](book-composition-plan.md) (照合は「開く・送るときに新しく表示するページだけ worker で」の方針)。規模 / 優先度: Small〜Medium / P2。報告者への返信は未。
 
-### 1.666 v4.10.0でも突然終了する・読み取りアクセス違反の報告 — 5ch >>655・657・672 (2026-10-31)
+### 1.670 独立した別ウィンドウで、Everything 検索結果から開いた本を閉じると、メインの検索結果が親フォルダ一覧に置き換わる — §1.664 の調査で判明 (2026-10-31)
 
-- 状態: **対応済み・v4.10.2 で出荷予定 (2026-10-31)。利用者の決定「3系を修正版へ」により、`libmimalloc-sys` 0.1.49 を vendor して同梱の v3 を上流無改変の mimalloc 3.5.3 へ差し替えた (ブランチ `release-4.10.2` の `dbdb5d2aa`、元は `mimalloc-fix-1666` の `bf942bc19`。独立レビュー ACCEPT)。修正の効果は利用者環境で未確認。以下は判断までの記録。** 旧状態: 原因の筋が判明・直し方を利用者と相談中 (2026-10-31)。v4.9.0・v4.10.0 とも mimalloc 3.3.2 の `mi_heap_main` の同じ命令で落ちており、上流で修正済みの既知の競合と一致 (下の「例外位置の特定」)**。[>>672](https://egg.5ch.io/test/read.cgi/software/1782419551/672) は名前欄「655」で「最新版でも突然死がおきました」と報告し、v4.10.0のnative例外ログ1行を提供した。このセッションでは原文・既存調査・ログ出力実装の軽い確認のみ行い、配布exeの解析・再現試験・修正は行っていない。
-- 経緯: >>655は約30画像のZIPでAI「高速汎用」の完了前にホイールで約10ページ送ると砂時計になって終了するとの報告。「先読みバッファをオーバー」は報告者の仮説。>>657はv4.9.0のイベントログ（例外 `0xc0000005`、障害offset `0x540a947`、Windows 11 Home 25H2・RAM32GB）。>>672は同じ報告者の追加証拠だが、その回の操作・素材・設定は未記載で、同じ手順・原因だったと断定しない。
-- >>672の原文ログ（書き換えず保存）:
-
-  ```text
-  [SystemTime { intervals: 134378486407355883 }] NATIVE EXCEPTION chance=first code=0xC0000005 flags=0x00000000 address=0x7ff70fe3dbc7 thread=45376 access=read target=0x18 version=4.10.0 exe_base=0x7ff70a880000 ntdll_base=0x7ffb510a0000
-  ```
-
-- 軽い確認: `address - exe_base = 0x055bdbc7`。無効な低アドレス `0x18` の読み取りで、NULL近傍の参照は候補だが、解放済みメモリ・破損等を含め原因は未確定。`src/native_exception_log.rs` はfirst-chanceで記録して `EXCEPTION_CONTINUE_SEARCH` を返すため、この1行だけでは未処理の致命的例外や最終終了地点の証明にならない。以前のGPU / VRAM不足やAIキャンセル仮説を確定原因に格上げしない。[Microsoftのアクセス違反の説明](https://learn.microsoft.com/en-us/shows/inside/c0000005)も参照。
-- 調査の最初の作業: **実際に配布したv4.10.0のcore exeと一致するPDB**を開発側の保管物から探し、PEのイメージ範囲・PDBの識別情報を照合して `0x055bdbc7` を関数・ソース行・命令へ逆引きする。現在のビルドや別版のPDBは代用しない。v4.9.0の旧offsetとの比較も各版に一致するexe/PDBで行う。該当箇所の処理・所有期間・非同期完了や破棄の順序を調べ、手元に残る終了ログ／通常・性能ログがあれば時刻を照合する。追加の利用者確認は、その結果で調査方針が変わる最小限に限る。
-- **例外位置の特定 (2026-10-31、ClaudeCode。配布物の解析で、実行・再現はしていない)**:
-  - 照合の方法: GitHub Release v4.10.0 の単体exe `mimageviewer.exe` から埋め込みの core を切り出した (PDB 識別子 `{6B163A65-2EA8-AC5D-4C4C-44205044422E}`)。v4.10.0 の配布ビルド元 `e127d9a23` を worktree `G:\home\mimageviewer-crash-1666` で `CARGO_INCREMENTAL=0 cargo build --release --bin mimageviewer-core` により作り直した。`.text` は大きさが完全に一致し、違いは後続の `.rdata` が 0x1000 大きいことによる参照先の差だけ。例外位置の前後の命令列も一致したので、作り直した PDB の名前を使った (PDB の GUID は一致しない)。作業物は `target/crash-1666/` (切り出した core、v4.10.0 portable) と上記 worktree。
-  - 版の判定: RVA `0x055bdbc7` は**通常版 (インストーラ / 単体exe) の core**では命令 `mov rbx, qword ptr [rax+18h]` の先頭に当たり、記録の `target=0x18` (rax=0) と合う。ポータブル版の core では命令の途中で合わない。報告者は通常版を使っていると見られる (報告者には未確認)。
-  - 関数: **mimalloc 3.3.2 (`libmimalloc-sys 0.1.49`、v4.8.3〜v4.10.0 で同じ) の `mi_heap_main`** (内側に `_mi_subproc` が展開されている)。処理は「TLS スロットからスレッドの既定 theap を読む → null でなければ `theap->tld->subproc` を読む」。例外は **theap は null でないのに `theap->tld` (先頭 8 byte) が null** のときに起きる。mimalloc の正常な状態では、スロットの値は null・`&_mi_theap_empty` (tld は `&tld_empty`)・生きている theap (tld あり) のどれかで、tld が null の theap は作られない。つまり、そのスレッドの mimalloc の TLS スロットに、有効な theap でない値 (解放・再利用された theap、または別の主体が書いた値) が入っていた可能性が高い。どちらかは未確定。
-  - 未確定: 例外を起こしたスレッド (`thread=45376`) が何のスレッドか、`mi_heap_main` の呼び出し元 (スレッド開始時の theap 作成・heap の新規作成・arena の確保など複数ある)、first-chance の後にそのまま終了したか。Rust の safe code の null 参照ではなく、アロケータの内部状態の不整合として扱う。
-  - v4.9.0 (>>657): GitHub Release v4.9.0 の単体exe (配布元 `162a56d91`) から切り出した core で、offset `0x540a947` は v4.10.0 の `mi_heap_main` と命令列が完全に同じ関数の `mov rbx, qword ptr [rax+18h]` の先頭に当たる。2 回とも同じ命令で落ちている (>>657 の障害モジュールが core であることは報告の原文で要確認)。
-  - **上流の既知不具合と一致**: [polars #29883](https://github.com/pola-rs/polars/issues/29883) (Windows 11、`libmimalloc-sys 0.1.49` = mimalloc 3.3.2、非メインスレッド、`mov rbx,[rax+0x18]` で `0x18` を読む) と同じ。報告者の分析では、スレッドの終了処理 (`_mi_thread_done`) の後に同じスレッドが再び確保して、解放済みの theap (`_mi_theap_free` が tld を null にする) をたどる競合。上流は **mimalloc 3.4.1 (PR #1289)** で `_mi_subproc` に `theap->tld == NULL` の確認を足し、その後 PR #1391 などで補強。Rust のラッパー (`purpleprotocol/mimalloc_rust` PR #169、3.4.5 へ更新) は 2026-10-31 時点で未 merge・未リリース。Polars の報告者はこの PR の版へ差し替えて 4 週間 54 回の落ち方が 17 日間 0 回になったと報告している。
-  - mIV の mimalloc の使い方は `src/lib.rs` の global allocator だけ (mimalloc 固有の API は使っていない)。導入は 2026-09-05 (`1dc4ee0cf`、ページめくりの確保の競合対策)。上流の最新は v3.6.1 (2026-10-30)、v3.5.3 (2026-09-17)。crate 同梱の v2 系は 2.3.2。
-  - 直し方の候補 (利用者と決める): (a) `libmimalloc-sys` を vendor して同梱の mimalloc v3 を上流の修正済みの版へ上げ、`[patch.crates-io]` + PATCHES.md で管理し、ラッパーの公式版が出たら戻す。(b) crate の `v2` feature で mimalloc 2.x に切り替える。(c) 3.3.2 に `_mi_subproc` の 1 行の確認だけを足す。どれも global allocator の差し替えなので、ページめくりの確保の速さを測って確かめる。
-- 既存調査との関係: ブランチ `ai-crash-655` の `docs/ai-crash-655-investigation.md` に、v4.9.0と当時HEAD各10回のheadless試験で未再現という記録がある。実画面・GPU texture upload・VRAM競合を試した結果ではないため、その範囲を除外しない。再現・原因と修正案を分けて報告し、実画面試験には事前承認と使い捨てポータブルを使う。原因未確定のままAI無効化・先読み縮小等で出荷機能を削らない。
-- §1.482は「異常終了の理由を利用者に表示する」診断機能の項目で、この終了原因の調査とは分ける。関連: `src/native_exception_log.rs`、`src/ai/` とfinal AIの要求・取消・回収経路、[表示パイプライン](display-pipeline.md)。規模: 原因調査後に確定 / P2。担当セッションへの実依頼・対外返信は未実施。
-
-### 1.664 Everything検索から直接開いた本を閉じると、検索結果ではなくページ一覧へ戻る — 5ch >>671 (2026-10-31)
-
-- 状態: **実装済み・実機未確認（2026-10-31、v4.10.2予定）**。[>>671](https://egg.5ch.io/test/read.cgi/software/1782419551/671) は、本の表示モードを「開いたとき、ページを表示」にすると、Everything検索結果からは設定どおりページを開くが、本を閉じると検索結果ではなくページ一覧になるという報告。閉じる入力とビューワモードは報告に記載なし。メインで開く場合を今回の修正対象とする（HEAD比較後の設計担当指示）。製品起動・実機再現試験は未実施。
-- 原因 (v4.10.0 と現行masterのコードを確認): `auto_open_for_current_container` は `global_search.active` / `favsearch.active` / `tag_view.active` の間 false を返す。検索から実フォルダの親へ飛ぶのを防ぐ既存の除外条件がEverythingにも適用され、`handle_fullscreen_close_request` が親一覧への復帰要求を立てず、画像表示だけを閉じて現在の本のページ一覧を残す。`resolve_close_return_navigation` にもEverythingの結果復帰先は含まれていない。
-- 期待する動作: メインでEverything検索結果から本を直接ページ表示した場合、通常の閉じる（Esc・Enterの閉じる操作・HUDの×等）では元の検索結果へ戻す。メイン全画面からF12で切り離した窓も同じ検索ownerなので対象とする（設計担当決定）。Backspaceで明示的にページ一覧へ戻す操作、および「開いたとき、ページ一覧を表示」の動作は維持する。独立viewerのcloseは下の既存不具合として今回の修正対象から分離し、HEADから悪化させない。
-- 方針: 検索中の除外条件を外すだけの修正にはしない。既存 `SearchAccepted::Everything` の `PhysicalChild` と `EverythingReturn::Results` / `return_from_everything_child` が保持する論理的な本・戻り先・採用済みdatasetを、通常の閉じる要求から使う。検索語・取得済み結果・表示条件と並び・開いた本の選択とスクロールの復元を既存の検索ownerに揃え、再IPCを行わず、実親フォルダや変換キャッシュへ飛ばさない。新たな戻り先boolや検索結果の第二キャッシュは追加しない。
-- 調査・検証: ZIP / PDF / 変換書庫（元パスとキャッシュを区別）と、設定ON時の画像フォルダ本で、検索結果の採用→本openの成功採用→通常の閉じる→結果復帰までを通す回帰を追加する。Backspace・明示的なページ一覧表示、検索結果からの再open、キャンセル・失敗、同じ検索除外条件を使うCtrl+G / Ctrl+S / タグビューの兄弟経路を確認する。F12・独立viewerではopen時のメインの選択・一覧を保ち、close時はHEADの帰路から悪化しないことを確認する。理想のclose時保持は下記の別項目で扱う。UI試験は事前承認と使い捨てポータブルの規則に従う。
-- 対象: `src/app.rs` の `auto_open_for_current_container` / `handle_fullscreen_close_request`、`src/app/close_return.rs`、`src/global_search_ui/everything.rs`、親移動dispatcher、関連マニュアル。[Everything検索計画 §7](everything-search-plan.md#7-openbackhistoryf12remote)、[ナビゲーション仕様](fullscreen-navigation-consistency.md)、detached経路に触る場合は[detached計画 §2](detached-rework-plan.md)を参照。対外返信は文案段階。規模 / 優先度: Small〜Medium（帰路の所有境界を調査して確定） / P2。
-
-- 修正: 採用済みEverything PhysicalChildだけを検索除外の例外とし、既存の閉じるcontinuation→`AddressBarNav::EverythingResults`→`return_from_everything_child(Results)`へ接続。保持datasetから元パスの本を選択・可視化する。新しいbool／pending／結果cache・再IPC・まれな失敗の回復処理は追加せず、detached述語／viewport経路も変更しない。
-- 兄弟経路: Ctrl+Gはdrill、Ctrl+S／タグはそれぞれnav_stackの別owner。同じ除外により通常closeではページ一覧に留まるコード経路がある。Everythingの修正では自然には直らないため、今回の範囲には含めない。
-- 初回検証（前回依頼時）: ZIP／PDF／変換書庫（元7zとcache ZIPを区別）／画像フォルダは、検索採用→open成功採用→通常closeの4件すべてで修正前REDを確認（`target/everything-close-red4.log`）。修正後の初回追加回帰は8成功／独立viewer1失敗、初回全libは15,193成功／2失敗／67 skipped（独立viewerと紙めくり）。これを受け、下記HEAD比較と続きの最終検証を実施した。環境はMSBUILDDISABLENODEREUSE=1、準備済みTurboJPEGを`target/everything-close-env.ps1`で再利用（初回CMake失敗、依存版・製品build設定は変更なし）。マニュアル・計画§7・ナビ仕様を同時更新。
-- HEAD比較（2026-10-31）: 追加テストを変更せず、srcの製品変更6ファイルだけを`f856f4f2f`へ一時復元（テスト専用exportは保持）して同じ独立viewer回帰を実行。同じmain rowsの置換で失敗（1件、exit 101）、**(A) もともとの不具合**と確定した。製品差分はfinallyでバイト単位復元・SHA-256照合済み。`target/1664-head-comparison/{manifest.json,head-detached.log,original-everything-close-return.rs}`に証跡を保持。設計担当指示により、この回帰は理想の未実装動作ではなくHEADと同じ帰路を検査する形へ変更した。最終結果は次項に記録する。
-- 最終検証（2026-10-31）: HEAD相当のclose回帰へ変更後、追加9件は全成功（`target/1664-final-regressions.log`）。複数ウィンドウ設定／F12設定の両ケースが完走し、main=Context(0)、reader=Context(1)、readerの検索inactive／accepted Metadata、close後の物理親一覧を確認した。紙めくりの同名テストは単独3回とも成功（5.57／5.71／5.66秒、`target/1664-paper-single-{1,2,3}.log`）。最終`cargo fmt`／`cargo fmt --check`／`cargo check -p mimageviewer --lib --tests --features test-script`成功（check 51.95秒、`target/1664-final-{fmt,check}.log`）。最終`test-lib-full.ps1`は750.405秒、15,195件実行・15,194成功（15 slow）・紙めくり1失敗・67 skipped、exit 100（`target/test-lib-full/runs/20261031T055543346Z-1edaa0ae/{stderr.log,junit.xml}`）。失敗は§1.447と同名で、421行・p=0.25・曲面数0／期待1も一致。単独成功／全件失敗という既存観測と整合するが原因自体は本件では未調査で、全件GREENとは扱わない。独立追補レビューACCEPT、製品コードの追加変更なし。コミット・製品起動はしない。
-- 確認用build: 関連9回帰・型check・fmt成功を根拠に、`scripts/build-dev.ps1 -PreserveRuntime`成功（normal feature set、portableなし）。core／remote service／EPUB PDF worker、FFmpeg・CRT・EffeTuneを`target/dev-runtime`へ配置し、PE検査も成功（runtime=4／pe=3、`target/1664-build-dev.log`）。起動はしていない。通常起動は`%APPDATA%\mimageviewer`の実設定・データを使い更新し得るため、利用者がinstalled／tray版を終了してから起動する。全libの紙めくり1失敗は上記のまま残す。
-
-#### 独立レビューP2追補 (2026-10-31)
-
-- P2-1: 採用済み`PhysicalChild`だけでは本の証明にならず、`photos.zip`という実フォルダも旧拡張子判定を通っていた。追加設定OFF・検索採用→実フォルダopen→画像の手動表示→Escの回帰で修正前REDを確認（`target/1664-p2-red.log`）。帰路判定をaccepted datasetの行種別・採用済み`ProjectionRecipe`・現在の論理sourceの照合に統一し、Folderは追加設定ONかつ画像のみの場合に限定する。拡張子判定そのものの既知問題§1.418は変更しない。追加設定ONと`photos.pdf`の対照、別コンテナ・変換cache・別分類・書庫内prefixの境界も回帰に含める。
-- P2-2: 旧9件の「複数ウィンドウ設定／F12設定」回帰は両方とも独立contextを直接作っており、実F12の切り替え検証ではなかった。実F12はmain contextへlinked windowを結び付け、mainの`global_search.active`と`SearchAccepted::Everything` 内の `PhysicalChild`を読む。設計担当の決定どおり、メインと同じ検索結果へ戻す。実F12キー切替→viewer viewportのEsc→結果採用→開いた本の選択・reveal→既存viewport cleanupの回帰を追加する。独立viewerは別contextのMetadataのままであり、今回の分岐は発火しない。複数ウィンドウ設定でF12切り替えが無効な既存仕様も検査する。detached述語・viewport・registry移譲は変更せず、[detached計画§11](detached-rework-plan.md#11-リワーク外からの変更記録)へ判断を記録する。
-- 最終検証: 追加13回帰すべて成功（9.29秒、`target/1664-p2-regressions-final.log`）。実F12はZIP／PDF／変換書庫／画像フォルダでmain=Context(0)のまま検索結果・選択・revealを復元し、既存cleanup後にsession=None／window binding=Noneを確認。独立viewerの両設定と複数ウィンドウ設定中のF12無効も成功。`cargo fmt`／`cargo fmt --check`、`cargo check -p mimageviewer --lib --tests --features test-script`成功（明示exit 0、`target/1664-p2-{fmt,check-final}.log`）。独立追補レビュー（gpt-6.1-sol / xhigh）ACCEPT。
-- 最終全lib: `scripts/test-lib-full.ps1`は**15,199成功／0失敗／67 skipped、744.570秒、exit 0**（11 slow・1 leaky、`target/test-lib-full/runs/20261031T064224884Z-f1bf690d/{stderr.log,junit.xml}`）。紙めくり§1.447の同名テストも成功したため、条件付きの単独3回は実施していない。全件中に設計文書の通常closeとResultsボタンの説明を整理したため、inputs変更として成功receiptの再利用記録は作られなかった。全件開始後に`src`は変更しておらず、実行結果は上記のとおり有効。環境は`MSBUILDDISABLENODEREUSE=1`、既存の`target/everything-close-env.ps1`を使用。製品起動・実機確認・コミットは行わない。
-- 確認用build: `scripts/build-dev.ps1 -PreserveRuntime`成功（exit 0、`target/1664-p2-build-dev.log`）。通常feature set・portableなしでcore／remote service／EPUB PDF workerを作成し、runtime／PE検査も成功。製品は起動していない。利用者がinstalled／tray版を終了し、通常の実設定・データを使うことを確認してから`target/dev-runtime/mimageviewer-core.exe`を起動する。実機ではEverythingから本を直接表示→通常close、および全画面→F12→Escで結果・選択・可視位置と窓の終了を確認する。
-
-#### 別ウィンドウで閉じたときの帰路 (もともとの不具合)
-
-- 状態: **未修正・今回のv4.10.2修正対象外**。上記HEAD比較で(A)を確認。独立viewerを閉じると、メインの検索結果が本の実親フォルダ一覧へ置換される。理想はメインの検索結果・選択・スクロールを保持すること。今回その理想を満たしたと扱わず、HEADからの非退行だけを回帰条件とする。
+- 経緯: §1.664 (5ch >>671、メインと linked F12 の帰路) は v4.10.2 で出荷した。調査中に、独立 viewer で閉じた場合の帰路が HEAD でも壊れていることを確かめ、範囲外として分けた。以下はそのときの記録。
+- 状態: **未修正・未着手**。§1.664 の HEAD 比較 (v4.10.1 相当の製品コードで同じ回帰を実行) で、もともとの不具合と確認。独立viewerを閉じると、メインの検索結果が本の実親フォルダ一覧へ置換される。理想はメインの検索結果・選択・スクロールを保持すること。今回その理想を満たしたと扱わず、HEADからの非退行だけを回帰条件とする。
 - 原因・所有境界: `build_viewer_context`がmainの`CloseReturnOrigin`を独立bundleへ継承し、`transfer_terminal_close_return`が`with_viewer_context_state(id)`で閉じる側の独立contextをmountして、そこのauto-openから物理親のTerminal recipeをmainへ配送する。独立側の`global_search.active=false`／`accepted=Metadata`なので、今回の`auto_open_for_current_container`のEverything例外も`resolve_close_return_navigation`先頭のEverything分岐も発火しない。検索ownerはmainのままである。実際のFolderCandidate→loading context→scan成功採用でも同じoriginを継承する。
 - 分類: [detached計画§2](detached-rework-plan.md#2-憲法-全ステージ共通の不変条件禁止事項-️-最重要)の**BA-7（所有者と資源寿命・終了遷移の所有境界）**。別の構造的修正として、mainへの帰路を作るべきcontext／close操作を設計確認する。detached述語・viewport・registry移譲は今回変更しない。
 - 検証範囲: 従来回帰は複数ウィンドウ設定とF12設定の2ケースで独立contextを直接作り、HEADと同じ帰路を検査したもの。実F12でmainに結び付ける経路の検査ではなかった。今回追加の実F12キー経路はmain所有のため対象内であり、この独立viewerの既存不具合とは区別する。HUDの実描画／クリック・実Everythingとの接続・実ウィンドウの手動確認は未実施。
