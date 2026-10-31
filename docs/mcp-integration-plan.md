@@ -1290,14 +1290,19 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
   | PDF | ページ数は catalog の `pdf_meta` を読み取り専用で引き、無ければ取消付きの `enumerate_pages_with_read_target` → `materialize_cached_document_rows` → `project_document_composition` |
 
 - 設定: 検索と同じく、その都度 `load_into_settings` で読んだ現在の設定。お気に入りの中のフォルダなら、
-  お気に入りごとの表示状態を DB から読み取り専用で読んで重ねる (一覧画面と同じ重ね方。DB への保存は 500 ms
-  遅れるので、変えた直後は最大でその分古い。読み取りの結果としてはそれで足りる)。
+  お気に入りごとの表示状態を DB から読み取り専用で読んで重ねる (一覧画面と同じ重ね方)。読むのは最後に保存された
+  表示状態で、UI は変更が止まってから 500 ms 後に保存を予約するので、変えた直後は古いことがある (同期の待ちはしない。
+  独立レビュー 5 巡目 P3)。
   ファイル名 prefix スタックの畳み表示は UI の一時状態なので重ねない (畳まない一覧を返す)。
 - 本の構成: `BookCompositionService` の `snapshot()` (lock だけ、I/O なし) から、一覧画面と同じ範囲の key で引く。
   agent server は service より前に起動するので、`install_agent_readers` で service の clone を共有 reader の束に入れる
-  (FTS の handle と同じ遅れた設置)。未設置の間は「起動処理中」の tool error (構成を黙って落とさない)。
+  (FTS の handle と同じ遅れた設置)。未設置の間と、snapshot の `status` が正常でない間
+  (service の初期 snapshot は `status=Err`・空の rows で始まる) は「本の構成を読み込み中です」の tool error。
+  rows が空であることを「構成なし」と解釈するのは `status` が正常な時だけ (構成を黙って落とさない。独立レビュー 5 巡目 P2-4)。
   保存中の構成の変更は snapshot に入っていないことがある (読み取りの時点の確定値を返す。変更の完了は待たない)。
 - 画像フォルダには本の構成が無い (一覧画面でも `ImageFolder` は対象外) ので、構成は ZIP/PDF だけに掛かる。
+- **返すのは一覧画面の基礎の一覧** (独立レビュー 5 巡目 P2-5): 一覧画面がその後に掛ける検索・★の絞り込み・facet・
+  色の絞り込み・ブックマーク / 閲覧履歴の表示の絞り込みは掛けない (どれも UI の一時状態)。tool の説明にもそう書く。
 - **書き込まない**: 一覧画面の ZIP の worker が行う `zip_key_migration`、Remote が行う `pdf_meta` の保存は agent ではしない。
 - 返す行: 項目の識別 (`path` + `subresource`)・名前・`kind` (`folder` / `image` / `video` / `audio` / `zip` / `pdf` /
   `epub` / `archive` / `zip_folder` / `pdf_page` / `zip_entry`)・大きさ・更新日時 (分かるものだけ)。
@@ -1315,12 +1320,35 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 - 対象: 画像・フォルダ・ZIP/PDF/書庫のファイル (代表の縮小画像)・ZIP の項目・PDF のページ。
   **動画・音声は 1b では「縮小画像なし (未対応)」** として返す (動画は pin・sidecar・Windows Shell と経路が別で、
   取消も受けない)。
-- 経路: 一覧画面の要求を作る関数 (`make_load_request_with_visibility` と `container_cache_base_key`。今は App の
-  private method) を、設定と項目だけを受ける `pub(crate)` の関数に取り出し (挙動は変えない)、一覧画面と agent の
-  両方がそれを使う。cache の key・代表の pin・種類の fingerprint は一覧画面と同じになる。
+- 経路: 一覧画面の要求を作る関数 (`app.rs` の自由関数 `make_load_request_with_visibility` と、App の method の
+  `container_cache_base_key`) を `pub(crate)` で共有し、cache の key・代表の pin・種類の fingerprint を一覧画面と
+  同じにする (一覧画面の挙動は変えない)。この関数が受ける入力は、agent では worker が読み取り専用で用意する
+  (独立レビュー 5 巡目 P2-2):
+
+  | 入力 | agent での取得元・値 |
+  |---|---|
+  | 項目・mtime・大きさ | `list_folder` と同じ経路で作った `GridItem` と `metadata` |
+  | 設定・種類の表示 | その都度読む現在の設定 |
+  | 代表の pin (`pin_map`・`pin_db`) | folder pin の DB を読み取り専用で開いて引く (Remote の `WorkerContext` と同じ DB) |
+  | 変換済み書庫 (`converted_archive_cache_paths`) | 渡さない。RAR・7z 等の書庫のファイルは **cache だけ** (`CacheOnly`) で、cache が無ければ `unavailable` |
+  | PDF の password | 渡さない。password 付き PDF は cache だけで、cache が無ければ `unavailable` |
+  | `archive_source_override`・full path の key | 渡さない (通常の閲覧と同じ key) |
+  | 動画の pin | 使わない (動画は 1b の対象外) |
+
   生成は既存の `process_load_request` に agent 自身の取消 (`Arc<AtomicBool>`) を渡す。
+- **agent の呼び出しは副作用を持たない** (独立レビュー 5 巡目 P2-1): 要求に「agent の読み取り」の印を足し、
+  その時は次をしない。一覧画面の挙動は変えない。
+  - ZIP のフォルダ代表を決める時の `zip_key_migration` (★・補正などの利用者の DB を書き換える)。代表を決める
+    ZIP の列挙は読み取り専用で取消を受ける `enumerate_image_entries_detailed_readonly_with_cancel` にする。
+  - PDF の cache に当たった時の `pdf_meta` の補完の予約 (agent とは別の取消で動く)。
+  - 書くのは下の「cache への保存」だけ。
+- **補正・編集**: 縮小画像は元の画像から作り、mIV の補正・編集は反映しない (一覧画面でも編集の preview は
+  `edit_preview_cache_enabled` の時だけ)。ただし **編集の「隠す」がある項目は画像を返さず `hidden_by_edit`** にする
+  (隠した部分を AI に渡さないため)。判定は「隠す」の DB の読み取り (Remote の `WorkerContext` と同じ DB)。
+  1d の見せる範囲の説明に「補正・編集は反映しない。隠す編集をした画像は渡さない」と書く。
 - **RAW は現像しない**: Remote と同じ `RawThumbHandoff::RemotePreviewOnly` を使い、埋め込みの preview か
-  cache だけ。半分の現像が要るなら「縮小画像なし」。RAW 現像 executor を agent では使わないので、その寿命を
+  cache だけ。半分の現像が要るなら「縮小画像なし」。pin・代表の解決の後の**実際の元の画像**が RAW の時も同じにし、
+  保存方針に `without_thumbnail()` を掛ける (小さな preview で PC の現像済みの行を上書きしない。5 巡目の回答 3)。RAW 現像 executor を agent では使わないので、その寿命を
   共有・停止する組み合わせが無い。
 - 返す画像: cache に当たっても、decode → 回転 (回転 DB の読み取り) → 要求の一辺 (cache の大きさを上限) で
   WebP に encode し直す (Remote と同じ)。cache の bytes をそのまま返す近道は作らない (古い行に JPEG があり、
@@ -1329,7 +1357,7 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
   (`CacheDecision::from_settings`、RAW は縮小画像を上書きしない) で、生成した時だけ書く。
   agent 専用の cache は持たない。
 - 予算 (§15.4): 画像は MCP の `content` の image block (`image/webp`) にだけ置き、text と `structuredContent` には
-  項目の識別・状態 (`ok` / `too_large` / `unavailable` / `unsupported`)・寸法だけを置く。1 件 256 KiB・合計 1 MiB。
+  項目の識別・状態 (`ok` / `too_large` / `unavailable` / `unsupported` / `hidden_by_edit`)・寸法だけを置く。1 件 256 KiB・合計 1 MiB。
   agent IPC では画像の bytes を別の欄で運ぶ (版 2 は未リリースなので型を足す)。
 - 期限: 指定順に 1 件ずつ作るので prefix が確定する tool。期限に達したら確定済みの画像 + 進む cursor (入力の位置から
   再開)。1 件もできなければ時間切れの error。
@@ -1369,22 +1397,27 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 - **worker 側** (UI へ送る前に分かる拒否): path の検証、Remote の phase が `Local` 以外。
   二重起動と同じく `ActivationOpenPath::received(path, session)` で受信時の Remote の状態を取る
   (`session` は App と同じ handle。Remote が起動していなければ両方 `None` で一致する)。
-- **窓を前に出す**: 二重起動は別の event で窓を戻してから (tray・最小化から復帰) 前面にする。agent の要求でも、
-  UI へ送る前に同じ処理 (`window_activation::activate_main_window`) を起こす。窓が隠れたままだと UI の pass が
-  回らず、受付まで届かないため。前面化は OS が拒むことがあり (失敗はログだけ。二重起動と同じ)、MCP exe は
-  要求の前に `AllowSetForegroundWindow` で core に前面化を許す (pipe の相手の PID から。効くかは未確認、
-  1d の実機確認で見る)。前面化の成否は応答に含めない。
-- **UI thread の判定** (`update_frame` の先頭、起動中の overlay で return するより前で受付を drain する):
+- **窓を前に出す**: 二重起動は別の activation event で窓を戻してから (tray・最小化から復帰) 前面にする。agent の
+  要求でも、UI へ送る前に core の中から**同じ activation event を通知**し、既存の listener に復帰を任せる
+  (窓が隠れたままだと UI の pass が回らず、受付まで届かないため。新しい復帰処理は作らない。5 巡目の回答 6)。
+  前面化は OS が拒むことがあり、失敗はログだけ (二重起動と同じ)。MCP exe が要求の前に `AllowSetForegroundWindow`
+  を呼ぶのは best effort (呼ぶ側に前面化の資格が要るので成功は保証されない。1d の実機確認で見る)。
+  前面化の成否は応答に含めない。
+- **UI thread の判定の位置** (独立レビュー 5 巡目 P2-3): 受理は `render_initial_open` の初期処理 (初期フォルダ・
+  前回の一覧を開く) の**後**、`poll_activation_open_paths` の**直前**で行う。同じ frame の初期 open に置き換えられない
+  ため。ただし `update_frame` は起動中の overlay の間 `render_initial_open` より前で return するので、`update_frame` の
+  先頭 (その return より前) でも受付を見て、overlay 中または初期処理前 (`!initialized`) なら「mIV の起動処理中です」で
+  拒否する (保留の状態は足さない)。
+- **UI thread の判定** (受理の位置で、要求ごとに):
   1. Cancelled なら捨てる (期限切れで遅れて届いた要求は実行しない)。`try_claim` で Claimed にする。
-  2. 起動中の overlay が出ていれば拒否「mIV の起動処理中です」。
-  3. 許可の段を照合する (3 以上でなければ拒否)。open は縮小画像・撮影位置を使わないので、照合するのは段だけ。
-  4. `poll_activation_open_paths` の判定 (Remote・本の構成 editor・文書を開くモーダル・sidecar 復元) を、
+  2. 許可の段を照合する (3 以上でなければ拒否)。open は縮小画像・撮影位置を使わないので、照合するのは段だけ。
+  3. `poll_activation_open_paths` の判定 (Remote・本の構成 editor・文書を開くモーダル・sidecar 復元) を、
      理由を型で返す 1 つの関数に取り出し、二重起動と agent が共有する。二重起動はその理由で今と同じく
      捨てる / 保留し、agent は理由つきの拒否を返す。
-  5. resolver の入口 (`start_startup_open_path_resolve`) に agent の source を足し、入口の判定の結果を返すようにする
+  4. resolver の入口 (`start_startup_open_path_resolve`) に agent の source を足し、入口の判定の結果を返すようにする
      (`Admitted` / `Requeued` / `Refused(理由)`)。二重起動では `Requeued` (モーダル・EPUB の cache 削除中の再送) を
      今のまま行い、agent では再送せず「いまは開けません (理由)」を返す。
-  6. 入口が `Admitted` を返した時点が**受理の確定点**。その時 1 度だけ「受け付けた」を返す
+  5. 入口が `Admitted` を返した時点が**受理の確定点**。その時 1 度だけ「受け付けた」を返す
      (`ReplyPolicy::AcceptedOperation`。送信直前の権限の再照合で失敗に変えない)。
 - 同じ frame の順序: agent の受付を先、二重起動を後に処理する。両方来たら利用者自身の二重起動が後から置き換える
   (agent 要求は受理済みなので追加の応答はしない)。
@@ -1538,6 +1571,23 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 | P2-3 期限までに新しい項目が 1 件もできない場合 | 妥当。時間切れの error。`get_item_info` は入力の位置から再開 | §15.4 |
 
 4 巡目 (設計 `f97b1ed74`): 追加の指摘なし。判定は「1a: ready」。最大の項目 + 最長の cursor で 28,474 文字 (ページ予算 38,000 以内)、envelope は 1,669 文字 (予約 2,000 以内) と計算で確認された。
+
+### 15.15 独立レビュー 5 巡目 (2026-10-31、同じ担当、設計 `c3f14e4f6`、1b・1c)
+
+判定は「1b: not ready」「1c: not ready」。Remote の engine を使わず一覧画面の純粋な関数を使う方針、全件の識別の
+digest を入れた cursor、typed admission と判定の共有は妥当とされた。1c は detached の述語・viewport の routing に
+触れず、症状パッチではない構造的な変更である、という主張に同意を得た (ClaudeCode も同じ判断)。
+
+| 指摘 | 判断 | 反映先 |
+|---|---|---|
+| P2-1 `process_load_request` が ZIP のキー移行 (利用者の DB の書き換え) と PDF の補完の予約 (別の取消) を伴う | 妥当 (`thumb_loader.rs` で確認) | §15.5「副作用を持たない」 |
+| P2-2 要求を作る関数は pin・変換済み書庫・password 等を受け、一覧画面は生成後に編集の preview を付ける | 妥当。worker が用意する入力の表、補正・編集は反映しない。**「隠す」編集のある項目は画像を返さない** (ClaudeCode の追加判断) | §15.5「経路」「補正・編集」 |
+| P2-3 frame の先頭で受理すると、同じ frame の初期 open に置き換えられ得る | 妥当 (`update_phases.rs` の `render_initial_open` で確認) | §15.6「判定の位置」 |
+| P2-4 service の初期 snapshot は `status=Err`・空の rows | 妥当 (`service.rs` で確認) | §15.5「本の構成」 |
+| P2-5 一覧画面は materializer の後に★・facet・色等で絞る | 妥当。基礎の一覧を返すと定義 | §15.5「基礎の一覧」 |
+| P3 お気に入りの表示状態の保存は「最大 500 ms」ではない (変更のたびに延びる) | 妥当 (`favorite_view_state.rs` で確認) | §15.5「設定」 |
+| 回答 3 RAW の保存抑止は解決後の実際の元の画像にも要る | 妥当 | §15.5「RAW」 |
+| 回答 6 窓の復帰は既存の activation event を通知すれば足りる。`AllowSetForegroundWindow` は保証されない | 妥当。event の通知にし、前者は best effort | §15.6「窓を前に出す」 |
 
 ## 16. 段階 1a の実装記録 (2026-10-31、基点 `17c85bb3a`、未コミット差分)
 
