@@ -1286,7 +1286,7 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
   | 対象 | 経路 |
   |---|---|
   | 実フォルダ | `scan_directory_with_settings` に取消を足した形 (既存の `scan_directory_with_visibility_cancel` と同じく途中で `Interrupted` を返す) → `materialize_local_folder_listing_with_order` |
-  | ZIP | `enumerate_image_entries_detailed_readonly_with_cancel` → `PreparedZipEnumeration::prepare` → 一覧画面と同じ raw / 表示の prefix → `materialize_archive_level(..., BOOK_READING_PAGE_ORDER, Some(grid_display_order))` → `project_archive_composition` |
+  | ZIP | `enumerate_image_entries_detailed_readonly_with_cancel` (一覧画面と同じ列挙。拡張子の判定で Susie の pool の初期化を待つことと、入れ子の ZIP を展開することも一覧画面の規則のまま。取消は I/O の境界で受ける) → `PreparedZipEnumeration::prepare` → 一覧画面と同じ raw / 表示の prefix → `materialize_archive_level(..., BOOK_READING_PAGE_ORDER, Some(grid_display_order))` → `project_archive_composition` |
   | PDF | ページ数は catalog の `pdf_meta` を読み取り専用で引き、無ければ取消付きの `enumerate_pages_with_read_target` → `materialize_cached_document_rows` → `project_document_composition` |
 
 - 設定: 検索と同じく、その都度 `load_into_settings` で読んだ現在の設定。お気に入りの中のフォルダなら、
@@ -1346,8 +1346,11 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
   `hidden_by_edit`。代表を解決しないので、返す画素と判定の key は常に同じ項目 (6 巡目 P1)。
   **ZIP の項目は旧名の key も照合する** (7 巡目 P1): v1.3.x までの CP932 名の ZIP では、隠す編集が文字化けした名前の
   key に残っていることがあり、移行 (`zip_key_migration`) は一覧画面で ZIP を開いた時にしか走らない (agent は移行しない)。
-  よって ZIP の項目では、読み取り専用で取消を受ける列挙 (`enumerate_image_entries_detailed_readonly_with_cancel`。
-  入れ子の名前も含む) の `legacy_renames` から、その項目の旧名を求め、新旧両方の key で照合する。列挙に失敗して
+  よって ZIP の項目では、新旧両方の key で照合する。旧名は**全件の列挙をせず** (列挙は拡張子の判定で Susie の pool の
+  初期化を待ち、対象以外の入れ子 ZIP も上限なしで展開する。8 巡目 P2)、対象の項目を読む 1a の `read_zip_index` /
+  `read_zip_member` の同じ読み取りの中で、各段の今の名前と旧名 (`entry.name().replace('\\', "/")`。移行の
+  `legacy_renames` と同じ求め方) を取り、入れ子の段ごとに新旧それぞれの prefix を連結して作る。key は
+  `adjustment_db::zip_entry_key` に新旧の名前を渡して作る (`zip_key_migration` と同じ)。読み取りに失敗して
   対応が決められなければ画像を返さない (`unavailable`)。回転も同じく新しい key を優先して旧 key を引く。
   1a の `get_item_info` の ZIP の項目の★も同じ旧 key を引くよう 1b で揃える (読み取りだけ。移行はしない)。DB の file が無ければ
   「隠すなし」、file があって読めなければログ + その呼び出し全体を tool error にする (「隠すなし」に倒さない)。
@@ -1615,6 +1618,16 @@ ClaudeCode の判断: 指摘はどれも、一覧画面の `process_load_request
 | P1 CP932 名の ZIP の旧 key に残った隠す編集を見落とす (agent は移行しない) | 妥当 (`zip_key_migration.rs` の対象に `conceal.db` がある) | §15.5 `get_thumbnail`「隠す」 |
 | P2 入力の上限だけでは decode の memory が決まらない (budget を省くと AVIF・WIC は無制限) | 妥当 | §15.5「decode の memory の上限」 |
 | 確認 PDF の取消の待ち方は既存の `HarvestOnCancel` | 採用 | §15.5 PDF のページ |
+
+### 15.18 独立レビュー 8 巡目 (2026-10-31、同じ担当、設計 `4b0678842`)
+
+判定は「1b: not ready」。7 巡目の P1 の契約 (新旧両 key・不明なら返さない)、256 MiB の上限、`HarvestOnCancel` は解消と確認された。
+
+| 指摘 | 判断 | 反映先 |
+|---|---|---|
+| P2 旧名のための全件の列挙が、Susie の pool の待ちと上限なしの入れ子の展開を持ち込む | 妥当。対象の項目を読む同じ読み取りで新旧の名前を取る | §15.5 `get_thumbnail`「隠す」 |
+
+`list_folder` の ZIP の一覧は同じ列挙を使うが、これは一覧画面の規則そのもの (一覧画面も同じ関数) なので変えず、その旨を表に書いた。
 
 ## 16. 段階 1a の実装記録 (2026-10-31、基点 `17c85bb3a`、未コミット差分)
 
