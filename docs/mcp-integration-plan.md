@@ -1287,7 +1287,7 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
   |---|---|
   | 実フォルダ | `scan_directory_with_settings` に取消を足した形 (既存の `scan_directory_with_visibility_cancel` と同じく途中で `Interrupted` を返す) → `materialize_local_folder_listing_with_order` |
   | ZIP | `enumerate_image_entries_detailed_readonly_with_cancel` (一覧画面と同じ列挙。拡張子の判定で Susie の pool の初期化を待つこと (1 回最大 5 秒、期限の後も worker の終了まで枠を保持する契約で扱う) と、入れ子の ZIP を展開することも一覧画面の規則のまま。取消は I/O の境界で受ける。**agent の呼び出しだけ入れ子の展開に上限を付ける** (9 巡目 P2): 入れ子 1 つ 64 MiB (1a の ZIP の項目と同じ)、同時に持つ合計 256 MiB。確保の前・読み取りの途中・nested cache に当たった時に確かめ、超えたら一覧全体を「大きすぎる入れ子の ZIP があります」の tool error にする (超えた枝を黙って省いた成功にしない)。一覧画面の呼び出しは上限なしのまま) → `PreparedZipEnumeration::prepare` → 一覧画面と同じ raw / 表示の prefix → `materialize_archive_level(..., BOOK_READING_PAGE_ORDER, Some(grid_display_order))` → `project_archive_composition` |
-  | PDF | ページ数は catalog の `pdf_meta` を読み取り専用で引き、無ければ取消付きの `enumerate_pages_with_read_target` → `materialize_cached_document_rows` → `project_document_composition` |
+  | PDF | ページ数は catalog の `pdf_meta` を読み取り専用で引き、無ければ取消付きの `enumerate_pages_with_read_target` → `materialize_cached_document_rows` → 表示する種類の設定で `allows_physical_file(logical_path)` が false なら、項目と meta を空にしてから (一覧画面の `book_composition_runtime.rs` と同じ。10 巡目 P2) → `project_document_composition` |
 
 - 設定: 検索と同じく、その都度 `load_into_settings` で読んだ現在の設定。お気に入りの中のフォルダなら、
   お気に入りごとの表示状態を DB から読み取り専用で読んで重ねる (一覧画面と同じ重ね方)。読むのは最後に保存された
@@ -1637,6 +1637,14 @@ Susie の初期化の待ちを既存の枠の保持で扱うことは妥当と�
 | 指摘 | 判断 | 反映先 |
 |---|---|---|
 | P2 入れ子の ZIP の展開は宣言の大きさをそのまま確保し、読み取り中も上限なく伸びる。期限と枠は巨大な確保を防がない | 妥当。agent の呼び出しだけ上限を付け、超えたら一覧全体を tool error | §15.5 `list_folder` の ZIP |
+
+### 15.20 独立レビュー 10 巡目 (2026-10-31、同じ担当、設計 `2b8a4452f`)
+
+判定は「1b: not ready」。9 巡目の上限は解消。§15.5 全体の最終確認で、指摘は次の 1 件だけだった。
+
+| 指摘 | 判断 | 反映先 |
+|---|---|---|
+| P2 PDF の表示する種類の設定を、構成の adapter へ渡す前に掛ける工程が無い (adapter は渡された行を `Present` と扱う) | 妥当 | §15.5 `list_folder` の PDF |
 
 ## 16. 段階 1a の実装記録 (2026-10-31、基点 `17c85bb3a`、未コミット差分)
 
