@@ -1087,4 +1087,4 @@ cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_lev
   `codex exec --json` で再実行すると、両 tool とも `limit: 1000` (上限 200) を渡していた。
   段階 1 で、範囲外の limit を上限へ丸めるか、エラー文に許容範囲 (1〜200) を書く。
 - **ChatGPT Windows アプリ (OpenAI.Codex 26.1027.3384.0)、観測者 利用者**: `target\mcp-trial\chatgpt-trial.ps1 add` で `~/.codex/config.toml` に `mimageviewer-trial` を足して起動し、同じ依頼をした。回答はタグ 4 種と件数、cat の 2 枚 (cat_garden.png = cat・outdoor、cat_sofa.png = cat・indoor) で seed と一致した。
-- Claude Desktop からの呼び出しは未確認 (利用者の他の作業のため再起動を見送り)。
+- **Claude Desktop (Squirrel 版、`app-4.4212.0`)、観測者 利用者**: `target\mcp-trial\claude-trial.ps1 add` で `%APPDATA%\Claude\claude_desktop_config.json` に `mimageviewer-trial` を足して再起動し、Chat で同じ依頼をした。回答はタグ 4 種と件数、cat の 2 枚 (cat_garden.png = outdoor・評価 0、cat_sofa.png = indoor・評価 0) で seed と一致した。段階 0 の完了条件 (§9.3) を満たした。
