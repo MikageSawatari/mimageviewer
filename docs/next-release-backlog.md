@@ -52,6 +52,19 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - §1.456 一覧の名前の文字サイズ・最大行数 (>>629): 出荷の案内は未。
 - §1.480 画像フォルダを Enter で開くと自動表示が ON でもページ一覧で止まる (>>649 の調査中に開発側で発見、v4.2.0 から): >>649 の評価フィルタの件は開発側で再現しなかった。報告者へは未返信。
 
+### 1.674 横連結読みで、画面に見えている隣の PDF ページが高画質にならず、一覧のサムネイルを拡大したままになる — 利用者報告 (2026-11-01)
+
+- 状態: **未着手・原因調査を実装担当へ (2026-11-01)**。利用者が v4.10.2 (インストール版) で PDF (`D:\home\scan\illust21030_010.pdf`、24 ページ) を全画面で閲覧中、2 枚並んだうち右はきれいで、左がサムネイル画質の拡大に見えると報告 (スクリーンショットあり)。利用者は「見開き」と認識していたが、ログ上の表示は連結読み。
+- 観測 (ClaudeCode が利用者の perf ログ `%APPDATA%\mimageviewer\logs\perf_events.jsonl` を読んだもの。アプリには触れていない。抜き出しは worktree `G:\home\mimageviewer-pdfq-1674	argetw4-evidence\`):
+  - 一覧で PDF を開き、ページ一覧から idx 0 をダブルクリックで開いた (t=5349.9)。全画面の高画質要求は t=5355.638 から **idx 3 だけ** (`scheduler_enqueue` contract=sequential、`pool_send` target_px 7539 → 3163 → 5532 と 3 回作り直し)。
+  - 画面に並んでいる **idx 4 は一度も全画面の要求が出ていない**。描画は `continuous_draw idx=4 texture=Managed(5940)` で、Managed(5940) は一覧のアイドル高画質化で作った長辺 561px のテクスチャ (`texture_delivery_submitted` t=5349.762、`page_0004` decode_end)。`final_prepare_native_lookup` も idx 4 は `native_key=null outcome=not_needed`。
+  - `page_turn_decision` は `reason=reading_flow_not_paged` (`fs_page_turn_ordinary_context_blocker`、`reading_flow.is_paged()` が false = 縦 / 横連結読み)。
+  - 先読みは `final_effect_prefetch_blocked reason=not_in_keep_set` が idx 7〜13 で毎秒出ている。idx 4 の blocked 記録は無い (要求の候補にすら上がっていない可能性)。
+  - 開いた直後 (t=5355.6〜5358.4) に `pool_promote_fullscreen trigger=not_found_retry not_found=1` が約 137 回、ほぼ毎フレーム出て止まった。同じ時間帯の idx 3 の要求とは別の、見つからない昇格対象がある。
+  - 静止中も約 40 フレーム / 秒で描画が続いている (直近 9 秒で `begin` 377 件、`tail_repaint action=none reasons=[]`)。マウス操作によるものかは未確認。
+- 調べること: 連結読みで、画面に見えているページ (現在のページ以外) に全画面の高画質要求が出る経路と、それが idx 4 で出なかった理由。keep set の作り方 (`prefetch_policy.rs` の `continuous_keep_set`)、sequential contract で現在ページ以外が後回し・取りこぼしになっていないか、ページ一覧から開いた入口に固有の問題か。`not_found_retry` の連続と、静止中の描画継続も同じ原因か別件か切り分ける。いつから起きているか (v4.10.0 のページめくり・先読みの変更との関係) も git 履歴で確かめる。
+- 対象: `src/ui_fullscreen.rs` の連結読みの描画と要求、`src/app/prefetch_policy.rs`、PDF の worker pool (`src/pdf_loader.rs`)、[表示パイプライン](display-pipeline.md)。規模: 原因確認後 / 優先度: P2 (通常の閲覧で画質が落ちる)。
+
 ### 1.673 マスクの編集で、描いたマスクに囲まれた領域を塗りつぶす (マスクを壁にしたバケツ) — 利用者要望 (2026-11-01)
 
 - 状態: **未着手・追加の方針 (利用者要望 2026-11-01、規模が小さければ次の v4 系)**。消しゴムなどで、筆でマスクの輪郭を描いた後、その輪郭に囲まれた内側をまとめて塗りたい、という要望。製品コードの変更・実機確認は未実施。
