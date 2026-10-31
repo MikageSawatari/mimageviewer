@@ -161,6 +161,47 @@ struct EditReaders {
     rotation: Option<crate::rotation_db::RotationDb>,
 }
 
+#[derive(Clone, Copy)]
+enum EditItem<'a> {
+    File,
+    PdfPage(u32),
+    ZipEntry { current: &'a str, legacy: &'a str },
+}
+
+fn edit_keys(paths: &[std::path::PathBuf], item: EditItem<'_>) -> Result<Vec<String>, AgentError> {
+    let mut keys = Vec::new();
+    // Rotation priority is spelling first (given, long, short), then current
+    // before legacy. Conceal checks every key and any hit hides the pixels.
+    for path in paths {
+        match item {
+            EditItem::ZipEntry { current, legacy } => {
+                for name in [current, legacy] {
+                    let key = crate::adjustment_db::zip_entry_key(path, name);
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+            }
+            EditItem::File | EditItem::PdfPage(_) => {
+                let grid_item = match item {
+                    EditItem::PdfPage(page_num) => crate::grid_item::GridItem::PdfPage {
+                        pdf_path: path.to_owned(),
+                        page_num,
+                        content_type: None,
+                    },
+                    _ => crate::grid_item::GridItem::Image(path.to_owned()),
+                };
+                let key =
+                    crate::edit_source::page_key_for_grid_item(&grid_item).ok_or_else(internal)?;
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+        }
+    }
+    Ok(keys)
+}
+
 fn edit_read_error() -> AgentError {
     // SQLite errors can contain the private path or item key. Only a bounded
     // category belongs in diagnostics for this agent lane.
@@ -246,7 +287,7 @@ fn read_thumbnail(
 ) -> Result<(ThumbnailItem, Option<Vec<u8>>), AgentError> {
     let path = super::input_path::validate(&item.path)?;
     let mut exact = item.clone();
-    let mut keys;
+    let keys;
     let pixels;
     if let Some(member) = &item.subresource {
         if path
@@ -257,14 +298,10 @@ fn read_thumbnail(
                 .strip_prefix("page_")
                 .and_then(|s| s.parse::<u32>().ok().filter(|n| n.to_string() == s))
                 .ok_or_else(|| error(ErrorCode::BadRequest, "ページの指定が正しくありません"))?;
-            keys = vec![
-                crate::edit_source::page_key_for_grid_item(&crate::grid_item::GridItem::PdfPage {
-                    pdf_path: path.to_owned(),
-                    page_num: page,
-                    content_type: None,
-                })
-                .ok_or_else(internal)?,
-            ];
+            keys = edit_keys(
+                &super::input_path::edit_spellings(path)?,
+                EditItem::PdfPage(page),
+            )?;
             if edits.hidden(&keys)? {
                 return Ok(unavailable(&exact, ThumbnailStatus::HiddenByEdit));
             }
@@ -281,6 +318,7 @@ fn read_thumbnail(
             if !supported(Path::new(member)) {
                 return Ok(unavailable(item, ThumbnailStatus::Unsupported));
             }
+            let paths = super::input_path::edit_spellings(path)?;
             let _permit = io
                 .acquire_cancellable(crate::io_semaphore::IoPriority::Normal, &ctx.cancel)
                 .ok_or_else(cancelled)?;
@@ -292,10 +330,13 @@ fn read_thumbnail(
                 }
             };
             exact.subresource = Some(read.name.clone());
-            keys = vec![crate::adjustment_db::zip_entry_key(path, &read.name)];
-            if read.legacy_name != read.name {
-                keys.push(crate::adjustment_db::zip_entry_key(path, &read.legacy_name));
-            }
+            keys = edit_keys(
+                &paths,
+                EditItem::ZipEntry {
+                    current: &read.name,
+                    legacy: &read.legacy_name,
+                },
+            )?;
             if edits.hidden(&keys)? {
                 return Ok(unavailable(&exact, ThumbnailStatus::HiddenByEdit));
             }
@@ -310,12 +351,7 @@ fn read_thumbnail(
         if !supported(path) {
             return Ok(unavailable(item, ThumbnailStatus::Unsupported));
         }
-        keys = vec![
-            crate::edit_source::page_key_for_grid_item(&crate::grid_item::GridItem::Image(
-                path.to_owned(),
-            ))
-            .ok_or_else(internal)?,
-        ];
+        keys = edit_keys(&super::input_path::edit_spellings(path)?, EditItem::File)?;
         if edits.hidden(&keys)? {
             return Ok(unavailable(item, ThumbnailStatus::HiddenByEdit));
         }
@@ -440,3 +476,7 @@ fn decode_bytes(
 #[cfg(test)]
 #[path = "thumbnail_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "thumbnail_alias_tests.rs"]
+mod alias_tests;

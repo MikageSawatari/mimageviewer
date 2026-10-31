@@ -2307,3 +2307,84 @@ ClaudeCode が sandbox 外の通常権限で実行するコマンド (今回の�
 cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
 cargo nextest run -p mimageviewer --lib -E '(test(/agent_ipc/) or test(/agent_level/) or test(/agent_permission/) or test(=settings_db::tests::failed_permission_commit_preserves_snapshot_and_epoch) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(/png_metadata/) or test(=pdf_loader::tests::anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results) or test(=pdf_loader::tests::page_sizes_preserve_existing_ui_diagnostic_identity) or test(=pdf_loader::tests::page_sizes_round_trip_and_reject_a_truncated_reply) or test(/app::folder_scan/) or test(/zip_loader/) or test(=pdf_loader::tests::anonymous_agent_render_and_enumerate_omit_keys_and_harvest_actual_completion) or test(=pdf_loader::tests::cancelled_anonymous_render_does_not_enqueue)) and not test(/section1375_scan_perf_tests/)'
 ```
+
+### 17.8 修正 2 回目
+
+前回成果 `b16e16b94` の sandbox 外の観測者は ClaudeCode。両crateの
+`cargo test ... -- --include-ignored` は exit 0 (11/11、49/49)、focused nextest は exit 0
+(246/246) と報告された。修正前のportable smokeでは、ClaudeCodeがCodex CLI経由で
+`samples\.\solid_secret.png` のdot成分付き表記によるconceal迂回を観測し、修正後はその表記を拒否した。
+正式な独立レビューは修正1回目の2件を受け入れたが、collectionの保存済み短名が返却後に拒否される
+P2を新たに指摘した。ClaudeCodeが採用し、`3d7ffb76f` で§15.5を更新した。
+
+#### 修正と前提の確認
+
+- `library.rs::get_collection` が `entry.source_path` を書き換えずに返すこと、collection登録が
+  短名を保持し得ること、conceal/rotationのkey生成が短名を長名へ展開しないことをコードで確認した。
+- `input_path.rs::validate` は純粋な構文検査に戻し、長名との一致条件を削除した。
+  dot成分、NUL、device/verbatim接頭辞、ADS、末尾dot/空白、重複区切りの拒否はそのまま。
+  cursorのkeyも渡された表記のcase/区切りだけを揃え、長名/短名を同一の引数へ置換しない。
+- 編集を読む時だけ、同じmoduleの `edit_spellings` が指定表記、`GetLongPathNameW`、
+  `GetShortPathNameW` の順に候補を作り、case/区切りで等価なkeyは重複させない。
+  Win32の名前展開だけを使い、`canonicalize`、junction/symlink先の解決、migrationは行わない。
+  OS2/3は各toolの既存not-found処理へ渡し、その他の名前解決失敗はInternalのtool error。
+  OS error/pathはagentのログへ渡さず、通常のrequest記録にerror種別だけを残す。
+- `thumbnail.rs` はtypedな `EditItem` と1つのkey投影で、実画像、PDF page、ZIP entryに同じ表記候補を
+  適用する。ZIPは各container表記ごとに現在名→旧CP932名を組み合わせる。concealはどれか1つのhitで
+  `hidden_by_edit`、rotationは指定→長名→短名、その中で現在名→旧名の最初のhitを使う。
+  ZIPのcontainer名は対象bytesを読む前に解決し、lookup失敗を`unavailable`へ吸収しない。
+  UI/Remote、共有reader、既存producer、wire/schema、DBの形式・保存内容は変更していない。
+
+#### 回帰
+
+- 新規 `thumbnail_alias_tests.rs`: 実際の短名を `GetShortPathNameW` で取れるvolumeでは実aliasを使う。
+  短名が生成されないvolumeでは、同じbytesを持つ2つのfixture fileとthread-localの名前解決注入を使う
+  (このbranchを実8.3の検証とは記録しない)。注入はtest buildだけで、実行thread内のscopeを出ると戻る。
+- collectionへ短名を登録→`get_collection`の返却path→`get_item_info`と`get_thumbnail`へそのまま渡し、
+  寸法と画像を取得できることを検査する。
+- 実画像、ZIP現在名/旧名、PDF pageについて、長名のconcealを短名の要求で、短名のconcealを長名の
+  要求で検出する。PDFはdecode前のconcealを確かめるため無効なPDF bytesを使用。
+  readonly照合でconceal DBが変わらないことも検査する。
+- ZIPの6keyを順に外すhandlerテストで、指定現在→指定旧→長名現在→長名旧→短名現在→短名旧の
+  rotation優先順を、非対称な画像の実WebP出力で区別する。rotation DBの書き換えもない。
+- `input_path_tests.rs` は短名を許可する期待へ変更し、cursorが長名へ置換されないこと、表記候補の
+  順序/重複除去、長名/短名どちらのlookup失敗もInternalとなることを確認する。
+  dot/prefix等の拒否と3toolのconceal迂回拒否は既存回帰のまま残す。
+
+#### 実装担当の検証
+
+観測者: 実装担当、このsandbox内、`3d7ffb76f` + 本修正、通常dev/test profile。
+今回の実装と自身による確認であり、正式な独立再レビューの代替ではない。
+
+| コマンド | 実 exit code | 結果 / ログ |
+|---|---:|---|
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | `target/mcp-1b-fix2-core.log` |
+| 下記 narrow nextest | 0 | input_path/thumbnailの20/20成功、新規handler3件を含む。`target/mcp-1b-fix2-narrow.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 101 | IPC11成功、MCP47成功/2失敗、ignore0。実pipeのOS5のみ。`target/mcp-1b-fix2-crates.log` |
+| §17.6 focused nextest | 100 | 249件中247成功/2失敗、実pipeのOS5のみ。`target/mcp-1b-fix2-focused.log` |
+| `cargo build -p mimageviewer-mcp --bin mimageviewer-mcp` | 0 | `target/mcp-1b-fix2-adapter.log` |
+| `cargo fmt` (workspace、引数なし) | 0 | 最終sourceを整形 |
+| `cargo fmt --check` | 0 | `target/mcp-1b-fix2-fmt.log` |
+| `git diff --check` | 0 | 最終差分を確認 |
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc::input_path/) or test(/agent_ipc::thumbnail/)'
+```
+
+失敗したcore2件は idle-connected shutdown とstdio fixture、adapter2件は
+withheld-response cancel と blocked-stdout cancelで、いずれもfixtureのnamed pipe作成/接続時のOS5。
+skip/ignore化、DACL変更は行っていない。FFmpeg DLLはこのworktreeに配置済みの実ファイルを使用。
+共有走査器/decoderを変更していないため、10万件走査・test-fullは再実行していない。
+
+変更ファイル: `src/agent_ipc/input_path.rs`, `input_path_tests.rs`, `thumbnail.rs`、
+新規 `thumbnail_alias_tests.rs`、本台帳。今回修正のsandbox外での実pipe成功と正式な再レビューは未観測。
+追加の設計矛盾はない。製品binary、UI、portable smokeは起動せず、commitも行っていない。
+実pipe gateがこのsandboxでは通らないため通常profileのcore確認用buildは行わず、
+依頼されたconsole adapterをbuildした。
+
+ClaudeCode が sandbox 外の通常権限で実行するコマンド (今回の修正後の成功は未観測):
+
+```powershell
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E '(test(/agent_ipc/) or test(/agent_level/) or test(/agent_permission/) or test(=settings_db::tests::failed_permission_commit_preserves_snapshot_and_epoch) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(/png_metadata/) or test(=pdf_loader::tests::anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results) or test(=pdf_loader::tests::page_sizes_preserve_existing_ui_diagnostic_identity) or test(=pdf_loader::tests::page_sizes_round_trip_and_reject_a_truncated_reply) or test(/app::folder_scan/) or test(/zip_loader/) or test(=pdf_loader::tests::anonymous_agent_render_and_enumerate_omit_keys_and_harvest_actual_completion) or test(=pdf_loader::tests::cancelled_anonymous_render_does_not_enqueue)) and not test(/section1375_scan_perf_tests/)'
+```

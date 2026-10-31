@@ -6,7 +6,7 @@ use std::io::{Cursor, Write};
 use std::sync::{Arc, atomic::AtomicBool};
 
 #[test]
-fn aliases_are_rejected_before_the_long_name_lookup() {
+fn syntactic_aliases_are_rejected_without_filesystem_lookups() {
     for path in [
         "relative.png",
         r"C:relative.png",
@@ -27,7 +27,7 @@ fn aliases_are_rejected_before_the_long_name_lookup() {
         r"\\server\",
         r"\\server\\share\a.png",
     ] {
-        let result = validate_with(path, |_| panic!("invalid path reached filesystem"));
+        let result = validate(path);
         let error = result.unwrap_err();
         assert_eq!(error.code, ErrorCode::BadRequest);
         assert_eq!(error.message, MESSAGE);
@@ -35,7 +35,7 @@ fn aliases_are_rejected_before_the_long_name_lookup() {
 }
 
 #[test]
-fn short_names_are_rejected_by_mocked_long_name_lookup() {
+fn short_names_are_admitted_and_edit_spellings_keep_given_long_short_priority() {
     // This does not depend on the volume having 8.3 name creation enabled.
     for (short, long) in [
         (r"C:\IMAGES~1\photo.png", r"C:\Images long\photo.png"),
@@ -45,42 +45,65 @@ fn short_names_are_rejected_by_mocked_long_name_lookup() {
             r"\\server\share\Book name.zip",
         ),
     ] {
-        let error = validate_with(short, |_| Ok(Some(long.into()))).unwrap_err();
-        assert_eq!(error.code, ErrorCode::BadRequest);
-        assert_eq!(error.message, MESSAGE);
+        assert_eq!(validate(short).unwrap(), Path::new(short));
+        assert_ne!(cursor_key(short).unwrap(), cursor_key(long).unwrap());
+        for (given, expected) in [(short, vec![short, long]), (long, vec![long, short])] {
+            let spellings = edit_spellings_with(Path::new(given), |path, form| {
+                assert_eq!(path, Path::new(given));
+                Ok(Some(PathBuf::from(match form {
+                    NameForm::Long => long,
+                    NameForm::Short => short,
+                })))
+            })
+            .unwrap();
+            assert_eq!(
+                spellings,
+                expected.into_iter().map(PathBuf::from).collect::<Vec<_>>()
+            );
+        }
     }
 }
 
 #[test]
 fn normal_paths_keep_case_separator_roots_and_link_identity() {
-    for (input, long) in [
-        (r"C:\", r"C:\"),
-        ("c:/Images/PHOTO.png", r"C:\Images\photo.png"),
-        (r"C:\画像\写真.png", r"C:\画像\写真.png"),
-        (r"C:\Ä\Ö.png", r"C:\ä\ö.png"),
-        (r"\\server\share\a.png", r"\\server\share\a.png"),
-        // A long-name lookup retains the link name; it does not open the final
-        // target or turn a junction into the target's unrelated edit key.
-        (r"C:\junction\a.png", r"C:\junction\a.png"),
+    for input in [
+        r"C:\",
+        "c:/Images/PHOTO.png",
+        r"C:\画像\写真.png",
+        r"C:\Ä\Ö.png",
+        r"\\server\share\a.png",
+        // Syntactic validation retains the link name instead of canonicalizing
+        // it into the target's unrelated edit key.
+        r"C:\junction\a.png",
     ] {
-        assert_eq!(
-            validate_with(input, |_| Ok(Some(long.into()))).unwrap(),
-            Path::new(input)
-        );
+        assert_eq!(validate(input).unwrap(), Path::new(input));
     }
     assert_ne!(
         key(Path::new(r"C:\junction\a.png")),
         key(Path::new(r"D:\target\a.png"))
     );
+    let path = Path::new(r"C:\missing\a.png");
     assert_eq!(
-        validate_with(r"C:\missing\a.png", |_| Ok(None)).unwrap(),
-        Path::new(r"C:\missing\a.png")
+        edit_spellings_with(path, |_, _| Ok(None)).unwrap(),
+        [path.to_owned()]
     );
-    let error = validate_with(r"C:\images\a.png", |_| {
-        Err(std::io::Error::from_raw_os_error(5))
+    let paths = edit_spellings_with(Path::new("C:/Images/photo.png"), |_, _| {
+        Ok(Some(PathBuf::from(r"c:\images\PHOTO.PNG")))
     })
-    .unwrap_err();
-    assert_eq!(error.code, ErrorCode::Internal);
+    .unwrap();
+    assert_eq!(paths.len(), 1);
+    for failure in [NameForm::Long, NameForm::Short] {
+        let error = edit_spellings_with(path, |_, form| {
+            if form == failure {
+                Err(std::io::Error::from_raw_os_error(5))
+            } else {
+                Ok(Some(path.to_owned()))
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(!error.message.contains("missing"));
+    }
 }
 
 fn context(fixture: &Fixture) -> ReadContext {
