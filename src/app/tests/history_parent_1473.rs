@@ -4,6 +4,9 @@ use crate::ring_shortcut::{MouseButtonSlot, RingActionId, RingShortcutContext};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+#[path = "physical_parent_1672.rs"]
+mod physical_parent_1672;
+
 // App and its workers must drop before the override, temporary files and global lock.
 pub(super) struct CaseEnv {
     app: App,

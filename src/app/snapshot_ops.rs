@@ -3913,6 +3913,68 @@ mod tests {
     }
 
     #[test]
+    fn section1672_snapshot_physical_child_can_explicitly_leave_fixed_scope() {
+        use crate::app::book_materialization::{BookScope, ProjectionRecipe};
+        let mut app =
+            test_app_with_items(vec![GridItem::Image(PathBuf::from(r"E:\test\page.png"))]);
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
+        assert!(!app.grid_physical_parent_action().available());
+        let parent = app.tmp.path().join("missing-physical-parent");
+        let child = parent.join("child.pdf");
+        app.current_folder = Some(child.clone());
+        app.projection_recipe = ProjectionRecipe::Book(BookScope::Document(child.clone()));
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: child.clone(),
+            page_num: 0,
+            content_type: None,
+        }];
+        assert!(app.grid_physical_parent_action().available());
+        assert!(
+            app.is_snapshot_active(),
+            "preview must not dismiss membership"
+        );
+        assert!(matches!(
+            app.grid_parent_action(),
+            super::super::grid_parent::GridParentAction::SnapshotList
+        ));
+        app.handle_grid_physical_parent_action();
+        assert!(!app.is_snapshot_active());
+        assert_eq!(app.current_folder.as_ref(), Some(&child));
+        let pending = app
+            .folder_pane_open_pending
+            .take()
+            .expect("existing jump scan owns selection");
+        assert_eq!(pending.path, parent);
+        assert!(
+            matches!(&pending.purpose, super::super::FolderOpenScanPurpose::JumpToPhysicalFolder {
+            selection: crate::ui_dialogs::context_menu::JumpToFolderSelection::ExactPath(path), ..
+        } if path == &child)
+        );
+        pending
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let before = app.items.clone();
+        let ready = super::super::FolderPaneOpenReady {
+            path: pending.path,
+            purpose: pending.purpose,
+            navigation: pending.navigation,
+            epub_restore: None,
+            scan: Err(std::io::Error::new(std::io::ErrorKind::NotFound, "fixture")),
+        };
+        assert!(
+            app.resolve_main_folder_open_ready(&egui::Context::default(), ready)
+                .is_none()
+        );
+        assert_eq!(app.current_folder.as_ref(), Some(&child));
+        assert_eq!(app.items, before);
+        assert!(
+            !app.is_snapshot_active(),
+            "failure does not recreate fixed membership"
+        );
+    }
+
+    #[test]
     fn g1_snapshot_child_return_and_deactivation_restore_accepted_recipes() {
         use crate::app::book_materialization::{BookScope, ExtractedSurface, ProjectionRecipe};
         let items = vec![GridItem::Image(PathBuf::from(r"E:\test\page.png"))];

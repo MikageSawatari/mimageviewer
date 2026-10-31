@@ -562,6 +562,7 @@ preferences_policy! {
         show_address_bar_history_nav => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_address_bar_quick_folders => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_toolbar_parent_button => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        show_toolbar_physical_parent_button => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_toolbar_prev_folder => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_toolbar_next_folder => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_toolbar_vst3 => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -1986,7 +1987,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 480);
+        assert_eq!(entries.len(), 481);
         assert_eq!(
             entries
                 .iter()
@@ -1999,7 +2000,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            326
+            327
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2013,6 +2014,7 @@ mod tests {
             "show_toolbar_search_local",
             "show_toolbar_search_metadata",
             "show_toolbar_search_everything",
+            "show_toolbar_physical_parent_button",
         ] {
             assert!(
                 entries

@@ -4,7 +4,34 @@
 //! make a synthetic root fall through to its backing directory's physical parent.
 
 use super::{App, StartupListIntent};
+use crate::ui_dialogs::context_menu::{
+    JumpToFolderDestination, JumpToFolderRequest, JumpToFolderSelection,
+};
 use crate::ui_main::AddressBarNav;
+use std::path::PathBuf;
+
+/// A preview is an input-local value, never a second navigation/pending owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GridPhysicalParentAction {
+    Disabled(&'static str),
+    Jump(JumpToFolderRequest),
+    DriveList(PathBuf),
+}
+
+impl GridPhysicalParentAction {
+    pub(crate) fn available(&self) -> bool {
+        !matches!(self, Self::Disabled(_))
+    }
+
+    pub(crate) fn tooltip(&self) -> String {
+        let destination = match self {
+            Self::Disabled(reason) => (*reason).to_owned(),
+            Self::Jump(request) => request.destination.path().display().to_string(),
+            Self::DriveList(_) => "ドライブ一覧".to_owned(),
+        };
+        format!("実際の親フォルダへ移動する\n{destination}")
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum GridParentAction {
@@ -356,6 +383,85 @@ enum GridParentPresentation {
 }
 
 impl App {
+    /// Resolve the displayed listing, not a selected row or its logical return route.
+    /// All facts are already owned by this viewer context; preview performs no I/O.
+    pub(crate) fn grid_physical_parent_action(&self) -> GridPhysicalParentAction {
+        use super::top_level_grid_view::{CollectionGridPosition, SmartFolderPosition};
+        let synthetic_root = self.items_are_drive_list
+            || self.items_are_global_search_view
+            || self.favsearch.on_results_grid()
+            || self.items_are_tag_view
+            || self.items_are_rating_view
+            || self.items_are_reading_history_view
+            || self.items_are_bookmark_view
+            || self.items_are_subfolder_expansion_view
+            || self.projection_recipe.extracted_surface().is_some()
+            || self
+                .top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| matches!(session.position, CollectionGridPosition::Root))
+            || self
+                .top_level_grid_view
+                .smart_folder()
+                .is_some_and(|state| matches!(state.position, SmartFolderPosition::Root));
+        if synthetic_root {
+            return GridPhysicalParentAction::Disabled("この一覧には実際の親フォルダがありません");
+        }
+        // ZipNavState keeps the outer backing archive even at a nested prefix.
+        // The override is the accepted original source for converted ZIPs/EPUBs.
+        let source = self
+            .archive_source_override
+            .as_ref()
+            .or_else(|| self.zip_nav.as_ref().map(|nav| &nav.tree.zip_path))
+            .or(self.current_folder.as_ref());
+        let Some(source) = source.filter(|path| !super::is_synthetic_view_path(path)) else {
+            return GridPhysicalParentAction::Disabled("現在の実フォルダがありません");
+        };
+        match source.parent() {
+            Some(parent) => GridPhysicalParentAction::Jump(JumpToFolderRequest {
+                destination: JumpToFolderDestination::PhysicalDirectory(parent.to_path_buf()),
+                selection: JumpToFolderSelection::ExactPath(source.clone()),
+                origin: None,
+            }),
+            None => GridPhysicalParentAction::DriveList(source.clone()),
+        }
+    }
+
+    pub(crate) fn handle_grid_physical_parent_action(&mut self) -> Option<AddressBarNav> {
+        let action = self.grid_physical_parent_action();
+        if !action.available() || self.document_open_modal_admission_blocked() {
+            return None;
+        }
+        // A physical child may have been opened from a fixed list. Explicitly leaving
+        // it ends that membership without restoring an unrelated saved root first.
+        if self.is_snapshot_active() {
+            self.dismiss_snapshot_with_origin();
+        }
+        match action {
+            GridPhysicalParentAction::Disabled(_) => None,
+            GridPhysicalParentAction::Jump(request) => {
+                // Classification, cancellation, exact selection and success-only exit of
+                // temporary views all belong to the existing explicit-jump transaction.
+                self.begin_context_jump_to_folder(request);
+                None
+            }
+            GridPhysicalParentAction::DriveList(root) => {
+                if !self.document_open_modal_admission_blocked() {
+                    self.adopt_synthetic_surface(
+                        super::FolderNavHistoryTarget::Path(super::drive_list_synthetic_path()),
+                        super::MainHistoryOperation::Direct(
+                            super::DirectNavigationPurpose::ExitTemporaryView {
+                                selection: JumpToFolderSelection::None,
+                            },
+                        ),
+                        Some(Some(root)),
+                    );
+                }
+                None
+            }
+        }
+    }
+
     pub(crate) fn grid_parent_action(&self) -> GridParentAction {
         if self.is_snapshot_active()
             // A history root uses its typed exit below, ending the fixed scope.

@@ -640,6 +640,7 @@ pub enum RingActionId {
     GridHistoryBack,
     GridHistoryForward,
     GridParentFolder,
+    GridPhysicalParentFolder,
     TreeFolderPrev,
     TreeFolderNext,
     SiblingFolderPrev,
@@ -1079,6 +1080,7 @@ impl RingActionId {
             Self::GridHistoryBack => "grid_history_back",
             Self::GridHistoryForward => "grid_history_forward",
             Self::GridParentFolder => "grid_parent_folder",
+            Self::GridPhysicalParentFolder => "grid_physical_parent_folder",
             Self::TreeFolderPrev => "tree_folder_prev",
             Self::TreeFolderNext => "tree_folder_next",
             Self::SiblingFolderPrev => "sibling_folder_prev",
@@ -1200,6 +1202,7 @@ impl RingActionId {
             "grid_history_back" => Self::GridHistoryBack,
             "grid_history_forward" => Self::GridHistoryForward,
             "grid_parent_folder" => Self::GridParentFolder,
+            "grid_physical_parent_folder" => Self::GridPhysicalParentFolder,
             "tree_folder_prev" => Self::TreeFolderPrev,
             "tree_folder_next" => Self::TreeFolderNext,
             "sibling_folder_prev" => Self::SiblingFolderPrev,
@@ -1378,6 +1381,7 @@ impl RingActionId {
             Self::GridHistoryBack => "フォルダ履歴 戻る",
             Self::GridHistoryForward => "フォルダ履歴 進む",
             Self::GridParentFolder => "親フォルダへ",
+            Self::GridPhysicalParentFolder => "実際の親フォルダへ移動",
             Self::TreeFolderPrev => "ツリー順 前フォルダ",
             Self::TreeFolderNext => "ツリー順 次フォルダ",
             Self::SiblingFolderPrev => "兄弟フォルダ 前",
@@ -1477,6 +1481,7 @@ impl RingActionId {
                     | Self::GridHistoryBack
                     | Self::GridHistoryForward
                     | Self::GridParentFolder
+                    | Self::GridPhysicalParentFolder
                     | Self::TreeFolderPrev
                     | Self::TreeFolderNext
                     | Self::SiblingFolderPrev
@@ -1638,6 +1643,7 @@ impl RingActionId {
                 Self::GridHistoryBack,
                 Self::GridHistoryForward,
                 Self::GridParentFolder,
+                Self::GridPhysicalParentFolder,
                 Self::TreeFolderPrev,
                 Self::TreeFolderNext,
                 Self::SiblingFolderPrev,
@@ -3054,6 +3060,58 @@ impl RightDragRecognition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_parent_assignment_is_grid_only_and_roundtrips_without_defaults() {
+        let action = RingActionId::GridPhysicalParentFolder;
+        assert_eq!(action.as_str(), "grid_physical_parent_folder");
+        assert_eq!(
+            RingActionId::from_str(action.as_str()),
+            Some(action.clone())
+        );
+        for &context in RingShortcutContext::all() {
+            assert_eq!(
+                action.is_valid_for_context(context),
+                context == RingShortcutContext::Grid
+            );
+            assert_eq!(
+                RingActionId::available_for_context(context).contains(&action),
+                context == RingShortcutContext::Grid
+            );
+        }
+        assert!(
+            RingActionId::available_for_right_drag_context(RightDragContext::Grid)
+                .contains(&action)
+        );
+        let defaults = RingShortcutSettings::default();
+        assert!(!defaults.grid.slots.contains(&action));
+        assert!(
+            !defaults
+                .mouse_gestures_grid
+                .bindings
+                .iter()
+                .any(|binding| binding.action == action)
+        );
+        assert_ne!(defaults.mouse_buttons_grid.back, action);
+        assert_ne!(defaults.mouse_buttons_grid.forward, action);
+        assert_ne!(defaults.mouse_buttons_grid.middle, action);
+        let mut settings = defaults;
+        settings.profile_mut(RingShortcutContext::Grid).slots[0] = action.clone();
+        settings.mouse_buttons_grid.back = action.clone();
+        settings.mouse_buttons_grid.forward = action.clone();
+        settings.mouse_buttons_grid.middle = action.clone();
+        settings
+            .mouse_gestures_grid
+            .bindings
+            .push(MouseGestureBinding::new(
+                vec![MouseGestureDirection::Down, MouseGestureDirection::Up],
+                action,
+            ));
+        let mut loaded: RingShortcutSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        loaded.sanitize();
+        assert_eq!(loaded, settings);
+    }
 
     #[test]
     fn copy_actions_are_candidates_in_grid_and_image_contexts_with_stable_ids() {

@@ -251,6 +251,7 @@
 # GridOpenExternalPlayer = Shift+Enter ; 選択中の動画を外部プレイヤーで開く
 # GridParentFolder.1 = Backspace ; 親フォルダへ移動する
 # GridParentFolder.2 = Alt+Up ; 親フォルダへ移動する
+# GridPhysicalParentFolder = none ; 実際の親フォルダへ移動する
 # GridHistoryBack = Alt+Left ; フォルダ履歴を戻る
 # GridHistoryForward = Alt+Right ; フォルダ履歴を進む
 # GridMoveFirst = Home ; 先頭の項目へ移動する

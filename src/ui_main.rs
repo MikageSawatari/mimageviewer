@@ -25,6 +25,47 @@ use crate::settings::{
 };
 use crate::tag_view::{TagViewMenuChoice, tag_view_menu_sections};
 
+const PHYSICAL_PARENT_BUTTON_WIDTH: f32 = 28.0;
+const PHYSICAL_PARENT_ACTION_LABEL: &str = "実際の親フォルダへ移動";
+
+/// Folder outline and up arrow are painted independently of installed fonts.
+fn physical_parent_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
+    let response = ui.add_enabled(
+        enabled,
+        egui::Button::new("").min_size(egui::vec2(PHYSICAL_PARENT_BUTTON_WIDTH, 20.0)),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::Button, enabled, PHYSICAL_PARENT_ACTION_LABEL)
+    });
+    let color = if enabled {
+        ui.style().interact(&response).fg_stroke.color
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let stroke = egui::Stroke::new(1.4, color);
+    let origin = response.rect.center() - egui::vec2(9.0, 7.0);
+    let point = |x, y| origin + egui::vec2(x, y);
+    ui.painter().add(egui::Shape::line(
+        vec![
+            point(0.0, 14.0),
+            point(0.0, 2.0),
+            point(6.0, 2.0),
+            point(8.0, 5.0),
+            point(18.0, 5.0),
+            point(18.0, 14.0),
+            point(0.0, 14.0),
+        ],
+        stroke,
+    ));
+    ui.painter()
+        .line_segment([point(12.0, 11.0), point(12.0, 0.0)], stroke);
+    ui.painter().add(egui::Shape::line(
+        vec![point(8.5, 3.5), point(12.0, 0.0), point(15.5, 3.5)],
+        stroke,
+    ));
+    response
+}
+
 // Headless pointer entry shared by the rating/list-order investigation tests.
 #[cfg(test)]
 pub(crate) fn ratingnav649_double_click_for_test(app: &mut App, idx: usize) -> AddressBarNav {
@@ -12076,6 +12117,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         s.show_address_bar_history_nav = true;
         s.show_address_bar_quick_folders = true;
         s.show_toolbar_parent_button = true;
+        s.show_toolbar_physical_parent_button = false;
         s.show_toolbar_prev_folder = true;
         s.show_toolbar_next_folder = true;
         s.show_address_bar_favorite_button = true;
@@ -12436,6 +12478,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .checkbox(
                 &mut self.settings.show_toolbar_parent_button,
                 "親フォルダ (⬆)",
+            )
+            .changed();
+        changed |= ui
+            .checkbox(
+                &mut self.settings.show_toolbar_physical_parent_button,
+                PHYSICAL_PARENT_ACTION_LABEL,
             )
             .changed();
         let mut show_tree_nav =
@@ -14956,6 +15004,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let show_history_nav = self.settings.show_address_bar_history_nav;
         let show_quick_folders = self.settings.show_address_bar_quick_folders;
         let show_parent = self.settings.show_toolbar_parent_button;
+        let show_physical_parent = self.settings.show_toolbar_physical_parent_button;
+        let physical_parent_action =
+            show_physical_parent.then(|| self.grid_physical_parent_action());
         let show_tree_nav =
             self.settings.show_toolbar_prev_folder || self.settings.show_toolbar_next_folder;
         if show_history_nav {
@@ -14968,18 +15019,23 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 widths.button(ui, egui::RichText::new(text).monospace().strong(), 24.0);
             }
         }
-        if (show_history_nav || show_quick_folders) && (show_parent || show_tree_nav) {
+        if (show_history_nav || show_quick_folders)
+            && (show_parent || show_physical_parent || show_tree_nav)
+        {
             widths.space(6.0 + ui.spacing().item_spacing.x);
         }
         if show_parent {
             widths.button(ui, "⬆", 0.0);
+        }
+        if show_physical_parent {
+            widths.button(ui, "", PHYSICAL_PARENT_BUTTON_WIDTH);
         }
         if show_tree_nav {
             for text in ["▲", "▼"] {
                 widths.button(ui, text, 0.0);
             }
         }
-        if show_history_nav || show_parent || show_tree_nav {
+        if show_history_nav || show_parent || show_physical_parent || show_tree_nav {
             widths.space(6.0 + ui.spacing().item_spacing.x);
         }
         widths.button(ui, "場所▼", 0.0);
@@ -15130,6 +15186,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     let show_history_nav = self.settings.show_address_bar_history_nav;
                     let show_quick_folders = self.settings.show_address_bar_quick_folders;
                     let show_parent = self.settings.show_toolbar_parent_button;
+                    let show_physical_parent = self.settings.show_toolbar_physical_parent_button;
                     let show_tree_nav = self.settings.show_toolbar_prev_folder
                         || self.settings.show_toolbar_next_folder;
 
@@ -15259,7 +15316,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                     }
 
-                    if (show_history_nav || show_quick_folders) && (show_parent || show_tree_nav) {
+                    if (show_history_nav || show_quick_folders)
+                        && (show_parent || show_physical_parent || show_tree_nav)
+                    {
                         ui.separator();
                     }
 
@@ -15355,6 +15414,20 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                     }
 
+                    if let Some(action) = physical_parent_action.as_ref() {
+                        let response = physical_parent_button(ui, action.available());
+                        let response = if action.available() {
+                            response.hover_tip(action.tooltip())
+                        } else {
+                            response.hover_tip_disabled(action.tooltip())
+                        };
+                        #[cfg(feature = "test-script")]
+                        crate::test_script::register_clickable_widget("physical-parent", &response);
+                        if response.clicked() {
+                            result = self.handle_grid_physical_parent_action();
+                        }
+                    }
+
                     if show_tree_nav {
                         // 検索中は ▲▼ を「前後のヒットフォルダへ移動」に転用する
                         // (キーボード Ctrl+↑↓ と一致)。最上位では disabled。
@@ -15404,7 +15477,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                     }
 
-                    if show_history_nav || show_parent || show_tree_nav {
+                    if show_history_nav || show_parent || show_physical_parent || show_tree_nav {
                         ui.separator();
                     }
 
@@ -31536,6 +31609,151 @@ mod section207_tests {
     }
 
     #[test]
+    fn physical_parent_folder_bar_snapshot() {
+        let fonts = Cell::new(false);
+        let mut path = String::from(r"C:\Books\Sample");
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(760.0, 90.0))
+            .build_ui(move |root| {
+                crate::test_ui::full_viewport_ui(root, |root| {
+                    crate::os_theme::apply_resolved(
+                        root.ctx(),
+                        crate::os_theme::ResolvedTheme::Dark,
+                    );
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(root.ctx());
+                        root.ctx().request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root, |ui| {
+                        use crate::ui_toolbar_layout as layout;
+                        // Pure folder-bar preview shares the production controls,
+                        // width policy and painter; no App, files or worker setup.
+                        ui.horizontal_wrapped(|ui| {
+                            let mut widths = layout::FolderBarWidth::with_input();
+                            widths.label(ui, "フォルダ:");
+                            for text in ["←", "→", "⬆", "▲", "▼", "場所▼"] {
+                                widths.button(ui, text, 0.0);
+                            }
+                            widths.button(ui, "", PHYSICAL_PARENT_BUTTON_WIDTH);
+                            widths.space(3.0 * (6.0 + ui.spacing().item_spacing.x) + 4.0);
+                            let mut right = layout::FolderBarWidth::controls();
+                            right.label(ui, egui::RichText::new("(25/120)").size(11.0).monospace());
+                            layout::flexible_section(
+                                ui,
+                                widths.width() + right.width(),
+                                false,
+                                |ui, compact| {
+                                    layout::folder_controls(ui, compact, |ui| {
+                                        let path_label = ui.label("フォルダ:");
+                                        let _ = ui.button("←");
+                                        let _ = ui.button("→");
+                                        ui.separator();
+                                        let _ = ui.button("⬆");
+                                        let _ = physical_parent_button(ui, true);
+                                        let _ = ui.button("▲");
+                                        let _ = ui.button("▼");
+                                        ui.separator();
+                                        let _ =
+                                            layout::folder_menu_button(ui, true, "場所▼", |_| {});
+                                        ui.add_space(4.0);
+                                        ui.separator();
+                                        layout::folder_tail(
+                                            ui,
+                                            layout::FolderBarWidth::with_input().width(),
+                                            right.width(),
+                                            |ui, part| match part {
+                                                layout::FolderTailPart::RightControls => {
+                                                    ui.label(
+                                                        egui::RichText::new("(25/120)")
+                                                            .size(11.0)
+                                                            .monospace()
+                                                            .color(ui.visuals().weak_text_color()),
+                                                    );
+                                                }
+                                                layout::FolderTailPart::Input => {
+                                                    layout::address_input(ui, None, |ui| {
+                                                        crate::ime_focus::add_singleline(
+                                                            ui,
+                                                            &mut path,
+                                                            None,
+                                                            |edit| {
+                                                                edit.desired_width(f32::INFINITY)
+                                                            },
+                                                        )
+                                                        .labelled_by(path_label.id);
+                                                    });
+                                                }
+                                            },
+                                        );
+                                    });
+                                },
+                            );
+                        });
+                    });
+                });
+            });
+        harness.run();
+        harness.snapshot("physical_parent_folder_bar_dark");
+    }
+
+    #[test]
+    fn physical_parent_folder_menu_toggle_controls_toolbar_and_resets_to_hidden() {
+        for width in [360.0, 1200.0] {
+            let mut env = crate::app::setup_app_for_test();
+            only_folder_and_tree(&mut env);
+            let folder = env.tmp.path().join("physical-parent-button");
+            std::fs::create_dir_all(&folder).unwrap();
+            env.load_folder_with_scan(folder, None);
+            let app = Rc::new(RefCell::new(env));
+            let render = Rc::clone(&app);
+            let settings_menu = Rc::new(Cell::new(false));
+            let render_settings_menu = Rc::clone(&settings_menu);
+            let fonts = Cell::new(false);
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(width, 700.0))
+                .build_ui(move |root| {
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(root.ctx());
+                        root.ctx().request_repaint();
+                        return;
+                    }
+                    if render_settings_menu.get() {
+                        render.borrow_mut().draw_folder_bar_settings_menu(root);
+                    } else {
+                        render.borrow_mut().render_toolbar(root);
+                    }
+                });
+            harness.run();
+            assert!(
+                harness
+                    .query_by_label(PHYSICAL_PARENT_ACTION_LABEL)
+                    .is_none()
+            );
+            settings_menu.set(true);
+            harness.run();
+            harness.get_by_label(PHYSICAL_PARENT_ACTION_LABEL).click();
+            harness.run();
+            assert!(app.borrow().settings.show_toolbar_physical_parent_button);
+            settings_menu.set(false);
+            harness.run();
+            let button = harness.get_by_label(PHYSICAL_PARENT_ACTION_LABEL);
+            assert!(!button.accesskit_node().is_disabled());
+            assert!(harness.ctx.content_rect().contains_rect(button.rect()));
+            let input = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
+            assert!(input.width() >= crate::ui_toolbar_layout::ADDRESS_INPUT_MIN_WIDTH);
+            app.borrow_mut().reset_toolbar_customization();
+            harness.run();
+            assert!(!app.borrow().settings.show_toolbar_physical_parent_button);
+            assert!(
+                harness
+                    .query_by_label(PHYSICAL_PARENT_ACTION_LABEL)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn section1450_other_toolbar_labels_do_not_select_text_when_dragged() {
         for label in ["列:", "フォルダ:"] {
             let mut app = crate::app::setup_app_for_test();
@@ -32105,6 +32323,7 @@ mod section207_tests {
                         env.settings.show_address_bar_history_nav = buttons;
                         env.settings.show_address_bar_quick_folders = buttons;
                         env.settings.show_toolbar_parent_button = buttons;
+                        env.settings.show_toolbar_physical_parent_button = buttons;
                         env.settings.show_toolbar_prev_folder = buttons;
                         env.settings.show_toolbar_next_folder = buttons;
                         env.settings.show_address_bar_history_menu = buttons;

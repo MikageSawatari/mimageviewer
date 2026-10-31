@@ -78,14 +78,43 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.672 論理的な「親へ」とは別に、実際の親フォルダへ移動する操作を追加する — 5ch >>691 (2026-11-01)
 
-- 状態: **未着手・追加の方針を採用 (利用者決定 2026-11-01)**。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643)・[>>656](https://egg.5ch.io/test/read.cgi/software/1782419551/656) の閲覧履歴からの親移動を v4.10.1 で修正した後、[>>691](https://egg.5ch.io/test/read.cgi/software/1782419551/691) でツリー幅と内部データフォルダへ移らなくなったことは確認された。一方、閲覧履歴から `C:\book\book1` を開いて親操作すると `C:\book` ではなく閲覧履歴、その次に履歴の入口へ戻るため、実際の親へ移りたい用途と合っていない。現在の動作は意図した仕様であり、実親へ移動できない技術的制約ではない。
+- 状態: **実装済み・実機未確認 (2026-11-01)**。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643)・[>>656](https://egg.5ch.io/test/read.cgi/software/1782419551/656) の閲覧履歴からの親移動を v4.10.1 で修正した後、[>>691](https://egg.5ch.io/test/read.cgi/software/1782419551/691) でツリー幅と内部データフォルダへ移らなくなったことは確認された。一方、閲覧履歴から `C:\book\book1` を開いて親操作すると `C:\book` ではなく閲覧履歴、その次に履歴の入口へ戻るため、実際の親へ移りたい用途と合っていない。現在の動作は意図した仕様であり、実親へ移動できない技術的制約ではない。
 - 既存操作は維持する。「戻る / 進む」は実際の移動履歴、「親へ」は現在の一覧の論理階層 (検索・閲覧履歴等の起点への復帰を含む) として扱う。履歴には途中の移動も積まれるため、履歴Backだけで論理親への操作を置き換えない。既存の `GridParentFolder` や Backspace / Alt+↑、全画面を閉じる際の帰路を実親へ変更しない。
 - 新操作 (仮称「実際の親フォルダへ移動」): 通常の実フォルダではその物理的な親へ移動する。ZIP / PDF 等の内部では、その本が置かれている実フォルダへ抜け、本の項目を選択する。画像フォルダを本扱いしている場合も、元フォルダの親へ移り、そのフォルダを選択する。変換した RAR / 7z / LZH / EPUB 等では内部キャッシュではなく元ファイルの置き場所を使う。入れ子書庫の内部では、実在する外側の元書庫の置き場所を解決し、仮想パスに単純な `.parent()` をかけない。
 - 閲覧履歴・検索結果・コレクション等の一覧そのものは物理的な親を持たないため、新操作は無効とする。偶然残っている `current_folder` や選択中の1項目から移動先を推測しない。選択した項目の置き場所へ行く既存メニュー (閲覧履歴の「この本のフォルダに移動」等) は維持する。明示的に実フォルダへ抜けた後は、そのフォルダを通常表示し、次の親操作で古い仮想一覧の帰路へ引き戻されないよう既存の明示移動の採用規則へ接続する。
 - UI: 一覧用の新しい `KeyAction` とマウスボタン・リング・ジェスチャの候補へ追加し、既定の割り当てはなし。フォルダバーにも独立したアイコンボタンを追加し、**既定非表示**・既存のツールバー表示設定で個別に表示可能とする。既存の上矢印と見分けられるフォルダ＋上矢印系のアイコンにし、ツールチップは操作名と移動先を示す。表示・非表示の両方で既存配置を保ち、幅不足の扱いも既存バーの規則に合わせる。
 - 実装時: 新操作の可否・移動先・移動後に選ぶ本を共通resolverで確定し、ボタンのpreviewと各入力で同じ結果を使う。`src/app/grid_parent.rs::resolve_physical_grid_parent_nav` は既存の限定用途のhelperであり、合成一覧や変換元の適格性を確認せずそのまま公開しない。`src/ui_dialogs/context_menu.rs::jump_to_book_folder_request` と物理フォルダへの明示移動・選択復元の経路を参照し、同期I/Oや新たなpending状態を足さない。独立viewerの帰路問題 (§1.670) の症状修正や、閲覧履歴の既存帰路設計の変更とは分ける。
-- 検証: 閲覧履歴 / 検索から開いた通常フォルダ・画像フォルダ本・ZIP内部階層・PDF・変換書庫を対象に、論理親と新操作の行き先の違い、元ファイルの選択、キャッシュ非露出、実フォルダへ抜けた後の親移動を確認する。各仮想一覧rootでは無効、previewは副作用なし、ボタン / キー / マウス / リング / ジェスチャの意味が一致することを検査する。既存の履歴Back/Forward、論理親、同じ場所を開いた別contextの状態を変えない回帰と、ボタンの表示設定・UI snapshot・マニュアル更新を含める。製品コードの実装と実機確認は未実施。
-- 対象: `src/app/grid_parent.rs`、`src/ui_main.rs` のフォルダバー、設定・環境設定、`src/keymap.rs`、`src/ring_shortcut.rs` と既存入力dispatcher、関連テスト。[閲覧履歴の設計](reading-history-plan.md)、[§1.473の親移動の調査・設計](history-parent-1473-investigation.md)、[キー仕様](keymap-spec.md)、[仮想フォルダ](virtual-folders.md) を参照。規模: 設計時に確定 / 優先度: P3。リリース時期は未指定。
+- 検証: 閲覧履歴 / 検索から開いた通常フォルダ・画像フォルダ本・ZIP内部階層・PDF・変換書庫を対象に、論理親と新操作の行き先の違い、元ファイルの選択、キャッシュ非露出、実フォルダへ抜けた後の親移動を確認する。各仮想一覧rootでは無効、previewは副作用なし、ボタン / キー / マウス / リング / ジェスチャの意味が一致することを検査する。既存の履歴Back/Forward、論理親、同じ場所を開いた別contextの状態を変えない回帰と、ボタンの表示設定・UI snapshot・マニュアル更新を含める。製品コードは実装済み。製品の起動・実機確認は未実施。
+- 対象: `src/app/grid_parent.rs`、`src/ui_main.rs` のフォルダバー、設定・環境設定、`src/keymap.rs`、`src/ring_shortcut.rs` と既存入力dispatcher、関連テスト。[閲覧履歴の設計](reading-history-plan.md)、[§1.473の親移動の調査・設計](history-parent-1473-investigation.md)、[キー仕様](keymap-spec.md)、[仮想フォルダ](virtual-folders.md) を参照。優先度: P3。リリース時期は未指定。
+
+#### 実装・自動検証（2026-11-01、未コミット）
+
+- 共通の `grid_physical_parent_action` は副作用・同期I/Oなし。表示中の合成一覧（既存flag・採用済みprojection・Collection/Smartのroot）を先に拒否し、選択行を参照しない。物理子では `archive_source_override` → `zip_nav.tree.zip_path` → `current_folder` の順で外側の元sourceを決め、実親とExactPath選択を一緒に返す。ZIP内prefixを実パスにしない。
+- `GridPhysicalParentFolder`（Grid / Press / 既定なし）をキー・マウスボタン・リング・ジェスチャ・ゲームパッドの候補へ追加。既定非表示の `show_toolbar_physical_parent_button` は既存親ボタンと同じ保存・欠落時既定・転送・preferences draftの扱い。フォルダ＋上矢印はpainter描画、無効理由/移動先はresolverの結果から表示する。
+- 実行は既存の `JumpToFolderRequest { PhysicalDirectory, ExactPath }`。成功時の `ExitTemporaryView` で検索・ReadingHistory/Bookmark・Smartの帰路を終える。Smart内部移動と明示退出の履歴記録を既存purposeで区別し、Collectionの既存退役規則も再利用。ドライブルートだけは同じExitTemporaryViewを既存のドライブ一覧採用へ渡す。
+- 簡素化: 専用pending・待機・rollback・第二のナビownerを増やさず、既存の明示移動と成功時採用へ集約した。固定一覧rootは無効、そこから開いた物理子の新操作は既存の非復元dismissで受付時に固定を解除する（移動失敗後も固定を再作成しない）。既存modal admissionを維持。まれな失敗は既存のログ＋通知に従う。
+- 既存の論理親・Back/Forward・全画面closeは維持。detachedの述語・viewport経路・context bundle構造は変更していない。独立viewerには本操作を追加するGridフォルダバー/input面がない。§1.670の帰路修正は範囲外。独立Sol/xhighレビューは製品差分と最終test-only IME修正の両方をACCEPT（設計担当の検収・実機確認は未実施）。
+
+| 検査 | 結果・記録 |
+| --- | --- |
+| 整形・型検査 | `cargo fmt --check`、`cargo check -p mimageviewer --lib --tests --features test-script` 成功。`target/section1672-check-final.log` |
+| 追加・関連 | `physical_parent` filter 15成功、設定メニューPNG 1成功、Snapshot物理子の受付・失敗時1成功、keymap 186成功、既存grid_parent 3成功。履歴/Ctrl+S/採用済みCtrl+G物理子からの通常folder・画像folder本・実ネストZIP・PDF・RAR変換・EPUB、Everything実結果採用からの物理open/退出/元source選択、Smart退出の履歴Back/Forward、同じPDFの兄弟ticket/generation/cancel保持をheadlessで検査 |
+| IME/fixture修正 | 新PNG fixtureのアクセシブル名不足を修正。初回全libのraw TextEdit監査も検出し、例外追加ではなく既存IME helperへ統一した。最終fixture比較・IME監査・既存失敗箇所の単独6件は全成功。`target/section1672-isolated.log` |
+| UI全体 | 通常構成の `cargo test --test ui_snapshot` 216成功。`target/section1672-ui-snapshot.log`。最後のIME修正はlib test専用fixtureのためこのintegration結果へ影響せず再利用 |
+| 全lib 初回 | `test-lib-full.ps1 -Features test-script`、既定24並列。15,367実行、15,361成功・5失敗・1 timeout・67 skipped、820.783秒。IME監査以外は既存folder treeのHarness待ち、RemoteのAcquiringRemote/RemoteActive 3件、10k/100k走査の600秒timeout。`target/test-lib-full/runs/20261031T171451776Z-35154727/` |
+| 全lib 最終source | `NEXTEST_TEST_THREADS=8` で同script。15,367実行、15,365成功・2失敗・67 skipped、1627.880秒。失敗は `main_chrome_folder_tree_clicks_follow_common_modal_ownership` と `no_resident_smart_pdf_missing_root_row_rolls_back_history`（既存5秒期限）。どちらも単独では成功。後者の最終単独は2.04秒（`target/section1672-smart-isolated.log`）。100k走査は232.393秒で成功。全libの成功とは扱わない |
+| 既存観測との照合 | 上記の待機/Remote/scan失敗は [既存検証](ai-crash-655-investigation.md)、[egui検証](egui-0.37-stage1a-verification.md)、[test-speed記録](test-speed-report.md) に同型の観測あり。負荷が原因/今回差分と無関係とは断定せず、期限・期待値・ignore・retryは変更していない。§1.447のページめくり失敗は両全libで発生せず |
+| 最終workspace/vendor/doc gate | `test-full.ps1 -SuppressCrashDialogs`（24並列）はlauncherビルド段階で停止。必要な `target/release/mimageviewer-{core,remote,epub-pdf}.exe` が未生成のため、テストは開始できず、vendor/doctest段も未実施。`target/section1672-full-gate.log`。入力のstub化・launcher/build logic変更はしていない |
+| グリフ | `python scripts/check_ui_glyphs.py` 成功、危険グリフ0件 |
+| 検証用build | `scripts/build-dev.ps1 -WaitForOtherBuildsMinutes 0` 成功。実行時のみ `CARGO_BUILD_JOBS=1`、`MSBUILDDISABLENODEREUSE=1` を指定。通常feature set・portableなし。core 20分05秒、remote 3分52秒、EPUB worker 5分41秒で生成し、FFmpeg/CRT/EffeTuneの配置まで成功。`target/section1672-build-dev-r4.log`。製品の起動はしていない |
+| build前提の切り分け | TurboJPEGのCMake/MSBuildは並列24/4でexit 1。生成先を変えず `cmake --build ... --parallel 1 -- /v:diag /nr:false` で正常完了（0 errors）。残るMSBuildプロセスを待つscript実行は中断し、ネイティブ生成済みのため既存の待機スキップ指定を使って上記buildを完了した。source/dependency/build scriptは変更していない。`target/section1672-turbojpeg-diagnostic.log`、`section1672-build-dev.log`、`section1672-build-dev-r3.log` |
+| 製品ページ | 一覧へ戻る操作と実際の置き場所へ移る操作の説明を反映。`python scripts/check_site_cards.py` は49件・超過0 |
+
+- PNG: 新規 `tests/snapshots/physical_parent_folder_bar_dark.png`（10,592 bytes、760×90）と、チェック項目追加で更新した `folder_bar_organize_destinations_toggle.png`（81,653 bytes）を目視確認。ほかの既存PNGは変更なし。合計92,245 bytes。フォルダバーのON/OFF・狭幅・設定メニューからの表示切替はheadless入力/geometryで検査。
+- ログ補足: `target/section1672-focused-r2.log`、`section1672-menu-snapshot.log`、`section1672-snapshot-child.log`、`target/test-focused/runs/20261031T170750679Z-dbbf512d/`（keymap）、`20261031T170754918Z-4122871a/`（旧親）、最終全libは `target/test-lib-full/runs/20261031T173442650Z-78aafbd6/`。
+- 変更ファイル（製品）: `src/app/grid_parent.rs`、`src/app.rs`、`src/app/gamepad_input.rs`、`src/keymap.rs`、`src/ring_shortcut.rs`、`src/settings.rs`、`src/settings_transfer.rs`、`src/ui_dialogs/preferences/pages.rs`、`src/ui_main.rs`。
+- 変更ファイル（テスト/画像）: `src/app/snapshot_ops.rs`（test-only）、`src/app/tests.rs`、`src/app/tests/everything_close_return.rs`、`src/app/tests/history_parent_1473.rs`、`src/app/tests/history_parent_context_1473.rs`、新規 `src/app/tests/physical_parent_1672.rs`、上記PNG2枚。
+- 変更ファイル（文書）: 本項、`docs/keymap-spec.md`、`docs/key-customization-impl-plan.md`、`docs/keymap.ini.default`、`docs/spec.md`、`docs/virtual-folders.md`、`docs/reading-history-plan.md`、`docs/ui-snapshot-policy.md`、`htdocs/mimageviewer/index.html`、manualの `grid.html`・`books.html`・`settings.html`・`shortcuts.html`。CHANGELOG・コミット操作・製品起動はなし。
 
 ### 1.671 ★で絞った本から一覧へ戻っても「★一時解除中」が残る — 5ch >>687 (2026-10-31)
 

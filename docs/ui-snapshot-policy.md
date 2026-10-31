@@ -14,6 +14,15 @@ ON・100%・1行のフォルダ代表画像あり／なし、ZIP、VIDEO表示�
 
 ## 目的
 
+§1.672 の実親移動は `physical_parent_folder_bar_dark`（760×90）の1枚で、
+論理親と独立したフォルダ＋上矢印ボタンのON表示を保持する。本体共通のpainterと
+folder controls／幅調整／address inputを使う純描画fixtureで、App・実ファイルを開かない。
+入力欄も既存IME helperとラベルの関連付けを使う。
+設定checkbox追加により既存 `folder_bar_organize_destinations_toggle` だけを更新し、
+新規10,592 bytes＋更新81,653 bytes（計92,245 bytes）を目視確認した。他の既存PNGは変更しない。
+表示ON/OFF、360pt／1200ptでの入力欄の幅、メニューから表示へ反映、既定へのresetは
+headless UI／geometryテストで検査する。製品起動・実機確認とは区別する。
+
 タグビューの付与時刻（§2.23）は lib の `tag_sort_choices_dark`（320×240）の1枚で、
 本体共通の専用3択（正式名・選択中表示）、列ヘッダソート中の無効な短名ボタン、
 「タグ付与時刻」列の見出しと日時表示を保持する。App・DB・実ウィンドウを起動しない純描画fixtureを使う。

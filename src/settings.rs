@@ -4962,6 +4962,9 @@ pub struct Settings {
     /// フォルダバーに「親フォルダへ」ボタンを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_parent_button: bool,
+    /// フォルダバーに「実際の親フォルダへ移動」ボタンを表示する (既定 OFF)。
+    #[serde(default)]
+    pub show_toolbar_physical_parent_button: bool,
     /// フォルダバーに「ツリー順で前のフォルダへ」ボタンを表示する (Phase 5.8)。
     /// 既定 true、Ctrl+↑ と等価。
     #[serde(default = "default_true")]
@@ -7939,6 +7942,7 @@ impl Default for Settings {
             show_address_bar_history_nav: true,
             show_address_bar_quick_folders: true,
             show_toolbar_parent_button: true,
+            show_toolbar_physical_parent_button: false,
             show_toolbar_prev_folder: true,
             show_toolbar_next_folder: true,
             show_toolbar_vst3: true,
@@ -10617,6 +10621,7 @@ impl Settings {
         self.show_address_bar_history_nav = src.show_address_bar_history_nav;
         self.show_address_bar_quick_folders = src.show_address_bar_quick_folders;
         self.show_toolbar_parent_button = src.show_toolbar_parent_button;
+        self.show_toolbar_physical_parent_button = src.show_toolbar_physical_parent_button;
         self.show_toolbar_prev_folder = src.show_toolbar_prev_folder;
         self.show_toolbar_next_folder = src.show_toolbar_next_folder;
         self.show_address_bar_favorite_button = src.show_address_bar_favorite_button;
@@ -10888,6 +10893,34 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn physical_parent_button_defaults_off_and_survives_settings_roundtrip() {
+        assert!(!Settings::default().show_toolbar_physical_parent_button);
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!missing.show_toolbar_physical_parent_button);
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(tmp.path()).unwrap();
+        for visible in [true, false] {
+            let mut live = Settings::default();
+            live.show_toolbar_physical_parent_button = visible;
+            let decoded: Settings =
+                serde_json::from_str(&serde_json::to_string(&live).unwrap()).unwrap();
+            assert_eq!(decoded.show_toolbar_physical_parent_button, visible);
+            db.save_full(&live).unwrap();
+            assert_eq!(
+                db.load_into_settings()
+                    .unwrap()
+                    .show_toolbar_physical_parent_button,
+                visible
+            );
+            // Applying an older preferences draft preserves the live toolbar choice.
+            let mut draft = Settings::default();
+            draft.show_toolbar_physical_parent_button = !visible;
+            draft.overwrite_non_preferences_from(&mut live);
+            assert_eq!(draft.show_toolbar_physical_parent_button, visible);
+        }
+    }
+
     #[test]
     fn notification_duration_defaults_and_sqlite_roundtrip() {
         assert_eq!(
@@ -15170,6 +15203,7 @@ mod tests {
         assert!(s.show_address_bar_history_nav);
         assert!(s.show_address_bar_quick_folders);
         assert!(s.show_toolbar_parent_button);
+        assert!(!s.show_toolbar_physical_parent_button);
         assert!(s.show_toolbar_prev_folder);
         assert!(s.show_toolbar_next_folder);
         assert!(s.show_toolbar_rating);
