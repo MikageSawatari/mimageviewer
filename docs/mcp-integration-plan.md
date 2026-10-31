@@ -1335,7 +1335,9 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
   **decode の memory の上限** (7 巡目 P2): 入力の大きさの上限とは別に、decode 後の buffer を 256 MiB までにする
   (TurboJPEG の既存の出力上限と同じ値)。`image_decode::primary` の budget、closure の中の `ImageReader::limits`、
   `preview_bounded` の `max_alloc` にこの値を渡し、超えたら `too_large`。budget を省くと AVIF・WIC が実質無制限に
-  なるので、省略しない。bounded の WIC は上限超過も非対応も同じ失敗で返すので、**decode の前に header の寸法から
+  なるので、省略しない。JPEG は先に DCT の縮小 decode (既存の関数が縮小後の割り当てを検査する) を試し、元の大きさの
+  decode に進む時だけ下の見積もりを掛ける (1b 実装レビュー P2。12,000×8,000 の JPEG も縮小 decode なら数 MB)。
+  bounded の WIC は上限超過も非対応も同じ失敗で返すので、**元の大きさの decode の前に header の寸法から
   buffer の大きさを見積もり**、上限を超えるものを `too_large` にする (1a の寸法の読み取りと同じ関数。ファイルと
   ZIP の項目の bytes の両方)。decode の失敗は、上限超過を含めて `unavailable` (新しい型付きの入口は作らない。
   実装担当の指摘による)。
@@ -1360,6 +1362,13 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
   1a の `get_item_info` の ZIP の項目の★も同じ旧 key を引くよう 1b で揃える (読み取りだけ。移行はしない)。DB の file が無ければ
   「隠すなし」、file があって読めなければログ + その呼び出し全体を tool error にする (「隠すなし」に倒さない)。
   ほかの補正・編集は反映しない。1d の見せる範囲の説明に「補正・編集は反映しない。隠す編集をした画像は渡さない」と書く。
+- **path の表記** (1b 実装レビュー P1): 編集の key は path の小文字化と区切りの置き換えだけで作るので、`.`・`..` を含む
+  表記や短い名前 (8.3) で同じファイルを指すと、隠す編集の key と一致せずに未加工の画素を返し得る。よって agent の
+  path を受ける全 tool で、**入口の 1 つの検査関数**が、一覧・検索が返すのと同じ通常の表記だけを受ける:
+  絶対 path、NUL・`.`・`..` の成分なし、`\\?\` 等の接頭辞なし、`:` は drive の後だけ (ADS なし)、末尾の `.`・空白なし、
+  長い名前の形 (`GetLongPathNameW` の結果と一致)。それ以外は「パスは mIV の一覧と同じ表記で指定してください」の
+  tool error。junction・symlink で別の名前を付けたものは一覧画面でも別の項目として扱われる (編集の key も別) ので、
+  agent も同じ扱いにする (既存の制限)。
 - 大きさと品質: 要求の一辺 (256〜512) に `catalog::encode_thumb_webp` (純粋な resize + WebP encode。透明は落ちる) で
   縮める。品質は設定の縮小画像の品質。
 - cache を使わないので、毎回 decode する (JPEG は DCT の縮小 decode で軽い)。AI の用途では一覧画面ほどの速さは要らない。
