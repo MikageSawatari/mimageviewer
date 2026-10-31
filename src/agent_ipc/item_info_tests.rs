@@ -139,13 +139,12 @@ fn png_projection_bounds_prompt_and_preserves_file_tags_and_rating() {
 
 #[test]
 fn unknown_chunks_and_unresolved_workflow_never_become_generation_fields() {
-    let unknown = project_generation(crate::png_metadata::extract_metadata_from_bytes(&png(&[(
-        "Secret",
-        "SECRET_CHUNK",
-    )])));
+    let unknown = project_generation(crate::png_metadata::extract_metadata_from_bytes_for_agent(
+        &png(&[("Secret", "SECRET_CHUNK")]),
+    ));
     assert_eq!(unknown, InfoField::Unavailable);
     let prompt = r#"{"1":{"class_type":"CLIPTextEncode","inputs":{"text":"safe positive"}},"2":{"class_type":"CLIPTextEncode","inputs":{"text":"safe negative"}},"3":{"class_type":"KSampler","inputs":{"positive":["1",0],"negative":["2",0],"seed":12,"steps":20,"sampler_name":"euler","scheduler":"UNKNOWN_SCHEDULER_SECRET"}},"4":{"class_type":"UnknownSecret","inputs":{"text":"UNKNOWN_NODE_SECRET"}}}"#;
-    let source = crate::png_metadata::extract_metadata_from_bytes(&png(&[
+    let source = crate::png_metadata::extract_metadata_from_bytes_for_agent(&png(&[
         ("prompt", prompt),
         ("workflow", r#"{"secret":"WORKFLOW_SECRET"}"#),
     ]));
@@ -162,6 +161,273 @@ fn unknown_chunks_and_unresolved_workflow_never_become_generation_fields() {
     assert!(!json.contains("SECRET"));
     assert!(!json.contains("class_type"));
     assert!(!json.contains("prompt_json"));
+}
+
+fn scalar_generation(chunk: &str, json: &serde_json::Value) -> InfoField<GenerationInfo> {
+    project_generation(crate::png_metadata::extract_metadata_from_bytes_for_agent(
+        &png(&[(chunk, &json.to_string())]),
+    ))
+}
+
+fn assert_no_nested_generation(source: &InfoField<GenerationInfo>) {
+    let InfoField::Present(generation) = source else {
+        return;
+    };
+    let mut values = vec![generation.tool.as_deref(), generation.model.as_deref()];
+    values.extend(
+        [
+            &generation.prompt,
+            &generation.negative_prompt,
+            &generation.seed,
+            &generation.steps,
+            &generation.sampler,
+            &generation.cfg,
+            &generation.dimensions,
+        ]
+        .into_iter()
+        .map(|field| field.as_ref().map(|value| value.text.as_str())),
+    );
+    for value in values.into_iter().flatten() {
+        for secret in ["gps", "latitude", "workflow_json", "secret", "{"] {
+            assert!(!value.contains(secret), "leaked {secret}: {value}");
+        }
+    }
+}
+
+#[test]
+fn nested_generation_seed_is_absent_for_file_and_same_png_in_zip() {
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    let path = directory.path().join("nested.png");
+    let archive = directory.path().join("nested.zip");
+    let image = png(&[(
+        "parameters",
+        r#"{"sui_image_params":{"prompt":"cat","seed":{"gps":{"latitude":35.5},"workflow_json":{"secret":"x"}}}}"#,
+    )]);
+    std::fs::write(&path, &image).unwrap();
+    std::fs::write(&archive, zip_bytes(&[("nested.png", &image)])).unwrap();
+    for input in [item(&path, None), item(&archive, Some("nested.png"))] {
+        let output = read(&input, permission(false), &AtomicBool::new(false)).unwrap();
+        assert_no_nested_generation(&output.generation);
+        let InfoField::Present(generation) = output.generation else {
+            panic!("missing safe generation");
+        };
+        assert_eq!(generation.prompt.as_ref().unwrap().text, "cat");
+        assert!(generation.seed.is_none());
+    }
+}
+
+#[test]
+fn every_generation_field_rejects_original_json_objects_and_arrays() {
+    use serde_json::json;
+    let object = json!({"gps":{"latitude":35.5},"workflow_json":{"secret":"x"}});
+    for nested in [object.clone(), json!([object, "secret"])] {
+        // All parameter aliases used by project_generation and all model aliases
+        // recognized by these JSON formats must retain their original type check.
+        for key in [
+            "prompt",
+            "negativeprompt",
+            "model",
+            "seed",
+            "steps",
+            "num_inference_steps",
+            "sampler",
+            "sampler_name",
+            "cfg",
+            "cfg scale",
+            "cfg_scale",
+            "guidance_scale",
+            "guidance scale",
+            "scale",
+            "size",
+            "dimensions",
+            "width",
+            "height",
+        ] {
+            let mut source = json!({"sui_image_params":{"prompt":"cat","negativeprompt":"bad"}});
+            source["sui_image_params"][key] = nested.clone();
+            let output = scalar_generation("parameters", &source);
+            assert_no_nested_generation(&output);
+            let InfoField::Present(generation) = output else {
+                panic!("missing safe generation for {key}");
+            };
+            let field = match key {
+                "prompt" => &generation.prompt,
+                "negativeprompt" => &generation.negative_prompt,
+                "seed" => &generation.seed,
+                "steps" | "num_inference_steps" => &generation.steps,
+                "sampler" | "sampler_name" => &generation.sampler,
+                "size" | "dimensions" | "width" | "height" => &generation.dimensions,
+                "model" => {
+                    assert!(generation.model.is_none());
+                    continue;
+                }
+                _ => &generation.cfg,
+            };
+            assert!(field.is_none(), "unexpected {key}: {field:?}");
+        }
+        for key in [
+            "base_model",
+            "base_model_name",
+            "refiner_model",
+            "full_prompt",
+            "raw_prompt",
+            "real_prompt",
+            "Prompt",
+            "Full prompt",
+            "full_negative_prompt",
+            "raw_negative_prompt",
+            "real_negative_prompt",
+            "Negative",
+            "Negative Prompt",
+        ] {
+            let mut source = json!({"prompt":"cat","negative_prompt":"bad"});
+            source[key] = nested.clone();
+            assert_no_nested_generation(&scalar_generation("parameters", &source));
+            assert_no_nested_generation(&scalar_generation("Comment", &source));
+        }
+        for key in [
+            "positive_prompt",
+            "positive",
+            "prompt",
+            "positive_style_prompt",
+            "negative_prompt",
+            "negative",
+            "negative_style_prompt",
+            "model",
+            "model_name",
+            "model_weights",
+            "seed",
+            "steps",
+            "cfg_scale",
+            "width",
+            "height",
+        ] {
+            let mut source = json!({"positive_prompt":"cat","negative_prompt":"bad"});
+            source[key] = nested.clone();
+            assert_no_nested_generation(&scalar_generation("invokeai_metadata", &source));
+        }
+        for key in ["prompt", "negative_prompt", "negative"] {
+            let mut source = json!({"image":{"prompt":"cat","negative_prompt":"bad"}});
+            source["image"][key] = nested.clone();
+            assert_no_nested_generation(&scalar_generation("sd-metadata", &source));
+        }
+        for key in [
+            "prompt",
+            "uc",
+            "seed",
+            "steps",
+            "scale",
+            "sampler",
+            "width",
+            "height",
+            "v4_prompt",
+            "v4_negative_prompt",
+        ] {
+            let mut source = json!({"prompt":"cat","uc":"bad"});
+            source[key] = nested.clone();
+            assert_no_nested_generation(&scalar_generation("Comment", &source));
+        }
+        for key in ["text", "ckpt_name", "seed", "steps", "cfg", "sampler_name"] {
+            let mut source = json!({
+                "1":{"class_type":"CLIPTextEncode","inputs":{"text":"cat"}},
+                "2":{"class_type":"KSampler","inputs":{"positive":["1",0]}},
+                "3":{"class_type":"CheckpointLoaderSimple","inputs":{}}
+            });
+            let node = match key {
+                "text" => "1",
+                "ckpt_name" => "3",
+                _ => "2",
+            };
+            source[node]["inputs"][key] = nested.clone();
+            assert_no_nested_generation(&scalar_generation("prompt", &source));
+        }
+        // RuinedFooocus tool detection and SwarmUI model-name/hash leaves also
+        // pass through JSON-to-text conversion, even though tool is a fixed label.
+        for key in ["software", "Software"] {
+            let mut source = json!({"Prompt":"cat","Negative":"bad"});
+            source[key] = nested.clone();
+            assert_no_nested_generation(&scalar_generation("parameters", &source));
+        }
+        for key in ["name", "hash"] {
+            let mut source =
+                json!({"sui_image_params":{"prompt":"cat"},"sui_models":[{"name":"model"}]});
+            source["sui_models"][0][key] = nested.clone();
+            assert_no_nested_generation(&scalar_generation("parameters", &source));
+        }
+    }
+}
+
+#[test]
+fn generation_preserves_valid_scalar_types_without_reinterpreting_text_as_json() {
+    use serde_json::json;
+    for seed in [json!(42), json!("42")] {
+        let output = scalar_generation(
+            "parameters",
+            &json!({"sui_image_params":{
+                "prompt":"literal {braces} and [arrays]", "negativeprompt":"bad",
+                "model":"model.safetensors", "seed":seed, "steps":20, "sampler":"euler",
+                "cfg":7.5, "width":7, "height":"5"
+            }}),
+        );
+        let InfoField::Present(generation) = output else {
+            panic!("missing generation")
+        };
+        assert_eq!(generation.tool.as_deref(), Some("SwarmUI"));
+        assert_eq!(generation.model.as_deref(), Some("model"));
+        assert_eq!(
+            generation.prompt.as_ref().unwrap().text,
+            "literal {braces} and [arrays]"
+        );
+        assert_eq!(generation.negative_prompt.as_ref().unwrap().text, "bad");
+        assert_eq!(generation.seed.as_ref().unwrap().text, "42");
+        assert_eq!(generation.steps.as_ref().unwrap().text, "20");
+        assert_eq!(generation.sampler.as_ref().unwrap().text, "euler");
+        assert_eq!(generation.cfg.as_ref().unwrap().text, "7.5");
+        assert_eq!(generation.dimensions.as_ref().unwrap().text, "7x5");
+    }
+    // No currently exported generation column is boolean. Boolean flags in
+    // metadata must not masquerade as numeric parameters or textual names.
+    let output = scalar_generation(
+        "parameters",
+        &json!({"sui_image_params":{
+            "prompt":"cat", "negativeprompt":true, "model":true, "sampler":true,
+            "seed":true, "steps":false, "cfg":true, "width":true, "height":false
+        }}),
+    );
+    let InfoField::Present(generation) = output else {
+        panic!("missing generation")
+    };
+    assert!(generation.negative_prompt.is_none());
+    assert!(generation.model.is_none());
+    assert!(generation.sampler.is_none());
+    assert!(generation.seed.is_none());
+    assert!(generation.steps.is_none());
+    assert!(generation.cfg.is_none());
+    assert!(generation.dimensions.is_none());
+}
+
+#[test]
+fn structured_chunks_never_fall_back_to_raw_generation_prompts() {
+    use serde_json::json;
+    let object = json!({"gps":{"latitude":35.5},"workflow_json":{"secret":"x"}});
+    for source in [
+        object.clone(),
+        json!([object, "Steps: 20", "Sampler: euler"]),
+    ] {
+        for chunk in ["parameters", "Description", "Dream"] {
+            let output = scalar_generation(chunk, &source);
+            assert_eq!(output, InfoField::Unavailable, "{chunk}");
+        }
+        let output =
+            project_generation(crate::png_metadata::extract_metadata_from_bytes_for_agent(
+                &png(&[("prompt", "{}"), ("parameters", &source.to_string())]),
+            ));
+        assert_no_nested_generation(&output);
+        let InfoField::Present(generation) = output else {
+            panic!("missing ComfyUI")
+        };
+        assert!(generation.prompt.is_none());
+    }
 }
 
 #[test]

@@ -1404,7 +1404,7 @@ fn revoked_read_does_not_advertise_disabled_tools_while_status_stays_enabled() {
                 Fixture { disabled: false }.call(command, client, control)
             } else {
                 Err(AgentError::new(
-                    ErrorCode::Disabled,
+                    ErrorCode::PermissionChanged,
                     "AI 連携の許可が変更されました。もう一度お試しください",
                 ))
             }
@@ -1467,11 +1467,80 @@ fn permission_observer_discards_old_poll_after_newer_actual_observations() {
     assert_eq!(observer.effective, Some(vec![]));
     let current = observer.revision.load(Ordering::Acquire);
     assert!(observer.observe(vec![], Some(current)).is_none());
-    for code in [ErrorCode::Busy, ErrorCode::NotReady, ErrorCode::Internal] {
+    for code in [
+        ErrorCode::Busy,
+        ErrorCode::NotReady,
+        ErrorCode::Internal,
+        ErrorCode::PermissionChanged,
+    ] {
         assert_eq!(
             permission_tools(&Err(AgentError::new(code, "fixture"))),
             None
         );
+    }
+}
+
+#[test]
+fn stale_status_poll_and_tool_list_never_advertise_disabled_tools() {
+    struct StaleStatus {
+        calls: mpsc::Sender<usize>,
+        count: AtomicU64,
+    }
+    impl Backend for StaleStatus {
+        fn call(
+            &self,
+            command: Command,
+            client: &str,
+            control: Arc<CallControl>,
+        ) -> Result<Payload, AgentError> {
+            assert_eq!(command, Command::Status);
+            let call = self.count.fetch_add(1, Ordering::AcqRel) as usize;
+            self.calls.send(call).unwrap();
+            if matches!(call, 1 | 2) {
+                // Core has rejected the result because GPS/thumbnails changed,
+                // while the level and therefore the advertised tools stayed put.
+                Err(AgentError::new(
+                    ErrorCode::PermissionChanged,
+                    "AI 連携の許可が変更されました。もう一度お試しください",
+                ))
+            } else {
+                Fixture { disabled: false }.call(command, client, control)
+            }
+        }
+    }
+    for version in &VERSIONS[1..] {
+        let (send, calls) = mpsc::channel();
+        let mut h = Harness::new(Arc::new(StaleStatus {
+            calls: send,
+            count: AtomicU64::new(0),
+        }));
+        h.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}));
+        h.receive();
+        h.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+        h.send(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}));
+        assert_eq!(calls.recv_timeout(Duration::from_secs(10)).unwrap(), 0);
+        assert_eq!(h.receive()["result"]["tools"].as_array().unwrap().len(), 8);
+        // The real five-second observer poll receives a stale snapshot result.
+        assert_eq!(calls.recv_timeout(Duration::from_secs(10)).unwrap(), 1);
+        h.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}));
+        assert_eq!(calls.recv_timeout(Duration::from_secs(10)).unwrap(), 2);
+        let stale = h.receive();
+        assert_eq!(
+            stale["id"], 2,
+            "a stale poll/list must not emit list_changed"
+        );
+        assert!(
+            stale.get("error").is_some(),
+            "staleness is an error, never an empty successful list"
+        );
+        assert!(stale.pointer("/result/tools").is_none());
+        h.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}));
+        assert_eq!(calls.recv_timeout(Duration::from_secs(10)).unwrap(), 3);
+        let fresh = h.receive();
+        assert_eq!(fresh["id"], 3, "recovery must not emit list_changed either");
+        assert_eq!(fresh["result"]["tools"].as_array().unwrap().len(), 8);
+        h.close();
+        assert!(h.output.try_recv().is_err());
     }
 }
 

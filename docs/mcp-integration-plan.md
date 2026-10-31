@@ -1591,4 +1591,118 @@ sandbox の外 (通常権限) で、実装担当が実 pipe の OS 5 で落と�
 | §16.6 の focused nextest | 0 | 36/36 成功 |
 | `cargo fmt` (workspace) | 0 | 差分なし |
 
-独立レビュー (別担当、gpt-6.1-sol / xhigh、read-only) の結果はこの下に追記する。
+独立レビュー 1 回目 (別担当 thread `01a18ce7`、gpt-6.1-sol / xhigh、read-only、`8edce9336`) は「changes needed」。
+3 件とも ClaudeCode がコードで確かめて妥当と判断し、§16.8 で直した:
+
+| 指摘 | 判断 |
+|---|---|
+| P1 許可した生成条件の値に object/array が来ると、既存 parser が JSON 文字列にして生 JSON・位置情報が漏れる | 妥当 (`png_metadata.rs` の object→文字列化を確認) |
+| P2 snapshot の失効を `Disabled` と返し、adapter が空の tool 集合と余計な `list_changed` を出す | 妥当 (`permission_tools` の Disabled→空集合を確認) |
+| P2 PDF の寸法取得が path 入りの perf key をログに出す | 妥当 (`pdf_file_perf_key(pdf_path)` を確認) |
+
+
+### 16.8 修正 1 回目 (基点 `8edce9336`、未コミット差分)
+
+正式な独立レビュー (ClaudeCode が別 thread の gpt-6.1-sol / xhigh へ依頼) は changes needed。
+以下3件を ClaudeCode がコードで確認して採用し、実装担当へ修正を依頼した。
+§16.7 の IPC 10/10・MCP 42/42・core 36/36 の sandbox 外成功は **ClaudeCode の観測**であり、
+今回の修正差分に対する実行結果とは区別する。
+
+| 指摘 | 修正 |
+|---|---|
+| P1: 許可済み生成条件へ object/array が文字列化され、生 JSON・位置が漏れる | 文字列化前の JSON 型が残る parser に agent 専用の scalar 制約を通す。既存の UI/search 入口は従来の変換を維持し、agent の file/ZIP bytes 両入口だけを切り替える |
+| P2: snapshot 失効を Disabled と誤認し、Status poll/tools/list が集合0件を通知する | wire に `PermissionChanged` を追加。実際に無効なら `Disabled`、有効のまま snapshot/epoch が変わったら `PermissionChanged`。adapter は後者から集合を推定しない |
+| P2: PDF page sizes の perf key に要求 path が入る | agent 専用の匿名入口を追加し、pool の任意の perf key を None にする。UI の既存入口は従来の key を維持する |
+
+権限は Status だけ再照合を免除する案も検討したが、§15.2/§15.4 の全 read 共通規則を保つため、
+単一の失効 error を区別する方式を選んだ。再試行・待機状態・追加の権限 observer は作らない。
+stale な tools/list は空一覧の成功にせず問い合わせ error とし、次回の新しい Status で通常の一覧を返す。
+tool call は「AI 連携の許可が変更されました。もう一度お試しください」の tool error になる。
+protocol は未リリースの v2 のまま。この修正は永続形式・設定 schema を変えない。
+
+生成情報の制約は JSON から文字列になる前に適用する。prompt/negative prompt/model/sampler 等は文字列、
+seed/steps/CFG/width/height は文字列または数値とし、これらに boolean/object/array は採用しない。
+tool 名は既知形式からの固定名。JSON container が平文 prompt に落ちる fallback も agent mode では除外する。
+既に文字列である prompt の `{...}` / `[...]` は内容から再解釈せず維持する。
+通常の UI/search の JSON 整形は Display mode のままで、既存 parser の表示内容を変えない。
+
+変更ファイルは `crates/agent-ipc/src/lib.rs` (wire error)、`crates/mcp-server/src/lib.rs` / `tests.rs`
+(集合判定と競合検査)、`src/agent_ipc/mod.rs` / `read_tests.rs` / `tests.rs` (失効の区別と旧期待値の追従)、
+`src/agent_ipc/item_info.rs` / `item_info_tests.rs` (新入口と投影fixture)、`src/png_metadata.rs`
+(agent scalar mode と UI互換検査)、`src/pdf_loader.rs` (匿名の入口と共通実行境界)、この文書。
+
+追加の検査は、PNG 実ファイルと同一 PNG の ZIP、全許可フィールド/別名の object/array、正常な scalar、
+JSON container fallback、UI/search の従来表示、EXIF からの生成情報、Status の wire 直前の snapshot変更、
+旧握手2版の実5秒 poll と tools/list が失効した場合の通知抑制/次回8件復帰、PDF の実際の匿名/UI入口を含む。
+PDF は thread-local の test executor で成功・worker status error・transport error を返し、
+実 native worker を起動せず、要求の path/password は IPC 内に残り diagnostic key は None と検査する。
+
+helper の呼出し経路のログ監査 (source inspection、実装担当の確認。正式な独立レビューを意味しない):
+
+| helper | 結果 |
+|---|---|
+| PDF | pool の dispatch/open/cancel/prune は任意の perf key を使用。agent は None、UI は従来の path key。PDF passthrough 解決・cache・response parser・worker の page-size error で要求 path をログに出す経路はなし |
+| ZIP | agent の `read_zip*`、archive open/cache、名前解決はログなし。既存の path 付き first-image 計測は呼ばない |
+| EXIF/生成情報 | 両 parser に logger/perf/print 呼出しなし |
+| 画像寸法 | header/RAW info に Rust の path ログなし。AVIF の native error は bytes から生成され、要求 filename は native parser へ渡らない |
+| LibRaw native | 一般の既定 callback は filename を出すが、実 shim の Windows wide-path 経路は narrow filename を持たず `fname()` が null、callback は unknown file とする。要求 path の漏えいはこの経路には確認されず、native/RAW は変更しない |
+| collection | actor read・DB snapshot load・prepare に要求 path/id/name のログなし |
+| 本棚/★/閲覧履歴/しおり/タグ | 使用する readonly/list/get 経路に要求 path ログなし。writer/recovery 診断は今回の呼出し経路外 |
+
+pool 初期化の executable/DLL/data/log ディレクトリの診断は既存の infrastructure ログで、要求 PDF の path ではない。
+第1回 crate 検査は exit 101、IPC 10/10成功・MCP 41成功/2失敗 (43件、ignore 0)。
+新しい poll/list 競合検査は成功、失敗2件は従来どおり実 pipe の OS 5。
+ログは `target/mcp-1a-fix1-crates.log`。その後の変更は core側修正と workspace整形のみで、この結果を再利用する。
+最初の core 焦点102件は exit 100、99成功/3失敗 (`target/mcp-1a-fix1-focused.log`)。
+追加した漏えい/権限/PDF 検査は成功し、失敗は既知の実 pipe OS 5 の2件と、
+再有効化後も Disabled を期待した旧 fixture の1件だった。後者は現在の無効時の Disabled を新たに検査し、
+再有効化後の古い結果は PermissionChanged とする期待値へ更新した。製品の判定を緩めず、以下の最終再検査へ進む。
+
+今回の focused filter は §16.6 に PNG parser 全体と PDF の3件を追加したもの。
+ClaudeCode が sandbox 外の通常権限で再実行するコマンドは以下 (今回の差分での sandbox 外成功は未観測)。
+
+```powershell
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc/) or test(/agent_level/) or test(/agent_permission/) or test(=settings_db::tests::failed_permission_commit_preserves_snapshot_and_epoch) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(/png_metadata/) or test(=pdf_loader::tests::anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results) or test(=pdf_loader::tests::page_sizes_preserve_existing_ui_diagnostic_identity) or test(=pdf_loader::tests::page_sizes_round_trip_and_reject_a_truncated_reply)'
+```
+
+最終検証 (観測者: 実装担当、この sandbox 内、`8edce9336` + この修正差分、通常 dev/test profile):
+
+| コマンド | 実 exit code | 結果 / ログ |
+|---|---:|---|
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | `target/mcp-1a-fix1-core.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 101 | IPC 10成功、MCP 41成功/2失敗、ignore 0。`target/mcp-1a-fix1-crates.log` |
+| 上記 focused nextest (期待値修正後) | 100 | 102件中100成功/2失敗。`target/mcp-1a-fix1-focused-final.log` |
+| `cargo build -p mimageviewer-mcp --bin mimageviewer-mcp` | 0 | `target/mcp-1a-fix1-adapter.log` |
+| `cargo fmt` (workspace、引数なし) | 0 | 統合後と旧期待値修正後に実行 |
+| `cargo fmt --check` | 0 | `target/mcp-1a-fix1-fmt.log` |
+| `git diff --check` | 0 | 最終差分を確認 |
+
+失敗4件は §16.6 と同じ実 pipe の作成/接続時の OS 5。
+core は idle-connected shutdown と stdio fixture、adapter は withheld-response cancel と blocked-stdout cancel。
+新しい型/投影/互換/競合/匿名化の検査はすべて成功した。
+core check と adapter build 後の Rust 変更は core の test-only 期待値追従だけなので、その成功結果を再利用した。
+FFmpeg DLL は前回配置済みの worktree 内実ファイルを使用した。
+
+正式な独立再レビュー、今回差分での sandbox 外実 pipe、実 native PDF worker の確認は未実施。
+製品 binary / UI / 通常 profile を起動せず、test-full、commit、snapshot 更新、公開文書更新は行っていない。
+この3件について設計担当の追加判断を要する矛盾は見つからなかった。
+
+### 16.9 クライアントからの呼び出し観測 (観測者: ClaudeCode、2026-10-31、コード `8edce9336`)
+
+- 使い捨て portable (`prepare-portable-smoke.ps1` で作り直し) + 隔離 data。段階 0 の seed (タグ) に、
+  ★ 4 件 (5・4・4・3) と `parameters` tEXt を持つ 8×8 PNG `ai_cat.png` を足した (seed は scratchpad の `seed_1a_smoke.py`)。
+- Codex CLI 0.166.0 + `mcp_client_smoke.py`、ログ `target\mcp-client-smoke\20261031-151929-codex.jsonl`。
+  モデルは list_library (rated, stars 3 / reading_history / favorites)・list_collections・get_item_info の 5 回を呼び、全て成功。
+  limit は 200 で送られた (段階 0 の 1000 は今回なし)。
+- 回答: ★順 cat_garden 5 → dog_park 4 → ai_cat 4 → cat_sofa 3 (同じ★は rated 時刻の新しい順で seed どおり)。
+  ai_cat.png は寸法 8×8、プロンプト・ネガティブ・モデル名・Sampler/Steps/CFG/Seed/サイズ、タグなし、★4。
+  お気に入り・閲覧履歴・コレクションは空。
+- 独立レビューの P1〜P2 (§16.8) を直す前のコードでの観測。
+
+### 16.10 修正 1 回目の検収 (観測者: ClaudeCode、sandbox 外)
+
+| コマンド | exit code | 結果 |
+|---|---:|---|
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 0 | IPC 10/10、MCP 43/43 成功 |
+| §16.8 の focused nextest | 0 | 102/102 成功 |

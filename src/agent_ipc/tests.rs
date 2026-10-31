@@ -301,8 +301,12 @@ fn queued_results_are_revoked_even_after_reenable_and_unrelated_saves_are_allowe
     .unwrap();
     assert!(reply().wire().result.is_ok());
     f.set_level(AgentLevel::Disabled);
-    f.set_level(AgentLevel::ReadOnly);
     assert_eq!(reply().wire().result.unwrap_err().code, ErrorCode::Disabled);
+    f.set_level(AgentLevel::ReadOnly);
+    assert_eq!(
+        reply().wire().result.unwrap_err().code,
+        ErrorCode::PermissionChanged
+    );
     assert_ne!(grant.1, permission().unwrap().1);
 }
 

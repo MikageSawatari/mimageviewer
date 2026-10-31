@@ -156,6 +156,8 @@ impl Drop for PermissionObserver {
     }
 }
 fn permission_tools(result: &Result<Payload, AgentError>) -> Option<Vec<&'static str>> {
+    // PermissionChanged is an invalidated read, not evidence of an empty tool
+    // set. This also applies to Status used by discovery and the idle poll.
     match result {
         Ok(Payload::Status(status)) => Some(schema::tool_names(status.permission)),
         Err(AgentError {
@@ -169,7 +171,6 @@ fn reply_permission_tools(
     action: Action,
     result: &Result<Payload, AgentError>,
 ) -> Option<Vec<&'static str>> {
-    // A rejected read can mean snapshot revocation while the level stays enabled.
     // Only discovery or a successful status snapshot establishes the tool set.
     match (action, result) {
         (Action::List, _) | (_, Ok(Payload::Status(_))) => permission_tools(result),

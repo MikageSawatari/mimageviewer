@@ -5528,6 +5528,17 @@ pub fn get_page_sizes(pdf_path: &Path, password: Option<&str>) -> std::io::Resul
     get_page_sizes_with_read_target(pdf_path, &read, password)
 }
 
+/// Agent metadata reads must not put the requested document path in pool logs.
+/// Keep normal pool ownership, scheduling, and completion semantics; only omit
+/// the optional diagnostic identity. The agent logs its own bounded tool result.
+pub(crate) fn get_page_sizes_anonymous(
+    pdf_path: &Path,
+    password: Option<&str>,
+) -> std::io::Result<Vec<(f32, f32)>> {
+    let read = resolve_read_target(pdf_path).map_err(PdfReadError::into_io)?;
+    get_page_sizes_with_diagnostics(&read, password, None)
+}
+
 /// Background-only page sizes using the target that validated the caller's
 /// cache rows. Converted EPUBs must not be resolved a second time here.
 pub fn get_page_sizes_with_read_target(
@@ -5535,25 +5546,66 @@ pub fn get_page_sizes_with_read_target(
     read: &ReadTarget,
     password: Option<&str>,
 ) -> std::io::Result<Vec<(f32, f32)>> {
+    get_page_sizes_with_diagnostics(
+        read,
+        password,
+        Some(crate::grid_item::pdf_file_perf_key(pdf_path)),
+    )
+}
+
+fn get_page_sizes_with_diagnostics(
+    read: &ReadTarget,
+    password: Option<&str>,
+    perf_key: Option<String>,
+) -> std::io::Result<Vec<(f32, f32)>> {
+    #[cfg(test)]
+    if PAGE_SIZES_TEST_EXECUTOR.with(|executor| executor.borrow().is_some()) {
+        return request_page_sizes(read, password, perf_key, |request, key| {
+            PAGE_SIZES_TEST_EXECUTOR
+                .with(|executor| executor.borrow_mut().as_mut().unwrap()(request, key))
+        });
+    }
     #[cfg(test)]
     if remote_pdf_test_capture(read.read_path.as_path()).is_some() {
         let bytes =
             remote_pdf_test_run(|cache| ipc_page_sizes(cache, read.read_path.as_path(), password))?;
         return PdfWorkerPool::parse_page_sizes_response(&bytes);
     }
-    let pool = get_pool();
-    let req = encode_page_sizes_request(&read.read_path, password);
-    let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
-    // ページ構成を組むための背景処理。Unscoped (prune 対象外) + AbortOnCancel。
-    let resp = pool.execute(
-        PdfPoolRequest::new(&req, &read.read_path),
-        None,
-        JobPriority::Normal,
-        Some(perf_key),
-        PdfRenderValidity::Unscoped,
-        CancelWaitPolicy::AbortOnCancel,
-    )?;
-    PdfWorkerPool::parse_page_sizes_response(&resp.bytes)
+    request_page_sizes(read, password, perf_key, |request, perf_key| {
+        // 背景処理。Unscoped (prune 対象外) + AbortOnCancel。
+        get_pool()
+            .execute(
+                request,
+                None,
+                JobPriority::Normal,
+                perf_key,
+                PdfRenderValidity::Unscoped,
+                CancelWaitPolicy::AbortOnCancel,
+            )
+            .map(|response| response.bytes)
+    })
+}
+
+#[cfg(test)]
+type PageSizesTestExecutor =
+    Box<dyn for<'a> FnMut(PdfPoolRequest<'a>, Option<String>) -> std::io::Result<Vec<u8>>>;
+
+#[cfg(test)]
+thread_local! {
+    // Per-test-thread substitution, restored on panic by the test's scope guard.
+    static PAGE_SIZES_TEST_EXECUTOR: std::cell::RefCell<Option<PageSizesTestExecutor>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn request_page_sizes(
+    read: &ReadTarget,
+    password: Option<&str>,
+    perf_key: Option<String>,
+    execute: impl FnOnce(PdfPoolRequest<'_>, Option<String>) -> std::io::Result<Vec<u8>>,
+) -> std::io::Result<Vec<(f32, f32)>> {
+    let request = encode_page_sizes_request(&read.read_path, password);
+    let response = execute(PdfPoolRequest::new(&request, &read.read_path), perf_key)?;
+    PdfWorkerPool::parse_page_sizes_response(&response)
 }
 
 /// AI canonical loader が vector PDF を pixel 化する前に型付きで拒否するための解析 API。
@@ -8889,6 +8941,85 @@ C:\isolated\miv-data"#
             }
             _ => panic!("MSG_PAGE_SIZES を decode 側が知らない"),
         }
+    }
+
+    #[test]
+    fn anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results() {
+        let path = Path::new(r"C:\private\sensitive-document.pdf");
+        for outcome in 0..3 {
+            let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let observed_calls = calls.clone();
+            let result = with_page_sizes_test_executor(
+                move |request, key| {
+                    observed_calls.set(observed_calls.get() + 1);
+                    // The worker still receives the real source and password, while
+                    // dispatcher/open/cancel diagnostics receive no path identity.
+                    assert!(key.is_none());
+                    assert_eq!(request.read_path.as_path(), path);
+                    match decode_request(request.bytes).unwrap() {
+                        DecodedRequest::PageSizes {
+                            path: source,
+                            password,
+                        } => {
+                            assert_eq!(source, path);
+                            assert_eq!(password.as_deref(), Some("secret"));
+                        }
+                        _ => panic!("expected page sizes request"),
+                    }
+                    match outcome {
+                        0 => {
+                            let mut bytes = vec![STATUS_OK];
+                            bytes.extend_from_slice(&1_u32.to_le_bytes());
+                            bytes.extend_from_slice(&612_f32.to_le_bytes());
+                            bytes.extend_from_slice(&792_f32.to_le_bytes());
+                            Ok(bytes)
+                        }
+                        1 => Ok(vec![STATUS_ERR, b'x']),
+                        _ => Err(std::io::ErrorKind::BrokenPipe.into()),
+                    }
+                },
+                || get_page_sizes_anonymous(path, Some("secret")),
+            );
+            assert_eq!(calls.get(), 1);
+            if outcome == 0 {
+                assert_eq!(result.unwrap(), vec![(612.0, 792.0)]);
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn page_sizes_preserve_existing_ui_diagnostic_identity() {
+        let path = Path::new(r"C:\books\document.pdf");
+        let key = crate::grid_item::pdf_file_perf_key(path);
+        let sizes = with_page_sizes_test_executor(
+            move |_, actual| {
+                assert_eq!(actual.as_deref(), Some(key.as_str()));
+                let mut bytes = vec![STATUS_OK];
+                bytes.extend_from_slice(&0_u32.to_le_bytes());
+                Ok(bytes)
+            },
+            || get_page_sizes(path, None),
+        )
+        .unwrap();
+        assert!(sizes.is_empty());
+    }
+
+    fn with_page_sizes_test_executor<T>(
+        executor: impl for<'a> FnMut(PdfPoolRequest<'a>, Option<String>) -> std::io::Result<Vec<u8>>
+        + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore(Option<PageSizesTestExecutor>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                PAGE_SIZES_TEST_EXECUTOR.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore =
+            Restore(PAGE_SIZES_TEST_EXECUTOR.with(|slot| slot.replace(Some(Box::new(executor)))));
+        run()
     }
 
     #[test]

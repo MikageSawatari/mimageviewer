@@ -292,10 +292,52 @@ fn real_read_results_recheck_whole_snapshot_during_work_and_at_wire_boundary() {
             if field == 2 {
                 assert_eq!(permission().unwrap().0, original);
             }
-            assert_eq!(reply.wire().result.unwrap_err().code, ErrorCode::Disabled);
+            assert_eq!(
+                reply.wire().result.unwrap_err().code,
+                ErrorCode::PermissionChanged
+            );
             assert_eq!(f.handlers.active.load(Ordering::Acquire), 0);
         }
     }
+}
+
+#[test]
+fn status_snapshot_staleness_is_distinct_from_actual_disable() {
+    let f = Fixture::new();
+    let c = f.connection();
+    let original = permission().unwrap().0;
+    for changed in [
+        PermissionSnapshot {
+            gps: !original.gps,
+            ..original
+        },
+        PermissionSnapshot {
+            thumbnails: !original.thumbnails,
+            ..original
+        },
+    ] {
+        set_snapshot(original);
+        let (worker, replies) = start(&c, 10, Command::Status);
+        let reply = receive(&replies);
+        worker.join().unwrap();
+        assert!(matches!(reply.response.result, Ok(Payload::Status(_))));
+        set_snapshot(changed);
+        let stale = reply.wire().result.unwrap_err();
+        assert_eq!(stale.code, ErrorCode::PermissionChanged);
+        assert_ne!(stale.code, ErrorCode::Disabled);
+        let Payload::Status(fresh) = f.call(&c, 11, Command::Status).result.unwrap() else {
+            panic!("expected fresh permission snapshot");
+        };
+        assert_eq!(fresh.permission, changed);
+    }
+    set_snapshot(PermissionSnapshot {
+        level: AgentLevel::Disabled,
+        ..original
+    });
+    assert_eq!(
+        f.call(&c, 12, Command::Status).result.unwrap_err().code,
+        ErrorCode::Disabled
+    );
 }
 
 fn zip_file(path: &Path, contents: &[u8]) {

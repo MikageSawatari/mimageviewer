@@ -189,6 +189,7 @@ pub struct CollectionPage {
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     Disabled,
+    PermissionChanged,
     NotReady,
     BadRequest,
     VersionMismatch,
@@ -523,8 +524,15 @@ mod tests {
         assert!(read_frame::<_, Request>(&mut &[1, 0, 0, 0, b'{'][..]).is_err());
         let response = Response {
             id: 1,
-            result: Err(AgentError::new(ErrorCode::Disabled, "Disabled.")),
+            result: Err(AgentError::new(
+                ErrorCode::PermissionChanged,
+                "許可が変更されました",
+            )),
         };
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["result"]["Err"]["code"],
+            "permission_changed"
+        );
         let mut bytes = vec![];
         write_frame(&mut bytes, &response).unwrap();
         assert_eq!(

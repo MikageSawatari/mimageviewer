@@ -409,6 +409,41 @@ fn decompress_zlib(data: &[u8]) -> std::io::Result<String> {
 // フォーマット判別 & 高レベル API
 // ---------------------------------------------------------------------------
 
+/// Controls JSON-to-text conversion at the point where original JSON types still exist.
+/// Display/search retain their historical rich formatting. Agent output accepts only
+/// scalar leaf values so nested metadata cannot cross its field allowlist as text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsonTextMode {
+    Display,
+    ScalarOnly,
+}
+
+/// Scalar-only metadata extraction for the agent boundary. UI/search callers must
+/// continue using `extract_metadata` to retain rich JSON formatting.
+pub(crate) fn extract_metadata_for_agent(path: &Path) -> Option<AiMetadata> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => {
+            let chunks = read_png_text_chunks(path).ok()?;
+            detect_and_parse_outcome_with_mode(&chunks, JsonTextMode::ScalarOnly)
+                .map(|outcome| outcome.meta)
+        }
+        "jpg" | "jpeg" | "jfif" => {
+            extract_exif_user_comment_metadata_from_path(JsonTextMode::ScalarOnly, path)
+        }
+        _ => None,
+    }
+}
+
+/// The same scalar boundary for ZIP image bytes, including EXIF metadata.
+pub(crate) fn extract_metadata_from_bytes_for_agent(bytes: &[u8]) -> Option<AiMetadata> {
+    if is_png_bytes(bytes) {
+        let chunks = read_png_text_chunks_from_bytes(bytes).ok()?;
+        return detect_and_parse_outcome_with_mode(&chunks, JsonTextMode::ScalarOnly)
+            .map(|outcome| outcome.meta);
+    }
+    extract_exif_user_comment_metadata_from_bytes(JsonTextMode::ScalarOnly, bytes)
+}
+
 /// ファイルパスからメタデータを抽出する。
 ///
 /// PNG は tEXt/iTXt/zTXt、JPEG/JFIF は EXIF UserComment を見る。
@@ -432,8 +467,10 @@ pub fn extract_metadata_with_origin(path: &Path) -> Option<(AiMetadata, Metadata
             let chunks = read_png_text_chunks(path).ok()?;
             detect_and_parse_outcome(&chunks).map(|outcome| (outcome.meta, MetadataOrigin::PngText))
         }
-        "jpg" | "jpeg" | "jfif" => extract_exif_user_comment_metadata_from_path(path)
-            .map(|meta| (meta, MetadataOrigin::ExifUserComment)),
+        "jpg" | "jpeg" | "jfif" => {
+            extract_exif_user_comment_metadata_from_path(JsonTextMode::Display, path)
+                .map(|meta| (meta, MetadataOrigin::ExifUserComment))
+        }
         _ => None,
     }
 }
@@ -451,7 +488,7 @@ pub fn extract_metadata_from_bytes_with_origin(
         return detect_and_parse_outcome(&chunks)
             .map(|outcome| (outcome.meta, MetadataOrigin::PngText));
     }
-    extract_exif_user_comment_metadata_from_bytes(bytes)
+    extract_exif_user_comment_metadata_from_bytes(JsonTextMode::Display, bytes)
         .map(|meta| (meta, MetadataOrigin::ExifUserComment))
 }
 
@@ -465,6 +502,13 @@ fn detect_and_parse(chunks: &[(String, String)]) -> Option<AiMetadata> {
 }
 
 fn detect_and_parse_outcome(chunks: &[(String, String)]) -> Option<ParseOutcome> {
+    detect_and_parse_outcome_with_mode(chunks, JsonTextMode::Display)
+}
+
+fn detect_and_parse_outcome_with_mode(
+    chunks: &[(String, String)],
+    mode: JsonTextMode,
+) -> Option<ParseOutcome> {
     if chunks.is_empty() {
         return None;
     }
@@ -478,7 +522,7 @@ fn detect_and_parse_outcome(chunks: &[(String, String)]) -> Option<ParseOutcome>
             && val.is_object()
         {
             let workflow = chunk_value(chunks, "workflow").and_then(parse_comfyui_json_value);
-            let mut meta = parse_comfyui(val, workflow);
+            let mut meta = parse_comfyui_with_mode(val, workflow, mode);
             // ComfyUI を認識した時点で同居 parameters は常に AI metadata として consumed。
             // raw text / Negative を非 AI chunk 経路から再混入させない。resolved positive が
             // 取れない場合だけ、A1111 の構造を持つ parameters の positive を代替にする。
@@ -486,7 +530,7 @@ fn detect_and_parse_outcome(chunks: &[(String, String)]) -> Option<ParseOutcome>
                 prompt.role == ComfyPromptRole::Positive && !prompt.text.trim().is_empty()
             }) && let Some(raw) = chunk_value(chunks, "parameters")
                 && looks_like_a1111(raw)
-                && let Some(parameters) = parse_a1111_as(raw, AiToolKind::A1111)
+                && let Some(parameters) = parse_a1111_for_mode(mode, raw, AiToolKind::A1111)
                 && !parameters.prompt.trim().is_empty()
             {
                 meta.resolved_prompts.push(ResolvedComfyPrompt {
@@ -509,7 +553,7 @@ fn detect_and_parse_outcome(chunks: &[(String, String)]) -> Option<ParseOutcome>
             if chunk_value(chunks, "fooocus_scheme").is_some() {
                 consumed.push("fooocus_scheme");
             }
-            if let Some(meta) = parse_parameters_json(raw, &json, chunks) {
+            if let Some(meta) = parse_parameters_json(mode, raw, &json, chunks) {
                 return Some(ParseOutcome {
                     meta: AiMetadata::A1111(meta),
                     consumed_keys: consumed,
@@ -525,7 +569,7 @@ fn detect_and_parse_outcome(chunks: &[(String, String)]) -> Option<ParseOutcome>
     // InvokeAI: 現行 JSON / 旧 JSON / 旧 Dream テキスト
     if let Some(raw) = chunk_value(chunks, "invokeai_metadata")
         && let Some(json) = parse_json_object(raw)
-        && let Some(meta) = parse_invokeai_json(raw, &json)
+        && let Some(meta) = parse_invokeai_json(mode, raw, &json)
     {
         return Some(ParseOutcome {
             meta: AiMetadata::A1111(meta),
@@ -534,7 +578,7 @@ fn detect_and_parse_outcome(chunks: &[(String, String)]) -> Option<ParseOutcome>
     }
     if let Some(raw) = chunk_value(chunks, "sd-metadata")
         && let Some(json) = parse_json_object(raw)
-        && let Some(meta) = parse_invokeai_legacy_json(raw, &json)
+        && let Some(meta) = parse_invokeai_legacy_json(mode, raw, &json)
     {
         return Some(ParseOutcome {
             meta: AiMetadata::A1111(meta),
@@ -542,6 +586,7 @@ fn detect_and_parse_outcome(chunks: &[(String, String)]) -> Option<ParseOutcome>
         });
     }
     if let Some(raw) = chunk_value(chunks, "Dream")
+        && (mode == JsonTextMode::Display || !is_json_container(raw))
         && let Some(meta) = parse_invokeai_dream(raw)
     {
         return Some(ParseOutcome {
@@ -551,7 +596,7 @@ fn detect_and_parse_outcome(chunks: &[(String, String)]) -> Option<ParseOutcome>
     }
 
     // NovelAI は Description と Comment を併用するため、Description 汎用分岐より前に置く。
-    if let Some(meta) = parse_novelai(chunks) {
+    if let Some(meta) = parse_novelai(mode, chunks) {
         return Some(ParseOutcome {
             meta: AiMetadata::A1111(meta),
             consumed_keys: vec!["Description", "Comment", "Software", "Source", "Title"],
@@ -563,8 +608,8 @@ fn detect_and_parse_outcome(chunks: &[(String, String)]) -> Option<ParseOutcome>
     // NovelAI も Comment を使うため、NovelAI 判定より後に置くこと。
     if let Some(raw) = chunk_value(chunks, "Comment")
         && let Some(json) = parse_json_object(raw)
-        && let Some(meta) =
-            parse_ruinedfooocus_json(raw, &json).or_else(|| parse_fooocus_json(raw, &json, chunks))
+        && let Some(meta) = parse_ruinedfooocus_json(mode, raw, &json)
+            .or_else(|| parse_fooocus_json(mode, raw, &json, chunks))
     {
         return Some(ParseOutcome {
             meta: AiMetadata::A1111(meta),
@@ -584,7 +629,7 @@ fn detect_and_parse_outcome(chunks: &[(String, String)]) -> Option<ParseOutcome>
 
     // A1111 / Forge: "parameters" キー (平文)
     if let Some(raw) = chunk_value(chunks, "parameters") {
-        if let Some(meta) = parse_a1111_as(raw, AiToolKind::A1111) {
+        if let Some(meta) = parse_a1111_for_mode(mode, raw, AiToolKind::A1111) {
             return Some(ParseOutcome {
                 meta: AiMetadata::A1111(meta),
                 consumed_keys: vec!["parameters"],
@@ -594,7 +639,7 @@ fn detect_and_parse_outcome(chunks: &[(String, String)]) -> Option<ParseOutcome>
 
     // Midjourney: "Description" キー
     if let Some(raw) = chunk_value(chunks, "Description") {
-        if let Some(meta) = parse_a1111_as(raw, AiToolKind::Midjourney) {
+        if let Some(meta) = parse_a1111_for_mode(mode, raw, AiToolKind::Midjourney) {
             return Some(ParseOutcome {
                 meta: AiMetadata::A1111(meta),
                 consumed_keys: vec!["Description"],
@@ -721,34 +766,40 @@ fn json_identifier_char(ch: char) -> bool {
 }
 
 fn parse_parameters_json(
+    mode: JsonTextMode,
     raw: &str,
     json: &serde_json::Value,
     chunks: &[(String, String)],
 ) -> Option<A1111Metadata> {
-    if let Some(meta) = parse_swarmui_json(raw, json) {
+    if let Some(meta) = parse_swarmui_json(mode, raw, json) {
         return Some(meta);
     }
-    if let Some(meta) = parse_ruinedfooocus_json(raw, json) {
+    if let Some(meta) = parse_ruinedfooocus_json(mode, raw, json) {
         return Some(meta);
     }
-    if let Some(meta) = parse_fooocus_json(raw, json, chunks) {
+    if let Some(meta) = parse_fooocus_json(mode, raw, json, chunks) {
         return Some(meta);
     }
     None
 }
 
-fn parse_swarmui_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metadata> {
+fn parse_swarmui_json(
+    mode: JsonTextMode,
+    raw: &str,
+    json: &serde_json::Value,
+) -> Option<A1111Metadata> {
     let params_obj = json.get("sui_image_params")?.as_object()?;
-    let prompt = json_value_to_text(params_obj.get("prompt")?).unwrap_or_default();
+    let prompt = json_string_to_text(mode, params_obj.get("prompt")?).unwrap_or_default();
     let negative_prompt = params_obj
         .get("negativeprompt")
-        .and_then(json_value_to_text)
+        .and_then(|value| json_string_to_text(mode, value))
         .unwrap_or_default();
     if prompt.trim().is_empty() && negative_prompt.trim().is_empty() {
         return None;
     }
 
     let mut params = scalar_params_from_object(
+        mode,
         params_obj,
         &[
             "prompt",
@@ -758,13 +809,17 @@ fn parse_swarmui_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metada
         ],
     );
     if let Some(extra) = json.get("sui_extra_data").and_then(|v| v.as_object()) {
-        params.extend(prefix_scalar_params("extra.", extra, &[]));
+        params.extend(prefix_scalar_params(mode, "extra.", extra, &[]));
     }
     if let Some(models) = json.get("sui_models").and_then(|v| v.as_array()) {
         for model in models {
             if let Some(obj) = model.as_object() {
-                let name = obj.get("name").and_then(json_value_to_text);
-                let hash = obj.get("hash").and_then(json_value_to_text);
+                let name = obj
+                    .get("name")
+                    .and_then(|value| json_string_to_text(mode, value));
+                let hash = obj
+                    .get("hash")
+                    .and_then(|value| json_string_to_text(mode, value));
                 match (name, hash) {
                     (Some(name), Some(hash)) if !hash.is_empty() => {
                         params.push(("model".to_string(), format!("{name} ({hash})")));
@@ -786,6 +841,7 @@ fn parse_swarmui_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metada
 }
 
 fn parse_fooocus_json(
+    mode: JsonTextMode,
     raw: &str,
     json: &serde_json::Value,
     chunks: &[(String, String)],
@@ -811,6 +867,7 @@ fn parse_fooocus_json(
     }
 
     let prompt = first_json_text(
+        mode,
         json,
         &[
             &["prompt"],
@@ -824,6 +881,7 @@ fn parse_fooocus_json(
     )
     .unwrap_or_default();
     let negative_prompt = first_json_text(
+        mode,
         json,
         &[
             &["negative_prompt"],
@@ -840,6 +898,7 @@ fn parse_fooocus_json(
     }
 
     let params = scalar_params_from_object(
+        mode,
         obj,
         &[
             "prompt",
@@ -865,21 +924,29 @@ fn parse_fooocus_json(
     })
 }
 
-fn parse_ruinedfooocus_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metadata> {
+fn parse_ruinedfooocus_json(
+    mode: JsonTextMode,
+    raw: &str,
+    json: &serde_json::Value,
+) -> Option<A1111Metadata> {
     let obj = json.as_object()?;
     let software = obj
         .get("software")
         .or_else(|| obj.get("Software"))
-        .and_then(json_value_to_text)
+        .and_then(|value| json_string_to_text(mode, value))
         .unwrap_or_default();
     if !software.eq_ignore_ascii_case("RuinedFooocus") {
         return None;
     }
-    let prompt = first_json_text(json, &[&["Prompt"], &["prompt"]]).unwrap_or_default();
-    let negative_prompt =
-        first_json_text(json, &[&["Negative"], &["negative"], &["negative_prompt"]])
-            .unwrap_or_default();
+    let prompt = first_json_text(mode, json, &[&["Prompt"], &["prompt"]]).unwrap_or_default();
+    let negative_prompt = first_json_text(
+        mode,
+        json,
+        &[&["Negative"], &["negative"], &["negative_prompt"]],
+    )
+    .unwrap_or_default();
     let params = scalar_params_from_object(
+        mode,
         obj,
         &[
             "Prompt",
@@ -999,8 +1066,13 @@ fn parse_easydiffusion_chunks(chunks: &[(String, String)]) -> Option<A1111Metada
     })
 }
 
-fn parse_invokeai_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metadata> {
+fn parse_invokeai_json(
+    mode: JsonTextMode,
+    raw: &str,
+    json: &serde_json::Value,
+) -> Option<A1111Metadata> {
     let prompt = first_json_text(
+        mode,
         json,
         &[
             &["positive_prompt"],
@@ -1010,10 +1082,12 @@ fn parse_invokeai_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metad
         ],
     )
     .unwrap_or_default();
-    let style_prompt = first_json_text(json, &[&["positive_style_prompt"]]).unwrap_or_default();
+    let style_prompt =
+        first_json_text(mode, json, &[&["positive_style_prompt"]]).unwrap_or_default();
     let prompt = join_non_empty(&[prompt.as_str(), style_prompt.as_str()], "\n");
 
     let negative_prompt = first_json_text(
+        mode,
         json,
         &[
             &["negative_prompt"],
@@ -1022,7 +1096,8 @@ fn parse_invokeai_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metad
         ],
     )
     .unwrap_or_default();
-    let negative_style = first_json_text(json, &[&["negative_style_prompt"]]).unwrap_or_default();
+    let negative_style =
+        first_json_text(mode, json, &[&["negative_style_prompt"]]).unwrap_or_default();
     let negative_prompt =
         join_non_empty(&[negative_prompt.as_str(), negative_style.as_str()], "\n");
 
@@ -1031,7 +1106,10 @@ fn parse_invokeai_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metad
     }
 
     let mut params = Vec::new();
-    if let Some(model) = json.get("model").and_then(model_json_value_to_text) {
+    if let Some(model) = json
+        .get("model")
+        .and_then(|value| model_json_value_to_text(mode, value))
+    {
         params.push(("model_name".to_string(), model.clone()));
         params.push(("model".to_string(), model));
     }
@@ -1052,7 +1130,10 @@ fn parse_invokeai_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metad
         "vae",
         "app_version",
     ] {
-        if let Some(v) = json.get(key).and_then(json_value_to_text) {
+        if let Some(v) = json
+            .get(key)
+            .and_then(|value| json_param_to_text(mode, key, value))
+        {
             params.push((key.to_string(), v));
         }
     }
@@ -1066,15 +1147,24 @@ fn parse_invokeai_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metad
     })
 }
 
-fn parse_invokeai_legacy_json(raw: &str, json: &serde_json::Value) -> Option<A1111Metadata> {
+fn parse_invokeai_legacy_json(
+    mode: JsonTextMode,
+    raw: &str,
+    json: &serde_json::Value,
+) -> Option<A1111Metadata> {
     // 旧 sd-metadata の image.prompt は [{"prompt": "...", "weight": 1.0}] という
     // 配列のことがある。要素の prompt フィールドだけを取り出す (生 JSON を
     // prompt として扱わない)。
-    let array_prompt = json_path(json, &["image", "prompt"])
+    let array_prompt = (mode == JsonTextMode::Display)
+        .then(|| json_path(json, &["image", "prompt"]))
+        .flatten()
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|e| e.get("prompt").and_then(json_value_to_text))
+                .filter_map(|e| {
+                    e.get("prompt")
+                        .and_then(|value| json_value_to_text(mode, value))
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         })
@@ -1082,6 +1172,7 @@ fn parse_invokeai_legacy_json(raw: &str, json: &serde_json::Value) -> Option<A11
     let mut prompt = array_prompt
         .or_else(|| {
             first_json_text(
+                mode,
                 json,
                 &[
                     &["image", "prompt"],
@@ -1092,6 +1183,7 @@ fn parse_invokeai_legacy_json(raw: &str, json: &serde_json::Value) -> Option<A11
         })
         .unwrap_or_default();
     let mut negative_prompt = first_json_text(
+        mode,
         json,
         &[
             &["image", "negative_prompt"],
@@ -1114,6 +1206,7 @@ fn parse_invokeai_legacy_json(raw: &str, json: &serde_json::Value) -> Option<A11
     let mut params = Vec::new();
     if let Some(obj) = json.as_object() {
         params.extend(prefix_scalar_params(
+            mode,
             "",
             obj,
             &["image", "prompt", "negative_prompt"],
@@ -1151,7 +1244,7 @@ fn parse_invokeai_dream(raw: &str) -> Option<A1111Metadata> {
     })
 }
 
-fn parse_novelai(chunks: &[(String, String)]) -> Option<A1111Metadata> {
+fn parse_novelai(mode: JsonTextMode, chunks: &[(String, String)]) -> Option<A1111Metadata> {
     let software_is_novelai =
         chunk_value(chunks, "Software").is_some_and(|s| s.trim().eq_ignore_ascii_case("NovelAI"));
     let comment_raw = chunk_value(chunks, "Comment")?;
@@ -1164,14 +1257,24 @@ fn parse_novelai(chunks: &[(String, String)]) -> Option<A1111Metadata> {
 
     let prompt = comment
         .get("v4_prompt")
+        .filter(|value| mode == JsonTextMode::Display || value.is_string())
         .and_then(novelai_v4_caption_text)
         .or_else(|| chunk_value(chunks, "Description").map(str::to_string))
-        .or_else(|| comment.get("prompt").and_then(json_value_to_text))
+        .or_else(|| {
+            comment
+                .get("prompt")
+                .and_then(|value| json_string_to_text(mode, value))
+        })
         .unwrap_or_default();
     let negative_prompt = comment
         .get("v4_negative_prompt")
+        .filter(|value| mode == JsonTextMode::Display || value.is_string())
         .and_then(novelai_v4_caption_text)
-        .or_else(|| comment.get("uc").and_then(json_value_to_text))
+        .or_else(|| {
+            comment
+                .get("uc")
+                .and_then(|value| json_string_to_text(mode, value))
+        })
         .unwrap_or_default();
     if prompt.trim().is_empty() && negative_prompt.trim().is_empty() {
         return None;
@@ -1180,6 +1283,7 @@ fn parse_novelai(chunks: &[(String, String)]) -> Option<A1111Metadata> {
     let mut params = Vec::new();
     if let Some(obj) = comment.as_object() {
         params.extend(scalar_params_from_object(
+            mode,
             obj,
             &["prompt", "uc", "v4_prompt", "v4_negative_prompt"],
         ));
@@ -1199,24 +1303,31 @@ fn parse_novelai(chunks: &[(String, String)]) -> Option<A1111Metadata> {
     })
 }
 
-fn extract_exif_user_comment_metadata_from_path(path: &Path) -> Option<AiMetadata> {
+fn extract_exif_user_comment_metadata_from_path(
+    mode: JsonTextMode,
+    path: &Path,
+) -> Option<AiMetadata> {
     let exif = crate::exif_reader::read_rexif_from_path(path).exif?;
-    extract_exif_user_comment_metadata_from_entries(&exif.entries)
+    extract_exif_user_comment_metadata_from_entries(mode, &exif.entries)
 }
 
-fn extract_exif_user_comment_metadata_from_bytes(bytes: &[u8]) -> Option<AiMetadata> {
+fn extract_exif_user_comment_metadata_from_bytes(
+    mode: JsonTextMode,
+    bytes: &[u8],
+) -> Option<AiMetadata> {
     let exif = rexif::parse_buffer(bytes).ok()?;
-    extract_exif_user_comment_metadata_from_entries(&exif.entries)
+    extract_exif_user_comment_metadata_from_entries(mode, &exif.entries)
 }
 
 fn extract_exif_user_comment_metadata_from_entries(
+    mode: JsonTextMode,
     entries: &[rexif::ExifEntry],
 ) -> Option<AiMetadata> {
     let raw = entries
         .iter()
         .find(|entry| matches!(entry.tag, rexif::ExifTag::UserComment))
         .and_then(decode_user_comment_entry)?;
-    parse_user_comment_metadata(&raw).map(AiMetadata::A1111)
+    parse_user_comment_metadata(mode, &raw).map(AiMetadata::A1111)
 }
 
 /// EXIF UserComment を **検索向け** に分類して (検索テキスト, origin) を返す。
@@ -1232,7 +1343,7 @@ fn exif_user_comment_searchable_from_entries(
         .iter()
         .find(|entry| matches!(entry.tag, rexif::ExifTag::UserComment))
         .and_then(decode_user_comment_entry)?;
-    match classify_user_comment(&raw) {
+    match classify_user_comment(JsonTextMode::Display, &raw) {
         UserCommentClass::Ai(meta) => Some((
             build_searchable_text(&AiMetadata::A1111(meta)),
             MetadataOrigin::ExifUserComment,
@@ -1328,43 +1439,47 @@ enum UserCommentClass {
     Plain,
 }
 
-fn classify_user_comment(raw: &str) -> UserCommentClass {
+fn classify_user_comment(mode: JsonTextMode, raw: &str) -> UserCommentClass {
     if let Some(json) = parse_json_object(raw) {
-        if let Some(meta) = parse_swarmui_json(raw, &json) {
+        if let Some(meta) = parse_swarmui_json(mode, raw, &json) {
             return UserCommentClass::Ai(meta);
         }
-        if let Some(meta) = parse_ruinedfooocus_json(raw, &json) {
+        if let Some(meta) = parse_ruinedfooocus_json(mode, raw, &json) {
             return UserCommentClass::Ai(meta);
         }
-        if let Some(meta) = parse_fooocus_json(raw, &json, &[]) {
+        if let Some(meta) = parse_fooocus_json(mode, raw, &json, &[]) {
             return UserCommentClass::Ai(meta);
         }
-        if let Some(meta) = parse_invokeai_json(raw, &json) {
+        if let Some(meta) = parse_invokeai_json(mode, raw, &json) {
             return UserCommentClass::Ai(meta);
         }
-        if let Some(meta) = parse_invokeai_legacy_json(raw, &json) {
+        if let Some(meta) = parse_invokeai_legacy_json(mode, raw, &json) {
             return UserCommentClass::Ai(meta);
         }
         return UserCommentClass::UnknownJson;
     }
     if looks_like_a1111(raw)
-        && let Some(meta) = parse_a1111_as(raw, AiToolKind::JpegExif)
+        && let Some(meta) = parse_a1111_for_mode(mode, raw, AiToolKind::JpegExif)
     {
         return UserCommentClass::Ai(meta);
     }
     UserCommentClass::Plain
 }
 
-fn parse_user_comment_metadata(raw: &str) -> Option<A1111Metadata> {
-    match classify_user_comment(raw) {
+fn parse_user_comment_metadata(mode: JsonTextMode, raw: &str) -> Option<A1111Metadata> {
+    match classify_user_comment(mode, raw) {
         UserCommentClass::Ai(meta) => Some(meta),
         UserCommentClass::UnknownJson | UserCommentClass::Plain => None,
     }
 }
 
-fn first_json_text(json: &serde_json::Value, paths: &[&[&str]]) -> Option<String> {
+fn first_json_text(
+    mode: JsonTextMode,
+    json: &serde_json::Value,
+    paths: &[&[&str]],
+) -> Option<String> {
     for path in paths {
-        if let Some(v) = json_path(json, path).and_then(json_value_to_text) {
+        if let Some(v) = json_path(json, path).and_then(|value| json_string_to_text(mode, value)) {
             if !v.trim().is_empty() {
                 return Some(v);
             }
@@ -1381,23 +1496,70 @@ fn json_path<'a>(json: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde
     Some(cur)
 }
 
-fn json_value_to_text(value: &serde_json::Value) -> Option<String> {
+fn json_string_to_text(mode: JsonTextMode, value: &serde_json::Value) -> Option<String> {
+    if mode == JsonTextMode::ScalarOnly {
+        value.as_str().map(str::to_owned)
+    } else {
+        json_value_to_text(mode, value)
+    }
+}
+
+fn json_param_to_text(mode: JsonTextMode, key: &str, value: &serde_json::Value) -> Option<String> {
+    if mode == JsonTextMode::ScalarOnly {
+        // Generation numeric fields accept numeric JSON or their customary text
+        // representation. A boolean is not a seed, step count, CFG or dimension.
+        return match key.to_ascii_lowercase().as_str() {
+            "seed"
+            | "steps"
+            | "num_inference_steps"
+            | "cfg"
+            | "cfg scale"
+            | "cfg_scale"
+            | "guidance_scale"
+            | "guidance scale"
+            | "scale"
+            | "width"
+            | "height" => match value {
+                serde_json::Value::Number(_) | serde_json::Value::String(_) => {
+                    json_value_to_text(mode, value)
+                }
+                _ => None,
+            },
+            // All remaining agent-visible params are text (model names, sampler,
+            // and preformatted dimensions). Unknown params never cross projection.
+            _ => value.as_str().map(str::to_owned),
+        };
+    }
+    json_value_to_text(mode, value)
+}
+
+fn json_value_to_text(mode: JsonTextMode, value: &serde_json::Value) -> Option<String> {
+    if mode == JsonTextMode::ScalarOnly && (value.is_array() || value.is_object()) {
+        return None;
+    }
     match value {
         serde_json::Value::Null => None,
         serde_json::Value::Bool(v) => Some(v.to_string()),
         serde_json::Value::Number(v) => Some(v.to_string()),
         serde_json::Value::String(v) => Some(v.clone()),
         serde_json::Value::Array(values) => {
-            let parts: Vec<String> = values.iter().filter_map(json_value_to_text).collect();
+            let parts: Vec<String> = values
+                .iter()
+                .filter_map(|value| json_value_to_text(mode, value))
+                .collect();
             (!parts.is_empty()).then(|| parts.join(", "))
         }
         serde_json::Value::Object(_) => serde_json::to_string(value).ok(),
     }
 }
 
-fn model_json_value_to_text(value: &serde_json::Value) -> Option<String> {
+fn model_json_value_to_text(mode: JsonTextMode, value: &serde_json::Value) -> Option<String> {
+    if mode == JsonTextMode::ScalarOnly {
+        return value.as_str().map(str::to_owned);
+    }
     match value {
         serde_json::Value::Object(_) => first_json_text(
+            mode,
             value,
             &[
                 &["model_name"],
@@ -1410,18 +1572,20 @@ fn model_json_value_to_text(value: &serde_json::Value) -> Option<String> {
                 &["base"],
             ],
         ),
-        _ => json_value_to_text(value),
+        _ => json_value_to_text(mode, value),
     }
 }
 
 fn scalar_params_from_object(
+    mode: JsonTextMode,
     obj: &serde_json::Map<String, serde_json::Value>,
     skip: &[&str],
 ) -> Vec<(String, String)> {
-    prefix_scalar_params("", obj, skip)
+    prefix_scalar_params(mode, "", obj, skip)
 }
 
 fn prefix_scalar_params(
+    mode: JsonTextMode,
     prefix: &str,
     obj: &serde_json::Map<String, serde_json::Value>,
     skip: &[&str],
@@ -1431,7 +1595,7 @@ fn prefix_scalar_params(
         if skip.iter().any(|candidate| key == candidate) {
             continue;
         }
-        if let Some(text) = json_value_to_text(value).filter(|s| !s.trim().is_empty()) {
+        if let Some(text) = json_param_to_text(mode, key, value).filter(|s| !s.trim().is_empty()) {
             params.push((format!("{prefix}{key}"), text));
         }
     }
@@ -2014,6 +2178,21 @@ pub fn parse_a1111(raw: &str) -> Option<A1111Metadata> {
     parse_a1111_as(raw, AiToolKind::A1111)
 }
 
+fn is_json_container(raw: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .is_ok_and(|value| value.is_object() || value.is_array())
+}
+
+/// A JSON container is never a raw positive prompt merely because a format's
+/// structured parser could not use it. This checks original chunk/comment text,
+/// before normalization; ordinary scalar string fields are not reinterpreted.
+fn parse_a1111_for_mode(mode: JsonTextMode, raw: &str, tool: AiToolKind) -> Option<A1111Metadata> {
+    if mode == JsonTextMode::ScalarOnly && is_json_container(raw) {
+        return None;
+    }
+    parse_a1111_as(raw, tool)
+}
+
 fn parse_a1111_as(raw: &str, tool: AiToolKind) -> Option<A1111Metadata> {
     if raw.trim().is_empty() {
         return None;
@@ -2181,9 +2360,18 @@ fn next_params_key_boundary(rest: &str, known_keys: &[&str]) -> Option<(usize, u
 // ---------------------------------------------------------------------------
 
 /// ComfyUI の prompt JSON + workflow JSON からメタデータを抽出する。
+#[cfg(test)]
 fn parse_comfyui(
     prompt_json: serde_json::Value,
     workflow_json: Option<serde_json::Value>,
+) -> ComfyUIMetadata {
+    parse_comfyui_with_mode(prompt_json, workflow_json, JsonTextMode::Display)
+}
+
+fn parse_comfyui_with_mode(
+    prompt_json: serde_json::Value,
+    workflow_json: Option<serde_json::Value>,
+    mode: JsonTextMode,
 ) -> ComfyUIMetadata {
     let mut resolved_prompts = Vec::new();
     let mut unresolved_inputs = Vec::new();
@@ -2219,6 +2407,12 @@ fn parse_comfyui(
                             "denoise",
                         ] {
                             if let Some(val) = inputs.get(key) {
+                                if mode == JsonTextMode::ScalarOnly
+                                    && key == "sampler_name"
+                                    && !val.is_string()
+                                {
+                                    continue;
+                                }
                                 let val_str = match val {
                                     serde_json::Value::Number(n) => n.to_string(),
                                     serde_json::Value::String(s) => s.clone(),
@@ -2544,6 +2738,65 @@ fn contains_dynamic_prompt_syntax(text: &str) -> bool {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn scalar_agent_mode_does_not_change_rich_display_or_search_conversion() {
+        let raw = r#"{"sui_image_params":{"prompt":["cat","dog"],"negativeprompt":"bad","seed":{"gps":{"latitude":35.5},"workflow_json":{"secret":"x"}},"steps":[20,30],"flag":true}}"#;
+        let values = chunks(&[("parameters", raw)]);
+        let display = expect_prompt_meta(detect_and_parse(&values));
+        assert_eq!(display.prompt, "cat, dog");
+        assert!(display.params.iter().any(|(key, value)| key == "seed"
+            && value == r#"{"gps":{"latitude":35.5},"workflow_json":{"secret":"x"}}"#));
+        assert!(
+            display
+                .params
+                .iter()
+                .any(|(key, value)| key == "steps" && value == "20, 30")
+        );
+        assert!(
+            display
+                .params
+                .iter()
+                .any(|(key, value)| key == "flag" && value == "true")
+        );
+        assert!(build_searchable_from_chunks(&values).contains("cat, dog"));
+
+        let agent = expect_prompt_meta(
+            detect_and_parse_outcome_with_mode(&values, JsonTextMode::ScalarOnly)
+                .map(|outcome| outcome.meta),
+        );
+        assert!(agent.prompt.is_empty());
+        assert_eq!(agent.negative_prompt, "bad");
+        assert!(
+            !agent
+                .params
+                .iter()
+                .any(|(key, _)| ["seed", "steps"].contains(&key.as_str()))
+        );
+        // The generic scalar converter supports JSON booleans, but generation
+        // fields apply their own string/numeric schema before using this helper.
+        assert_eq!(
+            json_value_to_text(JsonTextMode::ScalarOnly, &serde_json::json!(true)),
+            Some("true".into())
+        );
+    }
+
+    #[test]
+    fn exif_user_comment_agent_mode_rejects_nested_fields_before_normalization() {
+        let raw = r#"{"positive_prompt":"cat","negative_prompt":{"gps":{"latitude":35.5}},"model":{"name":{"workflow_json":{"secret":"x"}}},"seed":[{"secret":"x"}],"steps":20}"#;
+        let display = parse_user_comment_metadata(JsonTextMode::Display, raw).unwrap();
+        assert!(display.negative_prompt.contains("latitude"));
+        assert!(
+            display
+                .params
+                .iter()
+                .any(|(key, value)| key == "seed" && value.contains("secret"))
+        );
+        let agent = parse_user_comment_metadata(JsonTextMode::ScalarOnly, raw).unwrap();
+        assert_eq!(agent.prompt, "cat");
+        assert!(agent.negative_prompt.is_empty());
+        assert_eq!(agent.params, vec![("steps".into(), "20".into())]);
+    }
 
     fn fixture_files(root: &Path, extensions: &[&str]) -> Vec<PathBuf> {
         fn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
@@ -3789,7 +4042,7 @@ mod tests {
         let mut bytes = b"ASCII\0\0\0".to_vec();
         bytes.extend_from_slice(raw.as_bytes());
         let decoded = decode_user_comment_bytes(&bytes, true).unwrap();
-        let meta = parse_user_comment_metadata(&decoded).unwrap();
+        let meta = parse_user_comment_metadata(JsonTextMode::Display, &decoded).unwrap();
         assert_eq!(meta.tool, AiToolKind::JpegExif);
         let text = build_searchable_text(&AiMetadata::A1111(meta));
         assert!(text.contains("jpeg positive"));
@@ -3805,7 +4058,7 @@ mod tests {
                 "model": "model-name"
             }
         }"#;
-        let meta = parse_user_comment_metadata(raw).unwrap();
+        let meta = parse_user_comment_metadata(JsonTextMode::Display, raw).unwrap();
         assert_eq!(meta.tool, AiToolKind::SwarmUI);
         let text = build_searchable_text(&AiMetadata::A1111(meta));
         assert!(text.contains("json usercomment positive"));
@@ -3820,10 +4073,13 @@ mod tests {
     fn user_comment_plain_text_is_not_ai_metadata() {
         // 普通の写真キャプション (A1111 シグネチャ無し) は AI メタとして拾わない。
         // これがないとパネルに偽の AI バッジが出て、検索でも EXIF コメント扱いされない。
-        assert!(parse_user_comment_metadata("旅行の写真 2026 夏").is_none());
-        assert!(parse_user_comment_metadata("Shot on my camera at the beach").is_none());
+        assert!(parse_user_comment_metadata(JsonTextMode::Display, "旅行の写真 2026 夏").is_none());
+        assert!(
+            parse_user_comment_metadata(JsonTextMode::Display, "Shot on my camera at the beach")
+                .is_none()
+        );
         assert!(matches!(
-            classify_user_comment("just a normal note"),
+            classify_user_comment(JsonTextMode::Display, "just a normal note"),
             UserCommentClass::Plain
         ));
     }
@@ -3831,10 +4087,17 @@ mod tests {
     #[test]
     fn user_comment_a1111_signature_is_still_ai_metadata() {
         // Negative prompt 行があれば AI。
-        let meta = parse_user_comment_metadata("pos\nNegative prompt: neg\nSteps: 20").unwrap();
+        let meta = parse_user_comment_metadata(
+            JsonTextMode::Display,
+            "pos\nNegative prompt: neg\nSteps: 20",
+        )
+        .unwrap();
         assert_eq!(meta.tool, AiToolKind::JpegExif);
         // Steps パラメータ行だけでも AI。
-        assert!(parse_user_comment_metadata("a cat\nSteps: 20, Seed: 1").is_some());
+        assert!(
+            parse_user_comment_metadata(JsonTextMode::Display, "a cat\nSteps: 20, Seed: 1")
+                .is_some()
+        );
     }
 
     #[test]
@@ -3842,9 +4105,9 @@ mod tests {
         // 認識できない JSON は AI として index しない (positive/negative を分離できず、
         // 生 JSON を索引へ流すと negative がリークするため suppress する)。
         let raw = r#"{"some_tool":{"prompt":"p","secret_negative":"should-not-leak"}}"#;
-        assert!(parse_user_comment_metadata(raw).is_none());
+        assert!(parse_user_comment_metadata(JsonTextMode::Display, raw).is_none());
         assert!(matches!(
-            classify_user_comment(raw),
+            classify_user_comment(JsonTextMode::Display, raw),
             UserCommentClass::UnknownJson
         ));
     }

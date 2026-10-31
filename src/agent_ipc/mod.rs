@@ -103,7 +103,7 @@ impl Reply {
             self.response.result = permission().and_then(|current| {
                 if current != granted {
                     Err(error(
-                        ErrorCode::Disabled,
+                        ErrorCode::PermissionChanged,
                         "AI 連携の許可が変更されました。もう一度お試しください",
                     ))
                 } else {
@@ -352,6 +352,7 @@ fn result_summary(result: &Result<Payload, AgentError>) -> (usize, &'static str)
             0,
             match e.code {
                 ErrorCode::Disabled => "disabled",
+                ErrorCode::PermissionChanged => "permission_changed",
                 ErrorCode::NotReady => "not_ready",
                 ErrorCode::BadRequest => "bad_request",
                 ErrorCode::VersionMismatch => "version_mismatch",

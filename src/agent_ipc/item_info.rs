@@ -111,7 +111,7 @@ pub(super) fn read(
                 // add AbortOnCancel(Some(cancel)): the outer deadline may reply first,
                 // but its Permit must remain held while this worker still owns IPC.
                 check_cancel(cancel)?;
-                let sizes = crate::pdf_loader::get_page_sizes(path, None);
+                let sizes = crate::pdf_loader::get_page_sizes_anonymous(path, None);
                 check_cancel(cancel)?;
                 output.dimensions = match sizes {
                     Ok(sizes) => {
@@ -165,7 +165,7 @@ pub(super) fn read(
                             );
                             check_cancel(cancel)?;
                             output.generation = project_generation(
-                                crate::png_metadata::extract_metadata_from_bytes(&bytes),
+                                crate::png_metadata::extract_metadata_from_bytes_for_agent(&bytes),
                             );
                         } else {
                             output.dimensions = InfoField::TooLarge;
@@ -201,7 +201,8 @@ pub(super) fn read(
             check_cancel(cancel)?;
             output.exif = project_exif(crate::exif_reader::read_exif(path, &[]), permission.gps);
             check_cancel(cancel)?;
-            output.generation = project_generation(crate::png_metadata::extract_metadata(path));
+            output.generation =
+                project_generation(crate::png_metadata::extract_metadata_for_agent(path));
         }
         GridItem::Image(path.to_owned())
     };
@@ -492,8 +493,9 @@ fn project_generation(
     };
     let params = match &source {
         AiMetadata::A1111(meta) => {
-            output.prompt = Some(text(meta.prompt.clone()));
-            output.negative_prompt = Some(text(meta.negative_prompt.clone()));
+            output.prompt = (!meta.prompt.is_empty()).then(|| text(meta.prompt.clone()));
+            output.negative_prompt =
+                (!meta.negative_prompt.is_empty()).then(|| text(meta.negative_prompt.clone()));
             &meta.params
         }
         AiMetadata::ComfyUI(meta) => {
