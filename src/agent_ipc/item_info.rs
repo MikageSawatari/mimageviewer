@@ -85,6 +85,7 @@ pub(super) fn read(
         generation: InfoField::NotApplicable,
     };
 
+    let mut legacy_rating_key = None;
     let grid_item = if let Some(subresource) = &input.subresource {
         output.kind = ItemKind::Image;
         output.container_size = metadata.as_ref().map(std::fs::Metadata::len);
@@ -154,6 +155,8 @@ pub(super) fn read(
                 check_cancel(cancel)?;
                 let member = match zip {
                     Ok(zip) => {
+                        legacy_rating_key =
+                            Some(crate::adjustment_db::zip_entry_key(path, &zip.legacy_name));
                         output.size = available(zip.size);
                         output.modified = available(zip.modified);
                         if let Some(bytes) = zip.bytes {
@@ -208,13 +211,18 @@ pub(super) fn read(
     };
 
     check_cancel(cancel)?;
-    enrich(&mut output, &grid_item, path)?;
+    enrich(&mut output, &grid_item, path, legacy_rating_key.as_deref())?;
     trim_descriptions(&mut output)?;
     check_cancel(cancel)?;
     Ok(output)
 }
 
-fn enrich(output: &mut ItemInfo, item: &GridItem, path: &Path) -> Result<(), AgentError> {
+fn enrich(
+    output: &mut ItemInfo,
+    item: &GridItem,
+    path: &Path,
+    legacy_rating_key: Option<&str>,
+) -> Result<(), AgentError> {
     // These are precisely App::rating_path_key / page_path_key's physical and
     // page keys; a page must never inherit the container's stars.
     let rating_key = crate::edit_source::page_key_for_grid_item(item)
@@ -223,7 +231,16 @@ fn enrich(output: &mut ItemInfo, item: &GridItem, path: &Path) -> Result<(), Age
     if ratings_path.try_exists().map_err(|_| super::internal())? {
         let db = crate::rating_db::RatingDb::open_readonly(ratings_path)
             .map_err(|_| super::internal())?;
-        output.rating = db.get(&rating_key);
+        // Presence matters: a current zero-star row must override old stars.
+        let keys: Vec<_> = std::iter::once(rating_key.clone())
+            .chain(legacy_rating_key.map(str::to_owned))
+            .collect();
+        let ratings = db.get_many(&keys);
+        output.rating = ratings
+            .get(&rating_key)
+            .copied()
+            .or_else(|| legacy_rating_key.and_then(|key| ratings.get(key).copied()))
+            .unwrap_or(0);
     }
     let tags = super::optional_tags(&crate::tags_db::TagsDb::db_path())?;
     let tags = tags.map_or_else(Vec::new, |db| {
@@ -237,7 +254,7 @@ fn enrich(output: &mut ItemInfo, item: &GridItem, path: &Path) -> Result<(), Age
     Ok(())
 }
 
-fn bytes_dimensions(bytes: &[u8], name: &str) -> Option<(u32, u32)> {
+pub(super) fn bytes_dimensions(bytes: &[u8], name: &str) -> Option<(u32, u32)> {
     if crate::raw_format::is_raw_path(Path::new(name)) {
         let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Bytes(bytes))
             .ok()?
@@ -257,15 +274,16 @@ fn bytes_dimensions(bytes: &[u8], name: &str) -> Option<(u32, u32)> {
         .ok()
 }
 
-struct ZipRead {
-    name: String,
-    size: Option<u64>,
-    modified: Option<i64>,
+pub(super) struct ZipRead {
+    pub(super) name: String,
+    pub(super) legacy_name: String,
+    pub(super) size: Option<u64>,
+    pub(super) modified: Option<i64>,
     // None means the leaf or an intermediate archive exceeded the bound.
-    bytes: Option<Vec<u8>>,
+    pub(super) bytes: Option<Vec<u8>>,
 }
 
-fn read_zip(path: &Path, member: &str, cancel: &AtomicBool) -> std::io::Result<ZipRead> {
+pub(super) fn read_zip(path: &Path, member: &str, cancel: &AtomicBool) -> std::io::Result<ZipRead> {
     match crate::zip_loader::open_archive(path)? {
         crate::zip_loader::ZipArchiveHandle::Zip(archive) => {
             read_zip_member(archive, member, cancel)
@@ -295,6 +313,7 @@ fn read_zip_member<R: Read + Seek>(
     let Some(bytes) = outer.bytes else {
         return Ok(ZipRead {
             name: member.to_owned(),
+            legacy_name: member.to_owned(),
             size: None,
             modified: None,
             bytes: None,
@@ -306,6 +325,7 @@ fn read_zip_member<R: Read + Seek>(
     let inner = zip::ZipArchive::new(Cursor::new(bytes)).map_err(std::io::Error::other)?;
     let mut result = read_zip_member(inner, &remainder.join("/"), cancel)?;
     result.name = format!("{}/{}", outer.name, result.name);
+    result.legacy_name = format!("{}/{}", outer.legacy_name, result.legacy_name);
     Ok(result)
 }
 
@@ -322,6 +342,7 @@ fn read_zip_index<R: Read + Seek>(
     }
     let mut result = ZipRead {
         name: crate::zip_loader::zip_entry_name(&entry).replace('\\', "/"),
+        legacy_name: entry.name().replace('\\', "/"),
         size: Some(entry.size()),
         modified: entry.last_modified().and_then(zip_milliseconds),
         bytes: None,
@@ -335,7 +356,7 @@ fn read_zip_index<R: Read + Seek>(
     Ok(result)
 }
 
-fn read_capped(
+pub(super) fn read_capped(
     reader: &mut impl Read,
     maximum: u64,
     cancel: &AtomicBool,

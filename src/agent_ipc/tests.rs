@@ -417,12 +417,21 @@ fn mcp_fixture_executable() -> std::path::PathBuf {
 #[cfg(windows)]
 #[test]
 fn stdio_exe_uses_real_core_fixture_handlers() {
+    use base64::Engine;
     use serde_json::json;
     use std::io::{BufRead, Write};
     let f = Fixture::new();
     f.seed_index();
-    let path = crate::data_dir::get().join("cat.png");
-    std::fs::write(&path, []).unwrap();
+    let folder = crate::data_dir::get().join("stdio-images");
+    std::fs::create_dir(&folder).unwrap();
+    let path = folder.join("cat.png");
+    image::DynamicImage::new_rgb8(7, 5).save(&path).unwrap();
+    crate::settings_db::with_db_result(|db| {
+        let mut settings = db.load_into_settings()?;
+        settings.agent_show_thumbnails = true;
+        db.save_full(&settings)
+    })
+    .unwrap();
     let mut tags = crate::tags_db::TagsDb::open().unwrap();
     tags.set_item_tags(
         &crate::tags_db::item_key_for_path(&path),
@@ -489,6 +498,8 @@ fn stdio_exe_uses_real_core_fixture_handlers() {
         (3, "items_by_tag", json!({"tag":"cat"})),
         (4, "list_collections", json!({"limit":1})),
         (5, "search_items", json!({"query":"cat","limit":2})),
+        (6, "list_folder", json!({"path":folder})),
+        (7, "get_thumbnail", json!({"items":[{"path":path}]})),
     ] {
         writeln!(input, "{}", json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments,"_meta":meta}})).unwrap();
         input.flush().unwrap();
@@ -509,6 +520,36 @@ fn stdio_exe_uses_real_core_fixture_handlers() {
                 assert_eq!(structured["collections"][0]["name"], "fixture collection")
             }
             "search_items" => assert_eq!(structured["items"].as_array().unwrap().len(), 2),
+            "list_folder" => {
+                assert_eq!(structured["items"].as_array().unwrap().len(), 1);
+                assert_eq!(structured["items"][0]["name"], "cat.png");
+                assert_eq!(structured["items"][0]["kind"], "image");
+                assert_eq!(structured["book_composition_applied"], false);
+            }
+            "get_thumbnail" => {
+                assert_eq!(structured["items"][0]["status"], "ok");
+                assert!(structured.get("images").is_none());
+                let block = &result["result"]["content"][1];
+                assert_eq!(block["type"], "image");
+                assert_eq!(block["mimeType"], "image/webp");
+                let webp = base64::engine::general_purpose::STANDARD
+                    .decode(block["data"].as_str().unwrap())
+                    .unwrap();
+                let image =
+                    image::load_from_memory_with_format(&webp, image::ImageFormat::WebP).unwrap();
+                assert_eq!(
+                    u64::from(image.width()),
+                    structured["items"][0]["dimensions"]["width"]
+                        .as_u64()
+                        .unwrap()
+                );
+                assert_eq!(
+                    u64::from(image.height()),
+                    structured["items"][0]["dimensions"]["height"]
+                        .as_u64()
+                        .unwrap()
+                );
+            }
             _ => unreachable!(),
         }
         if matches!(name, "list_tags" | "list_collections") {

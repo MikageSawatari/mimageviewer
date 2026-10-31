@@ -4,6 +4,7 @@ pub mod pipe;
 mod schema;
 #[cfg(test)]
 mod tests;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use input::{InputLifetime, InputLine, InputQueue};
 use mimageviewer_agent_ipc::*;
 use pipe::{Backend, CallControl};
@@ -592,7 +593,9 @@ fn handle_line(
 }
 fn serialize_response(response: &Value) -> String {
     let mut serialized = response.to_string();
-    if serialized.chars().count() > MAX_MCP_RESPONSE_CHARS {
+    if response_non_image_chars(response) > MAX_MCP_RESPONSE_CHARS
+        || serialized.len() > MAX_FRAME_BYTES
+    {
         serialized = error(
             response.get("id").cloned().unwrap_or(Value::Null),
             -32603,
@@ -602,6 +605,22 @@ fn serialize_response(response: &Value) -> String {
     }
     serialized.push('\n');
     serialized
+}
+fn response_non_image_chars(response: &Value) -> usize {
+    // Image payloads have their own decoded-byte budget. Keep image block
+    // envelopes in the non-image count; exclude only their base64 data.
+    let mut non_image = response.clone();
+    if let Some(blocks) = non_image
+        .pointer_mut("/result/content")
+        .and_then(Value::as_array_mut)
+    {
+        for block in blocks {
+            if block["type"] == "image" {
+                block["data"] = json!("");
+            }
+        }
+    }
+    non_image.to_string().chars().count()
 }
 fn write_serialized(output: &mut impl Write, serialized: &str) -> io::Result<()> {
     output.write_all(serialized.as_bytes())?;
@@ -672,6 +691,21 @@ struct InfoArgs {
 struct InfoRefArgs {
     path: String,
     subresource: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FolderArgs {
+    path: String,
+    subresource: Option<String>,
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThumbnailArgs {
+    items: Vec<InfoRefArgs>,
+    long_side: Option<u32>,
+    cursor: Option<String>,
 }
 fn parse_tool(params: &Value) -> Result<(Action, Command), &'static str> {
     let args = params
@@ -793,6 +827,49 @@ fn parse_tool(params: &Value) -> Result<(Action, Command), &'static str> {
                 },
             )
         }
+        Some("list_folder") => {
+            let a: FolderArgs = serde_json::from_value(args).map_err(bad)?;
+            validate_paging(a.limit, a.cursor.as_deref())?;
+            if a.path.is_empty() {
+                return Err("Specify a nonempty folder path");
+            }
+            (
+                "list_folder",
+                Command::ListFolder {
+                    path: a.path,
+                    subresource: a.subresource,
+                    limit: clamp_limit(a.limit),
+                    cursor: a.cursor,
+                },
+            )
+        }
+        Some("get_thumbnail") => {
+            let a: ThumbnailArgs = serde_json::from_value(args).map_err(bad)?;
+            validate_paging(None, a.cursor.as_deref())?;
+            if a.items.is_empty()
+                || a.items.len() > MAX_THUMBNAIL_ITEMS
+                || a.items.iter().any(|item| item.path.is_empty())
+                || a.long_side
+                    .is_some_and(|side| side < DEFAULT_THUMBNAIL_SIDE)
+            {
+                return Err("Specify 1 to 20 items and a thumbnail side of at least 256");
+            }
+            (
+                "get_thumbnail",
+                Command::GetThumbnail {
+                    items: a
+                        .items
+                        .into_iter()
+                        .map(|item| ItemRef {
+                            path: item.path,
+                            subresource: item.subresource,
+                        })
+                        .collect(),
+                    long_side: a.long_side.map(|side| side.min(MAX_THUMBNAIL_SIDE)),
+                    cursor: a.cursor,
+                },
+            )
+        }
         _ => return Err("Unknown tool"),
     };
     Ok((Action::Tool(name), command))
@@ -826,7 +903,10 @@ fn tool_result(name: &str, result: Result<Payload, AgentError>) -> Value {
             | ("list_collections", Ok(Payload::Collections(_)))
             | ("list_library", Ok(Payload::Library(_)))
             | ("get_item_info", Ok(Payload::Info(_)))
+            | ("list_folder", Ok(Payload::Folder(_)))
+            | ("get_thumbnail", Ok(Payload::Thumbnails(_)))
     );
+    let mut images = vec![];
     let (value, is_error) = match result {
         Ok(payload) if expected => (
             match payload {
@@ -836,6 +916,20 @@ fn tool_result(name: &str, result: Result<Payload, AgentError>) -> Value {
                 Payload::Collections(v) => json!(v),
                 Payload::Library(v) => json!(v),
                 Payload::Info(v) => json!(v),
+                Payload::Folder(v) => json!(v),
+                Payload::Thumbnails(v) => {
+                    if !valid_thumbnail_attachments(&v) {
+                        return tool_result(
+                            name,
+                            Err(AgentError::new(
+                                ErrorCode::Internal,
+                                "mIV の縮小画像の応答を確認できませんでした",
+                            )),
+                        );
+                    }
+                    images = v.images;
+                    json!(v.page)
+                }
                 _ => unreachable!(),
             },
             false,
@@ -860,10 +954,43 @@ fn tool_result(name: &str, result: Result<Payload, AgentError>) -> Value {
     {
         (value, is_error)
     } else {
+        images.clear();
         (
             json!({"error":{"code":"internal","message":"mIV の応答が出力予算を超えました"}}),
             true,
         )
     };
-    json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value,"isError":is_error})
+    let mut content = vec![json!({"type":"text","text":value.to_string()})];
+    content.extend(images.into_iter().map(|image| {
+        json!({
+            "type":"image", "mimeType":"image/webp", "data":STANDARD.encode(image.webp)
+        })
+    }));
+    json!({"content":content,"structuredContent":value,"isError":is_error})
+}
+
+fn valid_thumbnail_attachments(response: &ThumbnailResponse) -> bool {
+    if response.page.items.len() > MAX_THUMBNAIL_ITEMS {
+        return false;
+    }
+    let mut attachments = response.images.iter();
+    let mut total = 0usize;
+    for (index, row) in response.page.items.iter().enumerate() {
+        if matches!(row, PageRow::Value(item) if item.status == ThumbnailStatus::Ok) {
+            let Some(image) = attachments.next() else {
+                return false;
+            };
+            if image.item_index != index
+                || image.webp.is_empty()
+                || image.webp.len() > MAX_THUMBNAIL_IMAGE_BYTES
+            {
+                return false;
+            }
+            total += image.webp.len();
+            if total > MAX_THUMBNAIL_TOTAL_BYTES {
+                return false;
+            }
+        }
+    }
+    attachments.next().is_none()
 }

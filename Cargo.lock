@@ -4218,6 +4218,7 @@ dependencies = [
 name = "mimageviewer-agent-ipc"
 version = "4.10.0"
 dependencies = [
+ "base64 0.22.1",
  "serde",
  "serde_json",
  "sha2",
@@ -4251,6 +4252,7 @@ dependencies = [
 name = "mimageviewer-mcp"
 version = "4.10.0"
 dependencies = [
+ "base64 0.22.1",
  "mimageviewer-agent-ipc",
  "serde",
  "serde_json",

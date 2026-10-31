@@ -439,6 +439,22 @@ pub(crate) fn scan_directory_with_settings(
     path: &std::path::Path,
     settings: &crate::settings::Settings,
 ) -> std::io::Result<ScannedDir> {
+    scan_directory_with_settings_cancel(path, settings, None)
+}
+
+/// The agent's read worker uses the same recognition policy as ordinary listings,
+/// with request-owned cancellation rather than a UI context's scan token.
+pub(crate) fn scan_directory_with_settings_cancel(
+    path: &std::path::Path,
+    settings: &crate::settings::Settings,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> std::io::Result<ScannedDir> {
+    if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "folder scan cancelled",
+        ));
+    }
     #[cfg(test)]
     CALLER_SCAN_COUNT.with(|count| count.set(count.get() + 1));
     scan_directory_with_visibility_cancel(
@@ -447,7 +463,7 @@ pub(crate) fn scan_directory_with_settings(
         !settings.epub_file_handling_ignores_epub(),
         settings.show_hidden_files,
         &settings.file_type_visibility,
-        None,
+        cancel,
     )
 }
 

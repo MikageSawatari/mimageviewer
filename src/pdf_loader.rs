@@ -1157,8 +1157,9 @@ pub enum JobPriority {
 /// ので「PDFium が既に処理した高価な render 結果」が捨てられず、ユーザが同フォルダに
 /// 戻ったとき cache hit になる。
 ///
-/// **`HarvestOnCancel` は thumbnail PDF render の cache-savable 経路のみ**で使う。
-/// enumerate / Critical / background catch-up / bulk cache creator は `AbortOnCancel` の
+/// `HarvestOnCancel` は thumbnail PDF render の cache-savable 経路と、agent の
+/// 読み取り枠を実際の IPC 完了まで保持する経路で使う。待つだけで保存は行わない。
+/// 既存の enumerate / Critical / background catch-up / bulk cache creator は `AbortOnCancel` の
 /// まま。詳細は [docs/pdf-pool-harvest-on-cancel-plan.md](../docs/pdf-pool-harvest-on-cancel-plan.md)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelWaitPolicy {
@@ -5699,6 +5700,83 @@ pub fn enumerate_pages_with_read_target(
     Ok(result)
 }
 
+/// Read-only agent enumeration: omit source identities from pool diagnostics and
+/// retain the caller's execution slot until in-flight IPC actually completes.
+pub(crate) fn enumerate_pages_anonymous_with_read_target(
+    _pdf_path: &Path,
+    read: &ReadTarget,
+    password: Option<&str>,
+    cancel: Option<Arc<AtomicBool>>,
+    options: EnumerateOptions,
+) -> std::io::Result<PdfEnumerateResult> {
+    let request = encode_enumerate_request(
+        &read.read_path,
+        password,
+        enumerate_worker_options(read, options),
+    );
+    let response = execute_agent_pdf_request(
+        PdfPoolRequest::new(&request, &read.read_path),
+        cancel.as_ref(),
+        true,
+    )?;
+    let mut result = PdfWorkerPool::parse_enumerate_response(&response.bytes)?;
+    display_enumerated_pages(&mut result, read);
+    Ok(result)
+}
+
+fn execute_agent_pdf_request(
+    request: PdfPoolRequest<'_>,
+    cancel: Option<&Arc<AtomicBool>>,
+    enumerate: bool,
+) -> std::io::Result<ProcessResponse> {
+    #[cfg(test)]
+    if AGENT_PDF_TEST_EXECUTOR.with(|slot| slot.borrow().is_some()) {
+        return AGENT_PDF_TEST_EXECUTOR.with(|slot| {
+            slot.borrow_mut().as_mut().unwrap()(
+                request,
+                cancel,
+                None,
+                CancelWaitPolicy::HarvestOnCancel,
+            )
+        });
+    }
+    if enumerate {
+        execute_enumerate_request(
+            request,
+            cancel,
+            JobPriority::Normal,
+            None,
+            PdfRenderValidity::Unscoped,
+            CancelWaitPolicy::HarvestOnCancel,
+        )
+    } else {
+        get_pool().execute(
+            request,
+            cancel,
+            JobPriority::Normal,
+            None,
+            PdfRenderValidity::Unscoped,
+            CancelWaitPolicy::HarvestOnCancel,
+        )
+    }
+}
+
+#[cfg(test)]
+type AgentPdfTestExecutor = Box<
+    dyn for<'a> FnMut(
+        PdfPoolRequest<'a>,
+        Option<&Arc<AtomicBool>>,
+        Option<String>,
+        CancelWaitPolicy,
+    ) -> std::io::Result<ProcessResponse>,
+>;
+
+#[cfg(test)]
+thread_local! {
+    static AGENT_PDF_TEST_EXECUTOR: std::cell::RefCell<Option<AgentPdfTestExecutor>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn execute_enumerate_request(
     request: PdfPoolRequest<'_>,
     cancel: Option<&Arc<AtomicBool>>,
@@ -5929,8 +6007,8 @@ pub fn render_page(
     // Inherit the UI snapshot; independent work is explicit Unscoped.
     validity: PdfRenderValidity,
     // cancel 時に in-flight IPC を harvest するかどうか。
-    // thumbnail PDF render の cache-savable 経路のみ `HarvestOnCancel`、それ以外は
-    // `AbortOnCancel`。詳細は `CancelWaitPolicy` の doc コメント参照。
+    // thumbnail PDF render の cache-savable 経路と agent の枠保持は
+    // `HarvestOnCancel`。詳細は `CancelWaitPolicy` の doc コメント参照。
     cancel_policy: CancelWaitPolicy,
 ) -> std::io::Result<RenderResult> {
     render_page_target(
@@ -5943,6 +6021,33 @@ pub fn render_page(
         validity,
         cancel_policy,
     )
+}
+
+/// Render precisely one agent-requested PDF page, without path-bearing perf
+/// identities, metadata/catalog writes, or early release of in-flight work.
+pub(crate) fn render_page_anonymous(
+    pdf_path: &Path,
+    page_num: u32,
+    target_px: u32,
+    cancel: Arc<AtomicBool>,
+) -> std::io::Result<RenderResult> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(std::io::ErrorKind::Interrupted.into());
+    }
+    let read = resolve_read_target(pdf_path).map_err(PdfReadError::into_io)?;
+    let request = encode_render_request(
+        &read.read_path,
+        page_num,
+        PdfRenderTarget::LongEdge(target_px),
+        None,
+        false,
+    );
+    let response = execute_agent_pdf_request(
+        PdfPoolRequest::new(&request, &read.read_path),
+        Some(&cancel),
+        false,
+    )?;
+    PdfWorkerPool::parse_render_response(&response.bytes)
 }
 
 /// Render an EPUB page after its cache lookup has already resolved the generation.
@@ -8987,6 +9092,159 @@ C:\isolated\miv-data"#
                 assert!(result.is_err());
             }
         }
+    }
+
+    fn with_agent_pdf_test_executor<T>(
+        executor: impl for<'a> FnMut(
+            PdfPoolRequest<'a>,
+            Option<&Arc<AtomicBool>>,
+            Option<String>,
+            CancelWaitPolicy,
+        ) -> std::io::Result<ProcessResponse>
+        + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore(Option<AgentPdfTestExecutor>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                AGENT_PDF_TEST_EXECUTOR.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore =
+            Restore(AGENT_PDF_TEST_EXECUTOR.with(|slot| slot.replace(Some(Box::new(executor)))));
+        run()
+    }
+
+    #[test]
+    fn anonymous_agent_render_and_enumerate_omit_keys_and_harvest_actual_completion() {
+        for render in [false, true] {
+            for outcome in 0..3 {
+                let path = Path::new(r"C:\private\agent-sensitive.pdf");
+                let cancel = Arc::new(AtomicBool::new(false));
+                let worker_cancel = cancel.clone();
+                let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+                let observed = calls.clone();
+                let result = with_agent_pdf_test_executor(
+                    move |request, actual_cancel, key, policy| {
+                        observed.set(observed.get() + 1);
+                        assert!(key.is_none(), "agent pool must have no path-bearing key");
+                        assert_eq!(policy, CancelWaitPolicy::HarvestOnCancel);
+                        assert!(Arc::ptr_eq(actual_cancel.unwrap(), &worker_cancel));
+                        assert_eq!(request.read_path.as_path(), path);
+                        match decode_request(request.bytes).unwrap() {
+                            DecodedRequest::Render {
+                                path: source,
+                                page_num,
+                                password,
+                                target,
+                                collect_metrics,
+                            } if render => {
+                                assert_eq!(source, path);
+                                assert_eq!(page_num, 3);
+                                assert!(password.is_none());
+                                assert_eq!(target, PdfRenderTarget::LongEdge(256));
+                                assert!(!collect_metrics);
+                            }
+                            DecodedRequest::Enumerate {
+                                path: source,
+                                password,
+                                options,
+                            } if !render => {
+                                assert_eq!(source, path);
+                                assert!(password.is_none());
+                                assert!(!options.want_direction);
+                            }
+                            _ => panic!("wrong agent PDF request"),
+                        }
+                        // Exercise the production wait loop itself. Cancellation
+                        // after enqueue must not release this caller before the
+                        // real worker's reply (success or error) is received.
+                        let mut receives = 0;
+                        let response = wait_for_pool_reply(
+                            |_| {
+                                receives += 1;
+                                if receives == 1 {
+                                    worker_cancel.store(true, Ordering::Release);
+                                    return Err(mpsc::RecvTimeoutError::Timeout);
+                                }
+                                if outcome == 2 {
+                                    return Ok(Err(std::io::ErrorKind::BrokenPipe.into()));
+                                }
+                                let bytes = if outcome == 1 {
+                                    vec![STATUS_ERR, b'x']
+                                } else if render {
+                                    let mut bytes = vec![STATUS_OK];
+                                    bytes.extend_from_slice(&1_u32.to_le_bytes()); // width
+                                    bytes.extend_from_slice(&1_u32.to_le_bytes()); // height
+                                    bytes.push(0); // vector
+                                    bytes.extend_from_slice(&0_u32.to_le_bytes());
+                                    bytes.extend_from_slice(&0_u32.to_le_bytes());
+                                    bytes.extend_from_slice(&10_u32.to_le_bytes());
+                                    bytes.extend_from_slice(&612_f32.to_le_bytes());
+                                    bytes.extend_from_slice(&792_f32.to_le_bytes());
+                                    bytes.extend_from_slice(&[0, 0, 0, 255]);
+                                    bytes
+                                } else {
+                                    let mut bytes = vec![STATUS_OK];
+                                    bytes.extend_from_slice(&0_u32.to_le_bytes());
+                                    bytes
+                                };
+                                Ok(Ok(ProcessResponse {
+                                    bytes,
+                                    parent_read: ParentReadMetrics::default(),
+                                    worker_render: None,
+                                }))
+                            },
+                            actual_cancel,
+                            policy,
+                            key.as_deref(),
+                        );
+                        assert_eq!(
+                            receives, 2,
+                            "actual completion must be harvested after cancellation"
+                        );
+                        response
+                    },
+                    || {
+                        if render {
+                            render_page_anonymous(path, 3, 256, cancel.clone()).map(|_| ())
+                        } else {
+                            let read = resolve_read_target(path).unwrap();
+                            enumerate_pages_anonymous_with_read_target(
+                                path,
+                                &read,
+                                None,
+                                Some(cancel.clone()),
+                                EnumerateOptions::default(),
+                            )
+                            .map(|_| ())
+                        }
+                    },
+                );
+                assert_eq!(calls.get(), 1);
+                assert_eq!(result.is_ok(), outcome == 0);
+                assert!(cancel.load(Ordering::Acquire));
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_anonymous_render_does_not_enqueue() {
+        let result = with_agent_pdf_test_executor(
+            |_, _, _, _| panic!("cancelled render must not enqueue"),
+            || {
+                render_page_anonymous(
+                    Path::new(r"C:\private\cancelled.pdf"),
+                    0,
+                    256,
+                    Arc::new(AtomicBool::new(true)),
+                )
+            },
+        );
+        assert_eq!(
+            result.err().unwrap().kind(),
+            std::io::ErrorKind::Interrupted
+        );
     }
 
     #[test]

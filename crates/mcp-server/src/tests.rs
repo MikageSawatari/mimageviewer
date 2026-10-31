@@ -49,6 +49,486 @@ fn catalog_tools_forward_and_validate_paging_arguments() {
         );
     }
 }
+
+fn thumbnail_fixture(statuses: &[ThumbnailStatus], image_bytes: usize) -> ThumbnailResponse {
+    ThumbnailResponse {
+        page: ThumbnailPage {
+            items: statuses
+                .iter()
+                .enumerate()
+                .map(|(index, &status)| {
+                    ThumbnailItem {
+                        item: ItemRef {
+                            path: format!("C:/猫-{index}.png"),
+                            subresource: None,
+                        },
+                        status,
+                        dimensions: (status == ThumbnailStatus::Ok).then_some(Dimensions {
+                            width: 256,
+                            height: 128,
+                            unit: DimensionUnit::Pixels,
+                        }),
+                    }
+                    .into()
+                })
+                .collect(),
+            cursor: Some("next-input-position".into()),
+            truncated: true,
+        },
+        images: statuses
+            .iter()
+            .enumerate()
+            .filter(|(_, status)| **status == ThumbnailStatus::Ok)
+            .map(|(item_index, _)| ThumbnailImage {
+                item_index,
+                webp: vec![255; image_bytes],
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn stage1b_argument_contracts_and_schema() {
+    let (_, folder) = parse_tool(&json!({"name":"list_folder","arguments":{"path":"C:/book.zip","subresource":"pages/","limit":999,"cursor":"next"}})).unwrap();
+    assert_eq!(
+        folder,
+        Command::ListFolder {
+            path: "C:/book.zip".into(),
+            subresource: Some("pages/".into()),
+            limit: Some(200),
+            cursor: Some("next".into())
+        }
+    );
+    let (_, thumbnail) = parse_tool(&json!({"name":"get_thumbnail","arguments":{"items":[{"path":"C:/book.zip","subresource":"cat.png"}],"long_side":999,"cursor":"next"}})).unwrap();
+    assert_eq!(
+        thumbnail,
+        Command::GetThumbnail {
+            items: vec![ItemRef {
+                path: "C:/book.zip".into(),
+                subresource: Some("cat.png".into())
+            }],
+            long_side: Some(512),
+            cursor: Some("next".into())
+        }
+    );
+    for arguments in [
+        json!({"items":[]}),
+        json!({"items":[{"path":""}]}),
+        json!({"items":vec![json!({"path":"C:/a.png"});21]}),
+        json!({"items":[{"path":"C:/a.png"}],"long_side":255}),
+        json!({"items":[{"path":"C:/a.png"}],"limit":1}),
+        json!({"items":[{"path":"C:/a.png","extra":true}]}),
+        json!({"items":[{"path":"C:/a.png"}],"cursor":"x".repeat(8193)}),
+    ] {
+        assert!(parse_tool(&json!({"name":"get_thumbnail","arguments":arguments})).is_err());
+    }
+    for arguments in [
+        json!({"path":""}),
+        json!({"path":"C:/book.zip","limit":0}),
+        json!({"path":"C:/book.zip","extra":true}),
+    ] {
+        assert!(parse_tool(&json!({"name":"list_folder","arguments":arguments})).is_err());
+    }
+    let tools = schema::tools();
+    let folder = tools
+        .iter()
+        .find(|tool| tool["name"] == "list_folder")
+        .unwrap();
+    assert_eq!(folder["inputSchema"]["properties"]["limit"]["default"], 100);
+    assert!(
+        folder["description"]
+            .as_str()
+            .unwrap()
+            .contains("UI search")
+    );
+    let thumbnail = tools
+        .iter()
+        .find(|tool| tool["name"] == "get_thumbnail")
+        .unwrap();
+    assert!(
+        thumbnail["inputSchema"]["properties"]
+            .get("limit")
+            .is_none()
+    );
+    assert_eq!(
+        thumbnail["inputSchema"]["properties"]["long_side"]["default"],
+        256
+    );
+    assert_eq!(
+        thumbnail["inputSchema"]["properties"]["long_side"]["maximum"],
+        512
+    );
+    for name in ["list_folder", "get_thumbnail"] {
+        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+        let error = tool_result(
+            name,
+            Err(AgentError::new(ErrorCode::PermissionChanged, "changed")),
+        );
+        assert!(accepts_schema(
+            &tool["outputSchema"],
+            &error["structuredContent"]
+        ));
+    }
+    let statuses = [
+        ThumbnailStatus::Ok,
+        ThumbnailStatus::TooLarge,
+        ThumbnailStatus::Unavailable,
+        ThumbnailStatus::Unsupported,
+        ThumbnailStatus::HiddenByEdit,
+    ];
+    let result = tool_result(
+        "get_thumbnail",
+        Ok(Payload::Thumbnails(thumbnail_fixture(&statuses, 8))),
+    );
+    assert!(accepts_schema(
+        &thumbnail["outputSchema"],
+        &result["structuredContent"]
+    ));
+    let invalid = json!({"items":[{"item":{"path":"C:/a.png","subresource":null},"status":"hidden","dimensions":null}],"cursor":null,"truncated":false});
+    assert!(!accepts_schema(&thumbnail["outputSchema"], &invalid));
+    let result = tool_result(
+        "list_folder",
+        Ok(Payload::Folder(FolderPage {
+            items: vec![
+                FolderItem {
+                    path: "C:/book.zip".into(),
+                    subresource: Some("pages/".into()),
+                    name: "pages".into(),
+                    kind: FolderKind::ZipFolder,
+                    size: None,
+                    modified: None,
+                }
+                .into(),
+            ],
+            cursor: None,
+            truncated: false,
+            book_composition_applied: true,
+        })),
+    );
+    assert!(accepts_schema(
+        &folder["outputSchema"],
+        &result["structuredContent"]
+    ));
+}
+
+#[test]
+fn stage1b_images_stay_out_of_metadata_and_have_separate_budgets() {
+    let thumbnails = thumbnail_fixture(&[ThumbnailStatus::Ok; 4], MAX_THUMBNAIL_IMAGE_BYTES);
+    let page = serde_json::to_value(&thumbnails.page).unwrap();
+    let page_chars = mcp_content_chars(&page).unwrap();
+    let result = tool_result("get_thumbnail", Ok(Payload::Thumbnails(thumbnails)));
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["structuredContent"], page);
+    assert_eq!(
+        serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+        page
+    );
+    assert_eq!(result["content"].as_array().unwrap().len(), 5);
+    for block in result["content"].as_array().unwrap().iter().skip(1) {
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["mimeType"], "image/webp");
+        assert_eq!(
+            STANDARD
+                .decode(block["data"].as_str().unwrap())
+                .unwrap()
+                .len(),
+            MAX_THUMBNAIL_IMAGE_BYTES
+        );
+    }
+    for modern in [true, false] {
+        let envelope = success(json!("id".repeat(128)), result.clone(), modern);
+        let serialized = serialize_response(&envelope);
+        assert!(serialized.len() > MAX_MCP_RESPONSE_CHARS);
+        assert!(
+            serde_json::from_str::<Value>(&serialized)
+                .unwrap()
+                .get("error")
+                .is_none()
+        );
+        let mut stripped = envelope;
+        for block in stripped["result"]["content"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .skip(1)
+        {
+            block["data"] = json!("");
+        }
+        assert!(stripped.to_string().chars().count() - page_chars <= MCP_ENVELOPE_RESERVE_CHARS);
+    }
+    for thumbnails in [
+        thumbnail_fixture(&[ThumbnailStatus::Ok], MAX_THUMBNAIL_IMAGE_BYTES + 1),
+        thumbnail_fixture(&[ThumbnailStatus::Ok; 5], MAX_THUMBNAIL_IMAGE_BYTES),
+    ] {
+        let result = tool_result("get_thumbnail", Ok(Payload::Thumbnails(thumbnails)));
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["content"].as_array().unwrap().len(), 1);
+    }
+    let mut oversized = thumbnail_fixture(&[ThumbnailStatus::Ok], 8);
+    let PageRow::Value(row) = &mut oversized.page.items[0] else {
+        panic!()
+    };
+    row.item.path = "猫\\\"".repeat(12_000);
+    assert_eq!(
+        tool_result("get_thumbnail", Ok(Payload::Thumbnails(oversized)))["content"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let too_large = success(
+        json!(1),
+        json!({"content":[{"type":"image","data":"x".repeat(MAX_FRAME_BYTES)}]}),
+        true,
+    );
+    assert!(
+        serde_json::from_str::<Value>(&serialize_response(&too_large))
+            .unwrap()
+            .get("error")
+            .is_some()
+    );
+}
+
+#[test]
+fn stage1b_final_budget_exempts_only_image_content_data() {
+    let small = json!({"jsonrpc":"2.0","id":1,"result":{
+        "structuredContent":{"data":"metadata","nested":{"type":"image","data":"metadata"}},
+        "content":[{"type":"text","text":"metadata","data":"metadata"},{"type":"image","mimeType":"image/webp","data":""}],
+        "isError":false
+    }});
+    let baseline = small.to_string().chars().count();
+    let mut response = small.clone();
+    response["result"]["content"][1]["data"] = json!("x".repeat(MAX_THUMBNAIL_TOTAL_BYTES));
+    assert_eq!(response_non_image_chars(&response), baseline);
+    assert!(
+        serde_json::from_str::<Value>(&serialize_response(&response))
+            .unwrap()
+            .get("error")
+            .is_none()
+    );
+    for pointer in [
+        "/result/structuredContent/data",
+        "/result/structuredContent/nested/data",
+        "/result/content/0/text",
+        "/result/content/0/data",
+    ] {
+        let mut oversized = response.clone();
+        *oversized.pointer_mut(pointer).unwrap() = json!("x".repeat(MAX_MCP_RESPONSE_CHARS));
+        assert!(
+            serde_json::from_str::<Value>(&serialize_response(&oversized))
+                .unwrap()
+                .get("error")
+                .is_some(),
+            "{pointer}"
+        );
+    }
+    let mut exact = small;
+    exact["result"]["content"][1]["data"] = json!("encoded image");
+    exact["result"]["structuredContent"]["padding"] = json!("");
+    let padding = MAX_MCP_RESPONSE_CHARS - response_non_image_chars(&exact);
+    exact["result"]["structuredContent"]["padding"] = json!("x".repeat(padding));
+    assert_eq!(response_non_image_chars(&exact), MAX_MCP_RESPONSE_CHARS);
+    assert!(
+        serde_json::from_str::<Value>(&serialize_response(&exact))
+            .unwrap()
+            .get("error")
+            .is_none()
+    );
+    exact["result"]["structuredContent"]["padding"] = json!("x".repeat(padding + 1));
+    assert!(
+        serde_json::from_str::<Value>(&serialize_response(&exact))
+            .unwrap()
+            .get("error")
+            .is_some()
+    );
+}
+
+#[test]
+fn stage1b_attachment_indices_must_match_exactly_the_ok_rows() {
+    assert!(!valid_thumbnail_attachments(&thumbnail_fixture(
+        &[ThumbnailStatus::Unsupported; 21],
+        0
+    )));
+    let fixture = thumbnail_fixture(
+        &[
+            ThumbnailStatus::Unsupported,
+            ThumbnailStatus::Ok,
+            ThumbnailStatus::HiddenByEdit,
+            ThumbnailStatus::Ok,
+        ],
+        8,
+    );
+    assert!(valid_thumbnail_attachments(&fixture));
+    for mutation in 0..6 {
+        let mut bad = fixture.clone();
+        match mutation {
+            0 => {
+                bad.images[0].item_index = 0;
+            }
+            1 => {
+                bad.images[1].item_index = 1;
+            }
+            2 => {
+                bad.images.pop();
+            }
+            3 => {
+                bad.images.reverse();
+            }
+            4 => {
+                bad.images[0].webp.clear();
+            }
+            _ => {
+                bad.images.push(bad.images[0].clone());
+            }
+        }
+        assert!(!valid_thumbnail_attachments(&bad));
+        let result = tool_result("get_thumbnail", Ok(Payload::Thumbnails(bad)));
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["content"].as_array().unwrap().len(), 1);
+    }
+    let mut omitted = fixture;
+    omitted.page.items[1] = PageRow::too_long(&"oversized item").unwrap();
+    assert!(!valid_thumbnail_attachments(&omitted));
+    omitted.images.remove(0);
+    assert!(valid_thumbnail_attachments(&omitted));
+}
+
+#[test]
+fn stage1b_permission_tool_sets_and_thumbnail_changes() {
+    for level in [
+        AgentLevel::Disabled,
+        AgentLevel::ReadOnly,
+        AgentLevel::ReadAndOpen,
+    ] {
+        for thumbnails in [true, false] {
+            let permission = PermissionSnapshot {
+                level,
+                thumbnails,
+                gps: true,
+            };
+            let names = schema::tool_names(permission);
+            assert_eq!(
+                names.contains(&"list_folder"),
+                level != AgentLevel::Disabled
+            );
+            assert_eq!(
+                names.contains(&"get_thumbnail"),
+                level != AgentLevel::Disabled && thumbnails
+            );
+            assert_eq!(schema::tools_for(permission).len(), names.len());
+        }
+    }
+    let (stop, _recv) = mpsc::sync_channel(1);
+    let mut observer = PermissionObserver {
+        stop,
+        revision: Arc::new(AtomicU64::new(0)),
+        effective: None,
+    };
+    for (index, thumbnails) in [false, true, false].into_iter().enumerate() {
+        let notice = observer.observe(
+            schema::tool_names(PermissionSnapshot {
+                level: AgentLevel::ReadOnly,
+                thumbnails,
+                gps: false,
+            }),
+            None,
+        );
+        assert_eq!(notice.is_some(), index > 0);
+    }
+}
+
+#[test]
+fn stage1b_all_protocols_transport_folder_pages_and_webp_blocks() {
+    struct Stage1b;
+    impl Backend for Stage1b {
+        fn call(
+            &self,
+            command: Command,
+            client: &str,
+            control: Arc<CallControl>,
+        ) -> Result<Payload, AgentError> {
+            match command {
+                Command::Status => Ok(Payload::Status(StatusPayload {
+                    app_version: "fixture".into(),
+                    permission: PermissionSnapshot {
+                        level: AgentLevel::ReadOnly,
+                        thumbnails: true,
+                        gps: false,
+                    },
+                    fts_ready: true,
+                    remote_active: false,
+                })),
+                Command::ListFolder { .. } => Ok(Payload::Folder(FolderPage {
+                    items: vec![],
+                    cursor: None,
+                    truncated: false,
+                    book_composition_applied: true,
+                })),
+                Command::GetThumbnail { .. } => Ok(Payload::Thumbnails(thumbnail_fixture(
+                    &[ThumbnailStatus::HiddenByEdit, ThumbnailStatus::Ok],
+                    MAX_THUMBNAIL_IMAGE_BYTES,
+                ))),
+                _ => Fixture { disabled: false }.call(command, client, control),
+            }
+        }
+    }
+    for version in VERSIONS {
+        let modern_protocol = version == MODERN;
+        let mut h = Harness::new(Arc::new(Stage1b));
+        if !modern_protocol {
+            h.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}));
+            h.receive();
+            h.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+        }
+        for (id, method, params) in [
+            (1, "tools/list", json!({})),
+            (
+                2,
+                "tools/call",
+                json!({"name":"list_folder","arguments":{"path":"C:/book.pdf"}}),
+            ),
+            (
+                3,
+                "tools/call",
+                json!({"name":"get_thumbnail","arguments":{"items":[{"path":"C:/a.png"},{"path":"C:/b.png"}]}}),
+            ),
+        ] {
+            h.send(if modern_protocol {
+                modern(id, method, params)
+            } else {
+                json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+            });
+            let response = h.receive();
+            assert_eq!(response["id"], id);
+            let result = &response["result"];
+            match id {
+                1 => assert_eq!(result["tools"].as_array().unwrap().len(), 10),
+                2 => assert_eq!(
+                    result["structuredContent"]["book_composition_applied"],
+                    true
+                ),
+                _ => {
+                    assert_eq!(result["isError"], false);
+                    assert_eq!(result["content"].as_array().unwrap().len(), 2);
+                    assert_eq!(result["content"][1]["mimeType"], "image/webp");
+                    assert_eq!(
+                        result["structuredContent"]["items"][0]["status"],
+                        "hidden_by_edit"
+                    );
+                    assert_eq!(
+                        serde_json::from_str::<Value>(
+                            result["content"][0]["text"].as_str().unwrap()
+                        )
+                        .unwrap(),
+                        result["structuredContent"]
+                    );
+                    assert!(!result["structuredContent"].to_string().contains("webp"));
+                }
+            }
+        }
+        h.close();
+    }
+}
 impl Read for Input {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         loop {
@@ -280,7 +760,7 @@ fn legacy_versions_require_handshake_and_keep_legacy_results() {
         h.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
         h.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}));
         let r = h.receive();
-        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 9);
         assert!(r["result"].get("resultType").is_none());
         h.close();
     }
@@ -1375,7 +1855,7 @@ fn idle_legacy_permission_observer_notifies_changes_and_refreshes_lists() {
         while !calls.recv_timeout(Duration::from_secs(10)).unwrap() {}
         assert_eq!(h.receive()["method"], "notifications/tools/list_changed");
         h.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}));
-        assert_eq!(h.receive()["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(h.receive()["result"]["tools"].as_array().unwrap().len(), 9);
         while calls.try_recv().is_ok() {}
         assert!(calls.recv_timeout(Duration::from_secs(10)).unwrap());
         h.send(json!({"jsonrpc":"2.0","id":4,"method":"ping"}));
@@ -1416,7 +1896,7 @@ fn revoked_read_does_not_advertise_disabled_tools_while_status_stays_enabled() {
         h.receive();
         h.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
         h.send(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}));
-        assert_eq!(h.receive()["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(h.receive()["result"]["tools"].as_array().unwrap().len(), 9);
         h.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_items","arguments":{"query":"fixture"}}}));
         let denied = h.receive();
         assert_eq!(
@@ -1497,7 +1977,7 @@ fn stale_status_poll_and_tool_list_never_advertise_disabled_tools() {
             let call = self.count.fetch_add(1, Ordering::AcqRel) as usize;
             self.calls.send(call).unwrap();
             if matches!(call, 1 | 2) {
-                // Core has rejected the result because GPS/thumbnails changed,
+                // Core has rejected the result because GPS changed,
                 // while the level and therefore the advertised tools stayed put.
                 Err(AgentError::new(
                     ErrorCode::PermissionChanged,
@@ -1519,7 +1999,7 @@ fn stale_status_poll_and_tool_list_never_advertise_disabled_tools() {
         h.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
         h.send(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}));
         assert_eq!(calls.recv_timeout(Duration::from_secs(10)).unwrap(), 0);
-        assert_eq!(h.receive()["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(h.receive()["result"]["tools"].as_array().unwrap().len(), 9);
         // The real five-second observer poll receives a stale snapshot result.
         assert_eq!(calls.recv_timeout(Duration::from_secs(10)).unwrap(), 1);
         h.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}));
@@ -1538,7 +2018,7 @@ fn stale_status_poll_and_tool_list_never_advertise_disabled_tools() {
         assert_eq!(calls.recv_timeout(Duration::from_secs(10)).unwrap(), 3);
         let fresh = h.receive();
         assert_eq!(fresh["id"], 3, "recovery must not emit list_changed either");
-        assert_eq!(fresh["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(fresh["result"]["tools"].as_array().unwrap().len(), 9);
         h.close();
         assert!(h.output.try_recv().is_err());
     }
@@ -1992,7 +2472,7 @@ fn permission_observer_compares_advertised_tools_rather_than_snapshot_bits() {
             .observe(
                 schema::tool_names(PermissionSnapshot {
                     level: AgentLevel::ReadAndOpen,
-                    thumbnails: true,
+                    thumbnails: false,
                     gps: true
                 }),
                 None

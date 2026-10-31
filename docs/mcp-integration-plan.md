@@ -1278,7 +1278,9 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 
 - 指定: `path` (絶対 path) と、ZIP の中のフォルダを指す任意の `subresource` (末尾 `/` の相対 path。
   既存の `book_scope::validate_relative_reference` で検証)。
-- 一覧できるもの: 実フォルダ、ZIP (cbz 含む)、PDF。**RAR・7z 等の変換が要る書庫・EPUB・ZIP の中の ZIP の中は 1b では
+- 一覧できるもの: 実フォルダ、ZIP (cbz 含む)、PDF。ZIP の中の ZIP は、一覧画面と同じく木の中のフォルダとして
+  扱い (列挙が入れ子を展開し、`collapse_redundant` も入れ子へ降りる)、`subresource` の prefix で中を指せる
+  (実装担当の指摘による。例外の境界を作らず一覧画面の規則に揃える)。**RAR・7z 等の変換が要る書庫・EPUB の中は 1b では
   一覧しない** (変換・cache・password の組み合わせを持ち込まないため)。項目としては一覧に出し (`kind` で区別)、
   中を求められたら「この形式の中は一覧できません。mIV で開いてください」の tool error。
 - 経路:
@@ -1287,7 +1289,7 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
   |---|---|
   | 実フォルダ | `scan_directory_with_settings` に取消を足した形 (既存の `scan_directory_with_visibility_cancel` と同じく途中で `Interrupted` を返す) → `materialize_local_folder_listing_with_order` |
   | ZIP | `enumerate_image_entries_detailed_readonly_with_cancel` (一覧画面と同じ列挙。拡張子の判定で Susie の pool の初期化を待つこと (1 回最大 5 秒、期限の後も worker の終了まで枠を保持する契約で扱う) と、入れ子の ZIP を展開することも一覧画面の規則のまま。取消は I/O の境界で受ける。**agent の呼び出しだけ入れ子の展開に上限を付ける** (9 巡目 P2): 入れ子 1 つ 64 MiB (1a の ZIP の項目と同じ)、同時に持つ合計 256 MiB。確保の前・読み取りの途中・nested cache に当たった時に確かめ、超えたら一覧全体を「大きすぎる入れ子の ZIP があります」の tool error にする (超えた枝を黙って省いた成功にしない)。一覧画面の呼び出しは上限なしのまま) → `PreparedZipEnumeration::prepare` → 一覧画面と同じ raw / 表示の prefix → `materialize_archive_level(..., BOOK_READING_PAGE_ORDER, Some(grid_display_order))` → `project_archive_composition` |
-  | PDF | ページ数は catalog の `pdf_meta` を読み取り専用で引き、無ければ取消付きの `enumerate_pages_with_read_target` → `materialize_cached_document_rows` → 表示する種類の設定で `allows_physical_file(logical_path)` が false なら、項目と meta を空にしてから (一覧画面の `book_composition_runtime.rs` と同じ。10 巡目 P2) → `project_document_composition` |
+  | PDF | ページ数は catalog の `pdf_meta` を読み取り専用で引き、無ければ **agent 専用の列挙の入口** (`enumerate_pages_with_read_target` と同じ処理で、path を perf key に入れず、取消の待ち方は `HarvestOnCancel`。既存の入口は path 入りの perf key と `AbortOnCancel` で固定されていて、ログに path を出さないことと枠を worker の終了まで持つことを満たせない。実装担当が着手前に指摘、ClaudeCode が判断。既存の UI・Remote の入口は変えない) → `materialize_cached_document_rows` → 表示する種類の設定で `allows_physical_file(logical_path)` が false なら、項目と meta を空にしてから (一覧画面の `book_composition_runtime.rs` と同じ。10 巡目 P2) → `project_document_composition` |
 
 - 設定: 検索と同じく、その都度 `load_into_settings` で読んだ現在の設定。お気に入りの中のフォルダなら、
   お気に入りごとの表示状態を DB から読み取り専用で読んで重ねる (一覧画面と同じ重ね方)。読むのは最後に保存された
@@ -1333,7 +1335,10 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
   **decode の memory の上限** (7 巡目 P2): 入力の大きさの上限とは別に、decode 後の buffer を 256 MiB までにする
   (TurboJPEG の既存の出力上限と同じ値)。`image_decode::primary` の budget、closure の中の `ImageReader::limits`、
   `preview_bounded` の `max_alloc` にこの値を渡し、超えたら `too_large`。budget を省くと AVIF・WIC が実質無制限に
-  なるので、省略しない。
+  なるので、省略しない。bounded の WIC は上限超過も非対応も同じ失敗で返すので、**decode の前に header の寸法から
+  buffer の大きさを見積もり**、上限を超えるものを `too_large` にする (1a の寸法の読み取りと同じ関数。ファイルと
+  ZIP の項目の bytes の両方)。decode の失敗は、上限超過を含めて `unavailable` (新しい型付きの入口は作らない。
+  実装担当の指摘による)。
   | ZIP (cbz 含む) の中の画像 | 1a の `read_zip` / `read_zip_member` (入れ子対応・64 MiB まで・取消付き) の bytes から上と同じ decode |
   | PDF のページ | 取消付きの `render_page` に**path を perf key に入れない入口**を足して使う (1a の `get_page_sizes_anonymous` と同じ形)。取消の待ち方は既存の `CancelWaitPolicy::HarvestOnCancel` (応答を待つだけで cache の保存は内蔵しない。用途のコメントを agent に広げる)。`AbortOnCancel` は早く return して同時実行の枠を先に離すので使わない。password 付きの PDF は password を渡さないので `unavailable` |
   | フォルダ・書庫のファイルの代表、動画・音声、Susie だけが読める形式、EPUB のページ、RAR の中 | `unsupported` (AI は `list_folder` で中の画像を指せる) |
@@ -1518,7 +1523,9 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 | 「接続中の AI アプリ」を表示する | しない。pipe は要求ごとに開き直すので「最近使った」にする |
 | cursor に引数を複製する | しない。正規化した引数の digest で照合する |
 | 1b で Remote の container を分けて使う | 使わない。一覧画面の純粋な関数を直接呼ぶ (Remote の一覧は一覧画面と規則が違う) |
-| 1b で RAR・7z・EPUB・ZIP の中の ZIP の中を一覧する | しない。変換・cache・password の組み合わせを持ち込まない |
+| 1b で RAR・7z・EPUB の中を一覧する | しない。変換・cache・password の組み合わせを持ち込まない |
+| 1b で ZIP の中の ZIP だけ一覧の対象から外す | 外さない。一覧画面と同じく木のフォルダとして扱う (agent 専用の境界規則を作らない) |
+| 1b で WIC の上限超過を型で返す入口を足す | 足さない。decode の前に header の寸法で見積もる |
 | 1b で RAW を現像して縮小画像を作る | しない。埋め込みの preview だけ。RAW 現像 executor の寿命を共有しない |
 | 1b で一覧画面の縮小画像の処理 (`process_load_request`・catalog) を使う | 使わない。指定の 1 枚から直接作る (代表の解決・cache の取り違え・保存方針・副作用の抑止が要らなくなる) |
 | 1b でフォルダ・書庫の代表の縮小画像 | 返さない。AI は `list_folder` で中の画像を指す |
@@ -1985,3 +1992,222 @@ FFmpeg DLL は前回配置済みの worktree 内実ファイルを使用した�
 
 独立レビュー 3 回目 (`d7d54c78a`) は追加指摘なし、判定「1a impl: accept」。段階 1a はこれで検収とする
 (観測者: ClaudeCode。実機の AI アプリでの確認は 1d の後に利用者へまとめて依頼する)。
+
+## 17. 段階 1b の実装記録
+
+### 17.1 前提照合での停止 (観測者: 実装担当、基点 `570454c5f`)
+
+依頼の「前提が違えば実装を止めて報告する」に従い、以下の矛盾で停止した。未コミット。
+一覧/縮小画像の実装を進めるための回避策・新APIは追加していない。
+
+§15.5 が `list_folder` の catalog miss 時に指定する `pdf_loader::enumerate_pages_with_read_target` は、
+現コードでは次の二つを固定している (`src/pdf_loader.rs:5677` 以降):
+
+- `pdf_file_perf_key(pdf_path)` を作り、`Some(perf_key)` を pool へ渡す。`pool_dispatch` 等はその key を
+  記録するため、agent の「要求 path をログに出さない」と両立しない。
+- `CancelWaitPolicy::AbortOnCancel` を渡す。`wait_for_pool_reply` は取消後、pool の実処理の応答を待たず
+  `Interrupted` で戻る (`src/pdf_loader.rs:1188` 以降)。agent の実 worker はその return で終了できるため、
+  現在の controller の join/Permit 保持だけでは native job 終了までの枠保持にならない。
+
+これは「取消付き API がある」という前提自体の否定ではなく、指定の既存 API が
+agent の必須のログ/所有契約を同時には満たさないという矛盾。
+`get_thumbnail` の render には匿名入口と HarvestOnCancel の追加が明記されているが、
+`list_folder` の PDF enumerate にも同じ分離が必要なことは設計にまだない。
+
+設計担当へ渡す最小案は、**PDF enumerate にも agent 専用の匿名・HarvestOnCancel 入口を追加する**こと。
+既存 UI/Remote の入口は path perf key / AbortOnCancel のままにし、agent の要求だけを
+perf key=None・実応答待ちへ通す。§15.5 の表と取消/ログの契約に追記し、設計判断を確定してから再開する。
+現段階でこの変更を独断では実装しない。
+
+このほか確認できた前提:
+
+- `app::folder_scan` / `app::book_materialization` は module を含め `pub(crate)`。
+- 本の構成 service は Clone 可能で、初期 snapshot は status=Err。
+  `snapshot()` と `current_candidate_snapshot()` の閉鎖後の違いも設計の注意どおり。
+- 現在の起動順は agent server → App で本の構成 service を設置 → install_agent_readers。
+  外側の終了順も agent → Remote → collection runtime → 本の構成 owner。
+- favorite overlay は readonly の DB reader と既存の overlay 関数を再利用できる。
+- 縮小画像の primary decode は budget と orientation の契約を持つ。
+  ZIP の新旧名は同じ targeted read の各段から取得して連結可能。
+
+着手済みだった IPC 型/依存追加はすべて戻し、コード差分を残さない。残る変更はこの §17 の記録のみ。
+製品 binary の起動、commit、cargo fmt/check/test/build は行っていない。
+設計矛盾で停止したため、実装・fixture・実 pipe の検証結果および今回の sandbox 外テストコマンドはまだない。
+`git diff --check` は exit 0。正式な独立実装レビューは未依頼 (設計レビューの代わりに扱わない)。
+
+### 17.2 PDF 列挙の設計判断を受けて再開
+
+ClaudeCode は agent 専用 PDF enumerate の追加を採用し、§15.5 の PDF 行を作業木で更新した。
+agent の入口だけ None perf key + HarvestOnCancel とし、既存 UI/Remote の入口はそのままにする。
+実装担当はこの更新を確認して再開した。§17.1 は停止時点の記録として保持する。
+
+### 17.3 追加の前提差分による再停止 (観測者: 実装担当)
+
+再開後のコード照合で次の2点が見つかった。依頼の停止条件に従い、実装を再度停止した。
+これは実装担当の source inspection であり、独立レビューや製品の実行観測ではない。
+
+1. **ZIP の collapse と「入れ子の中は一覧しない」の境界**。
+   `ZipTree::collapse_redundant` (`src/zip_tree.rs:231`) は「画像0枚・子directoryが1つ」なら降下し続け、
+   実際の nested ZIP の境界を検査しない。列挙は入れ子内のページを `inner.zip/page.png` のように木へ入れる。
+   よって外側ZIPが内側ZIP1つだけを含む場合、指定の grid と同じ raw/display prefix は内側へ進み、
+   root の list_folder でも入れ子内の画像を返すことになる。一方、§15.5 は ZIP-in-ZIP の中を一覧対象外とする。
+   明示 subresource の拒否だけでは、この root の自動降下は防げない。
+   設計側で、(a) 上限付きの既存 grid 経路のまま入れ子内も一覧可能にする、または
+   (b) agent だけ実際の入れ子境界で止める prefix 規則を追加する、等の境界を確定する必要がある。
+   UI の collapse を変えたり、root を黙って error にしたりする実装はしていない。
+
+2. **WIC の memory 上限超過の型が失われる**。
+   bounded WIC (`src/wic_decoder.rs:194`) は `Option<DynamicImage>` を返す。
+   `bounded_wic_buffer_layout` (`src/wic_decoder.rs:317`) の budget 超過も、codec 非対応・破損も None になる。
+   `image_decode::Backend::wic` も Option (`src/image_decode.rs:105`) で、`primary_with_backend` は WIC が None の時
+   元の primary error を返す (`src/image_decode.rs:222` 以降)。HEIC/HEIF/JXL は静的 SUPPORTED_EXTENSIONS にあり、
+   Rust primary が Unsupported、WIC が budget 超過なら、最終 error は Unsupported のまま。
+   上限自体は守れるが、§15.5 の「decode 上限超過を too_large にする」をこの API の情報だけでは満たせない。
+   最小案は budget 超過を区別する typed bounded WIC 入口を足し、agent の primary 経路へ型を失わず伝えること。
+   既存 Option 入口と UI/Remote の挙動を維持する分離を設計に追加する判断が必要。
+   上限超過を unavailable に置き換える仕様緩和や、別の無制限 decode は実装していない。
+
+再開用の下書きは `target/mcp-1b-checkpoint-570454c5f.json` に保存した。
+基点 HEAD、15ファイルの draft bytes、HEAD側の checksum を記録している。folder handler はまだ未作成で、
+ZIP cap・thumbnail・IPC/adapter/PDF匿名入口は途中または未検証の案。完成・compile可能とは扱わない。
+保存後、今回触った code/Cargo の差分と新規 source を戻し、追跡対象の変更はこの文書だけにした。
+再開時は HEAD と各 HEAD checksum および他者の変更を照合してから draft を再適用する。
+この保存データに通常 profile の設定や利用者データは含まれない。
+
+今回も cargo fmt/check/test/build、製品 binary 起動、commit は未実施。
+`git diff --check` は exit 0。変更したのは §15.5 (ClaudeCode) と §17 (実装担当) だけ。
+設計判断待ちのため、今回の実装に対する sandbox 外テストコマンド・成功結果はまだない。
+
+### 17.4 ZIP/WIC の設計判断を受けた再開と実装
+
+ClaudeCode は §15.5/§15.11 を更新し、入れ子ZIPは grid と同じ木・collapse・prefixで一覧対象とした。
+WIC の新しい型付き入口は作らず、1a と同じ header dimension reader から RGBA buffer を見積もり、
+256MiB超を decode 前に too_large とする。decode の失敗 (bounded WIC の上限拒否も含む) は unavailable。
+安全上限を primary / ImageReader / RAW preview に渡す規則は維持する。
+実装担当は基点の各 source checksum と作業木の他者差分を確認して checkpoint を復元し、
+ClaudeCode の文書変更と §17.1〜§17.3 を保持して再開した。
+
+実装の選択 (実装担当の確認・判断であり、正式な独立レビューではない):
+
+- 共通 wire は未リリース v2 に Folder/Thumbnails の型を追加。画像は別の images 欄で運び、
+  WebP bytes は base64 として JSON に載せる。1MiB を JSON 数値配列で運んで4MiB frameを超えることを避ける。
+  adapter は metadata の page だけを text/structuredContent に置き、images は content の image blockだけへ投影する。
+- list_folder は grid の純粋 materializer を worker から呼び、現在設定と readonly favorite overlay を使う。
+  ZIP の raw scopeから構成keyを決め、保存構成がある時はraw prefix、無い時はgridと同じdisplay collapseを使う。
+  PDF は readonly pdf_meta→匿名列挙の順で読み、visibilityを構成投影の前に掛ける。
+- SharedReaders には BookCompositionService の clone だけを遅れて設置する。
+  Appの install_agent_readers は service 設置後に呼ばれ、短いlockだけでcloneを渡す。
+  LiveFavorites・settings接続を追加せず、Remoteの通常処理やsession/cacheは使わない。
+  Agentの一覧は snapshot() のみを読み、close_admission 後も読む。未設置/status異常は NotReady。
+- 入れ子ZIPは既存列挙へ明示的な任意上限を足す。既存callerはNone、agentだけ64MiB/256MiB。
+  確保前・読出し途中・cachehitを検査し、祖先stackで保持する Vec capacity の合計も数える。
+  兄弟を離れた後の共通nested cacheは既存のprocess budgetのownerであり、agent専用cacheは持たない。
+- 縮小画像は指定項目だけを読み、catalog/代表/process_load_request/類似索引/移行を通らない。
+  EXIFを一度適用し、readonly回転を焼き込む。concealは項目自身の新旧keyを読み、DB読取り失敗は呼出し全体のerror。
+  新旧ZIP名は同じtargeted readの各段で取り、ネストprefixを各々連結する。1aの★も同じ旧key fallbackを使う。
+- RAWの見積りは実際の埋め込みpreviewのheader/割当上限を使う。full現像の寸法で小さいpreviewを拒否せず、現像しない。
+  その他の画像は既に上限付きで読んだbytesのheaderを1aの readerで調べる。未知寸法はdecodeの安全上限へ委ねる。
+- 共通I/Oは既存 GlobalIoSemaphore::process_shared(current profile permits) を使う。
+  ownerは同一で、holderやtray throttleを解除しない。取得待ちは取消を受ける。
+- long_sideは既定256、256未満はBadRequest、512超は512へ丸める。最大20入力。
+  list_folderは既定100、0はBadRequest、200超は200へ丸める。cursorはargs digestと全件identity digestを照合する。
+  本文・画像の予算を超える前にページを切り、入力位置のcursorで続ける。すべてread-result再照合の対象。
+
+所有と副作用・期限の fixture、実行コマンドと結果は以下に追記する。
+
+### 17.5 検証の範囲と途中の修正 (観測者: 実装担当、この sandbox 内)
+
+初回の core check は exit 0、IPC/MCP crate 検査は exit 101 (IPC 11成功、MCP 47成功/2失敗、ignore 0)。
+失敗は既知の real pipe preflight の OS 5 の2件だけ (`target/mcp-1b-crates-initial.log`)。
+adapter build は exit 0 (`target/mcp-1b-adapter.log`)。
+初回 focused nextest は test compile の exit 101 (`target/mcp-1b-focused-initial.log`)。
+旧 PDF enrichment fixture だけが追加の legacy key 引数を渡しておらず、None を渡すよう追従した。
+その回はテストを実行できておらず、成功件数へ数えない。
+
+実装担当の追加確認で、folder cursor の args は物理パスを正規化していたが、一覧の識別は返却pathの表記を
+そのまま使っていたため、slash/case/verbatim 表記だけを変えた次頁で偽の一覧変更を検出し得た。
+args と一覧の物理パスには同じ pure normalization を使い、ZIP subresource の綴りは保持するよう修正した。
+表記違いの継続成功と subresource の変更拒否を pure test で追加した。設計の新たな矛盾ではなく実装の修正。
+
+- 一覧 fixture は mixed kinds/visibility/重複の畳み方、favorite overlay、ZIP 内フォルダと構成順/hidden、
+  nested root collapse/明示 prefix、PDF visibility/構成、catalog miss、未設置/異常 snapshot、
+  全件 identity cursor、文字数と行数、pre-cancel、永続ファイル不変を検査する。
+  readonly SQLite が共有memory管理に使う `-shm` は byte比較の対象外とし、DB/WAL等は比較する。
+- ZIP 上限は確保前、cachehit の Vec capacity、祖先合計/兄弟解放、宣言を超える実読取り、取消を検査する。
+- 縮小画像は JPEG EXIF＋user rotation、PNGとZIP、nested CP932旧 conceal/rotation/rating、
+  conceal DB失敗、unsupported、animationの先頭、RAWに通常decodeを使わないこと、入力/header/decode予算、
+  cursorによる再読取り回避を検査する。cache未作成と、実際のcatalog候補をpoisonした後の全cache inventory/bytes不変も検査する。
+- Controller の実 request 経路に clock/worker を注入し、thumbnail の許可off admission、生成中/送信直前の変更による
+  画像丸ごとの破棄、thumbnail prefix/全件型 Timeout、実 worker終了まで両slot保持を検査する。
+  SharedReadersのsnapshotがclose_admission/owner shutdown後も読めることも検査する。
+- PDF の匿名 enumerate/render は pure executor で production wait loop を通し、perf key=None、
+  cancel後もactual completion待ち、成功/parse error/transport errorを検査する。native PDF worker は起動しない。
+- 既存 stdio adapter integration に list_folder/get_thumbnail を追加し、fixtureのPNGから返る実WebPと
+  metadata/textの一致を検査する。通常の製品processではなく、許可済みのfixture専用adapterを対象とする。
+
+正式な独立レビューは別 thread。ここまでの確認や補助担当の点検を正式レビューの代わりとは扱わない。
+最終コマンド・実 exit code は以下に追記する。
+
+2回目の focused は exit 100、241件中236成功 (既存10万件の実走査benchmark 1件を含む)、5失敗だった
+(`target/mcp-1b-focused-final.log`)。既知の pipe OS 5 の2件に加え、次の fixture 3件を修正した。
+
+- PNG の write_header だけの入力は IDAT がなく、寸法 reader が None を返す不完全データだった。
+  その場合の unavailable は維持し、正常な小さいPNGのIDATを保ってIHDR寸法とCRCを更新したfixtureで
+  寸法を取得できることと、file/ZIPともdecode前に too_large になることを検査する。
+- limit 1000 のページは件数上限200より先に文字数予算に達して176件になっていた。
+  件数の期待値を無条件200とせず、limit200と1000のページ全体の一致と、文字数・cursorの検査を維持する。
+- cached PDF の全bytes比較は、fixtureの初回共有settings起動とSQLiteの補助WALの寿命を同時に測っていた。
+  差分は settings.db-wal と起動ログ、catalogの空WALで、DB本体とbook compositionは同一だった。
+  通常の共有settings初期化をbaseline前に行い、既存catalog writerをreader検査中保持する。
+  DB/WALを含む比較の除外は増やさない。差分の診断も巨大byte配列ではなくpathとsizeで示す。
+
+これらは test-only の修正で、production source は変えない。
+成功済みの `section1375_large_physical_scan_10k_100k` (151.579秒) は同じ走査実装の有効な結果として再利用し、
+修正後の focused filter ではこのbenchmarkだけを除外する。0件一致や中断を成功として扱わない。
+
+### 17.6 最終検証と引き渡し
+
+観測者: 実装担当、この sandbox 内、`570454c5f` + この未コミット差分、通常 dev/test profile。
+
+| コマンド | 実 exit code | 結果 / ログ |
+|---|---:|---|
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | 最終 production 差分。`target/mcp-1b-core-final.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 101 | IPC 11成功、MCP 47成功/2失敗、ignore 0。`target/mcp-1b-crates-initial.log` |
+| 下記 focused nextest | 100 | 240件中238成功/2失敗。`target/mcp-1b-focused-verified.log` |
+| 既存10万件走査 (前回の同じproduction差分の結果を再利用) | 成功 | 151.579秒。含むrunの exitは100で他の失敗による。`target/mcp-1b-focused-final.log` |
+| `cargo build -p mimageviewer-mcp --bin mimageviewer-mcp` | 0 | `target/mcp-1b-adapter.log` |
+| `cargo fmt` (workspace、引数なし) | 0 | 最終sourceを整形 |
+| `cargo fmt --check` | 0 | `target/mcp-1b-fmt-verified.log` |
+| `git diff --check` | 0 | 最終差分を確認 |
+
+最終差分の新規 fixture・既存回帰は実 pipe の4件を除いて成功した。
+失敗は ignore/skip 化せず、DACL も緩めない。core は idle-connected shutdown と新2toolを追加したstdio fixture、
+adapter は withheld-response cancel と blocked-stdout cancel の、pipe作成/接続時の OS 5。
+core check・adapter build・crate 検査後の最後の修正は core test-only fixture なので、その成功結果を再利用する。
+FFmpeg DLL は既に配置したこのworktree内の実ファイルを使用し、リンク/ジャンクションは作っていない。
+
+変更ファイル一覧:
+
+| 役割 | ファイル |
+|---|---|
+| wireと予算 | `crates/agent-ipc/Cargo.toml`, `src/lib.rs`, 新規 `src/folder_types.rs` |
+| MCP adapter/schema/回帰 | `crates/mcp-server/Cargo.toml`, `src/lib.rs`, `src/schema.rs`, `src/tests.rs`, `Cargo.lock` |
+| agent dispatch/reader設置 | `src/agent_ipc/mod.rs`, `src/remote_ipc/mod.rs` |
+| 一覧 | 新規 `src/agent_ipc/folder.rs`, `folder_tests.rs`, `src/app/folder_scan.rs`, `src/zip_loader.rs` |
+| 縮小画像 | 新規 `src/agent_ipc/thumbnail.rs`, `thumbnail_tests.rs` |
+| ZIP新旧keyの共有/★ | `src/agent_ipc/item_info.rs`, `item_info_tests.rs` |
+| PDF匿名入口 | `src/pdf_loader.rs` |
+| controller/stdio回帰 | 新規 `src/agent_ipc/media_read_tests.rs`, `src/agent_ipc/tests.rs` |
+| 設計判断と台帳 | `docs/mcp-integration-plan.md` (§15はClaudeCode、§17は実装担当) |
+
+ClaudeCode が sandbox 外の通常権限で実行するコマンド (この最終差分での外側の成功は未観測):
+
+```powershell
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E '(test(/agent_ipc/) or test(/agent_level/) or test(/agent_permission/) or test(=settings_db::tests::failed_permission_commit_preserves_snapshot_and_epoch) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(/png_metadata/) or test(=pdf_loader::tests::anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results) or test(=pdf_loader::tests::page_sizes_preserve_existing_ui_diagnostic_identity) or test(=pdf_loader::tests::page_sizes_round_trip_and_reject_a_truncated_reply) or test(/app::folder_scan/) or test(/zip_loader/) or test(=pdf_loader::tests::anonymous_agent_render_and_enumerate_omit_keys_and_harvest_actual_completion) or test(=pdf_loader::tests::cancelled_anonymous_render_does_not_enqueue)) and not test(/section1375_scan_perf_tests/)'
+```
+
+正式な独立実装レビュー、実 pipe の最終成功、実 native PDF worker/WIC/RAW実画像での確認は未実施。
+通常profile・製品binary・UIを起動せず、commit、test-full、snapshot更新、公開文書更新は行っていない。
+依頼されたconsole adapter binaryは生成済み。coreの実機確認用buildはこのsandboxで実pipe gateが通らないため未実施。
+1c/1d/1eへは進んでいない。途中の設計前提3件はClaudeCodeの判断で解消し、追加の設計矛盾や未解決の実装上の指摘はない。

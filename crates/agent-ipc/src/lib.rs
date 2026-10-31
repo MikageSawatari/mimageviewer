@@ -8,12 +8,20 @@ use std::{
 
 mod read_types;
 pub use read_types::*;
+mod folder_types;
+pub use folder_types::*;
 
 pub const AGENT_PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_LIMIT: u32 = 50;
 pub const MAX_LIMIT: u32 = 200;
 pub const MAX_INFO_LIMIT: u32 = 50;
+pub const DEFAULT_FOLDER_LIMIT: u32 = 100;
+pub const MAX_THUMBNAIL_ITEMS: usize = 20;
+pub const DEFAULT_THUMBNAIL_SIDE: u32 = 256;
+pub const MAX_THUMBNAIL_SIDE: u32 = 512;
+pub const MAX_THUMBNAIL_IMAGE_BYTES: usize = 256 * 1024;
+pub const MAX_THUMBNAIL_TOTAL_BYTES: usize = 1024 * 1024;
 /// All non-image budgets count the structured JSON and its escaped text copy.
 pub const MAX_ITEM_CHARS: usize = 12_000;
 pub const MCP_ENVELOPE_RESERVE_CHARS: usize = 2_000;
@@ -84,6 +92,17 @@ pub enum Command {
         limit: Option<u32>,
         cursor: Option<String>,
     },
+    ListFolder {
+        path: String,
+        subresource: Option<String>,
+        limit: Option<u32>,
+        cursor: Option<String>,
+    },
+    GetThumbnail {
+        items: Vec<ItemRef>,
+        long_side: Option<u32>,
+        cursor: Option<String>,
+    },
     Cancel {
         request_id: u64,
     },
@@ -103,6 +122,8 @@ pub enum Payload {
     Collections(CollectionPage),
     Library(LibraryPage),
     Info(InfoPage),
+    Folder(FolderPage),
+    Thumbnails(ThumbnailResponse),
     Cancelled,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

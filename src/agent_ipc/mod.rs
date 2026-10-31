@@ -9,11 +9,15 @@ use std::time::{Duration, Instant};
 
 use mimageviewer_agent_ipc::*;
 use serde::{Deserialize, Serialize};
+mod folder;
 mod item_info;
 mod library;
+mod thumbnail;
 mod work;
 use work::*;
 
+#[cfg(test)]
+mod media_read_tests;
 #[cfg(windows)]
 mod pipe;
 #[cfg(test)]
@@ -261,6 +265,13 @@ impl Connection {
             ));
             return None;
         }
+        if matches!(request.command, Command::GetThumbnail { .. }) && !granted.0.thumbnails {
+            reject(error(
+                ErrorCode::Disabled,
+                "AI に縮小画像を見せる設定は無効です",
+            ));
+            return None;
+        }
         let (permit, cancel) = match self.acquire(request.id) {
             Ok(value) => value,
             Err(err) => {
@@ -337,6 +348,8 @@ fn tool_name(command: &Command) -> &'static str {
         Command::GetCollection { .. } => "get_collection",
         Command::ListLibrary { .. } => "list_library",
         Command::GetItemInfo { .. } => "get_item_info",
+        Command::ListFolder { .. } => "list_folder",
+        Command::GetThumbnail { .. } => "get_thumbnail",
         Command::Cancel { .. } => "cancel",
     }
 }
@@ -347,6 +360,8 @@ fn result_summary(result: &Result<Payload, AgentError>) -> (usize, &'static str)
         Ok(Payload::Collections(p)) => (p.collections.len(), "none"),
         Ok(Payload::Library(p)) => (p.items.len(), "none"),
         Ok(Payload::Info(p)) => (p.items.len(), "none"),
+        Ok(Payload::Folder(p)) => (p.items.len(), "none"),
+        Ok(Payload::Thumbnails(p)) => (p.page.items.len(), "none"),
         Ok(_) => (0, "none"),
         Err(e) => (
             0,
@@ -457,6 +472,17 @@ impl Handlers {
                 limit,
                 cursor,
             } => self.item_info(items, limit, cursor, ctx).map(Payload::Info),
+            Command::ListFolder {
+                path,
+                subresource,
+                limit,
+                cursor,
+            } => self.list_folder(path, subresource, limit, cursor, ctx),
+            Command::GetThumbnail {
+                items,
+                long_side,
+                cursor,
+            } => self.get_thumbnail(items, long_side, cursor, ctx),
             Command::Cancel { .. } | Command::SearchItems { .. } => unreachable!(),
         })();
         (result, None)
@@ -969,6 +995,9 @@ fn bounded_rows<T: Serialize>(
 
 impl crate::app::App {
     pub(crate) fn install_agent_readers(&mut self, readers: Arc<crate::remote_ipc::SharedReaders>) {
+        if let Some(service) = &self.book_composition_service {
+            readers.install_book_composition(service.clone());
+        }
         self.agent_readers = Some(readers);
         self.publish_agent_index();
     }

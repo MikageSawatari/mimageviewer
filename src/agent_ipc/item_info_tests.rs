@@ -710,7 +710,65 @@ fn bounded_zip_preserves_literal_nested_and_cp932_name_resolution() {
     )
     .unwrap();
     assert_eq!(result.name, "日本.png");
+    assert_ne!(result.legacy_name, result.name);
     assert_eq!(result.bytes.unwrap(), image);
+}
+
+#[test]
+fn nested_cp932_zip_rating_reads_legacy_key_without_migration_and_prefers_current() {
+    fn cp932_zip(placeholder: &str, actual: &str, content: &[u8]) -> (Vec<u8>, String) {
+        let mut bytes = zip_bytes(&[(placeholder, content)]);
+        let encoded = encoding_rs::SHIFT_JIS.encode(actual).0;
+        assert_eq!(encoded.len(), placeholder.len());
+        let offsets: Vec<_> = bytes
+            .windows(placeholder.len())
+            .enumerate()
+            .filter_map(|(i, value)| (value == placeholder.as_bytes()).then_some(i))
+            .collect();
+        for offset in offsets {
+            bytes[offset..offset + placeholder.len()].copy_from_slice(&encoded);
+        }
+        let mut archive = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        let legacy = archive.by_index_raw(0).unwrap().name().replace('\\', "/");
+        (bytes, legacy)
+    }
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    let path = directory.path().join("legacy.zip");
+    let (inner, legacy_leaf) = cp932_zip("xxxx.png", "日本.png", &png(&[]));
+    let (outer, legacy_outer) = cp932_zip("xxxx.zip", "日本.zip", &inner);
+    std::fs::write(&path, outer).unwrap();
+    let legacy =
+        crate::adjustment_db::zip_entry_key(&path, &format!("{legacy_outer}/{legacy_leaf}"));
+    let current = crate::adjustment_db::zip_entry_key(&path, "日本.zip/日本.png");
+    let db = crate::rating_db::RatingDb::open().unwrap();
+    db.set(&legacy, 5).unwrap();
+    let before = std::fs::read(crate::rating_db::RatingDb::db_path()).unwrap();
+    let output = read(
+        &item(&path, Some("日本.zip/日本.png")),
+        permission(false),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(output.rating, 5);
+    assert_eq!(
+        output.item.subresource.as_deref(),
+        Some("日本.zip/日本.png")
+    );
+    assert_eq!(
+        std::fs::read(crate::rating_db::RatingDb::db_path()).unwrap(),
+        before
+    );
+    assert_eq!(db.get(&legacy), 5);
+    assert_eq!(db.get(&current), 0);
+    db.set(&current, 2).unwrap();
+    let output = read(
+        &item(&path, Some("日本.zip/日本.png")),
+        permission(false),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(output.rating, 2);
+    assert_eq!(db.get(&legacy), 5);
 }
 
 #[test]
@@ -790,6 +848,7 @@ fn pdf_page_rating_and_container_tags_match_ui_without_starting_pdf_worker() {
             content_type: None,
         },
         &path,
+        None,
     )
     .unwrap();
     assert_eq!(output.rating, 3);
