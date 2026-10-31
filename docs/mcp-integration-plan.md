@@ -1666,6 +1666,18 @@ MCP の exe は console subsystem・CRT 静的リンク (DLL 不要)・引数は
 - MSIX・winget の manifest は無く、CI は release の exe を作らない (変更不要)。Store はインストーラの提出なので変更不要。
 - 1e までは配布物に入れて作れるところまでで、公開しない (U10)。公開文書 (§6) は段階 2 で直す。
 
+**mIV が起動していない時の `tools/list`** (1e の実装レビューの見解を受けて ClaudeCode が判断、2026-11-01): 段階 0 から、core に
+繋がらない時の `tools/list` は JSON-RPC の error (-32603) だった。AI アプリを先に起動して mIV を後から起動するのは通常の使い方で
+起こり、AI アプリが server を失敗の状態で持ち続ける恐れがある。よって:
+
+- core に繋がらない時の `tools/list` は**成功**にし、`miv_status` だけを返す (`miv_status` を呼ぶと「mIV が起動していません。mIV を
+  起動してからもう一度お試しください」の tool error。§8 の既存の文)。
+- 旧版の握手の 5 秒ごとの照会は、繋がらない時の tool の集合を `{miv_status}` として比べる。mIV が起動して許可の集合が分かれば
+  変化として `notifications/tools/list_changed` を送る (今は繋がらない時を「不明」として比べないので、通知が出ない)。
+- 2026-07-28 版は `tools/list` を毎回問い合わせる (`ttlMs=0`) ので、同じ規則で `miv_status` だけを返す。
+- 無効 (`Disabled`) の時の空の集合、許可が途中で変わった時 (`PermissionChanged`) に集合を更新しない扱い、core での要求ごとの
+  許可の判定は変えない。
+
 **確かめ方** (エージェントは製品の exe と `%APPDATA%\mimageviewer\runtime\*` を起動しない規則):
 
 - launcher の `--mcp` の分岐 (引数の受け渡し・lease を子の終了まで持つ・終了コード・失敗を標準エラーへ・MessageBox を出さない) を、
