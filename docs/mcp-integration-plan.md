@@ -2750,9 +2750,8 @@ PC の再起動で中断した portable の build は、`target-portable` の本
 (`finish_logs::DEADLINE` の未定義)。`cargo clean --release -p mimageviewer --target-dir target-portable` の後に
 `prepare-portable-smoke.ps1` で作り直した。seed は 1a・1b のもの + 許可の段 `read_and_open`。
 
-- `20261101-000950-codex.jsonl`: `open_in_viewer` を 3 回。`samplesook.zip` は受け付けた (「mIV で開く処理を始めました」)、
-  `samples
-o_such_file.png` は `bad_request`「指定のファイルまたはフォルダは存在しません」(UI へ送らずに拒否)、
+- `20261101-000950-codex.jsonl`: `open_in_viewer` を 3 回。`samples\book.zip` は受け付けた (「mIV で開く処理を始めました」)、
+  `samples\no_such_file.png` は `bad_request`「指定のファイルまたはフォルダは存在しません」(UI へ送らずに拒否)、
   `samples\solid_red.png` は受け付けた。
 - 直後に portable の窓を画像に撮ると (`PrintWindow`)、`solid_red.png` が全画面で表示されていた。閉じる操作で全画面を
   抜けると、`samples` フォルダの一覧で `solid_red.png` が選択されていた (二重起動で画像を開いた時と同じ)。
