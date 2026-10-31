@@ -38,6 +38,14 @@
 
 ## 1. 優先候補
 
+### v4.10.1 で出荷した 5ch 由来の項目と、報告者への案内 (2026-10-31)
+
+v4.10.1 (2026-10-31 公開) で出荷し、本書から外した項目。案内したら行を消す。
+- §1.488 一覧へ戻ると保存した位置から上へ動く (>>661、X の投稿のコレクション帰還も同じ原因): 出荷の案内は未。
+- §1.473 閲覧履歴の一覧で「親へ」移動すると内部のデータ用フォルダが開く (>>643・>>656): 出荷の案内は未。
+- §1.472 フォルダツリーの幅が起動のたびに狭くなる (>>643): 出荷の案内は未。
+- §1.662 ページ一覧の開閉操作の名前を「ページ一覧の表示切替」に揃えた (>>650): 出荷の案内は未。
+
 ### v4.10.0 で出荷した 5ch 由来の項目と、報告者への案内 (2026-10-30)
 
 v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち、5ch の報告・要望から来たもの。案内したら行を消す。
@@ -80,19 +88,6 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 検証: OFF の従来配置、ON の名前幅拡張、長い日本語 / 英数字名、文字サイズと1〜4行、狭いセル、形式 + 名前 + ★ + タグ / 編集 / pin、チェック / スタック枚数、右下の件数・長さ、前回位置メーター ON/OFF を純粋レイアウトの非交差・セル内判定と UI snapshot で確認する。動画・音声の文字バッジ、フォルダ名、ブックマーク一覧も回帰し、セル寸法・画像 fit・選択 / 開く操作・画像読み込み / キャッシュは変更しない。
 - 対象: `src/thumb_overlay_layout.rs`、`src/app/grid_paint.rs`、設定と環境設定のサムネイルページ、関連マニュアル。[表示パイプライン](display-pipeline.md)、本書 §2.2 の共通配置を参照。規模 / 優先度: Small〜Medium / P3。
 
-### 1.662 ページ一覧の開閉操作の名称を、キー・リング・ジェスチャで揃える — 5ch >>650 (2026-10-29)
-
-- 状態: **実装・指定自動検証・確認用build完了 (2026-10-30、未コミット・未検収)**。[>>650](https://egg.5ch.io/test/read.cgi/software/1782419551/650) で、画像ビューア内の「ページ一覧」の ON / OFF をリング・ジェスチャへ割り当てたいと要望。機能追加ではなく、既存機能を見つけやすくする表記の修正として扱う。
-- 変更前 (v4.9.0 のタグと当時のコードを確認、実画面試験なし): O キーの `FsPageOverviewToggle` の説明は「ページ一覧の表示を切り替える」。操作カスタマイズのコマンド一覧は `compact_key_action_label` / `compact_operation_label` により「ページ一覧の表示」へ短縮する。一方、リング・ジェスチャ候補の `ImagePageOverview` は「本のページ一覧」であり、同じ開閉操作だと分かりにくい。割り当て候補と O キー共通の実行経路は既に存在し、一覧表示中の同操作は取消・元ページへの復帰になる。
-- 方針: 共通の短い操作名を **「ページ一覧の表示切替」** とし、コマンド一覧・割り当て編集・リング / ジェスチャ / マウスボタン / パッドの候補・案内で揃える。詳細説明には「O キーと同じ操作。もう一度実行すると一覧を閉じる」と分かる内容を残す。別の操作である「本をページ一覧で開く」「フルスクリーンを閉じて一覧へ戻る」とは区別する。
-- 互換性と検証: `FsPageOverviewToggle` / `image_page_overview` の保存 ID、既定 O、利用可能な文脈・受付条件・開閉処理は変更しない。短縮処理で「表示切替」が消えず、同じ操作を検索・選択できること、既存の割り当てが読み戻せること、通常 / 別ウィンドウの開閉を既存テストと必要な UI snapshot で確認する。他の操作や入力共通化まで範囲を広げない。
-- 補足 (ClaudeCode がコードで確認、2026-10-30): リング候補名 `ImagePageOverview` の「本のページ一覧」は、ゲームパッド / ジェスチャのガイド表示 (`src/app/gamepad_input.rs` の候補表と `gamepad_input/overview_guide_snapshots.rs`・ガイド描画テストの期待文字列) にも出るので、名称変更ではそれらも揃える。一方、`src/ui_dialogs/context_shortcuts.rs` の `ShortcutHelpContext::FsPageOverview` の題名「本のページ一覧」は「一覧を開いている間に使えるキー」という文脈の名前で、開閉操作の名称ではないので変えない。
-- 実装担当の検証 (2026-10-30、`pagelist-label-1662` の未コミット差分): 共通操作名・詳細説明・HUD・ガイドの期待文字列・マニュアルを更新し、短縮／検索／候補・保存済みキー／リング／マウス／ジェスチャの回帰を追加。先行のTurboJPEG CMake/MSBuild失敗は、ClaudeCodeによるサンドボックス外での依存準備後に再開した。`MSBUILDDISABLENODEREUSE=1`、テスト／確認用buildは `CARGO_BUILD_JOBS=1`。`cargo check -p mimageviewer --lib --tests --features test-script -j 1` は exit 0。`test-focused.ps1` は文書変更で exit 2、その後の `test-lib-full.ps1` は最終 **15,067 passed／0 failed／66 skipped**（604.938秒、exit 0）。ログは `target/test-lib-full/runs/20261030T111005358Z-542d2979/`、成功台帳は `target/test-lib-full/e0abdf56a14adb7c92f71e19f8737a9a73bd1a4e4e4b09f853c916b6a56abd07.json`。検証時sourceは `6b5658980078d93f35ab3b490b7699fcef28106b2b444ad0cc00e211d88965a8` で、その後の本節の結果記録だけでは再実行しない。`cargo test --test ui_snapshot` は **214 passed／0 failed**（32.53秒、exit 0）、ログは `target/pagelist-1662-ui-snapshot.log`。`cargo fmt`／`cargo fmt --check`／グリフ検査（検出0件）は同じRustソースで成功済み。
-- PNG更新: 初回lib全件は15,062成功・名称変更によるsnapshot差分5件。`UPDATE_SNAPSHOTS=1` を指定し、`cargo nextest run -p mimageviewer --lib -E 'test(~overview_guide_snapshot_) | test(~fullscreen_overflow_panel_snapshot_root) | test(~fullscreen_overflow_panel_snapshot_page_turn_on)'` で対象5件だけ更新（5 passed、exit 0）。更新指定なしの最終全件比較でも成功した。変更PNGは `fullscreen_overflow_panel_root.png`、`fullscreen_overflow_panel_root_tall.png`、`fullscreen_overflow_panel_page_turn_on.png`、`page_overview_gamepad_ring_dark.png`、`page_overview_gesture_guide_dark.png`（すべて `tests/snapshots/`、計200,840 bytes）。全5枚を目視し、新名称の収まりを確認した。
-- 途中の別件失敗: PNG更新後の全件一回は15,066成功・`app::tests::scroll_661::row_anchor_observation_keeps_middle_selected_row_in_both_renderers` の `must adopt changed rows` 1件失敗（`src/app/tests/scroll_661.rs:569`、ログは `target/test-lib-full/runs/20261030T105906994Z-0ec1a4b4/`）。この試験は初回全件で成功しており、Rustソースは変更せず、直後の `cargo test -p mimageviewer --lib app::tests::scroll_661::row_anchor_observation_keeps_middle_selected_row_in_both_renderers -- --exact --nocapture` も1 passed（2.31秒、exit 0、`target/pagelist-1662-scroll-661-isolated.log`）。上記の最終全件も成功した。原因は未特定で、試験の期待値・待機条件や製品処理は変更していない。
-- 確認用build: `build-dev.ps1` は通常feature set（portableなし）で exit 0。本体・remote service・EPUB PDF workerを `target/dev-runtime/` に生成し、FFmpeg／VC runtime DLLとEffeTune bundleを配置した。PE依存検査は `runtime=4 pe=3` で成功。ログは `target/pagelist-1662-build-dev.log`、PE検査結果は `target/vcrt-pe-reports/dev-runtime.json`。製品起動・コミットなし。実機確認と独立レビュー・検収は未実施。利用者の起動コマンドは `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常の `%APPDATA%\mimageviewer` を使い設定・データを更新し得るため、先にインストール版／常駐tray版を終了する。確認対象は共通名の検索と各入力候補・ガイドの一致、通常／別窓でO・割り当て済み操作による一覧の開閉。
-- 対象: `src/keymap.rs`、`src/ring_shortcut.rs`、`src/ui_dialogs/preferences/pages.rs`、関連マニュアル。[キー仕様](keymap-spec.md)、[操作カスタマイズ計画](key-customization-impl-plan.md)、[ページ一覧計画](detached-book-page-overview-plan.md)。対外回答は文案作成段階で、投稿済みとは扱わない。規模 / 優先度: Small / P3。
-
 ### 1.481 ゲームパッドの本openとEnter/ダブルクリックで、parkと拡張子付き実フォルダの受付が異なる — §1.480 の着手前調査で開発側が確認 (2026-10-29)
 
 - 状態: **未着手・§1.480から分離（設計担当決定 2026-10-29）**。報告者が観測した不具合ではなく、コード・履歴から確認した出荷済みの入口差。今回の修正ではゲームパッドをhelperへ移さず、両差を維持する。
@@ -134,30 +129,6 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 - 許容範囲はMouseの混在に限らない。抑止しないCurrent tapや所属不明のclick-bearing releaseが同frameに混ざる場合も、v4.10.0と同じpointer fallbackとする。純touchでCurrentとRetiredが共存する場合を含む「複数所属のreleaseが混在するframe」では、cell clickを完全に隔離したとは扱わない。すべてのclick-bearing releaseが抑止対象の場合だけ拒否する規則であり、既存Current gestureの抑止要求は維持する。
 
-### 1.488 一覧へ戻ると保存した位置から上へ動く — 5ch >>661／コレクション帰還 (2026-10-30)
-
-- 状態: **実装済み・master取り込み済み（`d8c13925a`、v4.11.0予定）**。ツリー等で長い一覧→短い一覧→元の一覧と移動した場合や、コレクションの本から戻った場合の共通修正。出荷・統合の判断は設計担当の検収と残るリリースgate後に行う。
-- 原因: 保存位置と選択は正しく復元されるが、同じegui ScrollAreaに残る旧一覧のmaxでphysicsが復元位置をoverscrollと判定し、上へ押し戻す。詳細／サムネイル共通。非同期の復元が最初の描画より早く終わる場合に決定的に再現する。
-- 修正: canonical位置・一回要求・未消費RowAnchor・描画geometryをcontextのscroll ownerへ集約。現在extentと明示更新の意味をphysics前、描画のviewport／originをその後の位置で確定するopt-in契約を両rendererへ接続した。可視一覧と入力の寿命を分け、旧一覧の慣性・capture・touch commandを引き継がず、同一覧の正当な操作とcontextのmove／swapを保つ。遅延や毎frameの強制復元は使わない。
-- **あわせて直した既存の不具合**: 詳細表示の再読み込み・自動再走査・resumeで、保存する行位置が以前のサムネイル列数を使い、選択行の画面内位置がずれる。実列数1・行高・body viewportを同じownerへ記録して保存／復元／revealで共有した。
-- 自動検証: 実装レビューのP2四件と再レビューのmouse click誤抑止を再修正。元の4再現、R1〜R4、Collection **20件すべて成功**。最新の本体全件 **15,006件成功・66件除外**、UI snapshot214件成功・PNG差分なし、test-script check成功、audit違反0。今回vendorは無変更（前回egui165件成功）。同frameのtouch／mouse click混在は設計担当判断で§1.487へ含め、抑止しない許容挙動も回帰で確認した。独立再レビュー待ち。共通workspace full gateはrelease内包exe3点未配置で未完了。出荷前に整った環境で完走する。[最新の再修正台帳](scroll-661-investigation.md#implementation-review-mixed-release)を参照。
-- 取り込み後 (2026-10-30): 独立再レビューACCEPT (P3は文書で対応)。master で `test-full` 16,453件成功。ClaudeCode が隔離data-dirの dev-runtime ビルドを画面操作して確認 (Windows 11、マウス・キーボードのみ): ツリーでZIP 200冊→100冊→200冊の往復をサムネイル3回・詳細2回、本を開いてBS/ビューア→Escで戻る経路、コレクション (200冊) で末尾と途中位置から本を開いて戻る経路で、いずれも保存位置と選択が保たれた。修正前の版との同条件の比較は行っていない (自然な完了順では修正前も保持する場合がある)。タッチ・報告者環境は未確認。
-- 合成タッチでの確認 (2026-10-30、ClaudeCode): Windows の InjectTouchInput で作ったタッチを、隔離data-dirの dev-runtime ビルドへ送った (押す位置の窓が mIV であることを毎回検査)。フリックの慣性スクロール、タップでの選択、ツリーのタップでの往復で、位置と選択が保たれた。慣性スクロール中にツリーをタップして移った場合も、移った先の一覧は動き出さなかった。指を置いたまま Alt+←/→ で一覧を切り替えて離す操作では、接触中に位置の更新を約 16ms ごとに送った場合 (実際のタッチパネルに近い)、移った先のセルは選ばれなかった (2 方向)。**接触中に位置の更新を送らない合成タッチでは、移った先の指の位置のセルが選ばれた (2 回再現)**。実際の指は接触中も更新を送り続けるので、実機で起きるかは未確認。原因は未調査 (更新なしだと Start の処理が一覧の切り替え後のframeにずれる、等の可能性)。v4.10.0 での同操作との比較もしていない。手順は `scripts/touch-inject/hold_switch.py` (`noupdate` / `lift` mode、隔離起動した mIV の PID を渡す) で再現できる。
-- 別件: touchとmouseを同時に使う旧第二指のsynthetic Move誤採用は基点からの既存不具合として§1.487へ分離し、理由付きignoreで保持した。新契約では同frameの描画にも出る差がある。Windows実機・報告者環境の製品確認は未実施。
-- 根拠: [>>661調査・設計・実装記録](scroll-661-investigation.md)、[Collection帰還の調査](collection-return-investigation.md)。DB/schema変更なし。F12／兄弟contextの所有境界は[detached §11](detached-rework-plan.md#11-リワーク外からの変更記録)に記録。規模: Medium。
-
-### 1.472 フォルダツリーの幅が再起動するたびに狭くなる — 5ch >>643 (2026-10-29)
-
-- 状態: **実装済み・実機未確認 (2026-10-30、v4.10.1 対象)**。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、広げたツリー幅が再起動のたびに狭くなり、最後は一定幅になると報告。製品起動・報告者環境での確認は未実施。
-- 原因: `render_folder_pane` が描画後の実幅 / 画面幅を毎回設定へ書き戻していた。egui の `PanelState` は初回の幅を保持するため、その後の画面拡大で実幅は変わらず保存比率だけが縮む。新しい Context で 1280 → 1920 の起動を繰り返す非対話試験でも幅 448 → 299 → 199 → 180、比率 0.35 → 0.12 を再現した。1920 → 1920 の対照は672 / 0.35を維持。**実画面・報告者環境での再現ではない。**
-- 修正: 本体とテスト共通の `show_folder_pane_panel` で、境界ハンドルのドラッグ中・終了時、または AccessKit の Increment / Decrement / 数値 SetValue があるときだけ保存比率を更新する。P2対応で支援技術による既存操作の保存を維持し、相殺する増減・無効な値・別ノード・リサイズ禁止中の要求は保存しない。ハンドル ID は既存の親 scope + panel salt + `__resize` 規則を使う。vendor・保存形式・幅 / 比率の上下限・起動手順は変更せず、新しい永続状態や時間条件もない。
-- 変わる挙動: 起動中のサイズ補正・最大化・ウィンドウのリサイズや上下限制約だけでは保存比率を更新しない。同一起動中は egui が保持する実幅を使い、次回起動時は保存比率 × 初回描画時の画面幅から始める。
-- 回帰テスト: 初回は RED 2成功・4失敗 → 修正後6成功（起動幅変化・対照・上下限・ドラッグ / release・境界以外の入力）。P2では実際の AccessKit tree の Splitter へ要求する5件を追加し、保存・再起動復元の3件で RED、無効要求・リサイズ禁止の2件は成功。P2修正後の `cargo test -p mimageviewer --lib section1472 -- --nocapture` は **11件成功**。fmt / fmt --check / `cargo check -p mimageviewer --lib --tests --features test-script` も成功。P2ログは `target/section1472/accesskit-{red,green,fmt,check}.log`。
-- P2全件検証: focused exit 2 → lib全件 **15,074成功・1失敗・66除外（exit 100）**。関連16件と紙めくり同名testは成功。失敗は `app::tests::scroll_661::row_anchor_observation_keeps_middle_selected_row_in_both_renderers` の `scroll_661.rs:569`（must adopt changed rows）で、単独再実行は1成功。原因未確定、該当ソースは無変更、全件成功とは扱わない。ログ / JUnit: `target/test-lib-full/runs/20261030T121214134Z-fb7e36dc/`、単独: `target/section1472/accesskit-scroll-rerun.log`。
-- 紙めくりの切り分け: 初回の `page_turn_mainwindow_submits_visible_vacant_leaf_both_directions` 失敗（§1.447と同名）の記録は `b153c4b32` に保持。設計担当のmaster単独試験は成功との報告。今回4環境変数を外すと TurboJPEG の CMake/MSBuild exit 1 で **テスト実行前に停止**。通常環境での成否・環境差の影響は未確認。`git diff b153c4b32^ -- src/ui_fullscreen` は空（exit 0）。stash・親commit展開・紙めくり変更なし。ログ: `target/section1472/page-turn-default-env.log`。
-- 確認用build: P2後も `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` 成功（通常profile、core / Remote / EPUB worker・依存DLL検査）。未起動・実機未確認。初回のUI snapshot214成功・PNG差分なし等の証拠は `b153c4b32` の記録を維持し、今回は表示変更がなく再実行していない。仕様 §2.4もAccessKit操作へ合わせた。
-- 検証環境: `MSBUILDDISABLENODEREUSE=1`。既存の事前ビルド済み同一 TurboJPEG archiveを `TURBOJPEG_SOURCE=explicit` で再利用し、LibRawのinclude pathを `CXXFLAGS` で補う（製品のbuild設定は無変更）。環境指定は `target/section1472/test-env.ps1`、P2のREDは同directoryの `accesskit-red.log`。関連: [起動時のちらつき調査](section327-startup-window-flicker-investigation.md)。規模 / 優先度: Small / P2。
-
 ### 1.486 Snapshot（★固定）の固定ownerとcanonical origin / routeの単一所有
 
 - 状態: **未着手・§1.473から分離（設計担当決定 2026-10-30）**。根拠は[§1.473調査記録の再停止](history-parent-1473-investigation.md#再停止snapshotの固定ownerに関する設計前提不足2026-10-30)。`docs/`全体の`### 1.48`を検索し、1.486が未使用であることを確認して採番した。
@@ -165,25 +136,6 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 方針: 固定ownerと完全な帰路の単一所有、一時surfaceを採用しても失わない配送、固定listの再採用をsurface・行provenance・routeまで含むowner操作として設計する。解除/dismiss、Back/Forward、fork/close、同pathと異なるcontextの生命周期を揃え、新bool/並列Option/逆算guardで補わない。
 - §1.473の限定対応: 閲覧履歴rootからの親は既存の固定解除を終えて捕捉済canonical originへ戻す。固定listの完全な再採用機構は今回作らない。
 - 受入候補: 普通Folder/ReadingHistory/★/Bookmarks/検索由来の固定から別surfaceへ入り、固定listへの復帰・解除・一時ビュー移譲を確認する。特に同pathの別visit、行flag/来歴/route、行・scroll、未採用/取消、bundle/fork/closeとsibling不変を含める。設計時に通常利用の挙動を確定する。
-
-### 1.473 閲覧履歴から開いたフォルダで親へ移動すると内部キャッシュへ入る — 5ch >>643・>>656 (2026-10-29)
-
-- 状態: **実装済み・master取り込み済み (`186a85557`、対象 v4.11.0 予定)**。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、「履歴フォルダ」からフォルダを開いた後、親へ移動すると `mImageViewer_portable\data\cache` へ移ると報告。開発側では「本→親で閲覧履歴へ正常復帰→さらに親で実data_dir、cache選択→Enterで実cache」を再現した。報告者が同じ追加操作をしたかと、実アプリでの確認は未確認。
-- 実装・検証: typed root/完全な帰路、親受付の共通化、Tagの漏れを修正。最終全libraryは**14,965成功・失敗0・既存skip65**、うち§1.473は**53件全成功**（元の赤2件を含む）。core/feature付きlib-tests check、fmt、glyph、context audit（違反0）も成功し、独立実装レビューACCEPT。通常/portable相当の一時data_dirで検証し、製品起動・コミットは行っていない。生ログ・補完した同型経路は[調査記録](history-parent-1473-investigation.md)末尾を参照。
-- 取り込み後 (2026-10-30): master で `test-full` 16,453件成功。ClaudeCode が隔離data-dirの dev-runtime ビルドを画面操作して確認: 空の閲覧履歴rootで親→入口の zip-200 (位置・選択も保持)、zip-100 から閲覧履歴に入り履歴の本を開く→BSでroot→親で入口の zip-100 へ戻った (data_dir・本の物理親へは行かない)。報告者の環境は未確認。
-- 再開判断 (2026-10-30): Snapshot全体の所有を作り直す課題は§1.486へ分離。完全な固定一覧再採用の既存経路がないため、既存dismissで固定を終えて入口payloadのcanonical originへ戻す案を採った。固定の部分復帰や新field/逆算は追加せず、同pathのH1/H2と解除後取消も自動検証済み。固定中の親ボタンdisabledは維持し、許可されるBS/Alt+↑/mouse/ringを同じ退出へ通す。
-- 実装停止時の記録 (2026-10-30、WIP `7916a1e97`保存前): 承認設計 `cae94fb27` とmarker不在時Directの補足に沿う途中差分で、45件中44成功・Snapshot1失敗を確認した。Snapshot canonical originが共有TopLevelGridViewにしかなく、H採用で破棄され、list復帰もsurface/来歴/routeを再採用しないため停止。設計担当の限定解除方針を受領して再開し、現在は上記検証を完了した。Snapshot本体の所有問題は§1.486に残す。
-- 回答済みの条件 ([>>656](https://egg.5ch.io/test/read.cgi/software/1782419551/656)): 入口は**閲覧履歴**。主にマウスのサイドボタンへ割り当てて使い、ファイルメニューから閲覧履歴を開いても同じ。フォルダバーの「履歴▼」から開く場合は起きない。入口は再質問しない。
-- 期待する動作: 現在の一覧の論理的な場所と戻り元に従って移動する。閲覧履歴へ戻す仕様と実フォルダの親へ移る仕様は区別するが、内部キャッシュを利用者向けの親フォルダとして開くのは意図しない。
-- コード確認: `src/app.rs::effective_folder` は `archive_source_override` を優先し、`reading_history_back_nav` / `resolve_grid_parent_nav` は履歴等の戻り先を先に判定する。変換済み書庫から履歴へ戻る単体テスト (`reading_history_back_nav_handles_converted_archive`) もある。このため、単純にキャッシュ ZIP の親を見ていると断定せず、履歴からの open 完了時に論理パス・実体パス・戻り元が正しく渡るか調べる。`reading_history_synthetic_path` は `data/__reading_history__` であり、報告の `data/cache` と同一視しない。
-- 調査: ファイルメニュー・リング・マウス割り当ての「閲覧履歴」を入口とし、フォルダバーの「履歴▼」を対照にする。通常フォルダ・画像フォルダ本・ZIP/PDF・変換書庫・EPUB の open / 採用 / 親移動を非対話テストで追い、論理場所・元ファイル・読込実体・履歴への戻り元を区別する。親ボタン・BS・キー・マウス割り当ての共通処理も確認し、利用者に全組み合わせの試験を頼まない。
-- 初回試験: `section1473_*` 9件（248条件＋ZIP内階層／v4.9.0のEnter境界試験）と既存履歴復帰テスト10件が通過。本からの親1回までではcacheへの移動は再現しなかった。ZIP内部からはrootまで戻ってから閲覧履歴へ復帰する。
-- root追補: 通常／portable配置 × 一覧を開いた直後／本から戻った後 × Menu／Ring／Mouse入口 × 親5操作、**全60条件で実data_dirへ移り、cacheを選択、Enterで実cacheへ到達**。親ボタンは実toolbarのheadlessクリックでも確認。原因は `grid_parent_nav_target` / `resolve_grid_parent_nav` にReadingHistory rootの親規則がなく、`data/__reading_history__` を普通の物理pathとして `.parent()` すること（`src/app.rs:24506,24550`）。子名markerは実在しないため選択ヒントが外れ、今回の実一覧 `cache, logs` の先頭が選ばれる。
-- 他root: 11種類×親5操作×2配置の110条件で、**Tag rootのmouse／ringの4条件だけ同型にdata_dirへ漏れcacheを選択**。`handle_gamepad_grid_back` にBS側にあるtag分岐がない（`src/app/gamepad_input.rs:9688` / `src/app.rs:57413`）。Bookmarks／★一覧／検索／Drive／Collection／Smart／サブ展開／Snapshot／実本棚の既存の帰路・停止は内部へ漏れない。
-- 調査時の修正判断 (2026-10-29): 製品コードは変更せず設計へ返した。既存閲覧履歴設計は入口へ戻る仕様だが、単純なHistoryBack追加では本からReturn後の自己markerを消費するだけで余計な1操作を要することも実行確認。root ownerで入口への退出と自己marker／forward履歴を扱い、入口なしの行先を確定する必要があった。独立レビューもSmall変更として実施せず設計へ戻す判断に合意。追加質問・広い再試験依頼は報告者へ出さない。
-- 調査時の最終検証 (2026-10-29): 追補込み13テストは**11成功／既知不具合の安全契約2件が意図して失敗**（root60条件、Tag4条件）。この2件は実装途中の2026-10-30の再試験で成功したが、別のSnapshot受入1件が未解決。製品起動・実データ変更・コミットなし。詳細・生ログ・修正方針は[調査記録](history-parent-1473-investigation.md)の追補を参照。
-- 版差分: タグ v4.9.0 の通常 Folder の Enter には帰路記録の欠落があり、元フォルダの実親へ戻る。master の既存 §1.480 修正で補われているが、今回の合成rootの親欠落とは別件。親 resolver・変換 source/backing・描画後 dispatch の該当処理は同一。
-- 修正時: 合成rootの親を決める所有者で直し、正常な閲覧履歴への復帰、書庫内の階層移動、通常の履歴←→、他rootの固有規則を変えない。新bool／pending／cacheを隠すguardは追加しない。関連: [ナビゲーション仕様](fullscreen-navigation-consistency.md)、[閲覧履歴設計§7.2](reading-history-plan.md#72-backspace--履歴ボタン)。規模 / 優先度: Medium暫定 / P2。
 
 ### 1.475 コレクションの挙動が不安定・本を閉じたときの保存に時間がかかる — X の投稿 (2026-10-29)
 
