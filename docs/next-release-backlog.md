@@ -116,6 +116,13 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 直し方: AI action を全画面の viewport (表示中の viewer の入力所有者) へ送る。製品の main focus guard は変えない。直したら AI / GPU 経路を変える次の版で `-IncludeFirstAi` 付きの ReleaseChecks を実行して採用する。
 - 関連: [release-check-automation-plan.md](release-check-automation-plan.md)、`src/test_script.rs` の `release_check_first_ai`。規模: Small。
 
+### 1.667 ReleaseChecks の起動直後 frame 1→2 の判定が、ログ時刻の 1ms 丸めで成り立たないことがある (2026-10-31)
+
+- 状態: **未着手** (v4.10.1 の ReleaseChecks で判明。製品の不具合ではなく判定スクリプトの不具合)。
+- 内容: `scripts/release_check_analysis.py` の `startup_first_frame_gap` は、起動時の初期化 (`startup/indexer_manager_new`) の完了が frame 1 の update 終了より 1ms 以上後であることを、既知の起動直後の間隔の条件にしている。perf event の `t` は 1ms 単位に丸められるので、完了が update 終了の直後 (1ms 未満) だと順序を示せず、同じ形の間隔が `unexplained` で FAIL になる。証跡: run `release-checks-20261031-014232-5895a34d/perf-cached` で frame 1→2 が 112ms、update 終了 0.8235728、`indexer_manager_new` の `t`=0.824 (`ms`=3.46)。同じ run の perf-uncached は 120ms で既知と判定された (完了 0.811、update 終了 0.8076)。
+- 直し方: 判定に使う完了時刻を丸めない値で出す (例: `indexer_manager_new` に `end_t` を高精度で載せる) か、初期化が frame 1 の後まで未完了だったことを UI スレッド側の観測 (startup overlay の early return) で直接記録する。margin を広げて通すだけにはしない。
+- 関連: [release-check-automation-plan.md](release-check-automation-plan.md)、`scripts/test_release_check_analysis.py`。規模: Small。
+
 ### 1.487 旧二指touchの第二指のMoveが、新しく始めたmouse dragへ混ざる — >>661の統合確認から (2026-10-30)
 
 - 状態: **未着手・>>661から分離（設計担当判断 2026-10-30）**。touchとmouseを同時に使う操作の既存不具合と、同frameの複数所属release混在に対する許容範囲。通常の一覧移動で旧bounds・速度・captureを持ち越す>>661とは分けて扱う。
