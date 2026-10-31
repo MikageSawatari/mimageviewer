@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use mimageviewer_agent_ipc::*;
 use serde::{Deserialize, Serialize};
 mod folder;
+mod input_path;
 mod item_info;
 mod library;
 mod thumbnail;
@@ -666,10 +667,9 @@ impl Handlers {
         let normalized = items
             .iter()
             .map(|item| {
-                let path = resolve_data_dir(Path::new(&item.path))
-                    .map_err(|_| error(ErrorCode::BadRequest, "絶対パスを指定してください"))?;
+                let path = input_path::cursor_key(&item.path)?;
                 Ok(serde_json::json!([
-                    path.to_string_lossy().replace('/', "\\").to_lowercase(),
+                    path,
                     item.subresource.as_ref().map(|s| s.replace('\\', "/"))
                 ]))
             })

@@ -126,6 +126,70 @@ fn jpeg_exif_is_applied_once_then_readonly_user_rotation() {
 }
 
 #[test]
+fn large_jpeg_file_and_exact_zip_member_use_bounded_dct_before_full_size_estimate() {
+    fn segment(jpeg: &mut Vec<u8>, marker: u8, data: &[u8]) {
+        jpeg.extend_from_slice(&[0xff, marker]);
+        jpeg.extend_from_slice(&((data.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(data);
+    }
+
+    // A complete 12,000 x 8,000 baseline grayscale JPEG, with no full-size
+    // raster allocation while creating the fixture. Each constant-gray block
+    // has DC difference zero and AC end-of-block, each encoded by a zero bit.
+    let mut jpeg = vec![0xff, 0xd8];
+    let mut quantization = [1; 65];
+    quantization[0] = 0;
+    segment(&mut jpeg, 0xdb, &quantization);
+    let mut frame = vec![8];
+    frame.extend_from_slice(&8000_u16.to_be_bytes());
+    frame.extend_from_slice(&12000_u16.to_be_bytes());
+    frame.extend_from_slice(&[1, 1, 0x11, 0]);
+    segment(&mut jpeg, 0xc0, &frame);
+    let mut huffman = Vec::new();
+    for table in [0, 0x10] {
+        huffman.extend_from_slice(&[table, 1]);
+        huffman.extend_from_slice(&[0; 15]);
+        huffman.push(0);
+    }
+    segment(&mut jpeg, 0xc4, &huffman);
+    segment(&mut jpeg, 0xda, &[1, 1, 0, 0, 63, 0]);
+    jpeg.resize(jpeg.len() + (12000 / 8) * (8000 / 8) / 4, 0);
+    jpeg.extend_from_slice(&[0xff, 0xd9]);
+    assert!(jpeg.len() < 512 * 1024);
+    assert_eq!(
+        super::super::item_info::bytes_dimensions(&jpeg, "large.jpg"),
+        Some((12000, 8000))
+    );
+    assert!(12000_u64 * 8000 * 4 > MAX_DECODED_BYTES);
+
+    let fixture = super::super::tests::Fixture::new();
+    let path = fixture._dir.path().join("large.jpg");
+    let archive = fixture._dir.path().join("large.cbz");
+    std::fs::write(&path, &jpeg).unwrap();
+    std::fs::write(&archive, zip_bytes("pages/large.jpg", &jpeg)).unwrap();
+    let response = call(
+        &fixture,
+        vec![item(&path, None), item(&archive, Some("pages/large.jpg"))],
+        None,
+    );
+    assert_eq!(response.images.len(), 2);
+    for (index, attachment) in response.images.iter().enumerate() {
+        let value = row(&response, index);
+        assert_eq!(value.status, ThumbnailStatus::Ok);
+        assert_eq!(attachment.item_index, index);
+        let dimensions = value.dimensions.as_ref().unwrap();
+        assert!((1..=DEFAULT_THUMBNAIL_SIDE).contains(&dimensions.width));
+        assert!((1..=DEFAULT_THUMBNAIL_SIDE).contains(&dimensions.height));
+        assert!((f64::from(dimensions.width) / f64::from(dimensions.height) - 1.5).abs() < 0.01);
+        let decoded = image::load_from_memory(&attachment.webp).unwrap();
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (dimensions.width, dimensions.height)
+        );
+    }
+}
+
+#[test]
 fn png_file_and_exact_zip_member_do_not_read_catalog_or_create_metadata_stores() {
     fn inventory(root: &Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
         fn visit(
@@ -590,11 +654,7 @@ fn continuation_starts_at_input_offset_without_reopening_earlier_sources() {
         .iter()
         .map(|i| {
             serde_json::json!([
-                resolve_data_dir(Path::new(&i.path))
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('/', "\\")
-                    .to_lowercase(),
+                super::super::input_path::cursor_key(&i.path).unwrap(),
                 i.subresource.as_ref().map(|s| s.replace('\\', "/"))
             ])
         })

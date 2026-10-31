@@ -49,10 +49,7 @@ pub(super) fn read(
     cancel: &AtomicBool,
 ) -> Result<ItemInfo, AgentError> {
     check_cancel(cancel)?;
-    let path = Path::new(&input.path);
-    if !path.is_absolute() || input.path.contains('\0') {
-        return Err(bad_item());
-    }
+    let path = super::input_path::validate(&input.path)?;
     let metadata = std::fs::metadata(path).ok();
     check_cancel(cancel)?;
     let kind = if metadata.as_ref().is_some_and(std::fs::Metadata::is_dir) {

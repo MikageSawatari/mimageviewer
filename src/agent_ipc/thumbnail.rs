@@ -34,10 +34,8 @@ impl Handlers {
         let normalized = items
             .iter()
             .map(|item| {
-                let path = resolve_data_dir(Path::new(&item.path))
-                    .map_err(|_| error(ErrorCode::BadRequest, "絶対パスを指定してください"))?;
                 Ok(serde_json::json!([
-                    path.to_string_lossy().replace('/', "\\").to_lowercase(),
+                    super::input_path::cursor_key(&item.path)?,
                     item.subresource.as_ref().map(|s| s.replace('\\', "/"))
                 ]))
             })
@@ -246,10 +244,7 @@ fn read_thumbnail(
     edits: &EditReaders,
     io: &crate::io_semaphore::GlobalIoSemaphore,
 ) -> Result<(ThumbnailItem, Option<Vec<u8>>), AgentError> {
-    let path = Path::new(&item.path);
-    if !path.is_absolute() || item.path.contains('\0') {
-        return Err(error(ErrorCode::BadRequest, "絶対パスを指定してください"));
-    }
+    let path = super::input_path::validate(&item.path)?;
     let mut exact = item.clone();
     let mut keys;
     let pixels;
@@ -393,20 +388,6 @@ fn decode_bytes(
         .map(|preview| preview.image)
         .map_err(|_| ThumbnailStatus::Unavailable);
     }
-    // The same read-only header probe as get_item_info, on the already-owned
-    // bytes. Bounded WIC cannot distinguish allocation rejection from codec
-    // failure, so only a known header estimate is classified as TooLarge.
-    if super::item_info::bytes_dimensions(bytes, hint).is_some_and(|(w, h)| {
-        u64::from(w)
-            .checked_mul(u64::from(h))
-            .and_then(|n| n.checked_mul(4))
-            .is_none_or(|bytes| bytes > MAX_DECODED_BYTES)
-    }) {
-        return Err(ThumbnailStatus::TooLarge);
-    }
-    if cancel.load(Ordering::Acquire) {
-        return Err(ThumbnailStatus::Unavailable);
-    }
     if bytes.starts_with(&[0xff, 0xd8]) {
         match crate::thumb_loader::decode_jpeg_turbo_scaled_from_bytes(bytes, side) {
             Ok((image, _)) => {
@@ -419,6 +400,24 @@ fn decode_bytes(
             }
             Err(crate::thumb_loader::DctDecodeError::Fallback(_)) => {}
         }
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err(ThumbnailStatus::Unavailable);
+    }
+    // Only full-size decoding needs this estimate: TurboJPEG already bounds
+    // its DCT-scaled allocation, so large JPEG sources can still fit safely.
+    // Bounded WIC cannot distinguish allocation rejection from codec failure;
+    // use the same read-only header probe as get_item_info for TooLarge.
+    if super::item_info::bytes_dimensions(bytes, hint).is_some_and(|(w, h)| {
+        u64::from(w)
+            .checked_mul(u64::from(h))
+            .and_then(|n| n.checked_mul(4))
+            .is_none_or(|bytes| bytes > MAX_DECODED_BYTES)
+    }) {
+        return Err(ThumbnailStatus::TooLarge);
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err(ThumbnailStatus::Unavailable);
     }
     let source = crate::image_decode::Source::Bytes { bytes, hint };
     crate::image_decode::primary(

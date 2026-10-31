@@ -23,10 +23,7 @@ impl Handlers {
     ) -> Result<Payload, AgentError> {
         ctx.checkpoint()?;
         folder_limit(limit)?;
-        let path = Path::new(&path);
-        if !path.is_absolute() || path.as_os_str().to_string_lossy().contains('\0') {
-            return Err(bad_folder());
-        }
+        let path = input_path::validate(&path)?;
         let prefix = folder_prefix(subresource.as_deref())?;
         let mut settings = crate::settings_db::with_db_result(|db| db.load_into_settings())
             .map_err(|_| internal())?;
@@ -94,8 +91,7 @@ fn bad_folder() -> AgentError {
 }
 
 fn physical_identity(path: &Path) -> String {
-    crate::path_key::physical_path_spelling(path)
-        .unwrap_or_else(|| crate::path_key::normalize_keep_drive(path))
+    input_path::key(path)
 }
 
 fn composition_loading() -> AgentError {

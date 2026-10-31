@@ -2220,3 +2220,86 @@ cargo nextest run -p mimageviewer --lib -E '(test(/agent_ipc/) or test(/agent_le
 通常profile・製品binary・UIを起動せず、commit、test-full、snapshot更新、公開文書更新は行っていない。
 依頼されたconsole adapter binaryは生成済み。coreの実機確認用buildはこのsandboxで実pipe gateが通らないため未実施。
 1c/1d/1eへは進んでいない。途中の設計前提3件はClaudeCodeの判断で解消し、追加の設計矛盾や未解決の実装上の指摘はない。
+
+### 17.7 修正 1 回目
+
+前回成果の sandbox 外の観測者は ClaudeCode。`b66a63687` の段階1bについて、
+`cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` は exit 0
+(11/11、49/49)、§17.6 の focused nextest は exit 0 (240/240) と報告された。
+今回の正式な独立レビューは別スレッドで行われ、ClaudeCode が次の P1/P2 を確認・採用した。
+以下の実装・検証は実装担当自身のもので、独立レビューの代替ではない。
+
+#### 修正と前提の確認
+
+- **P1 (path の別表記による「隠す」の迂回)**: `normalize_path` は小文字化と区切りの置換だけで、
+  `list_folder` / `get_item_info` / `get_thumbnail` の入口はそれぞれ別の検査だった。
+  `src/agent_ipc/input_path.rs` に1つの検査関数を置き、実ファイルと ZIP/PDF の container path、
+  cursor の引数生成をこの入口へ揃えた。絶対 drive/UNC path、NUL/制御文字・dot成分・namespace接頭辞・
+  ADS・成分末尾のdot/空白・重複区切りの排除を検査し、`GetLongPathNameW` の結果と
+  `CompareStringOrdinal` のcase無視で一致するものだけを受ける。短い名前は tool error
+  「パスは mIV の一覧と同じ表記で指定してください」。存在しないpath (OS 2/3) は元の表記のまま
+  各toolの既存not-found処理へ渡し、その他の照合失敗はInternalとして閉じる。pathをログへ渡さない。
+  `canonicalize` / linkの解決は使わず、junction/symlinkはgridと同じ別項目のまま。
+  cursor は許可済みの表記の大小文字/区切りだけを揃え、dot成分やnamespace接頭辞を解消しない。
+  入力配列全件をcursorの解釈より先に検査するので、continuationで読み飛ばす項目にも適用する。
+- **P2 (大きなJPEGの縮小取得)**: 元の寸法の `width * height * 4` 検査がDCTの前にあった。
+  JPEGはまず既存の256MiB出力上限付き縮小DCTを試し、原寸の見積もりはそのfallbackまたは非JPEGの
+  full-size decode直前に移した。file128MiB/ZIP64MiB、decode256MiB、画像/応答予算、取消の契約は維持。
+  UI / Remote、共有decoderの本体、wire形式、永続DB/schemaは変更していない。
+
+#### 回帰
+
+- 新規 `input_path_tests.rs`: dot/dotdot、verbatim/device、ADS、末尾dot/空白、NUL、重複区切りを
+  filesystem照合前に拒否。8.3名はvolumeの短名生成設定に依存しないmock long-name lookupで確認。
+  Unicodeを含むcase/区切り、drive/UNC、link名の保持、存在しないpath、照合失敗のfail-closedも確認。
+- 隠した実画像、ZIP内画像、PDFページの通常表記は `hidden_by_edit` で添付なし。
+  同じ各containerの別表記は3toolすべてで指定のBadRequestとなり、画像を返さない。
+  continuationでskipする入力も拒否し、通常表記の不存在pathの既存結果も確認する。
+- `thumbnail_tests.rs`: 12000×8000、約375KiBの完全なbaseline grayscale JPEGを合成。
+  fixture生成で原寸rasterを確保せず、実ファイルとZIP内画像の両方が `ok`、WebPの寸法がmetadataと
+  一致することを確認する。既存の非JPEG原寸上限・入力上限・conceal/旧key回帰は維持。
+- 既存folder cursorテストは許可される大小文字/区切りの差だけを継続対象とし、dot/verbatimは
+  共通入口の拒否テストへ移した。
+
+#### 実装担当の検証
+
+観測者: 実装担当、このsandbox内、`901dee5a6` + 本修正、通常dev/test profile。
+
+| コマンド | 実 exit code | 結果 / ログ |
+|---|---:|---|
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 0 | 最終production差分。`target/mcp-1b-fix1-core.log` |
+| 下記 narrow nextest | 0 | 新規6件+既存cursor1件、7/7成功。`target/mcp-1b-fix1-narrow.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | 101 | IPC11成功、MCP47成功/2失敗、ignore0。失敗は実pipeのOS5。`target/mcp-1b-fix1-crates.log` |
+| §17.6 focused nextest (初回) | 100 | 243成功/3失敗。verbatim容認の旧cursorテスト1件の更新漏れを修正、ほか2件はOS5。`target/mcp-1b-fix1-focused.log` |
+| §17.6 focused nextest (最終) | 100 | 246件中244成功/2失敗。OS5以外の失敗なし。`target/mcp-1b-fix1-focused-final.log` |
+| `cargo build -p mimageviewer-mcp --bin mimageviewer-mcp` | 0 | `target/mcp-1b-fix1-adapter.log` |
+| `cargo fmt` (workspace、引数なし) | 0 | 最後のcursorテスト修正後も実行 |
+| `cargo fmt --check` | 0 | `target/mcp-1b-fix1-fmt.log` |
+| `git diff --check` | 0 | 最終差分を確認 |
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/agent_ipc::input_path/) or test(/large_jpeg_file_and_exact_zip_member/) or test(/folder_cursor_continues_across_equivalent/)'
+```
+
+最終のcore失敗は `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry` と
+`agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`、adapter失敗は
+`pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld` と
+`pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked`。
+いずれもfixtureの実pipe作成/接続時のOS5で、skip/ignore化、DACL変更は行っていない。
+core check・crate tests・adapter build後の変更は既存coreテストの期待とこの台帳だけなので、
+同じproduction/crate sourceに対する結果を再利用する。FFmpeg DLLも配置済みの実ファイルを使用。
+走査器やZIP/PDF共有readerの実装は今回は変更しておらず、10万件走査の再実行やtest-fullは行わない。
+
+変更ファイル: 新規 `src/agent_ipc/input_path.rs`, `input_path_tests.rs`、
+既存 `src/agent_ipc/mod.rs`, `folder.rs`, `folder_tests.rs`, `item_info.rs`, `thumbnail.rs`,
+`thumbnail_tests.rs` と本台帳。新たな設計矛盾はなく、今回修正のsandbox外の実pipe成功と
+正式な再レビューは未観測。製品binaryの起動、commit、UI/snapshot更新は行っていない。
+実pipe gateがこのsandbox内で通らないため、通常profileのcore確認用buildは行わず、
+依頼されたconsole adapterだけをbuildした。
+
+ClaudeCode が sandbox 外の通常権限で実行するコマンド (今回の修正後の成功は未観測):
+
+```powershell
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E '(test(/agent_ipc/) or test(/agent_level/) or test(/agent_permission/) or test(=settings_db::tests::failed_permission_commit_preserves_snapshot_and_epoch) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(/png_metadata/) or test(=pdf_loader::tests::anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results) or test(=pdf_loader::tests::page_sizes_preserve_existing_ui_diagnostic_identity) or test(=pdf_loader::tests::page_sizes_round_trip_and_reject_a_truncated_reply) or test(/app::folder_scan/) or test(/zip_loader/) or test(=pdf_loader::tests::anonymous_agent_render_and_enumerate_omit_keys_and_harvest_actual_completion) or test(=pdf_loader::tests::cancelled_anonymous_render_does_not_enqueue)) and not test(/section1375_scan_perf_tests/)'
+```
