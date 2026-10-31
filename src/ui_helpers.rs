@@ -516,10 +516,34 @@ pub(crate) fn apply_brush_radius_wheel(
     Some(applied)
 }
 
-/// 3 系統のバケツで共有する範囲選択と、範囲に応じた補助スライダー。
-///
-/// px の 2 本は 0.1 刻み / 小数 1 桁、割合は 1 刻み / 整数表示に固定する。egui の
-/// 自動桁数へ任せると、刻みより細かい桁が出て 3 本の見た目が不揃いになる。
+/// 3 系統のバケツで共有する基準選択。色差の値は無効化しても保持する。
+pub(crate) fn draw_bucket_source_controls(
+    ui: &mut egui::Ui,
+    source: &mut crate::mask_db::BucketSource,
+    tolerance: &mut f32,
+) {
+    use crate::mask_db::BucketSource;
+
+    ui.label("範囲の基準");
+    ui.horizontal(|ui| {
+        ui.selectable_value(source, BucketSource::ImageColor, "画像の色")
+            .on_hover_text("クリックした点に近い色を塗ります。");
+        ui.selectable_value(source, BucketSource::DrawnMask, "描いたマスク")
+            .on_hover_text("描いたマスクを境に塗ります。消去では塗った部分を基準にします。図形自体は変わりません。");
+    });
+    ui.add_enabled(
+        *source == BucketSource::ImageColor,
+        egui::Slider::new(tolerance, 0.0..=255.0)
+            .text("色差の許容値")
+            .step_by(1.0),
+    );
+}
+
+pub(crate) fn bucket_seed_already_value_message() -> &'static str {
+    "この場所は既に同じ状態です。塗るときはマスクのない場所、消すときはマスクの上をクリックしてください。"
+}
+
+/// 範囲選択と補助スライダー。px は 0.1 刻み・小数 1 桁、割合は整数表示。
 /// 戻り値は 5 択ボタン 2 行を確保した矩形。
 pub(crate) fn draw_bucket_region_controls(
     ui: &mut egui::Ui,
@@ -584,7 +608,7 @@ pub(crate) fn draw_bucket_region_controls(
                 .suffix("%"),
         )
         .on_hover_text(
-            "図形の中に混ざってよい別色の割合です。文字の抜けは埋め、大きな隙間は埋めません。0 で穴埋めなし。",
+            "図形の中に混ざってよい隙間の割合です。小さな穴は埋め、大きな隙間は埋めません。0 で穴埋めなし。",
         );
     }
     region_controls_rect
@@ -646,9 +670,24 @@ fn draw_bucket_region_row(
 
 pub(crate) fn bucket_shape_fit_failed_message(
     region: crate::mask_db::BucketRegion,
+    source: crate::mask_db::BucketSource,
 ) -> Option<&'static str> {
     use crate::mask_db::BucketRegion;
 
+    if source == crate::mask_db::BucketSource::DrawnMask {
+        return match region {
+            BucketRegion::Rect => Some(
+                "長方形として当てはまりませんでした。選択範囲を点滅表示しました。漏れ止めを見直してください。",
+            ),
+            BucketRegion::Ellipse => Some(
+                "楕円として当てはまりませんでした。選択範囲を点滅表示しました。漏れ止めを見直してください。",
+            ),
+            BucketRegion::Circle => Some(
+                "円として当てはまりませんでした。選択範囲を点滅表示しました。漏れ止めを見直してください。",
+            ),
+            BucketRegion::Whole | BucketRegion::Connected => None,
+        };
+    }
     match region {
         BucketRegion::Rect => Some(
             "長方形として当てはまりませんでした。選択範囲を点滅表示しました。漏れ止めを上げるか、色差の許容値を下げてください。",
@@ -4048,3 +4087,7 @@ mod tests {
         assert_eq!(open_side_panel_by_touch(ByTouchHandle), ByTouchHandle);
     }
 }
+
+#[cfg(test)]
+#[path = "ui_helpers/mask_bucket_1673_tests.rs"]
+mod mask_bucket_1673_tests;

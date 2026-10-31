@@ -1073,22 +1073,35 @@ impl App {
         };
 
         let mut next = mask.clone();
-        let outcome = crate::mask_db::flood_fill_bitmap_mask(
-            &mut next,
-            &source,
-            seed_x,
-            seed_y,
-            crate::mask_db::BucketFill {
-                tolerance: self.conceal_bucket_tolerance.round().clamp(0.0, 255.0) as u8,
-                region: self.conceal_bucket_region,
-                value: self.conceal_paint_mode,
-                leak_stop: self.conceal_bucket_leak_stop.max(0.0),
-                outset: self.conceal_bucket_outset.max(0.0),
-                gap_tolerance: self.conceal_bucket_gap_tolerance.clamp(0.0, 50.0),
-            },
-        );
+        let fill = crate::mask_db::BucketFill {
+            tolerance: self.conceal_bucket_tolerance.round().clamp(0.0, 255.0) as u8,
+            region: self.conceal_bucket_region,
+            value: self.conceal_paint_mode,
+            leak_stop: self.conceal_bucket_leak_stop.max(0.0),
+            outset: self.conceal_bucket_outset.max(0.0),
+            gap_tolerance: self.conceal_bucket_gap_tolerance.clamp(0.0, 50.0),
+        };
+        let outcome = match self.conceal_bucket_source {
+            crate::mask_db::BucketSource::ImageColor => {
+                crate::mask_db::flood_fill_bitmap_mask(&mut next, &source, seed_x, seed_y, fill)
+            }
+            crate::mask_db::BucketSource::DrawnMask => crate::mask_db::flood_fill_drawn_mask(
+                &mut next,
+                &self.conceal_shapes,
+                [w, h],
+                seed_x,
+                seed_y,
+                fill,
+            ),
+        };
         match outcome {
             crate::mask_db::BucketFillOutcome::Filled => {}
+            crate::mask_db::BucketFillOutcome::SeedAlreadyValue => {
+                self.show_feedback_warning(
+                    crate::ui_helpers::bucket_seed_already_value_message().to_string(),
+                );
+                return;
+            }
             crate::mask_db::BucketFillOutcome::SeedTooThin => {
                 self.show_feedback_warning(
                     "漏れ止めより細い場所です。漏れ止めを小さくしてください。".to_string(),
@@ -1097,9 +1110,10 @@ impl App {
             }
             crate::mask_db::BucketFillOutcome::ShapeFitFailed(preview) => {
                 self.start_bucket_region_flash(ctx, fs_idx, preview);
-                if let Some(message) =
-                    crate::ui_helpers::bucket_shape_fit_failed_message(self.conceal_bucket_region)
-                {
+                if let Some(message) = crate::ui_helpers::bucket_shape_fit_failed_message(
+                    self.conceal_bucket_region,
+                    self.conceal_bucket_source,
+                ) {
                     self.show_feedback_warning(message.to_string());
                 }
                 return;
@@ -2648,14 +2662,7 @@ impl App {
                                                 self.settings.conceal_brush_radius = r;
                                             }
                                             ConcealTool::Bucket => {
-                                                ui.add(
-                                                    egui::Slider::new(
-                                                        &mut self.conceal_bucket_tolerance,
-                                                        0.0..=255.0,
-                                                    )
-                                                    .text("色差の許容値")
-                                                    .step_by(1.0),
-                                                );
+                                                crate::ui_helpers::draw_bucket_source_controls(ui, &mut self.conceal_bucket_source, &mut self.conceal_bucket_tolerance);
                                                 crate::ui_helpers::draw_bucket_region_controls(
                                                     ui,
                                                     &mut self.conceal_bucket_region,
@@ -3366,3 +3373,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ui_conceal/mask_bucket_1673_tests.rs"]
+mod mask_bucket_1673_tests;

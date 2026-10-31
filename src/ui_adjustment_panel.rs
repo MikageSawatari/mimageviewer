@@ -1020,7 +1020,7 @@ mod local_adjust_segmentation_tests {
         let red = egui::Color32::from_rgb(180, 20, 20);
         let blue = egui::Color32::from_rgb(20, 20, 180);
         let source = egui::ColorImage::new([5, 1], vec![red, red, blue, red, red]);
-        let mut alpha = vec![0.0; 5];
+        let mut alpha = local_adjust_core::MaskAlpha::new(vec![0.0; 5]);
 
         let fill = crate::mask_db::BucketFill {
             tolerance: 0,
@@ -1033,10 +1033,18 @@ mod local_adjust_segmentation_tests {
         let filled = crate::mask_db::BucketFillOutcome::Filled;
 
         assert_eq!(
-            flood_fill_local_adjust_alpha_mask(&mut alpha, &source, 0, 0, fill),
+            flood_fill_local_adjust_alpha_mask(
+                &mut alpha,
+                &source,
+                0,
+                0,
+                fill,
+                crate::mask_db::BucketSource::ImageColor,
+                &[]
+            ),
             filled
         );
-        assert_eq!(alpha, vec![1.0, 1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(*alpha, vec![1.0, 1.0, 0.0, 0.0, 0.0]);
 
         assert_eq!(
             flood_fill_local_adjust_alpha_mask(
@@ -1048,10 +1056,12 @@ mod local_adjust_segmentation_tests {
                     value: false,
                     ..fill
                 },
+                crate::mask_db::BucketSource::ImageColor,
+                &[],
             ),
             filled
         );
-        assert_eq!(alpha, vec![0.0; 5]);
+        assert_eq!(*alpha, vec![0.0; 5]);
 
         assert_eq!(
             flood_fill_local_adjust_alpha_mask(
@@ -1063,10 +1073,12 @@ mod local_adjust_segmentation_tests {
                     region: crate::mask_db::BucketRegion::Whole,
                     ..fill
                 },
+                crate::mask_db::BucketSource::ImageColor,
+                &[],
             ),
             filled
         );
-        assert_eq!(alpha, vec![1.0, 1.0, 0.0, 1.0, 1.0]);
+        assert_eq!(*alpha, vec![1.0, 1.0, 0.0, 1.0, 1.0]);
     }
 
     #[test]
@@ -2182,24 +2194,68 @@ fn local_adjust_morph_alpha_1px(
 }
 
 fn flood_fill_local_adjust_alpha_mask(
-    alpha: &mut [f32],
+    alpha: &mut local_adjust_core::MaskAlpha,
     source: &egui::ColorImage,
     seed_x: usize,
     seed_y: usize,
     fill: crate::mask_db::BucketFill,
+    bucket_source: crate::mask_db::BucketSource,
+    shapes: &[local_adjust_core::MaskShape],
 ) -> crate::mask_db::BucketFillOutcome {
-    let expected_len = source.size[0].saturating_mul(source.size[1]);
-    if expected_len == 0 || alpha.len() < expected_len {
+    let [width, height] = source.size;
+    let expected_len = width.saturating_mul(height);
+    if width == 0
+        || height == 0
+        || seed_x >= width
+        || seed_y >= height
+        || alpha.len() < expected_len
+    {
         return crate::mask_db::BucketFillOutcome::Invalid;
+    }
+    // Reject matching seeds before bitmap allocation, full shape composition,
+    // or copy-on-write of the original alpha plane.
+    if bucket_source == crate::mask_db::BucketSource::DrawnMask
+        && local_adjust_core::rasterized_shapes_value_at(
+            alpha[seed_y * width + seed_x] >= 0.5,
+            width,
+            height,
+            shapes,
+            seed_x,
+            seed_y,
+        ) == fill.value
+    {
+        return crate::mask_db::BucketFillOutcome::SeedAlreadyValue;
     }
     let mut bitmap: Vec<bool> = alpha[..expected_len]
         .iter()
         .map(|value| *value >= 0.5)
         .collect();
-    let outcome = crate::mask_db::flood_fill_bitmap_mask(&mut bitmap, source, seed_x, seed_y, fill);
+    let outcome = match bucket_source {
+        crate::mask_db::BucketSource::ImageColor => {
+            crate::mask_db::flood_fill_bitmap_mask(&mut bitmap, source, seed_x, seed_y, fill)
+        }
+        crate::mask_db::BucketSource::DrawnMask => {
+            let mut composite = bitmap.clone();
+            local_adjust_core::rasterize_shapes_into_bitmap(
+                &mut composite,
+                source.size[0],
+                source.size[1],
+                shapes,
+            );
+            crate::mask_db::flood_fill_composite_mask(
+                &mut bitmap,
+                composite,
+                source.size,
+                seed_x,
+                seed_y,
+                fill,
+            )
+        }
+    };
     if outcome != crate::mask_db::BucketFillOutcome::Filled {
         return outcome;
     }
+    let alpha = std::sync::Arc::make_mut(alpha);
     for (alpha, value) in alpha[..expected_len].iter_mut().zip(bitmap) {
         *alpha = if value { 1.0 } else { 0.0 };
     }
@@ -4529,6 +4585,7 @@ fn draw_local_tool_settings(
     boundary_gap_px: &mut f32,
     edge_snap_radius: &mut f32,
     edge_brush_tolerance: &mut f32,
+    bucket_source: &mut crate::mask_db::BucketSource,
     bucket_region: &mut crate::mask_db::BucketRegion,
     bucket_leak_stop: &mut f32,
     bucket_outset: &mut f32,
@@ -4577,11 +4634,7 @@ fn draw_local_tool_settings(
 
     match mask_tool {
         LocalAdjustMaskTool::Bucket => {
-            ui.add(
-                egui::Slider::new(edge_brush_tolerance, 0.0..=255.0)
-                    .text("色差の許容値")
-                    .step_by(1.0),
-            );
+            crate::ui_helpers::draw_bucket_source_controls(ui, bucket_source, edge_brush_tolerance);
             crate::ui_helpers::draw_bucket_region_controls(
                 ui,
                 bucket_region,
@@ -4683,6 +4736,7 @@ fn draw_selected_local_adjust_layer_editor(
     boundary_gap_px: &mut f32,
     edge_snap_radius: &mut f32,
     edge_brush_tolerance: &mut f32,
+    bucket_source: &mut crate::mask_db::BucketSource,
     bucket_region: &mut crate::mask_db::BucketRegion,
     bucket_leak_stop: &mut f32,
     bucket_outset: &mut f32,
@@ -4721,6 +4775,7 @@ fn draw_selected_local_adjust_layer_editor(
                 boundary_gap_px,
                 edge_snap_radius,
                 edge_brush_tolerance,
+                bucket_source,
                 bucket_region,
                 bucket_leak_stop,
                 bucket_outset,
@@ -11610,9 +11665,27 @@ impl App {
             outset: self.local_adjust_bucket_outset.max(0.0),
             gap_tolerance: self.local_adjust_bucket_gap_tolerance.clamp(0.0, 50.0),
         };
+        let bucket_source = self.local_adjust_bucket_source;
         let mut outcome = crate::mask_db::BucketFillOutcome::Invalid;
         let changed =
             self.mutate_local_adjust_layer_from_canvas(fs_idx, layer_idx, true, |layer| {
+                // An absent override is an empty mask. Erasing it is a matching
+                // seed, not a preparation failure, and must not create a slot.
+                if bucket_source == crate::mask_db::BucketSource::DrawnMask
+                    && !paint
+                    && match target {
+                        LocalAdjustMaskEditTarget::OverrideAdd => {
+                            layer.manual_override.add.is_none()
+                        }
+                        LocalAdjustMaskEditTarget::OverrideSubtract => {
+                            layer.manual_override.subtract.is_none()
+                        }
+                        _ => false,
+                    }
+                {
+                    outcome = crate::mask_db::BucketFillOutcome::SeedAlreadyValue;
+                    return LocalAdjustCanvasEdit::Untouched;
+                }
                 let Some(handle) = local_adjust_prepare_target_raster_vector_mask(
                     layer, target, image_dims, paint,
                 ) else {
@@ -11623,11 +11696,13 @@ impl App {
                     return LocalAdjustCanvasEdit::prepared_only(preparation, target);
                 }
                 outcome = flood_fill_local_adjust_alpha_mask(
-                    mask.alpha_mut(),
+                    &mut mask.alpha,
                     source.as_ref(),
                     seed_x,
                     seed_y,
                     fill,
+                    bucket_source,
+                    &mask.shapes,
                 );
                 LocalAdjustCanvasEdit::from_edit(
                     matches!(&outcome, crate::mask_db::BucketFillOutcome::Filled),
@@ -11636,6 +11711,11 @@ impl App {
                 )
             });
         match outcome {
+            crate::mask_db::BucketFillOutcome::SeedAlreadyValue => {
+                self.show_feedback_warning(
+                    crate::ui_helpers::bucket_seed_already_value_message().to_string(),
+                );
+            }
             crate::mask_db::BucketFillOutcome::SeedTooThin => {
                 self.show_feedback_warning(
                     "漏れ止めより細い場所です。漏れ止めを小さくしてください。".to_string(),
@@ -11645,6 +11725,7 @@ impl App {
                 self.start_bucket_region_flash(ctx, fs_idx, preview);
                 if let Some(message) = crate::ui_helpers::bucket_shape_fit_failed_message(
                     self.local_adjust_bucket_region,
+                    self.local_adjust_bucket_source,
                 ) {
                     self.show_feedback_warning(message.to_string());
                 }
@@ -15418,6 +15499,7 @@ impl App {
         let mut boundary_gap_px = self.local_adjust_boundary_gap_px;
         let mut edge_snap_radius = self.local_adjust_edge_snap_radius;
         let mut edge_brush_tolerance = self.local_adjust_edge_brush_tolerance;
+        let mut bucket_source = self.local_adjust_bucket_source;
         let mut bucket_region = self.local_adjust_bucket_region;
         let mut bucket_leak_stop = self.local_adjust_bucket_leak_stop;
         let mut bucket_outset = self.local_adjust_bucket_outset;
@@ -15696,6 +15778,7 @@ impl App {
                                         &mut boundary_gap_px,
                                         &mut edge_snap_radius,
                                         &mut edge_brush_tolerance,
+                                        &mut bucket_source,
                                         &mut bucket_region,
                                         &mut bucket_leak_stop,
                                         &mut bucket_outset,
@@ -15768,6 +15851,7 @@ impl App {
         self.local_adjust_boundary_gap_px = boundary_gap_px.clamp(0.0, 8.0);
         self.local_adjust_edge_snap_radius = edge_snap_radius.clamp(2.0, 64.0);
         self.local_adjust_edge_brush_tolerance = edge_brush_tolerance.clamp(0.0, 255.0);
+        self.local_adjust_bucket_source = bucket_source;
         self.local_adjust_bucket_region = bucket_region;
         self.local_adjust_bucket_leak_stop = bucket_leak_stop.clamp(0.0, 16.0);
         self.local_adjust_bucket_outset = bucket_outset.clamp(0.0, 8.0);
@@ -17499,3 +17583,7 @@ mod section1445_slider_tests {
         assert_eq!(harness.state().effective_params(0), &standard);
     }
 }
+
+#[cfg(test)]
+#[path = "ui_adjustment_panel/mask_bucket_1673_tests.rs"]
+mod mask_bucket_1673_tests;

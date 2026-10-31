@@ -18620,6 +18620,7 @@ pub struct App {
     /// 補正レイヤー境界筆の開始色からの許容差。
     pub(crate) local_adjust_edge_brush_tolerance: f32,
     /// 補正レイヤーバケツの塗る範囲。
+    pub(crate) local_adjust_bucket_source: crate::mask_db::BucketSource,
     pub(crate) local_adjust_bucket_region: crate::mask_db::BucketRegion,
     /// バケツの漏れ止め半径 (px)。0 で無効。
     pub(crate) local_adjust_bucket_leak_stop: f32,
@@ -19024,6 +19025,7 @@ pub struct App {
     /// バケツの漏れ止め半径 (px)。0 で無効。細い通路と小さな隙間からの漏れを止める。
     pub(crate) erase_bucket_leak_stop: f32,
     /// バケツツールの塗る範囲。
+    pub(crate) erase_bucket_source: crate::mask_db::BucketSource,
     pub(crate) erase_bucket_region: crate::mask_db::BucketRegion,
     /// バケツの図形を外側へ広げる量 (px)。
     pub(crate) erase_bucket_outset: f32,
@@ -19148,6 +19150,7 @@ pub struct App {
     /// バケツの漏れ止め半径 (px)。0 で無効。
     pub(crate) conceal_bucket_leak_stop: f32,
     /// バケツツールの塗る範囲。
+    pub(crate) conceal_bucket_source: crate::mask_db::BucketSource,
     pub(crate) conceal_bucket_region: crate::mask_db::BucketRegion,
     /// バケツの図形を外側へ広げる量 (px)。
     pub(crate) conceal_bucket_outset: f32,
@@ -21647,6 +21650,7 @@ impl App {
             local_adjust_boundary_gap_px: 2.0,
             local_adjust_edge_snap_radius: 16.0,
             local_adjust_edge_brush_tolerance: 48.0,
+            local_adjust_bucket_source: crate::mask_db::BucketSource::ImageColor,
             local_adjust_bucket_region: crate::mask_db::BucketRegion::Connected,
             local_adjust_bucket_leak_stop: 0.0,
             local_adjust_bucket_outset: 1.0,
@@ -21783,6 +21787,7 @@ impl App {
             erase_brush_radius: 0.0, // enter_erase_mode で設定
             erase_bucket_tolerance: 48.0,
             erase_bucket_leak_stop: 0.0,
+            erase_bucket_source: crate::mask_db::BucketSource::ImageColor,
             erase_bucket_region: crate::mask_db::BucketRegion::Connected,
             erase_bucket_outset: 1.0,
             erase_bucket_gap_tolerance: 10.0,
@@ -21822,6 +21827,7 @@ impl App {
             conceal_paint_mode: true,
             conceal_bucket_tolerance: 48.0,
             conceal_bucket_leak_stop: 0.0,
+            conceal_bucket_source: crate::mask_db::BucketSource::ImageColor,
             conceal_bucket_region: crate::mask_db::BucketRegion::Connected,
             conceal_bucket_outset: 1.0,
             conceal_bucket_gap_tolerance: 10.0,
