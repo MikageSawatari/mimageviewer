@@ -46,9 +46,27 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - §1.456 一覧の名前の文字サイズ・最大行数 (>>629): 出荷の案内は未。
 - §1.480 画像フォルダを Enter で開くと自動表示が ON でもページ一覧で止まる (>>649 の調査中に開発側で発見、v4.2.0 から): >>649 の評価フィルタの件は開発側で再現しなかった。報告者へは未返信。
 
+### 1.668 コレクションの一覧がサムネイルのキャッシュを使わず、開くたびに作り直す — X @Rottytops (2026-10-31)
+
+- 状態: **未着手 (v4.11.0 候補)**。[X の投稿](https://x.com/Rottytops) (2026-10-31) は「2000 件のコレクションで毎回サムネイルを読みに行くのがしんどい。コレクションのサムネイルキャッシュを検討してほしい」という要望。報告者の素材の置き場所 (SSD / HDD / NAS)・本と画像の割合は未記載。開発側は実測していない。
+- 原因 (コードで確認、2026-10-31 ClaudeCode): コレクションの一覧は永続のサムネイルキャッシュ (catalog) を読みも書きもしない。`src/app/collection_grid.rs` の一覧の設置で `current_color_catalog = None`、`spawn_thumbnail_workers` の catalog 引数も `None` (コメント「No catalog open/write」)。`cache_map` は代表ピンが動画のフォルダ用の seed WebP (`folder_pin_cache`) だけで作る。catalog が無いので worker の `should_save` は常に false (`src/thumb_loader.rs`)。結果として、開くたび・表示範囲から外れて破棄されたセルへスクロールで戻るたびに元ファイルからデコードし直す。ZIP は書庫を開いて先頭画像を読み、PDF は PDFium で表紙を描く (HDD 上の大きな PDF の表紙は 1 枚 5〜29 秒の計測が §1.475 の調査にある)。キーはフルパス (`imgthumb:<path>` / `zipthumb:<path>`、`use_full_path_cache_keys()`) で、通常フォルダの DB (basename キー) とも一致しない。スマートフォルダ (`src/app/smart_folder.rs` が合成パスの専用 catalog を開く)・検索・評価・履歴などの集約ビューは catalog を持ち、持たないのはコレクションだけ。§1.266 にも「コレクションのサムネイルは毎回生成扱い」とある。
+- 開くたびの準備: prepare worker が全項目を `std::fs::metadata` し、動画 sidecar・編集 DB・ピン DB を引く (`src/collection_store/prepare.rs`、`src/app/collection_grid.rs`)。SSD・10,000 件で約 120ms の計測 (§1.475) があり、体感の主因はサムネイルの再生成と見ている (推測)。
+- 直し方の候補 (未決定): (A) スマートフォルダと同じく、collection_id から作った合成パスで専用 catalog を開き、`load_all` の結果と catalog を worker へ渡す。キーは既にフルパスなので衝突しない。登録の削除時の掃除 (合成パスでは `delete_missing` が走らない) とキャッシュ削除の所有単位 (catalog-design.md §2.4) を決める。(B) prepare worker で項目を親フォルダごとにまとめ、親フォルダの catalog を `open_existing_read_only` で引き、mtime・size が合えばフルパスキーへ付け替えて seed にする (前例: `src/remote_ipc/collections.rs` が親フォルダごとに catalog を読み取り専用で開く)。ふだんフォルダで見ている項目はすぐ当たるが、新しく作った分の保存は別に要る。(A) を基本にし、初回の空振りを (B) で埋める組み合わせも考えられる。設計を決める前に、2000 件規模で開く→表示が揃うまでの時間を perf ログで測る。
+- 対象: `src/app/collection_grid.rs`、`src/collection_store/prepare.rs`、`src/thumb_loader.rs`、`src/catalog.rs`、[catalog 設計](catalog-design.md)、[コレクション実装計画](collection-implementation-plan.md)。キャッシュの設定・削除の UI と、マニュアルのキャッシュの説明も合わせる。規模 / 優先度: Medium / P2。報告者への返信は未。
+
+### 1.669 本の構成を作っていない本でも、ページを出すたびに構成の照合が走る — X @Rottytops (2026-10-31)
+
+- 状態: **未着手 (v4.11.0 候補)**。[X の投稿](https://x.com/Rottytops) (2026-10-31) は「4.7.0 あたりで追加された本ごとに構成を保存する機能は切れないのか、ちょっと重いし使っていない」という声。どの操作で重いと感じたか (開く・めくる・一覧) は未記載。**この照合が体感の重さの原因かは未確認**で、開発側は実測していない。
+- コードで確認したこと (2026-10-31 ClaudeCode): 構成を無効にする設定は無い。構成 DB (`book_composition.db`) は最初の保存で作られ、起動時に全行をメモリ上の snapshot に読むので、DB を毎回引く作りではない。ただし「行が 1 つも無い / この本に行が無い」ときに処理を省く近道が無い。
+  - ページ提示のたびの照合: 全画面で新しく出すページ (相方を含む) ごとに `check_candidate` を構成の worker へ送り、返事が来るまで提示しない (`src/app/book_composition_permission.rs`)。worker の `candidate_permission` (`src/book_composition/permission.rs`) は行の有無を見る前に `resolve_candidate_scope` を呼ぶ。ZIP ではその中の `ArchiveScopeIndex::prepare` が書庫内の全画像エントリを正規化して HashMap に入れ直す。結果は保持しないので、候補 1 件ごとにやり直す。候補が開いている書庫の木と合わない場合 (Ctrl+G などの抽出一覧の ZIP ページ) は書庫を列挙し直す。この worker は表示モード・表示トリムの書き込み (毎回 DB を open し直す) と同じ FIFO を共有する。
+  - 本を開くたび: worker へ prepare を往復し、ZIP は行が無くても projection スレッドを起こしてページ列を作り、Automatic なら捨てる。待つ間は 50ms 刻みで起床する。PDF / EPUB は往復 1 回で済む。
+  - 一覧 (フォルダの ZIP のサムネイル・並べ替え) には関わらない。構成を保存したときだけ内容の指紋を取る。
+- 方針: 設定で機能を切る前に、**構成の無い本では照合と projection を省く**構造にする (行の有無はメモリ上の snapshot で分かる)。省けない場合も、書庫の scope index は本 1 冊につき 1 回作って使い回す。§1.447 などのページめくりの提示待ちと同じ区間なので、着手前にページめくり・本を開く区間へ `perf::event` を入れて、照合待ちの時間を測ってから直し方を決める。非表示ページのある本の挙動 (非表示を出さない、出力の許可) は変えない。
+- 対象: `src/book_composition/{permission,service}.rs`、`src/app/{book_composition_runtime,book_composition_permission,book_materialization}.rs`、[本の構成の計画](book-composition-plan.md) (照合は「開く・送るときに新しく表示するページだけ worker で」の方針)。規模 / 優先度: Small〜Medium / P2。報告者への返信は未。
+
 ### 1.666 v4.10.0でも突然終了する・読み取りアクセス違反の報告 — 5ch >>655・657・672 (2026-10-31)
 
-- 状態: **原因の筋が判明・直し方を利用者と相談中 (2026-10-31)。v4.9.0・v4.10.0 とも mimalloc 3.3.2 の `mi_heap_main` の同じ命令で落ちており、上流で修正済みの既知の競合と一致 (下の「例外位置の特定」)**。[>>672](https://egg.5ch.io/test/read.cgi/software/1782419551/672) は名前欄「655」で「最新版でも突然死がおきました」と報告し、v4.10.0のnative例外ログ1行を提供した。このセッションでは原文・既存調査・ログ出力実装の軽い確認のみ行い、配布exeの解析・再現試験・修正は行っていない。
+- 状態: **対応済み・v4.10.2 で出荷予定 (2026-10-31)。利用者の決定「3系を修正版へ」により、`libmimalloc-sys` 0.1.49 を vendor して同梱の v3 を上流無改変の mimalloc 3.5.3 へ差し替えた (ブランチ `release-4.10.2` の `dbdb5d2aa`、元は `mimalloc-fix-1666` の `bf942bc19`。独立レビュー ACCEPT)。修正の効果は利用者環境で未確認。以下は判断までの記録。** 旧状態: 原因の筋が判明・直し方を利用者と相談中 (2026-10-31)。v4.9.0・v4.10.0 とも mimalloc 3.3.2 の `mi_heap_main` の同じ命令で落ちており、上流で修正済みの既知の競合と一致 (下の「例外位置の特定」)**。[>>672](https://egg.5ch.io/test/read.cgi/software/1782419551/672) は名前欄「655」で「最新版でも突然死がおきました」と報告し、v4.10.0のnative例外ログ1行を提供した。このセッションでは原文・既存調査・ログ出力実装の軽い確認のみ行い、配布exeの解析・再現試験・修正は行っていない。
 - 経緯: >>655は約30画像のZIPでAI「高速汎用」の完了前にホイールで約10ページ送ると砂時計になって終了するとの報告。「先読みバッファをオーバー」は報告者の仮説。>>657はv4.9.0のイベントログ（例外 `0xc0000005`、障害offset `0x540a947`、Windows 11 Home 25H2・RAM32GB）。>>672は同じ報告者の追加証拠だが、その回の操作・素材・設定は未記載で、同じ手順・原因だったと断定しない。
 - >>672の原文ログ（書き換えず保存）:
 
@@ -294,6 +312,7 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
   (並列度を上げる・CPU 負荷を足す) を先に作る。待ちや再試行を足して隠さない。
 - 規模 / 優先度: 調査後に見積り / P3。
 - 追加の観測 (2026-10-28〜29): deps-update-1460 の全件 (421 行、p=0.25 で曲面 mesh 0) と、pageturn-1461-1457 の関連テスト群・単独 (462 行、p=0.75) でも落ちた。どちらもこのテストに触れていない変更の上で、単独の再実行では成功することもある。
+- 追加の観測 (2026-10-31、ClaudeCode): `release-4.10.2` (v4.10.1 + §1.664 + mimalloc 3.5.3) の全件で、ページめくりの 4 件 (landscape_tests 2 件・merge_master_tests 2 件、どれも「提示が ineligible_view で skip」「ordinary flat receipt に届かない」) が続けて失敗し、単独・モジュール単位では通った。mimalloc の影響を切り分けるため `ui_fullscreen::page_turn::` モジュール (159 件) を同じ worktree で 5 回ずつ流した: v4.10.1 (`57e572874`) は 5 回中 2 回失敗 (4 件・2 件、cover_tests・draw_submit_tests・landscape_tests)、v4.10.1 + mimalloc 3.5.3 (`bf942bc19`) は 5 回中 1 回失敗 (1 件、input_regression_tests)。不安定さは mimalloc 更新前からあり、落ちるテストは回ごとに違う。どれもページの提示・描画の待ちに関わるテストで、全件実行に限らずモジュール単位の並列でも起きる。
 
 ### 1.446 ffmpeg-sys のビルドスクリプトが、ときどきアクセス違反 (0xc0000005) で落ちる — v4.8.1・v4.8.2 のリリース作業で観測 (2026-10-26)
 
