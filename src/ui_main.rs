@@ -360,6 +360,8 @@ pub(crate) enum AddressBarNav {
     ReadingHistoryRootExit,
     Bookmarks,
     RatingViewBack,
+    /// Return through the accepted Search owner, without a filesystem destination or IPC.
+    EverythingResults,
     BooksRoot,
     HistoryBack,
     HistoryForward,
@@ -15331,6 +15333,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     Some(
                                         AddressBarNav::HistoryBack
                                         | AddressBarNav::HistoryForward
+                                        | AddressBarNav::EverythingResults
                                         | AddressBarNav::SavedGroupReady(_),
                                     )
                                     | None => "親フォルダへ [BS]".to_string(),

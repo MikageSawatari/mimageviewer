@@ -96,10 +96,11 @@ Everythingは外側の実ファイル・実フォルダを検索し、ZIP内部e
 本openは既存通常open/enumerate/password/convert経路へ渡す。取消/失敗はaccepted位置を変更せず、
 物理表示の成功adoptionだけが `EverythingPosition::PhysicalChild` にlogical source/return anchor/routeを記録する。
 
-ParentはZIP内部なら通常zip navを使い、それ以外でeffective_folderがlogical_sourceの厳密な物理子孫なら通常の物理親へ戻る。起点からは保持したimmutable検索datasetを既存Search prepareで再投影してRootへ戻る。Resultsボタンは階層を飛ばしてRootへ直帰する。IPCを再送せず、表示中本の合成pathから物理parentを推測しない。
+ParentはZIP内部なら通常zip navを使い、それ以外でeffective_folderがlogical_sourceの厳密な物理子孫なら通常の物理親へ戻る。起点からは保持したimmutable検索datasetを既存Search prepareで再投影してRootへ戻る。Resultsボタンと直接ページ表示設定時の通常close（§1.664）は階層を飛ばしてRootへ直帰する。Backspaceはページ一覧へ戻る。IPCを再送せず、表示中本の合成pathから物理parentを推測しない。
 同contextのitems/metasとthumbnail requestsは共通adoptionに従い、同pathを読むdetached兄弟の
 PDF ticket/queue/cacheを失効しない。先行PDF ownership改修 `4510346f5` / master `c1e66f589` を前提とする。
 F12は既存open/fork/park/promoteを維持し、Everything datasetを兄弟viewerの一覧ownerにしない。
+通常closeの検索帰路は、accepted行種別・本分類・現在の論理sourceが一致する本だけに適用する。画像フォルダ本は追加設定ON時のみ。メイン全画面からF12で切り離した窓は同じmain contextのため同じ検索結果へ戻る。独立contextの別ウィンドウは対象外で、既存帰路は維持する（§1.664）。
 この変更の自動gate・独立レビュー・実機確認は未完了。[台帳](everything-search-plan.md#14-実装記録2026-10-12検証待ち)。
 
 ## PDF render失効の所有（未リリース）

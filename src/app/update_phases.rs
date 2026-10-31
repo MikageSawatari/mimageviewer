@@ -1282,6 +1282,12 @@ impl App {
                         self.rating_view_parent_nav();
                         None
                     }
+                    crate::ui_main::AddressBarNav::EverythingResults => {
+                        self.return_from_everything_child(
+                            crate::global_search_ui::EverythingReturn::Results,
+                        );
+                        None
+                    }
                     crate::ui_main::AddressBarNav::BooksRoot => {
                         self.open_books_root();
                         None
@@ -1365,6 +1371,12 @@ impl App {
                             }
                             crate::ui_main::AddressBarNav::RatingViewBack => {
                                 self.rating_view_parent_nav();
+                                None
+                            }
+                            crate::ui_main::AddressBarNav::EverythingResults => {
+                                self.return_from_everything_child(
+                                    crate::global_search_ui::EverythingReturn::Results,
+                                );
                                 None
                             }
                             crate::ui_main::AddressBarNav::BooksRoot => {
@@ -1517,6 +1529,12 @@ impl App {
                     }
                     Some(crate::ui_main::AddressBarNav::RatingViewBack) => {
                         self.rating_view_parent_nav();
+                        None
+                    }
+                    Some(crate::ui_main::AddressBarNav::EverythingResults) => {
+                        self.return_from_everything_child(
+                            crate::global_search_ui::EverythingReturn::Results,
+                        );
                         None
                     }
                     Some(crate::ui_main::AddressBarNav::BooksRoot) => {

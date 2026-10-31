@@ -32,8 +32,9 @@ use crate::indexer_manager::SearchHandle;
 mod everything;
 #[cfg(test)]
 pub(crate) use everything::tests::{
-    adopt as adopt_everything_for_test, dataset as everything_dataset_for_test,
-    start_fake_run as start_everything_for_test,
+    adopt as adopt_everything_for_test,
+    assert_return_only as assert_everything_return_only_for_test,
+    dataset as everything_dataset_for_test, start_fake_run as start_everything_for_test,
 };
 use everything::{SearchMetadataInstall, SearchMetadataResources};
 
@@ -141,8 +142,8 @@ impl PreparedSearchThumbnails {
 }
 pub(crate) use everything::SearchOpenOrigin;
 pub(crate) use everything::{
-    EverythingPosition, MetadataAppliedSpec, SearchAccepted, SearchProducer, SearchProjection,
-    SearchSource,
+    EverythingPosition, EverythingReturn, MetadataAppliedSpec, SearchAccepted, SearchProducer,
+    SearchProjection, SearchSource,
 };
 pub(crate) use everything::{EverythingSearchEntryAvailability, everything_search_menu_button};
 pub use everything::{
