@@ -17,7 +17,12 @@ fn notification_duration_publisher_preserves_surface_reveal_and_replaces_previou
     );
     let path = app.tmp.path().join("日本語の保存画像.png");
     app.show_capture_saved_toast(path.clone());
-    assert_eq!(app.fs_feedback_toast_reveal_path.as_ref(), Some(&path));
+    assert_eq!(
+        app.fs_feedback_toast_action
+            .as_ref()
+            .and_then(crate::feedback::FeedbackAction::reveal_path),
+        Some(&path)
+    );
     assert_eq!(
         app.fs_feedback_toast.as_ref().unwrap().0,
         "保存しました: 日本語の保存画像.png"
@@ -25,7 +30,7 @@ fn notification_duration_publisher_preserves_surface_reveal_and_replaces_previou
     app.settings.notification_duration = NotificationDuration::Long;
     app.show_feedback_warning_with_duration("重要な案内".into(), 5.0);
     assert_eq!(app.fs_feedback_toast.as_ref().unwrap().2, 7.5);
-    assert!(app.fs_feedback_toast_reveal_path.is_none());
+    assert!(app.fs_feedback_toast_action.is_none());
 }
 
 #[cfg(windows)]
@@ -211,7 +216,9 @@ fn notification_duration_capture_and_debug_completion_preserve_surface_baselines
             }
             assert_eq!(app.fs_feedback_toast.as_ref().unwrap().2, 1.2 * factor);
             assert_eq!(
-                app.fs_feedback_toast_reveal_path.as_ref(),
+                app.fs_feedback_toast_action
+                    .as_ref()
+                    .and_then(crate::feedback::FeedbackAction::reveal_path),
                 Some(if debug { &manifest } else { &capture })
             );
             let toasts = probe.drain_toast_timings();

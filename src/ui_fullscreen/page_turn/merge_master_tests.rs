@@ -961,7 +961,7 @@ fn page_turn_merge_master_slideshow_barrier_commits_grid_and_deadline_once() {
         let mut app = ready_app(&ctx, SpreadMode::Single);
         seed_leaf(&ctx, &mut app);
         app.move_grid_cursor(Some(1), crate::app::GridCursorIntent::Automatic);
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_reveal_requested(false);
         app.slideshow_playing = true;
         app.settings.slideshow_interval_secs = 3.0;
         app.slideshow_anchor_idx = None;
@@ -978,7 +978,7 @@ fn page_turn_merge_master_slideshow_barrier_commits_grid_and_deadline_once() {
                 Some(purpose)
             );
             assert_eq!(app.selected, Some(1));
-            assert!(!app.scroll_to_selected);
+            assert!(!app.grid_scroll.reveal_requested());
             assert_eq!(app.slideshow_next_at, expired);
         });
         adopt_interrupted_target(&ctx, &mut app);
@@ -995,7 +995,7 @@ fn page_turn_merge_master_slideshow_barrier_commits_grid_and_deadline_once() {
                 .and_then(|anchor| anchor.index_for_generation(app.items_generation)),
             Some(2)
         );
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
         assert_eq!(app.slideshow_anchor_idx, Some(2));
         assert!(app.slideshow_next_at >= before + Duration::from_secs(3));
         assert!(app.slideshow_next_at <= after + Duration::from_secs(3));

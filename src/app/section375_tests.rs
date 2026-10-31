@@ -116,7 +116,7 @@ fn section1375_worker_equal_preserves_cursor_checks_scroll_and_late_thumbnail() 
     app.rx = rx;
     app.selected = Some(2);
     app.checked = [1, 3].into_iter().collect();
-    app.scroll_offset_y = 237.0;
+    app.grid_scroll.set_position(237.0);
     app.thumbnails[2] = ThumbnailState::Pending;
     app.keep_set.insert(2);
     app.keep_range = (0, 4);
@@ -135,7 +135,7 @@ fn section1375_worker_equal_preserves_cursor_checks_scroll_and_late_thumbnail() 
     );
     assert_eq!(app.selected, Some(2));
     assert_eq!(app.checked, [1, 3].into_iter().collect());
-    assert_eq!(app.scroll_offset_y, 237.0);
+    assert_eq!(app.grid_scroll.offset(), 237.0);
     assert!(
         app.requested.contains_key(&2),
         "Equal must retain the request owner"
@@ -161,7 +161,7 @@ fn section1375_worker_equal_preserves_cursor_checks_scroll_and_late_thumbnail() 
     assert!(matches!(app.thumbnails[2], ThumbnailState::Loaded { .. }));
     assert!(!app.requested.contains_key(&2));
     assert_eq!(app.selected, Some(2));
-    assert_eq!(app.scroll_offset_y, 237.0);
+    assert_eq!(app.grid_scroll.offset(), 237.0);
 }
 
 #[test]
@@ -221,7 +221,7 @@ fn section1375_actual_delete_no_notify_equal_preserves_rows_and_rating_zeros() {
     assert_eq!(app.get_rating(2), 0);
     app.rebuild_visible_indices();
     for offset in [0.0, 100.0, 400.0] {
-        app.scroll_offset_y = offset;
+        app.grid_scroll.set_position(offset);
         ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(

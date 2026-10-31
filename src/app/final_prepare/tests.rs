@@ -550,6 +550,7 @@ fn d3_2_worker_pixels_match_actual_synchronous_final_and_display_takeover_never_
             app.final_ai_cache.insert(
                 key,
                 FinalAiEntry {
+                    diagnostic_metadata: None,
                     canonical_dims: None,
                     source_size: [80, 120],
                     pixels: Arc::new(egui::ColorImage::filled(
@@ -647,6 +648,7 @@ fn d3_2_cpu_only_inputs_skip_missing_edit_materialization_and_reuse_completed_ai
     app.final_ai_cache.insert(
         ai_key,
         FinalAiEntry {
+            diagnostic_metadata: None,
             canonical_dims: None,
             source_size: [80, 120],
             pixels: pixels.clone(),

@@ -355,6 +355,7 @@ fn d3_4_legacy_computing_display_promotes_original_receiver_without_blocking() {
         app.final_effect_pending.insert(
             key,
             FinalEffectPending {
+                diagnostic: None,
                 pdf_metadata: None,
                 canonical_dims: None,
                 source_size: [80, 120],
@@ -418,6 +419,7 @@ fn d3_4_incomplete_legacy_display_keeps_the_ordinary_quality_producer_path() {
                 app.final_effect_pending.insert(
                     key,
                     FinalEffectPending {
+                        diagnostic: None,
                         pdf_metadata: None,
                         canonical_dims: None,
                         source_size: [80, 120],

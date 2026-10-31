@@ -1146,7 +1146,7 @@ const TABLE: &[VersionHighlights] = &[
         highlights: &[
             HighlightItem {
                 title: "O キーで本のページを一覧表示",
-                body: "閲覧中に O を押すと、本のページを並べて表示し、選んだページへ移れます。上部の「…」→「ページ一覧」からも開けます。Esc か O で元のページに戻ります。",
+                body: "閲覧中に O を押すと、本のページを並べて表示し、選んだページへ移れます。上部の「…」→「ページ一覧の表示切替」からも開けます。Esc か O で元のページに戻ります。",
             },
             HighlightItem {
                 title: "一覧の並び順で前後の本へ (Ctrl+Shift+↑↓)",

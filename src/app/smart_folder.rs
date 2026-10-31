@@ -270,7 +270,7 @@ struct SmartFolderPreparedGridLayout {
     /// The offset and the auto-aspect state that determined its row height are one snapshot.
     /// `AutoAspectState::samples` is also index-keyed, so moving only the resolved aspect would
     /// leave the restored grid with another context's decision inputs.
-    scroll_offset_y: f32,
+    grid_scroll: super::GridScrollState,
     auto_aspect: crate::auto_aspect::AutoAspectState,
     /// This is comparison-only: changed user settings are never restored. A mismatch asks the
     /// ordinary folder-navigation scroll owner to keep `selected` visible in the new layout.
@@ -304,8 +304,6 @@ pub(crate) struct SmartFolderPreparedGrid {
     selected: Option<usize>,
     grid_click_selection_anchor_index: Option<usize>,
     layout: SmartFolderPreparedGridLayout,
-    scroll_to_selected: bool,
-    pending_grid_scroll: Option<super::GridScrollIntent>,
     checked: HashSet<usize>,
     visible_indices: Vec<usize>,
     details_order: Vec<usize>,
@@ -980,10 +978,14 @@ pub(crate) enum StagedSmartHistoryAction {
 }
 
 enum SmartTransitionIntent {
-    Direct,
+    Direct {
+        origin: Option<Box<super::top_level_grid_view::TopLevelGridOrigin>>,
+    },
     Refresh,
     History,
-    Return { anchor: Option<PathBuf> },
+    Return {
+        anchor: Option<PathBuf>,
+    },
     FolderNav(SmartFolderNavContinuation),
 }
 
@@ -2210,7 +2212,7 @@ impl App {
         intent: &SmartTransitionIntent,
     ) -> Option<super::MainListNavigation> {
         let history = match intent {
-            SmartTransitionIntent::Direct | SmartTransitionIntent::FolderNav(_) => {
+            SmartTransitionIntent::Direct { .. } | SmartTransitionIntent::FolderNav(_) => {
                 super::MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation)
             }
             SmartTransitionIntent::Refresh => super::MainHistoryOperation::SameLocation,
@@ -2225,7 +2227,7 @@ impl App {
         );
         // Opening another Smart definition exits Search, rather than drilling within its
         // transparent overlay. Keep the original explicit Direct operation until adoption.
-        if matches!(intent, SmartTransitionIntent::Direct) {
+        if matches!(intent, SmartTransitionIntent::Direct { .. }) {
             navigation.history = history;
         }
         Some(navigation)
@@ -2612,7 +2614,7 @@ impl App {
                     super::MainListSourceProof::Surface(source_lease),
                 )
             }),
-            intent: SmartTransitionIntent::Direct,
+            intent: SmartTransitionIntent::Direct { origin: None },
             target: SmartFolderTransitionTarget::Child {
                 state,
                 source,
@@ -3138,7 +3140,8 @@ impl App {
         let restore_reading_history = self
             .reading_history_return_from
             .as_ref()
-            .is_some_and(|from| crate::folder_tree::path_eq(from, source_path));
+            .filter(|from| crate::folder_tree::path_eq(&from.container, source_path))
+            .cloned();
         let restore_bookmark_view = self
             .bookmark_view_state
             .as_ref()
@@ -3185,22 +3188,26 @@ impl App {
             super::FolderHistoryDirection::Forward => self.folder_history_forward_entry(),
         }
         .cloned();
-        let target = super::FolderNavHistoryTarget::SmartFolder(state.clone());
+        let target = super::FolderNavHistoryTarget::SmartFolder(
+            self.smart_folder_restore_snapshot(state.clone()),
+        );
         let Some(candidate) =
             candidate.filter(|candidate| Self::folder_nav_targets_eq(&candidate.location, &target))
         else {
             return false;
         };
-        let Some(plan) = super::FolderHistoryPlan::capture(self, direction, candidate) else {
+        let Some(plan) = super::FolderHistoryPlan::capture(self, direction, candidate.clone())
+        else {
             return false;
         };
         let Some(lease) = self.smart_folder_source_lease() else {
             return false;
         };
-        let navigation = self.capture_main_list_navigation(
+        let mut navigation = self.capture_main_list_navigation(
             super::MainHistoryOperation::Replay(Box::new(plan)),
             super::MainListSourceProof::Surface(lease),
         );
+        navigation.destination = super::MainListRestoreDestination::Entry(candidate);
         self.begin_smart_history_navigation_request(state, navigation)
     }
 
@@ -3257,9 +3264,11 @@ impl App {
             return Some(StagedSmartHistoryAction::Handled);
         }
         navigation.history = super::MainHistoryOperation::Replay(next);
+        navigation.destination = super::MainListRestoreDestination::Entry(target.clone());
         match &target.location {
             super::FolderNavHistoryTarget::SmartFolder(state) => {
-                let _ = self.begin_smart_history_navigation_request(state.clone(), navigation);
+                let _ =
+                    self.begin_smart_history_navigation_request(state.state.clone(), navigation);
                 Some(StagedSmartHistoryAction::Handled)
             }
             _ => Some(StagedSmartHistoryAction::Dispatch { target, navigation }),
@@ -3269,12 +3278,30 @@ impl App {
     /// Search remains the visible owner until the saved Smart destination is adopted.
     pub(crate) fn begin_smart_search_return_navigation(
         &mut self,
-        state: super::top_level_grid_view::SmartFolderViewState,
+        restore: super::top_level_grid_view::SmartFolderRestore,
     ) -> bool {
+        let route = self
+            .top_level_grid_view
+            .return_origin()
+            .map(|origin| origin.route.clone())
+            .unwrap_or_else(|| self.facet_navigation.route().clone());
+        let Some(mut navigation) =
+            self.capture_smart_list_navigation(&SmartTransitionIntent::Return { anchor: None })
+        else {
+            return false;
+        };
+        navigation.destination = super::MainListRestoreDestination::Origin(Box::new(
+            super::top_level_grid_view::TopLevelGridOrigin {
+                restore: super::top_level_grid_view::TopLevelGridRestore::SmartFolder(
+                    restore.clone(),
+                ),
+                route,
+            },
+        ));
         self.begin_staged_smart_target_navigation(
-            state,
+            restore.state,
             SmartTransitionIntent::Return { anchor: None },
-            None,
+            Some(navigation),
         )
     }
 
@@ -3443,23 +3470,11 @@ impl App {
         navigation: &super::MainListNavigation,
         state: super::top_level_grid_view::SmartFolderViewState,
     ) -> super::FolderNavHistoryEntry {
-        let location = super::FolderNavHistoryTarget::SmartFolder(state);
-        if let super::MainHistoryOperation::Replay(plan) = &navigation.history
-            && let Some(entry) = &plan.virtual_current
-        {
-            return super::FolderNavHistoryEntry::new(location, entry.route.clone());
-        }
-        if let super::MainHistoryOperation::Restore { route: Some(route) } = &navigation.history {
-            return super::FolderNavHistoryEntry::new(location, route.clone());
-        }
-        if matches!(
-            navigation.history,
-            super::MainHistoryOperation::SameLocation
-        ) && let Some(entry) = &navigation.source_location
-        {
-            return super::FolderNavHistoryEntry::new(location, entry.route.clone());
-        }
-        self.main_list_destination_entry(location, navigation.source_location.as_ref(), None)
+        self.main_list_requested_destination(
+            navigation,
+            super::FolderNavHistoryTarget::SmartFolder(self.smart_folder_restore_snapshot(state)),
+            None,
+        )
     }
 
     fn adopt_smart_transition_root(
@@ -3468,6 +3483,7 @@ impl App {
         prepared: PreparedSmartFolder,
         record_history: bool,
         anchor: Option<PathBuf>,
+        prior_origin: Option<super::top_level_grid_view::TopLevelGridOrigin>,
         navigation: super::MainListNavigation,
     ) -> bool {
         let definition_id = prepared.snapshot.definition.id;
@@ -3482,7 +3498,13 @@ impl App {
             return false;
         };
         self.adopt_main_list_navigation(adoption, |app| {
-            app.install_adopted_smart_transition_root(request_id, prepared, record_history, anchor);
+            app.install_adopted_smart_transition_root(
+                request_id,
+                prepared,
+                record_history,
+                anchor,
+                prior_origin,
+            );
             None
         })
     }
@@ -3493,6 +3515,7 @@ impl App {
         prepared: PreparedSmartFolder,
         record_history: bool,
         anchor: Option<PathBuf>,
+        prior_origin: Option<super::top_level_grid_view::TopLevelGridOrigin>,
     ) {
         let definition_id = prepared.snapshot.definition.id;
         // All fallible work is complete. This is the first point at which the prior viewer may
@@ -3501,7 +3524,11 @@ impl App {
         if self.smart_folder_local_search_reapply.is_some() && self.show_search_bar {
             self.smart_folder_local_search_reapply = Some(self.search_query.clone());
         }
-        let prior = self.close_transient_views_before_smart_folder();
+        let departed = self.close_transient_views_before_smart_folder();
+        let prior = prior_origin
+            .as_ref()
+            .map(|origin| origin.restore.clone())
+            .unwrap_or(departed);
         if self.smart_folder_pending.is_some()
             || self.smart_folder_prepare_pending.is_some()
             || self.smart_folder_confirm_pending.is_some()
@@ -3527,6 +3554,7 @@ impl App {
             ),
             Some(prior),
         );
+        self.top_level_grid_view.replace_return_origin(prior_origin);
         self.install_current_prepared_smart_folder(prepared);
         if let Some(session) = self.top_level_grid_view.smart_folder_session_mut() {
             session.adopted_request_id = Some(request_id);
@@ -3580,6 +3608,7 @@ impl App {
         let definition_id = target.definition_id;
         match root {
             SmartFolderTransitionRoot::Offscreen(prepared) => {
+                let prior_origin = self.capture_top_level_origin();
                 let prior = self.close_transient_views_before_smart_folder();
                 if self.smart_folder_pending.is_some()
                     || self.smart_folder_prepare_pending.is_some()
@@ -3594,6 +3623,7 @@ impl App {
                     super::top_level_grid_view::TopLevelGridSurface::SmartFolder(target),
                     Some(prior),
                 );
+                self.top_level_grid_view.replace_return_origin(prior_origin);
                 self.top_level_grid_view
                     .install_smart_folder_session(SmartFolderSession {
                         definition_id,
@@ -4702,7 +4732,7 @@ impl App {
                                     if history_ready {
                                         let record_history = matches!(
                                             transition.intent,
-                                            SmartTransitionIntent::Direct
+                                            SmartTransitionIntent::Direct { .. }
                                         );
                                         if self.adopt_smart_transition_root(
                                             transition.request_id,
@@ -4713,6 +4743,15 @@ impl App {
                                                     anchor.clone()
                                                 }
                                                 _ => None,
+                                            },
+                                            match &transition.intent {
+                                                SmartTransitionIntent::Direct { origin } => {
+                                                    origin.as_deref().cloned()
+                                                }
+                                                _ => self
+                                                    .top_level_grid_view
+                                                    .return_origin()
+                                                    .cloned(),
                                             },
                                             transition.navigation.clone(),
                                         ) {
@@ -7704,6 +7743,11 @@ impl App {
                     )
             })
             .map(|transition| {
+                if let super::MainListRestoreDestination::Origin(origin) =
+                    &transition.navigation.destination
+                {
+                    return (**origin).clone();
+                }
                 let state = match &transition.target {
                     SmartFolderTransitionTarget::Root(state)
                     | SmartFolderTransitionTarget::Child { state, .. } => state.clone(),
@@ -7713,7 +7757,9 @@ impl App {
                     _ => self.facet_navigation.route().clone(),
                 };
                 super::top_level_grid_view::TopLevelGridOrigin {
-                    restore: super::top_level_grid_view::TopLevelGridRestore::SmartFolder(state),
+                    restore: super::top_level_grid_view::TopLevelGridRestore::SmartFolder(
+                        self.smart_folder_restore_snapshot(state),
+                    ),
                     route,
                 }
             });
@@ -7812,7 +7858,9 @@ impl App {
         self.open_smart_folder_staged_with_intent(
             definition_id,
             refresh,
-            SmartTransitionIntent::Direct,
+            SmartTransitionIntent::Direct {
+                origin: self.capture_top_level_origin().map(Box::new),
+            },
         )
     }
 
@@ -7830,7 +7878,7 @@ impl App {
         refresh: bool,
         intent: SmartTransitionIntent,
     ) -> Option<u64> {
-        if matches!(&intent, SmartTransitionIntent::Direct)
+        if matches!(&intent, SmartTransitionIntent::Direct { .. })
             && self.document_open_modal_admission_blocked()
         {
             return None;
@@ -8139,8 +8187,13 @@ impl App {
                 && self.current_smart_folder_id == Some(state.definition_id)
             {
                 self.top_level_grid_view.replace_surface(
-                    super::top_level_grid_view::TopLevelGridSurface::SmartFolder(state.clone()),
+                    super::top_level_grid_view::TopLevelGridSurface::SmartFolder(
+                        state.state.clone(),
+                    ),
                 );
+                self.smart_folder_saved_folder = state.saved_folder.clone();
+                self.top_level_grid_view
+                    .replace_return_origin(state.return_to.as_deref().cloned());
                 return;
             }
 
@@ -8351,13 +8404,11 @@ impl App {
             selected: self.selected.take(),
             grid_click_selection_anchor_index: anchor_index,
             layout: SmartFolderPreparedGridLayout {
-                scroll_offset_y: std::mem::take(&mut self.scroll_offset_y),
+                grid_scroll: std::mem::take(&mut self.grid_scroll),
                 auto_aspect: std::mem::take(&mut self.auto_aspect),
                 mode: SmartFolderPreparedGridMode::current(&self.settings),
                 window_inner_size: self.last_inner_size,
             },
-            scroll_to_selected: std::mem::take(&mut self.scroll_to_selected),
-            pending_grid_scroll: self.pending_grid_scroll.take(),
             checked: std::mem::take(&mut self.checked),
             visible_indices: std::mem::take(&mut self.visible_indices),
             details_order: std::mem::take(&mut self.details_order),
@@ -8447,7 +8498,12 @@ impl App {
     ) {
         self.smart_folder_open_origin = Some(SmartFolderOpenOrigin::ReturnReprepare {
             prior: super::top_level_grid_view::TopLevelGridRestore::SmartFolder(
-                super::top_level_grid_view::SmartFolderViewState::root(definition_id, Vec::new()),
+                self.smart_folder_restore_snapshot(
+                    super::top_level_grid_view::SmartFolderViewState::root(
+                        definition_id,
+                        Vec::new(),
+                    ),
+                ),
             ),
             anchor: returned_root_entry.map(Path::to_path_buf),
         });
@@ -8498,8 +8554,6 @@ impl App {
             selected,
             grid_click_selection_anchor_index,
             layout,
-            scroll_to_selected,
-            pending_grid_scroll,
             checked,
             visible_indices,
             details_order,
@@ -8523,7 +8577,7 @@ impl App {
         } = grid;
         let layout_changed = !layout.matches_current_layout(self);
         let SmartFolderPreparedGridLayout {
-            scroll_offset_y,
+            grid_scroll,
             mut auto_aspect,
             ..
         } = layout;
@@ -8551,9 +8605,11 @@ impl App {
         self.selected = selected;
         self.grid_click_selection_anchor = grid_click_selection_anchor_index
             .map(|index| super::GridClickSelectionAnchor::new(index, self.items_generation));
-        self.scroll_offset_y = scroll_offset_y;
-        self.scroll_to_selected = scroll_to_selected || layout_changed;
-        self.pending_grid_scroll = pending_grid_scroll;
+        self.grid_scroll = grid_scroll;
+        self.grid_scroll.renew_session();
+        if layout_changed {
+            self.grid_scroll.set_reveal_requested(true);
+        }
         self.checked = checked;
         self.visible_indices = visible_indices;
         self.details_order = details_order;
@@ -8636,7 +8692,7 @@ impl App {
             .map(|definition| definition.name.as_str())
             .unwrap_or("?");
         self.address = format!("スマートフォルダ: {definition_name}");
-        self.last_scroll_offset_y_tracked = self.scroll_offset_y;
+        self.last_scroll_offset_y_tracked = self.grid_scroll.offset();
         if let Some(returned_root_entry) = returned_root_entry {
             let returned_index = self.items.iter().position(|item| {
                 item.drag_source_path()
@@ -8798,8 +8854,9 @@ impl App {
         self.capture_main_list_restore_cursor();
         // BS/parent is Direct independently of resident/prepared cache availability.
         // Search exits and replay callers supply their already-captured operation.
-        let navigation = navigation
-            .or_else(|| self.capture_smart_list_navigation(&SmartTransitionIntent::Direct));
+        let navigation = navigation.or_else(|| {
+            self.capture_smart_list_navigation(&SmartTransitionIntent::Direct { origin: None })
+        });
         let Some(navigation) = navigation else {
             return false;
         };
@@ -9287,7 +9344,9 @@ impl App {
             applied_tombstones,
         };
         let intent = match self.smart_folder_open_origin.as_ref() {
-            Some(SmartFolderOpenOrigin::Direct(_)) => SmartTransitionIntent::Direct,
+            Some(SmartFolderOpenOrigin::Direct(_)) => {
+                SmartTransitionIntent::Direct { origin: None }
+            }
             Some(SmartFolderOpenOrigin::ReturnReprepare { .. }) => {
                 SmartTransitionIntent::Return { anchor: None }
             }
@@ -9319,6 +9378,8 @@ impl App {
     /// Freshness was checked by the prepare owner before adoption. No worker or
     /// other UI event can interleave this install with that admission boundary.
     fn install_current_prepared_smart_folder(&mut self, prepared: PreparedSmartFolder) {
+        self.save_departing_session_grid_positions();
+        self.retire_rating_navigation_owner();
         let install_started = Instant::now();
         let PreparedSmartFolder {
             mut snapshot,
@@ -9421,7 +9482,7 @@ impl App {
         self.address = format!("スマートフォルダ: {definition_name}");
         if let Some(&index) = self.visible_indices.first() {
             self.move_grid_cursor(Some(index), crate::app::GridCursorIntent::Automatic);
-            self.scroll_to_selected = true;
+            self.grid_scroll.set_reveal_requested(true);
         }
         if let Some(SmartFolderOpenOrigin::ReturnReprepare {
             anchor: Some(path), ..
@@ -10259,7 +10320,7 @@ mod tests {
                 ),
                 super::MainListSourceProof::Surface(lease),
             ),
-            intent: SmartTransitionIntent::Direct,
+            intent: SmartTransitionIntent::Direct { origin: None },
             target: SmartFolderTransitionTarget::Child {
                 state: super::super::top_level_grid_view::SmartFolderViewState::root(
                     uuid::Uuid::new_v4(),
@@ -11899,6 +11960,46 @@ mod tests {
                 None,
                 app.settings.file_type_visibility.clone(),
             ),
+        );
+    }
+
+    #[test]
+    fn grid_scroll_smart_root_park_restore_keeps_own_row_anchor_and_request() {
+        let mut app = crate::app::setup_app_for_test();
+        let definition_id = install_smart_identity_test_root(&mut app, Default::default());
+        app.selected = Some(1);
+        app.grid_scroll.set_position(125.0);
+        app.grid_scroll.set_row_anchor(Some(2));
+        app.grid_scroll.set_reveal_requested(true);
+        app.grid_scroll
+            .request_edge(super::super::GridScrollIntent::Bottom);
+        let root_scroll = app.grid_scroll.clone();
+        let grid = app.take_visible_smart_folder_grid();
+        assert_eq!(grid.layout.grid_scroll, root_scroll);
+        assert_eq!(app.grid_scroll.offset(), 0.0);
+        assert_eq!(app.grid_scroll.row_anchor(), None);
+        assert!(!app.grid_scroll.reveal_requested());
+        assert_eq!(app.grid_scroll.pending_edge(), None);
+        park_smart_identity_test_root(&mut app, grid);
+        app.grid_scroll.set_position(77.0);
+        app.grid_scroll.set_row_anchor(Some(5));
+        app.grid_scroll
+            .request_edge(super::super::GridScrollIntent::Top);
+        assert!(!app.grid_scroll.take_reveal());
+        assert_eq!(
+            app.grid_scroll.take_layout_request().edge(),
+            Some(super::super::GridScrollIntent::Top)
+        );
+        assert_eq!(app.grid_scroll.row_anchor(), Some(5));
+        assert!(app.restore_prepared_smart_folder_session(definition_id, None));
+        assert_ne!(app.grid_scroll.session(), root_scroll.session());
+        assert_eq!(app.grid_scroll.offset(), root_scroll.offset());
+        assert_eq!(app.grid_scroll.geometry(), root_scroll.geometry());
+        assert_eq!(app.grid_scroll.row_anchor(), Some(2));
+        assert!(app.grid_scroll.reveal_requested());
+        assert_eq!(
+            app.grid_scroll.pending_edge(),
+            Some(super::super::GridScrollIntent::Bottom)
         );
     }
 

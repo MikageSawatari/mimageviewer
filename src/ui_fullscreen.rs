@@ -3452,6 +3452,7 @@ pub(crate) fn install_fs_navigator_input_tracking(ctx: &egui::Context) {
     if already_installed {
         return;
     }
+    crate::touch_correlation::install_main_grid_touch_transport_observer(ctx);
     ctx.on_begin_pass(
         "miv_fs_navigator_input_tracking",
         Arc::new(|ui| FsNavigatorFrameInput::record_current_pass(ui.ctx())),
@@ -25435,7 +25436,7 @@ impl App {
         self.begin_normal_book_reading();
         self.fullscreen_idx = Some(target_idx);
         self.move_grid_cursor(Some(target_idx), crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
         self.fs_vertical_scroll = 0.0;
         self.update_last_selected_image();
         self.record_book_resume(target_idx);
@@ -39490,7 +39491,7 @@ impl App {
                         tap_zones: touch_tap_zones,
                     },
                 },
-                self.frame_counter,
+                ctx.cumulative_frame_nr(),
                 false,
             );
             let _ =
@@ -39629,7 +39630,7 @@ impl App {
                             tap_zones: touch_tap_zones,
                         },
                     },
-                    self.frame_counter,
+                    ctx.cumulative_frame_nr(),
                     true,
                 );
                 let _ = self.fs_primary_suppression.apply(
@@ -39950,7 +39951,7 @@ impl App {
                             tap_zones: touch_tap_zones,
                         },
                     },
-                    self.frame_counter,
+                    ctx.cumulative_frame_nr(),
                     false,
                 );
                 let _ = self.fs_primary_suppression.apply(
@@ -40158,7 +40159,7 @@ impl App {
                     tap_zones: touch_tap_zones_enabled,
                 },
             },
-            self.frame_counter,
+            ctx.cumulative_frame_nr(),
             touch_input_enabled,
         );
         let touch_activity = touch_frame.has_touch_derived_pointer_activity();
@@ -41647,7 +41648,7 @@ impl App {
             return;
         }
         self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
         self.update_last_selected_image();
         if matches!(
             continuation,
@@ -42346,7 +42347,7 @@ impl App {
             }
         }
         self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = true;
+        self.grid_scroll.set_reveal_requested(true);
         self.slideshow_anchor_idx = None;
         // The accepted curl still owns presentation; arm the interval only after
         // its canonical flat is adopted, using the existing frame anchor owner.
@@ -53385,7 +53386,7 @@ impl App {
         let elapsed = start_time.elapsed().as_secs_f32();
         if elapsed > duration {
             self.fs_feedback_toast = None;
-            self.fs_feedback_toast_reveal_path = None;
+            self.fs_feedback_toast_action = None;
             self.fs_feedback_toast_surface = None;
             return;
         }
@@ -53400,6 +53401,9 @@ impl App {
         if let Some(surface) = self.fs_feedback_toast_surface
             && surface != drawing_surface
         {
+            return;
+        }
+        if !self.feedback_action_matches_mounted_context() {
             return;
         }
 
@@ -53456,19 +53460,12 @@ impl App {
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 255.0) as u8),
         );
 
-        if let Some(path) = self.fs_feedback_toast_reveal_path.clone() {
-            let resp = toast_ui
-                .interact(
-                    toast_rect,
-                    egui::Id::unique("feedback_toast_reveal_capture"),
-                    egui::Sense::click(),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .hover_tip_dark("クリックで保存ファイルを表示");
+        if let Some(action) = self.fs_feedback_toast_action.clone() {
+            let resp = action.response(&toast_ui, toast_rect);
             if resp.clicked() {
-                crate::capture::reveal_path_async(path);
+                action.activate(ctx);
                 self.fs_feedback_toast = None;
-                self.fs_feedback_toast_reveal_path = None;
+                self.fs_feedback_toast_action = None;
                 self.fs_feedback_toast_surface = None;
             }
         }
@@ -65442,7 +65439,7 @@ mod tests {
                                 0,
                                 FsOverflowPanelRow {
                                     item: FullscreenOverflowItemId::PageOverview,
-                                    label: "本のページ一覧 [O]".into(),
+                                    label: "ページ一覧の表示切替 [O]".into(),
                                     status: String::new(),
                                     enabled: true,
                                     disabled_reason: None,
@@ -91702,6 +91699,7 @@ mod specified_scale_consumer_tests {
         app.final_ai_pending.insert(
             key,
             FinalAiPending {
+                feedback_request: crate::app::FinalAiFeedbackRequest::default(),
                 job_id: 77,
                 cancel: Arc::new(AtomicBool::new(false)),
                 retained_key: None,
@@ -91711,6 +91709,7 @@ mod specified_scale_consumer_tests {
             },
         );
         app.final_ai_result_backlog.push(FinalAiResult::Ready {
+            diagnostic: None,
             canonical_dims: None,
             job_id: 77,
             key,

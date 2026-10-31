@@ -221,6 +221,7 @@ const ALLOWLIST_ENTRIES: &[AllowlistEntry] = &[
 const PUBLIC_API_ALLOWLIST: &[&str] = &[
     // 1.340 R5: immutable overview metadata/cursor projection only; no mount or mutation.
     // Accepted owner-scoped design and independent non-PDF implementation review (2026-10-12).
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn grid_scroll (self) -> & 'a super :: GridScrollState",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn page_overview_view (self ,) -> Option < crate :: page_overview :: PageOverviewView >",
     // egui 0.37 stage 1b (9481bc344): state-only mounts use the existing table,
     // restore the original owner even on unwind, and leave publication in the UI

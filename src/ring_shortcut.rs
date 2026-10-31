@@ -1383,7 +1383,7 @@ impl RingActionId {
             Self::SiblingFolderPrev => "兄弟フォルダ 前",
             Self::SiblingFolderNext => "兄弟フォルダ 次",
             Self::ImageHome => "先頭へ (Home)",
-            Self::ImagePageOverview => "本のページ一覧",
+            Self::ImagePageOverview => crate::keymap::KeyAction::FsPageOverviewToggle.description(),
             Self::ImageEnd => "末尾へ (End)",
             Self::ImageSpreadShiftLeft => "見開き 1Pずらし 左",
             Self::ImageSpreadShiftRight => "見開き 1Pずらし 右",
@@ -1749,6 +1749,11 @@ mod page_overview_tests {
     #[test]
     fn overview_ring_catalog_round_trips_and_is_image_only() {
         let action = RingActionId::ImagePageOverview;
+        assert_eq!(action.as_str(), "image_page_overview");
+        assert_eq!(
+            serde_json::from_str::<RingActionId>(r#""image_page_overview""#).unwrap(),
+            action
+        );
         assert_eq!(
             RingActionId::from_str(action.as_str()),
             Some(action.clone())
@@ -1768,6 +1773,26 @@ mod page_overview_tests {
             assert!(!action.is_valid_for_context(context));
             assert!(!RingActionId::available_for_context(context).contains(&action));
         }
+    }
+
+    #[test]
+    fn overview_toggle_saved_assignments_keep_their_ids_after_label_change() {
+        let mut settings: super::RingShortcutSettings = serde_json::from_str(r#"{
+            "image": {"slots": ["image_page_overview", "none", "none", "none", "none", "none", "none", "none"]},
+            "mouse_buttons_image": {"back": "image_page_overview", "forward": "none", "middle": "image_page_overview"},
+            "mouse_gestures_image": {"bindings": [{"pattern": ["right"], "action": "image_page_overview"}]}
+        }"#).unwrap();
+        settings.sanitize();
+        let action = RingActionId::ImagePageOverview;
+        assert_eq!(settings.image.slots[0], action);
+        assert_eq!(settings.mouse_buttons_image.back, action);
+        assert_eq!(settings.mouse_buttons_image.middle, action);
+        assert_eq!(settings.mouse_gestures_image.bindings[0].action, action);
+        let saved = serde_json::to_string(&settings).unwrap();
+        let restored: super::RingShortcutSettings = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored, settings);
+        assert!(saved.contains("image_page_overview"));
+        assert!(!saved.contains("ページ一覧"));
     }
 
     #[test]

@@ -46,13 +46,39 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - §1.456 一覧の名前の文字サイズ・最大行数 (>>629): 出荷の案内は未。
 - §1.480 画像フォルダを Enter で開くと自動表示が ON でもページ一覧で止まる (>>649 の調査中に開発側で発見、v4.2.0 から): >>649 の評価フィルタの件は開発側で再現しなかった。報告者へは未返信。
 
-### 1.662 ページ一覧の開閉操作の名称を、キー・リング・ジェスチャで揃える — 5ch >>650 (2026-10-29)
+### 1.666 v4.10.0でも突然終了する・読み取りアクセス違反の報告 — 5ch >>655・657・672 (2026-10-31)
 
-- 状態: **未着手・次版候補として採用 (利用者方針、2026-10-29)**。[>>650](https://egg.5ch.io/test/read.cgi/software/1782419551/650) で、画像ビューア内の「ページ一覧」の ON / OFF をリング・ジェスチャへ割り当てたいと要望。機能追加ではなく、既存機能を見つけやすくする表記の修正として扱う。
-- 現状 (v4.9.0 のタグと現在のコードを確認、実画面試験なし): O キーの `FsPageOverviewToggle` の説明は「ページ一覧の表示を切り替える」。操作カスタマイズのコマンド一覧は `compact_key_action_label` / `compact_operation_label` により「ページ一覧の表示」へ短縮する。一方、リング・ジェスチャ候補の `ImagePageOverview` は「本のページ一覧」であり、同じ開閉操作だと分かりにくい。割り当て候補と O キー共通の実行経路は既に存在し、一覧表示中の同操作は取消・元ページへの復帰になる。
-- 方針: 共通の短い操作名を **「ページ一覧の表示切替」** とし、コマンド一覧・割り当て編集・リング / ジェスチャ / マウスボタン / パッドの候補・案内で揃える。詳細説明には「O キーと同じ操作。もう一度実行すると一覧を閉じる」と分かる内容を残す。別の操作である「本をページ一覧で開く」「フルスクリーンを閉じて一覧へ戻る」とは区別する。
-- 互換性と検証: `FsPageOverviewToggle` / `image_page_overview` の保存 ID、既定 O、利用可能な文脈・受付条件・開閉処理は変更しない。短縮処理で「表示切替」が消えず、同じ操作を検索・選択できること、既存の割り当てが読み戻せること、通常 / 別ウィンドウの開閉を既存テストと必要な UI snapshot で確認する。他の操作や入力共通化まで範囲を広げない。
-- 対象: `src/keymap.rs`、`src/ring_shortcut.rs`、`src/ui_dialogs/preferences/pages.rs`、関連マニュアル。[キー仕様](keymap-spec.md)、[操作カスタマイズ計画](key-customization-impl-plan.md)、[ページ一覧計画](detached-book-page-overview-plan.md)。対外回答は文案作成段階で、投稿済みとは扱わない。規模 / 優先度: Small / P3。
+- 状態: **原因調査候補・詳細調査は開発用セッションへ引き継ぐ**。[>>672](https://egg.5ch.io/test/read.cgi/software/1782419551/672) は名前欄「655」で「最新版でも突然死がおきました」と報告し、v4.10.0のnative例外ログ1行を提供した。このセッションでは原文・既存調査・ログ出力実装の軽い確認のみ行い、配布exeの解析・再現試験・修正は行っていない。
+- 経緯: >>655は約30画像のZIPでAI「高速汎用」の完了前にホイールで約10ページ送ると砂時計になって終了するとの報告。「先読みバッファをオーバー」は報告者の仮説。>>657はv4.9.0のイベントログ（例外 `0xc0000005`、障害offset `0x540a947`、Windows 11 Home 25H2・RAM32GB）。>>672は同じ報告者の追加証拠だが、その回の操作・素材・設定は未記載で、同じ手順・原因だったと断定しない。
+- >>672の原文ログ（書き換えず保存）:
+
+  ```text
+  [SystemTime { intervals: 134378486407355883 }] NATIVE EXCEPTION chance=first code=0xC0000005 flags=0x00000000 address=0x7ff70fe3dbc7 thread=45376 access=read target=0x18 version=4.10.0 exe_base=0x7ff70a880000 ntdll_base=0x7ffb510a0000
+  ```
+
+- 軽い確認: `address - exe_base = 0x055bdbc7`。無効な低アドレス `0x18` の読み取りで、NULL近傍の参照は候補だが、解放済みメモリ・破損等を含め原因は未確定。`src/native_exception_log.rs` はfirst-chanceで記録して `EXCEPTION_CONTINUE_SEARCH` を返すため、この1行だけでは未処理の致命的例外や最終終了地点の証明にならない。以前のGPU / VRAM不足やAIキャンセル仮説を確定原因に格上げしない。[Microsoftのアクセス違反の説明](https://learn.microsoft.com/en-us/shows/inside/c0000005)も参照。
+- 調査の最初の作業: **実際に配布したv4.10.0のcore exeと一致するPDB**を開発側の保管物から探し、PEのイメージ範囲・PDBの識別情報を照合して `0x055bdbc7` を関数・ソース行・命令へ逆引きする。現在のビルドや別版のPDBは代用しない。v4.9.0の旧offsetとの比較も各版に一致するexe/PDBで行う。該当箇所の処理・所有期間・非同期完了や破棄の順序を調べ、手元に残る終了ログ／通常・性能ログがあれば時刻を照合する。追加の利用者確認は、その結果で調査方針が変わる最小限に限る。
+- 既存調査との関係: ブランチ `ai-crash-655` の `docs/ai-crash-655-investigation.md` に、v4.9.0と当時HEAD各10回のheadless試験で未再現という記録がある。実画面・GPU texture upload・VRAM競合を試した結果ではないため、その範囲を除外しない。再現・原因と修正案を分けて報告し、実画面試験には事前承認と使い捨てポータブルを使う。原因未確定のままAI無効化・先読み縮小等で出荷機能を削らない。
+- §1.482は「異常終了の理由を利用者に表示する」診断機能の項目で、この終了原因の調査とは分ける。関連: `src/native_exception_log.rs`、`src/ai/` とfinal AIの要求・取消・回収経路、[表示パイプライン](display-pipeline.md)。規模: 原因調査後に確定 / P2。担当セッションへの実依頼・対外返信は未実施。
+
+### 1.664 Everything検索から直接開いた本を閉じると、検索結果ではなくページ一覧へ戻る — 5ch >>671 (2026-10-31)
+
+- 状態: **未着手・不具合修正として採用 (利用者方針 2026-10-31)**。[>>671](https://egg.5ch.io/test/read.cgi/software/1782419551/671) は、本の表示モードを「開いたとき、ページを表示」にすると、Everything検索結果からは設定どおりページを開くが、本を閉じると検索結果ではなくページ一覧になるという報告。閉じる入力とビューワモードは報告に記載なし。コード上は通常の閉じるでも到達する経路を確認したが、実アプリ再現試験・修正は未実施。リリース時期は未指定。
+- 原因 (v4.10.0 と現行masterのコードを確認): `auto_open_for_current_container` は `global_search.active` / `favsearch.active` / `tag_view.active` の間 false を返す。検索から実フォルダの親へ飛ぶのを防ぐ既存の除外条件がEverythingにも適用され、`handle_fullscreen_close_request` が親一覧への復帰要求を立てず、画像表示だけを閉じて現在の本のページ一覧を残す。`resolve_close_return_navigation` にもEverythingの結果復帰先は含まれていない。
+- 期待する動作: Everything検索結果から本を直接ページ表示した場合、通常の閉じる（Esc・Enterの閉じる操作・HUDの×等）では元の検索結果へ戻す。Backspaceで明示的にページ一覧へ戻す操作、および「開いたとき、ページ一覧を表示」の動作は維持する。複数ウィンドウでメインの検索結果を残して独立閲覧している場合も、その一覧を不要に置き換えない。
+- 方針: 検索中の除外条件を外すだけの修正にはしない。既存 `SearchAccepted::Everything` の `PhysicalChild` と `EverythingReturn::Results` / `return_from_everything_child` が保持する論理的な本・戻り先・採用済みdatasetを、通常の閉じる要求から使う。検索語・取得済み結果・表示条件と並び・開いた本の選択とスクロールの復元を既存の検索ownerに揃え、再IPCを行わず、実親フォルダや変換キャッシュへ飛ばさない。新たな戻り先boolや検索結果の第二キャッシュは追加しない。
+- 調査・検証: ZIP / PDF / 変換書庫（元パスとキャッシュを区別）と、設定ON時の画像フォルダ本で、検索結果の採用→本openの成功採用→通常の閉じる→結果復帰までを通す回帰を追加する。Backspace・明示的なページ一覧表示、検索結果からの再open、キャンセル・失敗、同じ検索除外条件を使うCtrl+G / Ctrl+S / タグビューの兄弟経路を確認する。F12・独立viewerでは既存の所有境界とメインの選択・一覧を保つ。UI試験は事前承認と使い捨てポータブルの規則に従う。
+- 対象: `src/app.rs` の `auto_open_for_current_container` / `handle_fullscreen_close_request`、`src/app/close_return.rs`、`src/global_search_ui/everything.rs`、親移動dispatcher、関連マニュアル。[Everything検索計画 §7](everything-search-plan.md#7-openbackhistoryf12remote)、[ナビゲーション仕様](fullscreen-navigation-consistency.md)、detached経路に触る場合は[detached計画 §2](detached-rework-plan.md)を参照。対外返信は文案段階。規模 / 優先度: Small〜Medium（帰路の所有境界を調査して確定） / P2。
+
+### 1.663 形式バッジをファイル名の一段上に置き、名前の表示幅を優先する — 5ch >>667 (2026-10-30)
+
+- 状態: **未着手・オプション追加の方向で採用 (利用者方針 2026-10-30)**。[>>667](https://egg.5ch.io/test/read.cgi/software/1782419551/667) は、ZIP / RAR 等のバッジを上へ移し、ファイル名の表示幅を増やしたいという提案。利用者との検討で、画面上端ではなく「ファイル名の行の一段上」へ置く案として記録する。実装・実画面での検証は未着手、リリース時期は未指定。
+- 現状 (v4.10.0 と現行コードを確認): `layout_badges` は下段に形式バッジを先に置き、その右端から右側だけをファイル名に割り当てる。左上は時刻 / UP / 編集状態 / pin / タグ、右上はチェック / スタック枚数、右下は評価絞り込みの一致件数 / 動画・音声の長さが使うため、形式を単純に四隅へ移すのではなく、下段周辺の配置を整理する。
+- 方針: 環境設定の「表示 → サムネイル」に、仮称「ファイル名の表示幅を優先する」を追加する。**既定 OFF で従来配置を維持**し、ON では形式バッジをファイル名の一段上へ置き、名前はセル内の左右余白を除いた横幅を使う。フォルダ名バッジは名前そのものなので、形式バッジと同じ移動対象にしない。既存の名前の文字サイズ・最大行数を併用できるようにする。
+- 文字数: 現在のファイル名は1行設定時に `Some(18)` の省略上限があり、幅だけ広げても使い切れない場合がある。ON ではこの上限ではなく実測幅で省略し、複数行では既存の最大行数・折り返しを維持する。OFF の文字数・配置は変えない。
+- 重なり回避: 既存 `ThumbnailOverlayLayout` の単一の配置計算を拡張する。左下の★は下段の実測矩形に重なると上へ積み、右下の件数・長さは `place_bottom_right` で使用済み領域を避けて上へ移す実装がある。左上は横方向へ予約し、幅不足を省略等で処理しており、すべてのバッジが自動で縦移動するわけではない。新配置でも形式・名前・★・四隅・下端の前回位置メーターを同じ使用領域で扱い、描画とクリック / hover / 背景判定に同じ矩形を渡す。独自の座標ずらしや描画だけの位置変更を追加しない。
+- 検証: OFF の従来配置、ON の名前幅拡張、長い日本語 / 英数字名、文字サイズと1〜4行、狭いセル、形式 + 名前 + ★ + タグ / 編集 / pin、チェック / スタック枚数、右下の件数・長さ、前回位置メーター ON/OFF を純粋レイアウトの非交差・セル内判定と UI snapshot で確認する。動画・音声の文字バッジ、フォルダ名、ブックマーク一覧も回帰し、セル寸法・画像 fit・選択 / 開く操作・画像読み込み / キャッシュは変更しない。
+- 対象: `src/thumb_overlay_layout.rs`、`src/app/grid_paint.rs`、設定と環境設定のサムネイルページ、関連マニュアル。[表示パイプライン](display-pipeline.md)、本書 §2.2 の共通配置を参照。規模 / 優先度: Small〜Medium / P3。
 
 ### 1.481 ゲームパッドの本openとEnter/ダブルクリックで、parkと拡張子付き実フォルダの受付が異なる — §1.480 の着手前調査で開発側が確認 (2026-10-29)
 
@@ -64,10 +90,11 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.482 異常終了の理由を、次回起動時に画面へ出してコピーできるようにする — 5ch >>655 の調査から (2026-10-29)
 
-- 状態: **未着手・v4.10.0 の次の版に入れる (利用者判断 2026-10-29)**。
+- 状態: **段A〜D実装済み・master へ取り込み (2026-10-31、v4.10.1 のタグの後)・実機未確認**。段A〜Dと表示の作り直しは各段の独立レビュー ACCEPT、文言修正 `edbfc3565` の最終再レビューも ACCEPT。ブランチ上で本体 lib 15,172 件・UI snapshot 215 件成功。v4.11.0 に入れる (利用者判断 2026-10-29)。
 - 背景: >>655 (AI 処理中にホイールで約 10 ページ送ると、砂時計になってから終了) は、開発側の headless 試験 20 回 (v4.9.0 と v4.10.0 前の HEAD) では再現しなかった。コード調査で、描画用 texture の確保失敗が wgpu の既定 handler で panic し、画面に何も出さずに終了し得る経路を確認した。>>655 がこの経路だった証拠はない。panic hook はログに残すだけで、利用者は理由を知れず、ログの送付も負担が大きい。
-- 方針 (調査の推奨案): (a) 次回起動時に「前回の正常終了を確認できませんでした」と、終了前に観測できた情報 (エラーの種類・直前の VRAM 使用量と予算・表示ページと実行中の AI ジョブ・画像寸法) を出し、報告用の文をコピーできるようにする。(c) 直前の状態を小さく常時記録し、fatal 時に重い処理をせずに残す。あわせて、捕まえられる ORT の失敗はその場で通知する。パス・ファイル名はコピー文に入れない。回復処理 (device 再作成・再推論・AI 無効化) は含めない。
-- 設計の正本: ブランチ `ai-crash-655` (`1ed0635fd`) の `docs/ai-crash-655-investigation.md` の「追加調査: GPU / VRAM と終了理由の表示」。着手時は設計の独立レビューから始める。規模: Medium (数日)。
+- 方針: 次回起動時は「前回の正常終了を確認できませんでした。」と短い要点を常時表示し、詳しい記録は「詳細（報告用）」へ畳む。終了前のエラー観測・最後のAI処理・描画用GPUの使用量と予算などを許可項目だけで示し、要点＋詳細の全文をコピーできる。日時はローカル日時と数値時差を使い、終了原因や「直前」の鮮度は断定しない。活動中の通常workerが目標約1秒周期で小資料を保存し、fatal時は固定分類だけを残す。捕まえられるORT失敗はその場で通知する。パス・ファイル名・生のエラー文はコピー文に入れず、回復処理（device再作成・再推論・AI無効化）は含めない。
+- 設計の正本: [調査書の確定設計 (2026-10-30)](ai-crash-655-investigation.md#確定設計-2026-10-30)。確定設計と各段の独立レビューを経て実装し、段Dの検証・受入を進める。検証結果は同書の実装記録を参照。規模: Medium (数日)。
+- 追加報告: v4.10.0のnativeアクセス違反ログがある>>672の原因調査は§1.666へ分けた。本項目の診断表示を追加しただけでクラッシュを修正済みとは扱わない。
 
 ### 1.483 ReleaseChecks の first-ai が、全画面を開いた後にメイン窓へ focus して全画面を閉じてしまう (2026-10-30)
 
@@ -76,22 +103,31 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 直し方: AI action を全画面の viewport (表示中の viewer の入力所有者) へ送る。製品の main focus guard は変えない。直したら AI / GPU 経路を変える次の版で `-IncludeFirstAi` 付きの ReleaseChecks を実行して採用する。
 - 関連: [release-check-automation-plan.md](release-check-automation-plan.md)、`src/test_script.rs` の `release_check_first_ai`。規模: Small。
 
-### 1.472 フォルダツリーの幅が再起動するたびに狭くなる — 5ch >>643 (2026-10-29)
+### 1.667 ReleaseChecks の起動直後 frame 1→2 の判定が、ログ時刻の 1ms 丸めで成り立たないことがある (2026-10-31)
 
-- 状態: **未着手・修正対象として採用 (2026-10-29)**。修正時期は未指定。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、広げたツリー幅が再起動のたびに狭くなり、最後は一定幅になると報告。
-- 調査結果: `src/ui_folder_pane.rs::render_folder_pane` は、保存比率と現在の画面幅から初期幅を求める一方、描画後の実幅 / 現在の画面幅を毎回設定へ書き戻す。egui の `PanelState` は初回の幅を保持し、その後の `.default_size` より優先するため、初回描画後に画面幅が増えると、ツリーの実幅が変わらないまま保存比率だけが小さくなる。
-- 非対話試験: 同じ Panel と幅計算を使い、毎回新しい egui Context で画面幅 1280 → 1920 の起動を繰り返すと、保存比率 0.35 からツリー幅が 448 → 299 → 199 → 180px と縮み、比率下限 0.12 で止まった。1920 → 1920 の対照条件では 672px / 0.35 を維持した。**相当する描画処理での再現であり、mIV 実画面や報告者と同じ条件での再現ではない。**
-- 起動経路の候補: `src/lib.rs` と `src/app.rs` は通常サイズで生成後、DPI・作業領域に合わせたサイズ補正や表示後の最大化を行う。ツリーの初回描画とそのサイズ変更の順序を確認する。白い画面のちらつきを防ぐ既存の起動手順を取り除く修正にはしない。
-- 方針: ユーザーが選んだ幅と、起動途中・制約下の描画幅を区別し、画面サイズの変化だけで保存する希望値が書き換わらないようにする。比率 / 実幅のどちらを設定として持つか、手動リサイズと上下限の扱いを設計時に確定する。遅延や強制リセットで症状だけを抑えない。
-- 検証: 起動と終了を繰り返す幅復元、通常 → 最大化、同一サイズの対照、手動リサイズ、DPI / 作業領域の変更、最小・最大幅を回帰する。関連: [起動時のちらつき調査](section327-startup-window-flicker-investigation.md)、`vendor/egui/src/containers/panel.rs::outer_size`。規模 / 優先度: Small〜Medium の暫定見積り / P2。
+- 状態: **未着手** (v4.10.1 の ReleaseChecks で判明。製品の不具合ではなく判定スクリプトの不具合)。
+- 内容: `scripts/release_check_analysis.py` の `startup_first_frame_gap` は、起動時の初期化 (`startup/indexer_manager_new`) の完了が frame 1 の update 終了より 1ms 以上後であることを、既知の起動直後の間隔の条件にしている。perf event の `t` は 1ms 単位に丸められるので、完了が update 終了の直後 (1ms 未満) だと順序を示せず、同じ形の間隔が `unexplained` で FAIL になる。証跡: run `release-checks-20261031-014232-5895a34d/perf-cached` で frame 1→2 が 112ms、update 終了 0.8235728、`indexer_manager_new` の `t`=0.824 (`ms`=3.46)。同じ run の perf-uncached は 120ms で既知と判定された (完了 0.811、update 終了 0.8076)。
+- 直し方: 判定に使う完了時刻を丸めない値で出す (例: `indexer_manager_new` に `end_t` を高精度で載せる) か、初期化が frame 1 の後まで未完了だったことを UI スレッド側の観測 (startup overlay の early return) で直接記録する。margin を広げて通すだけにはしない。
+- 関連: [release-check-automation-plan.md](release-check-automation-plan.md)、`scripts/test_release_check_analysis.py`。規模: Small。
 
-### 1.473 履歴から開いたフォルダで親へ移動すると内部キャッシュへ入る — 5ch >>643 (2026-10-29)
+### 1.487 旧二指touchの第二指のMoveが、新しく始めたmouse dragへ混ざる — >>661の統合確認から (2026-10-30)
 
-- 状態: **未着手・不具合調査として採用 (2026-10-29)**。原因未特定、実アプリでの再現は未確認、修正時期は未指定。[>>643](https://egg.5ch.io/test/read.cgi/software/1782419551/643) で、「履歴フォルダ」からフォルダを開いた後、親へ移動すると `mImageViewer_portable\data\cache` へ移ると報告。
-- 期待する動作: 現在の一覧の論理的な場所と戻り元に従って移動する。閲覧履歴へ戻す仕様と実フォルダの親へ移る仕様は区別するが、内部キャッシュを利用者向けの親フォルダとして開くのは意図しない。
-- コード確認: `src/app.rs::effective_folder` は `archive_source_override` を優先し、`reading_history_back_nav` / `resolve_grid_parent_nav` は履歴等の戻り先を先に判定する。変換済み書庫から履歴へ戻る単体テスト (`reading_history_back_nav_handles_converted_archive`) もある。このため、単純にキャッシュ ZIP の親を見ていると断定せず、履歴からの open 完了時に論理パス・実体パス・戻り元が正しく渡るか調べる。`reading_history_synthetic_path` は `data/__reading_history__` であり、報告の `data/cache` と同一視しない。
-- 調査: 場所メニューの「閲覧履歴」、フォルダバーの「履歴▼」、戻る / 進むの入口を確認し、実フォルダと変換書庫の各 load / switch / back 経路を追う。親ボタンとキー操作の共通処理、メイン / 別窓での所有状態も確認し、利用者に全組み合わせの試験を頼まない。「履歴フォルダ」がどの入口かは未確定なので、追加質問をする場合は入口の確認だけに絞る。
-- 修正時: 誤った場所・戻り元を作る境界で直し、正常な閲覧履歴への復帰や書庫内の階層移動を壊さない。入口から親移動までの状態遷移に回帰テストを追加する。関連: [ナビゲーション仕様](fullscreen-navigation-consistency.md)、`src/ui_main.rs` の親ボタンとフォルダ open。規模 / 優先度: 原因調査後に確定 / P2。
+- 状態: **未着手・>>661から分離（設計担当判断 2026-10-30）**。touchとmouseを同時に使う操作の既存不具合と、同frameの複数所属release混在に対する許容範囲。通常の一覧移動で旧bounds・速度・captureを持ち越す>>661とは分けて扱う。
+- 再現: 旧一覧で二指touch → 別一覧へ移る → 主指を離す（第二指は保持）→ 新mouseで一覧背景をdrag → 旧第二指を動かす。backendの空いたpointer gateから出るsynthetic Moveを、新mouseのnative scrollが採る。
+- 基点検証: v4.10.0の `b10dc7406` をテスト用に展開し、同じ入力列・実worker・両入力の対照・実rendererを通す回帰が失敗。no-tailはnative offset756を維持、旧Moveありは756→800、直後のmouse移動も対照656に対し576となる。基点の同frame描画は756のまま、行丸め後は両方630となり、このfixtureでは差が見えない。>>661修正後はphysics後の位置でviewport／content originを確定するため同frameのviewportも800となる。この反映タイミングの差を「今回の影響なし」とは扱わない。
+- 根拠と証跡: [>>661調査書の基点比較](scroll-661-investigation.md#mixed-input-v410-baseline)。native pointer eventの由来を受理境界へつなぎ、本物mouseのcapture・慣性・直前位置を保って旧touch由来だけを隔離する設計が必要。修正案・規模は未確定。
+- 回帰は `src/app/tests/scroll_661.rs::retired_secondary_touch_move_cannot_drive_a_new_mouse_capture` を理由付きignoreで保持。基点でもState不変assertが失敗することを記録し、設計担当の指示に従って>>661の必須gateから除外する。実機イベント配送・製品画面は未確認。
+- 同frameのrelease／click混在も本項の範囲（設計担当判断 2026-10-30）。旧touchのreleaseとMouseのclick-bearing releaseが同frameに入る場合は、v4.10.0と同じくセル応答を抑止しない。例: 旧touchでcellをpress→一覧session交代→同frameに旧End／release／Gone→widgetのない場所へmouseをMoved／press／release。この場合も旧cellのnative clickは適用される。混在しない旧touch releaseは>>661の修正で拒否する。`mixed_retired_capture_and_uncaptured_mouse_click_keep_v410_pointer_fallback` はこの許容挙動を自動検査し、ignoreしない。[設計補足・再修正台帳](scroll-661-investigation.md#implementation-review-mixed-release)を参照。egui中核interactionの変更案は保守負担から不採用。
+
+- 許容範囲はMouseの混在に限らない。抑止しないCurrent tapや所属不明のclick-bearing releaseが同frameに混ざる場合も、v4.10.0と同じpointer fallbackとする。純touchでCurrentとRetiredが共存する場合を含む「複数所属のreleaseが混在するframe」では、cell clickを完全に隔離したとは扱わない。すべてのclick-bearing releaseが抑止対象の場合だけ拒否する規則であり、既存Current gestureの抑止要求は維持する。
+
+### 1.486 Snapshot（★固定）の固定ownerとcanonical origin / routeの単一所有
+
+- 状態: **未着手・§1.473から分離（設計担当決定 2026-10-30）**。根拠は[§1.473調査記録の再停止](history-parent-1473-investigation.md#再停止snapshotの固定ownerに関する設計前提不足2026-10-30)。`docs/`全体の`### 1.48`を検索し、1.486が未使用であることを確認して採番した。
+- 問題: 固定rowsはSnapshotState、canonical origin/routeはTopLevelGridViewが別々に持つ。一時的な別surfaceの採用で帰路が失われ、既存の固定list復帰はrows/path/recipeまででsurface・行provenance・routeを一括で再採用しない。同じpathの固定listと別surfaceもpath比較では区別できない。
+- 方針: 固定ownerと完全な帰路の単一所有、一時surfaceを採用しても失わない配送、固定listの再採用をsurface・行provenance・routeまで含むowner操作として設計する。解除/dismiss、Back/Forward、fork/close、同pathと異なるcontextの生命周期を揃え、新bool/並列Option/逆算guardで補わない。
+- §1.473の限定対応: 閲覧履歴rootからの親は既存の固定解除を終えて捕捉済canonical originへ戻す。固定listの完全な再採用機構は今回作らない。
+- 受入候補: 普通Folder/ReadingHistory/★/Bookmarks/検索由来の固定から別surfaceへ入り、固定listへの復帰・解除・一時ビュー移譲を確認する。特に同pathの別visit、行flag/来歴/route、行・scroll、未採用/取消、bundle/fork/closeとsibling不変を含める。設計時に通常利用の挙動を確定する。
 
 ### 1.475 コレクションの挙動が不安定・本を閉じたときの保存に時間がかかる — X の投稿 (2026-10-29)
 
@@ -126,6 +162,7 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
     - 製本・構成を変えた本。
     - 長時間使い続けた後の状態。
 - 計測の素材: `G:\home\mivtest-collection` (約 6.5 GB) と `E:\mivtest-collection` (約 12.9 GB)。再調査の材料として残してある。不要になったら削除してよい。
+- 別症状の追補 (2026-10-30、Codexの非対話試験): Xの「本から戻ると違う場所が表示される」は [位置復元の調査](collection-return-investigation.md) を参照。v4.10.0相当の実collection/worker/egui経路で、帰り先・選択・アドレス・ツリーは正しいまま、スクロールだけが上へずれる条件を確認した。短い側のページ一覧もスクロール可能な32ページ本で、>>661と同じ旧bounds/速度の持越しを再現（20件中13件が(c)の回帰検出で失敗、7件の対照は成功）。投稿者本人の原因は未確定。製品コード変更なし、`scroll-661` の共通修正後に今回の経路を確認するテストを追加。本節の「保存が遅い」調査結果とは分けて扱う。
 
 ### 1.476 タグビューで検索し直すと、開いていた画像が閉じる — §2.23 の実機確認で利用者が観測 (2026-10-29)
 

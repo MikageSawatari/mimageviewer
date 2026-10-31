@@ -5173,7 +5173,7 @@ impl KeyAction {
             GridDeleteEraseMask => "選択中またはチェック済み画像の消しゴムマスクを削除する",
             GridDeleteConcealMask => "選択中またはチェック済み画像の隠蔽マスクを削除する",
             FsToggleMetadata => "左右パネルの表示モードを切り替える",
-            FsPageOverviewToggle => "ページ一覧の表示を切り替える",
+            FsPageOverviewToggle => "ページ一覧の表示切替",
             FsPageOverviewConfirm => "ページ一覧で選択したページへ移動する",
             FsPageOverviewPagePrev => "ページ一覧を前の画面へ送る",
             FsPageOverviewPageNext => "ページ一覧を次の画面へ送る",
@@ -16214,6 +16214,29 @@ mod tests {
         assert_eq!(
             restored.effective_chords(KeyAction::FsCapture),
             vec![Chord::key(KeySlot::Period)]
+        );
+    }
+
+    #[test]
+    fn page_overview_toggle_saved_key_assignment_keeps_its_id_after_label_change() {
+        let settings: KeymapSettings = serde_json::from_str(
+            r#"{"overrides":[{"action":"FsPageOverviewToggle","chords":["Ctrl+O"]}]}"#,
+        )
+        .unwrap();
+        let keymap = Keymap::from_settings(&settings);
+        let action = KeyAction::FsPageOverviewToggle;
+        assert_eq!(action.ini_name(), "FsPageOverviewToggle");
+        assert_eq!(
+            action.default_chords().iter().collect::<Vec<_>>(),
+            vec![Chord::key(KeyName::O)]
+        );
+        assert_eq!(
+            keymap.effective_chords(action),
+            vec![Chord::ctrl(KeyName::O)]
+        );
+        assert_eq!(
+            KeymapSettings::from_keymap(&keymap).overrides,
+            settings.overrides
         );
     }
 

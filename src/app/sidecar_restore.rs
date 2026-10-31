@@ -5229,7 +5229,7 @@ mod tests {
             grid: crate::app::BookmarkViewReturnGridState {
                 row_keys: vec![(0, 7)],
                 selected_key: Some((0, 7)),
-                opened_key: (0, 7),
+                opened_key: Some((0, 7)),
                 scroll_offset_y: 125.0,
             },
         });
@@ -5250,7 +5250,7 @@ mod tests {
             owner.current_folder = Some(PathBuf::from("sibling"));
             owner.items = vec![GridItem::Image(PathBuf::from("sibling/page.jpg"))];
             owner.selected = Some(0);
-            owner.scroll_offset_y = 77.0;
+            owner.grid_scroll.set_position(77.0);
         });
         let sibling_before = app
             .with_viewer_context(sibling, |owner| {
@@ -5316,7 +5316,7 @@ mod tests {
             assert!(!owner.cancel_token.load(Ordering::Relaxed));
             assert!(Arc::ptr_eq(&owner.page_identity_index, &sibling_before.3));
             assert_eq!(owner.selected, Some(0));
-            assert_eq!(owner.scroll_offset_y, 77.0);
+            assert_eq!(owner.grid_scroll.offset(), 77.0);
         })
         .unwrap();
         app.retire_context(target, "failed_bookmark_fixture", |_| ())

@@ -947,7 +947,7 @@ impl FullscreenOverflowItemId {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::PageOverview => "ページ一覧",
+            Self::PageOverview => crate::keymap::KeyAction::FsPageOverviewToggle.description(),
             Self::SpreadAdjustment => "見開きの調整",
             Self::NavigatorToggle => "ナビゲータ",
             Self::NavigatorPosition => "ナビゲータ位置",

@@ -371,7 +371,7 @@ impl App {
     /// Destination ownership stays here; a Move always rebases Shift, even at the same raw index.
     fn apply_rating_membership_cursor(&mut self, target: Option<usize>) {
         self.move_grid_cursor(target, crate::app::GridCursorIntent::Automatic);
-        self.scroll_to_selected = target.is_some();
+        self.grid_scroll.set_reveal_requested(target.is_some());
     }
 
     pub(crate) fn adopt_rating_membership(

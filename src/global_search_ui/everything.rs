@@ -571,7 +571,7 @@ impl App {
             }) {
                 // Resolve reserves selection of the child. Dispatch directly rather than
                 // re-entering handle_grid_parent_folder_action's active-search gate.
-                if let Some(nav) = self.resolve_grid_parent_nav() {
+                if let Some(nav) = self.resolve_physical_grid_parent_nav() {
                     self.apply_fullscreen_close_nav_immediate(nav);
                 }
                 return true;

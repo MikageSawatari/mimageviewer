@@ -6,7 +6,7 @@
 App の発行時に egui の寿命、native の寿命と fade を `ResolvedFeedbackTiming` に確定する。
 一覧・画像 viewer・F12/別窓は既存 toast state の秒数、native は同じ確定済み payload を使う。
 描画時には設定を読まず、窓の切替・mount/deposit で再計算しない。
-保存先を開く `fs_feedback_toast_reveal_path`、発火面、連続通知による置換は維持する。
+保存先を開くaction、発火面、連続通知による置換は維持する。§1.482段Dでactionは`fs_feedback_toast_action`（保存先の表示 / 安全なAI診断コピーの単一enum）へ一般化した。AI失敗も既存のError通知時間を使い、hover詳細だけでは時間延長・自動コピーをしない。
 
 動画内部が発行する通知（フィルタ準備・失敗、再生位置操作を使えない案内）は、既存の
 `NativeChromeSnapshot.policy` の選択値を使う。

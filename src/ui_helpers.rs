@@ -1029,6 +1029,34 @@ pub(crate) fn hover_tip_disabled_with_cursor_extent(
     hover_tip_disabled_at_anchor(response, text, anchor)
 }
 
+/// Enabled dark tooltip fixture: never inspect the real desktop cursor.
+pub(crate) fn hover_tip_dark_with_cursor_extent(
+    response: egui::Response,
+    text: impl Into<egui::WidgetText>,
+    extent_physical: (f32, f32),
+) -> egui::Response {
+    let anchor = response
+        .contains_pointer()
+        .then(|| response.ctx.pointer_hover_pos())
+        .flatten()
+        .map(|pos| {
+            cursor_anchor_rect_from_extent(
+                pos,
+                response.ctx.pixels_per_point(),
+                Some(extent_physical),
+            )
+        });
+    let text = tooltip_text_with_accessibility(&response, text);
+    show_offset_tooltip(
+        &response.ctx,
+        egui::Tooltip::for_enabled(&response),
+        true,
+        anchor,
+        text,
+    );
+    response
+}
+
 fn hover_tip_disabled_at_anchor(
     response: egui::Response,
     text: impl Into<egui::WidgetText>,

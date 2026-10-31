@@ -63,6 +63,7 @@
 | [container-index-startup-optimization-plan.md](container-index-startup-optimization-plan.md) | コンテナ索引の起動・watch更新に共通するDB直下置換SQLの範囲限定。小規模修正の設計・検証記録 |
 | [ui-responsiveness.md](ui-responsiveness.md) | UI スレッド同期 I/O で UI を止めないための設計方針。**新機能追加前にチェックリスト §4 を必ず見る** |
 | [startup-diagnostics-plan.md](startup-diagnostics-plan.md) | §1.241 常時起動timeline、実PRESENT、5秒Indexer overlay、単一採用、狭いwatchdog。Phase Aと§1.335統合後の初期フォルダPhase Bの境界は§10 |
+| [ai-crash-655-investigation.md](ai-crash-655-investigation.md) | §1.482の調査・確定設計・段階実装。終了印/次回通知、活動中checkpoint、panic/native/device-lost、現役ORT失敗の即時通知と安全なコピー。段A〜D実装済み・実機未確認。段A〜Cは独立ACCEPT、段Dは検証・受入中 |
 | [preferences-layout-guidelines.md](preferences-layout-guidelines.md) | 環境設定 UI のページ構成、配置、レスポンシブレイアウトを触るとき |
 | [v3.7.0-input-and-still-seek-plan.md](v3.7.0-input-and-still-seek-plan.md) | v3.7.0 の動画ホイール・マウスボタン割り当て、段階別シーク秒数、詳細表示起点の不具合と静止画サムネイル列5段階の実装計画 |
 | [release-check-automation-plan.md](release-check-automation-plan.md) | **2026-10-11利用者採用**。毎リリースのReleaseChecks suite（隔離seed、5 idle、cached／uncached perf）、証拠・既知startup gapの上限500ms・foreground条件・採用run記録。手動／実データ確認の範囲も維持 |
@@ -76,6 +77,7 @@
 | [folder-tree-sort-plan.md](folder-tree-sort-plan.md) | §2.25 ツリー専用の並び順と、展開・現在位置を保持するworker再列挙の設計。§2.24の一覧サイズ順に先行 |
 | [collection-spec-proposal.md](collection-spec-proposal.md) | §1.118 名前付きコレクションの初期仕様案と、その後の利用者判断の記録。現在の操作仕様はマニュアル、実装状態は実装計画 §23 を参照 |
 | [collection-implementation-plan.md](collection-implementation-plan.md) | コレクションの保存・管理UI・一覧・再生・Remoteを触るとき。actorと各画面の所有境界、出荷前修正の実装・検収台帳 |
+| [collection-return-investigation.md](collection-return-investigation.md) | 2026-10-30 X投稿の「本から戻ると違う場所」。v4.10.0相当のheadless試験で帰り先・選択を保ったスクロールずれを再現。>>661との関係と20件の証跡 |
 | [folder-history-location-plan.md](folder-history-location-plan.md) | **Stage B 実装・自動 gate 完了**。§1.280 / §1.281 / §1.282 の Rating・Collection子の表示位置とフォルダ履歴、A/B・detached の所有境界、Rating 一覧ソート保存の設計・検証台帳。実アプリ smoke は未実行 |
 | [file-type-visibility-plan.md](file-type-visibility-plan.md) | **実装済み・独立レビュー指摘修正と自動検証済み（利用者決定2026-10-08/09、実機確認待ち）**。§1.345の全体ファイル種類設定、全一覧producer・代表画像・本判定・Remoteの共通ポリシー、旧変換cache通知、本内ブックマークのcontext所有と検証記録。§1.339の履歴再入場facet退避の独立した根治設計。bf509352dの独立レビュー承認を記録 |
 | [startup-restore-target-plan.md](startup-restore-target-plan.md) | §1.335「前回終了した場所」の明示一覧所有、物理／本／Drive の復元範囲、旧データの初回移行、ZIP 内階層、一覧復帰要求の受理境界と回帰検証。実機確認は未実施 |
@@ -106,6 +108,7 @@
 | [web-remote-video-streaming-plan.md](web-remote-video-streaming-plan.md) | リモートの動画 / 音声。PC 側トランスコード + HLS 配信、画質 mode、seek と再接続 |
 | [web-remote-left-panel-plan.md](web-remote-left-panel-plan.md) | リモートの左パネル (場所 / 検索 / タグ / お気に入り / 本棚) の範囲と、本体一覧との差 |
 | [web-remote-ai-plan.md](web-remote-ai-plan.md) | **段 3b-0〜3b-2 実装・実機確認済み。JPEG 転送 / 端末別画質 mode は実装済み・実機確認待ち**。remote AI アップスケール / デノイズの PC modal 排他、共有 canonical decoder、接続取得 / 切断 drain barrier、App 所有 singleton Runtime、stable remote key、HTTP job、Web UI、画面消灯復帰、VRAM、撤退条件 |
+| [mcp-integration-plan.md](mcp-integration-plan.md) | **設計検討中 (2026-10-30)**。AI 連携 (MCP)。stdio の別 exe と本体の agent lane (Remote IPC とは別の pipe・版)、Remote 操作権との関係、安全性、公開文書への影響、tool の段階分けと試験実装 |
 | [local-adjust-testing.md](local-adjust-testing.md) | 部分補正レイヤーの回帰テスト、合成順、キャッシュ無効化を検証するとき |
 | [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグを触るとき。**Ctrl+S/F/G/R の経路、Everythingの共通Search ownership、インデクサパイプライン + DB 責任分離** |
 | [name-index-write-failure-plan.md](name-index-write-failure-plan.md) | §1.369 名前／コンテナ索引の書込失敗。レビュー反映・実装と検証記録。同じDBの起動中1回の通知／予約、通常UIへの配送、Full/watch/clearの共通出口、無害なno-opの維持 |

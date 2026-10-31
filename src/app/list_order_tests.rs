@@ -300,7 +300,7 @@ fn list_order_capture_excluded_surfaces_preserve_the_previous_snapshot() {
         TopLevelGridSurface::Search(TopLevelSearchView::Tag),
         TopLevelGridSurface::Snapshot,
         TopLevelGridSurface::SubfolderExpansion,
-        TopLevelGridSurface::ReadingHistory,
+        TopLevelGridSurface::ReadingHistory(ReadingHistoryRootRestore::unavailable()),
         TopLevelGridSurface::Bookmarks,
         TopLevelGridSurface::Rating { stars: 5 },
         TopLevelGridSurface::SmartFolder(top_level_grid_view::SmartFolderViewState::root(

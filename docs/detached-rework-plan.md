@@ -1455,6 +1455,59 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### §1.473 合成一覧の親・typed帰路（2026-10-30、実装済み・実機未確認）
+
+承認設計 `cae94fb27`（[調査・設計記録](history-parent-1473-investigation.md)）に対し、
+独立設計レビューとClaudeCode/Codexは、合成rootと帰路の所有を直す構造的修正である点に合意した。
+着手した差分では `ViewerContextBundle` のReadingHistory帰路を元path＋typed originのpayloadへ、
+Ratingのpath/展開restore対を単一のtyped originへ置換し、既存構築・swap/moveのfield移譲を追従している。
+親入力の共有では、キー/背景にあったdetached保護・closeをmouse/ring全体へ広げず既存presentation境界を保つ方針である。
+HWND/rect/viewport/placement、park/promote/retireの述語やmain履歴の所有判定を変える目的の修正ではなく、
+Appの新しいdetachedフラグ、時間窓、回復処理は追加していない。
+
+root退出のBack境界を識別する情報が承認設計に不足することを発見し、依頼どおり実装を停止した。
+差分は未完成・コンパイル未確認であり、bundle/siblingの退行試験も未実行。
+本記録は実装完了や独立実装レビュー承認の宣言ではない。再開時は境界の設計補足を先に合意し、
+context/slotの所有、fork/closeと同じPDFを読むsibling不変の回帰を完了する。
+停止理由と未完範囲は調査記録末尾の「実装着手と停止の記録」を参照。
+
+再開（同日）: 設計担当からmarker不在時は通常Directへ揃える補足を受領し、
+設計へ記録して再開した。ReadingHistoryの帰路とRatingの帰路対をimmutableな共通originへ置換し、
+既存bundleのswap・park複製・close用originの移譲へ乗せる。Rating native表示stateをforkへ複製する規則には変えない。
+専用のheadless回帰はmount/swap/retire、stash/fork、main root退出時に同じPDFを読むsiblingの
+ticket・世代・cancel・待機jobが保たれることを対象とする。実行結果は調査記録の検証欄へ記す。
+
+再停止（同日、Snapshot前提不足）: 上記context回帰3件は成功した。pure plan/共通親/ライフサイクル等を含む
+`section1473`は45件中44成功・1失敗で、残るSnapshotは固定listのrows/pathへ戻ってもHの行flag/surfaceが残る。
+Snapshotのcanonical origin/routeは共有TopLevelGridViewにしかなく、H採用が置き換えるため、
+設計の「既存固定owner保持＋既存list復帰だけで完結」という前提を補う必要がある。独立レビューも停止に同意。
+SnapshotStateへの新slot、flagだけの修正、pathからの逆算は追加せず、製品差分は未完成のまま保存している。
+位置保存の集約ではbundle外のfolder_historyをmain ownerに限定し、Snapshot/集約行を既存recipeで除外した。
+HWND/viewport、park/promote/retireの述語、入力ごとの既存presentation cleanupは変えていない。
+2種類の指定cargo checkは成功、全library/最終gateと最終監査は未実行。補足設計を受領してから再開する。
+詳細と生ログは調査記録末尾の「再停止：Snapshotの固定ownerに関する設計前提不足」を参照。
+
+再開（同日、WIP `7916a1e97`の続き）: 設計担当決定でSnapshot所有全体は§1.486へ分離。
+既存の完全再採用経路がないため、H root退出受付で既存dismissにより固定を終了し、表示中のtyped H ownerを維持してから
+通常の履歴計画/source proofを捕捉する。新しいcontext field、Snapshot専用pending、scope判定の迂回は追加しない。
+可視SnapshotからのH1/H2を別visitとして扱い、親の共通resolverからH rootの部分的な固定一覧復帰を除く。
+限定設計・製品差分は独立レビューと設計担当指示により構造的修正と合意。新たなbundle/F12/viewport変更はない。
+既存のcontext回帰を含む全libraryの結果と最終監査は調査記録にまとめる。
+
+全libraryで見つかった型移行の補完：quick再選択の同値比較を既存helperへ揃え、ReadingHistoryのReturn再表示で
+Remote解除後の保留起動を明示取消しない旧契約を維持した。Collectionの一時ビュー経由NativeOuterでは、
+捕捉済main requestの完全帰路を、native root再構築とactual destinationへ明示配送する。
+同Collectionの有効なresident owner、`navigation=None`のdetached native ownerの既存契約は変更しない。
+PhysicalHistoryへのRAR等転送も同じpayloadを渡し、別contextのslotやliveなMain帰路を参照しない。
+ウィンドウ述語・HWND・viewport・fork/closeの条件の変更ではなく、型付きproducer/consumerの配送漏れを直す構造的補完として
+独立レビューと合意した。通常Folder/実RAR/CollectionPhysical起点の実caller回帰と既存sibling gateで検証する。
+
+最終結果：全library **14,965成功・失敗0・既存skip65**、うち§1.473 **53件全成功**。
+mount/swap/stash/fork/retireと、同じPDFを読むsiblingのticket/世代/queued work保持を含む。
+core/feature付きlib-tests check、fmt、glyph、最終context audit（違反0）も成功、独立最終レビューACCEPT。
+Snapshot本体の所有は§1.486へ残し、今回の限定解除は既存owner/通常navigationで完結した。
+製品起動・実機確認・コミットの完了は含めない。実行証拠は調査記録の最終節を参照。
+
 ### 2026-10-29 §1.480 Enterとdouble-clickの本open受付の共通化
 
 設計担当ClaudeCodeの決定に従い、`accept_grid_container_open`へEnter/double-clickの
@@ -6715,3 +6768,82 @@ bundle退役にも接続した。記録するcontextは要求に捕捉したowne
 `prepared_edit_disposition`の項目と理由型はpage-turn計画§28.5.1に記録した。
 detachedの実表示入口と、通常mounted状態での既存の編集切替・Resumeを、Bの各未公開状態で直接通すheadless回帰を追加した。
 採否やpresentation述語は変更せず、既存所有境界の観測と回帰を足す修正であり、症状パッチではない。
+
+### 2026-10-30: 5ch >>661 一覧スクロールの所有境界（設計ACCEPT・実装着手）
+
+設計正本は [調査書「修正の設計」第3版](scroll-661-investigation.md#修正の設計)、
+`446a435f1`。独立設計レビュー（GPT-6.1 Sol / xhigh）は追加指摘なしでACCEPT、
+ClaudeCodeとCodexは、現在geometry・位置更新の意味・入力所属を各ownerで確定する
+構造的修正であり、症状パッチではないことに合意した。
+
+対象はApp投影と `ViewerContextBundle` の一覧offset / reveal / edge / RowAnchorの集約、
+既存move / swap / fork / 実parkの入力寿命、MainGridのtouch生成・受理である。
+一時mount / deposit、兄弟のread-only open / closeでは寿命を変えない。
+geometry / velocityのegui Stateはviewer contextごと、captureの所属は実表示面の
+安定transport IDと一覧sessionで分離する。ROOTのtouch端数参照はmain ownerを明示する。
+
+新しいdetached bool、HWND同定・配置・viewport生成 / 閉鎖の変更、時間窓、追加repaint、
+兄弟のcache / generation失効は加えない。段A（挙動不変の集約）→B（>>661のgeometry契約）→
+C（入力寿命・contextの統合）の受入を順に行い、C完了まで出荷しない。
+本記録は着手前の構造合意であり、実装完了・検証成功を示さない。
+段ごとの実施結果は調査書の実装・検証台帳へ記録する。製品binaryは起動しない。
+
+同日、段Aのsource前提監査で、既存の未消費RowAnchorとEdgeの同時保持を設計の排他的requestが
+表現できない相違を確認し、依頼の停止条件に従って製品編集前に停止した。
+bundle / park / touch / vendorの変更・自動テストはまだ行っていない。
+詳細なproducer / consumer・既存試験・設計担当へ返す論点は調査書の「実装・検証記録」を参照。
+
+その後、ClaudeCodeがEdge等の一回限りの要求とRowAnchorの配置指定は寿命が違うため、
+同じ `GridScrollState` の別枠へ移すと補足し、再開を指示した。
+既存2試験の保持条件と起動hintのload reset跨ぎを保つ。これは旧状態の集約であり、
+新たなdetached bool / pendingを追加するものではない。
+再開後も各段の受入結果を調査書へ記録し、段C完了前には出荷しない。
+
+再開後、段AでApp / bundle / SmartRootのスクロール所有者を集約した。
+実mount / deposit、両fork、Smart退避・復帰のRowAnchor回帰を含む関連458件とowner単体5件、
+core check・context audit（違反0）は成功した。row hintはmoveで保持し、forkでは非継承とする。
+一方、R3の詳細表示で既存の `last_grid_cols` 捕捉不整合を検出したため、設計担当判断へ返して停止。
+段Aの受入は未完了で、B/Cのvendor / session / capture / recognizer / 実park接続には未着手。
+viewport / HWND / native表示・入力の操作は行っていない。詳細とログは同じ調査書の再開後台帳を参照。
+
+設計担当が詳細の実列数1の記録を段Bのgeometry契約に含め、R3の受入を段Bへ移した。
+段Aは挙動不変（R3を除く）として `a930891dd` にコミット済み。段Bを再開する。
+比率変更でcanonicalを先に変換する既存経路も、描画のcontext / 世代 / 列数の証明とgeometryを
+同じscroll ownerへ集約し、兄弟や未描画のgeometryを使わない。構造上の理由と検証は調査書へ記録する。
+
+段Cではscroll ownerのsessionを、成功した実pauseとlive-media parkの当該ownerで更新する。
+mainへ戻った一時投影から兄弟を更新せず、forkはfresh、move／swap／一時mount／depositは位置とownerを移す。
+ROOTのkeep／prefetchが読む端数は、read-only Main ContextRefのscroll ownerを明示して取得する。
+detachedを一時投影しているからという理由でROOTの端数をdetachedへ付け替えない。
+egui Stateの保存IDはcontext＋renderer、captureのtransport IDはphysical viewportで分ける。
+MainGrid recognizerとcommand batchは同じsessionへ結び、非描画区間も共通end-passでtransportだけ観測する。
+HWNDのowner／focus／z-order、viewport生成／閉鎖、detachedの表示述語は変更していない。
+これは一覧のgeometry・位置・入力所属を本来のownerへ揃える修正で、症状guardや兄弟resetではない。
+実施した自動回帰と未実施の実画面確認は調査書の段C台帳に記録する。
+
+段Bの元4再現・R3を含む15件と関連520件は成功した。段Cでは旧主接点Endでbackendの
+pointer gateが空いた後、新mouse captureへ残る旧第二接点のsynthetic Moveが入る設計上の不足を
+実App／egui Context試験で確認し、追加の製品変更を停止した。viewer contextのsessionが正しくても、
+native pointerの各eventの由来が消費境界へ届かない問題であり、HWND／focus／viewport述語の
+条件追加では直さない。設計補足待ちで段C未受入・出荷不可。詳細は調査書の同日停止記録を参照。
+
+同日、設計担当の指示で基点v4.10.0 `b10dc7406` に同じ入力回帰を移植し、native offsetの
+756→800と次のmouse deltaの汚染が既存であることを実行確認した。基点は同frameの描画に
+反映せず、新契約では描画にも出る差を明記したうえで、利用者の条件付き判断に従い§1.487へ分離した。
+当該回帰を理由付きignoreで保持し、>>661の段C統合確認を再開する。HWND／focus／viewportの
+変更やresetを追加する必要はない。最終受入結果は調査書の同日再開後記録へ集約する。
+
+再開後、同一Contextの別viewport・独立frame／discard／transport-only／replayを直接検査する2件を追加した。
+本体全件14,993件、Collection20件、snapshot214件とaudit違反0まで確認した。
+最後の本体fullで見つかった13件の失敗は、実描画しない起動復元fixtureが旧cacheだけへgeometryを手設定する
+API適合漏れで、ownerへ実際に模したgeometryを記録する6setupへ変更し、期待値と操作を維持した。
+当該73件と本体fullの再実行は全成功。製品のdetachedロジックやviewport述語を追加変更していない。
+共通workspace fullはランチャー内包release exe3点不足でテスト開始前に停止し、出荷判定は保留。
+全command・source・ログは [>>661最終台帳](scroll-661-investigation.md#stage-c-final-verification) を正本とする。
+
+実装独立レビューP2四件の再修正では、bar入力区間の順序・non-rubberの配置前確定と、
+旧touch releaseのセル受理／backend cursorに沿うtransport終端を所有境界内で修正した。
+新しいdetached状態や述語、HWND／viewport生成・閉鎖・focusは変更せず、既存のcontext移譲規則も維持する。
+同一path A/Bの実cell captureから旧tapを拒否し、後続mouse保持／新touchを受理する回帰を両rendererへ追加した。
+本体15,003件・vendor165件・snapshot214件とaudit違反0。共通workspace fullの前提不足は継続している。
+理由・先行RED・最終証跡は [再修正台帳](scroll-661-investigation.md#implementation-review-revise) に記録した。

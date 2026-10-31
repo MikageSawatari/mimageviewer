@@ -6,6 +6,60 @@ use super::*;
 #[path = "tests/audio_plugin_migration.rs"]
 mod audio_plugin_migration;
 
+#[path = "tests/ai_crash_655.rs"]
+mod ai_crash_655;
+
+#[path = "tests/diagnostic_lifecycle.rs"]
+mod diagnostic_lifecycle;
+
+// Legacy fixture paths now use the same immutable payload types as runtime navigation.
+pub(crate) fn reading_history_return_for_test(container: PathBuf) -> ReadingHistoryBookReturn {
+    ReadingHistoryBookReturn::without_entrance(container)
+}
+
+pub(crate) fn install_reading_history_surface_for_test(app: &mut App) {
+    let root = top_level_grid_view::ReadingHistoryRootRestore::unavailable();
+    app.items_are_reading_history_view = true;
+    app.facet_navigation
+        .reproject(facet_navigation::FacetRoute::root(
+            App::facet_scope_for_location(&FolderNavHistoryTarget::ReadingHistory(root.clone())),
+        ));
+    app.top_level_grid_view.replace_surface(
+        top_level_grid_view::TopLevelGridSurface::ReadingHistory(root),
+    );
+}
+
+pub(crate) fn expansion_origin_for_test(app: &App) -> Box<top_level_grid_view::TopLevelGridOrigin> {
+    Box::new(top_level_grid_view::TopLevelGridOrigin {
+        restore: top_level_grid_view::TopLevelGridRestore::SubfolderExpansion(
+            subfolder_expansion::SubfolderExpansionRestoreState {
+                root: app.subfolder_expansion_root.clone(),
+                roots: app.subfolder_expansion_roots.clone(),
+                saved_folder: app.subfolder_expansion_saved_folder.clone(),
+                snapshot: app.subfolder_expansion_snapshot.clone(),
+                removed_paths: app.subfolder_expansion_removed_paths.clone(),
+            },
+        ),
+        route: app.facet_navigation.route().clone(),
+    })
+}
+
+pub(crate) fn rating_root_for_test(stars: u8) -> top_level_grid_view::RatingRootRestore {
+    top_level_grid_view::RatingRootRestore {
+        stars,
+        return_to: None,
+    }
+}
+
+pub(crate) fn grid_origin_for_test(
+    restore: top_level_grid_view::TopLevelGridRestore,
+) -> Box<top_level_grid_view::TopLevelGridOrigin> {
+    Box::new(top_level_grid_view::TopLevelGridOrigin {
+        restore,
+        route: Default::default(),
+    })
+}
+
 /// Preserve the headless renderer's logical client dimensions while fixtures
 /// use the same physical outer placement as a decorated native window.
 #[cfg(windows)]
@@ -48,6 +102,18 @@ mod thumbnail_request_lifecycle;
 
 #[path = "tests/section1328_session.rs"]
 mod section1328_session;
+
+#[path = "tests/history_parent_1473.rs"]
+mod history_parent_1473;
+
+#[path = "tests/history_parent_context_1473.rs"]
+mod history_parent_context_1473;
+
+#[path = "tests/history_parent_lifecycle_1473.rs"]
+mod history_parent_lifecycle_1473;
+
+#[path = "tests/scroll_661.rs"]
+mod scroll_661;
 
 #[path = "tests/pdf_render_epoch.rs"]
 mod pdf_render_epoch;
@@ -594,8 +660,8 @@ mod folder_mtime_rescan_tests {
                 .items
                 .iter()
                 .position(|item| matches!(item, GridItem::Image(path) if path == &page));
-            app.scroll_offset_y = 125.0;
-            app.scroll_selected_to_rows_above = Some(2);
+            app.grid_scroll.set_position(125.0);
+            app.grid_scroll.set_row_anchor(Some(2));
             let old_index = app.selected.unwrap();
             if case == "explicit" {
                 app.select_after_load = Some("z.png".into());
@@ -675,7 +741,7 @@ mod folder_mtime_rescan_tests {
                 app.items[app.selected.unwrap()]
             );
             if matches!(case, "cursor" | "missing_explicit") {
-                assert_eq!(app.scroll_selected_to_rows_above, Some(2));
+                assert_eq!(app.grid_scroll.row_anchor(), Some(2));
             }
             if case != "operation" {
                 assert_ne!(
@@ -683,11 +749,11 @@ mod folder_mtime_rescan_tests {
                     Some(old_index),
                     "the new row shifts the saved raw cursor"
                 );
-                assert_eq!(app.scroll_offset_y, 125.0);
+                assert_eq!(app.grid_scroll.offset(), 125.0);
             } else {
                 assert_eq!(app.checked.len(), 2, "both operation outputs are selected");
             }
-            assert!(app.scroll_to_selected);
+            assert!(app.grid_scroll.reveal_requested());
             assert!(app.select_after_load.is_none());
             if let Some((generation, origin, root_items, root_keys, startup)) = snapshot_invariants
             {
@@ -1278,7 +1344,7 @@ fn mutation_refresh_synthetic_worker_prepares_cascade_and_video_seed_before_ui_a
     app.image_metas = vec![None];
     app.thumbnails = vec![mutation_refresh_loaded_thumb(&egui::Context::default())];
     app.selected = Some(0);
-    app.scroll_offset_y = 42.0;
+    app.grid_scroll.set_position(42.0);
     let base = folder_thumb_existing_keys_for(
         &app.items[0],
         None,
@@ -1386,7 +1452,7 @@ fn mutation_refresh_synthetic_worker_prepares_cascade_and_video_seed_before_ui_a
     assert!(!matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
     assert_eq!(app.items_generation, generation);
     assert_eq!(app.selected, Some(0));
-    assert_eq!(app.scroll_offset_y, 42.0);
+    assert_eq!(app.grid_scroll.offset(), 42.0);
     assert_eq!(
         app.folder_nav_history_snapshot().back_stack,
         history.back_stack
@@ -1619,7 +1685,7 @@ fn mutation_refresh_synthetic_pin_keeps_rows_location_selection_and_history() {
         app.image_metas = vec![None];
         app.thumbnails = vec![ThumbnailState::Pending];
         app.selected = Some(0);
-        app.scroll_offset_y = 42.0;
+        app.grid_scroll.set_position(42.0);
         app.top_level_grid_view.replace_surface(surface.clone());
         app.items_are_global_search_view = matches!(
             surface,
@@ -1684,7 +1750,7 @@ fn mutation_refresh_synthetic_pin_keeps_rows_location_selection_and_history() {
         assert_eq!(app.items, items);
         assert_eq!(app.items_generation, generation);
         assert_eq!(app.selected, Some(0));
-        assert_eq!(app.scroll_offset_y, 42.0);
+        assert_eq!(app.grid_scroll.offset(), 42.0);
         assert_eq!(
             app.folder_nav_history_snapshot().back_stack,
             history.back_stack
@@ -2168,7 +2234,9 @@ fn mutation_refresh_rating_sort_fixture() -> AppTestEnvForTest {
     app.current_folder = Some(search_results_synthetic_path());
     app.items_are_rating_view = true;
     app.rating_view_stars = 3;
-    app.rating_view_saved_folder = Some(app.tmp.path().to_path_buf());
+    app.rating_view_return_to = Some(crate::app::tests::grid_origin_for_test(
+        top_level_grid_view::TopLevelGridRestore::Folder(app.tmp.path().to_path_buf()),
+    ));
     app.top_level_grid_view
         .replace_surface(top_level_grid_view::TopLevelGridSurface::Rating { stars: 3 });
     for path in [parent, child] {
@@ -2226,7 +2294,7 @@ fn mutation_refresh_assert_rating_sort(physical_mode: PhysicalFolderSortReload) 
     let mut app = mutation_refresh_rating_sort_fixture();
     let location = app.folder_nav_current_target();
     let chain = app.rating_view_nav_stack.clone();
-    let saved = app.rating_view_saved_folder.clone();
+    let saved = app.rating_view_return_to.clone();
     let history = app.folder_nav_history_snapshot();
     assert!(!history.back_stack.is_empty());
     assert!(!history.forward_stack.is_empty());
@@ -2238,7 +2306,7 @@ fn mutation_refresh_assert_rating_sort(physical_mode: PhysicalFolderSortReload) 
             sibling.current_folder = Some(PathBuf::from("sibling"));
             sibling.items = vec![GridItem::Folder(PathBuf::from("sibling-row"))];
             sibling.selected = Some(0);
-            sibling.scroll_offset_y = 42.0;
+            sibling.grid_scroll.set_position(42.0);
             generation = sibling.items_generation;
             cancel = Some(sibling.cancel_token.clone());
         });
@@ -2267,7 +2335,7 @@ fn mutation_refresh_assert_rating_sort(physical_mode: PhysicalFolderSortReload) 
     assert_eq!(app.items[1].name(), "a.png");
     assert_eq!(app.folder_nav_current_target(), location);
     assert_eq!(app.rating_view_nav_stack, chain);
-    assert_eq!(app.rating_view_saved_folder, saved);
+    assert_eq!(app.rating_view_return_to, saved);
     assert!(matches!(
         app.resolve_return_to_parent_nav(),
         Some(crate::ui_main::AddressBarNav::RatingViewBack)
@@ -2313,7 +2381,7 @@ fn mutation_refresh_assert_rating_sort(physical_mode: PhysicalFolderSortReload) 
         assert!(Arc::ptr_eq(&sibling.cancel_token, &sibling_cancel));
         assert!(!sibling_cancel.load(Ordering::Relaxed));
         assert_eq!(sibling.selected, Some(0));
-        assert_eq!(sibling.scroll_offset_y, 42.0);
+        assert_eq!(sibling.grid_scroll.offset(), 42.0);
     })
     .unwrap();
 }
@@ -2396,7 +2464,7 @@ fn mutation_refresh_synthetic_parked_request_is_owned_by_its_context() {
         sibling.image_metas = vec![None];
         sibling.thumbnails = vec![mutation_refresh_loaded_thumb(&ctx)];
         sibling.selected = Some(0);
-        sibling.scroll_offset_y = 22.0;
+        sibling.grid_scroll.set_position(22.0);
         sibling
             .folder_thumb_pin_dirty
             .insert(PathBuf::from("sibling-folder"));
@@ -2436,7 +2504,7 @@ fn mutation_refresh_synthetic_parked_request_is_owned_by_its_context() {
             ThumbnailState::Loaded { .. }
         ));
         assert_eq!(sibling.selected, Some(0));
-        assert_eq!(sibling.scroll_offset_y, 22.0);
+        assert_eq!(sibling.grid_scroll.offset(), 22.0);
         while sibling
             .current_view_pin_refreshes
             .contains_key(&sibling.projected_viewer_context_id())
@@ -2463,7 +2531,7 @@ fn mutation_refresh_zip_pin_keeps_level_cursor_scroll_filter_and_checks() {
     app.zip_nav = Some(nav);
     app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
     app.selected = Some(1);
-    app.scroll_offset_y = 53.0;
+    app.grid_scroll.set_position(53.0);
     app.checked.insert(1);
     app.show_search_bar = true;
     app.search_query = "b".into();
@@ -2480,7 +2548,7 @@ fn mutation_refresh_zip_pin_keeps_level_cursor_scroll_filter_and_checks() {
     assert_eq!(app.zip_nav.as_ref().unwrap().current(), level);
     assert_eq!(app.items, rows);
     assert_eq!(app.selected, Some(1));
-    assert_eq!(app.scroll_offset_y, 53.0);
+    assert_eq!(app.grid_scroll.offset(), 53.0);
     assert!(app.checked.contains(&1));
     assert!(app.show_search_bar);
     assert_eq!(app.search_query, "b");
@@ -3898,8 +3966,10 @@ fn ignored_epub_grid_preflight_preserves_reading_history_return() {
     std::fs::write(&epub, b"book").unwrap();
     let previous = app.tmp.path().join("previous.pdf");
     app.items = vec![GridItem::PdfFile(epub.clone())];
-    app.items_are_reading_history_view = true;
-    app.reading_history_return_from = Some(previous.clone());
+    crate::app::tests::install_reading_history_surface_for_test(&mut app);
+    app.reading_history_return_from = Some(crate::app::tests::reading_history_return_for_test(
+        previous.clone(),
+    ));
     app.address = "閲覧履歴".into();
     app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
 
@@ -3919,7 +3989,10 @@ fn ignored_epub_grid_preflight_preserves_reading_history_return() {
         app.poll_open_path_classification(&ctx);
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert_eq!(app.reading_history_return_from, Some(previous));
+    assert_eq!(
+        app.reading_history_return_from,
+        Some(crate::app::tests::reading_history_return_for_test(previous))
+    );
     assert_eq!(app.address, "閲覧履歴");
     assert!(app.pdf_enumerate_pending.is_none());
 }
@@ -7824,12 +7897,12 @@ fn collection_shortcut_from_mounted_detached_keeps_main_selection_and_scroll() {
     app.items = vec![GridItem::Image(main_path.clone())];
     app.selected = Some(0);
     app.checked.insert(0);
-    app.scroll_offset_y = 120.0;
+    app.grid_scroll.set_position(120.0);
     app.build_active_context_for_test(None, DetachedSource::Image, |detached| {
         detached.items = vec![GridItem::Image(detached_path.clone())];
         detached.selected = Some(0);
         detached.checked.clear();
-        detached.scroll_offset_y = 44.0;
+        detached.grid_scroll.set_position(44.0);
         detached.fullscreen_idx = Some(0);
     });
 
@@ -7842,16 +7915,16 @@ fn collection_shortcut_from_mounted_detached_keeps_main_selection_and_scroll() {
         );
         assert_eq!(mounted.items, vec![GridItem::Image(detached_path.clone())]);
         assert_eq!(mounted.selected, Some(0));
-        assert_eq!(mounted.scroll_offset_y, 44.0);
+        assert_eq!(mounted.grid_scroll.offset(), 44.0);
     })
     .expect("detached context remains mounted for its own action");
     assert_eq!(app.items, vec![GridItem::Image(main_path.clone())]);
     assert_eq!(app.selected, Some(0));
     assert!(app.checked.contains(&0));
-    assert_eq!(app.scroll_offset_y, 120.0);
+    assert_eq!(app.grid_scroll.offset(), 120.0);
     app.with_active_viewer_context(|mounted| {
         assert_eq!(mounted.selected, Some(0));
-        assert_eq!(mounted.scroll_offset_y, 44.0);
+        assert_eq!(mounted.grid_scroll.offset(), 44.0);
     })
     .expect("detached context remains unchanged after its action");
 
@@ -7876,10 +7949,10 @@ fn collection_shortcut_from_mounted_detached_keeps_main_selection_and_scroll() {
     assert_eq!(saved.entries[0].source_path, detached_path);
     assert_ne!(saved.entries[0].source_path, main_path);
     assert_eq!(app.selected, Some(0));
-    assert_eq!(app.scroll_offset_y, 120.0);
+    assert_eq!(app.grid_scroll.offset(), 120.0);
     app.with_active_viewer_context(|mounted| {
         assert_eq!(mounted.selected, Some(0));
-        assert_eq!(mounted.scroll_offset_y, 44.0);
+        assert_eq!(mounted.grid_scroll.offset(), 44.0);
     })
     .expect("detached context remains unchanged after add completion");
     app.shutdown_collection_runtime_for_exit();
@@ -14372,7 +14445,7 @@ mod startup_open_path_resolve_tests {
         BookmarkViewReturnGridState {
             row_keys: vec![(0, 1)],
             selected_key: Some((0, 1)),
-            opened_key: (0, 1),
+            opened_key: Some((0, 1)),
             scroll_offset_y: 120.0,
         }
     }
@@ -18425,7 +18498,7 @@ mod phase_c_key_tests {
         let mut app = setup_app();
         let previous = PathBuf::from(r"C:\pics");
         app.current_folder = Some(previous.clone());
-        app.scroll_offset_y = 42.0;
+        app.grid_scroll.set_position(42.0);
         app.selected = Some(3);
 
         app.enter_drive_list(None);
@@ -20249,6 +20322,7 @@ mod quick_folder_restart_tests {
 
 #[cfg(test)]
 mod phase_c_folder_nav_history_tests {
+    use crate::app::top_level_grid_view;
     use crate::app::{
         App, FolderHistoryDirection, FolderHistoryPlan, FolderNavHistoryState,
         FolderNavHistoryTarget, FolderOpenOutcome, FolderPaneOpenReady, GridClickSelectionAnchor,
@@ -20691,9 +20765,9 @@ mod phase_c_folder_nav_history_tests {
             .collect();
         app.visible_indices = vec![1, 3];
         app.selected = Some(3);
-        app.scroll_offset_y = 420.0;
-        app.scroll_to_selected = true;
-        app.pending_grid_scroll = Some(GridScrollIntent::Bottom);
+        app.grid_scroll.set_position(420.0);
+        app.grid_scroll.set_reveal_requested(true);
+        app.grid_scroll.request_edge(GridScrollIntent::Bottom);
         app.grid_click_selection_anchor =
             Some(GridClickSelectionAnchor::new(3, app.items_generation));
         app.checked = HashSet::from([1, 3]);
@@ -20747,10 +20821,10 @@ mod phase_c_folder_nav_history_tests {
                 )
         );
         assert!(app.folder_history.is_empty());
-        assert_eq!(app.scroll_offset_y, 0.0);
+        assert_eq!(app.grid_scroll.offset(), 0.0);
         assert_eq!(app.selected, Some(1));
-        assert!(!app.scroll_to_selected);
-        assert_eq!(app.pending_grid_scroll, None);
+        assert!(!app.grid_scroll.reveal_requested());
+        assert_eq!(app.grid_scroll.pending_edge(), None);
         assert_eq!(
             app.grid_click_selection_anchor
                 .and_then(|anchor| anchor.index_for_generation(app.items_generation)),
@@ -20824,18 +20898,18 @@ mod phase_c_folder_nav_history_tests {
     fn clear_quick_folder_slots_selects_none_for_an_empty_visible_list() {
         let mut app = setup_app();
         app.selected = Some(5);
-        app.scroll_offset_y = 300.0;
-        app.scroll_to_selected = true;
-        app.pending_grid_scroll = Some(GridScrollIntent::Bottom);
+        app.grid_scroll.set_position(300.0);
+        app.grid_scroll.set_reveal_requested(true);
+        app.grid_scroll.request_edge(GridScrollIntent::Bottom);
         app.grid_click_selection_anchor =
             Some(GridClickSelectionAnchor::new(5, app.items_generation));
 
         app.execute_clear_quick_folder_slots();
 
         assert_eq!(app.selected, None);
-        assert_eq!(app.scroll_offset_y, 0.0);
-        assert!(!app.scroll_to_selected);
-        assert_eq!(app.pending_grid_scroll, None);
+        assert_eq!(app.grid_scroll.offset(), 0.0);
+        assert!(!app.grid_scroll.reveal_requested());
+        assert_eq!(app.grid_scroll.pending_edge(), None);
         assert_eq!(app.grid_click_selection_anchor, None);
     }
 
@@ -21667,7 +21741,9 @@ mod phase_c_folder_nav_history_tests {
         std::fs::write(&zip, b"invalid ZIP").unwrap();
         let prior_reading = saved.join("prior-reading.zip");
         arm_favorite_search_for_staged_archive_test(&mut app, saved);
-        app.reading_history_return_from = Some(prior_reading.clone());
+        app.reading_history_return_from = Some(crate::app::tests::reading_history_return_for_test(
+            prior_reading.clone(),
+        ));
         app.settings.rating_filter = [false, false, false, false, false, true];
         app.settings
             .facet_filter
@@ -21693,7 +21769,12 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.items_generation, generation);
         assert_eq!(app.address, address);
         assert!(app.favsearch.nav_stack.is_empty());
-        assert_eq!(app.reading_history_return_from, Some(prior_reading.clone()));
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(crate::app::tests::reading_history_return_for_test(
+                prior_reading.clone()
+            ))
+        );
         assert!(app.rating_filter_suppressed_at.is_none());
         assert!(!app.facet_navigation.suppressed());
         assert_eq!(
@@ -21712,7 +21793,12 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.items_generation, generation);
         assert_eq!(app.address, address);
         assert!(app.favsearch.nav_stack.is_empty());
-        assert_eq!(app.reading_history_return_from, Some(prior_reading));
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(crate::app::tests::reading_history_return_for_test(
+                prior_reading
+            ))
+        );
         assert!(app.rating_filter_suppressed_at.is_none());
         assert!(!app.facet_navigation.suppressed());
         assert_eq!(
@@ -21733,7 +21819,9 @@ mod phase_c_folder_nav_history_tests {
         std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
         let prior_reading = saved.join("prior-reading.pdf");
         arm_favorite_search_for_staged_archive_test(&mut app, saved);
-        app.reading_history_return_from = Some(prior_reading.clone());
+        app.reading_history_return_from = Some(crate::app::tests::reading_history_return_for_test(
+            prior_reading.clone(),
+        ));
         app.settings.rating_filter = [false, false, false, false, false, true];
         app.settings
             .facet_filter
@@ -21767,7 +21855,12 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.items_generation, generation);
         assert_eq!(app.address, pdf.to_string_lossy());
         assert!(app.favsearch.nav_stack.is_empty());
-        assert_eq!(app.reading_history_return_from, Some(prior_reading.clone()));
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(crate::app::tests::reading_history_return_for_test(
+                prior_reading.clone()
+            ))
+        );
         assert!(app.rating_filter_suppressed_at.is_none());
         assert!(!app.facet_navigation.suppressed());
         assert_eq!(
@@ -21786,7 +21879,12 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.items_generation, generation);
         assert_eq!(app.address, address);
         assert!(app.favsearch.nav_stack.is_empty());
-        assert_eq!(app.reading_history_return_from, Some(prior_reading));
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(crate::app::tests::reading_history_return_for_test(
+                prior_reading
+            ))
+        );
         assert!(app.rating_filter_suppressed_at.is_none());
         assert!(!app.facet_navigation.suppressed());
         assert_eq!(
@@ -21877,8 +21975,10 @@ mod phase_c_folder_nav_history_tests {
             app.install_new_items(vec![old_item], vec![None]);
             app.visible_indices = vec![0];
             app.current_folder = Some(source.clone());
-            app.items_are_reading_history_view = true;
-            app.reading_history_return_from = Some(source.clone());
+            crate::app::tests::install_reading_history_surface_for_test(&mut app);
+            app.reading_history_return_from = Some(
+                crate::app::tests::reading_history_return_for_test(source.clone()),
+            );
             app.settings.rating_filter = [false, false, false, false, false, true];
             app.settings.facet_filter.kinds.insert(if use_pdf {
                 crate::settings::FacetItemKind::Pdf
@@ -21914,7 +22014,10 @@ mod phase_c_folder_nav_history_tests {
                 app.items.first(),
                 Some(GridItem::ZipFile(_) | GridItem::PdfFile(_))
             ));
-            assert_eq!(app.reading_history_return_from, Some(source));
+            assert_eq!(
+                app.reading_history_return_from,
+                Some(crate::app::tests::reading_history_return_for_test(source))
+            );
             assert!(app.rating_filter_suppressed_at.is_none());
             assert!(!app.facet_navigation.suppressed());
             assert_eq!(app.settings.facet_filter, facet_before);
@@ -21942,7 +22045,12 @@ mod phase_c_folder_nav_history_tests {
                 app.items.first(),
                 Some(GridItem::ZipImage { .. } | GridItem::PdfPage { .. })
             ));
-            assert_eq!(app.reading_history_return_from, Some(path.clone()));
+            assert_eq!(
+                app.reading_history_return_from,
+                Some(crate::app::tests::reading_history_return_for_test(
+                    path.clone()
+                ))
+            );
             assert!(app.rating_filter_suppressed_at.is_some());
             assert_eq!(app.facet_navigation.saved_frame_count(), 1);
             assert!(app.settings.facet_filter.kinds.is_empty());
@@ -21972,8 +22080,10 @@ mod phase_c_folder_nav_history_tests {
         app.install_new_items(vec![GridItem::ZipFile(target.clone())], vec![None]);
         app.visible_indices = vec![0];
         app.current_folder = Some(source.clone());
-        app.items_are_reading_history_view = true;
-        app.reading_history_return_from = Some(source.clone());
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
+        app.reading_history_return_from = Some(crate::app::tests::reading_history_return_for_test(
+            source.clone(),
+        ));
 
         let crate::ui_main::AddressBarNav::GridVirtual(intent) =
             app.grid_physical_navigation(0, target.clone(), true)
@@ -21981,11 +22091,17 @@ mod phase_c_folder_nav_history_tests {
             panic!("stale ZIP tile must retain its typed grid request");
         };
         assert!(app.start_grid_virtual_open(intent));
-        assert_eq!(app.reading_history_return_from, Some(source));
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(crate::app::tests::reading_history_return_for_test(source))
+        );
         finish_staged_physical_history_for_test(&mut app);
 
         assert_eq!(app.current_folder.as_deref(), Some(target.as_path()));
-        assert_eq!(app.reading_history_return_from, Some(target));
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(crate::app::tests::reading_history_return_for_test(target))
+        );
         assert!(app.rating_filter_suppressed_at.is_some());
         assert_eq!(app.facet_navigation.saved_frame_count(), 1);
         assert_eq!(app.visible_indices, vec![0]);
@@ -22495,7 +22611,9 @@ mod phase_c_folder_nav_history_tests {
         app.active_quick_folder_slot = Some(QuickFolderSlotId::A);
         app.rating_view_stars = 1;
         app.rating_view_nav_stack = vec![source.clone()];
-        app.rating_view_saved_folder = Some(app.tmp.path().join("before-rating"));
+        app.rating_view_return_to = Some(crate::app::tests::grid_origin_for_test(
+            top_level_grid_view::TopLevelGridRestore::Folder(app.tmp.path().join("before-rating")),
+        ));
         assert!(matches!(
             app.folder_nav_current_target(),
             Some(FolderNavHistoryTarget::RatingPhysical(_))
@@ -23244,13 +23362,19 @@ mod phase_c_folder_nav_history_tests {
             Some(GridSortLockReason::DetailsHeaderSort)
         );
 
-        app.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
-        app.items_are_reading_history_view = true;
-        app.current_folder = None;
+        app.current_folder = Some(std::path::PathBuf::from(r"C:\x\book.zip"));
         assert_eq!(
             app.grid_sort_lock_reason(),
             Some(GridSortLockReason::PageOrderFixed),
             "ページ順の固定が列ヘッダより優先する"
+        );
+
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
+        app.current_folder = None;
+        assert_eq!(
+            app.grid_sort_lock_reason(),
+            Some(GridSortLockReason::FixedOrder),
+            "正規の閲覧履歴一覧ではsurfaceが固定順を所有する"
         );
     }
 
@@ -23283,7 +23407,9 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.effective_folder().as_deref(), Some(folder.as_path()));
         assert_eq!(
             app.folder_history_back_target(),
-            Some(&FolderNavHistoryTarget::Rating { stars: 4 })
+            Some(&FolderNavHistoryTarget::Rating(
+                crate::app::tests::rating_root_for_test(4)
+            ))
         );
     }
 
@@ -23794,7 +23920,7 @@ mod phase_c_folder_nav_history_tests {
                 .collect();
             install_1328_parent(&mut app, &parent, items.clone());
             app.selected = Some(20);
-            app.scroll_offset_y = 640.0;
+            app.grid_scroll.set_position(640.0);
             app.record_folder_nav_transition(&zip);
             app.load_zip_as_folder_prepared(
                 zip.clone(),
@@ -23807,7 +23933,7 @@ mod phase_c_folder_nav_history_tests {
             );
             app.finish_page_identity_preparation_for_test();
             app.selected = Some(3);
-            app.scroll_offset_y = 96.0;
+            app.grid_scroll.set_position(96.0);
             assert!(
                 app.dispatch_main_folder_history_input(FolderHistoryDirection::Back)
                     .is_none()
@@ -23816,8 +23942,8 @@ mod phase_c_folder_nav_history_tests {
             assert_eq!(target, parent);
             install_1328_parent(&mut app, &target, items);
             assert_eq!(app.selected, Some(20), "workspace {slot:?}");
-            assert_eq!(app.scroll_offset_y, 640.0);
-            assert!(app.scroll_to_selected);
+            assert_eq!(app.grid_scroll.offset(), 640.0);
+            assert!(app.grid_scroll.reveal_requested());
         }
     }
 
@@ -23833,7 +23959,7 @@ mod phase_c_folder_nav_history_tests {
             .collect();
         install_1328_parent(&mut app, &parent, items.clone());
         app.selected = Some(20);
-        app.scroll_offset_y = 640.0;
+        app.grid_scroll.set_position(640.0);
         app.load_zip_as_folder_prepared(
             zip.clone(),
             crate::zip_loader::PreparedZipEnumeration::prepare(
@@ -23853,7 +23979,7 @@ mod phase_c_folder_nav_history_tests {
         install_1328_parent(&mut app, &target, items);
         assert_eq!(restore_intent, crate::app::StartupListIntent::ExplicitList);
         assert_eq!(app.selected, Some(20));
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
     }
 
     #[test]
@@ -23879,7 +24005,7 @@ mod phase_c_folder_nav_history_tests {
             ];
             install_1328_parent(&mut app, &parent, items.clone());
             app.selected = Some(1);
-            app.scroll_offset_y = 320.0;
+            app.grid_scroll.set_position(320.0);
             app.record_folder_nav_transition(&source);
             app.load_zip_as_folder_prepared_with_logical_source(
                 backing.clone(),
@@ -23904,8 +24030,8 @@ mod phase_c_folder_nav_history_tests {
             let target = parent.clone();
             install_1328_parent(&mut app, &target, items);
             assert_eq!(app.selected, Some(1));
-            assert_eq!(app.scroll_offset_y, 320.0);
-            assert!(app.scroll_to_selected);
+            assert_eq!(app.grid_scroll.offset(), 320.0);
+            assert!(app.grid_scroll.reveal_requested());
         }
     }
 
@@ -23922,7 +24048,7 @@ mod phase_c_folder_nav_history_tests {
         ];
         install_1328_parent(&mut app, &parent, items.clone());
         app.selected = Some(1);
-        app.scroll_offset_y = 320.0;
+        app.grid_scroll.set_position(320.0);
         app.record_folder_nav_transition(&pdf);
         let pages = (0..4)
             .map(|page_num| crate::pdf_loader::PdfPageEntry {
@@ -23949,8 +24075,8 @@ mod phase_c_folder_nav_history_tests {
         let target = parent.clone();
         install_1328_parent(&mut app, &target, items);
         assert_eq!(app.selected, Some(1));
-        assert_eq!(app.scroll_offset_y, 320.0);
-        assert!(app.scroll_to_selected);
+        assert_eq!(app.grid_scroll.offset(), 320.0);
+        assert!(app.grid_scroll.reveal_requested());
     }
 
     #[test]
@@ -25209,7 +25335,7 @@ mod phase_c_folder_nav_history_tests {
             app.settings.thumb_aspect_auto = true;
             app.auto_aspect.current = Some(crate::settings::ThumbAspect::Portrait3x4);
             app.auto_aspect.samples.insert(0, 4.0 / 3.0);
-            app.scroll_offset_y = 420.0;
+            app.grid_scroll.set_position(420.0);
         }
         let owner = app.rating_view_physical_load_owner(&opened).unwrap();
         assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
@@ -25229,14 +25355,15 @@ mod phase_c_folder_nav_history_tests {
         assert!(app.items_are_rating_view);
         assert_eq!(app.selected, Some(4));
         assert_eq!(app.items[4].container_path(), Some(opened.as_path()));
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
         if auto {
             assert_eq!(
                 app.effective_thumb_aspect(),
                 crate::settings::ThumbAspect::Portrait3x4
             );
             assert_eq!(
-                app.scroll_offset_y, 420.0,
+                app.grid_scroll.offset(),
+                420.0,
                 "ZIP's empty pending UI must not overwrite the source"
             );
             assert!(
@@ -25314,6 +25441,7 @@ mod phase_c_folder_nav_history_tests {
             app.current_folder = Some(parent);
             app.enter_rating_view(3);
             finish_rating_navigation_for_test(&mut app);
+            let expected_rating_return = app.rating_view_return_to.clone();
             app.select_rating_view_row_for_opened_path(&opened);
             assert_eq!(app.selected, Some(4));
             let nav = app.grid_physical_navigation(4, opened.clone(), false);
@@ -25347,7 +25475,12 @@ mod phase_c_folder_nav_history_tests {
             assert_eq!(app.rating_view_nav_stack, vec![opened.clone()]);
             assert_eq!(
                 app.folder_history_back_target(),
-                Some(&FolderNavHistoryTarget::Rating { stars: 3 })
+                Some(&FolderNavHistoryTarget::Rating(
+                    top_level_grid_view::RatingRootRestore {
+                        stars: 3,
+                        return_to: expected_rating_return.clone()
+                    }
+                ))
             );
             app.selected = Some(3);
             if backspace {
@@ -25369,7 +25502,7 @@ mod phase_c_folder_nav_history_tests {
             assert!(app.items_are_rating_view);
             assert_eq!(app.selected, Some(4));
             assert_eq!(app.items[4].container_path(), Some(opened.as_path()));
-            assert!(app.scroll_to_selected);
+            assert!(app.grid_scroll.reveal_requested());
             if replay_forward {
                 app.dispatch_main_folder_history_input(FolderHistoryDirection::Forward);
                 if pdf {
@@ -25399,7 +25532,7 @@ mod phase_c_folder_nav_history_tests {
                 assert!(app.items_are_rating_view);
                 assert_eq!(app.selected, Some(4));
                 assert_eq!(app.items[4].container_path(), Some(opened.as_path()));
-                assert!(app.scroll_to_selected);
+                assert!(app.grid_scroll.reveal_requested());
             }
         }
     }
@@ -25534,12 +25667,14 @@ mod phase_c_folder_nav_history_tests {
                 .unwrap();
             let center =
                 (position / app.last_grid_cols) as f32 * app.last_cell_h + 0.5 * app.last_cell_h;
-            center >= app.scroll_offset_y && center <= app.scroll_offset_y + app.last_viewport_h
+            center >= app.grid_scroll.offset()
+                && center <= app.grid_scroll.offset() + app.last_viewport_h
         }
         draw(&mut app, &ctx, &mut frame);
         app.selected = Some(309);
-        app.scroll_offset_y = 25.0 * app.last_cell_h;
-        app.scroll_to_selected = true;
+        let scroll_offset = 25.0 * app.last_cell_h;
+        app.grid_scroll.set_position(scroll_offset);
+        app.grid_scroll.set_reveal_requested(true);
         for _ in 0..3 {
             draw(&mut app, &ctx, &mut frame);
         }
@@ -25551,7 +25686,7 @@ mod phase_c_folder_nav_history_tests {
             app.last_cell_h,
             app.last_grid_cols
         );
-        let saved_offset = app.scroll_offset_y;
+        let saved_offset = app.grid_scroll.offset();
         let catalog = app.current_color_catalog.as_ref().unwrap();
         for (index, item) in app.items.iter().enumerate().take(24) {
             let (mtime, size) = app.image_metas[index].unwrap();
@@ -25594,7 +25729,7 @@ mod phase_c_folder_nav_history_tests {
             assert_eq!(app.effective_folder(), Some(opened.clone()));
             assert_eq!(app.settings.grid_cols, 6);
             app.selected = Some(3);
-            app.scroll_to_selected = true;
+            app.grid_scroll.set_reveal_requested(true);
             for index in 0..8 {
                 app.auto_aspect.samples.insert(index, 1.5);
             }
@@ -25622,13 +25757,14 @@ mod phase_c_folder_nav_history_tests {
                     "opened folder lost visibility: cols={} cell={} offset={} viewport={} selected={:?}",
                     app.last_grid_cols,
                     app.last_cell_h,
-                    app.scroll_offset_y,
+                    app.grid_scroll.offset(),
                     app.last_viewport_h,
                     app.selected
                 );
             }
             assert_eq!(
-                app.scroll_offset_y, saved_offset,
+                app.grid_scroll.offset(),
+                saved_offset,
                 "mid-list position walked toward the end"
             );
             if roundtrip && attempt == 0 {
@@ -25854,13 +25990,14 @@ mod phase_c_folder_nav_history_tests {
                 .unwrap()
                 / app.settings.grid_cols;
             let center = (row as f32 + 0.5) * app.last_cell_h;
-            center >= app.scroll_offset_y && center <= app.scroll_offset_y + app.last_viewport_h
+            center >= app.grid_scroll.offset()
+                && center <= app.grid_scroll.offset() + app.last_viewport_h
         }
         draw(&mut app, &ctx);
         draw(&mut app, &ctx);
         assert_eq!(app.selected, Some(104));
         assert!(visible(&app));
-        let saved_offset = app.scroll_offset_y;
+        let saved_offset = app.grid_scroll.offset();
         assert!(saved_offset > 0.0);
         if warm {
             let catalog = app.current_color_catalog.as_ref().unwrap();
@@ -25909,7 +26046,7 @@ mod phase_c_folder_nav_history_tests {
             app.cancel_token.store(true, Ordering::Relaxed);
             assert_eq!(app.effective_folder(), Some(opened.clone()));
             app.selected = Some(3);
-            app.scroll_to_selected = true;
+            app.grid_scroll.set_reveal_requested(true);
             if warm {
                 // The departing image grid has a different shape from the Rating grid.
                 app.auto_aspect.current = Some(ThumbAspect::Portrait2x3);
@@ -25933,7 +26070,7 @@ mod phase_c_folder_nav_history_tests {
                     app.auto_aspect.switches_done, 0,
                     "saved aspect must seed Hold"
                 );
-                assert_eq!(app.scroll_offset_y, saved_offset);
+                assert_eq!(app.grid_scroll.offset(), saved_offset);
             }
             draw(&mut app, &ctx);
             assert!(
@@ -25955,7 +26092,8 @@ mod phase_c_folder_nav_history_tests {
             );
             assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Portrait3x4);
             assert_eq!(
-                app.scroll_offset_y, saved_offset,
+                app.grid_scroll.offset(),
+                saved_offset,
                 "position and aspect belong together"
             );
             if roundtrip && attempt == 0 {
@@ -26053,7 +26191,7 @@ mod phase_c_folder_nav_history_tests {
         app.open_global_search();
         // These are still the adopted star-3 rows, although the surface is now Search.
         app.selected = Some(4);
-        app.scroll_offset_y = 725.0;
+        app.grid_scroll.set_position(725.0);
         let expected = app.rating_path_key(4).unwrap();
         app.enter_rating_view(5);
         finish_rating_navigation_for_test(&mut app);
@@ -26070,7 +26208,7 @@ mod phase_c_folder_nav_history_tests {
         app.enter_rating_view(3);
         finish_rating_navigation_for_test(&mut app);
         assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(expected));
-        assert_eq!(app.scroll_offset_y, 725.0);
+        assert_eq!(app.grid_scroll.offset(), 725.0);
     }
 
     #[test]
@@ -26094,7 +26232,7 @@ mod phase_c_folder_nav_history_tests {
             finish_rating_navigation_for_test(&mut app);
             assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(saved_key));
             app.selected = Some(4);
-            app.scroll_offset_y = 500.0;
+            app.grid_scroll.set_position(500.0);
             let expected = app.rating_path_key(4).unwrap();
             let results = app.items.clone();
             match mode {
@@ -26114,7 +26252,7 @@ mod phase_c_folder_nav_history_tests {
             finish_rating_navigation_for_test(&mut app);
             assert!(app.items_are_rating_view);
             assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(expected));
-            assert_eq!(app.scroll_offset_y, 500.0);
+            assert_eq!(app.grid_scroll.offset(), 500.0);
         }
     }
 
@@ -26131,14 +26269,14 @@ mod phase_c_folder_nav_history_tests {
         app.open_global_search();
         // Until the first result arrives, the old Rating grid remains interactive.
         app.selected = Some(4);
-        app.scroll_offset_y = 600.0;
+        app.grid_scroll.set_position(600.0);
         let expected = app.rating_path_key(4).unwrap();
         let results = app.items.clone();
         app.replace_search_view_items(results, vec![None; 6]);
         app.close_global_search();
         finish_rating_navigation_for_test(&mut app);
         assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(expected));
-        assert_eq!(app.scroll_offset_y, 600.0);
+        assert_eq!(app.grid_scroll.offset(), 600.0);
     }
 
     #[test]
@@ -26152,18 +26290,20 @@ mod phase_c_folder_nav_history_tests {
         app.selected = Some(0);
         app.note_session_grid_positions();
         app.selected = Some(4);
-        app.scroll_offset_y = 700.0;
+        app.grid_scroll.set_position(700.0);
         let expected = app.rating_path_key(4).unwrap();
         app.open_collection_grid_after_context_change(
             crate::collection_store::CollectionId::new(),
             None,
-            Some(super::top_level_grid_view::TopLevelGridRestore::Rating { stars: 3 }),
+            Some(super::top_level_grid_view::TopLevelGridRestore::Rating(
+                crate::app::tests::rating_root_for_test(3),
+            )),
         );
         assert!(!app.items_are_rating_view);
         app.enter_rating_view(3);
         finish_rating_navigation_for_test(&mut app);
         assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(expected));
-        assert_eq!(app.scroll_offset_y, 700.0);
+        assert_eq!(app.grid_scroll.offset(), 700.0);
     }
 
     #[test]
@@ -26199,7 +26339,7 @@ mod phase_c_folder_nav_history_tests {
         app.rating_view_rows = rating_1328_install_rows(&mut app);
         app.install_rating_view_rows();
         assert_eq!(app.selected, Some(3));
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
     }
 
     #[test]
@@ -26214,7 +26354,7 @@ mod phase_c_folder_nav_history_tests {
         app.enter_rating_view(3);
         finish_rating_navigation_for_test(&mut app);
         app.selected = Some(4);
-        app.scroll_offset_y = 500.0;
+        app.grid_scroll.set_position(500.0);
         app.auto_aspect.current = Some(ThumbAspect::Portrait3x4);
         app.auto_aspect.samples = (0..6).map(|index| (index, 4.0 / 3.0)).collect();
         app.auto_aspect.switches_done = 2;
@@ -26237,7 +26377,7 @@ mod phase_c_folder_nav_history_tests {
         assert!(app.start_rating_history_replay(FolderHistoryDirection::Back, 3));
         finish_rating_navigation_for_test(&mut app);
         assert_eq!(app.selected, Some(4));
-        assert_eq!(app.scroll_offset_y, 500.0);
+        assert_eq!(app.grid_scroll.offset(), 500.0);
         assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Portrait3x4);
         assert!(app.auto_aspect.samples.is_empty());
         assert_eq!(app.auto_aspect.cached_sample_gate, Some(6));
@@ -26276,7 +26416,7 @@ mod phase_c_folder_nav_history_tests {
         app.settings.thumb_aspect = crate::settings::ThumbAspect::Landscape4x3;
         app.install_rating_view_rows();
         assert_eq!(app.selected, Some(4));
-        assert_eq!(app.scroll_offset_y, 200.0);
+        assert_eq!(app.grid_scroll.offset(), 200.0);
         assert_eq!(
             app.effective_thumb_aspect(),
             crate::settings::ThumbAspect::Landscape4x3
@@ -26293,7 +26433,7 @@ mod phase_c_folder_nav_history_tests {
         write_1328_zip(&zip);
         install_1328_parent(&mut app, &parent, vec![GridItem::ZipFile(zip.clone())]);
         app.selected = Some(0);
-        app.scroll_offset_y = 320.0;
+        app.grid_scroll.set_position(320.0);
         app.capture_main_list_restore_cursor();
         let startup_before = app.settings.startup_list_restore.clone();
         app.load_zip_as_folder_prepared(
@@ -26350,6 +26490,7 @@ mod phase_c_folder_nav_history_tests {
 
         app.enter_rating_view_from_menu(3);
         finish_rating_navigation_for_test(&mut app);
+        let expected_rating_return = app.rating_view_return_to.clone();
 
         app.enter_rating_view_from_menu(5);
         finish_rating_navigation_for_test(&mut app);
@@ -26358,7 +26499,10 @@ mod phase_c_folder_nav_history_tests {
             app.folder_nav_back_stack,
             vec![
                 FolderNavHistoryTarget::Path(real.clone()),
-                FolderNavHistoryTarget::Rating { stars: 3 },
+                FolderNavHistoryTarget::Rating(top_level_grid_view::RatingRootRestore {
+                    stars: 3,
+                    return_to: expected_rating_return.clone()
+                }),
             ]
         );
 
@@ -26371,7 +26515,12 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.rating_view_stars, 3);
         assert_eq!(
             app.folder_nav_forward_stack,
-            vec![FolderNavHistoryTarget::Rating { stars: 5 }]
+            vec![FolderNavHistoryTarget::Rating(
+                top_level_grid_view::RatingRootRestore {
+                    stars: 5,
+                    return_to: expected_rating_return.clone()
+                }
+            )]
         );
 
         assert!(app.start_rating_history_replay(FolderHistoryDirection::Forward, 5));
@@ -26381,7 +26530,10 @@ mod phase_c_folder_nav_history_tests {
             app.folder_nav_back_stack,
             vec![
                 FolderNavHistoryTarget::Path(real),
-                FolderNavHistoryTarget::Rating { stars: 3 },
+                FolderNavHistoryTarget::Rating(top_level_grid_view::RatingRootRestore {
+                    stars: 3,
+                    return_to: expected_rating_return.clone()
+                }),
             ]
         );
     }
@@ -26438,6 +26590,8 @@ mod phase_c_folder_nav_history_tests {
         app.current_folder = Some(saved);
         app.enter_rating_view_from_menu(1);
         finish_rating_navigation_for_test(&mut app);
+        let expected_return = app.rating_view_return_to.clone();
+        assert!(expected_return.is_some());
         let before = app.folder_nav_history_snapshot();
         let owner = app.rating_view_physical_load_owner(&pdf).unwrap();
         assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
@@ -26453,6 +26607,7 @@ mod phase_c_folder_nav_history_tests {
             app.top_level_grid_view.surface(),
             super::top_level_grid_view::TopLevelGridSurface::Rating { stars: 1 }
         ));
+        assert_eq!(app.rating_view_return_to, expected_return);
         assert_eq!(app.folder_nav_back_stack, before.back_stack);
         assert!(app.cancel_pdf_password_dialog_request());
         assert!(
@@ -26462,6 +26617,7 @@ mod phase_c_folder_nav_history_tests {
         );
         assert!(app.grid_item_input_allowed());
         assert!(app.items_are_rating_view);
+        assert_eq!(app.rating_view_return_to, expected_return);
         assert_eq!(app.folder_nav_back_stack, before.back_stack);
         assert_eq!(app.folder_nav_forward_stack, before.forward_stack);
     }
@@ -26478,6 +26634,7 @@ mod phase_c_folder_nav_history_tests {
         app.current_folder = Some(saved);
         app.enter_rating_view_from_menu(1);
         finish_rating_navigation_for_test(&mut app);
+        let expected_rating_return = app.rating_view_return_to.clone();
         let before = app.folder_nav_history_snapshot();
 
         let owner = app.rating_view_physical_load_owner(&pdf).unwrap();
@@ -26512,7 +26669,12 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.rating_view_nav_stack, vec![pdf]);
         assert_eq!(
             app.folder_history_back_target(),
-            Some(&FolderNavHistoryTarget::Rating { stars: 1 })
+            Some(&FolderNavHistoryTarget::Rating(
+                top_level_grid_view::RatingRootRestore {
+                    stars: 1,
+                    return_to: expected_rating_return.clone()
+                }
+            ))
         );
         assert!(
             app.top_level_grid_view
@@ -26583,6 +26745,8 @@ mod phase_c_folder_nav_history_tests {
         app.current_folder = Some(saved);
         app.enter_rating_view_from_menu(1);
         finish_rating_navigation_for_test(&mut app);
+        let expected_return = app.rating_view_return_to.clone();
+        assert!(expected_return.is_some());
         let before = app.folder_nav_history_snapshot();
 
         let _id = start_staged_rating_conversion_for_test(&mut app, &source);
@@ -26591,6 +26755,7 @@ mod phase_c_folder_nav_history_tests {
             app.top_level_grid_view.surface(),
             super::top_level_grid_view::TopLevelGridSurface::Rating { stars: 1 }
         ));
+        assert_eq!(app.rating_view_return_to, expected_return);
         assert_eq!(app.folder_nav_back_stack, before.back_stack);
         assert!(app.cancel_archive_convert_for_navigation("test_staged_cancel"));
         app.poll_collection_history_transition(&egui::Context::default());
@@ -26603,6 +26768,7 @@ mod phase_c_folder_nav_history_tests {
         assert!(app.grid_item_input_allowed());
         assert!(app.items_are_rating_view);
         assert!(app.rating_view_nav_stack.is_empty());
+        assert_eq!(app.rating_view_return_to, expected_return);
         assert_eq!(app.folder_nav_back_stack, before.back_stack);
         assert_eq!(app.folder_nav_forward_stack, before.forward_stack);
     }
@@ -26706,6 +26872,7 @@ mod phase_c_folder_nav_history_tests {
         app.current_folder = Some(saved);
         app.enter_rating_view_from_menu(1);
         finish_rating_navigation_for_test(&mut app);
+        let expected_rating_return = app.rating_view_return_to.clone();
         let before = app.folder_nav_history_snapshot();
 
         let id = start_staged_rating_conversion_for_test(&mut app, &source);
@@ -26727,7 +26894,12 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.rating_view_nav_stack, vec![source]);
         assert_eq!(
             app.folder_history_back_target(),
-            Some(&FolderNavHistoryTarget::Rating { stars: 1 })
+            Some(&FolderNavHistoryTarget::Rating(
+                top_level_grid_view::RatingRootRestore {
+                    stars: 1,
+                    return_to: expected_rating_return.clone()
+                }
+            ))
         );
     }
 
@@ -26746,7 +26918,11 @@ mod phase_c_folder_nav_history_tests {
 
         app.enter_rating_view_from_menu(1);
         finish_rating_navigation_for_test(&mut app);
-        let rating = FolderNavHistoryTarget::Rating { stars: 1 };
+        let expected_rating_return = app.rating_view_return_to.clone();
+        let rating = FolderNavHistoryTarget::Rating(top_level_grid_view::RatingRootRestore {
+            stars: 1,
+            return_to: expected_rating_return.clone(),
+        });
         let owner_f = app
             .rating_view_physical_load_owner(&f)
             .expect("Rating root owns F");
@@ -26895,6 +27071,7 @@ mod phase_c_folder_nav_history_tests {
         // 通常アドレスバー (quick folder A/B スロット非アクティブ) の ←/→ 経路。
         app.active_quick_folder_slot = None;
         app.current_folder = Some(super::reading_history_synthetic_path());
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(real.clone()).into()];
         app.folder_nav_forward_stack = Vec::new();
 
@@ -26919,7 +27096,9 @@ mod phase_c_folder_nav_history_tests {
         // 現在地だった合成パスを forward に残し、ビューへ戻せる。
         assert_eq!(
             app.folder_nav_forward_stack,
-            vec![super::reading_history_synthetic_path()]
+            vec![FolderNavHistoryTarget::ReadingHistory(
+                top_level_grid_view::ReadingHistoryRootRestore::unavailable()
+            )]
         );
     }
 
@@ -26958,7 +27137,9 @@ mod phase_c_folder_nav_history_tests {
         plan.commit(&mut app);
         assert_eq!(
             app.folder_nav_back_stack,
-            vec![FolderNavHistoryTarget::Rating { stars: 4 }]
+            vec![FolderNavHistoryTarget::Rating(
+                crate::app::tests::rating_root_for_test(4)
+            )]
         );
     }
 
@@ -26980,22 +27161,21 @@ mod phase_c_folder_nav_history_tests {
             Some(&super::reading_history_synthetic_path())
         );
 
+        let history_root = app
+            .folder_nav_current_target()
+            .expect("reading-history root");
         app.load_folder(after.clone());
         app.finish_page_identity_preparation_for_test();
         assert_eq!(
             app.folder_nav_back_stack
                 .last()
                 .map(|entry| &entry.location),
-            Some(&FolderNavHistoryTarget::Path(
-                super::reading_history_synthetic_path()
-            ))
+            Some(&history_root.clone())
         );
 
         assert_eq!(
             app.folder_history_back_target(),
-            Some(&FolderNavHistoryTarget::Path(
-                super::reading_history_synthetic_path()
-            ))
+            Some(&history_root.clone())
         );
         app.finish_page_identity_preparation_for_test();
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
@@ -27022,9 +27202,7 @@ mod phase_c_folder_nav_history_tests {
 
         assert_eq!(
             app.folder_history_back_target(),
-            Some(&FolderNavHistoryTarget::Path(
-                super::reading_history_synthetic_path()
-            ))
+            Some(&history_root.clone())
         );
         app.finish_page_identity_preparation_for_test();
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
@@ -27043,9 +27221,9 @@ mod phase_c_folder_nav_history_tests {
         rating_app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(prior.clone()).into()];
         rating_app.set_active_folder_nav_suppress_record_once(true);
         assert_eq!(
-            rating_app.dispatch_synthetic_folder_history_target(&FolderNavHistoryTarget::Rating {
-                stars: 4
-            }),
+            rating_app.dispatch_synthetic_folder_history_target(&FolderNavHistoryTarget::Rating(
+                crate::app::tests::rating_root_for_test(4)
+            )),
             super::SyntheticFolderHistoryDispatch::Restored
         );
         // The old physical location remains current until the Rating rows are installed.
@@ -27081,7 +27259,9 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(rating_app.address, "★★★★ レーティング一覧");
         assert_eq!(
             rating_app.folder_nav_current_target(),
-            Some(FolderNavHistoryTarget::Rating { stars: 4 })
+            Some(FolderNavHistoryTarget::Rating(
+                crate::app::tests::rating_root_for_test(4)
+            ))
         );
         assert!(
             !rating_app.suppress_folder_nav_record_once,
@@ -27165,7 +27345,7 @@ mod phase_c_folder_nav_history_tests {
         app.current_folder = Some(real.clone());
         let slot = QuickFolderSlotId::A;
         app.quick_folder_workspaces[slot.index()].history.back_stack =
-            vec![FolderNavHistoryTarget::Rating { stars: 0 }.into()];
+            vec![FolderNavHistoryTarget::Rating(crate::app::tests::rating_root_for_test(0)).into()];
         let snapshot = app.folder_nav_history_snapshot();
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
         assert_eq!(
@@ -27176,7 +27356,9 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.current_folder.as_ref(), Some(&real));
         assert_eq!(
             app.quick_folder_workspaces[slot.index()].history.back_stack,
-            vec![FolderNavHistoryTarget::Rating { stars: 0 }]
+            vec![FolderNavHistoryTarget::Rating(
+                crate::app::tests::rating_root_for_test(0)
+            )]
         );
         assert!(
             app.quick_folder_workspaces[slot.index()]
@@ -27571,7 +27753,7 @@ mod phase_c_folder_nav_history_tests {
             item.drag_source_path()
                 .is_some_and(|path| crate::folder_tree::path_eq(path, &selected_path))
         }));
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
         assert_eq!(app.recent_folder_entries().first(), Some(&destination));
         assert_eq!(
             app.quick_folder_workspaces[slot.index()].history.back_stack,
@@ -27599,10 +27781,12 @@ mod phase_c_folder_nav_history_tests {
         let book = destination.join("book.zip");
         std::fs::write(&book, b"not-a-real-zip").unwrap();
         app.install_new_items(vec![GridItem::ZipFile(book.clone())], vec![None]);
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.current_folder = Some(crate::app::reading_history_synthetic_path());
         app.top_level_grid_view
-            .replace_surface(TopLevelGridSurface::ReadingHistory);
+            .replace_surface(TopLevelGridSurface::ReadingHistory(
+                top_level_grid_view::ReadingHistoryRootRestore::unavailable(),
+            ));
 
         assert!(
             app.begin_context_jump_to_folder(JumpToFolderRequest {
@@ -27629,7 +27813,7 @@ mod phase_c_folder_nav_history_tests {
                     .is_some_and(|path| crate::folder_tree::path_eq(path, &book))
             })
         }));
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
     }
 
     #[cfg(windows)]
@@ -28365,7 +28549,7 @@ mod phase_c_folder_nav_history_tests {
                 app.items[selected].drag_source_path(),
                 Some(exact.as_path())
             );
-            assert!(app.scroll_to_selected);
+            assert!(app.grid_scroll.reveal_requested());
             assert_eq!(
                 app.folder_history_back_target(),
                 Some(&FolderNavHistoryTarget::Path(origin))
@@ -28404,7 +28588,9 @@ mod phase_c_folder_nav_history_tests {
         );
         app.top_level_grid_view.begin(
             TopLevelGridSurface::Search(TopLevelSearchView::Tag),
-            Some(TopLevelGridRestore::Rating { stars: 3 }),
+            Some(TopLevelGridRestore::Rating(
+                crate::app::tests::rating_root_for_test(3),
+            )),
         );
 
         assert!(
@@ -28421,7 +28607,9 @@ mod phase_c_folder_nav_history_tests {
         );
         assert!(matches!(
             app.top_level_grid_view.return_to(),
-            Some(TopLevelGridRestore::Rating { stars: 3 })
+            Some(TopLevelGridRestore::Rating(
+                top_level_grid_view::RatingRootRestore { stars: 3, .. }
+            ))
         ));
         assert!(
             !app.quick_folder_workspaces[slot.index()]
@@ -28445,7 +28633,7 @@ mod phase_c_folder_nav_history_tests {
                 .collect::<Vec<_>>(),
             vec![
                 FolderNavHistoryTarget::Path(older),
-                FolderNavHistoryTarget::Rating { stars: 3 }
+                FolderNavHistoryTarget::Rating(crate::app::tests::rating_root_for_test(3))
             ]
         );
     }
@@ -28734,7 +28922,7 @@ mod phase_c_folder_nav_history_tests {
         // スクロールして scroll_offset_y が C 本来の値から乖離している状態。
         app.current_folder = Some(c.clone());
         app.items_are_global_search_view = true;
-        app.scroll_offset_y = 999.0;
+        app.grid_scroll.set_position(999.0);
         app.selected = Some(7);
         app.folder_history.insert(c.clone(), (42.0, Some(3)));
 
@@ -28759,7 +28947,7 @@ mod phase_c_folder_nav_history_tests {
         std::fs::create_dir_all(&x).unwrap();
         app.current_folder = Some(d.clone());
         app.items_are_global_search_view = false;
-        app.scroll_offset_y = 555.0;
+        app.grid_scroll.set_position(555.0);
         app.selected = Some(9);
 
         app.start_loading_items(
@@ -28788,7 +28976,7 @@ mod phase_c_folder_nav_history_tests {
         app.items.clear();
         app.visible_indices.clear();
         app.selected = None;
-        app.scroll_offset_y = 0.0;
+        app.grid_scroll.set_position(0.0);
 
         app.start_loading_items(
             zip.clone(),
@@ -28803,7 +28991,7 @@ mod phase_c_folder_nav_history_tests {
         );
 
         assert_eq!(app.selected, Some(0));
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
     }
 }
 
@@ -28827,6 +29015,7 @@ mod phase_c_folder_nav_history_tests {
 #[cfg(test)]
 mod phase_c_drill_nav_tests {
     use super::phase_c_support::setup_app;
+    use crate::app::top_level_grid_view;
     use crate::app::{
         AdjustmentDragSession, App, FacetField, GridEditBadges, subfolder_expansion_synthetic_path,
     };
@@ -31044,8 +31233,8 @@ mod phase_c_drill_nav_tests {
             Some(0),
             "旧選択アイテムが消えたので先頭の可視アイテムへフォールバック"
         );
-        assert_eq!(app.scroll_offset_y, 0.0, "復元失敗時は先頭スクロール");
-        assert!(app.scroll_to_selected);
+        assert_eq!(app.grid_scroll.offset(), 0.0, "復元失敗時は先頭スクロール");
+        assert!(app.grid_scroll.reveal_requested());
     }
 
     /// Codex P2: Ctrl+G から実フォルダ/ZIP/PDF を開いた状態で rating 変更すると、
@@ -31093,7 +31282,7 @@ mod phase_c_drill_nav_tests {
     fn install_new_items_resets_reading_history_view_state() {
         use crate::grid_item::GridItem;
         let mut app = setup_app();
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.reading_history_rows.insert(
             "c:/books/a.zip".to_string(),
             crate::reading_history_db::ReadingHistoryEntry {
@@ -31468,7 +31657,7 @@ mod phase_c_drill_nav_tests {
             ),
         });
         app.rating_view_stars = 3;
-        app.rating_view_saved_folder = Some(subfolder_expansion_synthetic_path());
+        app.rating_view_return_to = Some(crate::app::tests::expansion_origin_for_test(&app));
 
         app.apply_rating_view_result(crate::rating_view::RatingViewBuildResult {
             visibility_notice: None,
@@ -31736,7 +31925,7 @@ mod phase_c_drill_nav_tests {
         let path = std::path::PathBuf::from("c:/books/a.zip");
         let key = crate::path_key::normalize_keep_drive(&path);
 
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.items = vec![GridItem::ZipFile(path.clone())];
         app.reading_history_rows.insert(
             key.clone(),
@@ -31843,7 +32032,7 @@ mod phase_c_drill_nav_tests {
             ("c:/books/book.pdf", ReadingHistoryKind::Pdf),
             ("c:/books/book.rar", ReadingHistoryKind::Archive),
         ];
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         for (path, kind) in specs {
             let path = std::path::PathBuf::from(path);
             let entry = ReadingHistoryEntry::new(
@@ -31899,7 +32088,7 @@ mod phase_c_drill_nav_tests {
             ("c:/other/song.flac", ReadingHistoryKind::Audio),
             ("c:/books/book.zip", ReadingHistoryKind::Zip),
         ];
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         for (path, kind) in specs {
             let path = std::path::PathBuf::from(path);
             let entry = ReadingHistoryEntry::new(
@@ -32063,7 +32252,7 @@ mod phase_c_drill_nav_tests {
         );
         entry.media_position_ms = Some(95_000);
         entry.media_duration_ms = Some(100_000);
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.items = vec![GridItem::Video(path)];
         app.reading_history_rows.insert(entry.key.clone(), entry);
 
@@ -32117,7 +32306,7 @@ mod phase_c_drill_nav_tests {
         let path = app.tmp.path().join("missing.zip");
         let key = crate::path_key::normalize_keep_drive(&path);
 
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.items = vec![GridItem::ZipFile(path.clone())];
         app.thumbnails = vec![ThumbnailState::Pending];
         app.image_metas = vec![None];
@@ -32162,29 +32351,33 @@ mod phase_c_drill_nav_tests {
         let mut app = setup_app();
 
         // 閲覧履歴ビューで本 (ZIP) を開いた → 戻り先予約が立つ。
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.items = vec![GridItem::ZipFile(std::path::PathBuf::from(
             "c:/books/a.zip",
         ))];
         app.note_reading_history_open(0);
         assert_eq!(
             app.reading_history_return_from,
-            Some(std::path::PathBuf::from("c:/books/a.zip"))
+            Some(crate::app::tests::reading_history_return_for_test(
+                std::path::PathBuf::from("c:/books/a.zip")
+            ))
         );
 
         // 本を開いた後 (ビューを抜け current_folder = 本) は、親へ戻る操作で閲覧履歴へ。
         app.items_are_reading_history_view = false;
+        app.top_level_grid_view
+            .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
         app.current_folder = Some(std::path::PathBuf::from("c:/books/a.zip"));
         assert!(matches!(
             app.reading_history_back_nav(),
             Some(crate::ui_main::AddressBarNav::ReadingHistory(
-                crate::app::ReadingHistoryEntrance::Return
+                crate::app::ReadingHistoryEntrance::Return(_)
             ))
         ));
         assert!(matches!(
             app.handle_grid_parent_folder_action(),
             Some(crate::ui_main::AddressBarNav::ReadingHistory(
-                crate::app::ReadingHistoryEntrance::Return
+                crate::app::ReadingHistoryEntrance::Return(_)
             ))
         ));
 
@@ -32197,6 +32390,8 @@ mod phase_c_drill_nav_tests {
         // 閲覧履歴ビュー外で開いても予約は立たない。
         app.reading_history_return_from = None;
         app.items_are_reading_history_view = false;
+        app.top_level_grid_view
+            .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
         app.note_reading_history_open(0);
         assert!(app.reading_history_return_from.is_none());
     }
@@ -32207,23 +32402,29 @@ mod phase_c_drill_nav_tests {
         let mut app = setup_app();
 
         // 履歴から本を開いて予約を立てる。
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.items = vec![GridItem::ZipFile(std::path::PathBuf::from(
             "c:/books/a.zip",
         ))];
         app.note_reading_history_open(0);
         assert_eq!(
             app.reading_history_return_from,
-            Some(std::path::PathBuf::from("c:/books/a.zip"))
+            Some(crate::app::tests::reading_history_return_for_test(
+                std::path::PathBuf::from("c:/books/a.zip")
+            ))
         );
 
         // 本の中でページ (画像) を開くだけでは予約は維持される。
         app.items_are_reading_history_view = false;
+        app.top_level_grid_view
+            .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
         app.items = vec![GridItem::Image(std::path::PathBuf::from("c:/books/p1.jpg"))];
         app.note_reading_history_open(0);
         assert_eq!(
             app.reading_history_return_from,
-            Some(std::path::PathBuf::from("c:/books/a.zip"))
+            Some(crate::app::tests::reading_history_return_for_test(
+                std::path::PathBuf::from("c:/books/a.zip")
+            ))
         );
 
         // 閲覧履歴ビュー以外で別のコンテナを開いたら予約を捨てる
@@ -32245,7 +32446,11 @@ mod phase_c_drill_nav_tests {
         app.settings.auto_fullscreen_zip_pdf = true;
         app.current_folder = Some(reserved_book.clone());
         app.items_are_reading_history_view = false;
-        app.reading_history_return_from = Some(reserved_book.clone());
+        app.top_level_grid_view
+            .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
+        app.reading_history_return_from = Some(crate::app::tests::reading_history_return_for_test(
+            reserved_book.clone(),
+        ));
         app.items = vec![GridItem::PdfFile(detached_book)];
         app.thumbnails = vec![ThumbnailState::Pending];
         app.image_metas = vec![None];
@@ -32263,13 +32468,15 @@ mod phase_c_drill_nav_tests {
         );
         assert_eq!(
             app.reading_history_return_from,
-            Some(reserved_book.clone()),
+            Some(crate::app::tests::reading_history_return_for_test(
+                reserved_book.clone()
+            )),
             "detached navigation must not clear the mounted main reservation"
         );
         assert!(matches!(
             app.reading_history_back_nav(),
             Some(crate::ui_main::AddressBarNav::ReadingHistory(
-                crate::app::ReadingHistoryEntrance::Return
+                crate::app::ReadingHistoryEntrance::Return(_)
             ))
         ));
     }
@@ -32292,7 +32499,12 @@ mod phase_c_drill_nav_tests {
             app.settings.detached_viewer_open_images_in_window = false;
             app.settings.auto_fullscreen_zip_pdf = false;
             app.items_are_reading_history_view = from_history;
-            app.reading_history_return_from = Some(previous.clone());
+            if from_history {
+                crate::app::tests::install_reading_history_surface_for_test(&mut app);
+            }
+            app.reading_history_return_from = Some(
+                crate::app::tests::reading_history_return_for_test(previous.clone()),
+            );
             app.items = vec![GridItem::PdfFile(book.clone())];
             app.thumbnails = vec![ThumbnailState::Pending];
             app.image_metas = vec![None];
@@ -32307,11 +32519,11 @@ mod phase_c_drill_nav_tests {
             assert_eq!(intent.path, book.clone());
             assert_eq!(
                 intent.effects.reading_history_return_from,
-                from_history.then_some(book)
+                from_history.then(|| crate::app::tests::reading_history_return_for_test(book))
             );
             assert_eq!(
                 app.reading_history_return_from,
-                Some(previous),
+                Some(crate::app::tests::reading_history_return_for_test(previous)),
                 "reading-history state stays with the visible source until adoption"
             );
         }
@@ -32335,13 +32547,17 @@ mod phase_c_drill_nav_tests {
             let folder = parent.join("mixed-folder");
             std::fs::create_dir_all(folder.join("nested-container")).unwrap();
             let previous = app.tmp.path().join("previous.zip");
-            let initial_reservation = (!from_history).then_some(previous);
+            let initial_reservation = (!from_history)
+                .then(|| crate::app::tests::reading_history_return_for_test(previous));
             let scan = scan_directory(&folder);
 
             app.settings.detached_viewer_open_images_in_window = true;
             app.settings.auto_fullscreen_image_folders = true;
             app.current_folder = Some(parent);
             app.items_are_reading_history_view = from_history;
+            if from_history {
+                crate::app::tests::install_reading_history_surface_for_test(&mut app);
+            }
             app.reading_history_return_from = initial_reservation.clone();
             app.items = vec![GridItem::Folder(folder.clone())];
             app.thumbnails = vec![ThumbnailState::Pending];
@@ -32386,7 +32602,8 @@ mod phase_c_drill_nav_tests {
             assert_eq!(adopted_path, folder);
             assert_eq!(
                 app.reading_history_return_from,
-                from_history.then_some(adopted_path),
+                from_history
+                    .then(|| crate::app::tests::reading_history_return_for_test(adopted_path)),
                 "the adopted main fallback must preserve the historical set/clear semantics"
             );
         }
@@ -32399,7 +32616,7 @@ mod phase_c_drill_nav_tests {
         let mut app = setup_app();
 
         // 閲覧履歴の変換アーカイブを開く → 予約は (キャッシュ ZIP ではなく) 元アーカイブ。
-        app.items_are_reading_history_view = true;
+        crate::app::tests::install_reading_history_surface_for_test(&mut app);
         app.items = vec![GridItem::ConvertibleArchive {
             path: std::path::PathBuf::from("c:/books/a.rar"),
             format: ArchiveFormat::Rar,
@@ -32407,19 +32624,23 @@ mod phase_c_drill_nav_tests {
         app.note_reading_history_open(0);
         assert_eq!(
             app.reading_history_return_from,
-            Some(std::path::PathBuf::from("c:/books/a.rar"))
+            Some(crate::app::tests::reading_history_return_for_test(
+                std::path::PathBuf::from("c:/books/a.rar")
+            ))
         );
 
         // 開いた後は current_folder = キャッシュ ZIP / archive_source_override = 元アーカイブ。
         // open_archive_via_cache が予約を元アーカイブへ復元しているので、effective_folder()
         // (= override) と一致し、閉じると閲覧履歴へ戻る。
         app.items_are_reading_history_view = false;
+        app.top_level_grid_view
+            .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
         app.current_folder = Some(std::path::PathBuf::from("c:/cache/abcd/book.zip"));
         app.archive_source_override = Some(std::path::PathBuf::from("c:/books/a.rar"));
         assert!(matches!(
             app.reading_history_back_nav(),
             Some(crate::ui_main::AddressBarNav::ReadingHistory(
-                crate::app::ReadingHistoryEntrance::Return
+                crate::app::ReadingHistoryEntrance::Return(_)
             ))
         ));
 
@@ -32433,7 +32654,7 @@ mod phase_c_drill_nav_tests {
             grid: super::BookmarkViewReturnGridState {
                 row_keys: Vec::new(),
                 selected_key: None,
-                opened_key: (1, 1),
+                opened_key: Some((1, 1)),
                 scroll_offset_y: 0.0,
             },
         });
@@ -33005,14 +33226,14 @@ fn bookmark_return_preserves_exact_scroll_when_rows_are_unchanged() {
     let state = super::BookmarkViewReturnGridState::capture(&rows, Some(2), (0, 3), 240.0);
     app.bookmark_browser_rows = rows;
     app.visible_indices = vec![0, 1, 2];
-    app.pending_grid_scroll = Some(super::GridScrollIntent::Top);
+    app.grid_scroll.request_edge(super::GridScrollIntent::Top);
 
     app.restore_bookmark_view_grid(state, &[(0, 1), (0, 2), (0, 3)]);
 
     assert_eq!(app.selected, Some(2));
-    assert_eq!(app.scroll_offset_y, 240.0);
-    assert!(!app.scroll_to_selected);
-    assert!(app.pending_grid_scroll.is_none());
+    assert_eq!(app.grid_scroll.offset(), 240.0);
+    assert!(!app.grid_scroll.reveal_requested());
+    assert!(app.grid_scroll.pending_edge().is_none());
 }
 
 #[test]
@@ -33036,9 +33257,11 @@ fn bookmark_return_keeps_opened_row_visible_when_rows_changed() {
     app.restore_bookmark_view_grid(state, &[(0, 9), (0, 1), (0, 2), (0, 3)]);
 
     assert_eq!(app.selected, Some(3));
-    assert!(app.scroll_to_selected);
+    assert!(app.grid_scroll.reveal_requested());
+    app.grid_scroll
+        .record_geometry(GridScrollGeometry::new(1, 100.0, 200.0, 400.0));
     app.apply_scroll_to_selected(1, 100.0);
-    assert_eq!(app.scroll_offset_y, 200.0);
+    assert_eq!(app.grid_scroll.offset(), 200.0);
 }
 
 #[test]
@@ -33100,7 +33323,7 @@ fn bookmark_open_routes_fullscreen_close_back_to_bookmark_view() {
         grid: super::BookmarkViewReturnGridState {
             row_keys: vec![(1, 7)],
             selected_key: Some((1, 7)),
-            opened_key: (1, 7),
+            opened_key: Some((1, 7)),
             scroll_offset_y: 0.0,
         },
     });
@@ -33158,7 +33381,7 @@ fn bookmark_media_close_returns_only_while_original_file_is_open() {
             grid: super::BookmarkViewReturnGridState {
                 row_keys: vec![(0, 7)],
                 selected_key: Some((0, 7)),
-                opened_key: (0, 7),
+                opened_key: Some((0, 7)),
                 scroll_offset_y: 0.0,
             },
         });
@@ -33179,7 +33402,7 @@ fn bookmark_media_close_returns_only_while_original_file_is_open() {
             grid: super::BookmarkViewReturnGridState {
                 row_keys: vec![(0, 7)],
                 selected_key: Some((0, 7)),
-                opened_key: (0, 7),
+                opened_key: Some((0, 7)),
                 scroll_offset_y: 0.0,
             },
         });
@@ -33204,7 +33427,7 @@ fn native_immediate_close_consumes_bookmark_return_in_same_dispatch() {
         grid: super::BookmarkViewReturnGridState {
             row_keys: vec![(0, 7)],
             selected_key: Some((0, 7)),
-            opened_key: (0, 7),
+            opened_key: Some((0, 7)),
             scroll_offset_y: 240.0,
         },
     });
@@ -33230,7 +33453,7 @@ fn bookmark_return_target_is_cleared_only_after_container_navigation() {
         grid: super::BookmarkViewReturnGridState {
             row_keys: vec![(0, 7)],
             selected_key: Some((0, 7)),
-            opened_key: (0, 7),
+            opened_key: Some((0, 7)),
             scroll_offset_y: 240.0,
         },
     });
@@ -33260,7 +33483,7 @@ fn bookmark_open_pending_is_owned_by_viewer_context_bundle() {
     let return_grid = super::BookmarkViewReturnGridState {
         row_keys: vec![(0, 5), (0, 7)],
         selected_key: Some((0, 7)),
-        opened_key: (0, 7),
+        opened_key: Some((0, 7)),
         scroll_offset_y: 360.0,
     };
     app.bookmark_view_state = Some(super::BookmarkViewState::Opening {
@@ -33387,7 +33610,7 @@ fn arm_detached_bookmark_book_open(
         grid: super::BookmarkViewReturnGridState {
             row_keys: vec![(1, 9)],
             selected_key: Some((1, 9)),
-            opened_key: (1, 9),
+            opened_key: Some((1, 9)),
             scroll_offset_y: 320.0,
         },
     });
@@ -34289,7 +34512,7 @@ fn begin_detached_bookmark_media_test(
         grid: super::BookmarkViewReturnGridState {
             row_keys: vec![(0, 7)],
             selected_key: Some((0, 7)),
-            opened_key: (0, 7),
+            opened_key: Some((0, 7)),
             scroll_offset_y: 240.0,
         },
     });
@@ -34783,7 +35006,7 @@ fn fullfeature_bookmark_book_parks_active_bookmark_media_before_main_open() {
         grid: super::BookmarkViewReturnGridState {
             row_keys: vec![(1, 73)],
             selected_key: Some((1, 73)),
-            opened_key: (1, 73),
+            opened_key: Some((1, 73)),
             scroll_offset_y: 360.0,
         },
     });
@@ -37936,7 +38159,7 @@ mod favorite_adjustment_defaults_tests {
         // 保存時: 4 列 / 行高 200。idx 22 は 5 行目、画面の一番上は 3 行目 → 2 行下。
         app.last_grid_cols = 4;
         app.last_cell_h = 200.0;
-        app.scroll_offset_y = 600.0;
+        app.grid_scroll.set_position(600.0);
         app.selected = Some(22);
         let (name, rows_above) = app.cursor_to_persist().expect("保存できるはず");
         assert_eq!(name, "22.jpg");
@@ -37944,21 +38167,26 @@ mod favorite_adjustment_defaults_tests {
 
         // 復元時: 5 列 / 行高 150 に変わった。idx 22 は 4 行目なので、2 行下に見せるには
         // 一番上を 2 行目にする → 2 * 150。**保存した pt (600) をそのまま使うと違う行になる。**
-        app.scroll_offset_y = 0.0;
-        app.scroll_selected_to_rows_above = Some(rows_above);
+        app.grid_scroll.set_position(0.0);
+        app.grid_scroll.set_row_anchor(Some(rows_above));
+        app.grid_scroll
+            .record_geometry(GridScrollGeometry::new(5, 150.0, 600.0, 1200.0));
         app.apply_scroll_to_selected(5, 150.0);
-        assert_eq!(app.scroll_offset_y, 300.0);
+        assert_eq!(app.grid_scroll.offset(), 300.0);
         assert!(
-            app.scroll_selected_to_rows_above.is_none(),
+            app.grid_scroll.row_anchor().is_none(),
             "1 回で使い切ること (次のカーソル移動まで効き続けない)"
         );
 
         // 使い切った後は従来どおり「見える最小限だけ動かす」に戻る。
         app.last_viewport_h = 600.0;
-        app.scroll_offset_y = 0.0;
+        app.grid_scroll.set_position(0.0);
+        app.grid_scroll
+            .record_geometry(GridScrollGeometry::new(5, 150.0, 600.0, 1200.0));
         app.apply_scroll_to_selected(5, 150.0);
         assert_eq!(
-            app.scroll_offset_y, 150.0,
+            app.grid_scroll.offset(),
+            150.0,
             "行 4 が下端に入る最小の移動。行位置の復元ではない"
         );
     }
@@ -38013,7 +38241,7 @@ mod favorite_adjustment_defaults_tests {
             "ヒントは take() で消費される (次回 load に持ち越さない)"
         );
         assert!(
-            app.scroll_to_selected,
+            app.grid_scroll.reveal_requested(),
             "選択行を可視化するスクロール要求が立つ"
         );
     }
@@ -38051,11 +38279,12 @@ mod favorite_adjustment_defaults_tests {
             "select_after_load should still choose the returned child"
         );
         assert_eq!(
-            app.scroll_offset_y, 321.0,
+            app.grid_scroll.offset(),
+            321.0,
             "history scroll should be restored before selected visibility correction"
         );
         assert!(
-            app.scroll_to_selected,
+            app.grid_scroll.reveal_requested(),
             "render_grid should still ensure the selected child is visible if needed"
         );
     }
@@ -38072,7 +38301,7 @@ mod favorite_adjustment_defaults_tests {
         std::fs::write(&book, b"%PDF-1.4\n").unwrap();
 
         app.folder_history.insert(parent.clone(), (321.0, Some(0)));
-        app.scroll_offset_y = 900.0;
+        app.grid_scroll.set_position(900.0);
         app.last_scroll_offset_y_tracked = 900.0;
         app.last_scroll_change_time = Instant::now() - Duration::from_secs(5);
         let stale_idle_at = app.last_scroll_change_time;
@@ -38088,11 +38317,13 @@ mod favorite_adjustment_defaults_tests {
         app.finish_page_identity_preparation_for_test();
 
         assert_eq!(
-            app.scroll_offset_y, 321.0,
+            app.grid_scroll.offset(),
+            321.0,
             "history scroll should be restored first"
         );
         assert_eq!(
-            app.last_scroll_offset_y_tracked, app.scroll_offset_y,
+            app.last_scroll_offset_y_tracked,
+            app.grid_scroll.offset(),
             "idle upgrade tracking should start from the restored scroll position"
         );
         assert!(
@@ -38325,7 +38556,7 @@ mod favorite_adjustment_defaults_tests {
         app.requested.clear();
         // スクロールは十分前に停止済み。入力だけが境界付近。
         app.last_scroll_change_time = Instant::now() - Duration::from_secs(5);
-        app.last_scroll_offset_y_tracked = app.scroll_offset_y;
+        app.last_scroll_offset_y_tracked = app.grid_scroll.offset();
 
         // 旧実装では 500ms を超えた時点で None を返し、enqueue がフレーム境界で skip すると
         // そのまま就寝した。MARGIN 区間内ではまだ wake を要求し続ける必要がある。
@@ -39098,7 +39329,7 @@ mod favorite_adjustment_defaults_tests {
         app.rebuild_visible_indices();
 
         app.selected = Some(0);
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_reveal_requested(false);
         app.fullscreen_idx = Some(1);
 
         app.close_fullscreen();
@@ -39110,7 +39341,7 @@ mod favorite_adjustment_defaults_tests {
             "動画終了時も表示中だった動画セルへカーソルを戻す"
         );
         assert!(
-            app.scroll_to_selected,
+            app.grid_scroll.reveal_requested(),
             "次のグリッド描画で選択セルへスクロールする"
         );
     }
@@ -39286,7 +39517,7 @@ mod favorite_adjustment_defaults_tests {
             [1, 2].into_iter().collect::<std::collections::HashSet<_>>(),
             "複数件なら追加項目だけをチェックし、元のチェックは解除する"
         );
-        assert!(app.scroll_to_selected, "見える位置まで運ぶ");
+        assert!(app.grid_scroll.reveal_requested(), "見える位置まで運ぶ");
         assert_eq!(
             app.grid_click_selection_anchor
                 .and_then(|anchor| anchor.index_for_generation(app.items_generation)),
@@ -41667,10 +41898,11 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.fullscreen_idx, None);
         assert_eq!(app.selected, Some(0));
         assert_eq!(
-            app.scroll_offset_y, 240.0,
+            app.grid_scroll.offset(),
+            240.0,
             "parent list scroll should survive the direct-page close route"
         );
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
     }
 
     /// ウィンドウ内フルスクリーン (embedded still) では root 側キー処理が
@@ -48254,7 +48486,7 @@ mod favorite_adjustment_defaults_tests {
             GridItem::ZipDir { dir_prefix, .. } => assert_eq!(dir_prefix, "bookB/"),
             _ => panic!("expected GridItem::ZipDir at selected idx"),
         }
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
     }
 
     /// 単一ラッパー本のピン: 本の中で set される「実効 prefix キー」のピンが、親階層の
@@ -54072,6 +54304,7 @@ mod pipeline_cache_refactor_tests {
                     app.final_ai_cache.insert(
                         key,
                         FinalAiEntry {
+                            diagnostic_metadata: None,
                             canonical_dims: None,
                             source_size: [4, 6],
                             pixels: Arc::new(egui::ColorImage::filled(
@@ -54417,6 +54650,7 @@ mod pipeline_cache_refactor_tests {
                 bg: 0,
             },
             FinalAiEntry {
+                diagnostic_metadata: None,
                 canonical_dims: None,
                 source_size: [1, 1],
                 pixels: Arc::new(egui::ColorImage::new(
@@ -55235,6 +55469,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_pending.insert(ai_key, pending);
         final_ai_tx
             .send(FinalAiResult::Ready {
+                diagnostic: None,
                 canonical_dims: None,
                 job_id: 0,
                 key: ai_key,
@@ -55294,6 +55529,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                diagnostic: None,
                 pdf_metadata: None,
                 canonical_dims: None,
                 source_size: edit_pixels.size,
@@ -55404,6 +55640,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                diagnostic: None,
                 pdf_metadata: None,
                 canonical_dims: None,
                 source_size: source.size,
@@ -55486,6 +55723,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                diagnostic: None,
                 pdf_metadata: None,
                 canonical_dims: None,
                 source_size: [1, 1],
@@ -55619,6 +55857,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                diagnostic: None,
                 pdf_metadata: None,
                 canonical_dims: None,
                 source_size: [2, 2],
@@ -55667,6 +55906,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                diagnostic: None,
                 pdf_metadata: None,
                 canonical_dims: None,
                 source_size: [2, 2],
@@ -58289,6 +58529,7 @@ mod pipeline_cache_refactor_tests {
     ) -> (FinalAiPending, Arc<std::sync::atomic::AtomicBool>) {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pending = FinalAiPending {
+            feedback_request: crate::app::FinalAiFeedbackRequest::default(),
             job_id,
             cancel: Arc::clone(&cancel),
             retained_key: None,
@@ -58412,6 +58653,7 @@ mod pipeline_cache_refactor_tests {
         let (pending, _c) = make_fake_final_ai_pending();
         app.final_ai_pending.insert(ready_key, pending);
         tx.send(FinalAiResult::Ready {
+            diagnostic: None,
             canonical_dims: None,
             job_id: 0,
             key: ready_key,
@@ -58428,15 +58670,17 @@ mod pipeline_cache_refactor_tests {
         let (pending, _c) = make_fake_final_ai_pending();
         app.final_ai_pending.insert(failed_key, pending);
         tx.send(FinalAiResult::Failed {
+            diagnostic: None,
             job_id: 0,
             key: failed_key,
-            error: "boom".to_string(),
+            error: "boom".to_string().into(),
         })
         .unwrap();
 
         // (3) Unknown: pending に無い key の Ready → 捨てる (cache に入らない)
         let unknown_key = mk_key(2);
         tx.send(FinalAiResult::Ready {
+            diagnostic: None,
             canonical_dims: None,
             job_id: 0,
             key: unknown_key,
@@ -58498,6 +58742,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_pending.insert(
             key,
             FinalAiPending {
+                feedback_request: crate::app::FinalAiFeedbackRequest::default(),
                 job_id: 44,
                 cancel: Arc::clone(&cancel),
                 retained_key: Some(retained_key),
@@ -58552,6 +58797,7 @@ mod pipeline_cache_refactor_tests {
         };
         app.retained_final_ai_orphans.insert(key, 0);
         tx.send(FinalAiResult::Ready {
+            diagnostic: None,
             canonical_dims: None,
             job_id: 0,
             key,
@@ -58610,6 +58856,7 @@ mod pipeline_cache_refactor_tests {
         let (new_pending, _cancel) = make_fake_final_ai_pending_with_job_id(2);
         app.final_ai_pending.insert(key, new_pending);
         tx.send(FinalAiResult::Ready {
+            diagnostic: None,
             canonical_dims: None,
             job_id: 1,
             key,
@@ -58674,6 +58921,7 @@ mod pipeline_cache_refactor_tests {
         app.retained_final_ai_orphans.insert(key, 0);
         app.clear_retained_final_ai_cache("test_epoch_bump");
         tx.send(FinalAiResult::Ready {
+            diagnostic: None,
             canonical_dims: None,
             job_id: 0,
             key,
@@ -59624,6 +59872,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             effect_key,
             FinalEffectPending {
+                diagnostic: None,
                 pdf_metadata: None,
                 canonical_dims: None,
                 source_size: [1, 1],
@@ -59683,6 +59932,7 @@ mod pipeline_cache_refactor_tests {
             app.final_effect_pending.insert(
                 key,
                 FinalEffectPending {
+                    diagnostic: None,
                     pdf_metadata: None,
                     canonical_dims: None,
                     source_size: [1, 1],
@@ -61744,6 +61994,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_cache.insert(
             base_key,
             FinalAiEntry {
+                diagnostic_metadata: None,
                 canonical_dims: None,
                 source_size: [1, 1],
                 pixels: Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
@@ -61895,6 +62146,7 @@ mod pipeline_cache_refactor_tests {
         app.final_effect_pending.insert(
             final_key,
             FinalEffectPending {
+                diagnostic: None,
                 pdf_metadata: None,
                 canonical_dims: None,
                 source_size: pending.source_size,
@@ -62592,6 +62844,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_cache.insert(
             ai_key,
             FinalAiEntry {
+                diagnostic_metadata: None,
                 canonical_dims: None,
                 source_size: [4, 1],
                 pixels: Arc::new(ai_image.clone()),
@@ -62632,6 +62885,7 @@ mod pipeline_cache_refactor_tests {
         app.final_ai_cache.insert(
             dn_key,
             FinalAiEntry {
+                diagnostic_metadata: None,
                 canonical_dims: None,
                 source_size: [4, 1],
                 pixels: Arc::new(dn_image.clone()),
@@ -64971,6 +65225,7 @@ fn install_collection_item_for_detached_plan(
     crate::app::top_level_grid_view::CollectionGridRestore {
         identity: CollectionGridIdentity { collection_id },
         revision_at_open: 7,
+        return_to: None,
         viewport_anchor: Some(CollectionGridViewportAnchor {
             entry_id,
             source_key,
@@ -71668,7 +71923,7 @@ mod still_window_mode_key_tests {
         app.show_search_bar = true;
         app.items_are_global_search_view = true;
         app.selected = Some(a_virtual_idx);
-        app.scroll_offset_y = 321.0;
+        app.grid_scroll.set_position(321.0);
         app.pending_folder_nav_steps = -2;
         app.pending_folder_nav_mode = FolderNavMode::SiblingFullscreen;
         app.settings.detached_viewer_open_images_in_window = true;
@@ -71712,7 +71967,7 @@ mod still_window_mode_key_tests {
             "the main Ctrl+G surface identity must remain intact"
         );
         assert_eq!(app.selected, Some(a_virtual_idx));
-        assert_eq!(app.scroll_offset_y, 321.0);
+        assert_eq!(app.grid_scroll.offset(), 321.0);
         assert_eq!(app.pending_folder_nav_steps, -2);
         assert_eq!(app.pending_folder_nav_mode.perf_tag(), "fullscreen_sibling");
         assert_eq!(
@@ -71892,7 +72147,7 @@ mod still_window_mode_key_tests {
             "unmounting the detached context must restore the main Ctrl+G surface identity"
         );
         assert_eq!(app.selected, Some(a_virtual_idx));
-        assert_eq!(app.scroll_offset_y, 321.0);
+        assert_eq!(app.grid_scroll.offset(), 321.0);
         assert_eq!(app.pending_folder_nav_steps, -2);
         assert_eq!(app.pending_folder_nav_mode.perf_tag(), "fullscreen_sibling");
         assert!(app.folder_nav_pending.is_none());
@@ -72185,7 +72440,7 @@ mod still_window_mode_key_tests {
                 grid: BookmarkViewReturnGridState {
                     row_keys: vec![(1, 1)],
                     selected_key: Some((1, 1)),
-                    opened_key: (1, 1),
+                    opened_key: Some((1, 1)),
                     scroll_offset_y: 0.0,
                 },
             });
@@ -72304,12 +72559,12 @@ mod still_window_mode_key_tests {
         app.finish_page_identity_preparation_for_test();
         app.selected = Some(0);
         app.bookmark_open_request_seq = request_id.0;
-        app.scroll_offset_y = 145.0;
+        app.grid_scroll.set_position(145.0);
         let return_grid = BookmarkViewReturnGridState::capture(
             &app.bookmark_browser_rows,
             app.selected,
             app.bookmark_browser_rows[0].stable_key(),
-            app.scroll_offset_y,
+            app.grid_scroll.offset(),
         );
         assert_eq!(return_grid.row_keys, vec![(0, 2)]);
         assert_eq!(return_grid.selected_key, Some((0, 2)));
@@ -72548,7 +72803,7 @@ mod still_window_mode_key_tests {
             grid: BookmarkViewReturnGridState {
                 row_keys: vec![(3, 3)],
                 selected_key: Some((3, 3)),
-                opened_key: (3, 3),
+                opened_key: Some((3, 3)),
                 scroll_offset_y: 0.0,
             },
         });
@@ -72735,7 +72990,7 @@ mod still_window_mode_key_tests {
         app.search_filter = Some(std::collections::HashSet::from([0]).into());
         app.show_search_bar = true;
         app.selected = Some(0);
-        app.scroll_offset_y = 219.0;
+        app.grid_scroll.set_position(219.0);
         app.settings.detached_viewer_open_images_in_window = true;
         (main_folder, app.items_generation)
     }
@@ -72763,7 +73018,7 @@ mod still_window_mode_key_tests {
         );
         assert!(app.show_search_bar);
         assert_eq!(app.selected, Some(0));
-        assert_eq!(app.scroll_offset_y, 219.0);
+        assert_eq!(app.grid_scroll.offset(), 219.0);
     }
 
     fn install_detached_grid_archive_completion(
@@ -73839,6 +74094,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 collection_id: CollectionId::new(),
             },
             revision_at_open: 9,
+            return_to: None,
             viewport_anchor: Some(CollectionGridViewportAnchor {
                 entry_id: CollectionEntryId::new(),
                 source_key: source.key().clone(),
@@ -73944,7 +74200,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.search_filter = Some(std::collections::HashSet::from([0]).into());
         app.show_search_bar = true;
         app.selected = Some(0);
-        app.scroll_offset_y = 246.0;
+        app.grid_scroll.set_position(246.0);
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.auto_fullscreen_image_folders = true;
 
@@ -73958,7 +74214,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             [GridItem::Folder(path)] if path == &child
         ));
         assert_eq!(app.selected, Some(0));
-        assert_eq!(app.scroll_offset_y, 246.0);
+        assert_eq!(app.grid_scroll.offset(), 246.0);
         assert_eq!(app.fullscreen_idx, None);
         let context_id = app
             .active_viewer_context_id()
@@ -74043,7 +74299,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(app.show_search_bar);
         assert_eq!(app.visible_indices, vec![0]);
         assert_eq!(app.selected, Some(0));
-        assert_eq!(app.scroll_offset_y, 246.0);
+        assert_eq!(app.grid_scroll.offset(), 246.0);
         app.with_active_viewer_context(|active| {
             assert_eq!(active.current_folder, Some(child));
             assert_eq!(active.fullscreen_idx, Some(0));
@@ -74083,7 +74339,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.image_metas = vec![None];
         app.visible_indices = vec![0];
         app.selected = Some(0);
-        app.scroll_offset_y = 135.0;
+        app.grid_scroll.set_position(135.0);
         app.settings.detached_viewer_open_images_in_window = true;
         app.settings.auto_fullscreen_image_folders = true;
 
@@ -75184,7 +75440,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.image_metas = vec![None; 2];
         app.visible_indices = vec![1];
         app.selected = Some(1);
-        app.scroll_offset_y = 137.5;
+        app.grid_scroll.set_position(137.5);
         app.show_search_bar = true;
         app.search_query = "tag:keep".to_string();
         app.search_filter = Some(HashSet::from([1]).into());
@@ -75210,7 +75466,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             .collect();
         let expected_visible = app.visible_indices.clone();
         let expected_selected = app.selected;
-        let expected_scroll = app.scroll_offset_y;
+        let expected_scroll = app.grid_scroll.offset();
         let expected_show_search_bar = app.show_search_bar;
         let expected_search_query = app.search_query.clone();
         let expected_search_filter = app.search_filter.clone();
@@ -75266,7 +75522,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(actual_item_paths, expected_item_paths);
         assert_eq!(app.visible_indices, expected_visible);
         assert_eq!(app.selected, expected_selected);
-        assert_eq!(app.scroll_offset_y, expected_scroll);
+        assert_eq!(app.grid_scroll.offset(), expected_scroll);
         assert_eq!(app.show_search_bar, expected_show_search_bar);
         assert_eq!(app.search_query, expected_search_query);
         assert_eq!(app.search_filter, expected_search_filter);
@@ -75476,7 +75732,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 std::time::Instant::now() - std::time::Duration::from_secs(1),
                 8,
             ));
-            bundle.scroll_offset_y = 250.0;
+            bundle.grid_scroll.set_position(250.0);
             bundle
                 .send_thumbnail_for_test(thumbnail_msg_for_test(
                     0,
@@ -75501,7 +75757,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             );
             assert_eq!(detached.auto_aspect.current, Some(ThumbAspect::Square));
             assert_eq!(detached.auto_aspect.switches_done, 0);
-            assert_eq!(detached.scroll_offset_y, 250.0);
+            assert_eq!(detached.grid_scroll.offset(), 250.0);
         })
         .unwrap();
     }
@@ -75875,7 +76131,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             std::time::Instant::now(),
             5.0,
         ));
-        app.fs_feedback_toast_reveal_path = Some(PathBuf::from(r"C:\pics\saved.jpg"));
+        app.fs_feedback_toast_action = Some(crate::feedback::FeedbackAction::RevealPath(
+            PathBuf::from(r"C:\pics\saved.jpg"),
+        ));
         app.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::NavNoOp {
             reason: crate::ui_fullscreen::FsNavNoOpReason::DetachedIndependent,
             at: std::time::Instant::now(),
@@ -75884,7 +76142,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(app.activate_detached_image_window_snapshot(&ctx, first_window_id));
 
         assert!(app.fs_feedback_toast.is_none());
-        assert!(app.fs_feedback_toast_reveal_path.is_none());
+        assert!(app.fs_feedback_toast_action.is_none());
         assert!(app.fs_boundary_hint.is_none());
     }
 
@@ -80989,7 +81247,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.image_metas = vec![None];
         app.search_filter = Some(HashSet::from([0]).into());
         app.selected = Some(0);
-        app.scroll_offset_y = 184.0;
+        app.grid_scroll.set_position(184.0);
         app.rating_db
             .as_ref()
             .unwrap()
@@ -81027,7 +81285,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(&app.settings.facet_filter, facet_filter);
         assert_eq!(app.current_folder.as_deref(), Some(parent));
         assert_eq!(app.selected, Some(0));
-        assert_eq!(app.scroll_offset_y, 184.0);
+        assert_eq!(app.grid_scroll.offset(), 184.0);
         assert_eq!(app.items_generation, generation);
         assert!(app.rating_filter_suppressed_at.is_none());
         assert!(!app.facet_navigation.suppressed());
@@ -81105,7 +81363,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.search_filter = Some(HashSet::from([0]).into());
         app.show_search_bar = true;
         app.selected = Some(0);
-        app.scroll_offset_y = 137.0;
+        app.grid_scroll.set_position(137.0);
         let main_generation = app.items_generation;
         let main_folder = app.current_folder.clone().unwrap();
 
@@ -81159,7 +81417,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
         assert!(app.show_search_bar);
         assert_eq!(app.selected, Some(0));
-        assert_eq!(app.scroll_offset_y, 137.0);
+        assert_eq!(app.grid_scroll.offset(), 137.0);
         assert_detached_pdf_pages(&mut app, &pdf_path, &[0, 1]);
         #[cfg(all(windows, feature = "test-script"))]
         assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
@@ -81185,7 +81443,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.search_filter = Some(HashSet::from([1]).into());
         app.show_search_bar = true;
         app.selected = Some(1);
-        app.scroll_offset_y = 173.0;
+        app.grid_scroll.set_position(173.0);
         let main_generation = app.items_generation;
         let main_folder = app.current_folder.clone().unwrap();
 
@@ -81241,7 +81499,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
         assert!(app.show_search_bar);
         assert_eq!(app.selected, Some(1));
-        assert_eq!(app.scroll_offset_y, 173.0);
+        assert_eq!(app.grid_scroll.offset(), 173.0);
         assert_detached_archive_pages(&mut app, &zip_path, &expected_pages);
         #[cfg(all(windows, feature = "test-script"))]
         assert_eq!(app.test_script_folder_load_requests, before_loads + 1);
@@ -83831,6 +84089,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.final_ai_pending.insert(
                 key,
                 FinalAiPending {
+                    feedback_request: crate::app::FinalAiFeedbackRequest::default(),
                     job_id: 7,
                     cancel: Arc::clone(&cancel),
                     retained_key: None,
@@ -84041,6 +84300,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             bundle.final_ai_pending.insert(
                 key,
                 FinalAiPending {
+                    feedback_request: crate::app::FinalAiFeedbackRequest::default(),
                     job_id: 99,
                     cancel,
                     retained_key: None,
@@ -84051,6 +84311,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             );
         });
         tx.send(FinalAiResult::Ready {
+            diagnostic: None,
             canonical_dims: None,
             job_id: 99,
             key,
@@ -85902,7 +86163,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let window_id = 53;
         app.settings.detached_viewer_enabled = true;
         app.selected = Some(video);
-        app.scroll_offset_y = 123.0;
+        app.grid_scroll.set_position(123.0);
         app.fullscreen_idx = Some(video);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.set_detached_window_binding_for_test(Some(window_id));
@@ -85915,7 +86176,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(app.address, r"C:\clips");
         assert_eq!(app.items.len(), 2);
         assert_eq!(app.selected, Some(video));
-        assert_eq!(app.scroll_offset_y, 123.0);
+        assert_eq!(app.grid_scroll.offset(), 123.0);
         assert_eq!(app.visible_indices, vec![still, video]);
         assert_eq!(app.detached_image_windows.len(), 1);
         let parked = &app.detached_image_windows[0];
@@ -90139,7 +90400,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         assert_eq!(app.fullscreen_idx, Some(second));
         assert_eq!(app.selected, Some(second));
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
         let stamp = app
             .last_viewer_sync_stamp
             .as_ref()
@@ -90173,7 +90434,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         assert_eq!(app.fullscreen_idx, Some(second));
         assert_eq!(app.selected, Some(second));
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
         assert_eq!(app.fs_vertical_scroll, 25.0);
         let stamp = app
             .last_viewer_sync_stamp
@@ -90792,7 +91053,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             install_open_overview_snapshot_fixture(&mut app, 4);
             app.viewer_presentation = presentation;
             app.selected = Some(0);
-            app.scroll_to_selected = false;
+            app.grid_scroll.set_reveal_requested(false);
             let selection = app.page_overview_view().unwrap().capture_select(2).unwrap();
             let active_context = app.page_overview_active_context_serial();
             assert!(app.handle_page_overview_command(
@@ -90804,7 +91065,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             ));
             assert_eq!(app.fullscreen_idx, Some(2));
             assert_eq!(app.selected, Some(2));
-            assert!(app.scroll_to_selected);
+            assert!(app.grid_scroll.reveal_requested());
             assert!(app.page_overview.session().is_none());
             app.sync_detached_viewer_to_selected(&ctx);
             assert_eq!(app.fullscreen_idx, Some(2));
@@ -91021,7 +91282,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let ctx = egui::Context::default();
         install_open_overview_snapshot_fixture(&mut app, 4);
         app.selected = Some(0);
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_reveal_requested(false);
         let view = app.page_overview_view().unwrap();
         let selection = view.capture_select(2).unwrap();
         let session = app.active_detached_session.map(|session| session.window_id);
@@ -91036,7 +91297,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         ));
         assert_eq!(app.fullscreen_idx, Some(0));
         assert_eq!(app.selected, Some(0));
-        assert!(!app.scroll_to_selected);
+        assert!(!app.grid_scroll.reveal_requested());
         assert_eq!(
             app.active_detached_session.map(|session| session.window_id),
             session
@@ -93263,7 +93524,9 @@ mod rating_view_navigation_tests {
     fn rating_view_nav_open_dedupes_only_after_visible_adoption_and_close_clears_stack() {
         let mut app = setup_app();
         let path = app.tmp.path().join("rating-child");
+        let origin = app.tmp.path().join("before-rating");
         std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir_all(&origin).unwrap();
 
         assert!(app.rating_view_physical_load_owner(&path).is_none());
         assert!(
@@ -93274,7 +93537,9 @@ mod rating_view_navigation_tests {
         app.active_quick_folder_slot = None;
         app.current_folder = Some(super::rating_view_synthetic_path());
         app.rating_view_stars = 4;
-        app.rating_view_saved_folder = Some(app.tmp.path().join("before-rating"));
+        app.rating_view_return_to = Some(crate::app::tests::grid_origin_for_test(
+            top_level_grid_view::TopLevelGridRestore::Folder(origin.clone()),
+        ));
         app.items_are_rating_view = true;
         app.top_level_grid_view.begin(
             super::top_level_grid_view::TopLevelGridSurface::Rating { stars: 4 },
@@ -93327,11 +93592,26 @@ mod rating_view_navigation_tests {
                 .is_none()
         );
 
-        assert_eq!(app.rating_view_nav_stack, vec![path]);
+        assert_eq!(app.rating_view_nav_stack, vec![path.clone()]);
 
         app.finish_page_identity_preparation_for_test();
         app.close_rating_view();
 
+        assert_eq!(
+            app.rating_view_nav_stack,
+            vec![path.clone()],
+            "退出先の採用前は現在のレーティング物理子の帰路を保持する"
+        );
+        assert_eq!(app.current_folder.as_ref(), Some(&path));
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        );
+
+        app.finish_history_restore_preparation_for_test();
+
+        assert_eq!(app.current_folder.as_ref(), Some(&origin));
         assert!(
             app.rating_view_nav_stack.is_empty(),
             "レーティング一覧を閉じたら仮想階層スタックも破棄する"
@@ -93354,7 +93634,9 @@ mod rating_view_navigation_tests {
             .set_user_rating(&key, 4, Some(&meta))
             .unwrap();
         app.rating_view_stars = 4;
-        app.rating_view_saved_folder = Some(app.tmp.path().join("before"));
+        app.rating_view_return_to = Some(crate::app::tests::grid_origin_for_test(
+            top_level_grid_view::TopLevelGridRestore::Folder(app.tmp.path().join("before")),
+        ));
         app.rating_view_rows = vec![crate::rating_view::RatingViewRow {
             key: "container".to_string(),
             item: GridItem::ZipFile(opened.clone()),
@@ -93386,8 +93668,10 @@ mod rating_view_navigation_tests {
         );
         assert_eq!(app.selected, Some(0));
         assert_eq!(
-            app.rating_view_saved_folder,
-            Some(app.tmp.path().join("before"))
+            app.rating_view_return_to,
+            Some(crate::app::tests::grid_origin_for_test(
+                top_level_grid_view::TopLevelGridRestore::Folder(app.tmp.path().join("before"))
+            ))
         );
     }
 
@@ -93640,7 +93924,7 @@ mod rating_view_navigation_tests {
             RightDragContext::Grid,
             &[MouseGestureDirection::Up],
         );
-        assert_eq!(app.pending_grid_scroll, Some(GridScrollIntent::Top));
+        assert_eq!(app.grid_scroll.pending_edge(), Some(GridScrollIntent::Top));
         assert!(app.fs_feedback_toast.is_none());
 
         app.trigger_mouse_gesture_action(
@@ -93736,7 +94020,7 @@ mod always_visible_selection_cursor_tests {
         app.rebuild_visible_indices();
 
         assert_eq!(app.selected, Some(image));
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
     }
 
     #[test]
@@ -93763,7 +94047,7 @@ mod always_visible_selection_cursor_tests {
         app.rebuild_visible_indices();
 
         assert_eq!(app.selected, Some(first));
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
     }
 
     #[test]
@@ -93773,7 +94057,7 @@ mod always_visible_selection_cursor_tests {
         app.current_folder = Some(zip_path.clone());
         app.zip_nav = Some(test_zip_nav_for(zip_path, &["p001.jpg", "p002.jpg"]));
         app.selected = None;
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_reveal_requested(false);
 
         app.zip_nav_show_current_level(crate::app::StartupListIntent::ExplicitList);
 
@@ -93781,7 +94065,7 @@ mod always_visible_selection_cursor_tests {
         assert!(
             matches!(app.items.first(), Some(GridItem::ZipImage { entry_name, .. }) if entry_name == "p001.jpg")
         );
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
     }
 }
 
@@ -94700,7 +94984,7 @@ fn common_dialog_registry_covers_cache_and_setup_dialogs() {
 fn unregistered_floating_window_still_blocks_background_wheel_under_pointer() {
     let mut app = phase_c_support::setup_app();
     app.last_cell_h = 28.0;
-    app.scroll_offset_y = 56.0;
+    app.grid_scroll.set_position(56.0);
     assert!(!app.any_dialog_open());
 
     let ctx = egui::Context::default();
@@ -94750,7 +95034,7 @@ fn unregistered_floating_window_still_blocks_background_wheel_under_pointer() {
     })
     .drop_without_applying_deltas();
 
-    assert_eq!(app.scroll_offset_y, 56.0);
+    assert_eq!(app.grid_scroll.offset(), 56.0);
 }
 
 #[cfg(test)]
@@ -95273,7 +95557,7 @@ mod smart_folder_transition_tests {
         app.address = prior.display().to_string();
         app.items = vec![GridItem::Folder(prior.join("visible-child"))];
         app.selected = Some(0);
-        app.scroll_offset_y = 147.0;
+        app.grid_scroll.set_position(147.0);
         let definition = definition("Staged Root", source);
         let id = definition.id;
         app.settings.smart_folders = vec![definition];
@@ -95283,7 +95567,7 @@ mod smart_folder_transition_tests {
         assert_eq!(app.current_folder.as_deref(), Some(prior.as_path()));
         assert!(matches!(app.items.as_slice(), [GridItem::Folder(_)]));
         assert_eq!(app.selected, Some(0));
-        assert_eq!(app.scroll_offset_y, 147.0);
+        assert_eq!(app.grid_scroll.offset(), 147.0);
         assert!(matches!(
             app.top_level_grid_view.surface(),
             crate::app::top_level_grid_view::TopLevelGridSurface::Folder
@@ -95315,7 +95599,7 @@ mod smart_folder_transition_tests {
         app.address = prior.display().to_string();
         app.items = vec![GridItem::Folder(prior.join("visible"))];
         app.selected = Some(0);
-        app.scroll_offset_y = 311.0;
+        app.grid_scroll.set_position(311.0);
         let definition = definition("Smart History", source);
         let id = definition.id;
         app.settings.smart_folders = vec![definition];
@@ -95328,7 +95612,7 @@ mod smart_folder_transition_tests {
             back_stack: Vec::new(),
         };
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone().into()).into());
         let ctx = egui::Context::default();
 
         assert!(app.begin_smart_history_navigation(
@@ -95336,7 +95620,7 @@ mod smart_folder_transition_tests {
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         assert_eq!(app.current_folder.as_deref(), Some(prior.as_path()));
-        assert_eq!(app.scroll_offset_y, 311.0);
+        assert_eq!(app.grid_scroll.offset(), 311.0);
         assert!(matches!(app.items.as_slice(), [GridItem::Folder(_)]));
         assert_eq!(app.folder_nav_back_stack.len(), 1);
         assert!(app.folder_nav_forward_stack.is_empty());
@@ -95380,7 +95664,7 @@ mod smart_folder_transition_tests {
         app.settings.smart_folders = vec![definition];
         let target = SmartFolderViewState::root(id, Vec::new());
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone().into()).into());
         let ctx = egui::Context::default();
 
         assert!(app.begin_smart_history_navigation(
@@ -95437,13 +95721,13 @@ mod smart_folder_transition_tests {
             .replace_surface(TopLevelGridSurface::Search(TopLevelSearchView::Global));
         app.items = vec![GridItem::Image(row.clone())];
         app.selected = Some(0);
-        app.scroll_offset_y = 425.0;
+        app.grid_scroll.set_position(425.0);
         let definition = definition("Smart History Cancel", source);
         let id = definition.id;
         app.settings.smart_folders = vec![definition];
         let target = SmartFolderViewState::root(id, Vec::new());
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone().into()).into());
 
         assert!(app.begin_smart_history_navigation(
             target,
@@ -95459,7 +95743,7 @@ mod smart_folder_transition_tests {
         ));
         assert_eq!(app.items[0].drag_source_path(), Some(row.as_path()));
         assert_eq!(app.selected, Some(0));
-        assert_eq!(app.scroll_offset_y, 425.0);
+        assert_eq!(app.grid_scroll.offset(), 425.0);
         assert_eq!(app.folder_nav_back_stack.len(), 1);
         assert!(app.folder_nav_forward_stack.is_empty());
     }
@@ -95547,7 +95831,7 @@ mod smart_folder_transition_tests {
         app.settings.smart_folders = vec![definition];
         let target = SmartFolderViewState::root(id, Vec::new());
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone().into()).into());
         assert!(app.begin_smart_history_navigation(
             target.clone(),
             crate::app::smart_folder::SmartHistoryDirection::Back,
@@ -95563,7 +95847,7 @@ mod smart_folder_transition_tests {
         assert_eq!(app.current_folder.as_deref(), Some(prior.as_path()));
         assert_eq!(
             app.folder_nav_back_stack,
-            vec![FolderNavHistoryTarget::SmartFolder(target)]
+            vec![FolderNavHistoryTarget::SmartFolder(target.into())]
         );
         assert!(app.folder_nav_forward_stack.is_empty());
     }
@@ -95590,8 +95874,8 @@ mod smart_folder_transition_tests {
         let root_b = SmartFolderViewState::root(definition_b.id, Vec::new());
         app.settings.smart_folders = vec![definition_a, definition_b];
         app.folder_nav_back_stack = vec![
-            FolderNavHistoryTarget::SmartFolder(root_a.clone()).into(),
-            FolderNavHistoryTarget::SmartFolder(root_b.clone()).into(),
+            FolderNavHistoryTarget::SmartFolder(root_a.clone().into()).into(),
+            FolderNavHistoryTarget::SmartFolder(root_b.clone().into()).into(),
         ];
         assert!(app.begin_smart_history_navigation(
             root_b.clone(),
@@ -95609,7 +95893,7 @@ mod smart_folder_transition_tests {
             app.folder_nav_forward_stack,
             vec![
                 FolderNavHistoryTarget::Path(prior),
-                FolderNavHistoryTarget::SmartFolder(root_b),
+                FolderNavHistoryTarget::SmartFolder(root_b.into()),
             ]
         );
     }
@@ -95635,7 +95919,7 @@ mod smart_folder_transition_tests {
         app.settings.smart_folders = vec![definition];
         app.folder_nav_back_stack = vec![
             FolderNavHistoryTarget::Path(earlier.clone()).into(),
-            FolderNavHistoryTarget::SmartFolder(root.clone()).into(),
+            FolderNavHistoryTarget::SmartFolder(root.clone().into()).into(),
         ];
         assert!(app.begin_smart_history_navigation(
             root.clone(),
@@ -95667,7 +95951,7 @@ mod smart_folder_transition_tests {
             app.folder_nav_forward_stack,
             vec![
                 FolderNavHistoryTarget::Path(current),
-                FolderNavHistoryTarget::SmartFolder(root),
+                FolderNavHistoryTarget::SmartFolder(root.into()),
             ]
         );
     }
@@ -95711,7 +95995,7 @@ mod smart_folder_transition_tests {
         let history_before = app.folder_nav_back_stack.clone();
         app.settings.sort_order = SortOrder::DateDesc;
         assert!(app.begin_smart_history_navigation(
-            root,
+            root.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         assert_eq!(app.current_folder.as_deref(), Some(child.as_path()));
@@ -95736,7 +96020,7 @@ mod smart_folder_transition_tests {
         let root = SmartFolderViewState::root(id, Vec::new());
         app.top_level_grid_view.begin(
             TopLevelGridSurface::Search(TopLevelSearchView::Global),
-            Some(TopLevelGridRestore::SmartFolder(root)),
+            Some(TopLevelGridRestore::SmartFolder(root.into())),
         );
         app.global_search.active = true;
         app.global_search.metadata_draft = "result".into();
@@ -95744,7 +96028,7 @@ mod smart_folder_transition_tests {
         let row = app.tmp.path().join("result.jpg");
         app.items = vec![GridItem::Image(row.clone())];
         app.selected = Some(0);
-        app.scroll_offset_y = 390.0;
+        app.grid_scroll.set_position(390.0);
         let history_before = app.folder_nav_history_snapshot();
         let ctx = egui::Context::default();
 
@@ -95756,7 +96040,7 @@ mod smart_folder_transition_tests {
         ));
         assert_eq!(app.items[0].drag_source_path(), Some(row.as_path()));
         assert_eq!(app.selected, Some(0));
-        assert_eq!(app.scroll_offset_y, 390.0);
+        assert_eq!(app.grid_scroll.offset(), 390.0);
         assert_eq!(app.folder_nav_back_stack, history_before.back_stack);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -95793,7 +96077,7 @@ mod smart_folder_transition_tests {
             .iter()
             .position(|item| item.drag_source_path() == Some(pdf.as_path()))
             .expect("root PDF row");
-        app.scroll_offset_y = 320.0;
+        app.grid_scroll.set_position(320.0);
         assert!(app.begin_smart_grid_container_navigation(
             index,
             pdf.clone(),
@@ -95810,7 +96094,7 @@ mod smart_folder_transition_tests {
         ));
         app.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
         assert!(app.items_are_smart_folder_view);
-        assert_eq!(app.scroll_offset_y, 320.0);
+        assert_eq!(app.grid_scroll.offset(), 320.0);
         assert!(app.smart_folder_prepare_pending.is_none());
         app.poll_smart_folder(&ctx);
         app.poll_smart_folder(&ctx);
@@ -96245,7 +96529,7 @@ mod smart_folder_transition_tests {
             .iter()
             .position(|item| item.drag_source_path() == Some(pdf.as_path()))
             .expect("root PDF row");
-        app.scroll_offset_y = 250.0;
+        app.grid_scroll.set_position(250.0);
         assert!(app.begin_smart_grid_container_navigation(
             index,
             pdf.clone(),
@@ -96265,7 +96549,7 @@ mod smart_folder_transition_tests {
         assert!(app.cancel_pdf_password_dialog_request());
         assert!(app.smart_folder_transition.is_none());
         assert!(app.items_are_smart_folder_view);
-        assert_eq!(app.scroll_offset_y, 250.0);
+        assert_eq!(app.grid_scroll.offset(), 250.0);
         assert!(
             app.items
                 .iter()
@@ -96304,8 +96588,8 @@ mod smart_folder_transition_tests {
             .samples
             .insert(selected, aspect.height_ratio());
         app.auto_aspect.current = Some(aspect);
-        app.scroll_offset_y = 900.0;
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_position(900.0);
+        app.grid_scroll.set_reveal_requested(false);
         let index = app
             .items
             .iter()
@@ -96337,7 +96621,7 @@ mod smart_folder_transition_tests {
             super::FolderOpenOutcome::Loaded
         ));
         app.reconcile_favorite_view_for_current_context_at(std::time::Instant::now());
-        assert_eq!(app.scroll_offset_y, 900.0);
+        assert_eq!(app.grid_scroll.offset(), 900.0);
         assert_eq!(app.effective_thumb_aspect(), aspect);
         assert!(
             selected_real_path(&app).is_some_and(|path| crate::folder_tree::path_eq(path, entry))
@@ -96360,8 +96644,8 @@ mod smart_folder_transition_tests {
         app.open_smart_folder(id, false);
         wait_for_smart_folder_idle(&mut app, &ctx, id);
         let root_items = app.items.len();
-        app.scroll_offset_y = 230.0;
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_position(230.0);
+        app.grid_scroll.set_reveal_requested(false);
 
         let index = app
             .items
@@ -96376,7 +96660,7 @@ mod smart_folder_transition_tests {
         ));
         assert!(app.items_are_smart_folder_view);
         assert_eq!(app.items.len(), root_items);
-        assert_eq!(app.scroll_offset_y, 230.0);
+        assert_eq!(app.grid_scroll.offset(), 230.0);
         assert_eq!(
             app.top_level_grid_view.smart_folder().unwrap().position,
             crate::app::top_level_grid_view::SmartFolderPosition::Root
@@ -96414,7 +96698,7 @@ mod smart_folder_transition_tests {
         wait_for_smart_folder_idle(&mut app, &ctx, id);
         let root_path = app.current_folder.clone();
         let root_count = app.items.len();
-        app.scroll_offset_y = 230.0;
+        app.grid_scroll.set_position(230.0);
         std::fs::remove_dir_all(&child).unwrap();
 
         assert!(
@@ -96439,7 +96723,7 @@ mod smart_folder_transition_tests {
         }
         assert_eq!(app.current_folder, root_path);
         assert_eq!(app.items.len(), root_count);
-        assert_eq!(app.scroll_offset_y, 230.0);
+        assert_eq!(app.grid_scroll.offset(), 230.0);
         assert!(app.items_are_smart_folder_view);
     }
 
@@ -96479,7 +96763,7 @@ mod smart_folder_transition_tests {
             back_stack: Vec::new(),
         };
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone().into()).into());
         let history = app.folder_nav_history_snapshot();
         assert!(app.begin_smart_history_navigation(
             target,
@@ -96973,7 +97257,7 @@ mod smart_folder_transition_tests {
             back_stack: Vec::new(),
         };
         app.folder_nav_back_stack
-            .push(FolderNavHistoryTarget::SmartFolder(target.clone()).into());
+            .push(FolderNavHistoryTarget::SmartFolder(target.clone().into()).into());
         assert!(app.begin_smart_history_navigation(
             target,
             crate::app::smart_folder::SmartHistoryDirection::Back,
@@ -97045,7 +97329,7 @@ mod smart_folder_transition_tests {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct ConvertibleArchiveMainState {
-        reading_history_return_from: Option<PathBuf>,
+        reading_history_return_from: Option<ReadingHistoryBookReturn>,
         rating_filter_suppressed_at: Option<(PathBuf, [bool; 6])>,
         facet_filter: crate::settings::FacetFilter,
         facet_navigation: crate::app::FacetNavigationState,
@@ -97115,7 +97399,9 @@ mod smart_folder_transition_tests {
             .insert(crate::settings::FacetItemKind::Archive);
         app.rebuild_visible_indices();
         assert!(app.visible_indices.contains(&idx));
-        app.reading_history_return_from = Some(app.tmp.path().join("reserved-history.zip"));
+        app.reading_history_return_from = Some(crate::app::tests::reading_history_return_for_test(
+            app.tmp.path().join("reserved-history.zip"),
+        ));
         assert!(app.rating_filter_suppressed_at.is_none());
         assert!(!app.facet_navigation.suppressed());
 
@@ -97668,7 +97954,11 @@ mod smart_folder_transition_tests {
         assert!(!app.settings.facet_filter.is_active());
         assert_eq!(app.facet_navigation.saved_frame_count(), 1);
         let destination = FolderNavHistoryTarget::SmartFolder(
-            app.top_level_grid_view.smart_folder().unwrap().clone(),
+            app.top_level_grid_view
+                .smart_folder()
+                .unwrap()
+                .clone()
+                .into(),
         );
         assert_eq!(
             app.facet_navigation.route().current(),
@@ -98247,7 +98537,8 @@ mod smart_folder_transition_tests {
         app.load_folder(outside.clone());
         app.finish_page_identity_preparation_for_test();
         assert!(app.top_level_grid_view.smart_folder_session().is_none());
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::SmartFolder(saved.clone()).into()];
+        app.folder_nav_back_stack =
+            vec![FolderNavHistoryTarget::SmartFolder(saved.clone().into()).into()];
         assert!(app.begin_smart_history_navigation(
             saved,
             crate::app::smart_folder::SmartHistoryDirection::Back,
@@ -98334,7 +98625,8 @@ mod smart_folder_transition_tests {
         std::fs::create_dir_all(&outside).unwrap();
         app.load_folder(outside.clone());
         app.finish_page_identity_preparation_for_test();
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::SmartFolder(saved.clone()).into()];
+        app.folder_nav_back_stack =
+            vec![FolderNavHistoryTarget::SmartFolder(saved.clone().into()).into()];
         assert!(app.begin_smart_history_navigation(
             saved,
             crate::app::smart_folder::SmartHistoryDirection::Back,
@@ -98415,7 +98707,8 @@ mod smart_folder_transition_tests {
         let outside = app.tmp.path().join("outside-nested-archive");
         std::fs::create_dir_all(&outside).unwrap();
         app.load_folder(outside.clone());
-        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::SmartFolder(saved.clone()).into()];
+        app.folder_nav_back_stack =
+            vec![FolderNavHistoryTarget::SmartFolder(saved.clone().into()).into()];
         assert!(app.begin_smart_history_navigation(
             saved,
             crate::app::smart_folder::SmartHistoryDirection::Back,
@@ -99068,7 +99361,9 @@ mod smart_folder_transition_tests {
         let outside = app.tmp.path().join("outside-snapshot-scope");
         std::fs::create_dir_all(&outside).unwrap();
         let reserved_history = app.tmp.path().join("still-reserved-history.zip");
-        app.reading_history_return_from = Some(reserved_history.clone());
+        app.reading_history_return_from = Some(crate::app::tests::reading_history_return_for_test(
+            reserved_history.clone(),
+        ));
         app.suppress_nav_record_for_search_restore = true;
 
         let folder_before = app.current_folder.clone();
@@ -99081,7 +99376,12 @@ mod smart_folder_transition_tests {
         app.load_folder(outside);
 
         assert_eq!(app.current_folder, folder_before);
-        assert_eq!(app.reading_history_return_from, Some(reserved_history));
+        assert_eq!(
+            app.reading_history_return_from,
+            Some(crate::app::tests::reading_history_return_for_test(
+                reserved_history
+            ))
+        );
         assert!(app.suppress_nav_record_for_search_restore);
         assert_eq!(app.top_level_grid_view.surface(), &surface_before);
         assert_eq!(app.current_smart_folder_id, smart_id_before);
@@ -99333,8 +99633,8 @@ mod smart_folder_transition_tests {
         }
 
         select_real_path(&mut app, &entry);
-        app.scroll_offset_y = 234.0;
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_position(234.0);
+        app.grid_scroll.set_reveal_requested(false);
         app.open_staged_smart_folder_and_wait(&ctx, &entry);
         #[cfg(all(windows, feature = "test-script"))]
         {
@@ -99363,9 +99663,9 @@ mod smart_folder_transition_tests {
             selected_real_path(&app)
                 .is_some_and(|selected| crate::folder_tree::path_eq(selected, &entry))
         );
-        assert_eq!(app.scroll_offset_y, 234.0);
+        assert_eq!(app.grid_scroll.offset(), 234.0);
         assert!(
-            !app.scroll_to_selected,
+            !app.grid_scroll.reveal_requested(),
             "returning to the already-selected visible entry must preserve the exact offset"
         );
         assert!(app.smart_folder_pending.is_none());
@@ -99396,8 +99696,8 @@ mod smart_folder_transition_tests {
 
         let entry = entries.last().unwrap();
         select_real_path(&mut app, entry);
-        app.scroll_offset_y = 900.0;
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_position(900.0);
+        app.grid_scroll.set_reveal_requested(false);
         app.open_staged_smart_folder_and_wait(&ctx, entry);
         let parent = match app.handle_grid_parent_folder_action() {
             Some(crate::ui_main::AddressBarNav::Direct(path, _)) => path,
@@ -99411,7 +99711,7 @@ mod smart_folder_transition_tests {
             app.load_folder_or_convert_archive(parent),
             super::FolderOpenOutcome::Loaded
         ));
-        assert_eq!(app.scroll_offset_y, 900.0);
+        assert_eq!(app.grid_scroll.offset(), 900.0);
         assert!(app.smart_folder_pending.is_none());
         assert!(
             selected_real_path(&app)
@@ -99536,8 +99836,8 @@ mod smart_folder_transition_tests {
         wait_for_smart_folder_idle(&mut app, &ctx, id);
 
         select_real_path(&mut app, &pdf);
-        app.scroll_offset_y = 430.0;
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_position(430.0);
+        app.grid_scroll.set_reveal_requested(false);
         assert!(app.begin_staged_smart_drill(&pdf));
         finish_smart_pdf_enumeration(&mut app, &pdf);
 
@@ -99553,7 +99853,7 @@ mod smart_folder_transition_tests {
             app.load_folder_or_convert_archive(parent),
             super::FolderOpenOutcome::Loaded
         ));
-        assert_eq!(app.scroll_offset_y, 430.0);
+        assert_eq!(app.grid_scroll.offset(), 430.0);
         assert!(app.smart_folder_pending.is_none());
         assert!(
             selected_real_path(&app)
@@ -99634,8 +99934,8 @@ mod smart_folder_transition_tests {
             .samples
             .insert(selected, saved_aspect.height_ratio());
         app.auto_aspect.current = Some(saved_aspect);
-        app.scroll_offset_y = saved_offset;
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_position(saved_offset);
+        app.grid_scroll.set_reveal_requested(false);
         app.open_staged_smart_folder_and_wait(&ctx, entry);
         assert_eq!(app.settings.sort_order, SortOrder::FileName);
         let parent = match app.resolve_grid_parent_nav() {
@@ -99646,7 +99946,7 @@ mod smart_folder_transition_tests {
             app.load_folder_or_convert_archive(parent),
             super::FolderOpenOutcome::Loaded
         ));
-        assert_eq!(app.scroll_offset_y, saved_offset);
+        assert_eq!(app.grid_scroll.offset(), saved_offset);
         assert_eq!(app.effective_thumb_aspect(), saved_aspect);
         assert!(
             selected_real_path(&app)
@@ -99659,9 +99959,9 @@ mod smart_folder_transition_tests {
             app.smart_folder_prepare_pending.is_none(),
             "return must not replace the prepared root with a fresh first-row install"
         );
-        assert_eq!(app.scroll_offset_y, saved_offset);
+        assert_eq!(app.grid_scroll.offset(), saved_offset);
         assert_eq!(app.effective_thumb_aspect(), saved_aspect);
-        assert!(!app.scroll_to_selected);
+        assert!(!app.grid_scroll.reveal_requested());
     }
 
     #[test]
@@ -99682,8 +99982,8 @@ mod smart_folder_transition_tests {
         app.open_smart_folder(id, false);
         wait_for_smart_folder_idle(&mut app, &ctx, id);
         select_real_path(&mut app, &entry);
-        app.scroll_offset_y = 180.0;
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_position(180.0);
+        app.grid_scroll.set_reveal_requested(false);
 
         std::fs::remove_dir_all(&entry).unwrap();
         assert!(app.begin_staged_smart_drill(&entry));
@@ -99694,7 +99994,7 @@ mod smart_folder_transition_tests {
                 .any(|item| item.drag_source_path() == Some(entry.as_path())),
             "failed scan must leave the previously visible root installed"
         );
-        assert_eq!(app.scroll_offset_y, 180.0);
+        assert_eq!(app.grid_scroll.offset(), 180.0);
         assert!(app.top_level_grid_view.smart_folder_session().is_some());
     }
 
@@ -99758,8 +100058,8 @@ mod smart_folder_transition_tests {
         app.open_smart_folder(id, false);
         wait_for_smart_folder_idle(&mut app, &ctx, id);
         select_real_path(&mut app, &pdf);
-        app.scroll_offset_y = 250.0;
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_position(250.0);
+        app.grid_scroll.set_reveal_requested(false);
         assert!(app.begin_staged_smart_drill(&pdf));
         assert!(app.replace_staged_pdf_enumeration_for_test(
             &pdf,
@@ -99777,7 +100077,7 @@ mod smart_folder_transition_tests {
                 .any(|item| item.drag_source_path() == Some(pdf.as_path())),
             "password cancellation must leave the root PDF row visible"
         );
-        assert_eq!(app.scroll_offset_y, 250.0);
+        assert_eq!(app.grid_scroll.offset(), 250.0);
     }
 
     fn finish_smart_pdf_enumeration(app: &mut App, pdf: &Path) {
@@ -99863,7 +100163,7 @@ mod smart_folder_transition_tests {
         };
         assert!(matches!(back.position, SmartFolderPosition::Root));
         assert!(app.begin_smart_history_navigation(
-            back,
+            back.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         assert!(matches!(
@@ -99882,7 +100182,7 @@ mod smart_folder_transition_tests {
             SmartFolderPosition::Container { .. }
         ));
         assert!(app.begin_smart_history_navigation(
-            forward,
+            forward.state,
             crate::app::smart_folder::SmartHistoryDirection::Forward,
         ));
         wait_for_no_resident_smart_pdf_open(&mut app, &ctx, &pdf);
@@ -99966,7 +100266,7 @@ mod smart_folder_transition_tests {
             _ => panic!("back to no-resident PDF"),
         };
         assert!(app.begin_smart_history_navigation(
-            back,
+            back.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         assert_eq!(app.folder_nav_back_stack, before.back_stack);
@@ -100022,7 +100322,7 @@ mod smart_folder_transition_tests {
             _ => panic!("folder history target missing"),
         };
         assert!(app.begin_smart_history_navigation(
-            container_target,
+            container_target.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         wait_for_smart_folder_scope(&mut app, &ctx, &folder);
@@ -100049,7 +100349,7 @@ mod smart_folder_transition_tests {
         };
         assert!(matches!(root_target.position, SmartFolderPosition::Root));
         assert!(app.begin_smart_history_navigation(
-            root_target,
+            root_target.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         assert!(matches!(
@@ -100119,7 +100419,7 @@ mod smart_folder_transition_tests {
             _ => panic!("back to PDF"),
         };
         assert!(app.begin_smart_history_navigation(
-            back,
+            back.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         assert_eq!(app.current_folder.as_deref(), Some(normal.as_path()));
@@ -100158,7 +100458,7 @@ mod smart_folder_transition_tests {
             _ => panic!("back to PDF"),
         };
         assert!(app.begin_smart_history_navigation(
-            back,
+            back.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -100216,7 +100516,7 @@ mod smart_folder_transition_tests {
             _ => panic!("back to PDF"),
         };
         assert!(app.begin_smart_history_navigation(
-            back,
+            back.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -100256,7 +100556,7 @@ mod smart_folder_transition_tests {
         wait_for_smart_folder_idle(&mut app, &ctx, id);
 
         select_real_path(&mut app, &entries[0]);
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_reveal_requested(false);
         app.open_staged_smart_folder_and_wait(&ctx, &entries[0]);
         assert!(app.start_smart_folder_scope_nav(true, false));
         assert!(app.start_smart_folder_scope_nav(true, false));
@@ -100275,7 +100575,7 @@ mod smart_folder_transition_tests {
                 .is_some_and(|selected| crate::folder_tree::path_eq(selected, &entries[2]))
         );
         assert!(
-            app.scroll_to_selected,
+            app.grid_scroll.reveal_requested(),
             "the shared parent-return path must ensure the newly selected entry is visible"
         );
         assert!(app.smart_folder_pending.is_none());
@@ -100399,8 +100699,8 @@ mod smart_folder_transition_tests {
         app.auto_aspect.last_switch_at = Some(saved_switch_at);
         app.auto_aspect.streak = Some((saved_aspect, saved_switch_at, 1));
         app.selected = Some(selected);
-        app.scroll_offset_y = saved_offset;
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_position(saved_offset);
+        app.grid_scroll.set_reveal_requested(false);
         app.open_staged_smart_folder_and_wait(&ctx, &entry);
         assert!(
             app.top_level_grid_view
@@ -100419,11 +100719,11 @@ mod smart_folder_transition_tests {
         assert!(app.smart_folder_prepare_pending.is_none());
         assert_eq!(app.selected, Some(selected));
         assert!(
-            !app.scroll_to_selected,
+            !app.grid_scroll.reveal_requested(),
             "an unchanged layout must keep the exact saved offset without an ensure-visible pass"
         );
         assert_eq!(
-            (app.scroll_offset_y, app.effective_thumb_aspect()),
+            (app.grid_scroll.offset(), app.effective_thumb_aspect()),
             (saved_offset, saved_aspect),
             "the offset and the row-height dependency it was measured against must travel together"
         );
@@ -100488,8 +100788,8 @@ mod smart_folder_transition_tests {
         assert!(selected_position >= 12, "test needs a multi-row grid");
         let saved_offset = (selected_position / saved_cols) as f32 * cell_h;
         app.selected = Some(selected);
-        app.scroll_offset_y = saved_offset;
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_position(saved_offset);
+        app.grid_scroll.set_reveal_requested(false);
 
         app.open_staged_smart_folder_and_wait(&ctx, &entry);
         app.settings.grid_cols = changed_cols;
@@ -100501,15 +100801,23 @@ mod smart_folder_transition_tests {
         assert_eq!(app.settings.grid_cols, changed_cols);
         assert_eq!(app.selected, Some(selected));
         assert_eq!(
-            app.scroll_offset_y, saved_offset,
+            app.grid_scroll.offset(),
+            saved_offset,
             "restore installs the saved snapshot before the shared ensure-visible pass"
         );
         assert!(
-            app.scroll_to_selected,
+            app.grid_scroll.reveal_requested(),
             "changed layout must reuse ordinary folder navigation's ensure-visible path"
         );
 
         app.last_viewport_h = viewport_h;
+        let natural_h = app.current_grid_order().len().div_ceil(changed_cols) as f32 * cell_h;
+        app.grid_scroll.record_geometry(GridScrollGeometry::new(
+            changed_cols,
+            cell_h,
+            viewport_h,
+            natural_h,
+        ));
         app.apply_scroll_to_selected(changed_cols, cell_h);
         let selected_position = app
             .current_grid_order()
@@ -100518,9 +100826,9 @@ mod smart_folder_transition_tests {
             .unwrap();
         let selected_row_top = (selected_position / changed_cols) as f32 * cell_h;
         let selected_row_bottom = selected_row_top + cell_h;
-        assert_ne!(app.scroll_offset_y, saved_offset);
-        assert!(selected_row_top >= app.scroll_offset_y);
-        assert!(selected_row_bottom <= app.scroll_offset_y + viewport_h);
+        assert_ne!(app.grid_scroll.offset(), saved_offset);
+        assert!(selected_row_top >= app.grid_scroll.offset());
+        assert!(selected_row_bottom <= app.grid_scroll.offset() + viewport_h);
     }
 
     #[test]
@@ -100852,7 +101160,7 @@ mod smart_folder_transition_tests {
             super::top_level_grid_view::SmartFolderPosition::Root
         ));
         assert!(app.begin_smart_history_navigation(
-            back,
+            back.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         assert!(matches!(
@@ -100869,7 +101177,7 @@ mod smart_folder_transition_tests {
         assert_eq!(forward.definition_id, id);
         assert_eq!(forward.scoped_current(), Some(entry.as_path()));
         assert!(app.begin_smart_history_navigation(
-            forward,
+            forward.state,
             crate::app::smart_folder::SmartHistoryDirection::Forward,
         ));
         wait_for_smart_folder_scope(&mut app, &ctx, &entry);
@@ -100892,7 +101200,7 @@ mod smart_folder_transition_tests {
         assert_eq!(back_to_entry.definition_id, id);
         assert_eq!(back_to_entry.scoped_current(), Some(entry.as_path()));
         assert!(app.begin_smart_history_navigation(
-            back_to_entry,
+            back_to_entry.state,
             crate::app::smart_folder::SmartHistoryDirection::Back,
         ));
         wait_for_smart_folder_scope(&mut app, &ctx, &entry);
@@ -102113,7 +102421,7 @@ fn subfolder_display_prepare_blocks_background_input() {
 fn settings_restore_blocks_background_wheel_scroll() {
     let mut app = phase_c_support::setup_app();
     app.last_cell_h = 28.0;
-    app.scroll_offset_y = 56.0;
+    app.grid_scroll.set_position(56.0);
     app.show_settings_restore = true;
     let ctx = egui::Context::default();
     let mut input = egui::RawInput::default();
@@ -102128,7 +102436,7 @@ fn settings_restore_blocks_background_wheel_scroll() {
     ctx.run_pass(input, |ctx| app.process_scroll(ctx))
         .drop_without_applying_deltas();
 
-    assert_eq!(app.scroll_offset_y, 56.0);
+    assert_eq!(app.grid_scroll.offset(), 56.0);
 }
 
 #[test]
@@ -102560,8 +102868,8 @@ fn grid_scroll_ring_actions_queue_layout_intent_without_changing_selection() {
     app.visible_indices = vec![0, 1, 2];
     app.selected = Some(1);
     app.checked = [0usize, 2].into_iter().collect();
-    app.scroll_offset_y = 240.0;
-    app.scroll_to_selected = false;
+    app.grid_scroll.set_position(240.0);
+    app.grid_scroll.set_reveal_requested(false);
     app.update_last_selected_image();
 
     let selected_before = app.selected;
@@ -102578,9 +102886,9 @@ fn grid_scroll_ring_actions_queue_layout_intent_without_changing_selection() {
         crate::ring_shortcut::RingActionId::GridScrollTop,
         "test",
     );
-    assert_eq!(app.pending_grid_scroll, Some(GridScrollIntent::Top));
-    assert_eq!(app.scroll_offset_y, 240.0);
-    assert!(!app.scroll_to_selected);
+    assert_eq!(app.grid_scroll.pending_edge(), Some(GridScrollIntent::Top));
+    assert_eq!(app.grid_scroll.offset(), 240.0);
+    assert!(!app.grid_scroll.reveal_requested());
     assert_eq!(app.selected, selected_before);
     assert_eq!(app.checked, checked_before);
     assert_eq!(
@@ -102596,7 +102904,10 @@ fn grid_scroll_ring_actions_queue_layout_intent_without_changing_selection() {
         crate::ring_shortcut::RingActionId::GridScrollBottom,
         "test",
     );
-    assert_eq!(app.pending_grid_scroll, Some(GridScrollIntent::Bottom));
+    assert_eq!(
+        app.grid_scroll.pending_edge(),
+        Some(GridScrollIntent::Bottom)
+    );
     assert_eq!(app.selected, selected_before);
     assert_eq!(app.checked, checked_before);
 }
@@ -102620,7 +102931,7 @@ fn grid_edge_move_ring_actions_follow_visible_order_and_keep_checks() {
         }
         app.selected = Some(0);
         app.checked = [0usize, 2].into_iter().collect();
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_reveal_requested(false);
         let checked_before = app.checked.clone();
         let ctx = egui::Context::default();
 
@@ -102631,10 +102942,10 @@ fn grid_edge_move_ring_actions_follow_visible_order_and_keep_checks() {
             "test",
         );
         assert_eq!(app.selected, order.first().copied());
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
         assert_eq!(app.checked, checked_before);
 
-        app.scroll_to_selected = false;
+        app.grid_scroll.set_reveal_requested(false);
         app.apply_ring_action(
             &ctx,
             crate::ring_shortcut::RingShortcutContext::Grid,
@@ -102642,7 +102953,7 @@ fn grid_edge_move_ring_actions_follow_visible_order_and_keep_checks() {
             "test",
         );
         assert_eq!(app.selected, order.last().copied());
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
         assert_eq!(app.checked, checked_before);
     }
 }
@@ -105745,7 +106056,9 @@ mod rating_folder_r2_tests {
         let mut app = setup_app();
         for surface in [
             TopLevelGridSurface::Search(TopLevelSearchView::Favorite),
-            TopLevelGridSurface::ReadingHistory,
+            TopLevelGridSurface::ReadingHistory(
+                top_level_grid_view::ReadingHistoryRootRestore::unavailable(),
+            ),
             TopLevelGridSurface::Snapshot,
             TopLevelGridSurface::DriveList,
         ] {
@@ -110022,7 +110335,9 @@ mod background_click_scroll_regression_tests {
                         state.navs.push(nav);
                     }
                     if state.app.current_folder != old_folder {
-                        state.parent_return_scroll.push(state.app.scroll_offset_y);
+                        state
+                            .parent_return_scroll
+                            .push(state.app.grid_scroll.offset());
                     }
                 },
                 State {
@@ -110103,13 +110418,13 @@ mod background_click_scroll_regression_tests {
         app.settings.grid_view_mode = view;
         app.settings.grid_cols = 4;
         app.settings.grid_background_double_click_parent = true;
-        app.scroll_offset_y = 100_000.0;
+        app.grid_scroll.set_position(100_000.0);
         let mut harness = harness(app);
         harness
             .ctx
             .options_mut(|options| options.input_options.max_double_click_delay = 5.0);
         harness.run_steps(6);
-        let old_offset = harness.state().app.scroll_offset_y;
+        let old_offset = harness.state().app.grid_scroll.offset();
         assert!(old_offset > 100.0);
         // The snapped end extent includes unowned background below the last row.
         let body_top = if view == crate::settings::GridViewMode::Details {
@@ -110133,10 +110448,10 @@ mod background_click_scroll_regression_tests {
             vec![0.0],
             "old {view:?} ScrollArea offset {old_offset} must not overwrite the restored list"
         );
-        assert_eq!(harness.state().app.scroll_offset_y, 0.0);
+        assert_eq!(harness.state().app.grid_scroll.offset(), 0.0);
         harness.run_steps(6);
         assert_eq!(
-            harness.state().app.scroll_offset_y,
+            harness.state().app.grid_scroll.offset(),
             0.0,
             "long restored list must remain at its own position"
         );
@@ -111297,3 +111612,5 @@ fn front_popup_presentation_open_keeps_page_owner_until_the_display_target_chang
         "native commit transfers the presentation owner too"
     );
 }
+
+mod collection_return;

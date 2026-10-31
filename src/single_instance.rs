@@ -240,7 +240,7 @@ fn data_dir_namespace_suffix(
 /// 相対 path、`.` / `..`、既存 symlink/junction、Windows verbatim prefix、区切り文字、
 /// 大文字小文字の表記差を同じ名前空間キーへ寄せる。data directory 自体がまだ無い場合は、
 /// 最も深い既存の親だけ canonicalize して、未作成の末尾を戻す。
-fn resolved_data_dir_key(path: &std::path::Path) -> String {
+pub(crate) fn resolved_data_dir_key(path: &std::path::Path) -> String {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let resolved = canonicalize_existing_prefix(&absolute);
     let mut key = resolved.to_string_lossy().replace('\\', "/");

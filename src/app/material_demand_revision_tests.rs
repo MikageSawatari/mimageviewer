@@ -150,6 +150,7 @@ fn material_demand_revision_existing_ai_outcomes_do_not_hydrate_input() {
                 app.final_ai_cache.insert(
                     key,
                     FinalAiEntry {
+                        diagnostic_metadata: None,
                         canonical_dims: Some(CanonicalPageDimensions::new(1200, 1800)),
                         source_size: [4, 6],
                         pixels: Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::WHITE)),
@@ -162,6 +163,7 @@ fn material_demand_revision_existing_ai_outcomes_do_not_hydrate_input() {
                 app.final_ai_pending.insert(
                     key,
                     FinalAiPending {
+                        feedback_request: crate::app::FinalAiFeedbackRequest::default(),
                         job_id: 9001,
                         cancel: Arc::new(AtomicBool::new(true)),
                         retained_key: None,
@@ -459,6 +461,7 @@ fn material_demand_revision_cached_ai_supplies_effect_without_edit_hydration() {
         app.final_ai_cache.insert(
             ai_key,
             FinalAiEntry {
+                diagnostic_metadata: None,
                 canonical_dims: Some(CanonicalPageDimensions::new(1200, 1800)),
                 source_size: [4, 6],
                 pixels: Arc::clone(&pixels),

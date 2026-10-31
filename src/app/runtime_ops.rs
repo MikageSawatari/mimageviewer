@@ -75,7 +75,7 @@ impl App {
         self.last_prefetch_scroll_at = Some(now);
         self.last_scroll_event_at = Some(now);
         self.last_scroll_change_time = now;
-        self.last_scroll_offset_y_tracked = self.scroll_offset_y;
+        self.last_scroll_offset_y_tracked = self.grid_scroll.offset();
         self.last_input_at = Some(now);
         self.scroll_settle_state = None;
     }
@@ -85,7 +85,7 @@ impl App {
     /// `App::update` の終盤 (= render_grid 反映後) で呼ぶ。
     pub(super) fn update_scroll_settle_state(&mut self) {
         let now = std::time::Instant::now();
-        let cur_offset = self.scroll_offset_y;
+        let cur_offset = self.grid_scroll.offset();
         if (cur_offset - self.prev_scroll_offset_y).abs() > 0.5 {
             self.last_scroll_event_at = Some(now);
             // prefetch gate にも fallback で書く (= scrollbar drag 等の保険)。
@@ -123,7 +123,7 @@ impl App {
         if vis_count == 0 {
             return;
         }
-        let vis_first_raw = (self.scroll_offset_y / cell_h) as usize * cols;
+        let vis_first_raw = (self.grid_scroll.offset() / cell_h) as usize * cols;
         let vis_first = vis_first_raw.min(vis_count.saturating_sub(1));
         let vis_end = vis_first.saturating_add(items_per_page).min(vis_count);
 

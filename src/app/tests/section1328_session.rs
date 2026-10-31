@@ -170,9 +170,10 @@ fn session1328_assert_visible(app: &App, path: &std::path::Path) {
         / app.settings.grid_cols;
     let center = (row as f32 + 0.5) * app.last_cell_h;
     assert!(
-        center >= app.scroll_offset_y && center <= app.scroll_offset_y + app.last_viewport_h,
+        center >= app.grid_scroll.offset()
+            && center <= app.grid_scroll.offset() + app.last_viewport_h,
         "row {row} center={center} scroll={} viewport={}",
-        app.scroll_offset_y,
+        app.grid_scroll.offset(),
         app.last_viewport_h
     );
 }
@@ -206,7 +207,7 @@ fn section1328_session_reading_folder_back_bs_and_forward_back() {
                 }
                 session1328_settle(&mut app);
                 assert_eq!(app.selected, Some(4));
-                assert!(app.scroll_to_selected);
+                assert!(app.grid_scroll.reveal_requested());
                 if bs || round == 1 {
                     break;
                 }
@@ -289,7 +290,7 @@ fn session1328_reading_zip_main_return(input: Session1328ReadingReturn) {
         assert_eq!(app.selected, Some(0));
         assert_eq!(app.items[4].container_path(), Some(zip.as_path()));
         app.selected = Some(4);
-        app.scroll_offset_y = 420.0;
+        app.grid_scroll.set_position(420.0);
         let ctx = egui::Context::default();
         let mut navigation = session1328_main_navigation();
         navigation.grid_nav = Some(app.grid_physical_navigation(4, zip.clone(), false));
@@ -297,7 +298,12 @@ fn session1328_reading_zip_main_return(input: Session1328ReadingReturn) {
         session1328_settle(&mut app);
         assert!(!app.items_are_reading_history_view);
         assert!(app.zip_nav.as_ref().is_some_and(|nav| nav.at_root()));
-        assert_eq!(app.reading_history_return_from.as_ref(), Some(&zip));
+        assert_eq!(
+            app.reading_history_return_from
+                .as_ref()
+                .map(|reservation| &reservation.container),
+            Some(&zip)
+        );
         let saved_key = crate::path_key::normalize_keep_drive(&zip);
         assert_eq!(
             app.top_level_grid_view
@@ -339,8 +345,8 @@ fn session1328_reading_zip_main_return(input: Session1328ReadingReturn) {
             app.items[app.selected.unwrap()].container_path(),
             Some(zip.as_path())
         );
-        assert!(app.scroll_to_selected);
-        assert_eq!(app.scroll_offset_y, 420.0);
+        assert!(app.grid_scroll.reveal_requested());
+        assert_eq!(app.grid_scroll.offset(), 420.0);
 
         // Explicit location commands must still discard the saved row in every input lane.
         for lane in 0..4 {
@@ -429,7 +435,7 @@ fn section1328_session_zip_bs_preserves_physical_and_expansion_parent_meaning() 
             app.items[app.selected.unwrap()].container_path(),
             Some(zip.as_path())
         );
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
     }
 }
 
@@ -450,7 +456,7 @@ fn section1328_session_reading_deep_zip_parent_does_not_return_to_history() {
     writer.finish().unwrap();
     app.load_folder(zip.clone());
     session1328_settle(&mut app);
-    app.reading_history_return_from = Some(zip.clone());
+    app.reading_history_return_from = Some(reading_history_return_for_test(zip.clone()));
     app.zip_nav_enter("A/");
     session1328_settle(&mut app);
     app.zip_nav_enter("A/sub/");
@@ -474,10 +480,15 @@ fn section1328_session_reading_deep_zip_parent_does_not_return_to_history() {
     assert!(matches!(
         app.reading_history_back_nav(),
         Some(crate::ui_main::AddressBarNav::ReadingHistory(
-            ReadingHistoryEntrance::Return
+            ReadingHistoryEntrance::Return(_)
         ))
     ));
-    assert_eq!(app.reading_history_return_from.as_ref(), Some(&zip));
+    assert_eq!(
+        app.reading_history_return_from
+            .as_ref()
+            .map(|reservation| &reservation.container),
+        Some(&zip)
+    );
 }
 
 #[test]
@@ -499,7 +510,7 @@ fn section1328_session_search_pending_saves_latest_reading_and_subfolder_rows() 
                 _ => app.open_tag_view(),
             }
             app.selected = Some(4);
-            app.scroll_offset_y = 600.0;
+            app.grid_scroll.set_position(600.0);
             let result_path = root.join("hit.png");
             match search {
                 0 => app.replace_search_view_items(vec![GridItem::Image(result_path)], vec![None]),
@@ -532,7 +543,7 @@ fn section1328_session_search_pending_saves_latest_reading_and_subfolder_rows() 
             }
             session1328_settle(&mut app);
             assert_eq!(app.selected, Some(4), "reading={reading} search={search}");
-            assert_eq!(app.scroll_offset_y, 600.0);
+            assert_eq!(app.grid_scroll.offset(), 600.0);
         }
     }
 }
@@ -550,7 +561,7 @@ fn section1328_session_snapshot_return_preserves_source_row() {
                 session1328_expansion(&mut app, &root, 6);
             }
             app.selected = Some(4);
-            app.scroll_offset_y = 600.0;
+            app.grid_scroll.set_position(600.0);
             app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
             assert!(app.snapshot.is_some());
             app.finish_page_identity_preparation_for_test();
@@ -573,7 +584,7 @@ fn section1328_session_snapshot_return_preserves_source_row() {
                 )
             ));
             app.selected = Some(1);
-            app.scroll_offset_y = 0.0;
+            app.grid_scroll.set_position(0.0);
             if via_search {
                 app.open_global_search();
                 app.replace_search_view_items(
@@ -591,7 +602,7 @@ fn section1328_session_snapshot_return_preserves_source_row() {
                 Some(4),
                 "reading={reading} via_search={via_search}"
             );
-            assert_eq!(app.scroll_offset_y, 600.0);
+            assert_eq!(app.grid_scroll.offset(), 600.0);
         }
     }
 }
@@ -646,7 +657,7 @@ fn section1328_session_reading_zip_pending_back_restores_saved_row() {
     app.enter_reading_history_from_menu();
     session1328_settle(&mut app);
     app.selected = Some(4);
-    app.scroll_offset_y = 420.0;
+    app.grid_scroll.set_position(420.0);
     let navigation = app.capture_main_list_navigation(
         super::MainHistoryOperation::Direct(super::DirectNavigationPurpose::Navigation),
         super::MainListSourceProof::Row,
@@ -669,7 +680,7 @@ fn section1328_session_reading_zip_pending_back_restores_saved_row() {
     app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
     session1328_settle(&mut app);
     assert_eq!(app.selected, Some(4));
-    assert_eq!(app.scroll_offset_y, 420.0);
+    assert_eq!(app.grid_scroll.offset(), 420.0);
     assert!(app.zip_enumerate_pending.is_none());
 }
 
@@ -756,13 +767,13 @@ fn session1328_tall_return(reading: bool, auto_off_child: bool) {
             crate::settings::ThumbAspect::Portrait3x4
         );
         app.selected = Some(310);
-        app.scroll_to_selected = true;
+        app.grid_scroll.set_reveal_requested(true);
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         session1328_draw(&mut app, &ctx);
         session1328_draw(&mut app, &ctx);
         session1328_assert_visible(&app, &paths[310]);
-        let offset = app.scroll_offset_y;
+        let offset = app.grid_scroll.offset();
         app.settings.remember_favorite_view_state = true;
         let favorite = crate::settings::FavoriteEntry::new("child".into(), paths[310].clone());
         let mut state = crate::settings::FavoriteViewState::from_settings(&app.settings);
@@ -799,7 +810,7 @@ fn session1328_tall_return(reading: bool, auto_off_child: bool) {
         session1328_draw(&mut app, &ctx);
         session1328_draw(&mut app, &ctx);
         session1328_assert_visible(&app, &paths[310]);
-        assert_eq!(app.scroll_offset_y, offset);
+        assert_eq!(app.grid_scroll.offset(), offset);
     }
 }
 
@@ -827,12 +838,12 @@ fn section1328_session_rating_snapshot_rows_do_not_overwrite_position_before_or_
         app.install_rating_view_rows();
         app.finish_page_identity_preparation_for_test();
         app.selected = Some(4);
-        app.scroll_offset_y = 600.0;
+        app.grid_scroll.set_position(600.0);
         let expected = app.rating_path_key(4).unwrap();
         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
         app.finish_page_identity_preparation_for_test();
         app.selected = Some(1);
-        app.scroll_offset_y = 0.0;
+        app.grid_scroll.set_position(0.0);
         if unfix {
             app.deactivate_snapshot();
             // The surface has changed but the pending worker has not replaced Snapshot rows.
@@ -849,7 +860,7 @@ fn section1328_session_rating_snapshot_rows_do_not_overwrite_position_before_or_
         session1328_settle(&mut app);
         // Rebuilt Rating rows may reorder by rated_at; restore identity, not the old index.
         assert_eq!(app.rating_path_key(app.selected.unwrap()), Some(expected));
-        assert_eq!(app.scroll_offset_y, 600.0);
+        assert_eq!(app.grid_scroll.offset(), 600.0);
     }
 }
 
@@ -859,7 +870,7 @@ fn section1328_session_r13_cancelled_rating_close_does_not_mark_current_rows_dep
     app.active_quick_folder_slot = None;
     let root = app.tmp.path().join("source");
     session1328_expansion(&mut app, &root, 6);
-    app.rating_view_saved_folder = Some(super::subfolder_expansion_synthetic_path());
+    app.rating_view_return_to = Some(expansion_origin_for_test(&app));
     app.apply_rating_view_result(crate::rating_view::RatingViewBuildResult {
         visibility_notice: None,
         stars: 3,
@@ -1029,13 +1040,13 @@ fn section1328_session_subfolder_prepare_uses_destination_sort_and_category_orde
             break;
         }
         app.selected = Some(2);
-        app.scroll_offset_y = 400.0;
+        app.grid_scroll.set_position(400.0);
         app.load_folder(root.clone());
         session1328_settle(&mut app);
         assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
         session1328_settle(&mut app);
         assert_eq!(app.selected, Some(2));
-        assert_eq!(app.scroll_offset_y, 400.0);
+        assert_eq!(app.grid_scroll.offset(), 400.0);
     }
 }

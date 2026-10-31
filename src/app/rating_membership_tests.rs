@@ -1211,7 +1211,7 @@ fn rating_grid_undo_returns_f2_item_and_redo_excludes_it_in_both_orders() {
         press_grid_key(&mut app, egui::Key::Z, egui::Modifiers::CTRL);
         assert_eq!(app.selected, Some(1));
         assert_eq!(anchor(&app), Some(1));
-        assert!(app.scroll_to_selected);
+        assert!(app.grid_scroll.reveal_requested());
         assert_eq!(app.fullscreen_idx, None);
         press_grid_key(&mut app, egui::Key::Y, egui::Modifiers::CTRL);
         assert_eq!(app.selected, Some(next));

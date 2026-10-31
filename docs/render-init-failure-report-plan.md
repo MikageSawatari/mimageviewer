@@ -30,8 +30,10 @@ P2 4 件・P3 4 件) を取り込んだ。実装は Codex、差分の独立レ�
 ## 3. 終了の順序 (固定)
 
 `run_native` 復帰 → **heartbeat watchdog を既存 API で休止** → 失敗の記録 (`logger::log` と startup の `record_detail`) →
-既存の runtime cleanup (`src/lib.rs:2014` 付近、remote service 等の後片付け) → `miv_startup::terminal(Error)` → `finish_logs()`
-(既存の合計 2 秒上限の flush を再利用) → **test-script の自動実行でないときだけ**メッセージボックス → 元の `Err` を返す。
+既存の runtime cleanup (`src/lib.rs`、remote service 等の後片付け) → 結果と通知本文をmainへ返す →
+mainで `miv_startup::terminal(Error)` → 共通ログ排出 → GUI診断の `ReturnedError` 保存
+(共通の合計2秒deadlineを共有) → **test-script の自動実行でないときだけ**メッセージボックス → 元の `Err` を返す。
+§1.482段Aでこの順序に改訂した。利用者が通知を読む時間は終了記録の保存予算を消費しない。
 
 - 表示はログの flush の後に置く。保存失敗への再試行・同期 fallback は足さない。「強制終了されても必ず残る」保証にはしない
   (まれな失敗は既定で割り切る)。

@@ -215,6 +215,7 @@ fn install(
     app.final_effect_pending.insert(
         key,
         FinalEffectPending {
+            diagnostic: None,
             pdf_metadata: input.pdf,
             canonical_dims: input.canonical,
             source_size: input.source_size,

@@ -2052,7 +2052,7 @@ impl crate::app::App {
                     })
                 {
                     self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
-                    self.scroll_to_selected = true;
+                    self.grid_scroll.set_reveal_requested(true);
                 }
             } else if let Some(root) = self.subfolder_expansion_root.clone() {
                 let roots = if self.subfolder_expansion_roots.is_empty() {
@@ -2335,8 +2335,8 @@ impl crate::app::App {
         self.search_filter = None;
         self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
         self.move_grid_cursor(select, crate::app::GridCursorIntent::Automatic);
-        self.scroll_offset_y = 0.0;
-        self.scroll_to_selected = select.is_some();
+        self.grid_scroll.set_position(0.0);
+        self.grid_scroll.set_reveal_requested(select.is_some());
         self.scroll_hint
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.rating_cache = rating_cache;
@@ -3721,7 +3721,7 @@ mod tests {
             assert_eq!(app.items[raw_selected], GridItem::Image(pages[1].clone()));
             assert_ne!(target_index, raw_selected);
             app.selected = Some(raw_selected);
-            app.scroll_offset_y = 125.0;
+            app.grid_scroll.set_position(125.0);
             app.folder_history
                 .insert(folder.clone(), (125.0, Some(raw_selected)));
             app.select_after_load = None;
@@ -3750,8 +3750,8 @@ mod tests {
             assert_eq!(app.items[target_index].name(), "a");
             assert!(matches!(&app.items[raw_selected], GridItem::Stack { key, .. } if key == "b"));
             assert_eq!(app.selected, Some(target_index), "target={use_group_key}");
-            assert_eq!(app.scroll_offset_y, 125.0);
-            assert!(app.scroll_to_selected);
+            assert_eq!(app.grid_scroll.offset(), 125.0);
+            assert!(app.grid_scroll.reveal_requested());
             assert_eq!(app.current_folder.as_ref(), Some(&folder));
             assert_eq!(app.folder_history[&folder], (125.0, Some(raw_selected)));
         }

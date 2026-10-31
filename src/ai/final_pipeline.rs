@@ -28,7 +28,7 @@ pub(crate) struct FinalAiExecutionOutput {
 
 pub(crate) enum FinalAiExecutionError {
     Cancelled,
-    Failed(String),
+    Failed(super::failure::FinalAiFailure),
 }
 
 pub(crate) fn effective_upscale_request(
@@ -108,11 +108,20 @@ pub(crate) fn execute_selected_final_ai(
     progress: &dyn FinalAiProgressSink,
 ) -> Result<FinalAiExecutionOutput, FinalAiExecutionError> {
     let source_size = request.source.size;
-    let denoise_model = load_requested_model(runtime, manager, request.denoise_kind, progress);
-    let upscale_model = load_requested_model(runtime, manager, request.upscale_kind, progress);
+    let denoise_load = load_requested_model(runtime, manager, request.denoise_kind, progress);
+    let upscale_load = load_requested_model(runtime, manager, request.upscale_kind, progress);
+    let denoise_model = denoise_load.as_ref().ok().copied().flatten();
+    let upscale_model = upscale_load.as_ref().ok().copied().flatten();
     if denoise_model.is_none() && upscale_model.is_none() {
         return Err(FinalAiExecutionError::Failed(
-            "no usable AI model (load failed)".to_owned(),
+            denoise_load
+                .err()
+                .or_else(|| upscale_load.err())
+                .unwrap_or_else(|| {
+                    super::failure::FinalAiFailure::model_unavailable(
+                        "no usable AI model (load failed)",
+                    )
+                }),
         ));
     }
     if cancel.load(Ordering::Relaxed) {
@@ -164,7 +173,7 @@ pub(crate) fn execute_selected_final_ai(
                 return Err(FinalAiExecutionError::Cancelled);
             }
             Err(error) if upscale_model.is_none() => {
-                return Err(FinalAiExecutionError::Failed(error.to_string()));
+                return Err(FinalAiExecutionError::Failed(error.into()));
             }
             Err(error) => {
                 crate::logger::log(format!("[AI] Final denoise failed: {error}"));
@@ -174,7 +183,7 @@ pub(crate) fn execute_selected_final_ai(
 
     let Some(kind) = upscale_model else {
         return Err(FinalAiExecutionError::Failed(
-            "no upscale model after denoise".to_owned(),
+            super::failure::FinalAiFailure::model_unavailable("no upscale model after denoise"),
         ));
     };
     let tile_progress = |completed, total| progress.upscaling(completed, total);
@@ -192,7 +201,7 @@ pub(crate) fn execute_selected_final_ai(
             used_upscale: result.used_upscale,
         }),
         Err(_) if cancel.load(Ordering::Relaxed) => Err(FinalAiExecutionError::Cancelled),
-        Err(error) => Err(FinalAiExecutionError::Failed(error.to_string())),
+        Err(error) => Err(FinalAiExecutionError::Failed(error.into())),
     }
 }
 
@@ -201,20 +210,24 @@ fn load_requested_model(
     manager: &ModelManager,
     kind: Option<ModelKind>,
     progress: &dyn FinalAiProgressSink,
-) -> Option<ModelKind> {
-    let kind = kind?;
+) -> Result<Option<ModelKind>, super::failure::FinalAiFailure> {
+    let Some(kind) = kind else {
+        return Ok(None);
+    };
     progress.loading_model(kind);
     if runtime.is_loaded(kind) {
-        return Some(kind);
+        return Ok(Some(kind));
     }
-    let path = manager.model_path(kind)?;
+    let Some(path) = manager.model_path(kind) else {
+        return Ok(None);
+    };
     match runtime.load_model(kind, &path) {
-        Ok(()) => Some(kind),
+        Ok(()) => Ok(Some(kind)),
         Err(error) => {
             crate::logger::log(format!(
                 "[AI] Final model load failed kind={kind:?}: {error}"
             ));
-            None
+            Err(super::failure::FinalAiFailure::model_load(error))
         }
     }
 }

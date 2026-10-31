@@ -807,6 +807,10 @@ impl App {
                 self.speculative_gpu_frame.note_ordinary_upload();
             }
             let registration_started = crate::perf::is_enabled().then(std::time::Instant::now);
+            diagnostic_stage(
+                &self.final_effect_pending[&key].diagnostic,
+                JobStage::GpuRegistration,
+            );
             let texture = ctx.load_texture(
                 format!(
                     "edit_prepare_{}_{}_{comic}",
@@ -848,6 +852,7 @@ impl App {
         let FinalEffectState::Registering(registration) = pending.state else {
             unreachable!()
         };
+        diagnostic_stage(&pending.diagnostic, JobStage::Completed);
         let input = &registration.ready.input;
         let worker_ms = registration.ready.elapsed_ms;
         let load_texture_ms = registration.load_texture_ms;
@@ -1425,9 +1430,12 @@ impl App {
         let (tx, rx) = mpsc::channel();
         #[cfg(test)]
         let test_registration = final_prepare::tests::attach_worker(&worker_cancel);
+        let diagnostic = self.diagnostic_post_ai(input.key, input.source_size, Arc::clone(&cancel));
+        let worker_diagnostic = diagnostic.clone();
         let spawn = std::thread::Builder::new()
             .name(format!("miv-edit-prepare-{idx}"))
             .spawn(move || {
+                let _diagnostic = DiagnosticEffectWorker::new(worker_diagnostic);
                 let started = crate::perf::is_enabled().then(std::time::Instant::now);
                 // The trace drops after all execution leases, including unwind.
                 let _finished = WorkerTrace {
@@ -1456,6 +1464,7 @@ impl App {
                         .and_then(|out| out.final_pixels.as_ref())
                         .map_or([0, 0], |pixels| pixels.size);
                     let key = worker_input.key;
+                    diagnostic_stage(&_diagnostic.0, JobStage::FinalEffectPending);
                     let sent = tx.send(PreparedEditPixels {
                         input: worker_input,
                         output,
@@ -1520,6 +1529,7 @@ impl App {
         self.final_effect_pending.insert(
             input.key,
             FinalEffectPending {
+                diagnostic,
                 pdf_metadata: input.pdf,
                 canonical_dims: input.canonical,
                 source_size: input.source_size,

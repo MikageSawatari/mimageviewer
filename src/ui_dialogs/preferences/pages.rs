@@ -2592,7 +2592,7 @@ fn command_overview_rows(
             assignments,
             status: status.join(" / "),
             conflicted: is_conflicted,
-            hover: action.description().to_owned(),
+            hover: key_action_detail_label(action).to_owned(),
             target: OperationOverviewTarget::Key(action),
         });
     }
@@ -2695,8 +2695,18 @@ fn key_action_context_label(action: KeyAction) -> &'static str {
     ))
 }
 
+fn key_action_detail_label(action: KeyAction) -> &'static str {
+    match action {
+        KeyAction::FsPageOverviewToggle => {
+            "ページ一覧の表示切替。O キーと同じ操作。もう一度実行すると一覧を閉じ、元のページ表示に戻ります。"
+        }
+        _ => action.description(),
+    }
+}
+
 fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext) -> &'static str {
     match action {
+        RingActionId::ImagePageOverview => key_action_detail_label(KeyAction::FsPageOverviewToggle),
         RingActionId::GridSelectAll => "表示中のチェック可能な項目をすべてチェックする",
         RingActionId::ImageSpreadShiftLeft => {
             "見開きを画面左方向へ1ページずらす。右→左の見開きでは前/次の意味を反転します"
@@ -3372,7 +3382,7 @@ fn operation_assignment_editor_header(ui: &mut egui::Ui, target: &OperationAssig
     match target {
         OperationAssignmentTarget::Key(action) => {
             ui.label(egui::RichText::new(compact_key_action_label(*action)).strong());
-            ui.small(action.description());
+            ui.small(key_action_detail_label(*action));
             if let Some((context, ring_action)) = ring_binding_for_key_action(*action) {
                 ui.small(format!(
                     "この操作は {} のリング / マウス / パッドにも割り当てられます: {}",
@@ -4932,7 +4942,7 @@ fn is_win32_modifier_key(virtual_key: u32) -> bool {
 fn command_action_matches_filter(action: KeyAction, filter: &str) -> bool {
     operation_text_matches_filter(
         &compact_key_action_label(action),
-        action.description(),
+        key_action_detail_label(action),
         key_action_context_label(action),
         filter,
     )
@@ -12314,6 +12324,57 @@ mod tests {
         assert!(command_key_labels_match_filter(&key_labels, "f11"));
         assert!(command_key_labels_match_filter(&key_labels, "numpad9"));
         assert!(!command_key_labels_match_filter(&key_labels, "F12"));
+    }
+
+    #[test]
+    fn page_overview_toggle_name_survives_compaction_and_selects_the_shared_operation() {
+        let action = KeyAction::FsPageOverviewToggle;
+        let context = RingShortcutContext::ImageFullscreen;
+        let ring = RingActionId::ImagePageOverview;
+        let label = "ページ一覧の表示切替";
+        assert_eq!(compact_key_action_label(action), label);
+        assert_eq!(compact_operation_label(action.description()), label);
+        assert_eq!(
+            compact_operation_label(ring.label_for_context(context)),
+            label
+        );
+        assert_eq!(
+            super::key_action_detail_label(action),
+            super::ring_action_detail_label(&ring, context)
+        );
+        assert!(super::key_action_detail_label(action).contains("O キーと同じ操作"));
+        assert!(super::key_action_detail_label(action).contains("もう一度実行すると一覧を閉じ"));
+
+        let mut state = zoom_key_editor_state();
+        let keymap = crate::keymap::Keymap::default();
+        for filter in [label, "表示切替", "O キーと同じ操作"] {
+            state.command_filter = filter.to_string();
+            let rows = super::command_overview_rows(&state, &keymap, &Default::default());
+            assert_eq!(rows.len(), 1, "{filter}");
+            assert_eq!(rows[0].label, label);
+            assert!(
+                matches!(rows[0].target, super::OperationOverviewTarget::Key(found) if found == action)
+            );
+        }
+        open_operation_assignment_editor(
+            &mut state,
+            OperationAssignmentTarget::Key(action),
+            OperationAssignmentTab::Keyboard,
+        );
+        assert_eq!(
+            super::operation_assignment_editor_title(&OperationAssignmentTarget::Key(action)),
+            format!("操作割り当て編集: {label}")
+        );
+        assert_eq!(
+            ring_bindings_for_key_action(action),
+            vec![(context, ring.clone())]
+        );
+        assert!(RingActionId::available_for_context(context).contains(&ring));
+        assert!(RingActionId::available_for_mouse_button_context(context).contains(&ring));
+        assert!(
+            RingActionId::available_for_right_drag_context(RightDragContext::ImageFullscreen)
+                .contains(&ring)
+        );
     }
 
     #[test]

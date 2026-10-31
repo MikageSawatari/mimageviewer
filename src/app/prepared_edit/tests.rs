@@ -135,6 +135,7 @@ fn install(
     app.final_effect_pending.insert(
         key,
         FinalEffectPending {
+            diagnostic: None,
             pdf_metadata: input.pdf,
             canonical_dims: input.canonical,
             source_size: input.source_size,
@@ -537,6 +538,7 @@ fn completed_erase_pixels_are_the_input_and_after_ai_does_not_reapply_adjustment
         app.final_ai_cache.insert(
             key,
             FinalAiEntry {
+                diagnostic_metadata: None,
                 canonical_dims: None,
                 source_size: pixels.size,
                 pixels: pixels.clone(),

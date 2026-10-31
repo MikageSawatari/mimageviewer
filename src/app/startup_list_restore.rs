@@ -354,7 +354,8 @@ impl App {
         (!name.is_empty()).then(|| ListCursorHint {
             name,
             rows_above: Some(
-                self.scroll_selected_to_rows_above
+                self.grid_scroll
+                    .row_anchor()
                     .unwrap_or_else(|| self.selected_rows_below_view_top(selected)),
             ),
         })
@@ -541,7 +542,7 @@ impl App {
             && let Some(cursor) = cursor
         {
             self.select_after_load = Some(cursor.name.clone());
-            self.scroll_selected_to_rows_above = cursor.rows_above;
+            self.grid_scroll.set_row_anchor(cursor.rows_above);
             self.try_select_after_load();
         }
         if !matches!(
@@ -562,7 +563,7 @@ impl App {
             && let Some(cursor) = cursor
         {
             self.select_after_load = Some(cursor.name);
-            self.scroll_selected_to_rows_above = cursor.rows_above;
+            self.grid_scroll.set_row_anchor(cursor.rows_above);
             self.try_select_after_load();
         }
         let cursor = self.current_main_list_cursor(&target);

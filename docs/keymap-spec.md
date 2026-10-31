@@ -43,7 +43,11 @@ Space だけではパン。消しゴムの `ErasePreviewHold` は押している
 面または `fs_zoom_owner()` が変わったら、値を書き戻さずに状態を破棄する。終了した primary は解放まで既存の抑止へ渡す。
 組合せを減らすため、chord 解放後の再開・パンへの切替は設けず、同じ primary の終端まで所有する。
 
-ページ一覧は `FsPageOverviewToggle`（FsCommon / Press、既定 O）で開閉する。
+ページ一覧は「ページ一覧の表示切替」`FsPageOverviewToggle`（FsCommon / Press、既定 O）で開閉する。
+操作カスタマイズの短い操作名、リング／ジェスチャ／マウスボタン／パッドの候補とガイド、HUDの案内も
+同じ名称を使う。詳細説明は「O キーと同じ操作。もう一度実行すると一覧を閉じる」と案内する。
+`image_page_overview` の保存IDと既存割り当ては維持する。「本をページ一覧で開く」や
+「フルスクリーンを閉じて一覧へ戻る」とは別操作で、一覧中のヘルプ文脈名「本のページ一覧」は変更しない。
 動画／音声／編集モードでは入場しない。S／Shift+S／Ctrl+S、Ctrl+O、編集の O は従来どおり。
 受理済み移動が未提示の間はanimationのON／OFFにかかわらずOによる新規入場を受け付けない。
 既存`fs_navigation_sequence_blocks_new_target()`と`page_turn_barrier_active()`を
@@ -659,6 +663,12 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 
 ## グリッドビュー (フルスクリーン外) 共通
 
+「親フォルダへ」(`GridParentFolder`) はキー、親ボタン、マウスボタン、リング/ジェスチャ、Padで
+同じ一覧ownerの規則を使う。閲覧履歴の一覧では開く前の場所へ戻り、入口なしはドライブ一覧へ戻る。
+本から閲覧履歴へ戻る操作と一覧から入口へ戻る操作は別で、ZIP内部は1階層ずつ戻る。
+タグの結果rootでは全入力とも停止し、開いた子からはタグ検索内の帰路を戻る。
+通常の履歴←/→ (`GridHistoryBack/Forward`) は別操作として1件移動を維持する。
+
 Everything ファイル名検索は `GlobalEverythingSearch` / `Grid` / `Press`、既定
 `Ctrl+R`。名前の Global は検索範囲を表し、fullscreen の Global scope へは登録しない。
 main の一覧からだけ開き、text focus / IME（focus recovery を含む）/ modal / Remote lock
@@ -1253,6 +1263,10 @@ snapshot 中のキー操作は以下のように再定義される:
 | <kbd>Backspace</kbd> / <kbd>Alt</kbd>+<kbd>↑</kbd> / <kbd>Alt</kbd>+<kbd>←</kbd>/<kbd>→</kbd> / フォルダツリー / お気に入りクリック / フォルダパス入力 | 無効、toast「スナップショット中は他のフォルダに移動できません」 |
 | <kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd> / <kbd>Ctrl</kbd>+<kbd>T</kbd> | snapshot 自動解除 + 検索 mode 起動 (= scope mutual exclusion) |
 | `[★固定]` ボタン再クリック | snapshot 解除 (= 元のフォルダ表示に戻る) |
+
+§1.473の例外：固定中にファイルメニューから開いた閲覧履歴rootでは、BS/Alt+↑およびマウス・リングの
+親操作が固定を終了し、入口payloadのcanonical originへ戻す。親ボタンは固定中disabledの既存制約を維持する。
+同pathでも固定一覧と新しい閲覧履歴visitを区別する。固定一覧の完全な再採用は§1.486の別課題とする。
 
 snapshot 末尾到達時は `FsBoundaryHint::NoImageFolder` で boundary hint を表示。
 
