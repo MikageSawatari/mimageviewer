@@ -487,6 +487,8 @@ VST3 bridge、署名、packagingなどrelease構成そのものを確認する�
   ネイティブ機能は、確認前でもテストが緑ならブランチにコミットしてよい (未確認と書く)。push / PR は指示時だけ。
 - 「コミットして」と言われたら、ローカル `master` へ merge まで行う (残す指示や conflict があれば止めて報告)。
   GitHub の既定は `main`、ローカルは `master`。
+- **`master` は v4 系のリリース用 (2026-11-01〜)**。v5 系 (MCP 対応 `mcp-trial`・mIV Sound・音楽動画エクスポート等) の
+  ブランチは、利用者が決めるまで `master` へ merge しない。`master` を v5 系ブランチへ取り込むのはよい。詳細は git-workflow。
 - **作業ツリーを他セッションと共有するとき**: コミットは `git commit [opts] -- <自分のパス>`。`git add -A` /
   `git add .` は使わない。HEAD が自分のコミットでなければ reset / rebase しない。コミット直後に
   `git log --oneline -1` を確かめる。想定外の変更は消さず、自分のコミットから外すだけにする。
