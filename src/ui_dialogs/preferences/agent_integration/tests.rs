@@ -852,7 +852,9 @@ fn change_fixture(
     AgentIntegrationState,
     crate::agent_ipc::changes::ChangeRecordId,
 ) {
-    use crate::agent_ipc::changes::{ChangeController, ChangeCounts, ChangeRecord, ChangeRow};
+    use crate::agent_ipc::changes::{
+        ChangeController, ChangeCounts, ChangeRecord, ChangeRow, ChangeRowOutcome, ChangeRowResult,
+    };
     let settings = Settings::default();
     let mut state = injected(&settings);
     let controller = ChangeController::new();
@@ -875,7 +877,9 @@ fn change_fixture(
                 item: format!(r"C:\写真\{}\項目{index}.jpg", "長いフォルダ名\\".repeat(12)),
                 before: "未登録".repeat(15),
                 after: "長いコレクション名".repeat(20),
-                result: format!("変更しました {index}"),
+                result: ChangeRowResult::Done(ChangeRowOutcome::Text(format!(
+                    "変更しました {index}"
+                ))),
             })
             .collect(),
         notice: String::new(),
@@ -972,6 +976,34 @@ fn agent_changes_copy_text_preserves_all_rows_and_results() {
 }
 
 #[test]
+fn agent_change_row_presentation_is_derived_from_typed_completion_state() {
+    use crate::agent_ipc::changes::{ChangeRow, ChangeRowOutcome, ChangeRowResult};
+    let mut row = ChangeRow {
+        item: "page.png".into(),
+        before: String::new(),
+        after: String::new(),
+        result: ChangeRowResult::Pending,
+    };
+    assert_eq!(
+        change_row_text(&row),
+        "項目: page.png\n前の値: 処理中\n後の値: 処理中\n結果: 処理中"
+    );
+    row.before = "#old".into();
+    row.after = "#new".into();
+    row.result = ChangeRowResult::Done(ChangeRowOutcome::Changed);
+    assert_eq!(
+        change_row_text(&row),
+        "項目: page.png\n前の値: #old\n後の値: #new\n結果: 変更"
+    );
+    row.result = ChangeRowResult::Done(ChangeRowOutcome::Unchanged);
+    assert!(change_row_text(&row).ends_with("結果: 変更なし"));
+    row.result = ChangeRowResult::Failed("保存エラー".into());
+    assert!(change_row_text(&row).ends_with("結果: 失敗: 保存エラー"));
+    row.result = ChangeRowResult::Done(ChangeRowOutcome::Text("変更しました".into()));
+    assert!(change_row_text(&row).ends_with("結果: 変更しました"));
+}
+
+#[test]
 fn agent_changes_same_name_collections_show_and_copy_distinct_targets() {
     use crate::agent_ipc::changes::{ChangeController, CollectionTarget};
     let (mut state, _) = change_fixture(1);
@@ -988,7 +1020,9 @@ fn agent_changes_same_name_collections_show_and_copy_distinct_targets() {
             item: r"C:\写真\海.jpg".into(),
             before: "未登録".into(),
             after: "登録済み".into(),
-            result: "変更しました".into(),
+            result: crate::agent_ipc::changes::ChangeRowResult::Done(
+                crate::agent_ipc::changes::ChangeRowOutcome::Text("変更しました".into()),
+            ),
         };
         controller.publish(record);
     }

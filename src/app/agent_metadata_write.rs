@@ -1,7 +1,9 @@
 //! UI admission and accepted metadata operations. Target I/O belongs to the
 //! agent worker; this boundary never enters the user's edit history.
 use super::*;
-use crate::agent_ipc::changes::{ChangeCounts, ChangeRecord, ChangeRow};
+use crate::agent_ipc::changes::{
+    ChangeCounts, ChangeRecord, ChangeRow, ChangeRowOutcome, ChangeRowResult,
+};
 use crate::agent_ipc::metadata_write::PreparedItem;
 use crate::agent_ipc::open::{UiOpenOutcome, UiRequestKind};
 use mimageviewer_agent_ipc::{
@@ -116,18 +118,22 @@ impl App {
                     .map(|(item, state)| ChangeRow {
                         item: item_label(&item.input),
                         before: if *state == ItemState::Queued {
-                            "処理中"
+                            ""
                         } else {
                             "—"
                         }
                         .into(),
                         after: if *state == ItemState::Queued {
-                            "処理中"
+                            ""
                         } else {
                             "—"
                         }
                         .into(),
-                        result: state.message().into(),
+                        result: if *state == ItemState::Queued {
+                            ChangeRowResult::Pending
+                        } else {
+                            ChangeRowResult::Done(ChangeRowOutcome::Text(state.message().into()))
+                        },
                     })
                     .collect();
                 self.request_agent_tag_set_for_targets(
@@ -200,7 +206,14 @@ impl App {
                             item: item_label(&item.input),
                             before,
                             after,
-                            result: message.into(),
+                            result: if item.target.is_ok()
+                                && states[index]
+                                    == ItemState::Skipped(MetadataSkipReason::Unavailable)
+                            {
+                                ChangeRowResult::Failed(message.into())
+                            } else {
+                                ChangeRowResult::Done(ChangeRowOutcome::Text(message.into()))
+                            },
                         }
                     })
                     .collect();

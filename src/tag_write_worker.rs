@@ -31,11 +31,21 @@ impl std::fmt::Debug for AgentTagChange {
 
 impl AgentTagChange {
     pub(crate) fn complete(&self, result: &TagWriteResult) {
+        use crate::agent_ipc::changes::{ChangeRowOutcome, ChangeRowResult};
+        // Only the job carrying this exact owner may finish this row. Neither
+        // display text nor a transaction from another call establishes ownership.
+        if !result.agent.as_ref().is_some_and(|origin| {
+            Arc::ptr_eq(&origin.controller, &self.controller)
+                && origin.record_id == self.record_id
+                && origin.row_index == self.row_index
+        }) {
+            return;
+        }
         self.controller.update(self.record_id, |record| {
             let Some(row) = record.rows.get_mut(self.row_index) else {
                 return;
             };
-            if row.result != "queued" {
+            if row.result != ChangeRowResult::Pending {
                 return;
             }
             row.before = result.tags_before.join(", ");
@@ -44,16 +54,16 @@ impl AgentTagChange {
                 Ok(action) => {
                     row.after = result.tags_after.join(", ");
                     if *action == TagAction::NoOp {
-                        row.result = "unchanged".into();
+                        row.result = ChangeRowResult::Done(ChangeRowOutcome::Unchanged);
                         record.counts.unchanged += 1;
                     } else {
-                        row.result = "changed".into();
+                        row.result = ChangeRowResult::Done(ChangeRowOutcome::Changed);
                         record.counts.changed += 1;
                     }
                 }
                 Err(error) => {
                     row.after = row.before.clone();
-                    row.result = format!("failed: {error}");
+                    row.result = ChangeRowResult::Failed(error.clone());
                     record.counts.failed += 1;
                 }
             }
@@ -173,7 +183,64 @@ pub struct TagWriteHandle {
     db_released: Arc<AtomicBool>,
 }
 
+/// Exercises publication and the later done counter as separate worker steps.
+#[cfg(test)]
+pub(crate) struct TagWriteTestDriver {
+    jobs: Receiver<TagWriteJob>,
+    results: Sender<TagWriteResult>,
+    done: Arc<AtomicUsize>,
+    failures: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+impl TagWriteTestDriver {
+    pub(crate) fn recv_job(&self) -> TagWriteJob {
+        self.jobs.try_recv().expect("submitted tag job")
+    }
+
+    pub(crate) fn publish_result(&self, result: TagWriteResult) {
+        if result.result.is_err() {
+            self.failures.fetch_add(1, Ordering::Relaxed);
+        }
+        self.results.send(result).unwrap();
+    }
+
+    pub(crate) fn finish_job(&self) {
+        self.done.fetch_add(1, Ordering::Release);
+    }
+}
+
 impl TagWriteHandle {
+    #[cfg(test)]
+    pub(crate) fn controlled_for_test() -> (Self, TagWriteTestDriver) {
+        let (job_tx, jobs) = unbounded();
+        let (results, result_rx) = unbounded();
+        let done = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let driver = TagWriteTestDriver {
+            jobs,
+            results,
+            done: done.clone(),
+            failures: failures.clone(),
+        };
+        (
+            Self {
+                job_tx,
+                result_rx,
+                total: Arc::new(AtomicUsize::new(0)),
+                user_total: AtomicUsize::new(0),
+                done,
+                failures,
+                pending_in_writer: Arc::new(AtomicUsize::new(0)),
+                _thread: None,
+                shutdown: Arc::new(AtomicBool::new(false)),
+                release_db_requested: Arc::new(AtomicBool::new(false)),
+                db_released: Arc::new(AtomicBool::new(false)),
+            },
+            driver,
+        )
+    }
+
     /// A deterministic published-but-unadopted result for real UI admission
     /// tests. No worker thread or timing window is involved.
     #[cfg(test)]
@@ -531,6 +598,103 @@ fn process_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_completion_requires_its_typed_owner_and_finishes_pending_once() {
+        use crate::agent_ipc::changes::{
+            ChangeController, ChangeCounts, ChangeRecord, ChangeRow, ChangeRowOutcome,
+            ChangeRowResult,
+        };
+        let controller = ChangeController::new();
+        let publish = |controller: &Arc<ChangeController>| {
+            controller.publish(ChangeRecord {
+                id: Default::default(),
+                at: std::time::SystemTime::UNIX_EPOCH,
+                client_name: "typed completion fixture".into(),
+                tool: "add_tags".into(),
+                collection: None,
+                counts: ChangeCounts {
+                    queued: 1,
+                    ..Default::default()
+                },
+                summary: String::new(),
+                rows: vec![ChangeRow {
+                    item: "page.png".into(),
+                    ..Default::default()
+                }],
+                notice: String::new(),
+            })
+        };
+        let id = publish(&controller);
+        let other_id = publish(&controller);
+        let owner = AgentTagChange {
+            controller: controller.clone(),
+            record_id: id,
+            row_index: 0,
+        };
+        let mut result = TagWriteResult {
+            agent: Some(owner.clone()),
+            path: "page.png".into(),
+            tag_sidecar: None,
+            result: Ok(TagAction::Added),
+            tags_before: vec!["#old".into()],
+            tags_after: vec!["#new".into()],
+            tx_id: 7,
+        };
+        let foreign = ChangeController::new();
+        let foreign_id = publish(&foreign);
+        for wrong_owner in [
+            AgentTagChange {
+                controller: controller.clone(),
+                record_id: other_id,
+                row_index: 0,
+            },
+            AgentTagChange {
+                controller: controller.clone(),
+                record_id: id,
+                row_index: 1,
+            },
+            AgentTagChange {
+                controller: foreign,
+                record_id: foreign_id,
+                row_index: 0,
+            },
+        ] {
+            wrong_owner.complete(&result);
+        }
+        result.agent = None;
+        owner.complete(&result);
+        assert!(
+            controller
+                .records()
+                .lock()
+                .unwrap()
+                .entries()
+                .iter()
+                .all(|record| record.counts.queued == 1)
+        );
+        result.agent = Some(owner.clone());
+        owner.complete(&result);
+        result.result = Err("a duplicate must not replace success".into());
+        owner.complete(&result);
+        let records = controller.records();
+        let records = records.lock().unwrap();
+        let record = records
+            .entries()
+            .iter()
+            .find(|record| record.id == id)
+            .unwrap();
+        assert_eq!(record.counts.changed, 1);
+        assert_eq!(record.counts.queued, 0);
+        assert_eq!(record.counts.failed, 0);
+        assert_eq!(
+            record.rows[0].result,
+            ChangeRowResult::Done(ChangeRowOutcome::Changed)
+        );
+        assert_eq!(record.rows[0].before, "#old");
+        assert_eq!(record.rows[0].after, "#new");
+        assert_eq!(records.entries()[0].counts.queued, 1);
+    }
 
     #[test]
     fn job_kinds_clone() {

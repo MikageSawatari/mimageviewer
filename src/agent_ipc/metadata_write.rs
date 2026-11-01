@@ -223,38 +223,61 @@ fn prepare_rating_with_pdf_sizes(
     let key = if let Some(member) = input.subresource.as_deref() {
         match meta.kind {
             RatingItemKind::ZipFile => {
-                if crate::book_scope::validate_relative_reference(member).is_err()
-                    || !crate::folder_tree::is_recognized_image_ext(
-                        &Path::new(member)
-                            .extension()
-                            .and_then(|extension| extension.to_str())
-                            .unwrap_or("")
-                            .to_ascii_lowercase(),
-                    )
+                let member = member.replace('\\', "/");
+                let is_directory = member.ends_with('/');
+                let reference = member.strip_suffix('/').unwrap_or(&member);
+                if crate::book_scope::validate_relative_reference(reference).is_err()
+                    || (!is_directory
+                        && !crate::folder_tree::is_recognized_image_ext(
+                            &Path::new(&member)
+                                .extension()
+                                .and_then(|extension| extension.to_str())
+                                .unwrap_or("")
+                                .to_ascii_lowercase(),
+                        ))
                 {
                     return Ok(Err(MetadataSkipReason::UnsupportedSubresource));
                 }
                 checkpoint(ctx)?;
-                let zip = super::item_info::read_zip_identity(
-                    &path,
-                    &member.replace('\\', "/"),
-                    &ctx.cancel,
-                );
-                checkpoint(ctx)?;
-                let zip = match zip {
-                    Ok(zip) if zip.size.is_some() => zip,
-                    Ok(_) => return Ok(Err(MetadataSkipReason::Unavailable)),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok(Err(MetadataSkipReason::NotFound));
-                    }
-                    Err(_) => return Ok(Err(MetadataSkipReason::Unavailable)),
-                };
-                let key = crate::adjustment_db::zip_entry_key(&path, &zip.name);
-                let old_key = crate::adjustment_db::zip_entry_key(&path, &zip.legacy_name);
-                legacy_key = (old_key != key).then_some(old_key);
-                meta.kind = RatingItemKind::ZipImage;
-                meta.entry_name = Some(zip.name);
-                key
+                if is_directory {
+                    let identity =
+                        super::item_info::read_zip_directory_identity(&path, &member, &ctx.cancel);
+                    checkpoint(ctx)?;
+                    let identity = match identity {
+                        Ok(Some(identity)) => identity,
+                        Ok(None) => return Ok(Err(MetadataSkipReason::Unavailable)),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(Err(MetadataSkipReason::NotFound));
+                        }
+                        Err(_) => return Ok(Err(MetadataSkipReason::Unavailable)),
+                    };
+                    let key = zip_directory_rating_key(&path, &identity.name);
+                    let old_key = zip_directory_rating_key(&path, &identity.legacy_name);
+                    legacy_key = (old_key != key).then_some(old_key);
+                    meta.kind = RatingItemKind::ZipDir;
+                    meta.zipdir_is_archive = Some(crate::zip_tree::segment_is_archive(
+                        crate::grid_item::zipdir_display_name(&identity.name),
+                    ));
+                    meta.dir_prefix = Some(identity.name);
+                    key
+                } else {
+                    let zip = super::item_info::read_zip_identity(&path, &member, &ctx.cancel);
+                    checkpoint(ctx)?;
+                    let zip = match zip {
+                        Ok(zip) if zip.size.is_some() => zip,
+                        Ok(_) => return Ok(Err(MetadataSkipReason::Unavailable)),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(Err(MetadataSkipReason::NotFound));
+                        }
+                        Err(_) => return Ok(Err(MetadataSkipReason::Unavailable)),
+                    };
+                    let key = crate::adjustment_db::zip_entry_key(&path, &zip.name);
+                    let old_key = crate::adjustment_db::zip_entry_key(&path, &zip.legacy_name);
+                    legacy_key = (old_key != key).then_some(old_key);
+                    meta.kind = RatingItemKind::ZipImage;
+                    meta.entry_name = Some(zip.name);
+                    key
+                }
             }
             RatingItemKind::PdfFile
                 if path
@@ -299,6 +322,10 @@ fn prepare_rating_with_pdf_sizes(
         xmp_target,
         compiled_book_page,
     }))
+}
+
+fn zip_directory_rating_key(path: &Path, prefix: &str) -> String {
+    crate::adjustment_db::normalize_path(&crate::app::book_container_key(path, prefix))
 }
 
 fn pdf_page_number(member: &str) -> Option<u32> {

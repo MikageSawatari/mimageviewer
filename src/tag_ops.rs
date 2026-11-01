@@ -630,18 +630,24 @@ impl App {
 /// `submit_tag_jobs` の None 経路でトースト表示する。
 const TAG_WRITE_UNAVAILABLE_MSG: &str = "タグ書き込みが初期化されていません";
 
+/// User-origin results belong to the writer batch, rather than a single UI poll.
+/// Publication may be adopted before `done`, or before later agent jobs finish.
+#[derive(Default)]
+pub(crate) struct TagWriteCompletion {
+    added: usize,
+    removed: usize,
+    cleared: usize,
+    restored: usize,
+    noop: usize,
+    errors: Vec<(PathBuf, String)>,
+}
+
 impl App {
     /// 毎フレーム呼ぶ: tag_write_worker の結果をドレインしてトーストする。
     /// 成功した各 path については worker が書いた mIV タグ一覧をそのまま `tags_cache` に
     /// 反映する。
     pub(crate) fn poll_tag_write_results(&mut self) {
-        let mut errors: Vec<(PathBuf, String)> = Vec::new();
         let mut agent_errors: Vec<(PathBuf, String)> = Vec::new();
-        let mut added = 0usize;
-        let mut removed = 0usize;
-        let mut cleared = 0usize;
-        let mut restored = 0usize;
-        let mut noop = 0usize;
         let mut just_completed = false;
         let mut user_batch_completed = false;
         let mut agent_changed = false;
@@ -666,27 +672,27 @@ impl App {
                         agent_changed |= agent && changed;
                         match action {
                             TagAction::Added => {
-                                added += usize::from(!agent);
+                                self.tag_write_completion.added += usize::from(!agent);
                                 crate::logger::log(format!("[TAG]   ✓ added → {path_disp}"));
                             }
                             TagAction::Removed => {
-                                removed += usize::from(!agent);
+                                self.tag_write_completion.removed += usize::from(!agent);
                                 crate::logger::log(format!("[TAG]   ✓ removed → {path_disp}"));
                             }
                             TagAction::Cleared => {
-                                cleared += usize::from(!agent);
+                                self.tag_write_completion.cleared += usize::from(!agent);
                                 crate::logger::log(format!(
                                     "[TAG]   ✓ cleared mIV tags → {path_disp}"
                                 ));
                             }
                             TagAction::Restored => {
-                                restored += usize::from(!agent);
+                                self.tag_write_completion.restored += usize::from(!agent);
                                 crate::logger::log(format!(
                                     "[TAG]   ✓ restored tags (undo/redo) → {path_disp}"
                                 ));
                             }
                             TagAction::NoOp => {
-                                noop += usize::from(!agent);
+                                self.tag_write_completion.noop += usize::from(!agent);
                                 crate::logger::log(format!(
                                     "[TAG]   = no-op (already in target state) → {path_disp}"
                                 ));
@@ -727,7 +733,7 @@ impl App {
                         if agent {
                             agent_errors.push((res.path, e));
                         } else {
-                            errors.push((res.path, e));
+                            self.tag_write_completion.errors.push((res.path, e));
                         }
                     }
                 }
@@ -773,40 +779,54 @@ impl App {
         // pending_tag_undos に worker 結果を集計し、完了したトランザクションは
         // UndoEntry::Tag を組み立てて meta_undo に push する。
         self.finalize_pending_tag_undos(pending_updates);
-        if just_completed {
+        if just_completed && user_batch_completed {
+            let TagWriteCompletion {
+                added,
+                removed,
+                cleared,
+                restored,
+                noop,
+                errors,
+            } = std::mem::take(&mut self.tag_write_completion);
             crate::logger::log(format!(
                 "[TAG] batch complete: added={added} removed={removed} cleared={cleared} \
                  restored={restored} noop={noop} errors={}",
                 errors.len()
             ));
-        }
-        if !errors.is_empty() {
-            let preview = errors
-                .iter()
-                .take(3)
-                .map(|(p, e)| {
-                    format!(
-                        "{}: {}",
-                        p.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
-                        e
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" / ");
-            let msg = format!("タグ書き込み失敗 {} 件: {}", errors.len(), preview);
-            // 発火面が分かるバッチはその面に出す (undo 復元など面未記録は従来どおり全面)。
-            match self.tag_toast_surface {
-                Some(surface) => self.show_feedback_warning_on(msg, surface),
-                None => self.show_feedback_warning(msg),
-            }
-        } else if just_completed && (added + removed + cleared + restored + noop) > 0 {
             let label = self.tag_toast_label.take();
             let surface = self.tag_toast_surface.take();
-            let msg =
-                format_completion_toast(label.as_deref(), added, removed, cleared, restored, noop);
-            match surface {
-                Some(surface) => self.show_feedback_toast_on(msg, surface),
-                None => self.show_feedback_toast(msg),
+            if !errors.is_empty() {
+                let preview = errors
+                    .iter()
+                    .take(3)
+                    .map(|(p, e)| {
+                        format!(
+                            "{}: {}",
+                            p.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                            e
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+                let msg = format!("タグ書き込み失敗 {} 件: {}", errors.len(), preview);
+                // 発火面が分かるバッチはその面に出す (undo 復元など面未記録は従来どおり全面)。
+                match surface {
+                    Some(surface) => self.show_feedback_warning_on(msg, surface),
+                    None => self.show_feedback_warning(msg),
+                }
+            } else if (added + removed + cleared + restored + noop) > 0 {
+                let msg = format_completion_toast(
+                    label.as_deref(),
+                    added,
+                    removed,
+                    cleared,
+                    restored,
+                    noop,
+                );
+                match surface {
+                    Some(surface) => self.show_feedback_toast_on(msg, surface),
+                    None => self.show_feedback_toast(msg),
+                }
             }
         }
         if !agent_errors.is_empty() {
@@ -816,13 +836,6 @@ impl App {
             ));
         }
         if just_completed {
-            // バッチ完了時は、完了トーストに使わなかった場合 (エラー完了等) でも
-            // routing 状態を必ず破棄する。残すと次バッチの完了トーストが古い
-            // ラベル/発火面で表示される (Codex P3)。成功分岐の take() 後は no-op。
-            if user_batch_completed {
-                self.tag_toast_label = None;
-                self.tag_toast_surface = None;
-            }
             if let Some(h) = self.tag_write_handle.as_ref() {
                 h.reset_counters_if_idle();
             }
@@ -944,6 +957,215 @@ fn format_completion_toast(
 #[cfg(test)]
 mod tests {
     use super::format_completion_toast;
+    use std::path::PathBuf;
+
+    fn controlled_result(
+        job: crate::tag_write_worker::TagWriteJob,
+        result: Result<crate::tag_write_worker::TagAction, &str>,
+    ) -> crate::tag_write_worker::TagWriteResult {
+        let agent = match job.kind {
+            crate::tag_write_worker::TagJobKind::Delta { agent, .. } => agent,
+            _ => None,
+        };
+        crate::tag_write_worker::TagWriteResult {
+            agent,
+            path: job.path,
+            tag_sidecar: job.tag_sidecar,
+            tags_before: vec![],
+            tags_after: if result.is_ok() {
+                vec!["#tag".into()]
+            } else {
+                vec![]
+            },
+            result: result.map_err(str::to_owned),
+            tx_id: job.tx_id,
+        }
+    }
+
+    fn submit_controlled_user(app: &mut crate::app::App, paths: &[PathBuf]) {
+        let targets = paths
+            .iter()
+            .map(|path| super::TagTarget {
+                path: path.clone(),
+                tag_sidecar: None,
+            })
+            .collect();
+        app.request_tag_add_for_targets("tag", targets, crate::app::ActionSurface::MainWindow);
+    }
+
+    fn submit_controlled_agent(app: &mut crate::app::App, path: PathBuf) {
+        use crate::agent_ipc::changes::{ChangeController, ChangeRow, ChangeRowResult};
+        app.request_agent_tag_set_for_targets(
+            vec![(
+                0,
+                super::TagTarget {
+                    path,
+                    tag_sidecar: None,
+                },
+            )],
+            &["agent".into()],
+            true,
+            "client".into(),
+            vec![ChangeRow {
+                result: ChangeRowResult::Pending,
+                ..Default::default()
+            }],
+            ChangeController::new(),
+        );
+    }
+
+    #[test]
+    fn user_completion_toast_survives_adoption_before_done() {
+        use crate::tag_write_worker::{TagAction, TagWriteHandle};
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let (handle, driver) = TagWriteHandle::controlled_for_test();
+        app.tag_write_handle = Some(handle);
+        let path = app.tmp.path().join("user.jpg");
+        submit_controlled_user(&mut app, &[path]);
+        let job = driver.recv_job();
+        assert!(app.pending_tag_undos.contains_key(&job.tx_id));
+        let notifications = app.feedback_toasts_for_test.len();
+        driver.publish_result(controlled_result(job, Ok(TagAction::Added)));
+        app.poll_tag_write_results();
+        assert_eq!(app.feedback_toasts_for_test.len(), notifications);
+        assert_eq!(app.tag_write_completion.added, 1);
+        assert_eq!(app.tag_toast_label.as_deref(), Some("#tag"));
+        assert_eq!(
+            app.tag_toast_surface,
+            Some(crate::app::ActionSurface::MainWindow)
+        );
+        assert!(app.pending_tag_undos.is_empty());
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        app.poll_tag_write_results();
+        assert_eq!(app.feedback_toasts_for_test.len(), notifications);
+        driver.finish_job();
+        app.poll_tag_write_results();
+        assert_eq!(app.feedback_toasts_for_test.len(), notifications + 1);
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "1 件に #tag を付与"
+        );
+        assert_eq!(
+            app.fs_feedback_toast_surface,
+            Some(crate::app::ActionSurface::MainWindow)
+        );
+        assert!(app.tag_toast_label.is_none());
+        assert!(app.tag_toast_surface.is_none());
+        assert_eq!(app.tag_write_completion.added, 0);
+        assert!(!app.tag_writer_has_unpublished_jobs());
+        app.poll_tag_write_results();
+        assert_eq!(app.feedback_toasts_for_test.len(), notifications + 1);
+    }
+
+    #[test]
+    fn mixed_batch_keeps_all_user_counts_until_later_agent_completion() {
+        use crate::tag_write_worker::{TagAction, TagWriteHandle};
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let (handle, driver) = TagWriteHandle::controlled_for_test();
+        app.tag_write_handle = Some(handle);
+        let paths = [
+            app.tmp.path().join("one.jpg"),
+            app.tmp.path().join("two.jpg"),
+        ];
+        submit_controlled_user(&mut app, &paths);
+        let first = driver.recv_job();
+        let second = driver.recv_job();
+        let agent_path = app.tmp.path().join("agent.jpg");
+        submit_controlled_agent(&mut app, agent_path);
+        let agent = driver.recv_job();
+        let pending_tx = app.next_tag_tx_id();
+        app.register_pending_tag_op(pending_tx, "unrelated pending".into(), 1);
+        let notifications = app.feedback_toasts_for_test.len();
+        driver.publish_result(controlled_result(first, Ok(TagAction::Added)));
+        driver.finish_job();
+        app.poll_tag_write_results();
+        assert_eq!(app.tag_write_completion.added, 1);
+        driver.publish_result(controlled_result(second, Ok(TagAction::Added)));
+        driver.finish_job();
+        app.poll_tag_write_results();
+        assert_eq!(app.tag_write_completion.added, 2);
+        assert_eq!(app.feedback_toasts_for_test.len(), notifications);
+        assert_eq!(app.tag_toast_label.as_deref(), Some("#tag"));
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        assert_eq!(app.pending_tag_undos.len(), 1);
+        assert!(app.pending_tag_undos.contains_key(&pending_tx));
+        driver.publish_result(controlled_result(agent, Ok(TagAction::Added)));
+        app.poll_tag_write_results();
+        assert_eq!(app.feedback_toasts_for_test.len(), notifications);
+        assert_eq!(
+            app.tag_write_completion.added, 2,
+            "agent result is excluded"
+        );
+        driver.finish_job();
+        app.poll_tag_write_results();
+        assert_eq!(app.feedback_toasts_for_test.len(), notifications + 1);
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "2 件に #tag を付与"
+        );
+        assert_eq!(
+            app.fs_feedback_toast_surface,
+            Some(crate::app::ActionSurface::MainWindow)
+        );
+        assert_eq!(app.pending_tag_undos.len(), 1);
+        assert!(app.pending_tag_undos.contains_key(&pending_tx));
+        assert_eq!(app.meta_undo.undo_len(), 1, "agent adoption adds no Undo");
+        app.poll_tag_write_results();
+        assert_eq!(app.feedback_toasts_for_test.len(), notifications + 1);
+    }
+
+    #[test]
+    fn user_failure_survives_later_success_and_notifies_once_at_completion() {
+        use crate::tag_write_worker::{TagAction, TagWriteHandle};
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let (handle, driver) = TagWriteHandle::controlled_for_test();
+        app.tag_write_handle = Some(handle);
+        let paths = [
+            app.tmp.path().join("failed.jpg"),
+            app.tmp.path().join("ok.jpg"),
+        ];
+        submit_controlled_user(&mut app, &paths);
+        let failed = driver.recv_job();
+        let success = driver.recv_job();
+        let notifications = app.feedback_toasts_for_test.len();
+        driver.publish_result(controlled_result(failed, Err("write rejected")));
+        driver.finish_job();
+        app.poll_tag_write_results();
+        assert_eq!(app.tag_write_completion.errors.len(), 1);
+        assert_eq!(app.feedback_toasts_for_test.len(), notifications);
+        driver.publish_result(controlled_result(success, Ok(TagAction::Added)));
+        driver.finish_job();
+        app.poll_tag_write_results();
+        assert_eq!(app.feedback_toasts_for_test.len(), notifications + 1);
+        assert_eq!(
+            app.feedback_toasts_for_test.last().unwrap().1,
+            crate::feedback::FeedbackKind::Warning
+        );
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("タグ書き込み失敗 1 件")
+        );
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("write rejected")
+        );
+        assert_eq!(
+            app.fs_feedback_toast_surface,
+            Some(crate::app::ActionSurface::MainWindow)
+        );
+        assert!(app.pending_tag_undos.is_empty());
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        assert!(app.tag_write_completion.errors.is_empty());
+        assert!(app.tag_toast_label.is_none());
+        app.poll_tag_write_results();
+        assert_eq!(app.feedback_toasts_for_test.len(), notifications + 1);
+    }
 
     #[test]
     fn agent_tag_submission_preserves_user_boundary_and_records_real_writer_values() {
@@ -976,7 +1198,7 @@ mod tests {
                 "client".into(),
                 vec![ChangeRow {
                     item: path.display().to_string(),
-                    result: "queued".into(),
+                    result: crate::agent_ipc::changes::ChangeRowResult::Pending,
                     ..Default::default()
                 }],
                 changes.clone(),
@@ -1044,7 +1266,7 @@ mod tests {
             "client".into(),
             vec![ChangeRow {
                 item: path.display().to_string(),
-                result: "queued".into(),
+                result: crate::agent_ipc::changes::ChangeRowResult::Pending,
                 ..Default::default()
             }],
             changes.clone(),

@@ -37,12 +37,27 @@ impl ChangeCounts {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ChangeRowOutcome {
+    Changed,
+    Unchanged,
+    Text(String),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ChangeRowResult {
+    #[default]
+    Pending,
+    Done(ChangeRowOutcome),
+    Failed(String),
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ChangeRow {
     pub(crate) item: String,
     pub(crate) before: String,
     pub(crate) after: String,
-    pub(crate) result: String,
+    pub(crate) result: ChangeRowResult,
 }
 
 #[derive(Clone, Debug)]
@@ -233,7 +248,7 @@ mod tests {
         assert!(controller.update(id, |record| {
             record.rows[0].before = "前".into();
             record.rows[0].after = "後".into();
-            record.rows[0].result = "changed".into();
+            record.rows[0].result = ChangeRowResult::Done(ChangeRowOutcome::Changed);
             record.rows.push(ChangeRow::default());
         }));
         assert!(receiver.try_recv().is_err());

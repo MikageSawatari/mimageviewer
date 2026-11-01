@@ -605,7 +605,12 @@ mod filesystem {
         let records = shared.lock().unwrap();
         let existing = &records.entries()[0];
         assert!(existing.rows.iter().all(|row| {
-            row.before == "登録済み" && row.after == "登録済み" && row.result == "変更なし"
+            row.before == "登録済み"
+                && row.after == "登録済み"
+                && row.result
+                    == changes::ChangeRowResult::Done(changes::ChangeRowOutcome::Text(
+                        "変更なし".into(),
+                    ))
         }));
         let add = &records.entries()[1];
         assert_eq!(add.counts.changed, 2);

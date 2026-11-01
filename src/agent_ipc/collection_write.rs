@@ -5,7 +5,9 @@ use crate::collection_store::{
     CollectionId, CollectionSnapshot, CollectionSourcePath, CollectionStoreClient,
     CollectionStoreError, prepare_collection_registrations,
 };
-use changes::{ChangeCounts, ChangeRecord, ChangeRow, CollectionTarget};
+use changes::{
+    ChangeCounts, ChangeRecord, ChangeRow, ChangeRowOutcome, ChangeRowResult, CollectionTarget,
+};
 use std::collections::HashSet;
 use std::time::SystemTime;
 
@@ -192,7 +194,7 @@ pub(super) fn respond(
                     };
                     for row in &mut record.rows {
                         row.after = row.before.clone();
-                        row.result = cause.message.clone();
+                        row.result = ChangeRowResult::Failed(cause.message.clone());
                     }
                     record.summary = cause.message.clone();
                     record.notice = "AI によるコレクションの変更に失敗しました".into();
@@ -285,7 +287,7 @@ fn execute(
                 item: "コレクション".into(),
                 before: "なし".into(),
                 after: name.clone(),
-                result: "作成".into(),
+                result: ChangeRowResult::Done(ChangeRowOutcome::Text("作成".into())),
             });
             let created = enqueue(handlers, ctx, gate, || client.create_collection(name))?;
             record.rows[0].item = created.definition.id.to_string();
@@ -304,7 +306,7 @@ fn execute(
                 item: id.to_string(),
                 before: before.definition.name.clone(),
                 after: name.clone(),
-                result: "名前変更".into(),
+                result: ChangeRowResult::Done(ChangeRowOutcome::Text("名前変更".into())),
             });
             let after = enqueue(handlers, ctx, gate, || {
                 client.rename_collection(id, before.revision(), name)
@@ -312,12 +314,14 @@ fn execute(
             let changed = before.definition.name != after.definition.name;
             record.counts.changed = usize::from(changed);
             record.counts.unchanged = usize::from(!changed);
-            record.rows[0].result = if changed {
-                "名前変更"
-            } else {
-                "変更なし"
-            }
-            .into();
+            record.rows[0].result = ChangeRowResult::Done(ChangeRowOutcome::Text(
+                if changed {
+                    "名前変更"
+                } else {
+                    "変更なし"
+                }
+                .into(),
+            ));
             record.summary = "コレクション名の変更".into();
             record.notice = format!(
                 "AI がコレクションを変更しました ({} 件)",
@@ -568,7 +572,7 @@ fn item_rows(
                 ),
                 before: before.into(),
                 after: after.into(),
-                result: outcome.into(),
+                result: ChangeRowResult::Done(ChangeRowOutcome::Text(outcome.into())),
             }
         })
         .collect()

@@ -404,9 +404,27 @@ pub(super) fn draw_changes(ui: &mut egui::Ui, state: &AgentIntegrationState) {
 }
 
 fn change_row_text(row: &crate::agent_ipc::changes::ChangeRow) -> String {
+    use crate::agent_ipc::changes::{ChangeRowOutcome, ChangeRowResult};
+    let failure;
+    let (before, after, result) = match &row.result {
+        ChangeRowResult::Pending => ("処理中", "処理中", "処理中"),
+        ChangeRowResult::Done(result) => (
+            row.before.as_str(),
+            row.after.as_str(),
+            match result {
+                ChangeRowOutcome::Changed => "変更",
+                ChangeRowOutcome::Unchanged => "変更なし",
+                ChangeRowOutcome::Text(text) => text.as_str(),
+            },
+        ),
+        ChangeRowResult::Failed(error) => {
+            failure = format!("失敗: {error}");
+            (row.before.as_str(), row.after.as_str(), failure.as_str())
+        }
+    };
     format!(
         "項目: {}\n前の値: {}\n後の値: {}\n結果: {}",
-        row.item, row.before, row.after, row.result
+        row.item, before, after, result
     )
 }
 
@@ -818,7 +836,9 @@ pub(super) fn snapshot(ui: &mut egui::Ui, level: u8) {
                 item: r"C:\写真\旅行\海辺の写真.jpg".into(),
                 before: "未登録".into(),
                 after: "旅行の写真".into(),
-                result: "変更しました".into(),
+                result: crate::agent_ipc::changes::ChangeRowResult::Done(
+                    crate::agent_ipc::changes::ChangeRowOutcome::Text("変更しました".into()),
+                ),
             }],
             notice: String::new(),
         });

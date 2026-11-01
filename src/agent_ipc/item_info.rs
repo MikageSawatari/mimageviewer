@@ -296,6 +296,127 @@ pub(super) fn read_zip_identity(
     read_zip_with_leaf_bytes(path, member, cancel, false)
 }
 
+pub(super) struct ZipDirectoryIdentity {
+    pub(super) name: String,
+    pub(super) legacy_name: String,
+}
+
+/// Inspect directory identities without enumerating/decoding images or changing
+/// any ZIP migration state. None denotes an oversized intermediate archive.
+pub(super) fn read_zip_directory_identity(
+    path: &Path,
+    prefix: &str,
+    cancel: &AtomicBool,
+) -> std::io::Result<Option<ZipDirectoryIdentity>> {
+    match crate::zip_loader::open_archive(path)? {
+        crate::zip_loader::ZipArchiveHandle::Zip(archive) => {
+            read_zip_directory_impl(archive, prefix, cancel)
+        }
+        crate::zip_loader::ZipArchiveHandle::Rar(_) => Err(std::io::ErrorKind::InvalidInput.into()),
+    }
+}
+
+fn read_zip_directory_impl<R: Read + Seek>(
+    mut archive: zip::ZipArchive<R>,
+    prefix: &str,
+    cancel: &AtomicBool,
+) -> std::io::Result<Option<ZipDirectoryIdentity>> {
+    // Literal directory paths take precedence over nested ZIP boundaries, just
+    // as image lookups do. ZIPs need not contain explicit directory entries.
+    for index in 0..archive.len() {
+        if cancel.load(Ordering::Acquire) {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        let entry = archive.by_index_raw(index).map_err(std::io::Error::other)?;
+        if let Some(identity) = zip_directory_entry_identity(&entry, prefix) {
+            return Ok(Some(identity));
+        }
+    }
+    let parts = crate::zip_loader::split_nested_zip_path(prefix);
+    let Some((first, remainder)) = parts.split_first().filter(|(_, rest)| !rest.is_empty()) else {
+        return Err(std::io::ErrorKind::NotFound.into());
+    };
+    let index = crate::zip_loader::resolve_entry_index(&mut archive, first, None, Some(cancel))?;
+    // A terminal nested book needs its identity only. Do not read its payload.
+    let terminal = remainder.len() == 1 && remainder[0].is_empty();
+    let outer = read_zip_index(&mut archive, index, cancel, !terminal)?;
+    if terminal {
+        return Ok(Some(ZipDirectoryIdentity {
+            name: format!("{}/", outer.name),
+            legacy_name: format!("{}/", outer.legacy_name),
+        }));
+    }
+    let Some(bytes) = outer.bytes else {
+        return Ok(None);
+    };
+    drop(archive);
+    let inner = zip::ZipArchive::new(Cursor::new(bytes)).map_err(std::io::Error::other)?;
+    Ok(
+        read_zip_directory_impl(inner, &remainder.join("/"), cancel)?.map(|identity| {
+            ZipDirectoryIdentity {
+                name: format!("{}/{}", outer.name, identity.name),
+                legacy_name: format!("{}/{}", outer.legacy_name, identity.legacy_name),
+            }
+        }),
+    )
+}
+
+fn zip_directory_entry_identity(
+    entry: &zip::read::ZipFile<'_>,
+    prefix: &str,
+) -> Option<ZipDirectoryIdentity> {
+    let raw = entry.name_raw();
+    let current = crate::zip_loader::zip_entry_name(entry);
+    let current_name = current.replace('\\', "/");
+    let legacy_name = entry.name().replace('\\', "/");
+    if !current_name.starts_with(prefix) && !legacy_name.starts_with(prefix) {
+        return None;
+    }
+    let utf8 = std::str::from_utf8(raw).ok();
+    // zip 2.x exposes the legacy spelling decoded as UTF-8 (including Unicode
+    // path extras), or CP437, which maps exactly one character per raw byte.
+    let legacy_utf8 = String::from_utf8_lossy(raw) == entry.name();
+    let current_cp932 = utf8.is_none() && current != entry.name();
+    // Match one raw boundary in both spellings. CP932's trail byte 0x5c is a
+    // legacy backslash, so normalized legacy and current component counts can
+    // differ (e.g. 表/inner/). Never truncate both by the same component count.
+    for (offset, byte) in raw.iter().enumerate() {
+        if !matches!(byte, b'/' | b'\\') {
+            continue;
+        }
+        let end = offset + 1;
+        let legacy_prefix = if legacy_utf8 {
+            String::from_utf8_lossy(&raw[..end]).into_owned()
+        } else {
+            entry.name().chars().take(end).collect()
+        };
+        let current_prefix = if let Some(utf8) = utf8 {
+            utf8[..end].to_owned()
+        } else if current_cp932 {
+            let (decoded, _, had_errors) = encoding_rs::SHIFT_JIS.decode(&raw[..end]);
+            if had_errors {
+                continue;
+            }
+            decoded.into_owned()
+        } else {
+            legacy_prefix.clone()
+        };
+        let current_prefix = current_prefix.replace('\\', "/");
+        let legacy_prefix = legacy_prefix.replace('\\', "/");
+        // A 0x5c inside a CP932 character is not a decoded separator.
+        if current_prefix.ends_with('/')
+            && current_name.starts_with(&current_prefix)
+            && (current_prefix == prefix || legacy_prefix == prefix)
+        {
+            return Some(ZipDirectoryIdentity {
+                name: current_prefix,
+                legacy_name: legacy_prefix,
+            });
+        }
+    }
+    None
+}
+
 fn read_zip_with_leaf_bytes(
     path: &Path,
     member: &str,

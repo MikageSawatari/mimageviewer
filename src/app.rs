@@ -17317,6 +17317,8 @@ pub struct App {
     /// 進行中タグバッチの発火面。`tag_toast_label` と同じライフサイクルで、
     /// 完了トーストをどの面に出すかを決める (`poll_tag_write_results` で take)。
     pub(crate) tag_toast_surface: Option<ActionSurface>,
+    /// Adopted user-origin writer results, retained until the whole batch is complete.
+    pub(crate) tag_write_completion: crate::tag_ops::TagWriteCompletion,
     /// ComfyUI Raw Prompt JSON の展開状態
     pub(crate) metadata_show_raw_prompt: bool,
     /// ComfyUI Raw Workflow JSON の展開状態
@@ -21161,6 +21163,7 @@ impl App {
             tags_cache: std::collections::HashMap::new(),
             tag_toast_label: None,
             tag_toast_surface: None,
+            tag_write_completion: Default::default(),
             metadata_show_raw_prompt: false,
             metadata_show_raw_workflow: false,
             exif_sections_open: std::collections::HashMap::new(),
@@ -100052,7 +100055,7 @@ fn make_drive_list_pin_load_request_with_visibility(
 /// `zip_path` に `dir_prefix` ("a/b/") のセグメントを join した合成パス。
 /// `App::spread_container_key` (zip_path + 現在の実効 prefix) と同じ構成で、非崩しの
 /// 通常本では「本の中で pin したキー」と「親で ZipDir セルを引くキー」が一致する。
-fn book_container_key(zip_path: &std::path::Path, dir_prefix: &str) -> PathBuf {
+pub(crate) fn book_container_key(zip_path: &std::path::Path, dir_prefix: &str) -> PathBuf {
     let mut p = zip_path.to_path_buf();
     for seg in dir_prefix.split('/').filter(|s| !s.is_empty()) {
         p.push(seg);

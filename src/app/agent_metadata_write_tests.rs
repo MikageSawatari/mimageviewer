@@ -500,3 +500,143 @@ fn agent_write_and_open_share_the_same_single_request_permit() {
     app.poll_agent_open_requests(&ctx);
     assert_eq!(app.rating_session_write_generation, 0);
 }
+
+#[test]
+fn agent_tag_admission_real_writer_finishes_changed_noop_and_failed_records() {
+    use crate::agent_ipc::changes::{ChangeRowOutcome, ChangeRowResult};
+    let mut app = setup_app();
+    let ctx = egui::Context::default();
+    install(&mut app, &ctx);
+    let path = app.tmp.path().join("agent-tag-record.png");
+    std::fs::write(&path, b"fixture").unwrap();
+    let key = crate::tags_db::item_key_for_path(&path);
+    let mut db = crate::tags_db::TagsDb::open().unwrap();
+    db.apply_item_tag_delta(&key, &["original".into()], true)
+        .unwrap();
+    // Disposable DB triggers fail the real writer deterministically, after
+    // it has read the existing tags. No product failure hook is required.
+    let connection = rusqlite::Connection::open(app.tmp.path().join("tags.db")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_agent_fixture BEFORE INSERT ON item_tags
+         WHEN NEW.tag = 'blocked'
+         BEGIN SELECT RAISE(ABORT, 'agent fixture rejection'); END;
+         CREATE TRIGGER fail_agent_remove_fixture BEFORE DELETE ON item_tags
+         WHEN OLD.tag = 'original'
+         BEGIN SELECT RAISE(ABORT, 'agent fixture rejection'); END;",
+        )
+        .unwrap();
+    drop(connection);
+    let undo_before = app.meta_undo.undo_len();
+    let cases = [
+        ("extra", true, Some(ChangeRowOutcome::Changed)),
+        ("extra", true, Some(ChangeRowOutcome::Unchanged)),
+        ("blocked", true, None),
+        ("extra", false, Some(ChangeRowOutcome::Changed)),
+        ("extra", false, Some(ChangeRowOutcome::Unchanged)),
+        ("original", false, None),
+    ];
+    for (iteration, (tag, add, expected)) in cases.into_iter().enumerate() {
+        let before = db.display_tags_for_item(&key);
+        let request = UiRequestKind::TagWrite(PreparedTags {
+            items: vec![
+                PreparedItem {
+                    input: mimageviewer_agent_ipc::ItemRef {
+                        path: "invalid input".into(),
+                        subresource: None,
+                    },
+                    target: Err(MetadataSkipReason::InvalidPath),
+                },
+                PreparedItem {
+                    input: mimageviewer_agent_ipc::ItemRef {
+                        path: path.to_string_lossy().into_owned(),
+                        subresource: None,
+                    },
+                    target: Ok(crate::tag_ops::TagTarget {
+                        path: path.clone(),
+                        tag_sidecar: None,
+                    }),
+                },
+            ],
+            tags: vec![tag.into()],
+            add,
+            client_name: "real tag admission fixture".into(),
+        });
+        let UiOpenOutcome::Written(Ok(Payload::TagWrite(reply))) =
+            app.admit_agent_metadata_write(&request)
+        else {
+            panic!("tag write must be admitted")
+        };
+        assert!(
+            reply
+                .outcomes
+                .contains(&MetadataItemOutcome::Queued { indices: vec![1] })
+        );
+        let controller = app.agent_changes.as_ref().unwrap().controller.clone();
+        let pending = controller.records().lock().unwrap().entries()[0].clone();
+        assert_eq!(pending.tool, if add { "add_tags" } else { "remove_tags" });
+        assert_eq!(pending.rows[1].result, ChangeRowResult::Pending);
+        assert!(pending.rows[1].before.is_empty());
+        assert!(pending.rows[1].after.is_empty());
+        assert_eq!(pending.counts.queued, 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll_tag_write_results();
+            if !app
+                .tag_write_handle
+                .as_ref()
+                .unwrap()
+                .has_unconsumed_batch()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real tag writer completion"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let after = db.display_tags_for_item(&key);
+        let completed = controller.records().lock().unwrap().entries()[0].clone();
+        assert_eq!(completed.id, pending.id);
+        assert_eq!(completed.tool, if add { "add_tags" } else { "remove_tags" });
+        assert_eq!(completed.counts.queued, 0);
+        assert_eq!(completed.counts.skipped, 1);
+        assert_eq!(completed.rows[1].before, before.join(", "));
+        assert_eq!(completed.rows[1].after, after.join(", "));
+        match expected {
+            Some(ChangeRowOutcome::Changed) => {
+                assert_eq!(
+                    completed.rows[1].result,
+                    ChangeRowResult::Done(ChangeRowOutcome::Changed)
+                );
+                assert_eq!(completed.counts.changed, 1);
+                assert_ne!(before, after);
+            }
+            Some(ChangeRowOutcome::Unchanged) => {
+                assert_eq!(
+                    completed.rows[1].result,
+                    ChangeRowResult::Done(ChangeRowOutcome::Unchanged)
+                );
+                assert_eq!(completed.counts.unchanged, 1);
+                assert_eq!(before, after);
+            }
+            None => {
+                assert!(
+                    matches!(&completed.rows[1].result, ChangeRowResult::Failed(error) if error.contains("agent fixture rejection"))
+                );
+                assert_eq!(completed.counts.failed, 1);
+                assert_eq!(before, after);
+            }
+            Some(ChangeRowOutcome::Text(_)) => unreachable!(),
+        }
+        assert_eq!(app.tags_cache.get(&key), Some(&after));
+        assert_eq!(app.meta_undo.undo_len(), undo_before);
+        // Adoption mutates the current record, never an already adopted UI snapshot.
+        assert_eq!(pending.rows[1].result, ChangeRowResult::Pending);
+        assert_eq!(
+            controller.records().lock().unwrap().entries().len(),
+            iteration + 1
+        );
+    }
+}

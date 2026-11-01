@@ -385,6 +385,254 @@ fn metadata_write_zip_preparation_is_bounded_and_keeps_both_keys_without_migrati
 }
 
 #[test]
+fn metadata_write_zip_directories_match_ui_rating_keys_without_reading_leaf_payloads() {
+    // The two fixtures each own the serialized data-directory override; finish
+    // worker preparation before constructing the App used for pure UI checks.
+    let targets = {
+        let fixture = Fixture::new();
+        let ctx = context(&fixture);
+        let root = fixture._dir.path();
+        let path = root.join("folders.zip");
+        let (folder_bytes, legacy_leaf) = cp932_zip("xxxx/page.png", "日本/page.png", b"image");
+        std::fs::write(&path, &folder_bytes).unwrap();
+        let legacy_folder = format!("{}/", legacy_leaf.split('/').next().unwrap());
+        let legacy_key = zip_directory_rating_key(&path, &legacy_folder);
+        let db = crate::rating_db::RatingDb::open().unwrap();
+        db.set(&legacy_key, 5).unwrap();
+        let folder = prepare_rating(&item(&path, Some("日本/")), root, &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(folder.meta.dir_prefix.as_deref(), Some("日本/"));
+        assert_eq!(folder.meta.zipdir_is_archive, Some(false));
+        assert_eq!(folder.legacy_key.as_deref(), Some(legacy_key.as_str()));
+        let old_spelling = prepare_rating(&item(&path, Some(&legacy_folder)), root, &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_spelling.key, folder.key);
+        assert_eq!(old_spelling.legacy_key, folder.legacy_key);
+        assert_eq!(
+            db.get(&legacy_key),
+            5,
+            "preparation must not migrate ratings"
+        );
+        assert_eq!(db.get(&folder.key), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), folder_bytes);
+        assert_eq!(
+            prepare_rating(&item(&path, Some("missing/")), root, &ctx)
+                .unwrap()
+                .unwrap_err(),
+            MetadataSkipReason::NotFound
+        );
+        for invalid in ["/", "日本//", "日本/../", "../日本/"] {
+            assert_eq!(
+                prepare_rating(&item(&path, Some(invalid)), root, &ctx)
+                    .unwrap()
+                    .unwrap_err(),
+                MetadataSkipReason::UnsupportedSubresource
+            );
+        }
+        // Every nesting level retains both its decoded and old ZIP spelling.
+        let nested_path = root.join("nested.zip");
+        let (outer_bytes, legacy_outer) = cp932_zip("xxxx.zip", "日本.zip", &folder_bytes);
+        std::fs::write(&nested_path, &outer_bytes).unwrap();
+        let book = prepare_rating(&item(&nested_path, Some("日本.zip/")), root, &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(book.meta.dir_prefix.as_deref(), Some("日本.zip/"));
+        assert_eq!(book.meta.zipdir_is_archive, Some(true));
+        assert_eq!(
+            book.legacy_key,
+            Some(zip_directory_rating_key(
+                &nested_path,
+                &format!("{legacy_outer}/")
+            ))
+        );
+        let nested_folder = prepare_rating(&item(&nested_path, Some("日本.zip/日本/")), root, &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            nested_folder.meta.dir_prefix.as_deref(),
+            Some("日本.zip/日本/")
+        );
+        assert_eq!(nested_folder.meta.zipdir_is_archive, Some(false));
+        assert_eq!(
+            nested_folder.legacy_key,
+            Some(zip_directory_rating_key(
+                &nested_path,
+                &format!("{legacy_outer}/{legacy_folder}")
+            ))
+        );
+        assert_eq!(
+            prepare_rating(&item(&nested_path, Some("日本.zip/missing/")), root, &ctx)
+                .unwrap()
+                .unwrap_err(),
+            MetadataSkipReason::NotFound
+        );
+        assert_eq!(std::fs::read(&nested_path).unwrap(), outer_bytes);
+        let old_nested = format!("{legacy_outer}/{legacy_folder}");
+        assert_eq!(
+            prepare_rating(&item(&nested_path, Some(&old_nested)), root, &ctx)
+                .unwrap()
+                .unwrap()
+                .key,
+            nested_folder.key
+        );
+        let explicit_path = root.join("explicit.zip");
+        let mut explicit = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        explicit
+            .add_directory("empty/", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::fs::write(&explicit_path, explicit.finish().unwrap().into_inner()).unwrap();
+        let empty_folder = prepare_rating(&item(&explicit_path, Some("empty/")), root, &ctx)
+            .unwrap()
+            .unwrap();
+        // Corrupt terminal ZIP payloads prove book identity lookup never opens
+        // that payload, even after reading a required intermediate ZIP.
+        let mut unread = zip_bytes("book.cbz", b"payload");
+        let offset = unread
+            .windows(7)
+            .position(|value| value == b"payload")
+            .unwrap();
+        unread[offset] ^= 1;
+        let deep_path = root.join("deep.zip");
+        std::fs::write(&deep_path, zip_bytes("inner.zip", &unread)).unwrap();
+        let deep_book = prepare_rating(&item(&deep_path, Some("inner.zip/book.cbz/")), root, &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(deep_book.meta.zipdir_is_archive, Some(true));
+        assert!(deep_book.legacy_key.is_none());
+        assert!(!root.join("mimageviewer.dat").exists());
+        vec![folder, book, nested_folder, empty_folder, deep_book]
+    };
+    let mut app = crate::app::setup_app_for_test();
+    for target in targets {
+        app.items = vec![crate::grid_item::GridItem::ZipDir {
+            zip_path: target.source.clone(),
+            dir_prefix: target.meta.dir_prefix.clone().unwrap(),
+            is_archive: target.meta.zipdir_is_archive.unwrap(),
+            representative: None,
+        }];
+        assert_eq!(app.rating_path_key(0).as_deref(), Some(target.key.as_str()));
+        assert_eq!(app.rating_meta_for_idx(0), Some(target.meta));
+        assert!(target.xmp_target.is_none());
+        assert!(!target.compiled_book_page);
+    }
+}
+
+#[test]
+fn metadata_write_zip_directory_cp932_backslash_trails_preserve_raw_boundaries() {
+    let fixture = Fixture::new();
+    let ctx = context(&fixture);
+    let root = fixture._dir.path();
+    assert_eq!(
+        encoding_rs::SHIFT_JIS.encode("表").0.as_ref(),
+        &[0x95, 0x5c]
+    );
+    for (placeholder, name, prefix) in [
+        ("xx/inner/page.png", "表/inner/page.png", "表/inner/"),
+        ("xxinner/page.png", "表inner/page.png", "表inner/"),
+    ] {
+        let (bytes, legacy_name) = cp932_zip(placeholder, name, b"payload");
+        // Derive the old prefix from the actual archive name at the filename
+        // boundary, retaining the CP437 backslash produced by the trail byte.
+        let legacy_prefix = legacy_name
+            .strip_suffix("page.png")
+            .unwrap()
+            .replace('\\', "/");
+        let path = root.join(format!("{}.zip", prefix.replace('/', "-")));
+        std::fs::write(&path, &bytes).unwrap();
+        let target = prepare_rating(&item(&path, Some(prefix)), root, &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.meta.dir_prefix.as_deref(), Some(prefix));
+        assert_eq!(target.key, zip_directory_rating_key(&path, prefix));
+        assert_eq!(
+            target.legacy_key,
+            Some(zip_directory_rating_key(&path, &legacy_prefix))
+        );
+        if crate::book_scope::validate_relative_reference(legacy_prefix.strip_suffix('/').unwrap())
+            .is_ok()
+        {
+            let old_input = prepare_rating(&item(&path, Some(&legacy_prefix)), root, &ctx)
+                .unwrap()
+                .unwrap();
+            assert_eq!(old_input.key, target.key);
+            assert_eq!(old_input.legacy_key, target.legacy_key);
+            // The apparent legacy separator inside 表 must not invent a
+            // directory half-way through a CP932 character.
+            let apparent_parent = format!("{}/", legacy_prefix.split('/').next().unwrap());
+            assert_eq!(
+                prepare_rating(&item(&path, Some(&apparent_parent)), root, &ctx)
+                    .unwrap()
+                    .unwrap_err(),
+                MetadataSkipReason::NotFound
+            );
+        }
+        let outer_path = path.with_extension("nested.zip");
+        let (outer, legacy_outer) = cp932_zip("xx.zip", "表.zip", &bytes);
+        std::fs::write(&outer_path, &outer).unwrap();
+        let nested_prefix = format!("表.zip/{prefix}");
+        let nested = prepare_rating(&item(&outer_path, Some(&nested_prefix)), root, &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            nested.meta.dir_prefix.as_deref(),
+            Some(nested_prefix.as_str())
+        );
+        assert_eq!(
+            nested.key,
+            zip_directory_rating_key(&outer_path, &nested_prefix)
+        );
+        assert_eq!(
+            nested.legacy_key,
+            Some(zip_directory_rating_key(
+                &outer_path,
+                &format!("{}/{legacy_prefix}", legacy_outer.replace('\\', "/"))
+            ))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read(&outer_path).unwrap(), outer);
+    }
+}
+
+#[test]
+fn metadata_write_zip_directory_intermediates_keep_size_and_cancellation_bounds() {
+    let fixture = Fixture::new();
+    let ctx = context(&fixture);
+    let root = fixture._dir.path();
+    let path = root.join("large-nested.zip");
+    let mut bytes = zip_bytes("inner.zip", b"small");
+    let central = bytes
+        .windows(4)
+        .position(|value| value == b"PK\x01\x02")
+        .unwrap();
+    let declared = (64_u32 * 1024 * 1024 + 1).to_le_bytes();
+    bytes[central + 24..central + 28].copy_from_slice(&declared);
+    bytes[22..26].copy_from_slice(&declared);
+    std::fs::write(&path, bytes).unwrap();
+    assert!(
+        prepare_rating(&item(&path, Some("inner.zip/")), root, &ctx)
+            .unwrap()
+            .is_ok(),
+        "terminal book identity needs no payload"
+    );
+    assert_eq!(
+        prepare_rating(&item(&path, Some("inner.zip/folder/")), root, &ctx)
+            .unwrap()
+            .unwrap_err(),
+        MetadataSkipReason::Unavailable
+    );
+    ctx.cancel.store(true, Ordering::Release);
+    assert_eq!(
+        super::super::item_info::read_zip_directory_identity(&path, "folder/", &ctx.cancel)
+            .err()
+            .unwrap()
+            .kind(),
+        std::io::ErrorKind::Interrupted
+    );
+}
+
+#[test]
 fn metadata_write_pdf_uses_exact_page_numbers_range_and_actual_completion_checkpoint() {
     let fixture = Fixture::new();
     let ctx = context(&fixture);

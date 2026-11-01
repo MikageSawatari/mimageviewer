@@ -4233,3 +4233,101 @@ cargo nextest run -p mimageviewer --lib -E 'test(=agent_ipc::pipe::tests::shutdo
 実core/AIアプリでの書込・画面追従・XMPの外部ExifTool確認は未実施 (XMP jobは一時PNGで実workerを通して検査済み)。
 正式な独立実装レビューは別threadで行う。実装担当の自己点検で追加の設計矛盾や未完のscope項目は検出していない。
 タグのcross-context公開・public docsは指定どおり範囲外。test-full、commit、製品起動、実client configの操作はしていない。
+
+### 23.5 実装レビュー 1 巡目の対応
+
+対象は実装 `c39489f5d` と設計追記 `956b46a25`。3件のP2と設定分類テストの指摘は、いずれも実装担当が
+コードで再確認し、指摘どおりだった。以下の自己点検/検証は実装担当 (担当サブエージェントを含む) のもので、
+正式な独立レビューではない。
+
+前回sourceのsandbox外の観測 (観測者: ClaudeCode、今回のbrief): `test-lib-full.ps1` は15,275成功で、
+残る失敗は `settings_transfer::tests::all_settings_fields_are_classified` の固定件数だけ。
+crates `--include-ignored` はIPC 15/15、MCP 65/65、exit 0。この結果を今回実行した検証としては扱わない。
+
+#### 指摘 → 修正 → 回帰
+
+1. **P2: タグ記録が処理中のまま**。
+   `ChangeRow.result` を `Pending / Done(ChangeRowOutcome) / Failed(String)` とし、
+   `ChangeRowOutcome` は `Changed / Unchanged / Text(String)`。Tag jobのcontroller・record id・row indexの
+   typedな対応とPending状態で完了を採用し、二重完了/別ownerの結果を拒否する。
+   処理中の前後値は空で、処理中/変更/変更なし/失敗の文言はUI描画/コピーでだけ生成する。
+   `Text` は既存の同期結果/fixtureの表示を保持するためのデータで、完了の判定には一切使わない。
+   実際の `App::admit_agent_metadata_write` → 実tag writer → App採用 → recordを、add/removeそれぞれの
+   成功・no-op・DB triggerによる失敗の計6ケースで検査する。skipped行の後のqueued行、件数、実DBの前後、
+   cache、Undo不変、古いUI snapshotの不変性も確認する。owner照合/二重完了とUI表示の回帰も追加した。
+2. **P2: 利用者の完了toastの件数がpollをまたぐと失われる**。
+   App所有の `TagWriteCompletion` に、採用したuser-originの件数/エラーをbatch retirementまで保持する。
+   label/surfaceをその間保持し、completeかつdrainedを確認した時に一度だけ取り出して通知する。
+   agentの件数は集計に含めない。send→done Release、Acquire/drainedの順序は変えない。
+   失敗も完了時に一度のwarningへまとめ、途中の失敗が後の成功toastで隠れることを防ぐ。
+   失敗のログとagent失敗行の採用は従来どおり直ちに行い、既通知フラグ等の別の通知状態は作らない。
+   決定的なwriter test driverで、送信とdoneを分け、user採用→agent遅延、送信後/done前の採用、
+   user失敗→後の成功を実pollで検査。label/surface・無関係の保留Undo・最終件数・通知1回を確認する。
+3. **P2: ZIPフォルダ/入れ子ZIP本を★の対象外にしていた**。
+   末尾 `/` のZIP subresourceは中央ディレクトリのidentity-only indexで存在を確認し、
+   UIの純粋な `book_container_key` (visibilityだけpub(crate)化、body不変) と同じkeyを使う。
+   RatingMetaは `ZipDir`、outer source、current dir_prefix、UIと同じarchive flag。新旧名のbook keyは
+   既存canonical rating writerへ渡し、legacy rowの削除も同じtransactionで行う。
+   葉の画像/末端ZIPの本文は読まず、必要な中間ZIPだけ既存64MiB/取消の下で読む。不在はskipped NotFound。
+   ZIPフォルダ・空フォルダ・入れ子本・不在・実Appのkey/meta一致・旧名入力・中間上限/取消・本文未読と無書込を回帰に追加した。
+   自己点検でCP932末尾byte 0x5c (`表` 等) による旧名の見かけの区切り増加も確認し、
+   同じcomponent数での切り出しをやめた。1つのraw name境界から現在名と旧名を作り、全entryと同じdecode選択を保つ。
+   文字途中の見かけの区切りを除外し、`表/inner/`・`表inner/`・入れ子 `表.zip`・旧名入力を追加で検査する。
+   `set_rating` の英語説明にもZIPフォルダ/入れ子本を含め、既存の文字数予算を維持する長さに収めた。
+4. **分類の固定件数**。
+   `agent_level` / `agent_show_thumbnails` / `agent_show_gps` は元から「移行先の許可を維持」の理由付きで分類済み。
+   production分類は変更せず、期待する総数を482、理由付き329へ修正 (理由なし153は不変)。
+   下記focused filterへ `test(=settings_transfer::tests::all_settings_fields_are_classified)` を明示追加した。
+
+変更ファイル: `src/agent_ipc/{changes.rs,collection_write.rs,collection_write_tests.rs,item_info.rs,metadata_write.rs,metadata_write_tests.rs}`、
+`src/{app.rs,tag_ops.rs,tag_write_worker.rs,settings_transfer.rs}`、`src/app/{agent_metadata_write.rs,agent_metadata_write_tests.rs}`、
+`src/ui_dialogs/preferences/{agent_integration.rs,agent_integration/tests.rs}`、`crates/mcp-server/src/schema.rs`、本節。
+コレクション/★の同期rowとfixtureは型への移行だけ。Remote body・detached述語/viewport routing・DB schema・IPC wireの変更は無し。
+
+#### コマンドと結果
+
+今回の全focusedは、§23.4の `$stage22Focused` 定義に分類テストを追加したもの:
+
+```powershell
+$stage22ReviewFocused = "($stage22Focused) or test(=settings_transfer::tests::all_settings_fields_are_classified)"
+cargo nextest run -p mimageviewer --lib -E $stage22ReviewFocused --no-fail-fast
+```
+
+| コマンド | 観測者 | 実 exit | 結果 / ログ |
+|---|---|---:|---|
+| `cargo fmt` / `cargo fmt --check` | root | 0 / 0 | workspace全体。`target/mcp-stage2-2-review1-fmt.log` / `target/mcp-stage2-2-review1-fmt-check.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` (最終) | root | 0 | 56.96s、`target/mcp-stage2-2-review1-core-check-final.log` |
+| 新規focused (typed record / toast / ZIP / 分類) | root | 0 | 10/10、実行0.684s。`target/mcp-stage2-2-review1-new-focused.log` |
+| 上記 `$stage22ReviewFocused` (最終) | root | 100 | 1,526件中1,524成功/2失敗。compile 2m23s、実行99.985s。`target/mcp-stage2-2-review1-focused-final.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | root | 101 | IPC 15/15、MCP 63成功/2失敗。`target/mcp-stage2-2-review1-crate-tests.log` |
+| `cargo test --test ui_snapshot` (UPDATE指定なし) | root | 0 | 222/222、実行36.46s。`target/mcp-stage2-2-review1-ui-snapshot.log` |
+| `python scripts/check_ui_glyphs.py` | root | 0 | 危険なUI glyphなし、`target/mcp-stage2-2-review1-glyphs.log` |
+| `git diff --check` | root | 0 | LF/CRLF warningのみ、`target/mcp-stage2-2-review1-diff-check.log` |
+
+新規focusedと最初の全focusedの後、CP932の追加自己点検/修正を行い、最終全focusedで全6ケースの実writer回帰と
+raw境界の追加回帰まで再検証した。最初の全focusedも1,525件中1,523成功/同じOS5の2失敗、exit 100だった
+(`target/mcp-stage2-2-review1-focused.log`)。設定の482/153/329、通常user書込、利用者の保留Undo、Openと既存同期rowの回帰も成功した。
+
+失敗は§23.4と同じrestricted-tokenのpipe open OS error 5のみ:
+
+- core: `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`
+- core: `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`
+- MCP: `pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked`
+- MCP: `pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld`
+
+DACLを緩めず、skip/ignoreや再試行は追加していない。PNGは**追加0・変更0**。
+UPDATE_SNAPSHOTSを外して全222枚を比較し、`git diff --name-only -- tests/snapshots` に差分なし。
+typed状態の表示/コピーはheadless UI回帰、既存画面はPNG比較で検査した。
+
+sandbox外でClaudeCodeが実行する最小の追加コマンド:
+
+```powershell
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E 'test(=agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry) or test(=agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers)' --no-fail-fast
+```
+
+全focusedを外で確認する場合は、§23.4の定義と上記の `$stage22ReviewFocused` を使う。
+実core/AIアプリでの操作確認、追加の確認用build-devは未実施 (real pipeのgreen前提がsandbox内では揃わないため)。
+必要な確認用core/MCPは外のpipe gate後に `.\scripts\build-dev.ps1 -PreserveRuntime` で同時更新する。
+test-lib-full/test-fullの再実行・commit・製品起動・実client configの操作はしていない。
+今回の指摘に残る未完項目/追加の設計矛盾は検出していない。正式な再レビューは別threadで行う。
