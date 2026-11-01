@@ -102,7 +102,7 @@ impl AgentIntegrationState {
         #[cfg(test)]
         if let Some(mock) = &self.mock_backend {
             let _ = tx.send(Ok((mock.env.clone(), mock.detection.clone())));
-            ctx.request_repaint();
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
             return;
         }
         let repaint = ctx.clone();
@@ -114,7 +114,7 @@ impl AgentIntegrationState {
                     (env, detection)
                 });
                 let _ = tx.send(result);
-                repaint.request_repaint();
+                repaint.request_repaint_of(egui::ViewportId::ROOT);
             });
     }
 
@@ -126,9 +126,10 @@ impl AgentIntegrationState {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.detection = DetectionState::Failed("確認に失敗しました".into())
                 }
-                Err(mpsc::TryRecvError::Empty) => {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(100))
-                }
+                Err(mpsc::TryRecvError::Empty) => ctx.request_repaint_after_for(
+                    std::time::Duration::from_millis(100),
+                    egui::ViewportId::ROOT,
+                ),
             }
         }
         if let Some(RegistrationOperation::Writing { target, rx }) = &self.operation {
@@ -138,7 +139,10 @@ impl AgentIntegrationState {
                     Some(Err("登録の処理に失敗しました".into()))
                 }
                 Err(mpsc::TryRecvError::Empty) => {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    ctx.request_repaint_after_for(
+                        std::time::Duration::from_millis(100),
+                        egui::ViewportId::ROOT,
+                    );
                     None
                 }
             };
@@ -194,7 +198,7 @@ impl AgentIntegrationState {
         if let Some(mock) = &mut self.mock_backend {
             mock.writes += 1;
             let _ = tx.send(mock.write_result.clone());
-            ctx.request_repaint();
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
             return;
         }
         let repaint = ctx.clone();
@@ -206,7 +210,7 @@ impl AgentIntegrationState {
                     crate::logger::log(format!("[agent-registration] {error}"));
                 }
                 let _ = tx.send(result);
-                repaint.request_repaint();
+                repaint.request_repaint_of(egui::ViewportId::ROOT);
             });
     }
 }
@@ -303,11 +307,13 @@ fn draw_exposure(ui: &mut egui::Ui, settings: &PermissionSelection) {
             ("見せないもの", &summary.hidden),
             ("AI に許す操作", &summary.actions),
         ]) {
-            column.label(egui::RichText::new(title).strong());
-            for line in lines {
-                column.add(egui::Label::new(*line).wrap().selectable(true));
-                column.add_space(4.0);
-            }
+            column.with_layout(egui::Layout::top_down(egui::Align::Min), |column| {
+                column.label(egui::RichText::new(title).strong());
+                for line in lines {
+                    column.add(egui::Label::new(*line).wrap().selectable(true));
+                    column.add_space(4.0);
+                }
+            });
         }
     });
     ui.add_space(6.0);

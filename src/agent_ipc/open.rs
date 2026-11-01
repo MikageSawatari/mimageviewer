@@ -253,7 +253,8 @@ impl OpenController {
                 reply,
             })
             .map_err(|_| not_ready())?;
-        ctx.request_repaint();
+        // App owns this queue in ROOT, even while a deferred child pass is current.
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
         #[cfg(test)]
         if let Some(observer) = self.enqueue_observer.lock().unwrap().as_ref() {
             let _ = observer.send(());

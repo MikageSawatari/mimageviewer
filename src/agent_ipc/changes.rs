@@ -160,7 +160,7 @@ impl ChangeController {
         if let UiState::Starting(installed) | UiState::Ready(installed) = &*self.ui.lock().unwrap()
         {
             let _ = installed.sender.send(notice);
-            installed.ctx.request_repaint();
+            installed.ctx.request_repaint_of(egui::ViewportId::ROOT);
         }
         id
     }
@@ -183,7 +183,7 @@ impl ChangeController {
         }
         if let UiState::Starting(installed) | UiState::Ready(installed) = &*self.ui.lock().unwrap()
         {
-            installed.ctx.request_repaint();
+            installed.ctx.request_repaint_of(egui::ViewportId::ROOT);
         }
         true
     }
@@ -208,6 +208,60 @@ mod tests {
             rows: vec![ChangeRow::default(); 501],
             notice: format!("notice{index}"),
         }
+    }
+
+    #[test]
+    fn publish_and_update_wake_root_while_a_minimized_child_pass_is_current() {
+        let controller = ChangeController::new();
+        let ctx = egui::Context::default();
+        let notices = controller.install(ctx.clone());
+        let (repaints, repaint_requests) = mpsc::channel();
+        ctx.set_repaint_observer(move |request| {
+            repaints.send(request).unwrap();
+        });
+        let child = egui::ViewportId::from_hash_of("passive-child");
+        let mut input = egui::RawInput {
+            viewport_id: child,
+            ..Default::default()
+        };
+        input.viewports.insert(
+            child,
+            egui::ViewportInfo {
+                parent: Some(egui::ViewportId::ROOT),
+                minimized: Some(true),
+                ..Default::default()
+            },
+        );
+        ctx.run_pass(input, |ctx| {
+            assert_eq!(ctx.viewport_id(), child);
+            while repaint_requests.try_recv().is_ok() {}
+            let worker_controller = controller.clone();
+            let id = std::thread::spawn(move || worker_controller.publish(record(0)))
+                .join()
+                .unwrap();
+            let wake = repaint_requests
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(wake.viewport_id, egui::ViewportId::ROOT);
+            assert_eq!(wake.delay, std::time::Duration::ZERO);
+            assert_eq!(notices.try_recv().unwrap(), "notice0");
+
+            let worker_controller = controller.clone();
+            assert!(
+                std::thread::spawn(move || worker_controller.update(id, |record| {
+                    record.rows[0].result = ChangeRowResult::Done(ChangeRowOutcome::Changed);
+                }))
+                .join()
+                .unwrap()
+            );
+            let wake = repaint_requests
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(wake.viewport_id, egui::ViewportId::ROOT);
+            assert_eq!(wake.delay, std::time::Duration::ZERO);
+            assert!(notices.try_recv().is_err());
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]

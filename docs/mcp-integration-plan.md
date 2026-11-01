@@ -4785,3 +4785,89 @@ test-lib-full/test-full、製品起動、commit、公開文書/配布物の変�
 - 受付/log: `src/agent_ipc/{mod.rs,open.rs,open_tests.rs,pipe.rs,tests.rs,logging_tests.rs}`。
 - タグsummary: `src/{tag_ops.rs,tag_write_worker.rs}`。
 - 内部文書: `docs/keymap-spec.md`、本節。`docs/keymap.ini.default` は生成されるKeyActionの集合が不変のため差分なし。
+
+### 26.5 実装レビュー 1 巡目の対応
+
+独立実装レビューの2指摘をClaudeCodeが採択し、rootがコードで両方を照合した。
+
+- **P2 / 起床先の所有者**: `Context::request_repaint()` は、その時点の `viewport_id()` を使っていた。
+  agent要求を処理するAppはROOTの所有者なので、`agent_ipc/open.rs` の送信後の起床を
+  `request_repaint_of(ViewportId::ROOT)` に変更した。§26.1の最小化/トレイ時の照合では、
+  別のchild pass中にworkerから呼ぶ場合の対象を明示できていなかった。
+  同じ観点で `agent_ipc/changes.rs` のpublish (collection通知) とupdate (タグの記録完了) も修正した。
+  AI連携窓の登録検出/書き込みworkerの完了通知、同じ経路のmock、UI側の遅延pollもROOTを明示する。
+  所有者への呼び出し元の指定だけを直し、detachedの述語・viewport配送・vendorコードは変更していない。
+  新しい状態、foreground操作、待ちやretryは追加していない。
+- **P2 / 回帰テスト**: 実際のeguiのpassを、ROOTを親に持つ `minimized: Some(true)` のchildで開始する。
+  pass中で `ctx.viewport_id() == child` を確認し、初期化由来のrepaintを取り除いた後、別threadから実際の
+  dispatchを通してOpen/タグ追加/タグ削除/★の起床先とdelayを観測する (ROOT / ZERO)。
+  ChangeControllerも別threadからpublish/updateを通して同じ条件を確認し、updateがtoastを増やさないことを維持した。
+  ネイティブ窓や製品を起動するテストではない。
+- **P3 / 説明欄**: `ui.columns()` が作るjustifiedなlayoutを、各列内の
+  `Layout::top_down(Align::Min)` で置き換えた。説明のwrapとselectable指定を維持する。
+  実際の `draw_exposure` を600ptで描くテストで、生成情報の説明のgalleyが左寄せ・非justifyで、
+  2行以上に折り返すことを確認する。窓以外のsnapshotを更新する指定は使わない。
+
+今回のfocusedは§26.3の新規/移設filterにChangeControllerを追加したもの:
+
+```powershell
+$stage23ReviewFocused = 'test(/ui_dialogs::agent_integration/) or test(/immediate_agent_permission_tests/) or test(/agent_integration_menu/) or test(/agent_ipc::logging_tests/) or test(/agent_ipc::open::tests/) or test(/agent_ipc::changes/) or test(/agent_ipc::item_info/) or test(/tag_write_worker/) or test(/tag_ops/)'
+cargo nextest run -p mimageviewer --lib -E $stage23ReviewFocused --no-fail-fast
+```
+
+| コマンド | 観測者 | 実 exit | 結果 / ログ |
+|---|---|---:|---|
+| `cargo fmt` (workspace) | root | 0 | Rust全体を整形 |
+| `cargo fmt --check` | root | 0 | `target/mcp-stage2-3-review1-fmt-check.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | root | 0 | 46.90s、`target/mcp-stage2-3-review1-core-check.log` |
+| 上記 `$stage23ReviewFocused` のnextest | root | 0 | 99/99。compile 5m29s、実行16.275s、`target/mcp-stage2-3-review1-focused.log` |
+| `python scripts/check_ui_glyphs.py` | root | 0 | 危険なUI glyphなし、`target/mcp-stage2-3-review1-glyphs.log` |
+
+`UPDATE_SNAPSHOTS=1` は `cargo test --test ui_snapshot agent_integration_window_` にだけ設定し、
+終了後に元の環境変数へ戻した。10/10、exit 0 (compile/lock待ちを含み7m16s、実行8.16s)。
+ログは `target/mcp-stage2-3-review1-snapshot-generate.log`。
+rootが変更10枚を全て目視し、生成情報/リモート接続の不自然な字間の解消、折り返し、明暗のコントラスト、
+登録操作、空/展開した変更記録を確認した。変更PNGは以下のみ (全て `tests/snapshots/` 配下、追加/削除なし)。
+
+| dark | light |
+|---|---|
+| `agent_integration_window_disabled_dark.png` | `agent_integration_window_disabled_light.png` |
+| `agent_integration_window_read_dark.png` | `agent_integration_window_read_light.png` |
+| `agent_integration_window_open_dark.png` | `agent_integration_window_open_light.png` |
+| `agent_integration_window_organize_dark.png` | `agent_integration_window_organize_light.png` |
+| `agent_integration_window_records_dark.png` | `agent_integration_window_records_light.png` |
+
+| 追加検証コマンド (更新指定なし) | 観測者 | 実 exit | 結果 / ログ |
+|---|---|---:|---|
+| `cargo test --test ui_snapshot` | root | 2173 | 223件成功後、`susie_diagnostic_workers_exhausted` が60秒以上実行中と表示され、test processが2173で異常終了。`target/mcp-stage2-3-review1-ui-snapshot.log` |
+| `cargo test --test ui_snapshot susie_diagnostic_workers_exhausted -- --exact` | root | 0 | 1/1、2.13s。`target/mcp-stage2-3-review1-susie-snapshot.log` |
+| `cargo test --test ui_snapshot -- --test-threads=1` | root | 0 | 224/224、552.35s。`target/mcp-stage2-3-review1-ui-snapshot-serial.log` |
+
+通常並列の全件比較が残る1件で進まなくなったため、同一ソース/PNGで単独、次いで1threadの全件比較を行った。
+初回のtest processをこちらからkill/停止した事実はない。初回をassertion failureやOS error 5と同一視せず、
+異常終了の原因は未特定として残す。Susieの当該fixtureは固定PoolStatusを描くもので、Susie/productを起動しない。
+原因を推測して製品コードやテスト、対象外PNGを変えることはしていない。外側で通常並列の完走を確かめるコマンド:
+
+```powershell
+cargo test --test ui_snapshot
+```
+
+§26.3で未作成だった確認用runtimeも、今回の回帰99件と対象PNG10件の成功後に、残りの比較と並行して準備した。
+
+| 最終確認コマンド | 観測者 | 実 exit | 結果 |
+|---|---|---:|---|
+| `powershell -NoProfile -File scripts\build-dev.ps1 -PreserveRuntime` | root | 0 | core 4m37s、remote/EPUB/MCPも成功。VCRT PE検査runtime=4 / pe=4、`target/vcrt-pe-reports/dev-runtime.json` |
+| `git diff --check` (最終) | root | 0 | `target/mcp-stage2-3-review1-diff-check.log` |
+
+変更はRust 5ファイル (実装3、テスト2)、本節、上記10 PNG。scope外のsource/PNGの変更なし。
+確認用の `target/dev-runtime/mimageviewer-core.exe` とcompanion 3本を用意したが、製品を起動していない。
+通常profileなので引数なしでは実利用中の `%APPDATA%\mimageviewer` を使い、設定/データを更新し得る。
+利用者が起動する時はインストール版/トレイ常駐版を終了してから、以下を使う。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+実機確認の対象は、最小化/トレイ状態でのタグ/★要求の応答 (前面化なし) と、AI連携窓の説明の字間・折り返し。
+これらの実窓での操作は未実施。今巡では実pipe経路を変更/再実行しておらず、§26.3の外側確認コマンドを維持する。
+通常並列snapshotの異常終了以外に新たな未解決事項/設計矛盾は見つからなかった。commit、実設定やAIアプリのconfig操作なし。

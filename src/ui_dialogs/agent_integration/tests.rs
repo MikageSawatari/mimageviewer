@@ -1,6 +1,56 @@
 use super::*;
 use egui_kittest::kittest::{NodeT, Queryable};
 
+#[test]
+fn exposure_descriptions_are_left_aligned_without_justification_and_still_wrap() {
+    fn check_text(shape: &egui::Shape, found: &mut bool) {
+        match shape {
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    check_text(shape, found);
+                }
+            }
+            egui::Shape::Text(text) if text.galley.job.text.contains("UserComment") => {
+                *found = true;
+                assert!(!text.galley.job.justify);
+                assert_eq!(text.galley.job.halign, egui::Align::Min);
+                assert!(text.galley.rows.len() > 1, "description must still wrap");
+            }
+            _ => {}
+        }
+    }
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    let output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 1000.0),
+            )),
+            ..Default::default()
+        },
+        |ui| {
+            draw_exposure(
+                ui,
+                &PermissionSelection {
+                    level: AgentLevel::ReadOnly,
+                    thumbnails: false,
+                    gps: false,
+                },
+            );
+        },
+    );
+    let mut found = false;
+    for shape in &output.shapes {
+        check_text(&shape.shape, &mut found);
+    }
+    assert!(
+        found,
+        "the actual generation-info description must be drawn"
+    );
+    output.drop_without_applying_deltas();
+}
+
 fn injected(_settings: &Settings) -> AgentIntegrationState {
     let env = backend::RegistrationEnvironment {
         local_app_data: None,

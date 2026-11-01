@@ -2,7 +2,6 @@ use super::*;
 
 #[test]
 fn only_open_activates_and_every_ui_request_wakes_without_desktop_input() {
-    use super::super::metadata_write::{PreparedRatings, PreparedTags};
     let controller = OpenController::new(None);
     let ctx = egui::Context::default();
     let (repaints, repaint_requests) = mpsc::channel();
@@ -12,27 +11,7 @@ fn only_open_activates_and_every_ui_request_wakes_without_desktop_input() {
     let queue = controller.install(ctx);
     let (activations, activation_requests) = mpsc::channel();
     *controller.activation_observer.lock().unwrap() = Some(activations);
-    let kinds = [
-        UiRequestKind::Open(ActivationOpenPath::received("C:\\fixture.jpg".into(), None)),
-        UiRequestKind::TagWrite(PreparedTags {
-            items: Vec::new(),
-            tags: vec!["tag".into()],
-            add: true,
-            client_name: "fixture".into(),
-        }),
-        UiRequestKind::TagWrite(PreparedTags {
-            items: Vec::new(),
-            tags: vec!["tag".into()],
-            add: false,
-            client_name: "fixture".into(),
-        }),
-        UiRequestKind::RatingWrite(PreparedRatings {
-            items: Vec::new(),
-            stars: 3,
-            client_name: "fixture".into(),
-        }),
-    ];
-    for kind in kinds {
+    for kind in prepared_ui_requests() {
         let should_activate = matches!(&kind, UiRequestKind::Open(_));
         let worker_controller = controller.clone();
         let worker = std::thread::spawn(move || {
@@ -55,6 +34,80 @@ fn only_open_activates_and_every_ui_request_wakes_without_desktop_input() {
         request.complete(UiOpenOutcome::Admitted);
         assert!(worker.join().unwrap().is_ok());
     }
+}
+
+fn prepared_ui_requests() -> [UiRequestKind; 4] {
+    use super::super::metadata_write::{PreparedRatings, PreparedTags};
+    [
+        UiRequestKind::Open(ActivationOpenPath::received("C:\\fixture.jpg".into(), None)),
+        UiRequestKind::TagWrite(PreparedTags {
+            items: Vec::new(),
+            tags: vec!["tag".into()],
+            add: true,
+            client_name: "fixture".into(),
+        }),
+        UiRequestKind::TagWrite(PreparedTags {
+            items: Vec::new(),
+            tags: vec!["tag".into()],
+            add: false,
+            client_name: "fixture".into(),
+        }),
+        UiRequestKind::RatingWrite(PreparedRatings {
+            items: Vec::new(),
+            stars: 3,
+            client_name: "fixture".into(),
+        }),
+    ]
+}
+
+#[test]
+fn every_ui_request_wakes_root_while_a_minimized_child_pass_is_current() {
+    let controller = OpenController::new(None);
+    let ctx = egui::Context::default();
+    let (repaints, repaint_requests) = mpsc::channel();
+    ctx.set_repaint_observer(move |request| {
+        repaints.send(request).unwrap();
+    });
+    let queue = controller.install(ctx.clone());
+    let child = egui::ViewportId::from_hash_of("passive-child");
+    let mut input = egui::RawInput {
+        viewport_id: child,
+        ..Default::default()
+    };
+    input.viewports.insert(
+        child,
+        egui::ViewportInfo {
+            parent: Some(egui::ViewportId::ROOT),
+            minimized: Some(true),
+            ..Default::default()
+        },
+    );
+    ctx.run_pass(input, |ctx| {
+        assert_eq!(ctx.viewport_id(), child);
+        // Discard pass setup requests before observing the actual worker wake.
+        while repaint_requests.try_recv().is_ok() {}
+        for kind in prepared_ui_requests() {
+            let worker_controller = controller.clone();
+            let worker = std::thread::spawn(move || {
+                worker_controller.dispatch_request(
+                    &AtomicBool::new(false),
+                    Arc::new(UiRequestDispatch::pending()),
+                    Duration::from_secs(5),
+                    || Ok(kind),
+                )
+            });
+            let request = queue.recv_timeout(Duration::from_secs(5)).unwrap();
+            let wake = repaint_requests
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(wake.viewport_id, egui::ViewportId::ROOT);
+            assert_eq!(wake.delay, Duration::ZERO);
+            assert!(request.try_claim());
+            request.complete(UiOpenOutcome::Admitted);
+            assert!(worker.join().unwrap().is_ok());
+        }
+    })
+    .drop_without_applying_deltas();
 }
 
 fn open_activation(request: &UiOpenRequest) -> &ActivationOpenPath {
