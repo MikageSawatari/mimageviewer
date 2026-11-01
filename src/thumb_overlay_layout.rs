@@ -499,17 +499,21 @@ pub fn layout_thumbnail_overlays(
     input: ThumbnailOverlayLayoutInput<'_>,
     mut measure: impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
 ) -> ThumbnailOverlayLayout {
-    let mut layout = layout_badges(&input, &mut measure);
-    if !input.book_resume_meter || input.inner.width() <= 0.0 || input.inner.height() <= 0.0 {
+    // Reserve the setting-owned band before placing badges, regardless of whether a saved
+    // position will actually paint it. The type slot can narrow its painted portion below.
+    let meter = (input.book_resume_meter && input.inner.is_positive()).then(|| {
+        egui::Rect::from_min_max(
+            egui::pos2(
+                input.inner.min.x,
+                input.inner.max.y - BOOK_RESUME_METER_HEIGHT,
+            ),
+            input.inner.max,
+        )
+    });
+    let mut layout = layout_badges(&input, meter, &mut measure);
+    let Some(meter) = meter else {
         return layout;
-    }
-    let meter = egui::Rect::from_min_max(
-        egui::pos2(
-            input.inner.min.x,
-            input.inner.max.y - BOOK_RESUME_METER_HEIGHT,
-        ),
-        input.inner.max,
-    );
+    };
     // Do not shrink or lift the slot for short cells or fitted images. The cell painter clips it;
     // badge layout already reserves the same lower band for cells with and without saved values.
     let meter = if let Some(icon) = &layout.type_icon
@@ -526,7 +530,7 @@ pub fn layout_thumbnail_overlays(
 fn layout_bookmark_title(
     input: &ThumbnailOverlayLayoutInput<'_>,
     top_left: &TopLeftOverlayLayout,
-    type_icon: Option<egui::Rect>,
+    reserved: &[egui::Rect],
     measure: &mut impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
 ) -> Option<BadgePlacement> {
     let title = input.bookmark_title?;
@@ -535,47 +539,67 @@ fn layout_bookmark_title(
         family: BadgeFontFamily::UserText,
         padding: BadgePadding::symmetric(7.0, 4.0),
     };
-    let max_text_width = (input.cell.width() - 28.0).max(0.0);
-    if max_text_width < 8.0 {
+    let mut bounds = input.cell.shrink(4.0);
+    bounds.min.y = top_left.lane_bottom().unwrap_or(input.cell.min.y) + 4.0;
+    if !bounds.is_positive() {
         return None;
     }
-    // Preserve the existing central-title fitting exactly, including the 36-character cap
-    // and yielding when even the shortest prefix plus ellipsis does not fit.
+    // Keep the existing 36-character cap and prefix fitting in each free area, yielding
+    // when even the shortest prefix plus ellipsis does not fit.
     let chars: Vec<char> = title.chars().collect();
-    let mut text = if chars.len() > 36 {
+    let capped = if chars.len() > 36 {
         chars[..35].iter().collect::<String>() + "…"
     } else {
         title.to_owned()
     };
-    if measure(&text, style).x > max_text_width {
-        let chars: Vec<char> = text.chars().collect();
-        for take in (1..chars.len()).rev() {
-            let candidate = chars[..take].iter().collect::<String>() + "…";
-            if measure(&candidate, style).x <= max_text_width {
-                text = candidate;
-                break;
+    let mut best = None;
+    let mut best_length = 0;
+    let mut best_distance = f32::INFINITY;
+    // Every candidate is constructed inside the remaining space. Never relocate a title
+    // around one obstacle and then check only the cell boundary, overlooking another band.
+    for area in unreserved_areas(bounds, reserved) {
+        let max_text_width = (input.cell.width() - 28.0).min(area.width() - style.padding.size().x);
+        if max_text_width < 8.0 {
+            continue;
+        }
+        let mut text = capped.clone();
+        if measure(&text, style).x > max_text_width {
+            let chars: Vec<char> = text.chars().collect();
+            for take in (1..chars.len()).rev() {
+                let candidate = chars[..take].iter().collect::<String>() + "…";
+                if measure(&candidate, style).x <= max_text_width {
+                    text = candidate;
+                    break;
+                }
             }
         }
+        let size = measure(&text, style);
+        let plate_size = size + style.padding.size();
+        if size.x > max_text_width || plate_size.y > area.height() {
+            continue;
+        }
+        let half = plate_size * 0.5;
+        let min_center = area.min + half;
+        // Addition/subtraction at fractional origins can reverse an exact-fit interval by
+        // one ulp. Keep clamp's bounds ordered, as in the content-marker fitter below.
+        let max_center = (area.max - half).max(min_center);
+        let center = input.cell.center().clamp(min_center, max_center);
+        let rect = egui::Rect::from_center_size(center, plate_size);
+        let length = text.chars().count();
+        let distance = center.distance_sq(input.cell.center());
+        if length > best_length || (length == best_length && distance < best_distance) {
+            best_length = length;
+            best_distance = distance;
+            best = Some(BadgePlacement {
+                kind: BadgeKind::BookmarkTitle,
+                priority: BadgePriority::BookmarkTitle,
+                text,
+                rect,
+                style,
+            });
+        }
     }
-    let size = measure(&text, style);
-    if size.x > max_text_width {
-        return None;
-    }
-    let centered = egui::Rect::from_center_size(input.cell.center(), size + style.padding.size());
-    let min_y = top_left.lane_bottom().unwrap_or(input.cell.min.y) + 4.0;
-    let min_y = if type_icon.is_some_and(|icon| icon.intersects(centered)) {
-        min_y.max(type_icon.unwrap().max.y + TOP_LEFT_GAP)
-    } else {
-        min_y
-    };
-    let rect = centered.translate(egui::vec2(0.0, (min_y - centered.min.y).max(0.0)));
-    (rect.max.y <= input.cell.max.y - 4.0).then_some(BadgePlacement {
-        kind: BadgeKind::BookmarkTitle,
-        priority: BadgePriority::BookmarkTitle,
-        text,
-        rect,
-        style,
-    })
+    best
 }
 
 fn layout_bottom_container(
@@ -648,6 +672,39 @@ pub fn type_icon_slot(cell: egui::Rect) -> egui::Rect {
     )
 }
 
+/// Subtract all reservations before choosing a destination for central content.
+/// Callers include their required gaps in the reservation rectangles.
+fn unreserved_areas(bounds: egui::Rect, reserved: &[egui::Rect]) -> Vec<egui::Rect> {
+    let mut free = vec![bounds];
+    for obstacle in reserved {
+        free = free
+            .into_iter()
+            .flat_map(|area| {
+                if !area.intersects(*obstacle) {
+                    return vec![area];
+                }
+                let cut = area.intersect(*obstacle);
+                [
+                    egui::Rect::from_min_max(area.min, egui::pos2(area.max.x, cut.min.y)),
+                    egui::Rect::from_min_max(egui::pos2(area.min.x, cut.max.y), area.max),
+                    egui::Rect::from_min_max(
+                        egui::pos2(area.min.x, cut.min.y),
+                        egui::pos2(cut.min.x, cut.max.y),
+                    ),
+                    egui::Rect::from_min_max(
+                        egui::pos2(cut.max.x, cut.min.y),
+                        egui::pos2(area.max.x, cut.max.y),
+                    ),
+                ]
+                .into_iter()
+                .filter(|r| r.is_positive())
+                .collect()
+            })
+            .collect();
+    }
+    free
+}
+
 /// Fit an existing mark before painting. No content can move the fixed type slot.
 /// The legacy geometry is exact when there is no collision (including setting OFF).
 pub(crate) fn fit_content_marker(
@@ -658,41 +715,12 @@ pub(crate) fn fit_content_marker(
     if !protected.iter().any(|r| r.intersects(source)) {
         return source;
     }
-    let free_areas = |bounds: egui::Rect| {
-        let mut free = vec![bounds];
-        for obstacle in protected {
-            free = free
-                .into_iter()
-                .flat_map(|area| {
-                    if !area.intersects(obstacle.expand(0.5)) {
-                        return vec![area];
-                    }
-                    let cut = area.intersect(obstacle.expand(0.5));
-                    [
-                        egui::Rect::from_min_max(area.min, egui::pos2(area.max.x, cut.min.y)),
-                        egui::Rect::from_min_max(egui::pos2(area.min.x, cut.max.y), area.max),
-                        egui::Rect::from_min_max(
-                            egui::pos2(area.min.x, cut.min.y),
-                            egui::pos2(cut.min.x, cut.max.y),
-                        ),
-                        egui::Rect::from_min_max(
-                            egui::pos2(cut.max.x, cut.min.y),
-                            egui::pos2(area.max.x, cut.max.y),
-                        ),
-                    ]
-                    .into_iter()
-                    .filter(|r| r.is_positive())
-                    .collect()
-                })
-                .collect();
-        }
-        free
-    };
-    let mut free = free_areas(cell.shrink(4.0));
+    let reserved: Vec<_> = protected.iter().map(|rect| rect.expand(0.5)).collect();
+    let mut free = unreserved_areas(cell.shrink(4.0), &reserved);
     // At the 32pt floor the plate occupies the whole inner area. Keep a secondary
     // mark in the remaining padding rather than hiding it beneath the type plate.
     if free.is_empty() {
-        free = free_areas(cell);
+        free = unreserved_areas(cell, &reserved);
     }
     let mut best = egui::Rect::NOTHING;
     let mut best_scale = 0.0;
@@ -744,6 +772,7 @@ fn reserved_check_rect(cell: egui::Rect, slot: Option<egui::Rect>) -> egui::Rect
 
 fn layout_badges(
     input: &ThumbnailOverlayLayoutInput<'_>,
+    meter: Option<egui::Rect>,
     mut measure: impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
 ) -> ThumbnailOverlayLayout {
     // The check state is the fixed-size interaction marker. Reserve its painted circle before
@@ -895,7 +924,23 @@ fn layout_badges(
     }
 
     let mut bottom_left = BottomLeftOverlayLayout::default();
-    let bookmark_title = layout_bookmark_title(input, &top_left, slot, &mut measure);
+    let bookmark_title = input.bookmark_title.and_then(|_| {
+        let mut reserved: Vec<_> = slot
+            .iter()
+            .chain(check.iter())
+            .copied()
+            .chain(stack_count.iter().map(|badge| badge.rect))
+            .chain(top_left.placements().map(|badge| badge.rect))
+            .map(|rect| rect.expand(TOP_LEFT_GAP))
+            .collect();
+        if let Some(meter) = meter {
+            reserved.push(egui::Rect::from_min_max(
+                egui::pos2(input.cell.min.x, meter.min.y - BOOK_RESUME_METER_GAP),
+                input.cell.max,
+            ));
+        }
+        layout_bookmark_title(input, &top_left, &reserved, &mut measure)
+    });
     // Folder-name badges retain their entire legacy layout. For filenames, an enabled width
     // preference also reserves the existing central title rather than painting through it.
     let prioritize_filename = input.name_style.prioritize_width
@@ -1347,6 +1392,144 @@ mod tests {
             assert!(calls <= 16, "{calls} font measurements");
             assert!(fitted.ends_with('…'));
             assert!(measure(&fitted, style).x <= 100.0);
+        }
+    }
+
+    #[test]
+    fn low_media_bookmark_titles_respect_all_reserved_overlays() {
+        let tags = tags(&["#タグ", "分類"]);
+        let mut visible_titles = 0;
+        let mut omitted_titles = 0;
+        for kind in [FormatBadgeKind::Video, FormatBadgeKind::Audio] {
+            for width in [48.0, 64.0, 100.0, 120.0, 180.0] {
+                for height in [48.0, 52.0, 56.0, 59.5, 60.0, 60.5, 64.0, 72.0, 96.0] {
+                    for crowded in [false, true] {
+                        for prioritize_width in [false, true] {
+                            let cell = egui::Rect::from_min_size(
+                                egui::pos2(10.25, 20.5),
+                                egui::vec2(width, height),
+                            );
+                            let mut input = duration_input(cell, cell.shrink(4.0));
+                            input.show_type_icon = true;
+                            input.book_resume_meter = true;
+                            input.bookmark_title =
+                                Some("長いブックマークタイトル_abcdefghijklmnop");
+                            input.bookmark_time = Some("0:07");
+                            input.name_style.prioritize_width = prioritize_width;
+                            input.bottom_container = Some(BottomContainerInput {
+                                kind: BottomContainerKind::Format(kind),
+                                label: if kind == FormatBadgeKind::Video {
+                                    "VIDEO"
+                                } else {
+                                    "AUDIO"
+                                },
+                            });
+                            input.filename = Some("bookmark-media-file");
+                            if crowded {
+                                input.checked = true;
+                                input.stack_count = Some(12);
+                                input.filter_match_count = Some(42);
+                                input.tags = &tags;
+                                input.rating_text = Some("★★★★★");
+                                input.upscaled_video = true;
+                                input.edit_badges.pin = true;
+                            }
+                            let layout = layout_thumbnail_overlays(input, measure);
+                            assert_eq!(
+                                layout.type_icon.as_ref().unwrap().rect,
+                                type_icon_slot(cell)
+                            );
+                            assert_placements_inside_cell(&layout, cell);
+                            assert_pairwise_non_intersecting(layout.badge_placements());
+                            let meter = layout.book_resume_meter.unwrap();
+                            for badge in layout.badge_placements() {
+                                assert!(
+                                    !meter.intersects(badge.rect),
+                                    "{width}x{height}: {badge:?}, meter={meter:?}"
+                                );
+                                assert!(!layout.check.is_some_and(|r| r.intersects(badge.rect)));
+                            }
+                            if layout.bookmark_title.is_some() {
+                                visible_titles += 1;
+                            } else {
+                                omitted_titles += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(visible_titles > 0);
+        assert!(omitted_titles > 0);
+    }
+
+    #[test]
+    fn low_bookmark_title_uses_free_space_and_yields_only_when_too_short() {
+        for width in [64.0, 100.0, 180.0] {
+            let cell = egui::Rect::from_min_size(egui::pos2(10.25, 20.5), egui::vec2(width, 60.0));
+            for show_type_icon in [false, true] {
+                let mut input = duration_input(cell, cell.shrink(4.0));
+                input.show_type_icon = show_type_icon;
+                input.media_duration = None;
+                input.book_resume_meter = true;
+                input.bookmark_title = Some(if width == 64.0 {
+                    "A"
+                } else {
+                    "場面のブックマーク"
+                });
+                let layout = layout_thumbnail_overlays(input.clone(), measure);
+                let title = layout
+                    .bookmark_title
+                    .as_ref()
+                    .expect("shorter title still fits");
+                assert!(cell.shrink(4.0).contains_rect(title.rect));
+                let meter = layout.book_resume_meter.unwrap();
+                assert!(title.rect.max.y <= meter.min.y - BOOK_RESUME_METER_GAP);
+                assert_pairwise_non_intersecting(layout.badge_placements());
+                // Reservations do not consume an unchanged, ample central title position.
+                input.book_resume_meter = false;
+                if !show_type_icon {
+                    let off = layout_thumbnail_overlays(input.clone(), measure);
+                    assert_eq!(title.rect, off.bookmark_title.unwrap().rect);
+                }
+                input.book_resume_meter = true;
+                input.bookmark_time = Some("0:07");
+                let crowded = layout_thumbnail_overlays(input, measure);
+                assert!(crowded.bookmark_title.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn relocated_content_markers_respect_meter_title_check_and_badges_together() {
+        for width in [32.0, 48.0, 64.0, 100.0, 180.0] {
+            for height in [32.0, 48.0, 59.5, 60.0, 60.5, 64.0, 96.0] {
+                let cell =
+                    egui::Rect::from_min_size(egui::pos2(10.25, 20.5), egui::vec2(width, height));
+                let mut input = duration_input(cell, cell.shrink(4.0));
+                input.show_type_icon = true;
+                input.book_resume_meter = true;
+                input.checked = true;
+                input.bookmark_title = Some("場面");
+                input.bookmark_time = Some("0:07");
+                input.rating_text = Some("★★★★★");
+                input.filter_match_count = Some(42);
+                let layout = layout_thumbnail_overlays(input, measure);
+                let reserved: Vec<_> = layout
+                    .badge_placements()
+                    .map(|b| b.rect)
+                    .chain(layout.check)
+                    .chain(layout.book_resume_meter)
+                    .collect();
+                let source = type_icon_slot(cell).expand(5.0);
+                let target = fit_content_marker(source, cell, &reserved);
+                assert!(target.is_positive());
+                assert!(cell.contains_rect(target));
+                assert!(
+                    !reserved.iter().any(|r| r.intersects(target)),
+                    "{width}x{height}: {target:?}"
+                );
+            }
         }
     }
 
