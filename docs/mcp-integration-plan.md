@@ -4331,3 +4331,131 @@ cargo nextest run -p mimageviewer --lib -E 'test(=agent_ipc::pipe::tests::shutdo
 必要な確認用core/MCPは外のpipe gate後に `.\scripts\build-dev.ps1 -PreserveRuntime` で同時更新する。
 test-lib-full/test-fullの再実行・commit・製品起動・実client configの操作はしていない。
 今回の指摘に残る未完項目/追加の設計矛盾は検出していない。正式な再レビューは別threadで行う。
+
+### 23.6 実装レビュー 2 巡目の対応
+
+観測者は、明記した外部結果を除き実装担当 root。正式な独立レビューの代用ではない。
+対象 HEAD は `0a313783e`。commit・製品起動・実client configの操作はしていない。
+
+#### 利用者タグ完了トーストのバッチ所有
+
+指摘を確認した。`poll_tag_write_results` が採用件数を次のpollまで保持する一方、操作入口が
+`tag_toast_label` を最後のタグで上書きしていたため、#Aの結果採用後に#Bを投入すると件数と名前が違うバッチを表した。
+
+- ラベルを `TagWriteCompletion` に統合し、件数・errorと同じ完了時点で `take` する。
+  `TagCompletionLabel` は未設定 / 特定タグと付与・削除種別 / Clear / Restore / 総称を表す。
+  同じ正規化タグかつ同じ操作の間だけ最初の表示名を保ち、混在後は完了まで総称に固定する。
+  agent-originの投入は利用者ラベルを変更しない。
+- toggle / add / remove / clear / Undo / Redo の全入口を同じ所有者に寄せた。
+  単独操作、Clear、`restored` の既存 formatter と文言・優先順位は変更しない。
+  総称の全件no-opがClear扱いにならないよう、総称は formatter に明示的な「タグ」を渡す。
+- 既存の並列入力を禁止する案は採用しない。通常操作を制限せず、すでに保持するバッチの件数とラベルを
+  一つの状態にまとめるだけで不整合を除去できるため。
+
+回帰は実操作入口と制御可能なwriter/pollを使用する。#A→#B、#A→#A、同じ正規化キーの表記違い、
+同じタグの付与→削除、toggleの方向変更、Clear、Undo/Redoと新規編集の混在、完了後の新バッチを検査する。
+単独の既存文言、既存のpollを跨ぐagent混在・send/done間の回帰も維持する。
+新規テストは `user_completion_label_matches_all_pending_operations`、
+`toggle_completion_label_stays_generic_after_direction_changes`、
+`clear_completion_label_cannot_be_replaced_by_a_pending_edit`、
+`undo_redo_completion_label_cannot_be_replaced_by_a_pending_edit`、
+`pending_edit_then_undo_uses_generic_label_and_next_batch_is_specific`。
+
+変更ファイルは `src/{app.rs,tag_ops.rs,undo_ops.rs}` と本節。PNGは追加0・変更0。
+page-turn、detached述語/viewport routing、tag writerのsend/done順、Undoの登録境界は変更していない。
+
+#### page-turn の原因切り分け
+
+ClaudeCodeの外部観測: `0a313783e` の全libで指定5件が失敗し、focused再実行ではretained-cover以外の4件が失敗。
+`c39489f5d` の全libでは同じテストが成功していた。外部の失敗ログは
+`target/test-lib-full/runs/20261101T042518766Z-ff26d6d5/`、先行成功ログは
+`target/test-lib-full/runs/20261101T033838229Z-0a544e00/` にある。
+
+修正前のclean HEADで、指示された5件のnextestは **exit 0、5/5成功 (3.720s)**。
+`target/mcp-stage2-2-review2-page-baseline.log`。この時点のlibtest実行体を保存して以後の比較に使用した。
+fixtureは一時data-dirのAppを直接描画し、`App::update_frame` やタグ完了pollを実行しない。
+`c39489f5d..0a313783e` のApp差分は完了状態の追加・初期化とbook-key helperの可視性だけであり、
+page-turnのsource差分はない。これらのfixtureにはタグ操作・完了pollによるrepaint/共有static変更もない。
+
+外部に依存する既存経路は次の2つだった。
+
+1. `FsLoupeHold` の既定Shiftは `page_turn_loupe_hold` → `modifier_held_via_os` →
+   `key_input::physical_key_down` で実際の `GetAsyncKeyState` を読む。
+   `lock_test_input` とframeのegui modifiers初期化だけではOS側を固定しない。
+   capture中のShiftはFlat成立を阻害し、capture後・描画直前のShiftはcurlを不成立にする。
+2. draw-submitは指定進行率から `Instant::now() - duration * progress` を作り、後の描画で再び実時刻を読む。
+   名目0.75でも、その間の実時間だけ進行する。描画直前の遅延で黒い葉がold9を完全に覆う。
+   一方、初回Flat captureにはturn時計自体がないため、cover系の失敗を時間経過では説明しない。
+
+差分の作用を除いた対照として、変更対象17ファイルの元バイトとSHA256をtarget内へ退避し、
+`git show c39489f5d:<path>` のソースでlibtestを **compileのみ** した (exit 0、5m28s)。
+実行体を別名保存後、finallyで全17ファイルを復元し、退避時SHA256との一致を確認した。
+Git HEADやgit dirは変更していない。これは当該commitのRustソースの対照であり、古いbuild metadataや実行環境の再現ではない。
+ログ: `target/mcp-review2-control-build.log`。保存実行体:
+`target/debug/deps/mcp-review2-{head0a,c394}-lib-tests.exe`。
+
+同じheadless libtestだけをWindows debuggerの子として実行し、当該子のAPI戻り値または1回の停止時間を制御した。
+OSへのキー送信・デスクトップ操作・製品起動・source/テストの変更はしていない。
+
+| 条件 | `0a313783e` | `c39489f5d` のソース対照 |
+|---|---|---|
+| 通常の直接実行、5件、Shift押下sampleは全て0 | 全件exit 0 | 全件exit 0 |
+| Shift読取を常時押下に固定 | cover初回anchor1/tail10/retained19で同じFlat失敗、各exit 101 | 同じ3箇所、各exit 101 |
+| 最初は未押下、navigateの描画直前だけ押下に変更 | whiteの `cover_tests.rs:379`、false/true、exit 101 | 同じ行・値、exit 101 |
+| Shift読取を未押下に固定したdebugger実行 | cover4件はexit 0。drawはold9・名目0.75でexit 101 | 5件ともexit 0 |
+| 上記未押下に加え、drawの名目0.75の描画前1回だけ25ms停止 | 未追加 (直前行で既に再現) | `draw_submit_tests.rs:462`、old9・名目0.75でexit 101 |
+
+常時Shiftではwhite/drawはより手前のFlat検査で止まるため、それを外部と同じ失敗とは数えていない。
+whiteは描画直前への切替、drawは実時間遅延でそれぞれ該当の検査まで確認した。
+各libtestの失敗exitは101。正常対照の成功exitは0であり、debugger wrapperの成功をテスト成功と扱っていない。
+ログ/集計: `target/mcp-review2-{sandbox-page,c394-normal}.json`、
+`target/mcp-review2-{head0a,c394}-{force-all,clear-all}.json`、
+`target/mcp-review2-{head0a,c394}-transition-shift.log`、`target/mcp-review2-c394-delayed-frame.log`。
+
+**判明したこと:** 受理済み修正がない旧ソースでも、OSの修飾キー読取とフレーム内の実時間という条件だけで
+各失敗と同じ検査を再現できる。タグ完了の差分を必須条件とする回帰ではない。
+そのためpage-turnの製品コード・テストは変更しない。
+**未確定:** ClaudeCodeの元の外部失敗時のキー状態・フレーム内経過時間はログに無い。
+当時もこの2条件だったとの断定はしない。再現条件の証明と元の観測の原因同定を区別する。
+
+外部で残る入力状態を確認する場合の読み取り専用probe (実行するのは保存済みlibtestのみ):
+
+```powershell
+python -I .\target\mcp-review2-page-probe.py --exe .\target\debug\deps\mcp-review2-head0a-lib-tests.exe --output-prefix .\target\mcp-review2-outside-page
+```
+
+5件を順に実行し、各exitとShiftの読取sampleをJSONへ保存する。入力送信はしない。
+失敗が再現しなくても、元の失敗時の状態が分かったとは扱わない。
+
+#### 最終検証
+
+要求された§23.5の `$stage22ReviewFocused` は変更せず使用する (新しいタグ回帰も `/tag_ops/` に含まれる)。
+最初のtag/undo focusedは新規Undo回帰のfixtureでE0502 (mutable receiverと `app.tmp` の同時借用) により
+compile exit 101。fixtureのpathを呼出前に作るよう修正した。製品コードの追加変更はない。
+
+| コマンド | 観測者 | 実 exit | 結果 / ログ |
+|---|---|---:|---|
+| `cargo fmt` / `cargo fmt --check` (最終) | root | 0 / 0 | workspace全体。`target/mcp-stage2-2-review2-fmt.log` / `target/mcp-stage2-2-review2-fmt-check.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | root | 0 | 1m03s、`target/mcp-stage2-2-review2-core-check.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/tag_ops/) or test(/undo_ops/)' --no-fail-fast` (最終) | root | 0 | 28/28、2.289s。`target/mcp-stage2-2-review2-tag-undo-final.log` |
+| brief指定のpage-turn 5件 (修正後) | root | 0 | 5/5、3.353s。compile 5m47s。`target/mcp-stage2-2-review2-page-final-five.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen::page_turn/)' --no-fail-fast` | root | 0 | module本体と関連submission fixtureを含め180/180、42.134s。`target/mcp-stage2-2-review2-page-module.log` |
+| §23.5 `$stage22ReviewFocused` | root | 100 | 1,531件中1,529成功/2失敗、103.420s。`target/mcp-stage2-2-review2-focused.log` |
+| `python scripts/check_ui_glyphs.py` | root | 0 | 危険なUI glyphなし、`target/mcp-stage2-2-review2-glyphs.log` |
+| `git diff --check` | root | 0 | `target/mcp-stage2-2-review2-diff-check.log`。source対照からの復元17ファイルのhashも一致 |
+
+全focusedの失敗は、§23.5と同じrestricted-tokenによるOS error 5の実pipe 2件のみ。
+新規5件、通常の利用者タグ/Undo、agent混在、設定の全field分類は成功した。
+失敗は `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry` と
+`agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`。DACL緩和・skip/ignore・retry追加はしていない。
+
+sandbox外の実pipe確認とpage-turn全体のコマンド:
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(=agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry) or test(=agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers)' --no-fail-fast
+cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen::page_turn/)' --no-fail-fast
+```
+
+全focusedを外で確認する場合は、§23.4の `$stage22Focused` 定義と§23.5の `$stage22ReviewFocused` をそのまま使う。
+実core/AIアプリの起動確認・確認用build-devは未実施 (sandbox内でreal-pipeのgreen前提が揃わないため)。
+test-lib-full/test-fullの再実行はしていない。page-turnの元の外部失敗時の状態についてのみ、上記の未確定点が残る。

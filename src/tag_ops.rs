@@ -233,10 +233,6 @@ impl App {
         self.prepare_page_edit_history_boundary();
         // 複数選択は all-or-nothing: 全対象に付与済みなら全削除、それ以外は全付与。
         // 結果は `poll_tag_write_results` が完了時にまとめてトースト表示する。
-        // ラベルは worker キュー全体で共有する 1 フィールドなので、**バリデーション通過後**
-        // に設定する。早期 return 経路で上書きすると、in-flight の前バッチの完了トーストが
-        // 誤ったタグ名を名乗る (空 targets での中断 → 古いバッチに新ラベル)。
-        self.tag_toast_label = Some(format!("#{name_owned}"));
         self.set_tag_toast_surface_for_new_batch(surface);
         self.hydrate_tags_cache_for_paths(&paths);
         let tag_key = crate::tags_db::normalize_tag_key(&name_owned);
@@ -253,6 +249,8 @@ impl App {
         // 「実 DB の before/after」を持って戻った時点で `poll_tag_write_results` が
         // pending_tag_undos から組み立てて確定する (Codex P3 完全対応)。
         let with_hash = crate::tags_db::format_display_tag(&name_owned);
+        self.tag_write_completion
+            .record_specific(&with_hash, !all_have_tag);
         let summary = if all_have_tag {
             format!("{with_hash} の削除")
         } else {
@@ -356,7 +354,7 @@ impl App {
         }
         self.prepare_page_edit_history_boundary();
         let with_hash = crate::tags_db::format_display_tag(&name);
-        self.tag_toast_label = Some(with_hash.clone());
+        self.tag_write_completion.record_specific(&with_hash, add);
         self.set_tag_toast_surface_for_new_batch(surface);
         let summary = if add {
             format!("{with_hash} の付与")
@@ -484,7 +482,9 @@ impl App {
         // ラベル/発火面はバリデーション通過後に設定する (toggle/add と同じ規約。
         // 早期 return 経路で上書きすると in-flight の前バッチの完了トーストが
         // 誤った面/ラベルで表示される — Codex P3)。
-        self.tag_toast_label = None; // clear は付与/削除ラベル不要 (complete 時にクリア件数で集計)
+        self.tag_write_completion
+            .label
+            .merge(TagCompletionLabel::Clear);
         self.set_tag_toast_surface_for_new_batch(surface);
         // 楽観的 UI 更新: tags.db 上の mIV タグを空にする。
         let summary = format!("{count} 件の mIV タグをクリア");
@@ -634,12 +634,83 @@ const TAG_WRITE_UNAVAILABLE_MSG: &str = "タグ書き込みが初期化されて
 /// Publication may be adopted before `done`, or before later agent jobs finish.
 #[derive(Default)]
 pub(crate) struct TagWriteCompletion {
+    label: TagCompletionLabel,
     added: usize,
     removed: usize,
     cleared: usize,
     restored: usize,
     noop: usize,
     errors: Vec<(PathBuf, String)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TagCompletionKind {
+    Add,
+    Remove,
+}
+
+/// The label and counts describe the same unretired user batch. Once operations
+/// differ, later submissions cannot make that batch specific again.
+#[derive(Default, Debug, PartialEq, Eq)]
+enum TagCompletionLabel {
+    #[default]
+    Uninitialized,
+    Specific {
+        tag: String,
+        kind: TagCompletionKind,
+    },
+    Clear,
+    Restore,
+    Generic,
+}
+
+impl TagCompletionLabel {
+    fn merge(&mut self, incoming: Self) {
+        let same = match (&*self, &incoming) {
+            (
+                Self::Specific { tag, kind },
+                Self::Specific {
+                    tag: next_tag,
+                    kind: next_kind,
+                },
+            ) => {
+                kind == next_kind
+                    && crate::tags_db::normalize_tag_key(tag)
+                        == crate::tags_db::normalize_tag_key(next_tag)
+            }
+            _ => *self == incoming,
+        };
+        if matches!(self, Self::Uninitialized) {
+            *self = incoming;
+        } else if !same {
+            *self = Self::Generic;
+        }
+    }
+
+    fn display_tag(&self) -> Option<&str> {
+        match self {
+            Self::Specific { tag, .. } => Some(tag),
+            Self::Generic => Some("タグ"),
+            Self::Uninitialized | Self::Clear | Self::Restore => None,
+        }
+    }
+}
+
+impl TagWriteCompletion {
+    fn record_specific(&mut self, tag: &str, add: bool) {
+        self.label.merge(TagCompletionLabel::Specific {
+            tag: tag.to_owned(),
+            kind: if add {
+                TagCompletionKind::Add
+            } else {
+                TagCompletionKind::Remove
+            },
+        });
+    }
+
+    pub(crate) fn record_restore(&mut self) {
+        self.label.merge(TagCompletionLabel::Restore);
+    }
 }
 
 impl App {
@@ -781,6 +852,7 @@ impl App {
         self.finalize_pending_tag_undos(pending_updates);
         if just_completed && user_batch_completed {
             let TagWriteCompletion {
+                label,
                 added,
                 removed,
                 cleared,
@@ -793,7 +865,6 @@ impl App {
                  restored={restored} noop={noop} errors={}",
                 errors.len()
             ));
-            let label = self.tag_toast_label.take();
             let surface = self.tag_toast_surface.take();
             if !errors.is_empty() {
                 let preview = errors
@@ -816,7 +887,7 @@ impl App {
                 }
             } else if (added + removed + cleared + restored + noop) > 0 {
                 let msg = format_completion_toast(
-                    label.as_deref(),
+                    label.display_tag(),
                     added,
                     removed,
                     cleared,
@@ -993,6 +1064,242 @@ mod tests {
         app.request_tag_add_for_targets("tag", targets, crate::app::ActionSurface::MainWindow);
     }
 
+    fn submit_named_user(app: &mut crate::app::App, name: &str, path: PathBuf, add: bool) {
+        let targets = vec![super::TagTarget {
+            path,
+            tag_sidecar: None,
+        }];
+        if add {
+            app.request_tag_add_for_targets(name, targets, crate::app::ActionSurface::MainWindow);
+        } else {
+            app.request_tag_remove_for_targets(
+                name,
+                targets,
+                crate::app::ActionSurface::MainWindow,
+            );
+        }
+    }
+
+    #[test]
+    fn user_completion_label_matches_all_pending_operations() {
+        use crate::tag_write_worker::{TagAction, TagWriteHandle};
+        for (second_name, second_add, action, expected) in [
+            ("B", true, TagAction::Added, "2 件に タグ を付与"),
+            ("A", true, TagAction::Added, "2 件に #A を付与"),
+            // DB identity is case insensitive; retain the first display spelling.
+            ("a", true, TagAction::Added, "2 件に #A を付与"),
+            ("A", false, TagAction::Removed, "タグ: 1 件付与 / 1 件削除"),
+            ("B", true, TagAction::NoOp, "タグ: 2 件は変更なし"),
+        ] {
+            let mut app = crate::app::tests::phase_c_support::setup_app();
+            let (handle, driver) = TagWriteHandle::controlled_for_test();
+            app.tag_write_handle = Some(handle);
+            let first_path = app.tmp.path().join("first.jpg");
+            submit_named_user(&mut app, "A", first_path, true);
+            let first = driver.recv_job();
+            let first_action = if matches!(action, TagAction::NoOp) {
+                TagAction::NoOp
+            } else {
+                TagAction::Added
+            };
+            let notifications = app.feedback_toasts_for_test.len();
+            driver.publish_result(controlled_result(first, Ok(first_action)));
+            app.poll_tag_write_results();
+            assert_eq!(app.feedback_toasts_for_test.len(), notifications);
+            let second_path = app.tmp.path().join("second.jpg");
+            submit_named_user(&mut app, second_name, second_path, second_add);
+            let second = driver.recv_job();
+            driver.finish_job();
+            driver.publish_result(controlled_result(second, Ok(action)));
+            app.poll_tag_write_results();
+            assert_eq!(app.feedback_toasts_for_test.len(), notifications);
+            driver.finish_job();
+            app.poll_tag_write_results();
+            assert_eq!(app.feedback_toasts_for_test.len(), notifications + 1);
+            assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, expected);
+            assert_eq!(
+                app.tag_write_completion.label,
+                super::TagCompletionLabel::Uninitialized
+            );
+            app.poll_tag_write_results();
+            assert_eq!(app.feedback_toasts_for_test.len(), notifications + 1);
+        }
+    }
+
+    #[test]
+    fn toggle_completion_label_stays_generic_after_direction_changes() {
+        use crate::tag_write_worker::{TagAction, TagJobKind, TagWriteHandle};
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let (handle, driver) = TagWriteHandle::controlled_for_test();
+        app.tag_write_handle = Some(handle);
+        let path = app.tmp.path().join("toggle.jpg");
+        let target = || {
+            vec![super::TagTarget {
+                path: path.clone(),
+                tag_sidecar: None,
+            }]
+        };
+        app.request_tag_toggle_for_targets("tag", target(), crate::app::ActionSurface::MainWindow);
+        let add = driver.recv_job();
+        assert!(matches!(add.kind, TagJobKind::Add(_)));
+        driver.publish_result(controlled_result(add, Ok(TagAction::Added)));
+        app.poll_tag_write_results();
+        app.request_tag_toggle_for_targets("tag", target(), crate::app::ActionSurface::MainWindow);
+        let remove = driver.recv_job();
+        assert!(matches!(remove.kind, TagJobKind::Remove(_)));
+        assert_eq!(
+            app.tag_write_completion.label,
+            super::TagCompletionLabel::Generic
+        );
+        // Returning to Add must not restore a label for the mixed batch.
+        submit_named_user(&mut app, "tag", path.clone(), true);
+        let add_again = driver.recv_job();
+        assert_eq!(
+            app.tag_write_completion.label,
+            super::TagCompletionLabel::Generic
+        );
+        driver.finish_job();
+        driver.publish_result(controlled_result(remove, Ok(TagAction::Removed)));
+        driver.finish_job();
+        driver.publish_result(controlled_result(add_again, Ok(TagAction::Added)));
+        driver.finish_job();
+        app.poll_tag_write_results();
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "タグ: 2 件付与 / 1 件削除"
+        );
+    }
+
+    #[test]
+    fn clear_completion_label_cannot_be_replaced_by_a_pending_edit() {
+        use crate::tag_write_worker::{TagAction, TagWriteHandle};
+        for (mix_edit, action) in [
+            (false, TagAction::Cleared),
+            (false, TagAction::NoOp),
+            (true, TagAction::NoOp),
+        ] {
+            let mut app = crate::app::tests::phase_c_support::setup_app();
+            let (handle, driver) = TagWriteHandle::controlled_for_test();
+            app.tag_write_handle = Some(handle);
+            let path = app.tmp.path().join("clear.jpg");
+            app.items = vec![crate::grid_item::GridItem::Folder(path)];
+            app.selected = Some(0);
+            app.request_tag_clear_for_selection(crate::app::ActionSurface::MainWindow);
+            let clear = driver.recv_job();
+            driver.publish_result(controlled_result(clear, Ok(action)));
+            app.poll_tag_write_results();
+            if mix_edit {
+                let path = app.tmp.path().join("edit.jpg");
+                submit_named_user(&mut app, "A", path, true);
+                let edit = driver.recv_job();
+                assert_eq!(
+                    app.tag_write_completion.label,
+                    super::TagCompletionLabel::Generic
+                );
+                driver.publish_result(controlled_result(edit, Ok(TagAction::NoOp)));
+                driver.finish_job();
+            }
+            let notifications = app.feedback_toasts_for_test.len();
+            driver.finish_job();
+            app.poll_tag_write_results();
+            assert_eq!(app.feedback_toasts_for_test.len(), notifications + 1);
+            let expected = if mix_edit {
+                "タグ: 2 件は変更なし"
+            } else {
+                "1 件から mIV タグをクリア"
+            };
+            assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, expected);
+        }
+    }
+
+    #[test]
+    fn undo_redo_completion_label_cannot_be_replaced_by_a_pending_edit() {
+        use crate::tag_write_worker::{TagAction, TagWriteHandle};
+        for redo in [false, true] {
+            for mix_edit in [false, true] {
+                let mut app = crate::app::tests::phase_c_support::setup_app();
+                let (handle, driver) = TagWriteHandle::controlled_for_test();
+                app.tag_write_handle = Some(handle);
+                let restore_path = app.tmp.path().join("restore.jpg");
+                app.push_tag_undo_entry(
+                    vec![crate::undo_stack::TagChange {
+                        path: restore_path,
+                        tag_sidecar: None,
+                        before: vec![],
+                        after: vec!["#A".into()],
+                    }],
+                    "#A の付与".into(),
+                );
+                app.apply_meta_undo();
+                if redo {
+                    let undo = driver.recv_job();
+                    driver.publish_result(controlled_result(undo, Ok(TagAction::Restored)));
+                    driver.finish_job();
+                    app.poll_tag_write_results();
+                    app.apply_meta_redo();
+                }
+                let restore = driver.recv_job();
+                driver.publish_result(controlled_result(restore, Ok(TagAction::Restored)));
+                app.poll_tag_write_results();
+                if mix_edit {
+                    let path = app.tmp.path().join("edit.jpg");
+                    submit_named_user(&mut app, "B", path, true);
+                    let edit = driver.recv_job();
+                    assert_eq!(
+                        app.tag_write_completion.label,
+                        super::TagCompletionLabel::Generic
+                    );
+                    driver.publish_result(controlled_result(edit, Ok(TagAction::Added)));
+                    driver.finish_job();
+                }
+                let notifications = app.feedback_toasts_for_test.len();
+                driver.finish_job();
+                app.poll_tag_write_results();
+                assert_eq!(app.feedback_toasts_for_test.len(), notifications + 1);
+                assert_eq!(
+                    app.fs_feedback_toast.as_ref().unwrap().0,
+                    "1 件のタグを元に戻しました"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pending_edit_then_undo_uses_generic_label_and_next_batch_is_specific() {
+        use crate::tag_write_worker::{TagAction, TagWriteHandle};
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let (handle, driver) = TagWriteHandle::controlled_for_test();
+        app.tag_write_handle = Some(handle);
+        let path = app.tmp.path().join("edit.jpg");
+        submit_named_user(&mut app, "A", path.clone(), true);
+        let edit = driver.recv_job();
+        driver.publish_result(controlled_result(edit, Ok(TagAction::Added)));
+        app.poll_tag_write_results();
+        app.apply_meta_undo();
+        let undo = driver.recv_job();
+        assert_eq!(
+            app.tag_write_completion.label,
+            super::TagCompletionLabel::Generic
+        );
+        driver.finish_job();
+        driver.publish_result(controlled_result(undo, Ok(TagAction::Restored)));
+        driver.finish_job();
+        app.poll_tag_write_results();
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "1 件のタグを元に戻しました"
+        );
+        submit_named_user(&mut app, "B", path, false);
+        let remove = driver.recv_job();
+        driver.publish_result(controlled_result(remove, Ok(TagAction::Removed)));
+        driver.finish_job();
+        app.poll_tag_write_results();
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "1 件から #B を削除"
+        );
+    }
+
     fn submit_controlled_agent(app: &mut crate::app::App, path: PathBuf) {
         use crate::agent_ipc::changes::{ChangeController, ChangeRow, ChangeRowResult};
         app.request_agent_tag_set_for_targets(
@@ -1029,7 +1336,7 @@ mod tests {
         app.poll_tag_write_results();
         assert_eq!(app.feedback_toasts_for_test.len(), notifications);
         assert_eq!(app.tag_write_completion.added, 1);
-        assert_eq!(app.tag_toast_label.as_deref(), Some("#tag"));
+        assert_eq!(app.tag_write_completion.label.display_tag(), Some("#tag"));
         assert_eq!(
             app.tag_toast_surface,
             Some(crate::app::ActionSurface::MainWindow)
@@ -1049,7 +1356,10 @@ mod tests {
             app.fs_feedback_toast_surface,
             Some(crate::app::ActionSurface::MainWindow)
         );
-        assert!(app.tag_toast_label.is_none());
+        assert_eq!(
+            app.tag_write_completion.label,
+            super::TagCompletionLabel::Uninitialized
+        );
         assert!(app.tag_toast_surface.is_none());
         assert_eq!(app.tag_write_completion.added, 0);
         assert!(!app.tag_writer_has_unpublished_jobs());
@@ -1085,7 +1395,7 @@ mod tests {
         app.poll_tag_write_results();
         assert_eq!(app.tag_write_completion.added, 2);
         assert_eq!(app.feedback_toasts_for_test.len(), notifications);
-        assert_eq!(app.tag_toast_label.as_deref(), Some("#tag"));
+        assert_eq!(app.tag_write_completion.label.display_tag(), Some("#tag"));
         assert_eq!(app.meta_undo.undo_len(), 1);
         assert_eq!(app.pending_tag_undos.len(), 1);
         assert!(app.pending_tag_undos.contains_key(&pending_tx));
@@ -1162,7 +1472,10 @@ mod tests {
         assert!(app.pending_tag_undos.is_empty());
         assert_eq!(app.meta_undo.undo_len(), 1);
         assert!(app.tag_write_completion.errors.is_empty());
-        assert!(app.tag_toast_label.is_none());
+        assert_eq!(
+            app.tag_write_completion.label,
+            super::TagCompletionLabel::Uninitialized
+        );
         app.poll_tag_write_results();
         assert_eq!(app.feedback_toasts_for_test.len(), notifications + 1);
     }
@@ -1178,7 +1491,7 @@ mod tests {
             .unwrap();
         app.set_tags_cache_entry(key.clone(), vec!["#stale".into()]);
         app.adjustment_dragging = true;
-        app.tag_toast_label = Some("user-label".into());
+        app.tag_write_completion.record_specific("user-label", true);
         app.tag_toast_surface = Some(crate::app::ActionSurface::MainWindow);
         let user_tx = app.next_tag_tx_id();
         app.register_pending_tag_op(user_tx, "user pending".into(), 1);
@@ -1209,7 +1522,10 @@ mod tests {
             app.adjustment_dragging,
             "agent must not finalize a user's edit session"
         );
-        assert_eq!(app.tag_toast_label.as_deref(), Some("user-label"));
+        assert_eq!(
+            app.tag_write_completion.label.display_tag(),
+            Some("user-label")
+        );
         assert_eq!(
             app.tag_toast_surface,
             Some(crate::app::ActionSurface::MainWindow)
@@ -1230,7 +1546,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(app.adjustment_dragging);
-        assert_eq!(app.tag_toast_label.as_deref(), Some("user-label"));
+        assert_eq!(
+            app.tag_write_completion.label.display_tag(),
+            Some("user-label")
+        );
         assert_eq!(
             app.tag_toast_surface,
             Some(crate::app::ActionSurface::MainWindow)

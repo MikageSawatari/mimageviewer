@@ -836,15 +836,15 @@ impl App {
     fn submit_tag_restore_jobs(&mut self, changes: &[TagChange], use_before: bool) {
         debug_assert!(!self.tag_maintenance_in_progress());
         self.ensure_tag_write_handle();
-        // 完了トーストのラベルは tag_ops の format_completion_toast で `restored` 件数を
-        // 専用文言に切り替えるので、ここではラベル不要。
-        self.tag_toast_label = None;
         let Some(h) = self.tag_write_handle.as_ref() else {
             self.show_feedback_warning(
                 "タグ書き込みが初期化されていないため Undo できません".to_string(),
             );
             return;
         };
+        if !changes.is_empty() {
+            self.tag_write_completion.record_restore();
+        }
         for c in changes {
             let target = if use_before { &c.before } else { &c.after };
             // tx_id=0 は「Undo entry を pending 経由で確定しない」signal。Undo/Redo の

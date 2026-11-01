@@ -17311,10 +17311,7 @@ pub struct App {
     ///  3. `poll_tag_write_results` が worker の tags_after で上書き (更新完了時)
     /// フォルダ切替時のみ全クリアし、tags.db から埋め直す。
     pub(crate) tags_cache: std::collections::HashMap<String, Vec<String>>,
-    /// tag toast 用: 直近の Toggle 操作で UI が使っていたタグ名 (`#ドール` 等)。
-    /// worker 完了時に「N 件に #ドール を付与 / 削除」として表示するのに使う。
-    pub(crate) tag_toast_label: Option<String>,
-    /// 進行中タグバッチの発火面。`tag_toast_label` と同じライフサイクルで、
+    /// 進行中タグバッチの発火面。`tag_write_completion` と同じライフサイクルで、
     /// 完了トーストをどの面に出すかを決める (`poll_tag_write_results` で take)。
     pub(crate) tag_toast_surface: Option<ActionSurface>,
     /// Adopted user-origin writer results, retained until the whole batch is complete.
@@ -21161,7 +21158,6 @@ impl App {
             pano_high_res_request_seq: 0,
             pano_banner_remember_session: false,
             tags_cache: std::collections::HashMap::new(),
-            tag_toast_label: None,
             tag_toast_surface: None,
             tag_write_completion: Default::default(),
             metadata_show_raw_prompt: false,
