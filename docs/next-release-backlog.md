@@ -52,6 +52,29 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - §1.456 一覧の名前の文字サイズ・最大行数 (>>629): 出荷の案内は未。
 - §1.480 画像フォルダを Enter で開くと自動表示が ON でもページ一覧で止まる (>>649 の調査中に開発側で発見、v4.2.0 から): >>649 の評価フィルタの件は開発側で再現しなかった。報告者へは未返信。
 
+### 1.681 補正レイヤーのボタン・スライダーにフォーカスがあると取り消しキーが届かない — 図形 Undo 調査 (2026-11-02)
+
+- 状態: **別件として起票、製品未修正**。設計担当 ClaudeCode の依頼で `inv-shape-undo` / `312b04810` を調査。図形作成の Undo 登録が §1.679 で失われたという退行は、下記のソース照合・headless handler 比較では確認できなかった。製品起動・実入力・コミットは行わない。
+- 元の観測は設計担当 ClaudeCode によるもの: 2026-11-02 未明、`312b04810` の dev-runtime を隔離データで起動し、画面操作ツールで、補正レイヤーのバケツ→Ctrl+Z は成功、その後の横線作成→Ctrl+Z はオブジェクトが残った。観測時のキーボード owner／widget focus／Undo 件数の記録はなく、以下のフォーカス抑止がその試行の原因だったとは断定しない。
+- 履歴登録の照合: 補正の線・縦線・横線・矩形・楕円は `commit_local_adjust_mask_shape` が変更前後の文書を `set_local_adjust_layers_for_idx_with_undo` → `UndoEntry::LocalAdjustment` へ登録する。ポインタ移動は開始前文書を保持し、`persist_local_adjust_shape_drag` が release で1件確定、Delete は `delete_selected_local_adjust_shape_from_shortcut` が1件登録する。キー移動／回転は既存の `LocalAdjustShapeKeyEdit` にまとめ、idle／履歴境界で確定する。これらの関数と Undo helper は前後同じで、§1.679 は release 処理を `finish_local_adjust_canvas_gesture` へ移して既存登録を維持している。
+- 消しゴム／伏せ字: 作成の release で、bitmap＋図形列の変更前 snapshot を各専用 Undo stack へ1件積んでから commit する。選択移動は drag 開始時、Delete は削除直前に snapshot を積む。動かさない選択クリックも snapshot を積む既存挙動がある。補正とは確定時点が異なるが、共通 pointer owner が Undo payload を所有する形へは変わっていない。多角形／囲みは3ツールとも bitmap に塗る操作で、移動・Delete 可能な図形オブジェクトではない。多角形確定も既存 Undo の1手となる。
+- 確認できたキー抑止: オブジェクトが選択されているだけなら Ctrl+Z／Ctrl+Y は届く。一方、egui のボタン／スライダーが keyboard focus を持つと `App::keyboard_ownership_snapshot` が `FocusedUi` を選び、`KeyboardOwner::blocks_legacy_keymap_shortcuts` → `keymap_owner_blocks_shortcuts` → `Keymap::consume_chord_inner` が consume 前に拒否する。補正モードの `handle_fs_key_input` は `handle_meta_undo_keys` へ到達するが、履歴は pop されず、キーイベントも残る。フォーカスを解除すると同じ履歴を取り消し・やり直しできる。TextEdit／IME の所有も別途優先する。**この抑止は `b99be2f1d` にもある**。パネルのどこにフォーカスがあっても効く、という動作にはなっていない。
+- 比較方法: `src/ui_adjustment_panel/shape_undo_investigation_tests.rs` の同一5テストを使用。`b99be2f1d` と HEAD で異なる既存 Rust source 33ファイル（`src/` と `vendor/egui/src/context.rs`）をバイト単位で退避し、旧版へ一時置換してテスト module の登録だけを追加。旧版に存在しない新規 module は旧版から参照されない。比較後は33ファイルを復元し、退避内容とのバイト一致と製品ソース無差分を確認した。branch／HEAD は変更しない。press・move・release は別 pass とし、§1.679 の既知の同 pass 取りこぼしと Undo を混同しない。
+
+| headless の検査 | §1.679 前 `b99be2f1d` | 後 `312b04810` |
+|---|---|---|
+| 3ツール × 線／縦線／横線／矩形／楕円の作成→Ctrl+Z で消える→Ctrl+Y で戻る | 成功 | 成功 |
+| 3ツールの矩形移動・Delete、それぞれ1手の Undo／Redo | 成功 | 成功 |
+| 3ツールの多角形確定（bitmap）、1手の Undo／Redo | 成功 | 成功 |
+| 補正のバケツ→Ctrl+Z→横線→Ctrl+Z／Ctrl+Y | 成功 | 成功 |
+| 補正のボタン／スライダーの実 egui focus 中は Undo 抑止、履歴保持、focus 解除後は成功 | 同じ抑止を再現 | 同じ抑止を再現 |
+
+- 旧版比較: 通常 feature／test profile／default nextest、retry 0、5件全成功、3.664秒、exit 0。run `8acca2ff-931e-4bcf-9473-25975e451205`、`target/shape-undo-before-b99be2f1d.log`。現行の初回4件も全成功（3.564秒、run `0f487a24-fbe2-489d-b4d2-64145ba73893`、`target/shape-undo-current-expanded-2.log`）。初期のテスト追加時に RawInput の修飾子指定と Panel API のコンパイル不備を修正したが、製品コードは変更していない。
+- 最終関連検証: `MSBUILDDISABLENODEREUSE=1` で `cargo nextest run -p mimageviewer --lib --no-fail-fast --retries 0 --no-tests fail -E 'test(adjustment) | test(local_adjust) | test(canvas_gesture) | test(conceal) | test(erase) | test(undo) | test(page_edit) | test(shape_undo_investigation)'`。通常 feature／test profile／default nextest、**1,021件中1,020成功・1失敗**、108.859秒、exit 100。追加5件は全成功。run `ab59d319-7489-441f-b6a0-55335f1b2700`、`target/shape-undo-related-final.log`。
+- 関連検証の唯一の失敗は既存の `ui_adjustment_panel::local_adjust_segmentation_tests::full_mask_with_large_subtract_preview_completes_quickly`。100ms上限に対して103.0347msだった。同じ完全名を `--test-threads 1 --retries 0 --no-fail-fast --no-tests fail -E 'test(=<完全名>)'` で単独3回実行し、**3/3成功、すべてexit 0**（nextest実行時間0.312／0.260／0.288秒）。`target/shape-undo-preview-single-{1,2,3}.log` と `target/shape-undo-preview-single-results.json`。製品処理・速度assertion・待機期限は変更していない。§1.679にも同名の速度失敗の記録があるが、今回の原因を負荷と断定せず、関連全体成功の代用にしない。
+- 最終整形・型確認: `cargo fmt` 実施、`cargo fmt --check` exit 0（`target/shape-undo-fmt-final.log`）、`cargo check -p mimageviewer --lib --tests --features test-script` exit 0、dev profile、4分22秒（`target/shape-undo-check-final.log`）。既存警告は残る。比較後のRust差分はテスト登録と同一5テストだけで、以後は本節の検証記録のみ更新した。
+- 次の設計判断: 編集 Undo／Redo を通常のボタン・スライダーの focus 中にも許可するかを、数値入力／TextEdit／IME の Undo 所有を保って別件で決める。今回の依頼では既存のフォーカスポリシーを変更しない。追加差分はテスト module と本記録だけで、全件lib／UI snapshot／確認用core build は製品修正時の条件付き検証のため実施しない。
+
 ### 1.679 補正キャンバスが同じ pass 内の押下・解放を取りこぼし、短いクリックやドラッグの終点が反映されない — 原因調査・実装記録 (2026-11-01)
 
 - 状態（以下の原因調査時）: **原因調査・製品未修正**。現在の実装・検証状況は本節末の「実装記録」を参照。設計担当 ClaudeCode からの依頼。調査基点は `inv-click-timing` / `8ff7fed9b`。製品起動・デスクトップ入力・コミットは行わない。観測ビルド `78bd5b6a3` と調査基点で `handle_local_adjust_canvas_input` の関数本体が同一であることを Git の両 source から照合した。
