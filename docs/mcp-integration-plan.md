@@ -3855,3 +3855,9 @@ launcher 内包物を更新してから §2.4 の隔離した stdio check を行
 DB も書き換える」→ その項目の新旧 key を rating writer の 1 つの transaction で正規化する形に直した。P3 2 件「context をまたぐ公開の延期の
 理由が凍結の規則と合わない (延期は許容)」「タグの toast が完了の文」→ 理由を「既存の UI と同じ表示の制限として範囲外」に、toast を
 受理の文に直した (§21.3・§21.4)。
+
+21 巡目 (設計 `9666c5d81`): 追加の指摘なし。判定は「stage 2 design: ready」。
+
+backlog の候補 (master の backlog への登録は親 session に依頼する): 「タグの cache は viewer context ごとで、書き込みの結果は mount 中の
+context にしか反映されない。別の窓が持つ同じ項目のタグの表示は読み直すまで古い (利用者の UI 操作でも同じ)。★の ledger と同じ形の
+context をまたぐ公開を足す」。
