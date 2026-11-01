@@ -1,10 +1,13 @@
 # UI スナップショットテスト運用方針
 
-§1.677の種類iconは、既存の`thumbnail_type_icon_dark/light`を固定slot・薄い4色の試作へ更新する。
+§1.677の種類iconは、既存の`thumbnail_type_icon_dark/light`を固定slot・識別重視の配色Aへ更新する。
 セル枠左上(4,4)pt、図形20pt＋背景24ptを全種類で保持する。
-設定説明の「左下」→「左上の固定マーク」に合わせ、`preferences_favorite_view_state_dark`も更新する。
-この3枚（計323,727 bytes）だけを明示対象として更新し、生成後に目視確認した。
-比較用の14枚は`target/1677-preview/`へ分け、色なし/薄い/やや濃い、OFF/ON、狭幅・最小32pt、
+今回の更新対象はこの2枚だけ。設定ページを含む他のbaselineは更新しない。
+前回は設定説明も含む3枚（計323,727 bytes）を更新し、目視確認した。
+今回の比較用8枚は`target/1677-preview/palette-*.png`へ分け、A/B/Cを並べた明暗各1枚と、
+各案の多数badge（通常幅・名前幅優先・狭幅）の明暗各1枚を作る。値・推奨理由・既存色との兼ね合いはREADME.txt。
+既存の補助比較もAで再生成する。前回の色なし/薄い/やや濃いの`colors-*.png`は履歴として扱う。
+OFF/ON、狭幅・最小32pt、
 名前幅優先・多数badge・代表画像なし・名前200%最大4行・中央bookmark titleをdark/lightで確認する。
 最小32ptでは補助マークの視認性が低下する制約も実寸で示す。製品は起動しない。
 検証結果の正本は[§1.677の実装記録](next-release-backlog.md)。

@@ -931,7 +931,7 @@ pub(crate) fn draw_cell(
         is_cut,
         resume_meter,
         false,
-        crate::os_theme::ThumbnailTypeTint::Soft,
+        crate::os_theme::ThumbnailTypeTint::default(),
     );
 }
 
@@ -971,7 +971,7 @@ pub(crate) fn draw_cell_with_hit_areas(
         is_cut,
         resume_meter,
         true,
-        crate::os_theme::ThumbnailTypeTint::Soft,
+        crate::os_theme::ThumbnailTypeTint::default(),
     )
 }
 

@@ -1,4 +1,4 @@
-﻿# 次リリース検討バックログ
+# 次リリース検討バックログ
 
 このファイルは、**いま着手できる**作業候補だけを置く恒久バックログ。
 完了した項目はコミット履歴・リリースノート・個別設計メモに任せ、このファイルからは削除する。
@@ -54,7 +54,7 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.677 サムネイル表示後も種類アイコンを残し、フォルダ・書庫・単体画像を見分けやすくする — 5ch >>700 (2026-11-01)
 
-- 状態: **固定slotへの改修・指定自動検証完了、配色の選定待ち (2026-11-01)**。比較PNGを見た利用者が既定ON・中20pt（背景24pt）を採択。位置を全状態で固定し、カテゴリ順と同じ4分類の薄い背景色を比較する。最新仕様・検証は下の「固定slotへの改修」を参照。[>>700](https://egg.5ch.io/test/read.cgi/software/1782419551/700) 由来。動画の画質についての感想は本項目の対象外。
+- 状態: **固定slotを維持した識別重視の3配色案・比較PNGと個別自動検証が揃い、配色の選定待ち (2026-11-01)**。比較PNGを見た利用者が既定ON・中20pt（背景24pt）を採択。薄い／やや濃い案は小面積で見分けにくいとの判断を受け、入れ物2分類は色相で離し、アイテム2分類は近色にまとめる。最新仕様・検証は下の「識別重視の配色再試作」を参照。[>>700](https://egg.5ch.io/test/read.cgi/software/1782419551/700) 由来。動画の画質についての感想は本項目の対象外。
 - 着手前: `src/app/grid_paint.rs` は代表サムネイルが Loaded になると中央のフォルダ・書庫アイコンを描かず、以降は緑のフォルダ名バッジや小さな ZIP / PDF / RAR 等の形式バッジで区別する。画像は種類マークを持たず、区別の手掛かりが揃っていない。セルの青背景と太い青枠はカーソル・チェック状態を示すので、種類を示すために上書きしない。
 - 方針: 種類アイコンをセル枠の左上(4,4)ptの固定slotへ常時表示する。読み込み前後・代表画像なし・名前非表示・名前幅優先・文字サイズ/行数で移動しない。既定ON、図形20pt＋背景24ptは利用者採択済み。環境設定でOFFにすると予約も外す。
 - 既存表示との統合: ZIP / RAR / PDF 等の短い形式ラベルと既存機能を維持する。slotを先に予約し、他の表示が避ける。狭いセルでは種類iconを最優先に残し、他badge側を既存の優先順で縮小・行数削減・省略する。セル寸法・行高・画像fitは変更しない。
@@ -112,6 +112,20 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - UI snapshotは**216/216成功**（`target/1677-ui-snapshot-final.log`）。予定した既存 `thumbnail_type_icon_dark.png` / `thumbnail_type_icon_light.png` と、設定説明を「左上の固定マーク」へ直した `preferences_favorite_view_state_dark.png` の**3枚だけ**を明示更新し、現画像を目視確認した（計323,727 bytes）。他の既存PNGは更新せず、通常比較で予定外の差分がないことを確認。設定ページの明示更新だけの先行実行も1/1成功（`target/1677-preferences-update.log`）。
 - `cargo fmt` / `cargo fmt --check`、`cargo check -p mimageviewer --lib --tests --features test-script` は**成功・exit 0**。checkは9m32s、unused/deprecated等のcompiler警告あり・エラーなし。ログは `target/1677-check-final.log` / `target/1677-fmt-final.log`（整形差分なしで空）。`python scripts/check_ui_glyphs.py` は**0件・exit 0**（`target/1677-glyphs-final.log`）。`git diff --check`も成功。
 - 最終の小変更（描画元`ui.visuals()`の明示、比較ラベルの幅制限、内部docs）まで独立レビューACCEPT。色は未採択のためSoftを仮適用した未コミット差分で引き渡す。製品起動・実機測定・全lib/full gate・build-dev・公開マニュアル反映・コミットは今回行わない。
+
+#### 識別重視の配色再試作（2026-11-01、14e99a13cからの差分）
+
+- 設計担当からの依頼。前回の薄い／やや濃いは小さな背景で区別しにくいという利用者判断を受け、3案を作り直す。位置(4,4)pt・図形20pt／背景24pt・既定ON・分類は維持する。製品起動・コミットは行わない。最終配色は利用者／設計担当の選定待ち。
+- **A（推奨、仮適用）**: 実フォルダは青緑、アーカイブ類はラズベリー。画像は紫、動画・音声は蘭色にして、入れ物を互いにもアイテム側とも離し、アイテムは隣接色相でまとめる。Bは入れ物の色を入れ替え、アイテムを紫の彩度／明度差でまとめる。Cは入れ物が紫／ラズベリー、アイテムがエメラルド／ターコイズ。
+- 青い選択枠・ZIP、黄の★、赤いPDF、橙のRAR／警告を避ける。既存の動画は青緑、音声は紫、フォルダ名は緑なので完全に未使用の色相だけでは構成できない。Aは青緑を緑寄り（約165度、名前バッジの約133度とは分離）、紫を赤紫寄り（約280／296度、音声ラベルの約254度から分離）へずらす。RGB値の流用はしない。不透明の正方形と図形を左上に固定し、下段の半透明文字ラベルとの位置／形の差も維持する。B・Cは既存の意味色に近い部分が増すためAを推す。色覚特性全般での識別保証とは扱わない。
+- 値の正本は引き続き `os_theme::thumbnail_type_background` の1か所。通常描画・hit領域付き描画・fixtureは同じ `ThumbnailTypeTint::default()`（A）を使う。darkは彩度を保った暗色、lightは中明度の鮮明色。図形・枠線は既存の `ui.visuals().text_color()` のままで、Light/Dark・文字コントラスト標準／強めに従う。4分類の図形／背景は全案4.5:1以上を契約テストへ追加する。その他の無彩色と既存の分類契約は維持する。
+- 再生成入口は既存のignored `thumbnail_type_icon_write_previews`。`target/1677-preview/palette-comparison-dark.png` / `-light.png` に同じ16項目のA/B/Cを横並びで描き、`palette-{a,b,c}-crowded-{dark,light}.png` の6枚に通常幅・名前幅優先・狭幅の多数badge条件を描く。値は正本関数からREADME.txtへ自動出力し、案の考え方・推奨理由も記録する。既存のOFF/ON・狭幅・最小32pt・多数badge・代表画像なし・大きい名前／bookmarkの補助12枚もAで再生成する。旧 `colors-*.png` は前回案の履歴。
+- 比較PNGは**8枚・3,196,689 bytes**。全8枚を実装担当と独立レビュー担当が目視し、明暗の線・4分類の色・説明ラベル・多数badge／狭幅での固定slotを確認した。更新したbaselineは `thumbnail_type_icon_dark.png` / `thumbnail_type_icon_light.png` の**2枚・248,725 bytes**だけで、実装担当が両方を目視。各PNGの変更6,344画素が13個の24×24pt分類背景内だけにあることもHEAD画像との比較で検査し、その他3項目の無彩色・選択枠・名前・既存badgeに差分がないことを確認（`palette-verification/pixel-diff.log`）。最小32ptの明暗の補助PNGも目視し、補助markの縮小限界は前回どおり。
+- 独立レビュー（GPT-6.1 Sol / xhigh、別コンテキスト）は修正後source・比較8枚・READMEを確認して**ACCEPT、未解決指摘なし**。生成説明の文字化け・旧案説明の残存を修正済み。検証は実装担当が所有し、レビュー側は再実行しない。
+- 自動検証は同worktreeの未コミット差分、`MSBUILDDISABLENODEREUSE=1`。配色契約は**1/1成功**。初回はB darkの4.469:1を検出して失敗し、B／Cの暗色VideoAudioだけを微調整後に成功（現在の最小は全案4.58:1）。baseline生成は `UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib thumbnail_type_icon_snapshot_` の**2/2成功**、比較生成はignoredテスト明示実行の**1/1成功**。関連nextest（`test(thumb_overlay) | test(grid_paint) | test(grid_type_icon)`）は**90/90成功**。`cargo check -p mimageviewer --lib --tests --features test-script` は**exit 0**（149秒）。`cargo fmt`成功。ログは `target/1677-preview/palette-verification/` の `contrast.log` / `snapshot-update.log` / `previews.log` / `related.log` / `check.log` / `fmt.log` と `results.tsv`。初回の失敗ログは `target/1677-preview/palette-contract.log`。
+- UI snapshotは**216件すべての個別成功を確認（初回164件＋補完52件）**。最初の `cargo test --test ui_snapshot` は164件の成功後に実行プロセスが**exit 2173で異常終了**し、一括完走の成功とは扱わない（`ui-snapshot.log`、コマンド全体325秒）。失敗assertionや画像差分の記録はなく、終了原因は未確定。既存のGPU調査で捕捉されたAVと同じ原因とは断定しない。216件の一覧と成功164件を照合し、未完了52件だけを `cargo test --test ui_snapshot -- --exact --nocapture <52件の完全名>` で補完、**52 passed / 0 failed / 164 filtered out、exit 0、142秒**。成功済みの再実行・並列数やbackendの変更・baselineの追加更新は行わない。ログは `ui-list.log` / `ui-completed.txt` / `ui-remaining.txt` / `ui-remaining.log` / `ui-coverage.txt`。名前200%／bookmarkの明暗の補助PNGも目視した。
+- `python scripts/check_ui_glyphs.py` は**0件・exit 0**、`cargo fmt --check` と `git diff --check` も成功。ログは同ディレクトリの `glyphs.log` / `fmt-check.log`。compilerには従来のunused／deprecated等の警告がある。設定ページを含む他のbaselineは更新しない。全lib／full gate・製品起動・実機測定・コミットは行わない。公開マニュアルは配色採択後に設計担当が仕上げる。
+- 確認用 `.\scripts\build-dev.ps1 -PreserveRuntime` は**成功・exit 0**。通常feature set、`dev-runtime` profile（portableなし）、`MSBUILDDISABLENODEREUSE=1`。coreは8m28s、remote／EPUB workerもビルドし、PE検査は runtime=4 / pe=3 成功。ログは `palette-verification/build-dev.log` と `results.tsv`、出力は `target/dev-runtime/mimageviewer-core.exe`。既存プロセスを停止せず、生成物も起動しない。利用者が確認する場合はインストール版／常駐tray版を終了して `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常の `%APPDATA%\mimageviewer` を使い、実際の設定／データを更新し得る。確認対象は明暗両テーマの4分類の識別と、多数badge・選択状態でも固定位置／既存表示を維持すること。色はAを仮適用したまま、コミットは設計担当へ渡す。
 
 ### 1.675 書庫内フォルダ・入れ子書庫にも、ページを直接表示する設定を適用する — 5ch >>694・696 (2026-11-01)
 
