@@ -46,11 +46,18 @@ pub(crate) struct ChangeRow {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct CollectionTarget {
+    pub(crate) id: String,
+    pub(crate) name: String,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ChangeRecord {
     pub(crate) id: ChangeRecordId,
     pub(crate) at: SystemTime,
     pub(crate) client_name: String,
     pub(crate) tool: String,
+    pub(crate) collection: Option<CollectionTarget>,
     pub(crate) counts: ChangeCounts,
     pub(crate) summary: String,
     pub(crate) rows: Vec<ChangeRow>,
@@ -177,6 +184,7 @@ mod tests {
             at: SystemTime::UNIX_EPOCH,
             client_name: format!("client{index}"),
             tool: "add_to_collection".into(),
+            collection: None,
             counts: ChangeCounts {
                 changed: 1,
                 ..Default::default()

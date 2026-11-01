@@ -104758,6 +104758,7 @@ mod agent_change_ui_tests {
             at: std::time::SystemTime::now(),
             client_name: "fixture".into(),
             tool: "create_collection".into(),
+            collection: None,
             counts: Default::default(),
             summary: "作成".into(),
             rows: Vec::new(),

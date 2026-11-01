@@ -349,12 +349,11 @@ pub(super) fn draw_recent(ui: &mut egui::Ui, state: &AgentIntegrationState) {
     ui.add_space(12.0);
 }
 
-pub(super) fn has_changes(state: &AgentIntegrationState) -> bool {
-    !state.changes.is_empty()
-}
-
 pub(super) fn draw_changes(ui: &mut egui::Ui, state: &AgentIntegrationState) {
     ui.label(egui::RichText::new("mIV を閉じると消えます。最新 100 回分を表示します。").weak());
+    if state.changes.is_empty() {
+        ui.label("変更の記録はありません");
+    }
     for record in &state.changes {
         let seconds = record
             .at
@@ -375,6 +374,9 @@ pub(super) fn draw_changes(ui: &mut egui::Ui, state: &AgentIntegrationState) {
                 ui.add(egui::Label::new(heading).wrap().selectable(true));
             })
             .body(|ui| {
+                if let Some(target) = collection_target_text(record) {
+                    ui.add(egui::Label::new(target).wrap().selectable(true));
+                }
                 ui.add(
                     egui::Label::new(format!(
                         "変更 {} 件 / 変更なし {} 件 / 対象外 {} 件 / 処理中 {} 件 / 失敗 {} 件",
@@ -393,7 +395,7 @@ pub(super) fn draw_changes(ui: &mut egui::Ui, state: &AgentIntegrationState) {
                 for (index, row) in record.rows.iter().enumerate() {
                     ui.push_id(index, |ui| {
                         ui.separator();
-                        selectable_copy(ui, &change_row_text(row));
+                        selectable_copy(ui, &change_row_copy_text(record, row));
                     });
                 }
             });
@@ -408,6 +410,26 @@ fn change_row_text(row: &crate::agent_ipc::changes::ChangeRow) -> String {
     )
 }
 
+fn collection_target_text(record: &ChangeRecord) -> Option<String> {
+    record.collection.as_ref().map(|target| {
+        format!(
+            "コレクション: {}\nコレクション ID: {}",
+            target.name, target.id
+        )
+    })
+}
+
+fn change_row_copy_text(
+    record: &ChangeRecord,
+    row: &crate::agent_ipc::changes::ChangeRow,
+) -> String {
+    let row = change_row_text(row);
+    match collection_target_text(record) {
+        Some(target) => format!("{target}\n{row}"),
+        None => row,
+    }
+}
+
 fn change_record_text(record: &ChangeRecord) -> String {
     let mut text = format!(
         "{} / {} / {} 件 / {}",
@@ -416,6 +438,10 @@ fn change_record_text(record: &ChangeRecord) -> String {
         record.counts.total(),
         record.summary
     );
+    if let Some(target) = collection_target_text(record) {
+        text.push('\n');
+        text.push_str(&target);
+    }
     for row in &record.rows {
         text.push_str("\n\n");
         text.push_str(&change_row_text(row));
@@ -777,6 +803,10 @@ pub(super) fn snapshot(ui: &mut egui::Ui, level: u8) {
             at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_501_696),
             client_name: "Claude Desktop".into(),
             tool: "add_to_collection".into(),
+            collection: Some(crate::agent_ipc::changes::CollectionTarget {
+                id: "collection-travel".into(),
+                name: "旅行の写真".into(),
+            }),
             counts: crate::agent_ipc::changes::ChangeCounts {
                 changed: 2,
                 unchanged: 1,

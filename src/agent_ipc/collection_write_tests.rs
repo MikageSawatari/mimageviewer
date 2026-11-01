@@ -603,6 +603,10 @@ mod filesystem {
         assert_eq!(snapshot(&fixture, &id), after);
         let shared = fixture.handlers.changes.records();
         let records = shared.lock().unwrap();
+        let existing = &records.entries()[0];
+        assert!(existing.rows.iter().all(|row| {
+            row.before == "登録済み" && row.after == "登録済み" && row.result == "変更なし"
+        }));
         let add = &records.entries()[1];
         assert_eq!(add.counts.changed, 2);
         assert_eq!(add.counts.unchanged, 1);
@@ -611,6 +615,8 @@ mod filesystem {
         assert_eq!(add.rows[0].item, second.to_string_lossy());
         assert_eq!(add.rows[1].item, first.to_string_lossy());
         assert_ne!(add.rows[0].before, add.rows[0].after);
+        assert_eq!(add.rows[2].before, "未登録");
+        assert_eq!(add.rows[2].after, "登録済み");
         drop(records);
         assert_eq!(notices.try_iter().count(), 3);
     }
@@ -679,6 +685,10 @@ mod filesystem {
         assert_eq!(record.counts.unchanged, 2);
         assert_eq!(record.rows.len(), 4);
         assert_ne!(record.rows[0].before, record.rows[0].after);
+        for index in [1, 2] {
+            assert_eq!(record.rows[index].before, "登録済み");
+            assert_eq!(record.rows[index].after, "未登録");
+        }
         drop(records);
         assert_eq!(notices.try_iter().count(), 2);
     }
@@ -786,6 +796,84 @@ mod filesystem {
                 .iter()
                 .any(|entry| entry.source_path == rejected)
         );
-        assert_eq!(notices.try_iter().count(), 2);
+        let shared = fixture.handlers.changes.records();
+        {
+            let records = shared.lock().unwrap();
+            let record = &records.entries()[0];
+            for index in [1, 2] {
+                assert_eq!(record.rows[index].before, "未登録");
+                assert_eq!(record.rows[index].after, "未登録");
+            }
+        }
+        // A completely full collection must not record a repeated rejected
+        // input as a member, even though its wire outcome is Duplicate.
+        let result = outcomes(
+            fixture.call(
+                &connection,
+                103,
+                Command::AddToCollection {
+                    id: id.clone(),
+                    items: vec![item(&rejected), item(&rejected)],
+                },
+            ),
+            &id,
+        );
+        assert!(result.contains(&CollectionItemOutcome::CapacityRejected { indices: vec![0] }));
+        assert!(result.contains(&CollectionItemOutcome::Duplicate { indices: vec![1] }));
+        assert_eq!(snapshot(&fixture, &id), after);
+        let records = shared.lock().unwrap();
+        assert!(
+            records.entries()[0]
+                .rows
+                .iter()
+                .all(|row| { row.before == "未登録" && row.after == "未登録" })
+        );
+        assert_eq!(notices.try_iter().count(), 3);
+    }
+
+    #[test]
+    fn add_and_remove_records_identify_same_named_collections() {
+        let fixture = Fixture::new();
+        let _notices = ready(&fixture);
+        let connection = fixture.connection();
+        let first = create(&fixture, &connection, "同じ名前");
+        let second = create(&fixture, &connection, "同じ名前");
+        assert_ne!(first, second);
+        let path = fixture._dir.path().join("member.png");
+        std::fs::write(&path, b"fixture").unwrap();
+        for id in [&first, &second] {
+            outcomes(
+                fixture.call(
+                    &connection,
+                    102,
+                    Command::AddToCollection {
+                        id: id.clone(),
+                        items: vec![item(&path)],
+                    },
+                ),
+                id,
+            );
+            outcomes(
+                fixture.call(
+                    &connection,
+                    103,
+                    Command::RemoveFromCollection {
+                        id: id.clone(),
+                        items: vec![item(&path)],
+                    },
+                ),
+                id,
+            );
+        }
+        let shared = fixture.handlers.changes.records();
+        let records = shared.lock().unwrap();
+        for (record, expected_id) in records.entries()[..4]
+            .iter()
+            .zip([&second, &second, &first, &first])
+        {
+            let target = record.collection.as_ref().unwrap();
+            assert_eq!(&target.id, expected_id);
+            assert_eq!(target.name, "同じ名前");
+        }
     }
 }

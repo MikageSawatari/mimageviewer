@@ -5,7 +5,7 @@ use crate::collection_store::{
     CollectionId, CollectionSnapshot, CollectionSourcePath, CollectionStoreClient,
     CollectionStoreError, prepare_collection_registrations,
 };
-use changes::{ChangeCounts, ChangeRecord, ChangeRow};
+use changes::{ChangeCounts, ChangeRecord, ChangeRow, CollectionTarget};
 use std::collections::HashSet;
 use std::time::SystemTime;
 
@@ -177,6 +177,7 @@ pub(super) fn respond(
                 tool: tool.into(),
                 counts: ChangeCounts::default(),
                 summary: String::new(),
+                collection: None,
                 rows: vec![],
                 notice: String::new(),
             };
@@ -331,6 +332,10 @@ fn execute(
             let id = collection_id(&id)?;
             validate_items(&items)?;
             let before = snapshot(&client, id, ctx)?;
+            record.collection = Some(CollectionTarget {
+                id: id.to_string(),
+                name: before.definition.name.clone(),
+            });
             let mut statuses =
                 vec![ItemResult::Skipped(CollectionSkipReason::UnsupportedType); items.len()];
             let mut paths = vec![];
@@ -376,7 +381,7 @@ fn execute(
                     Err(_) => return Err(failed()),
                 }
             }
-            record.rows = item_rows(&items, &statuses);
+            record.rows = item_rows(&items, &statuses, &before, &before);
             let outcome = enqueue(handlers, ctx, gate, || {
                 client.add_batch(id, before.revision(), registrations)
             })?;
@@ -401,7 +406,7 @@ fn execute(
                     return Err(failed());
                 };
             }
-            finish_items(record, &items, &statuses, &before.definition.name);
+            finish_items(record, &items, &statuses, &before, &outcome.snapshot);
             Ok(CollectionWriteResult::Items {
                 id: id.to_string(),
                 outcomes: grouped(&statuses),
@@ -411,6 +416,10 @@ fn execute(
             let id = collection_id(&id)?;
             validate_items(&items)?;
             let before = snapshot(&client, id, ctx)?;
+            record.collection = Some(CollectionTarget {
+                id: id.to_string(),
+                name: before.definition.name.clone(),
+            });
             let mut statuses = vec![];
             let mut ids = vec![];
             let mut seen = HashSet::new();
@@ -436,11 +445,11 @@ fn execute(
                 };
                 statuses.push(status);
             }
-            record.rows = item_rows(&items, &statuses);
-            enqueue(handlers, ctx, gate, || {
+            record.rows = item_rows(&items, &statuses, &before, &before);
+            let after = enqueue(handlers, ctx, gate, || {
                 client.remove_entries(id, before.revision(), ids)
             })?;
-            finish_items(record, &items, &statuses, &before.definition.name);
+            finish_items(record, &items, &statuses, &before, &after);
             Ok(CollectionWriteResult::Items {
                 id: id.to_string(),
                 outcomes: grouped(&statuses),
@@ -503,30 +512,55 @@ enum ItemResult {
     CapacityRejected,
     Skipped(CollectionSkipReason),
 }
-fn item_rows(items: &[ItemRef], results: &[ItemResult]) -> Vec<ChangeRow> {
+fn item_rows(
+    items: &[ItemRef],
+    results: &[ItemResult],
+    before: &CollectionSnapshot,
+    after: &CollectionSnapshot,
+) -> Vec<ChangeRow> {
+    let before_keys: HashSet<_> = before
+        .entries
+        .iter()
+        .map(|entry| &entry.source_key)
+        .collect();
+    let after_keys: HashSet<_> = after
+        .entries
+        .iter()
+        .map(|entry| &entry.source_key)
+        .collect();
     items
         .iter()
         .zip(results)
         .map(|(item, result)| {
-            let (before, after, outcome) = match result {
-                ItemResult::Added => ("未登録", "登録済み", "追加"),
-                ItemResult::Duplicate => ("登録済み", "登録済み", "変更なし"),
-                ItemResult::Removed => ("登録済み", "未登録", "削除"),
-                ItemResult::NotPresent => ("未登録", "未登録", "変更なし"),
-                ItemResult::CapacityRejected => ("未登録", "未登録", "上限で追加できません"),
-                ItemResult::Skipped(CollectionSkipReason::InvalidPath) => {
-                    ("—", "—", "パスの表記が不正です")
-                }
-                ItemResult::Skipped(CollectionSkipReason::NotFound) => {
-                    ("—", "—", "項目が見つかりません")
-                }
+            let outcome = match result {
+                ItemResult::Added => "追加",
+                ItemResult::Duplicate | ItemResult::NotPresent => "変更なし",
+                ItemResult::Removed => "削除",
+                ItemResult::CapacityRejected => "上限で追加できません",
+                ItemResult::Skipped(CollectionSkipReason::InvalidPath) => "パスの表記が不正です",
+                ItemResult::Skipped(CollectionSkipReason::NotFound) => "項目が見つかりません",
                 ItemResult::Skipped(CollectionSkipReason::UnsupportedSubresource) => {
-                    ("—", "—", "本の中の項目は対象外です")
+                    "本の中の項目は対象外です"
                 }
-                ItemResult::Skipped(CollectionSkipReason::UnsupportedType) => {
-                    ("—", "—", "対象外の形式です")
-                }
+                ItemResult::Skipped(CollectionSkipReason::UnsupportedType) => "対象外の形式です",
             };
+            let (mut before, mut after) = ("—", "—");
+            // Wire outcomes describe input positions (including repetitions),
+            // while the record describes actual membership in the snapshots.
+            if invalid_item(item).is_none() {
+                if let Ok(source) = CollectionSourcePath::from_trusted(Path::new(&item.path)) {
+                    before = if before_keys.contains(source.key()) {
+                        "登録済み"
+                    } else {
+                        "未登録"
+                    };
+                    after = if after_keys.contains(source.key()) {
+                        "登録済み"
+                    } else {
+                        "未登録"
+                    };
+                }
+            }
             ChangeRow {
                 item: item.subresource.as_ref().map_or_else(
                     || item.path.clone(),
@@ -539,8 +573,14 @@ fn item_rows(items: &[ItemRef], results: &[ItemResult]) -> Vec<ChangeRow> {
         })
         .collect()
 }
-fn finish_items(record: &mut ChangeRecord, items: &[ItemRef], results: &[ItemResult], name: &str) {
-    record.rows = item_rows(items, results);
+fn finish_items(
+    record: &mut ChangeRecord,
+    items: &[ItemRef],
+    results: &[ItemResult],
+    before: &CollectionSnapshot,
+    after: &CollectionSnapshot,
+) {
+    record.rows = item_rows(items, results, before, after);
     record.counts.changed = results
         .iter()
         .filter(|result| matches!(result, ItemResult::Added | ItemResult::Removed))
@@ -550,7 +590,7 @@ fn finish_items(record: &mut ChangeRecord, items: &[ItemRef], results: &[ItemRes
         .filter(|result| matches!(result, ItemResult::Duplicate | ItemResult::NotPresent))
         .count();
     record.counts.skipped = results.len() - record.counts.changed - record.counts.unchanged;
-    record.summary = format!("コレクション「{name}」の項目を変更");
+    record.summary = format!("コレクション「{}」の項目を変更", before.definition.name);
     record.notice = format!(
         "AI がコレクションを変更しました ({} 件)",
         record.counts.changed

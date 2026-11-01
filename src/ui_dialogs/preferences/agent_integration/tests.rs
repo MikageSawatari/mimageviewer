@@ -861,6 +861,10 @@ fn change_fixture(
         at: std::time::UNIX_EPOCH,
         client_name: "名乗った AI アプリの長い名前".repeat(10),
         tool: "add_to_collection".into(),
+        collection: Some(crate::agent_ipc::changes::CollectionTarget {
+            id: "collection-long-name".into(),
+            name: "長いコレクション名".repeat(20),
+        }),
         counts: ChangeCounts {
             changed: rows,
             ..Default::default()
@@ -964,5 +968,98 @@ fn agent_changes_copy_text_preserves_all_rows_and_results() {
     assert!(copied.contains("add_to_collection / 2 件"));
     for row in &record.rows {
         assert!(copied.contains(&change_row_text(row)));
+    }
+}
+
+#[test]
+fn agent_changes_same_name_collections_show_and_copy_distinct_targets() {
+    use crate::agent_ipc::changes::{ChangeController, CollectionTarget};
+    let (mut state, _) = change_fixture(1);
+    let controller = ChangeController::new();
+    for id in ["collection-a", "collection-b"] {
+        let mut record = (*state.changes[0]).clone();
+        record.client_name = "fixture".into();
+        record.summary = "追加".into();
+        record.collection = Some(CollectionTarget {
+            id: id.into(),
+            name: "同じ名前".into(),
+        });
+        record.rows[0] = crate::agent_ipc::changes::ChangeRow {
+            item: r"C:\写真\海.jpg".into(),
+            before: "未登録".into(),
+            after: "登録済み".into(),
+            result: "変更しました".into(),
+        };
+        controller.publish(record);
+    }
+    state.changes = controller.records().lock().unwrap().entries().to_vec();
+    let mut harness = crate::test_ui::builder()
+        .with_size(egui::vec2(900.0, 1000.0))
+        .with_context_setup(crate::ui_fonts::configure_fonts)
+        .build_ui_state(
+            |ui, state| {
+                for record in &state.changes {
+                    egui::collapsing_header::CollapsingState::load_with_default_open(
+                        ui.ctx(),
+                        ui.make_persistent_id(("agent_change", record.id)),
+                        true,
+                    )
+                    .store(ui.ctx());
+                }
+                draw_changes(ui, state);
+            },
+            state,
+        );
+    harness.run_steps(5);
+    for (index, id) in ["collection-b", "collection-a"].into_iter().enumerate() {
+        let target = format!("コレクション: 同じ名前\nコレクション ID: {id}");
+        assert_eq!(harness.get_all_by_label(&target).count(), 1);
+        let record = &harness.state().changes[index];
+        assert!(change_record_text(record).contains(&target));
+        assert!(change_row_copy_text(record, &record.rows[0]).contains(&target));
+        for button in ["この変更をコピー", "コピー"] {
+            harness.get_all_by_label(button).nth(index).unwrap().click();
+            harness.run_steps(1);
+            assert!(
+                harness
+                    .output()
+                    .platform_output
+                    .commands
+                    .iter()
+                    .any(|command| {
+                        matches!(command, egui::OutputCommand::CopyText(text)
+                    if text.contains(&target) && text.contains(r"C:\写真\海.jpg"))
+                    }),
+                "{button} must retain the target id and name: {id}"
+            );
+        }
+    }
+}
+
+#[test]
+fn agent_changes_empty_search_result_reaches_visible_anchor() {
+    let mut harness = app_harness();
+    let entry =
+        super::super::search_preferences("AI による変更", super::super::preference_category)
+            .into_iter()
+            .find(|entry| entry.anchor == "agent/changes")
+            .expect("change history search entry");
+    let state = harness.state_mut().pref_state.as_mut().unwrap();
+    assert!(state.agent_integration.changes.is_empty());
+    super::super::select_preference_search_result(state, &entry);
+    harness.run_steps(8);
+    let state = harness.state().pref_state.as_ref().unwrap();
+    assert_eq!(state.pending_anchor, None);
+    assert_eq!(state.highlight.unwrap().0, "agent/changes");
+    let viewport = harness.ctx.content_rect();
+    for label in [
+        "AI による変更",
+        "mIV を閉じると消えます。最新 100 回分を表示します。",
+        "変更の記録はありません",
+    ] {
+        assert!(
+            viewport.contains_rect(harness.get_by_label(label).rect()),
+            "{label}"
+        );
     }
 }

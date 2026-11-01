@@ -12905,12 +12905,10 @@ pub(super) fn page_agent_integration(ui: &mut egui::Ui, state: &mut PreferencesS
         ui.label(egui::RichText::new("最近使った AI アプリ").strong());
         super::agent_integration::draw_recent(ui, &state.agent_integration);
     });
-    if super::agent_integration::has_changes(&state.agent_integration) {
-        anchored(ui, state, "agent/changes", |ui, state| {
-            ui.label(egui::RichText::new("AI による変更").strong());
-            super::agent_integration::draw_changes(ui, &state.agent_integration);
-        });
-    }
+    anchored(ui, state, "agent/changes", |ui, state| {
+        ui.label(egui::RichText::new("AI による変更").strong());
+        super::agent_integration::draw_changes(ui, &state.agent_integration);
+    });
     anchored(ui, state, "agent/claude", |ui, state| {
         ui.label(egui::RichText::new("Claude Desktop").strong());
         super::agent_integration::draw_app(

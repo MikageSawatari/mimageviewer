@@ -4001,3 +4001,84 @@ OS5 で揃わないため、新しい実機確認用 build-dev は作ってい�
 `.\scripts\build-dev.ps1 -PreserveRuntime` で core と対応する MCP を同時に更新する。
 test-full は実行していない。タグ/★/UI 要求の一般化・公開文書は計画どおり2-2以降へ残す。
 本 slice の実装の未完項目/追加の設計矛盾は無い。commit・製品起動・実 client config の操作はしていない。
+
+### 22.6 実装レビュー 1 巡目の対応
+
+対象は実装 `e644613fd` と設計追記 `dee5e011f`。3件とも実装担当がコード上で再確認し、
+指摘どおりの経路を確認した。以下の確認は実装担当自身 (担当サブエージェントを含む) のもので、
+独立レビューの結果ではない。
+
+#### 指摘と修正・回帰
+
+- **P2: 入力内の重複を実際の所属として記録していた**。
+  `collection_write::item_rows` は actor の入力位置ごとの outcome から所属を推定せず、
+  受理前 snapshot と actor が返した結果 snapshot の source key を照合して前後を求める。
+  wire の Duplicate/CapacityRejected 等の意味と件数は変更していない。
+  受理後に actor が失敗した場合に備える初期行も、受理前 snapshot 同士で作る。
+  追加だけでなく、同じ項目を繰り返して外す場合にも同じ所属基準を適用した。
+  回帰: 満杯への `[X, X]` の両行は未登録→未登録、既存メンバーは登録済み→登録済み、
+  同じ呼び出しで追加された項目の重複行は未登録→登録済み、繰り返し削除は登録済み→未登録。
+- **P2: 同名コレクションへの操作を識別できない記録**。
+  `ChangeRecord` に `Option<CollectionTarget { id, name }>` を設け、add/remove が snapshot の
+  id/name を受理前に保持する。受理後の失敗記録にも対象を残す。展開した記録と個別行の表示、
+  記録全体/個別行のコピーに両方を含める。create/rename と後続のタグ/★用の記録では必須にしない。
+  回帰: 実 actor で同名の2コレクションへの add/remove を行い各 id/name を検証し、
+  headless UI でも同名2件の表示と両方のコピーボタンの CopyText を検証する。
+- **P3: 空の記録欄に検索 anchor がない**。
+  `pages::page_agent_integration` は `agent/changes` を常時描画し、見出し、
+  「mIV を閉じると消えます。最新 100 回分を表示します。」、空なら「変更の記録はありません」を出す。
+  回帰: 実際の設定検索の entry を選び、anchor 消費/highlight と3つの文言の viewport 内表示を検証する。
+
+変更は `src/agent_ipc/{changes.rs,collection_write.rs,collection_write_tests.rs}`、
+`src/ui_dialogs/preferences/{agent_integration.rs,agent_integration/tests.rs,pages.rs}`、
+`src/app.rs` (既存テストの record 初期化)、影響する snapshot PNG、本節。
+actor、Remote、IPC wire、設定の保存、UI thread の I/O 経路は変更していない。
+
+#### 検証・PNG
+
+| コマンド | 観測者 | 実 exit | 結果 |
+|---|---|---:|---|
+| `cargo fmt` | root | 0 | workspace 全体。`target/mcp-stage2-1-review1-fmt.log` |
+| `cargo fmt --check` | root | 0 | `target/mcp-stage2-1-review1-fmt-check.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | root | 0 | 33.05s。`target/mcp-stage2-1-review1-core-check.log` |
+| collection + changes/App/preferences focused nextest (下記) | UI 担当 | 0 | 224/224。compile 3m59s、実行37.456s。`target/mcp-stage2-1-review-ui-focused.log` |
+| AI ページ8件だけ UPDATE_SNAPSHOTS=1 (下記) | UI 担当 | 0 | 8/8。実行2.75s。`target/mcp-stage2-1-review-ai-update.log` |
+| `cargo test -p mimageviewer --test ui_snapshot` (更新指定なし、全件比較) | UI 担当 | 0 | 222/222、実行41.39s。`target/mcp-stage2-1-review-ui-snapshot-all.log` |
+| `python scripts/check_ui_glyphs.py` | root | 0 | 危険な UI glyph なし。`target/mcp-stage2-1-review1-glyphs.log` |
+| `git diff --check` | root | 0 | LF/CRLF warning のみ。`target/mcp-stage2-1-review1-diff-check.log` |
+| `powershell -NoProfile -File scripts\build-dev.ps1 -PreserveRuntime` | root | 0 | 規約の確認用 build。core/remote/EPUB worker/MCP を `target/dev-runtime` に生成、PE check `runtime=4 pe=4` 成功。起動なし。`target/mcp-stage2-1-review1-build-dev.log` |
+
+指定された collection と changes/App/preferences の範囲を一つの focused run にまとめ、preferences は全体へ広げた。
+新規3テスト (同名対象の actor 記録、同名対象の表示/コピー、空の検索 anchor) と既存テストへの所属 assertion を含む。
+正確なコマンド:
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(agent_ipc::collection_write_tests) or test(agent_ipc::changes) or test(agent_change_ui_tests) or test(ui_dialogs::preferences)' --no-tests fail --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast
+$env:UPDATE_SNAPSHOTS = '1'
+cargo test -p mimageviewer --test ui_snapshot preferences_agent_
+Remove-Item Env:UPDATE_SNAPSHOTS
+cargo test -p mimageviewer --test ui_snapshot
+```
+
+変更した PNG は次の6枚だけ (新規なし、合計1,262,076 bytes)。root と UI 担当が全6枚を目視し、
+明暗とも空状態の3文言が読め、登録操作まで枠内に収まること、重なり/欠けがないことを確認した。
+
+- `tests/snapshots/preferences_agent_disabled_dark.png` (199,018 bytes)
+- `tests/snapshots/preferences_agent_disabled_light.png` (200,884 bytes)
+- `tests/snapshots/preferences_agent_open_dark.png` (224,559 bytes)
+- `tests/snapshots/preferences_agent_open_light.png` (226,610 bytes)
+- `tests/snapshots/preferences_agent_read_dark.png` (204,587 bytes)
+- `tests/snapshots/preferences_agent_read_light.png` (206,418 bytes)
+
+`preferences_agent_organize_light.png` / `preferences_agent_organize_dark.png` は byte 単位で不変。
+コレクション id/name は展開後の本文にあり、同名の表示/コピー回帰と長文500行・100/200%の既存 geometry 回帰で検証した。
+他の snapshot に更新指定はしていない。
+
+この修正で IPC/adapter や実 pipe の経路は変更しておらず、指定範囲外の crates/実 pipe テストは再実行していない。
+製品の対話確認は未実施。commit・製品起動・実 client config の操作はしていない。
+追加の設計矛盾や、3件の修正で残る未完項目はない。
+確認用 binary は通常 profile (portable feature なし) で、既定では実 `%APPDATA%\mimageviewer` を使う。
+利用者が確認する際は、常駐/インストール版を閉じてから
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+通常 profile の実設定・データを更新し得る。確認対象は AI 連携ページの空の記録欄への検索ジャンプ、
+同名コレクションへの変更記録を展開/コピーした時の id/name、容量不足の重複入力の前後の所属表示。
