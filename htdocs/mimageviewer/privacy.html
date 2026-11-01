@@ -119,7 +119,7 @@
       本アプリは利用者の PC 上で動作するデスクトップアプリケーションです。
       <strong>開発者が利用者の個人情報を収集・送信・販売することはありません。</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年10月10日</p>
+    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年11月1日</p>
   </section>
 
   <section>
@@ -128,6 +128,7 @@
       本アプリは、氏名・メールアドレス・位置情報・連絡先などの個人情報を利用者に求めません。
       アカウント登録やログインも不要です。<strong>開発者が利用者の情報や利用状況を受け取ることはありません</strong>。
       ファイルの場所や閲覧位置など利用に必要な情報は利用者の PC に保存され、リモート閲覧中は利用者の端末と PC の間でだけやり取りされます。
+      AI アプリとの連携では、AI アプリが情報を受け取り、その提供元へ送ります（「ネットワーク通信」を参照）。
     </p>
   </section>
 
@@ -144,6 +145,7 @@
     <p>本アプリは、動作に必要な次のデータを利用者の PC に保存します。リモート閲覧を有効にした場合、再生位置などは利用者の端末から PC へ送られます。開発者のサーバーへ送信されることはありません。外出先との暗号化された通信は Tailscale の中継サーバーを経由することがあります。</p>
     <ul class="pink-list">
       <li>アプリの設定・表示状態、動画・音声の再生位置とファイルごとに選んだ音声トラック</li>
+      <li>AI 連携の許可の範囲、縮小画像と撮影位置を AI に見せるかの設定</li>
       <li>本ごとの見開き1ページずらしの調整（記憶をOFFにしても保存済み調整は保持し、明示的に解除できます。メタ情報の移行で持ち運べます）</li>
       <li>音響調整 (EffeTune) の調整状態、プリセット、設定、取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像</li>
       <li>登録した SFZ 音源の名前と保存場所。サンプルファイルはコピーしません</li>
@@ -207,10 +209,23 @@
       そのファイルをどう扱うかは、そのアプリ側の動作になります。
     </div>
     <div class="info-box">
-      不具合を調べるための<strong>動作記録を利用者が有効にした場合</strong>は、
+      不具合を調べるための<strong>通常の動作記録は常に有効</strong>で、
       開いたファイルの場所を含む記録が PC 内の <code>logs</code> フォルダに残ります。
       これも外部へ送信されることはなく、不要になれば削除できます。
         診断ZIPを保存すると、保存済みログと保存完了・欠落の説明もPC内にまとめます。保存確認用の接続は同じPCの利用者だけが使えるもので、外部へ送信しません。
+    </div>
+    <div class="info-box">
+      AI 連携の要求の記録には、ツール名・所要時間・件数・結果やエラーの種類が残ります。
+      AI からの検索語や読み取り結果は、mImageViewer の履歴・診断ログへ保存しません。
+      AI にタグや★の変更を許可した場合は、通常の操作と共通の動作記録に、変更したファイルの場所やタグ名などが残ります。
+      「AI による変更」と「最近使った AI アプリ」の表示用の記録はメモリ内に持ち、本アプリを終了すると消えます。
+      変更済みのタグ・★・コレクションや、通常の動作記録はこの表示用の記録とは別に保存されます。
+    </div>
+    <div class="info-box">
+      AI アプリへの登録・登録解除は、その AI アプリの設定ファイルを書き換えます。
+      既存の設定ファイルを書き換える前に、同じ場所へファイル名の末尾が <code>.mimageviewer.bak</code> のバックアップを 1 つ保存し、次の書き換え時には上書きします。
+      mIV のアンインストールやポータブル版のフォルダ削除では、AI アプリ側の登録やバックアップは削除しません。不要なら先に「登録を外す」を使い、バックアップは手動で削除してください。
+      AI アプリ側の会話履歴・ログ・保存した結果は、そのアプリと提供元の設定・方針に従って扱われます。
     </div>
     <div class="info-box">
       起動の不具合を調べられるように、<strong>起動のたびに起動時の記録</strong>を PC 内に保存します
@@ -228,6 +243,16 @@
       <li><strong>更新確認</strong>: 新しいバージョンの有無を確認するため、配布元（GitHub）の公開リリース情報を取得します。通常の HTTP リクエストのみで、個人を特定する情報は送信しません。</li>
       <li><strong>任意コンポーネントのダウンロード</strong>: 利用者が自ら選択した場合に限り、AI 高速化用コンポーネント等を配布元から取得します。</li>
       <li><strong>音響調整の画面表示</strong>: 音響調整を開いている間、画面表示に使う Windows の機能 (WebView2) が、Microsoft に自身の更新を確認することがあります。曲名や画像は送信しません。</li>
+      <li><strong>AI アプリとの連携（既定では無効）</strong>: 有効にすると、mImageViewer は同じ PC に登録した AI アプリへ PC 内で情報を渡します。
+        <strong>受け取った情報を AI アプリがその提供元へ送ります。</strong>
+        ファイルの場所（絶対パス）・名前・種類・大きさ・寸法・日時、タグ・★、コレクションと登録内容、本棚・閲覧履歴・ブックマーク・検索結果、
+        撮影日時や機種などの EXIF、AI 生成画像のプロンプト・モデル名・生成条件などが対象です。
+        状態確認では、連携の許可設定・検索の準備状態・リモート閲覧中かどうか・アプリの版も渡します。
+        縮小画像と EXIF の撮影位置（GPS）欄は、それぞれの設定を有効にした場合に渡します（どちらも既定では無効）。
+        GPS 欄を無効にしても、ファイル名やプロンプトなどの文章に書かれた場所の情報を取り除くものではありません。
+        <strong>この連携では、mImageViewer 自身がインターネットへ情報を送信せず、連携で渡す情報が mImageViewer の開発者へ送られることもありません。</strong>
+        AI アプリと提供元による情報の扱いは、各社のプライバシーポリシーに従います。
+        <a href="manual/ai-integration.html">使い方と渡る情報を見る</a></li>
       <li><strong>クリップボード取り込み</strong>: クリップボードの取り込み監視は、環境設定のチェックを ON にしたときだけ動きます。コピーしたページの画像は、選択ダイアログを開いたときに、画像の URL へ GET を送って取得します。User-Agent は <code>mImageViewer/&lt;版&gt;</code> です。<br>
         参照元はブラウザの既定と同じ規則（strict-origin-when-cross-origin）で送ります。同じオリジン（通信方式・ホスト名・ポート）にはページの URL、別のオリジンにはオリジンだけを送り、HTTPS から HTTP へは送りません。ページの URL から認証情報と「#」以降を除きます。Cookie やブラウザのログイン情報は使わず、送信もしません。この機能では、画像取得のための通信以外に、コピー内容や画像を送信・収集しません。<a href="manual/clipboard-capture.html">使い方を見る</a></li>
       <li><strong>リモート閲覧（既定では無効）</strong>: 利用者が自ら有効にした場合に限り、
@@ -244,7 +269,7 @@
     </ul>
     <p>EPUB は PC 内で PDF に変換し、本に含まれる外部サイトへの要求を遮断します。Windows または Edge WebView2 に管理者や利用者がポリシーを設定している場合は、その設定に従います。</p>
     <p>
-      これらの通信先（GitHub / mikage.to、Microsoft、リモート閲覧を使う場合の Tailscale、クリップボード取り込みで画像を取得するサイト等）は、各社のプライバシーポリシーに従って
+      これらの通信先（GitHub / mikage.to、Microsoft、リモート閲覧を使う場合の Tailscale、クリップボード取り込みで画像を取得するサイト、AI アプリの提供元等）は、各社のプライバシーポリシーに従って
       通常のアクセスログ（IP アドレス等）を記録する場合がありますが、
       <strong>開発者がそれらの情報を取得・利用することはありません。</strong>
     </p>
@@ -255,8 +280,9 @@
     <p>
       mImageViewer 本体の画像 AI によるアップスケール・ノイズ除去・補完・自動判別などの処理は、
       <strong>すべて利用者の PC 内（GPU）で実行</strong>されます。
-      AI 処理のために画像を外部のサーバーへアップロードすることはありません。
+      これらの本体の画像 AI 処理のために、画像を外部のサーバーへアップロードすることはありません。
     </p>
+    <p>AI アプリとの連携は別の機能です。有効にすると、上の「ネットワーク通信」に記載した情報が AI アプリの提供元へ送られます。</p>
   </section>
 
   <section>
@@ -274,6 +300,7 @@
   <section>
     <h2>第三者への提供</h2>
     <p>開発者は利用者の情報を取得しないため、その情報を第三者へ提供することはありません。</p>
+    <p>AI アプリへ渡した情報は、開発者を経由せず、そのアプリと提供元の方針に従って扱われます。</p>
     <p>
       リモート閲覧を外出先から使う場合に必要な Tailscale は、本アプリとは別の会社が提供する
       ソフトウェアとサービスで、利用者自身が契約・設定します。その利用は
@@ -306,7 +333,7 @@
       mImageViewer ("the App") respects your privacy. The App is a desktop application that
       runs on your PC. <strong>The developer does not collect, transmit, or sell your personal information.</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">Last updated: October 10, 2026</p>
+    <p style="font-size:0.85rem; color:#888;">Last updated: November 1, 2026</p>
   </section>
 
   <section>
@@ -317,6 +344,7 @@
       information or any usage data.</strong> Information needed to use the App, such as file locations
       and viewing positions, is stored on your PC and, during remote viewing, travels only between your
       device and your PC.
+      With AI integration, the AI app receives information and sends it to its provider; see "Network communication" below.
     </p>
   </section>
 
@@ -328,6 +356,7 @@
     <p>The App stores the following data on your PC. When you enable remote viewing, playback progress and related information travel from your device to your PC. They are not sent to the developer's server. Encrypted traffic may pass through a Tailscale relay server when you connect from outside your home.</p>
     <ul class="pink-list">
       <li>Application settings and view state, video and audio playback positions, and the audio track selected for each file</li>
+      <li>The permission level for AI integration, and settings for showing reduced images and shooting locations to AI</li>
       <li>Per-book spread-pairing adjustments (saved adjustments remain when remembering is turned off and can be explicitly cleared or moved using metadata transfer)</li>
       <li>EffeTune adjustment state, presets, configuration, imported IR files and measurements, and visualizer layouts and background images</li>
       <li>Registered SFZ instrument names and locations. Sample files are not copied</li>
@@ -383,10 +412,27 @@
       the App uses the EPUB's filename.
     </div>
     <div class="info-box">
-      <strong>If you turn on operation logging</strong> to investigate a problem, the records
+      <strong>Normal operation logging is always enabled</strong> to help investigate problems. The records
       kept in the <code>logs</code> folder on your PC include the locations of the files you
       opened. These are not sent anywhere either, and you can delete them once you no longer
       need them.
+    </div>
+    <div class="info-box">
+      AI integration request logs record tool names, duration, counts, and outcome or error types.
+      mImageViewer does not save AI search queries or read results in its history or diagnostic logs.
+      If you allow AI to change tags or ratings, the operation logs shared with normal user actions
+      contain information such as the locations of changed files and tag names.
+      The display records for "AI changes" and "Recent AI apps" are held in memory and cleared when the App exits.
+      Saved changes to tags, ratings, and collections, and normal operation logs, are stored separately from these display records.
+    </div>
+    <div class="info-box">
+      Registering or unregistering an AI app changes that app's settings file.
+      Before changing an existing file, the App saves one backup alongside it with <code>.mimageviewer.bak</code>
+      appended to the filename. The next change overwrites that backup.
+      Uninstalling mIV or deleting its portable folder does not remove the registration or backup in the AI app's settings folder.
+      If you no longer need them, use the unregister button first and delete the backup manually.
+      Conversation history, logs, and saved results in the AI app are handled according to that app's
+      and its provider's settings and policies.
     </div>
     <div class="info-box">
       So that startup problems can be investigated, the App saves a <strong>startup record on your PC
@@ -404,6 +450,17 @@
       <li><strong>Update check</strong>: to see whether a newer version exists, the App retrieves the public release information from the distribution source (GitHub). This is an ordinary HTTP request and includes no personally identifying information.</li>
       <li><strong>Optional component download</strong>: only when you choose to, the App downloads optional components (such as AI acceleration packs) from the distribution source.</li>
       <li><strong>Audio adjustment display</strong>: while audio adjustment is open, the Windows feature used to display it (WebView2) may contact Microsoft to check for its own updates. It does not send song titles or artwork.</li>
+      <li><strong>AI app integration (off by default)</strong>: when enabled, mImageViewer passes information locally to an AI app registered on the same PC.
+        <strong>The AI app sends the information it receives to its provider.</strong>
+        This includes file locations (absolute paths), names, types, sizes, dimensions and dates; tags and ratings;
+        collections and their contents; bookshelves, viewing history, bookmarks and search results;
+        EXIF such as shooting dates and camera models; and AI image generation information such as prompts, model names and generation settings.
+        Status checks also return the integration permissions, search readiness, whether remote viewing is active, and the App version.
+        Reduced images and EXIF shooting-location (GPS) fields are passed when you enable their respective settings (both are off by default).
+        Turning off GPS fields does not remove location information written in text such as filenames or prompts.
+        <strong>For this integration, mImageViewer itself does not send information over the internet, and the information passed through the integration is not sent to mImageViewer's developer.</strong>
+        The AI app and provider handle it under their privacy policies.
+        <a href="manual/ai-integration.html">Read about setup and shared information</a></li>
       <li><strong>Clipboard capture</strong>: capture monitoring runs only when you turn on its checkboxes in Preferences. When you open the image selection dialog for a copied page, the App fetches its images by sending GET requests to the image URLs. Its User-Agent is <code>mImageViewer/&lt;version&gt;</code>.<br>
         Referrers follow the browser's default rule (strict-origin-when-cross-origin): the page URL for the same origin (scheme, host, and port), only the origin for a different origin, and no referrer when going from HTTPS to HTTP. Credentials and the fragment after "#" are removed from the page URL. Cookies and browser login information are neither used nor sent. This feature does not send or collect clipboard contents or images beyond the requests needed to fetch the images. <a href="manual/clipboard-capture.html">Read the manual</a></li>
       <li><strong>Remote viewing (off by default)</strong>: only when you turn it on, the App
@@ -419,7 +476,7 @@
     </ul>
     <p>The App converts EPUB to PDF on your PC and blocks requests to external sites included in the book. If an administrator or user has configured Windows or Edge WebView2 policies, conversion follows those settings.</p>
     <p>
-      These endpoints (GitHub / mikage.to, Microsoft, Tailscale when you use remote viewing, the sites that serve images fetched by clipboard capture, etc.) may record standard access logs (such as IP
+      These endpoints (GitHub / mikage.to, Microsoft, Tailscale when you use remote viewing, the sites that serve images fetched by clipboard capture, AI app providers, etc.) may record standard access logs (such as IP
       addresses) under their own privacy policies, but <strong>the developer does not obtain or
       use that information.</strong>
     </p>
@@ -430,8 +487,9 @@
     <p>
       Image upscaling, denoising, inpainting, and automatic classification in mImageViewer itself are performed
       <strong>entirely on your PC (GPU)</strong>. The App does not upload images to an external
-      server for AI processing.
+      server for these built-in image AI operations.
     </p>
+    <p>AI app integration is a separate feature. When enabled, the information listed under "Network communication" above is sent to the AI app's provider.</p>
   </section>
 
   <section>
@@ -449,6 +507,7 @@
   <section>
     <h2>Sharing with third parties</h2>
     <p>The developer does not obtain your information and therefore does not share that information with third parties.</p>
+    <p>Information given to an AI app is handled by that app and its provider under their policies, without passing through the developer.</p>
     <p>
       Tailscale, which you need in order to use remote viewing away from home, is software and
       a service from a different company; you sign up for it and configure it yourself. Your use
