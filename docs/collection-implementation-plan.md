@@ -2,6 +2,15 @@
 
 ## 1. 目的と正本
 
+§1.668（2026-11-01、案C）: PC root一覧のgeneric thumbnailはCollection間でdrive/UNC保持の
+実親catalogを共有する。cold/history/navigation/warm設置は同じcontext-owned poolを使い、
+可視要求の共通受付で元GridItemの親とcache-dir epochを固定する。全件prepareにcatalog I/Oを
+追加せず、workerの16 slot LRUで個別lookup/saveする。lookupは既存DBのROだけで、
+保存targetがpolicy/実測で保存を選んだ時だけRWを開く。非保存Autoで空DBを作らない。
+参照解除/Collection削除ではcacheを消さず、
+元フォルダfamily/全件/期限clearで削除する。音声・動画・pin seedと既存再prepare/
+presentation-source epoch、Remoteは従来経路。詳細は [catalog設計 §2.4](catalog-design.md)。
+
 本書は [`collection-spec-proposal.md`](collection-spec-proposal.md) の合意済み仕様を、
 現在のコード所有へ接続する実装計画である。仕様を狭めず、複数の名前付きコレクション、
 手動順と通常ソート、PC の編集 UI、登録元を開く表示、ナビゲーション・スライドショー・
@@ -1654,7 +1663,8 @@ Collection root は検索・スマートフォルダと同じ `lookup_many(GridI
 EPUB の元 source path を使う。root に ZipDir の単独登録はないため literal/effective alias は不要。
 入れ子 Folder→Folder→Video はスマートフォルダの `prepare_video_folder_pin_seeds` を共有する。動画 WebP の一括取得後は
 正規化キーで対応付け、表記違いで同じ動画に到達した全コンテナへ seed を渡す。seed key は検索と同じ full-path
-`Seeded#pin:{source_id}`。Collection の catalog 無しの worker へは完成済み in-memory CacheEntry map を渡す。
+`Seeded#pin:{source_id}`。Collection の worker へは完成済み in-memory CacheEntry map を渡す。
+video seedは親catalogのlookup/mirrorへ広げず、従来のメモリ優先を維持する。
 invalid WebP は worker で missing seed へ正規化し、prepare / install に UI での DB open / 書込 / decode / BLOB 全量コピーは足さない。
 `make_load_request` は他の集約一覧と同じ共通 resolver を使う。その既存の metadata / 入れ子 pin DB / 動画 WebP の
 UI 同期参照は、この低リスク修正でも許容する（設計担当判断 2026-09-30）。共通 resolver の worker 化は別の P3 §1.309 とし、

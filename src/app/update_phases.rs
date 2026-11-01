@@ -617,11 +617,11 @@ impl App {
         self.poll_reading_history_thumbnail_sources(ctx);
         if let Some(detail) =
             crate::catalog::CatalogAccess::for_cache_dir(&crate::catalog::default_cache_dir())
-                .take_audio_art_notice()
+                .take_cache_notice()
         {
-            crate::logger::log(format!("audio art cache notice: {detail}"));
+            crate::logger::log(format!("thumbnail cache notice: {detail}"));
             self.show_feedback_warning(
-                "音声画像のキャッシュを保存・参照できませんでした。次回に再生成します".to_owned(),
+                "サムネイルキャッシュを保存・参照できませんでした。必要ならキャッシュ管理から削除してください".to_owned(),
             );
         }
         self.poll_metadata_cleanup(ctx);

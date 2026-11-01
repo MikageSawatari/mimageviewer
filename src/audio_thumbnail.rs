@@ -180,7 +180,7 @@ pub(crate) fn generate_with_options(
     let report_cache_error = |error: &rusqlite::Error, proof: CatalogAdmission| {
         if access.is_admitted(proof) {
             crate::logger::log(format!("audio art catalog: {error}"));
-            access.record_audio_art_cache_error(error.to_string());
+            access.record_cache_error(error.to_string());
         }
     };
     if policy.allows_cache() {

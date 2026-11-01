@@ -286,6 +286,76 @@ impl CatalogWork {
     pub(crate) fn open(&self, folder: &Path) -> rusqlite::Result<CatalogDb> {
         CatalogDb::open_admitted(&self.cache_dir, folder, self.admission)
     }
+
+    pub(crate) fn identity(&self) -> (&Path, CatalogAdmission) {
+        (&self.cache_dir, self.admission)
+    }
+
+    pub(crate) fn open_existing(&self, folder: &Path) -> rusqlite::Result<Option<CatalogDb>> {
+        CatalogDb::open_existing_read_only_admitted(&self.cache_dir, folder, self.admission)
+    }
+
+    /// Collection's new namespace has no legacy thumbnail schema. Publish only
+    /// readers with all current columns, never a reader of a newly created file
+    /// whose writer has not installed `thumbnails` yet.
+    pub(crate) fn open_existing_collection_parent(
+        &self,
+        identity: &Path,
+    ) -> rusqlite::Result<Option<CatalogDb>> {
+        let access = self.access();
+        let _lease = access.lease(self.admission)?;
+        let path = db_path_for(&self.cache_dir, identity);
+        if !catalog_file_exists(&path)? {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        // One statement/snapshot decides the immutable reader capabilities.
+        // An incomplete valid SQLite file is a miss, not a cached legacy reader.
+        let columns = {
+            let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('thumbnails')")?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<HashSet<_>>>()?
+        };
+        let required = [
+            "filename",
+            "mtime",
+            "file_size",
+            "width",
+            "height",
+            "thumb_data",
+            "source_width",
+            "source_height",
+            "layout_width",
+            "layout_height",
+            "folder_provenance",
+            "selection_proof",
+        ];
+        if !required.iter().all(|column| columns.contains(*column)) {
+            return Ok(None);
+        }
+        Ok(Some(CatalogDb::from_connection(
+            conn,
+            access.clone(),
+            self.admission,
+            true,
+            true,
+        )))
+    }
+
+    pub(crate) fn access(&self) -> std::sync::Arc<CatalogAccess> {
+        CatalogAccess::for_cache_dir(&self.cache_dir)
+    }
+}
+
+/// New cache data only. The lexical Collection identity retains drive/UNC and
+/// never adopts the ambiguous basename rows of a legacy physical catalog.
+pub(crate) fn collection_source_parent_identity(parent: &Path) -> Option<PathBuf> {
+    let source = crate::collection_store::CollectionSourcePath::from_trusted(parent).ok()?;
+    let hash = format!(
+        "{:x}",
+        Sha256::digest(source.key().normalized_path().as_bytes())
+    );
+    Some(PathBuf::from("__collection_source_parent_v1__").join(hash))
 }
 
 impl Default for CatalogWork {
@@ -341,7 +411,7 @@ impl CatalogAccess {
     }
 
     /// One rebuildable-cache notice per process/cache directory; no retry state.
-    pub fn record_audio_art_cache_error(&self, detail: impl Into<String>) {
+    pub fn record_cache_error(&self, detail: impl Into<String>) {
         let mut inner = self.inner.lock().unwrap();
         if matches!(inner.audio_art_notice, AudioArtCacheNotice::Fresh) {
             inner.audio_art_notice = AudioArtCacheNotice::Pending(detail.into());
@@ -349,7 +419,7 @@ impl CatalogAccess {
     }
 
     /// Memory-only UI polling. A notice can be consumed only once.
-    pub fn take_audio_art_notice(&self) -> Option<String> {
+    pub fn take_cache_notice(&self) -> Option<String> {
         let mut inner = self.inner.lock().unwrap();
         if !matches!(inner.audio_art_notice, AudioArtCacheNotice::Pending(_)) {
             return None;
@@ -836,6 +906,7 @@ pub struct CatalogDb {
     database_path: Option<PathBuf>,
     has_layout_dims_columns: bool,
     has_folder_proof_columns: bool,
+    read_only: bool,
 }
 
 /// journal mode の変更は排他ロックを要求するため、**`busy_timeout` が効かない**。SQLite は
@@ -952,6 +1023,9 @@ impl CatalogDb {
         has_layout_dims_columns: bool,
         has_folder_proof_columns: bool,
     ) -> Self {
+        let read_only = connection
+            .is_readonly(rusqlite::DatabaseName::Main)
+            .unwrap_or(true);
         let database_path = connection
             .path()
             .filter(|path| !path.is_empty())
@@ -965,6 +1039,17 @@ impl CatalogDb {
             database_path,
             has_layout_dims_columns,
             has_folder_proof_columns,
+            read_only,
+        }
+    }
+
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    pub(crate) fn record_cache_error(&self, detail: impl Into<String>) {
+        if !self.is_retired() {
+            self.access.record_cache_error(detail);
         }
     }
 
@@ -2601,6 +2686,26 @@ pub(crate) fn delete_folder_cache_under_delete(
     cache_dir: &Path,
     parent: &Path,
 ) -> rusqlite::Result<bool> {
+    // One caller-owned deletion/drain covers both members. Do not turn a
+    // read-only Collection open/remove into cache-dir-wide retirement.
+    let legacy = delete_legacy_folder_cache_under_delete(cache_dir, parent);
+    let collection: rusqlite::Result<bool> = (|| {
+        let Some(identity) = collection_source_parent_identity(parent) else {
+            return Ok(false);
+        };
+        let path = db_path_for(cache_dir, &identity);
+        let existed = catalog_file_exists(&path)?;
+        delete_catalog_unit(&path)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        Ok(existed)
+    })();
+    Ok(legacy? | collection?)
+}
+
+fn delete_legacy_folder_cache_under_delete(
+    cache_dir: &Path,
+    parent: &Path,
+) -> rusqlite::Result<bool> {
     let path = db_path_for(cache_dir, parent);
     if !catalog_file_exists(&path)? {
         delete_catalog_sidecars(&path)
@@ -3862,25 +3967,25 @@ mod tests {
         let remote = CatalogAccess::for_cache_dir(temp.path());
         let old = local.admit();
         assert!(std::sync::Arc::ptr_eq(&local, &remote));
-        assert!(local.take_audio_art_notice().is_none());
-        local.record_audio_art_cache_error("local save failed");
-        remote.record_audio_art_cache_error("remote lookup failed");
+        assert!(local.take_cache_notice().is_none());
+        local.record_cache_error("local save failed");
+        remote.record_cache_error("remote lookup failed");
         assert_eq!(
-            remote.take_audio_art_notice().as_deref(),
+            remote.take_cache_notice().as_deref(),
             Some("local save failed")
         );
-        assert!(local.take_audio_art_notice().is_none());
+        assert!(local.take_cache_notice().is_none());
         let deletion = local.begin_delete(CatalogDeleteOperation::All).unwrap();
         assert!(!local.is_admitted(old));
         deletion.retire_connections();
         drop(deletion);
-        local.record_audio_art_cache_error("later failure");
-        assert!(local.take_audio_art_notice().is_none());
+        local.record_cache_error("later failure");
+        assert!(local.take_cache_notice().is_none());
         let other = tempfile::tempdir().unwrap();
         let separate = CatalogAccess::for_cache_dir(other.path());
-        separate.record_audio_art_cache_error("different cache");
+        separate.record_cache_error("different cache");
         assert_eq!(
-            separate.take_audio_art_notice().as_deref(),
+            separate.take_cache_notice().as_deref(),
             Some("different cache")
         );
     }

@@ -24,7 +24,8 @@ pub enum CacheMaintTask {
     DeleteOld { days: u64 },
     /// .db をすべて削除。
     DeleteAll,
-    /// 指定フォルダに対応する 1 ファイルの .db を削除。
+    /// 指定フォルダの通常 catalog と Collection 用の実親 catalog を削除。
+    /// 通常 catalog 内の他 drive の audio scope は保持する。
     DeleteFolder {
         folder: PathBuf,
         /// Auto 比率キャッシュ側で削除するユーザー視点の対象。
@@ -683,7 +684,7 @@ pub(crate) fn run_audio_art_prune(
             if !access.is_admitted(admission) {
                 return 0;
             }
-            access.record_audio_art_cache_error(format!("audio art scope prune: {error}"));
+            access.record_cache_error(format!("audio art scope prune: {error}"));
             // Rebuildable cache failure: report once, no retry/recovery machinery.
             crate::logger::log(format!(
                 "audio art catalog prune failed: {}: {error}",

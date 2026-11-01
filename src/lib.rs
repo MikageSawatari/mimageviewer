@@ -2560,6 +2560,7 @@ mod tests {
     }
 }
 
+pub use ui_dialogs::draw_cache_manager_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_file_type_visibility_snapshot_fixture;
 pub use ui_dialogs::preferences::{
     draw_fullscreen_fit_cycle_settings, draw_fullscreen_specified_scale_live_settings,

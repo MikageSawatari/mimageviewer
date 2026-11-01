@@ -593,6 +593,13 @@ target clone を全件に行っていた。さらに可視優先範囲が移る�
 
 ### 4.4 コレクションの区間計測
 
+§1.668の親catalogは全件prepareで開かず、可視要求を処理する既存thumbnail worker内で遅延open/
+個別lookup/保存/closeする。UIの共通受付は元項目の親identityとepochだけを固定する。
+lookupは既存DBのROだけとし、不存在は存在確認でmiss。保存targetが実測policy/forceで保存を
+選んだ後だけRWを開く。非保存Autoのためのmkdir/schema初期化は行わない。
+`collection.thumb_catalog_open` / `thumb_catalog_lookup` のmsとhit、既存thumb encode/save区間で確認する。
+UIへcold openや最後の接続closeを持ち込まない。所有・上限は [catalog設計](catalog-design.md) を参照。
+
 ナビゲーション preflight の PDF 列挙は前面の要求として既存の Critical 列挙・合流を使う。
 v4.2.0 の staged 化で背景用 Normal に流れていたため、旧本の HighNormal サムネイルを
 待つ退行があった。同期待ちは preflight worker 上だけで行い、結果／取消通知の channel

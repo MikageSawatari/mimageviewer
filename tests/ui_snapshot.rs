@@ -29,6 +29,28 @@ use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
 
 #[test]
+fn cache_manager_collection_dark() {
+    snapshot_with_theme_at_size(
+        "cache_manager_collection_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(520.0, 280.0),
+        None,
+        mimageviewer::draw_cache_manager_snapshot_fixture,
+    );
+}
+
+#[test]
+fn cache_manager_collection_light() {
+    snapshot_with_theme_at_size(
+        "cache_manager_collection_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(520.0, 280.0),
+        None,
+        mimageviewer::draw_cache_manager_snapshot_fixture,
+    );
+}
+
+#[test]
 fn thumbnail_filename_width_dark() {
     snapshot_with_theme_at_size(
         "thumbnail_filename_width_dark",

@@ -57,7 +57,8 @@ normalize(path):
 別のドライブレターでマウントされても同じキャッシュにヒットする。
 
 > 注意: `C:\photos` と `D:\photos` は同一ハッシュになる。これは意図的な設計で、
-> パスが同じならキャッシュを共有する（mtime/file_size で整合性チェックするため実害なし）。
+> パスが同じならキャッシュを共有する。mtime/file_size が等しい別内容は区別できないという
+> 旧方式の制約がある。この行をコレクションの新しい保存先へコピーしない。
 
 **例外: ドライブルート catalog**: `C:\` / `D:\` のようなルートだけはドライブ文字を
 保持してハッシュ化する。ルート catalog は直下項目を `Photos` や `cover.jpg` のような
@@ -77,6 +78,57 @@ basename / full-path key で持つため、ドライブ文字を落とすと `C:
 ```
 
 ### 2.4 クリアの接続所有権と削除単位（backlog §2.12、2026-10-19）
+
+#### コレクションの元フォルダ共有（§1.668、案C、2026-11-01）
+
+PC Collection root の generic worker は、元の論理項目の実親を `CollectionSourcePath` の
+lexical規則で正規化し、drive/UNC保持のSHA-256を `__collection_source_parent_v1__/<hash>`
+として既存 `db_path_for` へ渡す。行は従来のfull-path request keyのまま。Collection間で共有する。
+通常Folder/Smart/Search/Remoteの宛先、旧hash/schema/行は変えず、旧行のコピー・移行はない。
+新規cacheだけを追加し、出荷済み `collection.db` は変更しない。
+
+全件prepareでcatalogを読まない。共通要求受付で元GridItemの親と `CatalogWork` を固定し、
+`ThumbnailCatalogProvider` の FixedCatalog / CollectionSourceParents を既存poolが所有する。
+workerだけで個別lookup、stamp/proof検証、miss生成と既存policyによる保存を行う。
+LRUはpoolごとに16 slot。lock下はslotの移動だけ、open/SQL/closeはlock外。
+同一slotの初期化はOnceLockに集約する。RO/RWを区別した合計16 slotを保持し、これに加えて
+実行中workerごと最大2接続（lookupのROと保存時のRW）を保持し得る。
+RAW follow-upは接続ではなく元scope/admission、FixedのPDF catch-upは既存有界queueの接続leaseを保持する。
+新providerの接続をUIへ置かず、空一覧/context retire/App dropも最後のpool Arcを退出workerで解放する。
+
+lookupはpolicyにかかわらず存在する新DBだけROで開き、warm RW slotを借りない。
+不存在はファイル存在確認だけでmissとし、空DB・hash directory・schemaを作らない。
+新namespaceのRO接続は必須thumbnail列を一つのSQLite snapshotで確かめてから登録・公開する。
+初回RW作成中の未完成schemaはmissとし、不完全な列情報の接続をLRUへ残さない。
+従来のlegacy互換RO openは変更しない。SQLite/I/Oの実エラーは既存のログ・一回通知を使う。
+SourceOnlyはlookupを行わない。missはLRUへ固定せず、後続要求や兄弟contextの保存を次回参照できる。
+`ThumbnailSaveTarget` がFixedの既存接続またはCollectionの元親・pool・受付時`CatalogWork`を所有し、
+force例外または既存policyの実測判定が保存を選んだ後だけRWを開く（なければ作る）。
+lookup接続の有無を保存可否へ使わず、非保存Autoは空DBを作らない。
+RO接続を保存/PDFメタ補完へ渡さず、メタ補完は従来のFixed writableだけで行う。
+PDF Harvestの静的資格は保存targetから判定し、Fixedの従来gateとCollectionのOff/force条件を維持する。
+削除前のwriter epochを更新せず、CacheOnlyだけ既存の一回RO継続を使う。
+pin/EPUB/RAW派生は元scopeを継承する。EPUB fallback再帰も元providerを引き継ぎ、
+lookup済みROをFixed保存先へ付け替えない。video/frame-pin seedは従来のメモリ優先。
+旧catalog由来の再帰 `CachedPinned` は表示を維持し、新DBへmirrorしない。
+保存先はproviderの `save_target` だけで決める。要求のCollection親scopeは候補のidentity/admissionであり、
+Collectionから開いた実フォルダ（PhysicalSource）ではFixedが優先する。Fixed宛ての再帰pinは
+要求scopeに関係なく従来どおり保存・map反映し、再訪時に再帰探索を省く。
+mtime秒/size、policy、pin世代、Folder proof、PDF source/layout寸法、idle品質更新は維持する。
+
+参照解除/Collection削除ではDBを消さず、inventory pruneも追加しない。未使用行やvariantは
+明示/期限clearまで残り得る。全件/期限削除・容量集計・保存先設定には通常hash配置として含まれる。
+元フォルダ指定削除は、一回のbegin-delete/drain/retire下で旧catalogのaudio scope保護と
+新親DB一式の削除を行う。他driveの新DBを消さず、DB削除失敗時にWAL/SHMだけを消さない。
+Collection rootの `current_folder=None` と削除無効は維持する。UI件数はカタログ数。
+まれな失敗はログ＋既存一回通知、明示clear後の再生成で割り切り、retry/rollback/自動修復は加えない。
+source生成可能なら元decodeへ進み、CacheOnly missは元ファイルを開かない。
+
+簡素化: UUID寿命・参照解除prune・専用worker・全件BLOB seedを持たせず、既存poolと元親単位へ集約。
+modal化/別windowの閉じ直しはスクロールと並行閲覧を制限するため採用しない。
+検証・計測は [backlog §1.668](next-release-backlog.md) の実装記録を参照。
+
+#### 既存の削除境界と検証記録（§2.12）
 
 調査基点は `be318299f`。利用者の2026-08-20実測は、クリア＋再起動後に対応DBのない
 WAL 1,410件（1,394.8 MB）とSHM 1,410件（44.1 MB）が残ったというもの。
@@ -451,4 +503,5 @@ fn path_to_db_path(cache_dir: &Path, folder_path: &Path) -> PathBuf {
 - `cache_dir` が存在しない場合は自動作成する（サブディレクトリ含む）
 - カタログのバージョンが変わった場合（スキーマ変更時）はそのDBを削除して再生成
 - SQLite の WAL モードを使用することでロック競合を最小化
-- 同一パス（ドライブ文字違い）のキャッシュ衝突は mtime/file_size チェックで実害なし
+- 通常catalogのdrive-letter継承は維持するが、同mtime/file_sizeの別内容は識別できない。
+  Collectionの新catalogはdrive/UNC保持の実親scopeへ分離する。

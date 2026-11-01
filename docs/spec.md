@@ -1,5 +1,13 @@
 # mimageviewer 仕様書
 
+§1.668: PCコレクション一覧の画像/本代表サムネイルは、drive/UNC保持の元フォルダ単位で
+Collection間共有の永続cacheを使う。通常フォルダ用とは別で、既存policyとidle品質更新を維持する。
+lookupは既存DBのROだけで行い、保存先はpolicy/実測で保存を選んだ後だけRWで開く。
+非保存Autoの閲覧だけでは空DBを作らない。
+参照解除やCollection削除では消さず、全件/期限/元フォルダを開いてのcache削除の対象とする。
+Collection rootで現在フォルダ削除は無効。Remoteのcache経路は変更しない。
+詳細は [catalog設計](catalog-design.md)、検証・計測はbacklog §1.668。
+
 ### 前回の正常終了を確認できない場合（§1.482 段A）
 
 通常 GUI の開始/終了を小資料に記録し、前回 Running のままなら次回の通常 root 描画時に、原因未記録であることと最終記録時刻を表示する。本文は明示操作でコピーでき、閉じるまで保持する。強制終了・OS終了・電断・保存失敗と crash を区別しない。正常/制御Err return、二重起動、worker/help、play-test/test-script/DComp 試験は異常終了通知へ流用しない。ファイル名・パス・検索語・任意エラー本文を小資料/コピーへ含めず、自動送信しない。記録は今回/前回の2 run、通常版LOCALAPPDATAの起動記録配下、portable/明示data_dirは当該dataのlogs/startup配下へ保存する。AI/GPU checkpoint と fatal 観測、ORT 即時通知は後続段。詳細は [確定設計](ai-crash-655-investigation.md#確定設計-2026-10-30)。
