@@ -28515,6 +28515,7 @@ mod grid_reclick_open_tests {
     struct HandlerState {
         app: AppTestEnvForTest,
         activations: usize,
+        click_batches: Vec<(usize, bool)>,
         touch_derived_pointer_activity: bool,
         background_navs: Vec<AddressBarNav>,
         close_popup_before_background: bool,
@@ -28537,6 +28538,7 @@ mod grid_reclick_open_tests {
         let state = HandlerState {
             app,
             activations: 0,
+            click_batches: Vec::new(),
             touch_derived_pointer_activity,
             background_navs: Vec::new(),
             close_popup_before_background: false,
@@ -28610,6 +28612,30 @@ mod grid_reclick_open_tests {
                             {
                                 state.activations += 1;
                             }
+                        }
+                        if ctx.input(|input| input.pointer.primary_clicked()) {
+                            let releases = ctx.input(|input| {
+                                input
+                                    .pointer
+                                    .released_buttons_with_click_counts()
+                                    .filter(|(button, click)| {
+                                        *button == egui::PointerButton::Primary && click.is_some()
+                                    })
+                                    .count()
+                            });
+                            let response = ctx
+                                .data(|data| {
+                                    data.get_temp::<egui::Response>(egui::Id::unique((
+                                        "grid_cell_input_response",
+                                        state.app.grid_scroll_context_id(),
+                                        0,
+                                    )))
+                                })
+                                .unwrap();
+                            state.click_batches.push((
+                                releases,
+                                response.double_clicked_by(egui::PointerButton::Primary),
+                            ));
                         }
                         state
                             .app
@@ -30283,6 +30309,82 @@ mod grid_reclick_open_tests {
         click_cell(&mut harness, 0, egui::Modifiers::NONE);
         click_cell(&mut harness, 0, egui::Modifiers::NONE);
         assert_eq!(harness.state().activations, 1);
+    }
+
+    /// Investigation witness for §1.680: preserve the current failure until the
+    /// design owner replaces this with the intended activation assertion.
+    #[test]
+    fn section1680_double_click_in_one_pass_collapses_to_selection_only() {
+        for open_selected in [false, true] {
+            for selected in [None, Some(0)] {
+                let mut harness = handler_harness(
+                    GridClickSelectionMode::Explorer,
+                    open_selected,
+                    selected,
+                    false,
+                    false,
+                );
+                let pos = cell_rect(0).center();
+                harness.hover_at(pos);
+                harness.run();
+                harness.input_mut().events = [true, false, true, false]
+                    .into_iter()
+                    .map(|pressed| egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    })
+                    .collect();
+                harness.run();
+                assert_eq!(harness.state().click_batches, vec![(2, true)]);
+                assert_eq!(harness.state().app.selected, Some(0));
+                assert_eq!(
+                    harness.state().activations,
+                    usize::from(open_selected && selected == Some(0))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn section1680_two_click_passes_and_four_edge_passes_activate_after_focus_return() {
+        for split_edges in [false, true] {
+            let mut harness =
+                handler_harness(GridClickSelectionMode::Explorer, false, None, false, false);
+            // The ROOT pair is explicitly retired on focus loss, as when leaving
+            // the grid; a new valid double click must not need a previous pair.
+            harness.input_mut().events = vec![egui::Event::WindowFocused(false)];
+            harness.run();
+            harness.input_mut().events = vec![egui::Event::WindowFocused(true)];
+            harness.run();
+            let pos = cell_rect(0).center();
+            harness.hover_at(pos);
+            harness.run();
+            if split_edges {
+                for pressed in [true, false, true, false] {
+                    harness.input_mut().events = vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }];
+                    harness.run();
+                }
+            } else {
+                click_cell(&mut harness, 0, egui::Modifiers::NONE);
+                click_cell(&mut harness, 0, egui::Modifiers::NONE);
+            }
+            assert_eq!(harness.state().click_batches.len(), 2);
+            assert!(
+                harness
+                    .state()
+                    .click_batches
+                    .iter()
+                    .all(|(count, _)| *count == 1)
+            );
+            assert_eq!(harness.state().activations, 1, "split_edges={split_edges}");
+        }
     }
 
     #[test]
