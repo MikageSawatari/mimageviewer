@@ -252,6 +252,9 @@ pub struct ViewportState {
     /// Which widgets are under the pointer?
     pub hits: WidgetHits,
 
+    // Immutable press witnesses for integrations replaying batched pointer input.
+    pointer_button_targets: Vec<(Pos2, crate::PointerButton, bool, Option<Id>, bool)>,
+
     /// What widgets are being interacted with this pass?
     ///
     /// Based on the widgets from last pass, and input in this pass.
@@ -540,6 +543,51 @@ impl ContextImpl {
             } else {
                 WidgetHits::default()
             };
+
+            // Unlike the aggregate Response, this read-only witness resolves each
+            // press at its own position. Preserve the single cross-button capture:
+            // another press cannot replace it, and every release retires it.
+            let mut capture = self
+                .memory
+                .interaction_mut()
+                .potential_click_id
+                .filter(|id| viewport.prev_pass.widgets.contains(*id));
+            viewport.pointer_button_targets.clear();
+            for event in &viewport.input.events {
+                match *event {
+                    crate::Event::WindowFocused(false) => capture = None,
+                    crate::Event::PointerButton {
+                        pos,
+                        button,
+                        pressed,
+                        ..
+                    } => {
+                        if pressed && capture.is_none() {
+                            capture = crate::hit_test::hit_test(
+                                &viewport.prev_pass.widgets,
+                                &layers,
+                                &self.memory.to_global,
+                                pos,
+                                self.memory.options.style().interaction.interact_radius,
+                            )
+                            .click
+                            .map(|widget| widget.id);
+                        }
+                        let allowed = capture.is_none_or(|id| {
+                            viewport.prev_pass.widgets.get(id).is_some_and(|widget| {
+                                widget.enabled && self.memory.allows_interaction(widget.layer_id)
+                            })
+                        });
+                        viewport
+                            .pointer_button_targets
+                            .push((pos, button, pressed, capture, allowed));
+                        if !pressed {
+                            capture = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
 
             viewport.interact_widgets = crate::interaction::interact(
                 &viewport.interact_widgets,
@@ -1761,6 +1809,23 @@ impl Context {
             })
         })
         .map(|widget_rect| self.get_response(widget_rect))
+    }
+
+    /// Immutable per-edge widget owners, captured at begin_pass from the previous
+    /// widget tree with the normal hit-test, layer/modal gates and button capture.
+    /// Each entry carries the raw position, button, edge, captured id and eligibility so integrations can reject
+    /// input consumed by an earlier handler instead of shifting the witnesses.
+    /// This does not change the aggregate Response or normal egui interaction.
+    #[must_use]
+    pub fn pointer_button_targets(
+        &self,
+    ) -> Vec<(Pos2, crate::PointerButton, bool, Option<Id>, bool)> {
+        self.read(|ctx| {
+            ctx.viewports
+                .get(&ctx.viewport_id())
+                .map(|viewport| viewport.pointer_button_targets.clone())
+                .unwrap_or_default()
+        })
     }
 
     /// Rectangles that could receive pointer input in the last completed pass.
@@ -6267,3 +6332,179 @@ mod stage3_viewport_retirement_tests {
 #[cfg(test)]
 #[path = "discard_texture_delivery_tests.rs"]
 mod discard_texture_delivery_tests;
+
+#[cfg(test)]
+mod miv_pointer_button_target_tests {
+    use super::*;
+    use crate::{Event, Modifiers, PointerButton, RawInput, Sense};
+
+    fn rect(index: usize) -> Rect {
+        Rect::from_min_size(
+            Pos2::new(20.0 + 100.0 * index as f32, 20.0),
+            Vec2::splat(80.0),
+        )
+    }
+    fn id(index: usize) -> Id {
+        Id::unique(("press_target_test", index))
+    }
+    fn edge(index: usize, button: PointerButton, pressed: bool) -> Event {
+        Event::PointerButton {
+            pos: rect(index).center(),
+            button,
+            pressed,
+            modifiers: Modifiers::NONE,
+        }
+    }
+    fn pass(ctx: &Context, events: Vec<Event>, overlay: Option<bool>) {
+        ctx.run_pass(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(300.0))),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    for index in 0..2 {
+                        ui.interact(rect(index), id(index), Sense::click());
+                    }
+                    if let Some(enabled) = overlay {
+                        ui.add_enabled_ui(enabled, |ui| {
+                            ui.interact(rect(1), id(2), Sense::click());
+                        });
+                    }
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+    }
+    #[test]
+    fn witnesses_keep_edge_positions_and_shared_button_capture() {
+        let ctx = Context::default();
+        pass(&ctx, vec![], None);
+        pass(
+            &ctx,
+            vec![
+                edge(0, PointerButton::Primary, true),
+                edge(1, PointerButton::Secondary, true),
+                edge(1, PointerButton::Secondary, false),
+                edge(0, PointerButton::Primary, false),
+                edge(1, PointerButton::Primary, true),
+                edge(1, PointerButton::Primary, false),
+            ],
+            None,
+        );
+        let witnesses = ctx.pointer_button_targets();
+        assert_eq!(
+            witnesses.iter().map(|edge| edge.3).collect::<Vec<_>>(),
+            vec![
+                Some(id(0)),
+                Some(id(0)),
+                Some(id(0)),
+                None,
+                Some(id(1)),
+                Some(id(1))
+            ]
+        );
+        assert_eq!(witnesses[1].0, rect(1).center());
+        assert_eq!(witnesses[1].1, PointerButton::Secondary);
+        assert!(witnesses[1].2 && witnesses[1].4);
+        assert!(!witnesses[2].2);
+    }
+    #[test]
+    fn carried_capture_release_precedes_a_new_widget_click() {
+        let ctx = Context::default();
+        pass(&ctx, vec![], None);
+        pass(&ctx, vec![edge(0, PointerButton::Secondary, true)], None);
+        pass(
+            &ctx,
+            vec![
+                edge(0, PointerButton::Secondary, false),
+                edge(1, PointerButton::Primary, true),
+                edge(1, PointerButton::Primary, false),
+            ],
+            None,
+        );
+        assert_eq!(
+            ctx.pointer_button_targets()
+                .iter()
+                .map(|edge| edge.3)
+                .collect::<Vec<_>>(),
+            vec![Some(id(0)), Some(id(1)), Some(id(1))]
+        );
+    }
+    #[test]
+    fn vanished_capture_does_not_block_a_new_press() {
+        let ctx = Context::default();
+        pass(&ctx, vec![], None);
+        ctx.write(|inner| {
+            inner.memory.interaction_mut().potential_click_id = Some(Id::unique("vanished"))
+        });
+        pass(&ctx, vec![edge(1, PointerButton::Primary, true)], None);
+        assert_eq!(ctx.pointer_button_targets()[0].3, Some(id(1)));
+    }
+    #[test]
+    fn same_layer_overlay_preserves_its_identity_and_disabled_gate() {
+        for enabled in [false, true] {
+            let ctx = Context::default();
+            pass(&ctx, vec![], Some(enabled));
+            pass(
+                &ctx,
+                vec![edge(1, PointerButton::Primary, true)],
+                Some(enabled),
+            );
+            let witness = ctx.pointer_button_targets()[0];
+            assert_eq!(witness.3, Some(id(if enabled { 2 } else { 1 })));
+            assert!(witness.4);
+            if !enabled {
+                ctx.write(|inner| inner.memory.interaction_mut().potential_click_id = Some(id(2)));
+                pass(
+                    &ctx,
+                    vec![edge(1, PointerButton::Secondary, true)],
+                    Some(false),
+                );
+                let blocked = ctx.pointer_button_targets()[0];
+                assert_eq!(blocked.3, Some(id(2)));
+                assert!(!blocked.4);
+            }
+        }
+    }
+    #[test]
+    fn first_child_pass_initializes_capture_without_retiring_root() {
+        let ctx = Context::default();
+        pass(&ctx, vec![], None);
+        pass(&ctx, vec![edge(0, PointerButton::Primary, true)], None);
+        let child = ViewportId::from_hash_of("press-target-child");
+        for events in [
+            vec![],
+            vec![
+                edge(1, PointerButton::Secondary, true),
+                edge(1, PointerButton::Secondary, false),
+            ],
+        ] {
+            let mut raw = RawInput {
+                viewport_id: child,
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(300.0))),
+                events: events.clone(),
+                ..Default::default()
+            };
+            raw.viewports.entry(child).or_default().parent = Some(ViewportId::ROOT);
+            ctx.run_pass(raw, |ctx| {
+                assert_eq!(ctx.viewport_id(), child);
+                let witnesses = ctx.pointer_button_targets();
+                if events.is_empty() {
+                    assert!(witnesses.is_empty());
+                } else {
+                    assert!(witnesses.iter().all(|edge| edge.3 == Some(id(1)) && edge.4));
+                }
+                ctx.root_ui(|ui| {
+                    for index in 0..2 {
+                        ui.interact(rect(index), id(index), Sense::click());
+                    }
+                });
+            })
+            .drop_without_applying_deltas();
+        }
+        pass(&ctx, vec![edge(0, PointerButton::Primary, false)], None);
+        assert_eq!(ctx.pointer_button_targets()[0].3, Some(id(0)));
+    }
+}
