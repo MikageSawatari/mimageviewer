@@ -52,6 +52,50 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - §1.456 一覧の名前の文字サイズ・最大行数 (>>629): 出荷の案内は未。
 - §1.480 画像フォルダを Enter で開くと自動表示が ON でもページ一覧で止まる (>>649 の調査中に開発側で発見、v4.2.0 から): >>649 の評価フィルタの件は開発側で再現しなかった。報告者へは未返信。
 
+### 1.678 Ctrl+↓で直下が複数フォルダだけのZIPへ移ると独立viewerが閉じる (2026-11-01 原因調査)
+
+- 状態: **原因調査・再現テストのみ。製品コード未修正、製品起動・commitなし**。設計担当ClaudeCodeからの依頼で `inv-ctrl-down-close` / `8ff7fed9b` を調査。§1.670の終了帰路撤去とは別の既存不具合。修正設計・独立設計レビュー・受入は未実施。
+- 観測の出典: サブPC担当が2026-11-01、master `78bd5b6a3` のportable／隔離データで画面操作して観測。閲覧履歴から独立窓で `zip_flat.zip`（直下16画像）を開き、→2回→Ctrl+↓で `zip_inner_folders.zip`（`inner_A/001.jpg..010.jpg`、`inner_B/…`）へ移ると窓が閉じ、mainは閲覧履歴のまま。本調査は `C:\miv-subpc\results\notes.md` §6と同ディレクトリの `logs/mimageviewer.log`・`perf_events.jsonl` を読み、実機操作の追試はしていない。
+
+#### 確認済みの経路と、不成立だった説明
+
+1. `handle_fullscreen_ctrl_nav_context`（`src/ui_fullscreen.rs`）は独立静止画の `DetachedPhysical` を検索等の分岐より先に処理し、`effective_folder()` 起点の `FolderNavMode::Fullscreen` を窓のbundleで開始する。main/linkedが後段で使う `zip_nav_dfs_fullscreen` はこの分岐では呼ばない。今回のflat ZIPには内部の次章がないので、これは今回の移動先選定の相違原因ではないが、内部章を持つ既存readerの次操作も修正時の棚卸し対象。
+2. `spawn_folder_nav` → `folder_tree::folder_has_still_image_with_memo` → `folder_qualifies` は、ZIPの**全階層**から `first_visible_image_entry` が1画像見つかれば停止対象とする。perf seq=93: t=5172.857 `dfs_begin`、5172.858 `dfs_end found=true hit_image_folder=true hit_path=…zip_inner_folders.zip`。空書庫としてskipされたのではなく、このZIPへの移動が成功扱いで受理された。
+3. `apply_folder_nav_result` → `close_fullscreen_for_folder_nav_reopen` → `load_folder_nav_target` → `load_zip_as_folder`。旧窓ID=1／HWND=0x160b5cを再利用し、`reopen_fullscreen_after_folder_nav_load` は `DeferredFsReopen { target: None, … }` を置いて列挙を待つ。perf t=5172.861 `apply_end reason=enumerate_defer`。この時点の `items=[]` は正常な列挙待ちであり、ここでは閉じていない。
+4. t=5172.891に20画像を認識、5172.896 `archive/items_installed item_count=2`、同世代 `9223372041149743106`。`ZipNavState::new`／`ZipTree::collapse_redundant` は「直下画像0・子1」のときだけラッパーを降りる。子2個なのでrootのまま、採用行は `ZipDir(inner_A/)` と `ZipDir(inner_B/)`。**画像デコード失敗や空のitemsではなく、確定した分岐一覧**である。
+5. `inner_A - mimageviewer` は内部への自動降下の証拠ではない。keep-alive builderがタイトル算出に仮のindex=0を渡し、`detached_image_snapshot_title_for_idx` が `items[0].name()` を使ったもの。ログも `source=keep_alive_holdover fs_idx=0 items_len=2 main_fs_idx=None`。この `main_fs_idx` はmount中の `self.fullscreen_idx` を出すため、実際の閲覧indexは未設定である。
+6. sidecar／page identityの復元完了（5173.014〜5173.021）後、`finish_installed_zip_first_display` がdeferred要求をtakeし、`open_deferred_fullscreen_after_enumerate` → `find_fullscreen_nav_target_filtered` が現在階層のimage-likeを探す。代替コンテナ探索も `ZipFile` / `PdfFile` / `ConvertibleArchive` だけで、**`ZipDir` は選ばず内部DFSもしない**。`NoPlayableItem` → `finish_visible_container_fs_nav_failed` でnavigation sequenceを終える。既に表示済みのReady sessionは `terminate_active_detached_open_before_viewport` の初回Preparing/Building対象外なので、ここでは明示terminalにならない。
+7. fullscreen indexなし、deferred/pendingなし、`fs_viewport_shown=true` となり、`keep_fullscreen_viewport_alive` のcleanupへ落ちる。t=5173.022 `active-detached-session clear reason=keep_alive_cleanup` → Visible(false)、5173.035 unbind。`update_active_viewer_context` の `fullscreen_idx=None && !active_detached_transition_outstanding() && !fs_viewport_shown` によりbundleも退役する。user closeではないのに「indexも待機もない」をclose intentとして扱った終端であり、BA-5/BA-7の境界。
+
+#### 仕様判定と比較
+
+- **不具合と判断する範囲**: 画像を持つ移動先を成功扱いで採用し、使用中の独立readerを通知なく失わせること。画像0件の正常なclose仕様が根拠ではない。`fullscreen-navigation-consistency.md` §2.2は画像なしでは境界案内、stage-folder-nav §2は移動時に窓ID・位置・サイズ維持、同§2.1はindex/pending/shownからterminalを推測しない契約。現状は「全階層で資格確認」と「現在階層で表示解決」が異なる単位を見ており、後段のcleanupが失敗をcloseへ変換する。
+- **未決定の仕様**: このZIPへCtrl+↓で入った際、最初の内部本へ着地するか、分岐一覧を提示するか、表示可能なscopeが確定するまで旧本を保持して案内するか。全階層の画像をフラット化する仕様や、直接openも勝手に子へ降りる仕様は現在存在しない。§1.675の直接open設計も、直下ページがない場合の分岐一覧を維持している。原因調査だけでその仕様を変更しない。
+- main内閲覧／main所有のlinked F12: 同じ全階層資格判定後、mainのphysical-history preflight／hydrationを通り、結局rootの2行に対して先頭ページを解決できずfullscreenが解除される。mainには内部フォルダ一覧が残るので、その後Enter等で子を選べる。linked F12の窓は非表示になり、mainの同じ一覧が利用できる。**この操作の実機比較結果は今回取得していない**（サブPCメモの「対照」は通常closeの比較で、当該Ctrl+↓の比較ではない）。追加headless比較の範囲は下記。
+- 一覧から直接open: mainの自動ページ表示も同じroot/現在階層解決で2行の分岐一覧に留まる。単一wrapperはcollapseで画像階層になりページを表示できる。この正常なcollapseと、複数の子本の自動選択は別である。独立fresh openは同じ `NoPlayableItem` でもPreparing/Buildingのため、`terminate_active_detached_open_before_viewport("deferred_open_no_playable_item")` が明示的にClosingへ進める。既存Ready readerの今回の `keep_alive_cleanup` とは終端が異なる。
+- 兄弟経路: Ctrl+PageUp/PageDownも同じload/reopen/ZIP完了consumerを使うので同型の候補。RAR直読み／変換cacheのZIP backingもこのconsumerへ収束するが、当該素材では未実行。PDFの真の0ページ、Required leaf消失、構成による非表示、password取消などの正当な初回terminalは別契約として維持する必要がある。
+
+#### いつからか
+
+- **§1.670の新規退行ではない**。`2fe8f4605^` と `2fe8f4605` で、`folder_qualifies`、Ctrlハンドラ、apply後reopen、`find_fullscreen_nav_target_filtered`、deferred open/outcome、初回terminal、transition outstanding、keep-aliveの9関数は同一。§1.670は閉じた独立窓からmainへの帰還権限・consumerを撤去した変更で、今回の画像解決・close判定は変えていない。mainが履歴のままなのは採択済み仕様に沿う結果であり、それ自体が閉鎖原因ではない。
+- source履歴上は**独立窓の物理ナビ導入 `c754a1333`（2026-07-24）時点で同型の条件が揃う**。ZIP全階層の `first_image_entry` 停止、複数子をroot一覧へmaterialize、ZipDir非対象のページresolver、再open不成立後のkeep-alive cleanupが既にある。現在の `NoPlayableItem` enum化等より古い。これはsourceで確認した成立時点で、旧commitのビルド／実行bisectや、過去リリースすべてでの実機再現をした主張ではない。実ログで確認できる版は上記 `78bd5b6a3`。
+
+#### headless再現・検証
+
+- `src/app/tests/ctrl_down_close_1678.rs` に実ZIP・実DFS workerを使う調査テストを追加。製品コードは変更していない。通常設定は既存 `AppTestEnv` の一時data-dirに隔離し、egui headless passだけを使う。実アプリ・OS窓・OSキー入力は起動／使用しない。fixtureは同じ16画像→2フォルダ各10画像の構造をPNGで作り、初回content passでReadyになった後、既存ページindex=2を設定して共通Ctrlナビhandlerから処理する（→2回のraw input自体は再生しない）。実際の列挙・hydration・ページ解決を完了させ、現行keep-aliveでsessionがclearされること、mainの履歴surface・items・選択・scroll不変を検査した。sidecar backup ON/OFFとも同じ。`NoPlayableItem` という中間戻り値は実ログには出ていないため、その分岐の同定はsourceとこの再現結果の照合による。
+- main/linkedの比較fixtureはmain所有bundle＋linked presentationを使い、同じCtrlナビhandler・実DFS・physical-history preflight／hydrationを通してroot2行・fullscreenなしになることを確認した。実F12キー入力／HWNDの非表示／z-orderは未検証。直接openはmainのauto-open consumerと独立grid routerをそれぞれ検査し、複数子では分岐一覧（独立freshでは明示Closing）、単一wrapperではページ表示となった。
+- 検証対象は `8ff7fed9b` ＋本調査のテスト差分、通常features／test profile。すべて `$env:MSBUILDDISABLENODEREUSE = '1'` を指定。`cargo test -p mimageviewer --lib section1678 --no-fail-fast` は **4成功・0失敗・既知不具合1 ignored、exit 0**（`target/section1678-tests.log`）。既知不具合の期待契約テストはignoreとして保持し、`cargo test -p mimageviewer --lib section1678_regression_independent_ctrl_down_must_keep_usable_viewer -- --ignored` を明示実行すると **1失敗・exit 101**、失敗文言は `Ctrl+Down to a ZIP containing twenty pages silently closed the reader`（`target/section1678-known-failure.log`）。通常gateを赤くするためではなく、修正前の失敗を再実行できる証拠として残す。修正時には期待契約テストを有効化し、現誤動作のcharacterizationのassertも採択した正しい契約へ更新する。
+- 既存の `cargo test -p mimageviewer --lib zip_nav_ctrl_updown` は **3成功・exit 0**（内部DFS・wrapper・変換元キー、`target/section1678-internal-dfs.log`）、`cargo test -p mimageviewer --lib detached_folder_nav_boundary_keeps_current_pdf_and_window` は **1成功・exit 0**（真の境界では既存PDFと窓を保持、`target/section1678-boundary.log`）。`cargo fmt --check` はexit 0（`target/section1678-fmt.log`）、`git diff --check` も成功。原因調査／test-onlyのため全件gate・製品確認用build・実機起動は行っていない。
+
+#### 構造的な修正案（未採択・未実装）
+
+- 分類は**主BA-7（要求の表示解決とterminalの所有）、表出BA-5（keep-aliveがindex/pendingの欠如からcloseを生成）**。BA-1のhost誤同定、BA-4のviewport generation更新、BA-6のplacement不整合を示す証拠はない。sidecarの完了は不整合を表面化させた時点であり、待ち時間や追加guardを原因としない。
+- 推奨する設計の単位は「一覧を開く」と「本を読み継ぐ」のtypedな受付・完了契約。既存folder-nav request/worker/prepared listingの所有境界で、**資格を判定したものと実際に開けるscope/pageを対にして解決してからcommit**する。読書ナビとして内部本を対象にするなら、既存 `ZipNavState` の有限DFS・collapse・本別構成/読書位置を再利用して先頭の表示可能scopeを準備し、main/linked/独立へ同じ意味の着地を渡す。rootの直接一覧openはその意図を維持する。内部DFSの現行main/独立差、逆方向・兄弟移動も含め、子選択の仕様を設計担当が決めてから実装する。
+- 成立しない読書ナビは要求ownerが明示的な「不成立」として完了させる。使用中readerのitems/cache/閲覧位置を破壊する前に判定し、旧本保持＋既存の境界案内へ終える案がある。ただし「このZIPへ入れなくする」だけを既定修正にせず、mainの分岐一覧へ進める既存機能との違いを設計判断として明示する。独立窓でも一覧を出す案は専用窓の表示面設計が必要で規模が増す。
+- terminal closeは要求owner/runtimeの明示イベントから決める。keep-aliveに `ZipDir` 特例を足す、pending boolを増やす、空indexのまま永久保持する、遅延／retry／repaint／窓の閉鎖再生成で隠す案は採らない。root causeのtarget解決と、rendererがclose権限を推測する境界を一緒にレビューする。deferred viewportへの全面R4移行だけでは移動先ページの未解決は直らない。
+- 簡素化検討: 追加modalでは「解決成功後にページがない」という不一致を消せない。既存要求の受付〜完了に揃え、新規のrollback/supersession機構を作らず、準備中は既存navigation gateを使う。表示可能scopeを準備してからの一回commitを優先する。まれなI/O失敗には既定のログ＋通知を使い、回復状態機械は増設しない。
+- 規模: **中〜大 / P2候補**。worker側のscope解決＋typed landing／既存採用・hydration／読書位置・構成／runtime終端／main・linked・独立の回帰までが1まとまり。独立に分岐一覧を実装するなら大。R4全面リワークは本案の必須条件にしない。着手時は§2の既存条件に従い、ClaudeCodeと独立Codex reviewerの「症状パッチでなく構造修正」の合意を取り、実際の変更範囲をdetached計画§11へ記録する。
+
 ### 1.677 サムネイル表示後も種類アイコンを残し、フォルダ・書庫・単体画像を見分けやすくする — 5ch >>700 (2026-11-01)
 
 - 状態: **未着手・種類アイコンを常時表示する方向でバックログへ追加 (利用者依頼 2026-11-01)**。[>>700](https://egg.5ch.io/test/read.cgi/software/1782419551/700) は ZIP・フォルダ・単体画像を見分けにくいため、枠を ZIP は薄い青、フォルダは薄い緑、画像は従来どおりにする提案。利用者自身も区別しにくいと感じているが、色分けだけで解決するかは慎重に検討し、まず固定位置の種類アイコンで形でも判別できる案を採る。動画の画質についての感想は、本項目の変更対象に含めない。
