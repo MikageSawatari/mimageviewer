@@ -7,6 +7,12 @@
 
 ## コードで確認した境界（初回調査）
 
+2026-11-01 §1.680追補: セル／余白とも集約click flagの一回登録を、判定済みrelease列の順序付き登録へ
+置き換える。egui Responseの受理対象・描画済み項目領域・press所有・touch相関・focus境界を照合し、
+別のtargetのreleaseを最終pointer位置で自分のクリックへ変えない。選択更新は従来のhandler内で行い、
+同frameの選択再描画とD&Dを維持する。全releaseの消費印は既存のframe markerを共有し、activation後の
+再passと同batchの残りを再登録しない。正本・検証記録は `next-release-backlog.md` §1.680。
+
 - `App::grid_click_pairing` / `GridClickPairingState` が同じセル・items generation・時間に
   よるクリック対を所有する。`begin_primary_click_frame` は一次クリック時に状態を取り出し、
   セルが受理しなければ対を切る。egui の double/triple click の回数を起動判定に使わない。

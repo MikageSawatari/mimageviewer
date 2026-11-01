@@ -54,7 +54,36 @@ pub(crate) struct TouchFrame {
     touch_cancelled: bool,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct GridPrimaryEdge {
+    pub(crate) ordinary_mouse: bool,
+    pub(crate) touch_derived: bool,
+    pub(crate) suppressed: bool,
+    pub(crate) accepted_tap: bool,
+}
+
 impl TouchFrame {
+    /// Exact raw primary edge, including retired releases in a mixed batch.
+    /// Ambiguous/missing correlation preserves ordinary pointer fallback.
+    pub(crate) fn grid_primary_edge(
+        &self,
+        release_ordinal: usize,
+        pressed: bool,
+    ) -> GridPrimaryEdge {
+        self.primary_events
+            .iter()
+            .find(|event| {
+                event.release_ordinal == release_ordinal
+                    && event.phase == PrimaryPhase::Button(pressed)
+            })
+            .map_or_else(GridPrimaryEdge::default, |event| GridPrimaryEdge {
+                ordinary_mouse: event.ownership == PrimaryOwnership::Mouse,
+                touch_derived: event.ownership != PrimaryOwnership::Mouse,
+                suppressed: event.should_suppress || event.ownership == PrimaryOwnership::Retired,
+                accepted_tap: event.accepted_grid_tap,
+            })
+    }
+
     fn replay_for_later_passes(&self) -> Self {
         Self {
             scope: self.scope,
@@ -332,7 +361,7 @@ impl TouchCorrelationState {
 struct CorrelatedPrimary {
     pos: Pos2,
     /// Raw primary-release order, including current events later discarded as
-    /// ambiguous. Only meaningful for `Button(false)`.
+    /// ambiguous. A press carries the ordinal of its upcoming release as well.
     release_ordinal: usize,
     phase: PrimaryPhase,
     ownership: PrimaryOwnership,

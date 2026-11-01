@@ -1285,6 +1285,13 @@ snapshot 末尾到達時は `FsBoundaryHint::NoImageFolder` で boundary hint �
 
 ## 設計メモ
 
+一覧のセル／余白のクリック対は `GridClickPairingState` が所有する。egui がクリックと判定した
+primary release を raw の press・focus 順序と照合し、同じ UI pass の複数 release も個々に登録する。
+同じ pass の2クリックでも選択だけで終えず、受理した対から既存のopen／親操作へ一度渡す。
+各 release の修飾キーで選択を更新し、Explorer／Check方式と選択済み項目の再クリック設定を維持する。
+egui の集約 double/triple flag をopen条件にせず、発火後の残りのクリックを次の対へ持ち越さない。
+実装・回帰と観測範囲は [次版バックログ §1.680](next-release-backlog.md)。
+
 一覧の余白ダブルクリック (§1.298) は環境設定 → 表示 → サムネイルの
 「サムネイルの余白部分のダブルクリックで親フォルダへ移動」で有効にする（既定OFF）。
 ON時のサムネイルでは、描いた画像矩形・ファイル名・アイコン・バッジ以外のセル内余白

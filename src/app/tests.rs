@@ -110754,6 +110754,87 @@ mod background_click_scroll_regression_tests {
     }
 
     #[test]
+    fn section1680_letterbox_mixed_completions_in_one_batch_keep_the_final_target() {
+        for image_first in [false, true] {
+            let mut harness = letterbox_harness([40, 120]);
+            let rect = cell_rect(&harness);
+            let image = rect.center();
+            let background = rect.min + egui::vec2(5.0, rect.height() * 0.5);
+            let (first, last) = if image_first {
+                (image, background)
+            } else {
+                (background, image)
+            };
+            harness.hover_at(first);
+            harness.run();
+            harness.input_mut().events = [first, last]
+                .into_iter()
+                .flat_map(|pos| {
+                    [true, false].map(|pressed| egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    })
+                })
+                .collect();
+            harness.run();
+            assert!(harness.state().navs.is_empty());
+            assert_eq!(harness.state().app.selected, (!image_first).then_some(0));
+            click(&mut harness, last);
+            assert_eq!(harness.state().navs.len(), 1);
+            assert_eq!(
+                matches!(
+                    harness.state().navs[0],
+                    crate::ui_main::AddressBarNav::Direct(_, _)
+                ),
+                image_first
+            );
+        }
+    }
+
+    #[test]
+    fn section1680_letterbox_new_press_does_not_reassign_the_older_release() {
+        for image_first in [false, true] {
+            let mut harness = letterbox_harness([40, 120]);
+            let rect = cell_rect(&harness);
+            let image = rect.center();
+            let background = rect.min + egui::vec2(5.0, rect.height() * 0.5);
+            let (first, next) = if image_first {
+                (image, background)
+            } else {
+                (background, image)
+            };
+            harness.hover_at(first);
+            harness.run();
+            let edge = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            harness.input_mut().events =
+                vec![edge(first, true), edge(first, false), edge(next, true)];
+            harness.run();
+            assert_eq!(harness.state().app.selected, image_first.then_some(0));
+            assert!(harness.state().navs.is_empty());
+            harness.input_mut().events = vec![edge(next, false)];
+            harness.run();
+            assert_eq!(harness.state().app.selected, (!image_first).then_some(0));
+            assert!(harness.state().navs.is_empty());
+            click(&mut harness, next);
+            assert_eq!(harness.state().navs.len(), 1);
+            assert_eq!(
+                matches!(
+                    harness.state().navs[0],
+                    crate::ui_main::AddressBarNav::Direct(_, _)
+                ),
+                image_first
+            );
+        }
+    }
+
+    #[test]
     fn letterbox_real_grid_press_release_targets_and_separate_frames() {
         for image_first in [true, false] {
             let mut harness = letterbox_harness([40, 120]);
