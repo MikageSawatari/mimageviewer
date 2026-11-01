@@ -355,7 +355,10 @@ fn release_matches_baseline(edit: PointerEdit, reindex: bool) {
     assert!(app.nudge_selected_local_adjust_shape_from_shortcut(0, 0.125, 0.0));
     let s1 = app.local_adjust_page_layers[&0].clone();
     assert_ne!(s0, s1);
-    // Prime egui's held-pointer state without invoking the start handler.
+    seed_pointer(&mut app, edit, &s1);
+    // Prime the physical press through the production input owner, without
+    // invoking the document start handler: this fixture deliberately preserves
+    // the existing mixed key/pointer before payloads and their history oracle.
     ctx.run_pass(
         egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -366,10 +369,27 @@ fn release_matches_baseline(edit: PointerEdit, reindex: bool) {
             }],
             ..Default::default()
         },
-        |_| {},
+        |ctx| {
+            let scope = app.canvas_gesture_scope(
+                0,
+                crate::app::canvas_gesture::CanvasTool::Local(
+                    0,
+                    app.local_adjust_mask_edit_target,
+                    app.local_adjust_mask_tool,
+                ),
+            );
+            let inputs = crate::app::canvas_gesture::canvas_pointer_inputs(
+                ctx,
+                scope,
+                Default::default(),
+                true,
+                |_| true,
+            );
+            assert_eq!(inputs.len(), 1);
+            assert!(inputs[0].pressed());
+        },
     )
     .drop_without_applying_deltas();
-    seed_pointer(&mut app, edit, &s1);
     frame(
         &mut app,
         &ctx,

@@ -1674,28 +1674,68 @@ impl App {
         if self.book_structural_op.is_some() {
             return;
         }
-        let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
-        let secondary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Secondary);
         let full_rect = transform.viewport_rect;
         // フォーカス復帰クリック中は塗り・選択操作を一切発生させない
         // (handle_fs_wheel_and_click で検出・セットされる)
         if self.fs_primary_suppression.is_active() {
             return;
         }
-        let primary_down = ctx.input(|i| primary_allowed && i.pointer.primary_down());
-        let primary_pressed = ctx.input(|i| primary_allowed && i.pointer.primary_pressed());
-        let primary_released = ctx.input(|i| {
-            primary_allowed
-                && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
-                && i.pointer.primary_released()
-        });
-        let secondary_pressed = ctx.input(|i| secondary_allowed && i.pointer.secondary_pressed())
+        let scope = self.canvas_gesture_scope(
+            self.fullscreen_idx.unwrap_or(usize::MAX),
+            crate::app::canvas_gesture::CanvasTool::Erase(self.erase_tool),
+        );
+        let panel = self.erase_panel_rect(full_rect);
+        // Preview owns a press even over a panel, until its physical release.
+        // Let the existing preview handler accept it before panel tool rejection.
+        let preview_owns_pointer = self.erase_preview_active;
+        let inputs = crate::app::canvas_gesture::canvas_pointer_inputs(
+            ctx,
+            scope,
+            overflow_pointer_input,
+            true,
+            |pos| preview_owns_pointer || !panel.contains(pos),
+        );
+        for input in inputs {
+            if matches!(
+                input,
+                crate::app::canvas_gesture::CanvasPointerInput::Cancel
+            ) {
+                self.erase_last_paint_pos = None;
+                self.erase_drag = None;
+                self.erase_line_start = None;
+                self.erase_line_end = None;
+                self.erase_shape_drag_start = None;
+                self.erase_shape_drag_end = None;
+                self.erase_lasso_points.clear();
+                continue;
+            }
+            self.handle_erase_canvas_pointer(ctx, transform, input);
+            // Observe the drawing owner before a same-pass release removes it.
+            // The panel uses this same preview-hold admission rule afterwards.
+            let drawing = self.erase_drawing_in_progress();
+            let _ = self
+                .erase_preview_hold
+                .merge(false, self.erase_preview_active, drawing);
+        }
+    }
+
+    fn handle_erase_canvas_pointer(
+        &mut self,
+        ctx: &egui::Context,
+        transform: &DisplayedImageTransform,
+        input: crate::app::canvas_gesture::CanvasPointerInput,
+    ) {
+        let full_rect = transform.viewport_rect;
+        let primary_pressed = input.pressed();
+        let primary_down = input.down();
+        let primary_released = input.released();
+        let secondary_pressed = input.secondary()
             && self
                 .settings
                 .ring_shortcuts
                 .right_drag_mode(crate::ring_shortcut::RightDragContext::EditMode)
                 != crate::ring_shortcut::RightDragMode::MouseGesture;
-        let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+        let pointer_pos = input.position();
         let paint = self.erase_paint_mode;
         // KeyHold は keymap 経由。Windows では内部で OS 状態も読むので、
         // FS ビューポートの stale key_down 問題を避けられる。
@@ -1737,13 +1777,20 @@ impl App {
             return;
         }
 
-        if self.edit_preview_owns_canvas(self.erase_preview_active, primary_down) {
+        // Drawing samples and a physical hold remaining after this pass are
+        // different facts: a completed click must not latch primary suppression.
+        if self.edit_preview_owns_canvas(
+            self.erase_preview_active,
+            primary_down && ctx.input(|i| i.pointer.primary_down()),
+        ) {
             return;
         }
 
-        if pointer_over_panel && !primary_released {
+        if pointer_over_panel && !drawing_in_progress && !primary_released {
             return;
         }
+
+        let primary_down = primary_down && (primary_pressed || self.erase_drawing_in_progress());
 
         if self.book_append_undo_in_progress() {
             if primary_down || primary_pressed || primary_released || secondary_pressed {
@@ -1756,8 +1803,13 @@ impl App {
         // 選択ツール中はドロー系の操作を行わず、クリック=選択/ハンドルドラッグ=編集
         // に徹する。Phase 2b で vector_edit に統一: 角・辺中点・回転ハンドル + 端点。
         // Shift = 軸拘束/等比/15°snap、Alt = 中心固定。
-        let modifiers = ctx.input(|i| i.modifiers);
+        let modifiers = input.modifiers();
         if self.erase_tool == EraseTool::Select {
+            // Hover/secondary coordinates are presentation or polygon input,
+            // not samples owned by the active primary handle gesture.
+            if !input.primary_sample() {
+                return;
+            }
             if primary_pressed {
                 if let Some((scale, _img_rect)) = self.erase_image_layout(transform) {
                     if let Some(screen) = pointer_pos {
@@ -1827,6 +1879,7 @@ impl App {
         let polygon_in_progress =
             self.erase_tool == EraseTool::Polygon && !self.erase_lasso_points.is_empty();
         if !polygon_in_progress
+            && input.primary_sample()
             && self.try_handle_active_erase_drag_or_handle_hit(
                 primary_pressed,
                 primary_released,
@@ -1857,7 +1910,8 @@ impl App {
                         }
                         self.erase_last_paint_pos = Some(pos);
                     }
-                } else {
+                }
+                if primary_released {
                     self.erase_last_paint_pos = None;
                 }
             }

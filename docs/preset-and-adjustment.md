@@ -958,6 +958,16 @@ idle まで遅延する。release 時は遅延をキャンセルして 1 回だ�
 
 画像上のキャンバス操作は以下を扱う:
 
+補正・消しゴム・隠蔽キャンバスの pointer 入力境界は
+`app/canvas_gesture.rs` の共通 gesture owner を通す（§1.679）。所有 viewport の
+press / move / release を配送順に消費し、page key・viewer context・
+モード／ツール（補正では layer／書込先も含む）が変わった押下を再所属させない。
+単発操作は各 press の座標で1回、筆／図形／ハンドルは release 座標まで更新してから
+既存の確定経路へ渡す。同じ pass の短いクリック・複数クリックも同じ契約で扱い、
+discard による再評価で編集を二重適用しない。同じページを表示し続ける一覧の再配置では、
+既存の page-edit owner と同じく gesture を継続し、items 世代だけで押下を失効させない。
+保存／Undo／下流 cache の経路は変えない。
+
 - `LinearGradient` / `RadialGradient`: 画像上ドラッグで開始/終了点または中心/半径を更新する。
 - `ColorRange`: 画像クリックで対象 RGB を拾う。
 - `SelectiveColor` と各種 RGB パラメータ: 効果 UI のスポイトボタンから画像クリックで色を拾う。
