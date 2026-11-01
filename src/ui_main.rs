@@ -17128,6 +17128,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 } else {
                     self.folder_rating_match(idx).map(|(count, _)| count)
                 };
+                let is_cut = self.items[idx]
+                    .drag_source_path()
+                    .is_some_and(|path| self.cut_clipboard.contains(path));
                 let overlay = crate::app::layout_cell_overlays(
                     ui.painter(),
                     rect,
@@ -17154,10 +17157,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     media_duration.as_deref(),
                     self.settings.thumb_show_resume_meter,
                     crate::thumb_overlay_layout::ThumbnailNameStyle::from_settings(&self.settings),
+                    self.settings.thumb_show_type_icon,
+                    is_cut,
                 );
-                let is_cut = self.items[idx]
-                    .drag_source_path()
-                    .is_some_and(|path| self.cut_clipboard.contains(path));
                 let rotation = self.get_rotation(idx);
                 let resume = self.thumbnail_resume_meter(idx);
                 let adjusted = if self.adjustment_dragging {
