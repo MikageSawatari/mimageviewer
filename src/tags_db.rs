@@ -330,6 +330,50 @@ impl TagsDb {
             .collect())
     }
 
+    /// Apply only the requested memberships. Existing rows (including their
+    /// display spelling and applied_at) are left intact; no-ops do not decide
+    /// an item or touch its timestamp.
+    pub(crate) fn apply_item_tag_delta(
+        &mut self,
+        item_key: &str,
+        tags: &[String],
+        add: bool,
+    ) -> Result<Vec<String>, rusqlite::Error> {
+        let now = now_unix_secs();
+        let normalized = collapse_tags(tags, now);
+        let existing = self.get_item_tags(item_key);
+        let changed: Vec<_> = normalized
+            .iter()
+            .filter(|tag| existing.iter().any(|old| old.tag_key == tag.tag_key) != add)
+            .collect();
+        if changed.is_empty() {
+            return Ok(existing
+                .iter()
+                .map(|tag| format_display_tag(&tag.tag))
+                .collect());
+        }
+        self.rotate_backups_once();
+        let _tag_write = TAG_WRITES.begin();
+        let tx = self.conn.transaction()?;
+        for tag in changed {
+            if add {
+                tx.execute(
+                    "INSERT OR IGNORE INTO item_tags (item_key, tag, tag_key, applied_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![item_key, tag.tag, tag.tag_key, now],
+                )?;
+            } else {
+                tx.execute(
+                    "DELETE FROM item_tags WHERE item_key = ?1 AND tag_key = ?2",
+                    params![item_key, tag.tag_key],
+                )?;
+            }
+        }
+        upsert_item_state_tx(&tx, item_key, source::EDIT, now)?;
+        tx.commit()?;
+        Ok(self.display_tags_for_item(item_key))
+    }
+
     pub fn union_item_tags<I, S>(
         &mut self,
         item_key: &str,
@@ -1358,6 +1402,56 @@ mod tests {
     fn normalize_strips_hash_and_nfkc_lowercases_key() {
         assert_eq!(normalize_tag_display_name("  ##ＦＡＴＥ  "), "FATE");
         assert_eq!(normalize_tag_key("  #ＦＡＴＥ  "), "fate");
+    }
+
+    #[test]
+    fn tag_delta_preserves_untouched_timestamps_spelling_and_noop_decision() {
+        let mut db = memory_db();
+        db.set_item_tags("item", ["Keep", "Remove"], source::EDIT)
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE item_tags SET applied_at = 42 WHERE item_key = 'item'",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tag_item_state SET decided_at = 17 WHERE item_key = 'item'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.apply_item_tag_delta("item", &["keep".into()], true)
+                .unwrap(),
+            vec!["#Keep", "#Remove"]
+        );
+        let decided: i64 = db
+            .conn
+            .query_row(
+                "SELECT decided_at FROM tag_item_state WHERE item_key = 'item'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(decided, 17, "no-op must not rewrite item state");
+        db.apply_item_tag_delta("item", &["New".into(), "keep".into()], true)
+            .unwrap();
+        db.apply_item_tag_delta("item", &["remove".into()], false)
+            .unwrap();
+        let keep = db
+            .get_item_tags("item")
+            .into_iter()
+            .find(|tag| tag.tag_key == "keep")
+            .unwrap();
+        assert_eq!(keep.tag, "Keep");
+        assert_eq!(keep.applied_at, 42);
+        db.apply_item_tag_delta("empty", &["absent".into()], false)
+            .unwrap();
+        assert!(
+            !db.has_item_state("empty"),
+            "no-op removal must not create a decision"
+        );
     }
 
     #[test]

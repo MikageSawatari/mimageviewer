@@ -12,7 +12,7 @@ use crate::tag_write_worker::{
     TagAction, TagJobKind, TagSidecarTarget, TagWriteHandle, TagWriteJob,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct TagTarget {
     pub(crate) path: PathBuf,
     pub(crate) tag_sidecar: Option<TagSidecarTarget>,
@@ -279,7 +279,7 @@ impl App {
         let tx_id = self.next_tag_tx_id();
         self.register_pending_tag_op(tx_id, summary, paths.len());
         let name_for_jobs = name_owned;
-        self.submit_tag_jobs(&targets, "toggle", tx_id, move |_| {
+        self.submit_tag_jobs(&targets, "toggle", tx_id, move |_, _| {
             if all_have_tag {
                 TagJobKind::Remove(name_for_jobs.clone())
             } else {
@@ -355,8 +355,6 @@ impl App {
             return;
         }
         self.prepare_page_edit_history_boundary();
-        self.hydrate_tags_cache_for_paths(&paths);
-
         let with_hash = crate::tags_db::format_display_tag(&name);
         self.tag_toast_label = Some(with_hash.clone());
         self.set_tag_toast_surface_for_new_batch(surface);
@@ -365,38 +363,105 @@ impl App {
         } else {
             format!("{with_hash} の削除")
         };
-        self.optimistic_update_tags_cache(&paths, |before| {
-            if add {
-                let mut after = before.to_vec();
-                if !after
-                    .iter()
-                    .any(|tag| crate::tags_db::normalize_tag_key(tag) == tag_key)
-                {
-                    after.push(with_hash.clone());
-                }
-                after
-            } else {
-                before
-                    .iter()
-                    .filter(|tag| crate::tags_db::normalize_tag_key(*tag) != tag_key)
-                    .cloned()
-                    .collect()
-            }
-        });
         let tx_id = self.next_tag_tx_id();
         self.register_pending_tag_op(tx_id, summary, paths.len());
+        self.submit_tag_set_lower(&targets, &[name], add, tx_id, &[]);
+    }
+
+    /// UI admission has already checked permission/Remote/modal state. Input
+    /// positions refer to the complete original-order record (including skips).
+    /// This entry deliberately does not finalize user edits or touch Undo/toast routing.
+    pub(crate) fn request_agent_tag_set_for_targets(
+        &mut self,
+        targets: Vec<(usize, TagTarget)>,
+        tags: &[String],
+        add: bool,
+        client_name: String,
+        rows: Vec<crate::agent_ipc::changes::ChangeRow>,
+        changes: std::sync::Arc<crate::agent_ipc::changes::ChangeController>,
+    ) -> usize {
+        use crate::agent_ipc::changes::{ChangeCounts, ChangeRecord, ChangeRecordId};
+        let queued = targets.len();
+        let skipped = rows.len().saturating_sub(queued);
+        let record_id = changes.publish(ChangeRecord {
+            id: ChangeRecordId::default(),
+            at: std::time::SystemTime::now(),
+            client_name,
+            tool: if add { "add_tags" } else { "remove_tags" }.into(),
+            collection: None,
+            counts: ChangeCounts {
+                queued,
+                skipped,
+                ..Default::default()
+            },
+            summary: format!("処理中 {queued} 件 / 対象外 {skipped} 件"),
+            rows,
+            notice: format!("AI からのタグの変更を受け付けました ({queued} 件)"),
+        });
+        let origins: Vec<_> = targets
+            .iter()
+            .map(|(row_index, _)| crate::tag_write_worker::AgentTagChange {
+                controller: changes.clone(),
+                record_id,
+                row_index: *row_index,
+            })
+            .collect();
+        let targets: Vec<_> = targets.into_iter().map(|(_, target)| target).collect();
+        let tx_id = self.next_tag_tx_id();
+        self.submit_tag_set_lower(&targets, tags, add, tx_id, &origins);
+        queued
+    }
+
+    /// Shared normalization, optimistic cache publication and writer submission.
+    /// User-only history/Undo/toast setup belongs above this boundary.
+    fn submit_tag_set_lower(
+        &mut self,
+        targets: &[TagTarget],
+        tags: &[String],
+        add: bool,
+        tx_id: u64,
+        origins: &[crate::tag_write_worker::AgentTagChange],
+    ) {
+        let tags: Vec<_> = tags
+            .iter()
+            .map(|tag| crate::tags_db::normalize_tag_display_name(tag))
+            .collect();
+        let keys: Vec<_> = tags
+            .iter()
+            .map(|tag| crate::tags_db::normalize_tag_key(tag))
+            .collect();
+        let paths: Vec<_> = targets.iter().map(|target| target.path.clone()).collect();
+        self.hydrate_tags_cache_for_paths(&paths);
+        self.optimistic_update_tags_cache(&paths, |before| {
+            let mut after = before.to_vec();
+            if add {
+                for (tag, key) in tags.iter().zip(&keys) {
+                    if !after
+                        .iter()
+                        .any(|old| crate::tags_db::normalize_tag_key(old) == *key)
+                    {
+                        after.push(crate::tags_db::format_display_tag(tag));
+                    }
+                }
+            } else {
+                after.retain(|old| !keys.contains(&crate::tags_db::normalize_tag_key(old)));
+            }
+            after
+        });
         self.submit_tag_jobs(
-            &targets,
+            targets,
             if add { "add" } else { "remove" },
             tx_id,
-            move |_| {
-                if add {
-                    TagJobKind::Add(name.clone())
-                } else {
-                    TagJobKind::Remove(name.clone())
-                }
+            |index, _| TagJobKind::Delta {
+                tags: tags.clone(),
+                add,
+                agent: origins.get(index).cloned(),
             },
         );
+    }
+
+    pub(crate) fn tag_maintenance_in_progress(&self) -> bool {
+        self.tag_maintenance_rx.is_some()
     }
 
     pub(crate) fn request_tag_clear_for_selection(&mut self, surface: crate::app::ActionSurface) {
@@ -427,7 +492,7 @@ impl App {
         self.show_feedback_toast_on(format!("{count} 件から mIV タグをクリア中"), surface);
         let tx_id = self.next_tag_tx_id();
         self.register_pending_tag_op(tx_id, summary, paths.len());
-        self.submit_tag_jobs(&targets, "clear", tx_id, |_| TagJobKind::ClearMiv);
+        self.submit_tag_jobs(&targets, "clear", tx_id, |_, _| TagJobKind::ClearMiv);
     }
 
     /// 新しいタグバッチの発火面を単一スロット `tag_toast_surface` に記録する。
@@ -435,18 +500,17 @@ impl App {
     /// 発火面が食い違う場合は面を確定できない — その場合は従来の全面表示 (None) に
     /// 落とし、混在バッチの完了が最後の面へ誤着弾しないようにする (Sol P2)。
     ///
-    /// in-flight 判定は worker カウンタの未リセット (`has_unconsumed_batch`) を使う。
+    /// in-flight 判定は利用者 origin の未リセット (`has_unconsumed_user_batch`) を使う。
     /// `pending_tag_undos` は `clear_meta_undo` (フォルダ移動等) が worker 稼働中でも
-    /// 意図的に破棄するため proxy にならず、`is_busy()` も worker が結果送信前に
-    /// done を進めるため「完了したが未 poll」の 1 フレーム窓を取りこぼす
-    /// (Sol P2 追指摘×2)。カウンタは完了 poll の `reset_counters_if_idle` まで
+    /// 意図的に破棄するため proxy にならず、`is_busy()` も「完了したが未 poll」の
+    /// 結果を取りこぼす。カウンタは完了 poll の `reset_counters_if_idle` まで
     /// 残るので、「前バッチが完了トーストとして未集計」を正しく表す。
     /// この呼び出しは新バッチの submit 前に行われる。
     fn set_tag_toast_surface_for_new_batch(&mut self, surface: crate::app::ActionSurface) {
         let in_flight = self
             .tag_write_handle
             .as_ref()
-            .is_some_and(|handle| handle.has_unconsumed_batch());
+            .is_some_and(|handle| handle.has_unconsumed_user_batch());
         if !in_flight || self.tag_toast_surface == Some(surface) {
             self.tag_toast_surface = Some(surface);
         } else {
@@ -458,6 +522,10 @@ impl App {
     /// 利用不可ならエラートーストを表示して `false` を返す。
     /// 呼び出し側は `false` のとき capture / submit を一切スキップすること。
     fn precheck_tag_write_available(&mut self, op_label: &str) -> bool {
+        if self.tag_maintenance_in_progress() {
+            self.show_feedback_warning("タグの改名/統合を反映中です".into());
+            return false;
+        }
         // Only request admission uses this precheck; worker result adoption and
         // its follow-up content-identity records must remain runnable.
         if self.book_structural_op.is_some() {
@@ -490,7 +558,7 @@ impl App {
         targets: &[TagTarget],
         op_label: &str,
         tx_id: u64,
-        kind_for: impl Fn(&PathBuf) -> TagJobKind,
+        kind_for: impl Fn(usize, &PathBuf) -> TagJobKind,
     ) {
         if targets.is_empty() {
             crate::logger::log(format!(
@@ -514,13 +582,13 @@ impl App {
             "[TAG] submitting '{op_label}' (tx={tx_id}) for {} item(s):",
             targets.len()
         ));
-        for target in targets {
+        for (index, target) in targets.iter().enumerate() {
             let p = &target.path;
             crate::logger::log(format!("[TAG]   → {}", p.display()));
             h.submit(TagWriteJob {
                 path: p.clone(),
                 tag_sidecar: target.tag_sidecar.clone(),
-                kind: kind_for(p),
+                kind: kind_for(index, p),
                 tx_id,
             });
         }
@@ -568,12 +636,15 @@ impl App {
     /// 反映する。
     pub(crate) fn poll_tag_write_results(&mut self) {
         let mut errors: Vec<(PathBuf, String)> = Vec::new();
+        let mut agent_errors: Vec<(PathBuf, String)> = Vec::new();
         let mut added = 0usize;
         let mut removed = 0usize;
         let mut cleared = 0usize;
         let mut restored = 0usize;
         let mut noop = 0usize;
         let mut just_completed = false;
+        let mut user_batch_completed = false;
+        let mut agent_changed = false;
         // worker が返してきた (path, 書き込み後タグ列) を後でまとめて tags_cache に反映する。
         // 次フレームの `cell_tag_list` が正しい値を拾えるため add/remove 対称になる。
         let mut cache_updates: Vec<(PathBuf, Vec<String>)> = Vec::new();
@@ -584,39 +655,44 @@ impl App {
         let mut pending_updates: Vec<PendingUpdate> = Vec::new();
         if let Some(h) = self.tag_write_handle.as_ref() {
             while let Some(res) = h.try_recv_result() {
+                let agent = res.agent.is_some();
+                if let Some(change) = res.agent.as_ref() {
+                    change.complete(&res);
+                }
                 let path_disp = res.path.display().to_string();
                 match res.result {
                     Ok(action) => {
                         let changed = !matches!(action, TagAction::NoOp);
+                        agent_changed |= agent && changed;
                         match action {
                             TagAction::Added => {
-                                added += 1;
+                                added += usize::from(!agent);
                                 crate::logger::log(format!("[TAG]   ✓ added → {path_disp}"));
                             }
                             TagAction::Removed => {
-                                removed += 1;
+                                removed += usize::from(!agent);
                                 crate::logger::log(format!("[TAG]   ✓ removed → {path_disp}"));
                             }
                             TagAction::Cleared => {
-                                cleared += 1;
+                                cleared += usize::from(!agent);
                                 crate::logger::log(format!(
                                     "[TAG]   ✓ cleared mIV tags → {path_disp}"
                                 ));
                             }
                             TagAction::Restored => {
-                                restored += 1;
+                                restored += usize::from(!agent);
                                 crate::logger::log(format!(
                                     "[TAG]   ✓ restored tags (undo/redo) → {path_disp}"
                                 ));
                             }
                             TagAction::NoOp => {
-                                noop += 1;
+                                noop += usize::from(!agent);
                                 crate::logger::log(format!(
                                     "[TAG]   = no-op (already in target state) → {path_disp}"
                                 ));
                             }
                         }
-                        if res.tx_id != 0 {
+                        if !agent && res.tx_id != 0 {
                             // 実 disk の before/after を確定情報として pending に積む。
                             pending_updates.push(PendingUpdate::Success {
                                 tx_id: res.tx_id,
@@ -628,7 +704,9 @@ impl App {
                                 },
                             });
                         }
-                        if let Some(target) = res.tag_sidecar.clone() {
+                        if (changed || !agent)
+                            && let Some(target) = res.tag_sidecar.clone()
+                        {
                             sidecar_updates.push((target, res.tags_after.clone()));
                         }
                         if changed {
@@ -638,7 +716,7 @@ impl App {
                     }
                     Err(e) => {
                         crate::logger::log(format!("[TAG]   ✗ FAILED: {e} → {path_disp}"));
-                        if res.tx_id != 0 {
+                        if !agent && res.tx_id != 0 {
                             pending_updates.push(PendingUpdate::Failure { tx_id: res.tx_id });
                         }
                         // 楽観更新済みの tags_cache を実 DB 状態 (= worker が読み取った
@@ -646,13 +724,26 @@ impl App {
                         // グリッドのバッジは予測値で更新済みのため放置すると stale
                         // 表示になる (Codex P3 指摘)。
                         cache_updates.push((res.path.clone(), res.tags_before));
-                        errors.push((res.path, e));
+                        if agent {
+                            agent_errors.push((res.path, e));
+                        } else {
+                            errors.push((res.path, e));
+                        }
                     }
                 }
             }
-            if !h.is_busy() && h.total.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            if h.is_complete_and_drained() && h.total.load(std::sync::atomic::Ordering::Relaxed) > 0
+            {
                 just_completed = true;
+                user_batch_completed = h.has_unconsumed_user_batch();
             }
+        }
+        if agent_changed {
+            // A later append Undo must not delete a file that AI has edited.
+            // Admission stays side-effect-free; a failed/no-op job preserves
+            // the receipt. The writer's unpublished batch blocks Undo until
+            // this completion is adopted.
+            self.invalidate_book_append_undo();
         }
         for path in identity_sources {
             self.record_content_identity_for_path(
@@ -718,12 +809,20 @@ impl App {
                 None => self.show_feedback_toast(msg),
             }
         }
+        if !agent_errors.is_empty() {
+            self.show_feedback_warning(format!(
+                "AI からのタグ書き込みに失敗しました ({} 件)",
+                agent_errors.len()
+            ));
+        }
         if just_completed {
             // バッチ完了時は、完了トーストに使わなかった場合 (エラー完了等) でも
             // routing 状態を必ず破棄する。残すと次バッチの完了トーストが古い
             // ラベル/発火面で表示される (Codex P3)。成功分岐の take() 後は no-op。
-            self.tag_toast_label = None;
-            self.tag_toast_surface = None;
+            if user_batch_completed {
+                self.tag_toast_label = None;
+                self.tag_toast_surface = None;
+            }
             if let Some(h) = self.tag_write_handle.as_ref() {
                 h.reset_counters_if_idle();
             }
@@ -845,6 +944,151 @@ fn format_completion_toast(
 #[cfg(test)]
 mod tests {
     use super::format_completion_toast;
+
+    #[test]
+    fn agent_tag_submission_preserves_user_boundary_and_records_real_writer_values() {
+        use crate::agent_ipc::changes::{ChangeController, ChangeRow};
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path = app.tmp.path().join("agent.jpg");
+        let mut db = crate::tags_db::TagsDb::open().unwrap();
+        let key = crate::tags_db::item_key_for_path(&path);
+        db.set_item_tags(&key, ["actual"], crate::tags_db::source::EDIT)
+            .unwrap();
+        app.set_tags_cache_entry(key.clone(), vec!["#stale".into()]);
+        app.adjustment_dragging = true;
+        app.tag_toast_label = Some("user-label".into());
+        app.tag_toast_surface = Some(crate::app::ActionSurface::MainWindow);
+        let user_tx = app.next_tag_tx_id();
+        app.register_pending_tag_op(user_tx, "user pending".into(), 1);
+        let changes = ChangeController::new();
+        let append_revision = app.book_append_undo_revision;
+        assert_eq!(
+            app.request_agent_tag_set_for_targets(
+                vec![(
+                    0,
+                    super::TagTarget {
+                        path: path.clone(),
+                        tag_sidecar: None
+                    }
+                )],
+                &["one".into(), "two".into()],
+                true,
+                "client".into(),
+                vec![ChangeRow {
+                    item: path.display().to_string(),
+                    result: "queued".into(),
+                    ..Default::default()
+                }],
+                changes.clone(),
+            ),
+            1
+        );
+        assert!(
+            app.adjustment_dragging,
+            "agent must not finalize a user's edit session"
+        );
+        assert_eq!(app.tag_toast_label.as_deref(), Some("user-label"));
+        assert_eq!(
+            app.tag_toast_surface,
+            Some(crate::app::ActionSurface::MainWindow)
+        );
+        assert_eq!(app.pending_tag_undos.len(), 1);
+        assert_eq!(app.meta_undo.undo_len(), 0);
+        assert_eq!(
+            app.book_append_undo_revision, append_revision,
+            "acceptance must not invalidate append Undo"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            app.poll_tag_write_results();
+            if !app.tag_writer_has_unpublished_jobs() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.adjustment_dragging);
+        assert_eq!(app.tag_toast_label.as_deref(), Some("user-label"));
+        assert_eq!(
+            app.tag_toast_surface,
+            Some(crate::app::ActionSurface::MainWindow)
+        );
+        assert!(app.pending_tag_undos.contains_key(&user_tx));
+        assert_eq!(app.meta_undo.undo_len(), 0);
+        assert!(
+            app.book_append_undo_revision > append_revision,
+            "an actual AI edit invalidates append Undo"
+        );
+        let records = changes.records();
+        let records = records.lock().unwrap();
+        let record = &records.entries()[0];
+        assert_eq!(record.counts.changed, 1);
+        assert_eq!(record.counts.queued, 0);
+        assert_eq!(record.rows[0].before, "#actual");
+        assert!(record.rows[0].after.contains("#actual"));
+        assert!(record.rows[0].after.contains("#one"));
+        assert!(record.rows[0].after.contains("#two"));
+        assert!(!record.rows[0].after.contains("stale"));
+        drop(records);
+        let append_revision = app.book_append_undo_revision;
+        app.request_agent_tag_set_for_targets(
+            vec![(
+                0,
+                super::TagTarget {
+                    path: path.clone(),
+                    tag_sidecar: None,
+                },
+            )],
+            &["one".into(), "two".into()],
+            true,
+            "client".into(),
+            vec![ChangeRow {
+                item: path.display().to_string(),
+                result: "queued".into(),
+                ..Default::default()
+            }],
+            changes.clone(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            app.poll_tag_write_results();
+            if !app.tag_writer_has_unpublished_jobs() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            app.book_append_undo_revision, append_revision,
+            "no-op must preserve append Undo"
+        );
+        assert_eq!(
+            changes.records().lock().unwrap().entries()[0]
+                .counts
+                .unchanged,
+            1
+        );
+    }
+
+    #[test]
+    fn tag_maintenance_blocks_user_submission_before_any_edit_state_changes() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        app.tag_maintenance_rx = Some(receiver);
+        app.adjustment_dragging = true;
+        let path = app.tmp.path().join("blocked.jpg");
+        app.request_tag_add_for_targets(
+            "tag",
+            vec![super::TagTarget {
+                path,
+                tag_sidecar: None,
+            }],
+            crate::app::ActionSurface::MainWindow,
+        );
+        assert!(app.adjustment_dragging);
+        assert!(app.pending_tag_undos.is_empty());
+        assert!(app.tag_write_handle.is_none());
+    }
 
     #[test]
     fn audio_is_a_tag_target() {

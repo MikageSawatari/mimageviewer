@@ -696,6 +696,7 @@ use book_structural_op::BookStructuralOp;
 mod startup_list_restore;
 pub(crate) mod top_level_grid_view;
 pub(crate) use startup_list_restore::StartupListIntent;
+pub(crate) mod agent_rating_write;
 mod list_order_navigation;
 #[cfg(test)]
 mod list_order_tests;
@@ -75385,9 +75386,23 @@ impl App {
         // A generation is a publication record, not an attempted-write
         // counter. Detached/main contexts may consume it only after SQLite is
         // the durable source of truth.
+        self.record_committed_user_rating_shared(source, key, before, stars, target, reader_member);
+        Ok(())
+    }
+
+    /// Publish only a committed DB mutation into the App-global ledger. The
+    /// ordinary, atomic batch and canonical ZIP writers share this boundary.
+    fn record_committed_user_rating_shared(
+        &mut self,
+        source: &str,
+        key: &str,
+        before: Option<u8>,
+        stars: u8,
+        target: Option<usize>,
+        reader_member: bool,
+    ) {
         self.record_rating_session_write(key.to_string(), stars, true);
         self.log_successful_rating_save(source, key, before, stars, target, reader_member);
-        Ok(())
     }
 
     /// Atomic multi-row form of [`Self::write_user_rating_shared`]. Session
@@ -75445,8 +75460,14 @@ impl App {
             let before = self
                 .rating_session_value_for_key(key)
                 .or_else(|| target.and_then(|idx| self.rating_cache.get(&idx).copied()));
-            self.record_rating_session_write(key.clone(), *stars, true);
-            self.log_successful_rating_save(source, key, before, *stars, target, reader_member);
+            self.record_committed_user_rating_shared(
+                source,
+                key,
+                before,
+                *stars,
+                target,
+                reader_member,
+            );
         }
         Ok(())
     }
@@ -75718,37 +75739,22 @@ impl App {
             "item",
             Some((Some(idx), old_stars)),
         )?;
-        self.rating_cache.insert(idx, stars);
-        self.invalidate_rating_counts_cache();
-        // コンテナ自身の★は子孫集計と別軸なので、単一ファイルレーティング (画像 / 動画 /
-        // ZIP 内画像 / PDF ページ) のみ親フォルダの集計に伝搬する。
-        if matches!(self.items.get(idx), Some(it) if it.is_rating_leaf()) {
-            self.apply_rating_delta_to_folder_counts(&key, old_stars, stars);
-        }
-        // コンテナへの rating 変更は current_folder と同じパスを指す可能性があるので
-        // アドレスバーキャッシュを lazy 再計算させる。
-        if matches!(self.items.get(idx), Some(it) if it.is_container_ratable()) {
-            self.current_folder_rating_cache = None;
-        }
-        self.schedule_current_smart_folder_metadata_refresh(
-            smart_folder::SmartFolderMetadataDependency::Rating,
-        );
-        // 設定 ON + Image (JPEG/PNG/WebP) のときだけ XMP にも書き込む。
-        // コンテナや ZIP 内画像・PDF ページには書き込み先がないので DB 止まり。
-        if self.settings.write_rating_to_xmp
-            && let Some(path) = xmp_target
-        {
-            self.ensure_rating_write_handle();
-            if let Some(h) = self.rating_write_handle.as_ref() {
-                h.submit(crate::rating_write_worker::RatingWriteJob {
-                    path,
-                    rating: if stars == 0 { None } else { Some(stars) },
-                });
-            }
-        }
-        self.record_content_identity_for_idx(
-            idx,
-            crate::content_identity::ContentIdentityTrigger::Edit,
+        self.finish_rating_write_deferred(
+            &key,
+            old_stars,
+            stars,
+            agent_rating_write::RatingWriteEffects {
+                policy: agent_rating_write::RatingWritePolicy::Item,
+                slots: vec![idx],
+                leaf: self.items[idx].is_rating_leaf(),
+                container: self.items[idx].is_container_ratable(),
+                xmp_target,
+                identity: if self.idx_is_compiled_book_page(idx) {
+                    None
+                } else {
+                    self.content_identity_source_for_idx(idx)
+                },
+            },
         );
         if publish {
             self.publish_current_context_rating_writes();
@@ -76511,7 +76517,6 @@ impl App {
         capture_undo: bool,
         publish: bool,
     ) -> Result<bool, String> {
-        let showing_this_container = self.showing_container_rating_key(key);
         let stars = stars.min(5);
         if capture_undo {
             self.prepare_page_edit_history_boundary();
@@ -76531,10 +76536,6 @@ impl App {
         if capture_undo && before != stars {
             self.capture_container_rating_undo_for_target(key, source, meta, before, stars);
         }
-        self.invalidate_rating_counts_cache();
-        if showing_this_container {
-            self.current_folder_rating_cache = Some(stars);
-        }
         // items 内の同じ rating key を指すコンテナがあればキャッシュ更新。
         // (1 階層上に戻ったときに cached な古い値を表示しないため。通常 current_folder は
         // items に含まれないが、search container 絞り込みビュー中は含まれうる。ZipDir も
@@ -76545,21 +76546,22 @@ impl App {
             .enumerate()
             .filter_map(|(i, _)| (self.rating_path_key(i).as_deref() == Some(key)).then_some(i))
             .collect();
-        for i in matching {
-            self.rating_cache.insert(i, stars);
-        }
-        if before != stars {
-            self.schedule_current_smart_folder_metadata_refresh(
-                smart_folder::SmartFolderMetadataDependency::Rating,
-            );
-        }
+        self.finish_rating_write_deferred(
+            key,
+            before,
+            stars,
+            agent_rating_write::RatingWriteEffects {
+                policy: agent_rating_write::RatingWritePolicy::NamedContainer,
+                slots: matching,
+                leaf: false,
+                container: true,
+                xmp_target: None,
+                identity: crate::content_identity::ContentIdentitySource::from_path(source),
+            },
+        );
         if publish {
             self.publish_current_context_rating_writes();
         }
-        self.record_content_identity_for_path(
-            source,
-            crate::content_identity::ContentIdentityTrigger::Edit,
-        );
         Ok(true)
     }
 

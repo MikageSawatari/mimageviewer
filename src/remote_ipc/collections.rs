@@ -1801,6 +1801,105 @@ mod tests {
     use crate::settings::FavoriteEntry;
 
     #[test]
+    fn remote_rating_fetch_after_accepted_agent_write_reads_committed_value() {
+        use crate::agent_ipc::metadata_write::{PreparedItem, PreparedRatings, PreparedWrite};
+        use crate::agent_ipc::open::{OpenController, UiOpenOutcome};
+        use crate::app::agent_rating_write::PreparedRatingTarget;
+        use crate::rating_db::{RatingItemKind, RatingMeta};
+        use mimageviewer_agent_ipc::{AgentLevel, ItemRef, Payload};
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path = app.tmp.path().join("agent-remote.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+            .save(&path)
+            .unwrap();
+        let key = crate::adjustment_db::normalize_path(&path);
+        let meta = RatingMeta::new(RatingItemKind::Image).with_source_path(&path);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 1, Some(&meta))
+            .unwrap();
+        let session = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(session.clone());
+        app.initialized = true;
+        app.indexer_init = crate::app::IndexerInit::Unavailable;
+        app.settings.agent_level = AgentLevel::Organize;
+        let ctx = egui::Context::default();
+        app.install_agent_changes(crate::agent_ipc::changes::ChangeController::new(), &ctx);
+        let controller = OpenController::new(Some(session.clone()));
+        app.install_agent_open(controller.clone(), &ctx);
+        let engine = CollectionEngine::new(app.settings.clone());
+        let request = |stars| CollectionRequest {
+            kind: CollectionKind::Rating { stars },
+            spread_mode: None,
+            reading_direction: None,
+            force_single_page: false,
+        };
+        assert_eq!(
+            collection_success(engine.collection(request(1))).entries[0].rating,
+            Some(1)
+        );
+        let write = PreparedWrite::Ratings(PreparedRatings {
+            items: vec![PreparedItem {
+                input: ItemRef {
+                    path: path.to_string_lossy().into_owned(),
+                    subresource: None,
+                },
+                target: Ok(PreparedRatingTarget {
+                    key,
+                    legacy_key: None,
+                    source: path.clone(),
+                    meta,
+                    xmp_target: None,
+                    compiled_book_page: false,
+                }),
+            }],
+            stars: 4,
+            client_name: "Remote ordering fixture".into(),
+        });
+        let (notice, queued) = std::sync::mpsc::channel();
+        controller.set_enqueue_observer(notice);
+        let worker = std::thread::spawn(move || {
+            controller.execute_prepared_for_test(
+                write,
+                &AtomicBool::new(false),
+                Arc::new(crate::ui_request_dispatch::UiRequestDispatch::pending()),
+                Duration::from_secs(5),
+            )
+        });
+        queued.recv_timeout(Duration::from_secs(10)).unwrap();
+        app.poll_agent_open_requests(&ctx);
+        assert!(matches!(
+            worker.join().unwrap().unwrap(),
+            UiOpenOutcome::Written(Ok(Payload::RatingWrite(_)))
+        ));
+
+        // Remote takes ownership only after UI acceptance has returned its
+        // committed result. Reuse the actual Remote collection reader, which
+        // opens its own read-only rating connection on each fetch.
+        session.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "remote-after-agent-write".into(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        assert!(session.snapshot().phase.blocks_local_control());
+        let after = collection_success(engine.collection(request(4)));
+        assert_eq!(after.entries.len(), 1);
+        assert_eq!(after.entries[0].path, path.to_string_lossy());
+        assert_eq!(after.entries[0].rating, Some(4));
+        assert!(
+            collection_success(engine.collection(request(1)))
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn g1_rating_and_smart_handlers_start_single_and_accept_only_temporary_mode() {
         let _data = crate::data_dir::TestDataDirGuard::new();
         let _ratings =

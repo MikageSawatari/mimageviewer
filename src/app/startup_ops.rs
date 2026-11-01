@@ -174,32 +174,41 @@ impl App {
             if !request.try_claim() {
                 continue;
             }
-            let outcome = if self.settings.agent_level
-                < mimageviewer_agent_ipc::AgentLevel::ReadAndOpen
-            {
-                Err(mimageviewer_agent_ipc::AgentError::new(
-                    mimageviewer_agent_ipc::ErrorCode::Disabled,
-                    "mIV で開く許可がありません",
-                ))
-            } else if let Some(reason) = self.activation_open_precheck(Some(&request.activation)) {
-                Err(reason.agent_error())
-            } else {
-                match self.start_startup_open_path_resolve(
-                    request.activation.path.clone(),
-                    StartupOpenPathSource::Agent,
-                    ctx,
-                ) {
-                    StartupOpenAdmission::Admitted => Ok(()),
-                    StartupOpenAdmission::Refused(reason) => Err(reason.agent_error()),
-                    StartupOpenAdmission::Requeued => {
-                        Err(ActivationOpenRefusal::Internal.agent_error())
-                    }
+            match &request.kind {
+                crate::agent_ipc::open::UiRequestKind::TagWrite(_)
+                | crate::agent_ipc::open::UiRequestKind::RatingWrite(_) => {
+                    let outcome = self.admit_agent_metadata_write(&request.kind);
+                    request.complete(outcome);
                 }
-            };
-            request.complete(match outcome {
-                Ok(()) => crate::agent_ipc::open::UiOpenOutcome::Admitted,
-                Err(error) => crate::agent_ipc::open::UiOpenOutcome::Refused(error),
-            });
+                crate::agent_ipc::open::UiRequestKind::Open(activation) => {
+                    let outcome = if self.settings.agent_level
+                        < mimageviewer_agent_ipc::AgentLevel::ReadAndOpen
+                    {
+                        Err(mimageviewer_agent_ipc::AgentError::new(
+                            mimageviewer_agent_ipc::ErrorCode::Disabled,
+                            "mIV で開く許可がありません",
+                        ))
+                    } else if let Some(reason) = self.activation_open_precheck(Some(activation)) {
+                        Err(reason.agent_error())
+                    } else {
+                        match self.start_startup_open_path_resolve(
+                            activation.path.clone(),
+                            StartupOpenPathSource::Agent,
+                            ctx,
+                        ) {
+                            StartupOpenAdmission::Admitted => Ok(()),
+                            StartupOpenAdmission::Refused(reason) => Err(reason.agent_error()),
+                            StartupOpenAdmission::Requeued => {
+                                Err(ActivationOpenRefusal::Internal.agent_error())
+                            }
+                        }
+                    };
+                    request.complete(match outcome {
+                        Ok(()) => crate::agent_ipc::open::UiOpenOutcome::Admitted,
+                        Err(error) => crate::agent_ipc::open::UiOpenOutcome::Refused(error),
+                    });
+                }
+            }
         }
     }
 
@@ -5035,3 +5044,6 @@ mod tests {
         assert_eq!(result.bookmark_relative_page_openable, Some(false));
     }
 }
+
+#[path = "agent_metadata_write.rs"]
+mod agent_metadata_write;

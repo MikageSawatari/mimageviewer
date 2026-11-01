@@ -1,4 +1,5 @@
-//! Agent-only admission into the existing UI open path. No display state lives here.
+//! One agent UI admission owner for Open, tags and ratings. Open keeps the
+//! existing activation path; metadata targets are prepared on workers.
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -41,13 +42,30 @@ impl Drop for OpenPermit {
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum UiOpenOutcome {
     Admitted,
+    Written(Result<mimageviewer_agent_ipc::Payload, AgentError>),
     Refused(AgentError),
 }
 
+pub(crate) enum UiRequestKind {
+    Open(ActivationOpenPath),
+    TagWrite(super::metadata_write::PreparedTags),
+    RatingWrite(super::metadata_write::PreparedRatings),
+}
+
+impl From<super::metadata_write::PreparedWrite> for UiRequestKind {
+    fn from(write: super::metadata_write::PreparedWrite) -> Self {
+        match write {
+            super::metadata_write::PreparedWrite::Tags(write) => Self::TagWrite(write),
+            super::metadata_write::PreparedWrite::Ratings(write) => Self::RatingWrite(write),
+        }
+    }
+}
+
 pub(crate) struct UiOpenRequest {
-    pub(crate) activation: ActivationOpenPath,
+    pub(crate) kind: UiRequestKind,
     dispatch: Arc<UiRequestDispatch>,
     reply: mpsc::SyncSender<UiOpenOutcome>,
 }
@@ -130,6 +148,65 @@ impl OpenController {
         dispatch: Arc<UiRequestDispatch>,
         timeout: Duration,
     ) -> Result<OpenResult, AgentError> {
+        let outcome = self.dispatch_request(cancel, dispatch.clone(), timeout, || {
+            let path = super::input_path::validate(&path)?;
+            #[cfg(test)]
+            {
+                let hook = self.validation_hook.lock().unwrap().clone();
+                if let Some(hook) = hook {
+                    hook(path);
+                }
+            }
+            // Worker-only I/O. Do not let the ordinary resolver walk up to a parent
+            // when the requested path is absent, or disclose OS errors and paths.
+            if !path.try_exists().map_err(|_| open_failed())? {
+                return Err(super::error(
+                    ErrorCode::BadRequest,
+                    "指定されたファイルまたはフォルダがありません",
+                ));
+            }
+            let activation = ActivationOpenPath::received(path.to_owned(), self.session.as_ref());
+            if activation.remote_owned_at_receive {
+                return Err(super::error(
+                    ErrorCode::Busy,
+                    "mIV Remote の操作中は開けません",
+                ));
+            }
+            Ok(UiRequestKind::Open(activation))
+        })?;
+        outcome_result(outcome)
+    }
+
+    pub(super) fn execute_write(
+        self: &Arc<Self>,
+        command: mimageviewer_agent_ipc::Command,
+        ctx: &super::ReadContext,
+        client_name: String,
+        dispatch: Arc<UiRequestDispatch>,
+    ) -> Result<UiOpenOutcome, AgentError> {
+        self.dispatch_request(&ctx.cancel, dispatch, UI_REPLY_TIMEOUT, || {
+            super::metadata_write::prepare(command, ctx, client_name).map(UiRequestKind::from)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_prepared_for_test(
+        self: &Arc<Self>,
+        prepared: super::metadata_write::PreparedWrite,
+        cancel: &AtomicBool,
+        dispatch: Arc<UiRequestDispatch>,
+        timeout: Duration,
+    ) -> Result<UiOpenOutcome, AgentError> {
+        self.dispatch_request(cancel, dispatch, timeout, || Ok(prepared.into()))
+    }
+
+    fn dispatch_request(
+        self: &Arc<Self>,
+        cancel: &AtomicBool,
+        dispatch: Arc<UiRequestDispatch>,
+        timeout: Duration,
+        prepare: impl FnOnce() -> Result<UiRequestKind, AgentError>,
+    ) -> Result<UiOpenOutcome, AgentError> {
         if self
             .active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -149,29 +226,7 @@ impl OpenController {
         if cancel.load(Ordering::Acquire) || dispatch.is_cancelled() {
             return Err(cancelled());
         }
-        let path = super::input_path::validate(&path)?;
-        #[cfg(test)]
-        {
-            let hook = self.validation_hook.lock().unwrap().clone();
-            if let Some(hook) = hook {
-                hook(path);
-            }
-        }
-        // Worker-only I/O. Do not let the ordinary resolver walk up to a parent
-        // when the requested path is absent, or disclose OS errors and paths.
-        if !path.try_exists().map_err(|_| open_failed())? {
-            return Err(super::error(
-                ErrorCode::BadRequest,
-                "指定されたファイルまたはフォルダがありません",
-            ));
-        }
-        let activation = ActivationOpenPath::received(path.to_owned(), self.session.as_ref());
-        if activation.remote_owned_at_receive {
-            return Err(super::error(
-                ErrorCode::Busy,
-                "mIV Remote の操作中は開けません",
-            ));
-        }
+        let kind = prepare()?;
         if cancel.load(Ordering::Acquire) || dispatch.is_cancelled() {
             return Err(cancelled());
         }
@@ -182,7 +237,7 @@ impl OpenController {
         crate::single_instance::signal_activate_existing();
         sender
             .send(UiOpenRequest {
-                activation,
+                kind,
                 dispatch: Arc::clone(&dispatch),
                 reply,
             })
@@ -213,14 +268,14 @@ impl OpenController {
                 }
                 // The UI owns the acceptance decision now. Cancellation and
                 // timeouts may not replace its single, synchronous reply.
-                return outcome(receiver.recv().map_err(|_| open_failed())?);
+                return receiver.recv().map_err(|_| open_failed());
             }
             match receiver.recv_timeout(
                 deadline
                     .saturating_duration_since(Instant::now())
                     .min(CANCEL_CHECK_INTERVAL),
             ) {
-                Ok(reply) => return outcome(reply),
+                Ok(reply) => return Ok(reply),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Err(open_failed()),
             }
@@ -228,13 +283,14 @@ impl OpenController {
     }
 }
 
-fn outcome(reply: UiOpenOutcome) -> Result<OpenResult, AgentError> {
+fn outcome_result(reply: UiOpenOutcome) -> Result<OpenResult, AgentError> {
     match reply {
         UiOpenOutcome::Admitted => Ok(OpenResult {
             status: OpenStatus::Accepted,
             message: "mIV で開く処理を始めました".to_owned(),
         }),
         UiOpenOutcome::Refused(error) => Err(error),
+        UiOpenOutcome::Written(_) => Err(open_failed()),
     }
 }
 

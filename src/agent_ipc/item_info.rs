@@ -276,28 +276,59 @@ pub(super) struct ZipRead {
     pub(super) legacy_name: String,
     pub(super) size: Option<u64>,
     pub(super) modified: Option<i64>,
-    // None means the leaf or an intermediate archive exceeded the bound.
+    // With payload reads enabled, None means the leaf or an intermediate
+    // archive exceeded the bound. Identity-only reads always leave this None;
+    // size=None then denotes an intermediate archive that could not be read.
     pub(super) bytes: Option<Vec<u8>>,
 }
 
 pub(super) fn read_zip(path: &Path, member: &str, cancel: &AtomicBool) -> std::io::Result<ZipRead> {
+    read_zip_with_leaf_bytes(path, member, cancel, true)
+}
+
+/// Canonical and legacy identities require no decompression of the image.
+/// Only intermediate nested ZIPs are read, with the normal bounded reader.
+pub(super) fn read_zip_identity(
+    path: &Path,
+    member: &str,
+    cancel: &AtomicBool,
+) -> std::io::Result<ZipRead> {
+    read_zip_with_leaf_bytes(path, member, cancel, false)
+}
+
+fn read_zip_with_leaf_bytes(
+    path: &Path,
+    member: &str,
+    cancel: &AtomicBool,
+    read_leaf_bytes: bool,
+) -> std::io::Result<ZipRead> {
     match crate::zip_loader::open_archive(path)? {
         crate::zip_loader::ZipArchiveHandle::Zip(archive) => {
-            read_zip_member(archive, member, cancel)
+            read_zip_member_impl(archive, member, cancel, read_leaf_bytes)
         }
         crate::zip_loader::ZipArchiveHandle::Rar(_) => Err(std::io::ErrorKind::InvalidInput.into()),
     }
 }
 
+#[cfg(test)]
 fn read_zip_member<R: Read + Seek>(
+    archive: zip::ZipArchive<R>,
+    member: &str,
+    cancel: &AtomicBool,
+) -> std::io::Result<ZipRead> {
+    read_zip_member_impl(archive, member, cancel, true)
+}
+
+fn read_zip_member_impl<R: Read + Seek>(
     mut archive: zip::ZipArchive<R>,
     member: &str,
     cancel: &AtomicBool,
+    read_leaf_bytes: bool,
 ) -> std::io::Result<ZipRead> {
     // Literal full names take precedence over nested boundaries, as in the
     // existing read_entry_bytes path (including flattened conversion caches).
     match crate::zip_loader::resolve_entry_index(&mut archive, member, None, Some(cancel)) {
-        Ok(index) => return read_zip_index(&mut archive, index, cancel),
+        Ok(index) => return read_zip_index(&mut archive, index, cancel, read_leaf_bytes),
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
         Err(_) => {}
     }
@@ -306,7 +337,7 @@ fn read_zip_member<R: Read + Seek>(
         return Err(std::io::ErrorKind::NotFound.into());
     };
     let index = crate::zip_loader::resolve_entry_index(&mut archive, first, None, Some(cancel))?;
-    let outer = read_zip_index(&mut archive, index, cancel)?;
+    let outer = read_zip_index(&mut archive, index, cancel, true)?;
     let Some(bytes) = outer.bytes else {
         return Ok(ZipRead {
             name: member.to_owned(),
@@ -320,7 +351,7 @@ fn read_zip_member<R: Read + Seek>(
     // The 64 MiB bound must not multiply by the number of nesting levels.
     drop(archive);
     let inner = zip::ZipArchive::new(Cursor::new(bytes)).map_err(std::io::Error::other)?;
-    let mut result = read_zip_member(inner, &remainder.join("/"), cancel)?;
+    let mut result = read_zip_member_impl(inner, &remainder.join("/"), cancel, read_leaf_bytes)?;
     result.name = format!("{}/{}", outer.name, result.name);
     result.legacy_name = format!("{}/{}", outer.legacy_name, result.legacy_name);
     Ok(result)
@@ -330,6 +361,7 @@ fn read_zip_index<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     index: usize,
     cancel: &AtomicBool,
+    read_bytes: bool,
 ) -> std::io::Result<ZipRead> {
     // Raw metadata is inspected before constructing a decompressor or reserving
     // the member's declared size. Actual reads get an independent hard cap.
@@ -344,7 +376,7 @@ fn read_zip_index<R: Read + Seek>(
         modified: entry.last_modified().and_then(zip_milliseconds),
         bytes: None,
     };
-    if entry.size() > MAX_ZIP_BYTES {
+    if !read_bytes || entry.size() > MAX_ZIP_BYTES {
         return Ok(result);
     }
     drop(entry);

@@ -11013,6 +11013,59 @@ mod tests {
     }
 
     #[test]
+    fn agent_rating_shared_publication_updates_smart_membership_once() {
+        use crate::app::agent_rating_write::{PreparedRatingTarget, RatingTargetStatus};
+        use crate::rating_db::{RatingItemKind, RatingMeta};
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("agent-smart-membership");
+        let allowed = [false, false, false, false, false, true];
+        let keys = install_rating_rule_test_root(
+            &mut app,
+            root.clone(),
+            &[
+                ("a.png", SmartFolderEntryKind::Image, 5),
+                ("b.png", SmartFolderEntryKind::Image, 4),
+            ],
+            allowed,
+            false,
+        );
+        wait_for_smart_rating_membership(&mut app);
+        let target = |index: usize, name: &str| {
+            let path = root.join(name);
+            PreparedRatingTarget {
+                key: keys[index].clone(),
+                legacy_key: None,
+                source: path.clone(),
+                meta: RatingMeta::new(RatingItemKind::Image).with_source_path(&path),
+                xmp_target: Some(path),
+                compiled_book_page: false,
+            }
+        };
+        let publications = app.rating_publication_count;
+        let undo = app.meta_undo.undo_len();
+        let result = app.apply_agent_rating_targets(&[target(0, "a.png"), target(1, "b.png")], 4);
+        assert_eq!(result[0].status, RatingTargetStatus::Changed);
+        assert_eq!(result[1].status, RatingTargetStatus::Unchanged);
+        assert!(
+            app.visible_indices.is_empty(),
+            "departing member is excluded before paint"
+        );
+        assert_eq!(app.rating_publication_count, publications + 1);
+        assert_eq!(app.meta_undo.undo_len(), undo);
+        wait_for_smart_rating_membership(&mut app);
+        app.apply_agent_rating_targets(&[target(1, "b.png")], 5);
+        wait_for_smart_rating_membership(&mut app);
+        let names = app
+            .visible_indices
+            .iter()
+            .map(|&index| app.items[index].name().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["b.png"]);
+        assert_eq!(app.rating_publication_count, publications + 2);
+    }
+
+    #[test]
     fn rating_smart_membership_drops_departure_before_paint_and_appends_entrant() {
         let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = crate::app::setup_app_for_test();

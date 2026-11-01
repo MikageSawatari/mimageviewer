@@ -1,5 +1,12 @@
 use super::*;
 
+fn open_activation(request: &UiOpenRequest) -> &ActivationOpenPath {
+    match &request.kind {
+        UiRequestKind::Open(activation) => activation,
+        _ => panic!("expected the unchanged Open request"),
+    }
+}
+
 #[test]
 fn not_installed_returns_not_ready_and_releases_permit() {
     let controller = OpenController::new(None);
@@ -107,9 +114,12 @@ mod filesystem {
                 Duration::from_secs(2),
             );
             let request = queue.recv_timeout(Duration::from_secs(2)).unwrap();
-            assert_eq!(request.activation.path.to_string_lossy(), requested);
-            assert_eq!(request.activation.acquisition_sequence_at_receive, None);
-            assert!(!request.activation.remote_owned_at_receive);
+            assert_eq!(open_activation(&request).path.to_string_lossy(), requested);
+            assert_eq!(
+                open_activation(&request).acquisition_sequence_at_receive,
+                None
+            );
+            assert!(!open_activation(&request).remote_owned_at_receive);
             assert!(request.try_claim());
             request.complete(UiOpenOutcome::Admitted);
             let result = worker.join().unwrap().unwrap();
@@ -354,10 +364,10 @@ mod filesystem {
         );
         let request = queue.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(
-            request.activation.acquisition_sequence_at_receive,
+            open_activation(&request).acquisition_sequence_at_receive,
             Some(before.acquisition_sequence)
         );
-        assert!(!request.activation.remote_owned_at_receive);
+        assert!(!open_activation(&request).remote_owned_at_receive);
         assert!(request.try_claim());
         request.complete(UiOpenOutcome::Admitted);
         assert!(worker.join().unwrap().is_ok());

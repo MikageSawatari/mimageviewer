@@ -1,4 +1,4 @@
-//! Agent reads and an admission-only bridge to the existing main-window open.
+//! Agent reads and a shared UI admission bridge for open and metadata writes.
 use std::path::Path;
 use std::sync::{
     Arc, Mutex,
@@ -14,6 +14,10 @@ mod folder;
 mod input_path;
 mod item_info;
 mod library;
+mod metadata_response;
+#[cfg(test)]
+mod metadata_response_tests;
+pub(crate) mod metadata_write;
 pub(crate) mod open;
 mod open_response;
 mod recent;
@@ -361,10 +365,17 @@ impl Connection {
             reject(error(ErrorCode::Disabled, "mIV で開く許可がありません"));
             return None;
         }
-        if collection_write::is_write(&request.command) && granted.0.level < AgentLevel::Organize {
+        if (collection_write::is_write(&request.command)
+            || metadata_write::is_write(&request.command))
+            && granted.0.level < AgentLevel::Organize
+        {
             reject(error(
                 ErrorCode::Disabled,
-                "コレクションを変更する許可がありません",
+                if metadata_write::is_write(&request.command) {
+                    "タグ・★を変更する許可がありません"
+                } else {
+                    "コレクションを変更する許可がありません"
+                },
             ));
             return None;
         }
@@ -394,6 +405,20 @@ impl Connection {
                         id,
                         tool,
                         client,
+                    );
+                    return;
+                }
+                if metadata_write::is_write(&request.command) {
+                    metadata_response::respond(
+                        connection,
+                        request.command,
+                        permit,
+                        context,
+                        replies,
+                        started,
+                        id,
+                        client,
+                        tool,
                     );
                     return;
                 }
@@ -480,7 +505,10 @@ fn request_log_line(
 ) -> String {
     let (count, error_kind) = result_summary(result);
     let outcome = match result {
-        Ok(Payload::Opened(_)) | Ok(Payload::CollectionWrite(_)) => "accepted",
+        Ok(Payload::Opened(_))
+        | Ok(Payload::CollectionWrite(_))
+        | Ok(Payload::TagWrite(_))
+        | Ok(Payload::RatingWrite(_)) => "accepted",
         Err(_) => "refused",
         _ => "ok",
     };
@@ -508,6 +536,9 @@ fn tool_name(command: &Command) -> &'static str {
         Command::RenameCollection { .. } => "rename_collection",
         Command::AddToCollection { .. } => "add_to_collection",
         Command::RemoveFromCollection { .. } => "remove_from_collection",
+        Command::AddTags { .. } => "add_tags",
+        Command::RemoveTags { .. } => "remove_tags",
+        Command::SetRating { .. } => "set_rating",
         Command::Cancel { .. } => "cancel",
     }
 }
@@ -535,6 +566,19 @@ fn result_summary(result: &Result<Payload, AgentError>) -> (usize, &'static str)
                     })
                     .sum(),
             },
+            "none",
+        ),
+        Ok(Payload::TagWrite(result)) | Ok(Payload::RatingWrite(result)) => (
+            result
+                .outcomes
+                .iter()
+                .map(|outcome| match outcome {
+                    MetadataItemOutcome::Queued { indices }
+                    | MetadataItemOutcome::Changed { indices }
+                    | MetadataItemOutcome::Unchanged { indices }
+                    | MetadataItemOutcome::Skipped { indices, .. } => indices.len(),
+                })
+                .sum(),
             "none",
         ),
         Ok(Payload::Opened(_)) => (1, "none"),
@@ -666,7 +710,10 @@ impl Handlers {
             | Command::CreateCollection { .. }
             | Command::RenameCollection { .. }
             | Command::AddToCollection { .. }
-            | Command::RemoveFromCollection { .. } => {
+            | Command::RemoveFromCollection { .. }
+            | Command::AddTags { .. }
+            | Command::RemoveTags { .. }
+            | Command::SetRating { .. } => {
                 unreachable!()
             }
         })();

@@ -42,6 +42,7 @@ pub const MAX_INFO_LIMIT: u32 = 50;
 pub const DEFAULT_FOLDER_LIMIT: u32 = 100;
 pub const MAX_THUMBNAIL_ITEMS: usize = 20;
 pub const MAX_WRITE_ITEMS: usize = 500;
+pub const MAX_WRITE_TAGS: usize = 10;
 pub const DEFAULT_THUMBNAIL_SIDE: u32 = 256;
 pub const MAX_THUMBNAIL_SIDE: u32 = 512;
 pub const MAX_THUMBNAIL_IMAGE_BYTES: usize = 256 * 1024;
@@ -147,6 +148,18 @@ pub enum Command {
         id: String,
         items: Vec<ItemRef>,
     },
+    AddTags {
+        items: Vec<ItemRef>,
+        tags: Vec<String>,
+    },
+    RemoveTags {
+        items: Vec<ItemRef>,
+        tags: Vec<String>,
+    },
+    SetRating {
+        items: Vec<ItemRef>,
+        stars: u8,
+    },
     Cancel {
         request_id: u64,
     },
@@ -170,6 +183,8 @@ pub enum Payload {
     Thumbnails(ThumbnailResponse),
     Opened(OpenResult),
     CollectionWrite(CollectionWriteResult),
+    TagWrite(MetadataWriteResult),
+    RatingWrite(MetadataWriteResult),
     Cancelled,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,6 +245,39 @@ pub enum CollectionSkipReason {
     NotFound,
     UnsupportedSubresource,
     UnsupportedType,
+}
+/// Input positions are grouped by status/reason, with every input represented
+/// exactly once. Tag acceptance is Queued; its actual result appears in the
+/// in-memory change record. Ratings return Changed/Unchanged after writing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetadataWriteResult {
+    pub outcomes: Vec<MetadataItemOutcome>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MetadataItemOutcome {
+    Queued {
+        indices: Vec<u16>,
+    },
+    Changed {
+        indices: Vec<u16>,
+    },
+    Unchanged {
+        indices: Vec<u16>,
+    },
+    Skipped {
+        indices: Vec<u16>,
+        reason: MetadataSkipReason,
+    },
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataSkipReason {
+    InvalidPath,
+    NotFound,
+    UnsupportedType,
+    UnsupportedSubresource,
+    Unavailable,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -785,6 +833,83 @@ mod tests {
             serde_json::to_value(ErrorCode::Conflict).unwrap(),
             "conflict"
         );
+    }
+
+    #[test]
+    fn metadata_write_wire_roundtrips_and_full_batch_outcomes_fit_budget() {
+        assert_eq!(AGENT_PROTOCOL_VERSION, 2);
+        let reference = ItemRef {
+            path: "C:/本.zip".into(),
+            subresource: Some("001.png".into()),
+        };
+        for command in [
+            Command::AddTags {
+                items: vec![reference.clone()],
+                tags: vec!["猫".into()],
+            },
+            Command::RemoveTags {
+                items: vec![reference.clone()],
+                tags: vec!["猫".into()],
+            },
+            Command::SetRating {
+                items: vec![reference],
+                stars: 0,
+            },
+        ] {
+            let mut bytes = vec![];
+            write_frame(&mut bytes, &command).unwrap();
+            assert_eq!(
+                read_frame::<_, Command>(&mut &bytes[..]).unwrap(),
+                Some(command)
+            );
+        }
+        for payload in [
+            Payload::TagWrite(MetadataWriteResult {
+                outcomes: vec![MetadataItemOutcome::Queued {
+                    indices: (0..MAX_WRITE_ITEMS as u16).collect(),
+                }],
+            }),
+            Payload::RatingWrite(MetadataWriteResult {
+                outcomes: vec![
+                    MetadataItemOutcome::Changed {
+                        indices: (0..200).collect(),
+                    },
+                    MetadataItemOutcome::Unchanged {
+                        indices: (200..400).collect(),
+                    },
+                    MetadataItemOutcome::Skipped {
+                        indices: (400..500).collect(),
+                        reason: MetadataSkipReason::Unavailable,
+                    },
+                ],
+            }),
+        ] {
+            let response = Response {
+                id: 1,
+                result: Ok(payload),
+            };
+            let value = serde_json::to_value(&response).unwrap();
+            assert_eq!(serde_json::from_value::<Response>(value).unwrap(), response);
+            assert!(mcp_content_chars(&response).unwrap() < MAX_PAGE_CHARS);
+        }
+        assert_eq!(MAX_WRITE_TAGS, 10);
+        for reason in [
+            MetadataSkipReason::InvalidPath,
+            MetadataSkipReason::NotFound,
+            MetadataSkipReason::UnsupportedType,
+            MetadataSkipReason::UnsupportedSubresource,
+            MetadataSkipReason::Unavailable,
+        ] {
+            let outcome = MetadataItemOutcome::Skipped {
+                indices: vec![0],
+                reason,
+            };
+            let value = serde_json::to_value(&outcome).unwrap();
+            assert_eq!(
+                serde_json::from_value::<MetadataItemOutcome>(value).unwrap(),
+                outcome
+            );
+        }
     }
 
     #[test]

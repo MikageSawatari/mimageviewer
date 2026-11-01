@@ -4093,3 +4093,142 @@ cargo test -p mimageviewer --test ui_snapshot
   直した (§22.6)。生の tool 名を日本語の要約と並べる表示は、AI 側の呼び出しと照合できるので維持でよいという判定。
 - 2 巡目 (`228185d54`): 追加の指摘なし。判定は「2-1 impl: accepted」。
 - 実 AI アプリ・実 core での変更・画面の追従の確認は未実施 (段階 1 の実機確認とまとめて利用者に頼む)。
+
+## 23. 段階 2-2 の実装記録
+
+### 23.1 前提の照合と担当範囲
+
+基点 `0df285ac2`、観測者は実装担当 (担当サブエージェントを含む)。独立レビューではない。
+§21 全体、§22、§15.6/§18、§5.4 とタグ/XMPの保存先を確認し、次を実装前にコードで照合した。
+
+- 1c の `OpenController` は一つの active permit と `UiRequestDispatch` を持ち、未設置拒否・5秒の
+  Pending取消・Claimed後の応答待ちを所有する。`open_response` の外側20秒期限とも同じ CAS を共有している。
+  `startup_ops` の App poll は初期open後/二重起動poll前で、起動overlayの前にも拒否する。
+- `tag_ops::request_tag_set_for_targets` の上位には編集履歴の区切り・Undo・利用者用toastがある。
+  worker は `tx_id` と DB の `tags_before` / `tags_after` を返すので、その下で origin を分けられる。
+  現行 Add/Remove の全置換は、差分操作に置き換える必要があった。
+- `TagWriteHandle::has_unconsumed_batch` は存在するが、結果公開より前に done を進めていた。
+  rename/mergeとの排他は、結果の採用までを含めて閉じる必要がある。
+- ★には deferred writer と App-global ledger があり、item と named-container で後処理が分かれていた。
+  共通化には DB だけでなく cache/count/identity/smart-folder/XMP を含める必要がある。
+  `RatingWriteHandle` は XMP 専用で、正本DBへの同期書き込みの所有者ではない。
+- ZIP の現行名/CP932旧名は1bの同じ読取から得られる。PDFページの既存指定は厳密な `page_N`。
+  RatingMeta (briefの RatingItemMeta の材料に相当) と各 page key の既存の構築規則を使う。
+  製本ページの判定用 `Settings::books_root_path` は既定時にOSの既知フォルダを解決するため worker 側で済ませる。
+- `ChangeController::publish/update` はキュー中の行を同じrecord idで埋め直せ、evict済みを復活させず、
+  更新時に2回目のtoastを出さない。新しい永続表・settings接続・Remote writerは不要。
+
+設計の前提を覆す矛盾は確認していない。detached述語・viewport routing・contextをまたぐタグ公開は変更しない。
+
+### 23.2 実装と選択
+
+- IPC v2 (未出荷のため据え置き) に `AddTags` / `RemoveTags` / `SetRating` と grouped typed outcome を追加。
+  Organizeだけが新3 toolを公開し、合計18 tool。上限500項目・10タグ・★0～5、指定annotations、schema、
+  structuredContentと同じtextを実装。タグの説明は受理と完了を区別し、実際の結果を変更記録で見る旨を書く。
+- UI要求は一つの既存controller/channel/permitを保ち、kindを `Open` / `TagWrite` / `RatingWrite` に広げた。
+  呼出し元のhook/内部controller名は既存を保って変更を狭めた。共通の既存activation eventでhidden UIも起こし、
+  metadata要求からresolverやfolder/viewer openは呼ばない。Openのassertionの期待値は変えず、テスト中のpayload取得だけ
+  enumのOpen variantへ合わせた。
+- `metadata_write` は全タグ名を先に正規化/検査し、項目のpath・存在・種類・ZIP名・PDF範囲・RatingMeta・
+  sidecar/XMP対象・製本ページflagをworkerで用意する。現在設定は既存settings_dbから読む。
+  ZIPは共有readのidentity-only入口を追加し、葉の画像を展開しない。入れ子ZIPのbytes読取は既存64MiB上限/取消を保つ。
+  既存 `read_zip` の画像bytes経路とUI/searchの解釈は不変。PDFは無記名のsizes読取を使い、実IPCが戻るまでpermitを保つ。
+- Appはclaim後に許可と全blocking stateを副作用なしで検査する。RemoteのLocal確認と受理の確定だけを
+  `with_local_composition_admission` の中で行い、DB/公開/recordはlock外。起動中・改名統合(タグのみ)・製本処理・
+  Append Undo・メタ情報処理・rename移行・sidecar復元・構成編集/保存・文書modalに理由つきで拒否する。
+  `Written` の結果は成功/失敗とも AcceptedOperation。Pendingだけが取消/期限で止まり、Claimed後は一度のUI応答を待つ。
+- タグは `submit_tag_set_lower` をUIと共有し、agentは上位の編集境界/Undo/user-toastを通らない。
+  tx_idは利用者と同じcheckedな単一UI発行元。typed originはrecord id/行と対応し、writer結果をUndoと利用者toastの集計より先に分ける。
+  正本DBは差分で変更し、既存タグの時刻/表示名を保持、no-opでは保存しない。recordは受理時「処理中」、完了後に実DBの前後で更新する。
+  ユーザーtoast用の未採用カウンタを全jobのカウンタから分け、agentだけの処理が利用者の保留ラベル/発火面を消さない。
+- タグの改名・統合はjobまたは未採用結果がある間は始めない。結果送信→done Release、UIはdone Acquireと
+  result queueのdrained確認の後にカウンタをretireする。改名中はタグのUndo/Redoだけをpop前に拒否し、★・補正のUndo/Redoは保つ。
+  実際にagentのタグ変更を採用した時だけAppend Undo受領票を無効化する (no-op/失敗/拒否では触らない)。
+- ★は `write_user_rating_canonical_shared_deferred_from` と既存writerがcommit後のledger/log境界を共有し、
+  item/named-container/agentが同じ後処理を通る。typed policyで既存UIのcache無効化・smart refresh条件を保持する。
+  agentはDB/cache/親件数/count invalidation/identity/smart refresh/XMPを適用し、公開/再構築は1回。
+  同値ではDB/ledger/XMPへ書かない。ZIPは各項目のtransactionで旧row削除と新keyへの設定/0削除を行い、
+  前値は新key優先→旧key。既存のXMP hydration fenceをDB書込前に立て、ZIP単位のmigrationは呼ばない。
+  XMPは利用者設定ONかつ既存UIの対象画像のみ、製本ページflagはworkerで確定。XMP_WRITE_LOCKの既存workerを使う。
+- tool一覧の最初の実装は44,538文字で既定40,000を超えた。上限や機能は変えず、get_item_info/write tool内の
+  同一schemaをローカル `$defs` へまとめ、説明を意味保持で短くした。展開後のschema同等性と、全権限/画像/GPS/legacy・modern/
+  numeric・UUID・64文字idで512文字以上の余裕を検査する。これはbudgetに収める実装調整で、上限緩和や新たな機能制限ではない。
+- agent laneはtool/count/outcome/durationのみ。共有tag/rating writerのpath/タグログは既存の方針のまま。
+  public docs、クロスcontextのタグ公開、collection toolは本sliceで変更しない。
+
+### 23.3 検証の途中経過
+
+以下は実装担当自身の観測であり、sandbox外の観測を代用していない。
+
+- 最初のcore check: exit 0、59.59s (`target/mcp-stage2-2-core-check-first.log`)。
+- crateの途中: test側のid整数型compile mismatch (exit 101) と、18tool一覧のbudget超過 (exit 101) を修正した。
+  budget調整後の全crate gateは exit 101、agent-ipc 15/15、MCP 63成功/2失敗 (既知のpipe OS5のみ)。
+  `target/mcp-stage2-2-crate-tests.log`。最終の説明短縮後のstage2回帰6/6とschema参照展開同等1/1はexit 0
+  (`target/mcp-stage2-2-adapter-targeted.log`、`target/mcp-stage2-2-schema-equivalence.log`)。
+- core新規focusedの初回はexit 101。一般化後も既存Openテストが旧struct fieldを直接読んでいた5か所のcompile errorで、
+  Open variantを読むtest helperへ合わせた。期待値やケースは変えていない (`target/mcp-stage2-2-new-focused.log`)。
+
+### 23.4 最終検証・引継ぎ
+
+すべて実装担当自身のsandbox内の観測。途中の新規focusedは59件中58成功/1失敗でexit 100
+(`target/mcp-stage2-2-new-focused-final.log`)。export/importのテストfixtureに実フォルダの走査済みmarkerがなく、
+既存のUI入口が正しく拒否していたため、fixtureを整えた (製品の検査は緩めていない)。最終の全focusedで当該15状態のテストも成功した。
+
+| コマンド | 実 exit | 結果 / ログ |
+|---|---:|---|
+| `cargo fmt` / `cargo fmt --check` | 0 / 0 | workspace全体。`target/mcp-stage2-2-fmt.log`、`target/mcp-stage2-2-fmt-check.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` (最終) | 0 | 39.78s、`target/mcp-stage2-2-core-check-final.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` (最終) | 101 | IPC 15/15、MCP 63成功/2失敗。`target/mcp-stage2-2-crate-tests-final.log` |
+| §22.4 + tag/rating/Undo/Remote collection focused nextest (下記) | 100 | 1,516件中1,514成功/2失敗。compile 2m49s、実行99.737s。`target/mcp-stage2-2-focused.log` |
+| `cargo test --test ui_snapshot` (UPDATE指定なし) | 0 | 222/222、実行38.50s、`target/mcp-stage2-2-ui-snapshot.log` |
+| `python scripts/check_ui_glyphs.py` (最終) | 0 | 危険なUI glyphなし、`target/mcp-stage2-2-glyphs.log` |
+| `git diff --check` | 0 | LF/CRLF warningのみ、`target/mcp-stage2-2-diff-check.log` |
+
+新規/変更した回帰は、入力/権限/schema/budget、実Connection→worker準備→共有UI CAS、Openとmetadataの共有Busy、
+Pending取消/期限とlate claim拒否、Claimed後の取消/期限/権限降格/切断と結果/帰属保持、15種類のApp拒否状態の副作用なし、
+実DBタグ前後値のrecord更新、利用者の保留Undo/補正draft/toast保持、タグ改名との双方向の排他、時刻保持/再実行no-op、
+ZIP新旧keyのtransaction/rollbackとA0→別callのB0→実migration後の非復活、★の件数差分/XMP/identity/1回公開/smart membership、
+agentのcommit後に同じ実Remote readerが更新を読む順序を含む。既存Openのケース/期待値とUI tag/rating経路の回帰も通った。
+
+失敗は次の既知のsandboxのrestricted tokenによるpipe open OS error 5だけ。DACLを緩めず、skip/ignoreを増やしていない。
+
+- MCP: `pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked`
+- MCP: `pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld`
+- core: `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`
+- core: `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`
+
+実行したfocusedの正確なコマンド (§22.4を保持して関連writer/UI/DB/取得を追加):
+
+```powershell
+$stage22Focused = '((test(/agent_ipc/) or test(/agent_level/) or test(/agent_permission/) or test(=settings_db::tests::failed_permission_commit_preserves_snapshot_and_epoch) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(/png_metadata/) or test(=pdf_loader::tests::anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results) or test(=pdf_loader::tests::page_sizes_preserve_existing_ui_diagnostic_identity) or test(=pdf_loader::tests::page_sizes_round_trip_and_reject_a_truncated_reply) or test(/app::folder_scan/) or test(/zip_loader/) or test(/conceal_db/) or test(=pdf_loader::tests::anonymous_agent_render_and_enumerate_omit_keys_and_harvest_actual_completion) or test(=pdf_loader::tests::cancelled_anonymous_render_does_not_enqueue) or test(/app::startup_ops/) or test(/single_instance/) or test(/remote_ipc::session/) or test(/ui_request_dispatch/) or test(/activation/) or test(/startup_open_path/) or test(/ui_dialogs::preferences/) or test(/agent_registration/) or test(/process_images/) or test(/runtime_cleanup/) or test(/collection_store/) or test(/agent_change_ui_tests/)) and not test(/section1375_scan_perf_tests/)) or test(/tag_write_worker/) or test(/tags_db/) or test(/tag_ops/) or test(/undo_ops/) or test(/rating/) or test(/ui_dialogs::tag_editor/) or test(/remote_ipc::collections/)'
+cargo nextest run -p mimageviewer --lib -E $stage22Focused --no-fail-fast
+```
+
+PNG: **追加0、変更0**。UPDATE_SNAPSHOTSは未設定で全222枚を比較し、`git diff --name-only -- tests/snapshots` に差分なし。
+新しい設定UI/固定画面は追加していない。タグ管理のgateは既存の実ダイアログをheadlessで操作する回帰で検査した。
+
+変更ファイル:
+
+- wire/adapter: `crates/agent-ipc/src/lib.rs`、`crates/mcp-server/src/{lib.rs,schema.rs,tests.rs}`。
+- agent: `src/agent_ipc/{mod.rs,open.rs,open_tests.rs,item_info.rs}`、新規 `metadata_write.rs`、
+  `metadata_write_tests.rs`、`metadata_response.rs`、`metadata_response_tests.rs`。
+- App: `src/app.rs`、`src/app/startup_ops.rs`、新規 `src/app/{agent_metadata_write.rs,agent_metadata_write_tests.rs,agent_rating_write.rs}`。
+  `src/app/smart_folder.rs` と `src/remote_ipc/collections.rs` はテストの追加だけ。
+- 共有書込: `src/{tag_ops.rs,tag_write_worker.rs,tags_db.rs,undo_ops.rs,rating_db.rs}`、`src/ui_dialogs/tag_editor.rs`。
+  `xmp_writer.rs` / `rating_write_worker.rs` の実シリアライズ/lock処理は変更していない。
+- 本計画。新しい依存、DB schema、public docs、collection toolの変更、detached述語/viewport routingの変更は無し。
+
+sandbox外でClaudeCodeが再実行する最小コマンド (既知pipe 4件を実際に通す):
+
+```powershell
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E 'test(=agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry) or test(=agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers)' --no-fail-fast
+```
+
+全focusedを外で確認する場合は上記 `$stage22Focused` を使う。成功済み1,514件と222 snapshotは、同じsource/条件なら再利用できる。
+このsliceではreal pipeのgreen前提がsandbox内で揃わないため、新しい確認用build-devは作っていない。
+対応するcoreとMCPの実機確認用binaryは、外で上のpipe gate後に `.\scripts\build-dev.ps1 -PreserveRuntime` で同時に更新する。
+以前の `target/dev-runtime` は2-1のままなので、今回の新toolを確認するbuildとして扱わない。
+実core/AIアプリでの書込・画面追従・XMPの外部ExifTool確認は未実施 (XMP jobは一時PNGで実workerを通して検査済み)。
+正式な独立実装レビューは別threadで行う。実装担当の自己点検で追加の設計矛盾や未完のscope項目は検出していない。
+タグのcross-context公開・public docsは指定どおり範囲外。test-full、commit、製品起動、実client configの操作はしていない。
