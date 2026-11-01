@@ -672,35 +672,46 @@ pub fn type_icon_slot(cell: egui::Rect) -> egui::Rect {
     )
 }
 
-/// Subtract all reservations before choosing a destination for central content.
-/// Callers include their required gaps in the reservation rectangles.
+/// All maximal empty rectangles, not disjoint tiles: candidates may overlap each other.
+/// Every empty rectangle within bounds is contained in at least one candidate. Callers
+/// include their required gaps in the reservations and choose a single destination.
 fn unreserved_areas(bounds: egui::Rect, reserved: &[egui::Rect]) -> Vec<egui::Rect> {
+    if !bounds.is_positive() {
+        return Vec::new();
+    }
     let mut free = vec![bounds];
     for obstacle in reserved {
-        free = free
-            .into_iter()
-            .flat_map(|area| {
-                if !area.intersects(*obstacle) {
-                    return vec![area];
-                }
-                let cut = area.intersect(*obstacle);
+        let mut next = Vec::with_capacity(free.len() * 2);
+        for area in free {
+            let cut = area.intersect(*obstacle);
+            if !cut.is_positive() {
+                next.push(area);
+                continue;
+            }
+            // Any rectangle avoiding this cut lies wholly above, below, left, or right.
+            // Keep each strip's full extent, so a fit can cross another strip's boundary.
+            next.extend(
                 [
                     egui::Rect::from_min_max(area.min, egui::pos2(area.max.x, cut.min.y)),
                     egui::Rect::from_min_max(egui::pos2(area.min.x, cut.max.y), area.max),
-                    egui::Rect::from_min_max(
-                        egui::pos2(area.min.x, cut.min.y),
-                        egui::pos2(cut.min.x, cut.max.y),
-                    ),
-                    egui::Rect::from_min_max(
-                        egui::pos2(cut.max.x, cut.min.y),
-                        egui::pos2(area.max.x, cut.max.y),
-                    ),
+                    egui::Rect::from_min_max(area.min, egui::pos2(cut.min.x, area.max.y)),
+                    egui::Rect::from_min_max(egui::pos2(cut.max.x, area.min.y), area.max),
                 ]
                 .into_iter()
-                .filter(|r| r.is_positive())
-                .collect()
-            })
-            .collect();
+                .filter(|r| r.is_positive()),
+            );
+        }
+        // Contained rectangles (including duplicates) cannot offer another fit. Prune
+        // after every reservation to keep the small candidate set maximal and bounded.
+        let mut i = 0;
+        while i < next.len() {
+            if (0..next.len()).any(|j| i != j && next[j].contains_rect(next[i])) {
+                next.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        free = next;
     }
     free
 }
@@ -1373,6 +1384,232 @@ fn fit_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bookmark_title_fits_across_type_slot_bottom_boundary() {
+        let cell = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(120.0, 68.0));
+        let mut input = duration_input(cell, cell.shrink(4.0));
+        input.show_type_icon = true;
+        input.book_resume_meter = true;
+        input.media_duration = None;
+        input.bookmark_time = Some("0:07");
+        input.bookmark_title = Some("場面");
+        let layout = layout_thumbnail_overlays(input, measure);
+        let title = layout
+            .bookmark_title
+            .as_ref()
+            .expect("40x24.25pt title fits");
+        assert_eq!(title.text, "場面");
+        assert_eq!(title.rect.size(), egui::vec2(40.0, 24.25));
+        assert!(title.rect.min.y < type_icon_slot(cell).max.y + TOP_LEFT_GAP);
+        assert!(title.rect.max.y > type_icon_slot(cell).max.y + TOP_LEFT_GAP);
+        assert_pairwise_non_intersecting(layout.badge_placements());
+        assert!(!title.rect.intersects(layout.book_resume_meter.unwrap()));
+    }
+
+    /// Independent oracle: enumerate every rectangle on a tiny board, then select
+    /// the empty ones that cannot grow. No subtraction or strip decomposition.
+    fn assert_maximal_empty_rectangles(reserved: &[egui::Rect]) {
+        let bounds = egui::Rect::from_min_max(egui::pos2(0.25, 0.5), egui::pos2(3.25, 3.5));
+        let mut empty = Vec::new();
+        for left in 0..3 {
+            for right in left + 1..=3 {
+                for top in 0..3 {
+                    for bottom in top + 1..=3 {
+                        let rect = egui::Rect::from_min_max(
+                            bounds.min + egui::vec2(left as f32, top as f32),
+                            bounds.min + egui::vec2(right as f32, bottom as f32),
+                        );
+                        if !reserved.iter().any(|r| r.intersect(rect).is_positive()) {
+                            empty.push(rect);
+                        }
+                    }
+                }
+            }
+        }
+        let expected: Vec<_> = empty
+            .iter()
+            .filter(|r| {
+                !empty
+                    .iter()
+                    .any(|other| other != *r && other.contains_rect(**r))
+            })
+            .copied()
+            .collect();
+        let actual = unreserved_areas(bounds, reserved);
+        assert_eq!(actual.len(), expected.len(), "reservations={reserved:?}");
+        for rect in expected {
+            assert!(
+                actual.contains(&rect),
+                "missing {rect:?}, reservations={reserved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unreserved_areas_match_exhaustive_maximal_rectangle_oracle() {
+        let origin = egui::pos2(0.25, 0.5);
+        // All 512 occupied/empty patterns, including holes and narrow passages.
+        for mask in 0..512 {
+            let reserved: Vec<_> = (0..9)
+                .filter(|i| mask & (1 << i) != 0)
+                .map(|i| {
+                    egui::Rect::from_min_size(
+                        origin + egui::vec2((i % 3) as f32, (i / 3) as f32),
+                        egui::Vec2::splat(1.0),
+                    )
+                })
+                .collect();
+            assert_maximal_empty_rectangles(&reserved);
+        }
+        // Every ordered pair of rectangles, also outside the board: overlapping,
+        // nested, duplicate, edge-touching, and fully covering reservations.
+        let mut obstacles = Vec::new();
+        for left in -1..3 {
+            for right in left + 1..=4 {
+                for top in -1..3 {
+                    for bottom in top + 1..=4 {
+                        obstacles.push(egui::Rect::from_min_max(
+                            origin + egui::vec2(left as f32, top as f32),
+                            origin + egui::vec2(right as f32, bottom as f32),
+                        ));
+                    }
+                }
+            }
+        }
+        for a in &obstacles {
+            for b in &obstacles {
+                assert_maximal_empty_rectangles(&[*a, *b]);
+            }
+        }
+        assert!(unreserved_areas(egui::Rect::NOTHING, &[]).is_empty());
+        assert!(unreserved_areas(egui::Rect::ZERO, &[]).is_empty());
+    }
+
+    /// A fixed-size rectangle can slide up/left until it reaches the bounds or
+    /// an obstacle's bottom/right edge. Enumerating these anchors proves existence
+    /// independently of the maximal-rectangle implementation.
+    fn can_place_size(bounds: egui::Rect, reserved: &[egui::Rect], size: egui::Vec2) -> bool {
+        std::iter::once(bounds.min.x)
+            .chain(reserved.iter().map(|r| r.max.x))
+            .any(|x| {
+                std::iter::once(bounds.min.y)
+                    .chain(reserved.iter().map(|r| r.max.y))
+                    .any(|y| {
+                        let rect = egui::Rect::from_min_size(egui::pos2(x, y), size);
+                        bounds.contains_rect(rect)
+                            && !reserved.iter().any(|r| r.intersect(rect).is_positive())
+                    })
+            })
+    }
+
+    #[test]
+    fn bookmark_title_never_omits_a_fit_or_intersects_reservations() {
+        for width in [48.0, 64.0, 80.0, 100.0, 120.0, 180.0] {
+            for height in (48..=100).step_by(2).map(|h| h as f32).chain([59.5, 60.5]) {
+                for font_factor in [0.75, 1.0, 1.25, 1.5, 2.0] {
+                    for show_icon in [false, true] {
+                        for meter_on in [false, true] {
+                            for crowded in [false, true] {
+                                for text in ["A", "場面", "長いブックマークタイトル"]
+                                {
+                                    let cell = egui::Rect::from_min_size(
+                                        egui::pos2(10.25, 20.5),
+                                        egui::vec2(width, height),
+                                    );
+                                    let mut input = duration_input(cell, cell.shrink(4.0));
+                                    input.media_duration = None;
+                                    input.show_type_icon = show_icon;
+                                    input.book_resume_meter = meter_on;
+                                    input.bookmark_time = Some("0:07");
+                                    input.bookmark_title = Some(text);
+                                    input.checked = crowded;
+                                    input.stack_count = crowded.then_some(12);
+                                    input.edit_badges.pin = crowded;
+                                    let measured = |s: &str, style| measure(s, style) * font_factor;
+                                    let layout = layout_thumbnail_overlays(input, measured);
+                                    let mut bounds = cell.shrink(4.0);
+                                    bounds.min.y =
+                                        layout.top_left.lane_bottom().unwrap_or(cell.min.y) + 4.0;
+                                    let mut reserved: Vec<_> = layout
+                                        .type_icon
+                                        .iter()
+                                        .map(|b| b.rect)
+                                        .chain(layout.check)
+                                        .chain(layout.stack_count.iter().map(|b| b.rect))
+                                        .chain(layout.top_left.placements().map(|b| b.rect))
+                                        .map(|r| r.expand(TOP_LEFT_GAP))
+                                        .collect();
+                                    if meter_on {
+                                        reserved.push(egui::Rect::from_min_max(
+                                            egui::pos2(cell.min.x, cell.max.y - 16.0),
+                                            cell.max,
+                                        ));
+                                    }
+                                    let style = BadgeTextStyle {
+                                        font_size: 13.0,
+                                        family: BadgeFontFamily::UserText,
+                                        padding: BadgePadding::symmetric(7.0, 4.0),
+                                    };
+                                    let fits = |s: &str| {
+                                        let size = measured(s, style);
+                                        // Preserve the existing minimum 8pt text lane,
+                                        // even when a small glyph itself is narrower.
+                                        size.x <= cell.width() - 28.0
+                                            && can_place_size(
+                                                bounds,
+                                                &reserved,
+                                                egui::vec2(size.x.max(8.0), size.y)
+                                                    + style.padding.size(),
+                                            )
+                                    };
+                                    let full_fits = fits(text);
+                                    let shortest = format!("{}…", text.chars().next().unwrap());
+                                    if full_fits || (text.chars().count() > 1 && fits(&shortest)) {
+                                        assert!(
+                                            layout.bookmark_title.is_some(),
+                                            "omitted {text}: {width}x{height}, factor={font_factor}, icon={show_icon}, meter={meter_on}, crowded={crowded}"
+                                        );
+                                    }
+                                    if let Some(title) = &layout.bookmark_title {
+                                        if full_fits {
+                                            assert_eq!(title.text, text);
+                                        }
+                                        assert!(bounds.expand(0.0001).contains_rect(title.rect));
+                                        assert!(
+                                            !reserved
+                                                .iter()
+                                                .any(|r| r.intersect(title.rect).area() > 0.0001)
+                                        );
+                                        assert_pairwise_non_intersecting(layout.badge_placements());
+                                        assert!(
+                                            !layout.check.is_some_and(|r| r.intersects(title.rect))
+                                        );
+                                        assert!(
+                                            !layout
+                                                .book_resume_meter
+                                                .is_some_and(|r| r.intersects(title.rect))
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn content_marker_keeps_full_size_across_reservation_boundaries() {
+        let cell = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(120.0, 68.0));
+        let obstacle = type_icon_slot(cell);
+        let source = egui::Rect::from_center_size(egui::pos2(26.0, 26.0), egui::vec2(70.0, 40.0));
+        let fitted = fit_content_marker(source, cell, &[obstacle]);
+        assert_eq!(fitted.size(), source.size());
+        assert!(cell.shrink(4.0).contains_rect(fitted));
+        assert!(!fitted.intersects(obstacle));
+    }
 
     #[test]
     fn width_only_filename_measurements_are_logarithmic() {

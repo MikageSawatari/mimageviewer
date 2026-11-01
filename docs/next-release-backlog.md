@@ -165,6 +165,31 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 最終`cargo fmt --check`は**exit0**、`python scripts/check_ui_glyphs.py`は**検出0件・exit0**（`fmt-check.log` / `glyphs.log`）。確認用`./scripts/build-dev.ps1 -PreserveRuntime`も**成功・exit0、194.57秒**（`build-dev.log`）。通常feature／dev-runtime profile／portableなし、core・Remote・EPUB PDF workerと実行時依存を準備した。製品起動・通常profileデータ操作・プロセス停止・コミットは行わず、設計担当へ未コミット差分を渡す（上記の例外処理中のtest実行体だけは終了した）。
 - 利用者が手動確認する場合は、インストール版／常駐tray版を閉じ、repoルートから`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。single-instance mutexを共有し、通常の`%APPDATA%\mimageviewer`を使用するため、実際の設定／データを更新し得る。確認対象は高さ60pt前後の動画・音声bookmarkで、titleが表示できる場合は種類icon・meter・他badgeと重ならず、場所不足ならtitleが短縮・省略されてiconを保持すること。実機確認は未実施。
 
+#### 再レビューP2・収まるタイトルの省略と最大空き矩形（2026-11-01、a36797643からの未コミット差分）
+
+- 観測と原因: 設計担当からの再レビュー指摘を純layoutで再現した。120×68pt、種類icon／meter ON、時刻`0:07`、タイトル`場面`（40×24.25pt）では、slot右側のy=25.75〜50ptへ収まるのに、`unreserved_areas`がslot下端で連続空間を22ptと4.25ptの帯へ分け、titleを`None`にしていた。修正前に追加回帰だけをnextestで実行し、**0 passed／1 failed・exit100**を確認（`target/1677-maxrect/regression-before.log`）。前追補の予約漏れ修正とは別の候補列挙の欠陥である。
+- 共通計算だけを修正: 予約との交差を各空き矩形から引く際、上下は全幅、左右は全高の候補を残す。互いに重なる候補を許し、各予約の処理後に包含候補・重複を取り除いて**最大空き矩形の集合**にする。任意の空き矩形は、交差する予約の上／下／左／右の少なくとも一方へ完全に入り、包含除去でも被覆が残るため、分割境界をまたぐ配置を失わない。面積最大の1個だけを選ぶ意味ではない。titleの文字数優先→セル中央への距離、補助markの縮小率優先→元中心への距離は維持する。
+- 同じ関数を使う`fit_content_marker`にも適用し、70×40ptの補助markがslot下端をまたいで等倍のまま収まる回帰を追加した。title専用の別規則や呼出元の追加分岐は作らない。既存の予約入力・間隔・最小文字lane 8pt・文字上限は維持する。有限の予約と純粋な幾何計算の修正であり、非同期状態・再構築・回復機構・モーダル化を加える必要はない。
+- 回帰: 指摘条件のtitle表示、補助markの等倍保持、3×3盤面の全512占有パターンと盤外を含む全196矩形の順序付き2予約（38,416組）、計**38,928条件**で全最大空き矩形を独立の全矩形列挙と照合する。重複・包含・交差・辺接触・全面予約・空boundsも含む。さらに幅6種類×高さ29種類（48〜100ptの2pt刻み＋59.5／60.5）×計測文字寸法5倍率（75〜200%）×icon ON/OFF×meter ON/OFF×check／stack／編集badgeありなし×title3種、**20,880条件**で、予約端を起点とする独立配置oracleとtitleの非省略・全文保持を照合し、表示したtitleと全予約の非交差／bounds内を検査する。既存の60pt前後・動画／音声・多数badgeの回帰は変更しない。新規PNGは増やさない。
+- 事前の高速検査は製品moduleを直接読む独立rustc harness（実物の`emath`、設定型のみstub、`opt-level=2`）を使用した。最初は新しいtitle oracleが既存の最小8pt文字laneを見落として54成功／1失敗だった。oracleだけに既存条件を反映し当該テストは成功。製品の配置・省略規則をこのfixtureに合わせて変えていない。正式なCargo検証は下記へ記録する。
+- 独立差分レビュー（別コンテキスト、GPT-6.1 Sol / xhigh）は**ACCEPT・未解決P1/P2なし**。最大矩形列挙の完全性／最大性、titleの予約入力と選択規則、補助markの予約拡張・fallback・縮小率／距離規則、独立oracleと文書の整合を確認した。検証は実装担当が所有し、レビュー担当はCargoを再実行していない。
+- 自動検証は本worktree、HEAD `a36797643`からの本追補の未コミット差分、`MSBUILDDISABLENODEREUSE=1`。ログ／command／exit／秒数は`target/1677-maxrect/`の各logと`results.jsonl`。`cargo fmt`は**exit0**、`cargo check -p mimageviewer --lib --tests --features test-script`は**exit0・66.98秒**。通常featureの純layout nextestは**55/55成功**（実行0.726秒、compile込み192.78秒、`focused.log`）。関連nextest（`test(thumb_overlay) | test(grid_paint) | test(grid_type_icon) | test(bookmark)`）は**385/385成功・失敗0・exit0**（実行36.423秒、compile込み39.97秒、`related.log`／`related-junit.xml`）。既存のunused／deprecated等のcompiler警告は残る。全lib／workspace全体gateはこの狭域の再修正では再実行しない。
+- `cargo test --test ui_snapshot`は**216/216成功・失敗0、一括完走・exit0**（実行41.81秒／compile込み146.27秒、`ui-snapshot.log`）。§1.175の停止・異常終了は今回は発生せず、未完了分の補完や再試行は不要だった。baseline PNGの更新0枚、画像差分による失敗なし。続く`cargo fmt --check`は**exit0**、`python scripts/check_ui_glyphs.py`は**検出0件・exit0**。Windowsクラッシュダイアログはテスト親processのerror modeだけで抑止し、backend・並列性・期待画像は変更しない。
+- 配置負荷は、Intel Core Ultra 9 285／Windows、rustc 1.99.1、`opt-level=2`／static CRTで、HEADの旧moduleと修正moduleを同一harnessから直接コンパイルした。`eframe::egui`名前空間には同じ実物の`emath`を再公開し、未使用のSettings型だけをstub化する。固定入力の`layout_thumbnail_overlays`全体（出力生成・合成measure込み）と、衝突時の`fit_content_marker`を別計測し、両variantに同じ入力を渡す。marker予約はtitleが旧版で省略されるかに依存しない固定の3／6矩形。各セル数で200回の平均を1標本とし、旧→新→新→旧の4 process（各7標本）による**各variant14標本の中央値、ms／セル群1回**を以下に示す。計測中に本タスクのCargoを重ねず、初回旧processの一部では別のrustcも稼働していたため、微小差を速度保証とは扱わない。
+
+|条件|計測経路|100セル 旧→新 (ms)|400セル 旧→新 (ms)|1,000セル 旧→新 (ms)|
+|---|---|---|---|---|
+|指摘条件 120×68pt・`場面`|全体配置|0.066→0.043|0.261→0.174|0.652→0.447|
+|同上・固定3予約|marker再配置|0.035→0.016|0.137→0.061|0.341→0.183|
+|混雑 180×96pt・長いtitle／時刻／check／stack／pin／tag／評価／形式／名前／長さ|全体配置|0.792→0.792|3.145→3.144|7.947→7.642|
+|同寸法・固定6予約|marker再配置|0.120→0.096|0.442→0.322|1.201→0.828|
+|余裕あり 240×180pt・同じ混雑入力|全体配置|0.379→0.354|1.538→1.359|3.897→3.396|
+|同寸法・固定6予約|marker再配置|0.119→0.091|0.465→0.372|1.135→0.965|
+
+- この標本では配置負荷の増加は認めなかった。新方式の400セルの全体配置は、指摘条件で標本平均0.166〜0.190ms、混雑条件で2.824〜3.664ms。marker側も予約数を増やした条件まで共通修正の効果を確認した。数値は**合成文字計測を使う純粋layoutの参考値**で、実フォントのgalley計測・GPU描画・decode・製品フレーム全体の性能ではない。最初のbench準備ではeframe全体への直接linkがnative Windows libの探索不足で失敗し、不要なUI依存を除いて実物emathの再公開へ変更した。製品コード／build設定は変更していない。再現用`target/1677-maxrect/run-bench.py`／`bench.rs`、旧source`before.rs`、全標本`benchmark-{0..3}-*.csv`、集計`benchmark-summary.csv`、source SHA-256／コンパイルcommand等`benchmark-metadata.json`を保存した。
+- 確認用`./scripts/build-dev.ps1 -PreserveRuntime`は**成功・exit0・202.53秒**（core compile3分16秒、`build-dev.log`）。通常feature／`dev-runtime` profile／portableなし／`MSBUILDDISABLENODEREUSE=1`。coreは339,592,192 bytes、Remote／EPUB workerは変更のない有効な同profileの成果物を再利用し、PE検査は**runtime=4／pe=3成功**。JUnitでも55件／385件の実行と失敗0を突合し、UI名集合は216件すべて成功・不足0（`ui-coverage.json`）、計測metadataのsource SHA-256は最終sourceと一致する。最終`git diff --check`も成功、変更はlayout sourceと本書／display-pipelineの3ファイルだけ。製品起動・実機確認・通常profileデータ操作・プロセス停止・コミットは行わず、HEAD `a36797643`の未コミット差分を設計担当へ渡す。
+- 手動確認する場合は、インストール版／常駐tray版を終了して、repoルートから`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。single-instance mutexを共有し、通常の`%APPDATA%\mimageviewer`を使用して実際の設定／データを更新し得る。確認対象は低い動画・音声bookmarkの種類icon／前回位置表示ON、時刻`0:07`、title`場面`で、空間がある場合はtitleが表示され、icon・meter・他badgeと重ならないこと。約60pt前後で場所不足なら従来どおり短縮／省略し、固定iconを保持すること。
+
 ### 1.675 書庫内フォルダ・入れ子書庫にも、ページを直接表示する設定を適用する — 5ch >>694・696 (2026-11-01)
 
 - 状態: **未着手・利用者からバックログへの起票依頼 (2026-11-01)**。[>>694](https://egg.5ch.io/test/read.cgi/software/1782419551/694) は「開いたとき、ページを表示」と「画像のみフォルダは、PDF/ZIPのように本として扱う」を有効にすると、通常フォルダはダブルクリックでページ表示になるが、書庫内フォルダはページ一覧で止まるという報告。[>>696](https://egg.5ch.io/test/read.cgi/software/1782419551/696) で入れ子書庫のダブルクリックでも同じと追記され、通常のフォルダ・書庫と同様に扱う設定が求められた。ウィンドウモードは明記されていない。開発側は今回、コード確認のみで実機再現・修正・回帰テストの実行はしていない。
