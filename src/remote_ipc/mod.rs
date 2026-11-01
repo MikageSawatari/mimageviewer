@@ -15,6 +15,8 @@ mod thumbnail;
 mod video_jump;
 mod video_stream;
 
+pub(crate) use container::file_image_dims;
+
 #[cfg(windows)]
 mod pipe;
 #[cfg(windows)]
@@ -22,6 +24,101 @@ pub(crate) use pipe::current_user_pipe_security;
 pub(crate) mod session;
 pub(crate) use live_favorites::RemoteSettingsReaderControl;
 pub(crate) use service::{RemoteServiceControl, RemoteServiceManager, RemoteServiceStatus};
+
+/// One settings reader/control for both read lanes. Restoring settings pauses exactly
+/// this LiveFavorites connection; borrowing it never opens a second persistent reader.
+pub(crate) struct SharedReaders {
+    favorites: std::sync::Arc<live_favorites::LiveFavorites>,
+    collections: std::sync::Arc<collections::CollectionEngine>,
+    pub(crate) fts: std::sync::RwLock<Option<std::sync::Arc<crate::fts_index::FtsIndex>>>,
+    book_composition: std::sync::RwLock<Option<crate::book_composition::BookCompositionService>>,
+    collection_store: std::sync::RwLock<Option<crate::collection_store::CollectionStoreClient>>,
+}
+
+impl SharedReaders {
+    pub(crate) fn open(
+        settings: &crate::settings::Settings,
+    ) -> Result<std::sync::Arc<Self>, String> {
+        let favorites = live_favorites::LiveFavorites::live(settings.favorites.clone())?;
+        Ok(std::sync::Arc::new(Self {
+            collections: std::sync::Arc::new(
+                collections::CollectionEngine::new_with_live_favorites(
+                    settings.clone(),
+                    std::sync::Arc::clone(&favorites),
+                ),
+            ),
+            favorites,
+            fts: std::sync::RwLock::new(None),
+            book_composition: std::sync::RwLock::new(None),
+            collection_store: std::sync::RwLock::new(None),
+        }))
+    }
+
+    pub(crate) fn settings_reader_control(&self) -> RemoteSettingsReaderControl {
+        self.favorites.control()
+    }
+
+    pub(crate) fn install_collection_store(
+        &self,
+        client: crate::collection_store::CollectionStoreClient,
+    ) {
+        *self.collection_store.write().unwrap() = Some(client);
+    }
+
+    pub(crate) fn collection_store(
+        &self,
+    ) -> Option<crate::collection_store::CollectionStoreClient> {
+        self.collection_store.read().unwrap().clone()
+    }
+
+    pub(crate) fn install_book_composition(
+        &self,
+        service: crate::book_composition::BookCompositionService,
+    ) {
+        *self.book_composition.write().unwrap() = Some(service);
+    }
+
+    pub(crate) fn book_composition(
+        &self,
+    ) -> Option<crate::book_composition::BookCompositionService> {
+        self.book_composition.read().unwrap().clone()
+    }
+
+    pub(crate) fn favorites(
+        &self,
+    ) -> Result<
+        std::sync::Arc<Vec<crate::settings::FavoriteEntry>>,
+        mimageviewer_agent_ipc::AgentError,
+    > {
+        self.favorites.current().map_err(|error| {
+            mimageviewer_agent_ipc::AgentError::new(
+                if error.is_busy() {
+                    mimageviewer_agent_ipc::ErrorCode::Busy
+                } else {
+                    mimageviewer_agent_ipc::ErrorCode::Internal
+                },
+                "閲覧起点を読み込めませんでした",
+            )
+        })
+    }
+
+    pub(crate) fn agent_tags(
+        &self,
+        choice: mimageviewer_agent_ipc::TagChoice,
+    ) -> Result<Vec<mimageviewer_agent_ipc::Tag>, mimageviewer_agent_ipc::AgentError> {
+        self.collections.agent_tags(choice)
+    }
+
+    pub(crate) fn agent_tag_items(
+        &self,
+        tag: &str,
+        kind: Option<mimageviewer_agent_ipc::ItemKind>,
+        wanted: usize,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(Vec<mimageviewer_agent_ipc::Item>, bool), mimageviewer_agent_ipc::AgentError> {
+        self.collections.agent_tag_items(tag, kind, wanted, cancel)
+    }
+}
 
 #[cfg(test)]
 pub(crate) use container::resolve_remote_effective_params_for_test;
@@ -909,6 +1006,7 @@ impl RemoteIpcServerControl {
 impl RemoteIpcServer {
     pub(crate) fn start(
         settings: crate::settings::Settings,
+        readers: std::sync::Arc<SharedReaders>,
         persistent_collection_producer: Option<
             crate::collection_store::CollectionRemoteProducerControl,
         >,
@@ -919,6 +1017,7 @@ impl RemoteIpcServer {
         {
             return pipe::ServerGuard::start(
                 settings,
+                readers,
                 persistent_collection_producer,
                 raw_develop_executor,
                 io_sem,
@@ -929,6 +1028,7 @@ impl RemoteIpcServer {
         {
             let _ = (
                 settings,
+                readers,
                 persistent_collection_producer,
                 raw_develop_executor,
                 io_sem,

@@ -6959,3 +6959,16 @@ Space パン／左右ドラッグズームも既存の終端経路へ通す。�
 既存 page-edit owner の再配置契約も維持する。同じ安定ページを表示し続ける reindex では
 gesture を継続し、単なる items 世代変更を入力の失効理由にしない。既存の実ページ交換前の
 finish/cancel と、兄弟 context の保留を終端しない規則は変更しない。
+
+### MCP 段階 1c: 既存activation受付への接続 (2026-10-31)
+
+設計担当ClaudeCodeと独立設計レビュー担当は、[MCP計画](mcp-integration-plan.md)の§15.15〜§15.16で、
+1cは症状パッチではなく構造的な変更で、detached述語/viewport routingへ触れない方針に合意した。
+今回の実装で触る接点は `update_frame` の起動中拒否hook、`render_initial_open` のagent→activation順のpoll、
+`startup_ops::poll_activation_open_paths` のprecheck抽出、`start_startup_open_path_resolve` /
+`start_startup_open_path_resolution_owned_with_navigation` のtyped admission、`startup_open_path_owner` のsource追加。
+agent sourceは受理後に既存Activation ownerとなり、bookmark専用detached分岐へ入らない。
+`StartupOpenPathSource::is_activation` はこの既存resolverのsource分類だけを担う。
+detachedの述語、viewport生成/閉鎖/配置/focus routing、bookmarkのdetached条件は変更していない。
+実装担当の前提照合・試験結果と未確認点は[MCP計画§18](mcp-integration-plan.md#18-段階-1c-の実装記録)に記録する。
+これは設計合意と変更範囲の記録であり、今回実装の独立レビュー受け入れを意味しない。

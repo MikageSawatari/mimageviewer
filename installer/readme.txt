@@ -125,6 +125,10 @@ Component（WIC）が必要ですが、Windows 11 には標準で
 
     %APPDATA%\mimageviewer\
 
+単体 exe 版を手動で置き換える場合は、mImageViewer と、
+mImageViewer を使っている AI アプリ (Claude・ChatGPT など) を
+終了してから置き換えてください。
+
 
 ----------------------------------------------------------------
  5. アンインストール方法
@@ -174,6 +178,8 @@ mImageViewer と関連するアプリを終了してから手動で削除でき�
                       （初回展開）
   - runtime\<version>\mimageviewer-epub-pdf.exe
                      : EPUB 変換用プログラム（初回展開）
+  - runtime\<version>\mimageviewer-mcp.exe
+                     : AI アプリとの連携用プログラム（利用時に展開）
   - epub_cache\      : EPUB から変換した PDF（管理画面で削除予約）
   - runtime\<version>\effetune\<hash12>-<generation>\EffeTune Mixwright.vst3\
                      : 音響調整用プラグインと関連ファイル（初回展開）

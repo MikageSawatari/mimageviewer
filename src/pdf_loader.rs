@@ -1157,8 +1157,9 @@ pub enum JobPriority {
 /// ので「PDFium が既に処理した高価な render 結果」が捨てられず、ユーザが同フォルダに
 /// 戻ったとき cache hit になる。
 ///
-/// **`HarvestOnCancel` は thumbnail PDF render の cache-savable 経路のみ**で使う。
-/// enumerate / Critical / background catch-up / bulk cache creator は `AbortOnCancel` の
+/// `HarvestOnCancel` は thumbnail PDF render の cache-savable 経路と、agent の
+/// 読み取り枠を実際の IPC 完了まで保持する経路で使う。待つだけで保存は行わない。
+/// 既存の enumerate / Critical / background catch-up / bulk cache creator は `AbortOnCancel` の
 /// まま。詳細は [docs/pdf-pool-harvest-on-cancel-plan.md](../docs/pdf-pool-harvest-on-cancel-plan.md)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelWaitPolicy {
@@ -5528,6 +5529,17 @@ pub fn get_page_sizes(pdf_path: &Path, password: Option<&str>) -> std::io::Resul
     get_page_sizes_with_read_target(pdf_path, &read, password)
 }
 
+/// Agent metadata reads must not put the requested document path in pool logs.
+/// Keep normal pool ownership, scheduling, and completion semantics; only omit
+/// the optional diagnostic identity. The agent logs its own bounded tool result.
+pub(crate) fn get_page_sizes_anonymous(
+    pdf_path: &Path,
+    password: Option<&str>,
+) -> std::io::Result<Vec<(f32, f32)>> {
+    let read = resolve_read_target(pdf_path).map_err(PdfReadError::into_io)?;
+    get_page_sizes_with_diagnostics(&read, password, None)
+}
+
 /// Background-only page sizes using the target that validated the caller's
 /// cache rows. Converted EPUBs must not be resolved a second time here.
 pub fn get_page_sizes_with_read_target(
@@ -5535,25 +5547,66 @@ pub fn get_page_sizes_with_read_target(
     read: &ReadTarget,
     password: Option<&str>,
 ) -> std::io::Result<Vec<(f32, f32)>> {
+    get_page_sizes_with_diagnostics(
+        read,
+        password,
+        Some(crate::grid_item::pdf_file_perf_key(pdf_path)),
+    )
+}
+
+fn get_page_sizes_with_diagnostics(
+    read: &ReadTarget,
+    password: Option<&str>,
+    perf_key: Option<String>,
+) -> std::io::Result<Vec<(f32, f32)>> {
+    #[cfg(test)]
+    if PAGE_SIZES_TEST_EXECUTOR.with(|executor| executor.borrow().is_some()) {
+        return request_page_sizes(read, password, perf_key, |request, key| {
+            PAGE_SIZES_TEST_EXECUTOR
+                .with(|executor| executor.borrow_mut().as_mut().unwrap()(request, key))
+        });
+    }
     #[cfg(test)]
     if remote_pdf_test_capture(read.read_path.as_path()).is_some() {
         let bytes =
             remote_pdf_test_run(|cache| ipc_page_sizes(cache, read.read_path.as_path(), password))?;
         return PdfWorkerPool::parse_page_sizes_response(&bytes);
     }
-    let pool = get_pool();
-    let req = encode_page_sizes_request(&read.read_path, password);
-    let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
-    // ページ構成を組むための背景処理。Unscoped (prune 対象外) + AbortOnCancel。
-    let resp = pool.execute(
-        PdfPoolRequest::new(&req, &read.read_path),
-        None,
-        JobPriority::Normal,
-        Some(perf_key),
-        PdfRenderValidity::Unscoped,
-        CancelWaitPolicy::AbortOnCancel,
-    )?;
-    PdfWorkerPool::parse_page_sizes_response(&resp.bytes)
+    request_page_sizes(read, password, perf_key, |request, perf_key| {
+        // 背景処理。Unscoped (prune 対象外) + AbortOnCancel。
+        get_pool()
+            .execute(
+                request,
+                None,
+                JobPriority::Normal,
+                perf_key,
+                PdfRenderValidity::Unscoped,
+                CancelWaitPolicy::AbortOnCancel,
+            )
+            .map(|response| response.bytes)
+    })
+}
+
+#[cfg(test)]
+type PageSizesTestExecutor =
+    Box<dyn for<'a> FnMut(PdfPoolRequest<'a>, Option<String>) -> std::io::Result<Vec<u8>>>;
+
+#[cfg(test)]
+thread_local! {
+    // Per-test-thread substitution, restored on panic by the test's scope guard.
+    static PAGE_SIZES_TEST_EXECUTOR: std::cell::RefCell<Option<PageSizesTestExecutor>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn request_page_sizes(
+    read: &ReadTarget,
+    password: Option<&str>,
+    perf_key: Option<String>,
+    execute: impl FnOnce(PdfPoolRequest<'_>, Option<String>) -> std::io::Result<Vec<u8>>,
+) -> std::io::Result<Vec<(f32, f32)>> {
+    let request = encode_page_sizes_request(&read.read_path, password);
+    let response = execute(PdfPoolRequest::new(&request, &read.read_path), perf_key)?;
+    PdfWorkerPool::parse_page_sizes_response(&response)
 }
 
 /// AI canonical loader が vector PDF を pixel 化する前に型付きで拒否するための解析 API。
@@ -5645,6 +5698,83 @@ pub fn enumerate_pages_with_read_target(
     let mut result = PdfWorkerPool::parse_enumerate_response(&resp.bytes)?;
     display_enumerated_pages(&mut result, &read);
     Ok(result)
+}
+
+/// Read-only agent enumeration: omit source identities from pool diagnostics and
+/// retain the caller's execution slot until in-flight IPC actually completes.
+pub(crate) fn enumerate_pages_anonymous_with_read_target(
+    _pdf_path: &Path,
+    read: &ReadTarget,
+    password: Option<&str>,
+    cancel: Option<Arc<AtomicBool>>,
+    options: EnumerateOptions,
+) -> std::io::Result<PdfEnumerateResult> {
+    let request = encode_enumerate_request(
+        &read.read_path,
+        password,
+        enumerate_worker_options(read, options),
+    );
+    let response = execute_agent_pdf_request(
+        PdfPoolRequest::new(&request, &read.read_path),
+        cancel.as_ref(),
+        true,
+    )?;
+    let mut result = PdfWorkerPool::parse_enumerate_response(&response.bytes)?;
+    display_enumerated_pages(&mut result, read);
+    Ok(result)
+}
+
+fn execute_agent_pdf_request(
+    request: PdfPoolRequest<'_>,
+    cancel: Option<&Arc<AtomicBool>>,
+    enumerate: bool,
+) -> std::io::Result<ProcessResponse> {
+    #[cfg(test)]
+    if AGENT_PDF_TEST_EXECUTOR.with(|slot| slot.borrow().is_some()) {
+        return AGENT_PDF_TEST_EXECUTOR.with(|slot| {
+            slot.borrow_mut().as_mut().unwrap()(
+                request,
+                cancel,
+                None,
+                CancelWaitPolicy::HarvestOnCancel,
+            )
+        });
+    }
+    if enumerate {
+        execute_enumerate_request(
+            request,
+            cancel,
+            JobPriority::Normal,
+            None,
+            PdfRenderValidity::Unscoped,
+            CancelWaitPolicy::HarvestOnCancel,
+        )
+    } else {
+        get_pool().execute(
+            request,
+            cancel,
+            JobPriority::Normal,
+            None,
+            PdfRenderValidity::Unscoped,
+            CancelWaitPolicy::HarvestOnCancel,
+        )
+    }
+}
+
+#[cfg(test)]
+type AgentPdfTestExecutor = Box<
+    dyn for<'a> FnMut(
+        PdfPoolRequest<'a>,
+        Option<&Arc<AtomicBool>>,
+        Option<String>,
+        CancelWaitPolicy,
+    ) -> std::io::Result<ProcessResponse>,
+>;
+
+#[cfg(test)]
+thread_local! {
+    static AGENT_PDF_TEST_EXECUTOR: std::cell::RefCell<Option<AgentPdfTestExecutor>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn execute_enumerate_request(
@@ -5877,8 +6007,8 @@ pub fn render_page(
     // Inherit the UI snapshot; independent work is explicit Unscoped.
     validity: PdfRenderValidity,
     // cancel 時に in-flight IPC を harvest するかどうか。
-    // thumbnail PDF render の cache-savable 経路のみ `HarvestOnCancel`、それ以外は
-    // `AbortOnCancel`。詳細は `CancelWaitPolicy` の doc コメント参照。
+    // thumbnail PDF render の cache-savable 経路と agent の枠保持は
+    // `HarvestOnCancel`。詳細は `CancelWaitPolicy` の doc コメント参照。
     cancel_policy: CancelWaitPolicy,
 ) -> std::io::Result<RenderResult> {
     render_page_target(
@@ -5891,6 +6021,33 @@ pub fn render_page(
         validity,
         cancel_policy,
     )
+}
+
+/// Render precisely one agent-requested PDF page, without path-bearing perf
+/// identities, metadata/catalog writes, or early release of in-flight work.
+pub(crate) fn render_page_anonymous(
+    pdf_path: &Path,
+    page_num: u32,
+    target_px: u32,
+    cancel: Arc<AtomicBool>,
+) -> std::io::Result<RenderResult> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(std::io::ErrorKind::Interrupted.into());
+    }
+    let read = resolve_read_target(pdf_path).map_err(PdfReadError::into_io)?;
+    let request = encode_render_request(
+        &read.read_path,
+        page_num,
+        PdfRenderTarget::LongEdge(target_px),
+        None,
+        false,
+    );
+    let response = execute_agent_pdf_request(
+        PdfPoolRequest::new(&request, &read.read_path),
+        Some(&cancel),
+        false,
+    )?;
+    PdfWorkerPool::parse_render_response(&response.bytes)
 }
 
 /// Render an EPUB page after its cache lookup has already resolved the generation.
@@ -8889,6 +9046,238 @@ C:\isolated\miv-data"#
             }
             _ => panic!("MSG_PAGE_SIZES を decode 側が知らない"),
         }
+    }
+
+    #[test]
+    fn anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results() {
+        let path = Path::new(r"C:\private\sensitive-document.pdf");
+        for outcome in 0..3 {
+            let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let observed_calls = calls.clone();
+            let result = with_page_sizes_test_executor(
+                move |request, key| {
+                    observed_calls.set(observed_calls.get() + 1);
+                    // The worker still receives the real source and password, while
+                    // dispatcher/open/cancel diagnostics receive no path identity.
+                    assert!(key.is_none());
+                    assert_eq!(request.read_path.as_path(), path);
+                    match decode_request(request.bytes).unwrap() {
+                        DecodedRequest::PageSizes {
+                            path: source,
+                            password,
+                        } => {
+                            assert_eq!(source, path);
+                            assert_eq!(password.as_deref(), Some("secret"));
+                        }
+                        _ => panic!("expected page sizes request"),
+                    }
+                    match outcome {
+                        0 => {
+                            let mut bytes = vec![STATUS_OK];
+                            bytes.extend_from_slice(&1_u32.to_le_bytes());
+                            bytes.extend_from_slice(&612_f32.to_le_bytes());
+                            bytes.extend_from_slice(&792_f32.to_le_bytes());
+                            Ok(bytes)
+                        }
+                        1 => Ok(vec![STATUS_ERR, b'x']),
+                        _ => Err(std::io::ErrorKind::BrokenPipe.into()),
+                    }
+                },
+                || get_page_sizes_anonymous(path, Some("secret")),
+            );
+            assert_eq!(calls.get(), 1);
+            if outcome == 0 {
+                assert_eq!(result.unwrap(), vec![(612.0, 792.0)]);
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    fn with_agent_pdf_test_executor<T>(
+        executor: impl for<'a> FnMut(
+            PdfPoolRequest<'a>,
+            Option<&Arc<AtomicBool>>,
+            Option<String>,
+            CancelWaitPolicy,
+        ) -> std::io::Result<ProcessResponse>
+        + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore(Option<AgentPdfTestExecutor>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                AGENT_PDF_TEST_EXECUTOR.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore =
+            Restore(AGENT_PDF_TEST_EXECUTOR.with(|slot| slot.replace(Some(Box::new(executor)))));
+        run()
+    }
+
+    #[test]
+    fn anonymous_agent_render_and_enumerate_omit_keys_and_harvest_actual_completion() {
+        for render in [false, true] {
+            for outcome in 0..3 {
+                let path = Path::new(r"C:\private\agent-sensitive.pdf");
+                let cancel = Arc::new(AtomicBool::new(false));
+                let worker_cancel = cancel.clone();
+                let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+                let observed = calls.clone();
+                let result = with_agent_pdf_test_executor(
+                    move |request, actual_cancel, key, policy| {
+                        observed.set(observed.get() + 1);
+                        assert!(key.is_none(), "agent pool must have no path-bearing key");
+                        assert_eq!(policy, CancelWaitPolicy::HarvestOnCancel);
+                        assert!(Arc::ptr_eq(actual_cancel.unwrap(), &worker_cancel));
+                        assert_eq!(request.read_path.as_path(), path);
+                        match decode_request(request.bytes).unwrap() {
+                            DecodedRequest::Render {
+                                path: source,
+                                page_num,
+                                password,
+                                target,
+                                collect_metrics,
+                            } if render => {
+                                assert_eq!(source, path);
+                                assert_eq!(page_num, 3);
+                                assert!(password.is_none());
+                                assert_eq!(target, PdfRenderTarget::LongEdge(256));
+                                assert!(!collect_metrics);
+                            }
+                            DecodedRequest::Enumerate {
+                                path: source,
+                                password,
+                                options,
+                            } if !render => {
+                                assert_eq!(source, path);
+                                assert!(password.is_none());
+                                assert!(!options.want_direction);
+                            }
+                            _ => panic!("wrong agent PDF request"),
+                        }
+                        // Exercise the production wait loop itself. Cancellation
+                        // after enqueue must not release this caller before the
+                        // real worker's reply (success or error) is received.
+                        let mut receives = 0;
+                        let response = wait_for_pool_reply(
+                            |_| {
+                                receives += 1;
+                                if receives == 1 {
+                                    worker_cancel.store(true, Ordering::Release);
+                                    return Err(mpsc::RecvTimeoutError::Timeout);
+                                }
+                                if outcome == 2 {
+                                    return Ok(Err(std::io::ErrorKind::BrokenPipe.into()));
+                                }
+                                let bytes = if outcome == 1 {
+                                    vec![STATUS_ERR, b'x']
+                                } else if render {
+                                    let mut bytes = vec![STATUS_OK];
+                                    bytes.extend_from_slice(&1_u32.to_le_bytes()); // width
+                                    bytes.extend_from_slice(&1_u32.to_le_bytes()); // height
+                                    bytes.push(0); // vector
+                                    bytes.extend_from_slice(&0_u32.to_le_bytes());
+                                    bytes.extend_from_slice(&0_u32.to_le_bytes());
+                                    bytes.extend_from_slice(&10_u32.to_le_bytes());
+                                    bytes.extend_from_slice(&612_f32.to_le_bytes());
+                                    bytes.extend_from_slice(&792_f32.to_le_bytes());
+                                    bytes.extend_from_slice(&[0, 0, 0, 255]);
+                                    bytes
+                                } else {
+                                    let mut bytes = vec![STATUS_OK];
+                                    bytes.extend_from_slice(&0_u32.to_le_bytes());
+                                    bytes
+                                };
+                                Ok(Ok(ProcessResponse {
+                                    bytes,
+                                    parent_read: ParentReadMetrics::default(),
+                                    worker_render: None,
+                                }))
+                            },
+                            actual_cancel,
+                            policy,
+                            key.as_deref(),
+                        );
+                        assert_eq!(
+                            receives, 2,
+                            "actual completion must be harvested after cancellation"
+                        );
+                        response
+                    },
+                    || {
+                        if render {
+                            render_page_anonymous(path, 3, 256, cancel.clone()).map(|_| ())
+                        } else {
+                            let read = resolve_read_target(path).unwrap();
+                            enumerate_pages_anonymous_with_read_target(
+                                path,
+                                &read,
+                                None,
+                                Some(cancel.clone()),
+                                EnumerateOptions::default(),
+                            )
+                            .map(|_| ())
+                        }
+                    },
+                );
+                assert_eq!(calls.get(), 1);
+                assert_eq!(result.is_ok(), outcome == 0);
+                assert!(cancel.load(Ordering::Acquire));
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_anonymous_render_does_not_enqueue() {
+        let result = with_agent_pdf_test_executor(
+            |_, _, _, _| panic!("cancelled render must not enqueue"),
+            || {
+                render_page_anonymous(
+                    Path::new(r"C:\private\cancelled.pdf"),
+                    0,
+                    256,
+                    Arc::new(AtomicBool::new(true)),
+                )
+            },
+        );
+        assert_eq!(
+            result.err().unwrap().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+    }
+
+    #[test]
+    fn page_sizes_preserve_existing_ui_diagnostic_identity() {
+        let path = Path::new(r"C:\books\document.pdf");
+        let key = crate::grid_item::pdf_file_perf_key(path);
+        let sizes = with_page_sizes_test_executor(
+            move |_, actual| {
+                assert_eq!(actual.as_deref(), Some(key.as_str()));
+                let mut bytes = vec![STATUS_OK];
+                bytes.extend_from_slice(&0_u32.to_le_bytes());
+                Ok(bytes)
+            },
+            || get_page_sizes(path, None),
+        )
+        .unwrap();
+        assert!(sizes.is_empty());
+    }
+
+    fn with_page_sizes_test_executor<T>(
+        executor: impl for<'a> FnMut(PdfPoolRequest<'a>, Option<String>) -> std::io::Result<Vec<u8>>
+        + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore(Option<PageSizesTestExecutor>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                PAGE_SIZES_TEST_EXECUTOR.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore =
+            Restore(PAGE_SIZES_TEST_EXECUTOR.with(|slot| slot.replace(Some(Box::new(executor)))));
+        run()
     }
 
     #[test]

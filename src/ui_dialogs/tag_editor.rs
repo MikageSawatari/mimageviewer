@@ -195,6 +195,12 @@ impl App {
             let previous = previous_tag_defs_by_id(&self.settings.tags);
             let draft = self.tag_editor_draft.clone();
             let (cleaned, retag_ops) = build_tag_editor_apply_plan(draft, &previous);
+            if !retag_ops.is_empty() && self.tag_writer_has_unpublished_jobs() {
+                self.show_feedback_warning(
+                    "タグの書き込みを反映中です。完了後にもう一度お試しください".into(),
+                );
+                return;
+            }
             if !retag_ops.is_empty() && !self.admit_book_append_followup_mutation() {
                 return;
             }
@@ -218,6 +224,7 @@ impl App {
     }
 
     fn start_tag_maintenance(&mut self, ops: Vec<RetagOp>) {
+        debug_assert!(!self.tag_writer_has_unpublished_jobs());
         let ops = order_retag_ops(ops);
         let data_dir = crate::data_dir::get();
         let (tx, rx) = mpsc::channel();
@@ -230,6 +237,12 @@ impl App {
             .ok();
         self.tag_maintenance_rx = Some(rx);
         self.show_feedback_toast("タグの改名/統合を反映中".to_string());
+    }
+
+    pub(crate) fn tag_writer_has_unpublished_jobs(&self) -> bool {
+        self.tag_write_handle
+            .as_ref()
+            .is_some_and(|handle| handle.has_unconsumed_batch())
     }
 
     pub(crate) fn poll_tag_maintenance_results(&mut self) {
@@ -410,6 +423,100 @@ fn run_tag_maintenance(data_dir: std::path::PathBuf, ops: Vec<RetagOp>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dialog_apply_waits_for_unadopted_tag_results_before_renaming_settings_and_db() {
+        use crate::tag_write_worker::{TagAction, TagWriteHandle, TagWriteResult};
+        use egui_kittest::kittest::Queryable;
+
+        let mut app = crate::app::setup_app_for_test();
+        let path = app.tmp.path().join("tagged.png");
+        let key = crate::tags_db::item_key_for_path(&path);
+        app.tags_db
+            .as_mut()
+            .unwrap()
+            .set_item_tags(&key, ["old"], crate::tags_db::source::EDIT)
+            .unwrap();
+        app.settings.tags = vec![tag_with(Uuid::new_v4(), "old", "old", true)];
+        app.open_tag_editor();
+        app.tag_editor_draft[0].name = "new".into();
+        app.tag_write_handle = Some(TagWriteHandle::completed_unadopted_for_test(
+            TagWriteResult {
+                agent: None,
+                path,
+                tag_sidecar: None,
+                result: Ok(TagAction::Added),
+                tags_before: vec![],
+                tags_after: vec!["#old".into()],
+                tx_id: 0,
+            },
+        ));
+        assert!(!app.tag_write_handle.as_ref().unwrap().is_busy());
+        app.tag_write_handle
+            .as_ref()
+            .unwrap()
+            .reset_counters_if_idle();
+        assert!(app.tag_writer_has_unpublished_jobs());
+        let mut fonts_ready = false;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_ui_state(
+                move |root_ui, app: &mut crate::app::AppTestEnvForTest| {
+                    let ctx = root_ui.ctx().clone();
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(&ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    app.show_tag_editor_dialog(&ctx);
+                },
+                app,
+            );
+        harness.run();
+        harness.get_by_label("OK").click_accesskit();
+        harness.run();
+        assert!(harness.state().show_tag_editor);
+        assert_eq!(harness.state().settings.tags[0].name, "old");
+        assert_eq!(harness.state().tag_editor_draft[0].name, "new");
+        assert!(harness.state().tag_maintenance_rx.is_none());
+        assert!(harness.state().tag_writer_has_unpublished_jobs());
+        assert_eq!(
+            harness
+                .state()
+                .tags_db
+                .as_ref()
+                .unwrap()
+                .display_tags_for_item(&key),
+            ["#old"]
+        );
+
+        harness.state_mut().poll_tag_write_results();
+        assert!(!harness.state().tag_writer_has_unpublished_jobs());
+        harness.get_by_label("OK").click_accesskit();
+        harness.run();
+        assert!(!harness.state().show_tag_editor);
+        assert!(harness.state().tag_editor_draft.is_empty());
+        assert_eq!(harness.state().settings.tags[0].name, "new");
+        let completion = harness
+            .state_mut()
+            .tag_maintenance_rx
+            .take()
+            .expect("accepted rename owns its worker receiver");
+        completion
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            harness
+                .state()
+                .tags_db
+                .as_ref()
+                .unwrap()
+                .display_tags_for_item(&key),
+            ["#new"]
+        );
+    }
 
     fn tag_with(id: Uuid, key: &str, name: &str, show_shortcut: bool) -> TagDef {
         TagDef {

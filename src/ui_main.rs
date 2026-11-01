@@ -8088,6 +8088,9 @@ impl App {
         let help_remote_connection_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::SettingsRemoteConnection);
+        let settings_agent_integration_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::SettingsAgentIntegration);
         let help_open_logs_menu_label = self.keymap.menu_command_label(MenuCommandId::HelpOpenLogs);
         let help_show_whats_new_menu_label = self
             .keymap
@@ -9194,6 +9197,12 @@ impl App {
                                                 .clicked()
                                             {
                                                 self.open_remote_connection_dialog();
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::SettingsAgentIntegration => {
+                                            if ui.button(&settings_agent_integration_menu_label).clicked() {
+                                                self.open_agent_integration_dialog();
                                                 ui.close();
                                             }
                                         }
@@ -34728,6 +34737,53 @@ mod section292_tests {
     #[test]
     fn section292_facet_sort_snapshot_narrow_dark() {
         facet_sort_snapshot("facet_sort_narrow_dark", 320.0);
+    }
+}
+
+#[cfg(test)]
+mod agent_integration_menu_tests {
+    use egui_kittest::kittest::{NodeT, Queryable};
+    use std::{cell::RefCell, rc::Rc};
+
+    #[test]
+    fn settings_menu_opens_agent_window_and_respects_hidden_command() {
+        for hidden in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            if hidden {
+                app.settings
+                    .menu_layout
+                    .hidden_commands
+                    .push("SettingsAgentIntegration".into());
+            }
+            let app = Rc::new(RefCell::new(app));
+            let draw_app = Rc::clone(&app);
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(1093.0, 614.0))
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .build_ui(move |ui| {
+                    // Deliberately draw only the real menu: opening the state does
+                    // not run app detection or read any client configuration.
+                    let ctx = ui.ctx().clone();
+                    draw_app
+                        .borrow_mut()
+                        .note_main_chrome_pointer_block_transition(&ctx);
+                    draw_app.borrow_mut().render_menubar(ui);
+                });
+            harness.run();
+            assert!(app.borrow().agent_integration_dialog.is_none());
+            harness.get_all_by_label("設定").next().unwrap().click();
+            harness.run();
+            assert_eq!(harness.query_by_label("AI 連携…").is_none(), hidden);
+            if !hidden {
+                let remote = harness.get_by_label("リモート接続…").rect();
+                let agent = harness.get_by_label("AI 連携…").rect();
+                assert!(agent.top() >= remote.bottom());
+                harness.get_by_label("AI 連携…").click();
+                harness.run();
+                assert!(app.borrow().agent_integration_dialog.is_some());
+                assert!(!app.borrow().show_preferences);
+            }
+        }
     }
 }
 

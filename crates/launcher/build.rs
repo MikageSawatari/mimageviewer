@@ -1,8 +1,8 @@
 //! ランチャークレートのビルドスクリプト。
 //!
-//! - 内包する `mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe` と FFmpeg DLL のパスを `MIMV_*` 環境変数
+//! - 内包する core、remote、EPUB worker、MCP の exe と FFmpeg DLL のパスを `MIMV_*` 環境変数
 //!   経由でソースに渡す (`include_bytes!(env!("..."))` で参照)。
-//! - core、remote、EPUB worker が先にビルドされていることを確認し、未ビルドなら明確なエラーで止める。
+//! - core、remote、EPUB worker、MCP が先にビルドされていることを確認し、未ビルドなら明確なエラーで止める。
 //! - exe アイコンを埋め込む (本体と同じアイコン)。
 
 use std::path::PathBuf;
@@ -27,14 +27,15 @@ fn main() {
 
     build_effetune::generate(&workspace_root);
 
-    // CARGO_TARGET_DIR を尊重 (環境変数が無ければ workspace_root/target)
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root.join("target"));
+    // Embedded release inputs always come from this repository's release tree.
+    // Cargo may place the launcher itself elsewhere, but output overrides must
+    // never silently switch the executables embedded in the distributable.
+    let target_dir = workspace_root.join("target");
 
     let core_exe = target_dir.join("release").join("mimageviewer-core.exe");
     let remote_exe = target_dir.join("release").join("mimageviewer-remote.exe");
     let epub_worker_exe = target_dir.join("release").join("mimageviewer-epub-pdf.exe");
+    let mcp_exe = target_dir.join("release").join("mimageviewer-mcp.exe");
 
     let missing = [
         (
@@ -52,6 +53,11 @@ fn main() {
             "mimageviewer-epub-pdf.exe",
             "cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf",
         ),
+        (
+            &mcp_exe,
+            "mimageviewer-mcp.exe",
+            "cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp",
+        ),
     ]
     .into_iter()
     .filter(|(path, _, _)| !path.exists())
@@ -65,7 +71,9 @@ fn main() {
             eprintln!("     build with: {command}");
         }
         eprintln!();
-        eprintln!(" Build core, remote, and EPUB worker before the launcher, or use the wrapper:");
+        eprintln!(
+            " Build core, remote, EPUB worker, and MCP before the launcher, or use the wrapper:"
+        );
         eprintln!("   bash scripts/build-release.sh        (Git Bash)");
         eprintln!("   .\\scripts\\build-release.ps1         (PowerShell)");
         eprintln!("================================================================");
@@ -134,6 +142,12 @@ fn main() {
         sha256_file_hex(&epub_worker_exe)
     );
     println!("cargo:rerun-if-changed={}", epub_worker_exe.display());
+    println!("cargo:rustc-env=MIMV_MCP_EXE={}", mcp_exe.display());
+    println!(
+        "cargo:rustc-env=MIMV_MCP_EXE_SHA256={}",
+        sha256_file_hex(&mcp_exe)
+    );
+    println!("cargo:rerun-if-changed={}", mcp_exe.display());
 
     // Single-instance 用の Mutex / Event 名を core 側のソースから取り出して
     // 環境変数経由で渡す。core 側を変えると次のビルドで自動反映される。

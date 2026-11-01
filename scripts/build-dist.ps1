@@ -10,9 +10,8 @@
 # Steps:
 #   1. complete Rust test gate (scripts\test-full.ps1)
 #   2. idle-health analyzer regression tests
-#   3. cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-launcher
-#      (+ the portable target dir's mimageviewer + remote + EPUB worker packages)
-#   4. build-release.ps1   -> target\release\mimageviewer.exe (launcher) + core + remote + EPUB worker
+#   3. cargo clean release workspace + portable packages (including MCP)
+#   4. build-release.ps1   -> launcher + core + remote + EPUB worker + MCP
 #   5. ISCC                -> installer\Output\mImageViewer_setup.exe
 #   6. build-portable.ps1  -> dist\mImageViewer_portable_v<ver>.zip (target-portable)
 #   7. inspect the final runtime/portable/installer PE closure
@@ -42,10 +41,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'build-process-policy.ps1')
+Assert-MivReleaseOutputContract
 $repoRoot = (Get-Location).Path
 $scripts = Join-Path $repoRoot 'scripts'
 $expectedRepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $workspaceTargetDir = Join-Path $repoRoot 'target'
+$releaseDir = Join-Path $workspaceTargetDir 'release'
 $portableTargetDir = Join-Path $repoRoot 'target-portable'
 . (Join-Path $scripts 'effetune-distribution.ps1')
 . (Join-Path $scripts 'vst3-host-identity.ps1')
@@ -69,7 +71,7 @@ if ($PreserveRuntime) {
     } else {
         [System.IO.Path]::GetFullPath($workspaceTargetDir)
     }
-    if (-not $configuredTarget.Equals([System.IO.Path]::GetFullPath($workspaceTargetDir), [System.StringComparison]::OrdinalIgnoreCase)) {
+    if (-not $configuredTarget.Equals([System.IO.Path]::GetFullPath((Join-Path $repoRoot 'target')), [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "[build-dist] -PreserveRuntime refuses a Cargo target outside the repository target directory: $configuredTarget"
     }
     foreach ($targetPath in @($workspaceTargetDir, $portableTargetDir)) {
@@ -102,14 +104,35 @@ if ($sign) {
 # holding unsaved state is the user's to close.
 $runningNames = @(
     'mimageviewer',
+    'mimageviewer-mcp',
     'mimageviewer-core',
     'mimageviewer-remote',
     'mimageviewer-epub-pdf',
     'mimageviewer-vst3-host',
     'mimageviewer-susie32'
 )
+$exactBuildProcessNames = @('mimageviewer', 'mimageviewer-mcp')
+$exactBuildOutputPaths = @(
+    (Join-Path $releaseDir 'mimageviewer.exe'),
+    (Join-Path $releaseDir 'mimageviewer-mcp.exe'),
+    (Join-Path $portableTargetDir 'release\mimageviewer-mcp.exe')
+)
+# The portable package is replaced too. Read the version before process selection.
+$cargoToml = Get-Content -LiteralPath (Join-Path $repoRoot 'Cargo.toml')
+$version = $null
+foreach ($line in $cargoToml) {
+    if ($line -match '^version\s*=\s*"([^"]+)"') { $version = $Matches[1]; break }
+}
+if (-not $version) { throw '[build-dist] could not parse version from Cargo.toml' }
+$portableDir = Join-Path $repoRoot "dist\mImageViewer_portable_v$version"
+$exactBuildOutputPaths += (Join-Path $portableDir 'mimageviewer.exe')
+$exactBuildOutputPaths += (Join-Path $portableDir 'mimageviewer-mcp.exe')
 $running = @(Get-Process -ErrorAction SilentlyContinue |
-    Where-Object { $runningNames -contains $_.Name })
+    Where-Object {
+        ($runningNames -contains $_.Name) -and
+        (($exactBuildProcessNames -notcontains $_.Name) -or
+            (Test-MivExactBuildProcess -Process $_ -OutputPaths $exactBuildOutputPaths))
+    })
 if ($running.Count -gt 0) {
     $list = ($running | ForEach-Object { "{0}({1})" -f $_.Name, $_.Id }) -join ', '
     $message = "[build-dist] mImageViewer is running: $list. Close it (including the tray icon)"
@@ -152,14 +175,14 @@ if ($LASTEXITCODE -ne 0) { throw ("[build-dist] VST3 host CRT preflight tests fa
 # exit in PowerShell 5.1, so check $LASTEXITCODE explicitly. A silently-failed
 # clean would let the build reuse a stale fingerprint -- the exact bug this script
 # exists to prevent.
-Write-Host "[build-dist] (3/7) cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-launcher"
-& cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-launcher
+Write-Host "[build-dist] (3/7) cargo clean --release --target-dir target -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p mimageviewer-launcher"
+& cargo clean --release --target-dir $workspaceTargetDir -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p mimageviewer-launcher
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] cargo clean (workspace) failed (exit {0})" -f $LASTEXITCODE) }
-Write-Host "[build-dist]       cargo clean --release --target-dir target-portable -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker"
-& cargo clean --release --target-dir $portableTargetDir -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker
+Write-Host "[build-dist]       cargo clean --release --target-dir target-portable -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp"
+& cargo clean --release --target-dir $portableTargetDir -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] cargo clean (portable) failed (exit {0})" -f $LASTEXITCODE) }
 
-# --- 2. Core + remote + EPUB worker + launcher (fresh, since cleaned above) ---
+# --- 2. Core + remote + EPUB worker + MCP + launcher (fresh, since cleaned above) ---
 $releaseArgs = @()
 if ($SkipVst3Bridge) { $releaseArgs += '-SkipVst3Bridge' }
 if ($sign) { $releaseArgs += '-Sign' }
@@ -204,18 +227,12 @@ if ($LASTEXITCODE -ne 0) { throw ("[build-dist] build-portable.ps1 failed (exit 
 # the final loose package and the final installer wrapper before declaring the
 # distribution complete. The installer does not load ORT and embeds the launcher,
 # so its own directory does not require the app-local companion DLLs.
-$cargoToml = Get-Content -LiteralPath (Join-Path $repoRoot 'Cargo.toml')
-$version = $null
-foreach ($line in $cargoToml) {
-    if ($line -match '^version\s*=\s*"([^"]+)"') { $version = $Matches[1]; break }
-}
-if (-not $version) { throw '[build-dist] could not parse version from Cargo.toml' }
-$portableDir = Join-Path $repoRoot "dist\mImageViewer_portable_v$version"
 $finalRuntimePe = @(
-    (Join-Path $repoRoot 'target\release\mimageviewer.exe'),
-    (Join-Path $repoRoot 'target\release\mimageviewer-core.exe'),
-    (Join-Path $repoRoot 'target\release\mimageviewer-remote.exe'),
-    (Join-Path $repoRoot 'target\release\mimageviewer-epub-pdf.exe'),
+    (Join-Path $releaseDir 'mimageviewer.exe'),
+    (Join-Path $releaseDir 'mimageviewer-core.exe'),
+    (Join-Path $releaseDir 'mimageviewer-remote.exe'),
+    (Join-Path $releaseDir 'mimageviewer-epub-pdf.exe'),
+    (Join-Path $releaseDir 'mimageviewer-mcp.exe'),
     $portableDir,
     (Join-Path $repoRoot 'target\effetune-dist-source\EffeTune Mixwright.vst3')
 )
@@ -232,7 +249,7 @@ Assert-MivEffetuneStage -RepoRoot $repoRoot -SourceRoot (Join-Path $repoRoot 'ta
 # --- Summary ---
 Write-Host ""
 Write-Host "[build-dist] DONE. Distribution artifacts:"
-Write-Host ("  single exe : {0}" -f (Join-Path $repoRoot 'target\release\mimageviewer.exe'))
+Write-Host ("  single exe : {0}" -f (Join-Path $releaseDir 'mimageviewer.exe'))
 Write-Host ("  installer  : {0}" -f (Join-Path $repoRoot 'installer\Output\mImageViewer_setup.exe'))
 $portableZip = Get-ChildItem (Join-Path $repoRoot 'dist') -Filter 'mImageViewer_portable_v*.zip' -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1

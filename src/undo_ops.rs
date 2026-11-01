@@ -168,6 +168,11 @@ impl App {
     /// Ctrl+Z ハンドラ。スタック先頭を取り出し、`before` 状態を再適用してから
     /// Redo スタックへ移す。スタックが空なら no-op。
     pub(crate) fn apply_meta_undo(&mut self) {
+        if self.tag_maintenance_in_progress()
+            && matches!(self.meta_undo.peek_undo(), Some(UndoEntry::Tag { .. }))
+        {
+            return;
+        }
         if self.book_append_undo_in_progress() {
             self.admit_book_append_followup_mutation();
             return;
@@ -240,6 +245,11 @@ impl App {
     /// Ctrl+Y / Ctrl+Shift+Z ハンドラ。Redo スタック先頭を取り出し、`after` 状態を
     /// 再適用してから Undo スタックへ戻す。
     pub(crate) fn apply_meta_redo(&mut self) {
+        if self.tag_maintenance_in_progress()
+            && matches!(self.meta_undo.peek_redo(), Some(UndoEntry::Tag { .. }))
+        {
+            return;
+        }
         if self.book_append_undo_in_progress() {
             self.admit_book_append_followup_mutation();
             return;
@@ -334,7 +344,10 @@ impl App {
         // 完了 (= pending 空 + worker idle) まで待つ。consume はしているのでキーは
         // ここで握り潰し、ユーザーが再度押してもらう運用 (非常に短いウィンドウ)。
         if undo || redo {
-            let tag_busy = self.tag_write_handle.as_ref().is_some_and(|h| h.is_busy())
+            let tag_busy = self
+                .tag_write_handle
+                .as_ref()
+                .is_some_and(|h| h.has_unconsumed_batch())
                 || !self.pending_tag_undos.is_empty();
             if tag_busy {
                 crate::logger::log(
@@ -821,16 +834,17 @@ impl App {
     /// `capture_tag_undo` と同じく `tags_cache` を即時反映する (Codex P1)。
     /// 次の操作 (続けて Ctrl+Z や別トグル) が古いキャッシュを見ない。
     fn submit_tag_restore_jobs(&mut self, changes: &[TagChange], use_before: bool) {
+        debug_assert!(!self.tag_maintenance_in_progress());
         self.ensure_tag_write_handle();
-        // 完了トーストのラベルは tag_ops の format_completion_toast で `restored` 件数を
-        // 専用文言に切り替えるので、ここではラベル不要。
-        self.tag_toast_label = None;
         let Some(h) = self.tag_write_handle.as_ref() else {
             self.show_feedback_warning(
                 "タグ書き込みが初期化されていないため Undo できません".to_string(),
             );
             return;
         };
+        if !changes.is_empty() {
+            self.tag_write_completion.record_restore();
+        }
         for c in changes {
             let target = if use_before { &c.before } else { &c.after };
             // tx_id=0 は「Undo entry を pending 経由で確定しない」signal。Undo/Redo の
@@ -1032,6 +1046,67 @@ mod rating_origin_tests {
             before: 3,
             after: 4,
         }
+    }
+
+    #[test]
+    fn tag_maintenance_preserves_rating_and_adjustment_history_but_blocks_tag_restores() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path = app.tmp.path().join("maintenance.jpg");
+        let key = crate::adjustment_db::normalize_path(&path);
+        app.rating_db.as_ref().unwrap().set(&key, 4).unwrap();
+        app.push_rating_undo_entry(vec![change(path.clone())], "rating".into());
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        app.tag_maintenance_rx = Some(receiver);
+        app.apply_meta_undo();
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 3);
+        assert_eq!(app.meta_undo.redo_len(), 1);
+        app.apply_meta_redo();
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 4);
+        assert_eq!(app.meta_undo.undo_len(), 1);
+
+        let before = app.settings.global_preset.clone();
+        let mut after = before.clone();
+        after.brightness = before.brightness + 5.0;
+        app.settings.global_preset = after.clone();
+        app.push_adjustment_undo_entry(
+            vec![AdjustmentChange {
+                scope: AdjustUndoScope::Global,
+                before: Some(before.clone()),
+                after: Some(after.clone()),
+            }],
+            "adjustment".into(),
+        );
+        app.apply_meta_undo();
+        assert_eq!(app.settings.global_preset, before);
+        app.apply_meta_redo();
+        assert_eq!(app.settings.global_preset, after);
+
+        app.push_tag_undo_entry(
+            vec![TagChange {
+                path,
+                tag_sidecar: None,
+                before: vec![],
+                after: vec!["#tag".into()],
+            }],
+            "tag".into(),
+        );
+        let undo_count = app.meta_undo.undo_len();
+        app.apply_meta_undo();
+        assert_eq!(app.meta_undo.undo_len(), undo_count);
+        assert!(matches!(
+            app.meta_undo.peek_undo(),
+            Some(UndoEntry::Tag { .. })
+        ));
+        assert!(app.tag_write_handle.is_none());
+        let tag = app.meta_undo.pop_undo().unwrap();
+        app.meta_undo.push_redo(tag);
+        app.apply_meta_redo();
+        assert_eq!(app.meta_undo.redo_len(), 1);
+        assert!(matches!(
+            app.meta_undo.peek_redo(),
+            Some(UndoEntry::Tag { .. })
+        ));
+        assert!(app.tag_write_handle.is_none());
     }
 
     #[test]
@@ -1263,7 +1338,10 @@ impl App {
     /// 新しいタグ操作の tx_id を発行する (1, 2, 3, ...)。
     pub(crate) fn next_tag_tx_id(&mut self) -> u64 {
         let id = self.next_tag_tx_id;
-        self.next_tag_tx_id = self.next_tag_tx_id.checked_add(1).unwrap_or(1);
+        self.next_tag_tx_id = self
+            .next_tag_tx_id
+            .checked_add(1)
+            .expect("tag transaction id exhausted");
         id
     }
 }

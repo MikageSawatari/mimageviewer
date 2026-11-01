@@ -12,6 +12,8 @@ members = [
     "crates/comic-core",
     "crates/music-core",
     "crates/remote-ipc",
+    "crates/agent-ipc",
+    "crates/mcp-server",
     "crates/remote-web",
     "crates/vst3-host-tester",
     "tools/png2mag",
@@ -384,6 +386,7 @@ local-adjust-core = { path = "crates/local-adjust-core" }
 # docs/comic-integration-plan.md §2)。Inc 0 で配線、実使用は Inc 1 以降。
 comic-core = { path = "crates/comic-core" }
 mimageviewer-ipc = { path = "crates/remote-ipc" }
+mimageviewer-agent-ipc = { path = "crates/agent-ipc" }
 # 音楽ビュー (音声再生・DJ 風タイムライン・スペクトラム解析) の純ロジック。
 # egui / cpal / FFmpeg / VST3 非依存 (rustfft + serde のみ)。analyze_stereo_timeline /
 # SpectrumAnalyzer / MediaVisualMode 等を本体から呼ぶ (統合計画
@@ -407,6 +410,7 @@ cssparser = "0.37"
 # `rc`: サイドカーの items を `Arc` のまま直列化・復元する (deep clone を作らない)。
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
+toml_edit = "0.25"
 webp = "0.3"
 # 2.6.1 regresses data_start bounds, corrupt local-header rejection and I/O details.
 # Unpin only after all three contracts are preserved; see dependency-update-20261028.md.

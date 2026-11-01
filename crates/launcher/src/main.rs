@@ -5,6 +5,8 @@
 //! from its own directory. The launcher extracts these executables, FFmpeg DLLs,
 //! app-local VC runtime and the complete EffeTune bundle into
 //! `%APPDATA%/mimageviewer/runtime/<version>/` first, then spawns the core there.
+//! A leading `--mcp` extracts only the MCP executable and proxies its stdio and
+//! lifetime without entering GUI startup or startup diagnostics.
 
 #![windows_subsystem = "windows"]
 
@@ -20,6 +22,7 @@ use sha2::{Digest, Sha256};
 mod bundle_location;
 mod bundle_paths;
 mod effetune_bundle;
+mod mcp_launch;
 #[path = "../../../src/runtime_locks.rs"]
 mod runtime_locks;
 include!(concat!(env!("OUT_DIR"), "/effetune_files.rs"));
@@ -35,6 +38,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 static CORE_EXE: &[u8] = include_bytes!(env!("MIMV_CORE_EXE"));
 static REMOTE_EXE: &[u8] = include_bytes!(env!("MIMV_REMOTE_EXE"));
 static EPUB_PDF_EXE: &[u8] = include_bytes!(env!("MIMV_EPUB_PDF_EXE"));
+static MCP_EXE: &[u8] = include_bytes!(env!("MIMV_MCP_EXE"));
+const MCP_ASSET: (&str, &[u8], &str) =
+    ("mimageviewer-mcp.exe", MCP_EXE, env!("MIMV_MCP_EXE_SHA256"));
 static AVCODEC_DLL: &[u8] = include_bytes!(env!("MIMV_AVCODEC_DLL"));
 static AVFORMAT_DLL: &[u8] = include_bytes!(env!("MIMV_AVFORMAT_DLL"));
 static AVUTIL_DLL: &[u8] = include_bytes!(env!("MIMV_AVUTIL_DLL"));
@@ -108,9 +114,23 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
         EPUB_PDF_EXE,
         env!("MIMV_EPUB_PDF_EXE_SHA256"),
     ),
+    MCP_ASSET,
 ];
 
 fn main() {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if let Some(args) = mcp_launch::arguments(&args) {
+        // Dispatch before diagnostics/help/activation: stdout belongs to MCP,
+        // and this lane must never start a path-bearing startup log or popup.
+        let result = mcp_launch::run(
+            args,
+            appdata_runtime_dir,
+            mcp_launch::Marker::create,
+            |command| command.spawn(),
+            |line| eprintln!("{line}"),
+        );
+        std::process::exit(mcp_launch::complete(result, |line| eprintln!("{line}")));
+    }
     miv_startup::init_process(Role::Launcher, VERSION, false);
     let code = complete_launcher(run(), show_error);
     if code != 0 {
@@ -485,6 +505,7 @@ fn requires_content_hash_on_launch(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "mimageviewer-epub-pdf.exe"
+            | "mimageviewer-mcp.exe"
             | "msvcp140.dll"
             | "msvcp140_1.dll"
             | "vcruntime140.dll"

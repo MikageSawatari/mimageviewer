@@ -78,6 +78,7 @@ pub use app::draw_thumbnail_filename_width_snapshot_fixture;
 pub use app::draw_thumbnail_name_style_snapshot_fixture;
 #[doc(hidden)]
 pub use app::draw_video_thumbnail_indicator_snapshot_fixture;
+pub use ui_dialogs::agent_integration::draw_agent_integration_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_book_resume_meter_settings_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_file_organize_destinations_settings_snapshot_fixture;
@@ -306,7 +307,10 @@ pub mod post_filter;
 pub mod post_operation_selection;
 // `GetProcessMemoryInfo` の宣言を 1 つに保つためのテスト専用ヘルパー
 // (`clashing_extern_declarations` 対策)。
+mod agent_ipc;
+mod agent_registration;
 pub(crate) mod page_edit_write_epoch;
+mod process_images;
 #[cfg(all(test, windows))]
 mod process_memory_test_support;
 pub mod rar_loader;
@@ -379,6 +383,7 @@ mod ui_analysis_panel;
 mod ui_conceal;
 mod ui_crop;
 mod ui_raw;
+mod ui_request_dispatch;
 #[doc(hidden)]
 pub use ui_raw::{
     draw_raw_blocked_preview_snapshot_fixture, draw_raw_progress_snapshot_fixture,
@@ -1804,12 +1809,14 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
         })
         .expect("RAW develop worker startup"),
     );
+    let shared_readers = remote_ipc::SharedReaders::open(&saved);
     let mut remote_ipc_server = match startup_result(
         miv_startup::Stage::RemoteReader,
         "remote-ipc-server-start",
         || {
             remote_ipc::RemoteIpcServer::start(
                 saved.clone(),
+                shared_readers.as_ref().map_err(Clone::clone)?.clone(),
                 collection_remote_producer.clone(),
                 Arc::clone(&raw_develop_executor),
                 io_semaphore::GlobalIoSemaphore::process_shared(
@@ -1834,9 +1841,28 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
         .map(remote_ipc::RemoteIpcServer::control);
     let app_remote_session_handle = remote_session_handle.clone();
     let app_remote_ipc_control = remote_ipc_control.clone();
-    let remote_settings_reader_control = remote_ipc_server
+    let remote_settings_reader_control = shared_readers
         .as_ref()
-        .map(remote_ipc::RemoteIpcServer::settings_reader_control);
+        .ok()
+        .map(|readers| readers.settings_reader_control());
+    let mut agent_ipc_server = shared_readers.as_ref().ok().and_then(|readers| {
+        agent_ipc::Server::start(
+            readers.clone(),
+            collection_remote_producer.clone(),
+            remote_session_handle.clone(),
+        )
+        .map_err(|_| logger::log("agent_ipc: startup failed"))
+        .ok()
+    });
+    let agent_open_controller = agent_ipc_server
+        .as_ref()
+        .map(agent_ipc::Server::open_controller);
+    let agent_recent_apps = agent_ipc_server
+        .as_ref()
+        .map(agent_ipc::Server::recent_apps);
+    let agent_changes_controller = agent_ipc_server
+        .as_ref()
+        .map(agent_ipc::Server::changes_controller);
     // server より後に所有し、逆順 Drop で service を先に止めてから pipe を閉じる。
     let remote_data_dir = data_dir::get();
     let mut remote_service_manager = if remote_ipc_server.is_some() {
@@ -2006,6 +2032,18 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
             if let Some(handle) = app_remote_session_handle.clone() {
                 app.set_remote_session_handle(handle);
             }
+            if let Ok(readers) = shared_readers.as_ref() {
+                app.install_agent_readers(readers.clone());
+            }
+            if let Some(controller) = agent_open_controller.as_ref() {
+                app.install_agent_open(controller.clone(), &cc.egui_ctx);
+            }
+            if let Some(recent) = agent_recent_apps.as_ref() {
+                app.install_agent_recent_apps(recent.clone());
+            }
+            if let Some(controller) = agent_changes_controller.as_ref() {
+                app.install_agent_changes(controller.clone(), &cc.egui_ctx);
+            }
             if let Some(control) = app_remote_ipc_control.clone() {
                 app.set_remote_ipc_server_control(control);
             }
@@ -2118,6 +2156,7 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
             // Stop public admission before named-pipe workers, then close the only Remote collection
             // producer before joining the actor. The App normally completed its drain in on_exit; this
             // outer fallback also covers creator failure/panic and is deliberately idempotent.
+            drop(agent_ipc_server.take());
             if let Some(control) = remote_ipc_control.as_ref() {
                 control.begin_app_exit();
             }

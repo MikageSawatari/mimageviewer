@@ -2799,6 +2799,7 @@ pub enum MenuCommandId {
     SettingsOperationCustomize,
     SettingsPreferences,
     SettingsRemoteConnection,
+    SettingsAgentIntegration,
     HelpOpenManual,
     HelpOpenLogs,
     HelpShowWhatsNew,
@@ -2856,6 +2857,7 @@ impl MenuCommandId {
         Self::SettingsOperationCustomize,
         Self::SettingsPreferences,
         Self::SettingsRemoteConnection,
+        Self::SettingsAgentIntegration,
         Self::HelpOpenManual,
         Self::HelpOpenLogs,
         Self::HelpShowWhatsNew,
@@ -2914,6 +2916,7 @@ impl MenuCommandId {
             MenuCommandId::SettingsPreferences => "SettingsPreferences",
             MenuCommandId::HelpOpenManual => "HelpOpenManual",
             MenuCommandId::SettingsRemoteConnection => "SettingsRemoteConnection",
+            MenuCommandId::SettingsAgentIntegration => "SettingsAgentIntegration",
             MenuCommandId::HelpOpenLogs => "HelpOpenLogs",
             MenuCommandId::HelpShowWhatsNew => "HelpShowWhatsNew",
             MenuCommandId::HelpAbout => "HelpAbout",
@@ -3237,6 +3240,12 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::SettingsRemoteConnection,
         parent: TopMenuId::Settings,
         label: "リモート接続…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::SettingsAgentIntegration,
+        parent: TopMenuId::Settings,
+        label: "AI 連携…",
         action: None,
     },
     MenuCommandSpec {
@@ -12161,6 +12170,58 @@ mod tests {
     }
 
     #[test]
+    fn agent_integration_menu_matches_remote_order_and_customization() {
+        let command = MenuCommandId::SettingsAgentIntegration;
+        assert_eq!(command.stable_name(), "SettingsAgentIntegration");
+        assert_eq!(
+            MenuCommandId::parse_stable_name(command.stable_name()),
+            Some(command)
+        );
+        let spec = menu_command_spec(command).unwrap();
+        assert_eq!(spec.parent, TopMenuId::Settings);
+        assert_eq!(spec.label, "AI 連携…");
+        assert_eq!(spec.action, None);
+        let commands = |settings: &MenuLayoutSettings| {
+            resolve_menu_layout(settings)
+                .menus
+                .into_iter()
+                .find(|menu| menu.id == TopMenuId::Settings)
+                .unwrap()
+                .commands
+        };
+        let default = commands(&MenuLayoutSettings::default());
+        let remote = default
+            .iter()
+            .position(|id| *id == MenuCommandId::SettingsRemoteConnection)
+            .unwrap();
+        assert_eq!(default[remote + 1], command);
+        let mut customized = MenuLayoutSettings {
+            command_order: vec![MenuCommandOrderSettings {
+                parent: "Settings".into(),
+                commands: vec![
+                    command.stable_name().into(),
+                    "SettingsRemoteConnection".into(),
+                ],
+            }],
+            ..Default::default()
+        };
+        let ordered = commands(&customized);
+        assert!(
+            ordered.iter().position(|id| *id == command).unwrap()
+                < ordered
+                    .iter()
+                    .position(|id| *id == MenuCommandId::SettingsRemoteConnection)
+                    .unwrap()
+        );
+        customized
+            .hidden_commands
+            .push(command.stable_name().into());
+        let hidden = commands(&customized);
+        assert!(!hidden.contains(&command));
+        assert!(hidden.contains(&MenuCommandId::SettingsRemoteConnection));
+    }
+
+    #[test]
     fn metadata_transfer_commands_are_available_in_v2_8_development_menus() {
         assert!(crate::metadata_transfer::UI_ENABLED);
         let file_commands = menu_commands_for_parent(TopMenuId::File)
@@ -12321,6 +12382,7 @@ mod tests {
             (MenuCommandId::SettingsPreferences, "環境設定…"),
             (MenuCommandId::HelpOpenManual, "ヘルプサイトを開く"),
             (MenuCommandId::SettingsRemoteConnection, "リモート接続…"),
+            (MenuCommandId::SettingsAgentIntegration, "AI 連携…"),
             (MenuCommandId::HelpOpenLogs, "ログフォルダを開く"),
             (MenuCommandId::HelpShowWhatsNew, "重要な変更点を表示"),
             (MenuCommandId::HelpAbout, "バージョン情報"),

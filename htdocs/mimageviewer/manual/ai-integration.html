@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI アプリとの連携 — mImageViewer マニュアル</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="Claude Desktop や ChatGPT (Codex) から mImageViewer のライブラリを検索・整理する方法。許可の範囲、渡る情報、登録・解除、変更の記録を説明します。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/ai-integration.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/ai-integration.html">
+  <meta property="og:title" content="AI アプリとの連携｜mImageViewer">
+  <meta property="og:description" content="Claude Desktop や ChatGPT (Codex) から mImageViewer のライブラリを検索・整理する方法。許可の範囲、渡る情報、登録・解除、変更の記録を説明します。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="AI アプリとの連携｜mImageViewer">
+  <meta name="twitter:description" content="Claude Desktop や ChatGPT (Codex) から mImageViewer のライブラリを検索・整理する方法。許可の範囲、渡る情報、登録・解除、変更の記録を説明します。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>AI アプリとの連携</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="tutorial.html">チュートリアル</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="stack.html">スタック表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="music.html">音楽再生</a>
+        <a href="effetune.html">音響調整 (EffeTune)</a>
+        <a href="effetune/index.html" class="sub">エフェクトの説明書</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="annotation.html">テキスト注釈</a>
+        <a href="export.html">エクスポート</a>
+        <a href="clipboard-capture.html">クリップボード取り込み</a>
+        <a href="metadata-transfer.html">メタ情報の移行</a>
+        <a href="external-tools.html">外部ツール連携</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="books.html">製本・本棚</a>
+        <a href="collections.html">コレクション</a>
+        <a href="search.html">検索機能</a>
+        <a href="remote.html">リモート閲覧</a>
+        <a href="ai-integration.html" class="active">AI アプリとの連携</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="gamepad.html">ゲームパッド操作</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+        <a href="known-issues.html">既知の問題</a>
+        <a href="changelog.html">更新履歴</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">AI アプリとの連携</h1>
+    <p class="page-desc">同じ PC の Claude Desktop や ChatGPT (Codex) から、mImageViewer のライブラリを検索・整理できます。
+      AI アプリとほかのアプリをつなぐ共通規格「MCP」を使います。</p>
+
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">
+        <strong>既定では無効です。</strong>有効にすると、許可した情報を AI アプリが受け取り、その提供元へ送ります。
+        この連携で mIV 自身がインターネットへ情報を送ることはなく、mIV の開発者にも送られません。
+        AI アプリと提供元のプライバシーポリシー・会話の保存設定を確認してから有効にしてください。
+      </div>
+    </div>
+
+    <h2 id="permissions">許可の範囲を選ぶ</h2>
+    <p>mIV を起動し、<strong>「設定」メニュー →「AI 連携…」</strong>を開きます。
+      許可の範囲と、縮小画像・撮影位置のチェックは<strong>変えた時点で反映</strong>されます。OK・キャンセルはありません。</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>許可の範囲</th><th>AI に許す操作</th></tr></thead>
+        <tbody>
+          <tr><td>無効（既定）</td><td>この連携では情報を渡さず、操作も受け付けません</td></tr>
+          <tr><td>読み取りのみ</td><td>検索、フォルダや本の一覧、ファイル情報、タグ・★・コレクション、本棚・閲覧履歴・ブックマークの確認</td></tr>
+          <tr><td>読み取りと、mIV で開く</td><td>読み取りに加えて、メイン画面で指定の場所を開きます。画像・動画・音声はそのフォルダへ移って選んだファイルを表示・再生し、ZIP / PDF は本として開きます。画面が切り替わります</td></tr>
+          <tr><td>整理まで: タグ・★・コレクションの変更</td><td>読み取りと開く操作に加えて、タグの追加・削除、★の設定・解除、コレクションの作成・名前の変更・項目の追加・取り外し</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>許可の範囲は、この連携を使う AI アプリに共通です。「整理まで」では、mIV は変更のたびに確認を出しません。
+      必要な範囲を選び、使い終わったら「読み取りのみ」や「無効」に戻せます。すでに受け付けた変更は、許可を下げても取り消されません。</p>
+
+    <h2 id="shared-information">AI に見せるもの・見せないもの</h2>
+    <p>読み取りを許可すると、AI アプリは次の情報を取得できます。ファイルに情報がない場合や、形式が対応していない場合は取得できない項目もあります。</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>情報</th><th>渡る内容</th></tr></thead>
+        <tbody>
+          <tr><td>mIV の状態</td><td>連携の許可の範囲、縮小画像・撮影位置の許可、検索の準備状態、リモート閲覧中かどうか、アプリの版</td></tr>
+          <tr><td>場所と基本情報</td><td>ファイルの場所（絶対パス）、名前、種類、大きさ、画像の寸法、日時、フォルダや対応する本の一覧、検索結果</td></tr>
+          <tr><td>mIV での整理・閲覧情報</td><td>タグ・★、コレクションの名前と登録内容、本棚、お気に入り、閲覧履歴、ブックマーク</td></tr>
+          <tr><td>撮影・生成情報</td><td>撮影日時・カメラやレンズの機種などの EXIF、AI 生成画像のプロンプト・モデル名・生成条件など。PNG tEXt チャンクや EXIF UserComment に含まれる生成情報から、対応する項目を取り出します</td></tr>
+          <tr><td>縮小画像</td><td>「縮小画像を AI に見せる」がオンの場合に渡ります。既定はオフです。画像や指定した本のページが対象で、補正・編集は反映しません。隠す編集をした画像、動画や書庫の代表画像は渡しません</td></tr>
+          <tr><td>撮影位置</td><td>「撮影位置 (GPS) を AI に見せる」がオンの場合に、EXIF の GPS 欄を渡します。既定はオフです</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>この連携では、画像・動画・音声の元データ、PDF / ZIP の本文全体、mIV の設定ファイルの内容全体、保存した PDF のパスワード、リモート接続の暗証番号は渡しません。
+      撮影位置をオフにしても、ファイル名・タグ・プロンプトなどの文章に書かれた地名を取り除くものではありません。</p>
+    <p>mIV 本体のアップスケール・ノイズ除去・消しゴムの補完などは PC 内で動く画像 AI です。
+      この AI アプリとの連携は別の機能で、渡した情報は提供元へ送られます。詳しくは<a href="../privacy.html">プライバシーポリシー</a>をご覧ください。</p>
+
+    <h2 id="registration">AI アプリへ登録する</h2>
+    <ol>
+      <li>使う AI アプリを終了します。Claude Desktop はウィンドウを閉じても通知領域（タスクトレイ）に残る場合があるため、そこからも終了してください。Codex をほかの画面でも使っている場合は、そちらも終了してください。</li>
+      <li>mIV の「AI 連携」ウィンドウで、<strong>Claude Desktop</strong> または <strong>ChatGPT (Codex)</strong> の行を確認します。「再確認」で検出し直せます。</li>
+      <li>「登録する」を押し、表示された書き換え内容と保存先を確かめて登録します。登録先が違うと表示された場合は「登録し直す」を使います。</li>
+      <li>許可の範囲を選んで AI アプリを起動し、mIV のライブラリを検索するなどの依頼をします。<strong>利用中は mIV を起動したまま</strong>にしてください。</li>
+    </ol>
+    <p>登録・解除では AI アプリの設定ファイルを書き換えます。既存のファイルがある場合は、書き換え前の内容を同じ場所に
+      <code>.mimageviewer.bak</code> を末尾に付けた名前で残します。バックアップは 1 つで、次の書き換えで上書きされます。</p>
+    <p>使わなくなった場合は、対象の AI アプリを終了してから「登録を外す」を押します。
+      自動で登録できない場合や手動で設定したい場合は、その行の<strong>「手順を見る」</strong>を使ってください。</p>
+    <p>mIV をアンインストールしたり、ポータブル版のフォルダを削除したりしても、AI アプリ側の登録とバックアップは残ります。
+      不要なら先に「登録を外す」を使い、バックアップは手動で削除してください。</p>
+
+    <h3 id="app-approval">AI アプリ側の確認について</h3>
+    <p>AI アプリが、個々の操作（ツール）を使うたびに許可を求める場合があります。これは AI アプリの確認で、mIV から止めることはできません。</p>
+    <ul>
+      <li><strong>Claude Desktop</strong>: アプリ自身の設定で、個々の操作を常に許可できる場合があります。お使いのアプリの設定を確認してください。</li>
+      <li><strong>ChatGPT (Codex)</strong>: mIV から登録すると、mIV との連携の操作は確認なしで実行する設定になります。mIV の「許可の範囲」が操作の上限になります。</li>
+    </ul>
+
+    <h2 id="changes">整理を頼むときの制限と変更の記録</h2>
+    <ul>
+      <li>1 回の変更は<strong>最大 500 件</strong>、タグは<strong>1 回に最大 10 個</strong>です。</li>
+      <li>★は 1〜5 を付けられ、0 は評価の解除です。タグの変更はファイルやフォルダが対象で、ZIP 内の項目や PDF のページには付けられません。</li>
+      <li>★を画像ファイルへ書き込む設定を有効にしている場合は、AI による★の変更にも適用されます。</li>
+      <li>コレクションから項目を外しても、元のファイルは削除されません。コレクション自体の削除は、この連携ではできません。</li>
+      <li>AI による変更は<strong>「元に戻す」の対象になりません</strong>。変更内容を確認し、必要なら自分でタグ・★・コレクションを直してください。</li>
+      <li><a href="remote.html">リモート閲覧</a>で操作中は、AI からの変更や mIV で開く依頼を受け付けません。</li>
+    </ul>
+    <p>「AI 連携」ウィンドウの<strong>「AI による変更」</strong>に、時刻・AI アプリ名・操作・件数が新しい順に並びます。
+      展開すると対象と変更前後の値・結果を確認でき、コピーもできます。最新 100 回分を表示し、mIV を終了すると消えます。
+      変更済みのタグ・★・コレクション自体は残ります。</p>
+    <p>タグ変更の「受け付けた」は完了を意味しません。記録の「処理中」が結果に変わったことを確認してください。
+      mIV で開く依頼の「受け付けた」は、開く処理を始めたという意味です。読み込み中の問題は mIV の画面に表示されます。</p>
+    <p>「最近使った AI アプリ」には、AI アプリが名乗った名前・バージョンと直近の利用状況を表示します。
+      これも mIV を終了すると消えます。</p>
+
+    <h2 id="logs">ログに残るもの</h2>
+    <p>AI からの要求の記録には、操作のツール名・所要時間・件数・結果やエラーの種類が残ります。
+      AI からの検索語や読み取り結果を、mIV の履歴・診断ログへ保存することはありません。</p>
+    <p>一方、AI が変更したタグや★は、自分で操作した場合と同じ通常の動作ログにも記録され、変更したファイルの場所やタグ名などが残ります。
+      mIV で開いたファイルも通常の閲覧と同じ記録の対象です。「AI による変更」の表示が消えても、通常のログまで消えるわけではありません。</p>
+    <p>AI アプリ側の会話履歴やログ、受け取った情報の保存は、そのアプリと提供元の設定・方針に従います。</p>
+
+    <h2 id="troubleshooting">使えないときは</h2>
+    <ul>
+      <li>mIV を起動し、「AI 連携」の許可の範囲と対象アプリの登録状態を確認してください。</li>
+      <li>登録・解除が動作中のため断られた場合は、対象アプリを終了して「再確認」を押してください。</li>
+      <li>設定ファイルを読めない、登録先を決められないなどと表示された場合は、表示された理由を確認し、「手順を見る」から手動設定の案内を開いてください。</li>
+      <li>読み取りはできても変更できない場合は、「整理まで」になっているか、リモート閲覧で操作中でないかを確認してください。</li>
+    </ul>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

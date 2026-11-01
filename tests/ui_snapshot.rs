@@ -28,6 +28,97 @@
 use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
 
+fn agent_integration_snapshot(name: &str, theme: mimageviewer::os_theme::ResolvedTheme, level: u8) {
+    snapshot_with_theme_at_size(name, theme, egui::vec2(1000.0, 1150.0), None, move |ui| {
+        mimageviewer::draw_agent_integration_snapshot_fixture(ui, level)
+    });
+}
+
+#[test]
+fn agent_integration_window_disabled_light() {
+    agent_integration_snapshot(
+        "agent_integration_window_disabled_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        0,
+    );
+}
+#[test]
+fn agent_integration_window_disabled_dark() {
+    agent_integration_snapshot(
+        "agent_integration_window_disabled_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        0,
+    );
+}
+#[test]
+fn agent_integration_window_read_light() {
+    agent_integration_snapshot(
+        "agent_integration_window_read_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        1,
+    );
+}
+#[test]
+fn agent_integration_window_read_dark() {
+    agent_integration_snapshot(
+        "agent_integration_window_read_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        1,
+    );
+}
+#[test]
+fn agent_integration_window_open_light() {
+    agent_integration_snapshot(
+        "agent_integration_window_open_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        2,
+    );
+}
+#[test]
+fn agent_integration_window_open_dark() {
+    agent_integration_snapshot(
+        "agent_integration_window_open_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        2,
+    );
+}
+
+#[test]
+fn agent_integration_window_organize_light() {
+    agent_integration_snapshot(
+        "agent_integration_window_organize_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        3,
+    );
+}
+
+#[test]
+fn agent_integration_window_organize_dark() {
+    agent_integration_snapshot(
+        "agent_integration_window_organize_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        3,
+    );
+}
+
+#[test]
+fn agent_integration_window_records_light() {
+    agent_integration_snapshot(
+        "agent_integration_window_records_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        4,
+    );
+}
+
+#[test]
+fn agent_integration_window_records_dark() {
+    agent_integration_snapshot(
+        "agent_integration_window_records_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        4,
+    );
+}
+
 #[test]
 fn cache_manager_collection_dark() {
     snapshot_with_theme_at_size(

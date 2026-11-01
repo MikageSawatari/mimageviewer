@@ -12,7 +12,7 @@
 | 変更ファイルから反復テストを選ぶ | `.\scripts\test-focused.ps1` | nextest、選択を毎回表示、0件一致は非ゼロ |
 | 本体lib全件と成功結果の再利用 | `.\scripts\test-lib-full.ps1` | nextest、同じ内容・条件の成功台帳があれば実行を省略 |
 | 診断用の窓固定・入力観測のテスト | `cargo test -p mimageviewer --lib <filter> --features test-script` | `test_script` / `native_ui_smoke`等の対象。通常core checkも別に行う |
-| 実アプリ用の軽量ビルド | `.\scripts\build-dev.ps1` | core と remote service を `dev-runtime` でビルド |
+| 実アプリ用の軽量ビルド | `.\scripts\build-dev.ps1` | core・remote・EPUB worker・MCP adapter を `dev-runtime` でビルド |
 | 自動操作用の使い捨て環境を準備 | `.\scripts\prepare-portable-smoke.ps1 -TestScript` | 診断portableを別出力先でbuildし、固定sandboxへ配置。起動はしない |
 | 了承済みのリリース前実アプリ検証 | `.\scripts\ui-smoke.ps1 -Scenario <対象> -InteractiveApproved` | [実行確認](interactive-release-verification.md)後だけ。通常の開発反復・test-fullへ自動連結しない |
 | 毎リリースのidle／perf正規確認 | `.\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved` | 2026-10-11採用。利用者がPowerShellで実行。隔離seed＋5 idle＋cached／uncached perf、全結果は `target/ui-smoke/runs/<run-id>/` |
@@ -68,6 +68,25 @@ witnessは`cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-feat
 稼働中のmImageViewerがあれば停止せず失敗し、通常APPDATAのVST3展開キャッシュも削除しない。
 子のrelease/portableビルドへ同じ指定を渡す。引数なしの従来CLI動作は変更しない。
 この指定は必須テストや署名を省略するものではなく、アプリの起動・操作を許可するものでもない。
+
+release 出力は `<repo>\target\release` に固定する。`build-release.ps1` / `.sh` は追加 Cargo 引数を
+停止/build 前に allow-list で検査する。許すのは `--features <x>` / `--features=<x>`、`--all-features`、
+`--no-default-features`、`--locked`、`--frozen`、`--offline`、`-v` / `--verbose`、`-j <n>` / `--jobs <n>`。
+各 build は `--message-format=json-render-diagnostics` を使い、`compiler-artifact.executable` が
+固定出力と一致しなければ署名/次の build/内包へ進めない。環境変数・利用者の Cargo 設定もこの照合で検出する。
+launcher と MCP については、その build が書く exe と image path が完全一致する process だけを
+停止/拒否の対象にする。インストール先の AI 連携と path 不明の process はこの2名の対象外。
+
+workspace 全体/launcher のテストは、埋込入力4本を先に作る必要がある:
+
+```powershell
+cargo build --release --bin mimageviewer-core
+cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets
+cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf
+cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp
+```
+
+release wrapper は core → remote → EPUB worker → MCP → launcher の順でビルドする。
 
 同経路では `test-full.ps1 -SuppressCrashDialogs` を子プロセス内で適用する。
 Windowsのクラッシュダイアログだけをそのプロセスで抑え、元のerror modeを終了時に復元する。
@@ -246,7 +265,7 @@ test profile は dev を継承するので、設定は `[profile.dev]` だけに
 
 ### 実アプリの開発ビルド
 
-`build-dev.ps1` は次の条件で本体 core と同じprotocolのremote serviceをビルドする。
+`build-dev.ps1` は次の条件で core → remote service → EPUB worker → MCP adapter をビルドする。
 
 - `dev-runtime` profile: `opt-level = 2`、LTO なし、codegen unit 64、incremental 有効
 - 通常 feature set（`portable` は付けない）: 設定・キャッシュ・ログの既定保存先は
@@ -254,13 +273,14 @@ test profile は dev を継承するので、設定は `[profile.dev]` だけに
 - launcher を省略して直接起動できるよう、FFmpeg DLL だけを exe の隣へ配置。他の
   DLL・worker・AI model は通常版と同じ埋め込み・展開経路を使う
 - 出力: `target\dev-runtime\mimageviewer-core.exe`
-  と `target\dev-runtime\mimageviewer-remote.exe`
+  と `mimageviewer-remote.exe` / `mimageviewer-epub-pdf.exe` / `mimageviewer-mcp.exe`。
+  MCP は1dの登録先として core と同じフォルダに必要。
 - Cargo の `dev-runtime` はビルド時間短縮用の最適化profileであり、アプリのデータprofileを
   切り替えるものではない
 
 スクリプトは必要な FFmpeg DLL を変更時だけ出力先へコピーし、成果物を起動しない。
 実行中のアプリを停止できない場合は `.\scripts\build-dev.ps1 -PreserveRuntime` を使う。
-出力先と同じ絶対パスの core または remote が実行中なら、停止せずエラーで終了する。
+出力先と同じ絶対パスの core / remote / EPUB worker / MCP が実行中なら、停止せずエラーで終了する。
 この指定を省略した場合は、従来どおり同じ出力先のプロセスを停止してからビルドする。
 停止分岐の回帰は `scripts/test-build-dev-safety.ps1` で実プロセスを操作せず確認できる。
 通常profileを汚さない隔離確認が明示的に必要な場合は、同じバイナリへ

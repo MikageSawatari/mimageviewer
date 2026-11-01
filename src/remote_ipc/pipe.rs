@@ -722,6 +722,7 @@ impl Drop for ServerStartupWorkers {
 impl ServerGuard {
     pub(super) fn start(
         settings: crate::settings::Settings,
+        readers: Arc<super::SharedReaders>,
         persistent_collection_producer: Option<
             crate::collection_store::CollectionRemoteProducerControl,
         >,
@@ -750,8 +751,7 @@ impl ServerGuard {
         session_handle.install_page_jobs(&page_jobs);
         let configured_worker_count = settings.parallelism.thread_count();
         let worker_count = remote_heavy_worker_count(configured_worker_count);
-        let favorites = super::live_favorites::LiveFavorites::live(settings.favorites.clone())?;
-        let settings_reader_control = favorites.control();
+        let settings_reader_control = readers.settings_reader_control();
         let thumbnail_engine = Arc::new(ThumbnailEngine::new_with_io_sem(settings.clone(), io_sem));
         let container_engine = Arc::new(ContainerEngine::new_with_session_and_raw_executor(
             settings.clone(),
@@ -773,9 +773,7 @@ impl ServerGuard {
         let video_stream_engine = Arc::new(VideoStreamEngine::new_with_container_engine(
             Arc::clone(&container_engine),
         ));
-        let collection_engine = Arc::new(CollectionEngine::new_with_live_favorites(
-            settings, favorites,
-        ));
+        let collection_engine = Arc::clone(&readers.collections);
         let persistent_collection_engine = persistent_collection_producer
             .map(PersistentCollectionEngine::new)
             .map(Arc::new);

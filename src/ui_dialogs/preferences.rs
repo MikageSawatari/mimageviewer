@@ -121,6 +121,7 @@ pub(crate) fn draw_fullscreen_specified_scale_max_controls(
 }
 
 mod name_colors;
+
 mod pages;
 mod search_index;
 mod transfer;
@@ -259,6 +260,45 @@ fn pref_panel_scroll_style() -> egui::style::ScrollStyle {
     scroll.bar_outer_margin = 2.0;
     scroll.foreground_color = true;
     scroll
+}
+
+#[cfg(test)]
+mod immediate_agent_permission_tests {
+    use super::*;
+
+    #[test]
+    fn preferences_ok_and_cancel_keep_permissions_changed_after_draft_opened() {
+        for apply in [true, false] {
+            let mut app = crate::app::setup_app_for_test();
+            app.open_preferences_page(PreferencesPage::General);
+            app.ensure_preferences_state();
+            assert_eq!(
+                app.pref_state.as_ref().unwrap().settings.agent_level,
+                crate::settings::AgentLevel::Disabled
+            );
+            // The independent window's successful immediate commit changes the
+            // live owner while this opening-time Preferences draft remains open.
+            app.settings.agent_level = crate::settings::AgentLevel::Organize;
+            app.settings.agent_show_thumbnails = true;
+            app.settings.agent_show_gps = true;
+            assert!(app.settings.save_checked());
+            if apply {
+                app.apply_preferences_dialog(&egui::Context::default());
+            } else {
+                app.discard_preferences_dialog();
+            }
+            assert!(!app.show_preferences);
+            assert_eq!(
+                app.settings.agent_level,
+                crate::settings::AgentLevel::Organize
+            );
+            assert!(app.settings.agent_show_thumbnails && app.settings.agent_show_gps);
+            let (saved, _) =
+                crate::settings_db::with_db_result(|db| db.load_agent_permission()).unwrap();
+            assert_eq!(saved.level, crate::settings::AgentLevel::Organize);
+            assert!(saved.thumbnails && saved.gps);
+        }
+    }
 }
 
 fn settings_equal_for_close_prompt(a: &Settings, b: &Settings) -> bool {
@@ -2260,7 +2300,7 @@ fn select_preference_search_result(state: &mut PreferencesState, entry: &PrefSea
     }
 }
 
-fn draw_preference_search(ui: &mut egui::Ui, state: &mut PreferencesState) {
+fn draw_preference_search(ui: &mut egui::Ui, state: &mut PreferencesState) -> egui::Response {
     let width = ui.available_width();
     let response = crate::ime_focus::add_singleline(ui, &mut state.search_query, None, |edit| {
         edit.desired_width(width).hint_text("設定を検索")
@@ -2269,16 +2309,23 @@ fn draw_preference_search(ui: &mut egui::Ui, state: &mut PreferencesState) {
         state.showing_results = !state.search_query.trim().is_empty();
     }
     ui.add_space(6.0);
+    response
+}
+
+enum PreferenceSearchSelection {
+    Page(&'static PrefSearchEntry),
+    Window(search_index::SettingsWindow),
 }
 
 fn draw_preference_search_results(
     ui: &mut egui::Ui,
     query: &str,
-) -> Option<&'static PrefSearchEntry> {
+) -> Option<PreferenceSearchSelection> {
     ui.heading("検索結果");
     ui.add_space(8.0);
     let results = search_preferences(query, preference_category);
-    if results.is_empty() {
+    let windows = search_index::search_settings_windows(query);
+    if results.is_empty() && windows.is_empty() {
         ui.label("一致する設定がありません");
         return None;
     }
@@ -2314,8 +2361,16 @@ fn draw_preference_search_results(
             ui.visuals().weak_text_color(),
         );
         if response.clicked() {
-            selected = Some(entry);
+            selected = Some(PreferenceSearchSelection::Page(entry));
         }
+    }
+    for window in windows {
+        ui.group(|ui| {
+            ui.add(egui::Label::new(window.hint()).wrap().selectable(true));
+            if ui.button(window.button_label()).clicked() {
+                selected = Some(PreferenceSearchSelection::Window(window));
+            }
+        });
     }
     selected
 }
@@ -2355,6 +2410,12 @@ pub(crate) fn prepare_preferences_settings_for_commit(
     let new_details_selection_bar_mode = edited.details_selection_bar_mode.normalized();
 
     edited.overwrite_non_preferences_from(live);
+    // Immediate settings windows own these values. An older Preferences draft
+    // must never restore their opening-time values, including on close checks.
+    edited.agent_level = live.agent_level;
+    edited.agent_show_thumbnails = live.agent_show_thumbnails;
+    edited.agent_show_gps = live.agent_show_gps;
+    edited.remote_service_enabled = live.remote_service_enabled;
     edited.route_preferences_view_state(standard_view_state, active_view_state);
 
     // セット C は上の移送対象なので、スナップショット上で先に複製すると live 値で
@@ -2511,6 +2572,9 @@ impl App {
     }
 
     pub(crate) fn open_preferences_request(&mut self, request: PreferencesOpenRequest) {
+        if self.agent_registration_dialog_open() {
+            return;
+        }
         if self.composition_editor_modal_active() {
             return;
         }
@@ -2559,6 +2623,9 @@ impl App {
     }
 
     fn request_close_preferences_dialog(&mut self) {
+        if self.agent_registration_dialog_open() {
+            return;
+        }
         if self.preferences_transfer_busy() || self.preferences_transfer_dialog_open() {
             return;
         }
@@ -2571,6 +2638,9 @@ impl App {
     }
 
     fn discard_preferences_dialog(&mut self) {
+        if self.agent_registration_dialog_open() {
+            return;
+        }
         self.pref_state = None;
         self.show_preferences = false;
         self.show_preferences_discard_confirm = false;
@@ -2693,6 +2763,9 @@ impl App {
     }
 
     pub(crate) fn apply_preferences_dialog(&mut self, ctx: &egui::Context) {
+        if self.agent_registration_dialog_open() {
+            return;
+        }
         if self.book_append_undo_in_progress()
             && let Some(state) = self.pref_state.as_ref()
         {
@@ -3183,25 +3256,29 @@ impl App {
                 .collect();
         }
 
+        let registration_dialog_open = self.agent_registration_dialog_open();
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
+        let mut settings_window = None;
 
         let transfer_dialog_open = self.preferences_transfer_dialog_open();
         let collection_reorder_open = self.collection_reorder_open();
-        if transfer_dialog_open {
+        if transfer_dialog_open || registration_dialog_open {
             // Popups use independent UI layers and do not inherit a disabled
             // parent. Remove that combination while the transfer modal is shown.
             egui::Popup::close_all(ctx);
         }
 
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-        let enter_pressed = !transfer_dialog_open && self.dialog_enter_pressed(ctx);
-        let escape_pressed = !transfer_dialog_open && self.dialog_escape_pressed(ctx);
+        let enter_pressed =
+            !transfer_dialog_open && !registration_dialog_open && self.dialog_enter_pressed(ctx);
+        let escape_pressed =
+            !transfer_dialog_open && !registration_dialog_open && self.dialog_escape_pressed(ctx);
 
         egui::Window::new("環境設定")
             .drag_area(egui::WindowDrag::Anywhere)
-            .enabled(!transfer_dialog_open)
+            .enabled(!transfer_dialog_open && !registration_dialog_open)
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -3240,7 +3317,7 @@ impl App {
                         .layout(egui::Layout::top_down(egui::Align::Min)),
                 );
                 let selected_before_tree = state.selected;
-                draw_preference_search(&mut left_ui, state);
+                let search_field = draw_preference_search(&mut left_ui, state);
                 let tree_height = left_ui.available_height().max(0.0);
                 egui::ScrollArea::vertical()
                     .scroll_source(egui::scroll_area::ScrollSource {
@@ -3280,7 +3357,10 @@ impl App {
                 // スクロールバーは本文上に重なるため、右端ボタンや区切り線が読みにくくなる。
                 right_ui.spacing_mut().scroll = pref_panel_scroll_style();
                 let mut command_capture_waiting = false;
-                if enter_pressed && state.showing_results {
+                if enter_pressed
+                    && state.showing_results
+                    && (search_field.has_focus() || ctx.memory(|memory| memory.focused().is_none()))
+                {
                     let first = search_preferences(&state.search_query, preference_category)
                         .into_iter()
                         .next();
@@ -3311,8 +3391,14 @@ impl App {
                     command_capture_waiting = state.command_capture_slot.is_some();
                     if state.showing_results {
                         let query = state.search_query.clone();
-                        if let Some(entry) = draw_preference_search_results(ui, &query) {
-                            select_preference_search_result(state, entry);
+                        match draw_preference_search_results(ui, &query) {
+                            Some(PreferenceSearchSelection::Page(entry)) => {
+                                select_preference_search_result(state, entry);
+                            }
+                            Some(PreferenceSearchSelection::Window(window)) => {
+                                settings_window = Some(window);
+                            }
+                            None => {}
                         }
                     } else {
                         draw_page(ui, state, enter_pressed);
@@ -3414,6 +3500,16 @@ impl App {
         if let Some(state) = self.pref_state.as_ref() {
             self.preferences_right_panel_scroll_sequence = state.right_panel_scroll_generation;
         }
+        if let Some(window) = settings_window {
+            match window {
+                search_index::SettingsWindow::AgentIntegration => {
+                    self.open_agent_integration_dialog()
+                }
+                search_index::SettingsWindow::RemoteConnection => {
+                    self.open_remote_connection_dialog()
+                }
+            }
+        }
         let external_launch = self
             .pref_state
             .as_mut()
@@ -3431,6 +3527,13 @@ impl App {
             self.diagnostics_export.submit(ctx);
         }
 
+        // Opening confirmation owns the draft immediately, including the frame
+        // which created it; a title × / Enter / Escape may not close it meanwhile.
+        if self.agent_registration_dialog_open() {
+            apply = false;
+            cancel = false;
+            open = true;
+        }
         if apply {
             self.apply_preferences_dialog(ctx);
         } else if cancel || !open {
@@ -6526,6 +6629,99 @@ mod tests {
             });
         harness.run();
         harness.snapshot("preferences_search_results");
+    }
+
+    #[test]
+    fn preferences_search_window_hints_snapshot() {
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(620.0, 320.0))
+            .with_context_setup(|ctx| {
+                crate::ui_fonts::configure_fonts(ctx);
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+            })
+            .build_ui(|ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let _ = draw_preference_search_results(ui, "PIN");
+                    ui.separator();
+                    let _ = draw_preference_search_results(ui, "AI 連携");
+                });
+            });
+        harness.run();
+        harness.snapshot("preferences_search_window_hints");
+    }
+
+    #[test]
+    fn preferences_search_hint_buttons_open_the_destination_without_applying_the_draft() {
+        use egui_kittest::kittest::Queryable;
+        for (query, window, keyboard) in [
+            (
+                "AI 連携",
+                search_index::SettingsWindow::AgentIntegration,
+                false,
+            ),
+            ("PIN", search_index::SettingsWindow::RemoteConnection, false),
+            ("登録", search_index::SettingsWindow::AgentIntegration, true),
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            // Like other direct links in Preferences, search destinations do not
+            // depend on the user's choice to hide their Settings-menu entries.
+            app.settings.menu_layout.hidden_commands.extend([
+                "SettingsAgentIntegration".into(),
+                "SettingsRemoteConnection".into(),
+            ]);
+            let applied = app.settings.notification_duration;
+            app.open_preferences_page(PreferencesPage::General);
+            app.ensure_preferences_state();
+            let draft = app.pref_state.as_mut().unwrap();
+            draft.settings.notification_duration =
+                if applied == crate::settings::NotificationDuration::Short {
+                    crate::settings::NotificationDuration::Long
+                } else {
+                    crate::settings::NotificationDuration::Short
+                };
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(1093.0, 614.0))
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .build_ui_state(
+                    |ui, app| app.show_preferences_dialog(&ui.ctx().clone()),
+                    app,
+                );
+            harness.run_steps(3);
+            // Opening a requested page first consumes its initial navigation.
+            let draft = harness.state_mut().pref_state.as_mut().unwrap();
+            draft.search_query = query.into();
+            draft.showing_results = true;
+            harness.run_steps(3);
+            assert!(harness.query_by_label(window.hint()).is_some(), "{query}");
+            assert!(harness.query_by_label("一致する設定がありません").is_none());
+            if keyboard {
+                harness.get_by_label(window.button_label()).focus();
+                harness.run_steps(1);
+                harness.key_press(egui::Key::Enter);
+            } else {
+                harness.get_by_label(window.button_label()).click();
+            }
+            harness.run_steps(2);
+            let app = harness.state();
+            assert_eq!(
+                app.agent_integration_dialog.is_some(),
+                window == search_index::SettingsWindow::AgentIntegration
+            );
+            assert_eq!(
+                app.remote_connection_dialog_open(),
+                window == search_index::SettingsWindow::RemoteConnection
+            );
+            assert!(app.show_preferences);
+            assert_eq!(app.settings.notification_duration, applied);
+            assert_ne!(
+                app.pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .notification_duration,
+                applied
+            );
+        }
     }
 
     #[test]

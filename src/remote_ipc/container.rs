@@ -2549,7 +2549,7 @@ fn collect_zip_entry_dims(
 /// 1 枚分のヘッダ読み。並列版 [`file_image_dims_batch`] の中身であり、その等価性テストの
 /// 参照でもある。実ファイル画像だけを扱う — ZIP / PDF は書庫展開と worker 往復が要るので
 /// [`collect_zip_entry_dims`] / [`catalog_free_dims`] が別に持つ。
-fn file_image_dims(path: &Path) -> Option<(u32, u32)> {
+pub(crate) fn file_image_dims(path: &Path) -> Option<(u32, u32)> {
     if crate::raw_format::is_raw_path(path) {
         let dims = crate::raw::raw_decoder::info(crate::raw::RawSource::Path(path))
             .ok()?

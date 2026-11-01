@@ -5,6 +5,7 @@
 #   target\dev-runtime\mimageviewer-core.exe
 #   target\dev-runtime\mimageviewer-remote.exe
 #   target\dev-runtime\mimageviewer-epub-pdf.exe
+#   target\dev-runtime\mimageviewer-mcp.exe
 #   FFmpeg DLLs are staged beside it so the core can run without the release
 #   launcher. Other native assets and models use the same embedded
 #   extraction path as the regular application.
@@ -41,10 +42,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$outputDir = Join-Path $repoRoot 'target\dev-runtime'
+$targetDir = Join-Path $repoRoot 'target'
+$outputDir = Join-Path $targetDir 'dev-runtime'
 $coreExe = Join-Path $outputDir 'mimageviewer-core.exe'
 $remoteExe = Join-Path $outputDir 'mimageviewer-remote.exe'
 $epubWorkerExe = Join-Path $outputDir 'mimageviewer-epub-pdf.exe'
+$mcpExe = Join-Path $outputDir 'mimageviewer-mcp.exe'
 $normalDataDir = if ($env:APPDATA) {
     Join-Path $env:APPDATA 'mimageviewer'
 } else {
@@ -227,6 +230,8 @@ try {
         -PreserveRuntime:$PreserveRuntime
     Stop-StagedProcess -ExeName 'mimageviewer-epub-pdf' -ExePath $epubWorkerExe -Label 'EPUB converter' `
         -PreserveRuntime:$PreserveRuntime
+    Stop-StagedProcess -ExeName 'mimageviewer-mcp' -ExePath $mcpExe -Label 'MCP adapter' `
+        -PreserveRuntime:$PreserveRuntime
 
     Ensure-LibclangPath
     $featureArgs = @()
@@ -237,7 +242,7 @@ try {
     }
     Write-Host ('[build-dev] building normal-profile core with Cargo profile dev-runtime ({0})' -f
         $featureLabel)
-    & cargo build --profile dev-runtime --bin mimageviewer-core @featureArgs
+    & cargo build --profile dev-runtime --target-dir $targetDir --bin mimageviewer-core @featureArgs
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
@@ -249,7 +254,7 @@ try {
     # carry the same PROTOCOL_VERSION. Building only the core leaves a stale
     # service beside it, which fails the handshake instead of running.
     Write-Host '[build-dev] building remote service with Cargo profile dev-runtime'
-    & cargo build --profile dev-runtime -p mimageviewer-remote --bin mimageviewer-remote
+    & cargo build --profile dev-runtime --target-dir $targetDir -p mimageviewer-remote --bin mimageviewer-remote
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
@@ -258,12 +263,19 @@ try {
     }
 
     Write-Host '[build-dev] building EPUB PDF worker with Cargo profile dev-runtime'
-    & cargo build --profile dev-runtime -p epub-pdf-worker --bin mimageviewer-epub-pdf
+    & cargo build --profile dev-runtime --target-dir $targetDir -p epub-pdf-worker --bin mimageviewer-epub-pdf
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
     if (-not (Test-Path $epubWorkerExe -PathType Leaf)) {
         throw "[build-dev] EPUB PDF worker was not produced: $epubWorkerExe"
+    }
+
+    Write-Host '[build-dev] building MCP adapter with Cargo profile dev-runtime'
+    & cargo build --profile dev-runtime --target-dir $targetDir -p mimageviewer-mcp --bin mimageviewer-mcp
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if (-not (Test-Path $mcpExe -PathType Leaf)) {
+        throw "[build-dev] MCP adapter was not produced: $mcpExe"
     }
 
     $copies = @(
@@ -288,7 +300,7 @@ try {
     Copy-EffetuneBundleIfChanged
 
     & (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1') `
-        -InputPaths @($coreExe, $remoteExe, $epubWorkerExe) -RequireCompanionRuntime `
+        -InputPaths @($coreExe, $remoteExe, $epubWorkerExe, $mcpExe) -RequireCompanionRuntime `
         -ReportPath 'target\vcrt-pe-reports\dev-runtime.json'
 
     Write-Host ''
@@ -296,6 +308,7 @@ try {
     Write-Host ("  core: {0}" -f $coreExe)
     Write-Host ("  remote service: {0}" -f $remoteExe)
     Write-Host ("  EPUB PDF worker: {0}" -f $epubWorkerExe)
+    Write-Host ("  MCP adapter: {0}" -f $mcpExe)
     Write-Host ("  data (default): {0}" -f $normalDataDir)
     Write-Host ("  isolated override: --data-dir `"{0}`"" -f
         (Join-Path $outputDir 'data'))

@@ -12,6 +12,7 @@ use mimageviewer_ipc::{
 };
 use uuid::Uuid;
 
+use crate::ui_request_dispatch::UiRequestDispatch;
 use crate::video::stream::session::{
     StreamingGeneration, StreamingGenerationAccess, StreamingSessionId,
 };
@@ -22,9 +23,6 @@ pub(crate) const LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub(crate) const UI_REQUEST_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
 const UI_REQUEST_QUEUE_CAPACITY: usize = 16;
-const UI_REQUEST_PENDING: u8 = 0;
-const UI_REQUEST_CLAIMED: u8 = 1;
-const UI_REQUEST_CANCELLED: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReleaseReason {
@@ -1141,10 +1139,6 @@ pub(crate) enum VideoStreamUiOutcome {
     Error(VideoStreamError),
 }
 
-struct UiRequestDispatch {
-    state: AtomicU8,
-}
-
 struct QueuedRemoteWrite {
     request: RemoteWriteRequest,
     composition_admission: crate::book_composition::CompositionWriteAdmission,
@@ -1330,36 +1324,6 @@ enum UiRequestEnqueueError {
     Closed,
     Full,
     Disconnected,
-}
-
-impl UiRequestDispatch {
-    fn pending() -> Self {
-        Self {
-            state: AtomicU8::new(UI_REQUEST_PENDING),
-        }
-    }
-
-    fn try_claim(&self) -> bool {
-        self.state
-            .compare_exchange(
-                UI_REQUEST_PENDING,
-                UI_REQUEST_CLAIMED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    fn cancel_pending(&self) -> bool {
-        self.state
-            .compare_exchange(
-                UI_REQUEST_PENDING,
-                UI_REQUEST_CANCELLED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
 }
 
 impl ClaimedRemoteWrite {

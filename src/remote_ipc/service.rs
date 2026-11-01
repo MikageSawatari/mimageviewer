@@ -539,6 +539,129 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preferences_keep_remote_window_changes_for_ok_cancel_and_unsaved_checks() {
+        use crate::settings::{NotificationDuration, Settings};
+        use crate::ui_dialogs::preferences::PreferencesPage;
+        use egui_kittest::kittest::Queryable;
+
+        for initial_enabled in [false, true] {
+            for close in ["ok", "cancel", "discard_edited_draft"] {
+                let mut app = crate::app::setup_app_for_test();
+                app.settings.remote_service_enabled = initial_enabled;
+                app.settings.save();
+                let initial_duration = app.settings.notification_duration;
+                app.open_preferences_page(PreferencesPage::General);
+                let mut harness = crate::test_ui::builder()
+                    .with_context_setup(crate::ui_fonts::configure_fonts)
+                    .with_size(egui::vec2(1093.0, 900.0))
+                    .build_ui_state(
+                        |ui, app| {
+                            app.show_preferences_dialog(&ui.ctx().clone());
+                            app.show_remote_connection_dialog(&ui.ctx().clone());
+                        },
+                        app,
+                    );
+                harness.run_steps(3);
+                let draft = harness.state_mut().pref_state.as_mut().unwrap();
+                draft.search_query = "リモート接続".into();
+                draft.showing_results = true;
+                harness.run_steps(3);
+
+                // Opening without a service control cannot probe real Tailscale.
+                harness.get_by_label("リモート接続を開く").click();
+                harness.run_steps(2);
+                assert!(harness.state().remote_connection_dialog_open());
+                // A configured PIN and a retained command channel exercise the
+                // real window's toggle without starting a service/child process.
+                let (tx, requests) = mpsc::channel();
+                let status = RemoteServiceStatus::stopped();
+                harness.state_mut().set_remote_service_control(
+                    status.clone(),
+                    Some(RemoteServiceControl {
+                        tx,
+                        status,
+                        pin_configured: Arc::new(AtomicBool::new(true)),
+                        port: mimageviewer_ipc::DEFAULT_REMOTE_PORT,
+                    }),
+                );
+                harness.run_steps(3);
+                harness
+                    .get_by_label(if initial_enabled {
+                        "リモート接続を無効にする"
+                    } else {
+                        "リモート接続を有効にする"
+                    })
+                    .click();
+                harness.run_steps(2);
+                assert!(matches!(requests.try_recv().unwrap(),
+                    RemoteServiceCommand::SetEnabled(enabled) if enabled == !initial_enabled));
+                assert_eq!(
+                    harness.state().settings.remote_service_enabled,
+                    !initial_enabled
+                );
+                assert_eq!(Settings::load().remote_service_enabled, !initial_enabled);
+                assert_eq!(
+                    harness
+                        .state()
+                        .pref_state
+                        .as_ref()
+                        .unwrap()
+                        .settings
+                        .remote_service_enabled,
+                    initial_enabled
+                );
+                harness.get_by_label("閉じる").click();
+                harness.run_steps(2);
+
+                if close == "discard_edited_draft" {
+                    harness
+                        .state_mut()
+                        .pref_state
+                        .as_mut()
+                        .unwrap()
+                        .settings
+                        .notification_duration = if initial_duration == NotificationDuration::Short
+                    {
+                        NotificationDuration::Long
+                    } else {
+                        NotificationDuration::Short
+                    };
+                }
+                harness
+                    .get_by_label(if close == "ok" {
+                        "  OK  "
+                    } else {
+                        "キャンセル"
+                    })
+                    .click();
+                harness.run_steps(3);
+                if close == "discard_edited_draft" {
+                    assert!(
+                        harness.state().show_preferences_discard_confirm,
+                        "a real Preferences edit still needs discard confirmation"
+                    );
+                    assert_eq!(Settings::load().remote_service_enabled, !initial_enabled);
+                    harness.get_by_label("破棄して閉じる").click();
+                    harness.run_steps(3);
+                }
+                // Cancel with only the stale remote value must close directly:
+                // the live-window change is not an unsaved Preferences edit.
+                assert!(!harness.state().show_preferences);
+                assert!(!harness.state().show_preferences_discard_confirm);
+                assert_eq!(
+                    harness.state().settings.remote_service_enabled,
+                    !initial_enabled
+                );
+                assert_eq!(Settings::load().remote_service_enabled, !initial_enabled);
+                assert_eq!(
+                    harness.state().settings.notification_duration,
+                    initial_duration
+                );
+            }
+        }
+    }
+
+    #[test]
     fn remote_executable_is_resolved_next_to_core() {
         assert_eq!(
             remote_executable_path(Path::new(r"C:\miv\mimageviewer-core.exe")).unwrap(),

@@ -70,6 +70,112 @@ struct CollectionSpreadPayload {
 }
 
 impl CollectionEngine {
+    /// MCP projection deliberately stops before Remote's thumbnail/sidecar materializer.
+    pub(super) fn agent_tags(
+        &self,
+        choice: mimageviewer_agent_ipc::TagChoice,
+    ) -> Result<Vec<mimageviewer_agent_ipc::Tag>, mimageviewer_agent_ipc::AgentError> {
+        use mimageviewer_agent_ipc::{AgentError, ErrorCode, Tag, TagChoice};
+        let settings = self
+            .settings
+            .load()
+            .map_err(|_| AgentError::new(ErrorCode::Busy, "設定を読み込めませんでした"))?;
+        let path = crate::tags_db::TagsDb::db_path();
+        let db = crate::agent_ipc::optional_tags(&path)?;
+        let Some(db) = db else {
+            return Ok(vec![]);
+        };
+        let summaries = db.tag_summaries();
+        let tags: Vec<Tag> = if choice == TagChoice::All {
+            summaries
+                .into_iter()
+                .map(|s| Tag {
+                    name: s.tag,
+                    count: s.count as u64,
+                })
+                .collect()
+        } else {
+            let (pinned, recent, frequent) =
+                crate::tag_view::tag_view_menu_sections(&summaries, &settings.tags);
+            let choices = match choice {
+                TagChoice::Pinned => pinned,
+                TagChoice::Recent => recent,
+                TagChoice::Frequent => frequent,
+                TagChoice::All => unreachable!(),
+            };
+            choices
+                .into_iter()
+                .map(|s| Tag {
+                    name: s.name,
+                    count: s.count as u64,
+                })
+                .collect()
+        };
+        Ok(tags)
+    }
+
+    pub(super) fn agent_tag_items(
+        &self,
+        tag: &str,
+        kind: Option<mimageviewer_agent_ipc::ItemKind>,
+        wanted: usize,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(Vec<mimageviewer_agent_ipc::Item>, bool), mimageviewer_agent_ipc::AgentError> {
+        use mimageviewer_agent_ipc::{AgentError, ErrorCode, Item};
+        let settings = self
+            .settings
+            .load()
+            .map_err(|_| AgentError::new(ErrorCode::Busy, "設定を読み込めませんでした"))?;
+        let Some(db) = crate::agent_ipc::optional_tags(&crate::tags_db::TagsDb::db_path())? else {
+            return Ok((vec![], false));
+        };
+        let scan_limit = crate::tag_view::key_scan_limit_for_projection(
+            kind.is_none(),
+            &settings.file_type_visibility,
+        );
+        let keys = crate::tag_view::select_tag_view_item_keys(&db, tag, scan_limit + 1);
+        let truncated = keys.len() > scan_limit;
+        let mut items = Vec::new();
+        for key in keys.into_iter().take(scan_limit) {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let Some(candidate) = candidate_from_tag_item_key(key, TagItemKind::All) else {
+                continue;
+            };
+            if !include_collection_candidate(&settings, &candidate) {
+                continue;
+            }
+            let item_kind = match candidate.kind {
+                RemoteEntryKind::Folder => mimageviewer_agent_ipc::ItemKind::Folder,
+                RemoteEntryKind::Image => mimageviewer_agent_ipc::ItemKind::Image,
+                RemoteEntryKind::Pdf => mimageviewer_agent_ipc::ItemKind::Pdf,
+                RemoteEntryKind::Video => mimageviewer_agent_ipc::ItemKind::Video,
+                RemoteEntryKind::Audio => mimageviewer_agent_ipc::ItemKind::Audio,
+                RemoteEntryKind::Zip | RemoteEntryKind::Archive => {
+                    mimageviewer_agent_ipc::ItemKind::Archive
+                }
+                _ => mimageviewer_agent_ipc::ItemKind::Other,
+            };
+            if kind.is_some_and(|filter| filter != item_kind) {
+                continue;
+            }
+            items.push(Item {
+                path: candidate.path.to_string_lossy().into_owned(),
+                subresource: None,
+                name: candidate.name,
+                kind: item_kind,
+                tags: Some(Vec::new()),
+                container_tags: None,
+                rating: 0,
+            });
+            if items.len() >= wanted.min(MAX_REMOTE_COLLECTION_ENTRIES) {
+                return Ok((items, true));
+            }
+        }
+        Ok((items, truncated))
+    }
+
     #[cfg(test)]
     pub(super) fn new(settings: Settings) -> Self {
         let favorites = super::live_favorites::LiveFavorites::snapshot(settings.favorites.clone());
@@ -1693,6 +1799,105 @@ fn collection_settings_error(
 mod tests {
     use super::*;
     use crate::settings::FavoriteEntry;
+
+    #[test]
+    fn remote_rating_fetch_after_accepted_agent_write_reads_committed_value() {
+        use crate::agent_ipc::metadata_write::{PreparedItem, PreparedRatings, PreparedWrite};
+        use crate::agent_ipc::open::{OpenController, UiOpenOutcome};
+        use crate::app::agent_rating_write::PreparedRatingTarget;
+        use crate::rating_db::{RatingItemKind, RatingMeta};
+        use mimageviewer_agent_ipc::{AgentLevel, ItemRef, Payload};
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let path = app.tmp.path().join("agent-remote.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+            .save(&path)
+            .unwrap();
+        let key = crate::adjustment_db::normalize_path(&path);
+        let meta = RatingMeta::new(RatingItemKind::Image).with_source_path(&path);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(&key, 1, Some(&meta))
+            .unwrap();
+        let session = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(session.clone());
+        app.initialized = true;
+        app.indexer_init = crate::app::IndexerInit::Unavailable;
+        app.settings.agent_level = AgentLevel::Organize;
+        let ctx = egui::Context::default();
+        app.install_agent_changes(crate::agent_ipc::changes::ChangeController::new(), &ctx);
+        let controller = OpenController::new(Some(session.clone()));
+        app.install_agent_open(controller.clone(), &ctx);
+        let engine = CollectionEngine::new(app.settings.clone());
+        let request = |stars| CollectionRequest {
+            kind: CollectionKind::Rating { stars },
+            spread_mode: None,
+            reading_direction: None,
+            force_single_page: false,
+        };
+        assert_eq!(
+            collection_success(engine.collection(request(1))).entries[0].rating,
+            Some(1)
+        );
+        let write = PreparedWrite::Ratings(PreparedRatings {
+            items: vec![PreparedItem {
+                input: ItemRef {
+                    path: path.to_string_lossy().into_owned(),
+                    subresource: None,
+                },
+                target: Ok(PreparedRatingTarget {
+                    key,
+                    legacy_key: None,
+                    source: path.clone(),
+                    meta,
+                    xmp_target: None,
+                    compiled_book_page: false,
+                }),
+            }],
+            stars: 4,
+            client_name: "Remote ordering fixture".into(),
+        });
+        let (notice, queued) = std::sync::mpsc::channel();
+        controller.set_enqueue_observer(notice);
+        let worker = std::thread::spawn(move || {
+            controller.execute_prepared_for_test(
+                write,
+                &AtomicBool::new(false),
+                Arc::new(crate::ui_request_dispatch::UiRequestDispatch::pending()),
+                Duration::from_secs(5),
+            )
+        });
+        queued.recv_timeout(Duration::from_secs(10)).unwrap();
+        app.poll_agent_open_requests(&ctx);
+        assert!(matches!(
+            worker.join().unwrap().unwrap(),
+            UiOpenOutcome::Written(Ok(Payload::RatingWrite(_)))
+        ));
+
+        // Remote takes ownership only after UI acceptance has returned its
+        // committed result. Reuse the actual Remote collection reader, which
+        // opens its own read-only rating connection on each fetch.
+        session.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "remote-after-agent-write".into(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        assert!(session.snapshot().phase.blocks_local_control());
+        let after = collection_success(engine.collection(request(4)));
+        assert_eq!(after.entries.len(), 1);
+        assert_eq!(after.entries[0].path, path.to_string_lossy());
+        assert_eq!(after.entries[0].rating, Some(4));
+        assert!(
+            collection_success(engine.collection(request(1)))
+                .entries
+                .is_empty()
+        );
+    }
 
     #[test]
     fn g1_rating_and_smart_handlers_start_single_and_accept_only_temporary_mode() {

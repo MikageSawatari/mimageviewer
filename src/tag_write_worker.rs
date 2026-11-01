@@ -12,6 +12,66 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
+/// Completion ownership travels with the job, independently of user Undo.
+#[derive(Clone)]
+pub struct AgentTagChange {
+    pub(crate) controller: Arc<crate::agent_ipc::changes::ChangeController>,
+    pub(crate) record_id: crate::agent_ipc::changes::ChangeRecordId,
+    pub(crate) row_index: usize,
+}
+
+impl std::fmt::Debug for AgentTagChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentTagChange")
+            .field("record_id", &self.record_id)
+            .field("row_index", &self.row_index)
+            .finish()
+    }
+}
+
+impl AgentTagChange {
+    pub(crate) fn complete(&self, result: &TagWriteResult) {
+        use crate::agent_ipc::changes::{ChangeRowOutcome, ChangeRowResult};
+        // Only the job carrying this exact owner may finish this row. Neither
+        // display text nor a transaction from another call establishes ownership.
+        if !result.agent.as_ref().is_some_and(|origin| {
+            Arc::ptr_eq(&origin.controller, &self.controller)
+                && origin.record_id == self.record_id
+                && origin.row_index == self.row_index
+        }) {
+            return;
+        }
+        self.controller.update(self.record_id, |record| {
+            let Some(row) = record.rows.get_mut(self.row_index) else {
+                return;
+            };
+            if row.result != ChangeRowResult::Pending {
+                return;
+            }
+            row.before = result.tags_before.join(", ");
+            record.counts.queued = record.counts.queued.saturating_sub(1);
+            match &result.result {
+                Ok(action) => {
+                    row.after = result.tags_after.join(", ");
+                    if *action == TagAction::NoOp {
+                        row.result = ChangeRowResult::Done(ChangeRowOutcome::Unchanged);
+                        record.counts.unchanged += 1;
+                    } else {
+                        row.result = ChangeRowResult::Done(ChangeRowOutcome::Changed);
+                        record.counts.changed += 1;
+                    }
+                }
+                Err(error) => {
+                    row.after = row.before.clone();
+                    row.result = ChangeRowResult::Failed(error.clone());
+                    record.counts.failed += 1;
+                }
+            }
+            record.summary = format!("タグを変更 ({} 件)", record.counts.changed);
+        });
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagSidecarTarget {
     pub folder: PathBuf,
@@ -37,6 +97,12 @@ pub enum TagJobKind {
     Add(String),
     /// 指定タグを削除する。
     Remove(String),
+    /// A whole call's requested memberships, applied once per item.
+    Delta {
+        tags: Vec<String>,
+        add: bool,
+        agent: Option<AgentTagChange>,
+    },
     /// mIV タグをすべて削除。
     ClearMiv,
     /// mIV タグを指定リストで完全置換する。Undo/Redo で「操作直前の状態」に
@@ -75,6 +141,7 @@ pub enum TagAction {
 
 #[derive(Debug, Clone)]
 pub struct TagWriteResult {
+    pub agent: Option<AgentTagChange>,
     pub path: PathBuf,
     /// 成功時に UI スレッドで sidecar へミラーするため、投入時の座標をそのまま返す。
     pub tag_sidecar: Option<TagSidecarTarget>,
@@ -95,6 +162,8 @@ pub struct TagWriteHandle {
     job_tx: Sender<TagWriteJob>,
     result_rx: Receiver<TagWriteResult>,
     pub total: Arc<AtomicUsize>,
+    /// Origin partition for the existing user-only completion toast slot.
+    user_total: AtomicUsize,
     pub done: Arc<AtomicUsize>,
     pub failures: Arc<AtomicUsize>,
     /// 旧 FTS 反映時代の互換フィールド。tags.db 専用化後は常に 0。
@@ -107,7 +176,88 @@ pub struct TagWriteHandle {
     db_released: Arc<AtomicBool>,
 }
 
+/// Exercises publication and the later done counter as separate worker steps.
+#[cfg(test)]
+pub(crate) struct TagWriteTestDriver {
+    jobs: Receiver<TagWriteJob>,
+    results: Sender<TagWriteResult>,
+    done: Arc<AtomicUsize>,
+    failures: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+impl TagWriteTestDriver {
+    pub(crate) fn recv_job(&self) -> TagWriteJob {
+        self.jobs.try_recv().expect("submitted tag job")
+    }
+
+    pub(crate) fn publish_result(&self, result: TagWriteResult) {
+        if result.result.is_err() {
+            self.failures.fetch_add(1, Ordering::Relaxed);
+        }
+        self.results.send(result).unwrap();
+    }
+
+    pub(crate) fn finish_job(&self) {
+        self.done.fetch_add(1, Ordering::Release);
+    }
+}
+
 impl TagWriteHandle {
+    #[cfg(test)]
+    pub(crate) fn controlled_for_test() -> (Self, TagWriteTestDriver) {
+        let (job_tx, jobs) = unbounded();
+        let (results, result_rx) = unbounded();
+        let done = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let driver = TagWriteTestDriver {
+            jobs,
+            results,
+            done: done.clone(),
+            failures: failures.clone(),
+        };
+        (
+            Self {
+                job_tx,
+                result_rx,
+                total: Arc::new(AtomicUsize::new(0)),
+                user_total: AtomicUsize::new(0),
+                done,
+                failures,
+                pending_in_writer: Arc::new(AtomicUsize::new(0)),
+                _thread: None,
+                shutdown: Arc::new(AtomicBool::new(false)),
+                release_db_requested: Arc::new(AtomicBool::new(false)),
+                db_released: Arc::new(AtomicBool::new(false)),
+            },
+            driver,
+        )
+    }
+
+    /// A deterministic published-but-unadopted result for real UI admission
+    /// tests. No worker thread or timing window is involved.
+    #[cfg(test)]
+    pub(crate) fn completed_unadopted_for_test(result: TagWriteResult) -> Self {
+        let (job_tx, _job_rx) = unbounded();
+        let (result_tx, result_rx) = unbounded();
+        let user_total = usize::from(result.agent.is_none());
+        let failures = usize::from(result.result.is_err());
+        result_tx.send(result).unwrap();
+        Self {
+            job_tx,
+            result_rx,
+            total: Arc::new(AtomicUsize::new(1)),
+            user_total: AtomicUsize::new(user_total),
+            done: Arc::new(AtomicUsize::new(1)),
+            failures: Arc::new(AtomicUsize::new(failures)),
+            pending_in_writer: Arc::new(AtomicUsize::new(0)),
+            _thread: None,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            release_db_requested: Arc::new(AtomicBool::new(false)),
+            db_released: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// worker スレッドを起動する。
     pub fn spawn() -> Self {
         let (job_tx, job_rx) = unbounded::<TagWriteJob>();
@@ -146,6 +296,7 @@ impl TagWriteHandle {
             job_tx,
             result_rx,
             total,
+            user_total: AtomicUsize::new(0),
             done,
             failures,
             pending_in_writer,
@@ -157,6 +308,9 @@ impl TagWriteHandle {
     }
 
     pub fn submit(&self, job: TagWriteJob) {
+        if !matches!(&job.kind, TagJobKind::Delta { agent: Some(_), .. }) {
+            self.user_total.fetch_add(1, Ordering::Relaxed);
+        }
         self.total.fetch_add(1, Ordering::Relaxed);
         let _ = self.job_tx.send(job);
     }
@@ -168,24 +322,35 @@ impl TagWriteHandle {
     /// tags.db 更新が完了するまで busy を維持する。
     /// `pending_in_writer` は旧 FTS 反映時代の互換値で、通常は 0。
     pub fn is_busy(&self) -> bool {
-        self.total.load(Ordering::Relaxed) != self.done.load(Ordering::Relaxed)
+        self.total.load(Ordering::Relaxed) != self.done.load(Ordering::Acquire)
             || self.pending_in_writer.load(Ordering::Relaxed) > 0
     }
 
     /// 直前バッチが **UI (完了 poll) に消費される**まで true。
-    /// worker は結果送信前に `done` を進めるため `is_busy()` は一足先に false へ
-    /// 落ちるが、`total` は完了 poll の `reset_counters_if_idle` まで残る。
+    /// worker の書き込み完了後も、`total` は結果をすべて採用した完了 poll の
+    /// `reset_counters_if_idle` まで残る。
     /// 「前バッチがまだ完了トーストとして集計されていないか」の判定はこちらを使う。
     pub fn has_unconsumed_batch(&self) -> bool {
         self.is_busy() || self.total.load(Ordering::Relaxed) > 0
     }
 
+    pub fn has_unconsumed_user_batch(&self) -> bool {
+        self.user_total.load(Ordering::Relaxed) > 0
+    }
+
     pub fn reset_counters_if_idle(&self) {
-        if !self.is_busy() {
+        if self.is_complete_and_drained() {
             self.total.store(0, Ordering::Relaxed);
+            self.user_total.store(0, Ordering::Relaxed);
             self.done.store(0, Ordering::Relaxed);
             self.failures.store(0, Ordering::Relaxed);
         }
+    }
+
+    /// Result publication precedes `done`; all results must also be adopted
+    /// before retiring the batch, even if publication raced the drain loop.
+    pub fn is_complete_and_drained(&self) -> bool {
+        !self.is_busy() && self.result_rx.is_empty()
     }
 
     /// 明示メタ情報importに備えて、workerが保持する`tags.db`接続の解放を要求する。
@@ -300,8 +465,11 @@ fn run_worker(
         }
         pending_in_writer.store(0, Ordering::Relaxed);
 
-        done.fetch_add(1, Ordering::Relaxed);
         let _ = result_tx.send(TagWriteResult {
+            agent: match &job.kind {
+                TagJobKind::Delta { agent, .. } => agent.clone(),
+                _ => None,
+            },
             path: job.path.clone(),
             tag_sidecar: job.tag_sidecar.clone(),
             result: res.map_err(|e| e.to_string()),
@@ -309,6 +477,7 @@ fn run_worker(
             tags_after,
             tx_id: job.tx_id,
         });
+        done.fetch_add(1, Ordering::Release);
     }
     pending_in_writer.store(0, Ordering::Relaxed);
 }
@@ -339,18 +508,8 @@ fn process_job(
                     (action, after)
                 })
         }
-        TagJobKind::Add(name) => {
-            let wanted = crate::tags_db::format_display_tag(name);
-            let mut next = tags_before.clone();
-            if !next.iter().any(|tag| tag == &wanted) {
-                next.push(wanted);
-            }
-            db.set_item_tags(
-                &item_key,
-                next.iter()
-                    .map(|tag| crate::tags_db::strip_display_hash(tag)),
-                crate::tags_db::source::EDIT,
-            )
+        TagJobKind::Add(name) => db
+            .apply_item_tag_delta(&item_key, std::slice::from_ref(name), true)
             .map(|after| {
                 let action = if after == tags_before {
                     TagAction::NoOp
@@ -358,24 +517,23 @@ fn process_job(
                     TagAction::Added
                 };
                 (action, after)
-            })
-        }
-        TagJobKind::Remove(name) => {
-            let wanted_key = crate::tags_db::normalize_tag_key(name);
-            let next: Vec<String> = tags_before
-                .iter()
-                .filter(|tag| crate::tags_db::normalize_tag_key(tag) != wanted_key)
-                .cloned()
-                .collect();
-            db.set_item_tags(
-                &item_key,
-                next.iter()
-                    .map(|tag| crate::tags_db::strip_display_hash(tag)),
-                crate::tags_db::source::EDIT,
-            )
+            }),
+        TagJobKind::Remove(name) => db
+            .apply_item_tag_delta(&item_key, std::slice::from_ref(name), false)
             .map(|after| {
                 let action = if after == tags_before {
                     TagAction::NoOp
+                } else {
+                    TagAction::Removed
+                };
+                (action, after)
+            }),
+        TagJobKind::Delta { tags, add, .. } => {
+            db.apply_item_tag_delta(&item_key, tags, *add).map(|after| {
+                let action = if after == tags_before {
+                    TagAction::NoOp
+                } else if *add {
+                    TagAction::Added
                 } else {
                     TagAction::Removed
                 };
@@ -435,6 +593,192 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agent_completion_requires_its_typed_owner_and_finishes_pending_once() {
+        use crate::agent_ipc::changes::{
+            ChangeController, ChangeCounts, ChangeRecord, ChangeRow, ChangeRowOutcome,
+            ChangeRowResult,
+        };
+        let controller = ChangeController::new();
+        let publish = |controller: &Arc<ChangeController>| {
+            controller.publish(ChangeRecord {
+                id: Default::default(),
+                at: std::time::SystemTime::UNIX_EPOCH,
+                client_name: "typed completion fixture".into(),
+                tool: "add_tags".into(),
+                collection: None,
+                counts: ChangeCounts {
+                    queued: 1,
+                    ..Default::default()
+                },
+                summary: String::new(),
+                rows: vec![ChangeRow {
+                    item: "page.png".into(),
+                    ..Default::default()
+                }],
+                notice: String::new(),
+            })
+        };
+        let id = publish(&controller);
+        let other_id = publish(&controller);
+        let owner = AgentTagChange {
+            controller: controller.clone(),
+            record_id: id,
+            row_index: 0,
+        };
+        let mut result = TagWriteResult {
+            agent: Some(owner.clone()),
+            path: "page.png".into(),
+            tag_sidecar: None,
+            result: Ok(TagAction::Added),
+            tags_before: vec!["#old".into()],
+            tags_after: vec!["#new".into()],
+            tx_id: 7,
+        };
+        let foreign = ChangeController::new();
+        let foreign_id = publish(&foreign);
+        for wrong_owner in [
+            AgentTagChange {
+                controller: controller.clone(),
+                record_id: other_id,
+                row_index: 0,
+            },
+            AgentTagChange {
+                controller: controller.clone(),
+                record_id: id,
+                row_index: 1,
+            },
+            AgentTagChange {
+                controller: foreign,
+                record_id: foreign_id,
+                row_index: 0,
+            },
+        ] {
+            wrong_owner.complete(&result);
+        }
+        result.agent = None;
+        owner.complete(&result);
+        assert!(
+            controller
+                .records()
+                .lock()
+                .unwrap()
+                .entries()
+                .iter()
+                .all(|record| record.counts.queued == 1)
+        );
+        result.agent = Some(owner.clone());
+        owner.complete(&result);
+        result.result = Err("a duplicate must not replace success".into());
+        owner.complete(&result);
+        let records = controller.records();
+        let records = records.lock().unwrap();
+        let record = records
+            .entries()
+            .iter()
+            .find(|record| record.id == id)
+            .unwrap();
+        assert_eq!(record.counts.changed, 1);
+        assert_eq!(record.counts.queued, 0);
+        assert_eq!(record.counts.failed, 0);
+        assert_eq!(
+            record.rows[0].result,
+            ChangeRowResult::Done(ChangeRowOutcome::Changed)
+        );
+        assert_eq!(record.rows[0].before, "#old");
+        assert_eq!(record.rows[0].after, "#new");
+        assert_eq!(record.summary, "タグを変更 (1 件)");
+        assert_eq!(records.entries()[0].counts.queued, 1);
+    }
+
+    #[test]
+    fn agent_summary_keeps_counts_and_actual_values_through_partial_and_failed_completion() {
+        use crate::agent_ipc::changes::{
+            ChangeController, ChangeCounts, ChangeRecord, ChangeRow, ChangeRowOutcome,
+            ChangeRowResult,
+        };
+        for tool in ["add_tags", "remove_tags"] {
+            let controller = ChangeController::new();
+            let record_id = controller.publish(ChangeRecord {
+                id: Default::default(),
+                at: std::time::SystemTime::UNIX_EPOCH,
+                client_name: "fixture".into(),
+                tool: tool.into(),
+                collection: None,
+                counts: ChangeCounts {
+                    queued: 3,
+                    skipped: 1,
+                    ..Default::default()
+                },
+                summary: "タグの変更を受け付けました (3 件)".into(),
+                rows: vec![
+                    ChangeRow::default(),
+                    ChangeRow::default(),
+                    ChangeRow::default(),
+                    ChangeRow {
+                        result: ChangeRowResult::Done(ChangeRowOutcome::Text("対象外".into())),
+                        ..Default::default()
+                    },
+                ],
+                notice: String::new(),
+            });
+            let changed_action = if tool == "add_tags" {
+                TagAction::Added
+            } else {
+                TagAction::Removed
+            };
+            for (index, action) in [
+                Ok(changed_action),
+                Ok(TagAction::NoOp),
+                Err("write failed".to_owned()),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let owner = AgentTagChange {
+                    controller: controller.clone(),
+                    record_id,
+                    row_index: index,
+                };
+                owner.complete(&TagWriteResult {
+                    agent: Some(owner.clone()),
+                    path: "fixture.jpg".into(),
+                    tag_sidecar: None,
+                    result: action,
+                    tags_before: vec!["#before".into()],
+                    tags_after: if index == 1 {
+                        vec!["#before".into()]
+                    } else {
+                        vec!["#after".into()]
+                    },
+                    tx_id: 1,
+                });
+                let records = controller.records();
+                let records = records.lock().unwrap();
+                let record = &records.entries()[0];
+                assert_eq!(record.summary, "タグを変更 (1 件)");
+                assert_eq!(record.counts.queued, 2 - index);
+                assert_eq!(record.counts.skipped, 1);
+                assert_eq!(record.counts.total(), 4);
+                assert_eq!(record.rows[index].before, "#before");
+                assert_eq!(
+                    record.rows[index].after,
+                    if index == 0 { "#after" } else { "#before" }
+                );
+            }
+            let records = controller.records();
+            let records = records.lock().unwrap();
+            let record = &records.entries()[0];
+            assert_eq!(record.counts.changed, 1);
+            assert_eq!(record.counts.unchanged, 1);
+            assert_eq!(record.counts.failed, 1);
+            assert_eq!(
+                record.rows[2].result,
+                ChangeRowResult::Failed("write failed".into())
+            );
+        }
+    }
+
+    #[test]
     fn job_kinds_clone() {
         let j1 = TagJobKind::Toggle("tag".into());
         let j2 = TagJobKind::ClearMiv;
@@ -442,6 +786,31 @@ mod tests {
         assert!(matches!(j1.clone(), TagJobKind::Toggle(_)));
         assert!(matches!(j2.clone(), TagJobKind::ClearMiv));
         assert!(matches!(j3.clone(), TagJobKind::SetTags(_)));
+    }
+
+    #[test]
+    fn published_results_prevent_counter_reset_until_consumed() {
+        let _data_dir = crate::data_dir::TestDataDirGuard::new();
+        let handle = TagWriteHandle::spawn();
+        handle.submit(TagWriteJob {
+            path: crate::data_dir::get().join("delta.jpg"),
+            kind: TagJobKind::Add("tag".into()),
+            tag_sidecar: None,
+            tx_id: 1,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while handle.is_busy() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!handle.is_complete_and_drained());
+        handle.reset_counters_if_idle();
+        assert!(handle.has_unconsumed_batch());
+        assert_eq!(handle.total.load(Ordering::Relaxed), 1);
+        assert!(handle.try_recv_result().unwrap().result.is_ok());
+        assert!(handle.is_complete_and_drained());
+        handle.reset_counters_if_idle();
+        assert!(!handle.has_unconsumed_batch());
     }
 
     /// `is_busy()` は互換フィールド `pending_in_writer > 0` も busy 扱いにする。
@@ -461,6 +830,7 @@ mod tests {
             job_tx: _job_tx,
             result_rx,
             total,
+            user_total: AtomicUsize::new(1),
             done,
             failures,
             pending_in_writer: pending_in_writer.clone(),

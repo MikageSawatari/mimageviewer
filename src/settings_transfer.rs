@@ -697,6 +697,9 @@ preferences_policy! {
         network_data_dir_notice_dismissed_for => "初回/学習/通知/保存版の内部記録";
         perf_log_enabled => "初回/学習/通知/保存版の内部記録";
         remote_service_enabled => "接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持";
+        agent_level => "AI 連携の許可は移行先を維持";
+        agent_show_thumbnails => "AI 連携の縮小画像送出の許可は移行先を維持";
+        agent_show_gps => "AI 連携の撮影位置送出の許可は移行先を維持";
         remote_video_streaming_enabled => "接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持";
         remote_video_encoder => "接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持";
         remote_video_quality_default => "接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持";
@@ -2018,7 +2021,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 482);
+        assert_eq!(entries.len(), 485);
         assert_eq!(
             entries
                 .iter()
@@ -2031,7 +2034,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            327
+            330
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2750,25 +2753,50 @@ mod tests {
         source.remote_service_enabled = true;
         source.remote_video_streaming_enabled = true;
         source.update_check_enabled = true;
+        source.agent_level = crate::settings::AgentLevel::ReadOnly;
+        source.agent_show_thumbnails = true;
+        source.agent_show_gps = true;
         let exported = export_preferences(&source).unwrap();
         let document: Value = serde_json::from_str(&exported.json).unwrap();
         let preferences = document["preferences"].as_object().unwrap();
         assert!(!preferences.contains_key("remote_service_enabled"));
         assert!(!preferences.contains_key("remote_video_streaming_enabled"));
         assert!(!preferences.contains_key("update_check_enabled"));
+        assert!(!preferences.contains_key("agent_level"));
+        assert!(!preferences.contains_key("agent_show_thumbnails"));
+        assert!(!preferences.contains_key("agent_show_gps"));
 
         let mut destination = Settings::default();
         destination.remote_service_enabled = false;
         destination.remote_video_streaming_enabled = false;
         destination.update_check_enabled = false;
         let parsed = parse_preferences(
-            r#"{"format":"mimageviewer.preferences","format_version":1,"preferences":{"remote_service_enabled":true,"remote_video_streaming_enabled":true,"update_check_enabled":true}}"#,
+            r#"{"format":"mimageviewer.preferences","format_version":1,"preferences":{"remote_service_enabled":true,"remote_video_streaming_enabled":true,"update_check_enabled":true,"agent_level":"read_and_open","agent_show_thumbnails":true,"agent_show_gps":true}}"#,
         )
         .unwrap();
         parsed.apply_to(&mut destination);
         assert!(!destination.remote_service_enabled);
         assert!(!destination.remote_video_streaming_enabled);
         assert!(!destination.update_check_enabled);
+        assert_eq!(
+            destination.agent_level,
+            crate::settings::AgentLevel::Disabled
+        );
+        assert!(!destination.agent_show_thumbnails);
+        assert!(!destination.agent_show_gps);
+        destination.agent_level = crate::settings::AgentLevel::ReadAndOpen;
+        destination.agent_show_thumbnails = true;
+        destination.agent_show_gps = true;
+        let parsed = parse_preferences(
+            r#"{"format":"mimageviewer.preferences","format_version":1,"preferences":{"agent_level":"disabled","agent_show_thumbnails":false,"agent_show_gps":false}}"#,
+        ).unwrap();
+        parsed.apply_to(&mut destination);
+        assert_eq!(
+            destination.agent_level,
+            crate::settings::AgentLevel::ReadAndOpen
+        );
+        assert!(destination.agent_show_thumbnails);
+        assert!(destination.agent_show_gps);
     }
 
     #[test]

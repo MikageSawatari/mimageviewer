@@ -44,7 +44,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; 配布する exe はランチャー (`mimageviewer.exe`) のみ。ランチャーは本体
-; `mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe` と FFmpeg LGPL DLL を include_bytes! で
+; `mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe`、
+; `mimageviewer-mcp.exe` と FFmpeg LGPL DLL を include_bytes! で
 ; 内包しており、初回起動時に %APPDATA%\mimageviewer\runtime\<version>\ へ
 ; 自動展開する。詳細は CLAUDE.md「FFmpeg LGPL DLL 管理」節。
 Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
@@ -84,8 +85,10 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 const
   EVENT_MODIFY_STATE = $0002;
   SYNCHRONIZE = $00100000;
+  ERROR_FILE_NOT_FOUND = 2;
   ShutdownEventName = 'Global\mImageViewerShutdown_v1';
   AppMutexName = 'Global\mImageViewerInstance_v1';
+  McpMutexName = 'Global\mImageViewerMcp_v1';
 
 function OpenEventW(dwDesiredAccess: DWORD; bInheritHandle: BOOL;
   lpName: string): THandle;
@@ -97,6 +100,31 @@ function SetEvent(hEvent: THandle): BOOL;
   external 'SetEvent@kernel32.dll stdcall';
 function CloseHandle(hObject: THandle): BOOL;
   external 'CloseHandle@kernel32.dll stdcall';
+
+{ MCP の launcher は AI アプリが使っている間も動き続ける。
+  不在を確認できた時だけ更新・削除を許可し、自動終了はしない。 }
+function CheckMcpStopped(): String;
+var
+  MutexHandle: THandle;
+  ErrorCode: DWORD;
+begin
+  MutexHandle := OpenMutexW(SYNCHRONIZE, False, McpMutexName);
+  if MutexHandle <> 0 then
+  begin
+    CloseHandle(MutexHandle);
+    Result := 'AI アプリ (Claude・ChatGPT など) が mImageViewer を使っています。' + #13#10 +
+              'AI アプリを終了してから、もう一度実行してください';
+  end
+  else
+  begin
+    ErrorCode := DLLGetLastError;
+    if ErrorCode = ERROR_FILE_NOT_FOUND then
+      Result := ''
+    else
+      Result := '確認できませんでした。AI アプリを終了してから、' + #13#10 +
+                'もう一度実行してください';
+  end;
+end;
 
 { 起動中の mImageViewer (トレイ常駐含む) にクリーン終了を要求する。
   - Named Event `Global\mImageViewerShutdown_v1` を SetEvent
@@ -146,7 +174,7 @@ begin
     あいだにユーザが予定を変えてキャンセルする余地を残すため、ここまで
     起動中の mIV には手を触れない方針。 }
   if SignalAppShutdown then
-    Result := ''
+    Result := CheckMcpStopped()
   else
     Result := 'mImageViewer が応答しませんでした。' + #13#10 +
               'タスクトレイアイコンを右クリック →「終了」で手動終了してから、' + #13#10 +
@@ -154,11 +182,16 @@ begin
 end;
 
 function InitializeUninstall(): Boolean;
+var
+  McpError: String;
 begin
   { アンインストール時も常駐中の mIV をクリーン終了させる (exe ファイル削除が
     「使用中」で失敗するのを防ぐ)。 }
   SignalAppShutdown;
-  Result := True;
+  McpError := CheckMcpStopped();
+  Result := McpError = '';
+  if not Result then
+    MsgBox(McpError, mbError, MB_OK);
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

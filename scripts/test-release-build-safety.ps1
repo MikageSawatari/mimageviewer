@@ -4,7 +4,7 @@
 # validates the process-local Windows error mode and test-full.ps1 exit behavior.
 
 [CmdletBinding()]
-param()
+param([switch] $PowerShellOnly)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -79,7 +79,7 @@ Assert-True ($distGuardBody.Contains('throw $message')) 'build-dist resident gua
 $releaseResidentGuards = @($buildReleaseAst.FindAll({
     param($node)
     $node -is [System.Management.Automation.Language.IfStatementAst] -and
-        $node.Clauses[0].Item1.Extent.Text -eq '$PreserveRuntime -and $candidates.Count -gt 0'
+        $node.Clauses[0].Item1.Extent.Text -eq '$PreserveRuntime -and $toKill.Count -gt 0'
 }, $true))
 Assert-True ($releaseResidentGuards.Count -eq 1) 'build-release preserve-runtime resident guard is missing or ambiguous'
 $releaseGuardThen = $releaseResidentGuards[0].Clauses[0].Item2.Extent.Text
@@ -123,7 +123,7 @@ Assert-OrderedText $buildDist @(
     'Assert-MivSignReady',
     "if (`$running.Count -gt 0)",
     "if (`$PreserveRuntime) { `$testArgs += '-SuppressCrashDialogs' }",
-    "& cargo clean --release -p mimageviewer",
+    '& cargo clean --release --target-dir $workspaceTargetDir -p mimageviewer',
     '& cargo clean --release --target-dir $portableTargetDir',
     "if (`$PreserveRuntime) { `$releaseArgs += '-PreserveRuntime' }",
     "& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path `$scripts 'build-release.ps1')",
@@ -136,7 +136,7 @@ Assert-OrderedText $buildDist @(
 Assert-OrderedText $buildRelease @(
     'if ($Sign)',
     'Assert-MivSignReady',
-    'if ($PreserveRuntime -and $candidates.Count -gt 0)',
+    'if ($PreserveRuntime -and $toKill.Count -gt 0)',
     'Stop-Process -Id $p.Id -Force -ErrorAction Stop',
     '& cmake -S $vst3SourceDir',
     '& cmake --build $vst3BuildDir',
@@ -144,6 +144,7 @@ Assert-OrderedText $buildRelease @(
     '$coreExit = Invoke-ReleaseCargo -Args $coreCmd',
     '$remoteExit = Invoke-ReleaseCargo -Args $remoteCmd',
     '$epubWorkerExit = Invoke-ReleaseCargo -Args $epubWorkerCmd',
+    '$mcpExit = Invoke-ReleaseCargo -Args $mcpCmd',
     'Invoke-MivSign -Files $launcherEmbedExecutables',
     '$launcherExit = Invoke-ReleaseCargo -Args $launcherCmd',
     'Invoke-MivSign -Files @($releaseExe) -Verify',
@@ -160,6 +161,7 @@ Assert-OrderedText $buildPortable @(
     '& cargo build --release --bin mimageviewer-core',
     '& cargo build --release -p mimageviewer-remote --bin mimageviewer-remote',
     '& cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf',
+    '& cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp',
     'Remove-Item -LiteralPath $pkgDir -Recurse -Force',
     'Invoke-MivSign -Files $portablePe -Verify',
     "Compress-Archive -Path (Join-Path `$pkgDir '*')"
@@ -168,13 +170,41 @@ Assert-OrderedText $buildPortable @(
 foreach ($script in @($buildDist, $buildRelease, $buildPortable)) {
     Assert-True ($script.Contains("'mimageviewer-epub-pdf'")) 'EPUB worker is absent from a process-stop list'
 }
-Assert-True ($buildDist.Contains('-p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-launcher')) 'workspace clean omits EPUB worker'
-Assert-True ($buildDist.Contains('-p mimageviewer-remote -p epub-pdf-worker')) 'portable clean omits EPUB worker'
-Assert-True ($buildDist.Contains("'target\release\mimageviewer-epub-pdf.exe'")) 'final PE list omits EPUB worker'
+Assert-True ($buildDist.Contains('-p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p mimageviewer-launcher')) 'workspace clean omits MCP'
+Assert-True ($buildDist.Contains('--target-dir $portableTargetDir -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp')) 'portable clean omits MCP'
+Assert-True ($buildDist.Contains("(Join-Path `$releaseDir 'mimageviewer-epub-pdf.exe')")) 'final PE list omits EPUB worker'
 Assert-True ($buildRelease.Contains('$releaseEpubWorkerExe') -and
     $buildRelease.Contains('Invoke-MivSign -Files $launcherEmbedExecutables')) 'EPUB worker is not signed before embedding'
 Assert-True ($buildPortable.Contains("@{ src = `$epubWorkerExe; dst = 'mimageviewer-epub-pdf.exe' }")) 'portable copy omits EPUB worker'
 Assert-True ($buildPortable.Contains("'mimageviewer-epub-pdf.exe'")) 'portable signing list omits EPUB worker'
+foreach ($script in @($buildDist, $buildRelease, $buildPortable)) {
+    Assert-True ($script.Contains("'mimageviewer-mcp'")) 'MCP is absent from a process list'
+}
+Assert-True ($buildDist.Contains("(Join-Path `$releaseDir 'mimageviewer-mcp.exe')")) 'final PE list omits MCP'
+Assert-True ($buildRelease.Contains('$releaseMcpExe')) 'release PE/signing list omits MCP'
+Assert-True ($buildPortable.Contains("@{ src = `$mcpExe; dst = 'mimageviewer-mcp.exe' }")) 'portable copy omits MCP'
+Assert-True ($buildPortable.Contains("'mimageviewer-mcp.exe',")) 'portable signing list omits MCP'
+$releaseBuildCalls = @($buildReleaseAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -eq 'Invoke-ReleaseCargo'
+}, $true))
+Assert-True ($releaseBuildCalls.Count -eq 5) 'release must build four inner executables, then launcher'
+$expectedReleasePaths = @('$releaseCoreExe', '$releaseRemoteExe', '$releaseEpubWorkerExe', '$releaseMcpExe', '$releaseExe')
+for ($index = 0; $index -lt $releaseBuildCalls.Count; $index++) {
+    Assert-True ($releaseBuildCalls[$index].Extent.Text.Contains('-ExpectedExecutable ' + $expectedReleasePaths[$index])) "release artifact path check missing/out of order at $index"
+}
+$portableBuildCalls = @($buildPortableAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -eq 'cargo'
+}, $true))
+Assert-True ($portableBuildCalls.Count -eq 4) 'portable must build four executables'
+foreach ($call in $portableBuildCalls) {
+    Assert-True ($call.Extent.Text.Contains('--target-dir $portableTargetDir')) 'portable companion escaped its isolated target'
+}
+
+& (Join-Path $PSScriptRoot 'test-build-process-policy.ps1') -PowerShellOnly:$PowerShellOnly
 
 Assert-OrderedText $testFull @(
     'public static extern uint SetErrorMode(uint mode);',
@@ -184,6 +214,7 @@ Assert-OrderedText $testFull @(
     '& cargo nextest run --workspace --features pack-build-tools @nextestArgs',
     '& cargo test --workspace --features pack-build-tools --doc --no-fail-fast',
     '& cargo nextest run --manifest-path vendor/egui/Cargo.toml --lib @nextestArgs',
+    '& cargo nextest run --manifest-path vendor/epaint/Cargo.toml --features default_fonts,color_fonts --lib @nextestArgs',
     '& cargo nextest run --manifest-path vendor/egui-winit/Cargo.toml --lib @nextestArgs',
     '& cargo nextest run --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib @nextestArgs',
     '& cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features default_fonts,wgpu --lib @nextestArgs',
@@ -278,7 +309,7 @@ exit $LASTEXITCODE
     $baselineExit = $LASTEXITCODE
     Assert-True ($baselineExit -eq 0) "test-full default success stub returned $baselineExit; output: $($baselineOutput -join ' | ')"
     $baselineCalls = @(Get-Content -LiteralPath $baselineLog -Encoding UTF8)
-    Assert-True ($baselineCalls.Count -eq 8) "test-full default path invoked cargo $($baselineCalls.Count) times"
+    Assert-True ($baselineCalls.Count -eq 9) "test-full default path invoked cargo $($baselineCalls.Count) times"
     Assert-True (-not (($baselineOutput -join "`n").Contains('crash-dialog suppression active'))) 'test-full default path enabled crash-dialog suppression'
 
     $successLog = Join-Path $testRootFull 'success.log'
@@ -286,7 +317,7 @@ exit $LASTEXITCODE
     $successExit = $LASTEXITCODE
     Assert-True ($successExit -eq 0) "test-full success stub returned $successExit; output: $($successOutput -join ' | ')"
     $successCalls = @(Get-Content -LiteralPath $successLog -Encoding UTF8)
-    Assert-True ($successCalls.Count -eq 8) "test-full success path invoked cargo $($successCalls.Count) times"
+    Assert-True ($successCalls.Count -eq 9) "test-full success path invoked cargo $($successCalls.Count) times"
     Assert-True ((@($successCalls | Where-Object { $_ -notmatch 'mode=0x[0-9A-Fa-f]{7}[37BFbf];' })).Count -eq 0) 'a success-path cargo child did not inherit both error-mode bits'
     Assert-True (($successOutput -join "`n").Contains('[test-full] process error mode restored:')) 'test-full success path did not report error-mode restoration'
 
@@ -295,6 +326,7 @@ exit $LASTEXITCODE
         'nextest run --workspace --features pack-build-tools',
         'test --workspace --features pack-build-tools --doc --no-fail-fast',
         'nextest run --manifest-path vendor/egui/Cargo.toml --lib',
+        'nextest run --manifest-path vendor/epaint/Cargo.toml --features default_fonts,color_fonts --lib',
         'nextest run --manifest-path vendor/egui-winit/Cargo.toml --lib',
         'nextest run --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib',
         'nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features default_fonts,wgpu --lib',
@@ -308,7 +340,7 @@ exit $LASTEXITCODE
         }
     }
     # Every stage, including missing nextest and doctests, must stop the gate.
-    foreach ($failCall in 1..8) {
+    foreach ($failCall in 1..9) {
         $failureLog = Join-Path $testRootFull "failure-$failCall.log"
         $failureOutput = @(& powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $stubRunner -TestFull $testFullPath -FakeCargo $fakeCargo -CargoLog $failureLog -FailCall $failCall -FailCode 37 -SuppressCrashDialogs 2>&1)
         $failureExit = $LASTEXITCODE

@@ -64,6 +64,7 @@
         <a href="collections.html">コレクション</a>
         <a href="search.html">検索機能</a>
         <a href="remote.html">リモート閲覧</a>
+        <a href="ai-integration.html">AI アプリとの連携</a>
         <a href="shortcuts.html">キーボードショートカット</a>
         <a href="gamepad.html">ゲームパッド操作</a>
         <a href="settings.html">設定リファレンス</a>
@@ -221,6 +222,11 @@
         <div class="toc-title">リモート閲覧</div>
         <div class="toc-desc">自宅 PC のライブラリを外出先の端末のブラウザから開く機能。接続ダイアログの見方、端末ごとの設定、できること・できないこと、うまくいかないときの確認先をまとめています。</div>
       </a>
+      <a class="toc-card" href="ai-integration.html">
+        <div class="toc-icon">AI</div>
+        <div class="toc-title">AI アプリとの連携</div>
+        <div class="toc-desc">Claude Desktop・ChatGPT (Codex) から検索・整理するための許可、登録、渡る情報と変更の記録。</div>
+      </a>
 
       <a class="toc-card" href="shortcuts.html">
         <div class="toc-icon">⌨️</div>
@@ -299,8 +305,8 @@
 
   if (appMajorMinor < manualMajorMinor) {
     alert(
-      "このヘルプは最新版の mImageViewer v" + MANUAL_VERSION + " の内容です。\n" +
-      "ご利用のアプリケーションは v" + appVersion + " のため、最新版への更新をお願いします。"
+      "このヘルプは最新版の mImageViewer の内容です。\n" +
+      "ご利用のアプリケーションが古いため、最新版への更新をお願いします。"
     );
   }
 })();

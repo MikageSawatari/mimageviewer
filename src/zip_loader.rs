@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 // ── 外側 ZIP の中央目次キャッシュ ─────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ArchiveCacheKey {
+pub(crate) struct ArchiveCacheKey {
     path: PathBuf,
     mtime: Option<std::time::SystemTime>,
     len: u64,
@@ -1007,7 +1007,7 @@ fn find_nested_zip_boundaries(entry_name: &str) -> Vec<usize> {
 /// エントリ名をネスト ZIP 境界で分割する。
 /// 戻り値: 各セグメント。先頭 n-1 個が nested zip パス (末尾 ".zip")、最後が葉。
 /// 境界がなければ長さ 1 の単一セグメントを返す。
-fn split_nested_zip_path(entry_name: &str) -> Vec<&str> {
+pub(crate) fn split_nested_zip_path(entry_name: &str) -> Vec<&str> {
     let boundaries = find_nested_zip_boundaries(entry_name);
     if boundaries.is_empty() {
         return vec![entry_name];
@@ -1123,6 +1123,55 @@ pub(crate) fn enumerate_image_entries_detailed_readonly_with_cancel(
     enumerate_image_entries_detailed_inner(zip_path, cancel, None, true, false)
 }
 
+/// Optional request-local limits. Ordinary UI/Remote enumeration keeps its
+/// released unlimited behavior; the agent explicitly opts into bounded nesting.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NestedZipLimits {
+    pub(crate) max_archive_bytes: u64,
+    pub(crate) max_total_bytes: u64,
+}
+
+#[derive(Debug)]
+struct NestedZipLimitExceeded;
+
+impl std::fmt::Display for NestedZipLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("nested ZIP exceeds request memory limit")
+    }
+}
+
+impl std::error::Error for NestedZipLimitExceeded {}
+
+pub(crate) fn is_nested_zip_limit_error(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<NestedZipLimitExceeded>())
+}
+
+fn check_nested_zip_size(
+    limits: Option<NestedZipLimits>,
+    held: u64,
+    size: u64,
+) -> std::io::Result<()> {
+    if limits.is_some_and(|limits| {
+        size > limits.max_archive_bytes
+            || held
+                .checked_add(size)
+                .is_none_or(|total| total > limits.max_total_bytes)
+    }) {
+        return Err(std::io::Error::other(NestedZipLimitExceeded));
+    }
+    Ok(())
+}
+
+pub(crate) fn enumerate_image_entries_detailed_readonly_with_cancel_and_limits(
+    zip_path: &Path,
+    cancel: Option<&AtomicBool>,
+    limits: Option<NestedZipLimits>,
+) -> std::io::Result<ZipEnumeration> {
+    enumerate_image_entries_detailed_inner_with_limits(zip_path, cancel, None, true, false, limits)
+}
+
 /// DB-confirmed converted caches may live outside the current cache root. Their literal
 /// member names require the same cancellable manifest read as ordinary converted caches.
 pub(crate) fn enumerate_converted_image_entries_detailed_readonly_with_cancel(
@@ -1138,6 +1187,24 @@ fn enumerate_image_entries_detailed_inner(
     stop: Option<&AtomicBool>,
     readonly: bool,
     require_origins: bool,
+) -> std::io::Result<ZipEnumeration> {
+    enumerate_image_entries_detailed_inner_with_limits(
+        zip_path,
+        cancel,
+        stop,
+        readonly,
+        require_origins,
+        None,
+    )
+}
+
+fn enumerate_image_entries_detailed_inner_with_limits(
+    zip_path: &Path,
+    cancel: Option<&AtomicBool>,
+    stop: Option<&AtomicBool>,
+    readonly: bool,
+    require_origins: bool,
+    limits: Option<NestedZipLimits>,
 ) -> std::io::Result<ZipEnumeration> {
     if cancelled_by(cancel, stop) {
         return Err(interrupted_error());
@@ -1159,7 +1226,7 @@ fn enumerate_image_entries_detailed_inner(
     let mut out: Vec<ZipImageEntry> = Vec::new();
     let mut has_foreign = false;
     let mut legacy_renames: Vec<(String, String)> = Vec::new();
-    enumerate_recursive(
+    enumerate_recursive_with_limits(
         &mut archive,
         Some(&archive_key),
         "",
@@ -1171,6 +1238,8 @@ fn enumerate_image_entries_detailed_inner(
         cancel,
         stop,
         &[],
+        limits,
+        0,
     )?;
     // Converted caches have literal names; only their manifest recovers real boundaries.
     if require_origins || crate::archive_cache::is_under_cache_root(zip_path) {
@@ -2173,6 +2242,7 @@ pub fn prefetch_may_select_raw_without_extraction(
     Ok(false)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn enumerate_recursive<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
@@ -2186,6 +2256,39 @@ fn enumerate_recursive<R: Read + Seek>(
     cancel: Option<&std::sync::atomic::AtomicBool>,
     stop: Option<&AtomicBool>,
     ancestry: &[crate::archive_origin::ArchiveContainerOrigin],
+) -> std::io::Result<()> {
+    enumerate_recursive_with_limits(
+        archive,
+        archive_key,
+        prefix,
+        legacy_prefix,
+        zip_mtime,
+        out,
+        has_foreign,
+        legacy_renames,
+        cancel,
+        stop,
+        ancestry,
+        None,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enumerate_recursive_with_limits<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    archive_key: Option<&ArchiveCacheKey>,
+    prefix: &str,
+    legacy_prefix: &str,
+    zip_mtime: i64,
+    out: &mut Vec<ZipImageEntry>,
+    has_foreign: &mut bool,
+    legacy_renames: &mut Vec<(String, String)>,
+    cancel: Option<&AtomicBool>,
+    stop: Option<&AtomicBool>,
+    ancestry: &[crate::archive_origin::ArchiveContainerOrigin],
+    limits: Option<NestedZipLimits>,
+    held: u64,
 ) -> std::io::Result<()> {
     let len = archive.len();
     for i in 0..len {
@@ -2233,6 +2336,8 @@ fn enumerate_recursive<R: Read + Seek>(
         }
         if crate::folder_tree::is_zip_extension(&ext) {
             let size = entry.size();
+            // Check the declaration before allocating or consulting shared bytes.
+            check_nested_zip_size(limits, held, size)?;
             let cache_key = archive_key.map(|archive| NestedCacheKey {
                 archive: archive.clone(),
                 path: NestedCachePath::Named(full_name.clone()),
@@ -2240,14 +2345,24 @@ fn enumerate_recursive<R: Read + Seek>(
             let cached = cache_key.as_ref().and_then(|key| NESTED_CACHE.get(key));
             let bytes = match cached {
                 Some(b) => {
+                    check_nested_zip_size(limits, held, b.capacity() as u64)?;
                     drop(entry);
                     b
                 }
                 None => {
                     let mut buf = Vec::with_capacity(size as usize);
-                    if read_to_end_with_cancel(&mut entry, &mut buf, cancel, stop).is_err() {
+                    let read = match limits {
+                        Some(limits) => read_nested_zip_bounded(
+                            &mut entry, &mut buf, cancel, stop, limits, held,
+                        ),
+                        None => read_to_end_with_cancel(&mut entry, &mut buf, cancel, stop),
+                    };
+                    if let Err(error) = read {
                         if cancelled_by(cancel, stop) {
                             return Err(interrupted_error());
+                        }
+                        if is_nested_zip_limit_error(&error) {
+                            return Err(error);
                         }
                         continue;
                     }
@@ -2279,7 +2394,7 @@ fn enumerate_recursive<R: Read + Seek>(
                 category: crate::file_type_visibility::FileTypeCategory::Zip,
                 navigation_prefix: new_prefix.clone(),
             });
-            enumerate_recursive(
+            enumerate_recursive_with_limits(
                 &mut inner,
                 archive_key,
                 &new_prefix,
@@ -2291,10 +2406,46 @@ fn enumerate_recursive<R: Read + Seek>(
                 cancel,
                 stop,
                 &next_ancestry,
+                limits,
+                held + bytes.capacity() as u64,
             )?;
         }
     }
     Ok(())
+}
+
+/// Do not trust a central-directory size while expanding compressed content.
+/// Probe one byte beyond the available budget without extending the allocation.
+fn read_nested_zip_bounded(
+    reader: &mut impl Read,
+    bytes: &mut Vec<u8>,
+    cancel: Option<&AtomicBool>,
+    stop: Option<&AtomicBool>,
+    limits: NestedZipLimits,
+    held: u64,
+) -> std::io::Result<()> {
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        if cancelled_by(cancel, stop) {
+            return Err(interrupted_error());
+        }
+        let remaining = limits
+            .max_archive_bytes
+            .min(limits.max_total_bytes.saturating_sub(held))
+            .saturating_sub(bytes.len() as u64);
+        let read_len = (remaining.saturating_add(1)).min(buffer.len() as u64) as usize;
+        let count = reader.read(&mut buffer[..read_len])?;
+        if count == 0 {
+            return Ok(());
+        }
+        check_nested_zip_size(Some(limits), held, bytes.len() as u64 + count as u64)?;
+        // Avoid Vec's geometric capacity growth exceeding the admitted budget
+        // when the actual payload is larger than its declared size.
+        if bytes.len() + count > bytes.capacity() {
+            bytes.reserve_exact(count);
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
 }
 
 fn cancelled_by(cancel: Option<&AtomicBool>, stop: Option<&AtomicBool>) -> bool {
@@ -2771,7 +2922,7 @@ fn read_entry_from_bytes(
 /// Shift-JIS の生名を持つことがあり、復号した名前では `index_for_name` が当たらない。
 /// 部分読みを別経路で書いたときにこの段を丸ごと落とし、**その書庫では寸法が 1 件も
 /// 取れなかった** (2026-08-26)。読み方が増えても、解決の順番は複製しないこと。
-fn resolve_entry_index<R: Read + Seek>(
+pub(crate) fn resolve_entry_index<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     entry_name: &str,
     cache_key: Option<ArchiveCacheKey>,
@@ -2970,6 +3121,148 @@ pub fn entry_basename(entry_name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn nested_limits(archive: u64, total: u64) -> Option<NestedZipLimits> {
+        Some(NestedZipLimits {
+            max_archive_bytes: archive,
+            max_total_bytes: total,
+        })
+    }
+
+    #[test]
+    fn agent_nested_zip_limits_reject_before_allocation_and_on_cached_payloads() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let leaf = dir.path().join("inner.zip");
+        write_test_zip(&leaf, &[("page.png", b"image")]);
+        let nested = std::fs::read(&leaf).unwrap();
+        let outer = dir.path().join("outer.zip");
+        write_test_zip(&outer, &[("inner.zip", &nested)]);
+        let tiny = nested.len() as u64 - 1;
+        let error = enumerate_image_entries_detailed_readonly_with_cancel_and_limits(
+            &outer,
+            None,
+            nested_limits(tiny, u64::MAX),
+        )
+        .unwrap_err();
+        assert!(is_nested_zip_limit_error(&error));
+        assert!(!nested_cache_contains(&outer, "inner.zip"));
+
+        // The unrestricted grid still enumerates the complete book, populating
+        // the shared cache. An agent may not bypass limits through that hit.
+        let grid = enumerate_image_entries_detailed(&outer).unwrap();
+        assert_eq!(grid.entries[0].entry_name, "inner.zip/page.png");
+        assert!(nested_cache_contains(&outer, "inner.zip"));
+        let error = enumerate_image_entries_detailed_readonly_with_cancel_and_limits(
+            &outer,
+            None,
+            nested_limits(tiny, u64::MAX),
+        )
+        .unwrap_err();
+        assert!(is_nested_zip_limit_error(&error));
+
+        // Even a cached vector whose capacity exceeds its length is charged
+        // for the allocation kept alive by the request, not just visible bytes.
+        let key = NestedCacheKey {
+            archive: ArchiveCacheKey::from_path(&outer).unwrap(),
+            path: NestedCachePath::Named("inner.zip".into()),
+        };
+        let mut oversized_allocation = Vec::with_capacity(nested.len() + 128);
+        oversized_allocation.write_all(&nested).unwrap();
+        NESTED_CACHE.insert(key, Arc::new(oversized_allocation));
+        let error = enumerate_image_entries_detailed_readonly_with_cancel_and_limits(
+            &outer,
+            None,
+            nested_limits(nested.len() as u64 + 1, u64::MAX),
+        )
+        .unwrap_err();
+        assert!(is_nested_zip_limit_error(&error));
+    }
+
+    #[test]
+    fn agent_nested_zip_total_limit_counts_live_ancestors_and_releases_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaf = dir.path().join("leaf.zip");
+        write_test_zip(&leaf, &[("page.png", b"image")]);
+        let leaf_bytes = std::fs::read(&leaf).unwrap();
+        let parent = dir.path().join("parent.zip");
+        write_test_zip(&parent, &[("leaf.zip", &leaf_bytes)]);
+        let parent_bytes = std::fs::read(&parent).unwrap();
+        let outer = dir.path().join("outer.zip");
+        write_test_zip(&outer, &[("parent.zip", &parent_bytes)]);
+        let total = (parent_bytes.len() + leaf_bytes.len()) as u64;
+        let error = enumerate_image_entries_detailed_readonly_with_cancel_and_limits(
+            &outer,
+            None,
+            nested_limits(u64::MAX, total - 1),
+        )
+        .unwrap_err();
+        assert!(is_nested_zip_limit_error(&error));
+        let complete = enumerate_image_entries_detailed_readonly_with_cancel_and_limits(
+            &outer,
+            None,
+            nested_limits(u64::MAX, total),
+        )
+        .unwrap();
+        assert_eq!(
+            complete.entries[0].entry_name,
+            "parent.zip/leaf.zip/page.png"
+        );
+
+        let siblings = dir.path().join("siblings.zip");
+        write_test_zip(
+            &siblings,
+            &[("one.zip", &leaf_bytes), ("two.zip", &leaf_bytes)],
+        );
+        let complete = enumerate_image_entries_detailed_readonly_with_cancel_and_limits(
+            &siblings,
+            None,
+            nested_limits(u64::MAX, leaf_bytes.len() as u64),
+        )
+        .unwrap();
+        assert_eq!(complete.entries.len(), 2);
+    }
+
+    #[test]
+    fn agent_nested_zip_read_limit_checks_actual_bytes_and_cancel_before_growth() {
+        struct Chunked(Cursor<Vec<u8>>);
+        impl Read for Chunked {
+            fn read(&mut self, target: &mut [u8]) -> std::io::Result<usize> {
+                let limit = target.len().min(7);
+                self.0.read(&mut target[..limit])
+            }
+        }
+        let limits = NestedZipLimits {
+            max_archive_bytes: 17,
+            max_total_bytes: 25,
+        };
+        let mut reader = Chunked(Cursor::new(vec![0; 18]));
+        let mut bytes = Vec::with_capacity(1); // An understated central-directory size.
+        let error =
+            read_nested_zip_bounded(&mut reader, &mut bytes, None, None, limits, 0).unwrap_err();
+        assert!(is_nested_zip_limit_error(&error));
+        assert_eq!(bytes.len(), 14);
+        assert!(bytes.len() <= 17);
+        assert!(bytes.capacity() <= 17);
+
+        let mut reader = Cursor::new(vec![0; 17]);
+        let mut bytes = Vec::with_capacity(1);
+        read_nested_zip_bounded(&mut reader, &mut bytes, None, None, limits, 0).unwrap();
+        assert_eq!(bytes.len(), 17);
+        assert!(bytes.capacity() <= 17);
+
+        let mut reader = Cursor::new(vec![0; 17]);
+        let mut bytes = Vec::new();
+        let error =
+            read_nested_zip_bounded(&mut reader, &mut bytes, None, None, limits, 9).unwrap_err();
+        assert!(is_nested_zip_limit_error(&error));
+        let cancel = AtomicBool::new(true);
+        let error =
+            read_nested_zip_bounded(&mut reader, &mut bytes, Some(&cancel), None, limits, 0)
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(reader.position(), 17);
+    }
 
     struct CancelAfterRead<R> {
         inner: R,

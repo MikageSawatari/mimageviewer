@@ -726,6 +726,41 @@ pub fn containing_book_folder(root: &Path, path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Agent read projection: direct children only, without opening/counting pages.
+pub(crate) fn list_book_paths_while(
+    root: &Path,
+    mut keep_running: impl FnMut() -> bool,
+) -> Result<Vec<(String, PathBuf)>, String> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err("本棚を読み取れません".into()),
+    };
+    let mut rows = Vec::new();
+    for entry in entries {
+        if !keep_running() {
+            return Err("取り消しました".into());
+        }
+        let entry = entry.map_err(|_| "本棚を読み取れません")?;
+        if entry
+            .file_type()
+            .map_err(|_| "本棚を読み取れません")?
+            .is_dir()
+        {
+            rows.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                entry.path(),
+            ));
+        }
+    }
+    rows.sort_by(|a, b| {
+        a.0.to_ascii_lowercase()
+            .cmp(&b.0.to_ascii_lowercase())
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    Ok(rows)
+}
+
 pub fn list_books(root: &Path) -> Result<Vec<BookInfo>, String> {
     if !root.exists() {
         return Ok(Vec::new());

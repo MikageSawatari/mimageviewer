@@ -134,6 +134,13 @@ pub struct RatingDb {
     conn: rusqlite::Connection,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CanonicalRatingWrite {
+    pub(crate) before: u8,
+    pub(crate) changed: bool,
+    pub(crate) legacy_removed: bool,
+}
+
 /// Complete coverage for exactly the requested keys, even though different
 /// chunks may reflect different committed moments. An absent rating row means
 /// zero stars only when the key belongs to this requested set.
@@ -505,6 +512,55 @@ impl RatingDb {
         self.set_with_timestamp(key, stars, meta, Some(now_ms()))
     }
 
+    /// Normalize only this ZIP entry, never the archive-wide migration marker
+    /// or any other edit store. Reading the before-value and removing the old
+    /// row belong to the same transaction as writing the canonical row.
+    pub(crate) fn set_user_rating_canonical(
+        &self,
+        key: &str,
+        legacy_key: Option<&str>,
+        stars: u8,
+        meta: &RatingMeta,
+    ) -> Result<CanonicalRatingWrite, rusqlite::Error> {
+        let stars = stars.min(5);
+        let transaction = self.conn.unchecked_transaction()?;
+        let read = |key: &str| -> Result<Option<u8>, rusqlite::Error> {
+            transaction
+                .query_row("SELECT stars FROM ratings WHERE path = ?1", [key], |row| {
+                    row.get(0)
+                })
+                .optional()
+        };
+        let canonical = read(key)?;
+        let legacy_key = legacy_key.filter(|legacy| *legacy != key);
+        let legacy = legacy_key.map(read).transpose()?.flatten();
+        let before = canonical.or(legacy).unwrap_or(0);
+        let changed = before != stars;
+        let legacy_removed = legacy.is_some();
+        if !changed && !legacy_removed {
+            return Ok(CanonicalRatingWrite {
+                before,
+                changed,
+                legacy_removed,
+            });
+        }
+        let _rating_write = RATING_WRITES.begin();
+        if let Some(legacy_key) = legacy_key {
+            transaction.execute("DELETE FROM ratings WHERE path = ?1", [legacy_key])?;
+        }
+        // Canonical rows already holding the requested nonzero value retain
+        // their timestamp when only a redundant legacy row needed cleanup.
+        if canonical != Some(stars) || stars == 0 {
+            Self::set_with_timestamp_on(&transaction, key, stars, Some(meta), Some(now_ms()))?;
+        }
+        transaction.commit()?;
+        Ok(CanonicalRatingWrite {
+            before,
+            changed,
+            legacy_removed,
+        })
+    }
+
     /// Apply one user operation atomically. Undo/Redo and other multi-item
     /// boundaries must not expose a partially-applied group when a later row
     /// fails.
@@ -659,6 +715,28 @@ impl RatingDb {
         rows.collect()
     }
 
+    /// Agent listing uses a threshold, with deterministic rating/time/path order.
+    pub(crate) fn list_at_least_stars(
+        &self,
+        stars: u8,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<RatingRow>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, stars, rated_at_ms, source_path, kind, entry_name, page_num,
+                    dir_prefix, archive_format, zipdir_is_archive, zipdir_representative
+             FROM ratings WHERE stars >= ?1
+             ORDER BY stars DESC, COALESCE(rated_at_ms, -1) DESC, path",
+        )?;
+        let mut result = Vec::new();
+        for row in stmt.query_map([stars.clamp(1, 5) as i64], row_from_sql)? {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
     /// ★0〜★5 の件数。index 0 は未評価ではなく常に 0 (DB 行が無いため)。
     pub fn count_by_stars(&self) -> Result<[usize; 6], rusqlite::Error> {
         #[cfg(test)]
@@ -791,6 +869,89 @@ mod tests {
 
     fn empty_db() -> RatingDb {
         db_with_schema("")
+    }
+
+    #[test]
+    fn canonical_rating_clears_two_legacy_zip_entries_without_resurrection() {
+        let db = empty_db();
+        let meta = RatingMeta::new(RatingItemKind::ZipImage);
+        db.set_user_rating("book.zip::legacy-A", 4, None).unwrap();
+        db.set_user_rating("book.zip::legacy-B", 5, None).unwrap();
+        let first = db
+            .set_user_rating_canonical("book.zip::A", Some("book.zip::legacy-A"), 0, &meta)
+            .unwrap();
+        let second = db
+            .set_user_rating_canonical("book.zip::B", Some("book.zip::legacy-B"), 0, &meta)
+            .unwrap();
+        assert_eq!((first.before, second.before), (4, 5));
+        assert!(first.changed && first.legacy_removed && second.changed && second.legacy_removed);
+        // The later normal ZIP-open migration can no longer resurrect either
+        // value: there is no legacy row for it to copy to the canonical key.
+        for key in [
+            "book.zip::A",
+            "book.zip::B",
+            "book.zip::legacy-A",
+            "book.zip::legacy-B",
+        ] {
+            assert_eq!(db.get(key), 0);
+        }
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM ratings", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+        let repeated = db
+            .set_user_rating_canonical("book.zip::A", Some("book.zip::legacy-A"), 0, &meta)
+            .unwrap();
+        assert!(!repeated.changed && !repeated.legacy_removed);
+    }
+
+    #[test]
+    fn canonical_rating_prioritizes_new_value_and_same_value_preserves_timestamp() {
+        let db = empty_db();
+        let meta = RatingMeta::new(RatingItemKind::ZipImage);
+        db.set_user_rating("canonical", 3, Some(&meta)).unwrap();
+        db.conn
+            .execute(
+                "UPDATE ratings SET rated_at_ms = 1234 WHERE path = 'canonical'",
+                [],
+            )
+            .unwrap();
+        db.set_user_rating("legacy", 5, Some(&meta)).unwrap();
+        let cleanup = db
+            .set_user_rating_canonical("canonical", Some("legacy"), 3, &meta)
+            .unwrap();
+        assert_eq!(
+            cleanup,
+            CanonicalRatingWrite {
+                before: 3,
+                changed: false,
+                legacy_removed: true
+            }
+        );
+        let repeated = db
+            .set_user_rating_canonical("canonical", Some("legacy"), 3, &meta)
+            .unwrap();
+        assert!(!repeated.changed && !repeated.legacy_removed);
+        let row = db.list_by_stars(3).unwrap().pop().unwrap();
+        assert_eq!(row.rated_at_ms, Some(1234));
+        assert_eq!(db.get("legacy"), 0);
+    }
+
+    #[test]
+    fn canonical_rating_rolls_back_legacy_deletion_when_new_write_fails() {
+        let db = empty_db();
+        let meta = RatingMeta::new(RatingItemKind::ZipImage);
+        db.set_user_rating("legacy", 4, None).unwrap();
+        db.conn.execute_batch("CREATE TRIGGER reject_canonical BEFORE INSERT ON ratings WHEN NEW.path = 'canonical' BEGIN SELECT RAISE(FAIL, 'rejected'); END;").unwrap();
+        assert!(
+            db.set_user_rating_canonical("canonical", Some("legacy"), 2, &meta)
+                .is_err()
+        );
+        assert_eq!(db.get("legacy"), 4);
+        assert_eq!(db.get("canonical"), 0);
     }
 
     #[test]

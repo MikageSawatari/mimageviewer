@@ -149,6 +149,15 @@ impl CollectionStoreRuntime {
         self.event_rx.try_recv().ok()
     }
 
+    /// Test fixtures can wait on the actor's actual event without polling.
+    #[cfg(test)]
+    pub(crate) fn recv_event_timeout_for_test(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<CollectionRuntimeEvent, crossbeam_channel::RecvTimeoutError> {
+        self.event_rx.recv_timeout(timeout)
+    }
+
     /// UI receives an event-only clone; process shutdown ownership stays with the runtime.
     pub(crate) fn event_stream(&self) -> CollectionRuntimeEventStream {
         CollectionRuntimeEventStream {

@@ -36,7 +36,6 @@ pub(super) fn draw_preferences_restore_position_setting(
         "アプリを終了するまで、ページ、スクロール位置、選択項目や折りたたみ状態を覚えます。",
     );
 }
-
 pub(super) fn draw_notification_duration_setting(
     ui: &mut egui::Ui,
     value: &mut crate::settings::NotificationDuration,
