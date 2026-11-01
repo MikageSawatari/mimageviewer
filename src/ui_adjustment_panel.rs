@@ -582,6 +582,89 @@ impl MaskKind {
 #[cfg(test)]
 mod local_adjust_segmentation_tests {
     use super::*;
+    use egui_kittest::kittest::Queryable;
+
+    fn segmentation_editor_harness(
+        width: f32,
+        inflated_content: bool,
+    ) -> egui_kittest::Harness<'static, bool> {
+        crate::test_ui::builder()
+            .with_context_setup(|ctx| {
+                crate::ui_fonts::configure_fonts(ctx);
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+            })
+            .with_size(egui::vec2(width, 340.0))
+            .build_ui_state(
+                move |ui, paint_add| {
+                    crate::test_ui::full_viewport_ui(ui, |ui| {
+                        let mut child = ui.new_child(
+                            egui::UiBuilder::new().max_rect(ui.available_rect_before_wrap()),
+                        );
+                        if inflated_content {
+                            // 先行widgetでcontent幅だけが広がったScrollAreaを再現する。
+                            child.set_width(800.0);
+                        }
+                        child.set_clip_rect(ui.clip_rect());
+                        let mut layer = local_adjust_core::LocalAdjustmentLayer::new(
+                            "領域分割",
+                            local_adjust_core::LocalMask::Segmentation(
+                                local_adjust_core::RegionMask::empty(2, 2),
+                            ),
+                            local_adjust_core::LocalEffect::None,
+                        );
+                        draw_local_mask_editor(
+                            &mut child,
+                            &mut layer,
+                            (2, 2),
+                            false,
+                            false,
+                            false,
+                            paint_add,
+                            &mut 32.0,
+                            &mut 16,
+                            0,
+                            &mut LocalEffectPanelRequests::default(),
+                        );
+                    });
+                },
+                true,
+            )
+    }
+
+    #[test]
+    fn local_adjust_segmentation_choice_buttons_fit_visible_panel_width() {
+        for width in [200.0, 300.0] {
+            for inflated_content in [false, true] {
+                let mut h = segmentation_editor_harness(width, inflated_content);
+                for (label, expected_add) in [("解除", false), ("追加", true)] {
+                    h.run();
+                    h.get_by_role_and_label(egui::accesskit::Role::Button, label)
+                        .click();
+                    h.run();
+                    assert_eq!(*h.state(), expected_add);
+                    let add = h.get_by_label("追加").rect();
+                    let remove = h.get_by_label("解除").rect();
+                    assert!((add.width() - remove.width()).abs() <= 0.5);
+                    assert!((add.top() - remove.top()).abs() <= 0.5);
+                    assert!((remove.left() - add.right() - 4.0).abs() <= 0.5);
+                    assert!((add.union(remove).width() - width).abs() <= 0.5);
+                    assert!((add.height() - remove.height()).abs() <= 0.5);
+                    for rect in [add, remove] {
+                        // 共通トグルの24ptは最小高で、実フォントの行高を尊重する。
+                        assert!(rect.height() >= 24.0);
+                        assert!(h.ctx.content_rect().contains_rect(rect));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_adjust_segmentation_choice_buttons_snapshot() {
+        let mut h = segmentation_editor_harness(300.0, false);
+        h.run();
+        h.snapshot("local_adjust_segmentation_choices_dark");
+    }
 
     fn test_transform(rect: egui::Rect, size: (usize, usize)) -> DisplayedImageTransform {
         DisplayedImageTransform::resolve(
@@ -9459,14 +9542,11 @@ fn draw_local_mask_editor(
                         .weak(),
                 );
             }
-            ui.horizontal_wrapped(|ui| {
-                if ui.selectable_label(*mask_paint_add, "追加").clicked() {
-                    *mask_paint_add = true;
-                }
-                if ui.selectable_label(!*mask_paint_add, "解除").clicked() {
-                    *mask_paint_add = false;
-                }
-            });
+            crate::ui_helpers::draw_panel_choice_row(
+                ui,
+                &[(true, "追加", None), (false, "解除", None)],
+                mask_paint_add,
+            );
             ui.horizontal_wrapped(|ui| {
                 if ui.small_button("全選択").clicked() {
                     for selected in mask.selected.iter_mut().skip(1) {

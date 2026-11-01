@@ -517,26 +517,40 @@ pub(crate) fn apply_brush_radius_wheel(
 }
 
 /// 3 系統のバケツで共有する基準選択。色差の値は無効化しても保持する。
+/// 戻り値は基準選択ボタンの行を確保した矩形。
 pub(crate) fn draw_bucket_source_controls(
     ui: &mut egui::Ui,
     source: &mut crate::mask_db::BucketSource,
     tolerance: &mut f32,
-) {
+) -> egui::Rect {
     use crate::mask_db::BucketSource;
 
     ui.label("範囲の基準");
-    ui.horizontal(|ui| {
-        ui.selectable_value(source, BucketSource::ImageColor, "画像の色")
-            .on_hover_text("クリックした点に近い色を塗ります。");
-        ui.selectable_value(source, BucketSource::DrawnMask, "描いたマスク")
-            .on_hover_text("描いたマスクを境に塗ります。消去では塗った部分を基準にします。図形自体は変わりません。");
-    });
+    let source_controls_rect = draw_panel_choice_row(
+        ui,
+        &[
+            (
+                BucketSource::ImageColor,
+                "画像の色",
+                Some("クリックした点に近い色を塗ります。"),
+            ),
+            (
+                BucketSource::DrawnMask,
+                "描いたマスク",
+                Some(
+                    "描いたマスクを境に塗ります。消去では塗った部分を基準にします。図形自体は変わりません。",
+                ),
+            ),
+        ],
+        source,
+    );
     ui.add_enabled(
         *source == BucketSource::ImageColor,
         egui::Slider::new(tolerance, 0.0..=255.0)
             .text("色差の許容値")
             .step_by(1.0),
     );
+    source_controls_rect
 }
 
 pub(crate) fn bucket_seed_already_value_message() -> &'static str {
@@ -555,28 +569,20 @@ pub(crate) fn draw_bucket_region_controls(
     use crate::mask_db::BucketRegion;
 
     ui.label("塗る範囲");
-    // ScrollArea の content Ui は、先に幅広い widget が置かれると max_rect が表示幅より
-    // 広がる。horizontal_wrapped は clip_rect ではなく、その max_rect 由来の
-    // available_size_before_wrap を折返し境界にするため、パネル外まで 1 行になり得る。
-    // 表示中の幅を上限に明示した 2 行へ固定し、パネル幅が異なる 3 系統で同じ規則を使う。
-    let visible_width = (ui.clip_rect().right() - ui.cursor().left()).max(0.0);
-    let controls_width = ui.available_width().min(visible_width).max(1.0);
-    let first_row = draw_bucket_region_row(
+    let first_row = draw_panel_choice_row(
         ui,
-        controls_width,
         &[
-            (BucketRegion::Whole, "全体"),
-            (BucketRegion::Connected, "隣接のみ"),
+            (BucketRegion::Whole, "全体", None),
+            (BucketRegion::Connected, "隣接のみ", None),
         ],
         region,
     );
-    let second_row = draw_bucket_region_row(
+    let second_row = draw_panel_choice_row(
         ui,
-        controls_width,
         &[
-            (BucketRegion::Rect, "長方形"),
-            (BucketRegion::Ellipse, "楕円"),
-            (BucketRegion::Circle, "円"),
+            (BucketRegion::Rect, "長方形", None),
+            (BucketRegion::Ellipse, "楕円", None),
+            (BucketRegion::Circle, "円", None),
         ],
         region,
     );
@@ -634,14 +640,18 @@ pub(crate) fn draw_tool_settings_heading(
     )
 }
 
-fn draw_bucket_region_row(
+/// 表示幅いっぱいの均等幅トグル行。未選択にも背景を描き、最小高24pt・横間隔4ptで揃える。
+pub(crate) fn draw_panel_choice_row<T: Copy + PartialEq>(
     ui: &mut egui::Ui,
-    row_width: f32,
-    choices: &[(crate::mask_db::BucketRegion, &str)],
-    region: &mut crate::mask_db::BucketRegion,
+    choices: &[(T, &str, Option<&str>)],
+    selected: &mut T,
 ) -> egui::Rect {
     const BUTTON_HEIGHT: f32 = 24.0;
     const BUTTON_GAP: f32 = 4.0;
+    // ScrollArea の content Ui は、先行 widget により max_rect が表示幅を超えうる。
+    // clip の表示幅を上限とした均等幅の行で描く。
+    let visible_width = (ui.clip_rect().right() - ui.cursor().left()).max(0.0);
+    let row_width = ui.available_width().min(visible_width).max(1.0);
     let gap_total = BUTTON_GAP * choices.len().saturating_sub(1) as f32;
     let button_width = ((row_width - gap_total) / choices.len().max(1) as f32).max(1.0);
     ui.allocate_ui_with_layout(
@@ -649,17 +659,27 @@ fn draw_bucket_region_row(
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
             ui.spacing_mut().item_spacing.x = BUTTON_GAP;
-            for &(value, label) in choices {
-                if crate::ui_fullscreen::draw_icons::panel_toggle_button(
+            for &(value, label, tooltip) in choices {
+                let response = crate::ui_fullscreen::draw_icons::panel_toggle_button(
                     ui,
                     label,
-                    *region == value,
+                    *selected == value,
                     Some(egui::vec2(button_width, BUTTON_HEIGHT)),
                     None,
-                )
-                .clicked()
-                {
-                    *region = value;
+                );
+                response.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::accesskit::Role::Button,
+                        ui.is_enabled(),
+                        *selected == value,
+                        label,
+                    )
+                });
+                if response.clicked() {
+                    *selected = value;
+                }
+                if let Some(tooltip) = tooltip {
+                    response.on_hover_text(tooltip);
                 }
             }
         },
@@ -3180,9 +3200,23 @@ mod tests {
     }
 
     #[test]
-    fn bucket_region_controls_stay_inside_a_200px_visible_ui() {
+    fn bucket_controls_stay_inside_each_tools_visible_ui() {
+        // 消しゴム・伏せ字は 200pt、補正のツールパネルは 300pt。
+        for width in [200.0, 300.0] {
+            for source in [
+                crate::mask_db::BucketSource::ImageColor,
+                crate::mask_db::BucketSource::DrawnMask,
+            ] {
+                assert_bucket_controls_fit(width, source);
+            }
+        }
+    }
+
+    fn assert_bucket_controls_fit(width: f32, mut source: crate::mask_db::BucketSource) {
         let ctx = egui::Context::default();
         let mut controls_rect = egui::Rect::NOTHING;
+        let mut source_rect = egui::Rect::NOTHING;
+        let mut region_height = 0.0;
         let _ = ctx
             .run_pass(
                 egui::RawInput {
@@ -3199,7 +3233,7 @@ mod tests {
                             .show(root_ui, |ui| {
                                 let visible_rect = egui::Rect::from_min_size(
                                     ui.cursor().left_top(),
-                                    egui::vec2(200.0, 400.0),
+                                    egui::vec2(width, 400.0),
                                 );
                                 // ScrollArea の content Ui は、先行 widget が幅を広げると表示範囲より
                                 // 大きい max_rect を持ちうる。clip はパネル幅のままという実機条件を再現する。
@@ -3210,6 +3244,9 @@ mod tests {
                                 let mut child =
                                     ui.new_child(egui::UiBuilder::new().max_rect(wide_rect));
                                 child.set_clip_rect(visible_rect);
+                                region_height = 48.0 + child.spacing().item_spacing.y;
+                                source_rect =
+                                    draw_bucket_source_controls(&mut child, &mut source, &mut 32.0);
                                 let mut region = crate::mask_db::BucketRegion::Connected;
                                 controls_rect = draw_bucket_region_controls(
                                     &mut child,
@@ -3224,11 +3261,15 @@ mod tests {
             )
             .drop_without_applying_deltas();
 
-        assert!(
-            controls_rect.width() <= 200.0 + 0.5,
-            "controls width={} exceeds the visible panel width",
-            controls_rect.width()
-        );
+        for rect in [source_rect, controls_rect] {
+            assert!(
+                (rect.width() - width).abs() <= 0.5,
+                "controls {rect:?} must fill the visible panel width {width}"
+            );
+            assert!(rect.left() >= -0.5 && rect.right() <= width + 0.5);
+        }
+        assert!((source_rect.height() - 24.0).abs() <= 0.5);
+        assert!((controls_rect.height() - region_height).abs() <= 0.5);
     }
 
     #[test]
