@@ -621,6 +621,14 @@ Undo / Redo は `Ctrl+Z` / `Ctrl+Y` / `Ctrl+Shift+Z` をサポートする。
 `input_gap_px_max`、ブラシ処理時間、マスク評価 / テクスチャ更新時間、再合成時間の集計にする。
 また、同一フレーム内に届いた `PointerMoved` を処理し、1 フレーム 1 点だけでストロークを
 作らないようにする。
+
+§1.679（v4.11.0）の入力境界は `app/canvas_gesture.rs` で共通化する。
+補正・消しゴム・隠蔽の各 canvas は集約された down/released フラグではなく、
+所有 viewport の press→各 move→release を順に扱う。release 自身の座標を更新してから
+1 gesture を確定するため、中間 move pass の無いクリック／ドラッグも取りこぼさない。
+バケツ・スポイト・多角形頂点は各 press ごとに処理する。既存の編集 document・Undo・
+保存と再合成の owner は維持し、入力 transport へ文書 payload を複製しない。
+
 マスクプレビューは 1 枚のフル解像度テクスチャを毎回更新せず、256px 程度のタイルに分ける。
 筆ストロークでは変更範囲にかかるタイルだけを更新し、全画面の `texture.set` による 20〜50ms
 級の停滞を避ける。

@@ -6934,3 +6934,28 @@ API適合漏れで、ownerへ実際に模したgeometryを記録する6setupへ�
 複数ウィンドウ設定中のF12切り替え無効も維持する。detached述語・viewport経路・registry移譲は
 変更していない。同じownerの既存帰路を使う判断であり、窓状態への症状guardは追加しない。
 検証結果は [バックログ§1.664](next-release-backlog.md#1664-everything検索から直接開いた本を閉じると検索結果ではなくページ一覧へ戻る--5ch-671-2026-10-31) に記録する。製品起動・実機確認は未実施。
+
+### 2026-11-01 §1.679 編集キャンバスの順序付き gesture 入力
+
+**2026-11-01 合意**: 実装後 (`fa11efc6f`、Cancel の終端を共通化した `f54995a4c` を含む) に、設計担当 ClaudeCode と、実装者とは別の独立レビュー担当 (GPT-6.1 Sol / xhigh、ACCEPT・指摘なし) の双方が「症状パッチではなく構造的修正である」ことに同意した。
+
+設計担当 ClaudeCode の実装依頼に従い、Codex が補正 canvas と同型欠陥のある
+消しゴム／隠蔽 canvas の入力境界を共通化する。linked F12 でも既存の編集 dispatch から
+同じ handler を使い、処理中の `ctx` の viewport に届いたイベントだけを消費する。
+新しい窓生成・detached 述語・HWND 同定・focus 操作・registry 移譲は追加しない。
+安定page/context/tool の gesture 所属とイベント順序を入力の owner で扱い、同 pass の
+press/release と release 座標欠落を作る集約フラグ分岐を置き換える構造的修正である。
+設計担当の構造案とこの境界の修正に実装担当も同意し、時間閾値・repaint・OS level の
+代用や兄弟 context の reset による症状パッチは行わない。独立レビューは設計担当が別途依頼する。
+headless 回帰・自動 gate・確認用 build の結果は [§1.679](next-release-backlog.md) の実装記録に集約する。
+製品起動・実デスクトップ入力・人の実操作での検証は行わない。
+
+独立レビュー P2 の追補では、同じ入力 owner の Cancel 配送を共通 dispatcher に集約し、
+Space パン／左右ドラッグズームも既存の終端経路へ通す。同 context・同 page の
+ツール／レイヤー変更も Cancel として終端するが、別 page／context へ旧 Cancel を配送しない。
+設計担当の修正依頼に実装担当も同意する所有境界の修正であり、detached の述語や窓の
+生成・移譲は変更しない。追補の独立レビューでも追加 P1／P2 指摘なし。
+
+既存 page-edit owner の再配置契約も維持する。同じ安定ページを表示し続ける reindex では
+gesture を継続し、単なる items 世代変更を入力の失効理由にしない。既存の実ページ交換前の
+finish/cancel と、兄弟 context の保留を終端しない規則は変更しない。

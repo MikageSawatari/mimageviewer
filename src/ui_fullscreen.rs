@@ -160,6 +160,37 @@ struct FsFrontPointerEventOwnership {
 }
 
 impl FsFrontPointerFrameInput {
+    /// Keep the provenance of each edge when a front gesture ends and a canvas
+    /// gesture starts in the same pass. Aggregate button flags cannot express it.
+    pub(crate) fn canvas_events(&self, ctx: &egui::Context) -> Vec<(egui::Event, bool)> {
+        if !self.events.is_empty() {
+            return self
+                .events
+                .iter()
+                .map(|event| (event.event.clone(), event.owned))
+                .collect();
+        }
+        // Direct/headless handler calls have no front-UI snapshot.
+        ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .map(|event| {
+                    let owned = match event {
+                        egui::Event::PointerButton {
+                            button, pressed, ..
+                        } => self.owns(*button) || (!pressed && self.owns_release(*button)),
+                        egui::Event::PointerMoved(_) | egui::Event::PointerGone => {
+                            self.owns(egui::PointerButton::Primary)
+                        }
+                        _ => false,
+                    };
+                    (event.clone(), owned)
+                })
+                .collect()
+        })
+    }
+
     pub(crate) fn owns(&self, button: egui::PointerButton) -> bool {
         match button {
             egui::PointerButton::Primary => self.primary_owned,
@@ -212,6 +243,15 @@ struct FsBackingClickBoundary {
 }
 
 impl FsFrontPointerOwnership {
+    #[cfg(test)]
+    pub(crate) fn capture_canvas_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        front: egui::Rect,
+    ) -> FsFrontPointerFrameInput {
+        self.capture(ctx, false, &[front])
+    }
+
     #[cfg(test)]
     pub(crate) fn primary_for_test() -> Self {
         Self {

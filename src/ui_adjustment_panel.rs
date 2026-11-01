@@ -12824,7 +12824,6 @@ impl App {
             return;
         }
         let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
-        let secondary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Secondary);
         if !self.local_adjust_mode {
             return;
         }
@@ -12865,26 +12864,123 @@ impl App {
             }
             return;
         }
-        let (
-            primary_pressed,
-            primary_down,
-            primary_released,
-            secondary_pressed,
-            modifiers,
-            pointer_pos,
-        ) = ctx.input(|i| {
-            (
-                primary_allowed && i.pointer.primary_pressed(),
-                primary_allowed && i.pointer.primary_down(),
-                primary_allowed
-                    && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
-                    && i.pointer.primary_released(),
-                secondary_allowed && i.pointer.secondary_pressed(),
-                i.modifiers,
-                i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()),
-            )
-        });
+        let Some(layer_idx) = self.selected_local_adjust_layer_idx(fs_idx) else {
+            self.local_adjust_canvas_drag = None;
+            self.local_adjust_mask_brush_stroke = None;
+            return;
+        };
+        let panel = self.local_adjust_panel_rect(full_rect);
+        let tools = self.local_adjust_tool_panel_rect(full_rect);
+        let scope = self.canvas_gesture_scope(
+            fs_idx,
+            crate::app::canvas_gesture::CanvasTool::Local(
+                layer_idx,
+                self.local_adjust_mask_edit_target,
+                self.local_adjust_mask_tool,
+            ),
+        );
+        let inputs = crate::app::canvas_gesture::canvas_pointer_inputs(
+            ctx,
+            scope,
+            overflow_pointer_input,
+            !self.fs_primary_suppression.is_active(),
+            |pos| !panel.contains(pos) && !tools.contains(pos),
+        );
+        for input in inputs {
+            self.dispatch_canvas_gesture_input(
+                ctx,
+                input,
+                |app, input| {
+                    // Update at the release coordinate before completing once.
+                    app.handle_local_adjust_canvas_pointer(
+                        ctx, full_rect, transform, fs_idx, layer_idx, input,
+                    );
+                    if input.released() {
+                        app.finish_local_adjust_canvas_gesture(ctx, fs_idx, layer_idx);
+                    }
+                },
+                |app| {
+                    app.commit_local_adjust_pending_edits();
+                    app.local_adjust_mask_lasso_points.clear();
+                    app.local_adjust_mask_shape_drag_start = None;
+                    app.local_adjust_mask_shape_drag_end = None;
+                },
+            );
+        }
+    }
 
+    fn finish_local_adjust_canvas_gesture(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        layer_idx: usize,
+    ) {
+        let image_dims = local_adjust_image_dims(self, fs_idx);
+        if self.local_adjust_shape_drag.is_some() {
+            self.persist_local_adjust_shape_drag();
+            ctx.request_repaint();
+            return;
+        }
+        let active_mask_edit_target = self
+            .local_adjust_page_layers
+            .get(&fs_idx)
+            .and_then(|layers| layers.get(layer_idx))
+            .and_then(|layer| {
+                effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target)
+            });
+        if let Some(target) = active_mask_edit_target {
+            match self.local_adjust_mask_tool {
+                LocalAdjustMaskTool::Lasso => {
+                    let points = std::mem::take(&mut self.local_adjust_mask_lasso_points);
+                    if points.len() >= 3 {
+                        self.fill_local_adjust_mask_polygon(fs_idx, layer_idx, target, points);
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
+                LocalAdjustMaskTool::Line
+                | LocalAdjustMaskTool::VertLine
+                | LocalAdjustMaskTool::HorizLine
+                | LocalAdjustMaskTool::Rect
+                | LocalAdjustMaskTool::Ellipse => {
+                    if let (Some(start), Some(end)) = (
+                        self.local_adjust_mask_shape_drag_start.take(),
+                        self.local_adjust_mask_shape_drag_end.take(),
+                    ) && let Some(shape) = make_local_adjust_shape(
+                        self.local_adjust_mask_tool,
+                        start,
+                        end,
+                        self.local_adjust_mask_line_width,
+                        image_dims,
+                        self.local_adjust_mask_paint_add,
+                    ) {
+                        self.commit_local_adjust_mask_shape(fs_idx, layer_idx, target, shape);
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.persist_local_adjust_mask_brush_stroke();
+        self.persist_local_adjust_canvas_drag();
+    }
+
+    fn handle_local_adjust_canvas_pointer(
+        &mut self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        transform: &DisplayedImageTransform,
+        fs_idx: usize,
+        layer_idx: usize,
+        input: crate::app::canvas_gesture::CanvasPointerInput,
+    ) {
+        let primary_pressed = input.pressed();
+        let primary_down = input.down();
+        let primary_released = input.released();
+        let secondary_pressed = input.secondary();
+        let pointer_pos = input.position();
+        let modifiers = input.modifiers();
         let pointer_over_panel = pointer_pos.is_some_and(|pos| {
             self.local_adjust_panel_rect(full_rect).contains(pos)
                 || self.local_adjust_tool_panel_rect(full_rect).contains(pos)
@@ -12918,75 +13014,12 @@ impl App {
             return;
         }
 
-        let Some(layer_idx) = self.selected_local_adjust_layer_idx(fs_idx) else {
-            self.local_adjust_canvas_drag = None;
-            self.local_adjust_mask_brush_stroke = None;
-            return;
-        };
         let image_dims = local_adjust_image_dims(self, fs_idx);
         // フルスクリーンビューポートでは `modifiers.ctrl` が stale (Ctrl を離しても true の
         // まま) になり得る。それを OR で混ぜると境界筆が常時「通常筆」化して境界の向こう側まで
         // 塗る回帰になるため、Ctrl 依存の境界筆→通常筆切替は OS 直読みのみを使う
         // (ソースプレビューの Ctrl 検出と同じ方式)。
         let ctrl_held = level_permit.is_some_and(crate::ui_fullscreen::ctrl_held_via_os);
-
-        if primary_released {
-            if self.local_adjust_shape_drag.is_some() {
-                self.persist_local_adjust_shape_drag();
-                ctx.request_repaint();
-                return;
-            }
-            let active_mask_edit_target = self
-                .local_adjust_page_layers
-                .get(&fs_idx)
-                .and_then(|layers| layers.get(layer_idx))
-                .and_then(|layer| {
-                    effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target)
-                });
-            if let Some(target) = active_mask_edit_target {
-                match self.local_adjust_mask_tool {
-                    LocalAdjustMaskTool::Lasso => {
-                        if let Some(pos) = pointer_pos
-                            && let Some(norm) = local_adjust_screen_to_norm(pos, transform, false)
-                        {
-                            let p = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
-                            self.local_adjust_mask_lasso_points.push([p.0, p.1]);
-                        }
-                        let points = std::mem::take(&mut self.local_adjust_mask_lasso_points);
-                        if points.len() >= 3 {
-                            self.fill_local_adjust_mask_polygon(fs_idx, layer_idx, target, points);
-                            ctx.request_repaint();
-                            return;
-                        }
-                    }
-                    LocalAdjustMaskTool::Line
-                    | LocalAdjustMaskTool::VertLine
-                    | LocalAdjustMaskTool::HorizLine
-                    | LocalAdjustMaskTool::Rect
-                    | LocalAdjustMaskTool::Ellipse => {
-                        if let (Some(start), Some(end)) = (
-                            self.local_adjust_mask_shape_drag_start.take(),
-                            self.local_adjust_mask_shape_drag_end.take(),
-                        ) && let Some(shape) = make_local_adjust_shape(
-                            self.local_adjust_mask_tool,
-                            start,
-                            end,
-                            self.local_adjust_mask_line_width,
-                            image_dims,
-                            self.local_adjust_mask_paint_add,
-                        ) {
-                            self.commit_local_adjust_mask_shape(fs_idx, layer_idx, target, shape);
-                            ctx.request_repaint();
-                            return;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            self.persist_local_adjust_mask_brush_stroke();
-            self.persist_local_adjust_canvas_drag();
-            return;
-        }
 
         if let Some(mut stroke) = self.local_adjust_mask_brush_stroke.clone() {
             if primary_down {
@@ -13012,7 +13045,7 @@ impl App {
                 }
                 return;
             }
-            self.local_adjust_mask_brush_stroke = None;
+            return;
         }
 
         if let Some(drag) = self.local_adjust_canvas_drag.clone() {
@@ -13058,7 +13091,63 @@ impl App {
                 }
                 return;
             }
-            self.local_adjust_canvas_drag = None;
+            return;
+        }
+
+        if let Some(pos) = pointer_pos
+            && let Some(norm) = local_adjust_screen_to_norm(pos, transform, false)
+        {
+            let active_mask_edit_target = self
+                .local_adjust_page_layers
+                .get(&fs_idx)
+                .and_then(|layers| layers.get(layer_idx))
+                .and_then(|layer| {
+                    effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target)
+                });
+            if let Some(drag) = self.local_adjust_shape_drag.clone()
+                && primary_down
+            {
+                let point = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
+                self.apply_local_adjust_shape_drag_from_canvas(
+                    &drag,
+                    [point.0, point.1],
+                    modifiers,
+                );
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                ctx.request_repaint();
+                return;
+            }
+
+            if active_mask_edit_target.is_some() {
+                match self.local_adjust_mask_tool {
+                    LocalAdjustMaskTool::Lasso
+                        if primary_down
+                            && !primary_pressed
+                            && !self.local_adjust_mask_lasso_points.is_empty() =>
+                    {
+                        let p = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
+                        self.local_adjust_mask_lasso_points.push([p.0, p.1]);
+                        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    LocalAdjustMaskTool::Line
+                    | LocalAdjustMaskTool::VertLine
+                    | LocalAdjustMaskTool::HorizLine
+                    | LocalAdjustMaskTool::Rect
+                    | LocalAdjustMaskTool::Ellipse
+                        if primary_down
+                            && !primary_pressed
+                            && self.local_adjust_mask_shape_drag_start.is_some() =>
+                    {
+                        self.local_adjust_mask_shape_drag_end = Some(norm);
+                        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
         }
 
         let Some(pos) = pointer_pos else {
@@ -13128,47 +13217,15 @@ impl App {
                 effective_local_mask_edit_target(layer, self.local_adjust_mask_edit_target)
             });
 
-        if let Some(drag) = self.local_adjust_shape_drag.clone()
-            && primary_down
-        {
-            let point = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
-            self.apply_local_adjust_shape_drag_from_canvas(&drag, [point.0, point.1], modifiers);
-            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-            ctx.request_repaint();
-            return;
-        }
-
-        if let Some(target) = active_mask_edit_target {
-            match self.local_adjust_mask_tool {
-                LocalAdjustMaskTool::Lasso if primary_down && !primary_pressed => {
-                    let p = local_adjust_norm_to_pixel(norm, image_dims.0, image_dims.1);
-                    self.local_adjust_mask_lasso_points.push([p.0, p.1]);
-                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        if secondary_pressed && self.local_adjust_mask_tool == LocalAdjustMaskTool::Polygon {
+            if let Some(target) = active_mask_edit_target {
+                let points = std::mem::take(&mut self.local_adjust_mask_lasso_points);
+                if points.len() >= 3 {
+                    self.fill_local_adjust_mask_polygon(fs_idx, layer_idx, target, points);
                     ctx.request_repaint();
-                    return;
                 }
-                LocalAdjustMaskTool::Line
-                | LocalAdjustMaskTool::VertLine
-                | LocalAdjustMaskTool::HorizLine
-                | LocalAdjustMaskTool::Rect
-                | LocalAdjustMaskTool::Ellipse
-                    if primary_down && !primary_pressed =>
-                {
-                    self.local_adjust_mask_shape_drag_end = Some(norm);
-                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
-                    ctx.request_repaint();
-                    return;
-                }
-                LocalAdjustMaskTool::Polygon if secondary_pressed => {
-                    let points = std::mem::take(&mut self.local_adjust_mask_lasso_points);
-                    if points.len() >= 3 {
-                        self.fill_local_adjust_mask_polygon(fs_idx, layer_idx, target, points);
-                        ctx.request_repaint();
-                    }
-                    return;
-                }
-                _ => {}
             }
+            return;
         }
 
         if primary_pressed {

@@ -1374,26 +1374,59 @@ impl App {
         if self.book_structural_op.is_some() {
             return;
         }
-        let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
-        let secondary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Secondary);
         let full_rect = transform.viewport_rect;
         if self.fs_primary_suppression.is_active() {
             return;
         }
-        let primary_down = ctx.input(|i| primary_allowed && i.pointer.primary_down());
-        let primary_pressed = ctx.input(|i| primary_allowed && i.pointer.primary_pressed());
-        let primary_released = ctx.input(|i| {
-            primary_allowed
-                && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
-                && i.pointer.primary_released()
-        });
-        let secondary_pressed = ctx.input(|i| secondary_allowed && i.pointer.secondary_pressed())
+        let scope = self.canvas_gesture_scope(
+            self.fullscreen_idx.unwrap_or(usize::MAX),
+            crate::app::canvas_gesture::CanvasTool::Conceal(self.conceal_tool),
+        );
+        let panel = self.conceal_panel_rect(full_rect);
+        // Preview owns a press even over a panel, until its physical release.
+        // Let the existing preview handler accept it before panel tool rejection.
+        let preview_owns_pointer = self.conceal_preview_active;
+        let inputs = crate::app::canvas_gesture::canvas_pointer_inputs(
+            ctx,
+            scope,
+            overflow_pointer_input,
+            true,
+            |pos| preview_owns_pointer || !panel.contains(pos),
+        );
+        for input in inputs {
+            self.dispatch_canvas_gesture_input(
+                ctx,
+                input,
+                |app, input| {
+                    app.handle_conceal_canvas_pointer(ctx, transform, input);
+                    // Observe drawing before a same-pass release removes it.
+                    let drawing = app.conceal_drawing_in_progress();
+                    let _ =
+                        app.conceal_preview_hold
+                            .merge(false, app.conceal_preview_active, drawing);
+                },
+                Self::cancel_conceal_tool_operation,
+            );
+        }
+    }
+
+    fn handle_conceal_canvas_pointer(
+        &mut self,
+        ctx: &egui::Context,
+        transform: &DisplayedImageTransform,
+        input: crate::app::canvas_gesture::CanvasPointerInput,
+    ) {
+        let full_rect = transform.viewport_rect;
+        let primary_pressed = input.pressed();
+        let primary_down = input.down();
+        let primary_released = input.released();
+        let secondary_pressed = input.secondary()
             && self
                 .settings
                 .ring_shortcuts
                 .right_drag_mode(crate::ring_shortcut::RightDragContext::EditMode)
                 != crate::ring_shortcut::RightDragMode::MouseGesture;
-        let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+        let pointer_pos = input.position();
         let paint = self.conceal_paint_mode;
         // KeyHold は keymap 経由。Windows では内部で OS 状態も読むので、
         // FS ビューポートの stale key_down 問題を避けられる。
@@ -1402,12 +1435,13 @@ impl App {
                 self.keymap
                     .key_held_action(ctx, permit, KeyAction::ConcealSpacePan)
             });
-        let modifiers = ctx.input(|i| i.modifiers);
+        let modifiers = input.modifiers();
 
         // パネル上のクリックはツール操作に使わない。ただし、画像上で進行中のドラッグを
         // パネル上で離した場合は state を片付けないとリーク (Codex P2 #6) する。
         // → release 検知時は通常 dispatch を通し、各 tool ハンドラが state リセットする。
         let panel_rect = self.conceal_panel_rect(full_rect);
+        let drawing_in_progress = self.conceal_drawing_in_progress();
         let pointer_over_panel = pointer_pos.is_some_and(|pos| panel_rect.contains(pos));
         if !drawing_in_progress
             && self.handle_overlay_space_pan_drag(
@@ -1428,13 +1462,20 @@ impl App {
             return;
         }
 
-        if self.edit_preview_owns_canvas(self.conceal_preview_active, primary_down) {
+        // Drawing samples and a physical hold remaining after this pass are
+        // different facts: a completed click must not latch primary suppression.
+        if self.edit_preview_owns_canvas(
+            self.conceal_preview_active,
+            primary_down && ctx.input(|i| i.pointer.primary_down()),
+        ) {
             return;
         }
 
-        if pointer_over_panel && !primary_released {
+        if pointer_over_panel && !drawing_in_progress && !primary_released {
             return;
         }
+
+        let primary_down = primary_down && (primary_pressed || self.conceal_drawing_in_progress());
 
         if self.book_append_undo_in_progress() {
             if primary_down || primary_pressed || primary_released || secondary_pressed {
@@ -1484,6 +1525,7 @@ impl App {
         let polygon_in_progress =
             self.conceal_tool == ConcealTool::Polygon && !self.conceal_lasso_points.is_empty();
         if !polygon_in_progress
+            && input.primary_sample()
             && self.try_handle_active_drag_or_handle_hit(
                 primary_pressed,
                 primary_released,
@@ -1497,13 +1539,17 @@ impl App {
 
         match self.conceal_tool {
             ConcealTool::Select => {
-                self.handle_select_tool(
-                    primary_pressed,
-                    primary_released,
-                    pointer_pos,
-                    transform,
-                    modifiers,
-                );
+                // A hover from another viewport must not update this drag or
+                // invalidate its preview. Only its accepted primary samples do.
+                if input.primary_sample() {
+                    self.handle_select_tool(
+                        primary_pressed,
+                        primary_released,
+                        pointer_pos,
+                        transform,
+                        modifiers,
+                    );
+                }
             }
             ConcealTool::Brush => {
                 self.handle_brush_tool(

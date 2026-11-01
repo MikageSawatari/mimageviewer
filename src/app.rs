@@ -641,6 +641,7 @@ mod book_composition_remap;
 pub(crate) mod book_composition_runtime;
 mod image_folder_zip_operation;
 pub(crate) use book_composition_editor::CompositionEditorCloseReason;
+pub(crate) mod canvas_gesture;
 pub(crate) mod normalize;
 mod page_edit_owner;
 mod page_edit_pivot;
