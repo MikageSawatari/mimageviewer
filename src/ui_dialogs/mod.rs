@@ -15,6 +15,7 @@ pub(crate) mod archive_convert;
 pub(crate) mod batch_convert;
 mod cache_creator;
 mod cache_manager;
+pub use cache_manager::draw_cache_manager_snapshot_fixture;
 pub(crate) mod clipboard_capture;
 pub(crate) mod collections;
 pub mod content_restore;

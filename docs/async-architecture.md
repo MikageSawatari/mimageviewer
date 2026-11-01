@@ -675,6 +675,18 @@ mainの成功したitems置換とQuick Folder切替で退役し、遅延結果�
 
 ## 1. ワーカー一覧
 
+### コレクション一覧の遅延catalog（§1.668、案C、2026-11-01）
+
+追加threadなし。既存generic poolが `ThumbnailCatalogProvider` のFixedCatalogまたは
+CollectionSourceParentsを所有する。共通UI enqueueで元GridItemの実親identityと `CatalogWork`
+を要求へ固定し、全件prepareにI/Oを足さない。pin/変換先へ宛先を付け替えず、EPUB fallback/RAW
+deferredもCloneで継承する。16親LRUはslot取得だけをlockし、open/lookup/保存/closeはlock外の
+worker。pool/要求は所有contextのqueue/cancelに従い、最後のArcはworkerでdropする。
+兄弟のopen/close/removeでは共有epochを進めず、明示cache clearだけ既存admission/drain/retireへ
+接続する。Off/CacheOnlyはRO専用slot、保存/catch-upへROを渡さない。
+`collection.thumb_catalog_open` / `thumb_catalog_lookup` はms・書込可否・hitを記録する。
+既存thumb encode/save計装も維持。配置/寿命/削除familyは [catalog設計](catalog-design.md) を参照。
+
 クリップボードの既定保存先は、App 起動後に `clipboard-capture-destination` thread が
 process ごとに一度だけ Shell で解決し、共有 owner に結果を公開する。監視・設定画面・場所▼は
 同じ結果を参照し、UI はメモリ上の解決済み値だけを読む。未解決の間は設定に「確認中」を表示し、

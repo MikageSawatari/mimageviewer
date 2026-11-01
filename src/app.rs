@@ -54705,6 +54705,16 @@ impl App {
         req.items_gen = self.items_generation;
         req.pdf_render_validity =
             crate::pdf_loader::PdfRenderValidity::Viewer(self.pdf_render_epoch.snapshot());
+        if matches!(
+            self.top_level_grid_view.surface(),
+            top_level_grid_view::TopLevelGridSurface::Collection(_)
+        ) && let Some(source) = self.items.get(req.idx).and_then(GridItem::drag_source_path)
+        {
+            req.catalog_target = crate::thumb_loader::RequestCatalog::collection(
+                source,
+                crate::catalog::CatalogWork::default(),
+            );
+        }
     }
 
     fn promote_viewer_pdf_keys(
@@ -54788,6 +54798,12 @@ impl App {
         catalog_arc: Option<Arc<crate::catalog::CatalogDb>>,
         pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
     ) {
+        // The provider is owned solely by this context's worker pool. No DB is
+        // opened here; final LRU/connection drop occurs on an exiting worker.
+        let catalog_provider = match catalog_arc {
+            Some(db) => crate::thumb_loader::ThumbnailCatalogProvider::FixedCatalog(Some(db)),
+            None => crate::thumb_loader::ThumbnailCatalogProvider::collection(),
+        };
         let total_threads = self.settings.parallelism.thread_count();
         // I/O ワーカー数: 2 本 (HDD シーク競合と並列性のバランス)
         // ただし全体が 4 本以下なら 1 本に制限
@@ -54817,7 +54833,7 @@ impl App {
             let cancel_w = Arc::clone(&cancel);
             let hint_w = Arc::clone(&scroll_hint);
             let cache_map_w = Arc::clone(&cache_map);
-            let catalog_w = catalog_arc.clone();
+            let catalog_w = catalog_provider.clone();
             let done_w = Arc::clone(&cache_gen_done);
             let display_px_w = Arc::clone(&display_px_shared);
             let stats_w = Arc::clone(&stats);
@@ -54985,7 +55001,7 @@ impl App {
                         &mut req,
                         &cache_map_w,
                         &tx_w,
-                        catalog_w.as_ref(),
+                        catalog_w.clone(),
                         thumb_px,
                         thumb_quality,
                         display_px,
@@ -101246,6 +101262,7 @@ fn apply_folder_thumb_pin(
         // pinned_key 下に書き戻してしまい、video frame が消える。
         return LoadRequest {
             file_type_visibility: base_req.file_type_visibility.clone(),
+            catalog_target: base_req.catalog_target.clone(),
             path: container.to_path_buf(),
             relative_page_provenance: None,
             zip_entry: None,
@@ -101349,6 +101366,7 @@ fn apply_folder_thumb_pin(
         .then(|| Box::new(base_req.clone()));
     LoadRequest {
         file_type_visibility: base_req.file_type_visibility.clone(),
+        catalog_target: base_req.catalog_target.clone(),
         path: request_path,
         relative_page_provenance: None,
         zip_entry,

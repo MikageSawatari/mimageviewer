@@ -5390,7 +5390,7 @@ mod tests {
 
     fn collection_pin_request(app: &App, index: usize) -> crate::thumb_loader::LoadRequest {
         let (mtime, size) = app.image_metas[index].unwrap_or_default();
-        super::super::make_load_request(
+        let mut req = super::super::make_load_request(
             &app.items[index],
             index,
             mtime,
@@ -5407,7 +5407,21 @@ mod tests {
             app.video_pin_db.as_ref(),
             app.use_full_path_cache_keys(),
         )
-        .unwrap()
+        .unwrap();
+        app.attach_viewer_thumbnail_context(&mut req);
+        let crate::thumb_loader::RequestCatalog::CollectionSourceParent { identity, .. } =
+            &req.catalog_target
+        else {
+            panic!("Collection request must retain its logical parent");
+        };
+        assert_eq!(
+            Some(identity.clone()),
+            app.items[index]
+                .drag_source_path()
+                .and_then(Path::parent)
+                .and_then(crate::catalog::collection_source_parent_identity)
+        );
+        req
     }
 
     #[test]

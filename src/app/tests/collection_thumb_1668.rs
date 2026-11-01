@@ -11,11 +11,188 @@ use std::time::{Duration, Instant};
 use crate::catalog::{CacheEntry, CatalogDb};
 use crate::collection_store::*;
 use crate::grid_item::GridItem;
-use crate::thumb_loader::{CacheDecision, LoadRequest, ThumbLoadOrigin, process_load_request};
+use crate::thumb_loader::{
+    CacheDecision, LoadRequest, ThumbLoadOrigin, ThumbnailCatalogProvider, process_load_request,
+};
 
 const COUNT: usize = 2_000;
 const VISIBLE: usize = 40;
 const REPEATS: usize = 5;
+
+#[test]
+#[ignore = "headless parent fanout measurement; creates 24,000 small images/directories"]
+fn measure_collection_parent_fanout() {
+    let sandbox = Sandbox::new();
+    let mut bytes = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        512,
+        384,
+        image::Rgb([50, 80, 120]),
+    ))
+    .write_to(&mut bytes, image::ImageFormat::Png)
+    .unwrap();
+    let cancel = AtomicBool::new(false);
+    let mut rows = Vec::new();
+    for count in [2_000, 10_000] {
+        for parents in [20, count] {
+            let root = sandbox.root.join(format!("{count}-{parents}"));
+            let id = CollectionId::new();
+            let mut entries = Vec::new();
+            for idx in 0..count {
+                let parent = root.join(format!("source/{}", idx / (count / parents)));
+                std::fs::create_dir_all(&parent).unwrap();
+                let path = parent.join(format!("item{idx}.png"));
+                std::fs::write(&path, bytes.get_ref()).unwrap();
+                let reg =
+                    CollectionRegistration::from_trusted_path(&path, CollectionResolvedKind::Image)
+                        .unwrap();
+                entries.push(CollectionEntry {
+                    id: CollectionEntryId::new(),
+                    collection_id: id,
+                    source_path: path,
+                    source_key: reg.source_key().clone(),
+                    resolved_kind: CollectionResolvedKind::Image,
+                    manual_position: idx as u64,
+                });
+            }
+            let snapshot = CollectionSnapshot {
+                catalog_revision: 1,
+                definition: CollectionDefinition {
+                    id,
+                    name: "fanout".into(),
+                    order_mode: CollectionOrderMode::Manual,
+                    standard_sort: crate::settings::SortOrder::Numeric,
+                    shuffle_seed: 0,
+                    revision: 1,
+                },
+                entries: entries.into(),
+            };
+            let started = Instant::now();
+            let prepared = prepare_collection_snapshot(
+                &snapshot,
+                &crate::settings::Settings::default().grid_display_order,
+                &cancel,
+                |_, _| {},
+            )
+            .unwrap();
+            let classify_ms = ms(started);
+            for policy in [
+                crate::settings::CachePolicy::Auto,
+                crate::settings::CachePolicy::Always,
+            ] {
+                let cache = root.join(format!("cache-{policy:?}"));
+                let provider = ThumbnailCatalogProvider::collection();
+                let map = RwLock::default();
+                let mut settings = crate::settings::Settings::default();
+                settings.cache_policy = policy;
+                let decision = CacheDecision::from_settings(&settings);
+                let first = batch_decided(
+                    &prepared.entries,
+                    0..VISIBLE,
+                    true,
+                    &map,
+                    provider.clone(),
+                    Some(&cache),
+                    decision,
+                );
+                let away = batch_decided(
+                    &prepared.entries,
+                    1000..1000 + VISIBLE,
+                    true,
+                    &map,
+                    provider.clone(),
+                    Some(&cache),
+                    decision,
+                );
+                let back = batch_decided(
+                    &prepared.entries,
+                    0..VISIBLE,
+                    true,
+                    &map,
+                    provider.clone(),
+                    Some(&cache),
+                    decision,
+                );
+                let reopen = batch_decided(
+                    &prepared.entries,
+                    0..VISIBLE,
+                    true,
+                    &RwLock::default(),
+                    ThumbnailCatalogProvider::collection(),
+                    Some(&cache),
+                    decision,
+                );
+                // Pair the old no-catalog route and C on exactly the same warm
+                // sources. Alternate order and recreate C's LRU for each reopen.
+                let mut paired_reopen = Vec::new();
+                for repeat in 0..REPEATS {
+                    let current = || {
+                        batch_decided(
+                            &prepared.entries,
+                            0..VISIBLE,
+                            true,
+                            &RwLock::default(),
+                            None::<&Arc<CatalogDb>>,
+                            None,
+                            decision,
+                        )
+                    };
+                    let cached = || {
+                        batch_decided(
+                            &prepared.entries,
+                            0..VISIBLE,
+                            true,
+                            &RwLock::default(),
+                            ThumbnailCatalogProvider::collection(),
+                            Some(&cache),
+                            decision,
+                        )
+                    };
+                    let (current, cached) = if repeat % 2 == 0 {
+                        (current(), cached())
+                    } else {
+                        let cached = cached();
+                        (current(), cached)
+                    };
+                    assert_eq!((current.source, current.cache), (VISIBLE, 0));
+                    paired_reopen
+                        .push(serde_json::json!({"repeat":repeat,"current":current,"C":cached}));
+                }
+                let multi = batch_decided(
+                    &prepared.entries,
+                    0..160,
+                    true,
+                    &map,
+                    provider,
+                    Some(&cache),
+                    decision,
+                );
+                let catalogs = crate::catalog::cache_stats(&cache).0;
+                assert!(
+                    catalogs <= parents.min(200),
+                    "only demanded parents may be opened"
+                );
+                if policy == crate::settings::CachePolicy::Always {
+                    assert_eq!(
+                        (first.source, away.source, back.cache, reopen.cache),
+                        (VISIBLE, VISIBLE, VISIBLE, VISIBLE)
+                    );
+                }
+                rows.push(serde_json::json!({"count":count,"parents":parents,"policy":format!("{policy:?}"),
+                    "classify_prepare_ms":classify_ms,"catalogs":catalogs,"first":first,"back":back,"reopen":reopen,"multi":multi,"paired_reopen":paired_reopen}));
+            }
+        }
+    }
+    std::fs::write(
+        sandbox.root.join("fanout-results.json"),
+        serde_json::to_vec_pretty(&rows).unwrap(),
+    )
+    .unwrap();
+    println!(
+        "section1668 fanout_results={}",
+        sandbox.root.join("fanout-results.json").display()
+    );
+}
 
 fn ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1_000.0
@@ -165,12 +342,46 @@ fn batch(
     range: std::ops::Range<usize>,
     full: bool,
     map: &RwLock<HashMap<String, CacheEntry>>,
-    catalog: Option<&Arc<CatalogDb>>,
+    catalog: impl Into<ThumbnailCatalogProvider> + Clone + Send,
+    collection_cache: Option<&Path>,
+) -> Batch {
+    batch_decided(
+        entries,
+        range,
+        full,
+        map,
+        catalog,
+        collection_cache,
+        CacheDecision {
+            policy: crate::settings::CachePolicy::Always,
+            threshold_ms: 0,
+            size_threshold: 0,
+            webp_always: true,
+            pdf_always: true,
+            zip_always: true,
+        },
+    )
+}
+
+fn batch_decided(
+    entries: &[PreparedCollectionEntry],
+    range: std::ops::Range<usize>,
+    full: bool,
+    map: &RwLock<HashMap<String, CacheEntry>>,
+    catalog: impl Into<ThumbnailCatalogProvider> + Clone + Send,
+    collection_cache: Option<&Path>,
+    decision: CacheDecision,
 ) -> Batch {
     let mut light = Vec::new();
     let mut heavy = Vec::new();
     for idx in range.clone() {
-        let req = request(&entries[idx], idx, full);
+        let mut req = request(&entries[idx], idx, full);
+        if let Some(cache) = collection_cache {
+            req.catalog_target = crate::thumb_loader::RequestCatalog::collection(
+                &entries[idx].source_path,
+                crate::catalog::CatalogWork::capture(cache),
+            );
+        }
         if entries[idx].item.is_heavy_io() {
             heavy.push(req);
         } else {
@@ -193,6 +404,7 @@ fn batch(
     let start = Instant::now();
     let ready_at = std::thread::scope(|scope| {
         for worker in 0..8 {
+            let catalog = catalog.clone();
             let queue = if worker < 6 { &light } else { &heavy };
             let tx = tx.clone();
             let done = &done;
@@ -208,18 +420,11 @@ fn batch(
                         &mut req,
                         map,
                         &tx,
-                        catalog,
+                        catalog.clone(),
                         512,
                         75,
                         256,
-                        CacheDecision {
-                            policy: crate::settings::CachePolicy::Always,
-                            threshold_ms: 0,
-                            size_threshold: 0,
-                            webp_always: true,
-                            pdf_always: true,
-                            zip_always: true,
-                        },
+                        decision,
                         done,
                         stats,
                         Some(cancel),
@@ -513,7 +718,7 @@ fn measure_collection_thumbnails_2000() {
             .unwrap(),
         );
         let map = RwLock::new(HashMap::new());
-        let result = batch(entries, range, false, &map, Some(&db));
+        let result = batch(entries, range, false, &map, Some(&db), None);
         assert_eq!(result.source, 100);
         assert_eq!(db.load_all().unwrap().len(), 100);
     }
@@ -554,7 +759,7 @@ fn measure_collection_thumbnails_2000() {
     let mut rows = Vec::new();
     for repeat in 0..REPEATS {
         // Three disjoint windows: first viewport, far-away viewport, return after eviction.
-        for mode in ["current", "B", "A"] {
+        for mode in ["current", "B", "A", "C"] {
             let open_start = Instant::now();
             let actor_start = Instant::now();
             let loaded = client
@@ -599,11 +804,31 @@ fn measure_collection_thumbnails_2000() {
                 }
             );
             let map = RwLock::new(map);
-            let first = batch(entries, 0..VISIBLE, true, &map, catalog.as_ref());
+            let provider = if mode == "C" {
+                ThumbnailCatalogProvider::collection()
+            } else {
+                catalog.as_ref().into()
+            };
+            let collection_cache = (mode == "C").then_some(cache_dir.as_path());
+            let first = batch(
+                entries,
+                0..VISIBLE,
+                true,
+                &map,
+                provider.clone(),
+                collection_cache,
+            );
             let open_ready_ms = first.ready_at.duration_since(open_start).as_secs_f64() * 1_000.0;
-            let away = batch(entries, 1000..1000 + VISIBLE, true, &map, catalog.as_ref());
+            let away = batch(
+                entries,
+                1000..1000 + VISIBLE,
+                true,
+                &map,
+                provider.clone(),
+                collection_cache,
+            );
             // Drop decoded pixels in batch. Retain encoded cache_map just like real scroll.
-            let back = batch(entries, 0..VISIBLE, true, &map, catalog.as_ref());
+            let back = batch(entries, 0..VISIBLE, true, &map, provider, collection_cache);
             if mode == "current" {
                 assert_eq!((first.source, back.source), (VISIBLE, VISIBLE));
                 assert!(map.read().unwrap().is_empty());

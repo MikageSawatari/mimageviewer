@@ -388,7 +388,7 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.668 コレクションの一覧がサムネイルのキャッシュを使わず、開くたびに作り直す — X @Rottytops (2026-10-31)
 
-- 状態: **計測・実装前設計案・ignoredハーネス作成済み（2026-11-01、製品未修正、v4.11.0候補）**。[X の投稿](https://x.com/Rottytops) (2026-10-31) は「2000 件のコレクションで毎回サムネイルを読みに行くのがしんどい。コレクションのサムネイルキャッシュを検討してほしい」という要望。報告者の素材の置き場所 (SSD / HDD / NAS)・本と画像の割合は未記載。開発側の条件付き計測と推奨C案は下記「計測と設計案」を参照。採否・製品実装は設計担当へ引き渡す。
+- 状態: **採択Cの実装・直接計測・確認用build済み、多数親に分散した小画像の追加コストについて設計判断待ち（2026-11-01、未コミット／製品未起動、v4.11.0候補）**。[X の投稿](https://x.com/Rottytops) (2026-10-31) は「2000 件のコレクションで毎回サムネイルを読みに行くのがしんどい。コレクションのサムネイルキャッシュを検討してほしい」という要望。報告者の素材の置き場所 (SSD / HDD / NAS)・本と画像の割合は未記載。実装前の根拠は下記「計測と設計案」、実装・検証・計測と残る判断点は「実装記録」を参照。独立実装レビューと受入判断は設計担当が行う。
 - 原因 (コードで確認、2026-10-31 ClaudeCode): コレクションの一覧は永続のサムネイルキャッシュ (catalog) を読みも書きもしない。`src/app/collection_grid.rs` の一覧の設置で `current_color_catalog = None`、`spawn_thumbnail_workers` の catalog 引数も `None` (コメント「No catalog open/write」)。`cache_map` は代表ピンが動画のフォルダ用の seed WebP (`folder_pin_cache`) だけで作る。catalog が無いので worker の `should_save` は常に false (`src/thumb_loader.rs`)。結果として、開くたび・表示範囲から外れて破棄されたセルへスクロールで戻るたびに元ファイルからデコードし直す。ZIP は書庫を開いて先頭画像を読み、PDF は PDFium で表紙を描く (HDD 上の大きな PDF の表紙は 1 枚 5〜29 秒の計測が §1.475 の調査にある)。キーはフルパス (`imgthumb:<path>` / `zipthumb:<path>`、`use_full_path_cache_keys()`) で、通常フォルダの DB (basename キー) とも一致しない。スマートフォルダ (`src/app/smart_folder.rs` が合成パスの専用 catalog を開く)・検索・評価・履歴などの集約ビューは catalog を持ち、持たないのはコレクションだけ。§1.266 にも「コレクションのサムネイルは毎回生成扱い」とある。
 - 開くたびの準備: prepare worker が全項目を `std::fs::metadata` し、動画 sidecar・編集 DB・ピン DB を引く (`src/collection_store/prepare.rs`、`src/app/collection_grid.rs`)。SSD・10,000 件で約 120ms の計測 (§1.475) があり、体感の主因はサムネイルの再生成と見ている (推測)。
 - 直し方の候補 (未決定): (A) スマートフォルダと同じく、collection_id から作った合成パスで専用 catalog を開き、`load_all` の結果と catalog を worker へ渡す。キーは既にフルパスなので衝突しない。登録の削除時の掃除 (合成パスでは `delete_missing` が走らない) とキャッシュ削除の所有単位 (catalog-design.md §2.4) を決める。(B) prepare worker で項目を親フォルダごとにまとめ、親フォルダの catalog を `open_existing_read_only` で引き、mtime・size が合えばフルパスキーへ付け替えて seed にする (前例: `src/remote_ipc/collections.rs` が親フォルダごとに catalog を読み取り専用で開く)。ふだんフォルダで見ている項目はすぐ当たるが、新しく作った分の保存は別に要る。(A) を基本にし、初回の空振りを (B) で埋める組み合わせも考えられる。設計を決める前に、2000 件規模で開く→表示が揃うまでの時間を perf ログで測る。
@@ -667,6 +667,156 @@ worktreeの `target/section1668/run-*/` に生成素材・隔離data・catalog�
 PDFiumは `vendor/pdfium/bin/pdfium.dll`、テストexe隣に通常のnative test依存DLLが必要。
 ビルドに10分以上かかることがある。製品用binaryのbuild/起動コマンドではない。
 今回の検証記録・結果ファイル・終了状態は上の計測表に併記する。
+
+#### 実装記録（2026-11-01、案C）
+
+設計担当がCを採択し、実装前の独立設計レビューはACCEPT済みという依頼に基づく。
+作業基点は `collection-thumb-1668` / `5965912ed`、開始時clean。コミットと独立実装レビューは
+設計担当が行う。実装担当から製品は起動していない。
+
+前提照合: Collection rootは `current_folder=None`、generic workerのcatalogはNoneだった。
+既存full-path row key、音声/動画の別経路、pin seed、通常catalogのdrive省略、cache-dir単位の
+削除admission/登録接続/close境界をコードで確認し、採択Cとの矛盾はなかった。
+通常catalogの旧行は同stampでもdrive出所を証明できず、再利用・移行しない。
+
+実装:
+
+- `thumb_loader/catalog_provider.rs` にFixedCatalog/CollectionSourceParentsのproviderと16親LRU。
+  元GridItemの実親は共通の要求受付で `CollectionSourcePath` のlexical identityへ固定し、
+  `CatalogWork` の受付epochと共にpin/EPUB fallback/RAW follow-upへ継承する。
+  全件prepareでcold openやBLOB読取を追加せず、既存workerが個別lookup/保存する。
+  LRU lockはslot取得だけ、SQLite I/O/closeはlock外。最終pool Arcもworkerが解放する。
+- 新namespaceはdrive/UNC保持の実親単位。Collection間共有、通常Folder/Smart/Search/Remote宛先と
+  `collection.db` は変更なし。Off/CacheOnlyは空DBを作らずRO専用で、warm RWやcatch-upへ迂回しない。
+  旧epochのwriterは復活させず、CacheOnlyだけ一回RO継続。古いメモリ行の再採用も防ぐ。
+- video/frame-pin seedはメモリ優先のまま。旧catalog由来の再帰CachedPinnedの表示は維持し、
+  Cへのmirrorだけを保存admissionで除外する。既存Fixedのmirror、preview優先、stamp/proof/
+  pin世代/PDF source・layout寸法、idle品質更新、音声・動画・Remoteは維持する。
+- 参照解除/Collection削除で消さず、inventory pruneなし。元フォルダclearは既存一回の
+  drain/retire下で旧catalogのaudio scope保護と新DB一式を扱う。全件/期限/容量/保存先は既存配置を使う。
+  rootの現在フォルダ削除無効を維持し、UI件数をカタログ数に修正。
+  まれな故障はログ＋既存の一回通知、明示clearで作り直し。retry/自動修復は追加しない。
+- catalog/collection/async/display/spec/architecture/UI応答性文書とmanual settings/collectionsを同期。
+  製品ページの保存・通信説明とprivacyを照合し、privacyの端末内cache説明を更新した。
+
+検証（基点＋未コミット差分、`MSBUILDDISABLENODEREUSE=1`、build jobs 1）:
+
+| 対象 | 結果・証跡 |
+| --- | --- |
+| 型チェック | `cargo check -p mimageviewer --lib --tests --features test-script`、最終Rustソースでもexit 0、4分51秒。`target/section1668-check-handoff.log` / `.exit`。途中の成功記録は `target/section1668-check-final.log` |
+| 関連回帰 | nextest通常feature/test profile、**1,698 passed / 0 failed**、678.666秒。run `61d0d2bc-1682-412b-b92b-a70b291e0af4`、`target/section1668-related.log` |
+| UI snapshot | `cargo test --test ui_snapshot`、**218 passed / 0 failed**、46.01秒。`target/section1668-snapshots-full.log`。新規dark/light 2枚計63,279 bytesを目視し、件数・容量・Collection root無効理由と元フォルダの有効ボタンに崩れなし |
+| 文言検査 | `python scripts/check_ui_glyphs.py` 危険glyph 0、`python scripts/check_site_cards.py` 49枚/違反0 |
+| 整形・差分 | `cargo fmt` / `cargo fmt --check` / `git diff --check` 成功 |
+| lib全件（1回） | `scripts/test-lib-full.ps1`、**15,377 passed / 2 failed / 1 timed out / 69 skipped**、nextest 1,232.702秒、exit 1。run `20261101T081232780Z-d1e770f0`。全件成功とは扱わず、失敗3件の単独3回確認を別記する |
+| 確認用build | `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`、通常feature、exit 0。core 24分35秒、Remote 1.89秒、EPUB worker 1.69秒。VCRT/PE検査 `runtime=4 / pe=3` 合格。`target/section1668-build-dev.log` / `.exit`、`target/vcrt-pe-reports/dev-runtime.json` |
+
+関連filterは `test(/collection/) | test(/catalog/) | test(/thumb/) | test(/cache_maint/) | test(/^remote_ipc::/)`。
+新規9件は別drive/UNC・等stamp別内容と旧方式の反例、再open/戻り・stamp miss・SourceOnly、
+Off/Auto/Always/force/CacheOnly、空DB/破損WebP/破損catalog/作成不可、同時contextとlocal close、
+LRU16上限、logical parent、全件/期限/family clear・旧writer/RO継続・古いmap非再採用、
+旧再帰pinの表示維持とCへのmirror除外を検査する。既存Collection pinテストも共通要求受付を通して
+元GridItemの親scope保持を検査する。通常catalog、audio scope、Remote、cold/warm/navigationは上記関連回帰を再利用。
+
+全件のsourceIdは `06222e1b3742edd944d3ab6fc6ec92905b35c6aaac7d89f5908047d87893aa60`。
+実行中はソース・fixture・文書を固定し、完了後に本記録を更新した。JUnit/ログは
+`target/test-lib-full/runs/20261101T081232780Z-d1e770f0/`、集計は `target/section1668-full-result.json`。
+失敗は既存の `video::tests::real_decoder_eof_full_loop_preserves_single_tail_burst_per_epoch`
+（48kHz callbackのburst分断）、`app::folder_scan::section1375_scan_perf_tests::section1375_large_physical_scan_10k_100k`
+（600秒timeout）、`ui_fullscreen::page_turn::draw_submit_tests::page_turn_mainwindow_submits_visible_vacant_leaf_both_directions`
+（回転面の収縮assertion）。本差分はこれらのテスト本体・走査/動画/ページ描画の実装ファイルを変更していないが、未変更を理由に全件失敗を無視しない。
+
+失敗3件を、同じ通常feature/test profileのnextest既定設定・retries=0・テスト名完全一致で
+各3回、直列に確認した（ソース修正なし）。**9回すべて成功**、この単独確認では未再現。
+
+| 単独確認の対象（上記末尾名） | 1回目 | 2回目 | 3回目 |
+| --- | ---: | ---: | ---: |
+| `real_decoder_eof_full_loop_preserves_single_tail_burst_per_epoch` | 75.234秒 / pass | 76.821秒 / pass | 79.672秒 / pass |
+| `section1375_large_physical_scan_10k_100k` | 495.706秒 / pass | 202.457秒 / pass | 123.698秒 / pass |
+| `page_turn_mainwindow_submits_visible_vacant_leaf_both_directions` | 3.445秒 / pass | 3.452秒 / pass | 3.704秒 / pass |
+
+証跡は `target/section1668-solo-results.json` と同ファイルに列挙した9ログ。
+これを全件成功への置き換えや失敗原因の確定とは扱わず、全件exit 1と併記して引き継ぐ。
+
+**Cの直接計測**（製品code固定、通常feature/dev-runtime、opt-level 2、debug_assertions=false）:
+
+既存と同じ2,000件・20親・JPEG/ZIP/PDF混在、4,490,285,000 bytes、可視40、regular6＋heavy2、
+CachePolicy Always、温まったOSキャッシュ・in-process実PDFium adapterで計測した。
+全prepare/actor往復から初回CPU画素までを含み、GPU upload/paint/present、50ms UI poll、
+idle品質更新による後段のSourceOnly、HDD/NASは含まない。製品/PDF worker processは起動していない。
+
+| 条件 | 全prepare | 可視40 worker（CPU画素） | open→CPU40 | scroll戻り40 |
+| --- | ---: | ---: | ---: | ---: |
+| 前回の現状値（5回、上の記録） | 171.3 | 201.1 | 360.8 | 269.6 |
+| 今回の従来経路・毎回生成（5回） | 67.0 | 98.5 | 166.7（153.1–175.8） | 98.8 |
+| C初回（1回） | 55.9 | 149.4 | 206.3 | 18.5 |
+| C再open（初回を除く4回） | 58.9 | 19.6 | 79.6（77.8–81.8） | 19.3 |
+
+ms、中央値（範囲）。各列の中央値は独立で加算しない。Cの初回保存までのworker終端は159.6ms。
+C初回は先頭/遠方40件ずつ元生成、直後の戻りは40hit。再openは全4回とも40hit/元生成0、
+全5回の戻りも40hit/元生成0（中央値18.5、16.1–21.1ms）。前段seedは0行で、Cのopen/個別lookupは
+worker時間に含む。全件prepareへcatalog I/Oを追加していない。
+前回より今回の従来経路自体が速いので、前回との差全体をCの効果と解釈しない。
+同一runの従来対照に対して、再open約52%・戻り約81%短縮という条件付きのCPU計測である。
+
+ログ `target/section1668-measure-C.log`、exit 0（2 passed / 0 failed、38.69秒）。
+主結果 `target/section1668/run-RT4Nbx/results.json`、初期分散probeは `run-EusdWU/fanout-results.json`。
+計測用lib test buildは26分46秒、`target/section1668-measure-build.log`。
+`target/section1668-source-C-sha256.json` に対象Rust 13ファイルのhashを保存した。
+
+**小画像・多数親の追加対照と設計判断点**:
+
+512×384の単色PNG、2,000/10,000件、20親/1項目1親、可視40＋多セル160。
+元画像は同一run内で温まった同じファイルを使い、従来のcatalog無し経路とCを交互順で5回比較した。
+各再openでCのLRUも作り直す。次表は可視40のworker CPU画素までの中央値で、actor/full prepare/
+UI/GPUは含まない。classification prepareは別に2,000/20親=58ms程度、10,000/全別親=465ms程度
+（初期probe）を要し、これ自体へCのcatalog処理は足していない。
+
+| 件数 | 実親数 | policy | 従来の再生成 | C再open | Cの増分 |
+| --- | ---: | --- | ---: | ---: | ---: |
+| 2,000 | 20 | Auto | 16.6 | 16.9 | +0.3 |
+| 2,000 | 2,000 | Auto | 17.9 | 49.0 | **+31.1** |
+| 10,000 | 20 | Auto | 17.1 | 19.0 | +1.9 |
+| 10,000 | 10,000 | Auto | 18.7 | 47.4 | **+28.7** |
+| 2,000 | 20 | Always | 17.0 | 19.8 | +2.8 |
+| 2,000 | 2,000 | Always | 16.6 | 42.1 | +25.5 |
+| 10,000 | 20 | Always | 18.9 | 19.5 | +0.7 |
+| 10,000 | 10,000 | Always | 18.3 | 43.7 | +25.4 |
+
+ms。Autoの小PNGは全再訪で40件元生成・保存hit 0、両経路とも256×192画素なので、上の
+Auto増分は画素サイズ差ではない。Alwaysは40hit/元生成0だが、保存512×384の復号を含み、
+従来の256×192とは出力画素サイズも異なる。初回の多親catalog作成と160セルは別に追加原価がある。
+全件prepareだけで全親を開くことはなく、今回の異なる需要200件の親だけを開き、最終DB数は
+20親条件で2～3、全別親条件で200（先頭160＋遠方40）。LRUのidle16上限は新規回帰で検査した。
+
+このため、混在素材の改善だけで「通常の使い方で必ず速くなる」とは言えない。
+Autoで保存しない安価な画像が多数の親へ分散した再訪には、初回保存以外の追加コストが確認された。
+依頼の「通常の使い方が遅くなる点は報告」に沿い、製品codeの追加変更を止め、採択Cの
+lookupコストとして許容するか、接続寿命/lookup・RW admissionの追加設計へ戻すかを設計担当へ照会した。
+policyを変える、既存機能を削る、場当たり的なguardを入れる対処はしていない。
+
+追加probeは1 passed / 0 failed / exit 0、24.29秒。
+`target/section1668-fanout-paired.log` / `.exit`、`target/section1668/run-aJ3nNG/fanout-results.json`。
+追加したのはignored計測の対照だけで、主混在計測後の製品code変更はない。
+この増分のUI上の体感・実素材での割合は未測定であり、CPU区間の2.5倍をUI全体の2.5倍とは扱わない。
+対照追加後のRust hashは `target/section1668-source-C-paired-sha256.json`。
+引き渡し前に照合し、主混在計測からの差分は計測ハーネスだけ、対照計測後のRust 13ファイルは全件一致した。
+
+確認用成果物は `target/dev-runtime/mimageviewer-core.exe` と同梱companion。サイズ・更新時刻・SHA-256は
+`target/section1668-build-artifacts.json`。製品の起動・既存アプリの停止・コミットは実施していない。
+独立実装レビュー・実機確認、上の速度差の受入は設計担当へ引き継ぐ。
+
+設計受入・レビュー後に利用者が手動確認する際のコマンド:
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+通常の `%APPDATA%\mimageviewer` を使い、実設定・データを更新し得る。
+single-instance mutexを共有するため、インストール版/トレイ常駐版を終了してから起動する。
+確認シナリオは、画像/ZIP/PDFを含むCollectionの再open・スクロール戻り、別Collectionからの同じ元項目の再表示、
+元ファイル更新後の再生成、元フォルダからのcache clear後の再生成とCollection rootの削除無効。
+これらのlive確認、GPU/UI提示時間、HDD/NASでの計測は未実施。
 
 ### 1.669 本の構成を作っていない本でも、ページを出すたびに構成の照合が走る — X @Rottytops (2026-10-31)
 

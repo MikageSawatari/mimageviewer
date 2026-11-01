@@ -13,6 +13,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
+mod catalog_provider;
+pub(crate) use catalog_provider::RequestCatalog;
+pub use catalog_provider::ThumbnailCatalogProvider;
+
 // -----------------------------------------------------------------------
 // ワーカーキュー優先度
 // -----------------------------------------------------------------------
@@ -48,6 +52,14 @@ pub(crate) fn request_worker_priority_key(
 }
 
 impl LoadRequest {
+    /// A video/frame pin is a prepared memory asset with no source decode route.
+    pub(crate) fn uses_memory_pin_seed(&self) -> bool {
+        self.folder_thumb_provenance == Some(crate::catalog::FolderThumbProvenance::Seeded)
+            && self.resolve_override.is_none()
+            && self.zip_entry.is_none()
+            && self.pdf_page.is_none()
+    }
+
     /// A derived source still completes the outer UI request, including its row.
     fn inherit_request_identity_from(&mut self, outer: &Self) {
         self.idx = outer.idx;
@@ -56,6 +68,7 @@ impl LoadRequest {
         self.input_seq = outer.input_seq;
         self.pdf_render_validity = outer.pdf_render_validity.clone();
         self.priority = outer.priority;
+        self.catalog_target = outer.catalog_target.clone();
     }
 
     /// The source variant owns this distinction; idx is unused for catalog work.
@@ -745,6 +758,8 @@ pub(crate) fn stamp_resolved_pdf_request(
 
 #[derive(Clone, Default)]
 pub struct LoadRequest {
+    /// Logical owner and acceptance epoch, fixed before pin/conversion resolution.
+    pub(crate) catalog_target: RequestCatalog,
     pub idx: usize,
     pub request_id: ThumbnailRequestId,
     /// 通常画像ならファイルパス、ZIP 画像なら ZIP ファイルのパス
@@ -2372,10 +2387,53 @@ pub fn process_load_request(
     req: &mut LoadRequest,
     cache_map: &std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
     tx: &mpsc::Sender<ThumbMsg>,
+    catalog: impl Into<ThumbnailCatalogProvider>,
+    thumb_px: u32,
+    thumb_quality: u8,
+    display_px: u32,
+    cache_decision: CacheDecision,
+    gen_done: &Arc<AtomicUsize>,
+    stats: &Arc<Mutex<crate::stats::ThumbStats>>,
+    cancel: Option<&Arc<AtomicBool>>,
+    keep_start: &Arc<AtomicUsize>,
+    keep_end: &Arc<AtomicUsize>,
+    still_seek_thumbnail_pages: Option<&Arc<std::sync::RwLock<std::collections::HashSet<usize>>>>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    edit_preview_db: Option<&Arc<crate::edit_preview_cache::EditPreviewCacheDb>>,
+    adjustment_db: Option<&crate::adjustment_db::AdjustmentDb>,
+    raw_handoff: Option<&RawThumbHandoff>,
+) {
+    process_load_request_with_provider(
+        req,
+        cache_map,
+        tx,
+        catalog.into(),
+        thumb_px,
+        thumb_quality,
+        display_px,
+        cache_decision,
+        gen_done,
+        stats,
+        cancel,
+        keep_start,
+        keep_end,
+        still_seek_thumbnail_pages,
+        pin_db,
+        edit_preview_db,
+        adjustment_db,
+        raw_handoff,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_load_request_with_provider(
+    req: &mut LoadRequest,
+    cache_map: &std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+    tx: &mpsc::Sender<ThumbMsg>,
     // **v1.0.0**: `Arc` 経由で受け取る (= 内部の WebP cache hit catch-up worker が
     // `Arc::clone` で所有権を持ったまま background スレッドに移すため)。既存 `&CatalogDb`
     // を期待する内部関数 (`load_one_cached` 等) には `.as_ref()` で透過的に渡せる。
-    catalog: Option<&Arc<crate::catalog::CatalogDb>>,
+    catalog: ThumbnailCatalogProvider,
     thumb_px: u32,
     thumb_quality: u8,
     display_px: u32,
@@ -2394,6 +2452,7 @@ pub fn process_load_request(
     adjustment_db: Option<&crate::adjustment_db::AdjustmentDb>,
     raw_handoff: Option<&RawThumbHandoff>,
 ) {
+    let provider = catalog;
     #[cfg(all(windows, any(test, feature = "test-script")))]
     trace_request_begin(req, display_px);
     if let Some(key) = req.cache_key_override.as_mut() {
@@ -2463,6 +2522,9 @@ pub fn process_load_request(
         gen_done.fetch_add(1, Ordering::Relaxed);
         return;
     }
+    let resolved_catalog = provider.resolve(req, cache_decision, cancel);
+    let catalog = resolved_catalog.as_ref();
+    let writable_catalog = catalog.filter(|db| !db.is_read_only());
     if matches!(req.raw_source, LoadRequestSource::RawHalfDeveloped { .. }) {
         let raw_source = std::mem::take(&mut req.raw_source);
         let proof = match &raw_source {
@@ -2490,7 +2552,7 @@ pub fn process_load_request(
             req.cache_key_override.as_deref(),
             req.idx,
             tx,
-            catalog.map(|arc| arc.as_ref()),
+            writable_catalog.map(|arc| arc.as_ref()),
             Some(cache_map),
             req.mtime,
             req.file_size,
@@ -2654,7 +2716,7 @@ pub fn process_load_request(
         .map_or(&*req, |(stamped, _)| stamped);
 
     // 内部関数向けに `&CatalogDb` を取り出しておく (= 既存シグネチャ互換)
-    let catalog_ref: Option<&crate::catalog::CatalogDb> = catalog.map(|a| a.as_ref());
+    let catalog_ref: Option<&crate::catalog::CatalogDb> = writable_catalog.map(|a| a.as_ref());
     // カタログキーを共通 helper で組み立て (auto_aspect の seed フェーズと共有)。
     // None ケース (path に file_name が無い等の異常) は既存挙動に合わせて空文字 fallback。
     let key_cow = cache_key_for_request(req).unwrap_or(std::borrow::Cow::Borrowed(""));
@@ -2762,26 +2824,65 @@ pub fn process_load_request(
         // WebP デコード (2-3 ms) をロック外で実行することで、
         // 他ワーカーの write (キャッシュ保存) をブロックしない。
         let retired_cache_only = req.source_policy == LoadSourcePolicy::CacheOnly
-            && catalog.is_some_and(|catalog| catalog.is_retired());
+            && (catalog.is_some_and(|catalog| catalog.is_retired())
+                || (req.catalog_target.is_retired() && !req.uses_memory_pin_seed()));
         let cached = if retired_cache_only {
             catalog
                 .and_then(|catalog| {
-                    catalog
-                        .resume_cache_only_after_maintenance(filename, &|| {
+                    if catalog.is_retired() {
+                        catalog.resume_cache_only_after_maintenance(filename, &|| {
                             cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed))
                         })
-                        .ok()
-                        .flatten()
+                    } else {
+                        // The Collection provider already performed its one RO continuation.
+                        catalog.load_one(filename)
+                    }
+                    .ok()
+                    .flatten()
                 })
                 .filter(|entry| entry.mtime == req.mtime && entry.file_size == req.file_size)
         } else {
-            cache_map.read().ok().and_then(|map| {
+            let memory = cache_map.read().ok().and_then(|map| {
                 let entry = map.get(filename)?;
                 if entry.mtime == req.mtime && entry.file_size == req.file_size {
                     Some(entry.clone())
                 } else {
                     None
                 }
+            });
+            memory.or_else(|| {
+                if !req.catalog_target.is_collection() {
+                    return None;
+                }
+                let started = std::time::Instant::now();
+                let entry = catalog
+                    .and_then(|db| match db.load_one(filename) {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            crate::logger::log(format!(
+                                "collection thumbnail lookup failed: {error}"
+                            ));
+                            db.record_cache_error(format!("collection thumbnail lookup: {error}"));
+                            None
+                        }
+                    })
+                    .filter(|entry| entry.mtime == req.mtime && entry.file_size == req.file_size);
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "collection",
+                        "thumb_catalog_lookup",
+                        None,
+                        req.input_seq,
+                        &[
+                            (
+                                "ms",
+                                serde_json::json!(started.elapsed().as_secs_f64() * 1000.0),
+                            ),
+                            ("hit", serde_json::json!(entry.is_some())),
+                        ],
+                    );
+                }
+                entry
             })
         };
         if let Some(entry) = cached.filter(|entry| folder_cached_row_usable(req, entry, pin_db)) {
@@ -2791,52 +2892,61 @@ pub fn process_load_request(
                     None => image,
                 }
             });
-            let cache_ms = req_t0.elapsed().as_secs_f64() * 1000.0;
-            // 通常 cache hit: 元ソースからの idle quality-upgrade 対象
-            // source_dims はカタログ由来 (旧バージョンで作成された
-            // エントリには None が入っている)
-            let _ = tx.send(
-                ThumbMsg::from_legacy_parts(
-                    req.idx,
-                    ci,
-                    ThumbLoadOrigin::UpgradeableCache,
-                    false,
-                    None,
-                    entry.source_dims,
-                    entry.layout_dims,
-                    false,
-                    false,
-                    req.input_seq,
-                    req.items_gen,
-                )
-                .with_request_id(req.request_id),
-            );
-            gen_done.fetch_add(1, Ordering::Relaxed);
-            crate::logger::log(format!(
-                "    idx={:>4} cache_hit={cache_ms:>5.1}ms  {filename}",
-                req.idx,
-            ));
-            if crate::perf::is_enabled() {
-                crate::perf::event(
-                    "thumb",
-                    "decode_end",
-                    Some(filename),
-                    req.input_seq,
-                    &[
-                        ("idx", serde_json::Value::from(req.idx)),
-                        ("ms", serde_json::Value::from(cache_ms)),
-                        ("from_cache", serde_json::Value::from(true)),
-                    ],
+            if req.catalog_target.is_collection() && ci.is_none() {
+                crate::logger::log(format!(
+                    "collection thumbnail: invalid cached WebP: {filename}"
+                ));
+                if let Some(db) = catalog {
+                    db.record_cache_error("collection thumbnail: invalid cached WebP");
+                }
+            } else {
+                let cache_ms = req_t0.elapsed().as_secs_f64() * 1000.0;
+                // 通常 cache hit: 元ソースからの idle quality-upgrade 対象
+                // source_dims はカタログ由来 (旧バージョンで作成された
+                // エントリには None が入っている)
+                let _ = tx.send(
+                    ThumbMsg::from_legacy_parts(
+                        req.idx,
+                        ci,
+                        ThumbLoadOrigin::UpgradeableCache,
+                        false,
+                        None,
+                        entry.source_dims,
+                        entry.layout_dims,
+                        false,
+                        false,
+                        req.input_seq,
+                        req.items_gen,
+                    )
+                    .with_request_id(req.request_id),
                 );
+                gen_done.fetch_add(1, Ordering::Relaxed);
+                crate::logger::log(format!(
+                    "    idx={:>4} cache_hit={cache_ms:>5.1}ms  {filename}",
+                    req.idx,
+                ));
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "thumb",
+                        "decode_end",
+                        Some(filename),
+                        req.input_seq,
+                        &[
+                            ("idx", serde_json::Value::from(req.idx)),
+                            ("ms", serde_json::Value::from(cache_ms)),
+                            ("from_cache", serde_json::Value::from(true)),
+                        ],
+                    );
+                }
+                // ── pdf_meta catch-up (v1.0.0) ──
+                // PDF ファイルサムネが WebP cache hit したケース (= render_page を skip した
+                // ケース) では `pdf_meta` テーブルが populate されない。v0.x 時代の WebP
+                // サムネ済みユーザーがアップグレードした場合、初回 Enter で cache miss
+                // になり 800ms 級の待ちが入る。サムネを表示した直後に裏で enumerate して
+                // pdf_meta を埋めることで、その PDF の初回 Enter から瞬時にする。
+                maybe_spawn_pdf_meta_catchup(req, writable_catalog);
+                return;
             }
-            // ── pdf_meta catch-up (v1.0.0) ──
-            // PDF ファイルサムネが WebP cache hit したケース (= render_page を skip した
-            // ケース) では `pdf_meta` テーブルが populate されない。v0.x 時代の WebP
-            // サムネ済みユーザーがアップグレードした場合、初回 Enter で cache miss
-            // になり 800ms 級の待ちが入る。サムネを表示した直後に裏で enumerate して
-            // pdf_meta を埋めることで、その PDF の初回 Enter から瞬時にする。
-            maybe_spawn_pdf_meta_catchup(req, catalog);
-            return;
         }
     }
 
@@ -2863,11 +2973,7 @@ pub fn process_load_request(
         return;
     }
 
-    if req.folder_thumb_provenance == Some(crate::catalog::FolderThumbProvenance::Seeded)
-        && req.resolve_override.is_none()
-        && req.zip_entry.is_none()
-        && req.pdf_page.is_none()
-    {
+    if req.uses_memory_pin_seed() {
         // A missing video-frame seed has no source decoder. Never fall through
         // to folder auto-selection under its released pinned key.
         send_thumb_failed(req, tx, gen_done);
@@ -3156,7 +3262,9 @@ pub fn process_load_request(
     if let Some(cached) = cached_pinned_folder_thumb {
         let policy_should_save =
             cache_decision.should_cache(&cached.source_path, cached.source_file_size, 0.0, 0.0);
-        let should_save = catalog_ref.is_some() && (req.force_cache || policy_should_save);
+        let should_save = !req.catalog_target.is_collection()
+            && catalog_ref.is_some()
+            && (req.force_cache || policy_should_save);
         let mut mirrored = false;
         if should_save {
             let cat = catalog_ref.expect("should_save => catalog is Some");
@@ -5751,6 +5859,7 @@ pub fn load_one_cached(
                 );
                 cache_save_ms = cache_save_started.elapsed().as_secs_f64() * 1000.0;
                 if let Err(e) = save_result {
+                    cat.record_cache_error(format!("thumbnail catalog save: {e}"));
                     measured_thumbnail_log(
                         format!("    idx={idx:>4} catalog save: {e}"),
                         &mut normal_log,
@@ -9531,6 +9640,88 @@ mod tests {
                 .unwrap()
         );
         cache_key
+    }
+
+    #[test]
+    fn collection_parent_recursive_legacy_pin_is_displayed_without_mirroring() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let tmp = TempDir::new().unwrap();
+        let mut fixture = prepare_pdf_pin_fixture(&tmp, 3);
+        fixture.cache_dir = data.path().join("cache");
+        save_pdf_pin_webp(&fixture, 3, &fixture_webp());
+        for collection in [false, true] {
+            let mut req = LoadRequest {
+                path: fixture.root.clone(),
+                mtime: 1,
+                file_size: 2,
+                cache_key_override: folder_thumb_cache_key_for_path(
+                    &fixture.root,
+                    true,
+                    SortOrder::Numeric,
+                    3,
+                    crate::catalog::FolderThumbProvenance::AutoSelected,
+                ),
+                folder_thumb_sort: Some(SortOrder::Numeric),
+                folder_thumb_depth: 3,
+                folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+                ..Default::default()
+            };
+            let provider = if collection {
+                req.catalog_target = RequestCatalog::collection(
+                    &fixture.root,
+                    crate::catalog::CatalogWork::capture(&fixture.cache_dir),
+                );
+                ThumbnailCatalogProvider::collection()
+            } else {
+                ThumbnailCatalogProvider::FixedCatalog(Some(Arc::new(
+                    crate::catalog::CatalogDb::open(
+                        &fixture.cache_dir,
+                        fixture.root.parent().unwrap(),
+                    )
+                    .unwrap(),
+                )))
+            };
+            let map = std::sync::RwLock::new(std::collections::HashMap::new());
+            let (tx, rx) = mpsc::channel();
+            process_load_request(
+                &mut req,
+                &map,
+                &tx,
+                provider.clone(),
+                64,
+                75,
+                32,
+                make_decision(CachePolicy::Always, 25, 2_000_000),
+                &Arc::new(AtomicUsize::new(0)),
+                &Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+                None,
+                &Arc::new(AtomicUsize::new(0)),
+                &Arc::new(AtomicUsize::new(1)),
+                None,
+                Some(&fixture.pin_db),
+                None,
+                None,
+                None,
+            );
+            assert!(
+                rx.try_recv().unwrap().pixels().is_some(),
+                "legacy pin display preserved"
+            );
+            let db = provider
+                .resolve(
+                    &req,
+                    make_decision(CachePolicy::Always, 25, 2_000_000),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                db.load_one(req.cache_key_override.as_deref().unwrap())
+                    .unwrap()
+                    .is_some(),
+                !collection
+            );
+            assert_eq!(map.read().unwrap().is_empty(), collection);
+        }
     }
 
     #[test]

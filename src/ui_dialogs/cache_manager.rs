@@ -57,16 +57,7 @@ impl App {
                     }
 
                     // ── 統計表示 ──────────────────────────────────
-                    if let Some((folders, bytes)) = self.cache_manager_stats {
-                        let size_str = if bytes >= 1024 * 1024 * 1024 {
-                            format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-                        } else {
-                            format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-                        };
-                        ui.label(format!("キャッシュ: {folders} フォルダ / {size_str}"));
-                    } else {
-                        ui.label("キャッシュ情報を取得中...");
-                    }
+                    draw_catalog_summary(ui, self.cache_manager_stats);
                     // 動画用の DB は別ファイル管理だが、削除操作 (フォルダ単位 /
                     // すべて) は静止画キャッシュと一括で走るので、サイズもこの
                     // ダイアログに表示する。タイルモードのサムネだけでなく、シーク
@@ -133,8 +124,7 @@ impl App {
 
                     // ── 現在のフォルダのキャッシュを削除 ─────────
                     let has_folder = self.current_folder.is_some();
-                    let folder_btn = egui::Button::new("  現在のフォルダのキャッシュを削除  ");
-                    if ui.add_enabled(has_folder && !busy, folder_btn).clicked() {
+                    if draw_folder_cache_delete(ui, has_folder, busy) {
                         if let Some(folder) = self.current_folder.clone() {
                             let auto_aspect_folder = self.auto_aspect_cache_target_path();
                             // Connection retirement/close belongs to the worker.
@@ -146,13 +136,6 @@ impl App {
                                 cache_dir.clone(),
                             ));
                         }
-                    }
-                    if !has_folder {
-                        ui.label(
-                            egui::RichText::new("(フォルダを開いていないため無効)")
-                                .small()
-                                .weak(),
-                        );
                     }
 
                     ui.add_space(8.0);
@@ -238,4 +221,51 @@ impl App {
             }
         }
     }
+}
+
+fn draw_catalog_summary(ui: &mut egui::Ui, stats: Option<(usize, u64)>) {
+    if let Some((catalogs, bytes)) = stats {
+        let size_str = if bytes >= 1024 * 1024 * 1024 {
+            format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        } else {
+            format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+        };
+        ui.label(format!("キャッシュ: {catalogs} カタログ / {size_str}"));
+    } else {
+        ui.label("キャッシュ情報を取得中...");
+    }
+    ui.label(
+        egui::RichText::new("通常フォルダとコレクションのキャッシュを含みます。")
+            .small()
+            .weak(),
+    );
+}
+
+fn draw_folder_cache_delete(ui: &mut egui::Ui, has_folder: bool, busy: bool) -> bool {
+    let clicked = ui
+        .add_enabled(
+            has_folder && !busy,
+            egui::Button::new("  現在のフォルダのキャッシュを削除  "),
+        )
+        .clicked();
+    if !has_folder {
+        ui.label(
+            egui::RichText::new("(フォルダを開いていないため無効)")
+                .small()
+                .weak(),
+        );
+    }
+    clicked
+}
+
+#[doc(hidden)]
+pub fn draw_cache_manager_snapshot_fixture(ui: &mut egui::Ui) {
+    ui.heading("サムネイルキャッシュ管理");
+    draw_catalog_summary(ui, Some((42, 128 * 1024 * 1024)));
+    ui.separator();
+    ui.label("コレクションの一覧");
+    draw_folder_cache_delete(ui, false, false);
+    ui.separator();
+    ui.label("元のフォルダ");
+    draw_folder_cache_delete(ui, true, false);
 }
