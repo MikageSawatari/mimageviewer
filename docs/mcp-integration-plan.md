@@ -4911,7 +4911,9 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 1. **ChatGPT (Codex) のアプリを終了しても、Codex の常駐プロセス (`%USERPROFILE%\.codex\packages\app-server-daemon\...\codex.exe`、
    `app-server --managed-daemon` 等) が残り、mIV が「動作中」と判定して登録を拒否する**。利用者の許可でプロセスを止めて続けた。
    登録の後の `codex.cmd exec` 9 回では、この常駐プロセスは起動しなかった (npm 版の codex.exe が子として mcp.exe を起動し、
-   終了で消えた)。ChatGPT アプリの起動で常駐プロセスが起動するかは未確認。
+   終了で消えた)。追記: 利用者が ChatGPT アプリを起動し直しても、約 6 分のあいだ常駐プロセスは現れなかった (アプリの子の
+   codex.exe は `AppData\Local\OpenAI\Codexin` の `app-server` と `exec-server` の 2 本)。朝の常駐プロセスの親 (PID 40416) は
+   アプリ本体とは別で、何が起動したかは分からない (サブ PC 担当の観測と推測)。
 2. 環境設定の検索で「AI 連携」と入れると「一致する設定がありません」とだけ出て、移った先の案内が無い。
 3. 登録の確認の窓の内容に、ファイルには書かれない見出しだけの `[mcp_servers]` の行が出る (実際の差分と合わない)。
 4. 参考: 表の中で語の途中で折り返す (「リモート接 / 続」)。egui の日本語の折り返しの既存の挙動で、この窓だけの問題ではない。
