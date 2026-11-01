@@ -5036,3 +5036,53 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 引数なしでは実際の `%APPDATA%\mimageviewer` を使い、実設定/データを更新し得るため、
 インストール版/トレイ常駐版を先に終了する。確認対象は検索案内と確認preview。
 実機での登録/解除とdaemon/CLI併存は未実施で、これらのテストは一時設定先で行う (通常のAIアプリconfigを試験用に変更しない)。
+
+### 29.4 実装レビュー 1 巡目の対応
+
+独立レビューのP2をClaudeCodeが採択し、実装担当rootがコードで再確認した。
+Preferencesが開いている間に別窓で変わった `remote_service_enabled` が、共通の保存/比較境界で拾われず、
+古いdraftの値を保存し直す経路と、誤った未保存判定の両方があった。
+
+- `prepare_preferences_settings_for_commit` の既存のAI設定と同じ境界で、`remote_service_enabled` も
+  live値から引き継ぐ。OKと未保存比較は同じ境界を通り、Cancelはlive値を保持してdraftを捨てる。
+  `Settings::overwrite_non_preferences_from` やtransferの分類/形式/取り込み処理は変更しない。
+- `show_remote_connection_dialog` の書き込みを棚卸しした。`Settings` の値は上記のboolだけ。
+  PIN・セッション鍵はserviceのauth store、Tailscaleは別の設定/commandの所有で、Preferences draftの項目ではない。
+  同file内の別機能による表示/並び順の書き込みを、接続窓が所有する値には含めない。
+- 回帰テストは実際の検索案内→接続窓→ON/OFF button→Preferences OK/Cancelを通す。
+  ON→OFF / OFF→ONそれぞれについて、OK、変更なしのCancel、別の未保存編集を破棄するCancelの6通り。
+  古いdraftが反対の値を保持していることを先に確認し、live値と `Settings::load()` の保存値が保たれることを検査する。
+  Remoteだけ変わった時はCancelで確認なしに閉じ、別の編集があれば破棄確認が必要なことも検査する。
+- service controlなしで接続窓を開き、PIN設定済みのin-process control/channelを注入する。
+  実windowからの `SetEnabled` も検査するが、service manager/子process/Tailscale probeは起動しない。
+  設定先はAppのtemp fixture。製品起動/実設定の操作/commitなし。UIの描画変更とPNG変更はなし。
+
+| 検証コマンド | 観測者 | 実 exit | 結果 / ログ |
+|---|---|---:|---|
+| `cargo fmt` (workspace) | root | 0 | workspace全体を整形 |
+| `cargo fmt --check` | root | 0 | `target/mcp-stage2-4-review1-fmt-check.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | root | 0 | 22.89s、`target/mcp-stage2-4-review1-core-check.log` |
+| 下記focused nextest | root | 0 | 349/349、compile 4m18s・実行45.076s、`target/mcp-stage2-4-review1-focused.log` |
+| `python scripts/check_ui_glyphs.py` | root | 0 | 危険なUI glyphなし、`target/mcp-stage2-4-review1-glyphs.log` |
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/agent_registration/) or test(/agent_integration/) or test(/ui_dialogs::preferences/) or test(/settings_transfer/) or test(/remote_ipc::service/) or test(/remote_ipc::ui/)' --no-fail-fast
+```
+
+既存の設定export/importとRemoteの検査も上記のfocusedで成功した。変更ファイルは
+`src/ui_dialogs/preferences.rs` (共通境界)、`src/remote_ipc/service.rs` (testのみ)、本節。
+| 引き渡しの確認 | 観測者 | 実 exit | 結果 |
+|---|---|---:|---|
+| `powershell -NoProfile -File scripts\build-dev.ps1 -PreserveRuntime` | root | 0 | core 2m53s、remote/EPUB/MCPも成功。VCRT PE検査runtime=4 / pe=4、`target/vcrt-pe-reports/dev-runtime.json` |
+| `git diff --check` (最終) | root | 0 | `target/mcp-stage2-4-review1-diff-check.log` |
+
+新たな設計矛盾・未解決の実装事項なし。実窓/実サービスでの切り替えは未実施。
+確認用runtimeは更新済み・未起動。利用者の起動コマンドは次のとおり。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+引数なしでは通常の `%APPDATA%\mimageviewer` を使い、実設定/データを更新し得るため、
+インストール版/トレイ常駐版を先に終了する。実機確認はPreferencesを開いたままリモートのON/OFFを変え、
+OK/Cancel/未保存判定で変化が巻き戻らないこと。製品起動・実機操作・commitはこの作業では行っていない。

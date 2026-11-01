@@ -2410,11 +2410,12 @@ pub(crate) fn prepare_preferences_settings_for_commit(
     let new_details_selection_bar_mode = edited.details_selection_bar_mode.normalized();
 
     edited.overwrite_non_preferences_from(live);
-    // AI permissions belong to the immediate AI integration window. An older
-    // Preferences draft must never restore its opening-time permission values.
+    // Immediate settings windows own these values. An older Preferences draft
+    // must never restore their opening-time values, including on close checks.
     edited.agent_level = live.agent_level;
     edited.agent_show_thumbnails = live.agent_show_thumbnails;
     edited.agent_show_gps = live.agent_show_gps;
+    edited.remote_service_enabled = live.remote_service_enabled;
     edited.route_preferences_view_state(standard_view_state, active_view_state);
 
     // セット C は上の移送対象なので、スナップショット上で先に複製すると live 値で
