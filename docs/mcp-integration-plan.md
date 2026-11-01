@@ -5086,3 +5086,15 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 引数なしでは通常の `%APPDATA%\mimageviewer` を使い、実設定/データを更新し得るため、
 インストール版/トレイ常駐版を先に終了する。実機確認はPreferencesを開いたままリモートのON/OFFを変え、
 OK/Cancel/未保存判定で変化が巻き戻らないこと。製品起動・実機操作・commitはこの作業では行っていない。
+
+### 29.x 検収 (ClaudeCode、2026-11-01)
+
+- sandbox の外で ClaudeCode が実行:
+  - `3e15b7a86`: agent_registration / agent_integration / ui_dialogs::preferences / process_images / agent_ipc の focused nextest
+    exit 0 (379/379)。`cargo test --test ui_snapshot` は並列で既知の異常終了 (exit 2173) の後、1 スレッドで exit 0 (224/224)。
+  - `5a9e365f7`: 上の範囲に settings_transfer / remote_ipc::service / remote_ipc::ui を加えた focused nextest exit 0 (349/349)。
+- 新しい PNG (`preferences_search_window_hints.png`) を ClaudeCode が目視 (案内の行とボタンが読める)。
+- 独立した実装レビュー: 1 巡目 (`3e15b7a86`) P2 1 件 (検索の案内から開いた「リモート接続…」の窓で切り替えた
+  `remote_service_enabled` を、環境設定の OK が古い下書きで巻き戻す) → `5a9e365f7` で直した。2 巡目で追加の指摘なし、
+  判定は「2-4 impl: accepted」。
+- 実機の未確認: 常駐プロセスが残った状態での Codex の登録、検索の案内、確認の窓の表示。
