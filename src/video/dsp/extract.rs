@@ -1,5 +1,5 @@
 //! VST3 host を data_dir/vst3/hosts/<content hash>/ に展開する。
-//! host の basename は維持し、CRT は検索対象外の vcrt/ に置く。
+//! CRT は検索対象外の vcrt/ に置く。音響調整の保存先は BridgePurpose で分離する。
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -112,6 +112,8 @@ fn prepare_bridge(base: &std::path::Path) -> std::io::Result<PathBuf> {
     for &(name, bytes) in HOST_VCRT {
         ensure_bytes(&runtime.join(name), bytes)?;
     }
+    // Keep the basename stable for user VST WebView data. Dedicated mIV Sound
+    // uses MIV_SOUND_DATA_DIR rather than the host filename for isolation.
     let exe = dir.join("mimageviewer-vst3-host.exe");
     ensure_bytes(&exe, BRIDGE_EXE_BYTES)?;
     Ok(exe)

@@ -26,6 +26,7 @@ public:
     FUnknown* identity = nullptr;
     DWORD thread = 0;
     IPtr<IMessage> held;
+    const char* expected_id = "EffeTune.NowPlaying";
     std::function<void()> entered;
     tresult PLUGIN_API queryInterface(const TUID interface_id, void** obj) override {
         if (identity && FUnknownPrivate::iidEqual(interface_id, FUnknown::iid)) {
@@ -43,7 +44,7 @@ public:
     tresult PLUGIN_API disconnect(IConnectionPoint*) override { return kResultOk; }
     tresult PLUGIN_API notify(IMessage* message) override {
         ++calls; thread = GetCurrentThreadId(); held = message;
-        require(std::strcmp(message->getMessageID(), "EffeTune.NowPlaying") == 0, "message ID");
+        require(std::strcmp(message->getMessageID(), expected_id) == 0, "message ID");
         if (entered) entered();
         return result;
     }
@@ -57,9 +58,9 @@ public:
     tresult PLUGIN_API queryInterface(const TUID, void** obj) override { *obj = nullptr; return kNoInterface; }
     uint32 PLUGIN_API addRef() override { return ++refs_; }
     uint32 PLUGIN_API release() override { const auto n = --refs_; if (!n) delete this; return n; }
-    tresult PLUGIN_API setInt(AttrID id, int64 value) override { return actual_->setInt(id, value); }
+    tresult PLUGIN_API setInt(AttrID id, int64 value) override { return key_ == id ? kInvalidArgument : actual_->setInt(id, value); }
     tresult PLUGIN_API getInt(AttrID id, int64& value) override { return actual_->getInt(id, value); }
-    tresult PLUGIN_API setFloat(AttrID id, double value) override { return actual_->setFloat(id, value); }
+    tresult PLUGIN_API setFloat(AttrID id, double value) override { return key_ == id ? kInvalidArgument : actual_->setFloat(id, value); }
     tresult PLUGIN_API getFloat(AttrID id, double& value) override { return actual_->getFloat(id, value); }
     tresult PLUGIN_API setString(AttrID id, const TChar* value) override { return key_ == id ? kInvalidArgument : actual_->setString(id, value); }
     tresult PLUGIN_API getString(AttrID id, TChar* value, uint32 bytes) override { return actual_->getString(id, value, bytes); }
@@ -219,6 +220,114 @@ static void mailbox_tests() {
     require(registry.watched().empty(), "all payload owners released");
 }
 
+
+static std::string extended_frame(const std::string& extra) {
+    auto json = frame(1); json.pop_back(); return json + "," + extra + "}";
+}
+static std::string position_frame(uint64_t generation, double position = 0, bool available = true) {
+    return "{\"cmd\":\"set_playback_position\",\"slot_id\":0,\"mediaGeneration\":" + std::to_string(generation) +
+        ",\"available\":" + (available ? "1" : "0") + ",\"playing\":0,\"positionSeconds\":" +
+        std::to_string(position) + ",\"rate\":2.0,\"hostTimeNanoseconds\":18446744073709551615}";
+}
+static void lyrics_parser_tests() {
+    NowPlayingSnapshot snapshot;
+    require(parse_now_playing(extended_frame("\"mediaGeneration\":18446744073709551615,\"durationSeconds\":6e1,\"lyricsSidecar\":\"[00:01]line\",\"lyricsEmbedded\":\"tag\""), snapshot), "all optional attributes");
+    require(snapshot.media_generation == UINT64_MAX && snapshot.duration_seconds == 60 && snapshot.lyrics_sidecar == L"[00:01]line" && snapshot.lyrics_embedded == L"tag", "optional values");
+    require(parse_now_playing(frame(2), snapshot) && !snapshot.media_generation && !snapshot.duration_seconds && !snapshot.lyrics_sidecar && !snapshot.lyrics_embedded, "optional absence resets snapshot");
+    require(parse_now_playing(extended_frame("\"mediaGeneration\":null,\"durationSeconds\":null,\"lyricsSidecar\":null,\"lyricsEmbedded\":null"), snapshot) && !snapshot.lyrics_sidecar, "null optional values");
+    for (size_t units : {NOW_PLAYING_LYRICS_MAX - 1, NOW_PLAYING_LYRICS_MAX, NOW_PLAYING_LYRICS_MAX + 1}) {
+        require(parse_now_playing(extended_frame("\"lyricsSidecar\":\"" + std::string(units, 'a') + "\""), snapshot), "lyrics boundary accepted");
+        require(snapshot.lyrics_sidecar->size() == std::min(units, NOW_PLAYING_LYRICS_MAX), "lyrics UTF16 limit");
+    }
+    require(parse_now_playing(extended_frame("\"lyricsSidecar\":\"" + std::string(NOW_PLAYING_LYRICS_MAX - 1, 'a') + "\\ud83d\\ude00\""), snapshot) && snapshot.lyrics_sidecar->size() == NOW_PLAYING_LYRICS_MAX - 1, "lyrics surrogate boundary");
+    for (const auto* invalid : {"\"lyricsSidecar\":\"\\ud800\"", "\"lyricsEmbedded\":\"\\u0000\"", "\"mediaGeneration\":-1", "\"durationSeconds\":-1", "\"durationSeconds\":1e999", "\"durationSeconds\":01", "\"durationSeconds\":1.", "\"lyricsSidecar\":false", "\"mediaGeneration\":1,\"mediaGeneration\":2"})
+        require(!parse_now_playing(extended_frame(invalid), snapshot), "invalid optional rejected");
+    auto maximum = frame(1, std::string(4096, 'a'), maximum_art(), "image/png"); maximum.pop_back();
+    std::string escaped;
+    for (size_t n = 0; n < NOW_PLAYING_LYRICS_MAX; ++n) escaped += "\\u0001";
+    maximum += ",\"mediaGeneration\":18446744073709551615,\"lyricsSidecar\":\"" + escaped + "\",\"lyricsEmbedded\":\"" + escaped + "\",\"durationSeconds\":60}";
+    require(maximum.size() < MAX_CONTROL_MSG_SIZE && parse_now_playing(maximum, snapshot), "max image plus both maximally escaped lyrics within frame");
+    require(snapshot.artwork.size() == NOW_PLAYING_IMAGE_MAX && snapshot.lyrics_sidecar->size() == NOW_PLAYING_LYRICS_MAX && snapshot.lyrics_embedded->size() == NOW_PLAYING_LYRICS_MAX, "maximum combined decoded sizes");
+    maximum.pop_back(); maximum += ",";
+    require(!parse_now_playing(maximum, snapshot), "twelve fields require closing brace");
+}
+static void playback_tests() {
+    PlaybackPositionSnapshot parsed;
+    require(parse_playback_position(position_frame(UINT64_MAX, 2.5), parsed) && parsed.media_generation == UINT64_MAX && parsed.host_time_ns == UINT64_MAX && parsed.position_seconds == 2.5 && parsed.available && !parsed.playing && parsed.rate == 2, "playback parser");
+    for (const auto& replace : {std::pair<std::string, std::string>{"available\":1", "available\":2"}, {"2.500000", "-1"}, {"2.0", "0"}, {"2.0", "1e999"}, {"18446744073709551615", "18446744073709551616"}, {"\"playing\"", "\"available\""}}) {
+        auto invalid = position_frame(1, 2.5); auto offset = invalid.find(replace.first); require(offset != std::string::npos, "mutation field exists"); invalid.replace(offset, replace.first.size(), replace.second);
+        require(!parse_playback_position(invalid, parsed), "invalid playback rejected");
+    }
+    auto host = owned(new Steinberg::Vst::HostApplication);
+    Receiver component, controller;
+    component.expected_id = controller.expected_id = "EffeTune.PlaybackPosition";
+    require(parse_playback_position(position_frame(UINT64_MAX, 2.5), parsed), "playback reparsed");
+    notify_playback_position(host, &component, &controller, parsed);
+    require(component.calls == 1 && controller.calls == 0 && component.thread == GetCurrentThreadId(), "playback component on caller GUI thread");
+    auto* attrs = component.held->getAttributes(); int64 integer = 0; double real = 0;
+    require(attrs->getInt("mediaGeneration", integer) == kResultOk && integer == -1, "generation bit pattern");
+    require(attrs->getInt("hostTimeNanoseconds", integer) == kResultOk && integer == -1, "QPC bit pattern");
+    require(attrs->getInt("available", integer) == kResultOk && integer == 1 && attrs->getInt("playing", integer) == kResultOk && integer == 0, "playback booleans use integers");
+    require(attrs->getFloat("positionSeconds", real) == kResultOk && real == 2.5 && attrs->getFloat("rate", real) == kResultOk && real == 2, "playback floats");
+    component.result = kNotImplemented;
+    notify_playback_position(host, &component, &controller, parsed);
+    require(controller.calls == 1, "playback controller fallback");
+    notify_playback_position(host, &component, &component, parsed);
+    require(component.calls == 3, "playback canonical identity notified once");
+    component.result = kResultOk; parsed.available = false;
+    notify_playback_position(host, &component, &controller, parsed);
+    require(component.held->getAttributes()->getInt("available", integer) == kResultOk && integer == 0, "unavailable clears playback");
+    for (const auto* key : {"mediaGeneration", "available", "playing", "positionSeconds", "rate", "hostTimeNanoseconds"}) {
+        auto failing = owned(new FailingHost); failing->key = key; const int before = component.calls;
+        notify_playback_position(failing, &component, &controller, parsed);
+        require(component.calls == before, "playback setter failure stops notify");
+    }
+    NowPlayingSnapshot text; text.media_generation = UINT64_MAX; text.lyrics_sidecar = L"sidecar"; text.lyrics_embedded = L"embedded"; text.duration_seconds = 60;
+    component.expected_id = controller.expected_id = "EffeTune.NowPlaying"; component.result = kResultOk;
+    notify_now_playing(host, &component, &controller, text);
+    attrs = component.held->getAttributes(); wchar_t lyrics[32]{};
+    require(attrs->getInt("mediaGeneration", integer) == kResultOk && integer == -1 && attrs->getFloat("durationSeconds", real) == kResultOk && real == 60, "NowPlaying typed trial attributes");
+    require(attrs->getString("lyricsSidecar", reinterpret_cast<TChar*>(lyrics), sizeof(lyrics)) == kResultOk && std::wstring(lyrics) == L"sidecar", "sidecar string");
+    require(attrs->getString("lyricsEmbedded", reinterpret_cast<TChar*>(lyrics), sizeof(lyrics)) == kResultOk && std::wstring(lyrics) == L"embedded", "embedded string");
+    for (const auto* key : {"mediaGeneration", "lyricsSidecar", "lyricsEmbedded", "durationSeconds"}) {
+        auto failing = owned(new FailingHost); failing->key = key; const int before = component.calls;
+        notify_now_playing(failing, &component, &controller, text);
+        require(component.calls == before, "optional setter failure stops notify");
+    }
+    notify_now_playing(host, &component, &controller, NowPlayingSnapshot{});
+    require(component.held->getAttributes()->getInt("mediaGeneration", integer) != kResultOk && component.held->getAttributes()->getString("lyricsSidecar", reinterpret_cast<TChar*>(lyrics), sizeof(lyrics)) != kResultOk, "missing trial attributes omitted from message");
+
+    NowPlayingRegistry media; PlaybackPositionRegistry positions; media.add(0, 0); positions.add(0, 0);
+    int wakes = 0; auto wake = [&](auto) { ++wakes; };
+    auto a = std::make_shared<NowPlayingSnapshot>(); a->media_generation = 1; a->revision = 1;
+    auto m = media.find(0); require(m->admit(a), "media A scheduled"); auto running_media = m->begin(100);
+    require(admit_playback_position_frame(position_frame(2, 5), positions, wake), "position B during media A notify");
+    auto b = std::make_shared<NowPlayingSnapshot>(); b->media_generation = 2; b->revision = 2; m->admit(b);
+    auto pos = positions.find(0); auto running = pos->begin(200);
+    require(running && running->media_generation != *running_media->media_generation, "position can precede media; plugin generation must gate");
+    require(admit_playback_position_frame(position_frame(2, 6), positions, wake) && admit_playback_position_frame(position_frame(2, 7), positions, wake) && wakes == 1, "position running keeps latest pending without more tokens");
+    require(pos->finish(), "position completion schedules pending"); auto latest = pos->begin(300);
+    require(latest->position_seconds == 7, "position latest wins even same generation");
+    require(m->finish(), "new media scheduled after A"); auto next_media = m->begin(300);
+    require(next_media->media_generation == latest->media_generation, "media B and latest position B match");
+    const auto epoch = positions.seal_all(); require(pos->stats().executing && pos->expired(5300), "closed playback still watched");
+    positions.add(0, epoch); require(positions.find(0) != pos, "position fresh slot incarnation");
+    require(!pos->finish(), "closed playback cannot repost"); positions.seal_all(); positions.add(0, epoch);
+    require(!positions.find(0), "old queued initialization cannot reopen playback lane");
+    m->finish(); media.seal_all(); require(positions.watched().empty() && media.watched().empty(), "both lanes release owners");
+
+    // Exercise the shared executor on an inert dedicated GUI worker.
+    auto thread_owner = std::make_shared<PlaybackPositionMailbox>(0);
+    auto thread_snapshot = std::make_shared<PlaybackPositionSnapshot>(); thread_snapshot->media_generation = 7;
+    thread_owner->admit(thread_snapshot); component.expected_id = "EffeTune.PlaybackPosition";
+    std::thread gui([&] {
+        execute_now_playing(thread_owner, GetTickCount64(), [&](const auto& value) {
+            notify_playback_position(host, &component, nullptr, value);
+        }, [](auto) {});
+    });
+    gui.join(); require(component.thread != GetCurrentThreadId() && !thread_owner->stats().executing, "position notify uses GUI executor thread");
+}
+
 // Holds a real packaged-task future. Begin/finish is injected exactly after the
 // helper's initial Scheduled snapshot and before its first positive wait, while
 // the operation itself stays gated until that wait has timed out. This makes
@@ -294,6 +403,35 @@ static void gui_future_tests() {
     require(result.outcome == GuiFutureWait::GuiTimeout, "Scheduled control wake is never waited");
     completed_notify_budget_test(false);
     completed_notify_budget_test(true);
+
+    auto media = std::make_shared<NowPlayingMailbox>(0);
+    auto position = std::make_shared<PlaybackPositionMailbox>(0);
+    auto pos = std::make_shared<PlaybackPositionSnapshot>(); position->admit(pos);
+    std::promise<int> operation_done; auto operation_future = operation_done.get_future();
+    struct PositionDuringWait {
+        std::future<int>& future;
+        std::shared_ptr<PlaybackPositionMailbox> owner;
+        bool began = false;
+        std::future_status wait_for(std::chrono::milliseconds duration) {
+            if (duration.count() > 0 && !began) {
+                began = true;
+                execute_now_playing(owner, GetTickCount64(), [](const auto&) {}, [](auto) {});
+            }
+            return future.wait_for(duration);
+        }
+    } waiting{operation_future, position};
+    int lookups = 0;
+    result = await_gui_notifications(waiting, std::chrono::milliseconds(1), [&] {
+        if (++lookups == 2) operation_done.set_value(1);
+        return std::vector<std::shared_ptr<NotificationMailbox>>{media, position};
+    });
+    require(result.outcome == GuiFutureWait::Ready && lookups == 2 && position->stats().execution_count == 1, "position lane completed during wait restores same operation budget");
+    position->admit(pos); position->begin(GetTickCount64() - NOW_PLAYING_TIMEOUT_MS); position->close();
+    result = await_gui_notifications(ordinary, std::chrono::milliseconds(1), [&] {
+        return std::vector<std::shared_ptr<NotificationMailbox>>{media, position};
+    });
+    require(result.outcome == GuiFutureWait::NowPlayingTimeout && result.mailbox == position, "closed hung position owns GUI timeout");
+    position->finish();
 }
 
 // A headless child host for actual stdin-frame -> reader -> shared mailbox ->
@@ -438,7 +576,7 @@ int main(int argc, char** argv) {
     try {
         if (argc > 1) return headless_host(std::strcmp(argv[1], "--slow") != 0,
             std::strcmp(argv[1], "--hang-sync") != 0);
-        parser_tests(); receiver_tests(); mailbox_tests(); gui_future_tests();
+        parser_tests(); lyrics_parser_tests(); receiver_tests(); mailbox_tests(); playback_tests(); gui_future_tests();
         std::cout << "Now Playing parser/SDK receiver/mailbox tests PASS\n";
         return 0;
     } catch (const std::exception& error) {

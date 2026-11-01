@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 /// T09 (v0.9.0) bump 1 → 2: 本体 `src/video/dsp/bridge.rs::PROTOCOL_VERSION` および
 /// `crates/vst3-host/include/protocol.h::PROTOCOL_VERSION` と必ず同期させること。
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 pub fn require_current_protocol(reported: u32) -> Result<(), String> {
     if reported == PROTOCOL_VERSION {
@@ -33,15 +33,15 @@ mod protocol_tests {
     use super::*;
 
     #[test]
-    fn protocol_handshake_rejects_v6_and_accepts_current_ready() {
-        let old: Event = serde_json::from_str(r#"{"event":"ready","version":6}"#).unwrap();
+    fn protocol_handshake_rejects_v7_and_accepts_current_ready() {
+        let old: Event = serde_json::from_str(r#"{"event":"ready","version":7}"#).unwrap();
         let Event::Ready { version } = old else {
             panic!("ready expected")
         };
         assert!(
             require_current_protocol(version)
                 .unwrap_err()
-                .contains("bridge=v6")
+                .contains("bridge=v7")
         );
         let current = serde_json::json!({"event":"ready", "version":PROTOCOL_VERSION});
         let Event::Ready { version } = serde_json::from_value(current).unwrap() else {
@@ -95,6 +95,50 @@ pub fn shm_size_bytes(capacity_samples: u32) -> u64 {
 #[serde(tag = "cmd")]
 #[serde(rename_all = "lowercase")]
 pub enum Cmd {
+    #[serde(rename = "set_now_playing")]
+    SetNowPlaying {
+        slot_id: u64,
+        revision: u64,
+        #[serde(rename = "mediaGeneration")]
+        media_generation: u64,
+        #[serde(
+            rename = "lyricsSidecar",
+            skip_serializing_if = "Option::is_none",
+            default
+        )]
+        lyrics_sidecar: Option<String>,
+        #[serde(
+            rename = "lyricsEmbedded",
+            skip_serializing_if = "Option::is_none",
+            default
+        )]
+        lyrics_embedded: Option<String>,
+        #[serde(
+            rename = "durationSeconds",
+            skip_serializing_if = "Option::is_none",
+            default
+        )]
+        duration_seconds: Option<f64>,
+        title: String,
+        album: String,
+        artist: String,
+        artwork: String,
+        #[serde(rename = "artworkMimeType")]
+        artwork_mime_type: String,
+    },
+    #[serde(rename = "set_playback_position")]
+    SetPlaybackPosition {
+        slot_id: u64,
+        #[serde(rename = "mediaGeneration")]
+        media_generation: u64,
+        available: u32,
+        playing: u32,
+        #[serde(rename = "positionSeconds")]
+        position_seconds: f64,
+        rate: f64,
+        #[serde(rename = "hostTimeNanoseconds")]
+        host_time_ns: u64,
+    },
     Hello {
         version: u32,
     },

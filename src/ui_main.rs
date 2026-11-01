@@ -79,14 +79,24 @@ pub(crate) fn ratingnav649_pointer_open_for_test(
     idx: usize,
     simultaneous_secondary_release: bool,
 ) -> Option<AddressBarNav> {
+    ratingnav649_pointer_clicks_for_test(app, idx, 2, simultaneous_secondary_release)
+}
+
+#[cfg(test)]
+pub(crate) fn ratingnav649_pointer_clicks_for_test(
+    app: &mut App,
+    idx: usize,
+    primary_clicks: usize,
+    simultaneous_secondary_release: bool,
+) -> Option<AddressBarNav> {
+    assert!((1..=2).contains(&primary_clicks));
     let ctx = egui::Context::default();
     let rect = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(120.0, 120.0));
     let pos = rect.center();
     let mut nav = None;
-    for (frame, pressed) in [None, Some(true), Some(false), Some(true), Some(false)]
-        .into_iter()
-        .enumerate()
-    {
+    let last_frame = primary_clicks * 2;
+    for frame in 0..=last_frame {
+        let pressed = (frame > 0).then_some(frame % 2 == 1);
         let mut events = vec![egui::Event::PointerMoved(pos)];
         if let Some(pressed) = pressed {
             events.push(egui::Event::PointerButton {
@@ -96,7 +106,7 @@ pub(crate) fn ratingnav649_pointer_open_for_test(
                 modifiers: egui::Modifiers::NONE,
             });
         }
-        if frame == 4 && simultaneous_secondary_release {
+        if frame == last_frame && simultaneous_secondary_release {
             for pressed in [true, false] {
                 events.push(egui::Event::PointerButton {
                     pos,
@@ -160,7 +170,7 @@ pub(crate) fn ratingnav649_pointer_open_for_test(
                 },
             )
             .drop_without_applying_deltas();
-        if frame < 4 {
+        if frame < last_frame {
             assert!(nav.is_none(), "selection/press alone must not open");
         }
     }

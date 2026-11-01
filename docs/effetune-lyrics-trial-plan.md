@@ -1,6 +1,17 @@
 # 音響調整の歌詞連携 試作計画 (EffeTune Mixwright Lyrics)
 
-状態: **第 6 版。独立設計レビュー 6 回目で ACCEPT (§10)。実装未着手**。2026-10-17。
+> **v5 統合時の追記 (2026-11-02)**: 以下は旧 Mixwright 試作時の設計・検証履歴を含む。
+> `v5-integration` は mIV Sound の名称・bundle・専用保存先を維持する。
+> `build-dev.ps1 -EffetuneBundle` の差し替え先も `mIV Sound.vst3` とし、旧 Mixwright bundle は拒否する。
+> 引数は `-MivSoundCandidate` と併用できず、ビルドには既存の mIV Sound notice 入力が別途必要。
+> raw bundle の配置は承認や ctest 成功を意味せず、配布用の検査も変更しない。
+> host の展開名は標準の `mimageviewer-vst3-host.exe` を維持する。旧試作の basename 分離を
+> 共通hostへ適用するとユーザーVSTのWebView保存先が変わるため採用せず、音響調整側は既存の
+> `BridgePurpose` / `MIV_SOUND_DATA_DIR` で分離する。
+> 歌詞を受け取るプラグイン側の変更は別リポジトリであり、このmergeだけではmIV Soundへ入らない。
+> 最新の統合結果と候補版の残作業は [v5 統合記録 §4](v5-integration.md#4-effetune-lyrics-trial-の取り込み2026-11-02) を参照。
+
+状態: **第 6 版。独立設計レビュー 6 回目で ACCEPT (§10)。T2 実装・指定検証完了、ClaudeCode レビュー/T3 待ち (§11)。追加の通常全体 gate は release 素材不足で未完了**。2026-10-17。
 目的は製品化ではなく、**作者 (Frieve-A) へ相談する前に、ホストから歌詞と再生位置を渡す方式が
 実際に噛み合うかを、動く試作で確かめること**。試作は配布しない。
 Coordinator は ClaudeCode。実装は Codex (mIV 側・Mixwright 側とも)。
@@ -592,3 +603,199 @@ ClaudeCode が正しいと判断し、第 6 版で連番と全フィールドの
 
 対象は第 6 版 (ae83082ac)。**指摘なし、判定 ACCEPT**。前回のメモリ順序の指摘は解消し、RT 専用の採取値・serial の一致条件・
 E から外せる範囲の限定も維持されていると確認された。「これまでの全指摘は設計上閉じており、試作の実装に進める」との判断。
+
+## 11. 実装記録 (T2、2026-10-17)
+
+対象は `effetune-lyrics-trial` の未コミット差分。Mixwright 側、公開文書、配布用バンドル検査は変更しない。
+製品バイナリの起動とコミットは行わない。T3 の確認用 build は ClaudeCode が担当するため本作業では省略する。
+
+### 11.1 所有・補完・位置
+
+- Now Playing の snapshot に曲の世代を持たせ、Local/Remote の新しい採用と現 owner の clear で進める。
+  同じ owner/media の metadata・画像・歌詞補完は revision だけを進める。A→B→A は別世代。
+  `NowPlayingInput` は同じ player から clone した clock/AudioDiagnostics を含み、所有者の state の中で一緒に保持する。
+  Remote の採用境界で埋め込み歌詞と Local source を除き、worker も sidecar 歌詞を読まない。
+- 既存の画像 worker の一つの job で画像と sidecar 歌詞を独立に取得する。画像なし/画像失敗でも歌詞を公開し、
+  歌詞の失敗でも画像を公開する。取消、revision の照合、latest pending 一件、text の先行送信を維持する。
+  sidecar 探索/metadata/file read は worker だけ。LRC の解析・優先選択は mIV に実装しない。
+- host-control worker が Local source のある間だけ 200 ms ごとに読み、20 ms 差・再生/速度変更・1秒再送で送る。
+  新世代/Empty/Remote は `available=0` を即送信。Local source がなければ channel の recv で待つ。
+  UI の frame 処理・repaint は追加しない。Windows QPC を u128 の整数計算で ns に変換する。
+- D 用 atomics は RT callback の既存 lead 計算箇所だけが書く。連番と全値を SeqCst で公開し、
+  読取りは一度だけ、途中更新は捨てる。既存 clear 経路から専用採取値を変更しない。
+- protocol v8。C++ は任意の NowPlaying 属性を受け、位置を独立 latest mailbox から GUI thread へ通知する。
+  既存の mailbox/registry を型で共用し、両 lane の watchdog・GUI 同期待ち・Closed 中の Running 寿命を維持する。
+  wire の available/playing は既存 GUI 命令と同じ JSON 数値 0/1、VST3 では契約どおり setInt。
+  任意属性は欠落時に省略する (C++ は null も未設定として受理)。属性名・型・意味の契約変更はない。
+
+### 11.2 FFmpeg・バンドル・E 記録の確認
+
+- PATH の ffmpeg で `-metadata lyrics=...` の MP3/M4A、`-metadata LYRICS=...` の FLAC を生成した。
+  ファイル中に MP3 の USLT、FLAC の LYRICS、M4A の `©lyr` を確認。
+  PATH の ffprobe は MP3/M4A を `lyrics`、FLAC を `LYRICS` として返した。
+  `lyrics-eng` を ffmpeg の書込みキーにすると USLT ではなく別タグになるため、素材生成には `lyrics` を使う。
+  mIV の linked FFmpeg も MP3/M4A は `lyrics`、FLAC は `LYRICS` だった。
+  生成した各形式の時刻付き/時刻なし計6素材で、読取りと VideoInfo への掲載を回帰テストで確認した。
+  証拠は `target/lyrics-trial/lyrics-tests.log` (実際の dictionary key と ffprobe JSON を掲載)。
+- 開発 core の直接起動: `resolve_bundle_at` は loose な exe 隣の `effetune/EffeTune Mixwright.vst3` を受け、
+  directory/reparse の検査と CPU 条件を確認するが、全ファイル hash は検査しない。
+  配布の source manifest 検査と launcher の hash 検査は別経路で、そのまま維持した。
+  試作 `build-dev.ps1 -EffetuneBundle <bundle-directory>` は dev-runtime にだけ全体コピーする。
+  host は展開時の basename だけ `mimageviewer-vst3-host-lyrics-trial.exe` へ変更し、埋込み元・CMake 名・identity は変更しない。
+- E の経路をコードで確認: `Bridge::spawn_with_gui_signal_wake` の bridge-stderr-pump は stderr を行ごとに
+  callback へ渡し、`DspBridge::add_plugin` の callback が `[vst3-bridge] {line}` として `logger::log` へ送る。
+  main logger の通常 sink は `logs/mimageviewer.log`。`[miv-lyrics-trial]` の行頭による除外やフィルタはないので、
+  その印を含む plugin stderr も同ファイルに保存される。logger は常時初期化され、旧 `--log` は no-op
+  (`src/lib.rs` の Logger 初期化)。実 plugin の出力/描画は T3 で確認する。
+
+### 11.3 記録の集計と T3 への引継ぎ
+
+`python scripts/analyze-lyrics-trial.py <perf.jsonl> --scenes <scenes.json>`。
+scene は `[{"name":"通常再生","start":10.0,"end":20.0}, ...]` で perf の t (秒) の区間を指定する。
+通常再生・速度変更直後・遅延変化・シーク・DSP 引継ぎ・EOF/ループは T3 の操作記録から区間を与える。
+指定のない行は未分類とし、時計の値だけから場面を診断しない。
+出力は場面ごとの採用数、lead の中央値/p95/絶対値p95/min/max、理由別の除外数。
+デバイス遅延や E の配送/描画遅延を D から推定しない。
+
+T3 は T1 の完成バンドルを `-EffetuneBundle` に指定し、同名 host の WebView 保存領域の分離を確認する。
+mIV は隔離 data-dir と `--perf-log` を指定する。Mixwright の設定/プリセットは DAW と共有のため、
+設定画面を変更せずプリセットを保存しない。取得対象は同じ data-dir の perf jsonl と mimageviewer.log。
+core の通常起動は実 `%APPDATA%\mimageviewer` を使い設定/データを更新し得る。
+確認前にインストール版/常駐版を閉じ、共有 mutex を解放する。試作には `--data-dir` を明示する。
+
+### 11.4 自動検証
+
+検証環境は `MSBUILDDISABLENODEREUSE=1`、`CARGO_NET_OFFLINE=true`。
+Rust の cold native build は並列実行で TurboJPEG が失敗したため、以後 `CARGO_BUILD_JOBS=1` で実行する。
+通常の個人設定・Cargo 設定は変更していない。
+
+| 検証 | 結果 / 証拠 |
+| --- | --- |
+| CMake configure / Release build | 成功。`target/lyrics-trial/cpp-configure.log` / `cpp-build-final.log` |
+| CTest | 全5/5成功 (39.92秒)。最終 ControlCommand variant 整理後の影響する handshake も1/1成功。`cpp-ctest.log` / `cpp-ctest-final.log` |
+| host identity | 現ソース一致 `6f4f609d40fe6b96ef41af393129bbf2235472cd089ea0b3f53fedc8f4b7dbee`。vendor exe SHA256 `a3a3c6ff0798005bc96281692b120e4b1322916987986f011fab8600bc4a59e3` |
+| Python D 集計回帰 | 4/4成功。`python scripts/test_analyze_lyrics_trial.py`。実JSONL/scene引数と空入力exit2も検査。CLI fixtureはworktreeのtarget内に保持 |
+| build-dev stage 回帰 | `powershell -NoProfile -File scripts/test-build-dev-lyrics-trial.ps1` 成功。既定/指定bundle、旧ファイル除去、原本維持、再配置不変、同一/相互包含の拒否を検査 |
+| build-dev 安全性回帰 | `powershell -NoProfile -File scripts/test-build-dev-safety.ps1` 成功 (アプリ/実processは操作しない) |
+| Rust core check | `cargo check -p mimageviewer --bin mimageviewer-core` exit 0 (15.68秒、`target/lyrics-trial/check-final.log`)。初回の可視性4件は修正済み |
+| UI glyph | `python scripts/check_ui_glyphs.py` 成功、危険文字0件 |
+| 独立実装レビュー | GPT-6.1 Sol / xhigh の別コンテキストで静的レビュー。既存host-control回帰の通知レーン混同とstage元/先の包含2件を修正し、再レビューで指摘なし。全件検証で判明したFakeHostのv8追従も追加レビューで指摘なし。検証実行は実装担当が所有 |
+| Rust focused | `scripts/test-focused.ps1 -Path @('src/effetune/now_playing.rs','src/video/audio_diagnostics.rs','src/video/dsp/bridge.rs')` で34/34 + 10/10 + 19/19、計63/63成功。`target/lyrics-trial/focused-r2.log` |
+| 歌詞追加回帰 | `cargo nextest run -p mimageviewer --lib -E 'test(/lyrics/)' --success-output immediate --no-tests fail --no-fail-fast` 10/10成功 (FFmpeg計6素材を含む)。`lyrics-tests.log` |
+| Rust tester | `cargo test -p vst3-host-tester --bin vst3-host-tester protocol_handshake_rejects_v7_and_accepts_current_ready` 1/1成功、exit 0。`tester.log` |
+| GUI配送回帰 | `cargo nextest run -p mimageviewer --lib -E 'test(/effetune_auto_open\|effetune_taskbar/)' --no-tests fail --no-fail-fast` 20/20成功、exit 0。`delivery-regression.log` |
+| 本体lib全件 | `powershell -NoProfile -File scripts/test-lib-full.ps1` 13,307/13,307成功、59 skip、exit 0 (nextest 339.125秒)。`lib-full-r2.log`。台帳 `target/test-lib-full/3725c129978ef60d437a4890ea2fd5a4b4fa3e084354d1a15840ecabd877fc20.json` |
+| 通常全体gate | `powershell -NoProfile -File scripts/test-full.ps1 -SuppressCrashDialogs` は exit 101。launcher用release素材3本がないためbuild段階で終了、テスト未実行。`test-full.log` / `test-full-result.json` |
+| workspace (launcher以外) | `cargo nextest run --workspace --exclude mimageviewer-launcher --features pack-build-tools` に下記共通引数を付与。14,563/14,563成功、62 skip、exit 0 (nextest 426.306秒)。`workspace-except-launcher.log` |
+| doc検査 (launcher以外) | `cargo test --workspace --exclude mimageviewer-launcher --features pack-build-tools --doc --no-fail-fast` exit 0。実行0件、既存ignore3件であり実行テスト成功数には含めない。`doctest-except-launcher.log` |
+| vendor egui | `cargo nextest run --manifest-path vendor/egui/Cargo.toml --lib` + 共通引数、25/25成功、exit 0。`vendor-egui.log` |
+| vendor egui-winit | `cargo nextest run -p egui-winit --lib` + 共通引数、29/29成功、exit 0。`vendor-egui-winit.log` |
+| vendor egui-wgpu | `cargo nextest run --manifest-path vendor/egui-wgpu/Cargo.toml --features winit --lib` + 共通引数、11/11成功、exit 0。`vendor-egui-wgpu.log` |
+| vendor eframe | `cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu --lib` + 共通引数、18/18成功、exit 0。`vendor-eframe.log` |
+| 最終整形/差分検査 | `cargo fmt` (引数なし) / `cargo fmt --check` / `git diff --check` すべて exit 0。Rust整形後の追加差分なし。HEADは開始時の `2d75d0c41`、コミットなし |
+| 独立コードレビューP3: 所有交代回帰 | `cargo nextest run -p mimageviewer --lib -E 'test(/lyrics_sender_owner_lifecycle_and_fake_clock/)'` 1/1成功、exit 0。基点 `e2a54a47a` 後の未コミット差分。`p3-owner-test-r2.log` |
+| 独立コードレビューP3: focused | `.\scripts\test-focused.ps1 -Path @('src/effetune/now_playing/position.rs','src/effetune/now_playing.rs')` 3/3 + 34/34成功、exit 0 (3件は重複)。`p3-focused-r2.log` / `p3-verification-r2.json` |
+| 独立コードレビューP3: 整形/差分検査 | `cargo fmt` (引数なし) / `cargo fmt --check` / `git diff --check` すべてexit 0。変更2ファイル、HEAD `e2a54a47a` のまま、コミット/製品起動なし |
+
+追加nextest検証の共通引数は `--config-file .config/nextest.toml --profile default --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --no-tests fail`。
+完全なargv・exit・所要時間は `target/lyrics-trial/verification.json` / `verification-r2.json` / `available-gate-result.json`。
+表の短いlog名も同じ `target/lyrics-trial/` 内。初回T2検証後の最終変更は本実装記録だけで、製品/テストの内容は固定していた。
+その後の独立コードレビューP3修正は上表のP3行として別に検証した。環境変数3本は本節冒頭と同じ。
+A/Bに別々のclockとdiagnosticsを与え、A→B→Aの各読取り対象の参照同一性、clock由来の位置、送信世代を照合する。
+Local clear直後の `available=0` と `wait() == None`、その後の読取り/送信なしも検査する。
+Localを再採用して既存のLocal→Remote抑制の検査も維持する。
+diagnosticsの読取り対象もテストから観測するため、既存の読取り注入関数の引数をclockだけからclockとdiagnosticsへ拡張した。
+両者は従来と同じ `PositionSource::Local` から取り出す。所有構造、送信条件/周期、D記録の処理に変更はない。
+
+通常全体gateの不足物は `target/release/mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe`。
+`crates/launcher/build.rs:31-75` がこれらの実在を必須とする。代替/偽のexeを置かず、検査を無効化せずに、
+launcher以外とvendorを個別に検証した。通常gateの完走、launcher test/docは未検証としてT3へ引き継ぐ。
+`build-dev.ps1` のみではこれらrelease素材は生成されない。T2でrelease配布用buildを追加実行したり、製品を起動したりしていない。
+
+最初の test compile の3件 (private helper の修飾漏れ、別moduleの同名VideoInfo fixtureへのfield追加2件) は
+テスト側の修正漏れで、修正後の焦点テストで解消を確認した。別moduleのVideoInfoとupscale実装には最終差分を残していない。
+
+初回lib全件の44失敗は、RAW素材不足37件と、FakeHostが旧固定属性集合をassertして切断したGUI配送7件。
+既存ツリーのRAW素材27件 (360,971,087 bytes) を `tests/raw-samples.json` のhash・サイズと照合し、
+reparse pointを通さず本worktreeのvendorへ実体コピーした (ネットワーク未使用)。
+FakeHostは既存属性/画像/revision検査を維持して任意3属性と必須世代を検査し、位置laneを無応答で受け取る。
+上記の20件と全libの再検証で解消した。証拠 `lib-full.log` / `raw-samples-copy.log` / `delivery-regression.log`。
+
+再buildした host と CRT のツリー外 backup は、本 worktree の書込み範囲外のため ClaudeCode へ引き継ぐ。
+protocol v8 の試作なので通常版のbackupを上書きせず、試作用として別保存すること。
+
+### 11.5 変更ファイル一覧
+
+| ファイル | 要点 |
+| --- | --- |
+| `src/effetune/now_playing.rs` | 所有世代、歌詞/duration snapshot、画像/歌詞の独立補完、Remote抑制、所有/再送回帰 |
+| `src/effetune/now_playing/lyrics.rs` (新規) | worker sidecar探索・1 MiB境界・文字コード・UTF16上限と回帰 |
+| `src/effetune/now_playing/position.rs` (新規) | QPC、host-control上の位置送り手、偽時計/所有lifecycle回帰、D記録 |
+| `src/effetune/now_playing/artwork.rs` | 既存画像テストの入力field追加 |
+| `src/effetune/mod.rs` | host-controlのLocal限定recv_timeout、再登録時の位置再送 |
+| `src/effetune/delivery_tests.rs` | FakeHostのv8属性/位置lane検査。既存GUI観測値とassertは維持 |
+| `src/app.rs` | 採用playerの埋め込み歌詞/duration/clock/diagnosticsをdescriptorへ渡す |
+| `src/video/mod.rs` | 同じplayerのclock/diagnostics accessor、VideoInfo fixture |
+| `src/video/decoder.rs` | workerの埋め込みmetadata読取り、VideoInfo拡張、FFmpeg6素材回帰 |
+| `src/video/audio.rs` | RT専用採取値の公開、早期return時に採取しない回帰 |
+| `src/video/audio_diagnostics.rs` | 専用SeqCst atomics、単回coherent読取り、clear/途中更新回帰 |
+| `src/video/dsp/bridge.rs` | typed Cmd拡張、protocol8、wire順/境界/handshake回帰 |
+| `src/video/dsp/mod.rs` | slot捕捉後にlock外で位置を送信 |
+| `src/video/dsp/extract.rs` | 試作hostの展開basenameと回帰だけ変更 |
+| `crates/vst3-host-tester/src/bridge.rs` | typed Cmd、protocol8、v7拒否回帰を同期 |
+| `crates/vst3-host/include/now_playing.h` | 任意属性/位置parser、型付きlatest mailbox/registryの共用、両laneの寿命/監視 |
+| `crates/vst3-host/include/now_playing_notify.h` | 位置notify宣言 |
+| `crates/vst3-host/include/plugin_loader.h` | 位置GUI配送宣言 |
+| `crates/vst3-host/include/protocol.h` | v8とwire契約説明 |
+| `crates/vst3-host/src/now_playing_notify.cpp` | 契約属性をsetInt/setFloat/setString、共通receiver配送 |
+| `crates/vst3-host/src/plugin_loader.cpp` | 位置GUI task、両mailboxのGUI同期待ち |
+| `crates/vst3-host/src/main.cpp` | readerで位置mailboxへ分岐、型付きwake、seal/register/watchdog |
+| `crates/vst3-host/tests/now_playing.cpp` | 属性型/UTF16/最大frame/世代順逆転/位置mailbox/GUI待機回帰 |
+| `crates/vst3-host/tests/smoke_hello.py` | v8成功とv7拒否 |
+| `scripts/build-dev.ps1` | 試作bundle引数、source/destination重複拒否 (同一/相互包含) |
+| `scripts/test-build-dev-lyrics-trial.ps1` (新規) | 起動なしのbundle配置/原本維持/重複拒否回帰 |
+| `scripts/analyze-lyrics-trial.py` (新規) | D記録の場面別・除外理由別集計 |
+| `scripts/test_analyze_lyrics_trial.py` (新規) | Dの除外/場面/世代/分位点回帰 |
+| 本設計書 | T2実装と確認事実、検証、T3引継ぎ |
+
+## 12. T3 の準備 (2026-10-17、ClaudeCode)
+
+- T1 (Mixwright `miv-lyrics-trial` 3843b96) のビルド済みバンドル
+  `G:\home\effetune-mixwright-trial\build\windows-release\VST3\Release\EffeTune Mixwright.vst3` を
+  `.\scripts\build-dev.ps1 -EffetuneBundle <そのパス>` で dev-runtime に置いた。dev-runtime のバンドルが元と完全に同じこと、
+  JS に P2 の修正 (歌詞用 listener が `telemetryWasHidden` に触れない) が入っていることを確かめた。
+- 試験素材は `python scripts/generate-lyrics-trial-assets.py` で `target/lyrics-trial/assets` に生成した (FFmpeg)。
+  ビープが 2 秒ごとに 50 ms 鳴ること (silencedetect)、埋め込みの歌詞のキー (MP3 / M4A は `lyrics`、FLAC は `LYRICS`) を ffprobe で確かめた。
+- 利用者向けの手順は [effetune-lyrics-trial-smoke.md](effetune-lyrics-trial-smoke.md)。測定用レイアウトの項目名は上流の日本語訳
+  (`external/effetune/js/locales/ja.json5`) から取った。
+- 実機での動作はまだ誰も確かめていない。
+
+## 13. 同期の測定結果 (2026-10-17、ClaudeCode が隔離 data-dir で実行)
+
+利用者の許可を得て、ClaudeCode が確認用ビルドを隔離 data-dir で起動し、音と画面を同じ QPC の時計で記録して比べた。
+道具は `scripts/lyrics-trial-sync/` (WASAPI ループバック録音 `loopback.cpp`、画面の領域を約 6 ms 間隔で記録する `capture.py`、
+ビープの鳴り始めと中央の行の数字の切り替わりを対応付ける `analyze.py`)。測定用レイアウト (§6.2) で `beep-60s.flac` を 1.0 倍で再生した。
+「差」= 数字が切り替わった時刻 − ビープが Windows のミキサーに届いた時刻 (ループバックの QPC)。ミキサーより後の機器の遅れは含まない。
+
+| 条件 | 対応付けた回数 | 差の中央値 | 範囲 |
+| --- | --- | --- | --- |
+| オフセット 0 | 19 | −58 ms (歌詞が早い) | −60〜−40 ms |
+| オフセット ＋0.05 秒 | 18 | ＋0.4 ms | −1〜＋19 ms |
+
+- オフセットを ＋0.05 秒にすると差がほぼ 50 ms 分動いたので、測定の仕組みは働いている。約 3 回に 1 回、＋18 ms 前後の値が出る (画面の更新の都合と考えられる、未検証)。
+- 同じ時間帯の D 記録: 時計と可聴 PTS の差 (lead) は中央値 −0.0002 ms・絶対値 p95 0.72 ms・最大 10 ms (213 行)。
+  E 記録: プラグイン内の往復時間の中央値 0.8 ms (5 秒窓の p95 の最大 22 ms)、描画間隔の中央値 6.1 ms。
+- §6.3 の判断に当てはめると、合う Offset は正 (歌詞が音より早い) で、D・E とも小さい。早さはソフトウェアの配送・描画では説明できず、
+  mIV が cpal に渡してからミキサーに届くまで (WASAPI 共有モードのバッファとエンジン) の遅れと合う向き。ミキサーより後の機器の遅れはこれに加わる。
+- 方式 A のままで、mIV が送る位置に出力側の遅れ (cpal の `OutputCallbackInfo` のタイムスタンプ、または WASAPI の遅延) を含めれば、
+  手動のオフセットなしでミキサーの時点まで合わせられる見込み。機器の遅れ (Bluetooth など) は利用者のオフセットに残る。未実装。
+- 映像も同じ時計で出しているので、mIV の動画でも映像が音より同程度早い可能性がある。映像は表示側の遅れもあるため、ここからは判断できない (未確認)。
+
+### 13.1 測定中に見つかったこと
+
+- **曲を最後まで再生したあと W キーで頭から再生し直すと、Visualizer の曲名・歌詞が戻らない**。最後まで再生すると Local の所有者が clear され
+  (`available=0`、世代 4)、再生し直しても新しい採用 (`PlaybackSuccess`) が起きないので送り直されない (`src/app.rs` の
+  `publish_mounted_local_now_playing`、`adopted_start` と所有者の判定)。この部分は試作で変えておらず、出荷済みの Now Playing にもある挙動と考えられる (実機の確認はこの試作版だけ)。
+- ClaudeCode の操作ミス: 前面化のつもりで computer-use の `open_application` を使い、試作版 core が**引数なし (実 `%APPDATA%\mimageviewer`)** で起動した (PID 40908、18:19:50)。
+  試作 host も単体で 5 回起動した。core は既存の settings.db を読み込み (移行の記録なし)、起動時の控え `settings.db.bak1` (18:19:51) を作り、設定を 3 回保存した。
+  利用者がトレイから終了する。試作 host の展開物 `%APPDATA%\mimageviewer\vst3\hosts\ecdd0b4c…\mimageviewer-vst3-host-lyrics-trial.exe` が実データ側に残る。

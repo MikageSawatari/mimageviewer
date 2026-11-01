@@ -374,3 +374,139 @@ launcher 込み workspace 検査・release build／展開試験を行う。
 今回の変更は launcher／埋め込み構成に依存するため、dev build だけを確認用成果物として渡さない。
 新しい user-runnable release 確認バイナリはこの前提不足により作成していない。
 §2 の検査専用 `target/dev-runtime` も通常 profile の起動確認には使わない。
+
+## 4. effetune-lyrics-trial の取り込み（2026-11-02）
+
+- 作業先は同じ `v5-integration` worktree。取り込み前 HEAD は `8915df78ee47888129d8069dc9b8371d16a1c21f`。
+- MERGE_HEAD / tip は `5b983ad06be798f7400e18c93efa2333af049a26`。
+  件名は `Merge master (v4.8.0) into effetune-lyrics-trial`。
+- 設計担当が開始した4本目のmergeについて、ファイル編集と非対話検証だけを担当。
+  git add / commit / merge / push、製品起動、通常設定の変更、Sound候補の承認は行わない。
+  index の `scripts/build-dev.ps1` は設計担当のaddまで `UU` のままとなる。
+
+### 試作から取り込む内容と範囲
+
+`docs/effetune-lyrics-trial-plan.md` の方式Aを取り込む。埋め込み歌詞をdecoder workerで取得し、
+既存の画像補完workerで同名 `.lrc` を独立に取得する。Now Playingは曲の世代・歌詞本文・長さを持ち、
+画像がない曲でも歌詞の補完を公開する。Localのclock/diagnosticsを同じ所有状態に保持し、
+host-control workerから世代付きの再生位置・停止/再生・速度・QPC時刻を通知する。
+Remoteは歌詞/位置なしとし、clear・所有交代・再登録を既存配送境界で扱う。
+
+Rust/C++/testerをprotocol v8に揃え、C++はNow PlayingとPlaybackPositionを別の有界mailboxで配送する。
+音声callbackには時刻差の採取を追加し、待ち・ログ出力は追加しない。
+分析・素材生成・旧試作の実機手順も保持する。歌詞解析・描画はプラグイン側の責任であり、
+このmergeが持つのはmIV/host側の送信実装。**歌詞を受信・表示するmIV Soundの完成を意味しない**。
+旧Mixwright試作の設計・検証結果は履歴として残し、planとsmoke冒頭に現行v5との差を追記した。
+
+### 衝突と自動merge後の食い違い
+
+| 対象 | 解消内容 |
+| --- | --- |
+| `scripts/build-dev.ps1`（唯一の衝突） | MCP・Remote・EPUB worker・musicvideoを含む5本のbuild/PE検査、process保護、Soundの既定承認入力とcandidate経路を保持。歌詞側のdev限定raw bundle差し替え引数 `-EffetuneBundle` を、現行configの `mIV Sound.vst3` 配置へ統合した。旧Mixwright名とcandidateとの同時指定は拒否し、配布の承認/manifest検査は緩めない。 |
+| `src/video/dsp/extract.rs`（非衝突） | 旧試作の `-lyrics-trial.exe` への改名を共通hostへ持ち込むと、ユーザーVSTのCHOC WebView保存先まで変わる。標準basenameを保持し、音響調整の分離は既存の `BridgePurpose` / `MIV_SOUND_DATA_DIR` を使う。対応する既存抽出テストも標準名を検査する。 |
+| `scripts/test-build-dev-lyrics-trial.ps1` | 旧vendor/bundle固定fixtureを現行Sound configへ更新。既定承認gateとraw manifest照合、実candidate reader/stager、試作差し替え、stale pointerを含む全container置換、入力原本・再配置不変、相互包含・旧名・同時指定の拒否を検査する。fixtureはtarget内の合成データで、承認候補としては使わない。 |
+| `src/app/list_order_ratingnav649_tests.rs` / `src/ui_main.rs`（全件検証で発見、test-only） | §1.680のactivation後の入力消費に対して旧positive controlが残っていた。現在のmasterの修正 `e56021968b60d366db57d9b10928688a89f8ad22` のtest/helper hunkだけを再利用。1クリック＋secondaryではmenuあり・open受付0、通常double-clickではnavあり・受付1・menuなし、Smartの既存assertを維持する。歌詞mergeによる製品退行ではなく、`611fdfb95` 後のテスト前提の不整合。製品の入力処理・MCP等は変更しない。 |
+
+`-EffetuneBundle` は既定の承認noticeが揃った開発環境で、移植済みのmIV Sound試作bundleを指定するための入口。
+raw入力のPE/名前確認は実装対応・全資産の完全性・ctest成功・承認を証明しない。
+既定の `Assert-MivEffetuneSource` / raw manifest検査、candidateの内容hash検査、releaseの承認gateは維持する。
+旧Mixwright試作をrenameして流用する互換経路は作らない。
+
+hostのmIV Sound窓タイトル・initialize失敗理由の保持・ProcessContextの既存契約は両親と照合して残存を確認。
+歌詞通知追加でこれらを置き換えていない。設定項目・永続schema・migration版番号に新たな選択はない。
+独立レビュー（GPT-6.1 Sol / xhigh、実装と別context、read-only）は上記basenameのP2を検出し、
+修正後の製品コード・build-dev・配置回帰をACCEPT。受信側未移植とnotice前提は残作業として扱う。
+検証追補のtest/helperも同じreviewerが元commitとの一致・既存2クリックの入力列保持・test-only範囲を確認しACCEPT。
+
+### 検証条件と結果
+
+観測者はCodex実装担当。`MSBUILDDISABLENODEREUSE=1`、`CARGO_NET_OFFLINE=true`。
+§2の検査専用Sound入力 `dcdfa79447071cc35bfb0dc81928271650fff543e5257275fe0d8c2812fa6d34`
+をRust検査の `MIV_SOUND_CANDIDATE` に指定。配布入力・承認済みbundle・歌詞受信側の代用とはしない。
+各command/exit/秒は `target/v5-integration/lyrics-*.json`、出力は同名 `.log` に保存する。
+Windowsのerror modeで検証子processのcrash dialogを抑止し、非ゼロ終了は失敗のまま記録する。
+
+| 検査 | 結果／証跡（`lyrics-` prefix） |
+| --- | --- |
+| `cargo fmt` / 最終 `cargo fmt --check` | exit 0 / 0。`fmt`、test-only追補後の `fmt-final`、`fmt-check` のlog/JSON。整形による無関係な変更なし。 |
+| `cargo check -p mimageviewer --lib --tests --features test-script` | exit 0、168.815秒。`check-lib`。後の追加変更は既存masterのtest-only差分で、下記112件のtest compile/runで確認。 |
+| `cargo check --workspace --all-targets` | exit 101、28.835秒。`check-workspace`。launcherの承認済みSound manifest不足で停止。 |
+| 同上 `--exclude mimageviewer-launcher` | exit 0、488.710秒（Cargo lock待ちを含む）。`check-workspace-no-launcher`。通常featureの全targetに型・引数の追加不整合なし。 |
+| CMake configure / Release build | exit 0 / 0、1.392秒 / 20.806秒。`host-configure` / `host-build`。既存exeの流用ではなく、歌詞とSound変更を持つ現ソースを実コンパイル。 |
+| `scripts/vst3-host-identity.ps1 -ValidateRepo .` | exit 0、0.753秒。`host-identity`。source identity `194ddc8da9ed51416f828db49508429a3b156b55f797011cfe0cbf27d3f888fc`。 |
+| host CTest | exit 0、5/5成功、40.946秒。`host-ctest`。通知・headless mailbox・protocol v8・GUI境界・pathのfixtureを確認。製品UIや実プラグインの起動ではない。 |
+| 関連nextest（`test-script`） | exit 0、628/628成功、15,408 skip、実行64.533秒（compile込み398.728秒）。`focused`、`focused-junit.xml`。歌詞・音響調整・音声/DSP・decoder・settings_transfer・preferencesを含む。 |
+| `scripts/test-lib-full.ps1 -Features test-script`（指定の1回） | exit 100、15,965実行／15,962成功／3失敗／71 skip。nextest763.145秒、wrapper1034.428秒。`lib-full`。run `fe26844e-dd56-4983-a56d-ce7188e20e66`、完全なJUnit/logは `target/test-lib-full/runs/20261101T154623294Z-ef8030c2/`。成功台帳は作られず、full PASSとはしない。 |
+| 上記で発見した入力テスト修正の関連nextest | 112/112成功、15,924 skip、106.672秒。`ordered-input.log` / `ordered-input-junit.xml` / `ordered-input-observed.json`、run `effb24aa-6503-42f9-bd00-cf353acc9c32`。ratingnav649、§1.680、共有helperを使う履歴親経路、§1.679を検査。テスト成功後のXMLコピーがdisk fullで失敗し記録helperはexit 1。元の完全なJUnitを回収・照合した。test成功と記録helperの失敗を混同しない。 |
+| 同じhelperの表示読込consumer（§1.674） | exit 0、1/1成功、実行12.857秒（compile込み15.700秒）。`ordered-input-display` / 同JUnit。PDF/通常画像・縦/横連結・animation有無の同じhandlerを確認。 |
+| `cargo test --test ui_snapshot` 再実行 | exit 0、228/228成功、実行36.21秒（compile込み79.851秒）。`ui-snapshot-r2`。§1.175の例外停止なし、未完了テストの補完不要、基準PNGの変更なし。 |
+| 各crateのnextest（本体/launcher除外） | exit 100、1,550実行／1,548成功／2失敗／5 skip、38 binaries。実行122.869秒（compile込み345.235秒）。`crates-r2` / 同JUnit、run `323d14b4-6d44-486c-9612-f9f69a17dc8b`。VST3 tester・MCP/IPC・musicvideo等を含む。失敗2件は下記named pipeの既知制約で、その他は全成功。 |
+| 各crateのdoctest（同じ2packageを除外） | exit 0、176.940秒。`crates-doc-r2`。実行0件で、実行テストの成功数には加えない。 |
+| `scripts/test-full.ps1 -SuppressCrashDialogs` | exit 101、190.154秒。`full-gate`。launcherの同じ承認manifest不足によりcompile準備で停止。テスト実行／vendor／doctestへ未到達。 |
+| Python分析回帰 / 配置回帰 / dev安全性 / UI glyph | 全てexit 0。Python4/4、Sound配置3経路のfixture成功、process操作をmockしたdev安全性成功、危険glyph 0。`python-analyzer` / `staging` / `dev-safety` / `glyphs`。 |
+
+再作成したhostは1,228,800 bytes、SHA-256
+`c348d193cfdbde1005db84e045472ef002a58560fde13318c345d848a777242f`。
+`host-artifact.json` に保存した。最終JUnitの件数・失敗名は `final-results.json` に集約し、
+取り込み差分37ファイルの最終SHA-256は `source-hashes-final.json` に保存。
+marker残存0、`git diff --check` exit 0、HEAD/MERGE_HEADは開始時のままと確認した。
+本体全件の後のRust変更は上記master由来のtest-only 2ファイルだけで、112件＋共有consumer1件の追加検証を適用する。
+
+本体全件の失敗は次の3件に限定された。
+`agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry` と
+`agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers` はnamed pipe作成時のWin32 error 5
+（`src/agent_ipc/pipe.rs:334` / `tests.rs:471`）。サンドボックス外では通るという設計担当の既知報告と
+一致するが、本作業では外側で再実行していない。残るratingnav649の旧positive controlは上記のtest-only差分で修正し、
+関連112件を再検証した。本体全件の再実行は行わず、元の失敗結果と修正後の結果を分けて保存する。
+§1.668 / §1.677 / §1.679 / §1.680、設定分類/転送、MCP/AI連携の本体回帰も全件選択に含む。
+既存ignoredは実行せず、skipを成功数へ加えていない。
+
+crate側の2失敗は `mimageviewer-mcp` の
+`pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked` と
+`pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld`。
+どちらも `crates/mcp-server/src/pipe.rs:499` で `raw_os_error=Some(5)`、named pipe clientのopenが拒否された。
+本体側の同じ制約2件と分けて数え、テストのignore化や期待変更は行っていない。
+
+検証途中の容量不足も区別する。最初の `cargo test --test ui_snapshot` はlink時の
+`LLVM ERROR: IO failure on output stream: no space on device` でexit 101、136.820秒、テスト未実行。
+各crateの初回nextestはcompile中にrustcの `STATUS_ACCESS_VIOLATION`（local-adjust-core）で停止し、
+記録helperのXMLコピーもdisk fullで失敗。doctest初回もos error 112 / no spaceでexit 101、7.741秒、未実行だった。
+これらはテスト本体の失敗や§1.175の実行時例外には数えない。
+
+未使用の `target/dev-runtime/incremental` と、古い `target/debug/incremental/mimageviewer-18cy3t3jl6zg2` を
+reparse point 0と確認してNTFS圧縮（ファイル内容保持、削除0）した。
+元の論理サイズは12,497,901,995 / 9,305,070,547 bytes、圧縮後の記憶量は8,528,831,127 / 5,521,649,664 bytes。
+空きは観測最少735,211,520 bytesから7,392,731,136 bytesへ回復。
+最初に試みたcache削除は実行ポリシーで拒否され、実行していない。
+`cache-*-preflight.json`、`cache-dev-compress-summary.txt`、`cache-debug-compress.log`（UTF-16）、`cache-space.json`に記録。
+追加のcompileの容量も確保するため、同じprofile内のcache `mimageviewer-0jv6ymp3zjw02` と、
+検証済みlib-testのcache `mimageviewer-3fzmlkzbrfl24` にも同じ検査後の圧縮を行った。
+論理サイズ5,799,159,703 / 9,651,075,440 bytesは保持し、記憶量3,774,144,512 / 5,719,871,488 bytesへ縮小。
+`cache-debug-{extra,test}-preflight.json` / 同 `compress.log`（UTF-16）に記録する。exe/DLL・検証記録・data directoryは圧縮/削除対象外。
+不足を解消した再実行は `CARGO_BUILD_JOBS=2` とし、global設定・期限・テスト期待・golden画像は変更しない。
+
+### 候補版を作るために残っていること
+
+1. **歌詞受信側の移植**: `G:\home\miv-sound` のpluginソースには、今回送る `lyricsSidecar` /
+   `EffeTune.PlaybackPosition` の受信がまだない。旧 `effetune-mixwright-trial` の変更を、
+   mIV Soundの名称・ID・専用保存先・現行ProcessContextと両立する形で別リポジトリへ移植・レビュー・検証する。
+   本worktreeのmergeだけで歌詞を表示できる候補とはしない。
+2. **正式なSound候補**: §2のビルド環境制約を解消し、同じ候補に結び付いた完全なctest証拠を作る。
+   利用者の明示承認後に `vendor/miv-sound/VERSION`、bundle、notice、承認manifest/provenanceを揃える。
+   検査専用snapshotを承認扱いにしたり、配布入力へコピーしたりしない。
+3. **release入力と残りのgate**: 正式入力を使ってcore→Remote→EPUB→MCP→editor→launcherの順で
+   release buildを行い、launcher込みworkspaceの型検査・全体gate・埋め込み/展開検査を完走する。
+   v5候補版の版番号・更新履歴・同梱文書も設計担当/公開担当が確定する（本mergeでは4.10.2を変更しない）。
+   今回は変更したVST3 bridgeを含むため、dev buildだけを確認成果物として渡さない。
+   正式入力が未配置のため、本作業では新しいuser-runnable release確認バイナリを作成していない。
+   検証後のG:空き容量は約0.97 GBまで減っているため、release build前に未使用build cache等を整理して容量を確保する。
+   本作業ではcache削除が実行ポリシーで拒否され、上記の内容保持の圧縮まで行った。
+4. **候補版の受入**: SoundのF3/F4等の未完了範囲、musicvideoのGUI受入、MCPとの共存を設計担当が整理する。
+   手元/サブPC用の使い捨てデータで、歌詞の停止・seek・速度・曲切替・Remote抑制、
+   ユーザーVSTの既存WebViewデータ、Sound窓タイトル・initializeエラー、masterの関連UIを確認する。
+   実アプリ試験は別途具体的なsuiteの明示承認後とし、今回の自動検証では未実施。
+5. **引き渡し**: 設計担当がdiffを確認してgit add / merge commitを行う。masterへは統合しない。
+   再ビルドしたhost exe＋CRTのツリー外backupも、書き込み範囲外のため設計担当へ引き継ぐ。
+
+同じ設定/UI/永続形式の衝突に関する判断待ちはない。旧歌詞受信実装をどのmIV Sound候補へ
+取り込むか、正式承認と実機受入はこのmergeのファイル解消とは別の未完了事項である。

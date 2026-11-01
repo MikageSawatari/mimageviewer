@@ -1610,6 +1610,21 @@ impl DspBridge {
         host.send(&snapshot.command(slot_id))
     }
 
+    pub(crate) fn send_playback_position(&self, mut command: bridge::Cmd) -> std::io::Result<()> {
+        let (host, real_slot) = {
+            let inner = self.inner.lock().unwrap();
+            let slot = inner.slots.first().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, "no EffeTune slot")
+            })?;
+            (Arc::clone(&slot.bridge), slot.slot_id)
+        };
+        let bridge::Cmd::SetPlaybackPosition { slot_id, .. } = &mut command else {
+            unreachable!("position command");
+        };
+        *slot_id = real_slot;
+        host.send(&command)
+    }
+
     /// Request the first loaded plugin's state without occupying the normal
     /// bridge event channel. The receiver may be waited on by a worker.
     pub fn query_first_state_concurrent(

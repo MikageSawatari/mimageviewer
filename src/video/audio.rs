@@ -3972,6 +3972,7 @@ fn fill_output(
         // 効いた場合の差分を検出する。**大ジャンプ専用 atomic** に書くのは
         // `should_record_pts_jump` 閾値判定で true のときだけ (= 通常の小さい更新は
         // pump が読む前に上書きされない)。
+        let lyrics_trial_serial_before = clock.current_seek_serial();
         let prev_now = clock.now_secs();
         let requested = pts_for_video;
         if latency_jumped {
@@ -3998,6 +3999,14 @@ fn fill_output(
         // 旧版だと wall extrapolation 分で通常時にも +10ms 程度の偽 lead が見えた。
         // 新版は通常時 ≈ 0、Norm 経路バグ時のみ +5000ms 級が表示される。
         let post_apply_lead_ms = (requested - after_now) * 1000.0;
+        // 試作 D 記録: the consumed PCM serial distinguishes a seek after the admission check.
+        diagnostics.lyrics_trial_lead.record(
+            post_apply_lead_ms,
+            pump_serial,
+            lyrics_trial_serial_before,
+            clock.current_seek_serial(),
+            diagnostics.wall_ns_now(),
+        );
         diagnostics
             .audio_audible_pts_bits
             .store(requested.to_bits(), Ordering::Release);
@@ -6401,6 +6410,29 @@ mod tests {
             buf.lock().unwrap().processed.is_empty(),
             "Playing: processed chunk should be consumed"
         );
+    }
+
+    #[test]
+    fn lyrics_trial_lead_only_advances_when_callback_updates_clock() {
+        let buf = make_buffer(48_000);
+        let clock = make_clock();
+        let diagnostics = make_diag();
+        let state = Arc::new(AtomicU8::new(state_code::PAUSED));
+        let mut out = [0.0; 480];
+        fill_output(&mut out, &buf, &clock, &state, &diagnostics, None);
+        assert!(diagnostics.lyrics_trial_lead.read().is_none());
+        {
+            let mut b = buf.lock().unwrap();
+            let samples_per_sec = b.samples_per_sec;
+            b.processed
+                .push_back(make_chunk(vec![0.5; 480], 0.0, samples_per_sec));
+        }
+        state.store(state_code::PLAYING, Ordering::Release);
+        fill_output(&mut out, &buf, &clock, &state, &diagnostics, None);
+        let sample = diagnostics.lyrics_trial_lead.read().unwrap();
+        state.store(state_code::PAUSED, Ordering::Release);
+        fill_output(&mut out, &buf, &clock, &state, &diagnostics, None);
+        assert_eq!(diagnostics.lyrics_trial_lead.read(), Some(sample));
     }
 
     /// PDC pre-target trim: chunk 全体が target 前なら DropAll。

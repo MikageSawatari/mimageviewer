@@ -8,4 +8,8 @@ void notify_now_playing(Steinberg::Vst::IHostApplication* host,
                         Steinberg::FUnknown* component,
                         Steinberg::FUnknown* controller,
                         const NowPlayingSnapshot& snapshot);
+void notify_playback_position(Steinberg::Vst::IHostApplication* host,
+                              Steinberg::FUnknown* component,
+                              Steinberg::FUnknown* controller,
+                              const PlaybackPositionSnapshot& snapshot);
 }

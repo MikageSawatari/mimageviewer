@@ -32962,6 +32962,11 @@ impl App {
             artist: info
                 .and_then(|info| info.artist.as_deref())
                 .map(clone_prefix),
+            lyrics_embedded: info.and_then(|info| info.lyrics_embedded.clone()),
+            duration_seconds: info
+                .map(|info| info.duration_secs)
+                .filter(|value| value.is_finite() && *value > 0.0),
+            position_source: player.now_playing_position_source(),
             artwork,
         }
     }

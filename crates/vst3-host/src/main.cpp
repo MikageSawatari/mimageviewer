@@ -57,6 +57,7 @@
 #include "vcrt_preload.h"
 #include "build_identity.h"
 #include "now_playing.h"
+#include <variant>
 
 namespace miv {
 
@@ -319,11 +320,19 @@ public:
                         std::fprintf(stderr, "[BRIDGE] now_playing rejected invalid payload or unknown/closed slot\n");
                     }
                     std::fflush(stderr);
+                } else if (command == "set_playback_position") {
+                    if (!admit_playback_position_frame(msg, playback_position_, [this](auto mailbox) {
+                        enqueue_playback_position(std::move(mailbox));
+                    })) {
+                        std::fprintf(stderr, "[BRIDGE] playback_position rejected invalid payload or unknown/closed slot\n");
+                    }
+                    std::fflush(stderr);
                 } else {
-                    const uint64_t epoch = command == "open" || command == "close" || command == "shutdown"
-                        ? now_playing_.seal_all() : now_playing_.epoch();
+                    const bool seal = command == "open" || command == "close" || command == "shutdown";
+                    const uint64_t epoch = seal ? now_playing_.seal_all() : now_playing_.epoch();
+                    if (seal) playback_position_.seal_all();
                     std::lock_guard<std::mutex> lk(cmd_mutex_);
-                    cmd_queue_.push_back({std::move(msg), {}, epoch});
+                    cmd_queue_.push_back({std::move(msg), epoch});
                 }
                 cmd_cv_.notify_all();
                 std::string{}.swap(msg); // Do not carry artwork frame capacity into a later generic command.
@@ -331,6 +340,7 @@ public:
             }
             enter_reader_state(BridgeReaderState::Eof);
             now_playing_.seal_all();
+            playback_position_.seal_all();
             // EOF: 親が stdin を閉じた → graceful shutdown
             {
                 std::lock_guard<std::mutex> lk(cmd_mutex_);
@@ -385,14 +395,24 @@ public:
 
 private:
     struct ControlCommand {
-        std::string json;
-        std::shared_ptr<NowPlayingMailbox> now_playing;
+        std::variant<std::string, std::shared_ptr<NowPlayingMailbox>, std::shared_ptr<PlaybackPositionMailbox>> payload;
         uint64_t epoch = 0;
+        std::string name() const {
+            if (const auto* json = std::get_if<std::string>(&payload)) return extract_json_string_field(*json, "cmd");
+            return std::holds_alternative<std::shared_ptr<NowPlayingMailbox>>(payload) ? "set_now_playing" : "set_playback_position";
+        }
     };
     void enqueue_now_playing(std::shared_ptr<NowPlayingMailbox> mailbox) {
         {
             std::lock_guard<std::mutex> lock(cmd_mutex_);
-            cmd_queue_.push_back({{}, std::move(mailbox), 0});
+            cmd_queue_.push_back({std::move(mailbox), 0});
+        }
+        cmd_cv_.notify_all();
+    }
+    void enqueue_playback_position(std::shared_ptr<PlaybackPositionMailbox> mailbox) {
+        {
+            std::lock_guard<std::mutex> lock(cmd_mutex_);
+            cmd_queue_.push_back({std::move(mailbox), 0});
         }
         cmd_cv_.notify_all();
     }
@@ -484,6 +504,10 @@ private:
                 if (mailbox->expired(now)) {
                     terminate_now_playing_timeout(mailbox);
                 }
+            }
+            for (const auto& mailbox : playback_position_.watched()) {
+                notify_active |= mailbox->stats().executing;
+                if (mailbox->expired(now)) terminate_now_playing_timeout(mailbox);
             }
             bool captures_active = false;
             {
@@ -661,26 +685,33 @@ private:
                 }
                 command = std::move(cmd_queue_.front());
                 cmd_queue_.pop_front();
-                if (extract_string_field(command.json, "cmd") == "notify_host_resize") {
+                if (command.name() == "notify_host_resize") {
                     while (!cmd_queue_.empty() &&
-                           extract_string_field(cmd_queue_.front().json, "cmd") == "notify_host_resize") {
+                           cmd_queue_.front().name() == "notify_host_resize") {
                         command = std::move(cmd_queue_.front());
                         cmd_queue_.pop_front();
                     }
                 }
             }
-            set_current_cmd(command.now_playing ? "set_now_playing" : extract_string_field(command.json, "cmd"));
+            set_current_cmd(command.name());
             enter_main_state(BridgeMainState::ProcessingCmd);
             bool keep_running = true;
-            if (command.now_playing) {
-                auto mailbox = command.now_playing;
+            if (auto* owner = std::get_if<std::shared_ptr<NowPlayingMailbox>>(&command.payload)) {
+                auto mailbox = *owner;
                 if (mailbox->stats().phase != NowPlayingMailbox::Phase::Closed) {
                     if (auto* loader = loader_at(mailbox->slot_id)) {
                         loader->post_now_playing(mailbox, [this](auto next) { enqueue_now_playing(std::move(next)); });
                     } else { mailbox->close(); }
                 }
+            } else if (auto* position_owner = std::get_if<std::shared_ptr<PlaybackPositionMailbox>>(&command.payload)) {
+                auto mailbox = *position_owner;
+                if (mailbox->stats().phase != PlaybackPositionMailbox::Phase::Closed) {
+                    if (auto* loader = loader_at(mailbox->slot_id)) {
+                        loader->post_playback_position(mailbox, [this](auto next) { enqueue_playback_position(std::move(next)); });
+                    } else { mailbox->close(); }
+                }
             } else {
-                keep_running = handle_message(command.json, command.epoch);
+                keep_running = handle_message(std::get<std::string>(command.payload), command.epoch);
             }
             main_cmds_processed_.fetch_add(1, std::memory_order_relaxed);
             set_current_cmd({});
@@ -1341,6 +1372,7 @@ private:
         }
         loader_->set_processing_enabled(false);
         now_playing_.add(0, epoch);
+        playback_position_.add(0, epoch);
 
         std::string reply = "{\"event\":\"loaded\",\"plugin_name\":\"" +
                             json_escape(info.plugin_name) +
@@ -1427,6 +1459,7 @@ private:
             rebuild_chain_snapshot_unlocked();
         }
         now_playing_.add(slot_id, epoch);
+        playback_position_.add(slot_id, epoch);
         std::string reply = "{\"event\":\"loaded\",\"plugin_name\":\"" +
                             json_escape(info.plugin_name) +
                             "\",\"slot_id\":" + std::to_string(slot_id) +
@@ -1941,6 +1974,7 @@ private:
     std::condition_variable cmd_cv_;
     std::deque<ControlCommand> cmd_queue_;
     NowPlayingRegistry now_playing_;
+    PlaybackPositionRegistry playback_position_;
     std::atomic<bool> running_{false};
 
     // watchdog diagnostics for bridge main/reader stalls

@@ -599,7 +599,10 @@ fn ratingnav649_smart_pointer_consumed_open_does_not_fall_through_to_secondary_c
             std::fs::create_dir(&book).unwrap();
             std::fs::write(book.join("001.png"), png.get_ref()).unwrap();
         }
-        // Positive control: the same composite input reaches the ordinary footer.
+        // Positive control: without activation, the same final-pass primary
+        // release + secondary press/release must reach the context-menu footer.
+        // Since §1.680, activation ends the ordered stream for ordinary opens
+        // as well as Smart opens; an activating double-click is not a control.
         app.load_folder(source.clone());
         app.finish_page_identity_preparation_for_test();
         let idx = app
@@ -608,12 +611,23 @@ fn ratingnav649_smart_pointer_consumed_open_does_not_fall_through_to_secondary_c
             .position(|item| item.container_path() == Some(book.as_path()))
             .unwrap();
         app.selected = Some(idx);
-        assert!(crate::ui_main::ratingnav649_pointer_open_for_test(&mut app, idx, true).is_some());
+        app.take_grid_container_open_accept_count_for_test();
         assert!(
-            app.context_menu_idx.is_some(),
+            crate::ui_main::ratingnav649_pointer_clicks_for_test(&mut app, idx, 1, true).is_none()
+        );
+        assert_eq!(app.take_grid_container_open_accept_count_for_test(), 0);
+        assert_eq!(
+            app.context_menu_idx.as_ref().map(|owner| owner.index),
+            Some(idx),
             "the secondary release is a real context-menu input"
         );
         app.context_menu_idx = None;
+        assert!(crate::ui_main::ratingnav649_pointer_open_for_test(&mut app, idx, true).is_some());
+        assert_eq!(app.take_grid_container_open_accept_count_for_test(), 1);
+        assert!(
+            app.context_menu_idx.is_none(),
+            "ordinary activation must also consume the remaining ordered input"
+        );
         let snapshot = app.list_order.as_ref().unwrap().clone();
         let mut definition = crate::settings::SmartFolderDefinition::new("Smart pointer receipt");
         definition.rules.push(crate::settings::SmartFolderRule::new(

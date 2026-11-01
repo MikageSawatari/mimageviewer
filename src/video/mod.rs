@@ -9121,6 +9121,7 @@ impl VideoPlayer {
             player.native_output = Some(NativeVideoOutput::disconnected_for_test());
         }
         player.info = Some(VideoInfo {
+            lyrics_embedded: None,
             width: 640,
             height: 360,
             duration_secs: 30.0,
@@ -10150,6 +10151,16 @@ impl VideoPlayer {
 
     pub(crate) fn media_identity(&self) -> u64 {
         self.media_identity
+    }
+
+    /// Capture both resources from this player at the Now Playing adoption boundary.
+    pub(crate) fn now_playing_position_source(
+        &self,
+    ) -> crate::effetune::now_playing::PositionSource {
+        crate::effetune::now_playing::PositionSource::Local {
+            clock: Arc::clone(&self.clock),
+            diagnostics: Arc::clone(&self.audio_diagnostics),
+        }
     }
 
     /// Lifetime termination only. App's EOF policy owner decides whether EOF is final:

@@ -1811,6 +1811,8 @@ pub struct VideoInfo {
     pub title: Option<String>,
     pub album: Option<String>,
     pub artist: Option<String>,
+    /// Raw bounded lyric candidate, read on the decode worker.
+    pub lyrics_embedded: Option<String>,
     /// Original webpage URL embedded by external tools (`PURL`,
     /// `webpage_url`, etc.). Only HTTP(S) URLs are surfaced to the UI.
     pub original_url: Option<String>,
@@ -2808,6 +2810,7 @@ fn run_decoder(
         title,
         album,
         artist,
+        lyrics_embedded: read_embedded_lyrics(&input),
         original_url,
         description,
         avg_fps: vi_avg_fps,
@@ -8922,6 +8925,30 @@ fn duration_to_secs(dur: i64) -> f64 {
 
 /// AVFormatContext のグローバル metadata から、与えられたキー候補を順番に試して
 /// 最初に値が取れたもの (空文字でない) を返す。Phase 5.4 の埋め込みメタ抽出用。
+fn read_embedded_lyrics(input: &ffmpeg_the_third::format::context::Input) -> Option<String> {
+    let started = std::time::Instant::now();
+    let result = input
+        .metadata()
+        .iter()
+        .find_map(|(key, value)| {
+            ((key.to_ascii_lowercase().starts_with("lyrics")
+                || key.eq_ignore_ascii_case("UNSYNCEDLYRICS"))
+                && !value.is_empty())
+            .then(|| crate::effetune::now_playing::lyrics::prefix(value).to_owned())
+        })
+        .filter(|text| !text.is_empty());
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "effetune",
+            "lyrics_embedded",
+            None,
+            0,
+            &[("ms", (started.elapsed().as_secs_f64() * 1000.0).into())],
+        );
+    }
+    result
+}
+
 fn read_metadata_value(
     input: &ffmpeg_the_third::format::context::Input,
     keys: &[&str],
@@ -10177,6 +10204,71 @@ mod audio_track_fixture_tests {
         assert_eq!(info.title.as_deref(), Some("Track title"));
         assert_eq!(info.album.as_deref(), Some("Album name"));
         assert_eq!(info.artist.as_deref(), Some("Artist name"));
+    }
+
+    #[test]
+    fn lyrics_ffmpeg_uslt_flac_and_m4a_metadata_keys_and_video_info() {
+        let dir = tempfile::tempdir().unwrap();
+        for (extension, tag, marker) in [
+            ("mp3", "lyrics", b"USLT".as_slice()),
+            ("flac", "LYRICS", b"LYRICS".as_slice()),
+            ("m4a", "lyrics", b"\xa9lyr".as_slice()),
+        ] {
+            for (name, text) in [
+                ("timed", "[00:00.00]trial lyrics"),
+                ("plain", "trial lyrics"),
+            ] {
+                let path = dir.path().join(format!("{name}.{extension}"));
+                let status = std::process::Command::new("ffmpeg")
+                    .args([
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "anullsrc=r=44100:cl=mono",
+                        "-t",
+                        "0.1",
+                        "-metadata",
+                    ])
+                    .arg(format!("{tag}={text}"))
+                    .arg("-y")
+                    .arg(&path)
+                    .status()
+                    .expect("PATH ffmpeg required for lyrics contract test");
+                assert!(status.success());
+                let bytes = std::fs::read(&path).unwrap();
+                assert!(
+                    bytes.windows(marker.len()).any(|bytes| bytes == marker),
+                    "missing native lyrics tag: {extension}"
+                );
+                let probe = std::process::Command::new("ffprobe")
+                    .args(["-v", "error", "-show_entries", "format_tags", "-of", "json"])
+                    .arg(&path)
+                    .output()
+                    .expect("PATH ffprobe required");
+                assert!(probe.status.success());
+                let tags: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+                assert_eq!(tags["format"]["tags"][tag], text);
+                let input = ffmpeg_the_third::format::input(&path).unwrap();
+                let keys: Vec<_> = input
+                    .metadata()
+                    .iter()
+                    .map(|(key, _)| key.to_owned())
+                    .collect();
+                eprintln!(
+                    "lyrics {extension}: linked FFmpeg keys={keys:?}; PATH ffprobe={}",
+                    String::from_utf8_lossy(&probe.stdout)
+                );
+                assert_eq!(super::read_embedded_lyrics(&input).as_deref(), Some(text));
+                drop(input);
+                assert_eq!(
+                    open_fixture_info_path(path).lyrics_embedded.as_deref(),
+                    Some(text)
+                );
+            }
+        }
     }
 
     fn open_fixture_info_path(path: PathBuf) -> VideoInfo {

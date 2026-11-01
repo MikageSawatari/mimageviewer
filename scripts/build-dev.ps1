@@ -32,6 +32,10 @@
 
 [CmdletBinding()]
 param(
+    # Trial (shisaku): stage a complete mIV Sound bundle only in dev-runtime.
+    # Kept under the trial's original argument name; old Mixwright bundles
+    # cannot provide mIV Sound's isolated storage contract.
+    [string] $EffetuneBundle,
     [switch] $TestScript,
     [string] $MivSoundCandidate,
     # Fail when an exact staged development executable is running instead of
@@ -145,6 +149,32 @@ function Copy-IfChanged {
 }
 
 function Copy-EffetuneBundleIfChanged {
+    if ($EffetuneBundle) {
+        if ($MivSoundCandidate) {
+            throw '[build-dev] -EffetuneBundle and -MivSoundCandidate are mutually exclusive'
+        }
+        $source = (Resolve-Path -LiteralPath $EffetuneBundle).Path
+        $destination = Join-Path $outputDir 'effetune'
+        $source = [IO.Path]::GetFullPath($source).TrimEnd('\', '/')
+        $destination = [IO.Path]::GetFullPath($destination).TrimEnd('\', '/')
+        $separator = [IO.Path]::DirectorySeparatorChar
+        if ($source.Equals($destination, [StringComparison]::OrdinalIgnoreCase) -or
+            $source.StartsWith($destination + $separator, [StringComparison]::OrdinalIgnoreCase) -or
+            $destination.StartsWith($source + $separator, [StringComparison]::OrdinalIgnoreCase)) {
+            throw '[build-dev] EffeTune source and destination overlap'
+        }
+        Assert-MivSoundSafeDirectory $source
+        Assert-MivSoundSafeDirectory $destination
+        $plugin = Join-Path $source ('Contents/x86_64-win/' + $MivSound.BUNDLE_NAME)
+        if ((Split-Path $source -Leaf) -cne $MivSound.BUNDLE_NAME -or
+            -not (Test-MivPeFile $plugin)) {
+            throw '[build-dev] Trial override requires a complete mIV Sound.vst3 bundle; old EffeTune Mixwright trials must be ported to mIV Sound first'
+        }
+        if (Test-Path -LiteralPath $destination) { Remove-Item -LiteralPath $destination -Recurse -Force }
+        New-Item -ItemType Directory -Path $destination -Force | Out-Null
+        Copy-Item -LiteralPath $source -Destination $destination -Recurse -Force
+        return
+    }
     if ($MivSoundCandidate) {
         Copy-MivSoundCandidateRuntime -RepoRoot $repoRoot -Candidate $MivSoundCandidate -OutputDir $outputDir
         return
@@ -190,6 +220,10 @@ function Wait-ForOtherNativeBuilds {
 $oldCandidate = $env:MIV_SOUND_CANDIDATE
 Push-Location $repoRoot
 try {
+    # Reject before build/process handling, as well as at the staging boundary.
+    if ($EffetuneBundle -and $MivSoundCandidate) {
+        throw '[build-dev] -EffetuneBundle and -MivSoundCandidate are mutually exclusive'
+    }
     if ($MivSoundCandidate) {
         $null = Read-MivSoundCandidate -RepoRoot $repoRoot -Candidate $MivSoundCandidate
         $env:MIV_SOUND_CANDIDATE = $MivSoundCandidate

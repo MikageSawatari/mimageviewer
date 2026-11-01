@@ -18,6 +18,7 @@
 
 #include "gui_visibility.h"
 #include "gui_frame.h"
+#include "now_playing.h"
 #include "host_app.h"  // PlugFrame, HostApplication, ComponentHandler の完全型
 #include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -27,7 +28,6 @@
 #include "public.sdk/source/vst/hosting/module.h"
 
 namespace miv {
-class NowPlayingMailbox;
 
 class HostApplication;
 class ComponentHandler;
@@ -246,6 +246,8 @@ public:
 
     void post_now_playing(std::shared_ptr<NowPlayingMailbox> mailbox,
                           std::function<void(std::shared_ptr<NowPlayingMailbox>)> wake);
+    void post_playback_position(std::shared_ptr<PlaybackPositionMailbox> mailbox,
+                               std::function<void(std::shared_ptr<PlaybackPositionMailbox>)> wake);
 
     /// プラグイン内部状態をバイト列から復元する (`IComponent::setState`)。
     /// `IEditController::setComponentState` も同期で呼んで UI 表示を合わせる。
