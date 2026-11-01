@@ -6937,6 +6937,8 @@ API適合漏れで、ownerへ実際に模したgeometryを記録する6setupへ�
 
 ### 2026-11-01 §1.679 編集キャンバスの順序付き gesture 入力
 
+**2026-11-01 合意**: 実装後 (`fa11efc6f`、Cancel の終端を共通化した `f54995a4c` を含む) に、設計担当 ClaudeCode と、実装者とは別の独立レビュー担当 (GPT-6.1 Sol / xhigh、ACCEPT・指摘なし) の双方が「症状パッチではなく構造的修正である」ことに同意した。
+
 設計担当 ClaudeCode の実装依頼に従い、Codex が補正 canvas と同型欠陥のある
 消しゴム／隠蔽 canvas の入力境界を共通化する。linked F12 でも既存の編集 dispatch から
 同じ handler を使い、処理中の `ctx` の viewport に届いたイベントだけを消費する。
