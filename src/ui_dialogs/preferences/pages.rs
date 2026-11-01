@@ -36,7 +36,6 @@ pub(super) fn draw_preferences_restore_position_setting(
         "アプリを終了するまで、ページ、スクロール位置、選択項目や折りたたみ状態を覚えます。",
     );
 }
-
 pub(super) fn draw_notification_duration_setting(
     ui: &mut egui::Ui,
     value: &mut crate::settings::NotificationDuration,
@@ -12884,47 +12883,4 @@ mod tests {
             );
         }
     }
-}
-
-/// The anchors live with the other preference pages; the shared pure renderer
-/// also serves the isolated snapshot and input fixtures.
-pub(super) fn page_agent_integration(ui: &mut egui::Ui, state: &mut PreferencesState) {
-    anchored(ui, state, "agent/permission", |ui, state| {
-        let label = ui.label(egui::RichText::new("許可の範囲").strong());
-        super::agent_integration::draw_permission(ui, &mut state.settings).labelled_by(label.id);
-    });
-    anchored(ui, state, "agent/images", |ui, state| {
-        ui.label(egui::RichText::new("縮小画像・撮影位置").strong());
-        super::agent_integration::draw_images(ui, &mut state.settings);
-    });
-    anchored(ui, state, "agent/exposure", |ui, state| {
-        ui.label(egui::RichText::new("AI に見せる範囲").strong());
-        super::agent_integration::draw_exposure(ui, &state.settings, &state.agent_integration);
-    });
-    anchored(ui, state, "agent/recent", |ui, state| {
-        ui.label(egui::RichText::new("最近使った AI アプリ").strong());
-        super::agent_integration::draw_recent(ui, &state.agent_integration);
-    });
-    anchored(ui, state, "agent/changes", |ui, state| {
-        ui.label(egui::RichText::new("AI による変更").strong());
-        super::agent_integration::draw_changes(ui, &state.agent_integration);
-    });
-    anchored(ui, state, "agent/claude", |ui, state| {
-        ui.label(egui::RichText::new("Claude Desktop").strong());
-        super::agent_integration::draw_app(
-            ui,
-            &state.settings,
-            &mut state.agent_integration,
-            crate::agent_registration::AppTarget::ClaudeDesktop,
-        );
-    });
-    anchored(ui, state, "agent/chatgpt", |ui, state| {
-        ui.label(egui::RichText::new("ChatGPT (Codex)").strong());
-        super::agent_integration::draw_app(
-            ui,
-            &state.settings,
-            &mut state.agent_integration,
-            crate::agent_registration::AppTarget::ChatGpt,
-        );
-    });
 }

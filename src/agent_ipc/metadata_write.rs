@@ -324,7 +324,7 @@ fn prepare_rating_with_pdf_sizes(
     }))
 }
 
-fn zip_directory_rating_key(path: &Path, prefix: &str) -> String {
+pub(super) fn zip_directory_rating_key(path: &Path, prefix: &str) -> String {
     crate::adjustment_db::normalize_path(&crate::app::book_container_key(path, prefix))
 }
 

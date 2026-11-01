@@ -30,6 +30,8 @@ mod work;
 use work::*;
 
 #[cfg(test)]
+mod logging_tests;
+#[cfg(test)]
 mod media_read_tests;
 #[cfg(test)]
 mod open_connection_tests;
@@ -79,6 +81,7 @@ impl Server {
                     recent_apps,
                     changes,
                     active: AtomicUsize::new(0),
+                    lane_log: Mutex::new(LaneLog::default()),
                     #[cfg(test)]
                     search_hooks: None,
                     #[cfg(test)]
@@ -116,6 +119,7 @@ struct Handlers {
     recent_apps: SharedRecentApps,
     changes: Arc<changes::ChangeController>,
     active: AtomicUsize,
+    lane_log: Mutex<LaneLog>,
     #[cfg(test)]
     search_hooks: Option<Arc<SearchHooks>>,
     #[cfg(test)]
@@ -148,6 +152,58 @@ struct Reply {
     policy: ReplyPolicy,
 }
 type PermissionGrant = (PermissionSnapshot, u64);
+
+/// Adapter calls use a fresh pipe and handshake, including each idle poll.
+/// Observe server state across those short-lived connections instead of logging
+/// their routine connect/EOF churn. Never retain client strings or read results.
+#[derive(Default)]
+struct LaneLog {
+    hello: Option<Result<(), ErrorCode>>,
+    status: Option<Result<(), ErrorCode>>,
+    permission: Option<Result<PermissionGrant, ErrorCode>>,
+    #[cfg(test)]
+    lines: Vec<String>,
+}
+
+impl LaneLog {
+    fn emit(&mut self, line: String) {
+        #[cfg(test)]
+        self.lines.push(line.clone());
+        crate::logger::log(line);
+    }
+
+    fn permission(&mut self, observed: &Result<PermissionGrant, AgentError>) {
+        let observed = observed.as_ref().copied().map_err(|error| error.code);
+        if self.permission.as_ref() != Some(&observed) {
+            self.permission = Some(observed);
+            self.emit("agent_ipc: state=permission_changed".into());
+        }
+    }
+
+    fn request(
+        &mut self,
+        tool: &'static str,
+        started: Instant,
+        result: &Result<Payload, AgentError>,
+    ) -> bool {
+        let previous = match tool {
+            "hello" => &mut self.hello,
+            "miv_status" => &mut self.status,
+            _ => {
+                self.emit(request_log_line(tool, started, result));
+                return true;
+            }
+        };
+        let observed = result.as_ref().map(|_| ()).map_err(|error| error.code);
+        if previous.as_ref() != Some(&observed) {
+            *previous = Some(observed);
+            self.emit(request_log_line(tool, started, result));
+            return true;
+        }
+        false
+    }
+}
+
 enum ReplyPolicy {
     Read(PermissionGrant),
     Rejected,
@@ -217,8 +273,13 @@ fn cancelled() -> AgentError {
     error(ErrorCode::Cancelled, "取り消しました")
 }
 fn permission() -> Result<PermissionGrant, AgentError> {
-    let (snapshot, epoch) = crate::settings_db::with_db_result(|db| db.load_agent_permission())
-        .map_err(|_| error(ErrorCode::Busy, "設定を読み込めませんでした"))?;
+    enabled_permission(load_permission()?)
+}
+fn load_permission() -> Result<PermissionGrant, AgentError> {
+    crate::settings_db::with_db_result(|db| db.load_agent_permission())
+        .map_err(|_| error(ErrorCode::Busy, "設定を読み込めませんでした"))
+}
+fn enabled_permission((snapshot, epoch): PermissionGrant) -> Result<PermissionGrant, AgentError> {
     if snapshot.level == AgentLevel::Disabled {
         Err(error(ErrorCode::Disabled, "AI 連携 (MCP) は無効です"))
     } else {
@@ -293,7 +354,7 @@ impl Connection {
                 });
                 Payload::Hello { version: *version }
             });
-            record(tool, started, &result);
+            self.record(None, tool, started, &result);
             let _ = replies.send(Reply {
                 response: Response {
                     id: request.id,
@@ -317,7 +378,9 @@ impl Connection {
                 policy: ReplyPolicy::Rejected,
             });
         };
-        let granted = match permission() {
+        let observed = load_permission();
+        self.handlers.lane_log.lock().unwrap().permission(&observed);
+        let granted = match observed.and_then(enabled_permission) {
             Ok(p) => p,
             Err(err) => {
                 reject(err);
@@ -465,7 +528,16 @@ impl Connection {
         started: Instant,
         result: &Result<Payload, AgentError>,
     ) {
-        record(tool, started, result);
+        // Normal and optional perf logging share the polling emission gate.
+        if self
+            .handlers
+            .lane_log
+            .lock()
+            .unwrap()
+            .request(tool, started, result)
+        {
+            record_perf(tool, started, result);
+        }
         if tool != "hello" && tool != "cancel" {
             if let Some(client) = client.filter(|client| client.kind == RequestKind::Tool) {
                 self.handlers
@@ -478,9 +550,8 @@ impl Connection {
     }
 }
 
-fn record(tool: &'static str, started: Instant, result: &Result<Payload, AgentError>) {
+fn record_perf(tool: &'static str, started: Instant, result: &Result<Payload, AgentError>) {
     let (count, error_kind) = result_summary(result);
-    crate::logger::log(request_log_line(tool, started, result));
     if crate::perf::is_enabled() {
         crate::perf::event(
             "agent_ipc",

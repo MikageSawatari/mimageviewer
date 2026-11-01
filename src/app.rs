@@ -16921,6 +16921,8 @@ pub struct App {
 
     // ── 統合環境設定ダイアログ ─────────────────────────────────────
     pub(crate) show_preferences: bool,
+    pub(crate) agent_integration_dialog:
+        Option<crate::ui_dialogs::agent_integration::AgentIntegrationState>,
     pub(crate) diagnostics_export: crate::diagnostics::ExportOwner,
     /// 編集の保存・破棄とは独立した、プロセス内だけの環境設定表示位置。
     pub(crate) preferences_view_position: crate::ui_dialogs::preferences::PreferencesViewPosition,
@@ -20995,6 +20997,7 @@ impl App {
             #[cfg(test)]
             rename_migration_data_dir_override: None,
             show_preferences: false,
+            agent_integration_dialog: None,
             diagnostics_export: crate::diagnostics::ExportOwner::Idle,
             preferences_view_position: Default::default(),
             preferences_right_panel_scroll_sequence: 0,
@@ -99362,6 +99365,7 @@ impl App {
         crate::key_debug::render_overlay(ctx);
         self.show_remote_session_dialog(ctx);
         self.show_remote_connection_dialog(ctx);
+        self.show_agent_integration_dialog(ctx);
         // progress UI の Cancel / Esc と、その後の late-frame items mutation の双方を
         // 確定してから spawn 境界を ACK する。progress より後に積まれた新要求は
         // UI checkpoint 未通過なので次 frame まで ACK されない。

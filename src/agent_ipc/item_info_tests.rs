@@ -672,6 +672,275 @@ fn zip_projection_uses_member_values_and_page_rating_with_separate_container_tag
     assert!(matches!(output.generation, InfoField::Present(_)));
 }
 
+fn corrupt_zip_payload(bytes: &mut [u8], payload: &[u8]) {
+    let offset = bytes
+        .windows(payload.len())
+        .position(|bytes| bytes == payload)
+        .unwrap();
+    bytes[offset] ^= 1;
+}
+
+#[test]
+fn list_folder_zip_books_round_trip_through_item_info_and_rating_preparation() {
+    use crate::agent_ipc::{ReadContext, metadata_write, tests::Fixture};
+    use crate::book_composition::{BookCompositionService, PageDomain};
+    use crate::book_scope::BookScopeKey;
+    use crate::rating_db::RatingItemKind;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let fixture = Fixture::new();
+    let path = fixture._dir.path().join("books.zip");
+    let image = png(&[]);
+    let inner = zip_bytes(&[("page.png", &image), ("chapter3/page.png", &image)]);
+    std::fs::write(
+        &path,
+        zip_bytes(&[
+            ("cover.png", &image),
+            ("chapter2/page.png", &image),
+            ("inner.zip", &inner),
+        ]),
+    )
+    .unwrap();
+    seed_tags(&path, "container-tag");
+    let (service, owner) = BookCompositionService::spawn_at(crate::data_dir::get(), None).unwrap();
+    service
+        .prepare(
+            BookScopeKey::document(fixture._dir.path().join("ready.pdf")).unwrap(),
+            PageDomain::Document,
+        )
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .status
+        .unwrap();
+    fixture.handlers.readers.install_book_composition(service);
+    let ctx = ReadContext::new(
+        &fixture.handlers,
+        permission(false),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let ratings = crate::rating_db::RatingDb::open().unwrap();
+    ratings
+        .set(&crate::adjustment_db::normalize_path(&path), 5)
+        .unwrap();
+    let mut books = Vec::new();
+    for prefix in [None, Some("inner.zip/")] {
+        let Payload::Folder(page) = fixture
+            .handlers
+            .list_folder(
+                path.to_string_lossy().into_owned(),
+                prefix.map(str::to_owned),
+                None,
+                None,
+                &ctx,
+            )
+            .unwrap()
+        else {
+            panic!("expected folder page")
+        };
+        let inputs: Vec<_> = page
+            .items
+            .into_iter()
+            .map(|row| {
+                let PageRow::Value(row) = row else {
+                    panic!("fixture row must fit")
+                };
+                ItemRef {
+                    path: row.path,
+                    subresource: row.subresource,
+                }
+            })
+            .collect();
+        let metadata_write::PreparedWrite::Ratings(prepared) = metadata_write::prepare(
+            Command::SetRating {
+                items: inputs.clone(),
+                stars: 2,
+            },
+            &ctx,
+            "fixture".into(),
+        )
+        .unwrap() else {
+            panic!("expected ratings")
+        };
+        for (input, prepared) in inputs.iter().zip(prepared.items) {
+            let target = prepared.target.unwrap();
+            ratings.set(&target.key, 2).unwrap();
+            let output = read(input, permission(false), &ctx.cancel).unwrap();
+            assert_eq!(output.item, *input);
+            assert_eq!(
+                output.rating, 2,
+                "must read the key prepared for set_rating"
+            );
+            assert_eq!(output.tags, InfoField::NotApplicable);
+            assert_eq!(output.container_tags, ["#container-tag"]);
+            assert_eq!(
+                output.container_size,
+                Some(std::fs::metadata(&path).unwrap().len())
+            );
+            if target.meta.kind == RatingItemKind::ZipDir {
+                let prefix = input.subresource.as_deref().unwrap();
+                let is_archive = crate::zip_tree::segment_is_archive(
+                    crate::grid_item::zipdir_display_name(prefix),
+                );
+                assert_eq!(
+                    target.key,
+                    crate::adjustment_db::normalize_path(&crate::app::book_container_key(
+                        &path, prefix
+                    ),)
+                );
+                assert_eq!(target.meta.dir_prefix.as_deref(), Some(prefix));
+                assert_eq!(target.meta.zipdir_is_archive, Some(is_archive));
+                assert_eq!(
+                    output.kind,
+                    if is_archive {
+                        ItemKind::Archive
+                    } else {
+                        ItemKind::Folder
+                    }
+                );
+                assert_eq!(output.name, crate::grid_item::zipdir_display_name(prefix));
+                assert_eq!(output.size, InfoField::NotApplicable);
+                assert_eq!(output.modified, InfoField::NotApplicable);
+                assert_eq!(output.dimensions, InfoField::NotApplicable);
+                assert_eq!(output.exif, InfoField::NotApplicable);
+                assert_eq!(output.generation, InfoField::NotApplicable);
+                books.push(prefix.to_owned());
+            }
+        }
+    }
+    books.sort();
+    assert_eq!(books, ["chapter2/", "inner.zip/", "inner.zip/chapter3/"]);
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn zip_folder_info_does_not_read_image_or_terminal_nested_zip_payloads() {
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    let path = directory.path().join("unread.zip");
+    let mut image_zip = zip_bytes(&[("chapter2/page.png", b"image-payload")]);
+    corrupt_zip_payload(&mut image_zip, b"image-payload");
+    std::fs::write(&path, image_zip).unwrap();
+    assert!(read_zip(&path, "chapter2/page.png", &AtomicBool::new(false)).is_err());
+    let folder = read(
+        &item(&path, Some("chapter2/")),
+        permission(false),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(folder.kind, ItemKind::Folder);
+    assert_eq!(folder.dimensions, InfoField::NotApplicable);
+
+    let mut terminal = zip_bytes(&[("book.cbz", b"archive-payload")]);
+    corrupt_zip_payload(&mut terminal, b"archive-payload");
+    std::fs::write(&path, &terminal).unwrap();
+    assert!(read_zip(&path, "book.cbz", &AtomicBool::new(false)).is_err());
+    assert_eq!(
+        read(
+            &item(&path, Some("book.cbz/")),
+            permission(false),
+            &AtomicBool::new(false)
+        )
+        .unwrap()
+        .kind,
+        ItemKind::Archive
+    );
+    std::fs::write(&path, zip_bytes(&[("inner.zip", &terminal)])).unwrap();
+    assert!(read_zip(&path, "inner.zip/book.cbz", &AtomicBool::new(false)).is_err());
+    assert_eq!(
+        read(
+            &item(&path, Some("inner.zip/book.cbz/")),
+            permission(false),
+            &AtomicBool::new(false)
+        )
+        .unwrap()
+        .kind,
+        ItemKind::Archive
+    );
+}
+
+#[test]
+fn zip_folder_info_preserves_legacy_rating_without_migration_and_prefers_current() {
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    let path = directory.path().join("legacy-folder.zip");
+    let mut bytes = zip_bytes(&[("xxxx/page.png", b"image")]);
+    let name = encoding_rs::SHIFT_JIS.encode("日本/page.png").0;
+    let offsets: Vec<_> = bytes
+        .windows(13)
+        .enumerate()
+        .filter_map(|(offset, bytes)| (bytes == b"xxxx/page.png").then_some(offset))
+        .collect();
+    for offset in offsets {
+        bytes[offset..offset + 13].copy_from_slice(&name);
+    }
+    let mut archive = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+    let legacy_name = archive.by_index_raw(0).unwrap().name().to_owned();
+    let legacy_prefix = legacy_name.strip_suffix("page.png").unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let old = super::super::metadata_write::zip_directory_rating_key(&path, legacy_prefix);
+    let current = super::super::metadata_write::zip_directory_rating_key(&path, "日本/");
+    let db = crate::rating_db::RatingDb::open().unwrap();
+    db.set(&old, 5).unwrap();
+    let before = std::fs::read(crate::rating_db::RatingDb::db_path()).unwrap();
+    for prefix in ["日本/", legacy_prefix] {
+        let output = read(
+            &item(&path, Some(prefix)),
+            permission(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(output.item.subresource.as_deref(), Some("日本/"));
+        assert_eq!(output.rating, 5);
+    }
+    assert_eq!(
+        std::fs::read(crate::rating_db::RatingDb::db_path()).unwrap(),
+        before
+    );
+    db.set(&current, 2).unwrap();
+    assert_eq!(
+        read(
+            &item(&path, Some("日本/")),
+            permission(false),
+            &AtomicBool::new(false)
+        )
+        .unwrap()
+        .rating,
+        2
+    );
+    assert_eq!(db.get(&old), 5);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn zip_folder_info_rejects_missing_and_invalid_folders_with_existing_bad_request_contract() {
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    let path = directory.path().join("missing-folder.zip");
+    let inner = zip_bytes(&[("page.png", b"image")]);
+    std::fs::write(
+        &path,
+        zip_bytes(&[("chapter2/page.png", b"image"), ("inner.zip", &inner)]),
+    )
+    .unwrap();
+    for prefix in [
+        "missing/",
+        "inner.zip/missing/",
+        "/",
+        "chapter2//",
+        "chapter2/../",
+        "../chapter2/",
+    ] {
+        assert_eq!(
+            read(
+                &item(&path, Some(prefix)),
+                permission(false),
+                &AtomicBool::new(false)
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::BadRequest
+        );
+    }
+}
+
 #[test]
 fn bounded_zip_preserves_literal_nested_and_cp932_name_resolution() {
     let image = png(&[]);

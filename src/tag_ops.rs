@@ -392,7 +392,7 @@ impl App {
                 skipped,
                 ..Default::default()
             },
-            summary: format!("処理中 {queued} 件 / 対象外 {skipped} 件"),
+            summary: format!("タグの変更を受け付けました ({queued} 件)"),
             rows,
             notice: format!("AI からのタグの変更を受け付けました ({queued} 件)"),
         });
@@ -1598,6 +1598,10 @@ mod tests {
             app.book_append_undo_revision, append_revision,
             "acceptance must not invalidate append Undo"
         );
+        assert_eq!(
+            changes.records().lock().unwrap().entries()[0].summary,
+            "タグの変更を受け付けました (1 件)"
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             app.poll_tag_write_results();
@@ -1627,6 +1631,7 @@ mod tests {
         let record = &records.entries()[0];
         assert_eq!(record.counts.changed, 1);
         assert_eq!(record.counts.queued, 0);
+        assert_eq!(record.summary, "タグを変更 (1 件)");
         assert_eq!(record.rows[0].before, "#actual");
         assert!(record.rows[0].after.contains("#actual"));
         assert!(record.rows[0].after.contains("#one"));
@@ -1670,6 +1675,10 @@ mod tests {
                 .counts
                 .unchanged,
             1
+        );
+        assert_eq!(
+            changes.records().lock().unwrap().entries()[0].summary,
+            "タグを変更 (0 件)"
         );
     }
 

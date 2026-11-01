@@ -67,14 +67,7 @@ impl AgentTagChange {
                     record.counts.failed += 1;
                 }
             }
-            record.summary = format!(
-                "変更 {} 件 / 変更なし {} 件 / 処理中 {} 件 / 失敗 {} 件 / 対象外 {} 件",
-                record.counts.changed,
-                record.counts.unchanged,
-                record.counts.queued,
-                record.counts.failed,
-                record.counts.skipped,
-            );
+            record.summary = format!("タグを変更 ({} 件)", record.counts.changed);
         });
     }
 }
@@ -693,7 +686,96 @@ mod tests {
         );
         assert_eq!(record.rows[0].before, "#old");
         assert_eq!(record.rows[0].after, "#new");
+        assert_eq!(record.summary, "タグを変更 (1 件)");
         assert_eq!(records.entries()[0].counts.queued, 1);
+    }
+
+    #[test]
+    fn agent_summary_keeps_counts_and_actual_values_through_partial_and_failed_completion() {
+        use crate::agent_ipc::changes::{
+            ChangeController, ChangeCounts, ChangeRecord, ChangeRow, ChangeRowOutcome,
+            ChangeRowResult,
+        };
+        for tool in ["add_tags", "remove_tags"] {
+            let controller = ChangeController::new();
+            let record_id = controller.publish(ChangeRecord {
+                id: Default::default(),
+                at: std::time::SystemTime::UNIX_EPOCH,
+                client_name: "fixture".into(),
+                tool: tool.into(),
+                collection: None,
+                counts: ChangeCounts {
+                    queued: 3,
+                    skipped: 1,
+                    ..Default::default()
+                },
+                summary: "タグの変更を受け付けました (3 件)".into(),
+                rows: vec![
+                    ChangeRow::default(),
+                    ChangeRow::default(),
+                    ChangeRow::default(),
+                    ChangeRow {
+                        result: ChangeRowResult::Done(ChangeRowOutcome::Text("対象外".into())),
+                        ..Default::default()
+                    },
+                ],
+                notice: String::new(),
+            });
+            let changed_action = if tool == "add_tags" {
+                TagAction::Added
+            } else {
+                TagAction::Removed
+            };
+            for (index, action) in [
+                Ok(changed_action),
+                Ok(TagAction::NoOp),
+                Err("write failed".to_owned()),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let owner = AgentTagChange {
+                    controller: controller.clone(),
+                    record_id,
+                    row_index: index,
+                };
+                owner.complete(&TagWriteResult {
+                    agent: Some(owner.clone()),
+                    path: "fixture.jpg".into(),
+                    tag_sidecar: None,
+                    result: action,
+                    tags_before: vec!["#before".into()],
+                    tags_after: if index == 1 {
+                        vec!["#before".into()]
+                    } else {
+                        vec!["#after".into()]
+                    },
+                    tx_id: 1,
+                });
+                let records = controller.records();
+                let records = records.lock().unwrap();
+                let record = &records.entries()[0];
+                assert_eq!(record.summary, "タグを変更 (1 件)");
+                assert_eq!(record.counts.queued, 2 - index);
+                assert_eq!(record.counts.skipped, 1);
+                assert_eq!(record.counts.total(), 4);
+                assert_eq!(record.rows[index].before, "#before");
+                assert_eq!(
+                    record.rows[index].after,
+                    if index == 0 { "#after" } else { "#before" }
+                );
+            }
+            let records = controller.records();
+            let records = records.lock().unwrap();
+            let record = &records.entries()[0];
+            assert_eq!(record.counts.changed, 1);
+            assert_eq!(record.counts.unchanged, 1);
+            assert_eq!(record.counts.failed, 1);
+            assert_eq!(
+                record.rows[2].result,
+                ChangeRowResult::Failed("write failed".into())
+            );
+        }
     }
 
     #[test]

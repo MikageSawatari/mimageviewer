@@ -32,6 +32,8 @@ pub(crate) struct OpenController {
     enqueue_observer: Mutex<Option<mpsc::Sender<()>>>,
     #[cfg(test)]
     validation_hook: Mutex<Option<Arc<ValidationHook>>>,
+    #[cfg(test)]
+    activation_observer: Mutex<Option<mpsc::Sender<()>>>,
 }
 
 struct OpenPermit(Arc<OpenController>);
@@ -90,6 +92,8 @@ impl OpenController {
             enqueue_observer: Mutex::new(None),
             #[cfg(test)]
             validation_hook: Mutex::new(None),
+            #[cfg(test)]
+            activation_observer: Mutex::new(None),
         })
     }
 
@@ -231,10 +235,17 @@ impl OpenController {
             return Err(cancelled());
         }
         let (reply, receiver) = mpsc::sync_channel(1);
-        // Reuse the existing event/listener to restore a hidden or minimized
-        // window. Headless unit tests must never signal a resident application.
-        #[cfg(not(test))]
-        crate::single_instance::signal_activate_existing();
+        // Only Open restores/foregrounds the window. Metadata requests wake the
+        // UI through repaint below, including minimized and tray-hidden windows.
+        if matches!(&kind, UiRequestKind::Open(_)) {
+            #[cfg(not(test))]
+            crate::single_instance::signal_activate_existing();
+            // Headless tests probe the same routing without signaling a resident app.
+            #[cfg(test)]
+            if let Some(observer) = &*self.activation_observer.lock().unwrap() {
+                let _ = observer.send(());
+            }
+        }
         sender
             .send(UiOpenRequest {
                 kind,

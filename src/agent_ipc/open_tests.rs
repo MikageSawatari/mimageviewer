@@ -1,5 +1,62 @@
 use super::*;
 
+#[test]
+fn only_open_activates_and_every_ui_request_wakes_without_desktop_input() {
+    use super::super::metadata_write::{PreparedRatings, PreparedTags};
+    let controller = OpenController::new(None);
+    let ctx = egui::Context::default();
+    let (repaints, repaint_requests) = mpsc::channel();
+    ctx.set_repaint_observer(move |request| {
+        repaints.send(request.delay).unwrap();
+    });
+    let queue = controller.install(ctx);
+    let (activations, activation_requests) = mpsc::channel();
+    *controller.activation_observer.lock().unwrap() = Some(activations);
+    let kinds = [
+        UiRequestKind::Open(ActivationOpenPath::received("C:\\fixture.jpg".into(), None)),
+        UiRequestKind::TagWrite(PreparedTags {
+            items: Vec::new(),
+            tags: vec!["tag".into()],
+            add: true,
+            client_name: "fixture".into(),
+        }),
+        UiRequestKind::TagWrite(PreparedTags {
+            items: Vec::new(),
+            tags: vec!["tag".into()],
+            add: false,
+            client_name: "fixture".into(),
+        }),
+        UiRequestKind::RatingWrite(PreparedRatings {
+            items: Vec::new(),
+            stars: 3,
+            client_name: "fixture".into(),
+        }),
+    ];
+    for kind in kinds {
+        let should_activate = matches!(&kind, UiRequestKind::Open(_));
+        let worker_controller = controller.clone();
+        let worker = std::thread::spawn(move || {
+            worker_controller.dispatch_request(
+                &AtomicBool::new(false),
+                Arc::new(UiRequestDispatch::pending()),
+                Duration::from_secs(5),
+                || Ok(kind),
+            )
+        });
+        let request = queue.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            repaint_requests
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+            Duration::ZERO,
+        );
+        assert_eq!(activation_requests.try_recv().is_ok(), should_activate);
+        assert!(request.try_claim());
+        request.complete(UiOpenOutcome::Admitted);
+        assert!(worker.join().unwrap().is_ok());
+    }
+}
+
 fn open_activation(request: &UiOpenRequest) -> &ActivationOpenPath {
     match &request.kind {
         UiRequestKind::Open(activation) => activation,

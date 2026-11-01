@@ -137,60 +137,105 @@ pub(super) fn read(
                     crate::folder_tree::is_zip_extension(&e.to_ascii_lowercase())
                 }) =>
             {
-                crate::book_scope::validate_relative_reference(subresource)
-                    .map_err(|_| bad_item())?;
                 let member = subresource.replace('\\', "/");
-                let extension = Path::new(&member)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                if !crate::folder_tree::is_recognized_image_ext(&extension) {
-                    return Err(bad_item());
-                }
-                let zip = read_zip(path, &member, cancel);
-                check_cancel(cancel)?;
-                let member = match zip {
-                    Ok(zip) => {
-                        legacy_rating_key =
-                            Some(crate::adjustment_db::zip_entry_key(path, &zip.legacy_name));
-                        output.size = available(zip.size);
-                        output.modified = available(zip.modified);
-                        if let Some(bytes) = zip.bytes {
-                            output.dimensions = pixel_dimensions(bytes_dimensions(&bytes, &member));
-                            check_cancel(cancel)?;
-                            output.exif = project_exif(
-                                crate::exif_reader::read_exif_from_bytes(&bytes, &[]),
-                                permission.gps,
-                            );
-                            check_cancel(cancel)?;
-                            output.generation = project_generation(
-                                crate::png_metadata::extract_metadata_from_bytes_for_agent(&bytes),
-                            );
-                        } else {
-                            output.dimensions = InfoField::TooLarge;
-                            output.exif = InfoField::TooLarge;
-                            output.generation = InfoField::TooLarge;
+                let is_directory = member.ends_with('/');
+                let reference = member.strip_suffix('/').unwrap_or(&member);
+                crate::book_scope::validate_relative_reference(reference)
+                    .map_err(|_| bad_item())?;
+                if is_directory {
+                    let identity = read_zip_directory_identity(path, &member, cancel);
+                    check_cancel(cancel)?;
+                    let identity = match identity {
+                        Ok(Some(identity)) => identity,
+                        Ok(None) => {
+                            return Err(super::error(
+                                ErrorCode::BadRequest,
+                                "大きすぎる入れ子の ZIP があります",
+                            ));
                         }
-                        zip.name
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return Err(bad_item());
+                        }
+                        Err(_) => return Err(super::internal()),
+                    };
+                    let is_archive = crate::zip_tree::segment_is_archive(
+                        crate::grid_item::zipdir_display_name(&identity.name),
+                    );
+                    legacy_rating_key = Some(super::metadata_write::zip_directory_rating_key(
+                        path,
+                        &identity.legacy_name,
+                    ));
+                    output.kind = if is_archive {
+                        ItemKind::Archive
+                    } else {
+                        ItemKind::Folder
+                    };
+                    output.name = crate::grid_item::zipdir_display_name(&identity.name).to_owned();
+                    output.item.subresource = Some(identity.name.clone());
+                    output.size = InfoField::NotApplicable;
+                    output.modified = InfoField::NotApplicable;
+                    GridItem::ZipDir {
+                        zip_path: path.to_owned(),
+                        dir_prefix: identity.name,
+                        is_archive,
+                        representative: None,
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                } else {
+                    let extension = Path::new(&member)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if !crate::folder_tree::is_recognized_image_ext(&extension) {
                         return Err(bad_item());
                     }
-                    Err(_) => {
-                        output.size = InfoField::Unavailable;
-                        output.modified = InfoField::Unavailable;
-                        output.dimensions = InfoField::Unavailable;
-                        output.exif = InfoField::Unavailable;
-                        output.generation = InfoField::Unavailable;
-                        member
+                    let zip = read_zip(path, &member, cancel);
+                    check_cancel(cancel)?;
+                    let member = match zip {
+                        Ok(zip) => {
+                            legacy_rating_key =
+                                Some(crate::adjustment_db::zip_entry_key(path, &zip.legacy_name));
+                            output.size = available(zip.size);
+                            output.modified = available(zip.modified);
+                            if let Some(bytes) = zip.bytes {
+                                output.dimensions =
+                                    pixel_dimensions(bytes_dimensions(&bytes, &member));
+                                check_cancel(cancel)?;
+                                output.exif = project_exif(
+                                    crate::exif_reader::read_exif_from_bytes(&bytes, &[]),
+                                    permission.gps,
+                                );
+                                check_cancel(cancel)?;
+                                output.generation = project_generation(
+                                    crate::png_metadata::extract_metadata_from_bytes_for_agent(
+                                        &bytes,
+                                    ),
+                                );
+                            } else {
+                                output.dimensions = InfoField::TooLarge;
+                                output.exif = InfoField::TooLarge;
+                                output.generation = InfoField::TooLarge;
+                            }
+                            zip.name
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return Err(bad_item());
+                        }
+                        Err(_) => {
+                            output.size = InfoField::Unavailable;
+                            output.modified = InfoField::Unavailable;
+                            output.dimensions = InfoField::Unavailable;
+                            output.exif = InfoField::Unavailable;
+                            output.generation = InfoField::Unavailable;
+                            member
+                        }
+                    };
+                    output.name = crate::zip_loader::entry_basename(&member).to_owned();
+                    output.item.subresource = Some(member.clone());
+                    GridItem::ZipImage {
+                        zip_path: path.to_owned(),
+                        entry_name: member,
                     }
-                };
-                output.name = crate::zip_loader::entry_basename(&member).to_owned();
-                output.item.subresource = Some(member.clone());
-                GridItem::ZipImage {
-                    zip_path: path.to_owned(),
-                    entry_name: member,
                 }
             }
             _ => return Err(bad_item()),
@@ -220,10 +265,17 @@ fn enrich(
     path: &Path,
     legacy_rating_key: Option<&str>,
 ) -> Result<(), AgentError> {
-    // These are precisely App::rating_path_key / page_path_key's physical and
-    // page keys; a page must never inherit the container's stars.
-    let rating_key = crate::edit_source::page_key_for_grid_item(item)
-        .unwrap_or_else(|| crate::adjustment_db::normalize_path(path));
+    // Match set_rating's virtual-book key as well as App's physical/page keys;
+    // neither a ZIP directory nor a page inherits the outer container's stars.
+    let rating_key = match item {
+        GridItem::ZipDir {
+            zip_path,
+            dir_prefix,
+            ..
+        } => super::metadata_write::zip_directory_rating_key(zip_path, dir_prefix),
+        _ => crate::edit_source::page_key_for_grid_item(item)
+            .unwrap_or_else(|| crate::adjustment_db::normalize_path(path)),
+    };
     let ratings_path = crate::rating_db::RatingDb::db_path();
     if ratings_path.try_exists().map_err(|_| super::internal())? {
         let db = crate::rating_db::RatingDb::open_readonly(ratings_path)

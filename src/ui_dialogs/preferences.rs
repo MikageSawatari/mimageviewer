@@ -120,13 +120,8 @@ pub(crate) fn draw_fullscreen_specified_scale_max_controls(
     pages::draw_fullscreen_specified_scale_max_controls(ui, max_tenths, dark_popup)
 }
 
-mod agent_integration;
 mod name_colors;
 
-#[doc(hidden)]
-pub fn draw_agent_integration_snapshot_fixture(ui: &mut egui::Ui, level: u8) {
-    agent_integration::snapshot(ui, level);
-}
 mod pages;
 mod search_index;
 mod transfer;
@@ -267,6 +262,45 @@ fn pref_panel_scroll_style() -> egui::style::ScrollStyle {
     scroll
 }
 
+#[cfg(test)]
+mod immediate_agent_permission_tests {
+    use super::*;
+
+    #[test]
+    fn preferences_ok_and_cancel_keep_permissions_changed_after_draft_opened() {
+        for apply in [true, false] {
+            let mut app = crate::app::setup_app_for_test();
+            app.open_preferences_page(PreferencesPage::General);
+            app.ensure_preferences_state();
+            assert_eq!(
+                app.pref_state.as_ref().unwrap().settings.agent_level,
+                crate::settings::AgentLevel::Disabled
+            );
+            // The independent window's successful immediate commit changes the
+            // live owner while this opening-time Preferences draft remains open.
+            app.settings.agent_level = crate::settings::AgentLevel::Organize;
+            app.settings.agent_show_thumbnails = true;
+            app.settings.agent_show_gps = true;
+            assert!(app.settings.save_checked());
+            if apply {
+                app.apply_preferences_dialog(&egui::Context::default());
+            } else {
+                app.discard_preferences_dialog();
+            }
+            assert!(!app.show_preferences);
+            assert_eq!(
+                app.settings.agent_level,
+                crate::settings::AgentLevel::Organize
+            );
+            assert!(app.settings.agent_show_thumbnails && app.settings.agent_show_gps);
+            let (saved, _) =
+                crate::settings_db::with_db_result(|db| db.load_agent_permission()).unwrap();
+            assert_eq!(saved.level, crate::settings::AgentLevel::Organize);
+            assert!(saved.thumbnails && saved.gps);
+        }
+    }
+}
+
 fn settings_equal_for_close_prompt(a: &Settings, b: &Settings) -> bool {
     // 実行中は対象フィールドにお気に入り専用値が載るため、永続化対象の標準値へ
     // 戻した snapshot 同士で比較する。これにより、専用値が有効な場所で標準値だけを
@@ -331,7 +365,6 @@ pub enum Vst3ScanMessage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PreferencesPage {
     General,
-    AgentIntegration,
     Font,
     Startup,
     ExternalTools,
@@ -539,7 +572,6 @@ impl PreferencesPage {
     #[cfg(test)]
     const ALL: &'static [Self] = &[
         Self::General,
-        Self::AgentIntegration,
         Self::Font,
         Self::Startup,
         Self::ExternalTools,
@@ -579,7 +611,6 @@ impl PreferencesPage {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::General => "全体設定",
-            Self::AgentIntegration => "AI 連携",
             Self::Font => "フォント",
             Self::Startup => "起動時の動作",
             Self::ExternalTools => "外部ツール",
@@ -813,7 +844,6 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::Startup,
             PreferencesPage::ExternalTools,
             PreferencesPage::ExplorerIntegration,
-            PreferencesPage::AgentIntegration,
             PreferencesPage::ClipboardCapture,
             PreferencesPage::TrayResidency,
             PreferencesPage::UpdateCheck,
@@ -1092,7 +1122,6 @@ pub fn draw_clipboard_capture_html_settings_snapshot_fixture(
 pub(crate) struct PreferencesState {
     /// 編集用の Settings 一時コピー
     pub settings: Settings,
-    agent_integration: agent_integration::AgentIntegrationState,
     transfer_feedback: Option<PreferencesTransferFeedback>,
     /// 保存済み位置と音声トラック選択を明示的にクリアした編集意図。
     video_media_memory_clear_requested: bool,
@@ -1691,7 +1720,6 @@ impl PreferencesState {
 
         Self {
             settings: s.preferences_snapshot(),
-            agent_integration: agent_integration::AgentIntegrationState::new(s),
             transfer_feedback: None,
             video_media_memory_clear_requested: false,
             initial_video_normal_wheel_action: s.ring_shortcuts.video_normal_wheel_action,
@@ -2367,6 +2395,11 @@ pub(crate) fn prepare_preferences_settings_for_commit(
     let new_details_selection_bar_mode = edited.details_selection_bar_mode.normalized();
 
     edited.overwrite_non_preferences_from(live);
+    // AI permissions belong to the immediate AI integration window. An older
+    // Preferences draft must never restore its opening-time permission values.
+    edited.agent_level = live.agent_level;
+    edited.agent_show_thumbnails = live.agent_show_thumbnails;
+    edited.agent_show_gps = live.agent_show_gps;
     edited.route_preferences_view_state(standard_view_state, active_view_state);
 
     // セット C は上の移送対象なので、スナップショット上で先に複製すると live 値で
@@ -3207,7 +3240,6 @@ impl App {
                 .collect();
         }
 
-        self.prepare_agent_integration(ctx);
         let registration_dialog_open = self.agent_registration_dialog_open();
         let mut open = true;
         let mut apply = false;
@@ -3346,12 +3378,6 @@ impl App {
                         draw_page(ui, state, enter_pressed);
                     }
                 });
-                #[cfg(test)]
-                if rendered_page == PreferencesPage::AgentIntegration {
-                    state.agent_integration.page_scroll = Some(
-                        crate::test_ui::scroll_layout::ScrollLayout::from_output(&output),
-                    );
-                }
                 // ScrollArea clamps its output against the current content and viewport.
                 // Capture before any close path drops the draft; never associate a result
                 // list's offset with the page selected by a click inside that list.
@@ -3472,7 +3498,6 @@ impl App {
             cancel = false;
             open = true;
         }
-        self.show_agent_registration_dialog(ctx);
         if apply {
             self.apply_preferences_dialog(ctx);
         } else if cancel || !open {
@@ -4204,7 +4229,6 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
 
     match state.selected {
         PreferencesPage::General => page_general(ui, state),
-        PreferencesPage::AgentIntegration => page_agent_integration(ui, state),
         PreferencesPage::Font => page_font(ui, state),
         PreferencesPage::Startup => page_startup(ui, state),
         PreferencesPage::ExternalTools => page_external_tools(ui, state),

@@ -1,17 +1,21 @@
-//! AI integration view and its draft-scoped, worker-only registration lifecycle.
-use super::*;
+//! Independent AI integration window and worker-only registration lifecycle.
 use crate::agent_ipc::changes::ChangeRecord;
 use crate::agent_registration::{self as backend, Action, AppTarget, RegistrationState};
+use crate::app::App;
 use crate::settings::AgentLevel;
+use crate::settings::Settings;
+use eframe::egui;
+use std::path::PathBuf;
+use std::sync::{Arc, mpsc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PermissionDraft {
+struct PermissionSelection {
     level: AgentLevel,
     thumbnails: bool,
     gps: bool,
 }
 
-impl From<&Settings> for PermissionDraft {
+impl From<&Settings> for PermissionSelection {
     fn from(s: &Settings) -> Self {
         Self {
             level: s.agent_level,
@@ -51,8 +55,7 @@ struct MockBackend {
     writes: usize,
 }
 
-pub(super) struct AgentIntegrationState {
-    applied: PermissionDraft,
+pub(crate) struct AgentIntegrationState {
     detection: DetectionState,
     operation: Option<RegistrationOperation>,
     feedback: Option<(AppTarget, Result<String, String>)>,
@@ -68,9 +71,8 @@ pub(super) struct AgentIntegrationState {
 }
 
 impl AgentIntegrationState {
-    pub(super) fn new(settings: &Settings) -> Self {
+    fn new() -> Self {
         Self {
-            applied: settings.into(),
             detection: DetectionState::Unchecked,
             operation: None,
             feedback: None,
@@ -84,10 +86,6 @@ impl AgentIntegrationState {
             #[cfg(test)]
             page_scroll: None,
         }
-    }
-
-    fn draft_changed(&self, settings: &Settings) -> bool {
-        self.applied != settings.into()
     }
 
     fn start_detection(&mut self, ctx: &egui::Context) {
@@ -152,14 +150,8 @@ impl AgentIntegrationState {
         }
     }
 
-    fn confirm(
-        &mut self,
-        settings: &Settings,
-        target: AppTarget,
-        action: Action,
-        opened_frame: u64,
-    ) {
-        if self.draft_changed(settings) || self.operation.is_some() {
+    fn confirm(&mut self, target: AppTarget, action: Action, opened_frame: u64) {
+        if self.operation.is_some() {
             return;
         }
         let DetectionState::Ready(env, detection) = &self.detection else {
@@ -219,9 +211,9 @@ impl AgentIntegrationState {
     }
 }
 
-pub(super) fn draw_permission(ui: &mut egui::Ui, settings: &mut Settings) -> egui::Response {
+fn draw_permission(ui: &mut egui::Ui, settings: &mut PermissionSelection) -> egui::Response {
     let response = egui::ComboBox::from_id_salt("agent_level")
-        .selected_text(level_label(settings.agent_level))
+        .selected_text(level_label(settings.level))
         .show_ui(ui, |ui| {
             for level in [
                 AgentLevel::Disabled,
@@ -229,7 +221,7 @@ pub(super) fn draw_permission(ui: &mut egui::Ui, settings: &mut Settings) -> egu
                 AgentLevel::ReadAndOpen,
                 AgentLevel::Organize,
             ] {
-                ui.selectable_value(&mut settings.agent_level, level, level_label(level));
+                ui.selectable_value(&mut settings.level, level, level_label(level));
             }
         });
     ui.add_space(8.0);
@@ -245,15 +237,9 @@ fn level_label(level: AgentLevel) -> &'static str {
     }
 }
 
-pub(super) fn draw_images(ui: &mut egui::Ui, settings: &mut Settings) {
-    ui.checkbox(
-        &mut settings.agent_show_thumbnails,
-        "縮小画像を AI に見せる",
-    );
-    ui.checkbox(
-        &mut settings.agent_show_gps,
-        "撮影位置 (GPS) を AI に見せる",
-    );
+fn draw_images(ui: &mut egui::Ui, settings: &mut PermissionSelection) {
+    ui.checkbox(&mut settings.thumbnails, "縮小画像を AI に見せる");
+    ui.checkbox(&mut settings.gps, "撮影位置 (GPS) を AI に見せる");
     ui.add_space(8.0);
 }
 
@@ -264,7 +250,7 @@ struct Exposure {
     actions: Vec<&'static str>,
 }
 
-fn exposure(draft: PermissionDraft) -> Exposure {
+fn exposure(draft: PermissionSelection) -> Exposure {
     let mut result = Exposure {
         shown: Vec::new(),
         hidden: vec![
@@ -309,14 +295,8 @@ fn exposure(draft: PermissionDraft) -> Exposure {
     result
 }
 
-pub(super) fn draw_exposure(ui: &mut egui::Ui, settings: &Settings, state: &AgentIntegrationState) {
-    if state.draft_changed(settings) {
-        ui.colored_label(
-            ui.visuals().warn_fg_color,
-            "編集中の設定です。OK で適用されます",
-        );
-    }
-    let summary = exposure(settings.into());
+fn draw_exposure(ui: &mut egui::Ui, settings: &PermissionSelection) {
+    let summary = exposure(*settings);
     ui.columns(3, |columns| {
         for (column, (title, lines)) in columns.iter_mut().zip([
             ("AI に見せるもの", &summary.shown),
@@ -350,6 +330,10 @@ pub(super) fn draw_recent(ui: &mut egui::Ui, state: &AgentIntegrationState) {
 }
 
 pub(super) fn draw_changes(ui: &mut egui::Ui, state: &AgentIntegrationState) {
+    draw_changes_content(ui, state, false);
+}
+
+fn draw_changes_content(ui: &mut egui::Ui, state: &AgentIntegrationState, expanded: bool) {
     ui.label(egui::RichText::new("mIV を閉じると消えます。最新 100 回分を表示します。").weak());
     if state.changes.is_empty() {
         ui.label("変更の記録はありません");
@@ -369,7 +353,7 @@ pub(super) fn draw_changes(ui: &mut egui::Ui, state: &AgentIntegrationState) {
             record.summary
         );
         let id = ui.make_persistent_id(("agent_change", record.id));
-        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, expanded)
             .show_header(ui, |ui| {
                 ui.add(egui::Label::new(heading).wrap().selectable(true));
             })
@@ -504,16 +488,14 @@ fn selectable_copy(ui: &mut egui::Ui, text: &str) {
     }
 }
 
-pub(super) fn draw_app(
+fn draw_app(
     ui: &mut egui::Ui,
-    settings: &Settings,
+    settings: &PermissionSelection,
     state: &mut AgentIntegrationState,
     target: AppTarget,
 ) {
     ui.add_enabled_ui(state.operation.is_none(), |ui| {
     ui.push_id(target.name(), |ui| {
-        ui.label(egui::RichText::new("登録・解除はすぐに実行されます。環境設定の OK / キャンセルとは無関係です。").weak());
-        let dirty = state.draft_changed(settings);
         let mut requested = None;
         match &state.detection {
             DetectionState::Unchecked | DetectionState::Checking(_) => { ui.label("確認中..."); }
@@ -527,17 +509,16 @@ pub(super) fn draw_app(
                     });
                     if let Some(message) = &row.message { ui.colored_label(ui.visuals().warn_fg_color, message); }
                     if let Err(error) = &detection.command { ui.colored_label(ui.visuals().error_fg_color, error); }
-                    let can_write = !dirty && detection.command.as_ref().ok().is_some_and(|command| row.write_request(Action::Register, command).is_some());
+                    let can_write = detection.command.as_ref().ok().is_some_and(|command| row.write_request(Action::Register, command).is_some());
                     ui.horizontal_wrapped(|ui| {
                         let label = if row.state == RegistrationState::DifferentTarget { "登録し直す" } else { "登録する" };
                         if ui.add_enabled(can_write, egui::Button::new(label)).clicked() { requested = Some(Action::Register); }
-                        if ui.add_enabled(!dirty && row.remove_request().is_some(), egui::Button::new("登録を外す")).clicked() { requested = Some(Action::Remove); }
+                        if ui.add_enabled(row.remove_request().is_some(), egui::Button::new("登録を外す")).clicked() { requested = Some(Action::Remove); }
                     });
                 }
             }
         }
-        if dirty { ui.colored_label(ui.visuals().warn_fg_color, "OK で設定を確定してから登録してください"); }
-        if state.applied.level == AgentLevel::Disabled { ui.label(egui::RichText::new("登録しても、許可の範囲を選ぶまで AI アプリからは使えません").weak()); }
+        if settings.level == AgentLevel::Disabled { ui.label(egui::RichText::new("登録しても、許可の範囲を選ぶまで AI アプリからは使えません").weak()); }
         ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(!matches!(state.detection, DetectionState::Checking(_)), egui::Button::new("再確認")).clicked() { state.start_detection(ui.ctx()); }
             if ui.button("手順を見る").clicked() { state.instructions = if state.instructions == Some(target) { None } else { Some(target) }; }
@@ -546,7 +527,7 @@ pub(super) fn draw_app(
                 if let Err(error) = opener::open("codex://settings") { state.feedback = Some((target, Err(format!("設定を開けませんでした: {error}")))); }
             }
         });
-        if let Some(action) = requested { state.confirm(settings, target, action, ui.ctx().cumulative_frame_nr()); }
+        if let Some(action) = requested { state.confirm(target, action, ui.ctx().cumulative_frame_nr()); }
         if let Some((owner, result)) = &state.feedback {
             if *owner == target { match result { Ok(message) => { ui.label(message); }, Err(error) => { ui.colored_label(ui.visuals().error_fg_color, error); } } }
         }
@@ -568,67 +549,168 @@ pub(super) fn draw_app(
 }
 
 impl App {
-    pub(crate) fn agent_registration_dialog_open(&self) -> bool {
-        self.show_preferences
-            && self
-                .pref_state
-                .as_ref()
-                .is_some_and(|state| state.agent_integration.operation.is_some())
-    }
-
-    pub(super) fn prepare_agent_integration(&mut self, ctx: &egui::Context) {
-        let Some(state) = &mut self.pref_state else {
-            return;
-        };
-        state.agent_integration.applied = (&self.settings).into();
-        state.agent_integration.poll(ctx);
-        if state.selected == PreferencesPage::AgentIntegration {
-            // Read immutable snapshots under a short lock. Keep the last view
-            // if the worker is publishing, rather than removing the section
-            // and changing the page's scroll geometry for that frame.
-            if let Some(changes) = &self.agent_changes {
-                let shared = changes.controller.records();
-                if let Ok(records) = shared.try_lock() {
-                    state.agent_integration.changes = records.entries().to_vec();
-                }
-            }
-            if matches!(state.agent_integration.detection, DetectionState::Unchecked) {
-                state.agent_integration.start_detection(ctx);
-            }
-            state.agent_integration.recent = self
-                .agent_recent_apps
-                .as_ref()
-                .and_then(|apps| apps.try_lock().ok())
-                .map(|apps| {
-                    apps.entries()
-                        .iter()
-                        .map(|entry| {
-                            let seconds = entry
-                                .last_called
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs() as i64;
-                            (
-                                entry.client_name.clone(),
-                                entry.client_version.clone(),
-                                crate::app::format_details_timestamp(seconds, true),
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+    pub(crate) fn open_agent_integration_dialog(&mut self) {
+        if self.agent_integration_dialog.is_none() {
+            self.agent_integration_dialog = Some(AgentIntegrationState::new());
         }
     }
 
-    pub(super) fn show_agent_registration_dialog(&mut self, ctx: &egui::Context) {
+    pub(crate) fn agent_registration_dialog_open(&self) -> bool {
+        self.agent_integration_dialog
+            .as_ref()
+            .is_some_and(|state| state.operation.is_some())
+    }
+
+    pub(crate) fn show_agent_integration_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut state) = self.agent_integration_dialog.take() else {
+            return;
+        };
+        state.poll(ctx);
+        if let Some(changes) = &self.agent_changes {
+            let shared = changes.controller.records();
+            if let Ok(records) = shared.try_lock() {
+                state.changes = records.entries().to_vec();
+            }
+        }
+        if matches!(state.detection, DetectionState::Unchecked) {
+            state.start_detection(ctx);
+        }
+        if let Some(recent) = self
+            .agent_recent_apps
+            .as_ref()
+            .and_then(|apps| apps.try_lock().ok())
+        {
+            state.recent = recent
+                .entries()
+                .iter()
+                .map(|entry| {
+                    let seconds = entry
+                        .last_called
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    (
+                        entry.client_name.clone(),
+                        entry.client_version.clone(),
+                        crate::app::format_details_timestamp(seconds, true),
+                    )
+                })
+                .collect();
+        }
         let enter = self.dialog_enter_pressed(ctx);
         let escape = self.dialog_escape_pressed(ctx);
         let ime_active = self.ime_input_active(ctx);
-        let Some(state) = &mut self.pref_state else {
-            return;
-        };
-        draw_registration_dialog(ctx, &mut state.agent_integration, enter, escape, ime_active);
+        let mut selected = PermissionSelection::from(&self.settings);
+        let open = draw_window(ctx, &mut selected, &mut state, escape, false);
+        if selected != PermissionSelection::from(&self.settings) {
+            self.commit_agent_permissions(selected);
+        }
+        draw_registration_dialog(ctx, &mut state, enter, escape, ime_active);
+        if open || state.operation.is_some() {
+            self.agent_integration_dialog = Some(state);
+        }
     }
+
+    fn commit_agent_permissions(&mut self, permission: PermissionSelection) {
+        // save_checked is the same DB transaction/permission epoch boundary as
+        // Preferences OK. Adopt only after success, so failure restores the UI.
+        let mut candidate = self.settings.clone();
+        candidate.agent_level = permission.level;
+        candidate.agent_show_thumbnails = permission.thumbnails;
+        candidate.agent_show_gps = permission.gps;
+        if candidate.save_checked() {
+            self.settings = candidate;
+        } else {
+            crate::logger::log("agent integration: permission settings save failed");
+            self.show_feedback_warning(
+                "AI 連携の設定を保存できませんでした。保存済みの値に戻しました。".into(),
+            );
+        }
+    }
+}
+
+fn panel_scroll_style() -> egui::style::ScrollStyle {
+    let mut scroll = egui::style::ScrollStyle::solid();
+    scroll.bar_width = 10.0;
+    scroll.bar_inner_margin = 8.0;
+    scroll.bar_outer_margin = 2.0;
+    scroll.foreground_color = true;
+    scroll
+}
+
+fn draw_body(
+    ui: &mut egui::Ui,
+    settings: &mut PermissionSelection,
+    state: &mut AgentIntegrationState,
+    expanded: bool,
+) {
+    let label = ui.label(egui::RichText::new("許可の範囲").strong());
+    draw_permission(ui, settings).labelled_by(label.id);
+    ui.label(egui::RichText::new("縮小画像・撮影位置").strong());
+    draw_images(ui, settings);
+    ui.label(egui::RichText::new("AI に見せる範囲").strong());
+    draw_exposure(ui, settings);
+    ui.label(egui::RichText::new("最近使った AI アプリ").strong());
+    draw_recent(ui, state);
+    ui.label(egui::RichText::new("AI による変更").strong());
+    if expanded {
+        draw_changes_content(ui, state, true);
+    } else {
+        draw_changes(ui, state);
+    }
+    for target in [AppTarget::ClaudeDesktop, AppTarget::ChatGpt] {
+        ui.label(egui::RichText::new(target.name()).strong());
+        draw_app(ui, settings, state, target);
+    }
+}
+
+fn draw_window(
+    ctx: &egui::Context,
+    settings: &mut PermissionSelection,
+    state: &mut AgentIntegrationState,
+    escape: bool,
+    expanded: bool,
+) -> bool {
+    let blocked = state.operation.is_some();
+    if blocked {
+        egui::Popup::close_all(ctx);
+    }
+    let mut open = true;
+    let screen = ctx.content_rect();
+    egui::Window::new("AI 連携")
+        .id(egui::Id::new("agent_integration_dialog"))
+        .drag_area(egui::WindowDrag::Anywhere)
+        .default_pos(screen.min + egui::vec2(60.0, 40.0))
+        .default_width(860.0)
+        .default_height((screen.height() - 100.0).max(100.0))
+        .max_size((screen.size() - egui::vec2(80.0, 80.0)).max(egui::vec2(100.0, 100.0)))
+        .resizable(true)
+        .collapsible(false)
+        .enabled(!blocked)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.spacing_mut().scroll = panel_scroll_style();
+            let output = egui::ScrollArea::vertical()
+                .id_salt("agent_integration_body")
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Always,
+                    ..Default::default()
+                })
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    draw_body(ui, settings, state, expanded);
+                });
+            #[cfg(test)]
+            {
+                state.page_scroll = Some(crate::test_ui::scroll_layout::ScrollLayout::from_output(
+                    &output,
+                ));
+            }
+            #[cfg(not(test))]
+            let _ = output;
+        });
+    blocked || state.operation.is_some() || (open && !escape)
 }
 
 fn draw_registration_dialog(
@@ -668,7 +750,7 @@ fn draw_registration_dialog(
         .show(ctx, |ui| {
             let button_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
             let body_height = (ui.available_height() - button_height - 12.0).max(24.0);
-            ui.spacing_mut().scroll = super::pref_panel_scroll_style();
+            ui.spacing_mut().scroll = panel_scroll_style();
             let output = egui::ScrollArea::vertical()
                 .id_salt("agent_registration_body")
                 .max_height(body_height)
@@ -754,28 +836,22 @@ fn registration_action_requested(
 }
 
 /// No environment capture, filesystem access, process enumeration, or workers.
-pub(super) fn snapshot(ui: &mut egui::Ui, level: u8) {
-    let mut settings = Settings::default();
-    settings.agent_level = match level {
+pub fn draw_agent_integration_snapshot_fixture(ui: &mut egui::Ui, level: u8) {
+    let mut settings = PermissionSelection {
+        level: AgentLevel::Disabled,
+        thumbnails: false,
+        gps: false,
+    };
+    settings.level = match level {
         0 => AgentLevel::Disabled,
         1 => AgentLevel::ReadOnly,
         2 => AgentLevel::ReadAndOpen,
         _ => AgentLevel::Organize,
     };
-    settings.agent_show_thumbnails = level >= 2;
-    settings.agent_show_gps = level >= 2;
-    let mut state = super::PreferencesState::from_settings(
-        &settings,
-        crate::external_tool::LaunchTarget::None,
-        None,
-        crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot(),
-        false,
-        0,
-        0,
-        0,
-    );
-    state.selected = PreferencesPage::AgentIntegration;
-    state.agent_integration.detection = DetectionState::Ready(
+    settings.thumbnails = level >= 2;
+    settings.gps = level >= 2;
+    let mut state = AgentIntegrationState::new();
+    state.detection = DetectionState::Ready(
         backend::RegistrationEnvironment {
             local_app_data: None,
             app_data: None,
@@ -809,12 +885,12 @@ pub(super) fn snapshot(ui: &mut egui::Ui, level: u8) {
             ],
         },
     );
-    state.agent_integration.recent.push((
+    state.recent.push((
         "Claude Desktop".into(),
         "1.0".into(),
         "2026-11-01 12:34:56".into(),
     ));
-    if level >= 3 {
+    if level >= 4 {
         let controller = crate::agent_ipc::changes::ChangeController::new();
         controller.publish(crate::agent_ipc::changes::ChangeRecord {
             id: Default::default(),
@@ -842,9 +918,37 @@ pub(super) fn snapshot(ui: &mut egui::Ui, level: u8) {
             }],
             notice: String::new(),
         });
-        state.agent_integration.changes = controller.records().lock().unwrap().entries().to_vec();
+        use crate::agent_ipc::changes::{ChangeRow, ChangeRowOutcome, ChangeRowResult};
+        let id = controller.records().lock().unwrap().entries()[0].id;
+        controller.update(id, |record| {
+            record.counts = crate::agent_ipc::changes::ChangeCounts {
+                changed: 1,
+                unchanged: 1,
+                queued: 1,
+                failed: 1,
+                ..Default::default()
+            };
+            record.rows = [
+                ("海辺.jpg", ChangeRowResult::Done(ChangeRowOutcome::Changed)),
+                ("山.jpg", ChangeRowResult::Done(ChangeRowOutcome::Unchanged)),
+                ("空.jpg", ChangeRowResult::Pending),
+                (
+                    "川.jpg",
+                    ChangeRowResult::Failed("保存できませんでした".into()),
+                ),
+            ]
+            .into_iter()
+            .map(|(name, result)| ChangeRow {
+                item: format!(r"C:\写真\旅行\{name}"),
+                before: "未登録".into(),
+                after: "旅行の写真".into(),
+                result,
+            })
+            .collect();
+        });
+        state.changes = controller.records().lock().unwrap().entries().to_vec();
     }
-    super::draw_page(ui, &mut state, false);
+    draw_window(ui.ctx(), &mut settings, &mut state, false, level >= 4);
 }
 
 #[cfg(test)]

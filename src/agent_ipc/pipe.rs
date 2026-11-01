@@ -112,7 +112,9 @@ fn run(handlers: Arc<super::Handlers>, stop: Arc<Event>) -> io::Result<()> {
     let pipes: Vec<_> = (0..8)
         .map(|i| Stream::create(&name, i == 0, stop.clone()))
         .collect::<io::Result<_>>()?;
+    crate::logger::log("agent_ipc: state=listener_started");
     run_pipes(handlers, pipes);
+    crate::logger::log("agent_ipc: state=listener_stopped");
     Ok(())
 }
 

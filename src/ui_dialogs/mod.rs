@@ -8,6 +8,7 @@
 //! 加えるだけで `update()` から `self.show_new_dialog(ctx)` として呼べる。
 
 mod about;
+pub(crate) mod agent_integration;
 #[doc(hidden)]
 pub use about::{draw_avif_license_snapshot_fixture, draw_raw_license_snapshot_fixture};
 pub(crate) mod archive_cache_manager;

@@ -4635,3 +4635,153 @@ AI 連携の設定と窓は未リリースなので、移行は要らない。
    `set_rating` と同じ本の key)。
 3. 接続中の adapter の定期の `hello` / `miv_status` を agent の lane のログに残さない。状態が変わった時 (接続・切断・許可の変化等) だけ残す。
 4. 「AI による変更」のタグの行の書式を、他の tool の行と揃える。
+
+## 26. 段階 2-3 の実装記録
+
+対象 HEAD は `689f765fb`。以下のコード照合・headless検査の観測者は実装担当 root。
+UI移設・ZIP情報・受付/ログ/記録はファイルを分けて実装し、rootが統合検証を担当した。
+正式な独立レビューは別threadで行う。§24の実アプリ観測はサブPC担当/利用者によるもので、今回の検査とは分ける。
+commit・製品起動・実Claude/Codex設定の読み書きはしていない。
+
+### 26.1 前提の照合
+
+- `agent_ipc/open.rs` は種類を問わず前面化イベントを送っていた。タグ/★も同じUI要求ownerを通るが、
+  admission/返信は `App::poll_agent_open_requests` が種類別に処理している。
+- 最小化/トレイでも要求のpollへ進めることをコードで照合した。
+  `ctx.request_repaint` → vendored eframeのRequestRepaint → schedulerの要求済みrepaint (hidden時100ms throttle) →
+  `ScheduledRepaint` のFull passとなる。Windows最小化時は `frame_output::PassDecision` がUIを実行しpaintだけ抑止する。
+  トレイは `tray_integration::hide_to_tray` がWin32 SW_HIDEを使い、eguiのVisible(false)を送らない。
+  winit 0.30.13はWindowsのOccludedイベントを実装していないため、トレイでもviewportのvisible判定は既存の既定経路を通る。
+  `update_frame` → `render_initial_open` → agent pollは表示状態による後段のreturnより前。
+  logic-onlyにはagent pollが無いが、ここでの要求済みFullをlogic-onlyに置き換える経路はない。
+  eframe/winit/トレイ/viewport routingの変更、前面化による代用は不要だった。実アプリでの最小化/トレイ確認は未実施。
+- Remote窓はApp所有のOptionを取り出し、通常テーマのegui::Windowを描いて戻す非modal構造。
+  AI窓もこの所有を使い、位置はコーディング規約のdefault_pos、配色は既存rootテーマとui.visuals()に従う。
+- 従来のPreferences OKはSettingsの保存から `settings_db::save_full` へ進み、成功したtransaction内で
+  permission snapshot/epochを確定していた。新しいDB接続を作らず `Settings::save_checked` の同じ境界を使う。
+  この保存は既存のfavorite overlay除去も通す。Preferences検索にRemote窓は無く、AIページ索引も除去する。
+- ZIPフォルダのidentity-only readerと `set_rating` のbook key helperは既存にあった。
+  `get_item_info` だけが画像拡張子を必須にし、ZipDirのratingをcontainerへ落としていた。
+- adapterは問い合わせごとに新しいpipeとHelloを使う。物理connect/disconnectの毎回記録は周期ログ抑止にならない。
+- タグ記録はtyped job ownerで完了するが、そのsummaryだけがcountsの列挙になっていた。
+
+### 26.2 実装と選択
+
+- `SettingsAgentIntegration` をMenuCommandId/ALL/catalog/stable名/label表へ追加。
+  既定ではRemoteの直後。既存の表示/非表示・並べ替えの仕組みを使い、実メニューのheadlessクリックも検査する。
+  `KeyAction` は足さないので生成参照 `keymap.ini.default` は変更しない。`keymap-spec.md` に両窓のmenu IDを記載した。
+- Appの `Option<AgentIntegrationState>` が独立した「AI 連携」窓を所有する。Preferencesのページ/tree/search/draft専用stateを除去。
+  窓本体は非modalで、登録の確認/書込の間だけ従来のcommon-modal判定と単一operation ownerを使う。
+  読み書きの検出・登録は従来どおりworker、単にmenuから窓のstateを開くだけでは検出/ファイル読み込みを始めない。
+- 許可/縮小画像/GPSは3値の表示用selectionから即時保存する。保存成功後だけlive Settingsへ採用し、失敗はlog+warning、
+  次の描画は保存済み値に戻る。UIの毎frameで全Settingsをcloneしない。
+  先に開いたPreferencesのOKでも、新しいliveの3値を移送してから保存する。Cancelも新しい許可を巻き戻さない。
+  書き出し/取り込みからの除外は変更しない。旧OK/キャンセル注意とdraft差分による登録無効化は除去した。
+- 前面化はOpenだけ。タグ/★は同じCAS/queueとrepaintを使う。テストでは前面化callbackを注入し、実アプリを起こさない。
+- ZIPの `chapter2/`、`inner.zip/`、`inner.zip/chapter3/` 等はidentity indexで存在を照合する。
+  通常のZIPフォルダはItemKind::Folder、入れ子ZIPの本はArchive。同じbook keyでratingを読み、旧CP932 keyもread-onlyで補う。
+  フォルダ自身のsize/modified/dimensions/EXIF/generationはNotApplicable、containerのstat/tagsは別欄のまま。
+  画像や終端の入れ子ZIPのbytesは読まない。helperは可視性だけ広げ、keyの式は変えない。
+- serverに固定サイズのHello/Status結果・permission snapshot/epochの観測stateを一つ置く。
+  最初の観測と状態/エラーの変化・復旧だけを通常laneへ記録し、同じHello/Statusがpipeを開き直しても繰り返さない。
+  optional perfも同じ出力判定を使い、不変の周期行を抑止する。他toolの要求ログ/perfとrecent-app attributionは維持する。
+  listener開始/終了は記録する。常時接続を表す新しいsession ownerや疑似disconnect検出は足さない。
+  ログへclient名/version、query、path、result/error本文は出さない。
+- タグの受付summaryを「タグの変更を受け付けました (N 件)」、完了summaryを「タグを変更 (N 件)」にした。
+  他toolと同様に説明と件数を示し、変更なし/対象外/処理中/失敗の内訳は既存のcounts欄で表示する。
+  typed row完了・before/after・warning/Undo境界は維持する。
+
+### 26.3 検証の記録
+
+| コマンド | 観測者 | 実 exit | 結果 / ログ |
+|---|---|---:|---|
+| `cargo fmt` / `cargo fmt --check` (最終) | root | 0 / 0 | workspace全体。`target/mcp-stage2-3-fmt.log` / `target/mcp-stage2-3-fmt-check.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | root | 0 | 1m18s、`target/mcp-stage2-3-core-check.log`。以後のRust修正はtest専用部分だけ |
+| 新規/移設focused (初回) | root | 100 | 94件中92成功/2失敗。compile 6m47s、実行8.050s。`target/mcp-stage2-3-narrow.log` |
+| 同focused (修正後) | root | 0 | 94/94、compile 2m24s、実行6.650s。`target/mcp-stage2-3-narrow-final.log` |
+| 下記 `$stage23Focused` | root | 100 | 2,042件中2,040成功/2失敗、138.007s。`target/mcp-stage2-3-focused.log` |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | root | 101 | IPC 15/15、MCP 63成功/2失敗。`target/mcp-stage2-3-crate-tests.log` |
+| `UPDATE_SNAPSHOTS=1` を新10件だけに指定した生成 | root | 0 | 10/10、compile 3m38s、実行3.13s。`target/mcp-stage2-3-snapshot-generate.log` |
+| `cargo test --test ui_snapshot` (更新指定なし) | root | 0 | 224/224、51.29s。`target/mcp-stage2-3-ui-snapshot.log` |
+| `python scripts/check_ui_glyphs.py` (最終) | root | 0 | 危険なUI glyphなし、`target/mcp-stage2-3-glyphs.log` |
+| `git diff --check` (最終) | root | 0 | `target/mcp-stage2-3-diff-check.log` |
+
+初回focusedの2失敗は検査の前提を直した。保存抑止flagはwriteだけでなく `with_db_result` のreadも拒否するので、
+失敗保存の後もflagが残ることを検査し、flag解除後に未変更のsnapshot/epochを比較する。
+小画面検査は、長い手順の末尾へscrollした位置で、上方にある「設定を開く」も同時に見えると誤って仮定していた。
+末尾のcopy到達を検査した後、実wheelでそのbuttonへ戻り、viewportとscroll clipの両方に収まることを検査する。
+表示領域の拡大・製品layoutの変更・assertの削除・scroll offsetの直接変更はしていない。
+
+新規/移設focusedのfilter:
+
+```powershell
+$stage23Narrow = 'test(/ui_dialogs::agent_integration/) or test(/immediate_agent_permission_tests/) or test(/agent_integration_menu/) or test(/agent_ipc::logging_tests/) or test(/agent_ipc::open::tests/) or test(/agent_ipc::item_info/) or test(/tag_write_worker/) or test(/tag_ops/)'
+cargo nextest run -p mimageviewer --lib -E $stage23Narrow --no-fail-fast
+```
+
+全focusedは§23.4/§23.5の定義に追加したもの。移設先moduleは旧Preferencesのfilterには含まれないため明記した。
+入力/Global menuのinventory、実menuクリック、Preferences OK/Cancel、Settings field全分類、既存のread途中の許可変更、
+ZIPのkey互換、Openの取消/受付、workerの本当の完了、登録IME/小画面/最大row、loggingの繰返し抑止まで含む。
+
+```powershell
+$stage23Focused = "($stage22ReviewFocused) or test(/keymap/) or test(/ui_main/) or test(/ui_dialogs::agent_integration/) or test(/agent_metadata_write/) or test(/agent_open_tests/) or test(=settings_transfer::tests::all_settings_fields_are_classified)"
+cargo nextest run -p mimageviewer --lib -E $stage23Focused --no-fail-fast
+```
+
+coreの2失敗は既知のrestricted-tokenの実pipe OS error 5のみ:
+
+- `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`
+- `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`
+
+MCPの2失敗も、fixtureのpipe open時のOS error 5:
+
+- `pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked`
+- `pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld`
+
+DACL緩和・skip/ignore・retryは追加していない。sandbox外での最小の再実行は以下。
+全focusedを確認する場合は上記変数 (§23.4/§23.5の定義込み) を使う。
+
+```powershell
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E 'test(=agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry) or test(=agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers)' --no-fail-fast
+```
+
+実pipe gateのgreen前提はsandbox内では揃わないため、確認用build-devは今回は未実施。
+外のgateが通った後に `.\scripts\build-dev.ps1 -PreserveRuntime` でcoreとcompanionを一緒に更新する。
+既存の `target/dev-runtime` は今回の検証用ビルドとは扱わない。
+実アプリでの最小化/トレイ操作、独立窓の表示・登録、サブPCの9段の再確認は未実施。
+test-lib-full/test-full、製品起動、commit、公開文書/配布物の変更はしていない。実装を止める新たな設計矛盾は見つからなかった。
+
+### 26.4 PNGと変更ファイル
+
+生成時だけ子processのUPDATE_SNAPSHOTSを設定し、`cargo test --test ui_snapshot agent_integration_window_` へ限定した。
+生成後に更新指定を外して全224件を比較し、rootが新10枚を各1枚ずつ目視した。
+タイトル/×、明暗の文字コントラスト、3列の折り返し、登録操作、空の記録と展開した記録を確認した。
+最大row/長い文字列/1093×614/200%の到達性はPNGだけに頼らずheadlessの実scroll/クリックで検査した。
+
+全て `tests/snapshots/` 配下。旧8枚を削除し、新10枚を追加。その他の既存PNGの変更は0。
+新10枚は計2,114,461 bytes (約2.02 MiB)、削除8枚との差は368,192 bytes (約0.35 MiB)。
+
+| 削除 | 追加 |
+|---|---|
+| `preferences_agent_disabled_dark.png` | `agent_integration_window_disabled_dark.png` |
+| `preferences_agent_disabled_light.png` | `agent_integration_window_disabled_light.png` |
+| `preferences_agent_read_dark.png` | `agent_integration_window_read_dark.png` |
+| `preferences_agent_read_light.png` | `agent_integration_window_read_light.png` |
+| `preferences_agent_open_dark.png` | `agent_integration_window_open_dark.png` |
+| `preferences_agent_open_light.png` | `agent_integration_window_open_light.png` |
+| `preferences_agent_organize_dark.png` | `agent_integration_window_organize_dark.png` |
+| `preferences_agent_organize_light.png` | `agent_integration_window_organize_light.png` |
+| — | `agent_integration_window_records_dark.png` |
+| — | `agent_integration_window_records_light.png` |
+
+コード/文書の主な差分:
+
+- 新窓: `src/ui_dialogs/agent_integration.rs` と `agent_integration/tests.rs`。
+  旧 `src/ui_dialogs/preferences/agent_integration.rs` と同 `agent_integration/tests.rs` から移設。
+- Preferences整理: `src/ui_dialogs/preferences.rs`、`preferences/{pages.rs,search_index.rs}`。
+- App/menu配線・snapshot export: `src/{app.rs,lib.rs,keymap.rs,ui_main.rs}`、`src/ui_dialogs/mod.rs`、`tests/ui_snapshot.rs`。
+- ZIP情報/key共有: `src/agent_ipc/{item_info.rs,item_info_tests.rs,metadata_write.rs}` (最後はhelperの可視性だけ)。
+- 受付/log: `src/agent_ipc/{mod.rs,open.rs,open_tests.rs,pipe.rs,tests.rs,logging_tests.rs}`。
+- タグsummary: `src/{tag_ops.rs,tag_write_worker.rs}`。
+- 内部文書: `docs/keymap-spec.md`、本節。`docs/keymap.ini.default` は生成されるKeyActionの集合が不変のため差分なし。

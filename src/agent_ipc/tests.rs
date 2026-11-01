@@ -43,6 +43,7 @@ impl Fixture {
             recent_apps: Arc::new(Mutex::new(RecentApps::default())),
             changes: super::changes::ChangeController::new(),
             active: AtomicUsize::new(0),
+            lane_log: Mutex::new(LaneLog::default()),
             search_hooks: None,
             read_hooks: None,
             write_hooks: None,
