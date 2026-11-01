@@ -4525,3 +4525,22 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 single-instance mutexを共有するため、先にインストール版/常駐tray版を終了する。
 確認対象は、単独操作の文言が従来どおりで、保留中にClear＋既存タグのno-op追加やUndo/Redo＋編集が混在すると
 カテゴリ別の内訳になること。決定的な順序は上記headless回帰で検査済みであり、実アプリの表示は未確認。
+
+### 23.8 検収 (ClaudeCode、2026-11-01)
+
+- sandbox の外で ClaudeCode が実行:
+  - `c39489f5d`: crates `--include-ignored` exit 0 (15/15、65/65)。`test-lib-full.ps1` は 15,276 件中 15,275 件成功。
+    落ちた 1 件は `settings_transfer::tests::all_settings_fields_are_classified` で、段階 0 から件数の期待値が古かった
+    (`0a313783e` で 482 / 329 に修正)。
+  - `0a313783e`: crates exit 0。`test-lib-full.ps1` はページめくりのテスト 5 件だけ失敗 (流し直しでは 4 件)。
+    実装担当が修正前のソースでも、OS の Shift の状態と描画の遅れで同じ失敗を再現した (§23.6)。当時のメイン PC では
+    別の重い処理が 2 本並行していた (設計担当の連絡)。本 slice の回帰ではないと判断し、レビューもその判断を妥当とした。
+  - `c28da6a9b`: 実 pipe 2 件・ページめくり全体・タグ/Undo・agent・設定の分類の focused nextest exit 0 (349/349)。
+  - `3eba8f75b`: タグ/Undo/tag writer/agent の focused nextest exit 0 (178/178)。
+- 独立した実装レビュー: 1 巡目 (`c39489f5d`) P2 3 件 (タグの記録が「処理中」のまま、利用者のタグ完了 toast の欠落、
+  ZIP の中のフォルダ・入れ子 ZIP の本に★を付けられない) → 設計 `956b46a25`、実装 `0a313783e`。2 巡目 P2 1 件 (連続した
+  利用者の編集で件数と最後のタグ名が食い違う) → `c28da6a9b`。3 巡目 P2 1 件 (クリアと別操作の変更なしの合算) →
+  `3eba8f75b`。4 巡目で追加の指摘なし、判定は「2-2 impl: accepted」。
+- 2 巡目以降の指摘は、利用者のタグ完了 toast を完了まで溜める修正 (1 巡目) に伴う文言の細部。単独の Clear で元から空の項目も
+  クリア件数に含める表現は master と同じ既存の挙動として残した。
+- 実 AI アプリ・実 core での書き込み・画面の追従・XMP の外部確認は未実施 (サブ PC での実機確認で行う)。
