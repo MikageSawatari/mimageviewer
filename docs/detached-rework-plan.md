@@ -1463,7 +1463,7 @@ main内閲覧・同じbundleのlinked F12・未分離のmain所有メディア�
 
 **設計段階で ClaudeCode と独立レビュー担当 (Sol xhigh) の双方が構造的修正であることに同意。**
 レビューP2の対象境界とmain側consumer撤去、P3のspec更新も設計担当の決定を反映した。
-実装後の独立レビューに関する合意記録は設計担当が追記する。
+**実装後 (コミット `2fe8f4605`) も、設計担当 ClaudeCode と、実装者とは別の独立レビュー担当 (GPT-6.1 Sol / xhigh、ACCEPT・指摘なし) の双方が「症状パッチではなく構造的修正である」ことに同意 (2026-11-01)。**
 
 触れた範囲は `close_return.rs` の帰還発行・終端捕捉、registryのbuild/forkの帰還情報非継承、
 `app.rs` のbookmark producerと独立closeのmain消費経路、`startup_ops.rs` の独立化完了時の帰還相関終了。
