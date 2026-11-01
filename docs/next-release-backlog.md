@@ -971,6 +971,75 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 確認する操作は、画像/ZIP/PDFを含むCollectionと、多数の親へ分散した小画像Collectionの
 再open・スクロール戻り。live操作は実施しておらず、自動検証の成功とは区別する。
 
+#### 独立レビュー P2 / P3 修正（2026-11-01、Codex）
+
+対象は `collection-thumb-1668` / `e9c8dec77` への未コミット差分。設計担当の修正依頼に従い、
+製品起動・実入力・既存アプリ停止・通常設定操作・コミットは行わない。
+
+- **P2の原因**: `attach_viewer_thumbnail_context` はCollection rootだけでなく、Collection surfaceを
+  保持したPhysicalSourceの要求にも親identity/admissionを付ける。poolには既存のFixed catalogが
+  渡っていても、再帰 `CachedPinned` の保存が要求側のCollection印だけで除外され、DBとmapに残らなかった。
+- **保存先の所有**: 実際の書込先は既存の `ThumbnailCatalogProvider::save_target` だけで解決する。
+  再帰pinはその `ThumbnailSaveTarget::fixed_catalog` が返す既存接続へ従来のpolicy/forceで保存・map反映する。
+  新namespace宛てには旧pin bytesをmirrorしない。要求印で保存可否を分ける分岐は撤去した。
+- **印の用途の確認・分離**: 要求の `RequestCatalog` は元logical項目の親と受付epochという候補情報で、
+  実際の保存先を確定しない。appの受付点と型コメントへこの優先関係を明記した。
+  lookup・破損通知・CacheOnlyの要求epoch失効判定にも印だけの判定が混ざっていたため、
+  実際のproviderがCollectionSourceParentsかつ要求に親scopeがあるときだけ適用する。
+  catalog未指定の別一覧も同providerを使うため、要求scopeがない場合を新経路として扱わない検査も追加した。
+  Fixedは自身の接続・map・退役規則を維持する。
+  EPUB fallback/RAW deferredは従来どおり元scope/providerを継承し、音声はgeneric provider解決前の専用経路、
+  動画は既存の別workerのまま。catalog schema・key・pin選択・機能の制限は変更していない。
+- **回帰**: 新規 `fixed_catalog_with_collection_scope_saves_recursive_pin_and_reuses_on_revisit` が
+  Fixed＋Collection印の実際の組合せを検査する。初回のpin WebP表示・DB保存・map反映、同じmapでの再訪、
+  接続を開き直してDBからmapを再読込した再訪を通す。既存のstamp照会hookで初回の再帰解決を確認し、
+  両再訪が `UpgradeableCache` を返し、再帰pin照会が増えないことを検査する。
+  既存 `collection_parent_recursive_legacy_pin_is_displayed_without_mirroring` も維持し、
+  新namespaceで表示はできてもDB作成/map反映をしない経路と、印なしFixedを共通fixtureで検査する。
+- **P3**: `manual/collections.html` / `manual/settings.html` の別保存・Collection間共有の対象を
+  「コレクションの一覧に出る画像・本などのサムネイル」に限定した。音声画像は通常フォルダと同じcache、
+  音声/動画はそれぞれの設定に従うことを別段落に明記し、版固有表現・実装用語は追加していない。
+
+検証は `MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`、nextestの実行並列度は既定、retry 0。
+検証中のRustソースは固定し、3ファイルのhashは `target/section1668-review-source-sha256.json`。
+コマンドは `target/section1668-review-gates.ps1`、最終各ログとexitは `target/section1668-review-final-<対象>.log` / `.exit`。
+
+| 対象 | 結果・証跡 |
+| --- | --- |
+| 焦点回帰 | nextest通常feature/test profile、**2 passed / 0 failed**、0.297秒。run `7f546e3c-4a6b-4003-b310-e915d56e253c`、`focused.log` |
+| 型検査 | `cargo check -p mimageviewer --lib --tests --features test-script`、exit 0、1分23秒。`check.log` |
+| 関連回帰 | nextest通常feature/test profile、**2,215 passed / 0 failed**、110.315秒。run `37f4636a-8c20-4d61-b5b4-0ad46a585253`、`related.log`。collection/catalog/thumb/pin/cache_maint/smart_folder/remote_ipcをOR選択 |
+| UI snapshot | `cargo test --test ui_snapshot`、**218 passed / 0 failed**、34.33秒。`snapshot.log`。期待画像の更新なし |
+| 整形・差分 | `cargo fmt`、`cargo fmt --check`、`git diff --check`成功。`fmt-check.log` |
+| 公開文言検査 | `python scripts/check_ui_glyphs.py` は問題0件、`python scripts/check_site_cards.py` は49枚・違反0、いずれもexit 0 |
+
+全libは依頼どおり再実行せず、直前の `20261101T110335290Z-9d0b6e14` の結果を既存の広域証拠として参照する。
+**15,385 passed / 1 timed out / 69 skipped**、走査1件は単独3回成功という記録を維持し、
+今回の差分で全件成功になったとは扱わない。製品の実操作は未実施。
+
+先行一式（焦点2件・関連2,215件・snapshot218件・型/整形）も成功したが、その後の最終照合で
+catalog未指定の別一覧へのlookup判定の適用範囲を限定したため、最終ソースで上記一式を再実行した。
+先行ログは `target/section1668-review-*.log.pre-final`。先行の確認用buildはこの限定修正前に
+自身のbuildプロセスだけを停止し、成功証拠に含めない（`target/section1668-review-build-dev.log.pre-final`）。
+
+**最終確認用build**: `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`、
+上記環境変数・通常feature（portableなし）、**exit 0**。全体653.589秒、core 10分41秒、
+Remote 0.75秒、EPUB worker 0.67秒。VCRT/PEは `runtime=4 / pe=3` 合格。
+ログ/exitは `target/section1668-review-build-dev.log` / `.exit`、
+成果物のサイズ・更新UTC・SHA-256は `target/section1668-review-build-artifacts.json`。
+coreは339,558,912 bytes、更新UTC `2026-11-01T12:31:26.4803955Z`。
+build後も最終Rust3ファイルのhashが全て一致し、製品起動・既存アプリ停止・実設定操作・コミットは未実施。
+
+手動確認する場合の対象は、子フォルダに本などをpinした実フォルダをCollectionから開き、
+再帰代表を表示してから戻る／開き直す操作（再帰探索せず保存済み代表を再利用すること）。
+Collection root側での表示・再訪も従来の確認対象として維持する。
+起動前にインストール版／常駐tray版を終了する（single-instance mutex共有）。次の通常profile版は
+実利用中の `%APPDATA%\mimageviewer` を開き、実設定・データを更新し得る。エージェントからは起動しない。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
 ### 1.669 本の構成を作っていない本でも、ページを出すたびに構成の照合が走る — X @Rottytops (2026-10-31)
 
 - 状態: **計測・修正・指定自動検証・確認用build完了（2026-11-01、未コミット／実機未確認、v4.11.0候補）**。[X の投稿](https://x.com/Rottytops) (2026-10-31) は「4.7.0 あたりで追加された本ごとに構成を保存する機能は切れないのか、ちょっと重いし使っていない」という声。どの操作で重いと感じたか (開く・めくる・一覧) は未記載。**この照合が体感の重さの原因かは未確認**。下記の開発側計測はworker候補経路の原価であり、報告者の操作・実機の提示時間を測ったものではない。

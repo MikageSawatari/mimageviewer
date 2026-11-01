@@ -4,6 +4,8 @@ use crate::catalog::{CatalogDb, CatalogWork};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
+/// Request-owned fallback scope/admission. The pool's provider selects the
+/// actual destination; a FixedCatalog always takes precedence over this scope.
 #[derive(Clone, Default)]
 pub(crate) enum RequestCatalog {
     #[default]
@@ -29,10 +31,6 @@ impl RequestCatalog {
                 Self::Fixed
             }
         }
-    }
-
-    pub(crate) fn is_collection(&self) -> bool {
-        matches!(self, Self::CollectionSourceParent { .. })
     }
 
     pub(crate) fn is_retired(&self) -> bool {
@@ -151,6 +149,16 @@ impl From<Option<&Arc<CatalogDb>>> for ThumbnailCatalogProvider {
 }
 
 impl ThumbnailCatalogProvider {
+    pub(super) fn uses_collection_source_parents(&self, req: &LoadRequest) -> bool {
+        matches!(
+            (self, &req.catalog_target),
+            (
+                Self::CollectionSourceParents(_),
+                RequestCatalog::CollectionSourceParent { .. }
+            )
+        )
+    }
+
     pub(crate) fn collection() -> Self {
         Self::CollectionSourceParents(Arc::default())
     }

@@ -111,6 +111,9 @@ PDF Harvestの静的資格は保存targetから判定し、Fixedの従来gateと
 pin/EPUB/RAW派生は元scopeを継承する。EPUB fallback再帰も元providerを引き継ぎ、
 lookup済みROをFixed保存先へ付け替えない。video/frame-pin seedは従来のメモリ優先。
 旧catalog由来の再帰 `CachedPinned` は表示を維持し、新DBへmirrorしない。
+保存先はproviderの `save_target` だけで決める。要求のCollection親scopeは候補のidentity/admissionであり、
+Collectionから開いた実フォルダ（PhysicalSource）ではFixedが優先する。Fixed宛ての再帰pinは
+要求scopeに関係なく従来どおり保存・map反映し、再訪時に再帰探索を省く。
 mtime秒/size、policy、pin世代、Folder proof、PDF source/layout寸法、idle品質更新は維持する。
 
 参照解除/Collection削除ではDBを消さず、inventory pruneも追加しない。未使用行やvariantは

@@ -54710,6 +54710,9 @@ impl App {
             top_level_grid_view::TopLevelGridSurface::Collection(_)
         ) && let Some(source) = self.items.get(req.idx).and_then(GridItem::drag_source_path)
         {
+            // Capture a fallback parent/admission, not the actual destination.
+            // PhysicalSource retains the Collection surface, but its worker's
+            // FixedCatalog takes precedence for lookup, retirement and saving.
             req.catalog_target = crate::thumb_loader::RequestCatalog::collection(
                 source,
                 crate::catalog::CatalogWork::default(),

@@ -2715,9 +2715,7 @@ fn process_load_request_with_provider(
         .as_ref()
         .map_or(&*req, |(stamped, _)| stamped);
 
-    // 内部関数向けに `&CatalogDb` を取り出しておく (= 既存シグネチャ互換)
     let save_target = provider.save_target(req);
-    let catalog_ref: Option<&crate::catalog::CatalogDb> = writable_catalog.map(|a| a.as_ref());
     // カタログキーを共通 helper で組み立て (auto_aspect の seed フェーズと共有)。
     // None ケース (path に file_name が無い等の異常) は既存挙動に合わせて空文字 fallback。
     let key_cow = cache_key_for_request(req).unwrap_or(std::borrow::Cow::Borrowed(""));
@@ -2826,7 +2824,9 @@ fn process_load_request_with_provider(
         // 他ワーカーの write (キャッシュ保存) をブロックしない。
         let retired_cache_only = req.source_policy == LoadSourcePolicy::CacheOnly
             && (catalog.is_some_and(|catalog| catalog.is_retired())
-                || (req.catalog_target.is_retired() && !req.uses_memory_pin_seed()));
+                || (provider.uses_collection_source_parents(req)
+                    && req.catalog_target.is_retired()
+                    && !req.uses_memory_pin_seed()));
         let cached = if retired_cache_only {
             catalog
                 .and_then(|catalog| {
@@ -2850,7 +2850,7 @@ fn process_load_request_with_provider(
                 }
             });
             memory.or_else(|| {
-                if !req.catalog_target.is_collection() {
+                if !provider.uses_collection_source_parents(req) {
                     return None;
                 }
                 let started = std::time::Instant::now();
@@ -2891,7 +2891,7 @@ fn process_load_request_with_provider(
                     None => image,
                 }
             });
-            if req.catalog_target.is_collection() && ci.is_none() {
+            if provider.uses_collection_source_parents(req) && ci.is_none() {
                 crate::logger::log(format!(
                     "collection thumbnail: invalid cached WebP: {filename}"
                 ));
@@ -3261,12 +3261,13 @@ fn process_load_request_with_provider(
     if let Some(cached) = cached_pinned_folder_thumb {
         let policy_should_save =
             cache_decision.should_cache(&cached.source_path, cached.source_file_size, 0.0, 0.0);
-        let should_save = !req.catalog_target.is_collection()
-            && catalog_ref.is_some()
-            && (req.force_cache || policy_should_save);
         let mut mirrored = false;
-        if should_save {
-            let cat = catalog_ref.expect("should_save => catalog is Some");
+        // Legacy pin bytes may be mirrored only to the existing fixed catalog,
+        // never to the new source-parent namespace. Request origin is irrelevant.
+        if let Some(cat) = save_target
+            .fixed_catalog()
+            .filter(|_| req.force_cache || policy_should_save)
+        {
             match cat.save_auto_folder_bytes(
                 filename,
                 req.mtime,
@@ -9647,50 +9648,78 @@ mod tests {
 
     #[test]
     fn collection_parent_recursive_legacy_pin_is_displayed_without_mirroring() {
+        check_recursive_legacy_pin_destination(true, true);
+        check_recursive_legacy_pin_destination(false, false);
+    }
+
+    #[test]
+    fn fixed_catalog_with_collection_scope_saves_recursive_pin_and_reuses_on_revisit() {
+        check_recursive_legacy_pin_destination(false, true);
+    }
+
+    fn check_recursive_legacy_pin_destination(collection: bool, collection_scope: bool) {
         let data = crate::data_dir::TestDataDirGuard::new();
         let tmp = TempDir::new().unwrap();
         let mut fixture = prepare_pdf_pin_fixture(&tmp, 3);
         fixture.cache_dir = data.path().join("cache");
         save_pdf_pin_webp(&fixture, 3, &fixture_webp());
-        for collection in [false, true] {
-            let mut req = LoadRequest {
-                path: fixture.root.clone(),
-                mtime: 1,
-                file_size: 2,
-                cache_key_override: folder_thumb_cache_key_for_path(
-                    &fixture.root,
-                    true,
-                    SortOrder::Numeric,
-                    3,
-                    crate::catalog::FolderThumbProvenance::AutoSelected,
-                ),
-                folder_thumb_sort: Some(SortOrder::Numeric),
-                folder_thumb_depth: 3,
-                folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
-                ..Default::default()
-            };
-            let provider = if collection {
-                req.catalog_target = RequestCatalog::collection(
-                    &fixture.root,
-                    crate::catalog::CatalogWork::capture(&fixture.cache_dir),
-                );
-                ThumbnailCatalogProvider::collection()
-            } else {
-                ThumbnailCatalogProvider::FixedCatalog(Some(Arc::new(
-                    crate::catalog::CatalogDb::open(
-                        &fixture.cache_dir,
-                        fixture.root.parent().unwrap(),
-                    )
+        let mut req = LoadRequest {
+            path: fixture.root.clone(),
+            mtime: 1,
+            file_size: 2,
+            cache_key_override: folder_thumb_cache_key_for_path(
+                &fixture.root,
+                true,
+                SortOrder::Numeric,
+                3,
+                crate::catalog::FolderThumbProvenance::AutoSelected,
+            ),
+            folder_thumb_sort: Some(SortOrder::Numeric),
+            folder_thumb_depth: 3,
+            folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            ..Default::default()
+        };
+        if collection_scope {
+            req.catalog_target = RequestCatalog::collection(
+                &fixture.root,
+                crate::catalog::CatalogWork::capture(&fixture.cache_dir),
+            );
+        }
+        let provider = if collection {
+            ThumbnailCatalogProvider::collection()
+        } else {
+            ThumbnailCatalogProvider::FixedCatalog(Some(Arc::new(
+                crate::catalog::CatalogDb::open(&fixture.cache_dir, fixture.root.parent().unwrap())
                     .unwrap(),
-                )))
-            };
-            let map = std::sync::RwLock::new(std::collections::HashMap::new());
+            )))
+        };
+        assert_eq!(
+            provider.uses_collection_source_parents(&req),
+            collection && collection_scope
+        );
+        assert!(
+            !ThumbnailCatalogProvider::collection()
+                .uses_collection_source_parents(&LoadRequest::default())
+        );
+        let hook = Arc::new(SelectionStampHook {
+            queries: AtomicUsize::new(0),
+            cancel_after: usize::MAX,
+            token: Arc::new(AtomicBool::new(false)),
+        });
+        selection_stamp_hooks()
+            .lock()
+            .unwrap()
+            .insert(fixture.root.clone(), hook.clone());
+        let map = std::sync::RwLock::new(std::collections::HashMap::new());
+        let run = |req: &mut LoadRequest,
+                   map: &std::sync::RwLock<_>,
+                   provider: ThumbnailCatalogProvider| {
             let (tx, rx) = mpsc::channel();
             process_load_request(
-                &mut req,
-                &map,
+                req,
+                map,
                 &tx,
-                provider.clone(),
+                provider,
                 64,
                 75,
                 32,
@@ -9706,23 +9735,58 @@ mod tests {
                 None,
                 None,
             );
+            rx.try_recv().unwrap()
+        };
+        let first = run(&mut req, &map, provider.clone());
+        assert!(first.pixels().is_some(), "legacy pin display preserved");
+        assert_eq!(first.pixels().unwrap().origin, ThumbLoadOrigin::FinalCache);
+        let recursive_queries = hook.queries.load(Ordering::Relaxed);
+        assert!(recursive_queries > 0, "first visit resolves the child pin");
+        let db = provider.resolve(&req, None);
+        if collection {
+            assert!(db.is_none(), "display-only legacy pin must not create a DB");
+        } else {
+            let db = db.unwrap();
             assert!(
-                rx.try_recv().unwrap().pixels().is_some(),
-                "legacy pin display preserved"
+                db.load_one(req.cache_key_override.as_deref().unwrap())
+                    .unwrap()
+                    .is_some()
             );
-            let db = provider.resolve(&req, None);
-            if collection {
-                assert!(db.is_none(), "display-only legacy pin must not create a DB");
-            } else {
-                assert!(
-                    db.unwrap()
-                        .load_one(req.cache_key_override.as_deref().unwrap())
-                        .unwrap()
-                        .is_some()
-                );
-            }
-            assert_eq!(map.read().unwrap().is_empty(), collection);
+            // Returning while the pool remains alive uses the mirrored map.
+            let revisit = run(&mut req, &map, provider.clone());
+            assert_eq!(
+                revisit.pixels().unwrap().origin,
+                ThumbLoadOrigin::UpgradeableCache
+            );
+            // A fresh pool/map models reopening the physical folder: load
+            // the actual persisted rows as the folder preparation does.
+            drop(provider);
+            drop(db);
+            let reopened = Arc::new(
+                crate::catalog::CatalogDb::open(&fixture.cache_dir, fixture.root.parent().unwrap())
+                    .unwrap(),
+            );
+            let reloaded_map = std::sync::RwLock::new(reopened.load_all().unwrap());
+            let revisit = run(
+                &mut req,
+                &reloaded_map,
+                ThumbnailCatalogProvider::FixedCatalog(Some(reopened)),
+            );
+            assert_eq!(
+                revisit.pixels().unwrap().origin,
+                ThumbLoadOrigin::UpgradeableCache
+            );
+            assert_eq!(
+                hook.queries.load(Ordering::Relaxed),
+                recursive_queries,
+                "both revisits must bypass recursive pin resolution"
+            );
         }
+        assert_eq!(map.read().unwrap().is_empty(), collection);
+        selection_stamp_hooks()
+            .lock()
+            .unwrap()
+            .remove(&fixture.root);
     }
 
     #[test]
