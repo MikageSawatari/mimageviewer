@@ -404,7 +404,7 @@ pub(crate) fn layout_cell_overlays(
     media_duration: Option<&str>,
     book_resume_meter: bool,
     name_style: crate::thumb_overlay_layout::ThumbnailNameStyle,
-    type_icon_size: Option<f32>,
+    show_type_icon: bool,
     _is_cut: bool,
 ) -> ThumbnailOverlayLayout {
     let inner = rect.shrink(4.0);
@@ -453,7 +453,7 @@ pub(crate) fn layout_cell_overlays(
 
     layout_thumbnail_overlays(
         ThumbnailOverlayLayoutInput {
-            type_icon_size,
+            show_type_icon,
             cell: rect,
             inner,
             book_resume_meter,
@@ -931,7 +931,6 @@ pub(crate) fn draw_cell(
         is_cut,
         resume_meter,
         false,
-        crate::os_theme::ThumbnailTypeTint::default(),
     );
 }
 
@@ -971,7 +970,6 @@ pub(crate) fn draw_cell_with_hit_areas(
         is_cut,
         resume_meter,
         true,
-        crate::os_theme::ThumbnailTypeTint::default(),
     )
 }
 
@@ -994,7 +992,6 @@ fn paint_cell(
     is_cut: bool,
     resume_meter: Option<f32>,
     collect_hit_areas: bool,
-    type_tint: crate::os_theme::ThumbnailTypeTint,
 ) -> ThumbnailHitAreas {
     let mut hit_areas = ThumbnailHitAreas::default();
     if !ui.is_rect_visible(rect) {
@@ -1613,7 +1610,6 @@ fn paint_cell(
             painter,
             placement.rect,
             item,
-            type_tint,
             ui.visuals(),
         );
     }
@@ -1912,7 +1908,7 @@ mod thumbnail_name_style_tests {
                                                 VideoThumbnailIndicator::BottomLeftBadge,
                                                 AudioThumbnailIndicator::default(), false, None,
                                                 None, true, name_style,
-                                            None,
+                                            false,
                                             false,
                                             )
                                                     };
@@ -2097,7 +2093,7 @@ mod book_resume_meter_tests {
                             let layout=layout_cell_overlays(ui.painter(),cell,EditBadgeFlags::default(),4,&item,&ThumbnailState::Pending,&[],None, None,false,
                                 VideoThumbnailIndicator::PlayIcon,AudioThumbnailIndicator::default(), false,None,Some("22:35"),true,
                                 crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
-                                None,
+                                false,
                                 false,
                                 );
                             let raw=layout.book_resume_meter.unwrap(); let meter=thumbnail_resume_meter_rect(ui.painter(),&layout).unwrap();
@@ -2182,7 +2178,7 @@ mod book_resume_meter_tests {
                                             None,
                                             enabled,
                                             crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
-                                        None,
+                                        false,
                                         false,
                                         );
                                         draw_cell(
@@ -2297,7 +2293,7 @@ mod book_resume_meter_tests {
                                     None,
                                     true,
                                     crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
-                                    None,
+                                    false,
                                     false,
                                 );
                                 draw_cell(
@@ -2391,7 +2387,7 @@ mod book_resume_meter_tests {
                                         None,
                                         true,
                                         crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
-                                        None,
+                                        false,
                                         false,
                                     );
                                     draw_cell(
@@ -2617,7 +2613,7 @@ mod book_resume_meter_tests {
                                                     duration,
                                                     enabled,
                                                     crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
-                                                None,
+                                                false,
                                                 false,
                                                 );
                                                 band = layout.book_resume_meter;
@@ -2738,7 +2734,7 @@ mod book_resume_meter_tests {
                                     None,
                                     true,
                                     crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
-                                    None,
+                                    false,
                                     false,
                                 );
                                 draw_cell(
@@ -2822,7 +2818,7 @@ mod book_resume_meter_tests {
                                 Some("1:02:03"),
                                 true,
                                 crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
-                                None,
+                                false,
                                 false,
                             );
                             assert!(layout.book_resume_meter.is_some());
@@ -3089,7 +3085,7 @@ mod book_resume_meter_tests {
             duration,
             true,
             crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
-            None,
+            false,
             false,
         );
         draw_cell(
@@ -3368,7 +3364,7 @@ mod book_resume_meter_tests {
                         duration,
                         enabled,
                         crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
-                        None,
+                        false,
                         false,
                     );
                     draw_cell(
@@ -3905,7 +3901,7 @@ fn draw_video_indicator_snapshot_cell(
         None,
         false,
         crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
-        None,
+        false,
         false,
     );
     draw_cell(
@@ -4052,7 +4048,7 @@ fn draw_thumbnail_name_settings_snapshot(ui: &mut egui::Ui, prioritize_width: bo
                             max_lines: if prioritize_width { 1 } else { 3 },
                             prioritize_width,
                         },
-                        None,
+                        false,
                         false,
                     );
                     draw_cell_with_hit_areas(
@@ -4510,7 +4506,7 @@ pub fn draw_audio_thumbnail_indicator_snapshot_fixture(ui: &mut egui::Ui) {
                     Some("3:45"),
                     true,
                     crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
-                    None,
+                    false,
                     false,
                 );
                 draw_cell(

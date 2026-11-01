@@ -1,16 +1,12 @@
 # UI スナップショットテスト運用方針
 
-§1.677の種類iconは、既存の`thumbnail_type_icon_dark/light`を固定slot・識別重視の配色Aへ更新する。
-セル枠左上(4,4)pt、図形20pt＋背景24ptを全種類で保持する。
-今回の更新対象はこの2枚だけ。設定ページを含む他のbaselineは更新しない。
-前回は設定説明も含む3枚（計323,727 bytes）を更新し、目視確認した。
-今回の比較用8枚は`target/1677-preview/palette-*.png`へ分け、A/B/Cを並べた明暗各1枚と、
-各案の多数badge（通常幅・名前幅優先・狭幅）の明暗各1枚を作る。値・推奨理由・既存色との兼ね合いはREADME.txt。
-既存の補助比較もAで再生成する。前回の色なし/薄い/やや濃いの`colors-*.png`は履歴として扱う。
-OFF/ON、狭幅・最小32pt、
-名前幅優先・多数badge・代表画像なし・名前200%最大4行・中央bookmark titleをdark/lightで確認する。
-最小32ptでは補助マークの視認性が低下する制約も実寸で示す。製品は起動しない。
-検証結果の正本は[§1.677の実装記録](next-release-backlog.md)。
+§1.677の種類iconは利用者採択の配色A・既定ON・セル枠左上(4,4)pt・図形20pt＋背景24ptで固定する。
+`thumbnail_type_icon_dark/light`の既存baselineはそのまま維持し、今回の仕上げでPNGは更新しない。
+比較候補のB/C・色なし・16/24ptはsourceから撤去する。ignoredの`thumbnail_type_icon_write_previews`は残し、
+確定仕様のOFF/ON・狭幅・最小32pt・多数badge・代表画像なし・名前200%最大4行・中央bookmark titleを
+dark/light各6枚、`target/1677-preview/adopted/`へ明示実行時だけ生成する。過去の比較PNGと混ぜない。
+通常のテストではPNG書き出しを行わず、2枚のbaseline比較と純layout・実paint回帰を維持する。
+製品起動や実速度測定の代わりには扱わない。検証結果の正本は[§1.677の実装記録](next-release-backlog.md)。
 
 §1.673 のバケツは、lib の純描画 fixture で `bucket_drawn_mask_options_dark`
 （250×300、27,771 bytes）を1枚追加する。3ツール共通の基準選択・色差の無効表示・既存の範囲と

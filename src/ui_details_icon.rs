@@ -151,13 +151,11 @@ pub(crate) fn draw_thumbnail_type_icon(
     painter: &egui::Painter,
     rect: egui::Rect,
     item: &GridItem,
-    tint: crate::os_theme::ThumbnailTypeTint,
     visuals: &egui::Visuals,
 ) {
     let background = crate::os_theme::thumbnail_type_background(
         visuals.dark_mode,
         crate::grid_item::display_kind(item),
-        tint,
     );
     let foreground = visuals.text_color();
     painter.rect_filled(rect, 3.0, background);

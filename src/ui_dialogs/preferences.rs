@@ -5607,7 +5607,7 @@ mod tests {
                     None,
                     false,
                     ThumbnailNameStyle::from_settings(&harness.state().settings),
-                    None,
+                    false,
                     false,
                 );
                 let filename = layout.bottom_left.filename.unwrap();

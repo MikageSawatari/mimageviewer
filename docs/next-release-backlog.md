@@ -54,7 +54,7 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.677 サムネイル表示後も種類アイコンを残し、フォルダ・書庫・単体画像を見分けやすくする — 5ch >>700 (2026-11-01)
 
-- 状態: **固定slotを維持した識別重視の3配色案・比較PNGと個別自動検証が揃い、配色の選定待ち (2026-11-01)**。比較PNGを見た利用者が既定ON・中20pt（背景24pt）を採択。薄い／やや濃い案は小面積で見分けにくいとの判断を受け、入れ物2分類は色相で離し、アイテム2分類は近色にまとめる。最新仕様・検証は下の「識別重視の配色再試作」を参照。[>>700](https://egg.5ch.io/test/read.cgi/software/1782419551/700) 由来。動画の画質についての感想は本項目の対象外。
+- 状態: **配色Aで仕上げ・個別自動検証・確認用build完了、未コミット／実機未確認 (2026-11-01)**（全lib一括は4件失敗。単独3回と旧fixture修正後の結果を下記に区別して記録）。既定ON、20pt（背景24pt）、セル枠左上から右4pt・下4pt、カテゴリ順と同じ4分類で確定。実フォルダ=青緑 / アーカイブ類=ラズベリー / 画像=紫 / 動画・音声=蘭色。[>>700](https://egg.5ch.io/test/read.cgi/software/1782419551/700) 由来。最新結果は下の「採択後の仕上げ」を参照。動画の画質についての感想は本項目の対象外。
 - 着手前: `src/app/grid_paint.rs` は代表サムネイルが Loaded になると中央のフォルダ・書庫アイコンを描かず、以降は緑のフォルダ名バッジや小さな ZIP / PDF / RAR 等の形式バッジで区別する。画像は種類マークを持たず、区別の手掛かりが揃っていない。セルの青背景と太い青枠はカーソル・チェック状態を示すので、種類を示すために上書きしない。
 - 方針: 種類アイコンをセル枠の左上(4,4)ptの固定slotへ常時表示する。読み込み前後・代表画像なし・名前非表示・名前幅優先・文字サイズ/行数で移動しない。既定ON、図形20pt＋背景24ptは利用者採択済み。環境設定でOFFにすると予約も外す。
 - 既存表示との統合: ZIP / RAR / PDF 等の短い形式ラベルと既存機能を維持する。slotを先に予約し、他の表示が避ける。狭いセルでは種類iconを最優先に残し、他badge側を既存の優先順で縮小・行数削減・省略する。セル寸法・行高・画像fitは変更しない。
@@ -126,6 +126,31 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - UI snapshotは**216件すべての個別成功を確認（初回164件＋補完52件）**。最初の `cargo test --test ui_snapshot` は164件の成功後に実行プロセスが**exit 2173で異常終了**し、一括完走の成功とは扱わない（`ui-snapshot.log`、コマンド全体325秒）。失敗assertionや画像差分の記録はなく、終了原因は未確定。既存のGPU調査で捕捉されたAVと同じ原因とは断定しない。216件の一覧と成功164件を照合し、未完了52件だけを `cargo test --test ui_snapshot -- --exact --nocapture <52件の完全名>` で補完、**52 passed / 0 failed / 164 filtered out、exit 0、142秒**。成功済みの再実行・並列数やbackendの変更・baselineの追加更新は行わない。ログは `ui-list.log` / `ui-completed.txt` / `ui-remaining.txt` / `ui-remaining.log` / `ui-coverage.txt`。名前200%／bookmarkの明暗の補助PNGも目視した。
 - `python scripts/check_ui_glyphs.py` は**0件・exit 0**、`cargo fmt --check` と `git diff --check` も成功。ログは同ディレクトリの `glyphs.log` / `fmt-check.log`。compilerには従来のunused／deprecated等の警告がある。設定ページを含む他のbaselineは更新しない。全lib／full gate・製品起動・実機測定・コミットは行わない。公開マニュアルは配色採択後に設計担当が仕上げる。
 - 確認用 `.\scripts\build-dev.ps1 -PreserveRuntime` は**成功・exit 0**。通常feature set、`dev-runtime` profile（portableなし）、`MSBUILDDISABLENODEREUSE=1`。coreは8m28s、remote／EPUB workerもビルドし、PE検査は runtime=4 / pe=3 成功。ログは `palette-verification/build-dev.log` と `results.tsv`、出力は `target/dev-runtime/mimageviewer-core.exe`。既存プロセスを停止せず、生成物も起動しない。利用者が確認する場合はインストール版／常駐tray版を終了して `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常の `%APPDATA%\mimageviewer` を使い、実際の設定／データを更新し得る。確認対象は明暗両テーマの4分類の識別と、多数badge・選択状態でも固定位置／既存表示を維持すること。色はAを仮適用したまま、コミットは設計担当へ渡す。
+
+#### 採択後の仕上げ（2026-11-01、073554ca4からの未コミット差分）
+
+- 設計担当からの仕上げ依頼。利用者確定値は**既定ON・図形20pt／背景24pt・セル枠左上から右4pt／下4pt・配色A**。カテゴリ順と同じ4分類で、実フォルダ=青緑、アーカイブ類=ラズベリー、画像=紫、動画・音声=蘭色。集約コンテナ／参照元なしは従来の無彩色、詳細一覧と共通の図形は維持する。
+- 製品コードから`ThumbnailTypeTint`とB/C/Neutral選択を撤去。配色正本は`os_theme::thumbnail_type_background`だけ。表示設定の既定は`settings::DEFAULT_THUMB_SHOW_TYPE_ICON`、寸法・padding・offsetは`thumb_overlay_layout`だけで定義し、plate寸法は20+2×2から導出する。layout入力は試作用の`Option<f32>`から表示boolへ変更し、呼出元と回帰テストを揃えた。分類・配置・描画・hit領域・OFF時の既存表示は変更しない。
+- 比較PNG生成テストは**残す**。狭幅・最小セル・多数badge・名前幅優先・画像なし・大きい名前／bookmarkを確定仕様で再確認できるため。通常`#[ignore]`を維持し、旧B/C比較と16/24ptの試験軸は撤去。生成先を`target/1677-preview/adopted/`へ分け、明暗各6枚とREADMEだけを書き出す。通常テストに画像書き出しの負荷を加えない。既存baselineは更新しない。
+- 公開マニュアルは`grid.html`の種類アイコン説明と`settings.html`のサムネイル設定表へ、左上固定・4色・形の区別・読込み後も残る・既定ON／OFF操作を追記。バージョン固有表現や内部用語は使わない。製品ページのカードは**変更不要**と判断：同一一覧で複数形式を扱うという既存カードの主張は変わらず、表示の詳細はマニュアルが担当する。`public-wording-policies.md`の「カードの主張そのものが変わるときだけ」に従い追記しない。
+- `display-pipeline.md`のoverlay配置、本書§2.2、`spec.md`の設定表、`ui-snapshot-policy.md`を確定仕様へ更新。試作記録は履歴として保存し、本追補を現行の正本とする。非同期状態・I/O・専用再構築や回復機構は追加しない。
+- 独立レビュー（GPT-6.1 Sol / xhigh、別コンテキスト）は仕上げ差分を**ACCEPT、未解決指摘なし**。AのRGB保持、寸法固定、通常／hit付きpaintと再layout、設定default／serde／DB／転送、テスト・公開文書を確認。検証は実装担当が所有し、レビュー側の再実行はしない。
+- 自動検証ログは`target/1677-finish/`、実行条件は`MSBUILDDISABLENODEREUSE=1`、HEAD `073554ca4`からの本追補の未コミット差分。コマンド・exit・秒数は`results.jsonl`。`cargo fmt`／`cargo fmt --check`、`cargo check -p mimageviewer --lib --tests --features test-script`はexit 0。最初のcheckはintegration fixtureの旧フィールド5か所を検出（`check.log`、exit101）し、bool入力へ揃えた後の`check-final.log`で成功。compilerの既存unused/deprecated等の警告は残る。
+- 関連nextest（`test(thumb_overlay) | test(grid_paint) | test(grid_type_icon) | test(settings) | test(ui_details_icon) | test(os_theme)`）は**739/739成功**（`related.log`）。ignoredのPNG生成は完全名を明示して**1/1成功**（`previews.log`）。出力は明暗各6枚・計12枚／2,740,667 bytesで、最小セルと多数badgeの明暗4枚を目視した。極小の補助マーク縮小は既存仕様どおり。`tests/snapshots`のbaselineは更新しない。
+- `cargo test --test ui_snapshot`は**216/216、一括完走・exit0**（`ui-snapshot.log`、実行36.52秒／compile込み181.16秒）。今回は§1.175のexit2173や画像差分は発生せず、補完実行なし。`python scripts/check_ui_glyphs.py`は**0件・exit0**（`glyphs-final.log`）。Windowsクラッシュダイアログはテスト親processのerror modeだけで抑止し、失敗exitや並列性・backend・期待画像は変更しない。
+- `scripts/test-lib-full.ps1`は**指定どおり1回だけ**新規実行し、**15,382成功／3失敗／1タイムアウト／68 skipped**（14 slow、2 leaky、実行868.586秒、script exit100）。一括成功とは扱わない。正規ログ／JUnitは`target/test-lib-full/runs/20261101T100220907Z-a5f0cd97/`、まとめは`lib-full.log`。失敗した4件を**ソース変更前にそれぞれ単独3回**確認した（`failed-{1..4}-single-{1..3}.log`）。
+
+|全件で失敗したテスト|全件の失敗|単独3回|
+|---|---|---|
+|`app::tests::background_click_scroll_regression_tests::letterbox_real_grid_missing_caption_and_reason_own_painted_padding`|`見つかりません`の文字がpaddingへ必ず描かれるというassertion|同じassertionで3回とも失敗|
+|`app::tests::still_window_mode_key_tests::remote_acquire_retires_startup_resolves_and_rejects_new_activations`|AcquiringRemoteのままでRemoteActive未到達|3回とも成功|
+|`app::folder_scan::section1375_scan_perf_tests::section1375_large_physical_scan_10k_100k`|既定600秒でタイムアウト（runnerの打切りではない）|3回とも成功（test実行117.146／102.383／113.046秒）|
+|`ui_adjustment_panel::local_adjust_segmentation_tests::full_mask_with_large_subtract_preview_completes_quickly`|所要126.9964msで時間assertion失敗|3回とも成功|
+
+- 再現したpadding試験は旧fixtureの前提不備。既定ONを継承した32pt級セルで、`14e99a13c`の`lower_caption_ink`は種類slotと交差する理由文字を設計どおり省略するが、旧試験は必ず文字がpaddingへ描かれると要求していた。クリック判定前の失敗で、今回の等価cleanupが作ったものではない。独立レビューも履歴・設計記録と照合して同意。製品を変更せず、当該試験だけOFFを明示して従来のcaption hit回帰を保持し、ONの実rendererで固定plateの描画・最小セル内収容・click選択・親移動不成立を検査する回帰を追加した。
+- fixture修正後は`cargo fmt`／`cargo fmt --check`、同じ`cargo check -p mimageviewer --lib --tests --features test-script`が**exit0**（`fixture-check.log`、63.79秒）。`test(background_click_scroll_regression_tests)`のfocused nextestは**36/36成功**（`fixture-focused.log`、test実行6.226秒／compile込み158.37秒）。修正した旧試験、新規ON試験、周辺の余白・スクロール・click回帰を含む。独立レビューも追補を**ACCEPT、未解決指摘なし**と確認し、integration側の5か所のbool置換も再確認した。`python scripts/check_ui_glyphs.py`も再実行して**0件・exit0**。製品コード／UI baselineの追加変更はなく、先の739件・216件の成功は有効な範囲を再利用する。全件の再実行は行わず、一括失敗・単独成功・fixture修正後のfocused成功を区別する。
+- 確認用`./scripts/build-dev.ps1 -PreserveRuntime`は**成功・exit0**（`build-dev.log`、command全体298.73秒、core compile4分50秒）。通常feature set／`dev-runtime` profile／portableなし／`MSBUILDDISABLENODEREUSE=1`。coreに加えRemote・EPUB PDF workerも同profileで確認し、PE検査は**runtime=4／pe=3成功**。出力は`target/dev-runtime/mimageviewer-core.exe`（339,622,400 bytes）、`mimageviewer-remote.exe`（14,836,736 bytes）、`mimageviewer-epub-pdf.exe`（5,094,400 bytes）。有効なcompanionの既存ビルドは再利用した。最終`git diff --check`成功、baseline PNGの差分なし。製品起動・実機確認・速度測定・コミットは実施せず、HEADは`073554ca4`のまま、コミットは設計担当へ引き継ぐ。
+- 利用者が確認する場合は、インストール版／常駐tray版を終了して、repoルートから`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。single-instance mutexを共有し、既定で通常の`%APPDATA%\mimageviewer`を使うため実際の設定／データを更新し得る。確認対象は、明暗両テーマの4分類の色・形、読み込み前後や代表画像なしでも左上固定、狭幅／多数badge／名前幅優先と選択の維持、設定OFFで種類iconと予約が外れること。
 
 ### 1.675 書庫内フォルダ・入れ子書庫にも、ページを直接表示する設定を適用する — 5ch >>694・696 (2026-11-01)
 
@@ -2949,8 +2974,8 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
   - 共通化の単位は「全バッジを同じ見た目で描く巨大関数」ではなく、セル四隅の使用領域を
     割り当てる純粋なレイアウトとする。形式、フォルダ名、時刻、評価など意味の異なる
     バッジは、共通の計測 / padding / 配置部品を使いつつ個別スタイルを維持する。
-  - 中央の再生アイコンや代替アイコンなど、隅のバッジではないコンテンツ overlay は
-    この仕組みに含めない。
+  - 中央の再生・代替・切り取り・集約マークの描画は個別に維持し、§1.677の種類iconがONなら
+    共通の`fit_content_marker`へ確定済み予約を渡して描画前に回避する。実描画targetをhit領域にも使う。
 - 実装案:
   1. セルの `inner` と表示対象を受け、`TopLeft` / `TopRight` / `BottomLeft` /
      `BottomRight` の各レーンに実測済み `BadgePlacement` (矩形、文字 / style、優先度) を返す
@@ -2963,7 +2988,12 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
      バッジと機械的に同じ 70% へ揃えず、長い名前の可読性を残したコンパクトな専用
      スタイルをスナップショット比較で決める。
   4. **現行実装**: 右上check/stack、右下filter件数・動画長さも同じ純layoutで予約する。
-     §1.256で下端meter帯 + gapを追加し、右下のcell基準にも予約を反映した。極小cellは既存badge優先。
+     §1.256で下端meter帯 + gapを追加し、右下のcell基準にも予約を反映した。
+  5. **§1.677 現行実装**: 既定ONの種類iconを最初にセル枠左上(4,4)ptへ24pt固定で予約する。
+     図形20pt・配色Aは利用者採択済み。カテゴリ順と同じ4分類の色を使い、その他は無彩色。
+     上段・中央bookmark title・下段・右のbadgeはslotを避け、狭幅では補助要素が縮小／省略する。
+     最小32ptでも種類slotは動かさず、checkは残幅へ縮小する。OFFでは予約も外し従来配置を保つ。
+     既存コンテンツmarkも同じ予約を避け、名前・形式・評価・meter・hit領域との非交差を回帰で保持する。
 - v2.9.1 実装記録 (2026-07-31):
   - `src/thumb_overlay_layout.rs` に painter 非依存の純粋レイアウトを新設。セルごとに 1 回だけ
     構築した左上 / 左下の配置結果を、通常描画、タグ hit-test、`UP`、ブックマーク時刻へ渡す。

@@ -1,5 +1,5 @@
 use super::*;
-use crate::thumb_overlay_layout::{BadgeKind, THUMB_TYPE_ICON_SIZE, ThumbnailNameStyle};
+use crate::thumb_overlay_layout::{BadgeKind, ThumbnailNameStyle};
 
 fn items() -> Vec<(&'static str, GridItem)> {
     use crate::archive_converter::ArchiveFormat;
@@ -154,7 +154,7 @@ fn thumbnail(ctx: &egui::Context, bright: bool) -> ThumbnailState {
 
 #[derive(Clone, Copy)]
 struct Preview {
-    size: Option<f32>,
+    show_type_icon: bool,
     width: f32,
     height: f32,
     prioritize: bool,
@@ -163,13 +163,12 @@ struct Preview {
     lines: usize,
     bookmark: bool,
     no_art: bool,
-    tint: crate::os_theme::ThumbnailTypeTint,
     play: bool,
 }
 impl Default for Preview {
     fn default() -> Self {
         Self {
-            size: Some(THUMB_TYPE_ICON_SIZE),
+            show_type_icon: true,
             width: 174.0,
             height: 132.0,
             prioritize: false,
@@ -178,7 +177,6 @@ impl Default for Preview {
             lines: 1,
             bookmark: false,
             no_art: false,
-            tint: crate::os_theme::ThumbnailTypeTint::default(),
             play: false,
         }
     }
@@ -252,7 +250,7 @@ fn draw(ui: &mut egui::Ui, p: Preview) {
                             max_lines: p.lines,
                             prioritize_width: p.prioritize,
                         },
-                        p.size,
+                        p.show_type_icon,
                         is_cut,
                     );
                     let hits = paint_cell(
@@ -276,7 +274,6 @@ fn draw(ui: &mut egui::Ui, p: Preview) {
                         is_cut,
                         Some(0.42),
                         true,
-                        p.tint,
                     );
                     if let Some(time) = layout.top_left.bookmark_time.as_ref() {
                         crate::ui_helpers::draw_overlay_bookmark_time_badge(
@@ -364,7 +361,6 @@ fn thumbnail_type_icon_snapshot_light() {
 
 #[test]
 fn thumbnail_type_icon_category_sort_and_palette_contract() {
-    use crate::os_theme::ThumbnailTypeTint;
     use crate::settings::GridItemDisplayKind::{Archive, Folder, Image, VideoAudio};
     let expected = [
         Some(Folder),
@@ -388,49 +384,43 @@ fn thumbnail_type_icon_category_sort_and_palette_contract() {
         assert_eq!(crate::grid_item::display_kind(&item), category, "{label}");
     }
     for dark in [false, true] {
-        for tint in [
-            ThumbnailTypeTint::TealRose,
-            ThumbnailTypeTint::RoseTeal,
-            ThumbnailTypeTint::VioletRose,
+        let colors: Vec<_> = [Folder, Archive, Image, VideoAudio]
+            .into_iter()
+            .map(|group| crate::os_theme::thumbnail_type_background(dark, Some(group)))
+            .collect();
+        assert!(colors.iter().all(|color| color.a() == 255));
+        for contrast in [
+            crate::settings::TextContrast::Standard,
+            crate::settings::TextContrast::Strong,
         ] {
-            let colors: Vec<_> = [Folder, Archive, Image, VideoAudio]
-                .into_iter()
-                .map(|group| crate::os_theme::thumbnail_type_background(dark, Some(group), tint))
-                .collect();
-            assert!(colors.iter().all(|color| color.a() == 255));
-            for contrast in [
-                crate::settings::TextContrast::Standard,
-                crate::settings::TextContrast::Strong,
-            ] {
-                let ctx = egui::Context::default();
-                crate::os_theme::apply_resolved_with_contrast(
-                    &ctx,
-                    if dark {
-                        crate::os_theme::ResolvedTheme::Dark
-                    } else {
-                        crate::os_theme::ResolvedTheme::Light
-                    },
-                    contrast,
-                );
-                for color in &colors {
-                    let ratio = crate::os_theme::contrast_ratio(
-                        ctx.global_style().visuals.text_color(),
-                        *color,
-                    );
-                    assert!(
-                        ratio >= 4.5,
-                        "{tint:?}, dark={dark}, {contrast:?}, {color:?}: {ratio}"
-                    );
-                }
-            }
-            for (index, color) in colors.iter().enumerate() {
-                assert!(!colors[index + 1..].contains(color));
-            }
-            assert_eq!(
-                crate::os_theme::thumbnail_type_background(dark, None, tint),
-                crate::os_theme::thumbnail_type_background(dark, None, ThumbnailTypeTint::Neutral)
+            let ctx = egui::Context::default();
+            crate::os_theme::apply_resolved_with_contrast(
+                &ctx,
+                if dark {
+                    crate::os_theme::ResolvedTheme::Dark
+                } else {
+                    crate::os_theme::ResolvedTheme::Light
+                },
+                contrast,
             );
+            for color in &colors {
+                let ratio = crate::os_theme::contrast_ratio(
+                    ctx.global_style().visuals.text_color(),
+                    *color,
+                );
+                assert!(
+                    ratio >= 4.5,
+                    "dark={dark}, {contrast:?}, {color:?}: {ratio}"
+                );
+            }
         }
+        for (index, color) in colors.iter().enumerate() {
+            assert!(!colors[index + 1..].contains(color));
+        }
+        let neutral = crate::os_theme::thumbnail_type_background(dark, None);
+        assert_eq!(neutral.a(), 255);
+        assert_eq!(neutral.r(), neutral.g());
+        assert_eq!(neutral.g(), neutral.b());
     }
 }
 
@@ -467,7 +457,7 @@ fn thumbnail_type_icon_preserves_small_primary_markers() {
                                 None,
                                 meter,
                                 ThumbnailNameStyle::default(),
-                                Some(THUMB_TYPE_ICON_SIZE),
+                                true,
                                 is_cut,
                             );
                             let protected: Vec<_> = layout
@@ -564,7 +554,7 @@ fn thumbnail_type_icon_real_paint_avoids_check_and_search_label() {
                             None,
                             meter,
                             Default::default(),
-                            Some(THUMB_TYPE_ICON_SIZE),
+                            true,
                             false,
                         );
                         let hits = draw_cell_with_hit_areas(
@@ -639,30 +629,19 @@ fn thumbnail_type_icon_real_paint_avoids_check_and_search_label() {
 }
 
 #[test]
-#[ignore = "Writes user comparison images into target/1677-preview; run explicitly"]
+#[ignore = "Writes user comparison images into target/1677-preview/adopted; run explicitly"]
 fn thumbnail_type_icon_write_previews() {
-    let output = std::path::Path::new("target/1677-preview");
+    let output = std::path::Path::new("target/1677-preview/adopted");
     std::fs::create_dir_all(output).unwrap();
     let mut readme = String::from(concat!(
         "§1.677 固定slot版。製品起動なし。本体共通のセル描画＋生成textureのheadless PNG。\n",
         "logical pt、1pt=1px。既定ON、図形20pt＋不透明背景24pt。slotはセル左上から(4,4)pt。\n",
-        "色の案は左からA=TealRose／B=RoseTeal／C=VioletRose。現sourceはAを仮適用。\n",
+        "配色は利用者採択のAで固定。比較候補の配色・寸法は生成しない。\n",
         "A: 実フォルダ=青緑／アーカイブ類=ラズベリー／画像=紫／動画・音声=蘭色。その他=無彩色。\n",
         "行順: フォルダ/ZIP/RAR/PDF、画像/動画/書庫内フォルダ/音声、書庫内画像/PDFページ/入れ子書庫/スタック、集約フォルダ/集約書庫/参照元なし/CBZ。\n",
         "集約書庫と参照元なしは画像なし。他は明暗の生成画像、選択状態、読書位置メーターを固定。\n",
         "minimumは32 OFF／32 ON／48 ON／74×48（再生マーク）を比較。バッジ多数。\n",
         "32ptではcheckが3pt、他の補助マークも縮小・省略される。極小時の視認性の限界を示す。\n\n",
-    ));
-    readme.push_str(concat!(
-        "A（推奨）: 入れ物は青緑とラズベリー、アイテムは紫→蘭色の隣接色相。小面積でも入れ物を区別し、アイテム同士の近さを保つ。\n",
-        "B: 入れ物はラズベリーと青緑。アイテムは紫の彩度・明るさで分け、同じ仲間という印象を優先。Aより画像と動画・音声が近い。\n",
-        "C: 入れ物は紫とラズベリー。アイテムはエメラルド→ターコイズ。画像と動画の差は大きいが、既存の緑・動画ラベルとの近さが増す。\n",
-        "既存色との兼ね合い: 青の選択枠/ZIP、黄の★、赤のPDF、橙のRAR/警告は避けた。青緑・紫系は動画(#148791)/音声(#5F4BA0)ラベルにも使われ、全てを避けると既存の意味色のため使える色相が足りない。\n",
-        "Aは緑寄りの青緑（約165度）と赤紫寄りの紫/蘭色（約280/296度）へずらす。フォルダ名の緑(#28823C、約133度)とも分ける。RGB値の流用はしない。固定左上の不透明24pt正方形・図形と、下段の半透明文字ラベルの形/位置も区別に使う。\n",
-        "Bの青緑/紫は既存ラベルにやや近く、Cは緑のフォルダ名と動画の青緑に近いのでAを推奨。形を含む認識であり、色覚特性全般での識別保証ではない。\n",
-        "darkは彩度を保った暗色に明色の線、lightは鮮明な中明度色に暗色の線。線はos_themeの通常文字色・コントラスト設定を維持。全案・4分類で線/背景4.5:1以上を回帰検査。\n",
-        "旧colors-*.pngは前回の履歴で今回の候補ではない。公開マニュアルの仕上げは配色採択後に設計担当へ引き継ぐ。\n",
-        "\n",
     ));
     for (name, theme) in [
         ("dark", crate::os_theme::ResolvedTheme::Dark),
@@ -672,29 +651,17 @@ fn thumbnail_type_icon_write_previews() {
         let suites = vec![
             (
                 "off-on",
-                vec![("OFF", Preview { size: None, ..p }), ("ON / 20pt", p)],
-                "通常セル174×132、名前幅優先OFF、OFF/ONを左右比較",
-            ),
-            (
-                "palette-comparison",
                 vec![
-                    ("A / 青緑・ラズベリー / 推奨", p),
                     (
-                        "B / ラズベリー・青緑",
+                        "OFF",
                         Preview {
-                            tint: crate::os_theme::ThumbnailTypeTint::RoseTeal,
+                            show_type_icon: false,
                             ..p
                         },
                     ),
-                    (
-                        "C / 紫・ラズベリー",
-                        Preview {
-                            tint: crate::os_theme::ThumbnailTypeTint::VioletRose,
-                            ..p
-                        },
-                    ),
+                    ("ON / 20pt", p),
                 ],
-                "A / B / C、同じ16項目・選択/画像/名前・24pt背景の実寸比較",
+                "通常セル174×132、名前幅優先OFF、OFF/ONを左右比較",
             ),
             (
                 "narrow",
@@ -728,7 +695,7 @@ fn thumbnail_type_icon_write_previews() {
                             width: 32.0,
                             height: 32.0,
                             crowded: true,
-                            size: None,
+                            show_type_icon: false,
                             ..p
                         },
                     ),
@@ -784,7 +751,7 @@ fn thumbnail_type_icon_write_previews() {
                     (
                         "代表画像なし / OFF",
                         Preview {
-                            size: None,
+                            show_type_icon: false,
                             no_art: true,
                             ..p
                         },
@@ -817,69 +784,18 @@ fn thumbnail_type_icon_write_previews() {
                 "174×132、名前200%最大4行、中央ブックマークタイトル",
             ),
         ];
-        for (id, title, tint) in [
-            (
-                "a",
-                "A / 推奨",
-                crate::os_theme::ThumbnailTypeTint::TealRose,
-            ),
-            ("b", "B", crate::os_theme::ThumbnailTypeTint::RoseTeal),
-            ("c", "C", crate::os_theme::ThumbnailTypeTint::VioletRose),
-        ] {
-            use crate::settings::GridItemDisplayKind::{Archive, Folder, Image, VideoAudio};
+        use crate::settings::GridItemDisplayKind::{Archive, Folder, Image, VideoAudio};
+        readme.push_str(&format!("{name} (Folder, Archive, Image, VideoAudio): "));
+        for group in [Folder, Archive, Image, VideoAudio] {
+            let color = crate::os_theme::thumbnail_type_background(name == "dark", Some(group));
             readme.push_str(&format!(
-                "{title} / {name} (Folder, Archive, Image, VideoAudio): "
-            ));
-            for group in [Folder, Archive, Image, VideoAudio] {
-                let color =
-                    crate::os_theme::thumbnail_type_background(name == "dark", Some(group), tint);
-                readme.push_str(&format!(
-                    "#{:02X}{:02X}{:02X} ",
-                    color.r(),
-                    color.g(),
-                    color.b()
-                ));
-            }
-            readme.push('\n');
-            let file = format!("palette-{id}-crowded-{name}.png");
-            let mut h = harness(
-                theme,
-                vec![
-                    (
-                        title,
-                        Preview {
-                            tint,
-                            crowded: true,
-                            ..p
-                        },
-                    ),
-                    (
-                        "名前幅優先 ON / 多数バッジ",
-                        Preview {
-                            tint,
-                            crowded: true,
-                            prioritize: true,
-                            ..p
-                        },
-                    ),
-                    (
-                        "74pt / 多数バッジ",
-                        Preview {
-                            tint,
-                            crowded: true,
-                            width: 74.0,
-                            height: 94.0,
-                            ..p
-                        },
-                    ),
-                ],
-            );
-            h.run();
-            h.render().unwrap().save(output.join(&file)).unwrap();
-            readme.push_str(&format!(
-                "{file}: {name} / 通常幅・名前幅優先・狭幅、★/タグ/全編集状態/check/枚数/長さ/meter/cut\n"
+                "#{:02X}{:02X}{:02X} ",
+                color.r(),
+                color.g(),
+                color.b()
             ));
         }
+        readme.push('\n');
         for (suite, configs, description) in suites {
             let file = format!("{suite}-{name}.png");
             let mut h = harness(theme, configs);
@@ -935,7 +851,7 @@ fn thumbnail_type_icon_all_states_contexts_and_hit_regions() {
                                         prioritize_width: prioritize,
                                         ..Default::default()
                                     };
-                                    let make = |size| {
+                                    let make = |show_type_icon| {
                                         layout_cell_overlays(
                                             ui.painter(),
                                             rect,
@@ -954,12 +870,12 @@ fn thumbnail_type_icon_all_states_contexts_and_hit_regions() {
                                             None,
                                             true,
                                             style,
-                                            size,
+                                            show_type_icon,
                                             false,
                                         )
                                     };
-                                    let off = make(None);
-                                    let on = make(Some(THUMB_TYPE_ICON_SIZE));
+                                    let off = make(false);
+                                    let on = make(true);
                                     assert!(off.type_icon.is_none());
                                     if width >= 32.0 {
                                         assert!(
@@ -971,10 +887,7 @@ fn thumbnail_type_icon_all_states_contexts_and_hit_regions() {
                                         assert!(rect.contains_rect(icon.rect));
                                         assert_eq!(
                                             icon.rect,
-                                            crate::thumb_overlay_layout::type_icon_slot(
-                                                rect,
-                                                THUMB_TYPE_ICON_SIZE
-                                            )
+                                            crate::thumb_overlay_layout::type_icon_slot(rect)
                                         );
                                         let hits = draw_cell_with_hit_areas(
                                             ui,

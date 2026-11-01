@@ -5333,7 +5333,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 None,
                 false,
                 crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
-                None,
+                false,
                 false,
             );
             crate::app::draw_cell(
@@ -20382,7 +20382,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     media_duration.as_deref(),
                                     self.settings.thumb_show_resume_meter,
                                     crate::thumb_overlay_layout::ThumbnailNameStyle::from_settings(&self.settings),
-                                    self.settings.thumb_show_type_icon.then_some(crate::thumb_overlay_layout::THUMB_TYPE_ICON_SIZE),
+                                    self.settings.thumb_show_type_icon,
                                     is_cut,
                                 );
 
@@ -20498,7 +20498,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         media_duration.as_deref(),
                                         self.settings.thumb_show_resume_meter,
                                         crate::thumb_overlay_layout::ThumbnailNameStyle::from_settings(&self.settings),
-                                        self.settings.thumb_show_type_icon.then_some(crate::thumb_overlay_layout::THUMB_TYPE_ICON_SIZE),
+                                        self.settings.thumb_show_type_icon,
                                         is_cut,
                                     );
                                 }

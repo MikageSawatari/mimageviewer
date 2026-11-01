@@ -318,56 +318,27 @@ pub fn book_resume_meter_palette(dark: bool) -> BookResumeMeterPalette {
     }
 }
 
-/// Background-tint candidates for the thumbnail type plate (not persisted).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum ThumbnailTypeTint {
-    Neutral,
-    #[default]
-    TealRose,
-    RoseTeal,
-    VioletRose,
-}
-
 /// Opaque category plates only; icon ink follows the active app text contrast.
 pub(crate) fn thumbnail_type_background(
     dark: bool,
     group: Option<crate::settings::GridItemDisplayKind>,
-    tint: ThumbnailTypeTint,
 ) -> egui::Color32 {
     use crate::settings::GridItemDisplayKind as G;
     let neutral = if dark { [32, 32, 32] } else { [248, 248, 248] };
-    // A: teal / raspberry containers, violet / orchid items (provisional default).
-    // B: raspberry / teal containers, violet items separated by saturation/lightness.
-    // C: violet / raspberry containers, emerald / turquoise items.
-    // Keep values here, including comparison candidates; previews query this function.
+    // Adopted palette: teal / raspberry containers, violet / orchid items.
+    // Keep category colors here; painting and previews query this function.
     // Existing audio/video labels occupy violet/teal too: shift the hues and keep
     // category plates opaque, square and in the fixed top-left slot (see §1.677).
-    let rgb = match (dark, tint, group) {
-        (_, ThumbnailTypeTint::Neutral, _) | (_, _, None) => neutral,
-        (true, ThumbnailTypeTint::TealRose, Some(G::Folder)) => [0, 98, 73],
-        (true, ThumbnailTypeTint::TealRose, Some(G::Archive)) => [150, 48, 78],
-        (true, ThumbnailTypeTint::TealRose, Some(G::Image)) => [100, 32, 141],
-        (true, ThumbnailTypeTint::TealRose, Some(G::VideoAudio)) => [128, 56, 135],
-        (false, ThumbnailTypeTint::TealRose, Some(G::Folder)) => [53, 196, 155],
-        (false, ThumbnailTypeTint::TealRose, Some(G::Archive)) => [237, 136, 169],
-        (false, ThumbnailTypeTint::TealRose, Some(G::Image)) => [192, 139, 232],
-        (false, ThumbnailTypeTint::TealRose, Some(G::VideoAudio)) => [221, 143, 219],
-        (true, ThumbnailTypeTint::RoseTeal, Some(G::Folder)) => [150, 38, 95],
-        (true, ThumbnailTypeTint::RoseTeal, Some(G::Archive)) => [0, 94, 88],
-        (true, ThumbnailTypeTint::RoseTeal, Some(G::Image)) => [96, 37, 143],
-        (true, ThumbnailTypeTint::RoseTeal, Some(G::VideoAudio)) => [102, 74, 130],
-        (false, ThumbnailTypeTint::RoseTeal, Some(G::Folder)) => [237, 132, 187],
-        (false, ThumbnailTypeTint::RoseTeal, Some(G::Archive)) => [53, 190, 180],
-        (false, ThumbnailTypeTint::RoseTeal, Some(G::Image)) => [188, 141, 233],
-        (false, ThumbnailTypeTint::RoseTeal, Some(G::VideoAudio)) => [202, 166, 228],
-        (true, ThumbnailTypeTint::VioletRose, Some(G::Folder)) => [105, 40, 151],
-        (true, ThumbnailTypeTint::VioletRose, Some(G::Archive)) => [148, 44, 85],
-        (true, ThumbnailTypeTint::VioletRose, Some(G::Image)) => [0, 82, 54],
-        (true, ThumbnailTypeTint::VioletRose, Some(G::VideoAudio)) => [0, 97, 98],
-        (false, ThumbnailTypeTint::VioletRose, Some(G::Folder)) => [192, 139, 237],
-        (false, ThumbnailTypeTint::VioletRose, Some(G::Archive)) => [237, 136, 178],
-        (false, ThumbnailTypeTint::VioletRose, Some(G::Image)) => [74, 181, 127],
-        (false, ThumbnailTypeTint::VioletRose, Some(G::VideoAudio)) => [73, 197, 198],
+    let rgb = match (dark, group) {
+        (_, None) => neutral,
+        (true, Some(G::Folder)) => [0, 98, 73],
+        (true, Some(G::Archive)) => [150, 48, 78],
+        (true, Some(G::Image)) => [100, 32, 141],
+        (true, Some(G::VideoAudio)) => [128, 56, 135],
+        (false, Some(G::Folder)) => [53, 196, 155],
+        (false, Some(G::Archive)) => [237, 136, 169],
+        (false, Some(G::Image)) => [192, 139, 232],
+        (false, Some(G::VideoAudio)) => [221, 143, 219],
     };
     egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2])
 }
