@@ -4459,3 +4459,69 @@ cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen::page_turn/)' --
 全focusedを外で確認する場合は、§23.4の `$stage22Focused` 定義と§23.5の `$stage22ReviewFocused` をそのまま使う。
 実core/AIアプリの起動確認・確認用build-devは未実施 (sandbox内でreal-pipeのgreen前提が揃わないため)。
 test-lib-full/test-fullの再実行はしていない。page-turnの元の外部失敗時の状態についてのみ、上記の未確定点が残る。
+
+### 23.7 実装レビュー 3 巡目の対応
+
+実装担当 root のコード照合・非対話テスト記録。対象 HEAD は `c28da6a9b`。
+正式な独立レビューは別threadで行う。commit・製品起動・実client configの操作はしていない。
+
+#### 指摘 → 修正 → 回帰
+
+P2をコードで確認した。完了ownerの `TagCompletionLabel::Generic` を最後に `Option<&str>` へ変換すると、
+formatterがClear/Restoreとの区別を失う。`cleared > 0` による分岐は別操作のno-opまでクリア件数へ足し、
+`restored > 0` による分岐は混在バッチの他の結果を隠していた。
+
+- `src/tag_ops.rs` の formatter へラベル型をそのまま渡し、`Specific` (付与/削除種別を含む) / Clear /
+  Restore / Genericで文言を決める。型の情報を落とす `display_tag` helperは削除した。
+- 単独種別の文言は維持する。Clearだけの場合は元から空だった項目も従来どおりクリア件数へ含める。
+  Specificの全件no-op、Restoreだけの場合も従来の文言を保つ。
+- Genericは「タグを変更しました (付与 N 件 / 削除 N 件 / クリア N 件 / 元に戻す N 件 / 変更なし N 件)」を使い、
+  この順で非ゼロの部分だけを出す。異なるカテゴリを合算しない。未設定のラベルで結果が届いた場合も同じ内訳とする。
+  §23.6で維持していた旧formatterの優先順位は、混在バッチについて本節の明示的な内訳へ置き換える。
+- エラー時のwarning分岐、バッチの終了/破棄、agent/userの件数分離、Undo登録、writerのsend/done順は変更しない。
+  入力の制限や新たな保留状態は足さず、既存の型による最終表示の選択だけで直す。
+
+実操作入口 → 制御可能なwriter → pollの既存回帰を拡張した。
+Clear Xの結果を採用し、完了前に#AがあるYへ#Aを追加したno-opが届くケースは
+「クリア 1 件 / 変更なし 1 件」となり、Yのcacheは#Aのまま、Xのcacheは空のままを検査する。
+Clear＋実追加、Clear＋追加の両方no-op、Undo/Redo＋新規編集、編集＋Undo、異なるタグ/付与削除の混在も
+新しい内訳を検査する。単独Clear/Undo/Redoと次の単独バッチは既存文言のまま検査する。
+
+formatter単体の引数も型へ移行し、付与、削除、Clear、空項目のClear、Restore、Specificのno-opの文言を固定。
+追加4件は `toast_clear_already_empty_keeps_clear_wording`、`toast_mixed_clear_keeps_noop_and_add_separate`、
+`toast_mixed_results_keep_every_nonzero_category_in_order`、`toast_mixed_all_noop_does_not_say_clear`。
+全5カテゴリの固定順とゼロ件の省略を含む。既存のwriter失敗warning回帰も指定focusedで検査する。
+
+変更ファイルは `src/tag_ops.rs` と本節のみ。DB/IPC/Remote/agentの書込結果・page-turn・detached述語/viewport routingの変更はない。
+PNGは追加0・変更0。実アプリでのトースト表示は未確認。
+
+#### コマンドと結果
+
+| コマンド | 観測者 | 実 exit | 結果 / ログ |
+|---|---|---:|---|
+| `cargo fmt` / `cargo fmt --check` | root | 0 / 0 | workspace全体。`target/mcp-stage2-2-review3-fmt.log` / `target/mcp-stage2-2-review3-fmt-check.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | root | 0 | 20.25s、`target/mcp-stage2-2-review3-core-check.log` |
+| 下記の指定focused | root | 0 | 43/43、5.101s、compile 2m23s。`target/mcp-stage2-2-review3-focused.log` |
+| `python scripts/check_ui_glyphs.py` | root | 0 | 危険なUI glyphなし、`target/mcp-stage2-2-review3-glyphs.log` |
+| `git diff --check` | root | 0 | `target/mcp-stage2-2-review3-diff-check.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | root | 0 | core 4m09s、Remote/EPUB worker/MCPも更新。PE/VCRT `runtime=4 pe=4` 成功。`target/mcp-stage2-2-review3-build-dev.log` / `target/vcrt-pe-reports/dev-runtime.json` |
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/tag_ops/) or test(/undo_ops/) or test(/tag_write_worker/) or test(/agent_metadata_write/)' --no-fail-fast
+```
+
+今回はこのfilterに実pipe試験を含まず、OS error 5による失敗もない。
+検証の範囲は本節のテストであり、全lib / snapshot比較 / 製品の実行を再実施した結果とは扱わない。
+AGENTS.mdの確認用ビルド規則に従い、全指定チェック成功後に
+`.\scripts\build-dev.ps1 -PreserveRuntime` で通常featureの成果物だけを更新した。起動していない。
+
+利用者が表示を確かめる場合の起動コマンド:
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+これは通常の `%APPDATA%\mimageviewer` を使用し、起動だけでも実設定/データを更新し得る。
+single-instance mutexを共有するため、先にインストール版/常駐tray版を終了する。
+確認対象は、単独操作の文言が従来どおりで、保留中にClear＋既存タグのno-op追加やUndo/Redo＋編集が混在すると
+カテゴリ別の内訳になること。決定的な順序は上記headless回帰で検査済みであり、実アプリの表示は未確認。

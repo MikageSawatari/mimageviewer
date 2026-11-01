@@ -686,14 +686,6 @@ impl TagCompletionLabel {
             *self = Self::Generic;
         }
     }
-
-    fn display_tag(&self) -> Option<&str> {
-        match self {
-            Self::Specific { tag, .. } => Some(tag),
-            Self::Generic => Some("タグ"),
-            Self::Uninitialized | Self::Clear | Self::Restore => None,
-        }
-    }
 }
 
 impl TagWriteCompletion {
@@ -886,14 +878,7 @@ impl App {
                     None => self.show_feedback_warning(msg),
                 }
             } else if (added + removed + cleared + restored + noop) > 0 {
-                let msg = format_completion_toast(
-                    label.display_tag(),
-                    added,
-                    removed,
-                    cleared,
-                    restored,
-                    noop,
-                );
+                let msg = format_completion_toast(&label, added, removed, cleared, restored, noop);
                 match surface {
                     Some(surface) => self.show_feedback_toast_on(msg, surface),
                     None => self.show_feedback_toast(msg),
@@ -996,39 +981,60 @@ impl App {
     }
 }
 
-/// 完了トーストの文言を組み立てる。Toggle で付与/削除が混在するケース (複数選択で
-/// 既に付与済のものと未付与のものが混ざる) にも耐える形式で出す。
-/// Undo/Redo 由来の SetTags (=`restored`) が混ざる場合は専用文言で出す。
+/// バッチの操作種別で文言を選ぶ。単一操作の既存文言は保ち、混在時はカテゴリを
+/// 合算・省略せず、非ゼロの結果を固定順で列挙する。
 fn format_completion_toast(
-    tag_label: Option<&str>,
+    label: &TagCompletionLabel,
     added: usize,
     removed: usize,
     cleared: usize,
     restored: usize,
     noop: usize,
 ) -> String {
-    if restored > 0 {
-        return format!("{restored} 件のタグを元に戻しました");
-    }
-    if cleared > 0 || (noop > 0 && added == 0 && removed == 0 && tag_label.is_none()) {
-        let total_clear = cleared + noop;
-        return format!("{total_clear} 件から mIV タグをクリア");
-    }
-    let tag = tag_label.unwrap_or("タグ");
-    if added == 0 && removed == 0 && noop > 0 {
-        return format!("{tag}: {noop} 件は変更なし");
-    }
-    match (added, removed) {
-        (a, 0) if a > 0 => format!("{a} 件に {tag} を付与"),
-        (0, r) if r > 0 => format!("{r} 件から {tag} を削除"),
-        (a, r) => format!("{tag}: {a} 件付与 / {r} 件削除"),
+    match label {
+        TagCompletionLabel::Specific { tag, kind } => {
+            if added == 0 && removed == 0 && noop > 0 {
+                return format!("{tag}: {noop} 件は変更なし");
+            }
+            match kind {
+                TagCompletionKind::Add => format!("{added} 件に {tag} を付与"),
+                TagCompletionKind::Remove => format!("{removed} 件から {tag} を削除"),
+            }
+        }
+        TagCompletionLabel::Clear => {
+            let total_clear = cleared + noop;
+            format!("{total_clear} 件から mIV タグをクリア")
+        }
+        TagCompletionLabel::Restore => format!("{restored} 件のタグを元に戻しました"),
+        TagCompletionLabel::Generic | TagCompletionLabel::Uninitialized => {
+            let parts = [
+                ("付与", added),
+                ("削除", removed),
+                ("クリア", cleared),
+                ("元に戻す", restored),
+                ("変更なし", noop),
+            ]
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(name, count)| format!("{name} {count} 件"))
+            .collect::<Vec<_>>()
+            .join(" / ");
+            format!("タグを変更しました ({parts})")
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::format_completion_toast;
+    use super::{TagCompletionKind, TagCompletionLabel, format_completion_toast};
     use std::path::PathBuf;
+
+    fn specific_label(tag: &str, kind: TagCompletionKind) -> TagCompletionLabel {
+        TagCompletionLabel::Specific {
+            tag: tag.into(),
+            kind,
+        }
+    }
 
     fn controlled_result(
         job: crate::tag_write_worker::TagWriteJob,
@@ -1084,12 +1090,27 @@ mod tests {
     fn user_completion_label_matches_all_pending_operations() {
         use crate::tag_write_worker::{TagAction, TagWriteHandle};
         for (second_name, second_add, action, expected) in [
-            ("B", true, TagAction::Added, "2 件に タグ を付与"),
+            (
+                "B",
+                true,
+                TagAction::Added,
+                "タグを変更しました (付与 2 件)",
+            ),
             ("A", true, TagAction::Added, "2 件に #A を付与"),
             // DB identity is case insensitive; retain the first display spelling.
             ("a", true, TagAction::Added, "2 件に #A を付与"),
-            ("A", false, TagAction::Removed, "タグ: 1 件付与 / 1 件削除"),
-            ("B", true, TagAction::NoOp, "タグ: 2 件は変更なし"),
+            (
+                "A",
+                false,
+                TagAction::Removed,
+                "タグを変更しました (付与 1 件 / 削除 1 件)",
+            ),
+            (
+                "B",
+                true,
+                TagAction::NoOp,
+                "タグを変更しました (変更なし 2 件)",
+            ),
         ] {
             let mut app = crate::app::tests::phase_c_support::setup_app();
             let (handle, driver) = TagWriteHandle::controlled_for_test();
@@ -1166,49 +1187,82 @@ mod tests {
         app.poll_tag_write_results();
         assert_eq!(
             app.fs_feedback_toast.as_ref().unwrap().0,
-            "タグ: 2 件付与 / 1 件削除"
+            "タグを変更しました (付与 2 件 / 削除 1 件)"
         );
     }
 
     #[test]
     fn clear_completion_label_cannot_be_replaced_by_a_pending_edit() {
         use crate::tag_write_worker::{TagAction, TagWriteHandle};
-        for (mix_edit, action) in [
-            (false, TagAction::Cleared),
-            (false, TagAction::NoOp),
-            (true, TagAction::NoOp),
+        for (action, edit_action, expected) in [
+            (TagAction::Cleared, None, "1 件から mIV タグをクリア"),
+            (TagAction::NoOp, None, "1 件から mIV タグをクリア"),
+            (
+                TagAction::Cleared,
+                Some(TagAction::NoOp),
+                "タグを変更しました (クリア 1 件 / 変更なし 1 件)",
+            ),
+            (
+                TagAction::Cleared,
+                Some(TagAction::Added),
+                "タグを変更しました (付与 1 件 / クリア 1 件)",
+            ),
+            (
+                TagAction::NoOp,
+                Some(TagAction::NoOp),
+                "タグを変更しました (変更なし 2 件)",
+            ),
         ] {
             let mut app = crate::app::tests::phase_c_support::setup_app();
             let (handle, driver) = TagWriteHandle::controlled_for_test();
             app.tag_write_handle = Some(handle);
             let path = app.tmp.path().join("clear.jpg");
+            let clear_key = crate::tags_db::item_key_for_path(&path);
+            let before = if action == TagAction::Cleared {
+                vec!["#old".into()]
+            } else {
+                vec![]
+            };
+            app.set_tags_cache_entry(clear_key.clone(), before.clone());
             app.items = vec![crate::grid_item::GridItem::Folder(path)];
             app.selected = Some(0);
             app.request_tag_clear_for_selection(crate::app::ActionSurface::MainWindow);
             let clear = driver.recv_job();
-            driver.publish_result(controlled_result(clear, Ok(action)));
+            let mut result = controlled_result(clear, Ok(action));
+            result.tags_before = before;
+            result.tags_after.clear();
+            driver.publish_result(result);
             app.poll_tag_write_results();
-            if mix_edit {
-                let path = app.tmp.path().join("edit.jpg");
-                submit_named_user(&mut app, "A", path, true);
+            let edit_path = app.tmp.path().join("edit.jpg");
+            if let Some(edit_action) = edit_action {
+                if edit_action == TagAction::NoOp {
+                    let key = crate::tags_db::item_key_for_path(&edit_path);
+                    app.set_tags_cache_entry(key, vec!["#A".into()]);
+                }
+                submit_named_user(&mut app, "A", edit_path.clone(), true);
                 let edit = driver.recv_job();
                 assert_eq!(
                     app.tag_write_completion.label,
                     super::TagCompletionLabel::Generic
                 );
-                driver.publish_result(controlled_result(edit, Ok(TagAction::NoOp)));
+                let mut result = controlled_result(edit, Ok(edit_action));
+                if edit_action == TagAction::NoOp {
+                    result.tags_before = vec!["#A".into()];
+                    result.tags_after = result.tags_before.clone();
+                }
+                driver.publish_result(result);
                 driver.finish_job();
             }
             let notifications = app.feedback_toasts_for_test.len();
             driver.finish_job();
             app.poll_tag_write_results();
             assert_eq!(app.feedback_toasts_for_test.len(), notifications + 1);
-            let expected = if mix_edit {
-                "タグ: 2 件は変更なし"
-            } else {
-                "1 件から mIV タグをクリア"
-            };
             assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, expected);
+            assert!(app.tags_cache[&clear_key].is_empty());
+            if edit_action == Some(TagAction::NoOp) {
+                let key = crate::tags_db::item_key_for_path(&edit_path);
+                assert_eq!(app.tags_cache[&key], vec!["#A"]);
+            }
         }
     }
 
@@ -1256,10 +1310,12 @@ mod tests {
                 driver.finish_job();
                 app.poll_tag_write_results();
                 assert_eq!(app.feedback_toasts_for_test.len(), notifications + 1);
-                assert_eq!(
-                    app.fs_feedback_toast.as_ref().unwrap().0,
+                let expected = if mix_edit {
+                    "タグを変更しました (付与 1 件 / 元に戻す 1 件)"
+                } else {
                     "1 件のタグを元に戻しました"
-                );
+                };
+                assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, expected);
             }
         }
     }
@@ -1287,7 +1343,7 @@ mod tests {
         app.poll_tag_write_results();
         assert_eq!(
             app.fs_feedback_toast.as_ref().unwrap().0,
-            "1 件のタグを元に戻しました"
+            "タグを変更しました (付与 1 件 / 元に戻す 1 件)"
         );
         submit_named_user(&mut app, "B", path, false);
         let remove = driver.recv_job();
@@ -1336,7 +1392,10 @@ mod tests {
         app.poll_tag_write_results();
         assert_eq!(app.feedback_toasts_for_test.len(), notifications);
         assert_eq!(app.tag_write_completion.added, 1);
-        assert_eq!(app.tag_write_completion.label.display_tag(), Some("#tag"));
+        assert_eq!(
+            app.tag_write_completion.label,
+            specific_label("#tag", TagCompletionKind::Add)
+        );
         assert_eq!(
             app.tag_toast_surface,
             Some(crate::app::ActionSurface::MainWindow)
@@ -1395,7 +1454,10 @@ mod tests {
         app.poll_tag_write_results();
         assert_eq!(app.tag_write_completion.added, 2);
         assert_eq!(app.feedback_toasts_for_test.len(), notifications);
-        assert_eq!(app.tag_write_completion.label.display_tag(), Some("#tag"));
+        assert_eq!(
+            app.tag_write_completion.label,
+            specific_label("#tag", TagCompletionKind::Add)
+        );
         assert_eq!(app.meta_undo.undo_len(), 1);
         assert_eq!(app.pending_tag_undos.len(), 1);
         assert!(app.pending_tag_undos.contains_key(&pending_tx));
@@ -1523,8 +1585,8 @@ mod tests {
             "agent must not finalize a user's edit session"
         );
         assert_eq!(
-            app.tag_write_completion.label.display_tag(),
-            Some("user-label")
+            app.tag_write_completion.label,
+            specific_label("user-label", TagCompletionKind::Add)
         );
         assert_eq!(
             app.tag_toast_surface,
@@ -1547,8 +1609,8 @@ mod tests {
         }
         assert!(app.adjustment_dragging);
         assert_eq!(
-            app.tag_write_completion.label.display_tag(),
-            Some("user-label")
+            app.tag_write_completion.label,
+            specific_label("user-label", TagCompletionKind::Add)
         );
         assert_eq!(
             app.tag_toast_surface,
@@ -1646,7 +1708,14 @@ mod tests {
     #[test]
     fn toast_single_add() {
         assert_eq!(
-            format_completion_toast(Some("#ドール"), 1, 0, 0, 0, 0),
+            format_completion_toast(
+                &specific_label("#ドール", TagCompletionKind::Add),
+                1,
+                0,
+                0,
+                0,
+                0
+            ),
             "1 件に #ドール を付与"
         );
     }
@@ -1654,7 +1723,14 @@ mod tests {
     #[test]
     fn toast_single_remove() {
         assert_eq!(
-            format_completion_toast(Some("#ドール"), 0, 1, 0, 0, 0),
+            format_completion_toast(
+                &specific_label("#ドール", TagCompletionKind::Remove),
+                0,
+                1,
+                0,
+                0,
+                0
+            ),
             "1 件から #ドール を削除"
         );
     }
@@ -1662,15 +1738,15 @@ mod tests {
     #[test]
     fn toast_mixed_add_remove() {
         assert_eq!(
-            format_completion_toast(Some("#tag"), 2, 3, 0, 0, 0),
-            "#tag: 2 件付与 / 3 件削除"
+            format_completion_toast(&TagCompletionLabel::Generic, 2, 3, 0, 0, 0),
+            "タグを変更しました (付与 2 件 / 削除 3 件)"
         );
     }
 
     #[test]
     fn toast_clear_miv() {
         assert_eq!(
-            format_completion_toast(None, 0, 0, 5, 0, 0),
+            format_completion_toast(&TagCompletionLabel::Clear, 0, 0, 5, 0, 0),
             "5 件から mIV タグをクリア"
         );
     }
@@ -1678,36 +1754,73 @@ mod tests {
     #[test]
     fn toast_clear_miv_with_noop() {
         assert_eq!(
-            format_completion_toast(None, 0, 0, 3, 0, 2),
+            format_completion_toast(&TagCompletionLabel::Clear, 0, 0, 3, 0, 2),
             "5 件から mIV タグをクリア"
         );
     }
 
     #[test]
     fn toast_tag_noop_does_not_say_clear() {
+        for kind in [TagCompletionKind::Add, TagCompletionKind::Remove] {
+            assert_eq!(
+                format_completion_toast(&specific_label("#tag", kind), 0, 0, 0, 0, 2),
+                "#tag: 2 件は変更なし"
+            );
+        }
+    }
+
+    #[test]
+    fn toast_clear_already_empty_keeps_clear_wording() {
         assert_eq!(
-            format_completion_toast(Some("#tag"), 0, 0, 0, 0, 2),
-            "#tag: 2 件は変更なし"
+            format_completion_toast(&TagCompletionLabel::Clear, 0, 0, 0, 0, 2),
+            "2 件から mIV タグをクリア"
+        );
+    }
+
+    #[test]
+    fn toast_mixed_clear_keeps_noop_and_add_separate() {
+        assert_eq!(
+            format_completion_toast(&TagCompletionLabel::Generic, 0, 0, 1, 0, 1),
+            "タグを変更しました (クリア 1 件 / 変更なし 1 件)"
+        );
+        assert_eq!(
+            format_completion_toast(&TagCompletionLabel::Generic, 1, 0, 1, 0, 0),
+            "タグを変更しました (付与 1 件 / クリア 1 件)"
+        );
+    }
+
+    #[test]
+    fn toast_mixed_results_keep_every_nonzero_category_in_order() {
+        assert_eq!(
+            format_completion_toast(&TagCompletionLabel::Generic, 1, 2, 3, 4, 5),
+            "タグを変更しました (付与 1 件 / 削除 2 件 / クリア 3 件 / 元に戻す 4 件 / 変更なし 5 件)"
+        );
+    }
+
+    #[test]
+    fn toast_mixed_all_noop_does_not_say_clear() {
+        assert_eq!(
+            format_completion_toast(&TagCompletionLabel::Generic, 0, 0, 0, 0, 2),
+            "タグを変更しました (変更なし 2 件)"
         );
     }
 
     #[test]
     fn toast_restore_for_undo() {
-        // Undo/Redo の SetTags は専用文言。タグラベルや add/remove 件数より優先される。
+        // Undo/Redo だけのバッチは既存の専用文言。
         assert_eq!(
-            format_completion_toast(None, 0, 0, 0, 4, 0),
+            format_completion_toast(&TagCompletionLabel::Restore, 0, 0, 0, 4, 0),
             "4 件のタグを元に戻しました"
         );
     }
 
     #[test]
     fn toast_restore_with_noop_does_not_say_clear() {
-        // Codex P3 回帰: 部分的に NoOp が混じった Restore でも「元に戻した」を
-        // 専用文言として優先する (誤って「mIV タグをクリア」にならない)。
+        // Restore だけのバッチでは、将来NoOpを返すようになっても既存文言を保つ。
         // 現状 worker は SetTags を必ず Restored 扱いにするため `noop=0` のはずだが、
         // 将来 NoOp が混ざるロジックに変えても文言が壊れないように回帰テストを置く。
         assert_eq!(
-            format_completion_toast(None, 0, 0, 0, 3, 2),
+            format_completion_toast(&TagCompletionLabel::Restore, 0, 0, 0, 3, 2),
             "3 件のタグを元に戻しました"
         );
     }
