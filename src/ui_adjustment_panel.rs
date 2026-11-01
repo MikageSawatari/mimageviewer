@@ -17667,3 +17667,7 @@ mod section1445_slider_tests {
 #[cfg(test)]
 #[path = "ui_adjustment_panel/mask_bucket_1673_tests.rs"]
 mod mask_bucket_1673_tests;
+
+#[cfg(test)]
+#[path = "ui_adjustment_panel/click_timing_1679_tests.rs"]
+mod click_timing_1679_tests;
