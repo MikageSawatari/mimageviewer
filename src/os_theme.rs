@@ -318,6 +318,31 @@ pub fn book_resume_meter_palette(dark: bool) -> BookResumeMeterPalette {
     }
 }
 
+/// Opaque category plates only; icon ink follows the active app text contrast.
+pub(crate) fn thumbnail_type_background(
+    dark: bool,
+    group: Option<crate::settings::GridItemDisplayKind>,
+) -> egui::Color32 {
+    use crate::settings::GridItemDisplayKind as G;
+    let neutral = if dark { [32, 32, 32] } else { [248, 248, 248] };
+    // Adopted palette: teal / raspberry containers, violet / orchid items.
+    // Keep category colors here; painting and previews query this function.
+    // Existing audio/video labels occupy violet/teal too: shift the hues and keep
+    // category plates opaque, square and in the fixed top-left slot (see §1.677).
+    let rgb = match (dark, group) {
+        (_, None) => neutral,
+        (true, Some(G::Folder)) => [0, 98, 73],
+        (true, Some(G::Archive)) => [150, 48, 78],
+        (true, Some(G::Image)) => [100, 32, 141],
+        (true, Some(G::VideoAudio)) => [128, 56, 135],
+        (false, Some(G::Folder)) => [53, 196, 155],
+        (false, Some(G::Archive)) => [237, 136, 169],
+        (false, Some(G::Image)) => [192, 139, 232],
+        (false, Some(G::VideoAudio)) => [221, 143, 219],
+    };
+    egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+}
+
 /// Windows の「アプリ用の色」(`HKCU\...\Personalize\AppsUseLightTheme`) を読んで
 /// Light / Dark を返す。取得失敗時は `None`。
 #[cfg(windows)]

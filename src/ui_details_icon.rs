@@ -143,12 +143,54 @@ pub(crate) fn draw_details_preview_icon(
     color: egui::Color32,
     muted: bool,
 ) {
+    draw_kind_icon(painter, rect, kind, color, muted, 1.0);
+}
+
+/// The thumbnail mark shares the Details shapes with a category-colored opaque plate.
+pub(crate) fn draw_thumbnail_type_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    item: &GridItem,
+    visuals: &egui::Visuals,
+) {
+    let background = crate::os_theme::thumbnail_type_background(
+        visuals.dark_mode,
+        crate::grid_item::display_kind(item),
+    );
+    let foreground = visuals.text_color();
+    painter.rect_filled(rect, 3.0, background);
+    painter.rect_stroke(
+        rect,
+        3.0,
+        egui::Stroke::new(1.0, foreground.gamma_multiply(0.35)),
+        egui::StrokeKind::Inside,
+    );
+    draw_kind_icon(
+        painter,
+        rect.shrink(crate::thumb_overlay_layout::TYPE_ICON_PADDING),
+        details_icon_kind(item),
+        foreground,
+        false,
+        f32::INFINITY,
+    );
+}
+
+fn draw_kind_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    kind: DetailsIconKind,
+    color: egui::Color32,
+    muted: bool,
+    max_scale: f32,
+) {
     if rect.width() < 12.0 || rect.height() < 12.0 {
         return;
     }
     let alpha = if muted { 90 } else { color.a() };
     let color = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
-    let scale = (rect.width() / 20.0).min(rect.height() / 18.0).min(1.0);
+    let scale = (rect.width() / 20.0)
+        .min(rect.height() / 18.0)
+        .min(max_scale);
     let origin = rect.center() - egui::vec2(10.0 * scale, 9.0 * scale);
     let c = IconCanvas {
         painter,

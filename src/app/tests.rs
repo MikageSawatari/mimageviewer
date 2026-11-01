@@ -110684,6 +110684,8 @@ mod background_click_scroll_regression_tests {
                 None,
                 app.settings.thumb_show_resume_meter,
                 crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+                false,
+                false,
             );
             let pos = if filename {
                 layout
@@ -110900,6 +110902,8 @@ mod background_click_scroll_regression_tests {
             None,
             app.settings.thumb_show_resume_meter,
             crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+            false,
+            false,
         )
     }
 
@@ -111379,6 +111383,8 @@ mod background_click_scroll_regression_tests {
                 None,
                 app.settings.thumb_show_resume_meter,
                 crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+                false,
+                false,
             );
             let pos = if check {
                 layout.check.expect("check badge").center()
@@ -111520,6 +111526,14 @@ mod background_click_scroll_regression_tests {
 
     fn assert_padding_text_is_item(harness: &mut Harness<'_, State>, label: &str) {
         let pos = painted_text_in_padding(harness, label);
+        assert_painted_position_is_item(harness, pos, label);
+    }
+
+    fn assert_painted_position_is_item(
+        harness: &mut Harness<'_, State>,
+        pos: egui::Pos2,
+        label: &str,
+    ) {
         harness.state_mut().app.selected = None;
         click(harness, pos);
         assert_eq!(
@@ -111548,8 +111562,39 @@ mod background_click_scroll_regression_tests {
                 reason: crate::grid_item::CollectionPlaceholderReason::Missing,
             };
             let mut harness = small_cell_harness(item, ThumbnailState::Failed);
+            // This regression probes legacy caption ink in the cell padding. At the
+            // width floor, the enabled type slot may legitimately suppress the reason.
+            harness.state_mut().app.settings.thumb_show_type_icon = false;
+            harness.run_steps(4);
             assert_padding_text_is_item(&mut harness, label);
         }
+    }
+
+    #[test]
+    fn letterbox_real_grid_missing_type_icon_remains_item_at_minimum_width() {
+        let item = GridItem::CollectionPlaceholder {
+            path: "very-long-missing-collection-file-name.png".into(),
+            last_known_kind: crate::collection_store::CollectionResolvedKind::Image,
+            reason: crate::grid_item::CollectionPlaceholderReason::Missing,
+        };
+        let mut harness = small_cell_harness(item, ThumbnailState::Failed);
+        harness.state_mut().app.settings.thumb_show_type_icon = true;
+        harness.run_steps(4);
+        let cell = cell_rect(&harness);
+        let slot = crate::thumb_overlay_layout::type_icon_slot(cell);
+        assert!(cell.contains_rect(slot));
+        let background = crate::os_theme::thumbnail_type_background(
+            harness.ctx.global_style().visuals.dark_mode,
+            None,
+        );
+        assert!(
+            harness.output().shapes.iter().any(|clipped| {
+                matches!(&clipped.shape, egui::Shape::Rect(shape)
+                if shape.rect == slot && shape.fill == background)
+            }),
+            "the enabled type plate must really be painted"
+        );
+        assert_painted_position_is_item(&mut harness, slot.center(), "type icon");
     }
 
     #[test]

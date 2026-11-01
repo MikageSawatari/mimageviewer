@@ -1,5 +1,13 @@
 # UI スナップショットテスト運用方針
 
+§1.677の種類iconは利用者採択の配色A・既定ON・セル枠左上(4,4)pt・図形20pt＋背景24ptで固定する。
+`thumbnail_type_icon_dark/light`の既存baselineはそのまま維持し、今回の仕上げでPNGは更新しない。
+比較候補のB/C・色なし・16/24ptはsourceから撤去する。ignoredの`thumbnail_type_icon_write_previews`は残し、
+確定仕様のOFF/ON・狭幅・最小32pt・多数badge・代表画像なし・名前200%最大4行・中央bookmark titleを
+dark/light各6枚、`target/1677-preview/adopted/`へ明示実行時だけ生成する。過去の比較PNGと混ぜない。
+通常のテストではPNG書き出しを行わず、2枚のbaseline比較と純layout・実paint回帰を維持する。
+製品起動や実速度測定の代わりには扱わない。検証結果の正本は[§1.677の実装記録](next-release-backlog.md)。
+
 §1.673 のバケツは、lib の純描画 fixture で `bucket_drawn_mask_options_dark`
 （250×300、27,771 bytes）を1枚追加する。3ツール共通の基準選択・色差の無効表示・既存の範囲と
 漏れ止め／はみ出しを描き、切替後の色差値保持もheadless入力で検査する。

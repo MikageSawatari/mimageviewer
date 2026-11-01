@@ -1,4 +1,4 @@
-﻿# 次リリース検討バックログ
+# 次リリース検討バックログ
 
 このファイルは、**いま着手できる**作業候補だけを置く恒久バックログ。
 完了した項目はコミット履歴・リリースノート・個別設計メモに任せ、このファイルからは削除する。
@@ -191,14 +191,141 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.677 サムネイル表示後も種類アイコンを残し、フォルダ・書庫・単体画像を見分けやすくする — 5ch >>700 (2026-11-01)
 
-- 状態: **未着手・種類アイコンを常時表示する方向でバックログへ追加 (利用者依頼 2026-11-01)**。[>>700](https://egg.5ch.io/test/read.cgi/software/1782419551/700) は ZIP・フォルダ・単体画像を見分けにくいため、枠を ZIP は薄い青、フォルダは薄い緑、画像は従来どおりにする提案。利用者自身も区別しにくいと感じているが、色分けだけで解決するかは慎重に検討し、まず固定位置の種類アイコンで形でも判別できる案を採る。動画の画質についての感想は、本項目の変更対象に含めない。
-- 現状: `src/app/grid_paint.rs` は代表サムネイルが Loaded になると中央のフォルダ・書庫アイコンを描かず、以降は緑のフォルダ名バッジや小さな ZIP / PDF / RAR 等の形式バッジで区別する。画像は種類マークを持たず、区別の手掛かりが揃っていない。セルの青背景と太い青枠はカーソル・チェック状態を示すので、種類を示すために上書きしない。
-- 方針: フォルダ・書庫・PDF・単体画像等の小さな種類アイコンを、セル左下の共通の配置規則で表示する。代表画像の読み込み前 / 後、キャッシュからの復帰、代表画像なしでも種類の目印を残す。単なるファイル名の文字列prefixではなく、名前とは独立したレイアウト要素とし、中央寄せ・複数行・名前非表示でも区別できるようにする。種類アイコン表示は環境設定で ON/OFF 可能とし、既定と具体的な寸法は実装時の見た目を確認して決める。
-- 既存表示との統合: ZIP / RAR / PDF 等の短い形式ラベルは残し、既存の形式バッジと種類アイコンを同じ下段領域で整理する。§1.663の「ファイル名の表示幅を優先する」ONでは、名前を再び狭めず、種類・形式表示を名前の上へまとめる案を基本とする。名前の折り返し・文字サイズ・フォルダ名バッジ、★・タグ・編集状態・チェック・スタック枚数・再生時間・読書位置メーターとの非交差を共通layoutで保証する。読み込み中にセル寸法や行高が変わる配置にしない。
+- 状態: **配色Aで仕上げ・個別自動検証・確認用build完了、未コミット／実機未確認 (2026-11-01)**（全lib一括は4件失敗。単独3回と旧fixture修正後の結果を下記に区別して記録）。既定ON、20pt（背景24pt）、セル枠左上から右4pt・下4pt、カテゴリ順と同じ4分類で確定。実フォルダ=青緑 / アーカイブ類=ラズベリー / 画像=紫 / 動画・音声=蘭色。[>>700](https://egg.5ch.io/test/read.cgi/software/1782419551/700) 由来。最新結果は下の「採択後の仕上げ」を参照。動画の画質についての感想は本項目の対象外。
+- 着手前: `src/app/grid_paint.rs` は代表サムネイルが Loaded になると中央のフォルダ・書庫アイコンを描かず、以降は緑のフォルダ名バッジや小さな ZIP / PDF / RAR 等の形式バッジで区別する。画像は種類マークを持たず、区別の手掛かりが揃っていない。セルの青背景と太い青枠はカーソル・チェック状態を示すので、種類を示すために上書きしない。
+- 方針: 種類アイコンをセル枠の左上(4,4)ptの固定slotへ常時表示する。読み込み前後・代表画像なし・名前非表示・名前幅優先・文字サイズ/行数で移動しない。既定ON、図形20pt＋背景24ptは利用者採択済み。環境設定でOFFにすると予約も外す。
+- 既存表示との統合: ZIP / RAR / PDF 等の短い形式ラベルと既存機能を維持する。slotを先に予約し、他の表示が避ける。狭いセルでは種類iconを最優先に残し、他badge側を既存の優先順で縮小・行数削減・省略する。セル寸法・行高・画像fitは変更しない。
 - 見た目: 画像の明暗に埋もれない小さな背景を付け、極端に小さくせず形を認識できるようにする。色を使う場合はアイコンやその小さな背景の補助に留め、セル全面や選択枠の種類別着色は今回の第一案にしない。サムネイル自体の色は変えない。詳細一覧の `src/ui_details_icon.rs` にある型別アイコンの流用を検討し、一覧間で同じ種類の目印を揃える。
 - 実装範囲: `GridItem`等の既存の型・来歴から種類を決め、描画のために追加のファイル走査・OSアイコン取得・デコード・キャッシュ再作成を行わない。`src/thumb_overlay_layout.rs` の共通の矩形計測・予約へ接続し、描画後の座標補正や別描画の重ね置きで済ませない。種類マークに新しい実行操作は付けず、項目の選択・開く操作を維持する。描画・hover・余白ダブルクリック判定も同じ予約領域を使い、マーク上を空白として誤判定しない。
-- 検証: 表示ON/OFF、サムネイルの全状態、Folder / ZIP・CBZ / RAR等 / PDF / 単体画像 / 書庫内フォルダ・ページ / 動画・音声を比較する。通常一覧・集約一覧・ブックマーク一覧で、light/dark、狭いセル・20列、名前非表示・文字サイズ100〜200%・1〜4行、名前幅優先のON/OFF、選択・チェック、既存バッジが多い条件を純粋layoutとUI snapshotで検証する。余白ダブルクリック、クリック・ドラッグの対象範囲と一覧の既存の読み込み・性能を変えない。実装・実機確認は未実施。
+- 検証: 表示ON/OFF、サムネイルの全状態、Folder / ZIP・CBZ / RAR等 / PDF / 単体画像 / 書庫内フォルダ・ページ / 動画・音声を比較する。通常一覧・集約一覧・ブックマーク一覧で、light/dark、狭いセル・20列、名前非表示・文字サイズ100〜200%・1〜4行、名前幅優先のON/OFF、選択・チェック、既存バッジが多い条件を純粋layoutとUI snapshotで検証する。余白ダブルクリック、クリック・ドラッグの対象範囲と一覧の既存の読み込み・性能を変えない。試作の自動検証は下記実装記録を参照。実機確認・実速度測定は未実施。
 - 対象: `src/thumb_overlay_layout.rs`、`src/app/grid_paint.rs`、`src/ui_details_icon.rs`、設定と環境設定のサムネイルページ、関連テスト・マニュアル。[表示パイプライン](display-pipeline.md)と本書§2.2の共通配置を参照。詳細一覧やRemoteの描画へ適用する範囲は設計時に明示し、無条件に同じ座標変更を広げない。規模: Small〜Medium / 優先度: P3。リリース時期は未指定。
+
+#### 実装記録（2026-11-01、§1.677 初回試作・998547378時点）
+
+以下は初回試作の履歴。既定・寸法・配置・優先順位は後続の「固定slotへの改修」を正本とする。
+
+- 設計担当からの依頼で `type-icon-1677` に試作。製品起動・コミットは行わない。既定は試作として ON (`settings::DEFAULT_THUMB_SHOW_TYPE_ICON`)、図形は暫定20pt (`thumb_overlay_layout::THUMB_TYPE_ICON_SIZE`)、各辺2ptの背景付き。既定・寸法の最終採択は比較画像を利用者が見た後に行う。
+- `details_icon_kind` と既存の図形を共有し、詳細一覧の従来寸法上限は維持。種類は `GridItem` の型だけから判定する。新たな走査・OSアイコン取得・デコード・キャッシュ更新・非同期状態は追加しない。Remoteは変更しない。
+- 左下の独立要素を共通layoutの計測・予約・使用領域列挙へ追加。通常は種類→形式／フォルダ名→名前の順に横へ予約し、名前幅優先ONでは種類と形式を名前の上へまとめる。Folder名バッジは名前自体なので元の幅を保ち、種類だけ上段へ置く。画像の読み込み状態から種類マークの有無を決めず、セル寸法・行高・画像fitは変えない。
+- 最終配置の優先順位: 横幅の予約を計測した後、既存の★・件数・長さを先に確定し、新しい種類マークだけ最後に空き領域へ置く。新マークを理由に既存★を押し上げて「読込失敗」と交差させたり、小セルで★を消したりしない。種類マークが既存badgeを避けて上へ移る場合がある。
+- 中央ブックマークtitle、チェック・スタック・編集・タグ・★・件数・長さ・下端メーターと共通予約で調整する。集約SearchContainerの階層／件数／plateとCollectionPlaceholderの名前／理由は既存座標と実ink計測を描画側と共有し、新マークだけ同じlayout内で避ける。fallback文字・再生／音符・drive・切り取りハサミも実ink／共通geometryを予約する。極小・過密セルで領域がない場合は交差させず新マークが譲り、既存markの位置・大きさは維持する。OFF時は追加の障害計測を行わず従来表示を維持する。
+- 環境設定「表示 → サムネイル」に「サムネイルに種類アイコンを表示する」を1項目追加。保存・取り込み／書き出し・設定検索へ接続する。新規未リリース設定のため移行処理は不要。
+- 構造の簡素化: 読み込みごとの再構築・専用キャッシュや待機を作らず、可視セルの既存layoutに型と設定を渡すだけで毎回同じ規則を使う。設定変更も既存のOK適用経路を利用する。
+- 比較画像は本体の共通セル描画＋固定生成textureをheadlessで描き、`target/1677-preview/`へ保存する。実アプリの画面撮影・実機動作や性能測定とは区別する。再生成用の明示実行テストは `app::grid_paint::type_icon_tests::thumbnail_type_icon_write_previews`（通常ignored）。条件の一覧は出力先の `README.txt`。
+- 試作の未採択事項: 174×132ptで名前200%・最大4行のFolder名が上段まで使う条件や、通常100%でも日時＋中央title＋名前を持つブックマークでは、新しい種類マークが入らず省略されるセルがある。今回は既存の名前やtitleを削らず、この実際の省略境界も比較画像で示す。「常時表示」を全条件で達成した完成仕様とは扱わず、既定・寸法と併せて設計担当／利用者の採択対象とする。アイコンOFFの既存表示は維持する。
+- マニュアル下書き（採択後に「サムネイルの表示」「環境設定」へ反映）: 「サムネイルの左下にある小さなマークで、フォルダ・書庫・画像・動画などを見分けられます。画像が表示された後もマークは残ります。『表示 → サムネイル → サムネイルに種類アイコンを表示する』で表示を切り替えられます。『ファイル名の表示幅を優先する』がONのときは、種類と形式を名前のすぐ上にまとめます。」既定・大きさの表記は採択後に確定する。
+- 自動検証（同worktreeの未コミット最終source、`MSBUILDDISABLENODEREUSE=1`）: `cargo nextest run -p mimageviewer --lib -E 'test(thumb_overlay) | test(grid_paint) | test(settings) | test(ui_details_icon)'` は **728/728成功**。純layoutの狭幅・文字100〜200%・1〜4行・四隅／メーター非交差、実painterの全型／全state・通常／完成cache・明暗×DPI・小セル・中央mark／cut・当たり判定、設定DB／転送／OK・取消を含む。ログは `target/1677-preview/related-pass.log`。
+- `cargo fmt`・`cargo fmt --check`、`cargo check -p mimageviewer --lib --tests --features test-script` は成功（check exit0、2m38s）、`python scripts/check_ui_glyphs.py` は0件。ログは同ディレクトリの `fmt.log` / `check-final.log` / `glyphs.log`。コンパイルには既存のunused/deprecated警告がある。
+- UI snapshot全件は **216/216成功**（`ui-snapshot-final.log`）。新規の `thumbnail_type_icon_dark/light` 2枚（計240,021 bytes）と、設定追加による既存 `preferences_favorite_view_state_dark` 1枚（74,708 bytes）だけを明示対象に生成／更新し、目視後に通常比較を成功させた。他の既存PNGは更新しない。初回の新規baseline未作成2件／予定された設定ページ1件の差分を除き、予定外の既存PNG差分はなかった。
+- 比較PNGは **12枚・3,173,114 bytes**。専用ignoredテストの明示実行は1/1成功（`previews-final.log`）。OFF/ON、16/20/24pt、74×94ptの狭いセル、名前幅優先ON/OFF、全編集badge等・cut、代表画像なし、名前200%・4行、日時＋中央title付きブックマークをdark/lightで生成し、12枚を目視した。16ptは省スペースだが内部ページ／スタックの細部が密、20ptは判別しやすいが一段上へ移る種類があり、24ptは読みやすい一方で名前省略と上積みが増える。省略・横予約の制約はREADMEにも明記した。
+- 独立レビュー（gpt-6.1-sol / xhigh）は最終source・代表PNG4枚・728件／216件／生成1件の成功ログを確認し、**採択前の試作としてACCEPT**。既存★を新markが押し上げる問題等を共通配置の優先順位で修正済み、未解決source指摘なし。常時表示の完成仕様・公開受入とは区別する。
+- 全lib・build-dev・製品起動・コミット・公開マニュアルの仕上げは今回の依頼どおり実施しない。変更は `type-icon-1677`（HEAD `081c58d97`）の未コミット差分として設計担当へ渡す。
+
+#### 固定slotへの改修（2026-11-01、998547378からの未コミット差分）
+
+- 利用者が既定ON、図形20pt・背景24ptを採択。位置・配色の再比較を依頼。コミットは設計担当が行う。全lib・build-dev・マニュアル反映は色の採択後の仕上げへ残す。製品は起動しない。
+- slotは**サムネイル枠左上から右4pt・下4pt、24×24pt**。画像fitではなくセル枠が基準なので、画像の縦横比・読込み状態・名前表示・中央寄せ・文字サイズ・行数・名前幅優先・他badgeの有無で変わらない。選択枠の内側に収まり、通常セルでは右上check/枚数・下端meter・名前/★から離れる。左下では名前とmeterの予約が常に競合するため左上を選んだ。
+- `ThumbnailOverlayLayout.type_icon`へ所有を移し、最初に予約する。編集・タグ・日時等の上段はslot右から既存の優先順で計測。名前・フォルダ名・形式・★・中央bookmark title・右件数/長さはslotを避けて既存の縮小/行数削減/省略を使う。空き場所へiconを移動する処理と、予約後にiconを消す処理は撤去。OFF時はslotを予約せず従来配置を保持する。
+- fallback図形・再生/音符・切り取り・集約一覧の既存種類マークも、共通の純粋配置でslotとcheck/確定badge/meter/集約文字背景を避ける。描画前のShapeに位置・倍率を適用し、その同じ矩形をhit領域へ登録する。画像fit、セル色、選択色は変更しない。lower caption/pathもslotと交差すれば既存の省略側へ譲る。
+- **最小セルの限界**: 実コードの最小値は32×32pt（20列・利用幅660pt未満でも到達）。24pt背景はinner全体を使う。種類iconを固定寸法で最優先に残し、checkは右の残幅へ縮小（32ptでは1ptの間隔を置いて3pt）、他のmarkは残領域へ縮小または省略。選択/checkの入力対象はセル全体のまま。極小時にsecondaryの形を通常寸法と同じように読めるとは扱わず、`minimum-dark/light.png`で実寸比較する。
+- 分類正本はカテゴリ順の `grid_item::display_kind`。可視性だけをcrate内へ広げ、並べ替え規則を変更・複製しない。形は既存の `details_icon_kind` / 図形を共有する。
+
+|項目|カテゴリ順と背景色のグループ|
+|---|---|
+|実フォルダ・ドライブ|実フォルダ|
+|ZIP/CBZ、変換RAR/7z/LZH等、PDF/EPUB本体|アーカイブ類|
+|書庫内フォルダ・入れ子書庫（ZipDirの両方）|アーカイブ類|
+|単体画像・書庫内画像・PDF/EPUBページ・画像スタック|画像|
+|動画・音声|動画・音声|
+|集約一覧のSearchContainer（Folder/Zipの両方）|その他（無彩色）|
+|CollectionPlaceholder（参照元なし等、last_known_kindによらない）|その他（無彩色）|
+|ブックマーク/検索/評価/Collectionの通常項目|その行のGridItemに上記分類を適用|
+
+- 色は小さな不透明背景だけ。`os_theme::thumbnail_type_background`がdark/lightを所有する。実フォルダ=青緑、アーカイブ類=薄紫、画像=薄桃、動画・音声=暖灰。選択の青・checkの緑・★の黄・警告の橙から離した低彩度色を使う。図形/枠線は現在のテーマの通常文字色に従い、文字コントラスト設定も反映する。その他は無彩色、形は維持。比較候補は色なし/薄い4色/やや濃い4色の3案で、現sourceは薄い案を仮適用。色の設定項目・永続化は追加しない。
+- 簡素化: 非同期状態・読込み時の移動・専用キャッシュ・設定変更時の再構築を追加せず、既存セル描画に純粋な予約だけを接続する。まれな失敗の追加回復機構は不要。
+- 比較PNGは `target/1677-preview/` の**14枚・3,474,431 bytes**。`off-on` / `colors` / `narrow` / `minimum` / `crowded` / `no-art` / `large-names-bookmarks` の各 `-dark.png` / `-light.png`。README.txtに実寸・素材・条件と全ファイルを列挙。14枚すべてを目視し、全種類でslotが固定、明暗の画像と背景から図形を識別でき、名前200%・最大4行指定/中央bookmark titleでもiconが残ることを確認した。minimumでは補助マークの縮小限界を示す。色の最終採択・実機確認・速度測定の証拠ではない。
+- 自動検証は同worktreeの未コミット最終source、`MSBUILDDISABLENODEREUSE=1`。関連nextest（`test(thumb_overlay) | test(grid_paint) | test(grid_type_icon) | test(settings) | test(ui_details_icon)`）は**731/731成功**（`target/1677-related-final.log`）。初回は予定された2画像差分に加え、旧優先順位の期待・接触境界・f32 clampの4件を検出して修正。実paintのplay/check・集約文字背景、端数境界の回帰を追加し、再検証で成功した。通常ignoredの比較生成は**3/3成功**（2枚のbaseline生成と比較PNG生成、`target/1677-generate-final.log`）。最小セルの説明ラベルがfixtureを押し広げる不備も検出し、製品セルを変更せず説明をセル幅内に収めて修正した。
+- 独立レビューはGPT-6.1 Sol / xhighの別コンテキストで実施。slotと既存予約の共有、集約labelのmeter shift、f32境界の指摘を修正後、ソースをACCEPT。検証は実装担当が所有し、レビュー担当は重複実行しない。
+- UI snapshotは**216/216成功**（`target/1677-ui-snapshot-final.log`）。予定した既存 `thumbnail_type_icon_dark.png` / `thumbnail_type_icon_light.png` と、設定説明を「左上の固定マーク」へ直した `preferences_favorite_view_state_dark.png` の**3枚だけ**を明示更新し、現画像を目視確認した（計323,727 bytes）。他の既存PNGは更新せず、通常比較で予定外の差分がないことを確認。設定ページの明示更新だけの先行実行も1/1成功（`target/1677-preferences-update.log`）。
+- `cargo fmt` / `cargo fmt --check`、`cargo check -p mimageviewer --lib --tests --features test-script` は**成功・exit 0**。checkは9m32s、unused/deprecated等のcompiler警告あり・エラーなし。ログは `target/1677-check-final.log` / `target/1677-fmt-final.log`（整形差分なしで空）。`python scripts/check_ui_glyphs.py` は**0件・exit 0**（`target/1677-glyphs-final.log`）。`git diff --check`も成功。
+- 最終の小変更（描画元`ui.visuals()`の明示、比較ラベルの幅制限、内部docs）まで独立レビューACCEPT。色は未採択のためSoftを仮適用した未コミット差分で引き渡す。製品起動・実機測定・全lib/full gate・build-dev・公開マニュアル反映・コミットは今回行わない。
+
+#### 識別重視の配色再試作（2026-11-01、14e99a13cからの差分）
+
+- 設計担当からの依頼。前回の薄い／やや濃いは小さな背景で区別しにくいという利用者判断を受け、3案を作り直す。位置(4,4)pt・図形20pt／背景24pt・既定ON・分類は維持する。製品起動・コミットは行わない。最終配色は利用者／設計担当の選定待ち。
+- **A（推奨、仮適用）**: 実フォルダは青緑、アーカイブ類はラズベリー。画像は紫、動画・音声は蘭色にして、入れ物を互いにもアイテム側とも離し、アイテムは隣接色相でまとめる。Bは入れ物の色を入れ替え、アイテムを紫の彩度／明度差でまとめる。Cは入れ物が紫／ラズベリー、アイテムがエメラルド／ターコイズ。
+- 青い選択枠・ZIP、黄の★、赤いPDF、橙のRAR／警告を避ける。既存の動画は青緑、音声は紫、フォルダ名は緑なので完全に未使用の色相だけでは構成できない。Aは青緑を緑寄り（約165度、名前バッジの約133度とは分離）、紫を赤紫寄り（約280／296度、音声ラベルの約254度から分離）へずらす。RGB値の流用はしない。不透明の正方形と図形を左上に固定し、下段の半透明文字ラベルとの位置／形の差も維持する。B・Cは既存の意味色に近い部分が増すためAを推す。色覚特性全般での識別保証とは扱わない。
+- 値の正本は引き続き `os_theme::thumbnail_type_background` の1か所。通常描画・hit領域付き描画・fixtureは同じ `ThumbnailTypeTint::default()`（A）を使う。darkは彩度を保った暗色、lightは中明度の鮮明色。図形・枠線は既存の `ui.visuals().text_color()` のままで、Light/Dark・文字コントラスト標準／強めに従う。4分類の図形／背景は全案4.5:1以上を契約テストへ追加する。その他の無彩色と既存の分類契約は維持する。
+- 再生成入口は既存のignored `thumbnail_type_icon_write_previews`。`target/1677-preview/palette-comparison-dark.png` / `-light.png` に同じ16項目のA/B/Cを横並びで描き、`palette-{a,b,c}-crowded-{dark,light}.png` の6枚に通常幅・名前幅優先・狭幅の多数badge条件を描く。値は正本関数からREADME.txtへ自動出力し、案の考え方・推奨理由も記録する。既存のOFF/ON・狭幅・最小32pt・多数badge・代表画像なし・大きい名前／bookmarkの補助12枚もAで再生成する。旧 `colors-*.png` は前回案の履歴。
+- 比較PNGは**8枚・3,196,689 bytes**。全8枚を実装担当と独立レビュー担当が目視し、明暗の線・4分類の色・説明ラベル・多数badge／狭幅での固定slotを確認した。更新したbaselineは `thumbnail_type_icon_dark.png` / `thumbnail_type_icon_light.png` の**2枚・248,725 bytes**だけで、実装担当が両方を目視。各PNGの変更6,344画素が13個の24×24pt分類背景内だけにあることもHEAD画像との比較で検査し、その他3項目の無彩色・選択枠・名前・既存badgeに差分がないことを確認（`palette-verification/pixel-diff.log`）。最小32ptの明暗の補助PNGも目視し、補助markの縮小限界は前回どおり。
+- 独立レビュー（GPT-6.1 Sol / xhigh、別コンテキスト）は修正後source・比較8枚・READMEを確認して**ACCEPT、未解決指摘なし**。生成説明の文字化け・旧案説明の残存を修正済み。検証は実装担当が所有し、レビュー側は再実行しない。
+- 自動検証は同worktreeの未コミット差分、`MSBUILDDISABLENODEREUSE=1`。配色契約は**1/1成功**。初回はB darkの4.469:1を検出して失敗し、B／Cの暗色VideoAudioだけを微調整後に成功（現在の最小は全案4.58:1）。baseline生成は `UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib thumbnail_type_icon_snapshot_` の**2/2成功**、比較生成はignoredテスト明示実行の**1/1成功**。関連nextest（`test(thumb_overlay) | test(grid_paint) | test(grid_type_icon)`）は**90/90成功**。`cargo check -p mimageviewer --lib --tests --features test-script` は**exit 0**（149秒）。`cargo fmt`成功。ログは `target/1677-preview/palette-verification/` の `contrast.log` / `snapshot-update.log` / `previews.log` / `related.log` / `check.log` / `fmt.log` と `results.tsv`。初回の失敗ログは `target/1677-preview/palette-contract.log`。
+- UI snapshotは**216件すべての個別成功を確認（初回164件＋補完52件）**。最初の `cargo test --test ui_snapshot` は164件の成功後に実行プロセスが**exit 2173で異常終了**し、一括完走の成功とは扱わない（`ui-snapshot.log`、コマンド全体325秒）。失敗assertionや画像差分の記録はなく、終了原因は未確定。既存のGPU調査で捕捉されたAVと同じ原因とは断定しない。216件の一覧と成功164件を照合し、未完了52件だけを `cargo test --test ui_snapshot -- --exact --nocapture <52件の完全名>` で補完、**52 passed / 0 failed / 164 filtered out、exit 0、142秒**。成功済みの再実行・並列数やbackendの変更・baselineの追加更新は行わない。ログは `ui-list.log` / `ui-completed.txt` / `ui-remaining.txt` / `ui-remaining.log` / `ui-coverage.txt`。名前200%／bookmarkの明暗の補助PNGも目視した。
+- `python scripts/check_ui_glyphs.py` は**0件・exit 0**、`cargo fmt --check` と `git diff --check` も成功。ログは同ディレクトリの `glyphs.log` / `fmt-check.log`。compilerには従来のunused／deprecated等の警告がある。設定ページを含む他のbaselineは更新しない。全lib／full gate・製品起動・実機測定・コミットは行わない。公開マニュアルは配色採択後に設計担当が仕上げる。
+- 確認用 `.\scripts\build-dev.ps1 -PreserveRuntime` は**成功・exit 0**。通常feature set、`dev-runtime` profile（portableなし）、`MSBUILDDISABLENODEREUSE=1`。coreは8m28s、remote／EPUB workerもビルドし、PE検査は runtime=4 / pe=3 成功。ログは `palette-verification/build-dev.log` と `results.tsv`、出力は `target/dev-runtime/mimageviewer-core.exe`。既存プロセスを停止せず、生成物も起動しない。利用者が確認する場合はインストール版／常駐tray版を終了して `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常の `%APPDATA%\mimageviewer` を使い、実際の設定／データを更新し得る。確認対象は明暗両テーマの4分類の識別と、多数badge・選択状態でも固定位置／既存表示を維持すること。色はAを仮適用したまま、コミットは設計担当へ渡す。
+
+#### 採択後の仕上げ（2026-11-01、073554ca4からの未コミット差分）
+
+- 設計担当からの仕上げ依頼。利用者確定値は**既定ON・図形20pt／背景24pt・セル枠左上から右4pt／下4pt・配色A**。カテゴリ順と同じ4分類で、実フォルダ=青緑、アーカイブ類=ラズベリー、画像=紫、動画・音声=蘭色。集約コンテナ／参照元なしは従来の無彩色、詳細一覧と共通の図形は維持する。
+- 製品コードから`ThumbnailTypeTint`とB/C/Neutral選択を撤去。配色正本は`os_theme::thumbnail_type_background`だけ。表示設定の既定は`settings::DEFAULT_THUMB_SHOW_TYPE_ICON`、寸法・padding・offsetは`thumb_overlay_layout`だけで定義し、plate寸法は20+2×2から導出する。layout入力は試作用の`Option<f32>`から表示boolへ変更し、呼出元と回帰テストを揃えた。分類・配置・描画・hit領域・OFF時の既存表示は変更しない。
+- 比較PNG生成テストは**残す**。狭幅・最小セル・多数badge・名前幅優先・画像なし・大きい名前／bookmarkを確定仕様で再確認できるため。通常`#[ignore]`を維持し、旧B/C比較と16/24ptの試験軸は撤去。生成先を`target/1677-preview/adopted/`へ分け、明暗各6枚とREADMEだけを書き出す。通常テストに画像書き出しの負荷を加えない。既存baselineは更新しない。
+- 公開マニュアルは`grid.html`の種類アイコン説明と`settings.html`のサムネイル設定表へ、左上固定・4色・形の区別・読込み後も残る・既定ON／OFF操作を追記。バージョン固有表現や内部用語は使わない。製品ページのカードは**変更不要**と判断：同一一覧で複数形式を扱うという既存カードの主張は変わらず、表示の詳細はマニュアルが担当する。`public-wording-policies.md`の「カードの主張そのものが変わるときだけ」に従い追記しない。
+- `display-pipeline.md`のoverlay配置、本書§2.2、`spec.md`の設定表、`ui-snapshot-policy.md`を確定仕様へ更新。試作記録は履歴として保存し、本追補を現行の正本とする。非同期状態・I/O・専用再構築や回復機構は追加しない。
+- 独立レビュー（GPT-6.1 Sol / xhigh、別コンテキスト）は仕上げ差分を**ACCEPT、未解決指摘なし**。AのRGB保持、寸法固定、通常／hit付きpaintと再layout、設定default／serde／DB／転送、テスト・公開文書を確認。検証は実装担当が所有し、レビュー側の再実行はしない。
+- 自動検証ログは`target/1677-finish/`、実行条件は`MSBUILDDISABLENODEREUSE=1`、HEAD `073554ca4`からの本追補の未コミット差分。コマンド・exit・秒数は`results.jsonl`。`cargo fmt`／`cargo fmt --check`、`cargo check -p mimageviewer --lib --tests --features test-script`はexit 0。最初のcheckはintegration fixtureの旧フィールド5か所を検出（`check.log`、exit101）し、bool入力へ揃えた後の`check-final.log`で成功。compilerの既存unused/deprecated等の警告は残る。
+- 関連nextest（`test(thumb_overlay) | test(grid_paint) | test(grid_type_icon) | test(settings) | test(ui_details_icon) | test(os_theme)`）は**739/739成功**（`related.log`）。ignoredのPNG生成は完全名を明示して**1/1成功**（`previews.log`）。出力は明暗各6枚・計12枚／2,740,667 bytesで、最小セルと多数badgeの明暗4枚を目視した。極小の補助マーク縮小は既存仕様どおり。`tests/snapshots`のbaselineは更新しない。
+- `cargo test --test ui_snapshot`は**216/216、一括完走・exit0**（`ui-snapshot.log`、実行36.52秒／compile込み181.16秒）。今回は§1.175のexit2173や画像差分は発生せず、補完実行なし。`python scripts/check_ui_glyphs.py`は**0件・exit0**（`glyphs-final.log`）。Windowsクラッシュダイアログはテスト親processのerror modeだけで抑止し、失敗exitや並列性・backend・期待画像は変更しない。
+- `scripts/test-lib-full.ps1`は**指定どおり1回だけ**新規実行し、**15,382成功／3失敗／1タイムアウト／68 skipped**（14 slow、2 leaky、実行868.586秒、script exit100）。一括成功とは扱わない。正規ログ／JUnitは`target/test-lib-full/runs/20261101T100220907Z-a5f0cd97/`、まとめは`lib-full.log`。失敗した4件を**ソース変更前にそれぞれ単独3回**確認した（`failed-{1..4}-single-{1..3}.log`）。
+
+|全件で失敗したテスト|全件の失敗|単独3回|
+|---|---|---|
+|`app::tests::background_click_scroll_regression_tests::letterbox_real_grid_missing_caption_and_reason_own_painted_padding`|`見つかりません`の文字がpaddingへ必ず描かれるというassertion|同じassertionで3回とも失敗|
+|`app::tests::still_window_mode_key_tests::remote_acquire_retires_startup_resolves_and_rejects_new_activations`|AcquiringRemoteのままでRemoteActive未到達|3回とも成功|
+|`app::folder_scan::section1375_scan_perf_tests::section1375_large_physical_scan_10k_100k`|既定600秒でタイムアウト（runnerの打切りではない）|3回とも成功（test実行117.146／102.383／113.046秒）|
+|`ui_adjustment_panel::local_adjust_segmentation_tests::full_mask_with_large_subtract_preview_completes_quickly`|所要126.9964msで時間assertion失敗|3回とも成功|
+
+- 再現したpadding試験は旧fixtureの前提不備。既定ONを継承した32pt級セルで、`14e99a13c`の`lower_caption_ink`は種類slotと交差する理由文字を設計どおり省略するが、旧試験は必ず文字がpaddingへ描かれると要求していた。クリック判定前の失敗で、今回の等価cleanupが作ったものではない。独立レビューも履歴・設計記録と照合して同意。製品を変更せず、当該試験だけOFFを明示して従来のcaption hit回帰を保持し、ONの実rendererで固定plateの描画・最小セル内収容・click選択・親移動不成立を検査する回帰を追加した。
+- fixture修正後は`cargo fmt`／`cargo fmt --check`、同じ`cargo check -p mimageviewer --lib --tests --features test-script`が**exit0**（`fixture-check.log`、63.79秒）。`test(background_click_scroll_regression_tests)`のfocused nextestは**36/36成功**（`fixture-focused.log`、test実行6.226秒／compile込み158.37秒）。修正した旧試験、新規ON試験、周辺の余白・スクロール・click回帰を含む。独立レビューも追補を**ACCEPT、未解決指摘なし**と確認し、integration側の5か所のbool置換も再確認した。`python scripts/check_ui_glyphs.py`も再実行して**0件・exit0**。製品コード／UI baselineの追加変更はなく、先の739件・216件の成功は有効な範囲を再利用する。全件の再実行は行わず、一括失敗・単独成功・fixture修正後のfocused成功を区別する。
+- 確認用`./scripts/build-dev.ps1 -PreserveRuntime`は**成功・exit0**（`build-dev.log`、command全体298.73秒、core compile4分50秒）。通常feature set／`dev-runtime` profile／portableなし／`MSBUILDDISABLENODEREUSE=1`。coreに加えRemote・EPUB PDF workerも同profileで確認し、PE検査は**runtime=4／pe=3成功**。出力は`target/dev-runtime/mimageviewer-core.exe`（339,622,400 bytes）、`mimageviewer-remote.exe`（14,836,736 bytes）、`mimageviewer-epub-pdf.exe`（5,094,400 bytes）。有効なcompanionの既存ビルドは再利用した。最終`git diff --check`成功、baseline PNGの差分なし。製品起動・実機確認・速度測定・コミットは実施せず、HEADは`073554ca4`のまま、コミットは設計担当へ引き継ぐ。
+- 利用者が確認する場合は、インストール版／常駐tray版を終了して、repoルートから`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。single-instance mutexを共有し、既定で通常の`%APPDATA%\mimageviewer`を使うため実際の設定／データを更新し得る。確認対象は、明暗両テーマの4分類の色・形、読み込み前後や代表画像なしでも左上固定、狭幅／多数badge／名前幅優先と選択の維持、設定OFFで種類iconと予約が外れること。
+
+#### 独立レビューP2・低いbookmarkセルのタイトル／meter交差（2026-11-01、143fb306fからの未コミット差分）
+
+- 設計担当からの修正依頼。独立レビュー（GPT-6.1 Sol / xhigh）のP2はコードと純layoutで確認した。旧`layout_bookmark_title`は種類slotを避けて下へ移動した後、セル下端だけを検査し、9ptのmeter帯を除外していなかった。追加した回帰は修正前に**64×59.5pt**で失敗し、titleのy=50.5〜74.75とmeterのy=67〜76の交差を記録した（`target/1677-p2/regression-before.log`、nextest 0成功／1失敗・exit100）。製品起動による観測ではない。
+- meter帯をbadge配置より先に確定し、種類slot・check・スタック枚数・左上badgeと一緒にtitleの予約として渡す。帯の上の3pt間隔も除外する。既存の補助markが使う空き矩形の差引きを`unreserved_areas`へ共通化し、titleは残りの領域内で文字をfitしてから配置する。36文字上限・13pt・余裕がある場合の中央位置を保ち、狭ければ短縮、高さ不足なら省略する。種類iconの優先・位置・寸法とmeter自体の描画位置／厚さは維持する。bookmarkのない通常セルにはtitle予約の配列生成を追加しない。
+- 同型確認: `fit_content_marker`へ渡す保護対象はすでにslot・check・全badge・meter・実際の集約文字背景を含み、移動／縮小先も全対象を差し引いていた。右下の件数／長さはmeter予約を引いた下端から上へ積み、各移動先を全occupiedと照合する。評価・形式／名前もmeterを引いた起点と上側予約を使う。下側caption/pathはmeter分の固定shift後にslot・帯・marker・セル内を検査して省略し、iconを避けるための再移動はしない。title以外に今回と同じ予約漏れは見つからなかった。titleのcheck／スタック枚数の見落としも同じ予約入力で解消する。補助markの共通関数化は既存の0.5pt間隔と縮小・選択規則をそのまま保持する。
+- 回帰は動画／音声、幅48〜180pt、高さ48／52／56／59.5／60／60.5／64／72／96pt、名前幅優先ON/OFF、時刻・check・stack・タグ・評価・形式・名前・長さ等の混雑条件で、titleを含む全badge・meter・icon・checkの非交差とセル内収容を検査する。別の純layoutで表示可能時のtitle保持／不足時の省略とicon OFF時のmeter予約、32ptを含む補助markの移動先と全予約の非交差を検査する。幾何を直接検査できるため新規snapshotは追加しない。
+- 検証途中の記録: 最初の純layout nextestは**49/49成功**（`focused.log`）。追加した表示保持回帰を含む最初の関連nextestは**380成功／1失敗**（`related-initial.log`、exit100）。幅64ptの残り30ptへ日本語prefix＋省略記号＋paddingが入るという新規fixtureの誤りで、既存の最短prefix fittingでは入らない。表示保持のfixtureだけをその幅で実際に入る`A`へ修正し、長い日本語titleの非交差matrixと省略規則は維持した。製品コードや既存期待値を緩めていない。
+- 修正後の自動検証（同worktree、HEAD `143fb306f`からの本追補の未コミット差分、`MSBUILDDISABLENODEREUSE=1`）: `cargo fmt`、`cargo check -p mimageviewer --lib --tests --features test-script`は**exit0**。関連nextest（`test(thumb_overlay) | test(grid_paint) | test(grid_type_icon) | test(bookmark)`）は**381/381成功、失敗0、1 leaky・exit0**（実行63.835秒／compile込み195.90秒）。leakyの対象名は通常出力／JUnitから未特定のため原因や既知性は断定しない。ログ・JUnitは`target/1677-p2/`の`check.log` / `related.log` / `related-junit.xml`、各command・exit・秒数は`results.jsonl`。compilerには従来のunused／deprecated等の警告がある。全libは依頼どおり再実行せず、直前の全件・単独補完・fixture修正後のfocused結果を上の仕上げ記録から参照する（一括全件の失敗を成功へ読み替えない）。
+- UI snapshotは**全216件の個別成功を確認（最初の215件＋未完了1件の補完）**。`cargo test --test ui_snapshot`は215件成功後、`diagnostics_export_running_light`だけが停止した。自分のtest実行体（PID89936）のexact pathを照合してCDBで全thread stackを採取し、当該threadが`ID3D12Device::CreateSampler → D3D12SDKLayers → RaiseException → UnhandledExceptionFilter → ZwRaiseHardError`にいることを確認。stack・161,371 bytesのminidumpを保存してdetach後、このtest実行体だけを終了した。一括runは**未完走・exit0xffffffff、640.97秒**であり、成功gateとは扱わない（`ui-snapshot.log` / `ui-snapshot-wait-stacks.log` / `ui-snapshot-wait.dmp`）。例外コードや原因は未確定で、過去のGL AVと同じ原因とは断定しない。製品実行体や他のtest processは操作していない。
+- 未完了の完全名だけを`cargo test --test ui_snapshot -- --exact diagnostics_export_running_light`で補完し、**1 passed／0 failed／215 filtered out・exit0、実行2.46秒**（compile込み6.60秒、`ui-remaining.log`）。全体の再試行、thread数／backendの変更、期待画像の更新はしない。初回215件と補完1件の名前集合が重複せず全216件になることを`ui-coverage.json`へ記録した。UI baselineの変更は0枚。
+- 最終`cargo fmt --check`は**exit0**、`python scripts/check_ui_glyphs.py`は**検出0件・exit0**（`fmt-check.log` / `glyphs.log`）。確認用`./scripts/build-dev.ps1 -PreserveRuntime`も**成功・exit0、194.57秒**（`build-dev.log`）。通常feature／dev-runtime profile／portableなし、core・Remote・EPUB PDF workerと実行時依存を準備した。製品起動・通常profileデータ操作・プロセス停止・コミットは行わず、設計担当へ未コミット差分を渡す（上記の例外処理中のtest実行体だけは終了した）。
+- 利用者が手動確認する場合は、インストール版／常駐tray版を閉じ、repoルートから`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。single-instance mutexを共有し、通常の`%APPDATA%\mimageviewer`を使用するため、実際の設定／データを更新し得る。確認対象は高さ60pt前後の動画・音声bookmarkで、titleが表示できる場合は種類icon・meter・他badgeと重ならず、場所不足ならtitleが短縮・省略されてiconを保持すること。実機確認は未実施。
+
+#### 再レビューP2・収まるタイトルの省略と最大空き矩形（2026-11-01、a36797643からの未コミット差分）
+
+- 観測と原因: 設計担当からの再レビュー指摘を純layoutで再現した。120×68pt、種類icon／meter ON、時刻`0:07`、タイトル`場面`（40×24.25pt）では、slot右側のy=25.75〜50ptへ収まるのに、`unreserved_areas`がslot下端で連続空間を22ptと4.25ptの帯へ分け、titleを`None`にしていた。修正前に追加回帰だけをnextestで実行し、**0 passed／1 failed・exit100**を確認（`target/1677-maxrect/regression-before.log`）。前追補の予約漏れ修正とは別の候補列挙の欠陥である。
+- 共通計算だけを修正: 予約との交差を各空き矩形から引く際、上下は全幅、左右は全高の候補を残す。互いに重なる候補を許し、各予約の処理後に包含候補・重複を取り除いて**最大空き矩形の集合**にする。任意の空き矩形は、交差する予約の上／下／左／右の少なくとも一方へ完全に入り、包含除去でも被覆が残るため、分割境界をまたぐ配置を失わない。面積最大の1個だけを選ぶ意味ではない。titleの文字数優先→セル中央への距離、補助markの縮小率優先→元中心への距離は維持する。
+- 同じ関数を使う`fit_content_marker`にも適用し、70×40ptの補助markがslot下端をまたいで等倍のまま収まる回帰を追加した。title専用の別規則や呼出元の追加分岐は作らない。既存の予約入力・間隔・最小文字lane 8pt・文字上限は維持する。有限の予約と純粋な幾何計算の修正であり、非同期状態・再構築・回復機構・モーダル化を加える必要はない。
+- 回帰: 指摘条件のtitle表示、補助markの等倍保持、3×3盤面の全512占有パターンと盤外を含む全196矩形の順序付き2予約（38,416組）、計**38,928条件**で全最大空き矩形を独立の全矩形列挙と照合する。重複・包含・交差・辺接触・全面予約・空boundsも含む。さらに幅6種類×高さ29種類（48〜100ptの2pt刻み＋59.5／60.5）×計測文字寸法5倍率（75〜200%）×icon ON/OFF×meter ON/OFF×check／stack／編集badgeありなし×title3種、**20,880条件**で、予約端を起点とする独立配置oracleとtitleの非省略・全文保持を照合し、表示したtitleと全予約の非交差／bounds内を検査する。既存の60pt前後・動画／音声・多数badgeの回帰は変更しない。新規PNGは増やさない。
+- 事前の高速検査は製品moduleを直接読む独立rustc harness（実物の`emath`、設定型のみstub、`opt-level=2`）を使用した。最初は新しいtitle oracleが既存の最小8pt文字laneを見落として54成功／1失敗だった。oracleだけに既存条件を反映し当該テストは成功。製品の配置・省略規則をこのfixtureに合わせて変えていない。正式なCargo検証は下記へ記録する。
+- 独立差分レビュー（別コンテキスト、GPT-6.1 Sol / xhigh）は**ACCEPT・未解決P1/P2なし**。最大矩形列挙の完全性／最大性、titleの予約入力と選択規則、補助markの予約拡張・fallback・縮小率／距離規則、独立oracleと文書の整合を確認した。検証は実装担当が所有し、レビュー担当はCargoを再実行していない。
+- 自動検証は本worktree、HEAD `a36797643`からの本追補の未コミット差分、`MSBUILDDISABLENODEREUSE=1`。ログ／command／exit／秒数は`target/1677-maxrect/`の各logと`results.jsonl`。`cargo fmt`は**exit0**、`cargo check -p mimageviewer --lib --tests --features test-script`は**exit0・66.98秒**。通常featureの純layout nextestは**55/55成功**（実行0.726秒、compile込み192.78秒、`focused.log`）。関連nextest（`test(thumb_overlay) | test(grid_paint) | test(grid_type_icon) | test(bookmark)`）は**385/385成功・失敗0・exit0**（実行36.423秒、compile込み39.97秒、`related.log`／`related-junit.xml`）。既存のunused／deprecated等のcompiler警告は残る。全lib／workspace全体gateはこの狭域の再修正では再実行しない。
+- `cargo test --test ui_snapshot`は**216/216成功・失敗0、一括完走・exit0**（実行41.81秒／compile込み146.27秒、`ui-snapshot.log`）。§1.175の停止・異常終了は今回は発生せず、未完了分の補完や再試行は不要だった。baseline PNGの更新0枚、画像差分による失敗なし。続く`cargo fmt --check`は**exit0**、`python scripts/check_ui_glyphs.py`は**検出0件・exit0**。Windowsクラッシュダイアログはテスト親processのerror modeだけで抑止し、backend・並列性・期待画像は変更しない。
+- 配置負荷は、Intel Core Ultra 9 285／Windows、rustc 1.99.1、`opt-level=2`／static CRTで、HEADの旧moduleと修正moduleを同一harnessから直接コンパイルした。`eframe::egui`名前空間には同じ実物の`emath`を再公開し、未使用のSettings型だけをstub化する。固定入力の`layout_thumbnail_overlays`全体（出力生成・合成measure込み）と、衝突時の`fit_content_marker`を別計測し、両variantに同じ入力を渡す。marker予約はtitleが旧版で省略されるかに依存しない固定の3／6矩形。各セル数で200回の平均を1標本とし、旧→新→新→旧の4 process（各7標本）による**各variant14標本の中央値、ms／セル群1回**を以下に示す。計測中に本タスクのCargoを重ねず、初回旧processの一部では別のrustcも稼働していたため、微小差を速度保証とは扱わない。
+
+|条件|計測経路|100セル 旧→新 (ms)|400セル 旧→新 (ms)|1,000セル 旧→新 (ms)|
+|---|---|---|---|---|
+|指摘条件 120×68pt・`場面`|全体配置|0.066→0.043|0.261→0.174|0.652→0.447|
+|同上・固定3予約|marker再配置|0.035→0.016|0.137→0.061|0.341→0.183|
+|混雑 180×96pt・長いtitle／時刻／check／stack／pin／tag／評価／形式／名前／長さ|全体配置|0.792→0.792|3.145→3.144|7.947→7.642|
+|同寸法・固定6予約|marker再配置|0.120→0.096|0.442→0.322|1.201→0.828|
+|余裕あり 240×180pt・同じ混雑入力|全体配置|0.379→0.354|1.538→1.359|3.897→3.396|
+|同寸法・固定6予約|marker再配置|0.119→0.091|0.465→0.372|1.135→0.965|
+
+- この標本では配置負荷の増加は認めなかった。新方式の400セルの全体配置は、指摘条件で標本平均0.166〜0.190ms、混雑条件で2.824〜3.664ms。marker側も予約数を増やした条件まで共通修正の効果を確認した。数値は**合成文字計測を使う純粋layoutの参考値**で、実フォントのgalley計測・GPU描画・decode・製品フレーム全体の性能ではない。最初のbench準備ではeframe全体への直接linkがnative Windows libの探索不足で失敗し、不要なUI依存を除いて実物emathの再公開へ変更した。製品コード／build設定は変更していない。再現用`target/1677-maxrect/run-bench.py`／`bench.rs`、旧source`before.rs`、全標本`benchmark-{0..3}-*.csv`、集計`benchmark-summary.csv`、source SHA-256／コンパイルcommand等`benchmark-metadata.json`を保存した。
+- 確認用`./scripts/build-dev.ps1 -PreserveRuntime`は**成功・exit0・202.53秒**（core compile3分16秒、`build-dev.log`）。通常feature／`dev-runtime` profile／portableなし／`MSBUILDDISABLENODEREUSE=1`。coreは339,592,192 bytes、Remote／EPUB workerは変更のない有効な同profileの成果物を再利用し、PE検査は**runtime=4／pe=3成功**。JUnitでも55件／385件の実行と失敗0を突合し、UI名集合は216件すべて成功・不足0（`ui-coverage.json`）、計測metadataのsource SHA-256は最終sourceと一致する。最終`git diff --check`も成功、変更はlayout sourceと本書／display-pipelineの3ファイルだけ。製品起動・実機確認・通常profileデータ操作・プロセス停止・コミットは行わず、HEAD `a36797643`の未コミット差分を設計担当へ渡す。
+- 手動確認する場合は、インストール版／常駐tray版を終了して、repoルートから`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。single-instance mutexを共有し、通常の`%APPDATA%\mimageviewer`を使用して実際の設定／データを更新し得る。確認対象は低い動画・音声bookmarkの種類icon／前回位置表示ON、時刻`0:07`、title`場面`で、空間がある場合はtitleが表示され、icon・meter・他badgeと重ならないこと。約60pt前後で場所不足なら従来どおり短縮／省略し、固定iconを保持すること。
 
 ### 1.675 書庫内フォルダ・入れ子書庫にも、ページを直接表示する設定を適用する — 5ch >>694・696 (2026-11-01)
 
@@ -3032,8 +3159,8 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
   - 共通化の単位は「全バッジを同じ見た目で描く巨大関数」ではなく、セル四隅の使用領域を
     割り当てる純粋なレイアウトとする。形式、フォルダ名、時刻、評価など意味の異なる
     バッジは、共通の計測 / padding / 配置部品を使いつつ個別スタイルを維持する。
-  - 中央の再生アイコンや代替アイコンなど、隅のバッジではないコンテンツ overlay は
-    この仕組みに含めない。
+  - 中央の再生・代替・切り取り・集約マークの描画は個別に維持し、§1.677の種類iconがONなら
+    共通の`fit_content_marker`へ確定済み予約を渡して描画前に回避する。実描画targetをhit領域にも使う。
 - 実装案:
   1. セルの `inner` と表示対象を受け、`TopLeft` / `TopRight` / `BottomLeft` /
      `BottomRight` の各レーンに実測済み `BadgePlacement` (矩形、文字 / style、優先度) を返す
@@ -3046,7 +3173,12 @@ snapshotの今回不足分は同一exeの45/45で補完できたが、本項目�
      バッジと機械的に同じ 70% へ揃えず、長い名前の可読性を残したコンパクトな専用
      スタイルをスナップショット比較で決める。
   4. **現行実装**: 右上check/stack、右下filter件数・動画長さも同じ純layoutで予約する。
-     §1.256で下端meter帯 + gapを追加し、右下のcell基準にも予約を反映した。極小cellは既存badge優先。
+     §1.256で下端meter帯 + gapを追加し、右下のcell基準にも予約を反映した。
+  5. **§1.677 現行実装**: 既定ONの種類iconを最初にセル枠左上(4,4)ptへ24pt固定で予約する。
+     図形20pt・配色Aは利用者採択済み。カテゴリ順と同じ4分類の色を使い、その他は無彩色。
+     上段・中央bookmark title・下段・右のbadgeはslotを避け、狭幅では補助要素が縮小／省略する。
+     最小32ptでも種類slotは動かさず、checkは残幅へ縮小する。OFFでは予約も外し従来配置を保つ。
+     既存コンテンツmarkも同じ予約を避け、名前・形式・評価・meter・hit領域との非交差を回帰で保持する。
 - v2.9.1 実装記録 (2026-07-31):
   - `src/thumb_overlay_layout.rs` に painter 非依存の純粋レイアウトを新設。セルごとに 1 回だけ
     構築した左上 / 左下の配置結果を、通常描画、タグ hit-test、`UP`、ブックマーク時刻へ渡す。

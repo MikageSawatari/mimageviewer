@@ -463,7 +463,32 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
    0.30em・縦 padding 0.12em とする。形式バッジと機械的に同じ 70% にはしない。
 
 サムネイル四隅 overlay の計測・padding・配置は `src/thumb_overlay_layout.rs` の
-`ThumbnailOverlayLayout` が一括で所有する。チェック印の領域とスタック枚数を先に確保してから左上を配置する。左上は
+`ThumbnailOverlayLayout` が一括で所有する。§1.677の種類iconがONなら、最初にセル枠左上から
+(4,4)ptの固定slot（図形20pt＋背景24pt）を予約する。既定ON・寸法・配色Aは利用者採択済み。
+画像fit・読み込み状態・名前の幅優先/非表示/文字サイズ/行数から位置を導出しない。
+`type_icon`は左下laneから独立し、名前や★を配置した後で移動・省略しない。
+左上の他badgeはslot右から既存の優先順で配置し、中央bookmark titleと下段/右のbadgeもslotを避ける。
+中央bookmark titleは、slot・check・スタック枚数・左上badgeと下端meter帯（上の3pt間隔込み）を
+予約した残りの領域へ配置する。予約ごとに順次移動して最後にセル内だけを検査する方式にはしない。
+空き領域は予約と交差しない最大矩形を列挙する。上下／左右へ全幅／全高の候補を残して包含候補を除き、
+予約の辺で空間を帯へ分断しない。候補同士の重なりは許し、titleと`fit_content_marker`が同じ計算を使う。
+余裕がある場合は従来の中央位置・13pt・36文字上限を保ち、空き領域が狭ければ短縮し、高さ不足なら省略する。
+狭いセルでは他badge側が縮小・行数削減・省略する。32ptセルではcheckも右の残幅へ縮小し、
+slotとの1pt間隔を確保して3ptとなる。極小時の補助マークの視認性は比較画像で示す。
+fallback・再生/音符・切り取り・集約の既存markは、同moduleの純粋な`fit_content_marker`で
+slot・check・確定badge・meter・実際の集約文字背景を避ける描画targetを求め、Painter提出前のShapeへ適用する。
+実際に描くtargetをhit領域にも使う。lower caption/pathはslotと交差すれば譲る。
+高さ不足でmeter帯自体がslotと交差する場合はslot右へ狭め、残幅がなければmeterを省略する。
+slotは常に保持する。画像fit・セル色・選択枠・入力対象は変えない。
+背景色の分類は並べ替えの`grid_item::display_kind`だけを使う。実フォルダ=青緑、アーカイブ類=ラズベリー、
+画像=紫、動画・音声=蘭色の4グループ（その他は無彩色）で固定し、`os_theme::thumbnail_type_background`が
+明暗両テーマの値を一か所で所有する。B/C・色なし・薄い案の選択分岐は製品にもfixtureにも残さない。
+寸法・余白は`thumb_overlay_layout`の定数と`type_icon_slot(cell)`が所有し、layout入力は表示boolだけを受ける。
+`settings::DEFAULT_THUMB_SHOW_TYPE_ICON`が既定値を所有し、OFFではslot予約もなくす。
+図形は詳細一覧と共有し、描画元`Ui`の通常文字色で描く。専用キャッシュ・worker・I/Oは追加しない。
+分類・確定仕様・検証記録は[バックログ§1.677の仕上げ](next-release-backlog.md)を参照。
+以下の従来配置は種類iconがOFFならそのまま維持する。
+チェック印の領域とスタック枚数を先に確保してから左上を配置する。左上は
 ブックマーク時刻 → 動画 `UP` → 編集状態 / pin → タグの順に実測幅を予約する。幅不足時は
 時刻・`UP` を省略表示し、編集状態は順序を保って入る分を置き、残りを ASCII の `+N` にまとめる。
 タグは残る幅に応じて省略または非表示にする。描画とタグ hover / click は同じ `BadgePlacement.rect` を

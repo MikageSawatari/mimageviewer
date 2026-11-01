@@ -471,6 +471,8 @@ GPU 情報・ドライバー・段階・エラー行・試行履歴と条件付�
 | モジュール | 役割 |
 | --- | --- |
 | `ui_main.rs` | メイン画面のグリッド描画とクリック/ドラッグ処理 |
+| `thumb_overlay_layout.rs` | サムネイルの四隅badge・中央title・下端meterの純粋な計測/予約。§1.677の種類iconはセル枠左上(4,4)ptの24pt slotを最初に予約し、他の表示が避ける。既存markの縮小先も同moduleの純粋配置で決定する |
+| `app/grid_paint.rs` / `ui_details_icon.rs` | 共通セル描画とhit領域、型別のベクター図形。種類iconの形を詳細一覧と共有し、小背景の4分類は並べ替えの`grid_item::display_kind`から導く。配色は`os_theme`、描画は渡された`Ui`の文字色を使う。画像fit・ロード要求・Remoteは変更しない |
 | `ui_pinned_search.rs` / `app/pinned_search.rs` | 4種類の常設検索入力の幅・純粋描画と、既存検索への単一transaction・Esc router。結果/worker ownerは追加しない |
 | `ui_dialogs/smart_folder_editor.rs` | 名前だけのスマートフォルダ作成、現在の実フォルダ + facet 条件をルールとして追加する確認 UI、ルール / グループ化単位の管理 UI。場所 / AI / 画像色など保存対象外の条件を明示する。管理中のテキストはローカル draft に保持し、フォーカス離脱・選択変更・ダイアログ操作の確定境界でだけ Settings 保存と対応 worker / snapshot の無効化を行う。終了・トレイ退避の共通保存境界では有効 draft を Settings へ確定するが worker は開始せず、トレイ復帰時だけ遅延した副作用を1回適用する |
 | `ui_fullscreen.rs` | フルスクリーンビューポート (`show_viewport_immediate`)。描画テクスチャの優先順位はここで決定。見開きのcanonical `SpreadDisplayUnit`はpage列と形成理由（paired / 本当に相方がない / 横長境界 / 非ペア境界）を同じcache tokenで所有し、共通compositionだけが端の単ページ配置を解決する。paged、F12、連結読み、holdover、Remoteはtyped placementを消費し、縦横を再判定しない |

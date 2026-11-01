@@ -5333,6 +5333,8 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 None,
                 false,
                 crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+                false,
+                false,
             );
             crate::app::draw_cell(
                 ui,
@@ -18261,18 +18263,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             );
         }
         if let Some(title) = overlay_layout.bookmark_title.as_ref() {
-            let galley = content_painter.layout_no_wrap(
-                title.text.clone(),
-                crate::ui_helpers::thumbnail_badge_font(title.style),
-                egui::Color32::WHITE,
-            );
             title_area = Some(title.rect.intersect(rect).intersect(ui.clip_rect()));
-            content_painter.rect_filled(title.rect, 4.0, egui::Color32::from_black_alpha(190));
-            content_painter.galley(
-                title.rect.center() - galley.size() * 0.5,
-                galley,
-                egui::Color32::WHITE,
-            );
+            crate::ui_helpers::draw_overlay_bookmark_title_badge(&content_painter, title);
         }
         let source = row.source_path().display().to_string();
         let position = row.position_label();
@@ -20369,6 +20361,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     crop: badges.crop,
                                     pin: has_pin,
                                 };
+                                let is_cut = self.items[idx].drag_source_path()
+                                    .is_some_and(|path| self.cut_clipboard.contains(path));
+                                let initially_cut = is_cut;
                                 let mut overlay_layout = crate::app::layout_cell_overlays(
                                     ui.painter(),
                                     cell_rect,
@@ -20387,6 +20382,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     media_duration.as_deref(),
                                     self.settings.thumb_show_resume_meter,
                                     crate::thumb_overlay_layout::ThumbnailNameStyle::from_settings(&self.settings),
+                                    self.settings.thumb_show_type_icon,
+                                    is_cut,
                                 );
 
                                 let selected_before = self.selected == Some(idx);
@@ -20478,9 +20475,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 if idx >= self.items.len() || idx >= self.thumbnails.len() {
                                     break;
                                 }
-                                // A click may toggle the check state during interaction. Re-layout only
-                                // that changed cell so the new check and its reserved area agree in this frame.
-                                if self.checked.contains(&idx) != is_checked {
+                                // Check/cut changes during interaction use the same new reservations
+                                // for repainting this cell in the current frame.
+                                let is_cut = self.items[idx].drag_source_path()
+                                    .is_some_and(|path| self.cut_clipboard.contains(path));
+                                if self.checked.contains(&idx) != is_checked || is_cut != initially_cut {
                                     overlay_layout = crate::app::layout_cell_overlays(
                                         ui.painter(),
                                         cell_rect,
@@ -20499,17 +20498,17 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         media_duration.as_deref(),
                                         self.settings.thumb_show_resume_meter,
                                         crate::thumb_overlay_layout::ThumbnailNameStyle::from_settings(&self.settings),
+                                        self.settings.thumb_show_type_icon,
+                                        is_cut,
                                     );
                                 }
 
-                                let is_cut = self.items[idx]
-                                    .drag_source_path()
-                                    .is_some_and(|path| self.cut_clipboard.contains(path));
                                 // Enabled cells were painted to obtain exact hit areas. Repaint only
                                 // a cell whose selection/check changed; OFF keeps its released order.
                                 let repaint_cell = hit_areas.is_none()
                                     || selected_before != (self.selected == Some(idx))
-                                    || is_checked != self.checked.contains(&idx);
+                                    || is_checked != self.checked.contains(&idx)
+                                    || is_cut != initially_cut;
                                 if repaint_cell {
                                     let book_resume_meter = self.thumbnail_resume_meter(idx);
                                     let rot = self.get_rotation(idx);

@@ -11,6 +11,11 @@ pub const TOP_LEFT_GAP: f32 = 2.0;
 pub const TOP_RIGHT_RESERVE: f32 = 28.0;
 pub const BOTTOM_LEFT_OFFSET: f32 = 3.0;
 pub const BOTTOM_ITEM_GAP: f32 = 4.0;
+/// Adopted glyph size, with a 24pt opaque plate.
+pub const THUMB_TYPE_ICON_SIZE: f32 = 20.0;
+pub const TYPE_ICON_PADDING: f32 = 2.0;
+pub const THUMB_TYPE_ICON_PLATE_SIZE: f32 = THUMB_TYPE_ICON_SIZE + TYPE_ICON_PADDING * 2.0;
+const TYPE_ICON_OFFSET: f32 = 4.0;
 pub const BOOK_RESUME_METER_HEIGHT: f32 = 9.0;
 pub const BOOK_RESUME_METER_GAP: f32 = 3.0;
 
@@ -107,6 +112,7 @@ pub enum BottomContainerKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BadgeKind {
+    TypeIcon,
     StackCount,
     FilterMatchCount,
     MediaDuration,
@@ -125,6 +131,7 @@ pub enum BadgeKind {
 /// owns the bottom lane before its format badge. Values also identify semantic badge priorities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BadgePriority {
+    TypeIcon,
     StackCount,
     BookmarkTime,
     UpscaledVideo,
@@ -195,6 +202,8 @@ impl BottomLeftOverlayLayout {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ThumbnailOverlayLayout {
+    /// Fixed at the thumbnail frame's upper-left, reserved before every other badge.
+    pub type_icon: Option<BadgePlacement>,
     pub bookmark_title: Option<BadgePlacement>,
     /// Shared saved-position slot for every cell while the display setting is on (historical name).
     /// Fixed to the inner bottom; only cells with a valid fraction actually paint a meter.
@@ -209,8 +218,9 @@ pub struct ThumbnailOverlayLayout {
 
 impl ThumbnailOverlayLayout {
     pub fn badge_placements(&self) -> impl Iterator<Item = &BadgePlacement> {
-        self.stack_count
+        self.type_icon
             .iter()
+            .chain(self.stack_count.iter())
             .chain(self.bookmark_title.iter())
             .chain(self.top_left.placements())
             .chain(self.bottom_left.placements())
@@ -254,6 +264,8 @@ pub struct BottomContainerInput<'a> {
 
 #[derive(Clone, Debug)]
 pub struct ThumbnailOverlayLayoutInput<'a> {
+    /// Reserve the fixed type mark before other overlays when enabled.
+    pub show_type_icon: bool,
     pub name_style: ThumbnailNameStyle,
     pub cell: egui::Rect,
     pub inner: egui::Rect,
@@ -487,26 +499,38 @@ pub fn layout_thumbnail_overlays(
     input: ThumbnailOverlayLayoutInput<'_>,
     mut measure: impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
 ) -> ThumbnailOverlayLayout {
-    let mut layout = layout_badges(&input, &mut measure);
-    if !input.book_resume_meter || input.inner.width() <= 0.0 || input.inner.height() <= 0.0 {
+    // Reserve the setting-owned band before placing badges, regardless of whether a saved
+    // position will actually paint it. The type slot can narrow its painted portion below.
+    let meter = (input.book_resume_meter && input.inner.is_positive()).then(|| {
+        egui::Rect::from_min_max(
+            egui::pos2(
+                input.inner.min.x,
+                input.inner.max.y - BOOK_RESUME_METER_HEIGHT,
+            ),
+            input.inner.max,
+        )
+    });
+    let mut layout = layout_badges(&input, meter, &mut measure);
+    let Some(meter) = meter else {
         return layout;
-    }
-    let meter = egui::Rect::from_min_max(
-        egui::pos2(
-            input.inner.min.x,
-            input.inner.max.y - BOOK_RESUME_METER_HEIGHT,
-        ),
-        input.inner.max,
-    );
+    };
     // Do not shrink or lift the slot for short cells or fitted images. The cell painter clips it;
     // badge layout already reserves the same lower band for cells with and without saved values.
-    layout.book_resume_meter = Some(meter);
+    let meter = if let Some(icon) = &layout.type_icon
+        && icon.rect.intersects(meter)
+    {
+        egui::Rect::from_min_max(egui::pos2(icon.rect.max.x + 1.0, meter.min.y), meter.max)
+    } else {
+        meter
+    };
+    layout.book_resume_meter = meter.is_positive().then_some(meter);
     layout
 }
 
 fn layout_bookmark_title(
     input: &ThumbnailOverlayLayoutInput<'_>,
     top_left: &TopLeftOverlayLayout,
+    reserved: &[egui::Rect],
     measure: &mut impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
 ) -> Option<BadgePlacement> {
     let title = input.bookmark_title?;
@@ -515,60 +539,90 @@ fn layout_bookmark_title(
         family: BadgeFontFamily::UserText,
         padding: BadgePadding::symmetric(7.0, 4.0),
     };
-    let max_text_width = (input.cell.width() - 28.0).max(0.0);
-    if max_text_width < 8.0 {
+    let mut bounds = input.cell.shrink(4.0);
+    bounds.min.y = top_left.lane_bottom().unwrap_or(input.cell.min.y) + 4.0;
+    if !bounds.is_positive() {
         return None;
     }
-    // Preserve the existing central-title fitting exactly, including the 36-character cap
-    // and yielding when even the shortest prefix plus ellipsis does not fit.
+    // Keep the existing 36-character cap and prefix fitting in each free area, yielding
+    // when even the shortest prefix plus ellipsis does not fit.
     let chars: Vec<char> = title.chars().collect();
-    let mut text = if chars.len() > 36 {
+    let capped = if chars.len() > 36 {
         chars[..35].iter().collect::<String>() + "…"
     } else {
         title.to_owned()
     };
-    if measure(&text, style).x > max_text_width {
-        let chars: Vec<char> = text.chars().collect();
-        for take in (1..chars.len()).rev() {
-            let candidate = chars[..take].iter().collect::<String>() + "…";
-            if measure(&candidate, style).x <= max_text_width {
-                text = candidate;
-                break;
+    let mut best = None;
+    let mut best_length = 0;
+    let mut best_distance = f32::INFINITY;
+    // Every candidate is constructed inside the remaining space. Never relocate a title
+    // around one obstacle and then check only the cell boundary, overlooking another band.
+    for area in unreserved_areas(bounds, reserved) {
+        let max_text_width = (input.cell.width() - 28.0).min(area.width() - style.padding.size().x);
+        if max_text_width < 8.0 {
+            continue;
+        }
+        let mut text = capped.clone();
+        if measure(&text, style).x > max_text_width {
+            let chars: Vec<char> = text.chars().collect();
+            for take in (1..chars.len()).rev() {
+                let candidate = chars[..take].iter().collect::<String>() + "…";
+                if measure(&candidate, style).x <= max_text_width {
+                    text = candidate;
+                    break;
+                }
             }
         }
+        let size = measure(&text, style);
+        let plate_size = size + style.padding.size();
+        if size.x > max_text_width || plate_size.y > area.height() {
+            continue;
+        }
+        let half = plate_size * 0.5;
+        let min_center = area.min + half;
+        // Addition/subtraction at fractional origins can reverse an exact-fit interval by
+        // one ulp. Keep clamp's bounds ordered, as in the content-marker fitter below.
+        let max_center = (area.max - half).max(min_center);
+        let center = input.cell.center().clamp(min_center, max_center);
+        let rect = egui::Rect::from_center_size(center, plate_size);
+        let length = text.chars().count();
+        let distance = center.distance_sq(input.cell.center());
+        if length > best_length || (length == best_length && distance < best_distance) {
+            best_length = length;
+            best_distance = distance;
+            best = Some(BadgePlacement {
+                kind: BadgeKind::BookmarkTitle,
+                priority: BadgePriority::BookmarkTitle,
+                text,
+                rect,
+                style,
+            });
+        }
     }
-    let size = measure(&text, style);
-    if size.x > max_text_width {
-        return None;
-    }
-    let centered = egui::Rect::from_center_size(input.cell.center(), size + style.padding.size());
-    let min_y = top_left.lane_bottom().unwrap_or(input.cell.min.y) + 4.0;
-    let rect = centered.translate(egui::vec2(0.0, (min_y - centered.min.y).max(0.0)));
-    (rect.max.y <= input.cell.max.y - 4.0).then_some(BadgePlacement {
-        kind: BadgeKind::BookmarkTitle,
-        priority: BadgePriority::BookmarkTitle,
-        text,
-        rect,
-        style,
-    })
+    best
 }
 
 fn layout_bottom_container(
     input: &ThumbnailOverlayLayoutInput<'_>,
+    left_x: f32,
     bottom_y: f32,
     require_containment: bool,
     mut measure: impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
     blocked_by_top: impl Fn(egui::Rect) -> bool,
 ) -> Option<BadgePlacement> {
-    let left_x = input.inner.min.x + BOTTOM_LEFT_OFFSET;
     if let Some(container) = input.bottom_container {
         let style = match container.kind {
             BottomContainerKind::Folder => input.name_style.apply(folder_badge_style(input.inner)),
             BottomContainerKind::Format(_) => file_badge_style(input.inner),
         };
-        let max_badge_width = match container.kind {
+        let legacy_width = match container.kind {
             BottomContainerKind::Folder => input.inner.width() * 0.80,
             BottomContainerKind::Format(_) => input.inner.width() - BOTTOM_LEFT_OFFSET * 2.0,
+        };
+        let max_badge_width = if left_x > input.inner.min.x + BOTTOM_LEFT_OFFSET {
+            legacy_width.min(input.inner.max.x - BOTTOM_LEFT_OFFSET - left_x)
+        } else {
+            legacy_width
         };
         let max_text_width = (max_badge_width - style.padding.left - style.padding.right).max(0.0);
         let is_name = container.kind == BottomContainerKind::Folder;
@@ -610,16 +664,144 @@ fn layout_bottom_container(
     None
 }
 
+/// This fixed reservation depends only on the cell frame, never on content.
+pub fn type_icon_slot(cell: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        cell.min + egui::Vec2::splat(TYPE_ICON_OFFSET),
+        egui::Vec2::splat(THUMB_TYPE_ICON_PLATE_SIZE),
+    )
+}
+
+/// All maximal empty rectangles, not disjoint tiles: candidates may overlap each other.
+/// Every empty rectangle within bounds is contained in at least one candidate. Callers
+/// include their required gaps in the reservations and choose a single destination.
+fn unreserved_areas(bounds: egui::Rect, reserved: &[egui::Rect]) -> Vec<egui::Rect> {
+    if !bounds.is_positive() {
+        return Vec::new();
+    }
+    let mut free = vec![bounds];
+    for obstacle in reserved {
+        let mut next = Vec::with_capacity(free.len() * 2);
+        for area in free {
+            let cut = area.intersect(*obstacle);
+            if !cut.is_positive() {
+                next.push(area);
+                continue;
+            }
+            // Any rectangle avoiding this cut lies wholly above, below, left, or right.
+            // Keep each strip's full extent, so a fit can cross another strip's boundary.
+            next.extend(
+                [
+                    egui::Rect::from_min_max(area.min, egui::pos2(area.max.x, cut.min.y)),
+                    egui::Rect::from_min_max(egui::pos2(area.min.x, cut.max.y), area.max),
+                    egui::Rect::from_min_max(area.min, egui::pos2(cut.min.x, area.max.y)),
+                    egui::Rect::from_min_max(egui::pos2(cut.max.x, area.min.y), area.max),
+                ]
+                .into_iter()
+                .filter(|r| r.is_positive()),
+            );
+        }
+        // Contained rectangles (including duplicates) cannot offer another fit. Prune
+        // after every reservation to keep the small candidate set maximal and bounded.
+        let mut i = 0;
+        while i < next.len() {
+            if (0..next.len()).any(|j| i != j && next[j].contains_rect(next[i])) {
+                next.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        free = next;
+    }
+    free
+}
+
+/// Fit an existing mark before painting. No content can move the fixed type slot.
+/// The legacy geometry is exact when there is no collision (including setting OFF).
+pub(crate) fn fit_content_marker(
+    source: egui::Rect,
+    cell: egui::Rect,
+    protected: &[egui::Rect],
+) -> egui::Rect {
+    if !protected.iter().any(|r| r.intersects(source)) {
+        return source;
+    }
+    let reserved: Vec<_> = protected.iter().map(|rect| rect.expand(0.5)).collect();
+    let mut free = unreserved_areas(cell.shrink(4.0), &reserved);
+    // At the 32pt floor the plate occupies the whole inner area. Keep a secondary
+    // mark in the remaining padding rather than hiding it beneath the type plate.
+    if free.is_empty() {
+        free = unreserved_areas(cell, &reserved);
+    }
+    let mut best = egui::Rect::NOTHING;
+    let mut best_scale = 0.0;
+    let mut best_distance = f32::INFINITY;
+    for area in free {
+        if !source.is_positive() {
+            break;
+        }
+        let scale = (area.width() / source.width())
+            .min(area.height() / source.height())
+            .min(1.0);
+        let size = (source.size() * scale).min(area.size());
+        let half = size * 0.5;
+        let center = egui::pos2(
+            source.center().x.clamp(
+                area.min.x + half.x,
+                (area.max.x - half.x).max(area.min.x + half.x),
+            ),
+            source.center().y.clamp(
+                area.min.y + half.y,
+                (area.max.y - half.y).max(area.min.y + half.y),
+            ),
+        );
+        let distance = center.distance_sq(source.center());
+        if scale > best_scale || (scale == best_scale && distance < best_distance) {
+            best_scale = scale;
+            best_distance = distance;
+            best = egui::Rect::from_center_size(center, size);
+        }
+    }
+    best
+}
+
+fn reserved_check_rect(cell: egui::Rect, slot: Option<egui::Rect>) -> egui::Rect {
+    let legacy = check_overlay_rect(cell);
+    let Some(slot) = slot.filter(|slot| slot.intersects(legacy)) else {
+        return legacy;
+    };
+    // Fit the painted check into the remaining right strip. At the 32pt floor
+    // this is 3pt; cell-wide selection/hit behavior does not depend on marker size.
+    let available = (cell.max.x - slot.max.x).max(0.0);
+    let margin = 4.0_f32.min((available - 4.0).max(0.0));
+    let side = 24.0_f32.min((available - margin - 1.0).max(0.0));
+    egui::Rect::from_min_size(
+        egui::pos2(cell.max.x - margin - side, cell.min.y + 4.0),
+        egui::Vec2::splat(side),
+    )
+}
+
 fn layout_badges(
     input: &ThumbnailOverlayLayoutInput<'_>,
+    meter: Option<egui::Rect>,
     mut measure: impl FnMut(&str, BadgeTextStyle) -> egui::Vec2,
 ) -> ThumbnailOverlayLayout {
     // The check state is the fixed-size interaction marker. Reserve its painted circle before
     // measuring any lower-priority badge, including the edit overflow summary.
-    let check = input.checked.then(|| check_overlay_rect(input.cell));
+    let type_icon = input.show_type_icon.then(|| BadgePlacement {
+        kind: BadgeKind::TypeIcon,
+        priority: BadgePriority::TypeIcon,
+        rect: type_icon_slot(input.cell),
+        text: String::new(),
+        style: filename_badge_style(),
+    });
+    let slot = type_icon.as_ref().map(|icon| icon.rect);
+    let check = input.checked.then(|| reserved_check_rect(input.cell, slot));
     let stack_count = input.stack_count.and_then(|count| {
         let style = stack_count_style(input.inner);
-        let available = input.inner.width() - 4.0 - style.padding.left - style.padding.right;
+        let available_left = slot.map_or(input.inner.min.x, |slot| slot.max.x + TOP_LEFT_GAP);
+        let available =
+            input.inner.max.x - 4.0 - available_left - style.padding.left - style.padding.right;
         [format!("{count} 枚"), count.to_string(), "…".to_owned()]
             .into_iter()
             .find(|text| measure(text, style).x <= available)
@@ -637,10 +819,13 @@ fn layout_badges(
             .filter(|badge| {
                 input.cell.contains_rect(badge.rect)
                     && !check.is_some_and(|rect| rect.intersects(badge.rect))
+                    && !slot.is_some_and(|rect| rect.intersects(badge.rect))
             })
     });
     let mut top_left = TopLeftOverlayLayout::default();
-    let mut cursor_x = input.cell.min.x + TOP_LEFT_OFFSET;
+    let mut cursor_x = slot.map_or(input.cell.min.x + TOP_LEFT_OFFSET, |rect| {
+        rect.max.x + TOP_LEFT_GAP
+    });
     let top_y = input.cell.min.y + TOP_LEFT_OFFSET;
     let top_right = check
         .iter()
@@ -750,7 +935,23 @@ fn layout_badges(
     }
 
     let mut bottom_left = BottomLeftOverlayLayout::default();
-    let bookmark_title = layout_bookmark_title(input, &top_left, &mut measure);
+    let bookmark_title = input.bookmark_title.and_then(|_| {
+        let mut reserved: Vec<_> = slot
+            .iter()
+            .chain(check.iter())
+            .copied()
+            .chain(stack_count.iter().map(|badge| badge.rect))
+            .chain(top_left.placements().map(|badge| badge.rect))
+            .map(|rect| rect.expand(TOP_LEFT_GAP))
+            .collect();
+        if let Some(meter) = meter {
+            reserved.push(egui::Rect::from_min_max(
+                egui::pos2(input.cell.min.x, meter.min.y - BOOK_RESUME_METER_GAP),
+                input.cell.max,
+            ));
+        }
+        layout_bookmark_title(input, &top_left, &reserved, &mut measure)
+    });
     // Folder-name badges retain their entire legacy layout. For filenames, an enabled width
     // preference also reserves the existing central title rather than painting through it.
     let prioritize_filename = input.name_style.prioritize_width
@@ -765,7 +966,8 @@ fn layout_badges(
     let bottom_y = input.inner.max.y - BOTTOM_LEFT_OFFSET - bottom_reserve;
     let left_x = input.inner.min.x + BOTTOM_LEFT_OFFSET;
     let blocked_by_top = |rect: egui::Rect| {
-        (input.book_resume_meter && !input.cell.contains_rect(rect))
+        ((input.book_resume_meter || slot.is_some()) && !input.cell.contains_rect(rect))
+            || slot.is_some_and(|slot| slot.intersects(rect))
             || check.is_some_and(|check| check.intersects(rect))
             || stack_count
                 .as_ref()
@@ -773,7 +975,7 @@ fn layout_badges(
             || top_left
                 .placements()
                 .any(|badge| badge.rect.intersects(rect))
-            || (prioritize_filename
+            || ((prioritize_filename || input.show_type_icon)
                 && bookmark_title
                     .as_ref()
                     .is_some_and(|title| title.rect.intersects(rect)))
@@ -783,9 +985,16 @@ fn layout_badges(
         && input
             .bottom_container
             .is_some_and(|container| matches!(container.kind, BottomContainerKind::Format(_)));
+    let content_left = left_x;
     if !separate_format {
-        bottom_left.container =
-            layout_bottom_container(input, bottom_y, false, &mut measure, blocked_by_top);
+        bottom_left.container = layout_bottom_container(
+            input,
+            content_left,
+            bottom_y,
+            false,
+            &mut measure,
+            blocked_by_top,
+        );
     }
 
     if let Some(filename) = input.filename {
@@ -793,7 +1002,9 @@ fn layout_badges(
         let available_left = bottom_left
             .container
             .as_ref()
-            .map_or(left_x, |container| container.rect.max.x + BOTTOM_ITEM_GAP);
+            .map_or(content_left, |container| {
+                container.rect.max.x + BOTTOM_ITEM_GAP
+            });
         let available_right = input.inner.max.x - BOTTOM_LEFT_OFFSET;
         let max_text_width =
             available_right - available_left - style.padding.left - style.padding.right;
@@ -848,6 +1059,7 @@ fn layout_badges(
             .map_or(bottom_y, |filename| filename.rect.min.y - BOTTOM_ITEM_GAP);
         bottom_left.container = layout_bottom_container(
             input,
+            left_x,
             anchor,
             bottom_left.filename.is_some(),
             &mut measure,
@@ -911,16 +1123,22 @@ fn layout_badges(
         }
     }
 
-    let mut occupied: Vec<egui::Rect> = check
+    let mut occupied: Vec<egui::Rect> = slot
         .iter()
+        .chain(check.iter())
         .copied()
         .chain(stack_count.iter().map(|badge| badge.rect))
         .chain(top_left.placements().map(|badge| badge.rect))
-        .chain(bottom_left.placements().map(|badge| badge.rect))
+        .chain(
+            bottom_left
+                .placements()
+                .filter(|badge| badge.kind != BadgeKind::TypeIcon)
+                .map(|badge| badge.rect),
+        )
         .chain(
             bookmark_title
                 .iter()
-                .filter(|_| prioritize_filename)
+                .filter(|_| prioritize_filename || input.show_type_icon)
                 .map(|title| title.rect),
         )
         .collect();
@@ -970,6 +1188,7 @@ fn layout_badges(
         });
 
     ThumbnailOverlayLayout {
+        type_icon,
         bookmark_title,
         book_resume_meter: None,
         check,
@@ -1167,6 +1386,232 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bookmark_title_fits_across_type_slot_bottom_boundary() {
+        let cell = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(120.0, 68.0));
+        let mut input = duration_input(cell, cell.shrink(4.0));
+        input.show_type_icon = true;
+        input.book_resume_meter = true;
+        input.media_duration = None;
+        input.bookmark_time = Some("0:07");
+        input.bookmark_title = Some("場面");
+        let layout = layout_thumbnail_overlays(input, measure);
+        let title = layout
+            .bookmark_title
+            .as_ref()
+            .expect("40x24.25pt title fits");
+        assert_eq!(title.text, "場面");
+        assert_eq!(title.rect.size(), egui::vec2(40.0, 24.25));
+        assert!(title.rect.min.y < type_icon_slot(cell).max.y + TOP_LEFT_GAP);
+        assert!(title.rect.max.y > type_icon_slot(cell).max.y + TOP_LEFT_GAP);
+        assert_pairwise_non_intersecting(layout.badge_placements());
+        assert!(!title.rect.intersects(layout.book_resume_meter.unwrap()));
+    }
+
+    /// Independent oracle: enumerate every rectangle on a tiny board, then select
+    /// the empty ones that cannot grow. No subtraction or strip decomposition.
+    fn assert_maximal_empty_rectangles(reserved: &[egui::Rect]) {
+        let bounds = egui::Rect::from_min_max(egui::pos2(0.25, 0.5), egui::pos2(3.25, 3.5));
+        let mut empty = Vec::new();
+        for left in 0..3 {
+            for right in left + 1..=3 {
+                for top in 0..3 {
+                    for bottom in top + 1..=3 {
+                        let rect = egui::Rect::from_min_max(
+                            bounds.min + egui::vec2(left as f32, top as f32),
+                            bounds.min + egui::vec2(right as f32, bottom as f32),
+                        );
+                        if !reserved.iter().any(|r| r.intersect(rect).is_positive()) {
+                            empty.push(rect);
+                        }
+                    }
+                }
+            }
+        }
+        let expected: Vec<_> = empty
+            .iter()
+            .filter(|r| {
+                !empty
+                    .iter()
+                    .any(|other| other != *r && other.contains_rect(**r))
+            })
+            .copied()
+            .collect();
+        let actual = unreserved_areas(bounds, reserved);
+        assert_eq!(actual.len(), expected.len(), "reservations={reserved:?}");
+        for rect in expected {
+            assert!(
+                actual.contains(&rect),
+                "missing {rect:?}, reservations={reserved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unreserved_areas_match_exhaustive_maximal_rectangle_oracle() {
+        let origin = egui::pos2(0.25, 0.5);
+        // All 512 occupied/empty patterns, including holes and narrow passages.
+        for mask in 0..512 {
+            let reserved: Vec<_> = (0..9)
+                .filter(|i| mask & (1 << i) != 0)
+                .map(|i| {
+                    egui::Rect::from_min_size(
+                        origin + egui::vec2((i % 3) as f32, (i / 3) as f32),
+                        egui::Vec2::splat(1.0),
+                    )
+                })
+                .collect();
+            assert_maximal_empty_rectangles(&reserved);
+        }
+        // Every ordered pair of rectangles, also outside the board: overlapping,
+        // nested, duplicate, edge-touching, and fully covering reservations.
+        let mut obstacles = Vec::new();
+        for left in -1..3 {
+            for right in left + 1..=4 {
+                for top in -1..3 {
+                    for bottom in top + 1..=4 {
+                        obstacles.push(egui::Rect::from_min_max(
+                            origin + egui::vec2(left as f32, top as f32),
+                            origin + egui::vec2(right as f32, bottom as f32),
+                        ));
+                    }
+                }
+            }
+        }
+        for a in &obstacles {
+            for b in &obstacles {
+                assert_maximal_empty_rectangles(&[*a, *b]);
+            }
+        }
+        assert!(unreserved_areas(egui::Rect::NOTHING, &[]).is_empty());
+        assert!(unreserved_areas(egui::Rect::ZERO, &[]).is_empty());
+    }
+
+    /// A fixed-size rectangle can slide up/left until it reaches the bounds or
+    /// an obstacle's bottom/right edge. Enumerating these anchors proves existence
+    /// independently of the maximal-rectangle implementation.
+    fn can_place_size(bounds: egui::Rect, reserved: &[egui::Rect], size: egui::Vec2) -> bool {
+        std::iter::once(bounds.min.x)
+            .chain(reserved.iter().map(|r| r.max.x))
+            .any(|x| {
+                std::iter::once(bounds.min.y)
+                    .chain(reserved.iter().map(|r| r.max.y))
+                    .any(|y| {
+                        let rect = egui::Rect::from_min_size(egui::pos2(x, y), size);
+                        bounds.contains_rect(rect)
+                            && !reserved.iter().any(|r| r.intersect(rect).is_positive())
+                    })
+            })
+    }
+
+    #[test]
+    fn bookmark_title_never_omits_a_fit_or_intersects_reservations() {
+        for width in [48.0, 64.0, 80.0, 100.0, 120.0, 180.0] {
+            for height in (48..=100).step_by(2).map(|h| h as f32).chain([59.5, 60.5]) {
+                for font_factor in [0.75, 1.0, 1.25, 1.5, 2.0] {
+                    for show_icon in [false, true] {
+                        for meter_on in [false, true] {
+                            for crowded in [false, true] {
+                                for text in ["A", "場面", "長いブックマークタイトル"]
+                                {
+                                    let cell = egui::Rect::from_min_size(
+                                        egui::pos2(10.25, 20.5),
+                                        egui::vec2(width, height),
+                                    );
+                                    let mut input = duration_input(cell, cell.shrink(4.0));
+                                    input.media_duration = None;
+                                    input.show_type_icon = show_icon;
+                                    input.book_resume_meter = meter_on;
+                                    input.bookmark_time = Some("0:07");
+                                    input.bookmark_title = Some(text);
+                                    input.checked = crowded;
+                                    input.stack_count = crowded.then_some(12);
+                                    input.edit_badges.pin = crowded;
+                                    let measured = |s: &str, style| measure(s, style) * font_factor;
+                                    let layout = layout_thumbnail_overlays(input, measured);
+                                    let mut bounds = cell.shrink(4.0);
+                                    bounds.min.y =
+                                        layout.top_left.lane_bottom().unwrap_or(cell.min.y) + 4.0;
+                                    let mut reserved: Vec<_> = layout
+                                        .type_icon
+                                        .iter()
+                                        .map(|b| b.rect)
+                                        .chain(layout.check)
+                                        .chain(layout.stack_count.iter().map(|b| b.rect))
+                                        .chain(layout.top_left.placements().map(|b| b.rect))
+                                        .map(|r| r.expand(TOP_LEFT_GAP))
+                                        .collect();
+                                    if meter_on {
+                                        reserved.push(egui::Rect::from_min_max(
+                                            egui::pos2(cell.min.x, cell.max.y - 16.0),
+                                            cell.max,
+                                        ));
+                                    }
+                                    let style = BadgeTextStyle {
+                                        font_size: 13.0,
+                                        family: BadgeFontFamily::UserText,
+                                        padding: BadgePadding::symmetric(7.0, 4.0),
+                                    };
+                                    let fits = |s: &str| {
+                                        let size = measured(s, style);
+                                        // Preserve the existing minimum 8pt text lane,
+                                        // even when a small glyph itself is narrower.
+                                        size.x <= cell.width() - 28.0
+                                            && can_place_size(
+                                                bounds,
+                                                &reserved,
+                                                egui::vec2(size.x.max(8.0), size.y)
+                                                    + style.padding.size(),
+                                            )
+                                    };
+                                    let full_fits = fits(text);
+                                    let shortest = format!("{}…", text.chars().next().unwrap());
+                                    if full_fits || (text.chars().count() > 1 && fits(&shortest)) {
+                                        assert!(
+                                            layout.bookmark_title.is_some(),
+                                            "omitted {text}: {width}x{height}, factor={font_factor}, icon={show_icon}, meter={meter_on}, crowded={crowded}"
+                                        );
+                                    }
+                                    if let Some(title) = &layout.bookmark_title {
+                                        if full_fits {
+                                            assert_eq!(title.text, text);
+                                        }
+                                        assert!(bounds.expand(0.0001).contains_rect(title.rect));
+                                        assert!(
+                                            !reserved
+                                                .iter()
+                                                .any(|r| r.intersect(title.rect).area() > 0.0001)
+                                        );
+                                        assert_pairwise_non_intersecting(layout.badge_placements());
+                                        assert!(
+                                            !layout.check.is_some_and(|r| r.intersects(title.rect))
+                                        );
+                                        assert!(
+                                            !layout
+                                                .book_resume_meter
+                                                .is_some_and(|r| r.intersects(title.rect))
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn content_marker_keeps_full_size_across_reservation_boundaries() {
+        let cell = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(120.0, 68.0));
+        let obstacle = type_icon_slot(cell);
+        let source = egui::Rect::from_center_size(egui::pos2(26.0, 26.0), egui::vec2(70.0, 40.0));
+        let fitted = fit_content_marker(source, cell, &[obstacle]);
+        assert_eq!(fitted.size(), source.size());
+        assert!(cell.shrink(4.0).contains_rect(fitted));
+        assert!(!fitted.intersects(obstacle));
+    }
+
+    #[test]
     fn width_only_filename_measurements_are_logarithmic() {
         for text in ["a".repeat(4096), "長".repeat(4096)] {
             let mut calls = 0;
@@ -1184,6 +1629,144 @@ mod tests {
             assert!(calls <= 16, "{calls} font measurements");
             assert!(fitted.ends_with('…'));
             assert!(measure(&fitted, style).x <= 100.0);
+        }
+    }
+
+    #[test]
+    fn low_media_bookmark_titles_respect_all_reserved_overlays() {
+        let tags = tags(&["#タグ", "分類"]);
+        let mut visible_titles = 0;
+        let mut omitted_titles = 0;
+        for kind in [FormatBadgeKind::Video, FormatBadgeKind::Audio] {
+            for width in [48.0, 64.0, 100.0, 120.0, 180.0] {
+                for height in [48.0, 52.0, 56.0, 59.5, 60.0, 60.5, 64.0, 72.0, 96.0] {
+                    for crowded in [false, true] {
+                        for prioritize_width in [false, true] {
+                            let cell = egui::Rect::from_min_size(
+                                egui::pos2(10.25, 20.5),
+                                egui::vec2(width, height),
+                            );
+                            let mut input = duration_input(cell, cell.shrink(4.0));
+                            input.show_type_icon = true;
+                            input.book_resume_meter = true;
+                            input.bookmark_title =
+                                Some("長いブックマークタイトル_abcdefghijklmnop");
+                            input.bookmark_time = Some("0:07");
+                            input.name_style.prioritize_width = prioritize_width;
+                            input.bottom_container = Some(BottomContainerInput {
+                                kind: BottomContainerKind::Format(kind),
+                                label: if kind == FormatBadgeKind::Video {
+                                    "VIDEO"
+                                } else {
+                                    "AUDIO"
+                                },
+                            });
+                            input.filename = Some("bookmark-media-file");
+                            if crowded {
+                                input.checked = true;
+                                input.stack_count = Some(12);
+                                input.filter_match_count = Some(42);
+                                input.tags = &tags;
+                                input.rating_text = Some("★★★★★");
+                                input.upscaled_video = true;
+                                input.edit_badges.pin = true;
+                            }
+                            let layout = layout_thumbnail_overlays(input, measure);
+                            assert_eq!(
+                                layout.type_icon.as_ref().unwrap().rect,
+                                type_icon_slot(cell)
+                            );
+                            assert_placements_inside_cell(&layout, cell);
+                            assert_pairwise_non_intersecting(layout.badge_placements());
+                            let meter = layout.book_resume_meter.unwrap();
+                            for badge in layout.badge_placements() {
+                                assert!(
+                                    !meter.intersects(badge.rect),
+                                    "{width}x{height}: {badge:?}, meter={meter:?}"
+                                );
+                                assert!(!layout.check.is_some_and(|r| r.intersects(badge.rect)));
+                            }
+                            if layout.bookmark_title.is_some() {
+                                visible_titles += 1;
+                            } else {
+                                omitted_titles += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(visible_titles > 0);
+        assert!(omitted_titles > 0);
+    }
+
+    #[test]
+    fn low_bookmark_title_uses_free_space_and_yields_only_when_too_short() {
+        for width in [64.0, 100.0, 180.0] {
+            let cell = egui::Rect::from_min_size(egui::pos2(10.25, 20.5), egui::vec2(width, 60.0));
+            for show_type_icon in [false, true] {
+                let mut input = duration_input(cell, cell.shrink(4.0));
+                input.show_type_icon = show_type_icon;
+                input.media_duration = None;
+                input.book_resume_meter = true;
+                input.bookmark_title = Some(if width == 64.0 {
+                    "A"
+                } else {
+                    "場面のブックマーク"
+                });
+                let layout = layout_thumbnail_overlays(input.clone(), measure);
+                let title = layout
+                    .bookmark_title
+                    .as_ref()
+                    .expect("shorter title still fits");
+                assert!(cell.shrink(4.0).contains_rect(title.rect));
+                let meter = layout.book_resume_meter.unwrap();
+                assert!(title.rect.max.y <= meter.min.y - BOOK_RESUME_METER_GAP);
+                assert_pairwise_non_intersecting(layout.badge_placements());
+                // Reservations do not consume an unchanged, ample central title position.
+                input.book_resume_meter = false;
+                if !show_type_icon {
+                    let off = layout_thumbnail_overlays(input.clone(), measure);
+                    assert_eq!(title.rect, off.bookmark_title.unwrap().rect);
+                }
+                input.book_resume_meter = true;
+                input.bookmark_time = Some("0:07");
+                let crowded = layout_thumbnail_overlays(input, measure);
+                assert!(crowded.bookmark_title.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn relocated_content_markers_respect_meter_title_check_and_badges_together() {
+        for width in [32.0, 48.0, 64.0, 100.0, 180.0] {
+            for height in [32.0, 48.0, 59.5, 60.0, 60.5, 64.0, 96.0] {
+                let cell =
+                    egui::Rect::from_min_size(egui::pos2(10.25, 20.5), egui::vec2(width, height));
+                let mut input = duration_input(cell, cell.shrink(4.0));
+                input.show_type_icon = true;
+                input.book_resume_meter = true;
+                input.checked = true;
+                input.bookmark_title = Some("場面");
+                input.bookmark_time = Some("0:07");
+                input.rating_text = Some("★★★★★");
+                input.filter_match_count = Some(42);
+                let layout = layout_thumbnail_overlays(input, measure);
+                let reserved: Vec<_> = layout
+                    .badge_placements()
+                    .map(|b| b.rect)
+                    .chain(layout.check)
+                    .chain(layout.book_resume_meter)
+                    .collect();
+                let source = type_icon_slot(cell).expand(5.0);
+                let target = fit_content_marker(source, cell, &reserved);
+                assert!(target.is_positive());
+                assert!(cell.contains_rect(target));
+                assert!(
+                    !reserved.iter().any(|r| r.intersects(target)),
+                    "{width}x{height}: {target:?}"
+                );
+            }
         }
     }
 
@@ -1981,6 +2564,7 @@ mod tests {
                 for count in [None, Some(42)] {
                     for dense in [false, true] {
                         let mut input = ThumbnailOverlayLayoutInput {
+                            show_type_icon: false,
                             tags: if dense { &tags } else { &[] },
                             ..duration_input(cell, inner)
                         };
@@ -2038,6 +2622,7 @@ mod tests {
             }),
         ] {
             let mut input = ThumbnailOverlayLayoutInput {
+                show_type_icon: false,
                 tags: &tags,
                 ..duration_input(cell, inner)
             };
@@ -2206,6 +2791,7 @@ mod tests {
 
     fn duration_input(cell: egui::Rect, inner: egui::Rect) -> ThumbnailOverlayLayoutInput<'static> {
         ThumbnailOverlayLayoutInput {
+            show_type_icon: false,
             cell,
             inner,
             name_style: ThumbnailNameStyle::default(),
@@ -2223,6 +2809,192 @@ mod tests {
             rating_text: None,
             filename: None,
         }
+    }
+
+    #[test]
+    fn type_icon_marker_fit_fractional_bounds_do_not_panic() {
+        let cell = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(28.0, 100.0));
+        let source = egui::Rect::from_min_size(egui::pos2(2.0, 5.0), egui::vec2(32.61314, 20.0));
+        let obstacle = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(28.0, 10.0));
+        let target = fit_content_marker(source, cell, &[obstacle]);
+        assert!(target.is_positive());
+        assert!(cell.contains_rect(target));
+        assert!(!target.intersects(obstacle));
+    }
+
+    #[test]
+    fn type_icon_keeps_its_slot_and_preserves_ample_plain_image_lanes() {
+        for width in [32.0, 48.0, 60.0, 74.0, 174.0] {
+            for meter in [false, true] {
+                let (cell, inner) = square_cell(width);
+                let mut input = duration_input(cell, inner);
+                input.rating_text = Some("★★★★");
+                input.filter_match_count = Some(12);
+                input.book_resume_meter = meter;
+                let off = layout_thumbnail_overlays(input.clone(), measure);
+                input.show_type_icon = true;
+                let on = layout_thumbnail_overlays(input, measure);
+                assert_eq!(on.type_icon.as_ref().unwrap().rect, type_icon_slot(cell));
+                if width >= 174.0 {
+                    assert_eq!(on.bottom_left.rating, off.bottom_left.rating);
+                    assert_eq!(on.filter_match_count, off.filter_match_count);
+                    assert_eq!(on.media_duration, off.media_duration);
+                }
+                assert_pairwise_non_intersecting(on.badge_placements());
+            }
+        }
+    }
+
+    #[test]
+    fn type_icon_bookmark_title_reserves_right_badges_with_width_priority_off_and_folders() {
+        for width in [74.0, 120.0, 174.0, 240.0] {
+            for prioritize in [false, true] {
+                for folder in [false, true] {
+                    let cell =
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 120.0));
+                    let mut input = duration_input(cell, cell.shrink(4.0));
+                    input.show_type_icon = true;
+                    input.name_style.prioritize_width = prioritize;
+                    input.bookmark_title = Some("場面");
+                    input.filter_match_count = Some(99);
+                    input.filename = (!folder).then_some("long filename.zip");
+                    input.bottom_container = Some(BottomContainerInput {
+                        kind: if folder {
+                            BottomContainerKind::Folder
+                        } else {
+                            BottomContainerKind::Format(FormatBadgeKind::Zip)
+                        },
+                        label: if folder { "folder" } else { "ZIP" },
+                    });
+                    assert_pairwise_non_intersecting(
+                        layout_thumbnail_overlays(input, measure).badge_placements(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn type_icon_off_preserves_legacy_tiny_folder_width() {
+        for width in [32.0, 34.0, 37.0] {
+            let (cell, inner) = cell(width);
+            let mut input = duration_input(cell, inner);
+            input.bottom_container = Some(BottomContainerInput {
+                kind: BottomContainerKind::Folder,
+                label: "ABCD",
+            });
+            let style = folder_badge_style(inner);
+            let expected = fit_name(
+                "ABCD",
+                None,
+                inner.width() * 0.80 - style.padding.left - style.padding.right,
+                1,
+                1,
+                &mut measure,
+                style,
+            );
+            let layout = layout_thumbnail_overlays(input, measure);
+            assert_eq!(layout.bottom_left.container.map(|p| p.text), expected);
+        }
+    }
+
+    #[test]
+    fn type_icon_reserves_shared_lanes_without_intersections() {
+        let tags = vec!["旅行".to_owned(), "写真".to_owned()];
+        for width in [48.0, 74.0, 120.0, 200.0, 320.0] {
+            for height in [64.0, 94.0, 180.0, 240.0] {
+                for prioritize in [false, true] {
+                    for font_scale in [1.0, 1.5, 2.0] {
+                        for max_lines in 1..=4 {
+                            for container in [
+                                None,
+                                Some(BottomContainerInput {
+                                    kind: BottomContainerKind::Folder,
+                                    label: "長いフォルダの名前を折り返して表示",
+                                }),
+                                Some(BottomContainerInput {
+                                    kind: BottomContainerKind::Format(FormatBadgeKind::Archive),
+                                    label: "RAR",
+                                }),
+                            ] {
+                                let cell = egui::Rect::from_min_size(
+                                    egui::pos2(10.0, 20.0),
+                                    egui::vec2(width, height),
+                                );
+                                let mut input = duration_input(cell, cell.shrink(4.0));
+                                input.show_type_icon = true;
+                                input.name_style = ThumbnailNameStyle {
+                                    font_scale,
+                                    max_lines,
+                                    prioritize_width: prioritize,
+                                };
+                                input.book_resume_meter = true;
+                                input.checked = true;
+                                input.stack_count = Some(123);
+                                input.edit_badges = EditBadgeFlags {
+                                    page_override: true,
+                                    local_adjust: true,
+                                    mask: true,
+                                    conceal: true,
+                                    comic: true,
+                                    crop: true,
+                                    pin: true,
+                                };
+                                input.tags = &tags;
+                                input.bottom_container = container;
+                                input.filename = (!container
+                                    .is_some_and(|c| c.kind == BottomContainerKind::Folder))
+                                .then_some("長いファイルの名前を折り返して表示する.rar");
+                                input.rating_text = Some("★★★★★");
+                                input.filter_match_count = Some(123);
+                                let layout = layout_thumbnail_overlays(input, measure);
+                                assert_pairwise_non_intersecting(layout.badge_placements());
+                                for badge in layout.badge_placements() {
+                                    assert!(
+                                        cell.contains_rect(badge.rect),
+                                        "{width}x{height}: {badge:?}"
+                                    );
+                                    assert!(
+                                        !layout.check.is_some_and(|r| r.intersects(badge.rect))
+                                    );
+                                    assert!(
+                                        !layout.book_resume_meter.unwrap().intersects(badge.rect)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn type_icon_width_priority_preserves_full_name_and_custom_content() {
+        let (cell, inner) = cell(240.0);
+        let mut input = duration_input(cell, inner);
+        input.filename = Some("a sufficiently long filename to use the full row.rar");
+        input.bottom_container = Some(BottomContainerInput {
+            kind: BottomContainerKind::Format(FormatBadgeKind::Archive),
+            label: "RAR",
+        });
+        input.name_style.prioritize_width = true;
+        let off = layout_thumbnail_overlays(input.clone(), measure);
+        input.show_type_icon = true;
+        let on = layout_thumbnail_overlays(input.clone(), measure);
+        assert_eq!(on.bottom_left.filename, off.bottom_left.filename);
+        let name = on.bottom_left.filename.unwrap();
+        let icon = on.type_icon.unwrap();
+        let format = on.bottom_left.container.unwrap();
+        assert!(icon.rect.max.y < name.rect.min.y);
+        assert!(!icon.rect.intersects(format.rect));
+        assert_eq!(icon.rect, type_icon_slot(cell));
+        let obstacle =
+            egui::Rect::from_min_max(egui::pos2(inner.min.x, inner.max.y - 60.0), inner.max);
+        input.filename = None;
+        input.bottom_container = None;
+        let layout = layout_thumbnail_overlays(input, measure);
+        assert!(layout.type_icon.unwrap().rect.max.y < obstacle.min.y);
     }
 
     #[test]
@@ -2338,6 +3110,7 @@ mod tests {
             let (cell, inner) = square_cell(width);
             let layout = layout_thumbnail_overlays(
                 ThumbnailOverlayLayoutInput {
+                    show_type_icon: false,
                     cell,
                     inner,
                     name_style: ThumbnailNameStyle::default(),
@@ -2400,6 +3173,7 @@ mod tests {
             let (cell, inner) = square_cell(width);
             let layout = layout_thumbnail_overlays(
                 ThumbnailOverlayLayoutInput {
+                    show_type_icon: false,
                     cell,
                     inner,
                     name_style: ThumbnailNameStyle::default(),
@@ -2437,6 +3211,7 @@ mod tests {
         let (cell, inner) = square_cell(100.0);
         let layout = layout_thumbnail_overlays(
             ThumbnailOverlayLayoutInput {
+                show_type_icon: false,
                 cell,
                 inner,
                 name_style: ThumbnailNameStyle::default(),
@@ -2468,6 +3243,7 @@ mod tests {
             let (cell, inner) = square_cell(width);
             let layout = layout_thumbnail_overlays(
                 ThumbnailOverlayLayoutInput {
+                    show_type_icon: false,
                     cell,
                     inner,
                     name_style: ThumbnailNameStyle::default(),
@@ -2511,6 +3287,7 @@ mod tests {
             let (cell, inner) = square_cell(width);
             let layout = layout_thumbnail_overlays(
                 ThumbnailOverlayLayoutInput {
+                    show_type_icon: false,
                     cell,
                     inner,
                     name_style: ThumbnailNameStyle::default(),
@@ -2573,6 +3350,7 @@ mod tests {
         let tags = tags(&["#風景", "旅行"]);
         let layout = layout_thumbnail_overlays(
             ThumbnailOverlayLayoutInput {
+                show_type_icon: false,
                 cell,
                 inner,
                 name_style: ThumbnailNameStyle::default(),
@@ -2610,6 +3388,7 @@ mod tests {
         let tags = tags(&["#tag"]);
         let layout = layout_thumbnail_overlays(
             ThumbnailOverlayLayoutInput {
+                show_type_icon: false,
                 cell,
                 inner,
                 name_style: ThumbnailNameStyle::default(),
@@ -2657,6 +3436,7 @@ mod tests {
         let tags = tags(&["#very-long-tag"]);
         let layout = layout_thumbnail_overlays(
             ThumbnailOverlayLayoutInput {
+                show_type_icon: false,
                 cell,
                 inner,
                 name_style: ThumbnailNameStyle::default(),
@@ -2692,6 +3472,7 @@ mod tests {
         let tags = tags(&["#同時表示"]);
         let layout = layout_thumbnail_overlays(
             ThumbnailOverlayLayoutInput {
+                show_type_icon: false,
                 cell,
                 inner,
                 name_style: ThumbnailNameStyle::default(),
@@ -2731,6 +3512,7 @@ mod tests {
         let (cell_rect, inner) = cell(240.0);
         let layout = layout_thumbnail_overlays(
             ThumbnailOverlayLayoutInput {
+                show_type_icon: false,
                 cell: cell_rect,
                 inner,
                 name_style: ThumbnailNameStyle::default(),
@@ -2767,6 +3549,7 @@ mod tests {
         let (cell_rect, inner) = cell(240.0);
         let layout = layout_thumbnail_overlays(
             ThumbnailOverlayLayoutInput {
+                show_type_icon: false,
                 cell: cell_rect,
                 inner,
                 name_style: ThumbnailNameStyle::default(),
@@ -2803,6 +3586,7 @@ mod tests {
         let (cell_rect, inner) = cell(240.0);
         let layout = layout_thumbnail_overlays(
             ThumbnailOverlayLayoutInput {
+                show_type_icon: false,
                 cell: cell_rect,
                 inner,
                 name_style: ThumbnailNameStyle::default(),
@@ -2839,6 +3623,7 @@ mod tests {
         let tags = tags(&["#非常に長い日本語タグ名がここに入ります"]);
         let layout = layout_thumbnail_overlays(
             ThumbnailOverlayLayoutInput {
+                show_type_icon: false,
                 cell,
                 inner,
                 name_style: ThumbnailNameStyle::default(),
