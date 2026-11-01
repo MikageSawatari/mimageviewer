@@ -4912,7 +4912,7 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
    `app-server --managed-daemon` 等) が残り、mIV が「動作中」と判定して登録を拒否する**。利用者の許可でプロセスを止めて続けた。
    登録の後の `codex.cmd exec` 9 回では、この常駐プロセスは起動しなかった (npm 版の codex.exe が子として mcp.exe を起動し、
    終了で消えた)。追記: 利用者が ChatGPT アプリを起動し直しても、約 6 分のあいだ常駐プロセスは現れなかった (アプリの子の
-   codex.exe は `AppData\Local\OpenAI\Codexin` の `app-server` と `exec-server` の 2 本)。朝の常駐プロセスの親 (PID 40416) は
+   codex.exe は `AppData\Local\OpenAI\Codex\bin` の `app-server` と `exec-server` の 2 本)。朝の常駐プロセスの親 (PID 40416) は
    アプリ本体とは別で、何が起動したかは分からない (サブ PC 担当の観測と推測)。
 2. 環境設定の検索で「AI 連携」と入れると「一致する設定がありません」とだけ出て、移った先の案内が無い。
 3. 登録の確認の窓の内容に、ファイルには書かれない見出しだけの `[mcp_servers]` の行が出る (実際の差分と合わない)。
