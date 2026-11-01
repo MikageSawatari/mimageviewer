@@ -543,7 +543,7 @@ fn decode_remote_source(
             request.cache_key_override.as_deref(),
             request.idx,
             &tx,
-            catalog.as_deref(),
+            catalog.as_deref().into(),
             Some(&cache_map),
             request.mtime,
             request.file_size,

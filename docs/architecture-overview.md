@@ -3,7 +3,8 @@
 ## コレクション一覧の永続サムネイル（§1.668、案C）
 
 `thumb_loader/catalog_provider.rs` は既存generic poolの固定catalog/実親catalog providerを所有する。
-PC Collectionの元GridItemからdrive/UNC保持の実親scopeを固定し、workerの16親LRUで個別lookup/saveする。
+PC Collectionの元GridItemからdrive/UNC保持の実親scopeを固定し、workerの16 slot LRUで個別lookup/saveする。
+lookupは既存DBをROで開くだけで、typedな保存targetがpolicy/実測で保存を選んだ後だけRWを開く。
 新namespaceのキャッシュだけを追加し、通常Folder/Smart/Search/Remoteの保存先と `collection.db` は変更しない。
 寿命は元フォルダ単位で、参照解除では消さない。接続/削除familyの詳細は [catalog設計](catalog-design.md)。
 

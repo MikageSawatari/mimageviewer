@@ -1,7 +1,9 @@
 # 表示パイプライン (サムネイル / フルスクリーン)
 
 §1.668（案C）: PC Collection rootのgeneric thumbnailは可視workerでdrive/UNC保持の実親catalogを
-個別lookupし、既存stamp/proof・preview優先・cache/source分岐を通る。行keyはfull-pathのまま、
+既存DBだけROで個別lookupし、既存stamp/proof・preview優先・cache/source分岐を通る。
+typedな保存targetは実測policy/forceで保存が確定した後だけRWを開き、非保存Autoで空DBを作らない。
+行keyはfull-pathのまま、
 通常catalogの旧行はseedしない。video pinの準備済みメモリseedは優先を維持し、旧catalog由来の
 再帰CachedPinnedは新DBへmirrorしない。保存policyとidle品質更新、音声/動画/Remoteの専用経路は
 維持する。所有と削除は [catalog設計](catalog-design.md) を参照。

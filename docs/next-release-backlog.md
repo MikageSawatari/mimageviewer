@@ -388,7 +388,7 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.668 コレクションの一覧がサムネイルのキャッシュを使わず、開くたびに作り直す — X @Rottytops (2026-10-31)
 
-- 状態: **採択Cの実装・直接計測・確認用build済み、多数親に分散した小画像の追加コストについて設計判断待ち（2026-11-01、未コミット／製品未起動、v4.11.0候補）**。[X の投稿](https://x.com/Rottytops) (2026-10-31) は「2000 件のコレクションで毎回サムネイルを読みに行くのがしんどい。コレクションのサムネイルキャッシュを検討してほしい」という要望。報告者の素材の置き場所 (SSD / HDD / NAS)・本と画像の割合は未記載。実装前の根拠は下記「計測と設計案」、実装・検証・計測と残る判断点は「実装記録」を参照。独立実装レビューと受入判断は設計担当が行う。
+- 状態: **追加判断のlazy RW修正・前後計測・独立レビュー・確認用build完了。全別親Autoの増分は約25〜31msから−0.8〜+0.9ms、Auto全条件でDB作成0。lib全件は走査1件timeout、単独3回成功。設計担当の検収待ち（2026-11-01、未コミット／製品未起動、v4.11.0候補）**。[X の投稿](https://x.com/Rottytops) (2026-10-31) は「2000 件のコレクションで毎回サムネイルを読みに行くのがしんどい。コレクションのサムネイルキャッシュを検討してほしい」という要望。報告者の素材の置き場所 (SSD / HDD / NAS)・本と画像の割合は未記載。実装前の根拠は下記「計測と設計案」、実装・検証・計測と残る判断点は「実装記録」と「追補」を参照。追加判断後の独立コード・計測レビューはACCEPT、最終受入判断とコミットは設計担当が行う。
 - 原因 (コードで確認、2026-10-31 ClaudeCode): コレクションの一覧は永続のサムネイルキャッシュ (catalog) を読みも書きもしない。`src/app/collection_grid.rs` の一覧の設置で `current_color_catalog = None`、`spawn_thumbnail_workers` の catalog 引数も `None` (コメント「No catalog open/write」)。`cache_map` は代表ピンが動画のフォルダ用の seed WebP (`folder_pin_cache`) だけで作る。catalog が無いので worker の `should_save` は常に false (`src/thumb_loader.rs`)。結果として、開くたび・表示範囲から外れて破棄されたセルへスクロールで戻るたびに元ファイルからデコードし直す。ZIP は書庫を開いて先頭画像を読み、PDF は PDFium で表紙を描く (HDD 上の大きな PDF の表紙は 1 枚 5〜29 秒の計測が §1.475 の調査にある)。キーはフルパス (`imgthumb:<path>` / `zipthumb:<path>`、`use_full_path_cache_keys()`) で、通常フォルダの DB (basename キー) とも一致しない。スマートフォルダ (`src/app/smart_folder.rs` が合成パスの専用 catalog を開く)・検索・評価・履歴などの集約ビューは catalog を持ち、持たないのはコレクションだけ。§1.266 にも「コレクションのサムネイルは毎回生成扱い」とある。
 - 開くたびの準備: prepare worker が全項目を `std::fs::metadata` し、動画 sidecar・編集 DB・ピン DB を引く (`src/collection_store/prepare.rs`、`src/app/collection_grid.rs`)。SSD・10,000 件で約 120ms の計測 (§1.475) があり、体感の主因はサムネイルの再生成と見ている (推測)。
 - 直し方の候補 (未決定): (A) スマートフォルダと同じく、collection_id から作った合成パスで専用 catalog を開き、`load_all` の結果と catalog を worker へ渡す。キーは既にフルパスなので衝突しない。登録の削除時の掃除 (合成パスでは `delete_missing` が走らない) とキャッシュ削除の所有単位 (catalog-design.md §2.4) を決める。(B) prepare worker で項目を親フォルダごとにまとめ、親フォルダの catalog を `open_existing_read_only` で引き、mtime・size が合えばフルパスキーへ付け替えて seed にする (前例: `src/remote_ipc/collections.rs` が親フォルダごとに catalog を読み取り専用で開く)。ふだんフォルダで見ている項目はすぐ当たるが、新しく作った分の保存は別に要る。(A) を基本にし、初回の空振りを (B) で埋める組み合わせも考えられる。設計を決める前に、2000 件規模で開く→表示が揃うまでの時間を perf ログで測る。
@@ -817,6 +817,159 @@ single-instance mutexを共有するため、インストール版/トレイ常�
 確認シナリオは、画像/ZIP/PDFを含むCollectionの再open・スクロール戻り、別Collectionからの同じ元項目の再表示、
 元ファイル更新後の再生成、元フォルダからのcache clear後の再生成とCollection rootの削除無効。
 これらのlive確認、GPU/UI提示時間、HDD/NASでの計測は未実施。
+
+#### 追補：非保存Autoの親DB作成を撤去（2026-11-01、設計担当の追加判断）
+
+基点 `41900862a`（`collection-thumb-1668`、開始時clean）。設計担当は小画像・全別親Autoの
+再訪増分約31msを不受入とし、lookupと保存時のRW作成を分離する判断を行った。
+実装担当は製品を起動せず、コミットは設計担当が行う。
+
+- Collection lookupは常に既存DBだけのRO。不存在は存在確認だけでmissとし、mkdir/schema/
+  空DBを作らない。SourceOnlyはlookupしない。不存在をLRUに固定せず、他要求の保存を次回読める。
+- `ThumbnailSaveTarget` がUnavailable / Fixedの既存接続 / 元親・pool・`CatalogWork`を一つに
+  保持する。`catalog.is_some()`を保存資格へ使わず、forceまたは既存policyの実測判定の後だけRWを
+  開く。Fixedの通常Folder/Smart/Remoteは渡された既存接続と保存条件を維持する。
+- EPUB fallbackは元providerを継承し、ROをFixedへ付け替えない。RAW継続も元scope/epochを維持。
+  PDF Harvestの静的資格は保存targetで判断し、Fixedの従来gate、CollectionのOff/forceを保持する。
+  PDFメタ補完・旧CachedPinned mirrorのFixed専用経路は維持し、Collection ROへ書かない。
+- LRUはRO/RWを区別して合計16 slot、I/O/closeはlock外。実行中要求はlookup ROと保存RWの
+  最大2接続を保持し得る。cache-dir/受付epoch、`CatalogAccess`への登録・clear/退役契約は維持。
+  schema/保存形式の変更や移行はない。
+- 独立設計・コードレビューはGPT-6.1 Sol / xhigh。P2として、RWの初回作成中にROを開くと
+  未完成schemaの列情報を固定した接続が残る競合を指摘された。新namespace専用RO helperで
+  必須列を一つのSQLite snapshotから検査し、完全なreaderだけ登録・公開する根因修正を行った。
+  初回lookupと、resolve直後のclearを含むCacheOnlyの再開も同じ境界へ通す。
+  未完成の有効SQLiteはmiss、実SQLite/I/O故障は既存ログ・一回通知。待機/リトライ/自動修復は追加しない。
+  既存legacy互換RO helperは変更しない。P2と迂回修正後の独立コードレビューはACCEPT。
+- 新規6回帰は、24親へ分散した非保存Autoの再訪後もDB数0/cache directory不存在、保存条件、
+  SourceOnly/CacheOnly、別cache-dir/旧epoch、実EPUB fallback/RAW継続、初回/clear後の未完成DBから
+  完成後のlayout/proof再読取りを検査する。既存LRU回帰もRO/RW混在にした。
+
+**同条件の前後計測**:
+
+変更前は既存のdev-runtime lib test実行体（HEAD `41900862a`相当、SHA-256は
+`target/section1668-lazy-before-artifact.json`）で既存ignoredハーネス2件を再実行した。
+変更後も同じハーネス・通常feature・dev-runtime opt-level 2・debug_assertions=false。
+G: SSD、rustc 1.99.1、`MSBUILDDISABLENODEREUSE=1`。素材・件数・可視40・regular6＋heavy2・
+温まったOS cache・交互順5回の条件は上の記録と同じ。PCの他のテスト負荷は固定しておらず、
+各run内の従来対照との差を重視する。負の増分も測定のばらつきとして扱う。
+
+可視40セルのworker CPU画素まで、ms、5回の中央値。増分は各runのC−従来（中央値の差）。
+「初回記録」は上のfan-out表、「前→後DB数」は先頭160＋遠方40まで要求した最終数。
+
+| 件数 | 親数 | policy | 初回記録の増分 | 今回変更前 従来 / C / 増分 | 変更後 従来 / C / 増分 | DB数 前→後 |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| 2,000 | 20 | Auto | +0.3 | 14.3 / 16.7 / +2.3 | 16.4 / 15.2 / −1.1 | 3→0 |
+| 2,000 | 2,000 | Auto | +31.1 | 16.0 / 46.9 / +31.0 | 15.5 / 16.4 / **+0.9** | 200→0 |
+| 10,000 | 20 | Auto | +1.9 | 18.1 / 17.5 / −0.6 | 14.1 / 14.4 / +0.3 | 2→0 |
+| 10,000 | 10,000 | Auto | +28.7 | 15.0 / 39.5 / +24.5 | 15.9 / 15.1 / **−0.8** | 200→0 |
+| 2,000 | 20 | Always | +2.8 | 15.8 / 16.4 / +0.6 | 14.8 / 15.7 / +0.8 | 3→3 |
+| 2,000 | 2,000 | Always | +25.5 | 19.0 / 42.8 / +23.8 | 16.2 / 24.6 / +8.5 | 200→200 |
+| 10,000 | 20 | Always | +0.7 | 15.2 / 17.3 / +2.2 | 15.0 / 15.7 / +0.7 | 2→2 |
+| 10,000 | 10,000 | Always | +25.4 | 16.6 / 40.7 / +24.1 | 15.4 / 26.4 / +11.0 | 200→200 |
+
+丸める前の中央値から増分を計算したため、表示した1桁同士の引き算とは0.1ms異なる場合がある。
+今回変更前の2,000件/20親/Autoだけは初回の実測で6件が保存され、全5再訪が6hit/34元生成、
+256×192と512×384の混在だった。設定・素材・手順は同じだが、この行は保存結果/画素まで同一の
+純粋lookup比較ではない。主要な全別親Autoの2条件は前後とも全再訪0hit/40元生成で比較できる。
+変更後Autoは全4条件・全5再訪で40件元生成/0hit、DB数0。Alwaysは全再訪40hit/元生成0。
+全別親Autoの約25〜31msの増分は消え、このSSD条件では従来対照のばらつきに近い範囲になった。
+Alwaysの多数親は既存DBのRO cold openと512×384 WebP復号の原価が残る（元生成表示は256×192）。
+保存policy・画素サイズを変えて結果を作ったものではない。
+
+混在素材も同じ2,000件・20親、JPEG1,000/ZIP500/PDF500、4,490,285,000 bytes、Always。
+値はms。従来は5回、C再openは初回を除く4回の中央値、C初回は1回を別記する。
+
+| 条件 | 全prepare 前→後 | 可視40 worker 前→後 | open→CPU40 前→後 | scroll戻り40 前→後 |
+| --- | ---: | ---: | ---: | ---: |
+| 従来・毎回生成 | 78.9→57.6 | 101.2→96.5 | 179.4→156.4 | 109.3→98.0 |
+| C初回（1回） | 119.1→56.3 | 147.1→139.8 | 267.7→197.3 | 20.8→36.7 |
+| C再open（4回） | 97.0→54.0 | 22.4→18.5 | 123.5→73.4 | 20.8→18.9 |
+
+各列の中央値は独立で加算しない。変更後C初回の保存等終了は160.8ms（変更前157.1ms）。
+C初回の戻り1回は遅かったが、全5回の戻り中央値は変更前20.8ms、変更後19.2ms。
+全prepareは変更しておらず、run間のprepare差を本修正の効果に含めない。
+変更後同一runの従来対照に対してC再openは156.4→73.4ms、戻りは98.0→18.9ms。
+C初回の先頭/遠方は各40元生成、初回戻りと全再open/戻りは40hitという既存条件を維持した。
+GPU upload/paint/present、UI poll、idle品質更新、HDD/NAS、実素材での体感は未計測。
+既存の空DBを自動で削除する処理は追加せず、存在するDBのRO open原価は残る。
+
+前後のハーネスは各 **2 passed / 0 failed / exit 0**（42.69秒 / 32.58秒）。
+ログは `target/section1668-lazy-before.log` と `target/section1668-lazy-measure-after.log`。
+前fan-out `run-ujm0uc/fanout-results.json`、前混在 `run-Jodkka/results.json`、
+後fan-out `run-9HNOa6/fanout-results.json`、後混在 `run-ES4GAj/results.json`（全て `target/section1668/`）。
+比較JSONは `target/section1668-lazy-comparison.json`。計測用buildは30分34秒。
+最終Rust4ファイルと既存ハーネスのhashは `target/section1668-lazy-source-sha256.json`。
+
+**追加判断後の検証**（最終Rust差分、通常feature/test profile。checkだけtest-script付き）:
+
+| 対象 | 結果・証跡 |
+| --- | --- |
+| 型check | `cargo check -p mimageviewer --lib --tests --features test-script -j 1`、exit 0、3分10秒。`target/section1668-lazy-check-final.log` |
+| provider焦点 | nextest **14 passed / 0 failed**、2.486秒。`target/section1668-lazy-focused-reviewed.log` |
+| 関連回帰 | nextest **1,907 passed / 0 failed**、1268.594秒。run `b3c06e03-2348-41e8-8a07-cd02c538369d`、`target/section1668-lazy-related.log`。filterは前回のcollection/catalog/thumb/cache_maint/remote_ipcにsmart_folderを追加 |
+| UI snapshot | `cargo test --test ui_snapshot -j 1`、**218 passed / 0 failed**、43.38秒。`target/section1668-lazy-snapshot.log`。UI/期待画像の変更なし |
+| 整形・文言 | `cargo fmt`、`cargo fmt --check`、`git diff --check`成功、glyph 0、site cards 49枚/違反0 |
+
+関連nextestの`-j 1`をbuild jobsと取り違え、実際はtest-threads=1で実行したため検証待ちが延びた。
+直列の成功結果として記録し、製品の速度計測には使わない。最後のlib全件は既定CPU並列で実行する。
+中間の焦点compile2回は独立レビューのP2修正でsourceが失効するためテスト実行前に中断し、採用証拠に含めない。
+**lib全件（追加判断後1回）と失敗分の単独確認**:
+
+`scripts/test-lib-full.ps1` は既定CPU並列・通常feature/test profile・retry 0で1回だけ実行。
+**15,385 passed / 1 timed out / 69 skipped、864.417秒、exit 100**。assertion failureは0だが、
+全件成功とは扱わない。sourceIdは `65ddd8b91648822c163c1797ef0eb88618394b0e148c4003f44d2424d8fa6f14`、
+run `20261101T110335290Z-9d0b6e14`、nextest ID `293864e3-e219-4cbf-bc90-d4b45a2ab546`。
+JUnit/全出力は `target/test-lib-full/runs/20261101T110335290Z-9d0b6e14/`、
+外側ログ/exitは `target/section1668-lazy-full.log` / `.exit`、集計は `target/section1668-lazy-full-result.json`。
+実行中はsource/fixture/文書を固定し、完了後は本記録と計測注記だけを更新した。
+
+タイムアウトは既存 `app::folder_scan::section1375_scan_perf_tests::section1375_large_physical_scan_10k_100k`
+の600.062秒（前回全件でも同じテストがtimeout）。10,000/100,000件の走査・投影ログまで出ており、
+100,000件のscanは1763.819ms、projectionは1373.642msだった。
+テスト全体には各件の実ファイル作成/一時領域解放も含まれるが、どこが600秒を消費したかは未確定。
+このテスト本体・走査実装は本差分で変更していない。上限延長・ignore・期待値緩和は行わない。
+
+全件終了後、同じ通常feature/test profile・nextest既定600秒枠・retry 0・完全一致filterで
+この1件だけを3回、直列に実行した。**3回とも成功、単独では未再現**。
+
+| 単独確認 | nextest実行時間 | 結果・ログ |
+| --- | ---: | --- |
+| 1回目 | 117.421秒 | pass / exit 0、`target/section1668-lazy-solo-1.log` |
+| 2回目 | 116.072秒 | pass / exit 0、`target/section1668-lazy-solo-2.log` |
+| 3回目 | 100.789秒 | pass / exit 0、`target/section1668-lazy-solo-3.log` |
+
+各exitファイルと `target/section1668-lazy-solo-results.json` も保存した。
+単独成功を全件成功へ置き換えず、全件負荷下のtimeout原因は未確定として引き継ぐ。
+追加判断後のRustrelevantファイル/ハーネスのhash一致と、数表・元JSON・各成功ログの整合は
+独立レビューでも確認済み。変更前Auto2,000件/20親の6hit注記を反映し、計測・証跡レビューもACCEPT。
+
+**確認用buildと引き渡し**:
+
+`scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`、
+`MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`、通常feature（portableなし）、exit 0。
+coreのdev-runtime buildは14分31秒、Remoteは0.70秒、EPUB workerは0.69秒。
+VCRT/PEは `runtime=4 / pe=3` 合格、`target/vcrt-pe-reports/dev-runtime.json`。
+ログ/exitは `target/section1668-lazy-build-dev.log` / `.exit`、成果物のサイズ/更新UTC/SHA-256は
+`target/section1668-lazy-build-artifacts.json`。
+coreは `target/dev-runtime/mimageviewer-core.exe`、339,559,424 bytes、更新UTC `2026-11-01T11:38:55Z`。
+検証・計測済みのRust4ファイルとハーネスの5hashをbuild後に再照合し、全件一致した。
+
+製品の起動・既存アプリの停止・通常設定の操作・コミットは実施していない。
+作業はこのworktreeの未コミット差分として設計担当へ引き渡す。
+残る懸念は、全件負荷下の走査test timeout（単独3回未再現）、Always多数親のRO/復号原価、
+混在初回戻り1回のばらつき、UI/GPU提示時間とHDD/NAS/実素材の未計測。
+設計担当の検収・実機確認・コミットは未実施。
+
+手動確認する場合は、インストール版/常駐tray版を先に終了する（single-instance mutex共有）。
+この通常profileのバイナリは実利用中の `%APPDATA%\mimageviewer` を使い、実設定・データを更新し得る。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+確認する操作は、画像/ZIP/PDFを含むCollectionと、多数の親へ分散した小画像Collectionの
+再open・スクロール戻り。live操作は実施しておらず、自動検証の成功とは区別する。
 
 ### 1.669 本の構成を作っていない本でも、ページを出すたびに構成の照合が走る — X @Rottytops (2026-10-31)
 

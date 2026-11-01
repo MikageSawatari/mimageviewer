@@ -2,6 +2,8 @@
 
 §1.668: PCコレクション一覧の画像/本代表サムネイルは、drive/UNC保持の元フォルダ単位で
 Collection間共有の永続cacheを使う。通常フォルダ用とは別で、既存policyとidle品質更新を維持する。
+lookupは既存DBのROだけで行い、保存先はpolicy/実測で保存を選んだ後だけRWで開く。
+非保存Autoの閲覧だけでは空DBを作らない。
 参照解除やCollection削除では消さず、全件/期限/元フォルダを開いてのcache削除の対象とする。
 Collection rootで現在フォルダ削除は無効。Remoteのcache経路は変更しない。
 詳細は [catalog設計](catalog-design.md)、検証・計測はbacklog §1.668。

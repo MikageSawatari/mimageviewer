@@ -15,7 +15,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 mod catalog_provider;
 pub(crate) use catalog_provider::RequestCatalog;
-pub use catalog_provider::ThumbnailCatalogProvider;
+pub use catalog_provider::{ThumbnailCatalogProvider, ThumbnailSaveTarget};
 
 // -----------------------------------------------------------------------
 // ワーカーキュー優先度
@@ -2522,7 +2522,7 @@ fn process_load_request_with_provider(
         gen_done.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let resolved_catalog = provider.resolve(req, cache_decision, cancel);
+    let resolved_catalog = provider.resolve(req, cancel);
     let catalog = resolved_catalog.as_ref();
     let writable_catalog = catalog.filter(|db| !db.is_read_only());
     if matches!(req.raw_source, LoadRequestSource::RawHalfDeveloped { .. }) {
@@ -2552,7 +2552,7 @@ fn process_load_request_with_provider(
             req.cache_key_override.as_deref(),
             req.idx,
             tx,
-            writable_catalog.map(|arc| arc.as_ref()),
+            provider.save_target(req),
             Some(cache_map),
             req.mtime,
             req.file_size,
@@ -2633,7 +2633,7 @@ fn process_load_request_with_provider(
             &mut fallback,
             cache_map,
             tx,
-            catalog,
+            provider.clone(),
             thumb_px,
             thumb_quality,
             display_px,
@@ -2660,7 +2660,7 @@ fn process_load_request_with_provider(
                 &mut fallback,
                 cache_map,
                 tx,
-                catalog,
+                provider.clone(),
                 thumb_px,
                 thumb_quality,
                 display_px,
@@ -2716,6 +2716,7 @@ fn process_load_request_with_provider(
         .map_or(&*req, |(stamped, _)| stamped);
 
     // 内部関数向けに `&CatalogDb` を取り出しておく (= 既存シグネチャ互換)
+    let save_target = provider.save_target(req);
     let catalog_ref: Option<&crate::catalog::CatalogDb> = writable_catalog.map(|a| a.as_ref());
     // カタログキーを共通 helper で組み立て (auto_aspect の seed フェーズと共有)。
     // None ケース (path に file_name が無い等の異常) は既存挙動に合わせて空文字 fallback。
@@ -2830,9 +2831,7 @@ fn process_load_request_with_provider(
             catalog
                 .and_then(|catalog| {
                     if catalog.is_retired() {
-                        catalog.resume_cache_only_after_maintenance(filename, &|| {
-                            cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed))
-                        })
+                        provider.resume_cache_only_lookup(req, catalog, filename, cancel)
                     } else {
                         // The Collection provider already performed its one RO continuation.
                         catalog.load_one(filename)
@@ -3407,12 +3406,14 @@ fn process_load_request_with_provider(
     // 静的 gate: SourceOnly / catalog 無し / cache_map 無し のいずれかが該当すれば
     // どうせ cache 保存しないので harvest 待ちの意味が無く AbortOnCancel に倒す。
     // (詳細は docs/pdf-pool-harvest-on-cancel-plan.md)
-    let cancel_policy =
-        if req.pdf_page.is_some() && req.source_policy.allows_cache() && catalog_ref.is_some() {
-            crate::pdf_loader::CancelWaitPolicy::HarvestOnCancel
-        } else {
-            crate::pdf_loader::CancelWaitPolicy::AbortOnCancel
-        };
+    let cancel_policy = if req.pdf_page.is_some()
+        && req.source_policy.allows_cache()
+        && save_target.can_harvest(req.force_cache, cache_decision)
+    {
+        crate::pdf_loader::CancelWaitPolicy::HarvestOnCancel
+    } else {
+        crate::pdf_loader::CancelWaitPolicy::AbortOnCancel
+    };
 
     let verified_source_bytes = match req.relative_page_provenance.as_ref() {
         Some(provenance) => match with_verified_relative_page_bytes(provenance, |bytes| bytes) {
@@ -3442,7 +3443,7 @@ fn process_load_request_with_provider(
         req.cache_key_override.as_deref(),
         req.idx,
         tx,
-        catalog_ref,
+        save_target,
         Some(cache_map),
         req.mtime,
         req.file_size,
@@ -5051,7 +5052,7 @@ pub fn load_one_cached(
     cache_key_override: Option<&str>,
     idx: usize,
     tx: &mpsc::Sender<ThumbMsg>,
-    catalog: Option<&crate::catalog::CatalogDb>,
+    save_target: ThumbnailSaveTarget<'_>,
     cache_map: Option<
         &std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
     >,
@@ -5093,6 +5094,7 @@ pub fn load_one_cached(
     raw_handoff: Option<&RawThumbHandoff>,
     deferred_req: Option<LoadRequest>,
 ) {
+    let catalog = save_target.fixed_catalog();
     // The existing continuation clone preserves the outer folder item even when
     // `path` is now its selected image. Diagnostics never register another owner.
     #[cfg(all(windows, any(test, feature = "test-script")))]
@@ -5803,10 +5805,11 @@ pub fn load_one_cached(
     let stats_timing = stats_started.map(|at| at.finish()).unwrap_or_default();
 
     // (B) キャッシュ保存判定 (段階 C)
-    //     catalog 未指定時は保存不可
-    //     それ以外は CacheDecision の判定に従う
+    // The destination opens a Collection writer only after the measured policy
+    // decision. A missing lookup DB does not disable future saving.
     let policy_should_save = cache_decision.should_cache(path, file_size, decode_ms, display_ms);
-    let should_save = catalog.is_some() && (force_cache || policy_should_save);
+    let save_catalog = save_target.open_if(force_cache, policy_should_save);
+    let should_save = save_catalog.is_some();
     #[cfg(all(windows, any(test, feature = "test-script")))]
     if let (ThumbnailRequestId::Registered(request_id), Some(key)) = (request_id, diagnostic_key) {
         crate::test_script::release_checks::trace(
@@ -5829,8 +5832,8 @@ pub fn load_one_cached(
     let mut cache_map_ms = 0.0;
     let mut normal_log = crate::perf::stall::Timing::default();
 
-    if should_save {
-        let cat = catalog.expect("should_save => catalog is Some");
+    if let Some(save_catalog) = save_catalog {
+        let cat = save_catalog.as_ref();
         let t_enc = std::time::Instant::now();
         let encoded = crate::catalog::encode_thumb_webp_with_aspect_dims(
             &img,
@@ -8145,7 +8148,7 @@ mod tests {
             None,
             0,
             &tx,
-            Some(&catalog),
+            Some(&catalog).into(),
             Some(&cache_map),
             123,
             0,
@@ -9707,19 +9710,17 @@ mod tests {
                 rx.try_recv().unwrap().pixels().is_some(),
                 "legacy pin display preserved"
             );
-            let db = provider
-                .resolve(
-                    &req,
-                    make_decision(CachePolicy::Always, 25, 2_000_000),
-                    None,
-                )
-                .unwrap();
-            assert_eq!(
-                db.load_one(req.cache_key_override.as_deref().unwrap())
-                    .unwrap()
-                    .is_some(),
-                !collection
-            );
+            let db = provider.resolve(&req, None);
+            if collection {
+                assert!(db.is_none(), "display-only legacy pin must not create a DB");
+            } else {
+                assert!(
+                    db.unwrap()
+                        .load_one(req.cache_key_override.as_deref().unwrap())
+                        .unwrap()
+                        .is_some()
+                );
+            }
             assert_eq!(map.read().unwrap().is_empty(), collection);
         }
     }

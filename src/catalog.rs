@@ -295,6 +295,53 @@ impl CatalogWork {
         CatalogDb::open_existing_read_only_admitted(&self.cache_dir, folder, self.admission)
     }
 
+    /// Collection's new namespace has no legacy thumbnail schema. Publish only
+    /// readers with all current columns, never a reader of a newly created file
+    /// whose writer has not installed `thumbnails` yet.
+    pub(crate) fn open_existing_collection_parent(
+        &self,
+        identity: &Path,
+    ) -> rusqlite::Result<Option<CatalogDb>> {
+        let access = self.access();
+        let _lease = access.lease(self.admission)?;
+        let path = db_path_for(&self.cache_dir, identity);
+        if !catalog_file_exists(&path)? {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        // One statement/snapshot decides the immutable reader capabilities.
+        // An incomplete valid SQLite file is a miss, not a cached legacy reader.
+        let columns = {
+            let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('thumbnails')")?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<HashSet<_>>>()?
+        };
+        let required = [
+            "filename",
+            "mtime",
+            "file_size",
+            "width",
+            "height",
+            "thumb_data",
+            "source_width",
+            "source_height",
+            "layout_width",
+            "layout_height",
+            "folder_provenance",
+            "selection_proof",
+        ];
+        if !required.iter().all(|column| columns.contains(*column)) {
+            return Ok(None);
+        }
+        Ok(Some(CatalogDb::from_connection(
+            conn,
+            access.clone(),
+            self.admission,
+            true,
+            true,
+        )))
+    }
+
     pub(crate) fn access(&self) -> std::sync::Arc<CatalogAccess> {
         CatalogAccess::for_cache_dir(&self.cache_dir)
     }

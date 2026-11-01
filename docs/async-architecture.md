@@ -683,7 +683,10 @@ CollectionSourceParentsを所有する。共通UI enqueueで元GridItemの実親
 deferredもCloneで継承する。16親LRUはslot取得だけをlockし、open/lookup/保存/closeはlock外の
 worker。pool/要求は所有contextのqueue/cancelに従い、最後のArcはworkerでdropする。
 兄弟のopen/close/removeでは共有epochを進めず、明示cache clearだけ既存admission/drain/retireへ
-接続する。Off/CacheOnlyはRO専用slot、保存/catch-upへROを渡さない。
+接続する。lookupは全policyで既存DBのRO専用slot、SourceOnlyはlookupを省く。
+`ThumbnailSaveTarget` が既存Fixed接続か元親・pool・受付epochを一つに保持し、実測policy/forceで
+保存が確定した後だけRWを開く。RO/RWは合計16 slotで、実行中要求は最大2接続を保持し得る。
+保存/catch-upへROを渡さず、EPUB fallback再帰も元providerを継承する。
 `collection.thumb_catalog_open` / `thumb_catalog_lookup` はms・書込可否・hitを記録する。
 既存thumb encode/save計装も維持。配置/寿命/削除familyは [catalog設計](catalog-design.md) を参照。
 

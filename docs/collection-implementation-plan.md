@@ -5,7 +5,9 @@
 §1.668（2026-11-01、案C）: PC root一覧のgeneric thumbnailはCollection間でdrive/UNC保持の
 実親catalogを共有する。cold/history/navigation/warm設置は同じcontext-owned poolを使い、
 可視要求の共通受付で元GridItemの親とcache-dir epochを固定する。全件prepareにcatalog I/Oを
-追加せず、workerの16親LRUで個別lookup/saveする。参照解除/Collection削除ではcacheを消さず、
+追加せず、workerの16 slot LRUで個別lookup/saveする。lookupは既存DBのROだけで、
+保存targetがpolicy/実測で保存を選んだ時だけRWを開く。非保存Autoで空DBを作らない。
+参照解除/Collection削除ではcacheを消さず、
 元フォルダfamily/全件/期限clearで削除する。音声・動画・pin seedと既存再prepare/
 presentation-source epoch、Remoteは従来経路。詳細は [catalog設計 §2.4](catalog-design.md)。
 

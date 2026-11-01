@@ -91,14 +91,25 @@ lexical規則で正規化し、drive/UNC保持のSHA-256を `__collection_source
 `ThumbnailCatalogProvider` の FixedCatalog / CollectionSourceParents を既存poolが所有する。
 workerだけで個別lookup、stamp/proof検証、miss生成と既存policyによる保存を行う。
 LRUはpoolごとに16 slot。lock下はslotの移動だけ、open/SQL/closeはlock外。
-同一slotの初期化はOnceLockに集約する。保持16に加え実行中workerごと最大1 slot/接続、
-RAW follow-upは接続ではなく元scope/admission、PDF catch-upは既存有界queueの接続leaseを保持する。
+同一slotの初期化はOnceLockに集約する。RO/RWを区別した合計16 slotを保持し、これに加えて
+実行中workerごと最大2接続（lookupのROと保存時のRW）を保持し得る。
+RAW follow-upは接続ではなく元scope/admission、FixedのPDF catch-upは既存有界queueの接続leaseを保持する。
 新providerの接続をUIへ置かず、空一覧/context retire/App dropも最後のpool Arcを退出workerで解放する。
 
-Off（既存force例外を除く）/CacheOnlyは存在する新DBだけROで開き、warm RW slotを借りない。
-RO接続を保存/PDFメタ補完へ渡さない。Auto/Alwaysは可視要求のRW作成を許す。
+lookupはpolicyにかかわらず存在する新DBだけROで開き、warm RW slotを借りない。
+不存在はファイル存在確認だけでmissとし、空DB・hash directory・schemaを作らない。
+新namespaceのRO接続は必須thumbnail列を一つのSQLite snapshotで確かめてから登録・公開する。
+初回RW作成中の未完成schemaはmissとし、不完全な列情報の接続をLRUへ残さない。
+従来のlegacy互換RO openは変更しない。SQLite/I/Oの実エラーは既存のログ・一回通知を使う。
+SourceOnlyはlookupを行わない。missはLRUへ固定せず、後続要求や兄弟contextの保存を次回参照できる。
+`ThumbnailSaveTarget` がFixedの既存接続またはCollectionの元親・pool・受付時`CatalogWork`を所有し、
+force例外または既存policyの実測判定が保存を選んだ後だけRWを開く（なければ作る）。
+lookup接続の有無を保存可否へ使わず、非保存Autoは空DBを作らない。
+RO接続を保存/PDFメタ補完へ渡さず、メタ補完は従来のFixed writableだけで行う。
+PDF Harvestの静的資格は保存targetから判定し、Fixedの従来gateとCollectionのOff/force条件を維持する。
 削除前のwriter epochを更新せず、CacheOnlyだけ既存の一回RO継続を使う。
-pin/EPUB/RAW派生は元scopeを継承する。video/frame-pin seedは従来のメモリ優先。
+pin/EPUB/RAW派生は元scopeを継承する。EPUB fallback再帰も元providerを引き継ぎ、
+lookup済みROをFixed保存先へ付け替えない。video/frame-pin seedは従来のメモリ優先。
 旧catalog由来の再帰 `CachedPinned` は表示を維持し、新DBへmirrorしない。
 mtime秒/size、policy、pin世代、Folder proof、PDF source/layout寸法、idle品質更新は維持する。
 

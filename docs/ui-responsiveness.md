@@ -595,6 +595,8 @@ target clone を全件に行っていた。さらに可視優先範囲が移る�
 
 §1.668の親catalogは全件prepareで開かず、可視要求を処理する既存thumbnail worker内で遅延open/
 個別lookup/保存/closeする。UIの共通受付は元項目の親identityとepochだけを固定する。
+lookupは既存DBのROだけとし、不存在は存在確認でmiss。保存targetが実測policy/forceで保存を
+選んだ後だけRWを開く。非保存Autoのためのmkdir/schema初期化は行わない。
 `collection.thumb_catalog_open` / `thumb_catalog_lookup` のmsとhit、既存thumb encode/save区間で確認する。
 UIへcold openや最後の接続closeを持ち込まない。所有・上限は [catalog設計](catalog-design.md) を参照。
 
