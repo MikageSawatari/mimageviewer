@@ -388,11 +388,285 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.668 コレクションの一覧がサムネイルのキャッシュを使わず、開くたびに作り直す — X @Rottytops (2026-10-31)
 
-- 状態: **未着手 (v4.11.0 候補)**。[X の投稿](https://x.com/Rottytops) (2026-10-31) は「2000 件のコレクションで毎回サムネイルを読みに行くのがしんどい。コレクションのサムネイルキャッシュを検討してほしい」という要望。報告者の素材の置き場所 (SSD / HDD / NAS)・本と画像の割合は未記載。開発側は実測していない。
+- 状態: **計測・実装前設計案・ignoredハーネス作成済み（2026-11-01、製品未修正、v4.11.0候補）**。[X の投稿](https://x.com/Rottytops) (2026-10-31) は「2000 件のコレクションで毎回サムネイルを読みに行くのがしんどい。コレクションのサムネイルキャッシュを検討してほしい」という要望。報告者の素材の置き場所 (SSD / HDD / NAS)・本と画像の割合は未記載。開発側の条件付き計測と推奨C案は下記「計測と設計案」を参照。採否・製品実装は設計担当へ引き渡す。
 - 原因 (コードで確認、2026-10-31 ClaudeCode): コレクションの一覧は永続のサムネイルキャッシュ (catalog) を読みも書きもしない。`src/app/collection_grid.rs` の一覧の設置で `current_color_catalog = None`、`spawn_thumbnail_workers` の catalog 引数も `None` (コメント「No catalog open/write」)。`cache_map` は代表ピンが動画のフォルダ用の seed WebP (`folder_pin_cache`) だけで作る。catalog が無いので worker の `should_save` は常に false (`src/thumb_loader.rs`)。結果として、開くたび・表示範囲から外れて破棄されたセルへスクロールで戻るたびに元ファイルからデコードし直す。ZIP は書庫を開いて先頭画像を読み、PDF は PDFium で表紙を描く (HDD 上の大きな PDF の表紙は 1 枚 5〜29 秒の計測が §1.475 の調査にある)。キーはフルパス (`imgthumb:<path>` / `zipthumb:<path>`、`use_full_path_cache_keys()`) で、通常フォルダの DB (basename キー) とも一致しない。スマートフォルダ (`src/app/smart_folder.rs` が合成パスの専用 catalog を開く)・検索・評価・履歴などの集約ビューは catalog を持ち、持たないのはコレクションだけ。§1.266 にも「コレクションのサムネイルは毎回生成扱い」とある。
 - 開くたびの準備: prepare worker が全項目を `std::fs::metadata` し、動画 sidecar・編集 DB・ピン DB を引く (`src/collection_store/prepare.rs`、`src/app/collection_grid.rs`)。SSD・10,000 件で約 120ms の計測 (§1.475) があり、体感の主因はサムネイルの再生成と見ている (推測)。
 - 直し方の候補 (未決定): (A) スマートフォルダと同じく、collection_id から作った合成パスで専用 catalog を開き、`load_all` の結果と catalog を worker へ渡す。キーは既にフルパスなので衝突しない。登録の削除時の掃除 (合成パスでは `delete_missing` が走らない) とキャッシュ削除の所有単位 (catalog-design.md §2.4) を決める。(B) prepare worker で項目を親フォルダごとにまとめ、親フォルダの catalog を `open_existing_read_only` で引き、mtime・size が合えばフルパスキーへ付け替えて seed にする (前例: `src/remote_ipc/collections.rs` が親フォルダごとに catalog を読み取り専用で開く)。ふだんフォルダで見ている項目はすぐ当たるが、新しく作った分の保存は別に要る。(A) を基本にし、初回の空振りを (B) で埋める組み合わせも考えられる。設計を決める前に、2000 件規模で開く→表示が揃うまでの時間を perf ログで測る。
 - 対象: `src/app/collection_grid.rs`、`src/collection_store/prepare.rs`、`src/thumb_loader.rs`、`src/catalog.rs`、[catalog 設計](catalog-design.md)、[コレクション実装計画](collection-implementation-plan.md)。キャッシュの設定・削除の UI と、マニュアルのキャッシュの説明も合わせる。規模 / 優先度: Medium / P2。報告者への返信は未。
+- 当初記録の補足: 「catalogを読まない」の対象範囲、RemoteのRO参照の用途、Bのdrive共有リスクは、下記の再確認で補足・訂正した。
+
+#### 計測と設計案（2026-11-01、Codex。製品実装前）
+
+対象ソースは `collection-thumb-1668` / `78bd5b6a3`。製品コードは変更せず、
+`src/app/tests.rs` に opt-in 計測モジュールを登録しただけ。製品・PDF worker process・GUIは起動せず、
+利用者の `%APPDATA%` とログは参照・変更していない。実装・検収・コミットは設計担当へ引き渡す。
+
+**計測条件と読み方**
+
+- 生成素材2,000件: JPEG 1,000（50%）、ZIP 500（25%）、PDF 500（25%）。20実親×100件。
+  各親で同じbasenameを再使用し、異なる親の取り違えをキーの検査対象にする。
+  JPEGは2048×1536・quality 85・決定的な模様とノイズ、ZIPはJPEG 4ページをStoredで格納、
+  PDFは768×576ptの4ページに同寸法JPEGを埋め込む。具体的なbyte数は下表。
+  大量ページ・巨大PDF・写真の内容の多様さを代表する素材ではない。
+- G: のローカルSSD、Intel Core Ultra 9 285、Windows、rustc 1.99.1。
+  `MSBUILDDISABLENODEREUSE=1`、通常feature / **dev-runtime profileのlib test（opt-level 2、LTO off）**。
+  製品coreを起動するものではなく、配布版の所要時間にも換算しない。
+  OSファイルキャッシュを排出しない。通常フォルダ相当で全2,000件を一度生成してから比較するため、
+  **元素材も温まった条件**での「毎回生成」と「WebP再利用」の比較である。
+- 可視40セル（画像20・ZIP10・PDF10）、遠方1000..1040へ移動してから先頭40へ戻る。
+  保存thumb長辺512px / WebP quality 75、source表示目標256px。cacheヒット時は保存済みWebPの画素サイズになる。
+  `make_load_request` → 実 `process_load_request` をregular 6本＋heavy I/O 2本で実行。
+  queue分類は製品の `GridItem::is_heavy_io()` を使い、PDFはregular、ZIPはheavyへ送る。
+  各batchの簡易dispatcherはthreadを起動/終了するため、scrollもそのコストを含む。製品の常駐queueの完全再現ではない。
+  スクロールはCPU画素を破棄し、encoded `cache_map`を保持する形で退去を模擬する。
+  元生成/ヒットを結果のoriginで数え、40件すべて成功・再生成回数をassertする。
+- 開き直しは実 `CollectionStoreRuntime::load_collection` の往復 → 実
+  `prepare_collection_grid_install` → cache読込 → 可視40件の最後のCPU画素受信まで。
+  `SourcePixels` と後続 `Finalized` を区別し、保存完了までのworker終了時間も別に残す。
+  UIの50ms poll、要求のframe分割、GPU upload（8枚/frame）、paint/present、先読み・競合する索引は含まない。
+  従って**クリック→画面上の全セル表示完了の実測ではなく、その非対話のCPU準備経路の実測**。
+  cache-hitは `UpgradeableCache` で返る。製品の `thumb_idle_upgrade` が有効なら0.5秒idle後に
+  `enqueue_idle_upgrades` がkeep内をSourceOnlyで再生成し得る。この後段は未計測であり、
+  ヒット40/元生成0は初回CPU画素までの値。セッション全体の原本再読込0を意味せず、既存の品質更新も抑止しない。
+- PDFは既存 `RemotePdfTestBackend` が実PDFiumの `ipc_render` / response parseへ接続する。
+  mock画素ではないが、毎回documentを開くin-process adapterであり、実process poolの並列・IPC・起動・
+  document再利用は測っていない。既知の4ページmetaをA試作へ用意し、別系統のmeta catch-upを測定から除く。
+  同basenameの複製素材は内容・size・mtimeを揃え、500対象すべてのpdf_metaヒットとpool未起動をassertする。
+  Auto比率actorは注入せず、編集7 DBとpin 2 DBは空の実DBを用意する。
+  動画・音声・sidecarファイル・編集済み画像・pin済み素材は今回の速度計測には含めない。
+- currentはcatalog無し、B試作は通常フォルダで温めた20親catalogをROで開き、2,000対象行だけを
+  `load_one`しmtime/size一致行を実requestのfull-path keyへ変換する（全件 `load_all` はしない）。
+  A試作はUUID合成パスのcatalogを実workerへ渡す。最初に先頭と遠方の計80件だけ保存し、次のopenで
+  80行を `load_all` する。Aもopenごとに接続を開き直し、その時間をcatalog読込に含める。
+  Aの初回生成を再訪の統計へ混ぜない。`CachePolicy::Always` を比較の共通条件にする。
+  実設定Auto/Off・全件閲覧済み2,000行のA・多数親への分散は別の受入計測が必要。
+
+数値はms、中央値（範囲）。current/Bは5回、A再訪は初回を除いた4回。各列の中央値は別々に計算しており、足してtotalにはしない。
+他のOS負荷を制御した専用ベンチPCの結果ではない。
+
+| 条件 | actor RTT | 全prepare | catalog読込 | 可視40のworker | open→CPU40 | scroll戻り40 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 現状・毎回生成 | 1.8 | 171.3 | 0.0 | 201.1 | **360.8（284.4–432.0）** | **269.6（159.1–334.2）** |
+| B試作・通常20親/2,000行をseed | 1.8 | 154.0 | 117.2 | 36.2 | **318.3（297.6–402.8）** | **61.7（36.5–80.4）** |
+| A試作・再訪、1 DB/80行 | 1.8 | 150.0 | 5.1 | 41.9 | **197.2（173.7–235.9）** | **56.8（39.0–76.6）** |
+
+currentは再open/戻りの両方で40/40元生成、Bは両方40/40hit、A再訪も両方40/40hit。
+A初回は別枠の1回でopen→CPU40 **525.7ms**、workerの初回画素338.6ms/保存等の終了382.8ms、
+遠方も40件元生成し、直後の戻りは40hit・65.3ms。新規保存に初回の追加原価があることを示す参考値で、Cの測定値ではない。
+全2,000件の通常フォルダ相当のwarm-upは17.36秒（比較時間へ含めない）。
+返った画素はsourceが256×192、cacheは256×192/512×384だった。
+
+| prepare独立probe（各5回） | 中央値（範囲）ms |
+| --- | ---: |
+| 全prepare | 213.7（170.6–282.0） |
+| metadata取得＋分類＋順序構築 | 202.3（127.5–240.7） |
+| sidecar探索（対象動画0件） | 0.005（0.004–0.035） |
+| 編集7 DBの読取＋projection | 12.4（10.6–25.0） |
+| pin 2 DBの読取 | 2.2（2.1–6.2） |
+
+| 素材 | 1件のサイズ | 件数 |
+| --- | ---: | ---: |
+| JPEG | 893,368 / 899,730 bytes | 各500 |
+| 4ページZIP | 3,593,037 bytes | 500 |
+| 4ページPDF | 3,594,435 bytes | 500 |
+| 合計 | **4,490,285,000 bytes（約4.49 GB）** | 2,000 |
+
+判断: この条件でもcache hitは可視画素/戻りの再生成待ちを短縮した。一方でBの全件seedは117msを要し、
+open全体の改善を小さくしている。prepareのstat/分類も残り、cacheだけで全待ちを解消する結果ではない。
+このため推奨Cは全件seedをprepareへ足さず、可視workerで遅延読取する（下記）。
+
+検証: 通常feature、dev-runtime opt-level 2、`debug_assertions=false`、本ハーネス **1 passed / 0 failed / exit 0**、本体34.07秒。
+ログ `target/section1668-optimized-final.log`、exit記録 `target/section1668-optimized-final.exit`、
+JSON `target/section1668/run-wQjq3h/results.json`、source hash `target/section1668-source-final-sha256.json`。
+初回最適化buildは34分30秒、最終sourceの差分buildは14分35秒。最終計測中はsourceを変更していない。
+先行の非最適化試行は、epoch fixture不足、その修正後のqueue分類/PDF meta前提の不備があり、上表へ採用しない。
+それらのログは `target/section1668-measure.log` / `section1668-measure-final.log` に区別して残す（製品テストの不具合とは扱わない）。
+`cargo fmt --all -- --check`、UI glyph 0件、diff checkを実施。製品未変更のためfull gate/確認用core build/live検証は今回の対象外。
+
+prepare内訳は、全prepareの壁時計に加え、同じ分類/sidecar/編集DB/pin DB関数を別途呼んだprobeを残す。
+probeは独立した温まった呼出しであり、全prepareの加算可能な内訳ではない。画像・ZIP・PDFだけなので
+sidecar対象動画は0件。全prepareには表示policy投影・page identity等も入る。
+HDD/NASは測っていない。元ファイルのopen/read/書庫展開/PDF描画を省く効果は、遅いストレージほど
+大きくなる見込みだが**推測**で、倍率・秒数は主張しない。mtime/size取得はcache hitでも残るため、
+NASのmetadata待ちまで消えるわけではない。§1.475のHDD大型PDF 5〜29秒/枚はClaudeCodeの別実機・別素材の
+観測であり、このSSDハーネスの値へ合算しない。§1.266の類似索引mutex待ちも再現していない。
+
+**原因の再確認（確認済みと推測の分離）**
+
+1. `collection_grid.rs::install_collection_grid_items_with_thumbnail_sources` は `current_folder=None`、
+   `current_color_catalog=None`、pin由来だけの `cache_map` とcatalog引数 `None` でgeneric workerを起動する。
+   `prepare_collection_snapshot_while` は全登録項目をstat/classifyし、Grid prepareはsidecar、編集DB、pin DBを読むが、
+   thumbnail catalogは開かない。`load_one_cached` は `catalog.is_some() && (force_cache || policy_should_save)`
+   なので、通常画像・Folder/ZIP/PDF/変換書庫代表の生成結果は保存されず、通常生成はmapにも残らない。
+   ハーネスでcurrentの再open/scroll戻りとも40/40再生成を検査する。
+2. `use_full_path_cache_keys()` / `make_load_request_with_visibility` はCollectionをfull-path scopeとし、
+   `imgthumb:<path>`、`zipthumb:<path>`、`pdfthumb:<path>`等を使う。通常実親catalogのbasenameキーとは違う。
+   代表にはpolicy、pin ID/世代、Folder sort/depth/provenance/proofも関係し、文字列のprefix削除だけでは変換できない。
+   ドライブ/共有rootは通常フォルダ側もfull-path keyなのでbasename決め打ちも不可。
+3. Smart Folderは `smart_folder.rs::prepare_smart_folder` で合成UUID pathのcatalogを
+   `CatalogWork`から開き、`PreparedAggregateCatalog`（DB＋WebP map）をworker準備して採用する。
+   検索/サブ展開・評価・履歴等にもcatalogを渡す経路がある。Collectionのcold normal/history/navigationと、
+   retained pin資産からmapを作り直すwarm navigationの全入口が対象になる。
+4. 「Collectionだけcatalogを一切使わない」は範囲が広すぎる。**音声**はgeneric関数先頭の
+   `AudioThumbnail` generatorで既に実親 `audioart:` scope/admissionを使い、**動画**は別のvideo worker、
+   sidecar、video pin/tileの経路である。Folderの再帰pin解決も既存の子/親catalogを読む経路がある。
+   本件は一覧自身のgeneric画像/代表の保存先とseedの欠落として扱い、音声/動画や既存の再帰pin表示を移設・削除しない。
+5. `remote_ipc/collections.rs::cached_prepared_collection_landscape_flags_while` のRO参照は主に
+   `load_source_dims`、旧NULL行の `load_one` による**見開き判定用寸法**の取得で、thumbnail BLOB seedの実装ではない。
+   保存コレクション本体は `persistent_collections.rs` が同helperを共有する。
+   実親catalogでthumbnailをlookup/saveする、より近い先例は `remote_ipc/thumbnail.rs`。
+6. RO openは通常RW openのmigrationを行わない。B/A+Bで旧PDFのlayout無し行を新catalogへコピーすると、
+   新catalogの移行markerだけが新しくなり、必要な再生成を迂回する恐れがある。
+   mtime/sizeだけのseed試作は今回生成した現行形式・非pin素材の比較に限定する。
+   報告者の体感の主因がこの再生成であること、素材比率・ストレージ、§1.266との重なりは未確認。
+
+**比較と推奨**
+
+| 案 | 効果・所有 | 判断 |
+| --- | --- | --- |
+| A: collection UUIDごとの専用catalog | 初回生成を保存し、再open/scroll戻りを改善。Smartと同じworker準備の形を使え、full-path rowは別driveも区別する | 成立する候補。ただし同sourceを複数collectionで重複保存。厳密な登録解除/UUID削除にはUUID単位writer資格・接続退役・掃除が必要 |
+| B: 既存実親catalogのRO seedのみ | 通常フォルダで閲覧済みなら初回から再利用できる | 新規生成を保存しないので単独では不足。さらに下記drive共有の問題があり、旧行を無条件にseedできない |
+| A+B | 初回の親cache再利用と以後の専用保存 | Aの寿命に加え、2種類のキー・旧PDF行・pin/proof変換とdrive出所の証明が要る。初段には推奨しない |
+| B′: 既存実親catalogへworkerがlookup/save | UUID寿命を無くし、通常Folder/Remoteとも共有できる案として検討した | **推奨しない**。旧basename行のdrive出所を証明できず、Collectionへ誤画像条件を新しく持ち込む。memory/DB key分離も必要 |
+| **C: drive保持の実親単位・新namespace catalogをCollection間で共有** | **推奨**。UUID寿命を無くし、既存Collectionのfull-path rowと共通workerを使う。memory/DB keyを同じにできる | 旧通常cacheの初回再利用とRemoteへの直共有は得ない。lazy parent providerと、指定フォルダclearの対象拡張が必要。C自体は未実装・未計測 |
+
+**B/B′をそのまま採れない理由（コード確認、実ファイルの取り違え再現は未実施）**:
+`catalog.rs::db_path_for` は非rootでdriveを除く。`C:\foo` と `D:\foo` は同じDBになり、通常の同basename行は
+mtime秒/sizeだけでhitする。別内容でも両stampが同じなら区別不能で、full-pathのmemory keyへ付け替えても
+既に取り違えたbytesは直らない。現Collectionのsource生成はこのDBを読まないため、B/B′の導入で増える退行になる。
+`catalog-design.md` §2.2の「実害なし」という説明を安全性の証明にはしない。
+旧行に今回のdriveラベルだけを後付けする案も、別driveが書いた行を正当化するので不可。
+本ハーネスのBはG:だけの現行形式fixtureに限定した性能試作で、Bの製品利用の正しさを証明しない。
+通常catalog全体のhash変更は既存cacheとリムーバブルdrive-letter継承へ波及するため、本件から外す。
+
+先に「Smartと同じAで済ませる」を検討した。worker成果物/準備境界の再利用は採るが、厳密なUUID掃除まで加えると
+Smartのコピーでは済まない。`CatalogAccess::begin_delete(Folder)` はFolder指定でもcache-dir内の全Local/Remote接続を
+退役させるので、毎open/removeへの流用は兄弟contextのwriter資格を落とす通常退行になり、採らない。
+全collection共通1DBも、union membership、参照共有、削除単位と競合writerが増えるため採らない。
+長いmodal化・別windowの閉じ直しは従来のスクロール/同時閲覧を制限し、cacheの所有を直さないので採らない。
+Cでは所有を元sourceの親へまとめ、collection actorの変更、UUID epoch、登録解除prune、保存完了待ちを設計から除く。
+
+**Cの実装前の契約（今回まだコードへ入れない）**
+
+- 所有単位はdrive/UNCを保持した**実親フォルダ**。例えば合成identityを
+  `__collection_source_parent_v1__/<SHA256(normalize_keep_drive(lexical_parent))>` とし、既存の
+  `db_path_for` へ渡す。namespace/versionを含むので旧物理catalog/Smart/collection UUIDと衝突しない。
+  SourcePathKeyと同じlexical正規化を再利用し、UIのcanonicalize/statを追加しない。
+  DB本体は通常の `cache_dir/<xx>/<hash>.db` 配置なので、全件/期限掃除・容量集計に自然に含まれる。
+- 同じ実親を登録する全Collectionが共有し、C/Dの同相対pathはDBもrowも別になる。row keyは現Collectionの
+  full-path keyをそのまま使う（memory/DB同key）。新しいbasename変換や共有loader全体のkey分離は不要。
+  旧通常catalogのbasename行は出所を証明できないのでseedしない。新namespaceへ保存するのは元sourceから生成した成果物だけ。
+  旧行をcopyして出所ラベルを付けない。従来の通常Folder/Smart/Search/Remoteのcatalog宛先は変えない。
+  同じrequest keyならCollection数ぶんの重複を作らないが、現full-path keyのcase/区切りの入力表記が違えば別rowになり得る。
+  その表記統合や永続key変更を本件の必須条件にはしない。
+- 全件prepareに2,000個のcold open/BLOB読取を加えない。可視/keep需要を受けた既存workerだけが、
+  元のlogical GridItemから固定した親scopeと、有界parent LRU（初期案: viewer poolのidle保持16親、要計測）で
+  個別lookup→stamp/proof照合→miss時decode→既存policyの保存を行う。全BLOBの `load_all` はしない。
+  `FixedCatalog | CollectionSourceParents` の一つのtyped providerを正本にし、既存fieldと並行するpending/flagを増やさない。
+  元のsource ownerをpin解決/ZIP entry/EPUB変換で変わるdecode pathから分けて保持する。
+  Off（既存force例外を除く）/CacheOnlyでは新しい空DBを作らず、存在する新namespaceをRO参照する。
+  lookup目的で `CatalogWork::open`（mkdir/schema初期化を行う）を呼ばず、admitted RO openを使う。
+  miss後のsource可否は元のpolicyを維持する。Auto/Alwaysは可視要求のRW openを許容するため、
+  Autoの実測判定で最終的に保存しない空DBが残る場合はある。全policyで保存確定後だけRWを開く案は
+  現workerの `should_save = catalog.is_some()` 境界まで変える追加設計であり、初段Cには混ぜない。
+- request受付側で既存 `CatalogWork` のcache-dir epochをcaptureし、cold normal/history/navigation、warm preflight、
+  RAW deferred、EPUB stamp/fallback、pin reload/catch-upまで継承する。worker内で新epochへ取り直さない。
+  全消去前の旧要求は表示を完了できるがDBを再作成しない。LRUを含む全接続を `CatalogAccess`へ登録する。
+  CではPDF metaのbasenameも実親内で一意になり、Aの複数親同名PDFのmeta衝突を持ち込まない。
+- cold open/SQL/close/encodeはworker側だけ。LRU lockをI/O/SQL全体で保持せず、lease/Arcを得てから離す。
+  実接続数には実行中worker/RAW ticket/catch-upのleaseも加わるので、既存上限込みで有界性を検査する。
+  空一覧への置換・context retire/App dropで最後のArcがUIへ残る場合も、provider/payload全体を既存drop workerへ渡す。
+- 各viewer contextが自分のmap・queue・channel・generation・cancel・providerを所有する。同collectionを別windowで
+  開いても共有するのはdisk cacheだけで、片方のopen/closeが兄弟の資源をresetしない。
+  同sourceの同時missによる重複生成は現行同様に許容し、dedup専用job/待機/workerは増やさない。
+- mtime秒/size完全一致、代表policy、Folder sort/depth/provenance/proof、pin ID/世代、PDF layout/source寸法を保持する。
+  元file変更は次のprepare/更新後にmiss→同key上書き。mtime秒とsizeを保つ外部変更は既存方式では検知できず、
+  hash検査を本件へ足さない。missing/unavailableは古いWebPだけでAvailableへ戻さず、参照とplaceholderを保持する。
+- 動画frame pinはkey不変でbytesだけ更新される。Collection prepareのvideo/folder pin seedは現行のメモリ優先を保ち、
+  そのseed対象を新DBのlookup/mirrorへ広げない。seed不在時も現行fallbackを保ち、旧prepareによる上書き経路を作らない。
+  再帰Folderの `CachedPinned` も、既存resolverが旧drive-shared catalogから得るbytesを新catalogへ
+  `save_auto_folder_bytes` でmirrorする経路があるため、**新C targetの保存admissionで除外する**。
+  その既存表示は維持し、通常Fixed targetのmirrorも変えない。旧catalog由来のbytesへ新scopeの安全ラベルを付けない。
+  `pin_materialization::Request` の「map＋単一catalog」前提にparent providerを偽装せず、既存のCollection再prepare/
+  presentation-source epochによる反映をcold/warm双方で維持する。音声・動画・sidecar・編集previewの専用経路、
+  `CachePolicy Off/Auto/Always`、force-cache例外、idle品質更新を変えない。
+- collection/登録項目の削除は参照DBだけの変更で、新catalogを消さない。rename/reorder/削除再作成でUUID別DBの孤児は増えず、
+  同sourceをCollection数だけ重複保存しない。cacheの寿命はsource親単位で、物理削除/rename後の未使用行・旧variantは
+  明示/期限クリアまで残り得る。親DBが他sourceの書込で更新され続ける場合は期限掃除でも残る。
+  「未使用cacheを全て自動回収する」とは説明せず、全ディスク走査や自動容量上限は新設しない。
+- cache削除の§2.4所有単位を**実親のcatalog family**へ拡張する。全件/期限は通常hash配置の新DBも対象。
+  指定フォルダclearは、既存通常catalog（既存audio scope保護を維持）と、そのdrive保持親に対応する新catalogの両方を、
+  一回のbegin-delete/drain/close後にworkerで処理する。旧catalogは既存scope削除/残存判定を使い、他driveのaudio行が残れば
+  DB/WAL/SHMを保持する。新Cは実親専用DB一式を削除する。他driveの新catalogは消さず、DB本体の削除失敗時に兄弟だけを消さない。
+  family全体のrollback/再試行は追加しない。
+  **初段Cにはinventory pruneを追加しない**。現表示設定のfull-path key集合を `delete_missing` へ渡すと、
+  同sourceのcase/区切り表記や別contextのpin/policy/sort/depth variantを誤って消すためである。
+  将来pruneするなら正規化した元source ownerの完全inventoryで除去対象を決め、出所不明/parse不確実は保持する別の設計とする。
+  Collectionだけから親全体をstat/走査して掃除せず、初段は明示/期限clearの寿命仕様へ統一する。
+- Collection rootの `current_folder=None` は維持し、現在フォルダ削除は従来どおり無効。Collection単位削除へ読み替えて
+  他Collectionの共有cacheを巻き込まない。元のフォルダを開けばfamilyを削除でき、全件/期限・保存先設定も適用する。
+  容量UIは今もDB数を「フォルダ」と表示しているため、新旧DBを合算した**カタログ数**の説明/文言へ揃える。
+  マニュアルには「Collection間で元フォルダ単位に共有。参照解除はcache削除ではない。通常フォルダの旧cacheとは別」を追記する。
+- `collection.db` はv4.0.0出荷済み利用者データで、schema/ID/revision/backup/restoreを変更しない。
+  Cのnamespace/versionは新規cacheデータだけ。既存catalogの形式・hash・行を変更せず、旧データ移行は不要。
+  新DBには既存CatalogDb schemaを作る。通常のdrive-letter継承を変えず、Collectionの参照が別driveへ移れば新scopeで再生成する。
+- Remoteの公開範囲/path guard/read-only collection操作/IPC protocolは変更しない。現Remoteは従来の物理catalog経路のままなので、
+  Cへ保存したPC Collection成果物の直共有という効果は今回は得ない。見開き寸法helperをBLOB seedへ変えず、既存pin対応範囲も拡張しない。
+- まれな失敗は既定の割り切り（ログ＋通知）。source生成が許可された要求は元decodeへ進み、CacheOnlyは既存の一回RO継続/
+  missを維持する。必要なら既存明示clear→次回要求で再作成。一般の破損DB自動復旧を仮定せず、retry/多段回復/保存完了を待つUIは増やさない。
+  collection/タグ/設定DBを削除・再作成しない。
+  Off/CacheOnlyではLRUのRW handle経由のsave/metadata/catch-up書込へ迂回しないことも受入で検査する。
+
+Aを選ぶ場合は、UUID単位保存資格とSQL直列境界、元source単位のprune、削除時の対象全接続closeが必要。
+actorはSQLを待たず、成功mutationのreply/watch前に短い資格更新＋cleanup enqueueを行う必要がある（現watchへ後付けするだけでは不足）。
+Remove/Delete以外のAdd/relink/import/source migration、旧snapshot、warm/RAW/catch-up、PDF meta namespaceも監査する。
+cache-dir全体epochを毎open/removeへ流用せず、別contextの有効variantを現表示policyだけで消さない。
+CはこのUUID lifecycleを持たず、かつB′の旧drive共有/キー分離を持たないため、状態の組み合わせが小さい。
+
+**通常の使い方・規模・必要な検証**
+
+登録/順序/本を開く/戻る/scroll/複数window/再生/編集/Remoteの操作手順や可否を変える案ではない。
+増えるのは可視要求のlookupと、policyが許す場合のencode/保存。初回はその分で遅くなる可能性があり、実測A初回も525.7msだった
+（1回だけの参考値でCの実測ではない）。未閲覧sourceが2,000別親に分散した場合のcold DB作成/LRU churnも未計測。
+全件prepareへ追加I/Oを入れず、Autoの小さいJPEGが保存対象外なら次回も再生成する既存仕様を保つ。
+通常使用の明確な速度低下・追加操作・機能制限が必要と分かった場合は、実装前に設計担当/利用者へ選択肢と費用を返し、独断で入れない。
+
+規模はC **Medium / P2（実装前概算、provider/clear familyまで含む）**。`None`を`Some`へ変えるだけではないが、
+既存full-path keyを維持でき、B′の共有loader全体のmemory/DB key分離より小さくできる見込み。
+providerとcold/warm接続、clear family/UI/文書の2まとまりを想定し、製品・回帰とも数百行規模から見積もる。
+実装時の前提照合で増える場合は見積りを更新する。設計担当の採否と独立設計合意後に製品実装へ進む。
+独立レビュー（GPT-6.1 Sol / xhigh、2026-11-01）はコード・最終草稿・計測log/JSONを読み、
+旧CachedPinnedのmirror除外等を反映したC案を **ACCEPT** とした（再実行なし）。製品実装後のcompletion reviewや設計担当の採否は未実施。
+
+- 元生成/ヒットの回数、再open/退去戻り、mtime/size更新、CachePolicy 3種、idle品質更新、DB無し/破損/書込不可。
+- **C/D同相対親・同basename・等stamp・別内容**のfake/隔離DB回帰で旧Bの反例とCの分離を検証する。
+  通常catalogのdrive-letter継承、root/UNC、同親別Collection共有、別親分離、通常/Smart/Search等の宛先不変も検査する。
+- 画像/Folder/ZIP/PDF/変換書庫、pin/unpin/frame更新、policy/sort/depth/Folder proof、RAW deferred/EPUB世代、編集preview優先。
+- 同Collection別context/別Collection同sourceで、片方のopen/close/cancel/removeが兄弟items/map/queue/generationを変えない。
+  同時保存、LRU eviction/最終drop、All/期限/Folder family clearと旧要求、他drive保持、cache-dir変更、cold/history/navigation/warm復帰。
+- 2,000/10,000件、20親/1項目1親、可視40/多セル、Auto/Alwaysの最適化計測。Cの初回/再訪を直接測り、
+  全件prepareを悪化させず、可視だけのlookupと有界接続になっていることを回数でも検査する。
+  製品実装後はfocused→共通worker/Remote回帰→`test-full.ps1`、fmt/glyph/context audit、確認用build。
+  live試験は別の明示了承済み検証枠とし、今回のCPU計測を画面表示/HDD/NASの検証と取り違えない。
+- cache管理のdark/light snapshotで、カタログ数/容量、Collection rootの無効理由、元フォルダfamily削除の結果を確認する。
+- 実装時は `catalog-design.md` §2.2/2.4、`collection-implementation-plan.md` のcold/warm資産、`async-architecture.md`、
+  表示パイプライン、manual/settings・collectionsのcache説明を同期する。今回は未実装案なので現行仕様を実装済みとして書き換えない。
+
+
+**残すハーネスと再実行**
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+New-Item -ItemType Directory -Force .\target\dev-runtime\deps | Out-Null
+Copy-Item .\vendor\ffmpeg\bin\*.dll .\target\dev-runtime\deps\ -Force
+cargo test -p mimageviewer --profile dev-runtime --lib app::tests::collection_thumb_1668::measure_collection_thumbnails_2000 -j 1 -- --ignored --exact --nocapture --test-threads=1
+```
+
+`#[ignore]` の1件だけを明示実行し、通常テストへ素材生成/計測を混ぜない。1 runで素材約4.5GB＋cacheの空きが必要。
+worktreeの `target/section1668/run-*/` に生成素材・隔離data・catalog・`results.json`を残し、run pathをstdoutへ出す。
+PDFiumは `vendor/pdfium/bin/pdfium.dll`、テストexe隣に通常のnative test依存DLLが必要。
+ビルドに10分以上かかることがある。製品用binaryのbuild/起動コマンドではない。
+今回の検証記録・結果ファイル・終了状態は上の計測表に併記する。
 
 ### 1.669 本の構成を作っていない本でも、ページを出すたびに構成の照合が走る — X @Rottytops (2026-10-31)
 

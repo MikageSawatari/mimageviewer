@@ -2,6 +2,9 @@
 use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
 
+#[path = "tests/collection_thumb_1668.rs"]
+mod collection_thumb_1668;
+
 #[path = "tests/ai_crash_655.rs"]
 mod ai_crash_655;
 
