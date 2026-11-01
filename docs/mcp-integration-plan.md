@@ -4937,3 +4937,102 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
    出す内容は実際の書き換えの結果から作り、書き換えとずれないようにする (Claude Desktop の JSON も同じ規則)。
 
 まれな失敗は割り切り (ログ + 表示)。
+
+## 29. 段階 2-4 の実装記録
+
+### 29.1 前提の照合
+
+- 着手時は `mcp-trial` / `4aba6c1c2`、working treeはclean。§27の実機観測はサブPC担当のものとして読み、
+  実装担当が実機で再現した証拠とは扱わない。以下の照合/検証の観測者は実装担当root。
+- `agent_registration::app_is_running` はimage pathだけを受け取り、すべての `codex.exe` を数えていた。
+  `RegistrationEnvironment` に注入可能な `codex_home` / `user_profile` が既にあり、command lineの取得は不要。
+- Preferencesの検索はページ内anchorだけを返し、結果が空なら「一致する設定がありません」だった。
+  AI連携ページ/remoteページの追加はせず、既存の `open_agent_integration_dialog` /
+  `open_remote_connection_dialog` に渡す別の検索先を追加できる。どちらも既存の非同期処理への入口で、新しいUI thread I/Oは不要。
+  Preferencesの直接案内にはメニューの非表示設定による絞り込みがなく、既存の窓を開くhelperも非表示設定では拒否しない。
+- 確認窓は `command.snippet(target)` (空の設定を編集した独立の見本) を描いていた。
+  一方、検出workerは実際のconfigを既に読み、書き込みworkerは書く直前に再読して同じeditorを使っていた。
+  このworker所有の編集結果からpreviewを用意し、UIは描くだけにできる。設計を止める前提矛盾なし。
+
+### 29.2 実装と判断
+
+- Codex homeは設定済み `CODEX_HOME` を優先し、なければ `%USERPROFILE%/.codex`。
+  separator/case/extended prefix/dot成分を正規化したcomponent列で、homeの `packages/app-server-daemon` 配下だけを除外する。
+  directory名の文字列prefix比較は使わない。別profile/類似名/CLI/アプリbin/WindowsAppsは従来どおり数える。
+  process enumerationやcommand line取得は変更しない。daemonとの同時config書き込みは§28の既定の割り切りを維持する。
+- 検索先は通常ページと独立窓をtypedに分けた。窓の見出し/主要項目をAND部分一致で検索し、通常の結果の後へ
+  所在と開くbuttonを表示する。通常の検索index/rank/anchorは変更しない。メニュー非表示でも案内buttonを出す。
+  クリック/Enterは下書きを適用/破棄せず窓を開く。Enterは検索欄/フォーカスなしの時だけ通常の先頭結果を選び、
+  buttonにfocusがある時はそのbuttonの既存の入力に任せる (IME-safeなdialog helperは維持、keymapの割り当て追加なし)。
+- previewは検出workerの実データを既存editorで編集した前後から、共通の行prefix/suffixを除いた
+  **一つの置換範囲** (removed / added) とした。新しいdiff依存や複雑な最小diffは導入しない。
+  改行/字下げをそのまま保持し、minified JSONの整形など実際に書き換わる範囲も含める。
+  TOML/JSONのwriter自体は変更しない。既存の明示parent headerや、editorが本当に新規作成するheaderはその結果どおり表示する。
+  ファイルに加わらない見本由来の `[mcp_servers]` は表示しない。登録/解除を同じ計算で扱い、変更がなければその旨を表示する。
+  UI threadは保持済みpreviewを描画/コピーするだけ。buttonの有効判定はread-only predicateとし、描画のたびに要求と長いpreviewをcloneしない。
+  確認のmodal/input所有、書く前の再読、backup/atomic replaceを維持する。
+
+### 29.3 回帰テストと結果
+
+追加した検査:
+
+- default/custom home、case/separator/extended prefix/dot、類似directory/別profile、CLI/App bin/WindowsApps、daemonとCLIの併存。
+  temp configへの登録でdaemonだけなら書け、CLIが同時にあれば拒否されること。
+- 両窓のタイトル/項目語/無関係語、実Preferencesの案内buttonのクリックとEnter、メニュー非表示、未確定値の維持。
+- TOMLの親tableなし/別MCP/明示parent/inline/CRLF、JSONの追加/置換/削除。
+  previewの範囲を前データへ置換すると実際のeditor出力と一致し、書き込み結果とも一致すること。
+  実確認窓がworkerで用意されたremoved/addedをそのまま表示すること。
+- 検索結果の既存snapshotがあるため、案内2種を一枚にした `preferences_search_window_hints.png` を新設する。
+
+| コマンド | 観測者 | 実 exit | 結果 / ログ |
+|---|---|---:|---|
+| `cargo fmt` (workspace、最終) | root | 0 | 全workspaceを整形 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` (最終) | root | 0 | 4m34s、`target/mcp-stage2-4-core-check-final.log`。以後のRust変更はテストのみ |
+| `python scripts/check_ui_glyphs.py` | root | 0 | 危険なUI glyphなし、`target/mcp-stage2-4-glyphs.log` |
+| 新しい案内snapshotのみ `UPDATE_SNAPSHOTS=1` | root | 0 | 1/1、compile/lock待ち12m25s・実行1.28s、`target/mcp-stage2-4-snapshot-generate.log` |
+| 下記focused (初回) | root | 100 | 230成功/3失敗、37.749s、`target/mcp-stage2-4-focused.log` |
+
+初回の3失敗は新規テストのfixture/入力順序を直した。TOMLのcommand表記をbasic stringのbackslash escapeと
+決め打ちせず、削除される実fragmentをparseして元のcommandと比較する (再構成/見出し検査も維持)。
+Preferencesは初回の指定ページへの遷移を終えてから検索する。確認窓は画面外のbuttonの座標をclickせず、
+既存の実scroll/可視性検査/Enterによる起動helperを共用して、実際に確認状態になってからpreviewを検査する。
+製品コードの回避策やassertの削除は入れていない。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/agent_registration/) or test(/agent_integration/) or test(/ui_dialogs::preferences/) or test(/process_images/)' --no-fail-fast
+```
+
+追加PNGは `tests/snapshots/preferences_search_window_hints.png` の1枚 (28,974 bytes)。
+既存のsearch-result snapshotと同じ右paneのfixtureで、remote/PINとAI連携の実際の検索結果を別々に描く。
+rootが所在地の全文・開くbutton・配色を目視した。生成の更新指定はこの新規testの完全一致filterだけへ渡して戻した。
+既存PNGを再生成する指定は使っていない。
+
+| 最終検証コマンド | 観測者 | 実 exit | 結果 / ログ |
+|---|---|---:|---|
+| 上記focused (テスト修正後) | root | 0 | 233/233、compile 2m26s・実行40.454s、`target/mcp-stage2-4-focused-final.log` |
+| `cargo test --test ui_snapshot` (更新指定なし) | root | 0 | 通常並列で224/224、compile/lock待ち5m16s・実行38.56s、`target/mcp-stage2-4-ui-snapshot.log` |
+| `cargo fmt --check` (最終) | root | 0 | `target/mcp-stage2-4-fmt-check-final.log` |
+
+既存PNGの変更/削除は0。登録確認の既存IME/小画面/200%検査と、通常の検索結果のsnapshotも成功した。
+§26.5の以前の実行で起きた2173は今巡の通常並列snapshotでは発生していない。
+| 引き渡しの確認 | 観測者 | 実 exit | 結果 |
+|---|---|---:|---|
+| `powershell -NoProfile -File scripts\build-dev.ps1 -PreserveRuntime` | root | 0 | core 5m01s、remote/EPUB/MCPも成功。VCRT PE検査runtime=4 / pe=4、`target/vcrt-pe-reports/dev-runtime.json` |
+| `git diff --check` (最終) | root | 0 | `target/mcp-stage2-4-diff-check.log` |
+
+変更ファイルは `src/agent_registration.rs`、`src/agent_registration/{config.rs,tests.rs}`、
+`src/ui_dialogs/agent_integration.rs` と同 `agent_integration/tests.rs`、
+`src/ui_dialogs/preferences.rs` と同 `preferences/search_index.rs`、本節、新規PNG1枚。
+UI threadのファイル読み書き、process command line取得、新しい設定/永続形式/依存は追加していない。
+検査は全てtemp/injectedの設定先。実利用中のClaude/Codex configにはアクセスしていない。
+製品/Claude/Codexの起動・実機操作、commitはしていない。新たな設計矛盾・未解決の実装事項なし。
+
+確認用runtimeは `target/dev-runtime` に準備したが未起動。利用者向けの通常profile起動コマンド:
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+引数なしでは実際の `%APPDATA%\mimageviewer` を使い、実設定/データを更新し得るため、
+インストール版/トレイ常駐版を先に終了する。確認対象は検索案内と確認preview。
+実機での登録/解除とdaemon/CLI併存は未実施で、これらのテストは一時設定先で行う (通常のAIアプリconfigを試験用に変更しない)。

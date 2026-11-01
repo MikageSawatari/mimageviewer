@@ -212,6 +212,239 @@ fn process_paths_guard_desktop_and_shared_codex_without_confusing_claude_code() 
 }
 
 #[test]
+fn codex_daemon_exclusion_uses_normalized_components_under_the_current_home_only() {
+    let (_temp, mut env) = fixture();
+    let profile = env.user_profile.as_ref().unwrap().clone();
+    let default_home = profile.join(".codex");
+    let running = |env: &RegistrationEnvironment, path: PathBuf| {
+        app_is_running(env, AppTarget::ChatGpt, &[(10, path)])
+    };
+    let daemon = default_home.join("packages/app-server-daemon/1/bin/codex.exe");
+    assert!(!running(&env, daemon.clone()));
+    assert!(!running(
+        &env,
+        PathBuf::from(daemon.to_str().unwrap().replace('\\', "/").to_uppercase())
+    ));
+    assert!(!running(
+        &env,
+        PathBuf::from(format!(r"\\?\{}", daemon.display()))
+    ));
+    assert!(!running(
+        &env,
+        default_home.join("packages/unused/../app-server-daemon/./1/codex.exe")
+    ));
+    for path in [
+        default_home.join("packages/app-server-daemon-other/1/codex.exe"),
+        default_home.join("packages/app-server-daemon.exe/codex.exe"),
+        default_home.join("packages/app-server-daemon/../other/codex.exe"),
+        default_home.join("packages-other/app-server-daemon/1/codex.exe"),
+        profile.join(".codex-other/packages/app-server-daemon/1/codex.exe"),
+        env.working_dir
+            .join("another-profile/.codex/packages/app-server-daemon/1/codex.exe"),
+        env.local_app_data
+            .as_ref()
+            .unwrap()
+            .join("OpenAI/Codex/bin/codex.exe"),
+        PathBuf::from(r"C:\tools\codex.exe"),
+        PathBuf::from(r"C:\Program Files\WindowsApps\OpenAI.Codex_one\app\ChatGPT.exe"),
+    ] {
+        assert!(running(&env, path.clone()), "{}", path.display());
+    }
+
+    // A relative CODEX_HOME uses the same injected cwd resolution as registration.
+    env.codex_home = Some(PathBuf::from("custom/../custom-codex"));
+    let custom_home = env.working_dir.join("custom-codex");
+    assert!(!running(
+        &env,
+        custom_home.join("packages/app-server-daemon/1/codex.exe")
+    ));
+    assert!(running(&env, daemon));
+    assert!(running(
+        &env,
+        env.working_dir
+            .join("custom-codex-other/packages/app-server-daemon/1/codex.exe")
+    ));
+    assert!(running(&env, custom_home.join("bin/codex.exe")));
+    env.user_profile = None;
+    assert!(!running(
+        &env,
+        custom_home.join("packages/app-server-daemon/1/codex.exe")
+    ));
+    env.codex_home = None;
+    assert!(running(
+        &env,
+        custom_home.join("packages/app-server-daemon/1/codex.exe")
+    ));
+}
+
+fn assert_preview_reconstructs(original: &str, edited: &str, preview: &RegistrationPreview) {
+    // Every displayed byte comes from the actual before/after text. The omitted
+    // prefix and suffix remain identical, including line endings and indentation.
+    let is_exact_replacement = if preview.removed.is_empty() {
+        edited.match_indices(&preview.added).any(|(offset, _)| {
+            format!(
+                "{}{}",
+                &edited[..offset],
+                &edited[offset + preview.added.len()..]
+            ) == original
+        })
+    } else {
+        original.match_indices(&preview.removed).any(|(offset, _)| {
+            format!(
+                "{}{}{}",
+                &original[..offset],
+                preview.added,
+                &original[offset + preview.removed.len()..]
+            ) == edited
+        })
+    };
+    assert!(is_exact_replacement, "{preview:?}");
+}
+
+#[test]
+fn codex_previews_are_exact_edited_spans_for_absent_implicit_and_explicit_tables() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for original in [
+        "",
+        "# keep\nmodel = 'x'\n",
+        "# keep\r\n[mcp_servers.other]\r\ncommand = 'other' # retain\r\n",
+        "[mcp_servers]\n# explicit parent\n[mcp_servers.other]\ncommand = 'other'\n",
+        "mcp_servers = { other = { command = 'other' } } # inline\n",
+    ] {
+        let edited =
+            config::edit(AppTarget::ChatGpt, original, Action::Register, &command).unwrap();
+        let preview =
+            RegistrationPreviews::from_config(AppTarget::ChatGpt, original, Some(&command))
+                .unwrap()
+                .register
+                .unwrap();
+        assert_preview_reconstructs(original, &edited, &preview);
+        assert_eq!(
+            preview
+                .added
+                .lines()
+                .filter(|line| *line == "[mcp_servers]")
+                .count(),
+            edited
+                .lines()
+                .filter(|line| *line == "[mcp_servers]")
+                .count()
+                - original
+                    .lines()
+                    .filter(|line| *line == "[mcp_servers]")
+                    .count(),
+            "a parent header must only appear if the editor actually adds one"
+        );
+        if original.contains("[mcp_servers.other]") {
+            assert!(!preview.added.contains("[mcp_servers]\n"));
+            assert!(!preview.added.contains("[mcp_servers]\r\n"));
+        }
+        if let Some(added) = edited.strip_prefix(original) {
+            assert_eq!(preview.added, added);
+            assert!(preview.removed.is_empty());
+        }
+
+        let removed = config::edit(AppTarget::ChatGpt, &edited, Action::Remove, &command).unwrap();
+        let preview = RegistrationPreviews::from_config(AppTarget::ChatGpt, &edited, None)
+            .unwrap()
+            .remove
+            .unwrap();
+        assert_preview_reconstructs(&edited, &removed, &preview);
+        assert!(preview.removed.contains("mimageviewer"));
+        // Parse the actual removed block/inline-table line: toml_edit may use
+        // either a basic string or a literal string for the Windows path.
+        let removed_config: toml_edit::DocumentMut = preview.removed.parse().unwrap();
+        assert_eq!(
+            removed_config["mcp_servers"]["mimageviewer"]["command"].as_str(),
+            Some(command.command.as_str())
+        );
+        if !original.contains("# inline") {
+            assert!(preview.added.is_empty());
+        }
+    }
+}
+
+#[test]
+fn replacement_and_claude_add_remove_previews_use_actual_before_and_after_text() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for (target, original) in [
+        (
+            AppTarget::ChatGpt,
+            "[mcp_servers.mimageviewer]\ncommand = 'old' # removed\nargs = []\n[other]\nvalue = 42 # keep\n",
+        ),
+        (AppTarget::ClaudeDesktop, ""),
+        (
+            AppTarget::ClaudeDesktop,
+            "{\"other\":42,\"mcpServers\":{\"another\":{\"command\":\"keep\"}}}",
+        ),
+        (
+            AppTarget::ClaudeDesktop,
+            "{\"mcpServers\":{\"mimageviewer\":{\"command\":\"old\",\"extra\":true},\"other\":{}},\"tail\":42}",
+        ),
+    ] {
+        let edited = config::edit(target, original, Action::Register, &command).unwrap();
+        let previews = RegistrationPreviews::from_config(target, original, Some(&command)).unwrap();
+        assert_preview_reconstructs(original, &edited, &previews.register.unwrap());
+        if original.contains("mimageviewer") {
+            let removed = config::edit(target, original, Action::Remove, &command).unwrap();
+            let preview = previews.remove.unwrap();
+            assert_preview_reconstructs(original, &removed, &preview);
+            assert!(preview.removed.contains("old"));
+            assert!(!preview.removed.contains(&command.command));
+        }
+        let removed = config::edit(target, &edited, Action::Remove, &command).unwrap();
+        let previews = RegistrationPreviews::from_config(target, &edited, None).unwrap();
+        assert!(previews.register.is_none());
+        let preview = previews.remove.unwrap();
+        assert_preview_reconstructs(&edited, &removed, &preview);
+        assert!(preview.removed.contains("mimageviewer"));
+        assert!(!preview.added.contains("mimageviewer"));
+    }
+}
+
+#[test]
+fn daemon_images_allow_writes_but_a_cli_image_in_the_same_snapshot_still_blocks() {
+    let (_temp, env) = fixture();
+    fs::create_dir_all(env.user_profile.as_ref().unwrap().join(".codex")).unwrap();
+    let detection = detect(&env);
+    let row = app(&detection, AppTarget::ChatGpt);
+    let request = row
+        .write_request(Action::Register, detection.command.as_ref().unwrap())
+        .unwrap();
+    let daemon = env
+        .user_profile
+        .as_ref()
+        .unwrap()
+        .join(".codex/packages/app-server-daemon/1/codex.exe");
+    write_with_processes(&env, &request, || Ok(vec![(10, daemon.clone())])).unwrap();
+    let written = fs::read_to_string(&request.path).unwrap();
+    assert_eq!(request.preview.added, written);
+    assert!(request.preview.removed.is_empty());
+    let detection = detect(&env);
+    let remove = app(&detection, AppTarget::ChatGpt)
+        .remove_request()
+        .unwrap();
+    assert!(
+        write_with_processes(&env, &remove, || {
+            Ok(vec![
+                (10, daemon.clone()),
+                (11, env.working_dir.join("cli/codex.exe")),
+            ])
+        })
+        .is_err()
+    );
+    assert_eq!(fs::read_to_string(&request.path).unwrap(), written);
+    write_with_processes(&env, &remove, || Ok(vec![(10, daemon)])).unwrap();
+    assert_preview_reconstructs(
+        &written,
+        &fs::read_to_string(&request.path).unwrap(),
+        &remove.preview,
+    );
+}
+
+#[test]
 fn json_edits_preserve_all_other_values_and_top_level_server_order() {
     let (_temp, env) = fixture();
     let command = env.resolve_command().unwrap();
@@ -390,6 +623,7 @@ fn invalid_files_and_running_processes_never_change_config_or_backup() {
             path: path.clone(),
             action: Action::Register,
             command: env.resolve_command().unwrap(),
+            preview: RegistrationPreview::default(),
         };
         let error = write_with_processes(&env, &request, || Ok(vec![])).unwrap_err();
         assert!(!error.contains("SECRET"));

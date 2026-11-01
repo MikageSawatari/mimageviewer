@@ -62,11 +62,12 @@ fn injected(_settings: &Settings) -> AgentIntegrationState {
         data_dir: PathBuf::from(r"C:\fixture\data"),
         working_dir: PathBuf::from(r"C:\fixture"),
     };
+    let command = backend::RegistrationCommand {
+        command: r"C:\fixture\mimageviewer-mcp.exe".into(),
+        args: vec!["--data-dir".into(), r"C:\fixture\data".into()],
+    };
     let detection = backend::Detection {
-        command: Ok(backend::RegistrationCommand {
-            command: r"C:\fixture\mimageviewer-mcp.exe".into(),
-            args: vec!["--data-dir".into(), r"C:\fixture\data".into()],
-        }),
+        command: Ok(command.clone()),
         apps: [AppTarget::ClaudeDesktop, AppTarget::ChatGpt]
             .into_iter()
             .map(|target| backend::AppRegistration {
@@ -77,6 +78,17 @@ fn injected(_settings: &Settings) -> AgentIntegrationState {
                     target.name()
                 ))],
                 message: None,
+                previews: {
+                    let mut text = command.snippet(target);
+                    if target == AppTarget::ClaudeDesktop {
+                        // Existing registered JSON may need formatting on rewrite.
+                        text = serde_json::from_str::<serde_json::Value>(&text)
+                            .unwrap()
+                            .to_string();
+                    }
+                    backend::RegistrationPreviews::from_config(target, &text, Some(&command))
+                        .unwrap()
+                },
             })
             .collect(),
     };
@@ -287,6 +299,14 @@ fn open_confirmation_with_enter(
     label: &str,
 ) -> egui_kittest::Harness<'static, crate::app::AppTestEnvForTest> {
     let mut harness = app_harness();
+    activate_confirmation_with_enter(&mut harness, label);
+    harness
+}
+
+fn activate_confirmation_with_enter(
+    harness: &mut egui_kittest::Harness<'_, crate::app::AppTestEnvForTest>,
+    label: &str,
+) {
     harness.run_steps(5);
     let scroll = harness
         .state()
@@ -314,8 +334,7 @@ fn open_confirmation_with_enter(
     assert!(harness.ctx.memory(|memory| memory.focused().is_some()));
     harness.key_press(egui::Key::Enter);
     harness.run_steps(3);
-    assert_confirming(&harness);
-    harness
+    assert_confirming(harness);
 }
 
 fn begin_composition(harness: &mut egui_kittest::Harness<'_, crate::app::AppTestEnvForTest>) {
@@ -344,6 +363,28 @@ fn agent_registration_real_row_enter_opens_confirmation_without_writing() {
                 && request.action == if label == "登録する" { Action::Register } else { Action::Remove })
         );
     }
+}
+
+#[test]
+fn agent_registration_confirmation_shows_the_worker_prepared_replacement() {
+    let mut harness = app_harness();
+    let preview = backend::RegistrationPreview {
+        removed: "# actual previous registration\n".into(),
+        added: "# actual edited registration\n".into(),
+    };
+    let integration = harness
+        .state_mut()
+        .agent_integration_dialog
+        .as_mut()
+        .unwrap();
+    let DetectionState::Ready(_, detection) = &mut integration.detection else {
+        panic!("injected detection is ready");
+    };
+    detection.apps[0].previews.register = Some(preview.clone());
+    activate_confirmation_with_enter(&mut harness, "登録する");
+    assert!(harness.query_by_label(&preview.removed).is_some());
+    assert!(harness.query_by_label(&preview.added).is_some());
+    assert_confirming(&harness);
 }
 
 #[test]

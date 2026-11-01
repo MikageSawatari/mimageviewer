@@ -124,15 +124,71 @@ pub(crate) struct AppRegistration {
     pub(crate) state: RegistrationState,
     pub(crate) config_paths: Vec<PathBuf>,
     pub(crate) message: Option<String>,
+    pub(crate) previews: RegistrationPreviews,
+}
+
+/// Exact replacement text, prepared alongside detection on its worker.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RegistrationPreview {
+    pub(crate) removed: String,
+    pub(crate) added: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RegistrationPreviews {
+    pub(crate) register: Option<RegistrationPreview>,
+    pub(crate) remove: Option<RegistrationPreview>,
+}
+
+impl RegistrationPreviews {
+    pub(crate) fn from_config(
+        target: AppTarget,
+        text: &str,
+        command: Option<&RegistrationCommand>,
+    ) -> Result<Self, String> {
+        let remove_command = RegistrationCommand {
+            command: String::new(),
+            args: Vec::new(),
+        };
+        Ok(Self {
+            register: command
+                .map(|command| config::preview(target, text, Action::Register, command))
+                .transpose()?,
+            remove: Some(config::preview(
+                target,
+                text,
+                Action::Remove,
+                &remove_command,
+            )?),
+        })
+    }
 }
 
 impl AppRegistration {
-    /// Removal does not need the currently installed MCP executable to exist.
-    pub(crate) fn remove_request(&self) -> Option<WriteRequest> {
-        if !matches!(
+    /// Drawing availability must not clone the potentially long preview each frame.
+    pub(crate) fn can_write(&self, action: Action) -> bool {
+        !matches!(
+            self.state,
+            RegistrationState::NotFound
+                | RegistrationState::Unreadable
+                | RegistrationState::Ambiguous
+        ) && self.config_paths.len() == 1
+            && match action {
+                Action::Register => self.previews.register.is_some(),
+                Action::Remove => self.previews.remove.is_some(),
+            }
+    }
+
+    pub(crate) fn can_remove(&self) -> bool {
+        matches!(
             self.state,
             RegistrationState::Registered | RegistrationState::DifferentTarget
-        ) {
+        ) && self.can_write(Action::Remove)
+    }
+
+    /// Removal does not need the currently installed MCP executable to exist.
+    pub(crate) fn remove_request(&self) -> Option<WriteRequest> {
+        if !self.can_remove() {
             return None;
         }
         self.write_request(
@@ -149,13 +205,7 @@ impl AppRegistration {
         action: Action,
         command: &RegistrationCommand,
     ) -> Option<WriteRequest> {
-        if matches!(
-            self.state,
-            RegistrationState::NotFound
-                | RegistrationState::Unreadable
-                | RegistrationState::Ambiguous
-        ) || self.config_paths.len() != 1
-        {
+        if !self.can_write(action) {
             return None;
         }
         Some(WriteRequest {
@@ -163,6 +213,10 @@ impl AppRegistration {
             path: self.config_paths[0].clone(),
             action,
             command: command.clone(),
+            preview: match action {
+                Action::Register => self.previews.register.clone()?,
+                Action::Remove => self.previews.remove.clone()?,
+            },
         })
     }
 }
@@ -186,6 +240,7 @@ pub(crate) struct WriteRequest {
     pub(crate) path: PathBuf,
     pub(crate) action: Action,
     pub(crate) command: RegistrationCommand,
+    pub(crate) preview: RegistrationPreview,
 }
 
 fn packages(env: &RegistrationEnvironment, prefix: &str) -> io::Result<Vec<PathBuf>> {
@@ -221,7 +276,7 @@ fn packages(env: &RegistrationEnvironment, prefix: &str) -> io::Result<Vec<PathB
 pub(crate) fn detect(env: &RegistrationEnvironment) -> Detection {
     let command = env.resolve_command();
     let apps = [AppTarget::ClaudeDesktop, AppTarget::ChatGpt].into_iter().map(|target| {
-        let mut row = AppRegistration { target, state: RegistrationState::NotFound, config_paths: Vec::new(), message: None };
+        let mut row = AppRegistration { target, state: RegistrationState::NotFound, config_paths: Vec::new(), message: None, previews: RegistrationPreviews::default() };
         let result = (|| -> Result<(), String> {
             match target {
                 AppTarget::ClaudeDesktop => {
@@ -249,6 +304,7 @@ pub(crate) fn detect(env: &RegistrationEnvironment) -> Detection {
             let Some(path) = row.config_paths.first() else { return Ok(()); };
             let text = read_config(path)?;
             row.state = config::state(target, &text, command.as_ref().ok())?;
+            row.previews = RegistrationPreviews::from_config(target, &text, command.as_ref().ok())?;
             Ok(())
         })();
         if let Err(error) = result { row.state = RegistrationState::Unreadable; row.message = Some(error); }
@@ -266,13 +322,22 @@ fn read_config(path: &Path) -> Result<String, String> {
 }
 
 fn normalized_components(path: &Path) -> Vec<String> {
-    path.to_string_lossy()
-        .replace('/', "\\")
-        .trim_start_matches(r"\\?\")
-        .split('\\')
-        .filter(|s| !s.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect()
+    let path = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    let path = path.strip_prefix(r"\\?\").unwrap_or(&path);
+    let path = path.strip_prefix(r"unc\").unwrap_or(path);
+    let mut parts: Vec<String> = Vec::new();
+    for part in path.split('\\').filter(|part| !part.is_empty()) {
+        match part {
+            "." => {}
+            ".." => {
+                if parts.last().is_some_and(|part| !part.ends_with(':')) {
+                    parts.pop();
+                }
+            }
+            part => parts.push(part.to_owned()),
+        }
+    }
+    parts
 }
 
 pub(crate) fn app_is_running(
@@ -285,6 +350,17 @@ pub(crate) fn app_is_running(
         .as_deref()
         .and_then(|p| env.absolute(p).ok())
         .map(|p| normalized_components(&p.join("AnthropicClaude")));
+    let codex_daemon = env
+        .codex_home
+        .as_deref()
+        .map(|home| env.absolute(home))
+        .or_else(|| {
+            env.user_profile
+                .as_deref()
+                .map(|profile| env.absolute(profile).map(|p| p.join(".codex")))
+        })
+        .and_then(Result::ok)
+        .map(|home| normalized_components(&home.join("packages/app-server-daemon")));
     images.iter().any(|(_, image)| {
         let parts = normalized_components(image);
         let windows_package = |prefix: &str| {
@@ -300,7 +376,12 @@ pub(crate) fn app_is_running(
                     || windows_package("claude_")
             }
             AppTarget::ChatGpt => {
-                parts.last().is_some_and(|p| p == "codex.exe") || windows_package("openai.codex_")
+                let is_daemon = codex_daemon
+                    .as_ref()
+                    .is_some_and(|root| parts.len() > root.len() && parts.starts_with(root));
+                !is_daemon
+                    && (parts.last().is_some_and(|p| p == "codex.exe")
+                        || windows_package("openai.codex_"))
             }
         }
     })

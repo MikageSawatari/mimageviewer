@@ -1,5 +1,5 @@
 //! Local ordered JSON representation avoids enabling serde_json/preserve_order globally.
-use super::{Action, AppTarget, RegistrationCommand, RegistrationState};
+use super::{Action, AppTarget, RegistrationCommand, RegistrationPreview, RegistrationState};
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -273,5 +273,38 @@ pub(super) fn edit(
                 output
             })
         }
+    }
+}
+
+pub(super) fn preview(
+    target: AppTarget,
+    text: &str,
+    action: Action,
+    command: &RegistrationCommand,
+) -> Result<RegistrationPreview, String> {
+    let edited = edit(target, text, action, command)?;
+    Ok(replacement_preview(text, &edited))
+}
+
+/// Trim only whole equal lines so indentation and line endings remain verbatim.
+/// The remaining ranges describe one exact replacement, including any JSON
+/// reformatting done by the editor; no registration block is reconstructed.
+fn replacement_preview(original: &str, edited: &str) -> RegistrationPreview {
+    let before: Vec<_> = original.split_inclusive('\n').collect();
+    let after: Vec<_> = edited.split_inclusive('\n').collect();
+    let prefix = before
+        .iter()
+        .zip(&after)
+        .take_while(|(before, after)| before == after)
+        .count();
+    let suffix = before[prefix..]
+        .iter()
+        .rev()
+        .zip(after[prefix..].iter().rev())
+        .take_while(|(before, after)| before == after)
+        .count();
+    RegistrationPreview {
+        removed: before[prefix..before.len() - suffix].concat(),
+        added: after[prefix..after.len() - suffix].concat(),
     }
 }

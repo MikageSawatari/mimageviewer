@@ -1,5 +1,82 @@
 use super::PreferencesPage;
 
+/// Settings-menu windows are destinations, not pages/anchors in the draft.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SettingsWindow {
+    AgentIntegration,
+    RemoteConnection,
+}
+
+impl SettingsWindow {
+    pub(super) fn hint(self) -> &'static str {
+        match self {
+            Self::AgentIntegration => "この設定は『設定』メニューの『AI 連携…』にあります",
+            Self::RemoteConnection => "この設定は『設定』メニューの『リモート接続…』にあります",
+        }
+    }
+
+    pub(super) fn button_label(self) -> &'static str {
+        match self {
+            Self::AgentIntegration => "AI 連携を開く",
+            Self::RemoteConnection => "リモート接続を開く",
+        }
+    }
+
+    fn terms(self) -> &'static [&'static str] {
+        match self {
+            Self::AgentIntegration => &[
+                "AI 連携",
+                "AI連携",
+                "MCP",
+                "許可の範囲",
+                "縮小画像を AI に見せる",
+                "撮影位置 (GPS) を AI に見せる",
+                "AI に見せる範囲",
+                "最近使った AI アプリ",
+                "AI による変更",
+                "Claude Desktop",
+                "ChatGPT (Codex)",
+                "登録する",
+                "登録を外す",
+            ],
+            Self::RemoteConnection => &[
+                "リモート接続",
+                "Tailscale",
+                "リモート閲覧を有効にする",
+                "PIN",
+                "PIN を変更",
+                "すべての端末をログアウト",
+                "接続先",
+                "利用状況",
+            ],
+        }
+    }
+}
+
+pub(super) fn search_settings_windows(query: &str) -> Vec<SettingsWindow> {
+    let terms: Vec<_> = query
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    [
+        SettingsWindow::AgentIntegration,
+        SettingsWindow::RemoteConnection,
+    ]
+    .into_iter()
+    .filter(|window| {
+        terms.iter().all(|term| {
+            window
+                .terms()
+                .iter()
+                .any(|text| text.to_ascii_lowercase().contains(term))
+        })
+    })
+    .collect()
+}
+
 pub(super) struct PrefSearchEntry {
     /// ページ内で一意な anchor id。
     pub anchor: &'static str,
@@ -1490,6 +1567,42 @@ pub(super) fn search_preferences(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn settings_window_hints_match_window_titles_and_main_items_only() {
+        for query in [
+            "AI 連携",
+            "AI連携",
+            "MCP",
+            "許可の範囲",
+            "登録",
+            "GPS",
+            "最近使った AI アプリ",
+            "AI による変更",
+        ] {
+            assert_eq!(
+                search_settings_windows(query),
+                [SettingsWindow::AgentIntegration],
+                "{query}"
+            );
+        }
+        for query in [
+            "リモート接続",
+            "PIN",
+            "pin 変更",
+            "Tailscale",
+            "すべての端末をログアウト",
+        ] {
+            assert_eq!(
+                search_settings_windows(query),
+                [SettingsWindow::RemoteConnection],
+                "{query}"
+            );
+        }
+        for query in ["", "  ", "GPU", "テーマ", "存在しない設定", "PIN 登録"] {
+            assert!(search_settings_windows(query).is_empty(), "{query}");
+        }
+    }
 
     const PAGES_SOURCE: &str = include_str!("pages.rs");
     const PREFERENCES_SOURCE: &str = include_str!("../preferences.rs");

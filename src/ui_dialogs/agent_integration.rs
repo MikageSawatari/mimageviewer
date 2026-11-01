@@ -515,11 +515,11 @@ fn draw_app(
                     });
                     if let Some(message) = &row.message { ui.colored_label(ui.visuals().warn_fg_color, message); }
                     if let Err(error) = &detection.command { ui.colored_label(ui.visuals().error_fg_color, error); }
-                    let can_write = detection.command.as_ref().ok().is_some_and(|command| row.write_request(Action::Register, command).is_some());
+                    let can_write = detection.command.is_ok() && row.can_write(Action::Register);
                     ui.horizontal_wrapped(|ui| {
                         let label = if row.state == RegistrationState::DifferentTarget { "登録し直す" } else { "登録する" };
                         if ui.add_enabled(can_write, egui::Button::new(label)).clicked() { requested = Some(Action::Register); }
-                        if ui.add_enabled(row.remove_request().is_some(), egui::Button::new("登録を外す")).clicked() { requested = Some(Action::Remove); }
+                        if ui.add_enabled(row.can_remove(), egui::Button::new("登録を外す")).clicked() { requested = Some(Action::Remove); }
                     });
                 }
             }
@@ -774,9 +774,19 @@ fn draw_registration_dialog(
                                 ui.label(
                                     "mimageviewer の登録項目を消します。他の項目は変更しません。",
                                 );
-                            } else {
+                            }
+                            if !request.preview.removed.is_empty() {
+                                ui.label("次の内容を削除します。");
+                                selectable_copy(ui, &request.preview.removed);
+                            }
+                            if !request.preview.added.is_empty() {
                                 ui.label("次の内容を登録します。");
-                                selectable_copy(ui, &request.command.snippet(request.target));
+                                selectable_copy(ui, &request.preview.added);
+                            }
+                            if request.preview.removed.is_empty()
+                                && request.preview.added.is_empty()
+                            {
+                                ui.label("登録内容の変更はありません。");
                             }
                             ui.label("書き換え前の内容は .mimageviewer.bak に残します。");
                         }
@@ -856,6 +866,10 @@ pub fn draw_agent_integration_snapshot_fixture(ui: &mut egui::Ui, level: u8) {
     };
     settings.thumbnails = level >= 2;
     settings.gps = level >= 2;
+    let command = backend::RegistrationCommand {
+        command: r"C:\mImageViewer\mimageviewer-mcp.exe".into(),
+        args: vec!["--data-dir".into(), r"C:\mImageViewer\data".into()],
+    };
     let mut state = AgentIntegrationState::new();
     state.detection = DetectionState::Ready(
         backend::RegistrationEnvironment {
@@ -869,10 +883,7 @@ pub fn draw_agent_integration_snapshot_fixture(ui: &mut egui::Ui, level: u8) {
             working_dir: PathBuf::from(r"C:\mImageViewer"),
         },
         backend::Detection {
-            command: Ok(backend::RegistrationCommand {
-                command: r"C:\mImageViewer\mimageviewer-mcp.exe".into(),
-                args: vec!["--data-dir".into(), r"C:\mImageViewer\data".into()],
-            }),
+            command: Ok(command.clone()),
             apps: vec![
                 backend::AppRegistration {
                     target: AppTarget::ClaudeDesktop,
@@ -881,12 +892,24 @@ pub fn draw_agent_integration_snapshot_fixture(ui: &mut egui::Ui, level: u8) {
                         r"C:\Users\User\AppData\Roaming\Claude\claude_desktop_config.json",
                     )],
                     message: None,
+                    previews: backend::RegistrationPreviews::from_config(
+                        AppTarget::ClaudeDesktop,
+                        &command.snippet(AppTarget::ClaudeDesktop),
+                        Some(&command),
+                    )
+                    .unwrap(),
                 },
                 backend::AppRegistration {
                     target: AppTarget::ChatGpt,
                     state: RegistrationState::Unregistered,
                     config_paths: vec![PathBuf::from(r"C:\Users\User\.codex\config.toml")],
                     message: None,
+                    previews: backend::RegistrationPreviews::from_config(
+                        AppTarget::ChatGpt,
+                        "",
+                        Some(&command),
+                    )
+                    .unwrap(),
                 },
             ],
         },
