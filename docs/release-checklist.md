@@ -552,8 +552,15 @@ GitHub Release 公開後、各配布チャネルへ反映・申請する。**Vec
     - **前提**: EXE/MSI 掲載は **Store が既存ユーザーを自動更新しない** (自動更新は MSIX のみ)。
       **既存ユーザーは mIV 自身の更新通知で自己更新**するので、Store 更新は「新規 Store インストール
       の初期版を新しく保つ」ためのもの。**毎リリースで出す必要はなく、区切りの良い版で更新すれば十分**。
-    - **① 版付きの直リンクにインストーラを配置**: 署名済み `mImageViewer_setup.exe` を mikage.to の
-      版付きパスに**直リンク**で置く。例: `https://mikage.to/mimageviewer/download/v<VER>/mImageViewer_setup.exe`。
+    - **① 版付きの直リンクにインストーラを配置**: 署名済み `mImageViewer_setup.exe` を Cloudflare R2 の
+      版付きパスに**直リンク**で置く (2026-11-01 から。AWS の転送料削減のため。Microsoft の検査用アクセスだけで月 100GB 超になる)。
+      `.\scripts\upload-store-installer.ps1 -Version <VER>` が、上書きの拒否 → アップロード → 公開 URL の
+      200・リダイレクトなし・サイズ → 配信された中身の sha256 の照合までを行う。URL は
+      `https://dl.mikage.jp/mimageviewer/v<VER>/mImageViewer_setup.exe`。前提は AWS CLI のプロファイル `r2-mikage`
+      (バケット `mikage-dl`、エンドポイント `https://eaf4c251474bb38fb026540b177c78d6.r2.cloudflarestorage.com`、
+      region `auto`、`request_checksum_calculation` / `response_checksum_validation` = `when_required`。キーは利用者が入力)。
+      v4.10.2 までの申請は `https://mikage.to/mimageviewer/download/v<VER>/mImageViewer_setup.exe` を使っていた。
+      Store の登録が R2 の URL に切り替わって公開が終わるまで、mikage.to 側の古いファイルは消さない。
       - ⚠ **GitHub Release の URL は使えない** (実体 CDN へ 302 リダイレクトし、Store に
         「リダイレクトのないダウンロード URL を指定して」と却下される)。
       - ⚠ **非バージョン名の setup.exe (上書き運用) も使わない** (Store は提出後のバイナリ変更を
