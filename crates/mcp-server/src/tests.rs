@@ -399,6 +399,7 @@ fn stage1b_permission_tool_sets_and_thumbnail_changes() {
         AgentLevel::Disabled,
         AgentLevel::ReadOnly,
         AgentLevel::ReadAndOpen,
+        AgentLevel::Organize,
     ] {
         for thumbnails in [true, false] {
             let permission = PermissionSnapshot {
@@ -420,6 +421,14 @@ fn stage1b_permission_tool_sets_and_thumbnail_changes() {
                 level >= AgentLevel::ReadAndOpen
             );
             assert_eq!(schema::tools_for(permission).len(), names.len());
+            for name in [
+                "create_collection",
+                "rename_collection",
+                "add_to_collection",
+                "remove_from_collection",
+            ] {
+                assert_eq!(names.contains(&name), level >= AgentLevel::Organize);
+            }
         }
     }
     let (stop, _recv) = mpsc::sync_channel(1);
@@ -982,6 +991,347 @@ fn stage1c_open_arguments_and_results_match_schema_and_budget() {
         tool_result("open_in_viewer", Ok(Payload::Cancelled))["isError"],
         true
     );
+}
+
+#[test]
+fn stage2_collection_arguments_results_and_full_batch_budget() {
+    for (name, args, expected) in [
+        (
+            "create_collection",
+            json!({"name":" 同名可 "}),
+            Command::CreateCollection {
+                name: " 同名可 ".into(),
+            },
+        ),
+        (
+            "rename_collection",
+            json!({"id":"id","name":"改名"}),
+            Command::RenameCollection {
+                id: "id".into(),
+                name: "改名".into(),
+            },
+        ),
+        (
+            "add_to_collection",
+            json!({"id":"id","items":[{"path":"C:/本.zip","subresource":"001.png"}]}),
+            Command::AddToCollection {
+                id: "id".into(),
+                items: vec![ItemRef {
+                    path: "C:/本.zip".into(),
+                    subresource: Some("001.png".into()),
+                }],
+            },
+        ),
+        (
+            "remove_from_collection",
+            json!({"id":"id","items":[{"path":""}]}),
+            Command::RemoveFromCollection {
+                id: "id".into(),
+                items: vec![ItemRef {
+                    path: String::new(),
+                    subresource: None,
+                }],
+            },
+        ),
+    ] {
+        let tool = schema::tools()
+            .into_iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap();
+        assert_eq!(
+            parse_tool(&json!({"name":name,"arguments":args}))
+                .unwrap()
+                .1,
+            expected
+        );
+        assert!(accepts_schema(&tool["inputSchema"], &args));
+        assert_eq!(tool["annotations"]["readOnlyHint"], false);
+        assert_eq!(
+            tool["annotations"]["destructiveHint"],
+            name == "remove_from_collection"
+        );
+        assert_eq!(
+            tool["annotations"]["idempotentHint"],
+            name != "create_collection"
+        );
+        assert!(
+            !tool["description"]
+                .as_str()
+                .unwrap()
+                .contains("results per page")
+        );
+        let mut unknown = args.clone();
+        unknown["unknown"] = json!(true);
+        assert!(parse_tool(&json!({"name":name,"arguments":unknown})).is_err());
+        assert!(!accepts_schema(&tool["inputSchema"], &unknown));
+        for bad in [
+            json!({}),
+            json!({"id":" ","name":"name"}),
+            json!({"id":"id","name":"\u{0}"}),
+        ] {
+            assert!(parse_tool(&json!({"name":name,"arguments":bad})).is_err());
+        }
+        let result = match name {
+            "create_collection" => CollectionWriteResult::Created { id: "id".into() },
+            "rename_collection" => CollectionWriteResult::Renamed {
+                id: "id".into(),
+                changed: false,
+            },
+            _ => CollectionWriteResult::Items {
+                id: "id".into(),
+                outcomes: vec![
+                    CollectionItemOutcome::Added {
+                        indices: (0..60).collect(),
+                    },
+                    CollectionItemOutcome::Duplicate {
+                        indices: (60..120).collect(),
+                    },
+                    CollectionItemOutcome::Removed {
+                        indices: (120..180).collect(),
+                    },
+                    CollectionItemOutcome::NotPresent {
+                        indices: (180..240).collect(),
+                    },
+                    CollectionItemOutcome::CapacityRejected {
+                        indices: (240..300).collect(),
+                    },
+                    CollectionItemOutcome::Skipped {
+                        indices: (300..350).collect(),
+                        reason: CollectionSkipReason::InvalidPath,
+                    },
+                    CollectionItemOutcome::Skipped {
+                        indices: (350..400).collect(),
+                        reason: CollectionSkipReason::NotFound,
+                    },
+                    CollectionItemOutcome::Skipped {
+                        indices: (400..450).collect(),
+                        reason: CollectionSkipReason::UnsupportedSubresource,
+                    },
+                    CollectionItemOutcome::Skipped {
+                        indices: (450..500).collect(),
+                        reason: CollectionSkipReason::UnsupportedType,
+                    },
+                ],
+            },
+        };
+        let result = tool_result(name, Ok(Payload::CollectionWrite(result)));
+        assert_eq!(result["isError"], false);
+        assert!(accepts_schema(
+            &tool["outputSchema"],
+            &result["structuredContent"]
+        ));
+        assert_eq!(
+            serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+            result["structuredContent"]
+        );
+        for modern in [true, false] {
+            let response = success(json!(1), result.clone(), modern);
+            assert!(response_non_image_chars(&response) < MAX_MCP_RESPONSE_CHARS);
+            assert!(
+                serde_json::from_str::<Value>(&serialize_response(&response))
+                    .unwrap()
+                    .get("error")
+                    .is_none()
+            );
+        }
+        for code in [
+            ErrorCode::Conflict,
+            ErrorCode::Busy,
+            ErrorCode::PermissionChanged,
+        ] {
+            let error = tool_result(name, Err(AgentError::new(code, "変更できません")));
+            assert_eq!(error["isError"], true);
+            assert!(accepts_schema(
+                &tool["outputSchema"],
+                &error["structuredContent"]
+            ));
+        }
+    }
+    for name in ["add_to_collection", "remove_from_collection"] {
+        let tool = schema::tools()
+            .into_iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap();
+        for count in [0, 1, 500, 501] {
+            let args = json!({"id":"id","items":vec![json!({"path":"C:/item.png"});count]});
+            let valid = (1..=MAX_WRITE_ITEMS).contains(&count);
+            assert_eq!(
+                parse_tool(&json!({"name":name,"arguments":args})).is_ok(),
+                valid
+            );
+            assert_eq!(accepts_schema(&tool["inputSchema"], &args), valid);
+        }
+        for item in [
+            json!({}),
+            json!({"path":null}),
+            json!({"path":1}),
+            json!({"path":"C:/a","unknown":true}),
+        ] {
+            let args = json!({"id":"id","items":[item]});
+            assert!(parse_tool(&json!({"name":name,"arguments":args})).is_err());
+            assert!(!accepts_schema(&tool["inputSchema"], &args));
+        }
+    }
+    assert_eq!(
+        tool_result(
+            "create_collection",
+            Ok(Payload::CollectionWrite(CollectionWriteResult::Renamed {
+                id: "id".into(),
+                changed: true
+            }))
+        )["isError"],
+        true
+    );
+}
+
+#[test]
+fn stage2_all_protocols_refresh_organize_permission_and_return_collection_writes() {
+    struct CollectionsBackend {
+        organize: std::sync::atomic::AtomicBool,
+        commands: Mutex<Vec<Command>>,
+    }
+    impl Backend for CollectionsBackend {
+        fn call(
+            &self,
+            command: Command,
+            _: &ClientIdentity,
+            _: RequestKind,
+            _: Arc<CallControl>,
+        ) -> BackendResult {
+            if command == Command::Status {
+                return Ok(Payload::Status(StatusPayload {
+                    app_version: "fixture".into(),
+                    permission: PermissionSnapshot {
+                        level: if self.organize.load(Ordering::Acquire) {
+                            AgentLevel::Organize
+                        } else {
+                            AgentLevel::ReadAndOpen
+                        },
+                        ..Default::default()
+                    },
+                    fts_ready: true,
+                    remote_active: false,
+                }));
+            }
+            self.commands.lock().unwrap().push(command.clone());
+            if !self.organize.load(Ordering::Acquire) {
+                return Err(AgentError::new(ErrorCode::Disabled, "整理の許可が必要です").into());
+            }
+            let result = match command {
+                Command::CreateCollection { .. } => CollectionWriteResult::Created {
+                    id: "new-id".into(),
+                },
+                Command::RenameCollection { id, .. } => {
+                    CollectionWriteResult::Renamed { id, changed: true }
+                }
+                Command::AddToCollection { id, .. } => CollectionWriteResult::Items {
+                    id,
+                    outcomes: vec![CollectionItemOutcome::Skipped {
+                        indices: vec![0],
+                        reason: CollectionSkipReason::UnsupportedSubresource,
+                    }],
+                },
+                Command::RemoveFromCollection { id, .. } => CollectionWriteResult::Items {
+                    id,
+                    outcomes: vec![CollectionItemOutcome::Removed { indices: vec![0] }],
+                },
+                _ => unreachable!(),
+            };
+            Ok(Payload::CollectionWrite(result))
+        }
+    }
+    for version in VERSIONS {
+        let backend = Arc::new(CollectionsBackend {
+            organize: std::sync::atomic::AtomicBool::new(false),
+            commands: Mutex::new(vec![]),
+        });
+        let mut h = Harness::new(backend.clone());
+        if version != MODERN {
+            h.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}));
+            h.receive();
+            h.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+        }
+        let request = |id, method, params| {
+            if version == MODERN {
+                modern(id, method, params)
+            } else {
+                json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+            }
+        };
+        for (id, organize) in [(1, false), (2, true), (3, false), (4, true)] {
+            backend.organize.store(organize, Ordering::Release);
+            h.send(request(id, "tools/list", json!({})));
+            if version != MODERN && id > 1 {
+                assert_eq!(h.receive()["method"], "notifications/tools/list_changed");
+            }
+            let response = h.receive();
+            assert_eq!(response["id"], id);
+            let listed = response["result"]["tools"].as_array().unwrap();
+            assert_eq!(listed.len(), if organize { 14 } else { 10 });
+            for name in [
+                "create_collection",
+                "rename_collection",
+                "add_to_collection",
+                "remove_from_collection",
+            ] {
+                assert_eq!(listed.iter().any(|tool| tool["name"] == name), organize);
+            }
+            assert!(listed.iter().any(|tool| tool["name"] == "open_in_viewer"));
+        }
+        for (id, name, args) in [
+            (5, "create_collection", json!({"name":"同名可"})),
+            (6, "rename_collection", json!({"id":"id","name":"改名"})),
+            (
+                7,
+                "add_to_collection",
+                json!({"id":"id","items":[{"path":"C:/本.zip","subresource":"001.png"}]}),
+            ),
+            (
+                8,
+                "remove_from_collection",
+                json!({"id":"id","items":[{"path":"C:/missing.png"}]}),
+            ),
+        ] {
+            h.send(request(
+                id,
+                "tools/call",
+                json!({"name":name,"arguments":args}),
+            ));
+            let response = h.receive();
+            assert_eq!(response["id"], id);
+            assert_eq!(response["result"]["isError"], false);
+            assert_eq!(
+                serde_json::from_str::<Value>(
+                    response["result"]["content"][0]["text"].as_str().unwrap()
+                )
+                .unwrap(),
+                response["result"]["structuredContent"]
+            );
+            let tool = schema::tools()
+                .into_iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            assert!(accepts_schema(
+                &tool["outputSchema"],
+                &response["result"]["structuredContent"]
+            ));
+        }
+        assert_eq!(backend.commands.lock().unwrap().len(), 4);
+        backend.organize.store(false, Ordering::Release);
+        h.send(request(
+            9,
+            "tools/call",
+            json!({"name":"create_collection","arguments":{"name":"拒否"}}),
+        ));
+        let denied = h.receive();
+        assert_eq!(denied["id"], 9);
+        assert_eq!(denied["result"]["isError"], true);
+        assert_eq!(
+            denied["result"]["structuredContent"]["error"]["code"],
+            "disabled"
+        );
+        h.close();
+    }
 }
 
 #[test]

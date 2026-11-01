@@ -84,6 +84,24 @@ fn preferences_agent_open_dark() {
 }
 
 #[test]
+fn preferences_agent_organize_light() {
+    agent_integration_snapshot(
+        "preferences_agent_organize_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        3,
+    );
+}
+
+#[test]
+fn preferences_agent_organize_dark() {
+    agent_integration_snapshot(
+        "preferences_agent_organize_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        3,
+    );
+}
+
+#[test]
 fn thumbnail_name_style_multiline_dark() {
     snapshot_with_theme_at_size(
         "thumbnail_name_style_multiline_dark",

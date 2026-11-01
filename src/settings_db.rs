@@ -4711,6 +4711,7 @@ mod tests {
             (AgentLevel::ReadOnly, "read_only"),
             (AgentLevel::Disabled, "disabled"),
             (AgentLevel::ReadAndOpen, "read_and_open"),
+            (AgentLevel::Organize, "organize"),
             (AgentLevel::ReadOnly, "read_only"),
         ] {
             let settings = Settings {

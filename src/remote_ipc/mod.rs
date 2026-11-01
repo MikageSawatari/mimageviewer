@@ -32,6 +32,7 @@ pub(crate) struct SharedReaders {
     collections: std::sync::Arc<collections::CollectionEngine>,
     pub(crate) fts: std::sync::RwLock<Option<std::sync::Arc<crate::fts_index::FtsIndex>>>,
     book_composition: std::sync::RwLock<Option<crate::book_composition::BookCompositionService>>,
+    collection_store: std::sync::RwLock<Option<crate::collection_store::CollectionStoreClient>>,
 }
 
 impl SharedReaders {
@@ -49,11 +50,25 @@ impl SharedReaders {
             favorites,
             fts: std::sync::RwLock::new(None),
             book_composition: std::sync::RwLock::new(None),
+            collection_store: std::sync::RwLock::new(None),
         }))
     }
 
     pub(crate) fn settings_reader_control(&self) -> RemoteSettingsReaderControl {
         self.favorites.control()
+    }
+
+    pub(crate) fn install_collection_store(
+        &self,
+        client: crate::collection_store::CollectionStoreClient,
+    ) {
+        *self.collection_store.write().unwrap() = Some(client);
+    }
+
+    pub(crate) fn collection_store(
+        &self,
+    ) -> Option<crate::collection_store::CollectionStoreClient> {
+        self.collection_store.read().unwrap().clone()
     }
 
     pub(crate) fn install_book_composition(

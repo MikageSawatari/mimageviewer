@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use mimageviewer_agent_ipc::*;
 use serde::{Deserialize, Serialize};
+pub(crate) mod changes;
 mod folder;
 mod input_path;
 mod item_info;
@@ -17,6 +18,9 @@ pub(crate) mod open;
 mod open_response;
 mod recent;
 pub(crate) use recent::{RecentApps, SharedRecentApps};
+mod collection_write;
+#[cfg(test)]
+mod collection_write_tests;
 mod thumbnail;
 mod work;
 use work::*;
@@ -37,6 +41,7 @@ mod tests;
 pub(crate) struct Server {
     open: Arc<open::OpenController>,
     recent_apps: SharedRecentApps,
+    changes: Arc<changes::ChangeController>,
     #[cfg(windows)]
     pipe: pipe::Server,
 }
@@ -51,20 +56,31 @@ impl Server {
         {
             let open = open::OpenController::new(session.clone());
             let recent_apps = Arc::new(Mutex::new(RecentApps::default()));
+            let changes = changes::ChangeController::new();
+            if let Some(lease) = producer
+                .as_ref()
+                .and_then(|producer| producer.begin_request())
+            {
+                readers.install_collection_store(lease.client().clone());
+            }
             Ok(Self {
                 open: open.clone(),
                 recent_apps: recent_apps.clone(),
+                changes: changes.clone(),
                 pipe: pipe::Server::start(Arc::new(Handlers {
                     readers,
                     producer,
                     session,
                     open,
                     recent_apps,
+                    changes,
                     active: AtomicUsize::new(0),
                     #[cfg(test)]
                     search_hooks: None,
                     #[cfg(test)]
                     read_hooks: None,
+                    #[cfg(test)]
+                    write_hooks: None,
                 }))?,
             })
         }
@@ -82,6 +98,10 @@ impl Server {
     pub(crate) fn recent_apps(&self) -> SharedRecentApps {
         self.recent_apps.clone()
     }
+
+    pub(crate) fn changes_controller(&self) -> Arc<changes::ChangeController> {
+        self.changes.clone()
+    }
 }
 
 struct Handlers {
@@ -90,11 +110,14 @@ struct Handlers {
     session: Option<crate::remote_ipc::session::SessionHandle>,
     open: Arc<open::OpenController>,
     recent_apps: SharedRecentApps,
+    changes: Arc<changes::ChangeController>,
     active: AtomicUsize,
     #[cfg(test)]
     search_hooks: Option<Arc<SearchHooks>>,
     #[cfg(test)]
     read_hooks: Option<Arc<ReadHooks>>,
+    #[cfg(test)]
+    write_hooks: Option<Arc<collection_write::WriteHooks>>,
 }
 
 #[cfg(test)]
@@ -124,7 +147,7 @@ type PermissionGrant = (PermissionSnapshot, u64);
 enum ReplyPolicy {
     Read(PermissionGrant),
     Rejected,
-    // Accepted operations retain their result after the UI acceptance point.
+    // Accepted operations retain their result after UI/actor acceptance.
     AcceptedOperation,
 }
 impl Reply {
@@ -338,6 +361,13 @@ impl Connection {
             reject(error(ErrorCode::Disabled, "mIV で開く許可がありません"));
             return None;
         }
+        if collection_write::is_write(&request.command) && granted.0.level < AgentLevel::Organize {
+            reject(error(
+                ErrorCode::Disabled,
+                "コレクションを変更する許可がありません",
+            ));
+            return None;
+        }
         let (permit, cancel) = match self.acquire(request.id) {
             Ok(value) => value,
             Err(err) => {
@@ -353,6 +383,20 @@ impl Connection {
         match std::thread::Builder::new()
             .name("agent-read".into())
             .spawn(move || {
+                if collection_write::is_write(&request.command) {
+                    collection_write::respond(
+                        connection,
+                        request.command,
+                        permit,
+                        context,
+                        replies,
+                        started,
+                        id,
+                        tool,
+                        client,
+                    );
+                    return;
+                }
                 if let Command::OpenInViewer { path } = request.command {
                     open_response::respond(
                         connection, path, permit, context, replies, started, id, client,
@@ -411,15 +455,7 @@ impl Connection {
 
 fn record(tool: &'static str, started: Instant, result: &Result<Payload, AgentError>) {
     let (count, error_kind) = result_summary(result);
-    let outcome = match result {
-        Ok(Payload::Opened(_)) => "accepted",
-        Err(_) => "refused",
-        _ => "ok",
-    };
-    crate::logger::log(format!(
-        "agent_ipc: tool={tool} duration_ms={} count={count} error={error_kind} outcome={outcome}",
-        started.elapsed().as_millis()
-    ));
+    crate::logger::log(request_log_line(tool, started, result));
     if crate::perf::is_enabled() {
         crate::perf::event(
             "agent_ipc",
@@ -437,6 +473,22 @@ fn record(tool: &'static str, started: Instant, result: &Result<Payload, AgentEr
         );
     }
 }
+fn request_log_line(
+    tool: &'static str,
+    started: Instant,
+    result: &Result<Payload, AgentError>,
+) -> String {
+    let (count, error_kind) = result_summary(result);
+    let outcome = match result {
+        Ok(Payload::Opened(_)) | Ok(Payload::CollectionWrite(_)) => "accepted",
+        Err(_) => "refused",
+        _ => "ok",
+    };
+    format!(
+        "agent_ipc: tool={tool} duration_ms={} count={count} error={error_kind} outcome={outcome}",
+        started.elapsed().as_millis()
+    )
+}
 
 fn tool_name(command: &Command) -> &'static str {
     match command {
@@ -452,6 +504,10 @@ fn tool_name(command: &Command) -> &'static str {
         Command::ListFolder { .. } => "list_folder",
         Command::GetThumbnail { .. } => "get_thumbnail",
         Command::OpenInViewer { .. } => "open_in_viewer",
+        Command::CreateCollection { .. } => "create_collection",
+        Command::RenameCollection { .. } => "rename_collection",
+        Command::AddToCollection { .. } => "add_to_collection",
+        Command::RemoveFromCollection { .. } => "remove_from_collection",
         Command::Cancel { .. } => "cancel",
     }
 }
@@ -464,6 +520,23 @@ fn result_summary(result: &Result<Payload, AgentError>) -> (usize, &'static str)
         Ok(Payload::Info(p)) => (p.items.len(), "none"),
         Ok(Payload::Folder(p)) => (p.items.len(), "none"),
         Ok(Payload::Thumbnails(p)) => (p.page.items.len(), "none"),
+        Ok(Payload::CollectionWrite(result)) => (
+            match result {
+                CollectionWriteResult::Created { .. } | CollectionWriteResult::Renamed { .. } => 1,
+                CollectionWriteResult::Items { outcomes, .. } => outcomes
+                    .iter()
+                    .map(|outcome| match outcome {
+                        CollectionItemOutcome::Added { indices }
+                        | CollectionItemOutcome::Duplicate { indices }
+                        | CollectionItemOutcome::Removed { indices }
+                        | CollectionItemOutcome::NotPresent { indices }
+                        | CollectionItemOutcome::CapacityRejected { indices }
+                        | CollectionItemOutcome::Skipped { indices, .. } => indices.len(),
+                    })
+                    .sum(),
+            },
+            "none",
+        ),
         Ok(Payload::Opened(_)) => (1, "none"),
         Ok(_) => (0, "none"),
         Err(e) => (
@@ -478,6 +551,7 @@ fn result_summary(result: &Result<Payload, AgentError>) -> (usize, &'static str)
                 ErrorCode::Cancelled => "cancelled",
                 ErrorCode::Timeout => "timeout",
                 ErrorCode::Internal => "internal",
+                ErrorCode::Conflict => "conflict",
             },
         ),
     }
@@ -586,7 +660,13 @@ impl Handlers {
                 long_side,
                 cursor,
             } => self.get_thumbnail(items, long_side, cursor, ctx),
-            Command::Cancel { .. } | Command::SearchItems { .. } | Command::OpenInViewer { .. } => {
+            Command::Cancel { .. }
+            | Command::SearchItems { .. }
+            | Command::OpenInViewer { .. }
+            | Command::CreateCollection { .. }
+            | Command::RenameCollection { .. }
+            | Command::AddToCollection { .. }
+            | Command::RemoveFromCollection { .. } => {
                 unreachable!()
             }
         })();

@@ -3861,3 +3861,140 @@ DB も書き換える」→ その項目の新旧 key を rating writer の 1 �
 backlog の候補 (master の backlog への登録は親 session に依頼する): 「タグの cache は viewer context ごとで、書き込みの結果は mount 中の
 context にしか反映されない。別の窓が持つ同じ項目のタグの表示は読み直すまで古い (利用者の UI 操作でも同じ)。★の ledger と同じ形の
 context をまたぐ公開を足す」。
+
+## 22. 段階 2-1 の実装記録
+
+### 22.1 前提の照合と実装範囲
+
+基点 `bcd9f555f`、branch `mcp-trial`、開始時 clean。観測者は実装担当 (root と担当を分けた
+実装サブエージェント)。§21、U11/U12、許可 snapshot、AcceptedOperation、設定/記録の UI 規則を照合した。
+独立した実装レビューを行ったという意味ではない。
+
+- `CollectionStoreClient::request` は admission mutex 内の `try_send` 成功を `Ok(receiver)` とし、
+  Starting/Busy/Unavailable を投入前の Err と区別している。これをそのまま受理点にできる。
+  actor は receiver が捨てられても実行し、revision を公開する。App の collection grid は watch の
+  revision を見て読み直すため、worker から actor へ書ける。rename の同名は既存 actor が NoOp にする。
+- コレクション actor の生成は共通 readers より前。既存 producer lease から同じ client を clone して
+  SharedReaders に設置した。DB connection/actor/settings reader は追加していない。各 write worker は
+  producer lease を結果まで持つ。agent worker を止めて join → producer drain → actor shutdown の順序は維持。
+- Remote の session snapshot の phase が Local であることを admission で確認できる。
+  書き込みの起動完了判定は、App が frame 冒頭で initialized/overlay から公開する readiness を使う。
+  未設置/起動中は拒否し、App drop で Uninstalled に戻す。detached の述語/viewport routing は変更しない。
+- `prepare_collection_registrations` は worker 用で、Missing を Unresolved の registration にする。
+  agent ではこの結果を NotFound の skipped にし、UI の既存動作は変えない。
+  remove は shared input validator と CollectionSourcePath の構文/identity 正規化だけで source key を照合し、
+  stat/存在/形式の確認をしない。削除済みの参照も外せる。
+- 分類の perf と actor の mutation perf は件数/結果のみ。agent のログ formatter は tool・件数・所要時間・
+  outcome/error kind のみで、名前/path/actor のエラー詳細を直列化しない。
+
+対象は Organize、変更記録、コレクション4 tool のみ。タグ/★の tool、一般化した UI 要求、Undo、
+公開文書、永続化する記録、移行は追加していない。前提に矛盾は見つかっていない。
+
+### 22.2 実装上の選択
+
+- Agent IPC v2 は未リリースのまま。Organize と command/result/Conflict を同じ型定義へ追加した。
+  旧版と互換であるとは主張しない。core と adapter は同じ source を build する。
+- wire の作成結果は id、rename は id/changed。名前の前後はメモリの記録へ持ち、応答で繰り返さない。
+  actor の名前は trim 空以外の長さ制限が無いため、新たな制限で UI と異なる名前を拒むことはしない。
+- 500件の結果は入力の zero-based index を status/reason ごとにまとめる (最大9 group)。path を echo せず、
+  各 index をちょうど1度返す。これにより書き込みを分割/再実行せず既存の最終 MCP 出力予算に収める。
+  空配列/501件以上は全体の BadRequest、個々の不正な path/欠落/対象外/subresource は skipped。
+- 受付状態は Preparing/Stopped/Accepted の一つの mutex owner。期限の controller と actor enqueue が同じ
+  境界を共有する。設定 DB 読み取り/分類/actor の応答待ちはこの lock の外。Accepted 以後は cancel/EOF/
+  期限/権限変更で結果を置き換えず、actor の結果を採用し記録して AcceptedOperation で返す。
+  受付前の時間切れを返した場合も worker が終わるまで permit を保持する。
+- Conflict と Busy は再試行しない。queue に入った後の Conflict/失敗も1回の失敗記録と toast にする。
+  同じ batch で capacity rejected の key が再登場した時は、先頭を capacity_rejected、後続を duplicate とする
+  (actor の batch_seen と同じ意味)。
+- 記録は最新100回・1回500行、immutable Arc snapshot で UI に渡す。描画中は mutex を持たず、
+  競合時は前の snapshot を使う。2-2 の queued record 更新用に id/update の小さな接続口を残した。
+  collection の記録は完了/採用時刻と publication 順で出し、保存/Undo/復旧の仕組みは足していない。
+- 記録が空の時は新しい section を描かず、最初の記録以降に「AI による変更」を出す。
+  §21 は empty state の常時表示を要求しておらず、既存 PNG を更新しない条件とも両立する。
+  level4 の新しい明暗 snapshot は記録入りで追加する。
+
+### 22.3 検証の途中経過
+
+- root: `cargo check -p mimageviewer --bin mimageviewer-core` exit 0 (1m07s、
+  `target/mcp-stage2-1-core-check.log`)。
+- protocol 実装担当: `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp` exit 0、14/14 と60/60。
+  `--include-ignored` 無し。保存ログ無し、tool session 58039 で観測。担当 agent の環境では実 pipe 2件も成功。
+  root の既知 sandbox OS5 の過去結果でこの観測を置き換えない。必須の include-ignored 版は最終検証へ残す。
+- glyph lint は UI 実装担当が1回実行し exit 0。root の最終 source でも再確認する。
+- 最初の lib-test compile は root の Server initializer の cfg(test) write_hooks 欠落で exit 101。
+  initializer を補い、UI 担当の focused を再実行中。これは製品の実行結果ではない。
+
+本節は途中経過。最終コマンド/PNG/残りの確認は次節へ追記する。commit・製品起動・実 client config の
+読書きはしていない。
+
+### 22.4 最終検証と追加 PNG
+
+以下の root は実装担当自身。担当サブエージェントの検証も実装担当の確認であり、独立レビューではない。
+
+| コマンド | 観測者 | 実 exit | 結果 |
+|---|---|---:|---|
+| `cargo fmt` / `cargo fmt --check` | root | 0 / 0 | workspace 全体。`target/mcp-stage2-1-fmt.log`、`target/mcp-stage2-1-fmt-check.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` (最終) | root | 0 | `target/mcp-stage2-1-core-check-final.log`、1m29s |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored` | root | 101 | agent-ipc 14/14、MCP 58成功/2失敗。`target/mcp-stage2-1-crate-tests.log` |
+| collection write focused nextest | collection test 担当 | 0 | 11/11、`target/mcp-stage2-1-collection-tests.log`、実行0.616s |
+| changes/App/preferences focused nextest | UI 担当 | 0 | 21/21、`target/mcp-stage2-ui-focused-final.log`、実行3.324s |
+| §19.6 + collection_store + agent_change_ui_tests focused nextest | root | 100 | 863件中861成功/2失敗、`target/mcp-stage2-1-focused.log`、実行54.334s |
+| 新規2枚だけ UPDATE_SNAPSHOTS=1 で `cargo test --test ui_snapshot preferences_agent_organize_` | UI 担当 | 0 | 2/2、`target/mcp-stage2-ui-new-snapshots.log` |
+| `cargo test --test ui_snapshot` (更新 mode 無し、全件比較) | root | 0 | 222/222、`target/mcp-stage2-1-ui-snapshot.log`、実行39.43s |
+| `python scripts/check_ui_glyphs.py` (最終 source) | root | 0 | `target/mcp-stage2-1-glyphs.log` |
+| `git diff --check` | root | 0 | LF/CRLF warning のみ、`target/mcp-stage2-1-diff-check.log` |
+
+collection focused の正確なコマンド:
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(agent_ipc::collection_write_tests)' --no-tests fail --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast
+```
+
+root の最終 focused filter は §19.6 の全条件に actor と App の変更記録テストを加えたもの:
+
+```powershell
+$stage2Focused = '(test(/agent_ipc/) or test(/agent_level/) or test(/agent_permission/) or test(=settings_db::tests::failed_permission_commit_preserves_snapshot_and_epoch) or test(/remote_ipc::live_favorites/) or test(/settings_transfer::tests::automatic_network_enablement/) or test(/png_metadata/) or test(=pdf_loader::tests::anonymous_page_sizes_keep_worker_path_out_of_diagnostics_on_all_results) or test(=pdf_loader::tests::page_sizes_preserve_existing_ui_diagnostic_identity) or test(=pdf_loader::tests::page_sizes_round_trip_and_reject_a_truncated_reply) or test(/app::folder_scan/) or test(/zip_loader/) or test(/conceal_db/) or test(=pdf_loader::tests::anonymous_agent_render_and_enumerate_omit_keys_and_harvest_actual_completion) or test(=pdf_loader::tests::cancelled_anonymous_render_does_not_enqueue) or test(/app::startup_ops/) or test(/single_instance/) or test(/remote_ipc::session/) or test(/ui_request_dispatch/) or test(/activation/) or test(/startup_open_path/) or test(/ui_dialogs::preferences/) or test(/agent_registration/) or test(/process_images/) or test(/runtime_cleanup/) or test(/collection_store/) or test(/agent_change_ui_tests/)) and not test(/section1375_scan_perf_tests/)'
+cargo nextest run -p mimageviewer --lib -E $stage2Focused --no-fail-fast
+```
+
+追加 PNG (既存 PNG の更新は無し):
+
+- `tests/snapshots/preferences_agent_organize_light.png` (243,220 bytes)
+- `tests/snapshots/preferences_agent_organize_dark.png` (240,973 bytes)
+
+合計484,193 bytes。UI 担当と root が両方を目視し、4段目・3列・変更記録・登録行が明暗で読めることを確認。
+既存6枚の AI 設定 PNG の hash は生成前後で不変、root の全222件比較も成功した。
+geometry は PNG を増やさず、1093×614・100/200%・長文/最大500行で実 wheel の末尾到達と CopyText を検証。
+16組の説明、100回/500行 cap、queued 更新/evict、App readiness/drop/再設置/toast、create 同名2回、
+rename NoOp、Conflict/Busy、受付前後の cancel/期限/権限変更/切断、消えた file の remove、ZIP/PDF
+subresource skipped、500/501、容量と duplicate の優先、ログの path/name/error detail 非露出を確認した。
+
+root で失敗したのは、既知の sandbox の pipe open OS error 5 の以下4件のみ (skip/ignore は追加していない):
+
+- MCP: `pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked`、
+  `pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld`
+- core: `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`、
+  `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`
+
+### 22.5 変更ファイルと引継ぎ
+
+- wire/adapter: `crates/agent-ipc/src/lib.rs`、`crates/mcp-server/src/{lib.rs,schema.rs,tests.rs}`。
+- core: `src/agent_ipc/{mod.rs,tests.rs}`、新規 `changes.rs`、`collection_write.rs`、`collection_write_tests.rs`。
+  `src/remote_ipc/mod.rs` は shared client の設置/取得だけ。既存 Remote helper/engine の body と protocol 72 は不変。
+- integration/settings/UI: `src/{app.rs,lib.rs,settings_db.rs}`、
+  `src/ui_dialogs/preferences/{agent_integration.rs,agent_integration/tests.rs,pages.rs,search_index.rs}`、
+  `tests/ui_snapshot.rs`、上記新規 PNG 2枚、本計画。
+
+sandbox 外で ClaudeCode が行う最小の追加検証:
+
+```powershell
+cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp -- --include-ignored
+cargo nextest run -p mimageviewer --lib -E 'test(=agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry) or test(=agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers)'
+```
+
+861成功の同じ source/条件の結果は再利用できる。全 focused を外で確認する場合は §22.4 のコマンドを使う。
+実 core/AI アプリでの変更・画面追従・通知/記録の確認は未実施。所定の test green 前提が sandbox 内では
+OS5 で揃わないため、新しい実機確認用 build-dev は作っていない。必要時は外部担当が
+`.\scripts\build-dev.ps1 -PreserveRuntime` で core と対応する MCP を同時に更新する。
+test-full は実行していない。タグ/★/UI 要求の一般化・公開文書は計画どおり2-2以降へ残す。
+本 slice の実装の未完項目/追加の設計矛盾は無い。commit・製品起動・実 client config の操作はしていない。

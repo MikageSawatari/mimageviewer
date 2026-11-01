@@ -1,5 +1,6 @@
 //! AI integration view and its draft-scoped, worker-only registration lifecycle.
 use super::*;
+use crate::agent_ipc::changes::ChangeRecord;
 use crate::agent_registration::{self as backend, Action, AppTarget, RegistrationState};
 use crate::settings::AgentLevel;
 
@@ -57,6 +58,7 @@ pub(super) struct AgentIntegrationState {
     feedback: Option<(AppTarget, Result<String, String>)>,
     instructions: Option<AppTarget>,
     recent: Vec<(String, String, String)>,
+    changes: Vec<Arc<ChangeRecord>>,
     #[cfg(test)]
     mock_backend: Option<MockBackend>,
     #[cfg(test)]
@@ -74,6 +76,7 @@ impl AgentIntegrationState {
             feedback: None,
             instructions: None,
             recent: Vec::new(),
+            changes: Vec::new(),
             #[cfg(test)]
             mock_backend: None,
             #[cfg(test)]
@@ -224,6 +227,7 @@ pub(super) fn draw_permission(ui: &mut egui::Ui, settings: &mut Settings) -> egu
                 AgentLevel::Disabled,
                 AgentLevel::ReadOnly,
                 AgentLevel::ReadAndOpen,
+                AgentLevel::Organize,
             ] {
                 ui.selectable_value(&mut settings.agent_level, level, level_label(level));
             }
@@ -237,6 +241,7 @@ fn level_label(level: AgentLevel) -> &'static str {
         AgentLevel::Disabled => "無効",
         AgentLevel::ReadOnly => "読み取りのみ",
         AgentLevel::ReadAndOpen => "読み取りと、mIV で開く",
+        AgentLevel::Organize => "整理まで: タグ・★・コレクションの変更",
     }
 }
 
@@ -293,8 +298,13 @@ fn exposure(draft: PermissionDraft) -> Exposure {
         result.hidden.push("撮影位置 (GPS)");
     }
     result.actions.push("情報の読み取り・検索");
-    if draft.level == AgentLevel::ReadAndOpen {
+    if draft.level >= AgentLevel::ReadAndOpen {
         result.actions.push("mIV の画面で開く (表示が切り替わる)");
+    }
+    if draft.level >= AgentLevel::Organize {
+        result
+            .actions
+            .push("タグ・★・コレクションの変更 (確認なし。1 回 500 件まで)");
     }
     result
 }
@@ -337,6 +347,80 @@ pub(super) fn draw_recent(ui: &mut egui::Ui, state: &AgentIntegrationState) {
         let _ = draw_recent_table(ui, &state.recent);
     }
     ui.add_space(12.0);
+}
+
+pub(super) fn has_changes(state: &AgentIntegrationState) -> bool {
+    !state.changes.is_empty()
+}
+
+pub(super) fn draw_changes(ui: &mut egui::Ui, state: &AgentIntegrationState) {
+    ui.label(egui::RichText::new("mIV を閉じると消えます。最新 100 回分を表示します。").weak());
+    for record in &state.changes {
+        let seconds = record
+            .at
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let heading = format!(
+            "{}  {}  {} ({} 件)  {}",
+            crate::app::format_details_timestamp(seconds, true),
+            record.client_name,
+            record.tool,
+            record.counts.total(),
+            record.summary
+        );
+        let id = ui.make_persistent_id(("agent_change", record.id));
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+            .show_header(ui, |ui| {
+                ui.add(egui::Label::new(heading).wrap().selectable(true));
+            })
+            .body(|ui| {
+                ui.add(
+                    egui::Label::new(format!(
+                        "変更 {} 件 / 変更なし {} 件 / 対象外 {} 件 / 処理中 {} 件 / 失敗 {} 件",
+                        record.counts.changed,
+                        record.counts.unchanged,
+                        record.counts.skipped,
+                        record.counts.queued,
+                        record.counts.failed
+                    ))
+                    .wrap()
+                    .selectable(true),
+                );
+                if ui.small_button("この変更をコピー").clicked() {
+                    ui.ctx().copy_text(change_record_text(record));
+                }
+                for (index, row) in record.rows.iter().enumerate() {
+                    ui.push_id(index, |ui| {
+                        ui.separator();
+                        selectable_copy(ui, &change_row_text(row));
+                    });
+                }
+            });
+    }
+    ui.add_space(12.0);
+}
+
+fn change_row_text(row: &crate::agent_ipc::changes::ChangeRow) -> String {
+    format!(
+        "項目: {}\n前の値: {}\n後の値: {}\n結果: {}",
+        row.item, row.before, row.after, row.result
+    )
+}
+
+fn change_record_text(record: &ChangeRecord) -> String {
+    let mut text = format!(
+        "{} / {} / {} 件 / {}",
+        record.client_name,
+        record.tool,
+        record.counts.total(),
+        record.summary
+    );
+    for row in &record.rows {
+        text.push_str("\n\n");
+        text.push_str(&change_row_text(row));
+    }
+    text
 }
 
 /// Each row receives the full page width, and advances by its tallest natural
@@ -455,6 +539,15 @@ impl App {
         state.agent_integration.applied = (&self.settings).into();
         state.agent_integration.poll(ctx);
         if state.selected == PreferencesPage::AgentIntegration {
+            // Read immutable snapshots under a short lock. Keep the last view
+            // if the worker is publishing, rather than removing the section
+            // and changing the page's scroll geometry for that frame.
+            if let Some(changes) = &self.agent_changes {
+                let shared = changes.controller.records();
+                if let Ok(records) = shared.try_lock() {
+                    state.agent_integration.changes = records.entries().to_vec();
+                }
+            }
             if matches!(state.agent_integration.detection, DetectionState::Unchecked) {
                 state.agent_integration.start_detection(ctx);
             }
@@ -622,10 +715,11 @@ pub(super) fn snapshot(ui: &mut egui::Ui, level: u8) {
     settings.agent_level = match level {
         0 => AgentLevel::Disabled,
         1 => AgentLevel::ReadOnly,
-        _ => AgentLevel::ReadAndOpen,
+        2 => AgentLevel::ReadAndOpen,
+        _ => AgentLevel::Organize,
     };
-    settings.agent_show_thumbnails = level == 2;
-    settings.agent_show_gps = level == 2;
+    settings.agent_show_thumbnails = level >= 2;
+    settings.agent_show_gps = level >= 2;
     let mut state = super::PreferencesState::from_settings(
         &settings,
         crate::external_tool::LaunchTarget::None,
@@ -676,6 +770,30 @@ pub(super) fn snapshot(ui: &mut egui::Ui, level: u8) {
         "1.0".into(),
         "2026-11-01 12:34:56".into(),
     ));
+    if level >= 3 {
+        let controller = crate::agent_ipc::changes::ChangeController::new();
+        controller.publish(crate::agent_ipc::changes::ChangeRecord {
+            id: Default::default(),
+            at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_793_501_696),
+            client_name: "Claude Desktop".into(),
+            tool: "add_to_collection".into(),
+            counts: crate::agent_ipc::changes::ChangeCounts {
+                changed: 2,
+                unchanged: 1,
+                skipped: 1,
+                ..Default::default()
+            },
+            summary: "コレクション「旅行の写真」に追加".into(),
+            rows: vec![crate::agent_ipc::changes::ChangeRow {
+                item: r"C:\写真\旅行\海辺の写真.jpg".into(),
+                before: "未登録".into(),
+                after: "旅行の写真".into(),
+                result: "変更しました".into(),
+            }],
+            notice: String::new(),
+        });
+        state.agent_integration.changes = controller.records().lock().unwrap().entries().to_vec();
+    }
     super::draw_page(ui, &mut state, false);
 }
 

@@ -16847,6 +16847,7 @@ pub struct App {
     pub(crate) indexer_init: IndexerInit,
     pub(crate) agent_readers: Option<Arc<crate::remote_ipc::SharedReaders>>,
     pub(crate) agent_recent_apps: Option<crate::agent_ipc::SharedRecentApps>,
+    pub(crate) agent_changes: Option<crate::agent_ipc::changes::UiChanges>,
     pub(crate) agent_open_requests: Option<mpsc::Receiver<crate::agent_ipc::open::UiOpenRequest>>,
 
     // ── 別バージョン索引 ─────────────────────────────────────────
@@ -20965,6 +20966,7 @@ impl App {
             indexer_init,
             agent_readers: None,
             agent_recent_apps: None,
+            agent_changes: None,
             agent_open_requests: None,
             similar_index,
             name_index_manager: None,
@@ -23717,6 +23719,32 @@ impl App {
 
     pub(crate) fn install_agent_recent_apps(&mut self, recent: crate::agent_ipc::SharedRecentApps) {
         self.agent_recent_apps = Some(recent);
+    }
+
+    pub(crate) fn install_agent_changes(
+        &mut self,
+        controller: Arc<crate::agent_ipc::changes::ChangeController>,
+        ctx: &egui::Context,
+    ) {
+        self.agent_changes.take();
+        let notices = controller.install(ctx.clone());
+        self.agent_changes = Some(crate::agent_ipc::changes::UiChanges {
+            controller,
+            notices,
+        });
+    }
+
+    fn poll_agent_changes(&mut self) {
+        let Some(changes) = &self.agent_changes else {
+            return;
+        };
+        changes
+            .controller
+            .set_ready(self.initialized && !self.indexer_init.overlay_active());
+        let notices: Vec<_> = changes.notices.try_iter().collect();
+        for notice in notices {
+            self.show_feedback_toast(notice);
+        }
     }
 
     pub(crate) fn everything_search_entry_availability(
@@ -98136,6 +98164,7 @@ impl App {
     /// 呼び出し側 (`update`) へ置く。
     fn update_frame(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
+        self.poll_agent_changes();
         self.reject_agent_open_requests_during_startup();
         let update_perf_on = crate::perf::is_enabled();
         let mut update_perf = update_perf_start_with(
@@ -104687,5 +104716,61 @@ impl App {
     ) -> Option<egui::TextureHandle> {
         self.ensure_conceal_material(ctx, idx)
             .map(|resource| resource.source_texture().clone())
+    }
+}
+
+#[cfg(test)]
+mod agent_change_ui_tests {
+    use super::*;
+
+    #[test]
+    fn agent_changes_readiness_tracks_startup_and_drop_without_launching_ui() {
+        let mut app = setup_app_for_test();
+        let controller = crate::agent_ipc::changes::ChangeController::new();
+        app.install_agent_changes(controller.clone(), &egui::Context::default());
+        assert!(!controller.is_ready());
+        app.indexer_init = IndexerInit::Unavailable;
+        app.initialized = false;
+        app.poll_agent_changes();
+        assert!(!controller.is_ready());
+        app.initialized = true;
+        app.indexer_init = IndexerInit::NotStarted;
+        app.poll_agent_changes();
+        assert!(!controller.is_ready());
+        app.indexer_init = IndexerInit::Unavailable;
+        app.poll_agent_changes();
+        assert!(controller.is_ready());
+        app.agent_changes.take();
+        assert!(!controller.is_ready());
+    }
+
+    #[test]
+    fn agent_changes_drain_uses_existing_toast_and_reinstall_starts_unready() {
+        let mut app = setup_app_for_test();
+        let controller = crate::agent_ipc::changes::ChangeController::new();
+        let ctx = egui::Context::default();
+        app.install_agent_changes(controller.clone(), &ctx);
+        app.indexer_init = IndexerInit::Unavailable;
+        app.initialized = true;
+        app.poll_agent_changes();
+        controller.publish(crate::agent_ipc::changes::ChangeRecord {
+            id: Default::default(),
+            at: std::time::SystemTime::now(),
+            client_name: "fixture".into(),
+            tool: "create_collection".into(),
+            counts: Default::default(),
+            summary: "作成".into(),
+            rows: Vec::new(),
+            notice: "AI がコレクションを作成しました (1 件)".into(),
+        });
+        app.poll_agent_changes();
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "AI がコレクションを作成しました (1 件)"
+        );
+        app.install_agent_changes(controller.clone(), &ctx);
+        assert!(!controller.is_ready());
+        app.poll_agent_changes();
+        assert!(controller.is_ready());
     }
 }

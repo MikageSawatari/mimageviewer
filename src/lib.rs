@@ -1733,6 +1733,9 @@ pub fn run() -> eframe::Result {
     let agent_recent_apps = agent_ipc_server
         .as_ref()
         .map(agent_ipc::Server::recent_apps);
+    let agent_changes_controller = agent_ipc_server
+        .as_ref()
+        .map(agent_ipc::Server::changes_controller);
     // server より後に所有し、逆順 Drop で service を先に止めてから pipe を閉じる。
     let remote_data_dir = data_dir::get();
     let mut remote_service_manager = if remote_ipc_server.is_some() {
@@ -1906,6 +1909,9 @@ pub fn run() -> eframe::Result {
             }
             if let Some(recent) = agent_recent_apps.as_ref() {
                 app.install_agent_recent_apps(recent.clone());
+            }
+            if let Some(controller) = agent_changes_controller.as_ref() {
+                app.install_agent_changes(controller.clone(), &cc.egui_ctx);
             }
             if let Some(control) = app_remote_ipc_control.clone() {
                 app.set_remote_ipc_server_control(control);

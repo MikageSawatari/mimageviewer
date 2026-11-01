@@ -42,12 +42,13 @@ fn injected(settings: &Settings) -> AgentIntegrationState {
 }
 
 #[test]
-fn agent_exposure_all_twelve_permission_combinations() {
+fn agent_exposure_all_sixteen_permission_combinations() {
     let mut count = 0;
     for level in [
         AgentLevel::Disabled,
         AgentLevel::ReadOnly,
         AgentLevel::ReadAndOpen,
+        AgentLevel::Organize,
     ] {
         for thumbnails in [false, true] {
             for gps in [false, true] {
@@ -73,7 +74,13 @@ fn agent_exposure_all_twelve_permission_combinations() {
                     result
                         .actions
                         .contains(&"mIV の画面で開く (表示が切り替わる)"),
-                    level == AgentLevel::ReadAndOpen
+                    level >= AgentLevel::ReadAndOpen
+                );
+                assert_eq!(
+                    result
+                        .actions
+                        .contains(&"タグ・★・コレクションの変更 (確認なし。1 回 500 件まで)"),
+                    level == AgentLevel::Organize
                 );
                 assert!(result.hidden.contains(&"画像・動画・音声の元データ"));
                 assert!(result.hidden.contains(&"PDF / ZIP の中身の本文"));
@@ -85,7 +92,7 @@ fn agent_exposure_all_twelve_permission_combinations() {
             }
         }
     }
-    assert_eq!(count, 12);
+    assert_eq!(count, 16);
 }
 
 #[test]
@@ -836,5 +843,126 @@ fn agent_recent_table_uses_page_width_and_natural_top_aligned_rows() {
                 "timestamp must remain readable"
             );
         }
+    }
+}
+
+fn change_fixture(
+    rows: usize,
+) -> (
+    AgentIntegrationState,
+    crate::agent_ipc::changes::ChangeRecordId,
+) {
+    use crate::agent_ipc::changes::{ChangeController, ChangeCounts, ChangeRecord, ChangeRow};
+    let settings = Settings::default();
+    let mut state = injected(&settings);
+    let controller = ChangeController::new();
+    let id = controller.publish(ChangeRecord {
+        id: Default::default(),
+        at: std::time::UNIX_EPOCH,
+        client_name: "名乗った AI アプリの長い名前".repeat(10),
+        tool: "add_to_collection".into(),
+        counts: ChangeCounts {
+            changed: rows,
+            ..Default::default()
+        },
+        summary: "非常に長いコレクション名への追加".repeat(12),
+        rows: (0..rows)
+            .map(|index| ChangeRow {
+                item: format!(r"C:\写真\{}\項目{index}.jpg", "長いフォルダ名\\".repeat(12)),
+                before: "未登録".repeat(15),
+                after: "長いコレクション名".repeat(20),
+                result: format!("変更しました {index}"),
+            })
+            .collect(),
+        notice: String::new(),
+    });
+    state.changes = controller.records().lock().unwrap().entries().to_vec();
+    (state, id)
+}
+
+#[test]
+fn agent_changes_max_rows_long_text_small_200_percent_reaches_last_copy() {
+    use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+    for scale in [1.0, 2.0] {
+        let (state, id) = change_fixture(500);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1093.0, 614.0))
+            .with_context_setup(move |ctx| {
+                crate::ui_fonts::configure_fonts(ctx);
+                crate::settings::apply_ui_scale_factor(ctx, scale);
+            })
+            .build_ui_state(
+                |root, state| {
+                    root.spacing_mut().scroll = super::super::pref_panel_scroll_style();
+                    let output = egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(root, |ui| {
+                            egui::collapsing_header::CollapsingState::load_with_default_open(
+                                ui.ctx(),
+                                ui.make_persistent_id(("agent_change", id)),
+                                true,
+                            )
+                            .store(ui.ctx());
+                            draw_changes(ui, state);
+                        });
+                    root.ctx().data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new("changes_scroll"),
+                            ScrollLayout::from_output(&output),
+                        )
+                    });
+                },
+                state,
+            );
+        harness.run_steps(8);
+        let read = |harness: &egui_kittest::Harness<'_, AgentIntegrationState>| {
+            harness.ctx.data(|data| {
+                data.get_temp::<ScrollLayout>(egui::Id::new("changes_scroll"))
+                    .unwrap()
+            })
+        };
+        let before = read(&harness);
+        before.assert_height(
+            HeightExpectation::Scrolls,
+            harness.ctx.content_rect(),
+            harness.ctx.pixels_per_point(),
+        );
+        assert!(
+            before.content.x <= before.inner.width() + 1.0,
+            "long text widened the page scale={scale}: {before:?}"
+        );
+        harness.event(egui::Event::PointerMoved(before.inner.center()));
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -1_000_000.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
+        });
+        harness.run_steps(40);
+        read(&harness).assert_scrolled_to_end(before, harness.ctx.pixels_per_point());
+        let viewport = harness.ctx.content_rect();
+        let copies: Vec<_> = harness.get_all_by_label("コピー").collect();
+        let last = copies.last().expect("500th row copy button");
+        assert!(
+            viewport.contains_rect(last.rect()),
+            "last row copy not reachable scale={scale}"
+        );
+        last.click();
+        harness.run_steps(1);
+        assert!(harness.output().platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text.contains("項目499.jpg") && text.contains("前の値:") && text.contains("後の値:") && text.contains("結果: 変更しました 499"))
+        }), "last row copy must contain its item, before, after and result");
+    }
+}
+
+#[test]
+fn agent_changes_copy_text_preserves_all_rows_and_results() {
+    let (state, _) = change_fixture(2);
+    let record = &state.changes[0];
+    let copied = change_record_text(record);
+    assert!(copied.contains("add_to_collection / 2 件"));
+    for row in &record.rows {
+        assert!(copied.contains(&change_row_text(row)));
     }
 }

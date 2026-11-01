@@ -41,6 +41,7 @@ pub const MAX_LIMIT: u32 = 200;
 pub const MAX_INFO_LIMIT: u32 = 50;
 pub const DEFAULT_FOLDER_LIMIT: u32 = 100;
 pub const MAX_THUMBNAIL_ITEMS: usize = 20;
+pub const MAX_WRITE_ITEMS: usize = 500;
 pub const DEFAULT_THUMBNAIL_SIDE: u32 = 256;
 pub const MAX_THUMBNAIL_SIDE: u32 = 512;
 pub const MAX_THUMBNAIL_IMAGE_BYTES: usize = 256 * 1024;
@@ -131,6 +132,21 @@ pub enum Command {
     OpenInViewer {
         path: String,
     },
+    CreateCollection {
+        name: String,
+    },
+    RenameCollection {
+        id: String,
+        name: String,
+    },
+    AddToCollection {
+        id: String,
+        items: Vec<ItemRef>,
+    },
+    RemoveFromCollection {
+        id: String,
+        items: Vec<ItemRef>,
+    },
     Cancel {
         request_id: u64,
     },
@@ -153,6 +169,7 @@ pub enum Payload {
     Folder(FolderPage),
     Thumbnails(ThumbnailResponse),
     Opened(OpenResult),
+    CollectionWrite(CollectionWriteResult),
     Cancelled,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -164,6 +181,55 @@ pub struct OpenResult {
 #[serde(rename_all = "snake_case")]
 pub enum OpenStatus {
     Accepted,
+}
+/// Completed collection actor result. Item outcomes refer to zero-based input
+/// positions, grouped by status so all 500 results fit the MCP output budget.
+/// Every input position occurs exactly once; paths are never repeated here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum CollectionWriteResult {
+    Created {
+        id: String,
+    },
+    Renamed {
+        id: String,
+        changed: bool,
+    },
+    Items {
+        id: String,
+        outcomes: Vec<CollectionItemOutcome>,
+    },
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CollectionItemOutcome {
+    Added {
+        indices: Vec<u16>,
+    },
+    Duplicate {
+        indices: Vec<u16>,
+    },
+    Removed {
+        indices: Vec<u16>,
+    },
+    NotPresent {
+        indices: Vec<u16>,
+    },
+    CapacityRejected {
+        indices: Vec<u16>,
+    },
+    Skipped {
+        indices: Vec<u16>,
+        reason: CollectionSkipReason,
+    },
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectionSkipReason {
+    InvalidPath,
+    NotFound,
+    UnsupportedSubresource,
+    UnsupportedType,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -183,6 +249,7 @@ pub enum AgentLevel {
     Disabled,
     ReadOnly,
     ReadAndOpen,
+    Organize,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -252,6 +319,7 @@ pub enum ErrorCode {
     PermissionChanged,
     NotReady,
     BadRequest,
+    Conflict,
     VersionMismatch,
     Busy,
     Cancelled,
@@ -637,6 +705,15 @@ mod tests {
     fn permission_order_and_serde_include_read_and_open_without_enabling_defaults() {
         assert!(AgentLevel::Disabled < AgentLevel::ReadOnly);
         assert!(AgentLevel::ReadOnly < AgentLevel::ReadAndOpen);
+        assert!(AgentLevel::ReadAndOpen < AgentLevel::Organize);
+        assert_eq!(
+            serde_json::to_string(&AgentLevel::Organize).unwrap(),
+            r#""organize""#
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentLevel>(r#""organize""#).unwrap(),
+            AgentLevel::Organize
+        );
         assert_eq!(
             serde_json::to_string(&AgentLevel::ReadAndOpen).unwrap(),
             r#""read_and_open""#
@@ -648,6 +725,65 @@ mod tests {
                 thumbnails: false,
                 gps: false,
             }
+        );
+    }
+
+    #[test]
+    fn collection_write_wire_roundtrips_grouped_input_positions() {
+        assert_eq!(AGENT_PROTOCOL_VERSION, 2);
+        let reference = ItemRef {
+            path: "C:/本.zip".into(),
+            subresource: Some("001.png".into()),
+        };
+        for command in [
+            Command::CreateCollection {
+                name: "同名可".into(),
+            },
+            Command::RenameCollection {
+                id: "id".into(),
+                name: "改名".into(),
+            },
+            Command::AddToCollection {
+                id: "id".into(),
+                items: vec![reference.clone()],
+            },
+            Command::RemoveFromCollection {
+                id: "id".into(),
+                items: vec![reference],
+            },
+        ] {
+            let mut bytes = vec![];
+            write_frame(&mut bytes, &command).unwrap();
+            assert_eq!(
+                read_frame::<_, Command>(&mut &bytes[..]).unwrap(),
+                Some(command)
+            );
+        }
+        for result in [
+            CollectionWriteResult::Created { id: "id".into() },
+            CollectionWriteResult::Renamed {
+                id: "id".into(),
+                changed: false,
+            },
+            CollectionWriteResult::Items {
+                id: "id".into(),
+                outcomes: vec![CollectionItemOutcome::Skipped {
+                    indices: (0..MAX_WRITE_ITEMS as u16).collect(),
+                    reason: CollectionSkipReason::UnsupportedSubresource,
+                }],
+            },
+        ] {
+            let response = Response {
+                id: 1,
+                result: Ok(Payload::CollectionWrite(result)),
+            };
+            let json = serde_json::to_value(&response).unwrap();
+            assert_eq!(serde_json::from_value::<Response>(json).unwrap(), response);
+            assert!(mcp_content_chars(&response).unwrap() < MAX_PAGE_CHARS);
+        }
+        assert_eq!(
+            serde_json::to_value(ErrorCode::Conflict).unwrap(),
+            "conflict"
         );
     }
 

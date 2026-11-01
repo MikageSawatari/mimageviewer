@@ -83,7 +83,16 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "agent/permission",
         AgentIntegration,
         "許可の範囲",
-        ["AI 連携", "MCP", "無効", "読み取りのみ", "mIV で開く"]
+        [
+            "AI 連携",
+            "MCP",
+            "無効",
+            "読み取りのみ",
+            "mIV で開く",
+            "整理",
+            "タグ",
+            "コレクション"
+        ]
     ),
     entry!(
         "agent/images",
@@ -102,6 +111,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         AgentIntegration,
         "最近使った AI アプリ",
         ["接続", "版", "時刻"]
+    ),
+    entry!(
+        "agent/changes",
+        AgentIntegration,
+        "AI による変更",
+        ["記録", "コピー", "タグ", "★", "コレクション"]
     ),
     entry!(
         "agent/claude",
