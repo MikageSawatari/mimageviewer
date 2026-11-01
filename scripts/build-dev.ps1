@@ -32,6 +32,7 @@
 [CmdletBinding()]
 param(
     [switch] $TestScript,
+    [string] $MivSoundCandidate,
     # Fail when an exact staged development executable is running instead of
     # stopping it. This keeps a live verification runtime intact.
     [switch] $PreserveRuntime,
@@ -41,6 +42,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$env:MSBUILDDISABLENODEREUSE = '1'
+. (Join-Path $PSScriptRoot 'miv-sound-candidate.ps1')
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $targetDir = Join-Path $repoRoot 'target'
 $outputDir = Join-Path $targetDir 'dev-runtime'
@@ -137,54 +140,18 @@ function Copy-IfChanged {
 }
 
 function Copy-EffetuneBundleIfChanged {
-    $source = Join-Path $repoRoot 'vendor\effetune-mixwright\EffeTune Mixwright.vst3'
-    $destination = Join-Path $outputDir 'effetune\EffeTune Mixwright.vst3'
-    if (-not (Test-Path -LiteralPath $source -PathType Container)) {
-        throw "[build-dev] required EffeTune bundle is missing: $source"
+    if ($MivSoundCandidate) {
+        Copy-MivSoundCandidateRuntime -RepoRoot $repoRoot -Candidate $MivSoundCandidate -OutputDir $outputDir
+        return
     }
-    $sourceFiles = @(Get-ChildItem -LiteralPath $source -Recurse -File)
-    $destinationFiles = @()
-    if (Test-Path -LiteralPath $destination -PathType Container) {
-        $destinationItem = Get-Item -LiteralPath $destination
-        if (($destinationItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "[build-dev] EffeTune destination is a reparse point: $destination"
-        }
-        $destinationFiles = @(Get-ChildItem -LiteralPath $destination -Recurse -File)
-    }
-    $changed = $sourceFiles.Count -ne $destinationFiles.Count
-    if (-not $changed) {
-        foreach ($file in $sourceFiles) {
-            $relative = $file.FullName.Substring($source.Length).TrimStart('\')
-            $target = Join-Path $destination $relative
-            if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
-                $changed = $true
-                break
-            }
-            $targetInfo = Get-Item -LiteralPath $target
-            if ($file.Length -ne $targetInfo.Length -or
-                $file.LastWriteTimeUtc -ne $targetInfo.LastWriteTimeUtc) {
-                $changed = $true
-                break
-            }
-        }
-    }
-    if (-not $changed) { return }
-
-    $resolvedOutput = [IO.Path]::GetFullPath($outputDir).TrimEnd('\')
-    $resolvedDestination = [IO.Path]::GetFullPath($destination)
-    if (-not $resolvedDestination.StartsWith($resolvedOutput + '\',
-            [StringComparison]::OrdinalIgnoreCase)) {
-        throw "[build-dev] EffeTune destination is outside dev runtime: $resolvedDestination"
-    }
-    if (Test-Path -LiteralPath $destination) {
-        Remove-Item -LiteralPath $destination -Recurse -Force
-    }
-    $parent = Split-Path -Parent $destination
-    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
-        New-Item -ItemType Directory -Path $parent | Out-Null
-    }
-    Copy-Item -LiteralPath $source -Destination $destination -Recurse
-    Write-Host '[build-dev] staged EffeTune Mixwright bundle'
+    $source = Join-Path $repoRoot $MivSound.SOURCE_ROOT
+    $null = Assert-MivEffetuneSource -SourceRoot $source -NoticesRoot (Join-Path $repoRoot $MivSound.NOTICES_ROOT)
+    $destination = Join-Path $outputDir 'effetune'
+    Assert-MivSoundSafeDirectory $destination
+    if (Test-Path -LiteralPath $destination) { Remove-Item -LiteralPath $destination -Recurse -Force }
+    New-Item -ItemType Directory -Path $destination -Force | Out-Null
+    Get-ChildItem -LiteralPath $source -Force | Copy-Item -Destination $destination -Recurse -Force
+    Assert-MivEffetuneRawSource -SourceRoot $destination -ManifestPath (Join-Path $repoRoot $MivSound.Manifest)
 }
 
 function Wait-ForOtherNativeBuilds {
@@ -215,8 +182,15 @@ function Wait-ForOtherNativeBuilds {
     }
 }
 
+$oldCandidate = $env:MIV_SOUND_CANDIDATE
 Push-Location $repoRoot
 try {
+    if ($MivSoundCandidate) {
+        $null = Read-MivSoundCandidate -RepoRoot $repoRoot -Candidate $MivSoundCandidate
+        $env:MIV_SOUND_CANDIDATE = $MivSoundCandidate
+    } else {
+        Remove-Item Env:MIV_SOUND_CANDIDATE -ErrorAction SilentlyContinue
+    }
     & (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1')
 
     if ($WaitForOtherBuildsMinutes -gt 0) {
@@ -315,5 +289,6 @@ try {
     Write-Host '  default launch: close the installed/resident mImageViewer first (same data-dir namespace)'
     Write-Host '  isolated launch: may run beside the installed/resident mImageViewer'
 } finally {
+    $env:MIV_SOUND_CANDIDATE = $oldCandidate
     Pop-Location
 }

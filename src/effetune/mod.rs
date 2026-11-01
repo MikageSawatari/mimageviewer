@@ -11,16 +11,18 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use serde_json::Value;
 
-use crate::video::dsp::{DspBridge, GuiFailure, GuiOwnerPolicy, LatencyPolicy};
+use crate::video::dsp::{DspBridge, GuiFailure};
 
 pub(crate) mod bundle_location;
 pub mod composition;
 pub(crate) mod gui_gate;
+pub(crate) mod migration;
 pub(crate) mod now_playing;
+pub(crate) mod startup;
 mod window;
 pub(crate) use now_playing::{NowPlayingArtworkSource, NowPlayingInput, NowPlayingOwner};
 
-const BUNDLE_NAME: &str = "EffeTune Mixwright.vst3";
+const BUNDLE_NAME: &str = crate::miv_sound_config::BUNDLE_NAME;
 const INITIAL_CAPTURE_WAIT: Duration = Duration::from_secs(6);
 const EXIT_FENCE: Duration = Duration::from_secs(2);
 
@@ -100,6 +102,9 @@ pub enum EffetuneFailure {
 impl EffetuneFailure {
     pub(crate) fn user_reason(&self) -> &'static str {
         match self {
+            Self::LoadFailed(reason) if reason.contains("component initialize failed") => {
+                "mIV Sound の初期化に失敗しました (詳しくはログを確認してください)"
+            }
             Self::LoadFailed(_) => "読み込みに失敗しました",
             Self::RestoreFailed(_) => "保存した設定を復元できませんでした",
             Self::ProcessFailed(_) => "音声処理に失敗しました",
@@ -953,6 +958,7 @@ fn complete_load(
 }
 
 pub struct EffetuneController {
+    startup_gate: Arc<startup::HostStartupGate>,
     now_playing: now_playing::NowPlaying,
     auto_open: Arc<AutoOpenSession>,
     main_window: Arc<window::MainWindowObserver>,
@@ -984,6 +990,10 @@ fn wake_ui(context: &Mutex<Option<egui::Context>>) {
 
 impl EffetuneController {
     pub fn new() -> Self {
+        Self::new_with_startup_gate(startup::HostStartupGate::ready())
+    }
+
+    pub(crate) fn new_with_startup_gate(startup_gate: Arc<startup::HostStartupGate>) -> Self {
         let bundle = {
             let _memory = crate::perf::memory::span("effetune_bundle_resolve");
             #[cfg(all(windows, not(feature = "portable"), not(test)))]
@@ -1115,6 +1125,7 @@ impl EffetuneController {
                     .join("effetune")
                     .join("mixwright-state.json"),
             )),
+            startup_gate,
             pending_load: None,
             next_audio_generation: 0,
             pending_capture: None,
@@ -1350,7 +1361,10 @@ impl EffetuneController {
         pos: Option<(i32, i32)>,
         size: Option<(u32, u32)>,
     ) {
-        if !self.runtime.can_start_load() || self.pending_load.is_some() {
+        if !self.startup_gate.sound_allowed()
+            || !self.runtime.can_start_load()
+            || self.pending_load.is_some()
+        {
             return;
         }
         let retry = match &self.runtime {
@@ -1380,6 +1394,7 @@ impl EffetuneController {
             .join("mixwright-state.json");
         let (tx, rx) = mpsc::channel();
         self.pending_load = Some(rx);
+        let startup_gate = Arc::clone(&self.startup_gate);
         let spawn = std::thread::Builder::new()
             .name("effetune-load".into())
             .spawn(move || {
@@ -1427,6 +1442,7 @@ impl EffetuneController {
                         gui_failure_tx,
                         host_tx,
                         repaint_context.clone(),
+                        startup_gate,
                     )
                 });
                 let _ = tx.send(result);
@@ -1665,12 +1681,19 @@ fn send_latest_now_playing(
     core.start_artwork();
 }
 
+/// Migration and the child bridge must use the same absolute storage root,
+/// including when --data-dir itself is relative. Resolve on their workers;
+/// do not canonicalize, since the selected directory may not exist yet.
+fn sound_data_root(data_dir: &Path) -> Result<PathBuf, String> {
+    std::path::absolute(data_dir)
+        .map(|directory| directory.join("effetune"))
+        .map_err(|error| format!("sound data root: {error}"))
+}
+
+#[cfg(test)]
 pub(crate) fn new_bridge() -> Arc<DspBridge> {
-    DspBridge::new_with_gui_chrome(
-        GuiOwnerPolicy::Unowned,
-        LatencyPolicy::ReportOnly,
-        true,
-        false,
+    DspBridge::new_for_miv_sound(
+        sound_data_root(&crate::data_dir::get()).expect("absolute fixture sound data root"),
     )
 }
 
@@ -1684,6 +1707,7 @@ fn load_worker(
     gui_failure_tx: mpsc::Sender<GuiFailure>,
     host_tx: mpsc::Sender<HostCommand>,
     repaint_context: Arc<Mutex<Option<egui::Context>>>,
+    startup_gate: Arc<startup::HostStartupGate>,
 ) -> Result<Option<LoadDone>, EffetuneFailure> {
     let saved = match fs::read(path) {
         Ok(bytes) => Some(bytes),
@@ -1698,7 +1722,10 @@ fn load_worker(
             "saved state is empty".into(),
         ));
     }
-    let bridge = new_bridge();
+    let bridge = DspBridge::new_for_miv_sound_with_startup_gate(
+        sound_data_root(&crate::data_dir::get()).map_err(EffetuneFailure::LoadFailed)?,
+        startup_gate,
+    );
     bridge.set_gui_failure_sink(gui_failure_tx.clone());
     let gui_repaint = Arc::clone(&repaint_context);
     bridge.set_gui_result_wake(Arc::new(move || wake_ui(&gui_repaint)));
@@ -1775,6 +1802,31 @@ fn startup_state_requires_load(saved: Option<&[u8]>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sound_data_root_resolves_relative_data_dir_without_creating_it() {
+        // Like --data-dir, this path is intentionally relative. No global CWD
+        // or environment changes are needed, so parallel tests remain isolated.
+        let fixture = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let relative = PathBuf::from(fixture.path().file_name().unwrap()).join("new-profile");
+        let expected = fixture.path().join("new-profile").join("effetune");
+        assert!(!relative.is_absolute());
+        assert!(!expected.exists());
+        let actual = sound_data_root(&relative).unwrap();
+        assert!(actual.is_absolute());
+        assert_eq!(actual, expected);
+        assert!(!actual.exists());
+    }
+
+    #[test]
+    fn sound_data_root_preserves_an_absolute_data_dir() {
+        let fixture = tempfile::tempdir().unwrap();
+        let absolute = fixture.path().join("sound profile");
+        assert_eq!(
+            sound_data_root(&absolute).unwrap(),
+            absolute.join("effetune")
+        );
+    }
 
     #[cfg(not(feature = "portable"))]
     fn auto_test_controller() -> EffetuneController {

@@ -381,9 +381,9 @@ class GenerationTests(unittest.TestCase):
                 output.with_name('obsolete.html').write_bytes(b'extra')
                 self.assertEqual(run('--version', 'v0.12.0', '--check'), 1)
                 self.assertEqual(run('--version', 'v0.12.0'), 1)
-                vendor = root / 'vendor/effetune-mixwright'
+                vendor = root / 'config'
                 vendor.mkdir(parents=True)
-                (vendor / 'VERSION').write_text('v0.15.0\n', encoding='utf-8')
+                (vendor / 'miv-sound.rs').write_text('pub const DOCS_VERSION: &str = \"v0.15.0\";\n', encoding='utf-8')
                 self.assertEqual(run('--version', 'v0.12.0'), 0)
                 self.assertTrue((root / 'manual/effetune/v0.15.0/index.html').exists())
                 self.assertEqual(entry.read_bytes(), docs.entry_page('v0.15.0'))

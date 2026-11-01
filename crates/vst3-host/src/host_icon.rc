@@ -18,11 +18,11 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", "mImageViewer Project\0"
-            VALUE "FileDescription", "EffeTune (mImageViewer)\0"
+            VALUE "FileDescription", "mImageViewer audio host\0"
             VALUE "FileVersion", "0.0.0.0\0"
             VALUE "InternalName", "mimageviewer-vst3-host\0"
             VALUE "OriginalFilename", "mimageviewer-vst3-host.exe\0"
-            VALUE "ProductName", "EffeTune (mImageViewer)\0"
+            VALUE "ProductName", "mImageViewer audio host\0"
             VALUE "ProductVersion", "0.0.0.0\0"
         END
     END

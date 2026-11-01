@@ -73,6 +73,10 @@
 - MCP crate `pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked`
 - MCP crate `pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld`
 
+2026-11-01 設計担当の追確認: 上記4件はサンドボックス外では成功した。
+設計担当が `mimageviewer-mcp` 65件、本体 `agent_ipc` 146件の成功を確認している。
+これは設計担当による外部実行の報告であり、Codex がサンドボックス内で再現した結果とは区別する。
+
 機能本体の filter と共通 nextest 引数は `nextest-focused.json` に全文保存した。
 MCP / agent IPC の全lib、agent連携、settings_transfer、preferences、tag_ops、tag_write_worker、
 rating_db、collection_store、ui_request_dispatch、§1.679 / §1.680、type_icon、catalog_provider、
@@ -93,12 +97,16 @@ privacyのdiv対応も確認した。検証対象の `src/app.rs` / `src/setting
 ### 判断待ち・引き渡し
 
 同じ設定の意味、UI、永続スキーマ / migration に関する判断待ちはない。
-ファイル内容を解消しても index は未解決のまま（`UU`）であり、設計担当の git add と
-merge commit が必要。残る検証は、通常権限での実pipe 4件、release入力を準備できる
-状態でのlauncher込みworkspace gate、別途計画する実機確認である。Git Bashを使う
+この節のファイル編集の引き渡し時点では index は未解決（`UU`）で、git add と merge commit は
+設計担当へ引き渡した。その後の設計担当の merge commit は `e7d728213`（§2の基点）。
+実pipe 4件は設計担当のサンドボックス外での追確認により完了した。
+残る検証は、release入力を準備できる状態でのlauncher込みworkspace gate、別途計画する実機確認である。Git Bashを使う
 補助スクリプト2件の通常権限での再検査も残る。衝突解消上の判断待ちとは区別する。
 
-確認用 build は未起動。利用者が実行する場合のコマンドは次のとおり。
+以下の確認用 build と起動案内は MCP merge 時点の履歴であり、未起動。
+後続 merge が同じ `target/dev-runtime` を更新した後は、後続節の制約に従う。
+特に §2 の検査専用 Sound 入力を含む build の通常 profile 起動案内には使わない。
+MCP merge 時点の起動コマンドは次のとおり。
 
 ```powershell
 Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
@@ -110,3 +118,140 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 確認対象は「AI 連携」窓の許可 / 登録 / 読み取り / タグ・★・コレクション変更と、
 master 側の種類アイコン・短いクリック / ダブルクリック・コレクション再訪である。
 このmergeでは実機・サブPCでの確認を実施していない。
+
+## 2. claude/miv-sound-f1-a7147d の取り込み（2026-11-01〜02）
+
+- 作業先は引き続き `G:\home\mimageviewer-badge-1663` / `v5-integration`。
+- 取り込み前 HEAD: `e7d728213d0997efc544338d64760d8595d8b5fa`（前節の MCP merge）。
+- MERGE_HEAD / 取り込む tip: `62ebdd232b8a674e168cec405282dc636a13bdd9`。
+  件名: `Merge branch 'master' into claude/miv-sound-f1-a7147d`。
+- 設計担当が開始した merge のファイル編集だけを担当。git add / commit / merge / push、
+  製品起動、通常設定の変更、mIV Sound の配布承認は行わない。
+  検証担当・以下のローカル観測者は Codex 実装担当。全ビルドで `MSBUILDDISABLENODEREUSE=1`。
+- 派生版計画の F2a / F2b-1 の範囲を維持する。mIV の `effetune_*` 設定、状態ファイル名、
+  通知IDと保存形式を変えず、移行の終端結果を local / Remote 共通の起動 gate へ接続する。
+  未完了の F3 / F4 や旧版素材・実物 WebView2 の受け入れを、この merge だけで完了とはしない。
+
+### 衝突の解き方
+
+| ファイル | 解消内容 |
+| --- | --- |
+| `crates/launcher/Cargo.toml` | MCP を含む core → Remote → EPUB worker → MCP → launcher の5段階を保持し、音響調整の入力を `vendor/miv-sound` へ更新。 |
+| `docs/native-dependencies.md` | 3箇所。MCP adapter の同梱・存在検査と5段階を保持し、旧 Mixwright 固定ファイル数から mIV Sound の config / 承認 manifest・候補作成・明示承認の契約へ更新。 |
+| `docs/release-checklist.md` | 配布形態の表で MCP adapter と mIV Sound bundle を両方保持。取り込み側の承認・署名・公開前提も保持。 |
+| `docs/ui-snapshot-policy.md` | master §1.672 の実親移動の記録と mIV Sound の設定3枚・credit追加2枚を別段落で併存。§1.677 等の先行記録も保持。 |
+| `src/app/tests.rs` | `collection_thumb_1668` と Windows 限定 `audio_plugin_migration` を独立した module 宣言として両方保持。 |
+
+### 自動 merge の整合性確認
+
+- 引数・型・設定総数・起動 gate・Remote・runtime cleanup・build script の接続を確認した。
+  mIV Sound は設定フィールドを追加しておらず、前節の設定総数485件・除外330件・転送155件を維持する。
+- 初回の lib/test check は、未承認の `third_party/miv-sound/0.15.0-miv.1/` の通知が無く停止した。
+  初回 workspace check も同じ承認物の manifest 不足で停止。旧 Mixwright の通知や manifest を
+  新製品の承認物として代用せず、下記の検査専用入力で本体側の検証を進める。
+- §1.668 / §1.677 / §1.679 / §1.680 の既存機能・テストは保持。
+  衝突解消以外に新たな製品コード修正やスキーマ / migration 版番号の選択は行っていない。
+
+### ネイティブ入力の準備と制約
+
+- この worktree に VST3 SDK が無かったため、`G:\home\mimageviewer-everything-1664\vendor\vst3sdk`
+  から実ファイルをコピー（reparse point 共有なし）。CMake の VS 18 2026 / x64 / Release で
+  **現ソースを実コンパイルして host を再作成**し、再実行ログも保存した。古い host exe は流用しない。
+  `vst3-host-identity.ps1 -ValidateRepo` は成功。source identity は
+  `574446a13fa6faf50b3fc3e7d324867e6c75ba3de93f073fb16130c1e9f9ad89`。
+  host exe は1,201,152 bytes、SHA-256は
+  `91ecf527437ba1c59c3cc214dce6cd96f55640736e57d414c1e6840939ae799b`。
+  `sound-host-artifact.json` にも保存。後続の歌詞 merge で host が変わったら再ビルドが必要。
+- 指定の `build-miv-sound.ps1 -SourceRoot G:\home\miv-sound` は、ソース外 build tree への
+  書き込みがサンドボックスで拒否された（`sound-original.log`、exit 1）。
+- 同一ソース HEAD `f219c5604a95f0a209d39df1d7d431b73b5eb2e0` と submodule / SDK を
+  `target/miv-sound-source` へ実体コピーし、clean を確認して同スクリプトを再実行した。
+  CMake の compiler ABI detection / Ninja が10分以上無進捗となり、今回開始した process だけを
+  停止した（688.316秒、exit 1、`sound-local.log` / `sound-local-interruption.txt`）。
+  停止後の configure エラーを製品のテスト失敗には数えない。候補生成と ctest には未到達。
+- Rust 統合の検証を続けるため、元ソースの既存 `build/windows-release/VST3/Release/mIV Sound.vst3`
+  を **検査専用スナップショット**としてコピーした。ID:
+  `dcdfa79447071cc35bfb0dc81928271650fff543e5257275fe0d8c2812fa6d34`。
+  `target/v5-integration/prepare-sound-inspection.ps1` が artifact / VERSION の一覧と hash を記録し、
+  現行 `Read-MivSoundCandidate` で検査した。`candidate.json` は `inspection_only=true` と
+  原本の場所・コピー時の source HEAD・バイナリの由来未証明という注記を持つ。
+  この hash / PE / 通知存在の確認は、ソースとバイナリの対応・実際の版・再ビルド・ctest 成功を証明しない。
+  build contract / ctest 成功記録は作らず、承認処理はこの入力を明示拒否する。
+  `-Approve` は実行せず、vendor / third_party の配布承認物も作らない。
+- 下記の本体検証は `MIV_SOUND_CANDIDATE=<上記ID>` を用いる。
+  Rust の統合・UI・配置の証拠に限定し、mIV Sound 本体の再ビルド / 実物受け入れ / 配布 gate の
+  成功とは区別する。通常 profile の起動確認は行わない。
+
+### 検証結果
+
+ログ・各 command / exit / 経過秒の JSON は `target/v5-integration/sound-*`。
+検査対象の変更ソース33本の SHA-256 は `sound-source-hashes.json`。
+
+| 検査 | 結果 / ログ |
+| --- | --- |
+| `cargo fmt` / `cargo fmt --check` | exit 0 / 0、45.832秒 / 45.204秒。 |
+| `cargo check -p mimageviewer --lib --tests --features test-script` | 検査専用IDを指定して exit 0、393.161秒。`sound-check-lib-final.log`。初回の通知不足は `sound-check-lib.log`。 |
+| 関連 nextest（test-script） | 1,149件すべて成功、実行80.832秒（compile / lock待ち込み814.417秒）、exit 0。run `21f9994e-62e8-47be-97b3-ced647009534`、`sound-nextest.log` / `.json` / `sound-nextest-junit.xml`。 |
+| credit追加 nextest（test-script） | `test(miv_sound)` の1件成功（上の群とは重複なし）、実行2.511秒、compile / lock待ち込み754.763秒。run `aa2a5d22-a4d1-4a0f-b4f6-de26e7d764fc`、`sound-nextest-credits.log` / `.json` / `sound-nextest-credits-junit.xml`。本体共通helperのcredit画像2枚も比較。 |
+| `cargo test --test ui_snapshot` | 228件すべて成功、実行43.17秒、compile / lock待ち込み1016.698秒、exit 0。`sound-ui-snapshot.log` / `.json`。§1.175の例外停止は発生せず、補完不要。基準PNGの再生成・更新なし。 |
+| `cargo check --workspace --all-targets` | exit 101、978.807秒（lock待ち含む）。launcher が承認済み `third_party/miv-sound/0.15.0-miv.1/manifest.sha256` 不足で停止。検査専用IDはlauncherの承認を代用しない。`sound-workspace-final.log`。 |
+| `cargo check --workspace --all-targets --exclude mimageviewer-launcher` | exit 0、186.972秒。`sound-workspace-no-launcher.log`。通常featureの本体・workspace全targetの型検査に新たな食い違いなし。 |
+| `scripts/test-full.ps1 -SuppressCrashDialogs` | exit 101、957.391秒（lock待ち含む）。最初のworkspace nextestのcompile準備で同じ承認manifest不足。テスト実行・doctest・vendor段には進まず、full gateの成功とはしない。`sound-full-gate.log`。 |
+| VST3 CMake build / identity | exit 0 / 0。`sound-host-build.log` / `sound-host-identity.log`。 |
+| host のパス境界 ctest | 1件成功、exit 0。`sound-host-path.log`。inert DLL だけを使用し製品 host を起動しない。 |
+| 候補・配布・依存更新・dev build保護のスクリプト回帰 | すべて exit 0。`sound-candidate-tests` / `sound-distribution-tests` / `sound-dependency-tests` / `sound-dev-safety`。合成 fixture だけを使用。 |
+| マニュアル生成器 | 30件成功、exit 0。`sound-doc-tests.log`。 |
+| 移行検証ツールのオフライン検査 | 211項目 / 99項目成功、exit 0 / 0。`sound-probe-offline.log` / `sound-migration-probe-offline.log`。WebView2・製品は未起動。 |
+| UI glyph | 0件、exit 0。`sound-glyphs.log`。 |
+| dev build | `build-dev.ps1 -MivSoundCandidate dcdfa79447071cc35bfb0dc81928271650fff543e5257275fe0d8c2812fa6d34 -PreserveRuntime -WaitForOtherBuildsMinutes 0`、exit 0、286.453秒。通常featureのcore / Remote / EPUB worker / MCPを生成し、検査専用Sound入力を配置。PE検査は runtime=4 / pe=4 成功。`sound-build-dev.log` / `.json`、4本のhashは `sound-build-dev-artifacts.json`。未起動。 |
+
+nextest の filter と共通引数は `sound-nextest.json` に全文保存した。JUnit の実行件数を照合し、
+重複ありの領域別件数を `sound-test-coverage.json` に保存した。音響調整160件、移行App入口5件、
+DSP32件、Remote IPC536件、runtime cleanup22件、環境設定231件、設定転送35件を含む。
+master 側は catalog provider14件（§1.668）、種類icon16件（§1.677）、§1.679の22件、
+§1.680の35件が成功した。§1.668 の既存 ignored 性能ハーネスは実行していない。
+追加 credit 群を含む関連 nextest は計1,150件成功。新しいcredit基準2枚は今回も画像を開き、
+明暗の文字、狭幅での折り返しと全文の収まりを目視確認した。
+
+製品起動禁止に従い、`effetune_host_handler_tests` の3件は filter で除外し、未検証とする。
+テストの削除・ignore追加・期待値の緩和は行っていない。host の実プラグインロード、
+WebView2、実音声、通常profileの移行・実機・サブPC確認は今回実施していない。
+
+33本の変更ソースのhashは各検査・build後も一致し、検証中の製品コード変更はない。
+最終 `git diff --check` は exit 0、変更ファイルの衝突markerは0件。
+独立レビューは別contextの GPT-6.1 Sol / xhigh が読み取り専用で担当し、
+5衝突・自動merge近接経路・起動gate・build契約を確認。製品コードの未解決指摘なし。
+検証結果は実装担当の証拠を再利用した。文書の「実pipe4件が未完了」という古い記述を修正し、
+§1の起動案内を現在のSound buildへ適用しないことも追記した。
+
+### 判断待ち・引き渡し
+
+同じ設定・UI・永続形式・migration版番号について推測で決めた点や、未解決の判断待ちはない。
+ファイル内容は解消済みだが、index の5ファイルは `UU` のまま。
+設計担当が内容を確認して git add と merge commit を行う。Codex は git の書き込みを行っていない。
+
+残る検証は以下のとおり。衝突解消の判断待ちとは区別する。
+
+- サンドボックス外で正式な mIV Sound 候補をソースからビルドし、同じ候補の ctest を実行する。
+  今回の検査専用IDを承認へ進めず、正式候補で確認用buildを作り直す。
+- 配布承認・release埋め込み入力を用意できる段階で launcher 込みの workspace / full gate を通す。
+  今回は承認物を作らず、fullのdoctest・vendor段も未実施。
+- 製品起動を含むhost handler3件、実音声・WebView2と旧版素材の移行・本体/サブPCの確認は、
+  設計担当が別途計画する実機検証で扱う。後続の歌詞mergeではhostの再build / identity照合もやり直す。
+
+現在の `target/dev-runtime` は検査専用Sound入力を含み、通常profileでの起動を受け入れた候補ではない。
+この途中版は通常データでは起動しない（[派生版計画 §5.7](effetune-fork-plan.md#57-f2b-1-の実装と検証の入口)）。
+起動の承認・隔離データの規則は将来の確認にも必要であり、今回のbuild成功から起動許可は導かない。
+通常featureのcoreは引数なしでは `%APPDATA%\mimageviewer` の実設定・データを更新し得て、
+インストール版 / tray常駐版とsingle-instance mutexも共有する。
+正式候補を準備した後にユーザーが通常profileで実行する場合のコマンドは、リポジトリルートから次のとおり。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+通常profileで確認する場合は先にインストール版 / tray常駐版を終了する。
+隔離確認は同じexeへ `--data-dir .\target\dev-runtime\data` を渡す。
+確認対象は、音響調整の名称・credit、移行前後のlocal / Remoteの起動待ちとユーザーVST、
+MCP経由で開く操作との共存、masterのコレクションサムネイル・種類icon・クリック操作である。
+今回これらの製品起動は行っていない。

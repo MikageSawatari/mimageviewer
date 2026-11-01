@@ -8553,14 +8553,14 @@ pub(super) fn page_creative_lut(ui: &mut egui::Ui, state: &mut PreferencesState)
 pub(super) fn draw_effetune_input_limit_settings(ui: &mut egui::Ui, settings: &mut Settings) {
     #[cfg(not(feature = "portable"))]
     {
-        ui.label(egui::RichText::new("音響調整 (EffeTune)").strong());
+        ui.label(egui::RichText::new("音響調整 (mIV Sound)").strong());
         ui.checkbox(
             &mut settings.effetune_pre_limiter_enabled,
-            "EffeTune に渡す前に 0dB を超える音を抑える",
+            "mIV Sound に渡す前に 0dB を超える音を抑える",
         )
         .on_hover_text(
             "音量を全体的に下げず、0dB を超えるピークを抑えます。音の可視化だけでも OVERLOAD が出るのを防ぎます。\n\
-             EffeTune 内で音量を管理する場合は OFF にできます。出力の保護は常に有効です。\n\
+             mIV Sound 内で音量を管理する場合は OFF にできます。出力の保護は常に有効です。\n\
              OK を押すと再生中の音声にも反映します。リモート配信では先読み済みの音声の後から反映します。",
         );
     }
@@ -8915,7 +8915,7 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
             "再スキャン".to_string()
         };
         if ui
-            .add_enabled(!state.vst3_scan_in_progress, egui::Button::new(scan_label))
+            .add_enabled(!state.vst3_scan_in_progress && state.audio_plugin_startup.user_vst_allowed(), egui::Button::new(scan_label))
             .on_hover_text(
                 "%COMMONPROGRAMFILES%\\VST3\\ 等を再帰走査し、bridge subprocess で audio input/output を確認します",
             )

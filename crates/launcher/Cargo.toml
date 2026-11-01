@@ -22,7 +22,7 @@ rust-version.workspace = true
 #
 # ビルド前提: `target/release` の core / remote / EPUB worker / MCP を先にビルドする。
 # `scripts/build-release.{sh,ps1}` が core -> remote -> EPUB worker -> MCP -> launcher の順でビルドする。
-# EffeTune は vendor/effetune-mixwright または MIMV_EFFETUNE_DIR の完全なbundleを参照する。
+# EffeTune は vendor/miv-sound または MIMV_EFFETUNE_DIR の完全なbundleを参照する。
 
 [[bin]]
 name = "mimageviewer"

@@ -19,7 +19,8 @@ python scripts/test_gen_effetune_docs.py
 python scripts/gen-effetune-docs.py --version v0.15.0 --check
 ```
 
-`vendor/effetune-mixwright/VERSION` がある場合は、その値が `--version` より優先する。
+版の正本は `config/miv-sound.rs` の `DOCS_VERSION`。指定された `--version` よりも優先し、
+派生版の配布の版とは分ける。mIV Sound 用の本文・表記の作り替えは F3 で行う。
 スナップショットと同梱版の対応は `SOURCE.md` でも検証する。
 
 ## 出力とリンク

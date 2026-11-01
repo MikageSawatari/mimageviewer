@@ -81,16 +81,16 @@ int wmain(int argc, wchar_t** argv) {
     try {
         require(argc == 2); // CTest supplies the inert fixture's absolute path.
         const auto acp = GetACP();
-        const std::string text = u8R"(C:\Users\山田😀\音響調整\EffeTune Mixwright.vst3)";
-        const std::wstring wide = LR"(C:\Users\山田😀\音響調整\EffeTune Mixwright.vst3)";
+        const std::string text = u8R"(C:\Users\山田😀\音響調整\mIV Sound.vst3)";
+        const std::wstring wide = LR"(C:\Users\山田😀\音響調整\mIV Sound.vst3)";
         require(miv::utf8_to_utf16(text) == wide);
         require(miv::utf16_to_utf8(wide) == text);
         const auto binary = miv::bundle_binary_path(text, "x86_64-win");
-        require(binary.native() == LR"(\\?\)" + wide + LR"(\Contents\x86_64-win\EffeTune Mixwright.vst3)");
+        require(binary.native() == LR"(\\?\)" + wide + LR"(\Contents\x86_64-win\mIV Sound.vst3)");
         require(miv::loader_path_from_utf8(miv::path_to_utf8(binary)).native() ==
-            wide + LR"(\Contents\x86_64-win\EffeTune Mixwright.vst3)");
+            wide + LR"(\Contents\x86_64-win\mIV Sound.vst3)");
         require(miv::loader_path_from_utf8(text).native() == wide);
-        require(miv::loader_path_from_utf8(u8R"(C:/Users/山田😀/音響調整/EffeTune Mixwright.vst3)").native() == wide);
+        require(miv::loader_path_from_utf8(u8R"(C:/Users/山田😀/音響調整/mIV Sound.vst3)").native() == wide);
         require(miv::loader_path_from_utf8(u8R"(//?/C:/Users/山田/音響調整.vst3)").native() == LR"(C:\Users\山田\音響調整.vst3)");
         require(miv::loader_path_from_utf8(u8R"(//server/share/山田😀/音響調整.vst3)").native() == LR"(\\server\share\山田😀\音響調整.vst3)");
         require(miv::loader_path_from_utf8(u8R"(\\?\UNC\server\share\山田😀)").native() == LR"(\\server\share\山田😀)");
@@ -148,8 +148,8 @@ int wmain(int argc, wchar_t** argv) {
         require(miv::inspected_plugin_kind(false, std::make_error_code(std::errc::permission_denied)) == miv::PluginPathKind::Error);
         require(miv::inspected_plugin_kind(false, std::make_error_code(std::errc::filename_too_long)) == miv::PluginPathKind::Error);
 
-        const auto escaped = R"({"count":2,"nested":{"plugin_path":"wrong"},"plugin_path":"C:\\Users\\山田😀\\EffeTune Mixwright.vst3","state":"AA=="})";
-        require(miv::extract_json_string_field(escaped, "plugin_path") == u8R"(C:\Users\山田😀\EffeTune Mixwright.vst3)");
+        const auto escaped = R"({"count":2,"nested":{"plugin_path":"wrong"},"plugin_path":"C:\\Users\\山田😀\\mIV Sound.vst3","state":"AA=="})";
+        require(miv::extract_json_string_field(escaped, "plugin_path") == u8R"(C:\Users\山田😀\mIV Sound.vst3)");
         require(miv::extract_json_string_field(escaped, "state") == "AA==");
         require(miv::extract_json_string_field(R"({"plugin_path":"C:\\Users\\山田\\a\"b.vst3"})", "plugin_path") == u8R"(C:\Users\山田\a"b.vst3)");
         require(miv::extract_json_string_field(R"({"plugin_path":"\u5c71\u7530\ud83d\ude00"})", "plugin_path") == u8"山田😀");

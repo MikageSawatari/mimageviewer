@@ -315,12 +315,14 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
 - **署名順序 (include_bytes! のため「埋め込み前」に内側から署名)**:
   vendor 埋め込み対象 (pdfium / susie32 / vst3-host / FFmpeg 6 DLL / staging の EffeTune plugin PE) → core + remote + EPUB worker + MCP → launcher →
   setup.exe → portable の loose PE。この順を崩すと APPDATA 展開後のコピーが未署名になる。
-  EffeTune は `vendor/effetune-mixwright/` を target staging にコピーしてから全 PE を署名する
+  mIV Sound は `vendor/miv-sound/` を target staging にコピーしてから全 PE を署名する
   (plugin binary の `.vst3` も PE)。vendor 原本を変更せず、`MIMV_EFFETUNE_DIR` を staging に向け、
   `build-release.ps1` の launcher build と dependency gate が同じ署名済み実体を使う。
-  署名前に `third_party/effetune-mixwright/v0.14.0/manifest.sha256` の全463ファイル名・SHA256を照合し、署名後stageは有効な指定発行元署名と
+  署名前に `third_party/miv-sound/<ver>/manifest.sha256` の全ファイル名・SHA256を照合し、署名後stageは有効な指定発行元署名と
   PEのchecksum／証明書以外の一致を検査する。VERSIONと3通知原文も照合し、更新時は
-  `third_party/effetune-mixwright/<version>/` と about の include_str! を一体で更新する。
+  `third_party/miv-sound/<version>/` を明示承認で更新する。about の通知rootも同じ定義に従う。
+  同梱名・版・root の正本は `config/miv-sound.rs`。候補IDのビルド→確認→承認、ctest記録、
+  外部バックアップは [mIV Sound のビルド](miv-sound-build.md) を参照。配布ビルドでmanifestを作り直さない。
 - **`onnxruntime*.dll` と app-local VC runtime 4本は Microsoft 署名済みなので再署名しない**。
   `*.onnx` は PE でないので対象外。
 - `build-dist.ps1` は**署名を既定 ON** (`-NoSign` で回避)。実装は `scripts/sign-files.ps1`

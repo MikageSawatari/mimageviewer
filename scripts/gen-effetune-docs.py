@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Offline, deterministic Japanese EffeTune snapshot -> mIV manual.
 
-Usage: python scripts/gen-effetune-docs.py [snapshot] [--version v0.15.0] [--check]
-VERSION in vendor/effetune-mixwright takes precedence over --version.
+Usage: python scripts/gen-effetune-docs.py [snapshot] [--version VERSION] [--check]
+DOCS_VERSION in config/miv-sound.rs pins the pre-F3 public snapshot.
 Selection and post-conversion corrections live in docs/effetune-docs-overrides.
 Unpublished Markdown links become plain text; root-relative links go upstream.
 Plugin lists define category/plugin splits; corrections precede link remapping.
@@ -764,13 +764,15 @@ def updated_htaccess(data, version, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('snapshot', nargs='?', type=Path, default=DEFAULT_SOURCE)
-    parser.add_argument('--version', help='Bundled version, only if vendor VERSION is absent')
+    parser.add_argument('--version', help='Manual version, only if DOCS_VERSION is absent')
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
-    version_file = ROOT / 'vendor/effetune-mixwright/VERSION'
-    version = version_file.read_text(encoding='utf-8').strip() if version_file.is_file() else args.version
+    identity_file = ROOT / 'config/miv-sound.rs'
+    definition = identity_file.read_text(encoding='utf-8') if identity_file.is_file() else ''
+    pin = re.search(r'^pub const DOCS_VERSION: &str = "([^"\\]+)";$', definition, re.M)
+    version = pin[1] if pin else args.version
     if not version or not re.fullmatch(VERSION_PATTERN, version):
-        parser.error('A valid bundled version is required (vendor VERSION or --version)')
+        parser.error('A valid manual version is required (DOCS_VERSION or --version)')
     try:
         output = generate(args.snapshot.resolve(), version)
         htaccess = MANUAL.parent / '.htaccess'

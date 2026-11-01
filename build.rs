@@ -1,4 +1,89 @@
+#[path = "config/miv-sound.rs"]
+mod miv_sound_config;
+
 fn main() {
+    println!("cargo:rerun-if-changed=config/miv-sound.rs");
+    println!("cargo:rerun-if-env-changed=MIV_SOUND_CANDIDATE");
+    let root = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let notices = if let Some(id) = std::env::var_os("MIV_SOUND_CANDIDATE") {
+        let id = id.to_str().expect("candidate ID is ASCII");
+        assert!(
+            id.len() == 64
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "Invalid mIV Sound candidate ID"
+        );
+        let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+        let profile = out.ancestors().nth(3).and_then(|p| p.file_name()).unwrap();
+        assert!(
+            profile == "debug" || profile == "dev-runtime",
+            "Candidate inputs are only for development verification; release requires approval"
+        );
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let validator = root.join("scripts/miv-sound-candidate.ps1");
+            println!("cargo:rerun-if-changed={}", validator.display());
+            for helper in [
+                "scripts/effetune-distribution.ps1",
+                "scripts/miv-sound-config.ps1",
+                "scripts/sign-files.ps1",
+            ] {
+                println!("cargo:rerun-if-changed={}", root.join(helper).display());
+            }
+            println!(
+                "cargo:rerun-if-changed={}",
+                root.join("target/miv-sound-candidates").join(id).display()
+            );
+            let result = std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                ])
+                .arg(validator)
+                .arg("-ValidateCandidate")
+                .arg(id)
+                .arg("-WorkspaceRoot")
+                .arg(&root)
+                .creation_flags(0x08000000)
+                .output()
+                .expect("validate mIV Sound candidate");
+            assert!(
+                result.status.success(),
+                "mIV Sound candidate rejected: {}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        root.join("target/miv-sound-candidates")
+            .join(id)
+            .join("artifact")
+            .join(miv_sound_config::BUNDLE_NAME)
+    } else {
+        root.join(miv_sound_config::NOTICES_ROOT)
+            .join(miv_sound_config::VERSION)
+    };
+    if std::env::var_os("CARGO_FEATURE_PORTABLE").is_none() {
+        for notice in [
+            "Contents/Resources/THIRD-PARTY-NOTICES.txt",
+            "Contents/Resources/webview/THIRD-PARTY-NOTICES.txt",
+            "Contents/Resources/webview/plugins/dsp/NOTICE.txt",
+        ] {
+            assert!(
+                notices.join(notice).is_file(),
+                "mIV Sound notice missing: {}. Build/verify/approve a candidate with scripts/build-miv-sound.ps1, or use build-dev.ps1 -MivSoundCandidate <ID> for verification.",
+                notices.join(notice).display()
+            );
+        }
+    }
+    println!(
+        "cargo:rustc-env=MIV_SOUND_NOTICES_DIR={}",
+        notices.display()
+    );
     // vendor アセットのチェックと winresource 埋め込みは **Windows ターゲット**の
     // ビルドでのみ行う。CI (ubuntu) では `cargo check --bin mimageviewer-core
     // --features portable` を回して #[cfg(windows)] 宣言の unguarded 参照を検出する

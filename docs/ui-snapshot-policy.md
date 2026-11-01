@@ -38,6 +38,13 @@ folder controls／幅調整／address inputを使う純描画fixtureで、App・
 表示ON/OFF、360pt／1200ptでの入力欄の幅、メニューから表示へ反映、既定へのresetは
 headless UI／geometryテストで検査する。製品起動・実機確認とは区別する。
 
+mIV Sound F2a の名称変更では `preferences_effetune_input_limit_dark` と
+`preferences_effetune_auto_open_light`、`preferences_effetune_taskbar_narrow_dark` の3枚を更新し、
+文字以外の項目・配置を目視確認する。
+About の上流2本の著作権と credit は、本体と共用する描画helperを使う
+`miv_sound_credits_light`（480×180）と `miv_sound_credits_narrow_dark`（280×180）で確認する。
+追加2枚は計40,255 bytes。狭幅の折り返し後にも全文が収まり、製品の起動や実データ操作は含まない。
+
 タグビューの付与時刻（§2.23）は lib の `tag_sort_choices_dark`（320×240）の1枚で、
 本体共通の専用3択（正式名・選択中表示）、列ヘッダソート中の無効な短名ボタン、
 「タグ付与時刻」列の見出しと日時表示を保持する。App・DB・実ウィンドウを起動しない純描画fixtureを使う。

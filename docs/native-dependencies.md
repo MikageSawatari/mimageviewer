@@ -33,6 +33,12 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
 
 ### bootstrap で取れないもの
 
+- **`vendor/miv-sound/`**: 上流の無改変配布物を取得して代用しない。
+  `scripts/build-miv-sound.ps1` による候補のビルド→確認→明示承認、または承認済みの
+  `C:\home\mimageviewer_vendor_backup\miv-sound-<ver>\artifact\` から実体を戻す。
+  固定値は `config/miv-sound.rs`、検査用manifestと通知は `third_party/miv-sound/<ver>/`。
+  詳細は [mIV Sound のビルド](miv-sound-build.md)。
+
 - **`vendor/vst3-host/mimageviewer-vst3-host.exe`**: VST3 SDK の DL が ~490 MB と
   大きいので bootstrap には含めていない。以下のいずれかで配置する:
   - **既存ビルド済み exe をコピー** (推奨): 別 worktree やバックアップに残っている
@@ -226,7 +232,7 @@ HEVC / AV1 を再生する) のために、FFmpeg の **LGPL shared build** を 
 直接の本体には適用できない (ローダの解決タイミングに間に合わない)。`/DELAYLOAD` も
 rustc 経由の link.exe で機能しない (Delay Import Directory が空のまま、原因未解明)。
 
-そこで **launcher が core・remote service・EPUB converter・MCP adapter・FFmpeg DLL・VC runtime・EffeTune Mixwright bundle を内包する構成**で「単体 exe 配布」を実現している:
+そこで **launcher が core・remote service・EPUB converter・MCP adapter・FFmpeg DLL・VC runtime・mIV Sound bundle を内包する構成**で「単体 exe 配布」を実現している:
 
 ```
 配布する mimageviewer.exe (= ランチャー、crates/launcher/ が生成)
@@ -235,7 +241,7 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 │   ├── mimageviewer-remote.exe (本体と remote-ipc protocol version を共有、Web UI 資産も内包)
 │   ├── mimageviewer-epub-pdf.exe (EPUB → PDF 変換器)
 │   ├── mimageviewer-mcp.exe     (AI 連携の stdio adapter、console subsystem / CRT 静的リンク)
-│   ├── effetune/EffeTune Mixwright.vst3/ (全469ファイル、v0.15.0。入力は別の VERSION と計470ファイル)
+│   ├── effetune/mIV Sound.vst3/ (全体を同梱。版と入力一覧は config/miv-sound.rs と承認 manifest が正本)
 │   ├── app-local VC runtime 4 DLL (Microsoft 署名を保持)
 │   ├── avcodec-61.dll
 │   ├── avformat-61.dll
@@ -288,9 +294,13 @@ release link 時に未解決になることがあるため、配布ビルドは�
 
 `cargo build --release` を直接打つ場合は ① → ② → ③ → ④ → ⑤ の順で 5 回打つこと。
 ランチャー側 build.rs が `target/release` の core / remote / EPUB worker / MCP の存在をチェックし、
-無ければ復旧手順付きで止まる。EffeTune も `vendor/effetune-mixwright/VERSION` と
-`EffeTune Mixwright.vst3/` を必須検証する。`MIMV_EFFETUNE_DIR` で staging root を指定できる。
-承認済み入力は `third_party/effetune-mixwright/v0.15.0/manifest.sha256` の全470エントリと照合する。
+無ければ復旧手順付きで止まる。音響調整も `vendor/miv-sound/VERSION` と
+`mIV Sound.vst3/` を必須検証する（固定値は `config/miv-sound.rs`）。`MIMV_EFFETUNE_DIR` で staging root を指定できる。
+承認済み入力は `third_party/miv-sound/<ver>/manifest.sha256` の全エントリと照合する。
+候補のビルド・検証・明示承認は [mIV Sound のビルド](miv-sound-build.md) を参照。
+`build-miv-sound.ps1 -Approve -Candidate <ID>` だけが通知・manifest・provenanceと vendor 原本を更新し、
+`C:\home\mimageviewer_vendor_backup\miv-sound-<ver>\` に承認物そのものを保存する。
+未コミット差分・submodule のずれはビルド前に拒否し、承認前に同じ候補の ctest 成功記録を要求する。
 配布署名時は build-dist.ps1 が bundle を target にコピーして PE を署名し、埋め込み元を指定する
 (vendor 原本は変更しない)。
 

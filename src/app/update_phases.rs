@@ -355,6 +355,8 @@ impl App {
 
     // Worker adoption can enter a UI-bound presentation continuation; see the ledger.
     pub(super) fn render_startup_workers(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        self.poll_audio_plugin_migration(ctx);
         #[cfg(test)]
         super::egui037_connection_tests::observe("startup_before", self, ctx);
         #[cfg(windows)]

@@ -19,6 +19,9 @@ function Assert-Equal {
     if ($Actual -cne $Expected) { throw "$Label expected [$Expected], got [$Actual]" }
 }
 
+Assert-Equal (Get-UpstreamTagComparison 'v0.15.0' '0.15.0') 'up to date' 'upstream tag normalization'
+Assert-Equal (Get-UpstreamTagComparison '0.15.0' 'v0.15.0') 'up to date' 'latest tag normalization'
+Assert-Equal (Get-UpstreamTagComparison 'v0.14.0' 'v0.15.0') 'versions differ; review before updating' 'upstream update'
 # Check the real manifest/record discovery before installing filesystem mocks.
 $sections = @(Get-TomlSections (Join-Path $repoRoot 'Cargo.toml'))
 $mimalloc = @(Get-LocalCrates $sections | Where-Object { $_.Name -eq 'libmimalloc-sys' })

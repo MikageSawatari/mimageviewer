@@ -1354,6 +1354,8 @@ pub(crate) struct PreferencesState {
     #[cfg(windows)]
     pub vst3_scan_in_progress: bool,
     #[cfg(windows)]
+    pub audio_plugin_startup: std::sync::Arc<crate::effetune::startup::HostStartupGate>,
+    #[cfg(windows)]
     pub vst3_scan_error: Option<String>,
     #[cfg(windows)]
     pub vst3_scan_done: usize,
@@ -1860,6 +1862,8 @@ impl PreferencesState {
             vst3_scan_rx: None,
             #[cfg(windows)]
             vst3_scan_in_progress: false,
+            #[cfg(windows)]
+            audio_plugin_startup: crate::effetune::startup::HostStartupGate::ready(),
             #[cfg(windows)]
             vst3_scan_error: None,
             #[cfg(windows)]
@@ -3286,6 +3290,10 @@ impl App {
             .default_size([720.0, 520.0])
             .show(ctx, |ui| {
                 let state = self.pref_state.as_mut().unwrap();
+                #[cfg(windows)]
+                {
+                    state.audio_plugin_startup = self.audio_plugin_migration.gate();
+                }
                 state.poll_external_tool_workers(ctx);
                 if state.ui_font_catalog_started {
                     state.poll_ui_font_tasks(ctx);
@@ -9314,7 +9322,7 @@ mod tests {
         harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
         harness.run();
         harness
-            .get_by_label("EffeTune に渡す前に 0dB を超える音を抑える")
+            .get_by_label("mIV Sound に渡す前に 0dB を超える音を抑える")
             .click();
         harness.run();
         assert!(

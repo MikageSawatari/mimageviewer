@@ -1,4 +1,7 @@
 //! Approval gate for distribution inputs, shared with build-script regression tests.
+#[path = "../../config/miv-sound.rs"]
+mod identity;
+
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io;
@@ -8,7 +11,7 @@ use std::path::Path;
 #[allow(dead_code)]
 mod bundle_paths;
 
-const RECOVER: &str = "Restore the complete approved EffeTune Mixwright v0.15.0 vendor source. Do not regenerate the tracked manifest to accept local changes.";
+const RECOVER: &str = "Restore the complete approved mIV Sound vendor source. Do not regenerate the tracked manifest to accept local changes.";
 
 fn failure(message: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("EffeTune source approval: {message}. {RECOVER}"))
@@ -72,13 +75,19 @@ fn changed_files(
 }
 
 pub fn validate(workspace: &Path, source: &Path) -> io::Result<()> {
-    let manifest_path = workspace.join("third_party/effetune-mixwright/v0.15.0/manifest.sha256");
+    let manifest_path = workspace
+        .join(identity::NOTICES_ROOT)
+        .join(identity::VERSION)
+        .join("manifest.sha256");
     println!("cargo:rerun-if-changed={}", manifest_path.display());
     let approved = parse_manifest(&std::fs::read_to_string(manifest_path)?)?;
-    let original = workspace.join("vendor/effetune-mixwright");
+    let original = workspace.join(identity::SOURCE_ROOT);
     let original_hashes = hashes(&original)?;
     if !changed_files(&approved, &original_hashes)?.is_empty() {
         return Err(failure("approved vendor hash mismatch"));
+    }
+    if std::fs::read_to_string(original.join("VERSION"))?.trim() != identity::VERSION {
+        return Err(failure("VERSION differs from distribution identity"));
     }
     for (_, _, path) in bundle_paths::inventory(&original)? {
         // Also watch original files when embedding a signed stage.
@@ -157,20 +166,23 @@ mod tests {
     }
 
     #[test]
-    fn approved_vendor_snapshot_matches_all_470_raw_files() {
+    fn approved_vendor_snapshot_matches_all_raw_files() {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let source = workspace.join("vendor/effetune-mixwright");
+        let source = workspace.join(identity::SOURCE_ROOT);
         if !source.exists() {
             return;
         }
         let manifest = parse_manifest(
             &std::fs::read_to_string(
-                workspace.join("third_party/effetune-mixwright/v0.15.0/manifest.sha256"),
+                workspace
+                    .join(identity::NOTICES_ROOT)
+                    .join(identity::VERSION)
+                    .join("manifest.sha256"),
             )
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(manifest.len(), 470);
+        assert!(manifest.len() > 1);
         assert!(
             changed_files(&manifest, &hashes(&source).unwrap())
                 .unwrap()

@@ -690,18 +690,25 @@ impl Bridge {
     where
         F: Fn(String) + Send + 'static,
     {
-        Self::spawn_with_gui_signal_wake(exe_path, stderr_cb, None)
+        Self::spawn_with_gui_signal_wake(
+            exe_path,
+            stderr_cb,
+            None,
+            &super::BridgeEnvironment::UserVst,
+        )
     }
 
     pub(crate) fn spawn_with_gui_signal_wake<F>(
         exe_path: &std::path::Path,
         stderr_cb: F,
         gui_signal_wake: Option<GuiSignalWake>,
+        environment: &super::BridgeEnvironment,
     ) -> std::io::Result<Self>
     where
         F: Fn(String) + Send + 'static,
     {
         let mut command = Command::new(exe_path);
+        environment.apply(&mut command);
         command
             .arg("--parent-pid")
             .arg(std::process::id().to_string());
@@ -1731,7 +1738,7 @@ mod concurrent_state_tests {
 
     #[test]
     fn probe_and_open_preserve_utf8_windows_paths_in_ipc() {
-        let path = r"C:\Users\山田😀\音響調整\EffeTune Mixwright.vst3";
+        let path = r"C:\Users\山田😀\音響調整\mIV Sound.vst3";
         let commands = [
             Cmd::Probe {
                 plugin_path: path.into(),
@@ -2017,15 +2024,38 @@ mod effetune_host_handler_tests {
 
     use std::os::windows::io::AsRawHandle;
 
-    fn host_and_bundle() -> Option<(Bridge, String)> {
+    struct HostFixture {
+        bridge: Bridge,
+        bundle: String,
+        // Keep the disposable profile until the host has shut down.
+        _data: tempfile::TempDir,
+    }
+
+    impl Drop for HostFixture {
+        fn drop(&mut self) {
+            // Allow the plugin to Close its WebView before the process exits.
+            let _ = self.bridge.shutdown();
+        }
+    }
+
+    fn host_and_bundle() -> Option<HostFixture> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let host = root.join("vendor/vst3-host/mimageviewer-vst3-host.exe");
-        let bundle = root.join("vendor/effetune-mixwright/EffeTune Mixwright.vst3");
+        let bundle = root
+            .join(crate::miv_sound_config::SOURCE_ROOT)
+            .join(crate::miv_sound_config::BUNDLE_NAME);
         if !host.is_file() || !bundle.is_dir() {
             eprintln!("EffeTune host handler fixture unavailable; skipping native case");
             return None;
         }
-        let bridge = Bridge::spawn(&host, |_| {}).unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let bridge = Bridge::spawn_with_gui_signal_wake(
+            &host,
+            |_| {},
+            None,
+            &crate::video::dsp::BridgeEnvironment::MivSound(data.path().join("effetune")),
+        )
+        .unwrap();
         bridge
             .send(&Cmd::Hello {
                 version: PROTOCOL_VERSION,
@@ -2039,14 +2069,19 @@ mod effetune_host_handler_tests {
                 version: PROTOCOL_VERSION
             }
         ));
-        Some((bridge, bundle.to_string_lossy().into_owned()))
+        Some(HostFixture {
+            bridge,
+            bundle: bundle.to_string_lossy().into_owned(),
+            _data: data,
+        })
     }
 
     #[test]
     fn native_stdout_eof_resolves_exit_code_on_capture_worker() {
-        let Some((bridge, _)) = host_and_bundle() else {
+        let Some(fixture) = host_and_bundle() else {
             return;
         };
+        let bridge = &fixture.bridge;
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         bridge
             .pending_state_queries
@@ -2074,9 +2109,10 @@ mod effetune_host_handler_tests {
 
     #[test]
     fn strict_open_handler_rejects_invalid_restore_without_loaded_event() {
-        let Some((mut bridge, bundle)) = host_and_bundle() else {
+        let Some(mut fixture) = host_and_bundle() else {
             return;
         };
+        let (bridge, bundle) = (&mut fixture.bridge, &fixture.bundle);
         bridge
             .open_audio_pipe(&bundle, 48_000, 480, Some("not-base64!"), true)
             .unwrap();
@@ -2097,9 +2133,10 @@ mod effetune_host_handler_tests {
 
     #[test]
     fn strict_add_handler_rejects_invalid_restore_and_keeps_first_plugin() {
-        let Some((mut bridge, bundle)) = host_and_bundle() else {
+        let Some(mut fixture) = host_and_bundle() else {
             return;
         };
+        let (bridge, bundle) = (&mut fixture.bridge, &fixture.bundle);
         bridge
             .open_audio_pipe(&bundle, 48_000, 480, None, true)
             .unwrap();

@@ -1,6 +1,7 @@
 # EffeTune staging helpers. Dot-source; no signing/building on import.
 param([string] $ValidateSource, [string] $WorkspaceRoot)
 . (Join-Path $PSScriptRoot 'sign-files.ps1')
+. (Join-Path $PSScriptRoot 'miv-sound-config.ps1')
 
 function Read-MivEffetuneManifest {
     param([string] $ManifestPath)
@@ -34,11 +35,11 @@ function Assert-MivEffetuneFileSet {
     $actual = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::Ordinal)
     foreach ($file in $files) {
         $name = $file.FullName.Substring($root.Length + 1).Replace('\', '/')
-        if (-not $Entries.ContainsKey($name)) { throw "[effetune] Extra unapproved file: $name. Restore the approved v0.15.0 source; do not regenerate the manifest to accept local changes." }
+        if (-not $Entries.ContainsKey($name)) { throw "[effetune] Extra unapproved file: $name. Restore the approved mIV Sound source; do not regenerate the manifest to accept local changes." }
         $actual.Add($name, $file.FullName)
     }
     foreach ($name in $Entries.Keys) {
-        if (-not $actual.ContainsKey($name)) { throw "[effetune] Missing approved file: $name. Restore the complete approved v0.15.0 source." }
+        if (-not $actual.ContainsKey($name)) { throw "[effetune] Missing approved file: $name. Restore the complete approved mIV Sound source." }
     }
     return ,$actual
 }
@@ -49,7 +50,7 @@ function Assert-MivEffetuneRawSource {
     $files = Assert-MivEffetuneFileSet -SourceRoot $SourceRoot -Entries $entries
     foreach ($name in $entries.Keys) {
         if ((Get-FileHash -LiteralPath $files[$name] -Algorithm SHA256).Hash.ToLowerInvariant() -ne $entries[$name]) {
-            throw "[effetune] Approved source hash mismatch: $name. Restore the approved v0.15.0 source; do not regenerate the manifest to accept local changes."
+            throw "[effetune] Approved source hash mismatch: $name. Restore the approved mIV Sound source; do not regenerate the manifest to accept local changes."
         }
     }
 }
@@ -91,8 +92,8 @@ function Assert-MivEffetuneSigningOnlyChange {
 
 function Assert-MivEffetuneStage {
     param([string] $RepoRoot, [string] $SourceRoot)
-    $approved = Join-Path $RepoRoot 'vendor\effetune-mixwright'
-    $manifest = Join-Path $RepoRoot 'third_party\effetune-mixwright\v0.15.0\manifest.sha256'
+    $approved = Join-Path $RepoRoot $MivSound.SOURCE_ROOT
+    $manifest = Join-Path $RepoRoot $MivSound.Manifest
     # A signed stage depends on the same verified original, never on an arbitrary
     # environment-provided source or on trusting a new manifest made from it.
     Assert-MivEffetuneRawSource -SourceRoot $approved -ManifestPath $manifest
@@ -120,19 +121,19 @@ function Assert-MivEffetuneStage {
 function Assert-MivEffetuneSource {
     param([string] $SourceRoot, [string] $NoticesRoot)
     $versionPath = Join-Path $SourceRoot 'VERSION'
-    $bundle = Join-Path $SourceRoot 'EffeTune Mixwright.vst3'
+    $bundle = Join-Path $SourceRoot $MivSound.BUNDLE_NAME
     if (-not (Test-Path -LiteralPath $versionPath -PathType Leaf) -or
         -not (Test-Path -LiteralPath $bundle -PathType Container)) {
-        throw "[effetune] Missing VERSION or bundle in $SourceRoot. Restore vendor/effetune-mixwright from the approved Mixwright release (see docs/effetune-integration-plan.md section 7)."
+        throw "[effetune] Missing VERSION or bundle in $SourceRoot. Build, verify and explicitly approve an mIV Sound candidate (docs/effetune-fork-plan.md section 7.3)."
     }
     $version = (Get-Content -LiteralPath $versionPath -Raw -Encoding UTF8).Trim()
-    if ($version -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$') {
+    if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$') {
         throw "[effetune] Invalid VERSION: $version"
     }
-    if ($version -ne 'v0.15.0') { throw '[effetune] Unsupported VERSION; restore approved v0.15.0' }
-    Assert-MivEffetuneRawSource -SourceRoot $SourceRoot -ManifestPath (Join-Path $NoticesRoot 'v0.15.0\manifest.sha256')
+    if ($version -ne $MivSound.VERSION) { throw "[effetune] Unsupported VERSION; expected $($MivSound.VERSION)" }
+    Assert-MivEffetuneRawSource -SourceRoot $SourceRoot -ManifestPath (Join-Path $NoticesRoot "$($MivSound.VERSION)/manifest.sha256")
     $null = @(Get-MivTreeFiles -Path $SourceRoot)
-    $plugin = Join-Path $bundle 'Contents\x86_64-win\EffeTune Mixwright.vst3'
+    $plugin = Join-Path $bundle ("Contents/x86_64-win/" + $MivSound.BUNDLE_NAME)
     if (-not (Test-Path -LiteralPath $plugin -PathType Leaf)) {
         throw "[effetune] Plugin PE missing from $bundle; restore the complete approved release."
     }
@@ -149,7 +150,7 @@ function Assert-MivEffetuneSource {
         $trackedNotice = Join-Path $tracked $relative
         if (-not (Test-Path -LiteralPath $sourceNotice -PathType Leaf) -or
             -not (Test-Path -LiteralPath $trackedNotice -PathType Leaf)) {
-            throw "[effetune] License notice missing: $relative. Update tracked third_party/effetune-mixwright/$version together with the vendor release."
+            throw "[effetune] License notice missing: $relative. Update tracked third_party/miv-sound/$version together with the vendor release."
         }
         if ((Get-FileHash -LiteralPath $sourceNotice -Algorithm SHA256).Hash -ne
             (Get-FileHash -LiteralPath $trackedNotice -Algorithm SHA256).Hash) {
@@ -176,15 +177,15 @@ function New-MivEffetuneStage {
             }
         }
     }
-    $source = Join-Path $repo 'vendor\effetune-mixwright'
-    $version = Assert-MivEffetuneSource -SourceRoot $source -NoticesRoot (Join-Path $repo 'third_party\effetune-mixwright')
+    $source = Join-Path $repo $MivSound.SOURCE_ROOT
+    $version = Assert-MivEffetuneSource -SourceRoot $source -NoticesRoot (Join-Path $repo $MivSound.NOTICES_ROOT)
     if (Test-Path -LiteralPath $stage) {
         $null = @(Get-MivTreeFiles -Path $stage)
         Remove-Item -LiteralPath $stage -Recurse -Force
     }
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $source 'VERSION') -Destination $stage
-    Copy-Item -LiteralPath (Join-Path $source 'EffeTune Mixwright.vst3') -Destination $stage -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $source $MivSound.BUNDLE_NAME) -Destination $stage -Recurse -Force
     Write-Host "[effetune] staged $version at $stage"
     return $stage
 }

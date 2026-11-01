@@ -21,6 +21,9 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[path = "../config/miv-sound.rs"]
+pub(crate) mod miv_sound_config;
+
 #[cfg(test)]
 mod diagnostic_entry_tests;
 mod diagnostic_time;
@@ -1164,6 +1167,15 @@ pub fn finish_gui_run(prepared: PreparedRunExit, session: &mut GuiRunSession) ->
 }
 
 pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
+    #[cfg(windows)]
+    match effetune::startup::handle_test_arguments() {
+        Ok(Some(code)) => exit_gui_startup(code, session),
+        Ok(None) => {}
+        Err(error) => {
+            write_to_parent_console(&format!("error: {error}\n"));
+            exit_gui_startup(1, session);
+        }
+    }
     miv_startup::init_process(
         miv_startup::Role::Core,
         env!("CARGO_PKG_VERSION"),
@@ -2384,6 +2396,10 @@ fn cli_flag_takes_value(flag: &str) -> bool {
             | "--gpu-test-fail-device"
             | "--test-script"
             | "--settings-override"
+            | "--miv-sound-migration-source"
+            | "--miv-sound-migration-checkpoints"
+            | "--miv-sound-migration-original-browser"
+            | "--miv-sound-migration-close-file"
             | "--window-size"
             | "--perf-log-path"
             | "--play-test"
@@ -2473,6 +2489,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn source_close_probe_values_never_become_startup_open_paths() {
+        let args = os_args(&[
+            "core.exe",
+            "--miv-sound-migrate-only",
+            "--miv-sound-migration-original-browser",
+            "1234",
+            "--miv-sound-migration-close-file",
+            "source.stop",
+        ]);
+        assert_eq!(parse_startup_open_path_arg_from(&args), None);
     }
 
     #[test]

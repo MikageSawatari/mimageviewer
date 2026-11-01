@@ -24,6 +24,7 @@ bench_thumbs.tsv
 /vendor/vst3-host
 /vendor/twemoji
 /vendor/effetune-mixwright
+/vendor/miv-sound
 /vendor/bench_baseline.json
 /crates/vst3-host/build
 /dev/

@@ -163,7 +163,7 @@ fn cleanup_effetune(
         || !active_name.is_some_and(bundle_location::valid_generation)
         || bundle
             .file_name()
-            .is_none_or(|name| name != "EffeTune Mixwright.vst3")
+            .is_none_or(|name| name != crate::miv_sound_config::BUNDLE_NAME)
     {
         return Err(io::Error::other(
             "unrecognized pinned EffeTune layout; keeping generations",
@@ -358,7 +358,11 @@ mod tests {
         tree(&current);
         let container = current.join("effetune");
         for generation in [ACTIVE, POINTER, OLD] {
-            tree(&container.join(generation).join("EffeTune Mixwright.vst3"));
+            tree(
+                &container
+                    .join(generation)
+                    .join(crate::miv_sound_config::BUNDLE_NAME),
+            );
         }
         fs::write(current.join(".effetune.lock"), b"").unwrap();
         fs::write(
@@ -366,7 +370,9 @@ mod tests {
             bundle_location::encode_pointer(POINTER).unwrap(),
         )
         .unwrap();
-        let bundle = container.join(ACTIVE).join("EffeTune Mixwright.vst3");
+        let bundle = container
+            .join(ACTIVE)
+            .join(crate::miv_sound_config::BUNDLE_NAME);
         (temp, runtime, bundle)
     }
 
@@ -417,7 +423,7 @@ mod tests {
             tree(&runtime.join("3.0.0"));
             cleanup(temp.path(), VERSION, None);
             assert!(!runtime.join("3.0.0").exists());
-            let loose = temp.path().join("dev/effetune/EffeTune Mixwright.vst3");
+            let loose = temp.path().join("dev/effetune/mIV Sound.vst3");
             tree(&loose);
             cleanup(temp.path(), VERSION, Some(&loose));
             assert!(bundle.exists());
@@ -450,7 +456,7 @@ mod tests {
             .unwrap();
             let reader_alias = container
                 .join("aaaaaaaaaaaa-ABC123")
-                .join("EffeTune Mixwright.vst3");
+                .join(crate::miv_sound_config::BUNDLE_NAME);
             cleanup(temp.path(), VERSION, Some(&reader_alias));
             assert!(bundle.exists());
             assert!(container.join(POINTER).exists());
@@ -564,7 +570,10 @@ mod tests {
             cleanup(temp.path(), VERSION, Some(&bundle));
             assert_eq!(fs::read(old.join("nested/asset")).unwrap(), b"asset");
             assert_eq!(
-                fs::read(generation.join("EffeTune Mixwright.vst3/nested/asset")).unwrap(),
+                fs::read(generation.join(
+                    std::path::Path::new(crate::miv_sound_config::BUNDLE_NAME).join("nested/asset")
+                ))
+                .unwrap(),
                 b"asset"
             );
             drop((version_reader, generation_reader));
@@ -620,7 +629,10 @@ mod tests {
             assert!(old.join("nested/asset").exists());
             assert!(
                 generation
-                    .join("EffeTune Mixwright.vst3/nested/asset")
+                    .join(
+                        std::path::Path::new(crate::miv_sound_config::BUNDLE_NAME)
+                            .join("nested/asset")
+                    )
                     .exists()
             );
             assert!(!old.join(runtime_locks::IN_USE).exists());
@@ -642,7 +654,10 @@ mod tests {
             });
             assert!(
                 generation
-                    .join("EffeTune Mixwright.vst3/nested/asset")
+                    .join(
+                        std::path::Path::new(crate::miv_sound_config::BUNDLE_NAME)
+                            .join("nested/asset")
+                    )
                     .exists()
             );
             assert!(!generation.join(runtime_locks::IN_USE).exists());
@@ -770,7 +785,9 @@ mod tests {
             let generation_lock = fs::OpenOptions::new()
                 .read(true)
                 .share_mode(1)
-                .open(locked_generation.join("EffeTune Mixwright.vst3/nested/asset"))
+                .open(locked_generation.join(
+                    std::path::Path::new(crate::miv_sound_config::BUNDLE_NAME).join("nested/asset"),
+                ))
                 .unwrap();
             cleanup(temp.path(), VERSION, Some(&bundle));
             assert!(old.exists());
