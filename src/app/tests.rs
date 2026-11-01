@@ -34138,10 +34138,7 @@ fn detached_bookmark_pdf_routes_without_replacing_main_bookmark_grid() {
         app.current_folder.as_deref(),
         Some(super::bookmark_view_synthetic_path().as_path())
     );
-    assert!(matches!(
-        app.bookmark_view_state,
-        Some(super::BookmarkViewState::Opening { .. })
-    ));
+    assert!(app.bookmark_view_state.is_none());
     assert!(app.bookmark_open_pending.is_none());
     app.with_active_viewer_context(|active| {
         assert!(
@@ -34262,6 +34259,33 @@ fn converted_bookmark_archive_enters_the_same_detached_book_context() {
     .expect("converted archive bookmark must own a detached reader context");
     #[cfg(all(windows, feature = "test-script"))]
     assert_eq!(app.test_script_folder_load_requests, before_loads);
+    assert!(app.bookmark_view_state.is_none());
+    assert!(!app.pending_return_to_parent.is_pending());
+    let main_before = (
+        app.items.clone(),
+        app.visible_indices.clone(),
+        app.selected,
+        app.grid_scroll.offset(),
+        app.current_folder.clone(),
+        app.items_generation,
+        app.folder_nav_history_snapshot(),
+    );
+    assert!(app.close_current_active_viewer_context(&egui::Context::default()));
+    assert_eq!(
+        (
+            app.items.clone(),
+            app.visible_indices.clone(),
+            app.selected,
+            app.grid_scroll.offset(),
+            app.current_folder.clone(),
+            app.items_generation,
+            app.folder_nav_history_snapshot(),
+        ),
+        main_before
+    );
+    assert!(app.bookmark_view_state.is_none());
+    assert!(app.bookmark_browser_pending.is_none());
+    assert!(!app.pending_return_to_parent.is_pending());
 }
 
 #[cfg(windows)]
@@ -34402,79 +34426,65 @@ fn detached_bookmark_image_folder_routes_without_replacing_main_bookmark_grid() 
 
 #[cfg(windows)]
 #[test]
-fn closed_bookmark_summary_read_folds_all_terminal_values() {
-    let target = crate::bookmark_browser::BookmarkViewReturnTarget::Book(PathBuf::from(
-        r"C:\Books\opened.pdf",
-    ));
-    let image_path = PathBuf::from(r"C:\Books\cover.jpg");
-    let media_path = PathBuf::from(r"C:\Books\track.flac");
-    let archive_source = PathBuf::from(r"C:\Books\source.zip");
-    let current_folder = PathBuf::from(r"C:\Books\expanded-cache");
+fn closed_bookmark_summary_retains_pdf_password_cleanup_only() {
     let mut closed = phase_c_support::setup_app();
-    closed.bookmark_view_state = Some(super::BookmarkViewState::Detached {
-        target: target.clone(),
-    });
-    closed.items = vec![
-        GridItem::Image(image_path),
-        GridItem::Audio(media_path.clone()),
-    ];
-    closed.selected = Some(1);
-    closed.archive_source_override = Some(archive_source.clone());
-    closed.current_folder = Some(current_folder.clone());
     closed.pdf_password_request = Some(super::PdfPasswordRequest::legacy(PathBuf::from(
         r"C:\Books\protected.pdf",
     )));
-
-    let summary = super::ClosedBookmarkSummary::read(ContextRef::mounted(&closed));
-
-    assert_eq!(summary.bookmark_target, Some(target.clone()));
-    assert_eq!(summary.selected_media_path, Some(media_path));
-    assert_eq!(summary.destination, Some(archive_source));
-    assert!(summary.had_pdf_password_request);
-
-    closed.selected = Some(0);
-    closed.archive_source_override = None;
+    assert!(
+        super::ClosedBookmarkSummary::read(ContextRef::mounted(&closed)).had_pdf_password_request
+    );
     closed.pdf_password_request = None;
-    let image_summary = super::ClosedBookmarkSummary::read(ContextRef::mounted(&closed));
-    assert_eq!(image_summary.bookmark_target, Some(target));
-    assert_eq!(image_summary.selected_media_path, None);
-    assert_eq!(image_summary.destination, Some(current_folder));
-    assert!(!image_summary.had_pdf_password_request);
+    assert!(
+        !super::ClosedBookmarkSummary::read(ContextRef::mounted(&closed)).had_pdf_password_request
+    );
 }
 
 #[cfg(windows)]
 #[test]
-fn detached_bookmark_book_close_restores_main_grid_even_after_page_navigation() {
+fn detached_bookmark_book_close_keeps_main_grid_after_page_navigation() {
     let mut app = phase_c_support::setup_app();
-    let container = PathBuf::from(r"C:\Books\volume.pdf");
+    let container = app.tmp.path().join("volume.zip");
+    std::fs::write(&container, []).unwrap();
     arm_detached_bookmark_book_open(
         &mut app,
         container.clone(),
-        crate::book_bookmarks::BookContainerKind::Pdf,
-        crate::book_bookmarks::PageIdentity::PdfPage(0),
+        crate::book_bookmarks::BookContainerKind::Zip,
+        crate::book_bookmarks::PageIdentity::ArchiveEntry("page.jpg".into()),
     );
-    let closed_window_id = app.allocate_detached_viewer_window_id();
-    let closed_context_id = app.build_window_context_for_test(closed_window_id, |closed| {
-        closed.bookmark_view_state = Some(super::BookmarkViewState::Detached {
-            target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(container),
-        });
-        closed.current_folder = Some(PathBuf::from(r"C:\Books\another-volume.pdf"));
-    });
-    let summary = app
-        .with_window_viewer_context(closed_window_id, |closed| {
-            super::ClosedBookmarkSummary::read(ContextRef::mounted(closed))
-        })
-        .expect("closed detached context");
-    app.retire_context(closed_context_id, "test_closed_bookmark_summary", |_| ())
-        .expect("retire closed detached context");
-    app.reconcile_closed_bookmark_detached_context(&summary);
-
+    let ctx = egui::Context::default();
+    assert_eq!(
+        app.open_bookmark_book_in_detached_context(
+            &ctx,
+            container,
+            crate::folder_tree::OpenablePathKind::File,
+        ),
+        DetachedBuild::Built(true)
+    );
+    let before = (
+        app.current_folder.clone(),
+        app.items_generation,
+        app.selected,
+        app.grid_scroll.offset(),
+    );
+    app.with_active_viewer_context(|reader| {
+        reader.current_folder = Some(PathBuf::from(r"C:\Books\another-volume.pdf"));
+    })
+    .unwrap();
+    assert!(app.close_current_active_viewer_context(&ctx));
+    assert_eq!(
+        (
+            app.current_folder.clone(),
+            app.items_generation,
+            app.selected,
+            app.grid_scroll.offset()
+        ),
+        before
+    );
     assert!(app.items_are_bookmark_view);
-    assert!(matches!(
-        app.bookmark_view_state,
-        Some(super::BookmarkViewState::Restoring { .. })
-    ));
-    assert!(app.bookmark_browser_pending.is_some());
+    assert!(app.bookmark_view_state.is_none());
+    assert!(app.bookmark_browser_pending.is_none());
+    assert!(!app.pending_return_to_parent.is_pending());
 }
 
 #[cfg(windows)]
@@ -34847,10 +34857,7 @@ fn detached_bookmark_media_keeps_main_grid_and_closes_in_one_request() {
             app.current_folder.as_deref(),
             Some(super::bookmark_view_synthetic_path().as_path())
         );
-        assert!(matches!(
-            app.bookmark_view_state,
-            Some(super::BookmarkViewState::Opening { .. })
-        ));
+        assert!(app.bookmark_view_state.is_none());
         assert!(app.bookmark_open_pending.is_none());
         assert_eq!(app.cell_tag_list(0), ["#detached-cache-test".to_string()]);
         assert!(app.metadata_cache.contains_key("main-grid-meta"));
@@ -34930,19 +34937,19 @@ fn detached_bookmark_media_keeps_main_grid_and_closes_in_one_request() {
             app.current_folder.as_deref(),
             Some(super::bookmark_view_synthetic_path().as_path())
         );
-        assert!(matches!(
-            app.bookmark_view_state,
-            Some(super::BookmarkViewState::Restoring { .. })
-        ));
-        assert!(app.bookmark_browser_pending.is_some());
+        assert!(app.bookmark_view_state.is_none());
+        assert!(app.bookmark_browser_pending.is_none());
+        assert!(!app.pending_return_to_parent.is_pending());
     }
 }
 
 #[cfg(windows)]
 #[test]
-fn detached_bookmark_media_navigation_returns_main_to_real_folder() {
+fn detached_bookmark_media_navigation_close_keeps_main_bookmark_grid() {
     let mut app = phase_c_support::setup_app();
-    let (media_dir, _, other) = begin_detached_bookmark_media_test(&mut app, false);
+    let (_, target, other) = begin_detached_bookmark_media_test(&mut app, false);
+    let generation = app.items_generation;
+    let scroll = app.grid_scroll.offset();
 
     app.with_active_viewer_context(|detached| {
         let other_idx = detached
@@ -34956,7 +34963,7 @@ fn detached_bookmark_media_navigation_returns_main_to_real_folder() {
         detached.selected = Some(other_idx);
         detached.handle_fullscreen_close_request();
         assert_eq!(detached.fullscreen_idx, None);
-        assert!(detached.bookmark_view_state.is_none());
+        assert!(matches!(detached.bookmark_view_state, Some(super::BookmarkViewState::Detached { .. })));
     })
     .expect("active detached context");
     assert!(
@@ -34973,17 +34980,17 @@ fn detached_bookmark_media_navigation_returns_main_to_real_folder() {
     );
 
     assert!(app.active_viewer_context_id().is_none());
-    assert!(!app.items_are_bookmark_view);
-    assert_eq!(app.current_folder.as_deref(), Some(media_dir.as_path()));
+    assert!(app.items_are_bookmark_view);
     assert_eq!(
-        app.selected
-            .and_then(|idx| app.items.get(idx))
-            .and_then(|item| match item {
-                GridItem::Video(path) => Some(path.as_path()),
-                _ => None,
-            }),
-        Some(other.as_path())
+        app.current_folder,
+        Some(super::bookmark_view_synthetic_path())
     );
+    assert_eq!(app.items_generation, generation);
+    assert_eq!(app.grid_scroll.offset(), scroll);
+    assert!(matches!(app.items.get(0), Some(GridItem::Video(path)) if path == &target));
+    assert_eq!(app.selected, Some(0));
+    assert!(!app.pending_return_to_parent.is_pending());
+    assert!(app.bookmark_browser_pending.is_none());
     assert!(app.bookmark_view_state.is_none());
 }
 
@@ -72424,7 +72431,7 @@ mod still_window_mode_key_tests {
 
     #[test]
     #[cfg(windows)]
-    fn detached_bookmark_page_terminals_close_the_opening_context() {
+    fn detached_bookmark_page_terminals_preserve_main_and_close_the_opening_context() {
         for page_timeout in [false, true] {
             let mut app = setup_app();
             let ctx = egui::Context::default();
@@ -72442,17 +72449,28 @@ mod still_window_mode_key_tests {
             app.image_metas = vec![None];
             app.visible_indices = vec![0];
             app.items_are_bookmark_view = true;
-            app.bookmark_view_state = Some(BookmarkViewState::Opening {
-                target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(container.clone()),
-                grid: BookmarkViewReturnGridState {
-                    row_keys: vec![(1, 1)],
-                    selected_key: Some((1, 1)),
-                    opened_key: Some((1, 1)),
-                    scroll_offset_y: 0.0,
-                },
-            });
+            app.selected = Some(0);
+            app.grid_scroll.set_position(135.0);
+            app.bookmark_view_state = None;
             let request_id = crate::bookmark_browser::BookmarkOpenRequestId(window_id);
             app.bookmark_open_request_seq = request_id.0;
+            let capture_main = |app: &App| {
+                (
+                    app.items.clone(),
+                    app.visible_indices.clone(),
+                    app.items_generation,
+                    app.current_folder.clone(),
+                    app.selected,
+                    app.grid_scroll.offset(),
+                    app.bookmark_view_state.clone(),
+                    app.folder_nav_history_snapshot(),
+                    format!("{:?}", app.top_level_grid_view.surface()),
+                    app.pending_return_to_parent.is_pending(),
+                    app.bookmark_browser_pending.is_some(),
+                    app.items_are_bookmark_view,
+                )
+            };
+            let main_before = capture_main(&app);
             let pending_container = container.clone();
             app.build_active_context_for_test(
                 Some(window_id),
@@ -72520,6 +72538,7 @@ mod still_window_mode_key_tests {
                 Some(DetachedWindowState::Closing),
                 "page timeout/missing must explicitly terminate before the first normal content render"
             );
+            assert_eq!(capture_main(&app), main_before);
 
             run_active_detached_frame_for_test(&mut app, &ctx);
             assert!(app.active_viewer_context_id().is_none());
@@ -72531,16 +72550,15 @@ mod still_window_mode_key_tests {
                 [GridItem::Image(path)] if path == &main_item
             ));
             assert!(app.items_are_bookmark_view);
-            assert!(matches!(
-                app.bookmark_view_state,
-                Some(BookmarkViewState::Restoring { .. })
-            ));
+            assert!(app.bookmark_view_state.is_none());
+            assert_eq!(app.bookmark_open_request_seq, request_id.0);
+            assert_eq!(capture_main(&app), main_before);
         }
     }
 
     #[test]
     #[cfg(windows)]
-    fn detached_media_bookmark_resolve_cancel_preserves_target_until_exact_retirement() {
+    fn detached_media_bookmark_resolve_cancel_preserves_main_and_target_until_exact_retirement() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let window_id = 507;
@@ -72575,10 +72593,24 @@ mod still_window_mode_key_tests {
         );
         assert_eq!(return_grid.row_keys, vec![(0, 2)]);
         assert_eq!(return_grid.selected_key, Some((0, 2)));
-        app.bookmark_view_state = Some(BookmarkViewState::Opening {
-            target: target.clone(),
-            grid: return_grid.clone(),
-        });
+        app.bookmark_view_state = None;
+        let capture_main = |app: &App| {
+            (
+                app.items.clone(),
+                app.visible_indices.clone(),
+                app.items_generation,
+                app.current_folder.clone(),
+                app.selected,
+                app.grid_scroll.offset(),
+                app.bookmark_view_state.clone(),
+                app.folder_nav_history_snapshot(),
+                format!("{:?}", app.top_level_grid_view.surface()),
+                app.pending_return_to_parent.is_pending(),
+                app.bookmark_browser_pending.is_some(),
+                app.items_are_bookmark_view,
+            )
+        };
+        let main_before_cancel = capture_main(&app);
         let pending_media = media.clone();
         let detached_target = target.clone();
         let retired_owner = app.build_active_context_for_test(
@@ -72626,6 +72658,8 @@ mod still_window_mode_key_tests {
         assert!(app.cancel_bookmark_open_request(request_id, "test_resolve_cancel"));
         assert!(resolver_cancel.load(std::sync::atomic::Ordering::Relaxed));
         assert!(app.startup_open_path_resolve_pending.is_none());
+        assert!(app.bookmark_view_state.is_none());
+        assert_eq!(capture_main(&app), main_before_cancel);
         app.with_active_viewer_context(|context| {
             assert!(context.bookmark_open_pending.is_none());
             assert!(context.items.is_empty());
@@ -72662,33 +72696,21 @@ mod still_window_mode_key_tests {
             "late resolver completion must not resurrect the retired shell"
         );
 
-        // The surviving main grid can change selection before the retirement consumer.
+        // Main may change its own selection while the canceled reader awaits retirement.
         app.selected = None;
+        let main_before_retirement = capture_main(&app);
         run_active_detached_frame_for_test(&mut app, &ctx);
         assert!(app.active_viewer_context_id().is_none());
         assert!(app.active_detached_session.is_none());
         assert!(app.with_viewer_context_ref(retired_owner, |_| ()).is_none());
-        // This is a root UI dispatch: update_active_viewer_context retires the child and
-        // invokes the existing main consumer in that same dispatch. Non-drawing Close's
-        // Terminal retention is covered separately by close_return_tests.
+        // This root dispatch retires only the exact canceled reader. It must not publish
+        // bookmark restoration or a main read-model refresh as a consequence of that close.
         assert_eq!(app.bookmark_open_request_seq, request_id.0);
         assert!(!app.pending_return_to_parent.is_pending());
-        let Some(BookmarkViewState::Restoring { grid }) = &app.bookmark_view_state else {
-            panic!(
-                "the same-dispatch main consumer must resume bookmark-grid restoration: state={:?}, return={:?}",
-                app.bookmark_view_state, app.pending_return_to_parent
-            );
-        };
-        let mut expected_grid = return_grid;
-        // Main selection can change before the delayed consumer; it is authoritative.
-        expected_grid.selected_key = None;
-        assert_eq!(grid, &expected_grid);
-        let restored = app.bookmark_view_state.clone();
+        assert!(app.bookmark_view_state.is_none());
+        assert_eq!(capture_main(&app), main_before_retirement);
         assert!(app.take_pending_return_to_parent_nav().is_none());
-        assert_eq!(
-            app.bookmark_view_state, restored,
-            "the same return cannot be consumed twice"
-        );
+        assert_eq!(capture_main(&app), main_before_retirement);
     }
 
     #[test]

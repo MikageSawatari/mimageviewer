@@ -199,7 +199,8 @@ fn section1473_context_mount_swap_and_retire_keep_complete_return_owners_separat
 }
 
 #[test]
-fn section1473_context_stash_and_materialized_fork_preserve_typed_returns() {
+fn section1473_context_stash_and_materialized_fork_preserve_typed_returns_without_main_close_authority()
+ {
     for rating in [false, true] {
         let mut app = setup_app();
         app.active_quick_folder_slot = None;
@@ -211,11 +212,15 @@ fn section1473_context_stash_and_materialized_fork_preserve_typed_returns() {
         let source_ticket = app.pdf_render_epoch.snapshot();
         let fork = app.fork_materialized_still_context(&pdf, 0);
         assert_eq!(returns(&app), expected);
+        assert_eq!(
+            format!("{:?}", app.close_return_origin()),
+            expected_close_origin
+        );
         let fork_ticket = app
             .with_viewer_context(fork, |owner| {
                 if rating {
-                    // The native Rating chain stays in main; the independent reader
-                    // inherits its immutable close recipe through the existing slot.
+                    // The native Rating chain stays in main. The independent reader
+                    // has no authority to publish a close return to main.
                     assert_eq!(
                         returns(owner),
                         Returns {
@@ -227,11 +232,8 @@ fn section1473_context_stash_and_materialized_fork_preserve_typed_returns() {
                 } else {
                     assert_eq!(returns(owner), expected);
                 }
-                assert_eq!(
-                    format!("{:?}", owner.close_return_origin()),
-                    expected_close_origin,
-                    "the inherited recipe includes the whole H2 → Rating → H1 → origin payload"
-                );
+                assert!(owner.close_return_origin().is_none());
+                assert!(!owner.pending_return_to_parent.is_pending());
                 assert!(owner.reading_history_root_exit_nav().is_none());
                 owner.pdf_render_epoch.snapshot()
             })
@@ -242,6 +244,10 @@ fn section1473_context_stash_and_materialized_fork_preserve_typed_returns() {
         assert!(fork_ticket.is_stale());
         assert!(!source_ticket.is_stale());
         assert_eq!(returns(&app), expected);
+        assert_eq!(
+            format!("{:?}", app.close_return_origin()),
+            expected_close_origin
+        );
 
         let previous_main = app.stash_mounted_and_start_fresh("section1473_return_owner_stash");
         assert_eq!(
@@ -254,6 +260,8 @@ fn section1473_context_stash_and_materialized_fork_preserve_typed_returns() {
         );
         app.with_viewer_context(previous_main, |owner| {
             assert_eq!(returns(owner), expected);
+            assert!(owner.close_return_origin().is_none());
+            assert!(!owner.pending_return_to_parent.is_pending());
             assert!(
                 owner
                     .pdf_render_epoch

@@ -1455,6 +1455,37 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-01 §1.670 A案の実装：独立readerのcloseはmain不変
+
+利用者決定（2026-11-01）により、第4.6版追加合意 (1) の**独立reader部分を廃止**する。
+main内閲覧・同じbundleのlinked F12・未分離のmain所有メディア窓の帰路は維持する。
+「独立」の判定は閉じる時点の実context所有であり、設定だけで通常メディアopenを分離しない。
+
+**設計段階で ClaudeCode と独立レビュー担当 (Sol xhigh) の双方が構造的修正であることに同意。**
+レビューP2の対象境界とmain側consumer撤去、P3のspec更新も設計担当の決定を反映した。
+実装後の独立レビューに関する合意記録は設計担当が追記する。
+
+触れた範囲は `close_return.rs` の帰還発行・終端捕捉、registryのbuild/forkの帰還情報非継承、
+`app.rs` のbookmark producerと独立closeのmain消費経路、`startup_ops.rs` の独立化完了時の帰還相関終了。
+viewport close共通経路のmain/linked捕捉と既存登録退役は維持し、identity/park/promote方策、
+detached述語、HWND生成、placement、RemoteAcquire/AppExitの失効経路を変更しない。
+`ClosedBookmarkSummary` はPDF password cleanup情報を保持する。loading成功install・close後のstale lease棄却も維持する。
+main/rootが非同期bookmark完了をpollするときも、採用判定はleaseが指すreaderのrequest ID/targetを読む。
+currentnessの参照先をmain表示状態から要求所有contextへ移し、現在投影中のBuildingはその投影から、
+他ownerはregistryのread-only ContextRefから読む。pending一致／従来Preparing fallbackとstale拒否は維持する。
+この補完も実装前に独立レビューで構造的修正へ同意され、Building維持の条件を反映した（検証はバックログに記録）。
+
+BA-7の根拠はmainの変更権を独立bundleへ複製したproducer境界にある。
+その複製とmainへの終端配送を消し、独立close内のmain Live/Terminal/pending消費も撤去した。
+不用になったViewing、bookmark refresh/media departure effect、帰還専用summary値・test helperを削除する。
+mainを保存し直して復元する案や全interleavingの調停を作らず、mainを変更しない所有契約へ単純化した。
+modal化／窓の閉鎖・再生成は不要であり、guard/delay/retry/一括reset/silent fallbackで症状を隠す変更ではない。
+利用者が承認した自動bookmark更新・media最終folder復帰・本の物理親復帰・独立内移動へのmain追従の廃止以外は維持する。
+まれな失敗は既定の割り切り（ログ＋通知）とし、回復機構を足さない。
+
+回帰・改めたテスト・検証結果の正本は `next-release-backlog.md` §1.670「実装記録」。
+以下のA〜D比較とB提案は採択前の履歴として保持する。
+
 ### 2026-11-01 §1.670 独立viewer終端とmain帰路の所有分離（設計案・合意待ち）
 
 設計本文・source入口表・代案・受入条件は

@@ -42,7 +42,7 @@ panic・backend再試行・依存ライブラリの保存ログ対象拡大は�
   元の本を選択・可視化する。画像フォルダ本は追加設定ON時が対象。Backspaceはページ一覧へ戻る。
   メイン全画面からF12で切り離した窓も同じ検索結果へ戻る。採用済み検索行の種類と本分類・論理sourceを照合し、
   本でない通常フォルダを拡張子だけで対象にしない。
-  「開いたとき、ページ一覧を表示」は維持する。独立viewerのcloseでmainが物理親へ移る既存挙動は変更しない（§1.664下の別項目）。
+  「開いたとき、ページ一覧を表示」は維持する。自前のbundleを持つ独立viewerのcloseはmainの一覧・選択・scroll・surface・bookmark状態・履歴を変更しない（§1.670）。main所有の未分離メディア窓とlinked F12は従来の帰路・選択復元を維持する。
 - 新しいSettings field/DB/schema/索引/Remote query endpoint/result共有は追加しない。
   query/result一覧を永続化・診断ログへ保存せず、通常open/tag/★/cacheの保存と既存F12 viewer機能は維持する。
   PDF prerequisiteは独立ACCEPT済み `4510346f5`（master `c1e66f589`）。Everything最新実装の独立レビュー、

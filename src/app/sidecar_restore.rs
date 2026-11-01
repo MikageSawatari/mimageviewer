@@ -5206,7 +5206,8 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn visibility_fresh_bookmark_media_index_failure_closes_only_its_published_owner() {
+    fn visibility_fresh_bookmark_media_index_failure_preserves_main_and_closes_only_its_published_owner()
+     {
         let mut app = crate::app::setup_app_for_test();
         app.settings.sidecar_backup_enabled = false;
         app.settings.tag_sidecar_backup_enabled = false;
@@ -5223,6 +5224,7 @@ mod tests {
         app.visible_indices = vec![0];
         app.items_are_bookmark_view = true;
         app.selected = Some(0);
+        app.grid_scroll.set_position(125.0);
         app.bookmark_open_request_seq = 1;
         app.bookmark_view_state = Some(crate::app::BookmarkViewState::Opening {
             target: crate::bookmark_browser::BookmarkViewReturnTarget::Media(media.clone()),
@@ -5264,6 +5266,24 @@ mod tests {
             .unwrap();
         let ctx = egui::Context::default();
         assert!(app.open_bookmark_media_in_detached_context(&ctx, &media, folder.clone(), true));
+        assert!(app.bookmark_view_state.is_none());
+        let capture_main = |app: &App| {
+            (
+                app.items.clone(),
+                app.visible_indices.clone(),
+                app.items_generation,
+                app.current_folder.clone(),
+                app.selected,
+                app.grid_scroll.offset(),
+                app.bookmark_view_state.clone(),
+                app.folder_nav_history_snapshot(),
+                format!("{:?}", app.top_level_grid_view.surface()),
+                app.pending_return_to_parent.is_pending(),
+                app.bookmark_browser_pending.is_some(),
+                app.items_are_bookmark_view,
+            )
+        };
+        let main_before = capture_main(&app);
         let target = app.active_viewer_context_id().unwrap();
         let window = app.viewer_context_window(target).unwrap();
         let cancel = app
@@ -5306,9 +5326,8 @@ mod tests {
         assert!(Arc::ptr_eq(&app.cancel_token, &main_cancel));
         assert!(!main_cancel.load(Ordering::Relaxed));
         assert!(Arc::ptr_eq(&app.page_identity_index, &main_index));
-        assert!(
-            matches!(app.bookmark_view_state, Some(crate::app::BookmarkViewState::Opening { ref target, .. }) if target.matches_loaded_container(&folder))
-        );
+        assert!(app.bookmark_view_state.is_none());
+        assert_eq!(capture_main(&app), main_before);
         app.with_viewer_context(sibling, |owner| {
             assert_eq!(owner.items, sibling_before.0);
             assert_eq!(owner.items_generation, sibling_before.1);
@@ -5322,6 +5341,7 @@ mod tests {
         app.retire_context(target, "failed_bookmark_fixture", |_| ())
             .unwrap();
         assert!(app.viewer_context_window(target).is_none());
+        assert_eq!(capture_main(&app), main_before);
     }
 
     #[test]
