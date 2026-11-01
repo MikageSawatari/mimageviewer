@@ -4883,3 +4883,36 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 - 独立した実装レビュー: 1 巡目 (`d659e09f3`) P2 1 件 (agent の要求の起こし先が子 viewport になり得る) と P3 1 件 (説明の列の
   両端揃え) → `1bf174a6e` で直した。2 巡目で追加の指摘なし、判定は「2-3 impl: accepted」。
 - 実機の未確認: 窓の表示、最小化・トレイ中のタグ・★の要求、登録。公開文書の下書きの後、サブ PC で段階 2 全体をもう一度確かめる。
+
+## 27. サブ PC での再確認 (依頼 3、2026-11-01)
+
+### 27.1 条件
+
+- 観測者: サブ PC 担当 (画面・mIV のログ・Codex の出力・プロセス一覧)。記録はメイン PC の
+  `C:\home\mimageviewer_subpc\mcp-stage2-r3\report\`。
+- ビルド: `1387e7c44` (段階 2-3 の検収後) のポータブル版。`--data-dir C:\miv-mcp-test3\data`。
+- AI アプリ: Codex CLI (npm 版、利用者が導入・サインイン)。サブ PC 担当が `codex.cmd exec` で英語の依頼文を送った
+  (exec の設定は approval: never / sandbox: read-only)。
+
+### 27.2 結果
+
+- 新しい窓: 「設定」メニューの「リモート接続…」の直下に「AI 連携…」。環境設定に AI 連携のページは無い。許可の範囲と縮小画像は
+  OK なしで残る。字間は自然。
+- Codex への登録: 書き換えは `[mcp_servers.mimageviewer]` の 4 行 (と空行) の追加だけ。`.mimageviewer.bak` は書き換え前と一致。
+  「登録を外す」の後の `config.toml` は書き換え前とハッシュが一致。
+- `default_tools_approval_mode = "approve"` の下で、tool の許可を求めて止まった段は無かった (§15.7 で未確認としていた点)。
+- 9 段すべて期待どおり。最小化中のタグの追加・削除で mIV は最小化のまま、前面の窓も変わらず、変更は反映された。
+  前面化の合図は「開く」の 1 回だけ。`get_item_info` は ZIP の中のフォルダ (`chapter2/`) を返した (kind folder・★4)。
+  「AI による変更」のタグの行は他の行と同じ書式。読み取りのみへ変えた直後の★の依頼は断られ、記録も増えなかった。
+- ログ: agent_ipc は全 22 行 (hello 1、miv_status 1)。permission_changed は接続中の変化だけ。panic なし。
+
+### 27.3 見つかった点
+
+1. **ChatGPT (Codex) のアプリを終了しても、Codex の常駐プロセス (`%USERPROFILE%\.codex\packages\app-server-daemon\...\codex.exe`、
+   `app-server --managed-daemon` 等) が残り、mIV が「動作中」と判定して登録を拒否する**。利用者の許可でプロセスを止めて続けた。
+   登録の後の `codex.cmd exec` 9 回では、この常駐プロセスは起動しなかった (npm 版の codex.exe が子として mcp.exe を起動し、
+   終了で消えた)。ChatGPT アプリの起動で常駐プロセスが起動するかは未確認。
+2. 環境設定の検索で「AI 連携」と入れると「一致する設定がありません」とだけ出て、移った先の案内が無い。
+3. 登録の確認の窓の内容に、ファイルには書かれない見出しだけの `[mcp_servers]` の行が出る (実際の差分と合わない)。
+4. 参考: 表の中で語の途中で折り返す (「リモート接 / 続」)。egui の日本語の折り返しの既存の挙動で、この窓だけの問題ではない。
+   確認の窓の後ろが薄く見えるのは modal の暗転で、問題ではない (スクリーンショット 09 で確認)。
