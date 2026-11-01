@@ -581,7 +581,7 @@ GitHub Release 公開後、各配布チャネルへ反映・申請する。**Vec
     - **③ 認定待ち**: 新規提出と同様 **約1〜3営業日**。合格でメール通知。年齢区分アンケートの回答が
       変わらなければ **IARC レーティングはそのまま引き継がれる** (mIV はローカルビューアなので通常不変)。
     - **確定値の控え** (変更なければ毎回同じ): Architecture=**x64** / Language=**ja** /
-      App type=**EXE** / Installer parameters=**`/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`** /
+      App type=**EXE** / Installer parameters=**`/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-`** (2026-11-01 に `/SP-` を追加。同じファイルを R2 の URL へ移しただけでは Partner Center が「変更なし」として検証を再実行できないため、動きの変わらない引数を足して検証をやり直した) /
       Installation successful=**0** / プライバシーURL=`https://mikage.to/mimageviewer/privacy.html`。
       Microsoft Store ID=**`XP8JLWDWV5LS01`**、公開ページ=`https://apps.microsoft.com/detail/xp8jlwdwv5ls01`。
       コード署名は build-dist.ps1 が実施済み (Phase 3 / 「code signing」)。詳細な経緯・ハマりどころは
