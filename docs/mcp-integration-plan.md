@@ -4082,3 +4082,14 @@ cargo test -p mimageviewer --test ui_snapshot
 `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
 通常 profile の実設定・データを更新し得る。確認対象は AI 連携ページの空の記録欄への検索ジャンプ、
 同名コレクションへの変更記録を展開/コピーした時の id/name、容量不足の重複入力の前後の所属表示。
+
+### 22.7 検収 (ClaudeCode、2026-11-01)
+
+- sandbox の外で ClaudeCode が実行 (`e644613fd` と同じ source): `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp --
+  --include-ignored` exit 0 (14/14、60/60)、core の実 pipe 2 件の nextest exit 0 (2/2)。
+- 新規 PNG 2 枚と、空の記録の表示で撮り直した 6 枚を ClaudeCode が目視 (明暗とも読める)。
+- 独立した実装レビュー 1 巡目 (`e644613fd`): P2 2 件 (容量不足の重複を記録で「登録済み」と書く、追加・外すの記録にコレクションの
+  id が無い)、P3 1 件 (記録が空の時に環境設定の検索の飛び先が無い)。設計書 §21.4 を `dee5e011f` で直し、実装を `228185d54` で
+  直した (§22.6)。生の tool 名を日本語の要約と並べる表示は、AI 側の呼び出しと照合できるので維持でよいという判定。
+- 2 巡目 (`228185d54`): 追加の指摘なし。判定は「2-1 impl: accepted」。
+- 実 AI アプリ・実 core での変更・画面の追従の確認は未実施 (段階 1 の実機確認とまとめて利用者に頼む)。
