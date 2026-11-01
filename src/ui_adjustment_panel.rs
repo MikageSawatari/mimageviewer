@@ -12887,24 +12887,25 @@ impl App {
             |pos| !panel.contains(pos) && !tools.contains(pos),
         );
         for input in inputs {
-            if matches!(
+            self.dispatch_canvas_gesture_input(
+                ctx,
                 input,
-                crate::app::canvas_gesture::CanvasPointerInput::Cancel
-            ) {
-                self.commit_local_adjust_pending_edits();
-                self.local_adjust_mask_lasso_points.clear();
-                self.local_adjust_mask_shape_drag_start = None;
-                self.local_adjust_mask_shape_drag_end = None;
-                continue;
-            }
-            // The final sample follows exactly the same update path as a move.
-            // Only after that update does the gesture complete and save once.
-            self.handle_local_adjust_canvas_pointer(
-                ctx, full_rect, transform, fs_idx, layer_idx, input,
+                |app, input| {
+                    // Update at the release coordinate before completing once.
+                    app.handle_local_adjust_canvas_pointer(
+                        ctx, full_rect, transform, fs_idx, layer_idx, input,
+                    );
+                    if input.released() {
+                        app.finish_local_adjust_canvas_gesture(ctx, fs_idx, layer_idx);
+                    }
+                },
+                |app| {
+                    app.commit_local_adjust_pending_edits();
+                    app.local_adjust_mask_lasso_points.clear();
+                    app.local_adjust_mask_shape_drag_start = None;
+                    app.local_adjust_mask_shape_drag_end = None;
+                },
             );
-            if input.released() {
-                self.finish_local_adjust_canvas_gesture(ctx, fs_idx, layer_idx);
-            }
         }
     }
 

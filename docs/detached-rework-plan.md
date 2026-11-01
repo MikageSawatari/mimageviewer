@@ -6948,6 +6948,12 @@ press/release と release 座標欠落を作る集約フラグ分岐を置き換
 headless 回帰・自動 gate・確認用 build の結果は [§1.679](next-release-backlog.md) の実装記録に集約する。
 製品起動・実デスクトップ入力・人の実操作での検証は行わない。
 
+独立レビュー P2 の追補では、同じ入力 owner の Cancel 配送を共通 dispatcher に集約し、
+Space パン／左右ドラッグズームも既存の終端経路へ通す。同 context・同 page の
+ツール／レイヤー変更も Cancel として終端するが、別 page／context へ旧 Cancel を配送しない。
+設計担当の修正依頼に実装担当も同意する所有境界の修正であり、detached の述語や窓の
+生成・移譲は変更しない。追補の独立レビューでも追加 P1／P2 指摘なし。
+
 既存 page-edit owner の再配置契約も維持する。同じ安定ページを表示し続ける reindex では
 gesture を継続し、単なる items 世代変更を入力の失効理由にしない。既存の実ページ交換前の
 finish/cancel と、兄弟 context の保留を終端しない規則は変更しない。

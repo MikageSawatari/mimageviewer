@@ -1394,26 +1394,19 @@ impl App {
             |pos| preview_owns_pointer || !panel.contains(pos),
         );
         for input in inputs {
-            if matches!(
+            self.dispatch_canvas_gesture_input(
+                ctx,
                 input,
-                crate::app::canvas_gesture::CanvasPointerInput::Cancel
-            ) {
-                self.conceal_last_paint_pos = None;
-                self.conceal_drag = None;
-                self.conceal_line_start = None;
-                self.conceal_line_end = None;
-                self.conceal_shape_drag_start = None;
-                self.conceal_shape_drag_end = None;
-                self.conceal_lasso_points.clear();
-                continue;
-            }
-            self.handle_conceal_canvas_pointer(ctx, transform, input);
-            // Observe the drawing owner before a same-pass release removes it.
-            // The panel uses this same preview-hold admission rule afterwards.
-            let drawing = self.conceal_drawing_in_progress();
-            let _ = self
-                .conceal_preview_hold
-                .merge(false, self.conceal_preview_active, drawing);
+                |app, input| {
+                    app.handle_conceal_canvas_pointer(ctx, transform, input);
+                    // Observe drawing before a same-pass release removes it.
+                    let drawing = app.conceal_drawing_in_progress();
+                    let _ =
+                        app.conceal_preview_hold
+                            .merge(false, app.conceal_preview_active, drawing);
+                },
+                Self::cancel_conceal_tool_operation,
+            );
         }
     }
 

@@ -1696,26 +1696,27 @@ impl App {
             |pos| preview_owns_pointer || !panel.contains(pos),
         );
         for input in inputs {
-            if matches!(
+            self.dispatch_canvas_gesture_input(
+                ctx,
                 input,
-                crate::app::canvas_gesture::CanvasPointerInput::Cancel
-            ) {
-                self.erase_last_paint_pos = None;
-                self.erase_drag = None;
-                self.erase_line_start = None;
-                self.erase_line_end = None;
-                self.erase_shape_drag_start = None;
-                self.erase_shape_drag_end = None;
-                self.erase_lasso_points.clear();
-                continue;
-            }
-            self.handle_erase_canvas_pointer(ctx, transform, input);
-            // Observe the drawing owner before a same-pass release removes it.
-            // The panel uses this same preview-hold admission rule afterwards.
-            let drawing = self.erase_drawing_in_progress();
-            let _ = self
-                .erase_preview_hold
-                .merge(false, self.erase_preview_active, drawing);
+                |app, input| {
+                    app.handle_erase_canvas_pointer(ctx, transform, input);
+                    // Observe drawing before a same-pass release removes it.
+                    let drawing = app.erase_drawing_in_progress();
+                    let _ = app
+                        .erase_preview_hold
+                        .merge(false, app.erase_preview_active, drawing);
+                },
+                |app| {
+                    app.erase_last_paint_pos = None;
+                    app.erase_drag = None;
+                    app.erase_line_start = None;
+                    app.erase_line_end = None;
+                    app.erase_shape_drag_start = None;
+                    app.erase_shape_drag_end = None;
+                    app.erase_lasso_points.clear();
+                },
+            );
         }
     }
 

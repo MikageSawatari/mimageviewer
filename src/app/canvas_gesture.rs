@@ -20,6 +20,37 @@ pub(crate) struct CanvasGestureScope {
 }
 
 impl App {
+    /// Every accepted primary gesture (drawing, Space pan or scrub zoom) has
+    /// the same cancellation boundary. Retire view manipulation through its
+    /// normal terminal path before the tool retires its document payload.
+    pub(crate) fn dispatch_canvas_gesture_input(
+        &mut self,
+        ctx: &egui::Context,
+        input: CanvasPointerInput,
+        handle: impl FnOnce(&mut Self, CanvasPointerInput),
+        cancel_edit: impl FnOnce(&mut Self),
+    ) {
+        if matches!(input, CanvasPointerInput::Cancel) {
+            // No final coordinate is invented. This also finishes overlay
+            // scrub zoom (including AwaitRelease), but not a middle-button or
+            // viewer-surface zoom owned by another input stream.
+            self.handle_overlay_space_pan_drag(
+                ctx,
+                false,
+                false,
+                egui::Pos2::ZERO,
+                false,
+                false,
+                false,
+                true,
+                None,
+            );
+            cancel_edit(self);
+        } else {
+            handle(self, input);
+        }
+    }
+
     pub(crate) fn canvas_gesture_scope(&self, idx: usize, tool: CanvasTool) -> CanvasGestureScope {
         CanvasGestureScope {
             context: self.projected_viewer_context_id(),
@@ -127,13 +158,21 @@ pub(crate) fn canvas_pointer_inputs(
         return Vec::new();
     }
     owner.frame = Some(frame);
+    let mut inputs = Vec::new();
     // A surviving page may acquire new item slots/generation while its document
     // owner reprojects the same draft. The stable page, not its old index or
     // items generation, owns the pointer gesture too.
-    if matches!(&owner.gesture, Gesture::Pressed { scope: old, .. } if old != &scope) {
+    if let Gesture::Pressed { scope: old, .. } = &owner.gesture
+        && old != &scope
+    {
+        // Tool/layer changes retire their document payload at the switch, but
+        // the same page's temporary view gesture must also receive its terminal
+        // input. Never deliver an old page/context's Cancel to a new document.
+        if old.context == scope.context && old.page == scope.page {
+            inputs.push(CanvasPointerInput::Cancel);
+        }
         owner.gesture = Gesture::Idle;
     }
-    let mut inputs = Vec::new();
     let events = front.canvas_events(ctx);
     let (raw_focused, mut modifiers, hover, down) = ctx.input(|i| {
         (
@@ -275,6 +314,58 @@ pub(crate) fn canvas_pointer_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section1679_scope_change_cancels_only_the_same_document_owner() {
+        for same_page in [true, false] {
+            let ctx = egui::Context::default();
+            let app = crate::app::setup_app_for_test();
+            let scope = app.canvas_gesture_scope(0, CanvasTool::Erase(EraseTool::Brush));
+            let pos = egui::pos2(10.0, 10.0);
+            let collect = |scope: CanvasGestureScope, events: Vec<egui::Event>| {
+                let mut inputs = Vec::new();
+                let _ = ctx
+                    .run_pass(
+                        egui::RawInput {
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            inputs = canvas_pointer_inputs(
+                                ctx,
+                                scope.clone(),
+                                Default::default(),
+                                true,
+                                |_| true,
+                            );
+                        },
+                    )
+                    .drop_without_applying_deltas();
+                inputs
+            };
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            assert!(collect(scope.clone(), vec![button(true)])[0].pressed());
+            let mut changed = scope;
+            changed.tool = CanvasTool::Erase(EraseTool::Rect);
+            if !same_page {
+                changed.page = Some("another-page".to_owned());
+            }
+            let inputs = collect(changed.clone(), vec![egui::Event::PointerMoved(pos)]);
+            assert_eq!(inputs.len(), 1);
+            assert_eq!(matches!(inputs[0], CanvasPointerInput::Cancel), same_page);
+            assert!(!inputs[0].primary_sample());
+            let inputs = collect(changed.clone(), vec![button(false)]);
+            assert!(!inputs.iter().any(|input| input.primary_sample()));
+            let inputs = collect(changed, vec![button(true), button(false)]);
+            assert!(inputs[0].pressed());
+            assert!(inputs.last().unwrap().released());
+        }
+    }
 
     #[test]
     fn section1679_mask_drag_preserves_hold_and_ordered_modifiers() {

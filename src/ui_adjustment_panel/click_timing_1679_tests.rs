@@ -792,6 +792,249 @@ fn section1679_cancel_does_not_commit_unfinished_shapes_or_restart_on_held_move(
     }
 }
 
+#[cfg(windows)]
+fn keyboard_frame(
+    app: &mut App,
+    ctx: &egui::Context,
+    transform: &DisplayedImageTransform,
+    canvas: Canvas,
+    time: f64,
+    events: Vec<egui::Event>,
+) {
+    let _ = ctx
+        .run_pass(
+            egui::RawInput {
+                screen_rect: Some(transform.viewport_rect),
+                time: Some(time),
+                events,
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                let _owner = app.keyboard_owner_for_pass(ctx);
+                match canvas {
+                    Canvas::Local => app.handle_local_adjust_canvas_input(
+                        ctx,
+                        transform.viewport_rect,
+                        transform,
+                        Default::default(),
+                    ),
+                    Canvas::Conceal => app.handle_conceal_paint(ctx, transform, Default::default()),
+                    Canvas::Erase => app.handle_erase_paint(ctx, transform, Default::default()),
+                }
+            },
+        )
+        .drop_without_applying_deltas();
+}
+
+#[cfg(windows)]
+fn set_canvas_space_hold(held: bool, scrub: bool) {
+    use crate::key_input::{SyntheticKeyCommand, SyntheticModifiers, SyntheticNavigationKey};
+    let now = std::time::Instant::now();
+    // Replace only the fake keyboard level; no native input is sent.
+    crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::cancel_all(now));
+    if held {
+        crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+            now,
+            SyntheticNavigationKey::Space,
+            SyntheticModifiers {
+                ctrl: scrub,
+                ..Default::default()
+            },
+        ));
+    }
+    crate::key_input::advance_test_synthetic_input(now);
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+enum CancelledGesture {
+    Drawing,
+    Pan,
+    Scrub,
+    ScrubAwaitRelease,
+}
+
+#[cfg(windows)]
+#[test]
+fn section1679_cancel_retires_drawing_pan_and_scrub_then_accepts_fresh_gestures() {
+    // KeyHold must pass the same App keyboard ownership gate as production.
+    use self::keyboard_frame as frame;
+    let _serial = crate::key_input::lock_test_input();
+    for canvas in [Canvas::Local, Canvas::Conceal, Canvas::Erase] {
+        for gesture in [
+            CancelledGesture::Drawing,
+            CancelledGesture::Pan,
+            CancelledGesture::Scrub,
+            CancelledGesture::ScrubAwaitRelease,
+        ] {
+            for terminal in [
+                Some(egui::Event::PointerGone),
+                Some(egui::Event::WindowFocused(false)),
+                None, // Tool change on the same page also retires the old gesture.
+            ] {
+                let ctx = egui::Context::default();
+                let (mut app, transform) = setup(&ctx);
+                prepare_canvas(&mut app, canvas, LocalAdjustMaskTool::Rect);
+                crate::key_input::arm_test_synthetic_input(0xE679, egui::ViewportId::ROOT);
+                let scrub = matches!(
+                    gesture,
+                    CancelledGesture::Scrub | CancelledGesture::ScrubAwaitRelease
+                );
+                set_canvas_space_hold(!matches!(gesture, CancelledGesture::Drawing), scrub);
+                let a = at(&transform, [0.4, 0.4]);
+                // Shape size is measured in source pixels, not screen points.
+                let drawing_end = at(&transform, [0.75, 0.75]);
+                let b = if matches!(gesture, CancelledGesture::Drawing) {
+                    drawing_end
+                } else {
+                    a + egui::vec2(40.0, 20.0)
+                };
+                frame(
+                    &mut app,
+                    &ctx,
+                    &transform,
+                    canvas,
+                    1.0,
+                    vec![button(a, true)],
+                );
+                frame(
+                    &mut app,
+                    &ctx,
+                    &transform,
+                    canvas,
+                    1.1,
+                    vec![egui::Event::PointerMoved(b)],
+                );
+                match gesture {
+                    CancelledGesture::Drawing => assert!(shapes(&app, canvas).is_empty()),
+                    CancelledGesture::Pan => {
+                        assert!(app.fs_pan_drag_start.is_some(), "{canvas:?}");
+                        assert_eq!(app.fs_pan, b - a, "{canvas:?}: pan must actually move");
+                    }
+                    CancelledGesture::Scrub | CancelledGesture::ScrubAwaitRelease => {
+                        assert!(app.fs_middle_zoom_drag.is_some(), "{canvas:?}");
+                        assert!(app.fs_zoom > 1.0, "{canvas:?}: scrub must actually zoom");
+                    }
+                }
+                if matches!(gesture, CancelledGesture::ScrubAwaitRelease) {
+                    set_canvas_space_hold(false, false);
+                    frame(&mut app, &ctx, &transform, canvas, 1.15, vec![]);
+                    assert!(
+                        app.fs_middle_zoom_drag.is_some(),
+                        "chord release retains primary ownership"
+                    );
+                }
+                let view = (app.fs_zoom, app.fs_pan);
+                if terminal.is_none() {
+                    app.local_adjust_mask_tool = LocalAdjustMaskTool::Ellipse;
+                    app.conceal_tool = crate::conceal::ConcealTool::Ellipse;
+                    app.erase_tool = crate::app::EraseTool::Ellipse;
+                }
+                frame(
+                    &mut app,
+                    &ctx,
+                    &transform,
+                    canvas,
+                    1.2,
+                    terminal.into_iter().collect(),
+                );
+                assert!(app.fs_pan_drag_start.is_none(), "{canvas:?} {gesture:?}");
+                assert!(app.fs_middle_zoom_drag.is_none(), "{canvas:?} {gesture:?}");
+                assert_eq!(
+                    (app.fs_zoom, app.fs_pan),
+                    view,
+                    "Cancel must preserve the last applied view"
+                );
+                assert!(shapes(&app, canvas).is_empty());
+                assert_eq!(undo_count(&app, canvas), 0);
+
+                // The owner is Idle: the late release must not be needed for
+                // cleanup. For Pan, Space stays held across Cancel and release.
+                frame(
+                    &mut app,
+                    &ctx,
+                    &transform,
+                    canvas,
+                    1.3,
+                    vec![egui::Event::WindowFocused(true), button(b, false)],
+                );
+                set_canvas_space_hold(true, false);
+                let c = at(&transform, [0.6, 0.6]);
+                let d = c + egui::vec2(12.0, 8.0);
+                frame(
+                    &mut app,
+                    &ctx,
+                    &transform,
+                    canvas,
+                    1.4,
+                    vec![button(c, true)],
+                );
+                assert_eq!(
+                    app.fs_pan, view.1,
+                    "{canvas:?} {gesture:?}: new press jumped"
+                );
+                assert_eq!(app.fs_pan_drag_start, Some((c, view.1)));
+                frame(
+                    &mut app,
+                    &ctx,
+                    &transform,
+                    canvas,
+                    1.5,
+                    vec![button(d, false)],
+                );
+                assert_eq!(
+                    app.fs_pan,
+                    view.1 + (d - c),
+                    "{canvas:?} {gesture:?}: stale pan origin"
+                );
+                assert!(app.fs_pan_drag_start.is_none());
+                assert!(app.fs_middle_zoom_drag.is_none());
+                assert!(shapes(&app, canvas).is_empty(), "pan must not draw");
+
+                // A fresh zoom must likewise capture a new pivot and starting view.
+                set_canvas_space_hold(true, true);
+                let zoom_before = app.fs_zoom;
+                frame(
+                    &mut app,
+                    &ctx,
+                    &transform,
+                    canvas,
+                    1.6,
+                    vec![button(c, true)],
+                );
+                assert_eq!(app.fs_zoom, zoom_before);
+                frame(
+                    &mut app,
+                    &ctx,
+                    &transform,
+                    canvas,
+                    1.7,
+                    vec![button(c + egui::vec2(100.0, 0.0), false)],
+                );
+                assert!((app.fs_zoom - zoom_before * 2.0).abs() < 1e-5);
+                assert!(app.fs_middle_zoom_drag.is_none());
+
+                set_canvas_space_hold(false, false);
+                frame(
+                    &mut app,
+                    &ctx,
+                    &transform,
+                    canvas,
+                    1.8,
+                    vec![button(a, true), button(drawing_end, false)],
+                );
+                assert_eq!(
+                    shapes(&app, canvas).len(),
+                    1,
+                    "{canvas:?} {gesture:?}: fresh drawing"
+                );
+                assert_eq!(undo_count(&app, canvas), 1);
+            }
+        }
+    }
+}
+
 #[test]
 fn section1679_discard_and_duplicate_dispatch_do_not_repeat_canvas_edits() {
     for canvas in [Canvas::Local, Canvas::Conceal, Canvas::Erase] {

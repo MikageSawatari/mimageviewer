@@ -966,6 +966,9 @@ press / move / release を配送順に消費し、page key・viewer context・
 既存の確定経路へ渡す。同じ pass の短いクリック・複数クリックも同じ契約で扱い、
 discard による再評価で編集を二重適用しない。同じページを表示し続ける一覧の再配置では、
 既存の page-edit owner と同じく gesture を継続し、items 世代だけで押下を失効させない。
+PointerGone／focus loss 等の Cancel は共通 dispatcher から編集 payload と一時的な
+Space パン／左右ドラッグズームへ配送する。ズームのキー解放後の primary release 待ちも
+同じ終端経路で畳み、最後に反映した表示位置・倍率は保持する。
 保存／Undo／下流 cache の経路は変えない。
 
 - `LinearGradient` / `RadialGradient`: 画像上ドラッグで開始/終了点または中心/半径を更新する。
