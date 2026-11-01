@@ -76,9 +76,13 @@ try {
         Assert-Policy ($preflight.Count -eq 1) 'missing output preflight'
         $statements = @($ast.EndBlock.Statements)
         Assert-Policy ($statements[0].Extent.Text -eq "`$ErrorActionPreference = 'Stop'") 'side effect before output preflight'
-        Assert-Policy ($statements[1].Extent.Text.Contains("'build-process-policy.ps1'")) 'policy import order changed'
-        Assert-Policy ($statements[2].Extent.Text -eq $preflight[0].Extent.Text) 'output preflight must precede all process/build/sign operations'
-        $prefix = ($statements[0..2] | ForEach-Object { $_.Extent.Text }) -join "`n"
+        Assert-Policy ($statements[1].Extent.Text.Contains("'build-output-safety.ps1'")) 'metadata guard import order changed'
+        Assert-Policy ($statements[2].Extent.Text.StartsWith('Assert-MivFixedCargoOutput')) 'metadata guard must precede all process/build/sign operations'
+        Assert-Policy ($statements[3].Extent.Text.Contains("'build-process-policy.ps1'")) 'policy import order changed'
+        Assert-Policy ($statements[4].Extent.Text -eq $preflight[0].Extent.Text) 'argument preflight must precede all process/build/sign operations'
+        # Metadata behavior is exercised with real disposable Cargo workspaces
+        # by test-build-output-safety.ps1. Execute only the CLI policy here.
+        $prefix = ($statements[@(0, 3, 4)] | ForEach-Object { $_.Extent.Text }) -join "`n"
         $prefix = $prefix.Replace('$PSScriptRoot', '$policyScriptRoot')
         if ($ast -eq $releaseAst) {
             foreach ($option in @('--target-dir', '--target', '--profile', '--out-dir', '--artifact-dir', '--config', '--message-format', '--unknown')) {
@@ -117,6 +121,7 @@ try {
     $portableStart = $portableSource.IndexOf('$portableTargetName =')
     $portableEnd = $portableSource.IndexOf('# ---------------------------------------------------------------------------', $portableStart)
     $portableSetup = $portableSource.Substring($portableStart, $portableEnd - $portableStart)
+    $portableSetup = $portableSetup.Replace('$PSScriptRoot', '$policyScriptRoot')
     & {
         foreach ($SmokeTestScript in @($true, $false)) {
             foreach ($SkipBuild in @($true, $false)) {
@@ -135,7 +140,7 @@ try {
     }, $true))
     Assert-Policy ($invokeDefinition.Count -eq 1) 'release Cargo wrapper missing'
     Invoke-Expression $invokeDefinition[0].Extent.Text
-    foreach ($name in @('mimageviewer-core', 'mimageviewer-remote', 'mimageviewer-epub-pdf', 'mimageviewer-mcp', 'mimageviewer')) {
+    foreach ($name in @('mimageviewer-core', 'mimageviewer-remote', 'mimageviewer-epub-pdf', 'mimageviewer-mcp', 'mimageviewer-musicvideo', 'mimageviewer')) {
         $expectedExecutable = Join-Path $releaseDir ($name + '.exe')
         foreach ($fresh in @($true, $false)) {
             $script:policyCargoMessages = @(@{ reason = 'compiler-artifact'; executable = $expectedExecutable; fresh = $fresh } | ConvertTo-Json -Compress)
@@ -365,7 +370,7 @@ function cargo { printf 'build:%s\n' "$*" >> "$MIV_POLICY_LOG"; }
         Assert-Policy ($definition.Count -eq 1) "manifest function missing: $functionName"
         Invoke-Expression $definition[0].Extent.Text
     }
-    $fixturePaths = @('core', 'remote', 'epub', 'mcp') | ForEach-Object {
+    $fixturePaths = @('core', 'remote', 'epub', 'mcp', 'editor') | ForEach-Object {
         $fixture = Join-Path $testRoot ($_.ToString() + '.exe')
         Set-Content -LiteralPath $fixture -Value $_ -Encoding ASCII
         $fixture

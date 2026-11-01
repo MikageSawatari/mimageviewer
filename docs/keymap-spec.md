@@ -253,6 +253,34 @@ target作成時に捕捉する。dispatchは保存したsourceをチェック集
 独立した非modal窓を開く。AI連携の許可・縮小画像・撮影位置は変更時に確定し、環境設定のOK/キャンセルから独立する。
 `KeyAction` は追加しないため、キーの参照ファイル `keymap.ini.default` には項目を足さない。
 
+## 音楽ビデオエディタの固定入力（P4f）
+
+正本は [music-video-export-plan.md](music-video-export-plan.md) D10「設定・入力」。
+2026-10-09 の利用者判断で、常用ツールではないエディタのキーのカスタマイズは当面実装しない。
+エディタは別 exe で、本体の `Settings.keymap` を共有せず、次のショートカットは
+`KeyAction` 外の固定入力とする。本体のキー割り当てを変更してもエディタには反映しない。
+
+| キー | エディタでの操作 |
+| --- | --- |
+| `Ctrl+Z` | プロジェクト編集を元に戻す |
+| `Ctrl+Y` | プロジェクト編集をやり直す |
+| `Ctrl+Shift+Z` | プロジェクト編集をやり直す |
+
+実装は `crates/musicvideo-ui/src/lib.rs` の `history_action_for_event` /
+`apply_history_shortcut`。修飾キーは完全一致、押下の初回だけで、文字入力・IME・入力復帰が
+キーを所有しているときはプロジェクト履歴へ渡さず入力欄へ任せる。
+確認画面・MP4 書き出しなどで入力が無効なときも発火しない
+（`EditorState::begin_frame_with_input_enabled`、エディタ `app.rs::process_editor_frame`）。
+保存・開く・再生・レイヤー削除への専用キーは実装されておらず、画面のボタンを使う。
+OS/テキスト欄のコピー・貼り付けや IME 確定等は上のアプリ操作一覧に含めない。
+
+本体の右クリック「音楽ビデオを作成」（`MenuCommand::CreateMusicVideo`）は、
+音声ファイル／音楽ビューに対するポインター操作の入口として追加したためキー割り当てを持たない。
+既存の右クリックメニューは keymap 対象外という方針に従い、新しい `KeyAction` は追加しない。
+`src/context_menu_model.rs::build_context_menu` と `src/ui_dialogs/context_menu.rs` の
+`MenuCommand::CreateMusicVideo` 分岐が、音声対象から `start_musicvideo_editor` へ渡す。
+利用者向けの一覧は [音楽ビデオの作成](../htdocs/mimageviewer/manual/music-video.html#shortcuts)。
+
 ## 構成のある本の表示キー（§1.242 B2）
 
 `FsViewSpread` / `FsViewLandscapeSplit`は閲覧方法だけを切り替える。既定キーなしでカスタム割当の対象。

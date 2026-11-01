@@ -45,6 +45,7 @@ pub mod ffmpeg_loader;
 mod frame_selection;
 #[cfg(windows)]
 pub mod gpu_renderer;
+pub mod mvexport;
 #[cfg(windows)]
 pub(crate) mod native_cursor;
 #[cfg(windows)]

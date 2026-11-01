@@ -10,8 +10,8 @@
 # Steps:
 #   1. complete Rust test gate (scripts\test-full.ps1)
 #   2. idle-health analyzer regression tests
-#   3. cargo clean release workspace + portable packages (including MCP)
-#   4. build-release.ps1   -> launcher + core + remote + EPUB worker + MCP
+#   3. cargo clean release workspace + portable packages (including MCP + editor)
+#   4. build-release.ps1   -> launcher + core + remote + EPUB worker + MCP + editor
 #   5. ISCC                -> installer\Output\mImageViewer_setup.exe
 #   6. build-portable.ps1  -> dist\mImageViewer_portable_v<ver>.zip (target-portable)
 #   7. inspect the final runtime/portable/installer PE closure
@@ -41,6 +41,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'build-output-safety.ps1')
+Assert-MivFixedCargoOutput
 . (Join-Path $PSScriptRoot 'build-process-policy.ps1')
 Assert-MivReleaseOutputContract
 $repoRoot = (Get-Location).Path
@@ -51,6 +53,11 @@ $releaseDir = Join-Path $workspaceTargetDir 'release'
 $portableTargetDir = Join-Path $repoRoot 'target-portable'
 . (Join-Path $scripts 'effetune-distribution.ps1')
 . (Join-Path $scripts 'vst3-host-identity.ps1')
+. (Join-Path $scripts 'musicvideo-build-safety.ps1')
+Assert-MivMusicvideoBuildOutputsIdle -OutputPaths @(
+    (Join-Path $workspaceTargetDir 'release\mimageviewer-musicvideo.exe'),
+    (Join-Path $portableTargetDir 'release\mimageviewer-musicvideo.exe')
+)
 if ($SkipVst3Bridge) { Assert-MivVst3HostIdentity -RepoRoot $repoRoot }
 # Fail before tests/clean if the complete release bundle or tracked licenses are
 # missing. build-release stages a fresh copy and signs its PE(s) before embedding.
@@ -169,20 +176,24 @@ Write-Host '[build-dist]       VST3 host source-identity regression tests'
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] VST3 host identity tests failed (exit {0})" -f $LASTEXITCODE) }
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-vst3-host-vcrt.ps1')
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] VST3 host CRT preflight tests failed (exit {0})" -f $LASTEXITCODE) }
+foreach ($testScript in @('test-build-dev-safety.ps1', 'test-release-build-safety.ps1', 'test-musicvideo-build-safety.ps1', 'test-build-output-safety.ps1')) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts $testScript)
+    if ($LASTEXITCODE -ne 0) { throw ("[build-dist] {0} failed (exit {1})" -f $testScript, $LASTEXITCODE) }
+}
 
 # --- 1. Clean the workspace package so the app is rebuilt from current source ---
 # NOTE: $ErrorActionPreference='Stop' does NOT stop on a native command's non-zero
 # exit in PowerShell 5.1, so check $LASTEXITCODE explicitly. A silently-failed
 # clean would let the build reuse a stale fingerprint -- the exact bug this script
 # exists to prevent.
-Write-Host "[build-dist] (3/7) cargo clean --release --target-dir target -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p mimageviewer-launcher"
-& cargo clean --release --target-dir $workspaceTargetDir -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p mimageviewer-launcher
+Write-Host "[build-dist] (3/7) cargo clean --release --target-dir target -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p musicvideo-editor -p mimageviewer-launcher"
+& cargo clean --release --target-dir $workspaceTargetDir -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p musicvideo-editor -p mimageviewer-launcher
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] cargo clean (workspace) failed (exit {0})" -f $LASTEXITCODE) }
-Write-Host "[build-dist]       cargo clean --release --target-dir target-portable -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp"
-& cargo clean --release --target-dir $portableTargetDir -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp
+Write-Host "[build-dist]       cargo clean --release --target-dir target-portable -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p musicvideo-editor"
+& cargo clean --release --target-dir $portableTargetDir -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p musicvideo-editor
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] cargo clean (portable) failed (exit {0})" -f $LASTEXITCODE) }
 
-# --- 2. Core + remote + EPUB worker + MCP + launcher (fresh, since cleaned above) ---
+# --- 2. Core + remote + EPUB worker + MCP + editor + launcher (fresh, since cleaned above) ---
 $releaseArgs = @()
 if ($SkipVst3Bridge) { $releaseArgs += '-SkipVst3Bridge' }
 if ($sign) { $releaseArgs += '-Sign' }
@@ -233,6 +244,7 @@ $finalRuntimePe = @(
     (Join-Path $releaseDir 'mimageviewer-remote.exe'),
     (Join-Path $releaseDir 'mimageviewer-epub-pdf.exe'),
     (Join-Path $releaseDir 'mimageviewer-mcp.exe'),
+    (Join-Path $releaseDir 'mimageviewer-musicvideo.exe'),
     $portableDir,
     (Join-Path $repoRoot ("target/effetune-dist-source/" + $MivSound.BUNDLE_NAME))
 )

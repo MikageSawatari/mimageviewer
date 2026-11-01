@@ -584,6 +584,7 @@ impl App {
         self.poll_epub_batch_convert();
         self.poll_file_drop_pending();
         self.poll_external_tool_launch(ctx);
+        self.poll_musicvideo_launches(ctx);
         self.poll_new_folder_pending(ctx);
         self.poll_rename_pending(ctx);
         self.poll_file_organize(ctx);

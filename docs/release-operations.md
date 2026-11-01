@@ -61,11 +61,11 @@ VST3 SDK は `vX.Y.Z_build_N` の版・build 番号を比較して最大のタ�
 ## 1. 全体の位置づけ
 
 - **配布ビルドは `scripts/build-dist.ps1` 一発**。Rust 全体テスト → idle-health 解析テスト
-  → clean → core → remote → EPUB worker → MCP → launcher → ISCC (installer) → portable を 1 コマンドで実行し、
+  → clean → core → remote → EPUB worker → MCP → editor → launcher → ISCC (installer) → portable を 1 コマンドで実行し、
   テスト通過後に**ワークスペースパッケージを `cargo clean --release`**
   してから実コンパイルするので stale 出荷が構造的に起きない。署名は既定 ON。
 - **通常の開発反復とcore内Windows native挙動の実機確認は
-  `scripts/build-dev.ps1`** (core + remote + EPUB worker + MCP、軽量Cargo profile、通常のAPPDATA profile、
+  `scripts/build-dev.ps1`** (core + remote + EPUB worker + MCP + editor、軽量Cargo profile、通常のAPPDATA profile、
   launcher省略用FFmpeg DLLだけloose配置)。launcher／release最適化／埋め込みasset／
   変更したVST3 bridgeなどrelease構成依存の確認だけ `scripts/build-release.ps1` 単体を使う
   (cleanなし・署名は `-Sign` 指定時のみ)。**どちらも配布物の生成には使わない**。
@@ -108,15 +108,15 @@ launcher/MCP は image path がその build の出力 exe と一致するもの�
   portable core は専用 `target-portable` dir に分離済みで、非 portable core を上書きしない。
 - **診断用の手動復旧** (`build-release.ps1` が stale に見える原因を切り分ける場合のみ):
   - 「Compiling 行なしの数秒完了」を見たら疑う。**正常な full recompile は core で 3〜4 分**。
-  - `cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p mimageviewer-launcher`
-    してから 5 段ビルドし、
+  - `cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p musicvideo-editor -p mimageviewer-launcher`
+    してから 6 段ビルドし、
     現行ソースから再コンパイルできることを確認する。
   - **文字列 grep で stale 判定しない** (消えたはずの UI 文字列が別箇所に正規に残っていて
     誤判定する。過去に実際に踏んだ)。
-  - launcher の mtime > core / remote / EPUB worker / MCP の mtime はビルド順の参考にしかならず、内包物が現行ソース由来で
+  - launcher の mtime > core / remote / EPUB worker / MCP / editor の mtime はビルド順の参考にしかならず、内包物が現行ソース由来で
     あることの証明には使わない。
   - **この診断ビルドは出荷しない**。原因解消後、最終成果物は必ず `build-dist.ps1` を先頭から
-    実行して clean → core → remote → EPUB worker → MCP → launcher → installer → portable を作り直す。
+    実行して clean → core → remote → EPUB worker → MCP → editor → launcher → installer → portable を作り直す。
 
 ### 2.2 stderr trap — ビルドスクリプトに `*>&1` を付けない
 
@@ -125,9 +125,11 @@ launcher/MCP は image path がその build の出力 exe と一致するもの�
   stderr に書く最初の行が NativeCommandError として terminating 化し、**ビルドが即 exit 1
   で死ぬ**。
 - **回避**: (A) スクリプトを素で `& scripts\build-release.ps1` (パイプ/マージなし) で呼ぶ、
-  または (B) cargo 5 段を直接実行する。どちらも stderr をリダイレクトしない。
+  または (B) cargo 6 段を直接実行する。どちらも stderr をリダイレクトしない。
 
-### 2.3 5 段ビルドの正しいコマンド (順序不変: core → remote → EPUB worker → MCP → launcher)
+### 2.3 6 段ビルドの正しいコマンド (順序不変: core → remote → EPUB worker → MCP → editor → launcher)
+
+先頭の core／remote／EPUB worker／MCP／editor の release exe 5 本が launcher の build.rs の前提となる。
 
 署名時の補足: SimplySignログイン済みでも、制限された実行環境のsigntoolが
 `No certificates were found that met all the given criteria`で失敗する場合がある。
@@ -144,6 +146,8 @@ cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --feature
 cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf
 # MCP adapter (launcher が内包、console subsystem / CRT 静的リンク)
 cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp
+# 音楽ビデオエディタ (launcher が内包)
+cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo
 # ランチャー (bin "mimageviewer" は package "mimageviewer-launcher" 側にある)
 cargo build --release -p mimageviewer-launcher --bin mimageviewer
 ```
@@ -155,6 +159,11 @@ cargo build --release -p mimageviewer-launcher --bin mimageviewer
   (Cargo.toml で code-verified。CLAUDE.md「FFmpeg LGPL DLL 管理」節の build 順序記述も
   2026-07-16 にこの `-p` 付き形へ修正済み。)
 - VST3 ブリッジ (C++) を変えていなければ `build-dist.ps1 -SkipVst3Bridge` で cmake 再ビルドを省ける。
+- エディタを署名する場合は launcher 内包前に署名する。portable は `target-portable` で同じ製品 bin を
+  ビルドし、core の隣へ loose 同梱してから署名・zip 化する。通常／portable の clean と最終 PE gate にも
+  エディタを含める。インストーラの配置対象は launcher のままなので `.iss` の変更は不要。
+- エディタは未保存編集を持つため `Stop-Process` の対象にしない。出力先のエディタが稼働中なら保存・終了を
+  求めてビルドを中止する（`-PreserveRuntime` の有無に関係なく、portable のフォルダ置換も保護する）。
 
 ### 2.4 MCP の配布経路の検証 (担当者が sandbox 外で実行)
 
@@ -240,7 +249,7 @@ perf/idle検証および実アプリsmokeの実行前に適用する。必須検
 ### 3.1 全 PE と app-local VC runtime gate
 
 `build-dist.ps1` は installer と portable の生成後、DONE 表示前に
-`scripts/check-vcrt-pe-dependencies.ps1` を実行する。release の launcher / core / remote / EPUB worker / MCP、
+`scripts/check-vcrt-pe-dependencies.ps1` を実行する。release の launcher / core / remote / EPUB worker / MCP / editor、
 installer wrapper、portable directory 配下、および埋め込み元 PDFium / DirectML ORT / FFmpeg /
 Susie / VST host / EffeTune plugin PE (`.vst3` を含む) を検査対象にする。各 input の SHA-256、machine、linker version、direct imports は
 `target/vcrt-pe-reports/` の JSON に残る。
@@ -313,7 +322,7 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
   `-SkipVst3Bridge`／SDK欠落時は一致するvendor hostのみ再利用できる。APPDATA等からのcopy fallbackはない。
   一致しなければCMakeで再buildしSHA256／sizeを記録する。実host確認は承認済み手動検証へ分ける。
 - **署名順序 (include_bytes! のため「埋め込み前」に内側から署名)**:
-  vendor 埋め込み対象 (pdfium / susie32 / vst3-host / FFmpeg 6 DLL / staging の EffeTune plugin PE) → core + remote + EPUB worker + MCP → launcher →
+  vendor 埋め込み対象 (pdfium / susie32 / vst3-host / FFmpeg 6 DLL / staging の EffeTune plugin PE) → core + remote + EPUB worker + MCP + editor → launcher →
   setup.exe → portable の loose PE。この順を崩すと APPDATA 展開後のコピーが未署名になる。
   mIV Sound は `vendor/miv-sound/` を target staging にコピーしてから全 PE を署名する
   (plugin binary の `.vst3` も PE)。vendor 原本を変更せず、`MIMV_EFFETUNE_DIR` を staging に向け、

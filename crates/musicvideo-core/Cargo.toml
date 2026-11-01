@@ -1,0 +1,32 @@
+[package]
+name = "musicvideo-core"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+[lib]
+name = "musicvideo_core"
+path = "src/lib.rs"
+
+[features]
+# Headless measurement only; no counters/timers in normal application builds.
+text-measure = []
+
+[[example]]
+name = "t1_measure"
+required-features = ["text-measure"]
+
+[dependencies]
+# テキストは comic-core が所有する (docs/music-video-export-plan.md D4)。日本語シェーピング
+# (rustybuzz)・グリフラスタライズ・袋文字・影・グローが RGBA8 への焼き込みまで揃っており、
+# ここで別のフォントスタックを立てない。
+comic-core = { path = "../comic-core" }
+# スペクトラム解析は music-core をそのまま呼ぶ (D5: 既定は半音バンド + 等ラウドネス重み)。
+music-core = { path = "../music-core" }
+encoding_rs = "0.8"
+# フレーム合成のレイヤ内並列。
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

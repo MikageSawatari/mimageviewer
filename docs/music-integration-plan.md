@@ -529,6 +529,13 @@ cargo fmt / fmt --check、通常 / portable core check、glyph lint（危険glyp
   **HarmNet L の基音確率 × 既存の音量ゲート（Norm ゲイン反映）**で光る。上下端は中央の明るさに
   奇数倍音比／偶数倍音比を掛ける。倍音加点・局所正規化による間引きは使わず、色相と残光は維持する。
   `src/video/audio.rs` の playback ring buffer は窓幅不足のため使わない（§11）。
+- 2026-10-14 の音楽ビデオ branch との統合: 本体の鍵盤も `music-core::keyboard` の共有 animation / layout を使う。
+  `KeyboardCenterInput::FundamentalProbabilities` と `KeyboardBassInput::AbsoluteMidi` で本体の HarmNet 契約を
+  明示し、書き出しの既存 spectral-energy / pitch-class 契約は別の入力 variant で保持する。
+  配色は本体の選択済み `note_color` を共有 `key_fill_with_color` へ渡す。横長 spectrum は共有
+  `MivSpectrumState::adopt_analysis_at` を最新解析結果の採用時に1回呼び、同時刻の再解析も反映する。
+  描画は `frame()` の読み取りだけを行う。export の `frame_at` の同時刻 cache 規則は維持し、
+  結果の bands / notes / probabilities は同じ採用結果に属する。
 - 推論は 20ms hop で順に進め、160ms 先読みの head 3（age 8）を再生位置に対応させる。
   worker は PCM の `Arc::ptr_eq` と絶対フレーム番号で継続を判定し、別 PCM・後退・58 フレームを
   超える移動ではリセットして表示位置の約 1 秒前から助走する。曲全体の事前計算・保存はしない。

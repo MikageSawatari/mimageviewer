@@ -270,7 +270,7 @@ Rust (edition 2024、MSVC) + eframe / egui 0.37 (wgpu 30)。画像は `image` cr
 - `vendor/` は git 管理外。不足は `cargo build` のエラーが復旧手順付きで示す。エージェントは
   `bash scripts/bootstrap-vendor.sh` で揃える。`vendor/models/` と `vendor/vst3-host/` は再取得できないので、
   追加・再ビルドしたら `C:\home\mimageviewer_vendor_backup\` へ実ファイルでコピーし直す。
-- リリースビルドは core → remote → EPUB worker → MCP → launcher の順 (`scripts/build-release.ps1` が行う)。
+- リリースビルドは core → remote → EPUB worker → MCP → editor → launcher の順 (`scripts/build-release.ps1` が行う)。
   出力は `<repo>\target\release` に固定する。release wrapper は追加 Cargo 引数を allow-list で停止/build 前に検査し、
   各 build の Cargo artifact の出力先も照合する。環境変数・利用者の Cargo 設定で変わっても署名/内包へ進めない。
   launcher は `-p mimageviewer-launcher --bin mimageviewer` が必要。配布物は必ず `scripts/build-dist.ps1`。
@@ -344,17 +344,18 @@ cargo test -p mimageviewer --test <integration-test-name>
 
 ⚠️ **`test-full.ps1` は `target\release\mimageviewer-core.exe` と
 `target\release\mimageviewer-remote.exe`、`target\release\mimageviewer-epub-pdf.exe`、
-`target\release\mimageviewer-mcp.exe` の4本が既に在ることを前提にする**。`--workspace` が
+`target\release\mimageviewer-mcp.exe`、`target\release\mimageviewer-musicvideo.exe` の5本が既に在ることを前提にする**。`--workspace` が
 launcher package を含み、その build.rs が内包対象 exe の存在を検査するため、いずれかが
 無いと**テストが 1 件も走らないままビルドエラーで落ちる**。新しい clone や
-`cargo clean` 直後は、先に 4 本を作ってから走らせる (どちらでもよい):
+`cargo clean` 直後は、先に 5 本を作ってから走らせる (どちらでもよい):
 
 ```powershell
-.\scripts\build-release.ps1     # core -> remote -> EPUB worker -> MCP -> launcher を正しい順で作る
+.\scripts\build-release.ps1     # core -> remote -> EPUB worker -> MCP -> editor -> launcher を正しい順で作る
 cargo build --release --bin mimageviewer-core
 cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets
 cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf
 cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp
+cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo
 ```
 
 `build-dist.ps1` は test-full を `cargo clean` の**前**に回すので、直前のビルド成果物が

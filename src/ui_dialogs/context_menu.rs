@@ -1672,6 +1672,32 @@ impl crate::app::App {
             crate::native_context_menu::ShellClipboardVerb,
         ),
     {
+        self.dispatch_native_grid_context_command_with_launchers(
+            ctx,
+            command,
+            target,
+            invoke_shell_clipboard,
+            Self::start_musicvideo_editor,
+        )
+    }
+
+    fn dispatch_native_grid_context_command_with_launchers<F, G>(
+        &mut self,
+        ctx: &egui::Context,
+        command: MenuCommand,
+        target: &NativeGridContextMenuTarget,
+        invoke_shell_clipboard: F,
+        launch_musicvideo: G,
+    ) -> Option<ContextMenuAction>
+    where
+        F: FnOnce(
+            &mut Self,
+            &egui::Context,
+            &[PathBuf],
+            crate::native_context_menu::ShellClipboardVerb,
+        ),
+        G: FnOnce(&mut Self, &egui::Context, PathBuf),
+    {
         if self.image_folder_zip_operation.is_some() {
             return None;
         }
@@ -1929,6 +1955,15 @@ impl crate::app::App {
             MenuCommand::OpenFolderInExplorer => {
                 if let Some(folder) = target.explorer_folder.as_deref() {
                     open_directory_in_explorer(folder);
+                }
+                None
+            }
+            MenuCommand::CreateMusicVideo => {
+                if !target.is_folder_context
+                    && !target.has_checked
+                    && let GridItem::Audio(path) = &target.item
+                {
+                    launch_musicvideo(self, ctx, path.clone());
                 }
                 None
             }
@@ -3925,6 +3960,61 @@ mod raw_clipboard_tests {
 #[cfg(test)]
 mod delete_confirm_tests {
     use super::*;
+
+    #[test]
+    fn context_menu_musicvideo_dispatch_uses_launcher_seam_and_input_gate() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        for surface in [ContextMenuSurface::Grid, ContextMenuSurface::Fullscreen] {
+            for item in [
+                GridItem::Audio(PathBuf::from("relative song.mp3")),
+                GridItem::Video(PathBuf::from("movie.mp4")),
+            ] {
+                for (checked, folder) in [(false, false), (true, false), (false, true)] {
+                    let mut target = target(&app, item.clone(), surface);
+                    target.has_checked = checked;
+                    target.is_folder_context = folder;
+                    let mut launched = None;
+                    let action = app.dispatch_native_grid_context_command_with_launchers(
+                        &ctx,
+                        MenuCommand::CreateMusicVideo,
+                        &target,
+                        |_, _, _, _| panic!("must not invoke shell clipboard"),
+                        |_, _, audio| launched = Some(audio),
+                    );
+                    assert!(action.is_none());
+                    assert_eq!(
+                        launched.is_some(),
+                        matches!(item, GridItem::Audio(_)) && !checked && !folder
+                    );
+                    if let Some(path) = launched {
+                        assert_eq!(path, PathBuf::from("relative song.mp3"));
+                    }
+                }
+            }
+        }
+        let target = target(
+            &app,
+            GridItem::Audio(PathBuf::from("song.mp3")),
+            ContextMenuSurface::Grid,
+        );
+        let source = app.tmp.path().join("photos");
+        std::fs::create_dir(&source).unwrap();
+        app.start_image_folder_zip(&ctx, source, false);
+        assert!(!app.grid_item_input_allowed());
+        app.dispatch_native_grid_context_command_with_launchers(
+            &ctx,
+            MenuCommand::CreateMusicVideo,
+            &target,
+            |_, _, _, _| panic!("blocked"),
+            |_, _, _| panic!("blocked"),
+        );
+        assert!(app.musicvideo_launches.is_empty());
+        assert!(!native_menu_command_closes_fullscreen(
+            &MenuCommand::CreateMusicVideo,
+            ContextMenuSurface::Fullscreen
+        ));
+    }
 
     #[cfg(windows)]
     #[test]

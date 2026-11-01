@@ -8,7 +8,7 @@
 
 | 配布形態 | ファイル名 | 中身 / 性質 | data 保存先 | 管理者権限 |
 | --- | --- | --- | --- | --- |
-| **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + remote service + EPUB converter + MCP adapter + FFmpeg DLL + VC runtime + mIV Sound bundle を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
+| **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + remote service + EPUB converter + MCP adapter + music-video editor + FFmpeg DLL + VC runtime + mIV Sound bundle を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
 | **インストーラ版** | `mImageViewer_setup.exe` | Inno Setup 出力 | `%APPDATA%\mimageviewer` | **要 (UAC)** |
 | **ポータブル版** (v1.1.0 新) | `mImageViewer_portable_v<VER>.zip` | loose-deps。native 依存を埋め込まず exe 隣に同梱、展開ゼロ | `<exe_dir>\data` (APPDATA 不使用) | 不要 |
 
@@ -20,9 +20,10 @@
 - **Vector**: インストーラ (.exe) + `installer/readme.txt` (利用者向け説明書) を zip にまとめて申請。
   readme 同梱を Vector が要件化しているため、単体 exe やインストーラ単独での申請は不可。
 - **インストーラ**: Inno Setup 6（`installer/mimageviewer.iss`）
-- **配布ビルド**: `.\scripts\build-dist.ps1` (全体テスト → clean → core → remote → EPUB worker → MCP → launcher → ISCC → portable を 1 コマンド、
+- **配布ビルド**: `.\scripts\build-dist.ps1` (全体テスト → clean → core → remote → EPUB worker → MCP → editor → launcher → ISCC → portable を 1 コマンド、
   stale 配布物を構造的に防ぐ)。開発中の素早い反復だけ `.\scripts\build-release.ps1` 単体を使う
-  (clean/ガードなしなので配布物には使わない)。
+  (配布用の clean／全体テストゲートがないので配布物には使わない)。
+- **出力先固定**: build-release／build-dist／build-portable／build-dev は開始前に実際の Cargo 実行場所・環境で `cargo metadata --format-version 1 --no-deps --offline` の `target_directory` と `build_directory` を固定出力先と照合し、不一致と `CARGO_BUILD_TARGET` を `-PreserveRuntime` に関係なく拒否する（`build_directory` 未出力時は `target_directory` と同じ扱い、portable 自身の固定 `--target-dir` は維持、設定ファイルの `build.target` は検査対象外）。
 - **出力**: `installer/Output/mImageViewer_setup.exe`
 - **Vector 申請用 zip**: `mImageViewer_installer_v<VERSION>.zip` に `mImageViewer_setup.exe` と
   `installer/readme.txt` を同梱する (v1.1.0 で `mImageViewer_v<VERSION>.zip` から改名。ポータブル
@@ -34,11 +35,12 @@
   `cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets --target-dir target-portable`
   と `cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf --target-dir target-portable`
   と `cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp --target-dir target-portable`
+  と `cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo --target-dir target-portable`
   (非portable core を上書きしないよう専用 target dir に分離) → loose 同梱フォルダ +
   `dist\mImageViewer_portable_v<VER>.zip` を生成する。`portable` feature で native 依存
   (pdfium / onnxruntime / susie / vst3-host / モデル) を埋め込まず exe 隣から解決し、`data_dir` を
   `<exe_dir>\data` に向ける。launcher は使わず core を `mimageviewer.exe` にリネームし、
-  remote service・EPUB converter・`mimageviewer-mcp.exe` をその隣へ同梱。
+  remote service・EPUB converter・`mimageviewer-mcp.exe`・music-video editor をその隣へ同梱。
   VST host と EffeTune bundle は利用者決定により非同梱。音響調整は bundle 不在で利用不可のまま。
   `portable` build flavor では音響調整ボタン・カスタマイズ候補・v4.3.0の関連告知も表示しない。
   保存済みセクション順は維持し、描画対象だけを除外する。通常版のbundle欠落は表示で隠さない。
@@ -183,7 +185,7 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
    `cargo test --lib version_highlights::` でテーブルがパースできることを確認。
 6. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
    - 製品ページのカードの長さを `python scripts/check_site_cards.py` で検査する (「製品ページのカードは短く保つ」)。
-   - マニュアル左サイドバーを持つ通常ページ 32 ページでリンク一覧が揃っているか
+   - マニュアル左サイドバーを持つ通常ページ 33 ページでリンク一覧が揃っているか
      `htdocs/mimageviewer/manual/` 配下で一括確認:
      ```bash
      cd htdocs/mimageviewer/manual && for f in *.html; do
@@ -193,7 +195,7 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
          | grep -E 'href="[a-z-]+\.html"' | wc -l
      done
      ```
-     各ページが 32 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
+     各ページが 33 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
      ページを増減したらこの数も更新する (数そのものより、**全ページが同じ数で揃っている**ことが要件)。
      `tut-*.html` など `sidebar-section` を持たないチュートリアルページは別レイアウトなので対象外。
      新規の通常ページを追加した際はサイドバーを持つ全ページを更新すること
@@ -448,10 +450,10 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
 
 ### Phase 3: ビルド・配布成果物
 
-10. **配布ビルドは `.\scripts\build-dist.ps1` を使う** (1 コマンドで全体テスト → clean → core → remote → EPUB worker → MCP → launcher → ISCC → portable)。
+10. **配布ビルドは `.\scripts\build-dist.ps1` を使う** (1 コマンドで全体テスト → clean → core → remote → EPUB worker → MCP → editor → launcher → ISCC → portable)。
     - build-dist.ps1 は Rust 全体テストを通してから
-      `cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p mimageviewer-launcher`
-      (+ `target-portable` の `-p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp`) してから実コンパイルするので、
+      `cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p musicvideo-editor -p mimageviewer-launcher`
+      (+ `target-portable` の `-p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p musicvideo-editor`) してから実コンパイルするので、
       cargo の偽 up-to-date 由来の **stale 配布物を構造的に防ぐ**
       ([docs/release-operations.md](release-operations.md) §2.1 参照)。内部で build-release.ps1 (常駐 mIV を自動停止して
       LNK1104 を回避) と build-portable.ps1 を子 PowerShell で呼び、各 `$LASTEXITCODE` を検査する。
@@ -463,9 +465,9 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
       単体 exe / portable の手動交換前も AI アプリを終了する。
     - **コード署名は build-dist.ps1 が既定で ON** (Certum Open Source Code Signing 証明書、SimplySign Desktop
       のクラウド鍵)。配布する全 PE に Authenticode 署名 + RFC3161 タイムスタンプを付ける: 単体exe (launcher) /
-      core / remote / EPUB worker / MCP / susie32 / vst3-host / pdfium / FFmpeg 6 DLL / EffeTune plugin (`.vst3` PE) / `mImageViewer_setup.exe` / portable の各 loose PE。
+      core / remote / EPUB worker / MCP / editor / susie32 / vst3-host / pdfium / FFmpeg 6 DLL / EffeTune plugin (`.vst3` PE) / `mImageViewer_setup.exe` / portable の各 loose PE。
       **`include_bytes!` で埋め込む物は「埋め込み前」に署名する**
-      (内側 vendor PE → core + remote + EPUB worker + MCP → launcher → setup.exe の順)。
+      (内側 vendor PE → core + remote + EPUB worker + MCP + editor → launcher → setup.exe の順)。
       EffeTune は vendor 原本ではなく target staging の全 PE を署名し、`MIMV_EFFETUNE_DIR` で
       launcher 埋め込み元を切り替える。`.vst3` の拡張子でも PE なら署名対象とする。
       でないと APPDATA へ展開されたコピーが未署名になり、AV 誤検知
@@ -480,7 +482,7 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
       (証明書選択は既定 subject `/n "Open Source Developer Taku Sano"`。証明書更新で拇印を固定したいときは
       `$env:MIV_SIGN_SHA1`、TS 変更は `$env:MIV_SIGN_TS`)。ポータブルの vst3-host は署名対応後も当面**非同梱据え置き**。
     - **通常の開発反復は `.\scripts\build-dev.ps1`**。通常feature set（portableなし）を
-      `dev-runtime` profileで `target\dev-runtime` へ core + remote + EPUB worker + MCP をビルドし、launcherなしで必要な
+      `dev-runtime` profileで `target\dev-runtime` へ core + remote + EPUB worker + MCP + editor をビルドし、launcherなしで必要な
       FFmpeg DLLだけを変更時に配置する。引数なしの起動は通常版と同じ
       `%APPDATA%\mimageviewer` を使う。launcher／release最適化／埋め込みasset／変更したVST3
       bridgeまで含む実機確認は `.\scripts\build-release.ps1` (incremental・cleanなし、署名は
@@ -506,7 +508,7 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
       インストール版をトレイ常駐させたまま起動しても両方独立に動く (mutex 分離) ことを確認。
       検証チェックリスト全項目は [docs/portable-build-plan.md](portable-build-plan.md) §8。
 12. **全 PE / app-local VC runtime gate** — `build-dist.ps1` が installer / portable 完成後に
-    `scripts/check-vcrt-pe-dependencies.ps1` を必須実行する。launcher / core / remote / EPUB worker / MCP / installer、
+    `scripts/check-vcrt-pe-dependencies.ps1` を必須実行する。launcher / core / remote / EPUB worker / MCP / editor / installer、
     portable 配下、埋め込み元 PDFium / DirectML ORT / FFmpeg / Susie / VST host / EffeTune plugin PE を filesystem から
     列挙し、artifact 別 machine、direct import closure、全 input SHA-256 を report に残す。
     4 CRT は Microsoft 署名、manifest exact hash、全4本同一版かつ最低 14.44 を必須とし、

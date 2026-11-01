@@ -205,6 +205,7 @@ mod final_composite;
 mod image_folder_zip;
 mod image_folder_zip_job;
 mod image_folder_zip_metadata;
+mod musicvideo_launch;
 // filename_stack_ui は private な App へ impl を追加する library-internal module。
 mod adjustment_parameter_edit;
 mod everything_ipc;
@@ -331,6 +332,16 @@ pub mod rotation_db;
 mod runtime_cleanup;
 #[cfg(any(not(feature = "portable"), test))]
 mod runtime_locks;
+
+/// Pin the launcher runtime containing this executable for a companion process.
+/// This uses the core package version and never initializes settings or logging.
+/// Keep the returned file alive until process exit. Loose/portable layouts return None.
+pub fn pin_companion_runtime() -> std::io::Result<Option<std::fs::File>> {
+    #[cfg(all(windows, not(feature = "portable")))]
+    return runtime_cleanup::pin_running_version();
+    #[cfg(not(all(windows, not(feature = "portable"))))]
+    Ok(None)
+}
 pub mod save_with_metadata;
 pub mod search_index_db;
 pub mod search_norm;

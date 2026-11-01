@@ -26,6 +26,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'build-output-safety.ps1')
+Assert-MivFixedCargoOutput -WorkingDirectory (Join-Path $PSScriptRoot '..') -Portable -SmokeTestScript:$SmokeTestScript
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 . (Join-Path $PSScriptRoot 'build-process-policy.ps1')
 
@@ -194,7 +196,8 @@ function Write-SmokeBuildManifest {
         [string] $CorePath,
         [string] $RemotePath,
         [string] $EpubWorkerPath,
-        [string] $McpPath
+        [string] $McpPath,
+        [string] $MusicvideoPath
     )
     $head = (& git -C $repoRoot rev-parse HEAD).Trim()
     if ($LASTEXITCODE -ne 0 -or -not $head) {
@@ -211,6 +214,7 @@ function Write-SmokeBuildManifest {
         remote_sha256 = (Get-FileHash -LiteralPath $RemotePath -Algorithm SHA256).Hash.ToLowerInvariant()
         epub_worker_sha256 = (Get-FileHash -LiteralPath $EpubWorkerPath -Algorithm SHA256).Hash.ToLowerInvariant()
         mcp_sha256 = (Get-FileHash -LiteralPath $McpPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        musicvideo_sha256 = (Get-FileHash -LiteralPath $MusicvideoPath -Algorithm SHA256).Hash.ToLowerInvariant()
     }
     $json = $manifest | ConvertTo-Json -Depth 3
     [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
@@ -223,7 +227,8 @@ function Assert-SmokeBuildManifest {
         [string] $CorePath,
         [string] $RemotePath,
         [string] $EpubWorkerPath,
-        [string] $McpPath
+        [string] $McpPath,
+        [string] $MusicvideoPath
     )
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "[portable-smoke-build] diagnostic build manifest not found: $Path"
@@ -250,8 +255,10 @@ function Assert-SmokeBuildManifest {
     $remoteHash = (Get-FileHash -LiteralPath $RemotePath -Algorithm SHA256).Hash.ToLowerInvariant()
     $epubWorkerHash = (Get-FileHash -LiteralPath $EpubWorkerPath -Algorithm SHA256).Hash.ToLowerInvariant()
     $mcpHash = (Get-FileHash -LiteralPath $McpPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $musicvideoHash = (Get-FileHash -LiteralPath $MusicvideoPath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($manifest.core_sha256 -ne $coreHash -or $manifest.remote_sha256 -ne $remoteHash -or
-        $manifest.epub_worker_sha256 -ne $epubWorkerHash -or $manifest.mcp_sha256 -ne $mcpHash) {
+        $manifest.epub_worker_sha256 -ne $epubWorkerHash -or $manifest.mcp_sha256 -ne $mcpHash -or
+        $manifest.musicvideo_sha256 -ne $musicvideoHash) {
         throw '[portable-smoke-build] diagnostic artifact hash does not match its build manifest'
     }
 }
@@ -301,6 +308,7 @@ $coreExe = Join-Path $portableTargetDir 'release\mimageviewer-core.exe'
 $remoteExe = Join-Path $portableTargetDir 'release\mimageviewer-remote.exe'
 $epubWorkerExe = Join-Path $portableTargetDir 'release\mimageviewer-epub-pdf.exe'
 $mcpExe = Join-Path $portableTargetDir 'release\mimageviewer-mcp.exe'
+$musicvideoExe = Join-Path $portableTargetDir 'release\mimageviewer-musicvideo.exe'
 $pkgName = "mImageViewer_portable_v$version"
 $distRoot = Join-Path $repoRoot 'dist'
 $pkgDir = if ($SmokeTestScript) {
@@ -311,6 +319,12 @@ $pkgDir = if ($SmokeTestScript) {
 $exactBuildProcessNames = @('mimageviewer', 'mimageviewer-mcp')
 $exactBuildOutputPaths = @((Join-Path $pkgDir 'mimageviewer.exe'), (Join-Path $pkgDir 'mimageviewer-mcp.exe'))
 if (-not $SkipBuild) { $exactBuildOutputPaths += $mcpExe }
+$editorPackageDir = $pkgDir
+. (Join-Path $PSScriptRoot 'musicvideo-build-safety.ps1')
+# This also protects package replacement with -SkipBuild and -KeepRunning.
+Assert-MivMusicvideoBuildOutputsIdle -OutputPaths @(
+    $musicvideoExe, (Join-Path $editorPackageDir 'mimageviewer-musicvideo.exe')
+)
 
 # ---------------------------------------------------------------------------
 # Stop any running core/portable instances that may lock the exe.
@@ -406,6 +420,11 @@ if (-not $SkipBuild) {
             & cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp --target-dir $portableTargetDir
             $cargoExit = $LASTEXITCODE
         }
+        if ($cargoExit -eq 0) {
+            Write-Host "[portable] cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo --target-dir $portableTargetName"
+            & cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo --target-dir $portableTargetDir
+            $cargoExit = $LASTEXITCODE
+        }
     }
     finally {
         Pop-Location
@@ -422,15 +441,17 @@ if (-not (Test-Path $coreExe)) { throw "[portable] core exe not found: $coreExe"
 if (-not (Test-Path $remoteExe)) { throw "[portable] remote service exe not found: $remoteExe" }
 if (-not (Test-Path $epubWorkerExe)) { throw "[portable] EPUB worker exe not found: $epubWorkerExe" }
 if (-not (Test-Path $mcpExe)) { throw "[portable] MCP exe not found: $mcpExe" }
+if (-not (Test-Path $musicvideoExe)) { throw "[portable] music-video editor exe not found: $musicvideoExe" }
 Assert-NoReparsePath $coreExe $repoRoot 'portable-core'
 Assert-NoReparsePath $remoteExe $repoRoot 'portable-remote'
 Assert-NoReparsePath $epubWorkerExe $repoRoot 'portable-epub-worker'
 Assert-NoReparsePath $mcpExe $repoRoot 'portable-mcp'
+Assert-NoReparsePath $musicvideoExe $repoRoot 'portable-musicvideo-editor'
 if ($SmokeTestScript) {
     if ($SkipBuild) {
-        Assert-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe $epubWorkerExe $mcpExe
+        Assert-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe $epubWorkerExe $mcpExe $musicvideoExe
     } else {
-        Write-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe $epubWorkerExe $mcpExe
+        Write-SmokeBuildManifest $smokeBuildManifest $sourceFingerprint $coreExe $remoteExe $epubWorkerExe $mcpExe $musicvideoExe
     }
 }
 
@@ -457,6 +478,7 @@ $copies = @(
     @{ src = $remoteExe; dst = 'mimageviewer-remote.exe' }
     @{ src = $epubWorkerExe; dst = 'mimageviewer-epub-pdf.exe' }
     @{ src = $mcpExe; dst = 'mimageviewer-mcp.exe' }
+    @{ src = $musicvideoExe; dst = 'mimageviewer-musicvideo.exe' }
     @{ src = 'vendor\ffmpeg\bin\avcodec-61.dll';     dst = 'avcodec-61.dll' }
     @{ src = 'vendor\ffmpeg\bin\avformat-61.dll';    dst = 'avformat-61.dll' }
     @{ src = 'vendor\ffmpeg\bin\avutil-59.dll';      dst = 'avutil-59.dll' }
@@ -552,6 +574,7 @@ if ($Sign) {
         'mimageviewer-remote.exe',
         'mimageviewer-epub-pdf.exe',
         'mimageviewer-mcp.exe',
+        'mimageviewer-musicvideo.exe',
         'pdfium.dll',
         'mimageviewer-susie32.exe',
         'avcodec-61.dll', 'avformat-61.dll', 'avutil-59.dll',

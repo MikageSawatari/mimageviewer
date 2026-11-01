@@ -36,13 +36,19 @@
 
 ## 2. 現状アーキテクチャの整理
 
-### launcher + core + remote service + EPUB converter + MCP adapter
+### launcher + core + remote service + EPUB converter + MCP adapter + music-video editor
 
 配布 `mimageviewer.exe` は **ランチャー** ([crates/launcher/src/main.rs](../crates/launcher/src/main.rs))。
-起動時に `mimageviewer-core.exe` + `mimageviewer-remote.exe` + `mimageviewer-epub-pdf.exe` + `mimageviewer-mcp.exe` + FFmpeg 6 DLL を
+起動時に `mimageviewer-core.exe` + `mimageviewer-remote.exe` + `mimageviewer-epub-pdf.exe` + `mimageviewer-mcp.exe` + `mimageviewer-musicvideo.exe` + FFmpeg 6 DLL を
 `%APPDATA%\mimageviewer\runtime\<version>\` へ展開して core を spawn する。core は
 remote service と EPUB converter を自分の隣から起動する。core と remote service は同じ remote-ipc protocol source からビルドされる。
 MCP は AI アプリから launcher の先頭 `--mcp` で起動する。この経路は MCP exe だけを展開し、core を起動しない。
+音楽ビデオエディタも同じディレクトリから起動し、data-dir は本体から引数で受け取る。
+portable は `musicvideo-editor` の製品 bin を `target-portable` でビルドし、core の隣へ loose 同梱する。
+build は出力先や配布フォルダのエディタを停止せず、保存・終了を求めて中止する。
+この統合では mIV Sound／VST3 host の portable 同梱・有効化は行わない。
+[派生版への切替計画](effetune-fork-plan.md) の F3（公開文書）・F4（ポータブル有効化）は別段階であり、
+現行の音響調整非同梱・利用不可の境界を維持する。
 ランチャーが存在する主な理由は **FFmpeg がロード時リンク**で、
 Rust コードが走る前に Windows ローダが DLL を解決する必要があるため
 ([build.rs:9-26](../build.rs)、[src/video/ffmpeg_loader.rs](../src/video/ffmpeg_loader.rs))。
@@ -102,7 +108,7 @@ fn main():
    そのモジュールを呼ぶだけにし、cfg 分岐をそこ 1 箇所に閉じる。新しい native 依存を足すときも
    ここ + パッケージング一覧の 2 箇所だけ。
 4. **ポータブル版は launcher を使わない**。core を `mimageviewer.exe` にリネームし、
-   remote service、EPUB converter、MCP adapter と FFmpeg DLL を含む native 依存をその隣へ loose 同梱する。
+   remote service、EPUB converter、MCP adapter、music-video editor と FFmpeg DLL を含む native 依存をその隣へ loose 同梱する。
 5. **CI に `cargo check --features portable` を 1 行**足し、portable 分岐の腐りを機械的に防ぐ。
 
 ## 4. 具体設計
@@ -321,7 +327,8 @@ portable は launcher を使わないので影響しないが、抽出ロジッ�
    で同じ source tree の Web UI 資産内包 remote service を生成し、
    `cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf` で EPUB converter を生成し、
    `cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp` で MCP adapter を生成する。
-   4本とも `--target-dir target-portable` を付け、通常版の `target\release` と混ぜない。
+   続けて `cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo` で editor を生成する。
+   5 本とも `--target-dir target-portable` を付け、通常版の `target\release` と混ぜない。
    - launcher (`-p mimageviewer-launcher`) は**ビルドしない**。
    - VST3 bridge (`mimageviewer-vst3-host.exe`) は **同梱しない** (下記の注を参照)。
 2. 配布フォルダ `dist/portable/` を組み立て:
@@ -332,6 +339,7 @@ mImageViewer_portable/
 ├─ mimageviewer-remote.exe           (= core が同じディレクトリから起動)
 ├─ mimageviewer-epub-pdf.exe         (= core が同じディレクトリから起動)
 ├─ mimageviewer-mcp.exe              (= AI アプリが直接起動。--mcp は付けない)
+├─ mimageviewer-musicvideo.exe       (= core が同じディレクトリから起動)
 ├─ avcodec-61.dll  avformat-61.dll  avutil-59.dll
 ├─ avfilter-10.dll  swscale-8.dll  swresample-5.dll
 ├─ pdfium.dll

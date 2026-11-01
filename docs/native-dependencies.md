@@ -232,7 +232,7 @@ HEVC / AV1 を再生する) のために、FFmpeg の **LGPL shared build** を 
 直接の本体には適用できない (ローダの解決タイミングに間に合わない)。`/DELAYLOAD` も
 rustc 経由の link.exe で機能しない (Delay Import Directory が空のまま、原因未解明)。
 
-そこで **launcher が core・remote service・EPUB converter・MCP adapter・FFmpeg DLL・VC runtime・mIV Sound bundle を内包する構成**で「単体 exe 配布」を実現している:
+そこで **launcher が core・remote service・EPUB converter・MCP adapter・music-video editor・FFmpeg DLL・VC runtime・mIV Sound bundle を内包する構成**で「単体 exe 配布」を実現している:
 
 ```
 配布する mimageviewer.exe (= ランチャー、crates/launcher/ が生成)
@@ -241,6 +241,7 @@ rustc 経由の link.exe で機能しない (Delay Import Directory が空のま
 │   ├── mimageviewer-remote.exe (本体と remote-ipc protocol version を共有、Web UI 資産も内包)
 │   ├── mimageviewer-epub-pdf.exe (EPUB → PDF 変換器)
 │   ├── mimageviewer-mcp.exe     (AI 連携の stdio adapter、console subsystem / CRT 静的リンク)
+│   ├── mimageviewer-musicvideo.exe (音楽ビデオエディタ)
 │   ├── effetune/mIV Sound.vst3/ (全体を同梱。版と入力一覧は config/miv-sound.rs と承認 manifest が正本)
 │   ├── app-local VC runtime 4 DLL (Microsoft 署名を保持)
 │   ├── avcodec-61.dll
@@ -266,7 +267,7 @@ Windows の DLL 検索順 (exe 同居が最優先) で確実に解決される�
 core/EffeTune の準備や activate はせず、子の終了まで runtime lease と MCP marker を保持する。
 
 **バージョン別 runtime ディレクトリ**: `runtime\<version>\` のように分けることで、
-古い core / remote / EPUB worker / MCP が走行中に新ランチャーが上書きしようとして file lock で失敗する事象を回避
+古い core / remote / EPUB worker / MCP / editor が走行中に新ランチャーが上書きしようとして file lock で失敗する事象を回避
 (Codex レビュー助言)。core の起動完了・初回描画後、短命の背景 worker が現在実行中の
 `CARGO_PKG_VERSION` と使用中lockで保護された版を残し、他の版を best-effort 削除する。
 coreはexeの版directoryと固定EffeTune世代のshared leaseを寿命中保持し、launcherもcoreへの
@@ -279,21 +280,22 @@ workerが実行中process画像を一度だけ列挙し、候補内の画像が�
 その版を再び起動すると launcher が再展開する。portable は清掃しない。
 
 **ビルド順序**: cargo は同一ワークスペース内 bin の依存順序を表現できないので
-`scripts/build-release.{sh,ps1}` が 5 段階に分けて呼ぶ:
+`scripts/build-release.{sh,ps1}` が 6 段階に分けて呼ぶ:
 1. `cargo build --release --bin mimageviewer-core` → 本体生成 (package `mimageviewer` 内の bin なので `-p` 不要)
 2. `cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets`
    → Web UI 資産を内包した remote service 生成
 3. `cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf` → EPUB converter 生成
 4. `cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp` → MCP adapter 生成
-5. `cargo build --release -p mimageviewer-launcher --bin mimageviewer` → ランチャー生成 (core + remote + EPUB worker + MCP + EffeTune bundle 等を include_bytes!)。**bare `cargo build --release --bin mimageviewer` は失敗する** (`no bin target named mimageviewer in default-run packages`。`mimageviewer` bin は package `mimageviewer-launcher` にあり workspace default-members 外なので `-p` 必須)
+5. `cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo` → 音楽ビデオエディタ生成
+6. `cargo build --release -p mimageviewer-launcher --bin mimageviewer` → ランチャー生成 (core + remote + EPUB worker + MCP + editor + EffeTune bundle 等を include_bytes!)。**bare `cargo build --release --bin mimageviewer` は失敗する** (`no bin target named mimageviewer in default-run packages`。`mimageviewer` bin は package `mimageviewer-launcher` にあり workspace default-members 外なので `-p` 必須)
 
-ラッパーは 5 つの cargo 呼び出しすべてで `CARGO_INCREMENTAL=0` を明示する。`Cargo.toml` の
+ラッパーは 6 つの cargo 呼び出しすべてで `CARGO_INCREMENTAL=0` を明示する。`Cargo.toml` の
 release profile はローカル rebuild 高速化のため `incremental = true` だが、ThinLTO +
 rust-lld で stale incremental object が残ると `fast_image_resize` などの SIMD symbol が
 release link 時に未解決になることがあるため、配布ビルドは安定優先で incremental を切る。
 
-`cargo build --release` を直接打つ場合は ① → ② → ③ → ④ → ⑤ の順で 5 回打つこと。
-ランチャー側 build.rs が `target/release` の core / remote / EPUB worker / MCP の存在をチェックし、
+`cargo build --release` を直接打つ場合は ① → ② → ③ → ④ → ⑤ → ⑥ の順で 6 回打つこと。
+ランチャー側 build.rs は Cargo の `OUT_DIR` の形を検査し、その profile と同じ出力 tree の `release` から core / remote / EPUB worker / MCP / editor の 5 本を参照する（debug の launcher テストも release 5 本を使う）。子へ差し込まれた `CARGO_TARGET_DIR` や既定値の推測は使わず、想定外の `OUT_DIR` は明示的に失敗する。通常構成では `target/release` となる。wrapper は metadata の `target_directory` と `build_directory` を固定出力先と照合し、`build.build-dir` による分離も開始前に拒否する。
 無ければ復旧手順付きで止まる。音響調整も `vendor/miv-sound/VERSION` と
 `mIV Sound.vst3/` を必須検証する（固定値は `config/miv-sound.rs`）。`MIMV_EFFETUNE_DIR` で staging root を指定できる。
 承認済み入力は `third_party/miv-sound/<ver>/manifest.sha256` の全エントリと照合する。
@@ -304,7 +306,7 @@ release link 時に未解決になることがあるため、配布ビルドは�
 配布署名時は build-dist.ps1 が bundle を target にコピーして PE を署名し、埋め込み元を指定する
 (vendor 原本は変更しない)。
 
-release wrapper の出力先と launcher の埋込入力は `<repo>\target\release` の4本に固定する。
+release wrapper の出力先と launcher の埋込入力は `<repo>\target\release` の5本に固定する。
 追加 Cargo 引数は停止/build 前に allow-list で検査する (`--features`、feature/lock/offline の指定、
 verbose/jobs の指定だけ。正確な一覧は `mcp-integration-plan.md` §15.8)。
 各 build の `compiler-artifact.executable` も固定出力と照合し、環境変数や Cargo 設定で出力が
@@ -313,7 +315,7 @@ Bash 版の artifact JSON 検査は Python 3 (`scripts/check-cargo-build-output.
 PowerShell 版は `ConvertFrom-Json` を使う。
 
 **配布物**:
-- 単体 exe 版: `mimageviewer.exe` 1 ファイル (内包する core + remote + EPUB worker + MCP + DLL + EffeTune bundle を含む)
+- 単体 exe 版: `mimageviewer.exe` 1 ファイル (内包する core + remote + EPUB worker + MCP + editor + DLL + EffeTune bundle を含む)
 - インストーラ版: `mImageViewer_setup.exe` (Inno Setup が同じランチャーを配置)
 - どちらも初回起動時に APPDATA に展開、2 回目以降は展開済みなのでスキップして高速
 
@@ -367,14 +369,16 @@ FFmpeg メジャーが上がると DLL のメジャー番号が変わる (例: 7
 ```
 target/release/mimageviewer.exe          # 配布用 (ランチャー、~365MB)
 target/release/mimageviewer-core.exe     # 本体 (内包される実体、単体では起動不可)
+target/release/mimageviewer-mcp.exe      # AI 連携の stdio adapter (launcher 内包)
+target/release/mimageviewer-musicvideo.exe # 音楽ビデオエディタ (launcher 内包)
 ```
 
 `mimageviewer.exe` をダブルクリックすると:
-1. 初回のみ `%APPDATA%\mimageviewer\runtime\<CARGO_PKG_VERSION>\` (例: `runtime\0.9.0\`) に core + 6 DLL を展開
+1. `%APPDATA%\mimageviewer\runtime\<CARGO_PKG_VERSION>\` に core／remote／EPUB worker／MCP／editor、FFmpeg 6 DLL、VC runtime 4 DLL を展開・検証。mIV Sound は前述の承認 manifest と世代公開の契約に従う
 2. core が spawn されて自身のウィンドウを開く
 3. 動画フォルダで動画をダブルクリック → フルスクリーンでインライン再生開始
 
-2 回目以降は展開済みなのでスキップ (サイズ一致チェック)、起動が速い。
+2 回目以降は既存資産のサイズと SHA-256 sidecar を照合して再利用する。EPUB worker、MCP、editor、CRT は内容 hash も毎回確認する。mIV Sound の世代検証は前述の契約に従う。
 
 ### 開発時に core を直接起動したいとき
 

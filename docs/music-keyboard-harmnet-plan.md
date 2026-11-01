@@ -119,6 +119,15 @@ read lock の保持は今の `copy_window` と同じく短くする。
 
 ### 4.4 鍵盤の描画 (`compute_keyboard_visuals` / `draw_pitch_keyboard`)
 
+2026-10-14 master 統合後は `compute_keyboard_visuals` と sustain / 残光 / 配置 / Bass 三角形の
+判断を `music-core::keyboard` に共有する。本体は `KeyboardCenterInput::FundamentalProbabilities` /
+`KeyboardBassInput::AbsoluteMidi` を渡し、以下の HarmNet 契約を維持する。
+音楽ビデオの既存 `prepare_keyboard_frame[_into]` / `layout_bass_markers[_into]` は spectral-energy /
+pitch-class の wrapper のまま維持するため、export の意味を今回の統合で変更しない。
+本体設定の音名色は共通 key blend に渡し、書き出しの既存配色は維持する。
+従来の純 visual 回帰 5 件は共有 module へ移し、worker / frontier / 再要求 / absolute MIDI の
+回帰は本体の共有 API 接続を検査する。
+
 - `center[idx] = pitch_probabilities[idx] × presence`。presence は今の式
   (`update_keyboard_sustain` 後の `notes` の最大値に Norm ゲインを反映し、`KEY_HIGHLIGHT_MIN_PEAK` と
   0.28 で正規化した値の 0.7 乗) をそのまま使う。確率への追加のガンマは定数 1 本 (`KEY_PITCH_GAMMA`、

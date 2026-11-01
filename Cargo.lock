@@ -4165,6 +4165,7 @@ dependencies = [
  "mimalloc",
  "miv-startup",
  "music-core",
+ "musicvideo-core",
  "naga 27.0.3",
  "ndarray",
  "notify",
@@ -4421,6 +4422,47 @@ dependencies = [
  "serde",
  "serde_json",
  "symphonia",
+]
+
+[[package]]
+name = "musicvideo-core"
+version = "0.1.0"
+dependencies = [
+ "comic-core",
+ "encoding_rs",
+ "music-core",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "musicvideo-editor"
+version = "0.1.0"
+dependencies = [
+ "comic-core",
+ "cpal",
+ "eframe",
+ "egui",
+ "image",
+ "mimageviewer",
+ "music-core",
+ "musicvideo-core",
+ "musicvideo-ui",
+ "rfd",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "musicvideo-ui"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "egui-ime",
+ "musicvideo-core",
 ]
 
 [[package]]

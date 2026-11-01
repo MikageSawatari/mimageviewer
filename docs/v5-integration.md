@@ -255,3 +255,122 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 確認対象は、音響調整の名称・credit、移行前後のlocal / Remoteの起動待ちとユーザーVST、
 MCP経由で開く操作との共存、masterのコレクションサムネイル・種類icon・クリック操作である。
 今回これらの製品起動は行っていない。
+
+## 3. musicvideo の取り込み（2026-11-02）
+
+- 作業先: `G:\home\mimageviewer-badge-1663` / `v5-integration`。
+- 取り込み前 HEAD: `c23d75661`（前節の mIV Sound merge）。
+- MERGE_HEAD / 取り込む tip: `6aa58ae7da047c3c93e46aa90921bbff6f91799e`。
+  件名: `docs(musicvideo): Record P5a independent review 3 ACCEPT`。
+- 設計担当が開始した merge のファイル編集のみを担当。git add / commit / merge / push、
+  製品起動、通常設定の変更、Sound の配布承認は行わない。未追跡 `out.mp4` は対象外。
+  検証時は `MSBUILDDISABLENODEREUSE=1`。以下のローカル結果の観測者は Codex 実装担当。
+- P5a は取り込み元で独立レビュー3回目 ACCEPT、利用者の GUI 確認待ちという状態を保持。
+  この merge の自動検査だけで GUI 確認や候補版の受け入れを完了とはしない。
+
+### 衝突23ファイルの解き方
+
+| ファイル | 解消内容 |
+| --- | --- |
+| `CLAUDE.md` | master の規則・v4/v5並行開発を保持。MCP と editor の前提・出力固定を統合し、release 6段／内包入力5本へ更新。 |
+| `crates/launcher/Cargo.toml` | MCP・editor・mIV Sound の全同梱を保持。core → Remote → EPUB worker → MCP → editor → launcher の順序を記載。 |
+| `crates/launcher/build.rs` | 全5 exe の存在・hash・rerun を保持。musicvideo P4e のレビュー済み OUT_DIR 導出を採り、MCP も同じ release tree から読む。Sound の config／承認 manifest 検査は維持。 |
+| `crates/launcher/src/main.rs` | MCP 専用起動入口・MCP_ASSET と editor の ASSETS を併存。両 exe の毎回の内容 hash 検査を維持。 |
+| `docs/development-build-and-test-native.md` | release 6段と全成果物を併記。通常データの保護・製品起動禁止を維持。 |
+| `docs/development-build-and-test.md` | dev 5本、release 6段、launcher 前提5本、準備コマンドを統合。出力先 guard と editor 自動停止禁止を維持。 |
+| `docs/keymap-spec.md` | 既存の連携窓と editor 固定入力の説明を両方保持。 |
+| `docs/native-dependencies.md` | MCP＋editor 同梱、OUT_DIR 契約と Sound の承認 manifest／ctest／provenance 契約を統合。 |
+| `docs/portable-build-plan.md` | MCP＋editor の loose 配置・5本の build と editor 保護を統合。Sound／host の portable 非同梱という現行制約を維持。 |
+| `docs/release-checklist.md` | MCP と editor を build／clean／署名／PE 検査対象へ併記。Sound 承認・公開前提は保持。 |
+| `docs/release-operations.md` | 6段 build、両 package の clean・署名・PE 検査を統合。MCP の検証入口と editor 保護を維持。 |
+| `docs/spec.md` | master の Collection 永続キャッシュ仕様と musicvideo の fps 仕様を両方保持。 |
+| `htdocs/mimageviewer/index.html` | Everything／AI と editor の通信・保存説明を保持。カードの字数上限を守り、詳細は privacy と既存 trust-note へ配置。 |
+| `htdocs/mimageviewer/privacy.html` | 更新日は新しい11月1日を保持。MCP／既存診断と musicvideo の保存・通信説明を保持。 |
+| `scripts/build-dev.ps1` | MCP と editor を同じ dev-runtime へ build。5本の artifact／PE 検査、Sound candidate、既存 process 保護を併存。 |
+| `scripts/build-dist.ps1` | 両 package の clean と全5 exe の署名／内包前 PE 検査を保持。Sound 承認 staging は従来契約のまま。 |
+| `scripts/build-portable.ps1` | 全5 exe の build／copy／署名／PE／manifest を統合。MCP の既存 process 保護と editor 非停止を保持。 |
+| `scripts/build-release.ps1` | 6段 build、5入力の artifact 照合・署名、固定出力 guard、MCP の exact-path 停止、editor 非停止、Sound 承認検査を統合。 |
+| `scripts/build-release.sh` | 同じ6段順序・artifact 照合を保持し、両 exe の前提検査と editor 保護を統合。 |
+| `scripts/test-build-dev-safety.ps1` | MCP＋editor の出力・mock build 件数・process 保護を検査する一覧へ統合。 |
+| `scripts/test-release-build-safety.ps1` | 6段の mock build・artifact／署名順序を検査する一覧へ統合。 |
+| `scripts/ui-smoke/release-checks/Support.ps1` | manifest 照合へ MCP と editor の両パスを渡す。実アプリ試験自体は未実施。 |
+| `src/runtime_cleanup.rs` | editor を残す process snapshot 回帰に MCP も加え、Sound bundle 名は config の BUNDLE_NAME を使う。既存の版／世代 lease と保護を保持。 |
+
+### 自動 merge 後に直した食い違い
+
+- launcher の非衝突テストに残った editor 追加時の資産一覧・OUT_DIR 入力一覧へ MCP を補った。
+  MCP と editor を含む全資産が抽出され、埋め込み入力が同じ release tree に属する不変条件を検査する。
+- `scripts/test-musicvideo-build-safety.ps1` の manifest fixture に MCP を補い、両 exe の hash を検査する。
+- `scripts/test-build-process-policy.ps1` の先頭3文固定の検査が musicvideo の metadata guard と
+  衝突していたため、metadata guard → allow-list guard の両方が停止・build・署名前にあることを検査する。
+  mock artifact／manifest の対象一覧にも両 exe を保持した。
+- 文書の自動 merge 箇所にも残った MCP 欠落・4本／5段表記を現行5入力／6段へ補正。
+  `docs/project-reference.md` の旧 Mixwright 表記も承認契約付き mIV Sound へ更新した。
+  `music-video-export-plan.md` の過去の検査件数・当時の4本／5段は履歴として変更していない。
+- 設定の総数485・除外330・転送155は不変。schema／migration／保存設定の意味を選び直す変更はない。
+  music-core の既存APIは既定寸法を維持し、editor の寸法指定APIと併存する。
+- Sound の F3（公開文書）／F4（portable 有効化）は本 merge の対象外。
+  launcher／release の Sound 承認同梱契約は保持し、portable の未実装機能を新たに有効化しない。
+
+### 検証条件と結果
+
+ログと command／exit／秒の JSON は `target/v5-integration/musicvideo-*`。
+本体の検査には §2 と同じ検査専用 Sound 入力
+`dcdfa79447071cc35bfb0dc81928271650fff543e5257275fe0d8c2812fa6d34`
+を `MIV_SOUND_CANDIDATE` に指定した。承認済み bundle・ctest 成功の代用にはせず、
+製品・通常 profile・実 editor は起動しない。詳細な入力の限界は §2 を参照。
+
+| 検査 | 結果／証跡 |
+| --- | --- |
+| `cargo fmt` | exit 0、22.130秒。`musicvideo-fmt.log` / `.json`。 |
+| `cargo fmt --check` | exit 0、21.050秒。`musicvideo-fmt-check.log` / `.json`。 |
+| `cargo check -p mimageviewer --lib --tests --features test-script` | exit 0、192.045秒。`musicvideo-check-lib.log` / `.json`。型・引数・設定分類で追加修正を要するエラーなし。 |
+| `cargo check --workspace --all-targets` | exit 101、99.096秒（Cargo lock待ちを含む）。launcher の承認済み Sound manifest 読み取りで停止。`musicvideo-workspace.log` / `.json`。 |
+| `cargo check --workspace --all-targets --exclude mimageviewer-launcher` | exit 0、671.179秒（lock待ちを含む）。通常 feature の workspace 全targetに追加の型・呼出し不整合なし。`musicvideo-workspace-no-launcher.log` / `.json`。 |
+| 機能・関連 nextest（`test-script`） | exit 0、1,234件すべて成功／15,453 skip、実行129.006秒、compile／lock待ち込み530.216秒。run `966a942f-3fe3-4e9e-8f51-de1786e370df`。`musicvideo-nextest.log` / `.json` / `musicvideo-nextest-junit.xml`。 |
+| 追加の経路 nextest | `comic-core` の `legacy_text_pixels` と `musicvideo-core` の `analysis_routes`、5件すべて成功。exit 0、実行0.148秒、compile／lock待ち込み505.049秒。run `c7cc9c0a-4c0e-4604-9009-8c90044569b7`。`musicvideo-nextest-routes.log` / `.json` / `musicvideo-nextest-routes-junit.xml`。前のlib群と重複なし。 |
+| `cargo test --test ui_snapshot` | exit 0、228件すべて成功、実行38.15秒、compile／lock待ち込み578.603秒。`musicvideo-ui-snapshot.log` / `.json`。§1.175の例外停止なし、補完不要、基準PNGの再生成・更新なし。 |
+| `scripts/test-full.ps1 -SuppressCrashDialogs` | exit 101、607.771秒（lock待ちを含む）。workspace nextest のcompile準備で同じ承認manifest不足。テスト実行／doctest／vendor段へ未到達。`musicvideo-full-gate.log` / `.json`。 |
+| OUT_DIR 導出 helper の単独テスト | 実 module を `rustc --test` でコンパイルし5件すべて成功。製品の起動ではない。`musicvideo-launcher-path-{compile,tests}.log` / `.json`。launcher 全体の埋め込み・展開テストは配布入力不足で未実施。 |
+| UI glyph／製品ページカード | 両方 exit 0、glyph違反0／51 cardsの字数違反0。`musicvideo-glyphs` / `musicvideo-site-cards` の `.log` / `.json`。 |
+| build safety（実装担当の別 context） | 下記5系統成功。実行履歴を再利用し、同じ検査の再実行はしない。ログファイルはなくツール実行履歴のみ。 |
+| 独立レビュー | GPT-6.1 Sol / xhigh、実装と別 context・read-only。23衝突と非衝突の近接経路を両親と照合、最終 ACCEPT・P1〜P3指摘なし。既存変更snapshot2枚も目視。自動検証は担当者の証拠を使用し、§3とJSON／ログ／JUnit、114本のsource hashも照合。 |
+
+関連 nextest の内訳は本体574、comic-core 122、music-core 49、musicvideo-core 165、
+musicvideo-editor 189、musicvideo-ui 135。filter 全文と共通引数は JSON に保存した。
+本体 mvexport／musicvideo launch／共有 spectrum、runtime cleanup／locks、settings_transfer、
+preferences、context menu、type_icon、catalog_provider、§1.679／§1.680を含む。
+設定分類テストと文字準備予算の致命エラーテストも成功。
+§1.668 の opt-in 大量画像計測2件は既存 ignored のままで実行せず、catalog_provider の通常回帰14件を実行した。
+skip 数は filter 対象外と既存 ignored の合計で、0件一致を成功とはしていない。
+nextest は2群合計1,239件成功。これを full gate 成功とは扱わない。
+検査中に製品コードや基準PNGの追加変更はなく、統合された変更ソース114本の SHA-256 は
+`musicvideo-source-hashes.json` に保存した。最終の差分／marker 検査も成功し、
+`musicvideo-final-checks.json` に source変更0／marker残存0／diff-check exit 0／未stageのUU 23件を記録した。
+
+build safety の command はすべて
+`powershell -NoProfile -ExecutionPolicy Bypass -File scripts/<name>`。
+`test-build-dev-safety.ps1`（exit 0、0.768秒）、
+`test-musicvideo-build-safety.ps1`（exit 0、1.101秒）、
+`test-build-output-safety.ps1`（exit 0、7.826秒、実Cargo metadata 88ケース）、
+`test-release-build-safety.ps1 -PowerShellOnly`（内部の process-policy 検査も含む、exit 0、総秒未計測）、
+`test-release-check-safety.ps1`（exit 0、総秒未計測）が成功。
+通常の `test-release-build-safety.ps1` は exit 1、1.584秒で、内部の Git Bash が
+`CreateFileMapping` / Win32 error 5（内部exit 256）により起動できなかった。
+Bash の syntax／mock 実行は環境不成立として残し、PowerShell の成功と混同しない。
+修正前の release safety 一回は新しい fixture の `PSScriptRoot` が空で停止したが、
+fixture の修正後に PowerShell 全範囲が成功した。製品の不具合とは区別する。
+
+### 判断待ち・引き渡し
+
+同じ設定項目・UI・永続データ形式の意味に関する判断待ちはない。
+index は設計担当の git add 前なので23ファイルが `UU` のまま。作業ファイルの衝突マーカーは除去済み。
+git add と merge commit は設計担当が行う。
+
+launcher の配布入力は release exe 5本すべて、
+`third_party/miv-sound/0.15.0-miv.1/manifest.sha256` と `vendor/miv-sound/VERSION` が未配置。
+承認を作ったり検査専用入力で置き換えたりせず、設計担当が正規の入力を揃えてから
+launcher 込み workspace 検査・release build／展開試験を行う。
+今回の変更は launcher／埋め込み構成に依存するため、dev build だけを確認用成果物として渡さない。
+新しい user-runnable release 確認バイナリはこの前提不足により作成していない。
+§2 の検査専用 `target/dev-runtime` も通常 profile の起動確認には使わない。

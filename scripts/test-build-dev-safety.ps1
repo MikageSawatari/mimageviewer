@@ -76,19 +76,23 @@ Assert-True ($stopCallText[3].Contains("-ExeName 'mimageviewer-mcp'") -and
     $stopCallText[3].Contains('-ExePath $mcpExe') -and
     $stopCallText[3].Contains('-PreserveRuntime:$PreserveRuntime')) 'fourth staged-process check does not preserve the exact MCP policy'
 
+Assert-True ($buildDev.Contains('Assert-MivMusicvideoBuildOutputsIdle -OutputPaths @($musicvideoExe)')) 'editor output is not protected'
+Assert-True ($buildDev.IndexOf('Assert-MivMusicvideoBuildOutputsIdle -OutputPaths') -lt
+    $buildDev.IndexOf("Stop-StagedProcess -ExeName 'mimageviewer-core'")) 'editor guard must run before stopping companions'
+
 $cargoCalls = @($buildDevAst.FindAll({
     param($node)
     $node -is [System.Management.Automation.Language.CommandAst] -and
         $node.GetCommandName() -eq 'cargo'
 }, $true))
-Assert-True ($cargoCalls.Count -eq 4) 'build-dev Cargo call count changed'
-$expectedBins = @('mimageviewer-core', 'mimageviewer-remote', 'mimageviewer-epub-pdf', 'mimageviewer-mcp')
+Assert-True ($cargoCalls.Count -eq 5) 'build-dev Cargo call count changed'
+$expectedBins = @('mimageviewer-core', 'mimageviewer-remote', 'mimageviewer-epub-pdf', 'mimageviewer-mcp', 'mimageviewer-musicvideo')
 for ($index = 0; $index -lt $cargoCalls.Count; $index++) {
     $command = $cargoCalls[$index].Extent.Text
     Assert-True ($command.Contains('--bin ' + $expectedBins[$index])) "build-dev wrong binary order at $index"
     Assert-True ($command.Contains('--profile dev-runtime --target-dir $targetDir')) 'dev build must use its fixed actual target output'
 }
-Assert-True ($buildDev.Contains('-InputPaths @($coreExe, $remoteExe, $epubWorkerExe, $mcpExe)')) 'MCP is absent from the dev PE gate'
+Assert-True ($buildDev.Contains('-InputPaths @($coreExe, $remoteExe, $epubWorkerExe, $mcpExe, $musicvideoExe)')) 'MCP or editor is absent from the dev PE gate'
 
 $powershellCalls = @($buildDevAst.FindAll({
     param($node)

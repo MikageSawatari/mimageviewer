@@ -1,8 +1,8 @@
 //! ランチャークレートのビルドスクリプト。
 //!
-//! - 内包する core、remote、EPUB worker、MCP の exe と FFmpeg DLL のパスを `MIMV_*` 環境変数
-//!   経由でソースに渡す (`include_bytes!(env!("..."))` で参照)。
-//! - core、remote、EPUB worker、MCP が先にビルドされていることを確認し、未ビルドなら明確なエラーで止める。
+//! - 内包する core、remote、EPUB worker、MCP、music-video editor の exe と FFmpeg DLL のパスを
+//!   `MIMV_*` 環境変数経由でソースに渡す (`include_bytes!(env!("..."))` で参照)。
+//! - 上記 5 本が先にビルドされていることを確認し、未ビルドなら明確なエラーで止める。
 //! - exe アイコンを埋め込む (本体と同じアイコン)。
 
 use std::path::PathBuf;
@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
 
 #[path = "src/build_const_parser.rs"]
 mod build_const_parser;
+#[path = "src/build_output_paths.rs"]
+mod build_output_paths;
 
 use build_const_parser::extract_const;
 
@@ -25,17 +27,27 @@ fn main() {
         .expect("workspace root inferable from CARGO_MANIFEST_DIR")
         .to_path_buf();
 
+    let out_dir = std::env::var_os("OUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            eprintln!(
+                "Launcher build requires Cargo OUT_DIR; no target directory fallback is allowed."
+            );
+            std::process::exit(1);
+        });
+    let release_dir =
+        build_output_paths::release_inputs_dir_from_out_dir(&out_dir).unwrap_or_else(|error| {
+            eprintln!("Launcher build cannot resolve inputs from OUT_DIR: {error}");
+            std::process::exit(1);
+        });
+
     build_effetune::generate(&workspace_root);
 
-    // Embedded release inputs always come from this repository's release tree.
-    // Cargo may place the launcher itself elsewhere, but output overrides must
-    // never silently switch the executables embedded in the distributable.
-    let target_dir = workspace_root.join("target");
-
-    let core_exe = target_dir.join("release").join("mimageviewer-core.exe");
-    let remote_exe = target_dir.join("release").join("mimageviewer-remote.exe");
-    let epub_worker_exe = target_dir.join("release").join("mimageviewer-epub-pdf.exe");
-    let mcp_exe = target_dir.join("release").join("mimageviewer-mcp.exe");
+    let core_exe = release_dir.join("mimageviewer-core.exe");
+    let remote_exe = release_dir.join("mimageviewer-remote.exe");
+    let epub_worker_exe = release_dir.join("mimageviewer-epub-pdf.exe");
+    let musicvideo_exe = release_dir.join("mimageviewer-musicvideo.exe");
+    let mcp_exe = release_dir.join("mimageviewer-mcp.exe");
 
     let missing = [
         (
@@ -58,6 +70,11 @@ fn main() {
             "mimageviewer-mcp.exe",
             "cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp",
         ),
+        (
+            &musicvideo_exe,
+            "mimageviewer-musicvideo.exe",
+            "cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo",
+        ),
     ]
     .into_iter()
     .filter(|(path, _, _)| !path.exists())
@@ -72,7 +89,7 @@ fn main() {
         }
         eprintln!();
         eprintln!(
-            " Build core, remote, EPUB worker, and MCP before the launcher, or use the wrapper:"
+            " Build core, remote, EPUB worker, MCP, and music-video editor before the launcher, or use the wrapper:"
         );
         eprintln!("   bash scripts/build-release.sh        (Git Bash)");
         eprintln!("   .\\scripts\\build-release.ps1         (PowerShell)");
@@ -148,6 +165,15 @@ fn main() {
         sha256_file_hex(&mcp_exe)
     );
     println!("cargo:rerun-if-changed={}", mcp_exe.display());
+    println!(
+        "cargo:rustc-env=MIMV_MUSICVIDEO_EXE={}",
+        musicvideo_exe.display()
+    );
+    println!(
+        "cargo:rustc-env=MIMV_MUSICVIDEO_EXE_SHA256={}",
+        sha256_file_hex(&musicvideo_exe)
+    );
+    println!("cargo:rerun-if-changed={}", musicvideo_exe.display());
 
     // Single-instance 用の Mutex / Event 名を core 側のソースから取り出して
     // 環境変数経由で渡す。core 側を変えると次のビルドで自動反映される。
@@ -172,6 +198,10 @@ fn main() {
     println!("cargo:rustc-env=MIMV_ACTIVATE_EVENT_NAME={activate_name}");
     println!("cargo:rustc-env=MIMV_OPEN_PATH_PIPE_NAME={open_path_pipe_name}");
     println!("cargo:rerun-if-changed={}", single_instance_rs.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("src/build_output_paths.rs").display()
+    );
     println!(
         "cargo:rerun-if-changed={}",
         manifest_dir

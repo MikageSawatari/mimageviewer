@@ -33,9 +33,10 @@ pub use model::{
     markup_rules_white,
 };
 pub use raster::{
-    AnnotationLayer, RgbaOverlay, StampImages, bake_annotation_layers, bake_overlay,
-    bake_overlay_with_stamps, composite_stamp_sticker, effective_bubble_shape,
-    effective_window_half_extents, message_window_overflows,
+    AnnotationLayer, PreparedTextRaster, RgbaOverlay, StampImages, bake_annotation_layers,
+    bake_overlay, bake_overlay_with_stamps, bake_text_region, composite_stamp_sticker,
+    effective_bubble_shape, effective_window_half_extents, message_window_overflows,
+    prepare_text_regions, text_effect_padding,
 };
 pub use tessellate::{
     BubbleGeometry, auto_base_t, bubble_geometry, fit_bubble_shape, nearest_base_t,
@@ -73,6 +74,76 @@ mod integration_tests {
             size_px: 48.0,
             orientation,
             ..TextBlock::default()
+        }
+    }
+
+    #[test]
+    fn text_region_matches_full_bake_with_effects_and_original_pixel_rounding() {
+        let Some(font) = load_test_font() else {
+            return;
+        };
+        let mut fonts = FontSet::new();
+        fonts.insert(font);
+        let block = TextBlock {
+            text: "Á A\n日本語".into(),
+            font_key: "test".into(),
+            size_px: 31.25,
+            color: Rgba::new(190, 70, 30, 180),
+            outline: Some(StrokeStyle {
+                color: Rgba::new(10, 50, 230, 210),
+                width_px: 12.25,
+            }),
+            extra_outlines: vec![StrokeStyle {
+                color: Rgba::new(30, 210, 80, 170),
+                width_px: 24.5,
+            }],
+            shadow: Some(TextShadowStyle {
+                color: Rgba::new(50, 80, 90, 150),
+                offset: (-35.25, 10.5),
+                spread_px: 4.5,
+                blur_px: 11.25,
+            }),
+            glow: Some(TextGlowStyle {
+                color: Rgba::new(120, 90, 230, 100),
+                spread_px: 3.0,
+                radius_px: 12.0,
+            }),
+            echo: Some(TextEchoStyle {
+                color: Rgba::new(240, 30, 60, 190),
+                offset: (512.0, -9.25),
+                count: 12,
+            }),
+            background: Some(TextBackgroundStyle {
+                fill: Rgba::new(35, 70, 90, 190),
+                padding_px: 128.0,
+                corner_px: 29.5,
+            }),
+            letter_gap: -2.5,
+            line_gap: -12.25,
+            ..Default::default()
+        };
+        for origin in [(-0.5, -0.5), (15.75, 113.25), (6145.25, 143.125)] {
+            let full = bake_overlay(
+                &[AnnotationObject::new_text(1, origin, block.clone())],
+                7400,
+                400,
+                &fonts,
+            );
+            for (x, y, width, height) in
+                [(0, 0, 85, 110), (13, 91, 1025, 173), (6100, 100, 1250, 128)]
+            {
+                let region =
+                    bake_text_region(&block, origin, (x as i32, y as i32), width, height, &fonts);
+                for row in 0..height {
+                    let expected = ((y + row) * full.w + x) * 4;
+                    let actual = row * width * 4;
+                    assert_eq!(
+                        &region.pixels[actual..actual + width * 4],
+                        &full.pixels[expected..expected + width * 4],
+                        "origin={origin:?}, region={x},{y}, row={row}"
+                    );
+                }
+            }
         }
     }
 

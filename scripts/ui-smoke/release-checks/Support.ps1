@@ -72,7 +72,7 @@ function Assert-ReleaseCheckArtifact {
     if ((Get-Content -LiteralPath $marker -Encoding ASCII -Raw).Trim() -ne 'mimageviewer-disposable-smoke-v1;test-script=true') { throw 'Disposable test-script marker mismatch.' }
     Assert-SmokeBuildManifest (Join-Path $smoke '.test-script-build.json') (Get-MivSourceFingerprint $RepoRoot) `
         (Join-Path $smoke 'mimageviewer.exe') (Join-Path $smoke 'mimageviewer-remote.exe') (Join-Path $smoke 'mimageviewer-epub-pdf.exe') `
-        (Join-Path $smoke 'mimageviewer-mcp.exe')
+        (Join-Path $smoke 'mimageviewer-mcp.exe') (Join-Path $smoke 'mimageviewer-musicvideo.exe')
 }
 
 function Assert-ReleaseCheckIdentity {

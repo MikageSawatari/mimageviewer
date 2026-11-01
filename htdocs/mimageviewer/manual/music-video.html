@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>音楽ビデオの作成 — mImageViewer マニュアル</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="音声に画像・スペクトラム・鍵盤・歌詞を重ねて MP4 を作成する方法。レイヤー編集、動きの設定、プロジェクトの保存、書き出しを説明します。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/music-video.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/music-video.html">
+  <meta property="og:title" content="音楽ビデオの作成｜mImageViewer">
+  <meta property="og:description" content="音声に画像・スペクトラム・鍵盤・歌詞を重ねて MP4 を作成する方法。レイヤー編集、動きの設定、プロジェクトの保存、書き出しを説明します。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="音楽ビデオの作成｜mImageViewer">
+  <meta name="twitter:description" content="音声に画像・スペクトラム・鍵盤・歌詞を重ねて MP4 を作成する方法。レイヤー編集、動きの設定、プロジェクトの保存、書き出しを説明します。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>音楽ビデオの作成</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="tutorial.html">チュートリアル</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="stack.html">スタック表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="music.html">音楽再生</a>
+        <a href="music-video.html" class="active">音楽ビデオの作成</a>
+        <a href="effetune.html">音響調整 (EffeTune)</a>
+        <a href="effetune/index.html" class="sub">エフェクトの説明書</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="annotation.html">テキスト注釈</a>
+        <a href="export.html">エクスポート</a>
+        <a href="clipboard-capture.html">クリップボード取り込み</a>
+        <a href="metadata-transfer.html">メタ情報の移行</a>
+        <a href="external-tools.html">外部ツール連携</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="books.html">製本・本棚</a>
+        <a href="collections.html">コレクション</a>
+        <a href="search.html">検索機能</a>
+        <a href="remote.html">リモート閲覧</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="gamepad.html">ゲームパッド操作</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+        <a href="known-issues.html">既知の問題</a>
+        <a href="changelog.html">更新履歴</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">音楽ビデオの作成</h1>
+    <p class="page-desc">音声に画像・スペクトラム・鍵盤・文字・歌詞などを重ねて、MP4 の音楽ビデオを作れます。
+    別ウィンドウのエディタで、曲を聴きながら配置や動きを調整します。</p>
+
+    <h2 id="open">エディタを開く</h2>
+    <p>一覧のチェック選択を解除してから、音声ファイルを右クリックし、<strong>「音楽ビデオを作成」</strong>を選びます。
+    チェック選択が残っていると、この項目は表示されません。
+    音声ファイルの再生中は、音楽ビューの右クリックメニューからも開けます。動画の音声モードは対象外です。
+    選んだ音声がエディタに読み込まれます。
+    この起動操作にショートカットキーはありません。</p>
+
+    <h2 id="layout">画面の構成</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>場所</th><th>できること</th></tr></thead>
+        <tbody>
+          <tr><td>上部のツールバー</td><td>プロジェクトや素材を開く・保存する、動画を書き出す、再生・一時停止、時刻の指定、元に戻す・やり直す操作を行います。</td></tr>
+          <tr><td>左の「レイヤー」一覧</td><td>映像に重ねる要素を追加・選択・削除し、重なり順を変えます。一覧の上が奥、下が手前です。</td></tr>
+          <tr><td>中央のプレビュー</td><td>現在の時刻の映像を表示します。「選択レイヤーの枠」で、選んだ要素の位置を見つけられます。この枠は書き出す映像には入りません。</td></tr>
+          <tr><td>右の「レイヤー」タブ</td><td>選択中のレイヤーの位置・大きさ・不透明度などを調整します。表示される項目はレイヤーの種類によって変わります。</td></tr>
+          <tr><td>右の「モジュレータ」タブ</td><td>音に反応する動きを設定します。</td></tr>
+          <tr><td>右の「プロジェクト」タブ</td><td>「出力」で fps を選び、「表示ゲイン」で鍵盤の点灯の強さを調整し、プロジェクト・音声・画像の保存場所を参照できます。表示ゲインを変えても音量は変わりません。</td></tr>
+          <tr><td>下部の「タイムライン」</td><td>音声波形とキーフレーム、歌詞の時刻を表示します。波形や行の時刻部分をクリック・ドラッグすると、その位置へ移動します。</td></tr>
+          <tr><td>最下部のステータスバー</td><td>プロジェクト名、未保存の印、処理の進捗や結果を表示します。「詳細」から最近使ったプロジェクトや未解決の素材を開けます。</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="first-video">基本の作り方</h2>
+    <ol>
+      <li>音声を変更する場合は、上部の<strong>「音声を開く」</strong>で選びます。</li>
+      <li><strong>「背景画像を開く」</strong>で背景を選び、左の<strong>「＋ レイヤーを追加」</strong>で重ねる要素を追加します。</li>
+      <li>左の一覧でレイヤーを選び、右の「レイヤー」タブで見た目を調整します。
+        重なり順は<strong>「一覧の上へ（奥）」</strong>・<strong>「一覧の下へ（手前）」</strong>で変更します。
+        削除は<strong>「選択中のレイヤーを削除…」</strong>を押し、確認画面で決定します。</li>
+      <li>上部の<strong>「再生」</strong>・<strong>「一時停止」</strong>と<strong>「時刻 (秒)」</strong>、下部の波形を使って、曲の各部分の映像を確かめます。</li>
+      <li>編集を続けられるようプロジェクトを保存し、<strong>「MP4 を書き出す」</strong>から動画を保存します。</li>
+    </ol>
+    <p>追加できる要素は、画像、円形スペクトラム、直線スペクトラム、mIV と同じ横長スペクトラム、
+    mIV スペクトラム + 鍵盤、ピッチ鍵盤、進捗バー、時間表示、テキスト、歌詞、単色です。
+    テキスト・時間表示・歌詞には、縁取り、追加縁取り、ドロップシャドウ、エコー、背景ボックス、字間・行間の調整を使えます。</p>
+    <p>円形スペクトラムの<strong>「内側の円」</strong>は、枠の短辺の半分を基準にした割合を % で指定します。
+    バーは枠の端まで伸びます。枠を大きくすると内側の円も大きくなります。</p>
+    <p>レイヤーが画面をはみ出すと、その部分だけが見えなくなります。
+    円の大きさや画像の枠への合わせ方は、レイヤーの枠全体を基準にします。</p>
+    <p>画像の<strong>「枠への合わせ方」</strong>は、<strong>「切り抜いて埋める」</strong>・<strong>「全体を収める」</strong>・<strong>「引き伸ばす」</strong>から選べます。
+    「＋ レイヤーを追加」から加えた画像は、縦横比を保って中央に置き、全体を収めます。背景画像は枠を埋めるように表示します。</p>
+    <p>重なり順の変更・削除・追加のボタンは一覧の上にあり、レイヤー名の一覧だけをスクロールできます。</p>
+
+    <h2 id="motion">動きを付ける</h2>
+    <h3>キーフレームで時刻ごとの値を決める</h3>
+    <p>動かしたい時刻へ移動し、レイヤーのプロパティにある<strong>「◆ 現在にキー」</strong>でキーフレームを追加します。
+    別の時刻でもキーフレームを追加して値を設定すると、位置・大きさ・不透明度などを時間に合わせて変えられます。
+    タイムラインの ◆ を選ぶと時刻を数値で修正でき、ドラッグでも移動できます。
+    値をなめらかにつなぐ項目では「線形」「イーズイン」などの補間方法を選べます。
+    不要なキーフレームは<strong>「キーを削除」</strong>、時間による変化をやめる場合は<strong>「定数に戻す」</strong>を使います。</p>
+    <h3>モジュレータで音に反応させる</h3>
+    <ol>
+      <li>右の「モジュレータ」タブで<strong>「＋ キックに合わせる動きを追加」</strong>を押します。</li>
+      <li>「反応するもの」と「範囲指定」で、反応させたい音を設定します。音の範囲は Hz または音名で指定できます。</li>
+      <li>動かすレイヤーを選び、「レイヤー」タブの<strong>「変調の割り当て」</strong>を開いて<strong>「＋ 割り当てを追加」</strong>を押します。</li>
+      <li>使うモジュレータと、変える項目を選びます。「不透明度」「全体の拡大縮小」「回転」などから選び、「量」で変化の大きさを調整します。</li>
+    </ol>
+    <p><strong>「全体の拡大縮小」</strong>は枠の中心を基準に、文字や装飾を含めたレイヤーの大きさを変えます。文字や一部の装飾は、描画の上限に達するとそれ以上大きくなりません。
+    枠の幅・高さを直接編集したときは、文字の大きさは変わりません。
+    <strong>「円形スペクトラムの内側の円」</strong>の量は % で指定します。</p>
+
+    <h2 id="lyrics">歌詞と LRC</h2>
+    <p>「歌詞」レイヤーでは、歌詞を 1 行ずつ入力・貼り付けできます。
+    曲を再生しながら<strong>「次の行へ」</strong>を押すと、まだ時刻のない行に現在の時刻を付けられます。
+    空行は歌詞を消す区間として使います。「行ごとの時刻を修正」や、タイムラインの ◆ から時刻を直せます。</p>
+    <p><strong>「LRC を読み込む…」</strong>で時刻付き歌詞を取り込み、<strong>「LRC に書き出す…」</strong>で保存できます。
+    読み込みは UTF-8 と Shift_JIS に対応し、書き出しは UTF-8 です。
+    時刻を設定していない行は LRC に出力されません。歌詞の編集内容はプロジェクトにも保存します。</p>
+
+    <h2 id="project">プロジェクトの設定・保存と再開</h2>
+    <p>右の<strong>「プロジェクト」タブ →「出力」</strong>で、フレームレートを
+    <strong>24 / 30 / 60 fps</strong>から選べます。既定は 60 fps です。解像度は<strong>1920 × 1080</strong>で、エディタ上では変更できません。
+    fps はプレビューと書き出しの両方に使い、プロジェクトに保存されます。「元に戻す」「やり直す」も使えます。
+    保存済みプロジェクトの fps が選択肢以外の場合は「このプロジェクトの値」と表示し、選び直すまで元の値を保持します。</p>
+    <p><strong>「プロジェクトを保存」</strong>で編集内容を <code>.mivmv.json</code> ファイルに保存します。
+    別名で残す場合は<strong>「名前を付けて保存」</strong>、再開する場合は<strong>「プロジェクトを開く」</strong>を使います。
+    最下部の<strong>「詳細」→「最近使ったプロジェクト」</strong>からも開けます。
+    一覧の<strong>「一覧から外す」</strong>は履歴から外す操作で、プロジェクトファイル自体は削除しません。</p>
+    <p>プロジェクトには音声や画像の保存場所を記録します。素材そのものをまとめて埋め込む形式ではないため、
+    別の PC へ持ち運ぶときは素材も一緒に用意してください。</p>
+    <p>未保存の変更がある状態で「新規」、別のプロジェクトを開く操作、ウィンドウを閉じる操作をすると、
+    <strong>「未保存の編集の確認」</strong>が表示されます。
+    「保存」で残す、「破棄」で変更を捨てる、「キャンセル」で現在の編集へ戻ることを選べます。
+    自動保存や異常終了後の編集内容の復元はありません。途中でもプロジェクトを保存してください。</p>
+
+    <h2 id="export">MP4 の書き出し</h2>
+    <p>出力の解像度は<strong>1920 × 1080</strong>です（エディタ上では変更できません）。fps は書き出す前に
+    <strong>「プロジェクト」タブ →「出力」</strong>で 24 / 30 / 60 fps から選びます（既定 60 fps）。
+    <strong>「MP4 を書き出す」</strong>を押すと、プロジェクトの出力サイズ・フレームレートの確認表示と書き出し設定が表示されます。</p>
+    <ol>
+      <li>エンコーダを選びます。既定は<strong>「エンコーダ: 自動」</strong>です。使用する PC に応じて、NVIDIA NVENC、Intel QSV、AMD AMF なども選べます。</li>
+      <li><strong>「映像ビットレート (bps)」</strong>を設定します。既定値は <strong>12000000 bps（12 Mbps）</strong>です。</li>
+      <li><strong>「保存先を選ぶ」</strong>で MP4 の保存先を決めます。既存のファイルを選ぶと上書きの確認が表示されます。残したいファイルがある場合は別の名前を付けてください。</li>
+      <li>進捗画面で処理の段階とフレーム数を見られます。中断する場合は<strong>「中止」</strong>を押し、中止が終わるまで待ちます。</li>
+    </ol>
+    <div class="box warn">
+      <span class="box-icon">⚠️</span>
+      <div class="box-body">MP4 の書き出し中は、編集・別ファイルを開く・保存などの操作はできません。完了または中止を待ってから操作してください。
+      ウィンドウを閉じようとすると「書き出しを中止して閉じますか」と表示されます。「中止して閉じる」を選ぶと、中止の後に未保存の編集を確認します。</div>
+    </div>
+    <p>エンコーダと映像ビットレートの設定は次回の起動用には保存しません。fps はプロジェクトに保存されます。
+    映像を静止画として保存する場合は、上部の<strong>「連番 PNG を書き出す」</strong>も使えます。</p>
+
+    <h2 id="shortcuts">キー操作</h2>
+    <p>エディタのショートカットは固定で、カスタマイズできません。mImageViewer 本体のキー設定は引き継ぎません。</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>キー</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>元に戻す</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Y</kbd></td><td>やり直す</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></td><td>やり直す</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>文字の入力中は、その入力欄の編集や日本語変換を優先します。レイヤーや時刻付けの変更を戻す場合は、上部の「元に戻す」も使えます。
+    再生や保存は、画面上のボタンから操作してください。</p>
+
+    <h2 id="missing">素材が見つからないとき</h2>
+    <p>素材を移動・削除した後にプロジェクトを開くと、未解決の素材が表示されます。
+    最下部の<strong>「詳細」→「未解決の素材」</strong>から、画像・音声・フォントの問題を参照できます。
+    画像は<strong>「画像を差し替える」</strong>で選び直し、音声は「音声を開く」で選び直してください。</p>
+    <p>文字の描画に必要な作業量が上限を超えると、その文字レイヤーを描画せず、同じ詳細画面に理由を表示します。
+    文字のサイズ・文字数・装飾を減らしてください。この問題があるフレームでは書き出しも停止します。</p>
+
+    <h2 id="privacy">通信とデータの保存</h2>
+    <p>音楽ビデオエディタはネットワーク通信を行いません。
+    プロジェクト・MP4・LRC・連番 PNG は利用者が選んだ保存先へ書き出します。
+    最近使ったプロジェクトの一覧と動作記録・エラーログは mImageViewer のデータフォルダに保存し、編集用の一時データは Windows の一時フォルダに置きます。
+    保存場所の詳細は<a href="../privacy.html">プライバシーポリシー</a>をご覧ください。</p>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

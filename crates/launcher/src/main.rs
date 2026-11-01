@@ -1,7 +1,7 @@
 //! Small launcher for the distributable `mimageviewer.exe`.
 //!
 //! The real application binary (`mimageviewer-core.exe`) imports FFmpeg DLLs at
-//! process load time and starts `mimageviewer-remote.exe` and `mimageviewer-epub-pdf.exe`
+//! process load time and starts the remote service, EPUB worker and music-video editor
 //! from its own directory. The launcher extracts these executables, FFmpeg DLLs,
 //! app-local VC runtime and the complete EffeTune bundle into
 //! `%APPDATA%/mimageviewer/runtime/<version>/` first, then spawns the core there.
@@ -35,6 +35,8 @@ mod build_const_parser;
 #[cfg(test)]
 #[path = "../build_effetune_source.rs"]
 mod build_effetune_source;
+#[cfg(test)]
+mod build_output_paths;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -44,6 +46,7 @@ static EPUB_PDF_EXE: &[u8] = include_bytes!(env!("MIMV_EPUB_PDF_EXE"));
 static MCP_EXE: &[u8] = include_bytes!(env!("MIMV_MCP_EXE"));
 const MCP_ASSET: (&str, &[u8], &str) =
     ("mimageviewer-mcp.exe", MCP_EXE, env!("MIMV_MCP_EXE_SHA256"));
+static MUSICVIDEO_EXE: &[u8] = include_bytes!(env!("MIMV_MUSICVIDEO_EXE"));
 static AVCODEC_DLL: &[u8] = include_bytes!(env!("MIMV_AVCODEC_DLL"));
 static AVFORMAT_DLL: &[u8] = include_bytes!(env!("MIMV_AVFORMAT_DLL"));
 static AVUTIL_DLL: &[u8] = include_bytes!(env!("MIMV_AVUTIL_DLL"));
@@ -118,6 +121,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
         env!("MIMV_EPUB_PDF_EXE_SHA256"),
     ),
     MCP_ASSET,
+    (
+        "mimageviewer-musicvideo.exe",
+        MUSICVIDEO_EXE,
+        env!("MIMV_MUSICVIDEO_EXE_SHA256"),
+    ),
 ];
 
 fn main() {
@@ -509,6 +517,7 @@ fn requires_content_hash_on_launch(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "mimageviewer-epub-pdf.exe"
             | "mimageviewer-mcp.exe"
+            | "mimageviewer-musicvideo.exe"
             | "msvcp140.dll"
             | "msvcp140_1.dll"
             | "vcruntime140.dll"
@@ -546,8 +555,8 @@ fn asset_hash_matches(
     always_verify_contents: bool,
 ) -> std::io::Result<bool> {
     trace(Stage::AssetHash, &path.to_string_lossy(), || {
-        // Core, remote, and FFmpeg assets retain the versioned sidecar shortcut. The small EPUB
-        // worker and four loader-critical app-local CRT files are hashed on every launch, so a
+        // Core, remote, and FFmpeg assets retain the versioned sidecar shortcut. The EPUB
+        // worker, editor and four loader-critical app-local CRT files are hashed on every launch, so a
         // current sidecar cannot bless same-length corruption in those assets.
         if !always_verify_contents && let Ok(stored) = std::fs::read_to_string(hash_path) {
             return Ok(stored.trim().eq_ignore_ascii_case(expected_hash));
@@ -849,6 +858,30 @@ fn show_error(msg: &str) {
 #[cfg(test)]
 mod diagnostics_tests {
     #[test]
+    fn embedded_companion_paths_follow_cargo_out_dir_even_with_injected_target_env() {
+        let release_dir = super::build_output_paths::release_inputs_dir_from_out_dir(
+            std::path::Path::new(env!("OUT_DIR")),
+        )
+        .unwrap();
+        if let Some(injected) = std::env::var_os("MIV_TEST_EXPECT_INJECTED_TARGET_DIR") {
+            assert_eq!(std::env::var_os("CARGO_TARGET_DIR"), Some(injected.clone()));
+            assert_ne!(
+                release_dir,
+                std::path::PathBuf::from(injected).join("release")
+            );
+        }
+        for (actual, name) in [
+            (env!("MIMV_CORE_EXE"), "mimageviewer-core.exe"),
+            (env!("MIMV_REMOTE_EXE"), "mimageviewer-remote.exe"),
+            (env!("MIMV_EPUB_PDF_EXE"), "mimageviewer-epub-pdf.exe"),
+            (env!("MIMV_MCP_EXE"), "mimageviewer-mcp.exe"),
+            (env!("MIMV_MUSICVIDEO_EXE"), "mimageviewer-musicvideo.exe"),
+        ] {
+            assert_eq!(std::path::Path::new(actual), release_dir.join(name));
+        }
+    }
+
+    #[test]
     fn asset_disposition_preserves_content_verification_and_reuse() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("asset.dll");
@@ -1114,6 +1147,70 @@ mod tests {
         assert!(core.is_file());
         assert!(worker.is_file());
         assert_eq!(super::sha256_file_hex(&worker).unwrap(), asset.2);
+    }
+
+    #[test]
+    fn embedded_musicvideo_editor_extracts_beside_core_and_preserves_existing_assets() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path().join("runtime").join(super::VERSION);
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        super::extract_assets(&runtime_dir).unwrap();
+
+        let expected_names = [
+            "mimageviewer-core.exe",
+            "mimageviewer-remote.exe",
+            "mimageviewer-epub-pdf.exe",
+            "mimageviewer-mcp.exe",
+            "mimageviewer-musicvideo.exe",
+            "avcodec-61.dll",
+            "avformat-61.dll",
+            "avutil-59.dll",
+            "avfilter-10.dll",
+            "swscale-8.dll",
+            "swresample-5.dll",
+            "msvcp140.dll",
+            "msvcp140_1.dll",
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+        ];
+        assert_eq!(super::ASSETS.len(), expected_names.len());
+        let editor = runtime_dir
+            .join("mimageviewer-core.exe")
+            .with_file_name("mimageviewer-musicvideo.exe");
+        assert!(editor.is_file());
+        assert_eq!(std::fs::read(&editor).unwrap(), super::MUSICVIDEO_EXE);
+        assert_eq!(
+            super::sha256_file_hex(&editor).unwrap(),
+            env!("MIMV_MUSICVIDEO_EXE_SHA256")
+        );
+        // All previously embedded assets still have exactly their declared contents.
+        for name in expected_names {
+            let asset = super::ASSETS.iter().find(|asset| asset.0 == name).unwrap();
+            let path = runtime_dir.join(name);
+            assert_eq!(std::fs::read(&path).unwrap(), asset.1, "{name}");
+            assert_eq!(super::sha256_file_hex(&path).unwrap(), asset.2, "{name}");
+        }
+    }
+
+    #[test]
+    fn embedded_musicvideo_editor_repairs_corruption_with_a_current_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path().join("runtime").join(super::VERSION);
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let asset = super::ASSETS
+            .iter()
+            .find(|asset| asset.0 == "mimageviewer-musicvideo.exe")
+            .unwrap();
+        super::extract_asset(&runtime_dir, asset).unwrap();
+        let editor = runtime_dir.join(asset.0);
+        let sidecar = super::sidecar_hash_path(&editor);
+        let mut corrupt = std::fs::read(&editor).unwrap();
+        corrupt[0] ^= 0xff;
+        std::fs::write(&editor, corrupt).unwrap();
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap().trim(), asset.2);
+        super::extract_asset(&runtime_dir, asset).unwrap();
+        assert_eq!(std::fs::read(&editor).unwrap(), asset.1);
+        assert_eq!(super::sha256_file_hex(&editor).unwrap(), asset.2);
     }
 
     #[test]

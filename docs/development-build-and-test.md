@@ -12,7 +12,7 @@
 | 変更ファイルから反復テストを選ぶ | `.\scripts\test-focused.ps1` | nextest、選択を毎回表示、0件一致は非ゼロ |
 | 本体lib全件と成功結果の再利用 | `.\scripts\test-lib-full.ps1` | nextest、同じ内容・条件の成功台帳があれば実行を省略 |
 | 診断用の窓固定・入力観測のテスト | `cargo test -p mimageviewer --lib <filter> --features test-script` | `test_script` / `native_ui_smoke`等の対象。通常core checkも別に行う |
-| 実アプリ用の軽量ビルド | `.\scripts\build-dev.ps1` | core・remote・EPUB worker・MCP adapter を `dev-runtime` でビルド |
+| 実アプリ用の軽量ビルド | `.\scripts\build-dev.ps1` | core・remote・EPUB worker・MCP adapter・music-video editor を `dev-runtime` でビルド |
 | 自動操作用の使い捨て環境を準備 | `.\scripts\prepare-portable-smoke.ps1 -TestScript` | 診断portableを別出力先でbuildし、固定sandboxへ配置。起動はしない |
 | 了承済みのリリース前実アプリ検証 | `.\scripts\ui-smoke.ps1 -Scenario <対象> -InteractiveApproved` | [実行確認](interactive-release-verification.md)後だけ。通常の開発反復・test-fullへ自動連結しない |
 | 毎リリースのidle／perf正規確認 | `.\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved` | 2026-10-11採用。利用者がPowerShellで実行。隔離seed＋5 idle＋cached／uncached perf、全結果は `target/ui-smoke/runs/<run-id>/` |
@@ -77,16 +77,17 @@ release 出力は `<repo>\target\release` に固定する。`build-release.ps1` 
 launcher と MCP については、その build が書く exe と image path が完全一致する process だけを
 停止/拒否の対象にする。インストール先の AI 連携と path 不明の process はこの2名の対象外。
 
-workspace 全体/launcher のテストは、埋込入力4本を先に作る必要がある:
+workspace 全体/launcher のテストは、埋込入力5本を先に作る必要がある:
 
 ```powershell
 cargo build --release --bin mimageviewer-core
 cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets
 cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf
 cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp
+cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo
 ```
 
-release wrapper は core → remote → EPUB worker → MCP → launcher の順でビルドする。
+release wrapper は core → remote → EPUB worker → MCP → editor → launcher の順でビルドする。
 
 同経路では `test-full.ps1 -SuppressCrashDialogs` を子プロセス内で適用する。
 Windowsのクラッシュダイアログだけをそのプロセスで抑え、元のerror modeを終了時に復元する。
@@ -265,7 +266,7 @@ test profile は dev を継承するので、設定は `[profile.dev]` だけに
 
 ### 実アプリの開発ビルド
 
-`build-dev.ps1` は次の条件で core → remote service → EPUB worker → MCP adapter をビルドする。
+`build-dev.ps1` は次の条件で core → remote service → EPUB worker → MCP adapter → music-video editor をビルドする。
 
 - `dev-runtime` profile: `opt-level = 2`、LTO なし、codegen unit 64、incremental 有効
 - 通常 feature set（`portable` は付けない）: 設定・キャッシュ・ログの既定保存先は
@@ -273,7 +274,7 @@ test profile は dev を継承するので、設定は `[profile.dev]` だけに
 - launcher を省略して直接起動できるよう、FFmpeg DLL だけを exe の隣へ配置。他の
   DLL・worker・AI model は通常版と同じ埋め込み・展開経路を使う
 - 出力: `target\dev-runtime\mimageviewer-core.exe`
-  と `mimageviewer-remote.exe` / `mimageviewer-epub-pdf.exe` / `mimageviewer-mcp.exe`。
+  と `mimageviewer-remote.exe` / `mimageviewer-epub-pdf.exe` / `mimageviewer-mcp.exe` / `mimageviewer-musicvideo.exe`。
   MCP は1dの登録先として core と同じフォルダに必要。
 - Cargo の `dev-runtime` はビルド時間短縮用の最適化profileであり、アプリのデータprofileを
   切り替えるものではない
@@ -283,6 +284,7 @@ test profile は dev を継承するので、設定は `[profile.dev]` だけに
 出力先と同じ絶対パスの core / remote / EPUB worker / MCP が実行中なら、停止せずエラーで終了する。
 この指定を省略した場合は、従来どおり同じ出力先のプロセスを停止してからビルドする。
 停止分岐の回帰は `scripts/test-build-dev-safety.ps1` で実プロセスを操作せず確認できる。
+エディタはこの停止対象に含めず、出力先のエディタが稼働中なら `-PreserveRuntime` の有無にかかわらず、保存・終了を求めて中止する。
 通常profileを汚さない隔離確認が明示的に必要な場合は、同じバイナリへ
 `--data-dir .\target\dev-runtime\data` を渡す。build flavor自体をportableへ変えない。
 C++ VST3 bridge 自体を変更した場合は、従来どおり先にCMakeでbridgeを再ビルドする。
@@ -353,6 +355,27 @@ cargo run --release --features dev-tools --bin bench_search -- --docs 50000
 これにより本体unit testはlib test executableに一本化され、lib用の互換`app` stubも不要になった。
 
 ## リリースゲート
+
+`test-full.ps1` の前提: launcher の build.rs は `target/release/` に core、remote、
+EPUB worker、MCP adapter、音楽ビデオエディタの release exe が揃っていることを要求する。
+新しい clone や clean 後は `.\scripts\build-release.ps1 -PreserveRuntime`、または次の順で準備する。
+
+```powershell
+cargo build --release --bin mimageviewer-core
+cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets
+cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf
+cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp
+cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo
+```
+
+launcher はこの 5 本の後にビルドする。`musicvideo-editor` は workspace 全体テストに含まれる。
+launcher の内包元は Cargo の `OUT_DIR` の profile と同じ出力 tree の `release` を導く。debug-profile テストも release 5 本を前提とし、`[env] CARGO_TARGET_DIR` による子プロセスの環境変更では内包元を変えない。想定外の `OUT_DIR` は fallback せず失敗し、`build.build-dir` による出力先の分離は wrapper が開始前に拒否する。
+build-release／build-dist／build-portable／build-dev は開始前に実際の Cargo 実行場所・環境で `cargo metadata --format-version 1 --no-deps --offline` の `target_directory` と `build_directory` を固定出力先と照合し、不一致と `CARGO_BUILD_TARGET` を `-PreserveRuntime` に関係なく拒否する（`build_directory` 未出力時は `target_directory` と同じ扱い、portable 自身の固定 `--target-dir` は維持、設定ファイルの `build.target` は検査対象外）。
+配布は test-full → clean → core → remote → EPUB worker → MCP → editor → launcher → installer → portable。
+エディタは全 build スクリプトで自動終了しない。出力先が使用中なら、保存・終了後に再実行する。
+portable の配布フォルダ置換は `-SkipBuild` / `-KeepRunning` でも同じ保護対象となる。
+
+`test-full.ps1` は次のコマンドを実行し、失敗すれば非ゼロで終了する。
 
 ### 非対話 gate と live Windows 試験
 
