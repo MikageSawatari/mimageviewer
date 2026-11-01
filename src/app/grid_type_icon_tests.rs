@@ -163,6 +163,8 @@ struct Preview {
     lines: usize,
     bookmark: bool,
     no_art: bool,
+    tint: crate::os_theme::ThumbnailTypeTint,
+    play: bool,
 }
 impl Default for Preview {
     fn default() -> Self {
@@ -176,6 +178,8 @@ impl Default for Preview {
             lines: 1,
             bookmark: false,
             no_art: false,
+            tint: crate::os_theme::ThumbnailTypeTint::Soft,
+            play: false,
         }
     }
 }
@@ -189,7 +193,8 @@ fn draw(ui: &mut egui::Ui, p: Preview) {
         ui.horizontal(|ui| {
             for (col, (label, item)) in row.iter().enumerate() {
                 ui.vertical(|ui| {
-                    ui.label(egui::RichText::new(*label).small());
+                    ui.set_width(p.width);
+                    ui.add(egui::Label::new(egui::RichText::new(*label).small()).truncate());
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(p.width, p.height), egui::Sense::hover());
                     let index = row_idx * 4 + col;
@@ -232,7 +237,11 @@ fn draw(ui: &mut egui::Ui, p: Preview) {
                         p.bookmark.then_some("12:34"),
                         p.bookmark.then_some("お気に入りの場面"),
                         false,
-                        VideoThumbnailIndicator::BottomLeftBadge,
+                        if p.play {
+                            VideoThumbnailIndicator::PlayIcon
+                        } else {
+                            VideoThumbnailIndicator::BottomLeftBadge
+                        },
                         AudioThumbnailIndicator::BottomLeftBadge,
                         p.crowded && index % 2 == 0,
                         Some(12),
@@ -246,7 +255,7 @@ fn draw(ui: &mut egui::Ui, p: Preview) {
                         p.size,
                         is_cut,
                     );
-                    let hits = draw_cell_with_hit_areas(
+                    let hits = paint_cell(
                         ui,
                         rect,
                         index == 1,
@@ -258,10 +267,16 @@ fn draw(ui: &mut egui::Ui, p: Preview) {
                         crate::rotation_db::Rotation::None,
                         None,
                         false,
-                        VideoThumbnailIndicator::BottomLeftBadge,
+                        if p.play {
+                            VideoThumbnailIndicator::PlayIcon
+                        } else {
+                            VideoThumbnailIndicator::BottomLeftBadge
+                        },
                         AudioThumbnailIndicator::BottomLeftBadge,
                         is_cut,
                         Some(0.42),
+                        true,
+                        p.tint,
                     );
                     if let Some(time) = layout.top_left.bookmark_time.as_ref() {
                         crate::ui_helpers::draw_overlay_bookmark_time_badge(
@@ -273,7 +288,7 @@ fn draw(ui: &mut egui::Ui, p: Preview) {
                     if let Some(title) = layout.bookmark_title.as_ref() {
                         crate::ui_helpers::draw_overlay_bookmark_title_badge(ui.painter(), title);
                     }
-                    if let Some(icon) = layout.bottom_left.type_icon.as_ref() {
+                    if let Some(icon) = layout.type_icon.as_ref() {
                         assert!(hits.contains(icon.rect.center()));
                     }
                     let badges: Vec<_> = layout.badge_placements().collect();
@@ -348,6 +363,49 @@ fn thumbnail_type_icon_snapshot_light() {
 }
 
 #[test]
+fn thumbnail_type_icon_category_sort_and_palette_contract() {
+    use crate::os_theme::ThumbnailTypeTint;
+    use crate::settings::GridItemDisplayKind::{Archive, Folder, Image, VideoAudio};
+    let expected = [
+        Some(Folder),
+        Some(Archive),
+        Some(Archive),
+        Some(Archive),
+        Some(Image),
+        Some(VideoAudio),
+        Some(Archive),
+        Some(VideoAudio),
+        Some(Image),
+        Some(Image),
+        Some(Archive),
+        Some(Image),
+        None,
+        None,
+        None,
+        Some(Archive),
+    ];
+    for ((label, item), category) in items().into_iter().zip(expected) {
+        assert_eq!(crate::grid_item::display_kind(&item), category, "{label}");
+    }
+    for dark in [false, true] {
+        for tint in [ThumbnailTypeTint::Soft, ThumbnailTypeTint::Strong] {
+            let colors: Vec<_> = [Folder, Archive, Image, VideoAudio]
+                .into_iter()
+                .map(|group| crate::os_theme::thumbnail_type_background(dark, Some(group), tint))
+                .collect();
+            assert!(colors.iter().all(|color| color.a() == 255));
+            for (index, color) in colors.iter().enumerate() {
+                assert!(!colors[index + 1..].contains(color));
+            }
+            assert_eq!(
+                crate::os_theme::thumbnail_type_background(dark, None, tint),
+                crate::os_theme::thumbnail_type_background(dark, None, ThumbnailTypeTint::Neutral)
+            );
+        }
+    }
+}
+
+#[test]
 fn thumbnail_type_icon_preserves_small_primary_markers() {
     let ctx = egui::Context::default();
     crate::ui_fonts::configure_fonts(&ctx);
@@ -383,15 +441,27 @@ fn thumbnail_type_icon_preserves_small_primary_markers() {
                                 Some(THUMB_TYPE_ICON_SIZE),
                                 is_cut,
                             );
-                            if let Some(icon) = layout.bottom_left.type_icon {
+                            let protected: Vec<_> = layout
+                                .badge_placements()
+                                .map(|b| b.rect)
+                                .chain(layout.check)
+                                .chain(layout.book_resume_meter)
+                                .collect();
+                            if let Some(icon) = layout.type_icon {
                                 if is_cut
                                     && let Some((center, radius)) =
                                         cut_badge_geometry(cell.shrink(4.0))
                                 {
-                                    assert!(!icon.rect.intersects(egui::Rect::from_center_size(
-                                        center,
-                                        egui::Vec2::splat(radius * 2.0)
-                                    )));
+                                    assert!(!icon.rect.intersects(
+                                        crate::thumb_overlay_layout::fit_content_marker(
+                                            egui::Rect::from_center_size(
+                                                center,
+                                                egui::Vec2::splat(radius * 2.0)
+                                            ),
+                                            cell,
+                                            &protected
+                                        )
+                                    ));
                                 }
                                 for obstacle in primary_marker_obstacles(
                                     ui.painter(),
@@ -407,7 +477,11 @@ fn thumbnail_type_icon_preserves_small_primary_markers() {
                                     AudioThumbnailIndicator::MusicNoteIcon,
                                 ) {
                                     assert!(
-                                        !icon.rect.intersects(obstacle),
+                                        !icon.rect.intersects(
+                                            crate::thumb_overlay_layout::fit_content_marker(
+                                                obstacle, cell, &protected
+                                            )
+                                        ),
                                         "{item:?}, side={side}"
                                     );
                                 }
@@ -422,13 +496,134 @@ fn thumbnail_type_icon_preserves_small_primary_markers() {
 }
 
 #[test]
+fn thumbnail_type_icon_real_paint_avoids_check_and_search_label() {
+    for meter in [false, true] {
+        for search in [false, true] {
+            let ctx = egui::Context::default();
+            crate::os_theme::apply_resolved(&ctx, crate::os_theme::ResolvedTheme::Dark);
+            crate::ui_fonts::configure_fonts(&ctx);
+            let item = if search {
+                items().remove(12).1
+            } else {
+                GridItem::Video("clip.mp4".into())
+            };
+            let mut output = None;
+            for _ in 0..2 {
+                output = Some(crate::test_ui::headless_paint_output(ctx.run_ui(
+                    Default::default(),
+                    |ui| {
+                        let cell = egui::Rect::from_min_size(
+                            egui::pos2(20.0, 20.0),
+                            egui::vec2(74.0, 48.0),
+                        );
+                        let thumb = thumbnail(ui.ctx(), true);
+                        let layout = layout_cell_overlays(
+                            ui.painter(),
+                            cell,
+                            Default::default(),
+                            0,
+                            &item,
+                            &thumb,
+                            &[],
+                            None,
+                            None,
+                            false,
+                            VideoThumbnailIndicator::PlayIcon,
+                            AudioThumbnailIndicator::MusicNoteIcon,
+                            !search,
+                            None,
+                            None,
+                            meter,
+                            Default::default(),
+                            Some(THUMB_TYPE_ICON_SIZE),
+                            false,
+                        );
+                        let hits = draw_cell_with_hit_areas(
+                            ui,
+                            cell,
+                            false,
+                            !search,
+                            false,
+                            &layout,
+                            &item,
+                            &thumb,
+                            crate::rotation_db::Rotation::None,
+                            None,
+                            false,
+                            VideoThumbnailIndicator::PlayIcon,
+                            AudioThumbnailIndicator::MusicNoteIcon,
+                            false,
+                            meter.then_some(0.4),
+                        );
+                        assert!(hits.contains(layout.type_icon.as_ref().unwrap().rect.center()));
+                    },
+                )));
+            }
+            let output = output.unwrap();
+            let shapes: Vec<_> = output.shapes.iter().map(|clipped| &clipped.shape).collect();
+            if search {
+                let marker = shapes
+                    .iter()
+                    .find_map(|shape| match shape {
+                        egui::Shape::Text(text) if text.galley.job.text == "📁" => {
+                            Some(shape.visual_bounding_rect())
+                        }
+                        _ => None,
+                    })
+                    .expect("search marker must still be painted");
+                let label = shapes
+                    .iter()
+                    .find_map(|shape| match shape {
+                        egui::Shape::Rect(rect)
+                            if rect.fill == egui::Color32::from_rgb(38, 42, 50) =>
+                        {
+                            Some(rect.rect)
+                        }
+                        _ => None,
+                    })
+                    .expect("search label background must still be painted");
+                assert!(
+                    !marker.intersects(label),
+                    "meter={meter}: {marker:?} / {label:?}"
+                );
+            } else {
+                let circle = |fill| {
+                    shapes
+                        .iter()
+                        .find_map(|shape| match shape {
+                            egui::Shape::Circle(circle) if circle.fill == fill => {
+                                Some(shape.visual_bounding_rect())
+                            }
+                            _ => None,
+                        })
+                        .expect("both play and check circles must still be painted")
+                };
+                let play = circle(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160));
+                let check = circle(egui::Color32::from_rgb(40, 140, 40));
+                assert!(
+                    !play.intersects(check),
+                    "meter={meter}: {play:?} / {check:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 #[ignore = "Writes user comparison images into target/1677-preview; run explicitly"]
 fn thumbnail_type_icon_write_previews() {
     let output = std::path::Path::new("target/1677-preview");
     std::fs::create_dir_all(output).unwrap();
-    let mut readme = String::from(
-        "§1.677 試作比較。製品起動なし・共通の本体セル描画へ生成画像を渡した headless PNG。\n寸法は logical pt、1pt=1px。背景の枠は各辺2pt、glyph16/20/24ptのplate20/24/28pt。\n各一覧の項目・明暗画像・選択・メーターを固定。左からフォルダ/ZIP/RAR/PDF、画像/動画/書庫内フォルダ/音声、書庫内画像/PDFページ/入れ子書庫/スタック、集約フォルダ/集約書庫/参照元なし/CBZ。\n集約書庫と参照元なしは画像なし。FinalCacheの生成textureを利用。他の全状態は回帰テストで検査。\n\n",
-    );
+    let mut readme = String::from(concat!(
+        "§1.677 固定slot版。製品起動なし。本体共通のセル描画＋生成textureのheadless PNG。\n",
+        "logical pt、1pt=1px。既定ON、図形20pt＋不透明背景24pt。slotはセル左上から(4,4)pt。\n",
+        "色の案は左からNeutral=色なし／Soft=薄い4色／Strong=やや濃い4色。現sourceはSoftを仮適用。\n",
+        "実フォルダ=青緑／アーカイブ類=薄紫／画像=薄桃／動画・音声=暖灰。その他=無彩色。\n",
+        "行順: フォルダ/ZIP/RAR/PDF、画像/動画/書庫内フォルダ/音声、書庫内画像/PDFページ/入れ子書庫/スタック、集約フォルダ/集約書庫/参照元なし/CBZ。\n",
+        "集約書庫と参照元なしは画像なし。他は明暗の生成画像、選択状態、読書位置メーターを固定。\n",
+        "minimumは32 OFF／32 ON／48 ON／74×48（再生マーク）を比較。バッジ多数。\n",
+        "32ptではcheckが3pt、他の補助マークも縮小・省略される。極小時の視認性の限界を示す。\n\n",
+    ));
     for (name, theme) in [
         ("dark", crate::os_theme::ResolvedTheme::Dark),
         ("light", crate::os_theme::ResolvedTheme::Light),
@@ -441,25 +636,25 @@ fn thumbnail_type_icon_write_previews() {
                 "通常セル174×132、名前幅優先OFF、OFF/ONを左右比較",
             ),
             (
-                "sizes",
+                "colors",
                 vec![
                     (
-                        "小 / 16pt",
+                        "Neutral",
                         Preview {
-                            size: Some(16.0),
+                            tint: crate::os_theme::ThumbnailTypeTint::Neutral,
                             ..p
                         },
                     ),
-                    ("中 / 20pt", p),
+                    ("Soft / 4 colors", p),
                     (
-                        "大 / 24pt",
+                        "Strong / 4 colors",
                         Preview {
-                            size: Some(24.0),
+                            tint: crate::os_theme::ThumbnailTypeTint::Strong,
                             ..p
                         },
                     ),
                 ],
-                "同じ一覧でglyph16/20/24ptを左右比較",
+                "Neutral / Soft / Strong, fixed 20pt glyph + 24pt plate",
             ),
             (
                 "narrow",
@@ -483,6 +678,50 @@ fn thumbnail_type_icon_write_previews() {
                     ),
                 ],
                 "狭いセル74×94、名前幅優先OFF/ON",
+            ),
+            (
+                "minimum",
+                vec![
+                    (
+                        "32 OFF",
+                        Preview {
+                            width: 32.0,
+                            height: 32.0,
+                            crowded: true,
+                            size: None,
+                            ..p
+                        },
+                    ),
+                    (
+                        "32 ON",
+                        Preview {
+                            width: 32.0,
+                            height: 32.0,
+                            crowded: true,
+                            ..p
+                        },
+                    ),
+                    (
+                        "48 ON",
+                        Preview {
+                            width: 48.0,
+                            height: 48.0,
+                            crowded: true,
+                            ..p
+                        },
+                    ),
+                    (
+                        "74 x 48",
+                        Preview {
+                            width: 74.0,
+                            height: 48.0,
+                            play: true,
+                            crowded: true,
+                            ..p
+                        },
+                    ),
+                ],
+                "Minimum cells: icon wins; secondary markers shrink or yield",
             ),
             (
                 "crowded",
@@ -618,27 +857,22 @@ fn thumbnail_type_icon_all_states_contexts_and_hit_regions() {
                                     };
                                     let off = make(None);
                                     let on = make(Some(THUMB_TYPE_ICON_SIZE));
-                                    assert!(off.bottom_left.type_icon.is_none());
-                                    if width >= 174.0 {
+                                    assert!(off.type_icon.is_none());
+                                    if width >= 32.0 {
                                         assert!(
-                                            on.bottom_left.type_icon.is_some(),
+                                            on.type_icon.is_some(),
                                             "missing icon: {label}, bookmark={bookmark}"
                                         );
                                     }
-                                    if let Some(icon) = on.bottom_left.type_icon.as_ref() {
+                                    if let Some(icon) = on.type_icon.as_ref() {
                                         assert!(rect.contains_rect(icon.rect));
-                                        for obstacle in custom_caption_obstacles(
-                                            ui.painter(),
-                                            rect,
-                                            &item,
-                                            thumb,
-                                            true,
-                                        ) {
-                                            assert!(
-                                                !icon.rect.intersects(obstacle),
-                                                "custom content: {label}"
-                                            );
-                                        }
+                                        assert_eq!(
+                                            icon.rect,
+                                            crate::thumb_overlay_layout::type_icon_slot(
+                                                rect,
+                                                THUMB_TYPE_ICON_SIZE
+                                            )
+                                        );
                                         let hits = draw_cell_with_hit_areas(
                                             ui,
                                             rect,

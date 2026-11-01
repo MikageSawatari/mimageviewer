@@ -1413,7 +1413,7 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
             "サムネイルに種類アイコンを表示する",
         );
         ui.small(
-            "画像が表示された後も、左下の小さなマークでフォルダ・書庫・画像などを見分けられます。",
+            "画像が表示された後も、左上の固定マークでフォルダ・書庫・画像などを見分けられます。",
         );
     });
     anchored(ui, state, "thumbnail/name-font-scale", |ui, state| {

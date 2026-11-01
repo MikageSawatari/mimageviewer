@@ -318,6 +318,46 @@ pub fn book_resume_meter_palette(dark: bool) -> BookResumeMeterPalette {
     }
 }
 
+/// Background-tint candidates for the thumbnail type plate (not persisted).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ThumbnailTypeTint {
+    Neutral,
+    #[default]
+    Soft,
+    Strong,
+}
+
+/// Opaque category plates only; icon ink follows the active app text contrast.
+pub(crate) fn thumbnail_type_background(
+    dark: bool,
+    group: Option<crate::settings::GridItemDisplayKind>,
+    tint: ThumbnailTypeTint,
+) -> egui::Color32 {
+    use crate::settings::GridItemDisplayKind as G;
+    let neutral = if dark { [32, 32, 32] } else { [248, 248, 248] };
+    // Teal / lavender / rose / warm gray, avoiding selection/check/rating/warning hues.
+    let rgb = match (dark, tint, group) {
+        (_, ThumbnailTypeTint::Neutral, _) | (_, _, None) => neutral,
+        (true, ThumbnailTypeTint::Soft, Some(G::Folder)) => [43, 76, 77],
+        (true, ThumbnailTypeTint::Soft, Some(G::Archive)) => [69, 57, 87],
+        (true, ThumbnailTypeTint::Soft, Some(G::Image)) => [87, 54, 69],
+        (true, ThumbnailTypeTint::Soft, Some(G::VideoAudio)) => [76, 71, 62],
+        (false, ThumbnailTypeTint::Soft, Some(G::Folder)) => [218, 238, 237],
+        (false, ThumbnailTypeTint::Soft, Some(G::Archive)) => [233, 224, 245],
+        (false, ThumbnailTypeTint::Soft, Some(G::Image)) => [246, 222, 232],
+        (false, ThumbnailTypeTint::Soft, Some(G::VideoAudio)) => [234, 230, 220],
+        (true, ThumbnailTypeTint::Strong, Some(G::Folder)) => [42, 97, 98],
+        (true, ThumbnailTypeTint::Strong, Some(G::Archive)) => [88, 64, 119],
+        (true, ThumbnailTypeTint::Strong, Some(G::Image)) => [121, 61, 87],
+        (true, ThumbnailTypeTint::Strong, Some(G::VideoAudio)) => [101, 91, 72],
+        (false, ThumbnailTypeTint::Strong, Some(G::Folder)) => [181, 222, 220],
+        (false, ThumbnailTypeTint::Strong, Some(G::Archive)) => [214, 196, 237],
+        (false, ThumbnailTypeTint::Strong, Some(G::Image)) => [237, 189, 208],
+        (false, ThumbnailTypeTint::Strong, Some(G::VideoAudio)) => [216, 208, 188],
+    };
+    egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+}
+
 /// Windows の「アプリ用の色」(`HKCU\...\Personalize\AppsUseLightTheme`) を読んで
 /// Light / Dark を返す。取得失敗時は `None`。
 #[cfg(windows)]

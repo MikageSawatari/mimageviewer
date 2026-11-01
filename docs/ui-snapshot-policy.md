@@ -1,5 +1,14 @@
 # UI スナップショットテスト運用方針
 
+§1.677の種類iconは、既存の`thumbnail_type_icon_dark/light`を固定slot・薄い4色の試作へ更新する。
+セル枠左上(4,4)pt、図形20pt＋背景24ptを全種類で保持する。
+設定説明の「左下」→「左上の固定マーク」に合わせ、`preferences_favorite_view_state_dark`も更新する。
+この3枚（計323,727 bytes）だけを明示対象として更新し、生成後に目視確認した。
+比較用の14枚は`target/1677-preview/`へ分け、色なし/薄い/やや濃い、OFF/ON、狭幅・最小32pt、
+名前幅優先・多数badge・代表画像なし・名前200%最大4行・中央bookmark titleをdark/lightで確認する。
+最小32ptでは補助マークの視認性が低下する制約も実寸で示す。製品は起動しない。
+検証結果の正本は[§1.677の実装記録](next-release-backlog.md)。
+
 §1.673 のバケツは、lib の純描画 fixture で `bucket_drawn_mask_options_dark`
 （250×300、27,771 bytes）を1枚追加する。3ツール共通の基準選択・色差の無効表示・既存の範囲と
 漏れ止め／はみ出しを描き、切替後の色差値保持もheadless入力で検査する。

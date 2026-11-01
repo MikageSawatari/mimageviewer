@@ -919,7 +919,7 @@ pub fn materialize_view_rows<R>(
     (items, image_metas)
 }
 
-fn display_kind(item: &GridItem) -> Option<crate::settings::GridItemDisplayKind> {
+pub(crate) fn display_kind(item: &GridItem) -> Option<crate::settings::GridItemDisplayKind> {
     use crate::settings::GridItemDisplayKind;
     match item {
         GridItem::Folder(_) => Some(GridItemDisplayKind::Folder),

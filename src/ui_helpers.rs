@@ -1986,12 +1986,17 @@ pub enum NaturalChunk {
 
 /// 動画サムネイル中央に表示する「再生ボタン」(半透明黒円 + 白三角) を描画する。
 pub fn draw_play_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
+    painter.extend(play_icon_shapes(center, radius));
+}
+pub(crate) fn play_icon_shapes(center: egui::Pos2, radius: f32) -> Vec<egui::Shape> {
+    let mut shapes = Vec::new();
+
     // 背景円
-    painter.circle_filled(
+    shapes.push(egui::Shape::circle_filled(
         center,
         radius,
         egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
-    );
+    ));
     // 右向き三角形（ポリゴン）
     // 視覚的中心を合わせるため若干右にオフセット
     let tr = radius * 0.45;
@@ -2002,11 +2007,13 @@ pub fn draw_play_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32) 
         egui::pos2(cx - tr * 0.55, cy + tr * 0.9), // 左下
         egui::pos2(cx + tr * 0.95, cy),            // 右頂点
     ];
-    painter.add(egui::Shape::convex_polygon(
+    shapes.push(egui::Shape::convex_polygon(
         points,
         egui::Color32::WHITE,
         egui::Stroke::NONE,
     ));
+
+    shapes
 }
 
 /// グリッドの音声セル用に、固定の音楽アイコン (2 連八分音符) をベクター描画する。
@@ -2031,7 +2038,7 @@ pub(crate) fn music_icon_bounds(inner: egui::Rect) -> egui::Rect {
         })
 }
 
-fn music_icon_shapes(inner: egui::Rect, dark: bool) -> [egui::Shape; 5] {
+pub(crate) fn music_icon_shapes(inner: egui::Rect, dark: bool) -> [egui::Shape; 5] {
     let side = inner.width().min(inner.height());
     let s = (side * 0.34).clamp(22.0, 64.0);
     let center = inner.center() - egui::vec2(0.0, side * 0.05);

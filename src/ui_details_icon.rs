@@ -146,18 +146,20 @@ pub(crate) fn draw_details_preview_icon(
     draw_kind_icon(painter, rect, kind, color, muted, 1.0);
 }
 
-/// The thumbnail mark shares the Details shapes, with an opaque neutral plate for light/dark art.
+/// The thumbnail mark shares the Details shapes with a category-colored opaque plate.
 pub(crate) fn draw_thumbnail_type_icon(
     painter: &egui::Painter,
     rect: egui::Rect,
-    kind: DetailsIconKind,
-    dark: bool,
+    item: &GridItem,
+    tint: crate::os_theme::ThumbnailTypeTint,
+    visuals: &egui::Visuals,
 ) {
-    let (background, foreground) = if dark {
-        (egui::Color32::from_gray(32), egui::Color32::from_gray(245))
-    } else {
-        (egui::Color32::from_gray(248), egui::Color32::from_gray(30))
-    };
+    let background = crate::os_theme::thumbnail_type_background(
+        visuals.dark_mode,
+        crate::grid_item::display_kind(item),
+        tint,
+    );
+    let foreground = visuals.text_color();
     painter.rect_filled(rect, 3.0, background);
     painter.rect_stroke(
         rect,
@@ -168,7 +170,7 @@ pub(crate) fn draw_thumbnail_type_icon(
     draw_kind_icon(
         painter,
         rect.shrink(crate::thumb_overlay_layout::TYPE_ICON_PADDING),
-        kind,
+        details_icon_kind(item),
         foreground,
         false,
         f32::INFINITY,

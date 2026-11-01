@@ -1,4 +1,4 @@
-/// Prototype default: change this one constant after the visual comparison.
+/// Adopted default (section 1.677, 2026-11-01).
 pub const DEFAULT_THUMB_SHOW_TYPE_ICON: bool = true;
 fn default_thumb_show_type_icon() -> bool {
     DEFAULT_THUMB_SHOW_TYPE_ICON
@@ -4860,7 +4860,7 @@ pub struct Settings {
     /// 形式表示を名前の直上に置き、ファイル名に全幅を使う。
     #[serde(default)]
     pub thumb_name_prioritize_width: bool,
-    /// Keep a small typed mark after the representative thumbnail loads (§1.677 prototype).
+    /// Keep a small typed mark after the representative thumbnail loads (§1.677).
     #[serde(default = "default_thumb_show_type_icon")]
     pub thumb_show_type_icon: bool,
     /// サムネイル右下に動画・音声の長さを表示する。
