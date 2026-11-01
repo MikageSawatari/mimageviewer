@@ -15,6 +15,11 @@
 全入力の消費印は既存frame markerを共有し、activation後の再passと残りを再登録しない。
 親操作は旧ScrollArea読戻し後の既存経路。正本・検証記録は `next-release-backlog.md` §1.680。
 
+同日の再レビューP2追補: `process_scroll` が消費しない横ホイール／微小縦デルタが残っても、
+共通列全体を停止しない。残存ホイールは背景の一次press／releaseの対象判定と背景pairの終了にだけ
+適用し、セルの選択／activationとセル・余白のsecondary入力を受理する。大きい縦デルタは従来どおり
+上流ownerが消費し、全クリック対を終了する。受理済みwheel後の同passクリックは新しい入力として扱う。
+
 - `App::grid_click_pairing` / `GridClickPairingState` が同じセル・items generation・時間に
   よるクリック対を所有する。`begin_primary_click_frame` は一次クリック時に状態を取り出し、
   セルが受理しなければ対を切る。egui の double/triple click の回数を起動判定に使わない。

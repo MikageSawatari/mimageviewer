@@ -17729,7 +17729,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if !self.grid_item_input_allowed()
             || suppress_primary_pointer
             || egui::Popup::is_any_open(ctx)
-            || scroll
         {
             self.grid_click_pairing.end_activation();
             self.grid_right_drag_primary_suppression
@@ -17739,6 +17738,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         }
         ctx.data_mut(|data| data.insert_temp(id, GridPrimaryInputFrame::Processed(frame)));
         self.grid_click_pairing = previous;
+        // Remaining wheel input only blocks background primary operations. Cells
+        // and secondary input used to run before the background wheel guard.
+        if scroll {
+            self.grid_click_pairing.end_background_run();
+        }
         if !ctx.input(|input| input.focused)
             || self.any_dialog_open()
             || self.context_menu_idx.is_some()
@@ -17796,7 +17800,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     } => !cells.iter().any(|cell| cell.response.id == *widget),
                     _ => false,
                 };
-                (background_allowed && !foreign_widget && background_contains(pos))
+                (background_allowed && !scroll && !foreign_widget && background_contains(pos))
                     .then_some(GridPressTarget::Background)
             };
             // Background tap ownership is stricter than the cell mouse fallback.
