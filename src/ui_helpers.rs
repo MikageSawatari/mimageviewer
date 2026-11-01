@@ -526,7 +526,7 @@ pub(crate) fn draw_bucket_source_controls(
     use crate::mask_db::BucketSource;
 
     ui.label("範囲の基準");
-    let source_controls_rect = draw_bucket_choice_row(
+    let source_controls_rect = draw_panel_choice_row(
         ui,
         &[
             (
@@ -569,7 +569,7 @@ pub(crate) fn draw_bucket_region_controls(
     use crate::mask_db::BucketRegion;
 
     ui.label("塗る範囲");
-    let first_row = draw_bucket_choice_row(
+    let first_row = draw_panel_choice_row(
         ui,
         &[
             (BucketRegion::Whole, "全体", None),
@@ -577,7 +577,7 @@ pub(crate) fn draw_bucket_region_controls(
         ],
         region,
     );
-    let second_row = draw_bucket_choice_row(
+    let second_row = draw_panel_choice_row(
         ui,
         &[
             (BucketRegion::Rect, "長方形", None),
@@ -640,7 +640,8 @@ pub(crate) fn draw_tool_settings_heading(
     )
 }
 
-fn draw_bucket_choice_row<T: Copy + PartialEq>(
+/// 表示幅いっぱいの均等幅トグル行。未選択にも背景を描き、最小高24pt・横間隔4ptで揃える。
+pub(crate) fn draw_panel_choice_row<T: Copy + PartialEq>(
     ui: &mut egui::Ui,
     choices: &[(T, &str, Option<&str>)],
     selected: &mut T,
@@ -648,7 +649,7 @@ fn draw_bucket_choice_row<T: Copy + PartialEq>(
     const BUTTON_HEIGHT: f32 = 24.0;
     const BUTTON_GAP: f32 = 4.0;
     // ScrollArea の content Ui は、先行 widget により max_rect が表示幅を超えうる。
-    // 基準・範囲とも clip の表示幅を上限とした均等幅の行で描く。
+    // clip の表示幅を上限とした均等幅の行で描く。
     let visible_width = (ui.clip_rect().right() - ui.cursor().left()).max(0.0);
     let row_width = ui.available_width().min(visible_width).max(1.0);
     let gap_total = BUTTON_GAP * choices.len().saturating_sub(1) as f32;
