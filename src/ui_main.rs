@@ -457,6 +457,12 @@ impl GridRightDragPrimarySuppression {
         }
         suppress
     }
+
+    fn suppress_edge(&mut self, down: bool, released: bool, already_suppressed: bool) -> bool {
+        // Retire a cancelled hold even when another input owner suppresses this edge.
+        let cancelled = self.update(down, released);
+        already_suppressed || cancelled
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -605,12 +611,16 @@ enum GridPrimaryInputFrame {
     Blocked(u64),
     Processed(u64),
     Activated(u64),
+    CellActivated(u64),
 }
 
 impl GridPrimaryInputFrame {
     fn frame(self) -> u64 {
         match self {
-            Self::Blocked(frame) | Self::Processed(frame) | Self::Activated(frame) => frame,
+            Self::Blocked(frame)
+            | Self::Processed(frame)
+            | Self::Activated(frame)
+            | Self::CellActivated(frame) => frame,
         }
     }
 }
@@ -618,7 +628,46 @@ impl GridPrimaryInputFrame {
 #[derive(Clone, Default)]
 struct GridPrimaryHitRegions {
     frame: u64,
-    rects: Vec<egui::Rect>,
+    cells: Vec<GridCellInput>,
+}
+
+#[derive(Clone)]
+struct GridPressWitnesses {
+    frame: u64,
+    widgets: Vec<(
+        egui::Pos2,
+        egui::PointerButton,
+        bool,
+        Option<egui::Id>,
+        bool,
+    )>,
+}
+
+#[derive(Clone)]
+struct GridCellInput {
+    index: usize,
+    response: egui::Response,
+    previous_rect: egui::Rect,
+    hit_rects: Option<Vec<egui::Rect>>,
+    tag_badge_target: Option<(String, egui::Rect)>,
+    touch_derived: bool,
+    selected: bool,
+    checked: bool,
+    clip_rect: egui::Rect,
+    paint: GridCellPaint,
+}
+
+#[derive(Clone, Default)]
+enum GridCellPaint {
+    #[default]
+    None,
+    Thumbnail {
+        spread_cursor: bool,
+    },
+    Details {
+        row: usize,
+        spread_cursor: bool,
+    },
 }
 
 fn grid_primary_input_events(
@@ -627,6 +676,12 @@ fn grid_primary_input_events(
     background: bool,
 ) -> Vec<crate::app::GridPrimaryInput> {
     use crate::app::{GridClickSource, GridPrimaryInput};
+    let witnesses = ctx
+        .data(|data| data.get_temp::<GridPressWitnesses>(egui::Id::unique("grid_press_witnesses")))
+        .filter(|witness| witness.frame == ctx.cumulative_frame_nr())
+        .map(|witness| witness.widgets)
+        .unwrap_or_else(|| ctx.pointer_button_targets());
+    let mut witnesses = witnesses.into_iter();
     ctx.input(|input| {
         let mut releases = input.pointer.released_buttons_with_click_counts();
         let mut ordinal = 0;
@@ -634,12 +689,27 @@ fn grid_primary_input_events(
         for event in &input.events {
             match *event {
                 egui::Event::WindowFocused(false) => events.push(GridPrimaryInput::FocusLost),
+                egui::Event::PointerMoved(pos) => events.push(GridPrimaryInput::Moved(pos)),
+                egui::Event::Touch {
+                    phase: egui::TouchPhase::Cancel,
+                    ..
+                } => events.push(GridPrimaryInput::TouchCancelled),
                 egui::Event::PointerButton {
                     pos,
                     button,
                     pressed,
                     modifiers,
                 } => {
+                    let (widget, allowed) = match witnesses.next() {
+                        Some((witness_pos, witness_button, witness_pressed, widget, allowed))
+                            if witness_pos == pos
+                                && witness_button == button
+                                && witness_pressed == pressed =>
+                        {
+                            (widget, allowed)
+                        }
+                        _ => return vec![GridPrimaryInput::Cancelled],
+                    };
                     let click = if !pressed {
                         let Some((released_button, click)) = releases.next() else {
                             return vec![GridPrimaryInput::Cancelled];
@@ -652,6 +722,17 @@ fn grid_primary_input_events(
                         None
                     };
                     if button != egui::PointerButton::Primary {
+                        events.push(if button == egui::PointerButton::Secondary {
+                            GridPrimaryInput::Secondary {
+                                pos,
+                                pressed,
+                                clicked: click.is_some(),
+                                widget,
+                                suppressed: !allowed,
+                            }
+                        } else {
+                            GridPrimaryInput::Cancelled
+                        });
                         continue;
                     }
                     let edge = touch.grid_primary_edge(ordinal, pressed);
@@ -663,8 +744,9 @@ fn grid_primary_input_events(
                     if pressed {
                         events.push(GridPrimaryInput::Press {
                             pos,
+                            widget,
                             source,
-                            suppressed: edge.suppressed,
+                            suppressed: edge.suppressed || !allowed,
                         });
                     } else {
                         ordinal += 1;
@@ -673,6 +755,7 @@ fn grid_primary_input_events(
                             modifiers,
                             source,
                             suppressed: edge.suppressed
+                                || !allowed
                                 || (background && edge.touch_derived && !edge.accepted_tap)
                                 || (background
                                     && !edge.touch_derived
@@ -689,7 +772,7 @@ fn grid_primary_input_events(
         }
         // Earlier input owners can consume raw events. Never join a remaining raw
         // edge to a different adjudicated release or carry its old click pair on.
-        if releases.next().is_some() {
+        if releases.next().is_some() || witnesses.next().is_some() {
             return vec![GridPrimaryInput::Cancelled];
         }
         events
@@ -16661,43 +16744,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         self.grid_pointer_trace = Some(trace);
     }
 
-    fn begin_grid_cell_pointer_trace(
-        &mut self,
-        ctx: &egui::Context,
-        cell_rect: egui::Rect,
-        idx: usize,
-    ) {
-        if !crate::perf::is_enabled() {
-            return;
-        }
-        let Some(pos) = ctx.input(|input| {
-            input.pointer.primary_pressed().then(|| {
-                input
-                    .pointer
-                    .interact_pos()
-                    .or_else(|| input.pointer.latest_pos())
-            })
-        }) else {
-            return;
-        };
-        let Some(pos) = pos.filter(|pos| cell_rect.contains(*pos)) else {
-            return;
-        };
-        let Some(item) = self.items.get(idx) else {
-            return;
-        };
-        self.start_grid_pointer_trace(
-            ctx,
-            crate::grid_input_diagnostics::GridPointerTarget::Cell {
-                idx,
-                item_key: item.perf_key(),
-                archive_key: grid_item_archive_key(item),
-                item_kind: grid_item_diagnostic_kind(item),
-            },
-            pos,
-        );
-    }
-
     fn report_grid_cell_signal(
         &mut self,
         ctx: &egui::Context,
@@ -16797,36 +16843,23 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         );
     }
 
-    fn begin_grid_background_pointer_trace(&mut self, ctx: &egui::Context, grid_rect: egui::Rect) {
-        if !crate::perf::is_enabled() || self.grid_pointer_trace.is_some() {
-            return;
-        }
-        let Some(pos) = ctx.input(|input| {
-            input.pointer.primary_pressed().then(|| {
-                input
-                    .pointer
-                    .interact_pos()
-                    .or_else(|| input.pointer.latest_pos())
-            })
-        }) else {
-            return;
-        };
-        let Some(pos) = pos.filter(|pos| grid_rect.contains(*pos)) else {
-            return;
-        };
-        self.start_grid_pointer_trace(
-            ctx,
-            crate::grid_input_diagnostics::GridPointerTarget::Background,
-            pos,
-        );
-    }
-
     /// Cancel ROOT click pairs before extraction/cell handling, even if focus returns in this
     /// batch or cell navigation later skips the background handler. Capture popup ownership
     /// before widgets can dismiss it with this frame's input.
     pub(crate) fn begin_grid_click_input_frame(&mut self, ctx: &egui::Context) {
         if ctx.viewport_id() != egui::ViewportId::ROOT {
             return;
+        }
+        let witness_id = egui::Id::unique("grid_press_witnesses");
+        if !ctx
+            .data(|data| data.get_temp::<GridPressWitnesses>(witness_id))
+            .is_some_and(|witness| witness.frame == ctx.cumulative_frame_nr())
+        {
+            let widgets = ctx.pointer_button_targets();
+            let frame = ctx.cumulative_frame_nr();
+            ctx.data_mut(|data| {
+                data.insert_temp(witness_id, GridPressWitnesses { frame, widgets })
+            });
         }
         let input_frame_processed = ctx
             .data(|data| {
@@ -16883,27 +16916,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         )
     }
 
-    fn begin_grid_right_drag_primary_frame(&mut self, ctx: &egui::Context) -> bool {
+    fn begin_grid_right_drag_primary_frame(&mut self, _ctx: &egui::Context) -> bool {
         if !self.grid_item_input_allowed() {
             self.cancel_mouse_ring_flick();
             self.cancel_mouse_gesture();
             return true;
         }
-        let (primary_pressed, primary_down, primary_released) = ctx.input(|input| {
-            (
-                input.pointer.primary_pressed(),
-                input.pointer.primary_down(),
-                input.pointer.primary_released(),
-            )
-        });
-        if self.cancel_mouse_right_drag_on_primary_press(
-            crate::ring_shortcut::RightDragOwner::Root,
-            primary_pressed,
-        ) {
-            self.grid_right_drag_primary_suppression.arm();
-        }
-        self.grid_right_drag_primary_suppression
-            .update(primary_down, primary_released)
+        // Cancellation and suppression follow individual edges in the common stream.
+        false
     }
 
     /// グリッドセルのクリック・ダブルクリック・右クリックを処理する。
@@ -16970,13 +16990,237 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 );
             }
         }
-        // Diagnostics follow the same press owner as the enabled thumbnail hit test.
-        if primary_hit_areas.is_none_or(|areas| {
-            ctx.input(grid_primary_press_pos)
-                .is_some_and(|pos| areas.contains(pos))
-        }) {
-            self.begin_grid_cell_pointer_trace(ctx, cell_rect, idx);
+        let tag_badge_target = self.grid_tag_badge_target(idx, overlay_layout);
+        if let Some((tag_name, badge_rect)) = tag_badge_target.as_ref() {
+            if response.hovered()
+                && ctx
+                    .input(|i| i.pointer.hover_pos())
+                    .is_some_and(|pos| badge_rect.contains(pos))
+            {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                response
+                    .clone()
+                    .on_hover_text(format!("{tag_name} をタグビューで探す"));
+            }
         }
+        if !ctx.input(|input| {
+            input.pointer.any_pressed() || input.pointer.any_released() || input.pointer.any_down()
+        }) && !response.secondary_clicked()
+        {
+            return None;
+        }
+        let frame = ctx.cumulative_frame_nr();
+        ctx.data_mut(|data| {
+            let regions = data.get_temp_mut_or_default::<GridPrimaryHitRegions>(egui::Id::unique(
+                "grid_primary_hit_regions",
+            ));
+            if regions.frame != frame {
+                *regions = GridPrimaryHitRegions {
+                    frame,
+                    ..Default::default()
+                };
+            }
+            let previous_rect = regions
+                .cells
+                .iter()
+                .find(|cell| cell.index == idx && cell.response.id == response.id)
+                .map(|cell| cell.previous_rect)
+                .or(previous_rect)
+                .unwrap_or(response.interact_rect);
+            regions.cells.retain(|cell| cell.index != idx);
+            let hit_rects = primary_hit_areas.map(|areas| {
+                areas
+                    .rects()
+                    .iter()
+                    .map(|rect| rect.intersect(response.interact_rect))
+                    .collect::<Vec<_>>()
+            });
+            regions.cells.push(GridCellInput {
+                index: idx,
+                previous_rect,
+                hit_rects,
+                tag_badge_target,
+                touch_derived: touch_derived_pointer_activity,
+                selected: self.selected == Some(idx),
+                checked: self.checked.contains(&idx),
+                clip_rect: ui.clip_rect(),
+                response,
+                paint: GridCellPaint::None,
+            });
+        });
+        let _ = (
+            suppress_primary_pointer,
+            touch_frame,
+            previous_grid_click_pairing,
+        );
+        None
+    }
+
+    fn remember_grid_cell_paint(ctx: &egui::Context, idx: usize, paint: GridCellPaint) {
+        ctx.data_mut(|data| {
+            if let Some(regions) = data
+                .get_temp_mut_or_default::<GridPrimaryHitRegions>(egui::Id::unique(
+                    "grid_primary_hit_regions",
+                ))
+                .cells
+                .iter_mut()
+                .find(|cell| cell.index == idx)
+            {
+                regions.paint = paint;
+            }
+        });
+    }
+
+    fn repaint_grid_cell_after_input(&mut self, ctx: &egui::Context, cell: &GridCellInput) {
+        let idx = cell.index;
+        if cell.selected == (self.selected == Some(idx))
+            && cell.checked == self.checked.contains(&idx)
+        {
+            return;
+        }
+        let rect = cell.response.rect;
+        let mut ui = egui::Ui::new(
+            ctx.clone(),
+            cell.response.id.with("selection_redraw"),
+            egui::UiBuilder::new()
+                .layer_id(cell.response.layer_id)
+                .max_rect(rect),
+        );
+        ui.set_clip_rect(cell.clip_rect);
+        match cell.paint {
+            GridCellPaint::None => {}
+            GridCellPaint::Details { row, spread_cursor } => {
+                self.draw_details_row(
+                    &mut ui,
+                    rect,
+                    idx,
+                    row,
+                    spread_cursor,
+                    DetailsColumnSet::Details,
+                    false,
+                    false,
+                );
+            }
+            GridCellPaint::Thumbnail { spread_cursor } => {
+                let badges = self.grid_edit_badges(idx);
+                let rating = if self.items_are_drive_list {
+                    0
+                } else {
+                    self.get_rating(idx)
+                };
+                let tags = self.cell_tag_list(idx).to_vec();
+                let bookmark_time = self.bookmark_view_row(idx).map(|row| {
+                    if row.missing {
+                        format!("! {}", row.badge_label())
+                    } else {
+                        row.badge_label()
+                    }
+                });
+                let bookmark_title = self
+                    .bookmark_view_row(idx)
+                    .and_then(|row| row.title())
+                    .map(str::to_owned);
+                let media_duration = self.thumbnail_media_duration_text(idx);
+                let filter_match_count = if self.items_are_drive_list {
+                    None
+                } else {
+                    self.folder_rating_match(idx).map(|(count, _)| count)
+                };
+                let overlay = crate::app::layout_cell_overlays(
+                    ui.painter(),
+                    rect,
+                    crate::thumb_overlay_layout::EditBadgeFlags {
+                        page_override: badges.page_override,
+                        local_adjust: badges.local_adjust,
+                        mask: badges.mask,
+                        conceal: badges.conceal,
+                        comic: badges.comic,
+                        crop: badges.crop,
+                        pin: self.cell_has_pin_badge(idx),
+                    },
+                    rating,
+                    &self.items[idx],
+                    &self.thumbnails[idx],
+                    &tags,
+                    bookmark_time.as_deref(),
+                    bookmark_title.as_deref(),
+                    self.items_are_drive_list,
+                    self.settings.video_thumbnail_indicator,
+                    self.settings.audio_thumbnail_indicator,
+                    self.checked.contains(&idx),
+                    filter_match_count,
+                    media_duration.as_deref(),
+                    self.settings.thumb_show_resume_meter,
+                    crate::thumb_overlay_layout::ThumbnailNameStyle::from_settings(&self.settings),
+                );
+                let is_cut = self.items[idx]
+                    .drag_source_path()
+                    .is_some_and(|path| self.cut_clipboard.contains(path));
+                let rotation = self.get_rotation(idx);
+                let resume = self.thumbnail_resume_meter(idx);
+                let adjusted = if self.adjustment_dragging {
+                    None
+                } else {
+                    self.thumb_adjust_tex.get(&idx)
+                };
+                crate::app::draw_cell(
+                    &ui,
+                    rect,
+                    self.selected == Some(idx),
+                    self.checked.contains(&idx),
+                    spread_cursor,
+                    &overlay,
+                    &self.items[idx],
+                    &self.thumbnails[idx],
+                    rotation,
+                    adjusted,
+                    self.items_are_drive_list,
+                    self.settings.video_thumbnail_indicator,
+                    self.settings.audio_thumbnail_indicator,
+                    is_cut,
+                    resume,
+                );
+                self.draw_bookmark_view_overlay(
+                    &mut ui,
+                    rect,
+                    idx,
+                    &overlay,
+                    if is_cut {
+                        crate::cut_clipboard::CUT_CONTENT_OPACITY
+                    } else {
+                        1.0
+                    },
+                );
+            }
+        }
+        if self.selected == Some(idx) {
+            self.selected_cell_rect = Some(rect);
+        }
+    }
+
+    /// Dispatch one ordered click, or the cell's drag signal after the stream.
+    fn dispatch_grid_cell_input(
+        &mut self,
+        ctx: &egui::Context,
+        cell: &GridCellInput,
+        clicks: Vec<crate::app::AcceptedGridClick>,
+        secondary_pos: Option<egui::Pos2>,
+        allow_drag: bool,
+    ) -> Option<AddressBarNav> {
+        let idx = cell.index;
+        let response = &cell.response;
+        let cell_rect = response.rect;
+        let touch_derived_pointer_activity = cell.touch_derived;
+        let tag_badge_target = cell.tag_badge_target.clone();
+        let frame = ctx.cumulative_frame_nr();
+        let frame_id = egui::Id::unique("grid_background_primary_frame");
+        let cell_context = crate::app::GridBackgroundClickContext {
+            items_generation: self.items_generation,
+            view_mode: self.settings.grid_view_mode,
+            viewport: ctx.viewport_id(),
+            source: crate::app::GridClickSource::Mouse,
+        };
+        let mut nav = None;
         let (
             time_since_last_click,
             max_double_click_delay,
@@ -16992,184 +17236,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         } else {
             (0.0, 0.0, false, false)
         };
-        let mut nav = None;
-        if !self.any_dialog_open()
-            && !self.items_are_drive_list
-            && let Some(pos) = ctx.input(|i| {
-                i.pointer
-                    .secondary_pressed()
-                    .then(|| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
-                    .flatten()
-            })
-            && cell_rect.contains(pos)
-        {
-            let mode = self
-                .settings
-                .ring_shortcuts
-                .right_drag_mode(crate::ring_shortcut::RightDragContext::Grid);
-            if self.select_grid_right_drag_start(&mode, Some(idx)) {
-                self.update_last_selected_image();
-            }
-            match mode {
-                crate::ring_shortcut::RightDragMode::RingShortcut => self.start_mouse_ring_flick(
-                    ctx,
-                    crate::ring_shortcut::RightDragOwner::Root,
-                    crate::ring_shortcut::RingShortcutContext::Grid,
-                    pos,
-                    Some(idx),
-                ),
-                crate::ring_shortcut::RightDragMode::MouseGesture => self.start_mouse_gesture(
-                    ctx,
-                    crate::ring_shortcut::RightDragOwner::Root,
-                    crate::ring_shortcut::RightDragContext::Grid,
-                    pos,
-                    Some(idx),
-                ),
-                crate::ring_shortcut::RightDragMode::Disabled
-                | crate::ring_shortcut::RightDragMode::Unknown(_) => {}
-            }
-        }
-        let cell_context = crate::app::GridBackgroundClickContext {
-            items_generation: self.items_generation,
-            view_mode: self.settings.grid_view_mode,
-            viewport: ctx.viewport_id(),
-            source: crate::app::GridClickSource::Mouse,
-        };
-        let frame = ctx.cumulative_frame_nr();
-        let frame_id = egui::Id::unique("grid_background_primary_frame");
-        let frame_owner = ctx.data(|data| data.get_temp::<GridPrimaryInputFrame>(frame_id));
-        let frame_blocked = matches!(frame_owner, Some(GridPrimaryInputFrame::Blocked(f) | GridPrimaryInputFrame::Activated(f)) if f == frame);
-        let frame_processed = frame_owner.is_some_and(|owner| owner.frame() == frame);
-        let contains = |pos, pressed| {
-            if let Some(areas) = primary_hit_areas {
-                response.interact_rect.contains(pos) && areas.contains(pos)
-            } else if pressed {
-                previous_rect
-                    .unwrap_or(response.interact_rect)
-                    .contains(pos)
-            } else {
-                // The completed egui response and stored press authorize whole-cell releases.
-                true
-            }
-        };
-        // The background owner needs every painted item region, not only the final
-        // pointer position, when two completions arrive together.
-        if ctx.input(|input| {
-            input.pointer.primary_pressed()
-                || input.pointer.primary_released()
-                || input.pointer.primary_down()
-        }) {
-            ctx.data_mut(|data| {
-                let regions = data.get_temp_mut_or_default::<GridPrimaryHitRegions>(
-                    egui::Id::unique("grid_primary_hit_regions"),
-                );
-                if regions.frame != frame {
-                    regions.frame = frame;
-                    regions.rects.clear();
-                }
-                if let Some(areas) = primary_hit_areas {
-                    regions.rects.extend(
-                        areas
-                            .rects()
-                            .iter()
-                            .map(|rect| rect.intersect(response.interact_rect)),
-                    );
-                } else {
-                    regions.rects.push(response.interact_rect);
-                }
-            });
-        }
-        let events = grid_primary_input_events(ctx, touch_frame, false);
-        // Keep a later raw press even when a retired touch release prevented egui
-        // from acquiring a new cell capture (the existing mouse fallback). The
-        // completed Response still adjudicates clicks. Loading may change the
-        // painted shape while held, so D&D retains this original press owner.
-        if !suppress_primary_pointer
-            && !frame_blocked
-            && (!frame_processed || ctx.input(|input| input.pointer.primary_down()))
-            && (!self.grid_click_pairing.has_primary_press()
-                || (!frame_processed && response.is_pointer_button_down_on()))
-            && let Some(crate::app::GridPrimaryInput::Press {
-                pos,
-                source,
-                suppressed: false,
-            }) = events.iter().rev().find(|event| {
-                matches!(
-                    event,
-                    crate::app::GridPrimaryInput::Press { .. }
-                        | crate::app::GridPrimaryInput::FocusLost
-                )
-            })
-            && contains(*pos, true)
-        {
-            self.grid_click_pairing.begin_cell_press(
-                crate::app::GridBackgroundClickContext {
-                    source: *source,
-                    ..cell_context
-                },
-                frame,
-                idx,
-            );
-        }
-        // egui captures the entire cell even when only its painted regions own
-        // primary input. Let the final completed click choose cell vs letterbox;
-        // a later press must not overwrite that release's position.
-        let release_hits_item = primary_hit_areas.is_none()
-            || events
-                .iter()
-                .rev()
-                .find_map(|event| match event {
-                    crate::app::GridPrimaryInput::Release {
-                        click: Some((pos, _)),
-                        suppressed: false,
-                        ..
-                    } => Some(contains(*pos, false)),
-                    _ => None,
-                })
-                .unwrap_or(false);
-        let clicks = if !suppress_primary_pointer
-            && !frame_processed
-            && release_hits_item
-            && response.clicked_by(egui::PointerButton::Primary)
-        {
-            let options = ctx.options(|options| options.input_options);
-            self.grid_click_pairing.accept_primary_releases(
-                previous_grid_click_pairing,
-                cell_context,
-                Some(idx),
-                frame,
-                ctx.input(|input| input.time),
-                options.max_double_click_delay,
-                options.max_click_dist,
-                &events,
-                contains,
-            )
-        } else {
-            Vec::new()
-        };
+        let primary_release_pos = clicks.last().map(|click| (click.pos.x, click.pos.y));
+        let secondary_clicked = secondary_pos.is_some();
         let primary_clicked = !clicks.is_empty();
-        if primary_clicked {
-            ctx.data_mut(|data| {
-                data.insert_temp(frame_id, GridPrimaryInputFrame::Processed(frame))
-            });
-        }
         let primary_double_clicked =
             primary_clicked && response.double_clicked_by(egui::PointerButton::Primary);
-        if primary_clicked || primary_double_clicked || response.secondary_clicked() {
+        if primary_clicked || secondary_clicked {
             self.folder_pane.set_focus_grid();
-        }
-        let tag_badge_target = self.grid_tag_badge_target(idx, overlay_layout);
-        if let Some((tag_name, badge_rect)) = tag_badge_target.as_ref() {
-            if response.hovered()
-                && ctx
-                    .input(|i| i.pointer.hover_pos())
-                    .is_some_and(|pos| badge_rect.contains(pos))
-            {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                response
-                    .clone()
-                    .on_hover_text(format!("{tag_name} をタグビューで探す"));
-            }
         }
         let mut badge_clicked = false;
         let mut activate = false;
@@ -17217,23 +17290,24 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if activate || badge_clicked {
             self.grid_click_pairing.end_activation();
             ctx.data_mut(|data| {
-                data.insert_temp(frame_id, GridPrimaryInputFrame::Activated(frame))
+                data.insert_temp(frame_id, GridPrimaryInputFrame::CellActivated(frame))
             });
         } else if self.any_dialog_open() {
             self.grid_click_pairing.cancel_pair_preserving_cell_press();
         }
-        let drag_started = !suppress_primary_pointer
+        let drag_started = allow_drag
             && response.drag_started_by(egui::PointerButton::Primary)
             // Loading may change the painted shape while held. Only the press owner
             // can authorize D&D; the new shape must neither revoke nor acquire it.
-            && (primary_hit_areas.is_none()
+            && (cell.hit_rects.is_none()
                 || self.grid_click_pairing.owns_cell_press(cell_context, idx));
         let native_drag_started = native_grid_drag_start_allowed(
             self.items_are_drive_list,
             self.native_drag_just_finished,
             touch_derived_pointer_activity,
         ) && drag_started;
-        let release_pos = response.interact_pointer_pos().map(|pos| (pos.x, pos.y));
+        let release_pos = primary_release_pos
+            .or_else(|| response.interact_pointer_pos().map(|pos| (pos.x, pos.y)));
         let block_reason = crate::grid_input_diagnostics::GridOpenBlockReason::from_state(
             self.any_dialog_open(),
             self.context_menu_idx.is_some() && !activate,
@@ -17521,14 +17595,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         }
         // 右クリック → コンテキストメニュー
         if !self.items_are_drive_list
-            && response.secondary_clicked()
-            && !self.selection_info_bar_contains_pointer(ctx)
+            && secondary_clicked
+            && !selection_info_bar_contains_pos(self.selection_info_bar_rect, secondary_pos)
             && !self.mouse_ring_context_menu_suppressed(ctx)
         {
             self.select_grid_secondary_cell(idx);
             self.update_last_selected_image();
             self.context_menu_idx = Some(self.capture_grid_context_menu_owner(idx));
-            self.context_menu_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
+            self.context_menu_pos = secondary_pos.unwrap_or_default();
             // アイテムメニューを開いた経路を残す。ヘッダ右クリックでこのメニューが
             // 出る間欠不具合 (§1.168) は再現待ちで、`context_menu_idx` を書くのは
             // ここを含め 3 か所だけ。次に出たときログだけで経路が決まるようにしておく。
@@ -17612,225 +17686,442 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         hit_cell: bool,
         hit_press_cell: bool,
         suppress_primary_pointer: bool,
-        previous: GridClickPairingState,
+        mut previous: GridClickPairingState,
         touch: &crate::touch_correlation::TouchFrame,
     ) -> Option<AddressBarNav> {
-        use crate::app::{GridBackgroundClickContext, GridClickSource};
-        let frame = ctx.cumulative_frame_nr();
-        let items_generation = self.items_generation;
-        let view_mode = self.settings.grid_view_mode;
-        let context = |source| GridBackgroundClickContext {
-            items_generation,
-            view_mode,
-            viewport: ctx.viewport_id(),
-            source,
+        use crate::app::{
+            GridBackgroundClickContext, GridClickSource, GridPressTarget, GridPrimaryInput,
         };
-        // Validate the previously extracted state too: generation may change during cell handling.
-        let mut previous = previous;
-        previous.validate_background(context(GridClickSource::Mouse), frame);
-        self.grid_click_pairing
-            .validate_background(context(GridClickSource::Mouse), frame);
-        let wheel_options = ctx.options(|o| o.input_options);
-        let (released, down, pos, press_pos, scroll) = ctx.input(|input| {
-            (
-                input.pointer.primary_released(),
-                input.pointer.primary_down(),
-                input
-                    .pointer
-                    .interact_pos()
-                    .or_else(|| input.pointer.latest_pos()),
-                grid_primary_press_pos(input),
-                !crate::wheel_input::remaining_wheel_delta(input, wheel_options)
-                    .eq(&egui::Vec2::ZERO),
-            )
-        });
+        let frame = ctx.cumulative_frame_nr();
         let id = egui::Id::unique("grid_background_primary_frame");
         let frame_owner = ctx.data(|data| data.get_temp::<GridPrimaryInputFrame>(id));
-        let mouse_primary = (released && pos.is_some_and(|pos| touch.is_mouse_primary(pos, false)))
-            || press_pos.is_some_and(|pos| touch.is_mouse_primary(pos, true));
-        let blocked = matches!(frame_owner, Some(GridPrimaryInputFrame::Blocked(owner_frame)) if owner_frame == frame)
-            || !self.grid_item_input_allowed()
-            || suppress_primary_pointer
-            || egui::Popup::is_any_open(ctx)
-            || self.selection_info_bar_contains_pointer(ctx)
-            || (touch.touch_cancelled() && !mouse_primary)
-            || (touch.has_touch_derived_pointer_activity()
-                && matches!(
-                    touch.owner(),
-                    crate::touch_input::TouchOwner::GridScroll
-                        | crate::touch_input::TouchOwner::Pinch
-                        | crate::touch_input::TouchOwner::Cancelled
-                ))
-            || scroll;
-        if blocked {
-            self.grid_click_pairing.end_activation();
+        if frame_owner.is_some_and(|owner| owner.frame() == frame) {
+            self.grid_right_drag_primary_suppression
+                .update(ctx.input(|input| input.pointer.primary_down()), false);
             return None;
         }
-        if !ctx.input(|input| input.focused)
-            || self.any_dialog_open()
-            || self.context_menu_idx.is_some()
-        {
-            // Background activation requires focus. Cell responses also accept the diagnostic
-            // pointer path without OS focus, so this background-only restriction must not erase
-            // their accepted first click. The common input start cancels both on focus loss.
-            if !frame_owner.is_some_and(|owner| owner.frame() == frame) {
-                let events = grid_primary_input_events(ctx, touch, false);
-                self.grid_click_pairing
-                    .finish_unaccepted_primary_frame(previous, &events);
-                ctx.data_mut(|data| data.insert_temp(id, GridPrimaryInputFrame::Processed(frame)));
-            }
-            self.grid_click_pairing.end_background_run();
-            if self.any_dialog_open() || self.context_menu_idx.is_some() {
-                self.grid_click_pairing.cancel_pair_preserving_cell_press();
-            }
-            if !down {
-                self.grid_click_pairing.background_press_cancel();
-            }
-            return None;
-        }
+        let context = GridBackgroundClickContext {
+            items_generation: self.items_generation,
+            view_mode: self.settings.grid_view_mode,
+            viewport: ctx.viewport_id(),
+            source: GridClickSource::Mouse,
+        };
+        previous.validate_background(context, frame);
         let regions = ctx
             .data(|data| {
                 data.get_temp::<GridPrimaryHitRegions>(egui::Id::unique("grid_primary_hit_regions"))
             })
             .filter(|regions| regions.frame == frame)
-            .map(|regions| regions.rects)
             .unwrap_or_default();
-        let contains = |pos| {
-            rect.contains(pos)
-                && !selection_info_bar_contains_pos(self.selection_info_bar_rect, Some(pos))
-                && !regions.iter().any(|rect| rect.contains(pos))
-        };
-        let events = grid_primary_input_events(ctx, touch, true);
-        // A cell consumed the completed clicks, but a later background press is
-        // still a new capture. Re-passes may observe it, never replay the releases.
-        if frame_owner.is_some_and(|owner| owner.frame() == frame) {
-            if !matches!(frame_owner, Some(GridPrimaryInputFrame::Activated(_)))
-                && !self.grid_click_pairing.has_primary_press()
-                && down
-                && let Some(crate::app::GridPrimaryInput::Press {
-                    pos,
-                    source,
-                    suppressed: false,
-                }) = events.last()
-                && !hit_press_cell
-                && contains(*pos)
-            {
-                self.grid_click_pairing
-                    .begin_background_press(context(*source), frame);
-            }
+        let cells = regions.cells;
+        let item_rects = cells
+            .iter()
+            .flat_map(|cell| {
+                cell.hit_rects
+                    .clone()
+                    .unwrap_or_else(|| vec![cell.response.interact_rect])
+            })
+            .collect::<Vec<_>>();
+        let options = ctx.options(|options| options.input_options);
+        let scroll = ctx.input(|input| {
+            crate::wheel_input::remaining_wheel_delta(input, options) != egui::Vec2::ZERO
+        });
+        if !self.grid_item_input_allowed()
+            || suppress_primary_pointer
+            || egui::Popup::is_any_open(ctx)
+            || scroll
+        {
+            self.grid_click_pairing.end_activation();
+            self.grid_right_drag_primary_suppression
+                .update(ctx.input(|input| input.pointer.primary_down()), false);
+            ctx.data_mut(|data| data.insert_temp(id, GridPrimaryInputFrame::Blocked(frame)));
             return None;
         }
         ctx.data_mut(|data| data.insert_temp(id, GridPrimaryInputFrame::Processed(frame)));
-        let (max_delay, max_dist) = ctx.options(|options| {
-            (
-                options.input_options.max_double_click_delay,
-                options.input_options.max_click_dist,
-            )
-        });
-        let clicks = self.grid_click_pairing.accept_primary_releases(
-            previous,
-            context(GridClickSource::Mouse),
-            None,
-            frame,
-            ctx.input(|input| input.time),
-            max_delay,
-            max_dist,
-            &events,
-            |pos, _pressed| contains(pos) && (!regions.is_empty() || !(hit_cell || hit_press_cell)),
-        );
-        for click in clicks {
-            if self.settings.grid_click_selection_mode.normalized()
-                == GridClickSelectionMode::Explorer
-            {
-                self.folder_pane.set_focus_grid();
-            }
-            self.clear_grid_background_selection();
-            if click.paired && self.settings.grid_background_double_click_parent {
-                self.grid_click_pairing.end_activation();
-                ctx.data_mut(|data| data.insert_temp(id, GridPrimaryInputFrame::Activated(frame)));
-                return self.handle_grid_parent_folder_action();
+        self.grid_click_pairing = previous;
+        if !ctx.input(|input| input.focused)
+            || self.any_dialog_open()
+            || self.context_menu_idx.is_some()
+        {
+            self.grid_click_pairing.end_background_run();
+            if self.any_dialog_open() || self.context_menu_idx.is_some() {
+                self.grid_click_pairing.cancel_pair_preserving_cell_press();
             }
         }
-        None
+        let info_bar = self.selection_info_bar_rect;
+        let background_contains = |pos| {
+            rect.contains(pos)
+                && !selection_info_bar_contains_pos(info_bar, Some(pos))
+                && !item_rects.iter().any(|rect| rect.contains(pos))
+                && (!cells.is_empty() || !(hit_cell || hit_press_cell))
+        };
+        let events = grid_primary_input_events(ctx, touch, false);
+        let background_events = grid_primary_input_events(ctx, touch, true);
+        let mut nav = None;
+        let mut dispatched = std::collections::HashSet::new();
+        for (event, background_event) in events.iter().zip(&background_events) {
+            let background_allowed = ctx.input(|input| input.focused)
+                && !self.any_dialog_open()
+                && self.context_menu_idx.is_none();
+            let press_target = self.grid_click_pairing.primary_press_target();
+            let target_at = |pos: egui::Pos2, pressed: bool| {
+                let cell = if pressed {
+                    let widget = match event {
+                        GridPrimaryInput::Press { widget, .. } => *widget,
+                        _ => None,
+                    };
+                    cells.iter().find(|cell| {
+                        Some(cell.response.id) == widget
+                            && cell.response.enabled()
+                            && cell.previous_rect.contains(pos)
+                    })
+                } else {
+                    cells
+                        .iter()
+                        .find(|cell| press_target == Some(GridPressTarget::Cell(cell.index)))
+                };
+                if let Some(cell) = cell {
+                    if cell
+                        .hit_rects
+                        .as_ref()
+                        .is_none_or(|rects| rects.iter().any(|rect| rect.contains(pos)))
+                    {
+                        return Some(GridPressTarget::Cell(cell.index));
+                    }
+                }
+                let foreign_widget = match event {
+                    GridPrimaryInput::Press {
+                        widget: Some(widget),
+                        ..
+                    } => !cells.iter().any(|cell| cell.response.id == *widget),
+                    _ => false,
+                };
+                (background_allowed && !foreign_widget && background_contains(pos))
+                    .then_some(GridPressTarget::Background)
+            };
+            // Background tap ownership is stricter than the cell mouse fallback.
+            let selected_event = if matches!(event, GridPrimaryInput::Release {click: Some((pos, _)), ..}
+                if target_at(*pos, false) == Some(GridPressTarget::Background))
+            {
+                background_event
+            } else {
+                event
+            };
+            let effective_event;
+            let selected_event = match selected_event {
+                GridPrimaryInput::Press {
+                    pos,
+                    widget,
+                    source,
+                    suppressed,
+                } => {
+                    if self.cancel_mouse_right_drag_on_primary_press(
+                        crate::ring_shortcut::RightDragOwner::Root,
+                        true,
+                    ) {
+                        self.grid_right_drag_primary_suppression.arm();
+                    }
+                    effective_event = GridPrimaryInput::Press {
+                        pos: *pos,
+                        widget: *widget,
+                        source: *source,
+                        suppressed: self.grid_right_drag_primary_suppression.suppress_edge(
+                            true,
+                            false,
+                            *suppressed,
+                        ),
+                    };
+                    &effective_event
+                }
+                GridPrimaryInput::Release {
+                    click,
+                    modifiers,
+                    source,
+                    suppressed,
+                } => {
+                    effective_event = GridPrimaryInput::Release {
+                        click: *click,
+                        modifiers: *modifiers,
+                        source: *source,
+                        suppressed: self.grid_right_drag_primary_suppression.suppress_edge(
+                            false,
+                            true,
+                            *suppressed,
+                        ),
+                    };
+                    &effective_event
+                }
+                _ => selected_event,
+            };
+            let accepted = self.grid_click_pairing.accept_primary_input(
+                context,
+                frame,
+                ctx.input(|input| input.time),
+                options.max_double_click_delay,
+                options.max_click_dist,
+                selected_event,
+                target_at,
+            );
+            if let GridPrimaryInput::Press { pos, .. } = *event
+                && let Some(target) = self.grid_click_pairing.primary_press_target()
+            {
+                let target = match target {
+                    GridPressTarget::Background => {
+                        Some(crate::grid_input_diagnostics::GridPointerTarget::Background)
+                    }
+                    GridPressTarget::Cell(idx) => self.items.get(idx).map(|item| {
+                        crate::grid_input_diagnostics::GridPointerTarget::Cell {
+                            idx,
+                            item_key: item.perf_key(),
+                            archive_key: grid_item_archive_key(item),
+                            item_kind: grid_item_diagnostic_kind(item),
+                        }
+                    }),
+                };
+                if let Some(target) = target {
+                    self.start_grid_pointer_trace(ctx, target, pos);
+                }
+            }
+            match *event {
+                GridPrimaryInput::Moved(pos) => self.update_grid_mouse_ring_flick_at(
+                    ctx,
+                    pos,
+                    ctx.input(|input| input.pointer.secondary_down())
+                        || self.mouse_ring_flick.is_some()
+                        || self.mouse_gesture.is_some(),
+                    false,
+                ),
+                GridPrimaryInput::Secondary {
+                    pos,
+                    pressed,
+                    clicked,
+                    widget,
+                    suppressed,
+                } => {
+                    let cell = cells
+                        .iter()
+                        .find(|cell| Some(cell.response.id) == widget && cell.response.enabled());
+                    if pressed && !suppressed {
+                        if let Some(cell) = cell {
+                            self.start_grid_secondary_press(ctx, pos, Some(cell.index));
+                        } else if background_allowed && widget.is_none() && background_contains(pos)
+                        {
+                            self.start_grid_secondary_press(ctx, pos, None);
+                        }
+                    } else if !pressed {
+                        self.update_grid_mouse_ring_flick_at(ctx, pos, false, true);
+                        if clicked && !suppressed {
+                            if let Some(cell) = cell {
+                                dispatched.insert(cell.index);
+                                nav = self.dispatch_grid_cell_input(
+                                    ctx,
+                                    cell,
+                                    Vec::new(),
+                                    Some(pos),
+                                    false,
+                                );
+                                self.context_menu_pos = pos;
+                            } else if background_allowed
+                                && widget.is_none()
+                                && background_contains(pos)
+                                && !(self.items_are_bookmark_view
+                                    && (self.items.is_empty() || self.visible_indices.is_empty()))
+                                && self.context_menu_idx.is_none()
+                                && !self.mouse_ring_context_menu_suppressed(ctx)
+                            {
+                                self.open_current_folder_context_menu_at(ctx, pos);
+                            }
+                        }
+                    }
+                }
+                GridPrimaryInput::FocusLost | GridPrimaryInput::Cancelled => {
+                    self.grid_right_drag_primary_suppression =
+                        GridRightDragPrimarySuppression::Idle;
+                }
+                _ => {}
+            }
+            if let Some((target, click)) = accepted {
+                match target {
+                    GridPressTarget::Cell(idx) => {
+                        if let Some(cell) = cells.iter().find(|cell| cell.index == idx) {
+                            dispatched.insert(cell.index);
+                            nav =
+                                self.dispatch_grid_cell_input(ctx, cell, vec![click], None, false);
+                        }
+                    }
+                    GridPressTarget::Background => {
+                        if self.settings.grid_click_selection_mode.normalized()
+                            == GridClickSelectionMode::Explorer
+                        {
+                            self.folder_pane.set_focus_grid();
+                        }
+                        self.clear_grid_background_selection();
+                        if click.paired && self.settings.grid_background_double_click_parent {
+                            self.grid_click_pairing.end_activation();
+                            ctx.data_mut(|data| {
+                                data.insert_temp(id, GridPrimaryInputFrame::Activated(frame))
+                            });
+                            nav = self.handle_grid_parent_folder_action();
+                        }
+                    }
+                }
+            }
+            if nav.is_some() || self.items_generation != context.items_generation
+                || ctx.data(|data| matches!(data.get_temp::<GridPrimaryInputFrame>(id), Some(GridPrimaryInputFrame::Activated(f) | GridPrimaryInputFrame::CellActivated(f)) if f == frame)) { break; }
+        }
+        self.grid_right_drag_primary_suppression
+            .update(ctx.input(|input| input.pointer.primary_down()), false);
+        if nav.is_none()
+            && !ctx.data(|data| {
+                matches!(
+                    data.get_temp::<GridPrimaryInputFrame>(id),
+                    Some(
+                        GridPrimaryInputFrame::Activated(_)
+                            | GridPrimaryInputFrame::CellActivated(_)
+                    )
+                )
+            })
+            && !events.iter().any(|event| {
+                matches!(
+                    event,
+                    GridPrimaryInput::Moved(_) | GridPrimaryInput::Secondary { pressed: false, .. }
+                )
+            })
+            && let Some(pos) = ctx.input(|input| input.pointer.interact_pos())
+        {
+            self.update_grid_mouse_ring_flick_at(
+                ctx,
+                pos,
+                ctx.input(|input| input.pointer.secondary_down()),
+                false,
+            );
+        }
+        if self.items_generation == context.items_generation {
+            for cell in &cells {
+                if nav.is_none()
+                    && !ctx.data(|data| {
+                        matches!(
+                            data.get_temp::<GridPrimaryInputFrame>(id),
+                            Some(
+                                GridPrimaryInputFrame::Activated(_)
+                                    | GridPrimaryInputFrame::CellActivated(_)
+                            )
+                        )
+                    })
+                    && (!dispatched.contains(&cell.index)
+                        || cell.response.drag_started_by(egui::PointerButton::Primary))
+                {
+                    let long_touch = cell.response.long_touched()
+                        && !events
+                            .iter()
+                            .any(|event| matches!(event, GridPrimaryInput::Cancelled));
+                    self.dispatch_grid_cell_input(
+                        ctx,
+                        cell,
+                        Vec::new(),
+                        long_touch.then(|| {
+                            cell.response
+                                .interact_pointer_pos()
+                                .unwrap_or(cell.response.rect.center())
+                        }),
+                        self.grid_right_drag_primary_suppression
+                            == GridRightDragPrimarySuppression::Idle,
+                    );
+                }
+                self.repaint_grid_cell_after_input(ctx, cell);
+            }
+        }
+        nav
     }
 
-    fn start_grid_background_mouse_ring_flick_if_pressed(
+    fn start_grid_secondary_press(
         &mut self,
         ctx: &egui::Context,
-        rect: egui::Rect,
+        pos: egui::Pos2,
+        idx: Option<usize>,
     ) {
         if !self.grid_item_input_allowed()
             || self.any_dialog_open()
             || self.items_are_drive_list
-            || self.mouse_ring_flick.is_some()
-            || self.mouse_gesture.is_some()
-            || self.selection_info_bar_contains_pointer(ctx)
+            || selection_info_bar_contains_pos(self.selection_info_bar_rect, Some(pos))
         {
             return;
         }
-        if let Some(pos) = ctx.input(|i| {
-            i.pointer
-                .secondary_pressed()
-                .then(|| i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()))
-                .flatten()
-        }) && rect.contains(pos)
-        {
-            match self
-                .settings
-                .ring_shortcuts
-                .right_drag_mode(crate::ring_shortcut::RightDragContext::Grid)
-            {
-                crate::ring_shortcut::RightDragMode::RingShortcut => self.start_mouse_ring_flick(
-                    ctx,
-                    crate::ring_shortcut::RightDragOwner::Root,
-                    crate::ring_shortcut::RingShortcutContext::Grid,
-                    pos,
-                    None,
-                ),
-                crate::ring_shortcut::RightDragMode::MouseGesture => self.start_mouse_gesture(
-                    ctx,
-                    crate::ring_shortcut::RightDragOwner::Root,
-                    crate::ring_shortcut::RightDragContext::Grid,
-                    pos,
-                    None,
-                ),
-                crate::ring_shortcut::RightDragMode::Disabled
-                | crate::ring_shortcut::RightDragMode::Unknown(_) => {}
-            }
+        let mode = self
+            .settings
+            .ring_shortcuts
+            .right_drag_mode(crate::ring_shortcut::RightDragContext::Grid);
+        if self.select_grid_right_drag_start(&mode, idx) {
+            self.update_last_selected_image();
+        }
+        match mode {
+            crate::ring_shortcut::RightDragMode::RingShortcut => self.start_mouse_ring_flick(
+                ctx,
+                crate::ring_shortcut::RightDragOwner::Root,
+                crate::ring_shortcut::RingShortcutContext::Grid,
+                pos,
+                idx,
+            ),
+            crate::ring_shortcut::RightDragMode::MouseGesture => self.start_mouse_gesture(
+                ctx,
+                crate::ring_shortcut::RightDragOwner::Root,
+                crate::ring_shortcut::RightDragContext::Grid,
+                pos,
+                idx,
+            ),
+            _ => {}
         }
     }
 
-    fn update_grid_mouse_ring_flick(&mut self, ctx: &egui::Context) {
+    fn update_grid_mouse_ring_flick_at(
+        &mut self,
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+        down: bool,
+        released: bool,
+    ) {
         if !self.grid_item_input_allowed() || self.any_dialog_open() {
             self.cancel_mouse_ring_flick();
             self.cancel_mouse_gesture();
             return;
         }
-        match self.update_mouse_ring_flick(
+        let ring = self.update_mouse_ring_flick_with_pos(
             ctx,
             crate::ring_shortcut::RightDragOwner::Root,
             crate::ring_shortcut::RingShortcutContext::Grid,
-        ) {
-            crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
-                let target_idx = self.mouse_ring_grid_target_idx.take();
-                self.open_grid_right_drag_short_tap_menu(ctx, target_idx);
-            }
-            crate::ring_shortcut::MouseFlickOutcome::Cancelled
-            | crate::ring_shortcut::MouseFlickOutcome::Fired
-            | crate::ring_shortcut::MouseFlickOutcome::None => {}
+            pos,
+            down,
+            released,
+        );
+        if ring == crate::ring_shortcut::MouseFlickOutcome::ShortTap {
+            let idx = self.mouse_ring_grid_target_idx.take();
+            self.open_grid_right_drag_short_tap_menu(ctx, idx, pos);
+            self.context_menu_pos = pos;
         }
-        match self.update_mouse_gesture(
+        let gesture = self.update_mouse_gesture_with_pos(
             ctx,
             crate::ring_shortcut::RightDragOwner::Root,
             crate::ring_shortcut::RightDragContext::Grid,
-        ) {
-            crate::ring_shortcut::MouseFlickOutcome::ShortTap => {
-                let target_idx = self.mouse_gesture_grid_target_idx.take();
-                self.open_grid_right_drag_short_tap_menu(ctx, target_idx);
-            }
-            crate::ring_shortcut::MouseFlickOutcome::Cancelled
-            | crate::ring_shortcut::MouseFlickOutcome::Fired
-            | crate::ring_shortcut::MouseFlickOutcome::None => {}
+            pos,
+            down,
+            released,
+        );
+        if gesture == crate::ring_shortcut::MouseFlickOutcome::ShortTap {
+            let idx = self.mouse_gesture_grid_target_idx.take();
+            self.open_grid_right_drag_short_tap_menu(ctx, idx, pos);
+            self.context_menu_pos = pos;
+        }
+        if ring == crate::ring_shortcut::MouseFlickOutcome::Fired
+            || gesture == crate::ring_shortcut::MouseFlickOutcome::Fired
+        {
+            self.grid_click_pairing.end_activation();
+            let frame = ctx.cumulative_frame_nr();
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::unique("grid_background_primary_frame"),
+                    GridPrimaryInputFrame::Activated(frame),
+                )
+            });
         }
     }
 
@@ -17838,11 +18129,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         &mut self,
         ctx: &egui::Context,
         target_idx: Option<usize>,
+        pos: egui::Pos2,
     ) {
-        if !self.grid_item_input_allowed() || self.selection_info_bar_contains_pointer(ctx) {
+        if !self.grid_item_input_allowed()
+            || selection_info_bar_contains_pos(self.selection_info_bar_rect, Some(pos))
+        {
             return;
         }
-        let pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
         if self.context_menu_idx.is_some() {
             return;
         }
@@ -18054,6 +18347,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             ) {
                                 nav = Some(n);
                             }
+                            Self::remember_grid_cell_paint(
+                                ctx,
+                                idx,
+                                GridCellPaint::Details {
+                                    row,
+                                    spread_cursor: spread_pair_cursor_idx == Some(idx),
+                                },
+                            );
                             if idx >= self.items.len() {
                                 break;
                             }
@@ -18121,8 +18422,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.grid_scroll.adopt_readback(egui_offset_y);
         }
 
-        self.start_grid_background_mouse_ring_flick_if_pressed(ctx, body_inner_rect);
-        self.update_grid_mouse_ring_flick(ctx);
         nav = nav.or_else(|| {
             self.handle_grid_background_primary_click(
                 ctx,
@@ -18135,15 +18434,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             )
         });
 
-        let bg_right_clicked = ui.rect_contains_pointer(body_inner_rect)
-            && ctx.input(|i| i.pointer.secondary_clicked());
-        if bg_right_clicked
-            && self.context_menu_idx.is_none()
-            && !self.selection_info_bar_contains_pointer(ctx)
-            && !self.mouse_ring_context_menu_suppressed(ctx)
-        {
-            self.open_current_folder_context_menu(ctx);
-        }
         self.clear_mouse_ring_context_menu_suppression_if_idle(ctx);
 
         let full_rect = ui.max_rect();
@@ -19911,22 +20201,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         "フォルダを入力して Enter キーを押してください".to_owned()
                     };
                     ui.centered_and_justified(|ui| ui.label(msg));
-                    self.begin_grid_background_pointer_trace(ctx, ui.max_rect());
-                    self.finish_grid_pointer_trace(ctx);
                     // 空フォルダでも右クリックでフォルダ操作可能にする
-                    self.start_grid_background_mouse_ring_flick_if_pressed(ctx, ui.max_rect());
-                    self.update_grid_mouse_ring_flick(ctx);
                     let background_nav = self.handle_grid_background_primary_click(
                         ctx, ui.max_rect(), false, false, suppress_primary_pointer,
                         previous_grid_click_pairing, &touch_frame,
                     );
-                    if !self.items_are_bookmark_view
-                        && ui.rect_contains_pointer(ui.max_rect())
-                        && ctx.input(|i| i.pointer.secondary_clicked())
-                        && !self.mouse_ring_context_menu_suppressed(ctx)
-                    {
-                        self.open_current_folder_context_menu(ctx);
-                    }
+                    self.finish_grid_pointer_trace(ctx);
                     let full_rect = ui.max_rect();
                     self.draw_mouse_ring_flick_overlay(
                         ui,
@@ -19980,21 +20260,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         };
                         ui.label(message);
                     });
-                    self.begin_grid_background_pointer_trace(ctx, ui.max_rect());
-                    self.finish_grid_pointer_trace(ctx);
-                    self.start_grid_background_mouse_ring_flick_if_pressed(ctx, ui.max_rect());
-                    self.update_grid_mouse_ring_flick(ctx);
                     let background_nav = self.handle_grid_background_primary_click(
                         ctx, ui.max_rect(), false, false, suppress_primary_pointer,
                         previous_grid_click_pairing, &touch_frame,
                     );
-                    if !self.items_are_bookmark_view
-                        && ui.rect_contains_pointer(ui.max_rect())
-                        && ctx.input(|i| i.pointer.secondary_clicked())
-                        && !self.mouse_ring_context_menu_suppressed(ctx)
-                    {
-                        self.open_current_folder_context_menu(ctx);
-                    }
+                    self.finish_grid_pointer_trace(ctx);
                     let full_rect = ui.max_rect();
                     self.draw_mouse_ring_flick_overlay(
                         ui,
@@ -20048,7 +20318,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         previous_grid_click_pairing,
                         &touch_frame,
                     );
-                    self.begin_grid_background_pointer_trace(ctx, ui.max_rect());
                     self.finish_grid_pointer_trace(ctx);
                     return nav;
                 }
@@ -20661,6 +20930,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 ) {
                                     nav = Some(n);
                                 }
+                                Self::remember_grid_cell_paint(ctx, idx, GridCellPaint::Thumbnail {spread_cursor: spread_pair_cursor_idx == Some(idx)});
                                 // A synchronous item activation ends painting of the old generation.
                                 if hit_areas.is_some() && self.items_generation != painted_generation {
                                     break 'visible_rows;
@@ -20844,8 +21114,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     }
                 }
 
-                self.begin_grid_background_pointer_trace(ctx, scroll_output.inner_rect);
-                self.finish_grid_pointer_trace(ctx);
 
                 // グリッドの空白部分で右クリック → フォルダメニュー。
                 // セルの右クリックは handle_cell_interaction 側で先に `context_menu_idx`
@@ -20853,25 +21121,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 // 全体を背景として扱う。content Ui の `ui_contains_pointer()` だと、
                 // サムネイル総高さが viewport より低いときに最後の行より下の余白を
                 // 拾えないため、`scroll_output.inner_rect` を使う。
-                self.start_grid_background_mouse_ring_flick_if_pressed(
-                    ctx,
-                    scroll_output.inner_rect,
-                );
-                self.update_grid_mouse_ring_flick(ctx);
                 nav = nav.or_else(|| self.handle_grid_background_primary_click(
                     ctx, grid_background_rect_without_scrollbars(scroll_output.inner_rect, scroll_output.content_size, ui.spacing().scroll),
                     primary_click_hit_cell, primary_press_hit_cell, suppress_primary_pointer,
                     previous_grid_click_pairing, &touch_frame,
                 ));
-                let bg_right_clicked = ui.rect_contains_pointer(scroll_output.inner_rect)
-                    && ctx.input(|i| i.pointer.secondary_clicked());
-                if bg_right_clicked
-                    && self.context_menu_idx.is_none()
-                    && !self.selection_info_bar_contains_pointer(ctx)
-                    && !self.mouse_ring_context_menu_suppressed(ctx)
-                {
-                    self.open_current_folder_context_menu(ctx);
-                }
+                self.finish_grid_pointer_trace(ctx);
                 self.clear_mouse_ring_context_menu_suppression_if_idle(ctx);
 
                 // 右上フィードバックトースト (Q / Ctrl+Backspace / F7〜F10 / レーティング等)
@@ -28719,6 +28974,10 @@ mod grid_reclick_open_tests {
         close_popup_before_background: bool,
         replay_primary_handlers: bool,
         cell_offset: egui::Vec2,
+        letterbox: bool,
+        overlay: bool,
+        overlay_background: bool,
+        consume_press: bool,
     }
 
     fn handler_harness(
@@ -28744,6 +29003,10 @@ mod grid_reclick_open_tests {
             close_popup_before_background: false,
             replay_primary_handlers: false,
             cell_offset: egui::Vec2::ZERO,
+            letterbox: false,
+            overlay: false,
+            overlay_background: false,
+            consume_press: false,
         };
         crate::test_ui::builder()
             .with_size(egui::vec2(460.0, 200.0))
@@ -28752,6 +29015,12 @@ mod grid_reclick_open_tests {
                 |root_ui, state| {
                     let ctx = &root_ui.ctx().clone();
                     state.app.begin_grid_click_input_frame(ctx);
+                    if state.consume_press {
+                        ctx.input_mut(|input| {
+                            if let Some(index) = input.events.iter().position(|event| matches!(event, egui::Event::PointerButton {pressed: true, ..})) { input.events.remove(index); }
+                        });
+                    }
+
                     egui::CentralPanel::default().show(root_ui, |ui| {
                         let suppress_primary_pointer =
                             state.app.begin_grid_right_drag_primary_frame(ctx);
@@ -28796,6 +29065,9 @@ mod grid_reclick_open_tests {
                                 press_pos.is_some_and(|pos| cell_rect.contains(pos));
                             primary_click_hit_cell |=
                                 primary_click_pos.is_some_and(|pos| cell_rect.contains(pos));
+                            let mut areas = crate::app::ThumbnailHitAreas::default();
+                            areas.include(cell_rect.shrink(25.0));
+                            let hit_areas = (state.letterbox && state.app.settings.grid_background_double_click_parent).then_some(&areas);
                             if state
                                 .app
                                 .handle_cell_interaction(
@@ -28809,13 +29081,15 @@ mod grid_reclick_open_tests {
                                     suppress_primary_pointer,
                                     &touch_frame,
                                     previous_grid_click_pairing,
-                                    None,
+                                    hit_areas,
                                 )
                                 .is_some()
                             {
                                 state.activations += 1;
                             }
                         }
+                        if state.overlay { ui.interact(cell_rect(1), egui::Id::unique("grid_test_overlay"), egui::Sense::click()); }
+                        if state.overlay_background { ui.interact(egui::Rect::from_min_size(egui::pos2(420.0, 150.0), egui::vec2(35.0, 40.0)), egui::Id::unique("grid_background_overlay"), egui::Sense::click()); }
                         if state.replay_primary_handlers {
                             for idx in 0..state.app.items.len() {
                                 if state.app.handle_cell_interaction(
@@ -28850,10 +29124,6 @@ mod grid_reclick_open_tests {
                                 response.double_clicked_by(egui::PointerButton::Primary),
                             ));
                         }
-                        state
-                            .app
-                            .start_grid_background_mouse_ring_flick_if_pressed(ctx, ui.max_rect());
-                        state.app.update_grid_mouse_ring_flick(ctx);
                         if let Some(nav) = state.app.handle_grid_background_primary_click(
                             ctx,
                             ui.max_rect(),
@@ -28863,7 +29133,9 @@ mod grid_reclick_open_tests {
                             previous_grid_click_pairing,
                             &touch_frame,
                         ) {
-                            state.background_navs.push(nav);
+                            if ctx.data(|data| matches!(data.get_temp::<GridPrimaryInputFrame>(egui::Id::unique("grid_background_primary_frame")), Some(GridPrimaryInputFrame::CellActivated(_)))) {
+                                state.activations += 1;
+                            } else { state.background_navs.push(nav); }
                         }
                         state
                             .app
@@ -29986,7 +30258,7 @@ mod grid_reclick_open_tests {
     }
 
     #[test]
-    fn cell_focus_roundtrip_batch_restarts_pair_when_navigation_skips_background() {
+    fn cell_focus_roundtrip_batch_uses_common_completion_with_navigation_shortcut() {
         check_cell_focus_roundtrip_batch(true);
     }
 
@@ -30120,7 +30392,10 @@ mod grid_reclick_open_tests {
         let (navs, background_calls) = draw(&mut app, 1.2, click());
         assert_eq!(navs.len(), 1);
         assert!(matches!(&navs[0], AddressBarNav::GridVirtual(intent) if intent.path == path));
-        assert_eq!(background_calls == 0, skip_background_on_navigation);
+        assert!(
+            background_calls > 0,
+            "ordered completion owns cell navigation as well as background input"
+        );
     }
 
     #[test]
@@ -30594,6 +30869,439 @@ mod grid_reclick_open_tests {
         harness.input_mut().events =
             section1680_edges(pos, &[true, false, true, false], egui::Modifiers::NONE);
         harness.run();
+    }
+
+    #[test]
+    fn section1680_interleaved_clicks_follow_selection_order() {
+        for mode in [
+            GridClickSelectionMode::Explorer,
+            GridClickSelectionMode::Check,
+        ] {
+            for reclick in [false, true] {
+                for background in [false, true] {
+                    for sequence in [[0, 3, 0], [0, 1, 0], [0, 3, 1], [1, 0, 1]] {
+                        let mut harness = handler_harness(mode, reclick, None, false, false);
+                        harness.state_mut().letterbox = true;
+                        harness
+                            .state_mut()
+                            .app
+                            .settings
+                            .grid_background_double_click_parent = background;
+                        let positions = [
+                            cell_rect(0).center(),
+                            cell_rect(1).center(),
+                            cell_rect(2).center(),
+                            cell_rect(0).left_top() + egui::vec2(10.0, 60.0),
+                        ];
+                        harness.hover_at(positions[*sequence.last().unwrap()]);
+                        harness.run();
+                        harness.input_mut().events = sequence
+                            .iter()
+                            .flat_map(|&target| {
+                                section1680_edges(
+                                    positions[target],
+                                    &[true, false],
+                                    egui::Modifiers::NONE,
+                                )
+                            })
+                            .collect();
+                        harness.run();
+                        // OFF makes the letterbox part of A. Check mode preserves
+                        // the cursor on background, so an enabled reclick may open A.
+                        let expected_open = sequence[1] == 3
+                            && (!background
+                                || (sequence[2] == 0
+                                    && mode == GridClickSelectionMode::Check
+                                    && reclick));
+                        assert_eq!(
+                            harness.state().activations,
+                            usize::from(expected_open),
+                            "{mode:?} reclick={reclick} background={background} sequence={sequence:?}"
+                        );
+                        assert_eq!(
+                            harness.state().app.selected,
+                            Some(if expected_open {
+                                0
+                            } else {
+                                *sequence.last().unwrap()
+                            })
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn section1680_interleaved_modifier_and_secondary_clicks_keep_their_order() {
+        for mode in [
+            GridClickSelectionMode::Explorer,
+            GridClickSelectionMode::Check,
+        ] {
+            for middle in [
+                egui::Modifiers::CTRL,
+                egui::Modifiers::SHIFT,
+                egui::Modifiers::NONE,
+            ] {
+                let mut harness = handler_harness(mode, true, None, false, false);
+                harness
+                    .state_mut()
+                    .app
+                    .settings
+                    .ring_shortcuts
+                    .set_right_drag_mode(
+                        crate::ring_shortcut::RightDragContext::Grid,
+                        crate::ring_shortcut::RightDragMode::Disabled,
+                    );
+                harness.hover_at(cell_rect(0).center());
+                harness.run();
+                let mut events =
+                    section1680_edges(cell_rect(0).center(), &[true, false], egui::Modifiers::NONE);
+                let mut between = section1680_edges(cell_rect(1).center(), &[true, false], middle);
+                if middle == egui::Modifiers::NONE {
+                    for event in &mut between {
+                        if let egui::Event::PointerButton { button, .. } = event {
+                            *button = egui::PointerButton::Secondary;
+                        }
+                    }
+                }
+                events.extend(between);
+                events.extend(section1680_edges(
+                    cell_rect(0).center(),
+                    &[true, false],
+                    egui::Modifiers::NONE,
+                ));
+                harness.input_mut().events = events;
+                harness.run();
+                assert_eq!(harness.state().activations, 0, "{mode:?} {middle:?}");
+                assert_eq!(harness.state().app.selected, Some(0));
+                assert_eq!(
+                    harness.state().app.checked.contains(&1),
+                    mode == GridClickSelectionMode::Check && middle != egui::Modifiers::NONE
+                );
+                if middle == egui::Modifiers::NONE {
+                    assert_eq!(
+                        harness
+                            .state()
+                            .app
+                            .context_menu_idx
+                            .as_ref()
+                            .map(|owner| owner.index),
+                        Some(1)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn section1680_carried_release_is_applied_before_another_cell_click() {
+        let mut harness = handler_harness(GridClickSelectionMode::Check, false, None, false, false);
+        harness.hover_at(cell_rect(0).center());
+        harness.run();
+        harness.input_mut().events =
+            section1680_edges(cell_rect(0).center(), &[true], egui::Modifiers::NONE);
+        harness.run();
+        let mut events = section1680_edges(cell_rect(0).center(), &[false], egui::Modifiers::NONE);
+        events.extend(section1680_edges(
+            cell_rect(1).center(),
+            &[true, false],
+            egui::Modifiers::CTRL,
+        ));
+        harness.input_mut().events = events;
+        harness.run();
+        assert_eq!(harness.state().app.selected, Some(1));
+        assert_eq!(harness.state().app.checked, HashSet::from([0, 1]));
+        assert_eq!(harness.state().activations, 0);
+    }
+
+    #[test]
+    fn section1680_witness_rejects_same_layer_overlay_and_consumed_press() {
+        for consume in [false, true] {
+            let mut harness =
+                handler_harness(GridClickSelectionMode::Explorer, true, None, false, false);
+            harness.state_mut().overlay = !consume;
+            harness.hover_at(cell_rect(1).center());
+            harness.run();
+            harness.state_mut().consume_press = consume;
+            let mut events =
+                section1680_edges(cell_rect(0).center(), &[true, false], egui::Modifiers::CTRL);
+            events.extend(section1680_edges(
+                cell_rect(1).center(),
+                &[true, false],
+                egui::Modifiers::CTRL,
+            ));
+            harness.input_mut().events = events;
+            harness.run();
+            assert_eq!(harness.state().activations, 0);
+            assert!(!harness.state().app.checked.contains(&1));
+            assert_eq!(
+                harness.state().app.selected,
+                if consume { None } else { Some(0) }
+            );
+        }
+    }
+
+    #[test]
+    fn section1680_secondary_press_does_not_steal_an_existing_button_capture() {
+        let mut harness =
+            handler_harness(GridClickSelectionMode::Explorer, false, None, false, false);
+        harness
+            .state_mut()
+            .app
+            .settings
+            .ring_shortcuts
+            .set_right_drag_mode(
+                crate::ring_shortcut::RightDragContext::Grid,
+                crate::ring_shortcut::RightDragMode::Disabled,
+            );
+        harness.hover_at(cell_rect(0).center());
+        harness.run();
+        let mut events = section1680_edges(cell_rect(0).center(), &[true], egui::Modifiers::NONE);
+        events.extend(
+            [true, false]
+                .into_iter()
+                .map(|pressed| egui::Event::PointerButton {
+                    pos: cell_rect(1).center(),
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }),
+        );
+        events.extend(section1680_edges(
+            cell_rect(0).center(),
+            &[false],
+            egui::Modifiers::NONE,
+        ));
+        harness.input_mut().events = events;
+        harness.run();
+        assert_eq!(harness.state().activations, 0);
+        assert_ne!(harness.state().app.selected, Some(1));
+    }
+
+    #[test]
+    fn section1680_carried_secondary_release_keeps_its_owner_before_primary_click() {
+        let mut harness =
+            handler_harness(GridClickSelectionMode::Explorer, true, None, false, false);
+        harness
+            .state_mut()
+            .app
+            .settings
+            .ring_shortcuts
+            .set_right_drag_mode(
+                crate::ring_shortcut::RightDragContext::Grid,
+                crate::ring_shortcut::RightDragMode::Disabled,
+            );
+        harness.hover_at(cell_rect(0).center());
+        harness.run();
+        pointer_button(
+            &mut harness,
+            cell_rect(0).center(),
+            egui::PointerButton::Secondary,
+            true,
+        );
+        let mut events = vec![egui::Event::PointerButton {
+            pos: cell_rect(0).center(),
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        events.extend(section1680_edges(
+            cell_rect(1).center(),
+            &[true, false],
+            egui::Modifiers::NONE,
+        ));
+        harness.input_mut().events = events;
+        harness.run();
+        assert_eq!(harness.state().activations, 0);
+        assert_eq!(harness.state().app.selected, Some(1));
+        assert_eq!(
+            harness
+                .state()
+                .app
+                .context_menu_idx
+                .as_ref()
+                .map(|owner| owner.index),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn section1680_reclick_precedes_later_right_drag_short_tap() {
+        for mode in [
+            crate::ring_shortcut::RightDragMode::RingShortcut,
+            crate::ring_shortcut::RightDragMode::MouseGesture,
+        ] {
+            let mut harness = handler_harness(
+                GridClickSelectionMode::Explorer,
+                true,
+                Some(0),
+                false,
+                false,
+            );
+            harness
+                .state_mut()
+                .app
+                .settings
+                .ring_shortcuts
+                .set_right_drag_mode(crate::ring_shortcut::RightDragContext::Grid, mode);
+            harness.hover_at(cell_rect(0).center());
+            harness.run();
+            let mut events =
+                section1680_edges(cell_rect(0).center(), &[true, false], egui::Modifiers::NONE);
+            events.extend(
+                [true, false]
+                    .into_iter()
+                    .map(|pressed| egui::Event::PointerButton {
+                        pos: cell_rect(1).center(),
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }),
+            );
+            harness.input_mut().events = events;
+            harness.run();
+            assert_eq!(harness.state().activations, 1);
+            assert_eq!(harness.state().app.selected, Some(0));
+            assert!(harness.state().app.context_menu_idx.is_none());
+        }
+    }
+
+    #[test]
+    fn section1680_touch_long_press_keeps_the_cell_menu() {
+        let mut harness =
+            handler_harness(GridClickSelectionMode::Explorer, false, None, false, false);
+        let pos = cell_rect(1).center();
+        harness.hover_at(pos);
+        harness.run();
+        background_touch_event(&mut harness, egui::TouchPhase::Start, pos);
+        harness.run_steps(100);
+        assert_eq!(
+            harness
+                .state()
+                .app
+                .context_menu_idx
+                .as_ref()
+                .map(|owner| owner.index),
+            Some(1)
+        );
+        assert_eq!(harness.state().activations, 0);
+    }
+
+    #[test]
+    fn section1680_suppressed_release_retires_cancel_before_fresh_mouse_hold() {
+        let mut suppression = GridRightDragPrimarySuppression::UntilRelease;
+        assert!(suppression.suppress_edge(false, true, true));
+        assert_eq!(suppression, GridRightDragPrimarySuppression::Idle);
+        assert!(!suppression.suppress_edge(true, false, false));
+        assert_eq!(suppression, GridRightDragPrimarySuppression::Idle);
+    }
+
+    #[test]
+    fn section1680_blocked_cancel_release_does_not_swallow_the_next_click() {
+        let mut harness =
+            handler_harness(GridClickSelectionMode::Explorer, false, None, false, false);
+        harness
+            .state_mut()
+            .app
+            .settings
+            .ring_shortcuts
+            .set_right_drag_mode(
+                crate::ring_shortcut::RightDragContext::Grid,
+                crate::ring_shortcut::RightDragMode::RingShortcut,
+            );
+        let pos = cell_rect(0).center();
+        pointer_button(&mut harness, pos, egui::PointerButton::Secondary, true);
+        pointer_button(&mut harness, pos, egui::PointerButton::Primary, true);
+        assert_eq!(
+            harness.state().app.grid_right_drag_primary_suppression,
+            GridRightDragPrimarySuppression::UntilRelease
+        );
+        let mut events = section1680_edges(pos, &[false], egui::Modifiers::NONE);
+        events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, 10.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
+        });
+        harness.input_mut().events = events;
+        harness.step();
+        assert_eq!(
+            harness.state().app.grid_right_drag_primary_suppression,
+            GridRightDragPrimarySuppression::Idle
+        );
+        harness.run_steps(20);
+        pointer_button(&mut harness, pos, egui::PointerButton::Secondary, false);
+        click_cell(&mut harness, 1, egui::Modifiers::NONE);
+        assert_eq!(harness.state().app.selected, Some(1));
+        assert_eq!(harness.state().activations, 0);
+    }
+
+    #[test]
+    fn section1680_secondary_background_rejects_dialog_and_foreign_widget() {
+        for dialog in [false, true] {
+            let mut harness = handler_harness(
+                GridClickSelectionMode::Explorer,
+                false,
+                Some(0),
+                dialog,
+                false,
+            );
+            harness.state_mut().overlay_background = !dialog;
+            let pos = egui::pos2(440.0, 170.0);
+            harness.hover_at(pos);
+            harness.run();
+            for pressed in [true, false] {
+                pointer_button(&mut harness, pos, egui::PointerButton::Secondary, pressed);
+            }
+            assert_eq!(harness.state().app.selected, Some(0));
+            assert!(harness.state().app.context_menu_idx.is_none());
+        }
+    }
+
+    #[test]
+    fn section1680_secondary_info_bar_gate_uses_its_own_release_position() {
+        for mode in [
+            crate::ring_shortcut::RightDragMode::Disabled,
+            crate::ring_shortcut::RightDragMode::RingShortcut,
+            crate::ring_shortcut::RightDragMode::MouseGesture,
+        ] {
+            let mut harness =
+                handler_harness(GridClickSelectionMode::Explorer, false, None, false, false);
+            harness
+                .state_mut()
+                .app
+                .settings
+                .ring_shortcuts
+                .set_right_drag_mode(crate::ring_shortcut::RightDragContext::Grid, mode);
+            let bar = egui::Rect::from_min_size(egui::pos2(420.0, 150.0), egui::vec2(35.0, 40.0));
+            harness.state_mut().app.selection_info_bar_rect = Some(bar);
+            harness.hover_at(cell_rect(1).center());
+            harness.run();
+            let mut events = [true, false]
+                .into_iter()
+                .map(|pressed| egui::Event::PointerButton {
+                    pos: cell_rect(1).center(),
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                })
+                .collect::<Vec<_>>();
+            events.push(egui::Event::PointerMoved(bar.center()));
+            harness.input_mut().events = events;
+            harness.run();
+            assert_eq!(harness.state().app.selected, Some(1));
+            assert_eq!(
+                harness
+                    .state()
+                    .app
+                    .context_menu_idx
+                    .as_ref()
+                    .map(|owner| owner.index),
+                Some(1)
+            );
+        }
     }
 
     #[test]

@@ -15712,6 +15712,14 @@ enum GridClickTarget {
     },
 }
 
+impl GridClickTarget {
+    fn source(self) -> GridClickSource {
+        match self {
+            Self::Cell { context, .. } | Self::Background { context, .. } => context.source,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PendingGridClick {
     target: GridClickTarget,
@@ -15720,7 +15728,7 @@ struct PendingGridClick {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GridPressTarget {
+pub(crate) enum GridPressTarget {
     Cell(usize),
     Background,
 }
@@ -15729,8 +15737,11 @@ enum GridPressTarget {
 /// not an invitation to infer a click from the batch's final pointer position.
 pub(crate) enum GridPrimaryInput {
     Cancelled,
+    TouchCancelled,
+    Moved(egui::Pos2),
     Press {
         pos: egui::Pos2,
+        widget: Option<egui::Id>,
         source: GridClickSource,
         suppressed: bool,
     },
@@ -15738,6 +15749,13 @@ pub(crate) enum GridPrimaryInput {
         click: Option<(egui::Pos2, u32)>,
         modifiers: egui::Modifiers,
         source: GridClickSource,
+        suppressed: bool,
+    },
+    Secondary {
+        pos: egui::Pos2,
+        pressed: bool,
+        clicked: bool,
+        widget: Option<egui::Id>,
         suppressed: bool,
     },
     FocusLost,
@@ -15854,45 +15872,9 @@ impl GridClickPairingState {
         }
     }
 
-    pub(crate) fn background_press_cancel(&mut self) {
-        self.primary_press = None;
-    }
-
-    pub(crate) fn has_primary_press(&self) -> bool {
-        self.primary_press.is_some()
-    }
-
     pub(crate) fn cancel_pair_preserving_cell_press(&mut self) {
         self.pending = None;
         self.end_background_run();
-    }
-
-    /// Finish input not accepted by any cell when background actions are disabled.
-    /// A new hold preserves the preceding click; an unhandled release does not.
-    pub(crate) fn finish_unaccepted_primary_frame(
-        &mut self,
-        mut previous: Self,
-        events: &[GridPrimaryInput],
-    ) {
-        let mut new_press_suffix = false;
-        for event in events {
-            match event {
-                GridPrimaryInput::FocusLost
-                | GridPrimaryInput::Cancelled
-                | GridPrimaryInput::Release { .. } => {
-                    previous.end_activation();
-                    new_press_suffix = false;
-                }
-                GridPrimaryInput::Press { .. } => {
-                    previous.primary_press = None;
-                    new_press_suffix = true;
-                }
-            }
-        }
-        if new_press_suffix {
-            previous.primary_press = self.primary_press;
-        }
-        *self = previous;
     }
 
     pub(crate) fn begin_background_press(
@@ -15903,13 +15885,8 @@ impl GridClickPairingState {
         self.primary_press = Some((context, frame, GridPressTarget::Background));
     }
 
-    pub(crate) fn begin_cell_press(
-        &mut self,
-        context: GridBackgroundClickContext,
-        frame: u64,
-        index: usize,
-    ) {
-        self.primary_press = Some((context, frame, GridPressTarget::Cell(index)));
+    pub(crate) fn primary_press_target(&self) -> Option<GridPressTarget> {
+        self.primary_press.map(|(_, _, target)| target)
     }
 
     pub(crate) fn owns_cell_press(
@@ -15962,92 +15939,109 @@ impl GridClickPairingState {
         *self = Self::default();
     }
 
-    /// Replay only the target authorized by the caller's egui response / background gate.
-    /// Foreign releases and focus boundaries still retire its old pair, in raw order.
-    /// Rendering order cannot turn another target's release into this target's click.
+    /// Consume one edge of the unified cell/background stream. Selection is
+    /// applied before the next edge, so pairing and reclick observe the same order.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn accept_primary_releases(
+    pub(crate) fn accept_primary_input(
         &mut self,
-        mut previous: Self,
         context: GridBackgroundClickContext,
-        index: Option<usize>,
         frame: u64,
         at: f64,
         max_delay: f64,
         max_dist: f32,
-        events: &[GridPrimaryInput],
-        contains: impl Fn(egui::Pos2, bool) -> bool,
-    ) -> Vec<AcceptedGridClick> {
-        previous.validate_background(context, frame);
-        let mut clicks = Vec::new();
-        let target = index.map_or(GridPressTarget::Background, GridPressTarget::Cell);
-        let mut ends_with_foreign_press = false;
-        for event in events {
-            match *event {
-                GridPrimaryInput::FocusLost | GridPrimaryInput::Cancelled => {
-                    previous.end_activation();
-                    ends_with_foreign_press = false;
+        event: &GridPrimaryInput,
+        target_at: impl Fn(egui::Pos2, bool) -> Option<GridPressTarget>,
+    ) -> Option<(GridPressTarget, AcceptedGridClick)> {
+        match *event {
+            GridPrimaryInput::FocusLost
+            | GridPrimaryInput::Cancelled
+            | GridPrimaryInput::Secondary { .. } => self.end_activation(),
+            GridPrimaryInput::TouchCancelled => {
+                if self
+                    .primary_press
+                    .is_some_and(|(owner, _, _)| owner.source == GridClickSource::Touch)
+                {
+                    self.primary_press = None;
                 }
-                GridPrimaryInput::Press {
-                    pos,
-                    source,
-                    suppressed,
-                } => {
-                    previous.primary_press = None;
-                    ends_with_foreign_press = true;
-                    if !suppressed && contains(pos, true) {
-                        previous.primary_press = Some((
-                            GridBackgroundClickContext { source, ..context },
-                            frame,
-                            target,
-                        ));
-                        ends_with_foreign_press = false;
-                    }
+                if self
+                    .pending
+                    .is_some_and(|click| click.target.source() == GridClickSource::Touch)
+                {
+                    self.pending = None;
                 }
-                GridPrimaryInput::Release {
-                    click,
-                    modifiers,
-                    source,
-                    suppressed,
-                } => {
-                    ends_with_foreign_press = false;
-                    let owner = GridBackgroundClickContext { source, ..context };
-                    let accepted = !suppressed
-                        && click.is_some_and(|(pos, _)| contains(pos, false))
-                        && previous
-                            .primary_press
-                            .is_some_and(|(press, _, press_target)| {
-                                press == owner && press_target == target
-                            });
-                    if !accepted {
-                        previous.end_activation();
-                        continue;
+            }
+            GridPrimaryInput::Moved(_) => {}
+            GridPrimaryInput::Press {
+                pos,
+                source,
+                suppressed,
+                ..
+            } => {
+                if suppressed {
+                    self.end_activation();
+                    return None;
+                }
+                if self
+                    .pending
+                    .is_some_and(|click| click.target.source() != source)
+                {
+                    self.pending = None;
+                }
+                self.primary_press =
+                    (!suppressed)
+                        .then(|| target_at(pos, true))
+                        .flatten()
+                        .map(|target| {
+                            (
+                                GridBackgroundClickContext { source, ..context },
+                                frame,
+                                target,
+                            )
+                        });
+            }
+            GridPrimaryInput::Release {
+                click,
+                modifiers,
+                source,
+                suppressed,
+            } => {
+                let owner = GridBackgroundClickContext { source, ..context };
+                let press = self.primary_press.take();
+                let target = click.and_then(|(pos, _)| target_at(pos, false));
+                if suppressed
+                    || !press.is_some_and(|(press, _, press_target)| {
+                        press == owner && Some(press_target) == target
+                    })
+                {
+                    self.end_activation();
+                    return None;
+                }
+                let target = target.expect("accepted release has a target");
+                let (pos, _) = click.expect("accepted release has egui click classification");
+                let previous = *self;
+                let paired = match target {
+                    GridPressTarget::Cell(index) => {
+                        self.register_cell_click(previous, index, owner, frame, at, max_delay)
                     }
-                    let (pos, _) = click.expect("accepted release has egui click classification");
-                    let paired = if let Some(index) = index {
-                        previous.primary_press = None;
-                        previous.register_cell_click(previous, index, owner, frame, at, max_delay)
-                    } else {
-                        previous.register_background_click(
+                    GridPressTarget::Background => {
+                        self.primary_press = press;
+                        self.register_background_click(
                             previous, owner, pos, frame, at, max_delay, max_dist,
                         )
-                    };
-                    clicks.push(AcceptedGridClick {
+                    }
+                };
+                return Some((
+                    target,
+                    AcceptedGridClick {
                         pos,
                         modifiers,
                         paired,
                         source,
-                    });
-                }
+                    },
+                ));
             }
         }
-        // A later raw press may already have been claimed by another painted cell.
-        // Do not erase that new capture while completing this target's older release.
-        if ends_with_foreign_press {
-            previous.primary_press = self.primary_press;
-        }
-        *self = previous;
-        clicks
+        None
     }
 
     #[cfg(test)]
