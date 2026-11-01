@@ -4871,3 +4871,15 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 実機確認の対象は、最小化/トレイ状態でのタグ/★要求の応答 (前面化なし) と、AI連携窓の説明の字間・折り返し。
 これらの実窓での操作は未実施。今巡では実pipe経路を変更/再実行しておらず、§26.3の外側確認コマンドを維持する。
 通常並列snapshotの異常終了以外に新たな未解決事項/設計矛盾は見つからなかった。commit、実設定やAIアプリのconfig操作なし。
+
+### 26.x 検収 (ClaudeCode、2026-11-01)
+
+- sandbox の外で ClaudeCode が実行:
+  - `d659e09f3`: crates `--include-ignored` exit 0 (15/15、65/65)。`test-lib-full.ps1` は 3 件だけ失敗 (ページめくりの描画と提出、
+    ページめくりの許可の処理、本の strip の押下)。3 件とも単独の再実行で通った (負荷で落ちる時間に依存するテスト。§23.6 と同じ種類)。
+  - `1bf174a6e`: `cargo test --test ui_snapshot` exit 0 (224/224)、agent_ipc / agent_integration / keymap の focused nextest
+    exit 0 (370/370)。
+- 窓の PNG (明暗) を ClaudeCode が目視。1 巡目で見つけた説明の列の字間の広がりは、2 巡目の版で直っている。
+- 独立した実装レビュー: 1 巡目 (`d659e09f3`) P2 1 件 (agent の要求の起こし先が子 viewport になり得る) と P3 1 件 (説明の列の
+  両端揃え) → `1bf174a6e` で直した。2 巡目で追加の指摘なし、判定は「2-3 impl: accepted」。
+- 実機の未確認: 窓の表示、最小化・トレイ中のタグ・★の要求、登録。公開文書の下書きの後、サブ PC で段階 2 全体をもう一度確かめる。
