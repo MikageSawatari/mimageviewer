@@ -3703,7 +3703,7 @@ launcher 内包物を更新してから §2.4 の隔離した stdio check を行
   | tool | 引数 | 対象 | annotation |
   |---|---|---|---|
   | `add_tags` / `remove_tags` | `items` (path、500 件まで)、`tags` (10 個まで) | 実ファイル・フォルダ・書庫のファイル (UI と同じく ZIP の中の項目・PDF のページは対象外) | `destructiveHint` は remove だけ true、どちらも `idempotentHint=true` (変化が無ければ保存しない。下) |
-  | `set_rating` | `items` (path + 任意の `subresource`、500 件まで)、`stars` (0〜5) | 画像・動画・音声・ZIP の中の画像・PDF のページ・フォルダ・書庫 (UI で★を付けられるもの) | `idempotentHint=true` (同じ値なら書かない) |
+  | `set_rating` | `items` (path + 任意の `subresource`、500 件まで)、`stars` (0〜5) | 画像・動画・音声・ZIP の中の画像・ZIP の中のフォルダ (入れ子の ZIP の本を含む。UI と同じ本の key)・PDF のページ・フォルダ・書庫 (UI で★を付けられるもの。実装レビュー 2-2 の P2) | `idempotentHint=true` (同じ値なら書かない) |
   | `create_collection` | `name` | — | `idempotentHint=false` |
   | `rename_collection` | `id`、`name` | — | `idempotentHint=true` |
   | `add_to_collection` / `remove_from_collection` | `id`、`items` (path、500 件まで) | 実ファイル・フォルダ・書庫 (UI と同じく ZIP の中の項目・PDF のページは対象外) | remove だけ `destructiveHint=true` |
@@ -3791,6 +3791,7 @@ launcher 内包物を更新してから §2.4 の隔離した stdio check を行
   「AI による変更」に、新しい順で 1 回ずつ (時刻・AI アプリの名前・tool・件数・要約) を出し、開くと項目ごとの行 (項目・前の値 →
   後の値・結果) を出す。行はコピーできる。「mIV を閉じると消えます」と書く。
   - タグ: 前後のタグは tag writer の結果 (`tags_before` / `tags_after`、agent の `tx_id` で対応) で埋める。書き込みの前は「処理中」。
+    完了の採用は job と記録の対応 (typed な状態) で決め、表示の文言で判定しない (実装レビュー 2-2 の P2)。
   - ★: UI thread で書く前の値を cache / DB から読み、書いた後の値と並べる。
   - コレクション: 追加・外した項目、名前の変更の前後、作成した名前と id。**追加・外すの記録にも対象のコレクションの id と名前を
     残し、表示とコピーに含める** (同じ名前のコレクションを許すので、名前だけではどれへの変更か分からない。実装レビュー 2-1 の P2)。
