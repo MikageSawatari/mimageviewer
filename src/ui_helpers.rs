@@ -2015,6 +2015,23 @@ pub fn draw_play_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32) 
 /// Unicode グリフ選定ルール」)。動画セルの再生アイコン (`draw_play_icon`) と同様に
 /// painter プリミティブで描いてフォント依存を避ける。
 pub fn draw_music_icon(painter: &egui::Painter, inner: egui::Rect, dark: bool) -> egui::Rect {
+    let shapes = music_icon_shapes(inner, dark);
+    let bounds = shapes.iter().fold(egui::Rect::NOTHING, |bounds, shape| {
+        bounds.union(shape.visual_bounding_rect())
+    });
+    painter.extend(shapes);
+    bounds
+}
+
+pub(crate) fn music_icon_bounds(inner: egui::Rect) -> egui::Rect {
+    music_icon_shapes(inner, true)
+        .iter()
+        .fold(egui::Rect::NOTHING, |bounds, shape| {
+            bounds.union(shape.visual_bounding_rect())
+        })
+}
+
+fn music_icon_shapes(inner: egui::Rect, dark: bool) -> [egui::Shape; 5] {
     let side = inner.width().min(inner.height());
     let s = (side * 0.34).clamp(22.0, 64.0);
     let center = inner.center() - egui::vec2(0.0, side * 0.05);
@@ -2033,7 +2050,7 @@ pub fn draw_music_icon(painter: &egui::Painter, inner: egui::Rect, dark: bool) -
     let right_stem_x = right_head.x + head_r * 0.9;
     let stem_top_y = left_head.y - stem_h;
     // 符幹 (符頭の右端から上へ)
-    let shapes = [
+    [
         egui::Shape::line_segment(
             [
                 egui::pos2(left_stem_x, left_head.y),
@@ -2059,12 +2076,7 @@ pub fn draw_music_icon(painter: &egui::Painter, inner: egui::Rect, dark: bool) -
         // 符頭
         egui::Shape::circle_filled(left_head, head_r, color),
         egui::Shape::circle_filled(right_head, head_r, color),
-    ];
-    let bounds = shapes.iter().fold(egui::Rect::NOTHING, |bounds, shape| {
-        bounds.union(shape.visual_bounding_rect())
-    });
-    painter.extend(shapes);
-    bounds
+    ]
 }
 
 /// フルスクリーン右パネル共通の ★ レーティング行を描く (画像 / 動画 / 音声で共有)。
@@ -2237,6 +2249,23 @@ pub fn draw_overlay_bookmark_time_badge(
     };
     painter.rect_filled(placement.rect, 4.0, fill);
     draw_badge_text(painter, placement, egui::Color32::WHITE);
+}
+
+pub fn draw_overlay_bookmark_title_badge(
+    painter: &egui::Painter,
+    title: &crate::thumb_overlay_layout::BadgePlacement,
+) {
+    let galley = painter.layout_no_wrap(
+        title.text.clone(),
+        thumbnail_badge_font(title.style),
+        egui::Color32::WHITE,
+    );
+    painter.rect_filled(title.rect, 4.0, egui::Color32::from_black_alpha(190));
+    painter.galley(
+        title.rect.center() - galley.size() * 0.5,
+        galley,
+        egui::Color32::WHITE,
+    );
 }
 
 /// 統計ダイアログのヒストグラムを ASCII バー + 件数で描画する。

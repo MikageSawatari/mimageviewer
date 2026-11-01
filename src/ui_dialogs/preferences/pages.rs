@@ -1407,6 +1407,15 @@ fn favorite_standard_settings_notice(ui: &mut egui::Ui, state: &PreferencesState
 }
 
 pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "thumbnail/type-icon", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.thumb_show_type_icon,
+            "サムネイルに種類アイコンを表示する",
+        );
+        ui.small(
+            "画像が表示された後も、左下の小さなマークでフォルダ・書庫・画像などを見分けられます。",
+        );
+    });
     anchored(ui, state, "thumbnail/name-font-scale", |ui, state| {
         ui.horizontal_wrapped(|ui| {
             let label = ui.label("名前の文字サイズ:");

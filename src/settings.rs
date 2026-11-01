@@ -1,3 +1,9 @@
+/// Prototype default: change this one constant after the visual comparison.
+pub const DEFAULT_THUMB_SHOW_TYPE_ICON: bool = true;
+fn default_thumb_show_type_icon() -> bool {
+    DEFAULT_THUMB_SHOW_TYPE_ICON
+}
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -4854,6 +4860,9 @@ pub struct Settings {
     /// 形式表示を名前の直上に置き、ファイル名に全幅を使う。
     #[serde(default)]
     pub thumb_name_prioritize_width: bool,
+    /// Keep a small typed mark after the representative thumbnail loads (§1.677 prototype).
+    #[serde(default = "default_thumb_show_type_icon")]
+    pub thumb_show_type_icon: bool,
     /// サムネイル右下に動画・音声の長さを表示する。
     #[serde(default = "default_true")]
     pub thumb_show_media_duration: bool,
@@ -7803,6 +7812,7 @@ impl Default for Settings {
             thumb_name_font_scale_percent: default_thumb_name_font_scale_percent(),
             thumb_name_max_lines: default_thumb_name_max_lines(),
             thumb_name_prioritize_width: false,
+            thumb_show_type_icon: default_thumb_show_type_icon(),
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
             thumb_show_media_duration: true,
             thumb_show_resume_meter: true,
@@ -11137,6 +11147,33 @@ mod tests {
             assert_eq!(
                 db.load_into_settings().unwrap().thumb_name_prioritize_width,
                 value
+            );
+        }
+    }
+
+    #[test]
+    fn thumb_show_type_icon_default_and_db_roundtrip() {
+        assert_eq!(
+            Settings::default().thumb_show_type_icon,
+            DEFAULT_THUMB_SHOW_TYPE_ICON
+        );
+        assert_eq!(
+            serde_json::from_str::<Settings>("{}")
+                .unwrap()
+                .thumb_show_type_icon,
+            DEFAULT_THUMB_SHOW_TYPE_ICON
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        for enabled in [false, true] {
+            let settings = Settings {
+                thumb_show_type_icon: enabled,
+                ..Settings::default()
+            };
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings().unwrap().thumb_show_type_icon,
+                enabled
             );
         }
     }

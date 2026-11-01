@@ -355,6 +355,8 @@ pub(crate) fn layout_cell_overlays(
     media_duration: Option<&str>,
     book_resume_meter: bool,
     name_style: crate::thumb_overlay_layout::ThumbnailNameStyle,
+    type_icon_size: Option<f32>,
+    is_cut: bool,
 ) -> ThumbnailOverlayLayout {
     let inner = rect.shrink(4.0);
     let item_name = match item {
@@ -400,8 +402,35 @@ pub(crate) fn layout_cell_overlays(
         .map(|(kind, label)| BottomContainerInput { kind, label });
     let upscaled_video = matches!(item, GridItem::Video(path) if is_miv_upscaled_derivative(path));
 
+    let obstacles = if type_icon_size.is_some() {
+        let mut obstacles = custom_caption_obstacles(painter, rect, item, thumb, book_resume_meter);
+        obstacles.extend(primary_marker_obstacles(
+            painter,
+            inner,
+            item,
+            thumb,
+            is_drive_list,
+            if is_cut {
+                VideoThumbnailIndicator::Hidden
+            } else {
+                video_indicator
+            },
+            audio_indicator,
+        ));
+        if is_cut && let Some((center, radius)) = cut_badge_geometry(inner) {
+            obstacles.push(egui::Rect::from_center_size(
+                center,
+                egui::Vec2::splat(radius * 2.0),
+            ));
+        }
+        obstacles
+    } else {
+        Vec::new()
+    };
     layout_thumbnail_overlays(
         ThumbnailOverlayLayoutInput {
+            content_obstacles: &obstacles,
+            type_icon_size,
             cell: rect,
             inner,
             book_resume_meter,
@@ -466,11 +495,10 @@ fn thumbnail_badge_ink_rect(
 
 // Custom lower captions follow the common reservation. In a small cell omit a
 // caption that no longer fits, rather than moving it or the fixed primary icon.
-fn paint_lower_caption_galley(
+fn lower_caption_ink(
     painter: &egui::Painter,
     pos: egui::Pos2,
-    galley: std::sync::Arc<egui::Galley>,
-    color: egui::Color32,
+    galley: &egui::Galley,
     marker: Option<egui::Rect>,
     band: Option<(egui::Rect, egui::Rect)>,
 ) -> egui::Rect {
@@ -484,11 +512,25 @@ fn paint_lower_caption_galley(
             && !band.intersects(ink)
             && marker.is_none_or(|marker| !marker.intersects(ink))
     }) {
-        painter.galley(pos, galley, color);
         ink
     } else {
         egui::Rect::NOTHING
     }
+}
+
+fn paint_lower_caption_galley(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    galley: std::sync::Arc<egui::Galley>,
+    color: egui::Color32,
+    marker: Option<egui::Rect>,
+    band: Option<(egui::Rect, egui::Rect)>,
+) -> egui::Rect {
+    let ink = lower_caption_ink(painter, pos, &galley, marker, band);
+    if ink.is_positive() {
+        painter.galley(pos, galley, color);
+    }
+    ink
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -518,6 +560,18 @@ fn paint_lower_path(
     marker: Option<egui::Rect>,
     band: Option<(egui::Rect, egui::Rect)>,
 ) -> egui::Rect {
+    let (pos, galley) = layout_lower_path(painter, rect, components, color, max_font, min_font);
+    paint_lower_caption_galley(painter, pos, galley, color, marker, band)
+}
+
+fn layout_lower_path(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    components: &[&str],
+    color: egui::Color32,
+    max_font: f32,
+    min_font: f32,
+) -> (egui::Pos2, std::sync::Arc<egui::Galley>) {
     let galley = crate::ui_helpers::layout_path_hierarchy(
         painter,
         components,
@@ -531,7 +585,308 @@ fn paint_lower_path(
         rect.center().x - size.x * 0.5,
         rect.min.y + ((rect.height() - size.y).max(0.0)) * 0.5,
     );
-    paint_lower_caption_galley(painter, pos, galley, color, marker, band)
+    (pos, galley)
+}
+
+/// Geometry used by both the unchanged custom captions and their type-icon reservation.
+struct SearchCaptionGeometry {
+    thumb: egui::Rect,
+    label: egui::Rect,
+    path: egui::Rect,
+    marker: egui::Pos2,
+    marker_anchor: egui::Align2,
+    marker_font: f32,
+    count: egui::Pos2,
+    count_font: f32,
+    path_max_font: f32,
+    path_min_font: f32,
+}
+
+fn search_caption_geometry(
+    inner: egui::Rect,
+    loaded: bool,
+    shift: egui::Vec2,
+) -> SearchCaptionGeometry {
+    let thumb = egui::Rect::from_min_max(
+        inner.min,
+        egui::pos2(inner.max.x, inner.min.y + inner.height() * 0.62),
+    );
+    let label = egui::Rect::from_min_max(egui::pos2(inner.min.x, thumb.max.y + 2.0), inner.max)
+        .translate(shift);
+    if loaded {
+        let count_font = (label.height() * 0.19).clamp(10.0, 14.0);
+        SearchCaptionGeometry {
+            thumb,
+            label,
+            path: egui::Rect::from_min_max(
+                label.min + egui::vec2(4.0, 2.0),
+                egui::pos2(label.max.x - 4.0, label.max.y - count_font * 1.3),
+            ),
+            marker: thumb.min + egui::vec2(4.0, 4.0),
+            marker_anchor: egui::Align2::LEFT_TOP,
+            marker_font: (thumb.height() * 0.22).clamp(14.0, 28.0),
+            count: label.max - egui::vec2(6.0, 4.0),
+            count_font,
+            path_max_font: (label.height() * 0.24).clamp(10.0, 13.0),
+            path_min_font: 5.0,
+        }
+    } else {
+        let marker_font = (inner.height() * 0.18).clamp(22.0, 56.0);
+        let count_font = (inner.height() * 0.07).clamp(10.0, 14.0);
+        SearchCaptionGeometry {
+            thumb,
+            label,
+            path: egui::Rect::from_min_max(
+                egui::pos2(inner.min.x + 4.0, inner.min.y + marker_font * 1.35),
+                egui::pos2(inner.max.x - 4.0, inner.max.y - count_font * 2.2 + shift.y),
+            ),
+            marker: egui::pos2(inner.center().x, inner.min.y + marker_font * 0.75),
+            marker_anchor: egui::Align2::CENTER_CENTER,
+            marker_font,
+            count: inner.max - egui::vec2(6.0, 6.0) + shift,
+            count_font,
+            path_max_font: (inner.height() * 0.075).clamp(11.0, 15.0),
+            path_min_font: 8.0,
+        }
+    }
+}
+
+fn placeholder_caption_positions(inner: egui::Rect, shift: egui::Vec2) -> [egui::Pos2; 2] {
+    [
+        egui::pos2(inner.center().x, inner.max.y - 18.0) + shift,
+        egui::pos2(inner.center().x, inner.max.y - 3.0) + shift,
+    ]
+}
+
+/// Only the new mark consumes these existing ink/plate reservations. No I/O or decoding.
+fn custom_caption_obstacles(
+    painter: &egui::Painter,
+    cell: egui::Rect,
+    item: &GridItem,
+    thumb: &ThumbnailState,
+    meter: bool,
+) -> Vec<egui::Rect> {
+    let inner = cell.shrink(4.0);
+    let shift = egui::vec2(
+        0.0,
+        if meter {
+            -crate::thumb_overlay_layout::BOOK_RESUME_METER_RESERVE
+        } else {
+            0.0
+        },
+    );
+    let band = meter.then(|| {
+        (
+            egui::Rect::from_min_max(
+                egui::pos2(
+                    inner.min.x,
+                    inner.max.y - crate::thumb_overlay_layout::BOOK_RESUME_METER_HEIGHT,
+                ),
+                inner.max,
+            ),
+            cell,
+        )
+    });
+    let caption = |pos, anchor: egui::Align2, text: String, font: f32, marker| {
+        let galley =
+            painter.layout_no_wrap(text, egui::FontId::proportional(font), egui::Color32::WHITE);
+        lower_caption_ink(
+            painter,
+            anchor.anchor_size(pos, galley.size()).min,
+            &galley,
+            marker,
+            band,
+        )
+    };
+    match item {
+        GridItem::SearchContainer {
+            path,
+            kind,
+            hit_count,
+            representative,
+        } => {
+            let loaded = representative.is_some() && matches!(thumb, ThumbnailState::Loaded { .. });
+            let g = search_caption_geometry(inner, loaded, shift);
+            let icon = if *kind == crate::grid_item::SearchContainerKind::Folder {
+                "📁"
+            } else {
+                "📦"
+            };
+            // The old marker is unconditional, independent of the lower-band gate.
+            let galley = painter.layout_no_wrap(
+                icon.into(),
+                egui::FontId::proportional(g.marker_font),
+                egui::Color32::WHITE,
+            );
+            let marker = lower_caption_ink(
+                painter,
+                g.marker_anchor.anchor_size(g.marker, galley.size()).min,
+                &galley,
+                None,
+                None,
+            );
+            let raw = path.to_string_lossy();
+            let parts = crate::ui_helpers::split_path_components(&raw);
+            let (pos, galley) = layout_lower_path(
+                painter,
+                g.path,
+                &parts,
+                egui::Color32::WHITE,
+                g.path_max_font,
+                g.path_min_font,
+            );
+            let path_ink = lower_caption_ink(painter, pos, &galley, Some(marker), band);
+            let count = caption(
+                g.count,
+                egui::Align2::RIGHT_BOTTOM,
+                format!("{hit_count} 枚"),
+                g.count_font,
+                Some(marker),
+            );
+            let mut obstacles = vec![marker, path_ink, count];
+            if loaded {
+                obstacles.push(g.label);
+            }
+            obstacles.into_iter().filter(|r| r.is_positive()).collect()
+        }
+        GridItem::CollectionPlaceholder { path, reason, .. } => {
+            let galley = painter.layout_no_wrap(
+                "?".into(),
+                egui::FontId::proportional((inner.height() * 0.24).clamp(22.0, 46.0)),
+                egui::Color32::WHITE,
+            );
+            let marker = lower_caption_ink(
+                painter,
+                egui::Align2::CENTER_CENTER
+                    .anchor_size(inner.center() - egui::vec2(0.0, 10.0), galley.size())
+                    .min,
+                &galley,
+                None,
+                None,
+            );
+            let [name_pos, reason_pos] = placeholder_caption_positions(inner, shift);
+            vec![
+                marker,
+                caption(
+                    name_pos,
+                    egui::Align2::CENTER_BOTTOM,
+                    path.file_name()
+                        .unwrap_or(path.as_os_str())
+                        .to_string_lossy()
+                        .into_owned(),
+                    12.0,
+                    Some(marker),
+                ),
+                caption(
+                    reason_pos,
+                    egui::Align2::CENTER_BOTTOM,
+                    reason.label().into(),
+                    11.0,
+                    Some(marker),
+                ),
+            ]
+            .into_iter()
+            .filter(|r| r.is_positive())
+            .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn video_play_rect(inner: egui::Rect) -> egui::Rect {
+    let radius = (inner.width().min(inner.height()) * 0.18).max(10.0);
+    egui::Rect::from_center_size(inner.center(), egui::Vec2::splat(radius * 2.0))
+}
+
+fn drive_icon_body(inner: egui::Rect) -> egui::Rect {
+    let side = inner.width().min(inner.height());
+    egui::Rect::from_center_size(
+        inner.center() - egui::vec2(0.0, 12.0),
+        egui::vec2(
+            (side * 0.48).clamp(36.0, 72.0),
+            (side * 0.34).clamp(24.0, 48.0),
+        ),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn primary_marker_obstacles(
+    painter: &egui::Painter,
+    inner: egui::Rect,
+    item: &GridItem,
+    thumb: &ThumbnailState,
+    drive: bool,
+    video: VideoThumbnailIndicator,
+    audio: AudioThumbnailIndicator,
+) -> Vec<egui::Rect> {
+    let loaded = matches!(thumb, ThumbnailState::Loaded { .. });
+    let mut areas = Vec::new();
+    let caption = match item {
+        GridItem::Folder(_) if !loaded && drive => {
+            areas.push(drive_icon_body(inner).expand(0.75));
+            None
+        }
+        GridItem::Folder(_)
+        | GridItem::ZipDir {
+            is_archive: false, ..
+        } if !loaded => Some(("📁", 42.0, -14.0)),
+        GridItem::ZipFile(_)
+        | GridItem::ZipDir {
+            is_archive: true, ..
+        } if !loaded => Some(("📦", 32.0, 0.0)),
+        GridItem::PdfFile(_) if !loaded => Some(("📄", 32.0, 0.0)),
+        GridItem::ConvertibleArchive { .. } if !loaded => Some(("🗜", 32.0, 0.0)),
+        GridItem::Image(_)
+        | GridItem::ZipImage { .. }
+        | GridItem::PdfPage { .. }
+        | GridItem::Stack { .. }
+            if !loaded =>
+        {
+            Some((
+                if matches!(thumb, ThumbnailState::Pending | ThumbnailState::Evicted) {
+                    "読込中"
+                } else {
+                    "読込失敗"
+                },
+                12.0,
+                0.0,
+            ))
+        }
+        GridItem::Video(_) => {
+            if video_thumbnail_indicator_parts(item, video).play_icon {
+                areas.push(video_play_rect(inner));
+            }
+            matches!(thumb, ThumbnailState::Pending | ThumbnailState::Evicted)
+                .then_some(("動画", 12.0, 0.0))
+        }
+        GridItem::Audio(_) => {
+            if audio_thumbnail_indicator_parts(item, thumb, audio).music_icon {
+                let mark = if loaded {
+                    egui::Rect::from_center_size(
+                        inner.center(),
+                        egui::vec2(48.0, 48.0).min(inner.size()),
+                    )
+                } else {
+                    inner
+                };
+                areas.push(crate::ui_helpers::music_icon_bounds(mark));
+            }
+            None
+        }
+        _ => None,
+    };
+    if let Some((text, font, offset)) = caption {
+        let galley = painter.layout_no_wrap(
+            text.into(),
+            egui::FontId::proportional(font),
+            egui::Color32::WHITE,
+        );
+        let pos = egui::Align2::CENTER_CENTER
+            .anchor_size(inner.center() + egui::vec2(0.0, offset), galley.size())
+            .min;
+        areas.push(lower_caption_ink(painter, pos, &galley, None, None));
+    }
+    areas
 }
 
 /// Paint a valid saved-position fraction into the shared thumbnail strip, always left to right.
@@ -579,10 +934,9 @@ fn paint_resume_meter_shape(
 
 fn draw_drive_icon(painter: &egui::Painter, inner: egui::Rect, dark: bool) -> egui::Rect {
     let side = inner.width().min(inner.height());
+    let body = drive_icon_body(inner);
     let w = (side * 0.48).clamp(36.0, 72.0);
     let h = (side * 0.34).clamp(24.0, 48.0);
-    let center = inner.center() - egui::vec2(0.0, 12.0);
-    let body = egui::Rect::from_center_size(center, egui::vec2(w, h));
     let fill = if dark {
         egui::Color32::from_rgb(78, 88, 100)
     } else {
@@ -874,12 +1228,10 @@ fn paint_cell(
                 && !is_cut
                 && video_thumbnail_indicator_parts(item, video_indicator).play_icon
             {
-                let r = (inner.width().min(inner.height()) * 0.18).max(10.0);
+                let play_rect = video_play_rect(inner);
+                let r = play_rect.width() * 0.5;
                 draw_play_icon(painter, inner.center(), r);
-                record(egui::Rect::from_center_size(
-                    inner.center(),
-                    egui::Vec2::splat(r * 2.0),
-                ));
+                record(play_rect);
             }
         }
         GridItem::Audio(_) => {
@@ -1065,26 +1417,19 @@ fn paint_cell(
             let thumb_loaded =
                 representative.is_some() && matches!(thumb, ThumbnailState::Loaded { .. });
 
+            let geometry = search_caption_geometry(inner, thumb_loaded, caption_shift);
             if thumb_loaded {
-                let thumb_h = inner.height() * 0.62;
-                let thumb_rect = egui::Rect::from_min_max(
-                    inner.min,
-                    egui::pos2(inner.max.x, inner.min.y + thumb_h),
-                );
+                let thumb_rect = geometry.thumb;
                 if let ThumbnailState::Loaded { tex, .. } = thumb {
                     // 代表サムネは色調補正対象外 (adjusted_tex は常に None)
                     record(draw_thumb_texture(painter, thumb_rect, tex, rotation));
                 }
                 // 種別アイコン (小) を左上隅に重ねて Folder/ZIP を示す
-                let badge_size = (thumb_rect.height() * 0.22).clamp(14.0, 28.0);
+                let badge_size = geometry.marker_font;
 
                 // 下部の「少し背景色を付けたボックス」: ユーザー要望どおりフォルダ名を
                 // サムネから切り離して読みやすくする。
-                let label_rect = egui::Rect::from_min_max(
-                    egui::pos2(inner.min.x, thumb_rect.max.y + 2.0),
-                    inner.max,
-                )
-                .translate(caption_shift);
+                let label_rect = geometry.label;
                 let label_bg = if dark {
                     egui::Color32::from_rgb(38, 42, 50)
                 } else {
@@ -1095,7 +1440,7 @@ fn paint_cell(
                 }
                 let marker = paint_lower_caption(
                     painter,
-                    egui::pos2(thumb_rect.min.x + 4.0, thumb_rect.min.y + 4.0),
+                    geometry.marker,
                     egui::Align2::LEFT_TOP,
                     icon,
                     egui::FontId::proportional(badge_size),
@@ -1109,21 +1454,18 @@ fn paint_cell(
 
                 record(marker);
                 record(label_rect);
-                let badge_font = (label_rect.height() * 0.19).clamp(10.0, 14.0);
-                let text_rect = egui::Rect::from_min_max(
-                    egui::pos2(label_rect.min.x + 4.0, label_rect.min.y + 2.0),
-                    egui::pos2(label_rect.max.x - 4.0, label_rect.max.y - badge_font * 1.3),
-                );
+                let badge_font = geometry.count_font;
+                let text_rect = geometry.path;
                 let path_str = path.to_string_lossy();
                 let components = crate::ui_helpers::split_path_components(&path_str);
-                let max_font = (label_rect.height() * 0.24).clamp(10.0, 13.0);
+                let max_font = geometry.path_max_font;
                 record(paint_lower_path(
                     painter,
                     text_rect,
                     &components,
                     label_color,
                     max_font,
-                    5.0,
+                    geometry.path_min_font,
                     Some(marker),
                     overlay_layout.book_resume_meter.map(|band| (band, rect)),
                 ));
@@ -1135,7 +1477,7 @@ fn paint_cell(
                 };
                 record(paint_lower_caption(
                     painter,
-                    egui::pos2(label_rect.max.x - 6.0, label_rect.max.y - 4.0),
+                    geometry.count,
                     egui::Align2::RIGHT_BOTTOM,
                     &badge_text,
                     egui::FontId::proportional(badge_font),
@@ -1146,10 +1488,10 @@ fn paint_cell(
             } else {
                 // 代表サムネなし or 未ロード: 従来どおりアイコン + 階層パス + バッジ
                 // (日付フォルダ `2025-01-01` 等を単独で識別できるよう階層を多行表示)
-                let icon_size = (inner.height() * 0.18).clamp(22.0, 56.0);
+                let icon_size = geometry.marker_font;
                 let marker = paint_lower_caption(
                     painter,
-                    egui::pos2(inner.center().x, inner.min.y + icon_size * 0.75),
+                    geometry.marker,
                     egui::Align2::CENTER_CENTER,
                     icon,
                     egui::FontId::proportional(icon_size),
@@ -1158,26 +1500,20 @@ fn paint_cell(
                     None,
                 );
                 record(marker);
-                let badge_font = (inner.height() * 0.07).clamp(10.0, 14.0);
+                let badge_font = geometry.count_font;
                 // Reserve from the bottom; translating the entire hierarchy
                 // rectangle would put the terminal name inside the fixed icon.
-                let text_rect = egui::Rect::from_min_max(
-                    egui::pos2(inner.min.x + 4.0, inner.min.y + icon_size * 1.35),
-                    egui::pos2(
-                        inner.max.x - 4.0,
-                        inner.max.y - badge_font * 2.2 + caption_shift.y,
-                    ),
-                );
+                let text_rect = geometry.path;
                 let path_str = path.to_string_lossy();
                 let components = crate::ui_helpers::split_path_components(&path_str);
-                let max_font = (inner.height() * 0.075).clamp(11.0, 15.0);
+                let max_font = geometry.path_max_font;
                 record(paint_lower_path(
                     painter,
                     text_rect,
                     &components,
                     label_color,
                     max_font,
-                    8.0,
+                    geometry.path_min_font,
                     Some(marker),
                     overlay_layout.book_resume_meter.map(|band| (band, rect)),
                 ));
@@ -1189,7 +1525,7 @@ fn paint_cell(
                 };
                 record(paint_lower_caption(
                     painter,
-                    egui::pos2(inner.max.x - 6.0, inner.max.y - 6.0) + caption_shift,
+                    geometry.count,
                     egui::Align2::RIGHT_BOTTOM,
                     &badge_text,
                     egui::FontId::proportional(badge_font),
@@ -1239,7 +1575,7 @@ fn paint_cell(
             record(marker);
             record(paint_lower_caption(
                 painter,
-                egui::pos2(inner.center().x, inner.max.y - 18.0) + caption_shift,
+                placeholder_caption_positions(inner, caption_shift)[0],
                 egui::Align2::CENTER_BOTTOM,
                 path.file_name()
                     .unwrap_or_else(|| path.as_os_str())
@@ -1251,7 +1587,7 @@ fn paint_cell(
             ));
             record(paint_lower_caption(
                 painter,
-                egui::pos2(inner.center().x, inner.max.y - 3.0) + caption_shift,
+                placeholder_caption_positions(inner, caption_shift)[1],
                 egui::Align2::CENTER_BOTTOM,
                 reason.label(),
                 egui::FontId::proportional(11.0),
@@ -1271,7 +1607,7 @@ fn paint_cell(
     }
     for badge in overlay_layout.badge_placements() {
         record(badge.rect);
-        if collect_hit_areas {
+        if collect_hit_areas && badge.kind != crate::thumb_overlay_layout::BadgeKind::TypeIcon {
             record(thumbnail_badge_ink_rect(painter, badge));
         }
     }
@@ -1285,12 +1621,10 @@ fn paint_cell(
         && !is_cut
         && video_thumbnail_indicator_parts(item, video_indicator).play_icon
     {
-        let r = (inner.width().min(inner.height()) * 0.18).max(10.0);
+        let play_rect = video_play_rect(inner);
+        let r = play_rect.width() * 0.5;
         draw_play_icon(painter, inner.center(), r);
-        record(egui::Rect::from_center_size(
-            inner.center(),
-            egui::Vec2::splat(r * 2.0),
-        ));
+        record(play_rect);
     }
     if defer_primary_markers && matches!(item, GridItem::Audio(_)) {
         let parts = audio_thumbnail_indicator_parts(item, thumb, audio_indicator);
@@ -1342,6 +1676,14 @@ fn paint_cell(
         crate::ui_helpers::draw_overlay_tag_badge(painter, placement);
     }
 
+    if let Some(placement) = overlay_layout.bottom_left.type_icon.as_ref() {
+        crate::ui_details_icon::draw_thumbnail_type_icon(
+            painter,
+            placement.rect,
+            crate::ui_details_icon::details_icon_kind(item),
+            dark,
+        );
+    }
     if let Some(placement) = overlay_layout.bottom_left.container.as_ref() {
         match placement.kind {
             crate::thumb_overlay_layout::BadgeKind::BottomContainer(
@@ -1418,12 +1760,23 @@ fn paint_cell(
 ///
 /// Painter primitives keep the scissors recognizable without relying on an installed glyph.
 pub(crate) fn draw_cut_badge(painter: &egui::Painter, rect: egui::Rect) -> egui::Rect {
+    let Some((center, radius)) = cut_badge_geometry(rect) else {
+        return egui::Rect::NOTHING;
+    };
+    paint_cut_badge(painter, center, radius)
+}
+
+fn cut_badge_geometry(rect: egui::Rect) -> Option<(egui::Pos2, f32)> {
     let side = rect.width().min(rect.height());
     if !side.is_finite() || side < 8.0 {
-        return egui::Rect::NOTHING;
+        return None;
     }
     let radius = (side * 0.18).clamp(7.0, 26.0).min(side * 0.46);
     let center = rect.center();
+    Some((center, radius))
+}
+
+fn paint_cut_badge(painter: &egui::Painter, center: egui::Pos2, radius: f32) -> egui::Rect {
     painter.circle_filled(
         center,
         radius,
@@ -1608,6 +1961,8 @@ mod thumbnail_name_style_tests {
                                                 VideoThumbnailIndicator::BottomLeftBadge,
                                                 AudioThumbnailIndicator::default(), false, None,
                                                 None, true, name_style,
+                                            None,
+                                            false,
                                             )
                                                     };
                                                 let baseline =
@@ -1790,7 +2145,10 @@ mod book_resume_meter_tests {
                             let cell=egui::Rect::from_min_size(egui::pos2(20.3,20.7),egui::vec2(width,width));
                             let layout=layout_cell_overlays(ui.painter(),cell,EditBadgeFlags::default(),4,&item,&ThumbnailState::Pending,&[],None, None,false,
                                 VideoThumbnailIndicator::PlayIcon,AudioThumbnailIndicator::default(), false,None,Some("22:35"),true,
-                                crate::thumb_overlay_layout::ThumbnailNameStyle::default(),);
+                                crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+                                None,
+                                false,
+                                );
                             let raw=layout.book_resume_meter.unwrap(); let meter=thumbnail_resume_meter_rect(ui.painter(),&layout).unwrap();
                             assert_eq!(raw.height(),9.0); assert_eq!(raw.min.x,cell.min.x+4.0);assert_eq!(raw.max.x,cell.max.x-4.0);
                             assert!((meter.height()*dpi-(9.0_f32*dpi).floor()).abs()<0.001);
@@ -1873,6 +2231,8 @@ mod book_resume_meter_tests {
                                             None,
                                             enabled,
                                             crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+                                        None,
+                                        false,
                                         );
                                         draw_cell(
                                             ui,
@@ -1986,6 +2346,8 @@ mod book_resume_meter_tests {
                                     None,
                                     true,
                                     crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+                                    None,
+                                    false,
                                 );
                                 draw_cell(
                                     ui,
@@ -2078,6 +2440,8 @@ mod book_resume_meter_tests {
                                         None,
                                         true,
                                         crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+                                        None,
+                                        false,
                                     );
                                     draw_cell(
                                         ui,
@@ -2302,6 +2666,8 @@ mod book_resume_meter_tests {
                                                     duration,
                                                     enabled,
                                                     crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+                                                None,
+                                                false,
                                                 );
                                                 band = layout.book_resume_meter;
                                                 draw_cell(
@@ -2421,6 +2787,8 @@ mod book_resume_meter_tests {
                                     None,
                                     true,
                                     crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+                                    None,
+                                    false,
                                 );
                                 draw_cell(
                                     ui,
@@ -2503,6 +2871,8 @@ mod book_resume_meter_tests {
                                 Some("1:02:03"),
                                 true,
                                 crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+                                None,
+                                false,
                             );
                             assert!(layout.book_resume_meter.is_some());
                             draw_cell(
@@ -2768,6 +3138,8 @@ mod book_resume_meter_tests {
             duration,
             true,
             crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+            None,
+            false,
         );
         draw_cell(
             ui,
@@ -3045,6 +3417,8 @@ mod book_resume_meter_tests {
                         duration,
                         enabled,
                         crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+                        None,
+                        false,
                     );
                     draw_cell(
                         ui,
@@ -3580,6 +3954,8 @@ fn draw_video_indicator_snapshot_cell(
         None,
         false,
         crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+        None,
+        false,
     );
     draw_cell(
         ui,
@@ -3725,6 +4101,8 @@ fn draw_thumbnail_name_settings_snapshot(ui: &mut egui::Ui, prioritize_width: bo
                             max_lines: if prioritize_width { 1 } else { 3 },
                             prioritize_width,
                         },
+                        None,
+                        false,
                     );
                     draw_cell_with_hit_areas(
                         ui,
@@ -4181,6 +4559,8 @@ pub fn draw_audio_thumbnail_indicator_snapshot_fixture(ui: &mut egui::Ui) {
                     Some("3:45"),
                     true,
                     crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+                    None,
+                    false,
                 );
                 draw_cell(
                     ui,
@@ -4295,3 +4675,7 @@ mod audio_indicator_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "grid_type_icon_tests.rs"]
+mod type_icon_tests;

@@ -3164,6 +3164,8 @@ fn cell_filename_mixed_glyphs_dark() {
             let empty_tags = Vec::new();
             let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
+                    content_obstacles: &[],
+                    type_icon_size: None,
                     name_style: Default::default(),
                     cell,
                     inner,
@@ -3231,6 +3233,8 @@ fn compact_file_format_badges_light() {
                 .then_some(name);
                 let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
                     mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
+                        content_obstacles: &[],
+                        type_icon_size: None,
                         name_style: Default::default(),
                         cell,
                         inner,
@@ -3348,6 +3352,8 @@ fn rating_shares_the_bottom_row_with_a_centred_filename_dark() {
             let empty_tags = Vec::new();
             let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
+                    content_obstacles: &[],
+                    type_icon_size: None,
                     name_style: Default::default(),
                     cell,
                     inner,
@@ -3409,6 +3415,8 @@ fn media_duration_badges_fixture(ui: &mut egui::Ui) {
         );
         let layout = layout_thumbnail_overlays(
             ThumbnailOverlayLayoutInput {
+                content_obstacles: &[],
+                type_icon_size: None,
                 name_style: Default::default(),
                 cell,
                 inner,
@@ -3533,6 +3541,8 @@ fn bookmark_time_and_tag_badges_dark() {
             let tags = vec!["#長い日本語タグ".to_owned(), "旅行".to_owned()];
             let layout = mimageviewer::thumb_overlay_layout::layout_thumbnail_overlays(
                 mimageviewer::thumb_overlay_layout::ThumbnailOverlayLayoutInput {
+                    content_obstacles: &[],
+                    type_icon_size: None,
                     name_style: Default::default(),
                     cell,
                     inner,

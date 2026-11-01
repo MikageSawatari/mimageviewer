@@ -110680,6 +110680,8 @@ mod background_click_scroll_regression_tests {
                 None,
                 app.settings.thumb_show_resume_meter,
                 crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+                None,
+                false,
             );
             let pos = if filename {
                 layout
@@ -110896,6 +110898,8 @@ mod background_click_scroll_regression_tests {
             None,
             app.settings.thumb_show_resume_meter,
             crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+            None,
+            false,
         )
     }
 
@@ -111375,6 +111379,8 @@ mod background_click_scroll_regression_tests {
                 None,
                 app.settings.thumb_show_resume_meter,
                 crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
+                None,
+                false,
             );
             let pos = if check {
                 layout.check.expect("check badge").center()

@@ -5534,6 +5534,41 @@ mod tests {
     }
 
     #[test]
+    fn thumb_type_icon_preferences_ok_and_cancel() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
+        let initial = crate::settings::DEFAULT_THUMB_SHOW_TYPE_ICON;
+        let label = "サムネイルに種類アイコンを表示する";
+        assert_eq!(harness.state().settings.thumb_show_type_icon, initial);
+        harness.get_by_label(label).click();
+        harness.run_steps(3);
+        assert_eq!(harness.state().settings.thumb_show_type_icon, initial);
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert_eq!(harness.state().settings.thumb_show_type_icon, !initial);
+        let db = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().thumb_show_type_icon,
+            !initial
+        );
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Thumbnail);
+        harness.run_steps(3);
+        harness.get_by_label(label).click();
+        harness.run_steps(3);
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run_steps(3);
+        assert_eq!(harness.state().settings.thumb_show_type_icon, !initial);
+        assert_eq!(
+            db.load_into_settings().unwrap().thumb_show_type_icon,
+            !initial
+        );
+    }
+
+    #[test]
     fn thumb_name_width_preferences_ok_reaches_grid_layout_and_cancel_preserves_it() {
         use crate::thumb_overlay_layout::ThumbnailNameStyle;
         use egui_kittest::kittest::Queryable;
@@ -5572,6 +5607,8 @@ mod tests {
                     None,
                     false,
                     ThumbnailNameStyle::from_settings(&harness.state().settings),
+                    None,
+                    false,
                 );
                 let filename = layout.bottom_left.filename.unwrap();
                 assert_eq!(filename.text, "abcdefghijklmnopqrstuvwx.zip");

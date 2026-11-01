@@ -214,6 +214,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["送る", "エクスプローラー", "Explorer", "登録"]
     ),
     entry!(
+        "thumbnail/type-icon",
+        Thumbnail,
+        "サムネイルに種類アイコンを表示する",
+        ["フォルダ", "書庫", "画像", "ZIP", "RAR", "PDF", "目印"]
+    ),
+    entry!(
         "thumbnail/name-font-scale",
         Thumbnail,
         "名前の文字サイズ:",
