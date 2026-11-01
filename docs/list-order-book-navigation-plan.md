@@ -761,6 +761,13 @@ P2として指摘されて修正し、Folder/ZIPの両方で同passのprimary/se
 要求だけが受理され、menu・通常Folder副作用・列の再取得へ進まないことを確認する。
 フォローアップ独立レビューはACCEPT、新しいP1/P2なし。
 
+2026-11-01 §1.680追補: 上記は共通入力列化前の実行記録。`611fdfb95`以降は通常openも
+Smart openもactivation後の残りを消費するため、positiveはopenしない単クリックへ分けた。
+最終passのprimary release→secondary press/releaseで対象indexのmenuが開くことは厳密に維持し、
+通常double-clickのnavあり／受付1回／menuなしと、Smartのnavなし／受付1回／menuなし・
+通常副作用不変を検査する。製品コードは変更しない。原因・独立レビュー・再検証の記録は
+`next-release-backlog.md` §1.680「ratingnav649 の positive control と共通入力列の整合」を参照。
+
 | コマンド・条件 | 結果 | ログ |
 | --- | --- | --- |
 | `cargo fmt` (引数なし) | 成功 / 0 | tool出力 |
