@@ -4544,3 +4544,48 @@ single-instance mutexを共有するため、先にインストール版/常駐t
 - 2 巡目以降の指摘は、利用者のタグ完了 toast を完了まで溜める修正 (1 巡目) に伴う文言の細部。単独の Clear で元から空の項目も
   クリア件数に含める表現は master と同じ既存の挙動として残した。
 - 実 AI アプリ・実 core での書き込み・画面の追従・XMP の外部確認は未実施 (サブ PC での実機確認で行う)。
+
+## 24. サブ PC での実アプリ確認 (2026-11-01)
+
+### 24.1 条件と観測者
+
+- 観測者: サブ PC 担当 (Remote Control の Claude Code セッション「mImageViewer 実機確認」)。Claude Desktop の Chat の画面は
+  担当から撮れないため、許可の窓と AI の返事は利用者の報告と貼り付けによる。mIV 側は担当がスクリーンショット・
+  `mimageviewer.log`・設定ファイルで確かめた。記録はメイン PC の `C:\home\mimageviewer_subpc\mcp-stage2\report\`。
+- ビルド: `3b94fc953` (段階 2-2 の検収後) のポータブル版 (`prepare-portable-smoke.ps1`)。`--data-dir C:\miv-mcp-test\data`。
+- AI アプリ: Claude Desktop (MSIX 版。Windows 11 Pro 26200)。登録は mIV の「AI 連携」から、Claude Desktop を終了した状態で
+  利用者が行った (動作中は mIV が拒否した。設計どおり)。書き換え先は MSIX 版の `LocalCache\Roaming\Claude\claude_desktop_config.json`。
+  `.mimageviewer.bak` は書き換え前と一致。最後に「登録を外す」で mcpServers は書き換え前と同じに戻った。
+
+### 24.2 結果
+
+依頼の 9 段 (状態・一覧と縮小画像・mIV で開く・タグを付ける・外す・★ (ZIP の中のフォルダを含む)・コレクションの作成/名前の変更/
+追加/外す・AI による変更・読み取りのみへ下げた後) すべてで、AI の返事と mIV 側の結果が一致した (サブ PC 担当)。
+
+- 開く: mIV が前面に出て、指定の画像を全画面で表示した (利用者・ログ)。ログには activate の直後に `SetForegroundWindow failed`
+  もある。開いて約 3.5 秒後に全画面を閉じた記録があり、利用者が閉じたかは未回答。
+- タグ・★・コレクションの変更は、すぐ mIV の画面に出た。「AI による変更」の 8 件は、件数・対象・前後の値まで実際の変更と一致し、
+  行の展開とコピーも動いた。
+- 読み取りのみへ下げた後の★の依頼は「タグ・★を変更する許可がありません」で断られ、mIV は前面に出ず、★も付かなかった。
+- 許可の窓: tool を使うたびに Claude Desktop が出した (利用者。「かなり煩雑」)。窓の文言とコネクタ設定の画面は撮れていない。
+
+### 24.3 見つかった問題 (対応は §24.4)
+
+1. タグ・★の変更でも mIV が前面に出る (利用者・ログ)。コレクションでは出ない。原因はコードで確認: agent の UI 要求の受付
+   (`src/agent_ipc/open.rs`) が、要求の種類を問わず `single_instance::signal_activate_existing()` を呼ぶ。前面に出すのは `Open` だけ。
+2. `get_item_info` が ZIP の中のフォルダ (`list_folder` が返す `chapter2/` 等) を `bad_request` で断る。`set_rating` は同じ指定を
+   受け付ける。原因はコードで確認: `src/agent_ipc/item_info.rs` が ZIP の subresource を画像の拡張子に限っている。
+3. 接続中の adapter (Chat と Code の 2 本) が約 5 秒ごとに `hello` と `miv_status` を送り続け、agent の lane のログが埋まる
+   (セッション中に 945 行)。
+4. 「AI による変更」のタグの行だけ、説明文が無く「変更 N 件 / 変更なし…」の書式で、他の行とそろっていない。
+5. 参考: 「最近使った AI アプリ」の名前は `local-agent-mode-mimageviewer` (Claude Desktop が名乗った名前をそのまま出している)。
+   Claude Desktop の Code タブにも mimageviewer の tool が出る (同じ設定ファイルを読むためと推測、未確認)。サブ PC 担当が
+   Claude Desktop の中で動いていたため、Claude Desktop の終了で担当が起動した mIV も終了した (確認の手順の制約。mIV の問題ではない)。
+
+### 24.4 対応方針
+
+- 1〜4 は直す。1 は「開く」だけが前面化の合図を送り、タグ・★は前面化せずに UI thread を起こす (窓が最小化・トレイの時に
+  UI thread が回るかを確かめ、回らないなら設計に戻す)。2 は `get_item_info` が `list_folder` の返すすべての項目を受け付ける。
+  3 は定期の問い合わせを agent の lane のログに残さない (状態が変わった時だけ残す)。4 は記録の書式をそろえる。
+- 許可の窓は Claude Desktop の機能で、mIV からは止められない。Claude Desktop のコネクタの設定で tool ごとに「常に許可」等を
+  選べるという外部の案内がある (Anthropic の公式の説明は未確認。利用者の画面で確かめる)。公開文書 (マニュアル) で案内する。
