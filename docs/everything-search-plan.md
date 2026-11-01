@@ -206,7 +206,14 @@ media は一覧の exact physical identity から通常の fullscreen／native p
 
 §1.664（2026-10-31）: 通常 close の既存 Live continuation は、採用済み PhysicalChild が本で、現在の論理コンテナと採用済み本分類の root がその source に一致するとき `AddressBarNav::EverythingResults` を返し、通常／即時 dispatcher から `return_from_everything_child(Results)` を呼ぶ。本の種類は accepted dataset の行種別と `ProjectionRecipe` で確認する。Folder 行は追加設定 ON・画像のみを必須とし、拡張子付き実フォルダを旧拡張子判定だけで対象にしない（既存分類問題§1.418自体は範囲外）。この制限は通常 close に適用し、Results ボタンは従来どおり階層途中からも使える。新しい帰路 state・第二 cache は作らない。既存の取消可能な main modal と prepare/adoption を再利用する簡素化を採り、追加の割り込み・復元機構は不要とした。Ctrl+G／Ctrl+S／タグの検索除外は維持する（別々の drill／nav_stack owner が必要なため今回対象外）。まれな失敗は既定の割り切りとし、新しい回復処理を足さない。detached 述語・viewport・registry 移譲は変更しない。
 
-同回帰で独立viewerのclose時にmain結果が実親一覧へ置換される問題を検出した。製品コードだけをHEAD（f856f4f2f）へ戻した同じテストでも失敗し、既存不具合(A)と確定した。設計担当指示により、§1.664のメイン側修正はv4.10.2へ、独立viewerの既存帰路は対象外として分離する。検索ownerの非複製だけではmain不変を保証できず、独立bundleが継承した`CloseReturnOrigin`から`transfer_terminal_close_return`が物理親のTerminal recipeをmainへ作る。これはBA-7の別課題であり今回直さない。独立側は検索inactive／accepted Metadataなので新しいEverything分岐は発火しない。独立closeの回帰は両ウィンドウ設定でHEADと同じ挙動から悪化しないことを検査し、理想の結果保持は[バックログ§1.664下の別項目](next-release-backlog.md#別ウィンドウで閉じたときの帰路-もともとの不具合)に記録する。
+§1.670（2026-11-01、利用者採択A）: §1.664で分離した独立viewerの既存帰路を改訂する。
+自前のbundleを持つ独立readerはmainの帰還originを継承せず、User closeは自分のcontextの退役で完結する。
+mainのRoot結果・dataset/query・可視順・選択・scroll・surface・bookmark状態・navigation履歴は不変。
+closeからmainの既存Live/Terminal/pendingを消費する経路も撤去し、main自身の消費点へ残す。
+Everythingだけの除外ではなく、通常／合成一覧／ブックマークの全入口で同じ所有契約を使う。
+非同期openのrequest ID/target/leaseと対象readerへのinstall、close後のstale lease棄却・取消は維持する。
+独立窓で登録したブックマークはmainの「最新の情報に更新」で反映する。main内閲覧・linked F12・
+未分離のmain所有メディア窓の帰路は従来どおり。詳細と検証はバックログ§1.670に記録する。
 
 検索は一時 overlay。既存と同じく folder back/forward stack に登録せず、検索中の履歴ボタンを無効にする。検索の close は origin の typed restore を一回消費して元の folder／smart child／sub-expansion／Collection／rating／history／Drive に戻る。「実フォルダに移動」は origin を復元せず共通 `JumpToPhysicalFolder` の typed open へ移り、成功後に exact file を選択する。synthetic result path に `load_folder`／FS stat を呼ばない。再起動復元に query／検索一覧を保存しない。
 
@@ -214,7 +221,7 @@ media は一覧の exact physical identity から通常の fullscreen／native p
 
 新しい検索操作の発火面は **main grid のみ**。fullscreen／native video／detached viewer から検索バーを出す shortcut は初版に追加しない。結果を開くときの F12 モード、既存 viewer の park／fork／promote／close は維持する。
 
-メイン全画面から実 F12 で切り離す linked viewer は main context と検索 owner を共有するため、本の通常 close はメインと同じ検索結果へ戻る（§1.664、設計担当決定）。自分の context を持つ独立 viewer は上記既存不具合の対象であり、この帰路を使わない。「毎回新しいウィンドウで開く」設定中の F12 切り替え無効も維持する。実 F12 キー→切り離し→Esc→検索結果・選択復元と既存終了処理を headless 回帰で確認し、detached 述語・viewport 経路は変更しない。
+メイン全画面から実 F12 で切り離す linked viewer は main context と検索 owner を共有するため、本の通常 close はメインと同じ検索結果へ戻る（§1.664、設計担当決定）。自分の context を持つ独立 viewer はmainの結果を保持し、closeで帰路を発行しない（§1.670）。「毎回新しいウィンドウで開く」設定中の F12 切り替え無効も維持する。実 F12 キー→切り離し→Esc→検索結果・選択復元と既存終了処理を headless 回帰で確認し、detached 述語・viewport 経路は変更しない。
 
 `ViewerContextBundle` は global_search、top-level surface、thumbnail／items generation の既存所有単位。`viewer_context_registry.rs:3299` 付近の parked split は検索 UI state を main に保持する一方、表示束をメディア窓へ移す場合がある。検索 source が context に移る／main に残る契約を各 registry transaction と同じ境界で扱い、App-global Everything result cache から active window へ配送しない。検索 worker を fork しない。
 

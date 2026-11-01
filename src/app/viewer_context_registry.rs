@@ -2606,18 +2606,24 @@ impl<'a> ContextRef<'a> {
         }
     }
 
-    pub(in crate::app) fn bookmark_view_state(self) -> Option<&'a BookmarkViewState> {
-        match self.source {
-            ContextRefSource::Mounted(app) => app.bookmark_view_state.as_ref(),
-            ContextRefSource::AtRest(bundle) => bundle.bookmark_view_state.as_ref(),
-        }
+    pub(in crate::app) fn bookmark_open_request_id(
+        self,
+    ) -> Option<crate::bookmark_browser::BookmarkOpenRequestId> {
+        let pending = match self.source {
+            ContextRefSource::Mounted(app) => app.bookmark_open_pending.as_ref(),
+            ContextRefSource::AtRest(bundle) => bundle.bookmark_open_pending.as_ref(),
+        };
+        pending.map(crate::bookmark_browser::PendingBookmarkOpen::request_id)
     }
 
-    pub(in crate::app) fn archive_source_override(self) -> Option<&'a Path> {
-        match self.source {
-            ContextRefSource::Mounted(app) => app.archive_source_override.as_deref(),
-            ContextRefSource::AtRest(bundle) => bundle.archive_source_override.as_deref(),
-        }
+    pub(in crate::app) fn bookmark_view_target(
+        self,
+    ) -> Option<&'a crate::bookmark_browser::BookmarkViewReturnTarget> {
+        let state = match self.source {
+            ContextRefSource::Mounted(app) => app.bookmark_view_state.as_ref(),
+            ContextRefSource::AtRest(bundle) => bundle.bookmark_view_state.as_ref(),
+        };
+        state.and_then(BookmarkViewState::target)
     }
 
     pub(in crate::app) fn music_bookmarks(self) -> &'a [crate::video_bookmarks::VideoBookmarkMeta] {
@@ -4462,6 +4468,8 @@ impl App {
         // グリッド worker / 詳細列 / タグ prewarm / 編集・見開き・view-trim / folder-nav は
         // main が原本を保持する。parked メディア窓はこれらを駆動しないので empty のままでよい。
         keep_in_main!(
+            // Only main owns a close continuation; independent forks start empty.
+            pending_return_to_parent,
             list_order,
             current_folder_watch,
             current_folder_watch_failed,
@@ -4553,7 +4561,6 @@ impl App {
             zip_enumerate_pending,
             fs_nav_after_pdf_enumerate,
             pending_auto_fs_open,
-            pending_return_to_parent,
             pdf_placeholder_count,
             virtual_folder_writeback,
             pdf_prefetch_grace_until,
@@ -5512,13 +5519,11 @@ impl App {
         reason: &'static str,
         f: impl FnOnce(&mut Self, ViewerContextId) -> BuildOutcome,
     ) -> Option<ViewerContextId> {
-        let return_origin = self.close_return_origin();
         self.publish_mounted_context_rating_writes_at_boundary("build_outgoing");
         let (reserved, ops) = self.viewer_contexts.table.plan_begin_build();
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_begin_build();
         self.set_items_generation(Self::items_generation_for_viewer_context(reserved));
-        self.install_close_return_origin(return_origin);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self, reserved)));
         match result {
             Ok(outcome) => self.finish_viewer_context_build(reserved, reason, outcome),
@@ -5618,7 +5623,6 @@ impl App {
                 .find(|candidate| self.page_path_key(*candidate).as_ref() == Some(key))
                 .expect("materialized fork target must remain installed during publication");
         }
-        let return_origin = self.close_return_origin();
         let source = self.projected_viewer_context_id();
         let scan_candidate = self.normalize_state.as_ref().and_then(|state| {
             (state.owner_context_id == source).then(|| (state.fs_idx, state.file_path.clone()))
@@ -5632,8 +5636,6 @@ impl App {
         self.execute_viewer_context_ops(ops, Some(spec));
         let finished = self.viewer_contexts.table.finish_fork();
         assert_eq!(finished, id);
-        self.with_viewer_context_state(id, |app| app.install_close_return_origin(return_origin))
-            .expect("new fork retains its return owner");
         self.publish_mounted_context_rating_writes_at_boundary("fork_incoming");
         // Music analysis lives on App, outside the viewer bundle. Transfer its exact
         // source and worker inbox only when the same player and applied track moved.

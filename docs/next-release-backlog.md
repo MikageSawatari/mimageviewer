@@ -415,10 +415,211 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 ### 1.670 独立した別ウィンドウで、Everything 検索結果から開いた本を閉じると、メインの検索結果が親フォルダ一覧に置き換わる — §1.664 の調査で判明 (2026-10-31)
 
 - 経緯: §1.664 (5ch >>671、メインと linked F12 の帰路) は v4.10.2 で出荷した。調査中に、独立 viewer で閉じた場合の帰路が HEAD でも壊れていることを確かめ、範囲外として分けた。以下はそのときの記録。
-- 状態: **未修正・未着手**。§1.664 の HEAD 比較 (v4.10.1 相当の製品コードで同じ回帰を実行) で、もともとの不具合と確認。独立viewerを閉じると、メインの検索結果が本の実親フォルダ一覧へ置換される。理想はメインの検索結果・選択・スクロールを保持すること。今回その理想を満たしたと扱わず、HEADからの非退行だけを回帰条件とする。
+- 状態（§1.664調査時の記録）: **未修正・未着手**。§1.664 の HEAD 比較 (v4.10.1 相当の製品コードで同じ回帰を実行) で、もともとの不具合と確認。独立viewerを閉じると、メインの検索結果が本の実親フォルダ一覧へ置換される。理想はメインの検索結果・選択・スクロールを保持すること。今回その理想を満たしたと扱わず、HEADからの非退行だけを回帰条件とする。
 - 原因・所有境界: `build_viewer_context`がmainの`CloseReturnOrigin`を独立bundleへ継承し、`transfer_terminal_close_return`が`with_viewer_context_state(id)`で閉じる側の独立contextをmountして、そこのauto-openから物理親のTerminal recipeをmainへ配送する。独立側の`global_search.active=false`／`accepted=Metadata`なので、今回の`auto_open_for_current_container`のEverything例外も`resolve_close_return_navigation`先頭のEverything分岐も発火しない。検索ownerはmainのままである。実際のFolderCandidate→loading context→scan成功採用でも同じoriginを継承する。
 - 分類: [detached計画§2](detached-rework-plan.md#2-憲法-全ステージ共通の不変条件禁止事項-️-最重要)の**BA-7（所有者と資源寿命・終了遷移の所有境界）**。別の構造的修正として、mainへの帰路を作るべきcontext／close操作を設計確認する。detached述語・viewport・registry移譲は今回変更しない。
 - 検証範囲: 従来回帰は複数ウィンドウ設定とF12設定の2ケースで独立contextを直接作り、HEADと同じ帰路を検査したもの。実F12でmainに結び付ける経路の検査ではなかった。今回追加の実F12キー経路はmain所有のため対象内であり、この独立viewerの既存不具合とは区別する。HUDの実描画／クリック・実Everythingとの接続・実ウィンドウの手動確認は未実施。
+
+#### 実装記録（2026-11-01、利用者採択A）
+
+- 現状: A案の実装、関連自動検証、全件実行後の補完、確認用ビルドを完了。全件run自体は下記2失敗によるexit 100であり、全件成功とは扱わない。製品起動・実機受入・設計担当の最終受入とコミットは未。下の採択前の記録は履歴として保持する。
+- 基点 `8283aeb21`、branch `independent-close-1670`。正本 `design-1670-a.md` と独立設計レビューを全文確認し、設計担当が指定したP2/P3決定を反映した。コミットは設計担当が行うため未作成。製品は起動しない。
+- 前提確認: build/forkのmain origin複製、live-media forkの明示installとcontinuation移譲、独立closeのmain Terminal配送・消費、bookmark producerのmain Openingをsourceで確認。通常一覧のmedia openはmain所有のままの場合があり、閉じる時点で自前bundleを持つ窓だけを今回の対象にした。loading成功時の対象install、close後のstale lease棄却、resolverのrequest ID/target/lease、PDF password cleanup、main/linkedのviewport共通捕捉を維持する。設計との未解決の矛盾はない。
+- 実装: 独立build/forkへorigin・continuationを渡す処理、独立closeのmain配送とmain pending消費を撤去。帰還ownerはmainだけとした。独立bookmark openでmainを終了待ちOpeningへせず、旧main resolverから独立readerへ要求を移すfallbackの成功時も帰還相関だけを終える。使われなくなったViewing・origin内bookmark帰還相関・BookmarkRefresh/media departure・summary帰還値・reconcile test helperを削除。RemoteAcquire/AppExit、registry identity/park/promote方策は変更しない。
+- 仕様変更は承認済み4点に限定: 独立close時のbookmark一覧自動更新、media最終folder帰還、本の物理親帰還、独立内移動へのmain追従を廃止。main内閲覧・linked F12・main standalone・未分離main所有media・§1.664の帰路は維持する。まれな失敗の回復機構は追加しない。
+- 文書: 本項、detached計画§11、spec、architecture、fullscreen navigation、Everything§7、manual settings/books、製品ページを更新。第4.6版合意(1)の独立reader部分の廃止と、設計段階のClaudeCode / Sol xhigh双方の構造的修正への合意を§11へ記録。下のB提案は採択前の履歴であり、今回の採択はA。
+- 追加回帰（`close_return_` prefix）: `real_producers_multi_window_loading_and_ready_retirement_preserve_main`（Everything / Ctrl+G / Ctrl+S / tag / ★ / Collection / 閲覧履歴 / Smart / 通常folderの実producer9種×loading/ready）、`real_bookmark_open_in_both_modes_keeps_main_out_of_opening`（複数窓のbook/video/audio、フル機能のvideo/audioの実row open）、`real_independent_immediate_close_cannot_consume_main_live_or_terminal`、`real_fullfeature_media_is_shared_until_promote_or_live_fork`（video/audio×promote/live fork）。一覧・可視順・選択・scroll・surface・bookmark状態/rows・履歴・continuation・処理待ちをsnapshot比較。main/linked standaloneの既存帰路テストは維持する。
+- 追加追補: `close_return_real_bookmark_media_next_file_in_both_modes_preserves_main`（両モード×video/audio）。実bookmark row openからresolver・scan・hydrationの完了を確認し、decodeだけfake ready playerへ置換する。実bookmark seek→native next-file handler→候補resolver→次ファイル採用→closeを通し、元target不一致・main状態None・main snapshot不変を検査。fullscreen_idxやbookmark状態の直接書換えで移動を模擬しない。通常fullfeature mediaの対照はshared-close/promote/live-forkの6ケース。
+- 改めた既存テスト（以下は `close_return_` prefixを省略）:
+
+| 旧名 | 新名・期待 |
+| --- | --- |
+| `actual_logic_only_active_book_and_media_wait_for_main_full` | `independent_logic_only_book_and_media_preserve_main` |
+| `media_departure_uses_last_real_folder_while_book_navigation_keeps_grid` | `independent_book_and_media_departure_keep_main_grid` |
+| `unpresented_media_fallback_requires_exact_preparing_session` | `independent_unpresented_media_has_no_main_return_authority` |
+| `main_selection_scroll_and_same_list_refresh_survive_until_consumer` / `changed_bookmark_poll_preserves_live_main_position_before_consumer` / `empty_bookmark_poll_adopts_empty_live_grid` | `independent_close_allows_explicit_bookmark_refresh_without_restoration`（unchanged/rename/add/remove/empty。自動帰還3本をmain自身の明示更新へ統合） |
+| `bookmark_delete_receipt_preserves_live_main_position_before_consumer` | `independent_close_does_not_interfere_with_bookmark_delete_receipt` |
+| `remote_acquire_and_return_never_resurrects_terminal_request` | `remote_acquire_and_return_never_resurrects_main_terminal_request`（main自身が発行したTerminalの既存失効を確認） |
+| `parked_sibling_full_cannot_consume_surviving_main_request` | `independent_active_and_parked_close_preserve_main_live_terminal_and_bookmark_build` |
+| `replaced_remote_and_app_exit_causes_never_publish_user_return` | `replaced_remote_and_app_exit_causes_never_publish_independent_return` |
+| `native_hard_close_flag_reaches_production_poll_before_teardown` | `independent_native_hard_close_preserves_main_without_refresh` |
+| `loading_and_holdover_shell_escape_and_close_use_actual_child_ui` | `independent_loading_and_holdover_shell_close_preserve_main` |
+
+- 他の既存テスト: `detached_bookmark_book_close_restores_main_grid_even_after_page_navigation` → `detached_bookmark_book_close_keeps_main_grid_after_page_navigation`、`detached_bookmark_media_navigation_returns_main_to_real_folder` → `detached_bookmark_media_navigation_close_keeps_main_bookmark_grid`、`detached_close_matches_head_return_in_both_window_modes` → `detached_close_keeps_main_results_in_both_window_modes`。`closed_bookmark_summary_read_folds_all_terminal_values` → `closed_bookmark_summary_retains_pdf_password_cleanup_only`（廃止した帰還値を除去、password情報の有無を維持）。`detached_bookmark_pdf_routes_without_replacing_main_bookmark_grid` と `detached_bookmark_media_keeps_main_grid_and_closes_in_one_request` もmainのOpening/Restoring待ち・自動refreshなしへ期待を更新した。
+- 独立実装レビュー（Sol xhigh）のP2対応: `open_converted_bookmark_in_detached_context` のleaseなしfallbackがmain Openingを残す指摘をsourceで確認。成功時に帰還相関だけを終え、`converted_bookmark_archive_enters_the_same_detached_book_context` にopen後None・close後main不変を追加した。leaseあり継続は変更しない。加えてimmediate close後のactive update退役までmain Live/Terminal不変、未分離main所有mediaのshared closeでは選択を復元する対照を補完した。source再レビューはACCEPT・追加findingなし。構造的修正への同意も維持（設計担当による§11の実装後合意追記・実機受入は未）。
+- 検証担当はroot。条件は基点 `8283aeb21` + 本項未コミット差分、`MSBUILDDISABLENODEREUSE=1`、通常/test-script features、dev/test profile。ログは `target/close1670/`。
+  - `cargo fmt` 成功。`cargo check -p mimageviewer --lib --tests --features test-script` 成功、exit 0、2分34秒（`check-final.log`）。初回は新規tag fixtureの `tags_db.as_ref()` がmutable APIを呼ぶE0596で失敗（`check.log`）し、fixtureを `as_mut()` へ修正した。既存のwarningは残る。
+  - `python scripts/check_ui_glyphs.py`: 0件、exit 0。アプリUI文字列の変更はない。`python scripts/check_site_cards.py`: 49カード・超過0、exit 0（初回の追加文で151字になった1カードは短縮）。
+  - 焦点nextest初回（通常feature、`test(~close_return)`）: compile 4分33秒、146件中143成功・3失敗、exit 100、実行15.200秒（`close-return.log`、`close-return-initial.junit.xml`）。失敗は改訂fixtureの2点: `active_viewer_context_id` はmain所有bindingでもSome(main)を返すのにNoneを期待した1件と、独立close後のmain自身の明示更新／削除に廃止したTerminal専用scroll保持を期待した2件。実producer9種、実media次ファイル4ケース、main/linkedの既存帰路は成功した。対照fixtureへ修正し、下の関連unionで再検証した。初回はpassed-with-leaked-handles 1件を含む。
+  - 関連union nextest初回: compile 2分02秒、1,046件中1,041成功・5失敗、exit 100、71.072秒（`related.log` / `related.junit.xml`）。焦点3件のfixture修正は成功した。3失敗は旧独立Opening/Restoringの期待残りで、main不変へ更新した。残るstartup 2件は本物の欠陥であり、fixture緩和では処理しない。main/rootからのresolver完了で、窓へのrouting前のcurrentnessがmainのbookmark targetを読んでいた。main Opening廃止で正しいreaderの完了をstale棄却していたため、下の所有境界補完を行った。
+  - 所有境界補完: `bookmark_open_owner_is_current` はrequestのleaseが指すcontextのrequest ID/targetを読む。現在投影（Building含む）の同じwindowはMounted read、他ownerだけregistryのread-only ContextRefへ向ける。pending一致または従来のrequest sequence＋exact Preparing session fallbackを維持し、mainにOpeningを戻さない。取消・採用・変換完了が共有する同じpredicateを修正し、新しい状態/待機/回復処理は追加しない。実装前の独立レビュー（Sol xhigh）はBuilding維持を条件に構造的補完へ同意し、条件を反映してACCEPT。
+  - 回帰補完: 実media rowの次ファイルテストでmain/rootからのresolver pollを必須にし、誤request ID/target/leaseとclose後stale leaseの拒否も確認。`close_return_bookmark_request_currentness_reads_building_and_at_rest_owner` を追加し、Building、commit後AtRest、request消費後Preparing fallback、close後拒否を検査する。startupの既存2件の期待は弱めず維持する。
+  - 追加の既存テスト更新: `visibility_fresh_bookmark_media_index_failure_closes_only_its_published_owner` → `visibility_fresh_bookmark_media_index_failure_preserves_main_and_closes_only_its_published_owner`、`detached_bookmark_page_terminals_close_the_opening_context` → `detached_bookmark_page_terminals_preserve_main_and_close_the_opening_context`、`detached_media_bookmark_resolve_cancel_preserves_target_until_exact_retirement` → `detached_media_bookmark_resolve_cancel_preserves_main_and_target_until_exact_retirement`。旧main Opening/Restoring fixtureだけ改め、request/target/lease、取消、stale sender拒否、exact reader退役、main/siblingのtoken/index Arc境界は全て維持し、一覧・表示状態・履歴のsnapshot比較を補強した。
+  - 関連union nextest最終: `cargo nextest run -p mimageviewer --lib -E 'test(~close_return) | test(~viewer_context_registry) | test(~bookmark) | test(~everything) | test(~multiwindow) | test(~detached)' --no-tests fail --retries 0 --no-fail-fast`。**1,047/1,047成功、失敗0、leaky警告0**、exit 0、compile 2分26秒・実行71.468秒（`related-final.log` / `related-final.junit.xml`）。初回の5件も成功し、main/root resolverの本物の欠陥は所有境界修正で解消した。main/linked standaloneと§1.664の帰路は維持、計19本のclose_return_testsを含む。
+  - 補完実装の独立source再レビュー（Sol xhigh）はACCEPT・追加指摘なし、構造的修正への同意も維持。取消・request相関・Building投影・旧fixtureのmain保持への変更も確認済み。レビュー担当はCargoを重複実行せず、検証はrootが所有する。
+  - 最終機能実装の `cargo fmt --check` と `cargo check -p mimageviewer --lib --tests --features test-script`: exit 0、check 51.00秒（`fmt-check.log` / `check-complete.log`）。
+  - `test-script` 有効時も同じ関連unionをnextestで実行: **1,054/1,054成功、失敗0、leaky警告0**、exit 0、compile 5分38秒・実行74.197秒（`related-test-script.log` / `related-test-script.junit.xml`）。feature固有の受付回数等のassertも成功。以後のRust変更は、旧ClosedBookmarkSummaryだけが使っていた無呼出 `ContextRef::archive_source_override` getterの削除のみ。関連実行結果はその非機能cleanupにも有効として再利用し、最終ソースは下のcheck・lib全件・buildで検証する。
+  - 無呼出getter削除後の最終ソース: `cargo fmt` / `cargo fmt --check` / `cargo check -p mimageviewer --lib --tests --features test-script` 成功、exit 0、check 50.35秒（`check-final-source.log`）。`git diff --check`、UI glyph 0、site card 49件・超過0も成功した。
+  - `.\scripts\test-lib-full.ps1` は指示どおり**1回実行**。**15,369成功・2失敗・既存除外67、exit 100**、test 796.839秒・compile 1分39秒。SLOW 12件（100k走査537.167秒を含む）、leaky警告0。run `target/test-lib-full/runs/20261101T021420722Z-351faade/`（stdout/stderr/JUnit）、host `target/close1670/full-host.log`、当時のsource ID `0fdc4fcd9bf8fabfe6ed5b07d335cfff7ed0f5350dd32a89f57f3b887657845e`。成功receiptは作られておらず、全件成功とは扱わない。
+  - 全件失敗(1): `history_parent_context_1473::section1473_context_stash_and_materialized_fork_preserve_typed_returns` が独立forkへのmain close origin継承を期待した旧仕様で失敗。`section1473_context_stash_and_materialized_fork_preserve_typed_returns_without_main_close_authority` へ改名し、main originの前後不変とfork／stash後の旧mainのorigin None・pendingなしへ更新した。typed Returns payload、Rating chain、epochとretireの検査は維持。変更方針・実diffとも独立review ACCEPT。これは承認済みA案の期待更新であり、main/linkedの帰路を弱めない。
+  - 全件失敗(2): `smart_folder_transition_tests::section1353_smart_missing_prefix_restores_synthetic_zip_root_facet` が `staged Smart request did not finish`（45.444秒）で失敗。指定されたSmart系の不安定テスト確認として、全件終了後に下記の単独3回を実施した。§1.447・multiwindow・folder tree・audio EOFの失敗はなく、追加の単独反復は不要。
+  - 全件実行後は上記test-only期待更新だけを行い、製品ソースは全件時から不変。指示どおり全件は再実行せず、他の15,369件の成功を再利用して当該module＋close_return_testsの補完とSmart単独3回・最終check・確認用buildを完了した。補完の成功と全件の非ゼロ結果を混同しない。
+  - 全件後の補完: `cargo nextest run -p mimageviewer --lib -E 'test(~history_parent_context_1473) | test(~close_return_tests)' --no-tests fail --retries 0 --no-fail-fast` は **23/23成功**、exit 0、compile 2分14秒・実行8.052秒（`full-complement.log` / JUnit）。更新した履歴contextの両caseを含め、typed payload・main不変・独立に帰還権なし・epoch・retireを確認した。製品ソースは全件時から同一で、他の15,369成功を再利用する。
+  - Smart単独3回（各nextest exact filter、retry 0、他テストと並行しない）: **3/3成功、各exit 0**。実行8.071秒 / 7.889秒 / 7.954秒（`smart-alone-1.log`〜`smart-alone-3.log` と各JUnit）。全件時の45秒待ち切れは単独では再現しなかった。Smartテストと製品コードは変更しておらず、負荷原因まで断定しない。
+  - test-only期待更新後の最終 `cargo fmt --check` / `cargo check -p mimageviewer --lib --tests --features test-script`: 成功、exit 0、check 48.78秒（`fmt-check-handoff.log` / `check-handoff.log`）。補完の成功で全件runのexit 100を書き換えない。workspace/vendor/doctest の `test-full.ps1` と実機試験は今回未実施。
+  - 確認用ビルド: `.\scripts\build-dev.ps1 -PreserveRuntime` を `MSBUILDDISABLENODEREUSE=1` で実行し、exit 0。通常feature、portable/TestScriptなし、dev-runtime profile。core 4分47秒、remote service 0.67秒、EPUB PDF worker 0.58秒。`target/dev-runtime/` の3実行ファイルを確認し、VCRT/PE検査はruntime 4・PE 3で成功（`target/vcrt-pe-reports/dev-runtime.json`、`target/close1670/build-dev.log`）。coreは2026-11-01 11:39:57 JST生成。製品は起動せず、既存プロセスも停止していない。
+  - 利用者確認用コマンド（worktree直下）: `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常の `%APPDATA%\mimageviewer` を使い、実設定・データを更新し得る。single-instance mutexを共有するため、インストール版・トレイ常駐のmImageViewerを先に終了する。Everything等の検索結果・bookmark一覧から独立窓を開き、窓内でページ／media次ファイルへ移動して閉じても、mainの一覧・選択・scrollが変わらないことを確認する。対照としてmain内閲覧・連動F12・未分離のmain所有mediaでは従来の帰路を維持する。実機確認は利用者／設計担当に引き継ぎ、agentからは起動しない。
+
+
+#### 設計案（2026-11-01、Codexによるsource調査・実装前）
+
+上の「未着手」「今回」は§1.664時点の記録。本項は `independent-close-1670` の
+`8eb8e4443` を調べた設計追記であり、**製品は未修正、案の採択・ClaudeCodeとの構造合意は未了**。
+製品起動・実機観測・コミットは行っていない。入口別の以下の判定はsourceから導いた条件付きの結果で、
+全入口を実UIで再現したという意味ではない。Everythingの既存headless試験の今回の結果は末尾に記す。
+
+**原因と、取り違えている所有権（sourceで確認した事実）**
+
+1. `src/app/close_return.rs::close_return_origin` はmainで `MainListNavigation` とブックマーク要求番号を捕捉する。
+   既にViewing/Liveにoriginがあれば、非mainでもそのcloneを返す。
+2. `src/app/viewer_context_registry.rs::build_viewer_context` は、build目的を区別せずoriginを取り、
+   fresh bundleへ `install_close_return_origin` する。`fork_mounted_context` にも同じ複製がある。
+   originの `source_context` はmainのままなので、独立readerがmainの帰路発行権を持つ。
+3. fresh bundleの `global_search`、`top_level_grid_view`、Ratingのnav stack、ReadingHistory帰路等は空から始まる。
+   したがって独立readerの物理本は、mainの合成一覧の意味を持たない。一方、`favsearch` と `tag_view` 自体はApp-globalで、
+   bundleをmountしてもactive値は交換されない。この差を「検索をすべて継承しない」と一括りにしない。
+4. `transfer_terminal_close_return(id, User)` は閉じるidを `with_viewer_context_state` でmountし、
+   **そこで** `auto_open_for_current_container` と `resolve_close_return_navigation` を評価する。
+   検索/合成帰路がない物理本では `effective_folder().parent()` と本名の選択予約を作る。
+   変換本は `archive_source_override` による論理sourceの親であり、常にcacheの親という意味ではない。
+5. mainへ戻ってsource context・A/B切替sequenceを照合し、ブックマーク以外でもparentがあれば
+   `FullscreenCloseContinuation::Terminal(Navigation)` をmainに置く。main自身のownerから行先を解決し直す仕組みではない。
+   通常の消費点／`handle_fullscreen_close_request_immediate` がそのDirectをロードするので、検索datasetが残っていても表示rowsは物理一覧になる。
+   保存されたsurface/items世代が「他contextが作った行先」の権限を正当化するわけではない。
+
+この不変条件違反は「main一覧を変更する要求の発行権」と「独立readerの閲覧・終了寿命」の混同である（BA-7）。
+Everythingの結果再取得、選択・scrollの復元不足、repaint不足が原因ではない。
+`FolderCandidate → start_active_detached_loading_context → scan成功 → 同じwindowへinstall` もoriginを保持し、
+descriptorのZIP/PDF・変換書庫経路と同じtransportへ達する。
+
+**入口の棚卸し（通常の独立book contextを新規作成してUser closeする場合）**
+
+共通条件は、直接ページ表示ON（画像folder本は追加設定ON）、本の読込み成功、main側の新しい場所移動による
+origin失効なし、ブックマーク要求由来ではないこと。「同型」は子で作った物理親Directがmainへ配送されることを指す。
+入口の一覧が必ず差分を生むか（同じ物理親の再ロードか）は別に記す。
+
+| mainの入口 | 同型の物理親配送 | source上の理由・限界 |
+| --- | --- | --- |
+| Everything結果 | あり | 子はSearch inactive/Metadata。mainのRoot・datasetを子のPhysicalChild帰路として使えず、物理親へfallbackする。既存headless試験が表示rows置換まで検査する |
+| Ctrl+G（Metadata） | あり得る | 独立側のglobal_searchは空。PdfPage/ZipImage/通常Imageをdescriptorで物理列挙した後が対象。SearchContainerのhit-only drillやdrill中Folderはそのまま独立book openする入口ではない（`detached_grid_item_open_plan` のNotApplicable）。検索ノード全件を「必ず壊れる」としない |
+| Ctrl+S | activeの間はなし | App-global `favsearch.active` により子のauto-open判定がfalse。ブックマーク以外はparentを作らない。mainで検索を終了した後も子が残りoriginが有効なら判定は変わり得るが、通常の検索終了/admissionによるorigin失効と合わせて別途試験する |
+| タグ | activeの間はなし | Ctrl+Sと同様にApp-global `tag_view.active` がauto-open=falseの条件。tagの結果自体を子へ渡しているから安全なのではなく、他contextの現在active値への依存である |
+| ★評価一覧 | あり | fresh bundleのRating行・nav stack・pendingは空なのでRatingViewBackを選ばず物理親へ進む。通常folderの★絞り込みも子にmain帰路の意味を与えない。★固定Snapshotは別ownerであり、新規descriptor経路と既存表示のforkを分けて試験する（§1.486全体の修正は含めない） |
+| コレクション | 新規descriptor／画像folder本ではあり | sourceから捕捉したCollection restoreは子の `top_level_grid_view.return_to` に渡るが、`install_return_to` はCollection sessionを作らない。`collection_grid_parent_navigation` はsessionを必要とするので、このrestoreだけでは物理親配送を防げない。CollectionRootImage専用readerは別で、synthetic rootのままならauto-open=false。既存Collection PhysicalSource sessionを持つforkはCollection/CollectionSourceを返し得るため別試験が必要 |
+| 閲覧履歴 | あり | fresh bundleの `reading_history_return_from=None`。main側の履歴帰路を子の `reading_history_back_nav` は読めず、物理親へ進む |
+| スマートフォルダ | あり | fresh bundleにはSmart sessionがなく、`smart_folder_parent_nav_target` はNone。mainのroot/scoped drillは子の物理親計算に使われない |
+| 通常フォルダ | 配送そのものはあり | mainが既に本の実親なら行先は同じでも再ロード・本の再選択となり、scrollや選択を保持する保証はない。子で物理ナビした後なら別の実親へmainを移す可能性がある |
+
+根拠の主経路は `src/app.rs::{detached_grid_item_open_plan, detached_grid_descriptor,
+start_active_detached_book_context_with_start, start_active_detached_loading_context,
+auto_open_for_current_container}`、`src/app/collection_grid.rs::{collection_grid_restore_for_source,
+collection_grid_parent_navigation}`、`src/app/smart_folder.rs::smart_folder_parent_nav_target`。
+ページ一覧設定、混在folder、開けずに終わるloading shell、直接leaf、既存表示のfork/park/promoteは条件が異なり、
+上表の「本を独立openできた後」と区別する。単純なdirect mediaは通常auto-open対象外だが、画像のみfolderへのopt-in等で対象になり得る。
+
+**案の比較（規模は実装・自動回帰の相対見積り。今回はどれも実装しない）**
+
+| 案 | 所有・簡素化 | 変更範囲／detached機構 | 影響経路・必要な試験 | 規模・判断 |
+| --- | --- | --- | --- | --- |
+| A: 独立終了はmainへ一切作用しない | 独立fork/buildへmain originを複製せず、独立の終了は当該contextのretireで完結。mainの帰路はmain/linkedだけが所有 | close_return、registryのbuild/fork・origin移譲。close callerのid配送を監査。HWND/viewport生成・placement・窓状態述語は変更不要 | 上表全入口、active/parked/loading/native closeと全sibling不変。ブックマークの既存close仕様を変えるので、その期待値変更の承認が必要 | 小〜中。最初に検討した最小状態案。ただし下記の意図的な既存機能も消すので、そのままの採用は推奨しない |
+| B: 通常の独立readerはmain帰路なし、明示ブックマーク要求だけmainが所有（推奨） | Aを通常readerへ採り、ブックマークだけimmutable ticketで終了事実を返す。行先/一覧更新の唯一の決定者はmainの既存要求owner | close_return、registryのbuild/fork、bookmark要求の発行/受理、summary配送。既存continuation/Opening payloadを型で整理し、main navigation originのcloneを廃止。viewportの終了入口は同じid/receipt APIへ接続する範囲のみ。registryのidentity/park/promote方策・geometry・placement・窓状態述語を変えない | Aの回帰に加え、bookmark requestの相関・media移動後・本の移動後・LogicOnly→main消費・重複/旧要求・Preparing終端。main通常/linkedの既存帰路を維持 | 中。通常reader×main一覧種別の復元組合せを消し、既存ブックマーク機能を維持できる。仕様相談・設計レビュー後の候補 |
+| C: 通常folderだけmainへの帰還機能を残す | mainでopen時に `KeepMain / FollowReaderPhysicalParent / Bookmark` の型付き方策を選び、要求・source proof・生存資格をmainが一元所有。子はticketと終了事実だけ返す。合成一覧のKeepMainは何も復元せず保持する | Bの所有整理に加え、通常folderの帰還要求・admission失効・消費を統合。registryのticket移譲あり。viewport/HWND/placement変更は不要 | mainの再検索/一覧更新/選択scroll変更、A/B、複数子のclose順、同path別要求の相関、child物理ナビ後のmain親移動と選択。合成一覧は再採用せず不変を検査 | 中〜大。Bより通常folder×子の終了順/現在地を扱う分が増えるが、一覧別snapshot/復元機構は不要。通常folderの既存親移動を残したい場合の現実的な代案 |
+| D: Everythingのときだけ帰路を止める／main検索stateを子へ複製する | mainの変更権を独立readerが持つ誤りを残す | close_returnまたは検索分岐だけなら小さく見えるが、別入口・forkは残る | 検索一件の試験では所有違反を検出できず、同型入口が未解決 | 小だが不採用。source別guardや第二結果cacheは症状パッチである |
+
+**Bの所有契約案と実装の境界**
+
+- 独立readerの本の親・ZIP階層・物理ナビはそのreader自身の所有物。終端closeはreaderの資源を終了するだけであり、
+  「起点がmainだった」事実からmainへのnavigation権限を作らない。mainの通常/linked F12は同じmain contextなので、従来どおりmainのLive/Terminalを使う。
+- 一般のbuild/forkではmainの `CloseReturnOrigin` を取得・複製しない。build目的と終了の配送先は、
+  既存continuation／要求payloadの排他的な型（local・independent・明示bookmark ticket）で表す。
+  reason文字列や新bool、originの有無から独立性を推定するsentinelにはしない。終了側でEverythingだけ除外するguardにも置き換えない。
+- ブックマークはmainの `BookmarkViewState::Opening` と既存request sequenceを単一ownerとして拡張する案とする。
+  完全なmain origin・契約はここだけが持ち、子が持つのはimmutable ticket（main context、bookmark要求番号、対象、配送先reader id/window binding）だけ。
+  予約context作成時に対応付け、Preparingでも終端を同じ要求へ返す。子の `CloseReturnOrigin` にmain navigation payloadを残さない。
+  ticketは独立した第二pending ownerではなく既存open要求/continuationのpayloadへ入れる。名前と最終的な型配置は実装前レビューで確定する。
+- close側はteardown前に `ClosedBookmarkSummary` 相当の終了事実を一度取得する。mainだけがticketと現在のOpeningを照合し、
+  BookmarkRefresh／明示的なMediaDeparture navigationを決める。子のauto-open/parent resolverからmain用Navigationを生成しない。
+  mainの最新選択/scroll・正常な同一覧refreshを使う現行契約を保持し、open時snapshotを巻き戻さない。
+- forkはmain変更権を複製しない。同一bookmark media sessionの所有移動ならticketのreader bindingも既存registry transactionで移譲し、
+  materializedな別readerを作るforkには付与しない。park/mountは同一要求の値移動、promote/同window再openは旧要求を退役させてから新要求を結ぶ。
+  どの窓をmainとみなすかはcontext idと要求ownerで決め、viewer表示設定やwindowの見た目で決めない。
+- mainの新規navigation/再検索/新bookmark受付/A-B切替/Remote acquire/AppExitはmain要求を既存admissionで失効させる。
+  同pathの再openも別要求。consumerでも照合して一度だけ消費し、旧子・二重close・既に退役したidからの結果で新要求を置換しない。
+  選択/scrollのみの変更・同一覧のread-model refreshは取消理由にしない。必要なsource proofは既存のsurface lease/admissionに合わせ、items世代の変化を一律拒否しない。
+- long operationの新しい割込み/rollback/resume機構は作らない。現行の変換/password modalと要求/leaseを使い、
+  取消・失敗・build abortでは未成立のticketだけを終端にする。一般独立readerにはmain帰路がないため、main側の復元待ちもない。
+  まれな失敗は既定の割り切り（ログ＋通知）とし、新しいretry・回復待ち・第二cacheを作らない。
+
+終了consumerの棚卸し対象は `handle_fullscreen_close_request`（Esc/Enter/HUD等の共通入口）、
+`take_and_close_active_context_with_cause`、parked/paused teardown、active child updateのUser終端、native hard close、
+`viewport_retirement.rs::{accept_active_detached_window_close, accept_viewport_close_request}`。
+BSのページ一覧要求、内部folder-nav close、Replaced/RemoteAcquire/AppExitをUser returnと混同しない。
+viewport登録/retirement承認・HWND生成・rect捕捉・placement保存は既存のまま使う。
+
+**通常の使い方が変わる点・採択前の相談事項**
+
+一般独立readerのcloseでmainを本の実親へ移す現挙動はBでもなくなる。通常folderから開いても、
+子で別の本へ移動して閉じたときmainが追従する使い方はできなくなる。
+これはEverythingだけの見た目修正ではなく、全入口共通の所有契約変更である。
+この親移動を意図した機能として使う利用者がいるかは**未確認**で、いないとは判断しない。
+CHANGELOG v2.3.0には「閉じてもメインの一覧が保たれる」説明があるが、利用実態の証明ではない。
+実装着手前に設計担当から利用者へ、Bの変更と、親移動を残すCの費用を提示して採択を得る。
+Cでは通常folder由来の有効ticketだけが、終了summaryの論理本/最終mediaからmain用の実親を解決する。
+複数子はmainの帰還要求を後の受付で置き換える（旧子のcloseでは移動しない）方針を明示し、この点も既存動作との差として採択する。
+全合成一覧を個別に保存し直す拡張案は、保持で済むので採らない。
+
+Aを文字どおり採ると、ブックマーク一覧の終了後refreshと、動画/音声を別ファイルへ送った後の実フォルダ復帰まで失う。
+後者は `handle_fullscreen_close_request` のコメントと
+`close_return_tests::close_return_media_departure_uses_last_real_folder_while_book_navigation_keeps_grid` に意図的な機能として明記されている。
+Bはこの機能、本はページ/本内移動後もブックマーク一覧を保つ契約、main/linkedの通常帰路、独立窓の物理ナビを残す。
+新しい操作や設定を足して代替利用を強制する案は今回作らない。採択後にEverything計画§7、fullscreen navigation文書、
+ユーザー向けmanual等の帰路記述を更新する（今回は未採択なので変更しない）。
+
+**実装時の受入試験**
+
+1. 上表のsourceごとに実producerからopenするhandler-level回帰を追加する。Everything/Ctrl+G/Ctrl+S/tag/Rating/
+   Collection/History/Smart/通常folderでmainのrows・surface/位置・query/dataset・選択・Shift起点・scroll session/offset・
+   checked/details順・items世代を保存し、通常独立readerのopen/close前後で不変を検査する。
+   Ctrl+S/tagは開いている間にmainのactive状態を変える場合も含め、修正後はその値に独立closeの契約を依存させない。
+2. ZIP/PDF/EPUB/変換書庫の論理sourceとcache、画像folder本、leaf、mixed folder拒否/通常main経路への復帰を分ける。
+   descriptor/FolderCandidate/loading/adoption、window設定2種、既存表示のmaterialized fork/live-media park/promoteを検査する。
+   direct-page設定OFF、BS、main/実F12 linkedの既存帰路を退行させない。
+3. active/at-rest/parked各終端、LogicOnlyのviewport close→main描画時消費、HUD/キー/native hard close、
+   close連打、準備中cancel/error/build abort、Replaced/RemoteAcquire/AppExitを同じ相関規則で検査する。
+   通常readerではmain Terminalが一度も作られないことまで検査し、見かけのrows復元だけで合格にしない。
+4. main＋独立A＋parked Bが同じPDFを読むfixtureで、Aのread-only closeがmain/BのPDF epoch ticket・items世代・
+   thumbnail worker/queue/requested・cancel・fs pending・編集stateを変えず、Aの資源だけを終端にすることを検査する。
+   closeを変更通知として配信せず、main再ロードや全contextの一括resetで成立させない。
+5. ブックマーク要求r1→main新admission/同path r2→旧r1 close/遅延完了、A/B切替、同一覧refresh、選択scroll変更、
+   ticketを持つsessionのpark/所有移動、Preparingの厳密なtarget、二重closeを検査する。
+   mainのr2を旧完了が消さず、現在要求だけを一回消費し、子/兄弟の描画がmain用要求を消費しないことを示す。
+   既存 `close_return_tests` のbookmark/standalone親復帰は弱めず維持する。
+   `detached_close_matches_head_return_in_both_window_modes` の既知不具合を固定した期待値だけは、採択・指示書に明記して理想の不変条件へ更新する。
+
+**今回の検証記録（2026-11-01）**: 対象は `8eb8e4443` の製品/テストsource無変更、通常feature・test profile。
+
+- `cargo test -p mimageviewer --lib detached_close_matches_head_return_in_both_window_modes -- --nocapture`
+  はexit 0、1件成功（内部でwindow設定2種）、失敗/ignoredとも0。テスト出力では両方とも子がSearch inactive/Metadataで
+  `return=physical_parent`、mainは物理一覧へ置換され `main_scroll=0`。既知不具合を期待する試験の成功であり、修正済みの証拠ではない。
+  初回test compileは7分06秒、試験は0.77秒。実行出力の結果抜粋は `target/design1670-everything-test.result-excerpt.txt`。
+- `cargo test -p mimageviewer --lib app::close_return_tests -- --test-threads=1`
+  はexit 0、15件成功、失敗/ignoredとも0、10.15秒。
+  bookmark media移動後は最終実folderへ、本は元bookmark一覧へ戻す分岐、mainの最新選択/scroll、
+  同path新要求による旧origin失効、parked siblingの非消費、Preparing/native/LogicOnlyの既存契約を含む。
+  stdout/stderrは `target/design1670-close-return.stdout.log` / `target/design1670-close-return.stderr.log`。
+- 製品起動・実UI操作はなし。入口別の追加再現試験は書いておらず、Everything以外の上表はsourceによる判定である。
+  `git diff --check` 成功。文書だけの変更なのでfull gate・確認用buildは行わない。
+  実装後review、全入口のhandler回帰、実UI/実Everything接続の確認は実装時の受入へ残す。
 
 ### 1.663 形式バッジをファイル名の一段上に置き、名前の表示幅を優先する — 5ch >>667 (2026-10-30)
 

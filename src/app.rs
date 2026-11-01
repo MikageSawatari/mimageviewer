@@ -4361,12 +4361,6 @@ impl BookmarkViewState {
 /// 終端 close された context から、閉じた後に必要な所有値だけを取り出したもの。
 #[cfg(windows)]
 struct ClosedBookmarkSummary {
-    /// `bundle.bookmark_view_state.as_ref().and_then(BookmarkViewState::target).cloned()`。
-    bookmark_target: Option<crate::bookmark_browser::BookmarkViewReturnTarget>,
-    /// `selected` が指す item が `Video` / `Audio` のときだけ `Some`。
-    selected_media_path: Option<PathBuf>,
-    /// `archive_source_override` を優先し、無ければ `current_folder`。
-    destination: Option<PathBuf>,
     /// `pdf_password_request.is_some()`。
     had_pdf_password_request: bool,
 }
@@ -4374,33 +4368,7 @@ struct ClosedBookmarkSummary {
 #[cfg(windows)]
 impl ClosedBookmarkSummary {
     fn read(context: ContextRef<'_>) -> Self {
-        let selected_media_path = context
-            .fullscreen_idx()
-            .or(context.selected())
-            .and_then(|idx| {
-                context.items().get(idx).and_then(|item| match item {
-                    GridItem::Video(path) | GridItem::Audio(path) => Some(path.clone()),
-                    _ => None,
-                })
-            });
         Self {
-            bookmark_target: context
-                .bookmark_view_state()
-                .and_then(BookmarkViewState::target)
-                .filter(|target| match target {
-                    crate::bookmark_browser::BookmarkViewReturnTarget::Media(path) => {
-                        selected_media_path
-                            .as_ref()
-                            .is_some_and(|current| crate::path_key::eq_keep_drive(path, current))
-                    }
-                    crate::bookmark_browser::BookmarkViewReturnTarget::Book(_) => true,
-                })
-                .cloned(),
-            selected_media_path,
-            destination: context
-                .archive_source_override()
-                .or_else(|| context.current_folder())
-                .map(Path::to_path_buf),
             had_pdf_password_request: context.pdf_password_request().is_some(),
         }
     }
@@ -52699,13 +52667,6 @@ impl App {
         let previous_key = previous_selected
             .and_then(|idx| self.bookmark_browser_rows.get(idx))
             .map(crate::bookmark_browser::BookmarkBrowserRow::stable_key);
-        // The terminal navigation owner now holds the bookmark return snapshot.
-        // Until its UI consumer runs, main is still a live grid: a read-model
-        // install must preserve the user's current position across its list reset.
-        let live_return_scroll = self
-            .pending_return_to_parent
-            .preserves_live_bookmark_grid()
-            .then_some(self.grid_scroll.offset());
         let return_grid = self.take_bookmark_restore_grid();
         // Publication starts only after admission succeeds for the owning Bookmark surface.
         self.bookmark_browser_rows = rows;
@@ -52812,19 +52773,8 @@ impl App {
                     .or_else(|| self.visible_indices.first().copied()),
                 crate::app::GridCursorIntent::Automatic,
             );
-            if let Some(scroll) = live_return_scroll {
-                self.grid_scroll.set_position(scroll);
-                self.grid_scroll.clear_edge();
-                self.grid_scroll
-                    .set_reveal_requested(previous_key.is_some_and(|key| {
-                        self.selected
-                            .and_then(|idx| self.bookmark_browser_rows.get(idx))
-                            .is_none_or(|row| row.stable_key() != key)
-                    }));
-            } else {
-                self.grid_scroll
-                    .set_reveal_requested(self.selected.is_some());
-            }
+            self.grid_scroll
+                .set_reveal_requested(self.selected.is_some());
         }
         true
     }
@@ -52907,7 +52857,7 @@ impl App {
             },
         )
         // The pending bookmark already owns the EPUB lease. None here is a loading-context
-        // build/resolve result, not an EPUB admission refusal; the caller clears its return state.
+        // build/resolve result, not an EPUB admission refusal. Main has no close-return state.
         .is_some()
     }
 
@@ -53000,10 +52950,7 @@ impl App {
                 ..
             } => {
                 let target = crate::bookmark_browser::BookmarkViewReturnTarget::Media(path.clone());
-                self.bookmark_view_state = Some(BookmarkViewState::Opening {
-                    target: target.clone(),
-                    grid: return_grid,
-                });
+
                 crate::logger::log(format!(
                     "[bookmark-open] request media path={} pts={:.3} presentation={:?}",
                     path.display(),
@@ -53026,17 +52973,19 @@ impl App {
                     } else {
                         DetachedSource::Video
                     };
-                    if !self.start_detached_bookmark_loading_context(
+                    self.start_detached_bookmark_loading_context(
                         ctx,
                         pending,
                         target,
                         source,
                         path.clone(),
-                    ) {
-                        self.clear_bookmark_view_return_state();
-                    }
+                    );
                     return;
                 }
+                self.bookmark_view_state = Some(BookmarkViewState::Opening {
+                    target: target.clone(),
+                    grid: return_grid,
+                });
                 self.bookmark_open_pending = Some(pending);
                 self.start_startup_open_path_resolve(
                     path.clone(),
@@ -53102,10 +53051,7 @@ impl App {
         let target = crate::bookmark_browser::BookmarkViewReturnTarget::Book(
             bookmark.container_path.clone(),
         );
-        self.bookmark_view_state = Some(BookmarkViewState::Opening {
-            target: target.clone(),
-            grid: return_grid,
-        });
+
         crate::logger::log(format!(
             "[bookmark-open] request book container={} page={} presentation={:?}",
             bookmark.container_path.display(),
@@ -53115,17 +53061,19 @@ impl App {
         let pending = crate::bookmark_browser::PendingBookmarkOpen::Book(pending);
         #[cfg(windows)]
         if self.settings.detached_viewer_open_images_in_window {
-            if !self.start_detached_bookmark_loading_context(
+            self.start_detached_bookmark_loading_context(
                 ctx,
                 pending,
                 target,
                 DetachedSource::Book,
                 bookmark.container_path.clone(),
-            ) {
-                self.clear_bookmark_view_return_state();
-            }
+            );
             return;
         }
+        self.bookmark_view_state = Some(BookmarkViewState::Opening {
+            target: target.clone(),
+            grid: return_grid,
+        });
         self.bookmark_open_pending = Some(pending);
         let navigation = navigation.map(|mut navigation| {
             let StartupOpenPathOwner::Bookmark(owner) = self
@@ -67082,12 +67030,13 @@ impl App {
             // resolves a different first-volume backing path.
             archive_source_override: Some(bookmark_container),
         };
-        Some(self.start_active_detached_book_context(
-            descriptor,
-            ctx,
-            placement_seed,
-            Some(pending),
-        ))
+        let started =
+            self.start_active_detached_book_context(descriptor, ctx, placement_seed, Some(pending));
+        if started {
+            // Only the resolver request moves to the reader; main does not await its close.
+            self.bookmark_view_state = None;
+        }
+        Some(started)
     }
 
     #[cfg(windows)]
@@ -67517,7 +67466,7 @@ impl App {
 
                 if matches!(
                     app.pending_return_to_parent,
-                    FullscreenCloseContinuation::Live(_)
+                    FullscreenCloseContinuation::Live
                 ) {
                     let id = app.projected_viewer_context_id();
                     app.transfer_terminal_close_return(id, ViewerCloseCause::User);
@@ -67568,9 +67517,6 @@ impl App {
                     self.pdf_password_input.clear();
                     self.pdf_password_error = None;
                     self.pdf_password_save = false;
-                }
-                if let Some(nav) = self.take_pending_return_to_parent_nav() {
-                    self.apply_fullscreen_close_nav_immediate(nav);
                 }
             }
         }
@@ -80055,11 +80001,6 @@ impl App {
             return;
         }
         self.finish_fullscreen_navigation_for_true_close();
-        #[cfg(windows)]
-        if self.projected_viewer_context_id() != self.viewer_context_main() {
-            let id = self.projected_viewer_context_id();
-            self.transfer_terminal_close_return(id, ViewerCloseCause::User);
-        }
         // Detached bookmark viewers never navigate their own bundle to the bookmark surface: the
         // origin grid is still mounted in main. Embedded viewers instead use the normal Bookmarks
         // navigation transition. Ownership is explicit in BookmarkViewState, not inferred from a
@@ -80073,16 +80014,6 @@ impl App {
         {
             self.pending_return_to_parent.request_live();
             return;
-        }
-        if let Some(BookmarkViewState::Detached {
-            target: target @ crate::bookmark_browser::BookmarkViewReturnTarget::Media(_),
-        }) = self.bookmark_view_state.as_ref()
-            && !self.bookmark_target_is_current(target)
-        {
-            // Media navigation changes the detached context's disposition: closing after moving
-            // to another file returns main to that real folder. Books intentionally keep their
-            // origin grid even after page/container navigation.
-            self.bookmark_view_state = None;
         }
         if self.projected_viewer_context_id() == self.viewer_context_main()
             && self.auto_open_for_current_container()
@@ -80112,17 +80043,6 @@ impl App {
         self.handle_fullscreen_close_request();
         #[cfg(windows)]
         if self.projected_viewer_context_id() != self.viewer_context_main() {
-            let main = self.viewer_context_main();
-            let _ = self.with_viewer_context(main, |app| {
-                if matches!(
-                    app.pending_return_to_parent,
-                    FullscreenCloseContinuation::Terminal(_)
-                ) {
-                    if let Some(nav) = app.take_pending_return_to_parent_nav() {
-                        app.apply_fullscreen_close_nav_immediate(nav);
-                    }
-                }
-            });
             return;
         }
         let Some(nav) = self.take_pending_return_to_parent_nav() else {

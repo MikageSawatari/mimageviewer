@@ -984,29 +984,40 @@ impl App {
         &self,
         owner: &crate::bookmark_browser::BookmarkOpenRequestOwner,
     ) -> bool {
-        let projected_owner_matches = self
-            .bookmark_open_pending
-            .as_ref()
-            .is_some_and(|pending| pending.request_id() == owner.request_id)
-            && self.bookmark_view_target() == Some(&owner.target);
-        if projected_owner_matches {
-            return true;
-        }
         #[cfg(windows)]
         {
-            owner.detached_lease.is_some_and(|lease| {
+            let preparing_owner_matches = owner.detached_lease.is_some_and(|lease| {
                 self.bookmark_open_request_seq == owner.request_id.0
                     && self.active_detached_window_id() == Some(lease.window_id)
                     && self.active_detached_session.is_some_and(|session| {
                         session.window_id == lease.window_id
                             && session.content_phase == DetachedSessionContentPhase::Preparing
                     })
-                    && self.bookmark_view_target() == Some(&owner.target)
-            })
+            });
+            let matches = |context: ContextRef<'_>| {
+                context.bookmark_view_target() == Some(&owner.target)
+                    && (context.bookmark_open_request_id() == Some(owner.request_id)
+                        || preparing_owner_matches)
+            };
+            // The resolver is App-global, but its request/target belongs to the exact reader.
+            // Building contexts are already projected and have a private reserved binding;
+            // only another owner needs a read through the public Mounted/AtRest registry.
+            if let Some(lease) = owner.detached_lease
+                && self.detached_viewer_window_id() != Some(lease.window_id)
+            {
+                return self
+                    .locate_window_context(lease.window_id)
+                    .and_then(|(id, _)| self.with_viewer_context_ref(id, matches))
+                    .unwrap_or(false);
+            }
+            matches(ContextRef::mounted(self))
         }
         #[cfg(not(windows))]
         {
-            false
+            self.bookmark_open_pending
+                .as_ref()
+                .is_some_and(|pending| pending.request_id() == owner.request_id)
+                && self.bookmark_view_target() == Some(&owner.target)
         }
     }
 
@@ -1770,6 +1781,10 @@ impl App {
         if started {
             self.test_script_record_new_detached_descriptor_owner(&count_descriptor);
         }
+        if started {
+            // The request and lease moved to the reader; main no longer waits for its close.
+            self.bookmark_view_state = None;
+        }
         DetachedBuild::Built(started)
     }
 
@@ -1803,7 +1818,7 @@ impl App {
     /// 一覧復帰の folder load がプレイヤーを別 bundle へ promote し、1 回目は一覧復帰だけ、
     /// 2 回目で再生終了という二段 close になる。ここでは book detached context と同じ ownership
     /// seam で、実フォルダ・player・bookmark seek を最初から active detached bundle に載せる。
-    /// main bundle はブックマーク一覧と復帰時の grid snapshot を保持したままにする。
+    /// main bundle はブックマーク一覧を保持し、独立窓終了待ちの帰還相関は持たない。
     #[cfg(windows)]
     pub(super) fn open_bookmark_media_in_detached_context(
         &mut self,
@@ -1824,7 +1839,7 @@ impl App {
         };
 
         // 同じ media window が既に生きている場合は、コンテキストを作り直さず seek だけ
-        // 新しいブックマークへ差し替える。main 側の grid snapshot は今回のクリック時点の値。
+        // 新しいブックマークへ差し替える。帰還相関は main に残さない。
         if self.raise_active_detached_media_for_grid_open(ctx, &pending.path) {
             let Some(id) = self.active_viewer_context_id() else {
                 self.bookmark_open_pending =
@@ -1851,6 +1866,7 @@ impl App {
                 "[bookmark-open] reuse detached media context path={}",
                 requested.display()
             ));
+            self.bookmark_view_state = None;
             return true;
         }
 
@@ -1912,6 +1928,7 @@ impl App {
         if built.is_none() {
             return false;
         }
+        self.bookmark_view_state = None;
         crate::logger::log(format!(
             "[bookmark-open] detached media context started path={} main_bookmarks={}",
             requested.display(),

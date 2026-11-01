@@ -73,6 +73,16 @@ synthetic pathから推定しない。recipeはViewerContextBundleのmount/fork�
 Remoteは本の通常responseから復元し、A2のSingle/一時Spreadを本へ保存しない。
 
 
+## 独立readerの終了境界（§1.670）
+
+mainの帰還権限はmain contextだけが所有する。独立bundleのbuild/forkはoriginやcontinuationを
+複製・移譲せず、独立closeは自身の資源とviewport登録を退役させるだけで完結する。
+mainの既存Live/Terminal/pendingの消費はmain自身の既存消費点に限る。
+bookmarkの非同期open request/target/leaseはresolverとreaderが保持し、mainは独立close待ちのOpeningを持たない。
+App-global resolverの完了採用・取消・変換完了のcurrentnessはleaseが指す要求所有contextを読む。
+同じ投影中のBuildingは投影値、他ownerはread-only ContextRefを使い、mainのbookmark表示状態へ依存しない。
+未分離のmain所有メディア窓・linked F12・main standaloneの帰路は従来どおり。
+
 ## Everything検索の所有（§1.374）
 
 Everything ファイル名検索（§1.374、実装中・検証待ち）は `everything_ipc`

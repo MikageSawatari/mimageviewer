@@ -651,7 +651,7 @@ fn canceled_and_failed_pdf_opens_keep_results_without_a_child_return() {
 
 #[cfg(windows)]
 #[test]
-fn detached_close_matches_head_return_in_both_window_modes() {
+fn detached_close_keeps_main_results_in_both_window_modes() {
     for multi_window in [true, false] {
         let mut app = setup_app_for_test();
         let ctx = egui::Context::default();
@@ -685,9 +685,7 @@ fn detached_close_matches_head_return_in_both_window_modes() {
             &ctx,
             None
         ));
-        // Independent open preserves main; the pre-existing terminal close recipe below
-        // then returns main to the real parent. This is the HEAD comparison contract,
-        // not the desired search-result-preserving behavior (backlog 1.664 follow-up).
+        // Independent open and close both preserve the accepted main list.
         assert_eq!(app.items, rows);
         assert_eq!(app.selected, selected);
         assert_eq!(app.items_generation, generation);
@@ -719,21 +717,17 @@ fn detached_close_matches_head_return_in_both_window_modes() {
             assert!(viewer.auto_open_for_current_container());
             assert!(matches!(viewer.resolve_close_return_navigation(),
                 Some((crate::ui_main::AddressBarNav::Direct(ref parent, _), _)) if parent == &root));
-            eprintln!("independent close: multi_window={multi_window} main={main_context:?} reader={:?} search_active={} accepted=Metadata physical_child=false return=physical_parent",
-                viewer.projected_viewer_context_id(), viewer.global_search.active);
+            assert!(viewer.close_return_origin().is_none());
             viewer.handle_fullscreen_close_request_immediate();
         })
         .expect("independent reader");
         assert_eq!(app.current_folder.as_ref(), Some(&root));
-        assert_eq!(
-            app.items,
-            vec![
-                GridItem::ZipFile(root.join("cache.zip")),
-                GridItem::Folder(folder),
-                GridItem::Folder(root.join("logs")),
-            ],
-            "independent close must retain the observed HEAD parent-list behavior"
-        );
+        assert_eq!(app.items, rows);
+        assert_eq!(app.selected, selected);
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.grid_scroll.offset(), 240.0);
+        assert!(epoch.is_current());
+        assert!(app.global_search.active);
         assert!(!app.pending_return_to_parent.is_pending());
         assert!(app.rating_filter_suppressed_at.is_none());
         assert_eq!(app.effective_rating_filter(), filter);
@@ -744,7 +738,7 @@ fn detached_close_matches_head_return_in_both_window_modes() {
             matches!(&app.global_search.accepted, SearchAccepted::Everything { dataset, .. } if Arc::ptr_eq(dataset, &result))
         );
         eprintln!(
-            "HEAD-equivalent close completed: multi_window={multi_window} main_selected={:?} main_scroll={}",
+            "independent close completed: multi_window={multi_window} main_selected={:?} main_scroll={}",
             app.selected,
             app.grid_scroll.offset()
         );
