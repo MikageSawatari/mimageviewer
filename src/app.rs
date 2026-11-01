@@ -15701,12 +15701,24 @@ pub(crate) struct GridBackgroundClickContext {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum GridClickTarget {
-    Cell(usize),
+    Cell {
+        index: usize,
+        context: GridBackgroundClickContext,
+        frame: u64,
+    },
     Background {
         context: GridBackgroundClickContext,
         pos: egui::Pos2,
         frame: u64,
     },
+}
+
+impl GridClickTarget {
+    fn source(self) -> GridClickSource {
+        match self {
+            Self::Cell { context, .. } | Self::Background { context, .. } => context.source,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -15717,12 +15729,47 @@ struct PendingGridClick {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GridPressTarget {
+pub(crate) enum GridPressTarget {
     Cell(usize),
     Background,
 }
 
-/// セル／背景のクリック対の単一 owner。セルの既存条件を保ち、背景だけ距離・入力種別を照合する。
+/// Ordered, adjudicated primary input. A missing click is a real non-click release,
+/// not an invitation to infer a click from the batch's final pointer position.
+pub(crate) enum GridPrimaryInput {
+    Cancelled,
+    TouchCancelled,
+    Moved(egui::Pos2),
+    Press {
+        pos: egui::Pos2,
+        widget: Option<egui::Id>,
+        source: GridClickSource,
+        suppressed: bool,
+    },
+    Release {
+        click: Option<(egui::Pos2, u32)>,
+        modifiers: egui::Modifiers,
+        source: GridClickSource,
+        suppressed: bool,
+    },
+    Secondary {
+        pos: egui::Pos2,
+        pressed: bool,
+        clicked: bool,
+        widget: Option<egui::Id>,
+        suppressed: bool,
+    },
+    FocusLost,
+}
+
+pub(crate) struct AcceptedGridClick {
+    pub(crate) pos: egui::Pos2,
+    pub(crate) modifiers: egui::Modifiers,
+    pub(crate) paired: bool,
+    pub(crate) source: GridClickSource,
+}
+
+/// セル／背景のクリック対の単一 owner。所属と入力元を共通照合し、背景には距離制限も適用する。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct GridClickPairingState {
     pending: Option<PendingGridClick>,
@@ -15742,18 +15789,22 @@ impl GridClickPairingState {
         &mut self,
         previous: Self,
         index: usize,
-        items_generation: u64,
+        context: GridBackgroundClickContext,
+        frame: u64,
         at: f64,
         max_delay: f64,
     ) -> bool {
         let paired = previous.pending.is_some_and(|pending| {
-            pending.target == GridClickTarget::Cell(index)
-                && pending.items_generation == items_generation
+            matches!(pending.target, GridClickTarget::Cell { index: old_index, context: old, .. } if old_index == index && old == context)
                 && at - pending.at < max_delay
         });
         self.pending = Some(PendingGridClick {
-            target: GridClickTarget::Cell(index),
-            items_generation,
+            target: GridClickTarget::Cell {
+                index,
+                context,
+                frame,
+            },
+            items_generation: context.items_generation,
             at,
         });
         paired
@@ -15774,23 +15825,30 @@ impl GridClickPairingState {
                 context: old,
                 frame: last_frame,
                 ..
+            }
+            | GridClickTarget::Cell {
+                context: old,
+                frame: last_frame,
+                ..
             } => {
                 old.items_generation != context.items_generation
                     || old.view_mode != context.view_mode
                     || old.viewport != context.viewport
                     || frame.saturating_sub(last_frame) > 1
             }
-            GridClickTarget::Cell(_) => false,
         }) {
             self.pending = None;
         }
-        // Keep the live background identity current through ordinary idle frames.
+        // Keep the visible surface identity current through ordinary idle frames.
         if let Some((_, last_frame, _)) = &mut self.primary_press {
             *last_frame = frame;
         }
         if let Some(PendingGridClick {
             target:
                 GridClickTarget::Background {
+                    frame: last_frame, ..
+                }
+                | GridClickTarget::Cell {
                     frame: last_frame, ..
                 },
             ..
@@ -15815,8 +15873,9 @@ impl GridClickPairingState {
         }
     }
 
-    pub(crate) fn background_press_cancel(&mut self) {
-        self.primary_press = None;
+    pub(crate) fn cancel_pair_preserving_cell_press(&mut self) {
+        self.pending = None;
+        self.end_background_run();
     }
 
     pub(crate) fn begin_background_press(
@@ -15827,27 +15886,8 @@ impl GridClickPairingState {
         self.primary_press = Some((context, frame, GridPressTarget::Background));
     }
 
-    pub(crate) fn begin_cell_press(
-        &mut self,
-        context: GridBackgroundClickContext,
-        frame: u64,
-        index: usize,
-    ) {
-        self.primary_press = Some((context, frame, GridPressTarget::Cell(index)));
-    }
-
-    pub(crate) fn take_cell_press(
-        &mut self,
-        previous: Self,
-        context: GridBackgroundClickContext,
-        index: usize,
-    ) -> bool {
-        self.primary_press
-            .take()
-            .or(previous.primary_press)
-            .is_some_and(|(press, _, target)| {
-                press == context && target == GridPressTarget::Cell(index)
-            })
+    pub(crate) fn primary_press_target(&self) -> Option<GridPressTarget> {
+        self.primary_press.map(|(_, _, target)| target)
     }
 
     pub(crate) fn owns_cell_press(
@@ -15900,12 +15940,117 @@ impl GridClickPairingState {
         *self = Self::default();
     }
 
+    /// Consume one edge of the unified cell/background stream. Selection is
+    /// applied before the next edge, so pairing and reclick observe the same order.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn accept_primary_input(
+        &mut self,
+        context: GridBackgroundClickContext,
+        frame: u64,
+        at: f64,
+        max_delay: f64,
+        max_dist: f32,
+        event: &GridPrimaryInput,
+        target_at: impl Fn(egui::Pos2, bool) -> Option<GridPressTarget>,
+    ) -> Option<(GridPressTarget, AcceptedGridClick)> {
+        match *event {
+            GridPrimaryInput::FocusLost
+            | GridPrimaryInput::Cancelled
+            | GridPrimaryInput::Secondary { .. } => self.end_activation(),
+            GridPrimaryInput::TouchCancelled => {
+                if self
+                    .primary_press
+                    .is_some_and(|(owner, _, _)| owner.source == GridClickSource::Touch)
+                {
+                    self.primary_press = None;
+                }
+                if self
+                    .pending
+                    .is_some_and(|click| click.target.source() == GridClickSource::Touch)
+                {
+                    self.pending = None;
+                }
+            }
+            GridPrimaryInput::Moved(_) => {}
+            GridPrimaryInput::Press {
+                pos,
+                source,
+                suppressed,
+                ..
+            } => {
+                if suppressed {
+                    self.end_activation();
+                    return None;
+                }
+                if self
+                    .pending
+                    .is_some_and(|click| click.target.source() != source)
+                {
+                    self.pending = None;
+                }
+                self.primary_press =
+                    (!suppressed)
+                        .then(|| target_at(pos, true))
+                        .flatten()
+                        .map(|target| {
+                            (
+                                GridBackgroundClickContext { source, ..context },
+                                frame,
+                                target,
+                            )
+                        });
+            }
+            GridPrimaryInput::Release {
+                click,
+                modifiers,
+                source,
+                suppressed,
+            } => {
+                let owner = GridBackgroundClickContext { source, ..context };
+                let press = self.primary_press.take();
+                let target = click.and_then(|(pos, _)| target_at(pos, false));
+                if suppressed
+                    || !press.is_some_and(|(press, _, press_target)| {
+                        press == owner && Some(press_target) == target
+                    })
+                {
+                    self.end_activation();
+                    return None;
+                }
+                let target = target.expect("accepted release has a target");
+                let (pos, _) = click.expect("accepted release has egui click classification");
+                let previous = *self;
+                let paired = match target {
+                    GridPressTarget::Cell(index) => {
+                        self.register_cell_click(previous, index, owner, frame, at, max_delay)
+                    }
+                    GridPressTarget::Background => {
+                        self.primary_press = press;
+                        self.register_background_click(
+                            previous, owner, pos, frame, at, max_delay, max_dist,
+                        )
+                    }
+                };
+                return Some((
+                    target,
+                    AcceptedGridClick {
+                        pos,
+                        modifiers,
+                        paired,
+                        source,
+                    },
+                ));
+            }
+        }
+        None
+    }
+
     #[cfg(test)]
     pub(crate) fn pending_index_for_generation(self, items_generation: u64) -> Option<usize> {
         self.pending
             .filter(|pending| pending.items_generation == items_generation)
             .and_then(|pending| match pending.target {
-                GridClickTarget::Cell(index) => Some(index),
+                GridClickTarget::Cell { index, .. } => Some(index),
                 GridClickTarget::Background { .. } => None,
             })
     }

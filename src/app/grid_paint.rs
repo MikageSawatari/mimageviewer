@@ -884,6 +884,10 @@ pub(crate) struct ThumbnailHitAreas {
 }
 
 impl ThumbnailHitAreas {
+    pub(crate) fn rects(&self) -> &[egui::Rect] {
+        &self.rects
+    }
+
     pub(crate) fn contains(&self, pos: egui::Pos2) -> bool {
         self.rects.iter().any(|rect| rect.contains(pos))
     }

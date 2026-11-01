@@ -110566,6 +110566,195 @@ mod background_click_scroll_regression_tests {
         wheel_breaks_pair(crate::settings::GridViewMode::Details);
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum ConcurrentClick {
+        Cell,
+        CellDouble,
+        CellSecondary,
+        Background,
+        BackgroundDouble,
+        BackgroundSecondary,
+    }
+
+    fn wheel_with_click(kind: ConcurrentClick) {
+        use crate::settings::{GridClickSelectionMode, GridViewMode};
+        use ConcurrentClick::*;
+        for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+            for delta in [
+                egui::vec2(10.0, 0.0),
+                egui::vec2(0.0, 0.25),
+                egui::vec2(0.0, 10.0),
+            ] {
+                let mut app = setup_app_for_test();
+                let child = app.tmp.path().join("child");
+                install_items(&mut app, &child, 1);
+                app.settings.grid_view_mode = view;
+                app.settings.grid_cols = 8;
+                app.settings.grid_click_selection_mode = GridClickSelectionMode::Explorer;
+                app.settings.grid_open_selected_item_on_click = false;
+                app.settings.auto_fullscreen_zip_pdf = false;
+                app.settings.grid_background_double_click_parent = true;
+                let mut harness = harness(app);
+                harness.run_steps(6);
+                let background =
+                    matches!(kind, Background | BackgroundDouble | BackgroundSecondary);
+                let pos = if background {
+                    egui::pos2(30.0, 430.0)
+                } else {
+                    harness
+                        .ctx
+                        .data(|data| {
+                            data.get_temp::<egui::Response>(egui::Id::unique((
+                                "grid_cell_input_response",
+                                harness.state().app.grid_scroll_context_id(),
+                                0usize,
+                            )))
+                        })
+                        .expect("rendered cell handler")
+                        .rect
+                        .center()
+                };
+                harness.hover_at(pos);
+                harness.run_steps(2);
+                // A background rejection must preserve selection/checks; cell routes
+                // must still select/open the clicked cell, independently of the wheel.
+                harness.state_mut().app.selected = background.then_some(0);
+                harness.state_mut().app.checked = HashSet::from([0]);
+                let mut events = vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta,
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                }];
+                let button = if matches!(kind, CellSecondary | BackgroundSecondary) {
+                    egui::PointerButton::Secondary
+                } else {
+                    egui::PointerButton::Primary
+                };
+                let count = if matches!(kind, CellDouble | BackgroundDouble) {
+                    2
+                } else {
+                    1
+                };
+                for _ in 0..count {
+                    for pressed in [true, false] {
+                        events.push(egui::Event::PointerButton {
+                            pos,
+                            button,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        });
+                    }
+                }
+                harness.input_mut().events = events;
+                harness.step();
+                let state = harness.state();
+                let consumed = delta.y.abs() > 0.5;
+                assert_eq!(
+                    state.wheels_consumed.len(),
+                    usize::from(consumed),
+                    "{view:?} {delta:?} {kind:?}"
+                );
+                let primary_background = matches!(kind, Background | BackgroundDouble);
+                // Right-click preserves a checked target; the folder menu also
+                // leaves the existing checks untouched.
+                let checks_preserved = (primary_background && !consumed)
+                    || matches!(kind, CellSecondary | BackgroundSecondary);
+                assert_eq!(
+                    state.app.selected,
+                    (!background || checks_preserved).then_some(0),
+                    "{view:?} {delta:?} {kind:?}"
+                );
+                assert_eq!(
+                    state.app.checked.is_empty(),
+                    !checks_preserved,
+                    "{view:?} {delta:?} {kind:?}"
+                );
+                let opens =
+                    matches!(kind, CellDouble) || (matches!(kind, BackgroundDouble) && consumed);
+                assert_eq!(
+                    state.navs.len(),
+                    usize::from(opens),
+                    "{view:?} {delta:?} {kind:?}"
+                );
+                let menu_index = state.app.context_menu_idx.as_ref().map(|owner| owner.index);
+                assert_eq!(
+                    menu_index,
+                    match kind {
+                        CellSecondary => Some(0),
+                        BackgroundSecondary => Some(usize::MAX),
+                        _ => None,
+                    },
+                    "{view:?} {delta:?} {kind:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn section1680_scroll_with_cell_click() {
+        wheel_with_click(ConcurrentClick::Cell);
+    }
+
+    #[test]
+    fn section1680_scroll_with_cell_double_click() {
+        wheel_with_click(ConcurrentClick::CellDouble);
+    }
+
+    #[test]
+    fn section1680_scroll_with_cell_secondary_click() {
+        wheel_with_click(ConcurrentClick::CellSecondary);
+    }
+
+    #[test]
+    fn section1680_scroll_with_background_click() {
+        wheel_with_click(ConcurrentClick::Background);
+    }
+
+    #[test]
+    fn section1680_scroll_with_background_double_click() {
+        wheel_with_click(ConcurrentClick::BackgroundDouble);
+    }
+
+    #[test]
+    fn section1680_scroll_with_background_secondary_click() {
+        wheel_with_click(ConcurrentClick::BackgroundSecondary);
+    }
+
+    #[test]
+    fn section1680_scroll_remaining_wheel_ends_only_the_background_pair() {
+        use crate::settings::{GridClickSelectionMode, GridViewMode};
+        for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+            for delta in [egui::vec2(10.0, 0.0), egui::vec2(0.0, 0.25)] {
+                let mut app = setup_app_for_test();
+                let child = app.tmp.path().join("child");
+                install_items(&mut app, &child, 1);
+                app.settings.grid_view_mode = view;
+                app.settings.grid_cols = 8;
+                app.settings.grid_click_selection_mode = GridClickSelectionMode::Explorer;
+                app.settings.grid_background_double_click_parent = true;
+                let mut harness = harness(app);
+                harness.run_steps(6);
+                let pos = egui::pos2(30.0, 430.0);
+                click(&mut harness, pos);
+                harness.event(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta,
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                });
+                harness.step();
+                assert!(harness.state().wheels_consumed.is_empty());
+                click(&mut harness, pos);
+                assert!(harness.state().navs.is_empty(), "{view:?} {delta:?}");
+                click(&mut harness, pos);
+                assert_eq!(harness.state().navs.len(), 1, "{view:?} {delta:?}");
+            }
+        }
+    }
+
     #[test]
     fn background_scroll_snapshot_return_thumbnail_keeps_new_offset() {
         snapshot_return_keeps_new_scroll(crate::settings::GridViewMode::Thumbnail);
@@ -110747,6 +110936,87 @@ mod background_click_scroll_regression_tests {
             click(&mut harness, second);
             assert!(harness.state().navs.is_empty());
             click(&mut harness, second);
+            assert_eq!(harness.state().navs.len(), 1);
+            assert_eq!(
+                matches!(
+                    harness.state().navs[0],
+                    crate::ui_main::AddressBarNav::Direct(_, _)
+                ),
+                image_first
+            );
+        }
+    }
+
+    #[test]
+    fn section1680_letterbox_mixed_completions_in_one_batch_keep_the_final_target() {
+        for image_first in [false, true] {
+            let mut harness = letterbox_harness([40, 120]);
+            let rect = cell_rect(&harness);
+            let image = rect.center();
+            let background = rect.min + egui::vec2(5.0, rect.height() * 0.5);
+            let (first, last) = if image_first {
+                (image, background)
+            } else {
+                (background, image)
+            };
+            harness.hover_at(first);
+            harness.run();
+            harness.input_mut().events = [first, last]
+                .into_iter()
+                .flat_map(|pos| {
+                    [true, false].map(|pressed| egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    })
+                })
+                .collect();
+            harness.run();
+            assert!(harness.state().navs.is_empty());
+            assert_eq!(harness.state().app.selected, (!image_first).then_some(0));
+            click(&mut harness, last);
+            assert_eq!(harness.state().navs.len(), 1);
+            assert_eq!(
+                matches!(
+                    harness.state().navs[0],
+                    crate::ui_main::AddressBarNav::Direct(_, _)
+                ),
+                image_first
+            );
+        }
+    }
+
+    #[test]
+    fn section1680_letterbox_new_press_does_not_reassign_the_older_release() {
+        for image_first in [false, true] {
+            let mut harness = letterbox_harness([40, 120]);
+            let rect = cell_rect(&harness);
+            let image = rect.center();
+            let background = rect.min + egui::vec2(5.0, rect.height() * 0.5);
+            let (first, next) = if image_first {
+                (image, background)
+            } else {
+                (background, image)
+            };
+            harness.hover_at(first);
+            harness.run();
+            let edge = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            harness.input_mut().events =
+                vec![edge(first, true), edge(first, false), edge(next, true)];
+            harness.run();
+            assert_eq!(harness.state().app.selected, image_first.then_some(0));
+            assert!(harness.state().navs.is_empty());
+            harness.input_mut().events = vec![edge(next, false)];
+            harness.run();
+            assert_eq!(harness.state().app.selected, (!image_first).then_some(0));
+            assert!(harness.state().navs.is_empty());
+            click(&mut harness, next);
             assert_eq!(harness.state().navs.len(), 1);
             assert_eq!(
                 matches!(
