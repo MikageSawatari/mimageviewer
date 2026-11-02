@@ -280,6 +280,9 @@ AI 補正の VRAM 使用量は実測の記録が無い。ONNX Runtime の確保�
 
 ### V0 — モデルの比較 (製品の外、開発側)
 
+手順の正本: [local-vlm-v0-procedure.md](local-vlm-v0-procedure.md)。比較用の画像は利用者が
+`C:\home\mimageviewer_local\books\LVM比較` に用意した (2026-11-02、26 枚)。
+
 - llama.cpp の公式リリース (Vulkan 版) の CLI で、§3 の候補 4〜6 個を比べる。製品バイナリは使わない。
 - 画像は**利用者が用意した評価用セット** (家族写真・風景・AI 生成画像・スクリーンショットなど、各数十枚) を使う。
   ネットから集めない。
