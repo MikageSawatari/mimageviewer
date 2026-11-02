@@ -429,3 +429,5 @@
 | `git diff --check` | 成功 |
 
 最終焦点のcommand/config・stdout/stderr・JUnitは`target/section1683-conflict-focused-final/runs/20261102T152241854Z-769e18e4/`。初回結果は`target/section1683-conflict-focused/runs/20261102T151517792Z-b8ee6692/`に分けて保持する。最終source/testは検証後に変更せず、文書の結果追記だけを行う。UI描画・文字列・snapshot変更なし。製品起動・commit・lib全件・build-devは依頼どおり未実施で、過去の確認用バイナリに今回の修正は含まれない。
+
+2026-11-03追補: 「製本の管理」の初期位置をv4.11.0と同じ画面中央へ戻した。画面に収めた既定サイズの半分を中央から引く`default_pos`を使い、通常画面1366×728と小画面1093×614で初回から中央・画面内となる回帰検査を追加した。

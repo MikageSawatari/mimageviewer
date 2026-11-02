@@ -302,6 +302,8 @@ struct BookManagerActions {
     controls: Vec<(String, egui::Id, egui::Rect, egui::Rect, bool)>,
     #[cfg(test)]
     row_slots: Vec<(usize, egui::Rect, f32)>,
+    #[cfg(test)]
+    window_rect: Option<egui::Rect>,
 }
 
 struct BookManagerView<'a> {
@@ -636,19 +638,24 @@ fn draw_book_manager_window(
 ) -> BookManagerActions {
     let rect = ctx.content_rect();
     let available = (rect.size() - egui::vec2(24.0, 24.0)).max(egui::vec2(260.0, 160.0));
+    let default_size = egui::vec2(700.0, 540.0).min(available);
     let mut actions = BookManagerActions::default();
-    egui::Window::new("製本の管理")
+    let _window = egui::Window::new("製本の管理")
         .drag_area(egui::WindowDrag::Anywhere)
         .collapsible(false)
         .resizable(true)
-        .default_pos(rect.min + egui::vec2(12.0, 12.0))
-        .default_size(egui::vec2(700.0, 540.0).min(available))
+        .default_pos(rect.center() - default_size * 0.5)
+        .default_size(default_size)
         .min_width(260.0)
         .max_size(available)
         .open(open)
         .show(ctx, |ui| {
             actions = draw_book_manager_contents(ui, view);
         });
+    #[cfg(test)]
+    {
+        actions.window_rect = _window.map(|window| window.response.rect);
+    }
     actions
 }
 
@@ -29540,6 +29547,33 @@ mod saved_group_number_ui_tests {
                 (actual - step).abs() <= float_precision,
                 "actual row spacing differs from show_rows step: actual={actual}, step={step}; first={first:?}; second={second:?}"
             );
+        }
+    }
+
+    #[test]
+    fn book_manager_initial_window_is_centered_and_inside_viewport() {
+        for size in [egui::vec2(1366.0, 728.0), egui::vec2(1093.0, 614.0)] {
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let rows = manager_test_rows(21);
+            let mut names = std::collections::BTreeMap::new();
+            // Check the opening frame and the first settled frames, before any input.
+            for _ in 0..4 {
+                let actions =
+                    manager_test_frame(&ctx, size, &rows, &mut names, "名前順", None, vec![]);
+                let window = actions
+                    .window_rect
+                    .expect("book manager window must be shown");
+                assert!(
+                    bounds.contains_rect(window),
+                    "window outside viewport: {window:?}; viewport={bounds:?}"
+                );
+                assert!(
+                    window.center().distance(bounds.center()) <= 1.0,
+                    "window must open centered: {window:?}; viewport={bounds:?}"
+                );
+            }
         }
     }
 
