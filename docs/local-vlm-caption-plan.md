@@ -1,7 +1,7 @@
 # ローカル AI 説明文 (VLM) 計画書
 
 Status: 独立レビュー済み (2026-11-02、9 回で閉じた、§19)。設計担当 ClaudeCode。V0 (モデル比較・VRAM 計測) を終え、利用者の判断 U1〜U18 が出そろった。
-独立レビュー前。v5 に入れることが決まった (2026-11-02、v5 統合担当から連絡)。
+v5 に入れることが決まった (2026-11-02、v5 統合担当から連絡)。
 関連: [mcp-integration-plan.md](mcp-integration-plan.md) (§5.4・§5.6・§15.2)、
 [search-architecture.md](search-architecture.md) (§4.10・§4.11)、
 [editing-add-on-download-spec.md](editing-add-on-download-spec.md)、
