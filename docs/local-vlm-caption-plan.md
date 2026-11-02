@@ -790,3 +790,30 @@ TensorRT は `bench_ai` が `target\release\mimageviewer.exe` をワーカーと
 4 回目の P2 2 件は閉じた。新しい指摘は U15 の記述についての P2 1 件で、割り切りの方針はそのまま、書き方を事実に合わせた
 (署名が同じ別画像では誤りを見分けられず、通常の作り直しでも直らない)。仕組みへの指摘は残っていない。
 計画書の独立レビューはここで閉じる。
+
+## 20. V1-0 の結果 (2026-11-02、worker 単体)
+
+実装担当: Codex (gpt-6.1-sol / high)。コミット `db7434bf0` (`crates/vlm-worker/`、成果物 `vendor/vlm-worker/mimageviewer-vlm.exe`)。
+数値の観測者は実装担当の計測スクリプト。ClaudeCode が出力 JSONL と exe から a・b・c・d を独立に数え直し、同じ値になった。
+mIV 本体にはつないでいない。build と確認の手順は `crates/vlm-worker/README.md`。
+
+| 項目 | 結果 |
+| --- | --- |
+| build の形 | llama.cpp b12032 の `ggml`・`llama`・`mtmd` と MSVC の CRT を exe に静的リンク (45.85MiB、追加の DLL なし)。Vulkan。`common`・server・OpenSSL・RPC・OpenMP はリンクしない。`LLAMA_BUILD_MTMD=ON` で mtmd だけを組み込める |
+| a. V0 の llama-server (C9) との一致 | 3 欄とも一致 21/26 (説明文 22・画像内の文字 25・検索語 21)。入力トークン列は 26/26 一致 |
+| b. 画像の順番を逆にしたとき | 26/26 一致 (画像ごとに context と sampler を作り直している) |
+| c. §6.5 の成功の条件 | 26/26 (終了トークンで停止・JSON 完全・型・上限) |
+| d. import | `vulkan-1.dll`・`dxgi.dll`・`KERNEL32.dll`・`ADVAPI32.dll` だけ。exe の中に通信系 DLL の名前の文字列も無い (ClaudeCode が `dumpbin` と文字列検索で確認) |
+| e. 時間 | 1 枚 1.50 秒 (中央値、最初の 1 枚を除く)、モデルの読み込み 2.5 秒、最初の 1 枚 22〜25 秒 |
+| GPU の特定 | DXGI の LUID → Vulkan の device → ggml の device を PCI ID で突き合わせ、モデルと mmproj に同じ device を指定できた |
+
+残っていること:
+
+- C9 と違った 5 枚の原因は未確定。JSON 部分の文法は一致するが、llama-server は会話の前置き (thinking の prefix) を含めた文法を使うため、
+  文法の状態が厳密には同じでない (実装担当の見立て)。worker の中では決定的 (b) なので、製品の動作には影響しない。品質が同等かは、
+  必要なら V0 と同じ比較ページで利用者が確かめる。
+- 最初の 1 枚の 22〜25 秒は Vulkan の初回準備と見られる。ジョブの開始ごとに起きるので、V1 で pipeline cache などを確かめる (§18.3)。
+- 検索語 1 語の上限は、V0 の schema (`v0-3l`) の 40 文字と §6.4 の 32 文字が食い違っている。製品は §6.4 の 32 文字にそろえる。
+- CPU スレッド数を 24 に固定している (C9 と合わせるため)。製品では機種から決める。
+- 実装担当が報告に書いた「独立レビュー ACCEPT」は、実装担当が自分の結果ファイルに書いたもので、AGENTS.md の独立レビューではない。
+  worker のコードの独立レビューは別の担当に依頼する。
