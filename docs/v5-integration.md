@@ -516,3 +516,9 @@ reparse point 0と確認してNTFS圧縮（ファイル内容保持、削除0）
 - 設計担当 ClaudeCode が実施。master `3a193e50d` (v4.11.0 公開後。§1.677〜§1.685 の記録、RAW 縮小画像の再要求ループ修正、`deploy-site.ps1`) を `9d57d16c4` で、mcp-trial `bf70f3797` (サブ PC での利用例確認 依頼 4・5、ローカル VLM 説明文計画の下書き、VLM 評価スクリプト) を `87385aea0` で取り込んだ。どちらも衝突なし。版は master の 4.11.0 になった (v5 の版番号は候補版で決める)。
 - 検証: `MIV_SOUND_CANDIDATE` を §2 の検査専用入力 (`dcdfa794…6d34`) にして `test-lib-full.ps1`。15,834 件中 15,833 件成功、71 skip。失敗 1 件 `app::tests::history_parent_1473::section1473_smart_and_collection_physical_entrances_keep_native_root_and_origin` は全件時 27.6 秒で失敗し、単独では 3 回とも成功 (4.2〜4.7 秒)。負荷時の期限切れと判断し、製品の不具合とはしない。`MIV_SOUND_CANDIDATE` を付けないと build.rs が mIV Sound 通知の欠落で止まる (正式候補の未配置。§4 の残作業 2)。
 - この取り込みで §4「候補版を作るために残っていること」は変わらない。
+
+## 6. v5 に入れる範囲（2026-11-02 利用者決定）
+
+- 統合済みの 4 本: MCP 対応 (`mcp-trial`)、mIV Sound (`claude/miv-sound-f1-a7147d`)、音楽動画の書き出し (`musicvideo`)、歌詞の受け渡し (`effetune-lyrics-trial`)。§4 の残作業 (歌詞受信側の移植、正式 Sound 候補と承認、launcher 込みの release gate、候補版の受入) を済ませる。
+- 追加: §1.686 左ツリーの外部変更への追従、§1.684 フォルダバーで引用符付きパス、§1.683 製本の並び順、ローカル AI 説明文 (`docs/local-vlm-caption-plan.md`)。
+- 進め方: §1.686・§1.684・§1.683 は v4 のコードだけで完結するので、master から作業ブランチを切って master へ入れ、master → v5-integration の取り込みで v5 に入れる (v5 の build は正式 Sound 候補が揃うまで通常データで起動できず、実機確認を master の build-dev で頼むため)。master から v4 系の追加リリースは予定しない (2026-11-02 利用者方針)。ローカル AI 説明文は MCP 担当のセッションが mcp-trial で進め、v5-integration へ取り込む。
