@@ -224,6 +224,7 @@ mod tests {
             app.view_trim_save_pending = true;
             let (_tx, rx) = std::sync::mpsc::channel();
             app.book_op_pending = Some(crate::books::BookOpPending {
+                shelf_scope: None,
                 rx,
                 intent: if undo_pending {
                     crate::books::BookOpIntent::UndoAppend { receipt }

@@ -32,6 +32,7 @@ pub struct BookPageEntry {
 
 #[derive(Clone, Debug)]
 pub struct BookAppendSummary {
+    pub shelf: Option<crate::book_order::BookShelfCompletion>,
     pub book_name: String,
     pub folder: PathBuf,
     pub added: usize,
@@ -82,6 +83,14 @@ pub struct BookTransferSummary {
 
 #[derive(Debug)]
 pub enum BookOpResult {
+    ShelfList(crate::book_order::BookShelfSnapshot),
+    ShelfOrderSaved(
+        Result<crate::book_order::BookOrderToken, crate::book_order::BookOrderWriteError>,
+    ),
+    ShelfUpdated {
+        result: Box<BookOpResult>,
+        shelf: crate::book_order::BookShelfCompletion,
+    },
     Append(BookAppendSummary),
     AppendPresencePrepared {
         summary: BookAppendSummary,
@@ -248,6 +257,7 @@ impl Drop for PreparedBookmarkMigration {
 }
 
 pub struct BookOpPending {
+    pub(crate) shelf_scope: Option<crate::app::book_shelf::ShelfScope>,
     pub rx: std::sync::mpsc::Receiver<Result<BookOpResult, String>>,
     pub intent: BookOpIntent,
 }
@@ -256,6 +266,7 @@ pub struct BookOpPending {
 /// exact requested root until the success result supplies the removed path.
 #[derive(Clone)]
 pub enum BookOpIntent {
+    ShelfOrder,
     Unrelated,
     /// A manager refresh can also carry one read-only, cancelable grid-navigation request.
     List {
@@ -727,7 +738,14 @@ pub fn containing_book_folder(root: &Path, path: &Path) -> Option<PathBuf> {
 }
 
 pub fn list_books(root: &Path) -> Result<Vec<BookInfo>, String> {
-    if !root.exists() {
+    Ok(crate::book_order::read_snapshot(root)?.rows)
+}
+
+pub(crate) fn list_books_name_order(
+    root: &Path,
+    root_presence: crate::book_order::RootPresence,
+) -> Result<Vec<BookInfo>, String> {
+    if root_presence == crate::book_order::RootPresence::Missing {
         return Ok(Vec::new());
     }
     let mut rows = Vec::new();
@@ -789,6 +807,18 @@ pub fn apply_append_to_cached_list(
 }
 
 pub fn create_book(root: &Path, name: &str) -> Result<BookOpResult, String> {
+    let before = crate::book_order::read_snapshot(root);
+    let result = create_book_unordered(root, name)?;
+    let mutation = match &result {
+        BookOpResult::Created { name, .. } => {
+            crate::book_order::BookShelfMutation::Created(name.clone())
+        }
+        _ => unreachable!(),
+    };
+    Ok(with_shelf_completion(root, before, mutation, result))
+}
+
+fn create_book_unordered(root: &Path, name: &str) -> Result<BookOpResult, String> {
     let name = normalize_book_name(name);
     let path = book_folder(root, &name);
     if path.exists() {
@@ -801,7 +831,18 @@ pub fn create_book(root: &Path, name: &str) -> Result<BookOpResult, String> {
 }
 
 pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOpResult, String> {
-    rename_book_at(&crate::data_dir::get(), root, old_name, new_name)
+    let before = crate::book_order::read_snapshot(root);
+    let result = rename_book_at(&crate::data_dir::get(), root, old_name, new_name)?;
+    let mutation = match &result {
+        BookOpResult::Renamed {
+            old_name, new_name, ..
+        } if old_name != new_name => crate::book_order::BookShelfMutation::Renamed {
+            old_name: old_name.clone(),
+            new_name: new_name.clone(),
+        },
+        _ => crate::book_order::BookShelfMutation::Unchanged,
+    };
+    Ok(with_shelf_completion(root, before, mutation, result))
 }
 
 pub(crate) fn rename_book_at(
@@ -827,7 +868,8 @@ pub(crate) fn rename_book_at(
     let from = book_folder(root, &old_name);
     let to = book_folder(root, &new_name);
     ensure_direct_book_target(root, &from)?;
-    if to.exists() {
+    let case_only = crate::folder_tree::path_eq(&from, &to);
+    if to.exists() && !case_only {
         return Err(format!("同名の本が既にあります: {new_name}"));
     }
     // Keep missing bookmarks and folder-scoped settings in the same mapping as
@@ -837,10 +879,33 @@ pub(crate) fn rename_book_at(
         to: to.clone(),
     }];
     let job_id = crate::book_bookmarks::new_path_migration_job_id();
-    let plan = BookFsOperationPlan::new(vec![BookFsStep::Rename {
-        from: from.clone(),
-        to: to.clone(),
-    }]);
+    let steps = if case_only {
+        // Windows resolves both spellings to the same directory. The journal
+        // owns both physical steps, while metadata sees one original→final map.
+        let staging = root.join(format!(
+            ".mimageviewer-book-rename-{}",
+            uuid::Uuid::new_v4()
+        ));
+        if !filesystem_path_is_missing(&staging)? {
+            return Err("本の改名用の一時フォルダが既に存在します".into());
+        }
+        vec![
+            BookFsStep::Rename {
+                from: from.clone(),
+                to: staging.clone(),
+            },
+            BookFsStep::Rename {
+                from: staging,
+                to: to.clone(),
+            },
+        ]
+    } else {
+        vec![BookFsStep::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        }]
+    };
+    let plan = BookFsOperationPlan::new(steps);
     let migration = PreparedBookmarkMigration::prepare(data_dir, job_id, &edit_moves, &plan)?;
     let bookmark_migration_journal_id = migration.execute(&plan)?;
     let metadata = maintain_book_paths(data_dir, &edit_moves, &[]);
@@ -856,7 +921,10 @@ pub(crate) fn rename_book_at(
 }
 
 pub fn delete_book(root: &Path, name: &str) -> Result<BookOpResult, String> {
-    delete_book_at(&crate::data_dir::get(), root, name)
+    let before = crate::book_order::read_snapshot(root);
+    let result = delete_book_at(&crate::data_dir::get(), root, name)?;
+    let mutation = crate::book_order::BookShelfMutation::Deleted(normalize_book_name(name));
+    Ok(with_shelf_completion(root, before, mutation, result))
 }
 
 pub(crate) fn delete_book_at(
@@ -895,7 +963,41 @@ pub fn append_pages(
 ) -> Result<BookOpResult, String> {
     let data_dir = crate::data_dir::get();
     let stores = crate::book_append_undo::AppendMetadataStores::existing_at(&data_dir);
-    append_pages_at_with_raw(data_dir, root, book_name, sources, stores, Some(raw))
+    append_pages_at_with_raw_and_shelf(data_dir, root, book_name, sources, stores, Some(raw))
+}
+
+pub(crate) fn append_pages_at_with_raw_and_shelf(
+    data_dir: PathBuf,
+    root: PathBuf,
+    book_name: String,
+    sources: Vec<BookPageSource>,
+    stores: crate::book_append_undo::AppendMetadataStores,
+    raw: Option<&crate::raw::RawDecodeContext>,
+) -> Result<BookOpResult, String> {
+    let before = crate::book_order::read_snapshot(&root);
+    let mut result =
+        append_pages_at_with_raw(data_dir, root.clone(), book_name, sources, stores, raw)?;
+    let BookOpResult::Append(summary) = &mut result else {
+        unreachable!()
+    };
+    summary.shelf = Some(crate::book_order::finish_mutation(
+        &root,
+        before,
+        crate::book_order::BookShelfMutation::Created(summary.book_name.clone()),
+    ));
+    Ok(result)
+}
+
+fn with_shelf_completion(
+    root: &Path,
+    before: Result<crate::book_order::BookShelfSnapshot, String>,
+    mutation: crate::book_order::BookShelfMutation,
+    result: BookOpResult,
+) -> BookOpResult {
+    BookOpResult::ShelfUpdated {
+        result: Box::new(result),
+        shelf: crate::book_order::finish_mutation(root, before, mutation),
+    }
 }
 
 pub(crate) fn append_pages_at(
@@ -1054,6 +1156,7 @@ fn append_pages_at_with_raw_observed(
             .ok()
     });
     let mut summary = BookAppendSummary {
+        shelf: None,
         book_name,
         folder,
         added,
@@ -1113,15 +1216,23 @@ pub fn transfer_pages_between_books(
     target_book_name: String,
     kind: BookTransferKind,
 ) -> Result<BookOpResult, String> {
-    transfer_pages_between_books_at(
+    let before = crate::book_order::read_snapshot(&root);
+    let result = transfer_pages_between_books_at(
         &crate::data_dir::get(),
-        root,
+        root.clone(),
         source_folder,
         current_order_paths,
         selected_paths,
         target_book_name,
         kind,
-    )
+    )?;
+    let mutation = match &result {
+        BookOpResult::Transfer(summary) => {
+            crate::book_order::BookShelfMutation::Created(summary.target_book_name.clone())
+        }
+        _ => unreachable!(),
+    };
+    Ok(with_shelf_completion(&root, before, mutation, result))
 }
 
 pub(crate) fn transfer_pages_between_books_at(
@@ -4389,6 +4500,49 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(root.join("old"), root.join("new"))]
         );
+    }
+
+    #[test]
+    fn section1683_case_only_management_rename_preserves_order_and_page_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("books");
+        fs::create_dir_all(root.join("Old")).unwrap();
+        fs::create_dir_all(root.join("A")).unwrap();
+        fs::write(root.join("Old/0001_page.jpg"), b"original").unwrap();
+        let snapshot = crate::book_order::read_snapshot(&root).unwrap();
+        crate::book_order::write_order(
+            &root,
+            snapshot.token().unwrap(),
+            &crate::book_order::BookOrderPolicy::Manual(vec!["Old".into(), "A".into()]),
+        )
+        .unwrap();
+        let before = crate::book_order::read_snapshot(&root);
+        let result = rename_book_at(&temp.path().join("data"), &root, "Old", "old").unwrap();
+        assert!(matches!(result, BookOpResult::Renamed { .. }));
+        let completion = crate::book_order::finish_mutation(
+            &root,
+            before,
+            crate::book_order::BookShelfMutation::Renamed {
+                old_name: "Old".into(),
+                new_name: "old".into(),
+            },
+        );
+        assert!(completion.warning.is_none(), "{:?}", completion.warning);
+        assert_eq!(
+            completion
+                .snapshot
+                .unwrap()
+                .rows
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["old", "A"]
+        );
+        assert_eq!(
+            fs::read(root.join("old/0001_page.jpg")).unwrap(),
+            b"original"
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
     }
     #[test]
     fn qualified_append_filters_latest_hidden_preserves_selection_order_and_dense_numbering() {

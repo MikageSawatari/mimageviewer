@@ -1249,6 +1249,7 @@ mod tests {
             if busy {
                 let (_tx, rx) = mpsc::channel();
                 app.book_op_pending = Some(crate::books::BookOpPending {
+                    shelf_scope: None,
                     rx,
                     intent: crate::books::BookOpIntent::UndoAppend { receipt },
                 });

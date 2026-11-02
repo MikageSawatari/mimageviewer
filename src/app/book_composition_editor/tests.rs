@@ -109,6 +109,7 @@ fn section1373_composition_save_remove_admission_rejects_busy_without_mutation()
             if busy == 1 {
                 let (_tx, rx) = mpsc::channel();
                 f.app.book_op_pending = Some(crate::books::BookOpPending {
+                    shelf_scope: None,
                     rx,
                     intent: crate::books::BookOpIntent::UndoAppend { receipt },
                 });
@@ -127,7 +128,11 @@ fn section1373_composition_save_remove_admission_rejects_busy_without_mutation()
                         observations: Default::default(),
                     }
                 };
-                f.app.book_op_pending = Some(crate::books::BookOpPending { rx, intent });
+                f.app.book_op_pending = Some(crate::books::BookOpPending {
+                    shelf_scope: None,
+                    rx,
+                    intent,
+                });
             }
             let revision = f.app.book_append_undo_revision;
             f.app.save_local_composition_editor(&ctx, remove);

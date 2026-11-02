@@ -2431,6 +2431,11 @@ impl App {
     pub(crate) fn install_preferences_settings(&mut self, mut settings: Settings) {
         // This is the accepted boundary, before executor reconfiguration,
         // reader-policy changes, settings replacement, or index submission.
+        let books_root_changed = self.settings.books_root_path() != settings.books_root_path();
+        if books_root_changed && self.book_order_saving() {
+            self.show_feedback_warning("本の順序を保存中は本棚フォルダを変更できません".into());
+            return;
+        }
         if preferences_change_book_append_write_settings(&self.settings, &settings)
             && !self.admit_book_append_followup_mutation()
         {
@@ -2464,7 +2469,6 @@ impl App {
         let thumbnail_media_requirements_changed = self.settings.thumb_show_media_duration
             != settings.thumb_show_media_duration
             || self.settings.thumb_show_resume_meter != settings.thumb_show_resume_meter;
-        let books_root_changed = self.settings.books_root_path() != settings.books_root_path();
         // Fit mode is shared across contexts. End the selected continuous unit
         // at the setting boundary, including parked owners that will not draw
         // between a mode exit and a later re-entry.
@@ -2502,6 +2506,7 @@ impl App {
             self.invalidate_details_meta_requirements();
         }
         if books_root_changed {
+            self.book_shelf_root_changed();
             self.sync_shared_favorite_indexers();
         }
     }
@@ -4420,11 +4425,13 @@ mod tests {
     fn section1373_preferences_root_change_expires_receipt_but_same_root_and_appearance_do_not() {
         let mut app = crate::app::setup_app_for_test();
         app.book_append_undo_receipt = Some(preferences_append_receipt(&app));
+        let shelf_scope = app.shelf_scope();
         let revision = app.book_append_undo_revision;
         let mut same = app.settings.clone();
         same.book_root = Some(app.settings.books_root_path());
         same.show_toolbar_bookshelf = !same.show_toolbar_bookshelf;
         app.install_preferences_settings(same);
+        assert!(app.shelf_scope_current(&shelf_scope));
         assert_eq!(app.book_append_undo_revision, revision);
         assert!(app.book_append_undo_receipt.is_some());
 
@@ -4432,6 +4439,7 @@ mod tests {
         let new_root = app.tmp.path().join("new-preferences-books");
         changed.book_root = Some(new_root.clone());
         app.install_preferences_settings(changed);
+        assert!(!app.shelf_scope_current(&shelf_scope));
         assert_eq!(app.settings.books_root_path(), new_root);
         assert_eq!(app.book_append_undo_revision, revision + 1);
         assert!(app.book_append_undo_receipt.is_none());
@@ -4446,6 +4454,7 @@ mod tests {
             let (_tx, rx) = std::sync::mpsc::channel();
             app.book_op_pending = Some(crate::books::BookOpPending {
                 rx,
+                shelf_scope: None,
                 intent: if undo_pending {
                     crate::books::BookOpIntent::UndoAppend { receipt }
                 } else {

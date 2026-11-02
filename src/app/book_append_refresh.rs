@@ -383,7 +383,15 @@ impl App {
                         accepted_revision: operation.accepted_revision,
                     });
         }
-        if let Some(rows) = self.book_list_cache.as_mut() {
+        if let Some(shelf) = summary.shelf.take() {
+            let scope = self
+                .book_op_pending
+                .as_ref()
+                .and_then(|pending| pending.shelf_scope.clone());
+            self.adopt_book_shelf_completion(shelf, scope.as_ref());
+        } else if self.pending_book_shelf_current()
+            && let Some(rows) = self.book_shelf.snapshot.as_mut()
+        {
             crate::books::apply_append_to_cached_list(
                 rows,
                 &summary.book_name,
@@ -644,6 +652,7 @@ mod tests {
         };
         app.current_folder = Some(folder.clone());
         let summary = BookAppendSummary {
+            shelf: None,
             book_name: "book".into(),
             folder,
             added: 1,
@@ -665,6 +674,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.book_op_pending = Some(BookOpPending {
             rx,
+            shelf_scope: None,
             intent: BookOpIntent::Append {
                 operation_id: receipt.operation_id,
                 source_context: receipt.source_context,
@@ -674,6 +684,41 @@ mod tests {
             },
         });
         tx
+    }
+
+    #[test]
+    fn book_shelf_old_root_append_keeps_viewer_terminal_without_patching_current_counts() {
+        for return_to_original_root in [false, true] {
+            let (mut app, receipt, summary) = fixture();
+            let original_root = summary.folder.parent().unwrap().to_path_buf();
+            app.settings.book_root = Some(original_root.clone());
+            let scope = app.shelf_scope();
+            let _tx = hold(&mut app, &receipt);
+            app.book_op_pending.as_mut().unwrap().shelf_scope = Some(scope);
+            app.settings.book_root = Some(app.tmp.path().join("other-shelf"));
+            app.book_shelf_root_changed();
+            if return_to_original_root {
+                app.settings.book_root = Some(original_root);
+                app.book_shelf_root_changed();
+            }
+            app.book_shelf.snapshot = Some(
+                vec![crate::books::BookInfo {
+                    name: summary.book_name.clone(),
+                    path: summary.folder.clone(),
+                    page_count: 9,
+                }]
+                .into(),
+            );
+            // The originating viewer still receives its valid receipt; only
+            // the App-global shelf projection belongs to the newer selection.
+            app.current_folder = None;
+            assert!(!app.finish_book_append_terminal(&egui::Context::default(), summary, None,));
+            assert_eq!(app.book_shelf.snapshot.as_ref().unwrap()[0].page_count, 9);
+            assert_eq!(
+                app.book_append_undo_receipt.as_ref().unwrap().operation(),
+                receipt.operation(),
+            );
+        }
     }
 
     fn scan(folder: &Path) -> ScannedDir {

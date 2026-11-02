@@ -1,7 +1,7 @@
 # 本棚の本の並び順 — §1.683 改訂設計
 
 作成: 2026-11-02。対象: v5。調査基点: `c728cd613`、worktree / branch: `mimageviewer-booksort-1683` / `booksort-1683`。
-改訂: 2026-11-02。前案 `b48af3b9f` を同日の利用者決定に合わせて更新した。**§12 の利用者仕様は決定済み。改訂設計の ClaudeCode 受入・製品実装は未実施。製品コードは未変更、製品は起動していない。**
+改訂: 2026-11-02。前案 `b48af3b9f` を同日の利用者決定に合わせて更新した。**§12 の利用者仕様・設計受入に基づき実装済み。独立実装レビューは修正後ACCEPT。自動検証・確認用buildの最終結果は§13に記録する。製品起動・commitは行わない（設計担当がcommitする）。**
 
 ## 1. 範囲と採用する仕様
 
@@ -196,7 +196,7 @@
 ### 6.1 所有・即時表示・保存完了の契約
 
 - `Option<Vec<BookInfo>>` を、**root identity・root選択epoch・表示 revision・保存ポリシー・解決済み rows・読取 token**を一体にした snapshot へ整理する。viewer items の generation と共用しない。表示 snapshot と最後に保存が成功した基点を区別し、方式だけでは読取異常を表現しない（読取異常時の名前順は保存可能な `Name` ではない）。
-- read/write の受付と receiver は本棚の単一 owner に集約する。型付き phase は通常の読込/Ready、`Saving { 表示snapshot, 送信済み要求, 最新desired一件, 保存基点, lease }`、`Unsaved { 表示snapshot, 保存基点, 警告 }`、`ReadOnlyName { 名前順snapshot, 読取エラー }` 相当とする。これは契約の例であり、既存 `book_op_pending` / `BookStructuralOp` と別の pending/bool 群を並立させない。保存済み基点と表示が同じかの判定は **mode と rows の両方**を見る。
+- read/write の受付と receiver は本棚の単一 owner に集約する。型付き phase は通常の読込/Ready、`Saving { 表示snapshot, 送信済み要求, 最新desired一件, 保存基点, lease }`、`Unsaved { 表示snapshot, 保存基点, 警告 }`、`ReadOnlyName { 名前順snapshot, 読取エラー }`、全件列挙失敗の`ReadFailed`相当とする。これは契約の例であり、既存 `book_op_pending` / `BookStructuralOp` と別の pending/bool 群を並立させない。保存済み基点と表示が同じかの判定は **mode と rows の両方**を見る。
 - 最初の順操作は、Append/Undo/List/構造操作/未完了の本 open、`rename_pending`、`delete_pending`、`FileOrganizeRequest::Running` と未採用完了がないことを確認し、`SessionHandle::try_local_modal_lease` を取得してから受理・即時表示する。取得できなければ表示を変更せず理由を通知。batch は最新 desired の成功、書込失敗、競合のいずれかで終端し lease を解放する。管理の表示期間全体にわたる長期 lease は取らない。
 - 一度に送信する書込は1件。UI は後続を最新値1件に置き換え、成功応答の request/root/epoch を検証してから次を送る。成功が表示 revision より古ければ**保存基点とファイル token だけを進める**。表示を戻さず、内容が異なる最新 desired を新 token に対して保存する。成功した送信済み要求と最新表示の mode+本identity順列が一致する場合は、最新表示 revision まで保存済みとして batch を終える（同内容を revision だけのために再送しない）。たとえば r1=[B,A] の書込中に r2=[A,B]→r3=[B,A] なら r1 成功で r3 も保存済みとする。一方 in-flight が最新と別内容なら、最後の保存済み列と最新が同じでも戻しの要求を落とさない。途中失敗/競合では未送信分を捨てて終端し、自動送信を続けない。
 - 即時順序writeの worker は読込時に捕捉した「ファイル欠落/正確な内容 digest」と直下実フォルダ名集合を、各書込の前と atomic replace の直前に照合する。mtime だけで判定しない。自身の成功で token を更新して次要求の基点にする。外部の追加/削除/改名/順ファイル変更を見つけたら書かず通常 reload へ（§5.2）。独立した他プロセスとの最後の照合～replace間を完全排他にする共有編集は保証しない。自動マージ、OS全体の長期lock、journal は足さない。製本workerの順保守では、自身が成功させた作成/改名/削除のFS差分を反映した期待集合を照合基点とし、自操作による集合変化を外部競合にしない。別の外部差分を検出した場合はFSを巻き戻さず、順保守の警告として通常resolverへ返す。
@@ -254,7 +254,7 @@
 
 ## 10. テスト・受入計画（実装時）
 
-今回は文書改訂だけ。以下は**実装時の未実行の受入条件**であり、今回 Rust build/test・製品起動・確認用 binary の作成はしない。
+以下は設計時に定めた受入条件。実装と非対話検証の結果は§13を参照。実アプリでの検証は実施していない。
 
 | 層 | 必須ケースと期待結果 |
 | --- | --- |
@@ -271,13 +271,13 @@
 | まれな失敗の代表例 | 初回/既存Manualの置換失敗で原本不変、PC表示のみ未保存・通知・後続自動送信なし。次の明示順操作/通常reloadの契約を検査。warm/coldの壊れたJSON/読取失敗/未知版/上限超過は**名前順表示 + 全順序writer停止**（上下/今の順を固定/復帰/構造操作の保守）、本の既存操作は継続。FS成功後の順保存失敗はFS成功+警告、旧列と照合。回復経路の多重障害行列は作らない |
 | UI snapshot / geometry | 現行`book_manager_numbered_dark`更新、light追加。Name/Manual/保存中/未保存/読取異常、0/1/6/21冊/多数、長名、1093×614、倍率100%/200%。矢印の列と端無効、最終行/方式ボタン/×への到達、折返しとscrollbar重なりを矩形/scroll helperでも検査。ドラッグ用state/カーソルを新設していないことを検査 |
 
-実装担当は狭い `scripts/test-focused.ps1` または明示filterで books / saved_group / book_append / structural と新しいwriter/handler試験を実行し、fmt・UI glyph・通常/portable checkへ進む。共有状態と入力に触れるため最終 `scripts/test-full.ps1` gateを行う。検証台帳にはsource/条件/結果を残し、独立reviewerは同じsourceの成功証拠を再利用してfullを重複実行しない。
+実装担当は狭い `scripts/test-focused.ps1` または明示filterで books / saved_group / book_append / structural と新しいwriter/handler試験を実行する。今回の実装依頼で指定された最終gateはfmt・UI glyph・`cargo check -p mimageviewer --lib --tests`・UI snapshot・`scripts/test-lib-full.ps1`を1回とし、失敗項目は単独3回確認する（設計時のworkspace全体gateから、利用者の最新指示に合わせて限定）。検証台帳にはsource/条件/結果を残し、独立reviewerは同じsourceの成功証拠を再利用して全件を重複実行しない。
 
 製品修正完了時は `scripts/build-dev.ps1` で利用者確認用binaryを用意する。実機確認は管理内上下の連打/閉じ開き/再起動/名前順復帰/番号/pin/追加改名削除/root/複数窓の短いsuiteを計画し、所要時間・desktop入力・使い捨てデータを示して別途明示承認を得る。エージェント起動は `prepare-portable-smoke.ps1` の隔離portableのみ。今回の設計改訂は実行承認を含まず、通常profileの製品は起動しない。
 
 ## 11. 実装へ渡す単位と現時点の記録
 
-利用者への仕様質問は完了。ClaudeCodeは以下の改訂契約を受入後、各単位のwriter/検証担当をbriefで一度だけ指定する。製品コードの変更・実装コミットはこの改訂作業には含めない。**本worktreeの文書コミットは設計担当が行う。**
+設計改訂時の引継ぎ単位を以下に保持する。今回の実装依頼はこれらを一括で進める指示であり、実装結果は§13へ記録する。**本worktreeのcommitは設計担当が行う。**
 
 1. **保存層と互換性**: `books`/新規`book_order`の純粋resolver、version1 JSON/16MiB/原子的置換、missingとUnreadableの区別、Name表示+書込停止、旧tag fixtureをまとめる。既存本/設定schemaを変えない。
 2. **共通ownerと即時保存**: Appのroot/epoch付きsnapshot・単一read/write受付、表示revision・送信済み+最新1件のwriter、token/フォルダ集合照合、close再open/通常終了/leaseを接続する。連打・逆操作・失敗・外部競合を決定的channelで先に検証する。独立reviewはこの所有設計自体を確認する。
@@ -285,7 +285,7 @@
 4. **既存managerへUIを接続し文書更新**: 各行↑↓、見出しの方式/今の順を固定/名前順に戻す、保存中/未保存/読取異常の表示。headless handler/snapshot/geometry/IMEを検査し、§9の仕様・公開説明を同時更新する。専用editor/保存/キャンセルを実装しない。
 5. **完成単位の独立review・最終gate・確認build**: §10を満たす証拠を揃えてClaudeCode受入へ渡す。実機確認は別の承認された検証枠で行い、今回実施済みとは記録しない。
 
-段階はレビュー可能な実装順であり、部分的な機能を出荷する方針ではない。今回の変更対象は**本書のみ**。元コミットに含まれたbacklog記述は前回調査の記録で、今回の改訂による製品実装完了を意味しない。
+段階はレビュー可能な実装順であり、部分的な機能を出荷する方針ではない。設計改訂時の変更は本書だけだった。今回は製品コード・テスト・関連文書も変更し、backlogの状態を検証結果と合わせて更新する。
 
 ### 11.1 前案の独立設計レビュー（履歴、2026-11-02）
 
@@ -306,3 +306,81 @@
 5. **改名の位置保持 — 決定 (2026-11-02)**: **推奨どおり、「製本の管理」での改名は位置を保持。外部/v4/汎用改名は旧名削除+未知末尾**。既存の大小文字一意照合以外に安定ID/改名推定を追加しない。
 6. **名前順への復帰 — 決定 (2026-11-02)**: **初版から「名前順に戻す」を用意**。利用者の確定方法の決定に合わせ、管理見出しのボタンを押して即時反映・自動保存。一括「保存」での確定という前案部分は撤回。確認画面なし、失敗も同じ規則。
 7. **旧版往復 — 決定 (2026-11-02)**: **推奨どおり、本棚データの互換を保証し、v4/v5は別profileで同じ本棚を使う**。v4は手動順ファイルを無視して従来の名前順、v5へ戻れば保存順+未知末尾。既存settingsの新版保護gateを解除せず、同じsettings DBの往復は保証しない。
+8. **固定ボタン — 決定 (2026-11-02)**: 「いつも管理の順にそろえる」。順序保存なし・保存済みNameでも管理の名前順、Manualは管理の手動順。既存利用者の固定登録順が変わることは了承済み。`pinned_books`は集合としてのみ使い、既存保存形式を変えない。
+
+
+## 13. 実装記録（2026-11-02）
+
+一覧・番号・固定・Remote・Append差分の経路は設計と一致。Windowsの管理改名は既存の宛先存在検査が大小文字だけの改名も拒否し、journalも同じ制約を持つ。§4の要求を満たすため、同じworker/journalの二段階改名へ接続し、元名から最終名のmetadata引継ぎを保つ。既存保存形式は変更しない。
+
+§7・§12の固定表示は利用者の追加決定「いつも管理の順にそろえる」に従う。固定vectorは集合としてだけ扱う。
+
+### 13.1 独立レビュー中の補正
+
+- 保存中に管理を閉じると共通modalが通常menu/toolbarを止めるため、その期間だけ「保存中… / 管理を開く」の小さな再表示入口を描く。表示flagだけを戻し、通常再読込・保存ownerの再作成は行わない。
+- rootの存在観測を`RootPresence::Missing/Existing`でsnapshot/tokenへ保持。再読込workerへ既知Existingを渡し、消失を空一覧として採らない。保存前と置換直前も照合し、既存空rootの消失を黙って再作成しない。
+- coldのルート/ページ列挙失敗は`ReadFailed`で終端する。自動描画入口は再送せず、明示open/更新/番号入力だけが通常読込を一度開始できる。warmの前回一覧は保持する。周期的なI/O・通知を作らない。
+- 通常終了はroot lifecycleへ独立したdeferred受付を接続し、受理済み最新要求が成功/失敗で終端してから継続する。既存の他ownerのtray規則を変更しない。
+- 構造操作の完成snapshotで包む際も、本内transferのsource_entries採用を先に維持し、順保守の列挙失敗なら前回の完成一覧を残す。
+
+小画面の管理Windowは実viewportから外寸を制約し、固定の本棚path/追加先名は1行省略＋全文hoverとする。本文の名前編集は維持する。仮想行は実button galleyとTextEditの行高・折返し行数から計算し、各行をphysical pixel、次にeguiのGUI gridへ切上げてslotを作る。行の描画前に`set_min_height`で実slotも予約し、自然高・隣接行step・末尾の到達性を検査する。これは空本文やclipを余白追加・判定緩和で隠さないための実装補正であり、行drag/新規shortcutは追加しない。
+
+行内操作のIDを本identityへ固定し、上下操作では移動先の行を組込scroll要求で追う。仮想表示から外れる前に反映するため、このScrollAreaだけ`animated(false)`とする（組込`scroll_to_*`要求の補間にのみ作用し、wheel/drag入力の挙動は維持）。実Enter連続入力で追従を検査する。最初の保存で状態行が増えて下端のボタンを押し出す境界も実証できたため、短い保存/読込/未保存表示は既存操作行内に同寸法の枠を常時予約する。長い読取異常警告は別行を保つ。App側のpending scrollやoffset補正stateは追加しない。
+
+最終の独立source再確認もACCEPT。既存のWindowDrag::Anywhereを維持し、root/owner・UIの未解決P1/P2なし。最新ASTの非対話実行結果は後段へ記録する。
+
+### 13.2 担当・検証条件
+
+実装は保存/lifecycle・App共通owner・UIにファイル所有を分け、別contextの`gpt-6.1-sol`/`xhigh`が設計と実装を独立確認した。§13.1の修正後ACCEPT、未解決P1/P2なし。レビュー担当はCargoを再実行せず、下記の実装担当の結果を利用する。実装依頼の指定に従い、最終本体lib全件gateは`test-lib-full.ps1`を1回、失敗項目は単独3回で確認する。製品は起動しない。
+
+ビルド条件は`MSBUILDDISABLENODEREUSE=1`。初回cold checkのTurboJPEG CMake並列MSBuildがexit1となったため、同じ生成済みINSTALL.vcxprojを`/m:1 /nr:false`で構築し成功、後続checkは通常Cargoへ戻した。依存ソース・ビルド仕様の変更なし。
+
+### 13.3 焦点検証の途中記録
+
+- `cargo check -p mimageviewer --lib --tests`: exit0（`target/section1683-check-final.log`）。この後のUI調整・ReadFailed追加を含む最終sourceでは、後段のgateでも再確認する。
+- UI検証用にCargoが生成したlibtest（`target/debug/deps/mimageviewer-93f10f9ef4ffb6a0.exe`）へ明示filterを渡し、独立な保存/owner経路を先行検証した。以後その製品経路は変更せず、UI配置だけを調整している。全件gateは最終sourceで別に行う。
+- `books::`57件、`book_order::tests`21件、`app::book_append`39件、`app::book_structural_op`14件、`app::saved_group_actions`19件、Remote本棚1件、keymap本番号1件がすべてexit0。ログは`target/section1683-{books,storage,append,structural,number,remote,keymap}-precheck.log`。
+- `app::book_shelf_tests`は13成功/1失敗。失敗は終了継続のheadless試験が未適用の`TexturesDelta`を捨てていたテスト側の不備で、既存lifecycle helperと同じ明示clearへ修正した。修正した当該1件は単独3回とも成功（`target/section1683-quit-{1,2,3}.log`）。製品の終了処理変更は不要だった。
+- 旧版reader fixture、順序ファイル/通常tempの除外、実本棚の移動/全体コピー/本だけコピー、大小文字のみの管理改名は上記保存/本の試験に含む。旧版exeや旧設定writerそのものは起動していない。
+- UI geometryは最小scroll高64による4pt overflow、狭い初期Windowによる本文0高、分数行高による最終矢印0.1ptクリップを検出し、宣言領域/実領域を直した。既定ppp1の全matrixは一度成功（15.35秒）。追加レビューで固定headerの長文制限、実ppp、仮想slotの実予約も補い、最終sourceで再検証中。判定の許容緩和は行わない。
+- 状態表示の固定枠を含む完成sourceの管理UI回帰8件がすべて成功（11.50秒、`target/section1683-ui-lib-complete.log`）。実Enterの連続移動、初回保存時のviewport不変、分数ppp1.25/1.5/2と長名/深いroot、狭い表示での全操作到達性を含む。失敗履歴のある境界の単独再確認とPNG検査は別途記録する。
+
+テスト用native graphでも並列24のCMakeが停止したため、`CARGO_BUILD_JOBS=1`で成功させた。以降の検証/buildも同じ条件とする。nextestの実行並列数やretry条件は変更しない。
+
+### 13.4 完成sourceの非対話検証
+
+対象は`booksort-1683` / `7a7b4a125`上の未commit差分。製品コード・test・fixtureは最終UI補正後に固定し、以下の検証中は変更していない。独立sourceレビューは修正後ACCEPT、未解決P1/P2なし。文書の結果追記は製品挙動を変えない。
+
+| 検証 | 結果 |
+| --- | --- |
+| `cargo fmt` / `cargo fmt --check` | 成功 |
+| `cargo check -p mimageviewer --lib --tests` | 成功、2分46秒。`target/section1683-check-complete.log` |
+| UI glyph / site cards | 危険glyphなし、49 cards・超過0 |
+| 管理UIのheadless回帰 | 8件成功、11.50秒。標準geometry100条件、実ppp+長名6条件、focus/close再表示/pinを含む |
+| UIの失敗履歴4項目 | geometry/分数ppp/連続Enter/初回保存を各単独3回、12/12成功。`target/section1683-ui-alone3-summary.log` |
+| 管理Window integration | 6件成功（5PNG更新＋12条件の×/方式ボタン到達性） |
+| `cargo test --test ui_snapshot` | 更新modeを外した通常比較で224/224成功、49.21秒。`target/section1683-ui-snapshots-full.log` |
+| PNG目視 | 代表5枚すべて確認、428,180 bytes。名前/寸法/QAは[UI snapshot方針](ui-snapshot-policy.md) |
+| `scripts/test-lib-full.ps1` | 指定どおり1回だけ実行、exit1。15,534成功・7失敗・71 skip、1,382.192秒。成功gateとして扱わない |
+| `scripts/build-dev.ps1 -PreserveRuntime` | exit0。通常機能・portable無効。core 53分48秒、Remote 3分13秒、EPUB worker 2分03秒。DLL/VST bundle配置とPE依存検査成功（runtime 4 / PE 3） |
+| 差分・文字コード | `git diff --check`成功。変更/新規テキスト37件はUTF-8、BOM/NUL/新規の置換文字なし。既存indexのCSSコメント内の置換文字はHEADと同一で、本件では変更しない |
+
+全件実行のsource識別子は`05c263586cad68dbfe17ade7fab78ed2d9c8317c60639eb5911118ce9f311c97`。command・stderr/stdout・JUnitは`target/test-lib-full/runs/20261102T122428803Z-089d7fdc/`。成功receiptは作られていない。workspace全体の`test-full.ps1`は最新の実装依頼の指定対象外として実行していない。
+
+全件で失敗した7項目を、同じ製品source・feature/profile・期待値・時間制限のまま、選択だけ1件に限定して各3回実行し、**21/21成功**。既存`New-MivTestRun` / `Invoke-MivNextest`で通常profileを継承し、retryは0のまま。ログ/JUnitは`target/section1683-isolated/runs/`、各command/exit/秒数の索引は`target/section1683-isolated-summary.json`。
+
+| 全件での失敗項目 | 単独再確認（秒、nextest summary） |
+| --- | --- |
+| `app::tests::history_parent_1473::section1473_other_synthetic_roots_parent_inventory` | 3/3成功、60.695 / 44.069 / 43.684 |
+| `app::tests::smart_folder_transition_tests::no_resident_smart_pdf_missing_root_row_rolls_back_history` | 3/3成功、2.422 / 2.338 / 2.322 |
+| `log_writer::tests::rotation_stall_and_snapshot_handle_preserve_saved_prefix` | 3/3成功、0.311 / 0.283 / 0.291 |
+| `remote_ipc::raw_prefetch::tests::pending_retries_actual_admission_when_capacity_freed_before_pending_record` | 3/3成功、0.210 / 0.224 / 0.212 |
+| `ui_adjustment_panel::local_adjust_segmentation_tests::full_mask_with_large_subtract_preview_completes_quickly` | 3/3成功、0.174 / 0.172 / 0.179 |
+| `ui_fullscreen::page_turn::draw_submit_tests::page_turn_mainwindow_submits_visible_vacant_leaf_both_directions` | 3/3成功、2.973 / 3.135 / 3.067 |
+| `app::folder_scan::section1375_scan_perf_tests::section1375_large_physical_scan_10k_100k` | 3/3成功、109.107 / 149.148 / 487.365 |
+
+独立した限定source調査では、大規模走査はAppを生成せず新しい本棚ownerへ到達しない。Smartの欠落行検査も本棚read/writeを始めない。履歴inventoryはtoolbarから本棚readへ到達する接点があるが、全件失敗時のログは本棚case到達前のCollectionで終わっていた。これは到達関係の証拠であり、負荷などの原因確定ではない。大規模走査の600秒超過はfixture作成/片付けを含むtest全体であり、100kのscan処理自体が600秒かかったとは記録しない。単独で再現しなかった事実と全件実行の失敗を分け、期待値やtimeoutの緩和・新ignore・自動retry・無関係な製品修正は行わない。
+
+確認用buildは単独再確認完了後に成功。成果物は`target/dev-runtime/mimageviewer-core.exe`（339,713,024 bytes）、`mimageviewer-remote.exe`（14,836,224 bytes）、`mimageviewer-epub-pdf.exe`（5,094,400 bytes）。command/条件/exitと各SHA-256は`target/section1683-verification-build.json`、script出力は`target/section1683-build-dev.log`、PE検査は`target/vcrt-pe-reports/dev-runtime.json`へ記録した。並列数切替のためのビルド停止は権限拒否で実行されず、最初の単一job実行がそのまま完了した。製品起動・実IME/実機操作・commitは未実施。
+
+利用者がこのworktreeで確認する際の起動commandは`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。既定で通常の`%APPDATA%\mimageviewer`を使用し、実際の設定/データを更新しうる。single-instance mutexを共有するため、インストール済み/トレイ常駐のmImageViewerを先に終了する。管理内↑↓の連打、保存中の閉じ開き、番号/固定の一致、名前順復帰、再起動後の保存順を実機確認として設計担当/利用者へ引き継ぐ。

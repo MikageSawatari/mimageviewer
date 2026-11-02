@@ -2660,6 +2660,7 @@ mod local_adjust_canvas_edit_contract_tests {
         let receipt = seam_append_receipt(app);
         let (_tx, rx) = std::sync::mpsc::channel();
         app.book_op_pending = Some(crate::books::BookOpPending {
+            shelf_scope: None,
             rx,
             intent: crate::books::BookOpIntent::UndoAppend { receipt },
         });

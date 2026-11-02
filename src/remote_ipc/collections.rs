@@ -1695,6 +1695,56 @@ mod tests {
     use crate::settings::FavoriteEntry;
 
     #[test]
+    fn bookshelf_uses_shared_management_order_for_missing_manual_name_and_unreadable_file() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let root = data.path().join("shelf-order");
+        for name in ["A", "B", "C"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let settings = Settings {
+            book_root: Some(root.clone()),
+            ..Default::default()
+        };
+        let engine = CollectionEngine::new(settings.clone());
+        let read_names = || {
+            engine
+                .bookshelf(
+                    &settings,
+                    crate::settings::SortOrder::DateDesc,
+                    CollectionSpreadRequest::default(),
+                )
+                .unwrap()
+                .entries
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(read_names(), ["A", "B", "C"]);
+        let snapshot = crate::book_order::read_snapshot(&root).unwrap();
+        crate::book_order::write_order(
+            &root,
+            snapshot.token().unwrap(),
+            &crate::book_order::BookOrderPolicy::Manual(vec!["C".into(), "B".into(), "A".into()]),
+        )
+        .unwrap();
+        assert_eq!(read_names(), ["C", "B", "A"]);
+        let snapshot = crate::book_order::read_snapshot(&root).unwrap();
+        crate::book_order::write_order(
+            &root,
+            snapshot.token().unwrap(),
+            &crate::book_order::BookOrderPolicy::Name,
+        )
+        .unwrap();
+        assert_eq!(read_names(), ["A", "B", "C"]);
+        std::fs::write(root.join(crate::book_order::ORDER_FILE_NAME), b"broken").unwrap();
+        assert_eq!(read_names(), ["A", "B", "C"]);
+        assert_eq!(
+            std::fs::read(root.join(crate::book_order::ORDER_FILE_NAME)).unwrap(),
+            b"broken"
+        );
+    }
+
+    #[test]
     fn g1_rating_and_smart_handlers_start_single_and_accept_only_temporary_mode() {
         let _data = crate::data_dir::TestDataDirGuard::new();
         let _ratings =
