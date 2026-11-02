@@ -675,6 +675,18 @@ mainの成功したitems置換とQuick Folder切替で退役し、遅延結果�
 
 ## 1. ワーカー一覧
 
+### フォルダツリーの再照合（§1.686）
+
+`App::folder_pane` はmain chrome所有で、ViewerContextBundleのswap/fork対象外。
+一覧の`poll_external_rescan`は既存proofを通った`accepted_now`のEqual/Differentだけ、捕捉したmain identityと実folder pathをpaneへ通知する。defer/失敗/stale/非mainは通知しない。
+nodeは成功cacheと排他的な走査状態を持ち、private Receiverの寿命で応答を相関する。走査中の通知はFollowUp一件に合流し、旧完了を捨てて次を一度実行する。
+選択rootと到達できる展開parentの参加/離脱、同一drive実選択、pane/main再表示、options変更は同じ需要経路へ入る。表示中断は実main chrome描画有無とROOT可視状態から導き、pane走査だけを取消・未確認化する。監視session/ticket/lease/command channel、周期scan、UI待ちは追加しない。
+完全scanはentry/file_type/分類失敗・取消を成功にせず、hidden除外前membershipをworkerで準備する。親成功の子孫整理はcomponent境界で行い、消失枝のprivate応答を失効させる。旧cache/退役payloadのdropは既存rayonへ渡す。詳細と検証は[更新設計](folder-tree-refresh-plan.md#10-設計レビュー検証記録)。
+
+| ワーカー | 所有・通信 | 責務 |
+| --- | --- | --- |
+| `folder-pane-scan` | pane nodeごとのprivate mpsc/cancel、1 pump開始4件・採用4件まで | 実directory直下列挙・分類・hidden投影・6sort・membershipをworkerで確定。Queued残存中もUIは各passで短いrepaintを要求。需要離脱/options/reload/表示中断/Dropで取消し、UIはjoinしない。失敗は旧cache+row警告+logで終端し、同表示機会のretryをしない |
+
 ### コレクション一覧の遅延catalog（§1.668、案C、2026-11-01）
 
 追加threadなし。既存generic poolが `ThumbnailCatalogProvider` のFixedCatalogまたは
