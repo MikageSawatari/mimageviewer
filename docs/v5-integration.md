@@ -523,3 +523,13 @@ reparse point 0と確認してNTFS圧縮（ファイル内容保持、削除0）
 - 追加: §1.686 左ツリーの外部変更への追従、§1.684 フォルダバーで引用符付きパス、§1.683 製本の並び順、ローカル AI 説明文 (`docs/local-vlm-caption-plan.md`)。
 - 進め方: §1.686・§1.684・§1.683 は v4 のコードだけで完結するので、master から作業ブランチを切って master へ入れ、master → v5-integration の取り込みで v5 に入れる (v5 の build は正式 Sound 候補が揃うまで通常データで起動できず、実機確認を master の build-dev で頼むため)。master から v4 系の追加リリースは予定しない (2026-11-02 利用者方針)。ローカル AI 説明文は MCP 担当のセッションが mcp-trial で進め、v5-integration へ取り込む。
 - 追加 (2026-11-02 利用者要望): mIV Sound の Visualizer に「mIV Original」プリセットを足し、初めて開いたときの表示を Visualizer のこのプリセットにする。内容はタイトル・サムネイル (title / artist / album / artwork)、歌詞があれば歌詞 (lyrics)、スペクトラム (spectrum)、Harmony Lab プリセットの左側の鍵盤と音階が縦に流れる表示 (notes)。既存の部品の組み合わせで、デザインは利用者と相談しながら別セッションで作る。G:\home\miv-sound のソースが変わるので、正式候補は作り直し、承認はプリセット完成後に 1 回にまとめる (今の候補 195326d4… はサブ PC の依頼 4 で確認だけ行う)。既存利用者の保存済みの表示選択は上書きしない。
+
+## 7. mIV Sound 候補 195326d4… のサブ PC 確認 (依頼 4、2026-11-02)
+
+観測者はサブ PC 担当 (記録 `C:\miv-subpc\results-4\`)。ビルドは v5-integration `18f936216` の dev-runtime に候補を `build-dev.ps1 -MivSoundCandidate` で入れたもの、隔離 data-dir。音は聞いておらず、ビープとの比較は HUD の時刻 (1 秒単位)・シークバー・メーターで代用。
+
+- 期待どおり: 名称・ロゴ・クレジット (「mIV Sound version 0.15.0-miv.1 … Based on EffeTune / EffeTune Mixwright by Frieve」)、エフェクトの効き (Mute と Level Meter で確認)、歌詞の同期 (1.0 倍・一時停止と再開・シークバーと ← → ・0.5 倍 / 2 倍・曲の切り替えで前の曲の歌詞が出ない)、文字コード (Shift_JIS)・埋め込み歌詞 (mp3 / m4a)・時刻なし歌詞・歌詞なし、歌詞行のクリックで位置が飛ばない、Lyric Stage (Counter なし)。WebView2 のダイアログ・panic なし。
+- C7 (動画の秒数が約 2 秒大きい) は素材の問題: `beep-video.mp4` の pts 0 の画面に元から「2.000000」と描かれている (設計担当が ffmpeg で確認)。mIV の不具合ではない。
+- **C6 (要調査)**: 再生画面から Backspace で一覧へ戻ると、音は続いているのに Visualizer の曲名・歌詞が消え、音響調整を開き直しても出ない。再生画面へ戻して再生すると正しく出る。Local の所有者が一覧への退出で clear される経路の疑い (「EOF 後の W で戻らない」件と同じ種類)。v4.11.0 (Mixwright) で曲名が同じく消えるかは未確認。
+- **A1 (要調査)**: mIV を最大化した状態で mIV Sound の窓が後ろに回ると、音響調整のボタンを 3 回押しても前に出ない (窓は可視のまま)。初回は 2 回目で前に出た。設計 (effetune-integration-plan §17.12「表示・前面化」) と異なる。v4.11.0 でも起きるかは未確認。
+- 承認は「mIV Original」プリセットを入れた候補で 1 回にまとめる方針 (§6) なので、この候補は承認しない。
