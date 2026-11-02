@@ -983,8 +983,17 @@ PDFium worker と同じくパイプにそのまま流して足りる。共有メ
 - **worker の起動**: EPUB worker と同じく `CreateProcessW` (suspended・`CREATE_NO_WINDOW`) → Job Object (kill-on-close) に入れる → resume。
   stdin・stdout は匿名パイプ (親側は継承させない)、stderr はログへ流す。EPUB と同じ処理を 2 か所に書かず、Job Object 付きの起動を
   1 つの helper にまとめて両方が使う (EPUB の挙動は変えない)。親が落ちれば Job Object で worker も終わる。
-- **枠**: u32 little-endian の長さ + 中身。`pdf_loader` の `write_msg` / `read_msg` と同じ形 (共通にできるなら同じ関数を使う)。上限 16MiB。
-  中身は「JSON の頭 + 必要なら binary」。
+  - **子に渡すハンドルを、その子の標準入出力の端だけに限る** (独立レビュー 10 回目 P2-1)。今の EPUB は継承可能なパイプを作り、
+    `CreateProcessW` に `bInheritHandles = true` を渡している (`epub_convert.rs`)。この形のままだと、EPUB 変換と VLM の worker が同時に起動したとき、
+    互いの子側の端も継承し、片方の worker を止めても別の子が書き込み側を握っていて EOF が届かない。helper は
+    `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (`STARTUPINFOEX`) でその子の端だけを渡し、起動後は親に残った子側の端を閉じる。EPUB にも同じ helper を使う。
+- **枠** (独立レビュー 10 回目 P2-2 で中身の形を決めた): 外側は u32 little-endian の全体の長さ + 中身 (`pdf_loader` の `write_msg` / `read_msg` と同じ。
+  共通にできるなら同じ関数を使う)。中身は「u32 の JSON の長さ + UTF-8 の JSON + 残りのバイト列」。`caption` の残りのバイト列は、行を詰めた RGB8
+  (幅 × 高さ × 3 バイト、行の間に余白なし) で、長さが幅 × 高さ × 3 と一致しなければ不正。16MiB の上限は外側の全体の長さに当てる。
+  不正な枠 (長さの上限超え・JSON の不正・RGB の長さの不一致・知らない種類) は、受け取った側がその worker を終わらせる扱いにする (やりとりを続けない)。
+- **worker の標準入出力はバイトで扱う**: `--serve` では stdin・stdout を CRT の文字モードで扱わず、Win32 の `ReadFile` / `WriteFile` で読み書きする
+  (または `_setmode(_O_BINARY)`)。文字モードでは改行が変換され、RGB や長さが壊れる。stdout はやりとり専用にし、ログは stderr だけに出す
+  (llama.cpp・ggml のログの出力先も stderr に向ける)。
 - **やりとり** (どれも 1 往復、同時に 1 つだけ):
   - `hello` → 版 (`protocol_version`) と worker の source identity を返す。版が違えば使わない (VST3 と同じ)。
   - `load` (モデル・mmproj のパス、device の LUID、CPU スレッド数) → 読み込みにかかった時間と使った device。
@@ -996,6 +1005,15 @@ PDFium worker と同じくパイプにそのまま流して足りる。共有メ
 - **Rust 側の client** (`VlmWorkerClient`): 起動・`hello`・`load`・`caption`・終了を持つ。呼ぶのはジョブの worker スレッドだけで、UI スレッドからは
   呼ばない。時間の上限: `hello` 30 秒、`load` 120 秒、最初の `caption` 120 秒 (Vulkan の初回準備、§20)、2 件目以降 60 秒。上限を超えた・パイプが
   切れた・`fatal` が来たら、worker を終わらせて client は使えなくなる (再起動や再試行はしない。まれな失敗は割り切り)。
+- **待ちを解く仕組みと止め方** (独立レビュー 10 回目 P2-3)。パイプの読み書きは同期 I/O で期限を持たないので、次のようにする。
+  - パイプの読み書きは、client が持つ**書き手のスレッドと読み手のスレッド**だけが行う (TRT worker の reader と同じ形)。ジョブのスレッドは
+    要求を書き手へ渡し、応答を読み手からの channel で `recv_timeout` で待つ。ジョブのスレッドがパイプで止まることは無い。
+  - worker を終わらせる手段は **kill handle** (Job Object の handle を共有したもの) 1 つ。client と App の持ち主の両方が持ち、どちらからでも
+    `TerminateJobObject` できる。期限切れ・不正な枠・`fatal` のときは client が、mIV の終了のときは App が呼ぶ。worker が終わればパイプが切れ、
+    書き手・読み手のスレッドは誤りで抜け、ジョブのスレッドは channel の切断で抜ける。**止めるのが先、スレッドの回収はその後**で、
+    UI スレッドは回収を待たない (回収は既存の reaper と同じく別スレッドで行うか、切り離す)。
+  - **通常の中止** (利用者がジョブを止める) は、今の 1 件の推論が終わるのを待ってから `shutdown` を送り、kill handle で終わらせる (§6.5)。
+    **mIV の終了** は待たずにすぐ kill handle で終わらせる。この 2 つを分ける。
 - **GPU の判定**: worker の `--list-devices` (V1-0 で作った、DXGI の LUID と Vulkan の device の対応と VRAM 総量) を、モデルを読まずに起動して使う。
   結果は「使う device (専用メモリが最大のアダプタ) と、その VRAM 総量、Vulkan の有無」の 1 つ。判定は mIV の起動ごとに 1 回、必要になったときに
   worker スレッドで行い、その起動の間は結果を使い回す (実行時の空きでは変えない)。`gpu_info` (DXGI の最初のアダプタ) は使わない。
@@ -1005,3 +1023,9 @@ PDFium worker と同じくパイプにそのまま流して足りる。共有メ
   26/26 一致することを確かめる。通信の枠・時間の上限・`image_failure` と `fatal` の分け方・パイプが切れたときは、偽の worker (テスト用の小さな exe か
   Rust のテスト用 binary) で確かめる。
 - **まれな失敗**は割り切り (ログ + 通知。ジョブを止め、利用者がやり直す)。
+
+### 19.10 10 回目 (2026-11-02、同じ担当の続き、基準 `a42fcd4ab`、V1-1 の設計)
+
+§21.2 の事実・共有メモリを使わない判断・再起動しない判断・段階分けは「問題なし」。P2 3 件を §21.3 に足した: 子に渡すハンドルを
+その子の標準入出力に限る (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`、EPUB にも適用) / worker の標準入出力をバイトで扱い、枠の中身を
+「JSON の長さ + JSON + RGB」に決める / 書き手・読み手のスレッドと kill handle で待ちを解き、止めるのを回収より先にする。
