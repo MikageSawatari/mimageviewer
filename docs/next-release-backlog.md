@@ -52,6 +52,28 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - §1.456 一覧の名前の文字サイズ・最大行数 (>>629): 出荷の案内は未。
 - §1.480 画像フォルダを Enter で開くと自動表示が ON でもページ一覧で止まる (>>649 の調査中に開発側で発見、v4.2.0 から): >>649 の評価フィルタの件は開発側で再現しなかった。報告者へは未返信。
 
+### 1.685 一覧を開いた直後、同じ座標の項目がダブルクリックで開かない — サブPC観測の再調査 (2026-11-02)
+
+- 状態: **報告の持続的な拒否は headless 未再現・原因未特定・製品未修正**。§1.680以降の退行とも、以前からある同じ不具合とも確定しない。成功したheadless検査だけでサブPCの観測を否定せず、今回の調査だけでは公開判断の懸念を解除できない。設計担当ClaudeCodeからの依頼、`inv-samepos-dblclick` / `17808e40d`。製品起動・デスクトップ操作・コミットは行わず、コミットは設計担当。
+- 観測の出典: 2026-11-02、サブPC担当、v4.11.0署名済みポータブル（`2322f5a2c`と同じソース）、画面操作ツールのdouble_click。ZIPを(530,420)で開き2秒後に同位置の未選択002を開こうとしても選択・openなし。ZIP内のinner_Bから同位置の002も2回失敗し、003を単クリックした後なら成功、(540,430)への10px移動でも成功。PDFを(289,420)で開いた後の選択済みPage 1も失敗。位置が違う全画面復帰後は10/10成功、inner_Aを(290,420)で開いた後の(530,420)の002も成功。クリック間にポインタ移動イベントを出さないツール入力の報告であり、製品へ届いたRawInputの全列・実マウスでの発生は今回採取していない。
+- 現行の製品ソースは観測対応commit `2322f5a2c`と無差分（`git diff 2322f5a2c HEAD -- src vendor/egui`）。追加した `src/app/tests/same_position_double_click.rs` は実 `render_grid` → 共通セル／背景ハンドラ → `post_render_main_navigation` → 実folder/ZIP採用 → ページopenを使う。使い捨てPNG/ZIPとAppTestEnvだけを使い、最初の位置合わせ以外の `PointerMoved` は送らない。Folder / ZipFile / ZipDir、選択済み001と未選択002、採用後に空frameを挟まず入力時刻を2秒進める場合と200frame描画する場合、2回目のdouble-clickを4 edge pass / 2 click pass / 1 batchに分ける場合を検査。比較用の初回openは旧版でも一覧へ入れる4 edge passに固定した。初回も1 batchにする追加検査と、選択済み再クリックONで最初のreleaseで開いて残りedgeが破棄される追加検査も残す。
+- 前後比較方法: §1.681と同じ一時source置換。`93e7cd7a3`とHEADで異なる既存Rust source9ファイル（`src/`と`vendor/egui/src/context.rs`）をバイト退避し、旧版へ置換、新しいテストmoduleの登録だけ追加。同じ3テストを実行してから9ファイルすべてをバイト一致で復元、HEAD/branch不変・製品ソース無差分を確認。新しい2テストは初回openも同batchにする現行の補完検査。v4.10.2比較は追加しない（直前の基点で同batchの既知差を確認できたため）。手順・復元記録は `target/samepos-compare.py` / `target/samepos-compare-result.json`。
+
+| 同一座標・移動なしのheadless検査（初回openは4 edge pass） | §1.680前 `93e7cd7a3` | 現行 `17808e40d`＋追加テスト |
+|---|---|---|
+| 一覧入替後のdouble-clickを4 edge passに分割（12条件） | 全成功 | 全成功 |
+| 一覧入替後のdouble-clickを2 click passに分割（12条件） | 全成功 | 全成功 |
+| 一覧入替後のdouble-click全体を1 batch（12条件） | 最初のFolder/選択済み001/空frameなしでopenせず失敗、そのテスト内の残り条件は未実行 | 全成功 |
+
+- 旧版の失敗は§1.680で確認・修正した「Responseの集約boolから1 batchの2クリックを1回だけ登録する」経路と一致する。**旧版失敗→現行成功であり、今回報告の新しい退行を示す前後差ではない**。旧版は2成功/1失敗、8.54秒、exit101、compile4分35秒（`target/samepos-before.log`）。現行の同じ3テストは3成功・36条件成功、12.12秒（`target/samepos-current-sparse.log`）。初期fixtureのZIP内移動を戻りnav数だけで数えたassertionは、同期一覧入替も数えるよう修正した。これはテスト側の不備で、製品の再現失敗として扱わない。
+- 現行の補完検査: 初回も1 batchとする場合、再クリックONで残りedgeを破棄する場合を含め、**5テスト・60条件すべて成功、20.01秒、exit0**（`target/samepos-current-final.log`）。再クリックONの12条件のうち、初期選択と一致するtarget0の6条件が実際の早期open／残り破棄の検査、target1の6条件は最後のreleaseで開く対照。独立Sol/xhighのfixture確認で重大な不備なし。早期openの前提を将来も保つため、この実行後に初回入力前のselected=Some(0) assertionだけを追加し、最終関連nextestの対象に含めた。製品ソースは変更していない。
+- コード上で確かめた拒否境界: 共通routerはraw入力とegui判定済みrelease・押下witnessを順序照合し、pressのwidget ID/有効性・前回矩形・描画hit領域を照合してから選択とクリック対へ渡す。`GridPressWitnesses` / `GridPrimaryHitRegions` / 消費印はframe所属で、クリック対はindex/context/時刻を持つ。セル用の「同じ座標を拒否し続け、移動や別セルクリックで解除する」状態・待機時間は確認できなかった。独立Sol/xhighの静的確認も同じ所見。従って別セル単クリック／10px移動で直る理由や、拒否がいつまで続くかを今回の共通routerの診断として断定しない。
+- 未検証の別境界: `vendor/egui-winit/src/lib.rs::on_mouse_button_input` は保持pointer位置がNoneならPointerButtonを生成しない。CursorLeftやTouch End/Cancelがその位置を消し、CursorMovedが戻すため、条件付きでは移動まで押下が届かない機構がある。ただしこのbackendは§1.680で変更されておらず、今回の通常folder/ZIP openで位置が消えた証拠もない。**今回の原因と認定しない**。headlessのRawInput注入はこのnative配送を検査しない。
+- 次の開発側の切り分け: 観測する同じ試行でnative MouseInput/保持pointer位置、egui RawInput、押下witness/current cell IDと矩形を照合し、「配送前の消失」「press所属拒否」「選択／対の不成立」のどこで止まるかを確定する。今回は製品起動禁止に従い未実施。追加の実機総当たりを報告者へ依頼する段階にはしない。
+- 最終検証（Codex担当、`17808e40d`＋本テスト差分、すべて `MSBUILDDISABLENODEREUSE=1`）: `cargo fmt` 実施、`cargo fmt --check` exit0、17.75秒（`target/samepos-fmt.log`）。`cargo check -p mimageviewer --lib --tests --features test-script` はdev profileでexit0、162.78秒、既存warningあり（`target/samepos-check.log`）。`git diff --check` exit0（`target/samepos-diff-check.log`）。コマンド・exit・所要時間は `target/samepos-verification-results.json`。
+- 最終関連検証: `cargo nextest run -p mimageviewer --lib -E 'test(grid) | test(selection) | test(activation) | test(ui_main::) | test(touch_correlation::) | test(section1680) | test(section1679) | test(ratingnav649)' --profile default --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --no-tests fail`。通常feature／test profile／default nextest、**1,315件すべて成功（slow5）、失敗・timeoutなし、14,240 skip、実行200.731秒、exit0**。run `ce9ed532-8c90-4073-9717-78423daf08e3`、`target/samepos-related.log`、JUnit `target/nextest/default/junit.xml`。初回入力前assertionを含む追加5件・60条件と§1.679／§1.680／ratingnav649も成功。slow5件は一覧親router、startup activation、§1.674表示読込、§1.679の図形終点／cancelで、すべて既定期限内に成功した。
+- 最終引継ぎ: 変更はテスト登録・新しいテストmodule・本記録の3ファイルだけ。HEAD `17808e40d` / branch `inv-samepos-dblclick` は不変、製品ソース無差分。製品修正時の条件付き検証である全件lib／UI snapshot／確認用core buildは、今回のテスト・記録のみの差分では実施しない。製品未起動・未コミット。原因とnative入力配送が未確定である点を残して設計担当へ渡す。
+
 ### 1.684 フォルダバーのパス欄で、引用符で囲んだパス ("C:\xxx") でも移動できるようにする — 利用者要望 (2026-11-02)
 
 - 状態: **未着手・利用者が起票を依頼 (2026-11-02)。v5 以降の版で対応** (v4 系の追加作業は v4.11.0 で止める利用者方針)。
