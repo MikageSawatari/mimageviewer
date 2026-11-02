@@ -5526,4 +5526,9 @@ get_thumbnail で縮小画像を見る)、文字情報の tool (get_item_info・
 古い表示のままになる。「AI による変更」の記録側 (`agent_ipc/changes.rs`) は `request_repaint_of(ROOT)` を呼んでいるので、
 同じ形にそろえれば直る。小さな修正なので、利用者の判断を受けて実装担当へ出す。
 
+実装修正 (2026-11-02): コードで上の前提を確認し、共通の `record` で最近の AI アプリを記録した直後、
+記録のロックを解放してから `ChangeController::request_ui_repaint` を呼ぶ形にした。既存の UI Context の所有者を使い、
+窓の開閉には依存せず root viewport を再描画する。`Hello`・`Cancel`・`internal` の分類と、変更記録・通知は変えない。
+handler-level テストで、読み取り tool による root への通知、通知時の記録ロック解放、記録対象外で通知しないことを検査する。
+
 §33.3 の「縮小画像で全部を見る頼み方は確かめていない」を改める: 使う機能を具体的に頼めば、420 枚でも数分で全部を見られた。

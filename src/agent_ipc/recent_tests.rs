@@ -11,6 +11,81 @@ fn hello(name: &str, version: &str, kind: RequestKind) -> Command {
 }
 
 #[test]
+fn recent_apps_read_tool_wakes_root_after_releasing_record_lock() {
+    let f = Fixture::new();
+    let ctx = egui::Context::default();
+    let notices = f.handlers.changes.install(ctx.clone());
+    let recent_apps = f.handlers.recent_apps.clone();
+    let (repaints, repaint_requests) = std::sync::mpsc::channel();
+    ctx.set_repaint_observer(move |request| {
+        let recent = recent_apps
+            .try_lock()
+            .expect("recent-apps lock must be released before repainting");
+        assert_eq!(recent.entries().len(), 1);
+        assert_eq!(recent.entries()[0].client_name, "test");
+        repaints.send(request).unwrap();
+    });
+    let tool = f.connection();
+    assert!(repaint_requests.try_recv().is_err());
+
+    // Both installed states must refresh, including a later call by the same app.
+    for (id, ready) in [(1, false), (2, true)] {
+        f.handlers.changes.set_ready(ready);
+        assert!(f.call(&tool, id, Command::Status).result.is_ok());
+        let wake = repaint_requests.try_recv().expect("read tool must repaint");
+        assert_eq!(wake.viewport_id, egui::ViewportId::ROOT);
+        assert_eq!(wake.delay, Duration::ZERO);
+        assert!(repaint_requests.try_recv().is_err());
+        assert!(notices.try_recv().is_err());
+        assert!(
+            f.handlers
+                .changes
+                .records()
+                .lock()
+                .unwrap()
+                .entries()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn recent_apps_unrecorded_requests_do_not_wake_ui() {
+    let f = Fixture::new();
+    let ctx = egui::Context::default();
+    let _notices = f.handlers.changes.install(ctx.clone());
+    let (repaints, repaint_requests) = std::sync::mpsc::channel();
+    ctx.set_repaint_observer(move |request| {
+        repaints.send(request).unwrap();
+    });
+
+    for level in [AgentLevel::ReadOnly, AgentLevel::Disabled] {
+        f.set_level(level);
+        let tool = f.connection();
+        let cancel = f.call(&tool, 1, Command::Cancel { request_id: 20 });
+        if level == AgentLevel::ReadOnly {
+            assert!(cancel.result.is_ok());
+        } else {
+            assert_eq!(cancel.result.unwrap_err().code, ErrorCode::Disabled);
+        }
+        let internal = Connection::new(f.handlers.clone());
+        assert!(
+            f.call(&internal, 2, hello("internal", "1", RequestKind::Internal))
+                .result
+                .is_ok()
+        );
+        let status = f.call(&internal, 3, Command::Status);
+        if level == AgentLevel::ReadOnly {
+            assert!(status.result.is_ok());
+        } else {
+            assert_eq!(status.result.unwrap_err().code, ErrorCode::Disabled);
+        }
+        assert!(f.handlers.recent_apps.lock().unwrap().entries().is_empty());
+        assert!(repaint_requests.try_recv().is_err());
+    }
+}
+
+#[test]
 fn recent_apps_exclude_handshake_cancel_internal_and_include_disabled_busy_tools() {
     let f = Fixture::new();
     f.set_level(AgentLevel::Disabled);
