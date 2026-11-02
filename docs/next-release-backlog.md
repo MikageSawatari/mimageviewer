@@ -58,6 +58,16 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - >>694・696 は §1.675、>>697 は §1.676、>>704 の一覧順移動は §1.682、>>707・710 の左ツリー更新は §1.686 に記録済み。内部 D&D は保留側 §1.464 に経緯を追補し、今回実装採用した扱いにはしない。>>688 の左クリック割り当て・>>695 のバックアップは >>690・699 で現仕様・既存機能を案内したもので、新規対応の確約はない。
 - 未記載だった >>717・718 と返信 >>721・722 は §1.688〜1.692 へ分けて追加。>>702・706・719・720 と返信 >>723、他アプリ調査は保留側 §1.687 へ記録した。仕様検討・再現待ちを実装確約と混同せず、各項目の収録版は未定。今回の照合範囲は >>687〜723 で、スレ全体を再監査した主張ではない。
 
+### 1.693 音響調整の窓が後ろに回ったとき、「音響調整」ボタンで前面に出ないことがある — v5 のサブ PC 確認 (2026-11-02)
+
+- 状態: **原因未特定・製品未修正。v4 系にも同じ作りがある (v5 固有ではない)**。収録版は未定 (v5 の作業中に計装するかは利用者と相談)。
+- 観測 (サブ PC 担当、2026-11-02、v5-integration の dev build + mIV Sound 候補、隔離データ、操作は画面操作ツールの SendInput): 「音響調整」で開いた mIV Sound の窓 (別プロセス `mimageviewer-vst3-host.exe`) が、初回は mIV の後ろに隠れ、2 回目で前に出た。その後、mIV を最大化した状態で後ろに回ったとき、3 回押しても前に出なかった (窓は可視のまま)。v4.11.0 (Mixwright) での実機確認はしていない。記録は `C:\miv-subpc\results-4\` と v5-integration の `docs/v5-integration.md` §7 (A1)。
+- 設計上の期待: `docs/effetune-integration-plan.md` §17.12 (2026-10-13 利用者決定) でボタンは「表示・前面化」。
+- コード調査 (2026-11-02、Codex 読み取り調査、v5-integration `dd5a3f71b` と master `c728cd613` を比較): ボタン → `effetune_toolbar_click` → `request_show_gui` (`ShowIntent::Manual`) → host-control worker が editor を attach → IPC 送信直前に `AllowSetForegroundWindow(bridge pid)` (`src/video/dsp/mod.rs` 1873 付近、返り値は捨てている) → host の GUI thread で `SW_SHOWNA` → plugin のサイズ通知・再描画 → `SetForegroundWindow(container)` (`crates/vst3-host/src/plugin_loader.cpp` 1877 付近)。host は `SetForegroundWindow` の失敗を返さず、`requested && IsWindowVisible` だけで "shown" と応答する (同 1941 付近)。owner は意図的に 0 (2026-09-30 の利用者決定「main をクリックして Sound を背面へ回せる」)。master と v5 で、この経路は同じ。
+- 原因の候補: mIV が渡した前面化の許可が、IPC・host のキュー・plugin のコールバックを経て `SetForegroundWindow` が呼ばれるまでの間に失効する (移譲先以外への入力などで失効する Windows の仕様)。最大化固有・v5 固有の原因は確認できていない。既存のログに API の成否がないため、ここで止まる。
+- 次の一手 (直す前に): 境界の計装。mIV 側の request ID・対象 PID・`AllowSetForegroundWindow` の成否と失敗時のエラー、host 側の permit の受理 / 取消・`SetForegroundWindow` の成否・前後の foreground HWND/PID、対象窓の activation・最小化・z-order の遷移と main の TOPMOST 属性。これで「許可失敗」「許可後の失効」「要求取消」「成功後に背面へ戻された」を分ける。
+- 直し方の第一候補 (計装の結果を見てから決める): 表示・復元は host、前面化は入力元の mIV プロセスが担当する (host の checked Show 完了後に、mIV から対象 frame に一度だけ `SetForegroundWindow`)。retry・delay・TOPMOST は採らない。main を恒久 owner にする案は利用者決定と矛盾するので採らない。
+
 ### 1.691 Everything 検索欄で、文字列の一部を選択・切り取りしづらい原因を調べる — 5ch >>718 (2026-11-02)
 
 - 状態: **未着手・原因調査候補**。報告者が「座標が微妙にずれているのか、部分選択して切り取りが困難」と報告し、>>722 で確認すると回答済み。開発側で製品を起動しての再現試験はしておらず、座標ずれを原因と認定しない。
