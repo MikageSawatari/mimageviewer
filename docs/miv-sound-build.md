@@ -38,6 +38,31 @@ ctest を呼ぶ。通常ビルドと `-TestCandidate` は同じ照合・テス�
 WebView2 を使うテストがサンドボックスで失敗する場合は、同じ派生版 source/build tree を
 サンドボックス外で `-TestCandidate` に渡す。テストを削って成功させない。
 
+<a id="where-to-run"></a>
+
+### 実行する場所と担当 (2026-11-02)
+
+- **候補の作成と ctest は Codex のサンドボックスでは行わない**。v5-integration への取り込み
+  (2026-11-01) で、サンドボックスは派生版の build tree (mIV の作業ツリーの外) への書き込みを拒否し、
+  build tree を mIV 側へ写した場合も CMake の configure (compiler ABI 検出 / Ninja) が 10 分以上
+  進まなかった。サンドボックス外の ClaudeCode が実行する。2026-10-26 にこの方法で候補
+  `dcdfa794…6d34` を作り、ctest 113/113 を通している。
+- **承認する mIV の作業ツリーで実行する**。候補はスクリプトのある作業ツリーの
+  `target/miv-sound-candidates/<ID>/` に置かれ、`-Approve` は同じ作業ツリーの `third_party/` と
+  `vendor/` に書く。別の作業ツリーで作った候補は、フォルダごと写しても `Read-MivSoundCandidate`
+  が全 hash を照合する。
+- 実行前に確かめること: 派生版のソースと submodule がコミット済みで、同じ build tree を使う
+  ビルドが他に動いていない。サンドボックスで直前に C++ をビルドした場合は、残った
+  `mspdbsrv.exe` が PDB を開いたままにして C1041 で落ちることがある (cl / link が動いていないのを
+  確かめてから、その時刻の mspdbsrv だけを止める)。
+- **候補を作ってから承認するまで、派生版の source と build tree を変えない**。ctest と承認は
+  現在の source の commit と build tree の構成・登録テスト一覧を候補の記録と照合する。
+  派生版を直すときは承認前でも候補を作り直す。
+- 承認物の内容を事前に確認したいときは、`scripts/miv-sound-candidate.ps1` を読み込み、
+  `Approve-MivSoundCandidate` を候補フォルダだけを写した使い捨ての `-RepoRoot` と使い捨ての
+  `-BackupRoot` (どちらも `target/` の下) に向けて呼ぶ。本番の `third_party/`・`vendor/`・
+  バックアップには書かず、承認の代わりにもならない。
+
 ## 候補 ID と ctest 記録
 
 候補は `target/miv-sound-candidates/<ID>/` に置く。
