@@ -504,7 +504,12 @@ fn resolve_folder_bar_nav_path(path: &Path) -> Option<PathBuf> {
 }
 
 fn resolve_folder_bar_address_input(raw: &str) -> Option<PathBuf> {
-    resolve_folder_bar_nav_path(&normalize_folder_bar_input_path(raw))
+    let path = normalize_folder_bar_input_path(raw);
+    // Empty/whitespace-only quoted input is a no-op, not a relative path.
+    if path.to_str().is_some_and(|input| input.trim().is_empty()) {
+        return None;
+    }
+    resolve_folder_bar_nav_path(&path)
 }
 
 fn normalize_folder_bar_input_path(raw: &str) -> PathBuf {
@@ -512,7 +517,6 @@ fn normalize_folder_bar_input_path(raw: &str) -> PathBuf {
     let input = trimmed
         .strip_prefix('"')
         .and_then(|inner| inner.strip_suffix('"'))
-        .map(str::trim)
         .unwrap_or(raw);
     // Preserve the original drive-only completion, including surrounding spaces.
     // All other unquoted inputs keep their original leading/trailing whitespace.
@@ -23528,12 +23532,15 @@ mod rating_filter_op_tests {
     }
 
     #[test]
-    fn folder_bar_only_paired_quotes_allow_whitespace_removal() {
+    fn folder_bar_paired_quotes_remove_only_outer_whitespace() {
         for (input, expected) in [
             (r#"C:\books"#, r"C:\books"),
             (r#""C:\books""#, r"C:\books"),
             (" \tC:\\my books \r\n", " \tC:\\my books \r\n"),
-            (" \t\" C:\\my books \t\" \r\n", r"C:\my books"),
+            (" \t\" C:\\my books \t\" \r\n", " C:\\my books \t"),
+            ("\u{3000}\"C:\\写真\u{3000}\"\u{3000}", "C:\\写真\u{3000}"),
+            ("\"\u{3000}写真\"", "\u{3000}写真"),
+            (r#"" C:\x ""#, r" C:\x "),
             (r#""C:""#, r"C:\"),
             (r#""C:\""#, r"C:\"),
             (r#""\\server\share\x""#, r"\\server\share\x"),
@@ -23567,7 +23574,7 @@ mod rating_filter_op_tests {
     }
 
     #[test]
-    fn folder_bar_unquoted_unicode_whitespace_keeps_real_folder_identity() {
+    fn folder_bar_quoted_and_unquoted_unicode_whitespace_keep_real_folder_identity() {
         let tmp = tempfile::tempdir().unwrap();
         let sibling = tmp.path().join("写真");
         let target = tmp.path().join("写真\u{3000}");
@@ -23578,16 +23585,20 @@ mod rating_filter_op_tests {
             resolve_folder_bar_address_input(target.to_str().unwrap()),
             Some(target.clone())
         );
-        // Paired quotes deliberately trim Unicode whitespace inside the pair.
+        // A copied quoted path must select the same folder, not its sibling.
         assert_eq!(
             resolve_folder_bar_address_input(&format!("\"{}\"", target.display())),
-            Some(sibling.clone())
+            Some(target.clone())
         );
         std::fs::remove_dir(&sibling).unwrap();
-        // Without the sibling, unquoted/native input must not fall back to tmp.
+        // Without the sibling, no input route may fall back to tmp.
         assert_eq!(resolve_folder_bar_nav_path(&target), Some(target.clone()));
         assert_eq!(
             resolve_folder_bar_address_input(target.to_str().unwrap()),
+            Some(target.clone())
+        );
+        assert_eq!(
+            resolve_folder_bar_address_input(&format!("\"{}\"", target.display())),
             Some(target)
         );
     }
@@ -23607,6 +23618,10 @@ mod rating_filter_op_tests {
         );
         assert_eq!(
             resolve_folder_bar_address_input(relative.to_str().unwrap()),
+            Some(relative.to_path_buf())
+        );
+        assert_eq!(
+            resolve_folder_bar_address_input(&format!(" \"{}\" ", relative.display())),
             Some(relative.to_path_buf())
         );
         assert_eq!(
@@ -23650,12 +23665,16 @@ mod rating_filter_op_tests {
     }
 
     #[test]
-    fn folder_bar_quoted_empty_path_does_not_resolve() {
-        for input in [r#""""#, "  \" \t\"  "] {
-            assert!(
-                normalize_folder_bar_input_path(input)
-                    .as_os_str()
-                    .is_empty()
+    fn folder_bar_quoted_empty_or_whitespace_only_path_does_not_resolve() {
+        for (input, inner) in [
+            (r#""""#, ""),
+            (r#"" ""#, " "),
+            ("  \" \t\"  ", " \t"),
+            ("\"\u{3000}\"", "\u{3000}"),
+        ] {
+            assert_eq!(
+                normalize_folder_bar_input_path(input).as_os_str(),
+                Path::new(inner).as_os_str()
             );
             assert_eq!(resolve_folder_bar_address_input(input), None);
         }
@@ -23675,7 +23694,7 @@ mod rating_filter_op_tests {
             if path != folder {
                 std::fs::write(&path, b"fixture").unwrap();
             }
-            let quoted = format!(" \t\" {} \t\" ", path.display());
+            let quoted = format!(" \t\"{}\" \t", path.display());
             let expected = if path.extension().is_some_and(|ext| ext == "jpg") {
                 &folder
             } else {
@@ -23686,6 +23705,22 @@ mod rating_filter_op_tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn folder_bar_quoted_missing_path_keeps_whitespace_during_parent_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("my books");
+        std::fs::create_dir(&folder).unwrap();
+        let missing = folder.join("missing\u{3000}");
+        assert_eq!(
+            normalize_folder_bar_input_path(&format!("\"{}\"", missing.display())),
+            missing
+        );
+        assert_eq!(
+            resolve_folder_bar_address_input(&format!("\"{}\"", missing.display())),
+            Some(folder)
+        );
     }
 
     #[cfg(windows)]
@@ -34233,17 +34268,20 @@ mod section207_tests {
             });
         harness.run();
         for (input, expected) in [
-            (format!(" \" {} \" ", target.display()), Some(Some(target))),
+            (format!(" \"{}\" ", target.display()), Some(Some(target))),
             (
                 unicode_target.to_str().unwrap().to_owned(),
                 Some(Some(unicode_target.clone())),
             ),
             (
                 format!("\"{}\"", unicode_target.display()),
-                Some(Some(sibling)),
+                Some(Some(unicode_target)),
             ),
+            (String::new(), Some(None)),
             (" \t ".to_owned(), Some(None)),
             (r#""""#.to_owned(), None),
+            (r#"" ""#.to_owned(), None),
+            ("\"\u{3000}\"".to_owned(), None),
             (" \" \t\" ".to_owned(), None),
             (" 本棚 ".to_owned(), Some(Some(book_root.clone()))),
             (
