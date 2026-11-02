@@ -557,6 +557,10 @@ fn write_order_observed(
     before_replace: impl FnOnce(&Path),
 ) -> Result<BookOrderToken, BookOrderWriteError> {
     validate_policy(policy).map_err(BookOrderWriteError::Failed)?;
+    // A displayed delta may include an externally returned book while keeping
+    // the last observed token. Reject that stale base as Conflict so the owner
+    // reloads it, before diagnosing a malformed request against a current base.
+    check_expected(root, expected)?;
     if let BookOrderPolicy::Manual(names) = policy {
         let mut names = names.clone();
         names.sort();
@@ -566,7 +570,6 @@ fn write_order_observed(
             ));
         }
     }
-    check_expected(root, expected)?;
     let (mode, books) = match policy {
         BookOrderPolicy::Name => (Mode::Name, Vec::new()),
         BookOrderPolicy::Manual(names) => (Mode::Manual, names.clone()),
@@ -880,6 +883,112 @@ mod tests {
             write_order(root, before.token().unwrap(), &BookOrderPolicy::Name),
             Err(BookOrderWriteError::Conflict)
         );
+    }
+
+    #[test]
+    fn stale_base_conflicts_before_manual_membership_validation() {
+        for change in ["returned", "removed", "renamed", "order-file"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            folders(root, &["A", "Z"]);
+            let token = save(root, &["Z", "A"]);
+            let requested = match change {
+                "returned" => {
+                    folders(root, &["B"]);
+                    vec!["Z", "B", "A"]
+                }
+                "removed" => {
+                    fs::remove_dir(root.join("Z")).unwrap();
+                    vec!["A"]
+                }
+                "renamed" => {
+                    fs::rename(root.join("A"), root.join("C")).unwrap();
+                    vec!["Z", "C"]
+                }
+                "order-file" => {
+                    fs::write(
+                        root.join(ORDER_FILE_NAME),
+                        br#"{"version":1,"mode":"name","books":[]}"#,
+                    )
+                    .unwrap();
+                    vec!["A"]
+                }
+                _ => unreachable!(),
+            };
+            let original = fs::read(root.join(ORDER_FILE_NAME)).unwrap();
+            let count = fs::read_dir(root).unwrap().count();
+            assert_eq!(
+                write_order(
+                    root,
+                    &token,
+                    &BookOrderPolicy::Manual(requested.into_iter().map(str::to_owned).collect())
+                ),
+                Err(BookOrderWriteError::Conflict),
+                "{change}"
+            );
+            assert_eq!(fs::read(root.join(ORDER_FILE_NAME)).unwrap(), original);
+            assert_eq!(
+                fs::read_dir(root).unwrap().count(),
+                count,
+                "no temp may be published"
+            );
+        }
+    }
+
+    #[test]
+    fn current_base_still_rejects_incomplete_or_extra_manual_membership() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        folders(root, &["A", "Z"]);
+        let token = save(root, &["Z", "A"]);
+        let original = fs::read(root.join(ORDER_FILE_NAME)).unwrap();
+        for requested in [vec!["A"], vec!["Z", "A", "B"]] {
+            assert!(matches!(
+                write_order(
+                    root,
+                    &token,
+                    &BookOrderPolicy::Manual(requested.into_iter().map(str::to_owned).collect())
+                ),
+                Err(BookOrderWriteError::Failed(_))
+            ));
+            assert_eq!(fs::read(root.join(ORDER_FILE_NAME)).unwrap(), original);
+            assert_eq!(fs::read_dir(root).unwrap().count(), 3);
+        }
+    }
+
+    #[test]
+    fn returned_existing_book_rename_and_delete_observe_fresh_disk_membership() {
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        for rename in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            folders(root, &["A", "Z"]);
+            let old_token = save(root, &["Z", "A"]);
+            folders(root, &["B"]);
+            assert_eq!(old_token.directories, ["A", "Z"]);
+            let result = if rename {
+                crate::books::rename_book(root, "B", "C")
+            } else {
+                crate::books::delete_book(root, "B")
+            }
+            .unwrap();
+            let crate::books::BookOpResult::ShelfUpdated { shelf, .. } = result else {
+                panic!("expected structural completion");
+            };
+            assert!(shelf.warning.is_none(), "{:?}", shelf.warning);
+            let snapshot = shelf.snapshot.unwrap();
+            let wanted = if rename {
+                vec!["Z", "A", "C"]
+            } else {
+                vec!["Z", "A"]
+            };
+            assert_eq!(names(&snapshot.rows), wanted);
+            assert_eq!(
+                snapshot.policy,
+                BookOrderPolicy::Manual(wanted.into_iter().map(str::to_owned).collect())
+            );
+            write_order(root, snapshot.token().unwrap(), &BookOrderPolicy::Name).unwrap();
+        }
     }
 
     #[test]

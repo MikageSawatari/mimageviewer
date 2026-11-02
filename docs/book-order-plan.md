@@ -405,3 +405,27 @@
 | UI glyph | 危険glyphなし |
 
 焦点の選択はbooks / book_order / app::book_shelf_tests / saved_group_actions / book_append系 / book_structural_op / root_lifecycle / egui037_connection_tests / Remote本棚 / keymap本番号。全件実行への拡大、失敗のretry、期待値・timeoutの緩和は行っていない。製品起動・commit・lib全件・build-devは依頼どおり未実施。§13.4の確認用バイナリは今回の修正を含まない。
+
+### 13.6 未登録の既存本へのAppend後の保存競合（`aa2001c6f`後）
+
+設計担当から渡された再レビュー全文とwriter/callerを照合し、新P2は正しい指摘と判断した。差分表示に復帰本Bを加えてもtokenは最後の観測集合[A,Z]のまま保持するのが正しいが、writerが基点照合より先にManual要求の集合を検査してFailedで止まり、既存Conflict→再読込へ進めなかった。§13.5のテストは差分反映とtoken保持までで、この次の保存を検査していなかった。
+
+`write_order_observed`の順序をpolicy形式検証→基点のfile digest/root存在/直下名集合照合→Manual要求と基点の集合整合にする。外部変更で古い基点なら保存/temp作成前にConflictを返し、既存ownerの通常List再読込へ進む。最新基点に対する本集合の欠落/余分な要求はFailedのまま。原本保護・置換直前の二度目の照合を維持し、差分からtokenを推測更新しない。新しい状態・再試行・特別なreload経路は追加しない。
+
+同型入口も調査した。上下/今の順を固定/名前順復帰は同じwriterを使う（Nameは従来から集合検査を省いて基点照合に進んでいた）。作成/管理改名/削除/transferはworkerが新しいsnapshotを読み、自操作で成功したFS差分だけ期待集合へ反映して順保守する。新規Appendは軽量観測が起点で、既存Append/Undoの件数差分に残る古いApp tokenをこれらのworkerへ渡さない。汎用Shell操作は順writerを持たず、後の順保存の基点照合が検出する。
+
+追加回帰は4test。Appの通し回帰は実runtime Appendを保留して管理を開く→List未発行→実summaryをpollしてBの差分反映/token旧集合保持→上下/固定/名前順復帰の各入口→実writerのConflict→既存Listを実poll→次の明示保存が成功、まで3ケースを通す。storage回帰は外部の復帰/削除/改名/順file変更でConflictが優先し原本/tempが不変、最新基点の不正要求はFailed、復帰本の実改名/削除が新しい集合を読んで順保守・後続保存に成功することを検査する。
+
+別contextのSol/xhighによる設計・完成sourceレビューはACCEPT、未解決P1/P2なし。`MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=1`で指定のfmt/check/焦点検証を実施した。
+
+初回焦点は158成功/通し回帰1失敗。初回Append replyの直後にterminalを仮定したテスト側の不備で、製品はmetadata presence準備へ同じAppend ownerを継続する。既存`drain_append`と同じ期限付きpollで実terminalまで駆動する形へ修正し、B反映・旧token・Conflict・次の保存のassertは維持した。独立再確認でもsourceからこの非同期継続を確認し、修正をACCEPT。製品コードの追加修正や期待値・timeout設定の緩和は行っていない。
+
+| 今回の検証 | 結果・証拠 |
+| --- | --- |
+| `cargo fmt` | 成功 |
+| `cargo check -p mimageviewer --lib --tests` | 初回exit0、1分11秒。テスト駆動修正後の最終checkもexit0、46.36秒。`target/section1683-conflict-check-final/{stdout,stderr}.log` |
+| 焦点nextest | 最終159/159成功、実行18.004秒（compile3分07秒）。books / book_order / app::book_shelf_tests / book_append系 / book_structural_opを選択 |
+| 新規回帰 | 4testすべて上記に含まれ成功。上下/固定/名前順復帰、stale基点4種、fresh不正要求、実改名/削除と後続保存を検査 |
+| `git diff --check` | 成功 |
+
+最終焦点のcommand/config・stdout/stderr・JUnitは`target/section1683-conflict-focused-final/runs/20261102T152241854Z-769e18e4/`。初回結果は`target/section1683-conflict-focused/runs/20261102T151517792Z-b8ee6692/`に分けて保持する。最終source/testは検証後に変更せず、文書の結果追記だけを行う。UI描画・文字列・snapshot変更なし。製品起動・commit・lib全件・build-devは依頼どおり未実施で、過去の確認用バイナリに今回の修正は含まれない。

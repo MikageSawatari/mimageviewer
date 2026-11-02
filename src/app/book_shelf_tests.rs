@@ -680,3 +680,163 @@ fn book_shelf_cold_read_failure_is_terminal_until_an_explicit_reload() {
     assert_eq!(app.book_order_status(), None);
     assert!(app.book_shelf.snapshot.is_some());
 }
+
+#[test]
+fn book_shelf_returned_book_append_then_order_conflict_reloads_and_next_save_succeeds() {
+    for action in ["move", "fix", "name"] {
+        let mut app = shelf(&["A", "Z"]);
+        let root = app.book_root_path();
+        for name in ["A", "Z"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let initial = crate::book_order::read_snapshot(&root).unwrap();
+        if action != "fix" {
+            crate::book_order::write_order(&root, initial.token().unwrap(), &manual(&["Z", "A"]))
+                .unwrap();
+        }
+        app.book_shelf.snapshot = Some(crate::book_order::read_snapshot(&root).unwrap());
+        let old_token = app
+            .book_shelf
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .token()
+            .unwrap()
+            .clone();
+        let original = std::fs::read(root.join(crate::book_order::ORDER_FILE_NAME)).ok();
+
+        // The destination returned externally after this list was observed.
+        std::fs::create_dir(root.join("B")).unwrap();
+        app.settings.active_book_name = "B".into();
+        app.current_folder = None;
+        let source = app.tmp.path().join("returned-source.jpg");
+        std::fs::write(&source, b"appended page").unwrap();
+        let (append_reply, rx) = mpsc::channel();
+        app.book_op_pending = Some(crate::books::BookOpPending {
+            rx,
+            intent: crate::books::BookOpIntent::Append {
+                operation_id: 1683,
+                source_context: app.projected_viewer_context_id(),
+                accepted_revision: app.book_append_undo_revision,
+                target_folder: root.join("B"),
+                observations: Default::default(),
+            },
+            shelf_scope: Some(app.shelf_scope()),
+        });
+        app.open_book_manager_from_action();
+        assert!(app.show_book_manager);
+        assert!(matches!(
+            app.book_op_pending.as_ref().unwrap().intent,
+            crate::books::BookOpIntent::Append { .. }
+        ));
+        assert!(
+            !app.book_list_refresh_pending(),
+            "manager open cannot read during Append"
+        );
+        let data = crate::data_dir::get();
+        let appended = crate::books::append_pages_at_with_raw_and_shelf(
+            data.clone(),
+            root.clone(),
+            "B".into(),
+            vec![crate::books::BookPageSource::File {
+                src: source,
+                original_name: "returned-source.jpg".into(),
+            }],
+            crate::book_append_undo::AppendMetadataStores::existing_at(&data),
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(&appended, crate::books::BookOpResult::Append(summary) if summary.added == 1 && summary.shelf.is_none())
+        );
+        append_reply.send(Ok(appended)).unwrap();
+        let ctx = egui::Context::default();
+        // Real Append can retain this receiver through asynchronous metadata
+        // presence preparation. Drive that terminal too, rather than assuming
+        // the initial file-copy reply alone completes the operation.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.book_op_pending.is_some() {
+            app.poll_book_op_pending(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Append terminal timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(names(&app).contains(&"B"));
+        assert_eq!(
+            app.book_shelf.snapshot.as_ref().unwrap().token(),
+            Some(&old_token)
+        );
+        assert_eq!(old_token.directories, ["A", "Z"]);
+
+        let writes = app.book_order_writes_for_test();
+        let edit = |app: &mut App| match action {
+            "move" => app.move_book_order("B", -1, &ctx),
+            "fix" => app.fix_book_order(&ctx),
+            "name" => app.reset_book_order(&ctx),
+            _ => unreachable!(),
+        };
+        edit(&mut app);
+        let first = writes.try_recv().unwrap();
+        assert_eq!(
+            first.token, old_token,
+            "do not infer a token from the display delta"
+        );
+        let result = crate::book_order::write_order(&root, &first.token, &first.policy);
+        assert_eq!(result, Err(BookOrderWriteError::Conflict), "{action}");
+        assert_eq!(
+            std::fs::read(root.join(crate::book_order::ORDER_FILE_NAME)).ok(),
+            original
+        );
+        first
+            .reply
+            .send(Ok(crate::books::BookOpResult::ShelfOrderSaved(result)))
+            .unwrap();
+        app.poll_book_op_pending(&ctx);
+        assert_eq!(app.book_order_status(), Some("読込中…"));
+        assert!(app.book_list_refresh_pending());
+        assert!(
+            writes.try_recv().is_err(),
+            "conflict must not resend the old desired order"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.book_list_refresh_pending() {
+            app.poll_book_op_pending(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "conflict reload timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(app.book_order_status(), None);
+        assert_eq!(
+            app.book_shelf
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .token()
+                .unwrap()
+                .directories,
+            ["A", "B", "Z"]
+        );
+        edit(&mut app);
+        let next = writes.try_recv().unwrap();
+        let expected_policy = next.policy.clone();
+        let result = crate::book_order::write_order(&root, &next.token, &next.policy);
+        assert!(result.is_ok(), "{action}: {result:?}");
+        next.reply
+            .send(Ok(crate::books::BookOpResult::ShelfOrderSaved(result)))
+            .unwrap();
+        app.poll_book_op_pending(&ctx);
+        assert!(!app.book_order_saving());
+        assert!(app.book_op_pending.is_none());
+        assert_eq!(app.book_order_status(), None);
+        assert_eq!(
+            crate::book_order::read_snapshot(&root).unwrap().policy,
+            expected_policy
+        );
+        assert!(writes.try_recv().is_err());
+    }
+}
