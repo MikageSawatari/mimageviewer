@@ -7172,6 +7172,7 @@ mod tests {
             let revision = app.details_cell_content_revisions.tags;
             let projected = app.projected_viewer_context_id();
             let summary = crate::books::BookAppendSummary {
+                shelf: None,
                 book_name: "book".into(),
                 folder,
                 added: 1,

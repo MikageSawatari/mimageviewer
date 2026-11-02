@@ -287,6 +287,17 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   途中の書き込み失敗で同じ項目の一部ストアだけ新しくならないようにする。
   キャンセル可能で、エクスポートは sibling temp を破棄して既存 sidecar を保持する。
   インポートは物理項目ごとの transaction 完了境界で停止し、反映済み項目は rollback しない。
+- 本棚の本の管理順は、本内のページ順と独立する。初期状態は従来の名前比較順。
+  「製本の管理」の各行 ↑ / ↓ は隣接交換を即時反映し、手動順を自動保存する。
+  「今の順を固定」は0冊・1冊でも手動順を開始し、「名前順に戻す」は即時復帰・保存する。
+  正本は本棚直下の `mimageviewer.book-order.json`（UTF-8 / version 1）。保存のない既存本棚は
+  名前順として読み替え、読むだけではファイルを書かない。手動順は現存する既知本の相対順を保ち、
+  未知本を末尾の名前順グループにする。管理作成は末尾、管理改名は位置保持、管理削除後は番号を詰める。
+  番号1〜20・前次・追加先候補・固定本の部分列はApp共通snapshotから導き、設定のpin列は集合として使う。
+  保存中の順操作は継続し、単一writerが後続の最新完全snapshot一件へ集約する。構造変更・root変更・更新は
+  batch終端まで拒否し、管理close後もownerを保持する。失敗時はsession表示を保持し「未保存」とするが、
+  通常再読込はディスク順へ戻る。順序読取異常は名前順表示+全順序write停止で原本を保護する。
+  既存の閲覧・作成・追加・改名・削除は維持する。詳細は [本棚順設計](book-order-plan.md)。
 - 製本の「この本を並べ替え」は常にメニューへ表示し、本フォルダ以外では disabled にする。
   本フォルダでは専用の並べ替えダイアログを開く。小サムネイルの
   サイズをその場で調整でき、ドラッグ中は挿入先に I 字型インジケータを表示する。左右ボタンで
@@ -2494,7 +2505,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `smart_folders` | Vec\<SmartFolderDefinition\> | [] | 任意の複数実フォルダを横断する保存済み snapshot view。定義 UUID、名前、ルールごとの検索元 UUID/path/enabled、保存フィルタ、相対フォルダの並び単位を保持。通常一覧と共通のソート順・サムネイル / 詳細表示は保持せず、索引 / watcher も持たない。開く・更新時に再走査する |
 | `last_folder` | Option\<PathBuf\> | None | 旧復元値と互換 carrier。実フォルダ／本はパス、ドライブ一覧は空パス sentinel を保存する。新しい起動復元 record が無い旧設定の初回移行と、Desktop／Specific の既存 fallback 用に保持する。新 record をこの値で上書きしない |
 | `startup_list_restore` | Option\<StartupListRestore\> | V1 / Unavailable | 「前回終了した場所」の正本。main で最後に明示した復元可能な物理フォルダ／本／ドライブ一覧と、対応する名前・行位置の cursor hint を一つの record に保存する。本の内部 load／直接ページ表示／読書中の本移動／reload は target を更新しない。採用済みの本一覧を明示表示する要求は main の受理時に更新し、遅延 close 完了時に再更新しない。ZIP の実効 prefix と変換書庫の元 logical source を保持する。合成一覧と independent viewer は更新しない。旧設定で欠落時は旧 `last_folder` と cursor を一度だけそのまま移行する。環境設定 export/import の対象外 |
-| `book_root` | Option\<PathBuf\> | None | 製本ルート。`None` のときは `Pictures\mimageviewer\books` を使う。Ctrl+S/Ctrl+G の自動索引対象外で、お気に入り追加対象外。本棚メニューからは Explorer ではなく mIV 内の `本棚` 仮想表示として開く |
+| `book_root` | Option\<PathBuf\> | None | 製本ルート。`None` のときは `Pictures\mimageviewer\books` を使う。Ctrl+S/Ctrl+G の自動索引対象外で、お気に入り追加対象外。本棚メニューからは Explorer ではなく mIV 内の `本棚` 仮想表示として開く。本の管理順は本棚直下の `mimageviewer.book-order.json` へ保存し、設定内には保存しない ([本棚順設計](book-order-plan.md)) |
 | `active_book_name` | String | `名前なし` | 製本メニュー / ツールバー / 追加ショートカットからページを追加する先の本名。製本ルート直下のフォルダ名として使う |
 | `startup_folder_mode` | StartupFolderMode | Previous | 起動時に開く場所。`Previous`=最後に明示した復元可能な一覧、`Desktop`=Windows Known Folder API のデスクトップ、`Drives`=ドライブ一覧、`ReadingHistory`=閲覧履歴、`Specific`=指定フォルダ。Previous は一覧を開き、自動 fullscreen は開始しない |
 | `startup_folder_path` | Option\<PathBuf\> | None | `startup_folder_mode = Specific` の指定フォルダ。開けない場合は Desktop、Desktop も取得できない場合は前回フォルダへフォールバックする |

@@ -699,6 +699,9 @@ pub(crate) use subfolder_expansion::{
 pub(crate) mod book_append_producer_tests;
 pub(crate) mod book_append_refresh;
 mod book_append_undo;
+pub(crate) mod book_shelf;
+#[cfg(test)]
+mod book_shelf_tests;
 mod book_structural_op;
 use book_structural_op::BookStructuralOp;
 mod startup_list_restore;
@@ -17210,7 +17213,7 @@ pub struct App {
     pub(crate) book_manager_rename_name: String,
     pub(crate) book_manager_rename_inputs: std::collections::BTreeMap<String, String>,
     pub(crate) book_manager_delete_confirm: Option<String>,
-    pub(crate) book_list_cache: Option<Vec<crate::books::BookInfo>>,
+    pub(crate) book_shelf: book_shelf::BookShelfOwner,
     saved_group_open_sequence: u64,
     saved_group_open: Option<saved_group_actions::SavedGroupOpenTransition>,
     /// タグセクションがプルダウン表示のときに、コンボで選択中のタグ名 (非永続)。
@@ -21208,7 +21211,7 @@ impl App {
             book_manager_rename_name: String::new(),
             book_manager_rename_inputs: std::collections::BTreeMap::new(),
             book_manager_delete_confirm: None,
-            book_list_cache: None,
+            book_shelf: Default::default(),
             saved_group_open_sequence: 0,
             saved_group_open: None,
             toolbar_tag_dropdown_pick: None,
@@ -23941,6 +23944,7 @@ impl App {
             };
         }
         first![
+            self.book_order_saving() => "book_order",
             self.book_structural_op.is_some() => "book_structural_op",
             self.book_append_undo_in_progress() => "book_append_undo",
             self.image_folder_zip_operation.is_some() => "image_folder_zip",
@@ -53802,24 +53806,36 @@ impl App {
     }
 
     pub(crate) fn request_book_list_refresh(&mut self) {
-        if self.book_op_pending.is_some() || self.book_structural_op.is_some() {
+        if self.book_op_pending.is_some()
+            || self.book_structural_op.is_some()
+            || self.book_order_saving()
+        {
             return;
         }
-        let root = self.book_root_path();
+        let scope = self.begin_book_shelf_read();
+        let root = scope.root.clone();
+        let previous_presence = self
+            .book_shelf
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.root_presence);
         let (tx, rx) = std::sync::mpsc::channel();
         match std::thread::Builder::new()
             .name("book-list".into())
             .spawn(move || {
-                let result = crate::books::list_books(&root).map(crate::books::BookOpResult::List);
+                let result = crate::book_order::read_snapshot_with_prior(&root, previous_presence)
+                    .map(crate::books::BookOpResult::ShelfList);
                 let _ = tx.send(result);
             }) {
             Ok(_) => {
                 self.book_op_pending = Some(crate::books::BookOpPending {
                     rx,
                     intent: crate::books::BookOpIntent::List { navigation: None },
-                });
+                    shelf_scope: Some(scope),
+                })
             }
             Err(err) => {
+                self.fail_book_shelf_read();
                 self.show_feedback_warning(format!("本棚一覧 worker を開始できません: {err}"));
             }
         }
@@ -53934,7 +53950,7 @@ impl App {
                         error
                     })?;
             }
-            crate::books::append_pages_at_with_raw(
+            crate::books::append_pages_at_with_raw_and_shelf(
                 data_dir,
                 root,
                 book_name,
@@ -54193,7 +54209,7 @@ impl App {
                 f,
             );
         }
-        if self.book_structural_op.is_some() {
+        if self.book_structural_op.is_some() || self.book_order_saving() {
             return false;
         }
         if self.book_op_pending.is_some() {
@@ -54210,7 +54226,11 @@ impl App {
             return false;
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        self.book_op_pending = Some(crate::books::BookOpPending { rx, intent });
+        self.book_op_pending = Some(crate::books::BookOpPending {
+            rx,
+            intent,
+            shelf_scope: Some(self.shelf_scope()),
+        });
         match std::thread::Builder::new()
             .name(thread_name.into())
             .spawn(move || {
@@ -54253,12 +54273,30 @@ impl App {
                 Err("製本処理が中断されました".to_string())
             }
         };
+        let scope = self
+            .book_op_pending
+            .as_ref()
+            .and_then(|pending| pending.shelf_scope.clone());
         let intent = self
             .book_op_pending
             .as_ref()
             .expect("book pending is present")
             .intent
             .clone();
+        if let crate::books::BookOpIntent::List { navigation } = &intent {
+            let valid = scope
+                .as_ref()
+                .is_none_or(|scope| self.book_shelf_read_current(scope));
+            if (result.is_err() || !valid)
+                && let Some(id) = *navigation
+            {
+                self.cancel_saved_group_open_request(id);
+            }
+            if !valid {
+                self.book_op_pending = None;
+                return;
+            }
+        }
         let retained = matches!(
             intent,
             crate::books::BookOpIntent::Append { .. }
@@ -54277,17 +54315,17 @@ impl App {
         let continuing = if let Some(source) = source {
             if self.with_viewer_context_ref(source, |_| ()).is_some() {
                 self.with_owner_viewer_context(source, |app| {
-                    app.complete_book_op_result(ctx, result, &intent)
+                    app.complete_book_op_result(ctx, result, &intent, scope.as_ref())
                 })
                 .expect("live owner checked in this UI call")
             } else {
                 self.invalidate_book_append_undo();
                 // Closing the source ends its visible adoption, not the actual
                 // copy/metadata result or its normal success/error notification.
-                self.complete_book_op_result(ctx, result, &intent)
+                self.complete_book_op_result(ctx, result, &intent, scope.as_ref())
             }
         } else {
-            self.complete_book_op_result(ctx, result, &intent)
+            self.complete_book_op_result(ctx, result, &intent, scope.as_ref())
         };
         if continuing {
             return;
@@ -54320,8 +54358,28 @@ impl App {
         ctx: &egui::Context,
         result: Result<crate::books::BookOpResult, String>,
         intent: &crate::books::BookOpIntent,
+        scope: Option<&book_shelf::ShelfScope>,
     ) -> bool {
+        let shelf_current = scope.is_none_or(|scope| self.shelf_scope_current(scope));
         match result {
+            Ok(crate::books::BookOpResult::ShelfUpdated { result, shelf }) => {
+                // Legacy operation consumers invalidate their list. Keep its last
+                // complete value until the same worker's new snapshot is adopted,
+                // including an enumeration failure after filesystem success.
+                let previous = self.book_shelf.snapshot.take();
+                let continuing = self.complete_book_op_result(ctx, Ok(*result), intent, scope);
+                if self.book_shelf.snapshot.is_none() {
+                    self.book_shelf.snapshot = previous;
+                }
+                self.adopt_book_shelf_completion(shelf, scope);
+                return continuing;
+            }
+            Ok(crate::books::BookOpResult::ShelfList(snapshot)) => {
+                self.finish_book_shelf_read(snapshot, scope)
+            }
+            Ok(crate::books::BookOpResult::ShelfOrderSaved(result)) => {
+                self.finish_book_order_write(ctx, result)
+            }
             Ok(crate::books::BookOpResult::Append(summary)) => {
                 if [
                     &summary.metadata_copy.adjusted,
@@ -54389,7 +54447,9 @@ impl App {
                 );
                 self.adopt_book_path_metadata(&[], &summary.edit_copies, None);
                 self.adopt_book_store_summary(summary.metadata);
-                self.book_list_cache = None;
+                if shelf_current {
+                    self.book_shelf.snapshot = None;
+                }
                 if self.current_folder.as_ref().is_some_and(|current| {
                     crate::folder_tree::path_eq(current, &summary.source_folder)
                         || crate::folder_tree::path_eq(current, &summary.target_folder)
@@ -54411,16 +54471,20 @@ impl App {
                     self.book_manager_rename_inputs
                         .insert(row.name.clone(), row.name.clone());
                 }
-                self.book_list_cache = Some(rows);
+                self.finish_book_shelf_read(rows.into(), scope);
             }
             Ok(crate::books::BookOpResult::Created { name, path }) => {
-                self.settings.active_book_name = name.clone();
-                self.settings.save();
-                self.book_manager_new_name.clear();
-                self.book_manager_rename_name = name.clone();
-                self.book_manager_rename_inputs
-                    .insert(name.clone(), name.clone());
-                self.book_list_cache = None;
+                if shelf_current {
+                    self.settings.active_book_name = name.clone();
+                    self.settings.save();
+                    self.book_manager_new_name.clear();
+                    self.book_manager_rename_name = name.clone();
+                    self.book_manager_rename_inputs
+                        .insert(name.clone(), name.clone());
+                    if shelf_current {
+                        self.book_shelf.snapshot = None;
+                    }
+                }
                 self.show_feedback_toast(format!("本を作成しました: {name}"));
                 crate::logger::log(format!("book created: {}", path.display()));
             }
@@ -54439,26 +54503,30 @@ impl App {
                     bookmark_migration_journal_id.as_deref(),
                     Some((&source_folder, &target_folder)),
                 );
-                if self.settings.active_book_name == old_name {
-                    self.settings.active_book_name = new_name.clone();
-                    self.settings.save();
+                if shelf_current {
+                    if self.settings.active_book_name == old_name {
+                        self.settings.active_book_name = new_name.clone();
+                        self.settings.save();
+                    }
+                    // ツールバーのピン留めも旧名→新名へ追従 (Codex P2: 放置すると exists
+                    // フィルタでピンが消えたように見える)。
+                    if let Some(pos) = self
+                        .settings
+                        .pinned_books
+                        .iter()
+                        .position(|b| b == &old_name)
+                    {
+                        self.settings.pinned_books[pos] = new_name.clone();
+                        self.settings.save();
+                    }
+                    self.book_manager_rename_name = new_name.clone();
+                    self.book_manager_rename_inputs.remove(&old_name);
+                    self.book_manager_rename_inputs
+                        .insert(new_name.clone(), new_name.clone());
+                    if shelf_current {
+                        self.book_shelf.snapshot = None;
+                    }
                 }
-                // ツールバーのピン留めも旧名→新名へ追従 (Codex P2: 放置すると exists
-                // フィルタでピンが消えたように見える)。
-                if let Some(pos) = self
-                    .settings
-                    .pinned_books
-                    .iter()
-                    .position(|b| b == &old_name)
-                {
-                    self.settings.pinned_books[pos] = new_name.clone();
-                    self.settings.save();
-                }
-                self.book_manager_rename_name = new_name.clone();
-                self.book_manager_rename_inputs.remove(&old_name);
-                self.book_manager_rename_inputs
-                    .insert(new_name.clone(), new_name.clone());
-                self.book_list_cache = None;
                 self.pending_reload = true;
                 self.show_feedback_toast(format!("本名を変更しました: {old_name} → {new_name}"));
             }
@@ -54486,19 +54554,24 @@ impl App {
                     ));
                 }
                 self.invalidate_rename_migrations_for_removed_paths(std::slice::from_ref(&path));
-                if self.settings.active_book_name == name {
-                    self.settings.active_book_name = crate::books::DEFAULT_BOOK_NAME.to_string();
-                    self.settings.save();
-                    self.book_manager_rename_name = self.settings.active_book_name.clone();
+                if shelf_current {
+                    if self.settings.active_book_name == name {
+                        self.settings.active_book_name =
+                            crate::books::DEFAULT_BOOK_NAME.to_string();
+                        self.settings.save();
+                        self.book_manager_rename_name = self.settings.active_book_name.clone();
+                    }
+                    // 削除された本のピン留めも除去 (Codex P2: 残すと同名再作成でピンが復活する)。
+                    if let Some(pos) = self.settings.pinned_books.iter().position(|b| b == &name) {
+                        self.settings.pinned_books.remove(pos);
+                        self.settings.save();
+                    }
+                    self.book_manager_delete_confirm = None;
+                    self.book_manager_rename_inputs.remove(&name);
+                    if shelf_current {
+                        self.book_shelf.snapshot = None;
+                    }
                 }
-                // 削除された本のピン留めも除去 (Codex P2: 残すと同名再作成でピンが復活する)。
-                if let Some(pos) = self.settings.pinned_books.iter().position(|b| b == &name) {
-                    self.settings.pinned_books.remove(pos);
-                    self.settings.save();
-                }
-                self.book_manager_delete_confirm = None;
-                self.book_manager_rename_inputs.remove(&name);
-                self.book_list_cache = None;
                 self.pending_reload = true;
                 self.show_feedback_toast(format!("本を削除しました: {name}"));
             }
@@ -54515,7 +54588,9 @@ impl App {
                     bookmark_migration_journal_id.as_deref(),
                     None,
                 );
-                self.book_list_cache = None;
+                if shelf_current {
+                    self.book_shelf.snapshot = None;
+                }
                 if self
                     .current_folder
                     .as_ref()
@@ -54526,6 +54601,16 @@ impl App {
                 self.show_feedback_toast(format!("ページ順を保存しました: {count} ページ"));
             }
             Err(err) => {
+                if matches!(intent, crate::books::BookOpIntent::ShelfOrder) {
+                    self.finish_book_order_write(
+                        ctx,
+                        Err(crate::book_order::BookOrderWriteError::Failed(err)),
+                    );
+                    return false;
+                }
+                if matches!(intent, crate::books::BookOpIntent::List { .. }) {
+                    self.fail_book_shelf_read();
+                }
                 crate::logger::log(format!("book op failed: {err}"));
                 self.show_feedback_error(format!("製本処理に失敗しました: {err}"));
             }

@@ -17,6 +17,7 @@ pub(crate) struct RootLifecycleSnapshot {
     sidecar_rejected: bool,
     zip_deferred: bool,
     process_deferred: bool,
+    book_order_deferred: bool,
 }
 
 impl App {
@@ -61,9 +62,11 @@ impl App {
             sidecar_rejected,
             zip_deferred: false,
             process_deferred: false,
+            book_order_deferred: false,
         };
         if let Some(intent) = intent {
             // These are independent existing owners: a single close must reach all of them.
+            snapshot.book_order_deferred = self.accept_book_order_root_close(ctx, intent);
             snapshot.process_deferred = self.accept_settings_family_root_close(ctx, intent);
             snapshot.process_deferred |= self.accept_composition_editor_root_close(ctx);
             snapshot.zip_deferred = self.accept_image_folder_zip_root_close(ctx, intent);
@@ -86,7 +89,7 @@ impl App {
         let Some(intent) = snapshot.intent else {
             return;
         };
-        if snapshot.zip_deferred || snapshot.sidecar_rejected {
+        if snapshot.zip_deferred || snapshot.sidecar_rejected || snapshot.book_order_deferred {
             return;
         }
         self.intercept_root_close_request(
@@ -114,8 +117,10 @@ impl App {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         let snapshot = self.accept_root_lifecycle_request(ctx, Some(intent));
-        let blocked =
-            snapshot.process_deferred || snapshot.zip_deferred || snapshot.sidecar_rejected;
+        let blocked = snapshot.process_deferred
+            || snapshot.zip_deferred
+            || snapshot.sidecar_rejected
+            || snapshot.book_order_deferred;
         // A resumed ordinary Close still crosses modal/tray policy. It never becomes Quit.
         let tray_close = !matches!(intent, RootCloseIntent::ApplicationQuit)
             && (matches!(intent, RootCloseIntent::TrayHide)

@@ -684,6 +684,7 @@ mod tests {
         let fixture = Fixture::new();
         let receipt = fixture.receipt(1);
         let mut summary = crate::books::BookAppendSummary {
+            shelf: None,
             book_name: "book".into(),
             folder: fixture.folder.clone(),
             added: 1,

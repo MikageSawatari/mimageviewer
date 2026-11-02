@@ -34,6 +34,7 @@ pub(crate) struct BookStructuralOp {
     phase: Phase,
     intent: crate::books::BookOpIntent,
     completion: Completion,
+    shelf_scope: Option<super::book_shelf::ShelfScope>,
     _lease: Option<crate::remote_ipc::session::LocalModalLease>,
 }
 
@@ -51,6 +52,7 @@ impl BookStructuralOp {
             },
             intent,
             completion,
+            shelf_scope: None,
             _lease: None,
         }
     }
@@ -73,7 +75,7 @@ impl App {
     /// D2c: finish every accepted open before admitting a structural modal. The
     /// source path is deliberately irrelevant. Retained-session readoption and
     /// passive display/decoder reads are not new opens.
-    fn book_structural_open_pending(&mut self) -> bool {
+    pub(super) fn book_structural_open_pending(&mut self) -> bool {
         if self.sidecar_restore.is_some()
             || self.saved_group_open.is_some()
             || self.startup_open_path_resolve_pending.is_some()
@@ -239,6 +241,9 @@ impl App {
     }
 
     fn book_structural_admission_block_reason(&self) -> Option<&'static str> {
+        if self.book_order_saving() {
+            return Some("本の順序を保存中です");
+        }
         if self.book_structural_op.is_some() || self.book_op_pending.is_some() {
             return Some("製本処理中です");
         }
@@ -320,6 +325,7 @@ impl App {
             },
             intent,
             completion,
+            shelf_scope: Some(self.shelf_scope()),
             _lease: lease,
         });
         ctx.request_repaint();
@@ -419,9 +425,16 @@ impl App {
                 }
             },
         };
+        // Shelf completion wraps the same filesystem result; page consumers still
+        // adopt their original transfer payload before the bookshelf projection.
+        let operation = match &result {
+            Ok(crate::books::BookOpResult::ShelfUpdated { result, .. }) => Some(result.as_ref()),
+            Ok(result) => Some(result),
+            Err(_) => None,
+        };
         // The lease remains in op until every result consumer has adopted the mutation.
         if let Completion::ReorderTransfer = op.completion
-            && let Ok(crate::books::BookOpResult::Transfer(summary)) = &result
+            && let Some(crate::books::BookOpResult::Transfer(summary)) = operation
             && let Some(state) = self.book_reorder.as_mut()
         {
             state.entries = summary.source_entries.clone();
@@ -453,7 +466,7 @@ impl App {
         {
             state.error = Some(error.clone());
         }
-        self.complete_book_op_result(ctx, result, &op.intent);
+        self.complete_book_op_result(ctx, result, &op.intent, op.shelf_scope.as_ref());
         if (matches!(op.completion, Completion::ReorderFlush) && success)
             || (matches!(op.completion, Completion::ReorderTransfer)
                 && (!success
@@ -839,7 +852,11 @@ mod tests {
             crate::books::BookOpIntent::Delete { path: "B".into() },
         ] {
             let (_tx, rx) = mpsc::channel();
-            app.book_op_pending = Some(crate::books::BookOpPending { rx, intent });
+            app.book_op_pending = Some(crate::books::BookOpPending {
+                rx,
+                intent,
+                shelf_scope: None,
+            });
             assert!(!request(&mut app, || unreachable!()));
             assert!(app.book_structural_op.is_none());
         }

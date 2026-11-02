@@ -29,6 +29,105 @@ use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
 
 #[test]
+fn book_manager_numbered_dark() {
+    snapshot_with_theme_at_size(
+        "book_manager_numbered_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(900.0, 600.0),
+        None,
+        |ui| mimageviewer::draw_book_manager_snapshot_fixture(ui, "名前順", None, 6),
+    );
+}
+
+#[test]
+fn book_manager_manual_light() {
+    snapshot_with_theme_at_size(
+        "book_manager_manual_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(1093.0, 614.0),
+        None,
+        |ui| mimageviewer::draw_book_manager_snapshot_fixture(ui, "手動順", None, 21),
+    );
+}
+
+#[test]
+fn book_manager_saving_small_dark() {
+    snapshot_with_theme_at_size(
+        "book_manager_saving_small_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(546.5, 307.0),
+        None,
+        |ui| mimageviewer::draw_book_manager_snapshot_fixture(ui, "手動順", Some("保存中…"), 21),
+    );
+}
+
+#[test]
+fn book_manager_unsaved_light() {
+    snapshot_with_theme_at_size(
+        "book_manager_unsaved_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(700.0, 460.0),
+        None,
+        |ui| mimageviewer::draw_book_manager_snapshot_fixture(ui, "手動順", Some("未保存"), 1),
+    );
+}
+
+#[test]
+fn book_manager_readonly_dark() {
+    snapshot_with_theme_at_size(
+        "book_manager_readonly_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(700.0, 460.0),
+        None,
+        |ui| {
+            mimageviewer::draw_book_manager_snapshot_fixture(
+                ui,
+                "名前順",
+                Some("本の順序を読み込めないため名前順で表示しています"),
+                6,
+            )
+        },
+    );
+}
+
+#[test]
+fn book_manager_window_close_and_mode_controls_in_small_viewport() {
+    for screen in [egui::vec2(1093.0, 614.0), egui::vec2(1366.0, 728.0)] {
+        for scale in [1.0, 2.0] {
+            for (mode, status) in [
+                ("名前順", None),
+                ("手動順", Some("保存中…")),
+                (
+                    "名前順",
+                    Some("本の順序を読み込めないため名前順で表示しています"),
+                ),
+            ] {
+                let size = screen / scale;
+                let mut fonts_ready = false;
+                let mut harness = test_ui::builder().with_size(size).build_ui(move |ui| {
+                    if !fonts_ready {
+                        install_app_fonts(ui.ctx());
+                        fonts_ready = true;
+                        ui.ctx().request_repaint();
+                        return;
+                    }
+                    mimageviewer::draw_book_manager_snapshot_fixture(ui, mode, status, 21);
+                });
+                harness.run();
+                let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                for label in ["Close window", "今の順を固定", "名前順に戻す"] {
+                    let rect = harness.get_by_label(label).rect();
+                    assert!(
+                        bounds.contains_rect(rect),
+                        "{label} outside viewport: {rect:?}; viewport={bounds:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn cache_manager_collection_dark() {
     snapshot_with_theme_at_size(
         "cache_manager_collection_dark",

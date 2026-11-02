@@ -387,6 +387,9 @@ impl App {
                 lease,
                 phase: SavedGroupOpenPhase::WaitingBookList,
             };
+            if action != KeyAction::GridOpenActiveBook && self.book_list_read_failed() {
+                self.request_book_list_refresh();
+            }
             let target = if action == KeyAction::GridOpenActiveBook {
                 Some(self.active_book_folder_path())
             } else if let Some(pending) = self.book_op_pending.as_mut() {
@@ -397,7 +400,7 @@ impl App {
                     self.show_feedback_warning("本棚の更新処理が進行中です".into());
                     return None;
                 }
-            } else if let Some(rows) = self.book_list_cache.as_ref() {
+            } else if let Some(rows) = self.book_shelf.snapshot.as_ref() {
                 match book_action_target(rows, action, transition.current_book.as_ref()) {
                     Ok(path) => Some(path),
                     Err(message) => {
@@ -520,7 +523,7 @@ impl App {
                     if let Some(delay) = request.lease.completion_poll_delay() {
                         ctx.request_repaint_after(delay);
                     }
-                } else if let Some(rows) = self.book_list_cache.as_ref() {
+                } else if let Some(rows) = self.book_shelf.snapshot.as_ref() {
                     match book_action_target(rows, request.action, request.current_book.as_ref()) {
                         Ok(path) => {
                             if let Err(message) = self.start_saved_book_scan(&mut request, path) {
@@ -758,17 +761,18 @@ mod tests {
             path: app.tmp.path().join("Cached"),
             page_count: 3,
         };
-        app.book_list_cache = Some(vec![old]);
+        app.book_shelf.snapshot = Some(vec![old].into());
         let (sender, receiver) = std::sync::mpsc::channel();
         app.book_op_pending = Some(crate::books::BookOpPending {
             rx: receiver,
             intent: crate::books::BookOpIntent::List { navigation: None },
+            shelf_scope: None,
         });
 
         app.open_book_manager_from_action();
 
         assert!(app.show_book_manager);
-        assert_eq!(app.book_list_cache.as_ref().unwrap()[0].name, "Cached");
+        assert_eq!(app.book_shelf.snapshot.as_ref().unwrap()[0].name, "Cached");
         sender
             .send(Ok(crate::books::BookOpResult::List(vec![
                 crate::books::BookInfo {
@@ -779,7 +783,97 @@ mod tests {
             ])))
             .unwrap();
         app.poll_book_op_pending(&egui::Context::default());
-        assert_eq!(app.book_list_cache.as_ref().unwrap()[0].name, "Fresh");
+        assert_eq!(app.book_shelf.snapshot.as_ref().unwrap()[0].name, "Fresh");
+    }
+
+    #[test]
+    fn book_number_waits_for_pending_refresh_instead_of_resolving_warm_rows() {
+        let mut app = crate::app::setup_app_for_test();
+        app.book_shelf.snapshot = Some(
+            vec![crate::books::BookInfo {
+                name: "Old".into(),
+                path: app.tmp.path().join("Old"),
+                page_count: 3,
+            }]
+            .into(),
+        );
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        app.book_op_pending = Some(crate::books::BookOpPending {
+            rx: receiver,
+            intent: crate::books::BookOpIntent::List { navigation: None },
+            shelf_scope: None,
+        });
+        let ctx = egui::Context::default();
+        app.apply_saved_group_key_action(&ctx, KeyAction::GridOpenBook1);
+        let request = app.saved_group_open.as_ref().unwrap();
+        assert!(matches!(
+            request.phase,
+            SavedGroupOpenPhase::WaitingBookList
+        ));
+        let request_id = request.id;
+        assert!(matches!(
+            app.book_op_pending.as_ref().map(|pending| &pending.intent),
+            Some(crate::books::BookOpIntent::List { navigation: Some(id) })
+                if *id == request_id
+        ));
+        app.poll_saved_group_open(&ctx);
+        assert!(matches!(
+            app.saved_group_open.as_ref().unwrap().phase,
+            SavedGroupOpenPhase::WaitingBookList
+        ));
+        assert!(app.saved_group_ready_nav().is_none());
+    }
+
+    #[test]
+    fn failed_warm_book_refresh_cancels_numbered_navigation_without_using_old_rows() {
+        let mut app = crate::app::setup_app_for_test();
+        app.book_shelf.snapshot = Some(
+            vec![crate::books::BookInfo {
+                name: "Old".into(),
+                path: app.tmp.path().join("Old"),
+                page_count: 3,
+            }]
+            .into(),
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.book_op_pending = Some(crate::books::BookOpPending {
+            rx: receiver,
+            intent: crate::books::BookOpIntent::List { navigation: None },
+            shelf_scope: None,
+        });
+        let ctx = egui::Context::default();
+        app.apply_saved_group_key_action(&ctx, KeyAction::GridOpenBook1);
+        assert!(app.saved_group_open.is_some());
+        sender.send(Err("test listing failed".into())).unwrap();
+        app.poll_book_op_pending(&ctx);
+        app.poll_saved_group_open(&ctx);
+        assert!(app.saved_group_open.is_none());
+        assert!(app.saved_group_ready_nav().is_none());
+        assert_eq!(app.book_shelf.snapshot.as_ref().unwrap()[0].name, "Old");
+    }
+
+    #[test]
+    fn numbered_input_after_failed_warm_read_reloads_once_before_selecting_a_book() {
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("books");
+        std::fs::create_dir_all(root.join("Old")).unwrap();
+        app.settings.book_root = Some(root.clone());
+        app.book_shelf.snapshot = Some(crate::book_order::read_snapshot(&root).unwrap());
+        app.begin_book_shelf_read();
+        app.fail_book_shelf_read();
+        let ctx = egui::Context::default();
+        app.apply_saved_group_key_action(&ctx, KeyAction::GridOpenBook1);
+        assert!(app.book_list_refresh_pending());
+        assert!(matches!(
+            app.saved_group_open.as_ref().unwrap().phase,
+            SavedGroupOpenPhase::WaitingBookList
+        ));
+        let pending = app.book_op_pending.take().unwrap();
+        let result = pending.rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(result.is_ok());
+        app.cancel_saved_group_open_for_other_nav();
+        app.complete_book_op_result(&ctx, result, &pending.intent, pending.shelf_scope.as_ref());
+        assert_eq!(app.book_order_status(), None);
     }
 
     #[test]
@@ -941,7 +1035,7 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         app.settings.book_root = Some(root);
         app.settings.pinned_books = vec!["Zulu".into()];
-        app.book_list_cache = None;
+        app.book_shelf.snapshot = None;
         let ctx = egui::Context::default();
         let old_generation = app.top_level_grid_view.generation();
         let old_history = app.folder_nav_back_stack.len();
@@ -985,6 +1079,131 @@ mod tests {
                 .as_ref()
                 .is_some_and(|path| crate::folder_tree::path_eq(path, &alpha))
         );
+    }
+
+    fn numbered_open_after_shelf_switch_retires_old_list(return_to_a: bool) {
+        for old_navigation in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let root_a = app.tmp.path().join("shelf-a");
+            let root_b = app.tmp.path().join("shelf-b");
+            std::fs::create_dir_all(root_a.join("First in A")).unwrap();
+            std::fs::create_dir_all(root_b.join("First in B")).unwrap();
+            app.settings.book_root = Some(root_a.clone());
+            app.book_shelf.snapshot = None;
+            let old_scope = app.begin_book_shelf_read();
+            let (old_reply, old_rx) = std::sync::mpsc::channel();
+            app.book_op_pending = Some(crate::books::BookOpPending {
+                rx: old_rx,
+                intent: crate::books::BookOpIntent::List { navigation: None },
+                shelf_scope: Some(old_scope.clone()),
+            });
+            let ctx = egui::Context::default();
+            let previous_id = if old_navigation {
+                app.apply_saved_group_key_action(&ctx, KeyAction::GridOpenBook1);
+                app.saved_group_open_request_id_for_test()
+            } else {
+                None
+            };
+            let mut settings = app.settings.clone();
+            settings.book_root = Some(root_b.clone());
+            app.install_preferences_settings(settings);
+            assert!(
+                app.book_op_pending.is_none(),
+                "old List must retire before its reply"
+            );
+            assert!(app.saved_group_open.is_none());
+            if return_to_a {
+                let mut settings = app.settings.clone();
+                settings.book_root = Some(root_a.clone());
+                app.install_preferences_settings(settings);
+            }
+            assert!(!app.shelf_scope_current(&old_scope));
+            let current_root = if return_to_a { &root_a } else { &root_b };
+            let expected = current_root.join(if return_to_a {
+                "First in A"
+            } else {
+                "First in B"
+            });
+
+            // The previous reader is still unresolved. The new input must start
+            // its own current-root List rather than waiting on that reader.
+            app.apply_saved_group_key_action(&ctx, KeyAction::GridOpenBook1);
+            let id = app.saved_group_open_request_id_for_test().unwrap();
+            assert_ne!(Some(id), previous_id);
+            let pending = app.book_op_pending.as_ref().unwrap();
+            assert!(app.book_shelf_read_current(pending.shelf_scope.as_ref().unwrap()));
+            assert_eq!(&pending.shelf_scope.as_ref().unwrap().root, current_root);
+            assert!(
+                matches!(pending.intent, crate::books::BookOpIntent::List { navigation: Some(owner) } if owner == id)
+            );
+            // A late result can no longer reach the App or cancel this new id.
+            assert!(old_reply.send(Err("retired old reader".into())).is_err());
+            assert_eq!(app.saved_group_open_request_id_for_test(), Some(id));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                app.poll_book_op_pending(&ctx);
+                app.poll_saved_group_open(&ctx);
+                if matches!(
+                    app.saved_group_open.as_ref().map(|request| &request.phase),
+                    Some(SavedGroupOpenPhase::ReadyBook { .. })
+                ) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "current shelf numbered open did not complete"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                matches!(app.saved_group_open.as_ref().map(|request| &request.phase), Some(SavedGroupOpenPhase::ReadyBook { path, .. }) if path == &expected)
+            );
+            assert_eq!(
+                &app.book_shelf.snapshot.as_ref().unwrap().root,
+                current_root
+            );
+            app.adopt_saved_group_ready(id);
+            assert!(app.saved_group_open.is_none());
+            assert_eq!(app.current_folder.as_ref(), Some(&expected));
+        }
+    }
+
+    #[test]
+    fn numbered_open_after_a_to_b_uses_current_shelf_before_old_list_reply() {
+        numbered_open_after_shelf_switch_retires_old_list(false);
+    }
+
+    #[test]
+    fn numbered_open_after_a_to_b_to_a_uses_new_epoch_before_old_list_reply() {
+        numbered_open_after_shelf_switch_retires_old_list(true);
+    }
+
+    #[test]
+    fn shelf_switch_retires_list_without_cancelling_independent_active_book_open() {
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("shelf-a");
+        std::fs::create_dir_all(root.join("Active")).unwrap();
+        app.settings.book_root = Some(root);
+        app.settings.active_book_name = "Active".into();
+        let scope = app.begin_book_shelf_read();
+        let (old_reply, rx) = std::sync::mpsc::channel();
+        app.book_op_pending = Some(crate::books::BookOpPending {
+            rx,
+            intent: crate::books::BookOpIntent::List { navigation: None },
+            shelf_scope: Some(scope),
+        });
+        app.apply_saved_group_key_action(&egui::Context::default(), KeyAction::GridOpenActiveBook);
+        let id = app.saved_group_open_request_id_for_test().unwrap();
+        let mut settings = app.settings.clone();
+        settings.book_root = Some(app.tmp.path().join("shelf-b"));
+        app.install_preferences_settings(settings);
+        assert!(app.book_op_pending.is_none());
+        assert!(old_reply.send(Err("retired List".into())).is_err());
+        assert_eq!(app.saved_group_open_request_id_for_test(), Some(id));
+        assert!(matches!(
+            app.saved_group_open.as_ref().map(|request| &request.phase),
+            Some(SavedGroupOpenPhase::ScanningBook { .. })
+        ));
     }
 
     #[test]
@@ -1095,7 +1314,7 @@ mod tests {
         std::fs::create_dir_all(root.join("First")).unwrap();
         let mut app = crate::app::setup_app_for_test();
         app.settings.book_root = Some(root);
-        app.book_list_cache = None;
+        app.book_shelf.snapshot = None;
         let ctx = egui::Context::default();
         let before = app.current_folder.clone();
         let history = app.folder_nav_back_stack.len();
@@ -1114,7 +1333,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         app.poll_saved_group_open(&ctx);
-        assert!(app.book_list_cache.is_some());
+        assert!(app.book_shelf.snapshot.is_some());
         assert!(app.saved_group_ready_nav().is_none());
         assert_eq!(app.current_folder, before);
         assert_eq!(app.folder_nav_back_stack.len(), history);
@@ -1155,7 +1374,7 @@ mod tests {
             .unwrap(),
             zulu,
         );
-        app.book_list_cache = Some(rows);
+        app.book_shelf.snapshot = Some(rows.into());
         let ctx = egui::Context::default();
         app.apply_saved_group_key_action(&ctx, KeyAction::GridBookPrev);
         assert!(app.saved_group_open_modal_visible());
@@ -1172,7 +1391,7 @@ mod tests {
         std::fs::create_dir_all(root.join("First")).unwrap();
         let mut app = crate::app::setup_app_for_test();
         app.settings.book_root = Some(root);
-        app.book_list_cache = None;
+        app.book_shelf.snapshot = None;
         app.keymap = crate::keymap::Keymap::from_ini_str(
             "[Grid]\nGridOpenBook1 = F13\nGridManageFavorites = F14\n",
         );
