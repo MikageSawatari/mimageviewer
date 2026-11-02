@@ -229,6 +229,28 @@ impl CaptionDb {
     /// filesystem metadata call is made inside the transaction. DB failures are
     /// returned to V1-3 to stop the job and notify the user, without retrying.
     pub fn save(&self, request: &SaveRequest) -> rusqlite::Result<SaveOutcome> {
+        self.save_inner(request, || false)
+            .map(|result| result.expect("uncancellable save"))
+    }
+
+    /// A caption job may be cancelled while SQLite waits for another writer.
+    /// Check again inside the transaction, at the mutation boundary. None means
+    /// cancellation, distinct from an input signature change (Discarded).
+    pub(crate) fn save_unless_cancelled(
+        &self,
+        request: &SaveRequest,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> rusqlite::Result<Option<SaveOutcome>> {
+        self.save_inner(request, || {
+            cancel.load(std::sync::atomic::Ordering::Acquire)
+        })
+    }
+
+    fn save_inner(
+        &self,
+        request: &SaveRequest,
+        cancelled: impl Fn() -> bool,
+    ) -> rusqlite::Result<Option<SaveOutcome>> {
         if let CaptionResult::Ok {
             caption,
             text,
@@ -238,13 +260,17 @@ impl CaptionDb {
             validate_caption(caption, text, keywords).map_err(|_| rusqlite::Error::InvalidQuery)?;
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if cancelled() {
+            tx.rollback()?;
+            return Ok(None);
+        }
         let current = std::fs::metadata(&request.signature_path)
             .ok()
             .as_ref()
             .and_then(FileSignature::from_metadata);
         if current != Some(request.signature) {
             tx.rollback()?;
-            return Ok(SaveOutcome::Discarded);
+            return Ok(Some(SaveOutcome::Discarded));
         }
         let key = Self::normalize_path(&request.item_path);
         let (status, caption, text, keywords) = match &request.result {
@@ -260,6 +286,10 @@ impl CaptionDb {
             ),
             CaptionResult::Failed => ("failed", "", "", "[]".to_string()),
         };
+        if cancelled() {
+            tx.rollback()?;
+            return Ok(None);
+        }
         let changed = tx.execute(
             "INSERT INTO captions (item_key, mtime_ms, size, model_id, prompt_version,
                 lang, caption, visible_text, cover_ref, keywords, status, created_at)
@@ -287,11 +317,11 @@ impl CaptionDb {
             ],
         )?;
         tx.commit()?;
-        Ok(if changed == 0 {
+        Ok(Some(if changed == 0 {
             SaveOutcome::KeptExistingOk
         } else {
             SaveOutcome::Written
-        })
+        }))
     }
 
     /// Worker-only destination initialization/purge. The trigger records removal.
@@ -352,6 +382,46 @@ mod tests {
         let db = CaptionDb::open_at(temp.path().join("ai_caption.db")).unwrap();
         let req = request(&path);
         (temp, db, req)
+    }
+
+    #[test]
+    fn caption_job_cancel_while_waiting_for_db_writer_does_not_save() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        thread_local! {
+            static WAITING: std::cell::RefCell<Option<mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+        }
+        fn busy(_attempt: i32) -> bool {
+            WAITING.with(|slot| {
+                if let Some(notify) = slot.borrow_mut().take() {
+                    let _ = notify.send(());
+                }
+            });
+            std::thread::sleep(Duration::from_millis(1));
+            true
+        }
+        let (temp, db, req) = fixture();
+        let path = temp.path().join("ai_caption.db");
+        let tx = Transaction::new_unchecked(&db.conn, TransactionBehavior::Immediate).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let (notify, waiting) = mpsc::channel();
+        let worker_req = req.clone();
+        let worker = std::thread::spawn(move || {
+            let db = CaptionDb::open_existing_for_write(path).unwrap();
+            WAITING.with(|slot| *slot.borrow_mut() = Some(notify));
+            db.conn.busy_handler(Some(busy)).unwrap();
+            db.save_unless_cancelled(&worker_req, &worker_cancel)
+                .unwrap()
+        });
+        waiting.recv_timeout(Duration::from_secs(10)).unwrap();
+        cancel.store(true, Ordering::Release);
+        tx.rollback().unwrap();
+        assert_eq!(worker.join().unwrap(), None);
+        assert!(read(&db, &req).is_none());
+        assert_eq!(seq(&db), 0);
     }
 
     fn read(db: &CaptionDb, req: &SaveRequest) -> Option<CaptionRow> {

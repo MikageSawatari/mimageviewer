@@ -16,6 +16,7 @@ impl VlmSetup {
 pub(crate) struct VlmPreferencesView;
 
 impl App {
+    pub(crate) fn request_create_ai_captions(&mut self, _ctx: &egui::Context, _background: bool) {}
     pub(crate) fn poll_vlm_setup(&mut self, _ctx: &egui::Context) {}
     pub(crate) fn show_vlm_addon_dialog(&mut self, _ctx: &egui::Context) {}
     pub(crate) fn refresh_vlm_preferences(&mut self, _ctx: &egui::Context) {}

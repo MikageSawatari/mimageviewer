@@ -710,8 +710,9 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 
 | ワーカー | 実装 | 個数 | 用途 |
 | --- | --- | --- | --- |
-| AI 説明文モデルの管理 (V1-3b) | App の `VlmSetup` → `VlmAddon`、短命 scan/install/remove thread と bounded channel | 同時に1処理 (GPU 検査は別に起動中1回) | 設定／明示要求から lazy scan と GPU 検査。HTTP は新規の小さな VLM 専用 transport。Range 再開、取得量の上限、部分 SHA-256、連結後 SHA-256 を検査し、staging → packs → INSTALL_OK → active.json の順に公開。取消／削除は完了採用まで受付を閉じる。取得窓の寿命と owner を分け、閉じても completion barrier を保持。UI は cached view と非blocking poll のみ、静止時の repaint は追加しない。作成ジョブは V1-3c |
-| ローカル AI 説明文 (V1-1、ジョブ/UI は未接続) | 別 exe `mimageviewer-vlm.exe --serve` + `ai::vlm_worker::VlmWorkerClient` + stdin writer / stdout reader / stderr logger | client ごとに子 1 本、要求は直列 1 件 | EPUB と共通の `job_process` が suspended 起動 → kill-on-close Job 割当 → resume を行い、HANDLE_LIST でその子の標準入出力だけを継承する。16MiB 上限の u32 LE 枠に JSON 長・JSON・RGB8 を格納する。ジョブスレッドだけが呼び、hello 30秒・load 120秒・初回caption 120秒・以降60秒で待つ。image_failure は続行、fatal/不正枠/切断/期限超過は Job を kill して client を退役し、再起動しない。通常の中止は現在の1件の完了後に shutdown、アプリ終了は共有 kill handle で即停止。UI で join しない。GPU の判定は --list-devices を必要時に worker スレッドで1回実行し、最大の専用 VRAM のアダプター・LUID・総量・Vulkan 対応を起動中だけ保持する。詳細は [計画 §21](local-vlm-caption-plan.md#213-v1-1-の設計) |
+| AI 説明文モデルの管理 (V1-3b) | App の `VlmSetup` → `VlmAddon`、短命 scan/install/remove thread と bounded channel | 同時に1処理 (GPU 検査は別に起動中1回) | 設定／明示要求から lazy scan と GPU 検査。HTTP は新規の小さな VLM 専用 transport。Range 再開、取得量の上限、部分 SHA-256、連結後 SHA-256 を検査し、staging → packs → INSTALL_OK → active.json の順に公開。取消／削除は完了採用まで受付を閉じる。取得窓の寿命と owner を分け、閉じても completion barrier を保持。UI は cached view と非blocking poll のみ、静止時の repaint は追加しない。成功時に凍結した対象を作成ジョブへ一回渡す |
+| AI 説明文の作成ジョブ (V1-3c) | `App::caption_job` → job worker → VLM client、命令／結果channel | App全体で1本、対象は1件ずつ | App が待ち行列と `Running` / `Stopping` の唯一の owner。worker は `Item(path)` / `Finish` を受け、署名確認・既存行の判定・canonical decode・回転・縮小・推論・保存を行い、1件ごとの結果と完了を返して `request_repaint` する。進捗窓はmainのみのmodeless。中止・最後の結果で先に受付を閉じ、処理中の1件が無くなってから `Finish`。中止後の結果は保存しない。fatal・切断・時間切れ・DB失敗は停止と通知、再試行なし。詳細は下の §3.2.3 |
+| ローカル AI 説明文の推論 | 別 exe `mimageviewer-vlm.exe --serve` + `ai::vlm_worker::VlmWorkerClient` + stdin writer / stdout reader / stderr logger | client ごとに子 1 本、要求は直列 1 件 | EPUB と共通の `job_process` が suspended 起動 → kill-on-close Job 割当 → resume を行い、HANDLE_LIST でその子の標準入出力だけを継承する。16MiB 上限の u32 LE 枠に JSON 長・JSON・RGB8 を格納する。ジョブスレッドだけが呼び、hello 30秒・load 120秒・初回caption 120秒・以降60秒で待つ。image_failure は続行、fatal/不正枠/切断/期限超過は Job を kill して client を退役し、再起動しない。通常の中止は現在の1件の完了後に shutdown、アプリ終了は共有 kill handle で即停止。UI で join しない。GPU の判定は --list-devices を必要時に worker スレッドで1回実行し、最大の専用 VRAM のアダプター・LUID・総量・Vulkan 対応を起動中だけ保持する。詳細は [計画 §21](local-vlm-caption-plan.md#213-v1-1-の設計) |
 | HTML 画像の取得・選択保存 | `std::thread` (`clipboard-fetch-0`〜`3`) + bounded result channel、session 最終解放後の短命 `clipboard-fetch-cleanup` | App 所有サービスごとに固定 4 worker | 起動時の一時ルート清掃、ページ区分と session 固有 Agent の準備、上限付き取得・ヘッダ寸法検査・原本ハッシュ・縮小画像準備、選択済み原本の背景保存を共通 queue で処理する。ダイアログごとに原本予算 2 GiB、画像ごとに実読取 64 MiB。保存 worker は自動 intent だけ月別保存先の背景解決を待ち、手動 intent は現在の実フォルダ直下へ保存する。最後の fetch / save owner 解放後に一時フォルダを背景削除する |
 | 手動クリップボード取り込み | `std::thread` (`clipboard-capture-manual`) | process ごとに最大 1 要求 | Ctrl+V の画像 / HTML 分岐から短命 worker を起動し、生データ取得後に Clipboard を閉じてから解析・画像保存を行う。HTML snapshot と画像保存の完了・失敗は typed event と repaint で App へ返す。監視の設定世代・除外・重複抑止を参照しない |
 | クリップボード画像・HTML の自動監視 | message-only window STA (`clipboard-capture-listener`) + reader STA (`clipboard-capture-reader`) + bounded 保存 worker (`clipboard-capture-save`) + Win32 / GDI (`clipboard-capture-popup`) | App / process ごとに各 1 | 最初に監視を有効にしたときに非同期起動し、両 OFF でも App 終了まで保持。起動時の読取はしない。通知ごとに不変 `Arc` スナップショットと request serial / sequence / 通知時刻を latest slot へ置く。reader は要求・直前・直後の sequence と現在世代の一致だけを受理し、不一致なら最新要求優先、なければ同じスナップショットで 1 回だけ再読取。開く前の 300 ms の合流待ちと形式 availability の除外判定は上記のとおり。clipboard を開いている間は上限付き生バイトのコピーだけを行い、閉じてから分類・デコード・ハッシュ計算を行う。保存 queue は 1 件に制限し、保存開始前に世代を確認する。開始済みの保存は完了まで行い、古い世代の小窓は表示しない。設定変更で小窓を隠す。UI は typed event と repaint だけを受ける。終了時は listener へ shutdown を post できた場合だけ join し、外部呼出中の reader / 保存 worker は待たない。切り取り監視とは独立。詳細は [clipboard-capture-plan.md](clipboard-capture-plan.md) |
@@ -1292,6 +1293,22 @@ worker は CPU pixels までを作り、`ctx.load_texture` は UI スレッド�
 prefix preview、`edit_result` texture 化を合わせて **1 フレーム 1 枚**だけ upload する。ready result が
 複数あれば表示中ページを優先し、残りは pending の `ready` に保持して repaint を要求する。
 materialization 待ちの edit / final assembly は `None` を返し、未完成の上位レイヤーを作らない。
+
+### 3.2.3 AI 説明文ジョブの受付と終了
+
+待ち行列と終了判断は `App::caption_job` の同じ owner で直列に行う。`Running` 中の追加は待ち行列の
+末尾へ足し、既に待っているパスの重複を除く。worker は次の命令を待ち、キューが空かどうかを判断しない。
+最後の結果で待ち行列が空なら、同じフレームで `Stopping` にして受付を閉じ、`Finish` を送る。
+中止操作では現在の推論が終わる前に `Stopping` へ移り、cancel の `AtomicBool` を立て、未開始分を捨てる。
+現在の1件の結果は保存せず、処理中の1件が無くなってから `Finish` を送る。
+`Stopping` 中は対象を追加せず、完了後に選び直してもらう。次ジョブ用の pending queue は持たない。
+worker の完了通知を poll で採用するまで App の owner とモデル削除の排他を維持する。
+
+画像の読み込み・回転DBの参照・推論・保存は job worker 内で行い、保存は `BEGIN IMMEDIATE` 後に
+入力署名を再確認する。モデルの出力を保存する前に、前後の空白を除いた完全一致の検索語だけを重複除去する。
+保存の成功通知は表示キャッシュ／索引向けの単一hookへ集約するが、V1-3c では後段の接続は行わない。
+フォルダ移動・detachedのclose・Remote利用では止めない。App終了だけは共有kill handleで子を即時停止し、
+UI threadでworkerをjoinしない。詳細と状態簡素化の判断は [計画 §21.7.3](local-vlm-caption-plan.md#2173-v1-3c-作成ジョブ)。
 
 ### 3.3 フルスクリーン読み込みの優先度制御
 

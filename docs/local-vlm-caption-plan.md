@@ -1453,3 +1453,43 @@ DOS予約名・末尾dot/space・区切り・相対移動・case-insensitive衝�
 - `fc21fd392` で設計担当が VLM 関連 69/69 と `scripts/test-vlm-worker-identity.ps1`、実リポジトリでの identity の関門を再実行し、いずれも成功。
 - 残り: `scripts/setup-llama-cpp.ps1` の archive の SHA-256 は未設定 (未設定の間は取得しない)。バックアップが無い環境で
   ソースから作り直す経路は、この値を確定するまで開通しない。実機確認・署名・モデルの公開は未実施。
+
+
+### 21.9 V1-3c の実装記録 (2026-11-03、実機未確認)
+
+- `App::caption_job` と `ui_dialogs/caption_job.rs` に単一の待ち行列と `Running` / `Stopping` の受付を実装。
+  最後の結果または中止で受付を閉じ、現在の1件を受け取ってから `Finish`、worker 完了の採用で `None` に戻す。
+  重複除去は待ち行列のパスだけ。推論中の同パスを再要求した場合は、保存／失敗／破棄の後に再確認する (§6.6)。
+  対象確定と追加の重複除去は一時 HashSet を使い、UI 上でパス比較の二乗走査をしない。
+- 対象は `selection_target_indices(MainWindow)` の既存規則を共有。空白または選択対象なしは採用済み一覧の現在フォルダ直下を
+  パスで選び、再走査・ファイル読み込みは行わない。本・仮想ページ・動画・音声は作成対象にしない。
+  初回導入を通る要求は `CaptionTargets { paths, unsupported }` の一値で保持し、画面を移動しても対象と集計を変えない。
+  既存の `request_vlm_caption_setup(ctx, Vec<PathBuf>)` は設定等の受け口として維持し、型付き要求は共通処理へ渡す。
+- `ai/caption_job_worker.rs` は `Item` / `Finish` を受け、worker の展開／起動、hello、load、署名・作成済み判定、canonical first-frame decode、
+  回転 DB、長辺1024px Lanczos3縮小、RGB8、推論、trim後の完全一致語だけの重複除去、`CaptionDb` 保存を行う。
+  RAW は既存 executor と明るさ設定を渡して現像する。`Written` 後だけ空の通知hookを呼ぶ。読み込み・推論・保存にperfを追加。
+- 保存の取消確認は `CaptionDb::save_unless_cancelled` で writer transaction の獲得後と署名確認後の書き込み直前にも行う。
+  メタ情報取り込み等の writer 待ち中の中止を保存へ流さない。既存 `CaptionDb::save` の契約・schema は変更しない。
+- kill handle は開始時に共有寿命ownerへ公開し、App が Started をpollする前の終了でもkillできる。
+  App 終了・Dropは即時kill、joinなし。現在の推論を終える通常中止と区別し、worker の再起動／再試行はしない。
+- 進捗はメイン窓だけのmodeless小窓。Remote／detached viewer の寿命ではジョブを止めない。
+  設定の削除に加え、同一packを置き換える再導入もジョブ中は開始させない (再導入内部にも削除があるため)。
+  設定の表示・保存先を開く操作・通常の画像追加は維持する。
+- `MenuCommand` / `ContextMenuItemId` とメニュー専用のキー仕様を追加。公開マニュアル・privacy(日英)・製品の安心欄と
+  architecture／async／UI応答性の説明を更新。本の表紙・表示・検索・MCP は実装しない。
+- 担当を分けたコード確認で、UI上の二乗走査、推論中の再要求消失、DB待ち中の中止、同一pack再導入の4点を修正。
+  設計担当による検収の代替とはしない。
+- 最終関連テストは66/66成功 (snapshot比較・小画面の中止クリック・偽worker・DB待ち中止を含む)。
+  `target/vlm-caption-final-focused.log`、nextest run `8b0d3ed0-00bd-47b1-a582-87cac1619767`。
+- 本体lib全件は指定どおり `scripts/test-lib-full.ps1` を1回だけ実行。
+  15,437実行中15,435成功 (9 slow、1 leaky)／2失敗／66 skipped、実行769.095秒。
+  記録は `target/test-lib-full/runs/20261102T194009552Z-2c378829/` のログとJUnit。
+  失敗は既存の `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry` と
+  `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`。両方とも名前付きpipe作成でOS error 5。
+  同じ2件の単独選択でも同じエラーを再現した (`target/vlm-caption-pipe-isolated.log`)。
+  前段§21.8と同じ実行環境の制限として残し、全件成功とは扱わない。全件は再実行していない。
+- 進捗小窓のsnapshotを1枚追加 (22,838 bytes)、右クリック設定の既存2枚を更新して目視確認。
+  `cargo fmt --check`、UI glyph検査、サイトカード検査 (50件、超過0)、`git diff --check` は成功。
+  `scripts/build-dev.ps1 -PreserveRuntime` は通常featureの `dev-runtime` coreと同伴3exeのbuild／配置・VC runtime PE検査に成功。
+  `target/vlm-caption-build-dev.log` に記録し、成果物は起動していない。
+- 実モデル・製品バイナリの起動、外部通信、評価用データの読み込み、C++／vendor変更、コミットは行っていない。

@@ -1680,6 +1680,7 @@ impl crate::app::App {
                 && matches!(
                     &command,
                     MenuCommand::NewFolder
+                        | MenuCommand::CreateAiCaptions
                         | MenuCommand::EditBookComposition
                         | MenuCommand::ConvertImageFolderToZip
                         | MenuCommand::Paste
@@ -1704,6 +1705,12 @@ impl crate::app::App {
             }
             MenuCommand::ConvertEpubToPdf => {
                 self.start_batch_convert_to_pdf_at(target.item_index);
+                None
+            }
+            MenuCommand::CreateAiCaptions => {
+                if target.surface == ContextMenuSurface::Grid {
+                    self.request_create_ai_captions(ctx, target.is_folder_context);
+                }
                 None
             }
             MenuCommand::NewFolder => {

@@ -31,6 +31,8 @@ pub mod file_organize;
 mod first_setup;
 #[doc(hidden)]
 pub use first_setup::draw_first_setup_dialog;
+#[cfg(windows)]
+pub(crate) mod caption_job;
 mod metadata_cleanup;
 pub(crate) mod metadata_transfer;
 pub mod network_data_dir_notice;

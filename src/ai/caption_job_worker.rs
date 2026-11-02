@@ -1,0 +1,861 @@
+//! One caption job's worker thread. The App alone owns the queue and decides
+//! when to send `Finish`; this worker never interprets an empty queue as EOF.
+
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use super::vlm_worker::{
+    self, CaptionOutcome, KillHandle, LoadRequest, PROMPT_VERSION, VlmError, VlmWorkerClient,
+};
+use crate::ai_caption_db::{
+    CaptionDb, CaptionResult, CaptionStatus, FileSignature, SaveOutcome, SaveRequest,
+};
+use crate::canonical_image_loader::{
+    AnimationPolicy, CanonicalDecodeOptions, CanonicalImageDecode, CanonicalImageSource,
+    RawDecodeRuntime, RawStage, decode_canonical_image,
+};
+use crate::rotation_db::{Rotation, RotationDb};
+
+pub struct CaptionWorkerConfig {
+    /// None resolves/extracts the bundled worker on this job's thread.
+    pub worker_executable: Option<PathBuf>,
+    pub load: LoadRequest,
+    pub model_id: String,
+    pub caption_db_path: PathBuf,
+    pub rotation_db_path: PathBuf,
+    pub raw: crate::raw::RawDecodeContext,
+}
+
+#[derive(Debug)]
+pub enum CaptionWorkerCommand {
+    Item(PathBuf),
+    Finish,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptionItemOutcome {
+    Created,
+    AlreadyCreated,
+    Missing,
+    Failed,
+    Discarded,
+    Cancelled,
+}
+
+pub enum CaptionWorkerEvent {
+    Started(KillHandle),
+    ItemDone(CaptionItemOutcome),
+    Finished(Result<(), String>),
+}
+
+/// No thread joins occur on drop. Publication of the kill handle is protected
+/// together with the exit flag check, including exit before Started is polled.
+pub struct CaptionWorker {
+    pub commands: Sender<CaptionWorkerCommand>,
+    pub events: Receiver<CaptionWorkerEvent>,
+    lifetime: Arc<WorkerLifetime>,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct WorkerLifetime {
+    exit: AtomicBool,
+    kill: Mutex<Option<KillHandle>>,
+}
+
+impl WorkerLifetime {
+    fn publish(&self, kill: KillHandle) -> bool {
+        let mut slot = self.kill.lock().unwrap();
+        if self.exit.load(Ordering::Acquire) {
+            drop(slot);
+            let _ = kill.kill();
+            return false;
+        }
+        *slot = Some(kill);
+        true
+    }
+
+    fn terminate(&self) {
+        self.exit.store(true, Ordering::Release);
+        // Never keep this brief publication lock across a process API call.
+        let kill = self.kill.lock().unwrap().clone();
+        if let Some(kill) = kill {
+            let _ = kill.kill();
+        }
+    }
+}
+
+impl CaptionWorker {
+    /// Application exit, unlike the user's graceful cancel, kills immediately.
+    pub fn stop_for_exit(&self) {
+        self.cancel.store(true, Ordering::Release);
+        self.lifetime.terminate();
+        let _ = self.commands.send(CaptionWorkerCommand::Finish);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_channels(
+        cancel: Arc<AtomicBool>,
+    ) -> (
+        Self,
+        Receiver<CaptionWorkerCommand>,
+        Sender<CaptionWorkerEvent>,
+    ) {
+        let (commands, command_rx) = mpsc::channel();
+        let (event_tx, events) = mpsc::channel();
+        (
+            Self {
+                commands,
+                events,
+                lifetime: Arc::new(WorkerLifetime::default()),
+                cancel,
+            },
+            command_rx,
+            event_tx,
+        )
+    }
+}
+
+impl Drop for CaptionWorker {
+    fn drop(&mut self) {
+        self.stop_for_exit();
+    }
+}
+
+pub fn spawn_caption_worker(
+    config: CaptionWorkerConfig,
+    cancel: Arc<AtomicBool>,
+    repaint: egui::Context,
+) -> io::Result<CaptionWorker> {
+    let (commands, command_rx) = mpsc::channel();
+    let (event_tx, events) = mpsc::channel();
+    let lifetime = Arc::new(WorkerLifetime::default());
+    let worker_lifetime = Arc::clone(&lifetime);
+    let worker_cancel = Arc::clone(&cancel);
+    std::thread::Builder::new()
+        .name("caption-job".into())
+        .spawn(move || {
+            let result = run_worker(
+                &config,
+                &worker_cancel,
+                &worker_lifetime,
+                command_rx,
+                &event_tx,
+                &repaint,
+            );
+            if let Err(error) = &result {
+                crate::logger::log(format!("caption_job: {error}"));
+            }
+            send_event(&event_tx, &repaint, CaptionWorkerEvent::Finished(result));
+        })?;
+    Ok(CaptionWorker {
+        commands,
+        events,
+        lifetime,
+        cancel,
+    })
+}
+
+fn send_event(
+    events: &Sender<CaptionWorkerEvent>,
+    repaint: &egui::Context,
+    event: CaptionWorkerEvent,
+) -> bool {
+    let sent = events.send(event).is_ok();
+    repaint.request_repaint();
+    sent
+}
+
+fn stopped(cancel: &AtomicBool, lifetime: &WorkerLifetime) -> bool {
+    cancel.load(Ordering::Acquire) || lifetime.exit.load(Ordering::Acquire)
+}
+
+fn run_worker(
+    config: &CaptionWorkerConfig,
+    cancel: &Arc<AtomicBool>,
+    lifetime: &WorkerLifetime,
+    commands: Receiver<CaptionWorkerCommand>,
+    events: &Sender<CaptionWorkerEvent>,
+    repaint: &egui::Context,
+) -> Result<(), String> {
+    if stopped(cancel, lifetime) {
+        return Ok(());
+    }
+    let executable = match &config.worker_executable {
+        Some(path) => path.clone(),
+        None => vlm_worker::worker_executable().map_err(|error| error.to_string())?,
+    };
+    if stopped(cancel, lifetime) {
+        return Ok(());
+    }
+    let mut client = VlmWorkerClient::start_at(&executable).map_err(|error| error.to_string())?;
+    let kill = client.kill_handle();
+    if !lifetime.publish(kill.clone()) {
+        return Ok(());
+    }
+    if !send_event(events, repaint, CaptionWorkerEvent::Started(kill)) {
+        return Ok(());
+    }
+    // Keep the client in this scope so every early return shuts it down too.
+    let result = run_started_worker(
+        config,
+        cancel,
+        lifetime,
+        commands,
+        events,
+        repaint,
+        &mut client,
+    );
+    client.shutdown();
+    result
+}
+
+fn run_started_worker(
+    config: &CaptionWorkerConfig,
+    cancel: &Arc<AtomicBool>,
+    lifetime: &WorkerLifetime,
+    commands: Receiver<CaptionWorkerCommand>,
+    events: &Sender<CaptionWorkerEvent>,
+    repaint: &egui::Context,
+    client: &mut VlmWorkerClient,
+) -> Result<(), String> {
+    if stopped(cancel, lifetime) {
+        return Ok(());
+    }
+    client.hello().map_err(|error| error.to_string())?;
+    if stopped(cancel, lifetime) {
+        return Ok(());
+    }
+    let started = Instant::now();
+    let loaded = client.load(&config.load);
+    stage_event("model_load", started, loaded.is_ok());
+    loaded.map_err(|error| error.to_string())?;
+    if stopped(cancel, lifetime) {
+        return Ok(());
+    }
+    let db = CaptionDb::open_at(&config.caption_db_path).map_err(|error| error.to_string())?;
+    let rotation = match std::fs::metadata(&config.rotation_db_path) {
+        Ok(_) => Some(
+            RotationDb::open_readonly_at(&config.rotation_db_path)
+                .map_err(|error| error.to_string())?,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut request_id = 0;
+    let mut discarded = 0;
+    while let Ok(command) = commands.recv() {
+        match command {
+            CaptionWorkerCommand::Finish => break,
+            CaptionWorkerCommand::Item(path) => {
+                request_id += 1;
+                let outcome = if stopped(cancel, lifetime) {
+                    CaptionItemOutcome::Cancelled
+                } else {
+                    process_item(
+                        config,
+                        &db,
+                        rotation.as_ref(),
+                        cancel,
+                        &path,
+                        request_id,
+                        &mut |id, width, height, rgb| client.caption(id, width, height, rgb),
+                    )?
+                };
+                if outcome == CaptionItemOutcome::Discarded {
+                    discarded += 1;
+                }
+                if !send_event(events, repaint, CaptionWorkerEvent::ItemDone(outcome)) {
+                    break;
+                }
+            }
+        }
+    }
+    if discarded != 0 {
+        crate::logger::log(format!("caption_job: discarded={discarded}"));
+    }
+    Ok(())
+}
+
+fn process_item(
+    config: &CaptionWorkerConfig,
+    db: &CaptionDb,
+    rotation: Option<&RotationDb>,
+    cancel: &Arc<AtomicBool>,
+    path: &Path,
+    request_id: u64,
+    infer: &mut impl FnMut(u64, u32, u32, Vec<u8>) -> Result<CaptionOutcome, VlmError>,
+) -> Result<CaptionItemOutcome, String> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(CaptionItemOutcome::Missing);
+        }
+        Err(error) => {
+            crate::logger::log(format!("caption_job: input metadata: {error}"));
+            return Ok(CaptionItemOutcome::Failed);
+        }
+    };
+    let Some(signature) = FileSignature::from_metadata(&metadata) else {
+        crate::logger::log("caption_job: unavailable input signature");
+        return Ok(CaptionItemOutcome::Failed);
+    };
+    let existing = db
+        .get(&path.to_string_lossy())
+        .map_err(|error| error.to_string())?;
+    if existing.is_some_and(|row| {
+        row.status == CaptionStatus::Ok
+            && row.signature == signature
+            && row.model_id == config.model_id
+            && row.prompt_version == PROMPT_VERSION
+    }) {
+        return Ok(CaptionItemOutcome::AlreadyCreated);
+    }
+    let started = Instant::now();
+    let decoded = decode_input(config, rotation, path, cancel);
+    stage_event("image_load", started, decoded.is_ok());
+    if cancel.load(Ordering::Acquire) {
+        return Ok(CaptionItemOutcome::Cancelled);
+    }
+    let result = match decoded? {
+        Ok(rgb) => {
+            let started = Instant::now();
+            let inferred = infer(request_id, rgb.width(), rgb.height(), rgb.into_raw());
+            stage_event("infer", started, inferred.is_ok());
+            // User cancellation never persists the current result, even failure.
+            if cancel.load(Ordering::Acquire) {
+                return Ok(CaptionItemOutcome::Cancelled);
+            }
+            match inferred.map_err(|error| error.to_string())? {
+                CaptionOutcome::Ok(result) => CaptionResult::Ok {
+                    caption: result.caption,
+                    text: result.text,
+                    keywords: deduplicate_keywords(result.keywords),
+                },
+                CaptionOutcome::ImageFailure { message } => {
+                    crate::logger::log(format!("caption_job: image inference: {message}"));
+                    CaptionResult::Failed
+                }
+            }
+        }
+        Err(message) => {
+            crate::logger::log(format!("caption_job: image decode: {message}"));
+            CaptionResult::Failed
+        }
+    };
+    save_result(config, db, cancel, path, signature, result)
+}
+
+/// Outer errors are fatal DB failures; inner errors belong to just this image.
+fn decode_input(
+    config: &CaptionWorkerConfig,
+    rotation: Option<&RotationDb>,
+    path: &Path,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Result<image::RgbImage, String>, String> {
+    let angle = match rotation {
+        Some(db) => {
+            // RotationDb's existing physical-path key contract.
+            let key = path.to_string_lossy().to_lowercase().replace('\\', "/");
+            db.get_key_checked(&key)
+                .map_err(|error| error.to_string())?
+                .unwrap_or(Rotation::None)
+        }
+        None => Rotation::None,
+    };
+    let decoded = decode_canonical_image(
+        CanonicalImageSource::File {
+            path,
+            verified_bytes: None,
+        },
+        CanonicalDecodeOptions::fullscreen_cancellable(
+            AnimationPolicy::FirstFrameOnly,
+            cancel,
+            RawStage::Full,
+        )
+        .with_avif_workload(crate::avif_decoder::Workload::Background)
+        .with_raw_runtime(RawDecodeRuntime {
+            executor: &config.raw.executor,
+            brightness: config.raw.brightness,
+            priority: crate::raw::RawPriority::Background,
+            on_submitted: None,
+        }),
+    );
+    let image = match decoded {
+        Ok(CanonicalImageDecode::Static(image)) => image.image,
+        Ok(_) => {
+            return Ok(Err(
+                "first-frame decode did not return a static image".into()
+            ));
+        }
+        Err(error) => return Ok(Err(format!("{error:?}"))),
+    };
+    let image = crate::capture::rotate_dynamic_image(image, angle);
+    Ok(Ok(crate::fast_resize::resize_dynamic_fit(
+        &image,
+        1024,
+        1024,
+        crate::fast_resize::Quality::Lanczos3,
+    )
+    .into_rgb8()))
+}
+
+fn deduplicate_keywords(keywords: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    keywords
+        .into_iter()
+        .filter_map(|word| {
+            let word = word.trim().to_owned();
+            seen.insert(word.clone()).then_some(word)
+        })
+        .collect()
+}
+
+fn save_result(
+    config: &CaptionWorkerConfig,
+    db: &CaptionDb,
+    cancel: &AtomicBool,
+    path: &Path,
+    signature: FileSignature,
+    result: CaptionResult,
+) -> Result<CaptionItemOutcome, String> {
+    if cancel.load(Ordering::Acquire) {
+        return Ok(CaptionItemOutcome::Cancelled);
+    }
+    let failed = matches!(result, CaptionResult::Failed);
+    let request = SaveRequest {
+        item_path: path.to_owned(),
+        signature_path: path.to_owned(),
+        signature,
+        cover_ref: String::new(),
+        model_id: config.model_id.clone(),
+        prompt_version: PROMPT_VERSION,
+        lang: "ja".into(),
+        result,
+    };
+    let started = Instant::now();
+    let saved = db.save_unless_cancelled(&request, cancel);
+    stage_event("save", started, saved.is_ok());
+    match saved.map_err(|error| error.to_string())? {
+        None => Ok(CaptionItemOutcome::Cancelled),
+        Some(SaveOutcome::Discarded) => Ok(CaptionItemOutcome::Discarded),
+        Some(SaveOutcome::Written) => {
+            notify_written(path);
+            Ok(if failed {
+                CaptionItemOutcome::Failed
+            } else {
+                CaptionItemOutcome::Created
+            })
+        }
+        Some(SaveOutcome::KeptExistingOk) => Ok(CaptionItemOutcome::Failed),
+    }
+}
+
+/// V1-4 will invalidate the shared caption display cache here; V2 will wake
+/// each search index owner. Only committed Written results reach this hook.
+fn notify_written(_path: &Path) {}
+
+fn stage_event(stage: &str, started: Instant, success: bool) {
+    crate::perf::event(
+        "caption",
+        stage,
+        None,
+        0,
+        &[
+            (
+                "elapsed_ms",
+                serde_json::json!(started.elapsed().as_secs_f64() * 1000.0),
+            ),
+            ("success", serde_json::json!(success)),
+        ],
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    fn config(root: &Path) -> CaptionWorkerConfig {
+        CaptionWorkerConfig {
+            worker_executable: None,
+            load: LoadRequest {
+                model_path: "synthetic model.gguf".into(),
+                mmproj_path: "synthetic mmproj.gguf".into(),
+                device_luid: "00000000:00000001".into(),
+                cpu_threads: 2,
+            },
+            model_id: "synthetic-model".into(),
+            caption_db_path: root.join("ai_caption.db"),
+            rotation_db_path: root.join("rotation.db"),
+            raw: crate::raw::RawDecodeContext::new(
+                Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap()),
+                crate::raw::RawBrightness::default(),
+            ),
+        }
+    }
+
+    fn image(root: &Path) -> PathBuf {
+        let path = root.join("synthetic.png");
+        image::RgbImage::from_raw(2, 1, vec![13, 10, 0, 26, 255, 128])
+            .unwrap()
+            .save(&path)
+            .unwrap();
+        path
+    }
+
+    fn ok_result() -> CaptionOutcome {
+        CaptionOutcome::Ok(vlm_worker::CaptionResult {
+            content: String::new(),
+            finish_reason: "stop".into(),
+            caption: "synthetic caption".into(),
+            text: String::new(),
+            keywords: vec![" 海 ".into(), "海".into(), "海辺".into()],
+            validation: vlm_worker::Validation {
+                encoding_valid: true,
+                ended_on_eog: true,
+                json_complete: true,
+                field_types: true,
+                limits: true,
+                token_limit: true,
+                ok: true,
+            },
+            generated_tokens: 7,
+            wall_s: 0.01,
+        })
+    }
+
+    fn fake_worker() -> &'static Path {
+        use sha2::{Digest as _, Sha256};
+
+        static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+        FIXTURE.get_or_init(|| {
+            let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let source = manifest.join("tests/support/vlm_fake_worker.rs");
+            let hash = Sha256::digest(include_bytes!("../../tests/support/vlm_fake_worker.rs"));
+            // Reuse the transport tests' content-addressed standalone fake.
+            let root = manifest.join("target/vlm-fake-worker");
+            let directory = root.join(format!("{hash:x}"));
+            let executable = directory.join("vlm-fake-worker.exe");
+            if executable.is_file() {
+                return executable;
+            }
+            std::fs::create_dir_all(&root).unwrap();
+            let staging = tempfile::Builder::new()
+                .prefix(".build-")
+                .tempdir_in(&root)
+                .unwrap();
+            let output = std::process::Command::new("rustc")
+                .env("TEMP", staging.path())
+                .env("TMP", staging.path())
+                .args(["--edition=2024", "--crate-name=vlm_fake_worker"])
+                .arg(source)
+                .arg("-o")
+                .arg(staging.path().join("vlm-fake-worker.exe"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if let Err(error) = std::fs::rename(staging.path(), &directory) {
+                assert!(executable.is_file(), "fake worker publish: {error}");
+            }
+            executable
+        })
+    }
+
+    fn next(worker: &CaptionWorker) -> CaptionWorkerEvent {
+        worker
+            .events
+            .recv_timeout(Duration::from_secs(20))
+            .expect("worker completion")
+    }
+
+    #[test]
+    fn keyword_deduplication_trims_exact_matches_and_preserves_order_and_spelling() {
+        let words = [
+            " 海 ",
+            "海辺",
+            "海",
+            "Ａ",
+            "A",
+            " ｶﾀｶﾅ",
+            "カタカナ",
+            "A",
+            "",
+            " ",
+        ];
+        assert_eq!(
+            deduplicate_keywords(words.into_iter().map(str::to_owned).collect()),
+            ["海", "海辺", "Ａ", "A", "ｶﾀｶﾅ", "カタカナ", ""]
+        );
+    }
+
+    #[test]
+    fn fake_job_saves_rotated_rgb_then_skips_and_waits_for_app_finish() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = config(temp.path());
+        config.worker_executable = Some(fake_worker().to_owned());
+        let path = image(temp.path());
+        let rotations = RotationDb::open_at(&config.rotation_db_path).unwrap();
+        rotations.set(&path, Rotation::Cw90).unwrap();
+        let worker = spawn_caption_worker(
+            config,
+            Arc::new(AtomicBool::new(false)),
+            egui::Context::default(),
+        )
+        .unwrap();
+        worker
+            .commands
+            .send(CaptionWorkerCommand::Item(path.clone()))
+            .unwrap();
+        assert!(matches!(next(&worker), CaptionWorkerEvent::Started(_)));
+        assert!(matches!(
+            next(&worker),
+            CaptionWorkerEvent::ItemDone(CaptionItemOutcome::Created)
+        ));
+        let db = CaptionDb::open_at(temp.path().join("ai_caption.db")).unwrap();
+        let row = db.get(&path.to_string_lossy()).unwrap().unwrap();
+        assert_eq!(row.caption, "0d0a001aff80");
+        assert_eq!(row.keywords, ["binary"]);
+        worker
+            .commands
+            .send(CaptionWorkerCommand::Item(path))
+            .unwrap();
+        assert!(matches!(
+            next(&worker),
+            CaptionWorkerEvent::ItemDone(CaptionItemOutcome::AlreadyCreated)
+        ));
+        assert!(matches!(
+            worker.events.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        worker.commands.send(CaptionWorkerCommand::Finish).unwrap();
+        assert!(matches!(
+            next(&worker),
+            CaptionWorkerEvent::Finished(Ok(()))
+        ));
+    }
+
+    #[test]
+    fn worker_preprocessing_rotates_and_never_upscales_or_exceeds_1024() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let path = image(temp.path());
+        let rotation = RotationDb::open_at(&config.rotation_db_path).unwrap();
+        rotation.set(&path, Rotation::Cw90).unwrap();
+        let rgb = decode_input(&config, Some(&rotation), &path, &cancel)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rgb.dimensions(), (1, 2));
+        assert_eq!(rgb.into_raw(), [13, 10, 0, 26, 255, 128]);
+        image::RgbImage::new(2048, 1024).save(&path).unwrap();
+        let rgb = decode_input(&config, Some(&rotation), &path, &cancel)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rgb.dimensions(), (512, 1024));
+    }
+
+    #[test]
+    fn failed_items_retry_and_never_replace_existing_ok() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = config(temp.path());
+        let db = CaptionDb::open_at(&config.caption_db_path).unwrap();
+        let path = image(temp.path());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut failed = |_, _, _, _| {
+            Ok(CaptionOutcome::ImageFailure {
+                message: "synthetic failure".into(),
+            })
+        };
+        assert_eq!(
+            process_item(&config, &db, None, &cancel, &path, 1, &mut failed).unwrap(),
+            CaptionItemOutcome::Failed
+        );
+        assert_eq!(
+            db.get(&path.to_string_lossy()).unwrap().unwrap().status,
+            CaptionStatus::Failed
+        );
+        assert_eq!(
+            process_item(&config, &db, None, &cancel, &path, 2, &mut |_, _, _, _| Ok(
+                ok_result()
+            ))
+            .unwrap(),
+            CaptionItemOutcome::Created
+        );
+        let row = db.get(&path.to_string_lossy()).unwrap().unwrap();
+        assert_eq!(row.keywords, ["海", "海辺"]);
+        config.model_id = "other model".into();
+        assert_eq!(
+            process_item(&config, &db, None, &cancel, &path, 3, &mut failed).unwrap(),
+            CaptionItemOutcome::Failed
+        );
+        assert_eq!(db.get(&path.to_string_lossy()).unwrap().unwrap(), row);
+    }
+
+    #[test]
+    fn cancellation_after_inference_and_source_change_discard_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path());
+        let db = CaptionDb::open_at(&config.caption_db_path).unwrap();
+        let path = image(temp.path());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = process_item(&config, &db, None, &cancel, &path, 1, &mut |_, _, _, _| {
+            cancel.store(true, Ordering::Release);
+            Ok(ok_result())
+        })
+        .unwrap();
+        assert_eq!(result, CaptionItemOutcome::Cancelled);
+        assert!(db.get(&path.to_string_lossy()).unwrap().is_none());
+        cancel.store(false, Ordering::Release);
+        let result = process_item(&config, &db, None, &cancel, &path, 2, &mut |_, _, _, _| {
+            std::fs::write(&path, b"changed source").unwrap();
+            Ok(ok_result())
+        })
+        .unwrap();
+        assert_eq!(result, CaptionItemOutcome::Discarded);
+        assert!(db.get(&path.to_string_lossy()).unwrap().is_none());
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            process_item(
+                &config,
+                &db,
+                None,
+                &cancel,
+                &path,
+                3,
+                &mut |_, _, _, _| panic!("missing input inferred")
+            )
+            .unwrap(),
+            CaptionItemOutcome::Missing
+        );
+    }
+
+    #[test]
+    fn fatal_inference_and_database_failure_stop_the_item_pipeline() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path());
+        let db = CaptionDb::open_at(&config.caption_db_path).unwrap();
+        let path = image(temp.path());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = process_item(&config, &db, None, &cancel, &path, 1, &mut |_, _, _, _| {
+            Err(VlmError::Fatal("synthetic fatal".into()))
+        });
+        assert!(result.unwrap_err().contains("synthetic fatal"));
+        assert!(db.get(&path.to_string_lossy()).unwrap().is_none());
+        let result = process_item(&config, &db, None, &cancel, &path, 2, &mut |_, _, _, _| {
+            rusqlite::Connection::open(&config.caption_db_path)
+                .unwrap()
+                .execute_batch("DROP TABLE captions")
+                .unwrap();
+            Ok(ok_result())
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn undecodable_input_saves_failed_and_old_prompt_does_not_skip() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path());
+        let db = CaptionDb::open_at(&config.caption_db_path).unwrap();
+        let path = image(temp.path());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let signature = FileSignature::from_metadata(&std::fs::metadata(&path).unwrap()).unwrap();
+        db.save(&SaveRequest {
+            item_path: path.clone(),
+            signature_path: path.clone(),
+            signature,
+            cover_ref: String::new(),
+            model_id: config.model_id.clone(),
+            prompt_version: PROMPT_VERSION - 1,
+            lang: "ja".into(),
+            result: CaptionResult::Ok {
+                caption: "old prompt".into(),
+                text: String::new(),
+                keywords: Vec::new(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            process_item(&config, &db, None, &cancel, &path, 1, &mut |_, _, _, _| Ok(
+                ok_result()
+            ))
+            .unwrap(),
+            CaptionItemOutcome::Created
+        );
+        db.delete(&path.to_string_lossy()).unwrap();
+        std::fs::write(&path, b"synthetic invalid PNG").unwrap();
+        assert_eq!(
+            process_item(
+                &config,
+                &db,
+                None,
+                &cancel,
+                &path,
+                2,
+                &mut |_, _, _, _| panic!("undecodable input inferred")
+            )
+            .unwrap(),
+            CaptionItemOutcome::Failed
+        );
+        assert_eq!(
+            db.get(&path.to_string_lossy()).unwrap().unwrap().status,
+            CaptionStatus::Failed
+        );
+    }
+
+    #[test]
+    fn startup_cancel_prevents_resolution_and_spawn_and_missing_worker_reports_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = config(temp.path());
+        config.worker_executable = Some(temp.path().join("does-not-exist.exe"));
+        let worker = spawn_caption_worker(
+            config,
+            Arc::new(AtomicBool::new(true)),
+            egui::Context::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            next(&worker),
+            CaptionWorkerEvent::Finished(Ok(()))
+        ));
+        let mut config = self::config(temp.path());
+        config.worker_executable = Some(temp.path().join("does-not-exist.exe"));
+        let worker = spawn_caption_worker(
+            config,
+            Arc::new(AtomicBool::new(false)),
+            egui::Context::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            next(&worker),
+            CaptionWorkerEvent::Finished(Err(_))
+        ));
+    }
+
+    #[test]
+    fn exit_before_or_after_kill_publication_terminates_the_same_worker() {
+        for exit_first in [true, false] {
+            let client = VlmWorkerClient::start_at(fake_worker()).unwrap();
+            let kill = client.kill_handle();
+            let lifetime = WorkerLifetime::default();
+            if exit_first {
+                lifetime.terminate();
+                assert!(!lifetime.publish(kill.clone()));
+            } else {
+                assert!(lifetime.publish(kill.clone()));
+                lifetime.terminate();
+            }
+            assert!(kill.is_killed());
+            assert!(!client.is_usable());
+        }
+    }
+}

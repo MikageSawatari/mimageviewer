@@ -298,6 +298,14 @@ impl Default for VlmAddon {
 }
 
 impl VlmAddon {
+    #[cfg(test)]
+    pub(crate) fn with_test_status(root: PathBuf, status: AddonStatus) -> Self {
+        let mut addon = Self::new(root);
+        addon.status = status;
+        addon.scanned = true;
+        addon
+    }
+
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,

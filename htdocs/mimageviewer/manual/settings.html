@@ -788,6 +788,10 @@
       <li>TensorRT は別プロセスで動作するため、推論が予期せず停止しても本体は影響を受けません。停止を検知すると自動的にワーカーを再起動して処理を継続します（最大 3 回）。それでも復旧しなければ DirectML にフォールバックし、通知バナーから「ワーカーを再起動」で手動復旧を試みられます。</li>
     </ul>
 
+    <h2 id="ai-captions">AI 説明文のモデル</h2>
+    <p>環境設定の「AI 説明文」ページでは、モデルの状態と大きさ、GPU が利用条件を満たすかを確認できます。<strong>ダウンロード</strong>は確認後に GitHub Releases からモデルを取得し、<strong>フォルダを開く</strong>で保存場所を開きます。設定からのダウンロードだけでは説明文の作成は始まりません。作成方法は<a href="grid.html#ai-captions">AI 説明文を作る</a>をご覧ください。</p>
+    <p><strong>削除</strong>でモデルを削除しても、保存済みの説明文・文字の書き写し・検索語は消えません。必要になったらモデルを再取得できます。作成中はモデルの取得・削除はできません。取得の中止や削除の後片付け中は、完了するまで次の取得・削除を待ちます。</p>
+
     <h2 id="page-turn-animation">ページめくりアニメーション（環境設定 → 表示 → 閲覧表示）</h2>
     <p>環境設定 → 表示 → 閲覧表示の「ページめくりアニメーション」は既定OFFです。
     単発のページ送りとスライドショーで紙をめくる効果を付けます。連打・表示素材が一切ない読込待ち・連結読みには適用しません。
@@ -1610,6 +1614,9 @@
           <tr><td>Susie プラグイン</td><td><code>%APPDATA%\mimageviewer\susie_plugins\</code>（<code>.spi</code> ファイル配置場所）</td><td>—</td></tr>
           <tr><td>ログ</td><td><code>%APPDATA%\mimageviewer\logs\</code>（動作ログ・エラーログ）</td><td>—</td></tr>
           <tr><td>AI モデル</td><td><code>%APPDATA%\mimageviewer\models\</code></td><td>—</td></tr>
+          <tr><td>AI 説明文</td><td><code>%APPDATA%\mimageviewer\ai_caption.db</code></td><td>画像ファイル単位。説明文・画像内の文字・検索語を保存</td></tr>
+          <tr><td>AI 説明文のモデル</td><td><code>%APPDATA%\mimageviewer\addons\vlm\</code></td><td>環境設定の「AI 説明文」から取得・削除</td></tr>
+          <tr><td>AI 説明文の実行用ファイル</td><td><code>%APPDATA%\mimageviewer\vlm\workers\</code></td><td>通常版で利用時に展開。ポータブル版では実行ファイルと同じ場所の同梱ファイルを使用</td></tr>
           <tr><td>PDF 表示エンジン DLL</td><td><code>%APPDATA%\mimageviewer\pdfium.dll</code></td><td>—</td></tr>
           <tr><td>AI 機能用 DLL（DirectML）</td><td><code>%APPDATA%\mimageviewer\onnxruntime.dll</code><br><code>%APPDATA%\mimageviewer\onnxruntime_providers_shared.dll</code>（本体に埋め込み済み。初回 AI 機能利用時に自動展開）</td><td>—</td></tr>
           <tr><td>TensorRT パック<br>（NVIDIA 利用時のみ）</td><td><code>%APPDATA%\mimageviewer\tensorrt\</code>（CUDA / cuDNN / TensorRT / OnnxRuntime GPU 版 DLL + 事前ビルド済みエンジン、約 1.97 GB。アプリ内「TensorRT パックをダウンロード」ボタンから GitHub 取得）</td><td>—</td></tr>

@@ -1,10 +1,11 @@
-//! Model setup only. Caption jobs and their progress window belong to V1-3c.
+//! Model setup and captured-target handoff to the App-owned caption job.
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
 use eframe::egui;
 
+use super::caption_job::CaptionTargets;
 use crate::ai::vlm_worker::GpuDetection;
 use crate::app::App;
 use crate::vlm_addon::{AddonEvent, AddonOperation, AddonStatus, InstallProgress, VlmAddon};
@@ -23,9 +24,9 @@ enum GpuProbe {
 
 #[derive(Debug, PartialEq)]
 enum Dialog {
-    Checking(Vec<PathBuf>),
-    Confirm(Vec<PathBuf>),
-    Running(Vec<PathBuf>),
+    Checking(CaptionTargets),
+    Confirm(CaptionTargets),
+    Running(CaptionTargets),
     Unsupported(String),
     Done,
     Cancelled,
@@ -55,7 +56,7 @@ pub(crate) struct VlmPreferencesView {
 }
 
 impl VlmSetup {
-    fn installed(&mut self, cancelling: bool) -> Option<Vec<PathBuf>> {
+    fn installed(&mut self, cancelling: bool) -> Option<CaptionTargets> {
         let targets = match self.dialog.take() {
             Some(Dialog::Running(paths)) if !cancelling => Some(paths),
             _ => None,
@@ -145,11 +146,15 @@ impl VlmSetup {
                 }
             ),
         };
-        let busy = self.addon.operation() != AddonOperation::None || self.addon.is_scanning();
+        // Reinstall replaces the same pack too, so it shares deletion's job fence.
+        let busy = self.addon.operation() != AddonOperation::None
+            || self.addon.is_scanning()
+            || job_running;
         let activity = match self.addon.operation() {
             AddonOperation::Installing => "ダウンロード中です",
             AddonOperation::Cancelling | AddonOperation::Removing => "前の処理を片付けています",
             AddonOperation::None if self.addon.is_scanning() => "モデルを確認中...",
+            AddonOperation::None if job_running => "AI 説明文を作成中です",
             AddonOperation::None => "",
         }
         .into();
@@ -169,6 +174,17 @@ impl App {
     /// A second request during installation is rejected; it never replaces/adds targets.
     /// Success calls `on_vlm_caption_targets_ready` exactly once with the original paths.
     pub(crate) fn request_vlm_caption_setup(&mut self, ctx: &egui::Context, targets: Vec<PathBuf>) {
+        self.request_vlm_caption_setup_targets(ctx, targets.into());
+    }
+
+    pub(crate) fn request_vlm_caption_setup_targets(
+        &mut self,
+        ctx: &egui::Context,
+        targets: CaptionTargets,
+    ) {
+        if targets.paths.is_empty() && self.vlm_caption_job_running() {
+            return;
+        }
         if self.vlm_setup.addon.operation() != AddonOperation::None {
             let removing = self.vlm_setup.addon.operation() == AddonOperation::Removing;
             self.show_feedback_result(
@@ -184,7 +200,7 @@ impl App {
                 return;
             }
             if self.vlm_setup.dialog.is_none() {
-                self.vlm_setup.dialog = Some(Dialog::Running(Vec::new()));
+                self.vlm_setup.dialog = Some(Dialog::Running(CaptionTargets::default()));
             }
             ctx.move_to_top(egui::LayerId::new(
                 egui::Order::Foreground,
@@ -203,19 +219,59 @@ impl App {
         ) {
             return;
         }
+        if self.vlm_setup.eligible()
+            && matches!(self.vlm_setup.addon.status(), AddonStatus::Valid { .. })
+            && !targets.paths.is_empty()
+        {
+            self.on_vlm_caption_targets_ready(ctx, targets);
+            return;
+        }
         self.vlm_setup.ensure_checked(ctx);
         self.vlm_setup.dialog = Some(Dialog::Checking(targets));
     }
 
-    /// V1-3c replaces this body with caption-job admission. Paths are captured before
-    /// setup, never reconstructed from the current selection. Empty paths mean a
-    /// settings/development-only install and must not start a job. Failed/cancelled
-    /// installation drops the captured paths without invoking this hook.
-    fn on_vlm_caption_targets_ready(&mut self, _targets: Vec<PathBuf>) {}
+    /// Setup retains the original paths and counts, independent of later navigation.
+    /// Empty settings-only installs never start a caption job.
+    fn on_vlm_caption_targets_ready(&mut self, ctx: &egui::Context, targets: CaptionTargets) {
+        if targets.paths.is_empty() {
+            return;
+        }
+        let AddonStatus::Valid {
+            model_id,
+            model_path,
+            mmproj_path,
+            ..
+        } = self.vlm_setup.addon.status()
+        else {
+            return;
+        };
+        let GpuProbe::Ready(Ok(GpuDetection::Device(gpu))) = &self.vlm_setup.gpu else {
+            return;
+        };
+        let Some(device) = gpu.device.as_ref().filter(|_| gpu.is_eligible()) else {
+            return;
+        };
+        let config = crate::ai::caption_job_worker::CaptionWorkerConfig {
+            worker_executable: None,
+            model_id: model_id.clone(),
+            load: crate::ai::vlm_worker::LoadRequest {
+                model_path: model_path.clone(),
+                mmproj_path: mmproj_path.clone(),
+                device_luid: device.luid.clone(),
+                cpu_threads: 4,
+            },
+            caption_db_path: crate::ai_caption_db::CaptionDb::db_path(),
+            rotation_db_path: crate::rotation_db::RotationDb::db_path(),
+            raw: crate::raw::RawDecodeContext::new(
+                std::sync::Arc::clone(&self.raw_develop_executor),
+                self.settings.raw_brightness,
+            ),
+        };
+        self.start_caption_job(ctx, targets, config);
+    }
 
-    /// V1-3c connects this to `caption_job.is_some()` before enabling job entry points.
-    fn vlm_caption_job_running(&self) -> bool {
-        false
+    pub(crate) fn vlm_caption_job_running(&self) -> bool {
+        self.caption_job.is_some()
     }
 
     pub(crate) fn refresh_vlm_preferences(&mut self, ctx: &egui::Context) {
@@ -270,7 +326,7 @@ impl App {
             match event {
                 AddonEvent::Installed { .. } => {
                     if let Some(targets) = self.vlm_setup.installed(cancelling) {
-                        self.on_vlm_caption_targets_ready(targets);
+                        self.on_vlm_caption_targets_ready(ctx, targets);
                     }
                 }
                 AddonEvent::Cancelled => self.vlm_setup.dialog = Some(Dialog::Cancelled),
@@ -307,9 +363,9 @@ impl App {
                 self.vlm_setup.dialog = Some(Dialog::Unsupported(VULKAN_LOADER_REASON.into()));
             } else if self.vlm_setup.eligible() {
                 if matches!(self.vlm_setup.addon.status(), AddonStatus::Valid { .. })
-                    && !paths.is_empty()
+                    && !paths.paths.is_empty()
                 {
-                    self.on_vlm_caption_targets_ready(paths);
+                    self.on_vlm_caption_targets_ready(ctx, paths);
                 } else {
                     self.vlm_setup.dialog = Some(Dialog::Confirm(paths));
                 }
@@ -333,7 +389,7 @@ impl App {
         let download = std::mem::take(&mut state.vlm_download_requested);
         let remove = std::mem::take(&mut state.vlm_remove_requested);
         let folder = std::mem::take(&mut state.vlm_folder_requested);
-        if download {
+        if download && !self.vlm_caption_job_running() {
             // Same immediate management action as the existing addon pages.
             self.pref_state = None;
             self.show_preferences = false;
@@ -386,11 +442,12 @@ impl App {
             self.vlm_setup.addon.operation(),
         );
         match action {
+            Action::Download if self.vlm_caption_job_running() => return,
             Action::Download => match self.vlm_setup.addon.start_install() {
                 Ok(()) => {
                     let paths = match dialog {
                         Dialog::Confirm(paths) => paths,
-                        _ => Vec::new(),
+                        _ => CaptionTargets::default(),
                     };
                     dialog = Dialog::Running(paths);
                 }
@@ -407,7 +464,7 @@ impl App {
             Action::Cancel => {
                 self.vlm_setup.addon.cancel();
                 // Discard paths now, retain owner until worker completion.
-                dialog = Dialog::Running(Vec::new());
+                dialog = Dialog::Running(CaptionTargets::default());
             }
             Action::Close => {
                 if matches!(dialog, Dialog::Running(_)) {
@@ -416,7 +473,7 @@ impl App {
                 return;
             }
             Action::Retry => {
-                dialog = Dialog::Checking(Vec::new());
+                dialog = Dialog::Checking(CaptionTargets::default());
             }
             Action::None => {}
         }
@@ -554,13 +611,44 @@ mod tests {
     use egui_kittest::kittest::{NodeT, Queryable};
 
     #[test]
+    fn vlm_setup_model_remove_is_disabled_for_running_and_stopping_job_owner() {
+        use super::super::caption_job::CaptionJob;
+        use crate::ai::caption_job_worker::CaptionWorker;
+        use std::sync::{Arc, atomic::AtomicBool};
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = crate::app::setup_app_for_test();
+        app.vlm_setup.addon = VlmAddon::with_test_status(
+            temp.path().join("vlm"),
+            AddonStatus::Valid {
+                model_id: "synthetic-model".into(),
+                bytes: 10,
+                model_path: "synthetic-model.gguf".into(),
+                mmproj_path: "synthetic-mmproj.gguf".into(),
+            },
+        );
+        assert!(app.vlm_setup.view(app.vlm_caption_job_running()).can_remove);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (worker, _commands, _events) = CaptionWorker::test_channels(cancel.clone());
+        app.caption_job = Some(CaptionJob::new(worker, cancel.clone()));
+        assert!(!app.vlm_setup.view(app.vlm_caption_job_running()).can_remove);
+        assert!(app.vlm_setup.view(app.vlm_caption_job_running()).busy);
+        app.request_vlm_caption_setup(&egui::Context::default(), Vec::new());
+        assert!(app.vlm_setup.dialog.is_none());
+        app.caption_job.as_mut().unwrap().stop();
+        assert!(!app.vlm_setup.view(app.vlm_caption_job_running()).can_remove);
+        assert!(app.vlm_setup.view(app.vlm_caption_job_running()).busy);
+        app.caption_job = None;
+        assert!(app.vlm_setup.view(app.vlm_caption_job_running()).can_remove);
+    }
+
+    #[test]
     fn vlm_setup_targets_are_handed_off_once_and_discarded_on_cancel() {
         let mut setup = VlmSetup::default();
         let paths = vec![PathBuf::from("captured-before-navigation.png")];
-        setup.dialog = Some(Dialog::Running(paths.clone()));
-        assert_eq!(setup.installed(false), Some(paths.clone()));
+        setup.dialog = Some(Dialog::Running(paths.clone().into()));
+        assert_eq!(setup.installed(false), Some(paths.clone().into()));
         assert_eq!(setup.installed(false), None);
-        setup.dialog = Some(Dialog::Running(paths));
+        setup.dialog = Some(Dialog::Running(paths.into()));
         assert_eq!(setup.installed(true), None);
         assert_eq!(setup.dialog, Some(Dialog::Cancelled));
         setup.dialog = None; // Window close already discarded pending targets.
@@ -571,8 +659,8 @@ mod tests {
     fn vlm_setup_modal_boundary_excludes_download_and_terminal_windows() {
         let mut setup = VlmSetup::default();
         for dialog in [
-            Dialog::Confirm(vec![]),
-            Dialog::Checking(vec![]),
+            Dialog::Confirm(vec![].into()),
+            Dialog::Checking(vec![].into()),
             Dialog::Unsupported(GPU_REQUIREMENTS_REASON.into()),
             Dialog::RemoveConfirm,
         ] {
@@ -580,7 +668,7 @@ mod tests {
             assert!(setup.modal_open());
         }
         for dialog in [
-            Dialog::Running(vec![]),
+            Dialog::Running(vec![].into()),
             Dialog::Done,
             Dialog::Cancelled,
             Dialog::Error("failure".into()),
@@ -601,7 +689,7 @@ mod tests {
             .map_err(|error| error.to_string());
             let mut app = crate::app::setup_app_for_test();
             app.vlm_setup.gpu = GpuProbe::Ready(result);
-            app.vlm_setup.dialog = Some(Dialog::Checking(vec!["original.png".into()]));
+            app.vlm_setup.dialog = Some(Dialog::Checking(vec!["original.png".into()].into()));
             app.poll_vlm_setup(&egui::Context::default());
             if loader_available {
                 assert!(
@@ -644,26 +732,26 @@ mod tests {
         app.poll_vlm_setup(&ctx);
         assert_eq!(
             app.vlm_setup.dialog,
-            Some(Dialog::Confirm(vec!["accepted.png".into()]))
+            Some(Dialog::Confirm(vec!["accepted.png".into()].into()))
         );
         app.vlm_setup.dialog = Some(Dialog::Cancelled);
         app.request_vlm_caption_setup(&ctx, vec!["after-cancel.png".into()]);
         app.poll_vlm_setup(&ctx);
         assert_eq!(
             app.vlm_setup.dialog,
-            Some(Dialog::Confirm(vec!["after-cancel.png".into()]))
+            Some(Dialog::Confirm(vec!["after-cancel.png".into()].into()))
         );
     }
 
     fn dialog_case(case: usize) -> (Dialog, AddonOperation, &'static str) {
         match case {
             0 => (
-                Dialog::Confirm(vec![]),
+                Dialog::Confirm(vec![].into()),
                 AddonOperation::None,
                 "ダウンロード",
             ),
             1 => (
-                Dialog::Running(vec![]),
+                Dialog::Running(vec![].into()),
                 AddonOperation::Installing,
                 "キャンセル",
             ),
@@ -764,7 +852,7 @@ mod tests {
                 crate::os_theme::apply_resolved(ui.ctx(), crate::os_theme::ResolvedTheme::Dark);
                 draw_dialog(
                     ui.ctx(),
-                    &Dialog::Confirm(vec![]),
+                    &Dialog::Confirm(vec![].into()),
                     true,
                     &InstallProgress::Idle,
                     AddonOperation::None,

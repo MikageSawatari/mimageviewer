@@ -476,6 +476,14 @@ worker exe の内容別展開・GPU 検査を背景 thread に置く。設定ペ
 root frame が非blocking poll で完了を採用する。取消／削除の worker 完了までは次操作を拒否し、UI で join しない。
 取得窓を閉じても App の owner は残る。起動時の自動取得や実機 perf 測定の実施を意味しない。
 
+作成ジョブ (V1-3c) は UI 上の一覧項目をパスへ凍結するだけで、ファイルのmetadata・既存説明文・回転DBの参照、
+canonical decode、縮小、VLMプロセスの起動／モデル読込／推論、署名を再確認しての保存はjob workerへ置く。
+App が待ち行列・`Running` / `Stopping`・次の1件の送信・終了判断を単独所有し、workerには1件ずつ渡す。
+中止を押したフレームで受付を閉じ、今の1件が終わってから保存せず停止する。`Finish` は処理中の1件が無くなってから送り、
+完了通知まではownerを解放しない。進捗と結果は非blocking pollで受け取り、worker側からrepaintを要求する。
+進捗窓はmainだけのmodelessで閲覧を止めない。App終了時は共有kill handleで即時停止し、UIでjoinしない。
+読み込み・推論・保存には `perf::event` を置く。実モデルの速度や実機の応答性を検証済みとするものではない。
+
 注釈fontの先回り（§1.602）はNext頁の計画でメモリ上の需要だけを判断し、列挙・font読取・parseを`comic-font-load` workerへ置く。
 App共有ownerの受信口は1つ。root pollは非blockingで採用し、workerの完了時にroot再描画を要求する。
 `comic / font_load`に所要ms・要求key数・読込key数・結果を記録する。同期表示はworkerを待たず、不足時は受信口を捨てて既存の同期経路を維持する。

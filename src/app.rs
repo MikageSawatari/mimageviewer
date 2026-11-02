@@ -18972,6 +18972,8 @@ pub struct App {
     /// true の間は編集系入口での再 prompt を抑制する (spec §4.1 `declined_this_session`)。
     pub(crate) editing_addon_declined_session: bool,
     pub(crate) vlm_setup: crate::ui_dialogs::vlm_addon::VlmSetup,
+    #[cfg(windows)]
+    pub(crate) caption_job: Option<crate::ui_dialogs::caption_job::CaptionJob>,
     /// フルスクリーン中央のヒントオーバーレイ。
     /// 最後/最初の項目でさらに進もう/戻ろうとしたとき、または Ctrl+↑↓ で
     /// 画像・動画のあるフォルダが skip_limit 以内に見つからなかったときに表示する。
@@ -19816,6 +19818,8 @@ pub struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        self.stop_caption_job_for_exit();
         self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
         self.pdf_render_epoch.retire();
         self.transfer_spread_shift_exit_ownership();
@@ -21750,6 +21754,8 @@ impl App {
             editing_addon_install_state: None,
             editing_addon_declined_session: false,
             vlm_setup: Default::default(),
+            #[cfg(windows)]
+            caption_job: None,
             fs_boundary_hint: None,
             bucket_region_flash: None,
 
@@ -99477,6 +99483,8 @@ impl eframe::App for App {
         self.cut_clipboard.poll();
         self.poll_clipboard_capture(ctx);
         self.poll_vlm_setup(ctx);
+        #[cfg(windows)]
+        self.poll_caption_job();
         self.poll_capture_selection(ctx);
         self.render_update_before_frame(ctx);
         #[cfg(not(windows))]
@@ -99533,6 +99541,8 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        #[cfg(windows)]
+        self.stop_caption_job_for_exit();
         self.retire_close_return_owners(ViewerCloseCause::AppExit);
         self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
         self.diagnostics_export.retire();

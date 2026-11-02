@@ -569,9 +569,9 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `rotation_db.rs` / `rotation_cache.rs` | 非破壊回転の SQLite 永続化と context 所有の回転 memo。静止画シークの未読値は pending reader が非同期取得し、cache と要求寿命を一緒に交換・失効・破棄する |
 | `audio_normalize_db.rs` | 動画音量ノーマライズの per-file 測定値 (integrated LUFS / true peak / 算出ゲイン) の SQLite 永続化 |
 | `rating_db.rs` | レーティング (★1〜5) の SQLite 永続化 |
-| `ai_caption_db.rs` | ローカル AI 説明文の保存基盤（V1-2）。worker の保存役が `BEGIN IMMEDIATE` 後に入力署名を照合し、成功／失敗の上書き規則を適用する。DB trigger が全体 revision と索引反映待ちを管理し、STORES 経由の改名・削除・復元にも適用する。作成ジョブ・表示キャッシュ・検索接続は後段 |
+| `ai_caption_db.rs` | ローカル AI 説明文の保存基盤。作成ジョブの保存役が worker thread 上で `BEGIN IMMEDIATE` 後に入力署名を照合し、成功／失敗の上書き規則を適用する。DB trigger が全体 revision と索引反映待ちを管理し、STORES 経由の改名・削除・復元にも適用する。表示キャッシュ・検索接続は後段 |
 | `vlm_addon.rs` / `vlm_addon_download.rs` | ローカル AI 説明文モデルの導入 (V1-3b)。固定配布一覧・安全な名前・分割と全体の SHA-256 を検証する。App の単一 owner が導入／取消／削除を完了通知まで排他にし、状態確認・HTTP・連結・配置・削除は worker 上だけで行う |
-| `ui_dialogs/vlm_addon.rs` | GPU 判定を必要時に一度だけ worker で実行し、設定ページへ cached view を渡す。初回の確認だけ modal、長い取得は modeless。対象パスを完了 hook へ一回渡す受け口を置き、作成ジョブとの接続は V1-3c |
+| `ui_dialogs/vlm_addon.rs` | GPU 判定を必要時に一度だけ worker で実行し、設定ページへ cached view を渡す。初回の確認だけ modal、長い取得は modeless。取得成功時だけ操作時点の対象パスを作成ジョブへ一回渡す。設定からの導入だけではジョブを開始しない |
 | `mask_db.rs` | 消しゴムマスクの SQLite 永続化 (1bit/pixel deflate 圧縮 + ベクタオブジェクト JSON) |
 | `conceal_db.rs` | 隠蔽加工マスクの SQLite 永続化。`mask_db.rs` と同じビットマップ + ベクタ構造を使い、マスクスロットも管理 |
 | `local-adjust-core` | 補正レイヤー合成 core。mIV 本体では消しゴム後・隠蔽加工前の非同期レイヤーとして使う |
@@ -584,6 +584,21 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `png_metadata.rs` | PNG の tEXt/iTXt/zTXt に埋め込まれた AI メタデータ読み取り |
 | `exif_reader.rs` | EXIF 読み取り (rexif)。構造タグの抑止と Exif 2.3x 拡張タグの日本語名マップを持つ |
 | `xmp_reader.rs` | XMP 読み取り (quick-xml)。`xtw:*` 名前空間のツイート情報を抽出し「XMP ツイート情報」パネルに表示 |
+
+#### ローカル AI 説明文の作成ジョブ (V1-3c)
+
+`App::caption_job` が全 viewport 共通の単一ジョブを所有する。右クリックから既存の選択規則で
+対象をパスへ凍結し、無選択・空白部分なら現在の一覧直下を対象にする。UI はファイルを読まず、
+実パスの画像だけを渡す。本・仮想ページ・動画・音声は対象外として数える（本の表紙は V1-4）。
+待ち行列・追加の受付・次の1件・ジョブの終了判断も App に集約し、worker が空キューを見て自律終了しない。
+状態は `Running` / `Stopping`。中止操作または最後の結果の採用で先に受付を閉じ、
+処理中の1件が無くなってから `Finish` を送る。worker 完了を非blocking poll で採用して初めて owner を解放する。
+
+job worker は画像の署名・既存説明文を確認し、canonical decode → 非破壊回転 → 長辺1024pxまでの縮小 →
+RGB8 → 別プロセスの推論 → 署名を再確認して保存、を1件ずつ行う。中止後の処理中結果は保存せず、
+既に保存した分は残す。モデルはジョブ内で共用し、終了で子プロセスを閉じる。App 終了時は共有 kill handle で
+即時停止して join しない。detached を閉じてもジョブは続き、モデルの削除はジョブ終了まで受け付けない。
+詳細は [計画 §21.7.3](local-vlm-caption-plan.md#2173-v1-3c-作成ジョブ)。
 
 ### UI オーバーレイ / ダイアログ
 
@@ -713,6 +728,8 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `audio_normalize.db` | 動画ファイル単位のノーマライズ測定値 (integrated LUFS / true peak / 算出ゲイン)。主キー `(path_lower, file_size, mtime_ms, target_lufs_milli)`。環境設定 → 動画・音声 → 動画から全件クリア可能 | `audio_normalize_db.rs` |
 | `rating.db` | レーティング (★1〜5、0 は未登録)。ページ単位 (画像/ZIP 内画像/PDF ページ) とコンテナ (フォルダ/ZIP/PDF 本体) を同一テーブルに格納。キー形式の違い (`::` の有無) で区別 | `rating_db.rs` |
 | `ai_caption.db`（未リリース） | schema 1。物理項目キーごとの説明文・画像内の文字・検索語・入力署名を保存。rollback journal、trigger による全体 revision と削除記録。STORES は Follow／ページコピーなし、ページ追加先は作成前に初期化。説明文だけでは内容同一性の台帳を作らず、既存台帳のある項目だけ復元に便乗する | `ai_caption_db.rs` |
+| `addons/vlm/` | 利用者の明示操作で取得するモデル。固定 GitHub Releases の一覧と分割・全体hashを検証し、`packs/<model_id>/`、`INSTALL_OK`、`active.json` で導入を管理する。モデル削除では `ai_caption.db` を消さない | `vlm_addon.rs` / `vlm_addon_download.rs` |
+| `vlm/workers/<hash>/mimageviewer-vlm.exe` | 通常版の内容別展開先。背景threadで配置する。portable はexe隣の同梱workerを使う。モデルの重みは本体へ内包しない | `ai/vlm_worker_extract.rs` |
 | `search_index.db` | Ctrl+S 用。お気に入り配下のフォルダ/ZIP/PDF/動画名索引 | `search_index_db.rs` |
 | `fts_index/` | Ctrl+G 用 Tantivy index (複数 segment + meta.json)。bigram 候補絞り込み。旧 `tags` STORED は tags.db 移行専用 | `fts_index.rs` → `ingest_worker.rs` |
 | `fts_meta.db` | ファイル単位の管理メタ (path / mtime / size / status=Ok\|Failed / index_generation)。検索原文は持たず Tantivy STORED に集約 | `fts_meta.rs` |

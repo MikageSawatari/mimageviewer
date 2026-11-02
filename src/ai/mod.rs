@@ -8,6 +8,8 @@
 //! 精度不足とアーティファクトの問題により削除された
 //! (タグ `v0.6.0-with-spread-inpaint` 参照)。
 
+#[cfg(windows)]
+pub(crate) mod caption_job_worker;
 pub mod classify;
 pub mod denoise;
 pub mod final_pipeline;

@@ -6757,12 +6757,17 @@ mod tests {
         );
         assert!(
             harness
-                .query_by_label("新しいフォルダ…はこの場面で先頭")
+                .query_by_label("AI 説明文を作るはこの場面で先頭")
                 .is_some()
         );
         assert!(
             harness
-                .query_by_label("新しいフォルダ…の前の区切り線（先頭のため非表示）")
+                .query_by_label("AI 説明文を作るの前の区切り線（先頭のため非表示）")
+                .is_some()
+        );
+        assert!(
+            harness
+                .query_by_label("新しいフォルダ…の前の区切り線")
                 .is_some()
         );
         assert_eq!(
