@@ -215,6 +215,8 @@ captions(
 
 ### 11.1 VRAM の見積もり (2026-11-02、**すべて推定・未計測**)
 
+> 2026-11-02 に V0 で実測した。VLM は §18.1、AI 補正は §18.4、併用の見込みは §18.5。以下は計測前の推定として残す。
+
 AI 補正の VRAM 使用量は実測の記録が無い。ONNX Runtime の確保分は mIV の VRAM 会計
 (`src/app/vram_accounting.rs`) に入らない設計のため、perf ログからも読めない (web-remote-ai-plan §10)。
 以下はコードの設定値とモデルのサイズからの推定。
@@ -400,15 +402,52 @@ llama.cpp b12032 (GitHub Releases、sha256 照合済み)。モデルは §3.2 �
 - Qwen-VL 系は「位置の特定には画像トークン 1024 以上が必要」と警告する。説明文への影響は品質の比較で見る。
 - llama-server は「API キー無し、CORS は全オリジンを許可」と警告する。§4 で HTTP サーバ方式 (案 A) を採らない判断の裏付け。
 
-### 18.4 U1 への示唆 (AI 補正の計測 V0-3 は未実施)
+### 18.4 AI 補正の VRAM (V0-3、2026-11-02 利用者承認のうえ実施)
 
-- 4B 級はピーク約 4.0〜4.9GiB、9B 級は約 6.5〜6.7GiB。
-- 8GB 機での併用の見込み: 4B 級 (約 4.3GiB) + 表示用テクスチャの典型値 (24GB 機でのフルスクリーン中央値 0.4〜1.0GiB、V0 手順書 §V0-4)
-  + AI 補正 (未計測、推定 1GB 前後) + OS と画面表示 (1GB 前後と仮定) = 約 7〜7.5GiB で、収まる見込みがある。
-  9B 級は同じ計算で約 9〜10GiB になり、8GB 機には収まらない。
-- AI 補正の実測 (V0-3) は `bench_ai` が実利用中の `%APPDATA%\mimageviewer` に書き込むため、利用者の承認待ち。
+`bench_ai` (release、`--features dev-tools`) を DirectML で実行し、`scripts/vlm-eval/run-bench-ai.ps1` で
+プロセスの専用 VRAM を約 200ms ごとに記録した。入力は比較用画像の 1 枚 (1024×768、写真)、warmup 1 回 + 計測 5 回。
+TensorRT は `bench_ai` が `target\release\mimageviewer.exe` をワーカーとして起動する作りで、エージェントが起動しない
+製品バイナリに当たるため測っていない。
 
-### 18.5 残り
+| 読み込んだモデル | タイル | プロセスの VRAM ピーク | 1 枚の時間 (4 倍、5 回平均) |
+| --- | --- | --- | --- |
+| realesr_general_v3 | 512px | 0.35GiB | 0.41 秒 |
+| denoise_realplksr | 256px | 0.38GiB | 0.79 秒 (等倍) |
+| realcugan_4x | 192px | 0.57GiB | 0.35 秒 |
+| realesrgan_x4plus | 192px | 0.90GiB | 1.86 秒 |
+| realesrgan_anime6b | 192px | 0.96GiB | 0.76 秒 |
+| nmkd_siax_4x | 192px | 1.02GiB | 1.94 秒 |
+| **「軽量」モードの組** (realcugan_4x + realesr_general_v3) | — | **0.79GiB** | — |
+| **「高品質」モードの組** (anime6b + realcugan_4x + x4plus + denoise) | — | **2.41GiB** | — |
+| 6 モデルすべて | — | 3.47GiB | — |
+
+- 単独の値は実行をまたいで一致した (realcugan_4x は 3 回とも 0.57GiB)。
+- **製品は一度読み込んだ AI 補正のモデルを降ろさない** (`src/ai/runtime.rs` の `sessions: HashMap<ModelKind, Session>`。
+  外すのは BiRefNet 更新時の `unload_model(SubjectMatte)` だけ)。自動選択は画像のカテゴリごとにモデルを選ぶ
+  (`AiFeatureMode::auto_upscale_model`、`ImageCategory::preferred_upscale_model`) ため、写真とイラストが混じった
+  フォルダを見ていくと、そのモードの組が全部読み込まれたままになる。既定は「軽量」(`AiFeatureMode` の既定 = Light、ノイズ除去なし)。
+- §11.1 の推定 (1 モデル数百 MB〜1GB 台) は単独の値と合う。ただし「高品質」モードの組は約 2.4GiB で、推定の 1GB を大きく超える。
+
+### 18.5 U1 への示唆
+
+- 4B 級はピーク約 4.0〜4.9GiB、9B 級は約 6.5〜6.7GiB (§18.1)。
+- 8GB 機での併用の見込み = VLM + 表示用テクスチャの典型値 (24GB 機でのフルスクリーン中央値 0.4〜1.0GiB、V0 手順書 §V0-4)
+  + AI 補正 (§18.4 の実測) + OS と画面表示 (1GB 前後と仮定、未計測):
+
+  | VLM | AI 補正「軽量」(0.8GiB) | AI 補正「高品質」(2.4GiB) |
+  | --- | --- | --- |
+  | 4B 級 (約 4.3GiB) | 約 6.5〜7.1GiB で収まる見込み | 約 8.1〜8.7GiB で超える |
+  | 9B 級 (約 6.6GiB) | 約 8.8〜9.4GiB で超える | 約 10.4〜11.0GiB で超える |
+
+- 12GB 機では、4B 級はどちらのモードでも収まる見込み (最大 約 8.7GiB)。9B 級は「高品質」で約 11GiB と境目。
+  16GB 機以上では 9B 級もどちらのモードでも収まる見込み。
+- 表示用テクスチャの値は 24GB 機 (pool 上限 12GB) の記録で、8GB 機では pool 上限が 4GB になる。
+  大きな画像を拡大表示したときの p95 は 3.1GiB あり (V0 手順書 §V0-4)、8GB 機ではこの分が先に不足し得る。
+- AI 補正を止めて空く分は「軽量」で 0.8GiB、「高品質」で 2.4GiB。止める仕組み (§11.2 の a・b) より、
+  8GB 機では「高品質」と併用しない形 (d の段の条件に AI 補正のモードを含める、または 8GB 機は 4B 級 + 「軽量」までと案内する) のほうが
+  状態を増やさずに済む。判断は利用者 (U1)。
+
+### 18.6 残り
 
 - V0-5 品質の比較 (利用者): `G:\home\vlm-eval\runs\20261102-compare\compare.html`。比較するのは C1・C2・C3b・C5 の 4 列 (目隠し、対応表は `compare.key.json`)。
-- V0-3 AI 補正の VRAM (承認待ち)、V0-6 併用の確認 (任意)。
+- V0-6 併用の確認 (任意)。
