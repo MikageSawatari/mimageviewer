@@ -510,3 +510,9 @@ reparse point 0と確認してNTFS圧縮（ファイル内容保持、削除0）
 
 同じ設定/UI/永続形式の衝突に関する判断待ちはない。旧歌詞受信実装をどのmIV Sound候補へ
 取り込むか、正式承認と実機受入はこのmergeのファイル解消とは別の未完了事項である。
+
+## 5. master (v4.11.0) と mcp-trial の最新の取り込み（2026-11-02）
+
+- 設計担当 ClaudeCode が実施。master `3a193e50d` (v4.11.0 公開後。§1.677〜§1.685 の記録、RAW 縮小画像の再要求ループ修正、`deploy-site.ps1`) を `9d57d16c4` で、mcp-trial `bf70f3797` (サブ PC での利用例確認 依頼 4・5、ローカル VLM 説明文計画の下書き、VLM 評価スクリプト) を `87385aea0` で取り込んだ。どちらも衝突なし。版は master の 4.11.0 になった (v5 の版番号は候補版で決める)。
+- 検証: `MIV_SOUND_CANDIDATE` を §2 の検査専用入力 (`dcdfa794…6d34`) にして `test-lib-full.ps1`。15,834 件中 15,833 件成功、71 skip。失敗 1 件 `app::tests::history_parent_1473::section1473_smart_and_collection_physical_entrances_keep_native_root_and_origin` は全件時 27.6 秒で失敗し、単独では 3 回とも成功 (4.2〜4.7 秒)。負荷時の期限切れと判断し、製品の不具合とはしない。`MIV_SOUND_CANDIDATE` を付けないと build.rs が mIV Sound 通知の欠落で止まる (正式候補の未配置。§4 の残作業 2)。
+- この取り込みで §4「候補版を作るために残っていること」は変わらない。
