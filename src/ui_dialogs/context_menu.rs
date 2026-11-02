@@ -1282,6 +1282,17 @@ impl crate::app::App {
             // native video input 側で対応する down/up だけを消費する。
             self.begin_native_video_context_menu_dismiss_click();
         }
+        self.dispatch_native_context_menu_result(ctx, native_result, &target)
+    }
+
+    // Adopt the native result while its menu owner is still installed, just like
+    // the egui selected-command path. Kept separate from the desktop menu pump.
+    fn dispatch_native_context_menu_result(
+        &mut self,
+        ctx: &egui::Context,
+        native_result: NativeContextMenuResult,
+        target: &NativeGridContextMenuTarget,
+    ) -> NativeGridContextMenuOutcome {
         match native_result {
             NativeContextMenuResult::Canceled | NativeContextMenuResult::ShellCommandInvoked => {
                 NativeGridContextMenuOutcome::Consumed {
@@ -1292,7 +1303,7 @@ impl crate::app::App {
             NativeContextMenuResult::MivCommand(command) => {
                 let close_fullscreen =
                     native_menu_command_closes_fullscreen(&command, target.surface);
-                let nav = self.dispatch_native_grid_context_command(ctx, command, &target);
+                let nav = self.dispatch_native_grid_context_command(ctx, command, target);
                 NativeGridContextMenuOutcome::Consumed {
                     nav,
                     close_fullscreen,
@@ -3356,6 +3367,138 @@ fn open_folder_in_explorer(path: &std::path::Path) {
     #[cfg(not(windows))]
     {
         let _ = path;
+    }
+}
+
+#[cfg(all(test, windows))]
+mod caption_menu_tests {
+    use super::*;
+    use crate::ai::caption_job_worker::CaptionWorker;
+    use crate::ui_dialogs::caption_job::CaptionJob;
+    use crate::ui_dialogs::vlm_addon::VlmSetup;
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    fn fixture(append: bool) -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        app.current_folder = Some("C:/caption-menu".into());
+        app.items = vec![GridItem::Image("C:/caption-menu/image.png".into())];
+        app.selected = Some(0);
+        app.main_hwnd = None; // The headless egui test never opens a native desktop menu.
+        app.vlm_setup = VlmSetup::for_caption_menu_test(app.tmp.path().join("vlm"));
+        if append {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (worker, _commands, _events) = CaptionWorker::test_channels(cancel.clone());
+            app.caption_job = Some(CaptionJob::new(worker, cancel));
+        }
+        app.context_menu_pos = egui::pos2(24.0, 24.0);
+        app.context_menu_idx = Some(app.capture_grid_context_menu_owner(0));
+        assert!(app.common_modal_dialog_open());
+        assert!(!app.main_chrome_pointer_blocked());
+        app
+    }
+
+    fn assert_accepted(app: &crate::app::AppTestEnvForTest, append: bool) {
+        let expected = vec![PathBuf::from("C:/caption-menu/image.png")];
+        if append {
+            assert_eq!(
+                app.caption_job.as_ref().unwrap().queued_paths_for_test(),
+                expected
+            );
+        } else {
+            assert_eq!(
+                app.vlm_setup
+                    .captured_caption_targets_for_test()
+                    .unwrap()
+                    .paths,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn caption_job_native_menu_result_admits_setup_and_append_before_menu_owner_is_cleared() {
+        for append in [false, true] {
+            let mut app = fixture(append);
+            let target = app.context_menu_target(
+                0,
+                app.items[0].clone(),
+                false,
+                false,
+                None,
+                ContextMenuSurface::Grid,
+                None,
+            );
+            let outcome = app.dispatch_native_context_menu_result(
+                &egui::Context::default(),
+                NativeContextMenuResult::MivCommand(MenuCommand::CreateAiCaptions),
+                &target,
+            );
+            assert!(matches!(
+                outcome,
+                NativeGridContextMenuOutcome::Consumed { .. }
+            ));
+            assert!(app.context_menu_idx.is_some());
+            assert_accepted(&app, append);
+        }
+    }
+
+    #[test]
+    fn caption_job_egui_menu_click_admits_setup_and_append_before_menu_owner_is_cleared() {
+        use egui_kittest::kittest::Queryable;
+        for append in [false, true] {
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(900.0, 900.0))
+                .build_ui_state(
+                    |ui, app: &mut crate::app::AppTestEnvForTest| {
+                        if app.context_menu_idx.is_some() {
+                            let _ = app.show_context_menu(ui.ctx());
+                        }
+                    },
+                    fixture(append),
+                );
+            harness.run_steps(4);
+            assert!(harness.state().context_menu_idx.is_some());
+            harness.get_by_label("AI 説明文を作る").click();
+            harness.run_steps(2);
+            assert!(harness.state().context_menu_idx.is_none());
+            assert_accepted(harness.state(), append);
+        }
+    }
+
+    #[test]
+    fn caption_job_menu_admission_still_rejects_actual_dialog_and_stopping_job() {
+        for stopping in [false, true] {
+            let mut app = fixture(true);
+            if stopping {
+                app.caption_job.as_mut().unwrap().stop();
+            } else {
+                app.show_about_dialog = true;
+            }
+            let target = app.context_menu_target(
+                0,
+                app.items[0].clone(),
+                false,
+                false,
+                None,
+                ContextMenuSurface::Grid,
+                None,
+            );
+            app.dispatch_native_context_menu_result(
+                &egui::Context::default(),
+                NativeContextMenuResult::MivCommand(MenuCommand::CreateAiCaptions),
+                &target,
+            );
+            assert!(app.context_menu_idx.is_some());
+            assert!(
+                app.caption_job
+                    .as_ref()
+                    .unwrap()
+                    .queued_paths_for_test()
+                    .is_empty()
+            );
+            assert!(app.vlm_setup.captured_caption_targets_for_test().is_none());
+        }
     }
 }
 

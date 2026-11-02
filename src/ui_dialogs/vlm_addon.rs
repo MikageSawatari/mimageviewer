@@ -56,6 +56,31 @@ pub(crate) struct VlmPreferencesView {
 }
 
 impl VlmSetup {
+    #[cfg(test)]
+    pub(super) fn for_caption_menu_test(root: PathBuf) -> Self {
+        Self {
+            addon: VlmAddon::with_test_status(root, AddonStatus::Missing),
+            gpu: GpuProbe::Ready(Ok(GpuDetection::Device(
+                crate::ai::vlm_worker::GpuDecision {
+                    device: None,
+                    vulkan_available: true,
+                    vram_total_bytes: 8 * 1073741824,
+                },
+            ))),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn captured_caption_targets_for_test(&self) -> Option<&CaptionTargets> {
+        match &self.dialog {
+            Some(
+                Dialog::Checking(targets) | Dialog::Confirm(targets) | Dialog::Running(targets),
+            ) => Some(targets),
+            _ => None,
+        }
+    }
+
     fn installed(&mut self, cancelling: bool) -> Option<CaptionTargets> {
         let targets = match self.dialog.take() {
             Some(Dialog::Running(paths)) if !cancelling => Some(paths),

@@ -63,6 +63,11 @@ pub(crate) struct CaptionJob {
 }
 
 impl CaptionJob {
+    #[cfg(test)]
+    pub(super) fn queued_paths_for_test(&self) -> Vec<PathBuf> {
+        self.queue.iter().cloned().collect()
+    }
+
     pub(super) fn new(worker: CaptionWorker, cancel: Arc<AtomicBool>) -> Self {
         Self {
             state: JobState::Running,
@@ -198,6 +203,37 @@ fn collect_caption_targets(
     targets
 }
 
+/// Folder-wide actions use the context's retained source members, not only
+/// visible aggregate cells. This does not materialize/sort a second grid or scan.
+fn collect_folder_caption_targets(
+    items: &[GridItem],
+    stack: Option<&crate::filename_stack::StackView>,
+    folder: &Path,
+) -> CaptionTargets {
+    let Some(stack) = stack else {
+        return collect_caption_targets(items, 0..items.len(), Some(folder));
+    };
+    let mut targets =
+        collect_caption_targets(&stack.passthrough, 0..stack.passthrough.len(), Some(folder));
+    let mut seen: HashSet<_> = targets
+        .paths
+        .iter()
+        .map(|path| crate::path_key::normalize_keep_drive(path))
+        .collect();
+    for member in stack.groups.iter().flat_map(|group| &group.members) {
+        if !member.is_video
+            && member
+                .path
+                .parent()
+                .is_some_and(|parent| same_path(parent, folder))
+            && seen.insert(crate::path_key::normalize_keep_drive(&member.path))
+        {
+            targets.paths.push(member.path.clone());
+        }
+    }
+    targets
+}
+
 impl App {
     fn caption_targets(&self, background: bool) -> CaptionTargets {
         let indices = self.selection_target_indices(ActionSurface::MainWindow);
@@ -205,14 +241,16 @@ impl App {
             let Some(folder) = self.current_folder.as_deref() else {
                 return CaptionTargets::default();
             };
-            collect_caption_targets(&self.items, 0..self.items.len(), Some(folder))
+            collect_folder_caption_targets(&self.items, self.stack_view.as_deref(), folder)
         } else {
             collect_caption_targets(&self.items, indices, None)
         }
     }
 
     pub(crate) fn request_create_ai_captions(&mut self, ctx: &egui::Context, background: bool) {
-        if self.common_modal_dialog_open() || self.remote_session_blocks_local_control() {
+        // The command is dispatched before its native/egui menu owner is cleared.
+        // Reuse the shared non-menu modal policy, preserving all real blockers.
+        if self.main_chrome_pointer_blocked() || self.remote_session_blocks_local_control() {
             return;
         }
         if self
@@ -548,6 +586,98 @@ mod tests {
             collect_caption_targets(&items, 0..items.len(), Some(Path::new("C:/images")));
         assert_eq!(background.paths, vec![PathBuf::from("C:/images/a.png")]);
         assert_eq!(background.unsupported, 2);
+    }
+
+    fn stack_fixture() -> crate::filename_stack::StackView {
+        use crate::filename_stack::{StackMember, StackView};
+        let media = [
+            ("C:/images/post_0.png", false),
+            ("C:/images/post_1.png", false),
+            ("C:/images/single.png", false),
+            ("C:/images/sub/child.png", false),
+            ("C:/images/video.mp4", true),
+        ]
+        .into_iter()
+        .map(|(path, is_video)| StackMember {
+            path: path.into(),
+            mtime: 0,
+            size: Some(1),
+            is_video,
+        })
+        .collect();
+        StackView::build(
+            "C:/images".into(),
+            vec![
+                GridItem::ZipFile("C:/images/book.zip".into()),
+                GridItem::Folder("C:/images/sub".into()),
+                GridItem::Audio("C:/images/song.mp3".into()),
+            ],
+            vec![None; 3],
+            media,
+            '_',
+            crate::settings::SortOrder::FileName,
+        )
+    }
+
+    #[test]
+    fn caption_job_folder_targets_are_identical_with_stack_on_off_or_flat() {
+        let mut app = crate::app::setup_app_for_test();
+        let view = stack_fixture();
+        app.current_folder = Some(view.folder.clone());
+        app.items = view.materialize_flat().0;
+        app.selected = None;
+        let plain = app.caption_targets(false);
+        let keys = |targets: &CaptionTargets| -> std::collections::BTreeSet<_> {
+            targets
+                .paths
+                .iter()
+                .map(|p| crate::path_key::normalize_keep_drive(p))
+                .collect()
+        };
+        assert_eq!(plain.paths.len(), 3);
+        assert_eq!(plain.unsupported, 1);
+        app.items = view.materialize_aggregated().0;
+        app.stack_view = Some(Arc::new(view));
+        for background in [false, true] {
+            let aggregated = app.caption_targets(background);
+            assert_eq!(keys(&aggregated), keys(&plain));
+            assert_eq!(aggregated.unsupported, plain.unsupported);
+        }
+        // A background request ignores the selected collapsed stack too.
+        app.selected = app
+            .items
+            .iter()
+            .position(|i| matches!(i, GridItem::Stack { .. }));
+        assert!(app.selected.is_some());
+        assert_eq!(keys(&app.caption_targets(true)), keys(&plain));
+        app.items = app.stack_view.as_ref().unwrap().materialize_flat().0;
+        app.stack_showing_flat = true;
+        app.selected = None;
+        assert_eq!(keys(&app.caption_targets(false)), keys(&plain));
+    }
+
+    #[test]
+    fn caption_job_selected_stack_is_unsupported_like_existing_grid_tag_operation() {
+        let mut app = crate::app::setup_app_for_test();
+        let view = stack_fixture();
+        app.current_folder = Some(view.folder.clone());
+        app.items = view.materialize_aggregated().0;
+        app.stack_view = Some(Arc::new(view));
+        app.selected = app
+            .items
+            .iter()
+            .position(|i| matches!(i, GridItem::Stack { .. }));
+        assert!(app.selected.is_some());
+        assert!(app.tag_target_paths(ActionSurface::MainWindow).is_empty());
+        let targets = app.caption_targets(false);
+        assert!(targets.paths.is_empty());
+        assert_eq!(targets.unsupported, 1);
+        app.selected = app
+            .items
+            .iter()
+            .position(|i| matches!(i, GridItem::Image(_)));
+        assert!(app.selected.is_some());
+        assert_eq!(app.caption_targets(false).paths.len(), 1);
     }
 
     #[test]

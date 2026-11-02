@@ -1493,3 +1493,29 @@ DOS予約名・末尾dot/space・区切り・相対移動・case-insensitive衝�
   `scripts/build-dev.ps1 -PreserveRuntime` は通常featureの `dev-runtime` coreと同伴3exeのbuild／配置・VC runtime PE検査に成功。
   `target/vlm-caption-build-dev.log` に記録し、成果物は起動していない。
 - 実モデル・製品バイナリの起動、外部通信、評価用データの読み込み、C++／vendor変更、コミットは行っていない。
+
+#### 21.9.1 独立レビュー1回目への対応 (基準 `4fbba7d34`)
+
+- P1: 作成要求の受付を、既存の `main_chrome_pointer_blocked()` が共有する
+  `modal_dialog_block_reason_including_menus(false)` の判定に揃えた。右クリックの owner を残したまま受理し、
+  実際のダイアログ・Remote・`Stopping` は引き続き拒否する。メニュー固有の除外リストは追加しない。
+  native は結果採用を desktop menu pump から分け、実際と同じ `MivCommand` 採用経路を非対話で検査する。
+  egui は実メニュー描画への合成クリックで、owner の解除前に初回準備／実行中の追加が受理されることを検査する。
+- P2-1: rollback journal の reader が COMMIT を妨げている間も、SQLite の busy handler で中止を確認する。
+  handler は保存 worker 上の scope にだけ、所有された cancel `Arc` と従来と同じ5秒の期限を持つ。
+  中止した busy COMMIT は rollback 後に取消として戻し、既存の行とrevisionを変えない。
+  通常の `CaptionDb::save`、`BEGIN IMMEDIATE` 後の署名再確認、upsert条件は維持し、再実行・回復の経路は追加しない。
+  reader を保持したまま取消完了を待つ回帰を、新規保存／既存行の置換の両方で追加した。
+  reader 解放時の通常成功と、期限切れがDBエラーのまま戻ること、handler／timeoutの復元も確認する。
+- P2-2: フォルダ全体の対象は、同じ context の `StackView.passthrough` と `groups.members` から直下の実画像を取り出す。
+  UI上の再走査や全グリッドの再生成・再ソートは行わず、動画と直下でないパスを除く。
+  スタックOFF／集約表示／flat表示で画像の対象集合と対象外集計が一致する回帰を追加した。
+  選択した `Stack` セルは、現行 `tag_target_for_item` がメンバーを展開しない規則に合わせ、対象外1件のまま維持する。
+  メンバー単位で選択した実画像は従来どおり対象とする。製本の専用メンバー展開を、タグや今回の選択操作へ持ち込まない。
+- 関連focusedは110/110成功、実行2.644秒。nextest run `4c6f12e7-bca7-4caa-9bb2-78fdf60f80fe`、
+  ログは `target/vlm-caption-review1-focused.log`。選択は `caption_job`／`ai_caption_db::`／`vlm_setup`／
+  `context_menu_model`／`main_chrome_modal_classification`／`filename_stack::`。
+  本体lib全件は設計担当が実行するため、ここでは再実行しない。
+- `scripts/build-dev.ps1 -PreserveRuntime` は通常featureのcoreと同伴3exeのbuild／配置・VC runtime PE検査に成功。
+  ログは `target/vlm-caption-review1-build-dev.log`。最後にワークスペース全体へ `cargo fmt` を実行した。
+  UI glyph検査・差分検査も成功。製品起動・外部通信・コミットは行っていない。

@@ -5,9 +5,117 @@
 
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct CommitWait {
+    cancel: Arc<AtomicBool>,
+    deadline: Instant,
+}
+
+thread_local! {
+    // rusqlite 0.31's safe busy_handler accepts only a function pointer. Keep
+    // owned state on the calling worker instead of passing borrowed FFI data.
+    static COMMIT_WAIT: std::cell::RefCell<Option<CommitWait>> = const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static COMMIT_WAIT_NOTIFY: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn commit_busy(_attempt: i32) -> bool {
+    let remaining = COMMIT_WAIT.with(|slot| {
+        let slot = slot.borrow();
+        let wait = slot.as_ref()?;
+        if wait.cancel.load(Ordering::Acquire) {
+            return None;
+        }
+        wait.deadline.checked_duration_since(Instant::now())
+    });
+    let Some(remaining) = remaining else {
+        return false;
+    };
+    #[cfg(test)]
+    COMMIT_WAIT_NOTIFY.with(|slot| {
+        let notify = slot.borrow_mut().take();
+        if let Some(notify) = notify {
+            let _ = notify.send(());
+        }
+    });
+    // SQLite invokes this on its DB worker while a reader holds the rollback
+    // journal's commit lock. No TLS borrow spans the bounded SQLite busy wait.
+    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    COMMIT_WAIT.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|wait| {
+            !wait.cancel.load(Ordering::Acquire) && Instant::now() < wait.deadline
+        })
+    })
+}
+
+struct CommitBusyGuard<'a> {
+    conn: &'a Connection,
+    previous: Option<CommitWait>,
+}
+
+impl<'a> CommitBusyGuard<'a> {
+    fn install(
+        conn: &'a Connection,
+        cancel: &Arc<AtomicBool>,
+        timeout: Duration,
+    ) -> rusqlite::Result<Self> {
+        let previous = COMMIT_WAIT.with(|slot| {
+            slot.replace(Some(CommitWait {
+                cancel: Arc::clone(cancel),
+                deadline: Instant::now() + timeout,
+            }))
+        });
+        let guard = Self { conn, previous };
+        conn.busy_handler(Some(commit_busy))?;
+        Ok(guard)
+    }
+}
+
+impl Drop for CommitBusyGuard<'_> {
+    fn drop(&mut self) {
+        // Restore the store's normal busy timeout on success, cancellation,
+        // SQLite failure, and unwinding. The callback retains no borrowed data.
+        if let Err(error) = self.conn.busy_timeout(BUSY_TIMEOUT) {
+            crate::logger::log(format!(
+                "ai_caption: restoring busy timeout failed: {error}"
+            ));
+        }
+        COMMIT_WAIT.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
+
+fn commit_unless_cancelled(
+    conn: &Connection,
+    tx: Transaction<'_>,
+    cancel: &Arc<AtomicBool>,
+    timeout: Duration,
+) -> rusqlite::Result<bool> {
+    if cancel.load(Ordering::Acquire) {
+        tx.rollback()?;
+        return Ok(false);
+    }
+    let _guard = CommitBusyGuard::install(conn, cancel, timeout)?;
+    match tx.commit() {
+        Ok(()) => Ok(true),
+        // Transaction::commit drops/rolls back its transaction on error.
+        // Only an interrupted busy wait is cancellation; real DB failures,
+        // including an uncancelled five-second timeout, retain their error.
+        Err(error)
+            if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
+                && cancel.load(Ordering::Acquire) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
 
 /// Signature captured when the input is read, in portable metadata's units.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,7 +216,7 @@ impl CaptionDb {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         Self::ensure_schema(&conn)?;
         Ok(Self { conn })
     }
@@ -119,7 +227,7 @@ impl CaptionDb {
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         Ok(Self { conn })
     }
 
@@ -229,28 +337,28 @@ impl CaptionDb {
     /// filesystem metadata call is made inside the transaction. DB failures are
     /// returned to V1-3 to stop the job and notify the user, without retrying.
     pub fn save(&self, request: &SaveRequest) -> rusqlite::Result<SaveOutcome> {
-        self.save_inner(request, || false)
+        self.save_inner(request, None)
             .map(|result| result.expect("uncancellable save"))
     }
 
-    /// A caption job may be cancelled while SQLite waits for another writer.
-    /// Check again inside the transaction, at the mutation boundary. None means
-    /// cancellation, distinct from an input signature change (Discarded).
+    /// A caption job may be cancelled while SQLite waits for another writer or
+    /// for readers to release the rollback journal's commit lock. Recheck at
+    /// mutation/commit and abort a busy commit when cancellation arrives. None
+    /// means cancellation, distinct from an input signature change (Discarded).
     pub(crate) fn save_unless_cancelled(
         &self,
         request: &SaveRequest,
-        cancel: &std::sync::atomic::AtomicBool,
+        cancel: &Arc<AtomicBool>,
     ) -> rusqlite::Result<Option<SaveOutcome>> {
-        self.save_inner(request, || {
-            cancel.load(std::sync::atomic::Ordering::Acquire)
-        })
+        self.save_inner(request, Some(cancel))
     }
 
     fn save_inner(
         &self,
         request: &SaveRequest,
-        cancelled: impl Fn() -> bool,
+        cancel: Option<&Arc<AtomicBool>>,
     ) -> rusqlite::Result<Option<SaveOutcome>> {
+        let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::Acquire));
         if let CaptionResult::Ok {
             caption,
             text,
@@ -316,7 +424,13 @@ impl CaptionDb {
                 system_time_ms(SystemTime::now()).unwrap_or(0)
             ],
         )?;
-        tx.commit()?;
+        if let Some(cancel) = cancel {
+            if !commit_unless_cancelled(&self.conn, tx, cancel, BUSY_TIMEOUT)? {
+                return Ok(None);
+            }
+        } else {
+            tx.commit()?;
+        }
         Ok(Some(if changed == 0 {
             SaveOutcome::KeptExistingOk
         } else {
@@ -422,6 +536,127 @@ mod tests {
         assert_eq!(worker.join().unwrap(), None);
         assert!(read(&db, &req).is_none());
         assert_eq!(seq(&db), 0);
+    }
+
+    fn assert_commit_handler_removed(db: &CaptionDb) {
+        COMMIT_WAIT.with(|slot| assert!(slot.borrow().is_none()));
+        assert_eq!(
+            db.conn
+                .pragma_query_value::<i64, _>(None, "busy_timeout", |row| row.get(0))
+                .unwrap(),
+            5000
+        );
+    }
+
+    #[test]
+    fn caption_job_cancel_while_reader_blocks_commit_rolls_back_insert_and_update() {
+        use std::sync::mpsc;
+
+        for existing in [false, true] {
+            let (temp, db, mut req) = fixture();
+            if existing {
+                db.save(&req).unwrap();
+            }
+            let before = read(&db, &req);
+            let before_seq = seq(&db);
+            req.result = CaptionResult::Ok {
+                caption: "cancelled replacement".into(),
+                text: String::new(),
+                keywords: Vec::new(),
+            };
+            let reader =
+                Transaction::new_unchecked(&db.conn, TransactionBehavior::Deferred).unwrap();
+            // BEGIN alone does not acquire a shared lock. A real read holds
+            // the rollback journal's reader lock until this transaction ends.
+            reader
+                .query_row("SELECT n FROM caption_seq", [], |row| row.get::<_, i64>(0))
+                .unwrap();
+            let path = temp.path().join("ai_caption.db");
+            let worker_req = req.clone();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let worker_cancel = Arc::clone(&cancel);
+            let (notify, waiting) = mpsc::channel();
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let saving = CaptionDb::open_existing_for_write(path).unwrap();
+                COMMIT_WAIT_NOTIFY.with(|slot| *slot.borrow_mut() = Some(notify));
+                let result = saving.save_unless_cancelled(&worker_req, &worker_cancel);
+                assert_commit_handler_removed(&saving);
+                finished_tx.send(result).unwrap();
+            });
+            waiting.recv_timeout(Duration::from_secs(10)).unwrap();
+            cancel.store(true, Ordering::Release);
+            // Keep the reader locked until the save has cancelled. Releasing
+            // it here would let an uncancellable COMMIT pass this regression.
+            assert_eq!(
+                finished_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .unwrap(),
+                None
+            );
+            worker.join().unwrap();
+            reader.rollback().unwrap();
+            assert_eq!(read(&db, &req), before);
+            assert_eq!(seq(&db), before_seq);
+        }
+    }
+
+    #[test]
+    fn caption_job_commit_succeeds_when_reader_releases_without_cancellation() {
+        use std::sync::mpsc;
+
+        let (temp, db, req) = fixture();
+        let reader = Transaction::new_unchecked(&db.conn, TransactionBehavior::Deferred).unwrap();
+        reader
+            .query_row("SELECT n FROM caption_seq", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        let path = temp.path().join("ai_caption.db");
+        let worker_req = req.clone();
+        let (notify, waiting) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let saving = CaptionDb::open_existing_for_write(path).unwrap();
+            COMMIT_WAIT_NOTIFY.with(|slot| *slot.borrow_mut() = Some(notify));
+            let result =
+                saving.save_unless_cancelled(&worker_req, &Arc::new(AtomicBool::new(false)));
+            assert_commit_handler_removed(&saving);
+            result
+        });
+        waiting.recv_timeout(Duration::from_secs(10)).unwrap();
+        reader.rollback().unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), Some(SaveOutcome::Written));
+        assert_eq!(read(&db, &req).unwrap().caption, "青い空");
+    }
+
+    #[test]
+    fn uncancelled_commit_busy_deadline_is_an_error_and_restores_the_normal_timeout() {
+        let (temp, db, req) = fixture();
+        db.save(&req).unwrap();
+        let before = read(&db, &req).unwrap();
+        let before_seq = seq(&db);
+        let reader = Connection::open(temp.path().join("ai_caption.db")).unwrap();
+        let reader = Transaction::new_unchecked(&reader, TransactionBehavior::Deferred).unwrap();
+        reader
+            .query_row("SELECT n FROM caption_seq", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        let writer = Transaction::new_unchecked(&db.conn, TransactionBehavior::Immediate).unwrap();
+        writer.execute("DELETE FROM captions", []).unwrap();
+        // Exercise an already-expired deadline without a real five-second
+        // test wait. SQLite still attempts COMMIT and calls the same handler.
+        let result = commit_unless_cancelled(
+            &db.conn,
+            writer,
+            &Arc::new(AtomicBool::new(false)),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            result.unwrap_err().sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        assert_commit_handler_removed(&db);
+        reader.rollback().unwrap();
+        assert_eq!(read(&db, &req), Some(before));
+        assert_eq!(seq(&db), before_seq);
     }
 
     fn read(db: &CaptionDb, req: &SaveRequest) -> Option<CaptionRow> {

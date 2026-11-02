@@ -418,7 +418,7 @@ fn deduplicate_keywords(keywords: Vec<String>) -> Vec<String> {
 fn save_result(
     config: &CaptionWorkerConfig,
     db: &CaptionDb,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
     path: &Path,
     signature: FileSignature,
     result: CaptionResult,
