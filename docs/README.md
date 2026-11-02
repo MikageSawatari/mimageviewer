@@ -76,6 +76,7 @@
 | [post-v3.8.0-priority-work.md](post-v3.8.0-priority-work.md) | v3.8.0公開後の優先修正。§1.208動画音声モード、§1.209サイドカー取り込み、類似索引改善、CIの担当・不変条件・検収判断 |
 | [post-v3.10.0-development.md](post-v3.10.0-development.md) | v3.10.0後の修正・sort・コレクション開発順と、不在中の隔離検証 |
 | [folder-tree-sort-plan.md](folder-tree-sort-plan.md) | §2.25 ツリー専用の並び順と、展開・現在位置を保持するworker再列挙の設計。§2.24の一覧サイズ順に先行 |
+| [folder-tree-refresh-plan.md](folder-tree-refresh-plan.md) | §1.686 外部変更とツリー再照合。§9.5の一覧受理通知＋再参加を採用し、展開枝監視は見送り。typed node所有・完全membership・表示中断/復帰・scroll保持と§10の検証記録 |
 | [collection-spec-proposal.md](collection-spec-proposal.md) | §1.118 名前付きコレクションの初期仕様案と、その後の利用者判断の記録。現在の操作仕様はマニュアル、実装状態は実装計画 §23 を参照 |
 | [collection-implementation-plan.md](collection-implementation-plan.md) | コレクションの保存・管理UI・一覧・再生・Remoteを触るとき。actorと各画面の所有境界、出荷前修正の実装・検収台帳 |
 | [collection-return-investigation.md](collection-return-investigation.md) | 2026-10-30 X投稿の「本から戻ると違う場所」。v4.10.0相当のheadless試験で帰り先・選択を保ったスクロールずれを再現。>>661との関係と20件の証跡 |

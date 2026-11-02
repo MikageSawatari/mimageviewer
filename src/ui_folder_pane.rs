@@ -158,12 +158,12 @@ fn draw_folder_pane_row(
     ui: &mut egui::Ui,
     row: &folder_pane::FolderPaneRow,
     has_focus: bool,
-) -> (egui::Response, egui::Response) {
-    ui.horizontal(|ui| {
+) -> (egui::Response, egui::Response, egui::Rect) {
+    let drawn = ui.horizontal(|ui| {
         ui.set_height(FOLDER_PANE_ROW_HEIGHT);
         ui.spacing_mut().item_spacing.x = 2.0;
         ui.add_space(row.depth as f32 * FOLDER_PANE_INDENT_WIDTH);
-        let arrow = if row.has_children_or_unknown {
+        let arrow = if row.expanded || row.has_children_or_unknown {
             if row.expanded { "▼" } else { "▶" }
         } else {
             " "
@@ -212,8 +212,8 @@ fn draw_folder_pane_row(
             ui.label(egui::RichText::new("!").color(ui.visuals().warn_fg_color));
         }
         (arrow_resp, resp)
-    })
-    .inner
+    });
+    (drawn.inner.0, drawn.inner.1, drawn.response.rect)
 }
 
 impl App {
@@ -227,6 +227,7 @@ impl App {
             );
             self.folder_pane.set_focus_tree_at_active();
         } else {
+            self.folder_pane.suspend_display();
             self.folder_pane.set_focus_grid();
         }
         self.settings.save();
@@ -253,6 +254,7 @@ impl App {
 
     pub(crate) fn sync_folder_pane_state(&mut self, ctx: &egui::Context) {
         if !self.settings.folder_tree_pane_visible {
+            self.folder_pane.suspend_display();
             self.folder_pane.set_focus_grid();
             return;
         }
@@ -342,6 +344,31 @@ impl App {
         None
     }
 
+    /// Notifications only: no active-folder resolution, viewer mount, I/O or waiting.
+    pub(crate) fn service_folder_pane_visibility(&mut self, ctx: &egui::Context) {
+        let root_visible = ctx.input(|input| {
+            input
+                .raw
+                .viewports
+                .get(&egui::ViewportId::ROOT)
+                .is_none_or(|root| !root.minimized.unwrap_or(false))
+        });
+        if !self.settings.folder_tree_pane_visible || !self.window_visible || !root_visible {
+            self.folder_pane.suspend_display();
+        }
+    }
+
+    pub(crate) fn finish_folder_pane_presentation(
+        &mut self,
+        ctx: &egui::Context,
+        main_chrome_drawn: bool,
+    ) {
+        if !main_chrome_drawn {
+            self.folder_pane.suspend_display();
+        }
+        self.service_folder_pane_visibility(ctx);
+    }
+
     pub(crate) fn render_folder_pane(
         &mut self,
         root_ui: &mut egui::Ui,
@@ -351,6 +378,10 @@ impl App {
             return (None, None);
         }
 
+        self.service_folder_pane_visibility(ctx);
+        if self.window_visible && !ctx.input(|input| input.viewport().minimized.unwrap_or(false)) {
+            self.folder_pane.resume_display();
+        }
         self.sync_folder_pane_state(ctx);
         let disabled = self.folder_pane_disabled();
         if disabled {
@@ -384,7 +415,7 @@ impl App {
                 .as_deref()
                 .map(folder_pane::drive_label)
                 .unwrap_or_else(|| "Drive".to_string());
-            let mut next_drive = selected_drive.clone();
+            let mut next_drive = None;
             let drives = self.folder_pane.drives().to_vec();
             let named_combo = egui::ComboBox::from_id_salt("folder_pane_drive_combo")
                 .width(54.0)
@@ -401,11 +432,7 @@ impl App {
                     }
                 });
             crate::ui_helpers::set_accessibility_label(&named_combo.response, "Drive");
-            if let Some(drive) = next_drive
-                && selected_drive
-                    .as_ref()
-                    .is_none_or(|current| !crate::folder_tree::path_eq(current, &drive))
-            {
+            if let Some(drive) = next_drive {
                 self.folder_pane.select_drive(drive);
             }
 
@@ -450,49 +477,134 @@ impl App {
         let mut nav = None;
         let scroll_to_cursor = self.folder_pane.scroll_to_cursor;
         let mut cursor_scrolled = false;
-        egui::ScrollArea::vertical()
+        // Preserve a path and its in-row offset across automatic cache replacement.
+        // Button/text minimum sizes can exceed the requested 24pt label height.
+        // Reuse the pitch measured from the actual row allocation on the last draw.
+        let memory_id = ui.make_persistent_id("folder_pane_tree_anchor");
+        let paths: std::sync::Arc<[std::path::PathBuf]> =
+            rows.iter().map(|row| row.path.clone()).collect();
+        let previous = ui
+            .ctx()
+            .data(|data| data.get_temp::<FolderPaneScrollMemory>(memory_id));
+        let pitch = previous.as_ref().map_or(0.0, |previous| previous.pitch);
+        let mut drawn_pitch = pitch;
+        let restore = previous
+            .as_ref()
+            .filter(|previous| previous.paths != paths)
+            .map(|previous| previous.restore(&paths, pitch));
+        let mut scroll = egui::ScrollArea::vertical()
             .scroll_source(egui::scroll_area::ScrollSource {
                 drag: egui::scroll_area::DragScroll::Always,
                 ..Default::default()
             })
             .id_salt("folder_pane_tree_scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                for row in rows {
-                    let (arrow_resp, resp) =
-                        draw_folder_pane_row(ui, &row, self.folder_pane.has_focus);
-                    if row.has_children_or_unknown && arrow_resp.clicked() {
-                        self.folder_pane.set_focus_tree();
-                        self.folder_pane.set_cursor(row.path.clone());
-                        let key = if row.expanded {
-                            FolderPaneTreeKey::Left
-                        } else {
-                            FolderPaneTreeKey::Right
-                        };
-                        let _ = self.folder_pane.handle_tree_key(key);
-                    }
-                    if resp.clicked() {
-                        self.folder_pane.set_focus_tree();
-                        self.folder_pane.set_cursor(row.path.clone());
-                        if self
-                            .folder_pane
-                            .active_path()
-                            .is_none_or(|active| !crate::folder_tree::path_eq(active, &row.path))
-                        {
-                            nav = Some(row.path.clone());
-                        }
-                    }
-                    if scroll_to_cursor && row.is_cursor {
-                        resp.scroll_to_me(Some(egui::Align::Center));
-                        cursor_scrolled = true;
+            .auto_shrink([false, false]);
+        if !scroll_to_cursor && let Some(offset) = restore {
+            scroll = scroll.vertical_scroll_offset(offset);
+        }
+        let output = scroll.show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            for row in rows {
+                let (arrow_resp, resp, row_rect) =
+                    draw_folder_pane_row(ui, &row, self.folder_pane.has_focus);
+                drawn_pitch = row_rect.height() + ui.spacing().item_spacing.y;
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(folder_pane_test_row_rect_id(&row.path), row_rect);
+                });
+                if (row.expanded || row.has_children_or_unknown) && arrow_resp.clicked() {
+                    self.folder_pane.set_focus_tree();
+                    self.folder_pane.set_cursor(row.path.clone());
+                    let key = if row.expanded {
+                        FolderPaneTreeKey::Left
+                    } else {
+                        FolderPaneTreeKey::Right
+                    };
+                    let _ = self.folder_pane.handle_tree_key(key);
+                }
+                if resp.clicked() {
+                    self.folder_pane.set_focus_tree();
+                    self.folder_pane.set_cursor(row.path.clone());
+                    if self
+                        .folder_pane
+                        .active_path()
+                        .is_none_or(|active| !crate::folder_tree::path_eq(active, &row.path))
+                    {
+                        nav = Some(row.path.clone());
                     }
                 }
-            });
+                if scroll_to_cursor && row.is_cursor {
+                    resp.scroll_to_me(Some(egui::Align::Center));
+                    cursor_scrolled = true;
+                }
+            }
+        });
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::unique("folder_pane_test_viewport"),
+                output.inner_rect,
+            );
+        });
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                memory_id,
+                FolderPaneScrollMemory {
+                    paths,
+                    offset: output.state.unclamped_offset().y,
+                    pitch: drawn_pitch,
+                },
+            )
+        });
         if scroll_to_cursor && cursor_scrolled {
             self.folder_pane.scroll_to_cursor = false;
         }
         nav
+    }
+}
+
+#[derive(Clone)]
+struct FolderPaneScrollMemory {
+    paths: std::sync::Arc<[std::path::PathBuf]>,
+    offset: f32,
+    pitch: f32,
+}
+
+#[cfg(test)]
+fn folder_pane_test_row_rect_id(path: &std::path::Path) -> egui::Id {
+    egui::Id::unique(("folder_pane_test_row_rect", path))
+}
+
+impl FolderPaneScrollMemory {
+    fn restore(&self, paths: &[std::path::PathBuf], pitch: f32) -> f32 {
+        if self.paths.is_empty() {
+            return self.offset;
+        }
+        let index = ((self.offset / self.pitch).floor() as usize).min(self.paths.len() - 1);
+        let offset_in_row = self.offset - index as f32 * self.pitch;
+        // Prefer the top row, then a nearby surviving row, then a visible ancestor.
+        let positions: std::collections::HashMap<_, _> = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (crate::path_key::normalize_keep_drive(path), index))
+            .collect();
+        let remaining = self.paths[index..]
+            .iter()
+            .chain(self.paths[..index].iter().rev());
+        for path in remaining {
+            if let Some(&next) = positions.get(&crate::path_key::normalize_keep_drive(path)) {
+                return (next as f32 * pitch + offset_in_row).max(0.0);
+            }
+        }
+        for ancestor in self.paths[index].ancestors().skip(1) {
+            if let Some(next) = paths
+                .iter()
+                .position(|candidate| crate::folder_tree::path_eq(candidate, ancestor))
+            {
+                return next as f32 * pitch;
+            }
+        }
+        self.offset
     }
 }
 
@@ -531,9 +643,227 @@ pub fn draw_folder_pane_location_snapshot_fixture(ui: &mut egui::Ui) {
     }
 }
 
+#[doc(hidden)]
+pub fn draw_folder_pane_refresh_snapshot_fixture(ui: &mut egui::Ui) {
+    for (name, expanded, loading, error) in [
+        ("空フォルダ（展開中）", true, false, None),
+        ("空フォルダ（折りたたみ後）", false, false, None),
+        ("再確認中・前の表示を保持", true, true, None),
+        (
+            "列挙失敗・前の表示を保持",
+            true,
+            false,
+            Some("列挙に失敗しました".into()),
+        ),
+    ] {
+        draw_folder_pane_row(
+            ui,
+            &folder_pane::FolderPaneRow {
+                path: std::path::PathBuf::from(name),
+                depth: 0,
+                expanded,
+                loading,
+                has_children_or_unknown: true,
+                is_active: false,
+                is_cursor: false,
+                error,
+            },
+            false,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn actual_folder_pane_empty_branch_can_collapse_and_mouse_reexpand_after_external_add() {
+        use std::{cell::RefCell, rc::Rc};
+        let app = Rc::new(RefCell::new(crate::app::setup_app_for_test()));
+        let root = app.borrow().tmp.path().join("tree");
+        let branch = root.join("empty");
+        std::fs::create_dir_all(&branch).unwrap();
+        app.borrow_mut().folder_pane =
+            folder_pane::FolderPaneState::test_tree(&root, vec![branch.clone()]);
+        app.borrow_mut()
+            .folder_pane
+            .test_seed_listing(&branch, vec![], true);
+        let captured = app.clone();
+        let mut fonts = false;
+        let mut h = crate::test_ui::builder()
+            .with_size(egui::vec2(480.0, 300.0))
+            .build_ui(move |ui| {
+                if !fonts {
+                    crate::ui_fonts::configure_fonts(ui.ctx());
+                    fonts = true;
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                crate::test_ui::full_viewport_ui(ui, |ui| {
+                    captured.borrow_mut().render_folder_pane_tree(ui);
+                });
+            });
+        h.run_steps(3);
+        h.get_all_by_label("▼")
+            .nth(1)
+            .expect("expanded empty disclosure")
+            .click();
+        h.run_steps(2);
+        assert!(
+            !app.borrow()
+                .folder_pane
+                .visible_rows()
+                .iter()
+                .find(|row| row.path == branch)
+                .unwrap()
+                .expanded
+        );
+        std::fs::create_dir(branch.join("new")).unwrap();
+        h.get_by_label("▶").click();
+        h.run_steps(2);
+        app.borrow_mut().folder_pane.test_settle();
+        h.run_steps(2);
+        assert_eq!(
+            app.borrow().folder_pane.test_children(&branch),
+            vec![branch.join("new")]
+        );
+    }
+
+    #[test]
+    fn actual_folder_pane_same_drive_selection_explicitly_refreshes_unchanged_root() {
+        use std::{cell::RefCell, rc::Rc};
+        let app = Rc::new(RefCell::new(crate::app::setup_app_for_test()));
+        let root = app.borrow().tmp.path().join("tree");
+        std::fs::create_dir(&root).unwrap();
+        app.borrow_mut().folder_pane = folder_pane::FolderPaneState::test_tree(&root, vec![]);
+        // This fixture draws only the header (no live-drive synchronization).
+        app.borrow_mut()
+            .folder_pane
+            .test_set_drive_choices(vec![root.clone()]);
+        let captured = app.clone();
+        let mut fonts = false;
+        let mut h = crate::test_ui::builder()
+            .with_size(egui::vec2(480.0, 300.0))
+            .build_ui(move |ui| {
+                if !fonts {
+                    crate::ui_fonts::configure_fonts(ui.ctx());
+                    fonts = true;
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                crate::test_ui::full_viewport_ui(ui, |ui| {
+                    captured.borrow_mut().render_folder_pane_header(ui)
+                });
+            });
+        h.run_steps(3);
+        std::fs::create_dir(root.join("new")).unwrap();
+        h.get_by_label("Drive").click();
+        h.run_steps(2);
+        h.get_all_by_label(&folder_pane::drive_label(&root))
+            .last()
+            .expect("selected drive popup item")
+            .click();
+        h.run_steps(2);
+        assert!(
+            app.borrow().folder_pane.test_unverified(&root),
+            "same-drive actual click must enqueue a recheck"
+        );
+        app.borrow_mut().folder_pane.test_settle();
+        assert_eq!(
+            app.borrow().folder_pane.test_children(&root),
+            vec![root.join("new")]
+        );
+    }
+
+    #[test]
+    fn actual_folder_pane_deep_scroll_anchor_keeps_real_coordinate_and_cursor_scroll_wins() {
+        use std::{cell::RefCell, rc::Rc};
+        let app = Rc::new(RefCell::new(crate::app::setup_app_for_test()));
+        let root = app.borrow().tmp.path().join("tree");
+        let children: Vec<_> = (0..250).map(|i| root.join(format!("row-{i:03}"))).collect();
+        app.borrow_mut().folder_pane =
+            folder_pane::FolderPaneState::test_tree(&root, children.clone());
+        let captured = app.clone();
+        let mut fonts = false;
+        let once = Rc::new(RefCell::new(Some(1800.5)));
+        let requested = once.clone();
+        let mut h = crate::test_ui::builder()
+            .with_size(egui::vec2(480.0, 300.0))
+            .build_ui(move |ui| {
+                if !fonts {
+                    crate::ui_fonts::configure_fonts(ui.ctx());
+                    fonts = true;
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                crate::test_ui::full_viewport_ui(ui, |ui| {
+                    // Seed the real ScrollArea state, then exercise the live pane unchanged.
+                    if let Some(offset) = requested.borrow_mut().take() {
+                        let id = ui.make_persistent_id("folder_pane_tree_anchor");
+                        ui.ctx().data_mut(|data| {
+                            data.insert_temp(
+                                id,
+                                FolderPaneScrollMemory {
+                                    paths: std::sync::Arc::from([]),
+                                    offset,
+                                    pitch: 27.0,
+                                },
+                            )
+                        });
+                    }
+                    captured.borrow_mut().render_folder_pane_tree(ui);
+                });
+            });
+        h.run_steps(3);
+        let rect = |ctx: &egui::Context, path: &std::path::Path| {
+            ctx.data(|data| data.get_temp::<egui::Rect>(folder_pane_test_row_rect_id(path)))
+                .unwrap()
+        };
+        // AccessKit clips partly visible labels. Use the real allocation rectangles,
+        // including the portion above the viewport, for the path anchor assertion.
+        let viewport = h
+            .ctx
+            .data(|data| data.get_temp::<egui::Rect>(egui::Id::unique("folder_pane_test_viewport")))
+            .unwrap();
+        let anchor_index = children
+            .iter()
+            .position(|path| rect(&h.ctx, path).bottom() > viewport.top())
+            .unwrap();
+        let anchor = children[anchor_index].clone();
+        let target = rect(&h.ctx, &anchor);
+        let adjacent = rect(&h.ctx, &children[anchor_index + 1]);
+        assert!(
+            (adjacent.top()
+                - target.top()
+                - target.height()
+                - h.ctx.global_style().spacing.item_spacing.y)
+                .abs()
+                < 0.1,
+            "actual allocation height and spacing must match the drawn pitch: {target:?} {adjacent:?}"
+        );
+        let mut added = children.clone();
+        added.insert(0, root.join("aaa"));
+        app.borrow_mut()
+            .folder_pane
+            .test_seed_listing(&root, added, true);
+        h.run_steps(2);
+        assert!((rect(&h.ctx, &anchor).top() - target.top()).abs() < 0.1);
+        let mut reversed = children.clone();
+        reversed.reverse();
+        app.borrow_mut()
+            .folder_pane
+            .test_seed_listing(&root, reversed, true);
+        h.run_steps(2);
+        assert!((rect(&h.ctx, &anchor).top() - target.top()).abs() < 0.1);
+        app.borrow_mut()
+            .folder_pane
+            .set_cursor(children[240].clone());
+        h.run_steps(30);
+        let cursor = h.get_by_label("row-240").rect();
+        assert!(cursor.center().y > 0.0 && cursor.center().y < 300.0);
+    }
 
     struct WidthTest {
         ctx: egui::Context,

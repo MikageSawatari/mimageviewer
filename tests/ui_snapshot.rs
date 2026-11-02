@@ -207,6 +207,32 @@ fn folder_pane_location_dark() {
     );
 }
 
+#[test]
+fn folder_pane_refresh_light() {
+    snapshot_with_theme_options(
+        "folder_pane_refresh_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(400.0, 150.0),
+        Some(12),
+        mimageviewer::draw_folder_pane_refresh_snapshot_fixture,
+        |_| {},
+    );
+}
+
+#[test]
+fn folder_pane_refresh_dark() {
+    snapshot_with_theme_options(
+        "folder_pane_refresh_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(400.0, 150.0),
+        Some(12),
+        mimageviewer::draw_folder_pane_refresh_snapshot_fixture,
+        |_| {},
+    );
+}
+
 // Physical pixels above/below the hotspot. Never sample the desktop cursor in a fixture.
 const SNAPSHOT_CURSOR_EXTENT_PHYSICAL: (f32, f32) = (0.0, 34.0);
 

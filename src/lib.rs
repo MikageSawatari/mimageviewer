@@ -425,6 +425,7 @@ mod ui_erase;
 mod ui_folder_pane;
 #[doc(hidden)]
 pub use ui_folder_pane::draw_folder_pane_location_snapshot_fixture;
+pub use ui_folder_pane::draw_folder_pane_refresh_snapshot_fixture;
 pub mod ui_font_catalog;
 pub mod ui_fonts;
 mod ui_fullscreen;

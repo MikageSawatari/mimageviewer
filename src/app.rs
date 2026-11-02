@@ -27884,6 +27884,7 @@ impl App {
         ) {
             self.invalidate_book_append_undo();
         }
+        let main_context_id = self.viewer_context_main();
         let accepted_now = match result {
             ExternalRescanResult::Equal(signature, rows, _, parent_mtime) => {
                 self.current_folder_signature = Some(signature);
@@ -27917,6 +27918,9 @@ impl App {
                 )
             }
         };
+        if accepted_now && owner_context_id == main_context_id {
+            self.folder_pane.observe_accepted_folder(&folder);
+        }
         if accepted_now
             && let Some((epoch, cutoff)) = proof.as_ref().and_then(|proof| proof.subscription)
             && let Some(watch) = self
@@ -98721,7 +98725,7 @@ impl App {
     ///
     /// **早期 return を複数持つ。** frame の最後に必ず走らせたい処理は、ここではなく
     /// 呼び出し側 (`update`) へ置く。
-    fn update_frame(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    fn update_frame(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) -> bool {
         let ctx = &ui.ctx().clone();
         self.poll_agent_changes();
         self.reject_agent_open_requests_during_startup();
@@ -98815,7 +98819,7 @@ impl App {
             #[cfg(all(feature = "test-script", windows))]
             self.release_check_record_early_tail(ctx);
             finish_update_perf(&mut update_perf, self.frame_counter);
-            return;
+            return false;
         }
         if self.indexer_init.pending().is_some() {
             egui::Panel::top("startup-search-preparing").show(ui, |ui| {
@@ -99104,7 +99108,7 @@ impl App {
                 #[cfg(all(feature = "test-script", windows))]
                 self.release_check_record_early_tail(ctx);
                 finish_update_perf(&mut update_perf, self.frame_counter);
-                return;
+                return false;
             }
         }
         #[cfg(windows)]
@@ -99225,7 +99229,7 @@ impl App {
                 #[cfg(all(feature = "test-script", windows))]
                 self.release_check_record_early_tail(ctx);
                 finish_update_perf(&mut update_perf, self.frame_counter);
-                return;
+                return false;
             }
             self.sync_native_video_main_cloak(false);
             self.process_native_video_main_chrome_restore(ctx);
@@ -99239,7 +99243,7 @@ impl App {
                 #[cfg(all(feature = "test-script", windows))]
                 self.release_check_record_early_tail(ctx);
                 finish_update_perf(&mut update_perf, self.frame_counter);
-                return;
+                return false;
             }
 
             // ── in-window 静止画フルスクリーン ──
@@ -99265,7 +99269,7 @@ impl App {
                         #[cfg(all(feature = "test-script", windows))]
                         self.release_check_record_early_tail(ctx);
                         finish_update_perf(&mut update_perf, self.frame_counter);
-                        return;
+                        return false;
                     }
                 }
                 // 通常は描画前に回収済み。描画中の状態遷移でこの early-return に初めて
@@ -99314,7 +99318,7 @@ impl App {
                 #[cfg(all(feature = "test-script", windows))]
                 self.release_check_record_early_tail(ctx);
                 finish_update_perf(&mut update_perf, self.frame_counter);
-                return;
+                return false;
             }
         }
 
@@ -99927,6 +99931,7 @@ impl App {
         self.authorize_external_tool_launch_boundaries_after_ui();
         mark_update_perf(&mut update_perf, UpdatePerfStage::Tail);
         finish_update_perf(&mut update_perf, self.frame_counter);
+        true // The existing main bars drawing boundary was reached.
     }
 }
 
@@ -100035,7 +100040,8 @@ impl eframe::App for App {
             }
         }
         self.poll_image_folder_zip(ctx);
-        self.update_frame(ui, frame);
+        let main_chrome_drawn = self.update_frame(ui, frame);
+        self.finish_folder_pane_presentation(ctx, main_chrome_drawn);
         self.render_update_after_frame(ctx);
         self.render_update_owner_dialogs(ctx);
         self.show_previous_run_notice(ctx);
@@ -102265,6 +102271,8 @@ fn finite_video_target_secs(target_secs: f64, duration_secs: f64) -> f64 {
 // `phase_c_support::setup_app` を使う (production 配線を通した回帰は App が要る)。
 #[cfg(test)]
 pub(crate) mod composite_pixels_revision_tests;
+#[cfg(test)]
+mod folder_pane_refresh_tests;
 #[cfg(test)]
 mod grid_cursor_tests;
 #[cfg(test)]

@@ -14,15 +14,16 @@ UIスレッドに列挙・metadata照会・待機を追加しない。ソート�
 
 ## 再列挙の所有
 
-現実装はsort/hidden変更時にnodesと展開状態を全消去する。展開キーのclearだけを除くと、子が未ロードのまま展開済みになるため、変更受付から結果反映までを同じpane ownerで扱う。
+sort/hidden変更、一覧で受理したmainの実folder観測、需要への再参加は、同じpane/node ownerで扱う。§1.686の正本は [更新設計 §9.5](folder-tree-refresh-plan.md#95-設計担当の採否-2026-11-02claudecode)。展開枝の監視は追加しない。
 
 - `FolderPaneListingOptions`（tree sort、hidden）をpaneの正本とする。drive/reload/expand/key各経路はそのoptionを使う。
-- sort/hidden変更では全旧pendingをcancelし、private Receiverごとdropしてから新scanを作る。channel identityをrequestの所有境界とし、重複する世代counterは追加しない。
-- 保持するnodesではcancel対象keyの`loading`を解除する。`loaded=true`でも再列挙できるforce-refresh入口から、選択rootと既にmaterializeされた展開parentを新optionsの既存workerへ載せる。
+- sort/hidden変更では全旧pendingをcancelし、private Receiverをpane ownerから退役させてから新scanを作る。大きい受信payloadを持ち得るReceiverの実dropは既存rayonへ渡す。channel identityをrequestの所有境界とし、重複する世代counterは追加しない。
+- nodeは成功した`CachedListing`（表示children・hidden除外前membership・options）と、排他的`Unverified / Queued / Running(private pending, FollowUp) / Settled(options, error)`を持つ。表示loaded/loadingと適用方針はcache/stateから導く。走査中の通知は後続一件に合流し、旧結果は採用しない。
+- 選択rootと到達できる展開parentだけを需要とし、離脱時はpane走査を取消・未確認化、再参加時は同optionsでも再確認する。main chrome非描画、ROOT非表示/最小化、pane非表示でも同じ中断通知を使う。通知は走査だけを扱い、別窓のitems/watch/cancelへ波及しない。
 - 各parentの現在のchildren、3種の展開集合、cursor pathを、新しい結果が来るまで保持する。全treeを一括でstagingする必要はない。
-- 現世代の結果だけをpath identityで差し替える。sort変更だけでcursorをactiveへ戻さない。再列挙失敗時は旧childrenとerrorを保持する。
+- private Receiverと現需要/optionsに属する完全成功だけを親単位で差し替える。実消失子孫をcomponent境界で整理し、hidden除外だけの枝は保持する。sort変更だけでcursorをactiveへ戻さない。再列挙失敗時は旧cacheとerrorを保持する。
 - 現世代の成功結果でcursorの消失が確定した場合だけactive/rootへ戻す。これに伴うフォルダopenは発生させない。
-- 明示reloadの従来のresetと、option変更時の状態保持refreshは理由を型で区別する。
+- 明示reloadだけが先に全cache/展開をresetする。自動再照合はcache有無から適用を導き、requestにPopulate/RefreshPreservingChildrenを持たない。scrollは描画した実行allocation高+縦item spacingから記録したpitchでpath anchorを保持し、能動cursorのscroll要求を優先する。指定label高24ptを実行間隔とは見なさない。
 
 ## 現在地の表示 (§1.451、2026-10-27)
 
