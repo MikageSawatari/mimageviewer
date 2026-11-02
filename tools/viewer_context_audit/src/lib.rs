@@ -319,8 +319,9 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn similar_panel (self) -> & 'a crate :: ui_metadata_panel :: SimilarPanelState",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > :: # [cfg (feature = \"test-script\")] pub (in crate :: app) fn video_seek_strip_test_script_snapshot (self ,) -> crate :: test_script :: TestScriptSeekStripSnapshot",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn selected (self) -> Option < usize >",
-    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn bookmark_view_state (self) -> Option < & 'a BookmarkViewState >",
-    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn archive_source_override (self) -> Option < & 'a Path >",
+    // 1.670 splits the bookmark view return target from the open request id (detached-rework-plan 2026-11-01).
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn bookmark_open_request_id (self ,) -> Option < crate :: bookmark_browser :: BookmarkOpenRequestId >",
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn bookmark_view_target (self ,) -> Option < & 'a crate :: bookmark_browser :: BookmarkViewReturnTarget >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn music_bookmarks (self) -> & 'a [crate :: video_bookmarks :: VideoBookmarkMeta]",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn music_bookmarks_loaded (self) -> bool",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn normalize_ui_state (self , idx : usize ,) -> Option < crate :: video :: normalize_types :: NormalizeUiState >",
