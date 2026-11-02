@@ -12,6 +12,7 @@ param(
     [string]$Device = "",
     [int]$ImageMaxTokens = 0,
     [int]$CtxSize = 8192,
+    [string]$PromptVersion = "v0-1",
     [string[]]$Extra = @()
 )
 
@@ -55,7 +56,7 @@ try {
     "load_seconds=$([Math]::Round($loadSec, 1))" | Out-File -FilePath (Join-Path $OutDir "load.txt") -Encoding ascii
 
     & python -I (Join-Path $here "run_eval.py") --server "http://127.0.0.1:$port" --inputs $Inputs `
-        --out (Join-Path $OutDir "results.jsonl") --label $Label 2>&1 |
+        --out (Join-Path $OutDir "results.jsonl") --label $Label --prompt-version $PromptVersion 2>&1 |
         Tee-Object -FilePath (Join-Path $OutDir "eval.log")
 } finally {
     if (-not $srv.HasExited) { Stop-Process -Id $srv.Id -Force }
