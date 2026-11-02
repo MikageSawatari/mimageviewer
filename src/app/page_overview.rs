@@ -28,6 +28,37 @@ struct OverviewThumbnailDemandTrace {
     )>,
 }
 
+pub(super) fn thumbnail_enqueue_time_exhausted(
+    _ctx: &egui::Context,
+    started: std::time::Instant,
+) -> bool {
+    #[cfg(test)]
+    let elapsed = _ctx
+        .data(|data| {
+            data.get_temp::<std::time::Duration>(egui::Id::unique(
+                "overview-thumbnail-enqueue-test-elapsed",
+            ))
+        })
+        .unwrap_or_else(|| started.elapsed());
+    #[cfg(not(test))]
+    let elapsed = started.elapsed();
+    elapsed >= std::time::Duration::from_millis(2)
+}
+
+#[cfg(test)]
+pub(super) fn set_thumbnail_enqueue_elapsed_for_test(
+    ctx: &egui::Context,
+    elapsed: std::time::Duration,
+) {
+    // The disposable Context owns the override; other tests and contexts keep the real clock.
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            egui::Id::unique("overview-thumbnail-enqueue-test-elapsed"),
+            elapsed,
+        );
+    });
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PageOverviewCommand {
     Cancel {
@@ -80,6 +111,25 @@ impl PageOverviewCommand {
 }
 
 impl App {
+    #[cfg(test)]
+    pub(super) fn page_overview_thumbnail_admissions_for_test(
+        &self,
+        ctx: &egui::Context,
+    ) -> Vec<(usize, PriorityThumbnailAdmission)> {
+        let id = egui::Id::unique((
+            "overview-demand-trace",
+            self.projected_viewer_context_id().serial(),
+        ));
+        ctx.data(|data| {
+            data.get_temp::<OverviewThumbnailDemandTrace>(id)
+                .expect("overview demand must have been traced")
+                .pages
+                .into_iter()
+                .map(|(idx, admission, ..)| (idx, admission))
+                .collect()
+        })
+    }
+
     /// Sparse normal-log diagnostics. The UI cache only suppresses identical observations;
     /// it neither owns demand nor influences admission, cancellation, or worker completion.
     pub(super) fn trace_page_overview_thumbnail_demand(

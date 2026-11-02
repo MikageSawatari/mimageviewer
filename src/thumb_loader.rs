@@ -569,6 +569,10 @@ pub enum ThumbMsgPayload {
     NoArt,
     /// Cache lookup ended without pixels; source admission awaits archive judgement.
     CacheOnlyMiss,
+    /// Local RAW half development was not submitted; demand awaits foreground or size change.
+    AwaitingForeground {
+        display_px: u32,
+    },
     Failed {
         origin: ThumbLoadOrigin,
     },
@@ -5223,23 +5227,17 @@ pub fn load_one_cached(
                         return Err(raw_image_error(crate::raw::RawError::Internal(-1)));
                     };
                     if !priority {
-                        let _ = tx.send(
-                            ThumbMsg::from_legacy_parts(
-                                idx,
-                                None,
-                                ThumbLoadOrigin::SourceIntrinsic,
-                                false,
-                                None,
-                                None,
-                                None,
-                                true,
-                                false,
-                                input_seq,
-                                items_gen,
-                            )
-                            .with_request_id(request_id),
-                        );
+                        let _ = tx.send(ThumbMsg {
+                            idx,
+                            request_id,
+                            items_gen,
+                            input_seq,
+                            payload: ThumbMsgPayload::AwaitingForeground { display_px },
+                        });
                         gen_done.fetch_add(1, Ordering::Relaxed);
+                        crate::logger::log(format!(
+                            "  idx={idx} raw-half deferred until foreground (display_px={display_px})  {display_name}"
+                        ));
                         raw_handoff_control = RawHandoffControl::Deferred;
                         return Err(raw_image_error(crate::raw::RawError::Cancelled));
                     }
@@ -7200,6 +7198,88 @@ mod tests {
         assert_eq!(stats.count_raw, 1);
         assert_eq!(stats.count_wic, 0);
         assert_eq!(stats.count_susie, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_half_offscreen_defers_once_without_executor_submission_but_small_preview_loads() {
+        let path = PathBuf::from("vendor/raw-samples/5424.orf");
+        assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+        for display_px in [256, 128] {
+            let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+            let queue: Arc<crate::app::NotifyQueue> =
+                Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
+            let tickets = Arc::new(Mutex::new(
+                crate::items_generation_cache::ItemsGenerationMap::new("raw_deferred_test"),
+            ));
+            tickets.lock().unwrap().set_items_generation(7);
+            let handoff = RawThumbHandoff::Local(RawThumbLocalHandoff {
+                executor: Arc::clone(&executor),
+                queue: Arc::clone(&queue),
+                tickets: Arc::clone(&tickets),
+            });
+            let mut request = LoadRequest {
+                path: path.clone(),
+                idx: 3,
+                request_id: ThumbnailRequestId::Registered(104),
+                items_gen: 7,
+                input_seq: 9,
+                priority: false,
+                source_policy: LoadSourcePolicy::SourceOnly,
+                ..Default::default()
+            };
+            let (tx, rx) = mpsc::channel();
+            let done = Arc::new(AtomicUsize::new(0));
+            process_load_request(
+                &mut request,
+                &std::sync::RwLock::new(std::collections::HashMap::new()),
+                &tx,
+                None,
+                512,
+                75,
+                display_px,
+                CacheDecision::without_thumbnail(),
+                &done,
+                &Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+                None,
+                &Arc::new(AtomicUsize::new(0)),
+                &Arc::new(AtomicUsize::new(8)),
+                None,
+                None,
+                None,
+                None,
+                Some(&handoff),
+            );
+            let messages = rx.try_iter().collect::<Vec<_>>();
+            if display_px == 256 {
+                assert_eq!(messages.len(), 1);
+                assert!(matches!(
+                    messages[0].payload,
+                    ThumbMsgPayload::AwaitingForeground { display_px: 256 }
+                ));
+            } else {
+                assert_eq!(messages.len(), 2);
+                assert!(matches!(
+                    messages[0].payload,
+                    ThumbMsgPayload::SourcePixels(_)
+                ));
+                assert!(matches!(messages[1].payload, ThumbMsgPayload::Finalized));
+            }
+            for message in messages {
+                assert_eq!(message.idx, 3);
+                assert_eq!(message.request_id, request.request_id);
+                assert_eq!(message.items_gen, 7);
+                assert_eq!(message.input_seq, 9);
+            }
+            assert_eq!(done.load(Ordering::Relaxed), 1);
+            assert_eq!(executor.running_jobs_for_test(), 0);
+            assert_eq!(executor.waiting_jobs_for_test(), 0);
+            assert!(!tickets.lock().unwrap().contains_key(&3));
+            assert!(
+                queue.0.lock().unwrap().is_empty(),
+                "no half follow-up may be queued"
+            );
+        }
     }
 
     #[cfg(windows)]

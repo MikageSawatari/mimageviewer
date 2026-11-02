@@ -202,6 +202,65 @@ fn install_overview_demand(app: &mut App) {
     .unwrap();
 }
 
+#[test]
+fn overview_foreground_wait_resumption_is_enqueued_and_obeys_frame_budget() {
+    use crate::thumb_loader::{ThumbMsg, ThumbMsgPayload};
+    use std::time::Duration;
+
+    for (elapsed, expected_enqueued) in [(Duration::ZERO, 32), (Duration::from_millis(2), 0)] {
+        let ctx = egui::Context::default();
+        crate::app::page_overview::set_thumbnail_enqueue_elapsed_for_test(&ctx, elapsed);
+        let mut app = setup_thumbnail_app(40);
+        install_overview_demand(&mut app);
+        for idx in 0..40 {
+            let generation = app.items_generation;
+            let id = app
+                .requested
+                .begin(idx, generation, ThumbnailRequestKind::Normal, None)
+                .unwrap();
+            app.requested.receive(ThumbMsg {
+                idx,
+                items_gen: generation,
+                request_id: id,
+                input_seq: 0,
+                payload: ThumbMsgPayload::AwaitingForeground { display_px: 256 },
+            });
+        }
+        assert_eq!(app.requested.legacy_len(), 0);
+        let pages = (0..40).collect::<Vec<_>>();
+        app.ensure_page_overview_requests(&ctx, &pages);
+        let queue = app.reload_queue.as_ref().unwrap().0.lock().unwrap();
+        assert_eq!(queue.len(), expected_enqueued, "elapsed={elapsed:?}");
+        assert_eq!(
+            queue.iter().map(|request| request.idx).collect::<Vec<_>>(),
+            (0..expected_enqueued).collect::<Vec<_>>()
+        );
+        assert!(queue.iter().all(|request| request.priority));
+        assert_eq!(queue.len(), app.requested.legacy_len());
+        assert_eq!(
+            app.page_overview_thumbnail_admissions_for_test(&ctx),
+            (0..40)
+                .map(|idx| (
+                    idx,
+                    if idx < expected_enqueued {
+                        PriorityThumbnailAdmission::Enqueued
+                    } else {
+                        PriorityThumbnailAdmission::FrameBudget
+                    }
+                ))
+                .collect::<Vec<_>>(),
+            "the first request after the exact admission limit must receive FrameBudget"
+        );
+        for idx in expected_enqueued..40 {
+            assert!(
+                app.requested.contains_key(&idx),
+                "waiting demand must remain"
+            );
+            assert_eq!(app.requested.id(idx), None);
+        }
+    }
+}
+
 fn prepare_pdf_overview(app: &mut App, path: &std::path::Path, count: usize) {
     // Only admission is exercised: no worker, PDFium, or physical PDF is needed.
     app.items = (0..count)

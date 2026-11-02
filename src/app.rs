@@ -7258,7 +7258,9 @@ struct GridThumbnailRetentionGeometry {
     vis_keep_end: usize,
 }
 mod thumbnail_requests;
-use thumbnail_requests::{ThumbnailReceipt, ThumbnailRequestKind, ThumbnailRequests};
+use thumbnail_requests::{
+    DeferredKind, ThumbnailAdmission, ThumbnailReceipt, ThumbnailRequestKind, ThumbnailRequests,
+};
 
 fn cleanup_stale_edit_preview_request(
     requested: &mut ThumbnailRequests,
@@ -7357,6 +7359,15 @@ fn thumbnail_keep_projection(
         bounded_range,
         interactive_pages,
     }
+}
+
+fn thumbnail_is_foreground(
+    idx: usize,
+    visible_raw_range: (usize, usize),
+    interactive_thumbnail_pages: &HashSet<usize>,
+) -> bool {
+    (visible_raw_range.0..visible_raw_range.1).contains(&idx)
+        || interactive_thumbnail_pages.contains(&idx)
 }
 
 fn resolve_converted_archive_candidate(
@@ -55621,8 +55632,11 @@ impl App {
                         self.fire_virtual_folder_writeback_if_ready(i);
                     }
                 }
-                ThumbnailReceipt::Terminal(crate::thumb_loader::ThumbMsgPayload::CacheOnlyMiss) => {
-                    // No display failure: only source admission waits for archive judgement.
+                ThumbnailReceipt::Terminal(
+                    crate::thumb_loader::ThumbMsgPayload::CacheOnlyMiss
+                    | crate::thumb_loader::ThumbMsgPayload::AwaitingForeground { .. },
+                ) => {
+                    // Demand admission waits; neither terminal changes the displayed image.
                 }
                 ThumbnailReceipt::Terminal(crate::thumb_loader::ThumbMsgPayload::NoArt) => {
                     self.thumbnails[i] = ThumbnailState::NoArt;
@@ -56241,7 +56255,7 @@ impl App {
         if !pdf_keys.is_empty() {
             self.promote_viewer_pdf_keys(pdf_keys);
         }
-        if pages.iter().any(|idx| self.requested.contains_key(idx)) {
+        if pages.iter().any(|idx| self.requested.id(*idx).is_some()) {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
@@ -56381,7 +56395,7 @@ impl App {
                     continue;
                 }
                 if new_requests >= 32
-                    || enqueue_started.elapsed() >= std::time::Duration::from_millis(2)
+                    || page_overview::thumbnail_enqueue_time_exhausted(ctx, enqueue_started)
                 {
                     admissions.extend(
                         request_pages[offset..]
@@ -56391,12 +56405,11 @@ impl App {
                     break;
                 }
             }
-            let existed = self.requested.contains_key(&idx);
             let admission = self.enqueue_priority_thumbnail(idx);
             if overview {
                 admissions.push((idx, admission));
             }
-            new_requests += usize::from(!existed && self.requested.contains_key(&idx));
+            new_requests += usize::from(admission == PriorityThumbnailAdmission::Enqueued);
         }
         if overview {
             self.trace_page_overview_thumbnail_demand(ctx, admissions);
@@ -56415,7 +56428,7 @@ impl App {
             self.promote_viewer_pdf_keys(pdf_keys);
         }
         if request_pages.iter().any(|idx| {
-            self.requested.contains_key(idx)
+            self.requested.id(*idx).is_some()
                 || (overview
                     && matches!(
                         self.items.get(*idx),
@@ -56448,7 +56461,18 @@ impl App {
         if self.sidecar_restore_active() {
             return PriorityThumbnailAdmission::SidecarRestore;
         }
-        if self.requested.contains_key(&idx) {
+        let loaded = matches!(
+            self.thumbnails.get(idx),
+            Some(ThumbnailState::Loaded { .. })
+        );
+        if self.requested.admission(
+            idx,
+            DeferredKind::Normal,
+            true,
+            self.display_px_shared.load(Ordering::Relaxed),
+            loaded,
+        ) == ThumbnailAdmission::Busy
+        {
             return PriorityThumbnailAdmission::AlreadyRequested;
         }
         let Some(state) = self.thumbnails.get(idx) else {
@@ -56836,7 +56860,17 @@ impl App {
         let mut suppressed_regular: usize = 0;
         let mut suppressed_heavy: usize = 0;
         for i in self.keep_set_sorted() {
-            if self.requested.contains_key(&i) {
+            let foreground =
+                thumbnail_is_foreground(i, cur_vis_range, &interactive_thumbnail_pages);
+            let loaded = matches!(self.thumbnails[i], ThumbnailState::Loaded { .. });
+            if self.requested.admission(
+                i,
+                DeferredKind::Normal,
+                foreground,
+                current_display_px,
+                loaded,
+            ) == ThumbnailAdmission::Busy
+            {
                 continue;
             }
             let need_load = matches!(
@@ -56903,8 +56937,7 @@ impl App {
             {
                 req.force_cache = true;
             }
-            req.priority = (i >= visible_raw_start && i < visible_raw_end)
-                || interactive_thumbnail_pages.contains(&i);
+            req.priority = foreground;
             // prefetch suppression: スクロール中 / visible 待ち中は非 priority (= prefetch) を
             // enqueue しない。visible (= priority=true) は常に enqueue する。
             // SourceOnly は idle upgrade 経路 (本 PR scope 外) なので素通し。
@@ -56990,8 +57023,8 @@ impl App {
                     requested.cancel_queued(r.idx, r.request_id);
                     return false;
                 }
-                let now_visible = r.idx >= visible_raw_start && r.idx < visible_raw_end;
-                let foreground = now_visible || interactive_thumbnail_pages.contains(&r.idx);
+                let foreground =
+                    thumbnail_is_foreground(r.idx, cur_vis_range, interactive_thumbnail_pages);
                 let is_grid_prefetch = !foreground && !r.source_policy.bypasses_cache();
                 if !prefetch_ok && is_grid_prefetch {
                     finish_pruned_raw_half_followup(r, &self.tx, &self.cache_gen_done);
@@ -57005,8 +57038,8 @@ impl App {
                 if r.grid_index().is_none() {
                     continue;
                 }
-                r.priority = (r.idx >= visible_raw_start && r.idx < visible_raw_end)
-                    || interactive_thumbnail_pages.contains(&r.idx);
+                r.priority =
+                    thumbnail_is_foreground(r.idx, cur_vis_range, interactive_thumbnail_pages);
             }
             let _q_before = q.len();
             for mut r in new_regular {
@@ -57043,8 +57076,8 @@ impl App {
                     requested.cancel_queued(r.idx, r.request_id);
                     return false;
                 }
-                let now_visible = r.idx >= visible_raw_start && r.idx < visible_raw_end;
-                let foreground = now_visible || interactive_thumbnail_pages.contains(&r.idx);
+                let foreground =
+                    thumbnail_is_foreground(r.idx, cur_vis_range, interactive_thumbnail_pages);
                 let is_grid_prefetch = !foreground && !r.source_policy.bypasses_cache();
                 if !prefetch_ok && is_grid_prefetch {
                     finish_pruned_raw_half_followup(r, &self.tx, &self.cache_gen_done);
@@ -57058,8 +57091,8 @@ impl App {
                 if r.grid_index().is_none() {
                     continue;
                 }
-                r.priority = (r.idx >= visible_raw_start && r.idx < visible_raw_end)
-                    || interactive_thumbnail_pages.contains(&r.idx);
+                r.priority =
+                    thumbnail_is_foreground(r.idx, cur_vis_range, interactive_thumbnail_pages);
             }
             for mut r in new_heavy {
                 if let Some(id) = requested.begin(
@@ -57428,6 +57461,15 @@ impl App {
 
         // 現在の display_px (アイドル判定とサイズ比較に使用)
         let current_display_px = self.display_px_shared.load(Ordering::Relaxed);
+        let interactive_thumbnail_pages = thumbnail_keep_projection(
+            self.items.len(),
+            std::iter::empty(),
+            self.current_navigation_thumbnail_pages(),
+            self.details_hover_thumb_idx,
+            self.current_bookmark_panel_thumbnail_pages(),
+            self.still_seek_thumbnail_pages.iter().copied(),
+        )
+        .interactive_pages;
 
         // 候補集め: keep_range 内で upgradeable cache または未評価の解像度不足を全件
         //
@@ -57483,6 +57525,18 @@ impl App {
                 _ => false,
             };
             if !needs_upgrade {
+                continue;
+            }
+            let foreground =
+                thumbnail_is_foreground(i, self.last_vis_range, &interactive_thumbnail_pages);
+            if self.requested.admission(
+                i,
+                DeferredKind::Upgrade,
+                foreground,
+                current_display_px,
+                true,
+            ) == ThumbnailAdmission::Busy
+            {
                 continue;
             }
             let Some((mtime, file_size)) =
@@ -57552,6 +57606,7 @@ impl App {
                 continue;
             }
             req.relative_page_provenance = self.relative_page_provenance_for_idx(i);
+            req.priority = foreground;
             // 通常エンキューと同じく現世代を載せる (旧 items への upgrade 混入防止)
             self.attach_viewer_thumbnail_context(&mut req);
             upgrade_reqs.push(req);
