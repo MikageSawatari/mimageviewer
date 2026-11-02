@@ -50,6 +50,10 @@ impl App {
     }
 
     pub(crate) fn admit_book_append_followup_mutation(&mut self) -> bool {
+        if self.book_order_saving() {
+            self.show_feedback_warning("本の順序を保存中です".into());
+            return false;
+        }
         if self.book_append_undo_in_progress() {
             self.show_feedback_warning("本への追加を取り消しています".into());
             return false;
@@ -97,7 +101,8 @@ impl App {
     }
 
     fn book_append_undo_writers_busy(&mut self) -> bool {
-        self.book_op_pending.is_some()
+        self.book_order_saving()
+            || self.book_op_pending.is_some()
             || self.delete_pending.is_some()
             || self.metadata_cleanup_pending.is_some()
             || self.delete_purge_retry_pending.is_some()
@@ -288,7 +293,8 @@ impl App {
             if !idxs.is_empty() {
                 self.remove_items_batch(&idxs);
             }
-            if let Some(rows) = self.book_list_cache.as_mut()
+            if self.pending_book_shelf_current()
+                && let Some(rows) = self.book_shelf.snapshot.as_mut()
                 && let Some(row) = rows
                     .iter_mut()
                     .find(|row| crate::folder_tree::path_eq(&row.path, &result.folder))
@@ -347,6 +353,7 @@ mod tests {
         let destination = receipt.files.created[0].path.clone();
         let key = crate::adjustment_db::normalize_path(&destination);
         crate::books::BookAppendSummary {
+            shelf: None,
             book_name: receipt.files.book_name.clone(),
             folder: receipt.files.folder.clone(),
             added: 1,
@@ -498,6 +505,7 @@ mod tests {
         observations.record(receipt.source_context);
         app.book_op_pending = Some(BookOpPending {
             rx,
+            shelf_scope: None,
             intent: BookOpIntent::Append {
                 operation_id: receipt.operation_id,
                 source_context: receipt.source_context,
@@ -540,5 +548,43 @@ mod tests {
         assert!(app.book_op_pending.is_some());
         assert!(!app.book_append_operation_is_current(operation));
         assert!(!app.book_append_undo_in_progress());
+    }
+
+    #[test]
+    fn book_shelf_old_epoch_undo_preserves_new_shelf_counts_and_finishes_viewer_removal() {
+        let mut app = setup_app_for_test();
+        let receipt = receipt(&app);
+        let scope = app.shelf_scope();
+        let (_tx, rx) = mpsc::channel();
+        app.book_op_pending = Some(BookOpPending {
+            rx,
+            shelf_scope: Some(scope),
+            intent: BookOpIntent::UndoAppend {
+                receipt: receipt.clone(),
+            },
+        });
+        app.book_shelf_root_changed();
+        app.book_shelf.snapshot = Some(
+            vec![crate::books::BookInfo {
+                name: receipt.files.book_name.clone(),
+                path: receipt.files.folder.clone(),
+                page_count: 9,
+            }]
+            .into(),
+        );
+        let removed = receipt.files.created[0].path.clone();
+        app.items = vec![GridItem::Image(removed.clone())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.visible_indices = vec![0];
+        app.finish_book_append_undo(crate::book_append_undo::BookAppendUndoResult {
+            book_name: receipt.files.book_name.clone(),
+            folder: receipt.files.folder.clone(),
+            succeeded: vec![removed],
+            failed: Vec::new(),
+            purge_errors: Vec::new(),
+            store_mutations: Default::default(),
+        });
+        assert!(app.items.is_empty());
+        assert_eq!(app.book_shelf.snapshot.as_ref().unwrap()[0].page_count, 9);
     }
 }

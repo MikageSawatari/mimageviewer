@@ -27,7 +27,11 @@ fn hold_book_operation(
     intent: BookOpIntent,
 ) -> std::sync::mpsc::Sender<Result<BookOpResult, String>> {
     let (tx, rx) = std::sync::mpsc::channel();
-    app.book_op_pending = Some(BookOpPending { rx, intent });
+    app.book_op_pending = Some(BookOpPending {
+        shelf_scope: None,
+        rx,
+        intent,
+    });
     tx
 }
 
@@ -89,6 +93,7 @@ pub(crate) fn assert_followup_terminal(
             worker
                 .unwrap()
                 .send(Ok(BookOpResult::Append(crate::books::BookAppendSummary {
+                    shelf: None,
                     book_name: "book".into(),
                     folder: append.files.folder.clone(),
                     added: 1,

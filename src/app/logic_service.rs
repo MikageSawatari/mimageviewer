@@ -15,6 +15,7 @@ impl App {
         self.service_folder_pane_visibility(ctx);
         self.sync_tray_resident_media_wake();
 
+        self.service_book_order(ctx);
         self.poll_composition_editor_save_receipts(ctx);
         self.resume_composition_editor_root_close(ctx);
         self.service_settings_family_operation(ctx);

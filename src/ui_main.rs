@@ -283,6 +283,436 @@ pub(crate) const SAVED_GROUP_NUMBERED_SLOT_LIMIT: usize = 20;
 pub(crate) fn saved_group_slot_number(index: usize) -> Option<usize> {
     (index < SAVED_GROUP_NUMBERED_SLOT_LIMIT).then_some(index + 1)
 }
+
+#[derive(Default)]
+struct BookManagerActions {
+    open: Option<PathBuf>,
+    active: Option<String>,
+    rename: Option<(String, String)>,
+    pin: Option<String>,
+    delete: Option<String>,
+    create: Option<String>,
+    refresh: bool,
+    order: Option<(String, isize)>,
+    fix_order: bool,
+    reset_order: bool,
+    #[cfg(test)]
+    scroll_layout: Option<crate::test_ui::scroll_layout::ScrollLayout>,
+    #[cfg(test)]
+    controls: Vec<(String, egui::Id, egui::Rect, egui::Rect, bool)>,
+    #[cfg(test)]
+    row_slots: Vec<(usize, egui::Rect, f32)>,
+}
+
+struct BookManagerView<'a> {
+    root: &'a std::path::Path,
+    active: &'a str,
+    rows: Option<&'a [crate::books::BookInfo]>,
+    pinned: &'a [String],
+    new_name: &'a mut String,
+    rename_inputs: &'a mut std::collections::BTreeMap<String, String>,
+    mutation_enabled: bool,
+    order_enabled: bool,
+    mode: &'a str,
+    status: Option<&'a str>,
+}
+
+fn pinned_book_projection<'a>(
+    rows: &'a [crate::books::BookInfo],
+    pinned: &[String],
+) -> Vec<&'a str> {
+    let membership: std::collections::HashSet<&str> = pinned.iter().map(String::as_str).collect();
+    rows.iter()
+        .filter(|row| membership.contains(row.name.as_str()))
+        .map(|row| row.name.as_str())
+        .collect()
+}
+
+fn book_manager_button_size(ui: &egui::Ui, text: &str) -> egui::Vec2 {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    ui.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(text.to_owned(), font, ui.visuals().text_color())
+            .size()
+    }) + ui.spacing().button_padding * 2.0
+}
+
+fn book_manager_row_height(ui: &egui::Ui, width: f32) -> f32 {
+    let mut lines = 1;
+    let mut used = 0.0;
+    let mut button_height = ui.spacing().interact_size.y;
+    for text in [
+        "↑",
+        "↓",
+        "固定",
+        "名前変更",
+        "追加先の本にする",
+        "削除",
+        "開く",
+    ] {
+        let size = book_manager_button_size(ui, text);
+        let button = size.x;
+        button_height = button_height.max(size.y);
+        if used > 0.0 && used + ui.spacing().item_spacing.x + button > width {
+            lines += 1;
+            used = button;
+        } else {
+            used += if used > 0.0 {
+                ui.spacing().item_spacing.x
+            } else {
+                0.0
+            } + button;
+        }
+    }
+    let pixels_per_point = ui.pixels_per_point();
+    let ceil_layout = |height: f32| {
+        let physical = (height * pixels_per_point).ceil() / pixels_per_point;
+        let grid = egui::emath::GUI_ROUNDING;
+        (physical / grid).ceil() * grid
+    };
+    // TextEdit imposes this family/extra-line floor; each galley also rounds
+    // its own line to physical pixels before the wrapping Ui stacks lines.
+    let edit_line = ceil_layout(
+        ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().extra_text_line_spacing,
+    );
+    let height = ceil_layout(button_height.max(edit_line + ui.spacing().button_padding.y * 2.0));
+    let slot = (lines + 1) as f32 * height + lines as f32 * ui.spacing().item_spacing.y;
+    // ScrollArea rounds viewport/offset to physical pixels; Placer rounds row
+    // allocations to GUI_ROUNDING. Follow the physical ceiling with a GUI-grid
+    // ceiling so show_rows and the child allocation use the same reserved step.
+    ceil_layout(slot)
+}
+
+fn draw_book_manager_contents(ui: &mut egui::Ui, view: BookManagerView<'_>) -> BookManagerActions {
+    let mut actions = BookManagerActions::default();
+    let root_label = format!("本棚: {}", view.root.display());
+    ui.add(egui::Label::new(&root_label).truncate())
+        .on_hover_text(&root_label);
+    ui.horizontal_wrapped(|ui| {
+        ui.label("現在の追加先の本");
+        ui.add(egui::Label::new(egui::RichText::new(view.active).strong()).truncate())
+            .on_hover_text(view.active);
+        if ui.button("開く").clicked() {
+            actions.open = Some(view.root.join(view.active));
+        }
+        if ui.button("本棚フォルダ").clicked() {
+            actions.open = Some(view.root.to_owned());
+        }
+    });
+    ui.separator();
+    let short_status = match view.status {
+        Some(status) if matches!(status, "保存中…" | "読込中…" | "未保存") => {
+            Some(status)
+        }
+        None if !view.mutation_enabled => Some("処理中…"),
+        _ => None,
+    };
+    ui.horizontal_wrapped(|ui| {
+        let label = ui.label("新しい本");
+        crate::ime_focus::add_singleline(ui, view.new_name, None, |edit| {
+            edit.id(egui::Id::unique("book_manager_new_name"))
+                .desired_width(160.0)
+        })
+        .labelled_by(label.id);
+        let name = crate::books::normalize_book_name(view.new_name);
+        if ui
+            .add_enabled(
+                view.mutation_enabled && !name.is_empty(),
+                egui::Button::new("作成"),
+            )
+            .clicked()
+        {
+            actions.create = Some(name);
+        }
+    });
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        ui.strong("本一覧");
+        ui.label(view.mode);
+        ui.label(egui::RichText::new("番号").weak()).on_hover_text("操作カスタマイズの「本1〜20を開く」で使う番号です。\n本一覧の上から順に対応します。本の並べ替えや削除で番号が変わります。\n名前順では追加・名前変更でも変わります。\n固定ボタンも本一覧の順に並びます。");
+        let fix = ui.add_enabled(view.order_enabled && view.mode == "名前順", egui::Button::new("今の順を固定"));
+        let reset = ui.add_enabled(view.order_enabled && view.mode == "手動順", egui::Button::new("名前順に戻す"));
+        actions.fix_order = fix.clicked();
+        actions.reset_order = reset.clicked();
+        #[cfg(test)]
+        for (label, response) in [("fix", &fix), ("reset", &reset)] {
+            actions.controls.push((label.to_owned(), response.id, response.rect, ui.clip_rect(), response.enabled()));
+        }
+        actions.refresh = ui.add_enabled(view.mutation_enabled, egui::Button::new("更新")).clicked();
+        // Reserve the short status in the existing control row, even while
+        // idle. Starting a save must not shift the list under its focused row.
+        let status_size = book_manager_button_size(ui, "保存中…").max(ui.spacing().interact_size);
+        ui.allocate_ui_with_layout(status_size, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_size(status_size);
+            if let Some(status) = short_status {
+                let color = if status == "未保存" { ui.visuals().warn_fg_color } else { ui.visuals().weak_text_color() };
+                ui.label(egui::RichText::new(status).color(color));
+            }
+        });
+    });
+    if let Some(status) = view.status.filter(|_| short_status.is_none()) {
+        ui.label(egui::RichText::new(status).color(ui.visuals().warn_fg_color));
+    }
+    let Some(rows) = view.rows else {
+        let message = if view.status == Some("本棚一覧を読み込めません") {
+            "更新で読み込み直せます。"
+        } else {
+            "読み込み中…"
+        };
+        ui.label(egui::RichText::new(message).weak());
+        return actions;
+    };
+    if rows.is_empty() {
+        ui.label(egui::RichText::new("本はまだありません。").weak());
+        return actions;
+    }
+    // Fixed row slots account for every wrapped operation line. Only visible rows
+    // are rendered, and each widget belongs to the book rather than its slot.
+    let body_height = ui.available_height().max(0.0);
+    let scrollbar_width = ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_inner_margin;
+    ui.spacing_mut().scroll.floating_allocated_width = scrollbar_width;
+    let row_height = book_manager_row_height(ui, ui.available_width() - scrollbar_width);
+    let scroll = egui::ScrollArea::vertical()
+        .id_salt("book_manager_rows")
+        // egui's native content is placed before offset_target is advanced;
+        // disable only scroll_to_* animation so accepted moves have no extra
+        // frame of focus-scroll latency. Wheel/drag physics stay unchanged.
+        .animated(false)
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
+        .max_height(body_height)
+        .min_scrolled_height(0.0)
+        .auto_shrink([false, true])
+        .show_rows(ui, row_height, rows.len(), |ui, range| {
+            for index in range {
+                let row = &rows[index];
+                let row_id = ui.scope_id().with(("book_manager_row", &row.name));
+                // Explicit child identity also stabilizes auto-ID buttons when
+                // a book moves to a different virtual slot (egui 0.37).
+                ui.scope_builder(egui::UiBuilder::new().id(row_id), |ui| {
+                    let _allocation = ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), row_height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            // Reserve the slot before the cursor advances: this
+                            // floor is relative to the current cursor in egui.
+                            ui.set_min_height(row_height);
+                            let mut name_response = None;
+                            let input = view
+                                .rename_inputs
+                                .entry(row.name.clone())
+                                .or_insert_with(|| row.name.clone());
+                            ui.horizontal(|ui| {
+                                let (number, hover) = saved_group_slot_number(index).map_or_else(
+                                    || {
+                                        (
+                                            "—".to_owned(),
+                                            "番号操作の対象外です（1〜20のみ）".to_owned(),
+                                        )
+                                    },
+                                    |number| {
+                                        (
+                                            number.to_string(),
+                                            format!(
+                                                "操作カスタマイズの「本{number}を開く」で開きます"
+                                            ),
+                                        )
+                                    },
+                                );
+                                ui.add_sized(
+                                    [28.0, ui.spacing().interact_size.y],
+                                    egui::Label::new(number),
+                                )
+                                .on_hover_text(hover);
+                                ui.label(if row.name == view.active { "●" } else { " " });
+                                ui.label(format!("{}p", row.page_count));
+                                let width = ui.available_width().max(32.0);
+                                let name_id = ui.scope_id().with("name");
+                                name_response = Some(crate::ime_focus::add_singleline(
+                                    ui,
+                                    input,
+                                    None,
+                                    |edit| edit.id(name_id).desired_width(width),
+                                ));
+                            });
+                            let new_name = crate::books::normalize_book_name(input);
+                            ui.horizontal_wrapped(|ui| {
+                                for (symbol, delta, enabled, tip) in [
+                                    ("↑", -1, index > 0, "上へ"),
+                                    ("↓", 1, index + 1 < rows.len(), "下へ"),
+                                ] {
+                                    let response = ui.add_enabled(
+                                        view.order_enabled && enabled,
+                                        egui::Button::new(symbol),
+                                    );
+                                    crate::ui_helpers::set_accessibility_label(
+                                        &response,
+                                        &format!("{}を{}", row.name, tip),
+                                    );
+                                    #[cfg(test)]
+                                    actions.controls.push((
+                                        format!("{}:{delta}", row.name),
+                                        response.id,
+                                        response.rect,
+                                        ui.clip_rect(),
+                                        response.enabled(),
+                                    ));
+                                    let response = response.on_hover_text(tip);
+                                    if response.clicked() {
+                                        let step = row_height + ui.spacing().item_spacing.y;
+                                        ui.scroll_to_rect_animation(
+                                            response.rect.translate(egui::vec2(0.0, delta as f32 * step)),
+                                            None,
+                                            egui::style::ScrollAnimation::none(),
+                                        );
+                                        actions.order = Some((row.name.clone(), delta));
+                                    }
+                                }
+                                if ui
+                                    .selectable_label(view.pinned.contains(&row.name), "固定")
+                                    .on_hover_text("ツールバーの本棚にこの本のボタンを固定表示する")
+                                    .clicked()
+                                {
+                                    actions.pin = Some(row.name.clone());
+                                }
+                                let rename = ui.add_enabled(
+                                    view.mutation_enabled
+                                        && !new_name.is_empty()
+                                        && new_name != row.name,
+                                    egui::Button::new("名前変更"),
+                                );
+                                if let Some(response) = name_response {
+                                    response.labelled_by(rename.id);
+                                }
+                                if rename.clicked() {
+                                    actions.rename = Some((row.name.clone(), new_name));
+                                }
+                                if ui
+                                    .add_enabled(
+                                        view.mutation_enabled && row.name != view.active,
+                                        egui::Button::new("追加先の本にする"),
+                                    )
+                                    .clicked()
+                                {
+                                    actions.active = Some(row.name.clone());
+                                }
+                                if ui
+                                    .add_enabled(view.mutation_enabled, egui::Button::new("削除"))
+                                    .clicked()
+                                {
+                                    actions.delete = Some(row.name.clone());
+                                }
+                                if ui.button("開く").clicked() {
+                                    actions.open = Some(row.path.clone());
+                                }
+                            });
+                            #[cfg(test)]
+                            assert!(ui.min_rect().bottom() <= ui.max_rect().top() + row_height,
+                                "book row content exceeds virtual slot: top={:.9}, bottom={:.9}, actual_height={:.9}, max_top={:.9}, slot={row_height:.9}, ppp={:.9}, gui_rounding={:.9}", ui.min_rect().top(), ui.min_rect().bottom(), ui.min_rect().height(), ui.max_rect().top(), ui.pixels_per_point(), egui::emath::GUI_ROUNDING);
+                        },
+                    );
+                    #[cfg(test)]
+                    actions.row_slots.push((index, _allocation.response.rect, row_height + ui.spacing().item_spacing.y));
+                });
+            }
+        });
+    #[cfg(test)]
+    {
+        actions.scroll_layout = Some(crate::test_ui::scroll_layout::ScrollLayout::from_output(
+            &scroll,
+        ));
+    }
+    #[cfg(not(test))]
+    let _ = scroll;
+    actions
+}
+
+fn draw_book_manager_window(
+    ctx: &egui::Context,
+    open: &mut bool,
+    view: BookManagerView<'_>,
+) -> BookManagerActions {
+    let rect = ctx.content_rect();
+    let available = (rect.size() - egui::vec2(24.0, 24.0)).max(egui::vec2(260.0, 160.0));
+    let mut actions = BookManagerActions::default();
+    egui::Window::new("製本の管理")
+        .drag_area(egui::WindowDrag::Anywhere)
+        .collapsible(false)
+        .resizable(true)
+        .default_pos(rect.min + egui::vec2(12.0, 12.0))
+        .default_size(egui::vec2(700.0, 540.0).min(available))
+        .min_width(260.0)
+        .max_size(available)
+        .open(open)
+        .show(ctx, |ui| {
+            actions = draw_book_manager_contents(ui, view);
+        });
+    actions
+}
+
+fn draw_book_order_saving_reopen(ctx: &egui::Context) -> egui::Response {
+    let rect = ctx.content_rect();
+    egui::Area::new(egui::Id::unique("book_order_saving_reopen"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.min + egui::vec2(12.0, 12.0))
+        .constrain_to(rect)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style())
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("保存中…");
+                        ui.button("管理を開く")
+                    })
+                    .inner
+                })
+                .inner
+        })
+        .inner
+}
+
+/// Pure manager drawing fixture; no App, filesystem access, or worker is created.
+pub fn draw_book_manager_snapshot_fixture(
+    ui: &mut egui::Ui,
+    mode: &str,
+    status: Option<&str>,
+    count: usize,
+) {
+    let root = std::path::Path::new(r"C:\Users\example\Pictures\mIV Books");
+    let rows: Vec<_> = (0..count)
+        .map(|index| {
+            let name = if index == 0 {
+                "Alpha — 長い本の名前と日本語の入力欄".to_owned()
+            } else {
+                format!("Reference {index:02}")
+            };
+            crate::books::BookInfo {
+                path: root.join(&name),
+                name,
+                page_count: index + 2,
+            }
+        })
+        .collect();
+    let mut new_name = String::new();
+    let mut rename_inputs = std::collections::BTreeMap::new();
+    draw_book_manager_window(
+        ui.ctx(),
+        &mut true,
+        BookManagerView {
+            root,
+            active: rows.first().map_or("名前なし", |row| row.name.as_str()),
+            rows: Some(&rows),
+            pinned: &[],
+            new_name: &mut new_name,
+            rename_inputs: &mut rename_inputs,
+            mutation_enabled: status != Some("保存中…"),
+            order_enabled: !status.is_some_and(|value| value.contains("読み込めない")),
+            mode,
+            status,
+        },
+    );
+}
 // 詳細ヘッダ + 詳細行 + パネル内の最小余白。下部情報バーはこの 2 行に加えて
 // solid 横スクロールバー専用レーンを CentralPanel より先に予約する。
 // 列境界のダブルクリックは UI thread 上で egui の font atlas を使って文字幅を測る。
@@ -8507,17 +8937,17 @@ impl App {
                                     }
                                 }
                                 ui.separator();
-                                if self.book_list_cache.is_none() && self.book_op_pending.is_none() && self.book_structural_op.is_none() {
-                                    self.request_book_list_refresh();
+                                if self.book_shelf.snapshot.is_none() && self.book_op_pending.is_none() && self.book_structural_op.is_none() {
+                                    self.ensure_book_list_loaded();
                                 }
-                                let rows = self.book_list_cache.clone();
+                                let rows = self.book_shelf.snapshot.as_ref().map(|snapshot| snapshot.rows.clone());
                                 match rows {
                                     Some(rows) if rows.is_empty() => {
                                         ui.label(egui::RichText::new("（本はまだありません）").weak());
                                     }
                                     Some(rows) => {
                                         ui.menu_button("追加先の本を選ぶ", |ui| {
-                                            for row in rows {
+                                            for row in rows.iter() {
                                                 let selected = row.name == active_name;
                                                 let label = if selected {
                                                     format!("✓ {} ({}p)", row.name, row.page_count)
@@ -8525,14 +8955,19 @@ impl App {
                                                     format!("{} ({}p)", row.name, row.page_count)
                                                 };
                                                 if ui.button(label).clicked() {
-                                                    self.select_book_append_target(row.name);
+                                                    self.select_book_append_target(row.name.clone());
                                                     ui.close();
                                                 }
                                             }
                                         });
                                     }
                                     None => {
-                                        ui.label(egui::RichText::new("本棚を読み込み中…").weak());
+                                        let message = if self.book_list_read_failed() {
+                                            "本棚を読み込めません（製本の管理 → 更新）"
+                                        } else {
+                                            "本棚を読み込み中…"
+                                        };
+                                        ui.label(egui::RichText::new(message).weak());
                                     }
                                 }
                             });
@@ -9474,204 +9909,55 @@ impl App {
             transfer_target_book: String::new(),
             error: None,
         });
-        self.book_list_cache = None;
+        self.book_shelf.snapshot = None;
         self.request_book_list_refresh();
     }
 
     pub(crate) fn draw_book_manager(&mut self, ctx: &egui::Context) {
         if !self.show_book_manager {
+            if self.book_order_saving() && draw_book_order_saving_reopen(ctx).clicked() {
+                // The active owner retains the current snapshot and receiver.
+                // Reopen only the view: no refresh, cancellation, or new request.
+                self.show_book_manager = true;
+            }
             return;
         }
-        if self.book_list_cache.is_none()
+        if self.book_shelf.snapshot.is_none()
             && self.book_op_pending.is_none()
             && self.book_structural_op.is_none()
         {
-            self.request_book_list_refresh();
+            self.ensure_book_list_loaded();
         }
         let mut open = true;
-        let mut open_request: Option<PathBuf> = None;
-        let mut set_active_request: Option<String> = None;
-        let mut rename_request: Option<(String, String)> = None;
-        let mut pin_toggle_request: Option<String> = None;
-        let mut delete_request: Option<String> = None;
-        let mut refresh_request = false;
-        let default_pos = ctx.content_rect().center() - egui::vec2(250.0, 220.0);
-        egui::Window::new("製本の管理").drag_area(egui::WindowDrag::Anywhere)
-            .collapsible(false)
-            .resizable(true)
-            .default_pos(default_pos)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.set_min_width(660.0);
-                ui.label(format!("本棚: {}", self.book_root_path().display()));
-                ui.horizontal(|ui| {
-                    ui.label("現在の追加先の本");
-                    ui.strong(self.active_book_name());
-                    if ui.button("開く").clicked() {
-                        open_request = Some(self.active_book_folder_path());
-                    }
-                    if ui.button("本棚フォルダ").clicked() {
-                        open_request = Some(self.book_root_path());
-                    }
-                });
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let name_label = ui.label("新しい本");
-                    crate::ime_focus::add_singleline(
-                        ui,
-                        &mut self.book_manager_new_name,
-                        None,
-                        |edit| edit,
-                    )
-                    .labelled_by(name_label.id);
-                    let name = crate::books::normalize_book_name(&self.book_manager_new_name);
-                    let can_create = !name.trim().is_empty() && self.book_op_pending.is_none() && self.book_structural_op.is_none();
-                    if ui
-                        .add_enabled(can_create, egui::Button::new("作成"))
-                        .clicked()
-                    {
-                        self.start_book_create(ctx, name);
-                    }
-                });
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("本一覧");
-                    ui.label(egui::RichText::new("番号").weak())
-                        .on_hover_text(
-                            "操作カスタマイズの「本1〜20を開く」で使う番号です。\n名前順のため、追加・名前変更・削除で番号が変わります。",
-                        );
-                    if ui
-                        .add_enabled(self.book_op_pending.is_none() && self.book_structural_op.is_none(), egui::Button::new("更新"))
-                        .clicked()
-                    {
-                        refresh_request = true;
-                    }
-                    if self.book_op_pending.is_some() || self.book_structural_op.is_some() {
-                        ui.label(egui::RichText::new("処理中…").weak());
-                    }
-                });
-                match self.book_list_cache.clone() {
-                    Some(rows) if rows.is_empty() => {
-                        ui.label(egui::RichText::new("本はまだありません。").weak());
-                    }
-                    Some(rows) => {
-                        let active_name = self.active_book_name();
-                        let row_names: std::collections::BTreeSet<String> =
-                            rows.iter().map(|row| row.name.clone()).collect();
-                        self.book_manager_rename_inputs
-                            .retain(|name, _| row_names.contains(name));
-                        egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
-                            .max_height(360.0)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                for (index, row) in rows.into_iter().enumerate() {
-                                    let active = row.name == active_name;
-                                    ui.horizontal(|ui| {
-                                        let (number, hover) = saved_group_slot_number(index)
-                                            .map_or_else(
-                                                || {
-                                                    (
-                                                        "—".to_owned(),
-                                                        "番号操作の対象外です（1〜20のみ）"
-                                                            .to_owned(),
-                                                    )
-                                                },
-                                                |number| {
-                                                    (
-                                                        number.to_string(),
-                                                        format!(
-                                                            "操作カスタマイズの「本{number}を開く」で開きます"
-                                                        ),
-                                                    )
-                                                },
-                                            );
-                                        ui.add_sized(
-                                            [28.0, ui.spacing().interact_size.y],
-                                            egui::Label::new(number),
-                                        )
-                                        .on_hover_text(hover);
-                                        if active {
-                                            ui.strong("●");
-                                        } else {
-                                            ui.label(" ");
-                                        }
-                                        ui.label(format!("{}p", row.page_count));
-                                        let input = self
-                                            .book_manager_rename_inputs
-                                            .entry(row.name.clone())
-                                            .or_insert_with(|| row.name.clone());
-                                        let name_response = crate::ime_focus::add_singleline(
-                                            ui,
-                                            input,
-                                            None,
-                                            |edit| edit.desired_width(220.0),
-                                        );
-                                        let new_name = crate::books::normalize_book_name(input);
-                                        let can_rename = !new_name.is_empty()
-                                            && new_name != row.name
-                                            && self.book_op_pending.is_none() && self.book_structural_op.is_none();
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if ui.button("開く").clicked() {
-                                                    open_request = Some(row.path.clone());
-                                                }
-                                                if ui
-                                                    .add_enabled(
-                                                        self.book_op_pending.is_none() && self.book_structural_op.is_none(),
-                                                        egui::Button::new("削除"),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    self.book_manager_delete_confirm =
-                                                        Some(row.name.clone());
-                                                }
-                                                if ui
-                                                    .add_enabled(
-                                                        !active && self.book_op_pending.is_none() && self.book_structural_op.is_none(),
-                                                        egui::Button::new("追加先の本にする"),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    set_active_request = Some(row.name.clone());
-                                                }
-                                                let rename_response = ui
-                                                    .add_enabled(
-                                                        can_rename,
-                                                        egui::Button::new("名前変更"),
-                                                    );
-                                                name_response.clone().labelled_by(rename_response.id);
-                                                if rename_response.clicked() {
-                                                    rename_request =
-                                                        Some((row.name.clone(), new_name.clone()));
-                                                }
-                                                let is_pinned = self
-                                                    .settings
-                                                    .pinned_books
-                                                    .iter()
-                                                    .any(|b| b == &row.name);
-                                                if ui
-                                                    .selectable_label(is_pinned, "固定")
-                                                    .on_hover_text(
-                                                        "ツールバーの本棚にこの本のボタンを固定表示する",
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    pin_toggle_request = Some(row.name.clone());
-                                                }
-                                            },
-                                        );
-                                    });
-                                }
-                            });
-                    }
-                    None => {
-                        ui.label(egui::RichText::new("読み込み中…").weak());
-                    }
-                }
-            });
+        let root = self.book_root_path();
+        let active = self.active_book_name();
+        let rows = self.book_shelf.snapshot.as_ref();
+        let mutation_enabled = self.book_op_pending.is_none()
+            && self.book_structural_op.is_none()
+            && !self.book_order_saving();
+        let order_enabled = self.book_order_editable();
+        let mode = self.book_order_mode_label().to_owned();
+        let status = self.book_order_status().map(str::to_owned);
+        let mut actions = draw_book_manager_window(
+            ctx,
+            &mut open,
+            BookManagerView {
+                root: &root,
+                active: &active,
+                rows: rows.map(|snapshot| snapshot.as_slice()),
+                pinned: &self.settings.pinned_books,
+                new_name: &mut self.book_manager_new_name,
+                rename_inputs: &mut self.book_manager_rename_inputs,
+                mutation_enabled,
+                order_enabled,
+                mode: &mode,
+                status: status.as_deref(),
+            },
+        );
+        if let Some(name) = actions.delete.take() {
+            self.book_manager_delete_confirm = Some(name);
+        }
+        let mut delete_request = None;
         if let Some(name) = self.book_manager_delete_confirm.clone() {
             let mut close_confirm = false;
             let mut confirmed = false;
@@ -9690,10 +9976,7 @@ impl App {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .add_enabled(
-                                self.book_op_pending.is_none() && self.book_structural_op.is_none(),
-                                egui::Button::new("削除"),
-                            )
+                            .add_enabled(mutation_enabled, egui::Button::new("削除"))
                             .clicked()
                         {
                             confirmed = true;
@@ -9711,22 +9994,20 @@ impl App {
                 self.book_manager_delete_confirm = None;
             }
         }
-        if refresh_request {
-            self.book_list_cache = None;
-            self.book_manager_rename_inputs.clear();
+        if actions.refresh {
             self.request_book_list_refresh();
         }
-        if let Some(path) = open_request {
+        if let Some(path) = actions.open {
             if crate::folder_tree::path_eq(&path, &self.book_root_path()) {
                 self.open_books_root();
             } else {
                 self.load_folder(path);
             }
         }
-        if let Some(name) = set_active_request {
+        if let Some(name) = actions.active {
             self.select_book_append_target(name);
         }
-        if let Some(name) = pin_toggle_request {
+        if let Some(name) = actions.pin {
             if let Some(pos) = self.settings.pinned_books.iter().position(|b| b == &name) {
                 self.settings.pinned_books.remove(pos);
             } else {
@@ -9734,11 +10015,23 @@ impl App {
             }
             self.settings.save();
         }
-        if let Some((old_name, new_name)) = rename_request {
+        if let Some((old_name, new_name)) = actions.rename {
             self.start_book_rename(ctx, old_name, new_name);
+        }
+        if let Some(name) = actions.create {
+            self.start_book_create(ctx, name);
         }
         if let Some(name) = delete_request {
             self.start_book_delete(ctx, name);
+        }
+        if let Some((name, delta)) = actions.order {
+            self.move_book_order(&name, delta, ctx);
+        }
+        if actions.fix_order {
+            self.fix_book_order(ctx);
+        }
+        if actions.reset_order {
+            self.reset_book_order(ctx);
         }
         if !open {
             self.show_book_manager = false;
@@ -9818,13 +10111,18 @@ impl App {
             ctx.request_repaint();
         }
 
-        if self.book_list_cache.is_none()
+        if self.book_shelf.snapshot.is_none()
             && self.book_op_pending.is_none()
             && self.book_structural_op.is_none()
         {
-            self.request_book_list_refresh();
+            self.ensure_book_list_loaded();
         }
-        let book_rows = self.book_list_cache.clone().unwrap_or_default();
+        let book_rows = self
+            .book_shelf
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.as_slice().to_vec())
+            .unwrap_or_default();
         let mut close = false;
         let mut save_request: Option<(PathBuf, Vec<PathBuf>)> = None;
         let mut transfer_request: Option<(
@@ -10782,14 +11080,18 @@ impl App {
         let sort_lock = self.grid_sort_lock_reason();
         let root_order = self.collection_grid_root_order().and_then(Result::ok);
         if show_bookshelf
-            && self.book_list_cache.is_none()
+            && self.book_shelf.snapshot.is_none()
             && self.book_op_pending.is_none()
             && self.book_structural_op.is_none()
         {
-            self.request_book_list_refresh();
+            self.ensure_book_list_loaded();
         }
         let active_book_name = self.active_book_name();
-        let toolbar_book_rows = self.book_list_cache.clone();
+        let toolbar_book_rows = self
+            .book_shelf
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.rows.clone());
         let toolbar_pinned_books = self.settings.pinned_books.clone();
         let toolbar_smart_folder_definitions = self.settings.smart_folders.clone();
         let has_book_add_target = self.selected.is_some() || !self.checked.is_empty();
@@ -11102,7 +11404,12 @@ egui::ComboBox::from_id_salt("toolbar_book_target_combo")
                                     }
                                 }
                                 None => {
-                                    ui.label(egui::RichText::new("本棚を読み込み中…").weak());
+                                    let message = if self.book_list_read_failed() {
+                                        "本棚を読み込めません（製本の管理 → 更新）"
+                                    } else {
+                                        "本棚を読み込み中…"
+                                    };
+                                    ui.label(egui::RichText::new(message).weak());
                                 }
                             }
                         })
@@ -11147,23 +11454,17 @@ egui::ComboBox::from_id_salt("toolbar_book_target_combo")
                         };
                     if show_pins {
                         // 左=開く / 右=選択したアイテムを追加。実在する本だけ (削除済みピンは出さない)。
-                        for pin in &toolbar_pinned_books {
-                            let exists = toolbar_book_rows
-                                .as_ref()
-                                .is_some_and(|rows| rows.iter().any(|r| &r.name == pin));
-                            if !exists {
-                                continue;
-                            }
+                        for pin in pinned_book_projection(toolbar_book_rows.as_ref().map_or(&[], |rows| rows.as_slice()), &toolbar_pinned_books) {
                             // ハイライトはしない (追加先=active 本を強調すると「このアイテムを
                             // その本に入れた」と誤解されるため。ユーザー判断 2026-06-20)。
                             let resp = ui.button(pin).hover_tip(
                                 "左: この本を開く / 右: 選択したアイテムをこの本へ追加",
                             );
                             if resp.clicked() {
-                                toolbar_book_pin_open = Some(pin.clone());
+                                toolbar_book_pin_open = Some(pin.to_owned());
                             }
                             if resp.secondary_clicked() {
-                                toolbar_book_pin_add = Some(pin.clone());
+                                toolbar_book_pin_add = Some(pin.to_owned());
                             }
                         }
                     }
@@ -23959,6 +24260,7 @@ mod book_append_target_tests {
             let (_tx, rx) = std::sync::mpsc::channel();
             app.book_op_pending = Some(crate::books::BookOpPending {
                 rx,
+                shelf_scope: None,
                 intent: if undo_pending {
                     crate::books::BookOpIntent::UndoAppend { receipt }
                 } else {
@@ -29122,47 +29424,589 @@ mod saved_group_number_ui_tests {
     }
 
     #[test]
-    fn book_manager_numbered_dark_snapshot() {
-        let mut app = crate::app::setup_app_for_test();
-        app.show_book_manager = true;
-        app.settings.active_book_name = "Alpha".into();
-        app.settings.book_root = Some(PathBuf::from(r"C:\Users\example\Pictures\mIV Books"));
-        let book_root = app.settings.book_root.clone().unwrap();
-        app.book_list_cache = Some(vec![
-            crate::books::BookInfo {
-                name: "Alpha".into(),
-                path: book_root.join("Alpha"),
-                page_count: 16,
+    fn pinned_books_follow_all_rows_for_missing_manual_and_saved_name_order() {
+        use crate::book_order::{BookOrderPolicy, ORDER_FILE_NAME, read_snapshot, write_order};
+        let root = tempfile::tempdir().unwrap();
+        for name in ["C", "A", "B"] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+        }
+        let pins = vec!["A".to_owned(), "C".to_owned(), "Missing".to_owned()];
+        let absent = read_snapshot(root.path()).unwrap();
+        assert_eq!(pinned_book_projection(&absent.rows, &pins), ["A", "C"]);
+        assert!(!root.path().join(ORDER_FILE_NAME).exists());
+        write_order(
+            root.path(),
+            absent.token().unwrap(),
+            &BookOrderPolicy::Manual(vec!["C".into(), "B".into(), "A".into()]),
+        )
+        .unwrap();
+        let manual = read_snapshot(root.path()).unwrap();
+        assert_eq!(pinned_book_projection(&manual.rows, &pins), ["C", "A"]);
+        write_order(root.path(), manual.token().unwrap(), &BookOrderPolicy::Name).unwrap();
+        let saved_name = read_snapshot(root.path()).unwrap();
+        assert_eq!(pinned_book_projection(&saved_name.rows, &pins), ["A", "C"]);
+    }
+
+    fn manager_test_frame(
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        rows: &[crate::books::BookInfo],
+        names: &mut std::collections::BTreeMap<String, String>,
+        mode: &str,
+        status: Option<&str>,
+        events: Vec<egui::Event>,
+    ) -> BookManagerActions {
+        manager_test_frame_in(
+            ctx,
+            ManagerTestLayout {
+                size,
+                pixels_per_point: 1.0,
+                root: std::path::Path::new(r"C:\Users\example\Pictures\mIV Books"),
             },
-            crate::books::BookInfo {
-                name: "Reference".into(),
-                path: book_root.join("Reference"),
-                page_count: 2,
-            },
-        ]);
-        let app = std::rc::Rc::new(std::cell::RefCell::new(app));
-        let ui_app = std::rc::Rc::clone(&app);
-        let mut fonts_ready = false;
-        let mut harness = crate::test_ui::builder()
-            .with_size(egui::vec2(900.0, 600.0))
-            .build_ui(move |root_ui| {
-                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
-                    let ctx = &root_ui.ctx().clone();
-                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
-                    if !fonts_ready {
-                        crate::ui_fonts::configure_fonts(ctx);
-                        fonts_ready = true;
-                        ctx.request_repaint();
-                        return;
-                    }
-                    egui::CentralPanel::default().show(root_ui, |ui| {
-                        ui.heading("画像一覧");
-                    });
-                    ui_app.borrow_mut().draw_book_manager(ctx);
-                });
+            rows,
+            names,
+            mode,
+            status,
+            events,
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    struct ManagerTestLayout<'a> {
+        size: egui::Vec2,
+        pixels_per_point: f32,
+        root: &'a std::path::Path,
+    }
+
+    fn manager_test_frame_in(
+        ctx: &egui::Context,
+        layout: ManagerTestLayout<'_>,
+        rows: &[crate::books::BookInfo],
+        names: &mut std::collections::BTreeMap<String, String>,
+        mode: &str,
+        status: Option<&str>,
+        events: Vec<egui::Event>,
+    ) -> BookManagerActions {
+        let mut actions = BookManagerActions::default();
+        let mut new_name = String::new();
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, layout.size)),
+            events,
+            ..Default::default()
+        };
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .native_pixels_per_point = Some(layout.pixels_per_point);
+        ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.label("画像一覧");
             });
-        harness.run();
-        harness.snapshot("book_manager_numbered_dark");
+            actions = draw_book_manager_window(
+                ctx,
+                &mut true,
+                BookManagerView {
+                    root: layout.root,
+                    active: rows.first().map_or("名前なし", |row| row.name.as_str()),
+                    rows: Some(rows),
+                    pinned: &[],
+                    new_name: &mut new_name,
+                    rename_inputs: names,
+                    mutation_enabled: status != Some("保存中…"),
+                    order_enabled: !status.is_some_and(|value| value.contains("読み込めない")),
+                    mode,
+                    status,
+                },
+            );
+        })
+        .drop_without_applying_deltas();
+        actions
+    }
+
+    fn manager_test_rows(count: usize) -> Vec<crate::books::BookInfo> {
+        (0..count)
+            .map(|index| {
+                let name = format!("本{index:02} — 長い本の名前と日本語の入力欄");
+                crate::books::BookInfo {
+                    path: PathBuf::from(&name),
+                    name,
+                    page_count: index + 1,
+                }
+            })
+            .collect()
+    }
+
+    fn assert_manager_row_slots(actions: &BookManagerActions) {
+        for adjacent in actions.row_slots.windows(2) {
+            let (first_index, first, step) = adjacent[0];
+            let (second_index, second, _) = adjacent[1];
+            assert_eq!(second_index, first_index + 1);
+            let actual = second.top() - first.top();
+            let float_precision =
+                f32::EPSILON * first.top().abs().max(second.top().abs()).max(step) * 4.0;
+            assert!(
+                (actual - step).abs() <= float_precision,
+                "actual row spacing differs from show_rows step: actual={actual}, step={step}; first={first:?}; second={second:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn book_manager_small_viewport_controls_and_scroll_reachability() {
+        use crate::test_ui::scroll_layout::HeightExpectation;
+        for screen in [egui::vec2(1093.0, 614.0), egui::vec2(1366.0, 728.0)] {
+            for scale in [1.0, 2.0] {
+                for (mode, status) in [
+                    ("名前順", None),
+                    ("手動順", None),
+                    ("手動順", Some("保存中…")),
+                    ("手動順", Some("未保存")),
+                    (
+                        "名前順",
+                        Some("本の順序を読み込めないため名前順で表示しています"),
+                    ),
+                ] {
+                    for count in [0, 1, 6, 21, 1000] {
+                        let ctx = egui::Context::default();
+                        crate::ui_fonts::configure_fonts(&ctx);
+                        let size = screen / scale;
+                        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                        let rows = manager_test_rows(count);
+                        let mut names = std::collections::BTreeMap::new();
+                        let mut actions = BookManagerActions::default();
+                        for _ in 0..4 {
+                            actions = manager_test_frame(
+                                &ctx,
+                                size,
+                                &rows,
+                                &mut names,
+                                mode,
+                                status,
+                                vec![],
+                            );
+                        }
+                        for control in actions
+                            .controls
+                            .iter()
+                            .filter(|control| control.0 == "fix" || control.0 == "reset")
+                        {
+                            assert!(
+                                bounds.contains_rect(control.2),
+                                "header control outside screen: {control:?}; size={size:?}"
+                            );
+                            assert!(
+                                control.3.contains_rect(control.2),
+                                "header control clipped: {control:?}"
+                            );
+                        }
+                        assert_manager_row_slots(&actions);
+                        if let Some(before) = actions.scroll_layout {
+                            let expectation = if before.content.y > before.inner.height() + 1.0 {
+                                HeightExpectation::Scrolls
+                            } else {
+                                HeightExpectation::Fits
+                            };
+                            before.assert_height(expectation, bounds, 1.0);
+                            if matches!(expectation, HeightExpectation::Scrolls) {
+                                let events = vec![
+                                    egui::Event::PointerMoved(before.inner.center()),
+                                    egui::Event::MouseWheel {
+                                        unit: egui::MouseWheelUnit::Point,
+                                        delta: egui::vec2(0.0, -1_000_000.0),
+                                        modifiers: egui::Modifiers::NONE,
+                                        phase: egui::TouchPhase::Move,
+                                        source: egui::MouseWheelSource::Unknown,
+                                    },
+                                ];
+                                actions = manager_test_frame(
+                                    &ctx, size, &rows, &mut names, mode, status, events,
+                                );
+                                for _ in 0..80 {
+                                    actions = manager_test_frame(
+                                        &ctx,
+                                        size,
+                                        &rows,
+                                        &mut names,
+                                        mode,
+                                        status,
+                                        vec![],
+                                    );
+                                }
+                                actions
+                                    .scroll_layout
+                                    .unwrap()
+                                    .assert_scrolled_to_end(before, 1.0);
+                            }
+                            let last = format!("{}:1", rows.last().unwrap().name);
+                            assert_manager_row_slots(&actions);
+                            let control = actions
+                                .controls
+                                .iter()
+                                .find(|control| control.0 == last)
+                                .unwrap();
+                            assert!(!control.4, "last down arrow must be disabled");
+                            assert!(
+                                bounds.contains_rect(control.2)
+                                    && control.3.contains_rect(control.2),
+                                "last arrow unreachable: {control:?}; size={size:?}"
+                            );
+                            assert!(
+                                actions.controls.len() < 60,
+                                "large shelves must render visible rows only"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn book_manager_fractional_pixels_long_header_and_wrapped_rows_reach_end() {
+        use crate::test_ui::scroll_layout::HeightExpectation;
+        let root = PathBuf::from(format!("C:\\{}", "深いフォルダ\\".repeat(40)));
+        let mut rows = manager_test_rows(21);
+        rows[0].name = "本".repeat(255);
+        rows[0].path = root.join(&rows[0].name);
+        for pixels_per_point in [1.25, 1.5, 2.0] {
+            for size in [egui::vec2(546.5, 307.0), egui::vec2(350.0, 460.0)] {
+                let ctx = egui::Context::default();
+                crate::ui_fonts::configure_fonts(&ctx);
+                let layout = ManagerTestLayout {
+                    size,
+                    pixels_per_point,
+                    root: &root,
+                };
+                let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, layout.size);
+                let mut names = std::collections::BTreeMap::new();
+                let mut actions = BookManagerActions::default();
+                for _ in 0..4 {
+                    actions = manager_test_frame_in(
+                        &ctx,
+                        layout,
+                        &rows,
+                        &mut names,
+                        "手動順",
+                        Some("保存中…"),
+                        vec![],
+                    );
+                }
+                assert_eq!(ctx.pixels_per_point(), pixels_per_point);
+                assert_manager_row_slots(&actions);
+                for control in actions
+                    .controls
+                    .iter()
+                    .filter(|control| control.0 == "fix" || control.0 == "reset")
+                {
+                    assert!(
+                        bounds.contains_rect(control.2) && control.3.contains_rect(control.2),
+                        "mode control clipped: {control:?}"
+                    );
+                }
+                let before = actions.scroll_layout.unwrap();
+                before.assert_height(HeightExpectation::Scrolls, bounds, pixels_per_point);
+                let events = vec![
+                    egui::Event::PointerMoved(before.inner.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -1_000_000.0),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
+                    },
+                ];
+                manager_test_frame_in(
+                    &ctx,
+                    layout,
+                    &rows,
+                    &mut names,
+                    "手動順",
+                    Some("保存中…"),
+                    events,
+                );
+                for _ in 0..80 {
+                    actions = manager_test_frame_in(
+                        &ctx,
+                        layout,
+                        &rows,
+                        &mut names,
+                        "手動順",
+                        Some("保存中…"),
+                        vec![],
+                    );
+                }
+                actions
+                    .scroll_layout
+                    .unwrap()
+                    .assert_scrolled_to_end(before, pixels_per_point);
+                assert_manager_row_slots(&actions);
+                let last = format!("{}:1", rows.last().unwrap().name);
+                let control = actions
+                    .controls
+                    .iter()
+                    .find(|control| control.0 == last)
+                    .unwrap();
+                assert!(
+                    bounds.contains_rect(control.2) && control.3.contains_rect(control.2),
+                    "last arrow clipped: {control:?}; ppp={pixels_per_point}; size={size:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn book_manager_first_save_keeps_last_visible_focused_button_in_view() {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let size = egui::vec2(1093.0, 614.0);
+        let mut rows = manager_test_rows(30);
+        let mut names = std::collections::BTreeMap::new();
+        let mut actions = BookManagerActions::default();
+        for _ in 0..4 {
+            actions = manager_test_frame(&ctx, size, &rows, &mut names, "名前順", None, vec![]);
+        }
+        let down = actions
+            .controls
+            .iter()
+            .filter(|control| {
+                control.0.ends_with(":1") && control.4 && control.3.contains_rect(control.2)
+            })
+            .max_by(|left, right| left.2.top().total_cmp(&right.2.top()))
+            .unwrap()
+            .clone();
+        let target = down.0.strip_suffix(":1").unwrap().to_owned();
+        ctx.memory_mut(|memory| memory.request_focus(down.1));
+        let press = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let clicked =
+            manager_test_frame(&ctx, size, &rows, &mut names, "名前順", None, vec![press]);
+        assert_eq!(clicked.order, Some((target.clone(), 1)));
+        let index = rows.iter().position(|row| row.name == target).unwrap();
+        rows.swap(index, index + 1);
+        let release = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let saved = manager_test_frame(
+            &ctx,
+            size,
+            &rows,
+            &mut names,
+            "手動順",
+            Some("保存中…"),
+            vec![release],
+        );
+        assert_eq!(
+            saved.scroll_layout.unwrap().inner,
+            actions.scroll_layout.unwrap().inner,
+            "starting the first save must preserve list viewport geometry"
+        );
+        let moved = saved
+            .controls
+            .iter()
+            .find(|control| control.0 == down.0)
+            .expect("newly saving focused book must remain rendered");
+        assert_eq!(moved.1, down.1);
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(down.1));
+        assert!(
+            moved.3.contains_rect(moved.2),
+            "first saving frame must keep moved button visible: {moved:?}"
+        );
+    }
+
+    #[test]
+    fn book_manager_focused_enter_follows_book_across_virtual_viewport_while_saving() {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let size = egui::vec2(1093.0, 614.0);
+        let mut rows = manager_test_rows(30);
+        let target = rows[1].name.clone();
+        let mut names = std::collections::BTreeMap::new();
+        let mut actions = BookManagerActions::default();
+        for _ in 0..4 {
+            actions = manager_test_frame(&ctx, size, &rows, &mut names, "名前順", None, vec![]);
+        }
+        let down_label = format!("{target}:1");
+        let id = actions
+            .controls
+            .iter()
+            .find(|control| control.0 == down_label)
+            .unwrap()
+            .1;
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        for step in 0..18 {
+            let status = (step > 0).then_some("保存中…");
+            let mode = if step == 0 { "名前順" } else { "手動順" };
+            let press = egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let clicked =
+                manager_test_frame(&ctx, size, &rows, &mut names, mode, status, vec![press]);
+            assert_eq!(
+                clicked.order,
+                Some((target.clone(), 1)),
+                "focused Enter must continue moving the same book; step={step}"
+            );
+            let index = rows.iter().position(|row| row.name == target).unwrap();
+            rows.swap(index, index + 1);
+            let release = egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            actions = manager_test_frame(
+                &ctx,
+                size,
+                &rows,
+                &mut names,
+                "手動順",
+                Some("保存中…"),
+                vec![release],
+            );
+            let down = actions
+                .controls
+                .iter()
+                .find(|control| control.0 == down_label)
+                .expect("moved focused book must remain rendered");
+            assert_eq!(down.1, id);
+            assert_eq!(ctx.memory(|memory| memory.focused()), Some(id));
+            assert!(
+                down.3.contains_rect(down.2),
+                "moved button must remain visible; step={step}; control={down:?}"
+            );
+        }
+        assert_eq!(rows[19].name, target);
+        assert!(
+            actions.scroll_layout.unwrap().offset.y > 0.0,
+            "keyboard moves must cross the virtual viewport edge"
+        );
+    }
+
+    #[test]
+    fn book_manager_book_identity_keeps_button_focus_and_name_draft_after_move() {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let mut rows = manager_test_rows(4);
+        let target = rows[2].name.clone();
+        let mut names =
+            std::collections::BTreeMap::from([(target.clone(), "編集中の名前".to_owned())]);
+        let size = egui::vec2(1093.0, 614.0);
+        let mut actions = BookManagerActions::default();
+        for _ in 0..4 {
+            actions = manager_test_frame(
+                &ctx,
+                size,
+                &rows,
+                &mut names,
+                "手動順",
+                Some("保存中…"),
+                vec![],
+            );
+        }
+        let up = actions
+            .controls
+            .iter()
+            .find(|control| control.0 == format!("{target}:-1"))
+            .unwrap()
+            .clone();
+        assert!(up.4, "saving must allow another order operation");
+        ctx.memory_mut(|memory| memory.request_focus(up.1));
+        rows.swap(2, 1);
+        let actions = manager_test_frame(
+            &ctx,
+            size,
+            &rows,
+            &mut names,
+            "手動順",
+            Some("保存中…"),
+            vec![],
+        );
+        let moved = actions
+            .controls
+            .iter()
+            .find(|control| control.0 == format!("{target}:-1"))
+            .unwrap();
+        assert_eq!(up.1, moved.1, "button identity must follow the book");
+        assert_eq!(names[&target], "編集中の名前");
+        assert!(moved.4);
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(moved.1));
+        let first = actions
+            .controls
+            .iter()
+            .find(|control| control.0 == format!("{}:-1", rows[0].name))
+            .unwrap();
+        assert!(!first.4, "top up arrow remains present and disabled");
+        let down = actions
+            .controls
+            .iter()
+            .find(|control| control.0 == format!("{target}:1"))
+            .unwrap();
+        assert!(down.4);
+    }
+
+    #[test]
+    fn book_manager_closed_saving_reopen_button_accepts_real_pointer_click() {
+        for size in [egui::vec2(1093.0, 614.0), egui::vec2(546.5, 307.0)] {
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            let draw = |events| {
+                let mut response = None;
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            ui.label("画像一覧");
+                        });
+                        response = Some(draw_book_order_saving_reopen(&ctx));
+                    },
+                )
+                .drop_without_applying_deltas();
+                response.unwrap()
+            };
+            let mut button = draw(vec![]);
+            for _ in 0..3 {
+                button = draw(vec![]);
+            }
+            assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(button.rect));
+            assert!(button.enabled());
+            let position = button.rect.center();
+            let press = egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            };
+            draw(vec![egui::Event::PointerMoved(position), press]);
+            let release = egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            assert!(
+                draw(vec![release]).clicked(),
+                "closed manager must remain reachable during save"
+            );
+        }
     }
 }
 

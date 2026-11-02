@@ -32,6 +32,7 @@ pub struct BookPageEntry {
 
 #[derive(Clone, Debug)]
 pub struct BookAppendSummary {
+    pub shelf: Option<crate::book_order::BookShelfCompletion>,
     pub book_name: String,
     pub folder: PathBuf,
     pub added: usize,
@@ -82,6 +83,14 @@ pub struct BookTransferSummary {
 
 #[derive(Debug)]
 pub enum BookOpResult {
+    ShelfList(crate::book_order::BookShelfSnapshot),
+    ShelfOrderSaved(
+        Result<crate::book_order::BookOrderToken, crate::book_order::BookOrderWriteError>,
+    ),
+    ShelfUpdated {
+        result: Box<BookOpResult>,
+        shelf: crate::book_order::BookShelfCompletion,
+    },
     Append(BookAppendSummary),
     AppendPresencePrepared {
         summary: BookAppendSummary,
@@ -248,6 +257,7 @@ impl Drop for PreparedBookmarkMigration {
 }
 
 pub struct BookOpPending {
+    pub(crate) shelf_scope: Option<crate::app::book_shelf::ShelfScope>,
     pub rx: std::sync::mpsc::Receiver<Result<BookOpResult, String>>,
     pub intent: BookOpIntent,
 }
@@ -256,6 +266,7 @@ pub struct BookOpPending {
 /// exact requested root until the success result supplies the removed path.
 #[derive(Clone)]
 pub enum BookOpIntent {
+    ShelfOrder,
     Unrelated,
     /// A manager refresh can also carry one read-only, cancelable grid-navigation request.
     List {
@@ -762,7 +773,14 @@ pub(crate) fn list_book_paths_while(
 }
 
 pub fn list_books(root: &Path) -> Result<Vec<BookInfo>, String> {
-    if !root.exists() {
+    Ok(crate::book_order::read_snapshot(root)?.rows)
+}
+
+pub(crate) fn list_books_name_order(
+    root: &Path,
+    root_presence: crate::book_order::RootPresence,
+) -> Result<Vec<BookInfo>, String> {
+    if root_presence == crate::book_order::RootPresence::Missing {
         return Ok(Vec::new());
     }
     let mut rows = Vec::new();
@@ -805,8 +823,13 @@ pub fn apply_append_to_cached_list(
     folder: &Path,
     added: usize,
 ) {
-    if let Some(row) = rows.iter_mut().find(|row| row.name == book_name) {
-        row.path = folder.to_path_buf();
+    if let Some(row) = rows
+        .iter_mut()
+        .find(|row| row.name == book_name || crate::folder_tree::path_eq(&row.path, folder))
+    {
+        // Keep the observed directory spelling when the requested target is a
+        // Windows case alias, so the cached path/name identity stays coherent.
+        row.path = folder.with_file_name(&row.name);
         row.page_count = row.page_count.saturating_add(added);
         return;
     }
@@ -823,7 +846,46 @@ pub fn apply_append_to_cached_list(
     });
 }
 
+pub(crate) fn apply_append_to_cached_shelf(
+    snapshot: &mut crate::book_order::BookShelfSnapshot,
+    book_name: &str,
+    folder: &Path,
+    added: usize,
+) -> Result<(), String> {
+    if snapshot
+        .rows
+        .iter()
+        .any(|row| row.name == book_name || crate::folder_tree::path_eq(&row.path, folder))
+    {
+        apply_append_to_cached_list(&mut snapshot.rows, book_name, folder, added);
+    } else {
+        // An externally created book can exist before the cached list sees it.
+        // Resolve membership against the current display policy (also Unsaved),
+        // without replacing its order token or visiting any book folder.
+        let mut rows = snapshot.rows.clone();
+        rows.push(BookInfo {
+            name: book_name.to_owned(),
+            path: folder.to_path_buf(),
+            page_count: added,
+        });
+        snapshot.rows = crate::book_order::resolve_rows(&snapshot.policy, rows)?;
+    }
+    Ok(())
+}
+
 pub fn create_book(root: &Path, name: &str) -> Result<BookOpResult, String> {
+    let before = crate::book_order::read_snapshot(root);
+    let result = create_book_unordered(root, name)?;
+    let mutation = match &result {
+        BookOpResult::Created { name, .. } => {
+            crate::book_order::BookShelfMutation::Created(name.clone())
+        }
+        _ => unreachable!(),
+    };
+    Ok(with_shelf_completion(root, before, mutation, result))
+}
+
+fn create_book_unordered(root: &Path, name: &str) -> Result<BookOpResult, String> {
     let name = normalize_book_name(name);
     let path = book_folder(root, &name);
     if path.exists() {
@@ -836,7 +898,18 @@ pub fn create_book(root: &Path, name: &str) -> Result<BookOpResult, String> {
 }
 
 pub fn rename_book(root: &Path, old_name: &str, new_name: &str) -> Result<BookOpResult, String> {
-    rename_book_at(&crate::data_dir::get(), root, old_name, new_name)
+    let before = crate::book_order::read_snapshot(root);
+    let result = rename_book_at(&crate::data_dir::get(), root, old_name, new_name)?;
+    let mutation = match &result {
+        BookOpResult::Renamed {
+            old_name, new_name, ..
+        } if old_name != new_name => crate::book_order::BookShelfMutation::Renamed {
+            old_name: old_name.clone(),
+            new_name: new_name.clone(),
+        },
+        _ => crate::book_order::BookShelfMutation::Unchanged,
+    };
+    Ok(with_shelf_completion(root, before, mutation, result))
 }
 
 pub(crate) fn rename_book_at(
@@ -862,7 +935,8 @@ pub(crate) fn rename_book_at(
     let from = book_folder(root, &old_name);
     let to = book_folder(root, &new_name);
     ensure_direct_book_target(root, &from)?;
-    if to.exists() {
+    let case_only = crate::folder_tree::path_eq(&from, &to);
+    if to.exists() && !case_only {
         return Err(format!("同名の本が既にあります: {new_name}"));
     }
     // Keep missing bookmarks and folder-scoped settings in the same mapping as
@@ -872,10 +946,33 @@ pub(crate) fn rename_book_at(
         to: to.clone(),
     }];
     let job_id = crate::book_bookmarks::new_path_migration_job_id();
-    let plan = BookFsOperationPlan::new(vec![BookFsStep::Rename {
-        from: from.clone(),
-        to: to.clone(),
-    }]);
+    let steps = if case_only {
+        // Windows resolves both spellings to the same directory. The journal
+        // owns both physical steps, while metadata sees one original→final map.
+        let staging = root.join(format!(
+            ".mimageviewer-book-rename-{}",
+            uuid::Uuid::new_v4()
+        ));
+        if !filesystem_path_is_missing(&staging)? {
+            return Err("本の改名用の一時フォルダが既に存在します".into());
+        }
+        vec![
+            BookFsStep::Rename {
+                from: from.clone(),
+                to: staging.clone(),
+            },
+            BookFsStep::Rename {
+                from: staging,
+                to: to.clone(),
+            },
+        ]
+    } else {
+        vec![BookFsStep::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        }]
+    };
+    let plan = BookFsOperationPlan::new(steps);
     let migration = PreparedBookmarkMigration::prepare(data_dir, job_id, &edit_moves, &plan)?;
     let bookmark_migration_journal_id = migration.execute(&plan)?;
     let metadata = maintain_book_paths(data_dir, &edit_moves, &[]);
@@ -891,7 +988,10 @@ pub(crate) fn rename_book_at(
 }
 
 pub fn delete_book(root: &Path, name: &str) -> Result<BookOpResult, String> {
-    delete_book_at(&crate::data_dir::get(), root, name)
+    let before = crate::book_order::read_snapshot(root);
+    let result = delete_book_at(&crate::data_dir::get(), root, name)?;
+    let mutation = crate::book_order::BookShelfMutation::Deleted(normalize_book_name(name));
+    Ok(with_shelf_completion(root, before, mutation, result))
 }
 
 pub(crate) fn delete_book_at(
@@ -930,7 +1030,57 @@ pub fn append_pages(
 ) -> Result<BookOpResult, String> {
     let data_dir = crate::data_dir::get();
     let stores = crate::book_append_undo::AppendMetadataStores::existing_at(&data_dir);
-    append_pages_at_with_raw(data_dir, root, book_name, sources, stores, Some(raw))
+    append_pages_at_with_raw_and_shelf(data_dir, root, book_name, sources, stores, Some(raw))
+}
+
+pub(crate) fn append_pages_at_with_raw_and_shelf(
+    data_dir: PathBuf,
+    root: PathBuf,
+    book_name: String,
+    sources: Vec<BookPageSource>,
+    stores: crate::book_append_undo::AppendMetadataStores,
+    raw: Option<&crate::raw::RawDecodeContext>,
+) -> Result<BookOpResult, String> {
+    // Existing-book Append changes pages, not shelf membership. Keep its
+    // count-delta terminal independent of every other book's page enumeration.
+    let folder = book_folder(&root, &book_name);
+    let before = match fs::symlink_metadata(&folder) {
+        Ok(_) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Some(crate::book_order::observe_order(&root))
+        }
+        Err(error) => {
+            return Err(format!(
+                "本フォルダの状態を読み取れません: {}: {error}",
+                folder.display()
+            ));
+        }
+    };
+    let mut result =
+        append_pages_at_with_raw(data_dir, root.clone(), book_name, sources, stores, raw)?;
+    let BookOpResult::Append(summary) = &mut result else {
+        unreachable!()
+    };
+    if let Some(before) = before {
+        summary.shelf = Some(crate::book_order::finish_observed_mutation(
+            &root,
+            before,
+            crate::book_order::BookShelfMutation::Created(summary.book_name.clone()),
+        ));
+    }
+    Ok(result)
+}
+
+fn with_shelf_completion(
+    root: &Path,
+    before: Result<crate::book_order::BookShelfSnapshot, String>,
+    mutation: crate::book_order::BookShelfMutation,
+    result: BookOpResult,
+) -> BookOpResult {
+    BookOpResult::ShelfUpdated {
+        result: Box::new(result),
+        shelf: crate::book_order::finish_mutation(root, before, mutation),
+    }
 }
 
 pub(crate) fn append_pages_at(
@@ -1089,6 +1239,7 @@ fn append_pages_at_with_raw_observed(
             .ok()
     });
     let mut summary = BookAppendSummary {
+        shelf: None,
         book_name,
         folder,
         added,
@@ -1148,15 +1299,23 @@ pub fn transfer_pages_between_books(
     target_book_name: String,
     kind: BookTransferKind,
 ) -> Result<BookOpResult, String> {
-    transfer_pages_between_books_at(
+    let before = crate::book_order::read_snapshot(&root);
+    let result = transfer_pages_between_books_at(
         &crate::data_dir::get(),
-        root,
+        root.clone(),
         source_folder,
         current_order_paths,
         selected_paths,
         target_book_name,
         kind,
-    )
+    )?;
+    let mutation = match &result {
+        BookOpResult::Transfer(summary) => {
+            crate::book_order::BookShelfMutation::Created(summary.target_book_name.clone())
+        }
+        _ => unreachable!(),
+    };
+    Ok(with_shelf_completion(&root, before, mutation, result))
 }
 
 pub(crate) fn transfer_pages_between_books_at(
@@ -2642,6 +2801,8 @@ fn destination_for_existing_page(
 }
 
 fn next_page_number(folder: &Path) -> Result<usize, String> {
+    #[cfg(test)]
+    record_page_enumeration(folder);
     let mut max_page = 0usize;
     if !folder.exists() {
         return Ok(1);
@@ -2668,7 +2829,49 @@ fn book_page_count(folder: &Path) -> Result<usize, String> {
     Ok(book_page_paths(folder)?.len())
 }
 
+#[cfg(test)]
+thread_local! {
+    static PAGE_ENUMERATION_PATHS: std::cell::RefCell<Option<Vec<PathBuf>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn record_page_enumeration(folder: &Path) {
+    PAGE_ENUMERATION_PATHS.with(|paths| {
+        if let Some(paths) = paths.borrow_mut().as_mut() {
+            paths.push(folder.to_path_buf());
+        }
+    });
+}
+
+#[cfg(test)]
+struct PageEnumerationTrace;
+
+#[cfg(test)]
+impl PageEnumerationTrace {
+    fn start() -> Self {
+        PAGE_ENUMERATION_PATHS.with(|paths| {
+            assert!(paths.borrow_mut().replace(Vec::new()).is_none());
+        });
+        Self
+    }
+
+    fn paths(&self) -> Vec<PathBuf> {
+        PAGE_ENUMERATION_PATHS.with(|paths| paths.borrow().as_ref().unwrap().clone())
+    }
+}
+
+#[cfg(test)]
+impl Drop for PageEnumerationTrace {
+    fn drop(&mut self) {
+        PAGE_ENUMERATION_PATHS.with(|paths| *paths.borrow_mut() = None);
+    }
+}
+
 fn book_page_paths(folder: &Path) -> Result<Vec<PathBuf>, String> {
+    #[cfg(test)]
+    record_page_enumeration(folder);
     let mut paths = Vec::new();
     for entry in fs::read_dir(folder)
         .map_err(|e| format!("本フォルダを読み取れません: {}: {e}", folder.display()))?
@@ -2782,6 +2985,172 @@ fn sanitize_filename(input: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn append_through_shelf_wrapper(
+        public: bool,
+        root: &Path,
+        name: &str,
+        source: &Path,
+    ) -> BookAppendSummary {
+        let sources = vec![BookPageSource::File {
+            src: source.to_owned(),
+            original_name: "source.jpg".into(),
+        }];
+        let result = if public {
+            let raw = crate::raw::RawDecodeContext::new(
+                Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap()),
+                crate::raw::RawBrightness::None,
+            );
+            append_pages(root.to_owned(), name.into(), sources, &raw)
+        } else {
+            let data = crate::data_dir::get();
+            let stores = crate::book_append_undo::AppendMetadataStores::existing_at(&data);
+            append_pages_at_with_raw_and_shelf(
+                data,
+                root.to_owned(),
+                name.into(),
+                sources,
+                stores,
+                None,
+            )
+        }
+        .unwrap();
+        let BookOpResult::Append(summary) = result else {
+            panic!("expected Append result");
+        };
+        summary
+    }
+
+    fn shelf_order_fixture(root: &Path, mode: &str) -> Option<Vec<u8>> {
+        match mode {
+            "manual" => {
+                let snapshot = crate::book_order::read_snapshot(root).unwrap();
+                crate::book_order::write_order(
+                    root,
+                    snapshot.token().unwrap(),
+                    &crate::book_order::BookOrderPolicy::Manual(vec!["Z".into(), "A".into()]),
+                )
+                .unwrap();
+            }
+            "readonly" => {
+                fs::write(
+                    root.join(crate::book_order::ORDER_FILE_NAME),
+                    b"invalid order",
+                )
+                .unwrap();
+            }
+            "name" => {}
+            _ => unreachable!(),
+        }
+        fs::read(root.join(crate::book_order::ORDER_FILE_NAME)).ok()
+    }
+
+    #[test]
+    fn section1683_existing_append_public_and_runtime_never_enumerate_other_books() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        for public in [false, true] {
+            for mode in ["name", "manual", "readonly"] {
+                let root = data.path().join(format!("existing-{public}-{mode}"));
+                fs::create_dir_all(root.join("A")).unwrap();
+                fs::create_dir_all(root.join("Z")).unwrap();
+                fs::write(root.join("A/0001_first.jpg"), b"first").unwrap();
+                fs::write(root.join("Z/0001_unrelated.jpg"), b"unrelated").unwrap();
+                let before_order = shelf_order_fixture(&root, mode);
+                let source = data.path().join("source.jpg");
+                fs::write(&source, b"added").unwrap();
+                let trace = PageEnumerationTrace::start();
+                let summary = append_through_shelf_wrapper(public, &root, "A", &source);
+                let enumerated = trace.paths();
+                drop(trace);
+                assert!(
+                    !enumerated.is_empty(),
+                    "recorder must see target page enumeration"
+                );
+                assert!(
+                    enumerated.iter().all(|path| path == &root.join("A")),
+                    "public={public} mode={mode}: {enumerated:?}"
+                );
+                assert!(
+                    summary.shelf.is_none(),
+                    "existing Append must use the count delta"
+                );
+                assert_eq!(summary.added, 1);
+                assert!(summary.undo_files.is_some());
+                assert_eq!(fs::read(summary.first_path.unwrap()).unwrap(), b"added");
+                assert_eq!(
+                    fs::read(root.join(crate::book_order::ORDER_FILE_NAME)).ok(),
+                    before_order
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn section1683_new_append_public_and_runtime_maintain_order_after_creation_only() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        for public in [false, true] {
+            for mode in ["name", "manual", "readonly"] {
+                let root = data.path().join(format!("new-{public}-{mode}"));
+                fs::create_dir_all(root.join("A")).unwrap();
+                fs::create_dir_all(root.join("Z")).unwrap();
+                let before_order = shelf_order_fixture(&root, mode);
+                let source = data.path().join("source.jpg");
+                fs::write(&source, b"added").unwrap();
+                let trace = PageEnumerationTrace::start();
+                let mut summary = append_through_shelf_wrapper(public, &root, "B", &source);
+                let enumerated = trace.paths();
+                drop(trace);
+                // Only the final completed shelf snapshot enters sibling books.
+                // The pre-creation membership/token observation cannot do so.
+                for name in ["A", "Z"] {
+                    assert_eq!(
+                        enumerated
+                            .iter()
+                            .filter(|path| **path == root.join(name))
+                            .count(),
+                        1,
+                        "public={public} mode={mode}: {enumerated:?}"
+                    );
+                }
+                let shelf = summary.shelf.take().unwrap();
+                assert!(shelf.warning.is_none(), "{:?}", shelf.warning);
+                let snapshot = shelf.snapshot.unwrap();
+                assert_eq!(
+                    snapshot
+                        .rows
+                        .iter()
+                        .find(|row| row.name == "B")
+                        .unwrap()
+                        .page_count,
+                    1
+                );
+                let names = snapshot
+                    .rows
+                    .iter()
+                    .map(|row| row.name.as_str())
+                    .collect::<Vec<_>>();
+                if mode == "manual" {
+                    assert_eq!(names, ["Z", "A", "B"]);
+                    assert_eq!(
+                        snapshot.policy,
+                        crate::book_order::BookOrderPolicy::Manual(vec![
+                            "Z".into(),
+                            "A".into(),
+                            "B".into()
+                        ])
+                    );
+                } else {
+                    assert_eq!(names, ["A", "B", "Z"]);
+                    assert_eq!(
+                        fs::read(root.join(crate::book_order::ORDER_FILE_NAME)).ok(),
+                        before_order
+                    );
+                }
+                assert_eq!(snapshot.token().is_none(), mode == "readonly");
+                assert!(summary.undo_files.is_some());
+            }
+        }
+    }
 
     #[test]
     fn section1373_append_metadata_precedes_file_and_later_eight_store_edits_win() {
@@ -3383,6 +3752,83 @@ mod tests {
             ["A", "B"]
         );
         assert_eq!(rows[0].page_count, 2);
+    }
+
+    #[test]
+    fn section1683_existing_append_case_alias_keeps_cached_identity_and_manual_order() {
+        let root = Path::new("books");
+        let mut snapshot: crate::book_order::BookShelfSnapshot = ["Z", "Alpha", "A"]
+            .into_iter()
+            .map(|name| BookInfo {
+                name: name.into(),
+                path: root.join(name),
+                page_count: 4,
+            })
+            .collect::<Vec<_>>()
+            .into();
+        snapshot.policy = crate::book_order::BookOrderPolicy::Manual(vec![
+            "Z".into(),
+            "Alpha".into(),
+            "A".into(),
+        ]);
+        let token = snapshot.token().cloned();
+        apply_append_to_cached_shelf(&mut snapshot, "alpha", &root.join("alpha"), 2).unwrap();
+        assert_eq!(
+            snapshot
+                .rows
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Z", "Alpha", "A"]
+        );
+        assert_eq!(snapshot.rows[1].page_count, 6);
+        assert_eq!(snapshot.rows[1].path, root.join("Alpha"));
+        assert_eq!(snapshot.token(), token.as_ref());
+    }
+
+    #[test]
+    fn section1683_existing_uncached_append_resolves_membership_without_reordering_manual_rows() {
+        for manual in [false, true] {
+            let root = Path::new("books");
+            let mut snapshot: crate::book_order::BookShelfSnapshot = ["Z", "A"]
+                .into_iter()
+                .map(|name| BookInfo {
+                    name: name.into(),
+                    path: root.join(name),
+                    page_count: 4,
+                })
+                .collect::<Vec<_>>()
+                .into();
+            if manual {
+                snapshot.policy =
+                    crate::book_order::BookOrderPolicy::Manual(vec!["Z".into(), "A".into()]);
+            }
+            let token = snapshot.token().cloned();
+            apply_append_to_cached_shelf(&mut snapshot, "B", &root.join("B"), 2).unwrap();
+            let names = snapshot
+                .rows
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                if manual {
+                    ["Z", "A", "B"]
+                } else {
+                    ["A", "B", "Z"]
+                }
+            );
+            assert_eq!(
+                snapshot
+                    .rows
+                    .iter()
+                    .find(|row| row.name == "B")
+                    .unwrap()
+                    .page_count,
+                2
+            );
+            assert_eq!(snapshot.token(), token.as_ref());
+        }
     }
 
     #[test]
@@ -4424,6 +4870,49 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(root.join("old"), root.join("new"))]
         );
+    }
+
+    #[test]
+    fn section1683_case_only_management_rename_preserves_order_and_page_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("books");
+        fs::create_dir_all(root.join("Old")).unwrap();
+        fs::create_dir_all(root.join("A")).unwrap();
+        fs::write(root.join("Old/0001_page.jpg"), b"original").unwrap();
+        let snapshot = crate::book_order::read_snapshot(&root).unwrap();
+        crate::book_order::write_order(
+            &root,
+            snapshot.token().unwrap(),
+            &crate::book_order::BookOrderPolicy::Manual(vec!["Old".into(), "A".into()]),
+        )
+        .unwrap();
+        let before = crate::book_order::read_snapshot(&root);
+        let result = rename_book_at(&temp.path().join("data"), &root, "Old", "old").unwrap();
+        assert!(matches!(result, BookOpResult::Renamed { .. }));
+        let completion = crate::book_order::finish_mutation(
+            &root,
+            before,
+            crate::book_order::BookShelfMutation::Renamed {
+                old_name: "Old".into(),
+                new_name: "old".into(),
+            },
+        );
+        assert!(completion.warning.is_none(), "{:?}", completion.warning);
+        assert_eq!(
+            completion
+                .snapshot
+                .unwrap()
+                .rows
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["old", "A"]
+        );
+        assert_eq!(
+            fs::read(root.join("old/0001_page.jpg")).unwrap(),
+            b"original"
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
     }
     #[test]
     fn qualified_append_filters_latest_hidden_preserves_selection_order_and_dense_numbering() {

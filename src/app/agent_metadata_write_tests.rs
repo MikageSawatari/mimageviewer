@@ -126,6 +126,7 @@ fn agent_write_every_busy_precheck_refuses_without_mutation() {
                 app.book_op_pending = Some(crate::books::BookOpPending {
                     rx,
                     intent: crate::books::BookOpIntent::UndoAppend { receipt },
+                    shelf_scope: None,
                 });
                 WriteRefusal::AppendUndo
             }

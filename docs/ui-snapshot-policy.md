@@ -495,3 +495,26 @@ UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib local_adjust_panel_snapshot
 `notification_duration_preferences_dark_short_narrow`（260×145）で、本体と共通の全体設定helperを描く。
 3択の選択状態・狭幅の補足文の折り返しを確認する。App・実製品の起動は含めない。
 2枚は計35,683 bytes。生成画像を目視確認し、更新モードを外した通常比較も2件成功した。
+
+§1.683 の本棚管理は、App を構築せず製品と共通の Window / 本文 renderer を描く。
+既存 `book_manager_numbered_dark`（900×600、名前順6冊）を更新し、
+`book_manager_manual_light`（1093×614、手動順21冊）、
+`book_manager_saving_small_dark`（547×307 PNG、1093×614・200%相当の546.5×307論理領域）、
+`book_manager_unsaved_light`（700×460、1冊）、
+`book_manager_readonly_dark`（700×460、順序読取異常・名前順6冊）を追加した。
+各行の通常サイズ↑↓と端の無効化、方式ボタン、保存中/未保存/読取警告の明暗、
+短い状態表示の固定枠、名前欄と右端scrollbarの非重複を全5枚で目視確認した。
+合計428,180 bytes（約0.41 MiB）。製品起動・実IME・実保存をこのPNGの証拠にはしない。
+
+`saved_group_number_ui_tests` の標準geometryは2画面×実効倍率2通り×5状態×5冊数の100条件で、
+実wheelによる末尾到達・最終矢印と方式ボタンのclip/viewport内配置・可視行だけの描画を検査する。
+21冊/255文字名/深いrootを使う6条件はnative pixels-per-point 1.25/1.5/2.0を実際に設定し、
+546.5×307と折り返す350×460で物理pixelとGUI rounding後の行間隔・末尾到達を検査する。
+各行は宣言したslotを先に予約し、自然な本文の上限と隣接行の実stepを別に検査する。
+番号は先頭20冊、pinは保存なし/Manual/保存済みNameのresolver結果の部分列として検査する。
+実Enterで同じ本をviewport外へ18回移動し、最初の保存で最後の可視行を動かす境界も検査する。
+これらは状態表示のために本文の位置を変えず、組込scroll_toを即時適用してfocusを維持する回帰である。
+閉じた管理の保存中再表示は共有描画の実pointer clickで検査する。
+integrationの `book_manager_window_close_and_mode_controls_in_small_viewport` は12条件で×と方式ボタンを検査し、
+geometryの全組合せへPNGを増やさない。
+更新モードを外した `ui_snapshot` 全224件の通常比較も成功した。

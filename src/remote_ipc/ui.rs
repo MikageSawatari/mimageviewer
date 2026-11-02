@@ -6186,6 +6186,7 @@ mod tests {
                 if busy {
                     let (_tx, rx) = std::sync::mpsc::channel();
                     app.book_op_pending = Some(crate::books::BookOpPending {
+                        shelf_scope: None,
                         rx,
                         intent: crate::books::BookOpIntent::UndoAppend { receipt },
                     });
@@ -6286,6 +6287,7 @@ mod tests {
         let receipt = section1373_remote_receipt(&app);
         let (_worker, rx) = std::sync::mpsc::channel();
         app.book_op_pending = Some(crate::books::BookOpPending {
+            shelf_scope: None,
             rx,
             intent: crate::books::BookOpIntent::UndoAppend { receipt },
         });
@@ -6326,6 +6328,7 @@ mod tests {
             app.book_append_undo_receipt = Some(receipt.clone());
             let (_worker, rx) = std::sync::mpsc::channel();
             app.book_op_pending = Some(crate::books::BookOpPending {
+                shelf_scope: None,
                 rx,
                 intent: if undo_pending {
                     crate::books::BookOpIntent::UndoAppend { receipt }

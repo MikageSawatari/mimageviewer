@@ -591,7 +591,11 @@ impl App {
         self.poll_rename_migration_pending(ctx);
         self.poll_delete_purge_retry(ctx);
         self.poll_capture_pending(ctx);
-        self.poll_book_op_pending(ctx);
+        // ShelfOrder is App-global service work, already polled by the common
+        // logic service. Other book results may adopt visible viewer state.
+        if !self.book_order_service_pending() {
+            self.poll_book_op_pending(ctx);
+        }
         self.poll_book_structural_op(ctx);
         self.poll_saved_group_open(ctx);
         self.poll_pipeline_debug_export_pending(ctx);

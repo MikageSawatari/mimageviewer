@@ -1,5 +1,9 @@
 # 非同期・並列アーキテクチャ
 
+## 本棚順の単一writer（§1.683）
+
+一覧・本の操作・順保存は既存の製本pending受信口を共有する。`app/book_shelf`は送信済みmode/identity列と最新表示snapshotを分け、一件の書込が終わって異なる最新値があれば一件だけ送る。古い成功はtokenだけ進め、表示は戻さない。ShelfOrderの受信・後続送信・lease解放・終了再開はroot close受理後の共通logic serviceが所有し、LogicOnlyでも進む。他の本結果の表示採用はFull側に残す。管理closeはownerを破棄せず、通常終了は受理済みbatchの終端を既存root lifecycleへ非同期接続する。最初の順操作は既存製本・Shell操作・未完了openと排他し、Remote local modal leaseをbatch終端まで保持する。作成/新規本へのAppend/管理改名/削除/transferは同じworkerで順を保守して完成snapshotを返す。既存本Appendは追加先だけを処理し件数差分を採用する。新規Appendの事前観測は直下名と順序tokenだけで、ページ数は列挙しない。全結果はroot/選択epochで採用し、Listは要求revisionも照合する。root切替は旧List受信口とその番号continuationだけを退役し、捕捉済みmutation workerは保持する。[設計](book-order-plan.md)。
+
 ## 前回終了の単一 writerと現役AI失敗の通知（§1.482 段A〜D）
 
 `previous_run_diagnostics::GuiRunDiagnostics` は first admission 後に専用 worker を開始し、前回資料を読む→今回 Running を保存→main の終端を保存、の順序を所有する。AI等の実活動中だけ約1秒を目標にcheckpointを保存し、idleは周期起床なしでparkする。UI/App Drop では clean にせず、main 最終境界で共通2秒deadlineの残りだけを使う。結果と通知本文を返した `finish_run_native` の後、main が共通ログ・診断終端の保存を済ませてから native MessageBox を出す。初期化中の終了要求も同じ writer が直列化し、無期限 join/再試行/AI 完了待ちは追加しない。診断 lease の保有中は別 writer が資料を上書きしない。詳細は [確定設計](ai-crash-655-investigation.md#確定設計-2026-10-30)。
