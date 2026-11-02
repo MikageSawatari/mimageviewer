@@ -44,6 +44,7 @@ pub(crate) struct AppendMetadataStores {
     pub comic: bool,
     pub rating: bool,
     pub tags: bool,
+    pub ai_captions: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -75,6 +76,7 @@ impl AppendMetadataStores {
             comic: data_dir.join("comic.db").is_file(),
             rating: data_dir.join("rating.db").is_file(),
             tags: data_dir.join("tags.db").is_file(),
+            ai_captions: data_dir.join("ai_caption.db").is_file(),
         }
     }
 }
@@ -91,6 +93,7 @@ pub(crate) struct AppendMetadataWriter {
     comic: Option<crate::comic_db::ComicDb>,
     rating: Option<crate::rating_db::RatingDb>,
     tags: Option<crate::tags_db::TagsDb>,
+    ai_captions: Option<crate::ai_caption_db::CaptionDb>,
     report: BookAppendMetadataCopySummary,
 }
 
@@ -130,6 +133,11 @@ impl AppendMetadataWriter {
             comic: open_store!(stores.comic, "comic", crate::comic_db::ComicDb),
             rating: open_store!(stores.rating, "rating", crate::rating_db::RatingDb),
             tags: open_store!(stores.tags, "tags", crate::tags_db::TagsDb),
+            ai_captions: open_store!(
+                stores.ai_captions,
+                "ai_caption",
+                crate::ai_caption_db::CaptionDb
+            ),
             report: Default::default(),
         };
         writer.report.database_elapsed = started.elapsed();
@@ -148,7 +156,7 @@ impl AppendMetadataWriter {
         let semantic = semantic_source
             .or(full_source)
             .map(crate::adjustment_db::normalize_path);
-        // Preserve each store's global write epoch and publish all eight
+        // Preserve each store's global write epoch and publish the
         // committed initial values before the physical file becomes visible.
         let has_edit_store = self.adjustment.is_some()
             || self.local_adjust.is_some()
@@ -207,6 +215,12 @@ impl AppendMetadataWriter {
                     .map_err(|error| metadata_initialization_error("rating", error))?;
             }
             self.report.ratings.push(to.clone());
+        }
+        // Newly copied bytes have a new signature, so captions never follow a
+        // page copy. Clear a reused destination before publishing the file.
+        if let Some(db) = self.ai_captions.as_mut() {
+            db.delete(&to)
+                .map_err(|error| metadata_initialization_error("ai_caption", error))?;
         }
         if let Some(db) = self.tags.as_mut() {
             if let Some(from) = semantic.as_deref() {
@@ -1054,6 +1068,7 @@ pub(crate) mod append_test_support {
                 comic: true,
                 rating: true,
                 tags: true,
+                ai_captions: false,
             }
         }
 

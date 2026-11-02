@@ -569,6 +569,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `rotation_db.rs` / `rotation_cache.rs` | 非破壊回転の SQLite 永続化と context 所有の回転 memo。静止画シークの未読値は pending reader が非同期取得し、cache と要求寿命を一緒に交換・失効・破棄する |
 | `audio_normalize_db.rs` | 動画音量ノーマライズの per-file 測定値 (integrated LUFS / true peak / 算出ゲイン) の SQLite 永続化 |
 | `rating_db.rs` | レーティング (★1〜5) の SQLite 永続化 |
+| `ai_caption_db.rs` | ローカル AI 説明文の保存基盤（V1-2）。worker の保存役が `BEGIN IMMEDIATE` 後に入力署名を照合し、成功／失敗の上書き規則を適用する。DB trigger が全体 revision と索引反映待ちを管理し、STORES 経由の改名・削除・復元にも適用する。作成ジョブ・表示キャッシュ・検索接続は後段 |
 | `mask_db.rs` | 消しゴムマスクの SQLite 永続化 (1bit/pixel deflate 圧縮 + ベクタオブジェクト JSON) |
 | `conceal_db.rs` | 隠蔽加工マスクの SQLite 永続化。`mask_db.rs` と同じビットマップ + ベクタ構造を使い、マスクスロットも管理 |
 | `local-adjust-core` | 補正レイヤー合成 core。mIV 本体では消しゴム後・隠蔽加工前の非同期レイヤーとして使う |
@@ -709,6 +710,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `rotation.db` | 非破壊回転角 (0/90/180/270) | `rotation_db.rs` |
 | `audio_normalize.db` | 動画ファイル単位のノーマライズ測定値 (integrated LUFS / true peak / 算出ゲイン)。主キー `(path_lower, file_size, mtime_ms, target_lufs_milli)`。環境設定 → 動画・音声 → 動画から全件クリア可能 | `audio_normalize_db.rs` |
 | `rating.db` | レーティング (★1〜5、0 は未登録)。ページ単位 (画像/ZIP 内画像/PDF ページ) とコンテナ (フォルダ/ZIP/PDF 本体) を同一テーブルに格納。キー形式の違い (`::` の有無) で区別 | `rating_db.rs` |
+| `ai_caption.db`（未リリース） | schema 1。物理項目キーごとの説明文・画像内の文字・検索語・入力署名を保存。rollback journal、trigger による全体 revision と削除記録。STORES は Follow／ページコピーなし、ページ追加先は作成前に初期化。説明文だけでは内容同一性の台帳を作らず、既存台帳のある項目だけ復元に便乗する | `ai_caption_db.rs` |
 | `search_index.db` | Ctrl+S 用。お気に入り配下のフォルダ/ZIP/PDF/動画名索引 | `search_index_db.rs` |
 | `fts_index/` | Ctrl+G 用 Tantivy index (複数 segment + meta.json)。bigram 候補絞り込み。旧 `tags` STORED は tags.db 移行専用 | `fts_index.rs` → `ingest_worker.rs` |
 | `fts_meta.db` | ファイル単位の管理メタ (path / mtime / size / status=Ok\|Failed / index_generation)。検索原文は持たず Tantivy STORED に集約 | `fts_meta.rs` |
@@ -835,6 +837,12 @@ strict IPC v70のmode-only入口を追加した。構成editor固有のC7/C9はG
 
 ### 明示メタ情報転送 (`mimageviewer.meta.miv`)
 
+形式 v12 は保存済み AI 説明文の `ok` 行を物理項目へ追加する（仮想ページ・失敗行は対象外）。
+元の署名を保持して upsert し、欄が有効な記載項目の空は削除、未記載項目は保持する。
+`ai_caption.db` も rollback journal の ATTACH transaction に参加し、commit 後の実変更数と
+`ImportChangedSections.ai_captions` を後段の表示／索引への通知境界にする。
+v7〜v11 は説明文を保持し、本の構成の導入版は v11 に固定する。
+
 v2.7.0では安定化のためメニュー入口を一時非表示にしたが、v2.8.0の継続開発では
 `metadata_transfer::UI_ENABLED`を有効化して再公開する。
 
@@ -851,7 +859,7 @@ sidecarと同じ矩形と基準ラスタ寸法の組を保持する。ZIP / PDF 
 本単位表示トリムは実行時の`nav.tree.zip_path`と同じく変換後cache ZIP基点なので、実際に検出した
 source/cache originを移送先の決定的cache keyへ対応付ける。一方、代表サムネピンは
 `zip_pin_root_path`由来の元アーカイブsource keyを維持する。この非対称は実行時DB key体系に合わせたものとする。
-未リリースの開発ビルドだけが作成したv1〜v6 bundleは移行せず、v7だけを受け入れる。
+未リリースの開発ビルドだけが作成したv1〜v6 bundleは移行せず、v7〜v12を受け入れる。
 前回の未コミット検証で作成されたv6も、必須fieldを黙って補わずversion gateで明示的に拒否する。
 archive cache DB自体がない場合と対象行がない場合だけを未変換扱いにし、open / query失敗は
 ページメタ情報を黙って欠落させないようexport全体のエラーにする。

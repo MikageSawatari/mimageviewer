@@ -38,6 +38,7 @@ pub mod activity_gate;
 pub mod adjustment;
 pub mod adjustment_db;
 pub mod ai;
+pub mod ai_caption_db;
 mod app;
 pub mod detached_window_geometry;
 pub(crate) mod feedback;

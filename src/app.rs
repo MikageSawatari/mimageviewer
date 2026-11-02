@@ -53780,6 +53780,8 @@ impl App {
             comic: self.comic_db.is_some(),
             rating: self.rating_db.is_some(),
             tags: self.tags_db.is_some(),
+            // V1-2 has no UI caption handle. Discover the store on the worker below.
+            ai_captions: false,
         };
         // Capture the existing source-write FIFO before handing off Append.
         // The same worker waits before metadata initialization and publication.
@@ -53796,6 +53798,10 @@ impl App {
                         error
                     })?;
             }
+            let stores = crate::book_append_undo::AppendMetadataStores {
+                ai_captions: data_dir.join("ai_caption.db").is_file(),
+                ..stores
+            };
             crate::books::append_pages_at_with_raw(
                 data_dir,
                 root,
