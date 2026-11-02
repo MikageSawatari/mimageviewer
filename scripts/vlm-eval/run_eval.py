@@ -14,20 +14,72 @@ import statistics
 import time
 import urllib.request
 
-PROMPT_VERSION = "v0-1"
-PROMPT = (
-    "この画像に写っているものを日本語で説明してください。\n"
-    "caption: 1〜3 文、200 文字以内。写っていないことは書かない。\n"
-    "keywords: 画像を検索するときに使える日本語の語を 5〜15 個。"
-)
-SCHEMA = {
-    "type": "object",
-    "properties": {
-        "caption": {"type": "string"},
-        "keywords": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["caption", "keywords"],
+PROMPTS = {
+    "v0-1": (
+        "この画像に写っているものを日本語で説明してください。\n"
+        "caption: 1〜3 文、200 文字以内。写っていないことは書かない。\n"
+        "keywords: 画像を検索するときに使える日本語の語を 5〜15 個。"
+    ),
+    # v0-2: also copy visible text, title and authors (book covers etc.).
+    "v0-2": (
+        "この画像に写っているものを日本語で説明してください。\n"
+        "caption: 1〜3 文、200 文字以内。写っていないことは書かない。\n"
+        "title: 本・雑誌・作品の表紙などで題名が読み取れれば、書かれているとおりに書き写す。無ければ空文字。\n"
+        "authors: 作者名・著者名・サークル名が読み取れれば、書かれているとおりに書き写す。無ければ空の配列。\n"
+        "text: 画像の中で読み取れるその他の文字を、書かれているとおりに書き写す (200 文字以内)。無ければ空文字。推測で補わない。\n"
+        "keywords: 画像を検索するときに使える日本語の語を 5〜15 個。"
+    ),
+    # v0-3: one plain "text" field (no title/author split); text is for search only.
+    "v0-3": (
+        "この画像に写っているものを日本語で説明してください。\n"
+        "caption: 1〜3 文、200 文字以内。写っていないことは書かない。\n"
+        "text: 画像の中で読み取れる文字 (題名・作者名・看板・ラベルなど) を、書かれているとおりに書き写す (200 文字以内)。"
+        "無ければ空文字。推測で補わない。\n"
+        "keywords: 画像を検索するときに使える日本語の語を 5〜15 個。"
+    ),
 }
+SCHEMAS = {
+    "v0-1": {
+        "type": "object",
+        "properties": {
+            "caption": {"type": "string"},
+            "keywords": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["caption", "keywords"],
+    },
+    "v0-2": {
+        "type": "object",
+        "properties": {
+            "caption": {"type": "string"},
+            "title": {"type": "string"},
+            "authors": {"type": "array", "items": {"type": "string"}},
+            "text": {"type": "string"},
+            "keywords": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["caption", "title", "authors", "text", "keywords"],
+    },
+    "v0-3": {
+        "type": "object",
+        "properties": {
+            "caption": {"type": "string"},
+            "text": {"type": "string"},
+            "keywords": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["caption", "text", "keywords"],
+    },
+    # v0-3 prompt with the plan's limits (§6.4) written into the schema, so the
+    # grammar stops a runaway keyword list (seen once with v0-3).
+    "v0-3l": {
+        "type": "object",
+        "properties": {
+            "caption": {"type": "string", "maxLength": 400},
+            "text": {"type": "string", "maxLength": 400},
+            "keywords": {"type": "array", "items": {"type": "string", "maxLength": 40}, "maxItems": 20},
+        },
+        "required": ["caption", "text", "keywords"],
+    },
+}
+PROMPTS["v0-3l"] = PROMPTS["v0-3"]
 
 
 def post(url, body, timeout):
@@ -46,10 +98,13 @@ def main():
     ap.add_argument("--inputs", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--label", required=True)
-    ap.add_argument("--max-tokens", type=int, default=400)
+    ap.add_argument("--max-tokens", type=int, default=None, help="default 400 (v0-1) / 800 (others)")
     ap.add_argument("--no-schema", action="store_true")
     ap.add_argument("--timeout", type=int, default=600)
+    ap.add_argument("--prompt-version", default="v0-1", choices=sorted(PROMPTS))
     a = ap.parse_args()
+    if a.max_tokens is None:
+        a.max_tokens = 400 if a.prompt_version == "v0-1" else 800
 
     images = sorted(p for p in pathlib.Path(a.inputs).iterdir() if p.suffix.lower() == ".png")
     out = open(a.out, "w", encoding="utf-8")
@@ -62,7 +117,7 @@ def main():
                     "role": "user",
                     "content": [
                         {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}},
-                        {"type": "text", "text": PROMPT},
+                        {"type": "text", "text": PROMPTS[a.prompt_version]},
                     ],
                 }
             ],
@@ -73,10 +128,10 @@ def main():
         if not a.no_schema:
             body["response_format"] = {
                 "type": "json_schema",
-                "json_schema": {"name": "caption", "schema": SCHEMA},
+                "json_schema": {"name": "caption", "schema": SCHEMAS[a.prompt_version]},
             }
         t0 = time.perf_counter()
-        rec = {"label": a.label, "prompt_version": PROMPT_VERSION, "image": p.name, "index": i}
+        rec = {"label": a.label, "prompt_version": a.prompt_version, "image": p.name, "index": i}
         try:
             r = post(a.server.rstrip("/") + "/v1/chat/completions", body, a.timeout)
             rec["wall_s"] = round(time.perf_counter() - t0, 3)
@@ -94,6 +149,9 @@ def main():
                 rec["caption"] = obj.get("caption")
                 rec["keywords"] = obj.get("keywords")
                 rec["caption_chars"] = len(obj.get("caption") or "")
+                for f in ("title", "authors", "text"):
+                    if f in obj:
+                        rec[f] = obj[f]
             except Exception:
                 rec["json_ok"] = False
         except Exception as e:  # recorded, the run continues

@@ -545,6 +545,9 @@ impl Connection {
                     .lock()
                     .unwrap()
                     .record(&client.identity);
+                // The statement above releases the recent-apps lock before
+                // acquiring the installed UI state or requesting a repaint.
+                self.handlers.changes.request_ui_repaint();
             }
         }
     }

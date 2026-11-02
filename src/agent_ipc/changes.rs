@@ -153,6 +153,15 @@ impl ChangeController {
         matches!(*self.ui.lock().unwrap(), UiState::Ready(_))
     }
 
+    /// Wake the root UI without publishing a change record or notice.
+    /// Callers must release their record locks before calling this.
+    pub(crate) fn request_ui_repaint(&self) {
+        if let UiState::Starting(installed) | UiState::Ready(installed) = &*self.ui.lock().unwrap()
+        {
+            installed.ctx.request_repaint_of(egui::ViewportId::ROOT);
+        }
+    }
+
     /// Called once after acceptance. The record is visible before the notice.
     pub(crate) fn publish(&self, record: ChangeRecord) -> ChangeRecordId {
         let notice = record.notice.clone();
@@ -181,10 +190,7 @@ impl ChangeController {
             update(record);
             record.rows.truncate(MAX_CHANGE_ROWS);
         }
-        if let UiState::Starting(installed) | UiState::Ready(installed) = &*self.ui.lock().unwrap()
-        {
-            installed.ctx.request_repaint_of(egui::ViewportId::ROOT);
-        }
+        self.request_ui_repaint();
         true
     }
 }
