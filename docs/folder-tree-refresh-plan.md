@@ -2,7 +2,7 @@
 
 設計案 (2026-11-02、Codex)。v5 向け、ClaudeCode の採否・実装引き継ぎ用。
 調査基点は `tree-1686` / `3a193e50df91faed2969dd752ed780270a2ae3b0`。
-**設計だけを作成した。製品コードの変更、製品起動、再現試験、ビルド、コミットは行っていない。**
+§1〜9は初回提案の調査記録。**現在の実装範囲は§9.5の(a)+(c)であり、(b)の監視機構は実装しない。** 実装・検証は§10へ記録する。製品起動とコミットは実装担当では行わない。
 
 ## 1. 原因候補との照合と設計上の追加条件
 
@@ -125,7 +125,7 @@ hidden等で表示対象から外れただけの実在childは、cache/展開意
 - **現在地**: `active_path` はmainの採用済み現在地を表示するだけ。消失して行がなくなってもツリーrefreshは `load_folder` / `FolderPaneCommand::Open` / 履歴変更を起こさない。既存一覧のエラー・復帰判断へ委ねる。
 - **操作cursor**: path identityで保持。sort変更や取得開始・失敗でactiveへ戻さない。成功でcursorを含む実消失枝が確定した場合、既存 `repair_cursor_after_successful_refresh` と同じ可視active、なければ選択rootへ戻し、既存scroll-to-cursorを一度だけ要求する。hiddenで行が消える場合も可視cursorへの修復だけ行い、cache/展開破棄とは分ける。
 - **展開**: 同pathの追加・並べ替えは `user_expanded` / `auto_expanded` / `user_collapsed` を保持。折りたたみ中の子孫を勝手に再展開しない。実消失が確定した子孫だけ各集合から除去する。明示reload/drive操作/active変更に元からある規則は変えない。
-- **scroll**: 同じ `folder_pane_tree_scroll` のIDを保ち、refresh開始/失敗時は位置を変えない。自動成功時は交換直前の最上段可視pathと行内offsetをanchorにして、残存時は同位置へ復元する。anchor消失時は近い残存行/可視祖先へ寄せ、末尾のclampを許す。明示cursor移動や上記cursor修復のscroll要求を優先する。既存row高24ptを用いるメモリ内計算でありFS照会しない。drive切替や表示時の既存focus移動は自動refreshによるscroll保持とは別の能動規則のままにする。
+- **scroll**: 同じ `folder_pane_tree_scroll` のIDを保ち、refresh開始/失敗時は位置を変えない。自動成功時は交換直前の最上段可視pathと行内offsetをanchorにして、残存時は同位置へ復元する。anchor消失時は近い残存行/可視祖先へ寄せ、末尾のclampを許す。明示cursor移動や上記cursor修復のscroll要求を優先する。実際の行allocation高と縦item spacingから記録したpitchを用いるメモリ内計算でありFS照会しない。指定label高24ptはButton/textの最小寸法で拡張され得るため、pitchには使わない。drive切替や表示時の既存focus移動は自動refreshによるscroll保持とは別の能動規則のままにする。
 
 ## 8. テスト計画と受入条件
 
@@ -166,11 +166,90 @@ hidden等で表示対象から外れただけの実在childは、cache/展開意
 
 ## 9.5 設計担当の採否 (2026-11-02、ClaudeCode)
 
-- **採用: (a) 一覧で受理した実フォルダ観測のツリー親への通知 + (c) 再展開・再表示・ドライブ再選択/切替・main 再表示での再照合。(b) 展開枝の非再帰監視は見送る。** CLAUDE.md「設計の簡素化」による。(b) は監視 worker・登録 ticket・pane 表示 lease・logic service での退役・command channel 満杯時の合流など、状態と lifecycle を大きく増やす。報告 (>>707・710) の症状は「一覧の親は更新されるのにツリーに残る」「折りたたみ・再展開・ドライブ切替でも残る」で、(a)+(c) で閉じる。(a)+(c) で残るのは「一覧に出していない別の展開枝を開いたまま外部で変えた」場合だけで、これは再展開・再表示・既存の ↻ で取り直せる (割り切り)。(b) は利用者の報告や要望が出たときに、本書 §5.1 の監視節を土台に別途検討する。
+- **採用: (a) 一覧で受理した実フォルダ観測のツリー親への通知 + (c) 再展開・再表示・ドライブ再選択/切替・main 再表示での再照合。(b) 展開枝の非再帰監視は見送る。** CLAUDE.md「設計の簡素化」による。(b) は監視 worker・登録 ticket・pane 表示 lease・command channel 満杯時の合流など、状態と lifecycle を大きく増やす。報告 (>>707・710) の症状は「一覧の親は更新されるのにツリーに残る」「折りたたみ・再展開・ドライブ切替でも残る」で、(a)+(c) で閉じる。即時の自動反映を保証しない範囲は、別の展開枝、検索・ZIP/PDF表示中、一覧更新defer中、同pathの実体入れ替え、現在folder自身の消失も含む。現在folder自身の消失では一覧のmetadata失敗が走査前に戻るため通知がなく、親の再参加時の再照合で拾う。これらは再展開・再表示・drive選択・既存の ↻ で取り直す（割り切り）。(b) は利用者の報告や要望が出たときに、本書 §5.1 の監視節を土台に別途検討する。
 - 採用する部分: §1 の追加条件 (部分列挙・取消・分類失敗を成功扱いしない、hidden 除外と実消失の区別、成功で消えた枝を現在地同期や子の遅着で復活させない)、§2 の簡素化 (既存 `RefreshPreservingChildren` の受理境界への集約、手動 reload の契約維持)、§5 の排他 enum への集約と FollowUp 一件への合流、§5.1 の 1・2・4・5 (需要集合・祖先 reveal・需要離脱時の未確認化・以前 empty の collapsed leaf の再展開)、§5.2、§6 から (b) 固有の行を除いたもの、§7、§8 から監視固有の検査を除いたもの。§4 の一覧→ツリーの橋は `poll_external_rescan` の `accepted_now == true` の直後とする。
 - 見送る部分: §4 の「pane 監視 session」、§5.1 の 3 のうち監視登録、§5.1 の監視 worker / command channel / lease / logic service 退役 / callback 通知の段落、同 path の実体入れ替えを watch の affected path で検出する段落 (再表示と手動再取得で閉じる)、§8 の watch 登録・overflow・lease の検査。
 - (c) の再照合の入口は、需要へ新規参加した親を「同 options の cache があっても一度確認する」で実装する (§5.1 の 3 の監視を除いた部分)。毎 frame の `sync_to_active` は遷移がなければ何もしない。
+- main表示中断の通知は残す。既存main chrome実描画とROOT可視状態からpane走査だけを取消・未確認化し、復帰時に再参加する（監視leaseは作らない）。同一drive実クリックは明示再照合とする。現在地変更時だけ最初のmembership矛盾親を一度再確認する。非監視のexpanded emptyにもcollapse arrowを残す。Populate/RefreshPreservingChildrenのrequest方針は成功cache有無から導く。
 
 ## 10. 設計レビュー・検証記録
 
 本案はソース調査による提案。製品の実行観測はバックログに記録された報告者の結果だけであり、この作業で再現したものではない。独立レビューの結果は完了後に本節へ追記する。
+
+### 実装前照合・独立設計レビュー追補 (2026-11-02)
+
+§9.5を優先し、監視session/ticket/command channel/leaseは実装しない。採用範囲の補足:
+
+- 現在地変更時、祖先列の最初の既知membership矛盾親を一度だけ再確認する。同じ現在地の毎frame同期では再要求せず、確定消失枝を復活させない。
+- mainの描画中断は既存main chromeの実描画有無とROOT可視状態から通知し、pane走査だけ取消・未確認化する。復帰は需要へ再参加する。同一driveの実クリックも明示再確認にする。
+- expanded emptyにもcollapse arrowを残す。collapse後は未確認として再展開できる。
+- 行間隔は24ptではなく描画した行allocation高と縦item spacingから記録する実pitchを使う。
+- Populate/RefreshPreservingChildrenはrequestに持たず、成功cache有無から導く。明示reloadのみ先にcacheを消し、失敗は残存cacheを保持する。
+- (b)見送りの非自動範囲には、別の展開枝、検索・ZIP/PDF表示中、一覧更新defer中、同path実体入れ替え、現在folder自身の消失も含む。一覧のmetadata失敗は受理に到達しないため、親を再参加時に再照合して消失を取得する。
+
+コード照合: `poll_external_rescan`の既存owner/source/generation/projection検査と`accepted_now`を利用できる。paneはbundle swap対象外。main表示通知は`update_frame`のmain bars描画到達を外側へ返すだけにし、detached/fullscreen述語・viewport経路を変更しない。scan workerは`try_classify_dir_entry`を使い、hidden除外前membershipを返せる。上記以外に採用設計との矛盾なし。
+
+### 実装 (tree-1686 / ac412bb76上の未コミット差分)
+
+- `FolderPaneNode`が成功cacheと排他的scan stateを一つずつ所有する。適用方針をrequestから削除。Running中の通知はFollowUp一件、旧完了は非採用、options/需要離脱/表示中断/reloadは即時cancelとprivate Receiver退役。旧cache/受信payloadのdropは既存rayonへ渡す。
+- 完全な実directory membershipをhidden投影前にworkerで作る。entry/file_type/分類失敗と取消は成功にせず、失敗は旧cacheと既存row警告・logで終端する。成功した親から実消失子孫だけをcomponent境界で整理し、子の遅着と同じ現在地の同期による復活を止める。
+- 一覧橋は捕捉したmain identityとfolderを使い、Equal/Differentのacceptedだけ通知する。pane側はresident親だけ未確認化し、一覧/他窓への書戻し・新しい監視はない。
+- main表示は`update_frame`の既存chrome描画到達boolを外側で受け取る。ROOT不可視/最小化は既存logic service checkpointでpaneだけ中断する。実pane描画で復帰し、同一drive実選択とexpanded emptyのcollapse/reexpandも確認入口にした。新しいdetached/fullscreen述語やviewport処理は追加していない。
+- 自動成功時は同じScrollArea IDと実pitch（実allocation高+縦item spacing）のpath anchorを保持し、cursorの能動scroll要求を優先する。↻/GridReloadの全resetは維持する。
+- 開始/採用は各pump 4親まで。Queued/Running残存中は既存80ms repaint pollingを毎pass継続し、idleは新しいscan/repaintなし。worker送信wakeの新設はせず、既存paneの進行方式を再利用した。
+
+### 独立コードレビュー
+
+`gpt-6.1-sol / xhigh`、別context・read-only、ビルド/テスト重複実行なし。
+自動展開枝自身のcollapseを先行取得需要が無視するP2を指摘。自身のis_expandedと到達性の両方で需要を判定するよう修正し、empty/rootの再展開arrowも確認した。修正後のcoherent差分はコード観点ACCEPT。最終検証台帳・snapshotの確認は別途記録する。
+
+### 検証環境と途中の失敗
+
+- default features、Windows MSVC、`MSBUILDDISABLENODEREUSE=1`。製品起動/コミットなし。
+- 初回・2回目checkはTurboJPEGのCMake/MSBuild（parallel24/4）がexit1で止まり、製品型検査へ未到達。同じbundled sourceを既存target内で`cmake --build ... --target install --config Debug --parallel 1 -- /nr:false`として成功させた。
+- 以後はprocessだけ`TURBOJPEG_SOURCE=explicit`、`TURBOJPEG_LIB_DIR=target/section1686/turbo-explicit`（同じstatic libraryをturbojpeg.libとして実コピー）、`TURBOJPEG_INCLUDE_DIR=target/debug/build/turbojpeg-sys-e58481dd5d2e733f/out/include`、通常include補充の`CXXFLAGS`、`CARGO_BUILD_JOBS=4`を使用する。依存source、Cargo設定、build scriptは変更していない。再現用環境は`target/section1686/env.ps1`。
+- 3回目checkでegui ScrollArea Stateのprivate offset参照（製品1か所・test fixture1か所）を検出し、公開`unclamped_offset()`と実ScrollAreaへ渡す初期anchorに修正した。`check.log` / `check2.log` / `check3.log`を成功根拠にしない。最終結果は後記。
+- live UI、実機idle/perfは未実施。headless/fake-input/snapshotと区別し、製品は起動しない。
+- 初回焦点検査は44成功/3失敗。現在地testのSuspended直接代入とreload後root未展開を正規の状態遷移/fake backendへ直した。2回目は46成功/1失敗。実行行矩形の差は29ptで、指定label高24pt+spacing3ptの仮定が誤っていたことを確認した。Button/text最小寸法による実allocation高を返し、描画したgeometryからpitchを記録するよう製品を修正した。テストもviewport上端の実anchorを選び、未clip座標を比較する。初回/2回目を成功証拠にしない（`folder-pane.log` / `folder-pane2.log`）。
+
+### 最終検証台帳 (2026-11-02)
+
+対象は本worktreeの未コミット差分、default features、test/dev profile。製品起動・コミットなし。上記process環境を継続し、以後はcmdによるraw log転送と明示exitでPowerShellのnative stderr変換を避ける。
+
+| コマンド・範囲 | 結果 | 証跡 (`target/section1686/`) |
+| --- | --- | --- |
+| `cargo test -p mimageviewer --lib folder_pane -- --test-threads=2` | **47成功 / 失敗0**、実行18.36秒、exit0。実paneの同driveクリック、expanded empty再展開、実座標の深いanchor/逆順/cursor優先、報告経路とmain復帰A Equal/別枝B、受理資格、hidden、aaa/aaa2、私有応答、worker隔離を含む | `folder-pane4.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/section375/) \| test(/external_rescan/) \| test(/viewer_context_registry/) \| test(/folder_tree/) \| test(/reload/)' --no-fail-fast --retries 0 --no-tests fail` | **321成功 / 失敗0**、38.427秒、exit0。既存一覧/registry/手動更新/ソート・巡回を回帰 | `related.log` |
+| `UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot folder_pane_refresh -- --test-threads=2` | **2成功 / 失敗0**、exit0。light/dark新PNGを実装担当・独立reviewerが目視確認 | `snapshot-generate2.log`、`tests/snapshots/folder_pane_refresh_{light,dark}.png` |
+| `cargo test --test ui_snapshot -- --test-threads=4`（更新指定なし） | **220成功 / 失敗0**、75.24秒、exit0 | `snapshot-all.log` |
+| `cargo check -p mimageviewer --lib --tests` | exit0、47.24秒 | `check-final.log` |
+| `cargo fmt --check`、UI glyph / site cards、`git diff --check` | exit0。危険文字0、49cards・上限超過0 | `fmt-final.log`、`glyph.log`、`site-cards.log` |
+| `scripts/test-lib-full.ps1`（1回、source `42c758de…`） | **15,503成功 / 2失敗 / 71skip**、814.548秒、exit100。14slow / 2leakyを含む。成功扱いにしない | `lib-full.log`、`target/test-lib-full/runs/20261102T114744341Z-5cbad50b/junit.xml` |
+| 上記失敗2件を各単独3回、retryなし・test-threads1 | **6実行すべて成功**、各exit0。main chromeは約0.52秒、起動復元は約0.90〜0.95秒 | `isolated-before.json`、`isolated-before-{0,1}-{1,2,3}.log` |
+| fixture修正後 `nextest` の `folder_pane \| main_chrome::tests` | **55成功 / 失敗0**、2.552秒、exit0。a11y検査も有効 | `fixture-final.log` |
+| 修正後main chromeを各単独3回 | **3実行すべて成功**、各exit0 | `isolated-after.json`、`isolated-after-{1,2,3}.log` |
+| `scripts/test-full.ps1 -SuppressCrashDialogs`、`NEXTEST_TEST_THREADS=8` | **未完了 / exit101**。workspaceのno-run compileでlauncher入力exe不足。workspaceのテスト実行・doc・vendor後続へ未到達 | `full.log` |
+| fixture補正後 `cargo fmt --check` / `cargo check -p mimageviewer --lib --tests` | **各exit0**、check 46.81秒 | `fmt-post-fixture.log` / `check-post-fixture.log` |
+| `scripts/build-dev.ps1 -PreserveRuntime`（通常features / dev-runtime） | **exit0**。core 19分38秒、remote 2分05秒、EPUB worker 2分15秒。VCRT runtime4 / PE3成功。製品起動・プロセス停止なし | `build-dev.log` / `artifacts.json` / `target/vcrt-pe-reports/dev-runtime.json` |
+
+`folder-pane3.log`は追加testの廃止API `Context::style()` 参照でcompile失敗。既存`global_style()`へ直して上記47件で確認した。成功件数には含めない。
+
+初回snapshot生成は常時repaintするspinnerに対するHarness.runの静止待ちで2件失敗した。新規2件だけ、既存helperのanimated_steps=Some(12)へ変更して上記2件と全220件で確認した（製品描画と既存fixtureは不変）。
+
+全libの失敗は `main_chrome_folder_tree_clicks_follow_common_modal_ownership` のHarness.run 4pass超過（23passなら静止）と、`section1335_tray_explicit_book_list_hide_restore_keeps_normally_opened_and_backspace_lists` のlisting identity準備待ち上限超過。両方とも単独3回では再現しなかった。前者は入力/resizeの試験でありFS列挙完了の検査ではないため、既知cacheへfixtureを隔離し、全BlockerのassertionとHarness.runを維持した。旧blank-arrow用のaccessibility検査無効化も撤去した。test_treeは実drive一覧を保持し、1.5秒後の実drive再列挙によるtemp root変更を避ける。headerだけの同drive操作testは選択肢を明示し、同期入口を呼ばない。製品の同期I/O・待機・表示機能と、起動復元の待ち上限は変更しない。独立reviewerが単独6結果とこのtest隔離を確認してACCEPT。
+
+追加full gateは `target/release/mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe` の未配置で `crates/launcher/build.rs` が停止した。今回launcher/配布/ビルドlogicは変更しておらず、偽の入力や別sourceのexeを流用しない。この結果を全体gate成功と扱わず、release入力が揃った環境でのworkspace/doc/vendor gateを未検証として残す。必要な通常core確認用buildは別途`build-dev.ps1`で行う。
+
+### 利用者確認用成果物・引き継ぎ
+
+通常featuresの `target/dev-runtime/mimageviewer-core.exe` を作成済み（339,803,136 bytes、SHA-256 `1992F32CA9E16EEA30A190E8C097E40656ED334E5680972A64B886B187C3F462`）。同protocolのremoteとEPUB PDF workerも同じdirectoryに配置済み。3件の日時/size/hashは`target/section1686/artifacts.json`。エージェントは起動していない。実装担当はコミットせず、`tree-1686`の差分を設計担当へ渡す。
+
+このworktreeで利用者が起動するコマンド:
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+先にインストール版/tray常駐版を終了する（single-instance mutexを共有）。このfast buildは通常の `%APPDATA%\mimageviewer` を使い、実設定・data/cacheを更新し得る。手動確認は、一覧の親を開いたまま外部でaaaを移動/削除したときツリーからも消えること、空枝のcollapse→外部子作成→reexpand、一覧Aを変えず別の展開Bを変更したmain復帰、既に展開中のdataへ外部でnewを追加してアドレス入力で開いた場合の祖先表示を対象とする。live UI/idle/perfは未実施であり、headless成功と読み替えない。
+
+コード観点の独立reviewはACCEPT。独立reviewerも焦点/単独/snapshot/check/buildログと3exeの実hash一致、利用者向け手順・検証制限の記載を確認した。全体gate未完了と実機未確認を残し、release入力が揃った環境でのfull gateと最終受入・コミットは設計担当に引き継ぐ。

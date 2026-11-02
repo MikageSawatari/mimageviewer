@@ -336,7 +336,8 @@ mod tests {
         std::fs::create_dir_all(&destination).unwrap();
         env.current_folder = None;
         env.settings.folder_tree_pane_visible = true;
-        env.folder_pane.select_drive(destination.clone());
+        // This fixture owns click/resize routing, not completion of filesystem I/O.
+        env.folder_pane = crate::folder_pane::FolderPaneState::test_tree(&destination, vec![]);
         let label = crate::folder_pane::folder_label(&destination);
         let app = Rc::new(RefCell::new(env));
         let render = Rc::clone(&app);
@@ -347,9 +348,6 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(800.0, 480.0))
-            // Existing leaf expanders are blank buttons; this test owns input
-            // routing and resize behavior, not the separate accessibility defect.
-            .with_accessibility_check(false)
             .build_ui(move |root_ui| {
                 let mut app = render.borrow_mut();
                 app.note_main_chrome_pointer_block_transition(root_ui.ctx());
