@@ -570,6 +570,8 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `audio_normalize_db.rs` | 動画音量ノーマライズの per-file 測定値 (integrated LUFS / true peak / 算出ゲイン) の SQLite 永続化 |
 | `rating_db.rs` | レーティング (★1〜5) の SQLite 永続化 |
 | `ai_caption_db.rs` | ローカル AI 説明文の保存基盤（V1-2）。worker の保存役が `BEGIN IMMEDIATE` 後に入力署名を照合し、成功／失敗の上書き規則を適用する。DB trigger が全体 revision と索引反映待ちを管理し、STORES 経由の改名・削除・復元にも適用する。作成ジョブ・表示キャッシュ・検索接続は後段 |
+| `vlm_addon.rs` / `vlm_addon_download.rs` | ローカル AI 説明文モデルの導入 (V1-3b)。固定配布一覧・安全な名前・分割と全体の SHA-256 を検証する。App の単一 owner が導入／取消／削除を完了通知まで排他にし、状態確認・HTTP・連結・配置・削除は worker 上だけで行う |
+| `ui_dialogs/vlm_addon.rs` | GPU 判定を必要時に一度だけ worker で実行し、設定ページへ cached view を渡す。初回の確認だけ modal、長い取得は modeless。対象パスを完了 hook へ一回渡す受け口を置き、作成ジョブとの接続は V1-3c |
 | `mask_db.rs` | 消しゴムマスクの SQLite 永続化 (1bit/pixel deflate 圧縮 + ベクタオブジェクト JSON) |
 | `conceal_db.rs` | 隠蔽加工マスクの SQLite 永続化。`mask_db.rs` と同じビットマップ + ベクタ構造を使い、マスクスロットも管理 |
 | `local-adjust-core` | 補正レイヤー合成 core。mIV 本体では消しゴム後・隠蔽加工前の非同期レイヤーとして使う |

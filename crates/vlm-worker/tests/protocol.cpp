@@ -1,4 +1,5 @@
 #include "protocol.h"
+#include "prompt.h"
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -73,8 +74,11 @@ int main() {
     auto at_limit = hello + std::string(kMaxFrame - 4 - hello.size(), ' ');
     check(validate(decode(encode(at_limit))) == Kind::Hello);
     std::ostringstream response;
-    write(response, {{"type", "hello"}, {"protocol_version", kVersion}, {"source_identity", "identity"}});
-    check(decode(response.str()).header["protocol_version"] == 1);
+    write(response, {{"type", "hello"}, {"protocol_version", kVersion}, {"source_identity", "identity"},
+        {"prompt_version", kPromptVersion}});
+    auto hello_response = decode(response.str()).header;
+    check(hello_response["protocol_version"] == 2);
+    check(hello_response["prompt_version"].is_number_integer() && hello_response["prompt_version"] == 1);
     invalid([&] { std::ostringstream out; write(out, {{"large", std::string(kMaxFrame, 'x')}}); });
     Session session;
     invalid([&] { session.accept(Kind::Caption); });

@@ -1,6 +1,7 @@
 # ローカル AI 説明文 V1 worker
 
-Windows x64 の worker と Rust client の開発用構成。作成ジョブ・UI・DB には未接続。
+Windows x64 の worker と Rust client。GPU 判定・モデル導入の設定画面へ接続済み。
+画像から説明文を作成して DB へ保存するジョブは後続段階で接続する。
 製品バイナリ、通常の設定 DB、HTTP server を起動しない。
 `vendor/llama.cpp` は変更しない。画像は元の場所から読み、JSONL はリポジトリ外の runs に保存する。
 画像・説明文の内容をレビュー文書やリポジトリへ転載しない。
@@ -97,7 +98,7 @@ Vulkan-Hppの `vk::<型名>::<API名>`＋定義済みのメモリ不足/device�
 元の `run_eval.py` の v0-3l（40文字）は過去比較用として変更せず、worker の `prompt.h` の `kSchema` を32文字にする。
 JSONL の `prompt_version=v0-3l` は元の評価条件名を引き継ぐが、現在の worker の schema 上限は32文字である。
 
-## 常駐用の通信 (`--serve`、protocol version 1)
+## 常駐用の通信 (`--serve`、protocol version 2)
 
 stdin/stdout の匿名パイプを CRT の `_O_BINARY` にし、stdout は枠の出力だけに使う。
 llama/ggml/mtmd の callback は stderr へ向ける。ネットワーク、共有メモリ、worker 側の画像デコードは使わない。
@@ -111,7 +112,7 @@ llama/ggml/mtmd の callback は stderr へ向ける。ネットワーク、共�
 
 | 要求のJSON | 応答のJSON |
 | --- | --- |
-| `{"type":"hello"}` | `type="hello"`, `protocol_version=1`, `source_identity` (64桁のSHA-256) |
+| `{"type":"hello"}` | `type="hello"`, `protocol_version=2`, `prompt_version=1`, `source_identity` (64桁のSHA-256) |
 | `{"type":"load","model_path":"...","mmproj_path":"...","device_luid":"HIGH:LOW","cpu_threads":24}` | `type="load"`, `status="ok"`, `model_load_s`, `device`。読込失敗は `status="fatal"`, `error` を返して終了 |
 | `{"type":"caption","request_id":1,"width":1024,"height":768}` + RGB | `type="caption"`, 同じ `request_id`, `status="ok"` / `"image_failure"` / `"fatal"`, `wall_s`。成功時は `caption`, `text`, `keywords`, `content`, `finish_reason`, `validation`, `generated_tokens`, `usage`, `timings`, `prompt_chunks` |
 | `{"type":"shutdown"}` | 応答せず終了 |
@@ -130,7 +131,11 @@ LUID は各8桁16進数を `:` で結び、空なら既定GPUを選ぶ。load後
 source identity は `CMakeLists.txt`, `src/*.{cpp,h}`, `tests/*.cpp`, `tools/source-identity.ps1` が対象。
 CRLFだけをバイト単位でLFにし、各SHA-256をordinal順のslash相対名 `name:hash\n` に連結してさらにSHA-256化する。
 ビルド時に同じPowerShellスクリプトで再計算する。vendorコードや生成物は対象外。
-V1-1ではhelloで報告するだけで、親側の配布source identity照合はV1-3の範囲。
+`MIV_VLM_SOURCE_SHA256:<hash>` を PE に 1 つ焼き込む。配布時の source identity gate は
+`scripts/vlm-worker-identity.ps1` が worker を実行せずに現ソースと照合する。
+release Cargo build・通常版の署名と内包前・portable のコピー前に検査し、再利用でも省略しない。
+製品の `prompt_version` は `ai_caption.db` と同じ整数 (現在 1)。selftest JSONL の
+`v0-3l` は従来の比較条件名として残し、製品の版とは区別する。
 
 CTestの `vlm-protocol` はバイナリ画素（NUL/CR/LF/0x1Aを含む）、u64最大、16MiB境界、途中EOF、
 内外長さ、JSON/UTF-8、必須欄、RGB寸法/量、要求順序を非モデルテストで確認する。
@@ -148,8 +153,13 @@ V1-3 の持ち主は worker スレッドで `worker_executable()` → `VlmWorker
 通常の中止は今の1件の完了後に結果を捨てて `shutdown()`、アプリ終了は App の kill handle から直ちに `kill()`。
 終了は子を先に止め、I/O thread の join は待たない。client は再起動・再試行しない。
 Rust 側でも終了理由・完全JSON・3欄の型/内容一致・Unicode文字数の上限を検査する。
-worker の場所は `MIV_VLM_WORKER` → repository の `vendor/vlm-worker/mimageviewer-vlm.exe`。
-内包・展開・identity照合・署名は V1-3 の範囲。
+worker の場所は debug build だけ `MIV_VLM_WORKER` を優先し、その後 portable は exe の隣、
+通常版は core 内包の worker を `<data_dir>/vlm/workers/<内容のSHA256>/` に展開する。
+展開は worker スレッド上で VST3 と同じ regular-file 検査・全バイト照合・一時ファイルからの置換を使う。
+reparse point を拒否し、旧版は消さない。実行時は protocol と prompt_version を照合し、source identity は比較しない。
+GPU の利用条件は選択した同一 device が Vulkan 対応かつ専用 VRAM 総量 7.5GiB 以上。
+通常版・portable の build は `scripts/build-vlm-worker.ps1` で native worker を先に再ビルドする。
+署名は通常版が内包前、portable がコピー後に行う。
 
 ```powershell
 cargo nextest run -p mimageviewer --lib -E 'test(/ai::vlm_worker::tests/) | test(/job_process::tests/) | test(/epub_convert::tests/)'

@@ -513,6 +513,48 @@ VST のロゴは使用しない。名称の文字表記も商標ガイドライ�
 文字表記によってガイドラインを回避できるとは扱わない。この記録は採用した表記方針を
 示すもので、ガイドラインへの適合や商標侵害の有無を断定するものではない。
 
+## ローカル AI 説明文 worker
+
+`crates/vlm-worker` は llama.cpp b12032 (commit
+`dde879bc4f954b809892fd0d660515f42536394a`) の ggml / llama / mtmd と
+MSVC CRT を静的リンクする。`vendor/llama.cpp` は変更しない。
+Vulkan SDK `C:\VulkanSDK\1.4.363.0` と Visual Studio 18 2026 の C++ build tools が必要。
+モデルの取得や起動をせず、リポジトリルートで次を実行する。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+$env:VULKAN_SDK = 'C:\VulkanSDK\1.4.363.0'
+.\scripts\build-vlm-worker.ps1
+```
+
+出力は `vendor/vlm-worker/mimageviewer-vlm.exe`。bootstrap は worker と llama.cpp を取得しない。
+不足時の Cargo build は復旧案内付きで停止する。詳細な固定条件・CTest は
+[worker README](../crates/vlm-worker/README.md) を参照。
+
+通常版は core に worker を内包し、worker スレッドで
+`<data_dir>/vlm/workers/<exe の SHA256>/mimageviewer-vlm.exe` に展開する。
+VST3 と同じ regular-file 検査・全バイト照合・一時ファイルからの置換を使い、
+reparse point を拒否し、旧版は残す。portable は exe の隣に配置する。
+`MIV_VLM_WORKER` による上書きは debug build だけで有効。
+
+source identity は `tools/source-identity.ps1` で計算した hash を
+`MIV_VLM_SOURCE_SHA256:` marker として PE に 1 つ焼き込む。
+`scripts/vlm-worker-identity.ps1` は実行せずに marker の個数と現ソースとの一致を検査する。
+release Cargo (portable を含む)・build-release の署名前と core 内包前・
+build-portable のコピー前すべてで検査し、`-SkipBuild` の再利用でも省略しない。
+build-release / build-portable は native worker を先に build する。
+署名時は通常版が内包前に vendor exe を署名し、portable はコピー後の PE 一覧に含めて署名・検証する。
+protocol 2 の hello では DB と同じ整数の `prompt_version=1` も照合し、実行時には source identity を比較しない。
+非起動の回帰検査は `powershell -NoProfile -File scripts/test-vlm-worker-identity.ps1`。
+
+root の `VLM-WORKER-LICENSE.txt` を about の全文表示と portable の loose file に使う。
+llama.cpp / ggml / libmtmd の root MIT に加え、現 CMake 構成で有効な
+llamafile (Mozilla MIT)、rotate-bits、xxHash、JSON for Modern C++、stb_image、miniaudio、
+SHA の public-domain 表記、SDK の Vulkan / SPIR-V header の MIT 表記を含む。
+`GGML_LLAMAFILE=ON`、`MTMD_VIDEO=OFF` (subprocess header は未使用)、Vulkan loader は
+OS / driver 側の依存で再配布しない。native / SDK 更新時はリンク対象と header 内の著作権・許諾文も照合し、
+この notice を更新する。追加ダウンロードするモデルの Apache 2.0 LICENSE / NOTICE は別に保持する。
+
 ## libavif / dav1d / libyuv の静的リンク（§1.407）
 
 AVIF は libavif 1.4.2、dav1d 1.5.3、libyuv

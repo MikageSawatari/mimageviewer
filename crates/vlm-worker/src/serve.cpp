@@ -2,6 +2,7 @@
 #include "protocol.h"
 #include "inference.h"
 #include "build_identity.h"
+#include "prompt.h"
 #include <fcntl.h>
 #include <io.h>
 #include <iostream>
@@ -18,7 +19,7 @@ int serve() {
         if (kind == protocol::Kind::Shutdown) return 0;
         if (kind == protocol::Kind::Hello) {
             protocol::write(std::cout, {{"type", "hello"}, {"protocol_version", protocol::kVersion},
-                {"source_identity", MIV_VLM_SOURCE_SHA256}});
+                {"source_identity", MIV_VLM_SOURCE_SHA256}, {"prompt_version", kPromptVersion}});
             continue;
         }
         if (kind == protocol::Kind::Load) {

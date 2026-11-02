@@ -2,6 +2,27 @@ use super::*;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+#[test]
+fn worker_resolution_precedence_covers_debug_release_and_both_flavors_without_io() {
+    use WorkerExecutableSource::{Bundled, Embedded, Override};
+    let path = "synthetic-override.exe";
+    for (debug, portable, supplied, expected) in [
+        (false, false, None, Embedded),
+        (false, false, Some(path), Embedded),
+        (false, true, None, Bundled),
+        (false, true, Some(path), Bundled),
+        (true, false, None, Embedded),
+        (true, false, Some(path), Override(path.into())),
+        (true, true, None, Bundled),
+        (true, true, Some(path), Override(path.into())),
+    ] {
+        assert_eq!(
+            worker_executable_source(debug, portable, supplied.map(OsString::from)),
+            expected
+        );
+    }
+}
+
 fn fake_worker() -> &'static Path {
     use sha2::{Digest as _, Sha256};
 
@@ -137,6 +158,30 @@ fn incompatible_hello_version_is_rejected() {
         VlmWorkerClient::spawn_with(fake_worker(), &args("hello-version"), budgets()),
         Err(VlmError::Protocol(_))
     ));
+}
+
+#[test]
+fn incompatible_or_missing_prompt_version_is_rejected_and_worker_is_retired() {
+    for mode in ["hello-prompt", "hello-missing-prompt"] {
+        let mut client =
+            VlmWorkerClient::start_with(fake_worker(), &args(mode), budgets()).unwrap();
+        assert!(matches!(client.hello(), Err(VlmError::Protocol(_))));
+        assert_poisoned(&mut client);
+    }
+}
+
+#[test]
+fn gpu_eligibility_uses_vulkan_and_exact_seven_point_five_gib_boundary() {
+    for bytes in [MIN_VRAM_BYTES - 1, MIN_VRAM_BYTES, MIN_VRAM_BYTES + 1] {
+        for vulkan in [false, true] {
+            let gpu = GpuDecision {
+                device: None,
+                vram_total_bytes: bytes,
+                vulkan_available: vulkan,
+            };
+            assert_eq!(gpu.is_eligible(), vulkan && bytes >= 8_053_063_680);
+        }
+    }
 }
 
 #[test]

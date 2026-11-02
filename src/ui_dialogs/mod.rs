@@ -58,6 +58,11 @@ pub(crate) mod trt_worker_notice;
 mod update_notice;
 pub(crate) mod video_upscale;
 #[cfg(windows)]
+pub(crate) mod vlm_addon;
+#[cfg(not(windows))]
+#[path = "vlm_addon_unavailable.rs"]
+pub(crate) mod vlm_addon;
+#[cfg(windows)]
 mod vst3_actions;
 #[cfg(windows)]
 mod vst3_manager;

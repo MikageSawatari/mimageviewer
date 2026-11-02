@@ -116,11 +116,17 @@ fn main() {
             if mode == "stall-hello" {
                 stall();
             }
-            let version = if mode == "hello-version" { 999 } else { 1 };
+            let version = if mode == "hello-version" { 999 } else { 2 };
+            let prompt = if mode == "hello-prompt" { "999" } else { "1" };
+            let prompt_field = if mode == "hello-missing-prompt" {
+                String::new()
+            } else {
+                format!(",\"prompt_version\":{prompt}")
+            };
             send(
                 &mut output,
                 &format!(
-                    "{{\"type\":\"hello\",\"protocol_version\":{version},\"source_identity\":\"fake-worker-v1\"}}"
+                    "{{\"type\":\"hello\",\"protocol_version\":{version},\"source_identity\":\"fake-worker-v1\"{prompt_field}}}"
                 ),
                 &[],
             );

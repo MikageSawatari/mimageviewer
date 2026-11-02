@@ -139,13 +139,9 @@ v5 に入れることが決まった (2026-11-02、v5 統合担当から連絡)�
 ## 5. モデルの配布
 
 - **2026-11-03 改め (U20)**: 配布元は mIV 側で量子化したモデル (GitHub Releases、分割) にした。下の Hugging Face から直接取る案は採らない。詳細は §21.7.1。
-- 保存先: `%APPDATA%/mimageviewer/addons/vlm/<model-id>/` (編集用追加パックと同じ構造で、`manifest.json` が有効なものを指す)。
-- 取得元: Qwen3.5-4B の GGUF は本体 2.74GB + mmproj 0.67GB で (§3.3)、本体は GitHub Releases の 1 ファイル 2GB の上限を超える。
-  Qwen 公式の GGUF は無く、V0 では unsloth/Qwen3.5-4B-GGUF (コミット `e87f1764`) を使った。第三者の量子化を配布元にしてよいか、
-  公式の重みから mIV 側で量子化して置くかは独立レビューの論点とする。
-  **提供元の Hugging Face リポジトリから、コミットを固定した URL で直接取得する**案を推奨する。
-  mIV 側の一覧 (GitHub Releases に置く小さな index) には、URL・固定コミット・sha256・サイズ・ライセンスを書く。
-  index 自体は既存の追加パックと同じく https + 検証で取得する。
+- 保存先: `<data_dir>/addons/vlm/packs/<model_id>/`。`INSTALL_OK` と `active.json` で導入済みを判定する。
+- 取得元: mIV の固定 GitHub Releases `vlm-model-v1`。公式の重みから mIV 側で量子化した本体と mmproj、LICENSE、NOTICE を配る (§21.7.1)。
+  本体は 2GiB 未満の部分に分割する。index の schema、ファイル・部分のサイズと SHA-256 を検証し、全体の検証後だけ有効にする。
 - 取得: 既存と同じく `.partial` への Range 再開・再試行・sha256 の照合。取得は利用者の明示操作でだけ始める。
 - ライセンス: モデルの Apache 2.0 の本文と NOTICE、llama.cpp / ggml の MIT をライセンス表示に加える。
 - 削除: 設定画面からモデルを削除できる (1 モデルなので項目は 1 つ)。説明文はモデルを消しても残る。
@@ -173,9 +169,9 @@ v5 に入れることが決まった (2026-11-02、v5 統合担当から連絡)�
     - ボタン: [ダウンロード] [今はしない]。
   - **VRAM の総量が 8GB 未満のとき**は、取得を勧めず「この PC の GPU では使えません (VRAM 8GB 以上が必要)」とだけ出す (U1)。
     Vulkan が使えないときも同様 (U7)。
-  - 取得中は進捗の画面 (モーダル、キャンセル可) を出す。取得と検証は worker で行い、UI スレッドは止めない。
+  - 取得中は進捗の画面 (modeless、キャンセル可。§21.7.2 で改定) を出す。取得と検証は worker で行い、UI スレッドは止めない。
     キャンセルと失敗の扱いは編集用追加パックと同じ (`.partial` を残して次回に再開、失敗はログ + 通知)。
-  - 取得が終わったら、選んでいた項目で作成ジョブを始める。取得中はモーダルなので一覧の操作は入らず、対象はクリックした時点のまま扱える。
+  - 取得が終わったら、選んでいた項目で作成ジョブを始める。対象はクリックした時点のパスを持ち、取得中に一覧を動かしても変えない。
     ただし取得は数分かかり得るので、この間に画面外 (エクスプローラーなど) で対象が消えた場合は、ジョブ側の「対象のファイルがもう無い」(§6.5) で扱う。
 
 ### 6.2 1 件の流れ
@@ -567,7 +563,7 @@ AI 補正の VRAM 使用量は実測の記録が無い。ONNX Runtime の確保�
 
 ## 13. 安全性・プライバシー・公開文書
 
-- 推論は PC 内で完結する。新しく生じる通信は**モデルのダウンロード (利用者の操作時、huggingface.co と GitHub)** だけ。
+- 推論は PC 内で完結する。新しく生じる通信は**モデルのダウンロード (利用者の操作時、GitHub Releases)** だけ。
 - 説明文はローカルの `ai_caption.db` と索引に保存する。MCP のチェックが ON のときだけ AI アプリへ渡る。
 - 説明文は画像の内容を表す文字列で、ファイルの場所と合わせると敏感な情報になり得る。
   §5.6 の「AI に見せるもの」に明記する。
@@ -1340,3 +1336,75 @@ source identity を起動せずに確かめる関門 (P2) / ポータブル版�
 ### 19.17 17 回目 (2026-11-03、同じ担当の続き、基準 `49560b893`)
 
 16 回目の 1 件は閉じ、新しい指摘は無かった。V1-3 の設計 (§21.7) のレビューはここで閉じる。
+
+### 21.8 V1-3b の実装記録 (2026-11-03、実機未確認)
+
+- 対象は §21.7.2。作成ジョブ・右クリック・ジョブ進捗・本の表紙は未接続。公開用モデル・index の生成やアップロード、`htdocs/` の更新はしていない。
+- worker の解決は debug の `MIV_VLM_WORKER` → portable の exe 隣 / 通常版の内容別展開。
+  展開は VST3 の `plain_directory` / `ensure_bytes` を共用し、背景 thread からのみ呼ぶ。
+  protocol は 2、`hello.prompt_version` は DB の INTEGER と整合する整数 1。selftest の比較ラベル `v0-3l` とは用途を分ける。
+- `scripts/vlm-worker-identity.ps1` が現在のソースと PE 内の一意な marker を非起動で照合する。
+  release core build と release/portable script に接続し、portable の `-SkipBuild` も gate を通る。
+  署名は内包前／portable の配置後・zip 前。モデルの重みは内包しない。
+- `VlmAddon` は `WorkerState::{Idle,Scanning,Installing,Cancelling,Removing}` を内部の唯一の実行所有者とする。
+  公開操作状態は `None/Installing/Cancelling/Removing`、scan は別の read-only 射影。完了を poll で受け取るまで次操作を拒否する。
+  初回 scan と GPU 判定は必要時に背景で一度だけ行い、UI は cached view を読む。
+- 新しい HTTP 部品は VLM 専用とし、既存の編集／TensorRT 取得実装を移していない。
+  固定 `vlm-model-v1` URL を使い、`MIV_VLM_MODEL_BASE_URL` は debug だけで有効。
+  分割 `.partial` の検証後に連結し、全体 hash が一致してから部分を削除する。
+  同じ model_id の検証済み staging 出力も再開時に再利用する (mmproj 取得中の中止で本体を再取得しない)。
+- まれな I/O 失敗はログと通知で割り切り、回復状態やロールバックは追加しない。
+  普通に起こる取消と再要求だけは同じ owner の完了境界で排他にする。
+- 初回確認・削除確認は modal、取得と終端の窓は modeless。設定ページからの管理と debug の開発入口だけを接続。
+  `App::request_vlm_caption_setup(ctx, paths)` がパスを保持し、成功時だけ `on_vlm_caption_targets_ready(paths)` へ一回渡す。
+  後者の本体と `vlm_caption_job_running()` の判定を V1-3c が接続する。設定からの導入は空パスでジョブを始めない。
+  取消／失敗／窓を閉じたときは対象を破棄し、再要求を待ち行列に足さない。
+
+**配布 index schema 1** (`ModelIndex` / `ModelFile` / `ModelPart`)
+
+トップレベルは `schema: 1`、`model_id`、`files`。`files` は次の4件を持つ。
+各件に `name`、`kind`、`bytes` (正の整数)、`sha256` (64桁hex)、`license: "Apache-2.0"`、`parts` (省略時空配列) を持つ。
+
+| kind | name | parts |
+| --- | --- | --- |
+| `model` | 本体の `.gguf` 名 | 順序付きの `{name,bytes,sha256}`。各部分は2GiB未満、合計は全体のbytesと一致 |
+| `mmproj` | mmproj の `.gguf` 名 | 空 (単一asset) |
+| `license` | `LICENSE` | 空 |
+| `notice` | `NOTICE` | 空 |
+
+`model_id` は `qwen3.5-4b-miv-q4km-` + 本体SHA-256の先頭12桁 (小文字)。名前は全て安全な単一filenameとし、
+DOS予約名・末尾dot/space・区切り・相対移動・case-insensitive衝突・管理用の予約名を拒否する。
+一覧に書いたものだけ取得／検証し、導入先に `vlm-model-index.json` を保存する。
+`active.json` は `{ "schema": 1, "model_id": "..." }`、各packの `INSTALL_OK` は配置後に作る。
+実配布の hash・サイズ・index ファイルは設計担当が後で確定する。
+
+**検証** (製品の起動・外部通信・実モデルの読込は行っていない)
+
+- worker は CMake で再 build。CTest 6/6、identity の実exe照合と合成PEの一致／不一致／欠落／重複／SkipBuild検査が成功。
+  exe は48,105,472 bytes、SHA-256 `15921e46f0e5a1f8b06a059852b437fa44730962a01303df098454ba23078798`、
+  source identity `79c6482ae05f4aee923ff0b207af1386462658546a431f6e2bc1685331641fd9`。
+- worker focused 33/33 (run `aa942ace-27c0-42df-a79d-152811241cb6`)、モデル取得 backend 21/21、
+  UI focused 6/6。解決順の8条件、prompt版拒否、GPU境界、展開とreparse、HTTPと導入排他、
+  パスの一回引渡しと破棄、7状態×2サイズの操作可視性を含む。
+- 追加snapshot 2枚を生成・目視確認。既存の設定検索結果snapshotは追加1行だけの差分を確認して更新。
+- 通常／portable の `cargo check` と UI glyph lint は成功。
+  Windows専用workerを非Windows portable CIから参照しないよう、UIのmoduleもWindows境界で選択する (非Windows実行は未検証)。
+- 本体lib全件は `scripts/test-lib-full.ps1` を一度実行し、15,406実行中15,401成功／5失敗／66 skipped、801.946秒。
+  ログ: `target/test-lib-full/runs/20261102T173712283Z-c57a5cdb/`。
+  失敗は agent IPC の名前付きpipeでアクセス拒否2件、既存のstartup restoreのlisting準備待ち2件、設定検索snapshot1件。
+  snapshotは上記の意図した検索結果追加。全件成功とは扱わない。
+- 最新ソースで全VLM 60件＋上の失敗5件を `nextest --test-threads 1` で再検査。
+  run `32158127-abac-450e-a90a-980631e106aa`、63成功／2失敗、15.760秒。
+  VLM 60件、更新snapshot、startup restoreの2件は成功し、名前付きpipeの2件だけが同じOS error 5で再失敗。
+  通常の製品動作失敗や全件成功とは断定せず、この実行環境での検証制限として残す。全件は再実行していない。
+- 既存のrelease safety scriptはGit Bashの `CreateFileMapping` アクセス拒否で停止。
+  portable fingerprintはPowerShell5.1のprobeが成功、`pwsh.exe` が見つからないためcross-shell比較は未実施。
+- 検証用の通常構成 release build が成功 (core/remote/EPUB/MCP/launcher)。
+  `scripts/build-release.ps1 -PreserveRuntime -SkipVst3Bridge --offline` を使い、VST3 は現source identity一致の既存exeを再利用。
+  初回は既存turbojpeg-sysの24並列CMake buildが失敗したため、同じ生成先で `cmake --build ... --target install --config Release --parallel 1` を実行して成功。
+  Cargo全体を1並列にした試行はRustの最終最適化も直列になったため、成功済みlibraryを残してbinのrustcを意図的に中断し、
+  最後は `CARGO_BUILD_JOBS=8` / `CMAKE_BUILD_PARALLEL_LEVEL=1` / `CARGO_NET_OFFLINE=true` / `MSBUILDDISABLENODEREUSE=1` /
+  `VULKAN_SDK=C:\VulkanSDK\1.4.363.0` で同じwrapperを再実行した。中断は製品コンパイルエラーとして数えない。
+  core は393,739,776 bytes、launcher は561,397,248 bytes。最後のVC runtime PE検査はruntime4本・runtime側PE5本／embedded側PE13本で成功。
+  APPDATAの展開済みVST3 cacheは保持し、成果物は起動していない。
+- 署名・実配布モデル・実機確認は未実施。公開物・GitHub Release・`htdocs/` は作成／変更せず、コミットは設計担当が行う。

@@ -181,6 +181,8 @@ mod final_composite;
 mod image_folder_zip;
 mod image_folder_zip_job;
 mod image_folder_zip_metadata;
+pub mod vlm_addon;
+pub mod vlm_addon_download;
 // filename_stack_ui は private な App へ impl を追加する library-internal module。
 mod adjustment_parameter_edit;
 mod everything_ipc;

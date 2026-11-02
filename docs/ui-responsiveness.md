@@ -471,6 +471,11 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 
 ## 4. 新機能追加時のチェックリスト
 
+ローカル AI 説明文のモデル導入 (V1-3b) は、`VlmAddon` の初回 scan・HTTP・ハッシュ・連結・配置・削除と、
+worker exe の内容別展開・GPU 検査を背景 thread に置く。設定ページは cached view のみを読み、
+root frame が非blocking poll で完了を採用する。取消／削除の worker 完了までは次操作を拒否し、UI で join しない。
+取得窓を閉じても App の owner は残る。起動時の自動取得や実機 perf 測定の実施を意味しない。
+
 注釈fontの先回り（§1.602）はNext頁の計画でメモリ上の需要だけを判断し、列挙・font読取・parseを`comic-font-load` workerへ置く。
 App共有ownerの受信口は1つ。root pollは非blockingで採用し、workerの完了時にroot再描画を要求する。
 `comic / font_load`に所要ms・要求key数・読込key数・結果を記録する。同期表示はworkerを待たず、不足時は受信口を捨てて既存の同期経路を維持する。

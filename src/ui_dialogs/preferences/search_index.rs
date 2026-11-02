@@ -663,6 +663,20 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["パック", "ダウンロード", "削除", "engine", "CUDA"]
     ),
     entry!(
+        "ai-caption/manage",
+        AiCaption,
+        "AI 説明文",
+        [
+            "Qwen",
+            "Vulkan",
+            "モデル",
+            "GPU",
+            "VRAM",
+            "ダウンロード",
+            "削除"
+        ]
+    ),
+    entry!(
         "editing-addon/manage",
         EditingAddon,
         "編集用追加ファイル",

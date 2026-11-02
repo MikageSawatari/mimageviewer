@@ -14,7 +14,12 @@ use serde_json::{Value, json};
 pub use crate::job_process::KillHandle;
 use crate::job_process::{self, JobChild, StdinMode};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROMPT_VERSION: i64 = 1;
+pub const MIN_VRAM_BYTES: u64 = 15 * 1024 * 1024 * 1024 / 2;
+#[cfg(not(feature = "portable"))]
+#[path = "vlm_worker_extract.rs"]
+mod extract;
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +338,7 @@ impl VlmWorkerClient {
         }
         let hello = self.exchange(json!({"type":"hello"}), &[], "hello", self.timeouts.hello)?;
         if hello["protocol_version"].as_u64() != Some(PROTOCOL_VERSION as u64)
+            || hello["prompt_version"].as_i64() != Some(PROMPT_VERSION)
             || hello["source_identity"].as_str().is_none_or(str::is_empty)
         {
             return self.fail(VlmError::Protocol("incompatible hello".into()));
@@ -510,13 +516,51 @@ fn error_message(header: &Value) -> String {
         .to_owned()
 }
 
-/// Development resolution only. V1-3 adds embedded extraction here.
+/// Resolve/extract only on a worker thread. Release builds ignore overrides.
 pub fn worker_executable() -> io::Result<PathBuf> {
-    Ok(std::env::var_os("MIV_VLM_WORKER")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/vlm-worker/mimageviewer-vlm.exe")
-        }))
+    let override_path = if cfg!(debug_assertions) {
+        std::env::var_os("MIV_VLM_WORKER")
+    } else {
+        None
+    };
+    match worker_executable_source(
+        cfg!(debug_assertions),
+        cfg!(feature = "portable"),
+        override_path,
+    ) {
+        WorkerExecutableSource::Override(path) => Ok(path),
+        #[cfg(feature = "portable")]
+        WorkerExecutableSource::Bundled => {
+            crate::native_assets::bundled("mimageviewer-vlm.exe").map_err(io::Error::other)
+        }
+        #[cfg(not(feature = "portable"))]
+        WorkerExecutableSource::Embedded => extract::worker_executable(),
+        _ => unreachable!("worker source must match the compile-time portable feature"),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WorkerExecutableSource {
+    Override(PathBuf),
+    Bundled,
+    Embedded,
+}
+
+// Keep the precedence independent of environment mutation and filesystem I/O so
+// both build flavors and release's ignored override are covered in one test.
+fn worker_executable_source(
+    debug: bool,
+    portable: bool,
+    override_path: Option<OsString>,
+) -> WorkerExecutableSource {
+    if debug && let Some(path) = override_path {
+        return WorkerExecutableSource::Override(path.into());
+    }
+    if portable {
+        WorkerExecutableSource::Bundled
+    } else {
+        WorkerExecutableSource::Embedded
+    }
 }
 
 /// One immutable decision for this process, evaluated lazily on a worker thread.
@@ -527,6 +571,12 @@ pub struct GpuDecision {
     pub device: Option<Adapter>,
     pub vram_total_bytes: u64,
     pub vulkan_available: bool,
+}
+
+impl GpuDecision {
+    pub fn is_eligible(&self) -> bool {
+        self.vulkan_available && self.vram_total_bytes >= MIN_VRAM_BYTES
+    }
 }
 
 /// Must be called off the UI thread. Both success and failure are cached until

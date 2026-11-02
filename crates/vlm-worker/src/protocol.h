@@ -9,7 +9,7 @@
 
 namespace protocol {
 using json = nlohmann::json;
-inline constexpr uint32_t kVersion = 1;
+inline constexpr uint32_t kVersion = 2;
 inline constexpr uint32_t kMaxFrame = 16 * 1024 * 1024;
 struct Frame {
     json header;

@@ -2,6 +2,8 @@
 #include "inference.h"
 #include "serve.h"
 #include "exclusive_output.h"
+#include "prompt.h"
+#include "build_identity.h"
 #include <algorithm>
 #include <filesystem>
 #include <iostream>
@@ -13,6 +15,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 int run(const std::vector<std::string> & args) {
+    std::cerr << MIV_VLM_SOURCE_MARKER << '\n';
     route_engine_logs_to_stderr();
     if (args.size() == 1 && args[0] == "--serve") return serve();
     if (args.size() == 1 && args[0] == "--list-devices") {
@@ -49,7 +52,7 @@ int run(const std::vector<std::string> & args) {
     size_t failed = 0;
     for (size_t index = 0; index < images.size(); ++index) {
         auto t0 = Clock::now();
-        json rec{{"label", "V1-0"}, {"prompt_version", "v0-3l"}, {"image", images[index].filename().u8string()},
+        json rec{{"label", "V1-0"}, {"prompt_version", kPromptEvaluationLabel}, {"image", images[index].filename().u8string()},
             {"index", index}, {"order", order}, {"model_load_s", load_s}, {"device", engine.device()}};
         run_image_attempt(rec, [&] {
             engine.caption_png(rec, images[index]);

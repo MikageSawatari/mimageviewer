@@ -50,7 +50,7 @@ if(NOT VLM_IDENTITY_RESULT EQUAL 0 OR NOT VLM_IDENTITY_LENGTH EQUAL 64 OR NOT VL
 endif()
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/build_identity.h"
-    CONTENT "#pragma once\n#define MIV_VLM_SOURCE_SHA256 \"@VLM_SOURCE_SHA256@\"\n" @ONLY)
+    CONTENT "#pragma once\n#define MIV_VLM_SOURCE_SHA256 \"@VLM_SOURCE_SHA256@\"\n#define MIV_VLM_SOURCE_MARKER \"MIV_VLM_SOURCE_SHA256:@VLM_SOURCE_SHA256@\"\n" @ONLY)
 add_executable(mimageviewer-vlm src/main.cpp src/devices.cpp src/inference.cpp src/serve.cpp)
 target_include_directories(mimageviewer-vlm PRIVATE "${LLAMA_ROOT}/vendor" "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(mimageviewer-vlm PRIVATE ggml llama mtmd Vulkan::Vulkan dxgi)

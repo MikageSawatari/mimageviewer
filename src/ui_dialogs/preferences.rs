@@ -383,6 +383,7 @@ pub(crate) enum PreferencesPage {
     GpuMemory,
     /// AI 推論バックエンド (DirectML / TensorRT) の選択と TRT pack 管理
     AiBackend,
+    AiCaption,
     Cache,
     Folder,
     /// v1.7.0: 製本（本棚の保存先ルート）
@@ -588,6 +589,7 @@ impl PreferencesPage {
         Self::Prefetch,
         Self::GpuMemory,
         Self::AiBackend,
+        Self::AiCaption,
         Self::Cache,
         Self::Folder,
         Self::Book,
@@ -627,6 +629,7 @@ impl PreferencesPage {
             Self::Prefetch => "先読み",
             Self::GpuMemory => "GPUメモリ",
             Self::AiBackend => "AI バックエンド",
+            Self::AiCaption => "AI 説明文",
             Self::Cache => "キャッシュ",
             Self::Folder => "フォルダ・ファイル",
             Self::Book => "製本",
@@ -905,7 +908,11 @@ const TREE: &[TreeCategory] = &[
     TreeCategory {
         label: "拡張と診断",
         page: None,
-        children: &[PreferencesPage::EditingAddon, PreferencesPage::Developer],
+        children: &[
+            PreferencesPage::AiCaption,
+            PreferencesPage::EditingAddon,
+            PreferencesPage::Developer,
+        ],
     },
 ];
 
@@ -1326,6 +1333,10 @@ pub(crate) struct PreferencesState {
     // ── 編集用追加パック ページ用のキャッシュ ────────────────────
     /// 編集用追加パックの導入状態 (環境設定ダイアログを開いた時点のスナップショット)。
     pub editing_addon_status: crate::editing_addon::AddonStatus,
+    pub vlm_view: super::vlm_addon::VlmPreferencesView,
+    pub vlm_download_requested: bool,
+    pub vlm_remove_requested: bool,
+    pub vlm_folder_requested: bool,
     /// 導入済み pack のディスク使用量 (MiB)。未導入なら 0。
     pub editing_addon_size_mib: u64,
     /// 導入済み pack のフォント数。
@@ -1847,6 +1858,10 @@ impl PreferencesState {
             trt_cache_delete_confirm_open: false,
             uninstall_trt_pack_requested: false,
             editing_addon_status,
+            vlm_view: Default::default(),
+            vlm_download_requested: false,
+            vlm_remove_requested: false,
+            vlm_folder_requested: false,
             editing_addon_size_mib,
             editing_addon_font_count,
             editing_addon_subject_model,
@@ -3198,6 +3213,7 @@ impl App {
 
         // 初回: 一時コピーを作成
         self.ensure_preferences_state();
+        self.refresh_vlm_preferences(ctx);
         // A fresh draft gets a fresh ScrollArea id, with one explicit restore.
         // This also works when close and reopen happen without a hidden frame.
         let mut restore_scroll_y = (self
@@ -3257,6 +3273,7 @@ impl App {
         }
 
         let registration_dialog_open = self.agent_registration_dialog_open();
+        let vlm_dialog_open = self.vlm_setup.modal_open();
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
@@ -3264,21 +3281,25 @@ impl App {
 
         let transfer_dialog_open = self.preferences_transfer_dialog_open();
         let collection_reorder_open = self.collection_reorder_open();
-        if transfer_dialog_open || registration_dialog_open {
+        if transfer_dialog_open || registration_dialog_open || vlm_dialog_open {
             // Popups use independent UI layers and do not inherit a disabled
             // parent. Remove that combination while the transfer modal is shown.
             egui::Popup::close_all(ctx);
         }
 
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
-        let enter_pressed =
-            !transfer_dialog_open && !registration_dialog_open && self.dialog_enter_pressed(ctx);
-        let escape_pressed =
-            !transfer_dialog_open && !registration_dialog_open && self.dialog_escape_pressed(ctx);
+        let enter_pressed = !transfer_dialog_open
+            && !registration_dialog_open
+            && !vlm_dialog_open
+            && self.dialog_enter_pressed(ctx);
+        let escape_pressed = !transfer_dialog_open
+            && !registration_dialog_open
+            && !vlm_dialog_open
+            && self.dialog_escape_pressed(ctx);
 
         egui::Window::new("環境設定")
             .drag_area(egui::WindowDrag::Anywhere)
-            .enabled(!transfer_dialog_open && !registration_dialog_open)
+            .enabled(!transfer_dialog_open && !registration_dialog_open && !vlm_dialog_open)
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -3699,6 +3720,8 @@ impl App {
                 self.uninstall_editing_addon_now();
             }
         }
+
+        self.process_vlm_preferences_requests(ctx);
 
         // 「インストール先を開く」が押されていたら Explorer で開く。
         if let Some(ps) = self.pref_state.as_mut() {
@@ -4281,6 +4304,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::Prefetch => page_prefetch(ui, state),
         PreferencesPage::GpuMemory => page_gpu_memory(ui, state),
         PreferencesPage::AiBackend => page_ai_backend(ui, state),
+        PreferencesPage::AiCaption => page_ai_caption(ui, state),
         PreferencesPage::Cache => page_cache(ui, state),
         PreferencesPage::Folder => page_folder(ui, state),
         PreferencesPage::Book => page_book(ui, state),
