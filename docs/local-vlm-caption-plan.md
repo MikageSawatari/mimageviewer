@@ -1033,3 +1033,16 @@ PDFium worker と同じくパイプにそのまま流して足りる。共有メ
 ### 19.11 11 回目 (2026-11-02、同じ担当の続き、基準 `3ff700f3d`)
 
 10 回目の 3 件は閉じ、新しい指摘は無かった。V1-1 の設計 (§21) のレビューはここで閉じる。
+
+### 21.4 V1-1 の結果 (2026-11-02、`a1ab32ed3` + `de96c69bf`)
+
+- 実装: 共通の起動部品 `src/job_process.rs` (suspended 起動 → Job Object → resume、`PROC_THREAD_ATTRIBUTE_HANDLE_LIST` で子に渡すのはその子の標準入出力だけ)。
+  EPUB worker もこれに置き換えた (引数・環境・cancel・timeout は不変)。client は TRT client の隣の `src/ai/vlm_worker.rs`
+  (書き手・読み手・stderr の 3 スレッド、kill handle、1 往復ごとの時間の上限、失敗した client は再利用しない)。worker 側は `--serve`
+  (`serve.cpp` / `protocol.h`、stdin・stdout を binary mode、ログは stderr) と、`--selftest` と共通の 1 件の処理 (`inference.cpp`)。
+- V1-3 が使う形: `start_at` → `kill_handle()` を App に渡す → `hello` → `load` → `caption` を直列に。通常の中止は今の 1 件の戻りを待って
+  `shutdown()`、終了時は kill handle で即座に止める。
+- 確認 (設計担当の環境で再実行): 実モデル 26 枚で `--serve` の 3 欄が V1-0 と 26/26 一致 (読み込み込み 64 秒)。本体 lib 全件は 15,354 件中
+  失敗 2・時間切れ 1 で、3 件とも単独で成功 (VLM と無関係の時間依存テストと 10 万件走査の重いテスト)。CTest 6/6。
+- 独立コードレビュー (gpt-6.1-sol / xhigh): P1・P2 なし。P3 1 件 (テスト用の偽 worker が `%TEMP%` に残る) を `target/vlm-fake-worker/` への
+  キャッシュに改め、再確認で「指摘なし」。V1-1 はここで閉じる。
