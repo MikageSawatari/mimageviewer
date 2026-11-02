@@ -384,3 +384,24 @@
 確認用buildは単独再確認完了後に成功。成果物は`target/dev-runtime/mimageviewer-core.exe`（339,713,024 bytes）、`mimageviewer-remote.exe`（14,836,224 bytes）、`mimageviewer-epub-pdf.exe`（5,094,400 bytes）。command/条件/exitと各SHA-256は`target/section1683-verification-build.json`、script出力は`target/section1683-build-dev.log`、PE検査は`target/vcrt-pe-reports/dev-runtime.json`へ記録した。並列数切替のためのビルド停止は権限拒否で実行されず、最初の単一job実行がそのまま完了した。製品起動・実IME/実機操作・commitは未実施。
 
 利用者がこのworktreeで確認する際の起動commandは`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。既定で通常の`%APPDATA%\mimageviewer`を使用し、実際の設定/データを更新しうる。single-instance mutexを共有するため、インストール済み/トレイ常駐のmImageViewerを先に終了する。管理内↑↓の連打、保存中の閉じ開き、番号/固定の一致、名前順復帰、再起動後の保存順を実機確認として設計担当/利用者へ引き継ぐ。
+
+### 13.5 独立コードレビュー3件への修正（`e7bc35491`後）
+
+設計担当から渡された独立Sol/xhighレビュー全文と該当sourceを照合し、3件とも正しい指摘と判断した。§13.1–13.4の当初レビュー/検証履歴は保持し、今回の追加指摘をそこで検出済みだったとは扱わない。利用者の追加指示に従い、今回は製品起動・commit・lib全件・build-devを行わない。
+
+1. **LogicOnlyでの順保存終端**: `poll_book_op_pending`はFullの`render_other_worker_results`だけにあり、順保存のack・最新一件の後続送信・lease解放・終了再開がLogicOnlyで進まなかった。ShelfOrderだけを対象とするservice pollを`service_app_logic`へ接続し、root close受理の後で処理する。Full側はShelfOrderを重複pollせず、他の製本結果の表示採用を維持する。新しいqueue/pendingや待機は追加しない。`HeadlessEpiIntegration::update_logic_only`経由で、closeと同時の成功、失敗/切断、最新保存の成功/失敗、終了保留とlease解放、Listを消費しない境界を検査する。
+2. **root切替後の番号入力**: `book_shelf_root_changed`が旧Listを保持し、新しい番号入力を旧Listのnavigationへ付けていた。共通設定適用境界で旧Listのreceiverを退役し、そのListに付いたidだけを取消す。Create/Append等のmutation workerと独立した追加先openは保持する。新しいrootは通常のListを開始し、A→B→Aでも新epochへ所属させる。旧返信前の新番号入力が現在の本棚で一覧→scan→採用まで完了するhandler回帰をA→B/ABA、旧番号待ち有無で検査する。
+3. **既存本Appendの全本走査**: wrapperが追加前後の`read_snapshot`を毎回行い、常に`summary.shelf=Some`として件数差分経路を迂回していた。既存追加先は順の観測/保守を始めず、`shelf=None`で従来の件数差分を使う。新規追加先だけ直下名・policy/tokenの軽量観測を行い、同じworker内の作成後保守と完成snapshotへ接続する。resolverは名前列とBookInfoで共用し、仮のpage_count行を作らない。cache未登録の既存本は表示policyで所属だけ解決し、Manual/Unsaved/ReadOnlyの順・token・phaseと大小文字aliasの本identityを保つ。未登録本の件数が追加差分だけになる既存の限界を、全本走査で拡張しない。thread-local RAII recorderでページ列挙境界を捕捉し、公開/runtime APIの既存Appendが他本へ到達しないこと、新規Appendの他本列挙が作成後の一回だけであることを検査する。
+
+今回も別contextのSol/xhighが設計・完成sourceを独立確認し、3件とも修正後ACCEPT、未解決P1/P2なし。実装担当が下記検証を所有し、reviewerは同じ証拠を利用する。検証条件は`MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=1`、製品source/test固定。
+
+| 今回の検証 | 結果・証拠 |
+| --- | --- |
+| `cargo fmt` | 成功 |
+| `cargo check -p mimageviewer --lib --tests` | exit0、4分40秒。`target/section1683-reviewfix-check/{stdout,stderr}.log` |
+| 焦点nextest | 198/198成功、実行19.435秒（compile13分01秒）。`target/section1683-reviewfix-focused/runs/20261102T143656720Z-1a0fdb01/`にcommand/config・stdout/stderr・JUnit |
+| 新規回帰 | 13testすべて上記198件に含まれる。LogicOnly 4、mutation保持1、root切替番号/独立open 3、Append API/差分5。各test内の成功/失敗・root往復・policy・公開/runtime条件もすべて成功 |
+| `cargo test --test ui_snapshot` | UPDATE_SNAPSHOTSを外し224/224成功、実行40.74秒（compile2分54秒）。`target/section1683-reviewfix-ui-snapshot/{stdout,stderr}.log`。PNG変更なし |
+| UI glyph | 危険glyphなし |
+
+焦点の選択はbooks / book_order / app::book_shelf_tests / saved_group_actions / book_append系 / book_structural_op / root_lifecycle / egui037_connection_tests / Remote本棚 / keymap本番号。全件実行への拡大、失敗のretry、期待値・timeoutの緩和は行っていない。製品起動・commit・lib全件・build-devは依頼どおり未実施。§13.4の確認用バイナリは今回の修正を含まない。

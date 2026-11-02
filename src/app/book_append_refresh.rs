@@ -392,12 +392,15 @@ impl App {
         } else if self.pending_book_shelf_current()
             && let Some(rows) = self.book_shelf.snapshot.as_mut()
         {
-            crate::books::apply_append_to_cached_list(
+            if let Err(error) = crate::books::apply_append_to_cached_shelf(
                 rows,
                 &summary.book_name,
                 &summary.folder,
                 summary.added,
-            );
+            ) {
+                crate::logger::log(format!("[book-order] Append cache update: {error}"));
+                self.show_feedback_warning(format!("本棚一覧を更新できません: {error}"));
+            }
         }
         crate::logger::log(format!(
             "book append: {} added={} folder={}",
@@ -718,6 +721,110 @@ mod tests {
                 app.book_append_undo_receipt.as_ref().unwrap().operation(),
                 receipt.operation(),
             );
+        }
+    }
+
+    #[test]
+    fn section1683_existing_append_terminal_keeps_count_delta_order_and_save_state() {
+        use crate::book_order::{BookOrderPolicy, BookOrderReadState, BookOrderWriteError};
+        for mode in ["manual", "unsaved", "readonly"] {
+            let (mut app, receipt, initial) = fixture();
+            let root = initial.folder.parent().unwrap().to_path_buf();
+            app.settings.book_root = Some(root.clone());
+            let rows = ["A", "book", "Z"]
+                .into_iter()
+                .map(|name| crate::books::BookInfo {
+                    name: name.into(),
+                    path: root.join(name),
+                    // Deliberately distinct from filesystem counts: success must
+                    // add to the displayed count, never substitute a full scan.
+                    page_count: 4,
+                })
+                .collect::<Vec<_>>();
+            app.book_shelf.snapshot = Some(rows.into());
+            let ctx = egui::Context::default();
+            if mode == "readonly" {
+                app.book_shelf.snapshot.as_mut().unwrap().read =
+                    BookOrderReadState::ReadOnly("protected order".into());
+            } else {
+                let writes = app.book_order_writes_for_test();
+                app.move_book_order("Z", -2, &ctx);
+                let request = writes.try_recv().unwrap();
+                let result = if mode == "unsaved" {
+                    Err(BookOrderWriteError::Failed("write failed".into()))
+                } else {
+                    Ok(request.token)
+                };
+                request
+                    .reply
+                    .send(Ok(BookOpResult::ShelfOrderSaved(result)))
+                    .unwrap();
+                app.poll_book_op_pending(&ctx);
+                assert!(writes.try_recv().is_err());
+            }
+            let before = app.book_shelf.snapshot.as_ref().unwrap().clone();
+            let status = app.book_order_status();
+            assert_eq!(status == Some("未保存"), mode == "unsaved");
+            let source = app.tmp.path().join("delta-source.jpg");
+            std::fs::write(&source, b"append delta").unwrap();
+            let data = crate::data_dir::get();
+            let result = crate::books::append_pages_at_with_raw_and_shelf(
+                data.clone(),
+                root,
+                initial.book_name,
+                vec![crate::books::BookPageSource::File {
+                    src: source,
+                    original_name: "delta-source.jpg".into(),
+                }],
+                crate::book_append_undo::AppendMetadataStores::existing_at(&data),
+                None,
+            )
+            .unwrap();
+            let BookOpResult::Append(summary) = result else {
+                panic!("expected Append result");
+            };
+            assert!(summary.shelf.is_none());
+            let _tx = hold(&mut app, &receipt);
+            app.book_op_pending.as_mut().unwrap().shelf_scope = Some(app.shelf_scope());
+            app.current_folder = None;
+            assert!(!app.finish_book_append_terminal(&ctx, summary, None));
+            let after = app.book_shelf.snapshot.as_ref().unwrap();
+            assert_eq!(
+                after
+                    .rows
+                    .iter()
+                    .map(|row| row.name.as_str())
+                    .collect::<Vec<_>>(),
+                before
+                    .rows
+                    .iter()
+                    .map(|row| row.name.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                after
+                    .rows
+                    .iter()
+                    .find(|row| row.name == "book")
+                    .unwrap()
+                    .page_count,
+                5
+            );
+            assert!(
+                after
+                    .rows
+                    .iter()
+                    .filter(|row| row.name != "book")
+                    .all(|row| row.page_count == 4)
+            );
+            assert_eq!(after.policy, before.policy);
+            assert_eq!(after.token(), before.token());
+            assert_eq!(app.book_order_status(), status);
+            assert_eq!(
+                matches!(after.policy, BookOrderPolicy::Manual(_)),
+                mode != "readonly"
+            );
+            assert!(app.book_append_undo_receipt.is_some());
         }
     }
 

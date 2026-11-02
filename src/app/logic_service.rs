@@ -14,6 +14,7 @@ impl App {
         self.service_root_lifecycle_tray_checkpoint(ctx, lifecycle);
         self.sync_tray_resident_media_wake();
 
+        self.service_book_order(ctx);
         self.poll_composition_editor_save_receipts(ctx);
         self.resume_composition_editor_root_close(ctx);
         self.service_settings_family_operation(ctx);

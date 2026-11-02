@@ -150,16 +150,43 @@ pub(crate) enum BookShelfMutation {
     Unchanged,
 }
 
+/// Order maintenance needs membership and the order token, never page counts.
+pub(crate) struct BookOrderObservation {
+    root_presence: RootPresence,
+    names: Vec<String>,
+    policy: BookOrderPolicy,
+    read: BookOrderReadState,
+}
+
+impl From<BookShelfSnapshot> for BookOrderObservation {
+    fn from(snapshot: BookShelfSnapshot) -> Self {
+        Self {
+            root_presence: snapshot.root_presence,
+            names: snapshot.rows.into_iter().map(|row| row.name).collect(),
+            policy: snapshot.policy,
+            read: snapshot.read,
+        }
+    }
+}
+
 /// The filesystem operation has succeeded. Never roll it back for order errors.
 pub(crate) fn finish_mutation(
     root: &Path,
     before: Result<BookShelfSnapshot, String>,
     mutation: BookShelfMutation,
 ) -> BookShelfCompletion {
+    finish_observed_mutation(root, before.map(Into::into), mutation)
+}
+
+pub(crate) fn finish_observed_mutation(
+    root: &Path,
+    before: Result<BookOrderObservation, String>,
+    mutation: BookShelfMutation,
+) -> BookShelfCompletion {
     let previous_presence = before.as_ref().ok().map(|snapshot| snapshot.root_presence);
     let attempted = (|| {
         let before = before?;
-        let Some(mut token) = before.token().cloned() else {
+        let BookOrderReadState::Writable(mut token) = before.read else {
             return Ok(None);
         };
         if !matches!(before.policy, BookOrderPolicy::Manual(_))
@@ -167,11 +194,7 @@ pub(crate) fn finish_mutation(
         {
             return Ok(None);
         }
-        let mut names = before
-            .rows
-            .into_iter()
-            .map(|row| row.name)
-            .collect::<Vec<_>>();
+        let mut names = before.names;
         match mutation {
             BookShelfMutation::Created(name) => {
                 if token
@@ -283,24 +306,36 @@ fn validate_policy(policy: &BookOrderPolicy) -> Result<(), String> {
 /// The strings from storage never become filesystem paths.
 pub fn resolve_rows(
     policy: &BookOrderPolicy,
-    mut rows: Vec<BookInfo>,
+    rows: Vec<BookInfo>,
 ) -> Result<Vec<BookInfo>, String> {
-    validate_policy(policy)?;
-    let names = rows.iter().map(|row| row.name.clone()).collect::<Vec<_>>();
-    validate_names(&names)?;
     if rows
         .iter()
         .any(|row| row.path.file_name().and_then(|name| name.to_str()) != Some(row.name.as_str()))
     {
         return Err("本の名前を一意に読み取れません".into());
     }
-    rows.sort_by(|a, b| compare_names(&a.name, &b.name));
+    resolve_named(policy, rows, |row| row.name.as_str())
+}
+
+fn resolve_named<T>(
+    policy: &BookOrderPolicy,
+    mut rows: Vec<T>,
+    name: impl Fn(&T) -> &str,
+) -> Result<Vec<T>, String> {
+    validate_policy(policy)?;
+    validate_names(
+        &rows
+            .iter()
+            .map(|row| name(row).to_owned())
+            .collect::<Vec<_>>(),
+    )?;
+    rows.sort_by(|a, b| compare_names(name(a), name(b)));
     let BookOrderPolicy::Manual(saved) = policy else {
         return Ok(rows);
     };
-    let mut slots: HashMap<String, BookInfo> = rows
+    let mut slots: HashMap<String, T> = rows
         .into_iter()
-        .map(|row| (row.name.to_lowercase(), row))
+        .map(|row| (name(&row).to_lowercase(), row))
         .collect();
     let mut ordered = Vec::with_capacity(slots.len());
     for name in saved {
@@ -309,7 +344,7 @@ pub fn resolve_rows(
         }
     }
     let mut unknown = slots.into_values().collect::<Vec<_>>();
-    unknown.sort_by(|a, b| compare_names(&a.name, &b.name));
+    unknown.sort_by(|a, b| compare_names(name(a), name(b)));
     ordered.extend(unknown);
     Ok(ordered)
 }
@@ -401,6 +436,40 @@ fn directory_names(root: &Path) -> Result<(RootPresence, Vec<String>), String> {
     names.sort();
     validate_names(&names)?;
     Ok((root_presence, names))
+}
+
+/// Observe direct book names and order storage without entering any book folder.
+pub(crate) fn observe_order(root: &Path) -> Result<BookOrderObservation, String> {
+    let (root_presence, directories) = directory_names(root)?;
+    let loaded = read_file(root).and_then(|(policy, file)| {
+        let names = resolve_named(&policy, directories.clone(), String::as_str)?;
+        Ok((policy, file, names))
+    });
+    let (policy, names, read) = match loaded {
+        Ok((policy, file, names)) => (
+            policy,
+            names,
+            BookOrderReadState::Writable(BookOrderToken {
+                file,
+                root_presence,
+                directories,
+            }),
+        ),
+        Err(error) => {
+            crate::logger::log(format!("[book-order] {error}"));
+            (
+                BookOrderPolicy::Name,
+                directories,
+                BookOrderReadState::ReadOnly(error),
+            )
+        }
+    };
+    Ok(BookOrderObservation {
+        root_presence,
+        names,
+        policy,
+        read,
+    })
 }
 
 /// A bad order file still yields a complete name-ordered, protected snapshot.

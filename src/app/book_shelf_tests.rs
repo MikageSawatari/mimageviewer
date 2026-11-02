@@ -45,6 +45,182 @@ fn succeed(app: &mut App, request: book_shelf::BookOrderWriteForTest, ctx: &egui
     app.poll_book_op_pending(ctx);
 }
 
+fn book_order_close_input() -> egui::RawInput {
+    let mut input = egui::RawInput::default();
+    input
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(egui::ViewportEvent::Close);
+    input
+}
+
+#[test]
+fn book_shelf_logic_only_ready_success_accepts_close_before_receipt() {
+    for explicit_quit in [false, true] {
+        let mut app = shelf(&["A", "B"]);
+        app.settings.minimize_to_tray_on_close = explicit_quit;
+        app.shutdown_requested
+            .store(explicit_quit, std::sync::atomic::Ordering::SeqCst);
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        let writes = app.book_order_writes_for_test();
+        let ctx = egui::Context::default();
+        let mut backend = eframe::HeadlessEpiIntegration::new(ctx.clone());
+        let frame = app.frame_counter;
+        let sequence = app.input_seq;
+        app.move_book_order("A", 1, &ctx);
+        let first = writes.try_recv().unwrap();
+        assert!(handle.try_local_modal_lease().is_none());
+        first
+            .reply
+            .send(Ok(crate::books::BookOpResult::ShelfOrderSaved(Ok(
+                first.token
+            ))))
+            .unwrap();
+
+        let (output, _) = backend.update_logic_only(&mut app.app, book_order_close_input());
+        assert!(!app.book_order_saving());
+        assert!(app.book_op_pending.is_none());
+        assert!(handle.try_local_modal_lease().is_some());
+        let commands = &output.viewport_commands[&egui::ViewportId::ROOT];
+        assert!(commands.contains(&egui::ViewportCommand::CancelClose));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| **command == egui::ViewportCommand::Close)
+                .count(),
+            1
+        );
+        assert!(!backend.should_close(), "resumed Close is delivered next");
+        backend.update_logic_only(&mut app.app, book_order_close_input());
+        assert!(backend.should_close());
+        assert_eq!(app.frame_counter, frame);
+        assert_eq!(app.input_seq, sequence);
+        assert!(writes.try_recv().is_err());
+    }
+}
+
+#[test]
+fn book_shelf_logic_only_failure_or_disconnect_releases_lease_and_resumes_close() {
+    for disconnected in [false, true] {
+        let mut app = shelf(&["A", "B", "C"]);
+        app.settings.minimize_to_tray_on_close = false;
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        let writes = app.book_order_writes_for_test();
+        let ctx = egui::Context::default();
+        let mut backend = eframe::HeadlessEpiIntegration::new(ctx.clone());
+        app.move_book_order("A", 1, &ctx);
+        let first = writes.try_recv().unwrap();
+        app.move_book_order("A", 1, &ctx);
+        let (waiting, _) = backend.update_logic_only(&mut app.app, book_order_close_input());
+        assert!(
+            waiting.viewport_commands[&egui::ViewportId::ROOT]
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        assert!(app.book_order_saving());
+        if disconnected {
+            drop(first);
+        } else {
+            first
+                .reply
+                .send(Ok(crate::books::BookOpResult::ShelfOrderSaved(Err(
+                    BookOrderWriteError::Failed("logic-only failure".into()),
+                ))))
+                .unwrap();
+        }
+        let (terminal, _) = backend.update_logic_only(&mut app.app, Default::default());
+        assert!(!app.book_order_saving());
+        assert_eq!(app.book_order_status(), Some("未保存"));
+        assert!(app.book_op_pending.is_none());
+        assert!(handle.try_local_modal_lease().is_some());
+        assert!(
+            terminal.viewport_commands[&egui::ViewportId::ROOT]
+                .contains(&egui::ViewportCommand::Close)
+        );
+        assert!(
+            writes.try_recv().is_err(),
+            "failure must stop the unsent latest write"
+        );
+    }
+}
+
+#[test]
+fn book_shelf_logic_only_sends_latest_write_and_defers_close_until_its_terminal() {
+    for fail_latest in [false, true] {
+        let mut app = shelf(&["A", "B", "C"]);
+        app.settings.minimize_to_tray_on_close = false;
+        let handle = crate::remote_ipc::session::SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        let writes = app.book_order_writes_for_test();
+        let ctx = egui::Context::default();
+        let mut backend = eframe::HeadlessEpiIntegration::new(ctx.clone());
+        app.move_book_order("A", 1, &ctx);
+        let first = writes.try_recv().unwrap();
+        app.move_book_order("A", 1, &ctx);
+        backend.update_logic_only(&mut app.app, book_order_close_input());
+        first
+            .reply
+            .send(Ok(crate::books::BookOpResult::ShelfOrderSaved(Ok(
+                first.token
+            ))))
+            .unwrap();
+        let (middle, _) = backend.update_logic_only(&mut app.app, Default::default());
+        let latest = writes.try_recv().unwrap();
+        assert_eq!(latest.policy, manual(&["B", "C", "A"]));
+        assert_eq!(names(&app), ["B", "C", "A"]);
+        assert!(app.book_order_saving());
+        assert!(handle.try_local_modal_lease().is_none());
+        assert!(
+            !middle
+                .viewport_commands
+                .values()
+                .flatten()
+                .any(|command| *command == egui::ViewportCommand::Close)
+        );
+        latest
+            .reply
+            .send(Ok(crate::books::BookOpResult::ShelfOrderSaved(
+                if fail_latest {
+                    Err(BookOrderWriteError::Failed("latest failed".into()))
+                } else {
+                    Ok(latest.token)
+                },
+            )))
+            .unwrap();
+        let (terminal, _) = backend.update_logic_only(&mut app.app, Default::default());
+        assert!(!app.book_order_saving());
+        assert!(app.book_op_pending.is_none());
+        assert!(handle.try_local_modal_lease().is_some());
+        assert!(
+            terminal.viewport_commands[&egui::ViewportId::ROOT]
+                .contains(&egui::ViewportCommand::Close)
+        );
+        assert!(writes.try_recv().is_err());
+    }
+}
+
+#[test]
+fn book_shelf_logic_only_leaves_list_adoption_for_the_visible_driver() {
+    let mut app = shelf(&["A"]);
+    let scope = app.begin_book_shelf_read();
+    let (reply, rx) = mpsc::channel();
+    app.book_op_pending = Some(crate::books::BookOpPending {
+        rx,
+        intent: crate::books::BookOpIntent::List { navigation: None },
+        shelf_scope: Some(scope),
+    });
+    reply
+        .send(Err("List must not be consumed by the order service".into()))
+        .unwrap();
+    let mut backend = eframe::HeadlessEpiIntegration::new(egui::Context::default());
+    backend.update_logic_only(&mut app.app, Default::default());
+    assert!(app.book_op_pending.is_some());
+    assert_eq!(app.book_order_status(), Some("読込中…"));
+}
+
 #[test]
 fn book_shelf_writer_coalesces_clicks_and_old_success_keeps_latest_display() {
     let mut app = shelf(&["A", "B", "C"]);
@@ -209,6 +385,39 @@ fn book_shelf_root_epoch_rejects_old_completed_list_even_after_return() {
     );
     assert!(app.book_shelf.snapshot.is_none());
     assert!(!app.shelf_scope_current(&scope));
+}
+
+#[test]
+fn book_shelf_root_change_keeps_captured_mutation_receiver() {
+    for append in [false, true] {
+        let mut app = shelf(&["A"]);
+        let scope = app.shelf_scope();
+        let (reply, rx) = mpsc::channel();
+        let intent = if append {
+            crate::books::BookOpIntent::Append {
+                operation_id: 1683,
+                source_context: app.projected_viewer_context_id(),
+                accepted_revision: app.book_append_undo_revision,
+                target_folder: app.book_root_path().join("A"),
+                observations: Default::default(),
+            }
+        } else {
+            crate::books::BookOpIntent::Unrelated
+        };
+        app.book_op_pending = Some(crate::books::BookOpPending {
+            rx,
+            intent,
+            shelf_scope: Some(scope.clone()),
+        });
+        let mut settings = app.settings.clone();
+        settings.book_root = Some(app.tmp.path().join("new-shelf"));
+        app.install_preferences_settings(settings);
+        assert!(!app.shelf_scope_current(&scope));
+        let pending = app.book_op_pending.as_ref().unwrap();
+        assert_eq!(pending.shelf_scope.as_ref().unwrap().epoch, scope.epoch);
+        assert!(reply.send(Err("old-root mutation terminal".into())).is_ok());
+        assert!(pending.rx.try_recv().unwrap().is_err());
+    }
 }
 
 #[test]

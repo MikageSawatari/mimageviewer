@@ -4,6 +4,8 @@
 
 上下操作はメモリのrowsだけを交換する。順序ファイルのbounded read、JSON検証、フォルダ/ページ数列挙、内容digestと集合の再照合、temp保存・flush/sync・atomic replaceは製本workerで行う。UIは単一receiverを非blockingでpollし、最新の完全表示を次の一件へ集約する。idleの周期I/O・周期repaintは増やさない。管理行は可視行だけ描画し、本identityでwidgetを維持する。[所有・失敗契約](book-order-plan.md)。
 
+ShelfOrderのpollは描画ではなくFull/LogicOnly共通logic serviceに置く。既存本Appendでは本棚全体を走査せず、追加先の処理とメモリ上の件数差分を維持する。新規本Appendの順保守に必要な事前観測は直下名・順序tokenだけとし、全本のページ数取得は作成後の完成一覧で一度だけ行う。
+
 UI スレッドをブロックしないための設計方針と、2026-04 の Ctrl+↑↓ 引っかかり調査で
 得られた知見をまとめたもの。新しい機能を追加するとき、先に**この文書の §4 チェックリスト**
 を通すこと。UI 同期 I/O は一度入れると気付きにくく、直すときは大きなリファクタになる。

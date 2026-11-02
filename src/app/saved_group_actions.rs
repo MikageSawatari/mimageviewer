@@ -1081,6 +1081,131 @@ mod tests {
         );
     }
 
+    fn numbered_open_after_shelf_switch_retires_old_list(return_to_a: bool) {
+        for old_navigation in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let root_a = app.tmp.path().join("shelf-a");
+            let root_b = app.tmp.path().join("shelf-b");
+            std::fs::create_dir_all(root_a.join("First in A")).unwrap();
+            std::fs::create_dir_all(root_b.join("First in B")).unwrap();
+            app.settings.book_root = Some(root_a.clone());
+            app.book_shelf.snapshot = None;
+            let old_scope = app.begin_book_shelf_read();
+            let (old_reply, old_rx) = std::sync::mpsc::channel();
+            app.book_op_pending = Some(crate::books::BookOpPending {
+                rx: old_rx,
+                intent: crate::books::BookOpIntent::List { navigation: None },
+                shelf_scope: Some(old_scope.clone()),
+            });
+            let ctx = egui::Context::default();
+            let previous_id = if old_navigation {
+                app.apply_saved_group_key_action(&ctx, KeyAction::GridOpenBook1);
+                app.saved_group_open_request_id_for_test()
+            } else {
+                None
+            };
+            let mut settings = app.settings.clone();
+            settings.book_root = Some(root_b.clone());
+            app.install_preferences_settings(settings);
+            assert!(
+                app.book_op_pending.is_none(),
+                "old List must retire before its reply"
+            );
+            assert!(app.saved_group_open.is_none());
+            if return_to_a {
+                let mut settings = app.settings.clone();
+                settings.book_root = Some(root_a.clone());
+                app.install_preferences_settings(settings);
+            }
+            assert!(!app.shelf_scope_current(&old_scope));
+            let current_root = if return_to_a { &root_a } else { &root_b };
+            let expected = current_root.join(if return_to_a {
+                "First in A"
+            } else {
+                "First in B"
+            });
+
+            // The previous reader is still unresolved. The new input must start
+            // its own current-root List rather than waiting on that reader.
+            app.apply_saved_group_key_action(&ctx, KeyAction::GridOpenBook1);
+            let id = app.saved_group_open_request_id_for_test().unwrap();
+            assert_ne!(Some(id), previous_id);
+            let pending = app.book_op_pending.as_ref().unwrap();
+            assert!(app.book_shelf_read_current(pending.shelf_scope.as_ref().unwrap()));
+            assert_eq!(&pending.shelf_scope.as_ref().unwrap().root, current_root);
+            assert!(
+                matches!(pending.intent, crate::books::BookOpIntent::List { navigation: Some(owner) } if owner == id)
+            );
+            // A late result can no longer reach the App or cancel this new id.
+            assert!(old_reply.send(Err("retired old reader".into())).is_err());
+            assert_eq!(app.saved_group_open_request_id_for_test(), Some(id));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                app.poll_book_op_pending(&ctx);
+                app.poll_saved_group_open(&ctx);
+                if matches!(
+                    app.saved_group_open.as_ref().map(|request| &request.phase),
+                    Some(SavedGroupOpenPhase::ReadyBook { .. })
+                ) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "current shelf numbered open did not complete"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                matches!(app.saved_group_open.as_ref().map(|request| &request.phase), Some(SavedGroupOpenPhase::ReadyBook { path, .. }) if path == &expected)
+            );
+            assert_eq!(
+                &app.book_shelf.snapshot.as_ref().unwrap().root,
+                current_root
+            );
+            app.adopt_saved_group_ready(id);
+            assert!(app.saved_group_open.is_none());
+            assert_eq!(app.current_folder.as_ref(), Some(&expected));
+        }
+    }
+
+    #[test]
+    fn numbered_open_after_a_to_b_uses_current_shelf_before_old_list_reply() {
+        numbered_open_after_shelf_switch_retires_old_list(false);
+    }
+
+    #[test]
+    fn numbered_open_after_a_to_b_to_a_uses_new_epoch_before_old_list_reply() {
+        numbered_open_after_shelf_switch_retires_old_list(true);
+    }
+
+    #[test]
+    fn shelf_switch_retires_list_without_cancelling_independent_active_book_open() {
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("shelf-a");
+        std::fs::create_dir_all(root.join("Active")).unwrap();
+        app.settings.book_root = Some(root);
+        app.settings.active_book_name = "Active".into();
+        let scope = app.begin_book_shelf_read();
+        let (old_reply, rx) = std::sync::mpsc::channel();
+        app.book_op_pending = Some(crate::books::BookOpPending {
+            rx,
+            intent: crate::books::BookOpIntent::List { navigation: None },
+            shelf_scope: Some(scope),
+        });
+        app.apply_saved_group_key_action(&egui::Context::default(), KeyAction::GridOpenActiveBook);
+        let id = app.saved_group_open_request_id_for_test().unwrap();
+        let mut settings = app.settings.clone();
+        settings.book_root = Some(app.tmp.path().join("shelf-b"));
+        app.install_preferences_settings(settings);
+        assert!(app.book_op_pending.is_none());
+        assert!(old_reply.send(Err("retired List".into())).is_err());
+        assert_eq!(app.saved_group_open_request_id_for_test(), Some(id));
+        assert!(matches!(
+            app.saved_group_open.as_ref().map(|request| &request.phase),
+            Some(SavedGroupOpenPhase::ScanningBook { .. })
+        ));
+    }
+
     #[test]
     fn ready_book_waits_for_sidecar_modal_then_rechecks_source_before_adoption() {
         let temp = tempfile::tempdir().unwrap();

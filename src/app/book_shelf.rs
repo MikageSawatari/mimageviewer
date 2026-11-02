@@ -74,6 +74,19 @@ impl App {
 
     pub(crate) fn book_shelf_root_changed(&mut self) {
         debug_assert!(!self.book_order_saving());
+        // A readonly List belongs to the previous selection, including its
+        // numbered-open continuation. Retire its receiver now so a new input
+        // cannot attach to it or wait for the previous root's I/O to finish.
+        // Mutation workers retain their captured root and finish normally.
+        if self.book_list_refresh_pending() {
+            let pending = self.book_op_pending.take().expect("pending List");
+            if let crate::books::BookOpIntent::List {
+                navigation: Some(id),
+            } = pending.intent
+            {
+                self.cancel_saved_group_open_request(id);
+            }
+        }
         self.book_shelf.epoch = self.book_shelf.epoch.wrapping_add(1);
         self.book_shelf.revision = self.book_shelf.revision.wrapping_add(1);
         self.book_shelf.snapshot = None;
@@ -89,6 +102,20 @@ impl App {
 
     pub(crate) fn book_order_saving(&self) -> bool {
         matches!(self.book_shelf.phase, Phase::Saving { .. })
+    }
+
+    pub(super) fn book_order_service_pending(&self) -> bool {
+        self.book_op_pending
+            .as_ref()
+            .is_some_and(|pending| matches!(pending.intent, crate::books::BookOpIntent::ShelfOrder))
+    }
+
+    /// Durable order receipts progress without presentation, including latest
+    /// follow-up writes, the modal lease, and a deferred root close.
+    pub(super) fn service_book_order(&mut self, ctx: &egui::Context) {
+        if self.book_order_service_pending() {
+            self.poll_book_op_pending(ctx);
+        }
     }
 
     pub(crate) fn book_order_mode_label(&self) -> &'static str {
