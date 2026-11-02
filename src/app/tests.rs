@@ -2,6 +2,9 @@
 use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
 
+#[path = "tests/same_position_double_click.rs"]
+mod same_position_double_click;
+
 #[path = "tests/collection_thumb_1668.rs"]
 mod collection_thumb_1668;
 
