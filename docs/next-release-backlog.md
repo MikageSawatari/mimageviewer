@@ -121,11 +121,94 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.684 フォルダバーのパス欄で、引用符で囲んだパス ("C:\xxx") でも移動できるようにする — 利用者要望 (2026-11-02)
 
-- 状態: **未着手・利用者が起票を依頼 (2026-11-02)。v5 以降の版で対応** (v4 系の追加作業は v4.11.0 で止める利用者方針)。
+- 状態: **実装済み (v5 向け)** (2026-11-02)。検証結果は下記。コミット・検収は設計担当、製品は起動していない。
+- 現行仕様: 再レビュー ACCEPT の P3 を採用し、引用符の内側は trim しない（設計担当決定）。詳細は下記「P3 修正」を正とし、初回実装・P2 の内側 trim の記述と検証結果は当時の履歴として残す。
 - 要望: `"C:\xxxx"` のように二重引用符で囲まれたパス (エクスプローラーの「パスのコピー」で得られる形) をフォルダバーのパス欄に貼り付けて Enter を押しても移動しない (利用者の報告)。引用符付きのままでも移動できるようにしたい。
-- 現状 (master のソース照合): Enter の処理は `src/ui_main.rs` の `render_address_bar` 内。空欄・「本棚」・「本棚 > 名前」を先に見て、それ以外は `self.address` を `resolve_folder_bar_nav_path` へ渡す。入力の整形は `normalize_folder_bar_input_path` が持ち、前後の空白を取る・`C:` に `\` を補う・`path_key::normalize_input_path` に通す、までで、引用符は外さない。そのため `"C:\xxx"` は存在しないパスとして解決できず、`result` が `None` のまま何も起きない (移動できなかったことの表示もない)。
-- 直し方の候補: `normalize_folder_bar_input_path` で、前後の空白を取ったあと、先頭と末尾がそろって `"` のときだけ 1 組外す (中の空白は保つ)。片側だけの引用符や、パスの途中の引用符は外さない。整形の正本を 1 か所に置き、同じ種類の入力を受けるほかの経路 (お気に入りなどのパス編集欄、コマンドライン引数) で引用符の扱いが食い違わないかも確かめる。解決できなかったときに何も表示しない点を合わせて直すかは、着手時に利用者と相談する。
-- テスト: `normalize_folder_bar_input_path` の単体テスト (引用符あり・なし・前後の空白・`"C:"`・UNC `"\\server\share\x"`・片側だけの引用符)。
+- 修正前のソース照合: Enter の処理は `src/ui_main.rs` の `render_address_bar` 内。空欄・「本棚」・「本棚 > 名前」を先に見て、それ以外は `self.address` を `resolve_folder_bar_nav_path` へ渡す。`normalize_folder_bar_input_path` は引用符を外さず、`C:` に `\` を補って `path_key::normalize_input_path` に通していた。**旧記載の「前後の空白を取る」は通常パスには不正確**で、trim した値を使うのはドライブ文字だけの判定・補完だけ、通常パスは元の値を渡していた。引用符付きパスの解決失敗はソース上で利用者報告と整合する。実機再現は行っていない。
+- 実装 (2026-11-02、設計担当からの実装依頼に従う): `normalize_folder_bar_input_path` で外側の前後空白を除き、先頭・末尾がそろった二重引用符を **1 組だけ**外し、その内側の前後空白も除く。パス途中の空白は保持する。当初候補の「中の空白は保つ」から、今回の明示依頼により内側の端も trim する仕様へ確定した。片側だけ・途中の引用符は保持し、既存の解決処理 (開ける親へのフォールバックを含む) に渡す。追加の引用符の再帰除去や不正文字の一括除去はしない。native path を受け取る兄弟 caller の非 UTF-8 値は変換せず、既存の実パス表記整形へ渡す。
+- 空入力・本棚: 整形後に空になった `""` / `"   "` は resolver が `None` を返す。Enter の元入力による空欄→ドライブ一覧と本棚の先行判定は変更しないため、引用符付きの「本棚」「本棚 > 名前」は特別な本棚移動の対象外。解決失敗時の無表示も維持する。失敗表示を追加するかは利用者との相談事項として残す。
+- 呼び出し元: 同じ `resolve_folder_bar_nav_path` を使うフォルダバー内の A/B 切替、場所メニューの整理先・既知フォルダ・ドライブ、履歴メニューも照合した。共通の整形箇所だけを修正し、フォルダバー外の設定保存・入力 parser・open owner・非同期 lifecycle は変更しない。
+- 回帰: 引用符あり/なし、外側・内側の端の空白、途中の空白保持、`"C:"`、`"C:\"`、UNC、片側だけ、途中の引用符、1 組だけ除去、`""` を単体テストで固定。一時フォルダ・ZIP・変換書庫・通常画像の親解決を resolver 経由で検査する。headless の実 toolbar / TextEdit / Enter 経路で引用符付きパス、空欄、引用符付き空文字、本棚・本棚名 (引用符あり/なし) を検査する。マニュアルの「はじめての起動」「フォルダを開く・移動する」へ各 1 文追記した。UI の固定文字列・見た目は変更なし。
+
+#### 独立レビュー P2 の修正 (2026-11-02、内側 trim は後述の P3 で変更)
+
+- 原因・不変条件: 初回実装は引用符なしにも trim を適用し、通常パスを元の文字列で解決していた旧仕様を変えた。同じ resolver に保存済み実パスも入るため、末尾全角空白の実フォルダと空白なしの兄弟があると誤った兄弟を選び、兄弟がなければ親探索へ進む。namespace の末尾半角空白と相対パスの先頭空白も失われた。入力の構文解析は手入力だけに限定し、native path の identity は保存する。
+- 修正: 手入力用の `resolve_folder_bar_address_input(&str)` → `normalize_folder_bar_input_path(&str)` と、native 用の `resolve_folder_bar_nav_path(&Path)` を分離。外側を trim した値で引用符の対を検出し、対があるときだけ 1 組を外して内側を trim。対がなければ元入力を渡す（ドライブ文字だけの補完は従来どおり）。native resolver は `path_key::normalize_input_path` と既存の実パス解決だけで、trim・unquote・lossy な文字列化をしない。空欄／空白だけ・引用符付き空文字・本棚の先行判定は維持。
+- 内側 trim の判断: 設計担当の明示仕様を維持し、半角空白だけへの限定は行わない。Unicode `str::trim` を使うため、`"C:\data\写真　"` は `C:\data\写真` へ解決する。引用符なしの末尾全角空白フォルダは保持する。両方の実フォルダを一時領域に作り、この意図した差と、空白なし兄弟の削除後にも元フォルダへ解決できることを回帰で固定する。spec とマニュアルにも明記。
+- 全経路の棚卸し（修正前の `normalize_folder_bar_input_path` は共通 resolver の 1 か所から呼ばれ、その製品 caller が以下の 6 か所。テストからの直接呼び出しは別）:
+
+| caller / データの由来 | 種類 | 修正後の入口 |
+|---|---|---|
+| パス欄 Enter / `self.address` | 手入力 | `resolve_folder_bar_address_input` → 入力解析 → native resolver |
+| A/B 切替 / workspace の `raw_target` | native | `resolve_folder_bar_nav_path` 直行 |
+| 場所メニュー・整理先 / `destination.path` | native | 同上 |
+| 場所メニュー・既知フォルダ / `location.path` | native | 同上 |
+| 場所メニュー・ドライブ / `drive` | native | 同上 |
+| 履歴メニュー / `recent_folders` の `path` | native | 同上 |
+
+- 回帰追加: 実フォルダ `写真　` と `写真`、先頭空白の相対パス（cwd を変えず temp 名で検査）、Windows namespace `\\?\…\Album ` の実フォルダと兄弟、非 Unicode native path。headless の実 toolbar で A/B 両スロットの切替完了先と履歴メニューの返却先、Enter での引用符有無による差を検査する。片側だけの引用符に前後空白がある入力も保持する。
+- 変更範囲: `src/ui_main.rs`、spec、本節、マニュアル2ページ。キーイベント・IME・見た目・open owner・非同期 lifecycle は変更なし。製品ページの既存の機能紹介に変更は不要。製品起動・実機操作・コミットは行わず、コミット／検収は設計担当。
+- P2 修正後の検証結果は本節末尾へ追記する。上の「実装」「呼び出し元」と下の既存検証記録は `52bd432f5` までの初回実装の履歴であり、P2 後の仕様・結果は本追補を正とする。
+
+#### 再レビュー ACCEPT の P3 修正 (2026-11-02)
+
+- 原因・決定: 手入力の対になった引用符の内側を `str::trim` したため、実フォルダ `写真　` と `写真` があると、コピーした `"…\写真　"` で空白なしの兄弟へ移動していた。指定した対象の identity を保つため、設計担当が内側 trim の撤去を決定した。
+- 修正: 外側の前後空白を除いた値の先頭・末尾がそろって `"` なら1組だけ外し、内側はそのまま既存 resolver へ渡す。対がなければ元入力を保持。内側が空または空白だけ（`""` / `" "` / 全角空白・タブなど）なら手入力 resolver で移動なしとし、空欄・空白だけのドライブ一覧、`C:` 補完、本棚の先行判定、native 経路は変更しない。`" C:\x "` のような非空の内側空白も保持し、存在しない場合は既存の親探索を使う。
+- 回帰: 末尾全角空白フォルダは引用符あり・なしのどちらでもそのフォルダへ移り、空白なしの兄弟へ移らないことを resolver と headless Enter で固定。内側の先頭・末尾の半角／全角空白の保持、引用符付き先頭空白の実相対フォルダ、空／空白だけの no-op、非存在パスの親探索も検査する。spec・マニュアル2ページを同じ仕様へ更新。見た目・固定 UI 文字列の変更なし。
+- 検証は今回の未コミット差分（基点 `d74e420ba`）で実施し、結果を本節末尾へ追記する。全件テストは設計担当の指定により実行しない。製品起動・コミットは行わない。
+
+#### ほかのパス入力経路の棚卸し (今回変更なし)
+
+ソース照合であり、各経路の実機入力試験ではない。`path_key::normalize_input_path` 自体は区切りとドライブ文字の整形だけで、引用符・空白を除かない。
+
+| 経路 | 現在の引用符・空白の扱い / 根拠 | 今回の判断 |
+|---|---|---|
+| 「フォルダを開く」ダイアログ | `ui_dialogs/open_folder.rs` は trim・実パス表記整形後に存在確認。引用符を外さず、存在しないパスはエラー表示 | フォルダバーに近い入力なので追加対応候補。今回は未修正 |
+| お気に入り追加・編集 | `ui_dialogs/fav_add.rs` は現在の対象パスを表示し表示名だけ編集。`favorites_editor.rs` のパス列も読み取り専用。登録時は実パス表記を整形、引用符除去なし | 同種の自由入力欄なし。変更不要 |
+| コレクションへ選択項目を追加 | `ui_dialogs/collections.rs::add_captured_paths_to_collection` は既存項目の実パスを取得。パスの自由編集欄なし | 変更不要 |
+| コレクションのテキスト取込 | `collection_store/text.rs::unquote_whole_line` は行の外側を trim 後、全体を囲む 1 組を外す。内側の端の空白は保持。片側だけ・途中の引用符・空文字はエラー。相対パス等は専用検証あり | 既に引用符対応。取込形式の仕様なので共通化しない |
+| 設定の指定起動フォルダ・本棚・画面キャプチャ/クリップボード保存先 | `ui_dialogs/preferences/pages.rs` の各入力は trim 後に `PathBuf` 化。引用符を残す | コピーした引用符付きパスへの対応候補。今回は未修正 |
+| 設定の整理先パス | 同 `draw_file_organize_destinations_settings` の編集は `PathBuf::from(path)`。trim・引用符除去なし (フォルダバーの場所メニュー選択時は共通 resolver を通る) | 入力保存側の対応候補。今回は未修正 |
+| 設定の外部ツール実行ファイル・作業フォルダ | 同設定ページ。実行ファイルは入力を `PathBuf` 化、作業フォルダは trim 後に `PathBuf` 化。引用符除去なし。引数テンプレートの引用符は別の構文 | 単一パス欄は対応候補。引数構文と混同せず、今回は未修正 |
+| エクスポートの保存先 | 一括は `ui_dialogs/export_batch.rs::ExportBatchDialogState::output_dir`、表示中の画像は `ui_fullscreen.rs` の export UI で trim 後に `PathBuf` 化、引用符除去なし | 単一パス欄の追加対応候補。今回は未修正 |
+| コマンドラインの起動対象 | `lib.rs::parse_startup_open_path_arg_from` は `args_os` の要素をそのまま `PathBuf` 化し、絶対化・実パス表記整形。アプリ側の引用符除去なし。通常のコマンドライン構文の引用符は argv へ渡る前に処理される | argv にリテラルで残る引用符の追加対応なし |
+| コマンドラインの `--data-dir` | `data_dir.rs::init` は `args` の次の要素をそのまま `PathBuf` 化。trim・アプリ側の引用符除去なし | 同じくコマンドライン構文側で囲む。リテラル引用符の追加対応なし |
+| 外部 D&D | `vendor/egui-winit/src/lib.rs` は `WindowEvent::DroppedFile(PathBuf)` を受け、`app/update_phases.rs::input_drop_and_activity` が実パスを回収。任意のパス文字列を解析する受信経路なし | 文字列用 unquote は不要 |
+
+#### 初回実装の検証記録 (52bd432f5)
+
+- 対象: `quoted-1684` / `3a193e50d` からの本節の未コミット差分。build/check/test は `MSBUILDDISABLENODEREUSE=1`、通常 features。
+- `cargo fmt` / `cargo fmt --check` / `git diff --check`: 成功、exit 0。fmt check のログは `target/quoted-1684-fmt-check.log`。UI の固定文字列を変えていないため `check_ui_glyphs.py` は対象外。
+- `cargo check -p mimageviewer --lib --tests -j 1`: 成功、exit 0、4分52秒 (`target/quoted-1684-check-retry.log`)。通常の並列 check の初回と関連 nextest の初回準備はそれぞれ TurboJPEG の CMake/MSBuild 工程で exit 101。生成済みの各 CMake build を `--parallel 1` で完了させ、その後 Cargo の build jobs 1 で検証を続行した。タイムアウトによる中断ではなく native 依存のビルド失敗であり、製品・依存・ビルド設定ファイルは変更していない。初回ログは `target/quoted-1684-check.log` / `target/quoted-1684-focused.log`、直列準備は `target/quoted-1684-native-diagnostic.log` / `target/quoted-1684-test-native.log`。
+- 関連 nextest: `cargo nextest run -p mimageviewer --lib -E 'test(folder_bar) | test(address)' --profile default --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --no-tests fail`。追加した5件を含む **41成功・0失敗、6.103秒、exit 0** (`target/quoted-1684-focused-retry.log`)。通常 features / test profile、`MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`。
+- `.\scripts\test-lib-full.ps1`: **全件を1回実行し、15,495成功・2失敗・1 timeout・71 skipped、1062.789秒、exit 100** (17 slow / 4 leaky)。全件成功とは扱わず、再実行もしない。ログ・JUnit は `target/test-lib-full/runs/20261102T070453875Z-21b10e7f/`、呼出ログは `target/quoted-1684-full.log`。実行時 source ID は `bb5bab10d7bc43cc2b81d9709676d7cee86043d1a21fd98652fdb332f47bb54b`。検証後の変更は本節の棚卸し・結果追記のみで、Rust 差分は同じ。
+- 全件で落ちた以下3件は、同じ通常 features / test profile / build jobs 1 で **各1件だけを選び3回ずつ、計9回すべて成功、各 exit 0**。コマンドは上記 nextest の filter を `test(=<完全なテスト名>)` に置き換えたもの。結果一覧は `target/quoted-1684-single-results.json`。今回のフォルダバー整形を呼ばない既存テストだが、全件時の失敗原因を本作業で確定したものではない。
+
+| 全件での失敗対象 | 全件時の結果 | 単独3回の結果 (nextest 実行秒) / ログ |
+|---|---|---|
+| `app::folder_scan::section1375_scan_perf_tests::section1375_large_physical_scan_10k_100k` | 600.246秒 timeout。10k / 100k の走査・投影完了ログは出たが、fixture の生成・破棄を含むテスト全体は完了しなかった | 3成功 (508.762 / 211.242 / 134.873秒)。`target/quoted-1684-single-1-{1,2,3}.log` |
+| `video::clockless_transcode::tests::finite_source_reaches_end_after_filling_the_live_window_without_a_next_fetch` | EOF / ENDLIST の通知待ちが Timeout | 3成功 (1.084 / 1.026 / 0.920秒)。`target/quoted-1684-single-2-{1,2,3}.log` |
+| `video::engine::clock::tests::wall_clock_extrapolates_like_audio` | 30ms sleep 後の値 5.1121925 が期待上限 5.100 を超過 | 3成功 (0.232 / 0.225 / 0.225秒)。`target/quoted-1684-single-3-{1,2,3}.log` |
+
+- 確認用 build: `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` が **成功、exit 0**。通常 features / dev-runtime、`MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`。core 42分37秒、remote service 3分39秒、EPUB worker 2分13秒。core・同protocolのremote service・EPUB worker・FFmpeg DLL・EffeTune bundleを `target/dev-runtime/` へ配置し、CRT/PE検査も成功 (`runtime=4 pe=3`)。ログは `target/quoted-1684-build-dev.log`。製品起動・実機操作・コミットは行っていない。
+
+#### P2 修正後の検証記録
+
+- 対象: `quoted-1684` / `52bd432f5` に対する本節の未コミット差分5ファイル。通常 features、`MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`。以下の検証後は本節の結果記録だけを追記し、Rust source は変更していない。コマンド・exit・所要時間は `target/quoted-1684-p2-results.jsonl`。
+- `cargo fmt`、`cargo fmt --check`、`git diff --check`: 全て成功、exit 0。ログは `target/quoted-1684-p2-fmt-{1,2,3}.log`。UI の固定文字列・見た目の変更はなし。
+- `cargo check -p mimageviewer --lib --tests`: 成功、exit 0、85.787秒。通常 dev profile、既存 warning あり。ログは `target/quoted-1684-p2-check-1.log`。
+- 関連 nextest: `cargo nextest run -p mimageviewer --lib -E 'test(folder_bar) | test(address) | test(history) | test(quick_folder)' --profile default --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --no-tests fail`。**457成功・0失敗・0 timeout、96.712秒、exit 0**（7 slow、15,117 skipped）。追加5件と拡張した Enter 回帰を含む。test profile / default nextest。run `fd10880c-6200-403e-b284-6f71c35a687e`、ログ `target/quoted-1684-p2-focused-1.log`、JUnit の保存コピー `target/quoted-1684-p2-focused-junit.xml`。コンパイルを含む呼出全体は395.624秒。
+- `.\scripts\test-lib-full.ps1`: **全件を1回実行し、15,503成功・0失敗・0 timeout、71 skipped、776.243秒、exit 0**（11 slow / 1 leaky）。落ちたテストがないため単独3回は不要、全件の再実行もなし。初回実装で落ちた既存3件も今回の全件では成功（大量走査は495.636秒）。test profile / default を継承する miv-tool nextest profile。run `fbfbda4a-fffe-48c1-81b3-0d1d1d9058bf`、ログ・JUnit `target/test-lib-full/runs/20261102T084817554Z-ca6e5572/`、呼出ログ `target/quoted-1684-p2-full-1.log`。実行時 source ID `a0099638b52f865b27ed4ed5b4aedfb910c884a9a3cf35c9088874bf39cd70a9`、成功台帳 `target/test-lib-full/fb4e06262ad5021837ee4217c9ebec5e50644af34b856b5f9dece8dc4c0f0313.json`。
+- 独立レビュー: 別コンテキストの GPT-6.1 Sol / xhigh が6 caller、入力境界、既存分岐、追加回帰と文書を read-only で照合し **ACCEPT、指摘なし**。レビュー担当はテストを重複実行せず、本記録の結果を再利用する。
+- 確認用 build: `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` は **成功、exit 0、全体377.150秒**。通常 features / dev-runtime、上記と同じ環境変数。core 6分12秒、remote service 0.58秒、EPUB worker 0.64秒。core・同protocolのremote service・EPUB worker・FFmpeg DLL・EffeTune bundleを `target/dev-runtime/` へ配置し、CRT/PE検査も成功（`runtime=4 pe=3`）。ログ `target/quoted-1684-p2-build-1.log`。製品起動・実機操作・コミットは行っていない。ユーザーが確認する場合はインストール版／常駐tray版を終了してから `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常の `%APPDATA%\mimageviewer` を使い、実設定・データを更新し得る。確認対象は空白なし兄弟がある末尾全角空白フォルダへの引用符なし Enter・A/B・履歴での移動、および引用符付き Enter だけ内側 trim される仕様。
+
+#### P3 修正後の検証記録
+
+- 対象: `quoted-1684` / `d74e420ba` に対する本節の未コミット差分5ファイル。通常 features、`MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`。検証後は本節の結果記録だけを追記し、Rust source は変更していない。check・nextest・build のコマンド・exit・呼出全体の所要時間は `target/quoted-1684-p3-results.jsonl`。
+- `cargo fmt`、`cargo fmt --check`、`git diff --check`: 全て成功、exit 0。UI の固定文字列・見た目は変更なし。
+- `cargo check -p mimageviewer --lib --tests`: 成功、exit 0、68.051秒。通常 dev profile、既存 warning あり。ログ `target/quoted-1684-p3-check.log`。
+- 関連 nextest: `cargo nextest run -p mimageviewer --lib -E 'test(folder_bar) | test(address)' --profile default --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --no-tests fail`。**47成功・0失敗・0 timeout、4.769秒、exit 0**（15,528 skipped）。追加・変更した回帰と既存の native A/B・履歴、Enter・IME の回帰を含む。test profile / default nextest、run `8f4ca66a-3f27-4331-a52e-4a818ad72014`。ログ `target/quoted-1684-p3-focused.log`、JUnit 保存コピー `target/quoted-1684-p3-focused-junit.xml`。コンパイルを含む呼出全体は210.302秒。全件は設計担当の指定どおり未実施。
+- 確認用 build: `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` は **成功、exit 0、全体293.584秒**。通常 features / dev-runtime、上記と同じ環境変数。core 4分48秒、remote service 0.50秒、EPUB worker 0.45秒。CRT/PE検査も成功（`runtime=4 pe=3`）。ログ `target/quoted-1684-p3-build.log`。製品起動・実機操作・コミットは未実施、HEAD は `d74e420ba` のまま。ユーザーが確認する場合はインストール版／常駐tray版を終了してから `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常の `%APPDATA%\mimageviewer` を使い、実設定・データを更新し得る。確認対象は `写真　` と `写真` が共存するとき、引用符付きパスでも末尾全角空白フォルダへ移ること、および `""` / `" "` で移動しないこと。
 
 ### 1.683 製本の管理で、本の並び順を利用者が決められるようにする — 利用者要望 (2026-11-02)
 
