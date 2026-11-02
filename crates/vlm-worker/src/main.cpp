@@ -63,12 +63,11 @@ int run(const std::vector<std::string> & args) {
     if (order == "reverse") std::reverse(images.begin(), images.end());
     ExclusiveOutput out(out_path);
     static EngineErrors errors;
-    auto log = [](ggml_log_level, const char * message, void * user) {
-        static_cast<EngineErrors *>(user)->observe(message);
+    auto log = [](ggml_log_level level, const char * message, void * user) {
+        static_cast<EngineErrors *>(user)->observe(level, message);
         std::fputs(message, stderr);
     };
-    llama_log_set(log, &errors);
-    ggml_log_set(log, &errors);
+    // Only mtmd collapses resource failures into image failure return codes.
     mtmd_helper_log_set(log, &errors);
     auto selected = select_device(options["--device"]);
     auto start = Clock::now();

@@ -18,7 +18,7 @@ Rust 本体に接続しない Windows x64 の単体試作。製品バイナリ�
 $env:MSBUILDDISABLENODEREUSE = '1'
 $env:CMAKE_BUILD_PARALLEL_LEVEL = '1'
 cmake -S crates/vlm-worker -B crates/vlm-worker/build -G 'Visual Studio 18 2026' -A x64 -DVLM_REFERENCE_TOOLS=OFF
-cmake --build crates/vlm-worker/build --config Release --target mimageviewer-vlm vlm-contract-tests vlm-greedy-tests vlm-image-attempt-tests vlm-output-tests -- /m:1 /nr:false
+cmake --build crates/vlm-worker/build --config Release --target mimageviewer-vlm vlm-contract-tests vlm-greedy-tests vlm-image-attempt-tests vlm-output-tests vlm-image-input-tests -- /m:1 /nr:false
 ctest --test-dir crates/vlm-worker/build -C Release --output-on-failure
 ```
 
@@ -50,6 +50,11 @@ New-Item -ItemType Directory -Force $run | Out-Null
 引数は Unicode の Windows command line を受ける。
 PNG のファイル名でソートし、reverse はその逆順。画像をコピーしない。入力は縮小済みの PNG（各軸1〜1024px）だけを受ける。
 IHDR の寸法をデコード前に検査し、検査した同一の byte buffer を mtmd helper/STB でデコードする。
+入力ファイル全体（付加チャンク・末尾データを含む）は **16 MiB**まで。
+1024×1024・RGBA・16bit の非圧縮画素は約8 MiBなので、その約2倍を固定上限とし、通常のPNGと一定量の付加情報を収める。
+この確認用モードで大きすぎる付加情報まで読み込まないための上限で、超過はその画像だけ `ImageFailure` にする。
+64 KiB単位で読み、上限判定用の1 byteを含めても最大16 MiB＋1 byteしか読まない。ファイルサイズの事前確認やseekには依存しない。
+保持する入力は最大16 MiBであり、`kMaxPngBytes <= INT_MAX` をstatic_assertし、STBの `int` 長へ必ず収まる。
 
 モデルと mmproj はプロセスで一度だけ読み込む。各画像で llama context（memory・sequence）と grammar sampler を新規作成し、
 位置 0、sequence 0 から開始して、その画像の最後に破棄する。mtmd の画像チャンク・bitmap も各件で破棄する。
@@ -75,9 +80,15 @@ parse の前に buffer 全体の生の NUL と不正な UTF-8 を拒否する。
 | モデル/mmproj読込、context/sampler/batch作成・設定、割当失敗/VRAM不足、device喪失、評価戻り値 `< -1` | 全体を止める。自動再試行はしない |
 | 出力作成・書込の失敗、予期しない例外 | 全体を止める |
 
-b12032 の mtmd は `bad_alloc` 等も catch して前処理/encode の失敗コードにまとめるため、
-llama/ggml/mtmd の log callback で割当失敗と device 喪失の診断も保持し、戻り値と合わせて判定する。
-診断は stderr へ従来どおり転送する。これは固定版の診断文に依存するので、llama.cpp 更新時は分類テストも確認する。
+llama の評価は公開された戻り値（`< -1` は致命的）を優先して判定し、そのログは分類に使わない。
+b12032 の mtmd は `bad_alloc` 等も catch して画像の前処理/encode失敗コードへまとめるため、その範囲だけログを補完に使う。
+登録先をmtmd/clipのcallbackに限定し、`ERROR` の固定診断だけを照合する（数値が大きい `CONT` はERROR扱いしない）。
+具体的には `clip_encode` 等の割当失敗全文、clip graph computeの致命的status全文、
+`mtmd_tokenize` / `mtmd_encode_chunk` の例外報告形式における `bad allocation` / `std::bad_alloc` の完全一致、
+Vulkan-Hppの `vk::Device::<API名>` / `vk::Queue::<API名>`＋定義済みのメモリ不足/device喪失コード、
+およびggml-vulkanが直接投げる2種類の固定メモリ不足診断を認識する。
+パス・メタデータの部分文字列は検索しない。診断はstderrへそのまま転送する。
+この補完は固定版の発生元・形式に依存するので、llama.cpp 更新時は分類テストも確認する。
 
 検索語は schema・埋め込み GBNF・検証器のすべてで **32文字**に揃えた。
 元の `run_eval.py` の v0-3l（40文字）は過去比較用として変更せず、worker の `prompt.h` の `kSchema` を32文字にする。
@@ -217,3 +228,31 @@ python -I crates/vlm-worker/tools/compare_forward.py --previous 'G:\home\vlm-eva
 exe は48,080,384 bytes、SHA-256 `1b493a52b3a658e17d24a427ad659b5a3dafe88ec739da5c54324021d05963d4`。
 再度の `dumpbin /imports` は従来と同じ4 DLLのみ、通信系 import なし。
 llama.cpp は4,015ファイルすべてのSHA-256が初回作業前と一致した。Rust本体は未変更、製品起動・通信・コミットは行っていない。
+
+## ログ分類と入力byte上限の追補（2026-11-02）
+
+`2f0c54be8` 後の2件への対応。ログの全文部分一致を廃止し、上記のとおり戻り値を優先する。
+mtmd側だけは失敗の種類が失われるため、ERRORレベル・発生元・固定診断形式を照合する補完を残した。
+モデルパスやメタデータのINFO/DEBUGログ、ERRORに含まれる判定語、CONTや診断に続く余分な内容では致命扱いにしない。
+
+PNG入力の固定上限は16 MiB。読取中にも制限するので、大きな付加チャンク・末尾データ、seek不可の入力、
+検査後に増えるファイルでも入力全量を保持しない。上限超過は失敗行にして次の画像へ進む。
+STBに渡すbufferはこの読取関数からのものだけで、長さは必ず `int` に収まる。
+
+CTest **5/5成功**。判定語を含む正常なパスの各logレベル、ERRORの非診断メッセージ、固定形式の資源失敗を回帰検証した。
+入力は上限直前・上限ちょうどの受理、1 byte超過・2 GiB超の拒否、最大読取量16 MiB＋1 byte、
+拒否後の次画像への続行を非seekの合成streamで検証した。2 GiBの実ファイルや私的な画像のコピーは作成していない。
+
+forwardは新しい出力 `G:\home\vlm-eval\runs\20261102-V1-0-review-fixes-2\forward-bounded.jsonl` へ1回実行した。
+**26/26で全検証成功**。直前の `20261102-V1-0-review-fixes\forward-32.jsonl` と、caption・text・keywords・content・
+finish_reason・usage・prompt_chunks はすべて **26/26完全一致**。検索語は最長17文字。
+
+```powershell
+$run = 'G:\home\vlm-eval\runs\20261102-V1-0-review-fixes-2'
+python -I crates/vlm-worker/tools/compare_forward.py --previous 'G:\home\vlm-eval\runs\20261102-V1-0-review-fixes\forward-32.jsonl' --current "$run\forward-bounded.jsonl" --out "$run\forward-comparison.json"
+```
+
+読み込み2.393秒、初回21.757秒、初回以外の中央値1.392秒。
+exeは48,081,920 bytes、SHA-256 `708b8e2214251752f674737958de431b1115546cd555115dcc27cafbac6e671b`。
+importは引き続き4本のOS DLLのみ。llama.cppの4,015ファイルも初回作業前から不変。
+Rust本体・Cargo/workspaceは未変更、製品起動・通信・コミットは行っていない。

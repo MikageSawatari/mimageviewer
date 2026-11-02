@@ -1,16 +1,45 @@
 #pragma once
 #include "image_attempt.h"
+#include "ggml.h"
 #include <atomic>
-#include <cstring>
+#include <string_view>
 
 // b12032 mtmd catches allocation exceptions and returns the same code as bad images.
 struct EngineErrors {
     std::atomic<bool> fatal{false};
-    void observe(const char * message) noexcept {
-        for (const char * marker : {"bad allocation", "bad_alloc", "failed to allocate", "allocation failed",
-                "out of memory", "OutOfDeviceMemory", "OutOfHostMemory", "ErrorDeviceLost", "device lost"}) {
-            if (std::strstr(message, marker)) fatal.store(true, std::memory_order_relaxed);
+    static bool vulkan_resource_exception(std::string_view what) noexcept {
+        auto delimiter = what.rfind(": ");
+        if (delimiter == std::string_view::npos) return false;
+        auto origin = what.substr(0, delimiter);
+        auto code = what.substr(delimiter + 2);
+        if (code != "ErrorOutOfDeviceMemory" && code != "ErrorOutOfHostMemory" && code != "ErrorDeviceLost") return false;
+        if (origin == "Requested buffer size exceeds device buffer size limit" || origin == "No suitable memory type found")
+            return code == "ErrorOutOfDeviceMemory";
+        // Vulkan-Hpp generated exception origin: a qualified API identifier, never a path.
+        if (origin.substr(0, 12) == "vk::Device::") origin.remove_prefix(12);
+        else if (origin.substr(0, 11) == "vk::Queue::") origin.remove_prefix(11);
+        else return false;
+        if (origin.empty()) return false;
+        for (char c : origin) if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '_')) return false;
+        return true;
+    }
+    // Called only by mtmd/clip's callback. llama errors use their typed return codes.
+    void observe(ggml_log_level level, const char * message) noexcept {
+        // CONT has a larger numeric value but is not a higher severity.
+        if (level != GGML_LOG_LEVEL_ERROR || !message) return;
+        std::string_view text(message);
+        bool resource = text == "clip_encode: failed to allocate compute graph\n"
+            || text == "clip_gen_state_init: failed to allocate the gen state\n"
+            || text == "clip_enc_state_init: failed to allocate the encoder state\n"
+            || text == "clip_encode: ggml_backend_sched_graph_compute failed with error -2\n"
+            || text == "clip_encode: ggml_backend_sched_graph_compute failed with error -1\n";
+        for (auto prefix : {std::string_view("mtmd_tokenize: error: "), std::string_view("mtmd_encode_chunk: error: ")}) {
+            if (text.substr(0, prefix.size()) != prefix || text.empty() || text.back() != '\n') continue;
+            auto what = text.substr(prefix.size(), text.size() - prefix.size() - 1);
+            resource = resource || what == "bad allocation" || what == "std::bad_alloc" || vulkan_resource_exception(what);
         }
+        if (resource) fatal.store(true, std::memory_order_relaxed);
     }
     void check_fatal() const {
         if (fatal.load(std::memory_order_relaxed)) throw std::runtime_error("Engine memory allocation or device failure");

@@ -36,15 +36,38 @@ int main() {
             check(false);
         } catch (const ImageFailure &) { check(false); } catch (const std::runtime_error &) {}
     }
-    for (const char * diagnostic : {"clip: failed to allocate compute graph\n", "mtmd_tokenize: error: bad allocation\n",
-            "mtmd_encode_chunk: vk::Device::allocateMemory: ErrorOutOfDeviceMemory\n", "device lost"}) {
+    for (const char * diagnostic : {"clip_encode: failed to allocate compute graph\n", "mtmd_tokenize: error: bad allocation\n",
+            "mtmd_encode_chunk: error: vk::Device::allocateMemory: ErrorOutOfDeviceMemory\n",
+            "mtmd_encode_chunk: error: vk::Queue::submit: ErrorDeviceLost\n",
+            "clip_encode: ggml_backend_sched_graph_compute failed with error -2\n",
+            "mtmd_encode_chunk: error: Requested buffer size exceeds device buffer size limit: ErrorOutOfDeviceMemory\n"}) {
         EngineErrors resource;
-        resource.observe(diagnostic);
+        resource.observe(GGML_LOG_LEVEL_ERROR, diagnostic);
         try {
             nlohmann::json record;
             run_image_attempt(record, [&] { resource.check_tokenize(2); });
             check(false);
         } catch (const ImageFailure &) { check(false); } catch (const std::runtime_error &) {}
+    }
+    for (auto level : {GGML_LOG_LEVEL_NONE, GGML_LOG_LEVEL_DEBUG, GGML_LOG_LEVEL_INFO, GGML_LOG_LEVEL_WARN, GGML_LOG_LEVEL_CONT}) {
+        EngineErrors normal;
+        normal.observe(level, "load_model: G:\\models\\bad_alloc\\model.gguf\n");
+        normal.observe(level, "clip_model_load: G:\\out of memory\\mmproj.gguf\n");
+        normal.observe(level, "clip_encode: failed to allocate compute graph\n");
+        check(!normal.fatal.load());
+        normal.check_tokenize(0);
+    }
+    for (const char * normal : {"load_model: G:\\models\\bad_alloc\\model.gguf\n",
+            "clip_model_load: G:\\out of memory\\mmproj.gguf\n",
+            "metadata: clip_encode: failed to allocate compute graph\n",
+            "mtmd_tokenize: error: unsupported metadata G:\\models\\bad_alloc\\model.gguf\n",
+            "mtmd_encode_chunk: error: cannot open G:\\out of memory\\ErrorOutOfDeviceMemory\n",
+            "clip_encode: failed to allocate compute graph\nextra metadata",
+            "mtmd_encode_chunk: error: vk::Device::allocateMemory: ErrorOutOfDeviceMemory\nextra metadata",
+            "clip_encode: ggml_backend_sched_graph_compute failed with error 1\n"}) {
+        EngineErrors errors_with_metadata;
+        errors_with_metadata.observe(GGML_LOG_LEVEL_ERROR, normal);
+        check(!errors_with_metadata.fatal.load());
     }
     try {
         nlohmann::json record;
