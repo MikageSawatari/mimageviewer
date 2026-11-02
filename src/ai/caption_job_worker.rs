@@ -443,21 +443,14 @@ fn save_result(
     match saved.map_err(|error| error.to_string())? {
         None => Ok(CaptionItemOutcome::Cancelled),
         Some(SaveOutcome::Discarded) => Ok(CaptionItemOutcome::Discarded),
-        Some(SaveOutcome::Written) => {
-            notify_written(path);
-            Ok(if failed {
-                CaptionItemOutcome::Failed
-            } else {
-                CaptionItemOutcome::Created
-            })
-        }
+        Some(SaveOutcome::Written) => Ok(if failed {
+            CaptionItemOutcome::Failed
+        } else {
+            CaptionItemOutcome::Created
+        }),
         Some(SaveOutcome::KeptExistingOk) => Ok(CaptionItemOutcome::Failed),
     }
 }
-
-/// V1-4 will invalidate the shared caption display cache here; V2 will wake
-/// each search index owner. Only committed Written results reach this hook.
-fn notify_written(_path: &Path) {}
 
 fn stage_event(stage: &str, started: Instant, success: bool) {
     crate::perf::event(

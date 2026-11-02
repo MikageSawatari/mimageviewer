@@ -17,6 +17,34 @@ use crate::xmp_reader::{self, XmpTweetInfo};
 /// パネルタイトルバーの高さ
 const TITLE_BAR_H: f32 = 32.0;
 
+/// Presentation history belongs to the panel's egui viewport, not the shared
+/// value cache. A hidden frame or another item starts a new signature read.
+#[derive(Clone, Default)]
+struct CaptionPanelVisit {
+    key: Option<String>,
+    frame: u64,
+}
+
+impl CaptionPanelVisit {
+    fn observe(&mut self, key: Option<&str>, frame: u64) -> bool {
+        let started = key.is_some()
+            && (self.key.as_deref() != key
+                || (frame != self.frame && frame != self.frame.saturating_add(1)));
+        self.key = key.map(str::to_owned);
+        self.frame = frame;
+        started
+    }
+}
+
+fn caption_panel_visit(ctx: &egui::Context, key: Option<&str>) -> bool {
+    let id = egui::Id::unique(("caption_panel_visit", ctx.viewport_id()));
+    let frame = ctx.cumulative_frame_nr();
+    ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<CaptionPanelVisit>(id)
+            .observe(key, frame)
+    })
+}
+
 #[cfg(test)]
 thread_local! {
     static LAST_METADATA_CLOSE_BUTTON_RECT: std::cell::Cell<Option<egui::Rect>> = const {
@@ -2236,6 +2264,7 @@ impl App {
         lock_effective: bool,
         seek_height: f32,
     ) -> bool {
+        caption_panel_visit(ctx, None);
         let Some(content_rect) = self.begin_metadata_panel_frame(
             ui,
             ctx,
@@ -2245,6 +2274,7 @@ impl App {
             false,
             None,
         ) else {
+            caption_panel_visit(ctx, None);
             return false;
         };
         let similar_feature_capability = self.similar_feature_capability();
@@ -2313,6 +2343,7 @@ impl App {
             tag_picker_open,
             navigator_exclusion,
         ) else {
+            caption_panel_visit(ctx, None);
             return false;
         };
 
@@ -2461,6 +2492,7 @@ impl App {
                 }
 
                 if book_query_demanded {
+                    caption_panel_visit(ctx, None);
                     // 見開き中は**両方のページ**を見ている。片方だけ調べると、もう片方に
                     // 別バージョンがあっても気付けない。補正パネルが左右を切り替えるのは
                     // 編集が一度に 1 ページだからで、閲覧側にその制約はない。
@@ -2566,6 +2598,7 @@ impl App {
                 }
 
                 if self.fullscreen_tag_picker_open {
+                    caption_panel_visit(ctx, None);
                     draw_fullscreen_tag_picker_panel(
                         ui,
                         &tag_catalog,
@@ -2583,6 +2616,29 @@ impl App {
 
                 // ── ★ レーティング (最上段。★ → タグ → 内容 の統一順序) ──
                 // ページ★とコンテナ★を両方出す (コンテナ行があるときはページを明記)。
+                let caption_target = (self.similar_panel.tab == MetadataPanelTab::Info)
+                    .then_some(self.fullscreen_idx)
+                    .flatten()
+                    .and_then(|idx| match self.items.get(idx) {
+                        Some(crate::grid_item::GridItem::Image(path)) => {
+                            self.metadata_cache_key(idx).map(|key| (key, path.clone()))
+                        }
+                        _ => None,
+                    });
+                let refresh =
+                    caption_panel_visit(ctx, caption_target.as_ref().map(|(key, _)| key.as_str()));
+                let caption_display = caption_target.and_then(|(key, path)| {
+                    if let Err(error) = self.caption_display.request(ctx, &key, &path, refresh) {
+                        self.show_feedback_warning(format!(
+                            "AI 説明を読み込めませんでした: {error}"
+                        ));
+                    }
+                    self.caption_display.get(&key).cloned()
+                });
+                let caption_row = caption_display
+                    .as_ref()
+                    .and_then(|value| value.row.as_ref());
+
                 let show_rating = rating_idx.is_some() || container_rating.is_some();
                 if show_rating {
                     if let Some((label, stars)) = container_rating {
@@ -2602,6 +2658,7 @@ impl App {
                         || exif_info.is_some()
                         || sidecar_info.is_some()
                         || current_palette.is_some()
+                        || caption_row.is_some()
                     {
                         ui.add_space(8.0);
                         ui.separator();
@@ -2629,6 +2686,7 @@ impl App {
                         || exif_info.is_some()
                         || sidecar_info.is_some()
                         || current_palette.is_some()
+                        || caption_row.is_some()
                     {
                         ui.add_space(8.0);
                         ui.separator();
@@ -2640,6 +2698,7 @@ impl App {
                 if let Some(ref palette) = current_palette {
                     draw_image_color_palette_section(ui, palette, &mut clicked_palette_rgb);
                     if tweet_info.is_some()
+                        || caption_row.is_some()
                         || ai_metadata.is_some()
                         || exif_info.is_some()
                         || sidecar_info.is_some()
@@ -2648,6 +2707,19 @@ impl App {
                         ui.separator();
                         ui.add_space(8.0);
                     }
+                }
+
+                // Saved local descriptions sit above source/generation metadata.
+                if let Some(ref caption) = caption_display
+                    && draw_caption_section(ui, ctx, caption)
+                    && (tweet_info.is_some()
+                        || ai_metadata.is_some()
+                        || exif_info.is_some()
+                        || sidecar_info.is_some())
+                {
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
                 }
 
                 // X ツイート情報 (mXD 由来)
@@ -2712,6 +2784,7 @@ impl App {
                     && current_palette.is_none()
                     && rating_idx.is_none()
                     && container_rating.is_none()
+                    && caption_row.is_none()
                 {
                     draw_no_metadata(ui);
                 }
@@ -5765,6 +5838,181 @@ fn draw_unknown_panel(ui: &mut egui::Ui, chunks: &[(String, String)]) {
                 .font(crate::ui_fonts::user_text_font(BODY_FONT)),
         );
         ui.add_space(8.0);
+    }
+}
+
+/// Pure rendering shared with snapshots; no DB or filesystem access.
+fn draw_caption_section(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    value: &crate::caption_display_cache::CaptionDisplayValue,
+) -> bool {
+    let Some(row) = value.row.as_ref() else {
+        return false;
+    };
+    ui.label(
+        egui::RichText::new("AI 説明")
+            .color(ui.visuals().text_color())
+            .size(16.0)
+            .strong(),
+    );
+    ui.add_space(8.0);
+    match row.status {
+        crate::ai_caption_db::CaptionStatus::Ok => {
+            draw_text_section(ui, ctx, "説明文", &row.caption);
+            if !row.visible_text.is_empty() {
+                ui.add_space(8.0);
+                draw_text_section(ui, ctx, "画像内の文字", &row.visible_text);
+            }
+            ui.add_space(8.0);
+            draw_text_section(ui, ctx, "検索語", &row.keywords.join("、"));
+        }
+        crate::ai_caption_db::CaptionStatus::Failed => {
+            ui.label("この画像の説明文を作れませんでした");
+        }
+    }
+    ui.add_space(8.0);
+    let date = crate::app::format_details_timestamp(row.created_at / 1000, false);
+    ui.label(
+        egui::RichText::new(format!("作成日: {date}"))
+            .color(ui.visuals().weak_text_color())
+            .size(11.0),
+    )
+    .on_hover_text(&row.model_id);
+    if value.is_stale() {
+        ui.add_space(8.0);
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            "画像が変わっています。右クリックの『AI 説明文を作る』で作り直せます",
+        );
+    }
+    true
+}
+
+#[cfg(test)]
+mod caption_panel_tests {
+    use super::*;
+    use crate::ai_caption_db::{CaptionRow, CaptionStatus, FileSignature};
+    use crate::caption_display_cache::CaptionDisplayValue;
+    use egui_kittest::kittest::Queryable;
+
+    fn fixture() -> CaptionDisplayValue {
+        let signature = FileSignature {
+            size: 123,
+            mtime_ms: 1_793_665_800_000,
+        };
+        CaptionDisplayValue {
+            row: Some(CaptionRow {
+                item_key: "c:/photos/cafe.jpg".into(), signature,
+                model_id: "qwen3.5-4b-q4_k_m@fixture".into(),
+                prompt_version: 1, lang: "ja".into(),
+                caption: "木のテーブルにコーヒーと白いカップが置かれています。窓の外には緑の木々が見えます。".into(),
+                visible_text: "COFFEE".into(),
+                keywords: vec!["コーヒー".into(), "カップ".into(), "窓".into()],
+                cover_ref: String::new(), status: CaptionStatus::Ok,
+                created_at: 1_793_665_800_000, rev: 1, indexed: false,
+            }),
+            current: Some(signature),
+        }
+    }
+
+    fn harness(value: CaptionDisplayValue) -> egui_kittest::Harness<'static> {
+        let mut fonts_ready = false;
+        crate::test_ui::builder()
+            .with_size(egui::vec2(340.0, 390.0))
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    if !draw_caption_section(ui, ctx, &value) {
+                        draw_no_metadata(ui);
+                    }
+                });
+            })
+    }
+
+    #[test]
+    fn caption_panel_snapshot_ok() {
+        let mut ui = harness(fixture());
+        ui.run();
+        assert_eq!(ui.get_all_by_label("Copy").count(), 3);
+        ui.get_by_label("画像内の文字");
+        ui.get_by_label("コーヒー、カップ、窓");
+        ui.snapshot("caption_panel_ok");
+    }
+
+    #[test]
+    fn caption_panel_snapshot_failed() {
+        let mut value = fixture();
+        value.row.as_mut().unwrap().status = CaptionStatus::Failed;
+        let mut ui = harness(value);
+        ui.run();
+        ui.get_by_label("この画像の説明文を作れませんでした");
+        assert!(ui.query_by_label("Copy").is_none());
+        assert!(ui.query_by_label("画像内の文字").is_none());
+        ui.snapshot("caption_panel_failed");
+    }
+
+    #[test]
+    fn caption_panel_snapshot_stale_keeps_description() {
+        let mut value = fixture();
+        value.current.as_mut().unwrap().size += 1;
+        let mut ui = harness(value);
+        ui.run();
+        ui.get_by_label("説明文");
+        ui.get_by_label("画像が変わっています。右クリックの『AI 説明文を作る』で作り直せます");
+        ui.snapshot("caption_panel_stale");
+    }
+
+    #[test]
+    fn caption_panel_no_row_preserves_empty_display_and_empty_text_is_omitted() {
+        let mut ui = harness(CaptionDisplayValue::default());
+        ui.run();
+        ui.get_by_label("Image Info");
+        ui.get_by_label("No metadata found.");
+        assert!(ui.query_by_label("AI 説明").is_none());
+        drop(ui);
+        let mut value = fixture();
+        value.row.as_mut().unwrap().visible_text.clear();
+        value.current = None;
+        let mut ui = harness(value);
+        ui.run();
+        assert!(ui.query_by_label("画像内の文字").is_none());
+        assert_eq!(ui.get_all_by_label("Copy").count(), 2);
+        assert!(ui.query_by_label("No metadata found.").is_none());
+        assert!(
+            ui.query_by_label(
+                "画像が変わっています。右クリックの『AI 説明文を作る』で作り直せます"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn caption_panel_visit_refreshes_on_reopen_and_isolates_viewports() {
+        let mut visit = CaptionPanelVisit::default();
+        assert!(visit.observe(Some("a"), 1));
+        assert!(!visit.observe(Some("a"), 1)); // egui layout multipass
+        assert!(!visit.observe(Some("a"), 2));
+        assert!(visit.observe(Some("b"), 3));
+        assert!(visit.observe(Some("a"), 4));
+        assert!(!visit.observe(None, 5));
+        assert!(visit.observe(Some("a"), 6));
+        assert!(visit.observe(Some("a"), 8)); // fullscreen closed for a frame
+        assert!(visit.observe(Some("a"), 0)); // recreated viewport frame counter
+        let ctx = egui::Context::default();
+        assert!(caption_panel_visit(&ctx, Some("a")));
+        assert!(!caption_panel_visit(&ctx, Some("a")));
+        // A second panel's fresh presentation never resets the first one's visit.
+        let mut sibling = CaptionPanelVisit::default();
+        assert!(sibling.observe(Some("b"), 1));
+        assert!(!visit.observe(Some("a"), 1));
     }
 }
 

@@ -60,6 +60,8 @@ pub(crate) struct BookAppendMetadataCopySummary {
     /// the current stores, since users can edit a page before this report polls.
     pub ratings: Vec<String>,
     pub tags: Vec<String>,
+    /// A reused destination had a caption row removed before creating its file.
+    pub captions_changed: bool,
     pub errors: Vec<String>,
     pub database_elapsed: std::time::Duration,
 }
@@ -219,8 +221,10 @@ impl AppendMetadataWriter {
         // Newly copied bytes have a new signature, so captions never follow a
         // page copy. Clear a reused destination before publishing the file.
         if let Some(db) = self.ai_captions.as_mut() {
-            db.delete(&to)
+            let deleted = db
+                .delete(&to)
                 .map_err(|error| metadata_initialization_error("ai_caption", error))?;
+            self.report.captions_changed |= deleted > 0;
         }
         if let Some(db) = self.tags.as_mut() {
             if let Some(from) = semantic.as_deref() {
@@ -822,6 +826,41 @@ mod tests {
         .unwrap();
         assert!(result.succeeded.is_empty());
         assert_eq!(result.failed.len(), 1);
+    }
+
+    #[test]
+    fn ai_caption_append_report_changes_only_when_destination_row_was_deleted() {
+        let fixture = Fixture::new();
+        let data = fixture.tmp.path().join("data");
+        let db = crate::ai_caption_db::CaptionDb::open_at(&data.join("ai_caption.db")).unwrap();
+        let destination = fixture.folder.join("0001_reused.jpg");
+        let key = crate::adjustment_db::normalize_path(&destination);
+        let stores = AppendMetadataStores::existing_at(&data);
+        let mut writer = AppendMetadataWriter::open_at(&data, stores).unwrap();
+        writer
+            .prepare_destination(&destination, None, None)
+            .unwrap();
+        assert!(!writer.finish().captions_changed);
+
+        let connection = rusqlite::Connection::open(data.join("ai_caption.db")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO captions (item_key, mtime_ms, size, model_id, prompt_version, lang,
+                caption, visible_text, cover_ref, keywords, status, created_at)
+             VALUES (?1, 1, 1, 'test-model', 1, 'ja', 'old caption', '', '', '[]', 'ok', 1)",
+                [&key],
+            )
+            .unwrap();
+        let mut writer = AppendMetadataWriter::open_at(&data, stores).unwrap();
+        writer
+            .prepare_destination(&destination, None, None)
+            .unwrap();
+        assert!(db.get(&key).unwrap().is_none());
+        // A later destination with no prior row must not clear the summary bit.
+        writer
+            .prepare_destination(&destination, None, None)
+            .unwrap();
+        assert!(writer.finish().captions_changed);
     }
 
     #[test]

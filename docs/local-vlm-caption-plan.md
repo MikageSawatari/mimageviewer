@@ -1592,12 +1592,15 @@ gh release create vlm-model-v1 --repo MikageSawatari/mimageviewer --target main 
      採用しない (保存や取り込みより前に始まった読み込みが後から届く場合)。読み直しは、次にパネルがそのキーを描くときに起きる。
    - mIV の終了では channel を閉じるだけで join しない。DB の失敗は「行なし」として扱いログに出す (まれな失敗は割り切り)。
 3. **要求のきっかけ**: パネルが `GridItem::Image` を描くとき、キーがキャッシュに無ければ要求を送る (UI スレッドは channel に送るだけで I/O をしない)。
-   `Loading` の間は送り直さない。ほかの種類 (ZIP 内の画像・PDF のページ・動画・音声・本) では要求しない (本は V1-4b)。
+   同じキーを描き続けている間は、`Loading` 中も送り直さない。ほかの種類 (ZIP 内の画像・PDF のページ・動画・音声・本) では要求しない (本は V1-4b)。
    - **今の署名は、表示を始めるたびに取り直す** (独立レビュー 18 回目 P2-1)。キャッシュにある `current` は、その読み込みの時点の署名でしかない。
      画像は外部で上書きされても説明文の DB は変わらないので、DB の無効化だけでは「古い」にならない。そこで、パネルが描くキーが前のフレームと
      変わったとき (開く・前後の移動・開き直し) は、キャッシュにあっても読み直しを送る。届くまでは今の値を出し (ちらつかせない)、届いたら入れ替える。
      1 回の表示につき SELECT と stat が 1 回で、毎フレームは送らない。一覧の読み直し (今の context のメタデータキャッシュを消す経路、`app.rs` の
      一覧の再読み込み) でも共有キャッシュを全部消す。
+   - **読み込み中の再入場 (2026-11-03 設計担当の判断)**: 表示を始めたときは `Loading` 中でもそのキーの `gen` を進めて再送する。
+     先の結果は世代不一致で捨て、新しい stat は再入場後に取る。「Loading 中は送り直さない」は同じキーを描き続ける毎フレームだけの規則。
+     再入場の印や後続 read 待ち状態は足さず、Loading / Loaded の2状態を保つ。Loaded の再読込中は以前の値を残す。
 4. **パネルの欄「AI 説明」**: ★・タグ・パレットの後、ツイート・生成情報・EXIF の前に置く (内容の説明なので、生成情報より上)。
    - `ok` の行: 説明文・画像内の文字 (空なら出さない)・検索語 (読点でつなぐ) を、既存の `draw_text_section` (Copy ボタン付き) で出す。
      下に「作成日」を 1 行。モデルの `model_id` はその行の hover に出す (UI に内部名を常に出さない)。
@@ -1677,4 +1680,80 @@ P2 3 件・P3 2 件。§21.11 に足した: 今の署名を表示を始めるた
 ### 19.19 19 回目 (2026-11-03、同じ担当の続き、基準 `9749f16da`)
 
 18 回目の 5 件はすべて閉じ、新しい指摘は無かった。V1-4a の設計 (§21.11.2) と V1-4b の方向 (§21.11.3) のレビューはここで閉じる。
+
+### 21.12 V1-4a の実装記録 (2026-11-03、実機未確認)
+
+- 着手時に `ai_caption.db` / `CaptionDb` / `captions` と共通 `STORES` の更新・呼出元を再点検した。
+  書き手は作成ジョブの保存、メタ情報取り込み、STORES の改名・コピー・本の構造操作・削除・復元・孤児整理、
+  本への追記の直接 DELETE で、§21.11.2 の無効化点に収まっていた。画像フォルダ ZIP 化のストア列挙は
+  `captions` をコピーしないが、その終端 refresh が作る `ImportChangedSections.ai_captions` も明示した。
+- `App::caption_display` は bundle 外に置き、`caption_display_cache.rs` の遅延単一 worker が
+  read-only open / 1 SELECT / 1 stat を担当する。DB が無ければ作らず、schema を変更しない。
+  結果は root repaint と mpsc で返し、`poll_caption_job` の隣で epoch / gen を照合する。
+  上限512件で全消去、終了時は channel の drop のみで join しない。
+- 各キーの gen は要求ごとにキャッシュ内の単調番号から割り当てる。失効時は entry を消し、再要求では
+  別 gen を使うため、削除済みキーの墓標を保持せず遅着結果を捨てられる。全消去は epoch を進める。
+  Loading / Loaded の2状態を一つの enum にし、再読み込み中は以前の Loaded 値を表示する。
+- 表示再入場は共通パネルの egui viewport ごとの一時 frame / key 履歴で識別する。
+  非表示・別項目・描画の途切れの後は再 SELECT / stat、同一 frame の再 pass と連続表示は再送しない。
+  情報以外のタブ・タグ選択中は説明文を描かないため要求しない。detached の述語・viewport 経路・bundle は変更しない。
+- 欄「AI 説明」を ★・タグ・パレットの後へ追加した。成功時は説明文・空でない画像内の文字・検索語を
+  既存 Copy 付き表示で出し、失敗時は作れなかった旨と作成日を出す。モデル名は作成日の hover に置く。
+  署名違いは本文を残して作り直しを案内し、現在ファイルが無ければ警告しない。行なし・初回読込中は欄を出さない。
+- ジョブの App 側 `item_done` は全 outcome で current のキーだけ失効させ、空の worker hook を撤去した。
+  取り込みは terminal refresh の世代不一致判定より先に全消去する。STORES の `captions_changed` は実変更行数から作り、
+  共通 App 受け口の identity 設定 gate より先に採用する。復元成功は既存 ledger 増分採用を保って caption のみ全消去し、
+  追記は DELETE 件数を summary に集約する。一覧の既存メタキャッシュ消去3経路も共有キャッシュを全消去する。
+- 公開マニュアルの画像一覧・情報パネル、architecture / async / UI 応答性、detached 記録を更新した。
+  Remote・本の表紙/説明文・検索・MCP は追加していない。まれな DB 読み取り失敗はログと行なし、
+  worker 起動/送信失敗はログと通知に留め、再試行・回復状態を追加していない。
+- コードレビュー担当（実装とは別 context、`gpt-6.1-sol` / `xhigh`）から、pending 中の再入場について
+  設計 P2 が報告されたため、実装担当はここで設計担当への返却として停止した（検収・独立レビュー完了ではない）。
+  旧 visit の読み取りが行と署名 S1 を取得し、その結果が未採用の間に外部上書き S2 と新 visit が発生すると、
+  `refresh=true` は Loading / Refreshing によって抑止される。visit 履歴だけは更新済みになるので、S1 を採用した後も
+  追加の SELECT / stat は起きず、新 visit で S2 を確認できない。§21.11.2 の「Loading 中は送り直さない」と
+  「表示を始めるたびに取り直す」の優先条件を決める必要がある。
+  当時の候補は、再入場を保持して現在の read 完了後に一度読み直すことだったが、下記の設計担当判断で不採用。
+  正本に無い pending state を実装担当の判断で足さず、設計担当へ返した。
+- **停止後の設計担当の判断 (2026-11-03)**: 後続 read のための再入場の印は採用しない。表示開始時は Loading 中でも
+  `gen` を進めて再送し、旧結果を捨てる。毎フレームの連続描画では再送しない。Loading / Loaded の2状態とし、
+  Loaded の値は再読込中も残す。この方針で実装・検証を再開した。外部上書き後に別キーから戻る競合を、
+  旧結果を保留する channel と一時 DB / 画像で決定的に検証する回帰を追加した。
+- 停止前の初回 focused（通常feature、offline、snapshot更新指定）はコンパイルで終了し、テストは未実行。
+  Rust 2024 の予約語 `gen`、`metadata_cache_key` の Option、egui 0.37 harness API のコンパイルエラーを修正したが、
+  上記の停止により再実行していない。ログは `target/vlm-caption-display-initial-compile.log`（exit 101）。
+  停止時点ではsnapshot生成・目視、関連テスト、image ZIP 専用 refresh の追加回帰、確認用 build は未実施だった。
+  `cargo fmt` は成功。再開後の結果は以下へ記録する。
+- 再開後の重点テスト（通常feature、offline、`UPDATE_SNAPSHOTS=1`）はコンパイル成功（7分51秒）、
+  79件中78成功／1失敗。nextest run `1d9bd17e-5461-46a5-a425-b5e24f04394d`、
+  `target/vlm-caption-display-focused.log`。失敗した identity 設定OFFの受け口テストは、App fixture の
+  初期化時loaderを残したまま「新しいloaderが無い」と検査していた。製品の設定OFF処理
+  `sync_content_identity_detection_setting(true)` を通して既存loaderを止め、事前のNoneを確認する準備へ修正した。
+  製品コードの変更ではなく、関連filterへ含めて再検証する。
+- snapshotは `caption_panel_ok` / `caption_panel_failed` / `caption_panel_stale` の3枚、計81,016 bytes。
+  実装担当とコードレビュー担当が各PNGを目視し、本文・Copy・作成日・警告の折り返しに欠け・重なりが無いことを確認した。
+  画像フォルダZIP化の専用poll経路の全消去回帰も追加した。コードレビュー担当の変更箇所の再確認では
+  前回の設計P2は解消、新しい指摘なし（実装担当による独立レビュー判定ではない）。
+- 関連filter（通常feature、offline、snapshot更新指定なし）は437件中436成功／1失敗、実行70.603秒。
+  run `41cbd95b-52e5-4b86-894c-4596b24e74cb`、`target/vlm-caption-display-regression.log`。
+  対象は `ai_caption_db` / `caption_display_cache` / `rename_key_migration` / `metadata_transfer` /
+  `content_identity` / `delete_worker` / `metadata_cleanup` / `book_append_undo` / `books` と
+  App側の表示・復元・追記・画像フォルダZIP化、パネル・作成ジョブの回帰。
+  snapshot3枚の通常比較も成功。失敗した新規復元完了テストも、fixtureが起動時loaderを残してReadyを設定していたためで、
+  既存loaderをtake/cancelして事前Noneを確認してからReadyを設定するよう修正した（製品コードの変更なし）。
+- 修正した復元完了テストだけを `cargo nextest run --offline -p mimageviewer --lib -E
+  'test(=app::content_identity_restore::tests::caption_restore_completion_clears_shared_display_without_ledger_reload)'`
+  で再実行し1件成功（0.516秒）。run `a28903d9-6243-47c6-88fd-a332773f5515`、
+  `target/vlm-caption-display-restore-fixture.log`。製品コード・他のfixtureは不変なので436件の成功を再利用し、
+  対象437件の確認を揃えた。単一実行で437件全成功した結果としては扱わない。本体lib全件は設計担当の担当として実行していない。
+- コードレビュー担当は、修正後の1件成功ログと436件の成功ログ、snapshot3枚を確認し、
+  独立コードレビュー完了・未解決指摘なしと報告した。実装担当自身の判定によるものではない。
+  `cargo fmt --check`、UI glyph検査（0件）、サイトカード検査（50件・超過0）、差分検査は成功。
+- `scripts/build-dev.ps1 -PreserveRuntime` は通常featureの `dev-runtime` core（4分44秒）と
+  remote / EPUB PDF worker / MCP adapter のbuild・配置に成功した。VC runtime PE検査も `runtime=4 pe=4` で成功。
+  ログは `target/vlm-caption-display-build-dev.log`。成果物は `target/dev-runtime/mimageviewer-core.exe`。
+  `CARGO_NET_OFFLINE=true` で実行し、製品バイナリは起動していない。最後に引数なしの `cargo fmt` を実行する。
+  残る受入は設計担当の検収、本体lib全件、利用者の実機確認（作成済み画像の欄、外部上書き後の再表示、
+  ジョブ完了後とdetachedを開いたままの表示更新）。実機のUI応答性やperfを確認済みとは扱わない。
+- 製品起動・外部通信・評価データ読み込み・コミットは行っていない。
 V1-4b の詳しい設計は、V1-4a の実装の後に改めてレビューを受ける。

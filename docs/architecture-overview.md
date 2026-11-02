@@ -569,7 +569,8 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `rotation_db.rs` / `rotation_cache.rs` | 非破壊回転の SQLite 永続化と context 所有の回転 memo。静止画シークの未読値は pending reader が非同期取得し、cache と要求寿命を一緒に交換・失効・破棄する |
 | `audio_normalize_db.rs` | 動画音量ノーマライズの per-file 測定値 (integrated LUFS / true peak / 算出ゲイン) の SQLite 永続化 |
 | `rating_db.rs` | レーティング (★1〜5) の SQLite 永続化 |
-| `ai_caption_db.rs` | ローカル AI 説明文の保存基盤。作成ジョブの保存役が worker thread 上で `BEGIN IMMEDIATE` 後に入力署名を照合し、成功／失敗の上書き規則を適用する。DB trigger が全体 revision と索引反映待ちを管理し、STORES 経由の改名・削除・復元にも適用する。表示キャッシュ・検索接続は後段 |
+| `ai_caption_db.rs` | ローカル AI 説明文の保存基盤。作成ジョブの保存役が worker thread 上で `BEGIN IMMEDIATE` 後に入力署名を照合し、成功／失敗の上書き規則を適用する。DB trigger が全体 revision と索引反映待ちを管理し、STORES 経由の改名・削除・復元にも適用する。表示 worker は DB を作らない読み取り専用 open を使う。検索接続は後段 |
+| `caption_display_cache.rs` | bundle外の共有 `CaptionDisplayCache`、最大512件の保持と `epoch`／`gen`、専用の単一read-only SELECT＋stat workerを持つ。Appがroot pollと書き手の完了採用点から接続する |
 | `vlm_addon.rs` / `vlm_addon_download.rs` | ローカル AI 説明文モデルの導入 (V1-3b)。固定配布一覧・安全な名前・分割と全体の SHA-256 を検証する。App の単一 owner が導入／取消／削除を完了通知まで排他にし、状態確認・HTTP・連結・配置・削除は worker 上だけで行う |
 | `ui_dialogs/vlm_addon.rs` | GPU 判定を必要時に一度だけ worker で実行し、設定ページへ cached view を渡す。初回の確認だけ modal、長い取得は modeless。取得成功時だけ操作時点の対象パスを作成ジョブへ一回渡す。設定からの導入だけではジョブを開始しない |
 | `mask_db.rs` | 消しゴムマスクの SQLite 永続化 (1bit/pixel deflate 圧縮 + ベクタオブジェクト JSON) |
@@ -599,6 +600,23 @@ RGB8 → 別プロセスの推論 → 署名を再確認して保存、を1件�
 既に保存した分は残す。モデルはジョブ内で共用し、終了で子プロセスを閉じる。App 終了時は共有 kill handle で
 即時停止して join しない。detached を閉じてもジョブは続き、モデルの削除はジョブ終了まで受け付けない。
 詳細は [計画 §21.7.3](local-vlm-caption-plan.md#2173-v1-3c-作成ジョブ)。
+
+#### ローカル AI 説明文の表示 (V1-4a)
+
+`App::caption_display: CaptionDisplayCache` は `ViewerContextBundle` の外に一つだけ置く。
+物理画像のキーごとに読み込み中／読み込み済みの行・現在のファイル署名を最大512件保持し、
+全消去の `epoch` とキーごとの `gen` で古い結果を棄却する。上限超過は全消去し、LRUは持たない。
+専用の単一workerを必要時に起動し、1件のread-only SELECTとstatを行う。結果はrootの
+`App::ui`で非blocking pollし、共通情報パネルの「AI 説明」欄に投影する。既存のcontext別
+メタデータcache／workerには追加しない。表示への再入場時も読み直し、完了までは既存の値を表示する。
+表示開始の判定はeguiのviewport＋panel IDごとの一時履歴（frame／key）で行い、bundleへ状態を足さない。
+
+作成ジョブの1件完了では結果によらずそのキーを消す。取り込み、STORESの付け替え・コピー・
+復元・削除・孤児整理、本への追記による直接削除はAppの完了採用点で全消去する。
+一覧の再読み込みでも全消去する。署名不一致は保存済みの文を残して「古い」と案内し、
+モデルがなくても表示できる。ZIP内画像・PDFページ・本の説明は対象外、本の表紙はV1-4b。
+detachedは既存の共通パネルを使い、述語・viewport・bundleの交換は変えない。Remoteの表示とIPCは対象外。
+詳細は [計画 §21.11.2](local-vlm-caption-plan.md#21112-v1-4a-画像の説明文の表示)。
 
 ### UI オーバーレイ / ダイアログ
 

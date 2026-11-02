@@ -221,6 +221,28 @@ impl CaptionDb {
         Ok(Self { conn })
     }
 
+    /// Worker-only display reads. A missing store is empty; never initializes
+    /// its directory, schema, journal mode, or database file.
+    pub fn open_read_only(path: impl AsRef<Path>) -> rusqlite::Result<Option<Self>> {
+        let path = path.as_ref();
+        let conn = match Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(conn) => conn,
+            Err(error) => {
+                if std::fs::metadata(path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+        };
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        Ok(Some(Self { conn }))
+    }
+
     /// Existing, already-initialized database; never creates a missing store.
     pub fn open_existing_for_write(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let conn = Connection::open_with_flags(
@@ -702,6 +724,56 @@ mod tests {
         let absent = temp.path().join("absent.db");
         assert!(CaptionDb::open_existing_for_write(&absent).is_err());
         assert!(!absent.exists());
+    }
+
+    #[test]
+    fn read_only_missing_store_does_not_create_file_or_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("missing");
+        let path = parent.join("ai_caption.db");
+        assert!(CaptionDb::open_read_only(&path).unwrap().is_none());
+        assert!(!path.exists());
+        assert!(!parent.exists());
+    }
+
+    #[test]
+    fn read_only_existing_store_reads_without_schema_changes_or_writes() {
+        let (temp, db, req) = fixture();
+        db.save(&req).unwrap();
+        let path = temp.path().join("ai_caption.db");
+        let expected = read(&db, &req);
+        let reader = CaptionDb::open_read_only(&path).unwrap().unwrap();
+        assert_eq!(read(&reader, &req), expected);
+        assert!(reader.delete(req.item_path.to_str().unwrap()).is_err());
+        assert_eq!(read(&db, &req), expected);
+        assert!(reader.conn.is_autocommit());
+        drop(reader);
+        drop(db);
+
+        let uninitialized = temp.path().join("uninitialized.db");
+        let conn = Connection::open(&uninitialized).unwrap();
+        conn.execute_batch("CREATE TABLE unrelated (value TEXT); PRAGMA user_version=27;")
+            .unwrap();
+        drop(conn);
+        let reader = CaptionDb::open_read_only(&uninitialized).unwrap().unwrap();
+        assert_eq!(
+            reader
+                .conn
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM sqlite_master WHERE name='captions'",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            reader
+                .conn
+                .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            27
+        );
     }
 
     #[test]

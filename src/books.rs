@@ -4423,7 +4423,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(matches!(result, BookOpResult::Append(_)));
+        let BookOpResult::Append(summary) = result else {
+            panic!("expected append result");
+        };
+        assert!(summary.metadata_copy.captions_changed);
         assert!(checked_before_create);
         assert_eq!(fs::read(destination).unwrap(), b"replacement page");
         let keys: Vec<String> = connection

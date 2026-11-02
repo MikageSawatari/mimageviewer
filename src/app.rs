@@ -33,6 +33,8 @@ use std::sync::{
 };
 use std::time::Duration;
 #[cfg(test)]
+mod caption_display_tests;
+#[cfg(test)]
 use std::time::Instant;
 
 #[cfg(test)]
@@ -17238,6 +17240,8 @@ pub struct App {
     /// run_metadata_load (worker) が FS 画像のみ埋める (docs/sidecar-metadata-ingest.md §11)。
     pub(crate) sidecar_display_cache:
         std::collections::HashMap<String, Option<crate::external_metadata::SidecarDisplay>>,
+    /// All viewer contexts read this one cache; never move it into ViewerContextBundle.
+    pub(crate) caption_display: crate::caption_display_cache::CaptionDisplayCache,
     /// 360 度パノラマビュー: インタラクティブステート (フルスクリーン内のみ Some)。
     /// 360 モード ON → Some、OFF → None。equirect でない画像へナビした場合は
     /// **保持しつつ非アクティブ化** する設計 (`is_panorama_mode_active(fs_idx)` で判定)。
@@ -21148,6 +21152,7 @@ impl App {
             xmp_cache: std::collections::HashMap::new(),
             xmp_panorama_info: std::collections::HashMap::new(),
             sidecar_display_cache: std::collections::HashMap::new(),
+            caption_display: crate::caption_display_cache::CaptionDisplayCache::default(),
             panorama_state: None,
             video_zoom_state: None,
             #[cfg(windows)]
@@ -29053,6 +29058,7 @@ impl App {
         self.keep_end_shared.store(0, Ordering::Relaxed);
         self.visible_end_shared.store(0, Ordering::Relaxed);
         self.metadata_cache.clear();
+        self.caption_display.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
         self.xmp_panorama_info.clear();
@@ -39852,6 +39858,7 @@ impl App {
         self.local_adjust_cache.clear();
         // path-keyed メタキャッシュは新レベルの別 entry 用にリセット。
         self.metadata_cache.clear();
+        self.caption_display.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
         self.clear_tags_cache();
@@ -43127,6 +43134,7 @@ impl App {
         self.clear_still_seek_thumbnail_requests();
         self.details_hover_thumb_idx = None;
         self.metadata_cache.clear();
+        self.caption_display.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
         self.xmp_panorama_info.clear();
@@ -48790,6 +48798,10 @@ impl App {
         result: metadata_import_refresh::RefreshResult,
         changed: crate::metadata_transfer::ImportChangedSections,
     ) -> (Vec<String>, bool) {
+        // DB writes have committed even if a context needs another terminal refresh.
+        if changed.ai_captions {
+            self.caption_display.clear();
+        }
         #[cfg(windows)]
         let stale_before_apply = result.contexts.iter().any(|context| {
             match self.viewer_context_residence(context.context_id) {
@@ -99485,6 +99497,7 @@ impl eframe::App for App {
         self.poll_vlm_setup(ctx);
         #[cfg(windows)]
         self.poll_caption_job();
+        self.caption_display.poll();
         self.poll_capture_selection(ctx);
         self.render_update_before_frame(ctx);
         #[cfg(not(windows))]

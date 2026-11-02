@@ -130,8 +130,15 @@ impl CaptionJob {
         self.queue.clear();
     }
 
-    fn item_done(&mut self, outcome: CaptionItemOutcome) -> Result<(), String> {
-        self.current = None;
+    fn item_done(
+        &mut self,
+        outcome: CaptionItemOutcome,
+        display: &mut crate::caption_display_cache::CaptionDisplayCache,
+    ) -> Result<(), String> {
+        // Every outcome rechecks this path. Failed inference may retain an older ok row.
+        if let Some(path) = self.current.take() {
+            display.invalidate(&crate::ai_caption_db::CaptionDb::normalize_path(&path));
+        }
         let progress = Arc::make_mut(&mut self.progress);
         progress.done += 1;
         match outcome {
@@ -324,7 +331,7 @@ impl App {
             let result = match job.worker.events.try_recv() {
                 Ok(CaptionWorkerEvent::Started(_kill)) => continue,
                 Ok(CaptionWorkerEvent::ItemDone(outcome)) => {
-                    if let Err(error) = job.item_done(outcome) {
+                    if let Err(error) = job.item_done(outcome, &mut self.caption_display) {
                         Some(Err(error))
                     } else {
                         None
@@ -440,6 +447,40 @@ mod tests {
     }
 
     #[test]
+    fn caption_job_item_done_invalidates_only_current_key_for_every_outcome() {
+        for outcome in [
+            CaptionItemOutcome::Created,
+            CaptionItemOutcome::AlreadyCreated,
+            CaptionItemOutcome::Missing,
+            CaptionItemOutcome::Failed,
+            CaptionItemOutcome::Discarded,
+            CaptionItemOutcome::Cancelled,
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            let (mut job, commands, events) = job();
+            job.append(vec!["C:/images/a.png".into(), "C:/images/b.png".into()].into());
+            job.advance().unwrap();
+            assert_item(&commands, "C:/images/a.png");
+            let key = crate::ai_caption_db::CaptionDb::normalize_path(Path::new("C:/images/a.png"));
+            let sibling =
+                crate::ai_caption_db::CaptionDb::normalize_path(Path::new("C:/images/b.png"));
+            app.caption_display.seed_for_test(&key);
+            app.caption_display.seed_for_test(&sibling);
+            let epoch = app.caption_display.epoch_for_test();
+            app.caption_job = Some(job);
+            events.send(CaptionWorkerEvent::ItemDone(outcome)).unwrap();
+            app.poll_caption_job();
+            assert!(!app.caption_display.contains_for_test(&key), "{outcome:?}");
+            assert!(
+                app.caption_display.contains_for_test(&sibling),
+                "{outcome:?}"
+            );
+            assert_eq!(app.caption_display.epoch_for_test(), epoch);
+            assert_item(&commands, "C:/images/b.png");
+        }
+    }
+
+    #[test]
     fn caption_job_additions_before_and_after_result_keep_fifo_without_duplicates() {
         let (mut job, commands, _) = job();
         assert!(
@@ -448,14 +489,18 @@ mod tests {
         job.advance().unwrap();
         assert_item(&commands, "C:/images/a.png");
         assert!(job.append(vec!["c:/images/B.png".into(), "C:/images/c.png".into()].into()));
-        job.item_done(CaptionItemOutcome::Created).unwrap();
+        job.item_done(CaptionItemOutcome::Created, &mut Default::default())
+            .unwrap();
         assert_item(&commands, "C:/images/b.png");
         assert!(job.append(vec!["C:/images/d.png".into()].into()));
-        job.item_done(CaptionItemOutcome::AlreadyCreated).unwrap();
+        job.item_done(CaptionItemOutcome::AlreadyCreated, &mut Default::default())
+            .unwrap();
         assert_item(&commands, "C:/images/c.png");
-        job.item_done(CaptionItemOutcome::Failed).unwrap();
+        job.item_done(CaptionItemOutcome::Failed, &mut Default::default())
+            .unwrap();
         assert_item(&commands, "C:/images/d.png");
-        job.item_done(CaptionItemOutcome::Missing).unwrap();
+        job.item_done(CaptionItemOutcome::Missing, &mut Default::default())
+            .unwrap();
         assert!(matches!(
             commands.try_recv(),
             Ok(CaptionWorkerCommand::Finish)
@@ -475,7 +520,8 @@ mod tests {
         job.append(vec!["a.png".into()].into());
         job.advance().unwrap();
         assert_item(&commands, "a.png");
-        job.item_done(CaptionItemOutcome::Created).unwrap();
+        job.item_done(CaptionItemOutcome::Created, &mut Default::default())
+            .unwrap();
         assert!(matches!(
             commands.try_recv(),
             Ok(CaptionWorkerCommand::Finish)
@@ -502,7 +548,8 @@ mod tests {
         assert_item(&commands, "C:/a.png");
         job.append(vec!["c:/A.png".into(), "C:/a.png".into()].into());
         assert_eq!(job.queue.len(), 1);
-        job.item_done(CaptionItemOutcome::Failed).unwrap();
+        job.item_done(CaptionItemOutcome::Failed, &mut Default::default())
+            .unwrap();
         assert_item(&commands, "C:/a.png");
         assert_eq!(job.state, JobState::Running);
     }
@@ -523,7 +570,8 @@ mod tests {
             commands.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
-        job.item_done(CaptionItemOutcome::Cancelled).unwrap();
+        job.item_done(CaptionItemOutcome::Cancelled, &mut Default::default())
+            .unwrap();
         assert!(matches!(
             commands.try_recv(),
             Ok(CaptionWorkerCommand::Finish)

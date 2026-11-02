@@ -712,6 +712,7 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 | --- | --- | --- | --- |
 | AI 説明文モデルの管理 (V1-3b) | App の `VlmSetup` → `VlmAddon`、短命 scan/install/remove thread と bounded channel | 同時に1処理 (GPU 検査は別に起動中1回) | 設定／明示要求から lazy scan と GPU 検査。HTTP は新規の小さな VLM 専用 transport。Range 再開、取得量の上限、部分 SHA-256、連結後 SHA-256 を検査し、staging → packs → INSTALL_OK → active.json の順に公開。取消／削除は完了採用まで受付を閉じる。取得窓の寿命と owner を分け、閉じても completion barrier を保持。UI は cached view と非blocking poll のみ、静止時の repaint は追加しない。成功時に凍結した対象を作成ジョブへ一回渡す |
 | AI 説明文の作成ジョブ (V1-3c) | `App::caption_job` → job worker → VLM client、命令／結果channel | App全体で1本、対象は1件ずつ | App が待ち行列と `Running` / `Stopping` の唯一の owner。worker は `Item(path)` / `Finish` を受け、署名確認・既存行の判定・canonical decode・回転・縮小・推論・保存を行い、1件ごとの結果と完了を返して `request_repaint` する。進捗窓はmainのみのmodeless。中止・最後の結果で先に受付を閉じ、処理中の1件が無くなってから `Finish`。中止後の結果は保存しない。fatal・切断・時間切れ・DB失敗は停止と通知、再試行なし。詳細は下の §3.2.3 |
+| AI 説明文の表示 (V1-4a) | bundle外の `App::caption_display` → 説明文専用worker、要求／結果channel | App全体でlazy起動の1本、cache最大512件 | 物理画像の表示開始時に1件のread-only SELECTとstatを送り、root pollで `epoch`／`gen` が一致する結果だけ採用する。再入場の読み直し中は以前の値を表示し、同じ表示中は送り直さない。workerは完了時にrepaintを要求し、終了はchannelを閉じるだけでUIはjoinしない。詳細は下の §3.2.4 |
 | ローカル AI 説明文の推論 | 別 exe `mimageviewer-vlm.exe --serve` + `ai::vlm_worker::VlmWorkerClient` + stdin writer / stdout reader / stderr logger | client ごとに子 1 本、要求は直列 1 件 | EPUB と共通の `job_process` が suspended 起動 → kill-on-close Job 割当 → resume を行い、HANDLE_LIST でその子の標準入出力だけを継承する。16MiB 上限の u32 LE 枠に JSON 長・JSON・RGB8 を格納する。ジョブスレッドだけが呼び、hello 30秒・load 120秒・初回caption 120秒・以降60秒で待つ。image_failure は続行、fatal/不正枠/切断/期限超過は Job を kill して client を退役し、再起動しない。通常の中止は現在の1件の完了後に shutdown、アプリ終了は共有 kill handle で即停止。UI で join しない。GPU の判定は --list-devices を必要時に worker スレッドで1回実行し、最大の専用 VRAM のアダプター・LUID・総量・Vulkan 対応を起動中だけ保持する。詳細は [計画 §21](local-vlm-caption-plan.md#213-v1-1-の設計) |
 | HTML 画像の取得・選択保存 | `std::thread` (`clipboard-fetch-0`〜`3`) + bounded result channel、session 最終解放後の短命 `clipboard-fetch-cleanup` | App 所有サービスごとに固定 4 worker | 起動時の一時ルート清掃、ページ区分と session 固有 Agent の準備、上限付き取得・ヘッダ寸法検査・原本ハッシュ・縮小画像準備、選択済み原本の背景保存を共通 queue で処理する。ダイアログごとに原本予算 2 GiB、画像ごとに実読取 64 MiB。保存 worker は自動 intent だけ月別保存先の背景解決を待ち、手動 intent は現在の実フォルダ直下へ保存する。最後の fetch / save owner 解放後に一時フォルダを背景削除する |
 | 手動クリップボード取り込み | `std::thread` (`clipboard-capture-manual`) | process ごとに最大 1 要求 | Ctrl+V の画像 / HTML 分岐から短命 worker を起動し、生データ取得後に Clipboard を閉じてから解析・画像保存を行う。HTML snapshot と画像保存の完了・失敗は typed event と repaint で App へ返す。監視の設定世代・除外・重複抑止を参照しない |
@@ -1306,9 +1307,31 @@ worker の完了通知を poll で採用するまで App の owner とモデル�
 
 画像の読み込み・回転DBの参照・推論・保存は job worker 内で行い、保存は `BEGIN IMMEDIATE` 後に
 入力署名を再確認する。モデルの出力を保存する前に、前後の空白を除いた完全一致の検索語だけを重複除去する。
-保存の成功通知は表示キャッシュ／索引向けの単一hookへ集約するが、V1-3c では後段の接続は行わない。
+表示キャッシュの無効化はworkerの保存hookから行わず、App側の1件完了採用点から行う（§3.2.4）。索引接続は後段。
 フォルダ移動・detachedのclose・Remote利用では止めない。App終了だけは共有kill handleで子を即時停止し、
 UI threadでworkerをjoinしない。詳細と状態簡素化の判断は [計画 §21.7.3](local-vlm-caption-plan.md#2173-v1-3c-作成ジョブ)。
+
+### 3.2.4 AI 説明文の共有表示キャッシュ
+
+`CaptionDisplayCache` は `ViewerContextBundle` に入れずApp共有とし、共通情報パネルから読む。
+既存のcontext別メタデータcache・pending・読み込みworkerを変更せず、休眠中の窓も同じ値を参照する。
+キーごとにLoading／Loaded（行なしを含む）を持ち、全消去の `epoch` とキー別 `gen` を要求に付ける。
+初回要求で単一workerを起動し、以後はchannelで待つ。DB未作成なら作らず行なしを返す。
+1件ごとにread-only SELECTと現在のファイル署名取得を行い、読み取りtransactionを持ち越さない。
+結果は `request_repaint` とchannelでrootへ渡し、`App::ui` の非blocking pollで世代照合して採用する。
+DB失敗はログと行なしに留め、終了時はchannelを閉じてUIでjoinしない。
+
+パネルで物理画像の表示を始めるたびに読み直し、完了までは既存の値を保つ。
+表示の再入場はeguiのviewport＋panel IDごとの一時履歴のframe／keyで判定し、bundleには持たせない。
+同じキーの連続描画では再送せず、毎フレームのSELECT／statを避ける。表示再入場では読み込み中でも
+genを進めて再送し、旧結果を捨てる。後続readの印を足さずLoading／Loadedの2状態を保つ。ZIP内画像・PDFページ・
+動画・音声・本では送らない。512件を超えたcacheは全消去する。
+作成ジョブの `item_done` は結果によらずそのキーを失効させる。それ以外の書き手は、
+`ImportChangedSections.ai_captions`／`StoreMutationEffects.captions_changed`／本への追記の直接削除summaryを
+Appの完了点で採用して全消去する。一覧再読み込みも全消去する。
+消去より前の結果は `epoch`／`gen` の不一致で捨て、次のパネル描画で必要なキーだけ再要求する。
+detachedの述語・viewport・context別cacheを変更せず、Remoteのパネル・IPCへは接続しない。
+境界と簡素化の判断は [計画 §21.11.2](local-vlm-caption-plan.md#21112-v1-4a-画像の説明文の表示) を参照。
 
 ### 3.3 フルスクリーン読み込みの優先度制御
 

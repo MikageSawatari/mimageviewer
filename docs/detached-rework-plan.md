@@ -1455,6 +1455,15 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-03 ローカルAI説明文の共有表示（V1-4a）
+
+V1-4a で bundle の外の共有キャッシュを共通パネルから読む表示を足した。detached の述語・viewport は変えていない。独立レビュー 18 回目で症状パッチではないことに合意。
+範囲は `App::caption_display` の共有owner・専用読み込みworker・既存情報パネルの欄と、
+Appの完了採用点での無効化。既存の `sidecar_display_cache` と同じbundle外の共有表示に乗せ、
+contextごとのメタデータcache、bundle交換、window／placementの所有には変更を加えないためである。
+この合意は [説明文計画 §21.11.2](local-vlm-caption-plan.md#21112-v1-4a-画像の説明文の表示) の既存設計レビューを指し、
+今回の実装完了・独立実装レビュー・実機確認の宣言ではない。
+
 ### §1.473 合成一覧の親・typed帰路（2026-10-30、実装済み・実機未確認）
 
 承認設計 `cae94fb27`（[調査・設計記録](history-parent-1473-investigation.md)）に対し、

@@ -484,6 +484,15 @@ App が待ち行列・`Running` / `Stopping`・次の1件の送信・終了判�
 進捗窓はmainだけのmodelessで閲覧を止めない。App終了時は共有kill handleで即時停止し、UIでjoinしない。
 読み込み・推論・保存には `perf::event` を置く。実モデルの速度や実機の応答性を検証済みとするものではない。
 
+説明文の表示 (V1-4a) はbundle外のApp共有 `CaptionDisplayCache` を読み、UIは要求channelへの送信と
+rootの非blocking pollだけを行う。必要時に起動する単一workerが1件のread-only SELECTとstatを行い、
+DBを作らず読み取りtransactionを持ち越さない。表示開始・再入場時に署名を取り直すが、同じ表示中は
+毎フレーム送らず、読み直し中は既存の値を表示する。既存のcontext別メタデータworkerへ処理を足さない。
+cacheは最大512件、上限時は全消去。ジョブの1件完了はそのキーだけ、取り込み・STORES操作・
+本への追記の直接削除・一覧再読み込みは全消去し、古い結果は `epoch`／`gen` で採用しない。
+workerの1件（SELECTとstat）を `perf::event` で計装し、完了時だけrepaintを要求する。
+終了時はchannelを閉じるだけでUIはjoinしない。これは設計上の境界の記録であり、実機の応答性の測定結果ではない。
+
 注釈fontの先回り（§1.602）はNext頁の計画でメモリ上の需要だけを判断し、列挙・font読取・parseを`comic-font-load` workerへ置く。
 App共有ownerの受信口は1つ。root pollは非blockingで採用し、workerの完了時にroot再描画を要求する。
 `comic / font_load`に所要ms・要求key数・読込key数・結果を記録する。同期表示はworkerを待たず、不足時は受信口を捨てて既存の同期経路を維持する。
