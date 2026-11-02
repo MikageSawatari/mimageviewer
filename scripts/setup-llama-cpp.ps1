@@ -3,10 +3,9 @@ param([string] $RepoRoot = (Join-Path $PSScriptRoot '..'))
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'vlm-worker-identity.ps1')
 $script:MivLlamaCommit = 'dde879bc4f954b809892fd0d660515f42536394a' # b12032
-# TODO: Independently verify this exact GitHub ZIP and commit its SHA-256 here.
-# The archive used in V1-0 was a different supplied input, not this URL's pin.
-# Until reviewed, this empty placeholder intentionally disables ALL acquisition.
-$script:MivLlamaArchiveSha256 = ''
+# SHA-256 of the GitHub ZIP for this commit, checked 2026-11-03: its contents
+# match the vendor/llama.cpp tree used to build the worker.
+$script:MivLlamaArchiveSha256 = 'd705712976fc7a4f6b664b1b29e6c35af4cf256a35fca41c4bb7f9d26d3f9751'
 
 function Expand-MivPinnedLlamaArchive {
     param([string] $Archive, [string] $Destination, [string] $Commit)

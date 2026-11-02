@@ -68,7 +68,7 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
   (~490 MB) + cmake が要る。古い exe の流用は上記の通り不可。
 - **`vendor/vlm-worker/mimageviewer-vlm.exe`** — 現ソースと一致する exe は CMake / Vulkan SDK
   なしで再利用できる。失った場合はまず上記バックアップから検証付きで復旧する。
-  固定版ソースからの再ビルドも可能だが、取得用 ZIP の checksum は確認待ちのため現在は取得を停止する。
+  バックアップが無ければ、固定版ソースを取得して再ビルドする (下の「ローカル AI 説明文 worker」)。
 
 そのため `vendor/models/`・`vendor/vst3-host/`・`vendor/vlm-worker/` は**リポジトリツリー
 (`C:\home\mimageviewer` 配下) の外**へコピーを置く。現在のバックアップ先:
@@ -539,8 +539,8 @@ worker が欠落していれば、まず `bootstrap-vendor.sh` または次の P
 
 バックアップで復旧できない場合は `scripts/setup-llama-cpp.ps1` が、固定 commit の GitHub ZIP を
 SHA-256 照合後に staging へ安全に展開し、欠落している `vendor/llama.cpp` に公開する。
-**取得用 checksum は未設定の placeholder**。レビュー済みの SHA-256 をソースに固定するまで、
-この script はネットワーク通信・ディレクトリ変更の前に失敗する。過去に提供された別アーカイブの hash は流用しない。
+取得用 ZIP の SHA-256 は `d705712976fc…9751` に固定した (2026-11-03、展開した中身が worker を作った `vendor/llama.cpp` と一致することを確認)。
+GitHub が archive を作り直して hash が変わった場合は、取得を止めて照合し直す。
 既存 source tree を削除・置換せず、archive の traversal・絶対パス・リンク・Windows 名の別名・重複を拒否する。
 この段階では worker やモデルを起動しない。
 

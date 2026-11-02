@@ -25,8 +25,8 @@ PowerShell から同じ復旧だけを実行する場合:
 
 バックアップで復旧できない場合、`scripts/setup-llama-cpp.ps1` が固定 commit の GitHub ZIP を取得・
 SHA-256 照合・安全に staging へ展開し、欠落している `vendor/llama.cpp` へ公開する入口になる。
-ただし **GitHub ZIP の checksum は確認待ちで未設定**。レビュー済み SHA-256 をソースに固定するまで、
-ネットワーク・ディレクトリ変更の前に停止する。引数・環境変数で hash / URL を差し替える入口は無い。
+GitHub ZIP の SHA-256 はソースに固定してある (2026-11-03 に中身を照合)。一致しなければ展開しない。
+引数・環境変数で hash / URL を差し替える入口は無い。
 既存 source tree を消さず、archive の traversal・絶対パス・リンク・重複・Windows の不正名を拒否する。
 
 ### C++ の再ビルドが必要なとき

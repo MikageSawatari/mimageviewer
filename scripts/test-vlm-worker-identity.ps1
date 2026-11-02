@@ -118,6 +118,8 @@ try {
     Assert-MivVlmWorkerIdentity $testRoot
 
     . (Join-Path $PSScriptRoot 'setup-llama-cpp.ps1')
+    # Simulate an unset pin: acquisition must stop before any network or directory change.
+    $script:MivLlamaArchiveSha256 = ''
     function global:Invoke-WebRequest { throw 'Network command was called with an unset checksum.' }
     $newRepo = Join-Path $testRoot 'must-not-be-created'
     Assert-Throws { Install-MivPinnedLlamaSource -RepoRoot $newRepo } 'SHA-256 is not configured'
@@ -196,7 +198,7 @@ try {
     $bootstrap = Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'bootstrap-vendor.sh')
     $setup = Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'setup-llama-cpp.ps1')
     Assert-True ($bootstrap.Contains('-RestoreBackupRepo "$REPO_ROOT"')) 'Bootstrap omits verified backup restoration'
-    Assert-True ($setup.Contains('$script:MivLlamaArchiveSha256 = ' + "''")) 'Production archive checksum placeholder is no longer unset'
+    Assert-True ($setup.Contains("`$script:MivLlamaArchiveSha256 = 'd705712976fc7a4f6b664b1b29e6c35af4cf256a35fca41c4bb7f9d26d3f9751'")) 'Production archive checksum is not the pinned b12032 ZIP'
     Assert-True ($release.IndexOf('Assert-MivVlmWorkerIdentity -RepoRoot $repoRoot') -lt $release.IndexOf('Invoke-MivSign -Files $vendorEmbedTargets')) 'Release identity must precede signing'
     Assert-True ($release.Contains("'vendor\vlm-worker\mimageviewer-vlm.exe',")) 'Release signing omits worker'
     Assert-True ($portable.Contains('-SkipBuild:$SkipBuild')) 'Portable SkipBuild bypasses worker gate'
