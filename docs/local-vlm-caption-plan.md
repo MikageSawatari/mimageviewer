@@ -1046,3 +1046,78 @@ PDFium worker と同じくパイプにそのまま流して足りる。共有メ
   失敗 2・時間切れ 1 で、3 件とも単独で成功 (VLM と無関係の時間依存テストと 10 万件走査の重いテスト)。CTest 6/6。
 - 独立コードレビュー (gpt-6.1-sol / xhigh): P1・P2 なし。P3 1 件 (テスト用の偽 worker が `%TEMP%` に残る) を `target/vlm-fake-worker/` への
   キャッシュに改め、再確認で「指摘なし」。V1-1 はここで閉じる。
+
+### 21.5 V1-2 の設計 (2026-11-02、独立レビュー前)
+
+V1-2 は**保存の土台**だけを作る: `ai_caption.db` (§7)・保存役 (§6.6 の lock の中の確認)・`STORES` への登録・`metadata_transfer` (U6)。
+作成ジョブ・UI・表示用の共有キャッシュ (§9)・索引への反映 (§8 の管理役と旗) は作らない (V1-3・V1-4・V2)。V1-2 が後の段階へ渡すのは、
+保存・読み取りの API と「説明文が変わった」ことを書き手が知らせる場所 (戻り値・`ImportChangedSections`) まで。
+
+**既存の作り (2026-11-02、コードで確認)**
+
+- path をキーにするストアは `*_db.rs` が `open` (無ければ作成・schema の確認) / `open_at` / `open_existing_for_write` / `db_path()`
+  (`data_dir::get().join(...)`) を持つ (`rating_db.rs`)。改名・移動・本の構造操作・孤児整理・削除の hard purge・内容同一性の復元は
+  `rename_key_migration::STORES` の記述子を走査し、DB ごとに自分で接続を開く。ファイルが無い DB は飛ばす。
+- メタ情報の取り込みは、関係する DB を全部 1 つの接続に `ATTACH` し、**1 つのトランザクションで全 DB を更新する**
+  (`metadata_transfer.rs` の import)。複数 DB をまたいで原子的にするため、参加する DB はすべて rollback journal (WAL 不可) で、
+  取り込みの前に各 DB を `open_at` で開いて schema を作っておく。書き出し (`export`) は各 DB を読み取りで開き、走査範囲の表と join して読む。
+- 形式の版は `FORMAT_VERSION = 11` で、v4.11.0 で出荷済み。欄ごとの有無は `ManifestSections` の bool。新しい欄は版を上げ、
+  古い版の取り込みではその欄を無効にする (`composition` の前例: `version < FORMAT_VERSION` なら `sections.composition = false`)。
+  欄の選択 UI は無い (書き出しは常に全欄)。
+- `copies_with_book_page` は、本の構造操作でページを別の本へ写すときに行も写すかで、今は編集・★・タグの 8 種だけが `true`。
+
+**作るもの**
+
+1. **`src/ai_caption_db.rs`** (`CaptionDb`、他の `*_db.rs` と同じ形)。
+   - schema は §7 のまま (表 `captions`・`caption_seq`・`caption_removed` と trigger 3 つ)。列の名前は `mtime_ms` / `size` にし、
+     更新日時はミリ秒 (`metadata_transfer` の `FileFingerprint` と同じ単位・同じ求め方)。`PRAGMA user_version = 1`。未リリースなので移行は無い。
+   - **journal は rollback (既定の DELETE) のまま**にし、WAL にしない (取り込みの原子的な更新に参加するため)。busy timeout は保存で 5 秒。
+   - 読み取り: `get(item_key)` (飛ばす判定 §6.2 と表示用)。キーは `StoreKeyNormalization::KeepDrive` (タグ・★と同じ) で、正規化は呼び出し側でなく
+     記述子の `normalize_path` を使う。
+2. **保存役** `CaptionDb::save(&SaveRequest) -> Result<SaveOutcome>` (ジョブの worker スレッドから呼ぶ。UI スレッドからは呼ばない)。
+   - `SaveRequest`: 項目のパス、**署名を取り直すパス** (画像はその画像、ファイル 1 つの本は本のファイル、フォルダの本は実際に読んだファイル、
+     EPUB は元の EPUB。§6.7)、読んだときの署名 (size + mtime_ms)、`cover_ref`、model_id、prompt_version、lang、結果 (`Ok{caption, text, keywords}` /
+     `Failed`)。どの値を入れるかは V1-3 (画像) と V1-4 (本) が決める。保存役は「渡されたパスを取り直して比べる」だけで、本の種類を知らない。
+   - 手順 (§6.6): `BEGIN IMMEDIATE` → 署名を取るパスの `metadata` を取り直す → 無い・読めない・size か mtime_ms が違う (更新日時が取れない場合も含む)
+     → `ROLLBACK` して `Discarded` → 同じなら書く → `COMMIT`。ファイルの読み取りは `metadata` 1 回だけ (lock を持つ時間を短くする)。
+   - 書き方: `Ok` は無条件に upsert。`Failed` は、行が無いか `failed` の行のときだけ upsert し、`ok` の行があれば何もしない (`KeptExistingOk`。§6.5)。
+     upsert は `INSERT ... ON CONFLICT(item_key) DO UPDATE` にする (`INSERT OR REPLACE` は削除 + 挿入で、削除の trigger が既定では動かず
+     `caption_removed` が狂うため使わない)。
+   - 戻り値 `SaveOutcome`: `Written` / `KeptExistingOk` / `Discarded`。`Written` のときだけ、呼び出し側 (V1-3) が表示の無効化 (V1-4) と索引の旗 (V2) を立てる。
+   - lock が取れない (5 秒の busy) などの DB の失敗は、まれな失敗として割り切る (エラーを返し、V1-3 がジョブを止めて通知する)。
+3. **`STORES` への登録**: `store("ai_caption.db", "captions", "item_key", unique = true, KeepDrive, BookStorePolicy::Follow, copies_with_book_page = false)`。
+   - `Follow` にするのは、本の構造操作 (改名・ページの並べ替え) で、タグ・★と同じく本の worker が運ぶため (U15 の割り切りはこの動きが前提)。
+   - `copies_with_book_page = false`: ページを別の本へ写すとファイルは新しくなり (更新日時が変わる)、写した説明文はすぐ「古い」になるだけなので写さない。
+     写さないストアもコピー先は初期化される (既存の規則) ので、コピー先に前の説明文が残ることは無い。
+   - `caption_removed` と `caption_seq` は登録しない (キーで運ぶと、旧キーを索引から消す印が新しいキーへ移ってしまう)。
+   - これで改名・移動・本の構造操作・孤児整理・削除の hard purge・内容同一性の復元 (`copy_stores_at`) が説明文にも効く。どの経路でも §7 の trigger が
+     `rev`・`indexed`・`caption_removed` を付けるので、書き手のコードに印の扱いを足さない。STORES の件数を数えているテストは足した分だけ直す。
+4. **`metadata_transfer`** (U6):
+   - `FORMAT_VERSION` を 12 に上げ、`ManifestSections` に `ai_captions` (serde の既定は false) を足す。12 より古い版の取り込みでは
+     `ai_captions = false` にする (`composition` と同じ形)。v4 の mIV は v12 の書き出しを読めない (版を上げるたびの既存の扱いと同じ)。
+   - `PortableEntry` に `ai_caption: Option<PortableAiCaption>` (無ければ書かない)。中身は model_id・prompt_version・lang・caption・visible_text・
+     keywords・cover_ref・作成時の署名 (size + mtime_ms)・created_at。**書き出すのは `status = ok` の行だけ** (`failed` は「作れなかった」印で、
+     他の PC へ運ぶ意味が無い)。`ZIP` 内のページなど仮想の項目 (`virtual_items`) には足さない (v5 は対象外、§1)。
+   - 取り込み (欄が有効なとき): 記載された項目に説明文があれば upsert (`status = ok`、署名は書き出し元の値のまま。取り込み先のファイルと合わなければ「古い」になる §7)。
+     記載された項目に説明文が無ければ、その項目の行を消す (既存の欄と同じ「記載された空は消す」)。記載の無い項目には触れない。
+     upsert は保存役と同じく `ON CONFLICT DO UPDATE`。取り込みは署名の確認をしない (後勝ち、§6.6)。
+   - 取り込み前の schema の用意 (`open_at`) と `ATTACH`・journal の確認の一覧に `ai_caption.db` を足す。
+   - `ImportChangedSections` に `ai_captions` を足し、変えた件数を数える (V1-4 で表示の共有キャッシュを消し、V2 で索引の旗を立てるきっかけ)。
+     書き出し・取り込みの件数の表示は、既存の欄と同じ並びに足す。値の検証 (文字数・個数の上限 §6.4、keywords が文字列の配列) は既存の欄の検証と同じ場所で行う。
+5. **テスト**
+   - schema と trigger: INSERT / 内容の UPDATE / キーの UPDATE / DELETE で `rev` が全体で増え、`indexed = 0`、旧キーと削除が `caption_removed` に入る。
+     `rev`・`indexed` だけの UPDATE では trigger が動かない。本の入れ替え (一時キーを経由した 2 回の付け替え) の後に古い `(item_key, rev)` で
+     反映済みにしても 0 行 (§8 で確かめた筋書きを実装で確かめ直す)。
+   - 保存役: 署名一致で書く / ファイルが無い・size 違い・mtime 違いで捨てる / `Failed` が `ok` を上書きしない・`failed` は上書きする / `Ok` は両方を上書きする /
+     別の接続が書き込みの lock を持っている間は待ち、その commit の後に確認する (改名の付け替えが先に済んだら「無い」で捨てる筋書き)。
+   - `STORES`: 改名・移動・孤児整理・hard purge・内容同一性の復元・本の構造操作で行が運ばれる・消える。
+   - `metadata_transfer`: v12 の往復 / `failed` を書き出さない / 説明文の無い記載で消す / v11 の取り込みで説明文に触れない / 不正な値を拒む /
+     取り込み後の `ImportChangedSections.ai_captions`。
+   - 既存の metadata_transfer・rename_key_migration・content_identity・delete_worker・metadata_cleanup のテストが通ること。
+
+**状態を減らす検討** (CLAUDE.md の 2026-09-28 指示)
+
+- 保存の順序は §6.6 のとおり「lock の中で取り直して比べる」だけで、改名・取り込みとの調整 (待ち合わせ・受付の開け閉め) は作らない。
+- 索引の反映待ちは DB の trigger が持ち、書き手ごとの処理を足さない (§7・§8)。V1-2 の書き手 (保存役・取り込み・STORES の汎用操作) は印に触れない。
+- 書き出しの欄を選ぶ UI は今も無いので、説明文だけを外す選択肢も作らない。
+- まれな失敗 (DB が開けない・lock が 5 秒取れない・ディスクフル) は割り切り (エラー + ログ。ジョブは止めて通知、取り込みは既存の失敗の扱い)。
