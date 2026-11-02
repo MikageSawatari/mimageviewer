@@ -108,6 +108,26 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 呼び出し元: 同じ `resolve_folder_bar_nav_path` を使うフォルダバー内の A/B 切替、場所メニューの整理先・既知フォルダ・ドライブ、履歴メニューも照合した。共通の整形箇所だけを修正し、フォルダバー外の設定保存・入力 parser・open owner・非同期 lifecycle は変更しない。
 - 回帰: 引用符あり/なし、外側・内側の端の空白、途中の空白保持、`"C:"`、`"C:\"`、UNC、片側だけ、途中の引用符、1 組だけ除去、`""` を単体テストで固定。一時フォルダ・ZIP・変換書庫・通常画像の親解決を resolver 経由で検査する。headless の実 toolbar / TextEdit / Enter 経路で引用符付きパス、空欄、引用符付き空文字、本棚・本棚名 (引用符あり/なし) を検査する。マニュアルの「はじめての起動」「フォルダを開く・移動する」へ各 1 文追記した。UI の固定文字列・見た目は変更なし。
 
+#### 独立レビュー P2 の修正 (2026-11-02)
+
+- 原因・不変条件: 初回実装は引用符なしにも trim を適用し、通常パスを元の文字列で解決していた旧仕様を変えた。同じ resolver に保存済み実パスも入るため、末尾全角空白の実フォルダと空白なしの兄弟があると誤った兄弟を選び、兄弟がなければ親探索へ進む。namespace の末尾半角空白と相対パスの先頭空白も失われた。入力の構文解析は手入力だけに限定し、native path の identity は保存する。
+- 修正: 手入力用の `resolve_folder_bar_address_input(&str)` → `normalize_folder_bar_input_path(&str)` と、native 用の `resolve_folder_bar_nav_path(&Path)` を分離。外側を trim した値で引用符の対を検出し、対があるときだけ 1 組を外して内側を trim。対がなければ元入力を渡す（ドライブ文字だけの補完は従来どおり）。native resolver は `path_key::normalize_input_path` と既存の実パス解決だけで、trim・unquote・lossy な文字列化をしない。空欄／空白だけ・引用符付き空文字・本棚の先行判定は維持。
+- 内側 trim の判断: 設計担当の明示仕様を維持し、半角空白だけへの限定は行わない。Unicode `str::trim` を使うため、`"C:\data\写真　"` は `C:\data\写真` へ解決する。引用符なしの末尾全角空白フォルダは保持する。両方の実フォルダを一時領域に作り、この意図した差と、空白なし兄弟の削除後にも元フォルダへ解決できることを回帰で固定する。spec とマニュアルにも明記。
+- 全経路の棚卸し（修正前の `normalize_folder_bar_input_path` は共通 resolver の 1 か所から呼ばれ、その製品 caller が以下の 6 か所。テストからの直接呼び出しは別）:
+
+| caller / データの由来 | 種類 | 修正後の入口 |
+|---|---|---|
+| パス欄 Enter / `self.address` | 手入力 | `resolve_folder_bar_address_input` → 入力解析 → native resolver |
+| A/B 切替 / workspace の `raw_target` | native | `resolve_folder_bar_nav_path` 直行 |
+| 場所メニュー・整理先 / `destination.path` | native | 同上 |
+| 場所メニュー・既知フォルダ / `location.path` | native | 同上 |
+| 場所メニュー・ドライブ / `drive` | native | 同上 |
+| 履歴メニュー / `recent_folders` の `path` | native | 同上 |
+
+- 回帰追加: 実フォルダ `写真　` と `写真`、先頭空白の相対パス（cwd を変えず temp 名で検査）、Windows namespace `\\?\…\Album ` の実フォルダと兄弟、非 Unicode native path。headless の実 toolbar で A/B 両スロットの切替完了先と履歴メニューの返却先、Enter での引用符有無による差を検査する。片側だけの引用符に前後空白がある入力も保持する。
+- 変更範囲: `src/ui_main.rs`、spec、本節、マニュアル2ページ。キーイベント・IME・見た目・open owner・非同期 lifecycle は変更なし。製品ページの既存の機能紹介に変更は不要。製品起動・実機操作・コミットは行わず、コミット／検収は設計担当。
+- P2 修正後の検証結果は本節末尾へ追記する。上の「実装」「呼び出し元」と下の既存検証記録は `52bd432f5` までの初回実装の履歴であり、P2 後の仕様・結果は本追補を正とする。
+
 #### ほかのパス入力経路の棚卸し (今回変更なし)
 
 ソース照合であり、各経路の実機入力試験ではない。`path_key::normalize_input_path` 自体は区切りとドライブ文字の整形だけで、引用符・空白を除かない。
@@ -126,7 +146,7 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 | コマンドラインの `--data-dir` | `data_dir.rs::init` は `args` の次の要素をそのまま `PathBuf` 化。trim・アプリ側の引用符除去なし | 同じくコマンドライン構文側で囲む。リテラル引用符の追加対応なし |
 | 外部 D&D | `vendor/egui-winit/src/lib.rs` は `WindowEvent::DroppedFile(PathBuf)` を受け、`app/update_phases.rs::input_drop_and_activity` が実パスを回収。任意のパス文字列を解析する受信経路なし | 文字列用 unquote は不要 |
 
-#### 検証記録
+#### 初回実装の検証記録 (52bd432f5)
 
 - 対象: `quoted-1684` / `3a193e50d` からの本節の未コミット差分。build/check/test は `MSBUILDDISABLENODEREUSE=1`、通常 features。
 - `cargo fmt` / `cargo fmt --check` / `git diff --check`: 成功、exit 0。fmt check のログは `target/quoted-1684-fmt-check.log`。UI の固定文字列を変えていないため `check_ui_glyphs.py` は対象外。
@@ -142,6 +162,16 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 | `video::engine::clock::tests::wall_clock_extrapolates_like_audio` | 30ms sleep 後の値 5.1121925 が期待上限 5.100 を超過 | 3成功 (0.232 / 0.225 / 0.225秒)。`target/quoted-1684-single-3-{1,2,3}.log` |
 
 - 確認用 build: `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` が **成功、exit 0**。通常 features / dev-runtime、`MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`。core 42分37秒、remote service 3分39秒、EPUB worker 2分13秒。core・同protocolのremote service・EPUB worker・FFmpeg DLL・EffeTune bundleを `target/dev-runtime/` へ配置し、CRT/PE検査も成功 (`runtime=4 pe=3`)。ログは `target/quoted-1684-build-dev.log`。製品起動・実機操作・コミットは行っていない。
+
+#### P2 修正後の検証記録
+
+- 対象: `quoted-1684` / `52bd432f5` に対する本節の未コミット差分5ファイル。通常 features、`MSBUILDDISABLENODEREUSE=1` / `CARGO_BUILD_JOBS=1`。以下の検証後は本節の結果記録だけを追記し、Rust source は変更していない。コマンド・exit・所要時間は `target/quoted-1684-p2-results.jsonl`。
+- `cargo fmt`、`cargo fmt --check`、`git diff --check`: 全て成功、exit 0。ログは `target/quoted-1684-p2-fmt-{1,2,3}.log`。UI の固定文字列・見た目の変更はなし。
+- `cargo check -p mimageviewer --lib --tests`: 成功、exit 0、85.787秒。通常 dev profile、既存 warning あり。ログは `target/quoted-1684-p2-check-1.log`。
+- 関連 nextest: `cargo nextest run -p mimageviewer --lib -E 'test(folder_bar) | test(address) | test(history) | test(quick_folder)' --profile default --ignore-default-filter --run-ignored default --retries 0 --no-fail-fast --no-tests fail`。**457成功・0失敗・0 timeout、96.712秒、exit 0**（7 slow、15,117 skipped）。追加5件と拡張した Enter 回帰を含む。test profile / default nextest。run `fd10880c-6200-403e-b284-6f71c35a687e`、ログ `target/quoted-1684-p2-focused-1.log`、JUnit の保存コピー `target/quoted-1684-p2-focused-junit.xml`。コンパイルを含む呼出全体は395.624秒。
+- `.\scripts\test-lib-full.ps1`: **全件を1回実行し、15,503成功・0失敗・0 timeout、71 skipped、776.243秒、exit 0**（11 slow / 1 leaky）。落ちたテストがないため単独3回は不要、全件の再実行もなし。初回実装で落ちた既存3件も今回の全件では成功（大量走査は495.636秒）。test profile / default を継承する miv-tool nextest profile。run `fbfbda4a-fffe-48c1-81b3-0d1d1d9058bf`、ログ・JUnit `target/test-lib-full/runs/20261102T084817554Z-ca6e5572/`、呼出ログ `target/quoted-1684-p2-full-1.log`。実行時 source ID `a0099638b52f865b27ed4ed5b4aedfb910c884a9a3cf35c9088874bf39cd70a9`、成功台帳 `target/test-lib-full/fb4e06262ad5021837ee4217c9ebec5e50644af34b856b5f9dece8dc4c0f0313.json`。
+- 独立レビュー: 別コンテキストの GPT-6.1 Sol / xhigh が6 caller、入力境界、既存分岐、追加回帰と文書を read-only で照合し **ACCEPT、指摘なし**。レビュー担当はテストを重複実行せず、本記録の結果を再利用する。
+- 確認用 build: `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` は **成功、exit 0、全体377.150秒**。通常 features / dev-runtime、上記と同じ環境変数。core 6分12秒、remote service 0.58秒、EPUB worker 0.64秒。core・同protocolのremote service・EPUB worker・FFmpeg DLL・EffeTune bundleを `target/dev-runtime/` へ配置し、CRT/PE検査も成功（`runtime=4 pe=3`）。ログ `target/quoted-1684-p2-build-1.log`。製品起動・実機操作・コミットは行っていない。ユーザーが確認する場合はインストール版／常駐tray版を終了してから `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。通常の `%APPDATA%\mimageviewer` を使い、実設定・データを更新し得る。確認対象は空白なし兄弟がある末尾全角空白フォルダへの引用符なし Enter・A/B・履歴での移動、および引用符付き Enter だけ内側 trim される仕様。
 
 ### 1.683 製本の管理で、本の並び順を利用者が決められるようにする — 利用者要望 (2026-11-02)
 
