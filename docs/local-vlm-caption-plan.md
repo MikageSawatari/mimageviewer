@@ -1,6 +1,6 @@
 # ローカル AI 説明文 (VLM) 計画書
 
-Status: 独立レビュー済み (2026-11-02、9 回で閉じた、§19)。設計担当 ClaudeCode。V0 (モデル比較・VRAM 計測) を終え、利用者の判断 U1〜U18 が出そろった。
+Status: 独立レビュー済み (2026-11-02、9 回で閉じた、§19)。設計担当 ClaudeCode。V0 (モデル比較・VRAM 計測) を終え、利用者の判断 U1〜U19 が出そろった。
 v5 に入れることが決まった (2026-11-02、v5 統合担当から連絡)。
 関連: [mcp-integration-plan.md](mcp-integration-plan.md) (§5.4・§5.6・§15.2)、
 [search-architecture.md](search-architecture.md) (§4.10・§4.11)、
@@ -108,7 +108,7 @@ v5 に入れることが決まった (2026-11-02、v5 統合担当から連絡)�
 | 案 | 内容 | 判断 |
 | --- | --- | --- |
 | A | llama.cpp の `llama-server` を子プロセスで起動し、127.0.0.1 の HTTP で呼ぶ | 不採用。PC 内の他プロセスやブラウザから届く口ができ、「mIV はネットワークで待ち受けない」が崩れる。鍵と Origin 検査を足す管理も増える |
-| **B** | **llama.cpp (libllama + libmtmd) を組み込んだ自前の worker exe。本体とは匿名パイプ + 共有メモリ** | **推奨**。待ち受ける口が無い。既存の TRT worker・PDFium worker と同じ形で、落ちても本体を巻き込まない |
+| **B** | **llama.cpp (libllama + libmtmd) を組み込んだ自前の worker exe。本体とは匿名パイプ (長さ付きの枠、§21.3)** | **推奨**。待ち受ける口が無い。既存の TRT worker・PDFium worker と同じ形で、落ちても本体を巻き込まない |
 | C | 同梱済みの ONNX Runtime (DirectML) + onnxruntime-genai | 不採用。VLM の ONNX 版がほぼ無く、今の `ort` (api-24) との組み合わせの制約も増える |
 
 - GPU は **Vulkan 版**を既定にする (NVIDIA / AMD / Intel で 1 本の build が動き、CUDA 版より配布が小さい)。
@@ -133,7 +133,7 @@ v5 に入れることが決まった (2026-11-02、v5 統合担当から連絡)�
 - worker の寿命: 作成ジョブの開始で起動 → モデルを読み込む → 1 件ずつ処理 → ジョブの終了・中止・mIV の終了で終了。
   Job Object の kill-on-close (`src/epub_convert.rs` の EPUB worker に実例がある) で、本体が落ちても
   VRAM を持ったまま残らないようにする。常駐はさせない。
-- 入力画像は**本体側の既存デコーダ** (WIC / TurboJPEG / LibRaw ほか) で読み、縮小した RGB を共有メモリで渡す。
+- 入力画像は**本体側の既存デコーダ** (WIC / TurboJPEG / LibRaw ほか) で読み、縮小した RGB をパイプで渡す (共有メモリは使わない、§21.3)。
   対応形式が本体と完全に一致し、worker にデコーダを持たせずに済む。
 
 ## 5. モデルの配布
@@ -642,6 +642,7 @@ AI 補正の VRAM 使用量は実測の記録が無い。ONNX Runtime の確保�
 | U12 | 作成ジョブ中にメタ情報の書き出し・取り込みを使えなくすること | 問題ない (2026-11-02)。ただし U14 で止める必要が無くなり、止めないことにした |
 | U16 | 本の表紙も説明文にするか (§6.7) | する。保存は本のパス、表紙は一覧のサムネイルと同じもの、MCP の項目情報で返す (2026-11-02) |
 | U17 | ZIP・RAR・フォルダの本を説明文で Ctrl+G から探せるようにするか (§6.7) | 説明文がある本に限り、アイテム索引にも載せる (2026-11-02 利用者の案)。説明文の無い本は今どおり Ctrl+S だけ |
+| U19 | worker (`mimageviewer-vlm.exe`、約 46MB) の配り方 | 本体に内包する (VST3 bridge と同じ)。モデルだけを追加ダウンロード (2026-11-02) |
 | U18 | 未変換のファイル (EPUB・変換済みの ZIP が無い 7z・LZH) の表紙 (§6.7) | 飛ばす。何も保存せず、ジョブの終わりに飛ばした件数を出す。作成ジョブからは変換しない (2026-11-02) |
 | U15 | 名前を入れ替える操作 (本のページの並べ替えなど) の途中で読んだページの説明文が、別のページに付くことがある件 (§6.6) | 割り切る。タイミングとしてまれなため (2026-11-02)。付いた先で署名が違えば「古い」と表示され作り直せるが、署名が同じ画像どうしでは見分けられず、通常の作り直しでも直らない (独立レビュー 5 回目で記述を正した) |
 | U14 | 改名・削除と保存の順序の扱い (§6.6) | 作業を始めたときのパスと署名を覚え、書く前に違えば結果を捨てる (2026-11-02 利用者の案)。メタ情報の書き出し・取り込みも止めない |
@@ -947,3 +948,60 @@ mIV 本体にはつないでいない。build と確認の手順は `crates/vlm-
 ### 19.9 9 回目 (2026-11-02、同じ担当の続き、基準 `d031c286c`)
 
 8 回目の 2 件は閉じ、新しい指摘は無かった。本の表紙 (§6.7) を含め、計画書の独立レビューはここで閉じる。
+
+## 21. V1 の段階分けと V1-1 の設計 (2026-11-02、独立レビュー前)
+
+### 21.1 V1 の段階
+
+V1 (§14) は大きいので、所有の境界ごとに分ける。各段階で独立レビュー (設計・コード) を受けてから次へ進む。
+
+| 段階 | 内容 | 主な所有者 |
+| --- | --- | --- |
+| V1-1 | worker の常駐用の通信 (`--serve`)、Rust 側の worker client、GPU の判定 (VRAM 総量と device)、worker の場所の解決 (開発用) | `VlmWorkerClient` |
+| V1-2 | `ai_caption.db` (§7 の schema・trigger)、`STORES` 登録、`metadata_transfer`、保存役 (§6.6 の lock の中の確認) | 保存役 |
+| V1-3 | 作成ジョブの持ち主・右クリック・進捗の小窓・初回の取得案内・モデルの追加ダウンロード・VRAM 8GB の判定・worker の本体への内包 (展開・source identity・署名) | `CaptionJobOwner` |
+| V1-4 | 表示 (共有キャッシュ §9、情報パネル)、本の表紙の解決の切り出し (§6.7) と本のジョブ | 表示・表紙の解決 |
+
+V2 (検索) と V3 (MCP) は §14 のまま。
+
+### 21.2 既存の worker の作り (2026-11-02 調査、コードで確認)
+
+| worker | 起動 | 通信 | 大きなデータ | 親が落ちたとき |
+| --- | --- | --- | --- | --- |
+| TensorRT 推論 | 本体 exe を引数付きで起動 | 1 行 1 JSON | 名前付きの共有メモリ 2 つ | stdin の EOF で終わる (Job Object なし) |
+| PDFium | 本体 exe を引数付きで起動、複数 | u32 長さ付きの binary (`pdf_loader::write_msg` / `read_msg`、上限 512MiB) | パイプにそのまま (描画した画素) | Job Object なし |
+| EPUB → PDF | 別 exe を `CreateProcessW` (suspended) | stdout の 1 行 1 JSON (片方向) | ファイル | **Job Object の kill-on-close** (`epub_convert.rs`) |
+| VST3 bridge | 別 exe (`vendor/` で build、本体に内包し content-addressed で展開) | u32 長さ付きの JSON + 名前付きの共有メモリ | 共有メモリ | 子が親の pid を見張る |
+
+計画書 §4 の「TRT worker・PDFium worker と同じ形 (匿名パイプ + 共有メモリ)」は事実と違っていた (TRT は名前付きの共有メモリ、PDFium は画素もパイプ、Job Object を使うのは EPUB だけ)。V1-1 で次のように直す。
+
+### 21.3 V1-1 の設計
+
+**通信は長さ付きの枠をパイプに流すだけにし、共有メモリは使わない。** 1 件の入力は長辺 1024px の RGB で最大約 3MB、出力は数 KB なので、
+PDFium worker と同じくパイプにそのまま流して足りる。共有メモリの名前・寿命・読み書きの順序の約束を持たずに済む (状態を減らす)。
+
+- **worker の起動**: EPUB worker と同じく `CreateProcessW` (suspended・`CREATE_NO_WINDOW`) → Job Object (kill-on-close) に入れる → resume。
+  stdin・stdout は匿名パイプ (親側は継承させない)、stderr はログへ流す。EPUB と同じ処理を 2 か所に書かず、Job Object 付きの起動を
+  1 つの helper にまとめて両方が使う (EPUB の挙動は変えない)。親が落ちれば Job Object で worker も終わる。
+- **枠**: u32 little-endian の長さ + 中身。`pdf_loader` の `write_msg` / `read_msg` と同じ形 (共通にできるなら同じ関数を使う)。上限 16MiB。
+  中身は「JSON の頭 + 必要なら binary」。
+- **やりとり** (どれも 1 往復、同時に 1 つだけ):
+  - `hello` → 版 (`protocol_version`) と worker の source identity を返す。版が違えば使わない (VST3 と同じ)。
+  - `load` (モデル・mmproj のパス、device の LUID、CPU スレッド数) → 読み込みにかかった時間と使った device。
+  - `caption` (要求の番号、幅・高さ、RGB) → 要求の番号、結果 (`ok` / `image_failure` / `fatal`)、3 欄、検証 (§6.5)、生成トークン数、時間。
+    `image_failure` は 1 件の失敗 (次へ進む)、`fatal` は続けても意味がない失敗 (VRAM 不足など。ジョブを止める)。V1-0 の分け方をそのまま使う。
+  - `shutdown` → 終わる。返事を待たずに Job Object で終わらせてもよい (TRT と同じく、片付けを待たない)。
+- **worker 側 (C++)**: `--serve` を足す。1 件の処理は V1-0 の確認用モードと同じ関数を使う (処理を 2 つに分けない)。画像は本体から RGB で受け取り、
+  worker はデコードしない (§4)。確認用モード (`--selftest`) は PNG を読んでこの関数に渡す形に揃え、残す (回帰の確認に使う)。
+- **Rust 側の client** (`VlmWorkerClient`): 起動・`hello`・`load`・`caption`・終了を持つ。呼ぶのはジョブの worker スレッドだけで、UI スレッドからは
+  呼ばない。時間の上限: `hello` 30 秒、`load` 120 秒、最初の `caption` 120 秒 (Vulkan の初回準備、§20)、2 件目以降 60 秒。上限を超えた・パイプが
+  切れた・`fatal` が来たら、worker を終わらせて client は使えなくなる (再起動や再試行はしない。まれな失敗は割り切り)。
+- **GPU の判定**: worker の `--list-devices` (V1-0 で作った、DXGI の LUID と Vulkan の device の対応と VRAM 総量) を、モデルを読まずに起動して使う。
+  結果は「使う device (専用メモリが最大のアダプタ) と、その VRAM 総量、Vulkan の有無」の 1 つ。判定は mIV の起動ごとに 1 回、必要になったときに
+  worker スレッドで行い、その起動の間は結果を使い回す (実行時の空きでは変えない)。`gpu_info` (DXGI の最初のアダプタ) は使わない。
+- **worker の場所**: 1 つの関数で解決する。V1-1 では、環境変数 `MIV_VLM_WORKER` → `vendor/vlm-worker/mimageviewer-vlm.exe` (開発用) の順。
+  本体への内包・展開 (VST3 と同じ content-addressed)・portable での置き方・source identity の照合・署名は V1-3 でこの関数に足す。
+- **確認**: Rust の統合テスト (既定では走らない。モデルのパスを環境変数で渡したときだけ) で、`--serve` 経由の 26 枚の出力が V1-0 の確認用モードの出力と
+  26/26 一致することを確かめる。通信の枠・時間の上限・`image_failure` と `fatal` の分け方・パイプが切れたときは、偽の worker (テスト用の小さな exe か
+  Rust のテスト用 binary) で確かめる。
+- **まれな失敗**は割り切り (ログ + 通知。ジョブを止め、利用者がやり直す)。
