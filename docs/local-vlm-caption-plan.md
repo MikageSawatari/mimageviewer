@@ -1550,3 +1550,105 @@ gh release create vlm-model-v1 --repo MikageSawatari/mimageviewer --target main 
 - **公開済み (2026-11-03、利用者の承認の後に設計担当が実施)**: https://github.com/MikageSawatari/mimageviewer/releases/tag/vlm-model-v1 (prerelease)。
   6 つの asset の名前と大きさが手元と一致。固定の URL から取得した `vlm-model-index.json` の SHA-256 (`7015d1cb…d651`) が手元と一致。
   part2 への Range 要求が 206 を返す。`releases/latest` は v4.11.0 のまま。
+
+## 21.11 V1-4 の設計 (2026-11-03)
+
+### 21.11.1 段階の分け方
+
+§21.1 の V1-4 (表示・本の表紙) を 2 つに分ける。表示は画像の説明文だけで成り立ち、V1-3 の結果を画面で確かめられるようになる。
+本の表紙の解決は、既存のサムネイルの経路をまたぐ大きな切り出しで、§6.7 の前提がコードと食い違う点が見つかった (§21.11.3)。
+
+| 段階 | 中身 |
+| --- | --- |
+| V1-4a | 画像の説明文の表示 (共有キャッシュ・読み込み worker・情報パネルの欄・無効化) |
+| V1-4b | 本の表紙の解決 (`resolve_book_cover`)・本の作成ジョブ・情報パネルの「この本」の欄 |
+
+### 21.11.2 V1-4a: 画像の説明文の表示
+
+コードで確かめた前提 (2026-11-03):
+
+- 情報パネル (`ui_metadata_panel.rs` `draw_metadata_panel` → `draw_metadata_panel_inner`) を呼ぶのは fullscreen の描画 (`ui_fullscreen.rs`
+  `render_fullscreen_viewport_with_root_input`) だけ。detached viewer も同じ関数を、その context を `App` に載せた状態で呼ぶ
+  (`App::update_active_viewer_context`)。パネルは常に `&mut App` で動く。
+- context ごとのメタデータキャッシュは `ViewerContextBundle` (`viewer_context_registry.rs`) が持ち、載せ替えで `App` の field と入れ替わる。
+  `sidecar_display_cache` と `folder_thumb_pin_dirty` は bundle に入っておらず、すでに全 context で共有している。共有キャッシュはこの前例に倣う。
+- 画像の説明文のキーは、`GridItem::Image` の `metadata_cache_key(idx)` と同じ文字列になる (`CaptionDb::normalize_path` は STORES の記述子の
+  KeepDrive 正規化 = `adjustment_db::normalize_path`)。ZIP 内の画像・PDF のページのキー (`::` 付き) は説明文の対象ではない。
+- `CaptionDb::open_at` はスキーマを作る (書く)。読み取り専用で開く関数は無い。rollback journal なので、長く開いた読み取りの transaction は
+  書き手の COMMIT を待たせる (V1-3c の `CommitBusyGuard`)。
+- 一覧の `image_metas` の更新日時は秒で、説明文の署名 (ミリ秒) とは厳密に比べられない。
+
+設計:
+
+1. **持ち主**: `App` に `caption_display: CaptionDisplayCache` を 1 つ (bundle に入れない)。
+   - 中身: キー → `Loading { gen }` / `Loaded { row: Option<CaptionRow>, current: Option<FileSignature>, gen }`。`epoch` (全部消すたびに増やす) と
+     キーごとの `gen` (そのキーを消すたびに増やす) を持つ。
+   - 大きさの上限は 512 件。超えたら全部消す (表示中の項目は次のフレームで読み直す。LRU は持たない)。
+2. **読み込み worker**: 説明文だけの小さな worker を 1 本、初めて要るときに起動し、mIV が終わるまで要求を待つ (channel で `(key, path, epoch, gen)`)。
+   - 1 件ごとに、`ai_caption.db` を **読み取り専用で開く関数** (`CaptionDb::open_read_only`、新設。ファイルが無ければ `None` を返し、作らない) で
+     1 回の SELECT を行い、`std::fs::metadata` で今の署名を取る。読み取りの transaction を持ち越さない (接続は持っていてよいが、文と文の間で
+     transaction を開いたままにしない)。DB が無いときは、作成ジョブが作るまで「行なし」。
+   - 結果は `mpsc` で返し、`request_repaint` する。`App::ui` の先頭 (`poll_caption_job` の隣) で受け取る。届いた結果の `epoch`・`gen` が今と違えば
+     採用しない (保存や取り込みより前に始まった読み込みが後から届く場合)。読み直しは、次にパネルがそのキーを描くときに起きる。
+   - mIV の終了では channel を閉じるだけで join しない。DB の失敗は「行なし」として扱いログに出す (まれな失敗は割り切り)。
+3. **要求のきっかけ**: パネルが `GridItem::Image` を描くとき、キーがキャッシュに無ければ要求を送る (UI スレッドは channel に送るだけで I/O をしない)。
+   `Loading` の間は送り直さない。ほかの種類 (ZIP 内の画像・PDF のページ・動画・音声・本) では要求しない (本は V1-4b)。
+4. **パネルの欄「AI 説明」**: ★・タグ・パレットの後、ツイート・生成情報・EXIF の前に置く (内容の説明なので、生成情報より上)。
+   - `ok` の行: 説明文・画像内の文字 (空なら出さない)・検索語 (読点でつなぐ) を、既存の `draw_text_section` (Copy ボタン付き) で出す。
+     下に「作成日」を 1 行。モデルの `model_id` はその行の hover に出す (UI に内部名を常に出さない)。
+   - `failed` の行: 「この画像の説明文を作れませんでした」と作成日だけ。
+   - **古い**: 行の署名と今の署名が違えば「画像が変わっています。右クリックの『AI 説明文を作る』で作り直せます」を添える (説明文は消さずに出す、§7)。
+     ファイルが無ければ (今の署名が `None`) 古いとは出さない (一覧から消えるので)。
+   - 行が無い・読み込み中は欄を出さない (読み込みの間に「無し」がちらつかないように)。「表示するものが無い」の判定 (`draw_no_metadata`) に
+     説明文の有無を足す。
+5. **無効化** (書き手ごとに変わったキーを数えず、ジョブの 1 件以外は全部消す):
+   - 作成ジョブ: App 側の `CaptionJob::item_done` (今の 1 件のパスを `current` に持っている) で、**結果によらず**そのキーを消す。
+     `CaptionItemOutcome` は `Written` と `KeptExistingOk` を区別しないが、読み直しは 1 件の SELECT なので区別を足さない。
+     V1-3c が worker スレッドに残した空の `notify_written` は App に触れられないので使わず、消す (V2 の索引の旗は §8 の設計で別に決める)。
+   - 取り込み: `apply_metadata_import_terminal_refresh` (`ImportChangedSections.ai_captions` が立ったとき)。`poll_image_folder_zip` が作る
+     `ImportChangedSections` も同じ扱い。
+   - STORES の汎用操作: `StoreMutationEffects` に `captions_changed` (記述子のファイルが `ai_caption.db` で、行が変わったとき) を足し、
+     App 側の完了点で全部消す。完了点は 改名 (`poll_rename_migration_pending`)、削除の後始末 (`poll_delete_pending`・`poll_delete_purge_retry`)、
+     復元・コピー (`poll_content_identity_restore`)、孤児整理 (`apply_metadata_cleanup_result`)、本の操作 (`finish_book_append_undo`・
+     `adopt_book_store_summary`)。共通の受け口 `apply_content_identity_store_mutations` は早期 return するので、その前に呼ぶか別の関数にする。
+6. **detached viewer**: 共有キャッシュは bundle の外で、detached の経路と述語に触れない。パネルは同じ関数なので detached でも欄が出るが、
+   それは既存の bundle 外の共有表示 (`sidecar_display_cache`) と同じ形で、新しい分岐を足さない。CLAUDE.md の手続きに従い、
+   「症状パッチではなく、bundle の外の共有キャッシュという既存の形に乗せた新しい表示」であることを独立レビューで確かめ、
+   detached-rework-plan に 1 行残す。
+7. **リモート**: mIV Remote のパネルには出さない (V3 以降)。リモートの所有権・IPC に触れない。
+8. **perf**: 読み込み worker の 1 件 (SELECT と stat) に `perf::event`。
+9. **テスト**: 状態の遷移 (送り直さない・`gen` 違いを捨てる・読み込み中に全部消す・上限で全部消す)、ジョブの 1 件の完了でそのキーだけ消えること、
+   取り込みと各完了点で全部消えること、`open_read_only` が DB を作らないこと、古いの判定 (署名の違い・ファイルが無い)、パネルの欄の snapshot
+   (`ok`・`failed`・古い)、欄が無いときに「表示するものが無い」が今と同じであること。
+
+**状態を減らす検討**
+
+- キャッシュの消し方は「1 件だけ」(ジョブ) と「全部」(それ以外) の 2 つだけにし、書き手ごとに変わったキーを数え上げない (§9 のまま)。
+- 読み込み中の結果の行き先は `epoch` と `gen` の比較 1 つで決め、取り消しの印を持たない。
+- 欄は「行がある」ときだけ出し、読み込み中の表示を持たない。
+
+### 21.11.3 V1-4b の方向 (詳しい設計は V1-4a の後)
+
+§6.7 の前提と、コードの食い違い (2026-11-03 調査):
+
+1. **PDF のパスワード**: 一覧のサムネイルは保存済みのパスワード (`PdfPasswordStore`) を使わず、最後に開いた PDF のその場のパスワード
+   (`pdf_current_password`) だけを渡す。保護された PDF の多くは一覧ではアイコンになる。
+   → 本のジョブは、開くときの規則 (`pdf_open_password` = 保存済み → その場の値) で読む。利用者が選んで作成を頼んだ本なので、
+   一覧でアイコンでも 1 ページ目を読んでよい。表紙の位置 (1 ページ目) は一覧と同じなので、「見えている表紙と読む表紙が違う」には当たらない。
+2. **子の書庫だけのフォルダ**: フォルダの直下に画像が無いとき、一覧は子の ZIP・PDF の**保存済みサムネイル (WebP)** を流用し、元のファイルを
+   読まない。読んだ位置 (エントリ・ページ) が分からず、1024px で読み直せない。
+   → 表紙の解決は、勝った子 (`FolderSelectionProof.winner`) の本を、子の本の規則 (最初の画像・1 ページ目) で読み直す。見た目は同じ画像の高解像度版。
+3. **固定表紙のたどりは今 UI スレッドで行われている** (`make_load_request` → `apply_folder_thumb_pin`、各段で `metadata`)。
+   → 表紙の解決では worker で行う (`app/color_filter.rs` が worker で `apply_folder_thumb_pin` を呼ぶ前例)。一覧の経路はこの段階では動かさない。
+4. **表紙を決める処理は 1 つの関数ではない**: 計画 (`make_load_request_with_visibility` + `apply_folder_thumb_pin`) は UI スレッド、解決
+   (EPUB の世代・フォルダの選択・ZIP の最初の画像) は `thumb_loader::process_load_request` の中に直書き (約 480 行)。
+   → 解決の部分を `process_load_request` から関数に切り出し (`resolve_load_request_target`)、サムネイルと本のジョブの両方が呼ぶ。サムネイルの
+   読み込み・cache の段は動かさない。切り出しの前後でサムネイルの結果が変わらないことを既存のテストと追加のテストで押さえる。
+5. **変換済み書庫の状態**は `Pending` と RAR の包みもあり、表示中の範囲だけ App の map に解決されている。変換済み ZIP は、直接読める RAR より優先される。
+   → 本のジョブは worker で同じ判定 (`resolve_converted_archive_candidate`) を行う。`Unavailable` は §6.7 のとおり「未変換」として飛ばす。
+6. **ZIP・RAR の「最初の画像」は書庫の中の並び順** (並べ替えの設定は使わない)。フォルダの「最初の画像」は `folder_thumb_sort` (一覧の並び順とは別の設定)。
+   → §6.7 の「並び順で最初の画像」は `folder_thumb_sort` と読み替える。
+7. **EPUB**: `resolve_epub_at` は private で、入口は `resolve_read_target`。元ファイルの署名は `display_source_state` (FILETIME の 100ns 単位) で、
+   ミリ秒に直して記録する。
+8. **固定表紙のエントリ・ページが無いとき**、一覧はサムネイルを失敗にする (自動選択に戻らない)。本のジョブもその本を失敗として数え、行は書かない
+   (`ImageFailure` ではなく読み込みの失敗)。
