@@ -1519,3 +1519,13 @@ DOS予約名・末尾dot/space・区切り・相対移動・case-insensitive衝�
 - `scripts/build-dev.ps1 -PreserveRuntime` は通常featureのcoreと同伴3exeのbuild／配置・VC runtime PE検査に成功。
   ログは `target/vlm-caption-review1-build-dev.log`。最後にワークスペース全体へ `cargo fmt` を実行した。
   UI glyph検査・差分検査も成功。製品起動・外部通信・コミットは行っていない。
+
+#### 21.9.2 検収 (設計担当、2026-11-03)
+
+- 本体 lib 全件 (設計担当の環境): `4fbba7d34` で 15,437 件すべて成功、`cec28c6da` で 15,445 件すべて成功。
+- 独立コードレビュー 1 回目 (基準 `4fbba7d34`): P1 1 件 (右クリックからの要求がメニュー自身のモーダル判定で拒否される)、P2 2 件 (COMMIT 待ちの中止で保存される・
+  スタック表示で直下の画像が落ちる)。対応は `cec28c6da` (§21.9.1)。
+- 独立コードレビュー 2 回目 (基準 `cec28c6da`): 3 件とも閉じ、新しい指摘は無し。選択したスタックのセルを対象外にする扱いはタグ操作 (`src/tag_ops.rs`) と一致。
+  一括書き出しはメンバーを展開するので、全操作共通の規則ではない。
+- V1-3 (a の公開を除く) はここで閉じる。残り: V1-3a のモデルの分割・index・LICENSE/NOTICE・GitHub Releases への公開 (利用者の承認が要る)、
+  `scripts/setup-llama-cpp.ps1` の archive の SHA-256、実機確認 (実モデルでの生成・初回取得・UI)。
