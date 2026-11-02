@@ -1440,3 +1440,16 @@ DOS予約名・末尾dot/space・区切り・相対移動・case-insensitive衝�
   `CARGO_BUILD_JOBS=8` / `CMAKE_BUILD_PARALLEL_LEVEL=1` とし、実vendor workerのidentity一致で
   `Reusing the current-source worker; CMake and SDK are not needed.` の経路を通った。
   core / remote / EPUB / MCP / launcher と最後のPE依存検査が成功し、通常profileやAPPDATA cacheは変更せず、成果物は起動していない。
+
+**検収 (設計担当、2026-11-03)**
+
+- 本体 lib 全件 (`0ee27ebeb`、設計担当の環境): 15,406 件中 15,405 件成功。失敗 1 件は
+  `app::tests::scroll_661::row_anchor_observation_keeps_middle_selected_row_in_both_renderers` で、単独の再実行では成功 (VLM の変更範囲外)。
+  実装担当の環境で落ちた名前付きパイプの 2 件は、この環境では成功した (実装担当のサンドボックスの制限)。
+- 独立コードレビュー 1 回目 (基準 `0ee27ebeb`): P2 2 件。worker を全 Windows ビルドで必須にしたのに新しい clone での復旧経路が無い、
+  Vulkan loader が無い PC で非対応ではなく再起動を案内する。対応は `fc21fd392` (上の 2 項目)。
+  worker の exe は `C:\home\mimageviewer_vendor_backup\vlm-worker\` へ実ファイルでバックアップした (SHA-256 `15921e46…8798`)。
+- 独立コードレビュー 2 回目 (基準 `fc21fd392`): 2 件とも閉じ、新しい指摘は無し。
+- `fc21fd392` で設計担当が VLM 関連 69/69 と `scripts/test-vlm-worker-identity.ps1`、実リポジトリでの identity の関門を再実行し、いずれも成功。
+- 残り: `scripts/setup-llama-cpp.ps1` の archive の SHA-256 は未設定 (未設定の間は取得しない)。バックアップが無い環境で
+  ソースから作り直す経路は、この値を確定するまで開通しない。実機確認・署名・モデルの公開は未実施。
