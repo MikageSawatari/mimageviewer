@@ -484,6 +484,10 @@ enum FavoriteButtonClick {
 
 fn resolve_folder_bar_nav_path(path: &Path) -> Option<PathBuf> {
     let path = normalize_folder_bar_input_path(path);
+    // Quoted empty input is invalid; only the raw empty address selects drives.
+    if path.as_os_str().is_empty() {
+        return None;
+    }
     let convertible_archive = path.is_file()
         && path
             .extension()
@@ -498,15 +502,23 @@ fn resolve_folder_bar_nav_path(path: &Path) -> Option<PathBuf> {
 }
 
 fn normalize_folder_bar_input_path(path: &Path) -> PathBuf {
-    let raw = path.as_os_str().to_string_lossy();
+    // Other folder-bar callers can supply native paths, so preserve non-UTF-8 input.
+    let Some(raw) = path.to_str() else {
+        return crate::path_key::normalize_input_path(path);
+    };
     let trimmed = raw.trim();
+    let trimmed = trimmed
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .map(str::trim)
+        .unwrap_or(trimmed);
     if trimmed.len() == 2 {
         let bytes = trimmed.as_bytes();
         if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
             return crate::path_key::normalize_input_path(Path::new(&format!("{}\\", trimmed)));
         }
     }
-    crate::path_key::normalize_input_path(path)
+    crate::path_key::normalize_input_path(Path::new(trimmed))
 }
 
 fn checked_selection_overlay_label(checked_count: usize) -> Option<String> {
@@ -23515,6 +23527,82 @@ mod rating_filter_op_tests {
         );
     }
 
+    #[test]
+    fn folder_bar_quotes_and_surrounding_whitespace_are_removed() {
+        for (input, expected) in [
+            (r#"C:\books"#, r"C:\books"),
+            (r#""C:\books""#, r"C:\books"),
+            (" \tC:\\my books \r\n", r"C:\my books"),
+            (" \t\" C:\\my books \t\" \r\n", r"C:\my books"),
+            (r#""C:""#, r"C:\"),
+            (r#""C:\""#, r"C:\"),
+            (r#""\\server\share\x""#, r"\\server\share\x"),
+        ] {
+            assert_eq!(
+                normalize_folder_bar_input_path(Path::new(input)).as_os_str(),
+                Path::new(expected).as_os_str(),
+                "input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn folder_bar_unmatched_and_embedded_quotes_are_preserved() {
+        for (input, expected) in [
+            (r#""C:\books"#, r#""C:\books"#),
+            (r#"C:\books""#, r#"C:\books""#),
+            (r#"C:\my"books"#, r#"C:\my"books"#),
+            (r#""C:\my"books""#, r#"C:\my"books"#),
+            (r#"""C:\books"""#, r#""C:\books""#),
+            (r#"""#, r#"""#),
+        ] {
+            assert_eq!(
+                normalize_folder_bar_input_path(Path::new(input)).as_os_str(),
+                Path::new(expected).as_os_str(),
+                "remove at most one complete pair: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn folder_bar_quoted_empty_path_does_not_resolve() {
+        for input in [r#""""#, "  \" \t\"  "] {
+            assert!(
+                normalize_folder_bar_input_path(Path::new(input))
+                    .as_os_str()
+                    .is_empty()
+            );
+            assert_eq!(resolve_folder_bar_nav_path(Path::new(input)), None);
+        }
+    }
+
+    #[test]
+    fn folder_bar_quoted_paths_use_existing_resolution_routes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("my books");
+        std::fs::create_dir(&folder).unwrap();
+        for path in [
+            folder.clone(),
+            folder.join("book.zip"),
+            folder.join("book.cbr"),
+            folder.join("page.jpg"),
+        ] {
+            if path != folder {
+                std::fs::write(&path, b"fixture").unwrap();
+            }
+            let quoted = format!(" \t\" {} \t\" ", path.display());
+            let expected = if path.extension().is_some_and(|ext| ext == "jpg") {
+                &folder
+            } else {
+                &path
+            };
+            assert_eq!(
+                resolve_folder_bar_nav_path(Path::new(&quoted)).as_ref(),
+                Some(expected)
+            );
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn folder_bar_mixed_path_input_uses_standard_spelling() {
@@ -33945,6 +34033,71 @@ mod section207_tests {
                 .accesskit_node()
                 .is_disabled()
         );
+    }
+
+    #[test]
+    fn section1684_address_enter_preserves_empty_and_bookshelf_routing() {
+        let mut env = crate::app::setup_app_for_test();
+        only_folder_and_tree(&mut env);
+        let target = env.tmp.path().join("quoted address target");
+        std::fs::create_dir(&target).unwrap();
+        let book_root = env.book_root_path();
+        let app = Rc::new(RefCell::new(env));
+        let render = Rc::clone(&app);
+        let nav = Rc::new(RefCell::new(Vec::new()));
+        let nav_render = Rc::clone(&nav);
+        let fonts = Cell::new(false);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1200.0, 280.0))
+            .build_ui(move |root_ui| {
+                let ctx = &root_ui.ctx().clone();
+                crate::ime_focus::install_ime_input_policy(ctx);
+                if !fonts.replace(true) {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    ctx.request_repaint();
+                    return;
+                }
+                let mut app = render.borrow_mut();
+                app.update_ime_state(ctx);
+                if let Some(value) = app.render_toolbar(root_ui).1 {
+                    nav_render.borrow_mut().push(value);
+                }
+            });
+        harness.run();
+        for (input, expected) in [
+            (format!(" \" {} \" ", target.display()), Some(Some(target))),
+            (" \t ".to_owned(), Some(None)),
+            (r#""""#.to_owned(), None),
+            (" \" \t\" ".to_owned(), None),
+            (" 本棚 ".to_owned(), Some(Some(book_root.clone()))),
+            (
+                " 本棚 > 名前 ".to_owned(),
+                Some(Some(crate::books::book_folder(&book_root, "名前"))),
+            ),
+            (r#""本棚""#.to_owned(), None),
+            (r#""本棚 > 名前""#.to_owned(), None),
+        ] {
+            nav.borrow_mut().clear();
+            app.borrow_mut().address = input.clone();
+            harness.run();
+            harness
+                .get_by_role(egui::accesskit::Role::TextInput)
+                .click();
+            harness.run();
+            harness.key_press(egui::Key::Enter);
+            harness.run();
+            match expected {
+                None => assert!(nav.borrow().is_empty(), "input: {input:?}"),
+                Some(None) => assert!(
+                    matches!(nav.borrow().as_slice(), [AddressBarNav::DriveList(None)]),
+                    "input: {input:?}"
+                ),
+                Some(Some(expected)) => assert!(
+                    matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path, crate::app::StartupListIntent::ExplicitList)] if path == &expected),
+                    "input: {input:?}"
+                ),
+            }
+        }
     }
 
     #[test]
