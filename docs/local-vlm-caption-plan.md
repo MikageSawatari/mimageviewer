@@ -1547,3 +1547,6 @@ gh release create vlm-model-v1 --repo MikageSawatari/mimageviewer --target main 
 ```
 
 - 公開後に確かめること: 6 つの asset の名前と大きさ、`vlm-model-index.json` を取得して手元と一致すること、Releases の latest が製品の版のままであること。
+- **公開済み (2026-11-03、利用者の承認の後に設計担当が実施)**: https://github.com/MikageSawatari/mimageviewer/releases/tag/vlm-model-v1 (prerelease)。
+  6 つの asset の名前と大きさが手元と一致。固定の URL から取得した `vlm-model-index.json` の SHA-256 (`7015d1cb…d651`) が手元と一致。
+  part2 への Range 要求が 206 を返す。`releases/latest` は v4.11.0 のまま。
