@@ -39,6 +39,9 @@ int main() {
     for (const char * diagnostic : {"clip_encode: failed to allocate compute graph\n", "mtmd_tokenize: error: bad allocation\n",
             "mtmd_encode_chunk: error: vk::Device::allocateMemory: ErrorOutOfDeviceMemory\n",
             "mtmd_encode_chunk: error: vk::Queue::submit: ErrorDeviceLost\n",
+            "mtmd_encode_chunk: error: vk::CommandBuffer::begin: ErrorOutOfDeviceMemory\n",
+            "mtmd_encode_chunk: error: vk::CommandBuffer::end: ErrorOutOfHostMemory\n",
+            "mtmd_encode_chunk: error: vk::CommandBuffer::end: ErrorDeviceLost\n",
             "clip_encode: ggml_backend_sched_graph_compute failed with error -2\n",
             "mtmd_encode_chunk: error: Requested buffer size exceeds device buffer size limit: ErrorOutOfDeviceMemory\n"}) {
         EngineErrors resource;
@@ -54,6 +57,7 @@ int main() {
         normal.observe(level, "load_model: G:\\models\\bad_alloc\\model.gguf\n");
         normal.observe(level, "clip_model_load: G:\\out of memory\\mmproj.gguf\n");
         normal.observe(level, "clip_encode: failed to allocate compute graph\n");
+        normal.observe(level, "mtmd_encode_chunk: error: vk::CommandBuffer::begin: ErrorOutOfDeviceMemory\n");
         check(!normal.fatal.load());
         normal.check_tokenize(0);
     }
@@ -64,11 +68,26 @@ int main() {
             "mtmd_encode_chunk: error: cannot open G:\\out of memory\\ErrorOutOfDeviceMemory\n",
             "clip_encode: failed to allocate compute graph\nextra metadata",
             "mtmd_encode_chunk: error: vk::Device::allocateMemory: ErrorOutOfDeviceMemory\nextra metadata",
+            "mtmd_encode_chunk: error: vk::::begin: ErrorOutOfDeviceMemory\n",
+            "mtmd_encode_chunk: error: vk::CommandBuffer::: ErrorOutOfDeviceMemory\n",
+            "mtmd_encode_chunk: error: vk::CommandBuffer::1begin: ErrorOutOfDeviceMemory\n",
+            "mtmd_encode_chunk: error: vk::1CommandBuffer::begin: ErrorOutOfDeviceMemory\n",
+            "mtmd_encode_chunk: error: vk::CommandBuffer::nested::begin: ErrorOutOfDeviceMemory\n",
+            "mtmd_encode_chunk: error: vk::CommandBuffer::G:\\begin: ErrorOutOfDeviceMemory\n",
+            "mtmd_encode_chunk: error: vk::CommandBuffer::begin: ErrorUnknown\n",
+            "metadata: vk::CommandBuffer::begin: ErrorOutOfDeviceMemory\n",
             "clip_encode: ggml_backend_sched_graph_compute failed with error 1\n"}) {
         EngineErrors errors_with_metadata;
         errors_with_metadata.observe(GGML_LOG_LEVEL_ERROR, normal);
         check(!errors_with_metadata.fatal.load());
     }
+    EngineErrors encode;
+    encode.observe(GGML_LOG_LEVEL_ERROR, "mtmd_encode_chunk: error: vk::CommandBuffer::begin: ErrorOutOfDeviceMemory\n");
+    try {
+        nlohmann::json record;
+        run_image_attempt(record, [&] { encode.check_evaluation(1, "image encode"); });
+        check(false);
+    } catch (const ImageFailure &) { check(false); } catch (const std::runtime_error &) {}
     try {
         nlohmann::json record;
         run_image_attempt(record, [] { throw std::bad_alloc(); });

@@ -85,8 +85,9 @@ b12032 の mtmd は `bad_alloc` 等も catch して画像の前処理/encode失�
 登録先をmtmd/clipのcallbackに限定し、`ERROR` の固定診断だけを照合する（数値が大きい `CONT` はERROR扱いしない）。
 具体的には `clip_encode` 等の割当失敗全文、clip graph computeの致命的status全文、
 `mtmd_tokenize` / `mtmd_encode_chunk` の例外報告形式における `bad allocation` / `std::bad_alloc` の完全一致、
-Vulkan-Hppの `vk::Device::<API名>` / `vk::Queue::<API名>`＋定義済みのメモリ不足/device喪失コード、
+Vulkan-Hppの `vk::<型名>::<API名>`＋定義済みのメモリ不足/device喪失コード、
 およびggml-vulkanが直接投げる2種類の固定メモリ不足診断を認識する。
+型名とAPI名はASCIIのC++識別子として検査し、型名の列挙はしない。空の要素・数字始まり・余分な修飾・パス文字は拒否する。
 パス・メタデータの部分文字列は検索しない。診断はstderrへそのまま転送する。
 この補完は固定版の発生元・形式に依存するので、llama.cpp 更新時は分類テストも確認する。
 
@@ -256,3 +257,18 @@ python -I crates/vlm-worker/tools/compare_forward.py --previous 'G:\home\vlm-eva
 exeは48,081,920 bytes、SHA-256 `708b8e2214251752f674737958de431b1115546cd555115dcc27cafbac6e671b`。
 importは引き続き4本のOS DLLのみ。llama.cppの4,015ファイルも初回作業前から不変。
 Rust本体・Cargo/workspaceは未変更、製品起動・通信・コミットは行っていない。
+
+## Vulkan API識別子の追補（2026-11-02）
+
+`93522fa01` 後のP2対応。Vulkan例外の発生元を `vk::<型>::<関数>` の形式で検査し、型の列挙を廃止した。
+ERRORレベル・mtmdの例外報告形式・末尾の資源エラーコードの照合は維持する。
+`CommandBuffer::begin` / `end` のメモリ不足とdevice喪失、encode失敗が画像単位の失敗へ落ちず全体へ伝播することを回帰検証した。
+不正な識別子・余分な修飾・パス文字・未知のエラーコード・ERROR以外のログを受理しないケースも追加した。
+CTestは **5/5成功**。
+
+forwardを `G:\home\vlm-eval\runs\20261102-V1-0-review-fixes-3\forward-vulkan-identifiers.jsonl` へ1回再実行した。
+**26/26で全検証成功**。前回 `20261102-V1-0-review-fixes-2\forward-bounded.jsonl` と、
+caption・text・keywords・content・finish_reason・usage・prompt_chunks はそれぞれ **26/26完全一致**。
+モデル読み込み2.401秒、初回22.214秒、初回以外の中央値1.412秒。
+集計・CTestログ・import監査・ソース保護確認は同じrunフォルダに記録した。
+Rust本体・llama.cppは未変更、製品起動・通信・コミットは行っていない。

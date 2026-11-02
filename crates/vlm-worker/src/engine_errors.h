@@ -16,13 +16,17 @@ struct EngineErrors {
         if (origin == "Requested buffer size exceeds device buffer size limit" || origin == "No suitable memory type found")
             return code == "ErrorOutOfDeviceMemory";
         // Vulkan-Hpp generated exception origin: a qualified API identifier, never a path.
-        if (origin.substr(0, 12) == "vk::Device::") origin.remove_prefix(12);
-        else if (origin.substr(0, 11) == "vk::Queue::") origin.remove_prefix(11);
-        else return false;
-        if (origin.empty()) return false;
-        for (char c : origin) if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                (c >= '0' && c <= '9') || c == '_')) return false;
-        return true;
+        if (origin.substr(0, 4) != "vk::") return false;
+        origin.remove_prefix(4);
+        auto separator = origin.find("::");
+        if (separator == std::string_view::npos) return false;
+        auto identifier = [](std::string_view name) {
+            auto first = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; };
+            if (name.empty() || !first(name.front())) return false;
+            for (char c : name) if (!first(c) && !(c >= '0' && c <= '9')) return false;
+            return true;
+        };
+        return identifier(origin.substr(0, separator)) && identifier(origin.substr(separator + 2));
     }
     // Called only by mtmd/clip's callback. llama errors use their typed return codes.
     void observe(ggml_log_level level, const char * message) noexcept {
