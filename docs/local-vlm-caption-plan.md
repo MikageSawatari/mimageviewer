@@ -1529,3 +1529,21 @@ DOS予約名・末尾dot/space・区切り・相対移動・case-insensitive衝�
   一括書き出しはメンバーを展開するので、全操作共通の規則ではない。
 - V1-3 (a の公開を除く) はここで閉じる。残り: V1-3a のモデルの分割・index・LICENSE/NOTICE・GitHub Releases への公開 (利用者の承認が要る)、
   `scripts/setup-llama-cpp.ps1` の archive の SHA-256、実機確認 (実モデルでの生成・初回取得・UI)。
+
+### 21.10 V1-3a: モデルの公開の手順 (2026-11-03、公開は未実施)
+
+- 公開用のファイルは `scripts/vlm-eval/prepare_model_release.py` で作る。入力は量子化済みのモデル・mmproj・Qwen の `LICENSE`・
+  `scripts/vlm-eval/model-NOTICE.txt` (変更点の記載。Apache 2.0 §4(b))。出力先は空のフォルダ (2026-11-03 は `G:\home\vlm-eval\release\vlm-model-v1\`)。
+  モデルは 2 分割 (各 1,391,723,632 bytes)。つなぎ直した SHA-256 が元のモデル (`777d8abc…ae6e`) と一致することを確かめた。
+- 生成した index は `scripts/vlm-eval/vlm-model-index.v1.json` に置き、`published_v1_index_validates` が導入時と同じ検査を通す。
+  `model_id` は `qwen3.5-4b-miv-q4km-777d8abc7e8f`。
+- 公開 (利用者の承認の後に設計担当が行う): GitHub Releases に tag `vlm-model-v1` の **prerelease** を作り、最新版の扱いにしない
+  (製品ページのダウンロードは GitHub の latest を指すため)。添付は index・part1・part2・mmproj・LICENSE・NOTICE の 6 つ。
+
+```powershell
+gh release create vlm-model-v1 --repo MikageSawatari/mimageviewer --target main --prerelease --latest=false `
+  --title "AI caption model v1" --notes-file <notes> `
+  G:\home\vlm-eval\release\vlm-model-v1\*
+```
+
+- 公開後に確かめること: 6 つの asset の名前と大きさ、`vlm-model-index.json` を取得して手元と一致すること、Releases の latest が製品の版のままであること。

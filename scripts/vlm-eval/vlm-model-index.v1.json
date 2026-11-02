@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "model_id": "qwen3.5-4b-miv-q4km-777d8abc7e8f",
+  "files": [
+    {
+      "name": "Qwen3.5-4B-Q4_K_M-imat.gguf",
+      "kind": "model",
+      "bytes": 2783447264,
+      "sha256": "777d8abc7e8f91180b8db9dcd8e0adce0f7ec1eef84f22bc8e5088607152ae6e",
+      "license": "Apache-2.0",
+      "parts": [
+        {
+          "name": "Qwen3.5-4B-Q4_K_M-imat.gguf.part1",
+          "bytes": 1391723632,
+          "sha256": "c121b3a870153c83241cac1286a6913574298b323c3844e4e638412995c3d94d"
+        },
+        {
+          "name": "Qwen3.5-4B-Q4_K_M-imat.gguf.part2",
+          "bytes": 1391723632,
+          "sha256": "8cdffa20807f96b231ad7e598e17c8586c30791f07331f0cd53288c855cabd0d"
+        }
+      ]
+    },
+    {
+      "name": "mmproj-F16.gguf",
+      "kind": "mmproj",
+      "bytes": 672423488,
+      "sha256": "62a5ea783bf228839cc4a1f85fee878ad60538af248b2d0142b62c5e6b5fe7b1",
+      "license": "Apache-2.0",
+      "parts": []
+    },
+    {
+      "name": "LICENSE",
+      "kind": "license",
+      "bytes": 11544,
+      "sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a",
+      "license": "Apache-2.0",
+      "parts": []
+    },
+    {
+      "name": "NOTICE",
+      "kind": "notice",
+      "bytes": 927,
+      "sha256": "5cf7ec0039f33d6276e0e5d3884ad6756ac9b2a397667e5c9ddbe80aa9aa7729",
+      "license": "Apache-2.0",
+      "parts": []
+    }
+  ]
+}

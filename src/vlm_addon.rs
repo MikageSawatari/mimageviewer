@@ -881,6 +881,17 @@ mod tests {
         }
     }
 
+    /// The index published as the `vlm-model-v1` release asset must pass the same
+    /// validation the installer runs.
+    #[test]
+    fn published_v1_index_validates() {
+        let raw = include_str!("../scripts/vlm-eval/vlm-model-index.v1.json");
+        let index: ModelIndex = serde_json::from_str(raw).unwrap();
+        index.validate().unwrap();
+        assert_eq!(index.model_id, "qwen3.5-4b-miv-q4km-777d8abc7e8f");
+        assert_eq!(index.file(FileKind::Model).parts.len(), 2);
+    }
+
     #[test]
     fn index_rejects_unsafe_names_duplicate_roles_and_invalid_hashes() {
         let (index, _) = fixture();
