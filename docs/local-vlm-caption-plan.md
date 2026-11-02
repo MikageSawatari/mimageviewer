@@ -278,16 +278,44 @@ captions(
   keywords      TEXT,               -- JSON 配列
   status        TEXT,               -- ok / failed
   created_at    INTEGER,
-  rev           INTEGER,            -- 行を書くたびに増やす (表示のキャッシュと索引の照合用、§8・§9)
+  rev           INTEGER,            -- DB 全体で使い回さない番号。内容かキーが変わるたびに新しく振る (§8)
   indexed       INTEGER             -- 0 = 索引への反映待ち、1 = 反映済み (§8)
 )
--- キーの付け替え (改名の移行は STORES の汎用 UPDATE で行う) でも反映待ちに戻す
-CREATE TRIGGER captions_key_moved AFTER UPDATE OF item_key ON captions
-  BEGIN UPDATE captions SET indexed = 0, rev = rev + 1 WHERE item_key = NEW.item_key; END;
+caption_seq(n INTEGER)              -- 1 行だけ。rev の発行元 (増える一方)
+caption_removed(                    -- 消した行の、索引から消すための反映待ち (§8)
+  item_key TEXT, rev INTEGER, PRIMARY KEY (item_key, rev)
+)
+-- 書き手が誰でも (ジョブの保存・取り込み・STORES の汎用の付け替え・コピー・復元・孤児整理)、
+-- 次の trigger が反映待ちの印と新しい rev を付ける。書き手のコードに印の扱いを持たせない。
+CREATE TRIGGER captions_ins AFTER INSERT ON captions BEGIN
+  UPDATE caption_seq SET n = n + 1;
+  UPDATE captions SET rev = (SELECT n FROM caption_seq), indexed = 0 WHERE item_key = NEW.item_key;
+END;
+CREATE TRIGGER captions_upd AFTER UPDATE OF item_key, mtime, size, model_id, prompt_version, caption,
+    visible_text, keywords, status ON captions BEGIN
+  UPDATE caption_seq SET n = n + 1;
+  UPDATE captions SET rev = (SELECT n FROM caption_seq), indexed = 0 WHERE item_key = NEW.item_key;
+  -- キーが変わったときは、旧キーの索引からも消す
+  INSERT OR IGNORE INTO caption_removed SELECT OLD.item_key, n FROM caption_seq WHERE OLD.item_key <> NEW.item_key;
+END;
+CREATE TRIGGER captions_del AFTER DELETE ON captions BEGIN
+  UPDATE caption_seq SET n = n + 1;
+  INSERT OR IGNORE INTO caption_removed SELECT OLD.item_key, n FROM caption_seq;
+END;
 ```
 
+- `rev` を「行と一緒に動く番号 (`rev + 1`)」にしない (独立レビュー 3 回目 P2)。本の入れ替えは一時キーを経由してキーを 2 回付け替える
+  (`rename_key_migration.rs` の book migration) ので、行ごとの番号だと、別の画像の行が同じ `(item_key, rev)` になり、
+  古い反映済みの知らせが新しい行の印を消してしまう。DB 全体で増える一方の番号なら、同じ組は二度と現れない。
+- trigger の対象の列に `rev` と `indexed` は含めない (管理役が印を消す UPDATE で trigger が動かないように)。
+
 - 1 項目 1 行 (最後に作ったものだけを残す)。作り直しで成功したら上書きする。失敗で `ok` の行を上書きしない (§6.5)。
-- 書き込むのはジョブの持ち主の保存役と、メタ情報の取り込み・改名の移行・孤児整理だけ。その間の順序は §6.6。
+- 書き手は、ジョブの持ち主の保存役、メタ情報の取り込み、`STORES` の汎用操作 (改名・移動・本の構造操作の付け替え、
+  コピー `copy_stores`、内容に基づくメタ情報の復元 `content_identity::restore`、孤児整理)。保存役と他の書き手の順序は §6.6。
+  汎用のコピーはキー以外の全列をコピーする (`copy_exact`) が、コピー先は INSERT になるので、trigger で新しい `rev` と反映待ちに直る
+  (独立レビュー 3 回目 P2)。
+- 取り込みで説明文が「空」と記載された項目は行を消す (既存のメタ情報と同じ「記載された空は消す」)。消した行は
+  `caption_removed` に反映待ちとして残るので、索引から古い説明文が消える (独立レビュー 3 回目 P2)。
 - 画像が変わった (署名不一致) 説明文は消さずに「古い」と表示し、検索には使い続ける。作り直しは利用者の操作で行う。
 - `rename_key_migration::STORES` に登録し、mIV 内の改名・移動・本の構造操作に追従させる。孤児整理の対象にもなる。
 - mIV の外での移動には追従しない (タグなどの既存ストアと同じ)。
@@ -304,13 +332,16 @@ CREATE TRIGGER captions_key_moved AFTER UPDATE OF item_key ON captions
     通常の走査も画像とサイドカーの署名が同じなら「変化なし」にする (`search_walker.rs` の差分判定)。起動時の走査を省く経路もある
     (`can_skip_initial_scan`)。管理役への命令の通り道は容量 4 で、あふれた分は捨てられる (`try_send`)。そのため、命令だけで
     知らせると、止まっている間・あふれたときの更新が、再起動や通常の走査でも戻らない。
-  - 仕組み: 行を書くときに同じトランザクションで `indexed = 0` にして `rev` を増やす (§7。改名の移行は trigger で同じにする)。
+  - 仕組み: 反映待ちの印は §7 の trigger が付ける (行の INSERT・内容やキーの UPDATE で `indexed = 0` と新しい `rev`、
+    行の DELETE とキーの付け替えの旧キーで `caption_removed` に 1 行)。書き手のコードは印を扱わない。
     **反映待ちの一覧の持ち主は DB そのもの**で、メモリ上の待ち行列は作らない。
   - 管理役 (お気に入りごと) は、(1) 起動したとき (走査を省く場合も)、(2) 全件走査の後、(3) 「説明文が変わった」の知らせを受けたとき に、
-    自分の root の下で `indexed = 0` の行を読み、その項目を再 ingest する。commit の後に `UPDATE ... SET indexed = 1 WHERE item_key = ? AND rev = ?`
-    で印を消す (読んだ後にまた書かれていれば `rev` が違うので印が残り、次に拾われる)。
+    自分の root の下の反映待ち (`captions` の `indexed = 0` と `caption_removed`) を `(item_key, rev)` で読み、その項目を再 ingest する。
+    再 ingest は ingest の時点の DB を読むので、行が無ければ説明文なしの文書になり、索引から消える。
+  - 索引の commit の後、**読んだ `(item_key, rev)` と一致するものだけ**を反映済みにする (`captions` は `indexed = 1`、`caption_removed` は行を消す)。
+    `rev` は使い回されないので、読んだ後にまた書かれた・付け替えられた行の印は残り、次に拾われる。
   - 知らせは 1 つの旗 (`AtomicBool` と既存の起床の仕組み) にまとめ、容量のある通り道は使わない。何度知らせても 1 回の拾い直しになる。
-  - 送り手 (ジョブの保存役・取り込み・改名の移行・孤児整理) は DB の commit の後に旗を立てるだけ。VLM 側で索引の文書 (`IndexDoc`) を
+  - 送り手 (§7 の書き手すべて) は DB の commit の後に旗を立てるだけ。旗を立て忘れても、次の起動時・全件走査の後に拾われる。VLM 側で索引の文書 (`IndexDoc`) を
     作って直接入れることはしない (文書を作るのは管理役だけ)。
   - お気に入りの外の項目は索引に入らないので、印は残ったままでよい (拾われないだけで害はない)。
 - **schema が変わるので `INDEX_VERSION` を 10 → 11 に上げる**。既存の作り直しの仕組み (共通 owner) で、
@@ -333,8 +364,9 @@ CREATE TRIGGER captions_key_moved AFTER UPDATE OF item_key ON captions
   - **説明文の表示用キャッシュは、既存の context ごとのメタデータキャッシュに入れず、App に 1 つの共有キャッシュとして持つ**
     (`CaptionDisplayCache`、キー → 読み込み済みの行と `rev`、または読み込み中)。どの窓のパネルもこれを読む。消すのも 1 か所で済み、
     休眠中の窓が古い値を持つことが無い。既存のメタデータ読み込み worker には足さず、説明文だけの小さな読み込み worker を使う。
-  - ジョブの保存役・取り込み・改名の移行・孤児整理が DB を書いたら、そのキーの共有キャッシュを消す。改名の移行では旧キーと新キーの両方を消す。
-    フォルダ・本の中身としての前方一致の改名では、前方一致するキーをすべて消す。
+  - ジョブの保存役が書いたら、そのキーの共有キャッシュを消す。
+  - 取り込みと `STORES` の汎用操作 (付け替え・コピー・復元・孤児整理) が終わったら、**共有キャッシュを全部消す** (独立レビュー 3 回目 P2)。
+    説明文の表示用キャッシュは小さく、消しても表示中の項目を読み直すだけなので、どのキーが変わったかを書き手ごとに数え上げない。
   - 読み込みは開始時の「キャッシュの世代」(キーごとに、消すたびに増やす番号) を持ち、届いたときに世代が違えば採用せず読み直す
     (保存より前に始まった読み込みが後から届く場合のため)。
   - context ごとの既存キャッシュには触れないので、detached viewer の経路と述語は変えない。
@@ -711,3 +743,14 @@ TensorRT は `bench_ai` が `target\release\mimageviewer.exe` をワーカーと
 | P2 (1 回目 P2-3 の残り) | 止まっている間に捨てた知らせは、次の通常の走査でも直らない | 走査は画像とサイドカーの署名だけで「変化なし」にする。起動時の走査を省く経路がある。命令の通り道は容量 4 で `try_send` | §7 (`rev`・`indexed` の列と trigger)、§8 (反映待ちの印を DB に持たせ、管理役が起動時・走査後・知らせで拾う) |
 | P2 (1 回目 P2-4 の残り) | キャッシュは窓ごとにあり、休眠中の窓に古い値が残る | `metadata_cache` は viewer context ごと | §9 (説明文の表示用キャッシュを App に 1 つ持つ、既存のキャッシュには入れない) |
 | P2 (新規) | cursor に許可の版が無く、チェックを変えた後の続きが通る | `Cursor` は版・tool・digest・件数だけ。epoch 検査は 1 要求の中だけ | §10 (cursor に許可の版を入れて違えば拒む。MCP 担当と調整) |
+
+### 19.3 3 回目 (2026-11-02、同じ担当の続き、基準 `57566698f`)
+
+2 回目の 4 件のうち 2 件 (共有キャッシュ、cursor) は閉じた。残り 1 件と新しい 3 件を、設計担当が根拠のコードで確かめた。誤りの指摘は無かった。
+
+| # | 指摘 | 確かめたこと | 対応 |
+| --- | --- | --- | --- |
+| P1 (2 回目 P1 の残り) | 移行の完了の後に届く推論中の結果に、改名・削除が当たらない | 指摘は受付を閉じる案 (`57566698f` の §6.6) に対するもの | §6.6 を利用者の案 (U14、`5e56bd158`) に置き換えた。保存の直前に lock の中で署名を確かめて違えば捨てるので、届いた時期に関係なく旧キーへは書かない。次の回で確認を受ける |
+| P2 (新規) | 行ごとの `rev + 1` では、本の入れ替えの後に別の画像の古い知らせが一致する | 本の入れ替えは一時キーを経由して 2 回付け替える | §7 (DB 全体で使い回さない番号 `caption_seq`)、§8 (読んだ `(item_key, rev)` と一致するものだけ反映済みにする)。メモリ上の SQLite で確認 |
+| P2 (新規) | 汎用のコピー・復元が反映済みの印までコピーする | `copy_stores` → `copy_exact` はキー以外の全列をコピー。`content_identity::restore` から呼ばれる | §7 (INSERT の trigger で新しい `rev` と反映待ちにする、書き手の一覧に足す)、§9 (汎用操作の後は共有キャッシュを全部消す) |
+| P2 (2 回目の索引の残り) | 説明文を消すと、索引から消すための印も消える | 取り込みは「記載された空は消す」で行を消す | §7 (DELETE の trigger で `caption_removed` に残す)、§8 (それも拾って再 ingest する) |
