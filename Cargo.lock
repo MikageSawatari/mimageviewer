@@ -4216,7 +4216,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-agent-ipc"
-version = "4.10.2"
+version = "4.11.0"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -4250,7 +4250,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-mcp"
-version = "4.10.2"
+version = "4.11.0"
 dependencies = [
  "base64 0.22.1",
  "mimageviewer-agent-ipc",
