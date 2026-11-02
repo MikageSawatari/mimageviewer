@@ -579,14 +579,71 @@ impl GpuDecision {
     }
 }
 
+/// A missing system loader is an unsupported installation, not a failed probe.
+#[derive(Clone, Debug)]
+pub enum GpuDetection {
+    VulkanLoaderUnavailable,
+    Device(GpuDecision),
+}
+
 /// Must be called off the UI thread. Both success and failure are cached until
 /// application exit. This uses dedicated total VRAM, never free VRAM or gpu_info.
-pub fn detect_gpu() -> Result<GpuDecision, VlmError> {
-    static DECISION: std::sync::OnceLock<Result<GpuDecision, VlmError>> =
+pub fn detect_gpu() -> Result<GpuDetection, VlmError> {
+    static DECISION: std::sync::OnceLock<Result<GpuDetection, VlmError>> =
         std::sync::OnceLock::new();
     DECISION
-        .get_or_init(|| detect_gpu_at(&worker_executable()?, Duration::from_secs(30)))
+        .get_or_init(|| {
+            detect_gpu_with(system_vulkan_loader_available, || {
+                detect_gpu_at(&worker_executable()?, Duration::from_secs(30))
+            })
+        })
         .clone()
+}
+
+/// Injection boundary also guarantees that no extraction or process launch is
+/// attempted when the system loader is absent. Call only from a worker thread.
+pub(crate) fn detect_gpu_with(
+    loader_available: impl FnOnce() -> bool,
+    probe: impl FnOnce() -> Result<GpuDecision, VlmError>,
+) -> Result<GpuDetection, VlmError> {
+    if !loader_available() {
+        return Ok(GpuDetection::VulkanLoaderUnavailable);
+    }
+    probe().map(GpuDetection::Device)
+}
+
+fn system_vulkan_loader_available() -> bool {
+    use windows::Win32::Foundation::FreeLibrary;
+    use windows::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
+    let Some(path) = system_vulkan_loader_path() else {
+        return false;
+    };
+    // Use an absolute path as well as SYSTEM32: a bare name can reuse an
+    // already-loaded app-local module before the directory search runs.
+    let Ok(module) = (unsafe {
+        LoadLibraryExW(
+            windows::core::PCWSTR(path.as_ptr()),
+            None,
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    }) else {
+        return false;
+    };
+    let _ = unsafe { FreeLibrary(module) };
+    true
+}
+
+fn system_vulkan_loader_path() -> Option<Vec<u16>> {
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut directory = vec![0u16; 32768];
+    let length = unsafe { GetSystemDirectoryW(Some(&mut directory)) } as usize;
+    if length == 0 || length >= directory.len() {
+        return None;
+    }
+    directory.truncate(length);
+    directory.extend("\\vulkan-1.dll".encode_utf16());
+    directory.push(0);
+    Some(directory)
 }
 
 fn select_gpu(inventory: &Value) -> Result<GpuDecision, VlmError> {

@@ -1,5 +1,5 @@
 # Inspect the embedded source marker without ever launching the worker.
-param([string] $ValidateRepo)
+param([string] $ValidateRepo, [string] $RestoreBackupRepo)
 . (Join-Path $PSScriptRoot 'sign-files.ps1')
 
 function Assert-MivVlmIdentityAncestors {
@@ -21,9 +21,9 @@ function Get-MivVlmWorkerSourceHash {
 }
 
 function Assert-MivVlmWorkerIdentity {
-    param([Parameter(Mandatory = $true)] [string] $RepoRoot)
-    $worker = Join-Path $RepoRoot 'vendor\vlm-worker\mimageviewer-vlm.exe'
-    $recover = 'Restore the pinned vendor/llama.cpp and Vulkan SDK, then run scripts/build-vlm-worker.ps1. See crates/vlm-worker/README.md. Only the current-source vendor worker may be reused.'
+    param([Parameter(Mandatory = $true)] [string] $RepoRoot, [string] $WorkerPath)
+    $worker = if ($WorkerPath) { $WorkerPath } else { Join-Path $RepoRoot 'vendor\vlm-worker\mimageviewer-vlm.exe' }
+    $recover = 'Restore the current-source worker from C:\home\mimageviewer_vendor_backup\vlm-worker first (bootstrap-vendor.sh validates before publication). Otherwise use scripts/setup-llama-cpp.ps1 for the pinned source, install the Vulkan SDK, and run scripts/build-vlm-worker.ps1. See crates/vlm-worker/README.md.'
     if (-not (Test-Path -LiteralPath $worker -PathType Leaf)) {
         throw "[vlm-identity] Vendor worker is missing: $worker. $recover"
     }
@@ -38,7 +38,41 @@ function Assert-MivVlmWorkerIdentity {
     Write-Host "[vlm-identity] current vendor worker verified: $expected"
 }
 
+function Restore-MivVlmWorkerBackup {
+    param([Parameter(Mandatory = $true)] [string] $RepoRoot,
+        [string] $BackupPath = 'C:\home\mimageviewer_vendor_backup\vlm-worker\mimageviewer-vlm.exe')
+    $destination = Join-Path ([System.IO.Path]::GetFullPath($RepoRoot)) 'vendor\vlm-worker\mimageviewer-vlm.exe'
+    if (Test-Path -LiteralPath $destination) {
+        Assert-MivVlmWorkerIdentity -RepoRoot $RepoRoot
+        return
+    }
+    if (-not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
+        throw '[vlm-restore] Backup missing. Use scripts/setup-llama-cpp.ps1 (requires a verified archive checksum), Vulkan SDK and scripts/build-vlm-worker.ps1; see crates/vlm-worker/README.md.'
+    }
+    Assert-MivVlmIdentityAncestors $BackupPath
+    $directory = Split-Path -Parent $destination
+    # Check every existing ancestor before creating the missing vendor folders.
+    $ancestor = $directory
+    while (-not (Test-Path -LiteralPath $ancestor)) { $ancestor = Split-Path -Parent $ancestor }
+    Assert-MivVlmIdentityAncestors $ancestor
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    Assert-MivVlmIdentityAncestors $directory
+    $candidate = Join-Path $directory ('.restore-' + [guid]::NewGuid().ToString('N') + '.exe')
+    try {
+        [System.IO.File]::Copy($BackupPath, $candidate, $false)
+        Assert-MivVlmWorkerIdentity -RepoRoot $RepoRoot -WorkerPath $candidate
+        # Atomic publication, without replacing an existing file from another run.
+        [System.IO.File]::Move($candidate, $destination)
+        Write-Host '[vlm-restore] Published the verified backup worker as a real file.'
+    } finally {
+        if (Test-Path -LiteralPath $candidate) { Remove-Item -LiteralPath $candidate -Force }
+    }
+}
+
 if ($ValidateRepo) {
     $ErrorActionPreference = 'Stop'
     Assert-MivVlmWorkerIdentity -RepoRoot $ValidateRepo
+} elseif ($RestoreBackupRepo) {
+    $ErrorActionPreference = 'Stop'
+    Restore-MivVlmWorkerBackup -RepoRoot $RestoreBackupRepo
 }

@@ -29,6 +29,9 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
    build.rs が exe へ `include_bytes!` で同梱。未配置でもビルドは通るがスタンプは無効)
 8. `vendor/models/*.onnx` を `%APPDATA%/mimageviewer/models/` から自動 copy
    (= 一度 mIV をインストール / 起動して APPDATA に展開させた後でないと取れない)
+9. VLM worker が無ければ `C:\home\mimageviewer_vendor_backup\vlm-worker\mimageviewer-vlm.exe` を
+   一時候補へ実ファイルでコピーし、現ソースの identity と一致してから `vendor/vlm-worker/` へ公開する。
+   バックアップの欠落・不一致では配置せず、固定版ソースのセットアップ手順を案内する。
 
 ### bootstrap で取れないもの
 
@@ -63,14 +66,18 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
   インストールも APPDATA も両方失うと**永久に取得不可**。
 - **`vendor/vst3-host/mimageviewer-vst3-host.exe`** — 再ビルドには VST3 SDK
   (~490 MB) + cmake が要る。古い exe の流用は上記の通り不可。
+- **`vendor/vlm-worker/mimageviewer-vlm.exe`** — 現ソースと一致する exe は CMake / Vulkan SDK
+  なしで再利用できる。失った場合はまず上記バックアップから検証付きで復旧する。
+  固定版ソースからの再ビルドも可能だが、取得用 ZIP の checksum は確認待ちのため現在は取得を停止する。
 
-そのため `vendor/models/` と `vendor/vst3-host/` は**リポジトリツリー
+そのため `vendor/models/`・`vendor/vst3-host/`・`vendor/vlm-worker/` は**リポジトリツリー
 (`C:\home\mimageviewer` 配下) の外**へコピーを置く。現在のバックアップ先:
 
 ```
 C:\home\mimageviewer_vendor_backup\
   ├ models\        (*.onnx 一式)
-  └ vst3-host\     (mimageviewer-vst3-host.exe と vcrt\ の公式CRT4本)
+  ├ vst3-host\     (mimageviewer-vst3-host.exe と vcrt\ の公式CRT4本)
+  └ vlm-worker\    (mimageviewer-vlm.exe)
 ```
 
 - **定期ジョブは不要**。`vendor/` の中身は静的なので、モデル追加や vst3-host を
@@ -518,18 +525,40 @@ VST のロゴは使用しない。名称の文字表記も商標ガイドライ�
 `crates/vlm-worker` は llama.cpp b12032 (commit
 `dde879bc4f954b809892fd0d660515f42536394a`) の ggml / llama / mtmd と
 MSVC CRT を静的リンクする。`vendor/llama.cpp` は変更しない。
-Vulkan SDK `C:\VulkanSDK\1.4.363.0` と Visual Studio 18 2026 の C++ build tools が必要。
-モデルの取得や起動をせず、リポジトリルートで次を実行する。
+現ソースの identity と一致する `vendor/vlm-worker/mimageviewer-vlm.exe` があれば、
+`build-vlm-worker.ps1` は CMake の探索・実行をせず再利用する。CMake / Vulkan SDK / llama.cpp のソースは不要。
+worker が欠落していれば、まず `bootstrap-vendor.sh` または次の PowerShell でバックアップを復旧する。
+
+```powershell
+.\scripts\vlm-worker-identity.ps1 -RestoreBackupRepo .
+```
+
+バックアップは `C:\home\mimageviewer_vendor_backup\vlm-worker\mimageviewer-vlm.exe`。
+候補を一時ファイルへコピーして identity を検証した後だけ公開し、不一致・欠落では配置しない。
+既存の vendor worker は上書きしない。モデルや通常 profile の実行ファイルからは取り込まない。
+
+バックアップで復旧できない場合は `scripts/setup-llama-cpp.ps1` が、固定 commit の GitHub ZIP を
+SHA-256 照合後に staging へ安全に展開し、欠落している `vendor/llama.cpp` に公開する。
+**取得用 checksum は未設定の placeholder**。レビュー済みの SHA-256 をソースに固定するまで、
+この script はネットワーク通信・ディレクトリ変更の前に失敗する。過去に提供された別アーカイブの hash は流用しない。
+既存 source tree を削除・置換せず、archive の traversal・絶対パス・リンク・Windows 名の別名・重複を拒否する。
+この段階では worker やモデルを起動しない。
+
+実際に C++ の変更で再ビルドする場合だけ Vulkan SDK `C:\VulkanSDK\1.4.363.0` と
+Visual Studio 18 2026 の C++ build tools / CMake が必要。リポジトリルートで実行する。
 
 ```powershell
 $env:MSBUILDDISABLENODEREUSE = '1'
 $env:VULKAN_SDK = 'C:\VulkanSDK\1.4.363.0'
-.\scripts\build-vlm-worker.ps1
+.\scripts\build-vlm-worker.ps1 -Rebuild
 ```
 
-出力は `vendor/vlm-worker/mimageviewer-vlm.exe`。bootstrap は worker と llama.cpp を取得しない。
+出力は `vendor/vlm-worker/mimageviewer-vlm.exe`。通常の build helper は missing / stale のときだけ再ビルドする。
+`-Rebuild` は明示的な再ビルド、`-SkipBuild` は検査のみで、不一致でも再ビルドしない。
 不足時の Cargo build は復旧案内付きで停止する。詳細な固定条件・CTest は
 [worker README](../crates/vlm-worker/README.md) を参照。
+C++ 変更後は関連 CTest と identity 検査を通し、exe を上記 backup へ**実ファイルで**コピーし直す。
+通常の変更ごとに新しい SDK やソースを取り直す必要はない。
 
 通常版は core に worker を内包し、worker スレッドで
 `<data_dir>/vlm/workers/<exe の SHA256>/mimageviewer-vlm.exe` に展開する。
@@ -542,7 +571,7 @@ source identity は `tools/source-identity.ps1` で計算した hash を
 `scripts/vlm-worker-identity.ps1` は実行せずに marker の個数と現ソースとの一致を検査する。
 release Cargo (portable を含む)・build-release の署名前と core 内包前・
 build-portable のコピー前すべてで検査し、`-SkipBuild` の再利用でも省略しない。
-build-release / build-portable は native worker を先に build する。
+build-release / build-portable は内包・コピー前に build helper を呼ぶ。一致する worker は再利用し、missing / stale の場合だけ build する。
 署名時は通常版が内包前に vendor exe を署名し、portable はコピー後の PE 一覧に含めて署名・検証する。
 protocol 2 の hello では DB と同じ整数の `prompt_version=1` も照合し、実行時には source identity を比較しない。
 非起動の回帰検査は `powershell -NoProfile -File scripts/test-vlm-worker-identity.ps1`。

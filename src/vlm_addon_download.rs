@@ -366,6 +366,152 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn response_without_content_length_is_bounded_and_hash_checked() {
+        for (body, valid) in [
+            (b"abcdef-extra-untrusted-bytes".as_slice(), true),
+            (b"xxxxxx-extra-untrusted-bytes".as_slice(), false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("model.partial");
+            let (url, requests, join) = server(vec![response("200 OK", "", body)]);
+            let mut observed = Vec::new();
+            let result = download_with_backoffs(
+                &url,
+                &path,
+                6,
+                &digest(b"abcdef"),
+                &AtomicBool::new(false),
+                &mut |done| observed.push(done),
+                &[],
+            );
+            join.join().unwrap();
+            assert_eq!(requests.try_iter().count(), 1);
+            assert!(observed.iter().all(|&done| done <= 6));
+            assert_eq!(observed.last(), Some(&6));
+            if valid {
+                result.unwrap();
+                assert_eq!(fs::metadata(&path).unwrap().len(), 6);
+                assert_eq!(fs::read(path).unwrap(), b"abcdef");
+            } else {
+                assert!(result.unwrap_err().contains("SHA-256 does not match"));
+                assert!(!path.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn short_response_without_content_length_exhausts_bounded_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.partial");
+        let (url, requests, join) =
+            server((0..5).map(|_| response("200 OK", "", b"abc")).collect());
+        let error = download_with_backoffs(
+            &url,
+            &path,
+            6,
+            &digest(b"abcdef"),
+            &AtomicBool::new(false),
+            &mut |done| assert!(done <= 6),
+            &[Duration::ZERO; 4],
+        )
+        .unwrap_err();
+        join.join().unwrap();
+        assert!(error.contains("Download truncated: 3/6"));
+        let requests: Vec<_> = requests.try_iter().collect();
+        assert_eq!(requests.len(), 5);
+        assert!(!requests[0].to_ascii_lowercase().contains("range:"));
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|request| request.to_ascii_lowercase().contains("range: bytes=3-"))
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), 3);
+        assert_eq!(fs::read(path).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn corrupt_full_size_partial_is_removed_before_refetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.partial");
+        fs::write(&path, b"xxxxxx").unwrap();
+        let observed_path = path.clone();
+        let (url, requests, join) = server_with_hook(vec![ok(b"abcdef")], move |_| {
+            assert!(
+                !observed_path.exists(),
+                "corrupt partial must be removed before requesting its replacement"
+            );
+        });
+        download_with_backoffs(
+            &url,
+            &path,
+            6,
+            &digest(b"abcdef"),
+            &AtomicBool::new(false),
+            &mut |_| {},
+            &[],
+        )
+        .unwrap();
+        join.join().unwrap();
+        let requests: Vec<_> = requests.try_iter().collect();
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].to_ascii_lowercase().contains("range:"));
+        assert_eq!(fs::read(path).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn corrupt_resumed_partial_is_rejected_before_fresh_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.partial");
+        fs::write(&path, b"bad").unwrap();
+        let (url, requests, join) = server(vec![response(
+            "206 Partial Content",
+            "Content-Length: 3\r\nContent-Range: bytes 3-5/6\r\n",
+            b"def",
+        )]);
+        let error = download_with_backoffs(
+            &url,
+            &path,
+            6,
+            &digest(b"abcdef"),
+            &AtomicBool::new(false),
+            &mut |_| {},
+            &[],
+        )
+        .unwrap_err();
+        join.join().unwrap();
+        assert!(
+            requests
+                .recv()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("range: bytes=3-")
+        );
+        assert!(error.contains("SHA-256 does not match"));
+        assert!(!path.exists(), "corrupt resumed bytes must not be reusable");
+
+        let (url, requests, join) = server(vec![ok(b"abcdef")]);
+        download_with_backoffs(
+            &url,
+            &path,
+            6,
+            &digest(b"abcdef"),
+            &AtomicBool::new(false),
+            &mut |_| {},
+            &[],
+        )
+        .unwrap();
+        join.join().unwrap();
+        assert!(
+            !requests
+                .recv()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("range:")
+        );
+        assert_eq!(fs::read(path).unwrap(), b"abcdef");
+    }
+
+    #[test]
     fn invalid_range_cannot_append_wrong_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("model.partial");

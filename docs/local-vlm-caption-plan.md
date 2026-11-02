@@ -1408,3 +1408,35 @@ DOS予約名・末尾dot/space・区切り・相対移動・case-insensitive衝�
   core は393,739,776 bytes、launcher は561,397,248 bytes。最後のVC runtime PE検査はruntime4本・runtime側PE5本／embedded側PE13本で成功。
   APPDATAの展開済みVST3 cacheは保持し、成果物は起動していない。
 - 署名・実配布モデル・実機確認は未実施。公開物・GitHub Release・`htdocs/` は作成／変更せず、コミットは設計担当が行う。
+
+**独立レビュー1回目の指摘への対応** (基準 `0ee27ebeb`)
+
+- P2-1: Windows の全 build で worker を必須にする条件は維持し、復旧経路を補完した。
+  `bootstrap-vendor.sh` は欠落時に外部 backup の実ファイルを一時候補へコピーし、現ソースの identity と照合した後だけ公開する。
+  不一致の候補は配置せず、backup も無ければ固定版 source からの build を案内する。既存 vendor worker は上書きしない。
+  `build-vlm-worker.ps1` は identity 一致なら CMake の探索より前に再利用し、release / portable wrapper もこの判定を共用する。
+  missing / stale の場合だけ CMake を呼び、portable の `-SkipBuild` は引き続き検査のみで不一致を拒否する。
+- 固定 b12032 / commit `dde879bc4f954b809892fd0d660515f42536394a` の GitHub ZIP 取得入口を
+  `setup-llama-cpp.ps1` に追加した。SHA-256 は設計担当の確認待ちの明示的な空 placeholder とし、未設定なら通信・変更前に止める。
+  過去に提供された別 archive の hash は流用しない。固定 hash 照合・安全な staging 展開後に欠落先へ rename し、既存 source tree は置換しない。
+  C++ 変更後は再 build / CTest / identity 確認を通し、backup も実ファイルでコピーし直す手順を native dependencies と worker README に記した。
+- P2-2: GPU 判定の背景 thread で、worker の展開・起動前に System32 の絶対パスの `vulkan-1.dll` を
+  `LoadLibraryExW(LOAD_LIBRARY_SEARCH_SYSTEM32)` で確認し、成功時は `FreeLibrary` する。
+  絶対パスは、既に読み込まれた同名の app-local DLL を使い回さないために必要。
+  loader 不在は `GpuDetection::VulkanLoaderUnavailable` とし、初回案内と設定ページに
+  「Vulkan に対応したグラフィックスドライバが見つかりません」と表示する。再起動・取得は案内しない。
+  loader があり worker の起動に失敗した場合は、従来の `GpuError` を保つ。C++ / CMake / vendor exe は変更していない。
+- 取得処理の実装は変更せず、Content-Length の無い応答の大きさ上限・短い応答・hash 不一致、
+  別 model_id の staging の非再利用、完成済み／再開途中の壊れた部分の破棄と再取得を回帰テストで補った。
+  loader 検査の注入による worker 非起動／起動失敗の区別と、理由だけの案内を1093×614および半分の大きさで操作できることも検査する。
+- この対応の検証: `cargo nextest run --offline -p mimageviewer --lib -E 'test(/ai::vlm_worker::/) | test(/vlm_addon/)' --retries 0 --no-fail-fast`
+  は69/69成功 (run `6aebac70-bde2-4479-bac9-16cc03619b9d`、2.090秒)。
+  `scripts/test-vlm-worker-identity.ps1` は合成PE・fake CMake・ZIP・通信mockだけで成功。
+  CMake が PATH に無い場合の一致exe再利用、不一致／不在時だけのbuild、backup検証後の公開、不一致の非公開、
+  未設定checksumの変更前停止、archiveのhash／危険な名前の拒否を含む。
+  実vendor exeのsource identityとSHA-256は上記から不変。glyph検査・変更したPowerShellのASCII検査・`cargo fmt --check`も成功。
+  本体lib全件は依頼どおり実行せず、C++を変更していないためCTestも再実行していない。外部通信・製品起動・実モデル読込は行っていない。
+- 確認用の通常構成 release build も `scripts/build-release.ps1 -PreserveRuntime -SkipVst3Bridge --offline` で成功。
+  `CARGO_BUILD_JOBS=8` / `CMAKE_BUILD_PARALLEL_LEVEL=1` とし、実vendor workerのidentity一致で
+  `Reusing the current-source worker; CMake and SDK are not needed.` の経路を通った。
+  core / remote / EPUB / MCP / launcher と最後のPE依存検査が成功し、通常profileやAPPDATA cacheは変更せず、成果物は起動していない。

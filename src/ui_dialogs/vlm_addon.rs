@@ -5,16 +5,20 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use crate::ai::vlm_worker::GpuDecision;
+use crate::ai::vlm_worker::GpuDetection;
 use crate::app::App;
 use crate::vlm_addon::{AddonEvent, AddonOperation, AddonStatus, InstallProgress, VlmAddon};
+
+const GPU_REQUIREMENTS_REASON: &str =
+    "この PC の GPU では使えません (Vulkan 対応で VRAM 8GB 以上が必要)";
+const VULKAN_LOADER_REASON: &str = "Vulkan に対応したグラフィックスドライバが見つかりません";
 
 #[derive(Default)]
 enum GpuProbe {
     #[default]
     Unchecked,
-    Checking(mpsc::Receiver<Result<GpuDecision, String>>),
-    Ready(Result<GpuDecision, String>),
+    Checking(mpsc::Receiver<Result<GpuDetection, String>>),
+    Ready(Result<GpuDetection, String>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -22,7 +26,7 @@ enum Dialog {
     Checking(Vec<PathBuf>),
     Confirm(Vec<PathBuf>),
     Running(Vec<PathBuf>),
-    Unsupported,
+    Unsupported(String),
     Done,
     Cancelled,
     Error(String),
@@ -70,7 +74,7 @@ impl VlmSetup {
             Some(
                 Dialog::Checking(_)
                     | Dialog::Confirm(_)
-                    | Dialog::Unsupported
+                    | Dialog::Unsupported(_)
                     | Dialog::RemoveConfirm
             )
         )
@@ -95,7 +99,7 @@ impl VlmSetup {
     }
 
     fn eligible(&self) -> bool {
-        matches!(&self.gpu, GpuProbe::Ready(Ok(gpu)) if gpu.is_eligible())
+        matches!(&self.gpu, GpuProbe::Ready(Ok(GpuDetection::Device(gpu))) if gpu.is_eligible())
     }
 
     fn view(&self, job_running: bool) -> VlmPreferencesView {
@@ -119,7 +123,10 @@ impl VlmSetup {
         let gpu = match &self.gpu {
             GpuProbe::Unchecked | GpuProbe::Checking(_) => "GPU を確認中...".into(),
             GpuProbe::Ready(Err(error)) => format!("GPU の確認に失敗しました: {error}"),
-            GpuProbe::Ready(Ok(gpu)) => format!(
+            GpuProbe::Ready(Ok(GpuDetection::VulkanLoaderUnavailable)) => {
+                VULKAN_LOADER_REASON.into()
+            }
+            GpuProbe::Ready(Ok(GpuDetection::Device(gpu))) => format!(
                 "{} / VRAM {:.1} GiB / Vulkan {} / {}",
                 gpu.device
                     .as_ref()
@@ -293,6 +300,11 @@ impl App {
             if let GpuProbe::Ready(Err(error)) = &self.vlm_setup.gpu {
                 crate::logger::log(format!("[VLM] GPU probe: {error}"));
                 self.vlm_setup.dialog = Some(Dialog::GpuError(error.clone()));
+            } else if matches!(
+                self.vlm_setup.gpu,
+                GpuProbe::Ready(Ok(GpuDetection::VulkanLoaderUnavailable))
+            ) {
+                self.vlm_setup.dialog = Some(Dialog::Unsupported(VULKAN_LOADER_REASON.into()));
             } else if self.vlm_setup.eligible() {
                 if matches!(self.vlm_setup.addon.status(), AddonStatus::Valid { .. })
                     && !paths.is_empty()
@@ -302,7 +314,7 @@ impl App {
                     self.vlm_setup.dialog = Some(Dialog::Confirm(paths));
                 }
             } else {
-                self.vlm_setup.dialog = Some(Dialog::Unsupported);
+                self.vlm_setup.dialog = Some(Dialog::Unsupported(GPU_REQUIREMENTS_REASON.into()));
             }
         }
         if self.vlm_setup.addon.operation() != AddonOperation::None
@@ -363,7 +375,7 @@ impl App {
         let Some(mut dialog) = self.vlm_setup.dialog.take() else {
             return;
         };
-        let warning = matches!(&self.vlm_setup.gpu, GpuProbe::Ready(Ok(g)) if g.vram_total_bytes < 9 * 1073741824)
+        let warning = matches!(&self.vlm_setup.gpu, GpuProbe::Ready(Ok(GpuDetection::Device(g))) if g.vram_total_bytes < 9 * 1073741824)
             && self.settings.ai_feature_mode == crate::settings::AiFeatureMode::HighQuality;
         let progress = self.vlm_setup.addon.progress();
         let action = draw_dialog(
@@ -450,7 +462,7 @@ fn draw_dialog(
                     scroll.floating_allocated_width = scroll.bar_inner_margin + scroll.bar_width;
                     match dialog {
                         Dialog::Checking(_) => { ui.label("モデルと GPU を確認中..."); }
-                        Dialog::Unsupported => { ui.label("この PC の GPU では使えません (Vulkan 対応で VRAM 8GB 以上が必要)"); }
+                        Dialog::Unsupported(reason) => { ui.label(reason); }
                         Dialog::Confirm(_) => {
                             ui.label("画像の内容と画像内の文字を、PC 内の AI が文章と検索語にします。");
                             ui.label("画像は PC の外へ出ません。説明文や書き写した文字は正確とは限りません。");
@@ -561,7 +573,7 @@ mod tests {
         for dialog in [
             Dialog::Confirm(vec![]),
             Dialog::Checking(vec![]),
-            Dialog::Unsupported,
+            Dialog::Unsupported(GPU_REQUIREMENTS_REASON.into()),
             Dialog::RemoveConfirm,
         ] {
             setup.dialog = Some(dialog);
@@ -579,15 +591,45 @@ mod tests {
     }
 
     #[test]
+    fn vlm_setup_loader_absence_is_unsupported_but_worker_failure_is_gpu_error() {
+        use crate::ai::vlm_worker::{VlmError, detect_gpu_with};
+        for loader_available in [false, true] {
+            let result = detect_gpu_with(
+                || loader_available,
+                || Err(VlmError::Io("injected start failure".into())),
+            )
+            .map_err(|error| error.to_string());
+            let mut app = crate::app::setup_app_for_test();
+            app.vlm_setup.gpu = GpuProbe::Ready(result);
+            app.vlm_setup.dialog = Some(Dialog::Checking(vec!["original.png".into()]));
+            app.poll_vlm_setup(&egui::Context::default());
+            if loader_available {
+                assert!(
+                    matches!(app.vlm_setup.dialog, Some(Dialog::GpuError(ref error)) if error.contains("injected start failure"))
+                );
+            } else {
+                assert_eq!(
+                    app.vlm_setup.dialog,
+                    Some(Dialog::Unsupported(VULKAN_LOADER_REASON.into()))
+                );
+                assert!(app.vlm_setup.modal_open());
+                assert_eq!(app.vlm_setup.view(false).gpu, VULKAN_LOADER_REASON);
+            }
+        }
+    }
+
+    #[test]
     fn vlm_setup_request_during_remove_is_rejected_then_new_request_can_confirm() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = crate::app::setup_app_for_test();
         app.vlm_setup.addon = VlmAddon::new(temp.path().join("vlm"));
-        app.vlm_setup.gpu = GpuProbe::Ready(Ok(GpuDecision {
-            device: None,
-            vulkan_available: true,
-            vram_total_bytes: 8 * 1073741824,
-        }));
+        app.vlm_setup.gpu = GpuProbe::Ready(Ok(GpuDetection::Device(
+            crate::ai::vlm_worker::GpuDecision {
+                device: None,
+                vulkan_available: true,
+                vram_total_bytes: 8 * 1073741824,
+            },
+        )));
         app.vlm_setup.addon.start_remove().unwrap();
         let ctx = egui::Context::default();
         app.request_vlm_caption_setup(&ctx, vec!["rejected.png".into()]);
@@ -625,7 +667,11 @@ mod tests {
                 AddonOperation::Installing,
                 "キャンセル",
             ),
-            2 => (Dialog::Unsupported, AddonOperation::None, "閉じる"),
+            2 => (
+                Dialog::Unsupported(GPU_REQUIREMENTS_REASON.into()),
+                AddonOperation::None,
+                "閉じる",
+            ),
             3 => (Dialog::Done, AddonOperation::None, "閉じる"),
             4 => (
                 Dialog::Error("長いエラーメッセージと保存先のパスです。".repeat(60)),
@@ -633,6 +679,11 @@ mod tests {
                 "再試行",
             ),
             5 => (Dialog::Cancelled, AddonOperation::None, "閉じる"),
+            7 => (
+                Dialog::Unsupported(VULKAN_LOADER_REASON.into()),
+                AddonOperation::None,
+                "閉じる",
+            ),
             _ => (Dialog::RemoveConfirm, AddonOperation::None, "削除する"),
         }
     }
@@ -640,7 +691,7 @@ mod tests {
     #[test]
     fn vlm_setup_small_window_buttons_remain_visible_and_clickable() {
         for size in [egui::vec2(1093.0, 614.0), egui::vec2(546.5, 307.0)] {
-            for case in 0..7 {
+            for case in 0..8 {
                 let (dialog, operation, label) = dialog_case(case);
                 let mut harness = crate::test_ui::builder()
                     .with_context_setup(crate::ui_fonts::configure_fonts)
@@ -664,6 +715,19 @@ mod tests {
                         Action::None,
                     );
                 harness.run_steps(4);
+                if case == 7 {
+                    harness.get_by_label(VULKAN_LOADER_REASON);
+                    assert!(
+                        harness
+                            .query_by_label("mIV を再起動してからもう一度お試しください。")
+                            .is_none()
+                    );
+                    assert!(
+                        harness
+                            .query_by_role_and_label(egui::accesskit::Role::Button, "ダウンロード")
+                            .is_none()
+                    );
+                }
                 let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
                 for button in harness.get_all_by_role(egui::accesskit::Role::Button) {
                     assert!(

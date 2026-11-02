@@ -153,6 +153,43 @@ fn byte_rgb_roundtrip_preserves_cr_lf_nul_ctrl_z_and_high_bytes() {
 }
 
 #[test]
+fn missing_system_vulkan_loader_skips_the_worker_probe() {
+    assert!(matches!(
+        detect_gpu_with(
+            || false,
+            || panic!("worker must not start without the system loader")
+        ),
+        Ok(GpuDetection::VulkanLoaderUnavailable)
+    ));
+}
+
+#[test]
+fn system_vulkan_loader_path_is_absolute_instead_of_a_reusable_basename() {
+    let encoded = system_vulkan_loader_path().expect("Windows system directory must be available");
+    assert_eq!(encoded.last(), Some(&0));
+    let decoded = String::from_utf16(&encoded[..encoded.len() - 1]).unwrap();
+    let path = Path::new(&decoded);
+    assert!(path.is_absolute());
+    assert_eq!(path.file_name().unwrap(), "vulkan-1.dll");
+    assert!(path.parent().unwrap().is_absolute());
+}
+
+#[test]
+fn present_system_vulkan_loader_preserves_worker_start_failure() {
+    let error = VlmError::Io("injected worker start failure".into());
+    assert_eq!(
+        detect_gpu_with(|| true, || Err(error.clone())).unwrap_err(),
+        error
+    );
+    assert!(matches!(
+        detect_gpu_with(|| true, || Ok(GpuDecision {
+            device: None, vram_total_bytes: MIN_VRAM_BYTES, vulkan_available: true,
+        })),
+        Ok(GpuDetection::Device(gpu)) if gpu.is_eligible()
+    ));
+}
+
+#[test]
 fn incompatible_hello_version_is_rejected() {
     assert!(matches!(
         VlmWorkerClient::spawn_with(fake_worker(), &args("hello-version"), budgets()),

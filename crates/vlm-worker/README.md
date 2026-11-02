@@ -6,12 +6,37 @@ Windows x64 の worker と Rust client。GPU 判定・モデル導入の設定�
 `vendor/llama.cpp` は変更しない。画像は元の場所から読み、JSONL はリポジトリ外の runs に保存する。
 画像・説明文の内容をレビュー文書やリポジトリへ転載しない。
 
-## 前提とビルド
+## 復旧とビルド
+
+現ソースの identity と一致する `vendor/vlm-worker/mimageviewer-vlm.exe` があれば、
+`scripts/build-vlm-worker.ps1` は CMake を探さずそのまま使う。CMake / Vulkan SDK / llama.cpp のソースは不要。
+`-SkipBuild` も identity を検査し、古い exe の再利用は認めない。
+
+worker が無ければ、まず `bootstrap-vendor.sh` が
+`C:\home\mimageviewer_vendor_backup\vlm-worker\mimageviewer-vlm.exe` から復旧する。
+PowerShell から同じ復旧だけを実行する場合:
+
+```powershell
+.\scripts\vlm-worker-identity.ps1 -RestoreBackupRepo .
+```
+
+一時候補を実ファイルでコピーし、現ソースの identity と一致してから公開する。
+バックアップの欠落・不一致では配置しない。既存の worker を上書きせず、APPDATA からは取り込まない。
+
+バックアップで復旧できない場合、`scripts/setup-llama-cpp.ps1` が固定 commit の GitHub ZIP を取得・
+SHA-256 照合・安全に staging へ展開し、欠落している `vendor/llama.cpp` へ公開する入口になる。
+ただし **GitHub ZIP の checksum は確認待ちで未設定**。レビュー済み SHA-256 をソースに固定するまで、
+ネットワーク・ディレクトリ変更の前に停止する。引数・環境変数で hash / URL を差し替える入口は無い。
+既存 source tree を消さず、archive の traversal・絶対パス・リンク・重複・Windows の不正名を拒否する。
+
+### C++ の再ビルドが必要なとき
 
 - Visual Studio 18 2026 BuildTools、MSVC C++、Windows SDK、CMake 3.24 以上。
 - Vulkan SDK `C:\VulkanSDK\1.4.363.0`。未設定なら CMake がこの場所を使う。
-- llama.cpp **b12032**, commit `dde879bc4f954b809892fd0d660515f42536394a` を `vendor/llama.cpp/` に配置済みであること。
-  提供されたアーカイブの SHA-256 は `2fbadc9cc8552352efbdf3cf5bc7b8c9cce84a12c876cca03c858cb062567e2a`。
+- llama.cpp **b12032**, commit `dde879bc4f954b809892fd0d660515f42536394a` を `vendor/llama.cpp/` に用意する。
+  未配置の場合は上記の固定版 source の復旧手順を使う。
+  V1-0 で提供された別アーカイブの SHA-256 は `2fbadc9cc8552352efbdf3cf5bc7b8c9cce84a12c876cca03c858cb062567e2a`。
+  新しい GitHub ZIP 取得用の pin には使わない。
   ビルドに取得処理はない。別バージョンへの互換性は保証しない。
 
 リポジトリルートの PowerShell から実行する。
@@ -25,6 +50,17 @@ ctest --test-dir crates/vlm-worker/build -C Release --output-on-failure
 ```
 
 出力は `vendor/vlm-worker/mimageviewer-vlm.exe`。MSBuild の並列ノード起動が sandbox で不安定だったため `/m:1` を使う。
+worker だけを明示的に再ビルドする入口は `scripts/build-vlm-worker.ps1 -Rebuild`。
+引数なしでは現ソースと一致する exe を再利用し、missing / stale の場合だけ再ビルドする。
+C++ を変更したときは上記 CTest と identity の検査後、次のように backup も更新する。
+バックアップへの書込みは利用者が実行する手順であり、自動 build は backup を変更しない。
+
+```powershell
+.\scripts\vlm-worker-identity.ps1 -ValidateRepo .
+New-Item -ItemType Directory -Path C:\home\mimageviewer_vendor_backup\vlm-worker -Force | Out-Null
+Copy-Item -LiteralPath .\vendor\vlm-worker\mimageviewer-vlm.exe -Destination C:\home\mimageviewer_vendor_backup\vlm-worker\mimageviewer-vlm.exe -Force
+```
+
 `GGML_VULKAN=ON`, `GGML_NATIVE=OFF`, `GGML_RPC=OFF`, `BUILD_SHARED_LIBS=OFF`, `GGML_BACKEND_DL=OFF`。
 `LLAMA_OPENSSL`, `LLAMA_BUILD_SERVER/TOOLS/EXAMPLES/TESTS/APP/COMMON`, `LLAMA_SUBPROCESS`, `MTMD_VIDEO` は OFF。
 b12032 の `LLAMA_BUILD_MTMD=ON` が `tools/mtmd` のライブラリだけを追加するので、tools 一式を有効にする必要はない。
@@ -158,7 +194,8 @@ worker の場所は debug build だけ `MIV_VLM_WORKER` を優先し、その後
 展開は worker スレッド上で VST3 と同じ regular-file 検査・全バイト照合・一時ファイルからの置換を使う。
 reparse point を拒否し、旧版は消さない。実行時は protocol と prompt_version を照合し、source identity は比較しない。
 GPU の利用条件は選択した同一 device が Vulkan 対応かつ専用 VRAM 総量 7.5GiB 以上。
-通常版・portable の build は `scripts/build-vlm-worker.ps1` で native worker を先に再ビルドする。
+通常版・portable の build は `scripts/build-vlm-worker.ps1` で native worker を検査し、一致するものは再利用する。
+missing / stale の場合だけ再ビルドする。
 署名は通常版が内包前、portable がコピー後に行う。
 
 ```powershell

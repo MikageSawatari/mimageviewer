@@ -1146,6 +1146,62 @@ mod tests {
     }
 
     #[test]
+    fn another_model_staging_is_not_reused_for_current_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, bodies) = fixture();
+        let mut other_index = index.clone();
+        let mut other_bodies = bodies.clone();
+        other_bodies[0] = b"older!".to_vec();
+        other_index.files[0].sha256 = digest(&other_bodies[0]);
+        other_index.model_id =
+            format!("qwen3.5-4b-miv-q4km-{}", &other_index.files[0].sha256[..12]);
+        other_index.validate().unwrap();
+        assert_ne!(other_index.model_id, index.model_id);
+        let other_staging = dir
+            .path()
+            .join("downloads")
+            .join(&other_index.model_id)
+            .join("staging");
+        fs::create_dir_all(&other_staging).unwrap();
+        for (file, body) in other_index.files.iter().zip(&other_bodies) {
+            fs::write(other_staging.join(&file.name), body).unwrap();
+        }
+        // Three outputs have identical hashes across the two models. Ownership
+        // still requires fetching their current model's assets, not borrowing
+        // another model_id's completed outputs.
+        let mut responses = vec![ok(&serde_json::to_vec(&index).unwrap())];
+        responses.extend(bodies.iter().map(|body| ok(body)));
+        let (base, requests, join) = server(responses);
+        let (tx, _rx) = mpsc::sync_channel(8);
+        assert_eq!(
+            install(dir.path(), &base, &AtomicBool::new(false), &tx).unwrap(),
+            index.model_id
+        );
+        join.join().unwrap();
+        let requested: Vec<_> = requests
+            .try_iter()
+            .map(|request| request.lines().next().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            requested,
+            [
+                "GET /vlm-model-index.json HTTP/1.1",
+                "GET /model.gguf HTTP/1.1",
+                "GET /mmproj.gguf HTTP/1.1",
+                "GET /LICENSE HTTP/1.1",
+                "GET /NOTICE HTTP/1.1",
+            ]
+        );
+        for (file, body) in other_index.files.iter().zip(&other_bodies) {
+            assert_eq!(fs::read(other_staging.join(&file.name)).unwrap(), *body);
+        }
+        match scan(dir.path(), &AtomicBool::new(false)) {
+            AddonStatus::Valid { model_id, .. } => assert_eq!(model_id, index.model_id),
+            status => panic!("current model was not installed: {status:?}"),
+        }
+    }
+
+    #[test]
     fn startup_scan_is_lazy_cached_and_exclusive() {
         let dir = tempfile::tempdir().unwrap();
         write_pack(dir.path());
