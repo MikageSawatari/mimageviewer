@@ -4,12 +4,15 @@
 #include "caption-grammar.h"
 #include "chunks.h"
 #include "greedy.h"
+#include "engine_errors.h"
+#include "image_input.h"
+#include "exclusive_output.h"
 #include "llama.h"
 #include "mtmd-helper.h"
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
-#include <fstream>
+#include <cstdio>
 #include <iostream>
 #include <memory>
 #include <map>
@@ -49,7 +52,6 @@ int run(const std::vector<std::string> & args) {
     auto order = options.count("--order") ? options["--order"] : "forward";
     if (order != "forward" && order != "reverse") throw std::runtime_error("Order must be forward or reverse");
     auto out_path = fs::u8path(options["--out"]);
-    if (fs::exists(out_path)) throw std::runtime_error("Refusing to overwrite existing output");
     std::vector<fs::path> images;
     for (auto & entry : fs::directory_iterator(fs::u8path(options["--images"]))) {
         auto ext = entry.path().extension().u8string();
@@ -59,6 +61,15 @@ int run(const std::vector<std::string> & args) {
     std::sort(images.begin(), images.end(), [](const auto & a, const auto & b) { return a.filename().u8string() < b.filename().u8string(); });
     if (images.empty()) throw std::runtime_error("No PNG inputs");
     if (order == "reverse") std::reverse(images.begin(), images.end());
+    ExclusiveOutput out(out_path);
+    static EngineErrors errors;
+    auto log = [](ggml_log_level, const char * message, void * user) {
+        static_cast<EngineErrors *>(user)->observe(message);
+        std::fputs(message, stderr);
+    };
+    llama_log_set(log, &errors);
+    ggml_log_set(log, &errors);
+    mtmd_helper_log_set(log, &errors);
     auto selected = select_device(options["--device"]);
     auto start = Clock::now();
     auto mp = llama_model_default_params();
@@ -76,27 +87,23 @@ int run(const std::vector<std::string> & args) {
     vp.print_timings = false;
     Handle<mtmd_context, mtmd_free> vision(mtmd_init_from_file(options["--mmproj"].c_str(), model.get(), vp), mtmd_free);
     if (!vision) throw std::runtime_error("mmproj load failed");
+    errors.check_fatal();
     double load_s = seconds(start);
     auto vocab = llama_model_get_vocab(model.get());
-    std::ofstream out(out_path, std::ios::binary);
-    if (!out) throw std::runtime_error("Cannot open output");
-    out.exceptions(std::ios::badbit | std::ios::failbit);
     size_t failed = 0;
     for (size_t index = 0; index < images.size(); ++index) {
         auto t0 = Clock::now();
         json rec{{"label", "V1-0"}, {"prompt_version", "v0-3l"}, {"image", images[index].filename().u8string()},
             {"index", index}, {"order", order}, {"model_load_s", load_s}, {"device", selected.description}};
-        mtmd_helper_init_opt init{};
-        init.video_params = mtmd_helper_video_init_params_default();
-        auto loaded = mtmd_helper_bitmap_init_from_file(vision.get(), images[index].u8string().c_str(), false, init);
-        Handle<mtmd_bitmap, mtmd_bitmap_free> bitmap(loaded.bitmap, mtmd_bitmap_free);
-        if (!bitmap) {
-            rec["error"] = "Image decode failed";
-            rec["validation"] = validate_output("", false, 0);
-            rec["json_ok"] = false;
-            rec["status"] = "failed";
-            ++failed;
-        } else {
+        run_image_attempt(rec, [&] {
+            auto bytes = read_selftest_png(images[index]);
+            mtmd_helper_init_opt init{};
+            init.video_params = mtmd_helper_video_init_params_default();
+            auto loaded = mtmd_helper_bitmap_init_from_buf(vision.get(), bytes.data(), bytes.size(), false, init);
+            Handle<mtmd_bitmap, mtmd_bitmap_free> bitmap(loaded.bitmap, mtmd_bitmap_free);
+            errors.check_fatal();
+            if (!bitmap) throw ImageFailure("Image decode failed");
+            check_image_dimensions(mtmd_bitmap_get_nx(bitmap.get()), mtmd_bitmap_get_ny(bitmap.get()));
             // Every image owns a fresh memory, sequence 0, position and sampler.
             auto phase = Clock::now();
             auto cp = llama_context_default_params();
@@ -109,6 +116,7 @@ int run(const std::vector<std::string> & args) {
             cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
             Handle<llama_context, llama_free> context(llama_init_from_model(model.get(), cp), llama_free);
             if (!context) throw std::runtime_error("Context creation failed");
+            errors.check_fatal();
             rec["timings"]["context_init_s"] = seconds(phase);
             phase = Clock::now();
             Handle<llama_sampler, llama_sampler_free> sampler(llama_sampler_chain_init(llama_sampler_chain_default_params()), llama_sampler_free);
@@ -122,13 +130,13 @@ int run(const std::vector<std::string> & args) {
             mtmd_input_text text{prompt.data(), prompt.size(), true, true};
             Handle<mtmd_input_chunks, mtmd_input_chunks_free> chunks(mtmd_input_chunks_init(), mtmd_input_chunks_free);
             const mtmd_bitmap * bitmaps[] = {bitmap.get()};
-            if (mtmd_tokenize(vision.get(), chunks.get(), &text, bitmaps, 1) != 0) throw std::runtime_error("Prompt tokenization failed");
+            errors.check_tokenize(mtmd_tokenize(vision.get(), chunks.get(), &text, bitmaps, 1));
             rec["prompt_chunks"] = describe_chunks(chunks.get());
             size_t prompt_tokens = mtmd_helper_get_n_tokens(chunks.get());
             llama_pos position = 0;
-            if (prompt_tokens + 800 > 8192) throw std::runtime_error("Prompt exceeds context budget");
-            if (mtmd_helper_eval_chunks(vision.get(), context.get(), chunks.get(), 0, 0, 2048, true, &position) != 0)
-                throw std::runtime_error("Prompt evaluation failed");
+            check_image_context_budget(prompt_tokens);
+            errors.check_evaluation(mtmd_helper_eval_chunks(vision.get(), context.get(), chunks.get(), 0, 0, 2048, true, &position),
+                "Image prompt evaluation failed");
             rec["timings"]["prompt_s"] = seconds(phase);
             phase = Clock::now();
             std::string content;
@@ -147,7 +155,7 @@ int run(const std::vector<std::string> & args) {
                     || !llama_batch_ext_set_output_logits(batch.get(), slot, true)) throw std::runtime_error("Generation batch setup failed");
                 ++position;
                 int result = llama_process(context.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get());
-                if (result != 0) throw std::runtime_error("Generation decode failed");
+                errors.check_evaluation(result, "Image generation evaluation failed");
             }
             rec["timings"]["generation_s"] = seconds(phase);
             rec["content"] = content;
@@ -159,13 +167,14 @@ int run(const std::vector<std::string> & args) {
             rec["validation"] = validation;
             rec["json_ok"] = validation["json_complete"].get<bool>() && validation["field_types"].get<bool>();
             rec["status"] = validation["ok"].get<bool>() ? "ok" : "failed";
-            if (!validation["ok"].get<bool>()) ++failed;
-            auto obj = json::parse(content, nullptr, false);
-            if (obj.is_object()) for (auto key : {"caption", "text", "keywords"}) if (obj.contains(key)) rec[key] = obj[key];
-        }
+            if (validation["json_complete"].get<bool>()) {
+                auto obj = json::parse(content);
+                if (obj.is_object()) for (auto key : {"caption", "text", "keywords"}) if (obj.contains(key)) rec[key] = obj[key];
+            }
+        });
+        if (rec["status"] == "failed") ++failed;
         rec["wall_s"] = seconds(t0);
-        out << rec.dump(-1, ' ', false, json::error_handler_t::replace) << '\n';
-        out.flush();
+        out.write_line(rec.dump(-1, ' ', false, json::error_handler_t::replace));
         std::cout << "image=" << index + 1 << "/" << images.size() << " seconds=" << rec["wall_s"] << " status=" << rec["status"] << std::endl;
     }
     std::cout << "model_load_s=" << load_s << " failed=" << failed << std::endl;

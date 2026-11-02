@@ -18,7 +18,7 @@ Rust 本体に接続しない Windows x64 の単体試作。製品バイナリ�
 $env:MSBUILDDISABLENODEREUSE = '1'
 $env:CMAKE_BUILD_PARALLEL_LEVEL = '1'
 cmake -S crates/vlm-worker -B crates/vlm-worker/build -G 'Visual Studio 18 2026' -A x64 -DVLM_REFERENCE_TOOLS=OFF
-cmake --build crates/vlm-worker/build --config Release --target mimageviewer-vlm vlm-contract-tests vlm-greedy-tests -- /m:1 /nr:false
+cmake --build crates/vlm-worker/build --config Release --target mimageviewer-vlm vlm-contract-tests vlm-greedy-tests vlm-image-attempt-tests vlm-output-tests -- /m:1 /nr:false
 ctest --test-dir crates/vlm-worker/build -C Release --output-on-failure
 ```
 
@@ -38,15 +38,18 @@ Vulkan loader と GPU driver は OS/driver 側の前提で、worker の配布物
 
 ```powershell
 $modelDir = 'G:\home\vlm-eval\models\unsloth__Qwen3.5-4B-GGUF'
-$run = 'G:\home\vlm-eval\runs\20261102-V1-0'
+$run = 'G:\home\vlm-eval\runs\20261102-V1-0-review-fixes'
 New-Item -ItemType Directory -Force $run | Out-Null
 .\vendor\vlm-worker\mimageviewer-vlm.exe --list-devices
-.\vendor\vlm-worker\mimageviewer-vlm.exe --selftest --model "$modelDir\Qwen3.5-4B-Q4_K_M.gguf" --mmproj "$modelDir\mmproj-F16.gguf" --images 'G:\home\vlm-eval\inputs\1024' --out "$run\forward.jsonl" --order forward
-.\vendor\vlm-worker\mimageviewer-vlm.exe --selftest --model "$modelDir\Qwen3.5-4B-Q4_K_M.gguf" --mmproj "$modelDir\mmproj-F16.gguf" --images 'G:\home\vlm-eval\inputs\1024' --out "$run\reverse.jsonl" --order reverse
+.\vendor\vlm-worker\mimageviewer-vlm.exe --selftest --model "$modelDir\Qwen3.5-4B-Q4_K_M.gguf" --mmproj "$modelDir\mmproj-F16.gguf" --images 'G:\home\vlm-eval\inputs\1024' --out "$run\forward-32.jsonl" --order forward
+.\vendor\vlm-worker\mimageviewer-vlm.exe --selftest --model "$modelDir\Qwen3.5-4B-Q4_K_M.gguf" --mmproj "$modelDir\mmproj-F16.gguf" --images 'G:\home\vlm-eval\inputs\1024' --out "$run\reverse-32.jsonl" --order reverse
 ```
 
-既存の `--out` は上書きしない。再実行には別の出力名を使う。引数は Unicode の Windows command line を受ける。
-PNG のファイル名でソートし、reverse はその逆順。画像をコピーしない。入力デコードはこの段階だけ mtmd helper/STB を使う。
+`--out` はモデル読込前に `CreateFileW(CREATE_NEW)` で排他新規作成し、既存ファイルは上書きしない。
+読み取り共有だけを許可する。起動後にモデル読込等で失敗した場合も出力は残すので、再実行には別の出力名を使う。
+引数は Unicode の Windows command line を受ける。
+PNG のファイル名でソートし、reverse はその逆順。画像をコピーしない。入力は縮小済みの PNG（各軸1〜1024px）だけを受ける。
+IHDR の寸法をデコード前に検査し、検査した同一の byte buffer を mtmd helper/STB でデコードする。
 
 モデルと mmproj はプロセスで一度だけ読み込む。各画像で llama context（memory・sequence）と grammar sampler を新規作成し、
 位置 0、sequence 0 から開始して、その画像の最後に破棄する。mtmd の画像チャンク・bitmap も各件で破棄する。
@@ -61,11 +64,24 @@ JSONL は `image`, `caption`, `text`, `keywords`, `content`, `finish_reason`, `u
 `model_load_s`, `validation`, `status`, `prompt_chunks`, `device` を含む。stdout は番号・時間・成否だけで、説明文を表示しない。
 `wall_s` は画像デコードから context/sampler の解放まで。モデル読み込み時間はモデル＋mmproj＋vision warmup を含み、context 作成は各画像に含む。
 成功には EOG、完全な JSON、3欄の型、caption/text 各400 Unicode文字、検索語20個・各32文字、800 tokens以内をすべて要求する。
-失敗行を含む完走は exit 2、起動・モデル・推論・出力 I/O のエラーは exit 1、全件成功は exit 0。
-画像デコードの失敗は行を残して次へ進む。
+失敗行を含む完走は exit 2、全体を止める失敗は exit 1、全件成功は exit 0。
+parse の前に buffer 全体の生の NUL と不正な UTF-8 を拒否する。JSON の `\u0000` エスケープは受理する。
 
-**仕様差:** v0-3l の schema は検索語 **40文字**、計画書 §6.4 の成功条件は **32文字**。
-C9 との比較用 GBNF は40文字を維持し、検証器は32文字を適用する。C9 の26件は最長17文字で、この差による不合格はない。
+| 失敗 | 処理 |
+| --- | --- |
+| PNG読取・ヘッダ・寸法・デコードの拒否、画像前処理/tokenizeの失敗、文脈予算超過 | その画像を `status=failed`, `finish_reason=error` の JSONL に記録し、次へ進む |
+| 画像prompt/生成評価の非致命的エラー（戻り値 -1 または正値） | 同じくその画像だけ失敗。context/samplerを破棄して次へ進む |
+| 完成した出力のJSON・型・長さ・終了条件の不合格 | `validation` と失敗を記録して次へ進む |
+| モデル/mmproj読込、context/sampler/batch作成・設定、割当失敗/VRAM不足、device喪失、評価戻り値 `< -1` | 全体を止める。自動再試行はしない |
+| 出力作成・書込の失敗、予期しない例外 | 全体を止める |
+
+b12032 の mtmd は `bad_alloc` 等も catch して前処理/encode の失敗コードにまとめるため、
+llama/ggml/mtmd の log callback で割当失敗と device 喪失の診断も保持し、戻り値と合わせて判定する。
+診断は stderr へ従来どおり転送する。これは固定版の診断文に依存するので、llama.cpp 更新時は分類テストも確認する。
+
+検索語は schema・埋め込み GBNF・検証器のすべてで **32文字**に揃えた。
+元の `run_eval.py` の v0-3l（40文字）は過去比較用として変更せず、worker の `prompt.h` の `kSchema` を32文字にする。
+JSONL の `prompt_version=v0-3l` は元の評価条件名を引き継ぐが、現在の worker の schema 上限は32文字である。
 
 ## GPU の選択
 
@@ -93,12 +109,14 @@ $env:MSBUILDDISABLENODEREUSE = '1'
 $env:CMAKE_BUILD_PARALLEL_LEVEL = '1'
 cmake -S crates/vlm-worker -B crates/vlm-worker/build -G 'Visual Studio 18 2026' -A x64 -DVLM_REFERENCE_TOOLS=ON
 cmake --build crates/vlm-worker/build --config Release --target vlm-reference -- /m:1 /nr:false
-# Initial development generation only; the generated constant is tracked.
+# Regenerate after changing the fixed schema; the generated constant is tracked.
 .\crates\vlm-worker\build\Release\vlm-reference.exe --grammar-header crates/vlm-worker/src/caption-grammar.h
 .\crates\vlm-worker\build\Release\vlm-reference.exe "$modelDir\Qwen3.5-4B-Q4_K_M.gguf" "$modelDir\mmproj-F16.gguf" 'G:\home\vlm-eval\inputs\1024' "$run\reference.jsonl"
 ```
 
-`json_schema_to_grammar(common_json::parse(kSchema))` で作った GBNF を `caption-grammar.h` の定数へ一度だけ埋め込む。
+`prompt.h` の `kSchema.properties.keywords.items.maxLength=32` を入力に、上の `--grammar-header` を実行する。
+同じ b12032 の `json_schema_to_grammar(common_json::parse(kSchema))` の出力を `caption-grammar.h` に定数として埋め込む。
+今回もこの手順で再生成し、`keywords-item` の `char{0,32}` を確認した。
 実行時の schema 変換・Jinja は不要。reference は server と同じ `common_chat_templates_apply` に画像 marker と text の2 part、
 schema、thinking=false を渡す。rendered prompt と worker の固定文字列を byte 比較する。
 さらに server と同じ `mtmd_tokenize(add_special=true, parse_special=true)` で26枚を token 化して保存する。
@@ -113,7 +131,7 @@ prefill 後の whitespace 受理状態と worker の JSON root 開始は異な�
 ## a〜e の集計と import 検査
 
 ```powershell
-python -I crates/vlm-worker/tools/summarize.py --baseline 'G:\home\vlm-eval\runs\20261102-C9\results.jsonl' --forward "$run\forward.jsonl" --reverse "$run\reverse.jsonl" --reference "$run\reference.jsonl" --out "$run\summary.json"
+python -I crates/vlm-worker/tools/summarize.py --baseline 'G:\home\vlm-eval\runs\20261102-C9\results.jsonl' --forward "$run\forward-32.jsonl" --reverse "$run\reverse-32.jsonl" --reference "$run\reference.jsonl" --out "$run\summary.json"
 python -I crates/vlm-worker/tools/check_fixtures.py --server-grammar "$run\server-path.gbnf" --out "$run\grammar-comparison.json"
 $dumpbin = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64\dumpbin.exe'
 python -I crates/vlm-worker/tools/audit_imports.py --bin vendor/vlm-worker --dumpbin $dumpbin --out $run
@@ -125,7 +143,7 @@ import 検査は配布ディレクトリ以下の全 exe/DLL に `dumpbin /impor
 `ws2_32`, `wsock32`, `winhttp`, `wininet`, `urlmon`, `dnsapi`, `mswsock`, `iphlpapi`, `netapi32`, `wldap32`, `rasapi32` の直接 import を拒否する。
 これは worker/同梱 DLL の直接 import とリンク境界の検査であり、OS/Vulkan driver 内部や全ての動的ロード先の監査ではない。
 
-## 実測結果
+## 初回の実測結果（40文字版、履歴）
 
 2026-11-02、Windows / RTX 4090 / Intel Core Ultra 9 285、Release、上記設定。
 個別 JSONL とログは `G:\home\vlm-eval\runs\20261102-V1-0\` にのみ置く。
@@ -169,5 +187,33 @@ Vulkan の初回pipeline/graph準備が遅延の候補だが、その内部の�
 初版と最終版で **26/26のcontent・3欄・finish_reasonが完全一致**し、この最適化はC9との差を生んでいない。
 
 残る範囲は、C9との差の厳密な数値切り分け、初回の遅延、PCI ID がない同名複数GPU、別GPUでの性能、
-40文字の比較用schemaと32文字の製品上限の統一。本体IPC・ジョブ・保存・UI・配布への組み込みは次段階で設計する。
+本体IPC・ジョブ・保存・UI・配布への組み込み。検索語上限の32文字への統一は下記の追補で完了した。
 今回 Rust本体・Cargo/workspace・llama.cppソースを変更せず、mIV製品バイナリは起動していない。コミットもしていない。
+
+## 指摘対応と再確認（32文字版、2026-11-02）
+
+設計担当による `db7434bf0` の検収後の修正。上の失敗分類・排他作成・入力制限はこの追補で導入した。
+schema と GBNF を32文字に統一し、reference の全引数は `wmain` から UTF-8 に変換、filesystem は `u8path` で扱う。
+
+- CTest **4/4成功**。生のNUL＋末尾のゴミ、不正UTF-8（継続byte単独・overlong・途中終了・surrogate・Unicode範囲外）、
+  正当な `\u0000`、JSON前後の空白、空白だけを検証。
+- 画像処理の同じ実行境界に前処理・文脈超過・prompt/生成評価エラーを注入し、失敗行を作って次の画像へ進むことを確認。
+  致命的な戻り値、割当失敗の診断、`bad_alloc` は外へ伝播して全体を止めることを確認。実VRAM不足は発生させていない。
+- 131072×1 のPNGヘッダを読み、寸法で拒否する回帰テスト。出力は同期して開始する8 threadで新規作成を競わせ、
+  1つだけが書けること・既存内容が保持されることを検証。いずれも使い捨ての合成データだけを使う。
+- reference を日本語の入力フォルダ・PNG名・出力名・文法出力名で実行して成功。
+  同じ32文字 schema からの再生成headerがbyte一致し、serverのJSON部分とも生成規則が一致することを確認。
+
+26枚の forward は **1回だけ再実行**し、`G:\home\vlm-eval\runs\20261102-V1-0-review-fixes\forward-32.jsonl` に新規保存した。
+**26/26で全検証成功**。前回 `20261102-V1-0\forward.jsonl` と caption・text・keywords・content・finish_reason・usage・
+prompt_chunks がそれぞれ **26/26完全一致**。検索語は最長17文字だった。
+時刻・所要時間と、新設した `validation.encoding_valid` は比較対象に含めない。
+
+```powershell
+python -I crates/vlm-worker/tools/compare_forward.py --previous 'G:\home\vlm-eval\runs\20261102-V1-0\forward.jsonl' --current "$run\forward-32.jsonl" --out "$run\forward-comparison.json"
+```
+
+読み込み3.561秒、初回35.106秒、初回以外の中央値1.635秒。
+exe は48,080,384 bytes、SHA-256 `1b493a52b3a658e17d24a427ad659b5a3dafe88ec739da5c54324021d05963d4`。
+再度の `dumpbin /imports` は従来と同じ4 DLLのみ、通信系 import なし。
+llama.cpp は4,015ファイルすべてのSHA-256が初回作業前と一致した。Rust本体は未変更、製品起動・通信・コミットは行っていない。

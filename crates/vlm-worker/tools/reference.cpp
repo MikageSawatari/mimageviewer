@@ -11,11 +11,13 @@
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
-int main(int argc, char ** argv) {
+int wmain(int argc, wchar_t ** wide_argv) {
     try {
+        std::vector<std::string> argv;
+        for (int i = 0; i < argc; ++i) argv.push_back(fs::path(wide_argv[i]).u8string());
         if (argc == 3 && std::string(argv[1]) == "--grammar-header") {
             auto grammar = json_schema_to_grammar(common_json::parse(kSchema));
-            std::ofstream out(argv[2], std::ios::binary);
+            std::ofstream out(fs::u8path(argv[2]), std::ios::binary);
             out << "#pragma once\n// Generated offline by vlm-reference using b12032 json_schema_to_grammar.\n"
                 << "inline constexpr char kGrammar[] = R\"GBNF(" << grammar << ")GBNF\";\n";
             return out ? 0 : 1;
@@ -24,7 +26,7 @@ int main(int argc, char ** argv) {
         auto mp = llama_model_default_params();
         mp.vocab_only = true;
         mp.n_gpu_layers = 0;
-        auto model = llama_model_load_from_file(argv[1], mp);
+        auto model = llama_model_load_from_file(argv[1].c_str(), mp);
         if (!model) throw std::runtime_error("Reference model load failed");
         auto tmpls = common_chat_templates_init(model, "");
         common_chat_templates_inputs inputs;
@@ -46,17 +48,17 @@ int main(int argc, char ** argv) {
             throw std::runtime_error("Fixed prompt differs");
         }
         // Use the grammar actually returned by the server's template path.
-        std::ofstream grammar(fs::path(argv[4]).parent_path() / "server-path.gbnf", std::ios::binary);
+        std::ofstream grammar(fs::u8path(argv[4]).parent_path() / "server-path.gbnf", std::ios::binary);
         grammar << applied.grammar;
         auto vp = mtmd_context_params_default();
         vp.use_gpu = false;
         vp.warmup = false;
-        auto vision = mtmd_init_from_file(argv[2], model, vp);
+        auto vision = mtmd_init_from_file(argv[2].c_str(), model, vp);
         if (!vision) throw std::runtime_error("Reference mmproj load failed");
         std::vector<fs::path> images;
-        for (auto & e : fs::directory_iterator(argv[3])) if (e.path().extension() == ".png") images.push_back(e.path());
+        for (auto & e : fs::directory_iterator(fs::u8path(argv[3]))) if (e.path().extension() == ".png") images.push_back(e.path());
         std::sort(images.begin(), images.end());
-        std::ofstream out(argv[4], std::ios::binary);
+        std::ofstream out(fs::u8path(argv[4]), std::ios::binary);
         for (auto & image : images) {
             mtmd_helper_init_opt opt{};
             opt.video_params = mtmd_helper_video_init_params_default();
