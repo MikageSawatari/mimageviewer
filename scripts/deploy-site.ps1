@@ -1,8 +1,12 @@
 # Upload the mikage.to site files that this repository owns (htdocs/) over SSH.
 #
-# Only these paths are managed; everything else under the remote document root
-# belongs to other sites and is never touched:
-#   index.html  robots.txt  sitemap.xml  mimageviewer/ (recursive)
+# By default mimageviewer/ (recursive, into /home/mikagewww/htdocs/mimageviewer)
+# and the site-root sitemap.xml are uploaded, matching the user's manual routine.
+# The other site-root files kept in htdocs/ (robots.txt, index.html) were never
+# updated by hand; they are only compared and reported. Pass -IncludeRootFiles
+# to upload them as well.
+# Everything else under the document root belongs to other sites and is never
+# touched.
 #
 # Default is a dry run: it compares SHA-256 of local and remote files and lists
 # what would be uploaded. Pass -Apply to upload the new / changed files.
@@ -25,6 +29,7 @@
 param(
     [switch]$Apply,
     [switch]$ShowRemoteOnly,
+    [switch]$IncludeRootFiles,
     [string]$Target = 'mikage@mikage.to',
     [string]$RemoteRoot = '/home/mikagewww/htdocs'
 )
@@ -32,7 +37,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $localRoot = Join-Path $repo 'htdocs'
-$managed = @('index.html', 'robots.txt', 'sitemap.xml', 'mimageviewer')
+$rootFiles = @('robots.txt', 'index.html')
+$managed = @('mimageviewer', 'sitemap.xml')
+if ($IncludeRootFiles) { $managed += $rootFiles }
 $sshOpts = @('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=20')
 
 function Invoke-Remote([string]$cmd) {
@@ -66,6 +73,20 @@ foreach ($m in $managed) {
 }
 
 $remote = Get-RemoteHashes
+if (-not $IncludeRootFiles) {
+    $saved = $managed
+    $managed = $rootFiles
+    $rootRemote = Get-RemoteHashes
+    $managed = $saved
+    foreach ($f in $rootFiles) {
+        $lp = Join-Path $localRoot $f
+        if (-not (Test-Path $lp -PathType Leaf)) { continue }
+        $lh = (Get-FileHash -LiteralPath $lp -Algorithm SHA256).Hash.ToLower()
+        if ($rootRemote[$f] -ne $lh) {
+            Write-Host "[site] NOTE: site-root $f differs from htdocs/$f (not uploaded; use -IncludeRootFiles)"
+        }
+    }
+}
 $changed = @($local.Keys | Where-Object { $remote[$_] -ne $local[$_] } | Sort-Object)
 $remoteOnly = @($remote.Keys | Where-Object { -not $local.ContainsKey($_) } | Sort-Object)
 
