@@ -41,6 +41,8 @@ pub mod ai;
 mod app;
 pub mod detached_window_geometry;
 pub(crate) mod feedback;
+#[cfg(windows)]
+pub(crate) mod job_process;
 #[cfg(feature = "dev-tools")]
 pub mod raw;
 #[cfg(not(feature = "dev-tools"))]

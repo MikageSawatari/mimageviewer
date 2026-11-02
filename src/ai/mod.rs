@@ -23,6 +23,8 @@ pub mod trt_worker_runtime;
 #[cfg(windows)]
 pub mod trt_worker_shm;
 pub mod upscale;
+#[cfg(windows)]
+pub mod vlm_worker;
 
 use std::fmt;
 
