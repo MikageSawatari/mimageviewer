@@ -534,3 +534,10 @@ reparse point 0と確認してNTFS圧縮（ファイル内容保持、削除0）
 - **C6 (不具合ではない)**: 再生画面から Backspace で一覧へ戻ると Visualizer の曲名・歌詞が消える件は、歌詞担当の調査 (コードとサブ PC のログ) で、一覧への退出が `close_fullscreen_now` でプレイヤーを drop して再生自体を終える作りで、`reconcile_local_now_playing` がそれに合わせて Local を clear する一貫した動きと判明。ログでは退出直後から host への音声ブロックが途絶えている (「音は続いていた」はスペクトラムの動きからの推測だった)。v4.6.0 (§1.359 part B) からの作りで v4.11.0 も同じ (コード判断、実機未確認)。一覧へ戻っても再生を続けたい場合は、別の新機能として検討する。
 - **A1 (要調査)**: mIV を最大化した状態で mIV Sound の窓が後ろに回ると、音響調整のボタンを 3 回押しても前に出ない (窓は可視のまま)。初回は 2 回目で前に出た。設計 (effetune-integration-plan §17.12「表示・前面化」) と異なる。v4.11.0 でも起きるかは未確認。
 - 承認は「mIV Original」プリセットを入れた候補で 1 回にまとめる方針 (§6) なので、この候補は承認しない。
+
+## 8. mIV Sound 候補 4b7a3eba… の承認 (2026-11-03)
+
+- 候補 `4b7a3eba00d3946c591d103eb6adecfba42b6cae3ea3eb3f010958093bf8c0bc` (miv-sound `miv` ブランチ、「mIV Original」プリセットと初回表示を含む)。ctest 117/117、独立レビュー ACCEPT。
+- 利用者が v5 の dev build で、初回表示・字幕の読みやすさ・マイクのダイアログが出ないこと・アナライザーの 4 点を確認し (観測者: 利用者)、承認を指示した。
+- `.\scripts\build-miv-sound.ps1 -Approve -Candidate 4b7a3eba…` を実行し、`third_party/miv-sound/0.15.0-miv.1/` を `636b2936b` でコミット。バックアップは `C:\home\mimageviewer_vendor_backup\miv-sound-0.15.0-miv.1\`。以後の v5 の検査に `MIV_SOUND_CANDIDATE` は要らない。
+- 承認後の `cargo check --workspace --all-targets` は、承認物の検査を通過し、launcher が release の exe 5 本を要求するところで止まった (未ビルドのため。公開前ゲートで `build-release.ps1` から作る)。
