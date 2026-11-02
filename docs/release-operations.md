@@ -429,7 +429,7 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
 
 ## 8. 配布チャネル (公開後 = Phase 5)
 
-- **mikage.to**: 3 直接 DL 成果物を配置し、製品ページの版・「最終更新」日付・portable リンク URL
+- **mikage.to**: `.\scripts\deploy-site.ps1 -Apply` で `htdocs/` を反映し (2026-11-02 から。手順はチェックリスト 16)、製品ページの版・「最終更新」日付・portable リンク URL
   (版を含む) を更新。ダウンロード欄に「Microsoft Store でも入手可能」副導線が残っていることを確認。
 - **Vector**: `mImageViewer_installer_v<VER>.zip` (`mImageViewer_setup.exe` + `installer/readme.txt`)
   を申請。readme の版表記更新を忘れない。この zip は build-dist では作らないので

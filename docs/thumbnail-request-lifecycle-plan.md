@@ -121,7 +121,8 @@ idx だけで暗黙に受理する fallback は作らない。Remote の生成�
 ### 3.2 lifecycle の案
 
 以下は概念型であり、今回 Rust 定義は追加しない。具体名は実装時に既存の型と揃える。
-相互排他的な状態は enum で表し、表示状態を覗いて解除する分岐は持たない。
+相互排他的な状態は enum で表す。worker要求の終端を表示状態から推測しない。
+終端後のRAW前面待ち需要の再受付だけは、下記のLoaded消失条件を入力として扱う。
 
 | 状態 | 所有している事実 | 終了に必要な残り |
 | --- | --- | --- |
@@ -143,6 +144,16 @@ request ID・worker・画像を持たず、完了履歴でもない。keep 退�
 `begin` / admission用 `contains_key` はこの需要待ちを含むが、通知相関・idle blocker・tail repaint・
 progress・要求診断の投影は有効な `Slot::Request` のみを見る。したがって範囲外で判定されなくても
 完了したcache missがCPU仕事や継続repaintを要求せず、他の画像のupgradeを妨げない。
+RAW Local halfの非前面要求も相関付き `AwaitingForeground { display_px }` 一通知で終了し、
+同ownerに `Slot::AwaitingForeground { deferred: Normal | Upgrade, display_px }` を残す。
+除去したrequestのkindを記録し、request ID・worker・画像は保持しない。表示は変更せず、
+通知相関・idle blocker・tail repaint・progress・診断の投影から外す。
+Normal/Upgradeの全producerはownerの `admission` を通る。前面化、worker評価時と異なる要求寸法、
+またはUpgrade待機でLoadedが失われたときだけslotを除去して再受付する。要求種別変更だけでは
+解除しない（gridのNormal問い合わせでUpgrade待機を外すと、同frameのidle upgradeが再投入する）。
+`Request` / `AwaitingArchiveJudgement` は前面受付でもBusyのまま。
+keep出退・GPU解放だけでは除去せず、source reload / remove / clear / items世代退役 / context dropで除去する。
+`Canceled` は再試行できる取消なのでkeep内では次frameに再要求され、前面待ちの終端には使えない。
 FinalizedAwaitingResult は通知順序に依存しない表現で、通常の同一 sender では Pixels が先に届く。
 画像なしの成功を Finalized だけで通知することは許可せず、NoArt 等で明示する。
 
@@ -154,6 +165,7 @@ FinalizedAwaitingResult は通知順序に依存しない表現で、通常の�
 | UI 採用 / 明示破棄 | SourceImageQueued→ImageSettledAwaitingFinalized。TerminalImageQueued→完了 |
 | 画像なし終端 | 一致する要求の未採用画像も破棄し、worker 終端と画像側終端を一度に確定→完了 |
 | CacheOnly miss | 相関付き画像なし終端→requestを除去し、IDのないアーカイブ判定待ち需要へ移行。判定結果/明示更新/世代失効で需要待ちを除去 |
+| RAW half 非前面 | 相関付き `AwaitingForeground` 終端→IDのない前面待ち需要へ移行。前面化/要求寸法変更/Upgrade待機のLoaded消失で再受付。表示・進捗・repaintは変更しない |
 | 実行前 queue prune | lock 下で取り除いた一致する要求を画像なし局所取消→完了 |
 | scope 失効 / drop | その context の旧 namespace と未採用画像を廃棄。終端受信を偽装せず、以降の旧通知は棄却 |
 
@@ -296,7 +308,7 @@ upgrade peakは既存どおりUを使い、peak更新/zero時resetとsnapshotの
 | `process_load_request` の cache hit | 通常 cache、edit-preview cache、固定代表 cache、派生 WebP、cache-only を含む。TerminalPixels、または画像なし Failed / Canceled で一通知終端。backlog 内なら解除しない |
 | `load_one_cached` の source 成功 | 通常画像、Folder 代表、ZIP cover / ZipImage / ZipDir、PdfFile / PdfPage、変換済み archive / Stack 代表。SourcePixels→保存/省略→Finalized。`should_save=false` も必ず終端通知 |
 | source decode / resolve エラー、cache-only miss | `send_thumb_failed`、source failure は画像なし Failed 終端。CacheOnly miss は失敗表示を出さず `CacheOnlyMiss` 終端と判定待ち需要へ移行する。デコード途中取消、PDF Interrupted は Failed と区別し既存 retriable 表示を保つ |
-| RAW preview / half handoff | preview が十分なら既存 source 経路。不足なら同じ key を `RawThumbPending`、callback、follow-up queue、`finish_pruned_raw_half_followup` に渡す。handoff 自体は完了でない。取消通知と callback の遅着が後続 owner を壊さず、進捗の一回計上も維持 |
+| RAW preview / half handoff | previewが十分なら既存source経路。不足するLocal非前面は `AwaitingForeground { display_px }` 一通知とgen_done +1で終端、executorへsubmitしない。前面なら同じkeyを `RawThumbPending`、callback、follow-up queue、`finish_pruned_raw_half_followup` に渡す。submit自体は完了でない。取消通知とcallbackの遅着が後続ownerを壊さず、進捗の一回計上も維持 |
 | Audio | generator は cache admission 後に一通知。Pixels は TerminalPixels、NoArt / Failed / Canceled は画像なし終端。sidecar / MP3 art / RAW sidecar、idle upgrade と cache revisit は既存の共通 dispatch を維持 |
 | ドライブ代表 / child pin | seed→同一確定Finalized、seed→確定FinalCache、seed→child miss の各経路。seed の upload 有無に依存せず旧seedを閉じる。seed表示の省略や追加DB参照はしない |
 | `spawn_video_thread` | pin blob→sidecar→Shell の既存優先順・worker内retryを維持。バッチ投入前にVideoBatch ownerとkeyを確定し、終端画像/失敗を返す。§3.4の投影により画像のないkeep外retryはupgradeを妨げずrepaint/進捗を増やさない。grid の keep 外動画保持と tray 解放除外を維持。fullscreen-only policy を grid に変えない |

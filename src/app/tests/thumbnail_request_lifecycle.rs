@@ -37,6 +37,453 @@ fn fixture(item_count: usize) -> AppTestEnv {
     app
 }
 
+#[cfg(windows)]
+fn raw_foreground_fixture(sample: &str, display_px: u32) -> AppTestEnv {
+    let mut app = fixture(8);
+    app.requested.clear();
+    app.thumbnails.fill_with(|| ThumbnailState::Failed);
+    app.thumbnails[3] = ThumbnailState::Pending;
+    let path = PathBuf::from("vendor/raw-samples").join(sample);
+    assert!(path.is_file(), "Run .\\scripts\\setup-raw-samples.ps1");
+    app.items[3] = GridItem::Image(path);
+    app.last_cell_size = display_px as f32;
+    app.last_cell_h = display_px as f32;
+    app.last_pixels_per_point = 1.0;
+    app.last_viewport_h = display_px as f32;
+    app.settings.thumb_next_pages = 5;
+    app.display_px_shared.store(display_px, Ordering::Relaxed);
+    let generation = app.items_generation;
+    app.requested
+        .begin(3, generation, ThumbnailRequestKind::Normal, None)
+        .unwrap();
+    app
+}
+
+/// Use the real worker notification unchanged, including its correlation and terminal contract.
+#[cfg(windows)]
+fn run_raw_foreground_worker(app: &mut App, display_px: u32) {
+    use crate::thumb_loader::{
+        CacheDecision, LoadRequest, LoadSourcePolicy, RawThumbHandoff, RawThumbLocalHandoff,
+        process_load_request,
+    };
+    let executor = Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap());
+    let handoff = RawThumbHandoff::Local(RawThumbLocalHandoff {
+        executor: Arc::clone(&executor),
+        queue: Arc::clone(app.reload_queue.as_ref().unwrap()),
+        tickets: Arc::clone(&app.raw_thumb_develop),
+    });
+    let mut request = LoadRequest {
+        idx: 3,
+        path: app.items[3].file_operation_path().unwrap().to_owned(),
+        request_id: app.requested.id(3).unwrap(),
+        items_gen: app.items_generation,
+        source_policy: LoadSourcePolicy::SourceOnly,
+        priority: false,
+        ..Default::default()
+    };
+    let before = app.cache_gen_done.load(Ordering::Relaxed);
+    process_load_request(
+        &mut request,
+        &std::sync::RwLock::new(HashMap::new()),
+        &app.tx,
+        None,
+        512,
+        75,
+        display_px,
+        CacheDecision::without_thumbnail(),
+        &app.cache_gen_done,
+        &Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+        None,
+        &app.keep_start_shared,
+        &app.keep_end_shared,
+        None,
+        None,
+        None,
+        None,
+        Some(&handoff),
+    );
+    assert_eq!(app.cache_gen_done.load(Ordering::Relaxed), before + 1);
+    assert_eq!(executor.running_jobs_for_test(), 0);
+    assert!(!app.raw_thumb_develop.lock().unwrap().contains_key(&3));
+    app.poll_thumbnails(&egui::Context::default(), ThumbnailConsumptionPolicy::Grid);
+}
+
+#[test]
+#[cfg(windows)]
+fn lifecycle_raw_half_offscreen_worker_terminal_stops_frame_re_requests() {
+    let mut app = raw_foreground_fixture("5424.orf", 256);
+    run_raw_foreground_worker(&mut app, 256);
+    let ctx = egui::Context::default();
+    for _ in 0..4 {
+        app.update_keep_range_and_requests(&ctx, std::time::Instant::now());
+        assert!(app.keep_set.contains(&3), "RAW must stay inside keep");
+        assert!(app.last_vis_range.1 <= 3, "RAW must remain offscreen");
+        assert_eq!(app.display_px_shared.load(Ordering::Relaxed), 256);
+        assert_eq!(
+            app.requested.id(3),
+            None,
+            "foreground-waiting RAW must not be requested each frame"
+        );
+        assert!(
+            app.reload_queue
+                .as_ref()
+                .unwrap()
+                .0
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn lifecycle_raw_half_foreground_owner_admission_and_activity_projections() {
+    for (kind, deferred) in [
+        (ThumbnailRequestKind::Normal, DeferredKind::Normal),
+        (ThumbnailRequestKind::Upgrade, DeferredKind::Upgrade),
+    ] {
+        let mut owner = ThumbnailRequests::default();
+        let id = owner.begin(3, 7, kind, None).unwrap();
+        for (generation, request_id) in [(6, id), (7, ThumbnailRequestId::Registered(0))] {
+            assert!(matches!(
+                owner.receive(notification(
+                    3,
+                    generation,
+                    request_id,
+                    ThumbMsgPayload::AwaitingForeground { display_px: 316 }
+                )),
+                ThumbnailReceipt::Ignored
+            ));
+            assert_eq!(owner.id(3), Some(id));
+        }
+        assert!(matches!(
+            owner.receive(notification(
+                3,
+                7,
+                id,
+                ThumbMsgPayload::AwaitingForeground { display_px: 316 }
+            )),
+            ThumbnailReceipt::Terminal(ThumbMsgPayload::AwaitingForeground { display_px: 316 })
+        ));
+        assert!(owner.contains_key(&3));
+        assert_eq!(owner.id(3), None);
+        assert!(!owner.blocks_idle_upgrade());
+        assert_eq!(owner.legacy_len(), 0);
+        assert_eq!(owner.images_len(), 0);
+        assert_eq!(owner.progress_counts(&HashSet::from([3])), (0, 0, 0));
+        assert!(owner.diagnostic_requests().is_empty());
+        assert!(owner.diagnostic_projection(3, id, 7).is_none());
+        for incoming in [DeferredKind::Normal, DeferredKind::Upgrade] {
+            assert_eq!(
+                owner.admission(3, incoming, false, 316, true),
+                ThumbnailAdmission::Busy,
+                "changing request kind must never release a foreground wait"
+            );
+        }
+        assert_eq!(
+            owner.admission(3, deferred, false, 316, false),
+            if deferred == DeferredKind::Upgrade {
+                ThumbnailAdmission::Admit
+            } else {
+                ThumbnailAdmission::Busy
+            }
+        );
+        if deferred == DeferredKind::Normal {
+            assert_eq!(
+                owner.admission(3, deferred, false, 256, false),
+                ThumbnailAdmission::Admit
+            );
+        }
+        let next = owner.begin(3, 7, kind, None).unwrap();
+        assert!(matches!(
+            owner.receive(notification(
+                3,
+                7,
+                id,
+                ThumbMsgPayload::AwaitingForeground { display_px: 316 }
+            )),
+            ThumbnailReceipt::Ignored
+        ));
+        assert_eq!(owner.id(3), Some(next));
+        owner.receive(notification(
+            3,
+            7,
+            next,
+            ThumbMsgPayload::AwaitingForeground { display_px: 316 },
+        ));
+        assert_eq!(
+            owner.admission(3, deferred, true, 316, true),
+            ThumbnailAdmission::Admit
+        );
+        owner.begin(3, 7, kind, None).unwrap();
+        assert_eq!(
+            owner.admission(3, deferred, true, 256, false),
+            ThumbnailAdmission::Busy
+        );
+        owner.clear();
+        assert_eq!(
+            owner.admission(3, deferred, false, 316, true),
+            ThumbnailAdmission::Admit
+        );
+    }
+    let mut owner = ThumbnailRequests::default();
+    let id = owner
+        .begin(3, 7, ThumbnailRequestKind::Normal, None)
+        .unwrap();
+    owner.receive(notification(3, 7, id, ThumbMsgPayload::CacheOnlyMiss));
+    assert_eq!(
+        owner.admission(3, DeferredKind::Normal, true, 256, false),
+        ThumbnailAdmission::Busy,
+        "foreground must not release archive judgement"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn lifecycle_raw_half_direct_foreground_and_source_reload_reject_old_terminal() {
+    let mut app = raw_foreground_fixture("5424.orf", 256);
+    let generation = app.items_generation;
+    let old_id = app.requested.id(3).unwrap();
+    run_raw_foreground_worker(&mut app, 256);
+    assert!(matches!(app.thumbnails[3], ThumbnailState::Pending));
+    assert_eq!(
+        app.enqueue_priority_thumbnail(3),
+        PriorityThumbnailAdmission::Enqueued
+    );
+    assert_eq!(
+        app.enqueue_priority_thumbnail(3),
+        PriorityThumbnailAdmission::AlreadyRequested
+    );
+    let request = app
+        .reload_queue
+        .as_ref()
+        .unwrap()
+        .0
+        .lock()
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(request.priority);
+    assert_ne!(request.request_id, old_id);
+    app.tx
+        .send(notification(
+            3,
+            generation,
+            old_id,
+            ThumbMsgPayload::AwaitingForeground { display_px: 256 },
+        ))
+        .unwrap();
+    app.poll_thumbnails(&egui::Context::default(), ThumbnailConsumptionPolicy::Grid);
+    assert_eq!(app.requested.id(3), Some(request.request_id));
+    app.evict_thumbnail_for_reload(3);
+    assert_eq!(
+        app.enqueue_priority_thumbnail(3),
+        PriorityThumbnailAdmission::Enqueued
+    );
+    let new_id = app.requested.id(3);
+    app.tx
+        .send(notification(
+            3,
+            generation,
+            request.request_id,
+            ThumbMsgPayload::AwaitingForeground { display_px: 256 },
+        ))
+        .unwrap();
+    app.poll_thumbnails(&egui::Context::default(), ThumbnailConsumptionPolicy::Grid);
+    assert_eq!(app.requested.id(3), new_id);
+}
+
+#[cfg(windows)]
+fn raw_upgrade_wait_fixture(ctx: &egui::Context) -> AppTestEnv {
+    let mut app = raw_foreground_fixture("5424.orf", 256);
+    app.tx
+        .send(pixels(&app, 3, ThumbLoadOrigin::UpgradeableCache))
+        .unwrap();
+    app.poll_thumbnails(ctx, ThumbnailConsumptionPolicy::Grid);
+    app.update_keep_range_and_requests(ctx, std::time::Instant::now());
+    assert_eq!(app.requested.get(&3), Some(&true));
+    let queued = app
+        .reload_queue
+        .as_ref()
+        .unwrap()
+        .0
+        .lock()
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(!queued.priority);
+    assert!(queued.source_policy.bypasses_cache());
+    run_raw_foreground_worker(&mut app, 256);
+    assert!(matches!(
+        app.thumbnails[3],
+        ThumbnailState::Loaded {
+            origin: ThumbLoadOrigin::UpgradeableCache,
+            ..
+        }
+    ));
+    app
+}
+
+#[test]
+#[cfg(windows)]
+fn lifecycle_raw_half_upgrade_wait_survives_grid_normal_probe_and_resumes_visible_with_priority() {
+    let ctx = egui::Context::default();
+    let mut app = raw_upgrade_wait_fixture(&ctx);
+    for _ in 0..4 {
+        app.update_keep_range_and_requests(&ctx, std::time::Instant::now());
+        assert_eq!(app.requested.id(3), None);
+        assert!(
+            app.reload_queue
+                .as_ref()
+                .unwrap()
+                .0
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(app.requested.contains_key(&3));
+    }
+    // Make the existing cell visible without another frame's priority retagging.
+    app.last_viewport_h = 4.0 * app.last_cell_h;
+    app.update_keep_range_and_requests(&ctx, std::time::Instant::now());
+    let queue = app.reload_queue.as_ref().unwrap().0.lock().unwrap();
+    assert_eq!(queue.len(), 1);
+    assert!(
+        queue[0].priority,
+        "upgrade must be foreground immediately on insertion"
+    );
+    assert_eq!(app.requested.get(&3), Some(&true));
+}
+
+#[test]
+#[cfg(windows)]
+fn lifecycle_raw_half_upgrade_wait_eviction_reentry_allows_normal_cache_read() {
+    let ctx = egui::Context::default();
+    let mut app = raw_upgrade_wait_fixture(&ctx);
+    app.settings.thumb_next_pages = 0;
+    app.update_keep_range_and_requests(&ctx, std::time::Instant::now());
+    assert!(!app.keep_set.contains(&3));
+    assert!(matches!(app.thumbnails[3], ThumbnailState::Evicted));
+    assert!(
+        app.requested.contains_key(&3),
+        "GPU eviction must preserve the demand slot"
+    );
+    app.settings.thumb_next_pages = 5;
+    app.update_keep_range_and_requests(&ctx, std::time::Instant::now());
+    assert_eq!(app.requested.get(&3), Some(&false));
+    let queue = app.reload_queue.as_ref().unwrap().0.lock().unwrap();
+    assert_eq!(queue.len(), 1);
+    assert!(
+        !queue[0].source_policy.bypasses_cache(),
+        "normal cache read must resume"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn lifecycle_raw_half_iiq_smaller_display_reopens_admission_for_preview() {
+    let ctx = egui::Context::default();
+    let mut app = raw_foreground_fixture("8010.iiq", 316);
+    run_raw_foreground_worker(&mut app, 316);
+    for _ in 0..3 {
+        app.update_keep_range_and_requests(&ctx, std::time::Instant::now());
+        assert_eq!(app.requested.id(3), None);
+    }
+    app.last_cell_size = 256.0;
+    app.last_cell_h = 256.0;
+    app.last_viewport_h = 256.0;
+    app.update_keep_range_and_requests(&ctx, std::time::Instant::now());
+    let request = app
+        .reload_queue
+        .as_ref()
+        .unwrap()
+        .0
+        .lock()
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(request.idx, 3);
+    assert!(!request.priority);
+    assert_eq!(app.display_px_shared.load(Ordering::Relaxed), 256);
+    run_raw_foreground_worker(&mut app, 256);
+    assert!(matches!(app.thumbnails[3], ThumbnailState::Loaded { .. }));
+    app.update_keep_range_and_requests(&ctx, std::time::Instant::now());
+    assert_eq!(app.requested.id(3), None);
+}
+
+#[test]
+#[cfg(windows)]
+fn lifecycle_raw_half_wait_source_reload_generation_and_sibling_are_local() {
+    let ctx = egui::Context::default();
+    let mut app = raw_foreground_fixture("5424.orf", 256);
+    let generation = app.items_generation;
+    let old_id = app.requested.id(3).unwrap();
+    run_raw_foreground_worker(&mut app, 256);
+    let sibling = app.build_window_context_for_test(1681, |mounted| {
+        mounted.items_generation = generation;
+        mounted.items = vec![GridItem::Image(PathBuf::from(r"c:\sibling\raw.orf"))];
+        mounted.thumbnails = vec![ThumbnailState::Pending];
+        let id = mounted
+            .requested
+            .begin(0, generation, ThumbnailRequestKind::Normal, None)
+            .unwrap();
+        mounted.requested.receive(notification(
+            0,
+            generation,
+            id,
+            ThumbMsgPayload::AwaitingForeground { display_px: 256 },
+        ));
+    });
+    app.evict_thumbnail_for_reload(3);
+    assert!(!app.requested.contains_key(&3));
+    app.update_keep_range_and_requests(&ctx, std::time::Instant::now());
+    let new_id = app.requested.id(3).unwrap();
+    app.tx
+        .send(notification(
+            3,
+            generation,
+            old_id,
+            ThumbMsgPayload::AwaitingForeground { display_px: 256 },
+        ))
+        .unwrap();
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+    assert_eq!(app.requested.id(3), Some(new_id));
+    app.with_viewer_context(sibling, |mounted| {
+        assert_eq!(
+            mounted
+                .requested
+                .admission(0, DeferredKind::Normal, false, 256, false),
+            ThumbnailAdmission::Busy
+        );
+        assert_eq!(mounted.requested.id(0), None);
+    })
+    .unwrap();
+    app.set_items_generation(generation.wrapping_add(1));
+    assert!(!app.requested.contains_key(&3));
+    app.tx
+        .send(notification(
+            3,
+            generation,
+            new_id,
+            ThumbMsgPayload::AwaitingForeground { display_px: 256 },
+        ))
+        .unwrap();
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+    assert!(!app.requested.contains_key(&3));
+    app.with_viewer_context(sibling, |mounted| {
+        assert_eq!(
+            mounted
+                .requested
+                .admission(0, DeferredKind::Normal, false, 256, false),
+            ThumbnailAdmission::Busy
+        );
+    })
+    .unwrap();
+    app.set_viewer_context_generation_for_test(sibling, generation.wrapping_add(1));
+    app.with_viewer_context(sibling, |mounted| assert!(mounted.requested.is_empty()))
+        .unwrap();
+}
+
 fn pixels(app: &App, idx: usize, origin: ThumbLoadOrigin) -> ThumbMsg {
     ThumbMsg::from_legacy_parts(
         idx,

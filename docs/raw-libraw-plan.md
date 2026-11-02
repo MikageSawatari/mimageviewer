@@ -912,6 +912,18 @@ S2a の暫定実装と master の取り込みの後で §6〜§7・§13 を現�
   - 後続要求が queue に入った時点で ticket は map から外す (以後は通常の要求と同じ扱い)
 - 優先度: 可視範囲は Normal、それ以外の keep range の先読みは submit しない (可視に入ったら submit する)。
   fullscreen の settle には half 現像を使わないので (§7.6)、High の half 現像は無い
+  - Local handoff の非前面要求は `AwaitingForeground { display_px }` を1通送り、`gen_done` を1進める。
+    executor ticket は作らない。前面は可視 raw 範囲または navigation / hover / seek / ページ一覧等の
+    interactive 需要で判定し、idle upgrade も投入時点で同じ priority を設定する。
+  - context-local な `ThumbnailRequests` は request を終端にして、ID・worker・画像を持たない
+    `Slot::AwaitingForeground { deferred: Normal | Upgrade, display_px }` に移す。表示は変えず、
+    idle blocker / repaint / progress / diagnostics には数えない。通常・upgrade の全入口を同じ受付に通す。
+    前面化、要求寸法の変化、または Upgrade 待機で Loaded が失われた場合だけ再受付する。
+    種別変更だけでは解除しない。keep出退・GPU解放ではslotを維持し、source reload・clear・世代退役・dropで除去する。
+  - `Canceled` は再試行できる取消で、keep内なら次フレームに再要求されるため、この前面待ちを表せない。
+    ticket取消・callback取消・PDF Interrupted等の本当の取消は従来のままにする。
+  - 不採用: 先読みでも現像する案は、前面だけにCPU現像を割り当てる既存方針を変えるため採らない。
+  - 不採用: 小さいpreviewの暫定表示は、previewのないMOSを覆えず、upgradeも同じ分岐へ戻るため採らない。
 - 報告する `source_dims` は `developed_dims`。これで一覧の縦横比・見開き判定・詳細表示の解像度列が
   フル現像と一致する
 - `CacheDecision::should_cache` に RAW 専用の規則は足さない (RAW はファイルが大きく既存の

@@ -43,24 +43,38 @@ struct Request {
     edit_preview_epoch: Option<u64>,
     phase: Phase,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeferredKind {
+    Normal,
+    Upgrade,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThumbnailAdmission {
+    Admit,
+    Busy,
+}
 // A completed CacheOnly miss has no outstanding request, but demand still waits for
 // archive judgement. Keep this bounded, context-local admission state in the same
 // owner instead of preserving a fictitious worker or adding a separate pending set.
 enum Slot {
     Request(Request),
     AwaitingArchiveJudgement,
+    AwaitingForeground {
+        deferred: DeferredKind,
+        display_px: u32,
+    },
 }
 impl Slot {
     fn request(&self) -> Option<&Request> {
         match self {
             Self::Request(r) => Some(r),
-            Self::AwaitingArchiveJudgement => None,
+            Self::AwaitingArchiveJudgement | Self::AwaitingForeground { .. } => None,
         }
     }
     fn request_mut(&mut self) -> Option<&mut Request> {
         match self {
             Self::Request(r) => Some(r),
-            Self::AwaitingArchiveJudgement => None,
+            Self::AwaitingArchiveJudgement | Self::AwaitingForeground { .. } => None,
         }
     }
 }
@@ -88,6 +102,30 @@ pub(crate) struct ThumbnailRequestProjection {
     pub(crate) worker_pending: bool,
 }
 impl ThumbnailRequests {
+    /// Normal and Upgrade share admission: changing the producer alone never releases a wait.
+    pub(crate) fn admission(
+        &mut self,
+        idx: usize,
+        _kind: DeferredKind,
+        foreground: bool,
+        display_px: u32,
+        display_loaded: bool,
+    ) -> ThumbnailAdmission {
+        match self.entries.get(&idx) {
+            None => ThumbnailAdmission::Admit,
+            Some(Slot::AwaitingForeground {
+                deferred,
+                display_px: previous,
+            }) if foreground
+                || display_px != *previous
+                || (*deferred == DeferredKind::Upgrade && !display_loaded) =>
+            {
+                self.entries.remove(&idx);
+                ThumbnailAdmission::Admit
+            }
+            Some(_) => ThumbnailAdmission::Busy,
+        }
+    }
     pub(crate) fn begin(
         &mut self,
         idx: usize,
@@ -231,6 +269,22 @@ impl ThumbnailRequests {
             .and_then(Slot::request_mut)
             .unwrap();
         match msg.payload {
+            ThumbMsgPayload::AwaitingForeground { display_px } => {
+                let deferred = match r.kind {
+                    ThumbnailRequestKind::Normal => DeferredKind::Normal,
+                    ThumbnailRequestKind::Upgrade => DeferredKind::Upgrade,
+                    _ => unreachable!("RAW Local handoff belongs to Normal or Upgrade"),
+                };
+                self.remove(&idx);
+                self.entries.insert(
+                    idx,
+                    Slot::AwaitingForeground {
+                        deferred,
+                        display_px,
+                    },
+                );
+                ThumbnailReceipt::Terminal(ThumbMsgPayload::AwaitingForeground { display_px })
+            }
             ThumbMsgPayload::CacheOnlyMiss => {
                 // Explicitly settle both terminals, retire correlation, then retain only
                 // the existing archive-judgement demand gate. It is never busy work.

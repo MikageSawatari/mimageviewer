@@ -556,9 +556,18 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
 GitHub Release 公開後、各配布チャネルへ反映・申請する。**Vector と MS Store は忘れやすいので、
 リリースのたびに必ずこのリストを通し、ユーザーに作業を案内すること。**
 
-16. **mikage.to へ反映**:
-    - 3 直接DL成果物 (`mImageViewer_setup.exe` / `mimageviewer.exe` /
-      `mImageViewer_portable_v<VER>.zip`) を配置。
+16. **mikage.to へ反映** (2026-11-02 から ClaudeCode がスクリプトで行う):
+    - 反映するのは `htdocs/mimageviewer/` (サーバの `/home/mikagewww/htdocs/mimageviewer`) とサイト直下の `sitemap.xml`。
+      `htdocs/robots.txt` とサイト直下の `index.html` は普段更新しない (差分があればスクリプトが知らせるだけ。上げるときは `-IncludeRootFiles`)。
+      ダウンロードの 3 つ (`mImageViewer_setup.exe` / `mimageviewer.exe` / `mImageViewer_portable_v<VER>.zip`) は、
+      製品ページのボタンが GitHub の `releases/latest/download/…` を指しているので mikage.to には置かない。
+      Store 用の setup.exe は手順 19 の R2。
+    - `.\scripts\deploy-site.ps1` (差分の確認だけ) → `.\scripts\deploy-site.ps1 -Apply` (新しい・変わったファイルだけを上げ、
+      サーバ側の SHA-256 を照合)。接続は `mikage@mikage.to` (SSH 鍵は利用者が設定済み)、公開フォルダは
+      `/home/mikagewww/htdocs`。同じフォルダの他サイトには触れない。サーバにだけあるファイル (古い版の setup.exe・旧マニュアルなど) は消さない。
+    - 上げたあと `python scripts\verify-site.py htdocs https://www.mikage.to` で公開 URL を照合する
+      (`.htaccess` の 403 だけは想定どおり)。DL 3 点は `curl -sIL https://github.com/MikageSawatari/mimageviewer/releases/latest/download/<名前>` が
+      200 でサイズ一致することを見る。
     - 製品ページ (`htdocs/mimageviewer/index.html`) のダウンロード欄・バージョン表記・「最終更新」
       日付を新版に更新。ダウンロード欄に **「Microsoft Store でも入手可能」バッジ** (`.btn-store`、
       リンク先 `https://apps.microsoft.com/detail/xp8jlwdwv5ls01`) が入っていることを確認。

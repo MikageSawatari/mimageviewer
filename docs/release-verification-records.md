@@ -12,6 +12,19 @@
 
 ---
 
+## v4.11.0 (2026-11-02)
+
+- **対象**: master `2322f5a2c` (リリース用ブランチ `release-4.11.0` を、利用者の更新履歴承認後に merge)。v4.10.2 以降の §1.482・§1.663・§1.668・§1.669・§1.670・§1.671・§1.672・§1.673・§1.674・§1.677・§1.679・§1.680 と、バケツの「範囲の基準」ボタンの統一。各項目とも独立レビュー ACCEPT。
+- **自動テスト**: 版上げ前の master `06f94d2a4` で lib 全件 15,474 件成功、ui_snapshot 218 件成功。配布ビルド (`build-dist.ps1 -SkipVst3Bridge`、VST3 host は v4.10.2 から変更なし) の全体テストで workspace 16,879 件成功 (77 skip、slow 9 件) と vendor・doc が成功。再試行なし。
+- **ReleaseChecks (ClaudeCode が実行、利用者了承 2026-11-02)**: run `release-checks-20261102-002328-d3975711`、PASS_WITH_WARNINGS。AI 経路の変更がないため `-IncludeFirstAi` なし。idle 5 ケース PASS (CPU 1 コア比 0.003〜0.009、測定区間の frame 0)。perf cached / uncached とも 256 folder load・Ctrl+Down 5・検索完了、描画 frame の 16ms 未満 99.67% / 98.68%、p95 13 / 14ms、pre_grid raw p95 0.088 / 0.094ms。100ms 超の間隔は各 1 件で、どちらも測定操作前の起動直後 frame 1→2 (107 / 113ms、既知形・上限 500ms、2026-10-11 利用者了承) で警告として残る。unexplained 0 件。
+- **実アプリ確認 (メイン PC、ClaudeCode が隔離データ `data-qa` で dev-runtime build を操作)**: §1.677 種類アイコン、§1.680 素早いダブルクリック (全画面から戻った直後を含む)、§1.679 バケツの素早いクリックと Ctrl+Z、バケツのボタン統一、§1.668 コレクションの参照 (読み取りだけで約 0.07ms、Auto 方針で DB を作らない) が期待どおり。図形の Ctrl+Z が効かなかった件は、パネルのボタンに入力先があると keymap が Ctrl+Z を抑止する以前からの制限で、§1.681 に起票。
+- **実アプリ確認 (サブ PC、サブ PC 担当が操作)**: 依頼 1 (§1.669〜§1.674) は全項目期待どおり。配布物 (署名済みポータブル版) での依頼 2 は、種類アイコン・ファイル名の表示幅・コレクションのサムネイル保存・補正の素早いクリックと図形・バケツのボタン・強制終了のあとの報告・配布物の基本 (署名・版・各形式の表示と再生) が期待どおり。期待と違ったのは「開いた直後、同じ位置のダブルクリックが無視される」1 件で、依頼 3 で v4.10.2 と比べたところ v4.10.2 でも起き (回数は v4.10.2 のほうが多い)、退行ではないと判断して §1.685 に起票した。同時に気づいた点 (バージョン情報のライセンス欄の「?」、コレクションの ZIP / PDF のサムネイルを開くたびに作り直して保存し直すログ、強制終了の報告の最終記録時刻が起動直後のまま、選択中の情報吹き出しが下の段の種類アイコンに重なる) は公開を止める内容ではないとした。メイン PC での版比較は、computer-use が mIV ポータブル版の窓を前面と認識せず (前面を Explorer と判定、画面写真が暗いまま) 中止した。
+- **依存**: FFmpeg は手元が新しい (候補は旧版)、crate の小更新は見送り、AVIF・PDFium は最新、VST3 host は v4.10.2 から変更なし。EffeTune 上流 v0.16.0 は v5 側で扱う。
+- **panic.log**: 16 種すべて disposition あり。
+- **署名・成果物**: 単体exe / setup.exe / portable の mimageviewer.exe を `signtool verify /pa` で確認 (Open Source Developer Taku Sano、Certum Timestamp 2026、exit 0)。全 PE / VC runtime gate 通過 (portable 22 PE、installer)。setup.exe 256,395,552 bytes、SHA-256 `C038B7674C0586C9D2D25A9B08B6924032CE2BC5695D5046D3A2AD2BAA0CF15A`。portable zip 265.5 MB、Vector zip 作成済み。CHANGELOG の節は 3,603 bytes で短縮版不要。
+
+---
+
 ## v4.10.2 (2026-10-31)
 
 - **対象**: ブランチ `release-4.10.2` の `68226ebc7` (配布ビルド)。v4.10.1 (`57e572874`) を基点に、修正 2 件だけを載せた修正版。master には v4.11.0 向けの未出荷の変更があるため、master からは出さなかった。修正は mimalloc を 3.3.2 から 3.5.3 へ更新 (§1.666、5ch >>655・657・672 の突然終了の対策。`libmimalloc-sys` 0.1.49 を vendor し、同梱の v3 を上流無改変の 3.5.3 に差し替え、`[patch.crates-io]` で選ぶ) と、Everything 検索結果から直接ページ表示した本の閉じる帰路 (§1.664、5ch >>671)。どちらも独立レビュー ACCEPT。ビルドは G: の worktree `G:\home\mimageviewer-everything-1664` で行った (本体の作業ツリーは別セッションが master へコミット中だったため)。

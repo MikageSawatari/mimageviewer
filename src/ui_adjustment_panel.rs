@@ -17728,3 +17728,7 @@ mod mask_bucket_1673_tests;
 #[cfg(test)]
 #[path = "ui_adjustment_panel/click_timing_1679_tests.rs"]
 mod click_timing_1679_tests;
+
+#[cfg(test)]
+#[path = "ui_adjustment_panel/shape_undo_investigation_tests.rs"]
+mod shape_undo_investigation_tests;
