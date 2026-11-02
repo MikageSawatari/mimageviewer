@@ -3,32 +3,47 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 fn fake_worker() -> &'static Path {
-    static FIXTURE: OnceLock<(tempfile::TempDir, PathBuf)> = OnceLock::new();
-    &FIXTURE
-        .get_or_init(|| {
-            let directory = tempfile::Builder::new()
-                .prefix(&format!("miv-vlm-peer-{}-", std::process::id()))
-                .tempdir()
-                .unwrap();
-            let executable = directory.path().join("vlm-fake-worker.exe");
-            let source =
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/vlm_fake_worker.rs");
-            let output = std::process::Command::new("rustc")
-                .arg("--edition=2024")
-                .arg("--crate-name=vlm_fake_worker")
-                .arg(source)
-                .arg("-o")
-                .arg(&executable)
-                .output()
-                .expect("rustc must be available for the standalone fake worker");
-            assert!(
-                output.status.success(),
-                "fake worker compile failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            (directory, executable)
-        })
-        .1
+    use sha2::{Digest as _, Sha256};
+
+    static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = manifest.join("tests/support/vlm_fake_worker.rs");
+        // include_bytes also makes Cargo rebuild the tests when the peer changes.
+        let hash = Sha256::digest(include_bytes!("../../tests/support/vlm_fake_worker.rs"));
+        let cache_root = manifest.join("target/vlm-fake-worker");
+        let directory = cache_root.join(format!("{hash:x}"));
+        let executable = directory.join("vlm-fake-worker.exe");
+        if executable.is_file() {
+            return executable;
+        }
+        std::fs::create_dir_all(&cache_root).unwrap();
+        let staging = tempfile::Builder::new()
+            .prefix(".build-")
+            .tempdir_in(&cache_root)
+            .unwrap();
+        let output = std::process::Command::new("rustc")
+            .env("TEMP", staging.path())
+            .env("TMP", staging.path())
+            .arg("--edition=2024")
+            .arg("--crate-name=vlm_fake_worker")
+            .arg(source)
+            .arg("-o")
+            .arg(staging.path().join("vlm-fake-worker.exe"))
+            .output()
+            .expect("rustc must be available for the standalone fake worker");
+        assert!(
+            output.status.success(),
+            "fake worker compile failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Publish the exe and PDB together. Concurrent losers reuse the
+        // winner and drop their staging directory, including its PDB.
+        if let Err(error) = std::fs::rename(staging.path(), &directory) {
+            assert!(executable.is_file(), "fake worker publish failed: {error}");
+        }
+        executable
+    })
 }
 
 fn budgets() -> Timeouts {

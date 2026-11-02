@@ -155,7 +155,10 @@ worker の場所は `MIV_VLM_WORKER` → repository の `vendor/vlm-worker/mimag
 cargo nextest run -p mimageviewer --lib -E 'test(/ai::vlm_worker::tests/) | test(/job_process::tests/) | test(/epub_convert::tests/)'
 ```
 
-偽 worker は `tests/support/vlm_fake_worker.rs` をテスト専用の一時フォルダーで rustc により build する。
+偽 worker は `tests/support/vlm_fake_worker.rs` の内容のハッシュを名前に含めた
+`target/vlm-fake-worker/<hash>/` に rustc で build し、既存のものを使い回す。
+同じ cache root 内の一時フォルダーで build してから、exe・PDB を含むフォルダーを rename で公開する。
+同時 build で公開に負けた側は既存のものを使い、一時フォルダーを回収する。生成物は `%TEMP%` に残さない。
 製品の exe、画像、モデル、設定は使わない。実モデル照合は次の3つの環境変数がすべてある場合だけ実行する。
 PNG の decode → RGB8 はこのテスト内だけにあり、製品の画像準備・縮小は V1-3 で接続する。
 画像をコピーせず、説明文の内容・画像名をテスト出力に出さず、3欄の完全一致を26枚すべてで検査する。
