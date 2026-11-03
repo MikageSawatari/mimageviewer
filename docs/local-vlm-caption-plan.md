@@ -1756,4 +1756,51 @@ P2 3 件・P3 2 件。§21.11 に足した: 今の署名を表示を始めるた
   残る受入は設計担当の検収、本体lib全件、利用者の実機確認（作成済み画像の欄、外部上書き後の再表示、
   ジョブ完了後とdetachedを開いたままの表示更新）。実機のUI応答性やperfを確認済みとは扱わない。
 - 製品起動・外部通信・評価データ読み込み・コミットは行っていない。
+#### 21.12.1 独立レビュー1回目への対応 (基準 `f101001af`)
+
+- **P2-1（暗色固定欄に親のLight文字色が残る）**: 既存のEXIF・生成情報は明るい色を明示して親テーマの暗い文字色を避けていたが、
+  新しい欄は `ui.visuals()` を参照し、既存のwidget専用styleは非操作文字・補足・警告の色を変えていなかった。
+  「AI 説明」の `ui.scope` 内に `os_theme::apply_dark_ui` と既存widget配色を適用する。
+  文字コントラスト設定を保って暗色用の通常・補足・警告を使い、固定grayやContextの直接変更を足さない。
+  パネル全体・既存の欄のstyleは変えず、親UiとContextのLight/Dark styleが描画前後で同一であることも検査する。
+- 実際の欄をLight/Dark × 標準/強め × 成功/失敗から描き、paint済みの見出し・失敗文・作成日・古い警告の色と
+  暗色背景へのコントラストを検査する。snapshot fixtureも本体と同じwidget配色へ揃える。
+  既存の説明文snapshotのCopyボタンの色が変わる場合は、このfixture修正による意図した差分で、他の欄の配色変更ではない。
+- **P2-2（一覧の採用経路の無効化漏れ）**: `metadata_cache.clear()` と、同cacheの代入・取り外し・bundle交換も再検索した。
+  一覧再読込で全消去する箇所は下表の6つ。既接続の `app.rs` 3か所に加え、コレクション・ファイル名スタック・全体検索の
+  採用点にも `caption_display.clear()` を併設する。bundleの初期化・mount/swapは所有権の移動なので、新しい無効化を足さない。
+
+| ファイル | 一覧の採用関数 | 対応 |
+| --- | --- | --- |
+| `src/app.rs` | `install_drive_list` | 既接続 |
+| `src/app.rs` | `install_zip_current_level` | 既接続 |
+| `src/app.rs` | `install_loading_items_inner` | 既接続 |
+| `src/app/collection_grid.rs` | `install_collection_grid_items_with_thumbnail_sources` | 今回接続 |
+| `src/filename_stack_ui.rs` | `swap_stack_view_items` | 今回接続 |
+| `src/global_search_ui.rs` | `replace_search_view_items_with_ratings` | 今回接続 |
+
+- 新しく接続した3採用経路の回帰を追加する。コレクションは実actorとreload/poll採用を使い、別contextが同じ画像を
+  表示し続ける間の外部上書き→main一覧再読込→共有cache全消去→別contextの `refresh=false` で再読込→古い判定まで検査する。
+  兄弟のitems・世代・fullscreen対象は保持され、mount/swap/退役だけでは共有cacheを失効させないことも検査する。
+  DB・画像は一時領域だけで、画像decode・製品起動は行わない。detachedの述語・viewport経路は変更しない。
+- 初回focused（通常feature・offline・snapshot更新指定）は30件中29成功、1件は1test内で複数Harnessの
+  snapshot結果を集約せずに終了したため採取処理だけ失敗した。実描画色・新しい3採用経路の回帰は成功。
+  snapshot3条件を共通描画helperを使う3個のtestへ分けて修正した（製品コードの追加変更なし）。
+  run `dc49b878-8ca0-4460-b212-f0aa84d0adab`、`target/vlm-caption-review1-focused.log`。
+- snapshot再生成は6件全成功（2.058秒）、run `d479483f-555b-4a68-8517-129a12fa866e`、
+  `target/vlm-caption-review1-snapshots.log`。新規はLight/標準・Light/強め・Dark/強めの3枚、
+  既存は成功・古いの2枚のCopy配色を本体に合わせて更新し、失敗の既存PNGは不変。
+  計6枚198,529 bytesを実装担当と独立レビュー担当が目視し、欠け・重なり・豆腐が無いことを確認した。
+- 最終関連filterは `app::collection_grid` / `filename_stack_ui` / `global_search_ui` /
+  `caption_display_cache` / `app::caption_display_tests` と `caption_panel` を対象に通常feature・offlineで実行。
+  snapshot更新指定なしの比較を含め284件全成功（20.352秒）、
+  run `6deb5999-d9a0-44b7-94f8-b37be01a3829`、`target/vlm-caption-review1-regression.log`。
+  本体lib全件は指定どおり実行していない。`cargo fmt --check`、UI glyph検査（0件）、差分検査も成功。
+- 独立レビュー担当は最終source・新規画像・検証ログを確認し、今回のP2-1/P2-2解消・追加指摘なし・対応範囲のレビュー完了と報告した。
+  実装担当自身の判定ではなく、実機確認や確認用buildの受入とは区別する。
+- `scripts/build-dev.ps1 -PreserveRuntime` は通常feature・offlineでcore（3分19秒）と同伴3exeのbuild・配置に成功。
+  VC runtime PE検査も `runtime=4 pe=4` で成功した。ログは `target/vlm-caption-review1-build-dev.log`。
+  成果物は `target/dev-runtime/mimageviewer-core.exe`。起動していない。最後の整形には引数なしの `cargo fmt` を使う。
+  本体lib全件・実機確認は未実施。製品起動・外部通信・コミットは行っていない。
+
 V1-4b の詳しい設計は、V1-4a の実装の後に改めてレビューを受ける。

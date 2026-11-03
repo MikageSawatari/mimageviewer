@@ -3749,6 +3749,7 @@ impl App {
         }
         self.reproject_page_edit_owners();
         self.metadata_cache.clear();
+        self.caption_display.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
         self.clear_tags_cache();
@@ -4030,6 +4031,163 @@ mod tests {
             assert!(Instant::now() < deadline, "collection Grid did not settle");
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn caption_collection_reload_invalidates_continuously_displayed_sibling_signature() {
+        use crate::ai_caption_db::{
+            CaptionDb, CaptionResult, FileSignature, SaveOutcome, SaveRequest,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let page = app.tmp.path().join("caption-collection.jpg");
+        // Only metadata/stat are needed: no thumbnail request or decode is sent.
+        std::fs::write(&page, b"original").unwrap();
+        let key = CaptionDb::normalize_path(&page);
+        let original = FileSignature::from_metadata(&std::fs::metadata(&page).unwrap()).unwrap();
+        let db = CaptionDb::open_at(app.tmp.path().join("ai_caption.db")).unwrap();
+        assert_eq!(
+            db.save(&SaveRequest {
+                item_path: page.clone(),
+                signature_path: page.clone(),
+                signature: original,
+                cover_ref: String::new(),
+                model_id: "test-model".into(),
+                prompt_version: 1,
+                lang: "ja".into(),
+                result: CaptionResult::Ok {
+                    caption: "original caption".into(),
+                    text: String::new(),
+                    keywords: Vec::new(),
+                },
+            })
+            .unwrap(),
+            SaveOutcome::Written,
+        );
+        drop(db);
+        let collection =
+            collection_with_sources(&client, &[(page.clone(), CollectionResolvedKind::Image)]);
+        app.open_collection_grid(collection.collection_id(), None);
+        wait_for_grid(&mut app, collection.collection_id());
+        assert_eq!(app.items, vec![GridItem::Image(page.clone())]);
+        let main = app.projected_viewer_context_id();
+        let sibling = app.build_window_context_for_test(97421, |owner| {
+            owner.items = vec![GridItem::Image(page.clone())];
+            owner.image_metas = vec![None];
+            owner.thumbnails = vec![ThumbnailState::Failed];
+            owner.fullscreen_idx = Some(0);
+        });
+        assert_ne!(sibling, main);
+        assert_eq!(app.projected_viewer_context_id(), main);
+        let ctx = egui::Context::default();
+        let sibling_generation = app.with_window_context_for_test(sibling, |owner| {
+            assert_eq!(owner.projected_viewer_context_id(), sibling);
+            assert!(
+                owner
+                    .caption_display
+                    .request(&ctx, &key, &page, true)
+                    .unwrap()
+            );
+            owner.items_generation
+        });
+        let wait_for_caption = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                app.caption_display.poll();
+                if app.caption_display.get(&key).is_some() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "caption display read did not finish"
+                );
+                std::thread::yield_now();
+            }
+        };
+        wait_for_caption(&mut app);
+        assert_eq!(
+            app.caption_display.get(&key).unwrap().current,
+            Some(original)
+        );
+        assert_eq!(
+            app.caption_display
+                .get(&key)
+                .unwrap()
+                .row
+                .as_ref()
+                .unwrap()
+                .caption,
+            "original caption",
+        );
+        assert!(!app.caption_display.get(&key).unwrap().is_stale());
+        let epoch = app.caption_display.epoch_for_test();
+        app.caption_display.seed_for_test("d:/other/caption.jpg");
+
+        std::fs::write(&page, b"externally replaced image with a different size").unwrap();
+        app.with_window_context_for_test(sibling, |owner| {
+            assert_eq!(owner.items, vec![GridItem::Image(page.clone())]);
+            assert_eq!(owner.fullscreen_idx, Some(0));
+            assert!(
+                !owner
+                    .caption_display
+                    .request(&ctx, &key, &page, false)
+                    .unwrap()
+            );
+            assert!(!owner.caption_display.get(&key).unwrap().is_stale());
+        });
+        assert_eq!(app.projected_viewer_context_id(), main);
+        assert_eq!(app.caption_display.epoch_for_test(), epoch);
+        let main_generation = app.items_generation;
+
+        // Reload through the real collection request/prepare/poll adoption while
+        // the independent sibling retains its displayed key and item generation.
+        app.reload_top_level_grid(&ctx);
+        wait_for_grid(&mut app, collection.collection_id());
+
+        assert_ne!(app.items_generation, main_generation);
+        assert_eq!(app.items, vec![GridItem::Image(page.clone())]);
+        assert!(!app.caption_display.contains_for_test(&key));
+        assert!(
+            !app.caption_display
+                .contains_for_test("d:/other/caption.jpg")
+        );
+        assert_ne!(app.caption_display.epoch_for_test(), epoch);
+        app.with_window_context_for_test(sibling, |owner| {
+            assert_eq!(owner.projected_viewer_context_id(), sibling);
+            assert_eq!(owner.items_generation, sibling_generation);
+            assert_eq!(owner.items, vec![GridItem::Image(page.clone())]);
+            assert_eq!(owner.fullscreen_idx, Some(0));
+            // A continuously displayed panel still passes refresh=false. The
+            // process-wide invalidation must turn this into a new worker read.
+            assert!(
+                owner
+                    .caption_display
+                    .request(&ctx, &key, &page, false)
+                    .unwrap()
+            );
+        });
+        assert_eq!(app.projected_viewer_context_id(), main);
+        wait_for_caption(&mut app);
+        app.with_window_context_for_test(sibling, |owner| {
+            let value = owner.caption_display.get(&key).unwrap();
+            assert!(value.is_stale());
+            assert_eq!(value.row.as_ref().unwrap().caption, "original caption");
+            assert_ne!(value.current, Some(original));
+            assert!(
+                !owner
+                    .caption_display
+                    .request(&ctx, &key, &page, false)
+                    .unwrap()
+            );
+        });
+        let epoch = app.caption_display.epoch_for_test();
+        app.retire_context(sibling, "caption_collection_reload_test", |_| ())
+            .unwrap();
+        assert_eq!(app.caption_display.epoch_for_test(), epoch);
+        assert!(app.caption_display.get(&key).unwrap().is_stale());
+        app.shutdown_collection_runtime_for_exit();
     }
 
     #[cfg(windows)]

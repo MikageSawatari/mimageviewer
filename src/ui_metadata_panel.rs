@@ -5850,42 +5850,49 @@ fn draw_caption_section(
     let Some(row) = value.row.as_ref() else {
         return false;
     };
-    ui.label(
-        egui::RichText::new("AI 説明")
-            .color(ui.visuals().text_color())
-            .size(16.0)
-            .strong(),
-    );
-    ui.add_space(8.0);
-    match row.status {
-        crate::ai_caption_db::CaptionStatus::Ok => {
-            draw_text_section(ui, ctx, "説明文", &row.caption);
-            if !row.visible_text.is_empty() {
-                ui.add_space(8.0);
-                draw_text_section(ui, ctx, "画像内の文字", &row.visible_text);
-            }
-            ui.add_space(8.0);
-            draw_text_section(ui, ctx, "検索語", &row.keywords.join("、"));
-        }
-        crate::ai_caption_db::CaptionStatus::Failed => {
-            ui.label("この画像の説明文を作れませんでした");
-        }
-    }
-    ui.add_space(8.0);
-    let date = crate::app::format_details_timestamp(row.created_at / 1000, false);
-    ui.label(
-        egui::RichText::new(format!("作成日: {date}"))
-            .color(ui.visuals().weak_text_color())
-            .size(11.0),
-    )
-    .on_hover_text(&row.model_id);
-    if value.is_stale() {
-        ui.add_space(8.0);
-        ui.colored_label(
-            ui.visuals().warn_fg_color,
-            "画像が変わっています。右クリックの『AI 説明文を作る』で作り直せます",
+    // This panel has a fixed dark background even under a light parent theme.
+    // Scope semantic text colors to this new section, retaining the panel's
+    // established widget palette without changing existing metadata sections.
+    ui.scope(|ui| {
+        crate::os_theme::apply_dark_ui(ui);
+        apply_metadata_panel_dark_widget_style(ui);
+        ui.label(
+            egui::RichText::new("AI 説明")
+                .color(ui.visuals().text_color())
+                .size(16.0)
+                .strong(),
         );
-    }
+        ui.add_space(8.0);
+        match row.status {
+            crate::ai_caption_db::CaptionStatus::Ok => {
+                draw_text_section(ui, ctx, "説明文", &row.caption);
+                if !row.visible_text.is_empty() {
+                    ui.add_space(8.0);
+                    draw_text_section(ui, ctx, "画像内の文字", &row.visible_text);
+                }
+                ui.add_space(8.0);
+                draw_text_section(ui, ctx, "検索語", &row.keywords.join("、"));
+            }
+            crate::ai_caption_db::CaptionStatus::Failed => {
+                ui.label("この画像の説明文を作れませんでした");
+            }
+        }
+        ui.add_space(8.0);
+        let date = crate::app::format_details_timestamp(row.created_at / 1000, false);
+        ui.label(
+            egui::RichText::new(format!("作成日: {date}"))
+                .color(ui.visuals().weak_text_color())
+                .size(11.0),
+        )
+        .on_hover_text(&row.model_id);
+        if value.is_stale() {
+            ui.add_space(8.0);
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "画像が変わっています。右クリックの『AI 説明文を作る』で作り直せます",
+            );
+        }
+    });
     true
 }
 
@@ -5917,23 +5924,52 @@ mod caption_panel_tests {
     }
 
     fn harness(value: CaptionDisplayValue) -> egui_kittest::Harness<'static> {
+        themed_harness(
+            value,
+            crate::os_theme::ResolvedTheme::Dark,
+            crate::settings::TextContrast::Standard,
+        )
+    }
+
+    fn themed_harness(
+        value: CaptionDisplayValue,
+        theme: crate::os_theme::ResolvedTheme,
+        contrast: crate::settings::TextContrast,
+    ) -> egui_kittest::Harness<'static> {
         let mut fonts_ready = false;
         crate::test_ui::builder()
             .with_size(egui::vec2(340.0, 390.0))
             .build_ui(move |root_ui| {
                 let ctx = &root_ui.ctx().clone();
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                crate::os_theme::apply_resolved_with_contrast(ctx, theme, contrast);
                 if !fonts_ready {
                     crate::ui_fonts::configure_fonts(ctx);
                     fonts_ready = true;
                     ctx.request_repaint();
                     return;
                 }
-                egui::CentralPanel::default().show(root_ui, |ui| {
-                    if !draw_caption_section(ui, ctx, &value) {
-                        draw_no_metadata(ui);
-                    }
-                });
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::NONE
+                            .fill(crate::os_theme::dark_visuals(contrast).panel_fill)
+                            .inner_margin(8.0),
+                    )
+                    .show(root_ui, |ui| {
+                        apply_metadata_panel_dark_widget_style(ui);
+                        let parent_style = ui.style().clone();
+                        let light_style = ctx.style_of(egui::Theme::Light);
+                        let dark_style = ctx.style_of(egui::Theme::Dark);
+                        if !draw_caption_section(ui, ctx, &value) {
+                            draw_no_metadata(ui);
+                        }
+                        assert_eq!(
+                            ui.style(),
+                            &parent_style,
+                            "caption style must not reach sibling sections"
+                        );
+                        assert_eq!(ctx.style_of(egui::Theme::Light), light_style);
+                        assert_eq!(ctx.style_of(egui::Theme::Dark), dark_style);
+                    });
             })
     }
 
@@ -5968,6 +6004,101 @@ mod caption_panel_tests {
         ui.get_by_label("説明文");
         ui.get_by_label("画像が変わっています。右クリックの『AI 説明文を作る』で作り直せます");
         ui.snapshot("caption_panel_stale");
+    }
+
+    fn snapshot_themed_stale(
+        theme: crate::os_theme::ResolvedTheme,
+        contrast: crate::settings::TextContrast,
+        name: &str,
+    ) {
+        let mut value = fixture();
+        value.current.as_mut().unwrap().size += 1;
+        let mut ui = themed_harness(value, theme, contrast);
+        ui.run();
+        ui.snapshot(name);
+    }
+
+    #[test]
+    fn caption_panel_snapshot_stale_light() {
+        snapshot_themed_stale(
+            crate::os_theme::ResolvedTheme::Light,
+            crate::settings::TextContrast::Standard,
+            "caption_panel_stale_light",
+        );
+    }
+
+    #[test]
+    fn caption_panel_snapshot_stale_light_strong() {
+        snapshot_themed_stale(
+            crate::os_theme::ResolvedTheme::Light,
+            crate::settings::TextContrast::Strong,
+            "caption_panel_stale_light_strong",
+        );
+    }
+
+    #[test]
+    fn caption_panel_snapshot_stale_dark_strong() {
+        snapshot_themed_stale(
+            crate::os_theme::ResolvedTheme::Dark,
+            crate::settings::TextContrast::Strong,
+            "caption_panel_stale_dark_strong",
+        );
+    }
+
+    fn painted_text_color(shapes: &[egui::epaint::ClippedShape], prefix: &str) -> egui::Color32 {
+        fn find(shape: &egui::Shape, prefix: &str) -> Option<egui::Color32> {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, prefix)),
+                egui::Shape::Text(text) if text.galley.job.text.starts_with(prefix) => {
+                    let color = text
+                        .override_text_color
+                        .unwrap_or(text.galley.job.sections[0].format.color);
+                    Some(if color == egui::Color32::PLACEHOLDER {
+                        text.fallback_color
+                    } else {
+                        color
+                    })
+                }
+                _ => None,
+            }
+        }
+        shapes
+            .iter()
+            .find_map(|shape| find(&shape.shape, prefix))
+            .expect("section text must actually be painted")
+    }
+
+    #[test]
+    fn caption_panel_painted_semantic_colors_are_dark_for_every_parent_theme_and_contrast() {
+        use crate::os_theme::ResolvedTheme::{Dark, Light};
+        use crate::settings::TextContrast::{Standard, Strong};
+        for theme in [Light, Dark] {
+            for contrast in [Standard, Strong] {
+                for status in [CaptionStatus::Ok, CaptionStatus::Failed] {
+                    let mut value = fixture();
+                    value.row.as_mut().unwrap().status = status;
+                    value.current.as_mut().unwrap().size += 1;
+                    let mut ui = themed_harness(value, theme, contrast);
+                    ui.run();
+                    let dark = crate::os_theme::dark_visuals(contrast);
+                    let shapes = &ui.output().shapes;
+                    for (text, expected) in [
+                        ("AI 説明", dark.text_color()),
+                        ("作成日:", dark.weak_text_color()),
+                        ("画像が変わっています。", dark.warn_fg_color),
+                    ]
+                    .into_iter()
+                    .chain(
+                        (status == CaptionStatus::Failed)
+                            .then_some(("この画像の説明文を作れませんでした", dark.text_color())),
+                    ) {
+                        let painted = painted_text_color(shapes, text);
+                        assert_eq!(painted, expected, "{theme:?}/{contrast:?}: {text}");
+                        assert!(crate::os_theme::contrast_ratio(painted, dark.panel_fill) >= 4.5);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

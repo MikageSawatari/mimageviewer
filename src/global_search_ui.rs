@@ -2546,6 +2546,7 @@ impl App {
         self.local_adjust_cache.clear();
         // path-keyed キャッシュも Ctrl+G では items が総入れ替わりするのでリセット。
         self.metadata_cache.clear();
+        self.caption_display.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
         self.clear_tags_cache();
@@ -4847,6 +4848,26 @@ impl App {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn caption_search_view_adoption_clears_shared_display() {
+        let mut app = crate::app::setup_app_for_test();
+        let page = app.tmp.path().join("caption-search.jpg");
+        let key = crate::ai_caption_db::CaptionDb::normalize_path(&page);
+        app.caption_display.seed_for_test(&key);
+        app.caption_display.seed_for_test("d:/other/caption.jpg");
+        let epoch = app.caption_display.epoch_for_test();
+
+        app.replace_search_view_items(vec![GridItem::Image(page.clone())], vec![None]);
+
+        assert_eq!(app.items, vec![GridItem::Image(page)]);
+        assert!(!app.caption_display.contains_for_test(&key));
+        assert!(
+            !app.caption_display
+                .contains_for_test("d:/other/caption.jpg")
+        );
+        assert_ne!(app.caption_display.epoch_for_test(), epoch);
+    }
 
     #[test]
     fn grid_scroll_session_search_renews_at_first_rows_and_drill_not_stream_reprojection() {
