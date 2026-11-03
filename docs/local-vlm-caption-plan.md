@@ -1846,7 +1846,9 @@ V1-4b の詳しい設計は、V1-4a の実装の後に改めてレビューを�
       今の `winner.path` は PDF を指すが、固定の指定は B の行にあるので、PDF の葉のパスから選び直すと 1 ページ目になってしまう。そこで、子の
       選定 (`resolve_folder_thumb_image_inner` の子の固定表紙の解決) が固定表紙を使ったときは、その持ち主と `ResolvedPinTarget` を選定の結果に
       残し、本の解決はそれを読む。固定表紙を使っていない子だけ、子の本の規則 (子の固定表紙の確認を含む) で 1 から解決する。
-      深さは `folder_thumb_depth` まで、同じ本に戻ったら止める (既存の固定表紙のたどりの循環検出と同じ考え方)。サムネイルの側は、残した情報を使わず
+      `ChildCached` の再解決回数は探索の深さとして数えない。各段のフォルダ探索・固定表紙の cascade は、一覧と同じくその段の
+      `folder_thumb_depth` を使う（子の保存済み代表は、子自身の深さで選んだ結果）。保存済み代表の再解決の連鎖は `visited` で
+      同じ本に戻ったら止める。サムネイルの側は、残した情報を使わず
       今どおり WebP を使う (選定の結果に field が増えるだけで、選び方は変えない)。
    4. 返すもの: 読む位置 (`ReadLocation` のうち `File`/`ArchiveEntry`/`PdfPage`)、`cover_ref`、署名とその元のパス、読めない理由 (未変換・
       固定表紙のエントリやページが無い・本が無い)、**動画のフレームの表紙** (下の 6)。
@@ -1863,6 +1865,8 @@ V1-4b の詳しい設計は、V1-4a の実装の後に改めてレビューを�
    EPUB の 100ns 単位はミリ秒に直す (`FileSignature::from_metadata` と同じ切り捨てで、変わっていないファイルでは同じ値になることをテストで押さえる)。
 5. **`BookCoverEnv`** (worker へ渡す、UI スレッドで作る。I/O をしない): `folder_thumb_sort`・`folder_thumb_depth`・一覧の表示の種類の設定
    (`listing_file_type_visibility`)・`Arc<FolderThumbPinDb>`・動画の固定表紙の DB・archive cache の DB・PDF のパスワードの材料 (下の 21.13.2 の 4)。
+   UI から渡す種類は計画用の hint とし、最上位も子も worker の metadata がディレクトリならフォルダとして解決する。
+   拡張子付きの実フォルダでも、戻り値の `cover_ref` と署名の基準を実際に選んだ子ファイルへ揃える。UI の stat や `for_physical` の変更は行わない。
 
 #### 21.13.2 本の作成ジョブ (V1-3c のジョブを広げる)
 
@@ -2002,3 +2006,36 @@ P3 1 件の文言の修正なので、V1-4b の設計のレビューはここで
   通常の検証用 core は `%APPDATA%\mimageviewer` を使い設定・データを更新し得るため、利用者が起動する前に
   インストール版／tray 常駐版を閉じる（single-instance mutex を共有）。エージェントは起動しない。
   製品バイナリの起動・外部通信・`G:\home\vlm-eval` の読み込み・コミットは行っていない。
+
+#### 21.14.1 独立レビューの P2 2件への対応（2026-11-03、基準 `7a05c8e29`）
+
+- 保存済みの子代表（`ChildCached`）を解決し直す段数を、フォルダ探索の深さに数えていた上限を取り除いた。
+  子の保存済み代表は子自身の探索深さで選んだ結果なので、各段の選定・固定表紙の cascade には従来と同じ
+  `folder_thumb_depth` を渡し、再解決の連鎖だけを `visited` の再訪検出で止める。
+  一覧の選定・サムネイル読込・保存の経路は変更していない。§21.13.1 と関連設計文書の深さの条件を揃えた。
+- 最上位も worker の metadata がディレクトリならフォルダに補正する。外側の署名方針を決める前に補正し、
+  `album.pdf`／`album.zip` の実フォルダでも、作成時と表示時の `cover_ref` と実採用ファイルの署名を一致させる。
+  `ProjectionRecipe::for_physical` と UI の種類 hint は変更せず、UI の stat も追加していない。
+- 深さ1の `A/B/C/book.pdf` の保存済み代表から C の3ページ目（page2）を読む回帰を追加した。
+  B の固定先 ZIP が表示の種類の設定で除外され、自動選定の行が C の保存済み代表を採る経路も深さ1で確認する。
+  同じ解決器で実キャッシュの連鎖をたどった後の再訪、および `A→B→A` 相当の訪問集合からの再訪が停止することを確認する。
+  後者は再訪先を削除してから呼び、metadata より先に循環を止めることも検査する。
+- 表示の回帰は実際の `ProjectionRecipe::for_physical` と `current_caption_book_target` を通し、
+  `album.pdf`／`album.zip` の実フォルダを扱う。作成時の Folder 指定で解決・保存した行を、表示 worker が
+  Pdf／Zip の hint から同じ表紙・署名として読み、App の固定表紙の変更で cache が消えて「古い」になることを確認した。
+- 通常 feature / offline の関連 focused は176件すべて成功（5.825秒、run
+  `86dfc8c4-a9a1-4424-878a-041d1926dca5`、`target/vlm-book-p2-focused.log`）。
+  filter は `book_cover::`／`caption_display`／`caption_job`／`folder_thumb`／`folder_pin`／`folder_representative`。
+  追加の `thumb_loader::`／`folder_thumb_pins::`／`folder_representative` は161件すべて成功（16.383秒、run
+  `18c17abb-504e-4c6e-89f6-a3aab6802ec9`、`target/vlm-book-p2-thumbnail.log`）。重複する件数は合算しない。
+  `cargo fmt --check` と `git diff --check` も成功。製品の UI 文言は変更していない。
+- 別 context のコード確認担当からは、この2件の修正と回帰について追加指摘なしとの報告を受けた。
+  自動検証は実装担当が実行した。設計担当の検収とは区別し、ここで検収済みとはしない。
+  本体lib全件は依頼どおり再実行していない。基準コミットの全件15,531件中15,528件成功・残る3件は単独成功という結果は、
+  設計担当から引き継いだ証拠であり、この修正後の全件実行結果ではない。
+- `CARGO_NET_OFFLINE=true` の `scripts/build-dev.ps1 -PreserveRuntime` が成功した。
+  core は1分00秒、remote／EPUB PDF worker／MCP adapter のビルドと配置、VC runtime PE 検査（`runtime=4 pe=4`）も成功。
+  記録は `target/vlm-book-p2-build-dev.log`、成果物は `target/dev-runtime/mimageviewer-core.exe`。
+  最後に引数なしの `cargo fmt` を実行する。製品起動・外部通信・禁止領域の読み込み・コミットは行っていない。
+  実機・実モデルによる確認と設計担当の検収を残す。利用者が確認する場合は、深さ1の保存済み代表からの3ページ目の表紙と、
+  `album.pdf`／`album.zip` の実フォルダで作成・表示した後、固定表紙を変えて「古い」になることを対象とする。

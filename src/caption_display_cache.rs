@@ -906,6 +906,106 @@ mod tests {
     }
 
     #[test]
+    fn caption_book_display_adopted_extension_named_folder_matches_creation_and_pin_changes() {
+        use crate::app::book_cover::BookCover;
+        use crate::app::book_materialization::{BookScope, ProjectionRecipe};
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+        use crate::grid_item::GridItem;
+        let mut app = crate::app::setup_app_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, expected_hint) in [("album.pdf", BookKind::Pdf), ("album.zip", BookKind::Zip)] {
+            let folder = tmp.path().join(name);
+            std::fs::create_dir(&folder).unwrap();
+            let first = folder.join("a.png");
+            std::fs::write(&first, b"first cover").unwrap();
+            std::fs::write(folder.join("b.png"), b"second cover").unwrap();
+            app.current_folder = Some(folder.clone());
+            app.items = vec![GridItem::Image(first.clone())];
+            app.fullscreen_idx = Some(0);
+            // Use the real accepted recipe, which classifies these directories
+            // by extension. The worker must correct the hint without UI stat.
+            app.projection_recipe =
+                ProjectionRecipe::for_physical(&app.settings, &folder, &folder, &app.items);
+            assert!(matches!(
+                &app.projection_recipe,
+                ProjectionRecipe::Book(BookScope::Document(_))
+                    | ProjectionRecipe::Book(BookScope::Archive { .. })
+            ));
+            let (key, path, hint) = app.current_caption_book_target().unwrap();
+            assert_eq!(hint, expected_hint);
+            assert_eq!(key, CaptionDb::normalize_path(&folder));
+            assert_eq!(path, folder);
+            let source = |rel: &str| FolderPinSource::File {
+                rel: rel.into(),
+                kind: FileKind::Image,
+            };
+            assert!(app.set_folder_thumb_pin(&folder, source("a.png")));
+            let env = app.book_cover_env();
+            let BookCover::Readable(created) = resolve_book_cover(&folder, BookKind::Folder, &env)
+            else {
+                panic!("selected folder cover must be readable");
+            };
+            assert_eq!(created.cover_ref, "a.png");
+            assert_eq!(created.signature_path, first);
+            let db_path = tmp.path().join(format!("{name}.captions.db"));
+            let db = CaptionDb::open_at(&db_path).unwrap();
+            assert_eq!(
+                db.save(&SaveRequest {
+                    item_path: folder.clone(),
+                    signature_path: created.signature_path.clone(),
+                    signature: created.signature,
+                    cover_ref: created.cover_ref.clone(),
+                    model_id: "fixture".into(),
+                    prompt_version: 1,
+                    lang: "ja".into(),
+                    result: CaptionResult::Ok {
+                        caption: "saved cover".into(),
+                        text: String::new(),
+                        keywords: Vec::new()
+                    },
+                })
+                .unwrap(),
+                crate::ai_caption_db::SaveOutcome::Written
+            );
+            app.caption_display = CaptionDisplayCache {
+                worker: Some(Worker::start(Some(db_path)).unwrap()),
+                ..Default::default()
+            };
+            let ctx = egui::Context::default();
+            app.caption_display
+                .request_book(&ctx, &key, &path, false, hint, env)
+                .unwrap();
+            receive_worker(&mut app.caption_display);
+            let shown = app.caption_display.get(&key).unwrap();
+            assert!(!shown.is_stale());
+            assert_eq!(
+                shown.current,
+                Some(CurrentCaptionSource::Book {
+                    signature: created.signature,
+                    cover_ref: created.cover_ref
+                })
+            );
+            assert!(app.set_folder_thumb_pin(&folder, source("b.png")));
+            assert!(!app.caption_display.contains_for_test(&key));
+            let env = app.book_cover_env();
+            app.caption_display
+                .request_book(&ctx, &key, &path, false, hint, env)
+                .unwrap();
+            receive_worker(&mut app.caption_display);
+            let shown = app.caption_display.get(&key).unwrap();
+            assert!(shown.is_stale());
+            assert!(
+                matches!(&shown.current, Some(CurrentCaptionSource::Book { cover_ref, signature })
+                if cover_ref == "b.png" && *signature == file_signature_for_test(&folder.join("b.png")))
+            );
+        }
+    }
+
+    fn file_signature_for_test(path: &Path) -> FileSignature {
+        FileSignature::from_metadata(&std::fs::metadata(path).unwrap()).unwrap()
+    }
+
+    #[test]
     fn caption_book_display_invalidation_discards_pending_old_cover_result() {
         let (mut cache, requests, results) = fake_cache();
         let ctx = egui::Context::default();

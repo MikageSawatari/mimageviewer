@@ -132,10 +132,22 @@ pub(crate) fn resolve_book_cover(
     kind: BookKind,
     env: &BookCoverEnv,
 ) -> BookCover {
+    // The UI supplies an I/O-free kind hint. An accepted recipe can classify
+    // a real directory named album.pdf/album.zip as a document/archive.
+    // Establish the actual owner here, before choosing its signature policy.
+    let metadata = match std::fs::metadata(book_path) {
+        Ok(metadata) => metadata,
+        Err(_) => return BookCover::Unreadable(BookCoverFailure::Missing),
+    };
+    let kind = if metadata.is_dir() {
+        BookKind::Folder
+    } else {
+        kind
+    };
     let original_signature = if kind != BookKind::Folder {
-        match file_signature(book_path) {
-            Ok(signature) => Some(signature),
-            Err(error) => return BookCover::Unreadable(error),
+        match FileSignature::from_metadata(&metadata) {
+            Some(signature) => Some(signature),
+            None => return BookCover::Unreadable(BookCoverFailure::ReadFailed),
         }
     } else {
         None
@@ -149,7 +161,7 @@ pub(crate) fn resolve_book_cover(
         video_db,
         visited: HashSet::new(),
     };
-    match resolver.resolve(book_path, kind, 0, None) {
+    match resolver.resolve(book_path, kind, None) {
         Ok(mut cover) => {
             // File books are signed by the original file, never the converted ZIP.
             if kind != BookKind::Folder {
@@ -202,20 +214,20 @@ impl CoverResolver<'_> {
         &mut self,
         path: &Path,
         kind: BookKind,
-        depth: u32,
         selected: Option<&crate::thumb_loader::SelectedChildPin>,
     ) -> Result<ResolvedBookCover, CoverError> {
-        if depth > self.env.folder_thumb_depth
-            || !self
-                .visited
-                .insert(crate::path_key::normalize_keep_drive(path))
+        // Reconstructing a cached child is not another folder-search level.
+        // Each child repeats its own released selection at folder_thumb_depth;
+        // only a repeated owner terminates the cached reconstruction chain.
+        if !self
+            .visited
+            .insert(crate::path_key::normalize_keep_drive(path))
         {
             return Err(BookCoverFailure::ReadFailed.into());
         }
         let metadata = std::fs::metadata(path).map_err(|_| BookCoverFailure::Missing)?;
-        // A cached pin owner is a physical folder or book. Folder names may
-        // contain book extensions; classify that owner from worker metadata.
-        let kind = if depth > 0 && metadata.is_dir() {
+        // Classify every owner, including the top level, on the worker.
+        let kind = if metadata.is_dir() {
             BookKind::Folder
         } else {
             kind
@@ -391,12 +403,7 @@ impl CoverResolver<'_> {
                     .pin
                     .as_ref()
                     .map_or(selected.container.as_path(), |pin| pin.container.as_path());
-                return self.resolve(
-                    child,
-                    BookKind::for_path(child),
-                    depth + 1,
-                    selected.pin.as_ref(),
-                );
+                return self.resolve(child, BookKind::for_path(child), selected.pin.as_ref());
             }
             let physical_path = match &resolved.location {
                 ReadLocation::File(path) => path,
@@ -1063,6 +1070,63 @@ mod tests {
     }
 
     #[test]
+    fn book_cover_depth_one_cached_child_keeps_cascaded_third_pdf_page() {
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("A");
+        let child = root.join("B");
+        let owner = child.join("C");
+        std::fs::create_dir_all(&owner).unwrap();
+        let pdf = owner.join("book.pdf");
+        std::fs::write(&pdf, b"native boundary fixture").unwrap();
+        let mut env = pin_env(&tmp);
+        env.folder_thumb_depth = 1;
+        let db = env.pin_db.as_ref().unwrap();
+        db.set(
+            &owner,
+            &FolderPinSource::PdfPage {
+                pdf_rel: "book.pdf".into(),
+                page: 2,
+            },
+        )
+        .unwrap();
+        let source = FolderPinSource::File {
+            rel: "C".into(),
+            kind: FileKind::Folder,
+        };
+        db.set(&child, &source).unwrap();
+        let target = resolve_pin_target_cascaded(&child, &source, Some(db), 1).unwrap();
+        assert_eq!(target.pdf_page, Some(2));
+        let base = crate::thumb_loader::folder_thumb_cache_key_for_path(
+            &child,
+            false,
+            env.folder_thumb_sort,
+            1,
+            crate::catalog::FolderThumbProvenance::Seeded,
+        )
+        .unwrap();
+        let key = crate::thumb_loader::pinned_folder_row_key(&base, &target.source_id, None);
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &root).unwrap();
+        catalog
+            .save_thumb_bytes(&key, target.mtime, target.file_size, Some((8, 8)), &webp())
+            .unwrap();
+        with_pdf(
+            PdfFixture {
+                path: pdf.clone(),
+                password: None,
+                pages: 3,
+                source: None,
+            },
+            || {
+                let cover = readable(resolve_book_cover(&root, BookKind::Folder, &env));
+                assert_eq!(cover.cover_ref, "B/C/book.pdf#page=2");
+                assert_eq!(cover.signature_path, pdf);
+            },
+        );
+    }
+
+    #[test]
     fn book_cover_automatic_fallback_cached_row_restarts_its_child_book_and_keeps_nested_pdf_pin() {
         use crate::catalog::FolderThumbProvenance as P;
         let _data = crate::data_dir::TestDataDirGuard::new();
@@ -1088,6 +1152,7 @@ mod tests {
         outer.write_all(&inner).unwrap();
         outer.finish().unwrap();
         let mut env = pin_env(&tmp);
+        env.folder_thumb_depth = 1;
         env.visibility.excluded_extensions.insert("zip".into());
         let pdf_source = FolderPinSource::PdfPage {
             pdf_rel: "book.pdf".into(),
@@ -1100,16 +1165,26 @@ mod tests {
         let db = env.pin_db.as_ref().unwrap();
         db.set(&grandchild, &pdf_source).unwrap();
         db.set(&child, &hidden_source).unwrap();
-        let pdf_target =
-            resolve_pin_target_cascaded(&grandchild, &pdf_source, Some(db), 3).unwrap();
-        let hidden_target =
-            resolve_pin_target_cascaded(&child, &hidden_source, Some(db), 3).unwrap();
+        let pdf_target = resolve_pin_target_cascaded(
+            &grandchild,
+            &pdf_source,
+            Some(db),
+            env.folder_thumb_depth as usize,
+        )
+        .unwrap();
+        let hidden_target = resolve_pin_target_cascaded(
+            &child,
+            &hidden_source,
+            Some(db),
+            env.folder_thumb_depth as usize,
+        )
+        .unwrap();
         let cache_dir = crate::catalog::default_cache_dir();
         let grandchild_base = crate::thumb_loader::folder_thumb_cache_key_for_path(
             &grandchild,
             false,
             env.folder_thumb_sort,
-            3,
+            env.folder_thumb_depth,
             P::Seeded,
         )
         .unwrap();
@@ -1135,7 +1210,7 @@ mod tests {
         let automatic = LoadRequest {
             path: child.clone(),
             folder_thumb_sort: Some(env.folder_thumb_sort),
-            folder_thumb_depth: 3,
+            folder_thumb_depth: env.folder_thumb_depth,
             folder_thumb_provenance: Some(P::AutoSelected),
             file_type_visibility: env.visibility.clone(),
             cache_key_override: Some(
@@ -1143,7 +1218,7 @@ mod tests {
                     &child,
                     false,
                     env.folder_thumb_sort,
-                    3,
+                    env.folder_thumb_depth,
                     P::AutoSelected,
                 )
                 .unwrap(),
@@ -1159,7 +1234,7 @@ mod tests {
             &child,
             false,
             env.folder_thumb_sort,
-            3,
+            env.folder_thumb_depth,
             P::Seeded,
         )
         .unwrap();
@@ -1212,6 +1287,25 @@ mod tests {
                 let cover = readable(resolve_book_cover(&root, BookKind::Folder, &env));
                 assert_eq!(cover.cover_ref, "B.pdf/C/book.pdf#page=2");
                 assert_eq!(cover.signature_path, pdf);
+                // Reconstruct two cached owners at depth 1, then exercise a
+                // cached back-edge in the same traversal (A -> B -> C -> A).
+                let mut resolver = CoverResolver {
+                    env: &env,
+                    video_db: None,
+                    visited: HashSet::new(),
+                };
+                assert!(resolver.resolve(&root, BookKind::Folder, None).is_ok());
+                for owner in [&root, &child, &grandchild] {
+                    assert!(
+                        resolver
+                            .visited
+                            .contains(&crate::path_key::normalize_keep_drive(owner))
+                    );
+                }
+                assert!(matches!(
+                    resolver.resolve(&root, BookKind::Folder, None),
+                    Err(CoverError::Failure(BookCoverFailure::ReadFailed))
+                ));
             },
         );
         let after = parent_catalog.load_one(&child_key).unwrap().unwrap();
@@ -1227,7 +1321,7 @@ mod tests {
     }
 
     #[test]
-    fn book_cover_pin_cycles_stop_with_the_released_folder_depth_bound() {
+    fn book_cover_pin_cycles_and_cached_chain_revisits_stop() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("A");
         std::fs::create_dir_all(root.join("B")).unwrap();
@@ -1255,16 +1349,23 @@ mod tests {
             visited: HashSet::from([crate::path_key::normalize_keep_drive(&root)]),
         };
         assert!(matches!(
-            resolver.resolve(&root, BookKind::Folder, 0, None),
+            resolver.resolve(&root, BookKind::Folder, None),
             Err(CoverError::Failure(BookCoverFailure::ReadFailed))
         ));
+        // A -> B -> A is rejected before stat or selection, even when a
+        // corrupt cached back-edge names an owner that no longer exists.
         let mut resolver = CoverResolver {
             env: &env,
             video_db: None,
-            visited: HashSet::new(),
+            visited: HashSet::from([
+                crate::path_key::normalize_keep_drive(&root),
+                crate::path_key::normalize_keep_drive(&root.join("B")),
+            ]),
         };
+        std::fs::remove_dir(root.join("B")).unwrap();
+        std::fs::remove_dir(&root).unwrap();
         assert!(matches!(
-            resolver.resolve(&root, BookKind::Folder, env.folder_thumb_depth + 1, None),
+            resolver.resolve(&root, BookKind::Folder, None),
             Err(CoverError::Failure(BookCoverFailure::ReadFailed))
         ));
     }
