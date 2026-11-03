@@ -10,7 +10,11 @@
   [release-checklist.md](release-checklist.md) Phase 5 を参照。ここでは重複させない。
 - このメモに個人情報・認証情報・証明書拇印・注文番号などは載せない
   (証明書 subject / 拇印は `scripts/sign-files.ps1` と環境変数に閉じる)。
-- EffeTune 説明ページの公開前は `python scripts/gen-effetune-docs.py --check` を通す（旧版残存と301の同期を検査。[版更新手順](effetune-integration-plan.md#105-説明ページの版を上げる手順-2026-10-12)）。
+- mIV Sound 説明ページの公開前は `python scripts/gen-effetune-docs.py --check` を通す。
+  [派生版計画 §10](effetune-fork-plan.md#10-マニュアル製品ページ公開文書) が正本で、
+  [版更新手順](effetune-integration-plan.md#105-説明ページの版を上げる手順-2026-10-12) に従い、
+  `manual/sound/`・旧生成物の削除・旧URLからの301・sitemapを同時公開する。
+  名称と通知は派生版計画 §2、保存と一度だけのコピー移行は §4〜5、ポータブル取り込みは §6 と F3 実装記録を参照する。
 
 ---
 

@@ -2,7 +2,7 @@
   {
     "operation": "replace_inline",
     "anchor": "**音源を取り込んで読み込む**: **SFZ Library…** を押し、**フォルダーを取り込む…** で `.sfz` 定義ファイルとサンプルファイルを含むフォルダー（または `.bank.xml`、`Programs`、`Samples` がそろった ARIA バンクのフォルダー）を追加して、音源の横にある **読み込む** を押します。デスクトップ版では元のファイルをその場で読み込みます。Web 版では音源を端末内に保存するため、**ファイルを取り込む…** では音源が必要とするサンプルなどのファイルもすべて含めてください。使用中の音源は削除できません。",
-    "replacement": "**音源を取り込んで読み込む**: **SFZ Library…** を押し、**フォルダーを取り込む…** で `.sfz` 定義とサンプルを含むフォルダー、または ARIA バンクを登録して **読み込む** を押します。**ファイルを取り込む…** では SFZ ファイルを選んで登録できます。音源の名前と保存場所は EffeTune の設定フォルダ（%APPDATA%\\Frieve\\EffeTunePlugin）の sfz-references.json に記録します。サンプルは元のフォルダから読み取り、コピーしません。元の音源フォルダを保管してください。一覧の削除は登録を外すだけで、元のファイルは削除しません。使用中の音源は削除できません。",
+    "replacement": "**音源を取り込んで読み込む**: **SFZ Library…** を押し、**フォルダーを取り込む…** で `.sfz` 定義とサンプルを含むフォルダー、または ARIA バンクを登録して **読み込む** を押します。**ファイルを取り込む…** では SFZ ファイルを選んで登録できます。音源の名前と保存場所は mImageViewer のデータフォルダ内の `effetune/plugin/sfz-references.json` に記録します。サンプルは元のフォルダから読み取り、コピーしません。元の音源フォルダを保管してください。一覧の削除は登録を外すだけで、元のファイルは削除しません。使用中の音源は削除できません。",
     "reason": "v0.15.0 NativeSfzLibraryService uses native file/folder references, sfz-references.json and direct reads; removal edits references only."
   },
   {

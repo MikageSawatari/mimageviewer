@@ -9,7 +9,7 @@
   {
     "operation": "insert_note",
     "heading_id": "crosstalk-cancellation",
-    "note": "以下のマイク測定はデスクトップ版 EffeTune で行います。mImageViewer の EffeTune 画面には測定機能がありません。測定JSONの取り込みは Room EQ の Import ボタンで行い、保存した測定をここで選択します。",
+    "note": "以下のマイク測定は上流のデスクトップ版で行います。mImageViewer の EffeTune 画面には測定機能がありません。測定JSONの取り込みは Room EQ の **測定をインポート…** ボタンで行い、保存した測定をここで選択します。",
     "reason": "Measurement UI hidden; shared measurement-store IndexedDB and Room EQ importer."
   }
 ]

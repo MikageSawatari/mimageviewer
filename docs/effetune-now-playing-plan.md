@@ -35,6 +35,12 @@ v4.5.0公開済みのmaster `840c309ec` を `ba5367125` で本branchへmerge済�
 
 ## 1. バンドル更新を完了させる手順
 
+この節は無改変 Mixwright v0.13.0 更新時の履歴。現在の同梱版は mIV Sound で、
+名称・クレジット・保存先・一度だけのコピー移行・プリセット共有の変更は [派生版計画 §2・§4・§5・§11](effetune-fork-plan.md) が正本。
+候補からのビルド・検証・承認は [mIV Sound のビルド](miv-sound-build.md)、公開説明書は同計画 §10 と
+[生成器の説明](effetune-docs-overrides/README.md) に従う。上流 ZIP を現行の vendor 原本へ直接上書きしない。
+歌詞と再生位置の追加は [歌詞連携計画](effetune-lyrics-trial-plan.md) を参照する。以下の過去の文字・画像だけの契約と検証結果は保持する。
+
 ### 1.1 原本、配置、承認manifest
 
 1. ClaudeCode が利用者の許可を得て取得した

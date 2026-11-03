@@ -306,7 +306,10 @@ release link 時に未解決になることがあるため、配布ビルドは�
 無ければ復旧手順付きで止まる。音響調整も `vendor/miv-sound/VERSION` と
 `mIV Sound.vst3/` を必須検証する（固定値は `config/miv-sound.rs`）。`MIMV_EFFETUNE_DIR` で staging root を指定できる。
 承認済み入力は `third_party/miv-sound/<ver>/manifest.sha256` の全エントリと照合する。
+mIV Sound の正本は [派生版計画](effetune-fork-plan.md)（名前・クレジット §2、保存先・初回コピー §4〜5、配布 §7、説明書 §10）。
 候補のビルド・検証・明示承認は [mIV Sound のビルド](miv-sound-build.md) を参照。
+公開説明書は `VERSION` の派生版 URL と `DOCS_VERSION` の上流 snapshot を区別し、
+生成器・訂正ルールのテストと `--check` を通す。旧 EffeTune URL の301と sitemap を一緒に公開する。
 `build-miv-sound.ps1 -Approve -Candidate <ID>` だけが通知・manifest・provenanceと vendor 原本を更新し、
 `C:\home\mimageviewer_vendor_backup\miv-sound-<ver>\` に承認物そのものを保存する。
 未コミット差分・submodule のずれはビルド前に拒否し、承認前に同じ候補の ctest 成功記録を要求する。

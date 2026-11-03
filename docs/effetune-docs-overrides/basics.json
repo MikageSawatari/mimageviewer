@@ -9,7 +9,7 @@
   {
     "operation": "insert_note",
     "heading_id": "bass-management",
-    "note": "mImageViewer では出力チャンネルを追加できません。以下のサブウーファー用の追加出力やサラウンドの例は、デスクトップ版 EffeTune 向けの説明です。",
+    "note": "mImageViewer では出力チャンネルを追加できません。以下のサブウーファー用の追加出力やサラウンドの例は、上流のデスクトップ版向けの説明です。",
     "reason": "Stereo-only mIV pipe; preserve effect reference while identifying unsupported examples."
   },
   {
@@ -44,5 +44,11 @@
     "heading_id": "スペクトラムオーバーレイ",
     "before_heading_id": "プラグイン一覧",
     "reason": "Preserve shared spectrum instructions at category level before splitting plugin sections, including the existing heading id."
+  },
+  {
+    "operation": "insert_note",
+    "heading_id": "volume",
+    "note": "新しく追加する **Volume** の音量は **0 dB** です。保存済みプリセットの音量はそのまま復元します。",
+    "reason": "mIV Sound initializes new Volume effects at unity gain; saved state is retained."
   }
 ]

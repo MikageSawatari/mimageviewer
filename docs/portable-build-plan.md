@@ -49,6 +49,7 @@ build は出力先や配布フォルダのエディタを停止せず、保存�
 v5 の F4 では、署名済み VST3 host とプラグイン DLL を署名した mIV Sound bundle を同梱する。
 音響調整とユーザー VST を通常版と同じ画面から利用できる。
 [派生版への切替計画](effetune-fork-plan.md) §6・§17 が仕様と実装記録の正本。
+mIV Sound の名前・保存 (§2・§4〜5)・公開文書 (§10) も同計画が正本。公開文書のポータブル版の記述は F3 と F4 の統合で揃える (§17.3)。
 ランチャーが存在する主な理由は **FFmpeg がロード時リンク**で、
 Rust コードが走る前に Windows ローダが DLL を解決する必要があるため
 ([build.rs:9-26](../build.rs)、[src/video/ffmpeg_loader.rs](../src/video/ffmpeg_loader.rs))。

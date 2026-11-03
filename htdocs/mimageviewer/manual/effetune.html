@@ -3,22 +3,22 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>音響調整 (EffeTune) — mImageViewer マニュアル</title>
+  <title>音響調整 — mImageViewer マニュアル</title>
   <!-- meta:begin (generated) -->
-  <meta name="description" content="EffeTune の紹介と、mImageViewer での開き方、音響調整の適用範囲、設定の保存先、リモート配信の注意点。">
+  <meta name="description" content="mIV Sound の紹介と、mImageViewer での開き方、音響調整の適用範囲、設定の保存先、リモート配信の注意点。">
   <link rel="canonical" href="https://mikage.to/mimageviewer/manual/effetune.html">
   <meta property="og:type" content="article">
   <meta property="og:site_name" content="mImageViewer">
   <meta property="og:locale" content="ja_JP">
   <meta property="og:url" content="https://mikage.to/mimageviewer/manual/effetune.html">
-  <meta property="og:title" content="音響調整 (EffeTune)｜mImageViewer">
-  <meta property="og:description" content="EffeTune の紹介と、mImageViewer での開き方、音響調整の適用範囲、設定の保存先、リモート配信の注意点。">
+  <meta property="og:title" content="音響調整｜mImageViewer">
+  <meta property="og:description" content="mIV Sound の紹介と、mImageViewer での開き方、音響調整の適用範囲、設定の保存先、リモート配信の注意点。">
   <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="音響調整 (EffeTune)｜mImageViewer">
-  <meta name="twitter:description" content="EffeTune の紹介と、mImageViewer での開き方、音響調整の適用範囲、設定の保存先、リモート配信の注意点。">
+  <meta name="twitter:title" content="音響調整｜mImageViewer">
+  <meta name="twitter:description" content="mIV Sound の紹介と、mImageViewer での開き方、音響調整の適用範囲、設定の保存先、リモート配信の注意点。">
   <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
   <!-- meta:end -->
   <link rel="stylesheet" href="style.css">
@@ -32,7 +32,7 @@
     <span class="sep">›</span>
     <a href="index.html">マニュアル</a>
     <span class="sep">›</span>
-    <span>音響調整 (EffeTune)</span>
+    <span>音響調整</span>
   </nav>
 </header>
 
@@ -50,8 +50,8 @@
         <a href="video.html">動画再生</a>
         <a href="music.html">音楽再生</a>
         <a href="music-video.html">音楽ビデオの作成</a>
-        <a href="effetune.html" class="active">音響調整 (EffeTune)</a>
-        <a href="effetune/index.html" class="sub">エフェクトの説明書</a>
+        <a href="effetune.html" class="active">音響調整</a>
+        <a href="sound/index.html" class="sub">エフェクトの説明書</a>
         <a href="adjustment.html">画像補正</a>
         <a href="local-adjustment.html">補正レイヤー</a>
         <a href="analysis.html">画像分析モード</a>
@@ -81,24 +81,33 @@
   </aside>
 
   <main class="content">
-    <h1 class="page-title">音響調整 (EffeTune)</h1>
-    <p class="page-desc">EffeTune は、Frieve-A 氏が開発する音響調整ツールです。MIT License で公開されています。
-    イコライザーやエフェクトで音を整え、ビジュアライザーで音の様子を見ることができます。</p>
+    <h1 class="page-title">音響調整</h1>
+    <p class="page-desc">音響調整には mIV Sound を使用します。イコライザーやエフェクトで音を整え、
+    Visualizer で音の様子や再生中の曲情報・歌詞を見ることができます。</p>
 
-    <h2 id="about">EffeTune について</h2>
+    <h2 id="about">mIV Sound について</h2>
+    <p>mIV Sound は、Frieve 氏の EffeTune / EffeTune Mixwright（MIT License）を元にした、mImageViewer 専用の派生版です。
+    mIV Sound についてのお問い合わせは mImageViewer 側へお寄せください。</p>
     <ul>
-      <li><a href="https://effetune.frieve.com/">EffeTune 公式サイト</a></li>
+      <li><a href="https://effetune.frieve.com/">原作 EffeTune の公式サイト</a></li>
       <li><a href="https://github.com/Frieve-A/effetune">EffeTune の GitHub</a></li>
-      <li><a href="https://github.com/Frieve-A/effetune-mixwright">EffeTune Mixwright の GitHub</a>（mImageViewer が使用する EffeTune）</li>
-      <li><a href="https://www.youtube.com/@frieveamusic">作者による使い方の動画があります</a></li>
+      <li><a href="https://github.com/Frieve-A/effetune-mixwright">EffeTune Mixwright の GitHub</a></li>
+      <li><a href="https://www.youtube.com/@frieveamusic">作者による使い方の動画</a></li>
     </ul>
-    <p>チェーン作成、プリセット、A/B 比較などは、<a href="effetune/v0.15.0/README.html">基本操作</a>をご覧ください。</p>
-    <p>エフェクトごとの説明は、<a href="effetune/v0.15.0/index.html">同梱 EffeTune の説明書</a>をご覧ください。
+    <p>チェーン作成、プリセット、A/B 比較などは、<a href="sound/v0.15.0-miv.2/README.html">基本操作</a>をご覧ください。
+    新しく追加する Volume の音量は 0 dB です。</p>
+    <p>エフェクトごとの説明は、<a href="sound/index.html">mIV Sound の説明書</a>をご覧ください。
     以下では、mImageViewer から使うときの操作と注意点を説明します。</p>
 
+    <h2 id="startup-view">初めて開いたときの表示</h2>
+    <p>初めて開いたときは、Visualizer の <strong>mIV Original</strong> を表示します。
+    エフェクトを編集するときは <strong>Effect Pipeline</strong> へ切り替えます。
+    mIV Sound の <strong>設定 → 環境設定... → 起動</strong> にある <strong>起動時の表示</strong> は、
+    <strong>前回の表示 (デフォルト)</strong> が初期設定です。次回は前回の表示を引き継ぎます。</p>
+
     <h2 id="now-playing">曲名と代表画像を表示する</h2>
-    <p>音響調整を使用中は、再生中の曲名・アルバム名・アーティスト名と代表画像を EffeTune へ自動で渡します。
-    EffeTune の <strong>Visualizer</strong> で Artwork、Title、Album、Artist を配置すると表示できます。
+    <p>音響調整を使用中は、再生中の曲名・アルバム名・アーティスト名と代表画像を mIV Sound へ自動で渡します。
+    mIV Sound の <strong>Visualizer</strong> で Artwork、Title、Album、Artist を配置すると表示できます。
     曲名が無いときは拡張子を除いたファイル名を使い、アルバム名とアーティスト名は情報が無ければ空欄です。
     絶対パスや URL は渡しません。このためだけに音響調整を起動することはありません。</p>
     <p>画像は長辺1024ピクセルまでにし、縦横比を保って中央に置き、透明な余白で正方形にします。正方形の画像には余白を足しません。
@@ -108,45 +117,52 @@
     リモートは最後の曲が終わっても情報を残し、次曲への切替やセッション終了で消します。切替中や開始失敗時は空表示になることがあります。</p>
     <p>画像を読み込めないときは画像無しで送ります。送信失敗やプラグインの拒否では、前の表示が残る場合があります。
     通常の受け渡し失敗では音響調整を続け、次の情報変更や初期化時に送り直します。
-    プラグインが5秒以上応答しないときは EffeTune の専用ホストを終了して知らせ、音は音響調整を通さず再生します。
+    プラグインが5秒以上応答しないときは mIV Sound の専用ホストを終了して知らせ、音は音響調整を通さず再生します。
     ほかの VST プラグインは停止しません。自動で再起動はしません。</p>
+
+    <h2 id="lyrics">再生に合わせて歌詞を表示する</h2>
+    <p>Visualizer の <strong>Lyrics</strong> で、同じフォルダーにある曲と同名の <code>.lrc</code> ファイルや、
+    曲ファイルに埋め込まれた歌詞を表示できます。時刻付きの LRC、時刻付きの埋め込み歌詞、時刻なしの LRC、
+    時刻なしの埋め込み歌詞の順で選びます。一時停止・シーク・速度変更に表示が追従します。
+    歌詞の行をクリックして再生位置を変える操作はできません。リモート配信中は歌詞を表示しません。
+    表示が音とずれる場合は Lyrics の<strong>オフセット</strong>で調整します。正の値で歌詞が遅れて表示されます。</p>
 
     <h2 id="requirements">利用に必要な環境</h2>
     <p>音響調整には、<strong>AVX2 と FMA の両方に対応した CPU</strong>が必要です。
-    EffeTune の画面表示には <strong>Microsoft Edge WebView2 Runtime</strong> が必要です。Windows 11 には標準で含まれています。</p>
+    mIV Sound の画面表示には <strong>Microsoft Edge WebView2 Runtime</strong> が必要です。Windows 11 には標準で含まれています。</p>
 
     <h2 id="open">mImageViewer で開く</h2>
     <p>メイン画面のツールバーにある<strong>音響調整ボタン</strong>から開きます。
-    押すと EffeTune の窓を表示して前面に出します。表示中にもう一度押しても窓は隠れません。
+    押すと mIV Sound の窓を表示して前面に出します。表示中にもう一度押しても窓は隠れません。
     窓を閉じるときは、タイトルバーの × やタスクバーのメニューを使います。
-    窓を閉じても音響調整は続きます。初期設定では、メイン画面を最小化すると EffeTune の窓も一緒に隠れ、メイン画面を戻すと再び表示されます。</p>
+    窓を閉じても音響調整は続きます。初期設定では、メイン画面を最小化すると mIV Sound の窓も一緒に隠れ、メイン画面を戻すと再び表示されます。</p>
 
     <p id="taskbar-window">音響調整の窓は、初期設定では Windows のタスクバーに表示されます。
-    mImageViewer のアイコンの右下に音符が付いた項目を選び、最小化・復元できます。窓のタイトルは「EffeTune」です。
+    mImageViewer のアイコンの右下に音符が付いた項目を選び、最小化・復元できます。窓のタイトルは「mIV Sound」です。
     音響調整ボタンからも、最小化した窓を復元できます。窓のタイトルバーやタスクバーのメニューから閉じても、音響調整の処理は続きます。</p>
-    <p>環境設定 → 動画・音声 → 動画の「音響調整 (EffeTune)」にある
+    <p>環境設定 → 動画・音声 → 動画の「音響調整 (mIV Sound)」にある
     <strong>「音響調整の窓をタスクバーに表示する」</strong>を OFF にすると、タスクバーには表示されません（初期値は ON）。
     OK を押すと、開いている窓にも反映します。閉じている窓は開きません。タイトルバーの大きさは ON/OFF で変わりません。
     OFF のときに最小化すると窓が隠れ、音響調整ボタンで再び表示できます。最小化中に OFF へ変更したときも窓は隠れます。音響調整の処理は続きます。
     メイン画面の最小化中の表示は、次の設定に従います。リモート閲覧で操作している間は、タスクバー表示の設定にかかわらず隠れます。
     タスクバー上のグループ分けやメニューの表示名は Windows が決めます。</p>
-    <p id="minimized-window">ビジュアライザーなどを最小化中も見たいときは、環境設定 → 動画・音声 → 動画の「音響調整 (EffeTune)」で
+    <p id="minimized-window">ビジュアライザーなどを最小化中も見たいときは、環境設定 → 動画・音声 → 動画の「音響調整 (mIV Sound)」で
     <strong>「メインウィンドウを最小化しても音響調整の窓を表示したままにする」</strong>を ON にします（初期値は OFF）。
     OK を押すと反映し、最小化中に変更しても表示が切り替わります。自分で閉じた窓は開きません。
     まだ一度も表示していない窓も、この設定だけでは開きません。
     リモート閲覧で操作している間は、この設定にかかわらず隠れます。
     タスクトレイへの格納だけでは、どちらの設定でも音響調整の窓は隠れません。最小化した状態で格納した場合は、この設定に従います。</p>
     <p>一度設定すると、次からは mImageViewer の起動時に音響調整が自動で有効になります。窓を開かなくても、設定した調整が効いた音で再生されます。</p>
-    <p>音の加工を止めるときは、EffeTune 画面内の<strong>全体バイパス</strong>を使います。
+    <p>音の加工を止めるときは、mIV Sound 画面内の<strong>全体バイパス</strong>を使います。
     音響調整ボタンの点灯は、音響調整が有効なことを示します。窓を閉じても音響調整が有効なら点灯したままです。
     ボタンにポインターを重ねると、窓の開き方と音響調整が効いているかどうかが表示されます。
     保存済みの設定がない場合は、初めて開いた窓を閉じるまで設定は未確認となり、ボタンは点灯しません。
-    この表示は EffeTune の窓を閉じたときの設定で判定するため、窓を開いたまま変えた内容は、窓を閉じるまで表示に反映されません。</p>
+    この表示は mIV Sound の窓を閉じたときの設定で判定するため、窓を開いたまま変えた内容は、窓を閉じるまで表示に反映されません。</p>
     <p>音響調整ボタンが使えない場合は、ボタンにポインターを重ねると理由が表示されます。
     <strong>ポータブル版では音響調整を利用できません。</strong></p>
 
     <h2 id="auto-open">動画の再生時に自動で開く</h2>
-    <p>環境設定 → 動画・音声 → 動画の「音響調整 (EffeTune)」で
+    <p>環境設定 → 動画・音声 → 動画の「音響調整 (mIV Sound)」で
     <strong>「起動後の最初の動画再生で音響調整の窓を自動で開く」</strong>を ON にします（初期値は OFF）。
     OK を押すと反映し、この起動中で最初に条件を満たした動画の再生開始時に、一度だけ窓を開きます。
     キー操作中の画面を切り替えずに表示します。通常の別窓での動画再生も対象です。音声ファイルや動画を音声として再生するモードは対象外です。</p>
@@ -168,31 +184,38 @@
     <p>音響調整へ渡す前に、0dB を超える音のピークを抑えます。音量を全体的に下げるものではありません。
     動画や音楽では、音を加工していなくても元の音が 0dB を超えることがあります。
     この保護により、音の可視化だけで Level Meter に OVERLOAD が表示されるのを防ぎます。
-    EffeTune 内の調整で音量を上げた場合は、OVERLOAD が表示されることがあります。</p>
-    <p>環境設定 → 動画・音声 → 動画の<strong>「EffeTune に渡す前に 0dB を超える音を抑える」</strong>で切り替えます（初期値は ON）。
-    EffeTune 内で音量を管理したい場合は OFF にすると、元の音をそのまま渡します。
+    mIV Sound 内の調整で音量を上げた場合は、OVERLOAD が表示されることがあります。</p>
+    <p>環境設定 → 動画・音声 → 動画の<strong>「mIV Sound に渡す前に 0dB を超える音を抑える」</strong>で切り替えます（初期値は ON）。
+    mIV Sound 内で音量を管理したい場合は OFF にすると、元の音をそのまま渡します。
     ユーザーの VST3 プラグインを使っている場合は、その調整後の音に適用します。
     出力側の過大な音を抑える保護は、どちらの場合も有効です。音響調整を使わないときも常に働きます。</p>
     <p>OK を押すと、再生中の動画・音楽にも反映します。画面を開き直す必要はありません。
     リモート配信にも適用しますが、すでに先読みした音声の後から反映するため、聴こえる変化には遅れがあります。</p>
 
     <h2 id="storage">設定の保存先とプリセット</h2>
-    <p>次に起動したときに同じ調整で始めるための状態は、mImageViewer のデータフォルダーに保存します。</p>
-    <p>EffeTune 自身が保存するプリセットや設定は、mImageViewer のデータフォルダーとは別に、
-    <code>%APPDATA%\effetune\</code> または <code>%APPDATA%\Frieve\EffeTunePlugin\</code> に保存されます。
-    取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像などは
-    <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> に置かれます。
-    <strong>mImageViewer のデータフォルダーを変更しても、これらの保存先は変わりません。</strong></p>
-    <p>エフェクトの組み合わせを保存するプリセットは、デスクトップ版 EffeTune と共有されます。
-    mImageViewer のデータフォルダーだけを持ち運んでも、EffeTune 自身の保存データは含まれません。</p>
+    <p>調整状態、プリセット、設定、取り込んだ IR・測定データ、Visualizer のレイアウトや背景画像は、
+    mImageViewer のデータフォルダー内の <code>effetune</code> に保存します。
+    通常のデータフォルダーは <code>%APPDATA%\mimageviewer</code> です。
+    <code>--data-dir</code> で別のデータフォルダーを指定した場合も、その中に保存します。
+    SFZ 音源は元のファイルを参照するため、データフォルダーとは別に保管してください。</p>
+    <p>初回起動時に、従来の共通保存先にあるプリセット・設定と画面用データを一度だけコピーします。元のデータは削除しません。
+    <code>--data-dir</code> で別のフォルダーを使う場合は、そのフォルダーに音響調整の保存済み状態があるときに引き継ぎます。
+    ほかのアプリがコピー元を使用中の場合は、関連するアプリを終了して mImageViewer を起動し直してください。</p>
+    <p>コピー元は <code>%APPDATA%\Frieve\EffeTunePlugin\</code>、<code>%APPDATA%\effetune\</code>、
+    <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> です。mIV Sound はこれらを引き継ぎのために読み取り、日常の保存には使いません。
+    追加したユーザー VST や、ほかの EffeTune 製品がこれらを使うことはあります。</p>
+    <p>DAW の EffeTune Mixwright やデスクトップ版 EffeTune とは、プリセット・設定を自動で共有しません。
+    保存済みのプリセットを行き来させるには、<strong>設定 → バックアップ / 復元</strong>で書き出し・読み込みを行います。
+    <code>.effetune_preset</code> ファイルの読み込みにも対応します。現在のチェーンをファイルに残したい場合は、
+    名前付きのパイプラインプリセットとして保存してからバックアップしてください。</p>
 
     <h2 id="remote">リモート配信で使う</h2>
     <p><a href="remote.html">リモート閲覧</a>で配信する動画・音声にも、設定した音響調整が効いた音が届きます。</p>
-    <p>リモート閲覧で操作している間は、PC 側の EffeTune の窓を閉じ、リモート閲覧を終えると元に戻します。
+    <p>リモート閲覧で操作している間は、PC 側の mIV Sound の窓を閉じ、リモート閲覧を終えると元に戻します。
     <strong>調整を変えたいときは、リモート閲覧を始める前か、終えた後に行ってください。</strong></p>
 
-    <h2 id="external-sites">EffeTune から外部サイトを開く操作</h2>
-    <p>EffeTune のヘルプや GitHub のボタンは、既定のブラウザでそのページを開きます。
+    <h2 id="external-sites">mIV Sound から外部サイトを開く操作</h2>
+    <p>mIV Sound のヘルプはこのマニュアルを、原作のクレジットは EffeTune Mixwright の GitHub を既定のブラウザで開きます。
     「AI に質問」は、入力した質問とエフェクト名を含むリンクを ChatGPT または Perplexity のページとしてブラウザで開きます。
     どちらもリンクを開くだけで、mImageViewer が質問を送るわけではありません。</p>
     <p>保存先については、<a href="../privacy.html">プライバシーポリシー</a>もご覧ください。</p>

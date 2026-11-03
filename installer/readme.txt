@@ -80,7 +80,7 @@ GPU アクセラレーションによるサムネイルグリッド表示を特�
   OS        : Windows 11
               （64bit 版のみ）
   CPU       : x86-64（Intel / AMD）
-              音響調整 (EffeTune) には AVX2 と FMA の両方に対応した CPU が必要です。
+              音響調整 (mIV Sound) には AVX2 と FMA の両方に対応した CPU が必要です。
   メモリ    : 4 GB 以上（8 GB 以上推奨）
   GPU       : DirectX 12 対応 GPU
               （最新のグラフィックドライバを推奨）
@@ -89,7 +89,7 @@ GPU アクセラレーションによるサムネイルグリッド表示を特�
               追加で約 500 MB の空き容量が必要です。
               キャッシュや利用中の保存データには別途空き容量が必要です。
 
-追加ソフト: EPUB の変換と音響調整 (EffeTune) の画面表示には
+追加ソフト: EPUB の変換と音響調整 (mIV Sound) の画面表示には
           Microsoft Edge WebView2 Runtime が必要です。
           Windows 11 には標準で含まれています。
 
@@ -150,12 +150,13 @@ Windows の「設定」→「アプリ」→「インストールされている
 mImageViewer と関連するアプリを終了してから手動で削除できます。
 
   - %APPDATA%\effetune\ または %APPDATA%\Frieve\EffeTunePlugin\
-    音響調整 (EffeTune) のプリセット・設定です。他の EffeTune 製品と
-    共有するため、自動では削除しません。他の製品でも使わなくなった
-    ことを確認してから削除してください。
+    初回の引き継ぎ元となる、従来のプリセット・設定です。
+    引き継ぎではコピーし、元のデータは残します。mIV Sound の日常の
+    保存先には使いません。他の EffeTune 製品でも使わなくなったことを
+    確認してから削除してください。
   - %APPDATA%\mimageviewer-vst3-host.exe\
-    EffeTune に取り込んだ IR ファイル・測定データ、ビジュアライザーの
-    レイアウト・背景画像です。
+    初回の引き継ぎ元となる、従来の IR・測定データ、Visualizer の
+    レイアウト・背景画像です。追加したユーザー VST が使う場合もあります。
   - %APPDATA%\mimageviewer-remote\
     リモート閲覧用サービスの動作記録等です。
 
@@ -183,13 +184,15 @@ mImageViewer と関連するアプリを終了してから手動で削除でき�
   - epub_cache\      : EPUB から変換した PDF（管理画面で削除予約）
   - runtime\<version>\effetune\<hash12>-<generation>\mIV Sound.vst3\
                      : 音響調整用プラグインと関連ファイル（初回展開）
-  - effetune\        : 次回起動時に復元する音響調整の状態
+  - effetune\        : 音響調整の状態・設定・プリセット・画面用データ
 
-音響調整のプリセット・設定、取り込んだ IR ファイル・測定データ、
-ビジュアライザーのレイアウト・背景画像は、上記とは別のフォルダに
-保存されます。リモート閲覧用サービスも %APPDATA%\mimageviewer-remote\
-を利用します。これらの保存先と削除方法は「5. アンインストール方法」
-を参照してください。
+音響調整の設定・プリセットは effetune\plugin\、取り込んだ IR・測定データ、
+Visualizer のレイアウト・背景画像は effetune\webview\ に保存します。
+DAW の EffeTune Mixwright やデスクトップ版 EffeTune とは自動で共有しません。
+プリセットの受け渡しには「バックアップ / 復元」を使います。
+SFZ 音源のサンプルは元のファイルを参照するため、別途保管してください。
+リモート閲覧用サービスは %APPDATA%\mimageviewer-remote\ を利用します。
+保存先と削除方法は「5. アンインストール方法」を参照してください。
 
 また、お気に入りに登録したフォルダの更新を検知するため、
 内部的に Windows API の ReadDirectoryChangesW による
@@ -237,12 +240,13 @@ https://mikage.to/mimageviewer/privacy.html
     Source and license notes: https://mikage.to/mimageviewer/
   - UnRAR source code (UnRAR license): Alexander Roshal / RARLAB
     RAR 展開に使用します。ライセンス全文は UNRAR-LICENSE.txt を参照してください。
-  - EffeTune Mixwright (MIT): Copyright (c) 2025-2026 Yoshiyuki Kobayashi
+  - mIV Sound (MIT): EffeTune / EffeTune Mixwright (作者 Frieve) を元にした派生版
+    Copyright (c) 2025-2026 Yoshiyuki Kobayashi
     同梱コンポーネント（VST3 SDK、JSZip と内包される lie / immediate /
     setImmediate / pako (zlib)、CHOC、PFFFT、fdlibm、および通知に記載されたその他の
     ライブラリ）には、それぞれのライセンスが適用されます。
     ライセンス全文は、アプリの「ソフトウェア情報」（バージョン情報）の
-    EffeTune THIRD-PARTY-NOTICES / DSP NOTICE / 補足通知で確認できます。
+    mIV Sound THIRD-PARTY-NOTICES / WebView THIRD-PARTY-NOTICES / DSP NOTICE で確認できます。
   - Steinberg VST3 SDK (MIT): Steinberg Media Technologies GmbH
   - Twemoji 絵文字グラフィックス (CC-BY 4.0): Twitter, Inc. and other contributors
     （注釈機能のスタンプに使用）

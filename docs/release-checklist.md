@@ -4,6 +4,11 @@
 
 ## Distribution
 
+mIV Sound の名称・クレジット・保存先・初回移行・公開文書は [派生版計画 §2・§4・§5・§10](effetune-fork-plan.md) が正本。
+公開前に `python scripts/gen-effetune-docs.py --check`、`python scripts/test_gen_effetune_docs.py`、
+`python scripts/check_site_cards.py` と sitemap の再生成・検査を行う。`manual/sound/`、旧生成物の削除と
+`.htaccess` の 301 を同時反映する。F4 取り込み時のポータブル関連照合箇所は同計画の F3 実装記録を参照。
+
 3 つの配布形態がある (v1.1.0 以降):
 
 | 配布形態 | ファイル名 | 中身 / 性質 | data 保存先 | 管理者権限 |

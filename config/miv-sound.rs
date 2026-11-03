@@ -6,5 +6,5 @@ pub const BUNDLE_NAME: &str = "mIV Sound.vst3";
 pub const SOURCE_ROOT: &str = "vendor/miv-sound";
 pub const NOTICES_ROOT: &str = "third_party/miv-sound";
 pub const UPSTREAM_TAG: &str = "v0.15.0";
-// Keep the merged upstream manual snapshot until its mIV Sound rewrite in F3.
+// Upstream documentation version; the generated Sound URL uses VERSION.
 pub const DOCS_VERSION: &str = "v0.15.0";
