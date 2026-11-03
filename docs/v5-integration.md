@@ -687,3 +687,12 @@ git add / commit / merge等のgit書き込みも行わない。
 `final-checks.json` に記録した（差分検査exit 0、marker 0、両tip不変、indexのUU 16件）。
 統合後の全変更172ファイルのSHA-256は `final-source-hashes.json`。
 型検査・関連テスト以降の追加変更は本節とsnapshot方針の文書だけである。
+
+## 12. mIV Sound 0.15.0-miv.3 (候補 c2c45d51…) の承認と F3・F4 (2026-11-03)
+
+- 内容: Visualizer の Counter と Counter Gallery を、mIV が歌詞用に送っている「聞こえている再生位置」の時計で戻した (miv-sound `8059d68`)。0.15.0-miv.2 で Counter を外したことについて、利用者が「部品が消えるのは影響が大きい。本来は mIV が正しい位置を渡すべき」と判断した。mIV 側の変更は不要 (歌詞なし・動画・音声モードでも位置を送っている)。版は 0.15.0-miv.3 (`config/miv-sound.rs`)。
+- 独立レビュー (xhigh): ACCEPT、指摘なし。1 秒ごとの基準更新の間も再生速度で外挿して描くことを 2,904 描画分で確認。
+- ctest: 1 回目は 117 件中 2 件失敗 (`miv_sound_tests` が 5 分で時間切れ、続く `effetune_now_playing_metadata_tests` が他の msedgewebview2 のプロセス 8 つをアクセス拒否で調べられず失敗)。同じ時間帯に利用者の画面に `msedgewebview2.exe` の「unknown software exception (0x80000003)」のダイアログが 7 回ほど出た (観測者: 利用者)。`miv_sound_tests` は単独で 0.84 秒で成功、`-TestCandidate` での 2 回目は 117/117。どのテストで WebView2 が落ちたかは未特定 (イベントログに記録なし)。
+- 実機確認: サブ PC 依頼 10 (観測者: サブ PC 担当) で、再生中・一時停止・再生中のシーク・0.5/2 倍・曲の切り替え・動画・クリックで位置が飛ばないこと、最後まで再生すると 00:00、前回の表示と Volume 0 dB の引き継ぎが期待どおり。利用者も手元で確認 (観測者: 利用者。最初は以前のプロセスを見ていた可能性があり、改めて確認して期待どおり)。未確認: 一時停止中のシーク、再生を続けたまま音響調整の窓を開き直す操作。
+- `.\scripts\build-miv-sound.ps1 -Approve -Candidate c2c45d51…` で `third_party/miv-sound/0.15.0-miv.3/` を作成。バックアップは `C:\home\mimageviewer_vendor_backup\miv-sound-0.15.0-miv.3\`。
+- 同じ日に F3 (`55015b2e6`、マニュアル・公開文書。fork-plan §18)、F4 (`b6f4406dc`、ポータブル版で音響調整を有効化。§17)、その後片付け (`f52d99047`、ポータブル版の記述と Counter の説明、説明書を `manual/sound/v0.15.0-miv.3/` に生成。§19) を v5 に入れた。いずれも独立レビュー ACCEPT。
