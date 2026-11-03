@@ -201,7 +201,7 @@
       <code>effetune\webview\</code> に保存します。Windows または WebView2 の管理ポリシーで別の保存先が指定されている場合は、その設定に従います。
       サンプルは元のフォルダから読み取り、コピーしません。Remove は登録だけを削除し、元のファイルは削除しません。
       これらの保存先は mImageViewer のデータフォルダに従い、ほかの EffeTune 製品とは分かれています。
-      初回起動時に従来の共通保存先から一度だけコピーし、元のデータは残します。mIV Sound は共通保存先へ書き込みません。
+      初回起動時に従来の共通保存先から一度だけコピーし、元のデータは残します。mIV Sound は共通保存先を引き継ぎのために読み取り、日常の保存には使いません。
       従来の共通保存先の <code>%APPDATA%\effetune\</code>、<code>%APPDATA%\Frieve\EffeTunePlugin\</code>、
       <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> は、追加した VST プラグインやほかの EffeTune 製品が使うことがあります。
       それらでも不要になったことを確認し、関連するアプリを終了してから手動で削除できます。
@@ -443,7 +443,7 @@
       <code>effetune\webview\</code>. A different location specified by Windows or WebView2 administrative policy takes precedence.
       Samples are read from their original folder and are not copied. Remove deletes only the reference, leaving the source files untouched.
       These locations follow mImageViewer's data folder and are separate from other EffeTune products.
-      On first startup, data is copied once from the existing shared locations and the originals remain. mIV Sound does not write to those shared locations.
+      On first startup, data is copied once from the existing shared locations and the originals remain. mIV Sound reads those shared locations for this one-time copy and does not use them for everyday storage.
       The existing shared <code>%APPDATA%\effetune\</code>, <code>%APPDATA%\Frieve\EffeTunePlugin\</code>, and
       <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> locations may still be used by VST plug-ins you add or other EffeTune products.
       Delete them manually only after checking that those uses no longer need them and closing the related apps.
