@@ -828,7 +828,7 @@ mod tests {
         assert!(now.core.snapshot().artwork.is_empty());
     }
     #[test]
-    fn now_playing_portable_ignores_source_and_unavailable_defers_all_jobs_and_writes() {
+    fn now_playing_unavailable_ignores_source_and_defers_all_jobs_and_writes() {
         let mut candidate = input("missing.mp3");
         candidate.artwork = NowPlayingArtworkSource::Audio {
             sidecar: Some("missing.png".into()),
@@ -836,12 +836,12 @@ mod tests {
             raw_executor: Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap()),
             io_semaphore: Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1)),
         };
-        let (portable, rx) = service(false);
-        portable.publish(NowPlayingOwner::Local(1), candidate.clone());
-        portable.set_active(true);
-        assert!(portable.owner().is_none());
+        let (unavailable, rx) = service(false);
+        unavailable.publish(NowPlayingOwner::Local(1), candidate.clone());
+        unavailable.set_active(true);
+        assert!(unavailable.owner().is_none());
         assert!(rx.try_recv().is_err());
-        assert!(portable.core.queue.0.lock().unwrap().pending.is_none());
+        assert!(unavailable.core.queue.0.lock().unwrap().pending.is_none());
         let (idle, _rx) = service(true);
         idle.publish(NowPlayingOwner::Local(1), candidate.clone());
         idle.core.start_artwork();
@@ -971,7 +971,6 @@ mod tests {
         assert_eq!(now.owner(), Some(NowPlayingOwner::Local(3)));
     }
     #[test]
-    #[cfg(not(feature = "portable"))]
     fn now_playing_host_control_resends_equal_and_empty_snapshots_on_actual_slot() {
         let mut controller = super::super::EffetuneController::new();
         controller.now_playing.set_active(true);

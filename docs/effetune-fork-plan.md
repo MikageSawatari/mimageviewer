@@ -546,7 +546,7 @@ F2b-1 の移行本体・起動ゲート・検証入口は実装済み（§5.7）
 | F1 | 派生版リポジトリ (v0.15.0 元): 名前・クラス ID・3 種類の版・保存先の環境変数・WebView の user data folder・クレジットと通知・アイコン・Counter を外す (§8)、上流のテストの更新、出荷済みの状態ファイルを読むテスト、`build-miv.bat` | Codex (派生版リポジトリ) |
 | F2 | mIV: ビルド・確認・承認の手順 (§7.3)、配布の検査の作り替えと固定値の一本化・`.gitattributes` (§7.4)、bridge の環境変数、移行 (§5、受け入れ条件 §5.5)、host の窓タイトル・FileDescription、About・設定画面の表記 | Codex (mIV の worktree) |
 | F3 | マニュアルの生成器と公開文書 (§10) | Codex |
-| F4 | ポータブル版での有効化 (§6) | Codex。§11 の未決定 3 による |
+| F4 | ポータブル版での有効化 (§6) | Codex。v5 に含める (§11 の回答 3)。実装・検証は §17 |
 | F5 | 作者への連絡 (§13)。F1〜F3 が揃い、リリースの前 | 利用者 |
 | 後 | 位置と歌詞の受け取り (§9)。Counter をそこで戻す | 別計画 |
 
@@ -747,3 +747,168 @@ ClaudeCode が根拠を読み、3 件を妥当と判断して第 8 版に反映�
 - 移行先のパスの長さ: 実物確認の最初の実行 (`run-migration-20261026-185550-453-24436`) は道具のフォルダが深く、IndexedDB の保存先が 260 文字を超えて失敗した。
   2 回目 (`target\wm\73d4d473`) は、短くしたルートを試作のホストの安全装置が「使い捨てのルートの外」として拒んだ (道具の不備、2424f124e で修正)。製品では
   `<data_dir>` の長さ + 116 文字が必要になる (深いフォルダに置いたポータブル版で超え得る。F4 で扱う)。
+
+
+## 17. F4 の実装記録 (2026-11-03、未コミット)
+
+設計担当 ClaudeCode からの §6 の実装依頼。公開文書は別 worktree の F3 が所有するので編集しない。
+製品の起動・WebView2 を使う試験・署名・外部送信・コミットは行わない。
+
+### 17.1 実装前の制限棚卸しと保存先
+
+HEAD `ea813e726` のソースを対象に再検索し、次を確認した。
+
+| 場所 | 元の制限と F4 の変更 |
+| --- | --- |
+| `settings.rs` | `ToolbarSectionId::EffeTune` のビルド可否 1 か所。portable でも表示候補・描画を許す |
+| `preferences/pages.rs` | 設定ページの anchor 4 か所と描画 helper 4 か所の cfg を外す。portable の空実装 4 か所も撤去 |
+| `preferences/search_index.rs` | 設定検索の登録 4 か所の cfg を外す |
+| `about.rs` | credit helper・notice 定数・一覧・credit 呼出・notice 全文の 5 か所の cfg を外す |
+| `version_highlights.rs` | 音響調整の告知 3 か所の cfg を外す |
+| `effetune/mod.rs` | Now Playing の available を true にし、`try_auto_open` の portable 拒否を外す |
+| `app.rs` | auto suppression の portable 強制と自動表示採用ループの portable 除外を外す |
+| `build.rs` | notice 検査と host コピー元必須の portable 除外を外す |
+| `build-portable.ps1` | host 非同梱の定義・コメントを撤去。bundle・host 用 CRT を同梱し署名と検査へ接続 |
+| `ui_main.rs` の回帰 | toolbar の非表示期待 3 か所と preparation retry の portable 除外 1 か所を変更。行分けの描画位置も両 flavor で確認 |
+| 関連回帰 | 設定保存/適用・検索・toolbar 順・About credit/notice・自動表示・Now Playing・fake host delivery・snapshot の portable 除外／拒否期待を変更 |
+
+`vst3_supported()` は既に portable で host の存在を調べ、設定・スキャン・検索の VST 項目はその能力を使う。
+別の portable cfg は無いので、その経路自体は変更しない。host 同梱によりユーザー VST も使える。
+欠落時の設定画面の案内は、旧「ポータブル版では利用できません」から、host 欠落と zip 再展開の案内へ修正する。
+残した cfg は loose/埋込み・launcher 世代公開/pin・通常版抽出・通常版キャッシュ清掃等の配置方式の差であり、機能の非表示ではない。
+新しい状態や非同期遷移は加えず、既存の単一 controller・host startup gate・自動表示の機会管理を両 flavor で共有する。
+
+移行は §5.1 の表で **portable は対象外** と決定済み。`startup::production_request` は `MigrationMode::Portable` を渡し、
+既存の migration は旧 APPDATA をコピーせず `data/effetune/migration-v1.not-applicable` を置く。
+この方針とコードは維持する。`sound_data_root` と音響調整専用 bridge の `MIV_SOUND_DATA_DIR` は選択された
+`data_dir/effetune` を使い、plugin/WebView の保存はその配下。ユーザー VST 用 bridge にはこの環境変数を渡さない。
+任意のユーザー VST の APPDATA 等への独自保存は保証の対象外。
+
+### 17.2 配布物と検査
+
+- host は現ソースとの identity を build/copy 前に検査し、exe 隣へ置いて loose PE の署名対象にする。
+- mIV Sound は承認 manifest `third_party/miv-sound/0.15.0-miv.2/manifest.sha256` と照合した原本だけから
+  `target/effetune-dist-source` を作る。通常版と同じ署名処理と「署名だけが変わった」検査を通し、
+  `effetune/{VERSION,mIV Sound.vst3/}` へ配置する。追加・欠落・改変を配布先の集合と stage の hash 照合で拒否する。
+- host の `preload_vcrt` は `exe 隣/vcrt` と System32 の一組を選ぶ。公式 CRT 4 本を `vcrt/` に同梱し、
+  他の exe 用のルート CRT 4 本も維持する。PE gate は host とプラグインを再帰列挙し、host 用4本の署名・版・hash も必須検査する。
+- 配布署名は既存どおり `build-dist.ps1` が既定 ON、直接 `build-portable.ps1` では `-Sign`。
+  署名なしの開発用パッケージでも承認原本とコピーの完全一致検査は通す。
+- `release-checklist.md` Phase 3 に、最終署名済み host／プラグイン DLL 等の VirusTotal 確認を追加。
+  送信ごとに利用者了承を得て、Google/Microsoft の検出があれば公開停止。今回アップロードはしていない。
+
+### 17.3 F3 と統合するときに直す公開文書 (F4 では未編集)
+
+- `htdocs/mimageviewer/index.html`: mIV Sound／VST3 host 非同梱の説明 (現時点 1451 行)。
+- `htdocs/mimageviewer/privacy.html`: 音響調整が portable では使えない説明 (207 行)、新保存先と任意のユーザー VST の独自保存の書き分け。
+- `htdocs/mimageviewer/manual/effetune.html`: portable で利用不可 (146 行)。F3 の新 sound マニュアルへ引き継ぐ。
+- `htdocs/mimageviewer/manual/settings.html`: portable で音響調整の設定を隠す説明 (1201・1213 行)、自動表示等の対応。
+- `installer/readme_portable.txt`: 比較表の VST3 非対応 (34 行)・利用不可 (36〜38 行) と「システム領域には一切書き込まない」(22〜23 行) の断言。
+- `installer/readme.txt`: 新保存先・配布物／credit の説明と portable の記述を F3 と照合する。
+- `htdocs/mimageviewer/manual/changelog.html` の v4.3.0 (323 行) は当時の portable 非対応という履歴。
+  過去の事実は保持し、v5 の更新説明で有効化を示す。
+
+### 17.4 検証
+
+実行結果をこの節に追記する。製品/UI 実機、署名あり配布、VirusTotal は未実施。
+§4.1 の深い data-dir の WebView 内部パス長は既存の検討事項。今回長パス保存の実機証拠はなく、通常の bundle 公開時の
+パス長 gate と同じ検証済みとは扱わない。
+
+
+現時点の自動検証 (対象は HEAD `ea813e726` からの未コミット F4 差分、`CARGO_BUILD_JOBS=6`、`MSBUILDDISABLENODEREUSE=1`):
+
+- `cargo fmt` (引数なし) と `cargo fmt --check`: 成功。
+- 通常／`--features portable` の `cargo check -p mimageviewer --bin mimageviewer-core`: 成功。
+- `cargo test -p mimageviewer-mcp`: 68 件中 66 成功、2 失敗。追加 BOM 回帰は成功。
+  失敗は既存の `real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked` と
+  `real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld`。いずれも fixture の named pipe client open が
+  sandbox の `raw_os_error=Some(5)` (アクセス拒否) で失敗しており、BOM／製品の不具合とは判定しない。外部で再実行が必要。
+- `scripts/test-effetune-distribution.ps1`: 成功。portable コピーの成功と改変／余分なファイル／欠落の拒否を追加。
+- `check-vcrt-pe-dependencies.ps1 -SelfTest`: 成功。`check_ui_glyphs.py`: 危険な字形 0。
+- vendor host の source identity と mIV Sound 原本の承認 manifest 照合: 成功 (0.15.0-miv.2)。
+- `cargo nextest run -p mimageviewer --lib -E 'test(/effetune|portable|vst3/)' --no-fail-fast --no-tests fail`:
+  201/201 成功、16,106 skipped、実行6.569秒 (コンパイル3分31秒)。`target/f4-related.log`。
+  この後の変更は host 欠落時の案内とコメント・整形・同義のテスト整理だけ。関連経路の成功証拠は有効。
+- 引数なし `scripts/test-focused.ps1`: 共有ファイル／docs／scripts を検出し exit 2。テスト実行 0 であり成功扱いにしない。
+  `target/f4-focused-selection.log`。限定した -Path と広い gate を別に記録する。
+
+- portable 関連＋About＋version highlights の初回: 236 件中 230 成功、6 失敗 (`target/f4-related-portable.log`)。
+  toolbar 3 件の旧非表示期待を更新し、フォント未設定の portable 設定 fixture に製品と同じ日本語フォントを設定した。
+  世代再公開テスト 1 件は portable で存在しない経路が前提なので、通常版の配置方式のテストとして cfg を明示した。
+  代わりに flat bundle の既存解決テストは portable でも維持する。
+  VST picker 1 件は実行体隣に host が無く機能が正しく無効化されたため、検証済み vendor host と公式 `vcrt/` を
+  `target/debug/deps/` に配置して portable の配布条件を満たす (ファイル配置だけで起動しない)。
+  以降の portable 関連回帰・snapshot はこの配置条件で実行する。テストのために製品の能力判定を迂回しない。
+
+- portable 再検証: `target/f4-related-portable-final.log`、236/236 成功、16,040 skipped、実行7.661秒。
+  前項6件の各原因を是正した同じフィルタであり、失敗テストの黙った除外・retryは行わない。
+  世代公開経路を対象外とした1件に代わり、既存の toolbar retry UI のテストも portable で実行する。
+- `cargo test -p mimageviewer --test ui_snapshot effetune --features portable`: 5/5 成功、231 filtered、
+  `target/f4-ui-portable.log`。既存の明暗設定3枚・toolbar tooltip2枚と一致し、PNGの更新なし。
+  About の明暗/狭幅2枚は上の236件に含む。設定3枚とAbout2枚を目視し、折り返し後も全文が収まることを確認した。
+- `build-portable.ps1 -KeepRunning` (`-Sign` なし): cargo exit 101、`target/f4-build-portable.log`。
+  VLM は現ソースの既存成果物を再利用、VST3 host identity も成功したが、専用 target-portable の cold build で
+  `turbojpeg-sys 1.2.0` の `cmake --build ... --target install --config Release --parallel 6` が exit 1。
+  package/stage/copy/PE gate/zip 作成へは到達せず、検証用 portable binary と zip は未生成。
+  同じ CMake build を診断出力で一度だけ確認した (`target/f4-turbojpeg-diagnostic.log`、exit 1)。
+  MSBuild の INSTALL/ResolveProjectReferences と ALL_BUILD が失敗と記録される一方、末尾は警告0・エラー0で、
+  このログだけでは具体的な失敗原因を特定できない。アクセス拒否と断定しない。ソース／ビルド設定を回避変更せず、
+  設計担当が sandbox 外で同じ署名なしビルドを実行し、zip 内の以下を確認する。
+
+  ```text
+  mimageviewer-vst3-host.exe
+  effetune/VERSION
+  effetune/mIV Sound.vst3/Contents/x86_64-win/mIV Sound.vst3
+  effetune/mIV Sound.vst3/Contents/Resources/... (通知と全リソース)
+  vcrt/{msvcp140.dll,msvcp140_1.dll,vcruntime140.dll,vcruntime140_1.dll}
+  {msvcp140.dll,msvcp140_1.dll,vcruntime140.dll,vcruntime140_1.dll} (ルートにも維持)
+  ```
+
+  上は期待する配置であり、今回 zip の実物を検証した一覧ではない。
+  外部での再実行は `.\scripts\build-portable.ps1 -KeepRunning`、配布用の署名ありは既存の
+  `.\scripts\build-dist.ps1 -PreserveRuntime` の署名ゲートから行う。
+
+- `test-focused.ps1 -Path @('src/ui_dialogs/about.rs','src/version_highlights.rs','src/ui_main.rs') -Features pack-build-tools`:
+  通常構成で About 7/7、version highlights 28/28、ui_main 387/387 成功 (計422件)。
+  `target/f4-focused-final.log` と各 `target/test-focused/runs/` の command/JUnit/stdout/stderr。
+- 最終 `cargo fmt --check`・`check_ui_glyphs.py`・`git diff --check`: exit 0、危険な字形0。
+  `target/f4-{fmt,glyph,diff}-final.log`。
+- zip build が依存の CMake で停止するため、実 asset の配布配置だけを独立に確認した。
+  承認済み vendor の host・bundle・CRT (ルート4本＋vcrt/4本) を `target/f4-portable-static-layout/` に配置し、
+  `Assert-MivEffetunePortablePackage` による全ファイル集合/hash照合が成功。
+  `check-vcrt-pe-dependencies.ps1 -InputPaths <この配置> -RequireCompanionRuntime` も成功 (canonical runtime4本、PE10本)。
+  証拠は `target/f4-portable-static-pe.json`。さらに `vcrt/msvcp140_1.dll` だけを一時的に外し、
+  ルートの同名DLLがあっても `runtime file is missing: .../vcrt/msvcp140_1.dll` で拒否することを確認し、元の同じDLLを戻した。
+  製品の起動・プラグインのロードはしていない。この検査は core／他の companion／zip 全体／署名ありの配布を代替しない。
+
+- 最終 `test-full.ps1 -SuppressCrashDialogs`: workspace の nextest は18,278件を完走し、
+  18,273成功・5失敗・ignored77、実行1004.958秒、exit100。`target/f4-full.log`、
+  `target/f4-full-workspace-junit.xml` (他の default profile の実行で上書きされないよう保存)。
+  失敗の4件は実named pipe のアクセス拒否 (OS error5):
+  `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`、
+  `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`、上記MCPの2件。
+  もう1件は今回未変更の `ui_adjustment_panel::local_adjust_segmentation_tests::full_mask_with_large_subtract_preview_completes_quickly` で、
+  100ms未満の閾値に対し100.2774ms。全体終了後に同じtest/pack-build-toolsでこの1件だけを
+  `--test-threads 1 --retries 0` で一度確認し成功 (`target/f4-mask-isolated.log`)。
+  単独成功で全体の失敗を消さず、閾値・製品コードの変更や自動retryはしていない。
+  workspace段が非ゼロのため、後続のworkspace doctestとstandalone vendor graphは未実行。全体gateは未達として引き継ぐ。
+- full の通常構成 `ui_snapshot` は236/236成功 (JUnitでも確認)。音響調整の5枚もすべて成功し、PNG更新なし。
+- 追加の `cargo test -p mimageviewer --test ui_snapshot toolbar --features portable`: 6/6成功、
+  230 filtered、`target/f4-ui-toolbar-portable.log`。portable のtoolbar画像も既存と一致し、PNG更新なし。
+
+- 最終ソースで通常／portable の core check を再確認し、両方 exit0。
+  `target/f4-check-final.log` (19.59秒)、`target/f4-check-portable-final.log` (18.49秒)。
+
+### 17.5 引き継ぎ
+
+未コミットのまま ClaudeCode の設計／独立レビュー・受け入れへ渡す。
+残るのは sandbox 外での named pipe 4件の確認、全体gateの未実行段、依存のnative build失敗を解消した
+portable zip実物の生成・内容確認、署名あり配布とVirusTotal (送信ごとの了承)、WebView2を含む実機確認。
+今回の変更用の確認binary/zipはnative依存のbuild失敗により用意できていない。古い通常版や別flavorのbinaryで代用しない。
+深いdata-dirのWebView保存領域の長パスの実機証拠も未取得 (§4.1)。公開文書は §17.3 の一覧を F3 と統合する。
+
+
+実機確認では、音響調整ボタン・設定検索・About の表示、動画の初回自動表示、Now Playing、
+ユーザー VST のスキャン／追加を確認する。mIV Sound のプリセットと WebView の設定を保存して再起動し、
+`data/effetune/{plugin,webview}` に残り、旧共有 APPDATA を取り込まないことを確認する。
+エージェントが操作する場合は既存の使い捨て portable／明示了承の検証枠に従い、今回の依頼から起動を推測しない。

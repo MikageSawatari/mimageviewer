@@ -2457,7 +2457,6 @@ fn preferences_video_bar_visibility_dark() {
 }
 
 #[test]
-#[cfg(not(feature = "portable"))]
 fn preferences_effetune_input_limit_dark() {
     snapshot_with_theme(
         "preferences_effetune_input_limit_dark",
@@ -2467,7 +2466,6 @@ fn preferences_effetune_input_limit_dark() {
 }
 
 #[test]
-#[cfg(not(feature = "portable"))]
 fn preferences_effetune_auto_open_light() {
     snapshot_with_theme(
         "preferences_effetune_auto_open_light",
@@ -2477,7 +2475,6 @@ fn preferences_effetune_auto_open_light() {
 }
 
 #[test]
-#[cfg(not(feature = "portable"))]
 fn preferences_effetune_taskbar_narrow_dark() {
     let size = egui::vec2(320.0, 360.0);
     snapshot_with_theme_contrast_and_size_with_interaction(

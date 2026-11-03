@@ -336,6 +336,13 @@ foreach ($file in $inputFiles) {
             $companionPath = Join-Path $file.DirectoryName $name
             $null = Assert-CanonicalRuntimeFile -Path $companionPath -Entry $entry -Dumpbin $dumpbin `
                 -SignerSubjectContains $manifest.signer_subject_contains
+            if ($lowerName -eq 'mimageviewer-vst3-host.exe') {
+                # The host explicitly selects vcrt/ or System32 before loading
+                # plugins; root companions alone cannot satisfy that contract.
+                $hostRuntime = Join-Path $file.DirectoryName "vcrt\$name"
+                $null = Assert-CanonicalRuntimeFile -Path $hostRuntime -Entry $entry -Dumpbin $dumpbin `
+                    -SignerSubjectContains $manifest.signer_subject_contains
+            }
         }
     }
     $peReports += [pscustomobject]@{

@@ -2,7 +2,8 @@
 #
 # Produces a self-contained portable folder + zip that runs by extracting and
 # double-clicking, with NO launcher, NO include_bytes extraction, and NO APPDATA
-# usage (data goes to <exe_dir>\data). See docs/portable-build-plan.md.
+# usage by mIV and mIV Sound (data goes to <exe_dir>\data). User VSTs may use
+# their own nonportable storage. See docs/portable-build-plan.md.
 #
 # Output:
 #   dist\mImageViewer_portable_v<VERSION>\        (loose folder)
@@ -31,6 +32,8 @@ Assert-MivFixedCargoOutput -WorkingDirectory (Join-Path $PSScriptRoot '..') -Por
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 . (Join-Path $PSScriptRoot 'build-process-policy.ps1')
 . (Join-Path $PSScriptRoot 'vlm-worker-identity.ps1')
+. (Join-Path $PSScriptRoot 'vst3-host-identity.ps1')
+. (Join-Path $PSScriptRoot 'effetune-distribution.ps1')
 
 if ($SmokeTestScript -and $Sign) {
     throw '[portable-smoke-build] -Sign is not supported for diagnostic smoke artifacts'
@@ -390,6 +393,7 @@ if ($KeepRunning) {
 $smokeBuildManifest = Join-Path $portableTargetDir 'release\mimageviewer-core.build-manifest.json'
 Assert-NoReparsePath $portableTargetDir $repoRoot 'portable-target'
 & (Join-Path $PSScriptRoot 'build-vlm-worker.ps1') -RepoRoot $repoRoot -SkipBuild:$SkipBuild
+Assert-MivVst3HostIdentity -RepoRoot $repoRoot
 $sourceFingerprint = $null
 if ($SmokeTestScript) {
     $sourceFingerprint = Get-MivSourceFingerprint $repoRoot
@@ -460,6 +464,9 @@ if ($SmokeTestScript) {
 # ---------------------------------------------------------------------------
 # Assemble the distribution folder.
 # ---------------------------------------------------------------------------
+$effetuneStage = New-MivEffetuneStage -RepoRoot $repoRoot
+$effetunePe = @(Get-MivPeFiles -Paths (Join-Path $effetuneStage $MivSound.BUNDLE_NAME))
+if ($effetunePe.Count -eq 0) { throw '[portable] mIV Sound bundle contains no PE files' }
 $expectedPackagePath = if ($SmokeTestScript) {
     Join-Path $repoRoot 'target\portable-smoke-package'
 } else {
@@ -473,6 +480,7 @@ if (Test-Path -LiteralPath $pkgDir) {
 }
 New-Item -ItemType Directory -Path $pkgDir | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $pkgDir 'models') | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $pkgDir 'vcrt') | Out-Null
 
 # (source relative to repo root, destination relative to pkgDir)
 Assert-MivVlmWorkerIdentity -RepoRoot $repoRoot
@@ -498,15 +506,7 @@ $copies = @(
     @{ src = 'vendor\vcrt\vcruntime140.dll';         dst = 'vcruntime140.dll' }
     @{ src = 'vendor\vcrt\vcruntime140_1.dll';       dst = 'vcruntime140_1.dll' }
     @{ src = 'vendor\susie-worker\mimageviewer-susie32.exe'; dst = 'mimageviewer-susie32.exe' }
-    # NOTE: mimageviewer-vst3-host.exe is intentionally NOT bundled. The unsigned
-    # bridge exe is false-flagged by some security software, which blocked the
-    # portable zip download (v2.0.0). Without the host, src/video/dsp/vst3_supported()
-    # returns false and the app auto-disables VST3 (it cannot be turned on in settings).
-    # Permanent fix = code-sign the bridge exe, then restore this line to re-bundle it.
-    # (Keep this file ASCII-only: PowerShell 5.1 reads BOM-less .ps1 as the system
-    #  ANSI codepage, and a CP932-misdecoded Japanese comment once silently swallowed
-    #  the LICENSE-ffmpeg.txt entry below via comment line-continuation. See the
-    #  CLAUDE.md encoding policy: .ps1 = ASCII only.)
+    @{ src = 'vendor\vst3-host\mimageviewer-vst3-host.exe'; dst = 'mimageviewer-vst3-host.exe' }
     @{ src = 'vendor\ffmpeg\LICENSE.txt';            dst = 'LICENSE-ffmpeg.txt' }
     @{ src = 'UNRAR-LICENSE.txt';                     dst = 'UNRAR-LICENSE.txt' }
     @{ src = 'LIBRAW-LICENSE.txt';                    dst = 'LIBRAW-LICENSE.txt' }
@@ -519,6 +519,12 @@ $copies = @(
     @{ src = 'vendor\egui-wgpu\LICENSE-APACHE';      dst = 'egui-LICENSE-APACHE.txt' }
     @{ src = 'installer\readme_portable.txt';        dst = 'readme.txt' }
 )
+
+# The host preloads a whole CRT set from vcrt/ or System32. Root CRTs above
+# remain necessary for the other executables; preserve Microsoft's signatures.
+foreach ($name in @('msvcp140.dll', 'msvcp140_1.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
+    $copies += @{ src = "vendor\vcrt\$name"; dst = "vcrt\$name" }
+}
 
 # AI models loaded at runtime (must match EMBEDDED_MODELS in src/ai/model_manager.rs).
 $models = @(
@@ -570,8 +576,8 @@ Write-Host "[portable] portable core exe size: $exeSizeMb MB (embedded native de
 # ---------------------------------------------------------------------------
 # Sign the loose PE files (portable ships them uncompressed, no embedding), so
 # sign the actual package copies here. onnxruntime*.dll are Microsoft-signed and
-# NOT re-signed; models/*.onnx and the text files are not PE. vst3-host is not
-# bundled in the portable package.
+# NOT re-signed; models/*.onnx and the text files are not PE. Sign mIV Sound
+# in the same fixed stage as the normal distribution, then verify and copy it.
 # ---------------------------------------------------------------------------
 if ($Sign) {
     $portablePe = @(
@@ -581,6 +587,7 @@ if ($Sign) {
         'mimageviewer-mcp.exe',
         'mimageviewer-musicvideo.exe',
         'mimageviewer-vlm.exe',
+        'mimageviewer-vst3-host.exe',
         'pdfium.dll',
         'mimageviewer-susie32.exe',
         'avcodec-61.dll', 'avformat-61.dll', 'avutil-59.dll',
@@ -588,7 +595,15 @@ if ($Sign) {
     ) | ForEach-Object { Join-Path $pkgDir $_ }
     Write-Host "[portable] signing portable PE files"
     Invoke-MivSign -Files $portablePe -Verify
+    Invoke-MivSign -Files @($effetunePe | ForEach-Object { $_.FullName }) -Verify
 }
+
+Assert-MivEffetuneStage -RepoRoot $repoRoot -SourceRoot $effetuneStage
+$portableEffetune = Join-Path $pkgDir 'effetune'
+New-Item -ItemType Directory -Path $portableEffetune | Out-Null
+Copy-Item -LiteralPath (Join-Path $effetuneStage 'VERSION') -Destination $portableEffetune -Force
+Copy-Item -LiteralPath (Join-Path $effetuneStage $MivSound.BUNDLE_NAME) -Destination $portableEffetune -Recurse -Force
+Assert-MivEffetunePortablePackage -RepoRoot $repoRoot -SourceRoot $effetuneStage -PackageRoot $portableEffetune
 
 & (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1') `
     -InputPaths $pkgDir -RequireCompanionRuntime `

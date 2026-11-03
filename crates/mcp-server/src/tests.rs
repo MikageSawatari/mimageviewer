@@ -777,6 +777,33 @@ fn modern(id: i64, method: &str, mut params: Value) -> Value {
     json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
 }
 
+#[test]
+fn stdin_bom_is_accepted_only_at_the_start_of_the_stream() {
+    for prefix in ["", "\u{feff}"] {
+        let mut h = Harness::new(Arc::new(Fixture { disabled: false }));
+        let ping = modern(1, "ping", json!({}));
+        // Split the BOM across reads as a pipe can do.
+        let bytes = format!("{prefix}{ping}\n").into_bytes();
+        h.raw(bytes[..1].to_vec());
+        h.raw(bytes[1..].to_vec());
+        assert_eq!(h.receive()["id"], 1);
+        h.raw(format!("\u{feff}{ping}\n").into_bytes());
+        assert_eq!(h.receive()["error"]["code"], -32700);
+        h.raw(format!(" {0}{ping}\n", '\u{feff}').into_bytes());
+        assert_eq!(h.receive()["error"]["code"], -32700);
+        h.send(modern(2, "ping", json!({})));
+        assert_eq!(h.receive()["id"], 2);
+        h.close();
+    }
+    // An empty first line still consumes the sole BOM allowance.
+    let mut h = Harness::new(Arc::new(Fixture { disabled: false }));
+    h.raw(b"\n".to_vec());
+    assert_eq!(h.receive()["error"]["code"], -32700);
+    h.raw(format!("\u{feff}{}\n", modern(1, "ping", json!({}))).into_bytes());
+    assert_eq!(h.receive()["error"]["code"], -32700);
+    h.close();
+}
+
 struct IdentityProbe {
     calls: mpsc::Sender<(Command, ClientIdentity, RequestKind)>,
 }

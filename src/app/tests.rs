@@ -112346,7 +112346,7 @@ mod audio_refresh_tests;
 #[path = "tests/audio_idle_upgrade.rs"]
 mod audio_idle_upgrade_tests;
 
-#[cfg(all(windows, not(feature = "portable")))]
+#[cfg(windows)]
 #[path = "tests/effetune_auto_open.rs"]
 mod effetune_auto_open_tests;
 

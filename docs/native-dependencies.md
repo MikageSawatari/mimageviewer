@@ -495,6 +495,7 @@ ordinal順のslash相対名と各SHA256を `name:hash\n` としてUTF-8/BOMな�
 Gitの改行変換によるLF／CRLF checkout差を無視するが、未コミットのソース変更は検知する。
 SDK欠落時や `-SkipVst3Bridge` は現ソースと一致するvendor hostのみ再利用可能。不一致／欠落は復旧案内付きで停止する。
 build-release／build-distの署名前・core埋込前と、非portable coreのbare cargo release buildにも同じgateを通す。
+ポータブル版も `build-portable.ps1` の build／copy 前に同じ identity gate を通す (`-SkipBuild` でも省略しない)。
 `dev-runtime` もrelease継承profileのためこのgate対象。host変更時は先にCMakeで再buildする。
 再build成果物のSHA256／sizeを記録し、内側hostの署名→core→launcherの順で埋め込む。
 
@@ -525,6 +526,10 @@ cmake --build crates/vst3-host/build --config Release
   `test-full.ps1`／`build-dist.ps1` はテスト前に非起動preflightでCRT4本と正本の完全一致を検査し、
   欠落／破損ならCMake buildまたはセット全体の復元を案内して停止する。
   `build-dev.ps1` のcoreは公式CRTを埋め込み、通常の抽出経路で同じ `vcrt/` layoutを作る。
+  v5 のポータブル版は host を exe 隣、公式 CRT 4 本を `vcrt/` に loose 同梱する。
+  host の System32／同梱4本の一括選択はそのまま使う。本体用の exe 隣 CRT 4 本も残す。
+  配布時は host と mIV Sound のプラグイン PE を署名し、CRT は Microsoft 署名を保持する。
+  portable の PE gate は host・プラグインと `vcrt/` の4本も検査する。
 - 出力: `vendor/vst3-host/mimageviewer-vst3-host.exe` と `vcrt/` (.gitignore)。
   メイン exe のリリースビルド時に `include_bytes!` で内包される
 - 動作確認用: `crates/vst3-host-tester/` (Rust 単独 GUI exe)。本体に依存せずに

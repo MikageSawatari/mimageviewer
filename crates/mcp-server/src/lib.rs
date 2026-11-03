@@ -266,6 +266,7 @@ pub fn run_stdio_with_eof<
     let reader_queue = input_queue.clone();
     std::thread::spawn(move || {
         let mut input = BufReader::new(input);
+        let mut first_line = true;
         loop {
             let mut line = vec![];
             match input
@@ -287,6 +288,12 @@ pub fn run_stdio_with_eof<
                     break;
                 }
                 Ok(_) => {
+                    // PowerShell 5.1 may prefix stdin with a UTF-8 BOM. Only
+                    // accept it at the beginning of the stream, never later.
+                    if first_line && line.starts_with(b"\xef\xbb\xbf") {
+                        line.drain(..3);
+                    }
+                    first_line = false;
                     if !reader_queue.cancel_notification(&input_owner, &line)
                         && !reader_queue.push(line, &input_owner)
                     {

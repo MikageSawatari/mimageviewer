@@ -10,7 +10,7 @@
 | --- | --- | --- | --- | --- |
 | **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + remote service + EPUB converter + MCP adapter + music-video editor + FFmpeg DLL + VC runtime + mIV Sound bundle を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
 | **インストーラ版** | `mImageViewer_setup.exe` | Inno Setup 出力 | `%APPDATA%\mimageviewer` | **要 (UAC)** |
-| **ポータブル版** (v1.1.0 新) | `mImageViewer_portable_v<VER>.zip` | loose-deps。native 依存を埋め込まず exe 隣に同梱、展開ゼロ | `<exe_dir>\data` (APPDATA 不使用) | 不要 |
+| **ポータブル版** (v1.1.0 新) | `mImageViewer_portable_v<VER>.zip` | loose-deps。署名済み VST3 host・mIV Sound (プラグイン PE も署名)・CRT 等を同梱、展開ゼロ | `<exe_dir>\data` (ユーザー VST 独自保存は除く) | 不要 |
 
 > ⚠ **用語**: `mimageviewer.exe` (launcher 単体 exe) は APPDATA を使うので「ポータブル版」と
 > **呼ばない**。「単体exe版 / オールインワン版」と呼ぶ。「ポータブル」は loose-deps zip 専用。
@@ -41,12 +41,14 @@
   (pdfium / onnxruntime / susie / vst3-host / VLM worker / モデル) を埋め込まず exe 隣から解決し、`data_dir` を
   `<exe_dir>\data` に向ける。launcher は使わず core を `mimageviewer.exe` にリネームし、
   remote service・EPUB converter・`mimageviewer-mcp.exe`・music-video editor・`mimageviewer-vlm.exe` をその隣へ同梱。
-  VST host と EffeTune bundle は利用者決定により非同梱。音響調整は bundle 不在で利用不可のまま。
-  `portable` build flavor では音響調整ボタン・カスタマイズ候補・v4.3.0の関連告知も表示しない。
-  保存済みセクション順は維持し、描画対象だけを除外する。通常版のbundle欠落は表示で隠さない。
+  VST3 host と mIV Sound bundle は v5 から署名して同梱する。配置は
+  `<exe_dir>\effetune\mIV Sound.vst3`、host 用 CRT 4 本は `<exe_dir>\vcrt`。
+  音響調整のボタン・設定・検索・About・自動表示・再生情報とユーザー VST を有効にする。
+  mIV Sound の保存先は `data/effetune`、旧 APPDATA の共有データは移行しない。
+  任意のユーザー VST が独自に APPDATA 等を使うことはある。
   設計・保守方針 (CI guard 等) は [docs/portable-build-plan.md](portable-build-plan.md)。
   `portable` feature の cfg 分岐は `.git/hooks/pre-push` の `cargo check --features portable` が番人。
-- **mIV Sound 配布境界**: 単体exe版／インストーラ版は承認済み VERSION とbundle全体を
+- **mIV Sound 配布境界**: 単体exe版／インストーラ版／ポータブル版は承認済み VERSION とbundle全体を
   `third_party/miv-sound/<ver>/manifest.sha256` に固定し、署名前とlauncher build時に欠落・追加・
   改変を拒否する。署名stageは固定target配下だけ許可し、PEのchecksum／証明書以外は原本と同一、
   指定発行元の有効署名があることも検証する。未署名の開発buildはraw原本の完全一致が必要。
@@ -486,7 +488,7 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
       （[署名の注意点](release-operations.md#4-コード署名-v230-以降全配布-pe)）。
       署名なしで配布物を作るなら `.\scripts\build-dist.ps1 -NoSign`。実装は `scripts\sign-files.ps1`
       (証明書選択は既定 subject `/n "Open Source Developer Taku Sano"`。証明書更新で拇印を固定したいときは
-      `$env:MIV_SIGN_SHA1`、TS 変更は `$env:MIV_SIGN_TS`)。ポータブルの vst3-host は署名対応後も当面**非同梱据え置き**。
+      `$env:MIV_SIGN_SHA1`、TS 変更は `$env:MIV_SIGN_TS`)。ポータブルも host と mIV Sound の全 PE を署名する。承認 manifest・署名だけの変更・配布コピー一致を検査する。
     - **通常の開発反復は `.\scripts\build-dev.ps1`**。通常feature set（portableなし）を
       `dev-runtime` profileで `target\dev-runtime` へ core + remote + EPUB worker + MCP + editor をビルドし、launcherなしで必要な
       FFmpeg DLLだけを変更時に配置する。引数なしの起動は通常版と同じ
@@ -512,6 +514,8 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
       解凍し、`mimageviewer.exe` を起動 → PDF 表示 / 動画再生 / AI アップスケール / Susie の
       いずれかを 1 回ずつ確認。`<exe_dir>\data` が作られ APPDATA が触られないこと、
       インストール版をトレイ常駐させたまま起動しても両方独立に動く (mutex 分離) ことを確認。
+      音響調整とユーザー VST、音響調整の保存先 `data/effetune` と旧 APPDATA を取り込まないことも確認する。
+      任意のユーザー VST 自身の APPDATA 書き込みは保証の対象外。
       検証チェックリスト全項目は [docs/portable-build-plan.md](portable-build-plan.md) §8。
 12. **全 PE / app-local VC runtime gate** — `build-dist.ps1` が installer / portable 完成後に
     `scripts/check-vcrt-pe-dependencies.ps1` を必須実行する。launcher / core / remote / EPUB worker / MCP / editor / installer、
@@ -526,6 +530,15 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
     目視確認する。build-dist は署名時に検証も済ませているが、最終成果物で 1 度確認する。未署名・失効なら
     SimplySign Desktop のログイン状態を確認 (証明書は 1 年ごとに更新 → 更新時は `sign-files.ps1` の
     既定 subject が一致するか、または `$env:MIV_SIGN_SHA1` を新拇印に更新)。
+
+12.6. **公開前のポータブル版 VirusTotal 検査 (v5 / mIV Sound F4)** — 最終の署名済み zip に入る
+    新しい exe・DLL、少なくとも `mimageviewer-vst3-host.exe` と
+    `effetune/mIV Sound.vst3/Contents/x86_64-win/mIV Sound.vst3` (DLL の PE) を確認する。
+    **アップロードのたびに、送信するファイルと SHA-256 を示して利用者の明示了承を得る**。
+    外部送信を自動実行せず、同じハッシュの既存結果があればまず参照する。
+    Google または Microsoft が検出した場合は公開を止め、判定とハッシュを設計／公開担当へ報告する。
+    ファイル別 hash・署名状態・検査 URL・確認日時・Google/Microsoft の判定を記録する。
+    再ビルド・再署名で hash が変わればその成果物を改めて確認する。署名済みだけではこの検査を省略しない。
 
 ### Phase 4: GitHub Release 公開
 

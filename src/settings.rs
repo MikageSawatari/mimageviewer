@@ -1891,7 +1891,6 @@ impl ToolbarSectionId {
     /// 配布形態で提供されるセクション。実行時のファイル欠落では表示を隠さない。
     pub fn available_in_build(self) -> bool {
         match self {
-            Self::EffeTune => !cfg!(feature = "portable"),
             Self::Unknown => false,
             _ => true,
         }
@@ -12530,15 +12529,8 @@ mod tests {
         for order in [&saved[..], &[][..], TS::default_order()] {
             let all = TS::ordered_with_fallback(order);
             let rendered = TS::render_order(order);
-            assert_eq!(
-                rendered.contains(&TS::EffeTune),
-                !cfg!(feature = "portable")
-            );
-            let expected = all
-                .iter()
-                .copied()
-                .filter(|id| *id != TS::EffeTune || !cfg!(feature = "portable"))
-                .collect::<Vec<_>>();
+            assert!(rendered.contains(&TS::EffeTune));
+            let expected = all.to_vec();
             assert_eq!(rendered, expected);
             assert!(!rendered.contains(&TS::Unknown));
             assert!(all.contains(&TS::EffeTune));

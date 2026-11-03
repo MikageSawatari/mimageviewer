@@ -8435,19 +8435,15 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.add_space(8.0);
     }
 
-    #[cfg(not(feature = "portable"))]
     anchored(ui, state, "video/effetune-input-limit", |ui, state| {
         draw_effetune_input_limit_settings(ui, &mut state.settings);
     });
-    #[cfg(not(feature = "portable"))]
     anchored(ui, state, "video/effetune-auto-open", |ui, state| {
         draw_effetune_auto_open_settings(ui, &mut state.settings);
     });
-    #[cfg(not(feature = "portable"))]
     anchored(ui, state, "video/effetune-taskbar", |ui, state| {
         draw_effetune_taskbar_settings(ui, &mut state.settings);
     });
-    #[cfg(not(feature = "portable"))]
     anchored(ui, state, "video/effetune-minimized", |ui, state| {
         draw_effetune_minimized_settings(ui, &mut state.settings);
         ui.add_space(12.0);
@@ -8558,7 +8554,6 @@ pub(super) fn page_creative_lut(ui: &mut egui::Ui, state: &mut PreferencesState)
 }
 
 pub(super) fn draw_effetune_input_limit_settings(ui: &mut egui::Ui, settings: &mut Settings) {
-    #[cfg(not(feature = "portable"))]
     {
         ui.label(egui::RichText::new("音響調整 (mIV Sound)").strong());
         ui.checkbox(
@@ -8571,12 +8566,9 @@ pub(super) fn draw_effetune_input_limit_settings(ui: &mut egui::Ui, settings: &m
              OK を押すと再生中の音声にも反映します。リモート配信では先読み済みの音声の後から反映します。",
         );
     }
-    #[cfg(feature = "portable")]
-    let _ = (ui, settings);
 }
 
 pub(super) fn draw_effetune_auto_open_settings(ui: &mut egui::Ui, settings: &mut Settings) {
-    #[cfg(not(feature = "portable"))]
     ui.checkbox(
         &mut settings.effetune_auto_open_on_video,
         "起動後の最初の動画再生で音響調整の窓を自動で開く",
@@ -8587,12 +8579,9 @@ pub(super) fn draw_effetune_auto_open_settings(ui: &mut egui::Ui, settings: &mut
          音声ファイルは対象外です。OK を押すと反映します。再生中に ON にしても、その再生では開きません。\n\
          未起動の音響調整を開始した場合、窓を閉じても終了まで音の処理を続けます。",
     );
-    #[cfg(feature = "portable")]
-    let _ = (ui, settings);
 }
 
 pub(super) fn draw_effetune_taskbar_settings(ui: &mut egui::Ui, settings: &mut Settings) {
-    #[cfg(not(feature = "portable"))]
     ui.checkbox(
         &mut settings.effetune_show_in_taskbar,
         "音響調整の窓をタスクバーに表示する",
@@ -8603,12 +8592,9 @@ pub(super) fn draw_effetune_taskbar_settings(ui: &mut egui::Ui, settings: &mut S
          音響調整の窓を最小化・閉じる操作では、音の処理は続きます。\n\
          メインウィンドウの最小化中は「表示したままにする」の設定に従い、リモート閲覧中は隠れます。",
     );
-    #[cfg(feature = "portable")]
-    let _ = (ui, settings);
 }
 
 pub(super) fn draw_effetune_minimized_settings(ui: &mut egui::Ui, settings: &mut Settings) {
-    #[cfg(not(feature = "portable"))]
     ui.checkbox(
         &mut settings.effetune_keep_visible_when_minimized,
         "メインウィンドウを最小化しても音響調整の窓を表示したままにする",
@@ -8619,8 +8605,6 @@ pub(super) fn draw_effetune_minimized_settings(ui: &mut egui::Ui, settings: &mut
          リモート閲覧で操作している間は、この設定にかかわらず隠れます。\n\
          タスクトレイへの格納だけでは窓は隠れません。",
     );
-    #[cfg(feature = "portable")]
-    let _ = (ui, settings);
 }
 
 fn draw_audio_normalize_cache_controls(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -8763,8 +8747,7 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
     ui.add_space(8.0);
 
-    // VST3 bridge host が手に入らない版 (= host exe を同梱しないポータブルビルド) では
-    // 機能を利用できない。トグルを無効化し、理由をホバーで示す (= ユーザー要望の挙動)。
+    // ポータブル配布物の host が欠けている場合も、起動時の能力判定に合わせる。
     if !crate::video::dsp::vst3_supported() {
         state.settings.vst3_enabled = false;
         anchored(ui, state, "vst3/enabled", |ui, _state| {
@@ -8773,13 +8756,13 @@ pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 false,
                 egui::Checkbox::new(&mut off, "VST3 プラグイン処理を有効にする"),
             )
-            .on_hover_text("ポータブル版では利用できません");
+            .on_hover_text("VST3 ホストのファイルが見つかりません");
         });
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(
-                "この版では VST3 プラグイン機能を利用できません。\
-                 インストーラ版または単体 exe 版をご利用ください。",
+                "VST3 ホストのファイルが見つかりません。\
+                 配布 zip をすべて展開し直してください。",
             )
             .weak()
             .small(),

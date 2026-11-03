@@ -9333,7 +9333,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(windows, not(feature = "portable")))]
+    #[cfg(windows)]
     fn effetune_pre_limiter_preferences_checkbox_ok_save_reload_consumers() {
         use egui_kittest::kittest::Queryable;
         let mut app = crate::app::setup_app_for_test();
@@ -9414,7 +9414,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(windows, not(feature = "portable")))]
+    #[cfg(windows)]
     fn effetune_pre_limiter_loaded_preferences_initialize_shared_owner() {
         let app = crate::app::setup_app_for_test();
         let mut settings = app.settings.clone();
@@ -9428,7 +9428,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(windows, not(feature = "portable")))]
+    #[cfg(windows)]
     fn effetune_auto_open_preferences_cancel_ok_save_reload() {
         use egui_kittest::kittest::Queryable;
         let mut app = crate::app::setup_app_for_test();
@@ -9514,7 +9514,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(windows, not(feature = "portable")))]
+    #[cfg(windows)]
     fn effetune_taskbar_preferences_cancel_ok_save_reload() {
         use egui_kittest::kittest::Queryable;
         let mut app = crate::app::setup_app_for_test();
@@ -9591,7 +9591,7 @@ mod tests {
 
     #[test]
     #[cfg(all(windows, feature = "portable"))]
-    fn effetune_taskbar_preferences_portable_hides_control_and_keeps_value() {
+    fn effetune_taskbar_preferences_portable_exposes_control_and_keeps_value() {
         use egui_kittest::kittest::Queryable;
         let _data_dir = crate::data_dir::TestDataDirGuard::new();
         let settings = Settings {
@@ -9601,6 +9601,7 @@ mod tests {
         let mut state = preferences_state_for_test(&settings);
         state.selected = PreferencesPage::Video;
         let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(600.0, 2400.0))
             .build_ui_state(
                 |root_ui, state| {
@@ -9613,13 +9614,13 @@ mod tests {
         assert!(
             harness
                 .query_by_label("音響調整の窓をタスクバーに表示する")
-                .is_none()
+                .is_some()
         );
         assert!(!harness.state().settings.effetune_show_in_taskbar);
     }
 
     #[test]
-    #[cfg(all(windows, not(feature = "portable")))]
+    #[cfg(windows)]
     fn effetune_minimized_preferences_ok_publishes_saved_policy() {
         use egui_kittest::kittest::Queryable;
         let mut app = crate::app::setup_app_for_test();

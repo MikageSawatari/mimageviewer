@@ -32,7 +32,7 @@
 
 - TensorRT pack (~6.8GB ダウンロード物) の同梱。これは元々埋め込みでなく実行時 DL なので、
   ポータブルでも `data_dir` 配下に DL される (= 自動的にローカル化されるだけ。特別扱い不要)。
-- コード署名。AV 誤検知の本筋の解だが**ポータブル化とは独立**。§10 で補足するに留める。
+- コード署名自体の導入。ポータブル化とは別の手順で導入済み。v5 の F4 も既存の署名機構を使う (§4.7)。
 
 ## 2. 現状アーキテクチャの整理
 
@@ -46,9 +46,9 @@ MCP は AI アプリから launcher の先頭 `--mcp` で起動する。この�
 音楽ビデオエディタも同じディレクトリから起動し、data-dir は本体から引数で受け取る。
 portable は `musicvideo-editor` の製品 bin を `target-portable` でビルドし、core の隣へ loose 同梱する。
 build は出力先や配布フォルダのエディタを停止せず、保存・終了を求めて中止する。
-この統合では mIV Sound／VST3 host の portable 同梱・有効化は行わない。
-[派生版への切替計画](effetune-fork-plan.md) の F3（公開文書）・F4（ポータブル有効化）は別段階であり、
-現行の音響調整非同梱・利用不可の境界を維持する。
+v5 の F4 では、署名済み VST3 host とプラグイン DLL を署名した mIV Sound bundle を同梱する。
+音響調整とユーザー VST を通常版と同じ画面から利用できる。
+[派生版への切替計画](effetune-fork-plan.md) §6・§17 が仕様と実装記録の正本。
 ランチャーが存在する主な理由は **FFmpeg がロード時リンク**で、
 Rust コードが走る前に Windows ローダが DLL を解決する必要があるため
 ([build.rs:9-26](../build.rs)、[src/video/ffmpeg_loader.rs](../src/video/ffmpeg_loader.rs))。
@@ -69,8 +69,8 @@ Rust コードが走る前に Windows ローダが DLL を解決する必要が�
 | AI モデル 7 本 (*.onnx) | [ai/model_manager.rs:23-53](../src/ai/model_manager.rs) | `data_dir/models/` | path |
 
 > ⚠ この表は **非ポータブル (= 単体exe/インストーラ) の core** の埋め込み機構を示す。
-> **ポータブル版では `mimageviewer-vst3-host.exe` だけは同梱しない** (v2.0.0、未署名 exe の
-> AV 誤検知対策。§4.7 と本書末尾の注を参照)。他 5 経路は portable でも loose 同梱で carry over。
+> **ポータブル版は VST3 host を含む全経路を loose 同梱する**。host と mIV Sound のプラグイン DLL も
+> 配布時に署名し、公開前の VirusTotal 確認を行う (§4.7、release-checklist Phase 3)。
 
 **重要な観察**: 6 経路すべてが「`data_dir::get()` に join → (必要なら) `extract_embedded_file` で
 書き出し → 確定した `PathBuf` を返す」という**同一パターン**。アプリ本体 (UI/描画/async/動画/comic)
@@ -162,10 +162,9 @@ pub fn resolve(asset: Asset) -> Result<PathBuf, String> {
         Asset::OnnxRuntime => dir.join("onnxruntime.dll"),
         Asset::OnnxProvidersShared => dir.join("onnxruntime_providers_shared.dll"),
         Asset::SusieWorker => dir.join("mimageviewer-susie32.exe"),
-        // ※ 実装メモ (v2.0.0): ポータブル版は vst3-host を **同梱しない** (AV 誤検知対策)。
-        //    実コードの所在解決は `native_assets::bundled(name)` で、vst3-host は
+        // 実コードの所在解決は `native_assets::bundled(name)` で、vst3-host は
         //    `vst3_supported()` 経由で「あれば使う / 無ければ機能を自動無効化」する扱い。
-        //    下のスケッチの Asset::Vst3Host 分岐は portable では実質使われない。
+        //    v5 では host も loose 同梱する。欠落した配布物では VST3 を自動無効化する。
         Asset::Vst3Host => dir.join("mimageviewer-vst3-host.exe"),
         Asset::Model(name) => dir.join("models").join(name),
     };
@@ -330,7 +329,7 @@ portable は launcher を使わないので影響しないが、抽出ロジッ�
    続けて `cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo` で editor を生成する。
    5 本とも `--target-dir target-portable` を付け、通常版の `target\release` と混ぜない。
    - launcher (`-p mimageviewer-launcher`) は**ビルドしない**。
-   - VST3 bridge (`mimageviewer-vst3-host.exe`) は **同梱しない** (下記の注を参照)。
+   - VST3 bridge (`mimageviewer-vst3-host.exe`) は現ソースとの identity を照合して同梱する。
 2. 配布フォルダ `dist/portable/` を組み立て:
 
 ```
@@ -340,6 +339,11 @@ mImageViewer_portable/
 ├─ mimageviewer-epub-pdf.exe         (= core が同じディレクトリから起動)
 ├─ mimageviewer-mcp.exe              (= AI アプリが直接起動。--mcp は付けない)
 ├─ mimageviewer-musicvideo.exe       (= core が同じディレクトリから起動)
+├─ mimageviewer-vst3-host.exe         (署名した音声 host)
+├─ vcrt/                             (host 用の Microsoft 署名済み CRT 4 本)
+├─ effetune/
+│   ├─ VERSION
+│   └─ mIV Sound.vst3/                (プラグインの PE も署名する)
 ├─ avcodec-61.dll  avformat-61.dll  avutil-59.dll
 ├─ avfilter-10.dll  swscale-8.dll  swresample-5.dll
 ├─ pdfium.dll
@@ -351,13 +355,23 @@ mImageViewer_portable/
 └─ data/                             (初回起動時に自動作成。zip には空 or 同梱しない)
 ```
 
-> ⚠ **VST3 host exe は v2.0.0 以降ポータブル版に同梱しない**。未署名の
-> `mimageviewer-vst3-host.exe` を一部のセキュリティソフトがランサム誤検知し、ブラウザの
-> zip ダウンロードがブロックされる事象があったため (commit `ec83fee0`)。同梱しないことで
-> `src/video/dsp/vst3_supported()` が `false` を返し、VST3 機能はアプリ側で自動無効化される
-> (設定でも ON 不可)。`build.rs` の vendor チェックも `CARGO_FEATURE_PORTABLE` 時は
-> vst3-host を必須にしない。恒久対策 = bridge exe をコード署名 → 署名後に
-> `build-portable.ps1` の copy 行と build.rs の条件、本節を合わせて復活させる。
+v2.0.0 の未署名 host の AV 誤検知で一度は同梱を止めたが、v5 の F4 で再同梱する。
+配布ビルド (`build-dist.ps1` は既定署名 ON、直接 `build-portable.ps1` は `-Sign`) では host と
+mIV Sound の全 PE に署名する。未署名は開発確認用に限り、公開前に release checklist の VirusTotal 検査を通す。
+`New-MivEffetuneStage` で承認 manifest (`third_party/miv-sound/0.15.0-miv.2/manifest.sha256`) と照合した原本を
+固定 stage に写し、署名後も「署名だけが変わった」検査を通す。配布先は平らな `effetune/mIV Sound.vst3`。
+VERSION と全リソース・通知を含むファイル集合と hash を検証済み stage と照合し、追加・欠落・改変を拒む。
+`-SkipBuild` と診断 smoke 成果物でも同じ検査を省略しない。診断 smoke は未署名。
+
+host は `vcrt/` と System32 から 4 本を一組で選ぶ。`vendor/vcrt/` の公式 CRT 4 本を `vcrt/` に写し、
+本体等のために既存の exe 隣の CRT 4 本も維持する。Microsoft の署名を再署名しない。
+`check-vcrt-pe-dependencies.ps1 -RequireCompanionRuntime` は再帰列挙した host とプラグイン PE を検査し、
+host 用 `vcrt/` の欠落・hash/版/署名の不一致も拒否する。
+
+mIV Sound の設定・プリセット・WebView は `<exe_dir>/data/effetune/{plugin,webview}` に保存し、APPDATA は使わない。
+旧 Mixwright の共有 APPDATA からは移行しない (§5.1 の決定。`migration-v1.not-applicable` を data 配下へ置く)。
+利用者が追加する任意のユーザー VST はプラグイン自身の規則で APPDATA 等を使う場合があり、この保証の対象外。
+WebView2 Runtime は通常版と同じく必要。
 
 4. **同梱漏れ検出**: コピーするファイル一覧を `native_assets` の Asset 列挙と FFmpeg DLL 名から
    導出し、コピー後に全ファイルの存在を assert。1 つでも欠けたらスクリプトを fail させる
@@ -384,7 +398,7 @@ reparseを検査し、使用中のsmokeは停止せず準備を拒否する。
 
 診断の`-SkipBuild`はbuild時のfeature/profile/source fingerprint/exe hashを照合する。
 詳細と自動シナリオの到達点は [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md)。
-従来portableのVST3 bridge非同梱等の制限は、この診断成果物にも適用される。
+診断成果物も VST3 host・mIV Sound・host 用 CRT を同じ配置で含む。署名と zip は作らない。
 
 ## 5. 配布物まとめ + 命名スキーム (実装後)
 
@@ -454,8 +468,10 @@ reparseを検査し、使用中のsmokeは停止せず準備を拒否する。
 - [ ] DRM のない EPUB を変換できる (core と同じディレクトリの EPUB converter を起動)。
 - [ ] AI アップスケール / デノイズが動く (onnxruntime + models loose 解決)。
 - [ ] Susie プラグインが読める (susie32 worker loose 解決 + spawn)。
-- [ ] VST3 が**自動無効化**されている (環境設定→動画タブで「VST3 プラグイン処理」が選択不可・
-      「ポータブル版では利用できません」表示。`vst3_supported()` が false。host exe 非同梱)。
+- [ ] 音響調整ボタン・環境設定・検索・About が通常版と同じく使え、音響調整で音声処理・再生情報・自動表示が動く。
+- [ ] 音響調整の設定・プリセット・WebView は `data/effetune` だけに作られ、旧 APPDATA は取り込まれない。
+- [ ] ユーザー VST のスキャン・追加・音声処理が使える (任意プラグインの保存先は保証対象外)。
+- [ ] VC runtime 未導入の PC でも host が同梱 `vcrt/` を選んで動く。
 - [ ] インストール版をトレイ常駐させた状態でポータブル版を起動 → **両方独立して動く** (mutex 分離)。
 - [ ] フォルダごと別 PC にコピーしても動く (絶対パス依存がない)。
 - [ ] (AV) 手元の Defender / 主要 AV でスキャン → 単体 exe 版より誤検知が減る/消えることを確認。
@@ -478,7 +494,7 @@ reparseを検査し、使用中のsmokeは停止せず準備を拒否する。
 ## 9.5. 既知の制限 — 一時的なシステム temp 書き込み (Codex P3 2026-06-07)
 
 ポータブルの契約は「**永続データ** (設定 / キャッシュ / DB / モデル / DL 物) は `<exe_dir>\data` に置き
-APPDATA を使わない」こと。これは満たしている。一方、以下の **一時ファイル** は依然 system temp
+APPDATA を使わない」こと (利用者が追加するユーザー VST の独自保存は対象外)。一方、以下の **一時ファイル** は依然 system temp
 (`%TEMP%`、C:) に書かれる (いずれも処理後に削除される transient な write で、永続データではない):
 
 - `settings_restore.rs` の `validate_backup`: バックアップ検証時に temp へコピーしてから開く。

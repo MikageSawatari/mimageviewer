@@ -28431,7 +28431,6 @@ mod effetune_toolbar_flavor_tests {
     }
 
     #[test]
-    #[cfg(not(feature = "portable"))]
     fn effetune_button_enables_preparation_retry_but_keeps_other_failures_disabled() {
         use crate::effetune::{EffetuneFailure, EffetuneRuntime, LoadOrigin, UnavailableReason};
         use egui_kittest::kittest::{NodeT, Queryable};
@@ -28504,7 +28503,7 @@ mod effetune_toolbar_flavor_tests {
         let saved = vec![TS::FolderTree, TS::EffeTune, TS::Cols];
         app.settings.toolbar_section_order = saved.clone();
         app.settings.toolbar_section_new_row = vec![TS::EffeTune];
-        // A missing bundle must remain visible in the normal build. Never click or start it.
+        // A missing bundle must remain visible in every build. Never click or start it.
         app.effetune.runtime = crate::effetune::EffetuneRuntime::Unavailable(
             crate::effetune::UnavailableReason::BundleMissing("fixture".into()),
         );
@@ -28525,12 +28524,11 @@ mod effetune_toolbar_flavor_tests {
         for shape in &output.shapes {
             collect_text(&shape.shape, &mut text);
         }
-        assert_eq!(text.contains("音響調整"), !cfg!(feature = "portable"));
-        assert_eq!(
+        assert!(text.contains("音響調整"));
+        assert!(
             app.toolbar_section_anchors
                 .iter()
-                .any(|(id, _)| *id == TS::EffeTune),
-            !cfg!(feature = "portable")
+                .any(|(id, _)| *id == TS::EffeTune)
         );
         assert_eq!(app.settings.toolbar_section_order, saved);
         assert_eq!(app.settings.toolbar_section_new_row, [TS::EffeTune]);
@@ -28539,18 +28537,14 @@ mod effetune_toolbar_flavor_tests {
                 .contains("必要なファイルが見つかりません")
         );
 
-        if cfg!(feature = "portable") {
-            let with_hidden_row = app.toolbar_section_anchors.clone();
-            let with_hidden_row_rect = app.toolbar_content_rect;
-            app.settings.toolbar_section_new_row.clear();
-            let _ = ctx
-                .run_pass(input(), |ctx| {
-                    ctx.root_ui(|root_ui| app.render_toolbar(root_ui));
-                })
-                .drop_without_applying_deltas();
-            assert_eq!(app.toolbar_section_anchors, with_hidden_row);
-            assert_eq!(app.toolbar_content_rect, with_hidden_row_rect);
-        }
+        let section_rect = |id| {
+            app.toolbar_section_anchors
+                .iter()
+                .find(|(section, _)| *section == id)
+                .unwrap()
+                .1
+        };
+        assert!(section_rect(TS::EffeTune).top() > section_rect(TS::FolderTree).top());
 
         output.drop_without_applying_deltas();
     }
@@ -28570,7 +28564,7 @@ mod effetune_toolbar_flavor_tests {
         for shape in &output.shapes {
             collect_text(&shape.shape, &mut text);
         }
-        assert_eq!(text.contains("音響調整"), !cfg!(feature = "portable"));
+        assert!(text.contains("音響調整"));
         assert!(text.contains("ツリー"));
         assert!(app.settings.show_toolbar_effetune);
 
@@ -28579,18 +28573,20 @@ mod effetune_toolbar_flavor_tests {
 
     #[test]
     #[cfg(feature = "portable")]
-    fn hidden_effetune_alone_does_not_create_an_empty_toolbar() {
+    fn portable_effetune_alone_creates_a_toolbar() {
         let mut app = crate::app::setup_app_for_test();
         only_effetune(&mut app.settings);
         app.settings.toolbar_section_order = vec![TS::EffeTune];
         let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
         let _ = ctx
             .run_pass(input(), |ctx| {
                 ctx.root_ui(|root_ui| app.render_toolbar(root_ui));
             })
             .drop_without_applying_deltas();
-        assert!(app.toolbar_section_anchors.is_empty());
-        assert!(app.toolbar_content_rect.is_none());
+        assert_eq!(app.toolbar_section_anchors.len(), 1);
+        assert_eq!(app.toolbar_section_anchors[0].0, TS::EffeTune);
+        assert!(app.toolbar_content_rect.is_some());
     }
 }
 

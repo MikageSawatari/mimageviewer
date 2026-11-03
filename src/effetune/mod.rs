@@ -1065,11 +1065,8 @@ impl EffetuneController {
         let host_main_window = Arc::downgrade(&main_window);
         let host_remote_session = Arc::downgrade(&remote_session);
         let host_repaint = Arc::clone(&repaint_context);
-        let now_playing = now_playing::NowPlaying::new(
-            !cfg!(feature = "portable"),
-            host_tx.clone(),
-            Arc::clone(&repaint_context),
-        );
+        let now_playing =
+            now_playing::NowPlaying::new(true, host_tx.clone(), Arc::clone(&repaint_context));
         let host_now_playing = Arc::downgrade(&now_playing.core);
         let host_failure_tx = failure_tx.clone();
         let auto_open = Arc::new(AutoOpenSession::default());
@@ -1271,12 +1268,6 @@ impl EffetuneController {
         pos: Option<(i32, i32)>,
         size: Option<(u32, u32)>,
     ) -> bool {
-        #[cfg(feature = "portable")]
-        {
-            let _ = (success, pos, size);
-            return false;
-        }
-        #[cfg(not(feature = "portable"))]
         {
             let Some(gate) = self.gui_gate() else {
                 return false;
@@ -1921,7 +1912,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "portable"))]
     fn auto_test_controller() -> EffetuneController {
         let mut controller = EffetuneController::new();
         let gate = controller.gui_gate().unwrap();
@@ -1935,7 +1925,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "portable"))]
     fn auto_success_preserves_revision_and_spends_one_shared_opportunity() {
         let mut controller = auto_test_controller();
         let success = controller.auto_reader().unwrap().snapshot();
@@ -1952,7 +1941,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "portable"))]
     fn undrained_success_after_every_suppression_round_trip_does_not_spend() {
         for factor in [
             gui_gate::AutoSuppression::SettingOff,
@@ -1975,7 +1963,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "portable"))]
     fn manual_loading_intent_wins_and_successful_manual_ack_spends_auto() {
         let mut controller = auto_test_controller();
         controller.click_idle(None, None);
@@ -2032,7 +2019,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "portable"))]
     fn queued_manual_success_revokes_previously_accepted_unshown_auto() {
         let mut controller = auto_test_controller();
         let gate = controller.gui_gate().unwrap();
@@ -2061,14 +2047,17 @@ mod tests {
 
     #[test]
     #[cfg(feature = "portable")]
-    fn portable_never_accepts_auto_video_even_with_eligible_projection() {
+    fn portable_accepts_auto_video_with_eligible_projection() {
         let mut controller = EffetuneController::new();
-        controller.runtime = EffetuneRuntime::Idle;
         let gate = controller.gui_gate().unwrap();
         gate.set_auto_factor(gui_gate::AutoSuppression::SettingOff, false);
         gate.set_auto_factor(gui_gate::AutoSuppression::RootHidden, false);
-        assert!(!controller.try_auto_open(gate.auto_snapshot(), None, None));
-        assert!(!controller.auto_open.spent.load(Ordering::Acquire));
+        controller.runtime = EffetuneRuntime::Loading {
+            origin: LoadOrigin::Startup,
+            open_gui_when_ready: None,
+        };
+        assert!(controller.try_auto_open(gate.auto_snapshot(), None, None));
+        assert!(controller.auto_open.spent.load(Ordering::Acquire));
     }
 
     #[test]
@@ -2107,6 +2096,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "portable"))]
     fn process_generation_pin_is_installed_by_retry_only_once() {
         let temp = tempfile::tempdir().unwrap();
         let version = temp.path().join("runtime/4.3.0");
@@ -2153,7 +2143,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "portable"))]
     fn manual_visible_editor_activates_on_caller_without_host_show_or_visibility_mutation() {
         let mut controller = auto_test_controller();
         let (host_tx, host_rx) = mpsc::channel();
@@ -2188,7 +2177,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "portable"))]
     fn hidden_editor_and_auto_show_keep_checked_host_delivery() {
         let mut controller = auto_test_controller();
         let (host_tx, host_rx) = mpsc::channel();
@@ -2223,7 +2211,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "portable"))]
     fn revoked_manual_intent_never_activates_a_visible_editor() {
         let mut controller = auto_test_controller();
         let (host_tx, _host_rx) = mpsc::channel();
@@ -2240,7 +2227,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "portable"))]
     fn toolbar_only_shows_or_activates_and_close_preserves_position_and_dsp() {
         use crate::video::dsp::bridge::{GuiVisibilityOutcome, NormalScreenRect};
         let mut app = crate::app::setup_app_for_test();
@@ -2996,5 +2982,5 @@ mod tests {
     }
 }
 
-#[cfg(all(test, not(feature = "portable")))]
+#[cfg(test)]
 pub(crate) mod delivery_tests;

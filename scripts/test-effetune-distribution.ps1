@@ -95,6 +95,20 @@ try {
     Assert-True ((Get-FileHash -LiteralPath $pePath).Hash -eq
         (Get-FileHash -LiteralPath (Join-Path $stage $MivSound.Plugin)).Hash) 'staged PE differs'
     Assert-MivEffetuneStage -RepoRoot $testRoot -SourceRoot $stage
+    $package = Join-Path $testRoot 'portable\effetune'
+    New-Item -ItemType Directory -Path $package -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $stage 'VERSION'), (Join-Path $stage $MivSound.BUNDLE_NAME) -Destination $package -Recurse -Force
+    Assert-MivEffetunePortablePackage -RepoRoot $testRoot -SourceRoot $stage -PackageRoot $package
+    $packagePe = Join-Path $package $MivSound.Plugin
+    [System.IO.File]::WriteAllBytes($packagePe, [byte[]]@(1, 2, 3))
+    Assert-Throws { Assert-MivEffetunePortablePackage -RepoRoot $testRoot -SourceRoot $stage -PackageRoot $package } 'Portable copy differs'
+    Copy-Item -LiteralPath (Join-Path $stage $MivSound.Plugin) -Destination $packagePe -Force
+    $packageExtra = Join-Path $package 'extra.js'
+    [System.IO.File]::WriteAllText($packageExtra, 'extra')
+    Assert-Throws { Assert-MivEffetunePortablePackage -RepoRoot $testRoot -SourceRoot $stage -PackageRoot $package } 'Extra unapproved file'
+    Remove-Item -LiteralPath $packageExtra
+    Remove-Item -LiteralPath $packagePe
+    Assert-Throws { Assert-MivEffetunePortablePackage -RepoRoot $testRoot -SourceRoot $stage -PackageRoot $package } 'Missing approved file'
     $extraStage = Join-Path $stage 'unexpected.js'
     [System.IO.File]::WriteAllText($extraStage, 'extra')
     Assert-Throws { Assert-MivEffetuneStage -RepoRoot $testRoot -SourceRoot $stage } 'Extra unapproved file'
@@ -148,7 +162,7 @@ try {
     Assert-Throws { Assert-MivEffetuneSource -SourceRoot $source -NoticesRoot $noticesRoot } 'differs from vendor'
     Remove-Item -LiteralPath (Join-Path $source 'VERSION')
     Assert-Throws { Assert-MivEffetuneSource -SourceRoot $source -NoticesRoot $noticesRoot } 'explicitly approve'
-    foreach ($name in @('build-dist.ps1', 'build-release.ps1', 'check-vcrt-pe-dependencies.ps1', 'effetune-distribution.ps1', 'sign-files.ps1')) {
+    foreach ($name in @('build-dist.ps1', 'build-release.ps1', 'build-portable.ps1', 'check-vcrt-pe-dependencies.ps1', 'effetune-distribution.ps1', 'sign-files.ps1')) {
         $errors = $null; $tokens = $null
         $null = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot $name), [ref] $tokens, [ref] $errors)
         Assert-True ($errors.Count -eq 0) "parse failed: $name"
@@ -158,7 +172,9 @@ try {
         $release.IndexOf('$launcherExit = Invoke-ReleaseCargo')) 'plugin signing happens after embedding'
     Assert-True ($release.Contains('$env:MIMV_EFFETUNE_DIR = $effetuneStage')) 'launcher ignores signed stage'
     $portable = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'build-portable.ps1') -Raw -Encoding UTF8
-    Assert-True (-not $portable.Contains('effetune-distribution.ps1')) 'portable requires EffeTune stage'
+    Assert-True ($portable.Contains('Assert-MivEffetunePortablePackage')) 'portable must verify the staged bundle copy'
+    Assert-True ($portable.Contains("'mimageviewer-vst3-host.exe',")) 'portable host must be signed'
+    Assert-True ($portable.Contains('Invoke-MivSign -Files @($effetunePe')) 'portable plugin PE must be signed'
     Write-Host '[effetune-test] PASS'
 } finally {
     $resolved = [System.IO.Path]::GetFullPath($testRoot).TrimEnd('\')

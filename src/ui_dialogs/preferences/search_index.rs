@@ -1478,14 +1478,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "リモート端末への動画配信を有効にする",
         ["リモート", "remote", "配信", "ストリーミング"]
     ),
-    #[cfg(not(feature = "portable"))]
     entry!(
         "video/effetune-input-limit",
         Video,
         "mIV Sound に渡す前に 0dB を超える音を抑える",
         ["音響調整", "OVERLOAD", "ピーク", "mIV Sound"]
     ),
-    #[cfg(not(feature = "portable"))]
     entry!(
         "video/effetune-auto-open",
         Video,
@@ -1498,14 +1496,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
             "mIV Sound"
         ]
     ),
-    #[cfg(not(feature = "portable"))]
     entry!(
         "video/effetune-taskbar",
         Video,
         "音響調整の窓をタスクバーに表示する",
         ["音響調整", "タスクバー", "taskbar", "復元", "mIV Sound"]
     ),
-    #[cfg(not(feature = "portable"))]
     entry!(
         "video/effetune-minimized",
         Video,
@@ -1935,37 +1931,28 @@ mod tests {
     #[test]
     fn effetune_taskbar_search_matches_the_build_flavor() {
         let result = search_preferences("mIV Sound タスクバー", test_tree_position);
-        #[cfg(not(feature = "portable"))]
         assert_eq!(
             result.first().map(|entry| entry.anchor),
             Some("video/effetune-taskbar")
         );
-        #[cfg(feature = "portable")]
-        assert!(result.is_empty());
     }
 
     #[test]
     fn effetune_minimized_search_matches_the_build_flavor() {
         let result = search_preferences("mIV Sound 最小化", test_tree_position);
-        #[cfg(not(feature = "portable"))]
         assert_eq!(
             result.first().map(|entry| entry.anchor),
             Some("video/effetune-minimized")
         );
-        #[cfg(feature = "portable")]
-        assert!(result.is_empty());
     }
 
     #[test]
     fn effetune_auto_open_search_matches_the_build_flavor() {
         let result = search_preferences("mIV Sound 自動表示", test_tree_position);
-        #[cfg(not(feature = "portable"))]
         assert_eq!(
             result.first().map(|entry| entry.anchor),
             Some("video/effetune-auto-open")
         );
-        #[cfg(feature = "portable")]
-        assert!(result.is_empty());
     }
 
     #[test]

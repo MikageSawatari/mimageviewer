@@ -67,7 +67,7 @@ fn main() {
         root.join(miv_sound_config::NOTICES_ROOT)
             .join(miv_sound_config::VERSION)
     };
-    if std::env::var_os("CARGO_FEATURE_PORTABLE").is_none() {
+    {
         for notice in [
             "Contents/Resources/THIRD-PARTY-NOTICES.txt",
             "Contents/Resources/webview/THIRD-PARTY-NOTICES.txt",
@@ -776,17 +776,11 @@ fn check_vendor_files() {
     // `crates/vst3-host/` をビルドするとここに配置され、初回 VST3 enable 時に
     // `%APPDATA%\mimageviewer\vst3\` へ展開する (PDFium / Susie ワーカーと同パターン)。
     //
-    // ポータブルビルド (feature = "portable") では、未署名 exe が一部のセキュリティ
-    // ソフトに誤検知され zip ダウンロードがブロックされる事象を避けるため **同梱しない**
-    // (`scripts/build-portable.ps1` も copy 対象外、`vst3_supported()` が false を返して
-    // VST3 機能を自動無効化する)。よって portable では必須ファイルにしない。
-    // 将来 exe をコード署名して再同梱する場合は build-portable.ps1 と合わせて復活させる。
-    if std::env::var_os("CARGO_FEATURE_PORTABLE").is_none() {
-        required.push((
+    // ポータブル版も署名した host を loose 同梱するため、コピー元を必須にする。
+    required.push((
             "vendor/vst3-host/mimageviewer-vst3-host.exe",
             "cmake -S crates/vst3-host -B crates/vst3-host/build -G \"Visual Studio 18 2026\" -A x64 && cmake --build crates/vst3-host/build --config Release",
-        ));
-    }
+    ));
 
     required.push((
         "vendor/vlm-worker/mimageviewer-vlm.exe",

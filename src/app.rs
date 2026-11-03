@@ -20353,7 +20353,7 @@ impl App {
     ) -> Self {
         settings.raw_develop_parallelism = settings.raw_develop_parallelism.clamp(1, 10);
         let raw_brightness_for_materializer = settings.raw_brightness;
-        // VST3 bridge host が手に入らない版 (= host exe を同梱しないポータブルビルド) では
+        // ポータブル配布物の VST3 bridge host が欠けている場合は
         // VST3 を強制 OFF にする。設定 DB に true が残っていても (例: 通常版の設定を流用)
         // ここで落とすことで、bridge 起動・動画 VST 経路・設定 UI のすべてが OFF に揃う。
         // 設定ページのトグルも無効化するので、ユーザーが ON に戻すこともできない。
@@ -32923,7 +32923,7 @@ impl App {
         if let Some(gate) = self.effetune.gui_gate() {
             gate.set_auto_factor(
                 crate::effetune::gui_gate::AutoSuppression::SettingOff,
-                cfg!(feature = "portable") || !self.settings.effetune_auto_open_on_video,
+                !self.settings.effetune_auto_open_on_video,
             );
         }
     }
@@ -98759,7 +98759,7 @@ impl App {
         self.publish_mounted_local_now_playing(&now_playing_successes);
         // Sole automatic decision boundary: adopted playback facts survive all native
         // pause/close/source-result processing above, or are discarded in this frame.
-        #[cfg(all(windows, not(feature = "portable")))]
+        #[cfg(windows)]
         for (idx, path, success) in auto_video_successes {
             if self.fullscreen_idx == Some(idx)
                 && self.video_audio_mode != Some(idx)

@@ -33,11 +33,8 @@ pub use scanner::{
 /// この版で VST3 プラグイン機能を利用できるか (= bridge host exe が手に入るか)。
 ///
 /// 通常ビルド (インストーラ / 単体 exe) は bridge exe を `include_bytes!` で埋め込んで
-/// いるので常に `true`。ポータブルビルドでは、未署名の bridge exe が一部のセキュリティ
-/// ソフトに誤検知され zip ダウンロードがブロックされる問題があるため、exe を同梱しない
-/// ことがある。その場合は exe が exe 隣に存在しないので `false` を返し、設定で ON に
-/// できないようにする。将来 bridge exe をコード署名して再同梱すれば、ファイルが見つかる
-/// ので自動的に `true` に戻る (コード変更不要)。
+/// いるので常に `true`。ポータブルビルドも署名した host を exe 隣に同梱する。
+/// そのファイルが欠けている配布物では `false` を返し、設定で ON にできないようにする。
 pub fn vst3_supported() -> bool {
     use std::sync::OnceLock;
     static SUPPORTED: OnceLock<bool> = OnceLock::new();

@@ -285,7 +285,6 @@ const V4_3_HIGHLIGHTS: &[HighlightItem] = &[
         title: "動画の音声トラックを選べます",
         body: "複数の音声トラックがある動画では、下部 HUD の「音声 N」ボタンから聴くトラックを選べます。選んだトラックはファイルごとに記憶し、mIV Remote でも選べます。",
     },
-    #[cfg(not(feature = "portable"))]
     HighlightItem {
         title: "音響調整 (mIV Sound) で音を整えられます",
         body: "ツールバーの「音響調整」ボタンから、イコライザーやエフェクトで動画・音声の音を整えられます。一度設定すると、次からは起動時に自動で有効になります。",
@@ -1046,7 +1045,6 @@ const TABLE: &[VersionHighlights] = &[
                 title: "リモート接続中は PC の閲覧ウィンドウを閉じます",
                 body: "mIV Remote の接続を受け付けると、フルスクリーンや別ウィンドウなど PC 側の閲覧ウィンドウを閉じ、「リモート接続中」の表示だけにします。切断すると一覧に戻ります。閉じた閲覧ウィンドウは元に戻りません。",
             },
-            #[cfg(not(feature = "portable"))]
             HighlightItem {
                 title: "ツールバーに「音響調整」ボタンが加わりました",
                 body: "同梱の音響調整 (mIV Sound) を開くボタンです。不要な場合は、ツールバーの項目を右クリックして外せます。",
@@ -1099,7 +1097,6 @@ const TABLE: &[VersionHighlights] = &[
                 title: "検索や絞り込みで集めた一覧は、単ページから開きます",
                 body: "Ctrl+G・タグ・★・スマートフォルダ・コレクションなどの一覧をフルスクリーンで開くと、毎回単ページから始まります。2〜5 を押すと、その間だけ見開きで読めます。",
             },
-            #[cfg(not(feature = "portable"))]
             HighlightItem {
                 title: "音響調整の窓がタスクバーに出るようになり、ボタンでは閉じなくなりました",
                 body: "音響調整ボタンは窓を前面に出すだけになりました。窓はタイトルバーの × で閉じます。タスクバーに出さない場合は、環境設定の「動画・音声 → 動画」でオフにします。",
@@ -1671,14 +1668,8 @@ mod tests {
         let entries = for_version("4.3.0", table());
         assert_eq!(versions(&entries), ["4.3.0"]);
         let entry = entries[0];
-        assert_eq!(
-            entry.must_read.len(),
-            if cfg!(feature = "portable") { 1 } else { 2 }
-        );
-        assert_eq!(
-            entry.highlights.len(),
-            if cfg!(feature = "portable") { 2 } else { 3 }
-        );
+        assert_eq!(entry.must_read.len(), 2);
+        assert_eq!(entry.highlights.len(), 3);
         assert!(
             entry
                 .must_read
@@ -1702,7 +1693,7 @@ mod tests {
             let announces_effetune = items
                 .iter()
                 .any(|item| item.title.contains("音響調整") || item.body.contains("mIV Sound"));
-            assert_eq!(announces_effetune, !cfg!(feature = "portable"));
+            assert!(announces_effetune);
         }
     }
 

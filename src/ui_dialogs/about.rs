@@ -23,7 +23,6 @@ const HARMNET_NOTICE: (&str, &str, &str) = (
 const IJG_ATTRIBUTION: &str =
     "This software is based in part on the work of the Independent JPEG Group.";
 
-#[cfg(not(feature = "portable"))]
 fn draw_miv_sound_credits(ui: &mut egui::Ui) {
     ui.label(egui::RichText::new("mIV Sound (MIT)").strong());
     for text in [
@@ -112,8 +111,7 @@ pub fn draw_avif_license_snapshot_fixture(ui: &mut egui::Ui) {
     );
 }
 
-// portable は Mixwright bundle / notices を同梱しない。HarmNet は上の共通 notice。
-#[cfg(not(feature = "portable"))]
+// mIV Sound bundle / notices は portable を含む全構成で同梱する。
 const EFFETUNE_NOTICES: &[(&str, &str, &str)] = &[
     (
         "mIV Sound THIRD-PARTY-NOTICES 全文",
@@ -219,7 +217,6 @@ impl App {
                         ui.label(HARMNET_NOTICE.1);
                         ui.end_row();
 
-                        #[cfg(not(feature = "portable"))]
                         {
                             ui.label("mIV Sound");
                             ui.label("MIT — Yoshiyuki Kobayashi");
@@ -267,7 +264,6 @@ impl App {
                         ui.end_row();
                     });
 
-                #[cfg(not(feature = "portable"))]
                 {
                     ui.add_space(8.0);
                     draw_miv_sound_credits(ui);
@@ -343,7 +339,6 @@ impl App {
                     RUST_DEFLATE_NOTICES,
                 );
 
-                #[cfg(not(feature = "portable"))]
                 for &(title, relative_path, text) in EFFETUNE_NOTICES {
                     egui::CollapsingHeader::new(title)
                         .id_salt(("about_effetune_notice", relative_path))
@@ -512,7 +507,6 @@ mod tests {
         assert!(EGUI_LICENSE_APACHE.contains("Version 2.0, January 2004"));
     }
 
-    #[cfg(not(feature = "portable"))]
     #[test]
     fn miv_sound_credits_snapshot_light_and_narrow_dark() {
         use egui_kittest::kittest::Queryable;
@@ -608,7 +602,6 @@ mod tests {
         harness.get_by_label(super::HARMNET_NOTICE.2);
     }
 
-    #[cfg(not(feature = "portable"))]
     #[test]
     fn effetune_notice_texts_include_attribution_and_match_vendor_when_present() {
         use super::EFFETUNE_NOTICES;

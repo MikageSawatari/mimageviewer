@@ -118,6 +118,20 @@ function Assert-MivEffetuneStage {
     }
 }
 
+function Assert-MivEffetunePortablePackage {
+    param([string] $RepoRoot, [string] $SourceRoot, [string] $PackageRoot)
+    Assert-MivEffetuneStage -RepoRoot $RepoRoot -SourceRoot $SourceRoot
+    $entries = Read-MivEffetuneManifest -ManifestPath (Join-Path $RepoRoot $MivSound.Manifest)
+    $sourceFiles = Assert-MivEffetuneFileSet -SourceRoot $SourceRoot -Entries $entries
+    $packageFiles = Assert-MivEffetuneFileSet -SourceRoot $PackageRoot -Entries $entries
+    foreach ($name in $entries.Keys) {
+        if ((Get-FileHash -LiteralPath $sourceFiles[$name] -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $packageFiles[$name] -Algorithm SHA256).Hash) {
+            throw "[effetune] Portable copy differs from verified stage: $name"
+        }
+    }
+}
+
 function Assert-MivEffetuneSource {
     param([string] $SourceRoot, [string] $NoticesRoot)
     $versionPath = Join-Path $SourceRoot 'VERSION'
