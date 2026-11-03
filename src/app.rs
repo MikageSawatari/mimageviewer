@@ -17494,6 +17494,8 @@ pub struct App {
     pub(crate) address_has_focus: bool,
     /// 左側の実フォルダツリーペインの状態。ZIP/PDF などの仮想フォルダは含めない。
     pub(crate) folder_pane: crate::folder_pane::FolderPaneState,
+    pub(crate) folder_pane_visibility_request:
+        Option<crate::ui_folder_pane::FolderPaneVisibilityRequest>,
 
     // ── フォルダ移動履歴（戻る/進む + 履歴メニュー）───────────────
     /// フォルダ移動履歴の戻るスタック。末尾が次に戻る先。
@@ -21341,6 +21343,7 @@ impl App {
             exif_sections_open: std::collections::HashMap::new(),
             address_has_focus: false,
             folder_pane: crate::folder_pane::FolderPaneState::default(),
+            folder_pane_visibility_request: None,
             folder_nav_back_stack: Vec::new(),
             folder_nav_forward_stack: Vec::new(),
             recent_folders,
@@ -35716,6 +35719,9 @@ impl App {
     ) {
         if !self.main_folder_history_available() {
             return;
+        }
+        if explicit_request {
+            self.retire_folder_tree_pane_close_navigation();
         }
         self.cancel_unresolved_open_for_navigation(explicit_request);
         self.retire_close_returns_for_main_admission();
@@ -58150,11 +58156,9 @@ impl App {
             return Some(nav);
         }
         // ペイン開閉トグル (F) は `folder_pane_blocks_grid_keyboard()` の early-return
-        // より **前** で処理する。ペイン表示は即フォーカスを奪う (set_folder_tree_pane_visible)
-        // ため、early-return の後ろに置くと「F で開く」はできても「F で閉じる」が
-        // 効かない片道トグルになる (ペインにフォーカスがある間は閉じられない)。
-        // 閉じる時はカーソルが別フォルダへ動いていれば Enter 相当でそこへ移動する
-        // (`toggle_folder_tree_pane_from_key`)。
+        // より **前** で消費する。適用とfocus変更はclick処理後のframe末尾へ集約する。
+        // 非表示からF→矢印が同じframeに入った場合、矢印は開く前の一覧へ届く
+        // (利用者が受け入れた制限)。表示中のFもここで受理して閉じられるようにする。
         if !self.address_has_focus
             && !self.search_has_focus
             && !self.favsearch.has_focus
@@ -58166,8 +58170,9 @@ impl App {
                 .keymap
                 .consume_action(ctx, KeyAction::GridToggleFolderTreePane)
         {
-            self.toggle_folder_tree_pane_from_key();
-            return None;
+            self.request_folder_tree_pane_toggle(
+                crate::ui_folder_pane::FolderPaneToggleKind::CommitCursorOnClose,
+            );
         }
         if self.folder_pane_blocks_grid_keyboard() {
             return None;
