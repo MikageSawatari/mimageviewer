@@ -2054,3 +2054,138 @@ P3 1 件の文言の修正なので、V1-4b の設計のレビューはここで
   (関連 176 件・サムネイル関連 161 件は実装担当の環境で成功)。v5 の区切りで mcp-trial へ取り込む前に全件を流し直す。
 - 実機・実モデルでの確認は未実施 (利用者に依頼する)。
 
+### 21.15 V2 の設計 (2026-11-03)
+
+§8 (検索への反映) と §6.7 (本を索引に載せる、U17) を、コードを確かめて具体化する。2 段に分ける。
+V2a は画像・PDF の文書に説明文を足すことと反映の仕組み、V2b は説明文のある書庫・フォルダの本を索引と結果に出すこと。
+V2b は V2a の反映の仕組みと読み込みの関数を使うので、この順に作る。
+
+#### 21.15.1 コードで確かめた前提
+
+- `ai_caption.db` の `captions` には `rev`・`indexed` 列、`caption_seq`・`caption_removed` と 3 つの trigger が V1-2 で入っている (`ai_caption_db.rs` の `ensure_schema`)。
+  trigger が見る列に `indexed` は入っていないので、反映済みの更新は印を戻さない (既存のテストあり)。反映待ちを読む関数と反映済みにする関数はまだ無い。
+- 索引のキー (`fts_meta.files.path`、Tantivy の `path`) と `captions.item_key` は、どちらも「小文字・`/` 区切り・ドライブ付き」の同じ正規化
+  (`search_index_db::normalize_path` と `adjustment_db::normalize_path`)。`OwnedRange::sql_ranges()` の範囲はそのまま `item_key` に使える。
+- Tantivy の schema は `fts_index.rs` の `build_schema`、`INDEX_VERSION` は `fts_meta.rs` で 10。版を上げると、既存の作り直しの owner
+  (`indexer_manager::open_stores_with_rebuild_sync`) が `files` と走査済みの印を消し、Tantivy を作り直す。
+- 管理役 (`IndexerSupervisor`) の命令の通り道は容量 4 の `try_send` で、あふれると捨てる。管理役は少なくとも 1 秒ごとに自分で起きる (`WATCH_HEALTH_POLL`)。
+- タグ・評価・その他の DB の変更を索引へ反映する仕組みは今は無い (タグは索引に入れず、評価は結果に後から付ける)。説明文の反映は初めての「DB の変更を索引へ反映する」経路になる。
+- 検索の結果 `GlobalHit` は種類を持たない (索引には `kind` が保存されているが、結果へ読み戻していない)。Flat は `.zip` の結果を捨て、項目化
+  (`grid_item_from_fs_hit_path`) は拡張子で決めるので、RAR・7z・LZH とフォルダは画像になる。MCP の `item_from_hit` は RAR・7z・LZH を `Other` にする。
+- `global_search::run` を呼ぶのは Ctrl+G・MCP の `search_items`・スマートフォルダ。リモートは呼ばない。
+- Ctrl+F は worker で項目ごとにファイルを読む (Pass 1 は順に、Pass 2 は 8 本の並列で画像・動画)。DB は引いていない。
+- Ctrl+G・Ctrl+F の「検索対象」は単一選択の `TARGET_CHOICES`、Ctrl+G の「種類」は単一選択の `KIND_CHOICES` (`Option<IndexKind>`、画像・PDF・動画・音声)。
+
+#### 21.15.2 V2a: 説明文の検索と反映の仕組み
+
+1. **索引の欄**: Tantivy に `ai_caption_text` (説明文・画像内の文字・検索語を空白でつないだもの。`status = ok` の行だけ) を足す。他の本文の欄と同じ
+   bigram・STORED。`SourceKind::AiCaption` を足し、`SourceKind::ALL` に入れる。`PerSourceText` に欄を足し、`text_field_for`・`doc_per_source_text`・
+   `schema_is_stale` の必須欄に入れる。`INDEX_VERSION` を 11 に上げる (§8。U3 で作り直しを受け入れ済み)。
+2. **ingest で読む**: `IngestSession` は `CaptionDb::open_read_only` を 1 回開いて持ち (無ければ「説明文なし」)、画像・PDF・EPUB の文書を作るときに
+   `get(key)` で読む。動画・音声は読まない (§1 で対象外)。開けない・読めないはまれな失敗として扱う。ログに残し、説明文なしで文書を作る。
+   全件の走査・作り直しもこの経路なので、DB の内容がそのまま入る。
+3. **反映待ちの読み書き** (`ai_caption_db.rs`): `pending_in_ranges(ranges, limit) -> Vec<(item_key, rev, removed: bool)>` (`indexed = 0` の行と `caption_removed`)、
+   `mark_reflected(&[(item_key, rev, removed)])` (`captions` は `indexed = 1 WHERE item_key = ? AND rev = ?`、`caption_removed` は一致する行を消す)。
+   書き込みは既存の busy_timeout に従う。
+4. **知らせは共有の世代番号 1 つ** (§8 の「管理役ごとの旗と配り役」を簡素化する。§21.15.4)。
+   - `IndexerManager` が `Arc<AtomicU64>` の `caption_epoch` を持ち、`SupervisorParams` で全管理役に同じものを渡す。
+   - 送り手は DB の commit の後に `fetch_add(1)` するだけ。
+   - 管理役は自分が最後に処理した値 (`seen`) を持つ。ループの起床のたびに、次のように進める。
+     1. 今の値 `e` を読み、`seen` と違えば反映を行う。
+     2. 終わったら `seen = e` にする。
+   - 読む前に `e` を取るので、反映の途中で書かれたものは値が進み、次の起床で拾われる。
+   - 管理役ごとの状態は `seen` の 1 つだけで、配り役も、容量のある通り道も使わない。起床は既存の 1 秒ごとの自分での起床で足りる。
+5. **管理役の反映** (`indexer_supervisor`): 反映を行うのは、(1) 最初の走査の後 (走査を省いた場合も)、(2) 全件走査の後、(3) 世代番号が変わったとき。
+   - **何を読むか:** metadata が有効な管理役だけが、自分の `OwnedRange` の範囲の反映待ちを読む。1 回に読む件数には上限 (例: 500) を置き、繰り返す。
+   - **各キーの扱い:** 既存の `build_candidate_from_path` で候補を作り直して再 ingest する。候補を作れなければ (ファイルが無い・対象外の種類)、既存の watcher と同じく文書を消す。
+   - **反映済みにする時:** 索引の commit の後で、読んだ `(item_key, rev)` だけを反映済みにする。取り消しは既存の cancel に従う。
+6. **送り手** (`ai_caption.db` の行を変える commit のすべて): 作成ジョブの保存 (`Written`)、メタ情報の取り込み (`ImportChangedSections.ai_captions`)、
+   STORES の汎用操作 (付け替え・コピー・復元・孤児整理で `ai_caption.db` の行が変わったとき)、本への追記の直接の DELETE、content identity の復元、
+   ほか grep で見つかる書き手すべて。
+   - 判定には `StoreMutationEffects` に `ai_caption.db` だけの変更を表す値を持たせる。表示用の `caption_display_stale` は固定表紙の DB も含むので、そのままは使わない。
+   - V1-4a の表示の無効化と同じ場所から呼ぶ。送り忘れても、次の起動・全件走査の後に拾われる (§8)。
+7. **お気に入りの外の削除の印**: どのお気に入りの root にも属さない `caption_removed` の行は、メタ情報の所有の初回の構成の後に 1 回だけ消す (§8)。
+8. **Ctrl+F**: 項目一覧の worker で、Pass 2 の前に `open_read_only` を 1 回開き、次の項目の `status = ok` の説明文を `HashMap` に読む。
+   - 対象は画像の項目と、本の項目 (`PdfFile`・`ZipFile`・`ConvertibleArchive`・`Folder`)。
+   - Pass 1 (本の項目) と Pass 2 (画像) で、`AiCaption` が検索対象に入っていれば比較の文字列に足す。
+   - UI スレッドでは DB を読まない。ZIP の中で検索対象をファイル名に固定する既存の規則は変えない。
+9. **検索対象の選択肢**: `TARGET_CHOICES` に「AI 説明」を足す (Ctrl+G・Ctrl+F 共通)。「すべての対象」は説明文を含む (§8、利用者自身の検索は全種類)。
+   スマートフォルダが「すべての対象」で検索するなら、説明文で当たる項目も入る (利用者自身の検索として扱う)。
+10. **MCP**: `search_items` は検索対象を `SearchTarget::Only(SourceKind::ALL から AiCaption を除いたもの)` にする。
+    - **V3 で「AI 説明文」のチェックを足すまで、MCP からは説明文で検索できない** (§8 の P1-2。チェックの既定は OFF、U2)。
+    - 後置の絞り込み (`doc_text_for_target`) も同じ対象で行われることを確かめる。
+11. **公開文書・設計文書**:
+    - マニュアルの検索の節に「AI 説明」の検索対象を足す。
+    - `docs/search-architecture.md` (§4.1・§4.11 の版の履歴・§5.2・§5.3) を更新する。
+    - 計画書には実装記録 §21.16 を作る。
+
+#### 21.15.3 V2b: 説明文のある本を索引と結果に出す
+
+1. **載せる条件の判定を 1 つの関数にする**。`caption_book_candidate(path, &CaptionDb) -> BookCandidateDecision` を作る (§6.7、独立レビュー 6 回目 P2-6)。
+   - 結果は「載せる (書庫かフォルダかの種類)」か「載せない」。
+   - 載せる条件は、`status = ok` の行があり、パスが実在する書庫 (ZIP・CBZ と `ArchiveFormat` の RAR・7z・LZH) かフォルダであること。
+   - 走査・反映・watcher の 3 つの経路がこれを使う。PDF・EPUB は今どおり説明文によらず載せる。
+2. **走査**: `search_walker` の全件の走査で、`OwnedRange` の中の `status = ok` の行を 1 回の問い合わせで読む。
+   - 書庫・フォルダの拡張子に当たるキーだけを、worker で stat して候補にする。
+   - 候補の種類 `CandidateKind` に `Book(BookIndexKind::{Archive, Folder})` を足す。
+   - 差分の署名は、書庫はファイルの mtime・size、フォルダはフォルダの mtime と size 0。説明文の変更は反映の仕組みが拾うので、署名に説明文は入れない。
+   - 「ZIP を候補に入れない」(案 B1) と「フォルダは候補にしない」の例外はここだけにする。走査の印の指紋には、本の候補を含むことを表す成分を足す。
+     版は 11 のまま出荷し、開発機の索引は指紋の違いで走査し直される。
+3. **ingest**: 本の文書は、名前 (`Filename`) と説明文 (`AiCaption`) だけにする。
+   - `IndexKind` は、書庫が `Zip`、フォルダが `Folder` (どちらも既存の値)。
+   - `fts_meta.files` の行も、既存の文書と同じく作る・消す。
+4. **watcher**: Upsert の候補作り (`build_candidate_from_path`) で、フォルダと書庫の拡張子を断る前にこの判定を通す。載せないなら今どおり文書を消す。
+5. **反映**: 21.15.2 の 5 の候補作りが同じ関数を使うので、説明文を作れば載り、消せば消える。
+6. **結果の種類**: `GlobalHit` に `kind: IndexKind` を足し、`search_page` で保存済みの `kind` を読み戻す。以降の項目化は、この種類で決める。
+   - **項目化** (`grid_item_from_fs_hit_path`): `Zip` は拡張子で `ZipFile` または `ConvertibleArchive { format }`、`Folder` は `GridItem::Folder`。
+     画像・PDF・動画・音声は今どおり。UI スレッドで stat しない。
+   - **Flat:** ZIP の中の結果を捨てる規則は残す。`.zip` の結果を捨てる規則は外し、種類で判断する (本の結果を出す)。
+   - **Drill:** 開いたフォルダの中の本の結果は、そのまま項目にする。同じパスに子フォルダのまとめ (結果を含む子フォルダの欄) もあるときは、欄を 1 つにする。
+     まとめの欄を残し、検索の中を進めるようにする。
+   - **Aggregated:** 本の結果は親フォルダの群に数える。代表のサムネイルは画像の結果から選ぶ (本の結果を画像として読まない)。
+   - **結果から本を開く:** 既存の `open_grid_container_with_mode` を使う。`advance_drilled_current_path` の ZIP の判定 (`is_zip`) は、変換済みの書庫
+     (`ConvertibleArchive`) でも ZIP と同じにする。
+7. **Ctrl+G の「種類」**: `KIND_CHOICES` に「書庫・フォルダの本」を足す。
+   - 選んだときの `SearchScope.kinds` は `[Zip, Folder]` にする。
+   - 選択の型 (`Option<IndexKind>`) は変えず、`Some(IndexKind::Zip)` を「書庫・フォルダの本」の意味にする (保存しているなら形が変わらないようにする)。
+   - 「すべての種類」は本も含む。表示の種類の設定 (`visibility`) と `ignore_epub` の扱いが、フォルダ・書庫の結果で正しいかを確かめる。
+8. **MCP**: `item_from_hit` は結果の種類で分類する。
+   - `Zip` は `Archive`、`Folder` は `Folder`。
+   - 結果以外の分類 (`get_item_info` など) も、`ArchiveFormat` の RAR・7z・LZH を `Archive` にし、`library_row` と揃える。
+   - `index_kind` の `Archive`・`Folder` の絞り込みは、本の文書に当たる。
+   - V2a の 10 のとおり、MCP では説明文の欄で当たらないので、本は名前で当たったときだけ出る。
+9. **公開文書・設計文書**:
+   - マニュアルの検索の節に、次の 2 点を足す。
+     - 説明文のある書庫・フォルダの本は、Ctrl+G でも本として出ること。
+     - 「種類」に「書庫・フォルダの本」があること。
+   - `docs/search-container-item-redesign.md` §3.2 に、案 B1 の例外 (U17) を書く。
+   - `docs/search-architecture.md` §4.6 にも案 B1 の例外を書く。
+   - 実装記録は計画書の §21.17 に書く。
+
+#### 21.15.4 状態を減らす検討
+
+- **反映待ちの一覧は DB だけが持つ** (§8 のまま)。メモリ上の待ち行列を作らない。
+- **知らせを、§8 の「管理役ごとの `AtomicBool` と、`metadata_reconfiguration` の配り役」から、全管理役で共有する世代番号 1 つに改めた**。
+  - 世代番号なら、ある管理役が読んでも他の管理役の「未処理」は消えない。そのため、§8 で共有の旗を退けた理由 (独立レビュー 4 回目 P2) に当たらない。
+  - 管理役の一覧を持つ側へ配る処理と、管理役ごとの旗が要らなくなる。起床は既存の 1 秒ごとの自分での起床に乗せる。
+- **本の判定は DB の今の状態を読むだけ**にする。索引に「説明文で載せた本」の別の印を持たない。
+- 採らなかった案: 世代番号の代わりに命令の通り道 (容量 4) で知らせる案。あふれたときに落ちる (§8 の理由)。
+- まれな失敗 (DB を開けない・反映済みの書き込みの失敗・索引の commit の失敗) は割り切る。ログに残し、次の起動・全件走査で拾い直す。
+
+#### 21.15.5 テスト
+
+- **V2a:**
+  - ingest が `status = ok` の行だけを欄に入れること。
+  - 反映待ちの読み取りが `OwnedRange` の外と子のお気に入りの範囲を読まないこと。
+  - `(item_key, rev)` が一致するものだけを反映済みにすること (読んだ後に書かれた行は残る)。
+  - 削除の印。
+  - 世代番号の取りこぼしが無いこと (反映の途中の書き込み)。
+  - 送り手のそれぞれ (ジョブ・取り込み・STORES・本への追記・復元) で世代番号が進むこと。
+  - Ctrl+F の画像と本の項目。
+  - MCP の検索で説明文だけの語が当たらないこと。
+  - 版の上げで作り直しになること。
+- **V2b:**
+  - 3 つの経路で判定が同じになること。説明文を作ると載り、消すと文書と `fts_meta` の行が消えること。失敗の行だけでは載らないこと。
+  - RAR・フォルダの結果が本として項目化されること。Flat・Drill・Aggregated での扱い。
+  - 種類の絞り込み。
+  - MCP の分類。
