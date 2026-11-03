@@ -3,7 +3,9 @@
 use eframe::egui;
 
 use crate::app::App;
-use crate::folder_pane::{self, FolderPaneCommand, FolderPaneListingOptions, FolderPaneTreeKey};
+use crate::folder_pane::{
+    self, FolderPaneCommand, FolderPaneCursorScroll, FolderPaneListingOptions, FolderPaneTreeKey,
+};
 use crate::ui_main::AddressBarNav;
 
 const FOLDER_PANE_MIN_WIDTH: f32 = 180.0;
@@ -233,7 +235,7 @@ impl App {
         self.settings.save();
     }
 
-    /// トグルキー (キーボード T / ゲームパッド Y) でフォルダツリーペインを開閉する。
+    /// トグルキー (キーボード F / ゲームパッド Y) でフォルダツリーペインを開閉する。
     /// - 非表示 → 表示 (カーソルはアクティブフォルダに置かれる)。
     /// - 表示中 → 閉じる。ただしカーソルが別フォルダへ動いていれば、Enter と同じく
     ///   そのフォルダへ移動してグリッド一覧に戻ってから閉じる
@@ -410,7 +412,10 @@ impl App {
 
     fn render_folder_pane_header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let selected_drive = self.folder_pane.selected_drive.clone();
+            let selected_drive = self
+                .folder_pane
+                .selected_drive()
+                .map(std::path::Path::to_path_buf);
             let selected_text = selected_drive
                 .as_deref()
                 .map(folder_pane::drive_label)
@@ -475,8 +480,26 @@ impl App {
         }
 
         let mut nav = None;
-        let scroll_to_cursor = self.folder_pane.scroll_to_cursor;
-        let mut cursor_scrolled = false;
+        // Take the old request so clicks/arrows during this draw can publish a
+        // new Requested without the old draw's completion overwriting it.
+        let mut cursor_scroll = std::mem::take(&mut self.folder_pane.cursor_scroll);
+        if cursor_scroll == FolderPaneCursorScroll::FollowingRefresh
+            && ui.is_enabled()
+            && ui.rect_contains_pointer(ui.clip_rect())
+            && ui.input(|input| {
+                input.pointer.any_pressed()
+                    || input.smooth_scroll_delta() != egui::Vec2::ZERO
+                    || input
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
+            })
+        {
+            // A press starts scrollbar/content dragging (or a new row action).
+            // Explicit input in this pane takes ownership from automatic reveal.
+            cursor_scroll = FolderPaneCursorScroll::Idle;
+        }
+        let mut cursor_drawn = false;
         // Preserve a path and its in-row offset across automatic cache replacement.
         // Button/text minimum sizes can exceed the requested 24pt label height.
         // Reuse the pitch measured from the actual row allocation on the last draw.
@@ -488,21 +511,30 @@ impl App {
             .data(|data| data.get_temp::<FolderPaneScrollMemory>(memory_id));
         let pitch = previous.as_ref().map_or(0.0, |previous| previous.pitch);
         let mut drawn_pitch = pitch;
+        let paths_changed = previous
+            .as_ref()
+            .is_none_or(|previous| previous.paths != paths);
         let restore = previous
             .as_ref()
             .filter(|previous| previous.paths != paths)
             .map(|previous| previous.restore(&paths, pitch));
         let mut scroll = egui::ScrollArea::vertical()
+            // Commit a one-shot reveal in this layout, with no absolute native
+            // animation target left alive across later cache replacements.
+            .animated(false)
             .scroll_source(egui::scroll_area::ScrollSource {
                 drag: egui::scroll_area::DragScroll::Always,
                 ..Default::default()
             })
             .id_salt("folder_pane_tree_scroll")
             .auto_shrink([false, false]);
-        if !scroll_to_cursor && let Some(offset) = restore {
+        if cursor_scroll == FolderPaneCursorScroll::Idle
+            && let Some(offset) = restore
+        {
             scroll = scroll.vertical_scroll_offset(offset);
         }
-        let output = scroll.show(ui, |ui| {
+        let mut output = scroll.show(ui, |ui| {
+            let mut cursor_revealed = false;
             ui.set_width(ui.available_width());
             for row in rows {
                 let (arrow_resp, resp, row_rect) =
@@ -511,6 +543,10 @@ impl App {
                 #[cfg(test)]
                 ui.ctx().data_mut(|data| {
                     data.insert_temp(folder_pane_test_row_rect_id(&row.path), row_rect);
+                    data.insert_temp(
+                        egui::Id::unique(("folder_pane_test_label_id", row.path.as_path())),
+                        resp.id,
+                    );
                 });
                 if (row.expanded || row.has_children_or_unknown) && arrow_resp.clicked() {
                     self.folder_pane.set_focus_tree();
@@ -533,17 +569,40 @@ impl App {
                         nav = Some(row.path.clone());
                     }
                 }
-                if scroll_to_cursor && row.is_cursor {
-                    resp.scroll_to_me(Some(egui::Align::Center));
-                    cursor_scrolled = true;
+                if cursor_scroll != FolderPaneCursorScroll::Idle && row.is_cursor {
+                    cursor_drawn = true;
+                    if cursor_scroll == FolderPaneCursorScroll::Requested
+                        || paths_changed
+                        || (drawn_pitch - pitch).abs() > 0.1
+                    {
+                        resp.scroll_to_me(Some(egui::Align::Center));
+                        cursor_revealed = true;
+                        #[cfg(test)]
+                        ui.ctx().data_mut(|data| {
+                            let id = egui::Id::unique("folder_pane_test_cursor_scrolls");
+                            let count = data.get_temp::<usize>(id).unwrap_or_default();
+                            data.insert_temp(id, count + 1);
+                        });
+                    }
                 }
             }
+            cursor_revealed
         });
+        if output.inner {
+            // The new reveal owns this vertical position. Retire the previous
+            // drag/animation motion even when the reveal's delta was zero.
+            output.state.stop_vertical_scroll_motion();
+            output.state.store(ui.ctx(), output.id);
+        }
         #[cfg(test)]
         ui.ctx().data_mut(|data| {
             data.insert_temp(
                 egui::Id::unique("folder_pane_test_viewport"),
                 output.inner_rect,
+            );
+            data.insert_temp(
+                egui::Id::unique("folder_pane_test_scroll_state"),
+                output.state,
             );
         });
         ui.ctx().data_mut(|data| {
@@ -556,8 +615,16 @@ impl App {
                 },
             )
         });
-        if scroll_to_cursor && cursor_scrolled {
-            self.folder_pane.scroll_to_cursor = false;
+        if self.folder_pane.cursor_scroll == FolderPaneCursorScroll::Idle {
+            self.folder_pane.cursor_scroll = if cursor_drawn {
+                if self.folder_pane.has_pending() {
+                    FolderPaneCursorScroll::FollowingRefresh
+                } else {
+                    FolderPaneCursorScroll::Idle
+                }
+            } else {
+                cursor_scroll
+            };
         }
         nav
     }
