@@ -2299,6 +2299,42 @@ Windowsエラー5 `PermissionDenied`。後者はadapter実行体の取得・起�
 §21.16.1の修正と回帰を追加した。その後の追加指摘はなかった。設計担当の検収・実機確認は未実施。
 製品起動・外部通信・`G:\home\vlm-eval\` の参照・コミットは行っていない。
 
+#### 21.16.4 独立レビュー指摘への対応（基準 `072be6e76`）
+
+V2a実装は設計担当が `072be6e76` にコミットした。本追記の修正はその後の未コミット差分。
+設計担当が妥当と判断した独立レビューのP2 1件・P3 1件へ、指定された方針で対応する。
+
+- **P2：DB初回作成と読取の競合**。`Connection::open` が空ファイルを作ってから、schema初期化の
+  transactionがcommitするまでの間にも、従来のreadonly openは接続を公開していた。その接続の
+  `get` が `no such table: captions` となり、通常の初回作成を読取障害と誤認して全索引の
+  作り直しを予約し得た。
+  `CaptionDb::open_read_only` が接続後に `PRAGMA user_version` を読み、0なら `Ok(None)`、
+  1なら接続を公開、未知の版ならエラーを返す境界へ変更した。`ensure_schema` は表・triggerと
+  `user_version = 1` を既に同じtransactionでcommitしていることを確認し、その契約をコメントした。
+  ingestは既存の `Ok(None)` として扱い、次の反映・走査開始時に開き直す。表示workerとCtrl+Fも
+  同じreadonly境界を使う。新しい待機・retry・状態・索引版上げは加えない。
+- 回帰は、空ファイル、表のない版0のSQLite DB、未commitのschema版を別接続から読む順序、
+  初期化後の公開、未知の版の拒否と原本不変を確認する。ingestは空ファイル／版0 DBの両方で
+  読取エラー・通知・再構築予約がなく、初期化後の再openで説明文を索引へ入れられることを確認する。
+- **P3：EPUBの記述**。`search-architecture.md` §4.1のCtrl+Fについて、ファイル名と保存済みの
+  AI説明を検索し、EPUB内部のタイトル・著者と生成PDFのInfo辞書は検索しない記述へそろえた。
+
+設計担当から受領した修正前の検証結果：本体lib 15,553件中6件が失敗し、スマートフォルダ遷移5件と
+scroll_661 1件の待機timeout（機械混雑時）との報告。6件はいずれも単独で成功し、こちらの環境で
+PermissionDeniedになった既存IPC 2件も、設計担当の全件実行では成功した。これは設計担当の観測であり、
+今回こちらで全件・IPC・当該6件を再実行した結果ではない。
+
+今回の検証は通常feature、`--offline` / `CARGO_NET_OFFLINE=true`。変更コードを固定して実行した。
+
+| 確認 | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/ai_caption_db::\|ingest_worker::\|caption_display\|caption_reflection\|caption_read_failure/)' --no-fail-fast` | **71件成功、失敗0、exit 0**。run `dbdd249a-b1ca-4095-b30d-10028ca770a2`、`target/v2a-review-fixes-tests.log` / `target/v2a-review-fixes-tests.junit.xml` |
+| `scripts/build-dev.ps1 -PreserveRuntime` | **exit 0**、通常feature / dev-runtime。core・remote・EPUB worker・MCP adapter成功、PE検査 runtime=4 / pe=4成功。`target/v2a-review-fixes-build.log`、`target/vcrt-pe-reports/dev-runtime.json`。製品は起動していない |
+| 差分空白・最終整形 | `git diff --check`成功、最後に引数なしの `cargo fmt`。UI文字列は変更していない |
+
+P2・P3の対応を完了し、今回の範囲の未解決点はない。実機起動は未実施。製品起動・外部通信・
+評価用フォルダ参照・コミットは行っていない。
+
 ### 19.22 22 回目 (2026-11-03、同じ担当の続き、基準 `220cb5fb3`、V2 の設計)
 
 P2 6 件・P3 2 件。§21.15 に足した: 起動時に DB が無かった接続は次の反映・走査で開き直す (P2) / 走査の本の候補はディレクトリを先に判定する (P2) /

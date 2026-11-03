@@ -1510,6 +1510,78 @@ mod tests {
         assert!(!hits.is_empty());
     }
     #[test]
+    fn caption_ingest_uninitialized_store_does_not_reserve_rebuild_and_reopens_after_init() {
+        for sqlite_header in [false, true] {
+            let (tmp, meta, fts) = setup();
+            let path = tmp.path().join("ai_caption.db");
+            if sqlite_header {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.execute_batch("PRAGMA user_version = 0;").unwrap();
+            } else {
+                fs::write(&path, []).unwrap();
+            }
+            let candidate = make_image_file(tmp.path(), "initializing.jpg");
+            let mut session = IngestSession::new_with_caption_db_path(
+                Uuid::new_v4(),
+                tmp.path().into(),
+                &meta,
+                &fts,
+                path.clone(),
+            );
+            assert!(matches!(session.caption_db, Ok(None)));
+            let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start_with_reporter(
+                fts.writer().unwrap(),
+                std::sync::Arc::clone(&fts),
+                crate::fts_integrity::FailureReporter::new(std::sync::Arc::new(
+                    FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap(),
+                )),
+            );
+            let sem = GlobalIoSemaphore::new(1);
+            let cancel = AtomicBool::new(false);
+            let result = session
+                .apply(
+                    vec![candidate.clone()],
+                    vec![],
+                    &writer,
+                    &sem,
+                    IoPriority::Low,
+                    &cancel,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(result.ingested_ok, 1);
+            assert_eq!(result.caption_read_errors, 0);
+            assert!(!meta.tantivy_rebuild_pending().unwrap());
+            assert!(writer.test_take_failure_notifications().is_empty());
+
+            let db = CaptionDb::open_at(&path).unwrap();
+            save_caption(&db, &candidate, false);
+            session.reopen_caption_connection();
+            assert!(matches!(session.caption_db, Ok(Some(_))));
+            let result = session
+                .apply(
+                    vec![candidate.clone()],
+                    vec![],
+                    &writer,
+                    &sem,
+                    IoPriority::Low,
+                    &cancel,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(result.caption_read_errors, 0);
+            let searcher = fts.searcher();
+            let address = fts_index::find_doc_by_path(&searcher, fts.fields(), &candidate.key)
+                .unwrap()
+                .unwrap();
+            let text = fts_index::doc_per_source_text(&searcher, fts.fields(), address).unwrap();
+            assert_eq!(text.ai_caption, "blue sky visible letters search keyword");
+            assert!(!meta.tantivy_rebuild_pending().unwrap());
+            assert!(writer.test_take_failure_notifications().is_empty());
+        }
+    }
+
+    #[test]
     fn caption_ingest_read_failure_reserves_rebuild_but_absent_store_does_not() {
         let (tmp, meta, fts) = setup();
         let path = tmp.path().join("ai_caption.db");

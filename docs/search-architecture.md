@@ -258,7 +258,8 @@ EPUB は Ctrl+S / Ctrl+G とも元ファイル名を検索対象にし、検索�
 `ingest_worker::build_doc_for_pdf` は EPUB を
 拡張子で明示的に分岐し、未変換・変換済みのどちらでも生成 PDF の Info 辞書を呼ばない。
 EPUB 内のタイトル・著者も索引しない。取込失敗として記録・ログ出力せず、通常の `Pdf` 行を
-登録する。Ctrl+F も EPUB はファイル名だけで判定し、生成 PDF の Info 辞書を読まない。
+登録する。Ctrl+F も EPUB はファイル名と保存済みの AI 説明を検索する。EPUB 内部のタイトル・
+著者は検索せず、生成 PDF の Info 辞書も読まない。
 
 ```
 App 起動

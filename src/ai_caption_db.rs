@@ -221,8 +221,8 @@ impl CaptionDb {
         Ok(Self { conn })
     }
 
-    /// Worker-only display reads. A missing store is empty; never initializes
-    /// its directory, schema, journal mode, or database file.
+    /// Worker-only reads. Missing or not-yet-initialized stores are unpublished;
+    /// never initializes the directory, schema, journal mode, or database file.
     pub fn open_read_only(path: impl AsRef<Path>) -> rusqlite::Result<Option<Self>> {
         let path = path.as_ref();
         let conn = match Connection::open_with_flags(
@@ -240,7 +240,13 @@ impl CaptionDb {
             }
         };
         conn.busy_timeout(BUSY_TIMEOUT)?;
-        Ok(Some(Self { conn }))
+        // Schema and this version are published by the same initialization commit.
+        // Opening the file can race that commit, so version zero is still absent.
+        match conn.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))? {
+            0 => Ok(None),
+            1 => Ok(Some(Self { conn })),
+            _ => Err(rusqlite::Error::InvalidQuery),
+        }
     }
 
     /// Existing, already-initialized database; never creates a missing store.
@@ -258,6 +264,7 @@ impl CaptionDb {
         if version != 0 && version != 1 {
             return Err(rusqlite::Error::InvalidQuery);
         }
+        // Readers use user_version as the publication boundary; commit it with all DDL.
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS captions (
@@ -818,6 +825,63 @@ mod tests {
     }
 
     #[test]
+    fn read_only_uninitialized_stores_are_unpublished_and_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        for sqlite_header in [false, true] {
+            let path = temp
+                .path()
+                .join(format!("uninitialized-{sqlite_header}.db"));
+            if sqlite_header {
+                let conn = Connection::open(&path).unwrap();
+                conn.execute_batch("PRAGMA user_version = 0;").unwrap();
+                let tables: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE type='table'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(tables, 0);
+            } else {
+                std::fs::write(&path, []).unwrap();
+            }
+            let before = std::fs::read(&path).unwrap();
+            assert!(CaptionDb::open_read_only(&path).unwrap().is_none());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(!path.with_extension("db-journal").exists());
+
+            // The same file becomes visible after the real initializer commits.
+            let writer = CaptionDb::open_at(&path).unwrap();
+            let reader = CaptionDb::open_read_only(&path).unwrap().unwrap();
+            assert!(reader.get("c:/missing.jpg").unwrap().is_none());
+            drop(reader);
+            drop(writer);
+        }
+    }
+
+    #[test]
+    fn read_only_does_not_publish_an_uncommitted_schema_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("initializing.db");
+        let conn = Connection::open(&path).unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        tx.execute_batch("CREATE TABLE initializing (value TEXT); PRAGMA user_version = 1;")
+            .unwrap();
+        // A separate connection sees the committed version zero, without a retry/wait.
+        assert!(CaptionDb::open_read_only(&path).unwrap().is_none());
+        tx.rollback().unwrap();
+        CaptionDb::ensure_schema(&conn).unwrap();
+        assert!(
+            CaptionDb::open_read_only(&path)
+                .unwrap()
+                .unwrap()
+                .get("c:/missing.jpg")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn read_only_existing_store_reads_without_schema_changes_or_writes() {
         let (temp, db, req) = fixture();
         db.save(&req).unwrap();
@@ -831,15 +895,22 @@ mod tests {
         drop(reader);
         drop(db);
 
-        let uninitialized = temp.path().join("uninitialized.db");
-        let conn = Connection::open(&uninitialized).unwrap();
+        let unknown = temp.path().join("unknown-version.db");
+        let conn = Connection::open(&unknown).unwrap();
         conn.execute_batch("CREATE TABLE unrelated (value TEXT); PRAGMA user_version=27;")
             .unwrap();
         drop(conn);
-        let reader = CaptionDb::open_read_only(&uninitialized).unwrap().unwrap();
+        let before = std::fs::read(&unknown).unwrap();
+        assert!(matches!(
+            CaptionDb::open_read_only(&unknown),
+            Err(rusqlite::Error::InvalidQuery)
+        ));
+        assert_eq!(std::fs::read(&unknown).unwrap(), before);
+        let reader =
+            Connection::open_with_flags(&unknown, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
         assert_eq!(
             reader
-                .conn
                 .query_row::<i64, _, _>(
                     "SELECT count(*) FROM sqlite_master WHERE name='captions'",
                     [],
@@ -850,7 +921,6 @@ mod tests {
         );
         assert_eq!(
             reader
-                .conn
                 .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
                 .unwrap(),
             27
