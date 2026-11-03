@@ -2810,3 +2810,24 @@ test-only / 文書のみの変更のため、依頼どおり確認用ビルド�
 ## 22. 公開チュートリアルの追加 (2026-11-03)
 
 公開文書担当が [AI 説明文のチュートリアル](../htdocs/mimageviewer/manual/tut-ai-caption.html) を追加した。GPU 条件と 8 GB 機の案内、初回のモデル取得、一覧から画像・本の表紙を作成する順序、進捗と中止、情報パネルでの確認と一覧からの作り直し、Ctrl+G での本を含む検索、メタ情報の移行、既定 OFF の MCP 許可を扱う。対象・除外・未変換・パスワードの扱いは `caption_job.rs` / `caption_job_worker.rs`、取得と GPU 条件は `vlm_addon.rs`、UI 名は各描画箇所と `keymap.rs` / `settings.rs` に照合し、通信・保存は §13、worker のネットワーク機能を含めないビルド設定、`privacy.html` と製品ページの安心欄を突き合わせた。表示時の AI 処理の実ラベルは「高画質」なので、既存 `grid.html` の「高品質」も 1 か所訂正した。モデル名・容量は新しいページでは断定せず、取得画面とリファレンスへ案内する。既存分類「6. さらに使いこなす・最適化」にカードを置き、grid・fullscreen・search・settings・metadata-transfer・tut-search から各 1 か所リンクし、MCP チュートリアルとも相互リンクした。既存チュートリアルと同じ head・パンくず・幅広レイアウト・上下の戻るリンクを使用し、画像は使わない。文書だけの変更で、製品起動・ビルド・コミットはしていない。HTML 11 ページの相対リンク 514 件（ファイルと見出し）、新規ページの構造・meta / canonical / og / Twitter・ナビを検査し、`check_site_cards.py` は 50 件・違反 0、`gen-sitemap-xml.py --check` と `git diff --check` も成功した。
+
+### 21.20 V1〜V3 の実アプリ確認 (2026-11-03、観測者: サブ PC 担当)
+
+利用者の指示で、サブ PC (RTX 4060 Ti 16GB・Vulkan 1.4.341) の Claude Code 担当に実アプリでの確認を依頼した。設計担当はメイン PC で次を用意した
+(`C:\home\mimageviewer-subpc\vlm-v5\`): `target\dev-runtime` の確認用ビルド一式、ダウンロード済みと同じ形に組み立てたモデル (`addons\vlm`、ハッシュは公開の一覧と一致)、
+合成のテスト用の画像と本 (利用者の画像は使わない)、MCP の adapter へ stdio で直接問い合わせるスクリプト。mIV は `--data-dir C:\vlm-subpc-test\data` 付きでだけ起動した。
+モデルのダウンロードの経路そのものは確かめていない。
+
+サブ PC 担当の報告 (結果とスクリーンショットは `C:\home\mimageviewer-subpc\vlm-v5\results\`。設計担当はスクリーンショット 2 枚と MCP の結果ファイルを照らした):
+
+- 作成 (V1): 画像 3 枚・本 4 冊 (ZIP・PDF・フォルダ・名前が `.pdf` の実フォルダ) で作成でき、情報パネルの「AI 説明」「この本の AI 説明」に出た。
+  時間はログから: 押してから最初の 1 枚まで約 32 秒 (worker・モデル・GPU の確認を含む)、2 枚目から 1 枚あたり約 2.6〜2.9 秒。
+- 表紙の固定し直し (V1-4b): `cooking-notes` と実フォルダ `album.pdf` で「表紙が変わっています…作り直せます」が出て、作り直すと消え、説明文が新しい表紙の内容になった。
+- 検索 (V2): Ctrl+G の「AI 説明」で、ファイル名に無い語 (抹茶・野鳥・図鑑・料理) が画像・PDF・ZIP・フォルダの本に 1 件ずつ当たった。「書庫・フォルダの本」で 3 件 (PDF は外れる)。
+  Ctrl+F の「AI 説明」で該当の画像だけに絞られた。
+- MCP (V3): 3 欄は OFF で「見せないもの」、ON で「見せるもの」に AI 説明文 (表紙のページ等から読んだ文字を含む旨) が移った。OFF では 4 語とも検索 0 件・`ai_caption` は `not_permitted`、
+  ON では 1 件ずつ当たり `present`。ZIP の `002.png` と PDF の `page_1` は `ai_caption` が `none`、`container_ai_caption` に本の説明文。
+- 注: フォルダはチェックで選べない (既存の仕様、`GridItem::is_checkable`)。フォルダの本は 1 冊ずつ右クリックで作った。
+- 注: Windows PowerShell 5.1 から adapter を起動すると、標準入力の先頭に UTF-8 の BOM が入り、adapter が最初の行を `Parse error` にした。確認のスクリプトで
+  入力の文字コードを BOM なしにして回避した。実際の AI アプリは BOM を送らない見込みだが、adapter で先頭の BOM を読み飛ばすかは MCP 側の判断として残す。
+- 注 (既存の挙動): 検索の結果から ZIP・フォルダの本を開くと、PDF と同じく検索の中を進む表示 (Drill) で中のページが並ぶ。説明文の検索語に画像に無いもの (「日本国旗」) が混じる例があった (モデルの質)。
