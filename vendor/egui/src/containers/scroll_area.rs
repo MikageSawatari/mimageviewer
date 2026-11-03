@@ -124,6 +124,15 @@ impl State {
         self.vel
     }
 
+    /// Stop previous vertical kinetic velocity and scroll-to animation without
+    /// changing the offset, horizontal motion, or a current pointer gesture.
+    /// Call this when an application has committed a new explicit vertical
+    /// position, rather than during ordinary scroll synchronization.
+    pub fn stop_vertical_scroll_motion(&mut self) {
+        self.vel.y = 0.0;
+        self.offset_target[1] = None;
+    }
+
     /// The scroll offset, clamped to the valid range `0..=max_offset`.
     ///
     /// Positive means scrolled down/right.
@@ -2447,6 +2456,28 @@ fn paint_fade_areas_impl(ui: &Ui, inner_rect: Rect, content_size: Vec2, offset: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_vertical_scroll_motion_keeps_position_and_horizontal_motion() {
+        let mut state = State::default();
+        state.offset = Vec2::new(40.0, 600.0);
+        state.vel = Vec2::new(75.0, 2400.0);
+        state.offset_target = [
+            Some(ScrollingToTarget {
+                animation_time_span: (0.0, 1.0),
+                target_offset: 100.0,
+            }),
+            Some(ScrollingToTarget {
+                animation_time_span: (0.0, 1.0),
+                target_offset: 900.0,
+            }),
+        ];
+        state.stop_vertical_scroll_motion();
+        assert_eq!(state.offset, Vec2::new(40.0, 600.0));
+        assert_eq!(state.vel, Vec2::new(75.0, 0.0));
+        assert_eq!(state.offset_target[0].unwrap().target_offset, 100.0);
+        assert!(state.offset_target[1].is_none());
+    }
 
     struct ScrollSample {
         id: Id,

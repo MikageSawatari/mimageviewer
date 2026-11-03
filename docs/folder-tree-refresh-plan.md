@@ -253,3 +253,106 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 先にインストール版/tray常駐版を終了する（single-instance mutexを共有）。このfast buildは通常の `%APPDATA%\mimageviewer` を使い、実設定・data/cacheを更新し得る。手動確認は、一覧の親を開いたまま外部でaaaを移動/削除したときツリーからも消えること、空枝のcollapse→外部子作成→reexpand、一覧Aを変えず別の展開Bを変更したmain復帰、既に展開中のdataへ外部でnewを追加してアドレス入力で開いた場合の祖先表示を対象とする。live UI/idle/perfは未実施であり、headless成功と読み替えない。
 
 コード観点の独立reviewはACCEPT。独立reviewerも焦点/単独/snapshot/check/buildログと3exeの実hash一致、利用者向け手順・検証制限の記載を確認した。全体gate未完了と実機未確認を残し、release入力が揃った環境でのfull gateと最終受入・コミットは設計担当に引き継ぐ。
+
+## 11. §1.694 ツリーを開いたときの現在地表示 (2026-11-03)
+
+以下の初回実装・検証は`655e79211`までの記録。後続の独立レビューで見つかったP2 2件の対応は本節末尾に追記する。初回の確認用binaryには後続対応を含まない。
+
+### 観測・再現と旧版比較
+
+利用者は§1.686/§1.683を含むv5試用ビルドで「最初にツリーを開いたとき現在地が表示されず、開いた後の場所変更では追従する」と報告した。新しい隔離data-dirでの確認だが、開いた入口と、枝の未展開・画面外・選択表示なしのどれかは未確認。
+
+開発側のheadless Appテストは実際の`set_folder_tree_pane_visible(true)`と既定Fのキーイベント（Tはタグ操作）から開き、`render_folder_pane`のeguiフレームと実scan workerの完了を進めた。起動時非表示→表示、起動時表示、閉じた間の別フォルダ移動→再表示、移動なしの再表示では、枝・行、active/cursor表示、viewport内の行全体の包含が成功した。利用者の初回表示と同じ症状を再現したとは扱わない。
+
+別途、再表示の最初の描画後に再参加scanを完了させ、現在地より前へ多数の兄弟を挿入すると、**(b) 行とactive/cursor表示はあるが、行がviewport外に残る**ことを再現した。修正前の`target/tree-open-repro-ready.log`は9件中8成功/1失敗（行y=4825〜4851、viewport y=39〜358）。使い捨てsubtree内は製品scanner/workerで実走査し、その上の祖先だけ固定listingへ置き換え、ホストdriveの内容・権限を試験条件にしない。
+
+`4d421d1c5^`の旧`sync_to_active`は祖先を無条件にauto-expandし、現行`reveal_active`は成功membership/表示childrenの矛盾で止まる。未取得祖先の先行取得と、新しい場所/再参加時の確認を通じた展開は保たれており、今回のcoldテストで(a)/(c)の退行は確認できなかった。一方、旧版も最初の行描画でscroll要求を消す。§1.686は再表示時のscanとpath anchor復元を追加したため、残存cacheに対する能動scrollと新listing採用が重なる経路が生じた。再現した(b)はその経路の退行であり、祖先展開の停止条件を撤去する修正にはしない。
+
+### 原因と不変条件
+
+`set_folder_tree_pane_visible`→`sync_to_active`→`set_focus_tree_at_active`で作った一回要求を、`render_folder_pane_tree`が最初のcursor行描画だけで消費する。しかしeguiの既定`scroll_to_me`は数値offsetへのanimationを後続フレームへ持ち越す。その途中でscanが行を増減すると、古い絶対目標と新しいpath anchor復元が競合する。同じ親の新しい兄弟がviewport上端anchorと現在地の間に入る場合も、上端anchorの保持だけでは現在地の可視性を保証できない。
+
+不変条件は「開く/能動cursor操作の表示要求が完了するまで、要求したcursorの行を新しいscan/layoutへ追従させる。明示的なwheel/dragは利用者の操作を優先する。要求完了後の自動更新は従来の上端path anchorを保持する」。追加repaint、毎フレームの強制scroll、scan待ちの遅延、全tree resetは使わない。
+
+### 修正
+
+- `scroll_to_cursor: bool`を単一の`FolderPaneCursorScroll::{Idle, Requested, FollowingRefresh}`へ置換した。開く・active同期・cursor移動・Enter後の同期・drive選択・reload・展開/折りたたみは同じ要求へ合流する。scan中にcursor行を描いても、`FollowingRefresh`が最終listingまで要求を所有する。未変化のフレームではscrollを再発行せず、描画path列または実pitchが変わった時だけ現在のcursor行へ再解決する。
+- 能動scrollは`ScrollArea::animated(false)`で同じlayout内に確定する。通常のwheel/dragのnative physicsは維持する。native animationの絶対targetを別ownerで追跡・取消する機構を作る案を検討したが、現在地への一回要求を即時確定すればその寿命を除けるため採らなかった。再走査中の行挿入は上の単一状態が扱う。`ScrollAnimation::none()`だけでは次passまでtargetが残るため代用しない。
+- rendererは既存要求をtakeして処理し、同じ描画中の行click/arrowが作った新要求を旧要求の完了で上書きしない。追従中のtree内wheel/scrollbar/content drag開始は利用者へviewportの所有を渡す。tree外のgrid wheelでは追従を取り消さない。要求完了後は既存の上端path anchor復元へ戻す。
+- `reveal_active`のmembership/hidden投影による停止、需要の所有、完全成功による消失確定、他contextとの境界、§1.686の外部更新経路は変更しない。
+
+独立設計レビュー（Sol/xhigh、別context/read-only）は、即時確定と単一要求による最終layoutまでの追従を構造的修正として支持した。最終コードレビューと検証結果は以下に記録する。
+
+### 回帰・独立レビュー
+
+App側へ11件追加した。4つの開き方と既定F、root/同じ親へのscan中の兄弟挿入、tree内wheelでの追従取消・tree外wheelとdisabled treeでの追従保持、同じ描画中の新しい行Click要求の優先を検査する。最後の検査は実際のlabel response IDへのAccessKit Clickで製品の`resp.clicked()`を通し、pointer hit testing/drag配送の検査とは分ける。scan中の未変化フレームとscan完了後90フレームではscroll要求の発行数が増えないことも確認する。既存のstateテストは同じassertionをenumへ適応した。
+
+Sol/xhighの独立コードレビューは**ACCEPT、重要な未解決指摘なし**。指摘1件（disabled treeの入力でも追従を取り消していた）を`ui.is_enabled()`で修正し、modal gate下のwheel回帰を追加した。reviewerはコードと修正前/修正後ログを読み、ビルド・テストを重複実行していない。
+
+途中の追加testにはwheel eventの必須`phase/source`不足、行全体rectの中心をクリックしたfixture、disabled wheelを消費するdialog本体を描かず直ちにreenableしてsmooth tailを流したfixtureの不備があった。compile失敗/58件中56成功2失敗/57成功1失敗を成功根拠にはしない。Clickは上記handler経路へ限定し、disabled入力はgate保持中にscan/quiet framesを完了させてからreenableする。最終`target/tree-open-folder-final.log`は**58成功/失敗0、14.404秒、exit0**。focused runnerも39/17/18/15件の4群で全成功（計89実行、重複を含む）。
+
+### 検証環境
+
+`tree-open-1694` / `498a7e901`上の未コミット差分、Windows MSVC、default features、test/dev profile。`MSBUILDDISABLENODEREUSE=1`。初回FFmpeg binding生成はlibclangの`STATUS_PRIVILEGED_INSTRUCTION`、TurboJPEGは通常CMake buildのexit1で停止した。Visual Studio 18付属libclangを指定し、同梱TurboJPEG sourceを本worktreeの`target/tree-open-native/source`へ実コピー、SIMD有効・Release `/MT`・単並列で静的buildしてexplicit libraryへ配置した。依存source・Cargo設定・製品build scriptは変更していない。以後の再現用process環境は`target/tree-open-env.ps1`（LIBCLANG/TURBOJPEG/CXXFLAGS、最終`CARGO_BUILD_JOBS=4`）。初期PowerShell直接redirectのnative stderr変換を避け、最終Cargoログはcmdのraw redirectと明示exitで取得した。
+
+### 最終検証台帳
+
+全lib gateは利用者指定により設計担当へ引き継ぎ、WebView2を使う試験と製品起動は行わない。下記は同じ製品差分に対するdefault featuresの非対話検証。
+
+| コマンド・範囲 | 結果 | 証跡 (`target/`) |
+| --- | --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/folder_pane/)' --no-fail-fast` | **58成功/失敗0、14.404秒、exit0** | `tree-open-folder-final.log` |
+| `scripts/test-focused.ps1 -Path src/folder_pane.rs,src/folder_pane/refresh_tests.rs,src/ui_folder_pane.rs,src/app/folder_pane_refresh_tests.rs` | **39/17/18/15件の4群すべて成功、exit0**。89実行は重複を含む | `tree-open-focused.log`、`test-focused/runs/20261102T2329*`のJUnit/command/log |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/main_chrome::tests/)' --no-fail-fast` | **8成功/失敗0、0.982秒、exit0** | `tree-open-main-chrome.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **exit0、7分47秒**。既存warningあり | `tree-open-check.log` |
+| `cargo test --test ui_snapshot -- --test-threads=4`（画像更新なし） | **未完了、exit2173**。226件の途中で実行体が異常終了、assertion/画像差の失敗報告なし。成功扱いにしない | `tree-open-snapshot.log` |
+| 同じsnapshot実行体をCDB下、`--test-threads=4 --nocapture`で一度診断 | **226成功/失敗0、309.92秒、子process native exit0**。通常実行の2173は未再現・原因未特定。通常gateの失敗を置換しない | `tree-open-snapshot-debug.log`のexit event、`tree-open-cdb-summary-3.log`のlibtest summary |
+| `cargo test --test ui_snapshot folder_pane -- --test-threads=4`（通常、画像更新なし） | **4成功/失敗0、2.47秒、exit0**。`folder_pane_refresh_*`/`folder_pane_location_*` | `tree-open-snapshot-folder.log` |
+| 引数なし`cargo fmt`、`cargo fmt --check`、UI glyph、`git diff --check` | **各exit0**、危険文字0件。snapshot基準画像の差分なし | `tree-open-fmt.log`、`tree-open-fmt-check.log`、`tree-open-glyph.log`、`tree-open-diff-check.log` |
+| `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | **exit0**。通常features/dev-runtime、core17分46秒・remote1分28秒・EPUB worker1分11秒。runtime4/PE3検査成功、起動・既存process停止なし | `tree-open-build-dev.log`、`tree-open-build-progress-{9,10}.log`、`vcrt-pe-reports/dev-runtime.json` |
+
+snapshotの最後のokは4並列の完了順であり、原因テストを表さない。停止付近の`external_tool_*`はlabel等の純描画で外部tool起動・明示exitへ接続せず、対象sourceに2173の明示終了は見つからなかった。現在のharnessはwgpu30系・DX12/Vulkanであり、旧[WGL AV調査](ui-snapshot-gpu-investigation.md)と同一原因とは扱わない。同じ実行体/4threadsをCDB下で一度診断し、例外/exit eventを採取したが同じ異常終了は出ず全226件が成功した。CDB自体のexit0だけでなく、子processのexit event code0とlibtest summaryを確認した。製品、snapshot基準画像、harnessのbackend/並列性は変更していない。CDB初回はrelative executable pathを解決できず試験前に停止し、絶対pathへ直してから診断した。通常全件の2173は未解決の検証制限として残す。
+
+### 成果物・引き継ぎ
+
+`target/dev-runtime/mimageviewer-core.exe`（339,381,760 bytes、SHA-256 `D5CA4815E54FEBEB933B80B24F93FC265022682176A07C1293C2695FDA607C37`）と、同版のremote/EPUB workerを作成した。3ファイルの日時・size・hashは`target/tree-open-artifacts.json`。portable featureは使っていない。製品起動・コミット・全lib gateは実施していない。全lib検証をこのworktreeで行う際は、先に`. .\target\tree-open-env.ps1`で検証用のnative依存環境を読み込む。
+
+利用者確認用（エージェントは起動しない）:
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+先にインストール版/tray常駐版を終了する（single-instance mutexを共有）。この高速buildは通常の`%APPDATA%\mimageviewer`を使い、実設定・data/cacheを更新し得る。新しい隔離設定で確認する場合は`--data-dir .\target\dev-runtime\data`を引数へ渡す。確認対象は、兄弟の多い深い現在地から初めてツリーを開いた時の行表示（利用者報告との一致は未確認）と、閉じた間の場所変更/兄弟追加後の再表示で現在地が見えること。通常snapshot全件の異常終了は上記の未解決制限として残し、設計担当が全lib検証・実機確認・最終受入・コミットを行う。
+
+### `655e79211`への独立レビュー追補: P2 2件 (2026-11-03)
+
+追加レビューの指摘はどちらも正しい。製品コードの変更前に実App入口・描画・worker完了を通す8件を追加し、`target/tree-p2-repro.log`で8失敗/成功0（exit100）を確認した。
+
+- **P2-1 / (b):** `animated(false)`の即時scrollはoffsetだけを書き換え、以前のdrag releaseの速度や既存のanimation targetを消さない。実pointer drag→release→通常慣性でoffsetが進むことを確認した後、↑でrevealしても縦速度が約2443pt/s残った。旧animated経路はtarget処理時に速度を消していたため、これは初回修正の退行。不変条件は「通常の慣性は維持し、新しい能動revealが適用された境界で以前の縦運動を終える」。vendor eguiの`State::stop_vertical_scroll_motion`で縦velocity/targetだけを消し、rendererが実際に`scroll_to_me`した`ScrollArea`の出力stateへ一度適用してstoreする。offset・横運動・現在のpointer gesture・通常の同期は変更しない。deltaが0でも適用される。
+- **P2-2 / (a)(c)、表示範囲への要求欠落:** 現在地Noneで開くと`set_focus_tree`がfocusと既定root cursorを設定し、後日確定した現在地を`sync_to_active`のfocus guardが抑止する。同一driveでは現在地行にcursorが付かず、別driveでは`reveal_active`のdrive guardで枝も現れなかった。ZIP/PDF/検索から実フォルダへの移行でもcursor不一致を再現した。`4d421d1c5^`にも同じfocus/cursor guardとselected driveの同期条件があり、§1.686や初回修正で導入した退行ではない。利用者報告の原因候補だが、報告時の初期現在地が未確定だったことは未確認。
+
+P2-2の不変条件は「未確定時の代替位置と利用者が選んだ位置を区別し、受動位置は最初/次の現在地変更へdriveとcursorを一緒に追従させる。利用者の明示位置はツリー操作中には奪わない」。`selected_drive`と`cursor_path`を`FolderPaneSelection`へまとめ、focusは入力配送だけを担う。状態は受動`FollowActive`、ツリー操作の`Explicit`、gridへfocusを戻した後も次の現在地変更までは明示位置を保つ`ExplicitUntilActiveChange`。最後の状態はFでのEnter相当確定権限を保持し、次のactive変更で受動追従へ戻る。開く/Esc/reloadは現在地へ再解決し、cursor/drive/展開/折畳操作は明示状態、受動scanのcursor修復とdrive消失時のpair修復は由来を保つ。drive列挙を待たずactive rootへ解決でき、未確定時の既定rootをFで勝手に開かない。
+
+仮想フォルダの前提も照合した。現行`active_filesystem_folder`はZIP/PDFを親フォルダの`Some`へ写し、検索結果のsynthetic pathも`Some`を返す。これらの既存mappingを変更せず、各状態から実フォルダへの追従を検査する。drive列挙前はstate試験でdrive到着→代替root→別driveの現在地確定を検査する。非同期順序の組合せを待機・retryで管理する案は採らず、位置の由来を単一ownerで表すことでfocusとの曖昧な組合せを除く。
+
+追加回帰はApp 9件（Noneからの現在地確定をmenu/F×同一/別driveの4経路、ZIP/PDF/検索から実フォルダの3経路、実drag慣性中の↑/↓、明示矢印→active変更→grid focus→F確定）、state 6件（drive到着、明示cursor/drive保持、移動しない展開/折畳、drive消失、受動scan修復）、vendor 1件（offset/横運動を保った縦速度/target停止）。App試験は兄弟の多いsubtreeで(a)行・祖先、(c)active/cursor、(b)viewport内の行全体を確認し、慣性試験は通常慣性の継続とreveal後30フレームの可視性をIdle/scan中の両方で検査する。実subtree外のlistingはsyntheticに限定する。
+
+独立Sol/xhighの追補設計/コードレビューを実施した。最初の2状態案は、gridへfocusを戻すと明示位置の由来まで捨て、FのEnter相当確定を失うP2でREJECT。上の第三状態を加え、focus反復・同一activeの同期・F target保持のstate回帰と実App入力回帰を追加した最終差分は**ACCEPT、重要な未解決指摘なし**。reviewerはread-onlyでコードと再現ログを確認し、build/testを重複実行していない。
+
+初回修正後のfilterは72件中71成功/1失敗（`tree-p2-fixed.log`）。既存の祖先再確認テストが、fixture上で明示位置なのにcursor未設定のままactiveだけを注入していた。実openと同じ`set_focus_tree_at_active`で初期化するよう補正し、消失枝が同一active同期で復活しないassertionは維持した。この途中結果を最終成功の根拠にはしない。
+
+第三状態を含む次のfilterは73件中72成功/1失敗（`tree-p2-folder-final.log`）。新規App試験が現在地を親へ移したことで、既存のauto-expanded branch入替により保持cursorの枝が折り畳まれ、viewport検査まで進めなかった。製品の展開仕様は変更せず、現在地を同じ親の別子へ移すfixtureへ補正し、明示cursorの可視性・保持・F確定を検査する。これも最終成功として扱わない。core checkとsnapshot成功後の変更は、この`cfg(test)` fixtureと文書だけであり、製品差分は同一。
+
+追補の最終検証は`tree-open-1694` / `655e79211`上の差分、Windows MSVC/default features、`MSBUILDDISABLENODEREUSE=1`と上記`tree-open-env.ps1`のnative依存環境で実施した。
+
+| コマンド・範囲 | 結果 | 証跡 (`target/`) |
+| --- | --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/folder_pane/)' --no-fail-fast` | **73成功/失敗0、14.313秒、exit0** | `tree-p2-folder-verified.log` |
+| `scripts/test-focused.ps1 -Path src/folder_pane.rs,src/folder_pane/refresh_tests.rs,src/ui_folder_pane.rs,src/app/folder_pane_refresh_tests.rs` | **45/23/18/24件の4群すべて成功、exit0**。110実行は重複を含む | `tree-p2-focused.log`、`test-focused/runs/20261103T0107*`のJUnit/command/log |
+| `cargo test --manifest-path vendor/egui/Cargo.toml --lib stop_vertical_scroll_motion -- --nocapture` | **1成功/失敗0、exit0**。standalone vendor graph | `tree-p2-egui.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **exit0、4分41秒（build lock待ちを含む）** | `tree-p2-check.log` |
+| `cargo test --test ui_snapshot folder_pane -- --test-threads=4` | **4成功/失敗0、2.37秒、exit0**。画像更新なし | `tree-p2-snapshot.log` |
+| 引数なし`cargo fmt`、`cargo fmt --check`、`git diff --check` | **各exit0**、snapshot基準画像の差分なし | `tree-p2-fmt-check.log`、作業終了時のdiff検査 |
+
+今回の指定により`build-dev.ps1`、全snapshot、全lib gate、WebView2試験、製品起動、コミットは実施しない。確認用binaryの再作成と最終受入は設計担当へ引き継ぐ。初回全snapshotのexit2173に関する制限は上記の歴史的記録として残す。
