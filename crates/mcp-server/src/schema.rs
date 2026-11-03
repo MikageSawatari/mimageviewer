@@ -78,8 +78,23 @@ fn object(properties: Value, required: &[&str]) -> Value {
 fn string() -> Value {
     json!({"type":"string"})
 }
-fn nullable(schema: Value) -> Value {
-    json!({"anyOf":[schema,{"type":"null"}]})
+fn nullable(mut schema: Value) -> Value {
+    // Type-specific constraints only apply to values of that type. A nullable
+    // type keeps the same constraints without repeating an anyOf wrapper.
+    if let Some(kind) = schema
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        && schema.get("const").is_none()
+    {
+        schema["type"] = json!([kind, "null"]);
+        if let Some(choices) = schema.get_mut("enum").and_then(Value::as_array_mut) {
+            choices.push(Value::Null);
+        }
+        schema
+    } else {
+        json!({"anyOf":[schema,{"type":"null"}]})
+    }
 }
 fn nullable_string() -> Value {
     nullable(string())
@@ -91,7 +106,7 @@ fn unsigned() -> Value {
     json!({"type":"integer","minimum":0})
 }
 fn kind() -> Value {
-    json!({"type":"string","enum":["image","pdf","video","audio","archive","folder","other"]})
+    json!({"enum":["image","pdf","video","audio","archive","folder","other"]})
 }
 fn strings() -> Value {
     json!({"type":"array","items":string()})
@@ -125,6 +140,20 @@ fn text_value() -> Value {
         json!({"text":string(),"truncated":{"type":"boolean"}}),
         &["text", "truncated"],
     )
+}
+fn caption_field() -> Value {
+    let value = object(
+        json!({"caption":text_value(),"visible_text":text_value(),"keywords":strings(),"model":string(),"created_at":integer(),"stale":{"type":["boolean","null"]}}),
+        &[
+            "caption",
+            "visible_text",
+            "keywords",
+            "model",
+            "created_at",
+            "stale",
+        ],
+    );
+    json!({"oneOf":[object(json!({"status":{"const":"present"},"value":value}),&["status","value"]),object(json!({"status":{"enum":["none","not_permitted"]}}),&["status"])]})
 }
 fn exif() -> Value {
     let mut props = json!({});
@@ -176,6 +205,7 @@ fn output_schema(name: &str, failure: Value) -> Value {
         // for every EXIF/generation field in tools/list.
         let absent = field(string())["oneOf"][1].clone();
         for (key, repeated) in [
+            ("c", caption_field()),
             ("t", nullable(text_value())),
             ("a", absent),
             ("s", nullable_string()),
@@ -187,6 +217,9 @@ fn output_schema(name: &str, failure: Value) -> Value {
             );
             definitions[key] = repeated;
         }
+        let text = text_value();
+        replace_schema(&mut definitions["c"], &text, &json!({"$ref":"#/$defs/v"}));
+        definitions["v"] = text;
     }
     if metadata_write(name) || matches!(name, "add_to_collection" | "remove_from_collection") {
         let indices = write_indices();
@@ -236,11 +269,11 @@ fn output(name: &str) -> Value {
             &["operation", "id", "outcomes"],
         ),
         "open_in_viewer" => object(
-            json!({"status":{"type":"string","enum":["accepted"]},"message":string()}),
+            json!({"status":{"enum":["accepted"]},"message":string()}),
             &["status", "message"],
         ),
         "miv_status" => object(
-            json!({"app_version":string(),"permission":object(json!({"level":{"type":"string","enum":["disabled","read_only","read_and_open","organize"]},"thumbnails":{"type":"boolean"},"gps":{"type":"boolean"}}),&["level","thumbnails","gps"]),"fts_ready":{"type":"boolean"},"remote_active":{"type":"boolean"}}),
+            json!({"app_version":string(),"permission":object(json!({"level":{"enum":["disabled","read_only","read_and_open","organize"]},"thumbnails":{"type":"boolean"},"gps":{"type":"boolean"},"ai_captions":{"type":"boolean"}}),&["level","thumbnails","gps","ai_captions"]),"fts_ready":{"type":"boolean"},"remote_active":{"type":"boolean"}}),
             &["app_version", "permission", "fts_ready", "remote_active"],
         ),
         "search_items" | "items_by_tag" | "get_collection" => page(
@@ -294,7 +327,7 @@ fn output(name: &str) -> Value {
             let mut schema = page(
                 "items",
                 object(
-                    json!({"item":reference(false),"name":string(),"kind":kind(),"size":field(unsigned()),"modified":field(integer()),"dimensions":field(object(json!({"width":{"type":"integer","minimum":0,"maximum":4294967295_u64},"height":{"type":"integer","minimum":0,"maximum":4294967295_u64},"unit":{"enum":["pixels","points"]}}),&["width","height","unit"])),"rating":{"type":"integer","minimum":0,"maximum":5},"tags":field(strings()),"container_size":nullable(unsigned()),"container_modified":nullable(integer()),"container_tags":strings(),"exif":field(exif()),"generation":field(generation())}),
+                    json!({"item":reference(false),"name":string(),"kind":kind(),"size":field(unsigned()),"modified":field(integer()),"dimensions":field(object(json!({"width":{"type":"integer","minimum":0,"maximum":4294967295_u64},"height":{"type":"integer","minimum":0,"maximum":4294967295_u64},"unit":{"enum":["pixels","points"]}}),&["width","height","unit"])),"rating":{"type":"integer","minimum":0,"maximum":5},"tags":field(strings()),"container_size":nullable(unsigned()),"container_modified":nullable(integer()),"container_tags":strings(),"exif":field(exif()),"generation":field(generation()),"ai_caption":caption_field(),"container_ai_caption":nullable(caption_field())}),
                     &[
                         "item",
                         "name",
@@ -309,6 +342,8 @@ fn output(name: &str) -> Value {
                         "container_tags",
                         "exif",
                         "generation",
+                        "ai_caption",
+                        "container_ai_caption",
                     ],
                 ),
             );
@@ -368,14 +403,14 @@ pub fn tools_named(names: &[&str]) -> Vec<Value> {
 pub fn tools() -> Vec<Value> {
     TOOL_NAMES.into_iter().map(|name| {
         let description=match name {
-            "miv_status"=>"Read mImageViewer (mIV) version, full AI permissions, index readiness and Remote activity.",
-            "search_items"=>"Search mImageViewer (mIV)'s index (Ctrl+G syntax): paths/names/kinds/tags/ratings.",
+            "miv_status"=>"Read mImageViewer (mIV) version, full AI permissions including AI captions, index readiness and Remote activity.",
+            "search_items"=>"Search mImageViewer (mIV)'s index (Ctrl+G syntax): paths/names/kinds/tags/ratings; AI captions when permitted.",
             "list_tags"=>"List mImageViewer (mIV) tags/counts: pinned/recent/frequent/all.",
             "items_by_tag"=>"List via mImageViewer (mIV)'s tag-view query.",
             "list_collections"=>"List mImageViewer (mIV) collection IDs/names/item counts.",
             "get_collection"=>"Read a mImageViewer (mIV) collection by exactly one ID or name, in view order.",
             "list_library"=>"List mImageViewer (mIV) favorites, reading history, bookshelf, bookmarks or rated items. Rated: min stars (default 1; 0 means 1), order: rating descending, newest rating time, path. Times: UTC Unix ms.",
-            "get_item_info"=>"Read metadata for 1-50 path/subresource references, input order; cursor resumes at next input. Field status: unavailable/inapplicable vs empty. GPS requires permission. No raw metadata/workflow JSON/UserComment/external sidecars. Text marks truncation.",
+            "get_item_info"=>"Read metadata for 1-50 path/subresource references, input order; cursor resumes at next input. Field status: unavailable/inapplicable vs empty. GPS and AI captions require permission. Captions: present/none/not_permitted; book stale is null. No raw metadata/workflow JSON/UserComment/external sidecars. Text marks truncation.",
             "list_folder"=>"List a physical folder/ZIP/CBZ/PDF base grid in mImageViewer (mIV) using saved type visibility/order, duplicate folding, book composition order/hidden pages. Excludes UI search, star/facet/color/bookmark/history filters and temporary prefix-stack collapsing. ZIP subresource: relative folder ending in /. ZIP traversal/collapsing (nested ZIP images included) follows base grid. Other archives/EPUB unsupported. Limit default 100, max 200 (larger clamped). Listing changes void cursors; restart. Times: UTC Unix ms.",
             "get_thumbnail"=>"mImageViewer (mIV) WebP thumbnails: 1-20 explicit images/ZIP images/PDF pages, input order; requires thumbnail permission. Long side: default 256; >512 clamped, <256 rejected. No folder/archive representatives. Orientation/saved rotation only; withhold edited-hidden images. Image blocks follow ok rows in page order. Structured: references/statuses/dimensions only. Max 256 KiB/image, 1 MiB total; opaque cursor resumes at next input.",
             "open_in_viewer"=>"Open an existing absolute path in the main mImageViewer (mIV) viewer. Images/video/audio: open folder, select file, enter fullscreen (as on second launch). Other files: open folder; ZIP/PDF: open contents. No subresource. Accepted means opening started, not that display completed.",
@@ -405,7 +440,7 @@ pub fn tools() -> Vec<Value> {
             "open_in_viewer"=>object(json!({"path":{"type":"string","minLength":1,"description":"Existing absolute file or folder path, without NUL characters."}}),&["path"]),
             _=>object(json!({}),&[]),
         };
-        let failure=object(json!({"error":object(json!({"code":{"type":"string","enum":["disabled","permission_changed","not_ready","bad_request","conflict","version_mismatch","busy","cancelled","timeout","internal"]},"message":string()}),&["code","message"])}),&["error"]);
+        let failure=object(json!({"error":object(json!({"code":{"enum":["disabled","permission_changed","not_ready","bad_request","conflict","version_mismatch","busy","cancelled","timeout","internal"]},"message":string()}),&["code","message"])}),&["error"]);
         let limits = if write(name) || matches!(name,"get_thumbnail"|"list_folder"|"open_in_viewer") { "" } else { " Max 200/page; larger clamped. Opaque cursors may shift on library/index change/restart." };
         let contents = if name == "get_thumbnail" { " WebP only in image/webp blocks." } else { " No media/doc bytes." };
         let rows = if write(name) || name == "open_in_viewer" { "" } else { " Oversized rows: digest ID/too_long." };

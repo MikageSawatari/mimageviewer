@@ -452,7 +452,7 @@ impl Connection {
         let connection = self.clone();
         let fallback = replies.clone();
         let id = request.id;
-        let context = ReadContext::new(&self.handlers, granted.0, cancel);
+        let context = ReadContext::new(&self.handlers, granted, cancel);
         let record_client = client.clone();
         match std::thread::Builder::new()
             .name("agent-read".into())
@@ -697,7 +697,7 @@ impl Handlers {
             }
             Command::Status => Ok(Payload::Status(StatusPayload {
                 app_version: env!("CARGO_PKG_VERSION").into(),
-                permission: ctx.permission,
+                permission: ctx.granted.0,
                 fts_ready: self.readers.fts.read().unwrap().is_some(),
                 remote_active: self.session.as_ref().is_some_and(|s| {
                     s.snapshot().phase != crate::remote_ipc::session::RemoteControlPhase::Local
@@ -709,7 +709,7 @@ impl Handlers {
                 cursor,
             } => {
                 let args = serde_json::json!([choice, "tag_menu_order"]);
-                let offset = decode_cursor(cursor.as_deref(), "list_tags", &args)?;
+                let offset = decode_cursor(cursor.as_deref(), "list_tags", &args, ctx.granted.1)?;
                 let limit = limit_value(limit)?;
                 let tags = self.readers.agent_tags(choice)?;
                 let more = tags.len() > offset + limit;
@@ -720,6 +720,7 @@ impl Handlers {
                     "list_tags",
                     args,
                     "tags",
+                    ctx.granted.1,
                 )?;
                 Ok(Payload::Tags(TagPage {
                     tags,
@@ -736,15 +737,25 @@ impl Handlers {
                 let tag = tag.trim();
                 validate_text(tag)?;
                 let args = serde_json::json!([tag, kind, "path"]);
-                let offset = decode_cursor(cursor.as_deref(), "items_by_tag", &args)?;
+                let offset =
+                    decode_cursor(cursor.as_deref(), "items_by_tag", &args, ctx.granted.1)?;
                 let limit = limit_value(limit)?;
                 let (items, truncated) =
                     self.readers
                         .agent_tag_items(tag, kind, offset + limit + 1, cancel)?;
-                page(items, offset, limit, truncated, "items_by_tag", args).map(Payload::Items)
+                page(
+                    items,
+                    offset,
+                    limit,
+                    truncated,
+                    "items_by_tag",
+                    args,
+                    ctx.granted.1,
+                )
+                .map(Payload::Items)
             }
             Command::ListCollections { limit, cursor } => self
-                .collections(limit, cursor, cancel)
+                .collections(limit, cursor, ctx)
                 .map(Payload::Collections),
             Command::GetCollection {
                 id,
@@ -798,10 +809,11 @@ impl Handlers {
         &self,
         limit: Option<u32>,
         cursor: Option<String>,
-        cancel: &AtomicBool,
+        ctx: &ReadContext,
     ) -> Result<CollectionPage, AgentError> {
+        let cancel = &ctx.cancel;
         let args = serde_json::json!(["catalog_order"]);
-        let offset = decode_cursor(cursor.as_deref(), "list_collections", &args)?;
+        let offset = decode_cursor(cursor.as_deref(), "list_collections", &args, ctx.granted.1)?;
         let limit = limit_value(limit)?;
         let lease = self
             .producer
@@ -841,6 +853,7 @@ impl Handlers {
             "list_collections",
             args,
             "collections",
+            ctx.granted.1,
         )?;
         Ok(CollectionPage {
             collections,
@@ -862,7 +875,7 @@ impl Handlers {
             let query = query.trim().to_owned();
             validate_text(&query)?;
             let args = serde_json::json!([query, kind, "relevance"]);
-            let offset = decode_cursor(cursor.as_deref(), "search_items", &args)?;
+            let offset = decode_cursor(cursor.as_deref(), "search_items", &args, ctx.granted.1)?;
             let limit = limit_value(limit)?;
             let fts = self
                 .readers
@@ -881,15 +894,7 @@ impl Handlers {
                 .map_err(|_| internal())?;
             let scope = crate::global_search::SearchScope {
                 kinds: kind.map(|k| vec![index_kind(k)]),
-                // Caption access remains unavailable until its separate V3 permission exists.
-                // SearchScope applies this target to both the query and STORED post-filter.
-                target: crate::fts_index::SearchTarget::Only(
-                    crate::fts_index::SourceKind::ALL
-                        .iter()
-                        .copied()
-                        .filter(|source| *source != crate::fts_index::SourceKind::AiCaption)
-                        .collect(),
-                ),
+                target: caption_search_target(ctx.granted.0),
                 ignore_epub: settings.epub_file_handling_ignores_epub(),
                 ignore_archives: settings.archive_file_handling_ignores_convertible(),
                 visibility: settings.file_type_visibility,
@@ -948,6 +953,7 @@ impl Handlers {
                     true,
                     "search_items",
                     args.clone(),
+                    ctx.granted.1,
                 )?;
                 ctx.publish(Payload::Items(page));
             }
@@ -960,7 +966,16 @@ impl Handlers {
                 if truncated && items.len() <= offset && now() >= deadline {
                     return Err(timeout());
                 }
-                page(items, offset, limit, truncated, "search_items", args).map(Payload::Items)
+                page(
+                    items,
+                    offset,
+                    limit,
+                    truncated,
+                    "search_items",
+                    args,
+                    ctx.granted.1,
+                )
+                .map(Payload::Items)
             }),
             Some(worker),
         )
@@ -990,7 +1005,7 @@ impl Handlers {
             })
             .collect::<Result<Vec<_>, AgentError>>()?;
         let args = serde_json::json!([normalized, "input_order"]);
-        let offset = decode_cursor(cursor.as_deref(), "get_item_info", &args)?;
+        let offset = decode_cursor(cursor.as_deref(), "get_item_info", &args, ctx.granted.1)?;
         if offset > items.len() {
             return Err(error(ErrorCode::BadRequest, "最初からやり直してください"));
         }
@@ -998,7 +1013,7 @@ impl Handlers {
         let mut rows = Vec::new();
         for item in items.iter().skip(offset).take(limit) {
             ctx.checkpoint()?;
-            rows.push(item_info::read(item, ctx.permission, &ctx.cancel)?);
+            rows.push(item_info::read(item, ctx.granted.0, &ctx.cancel)?);
             let (page_rows, cursor, truncated) = bounded_rows(
                 rows.clone(),
                 offset,
@@ -1006,6 +1021,7 @@ impl Handlers {
                 "get_item_info",
                 args.clone(),
                 "items",
+                ctx.granted.1,
             )?;
             let count = page_rows.len();
             ctx.publish(Payload::Info(InfoPage {
@@ -1022,14 +1038,34 @@ impl Handlers {
         }
         ctx.checkpoint()?;
         let more = offset + rows.len() < items.len();
-        let (items, cursor, truncated) =
-            bounded_rows(rows, offset, more, "get_item_info", args, "items")?;
+        let (items, cursor, truncated) = bounded_rows(
+            rows,
+            offset,
+            more,
+            "get_item_info",
+            args,
+            "items",
+            ctx.granted.1,
+        )?;
         Ok(InfoPage {
             items,
             cursor,
             truncated,
         })
     }
+}
+
+fn caption_search_target(permission: PermissionSnapshot) -> crate::fts_index::SearchTarget {
+    use crate::fts_index::{SearchTarget, SourceKind};
+    // SearchScope shares this exact target between candidate lookup and the
+    // STORED post-filter. Never fetch a second permission snapshot mid-read.
+    SearchTarget::Only(
+        SourceKind::ALL
+            .iter()
+            .copied()
+            .filter(|source| permission.ai_captions || *source != SourceKind::AiCaption)
+            .collect(),
+    )
 }
 
 fn collect_search(
@@ -1171,14 +1207,22 @@ struct Cursor {
     tool: String,
     args_digest: String,
     returned: usize,
+    #[serde(default)]
+    permission_epoch: u64,
 }
-fn encode_cursor(tool: &str, args: serde_json::Value, returned: usize) -> String {
+fn encode_cursor(
+    tool: &str,
+    args: serde_json::Value,
+    returned: usize,
+    permission_epoch: u64,
+) -> String {
     // Hex JSON is opaque to clients and needs no dependency or process-local cursor state.
     serde_json::to_vec(&Cursor {
-        version: 2,
+        version: 3,
         tool: tool.into(),
         args_digest: wire_digest(&args).expect("serializable cursor arguments"),
         returned,
+        permission_epoch,
     })
     .unwrap()
     .iter()
@@ -1189,6 +1233,7 @@ fn decode_cursor(
     cursor: Option<&str>,
     tool: &str,
     args: &serde_json::Value,
+    permission_epoch: u64,
 ) -> Result<usize, AgentError> {
     let Some(cursor) = cursor else {
         return Ok(0);
@@ -1202,12 +1247,18 @@ fn decode_cursor(
         .map(|i| u8::from_str_radix(&cursor[i..i + 2], 16).map_err(|_| bad()))
         .collect::<Result<Vec<_>, _>>()?;
     let decoded: Cursor = serde_json::from_slice(&bytes).map_err(|_| bad())?;
-    if decoded.version != 2
+    if decoded.version != 3
         || decoded.tool != tool
         || decoded.args_digest != wire_digest(args).map_err(|_| bad())?
         || decoded.returned > 100_000
     {
         return Err(bad());
+    }
+    if decoded.permission_epoch != permission_epoch {
+        return Err(error(
+            ErrorCode::PermissionChanged,
+            "許可が変わりました。最初からやり直してください",
+        ));
     }
     Ok(decoded.returned)
 }
@@ -1257,6 +1308,7 @@ fn page(
     source_truncated: bool,
     tool: &str,
     args: serde_json::Value,
+    permission_epoch: u64,
 ) -> Result<ItemPage, AgentError> {
     let total = items.len();
     let mut items = items
@@ -1272,6 +1324,7 @@ fn page(
         tool,
         args,
         "items",
+        permission_epoch,
     )?;
     Ok(ItemPage {
         items,
@@ -1289,6 +1342,7 @@ fn bounded_rows<T: Serialize>(
     tool: &str,
     args: serde_json::Value,
     field: &str,
+    permission_epoch: u64,
 ) -> Result<(Vec<PageRow<T>>, Option<String>, bool), AgentError> {
     let mut rows = rows
         .into_iter()
@@ -1302,7 +1356,7 @@ fn bounded_rows<T: Serialize>(
         .collect::<Result<Vec<_>, AgentError>>()?;
     loop {
         let cursor = (truncated && !rows.is_empty())
-            .then(|| encode_cursor(tool, args.clone(), offset + rows.len()));
+            .then(|| encode_cursor(tool, args.clone(), offset + rows.len(), permission_epoch));
         if mcp_content_chars(
             &serde_json::json!({ (field): &rows, "cursor": &cursor, "truncated": truncated }),
         )

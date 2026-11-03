@@ -34,6 +34,7 @@ fn thumbnail_prefix() -> Payload {
                 "get_thumbnail",
                 serde_json::json!(["fixture"]),
                 1,
+                0,
             )),
             truncated: true,
         },
@@ -49,7 +50,7 @@ fn immediate(command: Command, ctx: &ReadContext) -> Result<Payload, Command> {
         Command::Hello { version, .. } => Ok(Payload::Hello { version }),
         Command::Status => Ok(Payload::Status(StatusPayload {
             app_version: "fixture".into(),
-            permission: ctx.permission,
+            permission: ctx.granted.0,
             fts_ready: false,
             remote_active: false,
         })),
@@ -204,7 +205,8 @@ fn media_deadline_keeps_both_slots_until_actual_reads_finish() {
                 decode_cursor(
                     response.page.cursor.as_deref(),
                     "get_thumbnail",
-                    &serde_json::json!(["fixture"])
+                    &serde_json::json!(["fixture"]),
+                    0
                 )
                 .unwrap(),
                 1

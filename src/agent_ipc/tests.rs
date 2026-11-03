@@ -182,6 +182,7 @@ fn permission_is_live_and_handshake_is_strict() {
             level: AgentLevel::ReadOnly,
             thumbnails: false,
             gps: false,
+            ai_captions: false,
         }
     );
     f.set_level(AgentLevel::Disabled);
@@ -272,20 +273,20 @@ fn cursor_continuation_and_character_budget() {
         })
         .collect();
     let args = serde_json::json!(["猫", null, "path"]);
-    let one = page(items.clone(), 0, 5, false, "items_by_tag", args.clone()).unwrap();
+    let one = page(items.clone(), 0, 5, false, "items_by_tag", args.clone(), 0).unwrap();
     assert!(one.truncated);
     assert!(mcp_content_chars(&one).unwrap() <= MAX_PAGE_CHARS);
-    let offset = decode_cursor(one.cursor.as_deref(), "items_by_tag", &args).unwrap();
-    let two = page(items, offset, 5, false, "items_by_tag", args.clone()).unwrap();
+    let offset = decode_cursor(one.cursor.as_deref(), "items_by_tag", &args, 0).unwrap();
+    let two = page(items, offset, 5, false, "items_by_tag", args.clone(), 0).unwrap();
     assert_ne!(row(&one.items[0]).path, row(&two.items[0]).path);
     assert_eq!(
-        decode_cursor(one.cursor.as_deref(), "search_items", &args)
+        decode_cursor(one.cursor.as_deref(), "search_items", &args, 0)
             .unwrap_err()
             .message,
         "最初からやり直してください"
     );
-    let bad = encode_cursor("items_by_tag", args.clone(), 1);
-    assert!(decode_cursor(Some(&bad), "items_by_tag", &serde_json::json!([])).is_err());
+    let bad = encode_cursor("items_by_tag", args.clone(), 1, 0);
+    assert!(decode_cursor(Some(&bad), "items_by_tag", &serde_json::json!([]), 0).is_err());
     drop(f);
 }
 
@@ -414,6 +415,133 @@ fn search_items_excludes_ai_captions_from_query_and_postfilter() {
         };
         assert_eq!(page.items.len(), expected, "{query}");
     }
+}
+
+#[test]
+fn search_items_allowed_ai_captions_match_images_and_books_in_query_and_postfilter() {
+    let f = Fixture::new();
+    seed_book_search_index(&f);
+    crate::settings_db::with_db_result(|db| {
+        let mut settings = db.load_into_settings()?;
+        settings.agent_show_ai_captions = true;
+        db.save_full(&settings)
+    })
+    .unwrap();
+    let connection = f.connection();
+    for (kind, query, expected) in [
+        (Some(ItemKind::Image), "captionsecret", 4),
+        (Some(ItemKind::Archive), "captionsecret", 5),
+        (Some(ItemKind::Folder), "captionsecret", 3),
+        (None, "cat captionsecret", 4),
+        (None, "book captionsecret", 8),
+        (None, "cat -captionsecret", 0),
+        (None, "book -captionsecret", 0),
+    ] {
+        let Payload::Items(page) = f
+            .call(
+                &connection,
+                1,
+                Command::SearchItems {
+                    query: query.into(),
+                    kind,
+                    limit: None,
+                    cursor: None,
+                },
+            )
+            .result
+            .unwrap()
+        else {
+            panic!("expected search page")
+        };
+        assert_eq!(page.items.len(), expected, "{query} / {kind:?}");
+    }
+}
+
+#[test]
+fn continued_search_and_folder_reject_every_permission_change_from_admission_grant() {
+    for field in ["captions", "gps", "thumbnails", "level"] {
+        let f = Fixture::new();
+        f.seed_index();
+        let root = f._dir.path().join("folder");
+        std::fs::create_dir(&root).unwrap();
+        for name in ["a.png", "b.png"] {
+            std::fs::write(root.join(name), b"fixture").unwrap();
+        }
+        let connection = f.connection();
+        let Payload::Items(search) = f
+            .call(
+                &connection,
+                1,
+                Command::SearchItems {
+                    query: "cat".into(),
+                    kind: None,
+                    limit: Some(1),
+                    cursor: None,
+                },
+            )
+            .result
+            .unwrap()
+        else {
+            panic!()
+        };
+        let folder_command = |cursor| Command::ListFolder {
+            path: root.to_string_lossy().into_owned(),
+            subresource: None,
+            limit: Some(1),
+            cursor,
+        };
+        let Payload::Folder(folder) = f.call(&connection, 2, folder_command(None)).result.unwrap()
+        else {
+            panic!()
+        };
+        assert!(search.cursor.is_some() && folder.cursor.is_some());
+        crate::settings_db::with_db_result(|db| {
+            let mut settings = db.load_into_settings()?;
+            match field {
+                "captions" => settings.agent_show_ai_captions = true,
+                "gps" => settings.agent_show_gps = true,
+                "thumbnails" => settings.agent_show_thumbnails = true,
+                "level" => settings.agent_level = AgentLevel::ReadAndOpen,
+                _ => unreachable!(),
+            }
+            db.save_full(&settings)
+        })
+        .unwrap();
+        for command in [
+            Command::SearchItems {
+                query: "cat".into(),
+                kind: None,
+                limit: Some(1),
+                cursor: search.cursor,
+            },
+            folder_command(folder.cursor),
+        ] {
+            assert_eq!(
+                f.call(&connection, 3, command).result.unwrap_err().code,
+                ErrorCode::PermissionChanged,
+                "{field}"
+            );
+        }
+    }
+}
+
+#[test]
+fn version_two_cursor_is_bad_request_even_when_permission_epoch_matches() {
+    let args = serde_json::json!(["cat", null, "relevance"]);
+    let legacy = serde_json::json!({
+        "version": 2, "tool": "search_items", "args_digest": wire_digest(&args).unwrap(), "returned": 1,
+    });
+    let cursor = serde_json::to_vec(&legacy)
+        .unwrap()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        decode_cursor(Some(&cursor), "search_items", &args, 0)
+            .unwrap_err()
+            .code,
+        ErrorCode::BadRequest
+    );
 }
 
 fn seed_book_search_index(f: &Fixture) {
@@ -1060,7 +1188,7 @@ fn named_pages_use_actual_serialized_character_cap_and_returned_offset() {
         })
         .collect();
     let (tags, cursor, truncated) =
-        bounded_rows(tags, 50, false, "list_tags", args.clone(), "tags").unwrap();
+        bounded_rows(tags, 50, false, "list_tags", args.clone(), "tags", 0).unwrap();
     assert!(truncated);
     assert!(!tags.is_empty());
     assert!(tags.len() < 20);
@@ -1071,7 +1199,7 @@ fn named_pages_use_actual_serialized_character_cap_and_returned_offset() {
     };
     assert!(mcp_content_chars(&page).unwrap() <= MAX_PAGE_CHARS);
     assert_eq!(
-        decode_cursor(page.cursor.as_deref(), "list_tags", &args).unwrap(),
+        decode_cursor(page.cursor.as_deref(), "list_tags", &args, 0).unwrap(),
         50 + page.tags.len()
     );
     let args = serde_json::json!(["catalog_order"]);
@@ -1089,6 +1217,7 @@ fn named_pages_use_actual_serialized_character_cap_and_returned_offset() {
         "list_collections",
         args.clone(),
         "collections",
+        0,
     )
     .unwrap();
     let page = CollectionPage {
@@ -1100,7 +1229,7 @@ fn named_pages_use_actual_serialized_character_cap_and_returned_offset() {
     assert!(!page.collections.is_empty());
     assert!(mcp_content_chars(&page).unwrap() <= MAX_PAGE_CHARS);
     assert_eq!(
-        decode_cursor(page.cursor.as_deref(), "list_collections", &args).unwrap(),
+        decode_cursor(page.cursor.as_deref(), "list_collections", &args, 0).unwrap(),
         200 + page.collections.len()
     );
     let (tags, cursor, _) = bounded_rows(
@@ -1113,6 +1242,7 @@ fn named_pages_use_actual_serialized_character_cap_and_returned_offset() {
         "list_tags",
         serde_json::json!([]),
         "tags",
+        0,
     )
     .unwrap();
     assert_eq!(tags.len(), 1);

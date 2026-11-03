@@ -36,6 +36,7 @@ fn exposure_descriptions_are_left_aligned_without_justification_and_still_wrap()
                     level: AgentLevel::ReadOnly,
                     thumbnails: false,
                     gps: false,
+                    ai_captions: false,
                 },
             );
         },
@@ -104,7 +105,7 @@ fn injected(_settings: &Settings) -> AgentIntegrationState {
 }
 
 #[test]
-fn agent_exposure_all_sixteen_permission_combinations() {
+fn agent_exposure_all_thirty_two_permission_combinations() {
     let mut count = 0;
     for level in [
         AgentLevel::Disabled,
@@ -114,47 +115,68 @@ fn agent_exposure_all_sixteen_permission_combinations() {
     ] {
         for thumbnails in [false, true] {
             for gps in [false, true] {
-                let result = exposure(PermissionSelection {
-                    level,
-                    thumbnails,
-                    gps,
-                });
-                let enabled = level != AgentLevel::Disabled;
-                assert_eq!(
-                    result.shown.iter().any(|line| line.contains("絶対パス")),
-                    enabled
-                );
-                assert_eq!(
-                    result
-                        .shown
-                        .iter()
-                        .any(|line| line.contains("縮小画像 (補正")),
-                    enabled && thumbnails
-                );
-                assert_eq!(result.shown.contains(&"撮影位置 (GPS)"), enabled && gps);
-                assert_eq!(
-                    result
-                        .actions
-                        .contains(&"mIV の画面で開く (表示が切り替わる)"),
-                    level >= AgentLevel::ReadAndOpen
-                );
-                assert_eq!(
-                    result
-                        .actions
-                        .contains(&"タグ・★・コレクションの変更 (確認なし。1 回 500 件まで)"),
-                    level == AgentLevel::Organize
-                );
-                assert!(result.hidden.contains(&"画像・動画・音声の元データ"));
-                assert!(result.hidden.contains(&"PDF / ZIP の中身の本文"));
-                assert!(result.hidden.iter().any(|line| line.contains("パスワード")));
-                if enabled && !gps {
-                    assert!(result.hidden.contains(&"撮影位置 (GPS)"));
+                for ai_captions in [false, true] {
+                    let result = exposure(PermissionSelection {
+                        level,
+                        thumbnails,
+                        gps,
+                        ai_captions,
+                    });
+                    let enabled = level != AgentLevel::Disabled;
+                    assert_eq!(
+                        result.shown.iter().any(|line| line.contains("絶対パス")),
+                        enabled
+                    );
+                    assert_eq!(
+                        result
+                            .shown
+                            .iter()
+                            .any(|line| line.contains("縮小画像 (補正")),
+                        enabled && thumbnails
+                    );
+                    assert_eq!(result.shown.contains(&"撮影位置 (GPS)"), enabled && gps);
+                    assert_eq!(
+                        result
+                            .shown
+                            .iter()
+                            .any(|line| line.starts_with("AI 説明文")),
+                        enabled && ai_captions
+                    );
+                    assert_eq!(
+                        result
+                            .actions
+                            .contains(&"mIV の画面で開く (表示が切り替わる)"),
+                        level >= AgentLevel::ReadAndOpen
+                    );
+                    assert_eq!(
+                        result
+                            .actions
+                            .contains(&"タグ・★・コレクションの変更 (確認なし。1 回 500 件まで)"),
+                        level == AgentLevel::Organize
+                    );
+                    assert!(result.hidden.contains(&"画像・動画・音声の元データ"));
+                    assert!(result.hidden.contains(
+                        &"PDF / ZIP の本文そのもの (ページの画像や文章を直接取り出すこと)"
+                    ));
+                    assert!(result.hidden.iter().any(|line| line.contains("パスワード")));
+                    if enabled && !gps {
+                        assert!(result.hidden.contains(&"撮影位置 (GPS)"));
+                    }
+                    if enabled && !ai_captions {
+                        assert!(result.hidden.contains(&"AI 説明文"));
+                    }
+                    if enabled && ai_captions {
+                        assert!(result.shown.iter().any(|line| {
+                            line.contains("表紙に固定した本文のページ")
+                                && line.contains("ZIP の中の画像から読み取った文字")
+                        }));
+                    }
+                    count += 1;
                 }
-                count += 1;
             }
         }
     }
-    assert_eq!(count, 16);
+    assert_eq!(count, 32);
 }
 
 #[test]
@@ -708,6 +730,9 @@ fn agent_integration_window_small_200_percent_controls_and_end_reachable() {
             .unwrap()
             .page_scroll
             .unwrap();
+        let caption_permission = harness.get_by_label("AI 説明文を AI に見せる").rect();
+        assert!(viewport.contains_rect(caption_permission));
+        assert!(before.inner.contains_rect(caption_permission));
         before.assert_height(
             HeightExpectation::Scrolls,
             viewport,
@@ -1074,12 +1099,13 @@ fn agent_integration_is_nonmodal_until_registration_and_preserves_preferences_pe
     app.settings.agent_level = AgentLevel::Organize;
     app.settings.agent_show_thumbnails = true;
     app.settings.agent_show_gps = true;
+    app.settings.agent_show_ai_captions = true;
     crate::ui_dialogs::preferences::prepare_preferences_settings_for_commit(
         &mut edited,
         &mut app.app.settings,
     );
     assert_eq!(edited.agent_level, AgentLevel::Organize);
-    assert!(edited.agent_show_thumbnails && edited.agent_show_gps);
+    assert!(edited.agent_show_thumbnails && edited.agent_show_gps && edited.agent_show_ai_captions);
     app.agent_integration_dialog.as_mut().unwrap().confirm(
         AppTarget::ClaudeDesktop,
         Action::Register,
@@ -1100,21 +1126,31 @@ fn agent_integration_immediate_permissions_commit_snapshot_and_epoch() {
             level: AgentLevel::Organize,
             thumbnails: false,
             gps: false,
+            ai_captions: false,
         },
         PermissionSelection {
             level: AgentLevel::Organize,
             thumbnails: true,
             gps: false,
+            ai_captions: false,
         },
         PermissionSelection {
             level: AgentLevel::Organize,
             thumbnails: true,
             gps: true,
+            ai_captions: false,
+        },
+        PermissionSelection {
+            level: AgentLevel::Organize,
+            thumbnails: true,
+            gps: true,
+            ai_captions: true,
         },
         PermissionSelection {
             level: AgentLevel::ReadOnly,
             thumbnails: true,
             gps: true,
+            ai_captions: true,
         },
     ] {
         app.commit_agent_permissions(selection);
@@ -1123,6 +1159,7 @@ fn agent_integration_immediate_permissions_commit_snapshot_and_epoch() {
         assert_eq!(current.0.level, selection.level);
         assert_eq!(current.0.thumbnails, selection.thumbnails);
         assert_eq!(current.0.gps, selection.gps);
+        assert_eq!(current.0.ai_captions, selection.ai_captions);
         assert_ne!(current.1, previous.1);
         previous = current;
     }
@@ -1175,4 +1212,17 @@ fn agent_integration_checkbox_commits_without_preferences_or_ok() {
     assert!(harness.state().settings.agent_show_gps);
     let saved = crate::settings_db::with_db_result(|db| db.load_agent_permission()).unwrap();
     assert!(saved.0.gps);
+    let before_caption = saved;
+    harness.get_by_label("AI 説明文を AI に見せる").click();
+    harness.run_steps(3);
+    assert!(harness.state().settings.agent_show_ai_captions);
+    let saved = crate::settings_db::with_db_result(|db| db.load_agent_permission()).unwrap();
+    assert!(saved.0.ai_captions);
+    assert_ne!(saved.1, before_caption.1);
+    harness.get_by_label("AI 説明文を AI に見せる").click();
+    harness.run_steps(3);
+    assert!(!harness.state().settings.agent_show_ai_captions);
+    let revoked = crate::settings_db::with_db_result(|db| db.load_agent_permission()).unwrap();
+    assert!(!revoked.0.ai_captions);
+    assert_ne!(revoked.1, saved.1);
 }

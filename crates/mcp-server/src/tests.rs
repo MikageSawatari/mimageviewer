@@ -402,35 +402,47 @@ fn stage1b_permission_tool_sets_and_thumbnail_changes() {
         AgentLevel::Organize,
     ] {
         for thumbnails in [true, false] {
-            let permission = PermissionSnapshot {
-                level,
-                thumbnails,
-                gps: true,
-            };
-            let names = schema::tool_names(permission);
-            assert_eq!(
-                names.contains(&"list_folder"),
-                level != AgentLevel::Disabled
-            );
-            assert_eq!(
-                names.contains(&"get_thumbnail"),
-                level != AgentLevel::Disabled && thumbnails
-            );
-            assert_eq!(
-                names.contains(&"open_in_viewer"),
-                level >= AgentLevel::ReadAndOpen
-            );
-            assert_eq!(schema::tools_for(permission).len(), names.len());
-            for name in [
-                "create_collection",
-                "rename_collection",
-                "add_to_collection",
-                "remove_from_collection",
-                "add_tags",
-                "remove_tags",
-                "set_rating",
-            ] {
-                assert_eq!(names.contains(&name), level >= AgentLevel::Organize);
+            for gps in [false, true] {
+                for ai_captions in [false, true] {
+                    let permission = PermissionSnapshot {
+                        level,
+                        thumbnails,
+                        gps,
+                        ai_captions,
+                    };
+                    let names = schema::tool_names(permission);
+                    assert_eq!(
+                        names,
+                        schema::tool_names(PermissionSnapshot {
+                            ai_captions: !ai_captions,
+                            ..permission
+                        })
+                    );
+                    assert_eq!(
+                        names.contains(&"list_folder"),
+                        level != AgentLevel::Disabled
+                    );
+                    assert_eq!(
+                        names.contains(&"get_thumbnail"),
+                        level != AgentLevel::Disabled && thumbnails
+                    );
+                    assert_eq!(
+                        names.contains(&"open_in_viewer"),
+                        level >= AgentLevel::ReadAndOpen
+                    );
+                    assert_eq!(schema::tools_for(permission).len(), names.len());
+                    for name in [
+                        "create_collection",
+                        "rename_collection",
+                        "add_to_collection",
+                        "remove_from_collection",
+                        "add_tags",
+                        "remove_tags",
+                        "set_rating",
+                    ] {
+                        assert_eq!(names.contains(&name), level >= AgentLevel::Organize);
+                    }
+                }
             }
         }
     }
@@ -446,11 +458,24 @@ fn stage1b_permission_tool_sets_and_thumbnail_changes() {
                 level: AgentLevel::ReadOnly,
                 thumbnails,
                 gps: false,
+                ai_captions: false,
             }),
             None,
         );
         assert_eq!(notice.is_some(), index > 0);
     }
+    assert!(
+        observer
+            .observe(
+                schema::tool_names(PermissionSnapshot {
+                    level: AgentLevel::ReadOnly,
+                    ai_captions: true,
+                    ..Default::default()
+                }),
+                None
+            )
+            .is_none()
+    );
 }
 
 #[test]
@@ -471,6 +496,7 @@ fn stage1b_all_protocols_transport_folder_pages_and_webp_blocks() {
                         level: AgentLevel::ReadOnly,
                         thumbnails: true,
                         gps: false,
+                        ai_captions: false,
                     },
                     fts_ready: true,
                     remote_active: false,
@@ -684,6 +710,8 @@ fn fixture_info(item: ItemRef) -> ItemInfo {
         container_size: None,
         container_modified: None,
         container_tags: vec![],
+        ai_caption: CaptionField::NotPermitted,
+        container_ai_caption: None,
         exif: InfoField::Present(ExifInfo {
             make: Some("camera".into()),
             ..Default::default()
@@ -1513,29 +1541,32 @@ fn stage2_complete_tool_discovery_fits_final_envelope_budget() {
     ] {
         for thumbnails in [false, true] {
             for gps in [false, true] {
-                for modern in [false, true] {
-                    let tools = schema::tools_for(PermissionSnapshot {
-                        level,
-                        thumbnails,
-                        gps,
-                    });
-                    for id in [
-                        json!(1),
-                        json!("01234567-89ab-cdef-0123-456789abcdef"),
-                        json!("x".repeat(64)),
-                    ] {
-                        let response = success(id, json!({"tools":tools}), modern);
-                        let chars = response_non_image_chars(&response);
-                        assert!(
-                            chars + 512 <= MAX_MCP_RESPONSE_CHARS,
-                            "discovery {level:?}/{thumbnails}/{gps}/{modern}: {chars} chars, needs 512 reserve"
-                        );
-                        assert!(
-                            serde_json::from_str::<Value>(&serialize_response(&response))
-                                .unwrap()
-                                .get("error")
-                                .is_none()
-                        );
+                for ai_captions in [false, true] {
+                    for modern in [false, true] {
+                        let tools = schema::tools_for(PermissionSnapshot {
+                            level,
+                            thumbnails,
+                            gps,
+                            ai_captions,
+                        });
+                        for id in [
+                            json!(1),
+                            json!("01234567-89ab-cdef-0123-456789abcdef"),
+                            json!("x".repeat(64)),
+                        ] {
+                            let response = success(id, json!({"tools":tools}), modern);
+                            let chars = response_non_image_chars(&response);
+                            assert!(
+                                chars + 512 <= MAX_MCP_RESPONSE_CHARS,
+                                "discovery {level:?}/{thumbnails}/{gps}/{ai_captions}/{modern}: {chars} chars, needs 512 reserve"
+                            );
+                            assert!(
+                                serde_json::from_str::<Value>(&serialize_response(&response))
+                                    .unwrap()
+                                    .get("error")
+                                    .is_none()
+                            );
+                        }
                     }
                 }
             }
@@ -3414,6 +3445,161 @@ fn accepts_schema_root(schema: &Value, value: &Value, root: &Value) -> bool {
 }
 
 #[test]
+fn caption_status_schema_requires_permission_for_all_snapshots() {
+    let tool = schema::tools()
+        .into_iter()
+        .find(|tool| tool["name"] == "miv_status")
+        .unwrap();
+    for level in [
+        AgentLevel::Disabled,
+        AgentLevel::ReadOnly,
+        AgentLevel::ReadAndOpen,
+        AgentLevel::Organize,
+    ] {
+        for thumbnails in [false, true] {
+            for gps in [false, true] {
+                for ai_captions in [false, true] {
+                    let result = tool_result(
+                        "miv_status",
+                        Ok(Payload::Status(StatusPayload {
+                            app_version: "fixture".into(),
+                            permission: PermissionSnapshot {
+                                level,
+                                thumbnails,
+                                gps,
+                                ai_captions,
+                            },
+                            fts_ready: true,
+                            remote_active: false,
+                        })),
+                    );
+                    let content = &result["structuredContent"];
+                    assert!(accepts_schema(&tool["outputSchema"], content));
+                    assert_eq!(content["permission"]["ai_captions"], ai_captions);
+                    let mut missing = content.clone();
+                    missing["permission"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("ai_captions");
+                    assert!(!accepts_schema(&tool["outputSchema"], &missing));
+                    let mut wrong_type = content.clone();
+                    wrong_type["permission"]["ai_captions"] = json!("true");
+                    assert!(!accepts_schema(&tool["outputSchema"], &wrong_type));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn caption_info_schema_matches_tagged_states_and_preserves_other_fields() {
+    let tool = schema::tools()
+        .into_iter()
+        .find(|tool| tool["name"] == "get_item_info")
+        .unwrap();
+    for stale in [Some(false), Some(true), None] {
+        let present = CaptionField::Present(AiCaptionInfo {
+            caption: TextValue {
+                text: "untrusted \"caption\"".into(),
+                truncated: true,
+            },
+            visible_text: TextValue {
+                text: "written text".into(),
+                truncated: false,
+            },
+            keywords: vec!["keyword".into()],
+            model: "fixture-model".into(),
+            created_at: 1_730_000_000_000,
+            stale,
+        });
+        for caption in [present, CaptionField::None, CaptionField::NotPermitted] {
+            for container_caption in [None, Some(caption.clone())] {
+                let mut info = fixture_info(ItemRef {
+                    path: "C:/book.pdf".into(),
+                    subresource: Some("page_1".into()),
+                });
+                info.ai_caption = caption.clone();
+                info.container_ai_caption = container_caption.clone();
+                let result = tool_result(
+                    "get_item_info",
+                    Ok(Payload::Info(InfoPage {
+                        items: vec![info.into()],
+                        cursor: None,
+                        truncated: false,
+                    })),
+                );
+                let content = &result["structuredContent"];
+                assert!(accepts_schema(&tool["outputSchema"], content), "{content}");
+                assert_eq!(
+                    content["items"][0]["ai_caption"],
+                    serde_json::to_value(&caption).unwrap()
+                );
+                assert_eq!(
+                    content["items"][0]["container_ai_caption"],
+                    serde_json::to_value(&container_caption).unwrap()
+                );
+                assert_eq!(
+                    serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap())
+                        .unwrap(),
+                    *content
+                );
+                for field in ["ai_caption", "container_ai_caption"] {
+                    let mut missing = content.clone();
+                    missing["items"][0].as_object_mut().unwrap().remove(field);
+                    assert!(!accepts_schema(&tool["outputSchema"], &missing));
+                    for invalid in [
+                        json!({"status":"unavailable"}),
+                        json!({"status":"not_applicable"}),
+                        json!({"status":"too_large"}),
+                        json!({"status":"present"}),
+                        json!({"status":"none","value":{}}),
+                        json!({"status":"not_permitted","value":{}}),
+                    ] {
+                        let mut wrong = content.clone();
+                        wrong["items"][0][field] = invalid;
+                        assert!(!accepts_schema(&tool["outputSchema"], &wrong));
+                    }
+                }
+                for invalid in [json!({"status":"none"}), json!({"status":"not_permitted"})] {
+                    let mut wrong = content.clone();
+                    wrong["items"][0]["size"] = invalid;
+                    assert!(!accepts_schema(&tool["outputSchema"], &wrong));
+                }
+                if matches!(caption, CaptionField::Present(_)) {
+                    for field in [
+                        "caption",
+                        "visible_text",
+                        "keywords",
+                        "model",
+                        "created_at",
+                        "stale",
+                    ] {
+                        let mut missing = content.clone();
+                        missing["items"][0]["ai_caption"]["value"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove(field);
+                        assert!(!accepts_schema(&tool["outputSchema"], &missing));
+                    }
+                    for (field, invalid) in [
+                        ("stale", json!("unknown")),
+                        ("caption", json!("plain")),
+                        ("visible_text", json!({"text":"plain"})),
+                        ("keywords", json!("keyword")),
+                        ("created_at", json!("today")),
+                        ("private", json!("extra")),
+                    ] {
+                        let mut wrong = content.clone();
+                        wrong["items"][0]["ai_caption"]["value"][field] = invalid;
+                        assert!(!accepts_schema(&tool["outputSchema"], &wrong));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn stage1a_schema_validates_serialized_payloads_and_explicit_absence_markers() {
     let backend = Fixture { disabled: false };
     for (name, args) in [
@@ -3593,7 +3779,8 @@ fn permission_observer_compares_advertised_tools_rather_than_snapshot_bits() {
                 schema::tool_names(PermissionSnapshot {
                     level: AgentLevel::ReadAndOpen,
                     thumbnails: false,
-                    gps: true
+                    gps: true,
+                    ai_captions: false,
                 }),
                 None
             )
@@ -3605,7 +3792,8 @@ fn permission_observer_compares_advertised_tools_rather_than_snapshot_bits() {
                 schema::tool_names(PermissionSnapshot {
                     level: AgentLevel::ReadOnly,
                     thumbnails: false,
-                    gps: true
+                    gps: true,
+                    ai_captions: false,
                 }),
                 None
             )
@@ -3617,7 +3805,8 @@ fn permission_observer_compares_advertised_tools_rather_than_snapshot_bits() {
                 schema::tool_names(PermissionSnapshot {
                     level: AgentLevel::ReadOnly,
                     thumbnails: false,
-                    gps: false
+                    gps: false,
+                    ai_captions: false,
                 }),
                 None
             )

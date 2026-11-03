@@ -145,7 +145,7 @@
     <p>本アプリは、動作に必要な次のデータを利用者の PC に保存します。リモート閲覧を有効にした場合、再生位置などは利用者の端末から PC へ送られます。開発者のサーバーへ送信されることはありません。外出先との暗号化された通信は Tailscale の中継サーバーを経由することがあります。</p>
     <ul class="pink-list">
       <li>アプリの設定・表示状態、動画・音声の再生位置とファイルごとに選んだ音声トラック</li>
-      <li>AI 連携の許可の範囲、縮小画像と撮影位置を AI に見せるかの設定</li>
+      <li>AI 連携の許可の範囲、縮小画像・撮影位置・AI 説明文を AI に見せるかの設定</li>
       <li>本ごとの見開き1ページずらしの調整（記憶をOFFにしても保存済み調整は保持し、明示的に解除できます。メタ情報の移行で持ち運べます）</li>
       <li>音響調整 (EffeTune) の調整状態、プリセット、設定、取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像</li>
       <li>登録した SFZ 音源の名前と保存場所。サンプルファイルはコピーしません</li>
@@ -250,7 +250,9 @@
         ファイルの場所（絶対パス）・名前・種類・大きさ・寸法・日時、タグ・★、コレクションと登録内容、本棚・閲覧履歴・ブックマーク・検索結果、
         撮影日時や機種などの EXIF、AI 生成画像のプロンプト・モデル名・生成条件などが対象です。
         状態確認では、連携の許可設定・検索の準備状態・リモート閲覧中かどうか・アプリの版も渡します。
-        縮小画像と EXIF の撮影位置（GPS）欄は、それぞれの設定を有効にした場合に渡します（どちらも既定では無効）。
+        縮小画像・EXIF の撮影位置（GPS）欄・AI 説明文は、それぞれの設定を有効にした場合に渡します（いずれも既定では無効）。
+        AI 説明文を許可すると、保存済みの説明文・画像内の文字・検索語で検索でき、ファイルや本の情報として内容も AI アプリへ渡ります。表紙に固定した本文のページや ZIP 内の画像から読み取った文字、氏名・連絡先なども含むことがあります。
+        許可しない場合はその内容で検索せず、内容も渡しません。ただし、説明文のある書庫・フォルダの本が名前での検索結果に出るため、説明文があることは推測できます。
         GPS 欄を無効にしても、ファイル名やプロンプトなどの文章に書かれた場所の情報を取り除くものではありません。
         <strong>この連携では、mImageViewer 自身がインターネットへ情報を送信せず、連携で渡す情報が mImageViewer の開発者へ送られることもありません。</strong>
         AI アプリと提供元による情報の扱いは、各社のプライバシーポリシーに従います。
@@ -284,7 +286,7 @@
       <strong>すべて利用者の PC 内（GPU）で実行</strong>されます。
       これらの本体の画像 AI 処理のために、画像を外部のサーバーへアップロードすることはありません。
     </p>
-    <p>AI 説明文は画像や本の表紙の内容と写っている文字を AI が文章にしたもので、正確とは限りません。利用者が明示的に作成を始めた対象だけを PC 内で処理し、説明文も PC 内に保存します。本の表紙も外部へ送信しません。<a href="manual/grid.html#ai-captions">作成方法を見る</a></p>
+    <p>AI 説明文は画像や本の表紙の内容と写っている文字を AI が文章にしたもので、正確とは限りません。利用者が明示的に作成を始めた対象だけを PC 内で処理し、説明文も PC 内に保存します。作成のために本の表紙を外部へ送信しません。<a href="manual/grid.html#ai-captions">作成方法を見る</a></p>
     <p>AI アプリとの連携は別の機能です。有効にすると、上の「ネットワーク通信」に記載した情報が AI アプリの提供元へ送られます。</p>
   </section>
 
@@ -359,14 +361,14 @@
     <p>The App stores the following data on your PC. When you enable remote viewing, playback progress and related information travel from your device to your PC. They are not sent to the developer's server. Encrypted traffic may pass through a Tailscale relay server when you connect from outside your home.</p>
     <ul class="pink-list">
       <li>Application settings and view state, video and audio playback positions, and the audio track selected for each file</li>
-      <li>The permission level for AI integration, and settings for showing reduced images and shooting locations to AI</li>
+      <li>The permission level for AI integration, and settings for showing reduced images, shooting locations, and AI captions to AI</li>
       <li>Per-book spread-pairing adjustments (saved adjustments remain when remembering is turned off and can be explicitly cleared or moved using metadata transfer)</li>
       <li>EffeTune adjustment state, presets, configuration, imported IR files and measurements, and visualizer layouts and background images</li>
       <li>Registered SFZ instrument names and locations. Sample files are not copied</li>
       <li>Thumbnail cache (including video frames and audio waveform analysis)</li>
       <li>PDFs converted from EPUBs for reading (you can delete them in the cache manager immediately; books in use remain and the App shows why they could not be deleted)</li>
       <li>Tags, ratings, rotation info, and reading history</li>
-      <li>Created or imported AI captions for images and book covers, transcribed visible text, and keywords (<code>ai_caption.db</code>). These may include names and contact details visible in images. For images, PDFs, and EPUBs in favorites with item indexing enabled, this content is also stored in the full-text index on your PC. Metadata exports also save this information in the selected folders</li>
+      <li>Created or imported AI captions for images and book covers, transcribed visible text, and keywords (<code>ai_caption.db</code>). These may include names and contact details visible in images. For images, PDFs, EPUBs, and archive or folder books with saved captions in favorites with item indexing enabled, this content is also stored in the full-text index on your PC. Metadata exports also save this information in the selected folders</li>
       <li>Downloaded AI caption models (<code>addons\vlm\</code>) and execution files extracted on use in the installer and single-exe editions (<code>vlm\workers\</code>). Removing a model does not delete saved captions</li>
       <li>Collections (list names, ordering, and the locations of the files and folders you add), and their rolling backups</li>
       <li>An index for finding alternate versions (image locations, formats, dimensions, and information used to compare their appearance)</li>
@@ -461,7 +463,9 @@
         collections and their contents; bookshelves, viewing history, bookmarks and search results;
         EXIF such as shooting dates and camera models; and AI image generation information such as prompts, model names and generation settings.
         Status checks also return the integration permissions, search readiness, whether remote viewing is active, and the App version.
-        Reduced images and EXIF shooting-location (GPS) fields are passed when you enable their respective settings (both are off by default).
+        Reduced images, EXIF shooting-location (GPS) fields, and AI captions are passed when you enable their respective settings (all are off by default).
+        Allowing AI captions lets the AI app search saved descriptions, transcribed visible text, and keywords, and receive their contents as file or book information. This may include text from a body page or an image inside a ZIP chosen as the cover, including names and contact details.
+        Without this permission, their contents are neither searched nor passed to the AI app. However, archive or folder books with captions can appear in searches by name, so the existence of a caption may be inferred.
         Turning off GPS fields does not remove location information written in text such as filenames or prompts.
         <strong>For this integration, mImageViewer itself does not send information over the internet, and the information passed through the integration is not sent to mImageViewer's developer.</strong>
         The AI app and provider handle it under their privacy policies.
@@ -494,7 +498,7 @@
       <strong>entirely on your PC (GPU)</strong>. The App does not upload images to an external
       server for these built-in image AI operations.
     </p>
-    <p>AI captions describe images and book covers and transcribe visible text; they may be inaccurate. The App processes only targets for which you explicitly start caption generation, and saves captions on your PC. Book covers are not sent to external servers. <a href="manual/grid.html#ai-captions">How to create captions</a></p>
+    <p>AI captions describe images and book covers and transcribe visible text; they may be inaccurate. The App processes only targets for which you explicitly start caption generation, and saves captions on your PC. Book covers are not sent to external servers to generate captions. <a href="manual/grid.html#ai-captions">How to create captions</a></p>
     <p>AI app integration is a separate feature. When enabled, the information listed under "Network communication" above is sent to the AI app's provider.</p>
   </section>
 

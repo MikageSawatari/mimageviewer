@@ -2701,3 +2701,74 @@ protocol の据え置きは「問題なし」。
 ### 19.25 25 回目 (2026-11-03、同じ担当の続き、基準 `e0c9a65fa`)
 
 24 回目の 3 件はすべて閉じた。新しい指摘は無し。V3 の設計 (§21.18) はここで確定する。
+
+### 21.19 V3 実装記録 (2026-11-03)
+
+基準 `efbbfa122`、`vlm-caption` の未コミット差分。正本は §21.18。本節は実装担当の記録であり、独立実装レビューや検収の判定ではない。
+利用者の指示に従いコミット・製品起動・外部通信・`G:\home\vlm-eval\` の参照は行わない。
+
+#### 21.19.1 実装と判断
+
+- `agent_show_ai_captions` は既定 false。settings の kv・snapshot 比較・commit 後の epoch・移行除外・環境設定確定時の現値の写しへ追加した。
+  MCP と説明文 DB は未リリースなので移行は追加せず、agent protocol は 2 を維持する。
+- `PermissionSnapshot.ai_captions` は serde の既定 false。tool の一覧は変えず、status の必須欄と読み取りの許可に加える。
+- `ItemInfo` の `CaptionField` は既存の `InfoField` と分離し、`present` / `none` / `not_permitted`。
+  値は `AiCaptionInfo { caption: TextValue, visible_text: TextValue, keywords, model, created_at, stale }`。
+  部分の指定がなければそのパス、あれば外側の本のパスを `CaptionDb::normalize_path` で読む。
+  PDF ページ・ZIP 内画像・ZIP 内ディレクトリの項目自身にはページ単位の説明文を付けない。部分の指定の無い container 欄は `null`。
+  OFF の欄は `not_permitted` で DB を開かず、対象外の種類と failed 行は `none`。未作成・版 0 も `none`。
+  DB 読取失敗はログと要求の失敗にし、元 DB を消さない。全て既存の読み取り worker 内で実行する。
+- 画像の `stale` は既に読んだ metadata と署名の比較。本は設計どおり `null` とし、表紙解決や App 状態の写しを追加しない。
+  生成情報を先に縮め、その後説明文・画像内の文字を縮める。`TextValue.truncated` を付け、検索語・モデル名・識別は保持する。
+- `search_items` は受付 snapshot から `SearchTarget` を作り、候補検索と STORED 後置照合の両方で共用する。
+  OFF でも名前に当たる説明文付きの本を出す既存仕様を維持し、存在の推測を画面・公開文書へ明記した。
+- `ReadContext` は受付の `(PermissionSnapshot, epoch)` を一組で保持する。`Cursor` と `FolderCursor` は版 3 と受付の epoch を持つ。
+  検索・タグ・コレクション・ライブラリ・項目情報・縮小画像・フォルダの作成と検査を同じ版に接続し、途中で版を読み直さない。
+  許可変更は `PermissionChanged`、旧 cursor は `BadRequest`。無効時の `Disabled` と応答直前の再照合は維持する。
+- 3 つ目のチェック・説明・3 欄・設定検索・fixture を更新。固定表紙にした本文ページや ZIP 画像の文字を含む旨と、本文そのものの直接取り出しを分けた。
+  manual 3 ページ・privacy 日英・製品ページのカードと「安心して使えます」を合わせた。
+- adapter は専用の CaptionField schema と必須欄を追加。discovery の既存上限を維持するため、同値な nullable 表現とローカル `$defs` で重複を減らした。
+  既存許可・tool の一覧・Remote IPC・MCP から生成を開始できない仕様は維持する。
+
+#### 21.19.2 検証
+
+通常 feature / test profile、未コミット差分に対して実装担当が実行。製品の起動・実データでの操作は行っていない。
+
+| 検査 | 結果・証跡 |
+| --- | --- |
+| `cargo check --offline -p mimageviewer --bin mimageviewer-core` | exit 0 |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/^agent_ipc::/)' --no-fail-fast` | 161 件中 158 成功、3 失敗。2 件は既知の名前付きパイプ OS 5 (`PermissionDenied`)、残る 1 件は下記の test-only 補完で成功。`target/v3-agent-tests.log` |
+| `favorite_deadline_returns_completed_prefix_before_blocked_next_row_finishes` の焦点再実行 | exit 0、1 成功。新しい cursor 検査引数に固定値 0 を渡した fixture を、実際の受付の epoch に合わせた。製品コードの変更は無し。`target/v3-settings-ui/favorite-deadline-final.log` |
+| 設定・UI・環境設定の写し・設定移行・検索索引の焦点 nextest | 90 件中 89 成功、全設定欄の件数の固定期待値 1 件が不一致。新欄を含む 483 件 / 除外 330 件へ期待値だけを修正し、同テストの再実行で exit 0、1 成功。`target/v3-settings-ui/{focused,classification-final}.log` |
+| `cargo nextest run --offline -p mimageviewer-agent-ipc --no-fail-fast` | 16 件すべて成功。初回 `target/v3-wire-tests.log` (run `04225ab6-e6d9-4c62-a38a-f3c1b555d4e2`) は待機時 stderr のため PowerShell 外側が非ゼロだったが、通常出力で最終再確認し exit 0 / 16 成功 (run `69ca0bfe-5a17-47c7-8002-d41538e90a38`) |
+| `cargo nextest run --offline -p mimageviewer-mcp --no-fail-fast` | 67 件中 65 成功、既知のパイプ OS 5 が 2 件。tool 出力の run `f1f2564f-c82a-43e2-9f71-06ab278a5060`。schema / discovery の焦点 12 件も成功 (run `9720b2ee-885e-4b1b-9e76-489f22d47e1c`) |
+| `UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --test ui_snapshot agent_integration_window_` | exit 0、既存 10 枚更新・全枚目視。更新指定なしの同じ比較も 10 件成功。`target/v3-settings-ui/{snapshot-update,snapshot-final}.log` |
+| `python scripts/check_ui_glyphs.py` / `python scripts/check_site_cards.py` | 危険な字形 0、50 カード中超過 0 |
+
+新規回帰は、画像・本・PDF ページ・ZIP 内画像とディレクトリ、ON/OFF・未作成/版 0・failed 行・古い画像・本文の縮小、
+OFF 時の破損 DB 非読取、読取エラーで原本を保持すること、内容が準備された後の許可変更による応答の拒否、
+ON の説明文検索と OFF の候補/後置照合、すべての許可の変更で検索/フォルダ cursor を失効すること、旧 cursor、schema と一覧不変を含む。
+PDF ページの caption 所有は共通の enrichment 境界を直接検査し、caption のためだけに PDF helper を起動しない。
+
+PNG は 10 枚合計 2,615,952 bytes (増分 502,030)。Light/Dark の説明と 3 欄は読め、列や scrollbar の重なり無し。
+小画面・100%/200% の末尾到達性と checkbox geometry は既存の headless 回帰で確認した。
+
+別 context の読み取り専用の実装レビューでは対応が必要な指摘は無かった (実行検証は本表の担当結果を再利用)。設計担当の検収とは区別する。
+本体 lib 全件は依頼どおり設計担当へ引き継ぐ。OS 5 のパイプ 4 件は sandbox 外での確認が残る。
+
+`CARGO_NET_OFFLINE=true` で `.\scripts\build-dev.ps1` を通常 feature / `dev-runtime` profile (portable 無効) で実行し exit 0。
+core (4 分 08 秒)、Remote、EPUB 変換 worker、MCP adapter を揃え、VCRT の PE 検査も runtime=4 / pe=4 で成功した。
+ログは `target/v3-build-dev.log`。生成物をエージェントは起動していない。
+`cargo fmt` (引数無し) と `cargo fmt --check`、`git diff --check` は成功。
+一括編集で触れたものの内容が HEAD と同じだった 14 ファイルは、内容一致を確認して checkout の改行だけを戻し、差分から除いた。
+最終ハンドオフ前にも引数無しの `cargo fmt` を行う。コミットは利用者の指示どおり行わない。
+
+確認する場合はインストール版・常駐版を終了し、利用者自身がリポジトリのルートから次を実行する。
+通常の `%APPDATA%\mimageviewer` を使うため、実際の設定・データを更新し得る。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+既存の説明文がある画像・本で、AI 連携の説明文チェックの ON/OFF、説明文だけの語による検索と項目情報、
+許可変更後の続きの取り直しを確認する。本体 lib 全件・sandbox 外の IPC・実アプリでの確認と検収は設計担当へ引き継ぐ。
