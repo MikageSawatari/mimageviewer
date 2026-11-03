@@ -2580,7 +2580,9 @@ UI文言の変更はない。確認用起動は §21.17.4 と同じ通常profile
 
 - 許可は `settings.rs` の `agent_level`・`agent_show_thumbnails`・`agent_show_gps` (既定は Disabled・false・false)。`settings_db` の kv に保存し、`save_full` の commit の後、
   3 つをまとめた snapshot が変わったときだけ、プロセス全体の許可の版 (epoch) を進める。DB を開き直したときも新しい版を取る。
-- 要求ごとに、受け付けたときの `(PermissionSnapshot, epoch)` を `ReadContext` に持ち、応答を送る直前の `Reply::wire` で今の値と比べる。違えば `PermissionChanged` で答える。
+- 要求ごとに、受け付けたときの `(PermissionSnapshot, epoch)` (`granted`) を取り、snapshot は `ReadContext` に、組は `ReplyPolicy::Read(granted)` に渡す
+  (`work.rs`)。応答を送る直前の `Reply::wire` で今の値と比べ、違えば `PermissionChanged` で答える (連携全体が無効になった場合は `Disabled`)。
+  (独立レビュー 24 回目 P3 で前提を訂正した。`ReadContext` が持つのは snapshot だけで、版は持たない。)
   この検査は 1 つの要求の受付から応答までで、ページ送りの続き (`Cursor { version, tool, args_digest, returned }`、`list_folder` は `FolderCursor`) は版を持たない。
 - `PermissionSnapshot` は外部の adapter (`crates/mcp-server`) へ `miv_status` の応答で渡る。adapter はツールの一覧をこの snapshot から作る (縮小画像だけがツールの増減に効く)。
   `miv_status` と `get_item_info` の出力の schema は手書きで、`additionalProperties: false`・全欄必須。
@@ -2624,9 +2626,13 @@ UI文言の変更はない。確認用起動は §21.17.4 と同じ通常profile
      (生成情報の後に縮める)。縮めたことは既存の印で示す。
 4. **`search_items`**: 検索対象を、受け付けたときの snapshot から作る。`ai_captions` が ON なら `SourceKind::ALL`、OFF なら V2a のとおり `AiCaption` を除く。
    - 候補の問い合わせと後置の絞り込みの両方が、同じ対象を使う。
-   - 説明文のある書庫・フォルダの本 (V2b) は、OFF でも名前で当たれば出る。説明文を持つことは結果からは分からない。
+   - 説明文のある書庫・フォルダの本 (V2b) は、OFF でも名前で当たれば出る (U17 の仕様のまま)。説明文のある書庫・フォルダだけが索引に載るので、
+     **OFF でも「説明文がある」ことは結果から推測できる**。OFF の保証は「説明文の内容で検索しない・内容を返さない」に絞り、存在が推測できることは
+     画面の説明と公開文書に書く (独立レビュー 24 回目 P3)。
 5. **ページ送りの続きに許可の版を入れる** (§10、独立レビュー 2 回目 P2):
-   - 対象は `Cursor` と `FolderCursor`。cursor を作るときの版 (受け付けたときの版) を持たせ、続きの要求で今の版と違えば `PermissionChanged` で拒む。
+   - 対象は `Cursor` と `FolderCursor`。**受け付けたときの `granted` (snapshot と版の組) を `ReadContext` へ通し**、cursor を作るときも検査するときもその版を使う。途中で版だけを読み直さない
+     (snapshot と版の取得の時点が分かれるため。独立レビュー 24 回目 P3)。続きの要求の受付の版が cursor の版と違えば `PermissionChanged` で拒む
+     (連携全体が無効なら今どおり `Disabled`)。
    - cursor の版 (`version`) を 3 に上げ、古い cursor は今どおり `BadRequest` (「最初からやり直してください」) にする。
    - 説明文の許可だけでなく、すべての許可の変更に同じく効く。
    - 許可の版はプロセスの中の番号なので、mIV を再起動すると同じ番号が出ることがある。その場合は続きが受け入れられるが、検索は今の許可で行うので、許可の無い内容は出ない。
@@ -2637,6 +2643,10 @@ UI文言の変更はない。確認用起動は §21.17.4 と同じ通常profile
      画像内の文字には氏名・連絡先などが入り得ることも添える (privacy の記述と同じ)。
    - 節の見出し「縮小画像・撮影位置」は、3 つを表す名前に改める。
    - 3 欄の表示は選択から作る。ON なら「AI に見せるもの」、OFF なら「見せないもの」に「AI 説明文」を出す。
+   - **「AI に見せるもの」の AI 説明文には、表紙に固定した本文のページや ZIP の中の画像から読み取った文字も含むことを書く**。
+     固定の「見せないもの」の「PDF / ZIP の中身の本文」は、「PDF / ZIP の本文そのもの (ページの画像や文章を直接取り出すこと)」に限る表現に改める
+     (独立レビュー 24 回目 P2。本文のページを表紙に固定して説明文を作ると、そのページの文字を書き写した説明文が渡るため、今の表現と矛盾する)。
+     公開文書 (`manual/ai-integration.html` の「AI に見せるもの・見せないもの」の表と「渡しません」の段落) も同じ表現に揃える。
    - 設定の検索の索引と UI スナップショット (`draw_agent_integration_snapshot_fixture`) も更新する。
 7. **adapter の文言** (`crates/mcp-server/src/schema.rs`):
    - `get_item_info` の説明: 「AI 説明文は許可がある場合だけ返す」。
@@ -2679,3 +2689,11 @@ UI文言の変更はない。確認用起動は §21.17.4 と同じ通常profile
   - discovery の大きさ。
   - 許可の組み合わせのテストに `ai_captions` を足す。
 - **画面:** UI スナップショット。
+
+### 19.24 24 回目 (2026-11-03、同じ担当の続き、基準 `e28206659`、V3 の設計)
+
+1 回目はレビュー担当のモデルの混雑で途中で止まり、同じ担当の続きで最後まで報告を受けた。P2 1 件・P3 2 件。§21.18 に足した:
+「見せないもの」の固定の文言が、表紙に固定した本文のページから書き写した説明文と矛盾する (P2、表現を本文の直接の取り出しに限り、見せるものに明記) /
+OFF でも説明文の存在は検索結果から推測できる (P3、保証を内容に絞り、存在の推測を明記) / 受付の版は `ReadContext` ではなく `ReplyPolicy` に渡っている
+(P3、受付の `granted` を context へ通して cursor にも使う)。許可の保存・応答直前の再検査・検索の対象・cursor の方針・本の `stale: null`・`CaptionField`・
+protocol の据え置きは「問題なし」。
