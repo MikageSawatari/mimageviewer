@@ -922,7 +922,7 @@ fn stage1c_open_arguments_and_results_match_schema_and_budget() {
     );
     let description = tool["description"].as_str().unwrap();
     for text in [
-        "main mIV viewer",
+        "main mImageViewer (mIV) viewer",
         "fullscreen",
         "Other files",
         "ZIP/PDF",
