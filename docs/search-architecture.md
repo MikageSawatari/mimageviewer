@@ -291,6 +291,8 @@ Tantivy writer には触れない。
 AI 説明文は画像・PDF・EPUB の ingest 時に `CaptionDb::open_read_only` の接続から読む。
 `status = ok` の説明文・画像内の文字・検索語だけを `ai_caption_text` に入れる。
 接続が無かった場合は次の反映・走査開始時に開き直す。動画・音声には説明文を付けない。
+反映待ちを読むのは公開済みのreadonly接続を確保できた回だけとする。未公開・open失敗の回は
+pendingを読まずACKもしない。直後に初回作成がcommitされても、書き手の世代更新を次の起床で拾う。
 説明文の commit は共有の `caption_epoch` を進め、各 supervisor は自分の既処理世代と比較する。
 起動時 (初回走査省略時も)・全件走査後・世代変化時に、自分の `OwnedRange` の反映待ちを
 DB から有界 batch で読み、既存候補作成・ingest/delete 経路へ渡す。索引 commit 成功後だけ

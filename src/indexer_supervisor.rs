@@ -69,6 +69,7 @@ thread_local! {
     static FULL_SCAN_GATE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
     static FULL_SCAN_AFTER_APPLY_GATE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
     static FTS_SCAN_EXTENSIONS_OVERRIDE: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+    static CAPTION_REFLECTION_AFTER_REOPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Supervisor が UI に返す進捗・状態スナップショット。
@@ -739,7 +740,19 @@ fn reflect_captions(
     if cancel.load(Ordering::Relaxed) || !session.caption_db_path.exists() {
         return;
     }
-    session.reopen_caption_connection();
+    let reader_ready = session.reopen_caption_connection();
+    #[cfg(test)]
+    {
+        let after_reopen = CAPTION_REFLECTION_AFTER_REOPEN.with(|hook| hook.borrow_mut().take());
+        if let Some(after_reopen) = after_reopen {
+            after_reopen();
+        }
+    }
+    // A writer may publish its first rows after the reopen attempt. Do not read
+    // or acknowledge them until this session has a published reader of its own.
+    if !reader_ready {
+        return;
+    }
     let db =
         match crate::ai_caption_db::CaptionDb::open_existing_for_write(&session.caption_db_path) {
             Ok(db) => db,
@@ -2567,6 +2580,103 @@ mod tests {
                     .unwrap()
                     .ai_caption
             })
+    }
+
+    #[test]
+    fn caption_reflection_defers_rows_published_after_an_uninitialized_reopen() {
+        let (tmp, meta, fts, writer, sem, _) = setup();
+        let root = tmp.path().join("images");
+        fs::create_dir(&root).unwrap();
+        write_image(&root, "first.jpg");
+        let key = crate::search_index_db::normalize_path(&root.join("first.jpg"));
+        let path = tmp.path().join("ai_caption.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA user_version = 0;").unwrap();
+        drop(conn);
+        let mut session = IngestSession::new_with_caption_db_path(
+            Uuid::new_v4(),
+            root,
+            &meta,
+            &fts,
+            path.clone(),
+        );
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mut seen = 0;
+        let stats = Mutex::new(SupervisorStats::default());
+        let progress = ProgressReporter::new();
+        let cancel = AtomicBool::new(false);
+        CAPTION_REFLECTION_AFTER_REOPEN.with(|hook| {
+            let path = path.clone();
+            let key = key.clone();
+            let epoch = Arc::clone(&epoch);
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // Reopen has observed version zero. Publish schema + content before
+                // reflection could open its separate pending/acknowledgement connection.
+                put_caption(&path, &key, "first-caption");
+                epoch.fetch_add(1, Ordering::Release);
+            }));
+        });
+        poll_caption_epoch(&epoch, &mut seen, || {
+            reflect_captions(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
+        });
+        assert_eq!(seen, 1);
+        assert_eq!(epoch.load(Ordering::Acquire), 2);
+        let db = crate::ai_caption_db::CaptionDb::open_read_only(&path)
+            .unwrap()
+            .unwrap();
+        assert!(!db.get(&key).unwrap().unwrap().indexed);
+        assert!(caption_text(&fts, &key).is_none());
+        assert!(meta.get(&key).unwrap().is_none());
+        assert!(!meta.tantivy_rebuild_pending().unwrap());
+        assert_eq!(stats.lock().unwrap().ingested_ok, 0);
+
+        // The pre-read sample cannot consume the commit's new epoch. The next
+        // wakeup reopens the now-published reader and reflects the still-pending row.
+        poll_caption_epoch(&epoch, &mut seen, || {
+            reflect_captions(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
+        });
+        assert_eq!(seen, 2);
+        assert!(db.get(&key).unwrap().unwrap().indexed);
+        assert_eq!(caption_text(&fts, &key).as_deref(), Some("first-caption"));
+        poll_caption_epoch(&epoch, &mut seen, || panic!("unchanged epoch"));
+    }
+
+    #[test]
+    fn caption_reflection_does_not_ingest_or_acknowledge_without_a_usable_reader() {
+        let (tmp, meta, fts, writer, sem, _) = setup();
+        let root = tmp.path().join("images");
+        fs::create_dir(&root).unwrap();
+        write_image(&root, "first.jpg");
+        let key = crate::search_index_db::normalize_path(&root.join("first.jpg"));
+        let path = tmp.path().join("ai_caption.db");
+        put_caption(&path, &key, "pending-caption");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA user_version = 27;").unwrap();
+        let mut session =
+            IngestSession::new_with_caption_db_path(Uuid::new_v4(), root, &meta, &fts, path);
+        assert!(!session.reopen_caption_connection());
+        let stats = Mutex::new(SupervisorStats::default());
+        reflect_captions(
+            &mut session,
+            &writer,
+            &sem,
+            &[],
+            &AtomicBool::new(false),
+            &stats,
+            &ProgressReporter::new(),
+        );
+        let indexed: bool = conn
+            .query_row(
+                "SELECT indexed FROM captions WHERE item_key=?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!indexed);
+        assert!(caption_text(&fts, &key).is_none());
+        assert!(meta.get(&key).unwrap().is_none());
+        assert!(!meta.tantivy_rebuild_pending().unwrap());
+        assert_eq!(stats.lock().unwrap().ingested_ok, 0);
     }
 
     #[test]

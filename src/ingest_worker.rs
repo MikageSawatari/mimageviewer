@@ -136,14 +136,15 @@ impl<'a> IngestSession<'a> {
 
     /// Retry a store absent at startup before a scan or pending reflection.
     /// A live read-only connection sees later commits without being reopened.
-    pub fn reopen_caption_connection(&mut self) {
-        if matches!(self.caption_db, Ok(Some(_))) {
-            return;
+    /// Returns whether a published reader is available for this attempt.
+    pub fn reopen_caption_connection(&mut self) -> bool {
+        if !matches!(self.caption_db, Ok(Some(_))) {
+            self.caption_db = CaptionDb::open_read_only(&self.caption_db_path).map_err(|error| {
+                crate::logger::log(format!("ingest: opening AI caption store failed: {error}"));
+                error.to_string()
+            });
         }
-        self.caption_db = CaptionDb::open_read_only(&self.caption_db_path).map_err(|error| {
-            crate::logger::log(format!("ingest: opening AI caption store failed: {error}"));
-            error.to_string()
-        });
+        matches!(self.caption_db, Ok(Some(_)))
     }
 
     /// Override the worker's store location, including for disposable tests.

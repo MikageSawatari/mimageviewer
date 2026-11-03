@@ -2335,6 +2335,36 @@ PermissionDeniedになった既存IPC 2件も、設計担当の全件実行で�
 P2・P3の対応を完了し、今回の範囲の未解決点はない。実機起動は未実施。製品起動・外部通信・
 評価用フォルダ参照・コミットは行っていない。
 
+#### 21.16.5 独立レビュー2回目のP2対応（基準 `47232d8d9`）
+
+前回の修正は設計担当が `47232d8d9` にコミットし、独立再レビューで前回のP2・P3は閉じた。
+今回のP2は、反映開始時のreadonly接続が版0で `Ok(None)` になった後、別接続で初期化と説明文の
+保存がcommitされ、pending側だけがその行を拾える順序。従来は接続なしのingestが説明文なしで
+成功し、行をACKしてしまった。
+
+- `IngestSession::reopen_caption_connection` は、既存の接続状態が `Ok(Some)` かどうかを戻り値で
+  返す。新しい保持状態は追加しない。
+- `reflect_captions` は公開済みreaderを確保できた回だけ、別の書き込み接続を開いて反映待ちを
+  読む。未公開・失敗の回は、その直後にwriterがcommitしていても、pendingの問い合わせ・ingest・
+  ACKを行わず終了する。通常走査の「説明文なしでも文書を作る」挙動は変更しない。
+- `seen` の規則は変更しない。世代 `e` は反映前に読み、終了後もその値を採用する。
+  版0を読んだ後に行を公開した書き手はcommit後に世代を進めるため、その更新を今回の `seen = e`
+  が消費することはなく、既存の次の起床で再open・反映される。retry・待機・通知用状態は足さない。
+- 回帰ではtest-onlyのhookで、再open直後からpending読取前の間にschema初期化・説明文保存・
+  世代更新を挟む。初回は未ACK・文書未作成・署名未更新・再構築予約なし、次の世代では説明文入りの
+  文書とACKがそろうことを確認する。open失敗時に読み取れるpending行があっても進めない回帰も追加した。
+
+今回の検証は通常feature、`--offline` / `CARGO_NET_OFFLINE=true`。変更コードを固定して実行した。
+
+| 確認 | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/ai_caption_db::\|ingest_worker::\|caption_display\|caption_reflection\|caption_read_failure\|caption_epoch/)' --no-fail-fast` | **75件成功、失敗0、exit 0**。run `d1e230fd-7c6f-4304-885c-2d53e461d154`、`target/v2a-review2-fixes-tests.log` / `target/v2a-review2-fixes-tests.junit.xml` |
+| `scripts/build-dev.ps1 -PreserveRuntime` | **exit 0**、通常feature / dev-runtime。core・remote・EPUB worker・MCP adapter成功、PE検査 runtime=4 / pe=4成功。`target/v2a-review2-fixes-build.log`、`target/vcrt-pe-reports/dev-runtime.json`。製品は起動していない |
+| 差分空白・最終整形 | `git diff --check`成功、最後に引数なしの `cargo fmt`。UI文字列は変更していない |
+
+今回のP2への実装対応を完了。実機起動は未実施。製品起動・外部通信・評価用フォルダ参照・
+コミットは行っていない。
+
 ### 19.22 22 回目 (2026-11-03、同じ担当の続き、基準 `220cb5fb3`、V2 の設計)
 
 P2 6 件・P3 2 件。§21.15 に足した: 起動時に DB が無かった接続は次の反映・走査で開き直す (P2) / 走査の本の候補はディレクトリを先に判定する (P2) /
