@@ -2569,3 +2569,113 @@ UI文言の変更はない。確認用起動は §21.17.4 と同じ通常profile
 - 本体 lib 全件は、V2a・V2b の修正をすべて含めた状態で流し直す (下に追記)。
 - 実機での確認は未実施。
 - 本体 lib 全件 (設計担当の環境、`183dce6f3`、V2a・V2b の修正をすべて含む): **15,574 件すべて成功** (828 秒)。
+
+### 21.18 V3 の設計 (2026-11-03)
+
+§10 (MCP との関係)・U2 (既定 OFF)・U13 (ON なら検索と `get_item_info` の両方で使う) を、コードを確かめて具体化する。
+着手前に `mcp-trial` の新しい 2 コミット (ツールの説明文・文書) を `vlm-caption` へ取り込んだ (`baa3aa3b6`)。MCP 担当のセッションは止まっており、
+`agent_ipc` と `crates/mcp-server` を並行して触る作業は無い。V3 で変えた点は `docs/mcp-integration-plan.md` (§5.6・§15.2) にも書き、MCP 担当へ引き継ぐ。
+
+#### 21.18.1 コードで確かめた前提
+
+- 許可は `settings.rs` の `agent_level`・`agent_show_thumbnails`・`agent_show_gps` (既定は Disabled・false・false)。`settings_db` の kv に保存し、`save_full` の commit の後、
+  3 つをまとめた snapshot が変わったときだけ、プロセス全体の許可の版 (epoch) を進める。DB を開き直したときも新しい版を取る。
+- 要求ごとに、受け付けたときの `(PermissionSnapshot, epoch)` を `ReadContext` に持ち、応答を送る直前の `Reply::wire` で今の値と比べる。違えば `PermissionChanged` で答える。
+  この検査は 1 つの要求の受付から応答までで、ページ送りの続き (`Cursor { version, tool, args_digest, returned }`、`list_folder` は `FolderCursor`) は版を持たない。
+- `PermissionSnapshot` は外部の adapter (`crates/mcp-server`) へ `miv_status` の応答で渡る。adapter はツールの一覧をこの snapshot から作る (縮小画像だけがツールの増減に効く)。
+  `miv_status` と `get_item_info` の出力の schema は手書きで、`additionalProperties: false`・全欄必須。
+- `AGENT_PROTOCOL_VERSION` は 2 で完全一致の検査。MCP 対応は v5 の未リリースの機能で、core と adapter は同じビルドで配られる。
+- `get_item_info` は読み取りの worker で、項目ごとに `TagsDb`・`RatingDb` を読み取り専用で開く (`enrich`)。部分の指定 (PDF の `page_N`・ZIP のエントリとディレクトリ) では、
+  外側の本の情報を `container_*` に入れる。撮影位置は `project_exif(.., permission.gps)` で、許可が無ければ値を `null` にする。
+- `search_items` は V2a で、検索対象から `AiCaption` を常に外している (V3 の許可が無い間の扱い)。
+- 「AI に見せる範囲」の画面 (`ui_dialogs/agent_integration.rs`) は即時に反映する独立の窓で、3 欄 (「AI に見せるもの」「見せないもの」「AI に許す操作」) を選択から作る。
+  設定の検索の索引・設定の移行の除外・環境設定の OK で値を写す処理 (`preferences.rs`) にも、許可の欄が列挙されている。
+
+#### 21.18.2 作るもの
+
+1. **許可の欄**:
+   - `settings.rs` に `agent_show_ai_captions: bool` を足す (`#[serde(default)]`、既定 false)。
+   - `settings_db` の kv に `agent_show_ai_captions` を足し、`read_agent_permission`・snapshot の比較・版の進め方を他の 2 つと同じにする。
+   - 設定の移行からは除外する (`settings_transfer.rs`)。環境設定の OK で今の値を写す処理 (`preferences.rs`) にも足す。
+   - 未リリースなので移行は要らない。kv が無ければ false。
+2. **`PermissionSnapshot` に `ai_captions: bool`** (`#[serde(default)]`) を足す。
+   - `AGENT_PROTOCOL_VERSION` は上げない (未リリースで、core と adapter は同じビルドで配る)。
+   - `miv_status` の出力の schema の `permission` に `ai_captions` を必須で足す。
+   - ツールの一覧はこの欄では変わらない (新しいツールは足さない)。
+3. **`get_item_info` の欄**: `ItemInfo` に `ai_caption: CaptionField` と `container_ai_caption: Option<CaptionField>` を足す。
+   - `CaptionField` は `status` の付いた enum で、次の 3 つ。
+     - `present`: 値は `AiCaptionInfo`。中身は説明文・画像内の文字・検索語・モデル名・作成日時・`stale`。
+     - `none`: 許可はあるが `status = ok` の行が無い。対象外の種類も含む。
+     - `not_permitted`: 「AI 説明文」が OFF。
+   - 「無い」と「見せない」を区別するのは、AI アプリが利用者に許可の変更を案内できるようにするため。
+   - `InfoField` (全欄で共有) に状態を足すと他の欄の schema の意味が変わるので、別の型にする。
+   - 失敗の行 (`status = failed`) は `none` と同じ扱いにし、失敗の理由は返さない。
+   - **どの行を読むか**:
+     - 部分の指定が無い要求: 画像・PDF・EPUB・書庫・フォルダのパスで行を読み、`ai_caption` に入れる。キーは `CaptionDb::normalize_path` で、本の行のキーはそのパス (§6.7)。
+     - 部分の指定がある要求 (PDF のページ・ZIP のエントリとディレクトリ): `ai_caption` は `none` にする (ページ単位の説明文は v5 では作らない)。
+       外側の本のパスの行を `container_ai_caption` に入れる。部分の指定が無い要求の `container_ai_caption` は `null`。
+   - **`stale`**:
+     - 通常のファイルの画像は、行の署名と、すでに読んだファイルの metadata を比べて決める。
+     - 本 (書庫・PDF・EPUB・フォルダ) は `null` (判定しない) にする。本の古さには表紙の解決が要る (§21.13、固定表紙・変換済み書庫・App の設定)。
+       agent の読み取りの worker で同じ解決をすると、App の状態を写す経路が増える。§21.18.4 で判断した。
+   - **読み方**: `enrich` と同じく、項目ごとに `CaptionDb::open_read_only` で開いて `get` する (無い・版 0 は `none`)。許可が OFF なら開かない。
+     読めないときはまれな失敗として扱う。ログに残し、`none` にはせず、要求の失敗として返す (既存の DB の読み取りの失敗と同じ扱い)。
+   - **長さ**: 説明文は短い (V1 の上限の内) が、`MAX_ITEM_CHARS` を超える場合に備え、`trim_descriptions` の縮め方に説明文・画像内の文字を加える
+     (生成情報の後に縮める)。縮めたことは既存の印で示す。
+4. **`search_items`**: 検索対象を、受け付けたときの snapshot から作る。`ai_captions` が ON なら `SourceKind::ALL`、OFF なら V2a のとおり `AiCaption` を除く。
+   - 候補の問い合わせと後置の絞り込みの両方が、同じ対象を使う。
+   - 説明文のある書庫・フォルダの本 (V2b) は、OFF でも名前で当たれば出る。説明文を持つことは結果からは分からない。
+5. **ページ送りの続きに許可の版を入れる** (§10、独立レビュー 2 回目 P2):
+   - 対象は `Cursor` と `FolderCursor`。cursor を作るときの版 (受け付けたときの版) を持たせ、続きの要求で今の版と違えば `PermissionChanged` で拒む。
+   - cursor の版 (`version`) を 3 に上げ、古い cursor は今どおり `BadRequest` (「最初からやり直してください」) にする。
+   - 説明文の許可だけでなく、すべての許可の変更に同じく効く。
+   - 許可の版はプロセスの中の番号なので、mIV を再起動すると同じ番号が出ることがある。その場合は続きが受け入れられるが、検索は今の許可で行うので、許可の無い内容は出ない。
+     起こるのは、件数のずれた続きを返すことだけ。まれで実害が小さいので割り切る (再起動を越えて続きを使う場面)。
+6. **画面** (`ui_dialogs/agent_integration.rs`):
+   - 「縮小画像を AI に見せる」「撮影位置 (GPS) を AI に見せる」の並びに、3 つ目として「AI 説明文を AI に見せる」を足す。
+   - 説明文は U13 のとおり、「ON にすると、AI アプリが AI 説明文 (説明文・画像内の文字・検索語) で検索でき、内容も受け取ります」。
+     画像内の文字には氏名・連絡先などが入り得ることも添える (privacy の記述と同じ)。
+   - 節の見出し「縮小画像・撮影位置」は、3 つを表す名前に改める。
+   - 3 欄の表示は選択から作る。ON なら「AI に見せるもの」、OFF なら「見せないもの」に「AI 説明文」を出す。
+   - 設定の検索の索引と UI スナップショット (`draw_agent_integration_snapshot_fixture`) も更新する。
+7. **adapter の文言** (`crates/mcp-server/src/schema.rs`):
+   - `get_item_info` の説明: 「AI 説明文は許可がある場合だけ返す」。
+   - `search_items` の説明: 「許可がある場合は AI 説明文でも検索する」。
+   - `miv_status` の説明: 許可に AI 説明文が入る。
+   - `get_item_info` の出力の schema に `ai_caption`・`container_ai_caption` を足す。discovery の大きさの上限 (40,000 字) を超えないことを既存のテストで確かめる。
+8. **公開文書・設計文書**:
+   - `manual/ai-integration.html` の「許可の範囲を選ぶ」と「AI に見せるもの・見せないもの」の表。
+   - `manual/settings.html` の該当の行。
+   - `manual/grid.html` の AI 説明文の節に、「許可すれば AI アプリから使える」ことを足す。
+   - `privacy.html` (日英) の「ネットワーク通信」の AI アプリ連携の項に、許可した場合は説明文が AI アプリへ渡ることを書く。
+   - 製品ページのカードは、該当があれば変える (150 字の上限)。
+   - `docs/mcp-integration-plan.md` の §5.6 (3 欄)・§15.2 (snapshot の欄と cursor の版) と、計画書の実装記録 §21.19。
+   - Remote IPC は変えない (§10)。MCP から作成ジョブを始めるツールは出さない (§10)。
+
+#### 21.18.3 状態を減らす検討
+
+- 許可は既存の snapshot と版の仕組みにそのまま 1 欄を足す。説明文のための別の許可の状態・別の版は作らない。
+- cursor の検査は、許可の版を cursor に入れるだけにする。サーバ側に cursor の記録は持たない。
+- 本の `stale` は判定しない (`null`)。agent の worker へ表紙の解決の環境を渡すと、App の設定・固定表紙の DB・変換済み書庫の状態を写す経路が増え、
+  その組み合わせのテストが要る。画像の古さは、すでに読んだ metadata だけで決まるので判定する。
+- まれな失敗 (DB を開けない) は割り切る (ログ + 要求の失敗)。
+
+#### 21.18.4 テスト
+
+- **許可の欄:** 保存・読み戻し、snapshot の比較と版の進め方 (変えたときだけ進む)、設定の移行からの除外、環境設定の OK での写し。
+- **`get_item_info`:**
+  - 次のそれぞれで、`ai_caption` / `container_ai_caption` の値が正しいこと: 画像・本・PDF のページ・ZIP のエントリ。
+  - ON / OFF・行の有無・失敗の行・古い画像・行の大きさの縮め方。
+  - OFF のとき DB を開かないこと。
+  - 受付と応答の間に OFF にすると `PermissionChanged` になること。
+- **`search_items`:**
+  - ON のとき、説明文だけの語で画像と本に当たること。
+  - OFF のとき当たらないこと (候補の問い合わせと後置の絞り込みの両方で)。
+- **cursor:**
+  - 1 ページ目の後に許可を変えると、続きが `PermissionChanged` になること (`list_folder` も)。
+  - 版 2 の cursor は `BadRequest` になること。
+- **adapter:**
+  - `miv_status` と `get_item_info` の schema への適合。
+  - discovery の大きさ。
+  - 許可の組み合わせのテストに `ai_captions` を足す。
+- **画面:** UI スナップショット。
