@@ -407,11 +407,13 @@ setup、build、upload の各入口でも同じ gate を通し、`INSTALL_OK` �
   でランサムウェア亜種に誤検知**される。単体exe版 / インストーラ版は依存を `include_bytes!` で
   内包し raw PE が露出しないので誤検知しない → **問題は portable (loose) 固有**。
 - **恒久対策 = コード署名** (§4)。署名済みなら発行元実績で Google/Microsoft の判定が好転する。
-  ただし VST3 ブリッジは**署名対応後も当面 portable へ非同梱**とする。再同梱は別タスクの
-  ユーザー承認が必要な機能変更であり、`build-portable.ps1` / portable 文書の同時更新、署名検証、
-  Chrome での実ダウンロード確認を通してから行う。単体exe / インストーラ版は埋め込みなので
-  VST3 は従来通り動く。EffeTune も portable には同梱しない (利用者決定、
-  [effetune-integration-plan.md](effetune-integration-plan.md) §10.1)。単体exe／インストーラでは
+  当時は VST3 ブリッジと EffeTune を portable へ同梱しないと決めた
+  ([effetune-integration-plan.md](effetune-integration-plan.md) §10.1 の履歴)。
+  現在は承認された F4 の方針に従い、署名済み host と全 PE を署名した mIV Sound を再同梱する。
+  `build-portable.ps1` の承認原本・署名差分・CRT 検査を通し、公開前に release checklist の
+  VirusTotal 検査（送信ごとに利用者了承）と Chrome での実ダウンロード確認を行う。
+  保存先とユーザー VST の例外、公開文書の統合は [派生版計画 §17・§19](effetune-fork-plan.md) を参照。
+  単体exe／インストーラでは
   launcher が VERSION を記録した全 bundle (v0.14.0 は462ファイル、VERSION込み入力463ファイル) を
   `runtime/<version>/effetune/<hash12>-<generation>/` へ全hash検証して公開し、
   atomic更新するのは小さなcurrent pointerだけ。既存・使用中treeは移動／削除／修復せず残す。

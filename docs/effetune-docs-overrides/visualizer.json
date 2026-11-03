@@ -3,7 +3,7 @@
     "operation": "insert_note",
     "heading_id": "visualizer",
     "note": "mImageViewer の音響調整を使用中は、再生中の曲名・アルバム名・アーティスト名と代表画像をこの表示へ自動で渡します。曲名が無ければ拡張子を除いたファイル名を使い、ほかの情報が無ければ空欄になります。画像は長辺1024ピクセルまでで、動く画像は最初の一枚を使います。先に文字を渡し、画像の準備ができたら表示します。音楽は同名画像・MP3表紙、動画は一覧と同じ代表画像を使います。一時停止やシークでは情報を残し、PCでの停止・閉じる・再生終了では消します。リモートは最後の曲が終わっても情報を残し、次曲への切替中は空になることがあります。Edit 中の文字は配置を調整するための見本です。自分で選ぶ背景画像も使用できます。",
-    "reason": "v0.15.0 visualizer-view.js metadata() uses the unchanged Now Playing contract; mIV sends neither lyrics nor video."
+    "reason": "mIV supplies Now Playing metadata, artwork, lyrics and playback position; no video frames."
   },
   {
     "operation": "replace_inline",
@@ -36,16 +36,10 @@
     "reason": "Clean Feed is a standalone menu and has no VST entry."
   },
   {
-    "operation": "replace_inline",
-    "anchor": "このほかの8種類は、それぞれが最も映える比率に用意されています。",
-    "replacement": "このほかの7種類は、それぞれが最も映える比率に用意されています。",
-    "reason": "mIV Sound retains Lyric Stage and omits Counter Gallery."
-  },
-  {
     "operation": "replace_html",
     "anchor": "<p><strong>Counter</strong>を追加すると、内蔵プレーヤーの現在の再生位置を表示し、一時停止やシークにも追従します。外部入力では、Counterを追加した時点、または現在のセッションでレイアウトを読み込んだ時点からの経過時間を表示し、Visualizerを隠している間も進みます。<strong>Edit</strong>以外でクリックまたはタップすると、そのCounterの外部入力用の経過時間だけが0に戻ります。プレーヤーの再生には影響しません。</p>",
-    "replacement": "<h3 id=\"miv-counter\">Counter</h3>\n<p><strong>Counter</strong>を追加すると、内蔵プレーヤーの現在の再生位置を表示し、一時停止やシークにも追従します。外部入力では、Counterを追加した時点、または現在のセッションでレイアウトを読み込んだ時点からの経過時間を表示し、Visualizerを隠している間も進みます。<strong>Edit</strong>以外でクリックまたはタップすると、そのCounterの外部入力用の経過時間だけが0に戻ります。プレーヤーの再生には影響しません。</p>",
-    "reason": "Counter has no upstream heading; exact paragraph anchor gives remove_section its ownership boundary."
+    "replacement": "<h3 id=\"miv-counter\">Counter</h3>\n<p><strong>Counter</strong> は、mImageViewer が送る再生位置を、歌詞と同じ時刻で表示します。歌詞のない曲でも使えます。一時停止中は止まり、シーク・再生速度の変更・曲の切り替え・繰り返し再生に追従します。停止中やリモート配信中など、再生位置を受け取れないときは0を表示します。クリックしても表示時刻はリセットされず、再生位置も変わりません。</p>",
+    "reason": "mIV Sound Counter uses the same host media playback clock as Lyrics, without click reset or DAW project time."
   },
   {
     "operation": "replace_inline",
@@ -74,7 +68,7 @@
   {
     "operation": "replace_inline",
     "anchor": "**Oscilloscope**、**Spectrum**、**Spectrogram**、**Stereo**、**Level Meter**、**Analog Meter**、**Notes**、**Guitar**、**Chroma Spiral**、**Phase Map**、**Rhythm Analyzer**のグラフ、または**Lyrics**、**Artwork**、**Video**、**Title**、**Album**、**Artist**、**Counter**、**Text**、**Shape**を追加します。アイテムはドラッグで移動し、ハンドルをドラッグしてサイズを変えます（**Shift**で縦横比を保ち、**Ctrl**/**Cmd**で中心を基準にサイズを変えます）。位置を揃えるには**グリッドに吸着**を使い、吸着を無視するには**Alt**を押しながらドラッグします。重なり順は**上へ移動**、**下へ移動**、**最前面へ**、**最背面へ**で変えます（一覧で下にあるアイテムほど手前に表示されます）。選択中のアイテムを複製するには、**Ctrl+D**（Macでは**Cmd+D**）を押すか、**Altを押しながらドラッグ**します。",
-    "replacement": "**Oscilloscope**、**Spectrum**、**Spectrogram**、**Stereo**、**Level Meter**、**Analog Meter**、**Notes**、**Guitar**、**Chroma Spiral**、**Phase Map**、**Rhythm Analyzer**のグラフ、または**Lyrics**、**Artwork**、**Title**、**Album**、**Artist**、**Text**、**Shape**を追加します。アイテムはドラッグで移動し、ハンドルをドラッグしてサイズを変えます（**Shift**で縦横比を保ち、**Ctrl**で中心を基準にサイズを変えます）。位置を揃えるには**グリッドに吸着**を使い、吸着を無視するには**Alt**を押しながらドラッグします。重なり順は**上へ移動**、**下へ移動**、**最前面へ**、**最背面へ**で変えます（一覧で下にあるアイテムほど手前に表示されます）。選択中のアイテムを複製するには、**Ctrl+D**を押すか、**Altを押しながらドラッグ**します。",
+    "replacement": "**Oscilloscope**、**Spectrum**、**Spectrogram**、**Stereo**、**Level Meter**、**Analog Meter**、**Notes**、**Guitar**、**Chroma Spiral**、**Phase Map**、**Rhythm Analyzer**のグラフ、または**Lyrics**、**Artwork**、**Title**、**Album**、**Artist**、**Counter**、**Text**、**Shape**を追加します。アイテムはドラッグで移動し、ハンドルをドラッグしてサイズを変えます（**Shift**で縦横比を保ち、**Ctrl**で中心を基準にサイズを変えます）。位置を揃えるには**グリッドに吸着**を使い、吸着を無視するには**Alt**を押しながらドラッグします。重なり順は**上へ移動**、**下へ移動**、**最前面へ**、**最背面へ**で変えます（一覧で下にあるアイテムほど手前に表示されます）。選択中のアイテムを複製するには、**Ctrl+D**を押すか、**Altを押しながらドラッグ**します。",
     "reason": "Windows VST modifiers; retain editing operations and omit unavailable Add items."
   },
   {
@@ -99,23 +93,18 @@
     "operation": "replace_html",
     "anchor": "<p><strong>Lyrics</strong> を追加すると、",
     "replacement": "<h3 id=\"miv-lyrics\">Lyrics</h3>\n<p><strong>Lyrics</strong> を追加すると、",
-    "reason": "Give Lyrics an explicit heading, ending the Counter-only span."
-  },
-  {
-    "operation": "remove_section",
-    "heading_id": "miv-counter",
-    "reason": "Counter is not available in mIV Sound; remove all its controls together."
-  },
-  {
-    "operation": "replace_html",
-    "anchor": "<li><p><strong>Counter Gallery</strong>（16:9）：機械式、LED、VFD、LCD、ドットマトリクス、フリップ、ニキシー管風の8つのカウンターを同時に表示します。30 fpsで計算したフレーム表示も含みます。動きを見比べたり、眺めて楽しんだり、気に入ったCounterだけを自分のレイアウトにコピーしたりできます。</p></li>",
-    "replacement": "",
-    "reason": "mIV Sound removes Counter Gallery from the preset inventory."
+    "reason": "Separate the Counter controls from Lyrics with explicit headings."
   },
   {
     "operation": "replace_inline",
     "anchor": "どの比率にも、共通の10種類のプリセットがあります。",
     "replacement": "どの比率にも **mIV Original** と、共通の10種類のプリセットがあります。**mIV Original** は、代表画像、曲情報、歌詞と音声グラフをまとめた初期表示です。",
     "reason": "mIV Original is available for every bundled aspect ratio."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "番号はプレーヤーのプレイリストの1曲目を1とし、外部入力では00になります。",
+    "replacement": "プレイリスト番号は00になります。",
+    "reason": "mIV supplies no playlist ordinal; counter trackIndex is zero."
   }
 ]

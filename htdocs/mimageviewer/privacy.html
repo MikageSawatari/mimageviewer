@@ -201,11 +201,13 @@
       <code>effetune\webview\</code> に保存します。Windows または WebView2 の管理ポリシーで別の保存先が指定されている場合は、その設定に従います。
       サンプルは元のフォルダから読み取り、コピーしません。Remove は登録だけを削除し、元のファイルは削除しません。
       これらの保存先は mImageViewer のデータフォルダに従い、ほかの EffeTune 製品とは分かれています。
-      初回起動時に従来の共通保存先から一度だけコピーし、元のデータは残します。mIV Sound は共通保存先を引き継ぎのために読み取り、日常の保存には使いません。
+      通常版では初回起動時に従来の共通保存先から一度だけコピーし、元のデータは残します。mIV Sound は共通保存先を引き継ぎのために読み取り、日常の保存には使いません。
       従来の共通保存先の <code>%APPDATA%\effetune\</code>、<code>%APPDATA%\Frieve\EffeTunePlugin\</code>、
       <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> は、追加した VST プラグインやほかの EffeTune 製品が使うことがあります。
       それらでも不要になったことを確認し、関連するアプリを終了してから手動で削除できます。
-      ポータブル版では音響調整を利用できません。
+      ポータブル版でも音響調整とユーザー VST を利用できます。音響調整の保存先は、実行ファイルの隣の
+      <code>data\effetune\</code> です。旧共有先からは引き継ぎません。
+      利用者が追加したユーザー VST は独自に APPDATA などへ保存する場合があり、mImageViewer からは止められません。
       次に起動したときに同じ調整で始めるための状態は、mImageViewer のデータフォルダーに保存します。
     </div>
     <div class="info-box">
@@ -277,6 +279,7 @@
     <ul class="pink-list">
       <li><strong>更新確認</strong>: 新しいバージョンの有無を確認するため、配布元（GitHub）の公開リリース情報を取得します。通常の HTTP リクエストのみで、個人を特定する情報は送信しません。</li>
       <li><strong>任意コンポーネントのダウンロード</strong>: 利用者が自ら選択した場合に限り、AI 高速化用コンポーネント等を配布元から取得します。AI 説明文のモデルは、確認画面でダウンロードを選んだときだけ mImageViewer の GitHub Releases から取得します。説明文の作成のために画像や画像内の文字を送信しません。</li>
+      <li><strong>利用者が追加したユーザー VST</strong>: プラグイン独自の通信は各プラグインの動作に従います。利用前に提供元の説明をご確認ください。</li>
       <li><strong>音響調整の画面表示</strong>: 音響調整を開いている間、画面表示に使う Windows の機能 (WebView2) が、Microsoft に自身の更新を確認することがあります。曲名や画像は送信しません。</li>
       <li><strong>AI アプリとの連携（既定では無効）</strong>: 有効にすると、mImageViewer は同じ PC に登録した AI アプリへ PC 内で情報を渡します。
         <strong>受け取った情報を AI アプリがその提供元へ送ります。</strong>
@@ -443,11 +446,13 @@
       <code>effetune\webview\</code>. A different location specified by Windows or WebView2 administrative policy takes precedence.
       Samples are read from their original folder and are not copied. Remove deletes only the reference, leaving the source files untouched.
       These locations follow mImageViewer's data folder and are separate from other EffeTune products.
-      On first startup, data is copied once from the existing shared locations and the originals remain. mIV Sound reads those shared locations for this one-time copy and does not use them for everyday storage.
+      In the installer and single-exe editions, on first startup, data is copied once from the existing shared locations and the originals remain. mIV Sound reads those shared locations for this one-time copy and does not use them for everyday storage.
       The existing shared <code>%APPDATA%\effetune\</code>, <code>%APPDATA%\Frieve\EffeTunePlugin\</code>, and
       <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> locations may still be used by VST plug-ins you add or other EffeTune products.
       Delete them manually only after checking that those uses no longer need them and closing the related apps.
-      The portable edition does not provide mIV Sound.
+      The portable edition also supports mIV Sound and user VST plug-ins. mIV Sound stores its data in
+      <code>data\effetune\</code> beside the executable and does not import data from the old shared locations.
+      User VST plug-ins you add may independently save data in APPDATA or elsewhere; mImageViewer cannot prevent this.
       The state that lets the next launch start with the same adjustment is saved in mImageViewer's own data folder.
     </div>
     <div class="info-box">
@@ -506,6 +511,7 @@
     <ul class="pink-list">
       <li><strong>Update check</strong>: to see whether a newer version exists, the App retrieves the public release information from the distribution source (GitHub). This is an ordinary HTTP request and includes no personally identifying information.</li>
       <li><strong>Optional component download</strong>: only when you choose to, the App downloads optional components (such as AI acceleration packs) from the distribution source. AI caption models are downloaded from mImageViewer's GitHub Releases only after you confirm the download. Images and text within images are not sent for caption generation.</li>
+      <li><strong>User VST plug-ins you add</strong>: independent network activity follows each plug-in’s behavior. Check the provider’s documentation before use.</li>
       <li><strong>Audio adjustment display</strong>: while audio adjustment is open, the Windows feature used to display it (WebView2) may contact Microsoft to check for its own updates. It does not send song titles or artwork.</li>
       <li><strong>AI app integration (off by default)</strong>: when enabled, mImageViewer passes information locally to an AI app registered on the same PC.
         <strong>The AI app sends the information it receives to its provider.</strong>

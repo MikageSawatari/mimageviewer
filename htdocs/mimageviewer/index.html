@@ -1328,13 +1328,13 @@
           <td style="padding:0.5rem 0.7rem; font-weight:600;">設定・データの保存先</td>
           <td style="padding:0.5rem 0.7rem;"><code>%APPDATA%\mimageviewer\</code></td>
           <td style="padding:0.5rem 0.7rem;"><code>%APPDATA%\mimageviewer\</code></td>
-          <td style="padding:0.5rem 0.7rem;"><strong>exe と同じフォルダの</strong> <code>data\</code><br>（システムドライブの APPDATA を使いません）</td>
+          <td style="padding:0.5rem 0.7rem;"><strong>exe と同じフォルダの</strong> <code>data\</code><br>（追加した VST の独自保存は別です）</td>
         </tr>
         <tr style="border-bottom:1px solid #eee;">
           <td style="padding:0.5rem 0.7rem; font-weight:600;">アンインストール</td>
           <td style="padding:0.5rem 0.7rem;">Windows の設定から削除</td>
           <td style="padding:0.5rem 0.7rem;">exe を削除（設定は APPDATA に残る）</td>
-          <td style="padding:0.5rem 0.7rem;">フォルダごと削除で完全に消える</td>
+          <td style="padding:0.5rem 0.7rem;">フォルダごと削除（外に保存した作品や VST のデータは別）</td>
         </tr>
         <tr style="border-bottom:1px solid #eee;">
           <td style="padding:0.5rem 0.7rem; font-weight:600;">持ち運び</td>
@@ -1346,7 +1346,7 @@
           <td style="padding:0.5rem 0.7rem; font-weight:600;">VST3 プラグイン<br>（動画・音楽の音声）</td>
           <td style="padding:0.5rem 0.7rem;">対応</td>
           <td style="padding:0.5rem 0.7rem;">対応</td>
-          <td style="padding:0.5rem 0.7rem;"><strong>非対応</strong>（この版では VST3 プラグイン機能は使えません）</td>
+          <td style="padding:0.5rem 0.7rem;">対応（音響調整とユーザー VST）</td>
         </tr>
       </tbody>
     </table>
@@ -1359,6 +1359,9 @@
       管理者権限を使いたくない・システムドライブを節約したい・USB メモリ等で持ち運びたい場合は
       <strong>ポータブル版</strong> をどうぞ。zip を<strong>書き込み可能な場所</strong>（デスクトップ・D ドライブ・USB 等）に
       解凍し、設定やキャッシュもそのフォルダ内の <code>data\</code> にまとまります。
+      音響調整も利用でき、<code>data\effetune\</code> に保存します。旧共有先からは引き継ぎません。
+      追加したユーザー VST が独自に APPDATA などへ保存することは mImageViewer からは止められません。
+      保存先の詳細は<a href="privacy.html">プライバシーポリシー</a>をご覧ください。
       <span style="color:#888;">※ <code>C:\Program Files\</code> など書き込みできない場所に置くと起動できません。</span><br>
       <strong>単体 exe 版</strong> は 1 ファイルで手軽ですが、設定は APPDATA に保存されます。
     </div>
@@ -1447,13 +1450,12 @@
 
     <h3 style="margin-top:1.6rem;">サードパーティ ソフトウェア（mIV Sound / VST3 SDK）</h3>
     <p style="font-size:0.9rem;">
-      単体exe版・インストーラ版の音響調整には mIV Sound（MIT License）を同梱しています。
+      単体exe版・インストーラ版・ポータブル版の音響調整には mIV Sound（MIT License）を同梱しています。
       EffeTune / EffeTune Mixwright by Frieve をもとにした派生版です。
       Copyright (c) 2026, Yoshiyuki Kobayashi / Copyright (c) 2025-2026, Yoshiyuki Kobayashi。
       VST3 対応には Steinberg VST3 SDK（MIT License、Steinberg Media Technologies GmbH）を使用しています。
       mIV Sound の同梱コンポーネント（VST3 SDK、JSZip と内包される lie / immediate / setImmediate / pako (zlib)、CHOC、Emscripten / musl、および通知に記載されたその他のライブラリ）には、それぞれのライセンスが適用されます。
       通知全文は、アプリの「ソフトウェア情報」（バージョン情報）の mIV Sound THIRD-PARTY-NOTICES / WebView THIRD-PARTY-NOTICES / DSP NOTICE で確認できます。
-      ポータブル版は mIV Sound と VST3 ホストを同梱しません。
     </p>
     <h3 style="margin-top:1.6rem;">サードパーティ ソフトウェア（FFmpeg / LGPL）</h3>
     <p style="font-size:0.9rem;">

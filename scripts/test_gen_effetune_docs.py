@@ -17,7 +17,7 @@ SPEC.loader.exec_module(docs)
 @contextlib.contextmanager
 def workspace_temporary_directory():
     # Keep fixtures inside the checkout in restricted Windows agent sessions.
-    parent = docs.ROOT / 'target/effetune-docs-tests'
+    parent = docs.ROOT / '.effetune-docs-tests'
     parent.mkdir(parents=True, exist_ok=True)
     # tempfile's 0o700 mkdir creates an inaccessible Windows sandbox ACL.
     temporary = parent / str(uuid.uuid4())
@@ -28,6 +28,8 @@ def workspace_temporary_directory():
         if not temporary.resolve().is_relative_to(parent.resolve()) or temporary.is_symlink() or temporary.is_junction():
             raise RuntimeError('Test directory escaped the workspace')
         shutil.rmtree(temporary)
+        if not any(parent.iterdir()):
+            parent.rmdir()
 
 
 class ConverterTests(unittest.TestCase):
@@ -165,22 +167,21 @@ class ConverterTests(unittest.TestCase):
 class GenerationTests(unittest.TestCase):
     def test_fork_and_upstream_versions_are_verified_separately(self):
         with self.assertRaisesRegex(docs.ConversionError, 'associated with mIV Sound'):
-            docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.3')
+            docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.2')
         with self.assertRaisesRegex(docs.ConversionError, 'DOCS_VERSION v0.14.0'):
-            docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.2', 'v0.14.0')
+            docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.3', 'v0.14.0')
 
     def test_sound_branding_defaults_storage_and_upstream_credit(self):
-        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.2')
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.3')
         for name, data in output.items():
             if not name.endswith('.html'):
                 continue
             page = data.decode()
             with self.subTest(page=name):
-                self.assertIn('manual/sound/v0.15.0-miv.2/' + name, page)
+                self.assertIn('manual/sound/v0.15.0-miv.3/' + name, page)
                 self.assertIn('EffeTune / EffeTune Mixwright (作者: Frieve、MIT License)', page)
                 self.assertNotIn('mIV Sound Web アプリ', page)
                 self.assertNotIn('%APPDATA%', page)
-                self.assertNotIn('Counter', page)
                 self.assertNotIn('CUE', page)
                 # Attribution and original license are intentionally unbranded.
                 content = page.split('<main class="content">')[1].split('</div></div>', 1)[1]
@@ -189,6 +190,7 @@ class GenerationTests(unittest.TestCase):
         visualizer = output['visualizer.html'].decode()
         self.assertIn('環境設定... &gt; 起動', visualizer)
         self.assertIn('前回の表示 (デフォルト)', visualizer)
+        self.assertIn('href="visualizer.html#miv-counter"', output['index.html'].decode())
         self.assertIn('mIV Original', visualizer)
         self.assertIn('Lyric Stage', visualizer)
         self.assertIn('0 dB', output['basics-volume.html'].decode())
@@ -196,19 +198,19 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('effetune/plugin/sfz-references.json', output['others-sfz-note-player.html'].decode())
 
     def test_snapshot_cannot_be_silently_relabelled_for_new_bundle(self):
-        with self.assertRaisesRegex(docs.ConversionError, 'associated with mIV Sound unspecified, not v0.15.0-miv.2'):
-            docs.generate(docs.ROOT / 'third_party/effetune-docs/03bffda3', 'v0.15.0-miv.2')
-        with self.assertRaisesRegex(docs.ConversionError, 'associated with mIV Sound unspecified, not v0.15.0-miv.2'):
-            docs.generate(docs.ROOT / 'third_party/effetune-docs/6791afdf', 'v0.15.0-miv.2')
-        with self.assertRaisesRegex(docs.ConversionError, 'associated with mIV Sound unspecified, not v0.15.0-miv.2'):
-            docs.generate(docs.ROOT / 'third_party/effetune-docs/01c96f00', 'v0.15.0-miv.2')
+        with self.assertRaisesRegex(docs.ConversionError, 'associated with mIV Sound unspecified, not v0.15.0-miv.3'):
+            docs.generate(docs.ROOT / 'third_party/effetune-docs/03bffda3', 'v0.15.0-miv.3')
+        with self.assertRaisesRegex(docs.ConversionError, 'associated with mIV Sound unspecified, not v0.15.0-miv.3'):
+            docs.generate(docs.ROOT / 'third_party/effetune-docs/6791afdf', 'v0.15.0-miv.3')
+        with self.assertRaisesRegex(docs.ConversionError, 'associated with mIV Sound unspecified, not v0.15.0-miv.3'):
+            docs.generate(docs.ROOT / 'third_party/effetune-docs/01c96f00', 'v0.15.0-miv.3')
 
     def test_snapshot_matches_output_and_preserves_license_images(self):
-        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.2')
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.3')
         self.assertEqual(len(output), 137)  # 20 category/guide/index/license + 113 plugin pages + 4 images
         for name, data in output.items():
             with self.subTest(name=name):
-                self.assertEqual((docs.MANUAL / 'sound/v0.15.0-miv.2' / name).read_bytes(), data)
+                self.assertEqual((docs.MANUAL / 'sound/v0.15.0-miv.3' / name).read_bytes(), data)
                 if name.endswith('.html'):
                     text = data.decode()
                     self.assertNotIn('sidebar-section', text)
@@ -224,7 +226,7 @@ class GenerationTests(unittest.TestCase):
             self.assertEqual(output['images/' + path.name], path.read_bytes())
 
     def test_snapshot_split_navigation_index_and_override_survival(self):
-        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.2').items() if name.endswith('.html')}
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.3').items() if name.endswith('.html')}
         eq = output['eq.html'].split('<main class="content">')[1]
         self.assertIn('id="スペクトラムオーバーレイ"', eq)
         self.assertIn('href="eq-15band-geq.html"', eq)
@@ -254,7 +256,7 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('visualizer.html', output)
 
     def test_readme_basic_operations_keep_vst_features_and_exclude_other_platforms(self):
-        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.2').items() if name.endswith('.html')}
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.3').items() if name.endswith('.html')}
         body = output['README.html'].split('<main class="content">')[1].split('</main>')[0]
         for heading in ['Visualizer', 'エフェクトチェーンの作成', 'プリセットの使用', 'エフェクトの共通操作', '保存データのバックアップと復元', 'セクション機能の使用方法', 'ABパイプライン機能の使用', 'エフェクト選択とキーボードショートカット', 'よく使われるエフェクトの組み合わせ']:
             self.assertIn(heading, body)
@@ -281,7 +283,7 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('href="controller-mapping.html"', body)
 
     def test_new_effects_and_expanded_visualizer_keep_bundled_operations(self):
-        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.2').items() if name.endswith('.html')}
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.3').items() if name.endswith('.html')}
         for page in ['analyzer-analog-meter.html', 'analyzer-rhythm-analyzer.html', 'eq-tonal-balance-eq.html', 'others-sfz-note-player.html', 'resonator-adaptive-prediction.html']:
             self.assertIn(page, output)
             self.assertIn('href="' + page + '"', output['index.html'])
@@ -302,7 +304,7 @@ class GenerationTests(unittest.TestCase):
                 self.assertNotIn('省電力', text)
                 self.assertNotIn('非表示時は表示専用DSPをスキップ', text)
         body = output['visualizer.html'].split('<main class="content">')[1].split('</main>')[0]
-        for retained in ['共通の10種類', 'このほかの7種類', 'mIV Original', 'Lyric Stage', 'Fretboard', 'Guitar', 'Analog Meter', 'Rhythm Analyzer', 'Phase Map', 'リンクを読み込む', 'Ctrl+V', 'Ctrl+D', 'Ctrl+クリック', '最前面へ', 'グラフスケール', 'Trail Feedback', 'Edge Fade', 'Cinema Strip', 'Meter Bridge']:
+        for retained in ['共通の10種類', 'このほかの8種類', 'mIV Original', 'Lyric Stage', 'Fretboard', 'Guitar', 'Analog Meter', 'Rhythm Analyzer', 'Phase Map', 'リンクを読み込む', 'Ctrl+V', 'Ctrl+D', 'Ctrl+クリック', '最前面へ', 'グラフスケール', 'Trail Feedback', 'Edge Fade', 'Cinema Strip', 'Meter Bridge']:
             self.assertIn(retained, body)
         for excluded in ['クリーンフィード', 'Macでは', 'WebAssembly 音声処理を使用する', 'ハードウェア アクセラレーションを使用', 'v0.12.0']:
             self.assertNotIn(excluded, body)
@@ -326,14 +328,14 @@ class GenerationTests(unittest.TestCase):
         self.assertNotIn('Safari', controller)
 
     def test_bundled_tour_and_visualizer_exclude_standalone_services(self):
-        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.2')
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.3')
         readme = output['README.html'].decode().split('<main class="content">')[1].split('</main>')[0]
         self.assertIn('設定メニューの <strong>画面の案内を見る</strong>', readme)
         self.assertIn('音楽や動画は mImageViewer で再生してください', readme)
         visualizer = output['visualizer.html'].decode().split('<main class="content">')[1].split('</main>')[0]
         for retained in ['Lyrics</strong> を追加すると', '同名 <code>.lrc</code>', '一時停止やシーク、速度変更', '歌詞の行をクリックしても再生位置は移動しません', 'リモート配信中は歌詞を表示しません', 'Lyric Stage', 'Edge Fade', 'Custom']:
             self.assertIn(retained, visualizer)
-        for absent in ['Counter Gallery', '再生中の歌詞は渡されません', '内蔵プレーヤーで再生している曲の歌詞', 'Clean Feed']:
+        for absent in ['再生中の歌詞は渡されません', '内蔵プレーヤーで再生している曲の歌詞', 'Clean Feed']:
             self.assertNotIn(absent, visualizer)
         for name, data in output.items():
             if name.endswith('.html'):
@@ -345,12 +347,17 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('Needle Response', output['analyzer-analog-meter.html'].decode())
 
     def test_counter_video_hdr_and_new_standalone_pages_match_vst_host(self):
-        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.2')
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.3')
         visualizer = output['visualizer.html'].decode()
         for expected in ['Video</strong> は追加メニューにありません', 'Visualizer HDR', 'Color Adjust', 'Color Map', 'Mid', 'Treble', 'Beat', 'Width']:
             self.assertIn(expected, visualizer)
-        for absent in ['内蔵プレーヤーの現在の再生位置', 'その行へ再生位置が移動', 'クリーンフィード', 'Counter', '小数桁数', 'プレイリスト番号', 'アートワーク、動画、曲情報と並べて表示できます', '必要に応じて動画に合わせて設定してください']:
+        for absent in ['内蔵プレーヤーの現在の再生位置', 'その行へ再生位置が移動', 'クリーンフィード', '外部入力用の経過時間', '処理サンプル', 'project time', 'アートワーク、動画、曲情報と並べて表示できます']:
             self.assertNotIn(absent, visualizer)
+        for expected in ['id="miv-counter"', 'Counter Gallery', 'このほかの8種類', 'mImageViewer が送る再生位置', '歌詞と同じ時刻', '歌詞のない曲でも使えます', '一時停止中は止まり', 'シーク・再生速度の変更・曲の切り替え・繰り返し再生に追従', '再生位置を受け取れないときは0', 'クリックしても表示時刻はリセットされず、再生位置も変わりません', 'プレイリスト番号は00', '小数桁数', 'フレームレート', '7セグメント', 'クロスフェード', '最小桁数', '全点灯', '数字の窓', 'ニキシー管']:
+            self.assertIn(expected, visualizer)
+        add_items = re.search(r'<li><p><strong>Oscilloscope</strong>.*?</p>', visualizer)[0]
+        self.assertIn('<strong>Counter</strong>', add_items)
+        self.assertNotIn('<strong>Video</strong>', add_items)
         sfz = output['others-sfz-note-player.html'].decode()
         for expected in ['Classic (Low Latency)', 'Event (+140 ms)', '約 230 ms', 'sfz-references.json', 'コピーしません', '元のファイルは削除しません']:
             self.assertIn(expected, sfz)
@@ -361,7 +368,7 @@ class GenerationTests(unittest.TestCase):
             self.assertLess(body.index('id="' + heading + '"'), body.index('id="プラグイン一覧"'))
 
     def test_bundled_prediction_and_rhythm_exclude_standalone_requirements(self):
-        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.2').items() if name.endswith('.html')}
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.3').items() if name.endswith('.html')}
         prediction = output['resonator-adaptive-prediction.html']
         self.assertIn('音響調整の音声処理を使います', prediction)
         self.assertIn('追加の音声設定は不要', prediction)
@@ -380,8 +387,8 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('<meta http-equiv="refresh" content="0; url=v0.12.0/index.html">', text)
         self.assertIn('<link rel="canonical" href="https://mikage.to/mimageviewer/manual/sound/v0.12.0/index.html">', text)
         self.assertIn('<a href="v0.12.0/index.html">', text)
-        self.assertNotEqual(docs.entry_page('v0.12.0'), docs.entry_page('v0.15.0-miv.2'))
-        self.assertEqual((docs.MANUAL / 'sound/index.html').read_bytes(), docs.entry_page('v0.15.0-miv.2'))
+        self.assertNotEqual(docs.entry_page('v0.12.0'), docs.entry_page('v0.15.0-miv.3'))
+        self.assertEqual((docs.MANUAL / 'sound/index.html').read_bytes(), docs.entry_page('v0.15.0-miv.3'))
 
     def test_check_exit_status_and_version_fallback_without_writes(self):
         with workspace_temporary_directory() as temporary:
@@ -415,10 +422,10 @@ class GenerationTests(unittest.TestCase):
                 self.assertEqual(run('--version', 'v0.12.0'), 1)
                 vendor = root / 'config'
                 vendor.mkdir(parents=True)
-                (vendor / 'miv-sound.rs').write_text('pub const VERSION: &str = \"0.15.0-miv.2\";\npub const DOCS_VERSION: &str = \"v0.15.0\";\n', encoding='utf-8')
+                (vendor / 'miv-sound.rs').write_text('pub const VERSION: &str = \"0.15.0-miv.3\";\npub const DOCS_VERSION: &str = \"v0.15.0\";\n', encoding='utf-8')
                 self.assertEqual(run('--version', 'v0.12.0'), 0)
-                self.assertTrue((root / 'manual/sound/v0.15.0-miv.2/index.html').exists())
-                self.assertEqual(entry.read_bytes(), docs.entry_page('v0.15.0-miv.2'))
+                self.assertTrue((root / 'manual/sound/v0.15.0-miv.3/index.html').exists())
+                self.assertEqual(entry.read_bytes(), docs.entry_page('v0.15.0-miv.3'))
                 self.assertEqual(output.read_bytes(), b'current')  # Check mode flags old versions without deleting them.
                 self.assertEqual(run('--check'), 1)
                 shutil.rmtree(output.parent)
@@ -430,7 +437,7 @@ class GenerationTests(unittest.TestCase):
             (root / '.htaccess').write_bytes(b'<IfModule mod_rewrite.c>\n</IfModule>\n')
             with patch.object(docs, 'ROOT', root), patch.object(docs, 'MANUAL', root / 'manual'), patch.object(docs, 'generate', return_value={'index.html': b'current'}), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 def run(*args):
-                    with patch('sys.argv', ['gen-effetune-docs.py', '--version', 'v0.15.0-miv.2', *args]):
+                    with patch('sys.argv', ['gen-effetune-docs.py', '--version', 'v0.15.0-miv.3', *args]):
                         return docs.main()
                 self.assertEqual(run(), 0)
                 legacy = root / 'manual/effetune'
@@ -441,8 +448,8 @@ class GenerationTests(unittest.TestCase):
                 self.assertEqual(run('--check'), 0)
                 htaccess = root / '.htaccess'
                 original = htaccess.read_bytes()
-                self.assertIn(b'/v0.15.0-miv.2/%1 [R=301,L]', original)
-                htaccess.write_bytes(original.replace(b'v0.15.0-miv.2/%1', b'v0.12.0/%1'))
+                self.assertIn(b'/v0.15.0-miv.3/%1 [R=301,L]', original)
+                htaccess.write_bytes(original.replace(b'v0.15.0-miv.3/%1', b'v0.12.0/%1'))
                 self.assertEqual(run('--check'), 1)
                 self.assertNotEqual(htaccess.read_bytes(), original)
                 self.assertEqual(run(), 0)
@@ -456,7 +463,7 @@ class GenerationTests(unittest.TestCase):
             htaccess.write_bytes(b'<IfModule mod_rewrite.c>\n</IfModule>\n')
             with patch.object(docs, 'ROOT', root), patch.object(docs, 'MANUAL', root / 'manual'), patch.object(docs, 'generate', return_value={'index.html': b'current'}), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 def run(*args):
-                    with patch('sys.argv', ['gen-effetune-docs.py', '--version', 'v0.15.0-miv.2', *args]):
+                    with patch('sys.argv', ['gen-effetune-docs.py', '--version', 'v0.15.0-miv.3', *args]):
                         return docs.main()
                 self.assertEqual(run(), 0)
                 base = root / 'manual/sound'
@@ -477,8 +484,8 @@ class RedirectTests(unittest.TestCase):
     HTACCESS = b'<IfModule mod_rewrite.c>\n  RewriteEngine On\n  RewriteCond %{HTTP_HOST} ^www\\.mikage\\.to$ [NC]\n  RewriteRule ^(.*)$ https://mikage.to/mimageviewer/$1 [R=301,L]\n</IfModule>\n# Other configuration\n'
 
     def test_redirects_cover_all_legacy_files_and_entries_without_loops(self):
-        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.2')
-        lines = [line.split() for line in docs.redirect_block('v0.15.0-miv.2', output).splitlines() if line.strip().startswith('Rewrite')]
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.3')
+        lines = [line.split() for line in docs.redirect_block('v0.15.0-miv.3', output).splitlines() if line.strip().startswith('Rewrite')]
         keep, fallback, legacy, entry, sound_keep, sound_fallback, sound = lines
         self.assertEqual(keep, sound_keep)
         self.assertEqual(fallback, sound_fallback)
@@ -495,48 +502,48 @@ class RedirectTests(unittest.TestCase):
                     return rule[2].replace('%1', condition[1])
             return None
 
-        current = 'https://mikage.to/mimageviewer/manual/sound/v0.15.0-miv.2/'
+        current = 'https://mikage.to/mimageviewer/manual/sound/v0.15.0-miv.3/'
         # Every actually published old file, including images, must redirect.
         previous = docs.MANUAL / 'effetune/v0.15.0'
         old_files = {p.relative_to(previous).as_posix() for p in previous.rglob('*') if p.is_file()}
         # Inventory remains checked after old generated files are removed.
         self.assertEqual(len(output), 137)
         for base in ['manual/effetune/', 'manual/sound/']:
-            for version in ['v0.15.0', 'v0.14.0', 'v0.13.0', 'v0.12.0', 'v0.11.1', 'v1.2.3-beta.1']:
+            for version in ['v0.15.0-miv.2', 'v0.15.0', 'v0.14.0', 'v0.13.0', 'v0.12.0', 'v0.11.1', 'v1.2.3-beta.1']:
                 for name in set(output) | old_files:
                     with self.subTest(base=base, version=version, name=name):
                         self.assertEqual(target(base + version + '/' + name), current + (name if name in output else 'index.html'))
                 for removed in ['', '/', '/removed.html', '/nested/removed.html', '/eq-15band-peq.html/extra', '/images/missing.png']:
                     self.assertEqual(target(base + version + removed), current + 'index.html')
         for name in output:
-            self.assertEqual(target('manual/effetune/v0.15.0-miv.2/' + name), current + name)
-            self.assertIsNone(target('manual/sound/v0.15.0-miv.2/' + name))
+            self.assertEqual(target('manual/effetune/v0.15.0-miv.3/' + name), current + name)
+            self.assertIsNone(target('manual/sound/v0.15.0-miv.3/' + name))
         for path in ['manual/effetune', 'manual/effetune/', 'manual/effetune/index.html']:
             self.assertEqual(target(path), current + 'index.html')
-        for path in ['manual/effetune.html', 'manual/sound/index.html', 'manual/sound/v0.15.0-miv.2', 'manual/effetune/vfoo/index.html', 'manual/other/v0.12.0/index.html']:
+        for path in ['manual/effetune.html', 'manual/sound/index.html', 'manual/sound/v0.15.0-miv.3', 'manual/effetune/vfoo/index.html', 'manual/other/v0.12.0/index.html']:
             self.assertIsNone(target(path))
 
     def test_marked_block_updates_only_generated_section_and_keeps_lf(self):
         first = docs.updated_htaccess(self.HTACCESS, 'v0.14.0', {'index.html': b'', 'retired.html': b''})
         self.assertEqual(docs.updated_htaccess(first, 'v0.14.0', {'retired.html': b'', 'index.html': b''}), first)
-        second = docs.updated_htaccess(first, 'v0.15.0-miv.2', {'index.html': b''})
+        second = docs.updated_htaccess(first, 'v0.15.0-miv.3', {'index.html': b''})
         self.assertNotIn(b'v0.14.0', second)
         self.assertNotIn(b'retired', second)
         self.assertEqual(second.count(docs.REDIRECT_BEGIN.encode()), 1)
         start = second.index(docs.REDIRECT_BEGIN.encode())
         end = second.index(docs.REDIRECT_END.encode()) + len(docs.REDIRECT_END) + 1
         self.assertEqual(second[:start] + second[end:], self.HTACCESS.replace(b'</IfModule>', b'\n</IfModule>'))
-        self.assertEqual(docs.updated_htaccess(self.HTACCESS.replace(b'\n', b'\r\n'), 'v0.15.0-miv.2', {'index.html': b''}), second)
+        self.assertEqual(docs.updated_htaccess(self.HTACCESS.replace(b'\n', b'\r\n'), 'v0.15.0-miv.3', {'index.html': b''}), second)
         self.assertNotIn(b'\r', second)
 
     def test_invalid_configuration_fails_instead_of_overwriting_unrelated_rules(self):
-        block = docs.redirect_block('v0.15.0-miv.2', {'index.html': b''}).encode()
+        block = docs.redirect_block('v0.15.0-miv.3', {'index.html': b''}).encode()
         for data in [b'', self.HTACCESS * 2, self.HTACCESS + block,
                      self.HTACCESS.replace(b'</IfModule>', docs.REDIRECT_BEGIN.encode() + b'\n</IfModule>'),
                      self.HTACCESS.replace(b'</IfModule>', block + block + b'</IfModule>'),
                      self.HTACCESS.replace(b'</IfModule>', block.replace(docs.REDIRECT_END.encode(), b'') + b'</IfModule>')]:
             with self.subTest(data=data), self.assertRaises(docs.ConversionError):
-                docs.updated_htaccess(data, 'v0.15.0-miv.2', {'index.html': b''})
+                docs.updated_htaccess(data, 'v0.15.0-miv.3', {'index.html': b''})
 
 
 class SplitTests(unittest.TestCase):

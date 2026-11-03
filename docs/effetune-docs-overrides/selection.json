@@ -53,7 +53,7 @@
   },
   "visualizer.md": {
     "include": true,
-    "reason": "mIV Sound: native graphs, mIV Original, host lyrics and Lyric Stage. Remove Counter/Counter Gallery and desktop-only controls in visualizer.json."
+    "reason": "mIV Sound: native graphs, mIV Original, host lyrics, Lyric Stage, host playback Counter and Counter Gallery. Correct host behavior and remove desktop-only controls in visualizer.json."
   },
   "plugins/analyzer.md": {
     "include": true,

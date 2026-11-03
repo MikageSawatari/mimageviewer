@@ -18,9 +18,12 @@ Windows 向け 高速サムネイル画像ビューワー（ポータブル版�
   - インストール不要。zip を解凍して mimageviewer.exe を
     ダブルクリックするだけで起動します。
   - 管理者権限は不要です（UAC のダイアログは出ません）。
-  - 設定・キャッシュ・AI モデル等はすべてこのフォルダの
-    data\ 以下に作られます。システムドライブの APPDATA や
-    その他のシステム領域には一切書き込みません。
+  - 設定・キャッシュ・AI モデル・音響調整の保存データは、
+    このフォルダの data\ 以下に作られます。
+    利用者が追加したユーザー VST は独自に APPDATA 等へ保存する
+    場合があり、本アプリからは止められません。
+    本棚の作品や書き出したファイルは指定先に保存します。
+    処理によって Windows の一時フォルダも使います。
   - フォルダごと USB メモリや別ドライブ・別 PC にコピーして
     持ち運べます（中の data\ ごと移動します）。
 
@@ -31,11 +34,14 @@ Windows 向け 高速サムネイル画像ビューワー（ポータブル版�
   管理者権限           不要                必要（UAC）
   設定・データの保存先 このフォルダ\data\  %APPDATA%\mimageviewer\
   アンインストール     フォルダを削除      Windows の設定から削除
-  VST3 プラグイン処理  非対応              対応
+  VST3 プラグイン処理  対応                対応
 
-  ※ ポータブル版では動画音声の VST3 プラグイン処理は利用できません
-    （環境設定の該当項目は選択できません）。VST3 を使う場合は
-    インストーラ版または単体 exe 版をご利用ください。
+  音響調整 (mIV Sound) とユーザー VST の両方を利用できます。
+  音響調整の設定・プリセットは data\effetune\plugin\、
+  取り込んだ IR・測定データ、Visualizer のレイアウト・背景画像は
+  data\effetune\webview\ に保存します。旧共有先のデータは引き継ぎません。
+  ほかの EffeTune 製品とは自動で共有しません。保存済みプリセットの
+  受け渡しには、音響調整の「設定 → バックアップ / 復元」を使います。
 
 
 ----------------------------------------------------------------
@@ -68,6 +74,9 @@ Windows 向け 高速サムネイル画像ビューワー（ポータブル版�
   mimageviewer-mcp.exe            AI アプリとの連携用プログラム
   *.dll                           動画再生 / PDF / AI 用ライブラリ
   mimageviewer-susie32.exe        Susie プラグイン用 32bit ワーカー
+  mimageviewer-vst3-host.exe      VST3 プラグイン用プログラム
+  effetune\                       音響調整 (mIV Sound) 用ファイル
+  vcrt\                           VST3 用ランタイム
   models\                         AI 用モデル
   LICENSE-ffmpeg.txt              FFmpeg のライセンス本文
   UNRAR-LICENSE.txt               UnRAR のライセンス本文
@@ -91,9 +100,11 @@ Windows 向け 高速サムネイル画像ビューワー（ポータブル版�
  4. アンインストール
 ----------------------------------------------------------------
 
-このフォルダごと削除するだけで、完全にアンインストールできます。
-レジストリやその他の場所には何も残りません
-（設定・キャッシュも data\ 以下にあるため一緒に消えます）。
+本体はこのフォルダごと削除できます。data\ 内の設定・キャッシュ・
+音響調整の保存データも一緒に消えます。
+外に保存した作品・元ファイル、ユーザー VST が独自に保存したデータ、
+連携先の AI アプリに行った登録などは残ります。必要に応じて、
+登録を外す操作や各プラグインの案内に従って削除してください。
 
 
 ----------------------------------------------------------------
@@ -102,10 +113,12 @@ Windows 向け 高速サムネイル画像ビューワー（ポータブル版�
 
   OS        : Windows 11（64bit 版のみ）
   CPU       : x86-64（Intel / AMD）
+              音響調整には AVX2 と FMA の両方への対応が必要です。
   メモリ    : 4 GB 以上（8 GB 以上推奨）
   GPU       : DirectX 12 対応 GPU（最新のドライバを推奨）
 
-追加ソフト: EPUB の変換には Microsoft Edge WebView2 Runtime が必要です。
+追加ソフト: EPUB の変換と音響調整の画面表示には
+          Microsoft Edge WebView2 Runtime が必要です。
           Windows 11 には標準で含まれています。
 
 RAW の表示・現像と AVIF の表示は追加インストール不要です。
@@ -118,9 +131,10 @@ HEIC / JPEG XL 表示は Windows Imaging Component（WIC）を
     HEVC ビデオ拡張機能は有料の場合があります。
   - JPEG XL: JPEG XL 画像表示オプション
 
-本ソフトウェアが外部と通信するのは次の場合だけです。利用状況の送信・
-広告・アカウント登録は一切ありません。画像・動画そのものを外部へ送る
-こともありません。
+本アプリの主な通信は次のとおりです。利用状況の自動送信や広告は
+ありません。リモート閲覧では、接続した端末へ画像・動画・音声を配信します。
+音響調整のヘルプや「AI に質問」は外部ページをブラウザで開きます。
+利用者が追加したユーザー VST の通信は、各プラグインの動作に従います。
 
   - 更新確認: 新しいバージョンの有無を調べるため、配布元（GitHub）の
     公開リリース情報を取得します。個人を特定する情報は送信しません。
@@ -162,6 +176,13 @@ HEIC / JPEG XL 表示は Windows Imaging Component（WIC）を
     https://mikage.to/mimageviewer/
   - UnRAR source code (UnRAR license): Alexander Roshal / RARLAB
     RAR 展開に使用します。同梱の UNRAR-LICENSE.txt を参照してください。
+  - mIV Sound (MIT): EffeTune / EffeTune Mixwright (作者 Frieve) を元にした派生版
+    Copyright (c) 2025-2026 Yoshiyuki Kobayashi
+    同梱コンポーネントには、それぞれのライセンスが適用されます。
+    通知全文はアプリの「ソフトウェア情報」（バージョン情報）の
+    mIV Sound THIRD-PARTY-NOTICES / WebView THIRD-PARTY-NOTICES / DSP NOTICE
+    で確認できます。
+  - Steinberg VST3 SDK (MIT): Steinberg Media Technologies GmbH
   - Twemoji 絵文字グラフィックス (CC-BY 4.0): Twitter, Inc. and other contributors
     （注釈機能のスタンプに使用）
 

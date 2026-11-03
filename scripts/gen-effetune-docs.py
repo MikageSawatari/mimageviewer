@@ -694,7 +694,7 @@ def generate(snapshot, version, docs_version=None):
         sublist = '<ul>' + ''.join(f'<li><a href="{p["filename"]}">{html.escape(p["label"])}</a></li>' for p in plugins) + '</ul>' if plugins else ''
         listing.append(f'<li><a href="{name}">{html.escape(label)}</a>{sublist}</li>')
     listing = '\n'.join(listing)
-    bodies['index.html'] = ('mIV Sound 説明書', '音響調整 mIV Sound のエフェクトと操作の説明。', '<h1 class="page-title">mIV Sound 説明書</h1>\n<p>mImageViewer での開き方、設定の保存先、リモート配信の注意点は<a href="../../effetune.html">音響調整</a>をご覧ください。エフェクトごとの設定と画面内の操作を以下にまとめています。</p>\n<ul>' + listing + '</ul>')
+    bodies['index.html'] = ('mIV Sound 説明書', '音響調整 mIV Sound のエフェクトと操作の説明。', '<h1 class="page-title">mIV Sound 説明書</h1>\n<p>mImageViewer での開き方、設定の保存先、リモート配信の注意点は<a href="../../effetune.html">音響調整</a>をご覧ください。エフェクトごとの設定と画面内の操作を以下にまとめています。</p>\n<p>再生位置を表示する Counter と Counter Gallery は、<a href="visualizer.html#miv-counter">Visualizer の Counter</a>をご覧ください。</p>\n<ul>' + listing + '</ul>')
     license_text = (snapshot / 'LICENSE').read_text(encoding='utf-8')
     bodies['license.html'] = ('mIV Sound — MIT License', '原文 EffeTune の MIT License 全文と派生版のクレジット。', '<h1 class="page-title">MIT License</h1>\n<p>mIV Sound は EffeTune / EffeTune Mixwright (作者: Frieve) を元にした派生版です。以下は説明書の原文 EffeTune のライセンスです。</p>\n<pre class="license">' + html.escape(license_text) + '</pre>')
     result = {name: chrome(title, description, body, name, pages, version, commit, categories, owners.get(name)).encode('utf-8') for name, (title, description, body) in bodies.items()}

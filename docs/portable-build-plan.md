@@ -25,7 +25,8 @@
 
 - フォルダを任意ドライブに解凍 → `mimageviewer.exe` ダブルクリックで起動 (インストール不要、管理者権限不要)。
 - 実行時の **DLL/exe 展開をゼロ**にする (= AV 誤検知の主因を除去、起動も速い)。
-- 設定・キャッシュ・ログを **exe の隣** (`data\`) に置き、APPDATA も C ドライブも汚さない。
+- 設定・キャッシュ・ログと音響調整のデータを **exe の隣** (`data\`) に置く。
+  任意のユーザー VST の独自保存・利用者が指定した作品保存先・一時ファイルは別 (§4.7・§9.5)。
 - **既存のインストーラ版・単体 exe 版はそのまま維持**。ポータブルは「第 3 の配布物」として追加する。
 
 ### 非ゴール
@@ -49,7 +50,7 @@ build は出力先や配布フォルダのエディタを停止せず、保存�
 v5 の F4 では、署名済み VST3 host とプラグイン DLL を署名した mIV Sound bundle を同梱する。
 音響調整とユーザー VST を通常版と同じ画面から利用できる。
 [派生版への切替計画](effetune-fork-plan.md) §6・§17 が仕様と実装記録の正本。
-mIV Sound の名前・保存 (§2・§4〜5)・公開文書 (§10) も同計画が正本。公開文書のポータブル版の記述は F3 と F4 の統合で揃える (§17.3)。
+mIV Sound の名前・保存 (§2・§4〜5)・公開文書 (§10) も同計画が正本。公開文書のポータブル版の記述は F3 と F4 の統合で揃えた (§19)。
 ランチャーが存在する主な理由は **FFmpeg がロード時リンク**で、
 Rust コードが走る前に Windows ローダが DLL を解決する必要があるため
 ([build.rs:9-26](../build.rs)、[src/video/ffmpeg_loader.rs](../src/video/ffmpeg_loader.rs))。
@@ -359,7 +360,7 @@ mImageViewer_portable/
 v2.0.0 の未署名 host の AV 誤検知で一度は同梱を止めたが、v5 の F4 で再同梱する。
 配布ビルド (`build-dist.ps1` は既定署名 ON、直接 `build-portable.ps1` は `-Sign`) では host と
 mIV Sound の全 PE に署名する。未署名は開発確認用に限り、公開前に release checklist の VirusTotal 検査を通す。
-`New-MivEffetuneStage` で承認 manifest (`third_party/miv-sound/0.15.0-miv.2/manifest.sha256`) と照合した原本を
+`New-MivEffetuneStage` で承認 manifest (`third_party/miv-sound/<VERSION>/manifest.sha256`、版は `config/miv-sound.rs` から取得) と照合した原本を
 固定 stage に写し、署名後も「署名だけが変わった」検査を通す。配布先は平らな `effetune/mIV Sound.vst3`。
 VERSION と全リソース・通知を含むファイル集合と hash を検証済み stage と照合し、追加・欠落・改変を拒む。
 `-SkipBuild` と診断 smoke 成果物でも同じ検査を省略しない。診断 smoke は未署名。

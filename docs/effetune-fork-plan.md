@@ -994,3 +994,65 @@ portable zip実物の生成・内容確認、署名あり配布とVirusTotal (�
   独立レビュー中に並行更新されていた。将来の Counter 復帰・候補版変更は設計担当が採否を確定してから文書と版を揃える。
   この作業は外部リポジトリを変更しておらず、並行更新を承認済み `0.15.0-miv.2` の仕様として採用していない。
 - F4 を反映していないこの差分を最終公開文書とせず、§18.3 を統合時に照合する。更新履歴の執筆と公開は設計担当へ引き継ぐ。
+
+
+## 19. F3・F4 の統合と 0.15.0-miv.3 の文書
+
+2026-11-03。対象は `v5-integration`、開始時 HEAD `55015b2e6`。
+文書と Python 生成器・生成回帰のみの執筆作業。mIV Sound の参照は `8059d68` の
+`README.md`・`docs/host-now-playing.md` と生成器・上流 UI の文字列。
+`config/miv-sound.rs` の `VERSION = "0.15.0-miv.3"` は設計担当の作業中の変更として読み取り、編集していない。
+
+### 19.1 ポータブル版の説明統一
+
+- §17.3・§18.3 の一覧を照合し、製品ページの比較表・同梱クレジット、privacy 日英、
+  `manual/effetune.html` の開き方・保存先、`manual/settings.html` の音響調整設定を更新した。
+  音響調整とユーザー VST を利用でき、設定・検索・自動表示も通常版と共通であることに揃えた。
+- 音響調整は exe 隣の `data/effetune/{plugin,webview}` に保存し、旧共有 APPDATA からは
+  引き継がない。通常版の初回コピーとは区別した。ユーザー VST が独自に APPDATA 等へ保存する
+  動作は mIV から止められないことを明記した。privacy の通信節も各プラグインの動作と区別した。
+- `installer/readme_portable.txt` の非対応表記を撤去し、同梱ファイル・ライセンス・利用条件を追加。
+  「システム領域には一切書き込まない」「フォルダ削除で完全に消える」は、一時ファイル、
+  本棚や書き出した作品、ユーザー VST の独自保存、AI アプリ側の登録と両立しないため範囲を訂正した。
+  通信を列挙した「だけ」も、ブラウザ起動・VST・リモート配信を踏まえて訂正した。
+- `installer/readme.txt` とルート README も保存・引き継ぎ・削除範囲を照合した。
+  `effetune-integration-plan.md` §7・§10.1・§17.5 には現行の F4 仕様を示し、当時の非同梱決定・
+  実装試験の記録は履歴として残した。release-checklist、release-operations、portable-build-plan の
+  現行手順・参照先も合わせた。F4 ですでに更新された配布レイアウト・署名・診断 smoke・検査手順は維持した。
+- 公開 HTML・配布 readme・README 全体を再検索し、現行の音響調整/VST の portable 非対応説明と
+  miv.2 へのリンクが残っていないことを確認した。過去の `manual/changelog.html` と `CHANGELOG.md` は変更していない。
+
+### 19.2 Counter と生成説明書
+
+- §8 の初期除外案・§18 の F3 時点の除外記録に対し、利用者が指定した mIV Sound `8059d68`
+  (`0.15.0-miv.3`) の復帰仕様を文書へ反映した。ホストの実装変更や新たな実機同期測定は行っていない。
+- `visualizer.json` の Counter 節削除・Counter Gallery 削除・プリセット数を7にする訂正を撤去し、
+  追加一覧、専用見出しと全表示設定、Counter Gallery と8種類の説明を戻した。
+  Counter は歌詞と同じ mIV の再生位置を使い、歌詞なしの曲でも動く。一時停止で止まり、
+  シーク・速度・曲の切替・ループに追従する。停止・Remote 等の位置なしは0、クリックでリセットもシークもしない。
+  番号は00。上流の内蔵プレーヤー・外部入力用経過時間・DAW の project time を動作説明に流用しない。
+- 採否台帳・overrides/README・生成回帰を更新し、生成器の目次と mIV の案内ページから Counter 節へリンクした。
+  上流 snapshot の本文・LICENSE・画像は不変で、現在の `c506bbab/SOURCE.md` の対応版だけ miv.3 に更新した。
+  ほかの snapshot の SOURCE.md は過去版の由来なので変更していない。
+- `manual/sound/v0.15.0-miv.3/` に133 HTML＋4画像を生成。miv.2 の137生成ファイルは、
+  絶対パス・再解析ポイント不在・生成印・ファイル集合・画像一致を確認して削除した。
+  miv.2 専用の転送は追加していない。既存の他版向け共通規則は維持し、旧 `manual/effetune/v0.15.0/` と
+  旧入口の301を miv.3 へ変更。入口・サイドバー・相互リンク・canonical・sitemap も揃えた。
+- テストの一時出力は `target/effetune-docs-tests` から作業ツリー直下の専用一時フォルダへ移し、終了時に削除する。
+  今回の設計担当の候補ビルドと `target/` を共有しない。
+
+### 19.3 検証と引き継ぎ
+
+- `python scripts/test_gen_effetune_docs.py`: **33件成功**。Counter の仕様・全設定・Gallery・追加一覧、
+  版の別照合、生成物一致、旧公開137ファイルと入口・他版の301・現在版の転送ループ不在を含む。
+  最初の実行は Gallery 復帰後も「7種類」を期待する既存1件が失敗し、8種類へ更新後に全件成功した。
+- `python scripts/gen-effetune-docs.py --check`: **137ファイル＋入口＋301が一致**。
+- 公開マニュアル全体・製品ページ・privacy の **206ページ、相対リンク・画像等7,897件、欠落0**。
+  フラグメントを照合し、更新履歴に残る旧説明書リンク1件も実際の `.htaccess` の規則を用いて解決した。
+  Apache 実サーバの HTTP 応答は未測定。
+- `python scripts/check_site_cards.py`: **52枚、超過0**。
+- `python scripts/gen-sitemap-xml.py` で再生成し、`--check`: **216 URL 一致**。miv.2 の URL は残っていない。
+- `git diff --check`: **成功**。UI 名は mIV の `preferences/pages.rs`・検索文字列、
+  mIV Sound の生成器と日本語 locale で確認した。
+- Rust/cargo のビルド・テスト、製品の起動、署名・候補承認・公開・コミットは行っていない。
+  `target/` と実際の `config/miv-sound.rs` は編集していない。候補のビルド・承認とコミットは設計担当へ引き継ぐ。
