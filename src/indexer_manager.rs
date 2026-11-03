@@ -31,7 +31,7 @@
 //! Startup reconciliation completes there before supervisors are spawned.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crossbeam_channel::{Receiver, Sender};
 use miv_startup::{Lane, Outcome, Stage, span};
@@ -82,6 +82,7 @@ pub struct IndexerManager {
     excluded_roots: Vec<std::path::PathBuf>,
     /// 再構成 worker が supervisor ハンドルと構成 snapshot を所有する。
     runtime: crate::metadata_reconfiguration::Runtime,
+    caption_epoch: Arc<AtomicU64>,
     startup_diag: StartupDiag,
     reporter: Arc<crate::fts_integrity::FailureReporter>,
 }
@@ -322,6 +323,7 @@ impl IndexerManager {
                 Err(StoreOpenFailure::Unavailable) => return StartupInitOutcome::Unavailable,
             };
         match Self::new_with_stores(
+            data_dir.join("ai_caption.db"),
             meta_db,
             fts,
             favorites,
@@ -358,6 +360,7 @@ impl IndexerManager {
                 Err(_) => return None,
             };
         Self::new_with_stores(
+            data_dir.join("ai_caption.db"),
             meta_db,
             fts,
             favorites,
@@ -382,6 +385,7 @@ impl IndexerManager {
         std::fs::create_dir_all(data_dir).unwrap();
         let (meta, fts) = open_stores_with_rebuild_sync(data_dir, "S3 fanout", None).unwrap();
         Self::new_with_stores(
+            data_dir.join("ai_caption.db"),
             meta,
             fts,
             &[],
@@ -399,6 +403,7 @@ impl IndexerManager {
 
     /// `new` / `new_at` 共通の本体。stores を受け取って reconciliation + supervisor spawn を行う。
     fn new_with_stores(
+        caption_db_path: std::path::PathBuf,
         meta_db: Arc<FtsMetaDb>,
         fts: Arc<FtsIndex>,
         favorites: &[FavoriteEntry],
@@ -447,9 +452,12 @@ impl IndexerManager {
         if let Some(p) = progress.as_ref() {
             p("アイテム索引を整理中…");
         }
+        let caption_epoch = Arc::new(AtomicU64::new(0));
         let runtime_spawn = span(Lane::Indexer, Stage::IndexerMetadataSpawn);
         let runtime_result = crate::metadata_reconfiguration::Runtime::start(
             crate::metadata_reconfiguration::Stores {
+                caption_epoch: Arc::clone(&caption_epoch),
+                caption_db_path,
                 meta: Arc::clone(&meta_db),
                 fts: Arc::clone(&fts),
                 writer: Arc::clone(&writer),
@@ -482,12 +490,22 @@ impl IndexerManager {
             excluded_roots,
             runtime,
             reporter,
+            caption_epoch,
             startup_diag: StartupDiag {
                 io_permits: permits,
                 ..StartupDiag::default()
             },
         };
         Some(mgr)
+    }
+
+    /// Publish only after a committed change to caption contents; no I/O or channel send.
+    pub fn notify_caption_changed(&self) {
+        self.caption_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn caption_epoch(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.caption_epoch)
     }
 
     /// 起動 overlay を閉じた後に呼ぶ。`fts_meta.db` の housekeeping (VACUUM) を
@@ -912,8 +930,11 @@ mod tests {
         similar: Option<crate::similar_index::SimilarIndexNotifier>,
     ) -> IndexerManager {
         let reporter = crate::fts_integrity::FailureReporter::new(Arc::clone(&meta));
+        let caption_epoch = Arc::new(AtomicU64::new(0));
         let runtime = crate::metadata_reconfiguration::Runtime::start(
             crate::metadata_reconfiguration::Stores {
+                caption_epoch: Arc::clone(&caption_epoch),
+                caption_db_path: crate::ai_caption_db::CaptionDb::db_path(),
                 meta: Arc::clone(&meta),
                 fts: Arc::clone(&fts),
                 writer: Arc::clone(&writer),
@@ -932,6 +953,7 @@ mod tests {
             io_sem: io,
             excluded_roots: Vec::new(),
             runtime,
+            caption_epoch,
             startup_diag: StartupDiag::default(),
             reporter,
         }
@@ -1062,6 +1084,7 @@ mod tests {
             .is_none()
         );
         let manager = IndexerManager::new_with_stores(
+            tmp.path().join("ai_caption.db"),
             meta,
             fts,
             std::slice::from_ref(&favorite),
@@ -2029,5 +2052,78 @@ mod tests {
         wait_until("reconciliation flag did not reset", || {
             !flag.load(Ordering::SeqCst)
         });
+    }
+    #[test]
+    fn caption_epoch_updates_nested_owners_and_full_rescan_drains_without_notification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let root = tmp.path().join("images");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let paths = [root.join("parent.jpg"), child.join("child.jpg")];
+        for path in &paths {
+            std::fs::write(path, b"test-image").unwrap();
+        }
+        let keys = paths.map(|path| crate::search_index_db::normalize_path(&path));
+        let favorites = [mk_fav("parent", &root, true), mk_fav("child", &child, true)];
+        let manager = IndexerManager::new_at(
+            &data,
+            &favorites,
+            crate::settings::IndexerSpeedProfile::default(),
+            Arc::new(ActivityGate::new(0)),
+            vec![],
+        )
+        .unwrap();
+        wait_until("initial metadata scans", || {
+            manager.supervisor_count() == 2 && manager.all_supervisors_idle()
+        });
+        let path = data.join("ai_caption.db");
+        crate::ai_caption_db::CaptionDb::open_at(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for key in &keys {
+            conn.execute(
+                "INSERT INTO captions (item_key, mtime_ms, size, model_id, prompt_version,
+                lang, caption, visible_text, keywords, cover_ref, status, created_at)
+                VALUES (?1,0,0,'test',1,'ja','epoch-caption','','[]','','ok',0)",
+                [key],
+            )
+            .unwrap();
+        }
+        let indexed = || {
+            conn.query_row("SELECT COUNT(*) FROM captions WHERE indexed=1", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+                == 2
+        };
+        manager.notify_caption_changed();
+        wait_until("both owners reflected caption epoch", indexed);
+        let text_for = |key: &str| {
+            let searcher = manager.fts.searcher();
+            let address = crate::fts_index::find_doc_by_path(&searcher, manager.fts.fields(), key)
+                .unwrap()
+                .unwrap();
+            crate::fts_index::doc_per_source_text(&searcher, manager.fts.fields(), address)
+                .unwrap()
+                .ai_caption
+        };
+        for (key, favorite) in keys.iter().zip(&favorites) {
+            assert_eq!(text_for(key), "epoch-caption");
+            assert_eq!(
+                manager.meta_db.get(key).unwrap().unwrap().favorite_id,
+                favorite.id
+            );
+        }
+        // An omitted sender notification is repaired by explicit full scans even with
+        // unchanged file signatures and an already-open readonly caption connection.
+        conn.execute("UPDATE captions SET caption='full-caption'", [])
+            .unwrap();
+        for favorite in &favorites {
+            manager.request_full_rescan(favorite.id);
+        }
+        wait_until("full scans drained pending captions", indexed);
+        for key in &keys {
+            assert_eq!(text_for(key), "full-caption");
+        }
     }
 }

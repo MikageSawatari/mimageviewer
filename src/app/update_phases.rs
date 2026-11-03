@@ -791,6 +791,8 @@ impl App {
         self.show_archive_convert_dialog(ctx);
         self.show_video_upscale_dialog(ctx);
         self.show_video_upscale_tasks_window(ctx);
+        #[cfg(windows)]
+        self.show_caption_job_progress(ctx);
     }
 
     pub(super) fn service_thumb_quality_results(&mut self, ctx: &egui::Context) {

@@ -11,11 +11,15 @@ fn item(path: &Path, subresource: Option<&str>) -> ItemRef {
 fn context(fixture: &super::super::tests::Fixture) -> ReadContext {
     ReadContext::new(
         &fixture.handlers,
-        PermissionSnapshot {
-            level: AgentLevel::ReadOnly,
-            thumbnails: true,
-            gps: false,
-        },
+        (
+            PermissionSnapshot {
+                level: AgentLevel::ReadOnly,
+                thumbnails: true,
+                gps: false,
+                ai_captions: false,
+            },
+            0,
+        ),
         Arc::new(AtomicBool::new(false)),
     )
 }
@@ -370,7 +374,7 @@ fn invalid_arguments_permission_and_cancellation_are_checked_before_io() {
     let fixture = super::super::tests::Fixture::new();
     let input = item(&fixture._dir.path().join("missing.png"), None);
     let mut ctx = context(&fixture);
-    ctx.permission.thumbnails = false;
+    ctx.granted.0.thumbnails = false;
     assert_eq!(
         fixture
             .handlers
@@ -379,7 +383,7 @@ fn invalid_arguments_permission_and_cancellation_are_checked_before_io() {
             .code,
         ErrorCode::Disabled
     );
-    ctx.permission.thumbnails = true;
+    ctx.granted.0.thumbnails = true;
     for (items, side) in [
         (vec![], None),
         (vec![input.clone(); 21], None),
@@ -561,7 +565,7 @@ fn metadata(name: String) -> ThumbnailItem {
 #[test]
 fn image_and_metadata_budgets_keep_attachments_in_sync_and_cursor_advancing() {
     let args = serde_json::json!(["fixture"]);
-    let mut builder = ThumbnailBuilder::new(7, args.clone());
+    let mut builder = ThumbnailBuilder::new(7, args.clone(), 0);
     for n in 0..4 {
         assert!(
             builder
@@ -580,14 +584,14 @@ fn image_and_metadata_budgets_keep_attachments_in_sync_and_cursor_advancing() {
     let response = builder.response(true).unwrap();
     assert_eq!(response.images.len(), 4);
     assert_eq!(
-        decode_cursor(response.page.cursor.as_deref(), "get_thumbnail", &args).unwrap(),
+        decode_cursor(response.page.cursor.as_deref(), "get_thumbnail", &args, 0).unwrap(),
         11
     );
     assert_eq!(
         response.images.iter().map(|i| i.webp.len()).sum::<usize>(),
         MAX_THUMBNAIL_TOTAL_BYTES
     );
-    let mut oversized = ThumbnailBuilder::new(0, args.clone());
+    let mut oversized = ThumbnailBuilder::new(0, args.clone(), 0);
     assert!(
         oversized
             .push(
@@ -600,10 +604,10 @@ fn image_and_metadata_budgets_keep_attachments_in_sync_and_cursor_advancing() {
     assert_eq!(row(&response, 0).status, ThumbnailStatus::TooLarge);
     assert!(response.images.is_empty());
     assert_eq!(
-        decode_cursor(response.page.cursor.as_deref(), "get_thumbnail", &args).unwrap(),
+        decode_cursor(response.page.cursor.as_deref(), "get_thumbnail", &args, 0).unwrap(),
         1
     );
-    let mut bounded = ThumbnailBuilder::new(0, args.clone());
+    let mut bounded = ThumbnailBuilder::new(0, args.clone(), 0);
     let mut accepted = 0;
     for n in 0..20 {
         if !bounded
@@ -622,10 +626,10 @@ fn image_and_metadata_budgets_keep_attachments_in_sync_and_cursor_advancing() {
     assert_eq!(response.images.len(), accepted);
     assert!(mcp_content_chars(&response.page).unwrap() <= MAX_PAGE_CHARS);
     assert_eq!(
-        decode_cursor(response.page.cursor.as_deref(), "get_thumbnail", &args).unwrap(),
+        decode_cursor(response.page.cursor.as_deref(), "get_thumbnail", &args, 0).unwrap(),
         accepted
     );
-    let mut too_long = ThumbnailBuilder::new(3, args.clone());
+    let mut too_long = ThumbnailBuilder::new(3, args.clone(), 0);
     assert!(
         too_long
             .push(
@@ -638,7 +642,7 @@ fn image_and_metadata_budgets_keep_attachments_in_sync_and_cursor_advancing() {
     assert!(matches!(response.page.items[0], PageRow::TooLong(_)));
     assert!(response.images.is_empty());
     assert_eq!(
-        decode_cursor(response.page.cursor.as_deref(), "get_thumbnail", &args).unwrap(),
+        decode_cursor(response.page.cursor.as_deref(), "get_thumbnail", &args, 0).unwrap(),
         4
     );
 }
@@ -660,7 +664,7 @@ fn continuation_starts_at_input_offset_without_reopening_earlier_sources() {
         })
         .collect();
     let args = serde_json::json!([normalized, DEFAULT_THUMBNAIL_SIDE, "input_order"]);
-    let cursor = encode_cursor("get_thumbnail", args, 1);
+    let cursor = encode_cursor("get_thumbnail", args, 1, 0);
     let Payload::Thumbnails(response) = fixture
         .handlers
         .get_thumbnail(

@@ -31,6 +31,8 @@ pub mod file_organize;
 mod first_setup;
 #[doc(hidden)]
 pub use first_setup::draw_first_setup_dialog;
+#[cfg(windows)]
+pub(crate) mod caption_job;
 mod metadata_cleanup;
 pub(crate) mod metadata_transfer;
 pub mod network_data_dir_notice;
@@ -57,6 +59,11 @@ pub(crate) mod trt_install;
 pub(crate) mod trt_worker_notice;
 mod update_notice;
 pub(crate) mod video_upscale;
+#[cfg(windows)]
+pub(crate) mod vlm_addon;
+#[cfg(not(windows))]
+#[path = "vlm_addon_unavailable.rs"]
+pub(crate) mod vlm_addon;
 #[cfg(windows)]
 mod vst3_actions;
 #[cfg(windows)]

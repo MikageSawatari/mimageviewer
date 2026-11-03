@@ -116,6 +116,7 @@ fn polling_state_is_bounded_to_permission_epoch_and_error_kind() {
         level: AgentLevel::ReadOnly,
         thumbnails: false,
         gps: false,
+        ai_captions: false,
     };
     log.permission(&Ok((snapshot, 1)));
     log.permission(&Ok((snapshot, 1)));

@@ -24,7 +24,7 @@ impl Handlers {
             },
             "source_order"
         ]);
-        let offset = decode_cursor(cursor.as_deref(), "list_library", &args)?;
+        let offset = decode_cursor(cursor.as_deref(), "list_library", &args, ctx.granted.1)?;
         let limit = limit_value(limit)?;
         let mut rows = Vec::new();
         match kind {
@@ -122,6 +122,7 @@ impl Handlers {
             "list_library",
             args,
             "items",
+            ctx.granted.1,
         )?;
         ctx.checkpoint()?;
         Ok(LibraryPage {
@@ -164,7 +165,7 @@ impl Handlers {
         };
         let id = requested_id.map(|id| id.to_string());
         let args = serde_json::json!([id, name, "collection_order"]);
-        let offset = decode_cursor(cursor.as_deref(), "get_collection", &args)?;
+        let offset = decode_cursor(cursor.as_deref(), "get_collection", &args, ctx.granted.1)?;
         let limit = limit_value(limit)?;
         let lease = self
             .producer
@@ -226,7 +227,15 @@ impl Handlers {
                 rating: 0,
             });
         }
-        let page = page(items, offset, limit, false, "get_collection", args)?;
+        let page = page(
+            items,
+            offset,
+            limit,
+            false,
+            "get_collection",
+            args,
+            ctx.granted.1,
+        )?;
         ctx.checkpoint()?;
         Ok(page)
     }
@@ -253,6 +262,7 @@ fn favorite_page(
             "list_library",
             args.clone(),
             "items",
+            ctx.granted.1,
         )?;
         let count = items.len();
         ctx.publish(Payload::Library(LibraryPage {
@@ -267,8 +277,15 @@ fn favorite_page(
     }
     ctx.checkpoint()?;
     let more = offset + rows.len() < favorites.len();
-    let (items, cursor, truncated) =
-        bounded_rows(rows, offset, more, "list_library", args, "items")?;
+    let (items, cursor, truncated) = bounded_rows(
+        rows,
+        offset,
+        more,
+        "list_library",
+        args,
+        "items",
+        ctx.granted.1,
+    )?;
     Ok(LibraryPage {
         items,
         cursor,
@@ -288,21 +305,7 @@ fn library_row(path: String) -> LibraryItem {
         .rsplit_once('.')
         .map(|(_, ext)| ext.to_ascii_lowercase())
         .unwrap_or_default();
-    let kind = if crate::folder_tree::is_recognized_image_ext(&extension) {
-        ItemKind::Image
-    } else if extension == "pdf" || extension == "epub" {
-        ItemKind::Pdf
-    } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&extension.as_str()) {
-        ItemKind::Video
-    } else if crate::folder_tree::is_audio_ext(&extension) {
-        ItemKind::Audio
-    } else if crate::folder_tree::is_zip_extension(&extension)
-        || crate::archive_converter::ArchiveFormat::from_extension(&extension).is_some()
-    {
-        ItemKind::Archive
-    } else {
-        ItemKind::Other
-    };
+    let kind = super::item_kind_from_extension(&extension);
     LibraryItem {
         path,
         subresource: None,
@@ -601,7 +604,13 @@ mod tests {
         assert_eq!(page.items.len(), 1);
         assert!(page.truncated);
         assert_eq!(
-            decode_cursor(page.cursor.as_deref(), "list_library", &args).unwrap(),
+            decode_cursor(
+                page.cursor.as_deref(),
+                "list_library",
+                &args,
+                permission().unwrap().1,
+            )
+            .unwrap(),
             1
         );
         assert_eq!(f.handlers.active.load(Ordering::Acquire), 1);

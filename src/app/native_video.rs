@@ -8711,6 +8711,7 @@ impl App {
                 }
                 match db.set_pin(path, pts_secs, &thumb_webp) {
                     Ok(()) => {
+                        self.caption_display.clear();
                         self.video_thumb_overrides_dirty_paths
                             .insert(path.to_path_buf());
                         if let Some(cache) = self
@@ -11969,6 +11970,7 @@ impl App {
         {
             match db.remove(&path) {
                 Ok(()) => {
+                    self.caption_display.clear();
                     // P ピン直後の後追い WebP 補完 (`tick_pending_pin_thumb_refresh`) が
                     // 残っていると、解除後に set_pin が走ってピンが復活する (Codex P1)。
                     // 解除した path の pending はここで破棄する。
@@ -12290,6 +12292,7 @@ impl App {
         };
         match db.set_pin(&path, pts, &webp) {
             Ok(()) => {
+                self.caption_display.clear();
                 self.video_thumb_overrides_dirty_paths.insert(path.clone());
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.set_native_hover_preview_pinned(true);
@@ -12416,6 +12419,7 @@ impl App {
         if let Some(db) = self.video_pin_db.as_ref() {
             match db.set_pin(&path, pts, &webp) {
                 Ok(()) => {
+                    self.caption_display.clear();
                     self.video_thumb_overrides_dirty_paths.insert(path.clone());
                     self.refresh_fullscreen_video_marker_cache(fs_idx);
                     self.sync_native_video_timeline_markers(fs_idx);

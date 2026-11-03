@@ -44,6 +44,7 @@ pub(crate) struct AppendMetadataStores {
     pub comic: bool,
     pub rating: bool,
     pub tags: bool,
+    pub ai_captions: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -59,6 +60,8 @@ pub(crate) struct BookAppendMetadataCopySummary {
     /// the current stores, since users can edit a page before this report polls.
     pub ratings: Vec<String>,
     pub tags: Vec<String>,
+    /// A reused destination had a caption row removed before creating its file.
+    pub captions_changed: bool,
     pub errors: Vec<String>,
     pub database_elapsed: std::time::Duration,
 }
@@ -75,6 +78,7 @@ impl AppendMetadataStores {
             comic: data_dir.join("comic.db").is_file(),
             rating: data_dir.join("rating.db").is_file(),
             tags: data_dir.join("tags.db").is_file(),
+            ai_captions: data_dir.join("ai_caption.db").is_file(),
         }
     }
 }
@@ -91,6 +95,7 @@ pub(crate) struct AppendMetadataWriter {
     comic: Option<crate::comic_db::ComicDb>,
     rating: Option<crate::rating_db::RatingDb>,
     tags: Option<crate::tags_db::TagsDb>,
+    ai_captions: Option<crate::ai_caption_db::CaptionDb>,
     report: BookAppendMetadataCopySummary,
 }
 
@@ -130,6 +135,11 @@ impl AppendMetadataWriter {
             comic: open_store!(stores.comic, "comic", crate::comic_db::ComicDb),
             rating: open_store!(stores.rating, "rating", crate::rating_db::RatingDb),
             tags: open_store!(stores.tags, "tags", crate::tags_db::TagsDb),
+            ai_captions: open_store!(
+                stores.ai_captions,
+                "ai_caption",
+                crate::ai_caption_db::CaptionDb
+            ),
             report: Default::default(),
         };
         writer.report.database_elapsed = started.elapsed();
@@ -148,7 +158,7 @@ impl AppendMetadataWriter {
         let semantic = semantic_source
             .or(full_source)
             .map(crate::adjustment_db::normalize_path);
-        // Preserve each store's global write epoch and publish all eight
+        // Preserve each store's global write epoch and publish the
         // committed initial values before the physical file becomes visible.
         let has_edit_store = self.adjustment.is_some()
             || self.local_adjust.is_some()
@@ -207,6 +217,14 @@ impl AppendMetadataWriter {
                     .map_err(|error| metadata_initialization_error("rating", error))?;
             }
             self.report.ratings.push(to.clone());
+        }
+        // Newly copied bytes have a new signature, so captions never follow a
+        // page copy. Clear a reused destination before publishing the file.
+        if let Some(db) = self.ai_captions.as_mut() {
+            let deleted = db
+                .delete(&to)
+                .map_err(|error| metadata_initialization_error("ai_caption", error))?;
+            self.report.captions_changed |= deleted > 0;
         }
         if let Some(db) = self.tags.as_mut() {
             if let Some(from) = semantic.as_deref() {
@@ -811,6 +829,41 @@ mod tests {
     }
 
     #[test]
+    fn ai_caption_append_report_changes_only_when_destination_row_was_deleted() {
+        let fixture = Fixture::new();
+        let data = fixture.tmp.path().join("data");
+        let db = crate::ai_caption_db::CaptionDb::open_at(&data.join("ai_caption.db")).unwrap();
+        let destination = fixture.folder.join("0001_reused.jpg");
+        let key = crate::adjustment_db::normalize_path(&destination);
+        let stores = AppendMetadataStores::existing_at(&data);
+        let mut writer = AppendMetadataWriter::open_at(&data, stores).unwrap();
+        writer
+            .prepare_destination(&destination, None, None)
+            .unwrap();
+        assert!(!writer.finish().captions_changed);
+
+        let connection = rusqlite::Connection::open(data.join("ai_caption.db")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO captions (item_key, mtime_ms, size, model_id, prompt_version, lang,
+                caption, visible_text, cover_ref, keywords, status, created_at)
+             VALUES (?1, 1, 1, 'test-model', 1, 'ja', 'old caption', '', '', '[]', 'ok', 1)",
+                [&key],
+            )
+            .unwrap();
+        let mut writer = AppendMetadataWriter::open_at(&data, stores).unwrap();
+        writer
+            .prepare_destination(&destination, None, None)
+            .unwrap();
+        assert!(db.get(&key).unwrap().is_none());
+        // A later destination with no prior row must not clear the summary bit.
+        writer
+            .prepare_destination(&destination, None, None)
+            .unwrap();
+        assert!(writer.finish().captions_changed);
+    }
+
+    #[test]
     fn section1373_metadata_copy_preserves_full_edit_and_semantic_only_routes() {
         let fixture = Fixture::new();
         let data = fixture.tmp.path().join("data");
@@ -1054,6 +1107,7 @@ pub(crate) mod append_test_support {
                 comic: true,
                 rating: true,
                 tags: true,
+                ai_captions: false,
             }
         }
 

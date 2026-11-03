@@ -33,6 +33,8 @@ use std::sync::{
 };
 use std::time::Duration;
 #[cfg(test)]
+mod caption_display_tests;
+#[cfg(test)]
 use std::time::Instant;
 
 #[cfg(test)]
@@ -584,6 +586,7 @@ mod page_param_writes;
 #[cfg(test)]
 mod rar_archive_cache_tests;
 pub(crate) use facet_navigation::{FacetNavigationState, FacetRoute, FacetScope};
+pub(crate) mod book_cover;
 pub(crate) mod book_materialization;
 pub(crate) mod book_preferred_rating;
 use book_preferred_rating::{ContainerRatingTarget, ContainerRatingToast};
@@ -7388,7 +7391,7 @@ fn thumbnail_keep_projection(
     }
 }
 
-fn resolve_converted_archive_candidate(
+pub(crate) fn resolve_converted_archive_candidate(
     candidate: &ConvertedArchiveCandidate,
     db: Option<&crate::archive_cache::ArchiveCacheDb>,
     cancel: &AtomicBool,
@@ -17238,6 +17241,8 @@ pub struct App {
     /// run_metadata_load (worker) が FS 画像のみ埋める (docs/sidecar-metadata-ingest.md §11)。
     pub(crate) sidecar_display_cache:
         std::collections::HashMap<String, Option<crate::external_metadata::SidecarDisplay>>,
+    /// All viewer contexts read this one cache; never move it into ViewerContextBundle.
+    pub(crate) caption_display: crate::caption_display_cache::CaptionDisplayCache,
     /// 360 度パノラマビュー: インタラクティブステート (フルスクリーン内のみ Some)。
     /// 360 モード ON → Some、OFF → None。equirect でない画像へナビした場合は
     /// **保持しつつ非アクティブ化** する設計 (`is_panorama_mode_active(fs_idx)` で判定)。
@@ -18971,6 +18976,9 @@ pub struct App {
     /// 編集用追加パックの確認ダイアログを「今はしない」で閉じたか (このセッション中)。
     /// true の間は編集系入口での再 prompt を抑制する (spec §4.1 `declined_this_session`)。
     pub(crate) editing_addon_declined_session: bool,
+    pub(crate) vlm_setup: crate::ui_dialogs::vlm_addon::VlmSetup,
+    #[cfg(windows)]
+    pub(crate) caption_job: Option<crate::ui_dialogs::caption_job::CaptionJob>,
     /// フルスクリーン中央のヒントオーバーレイ。
     /// 最後/最初の項目でさらに進もう/戻ろうとしたとき、または Ctrl+↑↓ で
     /// 画像・動画のあるフォルダが skip_limit 以内に見つからなかったときに表示する。
@@ -19815,6 +19823,8 @@ pub struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        self.stop_caption_job_for_exit();
         self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
         self.pdf_render_epoch.retire();
         self.transfer_spread_shift_exit_ownership();
@@ -21143,6 +21153,7 @@ impl App {
             xmp_cache: std::collections::HashMap::new(),
             xmp_panorama_info: std::collections::HashMap::new(),
             sidecar_display_cache: std::collections::HashMap::new(),
+            caption_display: crate::caption_display_cache::CaptionDisplayCache::default(),
             panorama_state: None,
             video_zoom_state: None,
             #[cfg(windows)]
@@ -21748,6 +21759,9 @@ impl App {
             trt_install_state: None,
             editing_addon_install_state: None,
             editing_addon_declined_session: false,
+            vlm_setup: Default::default(),
+            #[cfg(windows)]
+            caption_job: None,
             fs_boundary_hint: None,
             bucket_region_flash: None,
 
@@ -23922,6 +23936,7 @@ impl App {
             self.subfolder_expansion_install_pending.is_some()
                 => "subfolder_expansion_install_pending",
             self.editing_addon_install_state.is_some() => "editing_addon_install",
+            self.vlm_setup.modal_open() => "vlm_model_setup",
             self.text_subdialog_open() => "text_subdialog",
         ];
         None
@@ -29044,6 +29059,7 @@ impl App {
         self.keep_end_shared.store(0, Ordering::Relaxed);
         self.visible_end_shared.store(0, Ordering::Relaxed);
         self.metadata_cache.clear();
+        self.caption_display.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
         self.xmp_panorama_info.clear();
@@ -33334,6 +33350,9 @@ impl App {
         self.indexer_init = match outcome {
             crate::indexer_manager::StartupInitOutcome::Ready(manager) => {
                 // Current SW_HIDE state, not a snapshot taken when the worker began.
+                // Terminals consumed while Pending cannot reach this manager. Resample
+                // durable pending rows after adoption, even if its initial drain finished.
+                manager.notify_caption_changed();
                 manager.set_io_throttled(!self.window_visible);
                 if crate::perf::is_enabled() {
                     crate::perf::event("startup", "metadata_search_ready", None, 0, &[]);
@@ -39843,6 +39862,7 @@ impl App {
         self.local_adjust_cache.clear();
         // path-keyed メタキャッシュは新レベルの別 entry 用にリセット。
         self.metadata_cache.clear();
+        self.caption_display.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
         self.clear_tags_cache();
@@ -40151,26 +40171,12 @@ impl App {
     /// 「保存しない」を選んだ PDF を開けなくなる。開く経路と外部ツールの実体化が
     /// **同じ順序**で解決するよう、綴りは 1 か所に置く (Codex Sol 指摘 #10)。
     pub(crate) fn pdf_open_password(&self, pdf_path: &Path) -> Option<String> {
-        if !pdf_path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| crate::folder_tree::is_pdf_extension(&ext.to_ascii_lowercase()))
-        {
-            return None;
-        }
-        // A validated password from the current PDF session wins over an older saved value.
-        // New destinations still consult their per-file saved value first below.
-        if self
-            .current_folder
-            .as_ref()
-            .is_some_and(|current| crate::folder_tree::path_eq(current, pdf_path))
-            && let Some(password) = &self.pdf_current_password
-        {
-            return Some(password.clone());
-        }
-        self.pdf_passwords
-            .get(pdf_path)
-            .or_else(|| self.pdf_current_password.clone())
+        crate::pdf_passwords::pdf_open_password(
+            &self.pdf_passwords,
+            self.current_folder.as_deref(),
+            self.pdf_current_password.as_deref(),
+            pdf_path,
+        )
     }
 
     pub fn load_pdf_as_folder(&mut self, pdf_path: PathBuf) {
@@ -43118,6 +43124,7 @@ impl App {
         self.clear_still_seek_thumbnail_requests();
         self.details_hover_thumb_idx = None;
         self.metadata_cache.clear();
+        self.caption_display.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
         self.xmp_panorama_info.clear();
@@ -44214,6 +44221,7 @@ impl App {
         }
         self.persist_pending_view_trim_state();
         self.items = items;
+        self.global_search.clear_projection_branches();
         self.tag_view_applied_times.clear();
         self.projection_recipe = Default::default();
         self.image_metas = image_metas;
@@ -45591,6 +45599,7 @@ impl App {
         };
         match db.set(container, &source) {
             Ok(()) => {
+                self.caption_display.clear();
                 self.invalidate_converted_archive_pin_root_states();
                 let key = crate::path_key::normalize_keep_drive(container);
                 self.folder_pin_map.insert(key, source);
@@ -45623,6 +45632,7 @@ impl App {
         };
         match db.remove(container) {
             Ok(()) => {
+                self.caption_display.clear();
                 self.invalidate_converted_archive_pin_root_states();
                 let key = crate::path_key::normalize_keep_drive(container);
                 self.folder_pin_map.remove(&key);
@@ -48776,11 +48786,46 @@ impl App {
         crate::logger::log(message);
     }
 
+    /// DB writers publish only committed caption changes. Startup also drains
+    /// durable pending rows when the manager is not ready yet.
+    pub(crate) fn notify_caption_changed(&self) {
+        if let Some(manager) = self.indexer_init.as_ref() {
+            manager.notify_caption_changed();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn caption_epoch_for_test(
+        &mut self,
+        data_dir: &std::path::Path,
+    ) -> Arc<std::sync::atomic::AtomicU64> {
+        if self.indexer_init.as_ref().is_none() {
+            self.indexer_init = IndexerInit::Ready(
+                crate::indexer_manager::IndexerManager::new_at(
+                    data_dir,
+                    &[],
+                    crate::settings::IndexerSpeedProfile::default(),
+                    Arc::clone(&self.activity_gate),
+                    Vec::new(),
+                )
+                .expect("caption sender test manager"),
+            );
+        }
+        self.indexer_init.as_ref().unwrap().caption_epoch()
+    }
+
     pub(crate) fn apply_metadata_import_terminal_refresh(
         &mut self,
         result: metadata_import_refresh::RefreshResult,
         changed: crate::metadata_transfer::ImportChangedSections,
     ) -> (Vec<String>, bool) {
+        // DB writes have committed even if a context needs another terminal refresh.
+        if changed.ai_captions {
+            self.notify_caption_changed();
+        }
+        if changed.ai_captions || changed.thumbnail_pins {
+            self.caption_display.clear();
+        }
         #[cfg(windows)]
         let stale_before_apply = result.contexts.iter().any(|context| {
             match self.viewer_context_residence(context.context_id) {
@@ -53780,6 +53825,8 @@ impl App {
             comic: self.comic_db.is_some(),
             rating: self.rating_db.is_some(),
             tags: self.tags_db.is_some(),
+            // V1-2 has no UI caption handle. Discover the store on the worker below.
+            ai_captions: false,
         };
         // Capture the existing source-write FIFO before handing off Append.
         // The same worker waits before metadata initialization and publication.
@@ -53796,6 +53843,10 @@ impl App {
                         error
                     })?;
             }
+            let stores = crate::book_append_undo::AppendMetadataStores {
+                ai_captions: data_dir.join("ai_caption.db").is_file(),
+                ..stores
+            };
             crate::books::append_pages_at_with_raw(
                 data_dir,
                 root,
@@ -66424,8 +66475,9 @@ impl App {
             );
         }
         if auto_fullscreen && let Some(GridItem::Folder(path)) = self.items.get(idx) {
-            // Ctrl+G drill folders are navigation nodes, not physical book containers.
-            if self.global_search.active && self.global_search.drill.is_some() {
+            // Only projected search branches are navigation nodes; direct folder-book
+            // hits use the ordinary physical-container path, including inside a drill.
+            if self.global_search_folder_is_branch(path) {
                 return DetachedBuild::NotApplicable;
             }
             return DetachedBuild::Built(DetachedGridItemOpenPlan::FolderCandidate {
@@ -66618,6 +66670,13 @@ impl App {
         }
         if self.document_open_modal_admission_blocked() {
             return true;
+        }
+        // Resolve the accepted row's meaning before an asynchronous classifier
+        // takes ownership: its continuation cannot resume the caller's drill path.
+        if matches!(self.items.get(idx), Some(GridItem::Folder(path))
+            if self.global_search_folder_is_branch(path))
+        {
+            return false;
         }
         if let Some(path) = self.items.get(idx).and_then(GridItem::drag_source_path)
             && Self::path_needs_open_classification(path)
@@ -98797,6 +98856,7 @@ impl App {
         self.show_trt_worker_notice_dialog(ctx);
         // TRT pack オンラインインストールダイアログ (環境設定から起動)。
         self.show_trt_install_dialog(ctx);
+        self.show_vlm_addon_dialog(ctx);
         // 編集用追加パック (フォント + 被写体分離モデル) のオンライン取得ダイアログ。
         // ⚠️ フルスクリーン中はフルスクリーンビューポート側 (ui_fullscreen.rs) で描画する
         //    (VST3 マネージャと同様。両ビューポートで描くと egui::Window の位置が二重管理に
@@ -99466,6 +99526,10 @@ impl eframe::App for App {
         // returns so every viewer observes the same cut snapshot in the first repaint.
         self.cut_clipboard.poll();
         self.poll_clipboard_capture(ctx);
+        self.poll_vlm_setup(ctx);
+        #[cfg(windows)]
+        self.poll_caption_job();
+        self.caption_display.poll();
         self.poll_capture_selection(ctx);
         self.render_update_before_frame(ctx);
         #[cfg(not(windows))]
@@ -99522,6 +99586,8 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        #[cfg(windows)]
+        self.stop_caption_job_for_exit();
         self.retire_close_return_owners(ViewerCloseCause::AppExit);
         self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
         self.diagnostics_export.retire();

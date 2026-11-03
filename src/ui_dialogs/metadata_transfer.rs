@@ -1130,7 +1130,7 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState, recursive: bool) {
                 "このフォルダ直下のみ"
             };
             ui.label(format!(
-                "{} 項目（走査範囲: {scope}） / 評価 {} / タグ付き {} / 時刻ブックマーク {} / 本ブックマーク {} / ページ設定 {} / 本・フォルダ設定 {} / 見開き調整 {} / 本の構成 {} / サムネピン {}",
+                "{} 項目（走査範囲: {scope}） / 評価 {} / タグ付き {} / 時刻ブックマーク {} / 本ブックマーク {} / ページ設定 {} / 本・フォルダ設定 {} / 見開き調整 {} / 本の構成 {} / AI説明文 {} / サムネピン {}",
                 summary.entries,
                 summary.ratings,
                 summary.tagged_items,
@@ -1140,6 +1140,7 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState, recursive: bool) {
                 summary.container_states,
                 summary.spread_shifts,
                 summary.compositions,
+                summary.ai_captions,
                 summary.thumbnail_pins,
             ));
             if summary.skipped_reparse_directories > 0 {
@@ -1192,6 +1193,7 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState, recursive: bool) {
                 summary.committed.composition_replacements,
                 summary.committed.composition_removals,
             ));
+            ui.label(format!("AI説明文: 変更 {}", summary.committed.ai_captions));
             if summary.skipped_kind_mismatch > 0 {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
@@ -1699,6 +1701,30 @@ mod tests {
         assert!(!app.metadata_transfer_book_append_writers_busy());
     }
     use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn ai_caption_transfer_result_displays_exported_and_committed_counts() {
+        let export = ResultState::Export(Ok(ExportSummary {
+            ai_captions: 3,
+            ..Default::default()
+        }));
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_ui(move |ui| draw_result(ui, &export, false));
+        harness.run();
+        harness.get_by_label("0 項目（走査範囲: このフォルダ直下のみ） / 評価 0 / タグ付き 0 / 時刻ブックマーク 0 / 本ブックマーク 0 / ページ設定 0 / 本・フォルダ設定 0 / 見開き調整 0 / 本の構成 0 / AI説明文 3 / サムネピン 0");
+
+        let mut summary = ImportSummary::default();
+        summary.committed.ai_captions = 4;
+        let import = ResultState::Import(Ok(summary));
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_ui(move |ui| draw_result(ui, &import, false));
+        harness.run();
+        harness.get_by_label("AI説明文: 変更 4");
+    }
 
     #[test]
     fn import_shift_and_composition_confirmation_keeps_counts_and_actions_reachable() {

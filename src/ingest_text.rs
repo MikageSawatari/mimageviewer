@@ -8,6 +8,7 @@
 //!   - PDFium document info (PDF のみ) → `SourceKind::PdfMeta`
 //!   - FFmpeg container metadata (動画のみ) → `SourceKind::VideoMeta`
 //!   - 外部メタデータサイドカー (JSON/TXT) → `SourceKind::Sidecar`
+//!   - ローカル AI 説明文 → `SourceKind::AiCaption` (IngestSession が DB を参照)
 //!
 //! ## 設計方針
 //!
@@ -41,6 +42,8 @@ pub struct PerSourceText {
     /// JSON はリーフ値のみ / TXT は全文。mIV タグ (`tags`) とは別系統の読み取り専用
     /// フリーテキスト (docs/sidecar-metadata-ingest.md)。
     pub sidecar: String,
+    /// Local AI caption, visible text and keywords (only successful rows).
+    pub ai_caption: String,
 }
 
 impl PerSourceText {
@@ -54,6 +57,7 @@ impl PerSourceText {
             SourceKind::VideoMeta => &self.video_meta,
             SourceKind::Tags => &self.tags,
             SourceKind::Sidecar => &self.sidecar,
+            SourceKind::AiCaption => &self.ai_caption,
         }
     }
 
@@ -69,7 +73,8 @@ impl PerSourceText {
                 + self.video_meta.len()
                 + self.tags.len()
                 + self.sidecar.len()
-                + 8,
+                + self.ai_caption.len()
+                + 9,
         );
         for s in [
             &self.name,
@@ -80,6 +85,7 @@ impl PerSourceText {
             &self.video_meta,
             &self.tags,
             &self.sidecar,
+            &self.ai_caption,
         ] {
             if !s.is_empty() {
                 if !out.is_empty() {
@@ -100,12 +106,13 @@ impl PerSourceText {
             && self.video_meta.is_empty()
             && self.tags.is_empty()
             && self.sidecar.is_empty()
+            && self.ai_caption.is_empty()
     }
 
     /// Tantivy の STORED 原文へ投入する UTF-8 byte 数。
     ///
     /// `combined()` は検索互換用の一時文字列なので含めず、実際に個別保存する
-    /// 8 source field の総量だけを数える。
+    /// 9 source field の総量だけを数える。
     pub(crate) fn stored_text_byte_sizes(&self) -> (usize, usize) {
         let png_prompt_bytes = self.png_prompt.len();
         let total_bytes = self.name.len()
@@ -115,9 +122,22 @@ impl PerSourceText {
             + self.pdf_meta.len()
             + self.video_meta.len()
             + self.tags.len()
-            + self.sidecar.len();
+            + self.sidecar.len()
+            + self.ai_caption.len();
         (total_bytes, png_prompt_bytes)
     }
+}
+
+/// The same normalized successful caption text is used by ingest and Ctrl+F.
+/// Stale signatures deliberately remain searchable; only status controls inclusion.
+pub fn caption_search_text(row: &crate::ai_caption_db::CaptionRow) -> String {
+    if row.status != crate::ai_caption_db::CaptionStatus::Ok {
+        return String::new();
+    }
+    let mut parts = vec![row.caption.as_str(), row.visible_text.as_str()];
+    parts.extend(row.keywords.iter().map(String::as_str));
+    parts.retain(|part| !part.is_empty());
+    normalize_for_match(&parts.join(" "))
 }
 
 /// 旧 XMP タグ列を「空白区切り列に載せられる」安全な形に正規化する。
@@ -420,6 +440,7 @@ pub fn build_per_source_for_pdf(display_name: &str, info_text: &str) -> PerSourc
         video_meta: String::new(),
         tags: String::new(),
         sidecar: String::new(),
+        ai_caption: String::new(),
     }
 }
 
@@ -588,9 +609,10 @@ mod tests {
             video_meta: "video title".into(),
             tags: "".into(),
             sidecar: "".into(),
+            ai_caption: "caption text".into(),
         };
         let c = pst.combined();
-        assert_eq!(c, "photo.jpg canon 5d prompt text video title");
+        assert_eq!(c, "photo.jpg canon 5d prompt text video title caption text");
     }
 
     #[test]
@@ -604,6 +626,7 @@ mod tests {
             video_meta: "v".into(),
             tags: "t".into(),
             sidecar: "s".into(),
+            ai_caption: "a".into(),
         };
         assert_eq!(pst.get(SourceKind::Filename), "n");
         assert_eq!(pst.get(SourceKind::Exif), "e");
@@ -613,6 +636,7 @@ mod tests {
         assert_eq!(pst.get(SourceKind::VideoMeta), "v");
         assert_eq!(pst.get(SourceKind::Tags), "t");
         assert_eq!(pst.get(SourceKind::Sidecar), "s");
+        assert_eq!(pst.get(SourceKind::AiCaption), "a");
     }
 
     #[test]
@@ -624,6 +648,40 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(pst.stored_text_byte_sizes(), (5 + 9 + 6, 6));
+    }
+
+    #[test]
+    fn caption_text_uses_successful_content_without_signature_filtering() {
+        use crate::ai_caption_db::{CaptionRow, CaptionStatus, FileSignature};
+        let mut row = CaptionRow {
+            item_key: "c:/missing.jpg".into(),
+            signature: FileSignature {
+                size: 0,
+                mtime_ms: 0,
+            },
+            model_id: String::new(),
+            prompt_version: 1,
+            lang: "ja".into(),
+            caption: "BLUE 空".into(),
+            visible_text: "Visible Letter".into(),
+            keywords: vec!["KEYWORD".into()],
+            cover_ref: String::new(),
+            status: CaptionStatus::Ok,
+            created_at: 0,
+            rev: 1,
+            indexed: false,
+        };
+        let expected = "blue 空 visible letter keyword";
+        assert_eq!(caption_search_text(&row), expected);
+        let text = PerSourceText {
+            ai_caption: caption_search_text(&row),
+            ..Default::default()
+        };
+        assert!(!text.is_empty_all());
+        assert_eq!(text.combined(), expected);
+        assert_eq!(text.stored_text_byte_sizes(), (expected.len(), 0));
+        row.status = CaptionStatus::Failed;
+        assert!(caption_search_text(&row).is_empty());
     }
 
     #[test]

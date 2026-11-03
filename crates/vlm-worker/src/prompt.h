@@ -1,5 +1,8 @@
 #pragma once
 #include <string>
+#include <cstdint>
+inline constexpr int64_t kPromptVersion = 1;
+inline constexpr char kPromptEvaluationLabel[] = "v0-3l";
 inline constexpr char kPrompt[] = R"PROMPT(この画像に写っているものを日本語で説明してください。
 caption: 1〜3 文、200 文字以内。写っていないことは書かない。
 text: 画像の中で読み取れる文字 (題名・作者名・看板・ラベルなど) を、書かれているとおりに書き写す (200 文字以内)。無ければ空文字。推測で補わない。

@@ -55,7 +55,12 @@ pub(super) fn read(
     let kind = if metadata.as_ref().is_some_and(std::fs::Metadata::is_dir) {
         ItemKind::Folder
     } else {
-        super::item_from_hit(&input.path).kind
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        super::item_kind_from_extension(&extension)
     };
     let mut output = ItemInfo {
         item: input.clone(),
@@ -80,6 +85,12 @@ pub(super) fn read(
         container_tags: Vec::new(),
         exif: InfoField::NotApplicable,
         generation: InfoField::NotApplicable,
+        ai_caption: if permission.ai_captions {
+            CaptionField::None
+        } else {
+            CaptionField::NotPermitted
+        },
+        container_ai_caption: None,
     };
 
     let mut legacy_rating_key = None;
@@ -254,9 +265,82 @@ pub(super) fn read(
 
     check_cancel(cancel)?;
     enrich(&mut output, &grid_item, path, legacy_rating_key.as_deref())?;
+    enrich_caption(&mut output, path, metadata.as_ref(), permission.ai_captions)?;
     trim_descriptions(&mut output)?;
     check_cancel(cancel)?;
     Ok(output)
+}
+
+fn enrich_caption(
+    output: &mut ItemInfo,
+    path: &Path,
+    metadata: Option<&std::fs::Metadata>,
+    permitted: bool,
+) -> Result<(), AgentError> {
+    let partial = output.item.subresource.is_some();
+    if !partial
+        && permitted
+        && !matches!(
+            output.kind,
+            ItemKind::Image | ItemKind::Archive | ItemKind::Pdf | ItemKind::Folder
+        )
+    {
+        return Ok(());
+    }
+    let field = read_caption(
+        &crate::ai_caption_db::CaptionDb::db_path(),
+        path,
+        if !partial && output.kind == ItemKind::Image {
+            metadata
+        } else {
+            None
+        },
+        permitted,
+    )?;
+    if partial {
+        output.container_ai_caption = Some(field);
+    } else {
+        output.ai_caption = field;
+    }
+    Ok(())
+}
+
+/// All caption I/O stays on the existing metadata worker. In particular, the
+/// permission check precedes even opening the store (including absent stores).
+fn read_caption(
+    db_path: &Path,
+    path: &Path,
+    image_metadata: Option<&std::fs::Metadata>,
+    permitted: bool,
+) -> Result<CaptionField, AgentError> {
+    use crate::ai_caption_db::{CaptionDb, CaptionStatus, FileSignature};
+    if !permitted {
+        return Ok(CaptionField::NotPermitted);
+    }
+    let result = (|| {
+        let Some(db) = CaptionDb::open_read_only(db_path)? else {
+            return Ok(CaptionField::None);
+        };
+        let Some(row) = db.get(&CaptionDb::normalize_path(path))? else {
+            return Ok(CaptionField::None);
+        };
+        if row.status != CaptionStatus::Ok {
+            return Ok(CaptionField::None);
+        }
+        Ok(CaptionField::Present(AiCaptionInfo {
+            caption: text(row.caption),
+            visible_text: text(row.visible_text),
+            keywords: row.keywords,
+            model: row.model_id,
+            created_at: row.created_at,
+            stale: image_metadata
+                .map(|metadata| FileSignature::from_metadata(metadata) != Some(row.signature)),
+        }))
+    })();
+    result.map_err(|error: rusqlite::Error| {
+        log::error!("agent_ipc: caption read failed: {error}");
+        super::internal()
+    })
 }
 
 fn enrich(
@@ -787,16 +871,37 @@ fn trim_descriptions(output: &mut ItemInfo) -> Result<(), AgentError> {
         let Some(value) = longest else {
             break;
         };
-        let target = value.text.chars().count() / 2;
-        let boundary = value
-            .text
-            .char_indices()
-            .nth(target)
-            .map_or(value.text.len(), |(index, _)| index);
-        value.text.truncate(boundary);
-        value.truncated = true;
+        shrink_text(value);
+    }
+    // Generation details give up their budget first. Keep keywords/model and
+    // identity exact; only explanatory caption text carries truncation marks.
+    while mcp_content_chars(output).map_err(|_| super::internal())? > MAX_ITEM_CHARS {
+        let longest = std::iter::once(&mut output.ai_caption)
+            .chain(output.container_ai_caption.iter_mut())
+            .filter_map(|field| match field {
+                CaptionField::Present(info) => Some(info),
+                _ => None,
+            })
+            .flat_map(|info| [&mut info.caption, &mut info.visible_text])
+            .filter(|value| !value.text.is_empty())
+            .max_by_key(|value| value.text.len());
+        let Some(value) = longest else {
+            break;
+        };
+        shrink_text(value);
     }
     Ok(())
+}
+
+fn shrink_text(value: &mut TextValue) {
+    let target = value.text.chars().count() / 2;
+    let boundary = value
+        .text
+        .char_indices()
+        .nth(target)
+        .map_or(value.text.len(), |(index, _)| index);
+    value.text.truncate(boundary);
+    value.truncated = true;
 }
 
 #[cfg(test)]

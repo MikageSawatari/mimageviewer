@@ -80,7 +80,14 @@ impl Handlers {
                 .map(|segment| segment.to_lowercase())
                 .collect::<Vec<_>>(),
         ]);
-        let page = folder_page(items, applied, limit, cursor.as_deref(), &args)?;
+        let page = folder_page(
+            items,
+            applied,
+            limit,
+            cursor.as_deref(),
+            &args,
+            ctx.granted.1,
+        )?;
         ctx.checkpoint()?;
         Ok(Payload::Folder(page))
     }
@@ -404,15 +411,23 @@ struct FolderCursor {
     args_digest: String,
     listing_digest: String,
     returned: usize,
+    #[serde(default)]
+    permission_epoch: u64,
 }
 
-fn folder_cursor(args_digest: &str, listing_digest: &str, returned: usize) -> String {
+fn folder_cursor(
+    args_digest: &str,
+    listing_digest: &str,
+    returned: usize,
+    permission_epoch: u64,
+) -> String {
     serde_json::to_vec(&FolderCursor {
-        version: 2,
+        version: 3,
         tool: "list_folder".into(),
         args_digest: args_digest.into(),
         listing_digest: listing_digest.into(),
         returned,
+        permission_epoch,
     })
     .expect("serializable folder cursor")
     .iter()
@@ -425,6 +440,7 @@ fn folder_offset(
     args: &str,
     listing: &str,
     total: usize,
+    permission_epoch: u64,
 ) -> Result<usize, AgentError> {
     let Some(cursor) = cursor else {
         return Ok(0);
@@ -438,8 +454,14 @@ fn folder_offset(
         .map(|index| u8::from_str_radix(&cursor[index..index + 2], 16).map_err(|_| bad()))
         .collect::<Result<Vec<_>, _>>()?;
     let cursor: FolderCursor = serde_json::from_slice(&bytes).map_err(|_| bad())?;
-    if cursor.version != 2 || cursor.tool != "list_folder" || cursor.args_digest != args {
+    if cursor.version != 3 || cursor.tool != "list_folder" || cursor.args_digest != args {
         return Err(bad());
+    }
+    if cursor.permission_epoch != permission_epoch {
+        return Err(error(
+            ErrorCode::PermissionChanged,
+            "許可が変わりました。最初からやり直してください",
+        ));
     }
     if cursor.listing_digest != listing {
         return Err(error(
@@ -459,6 +481,7 @@ fn folder_page(
     limit: Option<u32>,
     cursor: Option<&str>,
     args: &serde_json::Value,
+    permission_epoch: u64,
 ) -> Result<FolderPage, AgentError> {
     let limit = folder_limit(limit)?;
     let args_digest = wire_digest(args).map_err(|_| internal())?;
@@ -467,7 +490,13 @@ fn folder_page(
         .map(|item| (physical_identity(Path::new(&item.path)), &item.subresource))
         .collect::<Vec<_>>();
     let listing_digest = wire_digest(&identity).map_err(|_| internal())?;
-    let offset = folder_offset(cursor, &args_digest, &listing_digest, items.len())?;
+    let offset = folder_offset(
+        cursor,
+        &args_digest,
+        &listing_digest,
+        items.len(),
+        permission_epoch,
+    )?;
     let total = items.len();
     let items = items
         .into_iter()
@@ -489,8 +518,14 @@ fn folder_page(
     };
     loop {
         page.truncated = offset + page.items.len() < total;
-        page.cursor = (page.truncated && !page.items.is_empty())
-            .then(|| folder_cursor(&args_digest, &listing_digest, offset + page.items.len()));
+        page.cursor = (page.truncated && !page.items.is_empty()).then(|| {
+            folder_cursor(
+                &args_digest,
+                &listing_digest,
+                offset + page.items.len(),
+                permission_epoch,
+            )
+        });
         if mcp_content_chars(&page).map_err(|_| internal())? <= MAX_PAGE_CHARS {
             return Ok(page);
         }

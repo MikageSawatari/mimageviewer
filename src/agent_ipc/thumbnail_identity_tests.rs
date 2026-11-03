@@ -9,11 +9,15 @@ type Fixture = super::super::tests::Fixture;
 fn context(fixture: &Fixture) -> ReadContext {
     ReadContext::new(
         &fixture.handlers,
-        PermissionSnapshot {
-            level: AgentLevel::ReadOnly,
-            thumbnails: true,
-            gps: false,
-        },
+        (
+            PermissionSnapshot {
+                level: AgentLevel::ReadOnly,
+                thumbnails: true,
+                gps: false,
+                ai_captions: false,
+            },
+            0,
+        ),
         Arc::new(AtomicBool::new(false)),
     )
 }

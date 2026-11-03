@@ -251,6 +251,10 @@ impl App {
         summary: &crate::books::BookAppendSummary,
     ) {
         let report = &summary.metadata_copy;
+        if report.captions_changed {
+            self.notify_caption_changed();
+            self.caption_display.clear();
+        }
         // Metadata is initialized on the append worker before the file is visible.
         // This terminal carries changed keys only: a user may already have edited
         // or cleared the destination. Fresh DB reads own cache/presence hydration.

@@ -51,7 +51,9 @@ pub(crate) fn folder_zip_page_backup(
 }
 const FORMAT_NAME: &str = "mimageviewer-portable-metadata";
 const SHARD_FORMAT_NAME: &str = "mimageviewer-portable-metadata-shard";
-const FORMAT_VERSION: u32 = 11;
+const FORMAT_VERSION: u32 = 12;
+const COMPOSITION_FORMAT_VERSION: u32 = 11;
+const AI_CAPTION_FORMAT_VERSION: u32 = 12;
 const SPREAD_SHIFT_FORMAT_VERSION: u32 = 10;
 const LEGACY_FORMAT_VERSION: u32 = 9;
 const PREVIOUS_FORMAT_VERSION: u32 = 8;
@@ -111,6 +113,7 @@ pub struct ExportSummary {
     pub container_states: usize,
     pub spread_shifts: usize,
     pub compositions: usize,
+    pub ai_captions: usize,
     pub thumbnail_pins: usize,
     /// セキュリティ上再帰しなかったjunction / symlink directoryの数。
     pub skipped_reparse_directories: usize,
@@ -161,6 +164,8 @@ pub struct ImportSummary {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ImportCommittedChanges {
+    /// Physical items whose caption was changed or removed, published after commit.
+    pub ai_captions: usize,
     pub video_pins: usize,
     pub folder_pins: usize,
     pub spread_shift_additions: usize,
@@ -193,6 +198,7 @@ pub struct ImportChangedSections {
     pub container_state: bool,
     pub spread_shift: bool,
     pub composition: bool,
+    pub ai_captions: bool,
     pub thumbnail_pins: bool,
 }
 
@@ -207,6 +213,7 @@ impl ManifestSections {
             container_state: self.container_state,
             spread_shift: self.spread_shift,
             composition: self.composition,
+            ai_captions: self.ai_captions,
             thumbnail_pins: self.thumbnail_pins,
         }
     }
@@ -371,6 +378,8 @@ struct ManifestSections {
     #[serde(default)]
     composition: bool,
     #[serde(default)]
+    ai_captions: bool,
+    #[serde(default)]
     thumbnail_pins: bool,
 }
 
@@ -385,6 +394,7 @@ impl Default for ManifestSections {
             container_state: true,
             spread_shift: true,
             composition: true,
+            ai_captions: true,
             thumbnail_pins: true,
         }
     }
@@ -453,12 +463,28 @@ struct PortableEntry {
     spread_shift_family: Option<PortableSpreadShiftFamily>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     composition_family: Option<PortableCompositionFamily>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ai_caption: Option<PortableAiCaption>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     nested_containers: Vec<PortableNestedContainer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     video_pin: Option<PortableVideoPin>,
     #[serde(default)]
     virtual_items: Vec<PortableVirtualItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PortableAiCaption {
+    model_id: String,
+    prompt_version: i64,
+    lang: String,
+    caption: String,
+    visible_text: String,
+    keywords: Vec<String>,
+    cover_ref: String,
+    mtime_ms: i64,
+    size: u64,
+    created_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -950,6 +976,7 @@ where
     let mut batch_applied = 0usize;
     let mut batch_video_pin_changes = 0usize;
     let mut batch_folder_pin_changes = 0usize;
+    let mut batch_ai_caption_changes = 0usize;
     let mut batch_spread_shift_changes = SpreadShiftFamilyChanges::default();
     let mut batch_composition_changes = CompositionFamilyChanges::default();
     let mut batch_started = batch_now();
@@ -1077,6 +1104,7 @@ where
                                 .saturating_add(usize::from(folder_pin_changed));
                             batch_spread_shift_changes.merge(outcome.spread_shift);
                             batch_composition_changes.merge(outcome.composition);
+                            batch_ai_caption_changes += usize::from(outcome.ai_caption_changed);
                         }
                         Err(error) => {
                             conn.execute_batch(
@@ -1134,6 +1162,7 @@ where
                     );
                 }
                 summary.applied_entries = summary.applied_entries.saturating_add(batch_applied);
+                summary.committed.ai_captions += std::mem::take(&mut batch_ai_caption_changes);
                 summary.committed.video_pins = summary
                     .committed
                     .video_pins
@@ -1205,6 +1234,7 @@ where
         Ok(())
     };
     if commit_result.is_ok() {
+        summary.committed.ai_captions += batch_ai_caption_changes;
         summary.applied_entries = summary.applied_entries.saturating_add(batch_applied);
         summary.committed.video_pins = summary
             .committed
@@ -1579,6 +1609,7 @@ fn make_enumerated(
             container_state: PortableContainerState::default(),
             spread_shift_family: None,
             composition_family: None,
+            ai_caption: None,
             nested_containers: Vec::new(),
             video_pin: None,
             virtual_items: Vec::new(),
@@ -2140,6 +2171,14 @@ where
     finalize_export_page_bases(entries, &page_index, &page_origins);
     attach_spread_shift_metadata(data_dir, entries, cancel, &mut metadata_rows, progress)?;
     attach_composition_metadata(data_dir, entries, cancel, &mut metadata_rows, progress)?;
+    attach_ai_caption_metadata(
+        data_dir,
+        entries,
+        &index,
+        cancel,
+        &mut metadata_rows,
+        progress,
+    )?;
     for entry in entries {
         entry
             .portable
@@ -2156,6 +2195,72 @@ where
         total: 0,
         current_path: None,
     });
+    Ok(())
+}
+
+fn attach_ai_caption_metadata<F>(
+    data_dir: &Path,
+    entries: &mut [EnumeratedEntry],
+    index: &HashMap<String, usize>,
+    cancel: &AtomicBool,
+    metadata_rows: &mut usize,
+    progress: &mut F,
+) -> Result<(), TransferError>
+where
+    F: FnMut(TransferProgress),
+{
+    let path = data_dir.join("ai_caption.db");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let mut conn = open_readonly(&path)?;
+    prepare_metadata_scope(&mut conn, index, &HashMap::new(), cancel)?;
+    // Captions belong only to physical items, never virtual page families.
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.item_key, c.model_id, c.prompt_version, c.lang, c.caption,
+                c.visible_text, c.keywords, c.cover_ref, c.mtime_ms, c.size, c.created_at
+         FROM metadata_transfer_physical_scope AS s CROSS JOIN captions AS c
+         WHERE c.item_key = s.item_key AND c.status = 'ok'",
+        )
+        .map_err(db_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            let keywords_json: String = row.get(6)?;
+            let keywords =
+                serde_json::from_str::<Vec<String>>(&keywords_json).map_err(|error| {
+                    invalid_db_value(
+                        6,
+                        rusqlite::types::Type::Text,
+                        format!("ai_caption.db: keywords: {error}"),
+                    )
+                })?;
+            Ok((
+                row.get::<_, String>(0)?,
+                PortableAiCaption {
+                    model_id: row.get(1)?,
+                    prompt_version: row.get(2)?,
+                    lang: row.get(3)?,
+                    caption: row.get(4)?,
+                    visible_text: row.get(5)?,
+                    keywords,
+                    cover_ref: row.get(7)?,
+                    mtime_ms: row.get(8)?,
+                    size: row.get(9)?,
+                    created_at: row.get(10)?,
+                },
+            ))
+        })
+        .map_err(db_error)?;
+    for row in rows {
+        check_cancel(cancel)?;
+        let (key, caption) = row.map_err(db_error)?;
+        validate_ai_caption(&caption)?;
+        report_metadata_progress(metadata_rows, &key, progress);
+        if let Some(&entry_index) = index.get(&key) {
+            entries[entry_index].portable.ai_caption = Some(caption);
+        }
+    }
     Ok(())
 }
 
@@ -3795,6 +3900,7 @@ fn summarize_entry(summary: &mut ExportSummary, entry: &PortableEntry) {
         .spread_shift_family
         .as_ref()
         .map_or(0, |family| family.scopes.len());
+    summary.ai_captions += usize::from(entry.ai_caption.is_some());
     summary.compositions += entry
         .composition_family
         .as_ref()
@@ -3849,8 +3955,11 @@ fn read_bundle_manifest(root: &Path, cancel: &AtomicBool) -> Result<BundleManife
     validate_bundle_manifest(&manifest)?;
     // Earlier versions cannot authorize composition replacement, even when a
     // producer retained an unknown field while rewriting an older bundle.
-    if manifest.version < FORMAT_VERSION {
+    if manifest.version < COMPOSITION_FORMAT_VERSION {
         manifest.sections.composition = false;
+    }
+    if manifest.version < AI_CAPTION_FORMAT_VERSION {
+        manifest.sections.ai_captions = false;
     }
     let generation_dir = bundle_generation_dir(&bundle_dir, &manifest.generation);
     ensure_plain_directory(&generation_dir)?;
@@ -4063,17 +4172,19 @@ fn validate_bundle_manifest(manifest: &BundleManifest) -> Result<(), TransferErr
         PREVIOUS_FORMAT_VERSION,
         LEGACY_FORMAT_VERSION,
         SPREAD_SHIFT_FORMAT_VERSION,
+        COMPOSITION_FORMAT_VERSION,
         FORMAT_VERSION,
     ]
     .contains(&manifest.version)
     {
         return Err(TransferError::Invalid(format!(
-            "未対応のバージョンです: {}（v{} / v{} / v{} / v{} / v{}を受け入れます）",
+            "未対応のバージョンです: {}（v{} / v{} / v{} / v{} / v{} / v{}を受け入れます）",
             manifest.version,
             RELEASED_FORMAT_VERSION,
             PREVIOUS_FORMAT_VERSION,
             LEGACY_FORMAT_VERSION,
             SPREAD_SHIFT_FORMAT_VERSION,
+            COMPOSITION_FORMAT_VERSION,
             FORMAT_VERSION
         )));
     }
@@ -4148,17 +4259,19 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), TransferError> {
         PREVIOUS_FORMAT_VERSION,
         LEGACY_FORMAT_VERSION,
         SPREAD_SHIFT_FORMAT_VERSION,
+        COMPOSITION_FORMAT_VERSION,
         FORMAT_VERSION,
     ]
     .contains(&manifest.version)
     {
         return Err(TransferError::Invalid(format!(
-            "未対応のバージョンです: {}（v{} / v{} / v{} / v{} / v{}を受け入れます）",
+            "未対応のバージョンです: {}（v{} / v{} / v{} / v{} / v{} / v{}を受け入れます）",
             manifest.version,
             RELEASED_FORMAT_VERSION,
             PREVIOUS_FORMAT_VERSION,
             LEGACY_FORMAT_VERSION,
             SPREAD_SHIFT_FORMAT_VERSION,
+            COMPOSITION_FORMAT_VERSION,
             FORMAT_VERSION
         )));
     }
@@ -4314,6 +4427,9 @@ fn validate_portable_entry(entry: &PortableEntry) -> Result<(), TransferError> {
         )));
     }
     validate_tags(&entry.tags)?;
+    if let Some(caption) = &entry.ai_caption {
+        validate_ai_caption(caption)?;
+    }
     if entry.timed_bookmarks.len() > MAX_BOOKMARKS_PER_ENTRY
         || entry.book_bookmarks.len() > MAX_BOOKMARKS_PER_ENTRY
         || entry.virtual_items.len() > MAX_BOOKMARKS_PER_ENTRY
@@ -5052,6 +5168,10 @@ fn ensure_database_schemas(data_dir: &Path) -> Result<(), TransferError> {
     );
     crate::spread_shift::initialize_database_at(&data_dir.join("spread_shift.db"))
         .map_err(TransferError::Database)?;
+    drop(
+        crate::ai_caption_db::CaptionDb::open_at(&data_dir.join("ai_caption.db"))
+            .map_err(|error| schema_open_error("ai_caption.db", error))?,
+    );
     crate::book_composition::store::initialize_database_at(&data_dir.join("book_composition.db"))
         .map_err(TransferError::Database)?;
     drop(
@@ -5220,6 +5340,7 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
         ("spread", "spread.db"),
         ("spread_shift", "spread_shift.db"),
         ("book_composition", "book_composition.db"),
+        ("ai_caption", "ai_caption.db"),
         ("folder_pin", "folder_thumb_pins.db"),
         ("video_pin", "video_pins.db"),
     ] {
@@ -5256,6 +5377,7 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
         "spread",
         "spread_shift",
         "book_composition",
+        "ai_caption",
         "folder_pin",
         "video_pin",
     ] {
@@ -5283,6 +5405,60 @@ struct ApplyEntryOutcome {
     folder_pin_changed: bool,
     spread_shift: SpreadShiftFamilyChanges,
     composition: CompositionFamilyChanges,
+    ai_caption_changed: bool,
+}
+
+fn validate_ai_caption(caption: &PortableAiCaption) -> Result<(), TransferError> {
+    crate::ai_caption_db::validate_caption(
+        &caption.caption,
+        &caption.visible_text,
+        &caption.keywords,
+    )
+    .map_err(|error| TransferError::Invalid(format!("AI説明文: {error}")))?;
+    if caption.size > i64::MAX as u64 {
+        return Err(TransferError::Invalid(
+            "AI説明文のファイルサイズが不正です".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_ai_caption(
+    tx: &Connection,
+    key: &str,
+    caption: Option<&PortableAiCaption>,
+) -> Result<bool, TransferError> {
+    let Some(caption) = caption else {
+        return tx
+            .prepare_cached("DELETE FROM ai_caption.captions WHERE item_key = ?1")
+            .map_err(db_error)?
+            .execute([key])
+            .map(|count| count > 0)
+            .map_err(db_error);
+    };
+    let keywords = serde_json::to_string(&caption.keywords)
+        .map_err(|error| TransferError::Invalid(format!("AI説明文: {error}")))?;
+    // A no-op must neither count as a change nor issue a new revision.
+    tx.prepare_cached(
+        "INSERT INTO ai_caption.captions
+            (item_key, mtime_ms, size, model_id, prompt_version, lang, caption,
+             visible_text, keywords, cover_ref, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'ok', ?11)
+         ON CONFLICT(item_key) DO UPDATE SET
+            mtime_ms=excluded.mtime_ms, size=excluded.size, model_id=excluded.model_id,
+            prompt_version=excluded.prompt_version, lang=excluded.lang, caption=excluded.caption,
+            visible_text=excluded.visible_text, keywords=excluded.keywords,
+            cover_ref=excluded.cover_ref, status='ok', created_at=excluded.created_at
+         WHERE captions.mtime_ms IS NOT excluded.mtime_ms OR captions.size IS NOT excluded.size
+            OR captions.model_id IS NOT excluded.model_id OR captions.prompt_version IS NOT excluded.prompt_version
+            OR captions.lang IS NOT excluded.lang OR captions.caption IS NOT excluded.caption
+            OR captions.visible_text IS NOT excluded.visible_text OR captions.keywords IS NOT excluded.keywords
+            OR captions.cover_ref IS NOT excluded.cover_ref OR captions.status IS NOT 'ok'
+            OR captions.created_at IS NOT excluded.created_at",
+    ).map_err(db_error)?.execute(params![
+        key, caption.mtime_ms, caption.size, caption.model_id, caption.prompt_version, caption.lang,
+        caption.caption, caption.visible_text, keywords, caption.cover_ref, caption.created_at,
+    ]).map(|count| count > 0).map_err(db_error)
 }
 
 fn apply_entry(
@@ -5343,6 +5519,9 @@ fn apply_entry(
             entry.media_kind,
             PortableMediaKind::Zip | PortableMediaKind::Pdf | PortableMediaKind::ConvertibleArchive
         );
+    if sections.ai_captions {
+        outcome.ai_caption_changed = apply_ai_caption(tx, &base_key, entry.ai_caption.as_ref())?;
+    }
     if sections.ratings {
         delete_page_key_family(
             tx,
@@ -7550,6 +7729,349 @@ mod tests {
         ensure_database_schemas(path).unwrap();
     }
 
+    fn transfer_caption() -> PortableAiCaption {
+        PortableAiCaption {
+            model_id: "test-model@revision".into(),
+            prompt_version: 1,
+            lang: "ja".into(),
+            caption: "画像の説明".into(),
+            visible_text: "画像内の文字".into(),
+            keywords: vec!["検索語".into()],
+            cover_ref: "chapter/cover.jpg".into(),
+            // Deliberately different from the destination: import preserves the
+            // generation signature rather than replacing it with current stat.
+            mtime_ms: 123,
+            size: 456,
+            created_at: 789,
+        }
+    }
+
+    fn set_transfer_caption(data: &Path, key: &str, status: &str, caption: &PortableAiCaption) {
+        Connection::open(data.join("ai_caption.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO captions (item_key, mtime_ms, size, model_id, prompt_version,
+                    lang, caption, visible_text, keywords, cover_ref, status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    key,
+                    caption.mtime_ms,
+                    caption.size,
+                    caption.model_id,
+                    caption.prompt_version,
+                    caption.lang,
+                    caption.caption,
+                    caption.visible_text,
+                    serde_json::to_string(&caption.keywords).unwrap(),
+                    caption.cover_ref,
+                    status,
+                    caption.created_at,
+                ],
+            )
+            .unwrap();
+    }
+
+    fn rewrite_transfer_version(root: &Path, version: u32) {
+        let cancel = AtomicBool::new(false);
+        let mut manifest = read_bundle_manifest(root, &cancel).unwrap();
+        manifest.version = version;
+        let bundle = root.join(SIDECAR_FILENAME);
+        fs::write(
+            bundle.join(BUNDLE_MANIFEST_FILENAME),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let shards = bundle_generation_dir(&bundle, &manifest.generation).join(SHARDS_DIRNAME);
+        for shard in fs::read_dir(shards).unwrap() {
+            let path = shard.unwrap().path();
+            let contents = fs::read_to_string(&path).unwrap();
+            let mut lines = contents.lines();
+            let mut header: ShardHeader = serde_json::from_str(lines.next().unwrap()).unwrap();
+            header.version = version;
+            fs::write(
+                path,
+                format!(
+                    "{}\n{}\n",
+                    serde_json::to_string(&header).unwrap(),
+                    lines.collect::<Vec<_>>().join("\n")
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn ai_caption_transfer_roundtrip_counts_noop_and_explicit_empty_removal() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&root).unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        for name in ["image.jpg", "failed.jpg", "book.zip"] {
+            fs::write(root.join(name), b"same").unwrap();
+        }
+        let key = crate::path_key::normalize_keep_drive(&root.join("image.jpg"));
+        let caption = transfer_caption();
+        set_transfer_caption(&source_data, &key, "ok", &caption);
+        set_transfer_caption(&destination_data, &key, "failed", &caption);
+        set_transfer_caption(
+            &source_data,
+            &crate::path_key::normalize_keep_drive(&root.join("failed.jpg")),
+            "failed",
+            &caption,
+        );
+        let virtual_key = format!(
+            "{}::page.jpg",
+            crate::path_key::normalize_keep_drive(&root.join("book.zip"))
+        );
+        set_transfer_caption(&source_data, &virtual_key, "ok", &caption);
+        let untouched_key = crate::path_key::normalize_keep_drive(&root.join("not-mentioned.jpg"));
+        set_transfer_caption(&destination_data, &untouched_key, "ok", &caption);
+        let cancel = AtomicBool::new(false);
+        let exported = export_at(&source_data, &root, false, &cancel, no_progress).unwrap();
+        assert_eq!(exported.ai_captions, 1);
+        let manifest = read_bundle_manifest(&root, &cancel).unwrap();
+        assert_eq!(manifest.version, 12);
+        assert!(manifest.sections.ai_captions);
+        visit_bundle_entries(&root, &manifest, &cancel, |entry, _, _| {
+            if entry.path == "image.jpg" {
+                assert_eq!(entry.ai_caption.as_ref(), Some(&caption));
+            } else {
+                assert!(entry.ai_caption.is_none());
+            }
+            for item in &entry.virtual_items {
+                assert!(
+                    serde_json::to_value(item)
+                        .unwrap()
+                        .get("ai_caption")
+                        .is_none()
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+        let imported = import_at(&destination_data, &root, &cancel, no_progress).unwrap();
+        assert_eq!(imported.failed_entries, 0);
+        assert!(imported.changed.ai_captions);
+        assert_eq!(imported.committed.ai_captions, 1);
+        let conn = Connection::open(destination_data.join("ai_caption.db")).unwrap();
+        let (mtime, size, rev, indexed): (i64, u64, i64, i64) = conn
+            .query_row(
+                "SELECT mtime_ms, size, rev, indexed FROM captions WHERE item_key=?1",
+                [&key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((mtime, size, indexed), (123, 456, 0));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM captions", [], |r| r
+                .get::<_, usize>(0))
+                .unwrap(),
+            2
+        );
+        drop(conn);
+        let noop = import_at(&destination_data, &root, &cancel, no_progress).unwrap();
+        assert_eq!(noop.committed.ai_captions, 0);
+        let conn = Connection::open(destination_data.join("ai_caption.db")).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT rev FROM captions WHERE item_key=?1", [&key], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            rev
+        );
+        drop(conn);
+        // An omitted section never authorizes clearing an existing caption.
+        let mut disabled = manifest.clone();
+        disabled.sections.ai_captions = false;
+        fs::write(
+            root.join(SIDECAR_FILENAME).join(BUNDLE_MANIFEST_FILENAME),
+            serde_json::to_vec(&disabled).unwrap(),
+        )
+        .unwrap();
+        rewrite_root_shard_entries(&root, &cancel, |entry| entry.ai_caption = None);
+        let ignored = import_at(&destination_data, &root, &cancel, no_progress).unwrap();
+        assert!(!ignored.changed.ai_captions);
+        assert_eq!(ignored.committed.ai_captions, 0);
+        fs::write(
+            root.join(SIDECAR_FILENAME).join(BUNDLE_MANIFEST_FILENAME),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let removed = import_at(&destination_data, &root, &cancel, no_progress).unwrap();
+        assert_eq!(removed.committed.ai_captions, 1);
+        let conn = Connection::open(destination_data.join("ai_caption.db")).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT item_key FROM captions", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            untouched_key
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM caption_removed WHERE item_key=?1",
+                [&key],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn ai_caption_transfer_v7_to_v11_keep_captions_and_v11_imports_composition() {
+        use crate::book_scope::BookScopeCoverage;
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("book.zip"), b"same").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        let key = crate::path_key::normalize_keep_drive(&root.join("book.zip"));
+        let caption = transfer_caption();
+        set_transfer_caption(&destination_data, &key, "ok", &caption);
+        set_composition(
+            &source_data,
+            &root.join("book.zip"),
+            "",
+            PortableMediaKind::Zip,
+            &archive_composition("cover.jpg"),
+        );
+        let cancel = AtomicBool::new(false);
+        for version in 7..=11 {
+            export_at(&source_data, &root, false, &cancel, no_progress).unwrap();
+            rewrite_transfer_version(&root, version);
+            let imported = import_at(&destination_data, &root, &cancel, no_progress).unwrap();
+            assert_eq!(imported.failed_entries, 0, "v{version}");
+            assert!(!imported.changed.ai_captions, "v{version}");
+            assert_eq!(imported.committed.ai_captions, 0);
+            let conn = Connection::open(destination_data.join("ai_caption.db")).unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT caption FROM captions WHERE item_key=?1",
+                    [&key],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                caption.caption
+            );
+            if version == COMPOSITION_FORMAT_VERSION {
+                assert!(imported.changed.composition);
+                assert_eq!(imported.committed.composition_additions, 1);
+                assert_eq!(
+                    read_composition_family_at(
+                        &destination_data,
+                        &root.join("book.zip"),
+                        &BookScopeCoverage::Root
+                    )
+                    .unwrap()
+                    .len(),
+                    1
+                );
+            } else {
+                assert!(!imported.changed.composition);
+                assert!(imported.committed.composition_scopes.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ai_caption_transfer_validates_limits_and_keyword_types() {
+        let mut entry = plain_portable_entry("image.jpg", PortableMediaKind::Image);
+        let mut caption = transfer_caption();
+        caption.caption = "説".repeat(400);
+        caption.visible_text = "文".repeat(400);
+        caption.keywords = vec!["語".repeat(32); 20];
+        entry.ai_caption = Some(caption.clone());
+        validate_portable_entry(&entry).unwrap();
+        let mut invalid = caption.clone();
+        invalid.caption.push('説');
+        entry.ai_caption = Some(invalid);
+        assert!(validate_portable_entry(&entry).is_err());
+        let mut invalid = caption.clone();
+        invalid.visible_text.push('文');
+        entry.ai_caption = Some(invalid);
+        assert!(validate_portable_entry(&entry).is_err());
+        let mut invalid = caption.clone();
+        invalid.keywords.push("extra".into());
+        entry.ai_caption = Some(invalid);
+        assert!(validate_portable_entry(&entry).is_err());
+        let mut invalid = caption.clone();
+        invalid.keywords[0].push('語');
+        entry.ai_caption = Some(invalid);
+        assert!(validate_portable_entry(&entry).is_err());
+        let mut wire = serde_json::to_value(caption).unwrap();
+        for invalid in [
+            serde_json::json!("word"),
+            serde_json::json!([1]),
+            serde_json::Value::Null,
+        ] {
+            wire["keywords"] = invalid;
+            assert!(serde_json::from_value::<PortableAiCaption>(wire.clone()).is_err());
+        }
+        let mut sections = serde_json::to_value(ManifestSections::default()).unwrap();
+        sections.as_object_mut().unwrap().remove("ai_captions");
+        assert!(
+            !serde_json::from_value::<ManifestSections>(sections)
+                .unwrap()
+                .ai_captions
+        );
+    }
+
+    #[test]
+    fn ai_caption_transfer_item_rollback_does_not_publish_caption_changes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("image.jpg"), b"same").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        let key = crate::path_key::normalize_keep_drive(&root.join("image.jpg"));
+        set_transfer_caption(&source_data, &key, "ok", &transfer_caption());
+        set_rating(&source_data, &root.join("image.jpg"), 5);
+        Connection::open(destination_data.join("rating.db")).unwrap().execute_batch(
+            "CREATE TRIGGER refuse_rating BEFORE INSERT ON ratings BEGIN SELECT RAISE(ABORT, 'fixture rejection'); END;"
+        ).unwrap();
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &root, false, &cancel, no_progress).unwrap();
+        let imported = import_at(&destination_data, &root, &cancel, no_progress).unwrap();
+        assert_eq!(imported.failed_entries, 1);
+        assert_eq!(imported.committed.ai_captions, 0);
+        let conn = Connection::open(destination_data.join("ai_caption.db")).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM captions", [], |r| r
+                .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT n FROM caption_seq", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn ai_caption_transfer_rejects_wal_participant() {
+        let temp = tempfile::TempDir::new().unwrap();
+        init_data_dir(temp.path());
+        let conn = Connection::open(temp.path().join("ai_caption.db")).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        drop(conn);
+        let error = open_import_connection(temp.path())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("ai_caption"), "{error}");
+        assert!(error.contains("wal"), "{error}");
+    }
+
     fn transfer_composition(
         page: crate::book_composition::CompositionPageRef,
     ) -> crate::book_composition::BookComposition {
@@ -7909,7 +8431,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         export_at(&data, &root, false, &cancel, no_progress).unwrap();
         rewrite_root_shard_entries(&root, &cancel, |entry| entry.composition_family = None);
-        for version in [7, 8, 9, 10, FORMAT_VERSION] {
+        for version in [7, 8, 9, 10, COMPOSITION_FORMAT_VERSION, FORMAT_VERSION] {
             let mut manifest = read_bundle_manifest(&root, &cancel).unwrap();
             manifest.version = version;
             manifest.sections.composition = true;
@@ -7936,7 +8458,7 @@ mod tests {
             )
             .unwrap();
             rewrite_root_shard_entries(&root, &cancel, |entry| {
-                if entry.path == "book.zip" && version < FORMAT_VERSION {
+                if entry.path == "book.zip" && version < COMPOSITION_FORMAT_VERSION {
                     // Legacy versions cannot turn a retained modern field into
                     // permission to clear receiver data.
                     entry.composition_family = Some(PortableCompositionFamily {
@@ -8456,6 +8978,7 @@ mod tests {
             container_state: PortableContainerState::default(),
             spread_shift_family: None,
             composition_family: None,
+            ai_caption: None,
             nested_containers: Vec::new(),
             video_pin: None,
             virtual_items: Vec::new(),
@@ -8635,6 +9158,7 @@ mod tests {
                 container_state: PortableContainerState::default(),
                 spread_shift_family: None,
                 composition_family: None,
+                ai_caption: None,
                 nested_containers: Vec::new(),
                 video_pin: None,
                 virtual_items: Vec::new(),
@@ -10260,6 +10784,7 @@ mod tests {
                 container_state: PortableContainerState::default(),
                 spread_shift_family: None,
                 composition_family: None,
+                ai_caption: None,
                 nested_containers: vec![PortableNestedContainer {
                     member_key: mixed_container.to_string(),
                     state: PortableContainerState {
@@ -10416,6 +10941,7 @@ mod tests {
                 container_state: PortableContainerState::default(),
                 spread_shift_family: None,
                 composition_family: None,
+                ai_caption: None,
                 nested_containers: Vec::new(),
                 video_pin: None,
                 virtual_items: vec![virtual_item("A/B"), virtual_item(r"A\B")],
@@ -11297,7 +11823,7 @@ mod tests {
                 Err(TransferError::Invalid(message))
                     if message.contains("未対応のバージョン")
                         && message.contains(&version.to_string())
-                        && message.contains("v7 / v8 / v9 / v10 / v11を受け入れます")
+                        && message.contains("v7 / v8 / v9 / v10 / v11 / v12を受け入れます")
             ));
         }
     }
@@ -12593,6 +13119,7 @@ mod tests {
                 container_state: PortableContainerState::default(),
                 spread_shift_family: None,
                 composition_family: None,
+                ai_caption: None,
                 nested_containers: Vec::new(),
                 video_pin: None,
                 virtual_items: Vec::new(),
@@ -12822,6 +13349,7 @@ mod tests {
                 container_state: PortableContainerState::default(),
                 spread_shift_family: None,
                 composition_family: None,
+                ai_caption: None,
                 nested_containers: Vec::new(),
                 video_pin: None,
                 virtual_items: Vec::new(),

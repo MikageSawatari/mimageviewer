@@ -144,6 +144,21 @@ ZIP で保管するユーザー向けの機能として、独立した後続プ�
 > として Ctrl+S が扱う。ZIP 内画像のメタ検索が必要になったら、独立した後続プロジェクト
 > として扱う (`search-architecture.md` §4.6 が想定する ZIP 内 item ingest とまとめて)。
 
+**案 B1 の例外 (U17、ローカル AI 説明文 V2b)**: `ai_caption.db` に `status = ok` の
+説明文がある書庫 (ZIP/CBZ・RAR/CBR・7z/CB7・LZH/LHA) とフォルダは、本そのものを
+アイテム索引にも載せる。名前だけの文書を重複登録するのではなく、名前と表紙の説明文・
+画像内の文字・検索語を持つ本の文書とする。説明文がない・失敗行だけの本は従来どおり
+Ctrl+S の対象で、PDF/EPUB は説明文の有無によらず従来どおり Ctrl+G に載る。
+走査・説明文の反映・watcher は同じ候補判定を使い、説明文を消すと追加した本の文書と
+`fts_meta` 行を消す。古い署名の `ok` 行は引き続き検索に使う。
+
+Ctrl+G の種類「書庫・フォルダの本」は `[IndexKind::Zip, IndexKind::Folder]` に絞る。
+結果は索引に保存した種類を保持し、一覧では本として開き、集約では親フォルダのヒットに数える。
+Drill の検索の枝と同じパスの直接の本が重なると枝を優先し、直接のフォルダ本は実フォルダを開く。
+ZIP 内のページを索引するものではなく、上の「ZIP 内画像のメタ検索はしない」は維持する。
+MCP も Archive / Folder の種類で返すが、AI 説明文の利用許可を追加するまでは説明文では
+照合せず、名前に一致した本だけを返す。詳細は [説明文計画 §21.15](local-vlm-caption-plan.md#2115-v2-の設計-2026-11-03)。
+
 ---
 
 ## 4. モード別 詳細仕様
@@ -368,8 +383,10 @@ aggregate_auto == false のとき:
 - `GlobalSearchView` enum を上記の `aggregate` / `aggregate_auto` / `drill` 構成へ再構成。
 - 「一覧」ビューの items 構築 `build_flat_items` を新規追加。`state.all_hits` を走査して
   各ヒットを `GridItem::Image / PdfFile / Video` に変換し (§3.2 より ZIP 内画像ヒットは
-  存在しない)、§4.3.3 のソート順で並べる。`build_drilled_items` と同じく placeholder
-  `image_metas` を使い、UI スレッドでの `fs::metadata` 同期呼び出しは避ける。
+  存在しない)、§4.3.3 のソート順で並べる。`build_drilled_items` と同じく、U17の直接の
+  書庫・フォルダ本には保存済み `GlobalHit` のmtime/sizeを `image_metas` に引き継ぐ。
+  変換キャッシュの照合に必要な元署名を0に置き換えない。他のメディアと検索枝は従来の
+  placeholderを使い、UI スレッドでの `fs::metadata` 同期呼び出しは避ける。
 - `rebuild_items_from_global_search` の view 分岐に Flat を追加。
 - `poll_global_search_events` の rebuild 時に、`aggregate_auto` なら閾値判定を行う。
 - 検索結果への操作 (b) を検出して `aggregate_auto = false` にするフックを 1 箇所用意する。

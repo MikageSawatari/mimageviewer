@@ -14,7 +14,7 @@ impl Handlers {
         cursor: Option<String>,
         ctx: &ReadContext,
     ) -> Result<Payload, AgentError> {
-        if !ctx.permission.thumbnails {
+        if !ctx.granted.0.thumbnails {
             return Err(error(ErrorCode::Disabled, "縮小画像の共有は無効です"));
         }
         if items.is_empty() || items.len() > MAX_THUMBNAIL_ITEMS {
@@ -41,7 +41,7 @@ impl Handlers {
             })
             .collect::<Result<Vec<_>, AgentError>>()?;
         let args = serde_json::json!([normalized, side, "input_order"]);
-        let offset = decode_cursor(cursor.as_deref(), "get_thumbnail", &args)?;
+        let offset = decode_cursor(cursor.as_deref(), "get_thumbnail", &args, ctx.granted.1)?;
         if offset > items.len() {
             return Err(error(ErrorCode::BadRequest, "最初からやり直してください"));
         }
@@ -52,7 +52,7 @@ impl Handlers {
         let io = crate::io_semaphore::GlobalIoSemaphore::process_shared(
             settings.indexer_speed_profile.io_permits(),
         );
-        let mut page = ThumbnailBuilder::new(offset, args);
+        let mut page = ThumbnailBuilder::new(offset, args, ctx.granted.1);
         for item in items.iter().skip(offset) {
             ctx.checkpoint()?;
             let (row, image) =
@@ -78,16 +78,18 @@ struct ThumbnailBuilder {
     bytes: usize,
     offset: usize,
     args: serde_json::Value,
+    permission_epoch: u64,
 }
 
 impl ThumbnailBuilder {
-    fn new(offset: usize, args: serde_json::Value) -> Self {
+    fn new(offset: usize, args: serde_json::Value, permission_epoch: u64) -> Self {
         Self {
             rows: Vec::new(),
             images: Vec::new(),
             bytes: 0,
             offset,
             args,
+            permission_epoch,
         }
     }
 
@@ -138,6 +140,7 @@ impl ThumbnailBuilder {
             "get_thumbnail",
             self.args.clone(),
             "items",
+            self.permission_epoch,
         )?;
         let images = self
             .images

@@ -38,9 +38,13 @@ pub mod activity_gate;
 pub mod adjustment;
 pub mod adjustment_db;
 pub mod ai;
+pub mod ai_caption_db;
 mod app;
+pub(crate) mod caption_display_cache;
 pub mod detached_window_geometry;
 pub(crate) mod feedback;
+#[cfg(windows)]
+pub(crate) mod job_process;
 #[cfg(feature = "dev-tools")]
 pub mod raw;
 #[cfg(not(feature = "dev-tools"))]
@@ -178,6 +182,8 @@ mod final_composite;
 mod image_folder_zip;
 mod image_folder_zip_job;
 mod image_folder_zip_metadata;
+pub mod vlm_addon;
+pub mod vlm_addon_download;
 // filename_stack_ui は private な App へ impl を追加する library-internal module。
 mod adjustment_parameter_edit;
 mod everything_ipc;

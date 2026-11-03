@@ -26,7 +26,7 @@ use windows_dpapi::{Scope, decrypt_data, encrypt_data};
 /// `Clone` は Ctrl+F の PDF document info 照合 (`run_metadata_search`) が
 /// ワーカースレッドへストアごと渡せるようにするため。中身は小さな
 /// `HashMap<String, String>` 1 個なので clone コストは無視できる。
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct PdfPasswordStore {
     /// path_hash → base64-encoded DPAPI-encrypted password
     entries: HashMap<String, String>,
@@ -42,6 +42,31 @@ pub struct PdfPasswordStore {
     /// reconcile snapshots the whole credential set, so any successful mutation must retire
     /// that snapshot without exposing password-derived material.
     configuration_revision: u64,
+}
+
+/// Shared open policy for App and background book-cover readers. A validated
+/// current session wins for that PDF; other PDFs prefer their saved password.
+pub(crate) fn pdf_open_password(
+    store: &PdfPasswordStore,
+    current_pdf: Option<&Path>,
+    current_password: Option<&str>,
+    pdf_path: &Path,
+) -> Option<String> {
+    if !pdf_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| crate::folder_tree::is_pdf_extension(&ext.to_ascii_lowercase()))
+    {
+        return None;
+    }
+    if current_pdf.is_some_and(|current| crate::folder_tree::path_eq(current, pdf_path))
+        && let Some(password) = current_password
+    {
+        return Some(password.to_owned());
+    }
+    store
+        .get(pdf_path)
+        .or_else(|| current_password.map(str::to_owned))
 }
 
 impl PdfPasswordStore {
@@ -215,6 +240,58 @@ impl PdfPasswordStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pdf_open_password_keeps_current_session_and_extension_policy() {
+        let store = PdfPasswordStore::empty_for_test();
+        let current = Path::new("c:/books/current.pdf");
+        assert_eq!(
+            pdf_open_password(&store, Some(current), Some("session"), current).as_deref(),
+            Some("session")
+        );
+        assert_eq!(
+            pdf_open_password(
+                &store,
+                Some(current),
+                Some("session"),
+                Path::new("c:/books/next.PDF")
+            )
+            .as_deref(),
+            Some("session")
+        );
+        assert_eq!(
+            pdf_open_password(
+                &store,
+                Some(current),
+                Some("session"),
+                Path::new("c:/books/next.epub")
+            ),
+            None
+        );
+        assert_eq!(pdf_open_password(&store, None, None, current), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pdf_open_password_prefers_saved_for_new_pdf_and_session_for_current_pdf() {
+        let mut store = PdfPasswordStore::empty_for_test();
+        let current = Path::new("c:/books/current.pdf");
+        let next = Path::new("c:/books/next.pdf");
+        store.set(current, "older");
+        store.set(next, "saved-next");
+        assert_eq!(
+            pdf_open_password(&store, Some(current), Some("validated"), current).as_deref(),
+            Some("validated")
+        );
+        assert_eq!(
+            pdf_open_password(&store, Some(current), Some("validated"), next).as_deref(),
+            Some("saved-next")
+        );
+        assert_eq!(
+            pdf_open_password(&store, Some(current), None, current).as_deref(),
+            Some("older")
+        );
+    }
 
     #[test]
     fn credential_changes_advance_the_global_configuration_revision() {

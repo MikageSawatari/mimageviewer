@@ -145,6 +145,27 @@ pub struct GenerationInfo {
     pub dimensions: Option<TextValue>,
 }
 
+/// Caption access is independent of the other metadata columns.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", content = "value", rename_all = "snake_case")]
+pub enum CaptionField {
+    Present(AiCaptionInfo),
+    None,
+    NotPermitted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiCaptionInfo {
+    pub caption: TextValue,
+    pub visible_text: TextValue,
+    pub keywords: Vec<String>,
+    pub model: String,
+    /// UTC Unix milliseconds, matching the caption store.
+    pub created_at: i64,
+    /// Books require cover resolution and intentionally do not report staleness.
+    pub stale: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ItemInfo {
     pub item: ItemRef,
@@ -160,6 +181,8 @@ pub struct ItemInfo {
     pub container_tags: Vec<String>,
     pub exif: InfoField<ExifInfo>,
     pub generation: InfoField<GenerationInfo>,
+    pub ai_caption: CaptionField,
+    pub container_ai_caption: Option<CaptionField>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

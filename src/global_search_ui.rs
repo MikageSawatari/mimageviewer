@@ -203,7 +203,7 @@ pub fn kind_label(k: IndexKind) -> &'static str {
     match k {
         IndexKind::Folder => "フォルダ",
         IndexKind::Image => "画像",
-        IndexKind::Zip => "ZIP ファイル",
+        IndexKind::Zip => "書庫・フォルダの本",
         IndexKind::Pdf => "PDF / EPUB ファイル",
         IndexKind::Video => "動画ファイル",
         IndexKind::Audio => "音声ファイル",
@@ -229,6 +229,7 @@ impl TargetChoice {
             TargetChoice::Only(SourceKind::VideoMeta) => "動画メタ情報",
             TargetChoice::Only(SourceKind::Tags) => "タグ",
             TargetChoice::Only(SourceKind::Sidecar) => "サイドカー",
+            TargetChoice::Only(SourceKind::AiCaption) => "AI 説明",
         }
     }
 
@@ -260,17 +261,25 @@ pub const TARGET_CHOICES: &[TargetChoice] = &[
     TargetChoice::Only(SourceKind::PdfMeta),
     TargetChoice::Only(SourceKind::VideoMeta),
     TargetChoice::Only(SourceKind::Sidecar),
+    TargetChoice::Only(SourceKind::AiCaption),
 ];
 
-// アイテム検索 (Ctrl+G) の対象は 画像 / PDF / 動画 / 音声。フォルダ・ZIP はコンテナなので
-// コンテナ検索 (Ctrl+S) 側で扱う (docs/search-container-item-redesign.md §3.2, §6)。
+// Zip represents captioned archive/folder books together (local-vlm-caption-plan §21.15.3).
 pub const KIND_CHOICES: &[Option<IndexKind>] = &[
     None,
     Some(IndexKind::Image),
     Some(IndexKind::Pdf),
     Some(IndexKind::Video),
     Some(IndexKind::Audio),
+    Some(IndexKind::Zip),
 ];
+
+fn search_scope_kinds(kind: Option<IndexKind>) -> Option<Vec<IndexKind>> {
+    kind.map(|kind| match kind {
+        IndexKind::Zip => vec![IndexKind::Zip, IndexKind::Folder],
+        other => vec![other],
+    })
+}
 
 /// クエリ入力後、検索実行までの debounce 間隔 (既存 Ctrl+F と揃える)。
 const DEBOUNCE_MS: u64 = 300;
@@ -445,6 +454,7 @@ struct SearchPreparedItems {
     image_metas: Vec<Option<(i64, i64)>>,
     video_thumb_overrides: HashMap<String, std::path::PathBuf>,
     drilled_counts: HashMap<String, [u32; 6]>,
+    drill_branches: HashSet<PathBuf>,
     page_edits: crate::app::page_edit_snapshot::StablePageEditProjection,
     ratings: Option<(HashMap<usize, u8>, u64)>,
     hit_rating_values: Option<HashMap<String, u8>>,
@@ -613,6 +623,8 @@ pub struct GlobalSearchState {
     pub containers: HashMap<PathBuf, ContainerHit>,
     /// 生の全ヒット (drill-down 時に container でフィルタするため保持)
     pub all_hits: Vec<GlobalHit>,
+    /// Branches of the accepted projection, distinct from direct folder-book hits.
+    drill_branches: HashSet<PathBuf>,
     /// 集約トグルの状態 (false = 一覧, true = 集約)。`drill` が Some のときは
     /// ドリルインビューが優先されるので、この値は「ドリルバック先」を決める。
     pub aggregate: bool,
@@ -696,6 +708,7 @@ impl Default for GlobalSearchState {
             page_edit_prepare: None,
             containers: HashMap::new(),
             all_hits: Vec::new(),
+            drill_branches: HashSet::new(),
             aggregate: false,
             aggregate_auto: true,
             drill: None,
@@ -762,6 +775,10 @@ pub const SORT_MODES: &[ContainerSortMode] = &[
 ];
 
 impl GlobalSearchState {
+    pub(crate) fn clear_projection_branches(&mut self) {
+        self.drill_branches.clear();
+    }
+
     pub(crate) fn draft(&self) -> &str {
         match self.source {
             SearchSource::Metadata => &self.metadata_draft,
@@ -913,11 +930,12 @@ impl GlobalSearchState {
 
     /// 集約ロジック (docs §10.4.2): 1 ヒットをコンテナに追加 + 生データも保持
     pub(crate) fn accumulate_hit(&mut self, hit: &GlobalHit) {
-        if !crate::global_search::search_hit_type_is_visible(&self.visibility, &hit.path) {
+        if !crate::global_search::search_hit_type_is_visible(&self.visibility, &hit.path, hit.kind)
+        {
             return;
         }
         let (container_path, kind) = parent_container(&hit.path);
-        let representative = image_representative_from_hit(&hit.path);
+        let representative = image_representative_from_hit(&hit.path, hit.kind);
         let entry = self
             .containers
             .entry(container_path.clone())
@@ -998,7 +1016,13 @@ fn is_zip_hit_path(hit_path: &str) -> bool {
 ///
 /// 画像ファイル / ZIP 内画像 / PDF ファイルのいずれかならサムネイル化できるため
 /// 代表として採用する。それ以外 (未対応拡張子 / フォルダ名ヒットのみ) は None。
-fn image_representative_from_hit(hit_path: &str) -> Option<ContainerRepresentative> {
+fn image_representative_from_hit(
+    hit_path: &str,
+    kind: IndexKind,
+) -> Option<ContainerRepresentative> {
+    if matches!(kind, IndexKind::Zip | IndexKind::Folder) {
+        return None;
+    }
     let (file_part, entry) = match split_zip_hit_path(hit_path) {
         Some((zip, ent)) => (zip, Some(ent.to_string())),
         None => (hit_path, None),
@@ -1267,8 +1291,8 @@ fn build_aggregated_items_prepared(
 /// `state.all_hits` を走査して各ヒットを `GridItem::{Image, PdfFile, Video, Audio}` に変換し、
 /// メインの `sort_order` で一律ソートする。ZIP 内画像ヒットはアイテム索引に存在しない
 /// が (§3.2)、stale な索引が残るケースに備えて防御的にスキップする。
-/// `build_drilled_items` と同じく placeholder image_metas を使い、UI スレッドでの
-/// `fs::metadata` 同期呼び出しは避ける。
+/// 直接の本は取得済みの署名を渡す。他の行は従来のplaceholderを使い、
+/// UI スレッドでの `fs::metadata` 同期呼び出しは避ける。
 pub(crate) fn build_flat_items(
     state: &GlobalSearchState,
     sort_order: crate::settings::SortOrder,
@@ -1296,15 +1320,7 @@ fn build_flat_items_with_recipe(
             continue;
         }
         let p = PathBuf::from(&h.path);
-        // ZIP ファイル自体もアイテム索引対象外 (§3.2)。Flat では stale doc を
-        // 防御的にスキップする。DrilledInto の既存復元契約は ZipFile のまま維持する。
-        if p.extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
-        {
-            continue;
-        }
-        let Some(item) = grid_item_from_fs_hit_path(&p) else {
+        let Some(item) = grid_item_from_fs_hit_path(&p, h.kind) else {
             continue;
         };
         let basename = p
@@ -1327,8 +1343,10 @@ fn build_flat_items_with_recipe(
         .collect();
     keyed_rows.sort_by(|(a, ak), (b, bk)| sort_order.compare_listing_keys(ak, a.2, bk, b.2));
     rows = keyed_rows.into_iter().map(|(row, _)| row).collect();
-    let placeholder = Some((0_i64, 0_i64));
-    let image_metas: Vec<Option<(i64, i64)>> = vec![placeholder; rows.len()];
+    let image_metas = rows
+        .iter()
+        .map(|(item, _, meta)| fs_hit_thumbnail_meta(item, *meta))
+        .collect();
     let items: Vec<GridItem> = rows.into_iter().map(|(it, _, _)| it).collect();
     (items, image_metas)
 }
@@ -1339,8 +1357,8 @@ fn build_flat_items_with_recipe(
 /// 含む子フォルダ (Folder 枝、件数バッジ付き) だけを並べる。ヒットを含まない枝は
 /// 枝刈りされる。
 ///
-/// image_metas は従来どおり placeholder。並べ替えには worker が STORED field から得た
-/// `GlobalHit::{mtime,file_size}` を使い、UI thread の `fs::metadata` は増やさない。
+/// 直接の本はサムネイルにもSTORED署名を引き継ぐ。検索枝と既存メディアは従来のplaceholder。
+/// 並べ替えも worker が得た `GlobalHit::{mtime,file_size}` を使い、UI thread のstatは増やさない。
 pub(crate) fn build_drilled_items(
     state: &GlobalSearchState,
     current_path: &Path,
@@ -1348,14 +1366,15 @@ pub(crate) fn build_drilled_items(
     sort_order: crate::settings::SortOrder,
     rating_filter: &[bool; 6],
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
-    build_drilled_items_with_recipe(
+    let (items, metas, _) = build_drilled_items_with_recipe(
         state,
         current_path,
         is_zip,
         sort_order,
         rating_filter,
         &Default::default(),
-    )
+    );
+    (items, metas)
 }
 
 fn build_drilled_items_with_recipe(
@@ -1365,16 +1384,19 @@ fn build_drilled_items_with_recipe(
     sort_order: crate::settings::SortOrder,
     rating_filter: &[bool; 6],
     recipe: &crate::rating_membership::RatingPreviewRecipe,
-) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>, HashSet<PathBuf>) {
     if is_zip {
-        return build_drilled_zip_items_with_recipe(state, current_path, rating_filter, recipe);
+        let (items, metas) =
+            build_drilled_zip_items_with_recipe(state, current_path, rating_filter, recipe);
+        return (items, metas, HashSet::new());
     }
     // ── 通常フォルダ配下の絞り込み ──
     // rating_filter が全 ON なら絞り込みスキップ (高速 path)。
     // App::rating_filter_active と同じ判定式を使う (固定 [bool; 6] へのアクセスなので
     // 自動ベクトル化された ~1ns、ヘルパー化するメリットなし)。
     let rf_active = !rating_filter.iter().all(|&b| b);
-    let mut direct_files: Vec<(PathBuf, crate::settings::ListingSortMetadata)> = Vec::new();
+    let mut direct_files: Vec<(PathBuf, IndexKind, crate::settings::ListingSortMetadata)> =
+        Vec::new();
     // 直下子フォルダ → その配下のヒット件数 (rating_filter 通過後)
     let mut sub_counts: HashMap<PathBuf, usize> = HashMap::new();
 
@@ -1399,6 +1421,7 @@ fn build_drilled_items_with_recipe(
         if hp_parent == current_path {
             direct_files.push((
                 hp,
+                h.kind,
                 crate::settings::ListingSortMetadata::new(h.mtime, h.file_size),
             ));
         } else {
@@ -1414,6 +1437,10 @@ fn build_drilled_items_with_recipe(
         }
     }
 
+    // A surviving search branch takes precedence over the direct folder-book hit.
+    direct_files
+        .retain(|(path, kind, _)| *kind != IndexKind::Folder || !sub_counts.contains_key(path));
+    let drill_branches = sub_counts.keys().cloned().collect();
     // サブフォルダ (Folder) を名前昇順 → 続いて直下ファイル (Image) を名前昇順
     let mut sub_vec: Vec<(PathBuf, usize)> = sub_counts.into_iter().collect();
     if sort_order.is_size() {
@@ -1435,7 +1462,7 @@ fn build_drilled_items_with_recipe(
         // 非サイズ順は従来のPathBuf順をexact維持する。
         sub_vec.sort_by(|a, b| a.0.cmp(&b.0));
     }
-    direct_files.sort_by(|(a_path, a_meta), (b_path, b_meta)| {
+    direct_files.sort_by(|(a_path, _, a_meta), (b_path, _, b_meta)| {
         let a_name = a_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -1452,27 +1479,35 @@ fn build_drilled_items_with_recipe(
     let mut items: Vec<GridItem> = Vec::with_capacity(sub_vec.len() + direct_files.len());
     let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(items.capacity());
 
-    // image_metas は placeholder (0,0) を使う。path_metadata の同期 fs::metadata は
-    // 大量ヒット (最大 HARD_MAX=10000) で UI を止めるため避ける。キャッシュキーはパスを
-    // 含むので衝突せず、mtime ベースの invalidate が効かない副作用は一時ビューのため許容。
+    // Search branches are structural rows, not direct hits with an indexed stamp.
     let placeholder = Some((0_i64, 0_i64));
     for (sub_path, _hits) in &sub_vec {
         items.push(GridItem::Folder(sub_path.clone()));
         image_metas.push(placeholder);
     }
-    for (f, _) in &direct_files {
-        // 拡張子で GridItem の種類を分岐する。旧実装は無条件に
-        // `GridItem::Image` を入れていたため、ScanSnap のような PDF だらけの
-        // favorite に drill-in すると全サムネが「画像フォーマット判定不可」で
-        // 失敗する現象があった (2026-04 ユーザー報告)。
-        let Some(item) = grid_item_from_fs_hit_path(f) else {
+    for (f, kind, meta) in &direct_files {
+        let Some(item) = grid_item_from_fs_hit_path(f, *kind) else {
             continue;
         };
+        image_metas.push(fs_hit_thumbnail_meta(&item, *meta));
         items.push(item);
-        image_metas.push(placeholder);
     }
 
-    (items, image_metas)
+    (items, image_metas, drill_branches)
+}
+
+/// Direct books need their indexed source stamp for conversion-cache validation
+/// and the existing folder thumbnail path. Do not stat or invent an unknown size.
+fn fs_hit_thumbnail_meta(
+    item: &GridItem,
+    meta: crate::settings::ListingSortMetadata,
+) -> Option<(i64, i64)> {
+    match item {
+        GridItem::ZipFile(_) | GridItem::ConvertibleArchive { .. } | GridItem::Folder(_) => {
+            meta.file_size.map(|size| (meta.mtime, size))
+        }
+        _ => Some((0, 0)),
+    }
 }
 
 /// ZIP コンテナをドリルインしたときのアイテム構築 (v0.8.0 はフラット表示)。
@@ -1660,22 +1695,28 @@ fn path_is_under_or_eq(child: &Path, ancestor: &Path) -> bool {
 ///
 /// Flat / DrilledInto の両経路が同じ分類を使うことで、音声を未知画像へフォールバック
 /// させず `GridItem::Audio` として音楽ビューの open 経路へ渡す。
-fn grid_item_from_fs_hit_path(path: &Path) -> Option<GridItem> {
+fn grid_item_from_fs_hit_path(path: &Path, kind: IndexKind) -> Option<GridItem> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    match ext.as_str() {
-        _ if crate::folder_tree::is_paged_document_path(path) => {
-            Some(GridItem::PdfFile(path.to_path_buf()))
-        }
-        "zip" => Some(GridItem::ZipFile(path.to_path_buf())),
-        _ if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) => {
-            Some(GridItem::Video(path.to_path_buf()))
-        }
-        _ if crate::folder_tree::is_audio_ext(&ext) => Some(GridItem::Audio(path.to_path_buf())),
-        _ => Some(GridItem::Image(path.to_path_buf())),
+    match kind {
+        IndexKind::Folder => Some(GridItem::Folder(path.to_path_buf())),
+        IndexKind::Zip => match crate::archive_converter::ArchiveFormat::from_extension(&ext) {
+            Some(format) => Some(GridItem::ConvertibleArchive {
+                path: path.to_path_buf(),
+                format,
+            }),
+            None if crate::folder_tree::is_zip_extension(&ext) => {
+                Some(GridItem::ZipFile(path.to_path_buf()))
+            }
+            None => None,
+        },
+        IndexKind::Pdf => Some(GridItem::PdfFile(path.to_path_buf())),
+        IndexKind::Video => Some(GridItem::Video(path.to_path_buf())),
+        IndexKind::Audio => Some(GridItem::Audio(path.to_path_buf())),
+        IndexKind::Image => Some(GridItem::Image(path.to_path_buf())),
     }
 }
 
@@ -1898,13 +1939,16 @@ fn search_prepare_worker(
             }
             SearchPrepareCommand::Batch(sequence, mut hits) => {
                 hits.retain(|hit| {
-                    crate::global_search::search_hit_type_is_visible(&state.visibility, &hit.path)
-                        && hit
-                            .path
-                            .split_once(crate::search_norm::ZIP_ENTRY_SEP)
-                            .is_none_or(|(container, member)| {
-                                archive_visibility.allows_member(Path::new(container), member)
-                            })
+                    crate::global_search::search_hit_type_is_visible(
+                        &state.visibility,
+                        &hit.path,
+                        hit.kind,
+                    ) && hit
+                        .path
+                        .split_once(crate::search_norm::ZIP_ENTRY_SEP)
+                        .is_none_or(|(container, member)| {
+                            archive_visibility.allows_member(Path::new(container), member)
+                        })
                 });
                 let rating_before = crate::rating_db::RATING_WRITES.sample();
                 if let Ok(db) = crate::rating_db::RatingDb::open_readonly(
@@ -2058,7 +2102,7 @@ fn search_prepare_worker(
                 }
                 let rating_sort_failed = rating_order_applies && !complete;
                 let sort = wish.order_request.standard_fallback();
-                let (mut items, mut image_metas, drilled_counts) =
+                let (mut items, mut image_metas, drilled_counts, drill_branches) =
                     if let SearchProjection::Everything { dataset, .. } = &wish.source {
                         let (items, metas) = everything::project_dataset(
                             dataset,
@@ -2067,7 +2111,7 @@ fn search_prepare_worker(
                             &wish.rating_filter,
                             &wish.rating_preview,
                         );
-                        (items, metas, HashMap::new())
+                        (items, metas, HashMap::new(), HashSet::new())
                     } else {
                         match &wish.view {
                             GlobalSearchView::Flat => {
@@ -2077,11 +2121,11 @@ fn search_prepare_worker(
                                     &wish.rating_filter,
                                     &wish.rating_preview,
                                 );
-                                (items, metas, HashMap::new())
+                                (items, metas, HashMap::new(), HashSet::new())
                             }
                             GlobalSearchView::Aggregated => {
                                 let (items, metas) = build_aggregated_items_prepared(&state);
-                                (items, metas, HashMap::new())
+                                (items, metas, HashMap::new(), HashSet::new())
                             }
                             GlobalSearchView::DrilledInto {
                                 current_path,
@@ -2090,7 +2134,7 @@ fn search_prepare_worker(
                             } => {
                                 let counts =
                                     compute_drilled_subfolder_counts(&state, current_path, *is_zip);
-                                let (items, metas) = build_drilled_items_with_recipe(
+                                let (items, metas, branches) = build_drilled_items_with_recipe(
                                     &state,
                                     current_path,
                                     *is_zip,
@@ -2098,7 +2142,7 @@ fn search_prepare_worker(
                                     &wish.rating_filter,
                                     &wish.rating_preview,
                                 );
-                                (items, metas, counts)
+                                (items, metas, counts, branches)
                             }
                         }
                     };
@@ -2278,6 +2322,7 @@ fn search_prepare_worker(
                             image_metas,
                             video_thumb_overrides,
                             drilled_counts,
+                            drill_branches,
                             page_edits,
                             ratings,
                             hit_rating_values,
@@ -2300,6 +2345,15 @@ fn search_prepare_worker(
 }
 
 impl App {
+    /// Use the accepted row projection, never a fresh scan of unfiltered hits.
+    /// Closing/cancelling ends that projection; rows retained during asynchronous
+    /// restoration keep their existing physical-item open behavior.
+    pub(crate) fn global_search_folder_is_branch(&self, path: &Path) -> bool {
+        self.global_search.active
+            && self.items_are_global_search_view
+            && self.global_search.drill_branches.contains(path)
+    }
+
     /// Ctrl+G 検索結果ビュー専用の軽量 items 差し替え (Codex P2 指摘対応)。
     ///
     /// `start_loading_items` がやるフォルダ切替フルコース (sidecar flush / fullscreen 閉じ /
@@ -2328,6 +2382,7 @@ impl App {
             None,
             SearchItemsRebuild::Ordinary,
             SearchMetadataInstall::Existing,
+            HashSet::new(),
         );
     }
 
@@ -2340,6 +2395,7 @@ impl App {
         page_identity_index: Option<Arc<crate::app::file_type_resume::PreparedPageIdentityIndex>>,
         rebuild: SearchItemsRebuild,
         metadata: SearchMetadataInstall,
+        drill_branches: HashSet<PathBuf>,
     ) {
         use std::sync::atomic::Ordering;
         debug_assert_eq!(items.len(), image_metas.len());
@@ -2483,6 +2539,7 @@ impl App {
         // install_new_items は既定で false に倒すので、合成ビューであることを上書き。
         // rating 変更時の rebuild_items_from_global_search 判定で参照される (Codex P2)。
         self.items_are_global_search_view = true;
+        self.global_search.drill_branches = drill_branches;
         // idx ベース状態 + キュー排水 (requested / pending_finalize / texture_backlog /
         // keep_* / rotation / rating / adjustment_cache / thumb_pixels / ai_* / fs_* /
         // reload_queue / heavy_io_queue / tag_prewarm_*) を一括破棄。
@@ -2546,6 +2603,7 @@ impl App {
         self.local_adjust_cache.clear();
         // path-keyed キャッシュも Ctrl+G では items が総入れ替わりするのでリセット。
         self.metadata_cache.clear();
+        self.caption_display.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
         self.clear_tags_cache();
@@ -2883,6 +2941,7 @@ impl App {
         // 開くと、検索前なのに戻るボタンや古い drill-down UI が残る可能性があった。
         self.global_search.containers.clear();
         self.global_search.all_hits.clear();
+        self.global_search.clear_projection_branches();
         self.global_search.drill = None;
         self.global_search.aggregate = false;
         self.global_search.aggregate_auto = true;
@@ -3017,10 +3076,11 @@ impl App {
         };
 
         let scope = crate::global_search::SearchScope {
-            kinds: self.global_search.filters.kind.map(|k| vec![k]),
+            kinds: search_scope_kinds(self.global_search.filters.kind),
             target: self.global_search.filters.target.clone(),
             mode: self.global_search.filters.or_mode.into(),
             ignore_epub: self.settings.epub_file_handling_ignores_epub(),
+            ignore_archives: self.settings.archive_file_handling_ignores_convertible(),
             visibility: self.global_search.visibility.clone(),
         };
 
@@ -3478,6 +3538,7 @@ impl App {
                                     SearchItemsRebuild::Ordinary
                                 },
                                 prepared.metadata,
+                                prepared.drill_branches,
                             );
                             app.install_prepared_page_edits(prepared.page_edits);
                             app.accept_search_projection(&wish, metadata_applied);
@@ -4019,26 +4080,41 @@ impl App {
             } => compute_drilled_subfolder_counts(&self.global_search, current_path, is_zip),
             _ => HashMap::new(),
         };
-        let (items, image_metas) = match self.global_search.view() {
+        let (items, image_metas, drill_branches) = match self.global_search.view() {
             GlobalSearchView::Flat => {
-                build_flat_items(&self.global_search, sort_order, &rating_filter)
+                let (items, metas) =
+                    build_flat_items(&self.global_search, sort_order, &rating_filter);
+                (items, metas, HashSet::new())
             }
-            GlobalSearchView::Aggregated => build_aggregated_items(&mut self.global_search),
+            GlobalSearchView::Aggregated => {
+                let (items, metas) = build_aggregated_items(&mut self.global_search);
+                (items, metas, HashSet::new())
+            }
             GlobalSearchView::DrilledInto {
                 ref current_path,
                 is_zip,
                 ..
-            } => build_drilled_items(
+            } => build_drilled_items_with_recipe(
                 &self.global_search,
                 current_path,
                 is_zip,
                 sort_order,
                 &rating_filter,
+                &Default::default(),
             ),
         };
         if !self.adopt_prepared_search_view(adoption, |app| {
             app.search_drilled_folder_counts = drilled_counts;
-            app.replace_search_view_items(items, image_metas);
+            app.replace_search_view_items_with_ratings(
+                items,
+                image_metas,
+                None,
+                false,
+                None,
+                SearchItemsRebuild::Ordinary,
+                SearchMetadataInstall::Existing,
+                drill_branches,
+            );
         }) {
             return;
         }
@@ -4135,10 +4211,20 @@ impl App {
             // BS 1 回で drill_back_to_top → 一覧ビューへ戻れる。これをしないと
             // drill=None のまま PDF ページ表示に居続け、BS が一覧へ戻れなくなる
             // (最上位での BS は no-op、検索の終了は ESC のみ)。
-            let is_zip = p
-                .extension()
-                .map(|e| e.eq_ignore_ascii_case("zip"))
-                .unwrap_or(false);
+            let is_zip = self
+                .global_search
+                .all_hits
+                .iter()
+                .find(|hit| crate::folder_tree::path_eq(Path::new(&hit.path), p))
+                .map(|hit| hit.kind == IndexKind::Zip)
+                .unwrap_or_else(|| {
+                    p.extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| {
+                            crate::folder_tree::is_zip_extension(&ext.to_ascii_lowercase())
+                        })
+                        || crate::folder_tree::is_convertible_archive_path(p)
+                });
             self.global_search.drill = Some(DrillState {
                 container_root: p.to_path_buf(),
                 current_path: p.to_path_buf(),
@@ -4848,6 +4934,346 @@ impl App {
 pub(crate) mod tests {
     use super::*;
 
+    fn caption_book_hit(path: &Path, kind: IndexKind, stars: u8) -> GlobalHit {
+        GlobalHit {
+            path: path.to_string_lossy().into_owned(),
+            kind,
+            score: 1.0,
+            mtime: 1,
+            file_size: Some(1),
+            stars,
+        }
+    }
+
+    #[test]
+    fn caption_books_use_stored_kind_in_flat_drill_and_aggregate() {
+        use crate::archive_converter::ArchiveFormat;
+        let mut state = GlobalSearchState::default();
+        for (name, kind) in [
+            ("album.pdf", IndexKind::Folder),
+            ("album.zip", IndexKind::Folder),
+            ("book.cbz", IndexKind::Zip),
+            ("book.rar", IndexKind::Zip),
+            ("book.7z", IndexKind::Zip),
+            ("book.lzh", IndexKind::Zip),
+            ("page.epub", IndexKind::Pdf),
+        ] {
+            state.accumulate_hit(&caption_book_hit(
+                &Path::new("C:/books").join(name),
+                kind,
+                0,
+            ));
+        }
+        let (flat, _) = build_flat_items(&state, crate::settings::SortOrder::FileName, &[true; 6]);
+        let (drill, _, branches) = build_drilled_items_with_recipe(
+            &state,
+            Path::new("C:/books"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+            &Default::default(),
+        );
+        assert_eq!(flat, drill);
+        assert!(branches.is_empty());
+        assert!(flat.contains(&GridItem::Folder("C:/books/album.pdf".into())));
+        assert!(flat.contains(&GridItem::Folder("C:/books/album.zip".into())));
+        assert!(flat.contains(&GridItem::ZipFile("C:/books/book.cbz".into())));
+        for (name, format) in [
+            ("book.rar", ArchiveFormat::Rar),
+            ("book.7z", ArchiveFormat::SevenZ),
+            ("book.lzh", ArchiveFormat::Lzh),
+        ] {
+            assert!(flat.contains(&GridItem::ConvertibleArchive {
+                path: Path::new("C:/books").join(name),
+                format
+            }));
+        }
+        let container = &state.containers[Path::new("C:/books")];
+        assert_eq!(container.hit_count, 7);
+        assert_eq!(
+            container.representative.as_ref().unwrap().path,
+            PathBuf::from("C:/books/page.epub")
+        );
+        assert_eq!(container.representative.as_ref().unwrap().pdf_page, Some(0));
+        assert_eq!(
+            search_scope_kinds(Some(IndexKind::Zip)),
+            Some(vec![IndexKind::Zip, IndexKind::Folder])
+        );
+        assert_eq!(search_scope_kinds(None), None);
+    }
+
+    #[test]
+    fn caption_book_thumbnail_stamps_follow_direct_hits_in_both_projections() {
+        let root = Path::new("C:/caption-stamps");
+        let mut state = GlobalSearchState::default();
+        for (name, kind, mtime, size) in [
+            ("a.rar", IndexKind::Zip, 101, Some(91)),
+            ("b.7z", IndexKind::Zip, 102, Some(92)),
+            ("c.lzh", IndexKind::Zip, 103, Some(93)),
+            ("d.zip", IndexKind::Zip, 104, Some(94)),
+            ("folder.epub", IndexKind::Folder, 105, Some(0)),
+            ("unknown.7z", IndexKind::Zip, 106, None),
+            ("image.jpg", IndexKind::Image, 107, Some(97)),
+            ("document.pdf", IndexKind::Pdf, 108, Some(98)),
+            ("video.mp4", IndexKind::Video, 109, Some(99)),
+            ("audio.flac", IndexKind::Audio, 110, Some(100)),
+        ] {
+            let mut hit = caption_book_hit(&root.join(name), kind, 0);
+            hit.mtime = mtime;
+            hit.file_size = size;
+            state.accumulate_hit(&hit);
+        }
+        for order in [
+            crate::settings::SortOrder::FileNameDesc,
+            crate::settings::SortOrder::SizeAsc,
+        ] {
+            let (flat, flat_metas) = build_flat_items(&state, order, &[true; 6]);
+            let (drill, drill_metas) = build_drilled_items(&state, root, false, order, &[true; 6]);
+            assert_eq!(flat, drill);
+            assert_eq!(flat_metas, drill_metas);
+            for (item, meta) in flat.iter().zip(&flat_metas) {
+                let hit = state
+                    .all_hits
+                    .iter()
+                    .find(|hit| Path::new(&hit.path) == item.drag_source_path().unwrap())
+                    .unwrap();
+                let expected = if matches!(hit.kind, IndexKind::Zip | IndexKind::Folder) {
+                    hit.file_size.map(|size| (hit.mtime, size))
+                } else {
+                    Some((0, 0))
+                };
+                assert_eq!(*meta, expected, "{item:?}");
+            }
+        }
+        let mut child = caption_book_hit(&root.join("folder.epub/page.jpg"), IndexKind::Image, 0);
+        child.mtime = 999;
+        state.accumulate_hit(&child);
+        let (rows, metas, branches) = build_drilled_items_with_recipe(
+            &state,
+            root,
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+            &Default::default(),
+        );
+        let idx = rows
+            .iter()
+            .position(|item| *item == GridItem::Folder(root.join("folder.epub")))
+            .unwrap();
+        assert!(branches.contains(&root.join("folder.epub")));
+        assert_eq!(
+            metas[idx],
+            Some((0, 0)),
+            "the surviving search branch keeps its original policy"
+        );
+    }
+
+    #[test]
+    fn caption_folder_book_is_visible_with_hidden_filename_extension() {
+        use crate::file_type_visibility::FileTypeCategory;
+        let mut state = GlobalSearchState::default();
+        state
+            .visibility
+            .excluded_categories
+            .extend([FileTypeCategory::Zip, FileTypeCategory::Epub]);
+        for name in ["album.zip", "album.epub"] {
+            state.accumulate_hit(&caption_book_hit(
+                &Path::new("C:/books").join(name),
+                IndexKind::Folder,
+                0,
+            ));
+        }
+        assert_eq!(state.all_hits.len(), 2);
+        assert!(
+            state.containers[Path::new("C:/books")]
+                .representative
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn caption_folder_direct_hit_yields_to_only_surviving_drill_branch() {
+        let root = Path::new("C:/books");
+        let folder = root.join("album.pdf");
+        let mut state = GlobalSearchState::default();
+        state.accumulate_hit(&caption_book_hit(&folder, IndexKind::Folder, 3));
+        state.accumulate_hit(&caption_book_hit(
+            &folder.join("child.jpg"),
+            IndexKind::Image,
+            0,
+        ));
+        let build = |filter| {
+            build_drilled_items_with_recipe(
+                &state,
+                root,
+                false,
+                crate::settings::SortOrder::FileName,
+                filter,
+                &Default::default(),
+            )
+        };
+        let (items, _, branches) = build(&[true; 6]);
+        assert_eq!(items, vec![GridItem::Folder(folder.clone())]);
+        assert_eq!(branches, HashSet::from([folder.clone()]));
+        let (items, _, branches) = build(&[false, false, false, true, false, false]);
+        assert_eq!(items, vec![GridItem::Folder(folder)]);
+        assert!(
+            branches.is_empty(),
+            "filtered child must not turn its matching book into a branch"
+        );
+    }
+
+    #[test]
+    fn caption_drill_branch_identity_lives_with_installed_rows() {
+        let mut app = crate::app::setup_app_for_test();
+        let branch = app.tmp.path().join("branch");
+        app.global_search.active = true;
+        app.global_search.drill = Some(DrillState {
+            container_root: app.tmp.path().to_path_buf(),
+            current_path: app.tmp.path().to_path_buf(),
+            is_zip: false,
+        });
+        app.replace_search_view_items_with_ratings(
+            vec![GridItem::Folder(branch.clone())],
+            vec![None],
+            None,
+            false,
+            None,
+            SearchItemsRebuild::Ordinary,
+            SearchMetadataInstall::Existing,
+            HashSet::from([branch.clone()]),
+        );
+        assert!(app.global_search_folder_is_branch(&branch));
+        app.global_search.reset_for_refresh();
+        assert!(
+            app.global_search_folder_is_branch(&branch),
+            "refresh intent keeps the displayed row identity"
+        );
+        app.global_search.drill = None;
+        assert!(
+            app.global_search_folder_is_branch(&branch),
+            "exit intent precedes asynchronous row adoption"
+        );
+        app.replace_search_view_items(vec![GridItem::Folder(branch.clone())], vec![None]);
+        assert!(
+            !app.global_search_folder_is_branch(&branch),
+            "Flat adoption owns an empty branch set"
+        );
+        app.global_search.drill_branches.insert(branch.clone());
+        app.install_new_items(vec![GridItem::Folder(branch.clone())], vec![None]);
+        assert!(
+            app.global_search.drill_branches.is_empty(),
+            "physical install retires old branch identities"
+        );
+        app.replace_search_view_items_with_ratings(
+            vec![GridItem::Folder(branch.clone())],
+            vec![None],
+            None,
+            false,
+            None,
+            SearchItemsRebuild::Ordinary,
+            SearchMetadataInstall::Existing,
+            HashSet::from([branch.clone()]),
+        );
+        assert!(app.global_search_folder_is_branch(&branch));
+        app.dismiss_global_search_without_restore();
+        assert!(app.global_search.drill_branches.is_empty());
+        assert!(!app.global_search.active);
+        assert!(!app.items_are_global_search_view);
+        assert!(app.global_search.drill.is_none());
+        assert_eq!(
+            app.items,
+            vec![GridItem::Folder(branch.clone())],
+            "closing ends the search projection without hiding rows awaiting restoration"
+        );
+        assert!(!app.global_search_folder_is_branch(&branch));
+        assert!(
+            matches!(
+                app.accept_grid_container_open(&egui::Context::default(), 0),
+                Some(crate::ui_main::AddressBarNav::Direct(path, _)) if path == branch
+            ),
+            "retained rows remain physically openable after the search ends"
+        );
+    }
+
+    #[test]
+    fn caption_drill_worker_adopts_branch_identity_with_rows() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("caption-worker");
+        let branch = root.join("album");
+        std::fs::create_dir_all(&branch).unwrap();
+        let page = branch.join("page.jpg");
+        std::fs::write(&page, b"fixture").unwrap();
+        app.global_search.metadata_draft = "test".into();
+        app.global_search.aggregate_auto = false;
+        app.global_search.drill = Some(DrillState {
+            container_root: root.clone(),
+            current_path: root,
+            is_zip: false,
+        });
+        let ctx = egui::Context::default();
+        app.begin_search_page_edit_prepare_for_test(&ctx);
+        let (stream, rx) = crossbeam_channel::unbounded();
+        app.global_search.pending = Some(SearchProducer::Metadata(
+            crate::indexer_manager::SearchHandle {
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+            },
+        ));
+        stream
+            .send(SearchStreamEvent::Batch {
+                hits: vec![
+                    caption_book_hit(&branch, IndexKind::Folder, 0),
+                    caption_book_hit(&page, IndexKind::Image, 0),
+                ],
+                scanned_candidates: 2,
+                valid_hits: 2,
+                visibility_notice: None,
+            })
+            .unwrap();
+        stream
+            .send(SearchStreamEvent::Done {
+                truncated: false,
+                reason: DoneReason::Complete,
+            })
+            .unwrap();
+        section1409_settle_metadata(&mut app, &ctx, |app| {
+            app.items == vec![GridItem::Folder(branch.clone())]
+                && app.global_search_folder_is_branch(&branch)
+        });
+        app.drill_back_to_top();
+        assert!(
+            app.global_search_folder_is_branch(&branch),
+            "old displayed rows retain their branch meaning while Flat is preparing"
+        );
+        section1409_settle_metadata(&mut app, &ctx, |app| {
+            app.items.len() == 2 && !app.global_search_folder_is_branch(&branch)
+        });
+        app.dismiss_global_search_without_restore();
+        assert!(app.global_search.drill_branches.is_empty());
+    }
+
+    #[test]
+    fn caption_search_view_adoption_clears_shared_display() {
+        let mut app = crate::app::setup_app_for_test();
+        let page = app.tmp.path().join("caption-search.jpg");
+        let key = crate::ai_caption_db::CaptionDb::normalize_path(&page);
+        app.caption_display.seed_for_test(&key);
+        app.caption_display.seed_for_test("d:/other/caption.jpg");
+        let epoch = app.caption_display.epoch_for_test();
+
+        app.replace_search_view_items(vec![GridItem::Image(page.clone())], vec![None]);
+
+        assert_eq!(app.items, vec![GridItem::Image(page)]);
+        assert!(!app.caption_display.contains_for_test(&key));
+        assert!(
+            !app.caption_display
+                .contains_for_test("d:/other/caption.jpg")
+        );
+        assert_ne!(app.caption_display.epoch_for_test(), epoch);
+    }
+
     #[test]
     fn grid_scroll_session_search_renews_at_first_rows_and_drill_not_stream_reprojection() {
         let mut app = crate::app::setup_app_for_test();
@@ -5047,6 +5473,31 @@ pub(crate) mod tests {
         }
     }
 
+    fn fixture_hit_kind(path: &str) -> IndexKind {
+        let path = path
+            .split_once(crate::search_norm::ZIP_ENTRY_SEP)
+            .map_or(path, |(_, entry)| entry);
+        let path = Path::new(path);
+        let ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if crate::folder_tree::is_paged_document_path(path) {
+            IndexKind::Pdf
+        } else if crate::folder_tree::is_zip_extension(&ext)
+            || crate::archive_converter::ArchiveFormat::from_extension(&ext).is_some()
+        {
+            IndexKind::Zip
+        } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) {
+            IndexKind::Video
+        } else if crate::folder_tree::is_audio_ext(&ext) {
+            IndexKind::Audio
+        } else {
+            IndexKind::Image
+        }
+    }
+
     const SEP: char = crate::search_norm::ZIP_ENTRY_SEP;
 
     pub(crate) fn g1_publish_search_hits(app: &mut App, ctx: &egui::Context, paths: &[PathBuf]) {
@@ -5065,6 +5516,7 @@ pub(crate) mod tests {
                 hits: paths
                     .iter()
                     .map(|path| GlobalHit {
+                        kind: fixture_hit_kind(&(path.to_string_lossy().into_owned())),
                         path: path.to_string_lossy().into_owned(),
                         score: 1.0,
                         stars: 0,
@@ -5362,6 +5814,7 @@ pub(crate) mod tests {
         let hits = paths
             .iter()
             .map(|path| GlobalHit {
+                kind: fixture_hit_kind(&(path.to_string_lossy().into_owned())),
                 path: path.to_string_lossy().into_owned(),
                 score: 1.0,
                 stars: 0,
@@ -5568,6 +6021,7 @@ pub(crate) mod tests {
                     1,
                     [&a, &b]
                         .map(|path| GlobalHit {
+                            kind: fixture_hit_kind(&(path.to_string_lossy().into_owned())),
                             path: path.to_string_lossy().into_owned(),
                             score: 1.0,
                             stars: 0,
@@ -5635,6 +6089,7 @@ pub(crate) mod tests {
     fn rating_membership_ring_recipe_keeps_only_preview_leaves_and_new_hits_live() {
         let root = PathBuf::from("C:/ring-stream");
         let hit = |name: &str, stars| GlobalHit {
+            kind: IndexKind::Image,
             path: root
                 .join(format!("{name}.jpg"))
                 .to_string_lossy()
@@ -5691,7 +6146,7 @@ pub(crate) mod tests {
         let (closed, _) = build_flat_items(&state, crate::settings::SortOrder::FileName, &filter);
         assert_eq!(closed.len(), 2);
         assert!(!closed.contains(&GridItem::Image(PathBuf::from(&a.path))));
-        let (drilled, _) = build_drilled_items_with_recipe(
+        let (drilled, _, _) = build_drilled_items_with_recipe(
             &state,
             &root,
             false,
@@ -5744,6 +6199,9 @@ pub(crate) mod tests {
                         hits: indices
                             .iter()
                             .map(|&index| GlobalHit {
+                                kind: fixture_hit_kind(
+                                    &(paths[index].to_string_lossy().into_owned()),
+                                ),
                                 path: paths[index].to_string_lossy().into_owned(),
                                 score: 1.0,
                                 stars: 0,
@@ -5907,6 +6365,9 @@ pub(crate) mod tests {
                         hits: indices
                             .iter()
                             .map(|&index| GlobalHit {
+                                kind: fixture_hit_kind(
+                                    &(paths[index].to_string_lossy().into_owned()),
+                                ),
                                 path: paths[index].to_string_lossy().into_owned(),
                                 score: 1.0,
                                 stars: 0,
@@ -6154,6 +6615,7 @@ pub(crate) mod tests {
             .send(SearchPrepareCommand::Batch(
                 1,
                 vec![GlobalHit {
+                    kind: fixture_hit_kind(&(path.to_string_lossy().into_owned())),
                     path: path.to_string_lossy().into_owned(),
                     score: 1.0,
                     stars: 0,
@@ -6245,6 +6707,7 @@ pub(crate) mod tests {
         stream
             .send(SearchStreamEvent::Batch {
                 hits: vec![GlobalHit {
+                    kind: fixture_hit_kind(&(audio.to_string_lossy().into_owned())),
                     path: audio.to_string_lossy().into_owned(),
                     score: 1.0,
                     stars: 0,
@@ -6349,6 +6812,7 @@ pub(crate) mod tests {
         for batch in 0..20 {
             let hits = (batch * 500..(batch + 1) * 500)
                 .map(|index| GlobalHit {
+                    kind: fixture_hit_kind(&(format!("C:/search/{index:05}.png"))),
                     path: format!("C:/search/{index:05}.png"),
                     score: 1.0,
                     stars: 0,
@@ -6538,6 +7002,7 @@ pub(crate) mod tests {
     fn accumulate_aggregates_by_container() {
         let mut state = GlobalSearchState::default();
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("c:/a/b/1.jpg")),
             path: "c:/a/b/1.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -6545,6 +7010,7 @@ pub(crate) mod tests {
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("c:/a/b/2.jpg")),
             path: "c:/a/b/2.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -6552,6 +7018,7 @@ pub(crate) mod tests {
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("c:/a/c/1.jpg")),
             path: "c:/a/c/1.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -6637,6 +7104,7 @@ pub(crate) mod tests {
         assert!(state.aggregate);
         assert!(!state.aggregate_auto);
         state.all_hits.push(GlobalHit {
+            kind: fixture_hit_kind(&(root.join("B/early.jpg").to_string_lossy().into_owned())),
             path: root.join("B/early.jpg").to_string_lossy().into_owned(),
             score: 1.0,
             stars: 0,
@@ -6699,6 +7167,7 @@ pub(crate) mod tests {
             std::fs::write(path, b"page").unwrap();
         }
         let hit = |path: &Path| GlobalHit {
+            kind: fixture_hit_kind(&(path.to_string_lossy().into_owned())),
             path: path.to_string_lossy().into_owned(),
             score: 1.0,
             stars: 0,
@@ -6849,6 +7318,7 @@ pub(crate) mod tests {
         // done / truncated / total_* が全部クリアされる (close 時に相当の処理を走らせる想定)
         let mut state = GlobalSearchState::default();
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("c:/a/1.jpg")),
             path: "c:/a/1.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -6900,6 +7370,7 @@ pub(crate) mod tests {
     fn all_hits_preserved_for_drill_down() {
         let mut state = GlobalSearchState::default();
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("c:/a/1.jpg")),
             path: "c:/a/1.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -6907,6 +7378,7 @@ pub(crate) mod tests {
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("c:/a/2.jpg")),
             path: "c:/a/2.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -6914,6 +7386,7 @@ pub(crate) mod tests {
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("c:/b/x.jpg")),
             path: "c:/b/x.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -6929,6 +7402,7 @@ pub(crate) mod tests {
     fn accumulate_mixed_folders_and_zips() {
         let mut state = GlobalSearchState::default();
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&(zip_hit("c:/album.zip", "0001.jpg"))),
             path: zip_hit("c:/album.zip", "0001.jpg"),
             score: 1.0,
             mtime: 0,
@@ -6936,6 +7410,7 @@ pub(crate) mod tests {
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&(zip_hit("c:/album.zip", "0002.jpg"))),
             path: zip_hit("c:/album.zip", "0002.jpg"),
             score: 1.0,
             mtime: 0,
@@ -6943,6 +7418,7 @@ pub(crate) mod tests {
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("c:/photos/x.jpg")),
             path: "c:/photos/x.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -6966,6 +7442,7 @@ pub(crate) mod tests {
     fn collect_hit_folders_dfs_is_preorder() {
         let hits = vec![
             GlobalHit {
+                kind: fixture_hit_kind(&("C:/root/a.jpg")),
                 path: "C:/root/a.jpg".into(),
                 score: 1.0,
                 mtime: 0,
@@ -6973,6 +7450,7 @@ pub(crate) mod tests {
                 stars: 0,
             },
             GlobalHit {
+                kind: fixture_hit_kind(&("C:/root/sub/b.jpg")),
                 path: "C:/root/sub/b.jpg".into(),
                 score: 1.0,
                 mtime: 0,
@@ -6980,6 +7458,7 @@ pub(crate) mod tests {
                 stars: 0,
             },
             GlobalHit {
+                kind: fixture_hit_kind(&("C:/root/sub/deeper/c.jpg")),
                 path: "C:/root/sub/deeper/c.jpg".into(),
                 score: 1.0,
                 mtime: 0,
@@ -7002,6 +7481,7 @@ pub(crate) mod tests {
     #[test]
     fn collect_hit_folders_dfs_prunes_empty_branches() {
         let hits = vec![GlobalHit {
+            kind: fixture_hit_kind(&("C:/root/yes/found.jpg")),
             path: "C:/root/yes/found.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -7028,6 +7508,7 @@ pub(crate) mod tests {
             "C:/other/z.jpg", // 別ツリー, current_path 配下ではない
         ] {
             state.accumulate_hit(&GlobalHit {
+                kind: fixture_hit_kind(&(p)),
                 path: p.into(),
                 score: 1.0,
                 mtime: 0,
@@ -7069,7 +7550,8 @@ pub(crate) mod tests {
     /// 全サムネ「画像フォーマット判定不可」で失敗していた。その回帰ガード。
     #[test]
     fn build_drilled_items_classifies_pdf_zip_and_image_by_extension() {
-        let representative = image_representative_from_hit("C:/mix/a.epub").unwrap();
+        let representative =
+            image_representative_from_hit("C:/mix/a.epub", IndexKind::Pdf).unwrap();
         assert_eq!(representative.pdf_page, Some(0));
         assert_eq!(representative.path, PathBuf::from("C:/mix/a.epub"));
         let mut state = GlobalSearchState::default();
@@ -7081,6 +7563,7 @@ pub(crate) mod tests {
             "C:/mix/d.jpg",
         ] {
             state.accumulate_hit(&GlobalHit {
+                kind: fixture_hit_kind(&(p)),
                 path: p.into(),
                 score: 1.0,
                 mtime: 0,
@@ -7112,8 +7595,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// build_flat_items: 全ヒットを sort_order で一律ソートし、拡張子で
-    /// Image / PdfFile / Video に分類する。ZIP 系ヒットは除外する (§3.2、§4.3.1)。
+    /// Flat keeps archive-book hits and skips legacy ZIP member hits.
     #[test]
     fn build_flat_items_sorts_classifies_and_skips_zip() {
         let mut state = GlobalSearchState::default();
@@ -7125,6 +7607,7 @@ pub(crate) mod tests {
             "c:/g/book.epub",
         ] {
             state.accumulate_hit(&GlobalHit {
+                kind: fixture_hit_kind(&(p)),
                 path: p.into(),
                 score: 1.0,
                 mtime: 0,
@@ -7132,8 +7615,9 @@ pub(crate) mod tests {
                 stars: 0,
             });
         }
-        // ZIP 内エントリ + ZIP ファイル自体は一覧に出さない
+        // ZIP member hits remain excluded; archive books are visible.
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&(zip_hit("c:/e/album.zip", "x.jpg"))),
             path: zip_hit("c:/e/album.zip", "x.jpg"),
             score: 1.0,
             mtime: 0,
@@ -7141,6 +7625,7 @@ pub(crate) mod tests {
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("c:/f/plain.zip")),
             path: "c:/f/plain.zip".into(),
             score: 1.0,
             mtime: 0,
@@ -7149,7 +7634,7 @@ pub(crate) mod tests {
         });
         let (items, metas) =
             build_flat_items(&state, crate::settings::SortOrder::FileName, &[true; 6]);
-        assert_eq!(items.len(), 5, "ZIP 系 2 件は除外される");
+        assert_eq!(items.len(), 6, "ZIP 内エントリだけを除外する");
         assert_eq!(items.len(), metas.len());
         // ファイル名順: 1.png → 2.jpg → clip.mp4 → doc.pdf
         let kinds: Vec<&str> = items
@@ -7158,10 +7643,14 @@ pub(crate) mod tests {
                 GridItem::Image(_) => "Image",
                 GridItem::PdfFile(_) => "PdfFile",
                 GridItem::Video(_) => "Video",
+                GridItem::ZipFile(_) => "ZipFile",
                 _ => "Other",
             })
             .collect();
-        assert_eq!(kinds, vec!["Image", "Image", "PdfFile", "Video", "PdfFile"]);
+        assert_eq!(
+            kinds,
+            vec!["Image", "Image", "PdfFile", "Video", "PdfFile", "ZipFile"]
+        );
     }
 
     #[test]
@@ -7169,6 +7658,7 @@ pub(crate) mod tests {
         let mut state = GlobalSearchState::default();
         for path in ["c:/results/page2.jpg", "c:/results/page10.jpg"] {
             state.accumulate_hit(&GlobalHit {
+                kind: fixture_hit_kind(&(path)),
                 path: path.into(),
                 score: 1.0,
                 mtime: 0,
@@ -7200,6 +7690,7 @@ pub(crate) mod tests {
     fn build_flat_items_applies_rating_filter() {
         let mut state = GlobalSearchState::default();
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("c:/a/keep.jpg")),
             path: "c:/a/keep.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -7207,6 +7698,7 @@ pub(crate) mod tests {
             stars: 3,
         });
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("c:/a/drop.jpg")),
             path: "c:/a/drop.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -7226,6 +7718,7 @@ pub(crate) mod tests {
     fn build_flat_items_sorts_by_mtime_for_date_order() {
         let mut state = GlobalSearchState::default();
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("c:/a/mid.jpg")),
             path: "c:/a/mid.jpg".into(),
             score: 1.0,
             mtime: 200,
@@ -7233,6 +7726,7 @@ pub(crate) mod tests {
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("c:/a/new.jpg")),
             path: "c:/a/new.jpg".into(),
             score: 1.0,
             mtime: 300,
@@ -7240,6 +7734,7 @@ pub(crate) mod tests {
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("c:/a/old.jpg")),
             path: "c:/a/old.jpg".into(),
             score: 1.0,
             mtime: 100,
@@ -7274,6 +7769,7 @@ pub(crate) mod tests {
             ("zero.jpg", Some(0)),
         ] {
             state.accumulate_hit(&GlobalHit {
+                kind: fixture_hit_kind(&(format!("c:/sizes/{name}"))),
                 path: format!("c:/sizes/{name}"),
                 score: 1.0,
                 mtime: 1,
@@ -7317,6 +7813,7 @@ pub(crate) mod tests {
         let mut folder_state = GlobalSearchState::default();
         for path in ["c:/sizes/Zebra/z.jpg", "c:/sizes/alpha/a.jpg"] {
             folder_state.accumulate_hit(&GlobalHit {
+                kind: fixture_hit_kind(&(path)),
                 path: path.into(),
                 score: 1.0,
                 mtime: 1,
@@ -7338,6 +7835,7 @@ pub(crate) mod tests {
     fn audio_hit_materializes_as_audio_in_flat_and_drilled_views() {
         let mut state = GlobalSearchState::default();
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("c:/music/MixedCase.FLAC")),
             path: "c:/music/MixedCase.FLAC".into(),
             score: 1.0,
             mtime: 100,
@@ -7379,6 +7877,7 @@ pub(crate) mod tests {
     fn build_drilled_items_prunes_branches_with_no_hits() {
         let mut state = GlobalSearchState::default();
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("C:/root/year2024/jan/matches/X.png")),
             path: "C:/root/year2024/jan/matches/X.png".into(),
             score: 1.0,
             mtime: 0,
@@ -7387,6 +7886,7 @@ pub(crate) mod tests {
         });
         // 上記以外にもヒットを入れておく (別枝が干渉しないことを確認)
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("C:/root/year2024/jan/matches/Y.png")),
             path: "C:/root/year2024/jan/matches/Y.png".into(),
             score: 1.0,
             mtime: 0,
@@ -7460,6 +7960,7 @@ pub(crate) mod tests {
             "c:/loose/z.jpg".to_string(),              // 通常ファイル
         ] {
             state.accumulate_hit(&GlobalHit {
+                kind: fixture_hit_kind(&(p)),
                 path: p,
                 score: 1.0,
                 mtime: 0,
@@ -7498,6 +7999,7 @@ pub(crate) mod tests {
         let mut state = GlobalSearchState::default();
         // 直下: ★3 1 枚 + ★1 1 枚 + ★なし 1 枚
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("C:/root/keep.jpg")),
             path: "C:/root/keep.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -7505,6 +8007,7 @@ pub(crate) mod tests {
             stars: 3,
         });
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("C:/root/drop_low.jpg")),
             path: "C:/root/drop_low.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -7512,6 +8015,7 @@ pub(crate) mod tests {
             stars: 1,
         });
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("C:/root/drop_unrated.jpg")),
             path: "C:/root/drop_unrated.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -7520,6 +8024,7 @@ pub(crate) mod tests {
         });
         // sub_keep: ★3 が 1 件含まれる → バッジ 1
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("C:/root/sub_keep/a.jpg")),
             path: "C:/root/sub_keep/a.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -7527,6 +8032,7 @@ pub(crate) mod tests {
             stars: 3,
         });
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("C:/root/sub_keep/b.jpg")),
             path: "C:/root/sub_keep/b.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -7535,6 +8041,7 @@ pub(crate) mod tests {
         });
         // sub_drop: ★3 ヒットなし → 枝刈り
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&("C:/root/sub_drop/a.jpg")),
             path: "C:/root/sub_drop/a.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -7567,6 +8074,7 @@ pub(crate) mod tests {
         let mut state = GlobalSearchState::default();
         for p in ["C:/root/a.jpg", "C:/root/b.jpg", "C:/root/sub/c.jpg"] {
             state.accumulate_hit(&GlobalHit {
+                kind: fixture_hit_kind(&(p)),
                 path: p.into(),
                 score: 1.0,
                 mtime: 0,
@@ -7591,6 +8099,7 @@ pub(crate) mod tests {
         let sep = crate::search_norm::ZIP_ENTRY_SEP;
         let mut state = GlobalSearchState::default();
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&(format!("c:/archives/target.zip{sep}keep.jpg"))),
             path: format!("c:/archives/target.zip{sep}keep.jpg"),
             score: 1.0,
             mtime: 0,
@@ -7598,6 +8107,7 @@ pub(crate) mod tests {
             stars: 3,
         });
         state.accumulate_hit(&GlobalHit {
+            kind: fixture_hit_kind(&(format!("c:/archives/target.zip{sep}drop.jpg"))),
             path: format!("c:/archives/target.zip{sep}drop.jpg"),
             score: 1.0,
             mtime: 0,

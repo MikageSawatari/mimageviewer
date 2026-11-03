@@ -17120,7 +17120,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     // Ctrl+G 絞り込みビューでは「ヒットを含む子フォルダ」を Folder として
                     // 並べているので、通常の load_folder ではなく絞り込みをさらに 1 段潜る
                     // 経路に流す (docs §10.3 [3] 絞り込みビュー)。
-                    if self.global_search.active && self.global_search.drill.is_some() {
+                    if self.global_search_folder_is_branch(p) {
                         let p = p.clone();
                         self.note_reading_history_open(idx);
                         self.drill_into_subfolder(p);

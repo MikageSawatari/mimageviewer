@@ -249,6 +249,13 @@ target作成時に捕捉する。dispatchは保存したsourceをチェック集
 独立した非modal窓を開く。AI連携の許可・縮小画像・撮影位置は変更時に確定し、環境設定のOK/キャンセルから独立する。
 `KeyAction` は追加しないため、キーの参照ファイル `keymap.ini.default` には項目を足さない。
 
+### 一覧の AI 説明文作成（メニュー専用）
+
+一覧の右クリック「AI 説明文を作る」は `MenuCommand::CreateAiCaptions` から受け付ける。
+`ContextMenuItemId::CreateAiCaptions` として表示・非表示と順序を設定できる。
+一覧の既存の選択規則を使い、何も選んでいないとき・空白の右クリックでは現在のフォルダ直下を対象にする。
+フルスクリーンには表示しない。メニュー専用なので `KeyAction`・既定キー・`keymap.ini.default` の項目は追加しない。
+
 ## 構成のある本の表示キー（§1.242 B2）
 
 `FsViewSpread` / `FsViewLandscapeSplit`は閲覧方法だけを切り替える。既定キーなしでカスタム割当の対象。

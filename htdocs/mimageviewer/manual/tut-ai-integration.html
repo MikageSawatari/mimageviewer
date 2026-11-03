@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI アプリとの連携 (MCP) を使う — チュートリアル — mImageViewer</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="Claude Desktop や ChatGPT (Codex) に mImageViewer の検索・整理を頼む手順。許可の選び方、登録、結果の確認と連携の止め方を説明します。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/tut-ai-integration.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/tut-ai-integration.html">
+  <meta property="og:title" content="AI アプリとの連携 (MCP) を使う｜mImageViewer">
+  <meta property="og:description" content="Claude Desktop や ChatGPT (Codex) に mImageViewer の検索・整理を頼む手順。許可の選び方、登録、結果の確認と連携の止め方を説明します。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="AI アプリとの連携 (MCP) を使う｜mImageViewer">
+  <meta name="twitter:description" content="Claude Desktop や ChatGPT (Codex) に mImageViewer の検索・整理を頼む手順。許可の選び方、登録、結果の確認と連携の止め方を説明します。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>AI アプリとの連携 (MCP) を使う</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+    <h1 class="page-title">AI アプリとの連携 (MCP) を使う</h1>
+    <p class="page-desc">
+      同じ PC の Claude Desktop や ChatGPT (Codex) に、mImageViewer の検索や整理を言葉で頼めます。
+      アプリどうしをつなぐ規格「MCP」を使います。まずは情報を見るだけの許可で始め、必要に応じて開く操作や整理を許可します。
+    </p>
+
+    <div class="box warn">
+      <div class="box-body">
+        <strong>連携は既定では無効です。</strong>有効にすると、ファイルの場所や名前、タグ、撮影情報など、
+        許可した情報を AI アプリが受け取り、その提供元へ送ります。AI アプリと提供元のプライバシーポリシー・
+        会話の保存設定を確認してください。渡る情報の詳しい範囲は<a href="ai-integration.html#shared-information">AI に見せるもの・見せないもの</a>、
+        通信と保存の扱いは<a href="../privacy.html">プライバシーポリシー</a>をご覧ください。
+      </div>
+    </div>
+
+    <h2 id="permissions">1. 読み取りだけを許可する</h2>
+    <ol class="step-list">
+      <li>mIV を起動し、メニューの<strong>「設定」→「AI 連携…」</strong>を開きます。</li>
+      <li>「許可の範囲」を<strong>「読み取りのみ」</strong>にします。検索や一覧の確認はできますが、画面を切り替えたり整理内容を変えたりはしません。</li>
+      <li>縮小画像・撮影位置・AI 説明文のチェックは、最初はオフのままにします。必要になってから、その内容を確かめてオンにしてください。</li>
+    </ol>
+    <p>許可は<strong>変えた時点で反映</strong>されます。OK・キャンセルはありません。この連携を使う AI アプリに共通の設定です。</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>追加の許可（すべて既定でオフ）</th><th>オンにすると渡るもの</th></tr></thead>
+        <tbody>
+          <tr><td>縮小画像を AI に見せる</td><td>画像や指定した本のページの縮小画像。補正・編集は反映しません。隠す編集をした画像など、渡さない対象もあります。</td></tr>
+          <tr><td>撮影位置 (GPS) を AI に見せる</td><td>EXIF の GPS 欄。AI アプリが地名を調べるため、受け取った位置で Web 検索などをする場合があります。</td></tr>
+          <tr><td>AI 説明文を AI に見せる</td><td>保存済みの説明文・画像内の文字・検索語。AI アプリからの検索にも使います。画像に写った氏名・連絡先などが含まれる場合があります。</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>それぞれの対象と制限は<a href="ai-integration.html#shared-information">連携のリファレンス</a>で確認できます。
+      AI 説明文は、先に mIV で<a href="tut-ai-caption.html">画像や本の表紙から作成</a>します。</p>
+
+    <h2 id="registration">2. AI アプリへ登録する</h2>
+    <ol class="step-list">
+      <li>使う AI アプリを終了します。Claude Desktop は通知領域（タスクトレイ）にも残っていないか確認し、そこからも終了してください。Codex をほかの画面でも使っている場合は、そちらも終了します。</li>
+      <li>mIV の「AI 連携」ウィンドウで、<strong>Claude Desktop</strong> または <strong>ChatGPT (Codex)</strong> の行を確認します。終了後の状態を調べ直すときは<strong>「再確認」</strong>を押します。</li>
+      <li><strong>「登録する」</strong>を押し、表示された保存先と書き換える内容を確かめて、<strong>「書き換える」</strong>を押します。</li>
+      <li>AI アプリを起動します。<strong>連携を使う間は、mIV も起動したまま</strong>にしてください。</li>
+    </ol>
+    <p>登録では AI アプリの設定ファイルを書き換え、既存の内容はバックアップに残します。
+      登録先が違う場合の「登録し直す」、自動登録できない場合の「手順を見る」などは<a href="ai-integration.html#registration">登録の詳しい説明</a>をご覧ください。</p>
+    <p>AI アプリ側で、操作を使う許可を求められる場合があります。ChatGPT (Codex) は mIV から登録すると、
+      連携の操作を確認なしで実行する設定になります。mIV の「許可の範囲」が上限なので、必要な範囲だけ選んでください。</p>
+
+    <h2 id="ask">3. 小さな範囲から頼む</h2>
+    <p>まずは「読み取りのみ」のまま、一覧を確かめる依頼から始めます。
+      たとえば「<strong>mImageViewer の★とタグの一覧を見せて</strong>」のように頼めます。</p>
+    <p>場所は<strong>「D:\AI画像」のようにフルパス</strong>で伝えます。「さっきのフォルダ」「画像フォルダ」だけでは、新しい会話で場所が分からなくなることがあります。
+      AI アプリが画面操作などを試して mIV の機能を使わないときは、<strong>「mImageViewer の MCP ツールを使って」</strong>と書き添えてください。</p>
+    <p>検索や整理へ進むときは、下の例に合う許可へ変えてから頼みます。実際のフォルダの場所に置き換えてください。</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>頼み方の例</th><th>必要な許可</th></tr></thead>
+        <tbody>
+          <tr><td>「雪山の画像を探して、1 枚を mImageViewer で開いて」</td><td>読み取りと、mIV で開く</td></tr>
+          <tr><td>「D:\AI画像 の画像を、生成に使ったモデルごとに model-モデル名 のタグで分けて」</td><td>整理まで: タグ・★・コレクションの変更</td></tr>
+          <tr><td>「D:\写真 の写真を見て、風景・建物・人物・動物などのタグを付けて。迷った写真も教えて」</td><td>整理まで: タグ・★・コレクションの変更、縮小画像を AI に見せる</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>「雪山の画像を探して」のような言葉での検索は、お気に入りで<a href="grid.html#favorite-index">「アイテム索引」</a>をオンにした場所が対象です。
+      ファイル名や AI 生成画像のプロンプトなど、文字で記録された情報を探します。「AI 説明文を AI に見せる」をオンにすると、保存済みの説明文でも探せます。</p>
+    <p>写っているもので分類する場合は、AI が縮小画像を見て判断します。枚数が多いほど時間と AI アプリの利用量が増えるため、
+      初めは枚数の少ないフォルダで頼んでください。ほかの頼み方は<a href="ai-integration.html#examples">頼めることの例</a>にまとめています。</p>
+
+    <h2 id="check">4. mIV で結果を確かめる</h2>
+    <ol class="step-list">
+      <li>開く依頼なら、mIV に目的の画像や本が表示されたことを確かめます。整理の依頼なら、一覧やタグ・コレクションで内容を確認します。</li>
+      <li>「設定」→「AI 連携…」を開き、<strong>「AI による変更」</strong>で今回の記録を展開します。対象と変更前後の値・結果を確認できます。</li>
+      <li>タグ変更が「処理中」の場合は、結果に変わったことを確認します。「受け付けた」という返事だけでは完了とは限りません。</li>
+    </ol>
+    <div class="box warn">
+      <div class="box-body">
+        <strong>分類や判断の正しさは AI アプリによります。</strong>「整理まで」では mIV は変更のたびに確認を出さず、
+        AI による変更は<strong>「元に戻す」の対象になりません</strong>。必要なら自分でタグ・★・コレクションを直してください。
+        「AI による変更」の記録は mIV を終了すると消えますが、変更した内容自体は残ります。
+      </div>
+    </div>
+    <p>ファイルの移動・名前の変更・削除は、この連携では頼めません。タグやコレクションで分けるように頼んでください。
+      コレクションにまとめても元のファイルは動きません。</p>
+
+    <h2 id="stop">5. 使い終わったら許可を下げる</h2>
+    <p>「AI 連携」で「読み取りのみ」へ戻すか、連携を止めるなら<strong>「無効」</strong>にします。
+      不要になった縮小画像・撮影位置・AI 説明文のチェックもオフにしてください。すでに受け付けた変更は、許可を下げても取り消されません。</p>
+    <p>登録自体を外す場合は、<strong>対象の AI アプリを終了</strong>してから、その行の<strong>「登録を外す」</strong>を押し、
+      内容を確認して「書き換える」を押します。mIV をアンインストールするだけでは AI アプリ側の登録は消えません。</p>
+    <p>困ったときは<a href="ai-integration.html#troubleshooting">使えないときは</a>をご覧ください。</p>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

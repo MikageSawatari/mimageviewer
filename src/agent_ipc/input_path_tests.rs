@@ -109,11 +109,15 @@ fn normal_paths_keep_case_separator_roots_and_link_identity() {
 fn context(fixture: &Fixture) -> ReadContext {
     ReadContext::new(
         &fixture.handlers,
-        PermissionSnapshot {
-            level: AgentLevel::ReadOnly,
-            thumbnails: true,
-            gps: false,
-        },
+        (
+            PermissionSnapshot {
+                level: AgentLevel::ReadOnly,
+                thumbnails: true,
+                gps: false,
+                ai_captions: false,
+            },
+            0,
+        ),
         Arc::new(AtomicBool::new(false)),
     )
 }
@@ -217,7 +221,7 @@ fn concealed_file_and_virtual_items_reject_aliases_in_all_three_handlers() {
             );
             assert_path_error(crate::agent_ipc::item_info::read(
                 &input,
-                ctx.permission,
+                ctx.granted.0,
                 &ctx.cancel,
             ));
             assert_path_error(
@@ -266,7 +270,7 @@ fn cursors_use_only_validated_spelling_and_validate_even_skipped_inputs() {
         } else {
             serde_json::json!([normalized, DEFAULT_THUMBNAIL_SIDE, "input_order"])
         };
-        let cursor = encode_cursor(tool, args, 1);
+        let cursor = encode_cursor(tool, args, 1, 0);
         let inputs = vec![bad.clone(), good.clone()];
         if tool == "get_item_info" {
             assert_path_error(fixture.handlers.item_info(inputs, None, Some(cursor), &ctx));

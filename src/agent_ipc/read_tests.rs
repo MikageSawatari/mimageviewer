@@ -20,6 +20,7 @@ fn item_payload() -> Payload {
             "search_items",
             serde_json::json!(["fixture", "path"]),
             1,
+            0,
         )),
         truncated: true,
     })
@@ -30,7 +31,7 @@ fn immediate(command: Command, ctx: &ReadContext) -> Result<Payload, Command> {
         Command::Hello { version, .. } => Ok(Payload::Hello { version }),
         Command::Status => Ok(Payload::Status(StatusPayload {
             app_version: "fixture".into(),
-            permission: ctx.permission,
+            permission: ctx.granted.0,
             fts_ready: false,
             remote_active: false,
         })),
@@ -117,7 +118,8 @@ fn real_controllers_return_advancing_prefix_or_timeout_and_retain_worker_permits
                 decode_cursor(
                     page.cursor.as_deref(),
                     "search_items",
-                    &serde_json::json!(["fixture", "path"])
+                    &serde_json::json!(["fixture", "path"]),
+                    0
                 )
                 .unwrap(),
                 1
@@ -219,6 +221,7 @@ fn set_snapshot(snapshot: PermissionSnapshot) {
         settings.agent_level = snapshot.level;
         settings.agent_show_thumbnails = snapshot.thumbnails;
         settings.agent_show_gps = snapshot.gps;
+        settings.agent_show_ai_captions = snapshot.ai_captions;
         db.save_full(&settings)
     })
     .unwrap();
@@ -238,9 +241,14 @@ fn revoke_or_cycle(which: usize, original: PermissionSnapshot) {
                 level: AgentLevel::Disabled,
                 thumbnails: false,
                 gps: false,
+                ai_captions: false,
             });
             set_snapshot(original);
         }
+        3 => set_snapshot(PermissionSnapshot {
+            ai_captions: false,
+            ..original
+        }),
         _ => unreachable!(),
     }
 }
@@ -248,13 +256,14 @@ fn revoke_or_cycle(which: usize, original: PermissionSnapshot) {
 #[test]
 fn real_read_results_recheck_whole_snapshot_during_work_and_at_wire_boundary() {
     for change_before_worker_finishes in [true, false] {
-        for field in 0..3 {
+        for field in 0..4 {
             let mut f = Fixture::new();
             let base = Instant::now();
             let original = PermissionSnapshot {
                 level: AgentLevel::ReadOnly,
                 thumbnails: true,
                 gps: true,
+                ai_captions: true,
             };
             set_snapshot(original);
             let granted_epoch = permission().unwrap().1;
@@ -267,7 +276,7 @@ fn real_read_results_recheck_whole_snapshot_during_work_and_at_wire_boundary() {
                         Ok(value) => return Ok(value),
                         Err(_) => {}
                     }
-                    started_send.send(ctx.permission).unwrap();
+                    started_send.send(ctx.granted.0).unwrap();
                     gate.recv_timeout(Duration::from_secs(10)).unwrap();
                     ctx.checkpoint()?;
                     Ok(item_payload())
@@ -307,6 +316,10 @@ fn status_snapshot_staleness_is_distinct_from_actual_disable() {
     let c = f.connection();
     let original = permission().unwrap().0;
     for changed in [
+        PermissionSnapshot {
+            ai_captions: !original.ai_captions,
+            ..original
+        },
         PermissionSnapshot {
             gps: !original.gps,
             ..original

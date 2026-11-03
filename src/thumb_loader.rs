@@ -339,7 +339,7 @@ pub fn folder_pin_source_allowed(
 
 /// Run only on the direct pin's source worker. Catalog-only parent/drive reads rely on the
 /// policy-scoped row written by that worker and never reopen an archive to choose a winner.
-fn policy_archive_pin_visible(req: &LoadRequest, cancel: Option<&AtomicBool>) -> bool {
+pub(crate) fn policy_archive_pin_visible(req: &LoadRequest, cancel: Option<&AtomicBool>) -> bool {
     if let Some(entry) = req.zip_entry.as_deref() {
         if !req
             .file_type_visibility
@@ -741,6 +741,304 @@ pub(crate) fn stamp_resolved_pdf_request(
         *key = pin_key_with_generation(key, (mtime, file_size));
     }
     Some(stamped)
+}
+
+/// Resolve the EPUB lease and its cache stamp before any cache lookup.
+/// The caller retains this same lease through rendering.
+pub(crate) fn prepare_load_request_stamp(
+    req: &LoadRequest,
+) -> Result<Option<(LoadRequest, crate::pdf_loader::ReadTarget)>, ()> {
+    match &req.pdf_stamp_policy {
+        PdfStampPolicy::ResolveInWorker => {
+            match crate::pdf_loader::resolve_read_target(&req.path) {
+                Ok(read) => {
+                    let Some(stamped) = stamp_resolved_pdf_request(req, &read) else {
+                        return Err(());
+                    };
+                    Ok(Some((stamped, read)))
+                }
+                Err(_) => {
+                    return Err(());
+                }
+            }
+        }
+        PdfStampPolicy::Resolved(read) => {
+            if read
+                .stamp
+                .generation_catalog_pair()
+                .is_some_and(|stamp| (req.mtime, req.file_size) != stamp)
+            {
+                return Err(());
+            }
+            Ok(Some((req.clone(), read.clone())))
+        }
+        PdfStampPolicy::CallerFileAttributes => Ok(None),
+    }
+}
+
+/// Source selection only; cache lookup and thumbnail lifecycle stay with the caller.
+#[derive(Clone, Debug)]
+pub(crate) enum ReadLocation {
+    File(std::path::PathBuf),
+    ArchiveEntry {
+        archive: std::path::PathBuf,
+        entry: String,
+    },
+    PdfPage {
+        pdf: std::path::PathBuf,
+        page: u32,
+    },
+    ChildCached,
+    Unreadable {
+        cancelled: bool,
+    },
+}
+
+pub(crate) struct ResolvedRead {
+    pub(crate) location: ReadLocation,
+    pub(crate) folder_selection_proof: Option<crate::catalog::FolderSelectionProof>,
+    pub(crate) preloaded_zip_bytes: Option<Vec<u8>>,
+    pub(crate) child_selection: Option<CachedChildSelection>,
+    cached_child: Option<CachedPinnedFolderThumb>,
+    pub(crate) effective_stamp: (i64, i64),
+    needs_heavy_io: bool,
+}
+
+impl ResolvedRead {
+    fn unreadable(req: &LoadRequest, cancelled: bool) -> Self {
+        Self {
+            location: ReadLocation::Unreadable { cancelled },
+            folder_selection_proof: None,
+            preloaded_zip_bytes: None,
+            child_selection: None,
+            cached_child: None,
+            effective_stamp: (req.mtime, req.file_size),
+            needs_heavy_io: false,
+        }
+    }
+}
+
+pub(crate) fn resolve_read_after_cache_miss(
+    req: &LoadRequest,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> ResolvedRead {
+    if req.folder_thumb_provenance == Some(crate::catalog::FolderThumbProvenance::Seeded)
+        && req.resolve_override.is_none()
+        && req.zip_entry.is_none()
+        && req.pdf_page.is_none()
+    {
+        // A missing video-frame seed has no source decoder. Never fall through
+        // to folder auto-selection under its released pinned key.
+        return ResolvedRead::unreadable(req, false);
+    }
+
+    // キャッシュミス or SourceOnly: フルデコード (+ 必要なら保存)
+    // load_one_cached は Source origin を送信する
+
+    // 重い I/O (Folder / ZipFile / ConvertibleArchive / ZipDir) は専用 I/O ワーカーキューで処理されるため、
+    // セマフォは不要。I/O ワーカー数 (1-2) で自然に同時実行数が制限される。
+    //
+    // pin 解決時 (`resolve_override` Some) は **prefix 判定をスキップ**し、
+    // 明示された strategy で dispatch する。pin の cache key は親側の prefix
+    // (folderthumb / zipthumb / pdfthumb) を保つので、prefix 判定だけだと
+    // 「ZIP 内画像を親のフォルダ thumb として scan しようとして失敗」のような
+    // ミスマッチが起きる。
+    let is_folder_thumb = match req.resolve_override {
+        Some(ResolveStrategy::FolderRepresentative) => true,
+        Some(_) => false,
+        None if req.zip_entry.is_none() && req.pdf_page.is_none() => req
+            .cache_key_override
+            .as_deref()
+            .is_some_and(|k| k.starts_with(CACHE_KEY_FOLDER)),
+        None => false,
+    };
+    let is_zip_thumb = match req.resolve_override {
+        Some(ResolveStrategy::ZipFirstImage) => true,
+        Some(_) => false,
+        None if req.zip_entry.is_none() && req.pdf_page.is_none() => req
+            .cache_key_override
+            .as_deref()
+            .is_some_and(|k| k.starts_with(CACHE_KEY_ZIP)),
+        None => false,
+    };
+    let is_zip_dir_thumb = matches!(
+        req.resolve_override,
+        Some(ResolveStrategy::ZipDirRepresentative)
+    );
+    let needs_heavy_io = is_folder_thumb || is_zip_thumb || is_zip_dir_thumb;
+
+    // フォルダサムネイル: フォルダ内の画像を探して代表画像のパスに差し替える。
+    // pin-aware: 再帰中に見つけたサブフォルダに pin があれば cascade 解決して
+    // leaf 画像、またはその子用に既に生成済みの pin WebP を採用する。
+    let (resolved_folder_image, cached_pinned_folder_thumb, folder_selection_proof) =
+        if is_folder_thumb {
+            let t_resolve = std::time::Instant::now();
+            let (resolution, proof) = select_folder_thumb_image_with_policy(
+                &req.path,
+                req.folder_thumb_sort
+                    .unwrap_or(crate::settings::SortOrder::Numeric),
+                req.folder_thumb_depth,
+                pin_db,
+                &crate::catalog::default_cache_dir(),
+                cancel,
+                &req.file_type_visibility,
+            );
+            let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
+            if resolve_ms > 10.0 {
+                crate::logger::log(format!(
+                    "    idx={:>4} folder_resolve={resolve_ms:>6.1}ms  {}",
+                    req.idx,
+                    req.path.display(),
+                ));
+            }
+            match resolution {
+                Some(FolderThumbResolution::Image(path)) => (Some(path), None, proof),
+                Some(FolderThumbResolution::CachedPinned(cached)) => (None, Some(cached), proof),
+                None => {
+                    return ResolvedRead::unreadable(
+                        req,
+                        cancel.is_some_and(|token| token.load(Ordering::Relaxed)),
+                    );
+                }
+            }
+        } else {
+            (None, None, None)
+        };
+    let load_path: &Path = resolved_folder_image.as_deref().unwrap_or(&req.path);
+
+    // ZipFile (フォルダ一覧用サムネイル) の場合、UI スレッドでの ZIP I/O を避けるため
+    // zip_entry が None のまま渡される。ワーカー側で遅延解決する。
+    //
+    // ネットワークドライブでは ZIP の open (セントラルディレクトリ読み取り) が高コスト
+    // なため、first_image_entry + read_entry_bytes の 2 回 open を
+    // read_first_image_bytes の 1 回 open に統合する。
+    let resolved_zip_entry: Option<String>;
+    let preloaded_zip_bytes: Option<Vec<u8>>;
+    let zip_entry_ref: Option<&str> = if req.zip_entry.is_some() {
+        preloaded_zip_bytes = None;
+        req.zip_entry.as_deref()
+    } else if is_zip_dir_thumb {
+        let t_zip = std::time::Instant::now();
+        let name = req.zip_dir_prefix.as_deref().and_then(|prefix| {
+            let enumeration =
+                crate::zip_loader::enumerate_image_entries_detailed(&req.path).ok()?;
+            // CP932 名 ZIP のリリース済み per-page キー移行 (worker スレッド)。
+            // フォルダ一覧のサムネ生成段階で済ませると、ZIP を開く前にピン/★ が直る。
+            crate::zip_key_migration::migrate_if_needed(&req.path, &enumeration.legacy_renames);
+            let entries = enumeration.entries;
+            let tree = crate::zip_tree::ZipTree::build(req.path.clone(), entries)
+                .project(&req.file_type_visibility);
+            tree.representative_for_prefix_str(
+                prefix,
+                req.folder_thumb_sort
+                    .unwrap_or(crate::settings::SortOrder::Numeric),
+            )
+            .map(|e| e.entry_name.clone())
+        });
+        let zip_ms = t_zip.elapsed().as_secs_f64() * 1000.0;
+        // ZipDir 代表解決は enumerate_image_entries (ZIP セントラルディレクトリ読み = 重 I/O) +
+        // ツリー構築を伴うことがあるため heavy_io_queue 側に振る。所要は regressions を
+        // 追えるよう analyze_perf.py で集計できるイベントとして残す。
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "thumb",
+                "zipdir_resolve",
+                None,
+                req.input_seq,
+                &[
+                    ("idx", serde_json::Value::from(req.idx)),
+                    ("ms", serde_json::Value::from(zip_ms)),
+                    ("resolved", serde_json::Value::from(name.is_some())),
+                ],
+            );
+        }
+        match name {
+            Some(name) => {
+                crate::logger::log(format!(
+                    "    idx={:>4} zipdir_resolve={zip_ms:>6.1}ms  {}",
+                    req.idx,
+                    req.path.display(),
+                ));
+                resolved_zip_entry = Some(name);
+                preloaded_zip_bytes = None;
+                resolved_zip_entry.as_deref()
+            }
+            None => {
+                return ResolvedRead::unreadable(req, false);
+            }
+        }
+    } else if is_zip_thumb {
+        // cache_key_override あり + pdf_page なし + フォルダでない = ZipFile サムネイル
+        // ZIP を 1 回だけ開いてエントリ名 + バイト列を同時取得
+        let t_zip = std::time::Instant::now();
+        let first = if req.file_type_visibility.is_all_visible() {
+            crate::zip_loader::read_first_image_bytes(&req.path)
+        } else {
+            crate::zip_loader::first_visible_image_entry(
+                &req.path,
+                cancel.map(|token| token.as_ref()),
+                &req.file_type_visibility,
+            )
+            .and_then(|name| {
+                crate::zip_loader::read_entry_bytes(&req.path, &name)
+                    .ok()
+                    .map(|bytes| (name, bytes))
+            })
+        };
+        match first {
+            Some((name, bytes)) => {
+                let zip_ms = t_zip.elapsed().as_secs_f64() * 1000.0;
+                crate::logger::log(format!(
+                    "    idx={:>4} zip_resolve={zip_ms:>6.1}ms  ({} bytes)  {}",
+                    req.idx,
+                    bytes.len(),
+                    req.path.display(),
+                ));
+                resolved_zip_entry = Some(name);
+                preloaded_zip_bytes = Some(bytes);
+                resolved_zip_entry.as_deref()
+            }
+            None => {
+                // ZIP 内に画像が無い場合は失敗として通知
+                return ResolvedRead::unreadable(req, false);
+            }
+        }
+    } else {
+        preloaded_zip_bytes = None;
+        None
+    };
+
+    let location = if cached_pinned_folder_thumb.is_some() {
+        ReadLocation::ChildCached
+    } else if let Some(entry) = zip_entry_ref {
+        ReadLocation::ArchiveEntry {
+            archive: load_path.to_path_buf(),
+            entry: entry.to_owned(),
+        }
+    } else if let Some(page) = req.pdf_page {
+        ReadLocation::PdfPage {
+            pdf: load_path.to_path_buf(),
+            page,
+        }
+    } else {
+        ReadLocation::File(load_path.to_path_buf())
+    };
+    ResolvedRead {
+        location,
+        folder_selection_proof,
+        preloaded_zip_bytes,
+        child_selection: cached_pinned_folder_thumb
+            .as_ref()
+            .map(|cached| CachedChildSelection {
+                container: cached.row_container.clone(),
+                source_path: cached.source_path.clone(),
+                pin: cached.selected_pin.clone(),
+            }),
+        cached_child: cached_pinned_folder_thumb,
+        effective_stamp: (req.mtime, req.file_size),
+        needs_heavy_io,
+    }
 }
 
 #[derive(Clone, Default)]
@@ -2619,34 +2917,12 @@ pub fn process_load_request(
         }
     };
 
-    let resolved_request = match &req.pdf_stamp_policy {
-        PdfStampPolicy::ResolveInWorker => {
-            match crate::pdf_loader::resolve_read_target(&req.path) {
-                Ok(read) => {
-                    let Some(stamped) = stamp_resolved_pdf_request(req, &read) else {
-                        fallback_or_fail();
-                        return;
-                    };
-                    Some((stamped, read))
-                }
-                Err(_) => {
-                    fallback_or_fail();
-                    return;
-                }
-            }
+    let resolved_request = match prepare_load_request_stamp(req) {
+        Ok(prepared) => prepared,
+        Err(()) => {
+            fallback_or_fail();
+            return;
         }
-        PdfStampPolicy::Resolved(read) => {
-            if read
-                .stamp
-                .generation_catalog_pair()
-                .is_some_and(|stamp| (req.mtime, req.file_size) != stamp)
-            {
-                fallback_or_fail();
-                return;
-            }
-            Some((req.clone(), read.clone()))
-        }
-        PdfStampPolicy::CallerFileAttributes => None,
     };
     let epub_read = resolved_request.as_ref().map(|(_, read)| read);
     let req = resolved_request
@@ -2863,240 +3139,38 @@ pub fn process_load_request(
         return;
     }
 
-    if req.folder_thumb_provenance == Some(crate::catalog::FolderThumbProvenance::Seeded)
-        && req.resolve_override.is_none()
-        && req.zip_entry.is_none()
-        && req.pdf_page.is_none()
-    {
-        // A missing video-frame seed has no source decoder. Never fall through
-        // to folder auto-selection under its released pinned key.
-        send_thumb_failed(req, tx, gen_done);
-        return;
-    }
-
-    // キャッシュミス or SourceOnly: フルデコード (+ 必要なら保存)
-    // load_one_cached は Source origin を送信する
-
-    // 重い I/O (Folder / ZipFile / ConvertibleArchive / ZipDir) は専用 I/O ワーカーキューで処理されるため、
-    // セマフォは不要。I/O ワーカー数 (1-2) で自然に同時実行数が制限される。
-    //
-    // pin 解決時 (`resolve_override` Some) は **prefix 判定をスキップ**し、
-    // 明示された strategy で dispatch する。pin の cache key は親側の prefix
-    // (folderthumb / zipthumb / pdfthumb) を保つので、prefix 判定だけだと
-    // 「ZIP 内画像を親のフォルダ thumb として scan しようとして失敗」のような
-    // ミスマッチが起きる。
-    let is_folder_thumb = match req.resolve_override {
-        Some(ResolveStrategy::FolderRepresentative) => true,
-        Some(_) => false,
-        None if req.zip_entry.is_none() && req.pdf_page.is_none() => req
-            .cache_key_override
-            .as_deref()
-            .is_some_and(|k| k.starts_with(CACHE_KEY_FOLDER)),
-        None => false,
-    };
-    let is_zip_thumb = match req.resolve_override {
-        Some(ResolveStrategy::ZipFirstImage) => true,
-        Some(_) => false,
-        None if req.zip_entry.is_none() && req.pdf_page.is_none() => req
-            .cache_key_override
-            .as_deref()
-            .is_some_and(|k| k.starts_with(CACHE_KEY_ZIP)),
-        None => false,
-    };
-    let is_zip_dir_thumb = matches!(
-        req.resolve_override,
-        Some(ResolveStrategy::ZipDirRepresentative)
-    );
-    let needs_heavy_io = is_folder_thumb || is_zip_thumb || is_zip_dir_thumb;
-
-    // フォルダサムネイル: フォルダ内の画像を探して代表画像のパスに差し替える。
-    // pin-aware: 再帰中に見つけたサブフォルダに pin があれば cascade 解決して
-    // leaf 画像、またはその子用に既に生成済みの pin WebP を採用する。
-    let (resolved_folder_image, cached_pinned_folder_thumb, folder_selection_proof) =
-        if is_folder_thumb {
-            let t_resolve = std::time::Instant::now();
-            let (resolution, proof) = select_folder_thumb_image_with_policy(
-                &req.path,
-                req.folder_thumb_sort
-                    .unwrap_or(crate::settings::SortOrder::Numeric),
-                req.folder_thumb_depth,
-                pin_db,
-                &crate::catalog::default_cache_dir(),
-                cancel,
-                &req.file_type_visibility,
+    let resolved = resolve_read_after_cache_miss(req, pin_db, cancel);
+    let (load_path, zip_entry_ref) = match &resolved.location {
+        ReadLocation::File(path) => (path.as_path(), None),
+        ReadLocation::ArchiveEntry { archive, entry } => (archive.as_path(), Some(entry.as_str())),
+        ReadLocation::PdfPage { pdf, .. } => (pdf.as_path(), None),
+        ReadLocation::ChildCached => (req.path.as_path(), None),
+        ReadLocation::Unreadable { cancelled } => {
+            let _ = tx.send(
+                ThumbMsg::from_legacy_parts(
+                    req.idx,
+                    None,
+                    ThumbLoadOrigin::SourceIntrinsic,
+                    false,
+                    None,
+                    None,
+                    None,
+                    *cancelled,
+                    false,
+                    req.input_seq,
+                    req.items_gen,
+                )
+                .with_request_id(req.request_id),
             );
-            let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
-            if resolve_ms > 10.0 {
-                crate::logger::log(format!(
-                    "    idx={:>4} folder_resolve={resolve_ms:>6.1}ms  {}",
-                    req.idx,
-                    req.path.display(),
-                ));
-            }
-            match resolution {
-                Some(FolderThumbResolution::Image(path)) => (Some(path), None, proof),
-                Some(FolderThumbResolution::CachedPinned(cached)) => (None, Some(cached), proof),
-                None => {
-                    let _ = tx.send(
-                        ThumbMsg::from_legacy_parts(
-                            req.idx,
-                            None,
-                            ThumbLoadOrigin::SourceIntrinsic,
-                            false,
-                            None,
-                            None,
-                            None,
-                            cancel.is_some_and(|token| token.load(Ordering::Relaxed)),
-                            false,
-                            req.input_seq,
-                            req.items_gen,
-                        )
-                        .with_request_id(req.request_id),
-                    );
-                    gen_done.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-            }
-        } else {
-            (None, None, None)
-        };
-    let load_path: &Path = resolved_folder_image.as_deref().unwrap_or(&req.path);
-
-    // ZipFile (フォルダ一覧用サムネイル) の場合、UI スレッドでの ZIP I/O を避けるため
-    // zip_entry が None のまま渡される。ワーカー側で遅延解決する。
-    //
-    // ネットワークドライブでは ZIP の open (セントラルディレクトリ読み取り) が高コスト
-    // なため、first_image_entry + read_entry_bytes の 2 回 open を
-    // read_first_image_bytes の 1 回 open に統合する。
-    let resolved_zip_entry: Option<String>;
-    let preloaded_zip_bytes: Option<Vec<u8>>;
-    let zip_entry_ref: Option<&str> = if req.zip_entry.is_some() {
-        preloaded_zip_bytes = None;
-        req.zip_entry.as_deref()
-    } else if is_zip_dir_thumb {
-        let t_zip = std::time::Instant::now();
-        let name = req.zip_dir_prefix.as_deref().and_then(|prefix| {
-            let enumeration =
-                crate::zip_loader::enumerate_image_entries_detailed(&req.path).ok()?;
-            // CP932 名 ZIP のリリース済み per-page キー移行 (worker スレッド)。
-            // フォルダ一覧のサムネ生成段階で済ませると、ZIP を開く前にピン/★ が直る。
-            crate::zip_key_migration::migrate_if_needed(&req.path, &enumeration.legacy_renames);
-            let entries = enumeration.entries;
-            let tree = crate::zip_tree::ZipTree::build(req.path.clone(), entries)
-                .project(&req.file_type_visibility);
-            tree.representative_for_prefix_str(
-                prefix,
-                req.folder_thumb_sort
-                    .unwrap_or(crate::settings::SortOrder::Numeric),
-            )
-            .map(|e| e.entry_name.clone())
-        });
-        let zip_ms = t_zip.elapsed().as_secs_f64() * 1000.0;
-        // ZipDir 代表解決は enumerate_image_entries (ZIP セントラルディレクトリ読み = 重 I/O) +
-        // ツリー構築を伴うことがあるため heavy_io_queue 側に振る。所要は regressions を
-        // 追えるよう analyze_perf.py で集計できるイベントとして残す。
-        if crate::perf::is_enabled() {
-            crate::perf::event(
-                "thumb",
-                "zipdir_resolve",
-                None,
-                req.input_seq,
-                &[
-                    ("idx", serde_json::Value::from(req.idx)),
-                    ("ms", serde_json::Value::from(zip_ms)),
-                    ("resolved", serde_json::Value::from(name.is_some())),
-                ],
-            );
+            gen_done.fetch_add(1, Ordering::Relaxed);
+            return;
         }
-        match name {
-            Some(name) => {
-                crate::logger::log(format!(
-                    "    idx={:>4} zipdir_resolve={zip_ms:>6.1}ms  {}",
-                    req.idx,
-                    req.path.display(),
-                ));
-                resolved_zip_entry = Some(name);
-                preloaded_zip_bytes = None;
-                resolved_zip_entry.as_deref()
-            }
-            None => {
-                let _ = tx.send(
-                    ThumbMsg::from_legacy_parts(
-                        req.idx,
-                        None,
-                        ThumbLoadOrigin::SourceIntrinsic,
-                        false,
-                        None,
-                        None,
-                        None,
-                        false,
-                        false,
-                        req.input_seq,
-                        req.items_gen,
-                    )
-                    .with_request_id(req.request_id),
-                );
-                gen_done.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        }
-    } else if is_zip_thumb {
-        // cache_key_override あり + pdf_page なし + フォルダでない = ZipFile サムネイル
-        // ZIP を 1 回だけ開いてエントリ名 + バイト列を同時取得
-        let t_zip = std::time::Instant::now();
-        let first = if req.file_type_visibility.is_all_visible() {
-            crate::zip_loader::read_first_image_bytes(&req.path)
-        } else {
-            crate::zip_loader::first_visible_image_entry(
-                &req.path,
-                cancel.map(|token| token.as_ref()),
-                &req.file_type_visibility,
-            )
-            .and_then(|name| {
-                crate::zip_loader::read_entry_bytes(&req.path, &name)
-                    .ok()
-                    .map(|bytes| (name, bytes))
-            })
-        };
-        match first {
-            Some((name, bytes)) => {
-                let zip_ms = t_zip.elapsed().as_secs_f64() * 1000.0;
-                crate::logger::log(format!(
-                    "    idx={:>4} zip_resolve={zip_ms:>6.1}ms  ({} bytes)  {}",
-                    req.idx,
-                    bytes.len(),
-                    req.path.display(),
-                ));
-                resolved_zip_entry = Some(name);
-                preloaded_zip_bytes = Some(bytes);
-                resolved_zip_entry.as_deref()
-            }
-            None => {
-                // ZIP 内に画像が無い場合は失敗として通知
-                let _ = tx.send(
-                    ThumbMsg::from_legacy_parts(
-                        req.idx,
-                        None,
-                        ThumbLoadOrigin::SourceIntrinsic,
-                        false,
-                        None,
-                        None,
-                        None,
-                        false,
-                        false,
-                        req.input_seq,
-                        req.items_gen,
-                    )
-                    .with_request_id(req.request_id),
-                );
-                gen_done.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        }
-    } else {
-        preloaded_zip_bytes = None;
-        None
     };
+    debug_assert_eq!(resolved.effective_stamp, (req.mtime, req.file_size));
+    let needs_heavy_io = resolved.needs_heavy_io;
+    let folder_selection_proof = resolved.folder_selection_proof;
+    let cached_pinned_folder_thumb = resolved.cached_child;
+    let preloaded_zip_bytes = resolved.preloaded_zip_bytes;
 
     // 重い I/O (ZIP/フォルダ) 完了後の stale チェック:
     // resolve に数秒かかった場合、スクロールで keep_range 外になっている可能性がある。
@@ -4033,6 +4107,26 @@ struct CachedPinnedFolderThumb {
     source_mtime: i64,
     source_file_size: i64,
     cache_key: String,
+    selected_pin: Option<SelectedChildPin>,
+    automatic_fallback: bool,
+    row_container: std::path::PathBuf,
+}
+
+/// The original selection remains authoritative even when the catalog winner is
+/// the leaf PDF/archive rather than the folder that owns its fixed cover.
+#[derive(Clone, Debug)]
+pub(crate) struct SelectedChildPin {
+    pub(crate) container: std::path::PathBuf,
+    pub(crate) target: crate::folder_thumb_pins::ResolvedPinTarget,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CachedChildSelection {
+    /// Original child tile, before an automatic row's proof is flattened to
+    /// its leaf source. Its own selection preserves further child pins.
+    pub(crate) container: std::path::PathBuf,
+    pub(crate) source_path: std::path::PathBuf,
+    pub(crate) pin: Option<SelectedChildPin>,
 }
 
 #[cfg(test)]
@@ -4151,6 +4245,7 @@ impl FolderResolveContext<'_> {
         expected_mtime: i64,
         expected_size: i64,
     ) -> Option<CachedPinnedFolderThumb> {
+        let row_container = source_path.to_owned();
         self.ensure_catalog(directory);
         if self.cancelled() {
             return None;
@@ -4249,6 +4344,10 @@ impl FolderResolveContext<'_> {
             source_mtime,
             source_file_size,
             cache_key: key.to_owned(),
+            selected_pin: None,
+            automatic_fallback: entry.folder_provenance
+                == Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            row_container,
         })
     }
 }
@@ -4415,7 +4514,16 @@ fn load_cached_pinned_folder_thumb(
         };
     let cache_key = pinned_folder_row_key(&base_key, &resolved.source_id, generation);
     let cache_key = representative_cache_key_for_policy(&cache_key, context.policy);
-    context.cached_candidate(parent_folder, &cache_key, &resolved.abs_path, mtime, size)
+    let mut cached =
+        context.cached_candidate(parent_folder, &cache_key, &resolved.abs_path, mtime, size)?;
+    cached.row_container = child_folder.to_path_buf();
+    if !cached.automatic_fallback {
+        cached.selected_pin = Some(SelectedChildPin {
+            container: child_folder.to_path_buf(),
+            target: resolved.clone(),
+        });
+    }
+    Some(cached)
 }
 
 /// フォルダ内をスキャンして代表画像、または再利用可能な pin WebP を返す。
@@ -4845,9 +4953,15 @@ fn resolve_folder_thumb_image_inner(
         } else if let (Some(key), Some((mtime, size))) =
             (candidate.cache_key.as_deref(), candidate.expected_stamp)
         {
-            if let Some(cached) =
+            if let Some(mut cached) =
                 context.cached_candidate(folder, key, &candidate.path, mtime, size)
             {
+                if !cached.automatic_fallback {
+                    cached.selected_pin = candidate.pin.clone().map(|target| SelectedChildPin {
+                        container: candidate.path.clone(),
+                        target,
+                    });
+                }
                 return Some(FolderThumbResolution::CachedPinned(cached));
             }
         }
@@ -8449,6 +8563,29 @@ mod tests {
         );
         assert_eq!(entry.folder_provenance, Some(P::AutoSelected));
         assert_eq!(entry.selection_proof.as_ref().unwrap().winner.path, winner);
+        let cache_dir = tmp.path().join("cache");
+        let mut context = FolderResolveContext {
+            cache_dir: &cache_dir,
+            policy: &policy,
+            pin_db: None,
+            cancel: None,
+            catalogs: Default::default(),
+            dependencies: Vec::new(),
+            pin_store: None,
+        };
+        let child = load_cached_pinned_folder_thumb(
+            &mut context,
+            tmp.path(),
+            &root,
+            SortOrder::Numeric,
+            3,
+            &resolved,
+        )
+        .unwrap();
+        assert!(child.automatic_fallback);
+        assert!(child.selected_pin.is_none());
+        assert_eq!(child.row_container, root);
+        assert_eq!(child.source_path, winner);
         assert!(catalog.load_one(&key).unwrap().is_none());
         request.cache_key_override = Some(scoped_key);
         // Pure proof validation must not enumerate the archive. Removing the winning image,
@@ -9714,6 +9851,357 @@ mod tests {
         );
 
         assert_eq!(resolved_image_path(picked), Some(expected));
+    }
+
+    #[test]
+    fn extracted_read_resolution_keeps_explicit_leaf_dispatch_and_stamp() {
+        for path in [
+            "image.png",
+            "book.zip",
+            "book.rar",
+            "converted.zip",
+            "book.pdf",
+        ] {
+            for (entry, page) in [
+                (None, None),
+                (Some("nested/cover.png"), None),
+                (None, Some(2)),
+            ] {
+                let req = LoadRequest {
+                    path: PathBuf::from(path),
+                    zip_entry: entry.map(str::to_owned),
+                    pdf_page: page,
+                    mtime: 17,
+                    file_size: 4096,
+                    // A pin retains the parent's key, so explicit leaves must win over it.
+                    cache_key_override: entry
+                        .or(page.map(|_| ""))
+                        .map(|_| "folderthumb:parent#pin:leaf".into()),
+                    ..Default::default()
+                };
+                assert!(prepare_load_request_stamp(&req).unwrap().is_none());
+                let resolved = resolve_read_after_cache_miss(&req, None, None);
+                match (&resolved.location, entry, page) {
+                    (ReadLocation::File(actual), None, None) => assert_eq!(actual, &req.path),
+                    (
+                        ReadLocation::ArchiveEntry {
+                            archive,
+                            entry: actual,
+                        },
+                        Some(expected),
+                        None,
+                    ) => {
+                        assert_eq!(archive, &req.path);
+                        assert_eq!(actual, expected);
+                    }
+                    (ReadLocation::PdfPage { pdf, page: actual }, None, Some(expected)) => {
+                        assert_eq!(pdf, &req.path);
+                        assert_eq!(*actual, expected);
+                    }
+                    _ => panic!("changed leaf dispatch: {path}"),
+                }
+                assert_eq!(resolved.effective_stamp, (17, 4096));
+                assert!(resolved.preloaded_zip_bytes.is_none());
+                assert!(resolved.folder_selection_proof.is_none());
+            }
+        }
+        let req = LoadRequest {
+            path: PathBuf::from("book.epub"),
+            pdf_page: Some(2),
+            pdf_stamp_policy: PdfStampPolicy::Resolved(
+                crate::pdf_loader::generation_target_for_test(Path::new("book.epub"), 17, 4096),
+            ),
+            mtime: 17,
+            file_size: 4096,
+            ..Default::default()
+        };
+        let (prepared, read) = prepare_load_request_stamp(&req).unwrap().unwrap();
+        assert_eq!(read.stamp.generation_catalog_pair(), Some((17, 4096)));
+        assert!(matches!(
+            resolve_read_after_cache_miss(&prepared, None, None).location,
+            ReadLocation::PdfPage { page: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn extracted_read_resolution_preserves_first_zip_bytes_and_saved_identity() {
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("book.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(12, 8)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = png.into_inner();
+        for name in ["nested/cover.png", "002.png"] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&bytes).unwrap();
+        }
+        zip.finish().unwrap();
+        let mut req = LoadRequest {
+            path: path.clone(),
+            cache_key_override: Some("zipthumb:book.zip".into()),
+            mtime: 71,
+            file_size: 92,
+            force_cache: true,
+            ..Default::default()
+        };
+        let resolved = resolve_read_after_cache_miss(&req, None, None);
+        assert!(
+            matches!(&resolved.location, ReadLocation::ArchiveEntry { archive, entry }
+            if archive == &path && entry == "nested/cover.png")
+        );
+        assert_eq!(
+            resolved.preloaded_zip_bytes.as_deref(),
+            Some(bytes.as_slice())
+        );
+        let catalog = Arc::new(
+            crate::catalog::CatalogDb::open(&tmp.path().join("cache"), tmp.path()).unwrap(),
+        );
+        let (messages, done) = collect_protocol_messages(&mut req, Some(&catalog), None, 1);
+        assert_eq!(done, 1);
+        assert!(messages.iter().any(|message| message.is_finalized()));
+        let row = catalog.load_one("zipthumb:book.zip").unwrap().unwrap();
+        assert_eq!(
+            (row.mtime, row.file_size, row.source_dims),
+            (71, 92, Some((12, 8)))
+        );
+
+        req.resolve_override = Some(ResolveStrategy::ZipDirRepresentative);
+        req.zip_dir_prefix = Some("nested/".into());
+        let resolved = resolve_read_after_cache_miss(&req, None, None);
+        assert!(
+            matches!(&resolved.location, ReadLocation::ArchiveEntry { entry, .. } if entry == "nested/cover.png")
+        );
+        assert!(resolved.preloaded_zip_bytes.is_none());
+    }
+
+    #[test]
+    fn extracted_read_resolution_preserves_folder_winner_proof_for_save() {
+        let tmp = TempDir::new().unwrap();
+        let image_path = tmp.path().join("00-cover.png");
+        image::DynamicImage::new_rgb8(12, 8)
+            .save(&image_path)
+            .unwrap();
+        let mut req = LoadRequest {
+            path: tmp.path().to_path_buf(),
+            cache_key_override: Some("folderthumb:test".into()),
+            folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            mtime: 71,
+            file_size: 0,
+            force_cache: true,
+            ..Default::default()
+        };
+        let resolved = resolve_read_after_cache_miss(&req, None, None);
+        assert!(matches!(&resolved.location, ReadLocation::File(path) if path == &image_path));
+        let proof = resolved.folder_selection_proof.unwrap();
+        assert_eq!(proof.winner.path, image_path);
+        let catalog = Arc::new(
+            crate::catalog::CatalogDb::open(&tmp.path().join("cache"), tmp.path()).unwrap(),
+        );
+        let (_, done) = collect_protocol_messages(&mut req, Some(&catalog), None, 1);
+        assert_eq!(done, 1);
+        let row = catalog.load_one("folderthumb:test").unwrap().unwrap();
+        assert_eq!(row.selection_proof.as_ref(), Some(&proof));
+        assert_eq!(
+            (row.mtime, row.file_size, row.source_dims),
+            (71, 0, Some((12, 8)))
+        );
+    }
+
+    #[test]
+    fn extracted_read_resolution_reads_direct_rar_and_converted_zip_and_saves_outer_stamp() {
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let rar = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/archives/rar-multipart-filename-regression/○×△□ Vol.2.rar");
+        let (name, bytes) = crate::rar_loader::read_first_image_bytes(&rar).unwrap();
+        assert_eq!(name, "test_no_metadata.png");
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        let converted = tmp.path().join("converted.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&converted).unwrap());
+        zip.start_file(
+            "normalized/cover.png",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(&bytes).unwrap();
+        zip.finish().unwrap();
+        for (path, entry) in [(&rar, name.as_str()), (&converted, "normalized/cover.png")] {
+            let mut req = LoadRequest {
+                path: path.clone(),
+                resolve_override: Some(ResolveStrategy::ZipFirstImage),
+                cache_key_override: Some("archivethumb:rar:source.rar".into()),
+                mtime: 17,
+                file_size: 4096,
+                force_cache: true,
+                ..Default::default()
+            };
+            let resolved = resolve_read_after_cache_miss(&req, None, None);
+            assert!(
+                matches!(&resolved.location, ReadLocation::ArchiveEntry { archive, entry: actual }
+                if archive == path && actual == entry)
+            );
+            assert_eq!(
+                resolved.preloaded_zip_bytes.as_deref(),
+                Some(bytes.as_slice())
+            );
+            let catalog = Arc::new(
+                crate::catalog::CatalogDb::open(
+                    &tmp.path().join(entry.replace('/', "-")),
+                    tmp.path(),
+                )
+                .unwrap(),
+            );
+            let (_, done) = collect_protocol_messages(&mut req, Some(&catalog), None, 1);
+            assert_eq!(done, 1);
+            let row = catalog
+                .load_one("archivethumb:rar:source.rar")
+                .unwrap()
+                .unwrap();
+            assert_eq!((row.mtime, row.file_size), (17, 4096));
+            assert_eq!(row.source_dims, Some((decoded.width(), decoded.height())));
+        }
+    }
+
+    #[test]
+    fn extracted_read_resolution_keeps_child_webp_and_proof_when_mirroring() {
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let tmp = TempDir::new().unwrap();
+        let mut fixture = prepare_pdf_pin_fixture(&tmp, 3);
+        fixture.cache_dir = crate::catalog::default_cache_dir();
+        let webp = fixture_webp();
+        let child_key = save_pdf_pin_webp(&fixture, 3, &webp);
+        let mut req = LoadRequest {
+            path: fixture.root.clone(),
+            cache_key_override: Some("folderthumb:parent".into()),
+            folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            folder_thumb_depth: 3,
+            mtime: 71,
+            force_cache: true,
+            ..Default::default()
+        };
+        let resolved = resolve_read_after_cache_miss(&req, Some(&fixture.pin_db), None);
+        assert!(matches!(resolved.location, ReadLocation::ChildCached));
+        let selection = resolved.child_selection.as_ref().unwrap();
+        assert_eq!(selection.container, fixture.child);
+        assert_eq!(selection.source_path, fixture.pdf);
+        let selected_pin = selection.pin.as_ref().unwrap();
+        assert_eq!(selected_pin.container, fixture.child);
+        assert_eq!(selected_pin.target.abs_path, fixture.pdf);
+        assert_eq!(selected_pin.target.kind, fixture.resolved.kind);
+        let cached = resolved.cached_child.as_ref().unwrap();
+        assert_eq!(cached.cache_key, child_key);
+        assert_eq!(cached.webp_data, webp);
+        let proof = resolved.folder_selection_proof.as_ref().unwrap();
+        assert_eq!(proof.winner.path, fixture.pdf);
+        let catalog = Arc::new(
+            crate::catalog::CatalogDb::open(&tmp.path().join("parent-cache"), &fixture.root)
+                .unwrap(),
+        );
+        let (tx, rx) = mpsc::channel();
+        let map = std::sync::RwLock::new(std::collections::HashMap::new());
+        let done = Arc::new(AtomicUsize::new(0));
+        process_load_request(
+            &mut req,
+            &map,
+            &tx,
+            Some(&catalog),
+            512,
+            75,
+            512,
+            make_decision(CachePolicy::Off, 0, 0),
+            &done,
+            &Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+            None,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(1)),
+            None,
+            Some(&fixture.pin_db),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(done.load(Ordering::Relaxed), 1);
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert_eq!(messages.len(), 1);
+        let row = catalog.load_one("folderthumb:parent").unwrap().unwrap();
+        assert_eq!(row.jpeg_data, webp);
+        assert_eq!(row.source_dims, cached.source_dims);
+        assert_eq!(row.layout_dims, cached.layout_dims);
+        assert_eq!(row.selection_proof.as_ref(), Some(proof));
+    }
+
+    #[test]
+    fn extracted_pin_strategies_keep_parent_key_without_using_its_prefix_for_dispatch() {
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let leaf = tmp.path().join("cover.png");
+        std::fs::write(&leaf, b"selection only").unwrap();
+        let archive = tmp.path().join("child.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        for name in ["first.png", "nested/cover.png"] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"selection only").unwrap();
+        }
+        zip.finish().unwrap();
+        for strategy in [
+            ResolveStrategy::DirectImage,
+            ResolveStrategy::FolderRepresentative,
+            ResolveStrategy::ZipFirstImage,
+            ResolveStrategy::ZipDirRepresentative,
+        ] {
+            let path = match strategy {
+                ResolveStrategy::DirectImage => leaf.clone(),
+                ResolveStrategy::FolderRepresentative => tmp.path().to_path_buf(),
+                _ => archive.clone(),
+            };
+            let req = LoadRequest {
+                path,
+                resolve_override: Some(strategy),
+                zip_dir_prefix: matches!(strategy, ResolveStrategy::ZipDirRepresentative)
+                    .then(|| "nested/".into()),
+                cache_key_override: Some("folderthumb:parent#pin:leaf".into()),
+                ..Default::default()
+            };
+            let resolved = resolve_read_after_cache_miss(&req, None, None);
+            match strategy {
+                ResolveStrategy::DirectImage | ResolveStrategy::FolderRepresentative => {
+                    assert!(
+                        matches!(&resolved.location, ReadLocation::File(path) if path == &leaf)
+                    );
+                }
+                ResolveStrategy::ZipFirstImage => {
+                    assert!(
+                        matches!(&resolved.location, ReadLocation::ArchiveEntry { archive: path, entry }
+                        if path == &archive && entry == "first.png")
+                    );
+                    assert_eq!(
+                        resolved.preloaded_zip_bytes.as_deref(),
+                        Some(b"selection only".as_slice())
+                    );
+                }
+                ResolveStrategy::ZipDirRepresentative => {
+                    assert!(
+                        matches!(&resolved.location, ReadLocation::ArchiveEntry { archive: path, entry }
+                        if path == &archive && entry == "nested/cover.png")
+                    );
+                }
+            }
+        }
+        let seeded = LoadRequest {
+            path: tmp.path().to_path_buf(),
+            folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::Seeded),
+            cache_key_override: Some("folderthumb:parent#pin:video".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            resolve_read_after_cache_miss(&seeded, None, None).location,
+            ReadLocation::Unreadable { cancelled: false }
+        ));
     }
 
     #[test]

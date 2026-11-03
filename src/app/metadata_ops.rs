@@ -2049,6 +2049,7 @@ struct MetadataSearchItemResult {
 struct MetadataSearchPass2<'a> {
     tokens: &'a [crate::search_query::Token],
     xmp_snapshot: &'a std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
+    caption_texts: &'a std::collections::HashMap<usize, String>,
     mode: crate::search_query::MatchMode,
     cancel: &'a AtomicBool,
     progress: Option<&'a SearchProgressShared>,
@@ -2072,7 +2073,7 @@ impl MetadataSearchPass2<'_> {
             GridItem::Video(path) => (path, false),
             _ => return None,
         };
-        if !self.fallback_contributes {
+        if !self.fallback_contributes && !self.caption_texts.contains_key(&idx) {
             mark_ctrl_f_progress(self.progress, false);
             return Some(MetadataSearchItemResult {
                 idx,
@@ -2091,7 +2092,8 @@ impl MetadataSearchPass2<'_> {
         let mut bytes_read = 0_u64;
         let mut read_any = false;
         let mut unmeasured_video_read = false;
-        let (meta_text, meta_origin) = if is_image && self.use_png && is_ai_metadata_path(path) {
+        let (mut meta_text, meta_origin) = if is_image && self.use_png && is_ai_metadata_path(path)
+        {
             let read = crate::png_metadata::build_searchable_from_path_counted(path);
             bytes_read = bytes_read.saturating_add(read.bytes_read);
             read_any |= read.bytes_read > 0;
@@ -2099,6 +2101,10 @@ impl MetadataSearchPass2<'_> {
         } else {
             (String::new(), None)
         };
+        if let Some(caption) = self.caption_texts.get(&idx) {
+            meta_text.push('\n');
+            meta_text.push_str(caption);
+        }
         // 1 項目のうちに最大 4 回 file を読むので、読み終えるたびに取消を見る。
         // これが無いと、取り消した検索の worker が残りの読みを最後まで続け、
         // 次の検索が新しい pool を建てるたびに並列読みが積み上がる。
@@ -2226,6 +2232,79 @@ pub(super) fn run_metadata_search(
     cancel: &AtomicBool,
     progress: Option<&SearchProgressShared>,
 ) -> SearchThreadResult {
+    run_metadata_search_at(
+        tokens,
+        items,
+        eligible,
+        xmp_snapshot,
+        pdf_passwords,
+        target,
+        mode,
+        cancel,
+        progress,
+        &crate::ai_caption_db::CaptionDb::db_path(),
+    )
+}
+
+/// The connection and all caption reads stay on the current-folder search worker.
+fn metadata_search_captions(
+    items: &[GridItem],
+    eligible: Option<&[bool]>,
+    caption_db_path: &Path,
+    cancel: &AtomicBool,
+) -> std::collections::HashMap<usize, String> {
+    let mut captions = std::collections::HashMap::new();
+    let db = match crate::ai_caption_db::CaptionDb::open_read_only(caption_db_path) {
+        Ok(Some(db)) => db,
+        Ok(None) => return captions,
+        Err(error) => {
+            crate::logger::log(format!("metadata search: failed to open captions: {error}"));
+            return captions;
+        }
+    };
+    for (idx, item) in items.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        if eligible.is_some_and(|flags| !flags.get(idx).copied().unwrap_or(false)) {
+            continue;
+        }
+        let path = match item {
+            GridItem::Image(path)
+            | GridItem::Folder(path)
+            | GridItem::ZipFile(path)
+            | GridItem::PdfFile(path)
+            | GridItem::ConvertibleArchive { path, .. } => path,
+            _ => continue,
+        };
+        match db.get(&crate::adjustment_db::normalize_path(path)) {
+            Ok(Some(row)) => {
+                let text = crate::ingest_text::caption_search_text(&row);
+                if !text.is_empty() {
+                    captions.insert(idx, text);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                crate::logger::log(format!("metadata search: failed to read caption: {error}"));
+            }
+        }
+    }
+    captions
+}
+
+fn run_metadata_search_at(
+    tokens: &[crate::search_query::Token],
+    items: &[GridItem],
+    eligible: Option<&[bool]>,
+    xmp_snapshot: &std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
+    pdf_passwords: &crate::pdf_passwords::PdfPasswordStore,
+    target: &crate::fts_index::SearchTarget,
+    mode: crate::search_query::MatchMode,
+    cancel: &AtomicBool,
+    progress: Option<&SearchProgressShared>,
+    caption_db_path: &Path,
+) -> SearchThreadResult {
     // Ctrl+F (現在地フィルタ) はインデックスを使わず、表示中アイテムを on-demand に
     // 判定する (docs/search-container-item-redesign.md §4.1)。構造アイテム
     // (Folder / ZipFile / PdfFile / ZipImage) も「持っている次元」で一貫して
@@ -2247,15 +2326,20 @@ pub(super) fn run_metadata_search(
     // で共有されるので、ここで対応しないと「サイドカー」絞り込みが無反応・「すべて」が
     // サイドカーを取りこぼす。
     let use_sidecar = target.includes(crate::fts_index::SourceKind::Sidecar);
+    let use_caption = target.includes(crate::fts_index::SourceKind::AiCaption);
+    let caption_texts = if use_caption && !cancel.load(Ordering::Relaxed) {
+        metadata_search_captions(items, eligible, caption_db_path, cancel)
+    } else {
+        std::collections::HashMap::new()
+    };
     // Image / Video の fallback 経路は name/png/exif/xmp/video_meta/sidecar のいずれかが
-    // 対象でないと結果が常に空になる。PdfMeta-only 等で無駄な per-file 走査を避ける。
+    // 対象外なら、読み込んだ説明文だけで評価できる項目以外の per-file 走査を避ける。
     let fallback_contributes =
         use_name || use_png || use_exif || use_xmp || use_video_meta || use_sidecar;
 
     // Pass 1: 構造アイテム + ZIP 内画像 (名前照合中心、PDF のみ document info I/O)。
     // 構造アイテムも一貫して絞り込む (§4.1): 名前がマッチしないものは非表示にする。
-    // 検索対象がファイル名次元を含まない (EXIF / タグ単独指定) なら構造アイテムは
-    // 全件非表示になる ("タグで絞ったらタグを持つアイテムだけ残る" = 正しい挙動)。
+    // 本は保存済みの説明文も持つ。EXIF 等、持たない次元だけの指定なら非表示になる。
     for (idx, item) in items.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             break;
@@ -2271,8 +2355,16 @@ pub(super) fn run_metadata_search(
             | GridItem::Stack { .. } => {
                 // フォルダ / ZIP / 変換対象アーカイブ / ネスト ZIP 子コンテナ / スタック集約セル:
                 // ファイル名 (basename = ZipDir は最後のセグメント、Stack は prefix キー) で照合。
-                // これらの子/メンバーは現 items に含まれないので名前照合のみ (plan §3.6 MVP)。
-                if use_name && crate::search_query::matches_with_mode(tokens, &item.name(), mode) {
+                // 子/メンバーは読まず、本自身に保存された説明文だけを名前へ加える。
+                let name = item.name();
+                let hay = hay_of(
+                    caption_texts.get(&idx).map(String::as_str).unwrap_or(""),
+                    if use_name { &name } else { "" },
+                    None,
+                );
+                if (use_name || caption_texts.contains_key(&idx))
+                    && crate::search_query::matches_with_mode(tokens, &hay, mode)
+                {
                     matches.insert(idx);
                 }
                 true
@@ -2284,15 +2376,21 @@ pub(super) fn run_metadata_search(
                 true
             }
             GridItem::PdfFile(path) => {
+                let name = item.name();
+                let name_hay = hay_of(
+                    caption_texts.get(&idx).map(String::as_str).unwrap_or(""),
+                    if use_name { &name } else { "" },
+                    None,
+                );
                 // EPUB は変換済みでも内部タイトル・著者を検索しない。
-                // 元ファイル名だけを対象にし、PDF Info の worker 要求も出さない。
+                // 元ファイル名と保存済み説明文を対象にし、PDF Info の worker 要求は出さない。
                 if path
                     .extension()
                     .and_then(|extension| extension.to_str())
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
                 {
-                    if use_name
-                        && crate::search_query::matches_with_mode(tokens, &item.name(), mode)
+                    if (use_name || caption_texts.contains_key(&idx))
+                        && crate::search_query::matches_with_mode(tokens, &name_hay, mode)
                     {
                         matches.insert(idx);
                     }
@@ -2303,10 +2401,8 @@ pub(super) fn run_metadata_search(
                     // (2 つの hay を別々に matches すると "scan invoice" や
                     // "scan -draft" を取りこぼす — Codex P2)。まずファイル名だけで
                     // 部分判定し、結論が出れば document info の IPC を省く。
-                    let name = item.name();
-                    let name_hay: &str = if use_name { &name } else { "" };
                     if use_pdf_meta {
-                        match crate::search_query::decide_partial_with_mode(tokens, name_hay, mode)
+                        match crate::search_query::decide_partial_with_mode(tokens, &name_hay, mode)
                         {
                             crate::search_query::PartialResult::Decided(true) => {
                                 matches.insert(idx);
@@ -2320,16 +2416,16 @@ pub(super) fn run_metadata_search(
                                     crate::pdf_loader::get_document_info(path, password.as_deref())
                                         .map(|info| info.as_search_text())
                                         .unwrap_or_default();
-                                let hay = hay_of(&doc_text, name_hay, None);
+                                let hay = hay_of(&doc_text, &name_hay, None);
                                 if crate::search_query::matches_with_mode(tokens, &hay, mode) {
                                     matches.insert(idx);
                                 }
                             }
                         }
-                    } else if use_name
-                        && crate::search_query::matches_with_mode(tokens, name_hay, mode)
+                    } else if (use_name || caption_texts.contains_key(&idx))
+                        && crate::search_query::matches_with_mode(tokens, &name_hay, mode)
                     {
-                        // PDF メタが検索対象外 → ファイル名のみで照合。
+                        // PDF メタが検索対象外 → ファイル名と保存済み説明文で照合。
                         matches.insert(idx);
                     }
                 }
@@ -2384,6 +2480,7 @@ pub(super) fn run_metadata_search(
     let pass2 = MetadataSearchPass2 {
         tokens,
         xmp_snapshot,
+        caption_texts: &caption_texts,
         mode,
         cancel,
         progress,
@@ -2568,6 +2665,115 @@ pub(super) fn exif_hay(info: &crate::exif_reader::ExifInfo, skip_user_comment: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctrl_f_searches_ok_captions_for_images_and_books_with_combined_hay() {
+        use crate::fts_index::{SearchTarget, SourceKind};
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("ai_caption.db");
+        let db = crate::ai_caption_db::CaptionDb::open_at(&db_path).unwrap();
+        drop(db);
+        let items = [
+            GridItem::Image(temp.path().join("image.png")),
+            GridItem::Folder(temp.path().join("folder")),
+            GridItem::ZipFile(temp.path().join("archive.zip")),
+            GridItem::PdfFile(temp.path().join("document.pdf")),
+            GridItem::PdfFile(temp.path().join("book.epub")),
+            GridItem::ConvertibleArchive {
+                path: temp.path().join("converted.rar"),
+                format: crate::archive_converter::ArchiveFormat::Rar,
+            },
+            GridItem::Image(temp.path().join("failed.png")),
+            GridItem::ZipImage {
+                zip_path: temp.path().join("archive.zip"),
+                entry_name: "member.png".into(),
+            },
+            GridItem::Video(temp.path().join("video.mp4")),
+        ];
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        for item in &items {
+            let path = match item {
+                GridItem::Folder(path) => path.as_path(),
+                GridItem::ZipImage { entry_name, .. } => Path::new(entry_name),
+                _ => item.file_operation_path().unwrap(),
+            };
+            conn.execute(
+                "INSERT INTO captions (item_key, mtime_ms, size, model_id, prompt_version,
+                 lang, caption, visible_text, keywords, cover_ref, status, created_at)
+                 VALUES (?1, 0, 0, 'fixture', 1, 'ja', 'sunflower', 'PrintedWords',
+                         '[\"yellowpetals\"]', '', ?2, 0)",
+                rusqlite::params![
+                    crate::adjustment_db::normalize_path(path),
+                    if path.ends_with("failed.png") {
+                        "failed"
+                    } else {
+                        "ok"
+                    },
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let passwords = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let run = |query: &str, target: SearchTarget, eligible: Option<&[bool]>| {
+            let SearchThreadResult::Done { matches, .. } = run_metadata_search_at(
+                &crate::search_query::parse(query),
+                &items,
+                eligible,
+                &std::collections::HashMap::new(),
+                &passwords,
+                &target,
+                crate::search_query::MatchMode::And,
+                &AtomicBool::new(false),
+                None,
+                &db_path,
+            );
+            matches
+        };
+        let caption_only = || SearchTarget::Only(vec![SourceKind::AiCaption]);
+        let expected = (0..6).collect::<std::collections::HashSet<_>>();
+        for query in [
+            "sunflower",
+            "printedwords",
+            "yellowpetals",
+            "sunflower -absent",
+        ] {
+            assert_eq!(run(query, caption_only(), None), expected, "{query}");
+        }
+        assert!(run("sunflower -printedwords", caption_only(), None).is_empty());
+        assert!(
+            run(
+                "sunflower",
+                SearchTarget::Only(vec![SourceKind::Filename]),
+                None
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            run("image sunflower", SearchTarget::All, None),
+            [0].into_iter().collect()
+        );
+        assert_eq!(
+            run("document sunflower", SearchTarget::All, None),
+            [3].into_iter().collect()
+        );
+        assert_eq!(
+            run("book sunflower", SearchTarget::All, None),
+            [4].into_iter().collect()
+        );
+        assert_eq!(
+            run("sunflower", caption_only(), Some(&[false, true])),
+            [1].into_iter().collect()
+        );
+        assert!(
+            metadata_search_captions(&items, None, &db_path, &AtomicBool::new(true)).is_empty()
+        );
+        let absent = temp.path().join("absent/ai_caption.db");
+        assert!(
+            metadata_search_captions(&items, None, &absent, &AtomicBool::new(false)).is_empty()
+        );
+        assert!(!absent.parent().unwrap().exists());
+    }
 
     #[test]
     fn ctrl_f_keeps_short_terms_and_phrase_matching_without_global_length_policy() {

@@ -48,6 +48,7 @@ pub enum ContextMenuItemId {
     CutFiles,
     CopyFiles,
     OrganizeFiles,
+    CreateAiCaptions,
     ConvertImageFolderToZip,
     NewFolder,
     Paste,
@@ -83,6 +84,7 @@ impl ContextMenuItemId {
         Self::CutFiles,
         Self::CopyFiles,
         Self::OrganizeFiles,
+        Self::CreateAiCaptions,
         Self::ConvertImageFolderToZip,
         Self::NewFolder,
         Self::Paste,
@@ -118,6 +120,7 @@ impl ContextMenuItemId {
             Self::CutFiles => "CutFiles",
             Self::CopyFiles => "CopyFiles",
             Self::OrganizeFiles => "OrganizeFiles",
+            Self::CreateAiCaptions => "CreateAiCaptions",
             Self::ConvertImageFolderToZip => "ConvertImageFolderToZip",
             Self::NewFolder => "NewFolder",
             Self::Paste => "Paste",
@@ -168,6 +171,7 @@ impl ContextMenuItemId {
             Self::CutFiles => "切り取り",
             Self::CopyFiles => "コピー",
             Self::OrganizeFiles => "ファイル整理先…",
+            Self::CreateAiCaptions => "AI 説明文を作る",
             Self::ConvertImageFolderToZip => "ZIP に変換…",
             Self::NewFolder => "新しいフォルダ…",
             Self::Paste => "貼り付け",
@@ -207,6 +211,7 @@ impl ContextMenuItemId {
             MenuCommand::CutFiles => Self::CutFiles,
             MenuCommand::CopyFiles => Self::CopyFiles,
             MenuCommand::OrganizeFiles => Self::OrganizeFiles,
+            MenuCommand::CreateAiCaptions => Self::CreateAiCaptions,
             MenuCommand::ConvertImageFolderToZip => Self::ConvertImageFolderToZip,
             MenuCommand::CopyPath => Self::CopyPath,
             MenuCommand::CopyFileName => Self::CopyFileName,
@@ -720,6 +725,7 @@ pub enum MenuCommand {
     CutFiles,
     CopyFiles,
     OrganizeFiles,
+    CreateAiCaptions,
     ConvertImageFolderToZip,
     CopyPath,
     CopyFileName,
@@ -1259,6 +1265,13 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
             );
         }
 
+        if input.surface == ContextMenuSurface::Grid {
+            push_group(
+                &mut nodes,
+                [item(MenuCommand::CreateAiCaptions, "AI 説明文を作る")],
+            );
+        }
+
         push_group(
             &mut nodes,
             [item(
@@ -1378,6 +1391,13 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
                 MenuCommand::OrganizeFiles,
                 with_key("ファイル整理先…", input.shortcuts.organize.as_ref()),
             )],
+        );
+    }
+
+    if input.surface == ContextMenuSurface::Grid {
+        push_group(
+            &mut nodes,
+            [item(MenuCommand::CreateAiCaptions, "AI 説明文を作る")],
         );
     }
 
@@ -2030,6 +2050,7 @@ mod tests {
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
+                    "AI 説明文を作る",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2051,6 +2072,7 @@ mod tests {
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
+                    "AI 説明文を作る",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2067,6 +2089,7 @@ mod tests {
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
+                    "AI 説明文を作る",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2083,6 +2106,7 @@ mod tests {
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
+                    "AI 説明文を作る",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2096,6 +2120,7 @@ mod tests {
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
+                    "AI 説明文を作る",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2112,6 +2137,7 @@ mod tests {
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
+                    "AI 説明文を作る",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2128,6 +2154,7 @@ mod tests {
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
+                    "AI 説明文を作る",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2142,6 +2169,7 @@ mod tests {
                 ContextMenuItemKind::ZipImage,
                 &[
                     "ファイル整理先…",
+                    "AI 説明文を作る",
                     "パスをコピー",
                     "ファイル名をコピー",
                     "画像をクリップボードにコピー",
@@ -2159,6 +2187,7 @@ mod tests {
                 ContextMenuItemKind::PdfPage,
                 &[
                     "ファイル整理先…",
+                    "AI 説明文を作る",
                     "パスをコピー",
                     "ページ名をコピー",
                     "編集を反映した画像をコピー",
@@ -2175,6 +2204,7 @@ mod tests {
                 ContextMenuItemKind::Stack,
                 &[
                     "ファイル整理先…",
+                    "AI 説明文を作る",
                     "代表画像のパスをコピー",
                     "アプリケーションで開く…",
                     "外部ツールの設定…",
@@ -2182,11 +2212,11 @@ mod tests {
             ),
             (
                 ContextMenuItemKind::ZipDir,
-                &["ファイル整理先…", "パスをコピー"][..],
+                &["ファイル整理先…", "AI 説明文を作る", "パスをコピー"][..],
             ),
             (
                 ContextMenuItemKind::SearchContainer,
-                &["ファイル整理先…", "パスをコピー"][..],
+                &["ファイル整理先…", "AI 説明文を作る", "パスをコピー"][..],
             ),
         ];
         for (kind, expected) in cases {
@@ -2309,6 +2339,7 @@ mod tests {
                 "切り取り [5件] (Ctrl+X)",
                 "コピー [5件] (Ctrl+C)",
                 "ファイル整理先…",
+                "AI 説明文を作る",
                 "選択項目のパスをコピー [5件]",
                 "左に回転 (L)",
                 "右に回転 (R)",
@@ -2507,6 +2538,7 @@ mod tests {
         assert_labels(
             folder,
             &[
+                "AI 説明文を作る",
                 "新しいフォルダ…",
                 "貼り付け",
                 "このフォルダのパスをコピー",
@@ -2607,6 +2639,8 @@ mod tests {
                 "|",
                 "OrganizeFiles",
                 "|",
+                "CreateAiCaptions",
+                "|",
                 "Rename",
                 "|",
                 "CopyPath",
@@ -2649,6 +2683,8 @@ mod tests {
                 "CopyFiles",
                 "|",
                 "OrganizeFiles",
+                "|",
+                "CreateAiCaptions",
                 "|",
                 "CopyPath",
                 "|",
@@ -2860,6 +2896,100 @@ mod tests {
             .filter(|item| *item != ContextMenuItemId::OrganizeFiles)
             .collect();
         assert_eq!(known_without_new, saved);
+    }
+
+    #[test]
+    fn ai_caption_creation_is_a_configurable_grid_only_command_including_background() {
+        let id = ContextMenuItemId::CreateAiCaptions;
+        assert!(ContextMenuItemId::ALL.contains(&id));
+        assert_eq!(id.stable_name(), "CreateAiCaptions");
+        assert_eq!(
+            ContextMenuItemId::parse_stable_name(id.stable_name()),
+            Some(id)
+        );
+        assert_eq!(id.parent(), ContextMenuParentId::Root);
+        assert_eq!(id.label(), "AI 説明文を作る");
+        assert_eq!(
+            ContextMenuItemId::from_command(&MenuCommand::CreateAiCaptions),
+            Some(id)
+        );
+
+        for surface in [ContextMenuSurface::Grid, ContextMenuSurface::Fullscreen] {
+            for kind in [
+                ContextMenuItemKind::Folder,
+                ContextMenuItemKind::Image,
+                ContextMenuItemKind::Video,
+                ContextMenuItemKind::Audio,
+                ContextMenuItemKind::ZipFile,
+                ContextMenuItemKind::PdfFile,
+                ContextMenuItemKind::ConvertibleArchive,
+                ContextMenuItemKind::ZipImage,
+                ContextMenuItemKind::PdfPage,
+                ContextMenuItemKind::Stack,
+                ContextMenuItemKind::ZipDir,
+                ContextMenuItemKind::SearchContainer,
+                ContextMenuItemKind::CollectionPlaceholder,
+            ] {
+                for (has_checked, is_folder_context) in
+                    [(false, false), (true, false), (false, true)]
+                {
+                    let mut case = input(kind, surface);
+                    case.has_checked = has_checked;
+                    case.is_folder_context = is_folder_context;
+                    case.checked_count = usize::from(has_checked) * 2;
+                    let nodes = build_context_menu(&case);
+                    let state = command_state(&nodes, MenuCommand::CreateAiCaptions);
+                    assert_eq!(state.is_some(), surface == ContextMenuSurface::Grid);
+                    if let Some((label, enabled, reason)) = state {
+                        assert_eq!(label, id.label());
+                        assert!(enabled);
+                        assert_eq!(reason, None);
+                    }
+                    case.layout.set_visible(id, false);
+                    assert!(
+                        command_state(&build_context_menu(&case), MenuCommand::CreateAiCaptions)
+                            .is_none()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ai_caption_creation_uses_its_canonical_slot_in_saved_and_custom_layouts() {
+        let id = ContextMenuItemId::CreateAiCaptions;
+        let canonical = ContextMenuLayoutSettings::canonical_order(ContextMenuParentId::Root);
+        let slot = canonical
+            .iter()
+            .position(|candidate| *candidate == id)
+            .unwrap();
+        assert_eq!(canonical[slot - 1], ContextMenuItemId::OrganizeFiles);
+        let old_order: Vec<_> = canonical
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != id)
+            .collect();
+        let mut case = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
+        case.layout.set_order(ContextMenuParentId::Root, &old_order);
+        assert_eq!(
+            case.layout.resolved_order(ContextMenuParentId::Root)[slot],
+            id
+        );
+        let ids = root_layout_ids(&build_context_menu(&case));
+        let organize_slot = ids
+            .iter()
+            .position(|candidate| *candidate == ContextMenuItemId::OrganizeFiles)
+            .unwrap();
+        assert_eq!(ids[organize_slot + 1], id);
+
+        let mut custom = canonical;
+        custom.remove(slot);
+        custom.insert(0, id);
+        case.layout.set_order(ContextMenuParentId::Root, &custom);
+        assert_eq!(root_layout_ids(&build_context_menu(&case))[0], id);
+        case.is_folder_context = true;
+        case.can_use_folder_commands = true;
+        assert_eq!(root_layout_ids(&build_context_menu(&case))[0], id);
     }
 
     #[test]

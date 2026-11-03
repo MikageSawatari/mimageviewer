@@ -569,6 +569,11 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `rotation_db.rs` / `rotation_cache.rs` | 非破壊回転の SQLite 永続化と context 所有の回転 memo。静止画シークの未読値は pending reader が非同期取得し、cache と要求寿命を一緒に交換・失効・破棄する |
 | `audio_normalize_db.rs` | 動画音量ノーマライズの per-file 測定値 (integrated LUFS / true peak / 算出ゲイン) の SQLite 永続化 |
 | `rating_db.rs` | レーティング (★1〜5) の SQLite 永続化 |
+| `ai_caption_db.rs` | ローカル AI 説明文の保存基盤。作成ジョブの保存役が worker thread 上で `BEGIN IMMEDIATE` 後に入力署名を照合し、成功／失敗の上書き規則を適用する。DB trigger が全体 revision と索引反映待ちを管理し、STORES 経由の改名・削除・復元にも適用する。表示 worker は DB を作らない読み取り専用 open を使う。検索接続は後段 |
+| `caption_display_cache.rs` | bundle外の共有 `CaptionDisplayCache`、最大512件の保持と `epoch`／`gen`、専用の単一read-only SELECT＋画像署名／本の表紙照合workerを持つ。Appがroot pollと書き手・固定表紙の変更の採用点から接続する |
+| `app/book_cover.rs` | 本の AI 説明文用の表紙解決。既存の一覧計画・固定表紙・変換 cache 候補とサムネイルの2段の解決をworkerから呼び、読む位置・`cover_ref`・元ファイルの署名と世代leaseを返す。未変換・パスワード不足・動画の表紙を値で区別し、変換や入力画面は起動しない |
+| `vlm_addon.rs` / `vlm_addon_download.rs` | ローカル AI 説明文モデルの導入 (V1-3b)。固定配布一覧・安全な名前・分割と全体の SHA-256 を検証する。App の単一 owner が導入／取消／削除を完了通知まで排他にし、状態確認・HTTP・連結・配置・削除は worker 上だけで行う |
+| `ui_dialogs/vlm_addon.rs` | GPU 判定を必要時に一度だけ worker で実行し、設定ページへ cached view を渡す。初回の確認だけ modal、長い取得は modeless。取得成功時だけ操作時点の対象パスを作成ジョブへ一回渡す。設定からの導入だけではジョブを開始しない |
 | `mask_db.rs` | 消しゴムマスクの SQLite 永続化 (1bit/pixel deflate 圧縮 + ベクタオブジェクト JSON) |
 | `conceal_db.rs` | 隠蔽加工マスクの SQLite 永続化。`mask_db.rs` と同じビットマップ + ベクタ構造を使い、マスクスロットも管理 |
 | `local-adjust-core` | 補正レイヤー合成 core。mIV 本体では消しゴム後・隠蔽加工前の非同期レイヤーとして使う |
@@ -581,6 +586,58 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `png_metadata.rs` | PNG の tEXt/iTXt/zTXt に埋め込まれた AI メタデータ読み取り |
 | `exif_reader.rs` | EXIF 読み取り (rexif)。構造タグの抑止と Exif 2.3x 拡張タグの日本語名マップを持つ |
 | `xmp_reader.rs` | XMP 読み取り (quick-xml)。`xtw:*` 名前空間のツイート情報を抽出し「XMP ツイート情報」パネルに表示 |
+
+#### ローカル AI 説明文の作成ジョブ (V1-3c / V1-4b)
+
+本の表紙への拡張（V1-4b）は実装・検証中で、検収・実機確認は未完了。
+
+`App::caption_job` が全 viewport 共通の単一ジョブを所有する。右クリックから既存の選択規則で
+対象をパスへ凍結し、無選択・空白部分なら現在の一覧直下を対象にする。UI はファイルを読まず、
+`CaptionTarget` の画像または本を渡す。選択した ZIP・PDF・EPUB・書庫・フォルダは本の対象、
+無選択の直下対象は画像とファイルの本で、サブフォルダは含めない。仮想ページ・`ZipDir`・動画・音声は対象外として数える。
+待ち行列・追加の受付・次の1件・ジョブの終了判断も App に集約し、worker が空キューを見て自律終了しない。
+状態は `Running` / `Stopping`。中止操作または最後の結果の採用で先に受付を閉じ、
+処理中の1件が無くなってから `Finish` を送る。worker 完了を非blocking poll で採用して初めて owner を解放する。
+
+job worker は画像の署名・既存説明文を確認し、canonical decode → 非破壊回転 → 長辺1024pxまでの縮小 →
+RGB8 → 別プロセスの推論 → 署名を再確認して保存、を1件ずつ行う。中止後の処理中結果は保存せず、
+既に保存した分は残す。モデルはジョブ内で共用し、終了で子プロセスを閉じる。App 終了時は共有 kill handle で
+即時停止して join しない。detached を閉じてもジョブは続き、モデルの削除はジョブ終了まで受け付けない。
+詳細は [計画 §21.7.3](local-vlm-caption-plan.md#2173-v1-3c-作成ジョブ)。
+
+本の `resolve_book_cover` は worker で既存の一覧計画・固定表紙・変換済み書庫の判定を使う。
+`thumb_loader` から cache 前の `prepare_load_request_stamp` と miss 後の
+`resolve_read_after_cache_miss` を切り出して共有し、一覧の計画は UI 側に残す。
+`ResolvedRead` は読む場所・選定証明・取得済み bytes・画像・子 WebP・寸法・署名を運び、
+EPUB は署名確定から描画まで同じ世代 lease を保持する。子の保存済み代表では固定の持ち主と
+解決済みの位置を残して、同じページを高解像度で読む。サムネイルの cache／取消／保存規約は変えない。
+保存済み代表の再解決回数は探索深さに数えず、各段の選定に同じ `folder_thumb_depth` を渡し、再訪した本で止める。
+UI の種類 hint は最上位も worker の metadata で照合し、`album.pdf` のような実フォルダも子ファイルを署名の基準にする。
+本の作成済み判定は `cover_ref`・署名・モデル・プロンプト版の一致を必要とし、保存キーは元の本のパスとする。
+変換とパスワードのモーダルは起動せず、未変換・パスワード不足・動画の表紙・読み込み失敗を数える。
+詳細は [計画 §21.13](local-vlm-caption-plan.md#2113-v1-4b-の設計-2026-11-03)。
+
+#### ローカル AI 説明文の表示 (V1-4a / V1-4b)
+
+`App::caption_display: CaptionDisplayCache` は `ViewerContextBundle` の外に一つだけ置く。
+物理画像・本のキーごとに読み込み中／読み込み済みの行・現在の署名と表紙照合結果を最大512件保持し、
+全消去の `epoch` とキーごとの `gen` で古い結果を棄却する。上限超過は全消去し、LRUは持たない。
+専用の単一workerを必要時に起動し、read-only SELECTと画像のstatまたは本の表紙解決を行う。結果はrootの
+`App::ui`で非blocking pollし、共通情報パネルの「AI 説明」欄に投影する。既存のcontext別
+メタデータcache／workerには追加しない。表示への再入場時も読み直し、完了までは既存の値を表示する。
+表示開始の判定はeguiのviewport＋panel IDごとの一時履歴（frame／key）で行い、bundleへ状態を足さない。
+
+作成ジョブの1件完了では結果によらずそのキーを消す。取り込み、STORESの付け替え・コピー・
+復元・削除・孤児整理、本への追記による直接削除はAppの完了採用点で全消去する。
+一覧の再読み込みでも全消去する。固定表紙・動画固定表紙の変更／解除と、その DB 行が変わる取り込み・
+STORES でも全消去する。STORES の通知は `caption_display_stale` で3 DBの実変更を表す。
+署名または本の `cover_ref` の不一致は保存済みの文を残して「古い」と案内し、モデルがなくても表示できる。
+本は「この本」の★と同じ `physical_container_rating_key`（変換済み書庫は元パス）で
+「この本の AI 説明」に出す。表紙は表示開始時に一度だけ worker で解決し、読めないときは古いと警告しない。
+動画の表紙への変更は作り直しを案内せず、作成できない旨を出す。ZIP内画像・PDFページ個別の説明は対象外。
+detachedは既存の共通パネルを使い、述語・viewport・bundleの交換は変えない。Remoteの表示とIPCは対象外。
+詳細は [画像の設計 §21.11.2](local-vlm-caption-plan.md#21112-v1-4a-画像の説明文の表示) と
+[本の設計 §21.13](local-vlm-caption-plan.md#2113-v1-4b-の設計-2026-11-03)。
 
 ### UI オーバーレイ / ダイアログ
 
@@ -709,6 +766,9 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `rotation.db` | 非破壊回転角 (0/90/180/270) | `rotation_db.rs` |
 | `audio_normalize.db` | 動画ファイル単位のノーマライズ測定値 (integrated LUFS / true peak / 算出ゲイン)。主キー `(path_lower, file_size, mtime_ms, target_lufs_milli)`。環境設定 → 動画・音声 → 動画から全件クリア可能 | `audio_normalize_db.rs` |
 | `rating.db` | レーティング (★1〜5、0 は未登録)。ページ単位 (画像/ZIP 内画像/PDF ページ) とコンテナ (フォルダ/ZIP/PDF 本体) を同一テーブルに格納。キー形式の違い (`::` の有無) で区別 | `rating_db.rs` |
+| `ai_caption.db`（未リリース） | schema 1。物理項目キーごとの説明文・画像内の文字・検索語・入力署名を保存。rollback journal、trigger による全体 revision と削除記録。STORES は Follow／ページコピーなし、ページ追加先は作成前に初期化。説明文だけでは内容同一性の台帳を作らず、既存台帳のある項目だけ復元に便乗する | `ai_caption_db.rs` |
+| `addons/vlm/` | 利用者の明示操作で取得するモデル。固定 GitHub Releases の一覧と分割・全体hashを検証し、`packs/<model_id>/`、`INSTALL_OK`、`active.json` で導入を管理する。モデル削除では `ai_caption.db` を消さない | `vlm_addon.rs` / `vlm_addon_download.rs` |
+| `vlm/workers/<hash>/mimageviewer-vlm.exe` | 通常版の内容別展開先。背景threadで配置する。portable はexe隣の同梱workerを使う。モデルの重みは本体へ内包しない | `ai/vlm_worker_extract.rs` |
 | `search_index.db` | Ctrl+S 用。お気に入り配下のフォルダ/ZIP/PDF/動画名索引 | `search_index_db.rs` |
 | `fts_index/` | Ctrl+G 用 Tantivy index (複数 segment + meta.json)。bigram 候補絞り込み。旧 `tags` STORED は tags.db 移行専用 | `fts_index.rs` → `ingest_worker.rs` |
 | `fts_meta.db` | ファイル単位の管理メタ (path / mtime / size / status=Ok\|Failed / index_generation)。検索原文は持たず Tantivy STORED に集約 | `fts_meta.rs` |
@@ -835,6 +895,12 @@ strict IPC v70のmode-only入口を追加した。構成editor固有のC7/C9はG
 
 ### 明示メタ情報転送 (`mimageviewer.meta.miv`)
 
+形式 v12 は保存済み AI 説明文の `ok` 行を物理項目へ追加する（仮想ページ・失敗行は対象外）。
+元の署名を保持して upsert し、欄が有効な記載項目の空は削除、未記載項目は保持する。
+`ai_caption.db` も rollback journal の ATTACH transaction に参加し、commit 後の実変更数と
+`ImportChangedSections.ai_captions` を後段の表示／索引への通知境界にする。
+v7〜v11 は説明文を保持し、本の構成の導入版は v11 に固定する。
+
 v2.7.0では安定化のためメニュー入口を一時非表示にしたが、v2.8.0の継続開発では
 `metadata_transfer::UI_ENABLED`を有効化して再公開する。
 
@@ -851,7 +917,7 @@ sidecarと同じ矩形と基準ラスタ寸法の組を保持する。ZIP / PDF 
 本単位表示トリムは実行時の`nav.tree.zip_path`と同じく変換後cache ZIP基点なので、実際に検出した
 source/cache originを移送先の決定的cache keyへ対応付ける。一方、代表サムネピンは
 `zip_pin_root_path`由来の元アーカイブsource keyを維持する。この非対称は実行時DB key体系に合わせたものとする。
-未リリースの開発ビルドだけが作成したv1〜v6 bundleは移行せず、v7だけを受け入れる。
+未リリースの開発ビルドだけが作成したv1〜v6 bundleは移行せず、v7〜v12を受け入れる。
 前回の未コミット検証で作成されたv6も、必須fieldを黙って補わずversion gateで明示的に拒否する。
 archive cache DB自体がない場合と対象行がない場合だけを未変換扱いにし、open / query失敗は
 ページメタ情報を黙って欠落させないようexport全体のエラーにする。

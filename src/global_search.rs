@@ -103,6 +103,8 @@ pub enum RejectReason {
 #[derive(Debug, Clone)]
 pub struct GlobalHit {
     pub path: String,
+    /// Stored index identity; never infer directories from extensions or UI stat.
+    pub kind: IndexKind,
     /// Tantivy が吐いたスコア (UI でのソートや表示に使える)
     pub score: f32,
     /// 0..=5。worker は常に 0 を入れ、UI 側 (`poll_global_search_events`) が
@@ -133,6 +135,8 @@ pub struct SearchScope {
     pub mode: crate::search_query::MatchMode,
     /// Hide EPUB paths before counting accepted hits toward HARD_MAX.
     pub ignore_epub: bool,
+    /// RAR/7z/LZH policy captured at query submission, before HARD_MAX counting.
+    pub ignore_archives: bool,
     /// List policy is captured once per search run and applied before the accepted-hit cap.
     pub visibility: crate::file_type_visibility::FileTypeVisibility,
 }
@@ -143,7 +147,11 @@ pub struct SearchScope {
 pub(crate) fn search_hit_type_is_visible(
     visibility: &crate::file_type_visibility::FileTypeVisibility,
     path: &str,
+    kind: IndexKind,
 ) -> bool {
+    if kind == IndexKind::Folder {
+        return true;
+    }
     let source = path
         .split_once(crate::search_norm::ZIP_ENTRY_SEP)
         .map_or(path, |(_, member)| member);
@@ -297,17 +305,28 @@ fn run_with_hit_limit(
         let mut batch = Vec::new();
         let mut inner_truncated = false;
         let mut inner_cancelled = false;
-        for (path, addr, score) in page {
+        for (path, addr, score, kind) in page {
             if cancel.load(Ordering::Relaxed) {
                 inner_cancelled = true;
                 break;
             }
             // The index has no separate EPUB kind. Skip by indexed path here,
             // before fetching STORED text and before the accepted-hit limit.
-            if scope.ignore_epub && is_epub_search_path(&path) {
+            if scope.ignore_epub && kind == IndexKind::Pdf && is_epub_search_path(&path) {
                 continue;
             }
-            if !search_hit_type_is_visible(&scope.visibility, &path) {
+            if scope.ignore_archives
+                && kind == IndexKind::Zip
+                && std::path::Path::new(&path)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        crate::archive_converter::ArchiveFormat::from_extension(ext).is_some()
+                    })
+            {
+                continue;
+            }
+            if !search_hit_type_is_visible(&scope.visibility, &path, kind) {
                 continue;
             }
             let text = match fts_index::doc_text_for_target(
@@ -337,6 +356,7 @@ fn run_with_hit_limit(
                         .unwrap_or((0, None));
                 batch.push(GlobalHit {
                     path,
+                    kind,
                     score,
                     stars: 0,
                     mtime,
@@ -1076,6 +1096,126 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "c:/books/zzz.pdf");
+    }
+
+    #[test]
+    fn caption_book_kinds_drive_visibility_scope_and_archive_ignoring_before_limit() {
+        use crate::file_type_visibility::{FileTypeCategory, FileTypeVisibility};
+        let (_tmp, _meta, fts) = setup();
+        let favorite = Uuid::new_v4();
+        let rows = [
+            ("c:/books/archive.rar", IndexKind::Zip),
+            ("c:/books/archive.cbr", IndexKind::Zip),
+            ("c:/books/archive.7z", IndexKind::Zip),
+            ("c:/books/archive.cb7", IndexKind::Zip),
+            ("c:/books/archive.lzh", IndexKind::Zip),
+            ("c:/books/archive.lha", IndexKind::Zip),
+            ("c:/books/archive.zip", IndexKind::Zip),
+            ("c:/books/archive.cbz", IndexKind::Zip),
+            ("c:/books/album.epub", IndexKind::Folder),
+            ("c:/books/album.zip", IndexKind::Folder),
+            ("c:/books/album.jpg", IndexKind::Folder),
+            ("c:/books/document.epub", IndexKind::Pdf),
+            ("c:/books/picture.jpg", IndexKind::Image),
+            ("c:/books/movie.mp4", IndexKind::Video),
+            ("c:/books/music.flac", IndexKind::Audio),
+        ];
+        {
+            let mut writer = fts.writer().unwrap();
+            for (path, kind) in rows {
+                upsert_doc(
+                    &writer,
+                    fts.fields(),
+                    &IndexDoc {
+                        path: path.into(),
+                        container: Container::Fs,
+                        zip_entry: String::new(),
+                        favorite_id: favorite,
+                        kind,
+                        mtime: 123,
+                        file_size: 456,
+                        norms: PerSourceText {
+                            name: "target".into(),
+                            ..Default::default()
+                        },
+                    },
+                )
+                .unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        fts.reload_reader().unwrap();
+        let (hits, _, _, _) =
+            collect_scoped_events("target", &[favorite], &SearchScope::default(), &fts);
+        assert_eq!(hits.len(), rows.len());
+        for hit in hits {
+            assert_eq!(
+                hit.kind,
+                rows.iter().find(|row| row.0 == hit.path).unwrap().1
+            );
+            assert_eq!((hit.mtime, hit.file_size), (123, Some(456)));
+        }
+        let scope = SearchScope {
+            kinds: Some(vec![IndexKind::Zip, IndexKind::Folder]),
+            ignore_archives: true,
+            ignore_epub: true,
+            ..Default::default()
+        };
+        let (hits, _, _, _) = collect_scoped_events("target", &[favorite], &scope, &fts);
+        assert_eq!(hits.len(), 5);
+        assert_eq!(
+            hits.iter()
+                .filter(|hit| hit.kind == IndexKind::Folder)
+                .count(),
+            3
+        );
+        assert!(
+            hits.iter()
+                .filter(|hit| hit.kind == IndexKind::Zip)
+                .all(|hit| hit.path.ends_with(".zip") || hit.path.ends_with(".cbz"))
+        );
+        let hidden = SearchScope {
+            kinds: Some(vec![
+                IndexKind::Zip,
+                IndexKind::Folder,
+                IndexKind::Pdf,
+                IndexKind::Image,
+            ]),
+            ignore_archives: true,
+            ignore_epub: true,
+            visibility: FileTypeVisibility {
+                excluded_categories: [FileTypeCategory::Zip, FileTypeCategory::Epub]
+                    .into_iter()
+                    .collect(),
+                excluded_extensions: ["jpg".into()].into_iter().collect(),
+            },
+            ..Default::default()
+        };
+        let (hits, _, _, _) = collect_scoped_events("target", &[favorite], &hidden, &fts);
+        assert_eq!(hits.len(), 3);
+        assert!(hits.iter().all(|hit| hit.kind == IndexKind::Folder));
+        // Hidden rows must not consume the accepted-hit cap, even if ordered first.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        run_with_hit_limit(
+            "target",
+            &[favorite],
+            &hidden,
+            &fts,
+            &AtomicBool::new(false),
+            &tx,
+            None,
+            3,
+        );
+        let capped: Vec<_> = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                SearchStreamEvent::Batch { hits, .. } => Some(hits),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(capped.len(), 3);
+        assert!(capped.iter().all(|hit| hit.kind == IndexKind::Folder));
     }
 
     #[test]

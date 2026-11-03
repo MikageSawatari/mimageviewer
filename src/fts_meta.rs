@@ -1,4 +1,4 @@
-//! `fts_meta.db` — 全文メタ検索のファイル単位 **管理メタ** 専用 DB (INDEX_VERSION=10)。
+//! `fts_meta.db` — 全文メタ検索のファイル単位 **管理メタ** 専用 DB (INDEX_VERSION=11)。
 //!
 //! docs/search-architecture.md に準拠する。
 //!
@@ -44,7 +44,8 @@ use crate::search_index_db::normalize_path;
 /// - 8: 外部メタデータサイドカー検索 (SourceKind::Sidecar + sidecar_text) を追加。
 /// - 9: AI 生成メタデータの対応形式拡充と EXIF UserComment の Negative 除外。
 /// - 10: ComfyUI prompt provenance を分離し、未解決 template / Negative の索引混入を防止。
-pub const INDEX_VERSION: i64 = 10;
+/// - 11: AI 説明文検索 (SourceKind::AiCaption + ai_caption_text) を追加。
+pub const INDEX_VERSION: i64 = 11;
 
 const TANTIVY_REBUILD_PENDING_KEY: &str = "tantivy_rebuild_pending";
 #[derive(Clone, Debug)]
@@ -55,6 +56,7 @@ pub struct RangeFileStamp {
     pub mtime: i64,
     pub file_size: i64,
     pub status: i64,
+    pub kind: IndexKind,
 }
 
 #[cfg(test)]
@@ -832,7 +834,7 @@ impl FtsMetaDb {
         scope: &crate::metadata_ownership::OwnedRange,
     ) -> rusqlite::Result<Vec<RangeFileStamp>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT path, favorite_id, favorite_root, mtime, file_size, status FROM files WHERE path >= ?1 AND path < ?2")?;
+        let mut stmt = conn.prepare("SELECT path, favorite_id, favorite_root, mtime, file_size, status, kind FROM files WHERE path >= ?1 AND path < ?2")?;
         let mut out = Vec::new();
         for range in scope.sql_ranges() {
             let rows = stmt.query_map(params![range.start, range.end], |r| {
@@ -843,6 +845,7 @@ impl FtsMetaDb {
                     mtime: r.get(3)?,
                     file_size: r.get(4)?,
                     status: r.get(5)?,
+                    kind: IndexKind::from_i64(r.get(6)?),
                 })
             })?;
             for row in rows {
@@ -1567,6 +1570,42 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, INDEX_VERSION);
+    }
+
+    #[test]
+    fn opening_v10_requires_caption_schema_rebuild_and_clears_scan_marker() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts_meta.db");
+        let db = FtsMetaDb::open_at(&db_path).unwrap();
+        db.upsert_meta_ok(
+            "c:/fav/a.jpg",
+            Uuid::new_v4(),
+            Path::new("C:/fav"),
+            IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        db.mark_scanned_once("c:/fav", "v10-fingerprint").unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("UPDATE files SET index_version=10; PRAGMA user_version=10;")
+            .unwrap();
+        drop(db);
+        let reopened = FtsMetaDb::open_at(&db_path).unwrap();
+        assert!(reopened.rebuilt_on_open);
+        assert!(reopened.get("c:/fav/a.jpg").unwrap().is_none());
+        assert!(reopened.scanned_once("c:/fav").unwrap().is_none());
+        assert_eq!(
+            reopened
+                .conn
+                .lock()
+                .unwrap()
+                .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            11
+        );
     }
 
     /// 初回 open で `application_id` が `HOUSEKEEPING_VERSION` に設定され、
