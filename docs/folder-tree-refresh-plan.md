@@ -420,3 +420,27 @@ P2-2の不変条件は「未確定時の代替位置と利用者が選んだ位�
 追加の一覧順filterは最初にfile名で指定して0件だったため、実module名`ratingnav649::`へ補正した（`tree-nav-arbitration-empty-filter.log`）。製品の失敗ではない。全lib・全snapshot・build-dev・製品起動・コミットは指定により省略する。
 
 終了時、追加archive試験で非同期payloadの戻り値を意図的に消費しないことを`let _ =`とcommentで明示し、新規unused-must-use warningを除いた。受理の成否は既存のrequest所有assertで引き続き確認する。試験だけの注記補正で製品source/挙動は同一のためcore/snapshot/他群は上記結果を再利用し、影響するApp回帰群とfolder pane filterを再確認して成功した。既存lib test warning数153へ戻り、追加したwarningは残っていない。
+
+### pendingと異なるcursorのF確定（2026-11-03、`42676f3dd`追補）
+
+別担当の独立レビューP2は妥当。`post_render_main_navigation`がpendingの有無だけでclose候補を除外し、同じOpenの重複と、新しく選んだ別の宛先を混同していた。現在地AからBのOpenがpendingの間にcursorをCへ移してFで確定しても、要求はHideへ退役したうえでCが捨てられ、古いBが残る。これは前追補の一律pending保護による退行。
+
+不変条件を「poll前にpendingの宛先とcursor確定の宛先を比較し、同じ先だけ重複として保護する」とする。異なる先は既存のpane navigation候補へ残し、既存のcancel/startまたはready置換経路で新しい先へ移る。`folder_tree::path_eq`の既存path同一性を使い、新しいbool/pending/順序番号は追加しない。高優先navigationの裁定・明示要求の退役・末尾でのvisibility適用は維持する。
+
+回帰は実B行クリックでOpenを開始し、既存receiverを遅延返信fixtureへ差し替えてBをpendingに保持してから、eguiのArrowDownでCへ移しFで確定する。Bの取消token、新しいCのpending、完了後の現在地Cを検査する。最初の試験は行全体の中央をクリックしてBのOpen開始前に失敗したため、既存のlabel idからresponse rectとviewportの交差を取得してクリック位置を補正した（`target/tree-pending-repro-fixture.log`）。このsetup失敗を製品の再現とは扱わない。
+
+補正した修正前回帰は**1件中1失敗**。BのOpen開始とCへのcursor移動は通り、F後の「Bの取消tokenが立つ」検査で失敗した（`target/tree-pending-repro.log`）。修正は裁定入口のfilterを、pending有無からpending.pathとtargetのpath同一性比較へ置換するだけ。比較はpoll前に保ち、同先のEnter＋Fは既存worker/readyを維持し、異先のCは既存`replace_ready_folder_pane_open`へ渡す。
+
+追補の独立Sol/xhighレビューは**ACCEPT**。poll前の同一宛先保護と異先のpending/ready置換、他nav優先・context所有・末尾visibilityの維持を確認し、重要な未解決指摘なし。レビュー側の編集・build/test・製品起動は行わず、検証は実装側が担当する。
+
+最終検証（`MSBUILDDISABLENODEREUSE=1`、`target/tree-open-env.ps1`の既存native環境）:
+
+| 検査 | 結果 | 記録（`target/`） |
+|---|---|---|
+| `cargo nextest run -p mimageviewer --lib -E 'test(/folder_pane/)' --no-fail-fast` | **89成功/失敗0、19.994秒、exit0**。異先Cへの確定と既存の同先Enter＋Fを含む | `tree-pending-filter.log` |
+| `scripts/test-focused.ps1 -Path @('src/app/folder_pane_refresh_tests.rs','src/app/update_phases.rs')` | **40/3件成功、計43実行（重複あり）、exit0** | `tree-pending-focused.log`、`test-focused/runs/20261103T052930687Z-f5b0208b` / `20261103T053349735Z-52587005` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **exit0** | `tree-pending-check.log` |
+| `cargo test --test ui_snapshot folder_pane` | **4成功/失敗0、2.11秒、exit0**。画像更新なし | `tree-pending-snapshot.log` |
+| 引数なし`cargo fmt`、`cargo fmt --check`、`git diff --check` | **各exit0** | `tree-pending-fmt-check.log`、終了時diff検査 |
+
+新規warningなし（既存lib test warning153件）。指定により全lib・全snapshot・build-dev・製品起動・コミットは行わない。

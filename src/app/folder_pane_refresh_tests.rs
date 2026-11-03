@@ -238,6 +238,89 @@ fn folder_pane_frame_end_enter_then_f_preserves_the_first_open_worker() {
 }
 
 #[test]
+fn folder_pane_frame_end_new_cursor_commit_replaces_a_different_pending_open() {
+    let (mut app, ctx, mut frame, b, c) = navigation_tree_fixture();
+    navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+    let label_id: egui::Id = ctx
+        .data(|data| data.get_temp(egui::Id::unique(("folder_pane_test_label_id", b.as_path()))))
+        .unwrap();
+    let rect = ctx.read_response(label_id).unwrap().rect;
+    let viewport: egui::Rect = ctx
+        .data(|data| data.get_temp(egui::Id::unique("folder_pane_test_viewport")))
+        .unwrap();
+    let clickable = rect.intersect(viewport);
+    assert!(clickable.is_positive(), "B's label must be in view");
+    let pos = clickable.center();
+    let pointer = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    navigation_tree_frame(
+        &mut app,
+        &ctx,
+        &mut frame,
+        vec![egui::Event::PointerMoved(pos), pointer(true)],
+    );
+    navigation_tree_frame(&mut app, &ctx, &mut frame, vec![pointer(false)]);
+    let pending = app
+        .folder_pane_open_pending
+        .as_mut()
+        .expect("B click starts Open");
+    assert_eq!(pending.path, b);
+    let first = pending.cancel.clone();
+    // Hold B's reply at the existing receiver boundary, independently of scan
+    // timing. This is the same delayed-completion fixture used by refresh tests.
+    let (_held_reply, rx) = mpsc::channel();
+    pending.rx = rx;
+    navigation_tree_frame(
+        &mut app,
+        &ctx,
+        &mut frame,
+        vec![tree_key_event(egui::Key::ArrowDown)],
+    );
+    assert!(
+        app.folder_pane
+            .visible_rows()
+            .iter()
+            .any(|row| row.path == c && row.is_cursor)
+    );
+    assert!(!first.load(Ordering::Relaxed));
+    navigation_tree_frame(
+        &mut app,
+        &ctx,
+        &mut frame,
+        vec![tree_key_event(egui::Key::F)],
+    );
+    assert!(!app.settings.folder_tree_pane_visible);
+    assert!(
+        first.load(Ordering::Relaxed),
+        "F must cancel the older B request"
+    );
+    let pending = app
+        .folder_pane_open_pending
+        .as_ref()
+        .expect("F starts C Open");
+    assert_eq!(pending.path, c);
+    assert!(!Arc::ptr_eq(&first, &pending.cancel));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+        settle(&mut app, &ctx);
+        if app.folder_pane_open_pending.is_none() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "C Open did not finish"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(app.current_folder.as_ref(), Some(&c));
+}
+
+#[test]
 fn folder_pane_frame_end_close_does_not_override_inline_search_drill() {
     for subfolder in [false, true] {
         let (mut app, ctx, _, _, c) = navigation_tree_fixture();

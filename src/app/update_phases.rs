@@ -1150,11 +1150,16 @@ impl App {
         navigation: update_phases::MainFrameNavigation,
     ) {
         // Consume only the commit part here; visibility remains deferred until
-        // the frame ends. Inspect pending before polling: an Enter Open can move
-        // to ready below and must not be replaced by another cursor commit.
+        // the frame ends. Inspect the destination before polling: the same Open
+        // can move to ready below and must remain deduplicated, while a newly
+        // chosen destination must replace the older pending/ready Open.
         let close_cursor_nav = self
             .take_folder_tree_pane_close_navigation()
-            .filter(|_| self.folder_pane_open_pending.is_none());
+            .filter(|target| {
+                self.folder_pane_open_pending
+                    .as_ref()
+                    .is_none_or(|pending| !crate::folder_tree::path_eq(&pending.path, target))
+            });
         let MainFrameNavigation {
             fav_nav,
             toolbar_fav_nav,
