@@ -383,8 +383,10 @@ aggregate_auto == false のとき:
 - `GlobalSearchView` enum を上記の `aggregate` / `aggregate_auto` / `drill` 構成へ再構成。
 - 「一覧」ビューの items 構築 `build_flat_items` を新規追加。`state.all_hits` を走査して
   各ヒットを `GridItem::Image / PdfFile / Video` に変換し (§3.2 より ZIP 内画像ヒットは
-  存在しない)、§4.3.3 のソート順で並べる。`build_drilled_items` と同じく placeholder
-  `image_metas` を使い、UI スレッドでの `fs::metadata` 同期呼び出しは避ける。
+  存在しない)、§4.3.3 のソート順で並べる。`build_drilled_items` と同じく、U17の直接の
+  書庫・フォルダ本には保存済み `GlobalHit` のmtime/sizeを `image_metas` に引き継ぐ。
+  変換キャッシュの照合に必要な元署名を0に置き換えない。他のメディアと検索枝は従来の
+  placeholderを使い、UI スレッドでの `fs::metadata` 同期呼び出しは避ける。
 - `rebuild_items_from_global_search` の view 分岐に Flat を追加。
 - `poll_global_search_events` の rebuild 時に、`aggregate_auto` なら閾値判定を行う。
 - 検索結果への操作 (b) を検出して `aggregate_auto = false` にするフックを 1 箇所用意する。

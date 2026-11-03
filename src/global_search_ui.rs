@@ -1291,8 +1291,8 @@ fn build_aggregated_items_prepared(
 /// `state.all_hits` を走査して各ヒットを `GridItem::{Image, PdfFile, Video, Audio}` に変換し、
 /// メインの `sort_order` で一律ソートする。ZIP 内画像ヒットはアイテム索引に存在しない
 /// が (§3.2)、stale な索引が残るケースに備えて防御的にスキップする。
-/// `build_drilled_items` と同じく placeholder image_metas を使い、UI スレッドでの
-/// `fs::metadata` 同期呼び出しは避ける。
+/// 直接の本は取得済みの署名を渡す。他の行は従来のplaceholderを使い、
+/// UI スレッドでの `fs::metadata` 同期呼び出しは避ける。
 pub(crate) fn build_flat_items(
     state: &GlobalSearchState,
     sort_order: crate::settings::SortOrder,
@@ -1343,8 +1343,10 @@ fn build_flat_items_with_recipe(
         .collect();
     keyed_rows.sort_by(|(a, ak), (b, bk)| sort_order.compare_listing_keys(ak, a.2, bk, b.2));
     rows = keyed_rows.into_iter().map(|(row, _)| row).collect();
-    let placeholder = Some((0_i64, 0_i64));
-    let image_metas: Vec<Option<(i64, i64)>> = vec![placeholder; rows.len()];
+    let image_metas = rows
+        .iter()
+        .map(|(item, _, meta)| fs_hit_thumbnail_meta(item, *meta))
+        .collect();
     let items: Vec<GridItem> = rows.into_iter().map(|(it, _, _)| it).collect();
     (items, image_metas)
 }
@@ -1355,8 +1357,8 @@ fn build_flat_items_with_recipe(
 /// 含む子フォルダ (Folder 枝、件数バッジ付き) だけを並べる。ヒットを含まない枝は
 /// 枝刈りされる。
 ///
-/// image_metas は従来どおり placeholder。並べ替えには worker が STORED field から得た
-/// `GlobalHit::{mtime,file_size}` を使い、UI thread の `fs::metadata` は増やさない。
+/// 直接の本はサムネイルにもSTORED署名を引き継ぐ。検索枝と既存メディアは従来のplaceholder。
+/// 並べ替えも worker が得た `GlobalHit::{mtime,file_size}` を使い、UI thread のstatは増やさない。
 pub(crate) fn build_drilled_items(
     state: &GlobalSearchState,
     current_path: &Path,
@@ -1477,23 +1479,35 @@ fn build_drilled_items_with_recipe(
     let mut items: Vec<GridItem> = Vec::with_capacity(sub_vec.len() + direct_files.len());
     let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(items.capacity());
 
-    // image_metas は placeholder (0,0) を使う。path_metadata の同期 fs::metadata は
-    // 大量ヒット (最大 HARD_MAX=10000) で UI を止めるため避ける。キャッシュキーはパスを
-    // 含むので衝突せず、mtime ベースの invalidate が効かない副作用は一時ビューのため許容。
+    // Search branches are structural rows, not direct hits with an indexed stamp.
     let placeholder = Some((0_i64, 0_i64));
     for (sub_path, _hits) in &sub_vec {
         items.push(GridItem::Folder(sub_path.clone()));
         image_metas.push(placeholder);
     }
-    for (f, kind, _) in &direct_files {
+    for (f, kind, meta) in &direct_files {
         let Some(item) = grid_item_from_fs_hit_path(f, *kind) else {
             continue;
         };
+        image_metas.push(fs_hit_thumbnail_meta(&item, *meta));
         items.push(item);
-        image_metas.push(placeholder);
     }
 
     (items, image_metas, drill_branches)
+}
+
+/// Direct books need their indexed source stamp for conversion-cache validation
+/// and the existing folder thumbnail path. Do not stat or invent an unknown size.
+fn fs_hit_thumbnail_meta(
+    item: &GridItem,
+    meta: crate::settings::ListingSortMetadata,
+) -> Option<(i64, i64)> {
+    match item {
+        GridItem::ZipFile(_) | GridItem::ConvertibleArchive { .. } | GridItem::Folder(_) => {
+            meta.file_size.map(|size| (meta.mtime, size))
+        }
+        _ => Some((0, 0)),
+    }
 }
 
 /// ZIP コンテナをドリルインしたときのアイテム構築 (v0.8.0 はフラット表示)。
@@ -4986,6 +5000,72 @@ pub(crate) mod tests {
             Some(vec![IndexKind::Zip, IndexKind::Folder])
         );
         assert_eq!(search_scope_kinds(None), None);
+    }
+
+    #[test]
+    fn caption_book_thumbnail_stamps_follow_direct_hits_in_both_projections() {
+        let root = Path::new("C:/caption-stamps");
+        let mut state = GlobalSearchState::default();
+        for (name, kind, mtime, size) in [
+            ("a.rar", IndexKind::Zip, 101, Some(91)),
+            ("b.7z", IndexKind::Zip, 102, Some(92)),
+            ("c.lzh", IndexKind::Zip, 103, Some(93)),
+            ("d.zip", IndexKind::Zip, 104, Some(94)),
+            ("folder.epub", IndexKind::Folder, 105, Some(0)),
+            ("unknown.7z", IndexKind::Zip, 106, None),
+            ("image.jpg", IndexKind::Image, 107, Some(97)),
+            ("document.pdf", IndexKind::Pdf, 108, Some(98)),
+            ("video.mp4", IndexKind::Video, 109, Some(99)),
+            ("audio.flac", IndexKind::Audio, 110, Some(100)),
+        ] {
+            let mut hit = caption_book_hit(&root.join(name), kind, 0);
+            hit.mtime = mtime;
+            hit.file_size = size;
+            state.accumulate_hit(&hit);
+        }
+        for order in [
+            crate::settings::SortOrder::FileNameDesc,
+            crate::settings::SortOrder::SizeAsc,
+        ] {
+            let (flat, flat_metas) = build_flat_items(&state, order, &[true; 6]);
+            let (drill, drill_metas) = build_drilled_items(&state, root, false, order, &[true; 6]);
+            assert_eq!(flat, drill);
+            assert_eq!(flat_metas, drill_metas);
+            for (item, meta) in flat.iter().zip(&flat_metas) {
+                let hit = state
+                    .all_hits
+                    .iter()
+                    .find(|hit| Path::new(&hit.path) == item.drag_source_path().unwrap())
+                    .unwrap();
+                let expected = if matches!(hit.kind, IndexKind::Zip | IndexKind::Folder) {
+                    hit.file_size.map(|size| (hit.mtime, size))
+                } else {
+                    Some((0, 0))
+                };
+                assert_eq!(*meta, expected, "{item:?}");
+            }
+        }
+        let mut child = caption_book_hit(&root.join("folder.epub/page.jpg"), IndexKind::Image, 0);
+        child.mtime = 999;
+        state.accumulate_hit(&child);
+        let (rows, metas, branches) = build_drilled_items_with_recipe(
+            &state,
+            root,
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+            &Default::default(),
+        );
+        let idx = rows
+            .iter()
+            .position(|item| *item == GridItem::Folder(root.join("folder.epub")))
+            .unwrap();
+        assert!(branches.contains(&root.join("folder.epub")));
+        assert_eq!(
+            metas[idx],
+            Some((0, 0)),
+            "the surviving search branch keeps its original policy"
+        );
     }
 
     #[test]

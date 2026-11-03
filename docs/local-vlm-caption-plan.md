@@ -2451,19 +2451,21 @@ ClaudeCodeとCodexは、採用済みの行と同じ所有境界の事実から�
 | --- | --- |
 | `ui_main`のFolder doubleclick | 共通別窓受付後、共通枝判定に当たる行だけdrill。直接本は既存の物理Folder open |
 | `detached_grid_item_open_plan` | 上記の共通枝判定。直接本は既存FolderCandidate、枝は従来受付へ返す |
+| 分類前の共通受付 `open_grid_item_in_detached_book_context_with_auto_fullscreen` | 拡張子付きFolderも非同期分類を始める前に共通枝判定。枝ならfalseで呼び出し元へ返し、直接本だけ従来の分類へ進む（独立レビューP2-1で補完） |
 | Enter | 共通別窓受付を通り、その後の`accept_grid_container_open`は従来どおり物理open。pointer-only drill契約を維持 |
 | gamepadの一覧決定 | 共通別窓受付後、従来どおり物理open。新たな枝drill化はしない |
 | 右クリック「ページを開く／一覧を開く」 | `open_grid_container_with_mode`。Folderは元から対象外であり変更しない |
 | F12 | 開いたメディアの`toggle_detached_viewer_mode`による表示先変更。Folder open planには到達せず変更不要 |
 
-`global_search.drill.is_some()`でFolderの意味を決めていたのはdoubleclickと別窓受付の2箇所。
+当初は`global_search.drill.is_some()`でFolderの意味を決めるdoubleclickと別窓planの2箇所を監査したが、
+拡張子付きパスの非同期分類がplanを迂回する受付を見落としていた。独立レビューP2-1により上表を補完した。
 grepの残存箇所は、ui_mainのアドレス欄可否/ツリー前後移動、appのCtrl+上下/評価tooltip、
 gamepad_inputのツリー/フォルダ前後移動2箇所、grid_parentの親可否、context_menuの検索面判定2箇所、
 page_overviewの親可否、ui_fullscreenのフォルダ前後移動。いずれもFolderを枝/直接本に分類する述語ではなく維持した。
 既存detached回帰の期待は保ち、手製Folder fixtureだけを実際の検索投影にそろえた。既存GlobalHit fixtureも
 PDF/EPUB・動画・音声・書庫/ZIPエントリそれぞれの種類へ追従した。
 
-#### 21.17.4 検証と引き継ぎ
+#### 21.17.4 初回実装の検証と引き継ぎ
 
 通常feature、offline、基準 `2262bca58`からの未コミット差分で実施。検証中にソースを変えない。
 本体lib全件は依頼どおり設計担当へ残す。終了時の今回の変更はテストとコメント/文書のみのため、
@@ -2471,7 +2473,8 @@ PDF/EPUB・動画・音声・書庫/ZIPエントリそれぞれの種類へ追�
 先行のコンパイル時の型追従不足2件とパス表記比較のfixture不備1件は修正し、下表は修正後の結果。
 
 終了契約を確定した最終回帰5件と確認用buildは成功。今回の実装範囲に未解決の実装判断はない。
-独立コードレビュー、検収、実機確認は未実施。本体lib全件は設計担当が実施する。
+この初回引き継ぎ時点では独立コードレビュー、検収、実機確認は未実施。
+その後の設計担当の全件・独立レビューと対応は §21.17.5。本体lib全件は設計担当が実施する。
 製品起動・外部通信・評価用フォルダ参照・commitは行っていない。
 
 
@@ -2505,3 +2508,50 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 確認対象は、作成/取り込み済みの説明文で書庫とフォルダをCtrl+Gから見つけて本として開くこと、
 「書庫・フォルダの本」で絞れること、説明文削除後は結果から消えること、
 直接Folder本と子ヒットを持つ検索枝の開き分けおよび検索を閉じた後の従来のフォルダ操作。
+
+#### 21.17.5 独立レビューP2二件への対応（基準 `3012719a7`）
+
+設計担当がV2bを `3012719a7` にコミットした。設計担当の本体lib全件は15,571件中5件失敗したが、
+機械混雑時の時間切れ（10k/100k走査の性能1件を含む）であり、5件とも単独で成功したとの報告を受領。
+今回この全件を再実行した結果ではない。独立レビュー担当はdetached述語の変更を構造的修正とする判断に
+合意したと設計担当から報告された。設計担当が妥当と認めたP2二件を、次の方針で修正した。
+
+- **P2-1: 非同期分類前の意味の確定**。
+  当初の入口監査（本節の §21.17.3）では、`detached_grid_item_open_plan`とdoubleclickだけを数え、
+  `open_grid_item_in_detached_book_context_with_auto_fullscreen`が拡張子付きのパスを先に分類し、
+  Directoryの続きでplanを迂回してFolderCandidateを作る入口を見落としていた。
+  この迂回自体は基準以前にもあるが、V2bの共通判定への統合漏れである。
+  設計担当の指示どおり、共通受付で `GridItem::Folder`かつ`global_search_folder_is_branch`のときは、
+  分類を始めずfalseを返して呼び出し元へ委ねる。分類の続きから呼び出し元のdrillを再開できないので、
+  分類後に拒否する対策にはしない。新しい状態・待機・retry・window/viewport ownerは追加しない。
+  `album.epub`/`album.7z`の実フォルダについて、直接ヒット・子ヒットだけの枝・両者の重複を、
+  Enter/doubleclickが使う共通受付から検査する。枝は分類を開始せず、doubleclickは既存drill、
+  Enterは既存の物理openへ進む。直接本は実際の分類workerのDirectory完了を通して別窓のFolderCandidateに届く。
+  ここでもpointer-only drillの既存契約を変更しない。§11の記録と上表の監査入口も補完した。
+- **P2-2: 本の署名をサムネイルへ渡す**。
+  Flat/Drillで、並べ替え用には保持していた `GlobalHit::{mtime,file_size}` を直接の書庫・Folder本の
+  `image_metas`へ渡す。`fs_hit_thumbnail_meta`を共有し、ZIP/CBZ・変換書庫・直接Folder本だけが対象。
+  本の実sizeが不明ならNoneのままで、0を捏造しない。実size 0は有効なSomeとして保持する。
+  Folderの既存LoadRequestもmtime/sizeをそのまま引き継ぐことをソースと回帰で確認する。
+  画像/PDF/動画/音声、検索の枝、Aggregated代表と旧ZIPエントリのplaceholderは維持し、UIのstatは追加しない。
+  回帰はFlat/Drillのソート後も署名が行に追従すること、重複時に残る枝のplaceholderを確認する。
+  別の回帰ではRAR/7z/LZHの実ファイルと隔離した変換キャッシュを用意し、項目化→metadata→既存解決worker→
+  readonlyキャッシュ照合→サムネイル要求のcached ZIPと元署名まで通す。旧(0,0)では同じキャッシュが当たらないことも検査する。
+  検索再設計文書の「image_metasはすべてplaceholder」という記述も、U17の直接本の例外を反映した。
+
+通常feature / offline、`3012719a7`からの未コミット差分を固定して検証した。
+追加回帰3件と関連広域693件はすべて成功。本体lib全件は重複実行していない。
+本修正の独立再レビュー・検収・実機確認は未実施。製品起動・外部通信・禁止領域参照・commitは行っていない。
+
+| 検証・command | 結果と証拠 |
+| --- | --- |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/caption_extension_folder_branch_is_decided_before_detached_classification\|caption_book_thumbnail_stamps_follow_direct_hits_in_both_projections\|caption_search_book_stamps_reach_archive_cache_and_thumbnail_requests/)' --test-threads 3 --no-fail-fast` | 3件成功、exit 0。run `6b09ef20-eb1c-4748-a860-20db3493a234`、`target/v2b-review-fixes-focused.log` / `.junit.xml` |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/global_search_ui::\|detached\|folder_candidate\|converted_archive\|archive_cache::\|thumb_loader::\|caption_search_book_stamps/)' --test-threads 4 --no-fail-fast` | 693件成功、失敗0、exit 0（92.8秒）。run `3c083a85-1e5f-475f-9b85-c621ddfa16d9`、`target/v2b-review-fixes-related.log` / `.junit.xml` |
+| `cargo fmt --check` | exit 0、`target/v2b-review-fixes-fmt-check.log` |
+| `CARGO_NET_OFFLINE=true`で `.\scripts\build-dev.ps1 -PreserveRuntime` | 通常feature / dev-runtime、exit 0。core（2分47秒）・Remote・EPUB worker・MCP adapterの4本成功、PE検査runtime=4/pe=4成功。`target/v2b-review-fixes-build.log`、`target/vcrt-pe-reports/dev-runtime.json` |
+| `git diff --check` / 最後に引数なし `cargo fmt` | 引き継ぎ時に実施 |
+
+P2二件の対応を完了し、今回の範囲に未解決の実装判断はない。再レビュー・実機確認は未実施。
+UI文言の変更はない。確認用起動は §21.17.4 と同じ通常profileのコマンドを使う。
+確認する場面は、拡張子付きFolderの検索枝はdoubleclickでdrillへ進み、直接本は別窓で実フォルダを開くこと、
+変換キャッシュのあるRAR/7z/LZHの直接結果にFlat/Drillの両方で表紙を出すこと。

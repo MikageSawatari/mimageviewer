@@ -66671,6 +66671,13 @@ impl App {
         if self.document_open_modal_admission_blocked() {
             return true;
         }
+        // Resolve the accepted row's meaning before an asynchronous classifier
+        // takes ownership: its continuation cannot resume the caller's drill path.
+        if matches!(self.items.get(idx), Some(GridItem::Folder(path))
+            if self.global_search_folder_is_branch(path))
+        {
+            return false;
+        }
         if let Some(path) = self.items.get(idx).and_then(GridItem::drag_source_path)
             && Self::path_needs_open_classification(path)
         {

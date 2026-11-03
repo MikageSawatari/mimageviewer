@@ -6887,9 +6887,10 @@ detachedの述語、viewport生成/閉鎖/配置/focus routing、bookmarkのdeta
 Drill 中という理由だけで全 `Folder` を枝として拒否すると、説明文だけに当たったフォルダ本を別窓で
 開けない。症状を抑える条件の追加ではなく、採用した一覧が持つ枝集合を判断の根拠にする。
 
-detached に触れる変更は `App::detached_grid_item_open_plan` の Folder 候補判定を
-`global_search_folder_is_branch` に置き換える箇所だけ。Enter と doubleclick の共通の別窓受付がここを
-通り、検索枝は従来の受付へ返し、直接の本は通常フォルダと同じ `FolderCandidate` に渡す。
+detached に触れる変更は `App::detached_grid_item_open_plan` の Folder 候補判定と、
+`open_grid_item_in_detached_book_context_with_auto_fullscreen` の非同期分類前の受付で
+`global_search_folder_is_branch` を使う箇所。Enter と doubleclick の共通受付で検索枝を先に返し、
+直接の本は通常フォルダと同じ `FolderCandidate` に渡す。
 doubleclick の検索枝 drill 判定も同じ helper を使う。Enter は従来どおり枝も物理フォルダとして開き、
 新しく drill 操作へ変更しない。明示的な「ページを開く／一覧を開く」は既存どおり Folder を受け付けない。
 通常の F12 は、開いたメディアの `toggle_detached_viewer_mode` による表示先変更であり、Folder の
@@ -6906,3 +6907,9 @@ rollbackは加えない（VLM計画 §21.17）。`GlobalSearchState` は viewer 
 直接本と枝の共通別窓受付、通常 Enter の物理 open、兄弟 context の install を回帰対象に加える。
 自動検証結果は VLM 計画の実装台帳へ集約する。これは変更範囲と設計合意の記録であり、
 独立実装レビュー受け入れ・実機確認の完了を意味しない。
+
+独立レビュー（基準 `3012719a7`）では、レビュー担当も構造的修正であることへ合意したと
+設計担当から報告を受領した。P2-1で、拡張子付きFolderを先に非同期分類し、Directoryの続きが
+planを迂回する入口の監査漏れが見つかった。設計担当の指示どおり、分類開始前に採用済みの枝を
+共通判定してfalseを返す。続きには呼び出し元のdrillへ戻る経路がないため、分類後の拒否にはしない。
+新しいdetached状態・待機・retry・viewport/window ownerは追加しない。本修正の再レビューは未実施。

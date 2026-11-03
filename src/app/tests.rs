@@ -45171,6 +45171,152 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    #[test]
+    fn caption_search_book_stamps_reach_archive_cache_and_thumbnail_requests() {
+        use crate::archive_converter::ArchiveFormat;
+        let mut app = setup_app();
+        let root = app.tmp.path().join("caption-cache");
+        std::fs::create_dir(&root).unwrap();
+        let mut caches = Vec::new();
+        for (name, format) in [
+            ("book.rar", ArchiveFormat::Rar),
+            ("book.7z", ArchiveFormat::SevenZ),
+            ("book.lzh", ArchiveFormat::Lzh),
+        ] {
+            let source = root.join(name);
+            let cached = app.tmp.path().join(format!("{name}.zip"));
+            std::fs::write(&source, b"source archive").unwrap();
+            std::fs::write(&cached, b"PK\x03\x04").unwrap();
+            let source_meta = std::fs::metadata(&source).unwrap();
+            let stamp = (
+                crate::ui_helpers::mtime_secs(&source_meta),
+                source_meta.len() as i64,
+            );
+            let db = app.archive_cache_db.as_ref().unwrap();
+            db.record(&source, stamp.0, stamp.1, format, &cached, 4, 1, false)
+                .unwrap();
+            assert!(
+                db.peek(&source, 0, 0).is_none(),
+                "the old placeholder must not validate this cache"
+            );
+            app.global_search
+                .accumulate_hit(&crate::global_search::GlobalHit {
+                    path: source.to_string_lossy().into_owned(),
+                    kind: crate::fts_index::IndexKind::Zip,
+                    score: 1.0,
+                    mtime: stamp.0,
+                    file_size: Some(stamp.1),
+                    stars: 0,
+                });
+            caches.push((source, cached, stamp));
+        }
+        let folder = root.join("folder.epub");
+        std::fs::create_dir(&folder).unwrap();
+        let folder_mtime = crate::ui_helpers::mtime_secs(&std::fs::metadata(&folder).unwrap());
+        app.global_search
+            .accumulate_hit(&crate::global_search::GlobalHit {
+                path: folder.to_string_lossy().into_owned(),
+                kind: crate::fts_index::IndexKind::Folder,
+                score: 1.0,
+                mtime: folder_mtime,
+                file_size: Some(0),
+                stars: 0,
+            });
+        for drill in [false, true] {
+            let (items, metas) = if drill {
+                crate::global_search_ui::build_drilled_items(
+                    &app.global_search,
+                    &root,
+                    false,
+                    crate::settings::SortOrder::FileNameDesc,
+                    &[true; 6],
+                )
+            } else {
+                crate::global_search_ui::build_flat_items(
+                    &app.global_search,
+                    crate::settings::SortOrder::FileNameDesc,
+                    &[true; 6],
+                )
+            };
+            app.install_new_items(items, metas);
+            let count = app.items.len();
+            start_archive_decisions_for_test(&mut app, 0..count);
+            poll_archive_decisions_for_test(&mut app);
+            for (source, cached, stamp) in &caches {
+                let idx = app
+                    .items
+                    .iter()
+                    .position(|item| item.drag_source_path() == Some(source.as_path()))
+                    .unwrap();
+                assert_eq!(app.image_metas[idx], Some(*stamp));
+                let resolved = &app.converted_archive_cache_paths
+                    [&crate::path_key::normalize_keep_drive(source)];
+                assert!(
+                    matches!(resolved.read_source(), ConvertedArchiveSourceState::CachedZip { path, .. } if path == cached)
+                );
+                let request = make_load_request(
+                    &app.items[idx],
+                    idx,
+                    stamp.0,
+                    stamp.1,
+                    false,
+                    None,
+                    Some(crate::settings::SortOrder::Numeric),
+                    1,
+                    &HashMap::new(),
+                    &app.converted_archive_cache_paths,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                )
+                .unwrap();
+                assert_eq!(request.path, *cached);
+                assert_eq!((request.mtime, request.file_size), *stamp);
+                assert_eq!(
+                    request.resolve_override,
+                    Some(crate::thumb_loader::ResolveStrategy::ZipFirstImage)
+                );
+                assert!(request.source_policy.allows_source());
+                assert_eq!(
+                    app.archive_cache_db
+                        .as_ref()
+                        .unwrap()
+                        .peek(source, stamp.0, stamp.1)
+                        .as_ref(),
+                    Some(cached)
+                );
+            }
+            let idx = app
+                .items
+                .iter()
+                .position(|item| *item == GridItem::Folder(folder.clone()))
+                .unwrap();
+            assert_eq!(app.image_metas[idx], Some((folder_mtime, 0)));
+            let request = make_load_request(
+                &app.items[idx],
+                idx,
+                folder_mtime,
+                0,
+                false,
+                None,
+                Some(crate::settings::SortOrder::Numeric),
+                1,
+                &HashMap::new(),
+                &app.converted_archive_cache_paths,
+                None,
+                None,
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(request.path, folder);
+            assert_eq!((request.mtime, request.file_size), (folder_mtime, 0));
+        }
+    }
+
     fn start_archive_decisions_for_test(app: &mut App, indices: impl IntoIterator<Item = usize>) {
         let scope: HashSet<usize> = indices.into_iter().collect();
         let end = app.items.len();
@@ -74699,6 +74845,94 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                     matches!(app.accept_grid_container_open(&ctx, idx), Some(crate::ui_main::AddressBarNav::Direct(path, _)) if path == folder),
                     "Enter keeps its existing physical-folder open after branch admission declines"
                 );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn caption_extension_folder_branch_is_decided_before_detached_classification() {
+        let ctx = egui::Context::default();
+        for name in ["album.epub", "album.7z"] {
+            // Direct hit, branch-only, and a direct hit overlapped by a branch.
+            for (direct_hit, child_hit) in [(true, false), (false, true), (true, true)] {
+                for pointer in [true, false] {
+                    let mut app = setup_app();
+                    let root = app.tmp.path().join("caption-classified");
+                    let folder = root.join(name);
+                    std::fs::create_dir_all(&folder).unwrap();
+                    let page = folder.join("page.jpg");
+                    std::fs::write(&page, b"fixture").unwrap();
+                    app.settings.detached_viewer_open_images_in_window = true;
+                    app.settings.auto_fullscreen_image_folders = true;
+                    app.global_search.active = true;
+                    app.global_search.aggregate_auto = false;
+                    app.global_search.drill = Some(crate::global_search_ui::DrillState {
+                        container_root: root.clone(),
+                        current_path: root.clone(),
+                        is_zip: false,
+                    });
+                    for (present, path, kind) in [
+                        (direct_hit, &folder, crate::fts_index::IndexKind::Folder),
+                        (child_hit, &page, crate::fts_index::IndexKind::Image),
+                    ] {
+                        if present {
+                            app.global_search
+                                .accumulate_hit(&crate::global_search::GlobalHit {
+                                    path: path.to_string_lossy().into_owned(),
+                                    kind,
+                                    score: 1.0,
+                                    mtime: 1,
+                                    file_size: Some(0),
+                                    stars: 0,
+                                });
+                        }
+                    }
+                    app.rebuild_items_from_global_search();
+                    assert_eq!(app.items, vec![GridItem::Folder(folder.clone())]);
+                    assert!(App::path_needs_open_classification(&folder));
+                    assert_eq!(app.global_search_folder_is_branch(&folder), child_hit);
+                    // Enter and doubleclick both call this public admission before
+                    // their existing, deliberately different fallback routes.
+                    let handled = app.open_grid_container_in_detached_book_context(&ctx, 0);
+                    assert_eq!(handled, !child_hit, "{name}: pointer={pointer}");
+                    if child_hit {
+                        assert!(
+                            app.top_level_grid_view.open_path_classification().is_none(),
+                            "a branch must not start a continuation that cannot resume drill"
+                        );
+                        assert!(app.active_detached_session.is_none());
+                        assert!(app.folder_pane_open_pending.is_none());
+                        if pointer {
+                            app.drill_into_subfolder(folder.clone());
+                            assert_eq!(
+                                app.global_search.drill.as_ref().unwrap().current_path,
+                                folder
+                            );
+                        } else {
+                            assert!(matches!(app.accept_grid_container_open(&ctx, 0),
+                                Some(crate::ui_main::AddressBarNav::Direct(path, _)) if path == folder));
+                            assert_eq!(
+                                app.global_search.drill.as_ref().unwrap().current_path,
+                                root,
+                                "Enter retains its existing physical-folder fallback"
+                            );
+                        }
+                    } else {
+                        assert!(app.top_level_grid_view.open_path_classification().is_some());
+                        app.settle_open_path_classification_for_test();
+                        assert!(
+                            app.active_detached_session.is_some(),
+                            "a directly matched folder book must still open in its own context"
+                        );
+                        assert!(matches!(
+                            app.folder_pane_open_pending
+                                .as_ref()
+                                .map(|pending| &pending.purpose),
+                            Some(FolderOpenScanPurpose::GridFolderCandidate { .. })
+                        ));
+                    }
+                }
             }
         }
     }
