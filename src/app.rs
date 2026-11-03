@@ -35597,6 +35597,9 @@ impl App {
         if !self.main_folder_history_available() {
             return;
         }
+        if explicit_request {
+            self.retire_folder_tree_pane_close_navigation();
+        }
         self.cancel_unresolved_open_for_navigation(explicit_request);
         self.retire_close_returns_for_main_admission();
         // タグ結果の再検索中に子の open 等を受理したら、遅着した root 結果で

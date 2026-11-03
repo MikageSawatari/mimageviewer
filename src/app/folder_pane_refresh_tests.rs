@@ -34,6 +34,7 @@ fn tree_event_frame(app: &mut App, ctx: &egui::Context, frame: &mut u64, events:
         |ui| {
             app.handle_keyboard(ctx);
             app.render_folder_pane(ui);
+            app.post_render_main_navigation(ctx, empty_main_navigation());
             app.finish_folder_pane_presentation(ctx, true);
         },
     )
@@ -62,10 +63,278 @@ fn complete_tree_frame(
             assert!(app.render_toolbar(ui).0.is_none());
             app.render_folder_pane(ui);
             assert!(app.render_grid(ui).is_none());
+            app.post_render_main_navigation(ctx, empty_main_navigation());
             app.finish_folder_pane_presentation(ctx, true);
         },
     )
     .drop_without_applying_deltas();
+}
+
+fn empty_main_navigation() -> update_phases::MainFrameNavigation {
+    update_phases::MainFrameNavigation {
+        fav_nav: None,
+        toolbar_fav_nav: None,
+        fullscreen_close_nav: None,
+        keyboard_nav: None,
+        keyboard_nav_from_fullscreen_close: false,
+        gamepad_nav: None,
+        address_nav: None,
+        open_folder_nav: None,
+        context_nav: None,
+        folder_pane_nav: None,
+        grid_nav: None,
+    }
+}
+
+fn navigation_tree_frame(
+    app: &mut App,
+    ctx: &egui::Context,
+    frame: &mut u64,
+    events: Vec<egui::Event>,
+) -> Option<Arc<AtomicBool>> {
+    *frame += 1;
+    let mut started = None;
+    ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 600.0),
+            )),
+            time: Some(*frame as f64 / 60.0),
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            let keyboard_nav = app.handle_keyboard(ctx);
+            let (toolbar_fav_nav, address_nav) = app.render_toolbar(ui);
+            let folder_pane_nav = app.render_folder_pane(ui).0;
+            let grid_nav = app.render_grid(ui);
+            started = app
+                .folder_pane_open_pending
+                .as_ref()
+                .map(|pending| pending.cancel.clone());
+            app.post_render_main_navigation(
+                ctx,
+                update_phases::MainFrameNavigation {
+                    keyboard_nav,
+                    toolbar_fav_nav,
+                    address_nav,
+                    folder_pane_nav,
+                    grid_nav,
+                    ..empty_main_navigation()
+                },
+            );
+            app.finish_folder_pane_presentation(ctx, true);
+        },
+    )
+    .drop_without_applying_deltas();
+    started
+}
+
+fn navigation_tree_fixture() -> (AppTestEnvForTest, egui::Context, u64, PathBuf, PathBuf) {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    let root = app.tmp.path().join("nav-tree");
+    let a = root.join("a");
+    let b = root.join("b");
+    let c = root.join("c");
+    for path in [&a, &b, &c] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    app.folder_pane.test_scan_subtree(root);
+    app.load_folder(a.clone());
+    settle(&mut app, &ctx);
+    app.set_folder_tree_pane_visible(true);
+    let mut frame = 0;
+    assert_tree_location(&mut app, &ctx, &mut frame, &a);
+    app.folder_pane.set_cursor(b.clone());
+    (app, ctx, frame, b, c)
+}
+
+fn tree_key_event(key: egui::Key) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+#[test]
+fn folder_pane_frame_end_close_does_not_override_toolbar_favorite_navigation() {
+    let (mut app, ctx, mut frame, b, c) = navigation_tree_fixture();
+    app.folder_pane.set_focus_grid();
+    app.settings.show_toolbar_favorites = true;
+    app.settings.toolbar_favorites_collapsed = false;
+    app.settings.toolbar_favorites_display = crate::settings::ToolbarSectionDisplay::Buttons;
+    app.settings.favorites = vec![crate::settings::FavoriteEntry::new(
+        "C".to_owned(),
+        c.clone(),
+    )];
+    for _ in 0..3 {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+    }
+    let rect: egui::Rect = ctx
+        .data(|data| data.get_temp(egui::Id::unique(("folder_pane_test_favorite_rect", &c))))
+        .unwrap();
+    let pos = rect.center();
+    let pointer = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    navigation_tree_frame(
+        &mut app,
+        &ctx,
+        &mut frame,
+        vec![egui::Event::PointerMoved(pos), pointer(true)],
+    );
+    navigation_tree_frame(
+        &mut app,
+        &ctx,
+        &mut frame,
+        vec![pointer(false), tree_key_event(egui::Key::F)],
+    );
+    assert!(!app.settings.folder_tree_pane_visible);
+    assert!(
+        app.folder_pane_open_pending.is_none(),
+        "closing must not start cursor Open({b:?}) after the favorite won"
+    );
+    settle(&mut app, &ctx);
+    for _ in 0..3 {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+    }
+    assert_eq!(app.current_folder.as_ref(), Some(&c));
+}
+
+#[test]
+fn folder_pane_frame_end_enter_then_f_preserves_the_first_open_worker() {
+    let (mut app, ctx, mut frame, b, _) = navigation_tree_fixture();
+    let first = navigation_tree_frame(
+        &mut app,
+        &ctx,
+        &mut frame,
+        vec![
+            tree_key_event(egui::Key::Enter),
+            tree_key_event(egui::Key::F),
+        ],
+    )
+    .expect("Enter starts an Open");
+    assert!(!app.settings.folder_tree_pane_visible);
+    assert!(
+        !first.load(Ordering::Relaxed),
+        "F must not cancel Enter's worker"
+    );
+    if let Some(pending) = &app.folder_pane_open_pending {
+        assert_eq!(pending.path, b);
+        assert!(
+            Arc::ptr_eq(&first, &pending.cancel),
+            "F must not replace an already-completed Enter worker either"
+        );
+    }
+}
+
+#[test]
+fn folder_pane_frame_end_close_does_not_override_inline_search_drill() {
+    for subfolder in [false, true] {
+        let (mut app, ctx, _, _, c) = navigation_tree_fixture();
+        app.global_search.active = true;
+        if subfolder {
+            app.drill_into_container(c.parent().unwrap().to_path_buf(), false);
+        }
+        app.request_folder_tree_pane_toggle(
+            crate::ui_folder_pane::FolderPaneToggleKind::CommitCursorOnClose,
+        );
+        // These grid click handlers apply navigation immediately and return no
+        // MainFrameNavigation candidate. Their surface owner retires the commit.
+        if subfolder {
+            app.drill_into_subfolder(c.clone());
+        } else {
+            app.drill_into_container(c.clone(), false);
+        }
+        app.post_render_main_navigation(&ctx, empty_main_navigation());
+        app.finish_folder_pane_presentation(&ctx, true);
+        assert!(!app.settings.folder_tree_pane_visible);
+        assert!(app.folder_pane_open_pending.is_none());
+        assert_eq!(
+            app.global_search
+                .drill
+                .as_ref()
+                .map(|drill| &drill.current_path),
+            Some(&c)
+        );
+    }
+}
+
+#[test]
+fn folder_pane_frame_end_without_navigation_arbitration_only_closes_visibility() {
+    let (mut app, ctx, _, _, _) = navigation_tree_fixture();
+    app.request_folder_tree_pane_toggle(
+        crate::ui_folder_pane::FolderPaneToggleKind::CommitCursorOnClose,
+    );
+    app.finish_folder_pane_presentation(&ctx, false);
+    assert!(!app.settings.folder_tree_pane_visible);
+    assert!(!app.folder_pane.has_focus);
+    assert!(app.folder_pane_open_pending.is_none());
+    assert!(app.folder_pane_visibility_request.is_none());
+}
+
+#[test]
+fn folder_pane_frame_end_close_does_not_override_inline_archive_admission() {
+    use std::io::Write;
+    for zipdir in [false, true] {
+        let (mut app, ctx, _, _, _) = navigation_tree_fixture();
+        let book = app.tmp.path().join("book.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
+        writer
+            .start_file("dir/001.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"image-source").unwrap();
+        writer.finish().unwrap();
+        app.request_folder_tree_pane_toggle(
+            crate::ui_folder_pane::FolderPaneToggleKind::CommitCursorOnClose,
+        );
+        // Both handlers start an explicit main request directly, without a
+        // MainFrameNavigation candidate or a folder-pane worker.
+        if zipdir {
+            app.open_rating_view_zipdir(book, "dir/".to_owned());
+        } else {
+            // Admission is checked through the request ownership below; this
+            // regression does not consume the asynchronous archive payload.
+            let _ = app.load_folder_or_convert_archive(book);
+        }
+        assert!(matches!(
+            app.folder_pane_visibility_request,
+            Some(crate::ui_folder_pane::FolderPaneVisibilityRequest::Hide)
+        ));
+        app.post_render_main_navigation(&ctx, empty_main_navigation());
+        app.finish_folder_pane_presentation(&ctx, true);
+        assert!(!app.settings.folder_tree_pane_visible);
+        assert!(app.folder_pane_open_pending.is_none());
+    }
+}
+
+#[test]
+fn folder_pane_frame_end_automatic_refresh_retirement_preserves_cursor_commit() {
+    let (mut app, ctx, _, b, _) = navigation_tree_fixture();
+    app.request_folder_tree_pane_toggle(
+        crate::ui_folder_pane::FolderPaneToggleKind::CommitCursorOnClose,
+    );
+    // Existing automatic refresh/continuation admission is not a new explicit
+    // navigation and must not discard the user's pending cursor commit.
+    app.retire_replaced_main_list_requests_with_startup_intent(None, false);
+    app.post_render_main_navigation(&ctx, empty_main_navigation());
+    app.finish_folder_pane_presentation(&ctx, true);
+    assert!(!app.settings.folder_tree_pane_visible);
+    assert_eq!(
+        app.folder_pane_open_pending
+            .as_ref()
+            .map(|pending| &pending.path),
+        Some(&b)
+    );
 }
 
 fn frame_end_tree_toggle_scenario(case: &str) {
@@ -233,6 +502,7 @@ fn folder_pane_frame_end_composes_accepted_toggle_parity_without_intermediate_co
                 app.settings.folder_tree_pane_visible, shown,
                 "deferred until finish"
             );
+            app.post_render_main_navigation(&ctx, empty_main_navigation());
             app.finish_folder_pane_presentation(&ctx, true);
             let visible = shown ^ (count % 2 != 0);
             assert_eq!(app.settings.folder_tree_pane_visible, visible);
@@ -277,6 +547,7 @@ fn folder_pane_frame_end_composes_accepted_toggle_parity_without_intermediate_co
         for kind in [VisibilityOnly, CommitCursorOnClose, last] {
             app.request_folder_tree_pane_toggle(kind);
         }
+        app.post_render_main_navigation(&ctx, empty_main_navigation());
         app.finish_folder_pane_presentation(&ctx, true);
         assert!(!app.settings.folder_tree_pane_visible);
         assert_eq!(

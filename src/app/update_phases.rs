@@ -1149,6 +1149,12 @@ impl App {
         ctx: &egui::Context,
         navigation: update_phases::MainFrameNavigation,
     ) {
+        // Consume only the commit part here; visibility remains deferred until
+        // the frame ends. Inspect pending before polling: an Enter Open can move
+        // to ready below and must not be replaced by another cursor commit.
+        let close_cursor_nav = self
+            .take_folder_tree_pane_close_navigation()
+            .filter(|_| self.folder_pane_open_pending.is_none());
         let MainFrameNavigation {
             fav_nav,
             toolbar_fav_nav,
@@ -1209,6 +1215,15 @@ impl App {
             || address_nav.is_some()
             || open_folder_nav.is_some()
             || context_nav.is_some();
+        // Every other admitted navigation keeps its existing priority. Closing
+        // with F/Y contributes a candidate only when none of them owns this pass.
+        let folder_pane_nav = folder_pane_nav.or_else(|| {
+            if !higher_priority_than_folder_pane && grid_nav.is_none() {
+                close_cursor_nav
+            } else {
+                None
+            }
+        });
         if higher_priority_than_folder_pane {
             self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
         }

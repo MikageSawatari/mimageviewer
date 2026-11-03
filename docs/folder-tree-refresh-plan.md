@@ -390,3 +390,33 @@ P2-2の不変条件は「未確定時の代替位置と利用者が選んだ位�
 | 引数なし`cargo fmt`、`cargo fmt --check`、`git diff --check` | **各exit0** | `tree-simple-fmt-check.log`、終了時diff検査 |
 
 `app.rs`はfocusedのbroad/shared対象なので、今回は指定された全lib省略に従い上記4pathを明示し、rootのF配線は実handler回帰で検査した。fixture補正は`cfg(test)`の試験だけで、製品sourceが同じcore check/snapshot結果を再利用する。独立レビューは補正後もACCEPTを維持。指定により全lib・全snapshot・build-dev・WebView2試験・製品起動・コミットは行わない。実機Cとの原因一致と最終受入は設計担当へ引き継ぐ。
+
+### 単純な形のnavigation裁定への接続（2026-11-03、`e196c3123`追補）
+
+別担当Sol/xhighの独立レビューはP2 1件/P3 1件でREJECT。単純なframe末尾適用の方針は維持する。P2はF-closeが予約した`HideAndNavigate`が、toolbarのお気に入りC等を既存裁定が採用した後にcursor BのOpenを新しく開始して覆す退行。P3はEnterが既に開始したBのOpenを同じbatchのF-closeが再開始し、先のworkerを取り消す既存経路。共通の原因は、visibility適用がnavigation裁定の外でOpenを開始していたこと。
+
+不変条件は「表示状態はframe末尾の1点で適用する。cursor確定Openは既存main navigationの所有境界で一度だけ裁定し、同じframeの別navigationや既存pane Openを覆さない」。単純化としてcommit候補を既存裁定へ合流し、新たなbool/pending/入力順序番号や全入力routerを追加しない。検索drillのように候補を返さずその場で移動する経路も、既存main surface切替の要求退役境界へ接続する。独立readerに対する既存main-owner条件は変更しない。
+
+`post_render_main_navigation`の入口で`HideAndNavigate`を`Hide`へ変更し、**poll前**のpane Openが無い場合だけcursor候補を取得する。mouse ring/saved groupを統合したinput、folder結果、favorite/address/context等の既存優先候補、明示pane候補、grid候補を優先し、他に移動が無い場合だけ既存pane worker開始経路へ合流する。末尾ではOpenを開始せず、main chrome未描画で裁定が無いframeもvisibilityだけを確定する。直接移動する検索drillや書庫開始は共通の`retire_replaced_main_list_requests_with_startup_intent`の既存main-owner確認後、既存`explicit_request=true`の場合にcommit部分を退役させる。非明示refresh/継続とShow/Hide要求は保つ。旧即時toggle helperは唯一の呼出し元が不要となるため撤去した。
+
+修正前の実handler回帰は**2件中2失敗**（`target/tree-nav-repro.log`）。F-close＋toolbarお気に入りはCの採用後にBのpendingが残り、Enter＋Fは既にreadyへ移ったEnterのworkerとは異なるcancel Arcを持つworkerが新規開始された。追加回帰はこの2件と、候補を返さない検索drill（container/subfolder両方）、裁定無しのframeでvisibilityだけ閉じる場合、書庫/rating ZipDirの直接受理、非明示refreshの退役境界でcursor確定を保持する場合の計6件。既存frame helperも製品と同じ裁定→末尾適用の順へ合わせた。
+
+最初はsurface切替境界だけへ退役を接続し、filter86件・focused552実行・core check・関連snapshot4件が成功した（`tree-nav-*-pass1.log`）。兄弟入口の追加照合で書庫/rating ZipDirの直接開始を取りこぼすと分かり、共通の明示request受理へ接続を移した。既存`explicit_request`で非明示refreshを区別できるため、新たな世代snapshotや別routerは不要。surface側への重複接続は残さない。
+
+追補の独立Sol/xhighレビューは**ACCEPT**。poll前のOpen保護・既存優先順位・直接surface切替の所有境界を確認し、重要な未解決指摘なし。レビュー側は編集・build/test・製品起動を行わず、最終検証は実装側が担当する。
+
+最終版の検証（`MSBUILDDISABLENODEREUSE=1`、`target/tree-open-env.ps1`の既存native環境）:
+
+| 検査 | 結果 | 記録（`target/`） |
+|---|---|---|
+| `cargo nextest run -p mimageviewer --lib -E 'test(/folder_pane/)' --no-fail-fast` | **88成功/失敗0、18.155秒、exit0**。新規6回帰を含む | `tree-nav-filter-final.log`（注記補正前も`tree-nav-filter.log`で88成功） |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/ratingnav649::/)' --no-fail-fast` | **17成功/失敗0、10.105秒、exit0**。既存main裁定を使う一覧順navigationも維持 | `tree-nav-arbitration.log` |
+| `scripts/test-focused.ps1 -Path @('src/ui_folder_pane.rs','src/ui_main.rs','src/app/folder_pane_refresh_tests.rs','src/app/update_phases.rs','src/app/gamepad_input.rs')` | **18/384/39/3/110件成功、計554実行（重複あり）、exit0** | `tree-nav-focused.log`、各runの台帳pathは同logに記録 |
+| `scripts/test-focused.ps1 -Path @('src/app/folder_pane_refresh_tests.rs')` | **39成功/失敗0、18.592秒、exit0**。試験の注記補正後の再確認 | `tree-nav-focused-app-final.log`、`test-focused/runs/20261103T051055906Z-c0b34290` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **exit0** | `tree-nav-check.log` |
+| `cargo test --test ui_snapshot folder_pane` | **4成功/失敗0、1.83秒、exit0**。画像更新なし | `tree-nav-snapshot.log` |
+| 引数なし`cargo fmt`、`cargo fmt --check`、`git diff --check` | **各exit0** | `tree-nav-fmt-check.log`、終了時diff検査 |
+
+追加の一覧順filterは最初にfile名で指定して0件だったため、実module名`ratingnav649::`へ補正した（`tree-nav-arbitration-empty-filter.log`）。製品の失敗ではない。全lib・全snapshot・build-dev・製品起動・コミットは指定により省略する。
+
+終了時、追加archive試験で非同期payloadの戻り値を意図的に消費しないことを`let _ =`とcommentで明示し、新規unused-must-use warningを除いた。受理の成否は既存のrequest所有assertで引き続き確認する。試験だけの注記補正で製品source/挙動は同一のためcore/snapshot/他群は上記結果を再利用し、影響するApp回帰群とfolder pane filterを再確認して成功した。既存lib test warning数153へ戻り、追加したwarningは残っていない。

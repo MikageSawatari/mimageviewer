@@ -60,6 +60,8 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.694 左のフォルダツリーを最初に開いたとき、現在地が表示されない — v5 試用ビルドの利用者確認 (2026-11-03)
 
+- `e196c3123`のnavigation追補（2026-11-03）: 別担当レビューREJECTのP2（F-closeのcursor Openがtoolbarお気に入り等の採用を覆す退行）とP3（Enter＋Fで同じOpenを再開始する既存経路）は、修正前の実handler回帰2件とも失敗して確認。visibilityのframe末尾適用は維持し、cursor確定は既存navigation裁定のfallbackへ移した。poll前の既存pane Openと他の移動候補を優先し、検索drill・書庫の直接移動も共通の明示main request退役境界へ接続する。既存`explicit_request`を使って非明示refreshは保護し、新bool/pending/入力順序番号は追加しない。回帰6件を追加、追補の独立Sol/xhighレビューはACCEPT。原因・修正・最終検証記録は§11へ追記。
+- navigation追補の状態: **実装・検証完了、独立レビューACCEPT**。folder pane88件、focused5群554実行（重複あり）、既存一覧順navigation17件、core check、snapshot4件、引数なしfmt/fmt check/diff checkが成功。試験の戻り値破棄を明示する注記補正後もApp39件とfolder pane88件を再確認済み、新規warning・画像更新なし。全lib・build-dev・製品起動・コミットは指定により省略。
 - サブPC Cのfocus差への再追補（2026-11-03）: 同じbatchのgrid release→Fで先行したtree focusを後段gridのreleaseが奪う既存経路を再現。入力ordinal案`90a6da40e`は独立レビューのP2 2件でREJECTとなり`517d0b5ce`でrevert済み。利用者決定に従い、F・toolbar・gamepad Yの開閉をtypedな最終要求1つへ合成し、click処理後の既存frame終端で一度適用する形へ変更。gamepad Aも追加commitなしのcloseを同じ点へ寄せる。複数受理は偶奇で反転し、途中closeでは移動しない。同じ描画内のF→clickではtree focusが残り、非表示F→矢印は一覧を動かす制限を承認済み。keymap API・detached経路・下寄りの末尾clampは変更しない。設計の簡素化・採らなかった案・検証結果は§11へ記録する。実機Cと再現条件の一致は未確定。
 - 再追補の状態: **実装完了・独立Sol/xhighレビューACCEPT**。修正前5件中3失敗を確認し、新規9件を含むfolder pane82件、focused4群545実行（重複あり）、core check、関連snapshot4件、引数なしfmt/fmt check/diff checkが成功。初回filterのfixture誤り1件は検査を補正して再実行し解消、製品の追加変更なし。画像更新・全lib検証・build-dev・起動・コミットは行わず、設計担当へ引き継ぐ。
 - 状態: **P2追補2件を含め実装完了・独立レビューACCEPT (2026-11-03)**。利用者報告の初期現在地・実機での原因一致は未確認。初回実装時の通常snapshot全件はexit2173で途中終了し、原因未特定（同一4並列のCDB診断は226件成功、通常の関連4件も成功）。この制限を成功で置換しない。追補のbuild・コミット・全lib検証・最終受入は設計担当。実装/検証記録は[ツリー再照合の計画 §11](folder-tree-refresh-plan.md#11-1694-ツリーを開いたときの現在地表示-2026-11-03)。
