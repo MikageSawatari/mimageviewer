@@ -2633,6 +2633,8 @@ UI文言の変更はない。確認用起動は §21.17.4 と同じ通常profile
    - 対象は `Cursor` と `FolderCursor`。**受け付けたときの `granted` (snapshot と版の組) を `ReadContext` へ通し**、cursor を作るときも検査するときもその版を使う。途中で版だけを読み直さない
      (snapshot と版の取得の時点が分かれるため。独立レビュー 24 回目 P3)。続きの要求の受付の版が cursor の版と違えば `PermissionChanged` で拒む
      (連携全体が無効なら今どおり `Disabled`)。
+   - **受付順序の例外**: ツール自体の許可 (縮小画像) が外れた場合は、cursor の検査より前の受付で `Disabled` になる。
+     縮小画像 ON で取得した `get_thumbnail` の cursor でも、連携が有効なまま縮小画像だけ OFF にした続きはこの扱い。既存の拒否の動きは変えない。
    - cursor の版 (`version`) を 3 に上げ、古い cursor は今どおり `BadRequest` (「最初からやり直してください」) にする。
    - 説明文の許可だけでなく、すべての許可の変更に同じく効く。
    - 許可の版はプロセスの中の番号なので、mIV を再起動すると同じ番号が出ることがある。その場合は続きが受け入れられるが、検索は今の許可で行うので、許可の無い内容は出ない。
@@ -2772,3 +2774,24 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 
 既存の説明文がある画像・本で、AI 連携の説明文チェックの ON/OFF、説明文だけの語による検索と項目情報、
 許可変更後の続きの取り直しを確認する。本体 lib 全件・sandbox 外の IPC・実アプリでの確認と検収は設計担当へ引き継ぐ。
+
+#### 21.19.3 独立レビュー P3 対応 (基準 `6e1a8ff79`)
+
+設計担当の判断に従い、縮小画像の許可を取り消した `get_thumbnail` の続きが、cursor の検査より前の受付で `Disabled` になる既存の順序を維持した。
+§21.18.2 の 5 と MCP 計画 §15.2 に、ツール自体の許可が外れた場合の例外を明記。製品コードは変更していない。
+
+回帰は既存の読み取り worker fixture と実際の `Connection::request` を使う。縮小画像 ON の要求から受付の版を持つ cursor を得て、
+同じ版では cursor の検査に通ることを確認してから縮小画像だけ OFF にする。連携は ReadOnly のまま、cursor 自体の版の検査は `PermissionChanged` になるが、
+続きの要求は worker を起動せず受付で `Disabled` になり、読み取り回数も増えないことを検査する。実画像のデコードや製品起動は行わない。
+
+通常 feature / test profile、未コミット差分で次の関連 3 件だけを実行し、exit 0 / 3 成功 / 15,647 除外。
+コンパイル 2 分 54 秒、テスト 0.291 秒。run `7fbce432-c94d-45a5-8e1a-7894440603de`、ログは `target/v3-p3-thumbnail-cursor.log`。
+追加の受付順序回帰と、既存の入力 offset 継続・画像/metadata 予算による cursor 継続の回帰が通った。
+
+```powershell
+cargo nextest run --offline -p mimageviewer --lib -E 'test(=agent_ipc::media_read_tests::thumbnail_cursor_revocation_is_disabled_at_admission_before_epoch_validation) | test(=agent_ipc::thumbnail::tests::continuation_starts_at_input_offset_without_reopening_earlier_sources) | test(=agent_ipc::thumbnail::tests::image_and_metadata_budgets_keep_attachments_in_sync_and_cursor_advancing)' --no-fail-fast
+```
+
+最後に `cargo fmt` (引数無し) を実行。`git diff --check` も成功。コミットは行わない。
+test-only / 文書のみの変更のため、依頼どおり確認用ビルド・本体 lib 全件・MCP/agent-ipc 全件・UI snapshot は再実行しない。
+設計担当から報告された `6e1a8ff79` の本体 lib 全件の失敗補完成功、MCP/agent-ipc 83 件 (名前付きパイプ込み)、UI snapshot 224 件の成功は、設計担当の観測として再利用する。

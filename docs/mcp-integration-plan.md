@@ -1160,6 +1160,8 @@ U8 で 1 段足して 6 段にする。順序のある 1 つの選択のまま (
 - 設定の自動転送では、3 つのチェックも `agent_level` と同じく移行対象外にする。
 - V3: `ReadContext` は受付の `(PermissionSnapshot, epoch)` を一組で保持し、`Cursor` と `FolderCursor` の作成・検査にその版を使う。
   cursor の版は 3。続きの受付で許可の版が違えば `PermissionChanged`、連携全体が無効なら `Disabled`、旧版は `BadRequest`。
+  ただし、ツール自体の許可 (縮小画像) が外れた場合は、cursor の検査より前の受付で `Disabled` になる。
+  縮小画像 ON で取得した `get_thumbnail` の cursor でも、連携が有効なまま縮小画像だけ OFF にした続きはこの例外に当たる。
   版はプロセス内の番号なので再起動後に一致することはあるが、検索対象は現在の許可から作る。再起動を越えた件数ずれは既定の割り切りとする。
   `PermissionSnapshot.ai_captions` は serde の既定 false。未リリースで core/adapter を同時配布するため agent protocol は 2 のまま、tool の一覧も変えない。
 
