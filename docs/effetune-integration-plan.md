@@ -311,7 +311,11 @@ enum EffectiveState {
   無効。区間外または有効区間で `enabled == true` のプラグインが 1 つでもあれば `Effective`。
   (上流 `aggregatePipelineLatency` と同じ有効判定)
 - それ以外は `Inert`。
-- ランプは最後に取得できた判定を表す。窓を開いている間の変更は、窓を閉じるまで反映しない (ツールチップに明記)。
+- ランプは最後に確定した判定を表す。窓を開いている間の変更は、窓を閉じるまで反映しない (ツールチップに明記)。
+  §1.695（2026-11-03）: 保存状態がないロード直後の初回captureは、WebView JSの既定チェーン生成前で
+  あり得るため、bytesは取得・検証・保存しつつ、判定だけ既存の`None`（未確認）とする。
+  capture jobの`InitialUnsaved`/`Confirmed`で採用時に区別し、UI側で判定を後から消す競合窓は作らない。
+  未確認は非点灯で説明に未確認と明記する。窓を閉じた後/終了時と保存状態がある初回は従来どおり確定する。
 - `Unparseable` は起動条件では起動する側に倒す。ランプは点けない。ファイルは書き換えない
   (取得に成功した新しい状態でだけ置き換える)。
 
@@ -2117,8 +2121,22 @@ main subclassだけでは直前の前面窓を取得できなかった。before-
 z-order案も検討した。その後、利用者が「前面かどうかによってボタン動作を変える」要件自体を撤回した。
 前面判定と別streamの対応付けをなくす単純化であり、時間推測や初回操作だけの制限で補わない。
 
-ボタンは引数なしの一入口にし、mouse/keyboardの違いで分岐しない。既存のhost-control workerへ
-ShowIntent::Manualを配送し、host GUI threadのset_gui_visibility_checked→activate_guiで表示・復元・前面化する。
+ボタンは引数なしの一入口にし、mouse/keyboardの違いで分岐しない。
+§1.693追補（2026-11-03、設計担当判断）: 既に可視かつ非最小化のeditorは、既存のvisible editor
+snapshotにあるHWND/PIDをnativeの生存・PID・可視性と照合し、入力を受けたmIVのUI threadから
+SetForegroundWindowを一度だけ呼ぶ。この場合hostへShowを送らず、visibility/requestedの正本は変更しない。
+成功した手動表示と同じ境界で自動表示機会を消費し、未表示AutoVideoのrevisionを失効させる。
+Remote/最小化連番のpermit検査は前面化にも残す。非表示・最小化・未attachのeditorは従来どおり
+host-control workerへShowIntent::Manualを配送し、host GUI threadの
+set_gui_visibility_checked→activate_guiで表示・復元・前面化する。
+AutoVideoは従来どおり非アクティブ表示し、UIからの前面化を呼ばない。
+呼出し元の棚卸し: Runningのtoolbarは`request_show_gui`、Loading完了の`App::poll_effetune`は
+保持していたManual/AutoVideoを`request_show_gui_with_permit`へ渡す。Runningの自動表示も
+`try_auto_open`から同じ入口へAutoVideoを渡す。いずれもAppのUI threadで、一般VSTのactivate経路は変更しない。
+UIのSetForegroundWindowとworkerのAllowSetForegroundWindowは、成功時もAPI結果・対象HWND/PID
+（Allow側は対象PID）・前後のforeground HWND/PIDを一行へ記録する。hostのAPI結果は取得していない。
+許可失効という実機原因は未確定。非表示から開く場合のhost前面化を外す変更は、計装の結果を見て判断する。
+今回host C++・protocol・CMake成果物は変更しない。
 UIはFS/DB/IPCやhost完了を待たず、二番目のvisibility owner・foreground cache・入力hook・vendor注釈は不要。
 GuiButtonAction/Hide分岐、ClickForegroundとmouse/pointer/touch捕捉、未使用のDSP foreground predicate、
 ボタン専用HostCommand::Hide/pending_hide/request_hide_guiを撤去する。main subclassはmainの表示・最小化と
@@ -2130,8 +2148,10 @@ GuiGate配送に必要なので残す。Close由来のcapture_on_hideとhost通�
 Remote中のPCボタン抑止と「窓を表示できない/接続後に元の表示を戻す」説明、配信の音響調整は維持する。
 portable非表示、settings_transfer/設定field/保存書式は変更しない。privacy/製品ページの通信説明にも影響しない。
 
-回帰は実App toolbar入口→fake HostCommand境界でhidden/back/frontがすべてManual Showを一回だけ送り、
-host結果前にUIがvisibilityを変更しないこと、GuiUserHidden/正常矩形→再表示で位置とDSP/点灯が保たれることを確認する。
+回帰は実App toolbar入口→fake HostCommand境界（実HWNDなしでは従来のchecked Show）と、
+native前面化境界を注入したcontrollerの可視/非表示分岐を検査する。可視窓ではcaller threadで一度処理し、
+host未配送・visibility/DSP保持・自動要求失効、非表示/AutoVideoは従来配送・失効permitは直接前面化しないことを確認する。
+GuiUserHidden/正常矩形→再表示で位置とDSP/点灯が保たれることも維持する。
 既存のRemote permit、main最小化、Close/frame identity、host allocation/protocol v7の回帰は維持する。
 前面判定専用の旧回帰は要件撤回に合わせて撤去し、成功を装うskipや期待値の緩和に置き換えない。
 まれな保存/配送失敗は既定のlog＋通知、再起動等の単純な入口で扱い、多段回復やretry loopは追加しない。

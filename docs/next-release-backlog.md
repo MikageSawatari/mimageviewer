@@ -58,6 +58,22 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - >>694・696 は §1.675、>>697 は §1.676、>>704 の一覧順移動は §1.682、>>707・710 の左ツリー更新は §1.686 に記録済み。内部 D&D は保留側 §1.464 に経緯を追補し、今回実装採用した扱いにはしない。>>688 の左クリック割り当て・>>695 のバックアップは >>690・699 で現仕様・既存機能を案内したもので、新規対応の確約はない。
 - 未記載だった >>717・718 と返信 >>721・722 は §1.688〜1.692 へ分けて追加。>>702・706・719・720 と返信 >>723、他アプリ調査は保留側 §1.687 へ記録した。仕様検討・再現待ちを実装確約と混同せず、各項目の収録版は未定。今回の照合範囲は >>687〜723 で、スレ全体を再監査した主張ではない。
 
+### 1.696 非モーダル窓の上に、後ろの一覧の選択情報が重なる — v5 全般チェック (2026-11-03)
+
+- 観測（サブPC担当、v5 dev `2185a9b09`、隔離data-dir、`C:\miv-subpc\results-7\notes.md` 第4部）: AI連携窓の上に、後ろの一覧の「test.mp4 長さ1:00」「img_002.jpg 画像1600×1000」等が重なった。AI連携窓はv5にだけ存在する。masterの非モーダル「アップスケールタスク」で同じ症状が起きる可能性はコード上の推定で、実機観測ではない。
+- コードで確認した原因: 表示はhoverではなく`render_selection_info`の非interactable Area。既存のmodal抑止だけでは、Windowと同じMiddle orderの追加順が残るeguiのlayer登録を制御できない。Windowの後で初めて選択情報を描くと、Windowより前になる経路がある。
+- 修正: 選択情報専用のBackground layerを`LayerId::background()`のsublayerとして背景直上へ固定した。色・位置・文字・最大3行・入力透過とmodal時の抑止は維持する。Windowをmodalへ変更せず、背景の一覧操作を保持する。新しい窓別bool・表示抑止一覧・repaintは追加しない。
+- 他のAreaとの関係: 明示Middleの音楽modal backdropとcontent_restore backdropは既存のviewer/modal抑止により選択情報と同時表示しない。native_video_perf_overlayもMiddleだが別viewport/contextであり、上下関係に影響しない。固定編集パネル、チェック件数、進捗・読込・エラー表示はForegroundなので、従来どおり選択情報より上。mainの通常バー/グリッドを描く背景よりは上に保つ。Windowを含むMiddle全体より下へ置くのが採用した方針。
+- 検証: 実rendererとeguiの最終paint出力で、Window先行/選択情報先行、両方の呼び出し順、非表示からの再表示を検査し、背景より上・Window/固定Middle Areaより下・入力透過を検査した。新規2件と既存modal抑止を含む`test(/selection_info/)`35件成功（`target/ui-fixes-1695-D2.log`、native exit 0）。初回は新規fixtureのWindow ID参照が誤っており、描画順assert後の矩形取得で2件失敗した。IDを明示して再実行し解消、製品の追加変更なし。共通検証・snapshot結果は§1.693へ集約する。実機では非モーダル窓を開く前後で一覧を選択し、窓を動かして重ね、一覧操作を継続できることを確認する。
+
+### 1.695 音響調整を初めて開くと、エフェクトがあっても「エフェクトが無い」と説明される — v5 全般チェック (2026-11-03)
+
+- 観測（サブPC担当、v5 dev `2185a9b09`、新しい隔離data-dir、`C:\miv-subpc\results-7\notes.md` 第2部）: EffectsにVolume（-6 dB）とLevel Meterがあり、窓をまだ一度も閉じていないのに、ボタンの説明が「エフェクトが無いか、全体バイパス中」だった。
+- コードで確認した原因: 保存状態の有無にかかわらず、load workerの初回captureが`CaptureQueue.latest.effective`へ確定判定を公開していた。WebView JSによる既定チェーン生成前の空pipelineがInertとして窓を閉じるまで残る経路がある。サブPCのJS/capture実行順そのものは未計測で、判定関数の誤りではない。
+- 修正: capture jobに`InitialUnsaved`/`Confirmed`の確認区分を持たせ、保存状態なしの初回だけ既存の`None`（未確認）として公開する。bytesの取得・検証・保存は維持する。保存状態がある初回と、窓を閉じた後・終了時のcaptureは従来どおり確定。未確認の間は非点灯で、説明は「設定は未確認です（設定の窓を閉じると判定します）」とし、Inertと断定しない。mIV Sound/hostの通知や保存書式は変えない。
+- 単純化: 既存の未確認値を使い、別の待機state・通知・定期capture・再試行を追加しない。通常操作を止める必要はない。
+- 検証: 実capture queueとAppの表示判定を通し、保存状態なし初回→未確認/非点灯→Close capture→確定/点灯、保存状態あり初回→確定/点灯の新規2件を追加した。`test(/effetune/)`123件成功（`target/ui-fixes-1695-C.log`、native exit 0）。共通検証・snapshot結果は§1.693へ集約する。実機では新規data-dirで初回表示中の説明と、×で閉じた後の説明・点灯、保存後の再起動を確認する。
+
 ### 1.694 左のフォルダツリーを最初に開いたとき、現在地が表示されない — v5 試用ビルドの利用者確認 (2026-11-03)
 
 - `42676f3dd`のpending宛先追補（2026-11-03）: 別担当レビューP2を修正前回帰1件の失敗で確認。BのOpen待機中にcursorをCへ動かしてF確定しても、一律pending保護でCが捨てられていた退行。poll前にpending.pathとcursor候補を既存`folder_tree::path_eq`で比較し、同先だけ重複として保護、異先は既存cancel/startまたはready置換で確定する。新bool/pendingを追加せず、既存navigation優先順位・明示request退役・frame末尾visibilityは維持。原因・実click/矢印/F回帰・検証記録は§11へ追記。
@@ -77,13 +93,19 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.693 音響調整の窓が後ろに回ったとき、「音響調整」ボタンで前面に出ないことがある — v5 のサブ PC 確認 (2026-11-02)
 
-- 状態: **原因未特定・製品未修正。v4 系にも同じ作りがある (v5 固有ではない)**。収録版は未定 (v5 の作業中に計装するかは利用者と相談)。
+- 状態: **可視窓の前面化をRust側で修正済み（2026-11-03）。実機原因・修正後の実機挙動は未確認**。v4系にも同じ作りがある（v5固有ではない）。
+- 追加観測（サブPC担当、2026-11-03、v5 dev `2185a9b09`、隔離data-dir、`C:\miv-subpc\results-7\notes.md`）: 可視・非最小化の音響調整窓を背面へ回してボタンを押すと12回中3回だけ前面へ出た。失敗時のforegroundはmIV。ボタンクリックやnative APIの成否はログに残っていなかった。
+- 確認した構造・採用範囲: 可視窓にもworker→IPC→host GUI threadの前面化を要求し、AllowSetForegroundWindowの返り値は捨て、hostのSetForegroundWindow成否は表示ACKへ反映していなかった（成功時のSetFocusには使う）。許可失効が実機原因かは未確定。設計担当判断で、既に可視・非最小化の場合だけmIVの入力UI threadで直接前面化し、host Showは送らない。HWND/PIDは既存snapshotから取得しnativeでも照合する。表示状態は変更せず、手動表示の自動要求失効とRemote/最小化permitを保持する。
+- 非表示・最小化・初回attachは従来のchecked host表示・復元・前面化を維持する。UIのSetForegroundWindowとworkerのAllowSetForegroundWindowに、成功も含む結果・対象・前後のforeground HWND/PIDを一行ずつ記録する。hostの成否は未計装で、host前面化を外す変更はこの計装の結果を見て判断する。C++/CMakeは変更しない。AutoVideoは従来の非アクティブ表示。
+- 単純化: 可視窓の要求を同期的な前面化だけで完了し、新pending・再試行・遅延・TOPMOST・owner変更を加えない。通常操作を止めるモーダル化は不要。
+- 個別検証: 可視/非表示/最小化の命令選択、caller threadでの直接処理・host未配送・表示状態/DSP保持、自動表示のhost配送、失効permitの前面化禁止を新規4件で検査した。A単独時点の`test(/effetune/)`121件成功（`target/ui-fixes-1695-A3.log`、native exit 0）。初回は新規fixture2件のslot未配置を補正して再実行した。実機では可視背面からのクリック、前面化後の窓内操作、非表示/最小化からの表示・復元、Remote中の抑止、自動表示がfocusを奪わないことを確認する。
+- A/C/D共通検証（同一未コミットRust差分）: `target/tree-open-env.ps1`を読み込み、`scripts/test-focused.ps1 -Path src/effetune/mod.rs,src/video/dsp/foreground.rs,src/video/dsp/mod.rs,src/ui_main.rs`の4群69/1/35/386件（491実行、重複あり）が成功、exit 0。台帳は`target/test-focused/runs/20261103T063822158Z-a847cb8f`、`20261103T063833971Z-c2b75b88`、`20261103T063841958Z-16d7c255`、`20261103T063850584Z-378f3987`。`cargo check -p mimageviewer --bin mimageviewer-core`も成功（`target/ui-fixes-1695-core-check.log`、native exit 0）。引数なし`cargo fmt`と`cargo fmt --check`、UI glyph lint（危険文字0）、diff checkも成功。WebView2テスト・製品起動・全lib・build-dev・コミットは指定により実施しない。
+- snapshot通常比較: `cargo test -p mimageviewer --test ui_snapshot <filter> -- --test-threads=1`を、`effetune_show_only`（2件）、`book_manager_`（6件、Window操作geometry 1件を含む）、`thumbnail_name_style_multiline`（1件）で実行し、すべてnative exit 0。ログは`target/ui-fixes-1695-snapshot-{effetune,window,thumbnail}.log`。画像基準は更新していない。既存PNGはDの重なりそのものを撮っていないため、Dの層順・入力透過は上記の新規paint回帰で検証する。最終のRust変更4ファイルのhashは`target/ui-fixes-1695-source-hashes.json`へ保存し、検証後も不変だった。実機の前面化・WebView初期化順・実窓の重なりは未確認のまま設計担当へ引き継ぐ。
 - 観測 (サブ PC 担当、2026-11-02、v5-integration の dev build + mIV Sound 候補、隔離データ、操作は画面操作ツールの SendInput): 「音響調整」で開いた mIV Sound の窓 (別プロセス `mimageviewer-vst3-host.exe`) が、初回は mIV の後ろに隠れ、2 回目で前に出た。その後、mIV を最大化した状態で後ろに回ったとき、3 回押しても前に出なかった (窓は可視のまま)。v4.11.0 (Mixwright) での実機確認はしていない。記録は `C:\miv-subpc\results-4\` と v5-integration の `docs/v5-integration.md` §7 (A1)。
 - 設計上の期待: `docs/effetune-integration-plan.md` §17.12 (2026-10-13 利用者決定) でボタンは「表示・前面化」。
 - コード調査 (2026-11-02、Codex 読み取り調査、v5-integration `dd5a3f71b` と master `c728cd613` を比較): ボタン → `effetune_toolbar_click` → `request_show_gui` (`ShowIntent::Manual`) → host-control worker が editor を attach → IPC 送信直前に `AllowSetForegroundWindow(bridge pid)` (`src/video/dsp/mod.rs` 1873 付近、返り値は捨てている) → host の GUI thread で `SW_SHOWNA` → plugin のサイズ通知・再描画 → `SetForegroundWindow(container)` (`crates/vst3-host/src/plugin_loader.cpp` 1877 付近)。host は `SetForegroundWindow` の失敗を返さず、`requested && IsWindowVisible` だけで "shown" と応答する (同 1941 付近)。owner は意図的に 0 (2026-09-30 の利用者決定「main をクリックして Sound を背面へ回せる」)。master と v5 で、この経路は同じ。
 - 原因の候補: mIV が渡した前面化の許可が、IPC・host のキュー・plugin のコールバックを経て `SetForegroundWindow` が呼ばれるまでの間に失効する (移譲先以外への入力などで失効する Windows の仕様)。最大化固有・v5 固有の原因は確認できていない。既存のログに API の成否がないため、ここで止まる。
-- 次の一手 (直す前に): 境界の計装。mIV 側の request ID・対象 PID・`AllowSetForegroundWindow` の成否と失敗時のエラー、host 側の permit の受理 / 取消・`SetForegroundWindow` の成否・前後の foreground HWND/PID、対象窓の activation・最小化・z-order の遷移と main の TOPMOST 属性。これで「許可失敗」「許可後の失効」「要求取消」「成功後に背面へ戻された」を分ける。
-- 直し方の第一候補 (計装の結果を見てから決める): 表示・復元は host、前面化は入力元の mIV プロセスが担当する (host の checked Show 完了後に、mIV から対象 frame に一度だけ `SetForegroundWindow`)。retry・delay・TOPMOST は採らない。main を恒久 owner にする案は利用者決定と矛盾するので採らない。
+- 旧調査時の候補: 非表示から開く場合もhostのchecked Show完了後にmIVから前面化する案を挙げたが、host C++変更が必要なため今回の採用範囲には含めない。mainを恒久ownerにする案は利用者決定と矛盾するので採らない。
 
 ### 1.691 Everything 検索欄で、文字列の一部を選択・切り取りしづらい原因を調べる — 5ch >>718 (2026-11-02)
 
