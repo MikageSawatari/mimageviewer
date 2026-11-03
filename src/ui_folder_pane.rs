@@ -4,7 +4,8 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::folder_pane::{
-    self, FolderPaneCommand, FolderPaneCursorScroll, FolderPaneListingOptions, FolderPaneTreeKey,
+    self, FolderPaneCommand, FolderPaneCursorScroll, FolderPaneFocusInput, FolderPaneInputOrder,
+    FolderPaneInputPosition, FolderPaneListingOptions, FolderPaneTreeKey,
 };
 use crate::ui_main::AddressBarNav;
 
@@ -16,6 +17,141 @@ const FOLDER_PANE_PANEL_ID: &str = "folder_tree_pane";
 const FOLDER_PANE_ROW_HEIGHT: f32 = 24.0;
 const FOLDER_PANE_INDENT_WIDTH: f32 = 14.0;
 const FOLDER_PANE_ARROW_WIDTH: f32 = 24.0;
+
+fn ordered_focus_input(
+    ctx: &egui::Context,
+    position: FolderPaneInputPosition,
+) -> FolderPaneFocusInput {
+    FolderPaneFocusInput::Ordered(FolderPaneInputOrder {
+        viewport: ctx.viewport_id(),
+        frame: ctx.cumulative_frame_nr(),
+        position,
+    })
+}
+
+pub(crate) fn folder_pane_focus_input_for_command(
+    ctx: &egui::Context,
+    input: crate::keymap::KeyActionInputOrder,
+) -> FolderPaneFocusInput {
+    ordered_focus_input(
+        ctx,
+        match input {
+            crate::keymap::KeyActionInputOrder::RawEvent(event) => {
+                FolderPaneInputPosition::Event(event)
+            }
+            crate::keymap::KeyActionInputOrder::AfterInputBatch => {
+                FolderPaneInputPosition::AfterInputBatch
+            }
+        },
+    )
+}
+
+fn focus_position_for_key(
+    input: &egui::InputState,
+    matches: impl Fn(&egui::Event) -> bool,
+) -> FolderPaneInputPosition {
+    let Some(event) = input.events.iter().find(|event| matches(event)) else {
+        return FolderPaneInputPosition::AfterInputBatch;
+    };
+    let mut raw = input
+        .raw
+        .events
+        .iter()
+        .enumerate()
+        .filter(|(_, original)| *original == event);
+    match (raw.next(), raw.next()) {
+        (Some((index, _)), None) => FolderPaneInputPosition::Event(index),
+        _ => FolderPaneInputPosition::AfterInputBatch,
+    }
+}
+
+fn focus_input_for_key(
+    ctx: &egui::Context,
+    matches: impl Fn(&egui::Event) -> bool,
+) -> FolderPaneFocusInput {
+    let position = ctx.input(|input| focus_position_for_key(input, matches));
+    ordered_focus_input(ctx, position)
+}
+
+/// Use only an already adjudicated response. Raw input supplies its order, never
+/// another click. Uncorrelated native/synthetic commands execute at batch end.
+pub(crate) fn folder_pane_focus_input_for_response(
+    response: &egui::Response,
+) -> FolderPaneFocusInput {
+    let ctx = &response.ctx;
+    let targets = ctx.pointer_button_targets();
+    let keyboard_focus = response.has_focus();
+    let accesskit_id = response.id.accesskit_id();
+    let position = ctx.input(|input| {
+        let pointer = input
+            .raw
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    ..
+                } => Some((index, pos, button, pressed)),
+                _ => None,
+            })
+            .zip(targets.iter())
+            .filter(
+                |(
+                    (_, pos, button, pressed),
+                    (target_pos, target_button, target_pressed, widget, allowed),
+                )| {
+                    !**pressed
+                        && **pos == *target_pos
+                        && **button == *target_button
+                        && **pressed == *target_pressed
+                        && *widget == Some(response.id)
+                        && *allowed
+                },
+            )
+            .map(|((index, ..), _)| index)
+            .last();
+        let mut activations = input
+            .events
+            .iter()
+            .filter(|event| match event {
+                egui::Event::AccessKitActionRequest(request) => {
+                    request.target_node == accesskit_id
+                        && request.target_tree == egui::accesskit::TreeId::ROOT
+                        && request.action == egui::accesskit::Action::Click
+                }
+                egui::Event::Key {
+                    key: egui::Key::Enter | egui::Key::Space,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } => keyboard_focus && *modifiers == egui::Modifiers::NONE,
+                _ => false,
+            })
+            .map(|event| {
+                let mut raw = input
+                    .raw
+                    .events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, original)| *original == event);
+                match (raw.next(), raw.next()) {
+                    (Some((index, _)), None) => FolderPaneInputPosition::Event(index),
+                    _ => FolderPaneInputPosition::AfterInputBatch,
+                }
+            });
+        match (pointer, activations.next(), activations.next()) {
+            (Some(index), None, None) => FolderPaneInputPosition::Event(index),
+            (None, Some(position), None) => position,
+            // No source, or multiple possible sources for the response's single
+            // accepted activation. Do not arbitrarily borrow an older source.
+            _ => FolderPaneInputPosition::AfterInputBatch,
+        }
+    });
+    ordered_focus_input(ctx, position)
+}
 
 fn show_folder_pane_panel<R>(
     root_ui: &mut egui::Ui,
@@ -220,6 +356,14 @@ fn draw_folder_pane_row(
 
 impl App {
     pub(crate) fn set_folder_tree_pane_visible(&mut self, visible: bool) {
+        self.set_folder_tree_pane_visible_from_input(visible, FolderPaneFocusInput::Programmatic);
+    }
+
+    pub(crate) fn set_folder_tree_pane_visible_from_input(
+        &mut self,
+        visible: bool,
+        input: FolderPaneFocusInput,
+    ) {
         self.settings.folder_tree_pane_visible = visible;
         if visible {
             let active = self.effective_folder();
@@ -227,10 +371,10 @@ impl App {
                 active.as_deref(),
                 FolderPaneListingOptions::from_settings(&self.settings),
             );
-            self.folder_pane.set_focus_tree_at_active();
+            self.folder_pane.focus_active_from_input(input);
         } else {
             self.folder_pane.suspend_display();
-            self.folder_pane.set_focus_grid();
+            self.folder_pane.focus_grid_from_input(input);
         }
         self.settings.save();
     }
@@ -240,15 +384,22 @@ impl App {
     /// - 表示中 → 閉じる。ただしカーソルが別フォルダへ動いていれば、Enter と同じく
     ///   そのフォルダへ移動してグリッド一覧に戻ってから閉じる
     ///   (worker scan 経由なので UI スレッドの read_dir で固まらない)。
-    pub(crate) fn toggle_folder_tree_pane_from_key(&mut self) {
+    pub(crate) fn toggle_folder_tree_pane_from_key(&mut self, ctx: &egui::Context) {
+        self.toggle_folder_tree_pane_from_input(ordered_focus_input(
+            ctx,
+            FolderPaneInputPosition::AfterInputBatch,
+        ));
+    }
+
+    pub(crate) fn toggle_folder_tree_pane_from_input(&mut self, input: FolderPaneFocusInput) {
         if !self.settings.folder_tree_pane_visible {
-            self.set_folder_tree_pane_visible(true);
+            self.set_folder_tree_pane_visible_from_input(true, input);
             return;
         }
         // 閉じる前に「カーソルが別フォルダへ動いていれば」その移動先を取得する。
         let target = self.folder_pane.cursor_nav_target_if_moved();
         // set_folder_tree_pane_visible(false) が focus をグリッドへ戻し settings も保存する。
-        self.set_folder_tree_pane_visible(false);
+        self.set_folder_tree_pane_visible_from_input(false, input);
         if let Some(target) = target {
             self.start_folder_pane_open(target);
         }
@@ -279,7 +430,7 @@ impl App {
 
     pub(crate) fn folder_pane_blocks_grid_keyboard(&self) -> bool {
         self.settings.folder_tree_pane_visible
-            && self.folder_pane.has_focus
+            && self.folder_pane.has_focus()
             && !self.folder_pane_disabled()
     }
 
@@ -298,25 +449,28 @@ impl App {
             return None;
         }
 
-        if self.folder_pane.has_focus {
-            let key = ctx.input_mut(|i| {
-                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                    Some(FolderPaneTreeKey::Up)
-                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-                    Some(FolderPaneTreeKey::Down)
-                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
-                    Some(FolderPaneTreeKey::Left)
-                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
-                    Some(FolderPaneTreeKey::Right)
-                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
-                    Some(FolderPaneTreeKey::Enter)
-                } else {
-                    None
+        if self.folder_pane.has_focus() {
+            let key = ctx.input_mut(|input| {
+                for (key, tree_key) in [
+                    (egui::Key::ArrowUp, FolderPaneTreeKey::Up),
+                    (egui::Key::ArrowDown, FolderPaneTreeKey::Down),
+                    (egui::Key::ArrowLeft, FolderPaneTreeKey::Left),
+                    (egui::Key::ArrowRight, FolderPaneTreeKey::Right),
+                    (egui::Key::Enter, FolderPaneTreeKey::Enter),
+                ] {
+                    let position = focus_position_for_key(input, |event| matches!(event,
+                        egui::Event::Key { key: event_key, pressed: true, modifiers, .. } if *event_key == key && *modifiers == egui::Modifiers::NONE));
+                    if input.consume_key(egui::Modifiers::NONE, key) { return Some((tree_key, position)); }
                 }
+                None
             });
-            if let Some(key) = key {
+            if let Some((key, position)) = key {
+                let input = ordered_focus_input(ctx, position);
+                if key != FolderPaneTreeKey::Enter {
+                    self.folder_pane.note_focus_input(input);
+                }
                 if let Some(FolderPaneCommand::Open(path)) = self.folder_pane.handle_tree_key(key) {
-                    self.folder_pane.set_focus_grid();
+                    self.folder_pane.focus_grid_from_input(input);
                     // クリック経路と同じく worker scan 経由で開く (UI スレッドの
                     // read_dir ブロック回避)。Enter は consume 済みなので、この後
                     // grid keyboard へ抜けても二重発火しない。
@@ -336,10 +490,14 @@ impl App {
             && !self.search_has_focus
             && !self.favsearch.has_focus
             && !self.global_search.has_focus;
+        let escape_input = focus_input_for_key(ctx, |event| {
+            matches!(event,
+            egui::Event::Key { key: egui::Key::Escape, pressed: true, modifiers, .. } if *modifiers == egui::Modifiers::NONE)
+        });
         if esc_to_tree_allowed
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
-            self.folder_pane.set_focus_tree_at_active();
+            self.folder_pane.focus_active_from_input(escape_input);
             return None;
         }
 
@@ -431,14 +589,16 @@ impl App {
                         let selected = selected_drive
                             .as_ref()
                             .is_some_and(|current| crate::folder_tree::path_eq(current, &drive));
-                        if ui.selectable_label(selected, label).clicked() {
-                            next_drive = Some(drive);
+                        let response = ui.selectable_label(selected, label);
+                        if response.clicked() {
+                            next_drive =
+                                Some((drive, folder_pane_focus_input_for_response(&response)));
                         }
                     }
                 });
             crate::ui_helpers::set_accessibility_label(&named_combo.response, "Drive");
-            if let Some(drive) = next_drive {
-                self.folder_pane.select_drive(drive);
+            if let Some((drive, input)) = next_drive {
+                self.folder_pane.select_drive_from_input(drive, input);
             }
 
             let previous_sort = self.settings.folder_tree_sort_order;
@@ -538,7 +698,7 @@ impl App {
             ui.set_width(ui.available_width());
             for row in rows {
                 let (arrow_resp, resp, row_rect) =
-                    draw_folder_pane_row(ui, &row, self.folder_pane.has_focus);
+                    draw_folder_pane_row(ui, &row, self.folder_pane.has_focus());
                 drawn_pitch = row_rect.height() + ui.spacing().item_spacing.y;
                 #[cfg(test)]
                 ui.ctx().data_mut(|data| {
@@ -547,20 +707,32 @@ impl App {
                         egui::Id::unique(("folder_pane_test_label_id", row.path.as_path())),
                         resp.id,
                     );
+                    data.insert_temp(
+                        egui::Id::unique(("folder_pane_test_arrow_id", row.path.as_path())),
+                        arrow_resp.id,
+                    );
                 });
                 if (row.expanded || row.has_children_or_unknown) && arrow_resp.clicked() {
-                    self.folder_pane.set_focus_tree();
-                    self.folder_pane.set_cursor(row.path.clone());
-                    let key = if row.expanded {
-                        FolderPaneTreeKey::Left
-                    } else {
-                        FolderPaneTreeKey::Right
-                    };
-                    let _ = self.folder_pane.handle_tree_key(key);
+                    if self
+                        .folder_pane
+                        .focus_tree_from_input(folder_pane_focus_input_for_response(&arrow_resp))
+                    {
+                        self.folder_pane.set_cursor(row.path.clone());
+                    }
+                    // A newer focus command does not cancel an accepted branch action.
+                    self.folder_pane.set_branch_expanded_from_input(
+                        &row.path,
+                        !row.expanded,
+                        folder_pane_focus_input_for_response(&arrow_resp),
+                    );
                 }
                 if resp.clicked() {
-                    self.folder_pane.set_focus_tree();
-                    self.folder_pane.set_cursor(row.path.clone());
+                    if self
+                        .folder_pane
+                        .focus_tree_from_input(folder_pane_focus_input_for_response(&resp))
+                    {
+                        self.folder_pane.set_cursor(row.path.clone());
+                    }
                     if self
                         .folder_pane
                         .active_path()
@@ -744,6 +916,140 @@ pub fn draw_folder_pane_refresh_snapshot_fixture(ui: &mut egui::Ui) {
 mod tests {
     use super::*;
     use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn folder_pane_response_order_ignores_consumed_keys_and_uses_batch_end_for_ambiguity() {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let raw = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 200.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut id = egui::Id::NULL;
+        let mut rect = egui::Rect::NOTHING;
+        ctx.run_ui(raw(vec![]), |ui| {
+            let response = ui.button("Focus order");
+            id = response.id;
+            rect = response.rect;
+        })
+        .drop_without_applying_deltas();
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        let activate = || {
+            egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: id.accesskit_id(),
+                action: egui::accesskit::Action::Click,
+                data: None,
+            })
+        };
+        ctx.run_ui(
+            raw(vec![
+                activate(),
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            |ui| {
+                ui.input_mut(|input| {
+                    input.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+                });
+                let response = ui.button("Focus order");
+                assert!(response.clicked());
+                assert!(matches!(
+                    folder_pane_focus_input_for_response(&response),
+                    FolderPaneFocusInput::Ordered(FolderPaneInputOrder {
+                        position: FolderPaneInputPosition::Event(0),
+                        ..
+                    })
+                ));
+            },
+        )
+        .drop_without_applying_deltas();
+        let pos = rect.center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        ctx.run_ui(
+            raw(vec![egui::Event::PointerMoved(pos), button(true)]),
+            |ui| {
+                let _ = ui.button("Focus order");
+            },
+        )
+        .drop_without_applying_deltas();
+        ctx.run_ui(raw(vec![button(false), activate()]), |ui| {
+            let response = ui.button("Focus order");
+            assert!(response.clicked());
+            assert!(matches!(
+                folder_pane_focus_input_for_response(&response),
+                FolderPaneFocusInput::Ordered(FolderPaneInputOrder {
+                    position: FolderPaneInputPosition::AfterInputBatch,
+                    ..
+                })
+            ));
+        })
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn folder_pane_center_reveal_centers_when_possible_and_clamps_near_end() {
+        for index in [150, 290] {
+            let mut app = crate::app::setup_app_for_test();
+            let root = app.tmp.path().join("center-tree");
+            let children: Vec<_> = (0..300).map(|i| root.join(format!("row-{i:03}"))).collect();
+            app.folder_pane = folder_pane::FolderPaneState::test_tree(&root, children.clone());
+            app.folder_pane.set_cursor(children[index].clone());
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            for _ in 0..8 {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(420.0, 900.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.render_folder_pane_tree(ui);
+                    },
+                )
+                .drop_without_applying_deltas();
+            }
+            let row: egui::Rect = ctx
+                .data(|data| data.get_temp(folder_pane_test_row_rect_id(&children[index])))
+                .unwrap();
+            let last: egui::Rect = ctx
+                .data(|data| data.get_temp(folder_pane_test_row_rect_id(children.last().unwrap())))
+                .unwrap();
+            let viewport: egui::Rect = ctx
+                .data(|data| data.get_temp(egui::Id::unique("folder_pane_test_viewport")))
+                .unwrap();
+            assert!(viewport.contains_rect(row));
+            if index == 150 {
+                assert!(
+                    (row.center().y - viewport.center().y).abs() < 1.0,
+                    "{row:?}/{viewport:?}"
+                );
+            } else {
+                assert!(row.center().y > viewport.center().y + row.height());
+                assert!(
+                    (last.bottom() - viewport.bottom()).abs() < row.height(),
+                    "tail clamp: {last:?}/{viewport:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn actual_folder_pane_empty_branch_can_collapse_and_mouse_reexpand_after_external_add() {

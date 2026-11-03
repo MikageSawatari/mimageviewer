@@ -1386,6 +1386,14 @@ impl Chord {
     }
 }
 
+/// Origin of an accepted action in the immutable egui input batch. Native or
+/// synthetic commands without one identifiable twin execute at the batch end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyActionInputOrder {
+    RawEvent(usize),
+    AfterInputBatch,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ChordList {
     chords: [Option<Chord>; 3],
@@ -8451,13 +8459,56 @@ impl Keymap {
     }
 
     pub fn consume_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
+        self.consume_action_observed(ctx, action, |_| ()).is_some()
+    }
+
+    pub(crate) fn consume_action_with_input_order(
+        &self,
+        ctx: &egui::Context,
+        action: KeyAction,
+    ) -> Option<KeyActionInputOrder> {
+        self.consume_action_observed(ctx, action, |chord| {
+            let Some(chord) = chord else { return KeyActionInputOrder::AfterInputBatch; };
+            #[cfg(windows)]
+            if crate::key_input::is_frame_active(ctx.viewport_id())
+                && crate::key_input::frame_had_key_down(ctx.viewport_id())
+                && chord.key_name().and_then(KeyName::to_egui).and_then(KeyName::from_egui)
+                    .is_some_and(KeyName::egui_event_cannot_identify_slot)
+            {
+                // Claiming a logical twin prevents duplicate dispatch; it does
+                // not prove this folded event came from the accepted physical slot.
+                return KeyActionInputOrder::AfterInputBatch;
+            }
+            ctx.input(|input| {
+                let Some(event) = input.events.iter().find(|event| matches!(event,
+                    egui::Event::Key { key, modifiers, pressed: true, .. } if chord.matches_egui(*key, *modifiers))) else {
+                    return KeyActionInputOrder::AfterInputBatch;
+                };
+                let mut raw = input.raw.events.iter().enumerate().filter(|(_, original)| *original == event);
+                match (raw.next(), raw.next()) {
+                    (Some((index, _)), None) => KeyActionInputOrder::RawEvent(index),
+                    // Identical earlier presses may already have been consumed.
+                    // Never borrow their raw position for the accepted command.
+                    _ => KeyActionInputOrder::AfterInputBatch,
+                }
+            })
+        })
+    }
+
+    fn consume_action_observed<T>(
+        &self,
+        ctx: &egui::Context,
+        action: KeyAction,
+        mut observe: impl FnMut(Option<Chord>) -> T,
+    ) -> Option<T> {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         #[cfg(all(windows, feature = "test-script"))]
         if crate::test_script::consume_pending_action(ctx, action) {
-            return true;
+            return Some(observe(None));
         }
         if let Some(chords) = self.overrides.get(&action) {
             for chord in chords.iter().copied() {
+                let witness = observe(Some(chord));
                 if self.consume_chord(ctx, chord) {
                     #[cfg(windows)]
                     crate::key_debug::record_consumed_action(
@@ -8466,12 +8517,13 @@ impl Keymap {
                         chord,
                         "consume_action",
                     );
-                    return true;
+                    return Some(witness);
                 }
             }
-            return false;
+            return None;
         }
         for chord in action.default_chords().iter() {
+            let witness = observe(Some(chord));
             if self.consume_chord(ctx, chord) {
                 #[cfg(windows)]
                 crate::key_debug::record_consumed_action(
@@ -8480,10 +8532,10 @@ impl Keymap {
                     chord,
                     "consume_action",
                 );
-                return true;
+                return Some(witness);
             }
         }
-        false
+        None
     }
 
     pub fn consume_action_no_repeat(&self, ctx: &egui::Context, action: KeyAction) -> bool {
@@ -10278,6 +10330,99 @@ fn next_legacy_keymap_backup_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn folder_pane_focus_order_uses_the_chord_actually_accepted_by_native_input() {
+        let _serial = crate::key_input::lock_test_input();
+        let _clear = ClearTestKeyFrame;
+        let mut keymap = Keymap::empty();
+        keymap.overrides.insert(
+            KeyAction::GridToggleFolderTreePane,
+            vec![Chord::key(KeyName::F), Chord::key(KeyName::J)],
+        );
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![
+                key_event(egui::Key::F, egui::Modifiers::NONE),
+                egui::Event::PointerMoved(egui::pos2(10.0, 10.0)),
+                key_event(egui::Key::J, egui::Modifiers::NONE),
+            ],
+            ..Default::default()
+        });
+        cache_test_keyboard_owner(&ctx);
+        crate::key_input::set_test_frame(vec![plain_key_edge(0x4a, 0x24)]);
+        assert_eq!(
+            keymap.consume_action_with_input_order(&ctx, KeyAction::GridToggleFolderTreePane),
+            Some(KeyActionInputOrder::RawEvent(2))
+        );
+        ctx.end_pass().drop_without_applying_deltas();
+        begin_key_pass(&ctx, egui::Key::F, egui::Modifiers::NONE);
+        crate::key_input::set_test_frame(vec![plain_key_edge(0x4a, 0x24)]);
+        assert_eq!(
+            keymap.consume_action_with_input_order(&ctx, KeyAction::GridToggleFolderTreePane),
+            Some(KeyActionInputOrder::AfterInputBatch),
+            "native J must not borrow the raw F position"
+        );
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn folder_pane_focus_order_does_not_borrow_an_identical_consumed_raw_press() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        let keymap = Keymap::empty();
+        let ctx = egui::Context::default();
+        begin_key_pass(&ctx, egui::Key::F, egui::Modifiers::NONE);
+        ctx.end_pass().drop_without_applying_deltas();
+        let press = key_event(egui::Key::F, egui::Modifiers::NONE);
+        ctx.begin_pass(egui::RawInput {
+            events: vec![
+                press.clone(),
+                egui::Event::PointerMoved(egui::pos2(10.0, 10.0)),
+                press,
+            ],
+            ..Default::default()
+        });
+        cache_test_keyboard_owner(&ctx);
+        ctx.input_mut(|input| {
+            input.events.remove(0);
+        });
+        assert_eq!(
+            keymap.consume_action_with_input_order(&ctx, KeyAction::GridToggleFolderTreePane),
+            Some(KeyActionInputOrder::AfterInputBatch)
+        );
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn folder_pane_focus_order_native_folded_slots_do_not_claim_a_raw_physical_position() {
+        let _serial = crate::key_input::lock_test_input();
+        let _clear = ClearTestKeyFrame;
+        for (name, raw, vk, scan, extended) in [
+            (KeyName::Enter, egui::Key::Enter, 0x0d, 0x1c, false),
+            (KeyName::NumpadEnter, egui::Key::Enter, 0x0d, 0x1c, true),
+            (KeyName::Num0, egui::Key::Num0, 0x30, 0x0b, false),
+            (KeyName::Numpad0, egui::Key::Num0, 0x60, 0x52, false),
+        ] {
+            let mut keymap = Keymap::empty();
+            keymap
+                .overrides
+                .insert(KeyAction::GridToggleFolderTreePane, vec![Chord::key(name)]);
+            let ctx = egui::Context::default();
+            begin_key_pass(&ctx, raw, egui::Modifiers::NONE);
+            crate::key_input::set_test_frame(vec![key_edge(vk, scan, extended, false, false)]);
+            assert_eq!(
+                keymap.consume_action_with_input_order(&ctx, KeyAction::GridToggleFolderTreePane),
+                Some(KeyActionInputOrder::AfterInputBatch),
+                "{name:?}"
+            );
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+    }
 
     #[test]
     fn page_overview_actions_register_defaults_and_keep_existing_bindings() {

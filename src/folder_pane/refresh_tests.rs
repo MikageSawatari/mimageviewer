@@ -16,6 +16,69 @@ fn listing(options: FolderPaneListingOptions, children: Vec<PathBuf>) -> CachedL
     }
 }
 
+fn focus_event(frame: u64, event: usize) -> FolderPaneFocusInput {
+    FolderPaneFocusInput::Ordered(FolderPaneInputOrder {
+        viewport: egui::ViewportId::ROOT,
+        frame,
+        position: FolderPaneInputPosition::Event(event),
+    })
+}
+
+#[test]
+fn folder_pane_input_focus_rejects_older_and_replayed_claims_without_releasing_selection() {
+    let root = p(r"C:\");
+    let a = root.join("a");
+    let b = root.join("b");
+    let mut state = synthetic_tree(&root, vec![a.clone(), b.clone()]);
+    state.sync_to_active(Some(&a), state.listing_options);
+    assert!(state.focus_tree_from_input(focus_event(7, 3)));
+    state.set_cursor(b.clone());
+    state.cursor_scroll = FolderPaneCursorScroll::Idle;
+    state.focus_grid_from_input(focus_event(7, 2));
+    state.select_drive_from_input(p(r"G:\"), focus_event(7, 2));
+    assert!(state.has_focus());
+    assert!(!state.selection.follows_active());
+    assert_eq!(state.cursor_path(), Some(b.as_path()));
+    assert_eq!(state.selected_drive(), Some(root.as_path()));
+    assert_eq!(state.cursor_scroll, FolderPaneCursorScroll::Idle);
+    state.focus_grid_from_input(focus_event(7, 4));
+    assert!(!state.has_focus());
+    assert!(state.selection.follows_active());
+    assert!(state.selection.has_explicit_position());
+    assert!(
+        !state.focus_tree_from_input(focus_event(7, 4)),
+        "same event in a later egui pass is already owned"
+    );
+    assert!(
+        !state.focus_tree_from_input(focus_event(6, 99)),
+        "previous frame cannot overtake current input"
+    );
+    assert!(!state.has_focus());
+    assert!(state.focus_tree_from_input(focus_event(8, 0)));
+}
+
+#[test]
+fn folder_pane_input_focus_batch_end_is_ordered_but_modal_force_is_unconditional() {
+    let mut state = FolderPaneState::default();
+    let end = FolderPaneFocusInput::Ordered(FolderPaneInputOrder {
+        viewport: egui::ViewportId::ROOT,
+        frame: 10,
+        position: FolderPaneInputPosition::AfterInputBatch,
+    });
+    assert!(state.focus_tree_from_input(end));
+    state.focus_grid_from_input(focus_event(10, 999));
+    assert!(state.has_focus());
+    state.focus_grid_from_input(focus_event(11, 0));
+    assert!(!state.has_focus());
+    assert!(!state.focus_tree_from_input(end));
+    state.set_focus_tree();
+    state.set_focus_grid();
+    assert!(
+        !state.has_focus(),
+        "hidden/disabled/modal ownership is a force transition"
+    );
+}
+
 #[test]
 fn folder_pane_unresolved_drive_arrival_is_a_following_fallback_not_an_open_target() {
     let mut state = FolderPaneState::default();

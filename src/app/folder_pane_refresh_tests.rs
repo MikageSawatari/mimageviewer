@@ -39,6 +39,383 @@ fn tree_event_frame(app: &mut App, ctx: &egui::Context, frame: &mut u64, events:
     .drop_without_applying_deltas();
 }
 
+fn startup_tree_grid_frame(
+    app: &mut App,
+    ctx: &egui::Context,
+    frame: &mut u64,
+    size: egui::Vec2,
+    events: Vec<egui::Event>,
+) {
+    *frame += 1;
+    ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            time: Some(*frame as f64 / 60.0),
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            app.handle_keyboard(ctx);
+            assert!(app.render_toolbar(ui).0.is_none());
+            app.render_folder_pane(ui);
+            assert!(app.render_grid(ui).is_none());
+            app.show_first_setup_dialog(ctx);
+        },
+    )
+    .drop_without_applying_deltas();
+}
+
+fn startup_tree_focus_scenario(startup_argument: bool, input_order: &str) {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    if input_order == "remapped" {
+        app.keymap = crate::keymap::Keymap::from_ini_str("[Grid]\nGridToggleFolderTreePane=J\n");
+    }
+    let toggle_key = if input_order == "remapped" {
+        egui::Key::J
+    } else {
+        egui::Key::F
+    };
+    app.settings.first_setup_completed = false;
+    app.settings.ai_feature_mode = crate::settings::AiFeatureMode::Disabled;
+    app.settings.auto_fullscreen_zip_pdf = false;
+    app.settings.grid_click_selection_mode = crate::settings::GridClickSelectionMode::Explorer;
+    app.settings.folder_tree_pane_visible = false;
+    let root = app.tmp.path().join("startup-tree");
+    let mut target = root.clone();
+    for depth in 1..=4 {
+        std::fs::create_dir_all(&target).unwrap();
+        for index in 0..40 {
+            std::fs::create_dir(target.join(format!("L{depth}-sib{index:02}"))).unwrap();
+        }
+        target = target.join(format!("L{depth}-zz-path"));
+    }
+    target = target.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(8, 8)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    for index in 0..3 {
+        std::fs::write(target.join(format!("img{index}.png")), png.get_ref()).unwrap();
+    }
+    app.folder_pane.test_scan_subtree(root);
+    if startup_argument {
+        app.start_startup_open_path_resolve(
+            target.clone(),
+            StartupOpenPathSource::InitialStartup,
+            &ctx,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while app.startup_open_path_resolve_pending.is_some() {
+            app.poll_startup_open_path_resolve(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        settle(&mut app, &ctx);
+    }
+    let normal = egui::vec2(1280.0, 800.0);
+    let maximized = egui::vec2(1920.0, 1080.0);
+    let mut frame = 0;
+    let key = |key| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    startup_tree_grid_frame(&mut app, &ctx, &mut frame, normal, vec![]);
+    assert!(app.first_setup_visible());
+    startup_tree_grid_frame(
+        &mut app,
+        &ctx,
+        &mut frame,
+        normal,
+        vec![key(egui::Key::Enter)],
+    );
+    assert!(
+        !app.first_setup_visible(),
+        "actual setup confirmation must complete"
+    );
+    if !startup_argument {
+        app.load_folder(target.clone());
+        settle(&mut app, &ctx);
+    }
+    assert_eq!(app.effective_folder(), Some(target.clone()));
+    assert_eq!(app.items.len(), 3);
+    assert!(!app.folder_pane_disabled());
+    for _ in 0..3 {
+        startup_tree_grid_frame(&mut app, &ctx, &mut frame, maximized, vec![]);
+    }
+    let pos = egui::pos2(1500.0, 900.0);
+    let pointer = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    startup_tree_grid_frame(
+        &mut app,
+        &ctx,
+        &mut frame,
+        maximized,
+        vec![egui::Event::PointerMoved(pos)],
+    );
+    if input_order != "whole_click" {
+        startup_tree_grid_frame(&mut app, &ctx, &mut frame, maximized, vec![pointer(true)]);
+    }
+    let release = match input_order {
+        "separate" | "toolbar" | "toolbar_coalesced" => vec![pointer(false)],
+        "key_first" => vec![key(toggle_key), pointer(false)],
+        "whole_click" => vec![pointer(true), pointer(false), key(toggle_key)],
+        _ => vec![pointer(false), key(toggle_key)],
+    };
+    if input_order == "toolbar" || input_order == "toolbar_coalesced" {
+        let rect: egui::Rect = ctx
+            .data(|data| data.get_temp(egui::Id::unique("folder_pane_test_toolbar_rect")))
+            .expect("actual toolbar button");
+        let pos = rect.center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        if input_order == "toolbar" {
+            startup_tree_grid_frame(&mut app, &ctx, &mut frame, maximized, release);
+            startup_tree_grid_frame(
+                &mut app,
+                &ctx,
+                &mut frame,
+                maximized,
+                vec![egui::Event::PointerMoved(pos), button(true)],
+            );
+            startup_tree_grid_frame(&mut app, &ctx, &mut frame, maximized, vec![button(false)]);
+        } else {
+            startup_tree_grid_frame(
+                &mut app,
+                &ctx,
+                &mut frame,
+                maximized,
+                vec![
+                    pointer(false),
+                    egui::Event::PointerMoved(pos),
+                    button(true),
+                    button(false),
+                ],
+            );
+        }
+    } else {
+        startup_tree_grid_frame(&mut app, &ctx, &mut frame, maximized, release);
+    }
+    if input_order == "separate" {
+        startup_tree_grid_frame(&mut app, &ctx, &mut frame, maximized, vec![key(toggle_key)]);
+    }
+    assert!(app.settings.folder_tree_pane_visible);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while app.folder_pane.has_pending() {
+        startup_tree_grid_frame(&mut app, &ctx, &mut frame, maximized, vec![]);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    for _ in 0..12 {
+        startup_tree_grid_frame(&mut app, &ctx, &mut frame, maximized, vec![]);
+    }
+    assert_eq!(
+        app.folder_pane.has_focus(),
+        input_order != "key_first",
+        "startup={startup_argument}, input order={input_order}"
+    );
+    assert_tree_location_row(&app, &ctx, &target);
+}
+
+#[test]
+fn folder_pane_startup_argument_setup_click_then_f_keeps_focus() {
+    startup_tree_focus_scenario(true, "separate");
+}
+
+#[test]
+fn folder_pane_startup_argument_setup_grid_release_then_f_in_one_frame_keeps_focus() {
+    startup_tree_focus_scenario(true, "release_first");
+}
+
+#[test]
+fn folder_pane_address_open_setup_click_then_f_keeps_focus() {
+    startup_tree_focus_scenario(false, "separate");
+}
+
+#[test]
+fn folder_pane_startup_argument_setup_f_then_grid_release_keeps_grid_focus() {
+    startup_tree_focus_scenario(true, "key_first");
+}
+
+#[test]
+fn folder_pane_startup_argument_setup_whole_click_then_f_keeps_tree_focus() {
+    startup_tree_focus_scenario(true, "whole_click");
+}
+
+#[test]
+fn folder_pane_startup_argument_setup_release_then_remapped_key_keeps_tree_focus() {
+    startup_tree_focus_scenario(true, "remapped");
+}
+
+#[test]
+fn folder_pane_startup_argument_setup_toolbar_keeps_tree_focus() {
+    startup_tree_focus_scenario(true, "toolbar");
+}
+
+#[test]
+fn folder_pane_startup_argument_setup_grid_release_then_toolbar_in_one_frame_keeps_tree_focus() {
+    startup_tree_focus_scenario(true, "toolbar_coalesced");
+}
+
+#[test]
+fn folder_pane_later_escape_keeps_focus_and_cursor_without_dropping_earlier_row_actions() {
+    for arrow in [false, true] {
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let root = app.tmp.path().join("ordered-row");
+        let a = root.join("a");
+        let b = root.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(b.join("child")).unwrap();
+        app.current_folder = Some(a.clone());
+        app.items_are_drive_list = false;
+        app.folder_pane.test_scan_subtree(root);
+        app.set_folder_tree_pane_visible(true);
+        let mut frame = 0;
+        assert_tree_location(&mut app, &ctx, &mut frame, &a);
+        app.folder_pane.set_focus_grid();
+        let tag = if arrow {
+            "folder_pane_test_arrow_id"
+        } else {
+            "folder_pane_test_label_id"
+        };
+        let id: egui::Id = ctx
+            .data(|data| data.get_temp(egui::Id::unique((tag, b.as_path()))))
+            .unwrap();
+        let mut nav = None;
+        frame += 1;
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 360.0),
+                )),
+                time: Some(frame as f64 / 60.0),
+                events: vec![
+                    egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                        target_tree: egui::accesskit::TreeId::ROOT,
+                        target_node: id.accesskit_id(),
+                        action: egui::accesskit::Action::Click,
+                        data: None,
+                    }),
+                    egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                app.handle_keyboard(&ctx);
+                nav = app.render_folder_pane(ui).0;
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(app.folder_pane.has_focus());
+        assert!(
+            app.folder_pane
+                .visible_rows()
+                .iter()
+                .any(|row| row.path == a && row.is_cursor)
+        );
+        if arrow {
+            assert!(
+                app.folder_pane
+                    .visible_rows()
+                    .iter()
+                    .any(|row| row.path == b && row.expanded)
+            );
+            assert!(nav.is_none());
+        } else {
+            assert_eq!(
+                nav,
+                Some(b),
+                "the older accepted Open is independent of focus arbitration"
+            );
+        }
+    }
+}
+
+#[test]
+fn folder_pane_ancestor_collapse_and_escape_respect_input_order_and_own_row_collapse() {
+    for collapse_first in [true, false] {
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let root = app.tmp.path().join("ordered-collapse");
+        let ancestor = root.join("branch");
+        let active = ancestor.join("current");
+        std::fs::create_dir_all(&active).unwrap();
+        app.current_folder = Some(active.clone());
+        app.items_are_drive_list = false;
+        app.folder_pane.test_scan_subtree(root);
+        app.set_folder_tree_pane_visible(true);
+        let mut frame = 0;
+        assert_tree_location(&mut app, &ctx, &mut frame, &active);
+        app.folder_pane.set_focus_grid();
+        let id: egui::Id = ctx
+            .data(|data| {
+                data.get_temp(egui::Id::unique((
+                    "folder_pane_test_arrow_id",
+                    ancestor.as_path(),
+                )))
+            })
+            .unwrap();
+        let collapse = egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+            target_tree: egui::accesskit::TreeId::ROOT,
+            target_node: id.accesskit_id(),
+            action: egui::accesskit::Action::Click,
+            data: None,
+        });
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        tree_event_frame(
+            &mut app,
+            &ctx,
+            &mut frame,
+            if collapse_first {
+                vec![collapse, escape]
+            } else {
+                vec![escape, collapse]
+            },
+        );
+        settle_tree_scans(&mut app, &ctx, &mut frame);
+        let rows = app.folder_pane.visible_rows();
+        let row = rows.iter().find(|row| row.path == ancestor).unwrap();
+        assert!(app.folder_pane.has_focus());
+        assert_eq!(row.expanded, collapse_first);
+        assert_eq!(row.is_cursor, !collapse_first);
+        if collapse_first {
+            assert_tree_location(&mut app, &ctx, &mut frame, &active);
+        } else {
+            assert!(!rows.iter().any(|row| row.path == active));
+            assert_tree_cursor_visible(&app, &ctx, &ancestor);
+        }
+    }
+}
+
 fn settle_tree_scans(app: &mut App, ctx: &egui::Context, frame: &mut u64) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
@@ -120,7 +497,7 @@ fn folder_pane_late_location(initial: &str, from_key: bool, other_drive: bool) {
     for _ in 0..4 {
         tree_frame(&mut app, &ctx, &mut frame, false);
     }
-    assert!(app.settings.folder_tree_pane_visible && app.folder_pane.has_focus);
+    assert!(app.settings.folder_tree_pane_visible && app.folder_pane.has_focus());
     app.current_folder = Some(active.clone());
     assert_tree_location(&mut app, &ctx, &mut frame, &active);
 }
@@ -309,6 +686,10 @@ fn assert_tree_location(app: &mut App, ctx: &egui::Context, frame: &mut u64, act
         "idle frames must not force cursor scrolling"
     );
     assert_eq!(app.folder_pane.cursor_scroll, FolderPaneCursorScroll::Idle);
+    assert_tree_location_row(app, ctx, active);
+}
+
+fn assert_tree_location_row(app: &App, ctx: &egui::Context, active: &Path) {
     let rows = app.folder_pane.visible_rows();
     let row = rows
         .iter()
