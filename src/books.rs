@@ -4813,6 +4813,91 @@ mod tests {
     }
 
     #[test]
+    fn ai_caption_append_clears_externally_deleted_last_page_before_reusing_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let root = tmp.path().join("books");
+        let destination = root.join("dst/0001_source.jpg");
+        let source = root.join("src/source.jpg");
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&destination, b"old page").unwrap();
+        fs::write(&source, b"replacement page").unwrap();
+        let caption_path = data.join("ai_caption.db");
+        crate::ai_caption_db::CaptionDb::open_at(&caption_path).unwrap();
+        let connection = rusqlite::Connection::open(caption_path).unwrap();
+        let destination_key = crate::adjustment_db::normalize_path(&destination);
+        let source_key = crate::adjustment_db::normalize_path(&source);
+        for key in [&destination_key, &source_key] {
+            connection.execute(
+                "INSERT INTO captions (item_key, mtime_ms, size, model_id, prompt_version, lang,
+                    caption, visible_text, cover_ref, keywords, status, created_at)
+                 VALUES (?1, 1, 1, 'test-model', 1, 'ja', 'old caption', '', '', '[]', 'ok', 1)",
+                [key],
+            ).unwrap();
+        }
+        // An external deletion leaves metadata behind, and next_page_number
+        // will reuse both the number and the source-derived file name.
+        fs::remove_file(&destination).unwrap();
+        let stores = crate::book_append_undo::AppendMetadataStores::existing_at(&data);
+        assert!(stores.ai_captions);
+        let mut checked_before_create = false;
+        let result = append_pages_at_with_raw_observed(
+            data,
+            root,
+            "dst".into(),
+            vec![BookPageSource::File {
+                src: source,
+                original_name: "source.jpg".into(),
+            }],
+            stores,
+            None,
+            |boundary, path| {
+                if boundary == AppendPageBoundary::BeforeFileCreate {
+                    assert_eq!(path, destination);
+                    assert!(!path.exists());
+                    let count: i64 = connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM captions WHERE item_key = ?1",
+                            [&destination_key],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(count, 0);
+                    checked_before_create = true;
+                }
+            },
+        )
+        .unwrap();
+        let BookOpResult::Append(summary) = result else {
+            panic!("expected append result");
+        };
+        assert!(summary.metadata_copy.captions_changed);
+        assert!(checked_before_create);
+        assert_eq!(fs::read(destination).unwrap(), b"replacement page");
+        let keys: Vec<String> = connection
+            .prepare("SELECT item_key FROM captions")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            keys,
+            vec![source_key],
+            "source captions must never be copied to new pages"
+        );
+        let removed: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM caption_removed WHERE item_key = ?1)",
+                [&destination_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(removed);
+    }
+
+    #[test]
     fn append_book_page_reports_edit_copy_mapping() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path().join("books");

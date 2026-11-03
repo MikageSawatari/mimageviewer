@@ -6447,6 +6447,7 @@ fn phase_b_search_batch(
 ) -> crate::global_search::SearchStreamEvent {
     crate::global_search::SearchStreamEvent::Batch {
         hits: vec![crate::global_search::GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: path.to_string_lossy().to_string(),
             score: 1.0,
             stars: 0,
@@ -29078,6 +29079,7 @@ mod phase_c_drill_nav_tests {
         // build_drilled_items が current_path でフィルタするため)
         app.global_search.active = true;
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: format!("{}/doc.pdf", folder_path.display()).to_lowercase(),
             score: 1.0,
             mtime: 0,
@@ -29128,6 +29130,7 @@ mod phase_c_drill_nav_tests {
 
         app.global_search.active = true;
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: format!("{}/album.zip", folder_path.display()).to_lowercase(),
             score: 1.0,
             mtime: 0,
@@ -29163,6 +29166,7 @@ mod phase_c_drill_nav_tests {
         // parent_container("c:/root/2025-11-30/a.jpg") = "c:/root/2025-11-30" → これがコンテナ root
         // hit 親まで walk up すると "2025-11-30" のみ → DFS = [2025-11-30]
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/root/2025-11-30/a.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -29170,6 +29174,7 @@ mod phase_c_drill_nav_tests {
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/root/2025-11-30/b.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -29179,6 +29184,7 @@ mod phase_c_drill_nav_tests {
         // コンテナ B: deep ヒット 1 件。parent_container = "c:/root/output/2025-12-30-1"
         // DFS = [2025-12-30-1] のみ (container_root より上は walk しない)
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/root/output/2025-12-30-1/x.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -29233,6 +29239,7 @@ mod phase_c_drill_nav_tests {
         // parent_container 単位で見ると "root" と "root/sub" の 2 コンテナだが、
         // Newer/Older ではなく HitCount ソートで root (件数 2) → root/sub (件数 1) の順。
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/x/root/a.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -29240,6 +29247,7 @@ mod phase_c_drill_nav_tests {
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/x/root/b.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -29247,6 +29255,7 @@ mod phase_c_drill_nav_tests {
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/x/root/sub/c.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -29288,6 +29297,7 @@ mod phase_c_drill_nav_tests {
         let mut app = setup_app();
         app.global_search.active = true;
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/root/sub_unrated/a.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -30724,6 +30734,7 @@ mod phase_c_drill_nav_tests {
         // 2 つの SearchContainer を accumulate (folder_b の方を開く想定)
         app.global_search.active = true;
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/folder_a/x.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -30731,6 +30742,7 @@ mod phase_c_drill_nav_tests {
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/folder_b/y.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -30782,6 +30794,7 @@ mod phase_c_drill_nav_tests {
         // 検索ヒット: コンテナ配下のサブフォルダ画像 (未評価)
         app.global_search.active = true;
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/books/vol1/sub/p1.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -32757,6 +32770,7 @@ mod phase_c_drill_nav_tests {
         app.global_search.active = true;
         // 単一画像を accumulate (★3 で受信)
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/root/sub/a.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -32791,6 +32805,7 @@ mod phase_c_drill_nav_tests {
         app.global_search.active = true;
         // /root/sub に: ★なし 2 件、★2 が 1 件、★4 が 1 件 を accumulate
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/root/sub/a.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -32798,6 +32813,7 @@ mod phase_c_drill_nav_tests {
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/root/sub/b.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -32805,6 +32821,7 @@ mod phase_c_drill_nav_tests {
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/root/sub/c.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -32812,6 +32829,7 @@ mod phase_c_drill_nav_tests {
             stars: 2,
         });
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/root/sub/d.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -32863,6 +32881,7 @@ mod phase_c_drill_nav_tests {
         let mut app = setup_app();
         app.global_search.active = true;
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/folder_a/x.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -32982,6 +33001,7 @@ mod phase_c_drill_nav_tests {
         app.global_search.active = true;
         // /root/sub1/x.jpg と /root/sub2/y.jpg のヒットを accumulate
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/root/sub1/x.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -32989,6 +33009,7 @@ mod phase_c_drill_nav_tests {
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: "c:/root/sub2/y.jpg".into(),
             score: 1.0,
             mtime: 0,
@@ -35161,6 +35182,7 @@ mod phase_c_drill_address_tests {
         app.global_search.active = true;
         app.global_search.last_executed = "グルグル".to_string();
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: format!(
                 "{}/衛藤ヒロユキ_魔法陣グルグル01_ipad.pdf",
                 folder_path.display()
@@ -35241,6 +35263,7 @@ mod phase_c_drill_address_tests {
         app.global_search.active = true;
         app.global_search.last_executed = "グルグル".to_string();
         app.global_search.accumulate_hit(&GlobalHit {
+            kind: crate::fts_index::IndexKind::Pdf,
             path: "d:/scansnap/a.pdf".to_string(),
             score: 1.0,
             mtime: 0,
@@ -35290,6 +35313,7 @@ mod phase_c_drill_address_tests {
         let tx = install_search_receiver(&mut app);
         let hits = (0..3)
             .map(|index| GlobalHit {
+                kind: crate::fts_index::IndexKind::Image,
                 path: format!("c:/search/{index}.jpg"),
                 score: 1.0,
                 stars: 0,
@@ -35364,6 +35388,7 @@ mod phase_c_drill_address_tests {
         tx.send(SearchStreamEvent::Batch {
             hits: (0..3)
                 .map(|index| GlobalHit {
+                    kind: crate::fts_index::IndexKind::Image,
                     path: format!("c:/search/{index}.jpg"),
                     score: 1.0,
                     stars: 0,
@@ -45174,6 +45199,152 @@ mod favorite_adjustment_defaults_tests {
             current_container_rating_key(&app),
             rating_key_for(&source.join("inner"))
         );
+    }
+
+    #[test]
+    fn caption_search_book_stamps_reach_archive_cache_and_thumbnail_requests() {
+        use crate::archive_converter::ArchiveFormat;
+        let mut app = setup_app();
+        let root = app.tmp.path().join("caption-cache");
+        std::fs::create_dir(&root).unwrap();
+        let mut caches = Vec::new();
+        for (name, format) in [
+            ("book.rar", ArchiveFormat::Rar),
+            ("book.7z", ArchiveFormat::SevenZ),
+            ("book.lzh", ArchiveFormat::Lzh),
+        ] {
+            let source = root.join(name);
+            let cached = app.tmp.path().join(format!("{name}.zip"));
+            std::fs::write(&source, b"source archive").unwrap();
+            std::fs::write(&cached, b"PK\x03\x04").unwrap();
+            let source_meta = std::fs::metadata(&source).unwrap();
+            let stamp = (
+                crate::ui_helpers::mtime_secs(&source_meta),
+                source_meta.len() as i64,
+            );
+            let db = app.archive_cache_db.as_ref().unwrap();
+            db.record(&source, stamp.0, stamp.1, format, &cached, 4, 1, false)
+                .unwrap();
+            assert!(
+                db.peek(&source, 0, 0).is_none(),
+                "the old placeholder must not validate this cache"
+            );
+            app.global_search
+                .accumulate_hit(&crate::global_search::GlobalHit {
+                    path: source.to_string_lossy().into_owned(),
+                    kind: crate::fts_index::IndexKind::Zip,
+                    score: 1.0,
+                    mtime: stamp.0,
+                    file_size: Some(stamp.1),
+                    stars: 0,
+                });
+            caches.push((source, cached, stamp));
+        }
+        let folder = root.join("folder.epub");
+        std::fs::create_dir(&folder).unwrap();
+        let folder_mtime = crate::ui_helpers::mtime_secs(&std::fs::metadata(&folder).unwrap());
+        app.global_search
+            .accumulate_hit(&crate::global_search::GlobalHit {
+                path: folder.to_string_lossy().into_owned(),
+                kind: crate::fts_index::IndexKind::Folder,
+                score: 1.0,
+                mtime: folder_mtime,
+                file_size: Some(0),
+                stars: 0,
+            });
+        for drill in [false, true] {
+            let (items, metas) = if drill {
+                crate::global_search_ui::build_drilled_items(
+                    &app.global_search,
+                    &root,
+                    false,
+                    crate::settings::SortOrder::FileNameDesc,
+                    &[true; 6],
+                )
+            } else {
+                crate::global_search_ui::build_flat_items(
+                    &app.global_search,
+                    crate::settings::SortOrder::FileNameDesc,
+                    &[true; 6],
+                )
+            };
+            app.install_new_items(items, metas);
+            let count = app.items.len();
+            start_archive_decisions_for_test(&mut app, 0..count);
+            poll_archive_decisions_for_test(&mut app);
+            for (source, cached, stamp) in &caches {
+                let idx = app
+                    .items
+                    .iter()
+                    .position(|item| item.drag_source_path() == Some(source.as_path()))
+                    .unwrap();
+                assert_eq!(app.image_metas[idx], Some(*stamp));
+                let resolved = &app.converted_archive_cache_paths
+                    [&crate::path_key::normalize_keep_drive(source)];
+                assert!(
+                    matches!(resolved.read_source(), ConvertedArchiveSourceState::CachedZip { path, .. } if path == cached)
+                );
+                let request = make_load_request(
+                    &app.items[idx],
+                    idx,
+                    stamp.0,
+                    stamp.1,
+                    false,
+                    None,
+                    Some(crate::settings::SortOrder::Numeric),
+                    1,
+                    &HashMap::new(),
+                    &app.converted_archive_cache_paths,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                )
+                .unwrap();
+                assert_eq!(request.path, *cached);
+                assert_eq!((request.mtime, request.file_size), *stamp);
+                assert_eq!(
+                    request.resolve_override,
+                    Some(crate::thumb_loader::ResolveStrategy::ZipFirstImage)
+                );
+                assert!(request.source_policy.allows_source());
+                assert_eq!(
+                    app.archive_cache_db
+                        .as_ref()
+                        .unwrap()
+                        .peek(source, stamp.0, stamp.1)
+                        .as_ref(),
+                    Some(cached)
+                );
+            }
+            let idx = app
+                .items
+                .iter()
+                .position(|item| *item == GridItem::Folder(folder.clone()))
+                .unwrap();
+            assert_eq!(app.image_metas[idx], Some((folder_mtime, 0)));
+            let request = make_load_request(
+                &app.items[idx],
+                idx,
+                folder_mtime,
+                0,
+                false,
+                None,
+                Some(crate::settings::SortOrder::Numeric),
+                1,
+                &HashMap::new(),
+                &app.converted_archive_cache_paths,
+                None,
+                None,
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(request.path, folder);
+            assert_eq!((request.mtime, request.file_size), (folder_mtime, 0));
+        }
     }
 
     fn start_archive_decisions_for_test(app: &mut App, indices: impl IntoIterator<Item = usize>) {
@@ -74663,11 +74834,219 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             current_path: drilled.tmp.path().to_path_buf(),
             is_zip: false,
         });
+        drilled.global_search.aggregate_auto = false;
+        drilled
+            .global_search
+            .accumulate_hit(&crate::global_search::GlobalHit {
+                path: folder.join("hit.jpg").to_string_lossy().into_owned(),
+                kind: crate::fts_index::IndexKind::Image,
+                score: 1.0,
+                mtime: 0,
+                file_size: None,
+                stars: 0,
+            });
+        drilled.rebuild_items_from_global_search();
+        assert!(drilled.global_search_folder_is_branch(&folder));
         assert!(
             !drilled.open_grid_container_in_detached_book_context(&ctx, 0),
             "Ctrl+G drill Folder nodes must remain ordinary drill navigation"
         );
         assert!(drilled.folder_pane_open_pending.is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn caption_folder_book_and_search_branch_share_detached_admission_classifier() {
+        let ctx = egui::Context::default();
+        for direct in [false, true] {
+            let mut app = setup_app();
+            let root = app.tmp.path().join("caption-search");
+            let folder = root.join("album");
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("page.jpg"), b"fixture").unwrap();
+            app.global_search.active = true;
+            app.global_search.aggregate_auto = false;
+            app.global_search.drill = Some(crate::global_search_ui::DrillState {
+                container_root: root.clone(),
+                current_path: root,
+                is_zip: false,
+            });
+            let hit_path = if direct {
+                folder.clone()
+            } else {
+                folder.join("page.jpg")
+            };
+            app.global_search
+                .accumulate_hit(&crate::global_search::GlobalHit {
+                    path: hit_path.to_string_lossy().into_owned(),
+                    kind: if direct {
+                        crate::fts_index::IndexKind::Folder
+                    } else {
+                        crate::fts_index::IndexKind::Image
+                    },
+                    score: 1.0,
+                    mtime: 0,
+                    file_size: None,
+                    stars: 0,
+                });
+            app.rebuild_items_from_global_search();
+            app.settings.detached_viewer_open_images_in_window = true;
+            app.settings.auto_fullscreen_image_folders = true;
+            let idx = app
+                .items
+                .iter()
+                .position(|item| item == &GridItem::Folder(folder.clone()))
+                .unwrap();
+            assert_eq!(app.global_search_folder_is_branch(&folder), !direct);
+            if direct {
+                assert!(matches!(app.detached_grid_item_open_plan(idx, true),
+                    DetachedBuild::Built(DetachedGridItemOpenPlan::FolderCandidate { path, .. }) if path == folder));
+            } else {
+                assert!(matches!(
+                    app.detached_grid_item_open_plan(idx, true),
+                    DetachedBuild::NotApplicable
+                ));
+            }
+            // Enter and pointer activation use this same public detached admission entry.
+            assert_eq!(
+                app.open_grid_container_in_detached_book_context(&ctx, idx),
+                direct
+            );
+            if direct {
+                assert!(app.active_detached_session.is_some());
+            } else {
+                assert!(app.active_detached_session.is_none());
+                assert!(
+                    matches!(app.accept_grid_container_open(&ctx, idx), Some(crate::ui_main::AddressBarNav::Direct(path, _)) if path == folder),
+                    "Enter keeps its existing physical-folder open after branch admission declines"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn caption_extension_folder_branch_is_decided_before_detached_classification() {
+        let ctx = egui::Context::default();
+        for name in ["album.epub", "album.7z"] {
+            // Direct hit, branch-only, and a direct hit overlapped by a branch.
+            for (direct_hit, child_hit) in [(true, false), (false, true), (true, true)] {
+                for pointer in [true, false] {
+                    let mut app = setup_app();
+                    let root = app.tmp.path().join("caption-classified");
+                    let folder = root.join(name);
+                    std::fs::create_dir_all(&folder).unwrap();
+                    let page = folder.join("page.jpg");
+                    std::fs::write(&page, b"fixture").unwrap();
+                    app.settings.detached_viewer_open_images_in_window = true;
+                    app.settings.auto_fullscreen_image_folders = true;
+                    app.global_search.active = true;
+                    app.global_search.aggregate_auto = false;
+                    app.global_search.drill = Some(crate::global_search_ui::DrillState {
+                        container_root: root.clone(),
+                        current_path: root.clone(),
+                        is_zip: false,
+                    });
+                    for (present, path, kind) in [
+                        (direct_hit, &folder, crate::fts_index::IndexKind::Folder),
+                        (child_hit, &page, crate::fts_index::IndexKind::Image),
+                    ] {
+                        if present {
+                            app.global_search
+                                .accumulate_hit(&crate::global_search::GlobalHit {
+                                    path: path.to_string_lossy().into_owned(),
+                                    kind,
+                                    score: 1.0,
+                                    mtime: 1,
+                                    file_size: Some(0),
+                                    stars: 0,
+                                });
+                        }
+                    }
+                    app.rebuild_items_from_global_search();
+                    assert_eq!(app.items, vec![GridItem::Folder(folder.clone())]);
+                    assert!(App::path_needs_open_classification(&folder));
+                    assert_eq!(app.global_search_folder_is_branch(&folder), child_hit);
+                    // Enter and doubleclick both call this public admission before
+                    // their existing, deliberately different fallback routes.
+                    let handled = app.open_grid_container_in_detached_book_context(&ctx, 0);
+                    assert_eq!(handled, !child_hit, "{name}: pointer={pointer}");
+                    if child_hit {
+                        assert!(
+                            app.top_level_grid_view.open_path_classification().is_none(),
+                            "a branch must not start a continuation that cannot resume drill"
+                        );
+                        assert!(app.active_detached_session.is_none());
+                        assert!(app.folder_pane_open_pending.is_none());
+                        if pointer {
+                            app.drill_into_subfolder(folder.clone());
+                            assert_eq!(
+                                app.global_search.drill.as_ref().unwrap().current_path,
+                                folder
+                            );
+                        } else {
+                            assert!(matches!(app.accept_grid_container_open(&ctx, 0),
+                                Some(crate::ui_main::AddressBarNav::Direct(path, _)) if path == folder));
+                            assert_eq!(
+                                app.global_search.drill.as_ref().unwrap().current_path,
+                                root,
+                                "Enter retains its existing physical-folder fallback"
+                            );
+                        }
+                    } else {
+                        assert!(app.top_level_grid_view.open_path_classification().is_some());
+                        app.settle_open_path_classification_for_test();
+                        assert!(
+                            app.active_detached_session.is_some(),
+                            "a directly matched folder book must still open in its own context"
+                        );
+                        assert!(matches!(
+                            app.folder_pane_open_pending
+                                .as_ref()
+                                .map(|pending| &pending.purpose),
+                            Some(FolderOpenScanPurpose::GridFolderCandidate { .. })
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn caption_search_branch_projection_is_not_cleared_by_sibling_item_install() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("caption-main");
+        let branch = root.join("branch");
+        app.global_search.active = true;
+        app.global_search.aggregate_auto = false;
+        app.global_search.drill = Some(crate::global_search_ui::DrillState {
+            container_root: root.clone(),
+            current_path: root,
+            is_zip: false,
+        });
+        app.global_search
+            .accumulate_hit(&crate::global_search::GlobalHit {
+                path: branch.join("hit.jpg").to_string_lossy().into_owned(),
+                kind: crate::fts_index::IndexKind::Image,
+                score: 1.0,
+                mtime: 0,
+                file_size: None,
+                stars: 0,
+            });
+        app.rebuild_items_from_global_search();
+        assert!(app.global_search_folder_is_branch(&branch));
+        app.build_active_context_for_test(Some(9192), DetachedSource::Image, |_| {});
+        app.with_active_viewer_context(|sibling| {
+            sibling.install_new_items(vec![GridItem::Folder(branch.clone())], vec![None]);
+            assert!(!sibling.global_search_folder_is_branch(&branch));
+        })
+        .unwrap();
+        assert!(
+            app.global_search_folder_is_branch(&branch),
+            "only the mounted context retires its branch projection"
+        );
+        app.remove_active_context_for_test();
     }
 
     #[test]

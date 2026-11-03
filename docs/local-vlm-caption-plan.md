@@ -1,6 +1,6 @@
 # ローカル AI 説明文 (VLM) 計画書
 
-Status: 独立レビュー済み (2026-11-02、9 回で閉じた、§19)。設計担当 ClaudeCode。V0 (モデル比較・VRAM 計測) を終え、利用者の判断 U1〜U18 が出そろった。
+Status: 独立レビュー済み (2026-11-02、9 回で閉じた、§19)。設計担当 ClaudeCode。V0 (モデル比較・VRAM 計測) を終え、利用者の判断 U1〜U19 が出そろった。
 v5 に入れることが決まった (2026-11-02、v5 統合担当から連絡)。
 関連: [mcp-integration-plan.md](mcp-integration-plan.md) (§5.4・§5.6・§15.2)、
 [search-architecture.md](search-architecture.md) (§4.10・§4.11)、
@@ -43,7 +43,7 @@ v5 に入れることが決まった (2026-11-02、v5 統合担当から連絡)�
 
 ### 内容に関与しない方針 (2026-11-02 利用者決定)
 
-- モデルの出力は長さの上限 (§6.4) で切る以外、そのまま保存・表示・返却する。
+- モデルの出力は長さの上限 (§6.4) で切ることと、検索語の全く同じ語の重複を除くこと (§21.7.3) 以外、そのまま保存・表示・返却する。
 - 語の選別・置き換え・伏せ字、内容による保存拒否、「断ったかどうか」の判定はしない。
   モデルが説明を断った文や曖昧な文を返したら、それもそのまま保存する。
 - 公開文書では「画像の内容を AI が文章にしたもの。正確とは限らない」と処理内容で説明し、
@@ -108,7 +108,7 @@ v5 に入れることが決まった (2026-11-02、v5 統合担当から連絡)�
 | 案 | 内容 | 判断 |
 | --- | --- | --- |
 | A | llama.cpp の `llama-server` を子プロセスで起動し、127.0.0.1 の HTTP で呼ぶ | 不採用。PC 内の他プロセスやブラウザから届く口ができ、「mIV はネットワークで待ち受けない」が崩れる。鍵と Origin 検査を足す管理も増える |
-| **B** | **llama.cpp (libllama + libmtmd) を組み込んだ自前の worker exe。本体とは匿名パイプ + 共有メモリ** | **推奨**。待ち受ける口が無い。既存の TRT worker・PDFium worker と同じ形で、落ちても本体を巻き込まない |
+| **B** | **llama.cpp (libllama + libmtmd) を組み込んだ自前の worker exe。本体とは匿名パイプ (長さ付きの枠、§21.3)** | **推奨**。待ち受ける口が無い。既存の TRT worker・PDFium worker と同じ形で、落ちても本体を巻き込まない |
 | C | 同梱済みの ONNX Runtime (DirectML) + onnxruntime-genai | 不採用。VLM の ONNX 版がほぼ無く、今の `ort` (api-24) との組み合わせの制約も増える |
 
 - GPU は **Vulkan 版**を既定にする (NVIDIA / AMD / Intel で 1 本の build が動き、CUDA 版より配布が小さい)。
@@ -133,18 +133,15 @@ v5 に入れることが決まった (2026-11-02、v5 統合担当から連絡)�
 - worker の寿命: 作成ジョブの開始で起動 → モデルを読み込む → 1 件ずつ処理 → ジョブの終了・中止・mIV の終了で終了。
   Job Object の kill-on-close (`src/epub_convert.rs` の EPUB worker に実例がある) で、本体が落ちても
   VRAM を持ったまま残らないようにする。常駐はさせない。
-- 入力画像は**本体側の既存デコーダ** (WIC / TurboJPEG / LibRaw ほか) で読み、縮小した RGB を共有メモリで渡す。
+- 入力画像は**本体側の既存デコーダ** (WIC / TurboJPEG / LibRaw ほか) で読み、縮小した RGB をパイプで渡す (共有メモリは使わない、§21.3)。
   対応形式が本体と完全に一致し、worker にデコーダを持たせずに済む。
 
 ## 5. モデルの配布
 
-- 保存先: `%APPDATA%/mimageviewer/addons/vlm/<model-id>/` (編集用追加パックと同じ構造で、`manifest.json` が有効なものを指す)。
-- 取得元: Qwen3.5-4B の GGUF は本体 2.74GB + mmproj 0.67GB で (§3.3)、本体は GitHub Releases の 1 ファイル 2GB の上限を超える。
-  Qwen 公式の GGUF は無く、V0 では unsloth/Qwen3.5-4B-GGUF (コミット `e87f1764`) を使った。第三者の量子化を配布元にしてよいか、
-  公式の重みから mIV 側で量子化して置くかは独立レビューの論点とする。
-  **提供元の Hugging Face リポジトリから、コミットを固定した URL で直接取得する**案を推奨する。
-  mIV 側の一覧 (GitHub Releases に置く小さな index) には、URL・固定コミット・sha256・サイズ・ライセンスを書く。
-  index 自体は既存の追加パックと同じく https + 検証で取得する。
+- **2026-11-03 改め (U20)**: 配布元は mIV 側で量子化したモデル (GitHub Releases、分割) にした。下の Hugging Face から直接取る案は採らない。詳細は §21.7.1。
+- 保存先: `<data_dir>/addons/vlm/packs/<model_id>/`。`INSTALL_OK` と `active.json` で導入済みを判定する。
+- 取得元: mIV の固定 GitHub Releases `vlm-model-v1`。公式の重みから mIV 側で量子化した本体と mmproj、LICENSE、NOTICE を配る (§21.7.1)。
+  本体は 2GiB 未満の部分に分割する。index の schema、ファイル・部分のサイズと SHA-256 を検証し、全体の検証後だけ有効にする。
 - 取得: 既存と同じく `.partial` への Range 再開・再試行・sha256 の照合。取得は利用者の明示操作でだけ始める。
 - ライセンス: モデルの Apache 2.0 の本文と NOTICE、llama.cpp / ggml の MIT をライセンス表示に加える。
 - 削除: 設定画面からモデルを削除できる (1 モデルなので項目は 1 つ)。説明文はモデルを消しても残る。
@@ -172,9 +169,9 @@ v5 に入れることが決まった (2026-11-02、v5 統合担当から連絡)�
     - ボタン: [ダウンロード] [今はしない]。
   - **VRAM の総量が 8GB 未満のとき**は、取得を勧めず「この PC の GPU では使えません (VRAM 8GB 以上が必要)」とだけ出す (U1)。
     Vulkan が使えないときも同様 (U7)。
-  - 取得中は進捗の画面 (モーダル、キャンセル可) を出す。取得と検証は worker で行い、UI スレッドは止めない。
+  - 取得中は進捗の画面 (modeless、キャンセル可。§21.7.2 で改定) を出す。取得と検証は worker で行い、UI スレッドは止めない。
     キャンセルと失敗の扱いは編集用追加パックと同じ (`.partial` を残して次回に再開、失敗はログ + 通知)。
-  - 取得が終わったら、選んでいた項目で作成ジョブを始める。取得中はモーダルなので一覧の操作は入らず、対象はクリックした時点のまま扱える。
+  - 取得が終わったら、選んでいた項目で作成ジョブを始める。対象はクリックした時点のパスを持ち、取得中に一覧を動かしても変えない。
     ただし取得は数分かかり得るので、この間に画面外 (エクスプローラーなど) で対象が消えた場合は、ジョブ側の「対象のファイルがもう無い」(§6.5) で扱う。
 
 ### 6.2 1 件の流れ
@@ -566,7 +563,7 @@ AI 補正の VRAM 使用量は実測の記録が無い。ONNX Runtime の確保�
 
 ## 13. 安全性・プライバシー・公開文書
 
-- 推論は PC 内で完結する。新しく生じる通信は**モデルのダウンロード (利用者の操作時、huggingface.co と GitHub)** だけ。
+- 推論は PC 内で完結する。新しく生じる通信は**モデルのダウンロード (利用者の操作時、GitHub Releases)** だけ。
 - 説明文はローカルの `ai_caption.db` と索引に保存する。MCP のチェックが ON のときだけ AI アプリへ渡る。
 - 説明文は画像の内容を表す文字列で、ファイルの場所と合わせると敏感な情報になり得る。
   §5.6 の「AI に見せるもの」に明記する。
@@ -642,7 +639,10 @@ AI 補正の VRAM 使用量は実測の記録が無い。ONNX Runtime の確保�
 | U12 | 作成ジョブ中にメタ情報の書き出し・取り込みを使えなくすること | 問題ない (2026-11-02)。ただし U14 で止める必要が無くなり、止めないことにした |
 | U16 | 本の表紙も説明文にするか (§6.7) | する。保存は本のパス、表紙は一覧のサムネイルと同じもの、MCP の項目情報で返す (2026-11-02) |
 | U17 | ZIP・RAR・フォルダの本を説明文で Ctrl+G から探せるようにするか (§6.7) | 説明文がある本に限り、アイテム索引にも載せる (2026-11-02 利用者の案)。説明文の無い本は今どおり Ctrl+S だけ |
+| U19 | worker (`mimageviewer-vlm.exe`、約 46MB) の配り方 | 本体に内包する (VST3 bridge と同じ)。モデルだけを追加ダウンロード (2026-11-02) |
 | U18 | 未変換のファイル (EPUB・変換済みの ZIP が無い 7z・LZH) の表紙 (§6.7) | 飛ばす。何も保存せず、ジョブの終わりに飛ばした件数を出す。作成ジョブからは変換しない (2026-11-02) |
+| U20 | モデルの配布元 (§5) | **mIV 側で公式の重みから量子化し、GitHub Releases に分割して置く** (2026-11-03)。第三者の量子化 (unsloth) からは取得しない。§21.7 |
+| U21 | ポータブル版 (loose-deps の zip) で使えるか | **ポータブル版にも worker を入れて使えるようにする** (2026-11-03)。VST3 bridge と違い、exe の隣に置く。ウイルス対策ソフトの誤検知の恐れは受け入れる。§21.7 |
 | U15 | 名前を入れ替える操作 (本のページの並べ替えなど) の途中で読んだページの説明文が、別のページに付くことがある件 (§6.6) | 割り切る。タイミングとしてまれなため (2026-11-02)。付いた先で署名が違えば「古い」と表示され作り直せるが、署名が同じ画像どうしでは見分けられず、通常の作り直しでも直らない (独立レビュー 5 回目で記述を正した) |
 | U14 | 改名・削除と保存の順序の扱い (§6.6) | 作業を始めたときのパスと署名を覚え、書く前に違えば結果を捨てる (2026-11-02 利用者の案)。メタ情報の書き出し・取り込みも止めない |
 | U13 | MCP で説明文を使えるようにするか (§10) | MCP の権限設定で、縮小画像と同じく利用者が選ぶ。「AI 説明文」チェックが ON なら MCP の検索と `get_item_info` の両方で使い、OFF ならどちらにも出さない。既定は OFF (U2) のまま (2026-11-02) |
@@ -947,3 +947,1887 @@ mIV 本体にはつないでいない。build と確認の手順は `crates/vlm-
 ### 19.9 9 回目 (2026-11-02、同じ担当の続き、基準 `d031c286c`)
 
 8 回目の 2 件は閉じ、新しい指摘は無かった。本の表紙 (§6.7) を含め、計画書の独立レビューはここで閉じる。
+
+## 21. V1 の段階分けと V1-1 の設計 (2026-11-02、独立レビュー済み §19.10・§19.11)
+
+### 21.1 V1 の段階
+
+V1 (§14) は大きいので、所有の境界ごとに分ける。各段階で独立レビュー (設計・コード) を受けてから次へ進む。
+
+| 段階 | 内容 | 主な所有者 |
+| --- | --- | --- |
+| V1-1 | worker の常駐用の通信 (`--serve`)、Rust 側の worker client、GPU の判定 (VRAM 総量と device)、worker の場所の解決 (開発用) | `VlmWorkerClient` |
+| V1-2 | `ai_caption.db` (§7 の schema・trigger)、`STORES` 登録、`metadata_transfer`、保存役 (§6.6 の lock の中の確認) | 保存役 |
+| V1-3 | 作成ジョブの持ち主・右クリック・進捗の小窓・初回の取得案内・モデルの追加ダウンロード・VRAM 8GB の判定・worker の本体への内包 (展開・source identity・署名) | `CaptionJobOwner` |
+| V1-4 | 表示 (共有キャッシュ §9、情報パネル)、本の表紙の解決の切り出し (§6.7) と本のジョブ | 表示・表紙の解決 |
+
+V2 (検索) と V3 (MCP) は §14 のまま。
+
+### 21.2 既存の worker の作り (2026-11-02 調査、コードで確認)
+
+| worker | 起動 | 通信 | 大きなデータ | 親が落ちたとき |
+| --- | --- | --- | --- | --- |
+| TensorRT 推論 | 本体 exe を引数付きで起動 | 1 行 1 JSON | 名前付きの共有メモリ 2 つ | stdin の EOF で終わる (Job Object なし) |
+| PDFium | 本体 exe を引数付きで起動、複数 | u32 長さ付きの binary (`pdf_loader::write_msg` / `read_msg`、上限 512MiB) | パイプにそのまま (描画した画素) | Job Object なし |
+| EPUB → PDF | 別 exe を `CreateProcessW` (suspended) | stdout の 1 行 1 JSON (片方向) | ファイル | **Job Object の kill-on-close** (`epub_convert.rs`) |
+| VST3 bridge | 別 exe (`vendor/` で build、本体に内包し content-addressed で展開) | u32 長さ付きの JSON + 名前付きの共有メモリ | 共有メモリ | 子が親の pid を見張る |
+
+計画書 §4 の「TRT worker・PDFium worker と同じ形 (匿名パイプ + 共有メモリ)」は事実と違っていた (TRT は名前付きの共有メモリ、PDFium は画素もパイプ、Job Object を使うのは EPUB だけ)。V1-1 で次のように直す。
+
+### 21.3 V1-1 の設計
+
+**通信は長さ付きの枠をパイプに流すだけにし、共有メモリは使わない。** 1 件の入力は長辺 1024px の RGB で最大約 3MB、出力は数 KB なので、
+PDFium worker と同じくパイプにそのまま流して足りる。共有メモリの名前・寿命・読み書きの順序の約束を持たずに済む (状態を減らす)。
+
+- **worker の起動**: EPUB worker と同じく `CreateProcessW` (suspended・`CREATE_NO_WINDOW`) → Job Object (kill-on-close) に入れる → resume。
+  stdin・stdout は匿名パイプ (親側は継承させない)、stderr はログへ流す。EPUB と同じ処理を 2 か所に書かず、Job Object 付きの起動を
+  1 つの helper にまとめて両方が使う (EPUB の挙動は変えない)。親が落ちれば Job Object で worker も終わる。
+  - **子に渡すハンドルを、その子の標準入出力の端だけに限る** (独立レビュー 10 回目 P2-1)。今の EPUB は継承可能なパイプを作り、
+    `CreateProcessW` に `bInheritHandles = true` を渡している (`epub_convert.rs`)。この形のままだと、EPUB 変換と VLM の worker が同時に起動したとき、
+    互いの子側の端も継承し、片方の worker を止めても別の子が書き込み側を握っていて EOF が届かない。helper は
+    `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (`STARTUPINFOEX`) でその子の端だけを渡し、起動後は親に残った子側の端を閉じる。EPUB にも同じ helper を使う。
+- **枠** (独立レビュー 10 回目 P2-2 で中身の形を決めた): 外側は u32 little-endian の全体の長さ + 中身 (`pdf_loader` の `write_msg` / `read_msg` と同じ。
+  共通にできるなら同じ関数を使う)。中身は「u32 の JSON の長さ + UTF-8 の JSON + 残りのバイト列」。`caption` の残りのバイト列は、行を詰めた RGB8
+  (幅 × 高さ × 3 バイト、行の間に余白なし) で、長さが幅 × 高さ × 3 と一致しなければ不正。16MiB の上限は外側の全体の長さに当てる。
+  不正な枠 (長さの上限超え・JSON の不正・RGB の長さの不一致・知らない種類) は、受け取った側がその worker を終わらせる扱いにする (やりとりを続けない)。
+- **worker の標準入出力はバイトで扱う**: `--serve` では stdin・stdout を CRT の文字モードで扱わず、Win32 の `ReadFile` / `WriteFile` で読み書きする
+  (または `_setmode(_O_BINARY)`)。文字モードでは改行が変換され、RGB や長さが壊れる。stdout はやりとり専用にし、ログは stderr だけに出す
+  (llama.cpp・ggml のログの出力先も stderr に向ける)。
+- **やりとり** (どれも 1 往復、同時に 1 つだけ):
+  - `hello` → 版 (`protocol_version`) と worker の source identity を返す。版が違えば使わない (VST3 と同じ)。
+  - `load` (モデル・mmproj のパス、device の LUID、CPU スレッド数) → 読み込みにかかった時間と使った device。
+  - `caption` (要求の番号、幅・高さ、RGB) → 要求の番号、結果 (`ok` / `image_failure` / `fatal`)、3 欄、検証 (§6.5)、生成トークン数、時間。
+    `image_failure` は 1 件の失敗 (次へ進む)、`fatal` は続けても意味がない失敗 (VRAM 不足など。ジョブを止める)。V1-0 の分け方をそのまま使う。
+  - `shutdown` → 終わる。返事を待たずに Job Object で終わらせてもよい (TRT と同じく、片付けを待たない)。
+- **worker 側 (C++)**: `--serve` を足す。1 件の処理は V1-0 の確認用モードと同じ関数を使う (処理を 2 つに分けない)。画像は本体から RGB で受け取り、
+  worker はデコードしない (§4)。確認用モード (`--selftest`) は PNG を読んでこの関数に渡す形に揃え、残す (回帰の確認に使う)。
+- **Rust 側の client** (`VlmWorkerClient`): 起動・`hello`・`load`・`caption`・終了を持つ。呼ぶのはジョブの worker スレッドだけで、UI スレッドからは
+  呼ばない。時間の上限: `hello` 30 秒、`load` 120 秒、最初の `caption` 120 秒 (Vulkan の初回準備、§20)、2 件目以降 60 秒。上限を超えた・パイプが
+  切れた・`fatal` が来たら、worker を終わらせて client は使えなくなる (再起動や再試行はしない。まれな失敗は割り切り)。
+- **待ちを解く仕組みと止め方** (独立レビュー 10 回目 P2-3)。パイプの読み書きは同期 I/O で期限を持たないので、次のようにする。
+  - パイプの読み書きは、client が持つ**書き手のスレッドと読み手のスレッド**だけが行う (TRT worker の reader と同じ形)。ジョブのスレッドは
+    要求を書き手へ渡し、応答を読み手からの channel で `recv_timeout` で待つ。ジョブのスレッドがパイプで止まることは無い。
+  - worker を終わらせる手段は **kill handle** (Job Object の handle を共有したもの) 1 つ。client と App の持ち主の両方が持ち、どちらからでも
+    `TerminateJobObject` できる。期限切れ・不正な枠・`fatal` のときは client が、mIV の終了のときは App が呼ぶ。worker が終わればパイプが切れ、
+    書き手・読み手のスレッドは誤りで抜け、ジョブのスレッドは channel の切断で抜ける。**止めるのが先、スレッドの回収はその後**で、
+    UI スレッドは回収を待たない (回収は既存の reaper と同じく別スレッドで行うか、切り離す)。
+  - **通常の中止** (利用者がジョブを止める) は、今の 1 件の推論が終わるのを待ってから `shutdown` を送り、kill handle で終わらせる (§6.5)。
+    **mIV の終了** は待たずにすぐ kill handle で終わらせる。この 2 つを分ける。
+- **GPU の判定**: worker の `--list-devices` (V1-0 で作った、DXGI の LUID と Vulkan の device の対応と VRAM 総量) を、モデルを読まずに起動して使う。
+  結果は「使う device (専用メモリが最大のアダプタ) と、その VRAM 総量、Vulkan の有無」の 1 つ。判定は mIV の起動ごとに 1 回、必要になったときに
+  worker スレッドで行い、その起動の間は結果を使い回す (実行時の空きでは変えない)。`gpu_info` (DXGI の最初のアダプタ) は使わない。
+- **worker の場所**: 1 つの関数で解決する。V1-1 では、環境変数 `MIV_VLM_WORKER` → `vendor/vlm-worker/mimageviewer-vlm.exe` (開発用) の順。
+  本体への内包・展開 (VST3 と同じ content-addressed)・portable での置き方・source identity の照合・署名は V1-3 でこの関数に足す。
+- **確認**: Rust の統合テスト (既定では走らない。モデルのパスを環境変数で渡したときだけ) で、`--serve` 経由の 26 枚の出力が V1-0 の確認用モードの出力と
+  26/26 一致することを確かめる。通信の枠・時間の上限・`image_failure` と `fatal` の分け方・パイプが切れたときは、偽の worker (テスト用の小さな exe か
+  Rust のテスト用 binary) で確かめる。
+- **まれな失敗**は割り切り (ログ + 通知。ジョブを止め、利用者がやり直す)。
+
+### 19.10 10 回目 (2026-11-02、同じ担当の続き、基準 `a42fcd4ab`、V1-1 の設計)
+
+§21.2 の事実・共有メモリを使わない判断・再起動しない判断・段階分けは「問題なし」。P2 3 件を §21.3 に足した: 子に渡すハンドルを
+その子の標準入出力に限る (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`、EPUB にも適用) / worker の標準入出力をバイトで扱い、枠の中身を
+「JSON の長さ + JSON + RGB」に決める / 書き手・読み手のスレッドと kill handle で待ちを解き、止めるのを回収より先にする。
+
+### 19.11 11 回目 (2026-11-02、同じ担当の続き、基準 `3ff700f3d`)
+
+10 回目の 3 件は閉じ、新しい指摘は無かった。V1-1 の設計 (§21) のレビューはここで閉じる。
+
+### 21.4 V1-1 の結果 (2026-11-02、`a1ab32ed3` + `de96c69bf`)
+
+- 実装: 共通の起動部品 `src/job_process.rs` (suspended 起動 → Job Object → resume、`PROC_THREAD_ATTRIBUTE_HANDLE_LIST` で子に渡すのはその子の標準入出力だけ)。
+  EPUB worker もこれに置き換えた (引数・環境・cancel・timeout は不変)。client は TRT client の隣の `src/ai/vlm_worker.rs`
+  (書き手・読み手・stderr の 3 スレッド、kill handle、1 往復ごとの時間の上限、失敗した client は再利用しない)。worker 側は `--serve`
+  (`serve.cpp` / `protocol.h`、stdin・stdout を binary mode、ログは stderr) と、`--selftest` と共通の 1 件の処理 (`inference.cpp`)。
+- V1-3 が使う形: `start_at` → `kill_handle()` を App に渡す → `hello` → `load` → `caption` を直列に。通常の中止は今の 1 件の戻りを待って
+  `shutdown()`、終了時は kill handle で即座に止める。
+- 確認 (設計担当の環境で再実行): 実モデル 26 枚で `--serve` の 3 欄が V1-0 と 26/26 一致 (読み込み込み 64 秒)。本体 lib 全件は 15,354 件中
+  失敗 2・時間切れ 1 で、3 件とも単独で成功 (VLM と無関係の時間依存テストと 10 万件走査の重いテスト)。CTest 6/6。
+- 独立コードレビュー (gpt-6.1-sol / xhigh): P1・P2 なし。P3 1 件 (テスト用の偽 worker が `%TEMP%` に残る) を `target/vlm-fake-worker/` への
+  キャッシュに改め、再確認で「指摘なし」。V1-1 はここで閉じる。
+
+### 21.5 V1-2 の設計 (2026-11-02、独立レビュー済み §19.12・§19.13)
+
+V1-2 は**保存の土台**だけを作る: `ai_caption.db` (§7)・保存役 (§6.6 の lock の中の確認)・`STORES` への登録・`metadata_transfer` (U6)。
+作成ジョブ・UI・表示用の共有キャッシュ (§9)・索引への反映 (§8 の管理役と旗) は作らない (V1-3・V1-4・V2)。V1-2 が後の段階へ渡すのは、
+保存・読み取りの API と「説明文が変わった」ことを書き手が知らせる場所 (戻り値・`ImportChangedSections`) まで。
+
+**既存の作り (2026-11-02、コードで確認)**
+
+- path をキーにするストアは `*_db.rs` が `open` (無ければ作成・schema の確認) / `open_at` / `open_existing_for_write` / `db_path()`
+  (`data_dir::get().join(...)`) を持つ (`rating_db.rs`)。改名・移動・本の構造操作・孤児整理・削除の hard purge・内容同一性の復元は
+  `rename_key_migration::STORES` の記述子を走査し、DB ごとに自分で接続を開く。ファイルが無い DB は飛ばす。
+- メタ情報の取り込みは、関係する DB を全部 1 つの接続に `ATTACH` し、**1 つのトランザクションで全 DB を更新する**
+  (`metadata_transfer.rs` の import)。複数 DB をまたいで原子的にするため、参加する DB はすべて rollback journal (WAL 不可) で、
+  取り込みの前に各 DB を `open_at` で開いて schema を作っておく。書き出し (`export`) は各 DB を読み取りで開き、走査範囲の表と join して読む。
+- 形式の版は `FORMAT_VERSION = 11` で、v4.11.0 で出荷済み。欄ごとの有無は `ManifestSections` の bool。新しい欄は版を上げ、
+  古い版の取り込みではその欄を無効にする (`composition` の前例: `version < FORMAT_VERSION` なら `sections.composition = false`)。
+  欄の選択 UI は無い (書き出しは常に全欄)。
+- `copies_with_book_page` は、本の構造操作でページを別の本へ写すときに行も写すかで、今は編集・★・タグの 8 種だけが `true`。
+
+**作るもの**
+
+1. **`src/ai_caption_db.rs`** (`CaptionDb`、他の `*_db.rs` と同じ形)。
+   - schema は §7 のまま (表 `captions`・`caption_seq`・`caption_removed` と trigger 3 つ)。列の名前は `mtime_ms` / `size` にし、
+     更新日時はミリ秒 (`metadata_transfer` の `FileFingerprint` と同じ単位・同じ求め方)。`PRAGMA user_version = 1`。未リリースなので移行は無い。
+   - **journal は rollback (既定の DELETE) のまま**にし、WAL にしない (取り込みの原子的な更新に参加するため)。busy timeout は保存で 5 秒。
+   - 読み取り: `get(item_key)` (飛ばす判定 §6.2 と表示用)。キーは `StoreKeyNormalization::KeepDrive` (タグ・★と同じ) で、正規化は呼び出し側でなく
+     記述子の `normalize_path` を使う。
+2. **保存役** `CaptionDb::save(&SaveRequest) -> Result<SaveOutcome>` (ジョブの worker スレッドから呼ぶ。UI スレッドからは呼ばない)。
+   - `SaveRequest`: 項目のパス、**署名を取り直すパス** (画像はその画像、ファイル 1 つの本は本のファイル、フォルダの本は実際に読んだファイル、
+     EPUB は元の EPUB。§6.7)、読んだときの署名 (size + mtime_ms)、`cover_ref`、model_id、prompt_version、lang、結果 (`Ok{caption, text, keywords}` /
+     `Failed`)。どの値を入れるかは V1-3 (画像) と V1-4 (本) が決める。保存役は「渡されたパスを取り直して比べる」だけで、本の種類を知らない。
+   - 手順 (§6.6): `BEGIN IMMEDIATE` → 署名を取るパスの `metadata` を取り直す → 無い・読めない・size か mtime_ms が違う (更新日時が取れない場合も含む)
+     → `ROLLBACK` して `Discarded` → 同じなら書く → `COMMIT`。ファイルの読み取りは `metadata` 1 回だけ (lock を持つ時間を短くする)。
+   - 書き方: `Ok` は無条件に upsert。`Failed` は、行が無いか `failed` の行のときだけ upsert し、`ok` の行があれば何もしない (`KeptExistingOk`。§6.5)。
+     upsert は `INSERT ... ON CONFLICT(item_key) DO UPDATE` にする (`INSERT OR REPLACE` は削除 + 挿入で、削除の trigger が既定では動かず
+     `caption_removed` が狂うため使わない)。
+   - 戻り値 `SaveOutcome`: `Written` / `KeptExistingOk` / `Discarded`。`Written` のときだけ、呼び出し側 (V1-3) が表示の無効化 (V1-4) と索引の旗 (V2) を立てる。
+   - lock が取れない (5 秒の busy) などの DB の失敗は、まれな失敗として割り切る (エラーを返し、V1-3 がジョブを止めて通知する)。
+3. **`STORES` への登録**: `store("ai_caption.db", "captions", "item_key", unique = true, KeepDrive, BookStorePolicy::Follow, copies_with_book_page = false)`。
+   - `Follow` にするのは、本の構造操作 (改名・ページの並べ替え) で、タグ・★と同じく本の worker が運ぶため (U15 の割り切りはこの動きが前提)。
+   - `copies_with_book_page = false`: ページを別の本へ写すとファイルは新しくなり (更新日時が変わる)、写した説明文はすぐ「古い」になるだけなので写さない。
+     写さないストアもコピー先は初期化される (既存の規則) ので、コピー先に前の説明文が残ることは無い。
+   - **本へのページ追加にも説明文の初期化をつなぐ** (独立レビュー 12 回目 P2-2)。ページ追加は汎用の構造操作ではなく専用の
+     `AppendMetadataWriter` (`book_append_undo.rs`、対象は既存の 8 種) で追加先のキーを初期化する。末尾のページを mIV の外で消してから
+     別の画像を追加すると、番号と名前が再利用され、前の画像の説明文がその名前に残る。`AppendMetadataStores` に説明文を足し、
+     `prepare_destination` (ファイルを作る前) で追加先のキーの行を消すだけにする (写さない。`copies_with_book_page = false` と同じ扱い)。
+   - **内容同一性の復元の限界** (独立レビュー 12 回目 P2-3): `STORES` に載せると復元の写し先には入るが、復元元の台帳 (`content_identity.rs` の
+     記録) は編集・タグ・★のある項目でしか作られない。説明文だけを持つ画像を mIV の外で改名した場合は、台帳が無いので説明文は運ばれない。
+     説明文は作り直せる機械の出力なので、説明文のために台帳の記録 (ファイル内容のハッシュ) を足すことはしない。既に台帳にある項目
+     (編集・タグ・★もある画像) の説明文が一緒に運ばれるだけ、とする。
+   - `caption_removed` と `caption_seq` は登録しない (キーで運ぶと、旧キーを索引から消す印が新しいキーへ移ってしまう)。
+   - これで改名・移動・本の構造操作・孤児整理・削除の hard purge・内容同一性の復元 (`copy_stores_at`) が説明文にも効く。どの経路でも §7 の trigger が
+     `rev`・`indexed`・`caption_removed` を付けるので、書き手のコードに印の扱いを足さない。STORES の件数を数えているテストは足した分だけ直す。
+4. **`metadata_transfer`** (U6):
+   - `FORMAT_VERSION` を 12 に上げ、`ManifestSections` に `ai_captions` (serde の既定は false) を足す。12 より古い版の取り込みでは
+     `ai_captions = false` にする。v4 の mIV は v12 の書き出しを読めない (版を上げるたびの既存の扱いと同じ)。
+   - **版の境界を欄ごとの固定の定数に分ける** (独立レビュー 12 回目 P2-1)。今は受け入れる版の一覧が 11 を `FORMAT_VERSION` で表し、
+     構成情報を無効にする条件も `version < FORMAT_VERSION` なので (`metadata_transfer.rs` の `validate_bundle_manifest` と manifest の読み込み)、
+     定数を 12 にするだけでは v11 を拒み、受け入れても v11 の本の構成情報を捨ててしまう。構成情報の導入版 (`COMPOSITION_FORMAT_VERSION = 11`) と
+     説明文の導入版 (`AI_CAPTION_FORMAT_VERSION = 12`) を別の定数にし、受け入れる版の一覧に 11 を明示する。
+   - `PortableEntry` に `ai_caption: Option<PortableAiCaption>` (無ければ書かない)。中身は model_id・prompt_version・lang・caption・visible_text・
+     keywords・cover_ref・作成時の署名 (size + mtime_ms)・created_at。**書き出すのは `status = ok` の行だけ** (`failed` は「作れなかった」印で、
+     他の PC へ運ぶ意味が無い)。`ZIP` 内のページなど仮想の項目 (`virtual_items`) には足さない (v5 は対象外、§1)。
+   - 取り込み (欄が有効なとき): 記載された項目に説明文があれば upsert (`status = ok`、署名は書き出し元の値のまま。取り込み先のファイルと合わなければ「古い」になる §7)。
+     記載された項目に説明文が無ければ、その項目の行を消す (既存の欄と同じ「記載された空は消す」)。記載の無い項目には触れない。
+     upsert は保存役と同じく `ON CONFLICT DO UPDATE`。取り込みは署名の確認をしない (後勝ち、§6.6)。
+   - 取り込み前の schema の用意 (`open_at`) と `ATTACH`・journal の確認の一覧に `ai_caption.db` を足す。
+   - `ImportChangedSections` に `ai_captions` を足し、変えた件数を数える (V1-4 で表示の共有キャッシュを消し、V2 で索引の旗を立てるきっかけ)。
+     書き出し・取り込みの件数の表示は、既存の欄と同じ並びに足す。値の検証 (文字数・個数の上限 §6.4、keywords が文字列の配列) は既存の欄の検証と同じ場所で行う。
+5. **テスト**
+   - schema と trigger: INSERT / 内容の UPDATE / キーの UPDATE / DELETE で `rev` が全体で増え、`indexed = 0`、旧キーと削除が `caption_removed` に入る。
+     `rev`・`indexed` だけの UPDATE では trigger が動かない。本の入れ替え (一時キーを経由した 2 回の付け替え) の後に古い `(item_key, rev)` で
+     反映済みにしても 0 行 (§8 で確かめた筋書きを実装で確かめ直す)。
+   - 保存役: 署名一致で書く / ファイルが無い・size 違い・mtime 違いで捨てる / `Failed` が `ok` を上書きしない・`failed` は上書きする / `Ok` は両方を上書きする /
+     別の接続が書き込みの lock を持っている間は待ち、その commit の後に確認する (改名の付け替えが先に済んだら「無い」で捨てる筋書き)。
+   - `STORES`: 改名・移動・孤児整理・hard purge・内容同一性の復元・本の構造操作で行が運ばれる・消える。
+   - 本へのページ追加: 説明文の付いた末尾のページを mIV の外で消し、別の画像を追加して同じ番号になったとき、追加先に説明文が残らない。
+   - `metadata_transfer`: v12 の往復 / `failed` を書き出さない / 説明文の無い記載で消す / v11 の取り込みで説明文に触れず、v11 の本の構成情報は
+     今までどおり取り込まれる / 不正な値を拒む /
+     取り込み後の `ImportChangedSections.ai_captions`。
+   - 既存の metadata_transfer・rename_key_migration・content_identity・delete_worker・metadata_cleanup のテストが通ること。
+
+**状態を減らす検討** (CLAUDE.md の 2026-09-28 指示)
+
+- 保存の順序は §6.6 のとおり「lock の中で取り直して比べる」だけで、改名・取り込みとの調整 (待ち合わせ・受付の開け閉め) は作らない。
+- 索引の反映待ちは DB の trigger が持ち、書き手ごとの処理を足さない (§7・§8)。V1-2 の書き手 (保存役・取り込み・STORES の汎用操作) は印に触れない。
+- 書き出しの欄を選ぶ UI は今も無いので、説明文だけを外す選択肢も作らない。
+- まれな失敗 (DB が開けない・lock が 5 秒取れない・ディスクフル) は割り切り (エラー + ログ。ジョブは止めて通知、取り込みは既存の失敗の扱い)。
+
+### 19.12 12 回目 (2026-11-02、同じ担当の続き、基準 `94f71c2c7`、V1-2 の設計)
+
+rollback journal と取り込みの一括更新・保存役の lock 内の確認・descriptor と trigger の整合・書き出しの規則・v4 との関係は「問題なし」。
+P2 3 件を §21.5 に足した: 版の境界を欄ごとの定数に分ける (v11 の受け入れと構成情報を壊さない) / 本へのページ追加の専用経路にも説明文の
+初期化をつなぐ / 内容同一性の復元は台帳のある項目だけに効く限界を明記する (説明文のために台帳を作らない)。
+
+### 19.13 13 回目 (2026-11-02、同じ担当の続き、基準 `672119a81`)
+
+12 回目の 3 件は閉じ、新しい指摘は無かった。V1-2 の設計 (§21.5) のレビューはここで閉じる。
+
+### 21.6 V1-2 の結果 (2026-11-02、`14cf7d1ea`)
+
+- 実装: `src/ai_caption_db.rs` (`CaptionDb`・`save`・`get`・`delete`、§7 の schema と trigger、rollback journal)、`STORES` への登録、本へのページ追加での
+  追加先の初期化 (存在の確認は worker 側)、`metadata_transfer` の形式 v12 (`ai_captions` の欄、版の境界は構成情報 11・説明文 12)、取り込み・書き出しの
+  件数表示、公開文書 (製品ページ・メタ情報の移行のマニュアル・プライバシー) と `architecture-overview.md`。
+- 確認: 本体 lib 全件は設計担当の環境で 15,373 件中 1 件失敗 (一覧のスクロール位置のテスト。単独で成功、VLM と無関係)。実装担当の環境では関連 358 件・新規 19 件が成功。
+- 独立コードレビュー (gpt-6.1-sol / xhigh、新しい担当): 指摘なし。V1-2 はここで閉じる。
+- 後の段階へ: `SaveOutcome::Written` のとき、V1-3 が表示の共有キャッシュ (V1-4) と索引の旗 (V2) を知らせる。取り込みの `ImportChangedSections.ai_captions` も同じきっかけ。
+
+### 21.7 V1-3 の設計 (2026-11-03、独立レビュー済み §19.14〜§19.17)
+
+V1-3 は大きいので 3 つに分ける。各段で独立レビュー (設計・コード) を受ける。
+
+| 段階 | 内容 | 主な所有者 |
+| --- | --- | --- |
+| V1-3a | モデルの用意 (開発側、§21.7.1) と配り方の形 | 設計担当 (開発機の作業) |
+| V1-3b | worker の内包・ポータブル版・署名、モデルの追加ダウンロード、GPU の判定、初回の案内、設定画面 | `VlmAddon` (モデルの導入状態)・worker の場所の解決 |
+| V1-3c | 作成ジョブ・右クリック・進捗の小窓・画像の準備・保存 | `CaptionJobOwner` |
+
+本の表紙 (§6.7) は V1-4。V1-3c のジョブは画像ファイルだけを扱い、選択に含まれた本は「対象外」として数える (V1-4 で表紙の処理をつなぐ)。
+
+**既存の作り (2026-11-03、コードで確認)**
+
+- 追加ダウンロードは 2 系統が別々の実装 (`editing_addon_download.rs` は index + 1 つの zip、`ai/tensorrt_installer.rs` は manifest + 複数ファイル)。
+  どちらも取得先が GitHub Releases の決まった場所 (`releases/download/<tag>/<name>`)、`.partial` への Range 再開、`[1, 3, 7, 15]` 秒の再試行、sha256 の照合、
+  `data_dir` の下への導入、`INSTALL_OK` と `active.json` で導入済みを判定。分割したファイルを結合する前例は無い。GitHub Releases は 1 ファイル 2GiB まで
+  (`tensorrt-pack-distribution.md`)。
+- 確認画面と進捗: 編集用追加パック (約 550MB) はモーダル。TensorRT pack (約 2GB) は閲覧を止めない modeless な窓で、`common_modal_dialog_open` に入れない
+  (coding-conventions: 数十分続く取得は modeless)。
+- VST3 bridge の内包: `include_bytes!` で core に埋め込み (portable 以外)、`<data_dir>/vst3/hosts/<内容の SHA256>/` に展開 (全バイト比較で再利用、
+  一時ファイル → rename)。展開は worker スレッド。portable 版は VST3 bridge を入れていない (未署名の C++ exe が誤検知されたため)。
+  埋め込むものは埋め込む前に署名する (`build-release.ps1 -Sign`)。build 時に source identity を検査し、実行時は protocol の版だけを見る。
+- 長いジョブの前例: 動画アップスケールのキュー (`video_upscale.rs`)。App が `Option<RunningTask>` を持ち、worker スレッド・`Arc` の進捗・cancel の `AtomicBool`・
+  完了の `mpsc`。窓は modeless でメイン窓だけに描く。終了時は cancel を立てて join しない。
+- 右クリック: `context_menu_model.rs` の `MenuCommand` と `ContextMenuItemId` (表示・順序の設定の ID)。対象は `selection_target_indices`。
+  画像の読み込みは `canonical_image_loader::decode_canonical_image` (全画面と同じ規則、EXIF 適用済み、RAW は LibRaw の現像)。mIV の非破壊回転
+  (`rotation.db`) はどのデコーダも適用せず、呼び出し側が `capture::rotate_dynamic_image` を使う。縮小は `fast_resize::resize_dynamic_fit` (拡大しない)。
+- `LocalAiActivityLease` はリモートの AI が `AiRuntime` を使う前の待ち合わせで、VLM は `AiRuntime` を使わないので関係しない (U1 で同時に動かす)。
+
+#### 21.7.1 V1-3a: モデルの用意と配り方 (U20)
+
+- 開発機で、Qwen 公式の重み (`Qwen/Qwen3.5-4B`、コミット `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`、Apache 2.0) を llama.cpp b12032 の
+  `convert_hf_to_gguf.py` で GGUF (BF16) と mmproj (F16) に変換し、`llama-quantize` で Q4_K_M にする。
+- 量子化には importance matrix (imatrix) を使う。V0 の unsloth 版も unsloth 自身の調整用の文章で作った imatrix を使っていた (GGUF の
+  `quantize.imatrix.*`)。mIV では、調整用の文章を **mIV 自身の日本語マニュアル** (`htdocs/mimageviewer/manual/*.html` の本文、
+  `scripts/vlm-eval/make_calibration.py`) から作る (第三者の文章のライセンスを持ち込まない)。`llama-imatrix` を 512 トークン × 128 区切りで回した。
+- **結果 (2026-11-03、V0 と同じ 26 枚)**:
+  - imatrix なしの Q4_K_M (2,783,446,976 バイト): 26 枚すべて成功。unsloth 版との説明文の近さ (文字列の一致率の平均) 0.60、画像内の文字が同じ 21/26。
+    書き写した文字が大きく減った画像が 1 枚 (48 → 19 文字)。
+  - **imatrix ありの Q4_K_M** (2,783,447,264 バイト、sha256 `777d8abc7e8f9118…`): 26 枚すべて成功。近さ 0.65、画像内の文字が同じ 20/26、上の 1 枚も 48 文字に戻った。
+  - 利用者の目隠しの評価 (imatrix あり と unsloth 版の 2 列、列の並びは画像ごとに入れ替え): imatrix あり = 良い 2・使える 23・不可 1、unsloth 版 = 使える 25 (未評価 1)。
+    不可の 1 枚は検索語の重複。unsloth 版にも「画像内の文字が正しくない」「検索語が重複」の注記が 1 枚ずつあった。
+  - **配るのは imatrix ありの版**とする (2026-11-03 利用者の評価による。利用者の見立てでは、2 つの差は小さく、26 枚では偶然の範囲。層ごとの精度を unsloth に寄せる追加の試行はしない)。mmproj は F16 のまま (672,423,488 バイト、sha256 `62a5ea783bf22883…`)。
+  - **unsloth 版との違い** (2026-11-03、2 つの GGUF の中身を比べた): 元の重みは同じ Qwen 公式。違いは量子化のしかただけで、どちらも追加の学習はしていない。
+    (1) imatrix の調整用の文章 (unsloth は自前の文章で 80 区切り、mIV はマニュアルで 128 区切り)。
+    (2) 層ごとの精度の割り当て: mIV 版は llama.cpp の標準の Q4_K_M の割り当て (Q4_K 222・Q6_K 35)。unsloth 版は独自の割り当てで、
+    線形注意 (SSM) の小さな重みの一部を Q8_0・Q5_K、注意の qkv の一部を Q5_K に上げている (Q4_K 131・Q5_K 48・Q8_0 48・Q6_K 22)。
+    (3) mIV 版には、複数トークンを先読みするための層 (`nextn`、MTP) が 1 層残っている (unsloth 版は除いている)。通常の生成では使わない層で、大きさの差 (約 42MB) の主な理由。
+    (4) 会話の書式 (chat template) が少し違うが、worker は書式を使わず自前で入力を組み立てる (`prompt.h`) ので、出力に影響しない。
+  - 検索語の重複は 2 つのモデルの両方に出る (26 枚の合計で、全く同じ語の重複が unsloth 版 13 語・imatrix あり 16 語)。§21.7.3 で機械的に除く。
+  - 作業の記録 (重み・道具・生成物のハッシュ、手順) は `G:\home\vlm-eval\models\miv-qwen3.5-4b\` (リポジトリの外)。公開前に手順書を `docs/` に置く。
+- 配り方: GitHub Releases に専用のタグ (`vlm-model-v1`、prerelease、latest にしない) を作り、置くのは:
+  - `vlm-model-index.json` (小さな一覧。schema・model_id・ファイルごとの名前・大きさ・sha256・分割の各部分の名前・大きさ・sha256・ライセンス)
+  - 本体 GGUF を 2GiB 未満の部分に分けたもの (`<name>.part01`、`.part02` …)、mmproj (分けない)、`LICENSE` (Apache 2.0 の本文) と `NOTICE`
+    (元の重み・変換に使った llama.cpp の版・量子化の方法を書く)
+- `model_id` は量子化したファイルの sha256 から決める (例: `qwen3.5-4b-miv-q4km-<sha256 の先頭 12 文字>`)。説明文の行の `model_id` もこれを使う。
+- 作り方の手順と、使った道具の版・ハッシュは `docs/` の手順書に残し、同じ手順で作り直せるようにする。公開は利用者の承認のうえで設計担当が行う。
+
+#### 21.7.2 V1-3b: worker の内包・モデルの導入・GPU の判定・案内
+
+- **worker の内包** (U19・U21):
+  - build: `crates/vlm-worker` を CMake で build し、成果物は今と同じ `vendor/vlm-worker/mimageviewer-vlm.exe`。`build.rs` の vendor 検査に足す
+    (無ければ build を止め、復旧手順を出す。VST3 と同じ形)。release の build では source identity の検査 (`tools/source-identity.ps1`) を通す。
+  - インストール版・単体exe版: core に `include_bytes!` で埋め込み、`<data_dir>/vlm/workers/<内容の SHA256>/mimageviewer-vlm.exe` に展開する。
+    再利用の確認・一時ファイル → rename・reparse point の拒否は VST3 と同じ処理を使う (同じ関数にできるなら共通にする)。展開は worker スレッドで行う。
+  - ポータブル版: exe の隣に置き、`native_assets::bundled` で解決する。`build-portable.ps1` が置く。
+  - 署名: `build-release.ps1 -Sign` で、埋め込む前に署名する (VST3 と同じ順序)。**ポータブル版は別の入口** (`build-portable.ps1`) で、自分で build・
+    コピーし、包む先の PE の一覧 (`$portablePe`) を署名する (独立レビュー 14 回目 P2-4)。この一覧にも worker を足す。順序は
+    source identity の検査 → 署名 → 署名の検証 → zip 化。
+  - `worker_executable()` は「環境変数 `MIV_VLM_WORKER` (debug build だけ) → ポータブル版なら exe の隣 → 埋め込みの展開」にする。
+  - 実行時の確認は `hello` の protocol の版 (V1-1) と、`hello` に足す `prompt_version` (プロンプトは worker が持つため。protocol の版を 2 に上げる)。
+    source identity は build 時の検査に任せ、実行時には比べない (VST3 と同じ)。
+  - 古い版の展開先は消さない (VST3 と同じ。1 つ約 46MB)。
+  - **同梱する exe の source identity を、起動せずに確かめる関門を作る** (独立レビュー 14 回目 P2-3)。`tools/source-identity.ps1` はソースの hash を
+    計算するだけで、vendor の exe とは比べない。VST3 の `scripts/vst3-host-identity.ps1` と同じく、exe の中に焼き込まれた `MIV_VLM_SOURCE_SHA256` の印が
+    1 つだけあり、今のソースの hash と一致することを検査するスクリプトを足す。つなぐ場所は `build.rs` の release の関門、`build-release.ps1` (内包の前)、
+    `build-portable.ps1` (置く前)。`-SkipBuild` で build を飛ばす経路でも検査は飛ばさない。ソースを直して exe を作り直し忘れると、ここで止まる。
+- **モデルの導入** (`VlmAddon`):
+  - 置き場所は §5 のとおり `<data_dir>/addons/vlm/`。`packs/<model_id>/` にファイル、`INSTALL_OK`、`active.json` (編集用追加パックと同じ形)。
+  - 取得: index → 部分ごとに `.partial` へ Range 再開・再試行・部分の sha256 → 部分を順に連結して本体を作り、全体の sha256 を照合 → 部分を消す →
+    staging から `packs/<model_id>/` へ rename → `INSTALL_OK` → `active.json`。HTTP の取得 (Range・再試行・sha256) は新しい共通の小さな部品にし、
+    VLM の導入だけが使う (既存の 2 系統は今回は移さない)。編集用追加パックの検証の境目をそのまま引き継ぐ (独立レビュー 14 回目 P3-5):
+    取得先は固定 (release の build では環境変数による上書きを無視する)、`model_id` と各ファイル・部分の名前は安全な名前か検査する
+    (`validate_safe_filename` と同じ規則)、書き込みは一覧に書かれた大きさで打ち切る。
+  - 取得中に要る空きは、部分と連結後で約 2 倍 (約 7GB)。足りないときの失敗はまれな失敗として扱う (エラーを出し、`.partial` は残す)。
+  - 導入状態は `Valid` / `Missing` / `Corrupt` (編集用追加パックと同じ判定)。読み込むのは一覧にあるファイルだけ (§13)。
+  - **取得・中止・削除は 1 つの持ち主の「実行中の処理」として持つ** (独立レビュー 14 回目 P2-1)。編集用追加パックは、削除で `active.json` を消した後に
+    裏のスレッドでフォルダを消し、取得のキャンセルでは worker を切り離して後片付けを任せる。同じ形だと「削除 → すぐ再取得」「キャンセル → すぐ再取得」で、
+    古い処理が新しい取得物を消す順序が生じる。`VlmAddon` は実行中の処理を `None` / `Installing` / `Cancelling` / `Removing` の 1 つで持ち、
+    その処理の worker から「終わった」を受け取るまで次の取得・削除を受け付けない (ボタンを押せなくし、「前の処理を片付けています」と出す)。
+    UI スレッドで終わりを待つことはしない (毎フレームの poll で受け取る)。
+  - 削除: 設定画面から。作成ジョブの実行中は押せない (§6.6)。`active.json` を消してから、裏のスレッドでフォルダを消す (既存と同じ)。説明文は消さない。
+- **GPU の判定** (U1・U7): V1-1 の `detect_gpu()` (起動ごとに 1 回、worker スレッド)。使えるのは `vulkan_available` かつ `vram_total_bytes >= 7.5GiB`。
+  8GB の製品は 8GiB をわずかに下回って報告されることがあるため (§11.2)。
+- **初めて使うとき** (§6.1・U11):
+  - 「AI 説明文を作る」を選んだとき、モデルが `Valid` でなければ、GPU の判定 (まだなら worker スレッドで) の後に確認の窓を出す。
+    - 使えない機種: 「この PC の GPU では使えません (Vulkan 対応で VRAM 8GB 以上が必要)」とだけ出す。
+    - 使える機種: §6.1 の文言 (何をするか・画像は PC の外へ出ない・正確とは限らない・取得するものと大きさ・ライセンス・8GB 級で AI 補正が「高品質」のときの注意) と
+      [ダウンロード] [今はしない]。
+  - **取得中の窓は modeless** にする (§6.1 の「モーダル」を改める)。3.4GB は数分〜数十分かかり、TensorRT pack と同じく閲覧を止めない
+    (coding-conventions の規則)。取得が終わったら、選んだ時点の対象でジョブを始める。対象はパスで覚えているので、取得中に一覧を動かしても変わらない。
+    取得中に消えた項目はジョブ側の「ファイルが無い」(§6.5) で扱う。
+  - 取得中にもう一度「AI 説明文を作る」を選んだら、取得の窓を前に出し、「取得が終わってから選び直してください」と知らせる (待ちの対象を足さない。状態を増やさない)。
+  - 取得のキャンセル・失敗では、覚えていた対象を捨てる (ジョブは始めない)。`.partial` は残し、次回に続きから取る。
+- **設定画面**: 環境設定に「AI 説明文」のページを足す。モデルの状態・大きさ・GPU の判定の結果、[ダウンロード] / [削除] / [フォルダを開く]。
+  確認と削除の流れは編集用追加パックのページと同じ。
+
+#### 21.7.3 V1-3c: 作成ジョブ
+
+- **持ち主**: App に `caption_job: Option<CaptionJob>` を 1 つ (§6.6)。同時に 1 本。
+- **待ち行列とジョブの終わりは App が 1 か所で決める** (独立レビュー 14 回目 P2-2)。worker が「待ち行列が空」を見て自分で終わると、App が同じ時に
+  対象を足した場合に、受け付けた対象が消える。そこで:
+  - 待ち行列 (パスの一覧) は App が持つ。worker スレッドには 1 件ずつ渡す (channel で `Item(path)` か `Finish`)。worker は 1 件を終えるたびに
+    結果を返して次を待つ (VLM worker は読み込んだまま待つ。返すときに `request_repaint` する)。
+  - App は結果を受け取ったフレームで、待ち行列が空でなければ次の 1 件を、空なら `Finish` を送る。対象の追加も同じ App の上で行うので、
+    「追加」と「終わりの判断」が同じ持ち主の上で順に起きる。
+  - 実行中に足された対象は待ち行列の後ろへ (同じパスが待ち行列にあれば足さない、§6.6)。
+  - **受付を閉じる時点と `Finish` を送る時点を分ける** (独立レビュー 15 回目・16 回目 P2)。ジョブの状態は `Running` と `Stopping` の 2 つ。
+    - `Stopping` に入る (= 受付を閉じる) のは、(a) 待ち行列が空で最後の結果を受け取ったとき (正常の終わり) と、(b) **中止を押したとき** (押した時点で。
+      推論中の 1 件の結果を待たない。動画アップスケールのキューも中止を押した時点で中止中にする)。
+    - `Finish` を送るのは、`Stopping` で、推論中の 1 件が無いとき (a ではその場で、b では今の 1 件の結果を受け取ったとき。その結果は保存しない、§6.5)。
+    - `Stopping` の間の「AI 説明文を作る」は対象を足さず、「前のジョブを終えています。終わってから選び直してください」と知らせる (取得中の扱いと同じ。
+      次のジョブのための待ち行列は持たない)。worker スレッドの完了の知らせで `caption_job` を `None` にし、その後の要求は新しいジョブになる。
+  - 回帰テスト: 1 件の結果が返る前後の追加・最後の結果を受け取って `Finish` を送った後、完了の知らせの前の要求・中止を押してから今の 1 件の結果が返るまでの要求。
+  - ほかに持つもの: `Arc` の進捗、cancel の `AtomicBool`、worker の kill handle (mIV の終了で使う)、結果の `mpsc`。
+- **対象の集め方** (§6.1):
+  - 右クリックの対象は、一覧の既存の選択の規則をそのまま使う (`selection_target_indices(ActionSurface::MainWindow)`。チェックが今の選択を含むときは
+    チェックの全件、含まないときは選択の 1 件。独自の規則を足さない。独立レビュー 14 回目 P3-6)。何も選んでいない・空白部分の右クリックなら、
+    今のフォルダの直下 (画像と本。サブフォルダは含めない)。
+  - 実際のパスを持つ画像 (`GridItem::Image`) だけを対象にする。ZIP 内の画像・PDF のページ・動画・音声は対象外 (§1)。本は V1-4 まで「対象外」として数える。
+  - 一覧の項目は UI スレッドでパスに直して渡す (ファイルは読まない)。以後はパスだけを使う。
+- **メニュー**: `MenuCommand::CreateAiCaptions`「AI 説明文を作る」を足し、`ContextMenuItemId` (表示・順序の設定) にも登録する。既定のショートカットは割り当てず、
+  `KeyAction` は足さない (メニューだけの操作。keymap-spec の「メニュー専用」の扱い)。
+- **1 件の流れ** (§6.2): worker スレッドで
+  1. ファイルの `metadata` から署名を取る。無ければ「無い」で次へ (保存しない)。
+  2. 保存済みの行が `ok`・署名一致・同じ `model_id`・同じ `prompt_version` なら飛ばす。
+  3. `decode_canonical_image` (先頭のフレームだけ、RAW は現像) で読み、mIV の非破壊回転を当て (`rotation.db` を worker で読む)、長辺 1024px に縮小 (拡大しない、Lanczos3)、RGB8 にする。
+     見えている向きと AI が読む向きを合わせるため、回転も当てる。回転を変えても説明文は「古い」にしない (署名はファイルのもの)。
+  4. `VlmWorkerClient::caption` → `ImageFailure` なら `Failed` を保存、`Ok` なら保存 (`CaptionDb::save`、V1-2)。`Discarded` は数えるだけ。
+     保存の前に、**検索語の全く同じ語の重複を除く** (前後の空白を除いて同じ文字列なら、最初の 1 つを残し、順番は変えない。2026-11-03 利用者の指摘)。
+     モデルの出力を受け取るのはこのジョブだけなので、除くのはここ 1 か所。片方がもう片方を含む語 (「海」と「海辺」) は別の語として残す
+     (どちらを残すかの判断は内容への関与になる、§1)。全角・半角の違いをそろえる正規化はしない (26 枚では差が無かった)。
+  5. `fatal`・worker の切断・時間切れ・DB の失敗はジョブを止めて通知する (まれな失敗は割り切り)。
+- **worker の寿命**: ジョブの開始で起動 (§4)、`start_at` → kill handle を App に渡す → `hello` → `load` → 1 件ずつ。待ち行列が空になったら `shutdown`。
+- **中止**: 窓の [中止] で cancel を立て、今の 1 件の推論が終わったら止める (結果は保存しない、§6.5)。mIV の終了では kill handle で即座に止め、join しない。
+- **進捗の小窓**: modeless、メイン窓だけに描く (動画アップスケールのキューと同じ)。件数 (済み / 全体)・今の項目の名前・飛ばした数 (作成済み・対象外・ファイルが無い)・
+  失敗の数・[中止]。終わったら結果を 1 行で知らせる (`show_feedback_result`)。detached viewer を閉じてもジョブは続く (App の持ち主なので)。
+- **Remote**: リモート操作中でもジョブは止めない (動画アップスケールのキューはリモート操作中に新しいタスクを始めないが、VLM は `AiRuntime` を使わず、
+  ジョブは利用者がローカルで始めたもの)。
+- **保存の後の知らせ**: `Written` のとき、V1-4 の表示の共有キャッシュと V2 の索引の旗へ知らせる場所を 1 つの関数にしておく (V1-3c では中身は空)。
+- **perf**: 読み込み・推論・保存に `perf::event` を入れる (§14)。
+
+**状態を減らす検討**
+
+- 取得中の 2 度目の要求は対象を足さず、選び直してもらう (取得と待ち行列の組み合わせを作らない)。
+- worker は常駐させず、ジョブと寿命をそろえる (R2)。再起動・再試行はしない。
+- ジョブ中のモデルの削除は押せなくする (削除とジョブの組み合わせを作らない)。
+- 本 (V1-4) は V1-3c では対象外として数えるだけにし、表紙の解決を V1-3c に入れない。
+- まれな失敗 (ディスクフル・展開の失敗・DB の失敗) は割り切り (ログ + 通知)。
+
+### 19.14 14 回目 (2026-11-03、同じ担当の続き、基準 `c60725667`、V1-3 の設計)
+
+7.5GiB の固定の境目・`hello` への `prompt_version` の追加・画像の準備を worker スレッドで行うこと・検索語の重複除去の規則・App の持ち主・
+メイン窓だけの進捗・リモート操作中も止めないことは「問題なし」。§21.7 に足した: 追加ダウンロードの取得・中止・削除を 1 つの実行中の処理として持ち、
+前の処理の終わりまで次を受け付けない (P2) / 待ち行列とジョブの終わりを App が 1 か所で決め、中止の後は受け付けない (P2) / 同梱する exe の
+source identity を起動せずに確かめる関門 (P2) / ポータブル版の署名の一覧に worker を足す (P2) / HTTP の検証の境目を編集用追加パックから引き継ぐ (P3) /
+選択の規則の説明を既存の規則にそろえる (P3)。§21.7.1 の評価値と GGUF の比較はコードでは確かめられないので、設計担当の記録のまま。
+
+### 19.15 15 回目 (2026-11-03、同じ担当の続き、基準 `9a81bdae2`)
+
+14 回目の 6 件のうち 5 件は閉じた。残る 1 件 (P2): 正常の終わりで `Finish` を送った後にも受付を閉じる必要がある。§21.7.3 を、`Finish` を送るのは
+`Stopping` に入るときだけ (正常の終わりと中止の両方) とし、`Stopping` の間の要求は断る形に改めた。
+
+### 19.16 16 回目 (2026-11-03、同じ担当の続き、基準 `06e1080c5`)
+
+15 回目の 1 件は閉じた。対応で生じた P2: `Stopping` に入る時点を「中止の後、今の 1 件の結果を受け取ったとき」にしたため、中止を押してから結果が返るまでの
+間に受付が残った。§21.7.3 を、中止を押した時点で `Stopping` に入り (受付を閉じ)、`Finish` は推論中の 1 件が無くなってから送る形に改めた。
+
+### 19.17 17 回目 (2026-11-03、同じ担当の続き、基準 `49560b893`)
+
+16 回目の 1 件は閉じ、新しい指摘は無かった。V1-3 の設計 (§21.7) のレビューはここで閉じる。
+
+### 21.8 V1-3b の実装記録 (2026-11-03、実機未確認)
+
+- 対象は §21.7.2。作成ジョブ・右クリック・ジョブ進捗・本の表紙は未接続。公開用モデル・index の生成やアップロード、`htdocs/` の更新はしていない。
+- worker の解決は debug の `MIV_VLM_WORKER` → portable の exe 隣 / 通常版の内容別展開。
+  展開は VST3 の `plain_directory` / `ensure_bytes` を共用し、背景 thread からのみ呼ぶ。
+  protocol は 2、`hello.prompt_version` は DB の INTEGER と整合する整数 1。selftest の比較ラベル `v0-3l` とは用途を分ける。
+- `scripts/vlm-worker-identity.ps1` が現在のソースと PE 内の一意な marker を非起動で照合する。
+  release core build と release/portable script に接続し、portable の `-SkipBuild` も gate を通る。
+  署名は内包前／portable の配置後・zip 前。モデルの重みは内包しない。
+- `VlmAddon` は `WorkerState::{Idle,Scanning,Installing,Cancelling,Removing}` を内部の唯一の実行所有者とする。
+  公開操作状態は `None/Installing/Cancelling/Removing`、scan は別の read-only 射影。完了を poll で受け取るまで次操作を拒否する。
+  初回 scan と GPU 判定は必要時に背景で一度だけ行い、UI は cached view を読む。
+- 新しい HTTP 部品は VLM 専用とし、既存の編集／TensorRT 取得実装を移していない。
+  固定 `vlm-model-v1` URL を使い、`MIV_VLM_MODEL_BASE_URL` は debug だけで有効。
+  分割 `.partial` の検証後に連結し、全体 hash が一致してから部分を削除する。
+  同じ model_id の検証済み staging 出力も再開時に再利用する (mmproj 取得中の中止で本体を再取得しない)。
+- まれな I/O 失敗はログと通知で割り切り、回復状態やロールバックは追加しない。
+  普通に起こる取消と再要求だけは同じ owner の完了境界で排他にする。
+- 初回確認・削除確認は modal、取得と終端の窓は modeless。設定ページからの管理と debug の開発入口だけを接続。
+  `App::request_vlm_caption_setup(ctx, paths)` がパスを保持し、成功時だけ `on_vlm_caption_targets_ready(paths)` へ一回渡す。
+  後者の本体と `vlm_caption_job_running()` の判定を V1-3c が接続する。設定からの導入は空パスでジョブを始めない。
+  取消／失敗／窓を閉じたときは対象を破棄し、再要求を待ち行列に足さない。
+
+**配布 index schema 1** (`ModelIndex` / `ModelFile` / `ModelPart`)
+
+トップレベルは `schema: 1`、`model_id`、`files`。`files` は次の4件を持つ。
+各件に `name`、`kind`、`bytes` (正の整数)、`sha256` (64桁hex)、`license: "Apache-2.0"`、`parts` (省略時空配列) を持つ。
+
+| kind | name | parts |
+| --- | --- | --- |
+| `model` | 本体の `.gguf` 名 | 順序付きの `{name,bytes,sha256}`。各部分は2GiB未満、合計は全体のbytesと一致 |
+| `mmproj` | mmproj の `.gguf` 名 | 空 (単一asset) |
+| `license` | `LICENSE` | 空 |
+| `notice` | `NOTICE` | 空 |
+
+`model_id` は `qwen3.5-4b-miv-q4km-` + 本体SHA-256の先頭12桁 (小文字)。名前は全て安全な単一filenameとし、
+DOS予約名・末尾dot/space・区切り・相対移動・case-insensitive衝突・管理用の予約名を拒否する。
+一覧に書いたものだけ取得／検証し、導入先に `vlm-model-index.json` を保存する。
+`active.json` は `{ "schema": 1, "model_id": "..." }`、各packの `INSTALL_OK` は配置後に作る。
+実配布の hash・サイズ・index ファイルは設計担当が後で確定する。
+
+**検証** (製品の起動・外部通信・実モデルの読込は行っていない)
+
+- worker は CMake で再 build。CTest 6/6、identity の実exe照合と合成PEの一致／不一致／欠落／重複／SkipBuild検査が成功。
+  exe は48,105,472 bytes、SHA-256 `15921e46f0e5a1f8b06a059852b437fa44730962a01303df098454ba23078798`、
+  source identity `79c6482ae05f4aee923ff0b207af1386462658546a431f6e2bc1685331641fd9`。
+- worker focused 33/33 (run `aa942ace-27c0-42df-a79d-152811241cb6`)、モデル取得 backend 21/21、
+  UI focused 6/6。解決順の8条件、prompt版拒否、GPU境界、展開とreparse、HTTPと導入排他、
+  パスの一回引渡しと破棄、7状態×2サイズの操作可視性を含む。
+- 追加snapshot 2枚を生成・目視確認。既存の設定検索結果snapshotは追加1行だけの差分を確認して更新。
+- 通常／portable の `cargo check` と UI glyph lint は成功。
+  Windows専用workerを非Windows portable CIから参照しないよう、UIのmoduleもWindows境界で選択する (非Windows実行は未検証)。
+- 本体lib全件は `scripts/test-lib-full.ps1` を一度実行し、15,406実行中15,401成功／5失敗／66 skipped、801.946秒。
+  ログ: `target/test-lib-full/runs/20261102T173712283Z-c57a5cdb/`。
+  失敗は agent IPC の名前付きpipeでアクセス拒否2件、既存のstartup restoreのlisting準備待ち2件、設定検索snapshot1件。
+  snapshotは上記の意図した検索結果追加。全件成功とは扱わない。
+- 最新ソースで全VLM 60件＋上の失敗5件を `nextest --test-threads 1` で再検査。
+  run `32158127-abac-450e-a90a-980631e106aa`、63成功／2失敗、15.760秒。
+  VLM 60件、更新snapshot、startup restoreの2件は成功し、名前付きpipeの2件だけが同じOS error 5で再失敗。
+  通常の製品動作失敗や全件成功とは断定せず、この実行環境での検証制限として残す。全件は再実行していない。
+- 既存のrelease safety scriptはGit Bashの `CreateFileMapping` アクセス拒否で停止。
+  portable fingerprintはPowerShell5.1のprobeが成功、`pwsh.exe` が見つからないためcross-shell比較は未実施。
+- 検証用の通常構成 release build が成功 (core/remote/EPUB/MCP/launcher)。
+  `scripts/build-release.ps1 -PreserveRuntime -SkipVst3Bridge --offline` を使い、VST3 は現source identity一致の既存exeを再利用。
+  初回は既存turbojpeg-sysの24並列CMake buildが失敗したため、同じ生成先で `cmake --build ... --target install --config Release --parallel 1` を実行して成功。
+  Cargo全体を1並列にした試行はRustの最終最適化も直列になったため、成功済みlibraryを残してbinのrustcを意図的に中断し、
+  最後は `CARGO_BUILD_JOBS=8` / `CMAKE_BUILD_PARALLEL_LEVEL=1` / `CARGO_NET_OFFLINE=true` / `MSBUILDDISABLENODEREUSE=1` /
+  `VULKAN_SDK=C:\VulkanSDK\1.4.363.0` で同じwrapperを再実行した。中断は製品コンパイルエラーとして数えない。
+  core は393,739,776 bytes、launcher は561,397,248 bytes。最後のVC runtime PE検査はruntime4本・runtime側PE5本／embedded側PE13本で成功。
+  APPDATAの展開済みVST3 cacheは保持し、成果物は起動していない。
+- 署名・実配布モデル・実機確認は未実施。公開物・GitHub Release・`htdocs/` は作成／変更せず、コミットは設計担当が行う。
+
+**独立レビュー1回目の指摘への対応** (基準 `0ee27ebeb`)
+
+- P2-1: Windows の全 build で worker を必須にする条件は維持し、復旧経路を補完した。
+  `bootstrap-vendor.sh` は欠落時に外部 backup の実ファイルを一時候補へコピーし、現ソースの identity と照合した後だけ公開する。
+  不一致の候補は配置せず、backup も無ければ固定版 source からの build を案内する。既存 vendor worker は上書きしない。
+  `build-vlm-worker.ps1` は identity 一致なら CMake の探索より前に再利用し、release / portable wrapper もこの判定を共用する。
+  missing / stale の場合だけ CMake を呼び、portable の `-SkipBuild` は引き続き検査のみで不一致を拒否する。
+- 固定 b12032 / commit `dde879bc4f954b809892fd0d660515f42536394a` の GitHub ZIP 取得入口を
+  `setup-llama-cpp.ps1` に追加した。SHA-256 は設計担当の確認待ちの明示的な空 placeholder とし、未設定なら通信・変更前に止める。
+  過去に提供された別 archive の hash は流用しない。固定 hash 照合・安全な staging 展開後に欠落先へ rename し、既存 source tree は置換しない。
+  C++ 変更後は再 build / CTest / identity 確認を通し、backup も実ファイルでコピーし直す手順を native dependencies と worker README に記した。
+- P2-2: GPU 判定の背景 thread で、worker の展開・起動前に System32 の絶対パスの `vulkan-1.dll` を
+  `LoadLibraryExW(LOAD_LIBRARY_SEARCH_SYSTEM32)` で確認し、成功時は `FreeLibrary` する。
+  絶対パスは、既に読み込まれた同名の app-local DLL を使い回さないために必要。
+  loader 不在は `GpuDetection::VulkanLoaderUnavailable` とし、初回案内と設定ページに
+  「Vulkan に対応したグラフィックスドライバが見つかりません」と表示する。再起動・取得は案内しない。
+  loader があり worker の起動に失敗した場合は、従来の `GpuError` を保つ。C++ / CMake / vendor exe は変更していない。
+- 取得処理の実装は変更せず、Content-Length の無い応答の大きさ上限・短い応答・hash 不一致、
+  別 model_id の staging の非再利用、完成済み／再開途中の壊れた部分の破棄と再取得を回帰テストで補った。
+  loader 検査の注入による worker 非起動／起動失敗の区別と、理由だけの案内を1093×614および半分の大きさで操作できることも検査する。
+- この対応の検証: `cargo nextest run --offline -p mimageviewer --lib -E 'test(/ai::vlm_worker::/) | test(/vlm_addon/)' --retries 0 --no-fail-fast`
+  は69/69成功 (run `6aebac70-bde2-4479-bac9-16cc03619b9d`、2.090秒)。
+  `scripts/test-vlm-worker-identity.ps1` は合成PE・fake CMake・ZIP・通信mockだけで成功。
+  CMake が PATH に無い場合の一致exe再利用、不一致／不在時だけのbuild、backup検証後の公開、不一致の非公開、
+  未設定checksumの変更前停止、archiveのhash／危険な名前の拒否を含む。
+  実vendor exeのsource identityとSHA-256は上記から不変。glyph検査・変更したPowerShellのASCII検査・`cargo fmt --check`も成功。
+  本体lib全件は依頼どおり実行せず、C++を変更していないためCTestも再実行していない。外部通信・製品起動・実モデル読込は行っていない。
+- 確認用の通常構成 release build も `scripts/build-release.ps1 -PreserveRuntime -SkipVst3Bridge --offline` で成功。
+  `CARGO_BUILD_JOBS=8` / `CMAKE_BUILD_PARALLEL_LEVEL=1` とし、実vendor workerのidentity一致で
+  `Reusing the current-source worker; CMake and SDK are not needed.` の経路を通った。
+  core / remote / EPUB / MCP / launcher と最後のPE依存検査が成功し、通常profileやAPPDATA cacheは変更せず、成果物は起動していない。
+
+**検収 (設計担当、2026-11-03)**
+
+- 本体 lib 全件 (`0ee27ebeb`、設計担当の環境): 15,406 件中 15,405 件成功。失敗 1 件は
+  `app::tests::scroll_661::row_anchor_observation_keeps_middle_selected_row_in_both_renderers` で、単独の再実行では成功 (VLM の変更範囲外)。
+  実装担当の環境で落ちた名前付きパイプの 2 件は、この環境では成功した (実装担当のサンドボックスの制限)。
+- 独立コードレビュー 1 回目 (基準 `0ee27ebeb`): P2 2 件。worker を全 Windows ビルドで必須にしたのに新しい clone での復旧経路が無い、
+  Vulkan loader が無い PC で非対応ではなく再起動を案内する。対応は `fc21fd392` (上の 2 項目)。
+  worker の exe は `C:\home\mimageviewer_vendor_backup\vlm-worker\` へ実ファイルでバックアップした (SHA-256 `15921e46…8798`)。
+- 独立コードレビュー 2 回目 (基準 `fc21fd392`): 2 件とも閉じ、新しい指摘は無し。
+- `fc21fd392` で設計担当が VLM 関連 69/69 と `scripts/test-vlm-worker-identity.ps1`、実リポジトリでの identity の関門を再実行し、いずれも成功。
+- 残り: `scripts/setup-llama-cpp.ps1` の archive の SHA-256 は未設定 (未設定の間は取得しない)。バックアップが無い環境で
+  ソースから作り直す経路は、この値を確定するまで開通しない。実機確認・署名・モデルの公開は未実施。
+
+
+### 21.9 V1-3c の実装記録 (2026-11-03、実機未確認)
+
+- `App::caption_job` と `ui_dialogs/caption_job.rs` に単一の待ち行列と `Running` / `Stopping` の受付を実装。
+  最後の結果または中止で受付を閉じ、現在の1件を受け取ってから `Finish`、worker 完了の採用で `None` に戻す。
+  重複除去は待ち行列のパスだけ。推論中の同パスを再要求した場合は、保存／失敗／破棄の後に再確認する (§6.6)。
+  対象確定と追加の重複除去は一時 HashSet を使い、UI 上でパス比較の二乗走査をしない。
+- 対象は `selection_target_indices(MainWindow)` の既存規則を共有。空白または選択対象なしは採用済み一覧の現在フォルダ直下を
+  パスで選び、再走査・ファイル読み込みは行わない。本・仮想ページ・動画・音声は作成対象にしない。
+  初回導入を通る要求は `CaptionTargets { paths, unsupported }` の一値で保持し、画面を移動しても対象と集計を変えない。
+  既存の `request_vlm_caption_setup(ctx, Vec<PathBuf>)` は設定等の受け口として維持し、型付き要求は共通処理へ渡す。
+- `ai/caption_job_worker.rs` は `Item` / `Finish` を受け、worker の展開／起動、hello、load、署名・作成済み判定、canonical first-frame decode、
+  回転 DB、長辺1024px Lanczos3縮小、RGB8、推論、trim後の完全一致語だけの重複除去、`CaptionDb` 保存を行う。
+  RAW は既存 executor と明るさ設定を渡して現像する。`Written` 後だけ空の通知hookを呼ぶ。読み込み・推論・保存にperfを追加。
+- 保存の取消確認は `CaptionDb::save_unless_cancelled` で writer transaction の獲得後と署名確認後の書き込み直前にも行う。
+  メタ情報取り込み等の writer 待ち中の中止を保存へ流さない。既存 `CaptionDb::save` の契約・schema は変更しない。
+- kill handle は開始時に共有寿命ownerへ公開し、App が Started をpollする前の終了でもkillできる。
+  App 終了・Dropは即時kill、joinなし。現在の推論を終える通常中止と区別し、worker の再起動／再試行はしない。
+- 進捗はメイン窓だけのmodeless小窓。Remote／detached viewer の寿命ではジョブを止めない。
+  設定の削除に加え、同一packを置き換える再導入もジョブ中は開始させない (再導入内部にも削除があるため)。
+  設定の表示・保存先を開く操作・通常の画像追加は維持する。
+- `MenuCommand` / `ContextMenuItemId` とメニュー専用のキー仕様を追加。公開マニュアル・privacy(日英)・製品の安心欄と
+  architecture／async／UI応答性の説明を更新。本の表紙・表示・検索・MCP は実装しない。
+- 担当を分けたコード確認で、UI上の二乗走査、推論中の再要求消失、DB待ち中の中止、同一pack再導入の4点を修正。
+  設計担当による検収の代替とはしない。
+- 最終関連テストは66/66成功 (snapshot比較・小画面の中止クリック・偽worker・DB待ち中止を含む)。
+  `target/vlm-caption-final-focused.log`、nextest run `8b0d3ed0-00bd-47b1-a582-87cac1619767`。
+- 本体lib全件は指定どおり `scripts/test-lib-full.ps1` を1回だけ実行。
+  15,437実行中15,435成功 (9 slow、1 leaky)／2失敗／66 skipped、実行769.095秒。
+  記録は `target/test-lib-full/runs/20261102T194009552Z-2c378829/` のログとJUnit。
+  失敗は既存の `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry` と
+  `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`。両方とも名前付きpipe作成でOS error 5。
+  同じ2件の単独選択でも同じエラーを再現した (`target/vlm-caption-pipe-isolated.log`)。
+  前段§21.8と同じ実行環境の制限として残し、全件成功とは扱わない。全件は再実行していない。
+- 進捗小窓のsnapshotを1枚追加 (22,838 bytes)、右クリック設定の既存2枚を更新して目視確認。
+  `cargo fmt --check`、UI glyph検査、サイトカード検査 (50件、超過0)、`git diff --check` は成功。
+  `scripts/build-dev.ps1 -PreserveRuntime` は通常featureの `dev-runtime` coreと同伴3exeのbuild／配置・VC runtime PE検査に成功。
+  `target/vlm-caption-build-dev.log` に記録し、成果物は起動していない。
+- 実モデル・製品バイナリの起動、外部通信、評価用データの読み込み、C++／vendor変更、コミットは行っていない。
+
+#### 21.9.1 独立レビュー1回目への対応 (基準 `4fbba7d34`)
+
+- P1: 作成要求の受付を、既存の `main_chrome_pointer_blocked()` が共有する
+  `modal_dialog_block_reason_including_menus(false)` の判定に揃えた。右クリックの owner を残したまま受理し、
+  実際のダイアログ・Remote・`Stopping` は引き続き拒否する。メニュー固有の除外リストは追加しない。
+  native は結果採用を desktop menu pump から分け、実際と同じ `MivCommand` 採用経路を非対話で検査する。
+  egui は実メニュー描画への合成クリックで、owner の解除前に初回準備／実行中の追加が受理されることを検査する。
+- P2-1: rollback journal の reader が COMMIT を妨げている間も、SQLite の busy handler で中止を確認する。
+  handler は保存 worker 上の scope にだけ、所有された cancel `Arc` と従来と同じ5秒の期限を持つ。
+  中止した busy COMMIT は rollback 後に取消として戻し、既存の行とrevisionを変えない。
+  通常の `CaptionDb::save`、`BEGIN IMMEDIATE` 後の署名再確認、upsert条件は維持し、再実行・回復の経路は追加しない。
+  reader を保持したまま取消完了を待つ回帰を、新規保存／既存行の置換の両方で追加した。
+  reader 解放時の通常成功と、期限切れがDBエラーのまま戻ること、handler／timeoutの復元も確認する。
+- P2-2: フォルダ全体の対象は、同じ context の `StackView.passthrough` と `groups.members` から直下の実画像を取り出す。
+  UI上の再走査や全グリッドの再生成・再ソートは行わず、動画と直下でないパスを除く。
+  スタックOFF／集約表示／flat表示で画像の対象集合と対象外集計が一致する回帰を追加した。
+  選択した `Stack` セルは、現行 `tag_target_for_item` がメンバーを展開しない規則に合わせ、対象外1件のまま維持する。
+  メンバー単位で選択した実画像は従来どおり対象とする。製本の専用メンバー展開を、タグや今回の選択操作へ持ち込まない。
+- 関連focusedは110/110成功、実行2.644秒。nextest run `4c6f12e7-bca7-4caa-9bb2-78fdf60f80fe`、
+  ログは `target/vlm-caption-review1-focused.log`。選択は `caption_job`／`ai_caption_db::`／`vlm_setup`／
+  `context_menu_model`／`main_chrome_modal_classification`／`filename_stack::`。
+  本体lib全件は設計担当が実行するため、ここでは再実行しない。
+- `scripts/build-dev.ps1 -PreserveRuntime` は通常featureのcoreと同伴3exeのbuild／配置・VC runtime PE検査に成功。
+  ログは `target/vlm-caption-review1-build-dev.log`。最後にワークスペース全体へ `cargo fmt` を実行した。
+  UI glyph検査・差分検査も成功。製品起動・外部通信・コミットは行っていない。
+
+#### 21.9.2 検収 (設計担当、2026-11-03)
+
+- 本体 lib 全件 (設計担当の環境): `4fbba7d34` で 15,437 件すべて成功、`cec28c6da` で 15,445 件すべて成功。
+- 独立コードレビュー 1 回目 (基準 `4fbba7d34`): P1 1 件 (右クリックからの要求がメニュー自身のモーダル判定で拒否される)、P2 2 件 (COMMIT 待ちの中止で保存される・
+  スタック表示で直下の画像が落ちる)。対応は `cec28c6da` (§21.9.1)。
+- 独立コードレビュー 2 回目 (基準 `cec28c6da`): 3 件とも閉じ、新しい指摘は無し。選択したスタックのセルを対象外にする扱いはタグ操作 (`src/tag_ops.rs`) と一致。
+  一括書き出しはメンバーを展開するので、全操作共通の規則ではない。
+- V1-3 (a の公開を除く) はここで閉じる。残り: V1-3a のモデルの分割・index・LICENSE/NOTICE・GitHub Releases への公開 (利用者の承認が要る)、
+  `scripts/setup-llama-cpp.ps1` の archive の SHA-256、実機確認 (実モデルでの生成・初回取得・UI)。
+
+### 21.10 V1-3a: モデルの公開の手順 (2026-11-03、公開は未実施)
+
+- 公開用のファイルは `scripts/vlm-eval/prepare_model_release.py` で作る。入力は量子化済みのモデル・mmproj・Qwen の `LICENSE`・
+  `scripts/vlm-eval/model-NOTICE.txt` (変更点の記載。Apache 2.0 §4(b))。出力先は空のフォルダ (2026-11-03 は `G:\home\vlm-eval\release\vlm-model-v1\`)。
+  モデルは 2 分割 (各 1,391,723,632 bytes)。つなぎ直した SHA-256 が元のモデル (`777d8abc…ae6e`) と一致することを確かめた。
+- 生成した index は `scripts/vlm-eval/vlm-model-index.v1.json` に置き、`published_v1_index_validates` が導入時と同じ検査を通す。
+  `model_id` は `qwen3.5-4b-miv-q4km-777d8abc7e8f`。
+- 公開 (利用者の承認の後に設計担当が行う): GitHub Releases に tag `vlm-model-v1` の **prerelease** を作り、最新版の扱いにしない
+  (製品ページのダウンロードは GitHub の latest を指すため)。添付は index・part1・part2・mmproj・LICENSE・NOTICE の 6 つ。
+
+```powershell
+gh release create vlm-model-v1 --repo MikageSawatari/mimageviewer --target main --prerelease --latest=false `
+  --title "AI caption model v1" --notes-file <notes> `
+  G:\home\vlm-eval\release\vlm-model-v1\*
+```
+
+- 公開後に確かめること: 6 つの asset の名前と大きさ、`vlm-model-index.json` を取得して手元と一致すること、Releases の latest が製品の版のままであること。
+- **公開済み (2026-11-03、利用者の承認の後に設計担当が実施)**: https://github.com/MikageSawatari/mimageviewer/releases/tag/vlm-model-v1 (prerelease)。
+  6 つの asset の名前と大きさが手元と一致。固定の URL から取得した `vlm-model-index.json` の SHA-256 (`7015d1cb…d651`) が手元と一致。
+  part2 への Range 要求が 206 を返す。`releases/latest` は v4.11.0 のまま。
+
+### 21.11 V1-4 の設計 (2026-11-03)
+
+#### 21.11.1 段階の分け方
+
+§21.1 の V1-4 (表示・本の表紙) を 2 つに分ける。表示は画像の説明文だけで成り立ち、V1-3 の結果を画面で確かめられるようになる。
+本の表紙の解決は、既存のサムネイルの経路をまたぐ大きな切り出しで、§6.7 の前提がコードと食い違う点が見つかった (§21.11.3)。
+
+| 段階 | 中身 |
+| --- | --- |
+| V1-4a | 画像の説明文の表示 (共有キャッシュ・読み込み worker・情報パネルの欄・無効化) |
+| V1-4b | 本の表紙の解決 (`resolve_book_cover`)・本の作成ジョブ・情報パネルの「この本」の欄 |
+
+#### 21.11.2 V1-4a: 画像の説明文の表示
+
+コードで確かめた前提 (2026-11-03):
+
+- 情報パネル (`ui_metadata_panel.rs` `draw_metadata_panel` → `draw_metadata_panel_inner`) を呼ぶのは fullscreen の描画 (`ui_fullscreen.rs`
+  `render_fullscreen_viewport_with_root_input`) だけ。detached viewer も同じ関数を、その context を `App` に載せた状態で呼ぶ
+  (`App::update_active_viewer_context`)。パネルは常に `&mut App` で動く。
+- context ごとのメタデータキャッシュは `ViewerContextBundle` (`viewer_context_registry.rs`) が持ち、載せ替えで `App` の field と入れ替わる。
+  `sidecar_display_cache` と `folder_thumb_pin_dirty` は bundle に入っておらず、すでに全 context で共有している。共有キャッシュはこの前例に倣う。
+- 画像の説明文のキーは、`GridItem::Image` の `metadata_cache_key(idx)` と同じ文字列になる (`CaptionDb::normalize_path` は STORES の記述子の
+  KeepDrive 正規化 = `adjustment_db::normalize_path`)。ZIP 内の画像・PDF のページのキー (`::` 付き) は説明文の対象ではない。
+- `CaptionDb::open_at` はスキーマを作る (書く)。読み取り専用で開く関数は無い。rollback journal なので、長く開いた読み取りの transaction は
+  書き手の COMMIT を待たせる (V1-3c の `CommitBusyGuard`)。
+- 一覧の `image_metas` の更新日時は秒で、説明文の署名 (ミリ秒) とは厳密に比べられない。
+
+設計:
+
+1. **持ち主**: `App` に `caption_display: CaptionDisplayCache` を 1 つ (bundle に入れない)。
+   - 中身: キー → `Loading { gen }` / `Loaded { row: Option<CaptionRow>, current: Option<FileSignature>, gen }`。`epoch` (全部消すたびに増やす) と
+     キーごとの `gen` (そのキーを消すたびに増やす) を持つ。
+   - 大きさの上限は 512 件。超えたら全部消す (表示中の項目は次のフレームで読み直す。LRU は持たない)。
+2. **読み込み worker**: 説明文だけの小さな worker を 1 本、初めて要るときに起動し、mIV が終わるまで要求を待つ (channel で `(key, path, epoch, gen)`)。
+   - 1 件ごとに、`ai_caption.db` を **読み取り専用で開く関数** (`CaptionDb::open_read_only`、新設。ファイルが無ければ `None` を返し、作らない) で
+     1 回の SELECT を行い、`std::fs::metadata` で今の署名を取る。読み取りの transaction を持ち越さない (接続は持っていてよいが、文と文の間で
+     transaction を開いたままにしない)。DB が無いときは、作成ジョブが作るまで「行なし」。
+   - 結果は `mpsc` で返し、`request_repaint` する。`App::ui` の先頭 (`poll_caption_job` の隣) で受け取る。届いた結果の `epoch`・`gen` が今と違えば
+     採用しない (保存や取り込みより前に始まった読み込みが後から届く場合)。読み直しは、次にパネルがそのキーを描くときに起きる。
+   - mIV の終了では channel を閉じるだけで join しない。DB の失敗は「行なし」として扱いログに出す (まれな失敗は割り切り)。
+3. **要求のきっかけ**: パネルが `GridItem::Image` を描くとき、キーがキャッシュに無ければ要求を送る (UI スレッドは channel に送るだけで I/O をしない)。
+   同じキーを描き続けている間は、`Loading` 中も送り直さない。ほかの種類 (ZIP 内の画像・PDF のページ・動画・音声・本) では要求しない (本は V1-4b)。
+   - **今の署名は、表示を始めるたびに取り直す** (独立レビュー 18 回目 P2-1)。キャッシュにある `current` は、その読み込みの時点の署名でしかない。
+     画像は外部で上書きされても説明文の DB は変わらないので、DB の無効化だけでは「古い」にならない。そこで、パネルが描くキーが前のフレームと
+     変わったとき (開く・前後の移動・開き直し) は、キャッシュにあっても読み直しを送る。届くまでは今の値を出し (ちらつかせない)、届いたら入れ替える。
+     1 回の表示につき SELECT と stat が 1 回で、毎フレームは送らない。一覧の読み直し (今の context のメタデータキャッシュを消す経路、`app.rs` の
+     一覧の再読み込み) でも共有キャッシュを全部消す。
+   - **読み込み中の再入場 (2026-11-03 設計担当の判断)**: 表示を始めたときは `Loading` 中でもそのキーの `gen` を進めて再送する。
+     先の結果は世代不一致で捨て、新しい stat は再入場後に取る。「Loading 中は送り直さない」は同じキーを描き続ける毎フレームだけの規則。
+     再入場の印や後続 read 待ち状態は足さず、Loading / Loaded の2状態を保つ。Loaded の再読込中は以前の値を残す。
+4. **パネルの欄「AI 説明」**: ★・タグ・パレットの後、ツイート・生成情報・EXIF の前に置く (内容の説明なので、生成情報より上)。
+   - `ok` の行: 説明文・画像内の文字 (空なら出さない)・検索語 (読点でつなぐ) を、既存の `draw_text_section` (Copy ボタン付き) で出す。
+     下に「作成日」を 1 行。モデルの `model_id` はその行の hover に出す (UI に内部名を常に出さない)。
+   - `failed` の行: 「この画像の説明文を作れませんでした」と作成日だけ。
+   - **古い**: 行の署名と今の署名が違えば「画像が変わっています。右クリックの『AI 説明文を作る』で作り直せます」を添える (説明文は消さずに出す、§7)。
+     ファイルが無ければ (今の署名が `None`) 古いとは出さず、説明文をそのまま出す (独立レビュー 18 回目 P3-4)。閲覧中は一覧の更新が先送りされ、
+     消えた項目が残ることがある (`app.rs` の閲覧中の一覧更新の先送り)。説明文は「そのパスに作ったもの」で、ファイルが無いことは一覧の側の状態なので、
+     この欄では扱わない。
+   - 行が無い・読み込み中は欄を出さない (読み込みの間に「無し」がちらつかないように)。「表示するものが無い」の判定 (`draw_no_metadata`) に
+     説明文の有無を足す。
+5. **無効化** (書き手ごとに変わったキーを数えず、ジョブの 1 件以外は全部消す):
+   - 作成ジョブ: App 側の `CaptionJob::item_done` (今の 1 件のパスを `current` に持っている) で、**結果によらず**そのキーを消す。
+     `CaptionItemOutcome` は `Written` と `KeptExistingOk` を区別しないが、読み直しは 1 件の SELECT なので区別を足さない。
+     V1-3c が worker スレッドに残した空の `notify_written` は App に触れられないので使わず、消す (V2 の索引の旗は §8 の設計で別に決める)。
+   - 取り込み: `apply_metadata_import_terminal_refresh` (`ImportChangedSections.ai_captions` が立ったとき)。`poll_image_folder_zip` が作る
+     `ImportChangedSections` も同じ扱い。
+   - STORES の汎用操作: `StoreMutationEffects` に `captions_changed` (記述子のファイルが `ai_caption.db` で、行が変わったとき) を足し、
+     App 側の完了点で全部消す。完了点は 改名 (`poll_rename_migration_pending`)、削除の後始末 (`poll_delete_pending`・`poll_delete_purge_retry`)、
+     復元・コピー (`poll_content_identity_restore`)、孤児整理 (`apply_metadata_cleanup_result`)、本の操作 (`finish_book_append_undo`・
+     `adopt_book_store_summary`)。共通の受け口 `apply_content_identity_store_mutations` は早期 return するので、その前に呼ぶか別の関数にする。
+   - **本への追記**: 追記は `STORES` を通さず、説明文の行を直接消す (`book_append_undo.rs` の DELETE、独立レビュー 18 回目 P2-2)。
+     その追記の summary に「説明文の行を消した」を足し、App の追記の完了点 (`finish_book_append_metadata`) でも全部消す。
+   - 実装の始めに、`ai_caption.db` の行を変える経路を `grep` で数え直し、上のどれにも当たらない経路があれば止めて報告する。
+6. **detached viewer**: 共有キャッシュは bundle の外で、detached の経路と述語に触れない。パネルは同じ関数なので detached でも欄が出るが、
+   それは既存の bundle 外の共有表示 (`sidecar_display_cache`) と同じ形で、新しい分岐を足さない。CLAUDE.md の手続きに従い、
+   「症状パッチではなく、bundle の外の共有キャッシュという既存の形に乗せた新しい表示」であることを独立レビューで確かめ、
+   detached-rework-plan に 1 行残す。
+7. **リモート**: mIV Remote のパネルには出さない (V3 以降)。リモートの所有権・IPC に触れない。
+8. **perf**: 読み込み worker の 1 件 (SELECT と stat) に `perf::event`。
+9. **テスト**: 状態の遷移 (送り直さない・`gen` 違いを捨てる・読み込み中に全部消す・上限で全部消す)、ジョブの 1 件の完了でそのキーだけ消えること、
+   取り込みと各完了点で全部消えること、`open_read_only` が DB を作らないこと、古いの判定 (署名の違い・ファイルが無い)、パネルの欄の snapshot
+   (`ok`・`failed`・古い)、欄が無いときに「表示するものが無い」が今と同じであること。
+
+**状態を減らす検討**
+
+- キャッシュの消し方は「1 件だけ」(ジョブ) と「全部」(それ以外) の 2 つだけにし、書き手ごとに変わったキーを数え上げない (§9 のまま)。
+- 読み込み中の結果の行き先は `epoch` と `gen` の比較 1 つで決め、取り消しの印を持たない。
+- 欄は「行がある」ときだけ出し、読み込み中の表示を持たない。
+
+#### 21.11.3 V1-4b の方向 (詳しい設計は V1-4a の後)
+
+§6.7 の前提と、コードの食い違い (2026-11-03 調査):
+
+1. **PDF のパスワード**: 一覧のサムネイルは保存済みのパスワード (`PdfPasswordStore`) を使わず、最後に開いた PDF のその場のパスワード
+   (`pdf_current_password`) だけを渡す。保護された PDF の多くは一覧ではアイコンになる。
+   → 本のジョブは、開くときの既存の規則 (`pdf_open_password`) をそのまま使う (優先順を複製しない。今開いている同じ PDF では検証済みのその場の値が
+   保存済みより先になる、独立レビュー 18 回目 P3-5)。利用者が選んで作成を頼んだ本なので、
+   一覧でアイコンでも 1 ページ目を読んでよい。表紙の位置 (1 ページ目) は一覧と同じなので、「見えている表紙と読む表紙が違う」には当たらない。
+2. **子の書庫だけのフォルダ**: フォルダの直下に画像が無いとき、一覧は子の ZIP・PDF の**保存済みサムネイル (WebP)** を流用し、元のファイルを
+   読まない。読んだ位置 (エントリ・ページ) が分からず、1024px で読み直せない。
+   → 表紙の解決は、勝った子 (`FolderSelectionProof.winner`) の本について、**子の固定表紙とそのたどりを含めた同じ表紙の解決**をやり直し、
+   その位置を読む (独立レビュー 18 回目 P2-3。親フォルダの選択は子の固定表紙も解決するので、子の「最初の画像・1 ページ目」に決め打ちすると、
+   子の PDF の 3 ページ目を固定した場合に表示と別のページになる)。「最初の画像・1 ページ目」は子に固定表紙が無いときだけ。見た目は同じ画像の高解像度版。
+3. **固定表紙のたどりは今 UI スレッドで行われている** (`make_load_request` → `apply_folder_thumb_pin`、各段で `metadata`)。
+   → 表紙の解決では worker で行う (`app/color_filter.rs` が worker で `apply_folder_thumb_pin` を呼ぶ前例)。一覧の経路はこの段階では動かさない。
+4. **表紙を決める処理は 1 つの関数ではない**: 計画 (`make_load_request_with_visibility` + `apply_folder_thumb_pin`) は UI スレッド、解決
+   (EPUB の世代・フォルダの選択・ZIP の最初の画像) は `thumb_loader::process_load_request` の中に直書き (約 480 行)。
+   → 解決の部分を `process_load_request` から関数に切り出し (`resolve_load_request_target`)、サムネイルと本のジョブの両方が呼ぶ。サムネイルの
+   読み込み・cache の段は動かさない。切り出しの前後でサムネイルの結果が変わらないことを既存のテストと追加のテストで押さえる。
+5. **変換済み書庫の状態**は `Pending` と RAR の包みもあり、表示中の範囲だけ App の map に解決されている。変換済み ZIP は、直接読める RAR より優先される。
+   → 本のジョブは worker で同じ判定 (`resolve_converted_archive_candidate`) を行う。`Unavailable` は §6.7 のとおり「未変換」として飛ばす。
+6. **ZIP・RAR の「最初の画像」は書庫の中の並び順** (並べ替えの設定は使わない)。フォルダの「最初の画像」は `folder_thumb_sort` (一覧の並び順とは別の設定)。
+   → §6.7 の「並び順で最初の画像」は `folder_thumb_sort` と読み替える。
+7. **EPUB**: `resolve_epub_at` は private で、入口は `resolve_read_target`。元ファイルの署名は `display_source_state` (FILETIME の 100ns 単位) で、
+   ミリ秒に直して記録する。
+8. **固定表紙のエントリ・ページが無いとき**、一覧はサムネイルを失敗にする (自動選択に戻らない)。本のジョブもその本を失敗として数え、行は書かない
+   (`ImageFailure` ではなく読み込みの失敗)。
+
+### 19.18 18 回目 (2026-11-03、同じ担当の続き、基準 `198057396`、V1-4a の設計と V1-4b の方向)
+
+P2 3 件・P3 2 件。§21.11 に足した: 今の署名を表示を始めるたびに取り直す (P2。外部の上書きで「古い」にならない) / 本への追記の直接の DELETE を
+無効化の完了点に足す (P2) / 子の書庫を読み直すときも子の固定表紙を含めて解決する (P2) / ファイルが無いときの理由の書き直し (P3) / PDF のパスワードは
+`pdf_open_password` をそのまま使う (P3)。detached viewer については「bundle の外の共有キャッシュを共通のパネルから読む新しい表示で、症状パッチではない」に
+合意 (detached-rework-plan に記録する)。`epoch`/`gen`・上限で全部消す・短い読み取り専用の SELECT・`ItemDone` での無効化・欄の位置・
+`process_load_request` からの解決の切り出しは「問題なし」。
+
+### 19.19 19 回目 (2026-11-03、同じ担当の続き、基準 `9749f16da`)
+
+18 回目の 5 件はすべて閉じ、新しい指摘は無かった。V1-4a の設計 (§21.11.2) と V1-4b の方向 (§21.11.3) のレビューはここで閉じる。
+
+### 21.12 V1-4a の実装記録 (2026-11-03、実機未確認)
+
+- 着手時に `ai_caption.db` / `CaptionDb` / `captions` と共通 `STORES` の更新・呼出元を再点検した。
+  書き手は作成ジョブの保存、メタ情報取り込み、STORES の改名・コピー・本の構造操作・削除・復元・孤児整理、
+  本への追記の直接 DELETE で、§21.11.2 の無効化点に収まっていた。画像フォルダ ZIP 化のストア列挙は
+  `captions` をコピーしないが、その終端 refresh が作る `ImportChangedSections.ai_captions` も明示した。
+- `App::caption_display` は bundle 外に置き、`caption_display_cache.rs` の遅延単一 worker が
+  read-only open / 1 SELECT / 1 stat を担当する。DB が無ければ作らず、schema を変更しない。
+  結果は root repaint と mpsc で返し、`poll_caption_job` の隣で epoch / gen を照合する。
+  上限512件で全消去、終了時は channel の drop のみで join しない。
+- 各キーの gen は要求ごとにキャッシュ内の単調番号から割り当てる。失効時は entry を消し、再要求では
+  別 gen を使うため、削除済みキーの墓標を保持せず遅着結果を捨てられる。全消去は epoch を進める。
+  Loading / Loaded の2状態を一つの enum にし、再読み込み中は以前の Loaded 値を表示する。
+- 表示再入場は共通パネルの egui viewport ごとの一時 frame / key 履歴で識別する。
+  非表示・別項目・描画の途切れの後は再 SELECT / stat、同一 frame の再 pass と連続表示は再送しない。
+  情報以外のタブ・タグ選択中は説明文を描かないため要求しない。detached の述語・viewport 経路・bundle は変更しない。
+- 欄「AI 説明」を ★・タグ・パレットの後へ追加した。成功時は説明文・空でない画像内の文字・検索語を
+  既存 Copy 付き表示で出し、失敗時は作れなかった旨と作成日を出す。モデル名は作成日の hover に置く。
+  署名違いは本文を残して作り直しを案内し、現在ファイルが無ければ警告しない。行なし・初回読込中は欄を出さない。
+- ジョブの App 側 `item_done` は全 outcome で current のキーだけ失効させ、空の worker hook を撤去した。
+  取り込みは terminal refresh の世代不一致判定より先に全消去する。STORES の `captions_changed` は実変更行数から作り、
+  共通 App 受け口の identity 設定 gate より先に採用する。復元成功は既存 ledger 増分採用を保って caption のみ全消去し、
+  追記は DELETE 件数を summary に集約する。一覧の既存メタキャッシュ消去3経路も共有キャッシュを全消去する。
+- 公開マニュアルの画像一覧・情報パネル、architecture / async / UI 応答性、detached 記録を更新した。
+  Remote・本の表紙/説明文・検索・MCP は追加していない。まれな DB 読み取り失敗はログと行なし、
+  worker 起動/送信失敗はログと通知に留め、再試行・回復状態を追加していない。
+- コードレビュー担当（実装とは別 context、`gpt-6.1-sol` / `xhigh`）から、pending 中の再入場について
+  設計 P2 が報告されたため、実装担当はここで設計担当への返却として停止した（検収・独立レビュー完了ではない）。
+  旧 visit の読み取りが行と署名 S1 を取得し、その結果が未採用の間に外部上書き S2 と新 visit が発生すると、
+  `refresh=true` は Loading / Refreshing によって抑止される。visit 履歴だけは更新済みになるので、S1 を採用した後も
+  追加の SELECT / stat は起きず、新 visit で S2 を確認できない。§21.11.2 の「Loading 中は送り直さない」と
+  「表示を始めるたびに取り直す」の優先条件を決める必要がある。
+  当時の候補は、再入場を保持して現在の read 完了後に一度読み直すことだったが、下記の設計担当判断で不採用。
+  正本に無い pending state を実装担当の判断で足さず、設計担当へ返した。
+- **停止後の設計担当の判断 (2026-11-03)**: 後続 read のための再入場の印は採用しない。表示開始時は Loading 中でも
+  `gen` を進めて再送し、旧結果を捨てる。毎フレームの連続描画では再送しない。Loading / Loaded の2状態とし、
+  Loaded の値は再読込中も残す。この方針で実装・検証を再開した。外部上書き後に別キーから戻る競合を、
+  旧結果を保留する channel と一時 DB / 画像で決定的に検証する回帰を追加した。
+- 停止前の初回 focused（通常feature、offline、snapshot更新指定）はコンパイルで終了し、テストは未実行。
+  Rust 2024 の予約語 `gen`、`metadata_cache_key` の Option、egui 0.37 harness API のコンパイルエラーを修正したが、
+  上記の停止により再実行していない。ログは `target/vlm-caption-display-initial-compile.log`（exit 101）。
+  停止時点ではsnapshot生成・目視、関連テスト、image ZIP 専用 refresh の追加回帰、確認用 build は未実施だった。
+  `cargo fmt` は成功。再開後の結果は以下へ記録する。
+- 再開後の重点テスト（通常feature、offline、`UPDATE_SNAPSHOTS=1`）はコンパイル成功（7分51秒）、
+  79件中78成功／1失敗。nextest run `1d9bd17e-5461-46a5-a425-b5e24f04394d`、
+  `target/vlm-caption-display-focused.log`。失敗した identity 設定OFFの受け口テストは、App fixture の
+  初期化時loaderを残したまま「新しいloaderが無い」と検査していた。製品の設定OFF処理
+  `sync_content_identity_detection_setting(true)` を通して既存loaderを止め、事前のNoneを確認する準備へ修正した。
+  製品コードの変更ではなく、関連filterへ含めて再検証する。
+- snapshotは `caption_panel_ok` / `caption_panel_failed` / `caption_panel_stale` の3枚、計81,016 bytes。
+  実装担当とコードレビュー担当が各PNGを目視し、本文・Copy・作成日・警告の折り返しに欠け・重なりが無いことを確認した。
+  画像フォルダZIP化の専用poll経路の全消去回帰も追加した。コードレビュー担当の変更箇所の再確認では
+  前回の設計P2は解消、新しい指摘なし（実装担当による独立レビュー判定ではない）。
+- 関連filter（通常feature、offline、snapshot更新指定なし）は437件中436成功／1失敗、実行70.603秒。
+  run `41cbd95b-52e5-4b86-894c-4596b24e74cb`、`target/vlm-caption-display-regression.log`。
+  対象は `ai_caption_db` / `caption_display_cache` / `rename_key_migration` / `metadata_transfer` /
+  `content_identity` / `delete_worker` / `metadata_cleanup` / `book_append_undo` / `books` と
+  App側の表示・復元・追記・画像フォルダZIP化、パネル・作成ジョブの回帰。
+  snapshot3枚の通常比較も成功。失敗した新規復元完了テストも、fixtureが起動時loaderを残してReadyを設定していたためで、
+  既存loaderをtake/cancelして事前Noneを確認してからReadyを設定するよう修正した（製品コードの変更なし）。
+- 修正した復元完了テストだけを `cargo nextest run --offline -p mimageviewer --lib -E
+  'test(=app::content_identity_restore::tests::caption_restore_completion_clears_shared_display_without_ledger_reload)'`
+  で再実行し1件成功（0.516秒）。run `a28903d9-6243-47c6-88fd-a332773f5515`、
+  `target/vlm-caption-display-restore-fixture.log`。製品コード・他のfixtureは不変なので436件の成功を再利用し、
+  対象437件の確認を揃えた。単一実行で437件全成功した結果としては扱わない。本体lib全件は設計担当の担当として実行していない。
+- コードレビュー担当は、修正後の1件成功ログと436件の成功ログ、snapshot3枚を確認し、
+  独立コードレビュー完了・未解決指摘なしと報告した。実装担当自身の判定によるものではない。
+  `cargo fmt --check`、UI glyph検査（0件）、サイトカード検査（50件・超過0）、差分検査は成功。
+- `scripts/build-dev.ps1 -PreserveRuntime` は通常featureの `dev-runtime` core（4分44秒）と
+  remote / EPUB PDF worker / MCP adapter のbuild・配置に成功した。VC runtime PE検査も `runtime=4 pe=4` で成功。
+  ログは `target/vlm-caption-display-build-dev.log`。成果物は `target/dev-runtime/mimageviewer-core.exe`。
+  `CARGO_NET_OFFLINE=true` で実行し、製品バイナリは起動していない。最後に引数なしの `cargo fmt` を実行する。
+  残る受入は設計担当の検収、本体lib全件、利用者の実機確認（作成済み画像の欄、外部上書き後の再表示、
+  ジョブ完了後とdetachedを開いたままの表示更新）。実機のUI応答性やperfを確認済みとは扱わない。
+- 製品起動・外部通信・評価データ読み込み・コミットは行っていない。
+#### 21.12.1 独立レビュー1回目への対応 (基準 `f101001af`)
+
+- **P2-1（暗色固定欄に親のLight文字色が残る）**: 既存のEXIF・生成情報は明るい色を明示して親テーマの暗い文字色を避けていたが、
+  新しい欄は `ui.visuals()` を参照し、既存のwidget専用styleは非操作文字・補足・警告の色を変えていなかった。
+  「AI 説明」の `ui.scope` 内に `os_theme::apply_dark_ui` と既存widget配色を適用する。
+  文字コントラスト設定を保って暗色用の通常・補足・警告を使い、固定grayやContextの直接変更を足さない。
+  パネル全体・既存の欄のstyleは変えず、親UiとContextのLight/Dark styleが描画前後で同一であることも検査する。
+- 実際の欄をLight/Dark × 標準/強め × 成功/失敗から描き、paint済みの見出し・失敗文・作成日・古い警告の色と
+  暗色背景へのコントラストを検査する。snapshot fixtureも本体と同じwidget配色へ揃える。
+  既存の説明文snapshotのCopyボタンの色が変わる場合は、このfixture修正による意図した差分で、他の欄の配色変更ではない。
+- **P2-2（一覧の採用経路の無効化漏れ）**: `metadata_cache.clear()` と、同cacheの代入・取り外し・bundle交換も再検索した。
+  一覧再読込で全消去する箇所は下表の6つ。既接続の `app.rs` 3か所に加え、コレクション・ファイル名スタック・全体検索の
+  採用点にも `caption_display.clear()` を併設する。bundleの初期化・mount/swapは所有権の移動なので、新しい無効化を足さない。
+
+| ファイル | 一覧の採用関数 | 対応 |
+| --- | --- | --- |
+| `src/app.rs` | `install_drive_list` | 既接続 |
+| `src/app.rs` | `install_zip_current_level` | 既接続 |
+| `src/app.rs` | `install_loading_items_inner` | 既接続 |
+| `src/app/collection_grid.rs` | `install_collection_grid_items_with_thumbnail_sources` | 今回接続 |
+| `src/filename_stack_ui.rs` | `swap_stack_view_items` | 今回接続 |
+| `src/global_search_ui.rs` | `replace_search_view_items_with_ratings` | 今回接続 |
+
+- 新しく接続した3採用経路の回帰を追加する。コレクションは実actorとreload/poll採用を使い、別contextが同じ画像を
+  表示し続ける間の外部上書き→main一覧再読込→共有cache全消去→別contextの `refresh=false` で再読込→古い判定まで検査する。
+  兄弟のitems・世代・fullscreen対象は保持され、mount/swap/退役だけでは共有cacheを失効させないことも検査する。
+  DB・画像は一時領域だけで、画像decode・製品起動は行わない。detachedの述語・viewport経路は変更しない。
+- 初回focused（通常feature・offline・snapshot更新指定）は30件中29成功、1件は1test内で複数Harnessの
+  snapshot結果を集約せずに終了したため採取処理だけ失敗した。実描画色・新しい3採用経路の回帰は成功。
+  snapshot3条件を共通描画helperを使う3個のtestへ分けて修正した（製品コードの追加変更なし）。
+  run `dc49b878-8ca0-4460-b212-f0aa84d0adab`、`target/vlm-caption-review1-focused.log`。
+- snapshot再生成は6件全成功（2.058秒）、run `d479483f-555b-4a68-8517-129a12fa866e`、
+  `target/vlm-caption-review1-snapshots.log`。新規はLight/標準・Light/強め・Dark/強めの3枚、
+  既存は成功・古いの2枚のCopy配色を本体に合わせて更新し、失敗の既存PNGは不変。
+  計6枚198,529 bytesを実装担当と独立レビュー担当が目視し、欠け・重なり・豆腐が無いことを確認した。
+- 最終関連filterは `app::collection_grid` / `filename_stack_ui` / `global_search_ui` /
+  `caption_display_cache` / `app::caption_display_tests` と `caption_panel` を対象に通常feature・offlineで実行。
+  snapshot更新指定なしの比較を含め284件全成功（20.352秒）、
+  run `6deb5999-d9a0-44b7-94f8-b37be01a3829`、`target/vlm-caption-review1-regression.log`。
+  本体lib全件は指定どおり実行していない。`cargo fmt --check`、UI glyph検査（0件）、差分検査も成功。
+- 独立レビュー担当は最終source・新規画像・検証ログを確認し、今回のP2-1/P2-2解消・追加指摘なし・対応範囲のレビュー完了と報告した。
+  実装担当自身の判定ではなく、実機確認や確認用buildの受入とは区別する。
+- `scripts/build-dev.ps1 -PreserveRuntime` は通常feature・offlineでcore（3分19秒）と同伴3exeのbuild・配置に成功。
+  VC runtime PE検査も `runtime=4 pe=4` で成功した。ログは `target/vlm-caption-review1-build-dev.log`。
+  成果物は `target/dev-runtime/mimageviewer-core.exe`。起動していない。最後の整形には引数なしの `cargo fmt` を使う。
+  本体lib全件・実機確認は未実施。製品起動・外部通信・コミットは行っていない。
+
+V1-4b の詳しい設計は、V1-4a の実装の後に改めてレビューを受ける。
+
+#### 21.12.2 検収 (設計担当、2026-11-03)
+
+- 実装の途中で、「読み込み中は送り直さない」と「表示を始めるたびに取り直す」の衝突を実装担当が報告した。設計担当の判断: 表示を始めたときは
+  `Loading` の間でも `gen` を進めて送り直し、先の結果は `gen` 違いで捨てる。「送り直さない」は同じキーを描き続ける間 (毎フレーム) の決まり。
+  状態は `Loading`/`Loaded` の 2 つのまま (再入場の印は足さない)。
+- 本体 lib 全件 (設計担当の環境): `f101001af` で 15,478 件中 15,475 件成功 (失敗 2 件は単独で成功、時間切れ 1 件は 10k/100k の性能テストで
+  レビューと同時に流したため)。`220946f73` で 15,485 件中 15,484 件成功 (失敗 1 件は動画のデコーダのテストで、単独で成功)。いずれも VLM の変更範囲の外。
+- 独立コードレビュー 1 回目 (基準 `f101001af`): P2 2 件 (ライトテーマで欄の文字が暗い背景に埋もれる・コレクション一覧の読み直しで共有キャッシュが残る)。
+  対応は `220946f73` (§21.12.1)。2 回目 (基準 `220946f73`): 2 件とも閉じ、新しい指摘は無し。
+
+### 21.13 V1-4b の設計 (2026-11-03)
+
+§6.7 を、§21.11.3 (コードとの食い違いと方向、独立レビュー 18・19 回目済み) で読み替えた形で具体化する。
+
+#### 21.13.1 表紙の解決 `resolve_book_cover`
+
+1. **解決の切り出し**: `thumb_loader::process_load_request` の中の「どこを読むか」を決める部分 (EPUB の世代の解決・フォルダの代表の選択・
+   ZipDir の代表・ZIP/RAR の最初の画像の決定) を、2 つの関数に切り出す (下の 2 段)。
+   切り出しの前後でサムネイルの結果を変えない。
+   - **2 つの段に分けて切り出す** (独立レビュー 20 回目 P2-1)。今の `process_load_request` は、EPUB の世代と署名の確定を cache の参照の前に行い、
+     フォルダ・ZIP の代表の選択を cache に無かった後に行う。`CacheOnly` は元のファイルを開かずに終わる。この順序と、取り消し・終わりの位置を変えない:
+     - 前段 `prepare_load_request_stamp` (cache の参照の前): EPUB の世代の確定と署名 (今の `stamp_resolved_pdf_request` の部分)。
+     - 後段 `resolve_read_after_cache_miss` (cache に無かった後): フォルダの代表・ZipDir の代表・ZIP/RAR の最初の画像の決定。
+     サムネイルは「前段 → cache の参照 → (無ければ) 後段 → 読み込み」の今の順で呼ぶ。本のための解決は cache を見ずに前段と後段を続けて呼ぶ。
+   - **後段の結果型** `ResolvedRead` (独立レビュー 20 回目 P2-2): 読む位置 `ReadLocation` (`File(path)` / `ArchiveEntry { archive, entry }` /
+     `PdfPage { pdf, page }` / `ChildCached { .. }` / 読めない (理由付き)) に加えて、今の後段が読み込み・保存の段へ渡しているものをそのまま運ぶ:
+     フォルダの選定証明 (`FolderSelectionProof`)、取得済みの bytes・画像・寸法 (ZIP の最初の画像を読んだ bytes など)、子の保存済みサムネイルの WebP と寸法、
+     有効な署名。サムネイルの読み込み・保存の段は、これを受け取って今と同じ処理をする (選定証明を保存し、取得済みの bytes を読み直さない)。
+     EPUB の `ReadTarget` (lease) は前段で得たものを、署名の確定から描画の終わりまで同じものを持つ。
+   - 切り出しは挙動を変えない移動に限る。サムネイルの既存のテストに加え、各種類 (画像・ZIP・RAR の直接と変換済み・PDF・EPUB・フォルダの直下の画像・
+     子の本の代表・固定表紙の各種) で、切り出しの前と同じ読み込み先になることをテストで押さえる。
+2. **本のための解決** `resolve_book_cover(book_path, kind, &BookCoverEnv) -> BookCover` (worker で呼ぶ。UI スレッドでは呼ばない):
+   1. 一覧と同じ計画を作る: `make_load_request_with_visibility` 相当の計画と `apply_folder_thumb_pin` を **worker で**行う
+      (`app/color_filter.rs` の `run_color_scan_worker` が worker で `apply_folder_thumb_pin` を呼ぶ前例に倣う)。固定表紙の DB は `Arc<FolderThumbPinDb>` を渡す。
+   2. 変換が要る書庫は、App の map ではなく worker で同じ判定 (`resolve_converted_archive_candidate`、`pub(crate)` にする) を行う。`Unavailable` は
+      「未変換」として返す (§6.7・U18)。
+   3. 前段と後段を呼ぶ。`ChildCached` (フォルダの代表が子の本の保存済みサムネイル) のときは、**選定の結果に残した「固定表紙の持ち主のコンテナ」と
+      「解決済みの位置」** から読む (独立レビュー 20 回目 P2-3)。子フォルダ B の表紙を `B/book.pdf` の 3 ページ目に固定し、親 A がその WebP を採った場合、
+      今の `winner.path` は PDF を指すが、固定の指定は B の行にあるので、PDF の葉のパスから選び直すと 1 ページ目になってしまう。そこで、子の
+      選定 (`resolve_folder_thumb_image_inner` の子の固定表紙の解決) が固定表紙を使ったときは、その持ち主と `ResolvedPinTarget` を選定の結果に
+      残し、本の解決はそれを読む。固定表紙を使っていない子だけ、子の本の規則 (子の固定表紙の確認を含む) で 1 から解決する。
+      `ChildCached` の再解決回数は探索の深さとして数えない。各段のフォルダ探索・固定表紙の cascade は、一覧と同じくその段の
+      `folder_thumb_depth` を使う（子の保存済み代表は、子自身の深さで選んだ結果）。保存済み代表の再解決の連鎖は `visited` で
+      同じ本に戻ったら止める。サムネイルの側は、残した情報を使わず
+      今どおり WebP を使う (選定の結果に field が増えるだけで、選び方は変えない)。
+   4. 返すもの: 読む位置 (`ReadLocation` のうち `File`/`ArchiveEntry`/`PdfPage`)、`cover_ref`、署名とその元のパス、読めない理由 (未変換・
+      固定表紙のエントリやページが無い・本が無い)、**動画のフレームの表紙** (下の 6)。
+   6. **動画のフレームを表紙に固定した本** (独立レビュー 20 回目 P2-4): 一覧は `video_pins.db` の WebP (固定したフレームの縮小画像) を表紙にする。
+      v5 では**対象外**にする (§1 で動画は対象外。フレームを 1024px で取り出し直すには動画のデコードが要り、ジョブに動画の処理が入る)。解決は
+      「動画のフレームの表紙」として `cover_ref` (`<動画の相対パス>#frame=<固定のフレームの位置>`) と動画ファイルの署名を返し、ジョブは
+      「対象外 (動画の表紙)」に数えて何も保存しない。表示では、行の `cover_ref` と違うので「古い」になる (画像の表紙で作った後に動画のフレームへ
+      固定し直した場合)。動画の固定表紙の DB (`VideoPinDb`) は `BookCoverEnv` に入れる。
+3. **`cover_ref` の形**: `<本からの相対パス>` に `#entry=<書庫の中のエントリ名>` か `#page=<0 始まりのページ番号>` を付ける (相対パスは区切りを `/` に揃える。
+   本そのものなら相対パスは空)。例: ZIP の最初の画像 `#entry=001.jpg`、フォルダの直下の画像 `cover.png`、フォルダの子 PDF の 3 ページ目 `sub/b.pdf#page=2`。
+   変換済み ZIP を読んだときは、**変換済み ZIP の中の実際のエントリ名**を記録する (独立レビュー 20 回目 P3-6。変換は名前の正規化・重複名への連番・
+   入れ子の展開の prefix を行うので、元の書庫の名前とは違うことがある。元の名前への逆変換はしない)。
+4. **署名** (§6.7 のまま): ファイル 1 つの本は本そのもの、フォルダの本は実際に読んだファイル、EPUB は読んだ世代の元ファイルの `display_source_state`。
+   EPUB の 100ns 単位はミリ秒に直す (`FileSignature::from_metadata` と同じ切り捨てで、変わっていないファイルでは同じ値になることをテストで押さえる)。
+5. **`BookCoverEnv`** (worker へ渡す、UI スレッドで作る。I/O をしない): `folder_thumb_sort`・`folder_thumb_depth`・一覧の表示の種類の設定
+   (`listing_file_type_visibility`)・`Arc<FolderThumbPinDb>`・動画の固定表紙の DB・archive cache の DB・PDF のパスワードの材料 (下の 21.13.2 の 4)。
+   UI から渡す種類は計画用の hint とし、最上位も子も worker の metadata がディレクトリならフォルダとして解決する。
+   拡張子付きの実フォルダでも、戻り値の `cover_ref` と署名の基準を実際に選んだ子ファイルへ揃える。UI の stat や `for_physical` の変更は行わない。
+
+#### 21.13.2 本の作成ジョブ (V1-3c のジョブを広げる)
+
+1. **対象**: 選んだセルが `ZipFile` / `PdfFile` (EPUB を含む) / `ConvertibleArchive` / `Folder` なら本として足す。`ZipDir` は対象外 (§6.7)。
+   選択なし・空白の右クリックの「今のフォルダの直下」には、直下の画像と ZIP・PDF などの本を含め、サブフォルダは含めない (§6.7。フォルダは選んだときだけ本)。
+   待ち行列の 1 件は `CaptionTarget::{Image(path), Book { path, kind }}`。同じパスは足さない (§6.6)。
+2. **1 件の流れ (本)**: `resolve_book_cover` → 飛ばす判定 (`status = ok`・`cover_ref` と署名が行と一致・同じ `model_id`・同じ `prompt_version`) →
+   読む位置から 1 枚を読む (書庫のエントリ・PDF のページは長辺 1024px 相当で、ファイルは画像と同じ流れ) → 画像と同じ縮小・RGB8 → 推論 →
+   検索語の重複除去 → 保存 (`SaveRequest { item_path: 本のパス, signature_path, signature, cover_ref }`)。mIV の非破壊回転は、読む位置が
+   ふつうの画像ファイルのときだけ画像と同じく当てる (書庫の中・PDF のページはサムネイルも回転の DB を見ていないなら当てない。実装の始めに確かめる)。
+3. **飛ばす・数える**: 未変換 (§6.7・U18) は何も保存せず「未変換のため飛ばした」に数え、終わりに「一度開いて変換すると作れます」を添える。
+   動画のフレームを表紙にした本は「対象外」に数える (21.13.1 の 2 の 6)。
+   固定表紙のエントリ・ページが無い本は「読めなかった」に数え、行は書かない (§21.11.3 の 8)。
+4. **PDF のパスワード**: 開くときの規則 (`pdf_open_password`) を、App の状態に依らない関数 (保存済みの store・今のその場の PDF とパスワードを引数に取る) に
+   切り出し、App と worker の両方から呼ぶ (優先順を複製しない)。ジョブの開始時に store の複製と、今のその場の PDF のパスとパスワードを worker へ渡す
+   (store を worker へ複製する前例がある)。パスワードが無い・違う PDF は「パスワードが必要」に数えて飛ばす。ジョブの途中でパスワードを尋ねない
+   (モーダルの割り込みを作らない)。
+5. 進捗の小窓に「未変換」「パスワードが必要」の数を足す。それ以外 (中止・終了・受付の締め切り) は V1-3c のまま。
+
+#### 21.13.3 本の説明文の表示
+
+1. 情報パネルの「この本」の欄 (本を開いて見ているとき、★・タグの並び) に、本の説明文を画像と同じ形で出す。見出しは「この本の AI 説明」。
+   本のキーは、パネルの「この本」の★が使う `physical_container_rating_key` (変換済みの書庫は元の書庫のパス) と同じ。
+2. 共有キャッシュ (V1-4a) をそのまま使い、要求に「本」の種類と `BookCoverEnv` を足す。読み込み worker は、行を読んだ後に `resolve_book_cover` で
+   今の `cover_ref` と署名を取り、行と比べて「古い」を決める (§6.7。固定表紙を変えると「古い」になる)。表紙の解決は表示を始めるときに 1 回。
+   解決が読めない (本が無い・未変換) ときは「古い」と出さない (画像のファイルが無いときと同じ扱い)。
+3. 古いの文言: 「表紙が変わっています。右クリックの『AI 説明文を作る』で作り直せます」。今の表紙が動画のフレームのとき (21.13.1 の 2 の 6) は、
+   作り直しを案内せず「表紙が変わっています。動画の表紙からは説明文を作れません」とする (独立レビュー 21 回目 P3。作成を頼んでも対象外で飛ばされるため)。
+4. 無効化に足すもの: **固定表紙の変更・解除で全部消す** (§6.7、独立レビュー 8 回目)。つなぐ場所は `set_folder_thumb_pin` と `remove_folder_thumb_pin` そのもの
+   (ZIP の中では呼び出し側が「読み直しの印」を取り除くので、印の消費の側ではなく、DB を変える 2 つの関数につなぐ)。動画の固定表紙の変更・解除も同じ。
+   **固定表紙の DB を取り込み・STORES が変える場合も全部消す** (独立レビュー 20 回目 P2-5): 取り込みの全部消しの条件に `ImportChangedSections.thumbnail_pins`
+   (と動画の固定表紙) を足し、`StoreMutationEffects` の `captions_changed` を「`ai_caption.db`・`folder_thumb_pins.db`・`video_pins.db` のいずれかの行が変わった」に広げる
+   (名前は `caption_display_stale` などに改める)。固定先の子の画像を改名して親の固定表紙だけが書き換わる場合も、これで拾う。
+
+#### 21.13.4 状態を減らす検討
+
+- 一覧の経路 (計画を UI スレッドで作る・固定表紙のたどりを UI スレッドで行う) は今回動かさない。本のための解決は worker で同じ部品を呼ぶだけにする。
+  一覧の経路を worker へ移すのは別の課題 (UI スレッドの同期 I/O の削減) として残す。
+- 本のジョブはパスワードを尋ねない・変換をしない (モーダルの割り込みを作らない)。
+- 表示の古いの判定は表示を始めるときに 1 回だけ解決する (固定表紙の変更は全部消しで拾う)。
+- まれな失敗 (書庫が壊れている・PDFium の失敗) は「読めなかった」に数えるだけ。
+
+#### 21.13.5 テスト
+
+- 切り出しの前後でサムネイルの読み込み先が同じこと (上の各種類)。
+- `resolve_book_cover`: 各種類の `cover_ref` と署名、子の本の代表の解決し直し (子の固定表紙を含む)、循環と深さ、未変換、固定表紙の先が無い。
+- EPUB の署名のミリ秒換算が `from_metadata` と一致すること。
+- 本のジョブ: 対象の集め方 (選択・空白・スタック・`ZipDir`)、飛ばす判定 (固定表紙を変えると作り直す)、未変換・パスワードの数え方、保存の中身。
+- 表示: 「この本」の欄、固定表紙の変更で全部消えて「古い」になること、`physical_container_rating_key` と保存のキーが一致すること (変換済みの書庫を含む)。
+
+### 19.20 20 回目 (2026-11-03、同じ担当の続き、基準 `412777b7f`、V1-4b の設計)
+
+P2 5 件・P3 1 件。§21.13 に足した: 解決を cache の参照の前後の 2 段に分けて今の順序を保つ (P2) / 後段の結果型に選定証明・取得済みの bytes・WebP を運ぶ (P2) /
+子の保存済みサムネイルを採ったときは固定表紙の持ち主と解決済みの位置から読む (P2) / 動画のフレームの表紙は対象外として数え、`cover_ref` で区別する (P2) /
+固定表紙の DB を取り込み・STORES が変えたときも全部消す (P2) / 変換済み ZIP の実際のエントリ名を記録する (P3)。EPUB の lease の持ち方は「問題なし」。
+
+### 19.21 21 回目 (2026-11-03、同じ担当の続き、基準 `ee2e02338`)
+
+20 回目の 6 件はすべて閉じた。新しい P3 1 件: 今の表紙が動画のフレームのときに「作り直せます」と案内しない (§21.13.3 の 3 に反映)。
+P3 1 件の文言の修正なので、V1-4b の設計のレビューはここで閉じる。
+
+### 21.14 V1-4b の実装記録（2026-11-03、検収・実機確認待ち）
+
+- 着手時は `vlm-caption` / `528f1186a`、作業ツリーは clean。§21.13 を正本として既存経路を照合した。
+  一覧の計画作成・固定表紙の UI 経路は移さず、検索・MCP・変換の開始・パスワードの問い合わせは追加していない。
+- 最初に `thumb_loader` の前段 `prepare_load_request_stamp` と後段 `resolve_read_after_cache_miss` だけを切り出した。
+  EPUB の同じ lease、cache 前後の順序、CacheOnly の終端、取消／request 相関、既存の保存位置を保持する。
+  `ResolvedRead` で選定証明・取得済み ZIP bytes・子の WebP／画像／寸法・有効な署名を後段へ渡す。
+  切り出しだけの状態を確認してから、本の実装を始めた。
+- 先行検証は通常 feature / offline で、サムネイル・固定表紙・archive cache・ZIP・RAR・EPUB の279件が全成功
+  （run `59c67adc-3017-4562-a39f-2a5b8c06c095`、compile 7分05秒、実行17.812秒、
+  `target/vlm-book-extraction-tests.log`）。実 RAR／変換済み ZIP・ChildCached mirror の bytes／寸法／proof と
+  App の pin／変換書庫経路を追加した66件も全成功（run `040327ac-aa11-4d83-a382-5b789a64db3c`、27.205秒、
+  `target/vlm-book-extraction-additional.log`）。親キーを残した4 strategy と動画 seed miss の追加1件も成功
+  （run `8e9dec01-1ab3-41a4-9243-88d7e8da89c8`、0.710秒、`target/vlm-book-extraction-pin-dispatch.log`）。
+  別 context のコード確認担当からは、切り出し範囲の追加停止理由なしとの報告を受けた。全体の検収とは区別する。
+- `app/book_cover.rs` に worker 用の `BookCoverEnv`／`resolve_book_cover` を追加した。既存の計画・pin・変換済み判定を使い、
+  ChildCached が採った固定表紙の持ち主と解決済み位置を保持する。AutoSelected の fallback 行へ pin の位置を誤って付けない。
+  変換済み ZIP の実エントリ名、元の本／フォルダの実採用ファイルの署名、EPUB 世代の元ファイルのミリ秒署名を返す。
+  署名は読み取り前に捕捉し、保存側の既存再確認で並行変更を捨てる。
+- `pdf_open_password` を App 非依存 helper に切り出し、元の優先順を App と worker で共用する。
+  PDF の固定ページ不存在を解決時に検証しながら認証不足を別集計できるよう、内部結果に `PasswordRequired` を持たせた。
+  列挙と描画は同じ ReadTarget／password を使う。未変換・動画の表紙・読めない表紙は行を書かない。
+- 待ち行列を `CaptionTarget::Image`／`Book` へ拡張し、既存の `Running`／`Stopping` と受付／Finish の境界を保持する。
+  フォルダは明示選択時だけ、選択なしの直下対象は画像とファイルの本。スタックの保持メンバー規則と ZipDir の除外を保つ。
+  本の作成済み判定は cover_ref／署名／model／prompt の一致を要求し、通常ファイルの表紙だけ回転 DB を適用する。
+- 共有表示 cache は既存の epoch／gen を使い、今の入力を画像／本／動画の表紙の一つの enum で保持する。
+  本の行がある場合に worker で表紙を一度解決する。UI は需要がある時だけ環境を捕捉し、毎フレーム複製しない。
+  情報パネルに「この本の AI 説明」を追加し、キーは `physical_container_rating_key` と一致させる。
+  種類は受理済みの Document／Archive／フォルダの状態から決め、拡張子付きのフォルダを UI の stat で判別しない。
+  動画の表紙の警告では作り直しを案内しない。detached 述語／viewport 経路／bundle は変更していない（§11 記録も更新）。
+- 固定表紙 set／remove と動画 pin の成功点、取り込みの thumbnail_pins を共有 cache の全消去へ接続した。
+  `StoreMutationEffects::caption_display_stale` は ai_caption／folder_thumb_pins／video_pins の実変更を表す。
+  通常のサムネイル選定・保存データ形式や caption DB schema の変更はない。まれな失敗は既定どおりログと既存の通知／件数に留める。
+- マニュアル（一覧・情報パネル・設定）、製品ページと privacy（日英）、architecture／async／display／virtual-folders／
+  UI responsiveness／spec を更新した。自動検証・snapshot・確認用 build の結果は下へ追記する。
+- 全体の別 context のコード確認で、AutoSelected fallback の子の行がさらに子の PDF 固定表紙を採った場合、
+  proof の leaf PDF から選び直すと固定した3ページ目が先頭へ戻る P2 が報告された。
+  `CachedChildSelection` に元の行の子コンテナを常に残し、pin が無い行もその子の本の規則から解決し直す。
+  `A/B.pdf/C/book.pdf`（B.pdf は実フォルダ）の非表示 ZIP pin の fallback と C の固定 page2 を含む実キャッシュ連鎖で、
+  読むページと既存 WebP／proof／provenance／stamp 不変の回帰を追加した。
+  確認担当からは該当経路の修正後に追加指摘なしとの報告を受けた。設計の検収・実行結果とは区別する。
+- 本機能の初回 focused（通常 feature / offline / snapshot 更新指定）は、テストコードの型追従3件で compile が exit101。
+  `collection_grid` の旧 FileSignature 比較2件を新しい型へ揃え、ジョブの既存 FIFO テスト1件の
+  `Vec<CaptionTarget>.into()` を既存の `From<Vec<PathBuf>>` で受ける形へ戻した。
+  追加の From 実装や製品動作の変更は行わず、テストは未実行のまま修正後の focused を開始した。
+  初回ログは `target/vlm-book-focused.log`。この試行をテスト成功の証拠には含めない。
+- 修正後 focused は compile 成功（9分51秒）、144件中143成功／1失敗、実行6.383秒。
+  run `d78e10f8-5c93-41b8-a39e-d75f5d4866cd`、`target/vlm-book-focused-fixed.log`。
+  失敗は新規フォルダ順序テストが FileName を文字列順と誤って期待したものだった。
+  既存の Windows に近い名前順では `2.jpg` が `10.jpg` より先で、製品コードの変更は不要。
+  名前順の期待値を直し、別の勝者を選ぶ検査は FileTimes で日時を固定した DateDesc にした。
+  NumericDesc はフォルダの許容順ではなく FileName へ正規化されるため、その中間修正案は使わない。
+  143件の成功を再利用し、最終の日時 fixture を別に実行して確認する。
+- snapshot は本の成功／表紙変更／動画表紙の3枚（新規111,010 bytes）と進捗小窓1枚（更新29,675 bytes）、
+  計140,685 bytes。共通の純粋描画と本体フォントを使い、App や実ウィンドウは起動しない。
+  実装担当と別 context の確認担当が4枚をそれぞれ目視し、本文・Copy・作成日・警告・中止ボタンに
+  欠け・重なり・豆腐がないことを確認した。最終順序 fixture の静的確認でも追加指摘なしの報告を受けた。
+- 関連範囲の拡大（通常 feature / offline / snapshot 更新指定なし）は719件中718成功／1失敗、35.600秒。
+  run `1e84d375-1387-4c2e-b59e-1b1b60cd03ef`、`target/vlm-book-regression.log`。
+  サムネイル／folder pins／archive cache・converter／ZIP・RAR・EPUB／変換済み書庫／STORES key migration／
+  メタ情報取り込み／content identity／filename stack／本の評価キーと、説明文パネル・進捗の通常snapshot比較を含む。
+  失敗は上記順序テストの中間修正（NumericDesc が FileName へ正規化される）のままコンパイルされた1件だけ。
+  その718件と先の143件の成功は製品コードが同一なので再利用する。
+- 最終の FileName／固定日時 DateDesc／深さを検査する1件は、通常 feature / offline で単独実行して成功（0.211秒）。
+  run `db40c3c5-570e-477c-ba43-8a46619a9717`、`target/vlm-book-folder-sort-final.log`。
+  これにより focused 144件と関連719件の必要な確認を揃えた。重複する件数を合算したり、単一実行で全成功した結果とはしない。
+  本体lib全件は依頼どおり設計担当へ残し、実行していない。
+- `cargo fmt --check`、UI glyph 検査（0件）、サイトカード検査（50件・超過0）、`git diff --check` は成功。
+  通常 feature の `scripts/build-dev.ps1 -PreserveRuntime` は `CARGO_NET_OFFLINE=true` で成功した。
+  core は5分30秒、remote／EPUB PDF worker／MCP adapter のビルド・配置も成功し、VC runtime PE 検査は `runtime=4 pe=4`。
+  ビルド手順と成果物は `target/vlm-book-build-dev.log`、検査は `target/vcrt-pe-reports/dev-runtime.json` に記録されている。
+  成果物は `target/dev-runtime/mimageviewer-core.exe`（通常設定用、portable feature なし）。
+  最後に引数なしの `cargo fmt` を実行する。
+- 実モデル／実機の確認、本体lib全件、設計担当の検収は未完了として引き継ぐ。
+  利用者の確認は、本の作成と表示、表紙の変更後の警告、未変換／パスワード不足／動画表紙の集計を対象とする。
+  通常の検証用 core は `%APPDATA%\mimageviewer` を使い設定・データを更新し得るため、利用者が起動する前に
+  インストール版／tray 常駐版を閉じる（single-instance mutex を共有）。エージェントは起動しない。
+  製品バイナリの起動・外部通信・`G:\home\vlm-eval` の読み込み・コミットは行っていない。
+
+#### 21.14.1 独立レビューの P2 2件への対応（2026-11-03、基準 `7a05c8e29`）
+
+- 保存済みの子代表（`ChildCached`）を解決し直す段数を、フォルダ探索の深さに数えていた上限を取り除いた。
+  子の保存済み代表は子自身の探索深さで選んだ結果なので、各段の選定・固定表紙の cascade には従来と同じ
+  `folder_thumb_depth` を渡し、再解決の連鎖だけを `visited` の再訪検出で止める。
+  一覧の選定・サムネイル読込・保存の経路は変更していない。§21.13.1 と関連設計文書の深さの条件を揃えた。
+- 最上位も worker の metadata がディレクトリならフォルダに補正する。外側の署名方針を決める前に補正し、
+  `album.pdf`／`album.zip` の実フォルダでも、作成時と表示時の `cover_ref` と実採用ファイルの署名を一致させる。
+  `ProjectionRecipe::for_physical` と UI の種類 hint は変更せず、UI の stat も追加していない。
+- 深さ1の `A/B/C/book.pdf` の保存済み代表から C の3ページ目（page2）を読む回帰を追加した。
+  B の固定先 ZIP が表示の種類の設定で除外され、自動選定の行が C の保存済み代表を採る経路も深さ1で確認する。
+  同じ解決器で実キャッシュの連鎖をたどった後の再訪、および `A→B→A` 相当の訪問集合からの再訪が停止することを確認する。
+  後者は再訪先を削除してから呼び、metadata より先に循環を止めることも検査する。
+- 表示の回帰は実際の `ProjectionRecipe::for_physical` と `current_caption_book_target` を通し、
+  `album.pdf`／`album.zip` の実フォルダを扱う。作成時の Folder 指定で解決・保存した行を、表示 worker が
+  Pdf／Zip の hint から同じ表紙・署名として読み、App の固定表紙の変更で cache が消えて「古い」になることを確認した。
+- 通常 feature / offline の関連 focused は176件すべて成功（5.825秒、run
+  `86dfc8c4-a9a1-4424-878a-041d1926dca5`、`target/vlm-book-p2-focused.log`）。
+  filter は `book_cover::`／`caption_display`／`caption_job`／`folder_thumb`／`folder_pin`／`folder_representative`。
+  追加の `thumb_loader::`／`folder_thumb_pins::`／`folder_representative` は161件すべて成功（16.383秒、run
+  `18c17abb-504e-4c6e-89f6-a3aab6802ec9`、`target/vlm-book-p2-thumbnail.log`）。重複する件数は合算しない。
+  `cargo fmt --check` と `git diff --check` も成功。製品の UI 文言は変更していない。
+- 別 context のコード確認担当からは、この2件の修正と回帰について追加指摘なしとの報告を受けた。
+  自動検証は実装担当が実行した。設計担当の検収とは区別し、ここで検収済みとはしない。
+  本体lib全件は依頼どおり再実行していない。基準コミットの全件15,531件中15,528件成功・残る3件は単独成功という結果は、
+  設計担当から引き継いだ証拠であり、この修正後の全件実行結果ではない。
+- `CARGO_NET_OFFLINE=true` の `scripts/build-dev.ps1 -PreserveRuntime` が成功した。
+  core は1分00秒、remote／EPUB PDF worker／MCP adapter のビルドと配置、VC runtime PE 検査（`runtime=4 pe=4`）も成功。
+  記録は `target/vlm-book-p2-build-dev.log`、成果物は `target/dev-runtime/mimageviewer-core.exe`。
+  最後に引数なしの `cargo fmt` を実行する。製品起動・外部通信・禁止領域の読み込み・コミットは行っていない。
+  実機・実モデルによる確認と設計担当の検収を残す。利用者が確認する場合は、深さ1の保存済み代表からの3ページ目の表紙と、
+  `album.pdf`／`album.zip` の実フォルダで作成・表示した後、固定表紙を変えて「古い」になることを対象とする。
+
+#### 21.14.2 検収 (設計担当、2026-11-03)
+
+- 実装担当の差分を設計担当が確かめ、`7a05c8e29` にコミットした。新しい snapshot 4 枚 (本の成功・表紙の変更・動画の表紙・進捗の小窓) を目視し、
+  動画の表紙では作り直しを案内しないことを確かめた。
+- 本体 lib 全件 (設計担当の環境、`7a05c8e29`): 15,531 件中 15,528 件成功。失敗 3 件 (scroll_661 の行の位置・補正マスクの処理時間 2 件) は単独で成功し、
+  いずれも VLM の変更範囲の外。
+- 独立コードレビュー 1 回目 (基準 `7a05c8e29`): サムネイルの切り出しは旧コードと照合して退行なし (cache の前後の順序・`CacheOnly`・取り消し・選定証明・
+  取得済みの bytes・EPUB の lease)。P2 2 件 (保存済みの子の表紙の復元を探索の深さに数えて、一覧では出る表紙を拒否する・拡張子付きの実フォルダを
+  作成と表示で違う種類として扱う)。設計担当がコードを読んで 2 件とも正しいと判断し、`b8a844484` で対応した (§21.14.1)。
+  §21.13.1 の「深さは `folder_thumb_depth` まで」は、「保存済みの子の表紙をたどる段は深さに数えず、各段の探索は `folder_thumb_depth`、循環は `visited` で止める」に読み替える。
+- 2 回目 (基準 `b8a844484`): 2 件とも閉じ、新しい指摘は無し。修正は `book_cover`・`caption_display_cache` に閉じるので、本体 lib 全件は流し直していない
+  (関連 176 件・サムネイル関連 161 件は実装担当の環境で成功)。v5 の区切りで mcp-trial へ取り込む前に全件を流し直す。
+- 実機・実モデルでの確認は未実施 (利用者に依頼する)。
+
+### 21.15 V2 の設計 (2026-11-03)
+
+§8 (検索への反映) と §6.7 (本を索引に載せる、U17) を、コードを確かめて具体化する。2 段に分ける。
+V2a は画像・PDF の文書に説明文を足すことと反映の仕組み、V2b は説明文のある書庫・フォルダの本を索引と結果に出すこと。
+V2b は V2a の反映の仕組みと読み込みの関数を使うので、この順に作る。
+
+#### 21.15.1 コードで確かめた前提
+
+- `ai_caption.db` の `captions` には `rev`・`indexed` 列、`caption_seq`・`caption_removed` と 3 つの trigger が V1-2 で入っている (`ai_caption_db.rs` の `ensure_schema`)。
+  trigger が見る列に `indexed` は入っていないので、反映済みの更新は印を戻さない (既存のテストあり)。反映待ちを読む関数と反映済みにする関数はまだ無い。
+- 索引のキー (`fts_meta.files.path`、Tantivy の `path`) と `captions.item_key` は、どちらも「小文字・`/` 区切り・ドライブ付き」の同じ正規化
+  (`search_index_db::normalize_path` と `adjustment_db::normalize_path`)。`OwnedRange::sql_ranges()` の範囲はそのまま `item_key` に使える。
+- Tantivy の schema は `fts_index.rs` の `build_schema`、`INDEX_VERSION` は `fts_meta.rs` で 10。版を上げると、既存の作り直しの owner
+  (`indexer_manager::open_stores_with_rebuild_sync`) が `files` と走査済みの印を消し、Tantivy を作り直す。
+- 管理役 (`IndexerSupervisor`) の命令の通り道は容量 4 の `try_send` で、あふれると捨てる。管理役は少なくとも 1 秒ごとに自分で起きる (`WATCH_HEALTH_POLL`)。
+- タグ・評価・その他の DB の変更を索引へ反映する仕組みは今は無い (タグは索引に入れず、評価は結果に後から付ける)。説明文の反映は初めての「DB の変更を索引へ反映する」経路になる。
+- 検索の結果 `GlobalHit` は種類を持たない (索引には `kind` が保存されているが、結果へ読み戻していない)。Flat は `.zip` の結果を捨て、項目化
+  (`grid_item_from_fs_hit_path`) は拡張子で決めるので、RAR・7z・LZH とフォルダは画像になる。MCP の `item_from_hit` は RAR・7z・LZH を `Other` にする。
+- `global_search::run` を呼ぶのは Ctrl+G と MCP の `search_items`。スマートフォルダは物理走査と評価・タグ等の条件で作り、本文検索を持たない (独立レビュー 22 回目 P3。スマートフォルダ上の Ctrl+F は今回の対象)。リモートは呼ばない。
+- Ctrl+F は worker で項目ごとにファイルを読む (Pass 1 は順に、Pass 2 は 8 本の並列で画像・動画)。DB は引いていない。
+- Ctrl+G・Ctrl+F の「検索対象」は単一選択の `TARGET_CHOICES`、Ctrl+G の「種類」は単一選択の `KIND_CHOICES` (`Option<IndexKind>`、画像・PDF・動画・音声)。
+
+#### 21.15.2 V2a: 説明文の検索と反映の仕組み
+
+1. **索引の欄**: Tantivy に `ai_caption_text` (説明文・画像内の文字・検索語を空白でつないだもの。`status = ok` の行だけ) を足す。他の本文の欄と同じ
+   bigram・STORED。`SourceKind::AiCaption` を足し、`SourceKind::ALL` に入れる。`PerSourceText` に欄を足し、`text_field_for`・`doc_per_source_text`・
+   `schema_is_stale` の必須欄に入れる。`INDEX_VERSION` を 11 に上げる (§8。U3 で作り直しを受け入れ済み)。
+2. **ingest で読む**: `IngestSession` は `CaptionDb::open_read_only` で開いた接続を持ち、画像・PDF・EPUB の文書を作るときに `get(key)` で読む。
+   **DB が無かった (`None`) ときは接続を持たず、次の反映・走査の始めに開き直す** (独立レビュー 22 回目 P2-1。`IngestSession` は管理役の起動時に 1 回だけ
+   作られるので、起動時に DB が無いと、初めて作った説明文を読めないまま反映済みにしてしまう)。正常に開けた接続はそのまま持つ。動画・音声は読まない (§1 で対象外)。開けない・読めないはまれな失敗として扱う。ログに残し、説明文なしで文書を作る。
+   全件の走査・作り直しもこの経路なので、DB の内容がそのまま入る。
+3. **反映待ちの読み書き** (`ai_caption_db.rs`): `pending_in_ranges(ranges, limit) -> Vec<(item_key, rev, removed: bool)>` (`indexed = 0` の行と `caption_removed`)、
+   `mark_reflected(&[(item_key, rev, removed)])` (`captions` は `indexed = 1 WHERE item_key = ? AND rev = ?`、`caption_removed` は一致する行を消す)。
+   書き込みは既存の busy_timeout に従う。
+4. **知らせは共有の世代番号 1 つ** (§8 の「管理役ごとの旗と配り役」を簡素化する。§21.15.4)。
+   - `IndexerManager` が `Arc<AtomicU64>` の `caption_epoch` を持ち、`SupervisorParams` で全管理役に同じものを渡す。
+   - 送り手は DB の commit の後に `fetch_add(1)` するだけ。
+   - 管理役は自分が最後に処理した値 (`seen`) を持つ。ループの起床のたびに、次のように進める。
+     1. 今の値 `e` を読み、`seen` と違えば反映を行う。
+     2. 終わったら `seen = e` にする。
+   - 読む前に `e` を取るので、反映の途中で書かれたものは値が進み、次の起床で拾われる。
+   - 管理役ごとの状態は `seen` の 1 つだけで、配り役も、容量のある通り道も使わない。起床は既存の 1 秒ごとの自分での起床で足りる。
+5. **管理役の反映** (`indexer_supervisor`): 反映を行うのは、(1) 最初の走査の後 (走査を省いた場合も)、(2) 全件走査の後、(3) 世代番号が変わったとき。
+   - **何を読むか:** metadata が有効な管理役だけが、自分の `OwnedRange` の範囲の反映待ちを読む。1 回に読む件数には上限 (例: 500) を置き、繰り返す。
+   - **各キーの扱い:** 既存の `build_candidate_from_path` で候補を作り直して再 ingest する。候補を作れなければ (ファイルが無い・対象外の種類)、既存の watcher と同じく文書を消す。
+   - **反映済みにする時:** 索引の commit の後で、読んだ `(item_key, rev)` だけを反映済みにする。取り消しは既存の cancel に従う。
+6. **送り手** (`ai_caption.db` の行を変える commit のすべて): 作成ジョブの保存 (`Written`)、メタ情報の取り込み (`ImportChangedSections.ai_captions`)、
+   STORES の汎用操作 (付け替え・コピー・復元・孤児整理で `ai_caption.db` の行が変わったとき)、本への追記の直接の DELETE、content identity の復元、
+   ほか grep で見つかる書き手すべて。
+   - 判定には `StoreMutationEffects` に `ai_caption.db` だけの変更を表す値を持たせる。表示用の `caption_display_stale` は固定表紙の DB も含むので、そのままは使わない。
+   - V1-4a の表示の無効化と同じ場所から呼ぶ。送り忘れても、次の起動・全件走査の後に拾われる (§8)。
+7. **お気に入りの外の削除の印**: どのお気に入りの root にも属さない `caption_removed` の行は、メタ情報の所有の初回の構成の後に 1 回だけ消す (§8)。
+8. **Ctrl+F**: 項目一覧の worker で、Pass 2 の前に `open_read_only` を 1 回開き、次の項目の `status = ok` の説明文を `HashMap` に読む。
+   - 対象は画像の項目と、本の項目 (`PdfFile`・`ZipFile`・`ConvertibleArchive`・`Folder`)。
+   - Pass 1 (本の項目) と Pass 2 (画像) で、`AiCaption` が検索対象に入っていれば比較の文字列に足す。
+   - UI スレッドでは DB を読まない。ZIP の中で検索対象をファイル名に固定する既存の規則は変えない。
+9. **検索対象の選択肢**: `TARGET_CHOICES` に「AI 説明」を足す (Ctrl+G・Ctrl+F 共通)。「すべての対象」は説明文を含む (§8、利用者自身の検索は全種類)。
+   スマートフォルダの定義は本文検索を持たないので変えない。スマートフォルダを開いた一覧での Ctrl+F は、他の一覧と同じく説明文も比べる。
+10. **MCP**: `search_items` は検索対象を `SearchTarget::Only(SourceKind::ALL から AiCaption を除いたもの)` にする。
+    - **V3 で「AI 説明文」のチェックを足すまで、MCP からは説明文で検索できない** (§8 の P1-2。チェックの既定は OFF、U2)。
+    - 後置の絞り込み (`doc_text_for_target`) も同じ対象で行われることを確かめる。
+11. **公開文書・設計文書**:
+    - マニュアルの検索の節に「AI 説明」の検索対象を足す。
+    - `docs/search-architecture.md` (§4.1・§4.11 の版の履歴・§5.2・§5.3) を更新する。
+    - 計画書には実装記録 §21.16 を作る。
+
+#### 21.15.3 V2b: 説明文のある本を索引と結果に出す
+
+1. **載せる条件の判定を 1 つの関数にする**。`caption_book_candidate(path, &CaptionDb) -> BookCandidateDecision` を作る (§6.7、独立レビュー 6 回目 P2-6)。
+   - 結果は「載せる (書庫かフォルダかの種類)」か「載せない」。
+   - 載せる条件は、`status = ok` の行があり、パスが実在する書庫 (ZIP・CBZ と `ArchiveFormat` の RAR・7z・LZH) かフォルダであること。
+   - 走査・反映・watcher の 3 つの経路がこれを使う。PDF・EPUB は今どおり説明文によらず載せる。
+2. **走査**: `search_walker` の全件の走査で、`OwnedRange` の中の `status = ok` の行を 1 回の問い合わせで読む。
+   - 範囲内の `ok` のキーを worker で stat し、**ディレクトリかどうかを先に判定する** (独立レビュー 22 回目 P2-2。フォルダ名に拡張子の制約は無い)。
+     ディレクトリならフォルダの本、ファイルなら拡張子で書庫か (画像・PDF などの既存の候補なら何もしない) を決める。
+   - 候補の種類 `CandidateKind` に `Book(BookIndexKind::{Archive, Folder})` を足す。
+   - 差分の署名は、書庫はファイルの mtime・size、フォルダはフォルダの mtime と size 0。説明文の変更は反映の仕組みが拾うので、署名に説明文は入れない。
+   - 「ZIP を候補に入れない」(案 B1) と「フォルダは候補にしない」の例外はここだけにする。走査の印の指紋には、本の候補を含むことを表す成分を足す。
+     版は 11 のまま出荷し、開発機の索引は指紋の違いで走査し直される。
+3. **ingest**: 本の文書は、名前 (`Filename`) と説明文 (`AiCaption`) だけにする。
+   - `IndexKind` は、書庫が `Zip`、フォルダが `Folder` (どちらも既存の値)。
+   - `fts_meta.files` の行も、既存の文書と同じく作る・消す。
+4. **watcher**: Upsert の候補作り (`build_candidate_from_path`) で、フォルダと書庫の拡張子を断る前にこの判定を通す。載せないなら今どおり文書を消す。
+   `.json`・`.txt` をサイドカーとして扱い早く return する入口 (`apply_single_change`) は、**そのパスが本の文書 (ディレクトリ、または索引に本として
+   ある) の場合にも本の更新・削除の経路を通す** (独立レビュー 22 回目 P2-4。`album.json` という名のフォルダを消しても文書が残るため)。
+   兄弟の画像をサイドカーの変更として再 ingest する今の処理は残す。
+5. **反映**: 21.15.2 の 5 の候補作りが同じ関数を使うので、説明文を作れば載り、消せば消える。
+6. **結果の種類**: `GlobalHit` に `kind: IndexKind` を足し、`search_page` で保存済みの `kind` を読み戻す。以降の項目化は、この種類で決める。
+   - **項目化** (`grid_item_from_fs_hit_path`): `Zip` は拡張子で `ZipFile` または `ConvertibleArchive { format }`、`Folder` は `GridItem::Folder`。
+     画像・PDF・動画・音声は今どおり。UI スレッドで stat しない。
+   - **Flat:** ZIP の中の結果を捨てる規則は残す。`.zip` の結果を捨てる規則は外し、種類で判断する (本の結果を出す)。
+   - **Drill:** 開いたフォルダの中の本の結果は、そのまま項目にする。同じパスに子フォルダのまとめ (結果を含む子フォルダの欄) もあるときは、欄を 1 つにする。
+     まとめの欄を残し、検索の中を進めるようにする。
+   - **本の結果と検索の枝を区別する** (独立レビュー 22 回目 P2-3): 今の Drill は `GridItem::Folder` を検索の枝として開き (`ui_main.rs`)、
+     `open_grid_container_with_mode` は `Folder` を受け付けない。フォルダ自身の説明文だけに当たった本を枝として開くと、子に結果が無ければ空の一覧になる。
+     項目化の境界で「本の直接の結果」と「検索の枝」を区別し (枝の欄の印、または本の結果の集合を持つ)、本の直接の結果は実際のフォルダを開く経路
+     (一覧からフォルダを開くのと同じ経路) へ送る。同じパスで重なるときに枝を優先する方針は変えない。
+   - **Aggregated:** 本の結果は親フォルダの群に数える。代表のサムネイルの選び方は今どおり (画像と PDF・EPUB の 1 ページ目) で、新しい `Zip`・`Folder` の
+     結果だけを代表から外す (本の結果を画像として読まない。独立レビュー 22 回目 P3-8)。
+   - **結果から本を開く:** 既存の `open_grid_container_with_mode` を使う。`advance_drilled_current_path` の ZIP の判定 (`is_zip`) は、変換済みの書庫
+     (`ConvertibleArchive`) でも ZIP と同じにする。
+7. **Ctrl+G の「種類」**: `KIND_CHOICES` に「書庫・フォルダの本」を足す。
+   - 選んだときの `SearchScope.kinds` は `[Zip, Folder]` にする。
+   - 選択の型 (`Option<IndexKind>`) は変えず、`Some(IndexKind::Zip)` を「書庫・フォルダの本」の意味にする (保存しているなら形が変わらないようにする)。
+   - 「すべての種類」は本も含む。
+   - **表示の種類の設定・EPUB を無視する設定の判定も、保存済みの種類で行う** (独立レビュー 22 回目 P2-5): 今は `global_search.rs` と `global_search_ui.rs` が
+     パスだけで判定するので、実フォルダ `album.epub` が EPUB を無視する設定で消え、`album.zip` も ZIP の非表示で消える。種類をこれらの判定の前に読み戻し、
+     `Folder` は一覧と同じくディレクトリとして扱う (常に通す)。EPUB を無視する設定は `Pdf` の EPUB にだけ効かせる。
+   - **「対応アーカイブを無視する」設定も検索に効かせる** (独立レビュー 22 回目 P2-6): 一覧・移動の対象から外す RAR・7z・LZH を、Ctrl+G の結果からも外す。
+     検索の開始時にこの設定を `SearchScope` に捕捉し、件数の上限に数える前に除く。ZIP・CBZ とフォルダは残す。MCP の検索も同じ `SearchScope` を通す。
+8. **MCP**: `item_from_hit` は結果の種類で分類する。
+   - `Zip` は `Archive`、`Folder` は `Folder`。
+   - 結果以外の分類 (`get_item_info` など) も、`ArchiveFormat` の RAR・7z・LZH を `Archive` にし、`library_row` と揃える。
+   - `index_kind` の `Archive`・`Folder` の絞り込みは、本の文書に当たる。
+   - V2a の 10 のとおり、MCP では説明文の欄で当たらないので、本は名前で当たったときだけ出る。
+9. **公開文書・設計文書**:
+   - マニュアルの検索の節に、次の 2 点を足す。
+     - 説明文のある書庫・フォルダの本は、Ctrl+G でも本として出ること。
+     - 「種類」に「書庫・フォルダの本」があること。
+   - `docs/search-container-item-redesign.md` §3.2 に、案 B1 の例外 (U17) を書く。
+   - `docs/search-architecture.md` §4.6 にも案 B1 の例外を書く。
+   - 実装記録は計画書の §21.17 に書く。
+
+#### 21.15.4 状態を減らす検討
+
+- **反映待ちの一覧は DB だけが持つ** (§8 のまま)。メモリ上の待ち行列を作らない。
+- **知らせを、§8 の「管理役ごとの `AtomicBool` と、`metadata_reconfiguration` の配り役」から、全管理役で共有する世代番号 1 つに改めた**。
+  - 世代番号なら、ある管理役が読んでも他の管理役の「未処理」は消えない。そのため、§8 で共有の旗を退けた理由 (独立レビュー 4 回目 P2) に当たらない。
+  - 管理役の一覧を持つ側へ配る処理と、管理役ごとの旗が要らなくなる。起床は既存の 1 秒ごとの自分での起床に乗せる。
+- **本の判定は DB の今の状態を読むだけ**にする。索引に「説明文で載せた本」の別の印を持たない。
+- 採らなかった案: 世代番号の代わりに命令の通り道 (容量 4) で知らせる案。あふれたときに落ちる (§8 の理由)。
+- まれな失敗 (DB を開けない・反映済みの書き込みの失敗・索引の commit の失敗) は割り切る。ログに残し、次の起動・全件走査で拾い直す。
+
+#### 21.15.5 テスト
+
+- **V2a:**
+  - ingest が `status = ok` の行だけを欄に入れること。
+  - 反映待ちの読み取りが `OwnedRange` の外と子のお気に入りの範囲を読まないこと。
+  - `(item_key, rev)` が一致するものだけを反映済みにすること (読んだ後に書かれた行は残る)。
+  - 削除の印。
+  - 世代番号の取りこぼしが無いこと (反映の途中の書き込み)。
+  - 送り手のそれぞれ (ジョブ・取り込み・STORES・本への追記・復元) で世代番号が進むこと。
+  - Ctrl+F の画像と本の項目。
+  - MCP の検索で説明文だけの語が当たらないこと。
+  - 版の上げで作り直しになること。
+- **V2b:**
+  - 3 つの経路で判定が同じになること。説明文を作ると載り、消すと文書と `fts_meta` の行が消えること。失敗の行だけでは載らないこと。
+  - RAR・フォルダの結果が本として項目化されること。Flat・Drill・Aggregated での扱い。
+  - 種類の絞り込み。
+  - MCP の分類。
+
+### 21.16 V2a 実装記録
+
+2026-11-03、基準 `2771e7c06`、`vlm-caption` の未コミット差分。正本は §21.15
+（独立設計レビューの履歴は §19.22・§19.23）。この記録は実装担当の記録で、独立実装レビューの判定ではない。
+
+#### 21.16.1 実装範囲と判断
+
+- `ai_caption_text`／`SourceKind::AiCaption`／`PerSourceText.ai_caption` と INDEX_VERSION 11。
+  説明文・画像内の文字・検索語は `ok` 行だけを空白で連結し、既存bigram／STORED／後置照合を通す。
+  画像・PDF・EPUBのingestで読む。署名が古い説明文も検索対象とする既定を維持する。
+- ingestのreadonly接続はセッション内で保持し、未作成で開けなかった場合は次の走査・反映の開始で
+  開き直す。管理役にはmanagerと同じdata_dirのDBパスを渡す（`new_at` の隔離も維持）。
+- `CaptionDb::pending_in_ranges` は既存 `OwnedRange::sql_ranges()` の半開区間だけを読み、
+  `mark_reflected` は `(item_key, rev, removed)` が一致する行だけを更新・削除する。
+  管理役は最大500件を既存候補作成→ingestへ流し、全commit/reload・metadata更新が完了した後に
+  ACKする。取消・索引失敗時はACKせず、その回の反映を終える。
+- DB未作成とopen失敗は接続の `Result<Option<CaptionDb>, String>` で区別する。
+  open/get失敗でも通常ingestは説明文なしの文書を作るが、そのapplyの読取失敗件数を返し、反映は
+  ACKせず終了する。通常watch/scanが既に反映済みの説明文を空欄で置き換えた場合も拾い直せるよう、
+  読取失敗は既存writer reporterのログ・通知・次起動再構築予約へ渡す。DB未作成では予約しない。
+  caption原本は変更せず、新しいretryや回復手順を足さない。単にログだけでは、同じ署名の文書と
+  `indexed = 1` の組が次回Fullにも残るため、この既存の粗い出口が必要だった。
+- 全管理役に共有する `caption_epoch` と管理役ごとの `seen` だけを使用。世代は反映前に取得し、
+  反映後にその値を採用する。初回走査の後（省略時を含む）、全件走査の後、世代更新時に反映する。
+  全件走査本体の順序は保ち、開始時の接続確認と終了後の反映を外側に置いた。
+- 起動時にmanagerをAppが受け取る前の終端は、Ready採用時に同じ世代を一度進めて拾う。
+  起動pollの後にbackgroundでReadyと初回反映が完了し、同じframeのジョブ完了pollがまだPendingを
+  見る順序も通常の操作で到達できるため、初回反映だけには依存しない。追加状態は持たない。
+- 初回構成後に一度だけ全お気に入りroot外の削除印を整理する。実効metadata所有範囲とは分け、
+  metadata無効・共通除外・子のお気に入りの中の印はこの整理で消さない。
+- Ctrl+Fのworkerがreadonly DBを1回開いて、画像・本（PDF/EPUB・ZIP・変換書庫・フォルダ）の
+  `ok` 行を先に読む。Pass 1/2で既存の比較文字列へ加える。ZIP内のファイル名固定は維持。
+  Ctrl+G/ Ctrl+F共通の選択肢に「AI 説明」を追加。MCPは同じSearchScopeの対象指定を使い、
+  候補検索と後置照合の双方からAiCaptionを除く。
+- 状態を減らす判断は §21.15.4 のとおり。追加queue・旗の配布・DB更新ごとの独自索引文書生成・
+  自動retryを作らない。まれなDB失敗はログ＋次回起動/全件走査、索引書込失敗は既存reporterを使う。
+- 旧Tantivy 0.26.2 fixtureは旧schemaのまま保存し、raw APIの読取・更新・削除・merge・再open検査を
+  残した。現行アプリAPIからは新しい必須欄が無い索引を作り直す検査を分けた。fixture再生成は不要。
+- V2bの候補追加・結果の種類・Flat/Drill・種類絞り込み・MCP分類は変更していない。
+  マニュアル・製品ページ・privacyに説明文の検索と端末内の索引への保存を追記した。
+
+#### 21.16.2 書き手の再監査と通知
+
+`src` の `ai_caption.db`／`CaptionDb`／`captions` のSQLと、V1の表示失効の呼出箇所をgrepで再監査した。
+内容を変えるcommitの所有者は次の5群。反映用ACKと削除印の整理は内容更新の通知対象に含めない。
+
+| 書き手とcommitの所有者 | commit後の通知境界 |
+| --- | --- |
+| `ai/caption_job_worker::save_request` → `CaptionDb::save_unless_cancelled` | `poll_caption_job` の `Created` / `FailedWritten`。失敗行のWrittenと既存okを保持したKeptExistingOkが同じFailedに畳まれていたため、保存済みだけを区別するvariantを追加。従来の失敗集計は維持し、Discarded/取消/未保存では通知しない |
+| `metadata_transfer::apply_ai_caption`（attached DBのDELETE / INSERT ON CONFLICT、import batch commit） | commit済み `ImportChangedSections.ai_captions` を `apply_metadata_import_terminal_refresh` で採用。元contextが古い場合も通知する |
+| STORES: `rename_key_migration::migrate_store`、`migrate_book_store`、`copy_store_transaction`、`purge_store`、`metadata_cleanup::delete_store` | 各commit後の `record_rows_changed` → 新しい `StoreMutationEffects.ai_captions_changed` → `apply_content_identity_store_mutations`。一般改名・移動、本の一時キー経由の入替、コピー、復元、hard purge、孤児整理とその各完了経路を含む |
+| `content_identity::restore` の `copy_stores_at_with_maintenance` | `app/content_identity_restore` の復元完了採用。既存ledger増分採用を維持するため、成功時の直接採用箇所でAI変更効果を通知する |
+| `book_append_undo::MetadataWriter::initialize_entry` の追記先 `CaptionDb::delete` | 削除件数が正の場合の `captions_changed` を `finish_book_append_metadata` で採用 |
+
+STORESの効果は説明文DBだけの実変更を表し、固定表紙を含む `caption_display_stale` と分けた。
+0行変更・pin-only・read-onlyの表示再入場・一覧再読込は索引用世代を進めない。
+画像フォルダZIP化の `image_folder_zip_metadata::copy_store_rows` はpage/container/ratingsだけを
+allowlistしており、説明文の書き手ではない。従来の表示失効用の人工 `ai_captions = true` を外し、
+既存の表示キャッシュ全消去は維持した。これ以外の直接save/delete/生SQLはテストfixtureだった。
+
+#### 21.16.3 検証
+
+検証担当は実装担当に集約。対象はこの節の未コミット差分、通常feature、test/dev-runtime profile。
+Cargoは `--offline` または `CARGO_NET_OFFLINE=true` で実行した。
+
+| 確認 | 結果と証拠 |
+| --- | --- |
+| `cargo check --offline -p mimageviewer --bin mimageviewer-core`（初期統合時） | exit 0。後続の読取失敗修正は統合テスト・確認用buildで通常featureのコンパイルを再確認する |
+| nextest、`--lib -E 'test(/caption_reflection\|caption_read_failure\|caption_epoch\|skipped_initial_scan_reflects\|ai_caption_db::tests\|ingest_worker::tests\|fts_index::tests\|fts_meta::tests\|ingest_text::tests\|caption_removed_cleanup_runs_once/)'` | **115件成功**、exit 0、run `84574ce8-78d4-454c-94d3-f5642049bef6`。`target/v2a-focused.log` |
+| nextest、libの関連範囲（FTS writer/integrity、管理役、所有範囲、walker/watcher、global search、metadata_ops、agent_ipc、caption、STORES、metadata_transfer、append/undo、content identity、Ctrl+F/検索バー。上の115件は除外して再利用） | **901件実行、899成功、2失敗**、exit 100、run `2e48a6ed-82ce-4c4d-90d3-d1d6acc36bee`。`target/v2a-related.log` / `target/v2a-related.junit.xml` |
+| MCPのquery/postfilter除外、Ctrl+Fの画像と本、Ready採用前の通知 | 上の関連実行で各新規テスト成功をJUnitでも確認 |
+| nextest、`--test search_metadata_e2e --test fts_tantivy_compat --test fts_tantivy_integrity` | 33件のうち32件成功。旧fixtureのアプリ再構築テスト1件は、単独openで自動wipeするという期待が誤っており失敗。単独openの拒否・原本保持→`IndexerManager::new_at` の共通ownerによる再構築へ直し、その1件を次行で再確認。run `25dcab65-485f-49b3-9c09-7506d3c8317d`、`target/v2a-integration.log` |
+| nextest、`--test fts_tantivy_compat -E 'test(=application_rebuilds_historical_fixture_without_caption_schema)'` | **1件成功**、exit 0。元の32件と合わせ統合33件の成功を確認。test-onlyの修正なので元の32件は再実行しない。run `5200d377-48bf-4148-9a08-6ae2bd7e2715`、`target/v2a-compat-recheck.log` |
+| `scripts/build-dev.ps1 -PreserveRuntime` | **exit 0**。最終ソースの通常feature、dev-runtime。core 2分49秒、remote 0.53秒、EPUB worker 0.52秒、MCP adapter 0.36秒。PE検査 runtime=4 / pe=4成功。`target/v2a-build-dev.log`、`target/vcrt-pe-reports/dev-runtime.json`。portableは有効にせず、製品は起動していない |
+| UIグリフ / 製品カード長 / 差分空白 | `python scripts/check_ui_glyphs.py` 0件、`python scripts/check_site_cards.py` 50件・超過0、`git diff --check` exit 0 |
+
+関連実行の2失敗は既存の
+`agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry` と
+`agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`。
+前者は名前付きパイプのclient open（`pipe.rs`）、後者はfixture serverの作成で
+Windowsエラー5 `PermissionDenied`。後者はadapter実行体の取得・起動より前に停止した。
+この環境でのIPC実transport検証は未完了とし、権限を変更した再実行や製品起動は行わない。
+新規MCP検索ハンドラテストは成功しており、これら2件を成功扱いにはしていない。
+
+初回の焦点実行（113件）は109成功・4失敗だった。4件は空のvisible_text/keywordsを連結して
+末尾空白が入ったことによる新規期待値との差で、空欄を連結から除き、上の115件で再確認した。
+型確認時の欄・引数・テスト配置の追従漏れも実行前に修正した。正常終了していないコンパイルを
+成功証拠には含めない。
+
+最終整形は引数なしの `cargo fmt`。本体lib全件は設計担当が実行する。
+実装とは別の担当が差分を点検し、起動採用前の通知とDB読取失敗の2経路を指摘したため、
+§21.16.1の修正と回帰を追加した。その後の追加指摘はなかった。設計担当の検収・実機確認は未実施。
+製品起動・外部通信・`G:\home\vlm-eval\` の参照・コミットは行っていない。
+
+#### 21.16.4 独立レビュー指摘への対応（基準 `072be6e76`）
+
+V2a実装は設計担当が `072be6e76` にコミットした。本追記の修正はその後の未コミット差分。
+設計担当が妥当と判断した独立レビューのP2 1件・P3 1件へ、指定された方針で対応する。
+
+- **P2：DB初回作成と読取の競合**。`Connection::open` が空ファイルを作ってから、schema初期化の
+  transactionがcommitするまでの間にも、従来のreadonly openは接続を公開していた。その接続の
+  `get` が `no such table: captions` となり、通常の初回作成を読取障害と誤認して全索引の
+  作り直しを予約し得た。
+  `CaptionDb::open_read_only` が接続後に `PRAGMA user_version` を読み、0なら `Ok(None)`、
+  1なら接続を公開、未知の版ならエラーを返す境界へ変更した。`ensure_schema` は表・triggerと
+  `user_version = 1` を既に同じtransactionでcommitしていることを確認し、その契約をコメントした。
+  ingestは既存の `Ok(None)` として扱い、次の反映・走査開始時に開き直す。表示workerとCtrl+Fも
+  同じreadonly境界を使う。新しい待機・retry・状態・索引版上げは加えない。
+- 回帰は、空ファイル、表のない版0のSQLite DB、未commitのschema版を別接続から読む順序、
+  初期化後の公開、未知の版の拒否と原本不変を確認する。ingestは空ファイル／版0 DBの両方で
+  読取エラー・通知・再構築予約がなく、初期化後の再openで説明文を索引へ入れられることを確認する。
+- **P3：EPUBの記述**。`search-architecture.md` §4.1のCtrl+Fについて、ファイル名と保存済みの
+  AI説明を検索し、EPUB内部のタイトル・著者と生成PDFのInfo辞書は検索しない記述へそろえた。
+
+設計担当から受領した修正前の検証結果：本体lib 15,553件中6件が失敗し、スマートフォルダ遷移5件と
+scroll_661 1件の待機timeout（機械混雑時）との報告。6件はいずれも単独で成功し、こちらの環境で
+PermissionDeniedになった既存IPC 2件も、設計担当の全件実行では成功した。これは設計担当の観測であり、
+今回こちらで全件・IPC・当該6件を再実行した結果ではない。
+
+今回の検証は通常feature、`--offline` / `CARGO_NET_OFFLINE=true`。変更コードを固定して実行した。
+
+| 確認 | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/ai_caption_db::\|ingest_worker::\|caption_display\|caption_reflection\|caption_read_failure/)' --no-fail-fast` | **71件成功、失敗0、exit 0**。run `dbdd249a-b1ca-4095-b30d-10028ca770a2`、`target/v2a-review-fixes-tests.log` / `target/v2a-review-fixes-tests.junit.xml` |
+| `scripts/build-dev.ps1 -PreserveRuntime` | **exit 0**、通常feature / dev-runtime。core・remote・EPUB worker・MCP adapter成功、PE検査 runtime=4 / pe=4成功。`target/v2a-review-fixes-build.log`、`target/vcrt-pe-reports/dev-runtime.json`。製品は起動していない |
+| 差分空白・最終整形 | `git diff --check`成功、最後に引数なしの `cargo fmt`。UI文字列は変更していない |
+
+P2・P3の対応を完了し、今回の範囲の未解決点はない。実機起動は未実施。製品起動・外部通信・
+評価用フォルダ参照・コミットは行っていない。
+
+#### 21.16.5 独立レビュー2回目のP2対応（基準 `47232d8d9`）
+
+前回の修正は設計担当が `47232d8d9` にコミットし、独立再レビューで前回のP2・P3は閉じた。
+今回のP2は、反映開始時のreadonly接続が版0で `Ok(None)` になった後、別接続で初期化と説明文の
+保存がcommitされ、pending側だけがその行を拾える順序。従来は接続なしのingestが説明文なしで
+成功し、行をACKしてしまった。
+
+- `IngestSession::reopen_caption_connection` は、既存の接続状態が `Ok(Some)` かどうかを戻り値で
+  返す。新しい保持状態は追加しない。
+- `reflect_captions` は公開済みreaderを確保できた回だけ、別の書き込み接続を開いて反映待ちを
+  読む。未公開・失敗の回は、その直後にwriterがcommitしていても、pendingの問い合わせ・ingest・
+  ACKを行わず終了する。通常走査の「説明文なしでも文書を作る」挙動は変更しない。
+- `seen` の規則は変更しない。世代 `e` は反映前に読み、終了後もその値を採用する。
+  版0を読んだ後に行を公開した書き手はcommit後に世代を進めるため、その更新を今回の `seen = e`
+  が消費することはなく、既存の次の起床で再open・反映される。retry・待機・通知用状態は足さない。
+- 回帰ではtest-onlyのhookで、再open直後からpending読取前の間にschema初期化・説明文保存・
+  世代更新を挟む。初回は未ACK・文書未作成・署名未更新・再構築予約なし、次の世代では説明文入りの
+  文書とACKがそろうことを確認する。open失敗時に読み取れるpending行があっても進めない回帰も追加した。
+
+今回の検証は通常feature、`--offline` / `CARGO_NET_OFFLINE=true`。変更コードを固定して実行した。
+
+| 確認 | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/ai_caption_db::\|ingest_worker::\|caption_display\|caption_reflection\|caption_read_failure\|caption_epoch/)' --no-fail-fast` | **75件成功、失敗0、exit 0**。run `d1e230fd-7c6f-4304-885c-2d53e461d154`、`target/v2a-review2-fixes-tests.log` / `target/v2a-review2-fixes-tests.junit.xml` |
+| `scripts/build-dev.ps1 -PreserveRuntime` | **exit 0**、通常feature / dev-runtime。core・remote・EPUB worker・MCP adapter成功、PE検査 runtime=4 / pe=4成功。`target/v2a-review2-fixes-build.log`、`target/vcrt-pe-reports/dev-runtime.json`。製品は起動していない |
+| 差分空白・最終整形 | `git diff --check`成功、最後に引数なしの `cargo fmt`。UI文字列は変更していない |
+
+今回のP2への実装対応を完了。実機起動は未実施。製品起動・外部通信・評価用フォルダ参照・
+コミットは行っていない。
+
+### 19.22 22 回目 (2026-11-03、同じ担当の続き、基準 `220cb5fb3`、V2 の設計)
+
+P2 6 件・P3 2 件。§21.15 に足した: 起動時に DB が無かった接続は次の反映・走査で開き直す (P2) / 走査の本の候補はディレクトリを先に判定する (P2) /
+Drill で本の直接の結果と検索の枝を区別し、本は実際のフォルダを開く (P2) / watcher のサイドカーの早い return が本の更新・削除を遮らない (P2) /
+表示の種類・EPUB を無視する設定の判定を保存済みの種類で行う (P2) / 「対応アーカイブを無視する」設定を検索にも効かせる (P2) /
+スマートフォルダは本文検索を持たない (前提の訂正、P3) / 集約の代表は PDF・EPUB を今どおり使う (P3)。
+キーの正規化・`OwnedRange` の区間・共有の世代番号・送り手の列挙・MCP の `Only` による除外は「問題なし」。
+
+### 19.23 23 回目 (2026-11-03、同じ担当の続き、基準 `4fa7242ad`)
+
+22 回目の 8 件はすべて閉じた。新しい指摘は無し。V2 の設計 (§21.15) はここで確定する。
+
+#### 21.16.6 検収 (設計担当、2026-11-03)
+
+- 実装担当の差分を設計担当が確かめ、`072be6e76` にコミットした。
+- 本体 lib 全件 (設計担当の環境、`072be6e76`): 15,553 件中 6 件が失敗 (スマートフォルダの遷移 5 件・scroll_661 1 件)。機械が混んでいてテスト内の待ちが時間切れになったもので、
+  6 件とも単独で成功。実装担当の環境で PermissionDenied になった IPC の 2 件は、この全件で成功した (実装担当の作業環境の制限による)。
+- 独立コードレビュー 1 回目 (基準 `072be6e76`): P2 1 件 (DB の初回作成の途中を読むと全索引の作り直しを予約する)・P3 1 件 (EPUB の記述)。`47232d8d9` で
+  `open_read_only` が版 0 を「まだ無い」とする境界にした (§21.16.4)。2 回目: 2 件は閉じ、新しい P2 1 件 (未公開の接続のまま反映済みにする)。`b78a0c77d` で
+  公開済みの接続を確保できた回だけ反映待ちを読むようにした (§21.16.5)。3 回目: 閉じ、新しい指摘は無し。
+- 修正後の 2 コミットは `ai_caption_db`・`indexer_supervisor`・`ingest_worker` に閉じ、関連 75 件は実装担当の環境で成功。本体 lib 全件は V2b の後にまとめて流す。
+- 実機での確認は未実施。
+
+### 21.17 V2b 実装記録（2026-11-03、検収・実機確認待ち）
+
+基準 `2262bca58`、`vlm-caption` の未コミット差分。正本は §21.15（独立設計レビュー
+§19.22・§19.23）。本節は実装担当の記録であり、独立コードレビュー・検収の判定ではない。
+
+#### 21.17.1 実装と判断
+
+- `caption_book_candidate` をFull・説明文反映・watcherで共有。実在するディレクトリを拡張子より
+  先に判定し、ZIP/CBZ・ArchiveFormatのRAR/CBR・7z/CB7・LZH/LHAとフォルダの `ok` 行だけを
+  `CandidateKind::Book(BookIndexKind::{Archive, Folder})` とする。署名が古い説明文も対象。
+  PDF/EPUBは説明文の有無によらず従来どおり載せる。
+- Fullはsessionの公開済みreadonly接続からOwnedRange内のokキーを1回の問い合わせで列挙。
+  共通判定で各キーの現在のstatusを再確認し、workerのI/O permitとActivityGateを通して候補に加える。
+  書庫は本体mtime/size、フォルダはmtime/size 0。説明文を消すと差分の削除対象にもなる。
+  同じ署名でも旧kindを保持しないよう、`RangeFileStamp`は既存kind列を読み、差分条件へ含めた。
+  走査指紋に `caption-books-v1` を追加し、INDEX_VERSIONは11のまま。
+- 本の文書はFilenameとAiCaptionだけ。IndexKindは書庫がZip、フォルダがFolder。
+  `fts_meta`も従来どおり作成/削除する。反映の世代・ACK・取消・batch・Tantivy First順序は維持。
+  watcherのjson/txt入口は兄弟画像の再取込を残し、ディレクトリまたは索引上の本なら本自身の更新/削除へ進む。
+- `search_page`からSTORED kindを読み、`GlobalHit.kind`へ渡す。UIでstat/DB読取を追加しない。
+  Flat/DrillはZipをZipFile/ConvertibleArchive、FolderをFolderへ項目化。旧ZIP内部結果のFlat除外は維持。
+  Drillの直接Folder本と子の検索枝が重なる場合は枝を優先する。
+  Aggregatedでは本も親フォルダ群の件数に含め、新しいZip/Folderだけを代表から外す。
+  画像・PDF/EPUB代表と既存動画/音声の扱いは維持。変換書庫もZIP同様の戻り経路を使う。
+- 種類選択Some(Zip)を「書庫・フォルダの本」とし、scopeは[Zip,Folder]へ展開。選択の型は維持。
+  Folderは表示種類を常に通し、EPUB無視はPdfのEPUBだけに適用する。
+  対応アーカイブ無視設定をCtrl+GとMCPのSearchScopeへ捕捉し、ZipのRAR/7z/LZHを件数上限前に除く。
+  ZIP/CBZとフォルダは残す。
+- MCP検索は保存済みkindから分類。非検索のitem_info/libraryの分類も共有してRAR等をArchiveへ揃える。
+  `Archive`/`Folder`絞込みは本の文書に当たる。V2aのAiCaption除外を候補検索・後置照合の双方で維持するため、
+  MCPの本の検索結果は名前で当たった場合だけ。EPUB/RAR等のページ指定範囲は広げない。
+- 新しいworker・通知queue・説明文由来の本を識別する保持フラグ・自動retryは追加しない。
+  まれなDB/索引失敗は既存reporterのログ・通知・次起動再構築を使い、原本を消さない。
+- 仕様書、検索設計/非同期文書、検索マニュアル、製品の機能一覧へU17と種類選択を反映した。
+  プライバシー文書の索引保存対象にも説明文のある書庫/フォルダの本を追加し、製品ページの端末内保存の説明と突き合わせた。
+  説明文のない本、既存のメディア結果、Ctrl+Sのコンテナ索引は変更しない。
+
+#### 21.17.2 枝集合の所有と設計担当の合意
+
+検索の枝集合は `GlobalSearchState` 一つが所有する。workerとfallbackの両方が評価絞り込み後に生成し、
+itemsの採用と同じ境界で置き換える。refresh/Drill退出の意図だけでは表示中の旧集合を消さず、新しい列の
+採用時に切り替える。Everything採用は空集合、物理一覧の `install_new_items_inner` は旧集合を破棄する。
+GlobalSearchStateはviewer context swap対象で、兄弟のinstallはmainの集合に影響しない。
+
+**閉じる・取り消しは検索投影の終了境界**。設計担当ClaudeCodeは追加指示で、当初の「項目と同時に捨てる」を
+「検索として解釈する間は同じ採用境界、終了境界では集合を捨てる」と確定した。
+`dismiss_global_search_with_origin`とsnapshotの`cancel_active_searches`で集合を消す。
+非同期復帰の読み込み中に旧itemsが残っても、active=falseなら共通判定は枝ではないと返し、
+従来どおり物理項目として開ける。旧項目の非表示・操作禁止・新pending・rollbackは加えない。
+終了回帰は、集合破棄と検索無効化に加え、旧Folder行が残り、物理openを受理できることを検査する。
+
+detachedの元の述語は「Drill中なら全Folderが枝」という仮定だったため、着手前に設計担当へ返した。
+ClaudeCodeとCodexは、採用済みの行と同じ所有境界の事実から意味を決める構造修正であり、症状パッチではないと
+明示合意した。detached述語に触れる変更は `detached_grid_item_open_plan` のFolder条件を
+`global_search_folder_is_branch`へ置き換える箇所だけ。viewport/window owner/配置/focus/待機は変えない。
+合意と範囲は `detached-rework-plan.md` §11にも記録。独立コードレビュー時の構造合意確認は設計担当が依頼する。
+
+#### 21.17.3 Folderを開く入口の監査
+
+| 入口 | 判定・維持する動作 |
+| --- | --- |
+| `ui_main`のFolder doubleclick | 共通別窓受付後、共通枝判定に当たる行だけdrill。直接本は既存の物理Folder open |
+| `detached_grid_item_open_plan` | 上記の共通枝判定。直接本は既存FolderCandidate、枝は従来受付へ返す |
+| 分類前の共通受付 `open_grid_item_in_detached_book_context_with_auto_fullscreen` | 拡張子付きFolderも非同期分類を始める前に共通枝判定。枝ならfalseで呼び出し元へ返し、直接本だけ従来の分類へ進む（独立レビューP2-1で補完） |
+| Enter | 共通別窓受付を通り、その後の`accept_grid_container_open`は従来どおり物理open。pointer-only drill契約を維持 |
+| gamepadの一覧決定 | 共通別窓受付後、従来どおり物理open。新たな枝drill化はしない |
+| 右クリック「ページを開く／一覧を開く」 | `open_grid_container_with_mode`。Folderは元から対象外であり変更しない |
+| F12 | 開いたメディアの`toggle_detached_viewer_mode`による表示先変更。Folder open planには到達せず変更不要 |
+
+当初は`global_search.drill.is_some()`でFolderの意味を決めるdoubleclickと別窓planの2箇所を監査したが、
+拡張子付きパスの非同期分類がplanを迂回する受付を見落としていた。独立レビューP2-1により上表を補完した。
+grepの残存箇所は、ui_mainのアドレス欄可否/ツリー前後移動、appのCtrl+上下/評価tooltip、
+gamepad_inputのツリー/フォルダ前後移動2箇所、grid_parentの親可否、context_menuの検索面判定2箇所、
+page_overviewの親可否、ui_fullscreenのフォルダ前後移動。いずれもFolderを枝/直接本に分類する述語ではなく維持した。
+既存detached回帰の期待は保ち、手製Folder fixtureだけを実際の検索投影にそろえた。既存GlobalHit fixtureも
+PDF/EPUB・動画・音声・書庫/ZIPエントリそれぞれの種類へ追従した。
+
+#### 21.17.4 初回実装の検証と引き継ぎ
+
+通常feature、offline、基準 `2262bca58`からの未コミット差分で実施。検証中にソースを変えない。
+本体lib全件は依頼どおり設計担当へ残す。終了時の今回の変更はテストとコメント/文書のみのため、
+影響しない519件の検証と通常core checkを再利用し、確定した終了契約の回帰を絞って再実行した。
+先行のコンパイル時の型追従不足2件とパス表記比較のfixture不備1件は修正し、下表は修正後の結果。
+
+終了契約を確定した最終回帰5件と確認用buildは成功。今回の実装範囲に未解決の実装判断はない。
+この初回引き継ぎ時点では独立コードレビュー、検収、実機確認は未実施。
+その後の設計担当の全件・独立レビューと対応は §21.17.5。本体lib全件は設計担当が実施する。
+製品起動・外部通信・評価用フォルダ参照・commitは行っていない。
+
+
+| 対象・command | 結果と証拠 |
+| --- | --- |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/caption_books_share_scan\|caption_book_sidecar\|caption_book_kinds_drive\|search_items_classifies_and_filters_captioned_books\|search_items_captures_ignore_archives\|physical_archives_and_extension_like_folders/)' --no-fail-fast` | 6件成功、失敗0、exit 0。run `bf411bc9-4738-49af-bbd1-95e5be18437f`、`target/v2b-focused-tests-r3.log`、`target/v2b-focused-tests.junit.xml` |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/ai_caption_db::\|search_walker::\|search_watcher::\|indexer_supervisor::\|indexer_manager::\|ingest_worker::\|ingest_text::\|fts_index::\|fts_meta::\|fts_writer_dispatcher::\|global_search::\|global_search_ui::\|agent_ipc::\|file_type_visibility::\|caption_folder_book_and_search_branch\|caption_search_branch_projection/)' --test-threads 4 --no-fail-fast` | 519件中517件成功、2件失敗、exit 100。35.6秒。run `580d51e9-c45f-4c80-9412-d76d9e7b96ef`、`target/v2b-related-tests.log`、`target/v2b-related-tests.junit.xml` |
+| `cargo check --offline -p mimageviewer --bin mimageviewer-core` | 通常feature / dev profile、exit 0、47.2秒。警告あり。`target/v2b-core-check.log` |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/caption_drill_branch_identity_lives_with_installed_rows\|caption_drill_worker_adopts_branch_identity_with_rows\|caption_folder_book_and_search_branch\|caption_search_branch_projection\|folder_candidate_mode_matrix_has_one_loading_shell_entrypoint/)' --test-threads 4 --no-fail-fast` | 終了契約と採用/別窓受付の最終回帰5件成功、exit 0。run `62b751c7-8636-456c-b34d-6cea4a10e404`、`target/v2b-final-projection-tests.log`、`target/v2b-final-projection-tests.junit.xml` |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/folder_candidate_mode_matrix_has_one_loading_shell_entrypoint\|detached_plan_classifies_every_grid_item_kind\|detached_grid_archive_candidate_does_not_change_zip_pdf_descriptor_plans\|detached_collection_plans_carry_origin/)' --test-threads 4 --no-fail-fast` | 既存detached受付回帰4件成功、exit 0。run `f28d06fe-dbc8-493b-aecf-c3b179279547`、`target/v2b-detached-admission-tests.log`、`target/v2b-detached-admission-tests.junit.xml` |
+| `python scripts/check_site_cards.py` / `python scripts/check_ui_glyphs.py` | exit 0、50カード/超過0、危険なUIグリフ0件 |
+| `cargo fmt --check` | 最終回帰と同じソースでexit 0 |
+| `CARGO_NET_OFFLINE=true`で `.\scripts\build-dev.ps1 -PreserveRuntime` | 通常feature / dev-runtime、exit 0。core（6分13秒）・Remote・EPUB worker・MCP adapterの4本成功、PE検査runtime=4/pe=4成功。`target/v2b-build-dev.log`、`target/vcrt-pe-reports/dev-runtime.json`。製品は起動していない |
+| `git diff --check` / 最後に引数なし `cargo fmt` | 引き継ぎ時に実施 |
+
+失敗2件は `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`
+（`pipe.rs`の名前付きpipeへの接続）と `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`
+（fixture server準備）。どちらもWindows code 5 / PermissionDeniedであり、V2aの記録にある
+実装環境で失敗した既存2件と同名。変更のないIPC準備/接続の地点で失敗しており、今回の新規検索回帰は成功。
+設計担当から「設計担当の全件では成功しており、作業環境の制限としてそのまま記録してよい」との
+追加指示を受領。この環境で成功したとは扱わず、制限を回避する変更・同条件の再実行は行わない。
+
+確認用の起動はリポジトリルートから利用者が実行する：
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+通常の `%APPDATA%\mimageviewer` を使い、実際の設定/データを更新し得る。
+単一インスタンスmutexを共有するため、先にインストール版/トレイ常駐版を終了する。
+確認対象は、作成/取り込み済みの説明文で書庫とフォルダをCtrl+Gから見つけて本として開くこと、
+「書庫・フォルダの本」で絞れること、説明文削除後は結果から消えること、
+直接Folder本と子ヒットを持つ検索枝の開き分けおよび検索を閉じた後の従来のフォルダ操作。
+
+#### 21.17.5 独立レビューP2二件への対応（基準 `3012719a7`）
+
+設計担当がV2bを `3012719a7` にコミットした。設計担当の本体lib全件は15,571件中5件失敗したが、
+機械混雑時の時間切れ（10k/100k走査の性能1件を含む）であり、5件とも単独で成功したとの報告を受領。
+今回この全件を再実行した結果ではない。独立レビュー担当はdetached述語の変更を構造的修正とする判断に
+合意したと設計担当から報告された。設計担当が妥当と認めたP2二件を、次の方針で修正した。
+
+- **P2-1: 非同期分類前の意味の確定**。
+  当初の入口監査（本節の §21.17.3）では、`detached_grid_item_open_plan`とdoubleclickだけを数え、
+  `open_grid_item_in_detached_book_context_with_auto_fullscreen`が拡張子付きのパスを先に分類し、
+  Directoryの続きでplanを迂回してFolderCandidateを作る入口を見落としていた。
+  この迂回自体は基準以前にもあるが、V2bの共通判定への統合漏れである。
+  設計担当の指示どおり、共通受付で `GridItem::Folder`かつ`global_search_folder_is_branch`のときは、
+  分類を始めずfalseを返して呼び出し元へ委ねる。分類の続きから呼び出し元のdrillを再開できないので、
+  分類後に拒否する対策にはしない。新しい状態・待機・retry・window/viewport ownerは追加しない。
+  `album.epub`/`album.7z`の実フォルダについて、直接ヒット・子ヒットだけの枝・両者の重複を、
+  Enter/doubleclickが使う共通受付から検査する。枝は分類を開始せず、doubleclickは既存drill、
+  Enterは既存の物理openへ進む。直接本は実際の分類workerのDirectory完了を通して別窓のFolderCandidateに届く。
+  ここでもpointer-only drillの既存契約を変更しない。§11の記録と上表の監査入口も補完した。
+- **P2-2: 本の署名をサムネイルへ渡す**。
+  Flat/Drillで、並べ替え用には保持していた `GlobalHit::{mtime,file_size}` を直接の書庫・Folder本の
+  `image_metas`へ渡す。`fs_hit_thumbnail_meta`を共有し、ZIP/CBZ・変換書庫・直接Folder本だけが対象。
+  本の実sizeが不明ならNoneのままで、0を捏造しない。実size 0は有効なSomeとして保持する。
+  Folderの既存LoadRequestもmtime/sizeをそのまま引き継ぐことをソースと回帰で確認する。
+  画像/PDF/動画/音声、検索の枝、Aggregated代表と旧ZIPエントリのplaceholderは維持し、UIのstatは追加しない。
+  回帰はFlat/Drillのソート後も署名が行に追従すること、重複時に残る枝のplaceholderを確認する。
+  別の回帰ではRAR/7z/LZHの実ファイルと隔離した変換キャッシュを用意し、項目化→metadata→既存解決worker→
+  readonlyキャッシュ照合→サムネイル要求のcached ZIPと元署名まで通す。旧(0,0)では同じキャッシュが当たらないことも検査する。
+  検索再設計文書の「image_metasはすべてplaceholder」という記述も、U17の直接本の例外を反映した。
+
+通常feature / offline、`3012719a7`からの未コミット差分を固定して検証した。
+追加回帰3件と関連広域693件はすべて成功。本体lib全件は重複実行していない。
+本修正の独立再レビュー・検収・実機確認は未実施。製品起動・外部通信・禁止領域参照・commitは行っていない。
+
+| 検証・command | 結果と証拠 |
+| --- | --- |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/caption_extension_folder_branch_is_decided_before_detached_classification\|caption_book_thumbnail_stamps_follow_direct_hits_in_both_projections\|caption_search_book_stamps_reach_archive_cache_and_thumbnail_requests/)' --test-threads 3 --no-fail-fast` | 3件成功、exit 0。run `6b09ef20-eb1c-4748-a860-20db3493a234`、`target/v2b-review-fixes-focused.log` / `.junit.xml` |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/global_search_ui::\|detached\|folder_candidate\|converted_archive\|archive_cache::\|thumb_loader::\|caption_search_book_stamps/)' --test-threads 4 --no-fail-fast` | 693件成功、失敗0、exit 0（92.8秒）。run `3c083a85-1e5f-475f-9b85-c621ddfa16d9`、`target/v2b-review-fixes-related.log` / `.junit.xml` |
+| `cargo fmt --check` | exit 0、`target/v2b-review-fixes-fmt-check.log` |
+| `CARGO_NET_OFFLINE=true`で `.\scripts\build-dev.ps1 -PreserveRuntime` | 通常feature / dev-runtime、exit 0。core（2分47秒）・Remote・EPUB worker・MCP adapterの4本成功、PE検査runtime=4/pe=4成功。`target/v2b-review-fixes-build.log`、`target/vcrt-pe-reports/dev-runtime.json` |
+| `git diff --check` / 最後に引数なし `cargo fmt` | 引き継ぎ時に実施 |
+
+P2二件の対応を完了し、今回の範囲に未解決の実装判断はない。再レビュー・実機確認は未実施。
+UI文言の変更はない。確認用起動は §21.17.4 と同じ通常profileのコマンドを使う。
+確認する場面は、拡張子付きFolderの検索枝はdoubleclickでdrillへ進み、直接本は別窓で実フォルダを開くこと、
+変換キャッシュのあるRAR/7z/LZHの直接結果にFlat/Drillの両方で表紙を出すこと。
+
+#### 21.17.7 検収 (設計担当、2026-11-03)
+
+- 実装の途中で、実装担当が 2 回止めて判断を求めた。(1) detached の述語 `detached_grid_item_open_plan` の Folder の判定を、採用済みの枝の集合による共通の判定へ置き換えること。
+  設計担当は「症状パッチではなく構造的修正である」に合意した (§21.17.4)。(2) 検索を閉じた後に残る旧項目の扱い。閉じる・取り消す時点を検索の投影の終わりとし、
+  残った項目は今と同じく物理の項目として扱う (旧項目の非表示・操作の禁止は足さない)。
+- 差分を設計担当が確かめ、`3012719a7` にコミットした。本体 lib 全件 (設計担当の環境、`3012719a7`): 15,571 件中 5 件が失敗 (コレクションの戻り 2 件・リモートの起動 2 件・
+  10k/100k の走査の性能 1 件の時間切れ)。機械が混んでいたためで、5 件とも単独で成功 (性能のテストは単独で 141 秒)。
+- 独立コードレビュー 1 回目 (基準 `3012719a7`): **レビュー担当も detached の述語の変更が構造的修正であることに合意** (CLAUDE.md の Detached viewer のルールの条件 2 を満たす)。
+  P2 2 件 (非同期の分類を経由する detached の受付が枝の判定を迂回する・検索の行の署名が 0 で変換済み書庫の表紙を解決できない)。`56927088a` で対応した。
+  2 回目: 2 件とも閉じ、新しい指摘は無し。構造的修正への合意も維持。
+- 本体 lib 全件は、V2a・V2b の修正をすべて含めた状態で流し直す (下に追記)。
+- 実機での確認は未実施。
+- 本体 lib 全件 (設計担当の環境、`183dce6f3`、V2a・V2b の修正をすべて含む): **15,574 件すべて成功** (828 秒)。
+
+### 21.18 V3 の設計 (2026-11-03)
+
+§10 (MCP との関係)・U2 (既定 OFF)・U13 (ON なら検索と `get_item_info` の両方で使う) を、コードを確かめて具体化する。
+着手前に `mcp-trial` の新しい 2 コミット (ツールの説明文・文書) を `vlm-caption` へ取り込んだ (`baa3aa3b6`)。MCP 担当のセッションは止まっており、
+`agent_ipc` と `crates/mcp-server` を並行して触る作業は無い。V3 で変えた点は `docs/mcp-integration-plan.md` (§5.6・§15.2) にも書き、MCP 担当へ引き継ぐ。
+
+#### 21.18.1 コードで確かめた前提
+
+- 許可は `settings.rs` の `agent_level`・`agent_show_thumbnails`・`agent_show_gps` (既定は Disabled・false・false)。`settings_db` の kv に保存し、`save_full` の commit の後、
+  3 つをまとめた snapshot が変わったときだけ、プロセス全体の許可の版 (epoch) を進める。DB を開き直したときも新しい版を取る。
+- 要求ごとに、受け付けたときの `(PermissionSnapshot, epoch)` (`granted`) を取り、snapshot は `ReadContext` に、組は `ReplyPolicy::Read(granted)` に渡す
+  (`work.rs`)。応答を送る直前の `Reply::wire` で今の値と比べ、違えば `PermissionChanged` で答える (連携全体が無効になった場合は `Disabled`)。
+  (独立レビュー 24 回目 P3 で前提を訂正した。`ReadContext` が持つのは snapshot だけで、版は持たない。)
+  この検査は 1 つの要求の受付から応答までで、ページ送りの続き (`Cursor { version, tool, args_digest, returned }`、`list_folder` は `FolderCursor`) は版を持たない。
+- `PermissionSnapshot` は外部の adapter (`crates/mcp-server`) へ `miv_status` の応答で渡る。adapter はツールの一覧をこの snapshot から作る (縮小画像だけがツールの増減に効く)。
+  `miv_status` と `get_item_info` の出力の schema は手書きで、`additionalProperties: false`・全欄必須。
+- `AGENT_PROTOCOL_VERSION` は 2 で完全一致の検査。MCP 対応は v5 の未リリースの機能で、core と adapter は同じビルドで配られる。
+- `get_item_info` は読み取りの worker で、項目ごとに `TagsDb`・`RatingDb` を読み取り専用で開く (`enrich`)。部分の指定 (PDF の `page_N`・ZIP のエントリとディレクトリ) では、
+  外側の本の情報を `container_*` に入れる。撮影位置は `project_exif(.., permission.gps)` で、許可が無ければ値を `null` にする。
+- `search_items` は V2a で、検索対象から `AiCaption` を常に外している (V3 の許可が無い間の扱い)。
+- 「AI に見せる範囲」の画面 (`ui_dialogs/agent_integration.rs`) は即時に反映する独立の窓で、3 欄 (「AI に見せるもの」「見せないもの」「AI に許す操作」) を選択から作る。
+  設定の検索の索引・設定の移行の除外・環境設定の OK で値を写す処理 (`preferences.rs`) にも、許可の欄が列挙されている。
+
+#### 21.18.2 作るもの
+
+1. **許可の欄**:
+   - `settings.rs` に `agent_show_ai_captions: bool` を足す (`#[serde(default)]`、既定 false)。
+   - `settings_db` の kv に `agent_show_ai_captions` を足し、`read_agent_permission`・snapshot の比較・版の進め方を他の 2 つと同じにする。
+   - 設定の移行からは除外する (`settings_transfer.rs`)。環境設定の OK で今の値を写す処理 (`preferences.rs`) にも足す。
+   - 未リリースなので移行は要らない。kv が無ければ false。
+2. **`PermissionSnapshot` に `ai_captions: bool`** (`#[serde(default)]`) を足す。
+   - `AGENT_PROTOCOL_VERSION` は上げない (未リリースで、core と adapter は同じビルドで配る)。
+   - `miv_status` の出力の schema の `permission` に `ai_captions` を必須で足す。
+   - ツールの一覧はこの欄では変わらない (新しいツールは足さない)。
+3. **`get_item_info` の欄**: `ItemInfo` に `ai_caption: CaptionField` と `container_ai_caption: Option<CaptionField>` を足す。
+   - `CaptionField` は `status` の付いた enum で、次の 3 つ。
+     - `present`: 値は `AiCaptionInfo`。中身は説明文・画像内の文字・検索語・モデル名・作成日時・`stale`。
+     - `none`: 許可はあるが `status = ok` の行が無い。対象外の種類も含む。
+     - `not_permitted`: 「AI 説明文」が OFF。
+   - 「無い」と「見せない」を区別するのは、AI アプリが利用者に許可の変更を案内できるようにするため。
+   - `InfoField` (全欄で共有) に状態を足すと他の欄の schema の意味が変わるので、別の型にする。
+   - 失敗の行 (`status = failed`) は `none` と同じ扱いにし、失敗の理由は返さない。
+   - **どの行を読むか**:
+     - 部分の指定が無い要求: 画像・PDF・EPUB・書庫・フォルダのパスで行を読み、`ai_caption` に入れる。キーは `CaptionDb::normalize_path` で、本の行のキーはそのパス (§6.7)。
+     - 部分の指定がある要求 (PDF のページ・ZIP のエントリとディレクトリ): `ai_caption` は `none` にする (ページ単位の説明文は v5 では作らない)。
+       外側の本のパスの行を `container_ai_caption` に入れる。部分の指定が無い要求の `container_ai_caption` は `null`。
+   - **`stale`**:
+     - 通常のファイルの画像は、行の署名と、すでに読んだファイルの metadata を比べて決める。
+     - 本 (書庫・PDF・EPUB・フォルダ) は `null` (判定しない) にする。本の古さには表紙の解決が要る (§21.13、固定表紙・変換済み書庫・App の設定)。
+       agent の読み取りの worker で同じ解決をすると、App の状態を写す経路が増える。§21.18.4 で判断した。
+   - **読み方**: `enrich` と同じく、項目ごとに `CaptionDb::open_read_only` で開いて `get` する (無い・版 0 は `none`)。許可が OFF なら開かない。
+     読めないときはまれな失敗として扱う。ログに残し、`none` にはせず、要求の失敗として返す (既存の DB の読み取りの失敗と同じ扱い)。
+   - **長さ**: 説明文は短い (V1 の上限の内) が、`MAX_ITEM_CHARS` を超える場合に備え、`trim_descriptions` の縮め方に説明文・画像内の文字を加える
+     (生成情報の後に縮める)。縮めたことは既存の印で示す。
+4. **`search_items`**: 検索対象を、受け付けたときの snapshot から作る。`ai_captions` が ON なら `SourceKind::ALL`、OFF なら V2a のとおり `AiCaption` を除く。
+   - 候補の問い合わせと後置の絞り込みの両方が、同じ対象を使う。
+   - 説明文のある書庫・フォルダの本 (V2b) は、OFF でも名前で当たれば出る (U17 の仕様のまま)。説明文のある書庫・フォルダだけが索引に載るので、
+     **OFF でも「説明文がある」ことは結果から推測できる**。OFF の保証は「説明文の内容で検索しない・内容を返さない」に絞り、存在が推測できることは
+     画面の説明と公開文書に書く (独立レビュー 24 回目 P3)。
+5. **ページ送りの続きに許可の版を入れる** (§10、独立レビュー 2 回目 P2):
+   - 対象は `Cursor` と `FolderCursor`。**受け付けたときの `granted` (snapshot と版の組) を `ReadContext` へ通し**、cursor を作るときも検査するときもその版を使う。途中で版だけを読み直さない
+     (snapshot と版の取得の時点が分かれるため。独立レビュー 24 回目 P3)。続きの要求の受付の版が cursor の版と違えば `PermissionChanged` で拒む
+     (連携全体が無効なら今どおり `Disabled`)。
+   - **受付順序の例外**: ツール自体の許可 (縮小画像) が外れた場合は、cursor の検査より前の受付で `Disabled` になる。
+     縮小画像 ON で取得した `get_thumbnail` の cursor でも、連携が有効なまま縮小画像だけ OFF にした続きはこの扱い。既存の拒否の動きは変えない。
+   - cursor の版 (`version`) を 3 に上げ、古い cursor は今どおり `BadRequest` (「最初からやり直してください」) にする。
+   - 説明文の許可だけでなく、すべての許可の変更に同じく効く。
+   - 許可の版はプロセスの中の番号なので、mIV を再起動すると同じ番号が出ることがある。その場合は続きが受け入れられるが、検索は今の許可で行うので、許可の無い内容は出ない。
+     起こるのは、件数のずれた続きを返すことだけ。まれで実害が小さいので割り切る (再起動を越えて続きを使う場面)。
+6. **画面** (`ui_dialogs/agent_integration.rs`):
+   - 「縮小画像を AI に見せる」「撮影位置 (GPS) を AI に見せる」の並びに、3 つ目として「AI 説明文を AI に見せる」を足す。
+   - 説明文は U13 のとおり、「ON にすると、AI アプリが AI 説明文 (説明文・画像内の文字・検索語) で検索でき、内容も受け取ります」。
+     画像内の文字には氏名・連絡先などが入り得ることも添える (privacy の記述と同じ)。
+   - 節の見出し「縮小画像・撮影位置」は、3 つを表す名前に改める。
+   - 3 欄の表示は選択から作る。ON なら「AI に見せるもの」、OFF なら「見せないもの」に「AI 説明文」を出す。
+   - **「AI に見せるもの」の AI 説明文には、表紙に固定した本文のページや ZIP の中の画像から読み取った文字も含むことを書く**。
+     固定の「見せないもの」の「PDF / ZIP の中身の本文」は、「PDF / ZIP の本文そのもの (ページの画像や文章を直接取り出すこと)」に限る表現に改める
+     (独立レビュー 24 回目 P2。本文のページを表紙に固定して説明文を作ると、そのページの文字を書き写した説明文が渡るため、今の表現と矛盾する)。
+     公開文書 (`manual/ai-integration.html` の「AI に見せるもの・見せないもの」の表と「渡しません」の段落) も同じ表現に揃える。
+   - 設定の検索の索引と UI スナップショット (`draw_agent_integration_snapshot_fixture`) も更新する。
+7. **adapter の文言** (`crates/mcp-server/src/schema.rs`):
+   - `get_item_info` の説明: 「AI 説明文は許可がある場合だけ返す」。
+   - `search_items` の説明: 「許可がある場合は AI 説明文でも検索する」。
+   - `miv_status` の説明: 許可に AI 説明文が入る。
+   - `get_item_info` の出力の schema に `ai_caption`・`container_ai_caption` を足す。discovery の大きさの上限 (40,000 字) を超えないことを既存のテストで確かめる。
+8. **公開文書・設計文書**:
+   - `manual/ai-integration.html` の「許可の範囲を選ぶ」と「AI に見せるもの・見せないもの」の表。
+   - `manual/settings.html` の該当の行。
+   - `manual/grid.html` の AI 説明文の節に、「許可すれば AI アプリから使える」ことを足す。
+   - `privacy.html` (日英) の「ネットワーク通信」の AI アプリ連携の項に、許可した場合は説明文が AI アプリへ渡ることを書く。
+   - 製品ページのカードは、該当があれば変える (150 字の上限)。
+   - `docs/mcp-integration-plan.md` の §5.6 (3 欄)・§15.2 (snapshot の欄と cursor の版) と、計画書の実装記録 §21.19。
+   - Remote IPC は変えない (§10)。MCP から作成ジョブを始めるツールは出さない (§10)。
+
+#### 21.18.3 状態を減らす検討
+
+- 許可は既存の snapshot と版の仕組みにそのまま 1 欄を足す。説明文のための別の許可の状態・別の版は作らない。
+- cursor の検査は、許可の版を cursor に入れるだけにする。サーバ側に cursor の記録は持たない。
+- 本の `stale` は判定しない (`null`)。agent の worker へ表紙の解決の環境を渡すと、App の設定・固定表紙の DB・変換済み書庫の状態を写す経路が増え、
+  その組み合わせのテストが要る。画像の古さは、すでに読んだ metadata だけで決まるので判定する。
+- まれな失敗 (DB を開けない) は割り切る (ログ + 要求の失敗)。
+
+#### 21.18.4 テスト
+
+- **許可の欄:** 保存・読み戻し、snapshot の比較と版の進め方 (変えたときだけ進む)、設定の移行からの除外、環境設定の OK での写し。
+- **`get_item_info`:**
+  - 次のそれぞれで、`ai_caption` / `container_ai_caption` の値が正しいこと: 画像・本・PDF のページ・ZIP のエントリ。
+  - ON / OFF・行の有無・失敗の行・古い画像・行の大きさの縮め方。
+  - OFF のとき DB を開かないこと。
+  - 受付と応答の間に OFF にすると `PermissionChanged` になること。
+- **`search_items`:**
+  - ON のとき、説明文だけの語で画像と本に当たること。
+  - OFF のとき当たらないこと (候補の問い合わせと後置の絞り込みの両方で)。
+- **cursor:**
+  - 1 ページ目の後に許可を変えると、続きが `PermissionChanged` になること (`list_folder` も)。
+  - 版 2 の cursor は `BadRequest` になること。
+- **adapter:**
+  - `miv_status` と `get_item_info` の schema への適合。
+  - discovery の大きさ。
+  - 許可の組み合わせのテストに `ai_captions` を足す。
+- **画面:** UI スナップショット。
+
+### 19.24 24 回目 (2026-11-03、同じ担当の続き、基準 `e28206659`、V3 の設計)
+
+1 回目はレビュー担当のモデルの混雑で途中で止まり、同じ担当の続きで最後まで報告を受けた。P2 1 件・P3 2 件。§21.18 に足した:
+「見せないもの」の固定の文言が、表紙に固定した本文のページから書き写した説明文と矛盾する (P2、表現を本文の直接の取り出しに限り、見せるものに明記) /
+OFF でも説明文の存在は検索結果から推測できる (P3、保証を内容に絞り、存在の推測を明記) / 受付の版は `ReadContext` ではなく `ReplyPolicy` に渡っている
+(P3、受付の `granted` を context へ通して cursor にも使う)。許可の保存・応答直前の再検査・検索の対象・cursor の方針・本の `stale: null`・`CaptionField`・
+protocol の据え置きは「問題なし」。
+
+### 19.25 25 回目 (2026-11-03、同じ担当の続き、基準 `e0c9a65fa`)
+
+24 回目の 3 件はすべて閉じた。新しい指摘は無し。V3 の設計 (§21.18) はここで確定する。
+
+### 21.19 V3 実装記録 (2026-11-03)
+
+基準 `efbbfa122`、`vlm-caption` の未コミット差分。正本は §21.18。本節は実装担当の記録であり、独立実装レビューや検収の判定ではない。
+利用者の指示に従いコミット・製品起動・外部通信・`G:\home\vlm-eval\` の参照は行わない。
+
+#### 21.19.1 実装と判断
+
+- `agent_show_ai_captions` は既定 false。settings の kv・snapshot 比較・commit 後の epoch・移行除外・環境設定確定時の現値の写しへ追加した。
+  MCP と説明文 DB は未リリースなので移行は追加せず、agent protocol は 2 を維持する。
+- `PermissionSnapshot.ai_captions` は serde の既定 false。tool の一覧は変えず、status の必須欄と読み取りの許可に加える。
+- `ItemInfo` の `CaptionField` は既存の `InfoField` と分離し、`present` / `none` / `not_permitted`。
+  値は `AiCaptionInfo { caption: TextValue, visible_text: TextValue, keywords, model, created_at, stale }`。
+  部分の指定がなければそのパス、あれば外側の本のパスを `CaptionDb::normalize_path` で読む。
+  PDF ページ・ZIP 内画像・ZIP 内ディレクトリの項目自身にはページ単位の説明文を付けない。部分の指定の無い container 欄は `null`。
+  OFF の欄は `not_permitted` で DB を開かず、対象外の種類と failed 行は `none`。未作成・版 0 も `none`。
+  DB 読取失敗はログと要求の失敗にし、元 DB を消さない。全て既存の読み取り worker 内で実行する。
+- 画像の `stale` は既に読んだ metadata と署名の比較。本は設計どおり `null` とし、表紙解決や App 状態の写しを追加しない。
+  生成情報を先に縮め、その後説明文・画像内の文字を縮める。`TextValue.truncated` を付け、検索語・モデル名・識別は保持する。
+- `search_items` は受付 snapshot から `SearchTarget` を作り、候補検索と STORED 後置照合の両方で共用する。
+  OFF でも名前に当たる説明文付きの本を出す既存仕様を維持し、存在の推測を画面・公開文書へ明記した。
+- `ReadContext` は受付の `(PermissionSnapshot, epoch)` を一組で保持する。`Cursor` と `FolderCursor` は版 3 と受付の epoch を持つ。
+  検索・タグ・コレクション・ライブラリ・項目情報・縮小画像・フォルダの作成と検査を同じ版に接続し、途中で版を読み直さない。
+  許可変更は `PermissionChanged`、旧 cursor は `BadRequest`。無効時の `Disabled` と応答直前の再照合は維持する。
+- 3 つ目のチェック・説明・3 欄・設定検索・fixture を更新。固定表紙にした本文ページや ZIP 画像の文字を含む旨と、本文そのものの直接取り出しを分けた。
+  manual 3 ページ・privacy 日英・製品ページのカードと「安心して使えます」を合わせた。
+- adapter は専用の CaptionField schema と必須欄を追加。discovery の既存上限を維持するため、同値な nullable 表現とローカル `$defs` で重複を減らした。
+  既存許可・tool の一覧・Remote IPC・MCP から生成を開始できない仕様は維持する。
+
+#### 21.19.2 検証
+
+通常 feature / test profile、未コミット差分に対して実装担当が実行。製品の起動・実データでの操作は行っていない。
+
+| 検査 | 結果・証跡 |
+| --- | --- |
+| `cargo check --offline -p mimageviewer --bin mimageviewer-core` | exit 0 |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/^agent_ipc::/)' --no-fail-fast` | 161 件中 158 成功、3 失敗。2 件は既知の名前付きパイプ OS 5 (`PermissionDenied`)、残る 1 件は下記の test-only 補完で成功。`target/v3-agent-tests.log` |
+| `favorite_deadline_returns_completed_prefix_before_blocked_next_row_finishes` の焦点再実行 | exit 0、1 成功。新しい cursor 検査引数に固定値 0 を渡した fixture を、実際の受付の epoch に合わせた。製品コードの変更は無し。`target/v3-settings-ui/favorite-deadline-final.log` |
+| 設定・UI・環境設定の写し・設定移行・検索索引の焦点 nextest | 90 件中 89 成功、全設定欄の件数の固定期待値 1 件が不一致。新欄を含む 483 件 / 除外 330 件へ期待値だけを修正し、同テストの再実行で exit 0、1 成功。`target/v3-settings-ui/{focused,classification-final}.log` |
+| `cargo nextest run --offline -p mimageviewer-agent-ipc --no-fail-fast` | 16 件すべて成功。初回 `target/v3-wire-tests.log` (run `04225ab6-e6d9-4c62-a38a-f3c1b555d4e2`) は待機時 stderr のため PowerShell 外側が非ゼロだったが、通常出力で最終再確認し exit 0 / 16 成功 (run `69ca0bfe-5a17-47c7-8002-d41538e90a38`) |
+| `cargo nextest run --offline -p mimageviewer-mcp --no-fail-fast` | 67 件中 65 成功、既知のパイプ OS 5 が 2 件。tool 出力の run `f1f2564f-c82a-43e2-9f71-06ab278a5060`。schema / discovery の焦点 12 件も成功 (run `9720b2ee-885e-4b1b-9e76-489f22d47e1c`) |
+| `UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --test ui_snapshot agent_integration_window_` | exit 0、既存 10 枚更新・全枚目視。更新指定なしの同じ比較も 10 件成功。`target/v3-settings-ui/{snapshot-update,snapshot-final}.log` |
+| `python scripts/check_ui_glyphs.py` / `python scripts/check_site_cards.py` | 危険な字形 0、50 カード中超過 0 |
+
+新規回帰は、画像・本・PDF ページ・ZIP 内画像とディレクトリ、ON/OFF・未作成/版 0・failed 行・古い画像・本文の縮小、
+OFF 時の破損 DB 非読取、読取エラーで原本を保持すること、内容が準備された後の許可変更による応答の拒否、
+ON の説明文検索と OFF の候補/後置照合、すべての許可の変更で検索/フォルダ cursor を失効すること、旧 cursor、schema と一覧不変を含む。
+PDF ページの caption 所有は共通の enrichment 境界を直接検査し、caption のためだけに PDF helper を起動しない。
+
+PNG は 10 枚合計 2,615,952 bytes (増分 502,030)。Light/Dark の説明と 3 欄は読め、列や scrollbar の重なり無し。
+小画面・100%/200% の末尾到達性と checkbox geometry は既存の headless 回帰で確認した。
+
+別 context の読み取り専用の実装レビューでは対応が必要な指摘は無かった (実行検証は本表の担当結果を再利用)。設計担当の検収とは区別する。
+本体 lib 全件は依頼どおり設計担当へ引き継ぐ。OS 5 のパイプ 4 件は sandbox 外での確認が残る。
+
+`CARGO_NET_OFFLINE=true` で `.\scripts\build-dev.ps1` を通常 feature / `dev-runtime` profile (portable 無効) で実行し exit 0。
+core (4 分 08 秒)、Remote、EPUB 変換 worker、MCP adapter を揃え、VCRT の PE 検査も runtime=4 / pe=4 で成功した。
+ログは `target/v3-build-dev.log`。生成物をエージェントは起動していない。
+`cargo fmt` (引数無し) と `cargo fmt --check`、`git diff --check` は成功。
+一括編集で触れたものの内容が HEAD と同じだった 14 ファイルは、内容一致を確認して checkout の改行だけを戻し、差分から除いた。
+最終ハンドオフ前にも引数無しの `cargo fmt` を行う。コミットは利用者の指示どおり行わない。
+
+確認する場合はインストール版・常駐版を終了し、利用者自身がリポジトリのルートから次を実行する。
+通常の `%APPDATA%\mimageviewer` を使うため、実際の設定・データを更新し得る。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+既存の説明文がある画像・本で、AI 連携の説明文チェックの ON/OFF、説明文だけの語による検索と項目情報、
+許可変更後の続きの取り直しを確認する。本体 lib 全件・sandbox 外の IPC・実アプリでの確認と検収は設計担当へ引き継ぐ。
+
+#### 21.19.3 独立レビュー P3 対応 (基準 `6e1a8ff79`)
+
+設計担当の判断に従い、縮小画像の許可を取り消した `get_thumbnail` の続きが、cursor の検査より前の受付で `Disabled` になる既存の順序を維持した。
+§21.18.2 の 5 と MCP 計画 §15.2 に、ツール自体の許可が外れた場合の例外を明記。製品コードは変更していない。
+
+回帰は既存の読み取り worker fixture と実際の `Connection::request` を使う。縮小画像 ON の要求から受付の版を持つ cursor を得て、
+同じ版では cursor の検査に通ることを確認してから縮小画像だけ OFF にする。連携は ReadOnly のまま、cursor 自体の版の検査は `PermissionChanged` になるが、
+続きの要求は worker を起動せず受付で `Disabled` になり、読み取り回数も増えないことを検査する。実画像のデコードや製品起動は行わない。
+
+通常 feature / test profile、未コミット差分で次の関連 3 件だけを実行し、exit 0 / 3 成功 / 15,647 除外。
+コンパイル 2 分 54 秒、テスト 0.291 秒。run `7fbce432-c94d-45a5-8e1a-7894440603de`、ログは `target/v3-p3-thumbnail-cursor.log`。
+追加の受付順序回帰と、既存の入力 offset 継続・画像/metadata 予算による cursor 継続の回帰が通った。
+
+```powershell
+cargo nextest run --offline -p mimageviewer --lib -E 'test(=agent_ipc::media_read_tests::thumbnail_cursor_revocation_is_disabled_at_admission_before_epoch_validation) | test(=agent_ipc::thumbnail::tests::continuation_starts_at_input_offset_without_reopening_earlier_sources) | test(=agent_ipc::thumbnail::tests::image_and_metadata_budgets_keep_attachments_in_sync_and_cursor_advancing)' --no-fail-fast
+```
+
+最後に `cargo fmt` (引数無し) を実行。`git diff --check` も成功。コミットは行わない。
+test-only / 文書のみの変更のため、依頼どおり確認用ビルド・本体 lib 全件・MCP/agent-ipc 全件・UI snapshot は再実行しない。
+設計担当から報告された `6e1a8ff79` の本体 lib 全件の失敗補完成功、MCP/agent-ipc 83 件 (名前付きパイプ込み)、UI snapshot 224 件の成功は、設計担当の観測として再利用する。
+
+#### 21.19.4 検収 (設計担当、2026-11-03)
+
+- 差分を設計担当が確かめ (「AI 連携」の窓のスナップショットを目視)、`6e1a8ff79` にコミットした。
+- 本体 lib 全件 (設計担当の環境、`6e1a8ff79`): 15,583 件中 19 件が失敗 (ほとんどがページめくり・比較表示の描画のテスト)。機械が混んでいたためで、単独で 17 件が成功し、
+  残る 2 件 (見開きの基準の分類待ち・スマートフォルダの PDF の履歴の巻き戻し) も 2 回目の単独で成功した。いずれも V3 の変更範囲の外。
+  `mimageviewer-mcp`・`mimageviewer-agent-ipc` の 83 件 (名前付きパイプの IPC を含む) と UI スナップショット 224 件はすべて成功。
+- 独立コードレビュー 1 回目 (基準 `6e1a8ff79`): **許可が OFF のときに説明文の内容が返る・検索に使われる経路は無し**。P3 1 件 (縮小画像の許可を外した後の cursor の
+  拒否が受付で `Disabled` になる例外の書き漏れ)。`ea333db9e` で文書とテストを足した (§21.19.3)。2 回目: 閉じ、新しい指摘は無し。
+- 修正は文書とテストだけなので、本体 lib 全件は流し直していない。
+- 実機 (AI アプリからの接続) での確認は未実施。
+
+## 22. 公開チュートリアルの追加 (2026-11-03)
+
+公開文書担当が [AI 説明文のチュートリアル](../htdocs/mimageviewer/manual/tut-ai-caption.html) を追加した。GPU 条件と 8 GB 機の案内、初回のモデル取得、一覧から画像・本の表紙を作成する順序、進捗と中止、情報パネルでの確認と一覧からの作り直し、Ctrl+G での本を含む検索、メタ情報の移行、既定 OFF の MCP 許可を扱う。対象・除外・未変換・パスワードの扱いは `caption_job.rs` / `caption_job_worker.rs`、取得と GPU 条件は `vlm_addon.rs`、UI 名は各描画箇所と `keymap.rs` / `settings.rs` に照合し、通信・保存は §13、worker のネットワーク機能を含めないビルド設定、`privacy.html` と製品ページの安心欄を突き合わせた。表示時の AI 処理の実ラベルは「高画質」なので、既存 `grid.html` の「高品質」も 1 か所訂正した。モデル名・容量は新しいページでは断定せず、取得画面とリファレンスへ案内する。既存分類「6. さらに使いこなす・最適化」にカードを置き、grid・fullscreen・search・settings・metadata-transfer・tut-search から各 1 か所リンクし、MCP チュートリアルとも相互リンクした。既存チュートリアルと同じ head・パンくず・幅広レイアウト・上下の戻るリンクを使用し、画像は使わない。文書だけの変更で、製品起動・ビルド・コミットはしていない。HTML 11 ページの相対リンク 514 件（ファイルと見出し）、新規ページの構造・meta / canonical / og / Twitter・ナビを検査し、`check_site_cards.py` は 50 件・違反 0、`gen-sitemap-xml.py --check` と `git diff --check` も成功した。
+
+### 21.20 V1〜V3 の実アプリ確認 (2026-11-03、観測者: サブ PC 担当)
+
+利用者の指示で、サブ PC (RTX 4060 Ti 16GB・Vulkan 1.4.341) の Claude Code 担当に実アプリでの確認を依頼した。設計担当はメイン PC で次を用意した
+(`C:\home\mimageviewer-subpc\vlm-v5\`): `target\dev-runtime` の確認用ビルド一式、ダウンロード済みと同じ形に組み立てたモデル (`addons\vlm`、ハッシュは公開の一覧と一致)、
+合成のテスト用の画像と本 (利用者の画像は使わない)、MCP の adapter へ stdio で直接問い合わせるスクリプト。mIV は `--data-dir C:\vlm-subpc-test\data` 付きでだけ起動した。
+モデルのダウンロードの経路そのものは確かめていない。
+
+サブ PC 担当の報告 (結果とスクリーンショットは `C:\home\mimageviewer-subpc\vlm-v5\results\`。設計担当はスクリーンショット 2 枚と MCP の結果ファイルを照らした):
+
+- 作成 (V1): 画像 3 枚・本 4 冊 (ZIP・PDF・フォルダ・名前が `.pdf` の実フォルダ) で作成でき、情報パネルの「AI 説明」「この本の AI 説明」に出た。
+  時間はログから: 押してから最初の 1 枚まで約 32 秒 (worker・モデル・GPU の確認を含む)、2 枚目から 1 枚あたり約 2.6〜2.9 秒。
+- 表紙の固定し直し (V1-4b): `cooking-notes` と実フォルダ `album.pdf` で「表紙が変わっています…作り直せます」が出て、作り直すと消え、説明文が新しい表紙の内容になった。
+- 検索 (V2): Ctrl+G の「AI 説明」で、ファイル名に無い語 (抹茶・野鳥・図鑑・料理) が画像・PDF・ZIP・フォルダの本に 1 件ずつ当たった。「書庫・フォルダの本」で 3 件 (PDF は外れる)。
+  Ctrl+F の「AI 説明」で該当の画像だけに絞られた。
+- MCP (V3): 3 欄は OFF で「見せないもの」、ON で「見せるもの」に AI 説明文 (表紙のページ等から読んだ文字を含む旨) が移った。OFF では 4 語とも検索 0 件・`ai_caption` は `not_permitted`、
+  ON では 1 件ずつ当たり `present`。ZIP の `002.png` と PDF の `page_1` は `ai_caption` が `none`、`container_ai_caption` に本の説明文。
+- 注: フォルダはチェックで選べない (既存の仕様、`GridItem::is_checkable`)。フォルダの本は 1 冊ずつ右クリックで作った。
+- 注: Windows PowerShell 5.1 から adapter を起動すると、標準入力の先頭に UTF-8 の BOM が入り、adapter が最初の行を `Parse error` にした。確認のスクリプトで
+  入力の文字コードを BOM なしにして回避した。実際の AI アプリは BOM を送らない見込みだが、adapter で先頭の BOM を読み飛ばすかは MCP 側の判断として残す。
+- 注 (既存の挙動): 検索の結果から ZIP・フォルダの本を開くと、PDF と同じく検索の中を進む表示 (Drill) で中のページが並ぶ。説明文の検索語に画像に無いもの (「日本国旗」) が混じる例があった (モデルの質)。

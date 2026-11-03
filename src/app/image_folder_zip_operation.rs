@@ -560,6 +560,10 @@ impl App {
                         page_state: true,
                         ..Default::default()
                     };
+                    // Folder ZIP uses its own chunked source adoption. Its
+                    // metadata allowlist does not copy captions; refresh the
+                    // displayed cover identity without publishing a DB change.
+                    self.caption_display.clear();
                     let mut requests = if matches!(op.exit, Exit::None) {
                         self.take_metadata_import_refresh_requests(changed, &Default::default())
                     } else {
@@ -1307,6 +1311,69 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn caption_folder_zip_refresh_poll_clears_shared_display() {
+        let mut app = setup_app_for_test();
+        let index_data = app.tmp.path().join("caption-index");
+        let caption_epoch = app.caption_epoch_for_test(&index_data);
+        let before = caption_epoch.load(std::sync::atomic::Ordering::Acquire);
+        let source = app.tmp.path().join("photos");
+        app.image_folder_zip_operation = Some(Box::new(Operation {
+            owner: app.projected_viewer_context_id(),
+            purpose: Purpose::FolderContext,
+            completion: Completion::Viewer,
+            destination: source.with_extension("zip"),
+            source,
+            control: Default::default(),
+            _lease: None,
+            exit: Exit::None,
+            last_wait: None,
+            phase: Phase::RefreshIndex {
+                result: Ok(()),
+                keys: Default::default(),
+                edits: Default::default(),
+            },
+        }));
+        app.caption_display.seed_for_test("c:/images/source.jpg");
+        app.caption_display
+            .seed_for_test("d:/images/other-viewer.jpg");
+        let epoch = app.caption_display.epoch_for_test();
+
+        // Folder ZIP has a dedicated chunked refresh path and never calls the
+        // generic metadata-import terminal that invalidates caption displays.
+        pump_until(&mut app, &egui::Context::default(), |app| {
+            !matches!(
+                app.image_folder_zip_operation.as_ref().unwrap().phase,
+                Phase::RefreshIndex { .. }
+            )
+        });
+        let Phase::Refresh { receiver, .. } =
+            &app.image_folder_zip_operation.as_ref().unwrap().phase
+        else {
+            panic!("folder ZIP must enter its dedicated source refresh");
+        };
+        // Finish the disposable worker before the fixture releases its data dir.
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !app.caption_display
+                .contains_for_test("c:/images/source.jpg")
+        );
+        assert!(
+            !app.caption_display
+                .contains_for_test("d:/images/other-viewer.jpg")
+        );
+        assert_ne!(app.caption_display.epoch_for_test(), epoch);
+        assert_eq!(
+            caption_epoch.load(std::sync::atomic::Ordering::Acquire),
+            before
+        );
     }
 
     fn finish_actual_worker(app: &mut App, ctx: &egui::Context, source: PathBuf, cancel: bool) {

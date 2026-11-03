@@ -63,6 +63,7 @@ def main():
             else:
                 cap = "(失敗: 説明文が出力されませんでした)"
             kws = r.get("keywords") or []
+            text = r.get("text") or ""
             meta = "%.1f 秒" % r["wall_s"] if "wall_s" in r else ""
             radios = "".join(
                 '<label><input type="radio" name="%s|%s" value="%s"> %s</label>'
@@ -71,8 +72,15 @@ def main():
             )
             cells.append(
                 '<div class="cell"><div class="lab">%s <span class="meta">%s</span></div>'
-                '<p>%s</p><p class="kw">%s</p><div class="rate">%s</div></div>'
-                % (shown, meta, html.escape(cap or ""), html.escape("、".join(map(str, kws))), radios)
+                '<p>%s</p>%s<p class="kw">%s</p><div class="rate">%s</div></div>'
+                % (
+                    shown,
+                    meta,
+                    html.escape(cap or ""),
+                    '<p class="txt">文字: %s</p>' % html.escape(text) if text else "",
+                    html.escape("、".join(map(str, kws))),
+                    radios,
+                )
             )
         parts.append(
             '<section><h2>%s</h2><div class="row"><img src="%s" loading="lazy">%s</div>'
@@ -92,7 +100,7 @@ h2{font-size:14px;color:var(--sub);margin:4px 0}
 img{max-width:360px;width:100%;height:auto;border-radius:4px}
 .cell{flex:1 1 240px;background:var(--card);border-radius:6px;padding:8px 10px}
 .lab{font-weight:600}.meta{font-weight:400;color:var(--sub);font-size:12px}
-.kw{color:var(--sub);font-size:13px}.rate label{margin-right:10px;white-space:nowrap}
+.kw{color:var(--sub);font-size:13px}.txt{font-size:13px;border-left:3px solid var(--line);padding-left:6px}.rate label{margin-right:10px;white-space:nowrap}
 textarea{width:100%;min-height:2.5em;margin-top:6px;background:var(--bg);color:var(--fg);border:1px solid var(--line)}
 #bar{position:fixed;bottom:0;left:0;right:0;background:var(--bg);border-top:1px solid var(--line);padding:8px 16px}
 </style></head><body><h1>VLM 比較</h1>

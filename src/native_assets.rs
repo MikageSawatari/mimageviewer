@@ -2,7 +2,7 @@
 //!
 //! ## 役割
 //!
-//! 通常ビルドは pdfium / onnxruntime / susie ワーカー / vst3-host / AI モデルを
+//! 通常ビルドは pdfium / onnxruntime / susie・VLM ワーカー / vst3-host / AI モデルを
 //! `include_bytes!` で exe に埋め込み、初回利用時に `data_dir` (= `%APPDATA%/mimageviewer`)
 //! へ展開して使う。ポータブルビルドでは **何も埋め込まず・展開せず**、これらの native
 //! ファイルを exe と同じディレクトリ (bundled root) に loose 配置したものから直接解決する。

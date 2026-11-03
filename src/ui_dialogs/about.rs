@@ -13,6 +13,7 @@ const ZLIB_LICENSE: &str = include_str!("../../ZLIB-LICENSE.txt");
 const RUST_DEFLATE_NOTICES: &str = include_str!("../../RUST-DEFLATE-NOTICES.txt");
 const EVERYTHING_IPC_NOTICE: &str = include_str!("../../EVERYTHING-IPC-NOTICE.txt");
 const LIBJPEG_TURBO_LICENSE: &str = include_str!("../../LIBJPEG-TURBO-LICENSE.txt");
+const VLM_WORKER_LICENSE: &str = include_str!("../../VLM-WORKER-LICENSE.txt");
 // HarmNet の推論と重みは core に埋め込むため、portable を含む全構成で表示する。
 const HARMNET_NOTICE: (&str, &str, &str) = (
     "EffeTune Note Spectrogram (HarmNet L)",
@@ -302,6 +303,11 @@ impl App {
                 draw_raw_license_snapshot_fixture(ui);
                 ui.separator();
                 draw_avif_license_snapshot_fixture(ui);
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("AI 説明文").strong());
+                ui.label("llama.cpp / ggml (MIT) を使用しています。");
+                draw_license_text(ui, "AI 説明文のライセンス・著作権表記 全文", "about_vlm_worker_license", VLM_WORKER_LICENSE);
+                ui.label("追加モデル: Qwen3.5-4B (Apache License 2.0)。モデルの LICENSE と NOTICE は環境設定の「AI 説明文」から保存先フォルダを開いて確認できます。");
 
                 draw_license_text(
                     ui,

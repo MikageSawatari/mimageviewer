@@ -34,6 +34,7 @@ fn thumbnail_prefix() -> Payload {
                 "get_thumbnail",
                 serde_json::json!(["fixture"]),
                 1,
+                0,
             )),
             truncated: true,
         },
@@ -49,7 +50,7 @@ fn immediate(command: Command, ctx: &ReadContext) -> Result<Payload, Command> {
         Command::Hello { version, .. } => Ok(Payload::Hello { version }),
         Command::Status => Ok(Payload::Status(StatusPayload {
             app_version: "fixture".into(),
-            permission: ctx.permission,
+            permission: ctx.granted.0,
             fts_ready: false,
             remote_active: false,
         })),
@@ -149,6 +150,93 @@ fn thumbnail_admission_and_wire_recheck_never_release_revoked_images() {
 }
 
 #[test]
+fn thumbnail_cursor_revocation_is_disabled_at_admission_before_epoch_validation() {
+    let mut fixture = Fixture::new();
+    set_thumbnails(true);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let worker_reads = reads.clone();
+    let args = serde_json::json!(["fixture"]);
+    let worker_args = args.clone();
+    Arc::get_mut(&mut fixture.handlers).unwrap().read_hooks = Some(Arc::new(ReadHooks {
+        now: Arc::new(Instant::now),
+        execute: Box::new(move |command, ctx| {
+            assert!(matches!(
+                command,
+                Command::GetThumbnail { cursor: None, .. }
+            ));
+            worker_reads.fetch_add(1, Ordering::AcqRel);
+            let Payload::Thumbnails(mut response) = thumbnail_prefix() else {
+                unreachable!()
+            };
+            response.page.cursor = Some(encode_cursor(
+                "get_thumbnail",
+                worker_args.clone(),
+                1,
+                ctx.granted.1,
+            ));
+            Ok(Payload::Thumbnails(response))
+        }),
+    }));
+    let connection = fixture.connection();
+    let Payload::Thumbnails(first) = fixture
+        .call(&connection, 1, thumbnail_command())
+        .result
+        .unwrap()
+    else {
+        panic!("expected thumbnail cursor")
+    };
+    let cursor = first.page.cursor.expect("fixture has another page");
+    assert_eq!(
+        decode_cursor(
+            Some(&cursor),
+            "get_thumbnail",
+            &args,
+            permission().unwrap().1
+        )
+        .unwrap(),
+        1
+    );
+
+    set_thumbnails(false);
+    let granted = permission().unwrap();
+    assert_eq!(granted.0.level, AgentLevel::ReadOnly);
+    assert_eq!(
+        decode_cursor(Some(&cursor), "get_thumbnail", &args, granted.1)
+            .unwrap_err()
+            .code,
+        ErrorCode::PermissionChanged
+    );
+    let Command::GetThumbnail {
+        items, long_side, ..
+    } = thumbnail_command()
+    else {
+        unreachable!()
+    };
+    let (send, recv) = crossbeam_channel::unbounded();
+    let worker = connection.request(
+        Request {
+            id: 2,
+            command: Command::GetThumbnail {
+                items,
+                long_side,
+                cursor: Some(cursor),
+            },
+        },
+        send,
+    );
+    assert!(
+        worker.is_none(),
+        "revoked tool must be rejected before starting work"
+    );
+    assert_eq!(
+        receive(&recv).wire().result.unwrap_err().code,
+        ErrorCode::Disabled
+    );
+    assert_eq!(reads.load(Ordering::Acquire), 1);
+    assert_eq!(fixture.handlers.active.load(Ordering::Acquire), 0);
+}
+
+#[test]
 fn media_deadline_keeps_both_slots_until_actual_reads_finish() {
     for has_prefix in [true, false] {
         let mut fixture = Fixture::new();
@@ -204,7 +292,8 @@ fn media_deadline_keeps_both_slots_until_actual_reads_finish() {
                 decode_cursor(
                     response.page.cursor.as_deref(),
                     "get_thumbnail",
-                    &serde_json::json!(["fixture"])
+                    &serde_json::json!(["fixture"]),
+                    0
                 )
                 .unwrap(),
                 1

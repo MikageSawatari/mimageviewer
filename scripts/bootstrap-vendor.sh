@@ -113,6 +113,19 @@ if [[ ${#missing_models[@]} -gt 0 ]]; then
     echo "    (= mIV を一度インストール / 起動して APPDATA に展開させた後に再実行する)"
 fi
 
+echo "============================================================"
+echo "[VLM worker backup]"
+if [[ -e "vendor/vlm-worker/mimageviewer-vlm.exe" ]]; then
+    echo "  Already present: vendor/vlm-worker/mimageviewer-vlm.exe"
+else
+    # Candidate copy -> source identity gate -> atomic publication. No CMake,
+    # model download, APPDATA import, or unverified backup publication here.
+    if ! powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+        -File "$SCRIPT_DIR/vlm-worker-identity.ps1" -RestoreBackupRepo "$REPO_ROOT"; then
+        echo "  VLM backup was not published. See scripts/setup-llama-cpp.ps1 and crates/vlm-worker/README.md."
+    fi
+fi
+
 # vst3-host exe: bootstrap の対象外 (上のヘッダコメント参照)
 echo "============================================================"
 echo "[VST3 host bridge]"

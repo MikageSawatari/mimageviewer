@@ -53,6 +53,7 @@ $releaseDir = Join-Path $workspaceTargetDir 'release'
 $portableTargetDir = Join-Path $repoRoot 'target-portable'
 . (Join-Path $scripts 'effetune-distribution.ps1')
 . (Join-Path $scripts 'vst3-host-identity.ps1')
+. (Join-Path $scripts 'vlm-worker-identity.ps1')
 . (Join-Path $scripts 'musicvideo-build-safety.ps1')
 Assert-MivMusicvideoBuildOutputsIdle -OutputPaths @(
     (Join-Path $workspaceTargetDir 'release\mimageviewer-musicvideo.exe'),
@@ -174,6 +175,8 @@ if ($LASTEXITCODE -ne 0) { throw ("[build-dist] EffeTune script tests failed (ex
 Write-Host '[build-dist]       VST3 host source-identity regression tests'
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-vst3-host-identity.ps1')
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] VST3 host identity tests failed (exit {0})" -f $LASTEXITCODE) }
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-vlm-worker-identity.ps1')
+if ($LASTEXITCODE -ne 0) { throw ("[build-dist] VLM worker identity tests failed (exit {0})" -f $LASTEXITCODE) }
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts 'test-vst3-host-vcrt.ps1')
 if ($LASTEXITCODE -ne 0) { throw ("[build-dist] VST3 host CRT preflight tests failed (exit {0})" -f $LASTEXITCODE) }
 foreach ($testScript in @('test-build-dev-safety.ps1', 'test-release-build-safety.ps1', 'test-musicvideo-build-safety.ps1', 'test-build-output-safety.ps1')) {
@@ -250,6 +253,7 @@ $finalRuntimePe = @(
 )
 Write-Host '[build-dist] (7/7) final PE dependency closure'
 Assert-MivVst3HostIdentity -RepoRoot $repoRoot
+Assert-MivVlmWorkerIdentity -RepoRoot $repoRoot
 Assert-MivEffetuneStage -RepoRoot $repoRoot -SourceRoot (Join-Path $repoRoot 'target\effetune-dist-source')
 & (Join-Path $scripts 'check-vcrt-pe-dependencies.ps1') `
     -InputPaths $finalRuntimePe -RequireCompanionRuntime `

@@ -119,7 +119,7 @@
       本アプリは利用者の PC 上で動作するデスクトップアプリケーションです。
       <strong>開発者が利用者の個人情報を収集・送信・販売することはありません。</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年11月1日</p>
+    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年11月3日</p>
   </section>
 
   <section>
@@ -142,20 +142,24 @@
       Everything 自身の検索履歴設定も変更しません。結果から開いたファイルの閲覧履歴、付けたタグや★、
       サムネイルキャッシュなどは通常どおり PC 内に保存します。検索のために外部へ検索語や結果を送信することはなく、
       リモート閲覧へ検索語や結果一覧を共有する機能もありません。詳しくは <a href="manual/search.html#ctrl-r">検索機能</a>をご覧ください。</p>
-    <p>音響調整を使用中は、再生中の曲名・アルバム名・アーティスト名と代表画像を、PC内の EffeTune に渡します。
-      絶対パスや URL は渡しません。この曲情報はプラグイン内の一時表示に使い、プリセットや履歴へ保存しません。</p>
+    <p>音響調整を使用中は、再生中の曲名・アルバム名・アーティスト名と代表画像を、PC 内の mIV Sound に渡します。
+      PC での再生では歌詞・曲の長さ・再生位置・再生速度・停止／再生の状態も渡します。
+      絶対パスや URL は渡しません。この曲情報は一時表示に使い、プリセットや履歴へ保存しません。</p>
     <p>音声予測 (Adaptive Prediction) の学習内容はメモリ内で使い、ファイルには保存しません。</p>
     <p>本アプリは、動作に必要な次のデータを利用者の PC に保存します。リモート閲覧を有効にした場合、再生位置などは利用者の端末から PC へ送られます。開発者のサーバーへ送信されることはありません。外出先との暗号化された通信は Tailscale の中継サーバーを経由することがあります。</p>
     <ul class="pink-list">
       <li>アプリの設定・表示状態、動画・音声の再生位置とファイルごとに選んだ音声トラック</li>
-      <li>AI 連携の許可の範囲、縮小画像と撮影位置を AI に見せるかの設定</li>
+      <li>AI 連携の許可の範囲、縮小画像・撮影位置・AI 説明文を AI に見せるかの設定</li>
       <li>本ごとの見開き1ページずらしの調整（記憶をOFFにしても保存済み調整は保持し、明示的に解除できます。メタ情報の移行で持ち運べます）</li>
-      <li>音響調整 (EffeTune) の調整状態、プリセット、設定、取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像</li>
+      <li>音響調整 (mIV Sound) の調整状態、プリセット、設定、取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像</li>
       <li>登録した SFZ 音源の名前と保存場所。サンプルファイルはコピーしません</li>
       <li>サムネイルキャッシュ（コレクションの一覧用も元フォルダ単位で保存・共有します。登録解除では削除せず、キャッシュ管理から削除できます。動画・音声の長さ、解像度、形式、読取可否の情報、動画の場面と音声波形の解析結果を含みます）</li>
       <li>EPUB を変換した閲覧用 PDF（キャッシュ管理画面でその場で削除できます。表示中など使用中の本は削除されず、理由が表示されます）</li>
       <li>タグ・レーティング・回転情報・読み込み履歴</li>
       <li>製本したページ画像と本棚の本の並び順（並び順は本棚ルートの <code>mimageviewer.book-order.json</code> に保存）</li>
+
+      <li>画像や本の表紙について作成・取り込み済みの AI 説明文、画像内の文字の書き写し、検索語（<code>ai_caption.db</code>）。写っている氏名や連絡先なども含むことがあります。アイテム索引を有効にしたお気に入りでは、画像・PDF・EPUB と説明文がある書庫・フォルダの本の保存済み説明文を、PC 内の全文索引にも保存します。メタ情報の移行で書き出した分は、対象フォルダにも保存されます</li>
+      <li>追加取得した AI 説明文のモデル（<code>addons\vlm\</code>）と、通常版で利用時に展開する実行用ファイル（<code>vlm\workers\</code>）。モデルを削除しても保存済みの説明文は残ります</li>
       <li>コレクションの名前・並び順・登録した元ファイルやフォルダのパス（<code>collection.db</code>）と、その世代バックアップ</li>
       <li>別バージョンを探すための索引（画像の保存場所・形式・大きさ・見た目を照合するための情報）</li>
       <li>PDF のパスワード（Windows の暗号化機能で暗号化して保存）</li>
@@ -190,15 +194,16 @@
       ネットワーク共有や同期フォルダを選ぶ場合は、その保存先や同期ソフトの動作に従います。
     </div>
     <div class="info-box">
-      音響調整 (EffeTune) のプリセット・設定は、別の <code>%APPDATA%\effetune\</code> または
-      <code>%APPDATA%\Frieve\EffeTunePlugin\</code> に保存されます。取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像は
-      <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> に置かれます。
-      SFZ 音源の登録は <code>%APPDATA%\Frieve\EffeTunePlugin\sfz-references.json</code> に名前と保存場所を記録します。
+      音響調整 (mIV Sound) のプリセット・設定は、mImageViewer のデータフォルダ内の
+      <code>effetune\plugin\</code> に保存します。SFZ 音源の登録もこの中の <code>sfz-references.json</code> に名前と保存場所を記録します。
+      取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像などの画面用データは
+      <code>effetune\webview\</code> に保存します。Windows または WebView2 の管理ポリシーで別の保存先が指定されている場合は、その設定に従います。
       サンプルは元のフォルダから読み取り、コピーしません。Remove は登録だけを削除し、元のファイルは削除しません。
-      mImageViewer のデータフォルダーを変更しても、これらの保存先は変わりません。
-      EffeTune 自身の保存データは mImageViewer のアンインストール時にも残ります。
-      プリセット・設定は他の EffeTune 製品とも共有されるため、自動では削除しません。
-      他の製品でも不要になったことを確認し、関連するアプリを終了してから手動で削除できます。
+      これらの保存先は mImageViewer のデータフォルダに従い、ほかの EffeTune 製品とは分かれています。
+      旧版の共通保存先から引き継ぐ場合はデータをコピーし、元のデータは残します。
+      従来の共通保存先の <code>%APPDATA%\effetune\</code>、<code>%APPDATA%\Frieve\EffeTunePlugin\</code>、
+      <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> は、追加した VST プラグインやほかの EffeTune 製品が使うことがあります。
+      それらでも不要になったことを確認し、関連するアプリを終了してから手動で削除できます。
       ポータブル版では音響調整を利用できません。
       次に起動したときに同じ調整で始めるための状態は、mImageViewer のデータフォルダーに保存します。
     </div>
@@ -270,14 +275,16 @@
     <p>本アプリでは、次のような通信が発生します。</p>
     <ul class="pink-list">
       <li><strong>更新確認</strong>: 新しいバージョンの有無を確認するため、配布元（GitHub）の公開リリース情報を取得します。通常の HTTP リクエストのみで、個人を特定する情報は送信しません。</li>
-      <li><strong>任意コンポーネントのダウンロード</strong>: 利用者が自ら選択した場合に限り、AI 高速化用コンポーネント等を配布元から取得します。</li>
+      <li><strong>任意コンポーネントのダウンロード</strong>: 利用者が自ら選択した場合に限り、AI 高速化用コンポーネント等を配布元から取得します。AI 説明文のモデルは、確認画面でダウンロードを選んだときだけ mImageViewer の GitHub Releases から取得します。説明文の作成のために画像や画像内の文字を送信しません。</li>
       <li><strong>音響調整の画面表示</strong>: 音響調整を開いている間、画面表示に使う Windows の機能 (WebView2) が、Microsoft に自身の更新を確認することがあります。曲名や画像は送信しません。</li>
       <li><strong>AI アプリとの連携（既定では無効）</strong>: 有効にすると、mImageViewer は同じ PC に登録した AI アプリへ PC 内で情報を渡します。
         <strong>受け取った情報を AI アプリがその提供元へ送ります。</strong>
         ファイルの場所（絶対パス）・名前・種類・大きさ・寸法・日時、タグ・★、コレクションと登録内容、本棚・閲覧履歴・ブックマーク・検索結果、
         撮影日時や機種などの EXIF、AI 生成画像のプロンプト・モデル名・生成条件などが対象です。
         状態確認では、連携の許可設定・検索の準備状態・リモート閲覧中かどうか・アプリの版も渡します。
-        縮小画像と EXIF の撮影位置（GPS）欄は、それぞれの設定を有効にした場合に渡します（どちらも既定では無効）。
+        縮小画像・EXIF の撮影位置（GPS）欄・AI 説明文は、それぞれの設定を有効にした場合に渡します（いずれも既定では無効）。
+        AI 説明文を許可すると、保存済みの説明文・画像内の文字・検索語で検索でき、ファイルや本の情報として内容も AI アプリへ渡ります。表紙に固定した本文のページや ZIP 内の画像から読み取った文字、氏名・連絡先なども含むことがあります。
+        許可しない場合はその内容で検索せず、内容も渡しません。ただし、説明文のある書庫・フォルダの本が名前での検索結果に出るため、説明文があることは推測できます。
         GPS 欄を無効にしても、ファイル名やプロンプトなどの文章に書かれた場所の情報を取り除くものではありません。
         <strong>この連携では、mImageViewer 自身がインターネットへ情報を送信せず、連携で渡す情報が mImageViewer の開発者へ送られることもありません。</strong>
         AI アプリと提供元による情報の扱いは、各社のプライバシーポリシーに従います。
@@ -308,10 +315,11 @@
   <section>
     <h2>AI 機能について</h2>
     <p>
-      mImageViewer 本体の画像 AI によるアップスケール・ノイズ除去・補完・自動判別などの処理は、
+      mImageViewer 本体の画像 AI によるアップスケール・ノイズ除去・補完・自動判別・AI 説明文の作成などの処理は、
       <strong>すべて利用者の PC 内（GPU）で実行</strong>されます。
       これらの本体の画像 AI 処理のために、画像を外部のサーバーへアップロードすることはありません。
     </p>
+    <p>AI 説明文は画像や本の表紙の内容と写っている文字を AI が文章にしたもので、正確とは限りません。利用者が明示的に作成を始めた対象だけを PC 内で処理し、説明文も PC 内に保存します。作成のために本の表紙を外部へ送信しません。<a href="manual/grid.html#ai-captions">作成方法を見る</a></p>
     <p>AI アプリとの連携は別の機能です。有効にすると、上の「ネットワーク通信」に記載した情報が AI アプリの提供元へ送られます。</p>
   </section>
 
@@ -363,7 +371,7 @@
       mImageViewer ("the App") respects your privacy. The App is a desktop application that
       runs on your PC. <strong>The developer does not collect, transmit, or sell your personal information.</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">Last updated: November 1, 2026</p>
+    <p style="font-size:0.85rem; color:#888;">Last updated: November 3, 2026</p>
   </section>
 
   <section>
@@ -383,19 +391,22 @@
     <p>The music video editor saves projects (<code>.mivmv.json</code>), MP4 videos, LRC lyrics, and PNG sequences to locations you choose.
       Projects record your edits and the locations of audio and images; they do not embed the source files.
       If you choose a network share or synced folder, access and syncing follow that location's or sync application's behavior.</p>
-    <p>While audio adjustment is in use, the App passes the current title, album, artist, and representative artwork to EffeTune on your PC.
-      It does not pass absolute paths or URLs. The plug-in uses this information for temporary display and does not save it in presets or history.</p>
+    <p>While audio adjustment is in use, the App passes the current title, album, artist, and representative artwork to mIV Sound on your PC.
+      For playback on the PC, it also passes lyrics, duration, playback position and speed, and the playing or paused state.
+      It does not pass absolute paths or URLs. This information is used for temporary display and is not saved in presets or history.</p>
     <p>Adaptive Prediction keeps learned data in memory and does not save it to files.</p>
     <p>The App stores the following data on your PC. When you enable remote viewing, playback progress and related information travel from your device to your PC. They are not sent to the developer's server. Encrypted traffic may pass through a Tailscale relay server when you connect from outside your home.</p>
     <ul class="pink-list">
       <li>Application settings and view state, video and audio playback positions, and the audio track selected for each file</li>
-      <li>The permission level for AI integration, and settings for showing reduced images and shooting locations to AI</li>
+      <li>The permission level for AI integration, and settings for showing reduced images, shooting locations, and AI captions to AI</li>
       <li>Per-book spread-pairing adjustments (saved adjustments remain when remembering is turned off and can be explicitly cleared or moved using metadata transfer)</li>
-      <li>EffeTune adjustment state, presets, configuration, imported IR files and measurements, and visualizer layouts and background images</li>
+      <li>mIV Sound adjustment state, presets, configuration, imported IR files and measurements, and visualizer layouts and background images</li>
       <li>Registered SFZ instrument names and locations. Sample files are not copied</li>
       <li>Thumbnail cache (including video frames and audio waveform analysis)</li>
       <li>PDFs converted from EPUBs for reading (you can delete them in the cache manager immediately; books in use remain and the App shows why they could not be deleted)</li>
       <li>Tags, ratings, rotation info, and reading history</li>
+      <li>Created or imported AI captions for images and book covers, transcribed visible text, and keywords (<code>ai_caption.db</code>). These may include names and contact details visible in images. For images, PDFs, EPUBs, and archive or folder books with saved captions in favorites with item indexing enabled, this content is also stored in the full-text index on your PC. Metadata exports also save this information in the selected folders</li>
+      <li>Downloaded AI caption models (<code>addons\vlm\</code>) and execution files extracted on use in the installer and single-exe editions (<code>vlm\workers\</code>). Removing a model does not delete saved captions</li>
       <li>Collections (list names, ordering, and the locations of the files and folders you add), and their rolling backups</li>
       <li>An index for finding alternate versions (image locations, formats, dimensions, and information used to compare their appearance)</li>
       <li>PDF passwords (encrypted using the Windows data-protection API)</li>
@@ -424,15 +435,17 @@
       See <a href="manual/music-video.html">Creating music videos</a> for instructions.
     </div>
     <div class="info-box">
-      EffeTune stores its presets and configuration separately in <code>%APPDATA%\effetune\</code> or
-      <code>%APPDATA%\Frieve\EffeTunePlugin\</code>. Imported IR files, measurements, and visualizer layouts and background images are stored in
-      <code>%APPDATA%\mimageviewer-vst3-host.exe\</code>, regardless of mImageViewer's data folder.
-      SFZ registration records instrument names and locations in <code>%APPDATA%\Frieve\EffeTunePlugin\sfz-references.json</code>.
+      mIV Sound stores presets and configuration in <code>effetune\plugin\</code> within mImageViewer's data folder.
+      SFZ registration records instrument names and locations in <code>sfz-references.json</code> in that folder.
+      Display data, including imported IR files, measurements, and visualizer layouts and background images, is stored in
+      <code>effetune\webview\</code>. A different location specified by Windows or WebView2 administrative policy takes precedence.
       Samples are read from their original folder and are not copied. Remove deletes only the reference, leaving the source files untouched.
-      EffeTune's own data remains when
-      mImageViewer is uninstalled. Presets and configuration are shared with other EffeTune products,
-      so they are not deleted automatically. Delete them manually only after checking that other products
-      no longer need them and closing the related apps. The portable edition does not provide EffeTune.
+      These locations follow mImageViewer's data folder and are separate from other EffeTune products.
+      When data is inherited from the shared locations used by older versions, it is copied and the originals remain.
+      The existing shared <code>%APPDATA%\effetune\</code>, <code>%APPDATA%\Frieve\EffeTunePlugin\</code>, and
+      <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> locations may still be used by VST plug-ins you add or other EffeTune products.
+      Delete them manually only after checking that those uses no longer need them and closing the related apps.
+      The portable edition does not provide mIV Sound.
       The state that lets the next launch start with the same adjustment is saved in mImageViewer's own data folder.
     </div>
     <div class="info-box">
@@ -490,7 +503,7 @@
     <p>Network activity includes the following:</p>
     <ul class="pink-list">
       <li><strong>Update check</strong>: to see whether a newer version exists, the App retrieves the public release information from the distribution source (GitHub). This is an ordinary HTTP request and includes no personally identifying information.</li>
-      <li><strong>Optional component download</strong>: only when you choose to, the App downloads optional components (such as AI acceleration packs) from the distribution source.</li>
+      <li><strong>Optional component download</strong>: only when you choose to, the App downloads optional components (such as AI acceleration packs) from the distribution source. AI caption models are downloaded from mImageViewer's GitHub Releases only after you confirm the download. Images and text within images are not sent for caption generation.</li>
       <li><strong>Audio adjustment display</strong>: while audio adjustment is open, the Windows feature used to display it (WebView2) may contact Microsoft to check for its own updates. It does not send song titles or artwork.</li>
       <li><strong>AI app integration (off by default)</strong>: when enabled, mImageViewer passes information locally to an AI app registered on the same PC.
         <strong>The AI app sends the information it receives to its provider.</strong>
@@ -498,7 +511,9 @@
         collections and their contents; bookshelves, viewing history, bookmarks and search results;
         EXIF such as shooting dates and camera models; and AI image generation information such as prompts, model names and generation settings.
         Status checks also return the integration permissions, search readiness, whether remote viewing is active, and the App version.
-        Reduced images and EXIF shooting-location (GPS) fields are passed when you enable their respective settings (both are off by default).
+        Reduced images, EXIF shooting-location (GPS) fields, and AI captions are passed when you enable their respective settings (all are off by default).
+        Allowing AI captions lets the AI app search saved descriptions, transcribed visible text, and keywords, and receive their contents as file or book information. This may include text from a body page or an image inside a ZIP chosen as the cover, including names and contact details.
+        Without this permission, their contents are neither searched nor passed to the AI app. However, archive or folder books with captions can appear in searches by name, so the existence of a caption may be inferred.
         Turning off GPS fields does not remove location information written in text such as filenames or prompts.
         <strong>For this integration, mImageViewer itself does not send information over the internet, and the information passed through the integration is not sent to mImageViewer's developer.</strong>
         The AI app and provider handle it under their privacy policies.
@@ -528,10 +543,11 @@
   <section>
     <h2>AI features</h2>
     <p>
-      Image upscaling, denoising, inpainting, and automatic classification in mImageViewer itself are performed
+      Image upscaling, denoising, inpainting, automatic classification, and AI caption generation in mImageViewer itself are performed
       <strong>entirely on your PC (GPU)</strong>. The App does not upload images to an external
       server for these built-in image AI operations.
     </p>
+    <p>AI captions describe images and book covers and transcribe visible text; they may be inaccurate. The App processes only targets for which you explicitly start caption generation, and saves captions on your PC. Book covers are not sent to external servers to generate captions. <a href="manual/grid.html#ai-captions">How to create captions</a></p>
     <p>AI app integration is a separate feature. When enabled, the information listed under "Network communication" above is sent to the AI app's provider.</p>
   </section>
 

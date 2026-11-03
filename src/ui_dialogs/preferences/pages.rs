@@ -7486,12 +7486,19 @@ pub(super) fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
     }
 }
 
+/// Cached VLM model/GPU view. All management work is dispatched by App.
+pub(super) fn page_ai_caption(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "ai-caption/manage", |ui, state| {
+        let (download, remove, folder) =
+            super::super::vlm_addon::draw_preferences(ui, &state.vlm_view);
+        state.vlm_download_requested |= download;
+        state.vlm_remove_requested |= remove;
+        state.vlm_folder_requested |= folder;
+    });
+}
+
 /// 編集用追加パック (オノマトペ向けフォント + 被写体分離モデル) の管理ページ。
-///
-/// 表示は `from_settings` で取ったスナップショット (`state.editing_addon_*`) を使う。
-/// 実際の DL / 削除 / フォルダオープンはボタンでリクエストフラグを立て、
-/// `show_preferences_dialog` の末尾 (closure 抜けた後) で App 側が処理する
-/// (TensorRT パック管理と同じパターン)。
+/// `from_settings` の snapshot を表示し、実際の処理は App に要求する。
 pub(super) fn page_editing_addon(ui: &mut egui::Ui, state: &mut PreferencesState) {
     use crate::editing_addon::AddonStatus;
 
@@ -11724,6 +11731,10 @@ pub(super) fn draw_diagnostics_export(
 /// 普通の利用者が「再生できない」「重い」等の不具合をサポートに伝えるとき、
 /// コマンドライン引数や `%APPDATA%` の手探りなしでログを集められるようにする。
 pub(super) fn page_developer(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    #[cfg(debug_assertions)]
+    if ui.button("AI 説明文の初回案内 (開発用)").clicked() {
+        state.vlm_download_requested = true;
+    }
     ui.label(
         "不具合をサポートに調べてもらうための診断機能です。\n\
          通常の利用では設定する必要はありません。",

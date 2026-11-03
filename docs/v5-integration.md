@@ -565,3 +565,125 @@ v5-integration `4cecdcd57` (mIV Sound 0.15.0-miv.2 承認後、§1.693・§1.694
 
 - 公開前の全体テストでは、メイン PC でほかのアプリが動いている場合に備えて `CARGO_BUILD_JOBS` を絞る (6 で通った)。`build-dist.ps1` も同じ並列ビルドを行う。
 - 残り: ローカル AI 説明文 (V2 検索・V3 MCP) の実装と取り込み、版 5.0.0 と更新履歴、公開文書、`build-dist.ps1` での本番ビルド・署名、配布物での受入、Phase 2 の依存物確認・perf smoke (`ui-smoke.ps1 -Scenario ReleaseChecks`)・panic log の棚卸し。
+
+## 11. mcp-trial (ローカル AI 説明文 V1〜V3) の取り込み（2026-11-03）
+
+- 作業先: `G:\home\mimageviewer-badge-1663` / `v5-integration`。
+- 取り込み前 HEAD: `deb712d04dedcf65bf595a083fc4e4de4a3dfe8a`。
+  MERGE_HEAD: `d982c85c34cc8681defcf03e29966344b232546e`（`mcp-trial`、62コミット）。
+- 設計担当が開始した `git merge --no-ff --no-commit mcp-trial` のファイル編集のみ。
+  git add / merge commit / その他のgit書き込み、製品起動は行わない。
+  本節の検証の観測者はCodex実装担当。mIV Sound 0.15.0-miv.2の承認物を使用し、
+  検査専用候補への差し替えは行っていない。
+- §6の範囲を保持する。VLMの取り込みはモデル公開・配布物の作成・受入の完了を意味しない。
+  本体lib全件、build-release、build-devは依頼どおり設計担当の検証範囲に残す。
+
+### 衝突の解き方
+
+| ファイル | 解消内容 |
+| --- | --- |
+| `docs/detached-rework-plan.md` | §1.670の独立reader終了境界の追補とV1-4a/V1-4bの表紙解決・検索分岐の記録を全文保持。今回新しいdetached述語・viewport処理は追加しない。 |
+| `docs/keymap-spec.md` | 音楽ビデオのメニュー専用操作・editorの固定キーと、AI説明文作成のメニュー専用操作を併存。既定キー割当を増やさない。 |
+| `docs/spec.md` | v5側の本棚順序・RAW foreground仕様と、VLMの保存・表示・検索・MCP仕様を保持。V2時点のMCP検索除外の説明は履歴とし、現在のV3の許可による制御へ参照する。 |
+| `docs/ui-responsiveness.md` / `docs/ui-snapshot-policy.md` | 両側の独立した追補を保持。mIV Soundの設定・creditとVLMの取得・情報パネル等の検証履歴を併存。 |
+| `htdocs/mimageviewer/index.html` / `privacy.html` | musicvideo・Everything・AI連携・AI説明文を保持。AI説明文の許可と本文の直接取得の違い、ローカル保存・モデル取得・外部AIアプリへ渡す境界を維持。mIV Soundの名称・分離保存先・歌詞等の受渡しを現コードへ照合して訂正。 |
+| `htdocs/sitemap.xml` | `python scripts/gen-sitemap-xml.py` で再生成。両側の音楽ビデオページとAIチュートリアル2ページを含む216 URL。 |
+| `scripts/build-release.ps1` / `scripts/build-portable.ps1` | v5のcore→Remote→EPUB→MCP→editor→launcherのRust順、mIV Sound承認照合、`-PreserveRuntime`、editor非停止とVC runtime gateを保持。core前のVLM build/identity/署名、通常core内包、portableのloose配置/署名/PE検査を統合。 |
+| `src/lib.rs` | AI失敗feedback fixtureとWindowsのjob_process、musicvideo_launchとvlm_addon/downloadをそれぞれ併存。 |
+| `src/app.rs` | RAW foreground用thumbnail_is_foregroundを保持し、既存の変換書庫resolverを表紙解決から参照可能にする。本の追記はworker内でai_caption.dbの存在を調べ、v5の本棚順序処理を含むappend_pages_at_with_raw_and_shelfへ渡す。 |
+| `src/settings_transfer.rs` | 新しい説明文許可を移行対象から除外。統合後は総数486・転送155・除外331。転送形式は1のまま。 |
+| `src/thumb_loader.rs` | VLM側で切り出した共有read resolverを通常サムネイルにも使用。v5側のcatalog provider、RAW foreground、要求identity、source policyを保持。memory pin seedの読出し拒否は既存uses_memory_pin_seedへ統一し、source解決を二重に残さない。 |
+| `tests/snapshots/preferences_context_menu_layout{,_open_with}.png` | 片側の画像を採用せず、解消後のlib fixtureだけをUPDATE_SNAPSHOTS=1で再生成する。結果と目視内容は下記。 |
+
+### 自動 merge 後に直した食い違い・確認した境界
+
+- `src/app/caption_display_tests.rs` のBookAppendSummary fixtureにv5側の `shelf: None` を補完。
+  初回の関連nextestはこのE0063でcompile中に停止し、テストは未実行だった。製品仕様や期待値の緩和ではない。
+- 設定分類の片親の件数485/483をそのまま採らず、新欄1件をv5側の分類へ合流。
+  メタ情報の形式はHEADの11からVLM側の12（AI説明文）へ、アイテム索引は10から11へ更新。
+  両側が別用途で同じ番号へ上げた衝突は無く、追加の版上げ・保存形式の再定義は不要だった。
+  旧形式11以下ではai_captions欄を無効にする取り込み契約も保持。
+- 自動mergeされたcontext_menu_modelのCreateMusicVideo / CreateAiCaptions、環境設定のSound項目と
+  AiCaptionページ・即時許可の写し、AboutのSound credit / VLMライセンスを照合。
+  `video/dsp/extract.rs` は既存のregular-file/ディレクトリ検査をpub(crate)で共有する変更だけで、
+  Soundの内容アドレス展開とVLMの展開を別々のdata_dir配下に保つ。
+- root `build.rs` は両build flavorでVLMを必須入力にし、release identityを検査する。
+  launcherはworkerを内包したcoreを包むため、VLMを別のlauncher assetへ追加する必要はない。
+  build-devも通常coreの同じ内包経路を使う。PE検査器は渡されたPEを列挙するため、呼出側の
+  VLM追加で対象になる。`build-dist.ps1` にVLM identityのfixture回帰と最終照合を補い、
+  `docs/release-checklist.md` の配布形態・署名・PE検査も合わせた。
+- 公開2ページは「作成処理で画像を外部へ送らない」と「許可時に説明文をAIアプリへ渡す」を区別。
+  mIV Soundは `<data_dir>/effetune/plugin` / `effetune/webview` を使い、旧共有先はコピー元として残る。
+  旧 `%APPDATA%/mimageviewer-vst3-host.exe` は利用者追加VSTが現在も使い得るため、自動削除を案内しない。
+  これは今回の公開主張の整合化であり、F3全体の改稿・マニュアル再編の完了とはしない。
+
+### 検証
+
+ログとcommand/exit/秒のJSONは `target/v5-vlm-merge/`（git管理外）。
+Rust検証は通常feature、`CARGO_BUILD_JOBS=6`、`CARGO_NET_OFFLINE=true`、
+`MSBUILDDISABLENODEREUSE=1`。製品・実モデル・WebView2の実試験は行わない。
+
+最初のcore checkはvendor workerの不足で停止した。文書の復旧入口
+`scripts/vlm-worker-identity.ps1 -RestoreBackupRepo .` でバックアップを実体コピーし、
+source identity `79c6482ae05f4aee923ff0b207af1386462658546a431f6e2bc1685331641fd9` を照合。
+workerは48,105,472 bytes、SHA-256
+`15921e46f0e5a1f8b06a059852b437fa44730962a01303df098454ba23078798`。
+再core checkはexit 0、81.076秒。workerの起動やバックアップへの書き込みは行っていない。
+
+| 検査 | 結果・証跡 |
+| --- | --- |
+| `cargo fmt`（引数なし）/ `cargo fmt --check` | exit 0 / 0。fixture補完後の最終fmtは21.581秒、checkは23.744秒。`fmt-final` / `fmt-check` のlog/JSON。 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 上記復旧後にexit 0、81.076秒。`check-core-final.log` / `.json`。 |
+| `cargo check --workspace --all-targets` | exit 0、198.268秒。`check-workspace.log` / `.json`。§10の既存release入力を使った型検査であり、VLM取り込み後のreleaseビルドや内包・展開の実行検証とは区別する。 |
+| 関連lib nextest | 891件実行、889成功・2失敗、exit 100。実行60.571秒、compile込み64.131秒。run `6d43d3b6-ddaa-4ec5-aa8b-4ceabd8bc585`。`tests-related-final.log` / `.json` / `.junit.xml`、集計は `coverage.json`。失敗は下記の既知pipe制約のみ。 |
+| `cargo test -p mimageviewer-mcp` | lib 67件中65成功・2失敗、exit 101、36.318秒（実行30.02秒）。`test-mcp.log` / `.json`。同じ既知pipe制約で、bin/doctest段には進まない。 |
+| `UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib preferences_context_menu_layout_snapshot -- --test-threads=1` | 1件成功、既存PNG2枚を再生成。exit 0、387.931秒（compile6分25秒、実行2.15秒）。`snapshot-update.log` / `.json`。更新指定なしの同テスト比較は上の891件に含まれ成功（1.785秒）。 |
+| `cargo test --test ui_snapshot preferences_context_menu` | exit 0、162.913秒、236件がfilter対象外で実行0件。成功件数には数えない。`snapshot-integration.log` / `.json`。実際の生成・比較は上のlib fixtureで完了した。 |
+| `scripts/test-focused.ps1 -Path <衝突16ファイル>` | exit 2、0.780秒、テスト実行なし。app/lib・scripts/docs・snapshot等の広域/未対応入力を仕様どおり全列挙して選択を拒否。`focused.ps1` / `.log` / `.json`。本体lib全件へ自動拡大せず、上の明示filterで検証した。 |
+| VLM実行体のPE静的検査 | exit 0、runtime=4 / pe=1、1.387秒。`vlm-pe.log` / `.json` / `vlm-pe-report.json`。workerを起動しない。 |
+| build scriptのfixture検査 | `test-vlm-worker-identity.ps1`、`test-release-build-safety.ps1 -PowerShellOnly`、`test-musicvideo-build-safety.ps1`、`check-vcrt-pe-dependencies.ps1 -SelfTest` はすべてexit 0。実装の別contextが担当し、ツール実行履歴の結果を再利用（専用logファイルなし）。実build・署名・process停止は行わない。 |
+| UI glyph / 公開文書 | glyph 0、exit 0、`glyphs.log` / `.json`。文書担当のカード検査は51件・超過0、HTML2枚の構造/ID/ローカル参照59件・sitemapのXML解析も成功。sitemap `--check` は216 URLで成功。 |
+| 独立レビュー | GPT-6.1 Sol / xhigh、実装と別context、読み取り専用。両親との差分、Rust衝突、自動merge近接経路、版・設定・Job・配布・公開文書を照合しACCEPT、未解決P1〜P3なし。PNG2枚と891件のJUnit/集計・hashも別途照合。検証コマンドの再実行なし。 |
+
+関連nextestは依頼の4 filterをORでまとめ、共有read resolverの回帰としてthumb_loader群と
+RAW foregroundの関連名も加えた。群ごとの件数は重複ありで、VLM/caption234成功、
+settings_transfer/metadata_transfer152成功、context_menu166成功、agent/mcp237成功・2失敗、
+thumb_loader120成功。これらを足して総実行数としない。
+分類486/155/331、説明文許可の移行除外、メタ情報の旧版互換、captionの保存・索引・表示・MCP許可、
+サムネイルの共有解決とCollection providerの回帰に失敗はなかった。
+
+今回の失敗4件は、いずれもfixtureのnamed pipe作成/openで `OS 5 / PermissionDenied`。
+本体側2件は `src/agent_ipc/pipe.rs:334` / `src/agent_ipc/tests.rs:757`、
+MCP側2件は `crates/mcp-server/src/pipe.rs:499`。本体stdio fixtureはadapterの起動前に失敗した。
+取り込み元のV3と本記録§1のsandbox内制約と同型だが、今回の統合後ソースをsandbox外で
+実行した証拠はまだ無い。skip化・期待値変更・DACL緩和・反復再試行は行わない。
+
+- `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`
+- `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`
+- MCP `pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked`
+- MCP `pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld`
+
+### 再生成PNGの目視
+
+2枚とも620×700。`preferences_context_menu_layout.png` は168,289 bytesで、
+「AI 説明文を作る」がファイル整理先の直後にあり、既存のチェック・上下移動・区切り線の操作列が保たれる。
+`preferences_context_menu_layout_open_with.png` は159,378 bytesで、末尾の「音楽ビデオを作成」と
+「アプリケーションで開く…」内の「外部ツールの設定…」がある。
+確認場面が画像なので音楽ビデオ行は「対象外」。新旧の両操作が設定表へ共存し、文字欠けや操作列の重なりがない。
+両方を実装担当と独立レビュー担当が開いて確認した。
+`snapshot-final-hashes.json` に両親と現在のhashを保存し、2枚ともどちらの親とも異なることを照合した。
+純粋なheadless fixtureの検査であり、製品GUIの起動や実機受入とは区別する。
+
+### 判断待ち・引き渡し
+
+設定・メニューの位置・保存形式・版番号の意味に関する判断待ちはない。
+衝突16ファイルの内容は解消済み。indexは設計担当のgit add前なので16件ともUUのまま。
+本体lib全件、最終full gate、build-release / build-dev、統合後のpipe4件のsandbox外確認と
+配布物/実機での受入は設計担当へ引き継ぐ。今回のチェック成功をこれらの完了とはしない。
+依頼に従いユーザー起動用バイナリは作らず、製品・実モデル・WebView2・通常profileを起動していない。
+git add / commit / merge等のgit書き込みも行わない。
+
+最終の差分空白検査・全追跡ファイルの衝突marker検索・HEAD/MERGE_HEADの照合は
+`final-checks.json` に記録した（差分検査exit 0、marker 0、両tip不変、indexのUU 16件）。
+統合後の全変更172ファイルのSHA-256は `final-source-hashes.json`。
+型検査・関連テスト以降の追加変更は本節とsnapshot方針の文書だけである。

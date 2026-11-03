@@ -4258,6 +4258,28 @@ mod tests {
         let bytes = vec![19_u8; HEAD_HASH_BYTES as usize + 31];
         std::fs::write(&source_path, &bytes).unwrap();
         give_test_file_restorable_content(temp.path(), &source_path);
+        let caption_path = temp.path().join("ai_caption.db");
+        crate::ai_caption_db::CaptionDb::open_at(&caption_path).unwrap();
+        let captions = rusqlite::Connection::open(caption_path).unwrap();
+        let source_key = crate::path_key::normalize_keep_drive(&source_path);
+        captions
+            .execute(
+                "INSERT INTO captions (item_key, mtime_ms, size, model_id, prompt_version, lang,
+                caption, visible_text, cover_ref, keywords, status, created_at)
+             VALUES (?1, 1, ?2, 'test-model', 1, 'ja', 'restored caption', '', '', '[]', 'ok', 1)",
+                rusqlite::params![source_key, bytes.len() as i64],
+            )
+            .unwrap();
+        captions
+            .execute("UPDATE captions SET indexed = 1", [])
+            .unwrap();
+        let source_rev: i64 = captions
+            .query_row(
+                "SELECT rev FROM captions WHERE item_key = ?1",
+                [&source_key],
+                |row| row.get(0),
+            )
+            .unwrap();
         let cancel = AtomicBool::new(false);
         let io_sem = crate::io_semaphore::GlobalIoSemaphore::new(1);
 
@@ -4303,6 +4325,35 @@ mod tests {
             detected.candidates[0].sources[0].file_key,
             crate::path_key::normalize_keep_drive(&source_path)
         );
+        // Captions piggyback on a source already recorded for edits. Restore
+        // copies them through STORES and its INSERT trigger creates a new rev.
+        let copied = crate::rename_key_migration::copy_restore_stores_without_identity_at(
+            temp.path(),
+            &[crate::rename_key_migration::StoreCopyPathMapping::exact(
+                &source_path,
+                &target_path,
+            )],
+        );
+        assert!(copied.errors.is_empty(), "{:?}", copied.errors);
+        let target_key = crate::path_key::normalize_keep_drive(&target_path);
+        let (caption, rev, indexed): (String, i64, i64) = captions
+            .query_row(
+                "SELECT caption, rev, indexed FROM captions WHERE item_key = ?1",
+                [&target_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(caption, "restored caption");
+        assert!(rev > source_rev);
+        assert_eq!(indexed, 0);
+        let source_indexed: i64 = captions
+            .query_row(
+                "SELECT indexed FROM captions WHERE item_key = ?1",
+                [&source_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_indexed, 1);
     }
 
     /// 編集を入れてすぐ取り消したファイルは復元元にならない。

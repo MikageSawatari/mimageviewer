@@ -305,6 +305,8 @@ pub struct PermissionSnapshot {
     pub level: AgentLevel,
     pub thumbnails: bool,
     pub gps: bool,
+    #[serde(default)]
+    pub ai_captions: bool,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -772,6 +774,7 @@ mod tests {
                 level: AgentLevel::Disabled,
                 thumbnails: false,
                 gps: false,
+                ai_captions: false,
             }
         );
     }
@@ -833,6 +836,22 @@ mod tests {
             serde_json::to_value(ErrorCode::Conflict).unwrap(),
             "conflict"
         );
+    }
+
+    #[test]
+    fn caption_permission_defaults_false_without_protocol_change() {
+        let old = r#"{"level":"read_only","thumbnails":true,"gps":false}"#;
+        let mut permission: PermissionSnapshot = serde_json::from_str(old).unwrap();
+        assert!(!permission.ai_captions);
+        permission.ai_captions = true;
+        assert_eq!(
+            serde_json::from_str::<PermissionSnapshot>(
+                &serde_json::to_string(&permission).unwrap()
+            )
+            .unwrap(),
+            permission
+        );
+        assert_eq!(AGENT_PROTOCOL_VERSION, 2);
     }
 
     #[test]

@@ -481,6 +481,35 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 
 §1.482 段A〜Cの前回終了通知は、資料のread/open/metadata/置換/整理・serialize・DXGI照会を専用writerで行う。Appは不変本文を非blockingで一度受け取り、起動overlay/非表示/最小化中に消費せず、表示と明示コピーだけを行う。AI等の実活動中はworker側だけで約1秒を目標にcheckpointを保存し、idleの周期起床・診断専用の周期repaintは追加しない。native前回資料の確保も今回のrotationより前にworkerで行う。device-lost callbackはdeviceごとの単一atomicへのCASだけで、通常root maintenance/活動/終端処理からworkerが観測・保存する。panicだけは既存hookの詳細処理より前に、事前open済みの専用sinkへ固定bufferで単発raw書込みを行う（同期WriteFileの完了時間は保証できず、通常UIへ流用しない）。main最終境界だけが共通終了deadlineまで保存完了を待ち、その後に制御エラーのnative通知を出す。
 
+本の AI 説明文（V1-4b）は、UI で種類と実パス、設定と読み取り用ハンドルだけを捕捉する。
+固定表紙のたどり、変換済み書庫の判定、フォルダ代表選定、EPUB 世代と署名、書庫エントリ・PDF ページの
+読み取りは作成／表示の worker 上で行う。一覧の既存の計画作成経路は移さない。
+表示は本の行がある場合だけ表紙を解決し、同じ本を表示し続けるフレームでは要求やパスワードの複製を繰り返さない。
+固定表紙・動画の固定表紙の変更／解除、取り込みの thumbnail_pins、対応ストアの実変更完了で共有表示 cache を全消去する。
+ジョブは自動変換もパスワード問い合わせも行わず、通常操作へ新しいモーダルを挟まない。実機の応答性は未測定。
+
+ローカル AI 説明文のモデル導入 (V1-3b) は、`VlmAddon` の初回 scan・HTTP・ハッシュ・連結・配置・削除と、
+worker exe の内容別展開・GPU 検査を背景 thread に置く。設定ページは cached view のみを読み、
+root frame が非blocking poll で完了を採用する。取消／削除の worker 完了までは次操作を拒否し、UI で join しない。
+取得窓を閉じても App の owner は残る。起動時の自動取得や実機 perf 測定の実施を意味しない。
+
+作成ジョブ (V1-3c) は UI 上の一覧項目をパスへ凍結するだけで、ファイルのmetadata・既存説明文・回転DBの参照、
+canonical decode、縮小、VLMプロセスの起動／モデル読込／推論、署名を再確認しての保存はjob workerへ置く。
+App が待ち行列・`Running` / `Stopping`・次の1件の送信・終了判断を単独所有し、workerには1件ずつ渡す。
+中止を押したフレームで受付を閉じ、今の1件が終わってから保存せず停止する。`Finish` は処理中の1件が無くなってから送り、
+完了通知まではownerを解放しない。進捗と結果は非blocking pollで受け取り、worker側からrepaintを要求する。
+進捗窓はmainだけのmodelessで閲覧を止めない。App終了時は共有kill handleで即時停止し、UIでjoinしない。
+読み込み・推論・保存には `perf::event` を置く。実モデルの速度や実機の応答性を検証済みとするものではない。
+
+説明文の表示 (V1-4a) はbundle外のApp共有 `CaptionDisplayCache` を読み、UIは要求channelへの送信と
+rootの非blocking pollだけを行う。必要時に起動する単一workerが1件のread-only SELECTとstatを行い、
+DBを作らず読み取りtransactionを持ち越さない。表示開始・再入場時に署名を取り直すが、同じ表示中は
+毎フレーム送らず、読み直し中は既存の値を表示する。既存のcontext別メタデータworkerへ処理を足さない。
+cacheは最大512件、上限時は全消去。ジョブの1件完了はそのキーだけ、取り込み・STORES操作・
+本への追記の直接削除・一覧再読み込みは全消去し、古い結果は `epoch`／`gen` で採用しない。
+workerの1件（SELECTとstat）を `perf::event` で計装し、完了時だけrepaintを要求する。
+終了時はchannelを閉じるだけでUIはjoinしない。これは設計上の境界の記録であり、実機の応答性の測定結果ではない。
+
 注釈fontの先回り（§1.602）はNext頁の計画でメモリ上の需要だけを判断し、列挙・font読取・parseを`comic-font-load` workerへ置く。
 App共有ownerの受信口は1つ。root pollは非blockingで採用し、workerの完了時にroot再描画を要求する。
 `comic / font_load`に所要ms・要求key数・読込key数・結果を記録する。同期表示はworkerを待たず、不足時は受信口を捨てて既存の同期経路を維持する。

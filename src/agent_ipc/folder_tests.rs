@@ -19,11 +19,15 @@ fn settings(change: impl FnOnce(&mut Settings)) {
 fn context(fixture: &Fixture) -> ReadContext {
     ReadContext::new(
         &fixture.handlers,
-        PermissionSnapshot {
-            level: AgentLevel::ReadOnly,
-            thumbnails: false,
-            gps: false,
-        },
+        (
+            PermissionSnapshot {
+                level: AgentLevel::ReadOnly,
+                thumbnails: false,
+                gps: false,
+                ai_captions: false,
+            },
+            0,
+        ),
         Arc::new(AtomicBool::new(false)),
     )
 }
@@ -557,13 +561,21 @@ fn folder_page_character_budget_counts_composition_flag_and_advances_oversized_r
         })
         .collect::<Vec<_>>();
     source[0].path = format!("C:/{}.png", "長".repeat(20_000));
-    let first = folder_page(source.clone(), true, Some(u32::MAX), None, &args).unwrap();
+    let first = folder_page(source.clone(), true, Some(u32::MAX), None, &args, 0).unwrap();
     assert!(matches!(first.items[0], PageRow::TooLong(_)));
     assert!(!first.items.is_empty());
     assert!(first.items.len() < 200);
     assert!(mcp_content_chars(&first).unwrap() <= MAX_PAGE_CHARS);
     assert!(first.book_composition_applied);
-    let second = folder_page(source.clone(), true, None, first.cursor.as_deref(), &args).unwrap();
+    let second = folder_page(
+        source.clone(),
+        true,
+        None,
+        first.cursor.as_deref(),
+        &args,
+        0,
+    )
+    .unwrap();
     let PageRow::Value(item) = &second.items[0] else {
         panic!("ordinary row")
     };
@@ -578,7 +590,8 @@ fn folder_page_character_budget_counts_composition_flag_and_advances_oversized_r
             first.cursor.as_deref(),
             &wire_digest(&args).unwrap(),
             &wire_digest(&identity).unwrap(),
-            source.len()
+            source.len(),
+            0
         )
         .unwrap(),
         first.items.len()
@@ -593,20 +606,49 @@ fn folder_page_character_budget_counts_composition_flag_and_advances_oversized_r
             modified: None,
         })
         .collect::<Vec<_>>();
-    let capped = folder_page(tiny.clone(), false, Some(200), None, &args).unwrap();
+    let capped = folder_page(tiny.clone(), false, Some(200), None, &args, 0).unwrap();
     assert_eq!(folder_limit(Some(1000)).unwrap(), 200);
     assert_eq!(
-        folder_page(tiny.clone(), false, Some(1000), None, &args).unwrap(),
+        folder_page(tiny.clone(), false, Some(1000), None, &args, 0).unwrap(),
         capped
     );
     assert!(capped.items.len() <= 200);
     assert!(mcp_content_chars(&capped).unwrap() <= MAX_PAGE_CHARS);
     assert_eq!(
-        folder_page(tiny, false, None, None, &args)
+        folder_page(tiny, false, None, None, &args, 0)
             .unwrap()
             .items
             .len(),
         100
+    );
+}
+
+#[test]
+fn folder_cursor_version_two_is_rejected_and_epoch_precedes_listing_change() {
+    let args = "argument-digest";
+    let listing = "listing-digest";
+    let cursor = folder_cursor(args, listing, 1, 7);
+    assert_eq!(
+        folder_offset(Some(&cursor), args, listing, 2, 7).unwrap(),
+        1
+    );
+    assert_eq!(
+        folder_offset(Some(&cursor), args, "changed-listing", 2, 8)
+            .unwrap_err()
+            .code,
+        ErrorCode::PermissionChanged
+    );
+    let legacy = serde_json::json!({"version": 2, "tool": "list_folder", "args_digest": args, "listing_digest": listing, "returned": 1});
+    let legacy = serde_json::to_vec(&legacy)
+        .unwrap()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        folder_offset(Some(&legacy), args, listing, 2, 0)
+            .unwrap_err()
+            .code,
+        ErrorCode::BadRequest
     );
 }
 
@@ -626,14 +668,21 @@ fn folder_cursor_continues_across_equivalent_physical_path_spellings() {
             .collect::<Vec<_>>()
     };
     let args = serde_json::json!([physical_identity(Path::new("C:/Books")), []]);
-    let first = folder_page(rows_for("C:/Books", "/"), false, Some(1), None, &args).unwrap();
+    let first = folder_page(rows_for("C:/Books", "/"), false, Some(1), None, &args, 0).unwrap();
     for (root, separator) in [(r"c:\books", r"\"), ("C:/BOOKS", "/")] {
         let alias_args = serde_json::json!([physical_identity(Path::new(root)), []]);
         assert_eq!(alias_args, args);
         let alias = rows_for(root, separator);
         let expected_path = alias[1].path.clone();
-        let next =
-            folder_page(alias, false, Some(1), first.cursor.as_deref(), &alias_args).unwrap();
+        let next = folder_page(
+            alias,
+            false,
+            Some(1),
+            first.cursor.as_deref(),
+            &alias_args,
+            0,
+        )
+        .unwrap();
         assert_eq!(rows(&next)[0].name, "b.png");
         // Only the cursor identity is normalized; emitted paths retain spelling.
         assert_eq!(rows(&next)[0].path, expected_path);
@@ -656,18 +705,18 @@ fn folder_cursor_keeps_zip_subresource_identity_spelling_exact() {
         })
         .collect::<Vec<_>>();
     let args = serde_json::json!([physical_identity(Path::new("C:/Books/book.zip")), []]);
-    let first = folder_page(source.clone(), false, Some(1), None, &args).unwrap();
+    let first = folder_page(source.clone(), false, Some(1), None, &args, 0).unwrap();
     let mut alias = source.clone();
     for item in &mut alias {
         item.path = r"c:\books\BOOK.ZIP".into();
     }
-    let next = folder_page(alias, false, Some(1), first.cursor.as_deref(), &args).unwrap();
+    let next = folder_page(alias, false, Some(1), first.cursor.as_deref(), &args, 0).unwrap();
     assert_eq!(rows(&next)[0].subresource.as_deref(), Some("pages/B.png"));
     for member in ["pages/a.png", r"pages\A.png"] {
         let mut changed = source.clone();
         changed[0].subresource = Some(member.into());
         assert_eq!(
-            folder_page(changed, false, Some(1), first.cursor.as_deref(), &args)
+            folder_page(changed, false, Some(1), first.cursor.as_deref(), &args, 0)
                 .unwrap_err()
                 .message,
             "一覧が変わりました。最初から取り直してください"

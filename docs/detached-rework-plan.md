@@ -1531,6 +1531,25 @@ bookmark要求相関と一回消費、loading/park/close/cancel/error/Remote/App
 利用者の挙動変更の採択、独立設計レビューは未了。本記録は双方合意や実装許可・完了を意味しない。
 今回の試験結果はバックログ正本に記録し、実装前合意後に実変更範囲と検証証拠を追記する。
 
+### 2026-11-03 ローカルAI説明文の本への拡張（V1-4b）
+
+共通情報パネルから、bundle 外の共有表示 cache に本の種類と読み取り環境を渡す。
+キーは既存 `physical_container_rating_key` の実物理コンテナ（変換済み書庫も元の本）で、ZipDir は対象外。
+画像と本の表示開始は既存の egui 一時履歴でそれぞれ判定し、固定表紙変更の無効化は全窓で共有する。
+detached の述語・viewport の経路・bundle の所有／交換は変更しない。
+既存 V1-4a の共有表示に本を追加するもので、症状パッチではない。設計側の合意は
+[計画 §21.13 と独立設計レビュー §19.20・§19.21](local-vlm-caption-plan.md#2113-v1-4b-の設計-2026-11-03) を参照。
+実装の検収・実機確認は別途行う。
+
+### 2026-11-03 ローカルAI説明文の共有表示（V1-4a）
+
+V1-4a で bundle の外の共有キャッシュを共通パネルから読む表示を足した。detached の述語・viewport は変えていない。独立レビュー 18 回目で症状パッチではないことに合意。
+範囲は `App::caption_display` の共有owner・専用読み込みworker・既存情報パネルの欄と、
+Appの完了採用点での無効化。既存の `sidecar_display_cache` と同じbundle外の共有表示に乗せ、
+contextごとのメタデータcache、bundle交換、window／placementの所有には変更を加えないためである。
+この合意は [説明文計画 §21.11.2](local-vlm-caption-plan.md#21112-v1-4a-画像の説明文の表示) の既存設計レビューを指し、
+今回の実装完了・独立実装レビュー・実機確認の宣言ではない。
+
 ### §1.473 合成一覧の親・typed帰路（2026-10-30、実装済み・実機未確認）
 
 承認設計 `cae94fb27`（[調査・設計記録](history-parent-1473-investigation.md)）に対し、
@@ -6972,3 +6991,37 @@ agent sourceは受理後に既存Activation ownerとなり、bookmark専用detac
 detachedの述語、viewport生成/閉鎖/配置/focus routing、bookmarkのdetached条件は変更していない。
 実装担当の前提照合・試験結果と未確認点は[MCP計画§18](mcp-integration-plan.md#18-段階-1c-の実装記録)に記録する。
 これは設計合意と変更範囲の記録であり、今回実装の独立レビュー受け入れを意味しない。
+
+### VLM V2b: 検索の枝とフォルダ本の直接結果の区別（2026-11-03）
+
+設計担当 ClaudeCode と実装担当 Codex は、`local-vlm-caption-plan.md` §21.15.3 の本の結果を既存の
+物理フォルダ open へ渡すため、検索の枝と直接の本を項目化境界で区別する構造修正に合意した。
+Drill 中という理由だけで全 `Folder` を枝として拒否すると、説明文だけに当たったフォルダ本を別窓で
+開けない。症状を抑える条件の追加ではなく、採用した一覧が持つ枝集合を判断の根拠にする。
+
+detached に触れる変更は `App::detached_grid_item_open_plan` の Folder 候補判定と、
+`open_grid_item_in_detached_book_context_with_auto_fullscreen` の非同期分類前の受付で
+`global_search_folder_is_branch` を使う箇所。Enter と doubleclick の共通受付で検索枝を先に返し、
+直接の本は通常フォルダと同じ `FolderCandidate` に渡す。
+doubleclick の検索枝 drill 判定も同じ helper を使う。Enter は従来どおり枝も物理フォルダとして開き、
+新しく drill 操作へ変更しない。明示的な「ページを開く／一覧を開く」は既存どおり Folder を受け付けない。
+通常の F12 は、開いたメディアの `toggle_detached_viewer_mode` による表示先変更であり、Folder の
+項目化・open plan を使わない。F12 の述語・viewport 生成／配置／focus は変更しない。
+
+枝集合は worker と fallback の双方が評価絞り込み後に生成し、items の採用と同時に置き換える。
+refresh、Drill 退出、Everything 切替の意図だけでは表示中の古い行の意味を変えない。
+物理一覧の install で破棄する。設計担当ClaudeCodeの追加判断により、検索を閉じる・取り消す時点も
+検索投影の終了境界として集合を捨てる。非同期復帰の間に旧itemsが残っても、検索が無効なら
+共通判定は枝ではないとし、従来どおり物理項目として開く。旧項目の非表示・操作禁止・新pending・
+rollbackは加えない（VLM計画 §21.17）。`GlobalSearchState` は viewer context の swap 対象であり、
+兄弟 context の install で main の枝集合は消さない。
+既存 detached 回帰の枝判定期待を維持し、手製の Folder 行を実際の検索投影 fixture に改めた。
+直接本と枝の共通別窓受付、通常 Enter の物理 open、兄弟 context の install を回帰対象に加える。
+自動検証結果は VLM 計画の実装台帳へ集約する。これは変更範囲と設計合意の記録であり、
+独立実装レビュー受け入れ・実機確認の完了を意味しない。
+
+独立レビュー（基準 `3012719a7`）では、レビュー担当も構造的修正であることへ合意したと
+設計担当から報告を受領した。P2-1で、拡張子付きFolderを先に非同期分類し、Directoryの続きが
+planを迂回する入口の監査漏れが見つかった。設計担当の指示どおり、分類開始前に採用済みの枝を
+共通判定してfalseを返す。続きには呼び出し元のdrillへ戻る経路がないため、分類後の拒否にはしない。
+新しいdetached状態・待機・retry・viewport/window ownerは追加しない。本修正の再レビューは未実施。

@@ -751,6 +751,10 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 
 | ワーカー | 実装 | 個数 | 用途 |
 | --- | --- | --- | --- |
+| AI 説明文モデルの管理 (V1-3b) | App の `VlmSetup` → `VlmAddon`、短命 scan/install/remove thread と bounded channel | 同時に1処理 (GPU 検査は別に起動中1回) | 設定／明示要求から lazy scan と GPU 検査。HTTP は新規の小さな VLM 専用 transport。Range 再開、取得量の上限、部分 SHA-256、連結後 SHA-256 を検査し、staging → packs → INSTALL_OK → active.json の順に公開。取消／削除は完了採用まで受付を閉じる。取得窓の寿命と owner を分け、閉じても completion barrier を保持。UI は cached view と非blocking poll のみ、静止時の repaint は追加しない。成功時に凍結した対象を作成ジョブへ一回渡す |
+| AI 説明文の作成ジョブ (V1-3c / V1-4b) | `App::caption_job` → job worker → VLM client、命令／結果channel | App全体で1本、対象は1件ずつ | App が待ち行列と `Running` / `Stopping` の唯一の owner。worker は `Item(CaptionTarget)` / `Finish` を受け、署名確認・本の表紙解決・既存行の判定・decode・回転・縮小・推論・保存を行い、1件ごとの結果と完了を返して `request_repaint` する。進捗窓はmainのみのmodeless。中止・最後の結果で先に受付を閉じ、処理中の1件が無くなってから `Finish`。中止後の結果は保存しない。fatal・切断・時間切れ・DB失敗は停止と通知、再試行なし。詳細は下の §3.2.3 |
+| AI 説明文の表示 (V1-4a / V1-4b) | bundle外の `App::caption_display` → 説明文専用worker、要求／結果channel | App全体でlazy起動の1本、cache最大512件 | 物理画像・本の表示開始時にread-only SELECTと署名／表紙の解決を送り、root pollで `epoch`／`gen` が一致する結果だけ採用する。再入場の読み直し中は以前の値を表示し、同じ表示中は送り直さない。workerは完了時にrepaintを要求し、終了はchannelを閉じるだけでUIはjoinしない。詳細は下の §3.2.4 |
+| ローカル AI 説明文の推論 | 別 exe `mimageviewer-vlm.exe --serve` + `ai::vlm_worker::VlmWorkerClient` + stdin writer / stdout reader / stderr logger | client ごとに子 1 本、要求は直列 1 件 | EPUB と共通の `job_process` が suspended 起動 → kill-on-close Job 割当 → resume を行い、HANDLE_LIST でその子の標準入出力だけを継承する。16MiB 上限の u32 LE 枠に JSON 長・JSON・RGB8 を格納する。ジョブスレッドだけが呼び、hello 30秒・load 120秒・初回caption 120秒・以降60秒で待つ。image_failure は続行、fatal/不正枠/切断/期限超過は Job を kill して client を退役し、再起動しない。通常の中止は現在の1件の完了後に shutdown、アプリ終了は共有 kill handle で即停止。UI で join しない。GPU の判定は --list-devices を必要時に worker スレッドで1回実行し、最大の専用 VRAM のアダプター・LUID・総量・Vulkan 対応を起動中だけ保持する。詳細は [計画 §21](local-vlm-caption-plan.md#213-v1-1-の設計) |
 | HTML 画像の取得・選択保存 | `std::thread` (`clipboard-fetch-0`〜`3`) + bounded result channel、session 最終解放後の短命 `clipboard-fetch-cleanup` | App 所有サービスごとに固定 4 worker | 起動時の一時ルート清掃、ページ区分と session 固有 Agent の準備、上限付き取得・ヘッダ寸法検査・原本ハッシュ・縮小画像準備、選択済み原本の背景保存を共通 queue で処理する。ダイアログごとに原本予算 2 GiB、画像ごとに実読取 64 MiB。保存 worker は自動 intent だけ月別保存先の背景解決を待ち、手動 intent は現在の実フォルダ直下へ保存する。最後の fetch / save owner 解放後に一時フォルダを背景削除する |
 | 手動クリップボード取り込み | `std::thread` (`clipboard-capture-manual`) | process ごとに最大 1 要求 | Ctrl+V の画像 / HTML 分岐から短命 worker を起動し、生データ取得後に Clipboard を閉じてから解析・画像保存を行う。HTML snapshot と画像保存の完了・失敗は typed event と repaint で App へ返す。監視の設定世代・除外・重複抑止を参照しない |
 | クリップボード画像・HTML の自動監視 | message-only window STA (`clipboard-capture-listener`) + reader STA (`clipboard-capture-reader`) + bounded 保存 worker (`clipboard-capture-save`) + Win32 / GDI (`clipboard-capture-popup`) | App / process ごとに各 1 | 最初に監視を有効にしたときに非同期起動し、両 OFF でも App 終了まで保持。起動時の読取はしない。通知ごとに不変 `Arc` スナップショットと request serial / sequence / 通知時刻を latest slot へ置く。reader は要求・直前・直後の sequence と現在世代の一致だけを受理し、不一致なら最新要求優先、なければ同じスナップショットで 1 回だけ再読取。開く前の 300 ms の合流待ちと形式 availability の除外判定は上記のとおり。clipboard を開いている間は上限付き生バイトのコピーだけを行い、閉じてから分類・デコード・ハッシュ計算を行う。保存 queue は 1 件に制限し、保存開始前に世代を確認する。開始済みの保存は完了まで行い、古い世代の小窓は表示しない。設定変更で小窓を隠す。UI は typed event と repaint だけを受ける。終了時は listener へ shutdown を post できた場合だけ join し、外部呼出中の reader / 保存 worker は待たない。切り取り監視とは独立。詳細は [clipboard-capture-plan.md](clipboard-capture-plan.md) |
@@ -1331,6 +1335,106 @@ worker は CPU pixels までを作り、`ctx.load_texture` は UI スレッド�
 prefix preview、`edit_result` texture 化を合わせて **1 フレーム 1 枚**だけ upload する。ready result が
 複数あれば表示中ページを優先し、残りは pending の `ready` に保持して repaint を要求する。
 materialization 待ちの edit / final assembly は `None` を返し、未完成の上位レイヤーを作らない。
+
+### 3.2.3 AI 説明文ジョブの受付と終了
+
+V1-4b は本の表紙へ対象を広げる（実装・検証中、検収・実機確認は未完了）。
+待ち行列は `CaptionTarget::{Image(path), Book { path, kind }}` とし、選択した物理本・
+フォルダを追加できる。無選択・空白部分の直下対象は画像とファイルの本で、サブフォルダを含めない。
+`ZipDir`・仮想ページ・動画・音声は対象外。受付と終了は下記の `Running` / `Stopping` を保つ。
+
+本の worker は `BookCoverEnv` の設定・固定表紙 DB・変換 cache DB・パスワード材料で
+`resolve_book_cover` を実行する。`ok` 行の `cover_ref`・入力署名・モデル・プロンプト版が
+すべて一致するときだけ作成を飛ばす。本の物理パス、署名元のパスと署名、`cover_ref` を保存へ渡し、
+保存時にも署名を再確認する。未変換とパスワード不足は別件数、動画の表紙は対象外、固定先欠落は
+読み込み失敗として数え、これらの行は保存しない。未変換には一度開いて変換する案内を出す。
+変換・パスワードのモーダルをジョブへ割り込ませず、既存の1件ずつの処理と中止を維持する。
+
+待ち行列と終了判断は `App::caption_job` の同じ owner で直列に行う。`Running` 中の追加は待ち行列の
+末尾へ足し、既に待っているパスの重複を除く。worker は次の命令を待ち、キューが空かどうかを判断しない。
+最後の結果で待ち行列が空なら、同じフレームで `Stopping` にして受付を閉じ、`Finish` を送る。
+中止操作では現在の推論が終わる前に `Stopping` へ移り、cancel の `AtomicBool` を立て、未開始分を捨てる。
+現在の1件の結果は保存せず、処理中の1件が無くなってから `Finish` を送る。
+`Stopping` 中は対象を追加せず、完了後に選び直してもらう。次ジョブ用の pending queue は持たない。
+worker の完了通知を poll で採用するまで App の owner とモデル削除の排他を維持する。
+
+画像の読み込み・回転DBの参照・推論・保存は job worker 内で行い、保存は `BEGIN IMMEDIATE` 後に
+入力署名を再確認する。モデルの出力を保存する前に、前後の空白を除いた完全一致の検索語だけを重複除去する。
+表示キャッシュの無効化はworkerの保存hookから行わず、App側の1件完了採用点から行う（§3.2.4）。
+説明文DBへの保存が commit された終端では、索引用の共有世代番号も進める（§3.2.5）。
+フォルダ移動・detachedのclose・Remote利用では止めない。App終了だけは共有kill handleで子を即時停止し、
+UI threadでworkerをjoinしない。詳細と状態簡素化の判断は [計画 §21.7.3](local-vlm-caption-plan.md#2173-v1-3c-作成ジョブ)。
+
+### 3.2.4 AI 説明文の共有表示キャッシュ
+
+V1-4b の本対応は実装・検証中で、検収・実機確認は未完了。
+
+`CaptionDisplayCache` は `ViewerContextBundle` に入れずApp共有とし、共通情報パネルから読む。
+既存のcontext別メタデータcache・pending・読み込みworkerを変更せず、休眠中の窓も同じ値を参照する。
+キーごとにLoading／Loaded（行なしを含む）を持ち、全消去の `epoch` とキー別 `gen` を要求に付ける。
+初回要求で単一workerを起動し、以後はchannelで待つ。DB未作成なら作らず行なしを返す。
+1件ごとにread-only SELECTを行い、画像は現在のファイル署名、本は `BookCoverEnv` を使う
+`resolve_book_cover` の `cover_ref` と署名で照合する。読み取りtransactionを持ち越さない。
+結果は `request_repaint` とchannelでrootへ渡し、`App::ui` の非blocking pollで世代照合して採用する。
+DB失敗はログと行なしに留め、終了時はchannelを閉じてUIでjoinしない。
+
+パネルで物理画像または本の表示を始めるたびに読み直し、完了までは既存の値を保つ。
+本のキーは「この本」の★と共通の `physical_container_rating_key`（変換済み書庫は元パス）を使い、
+共通パネルの「この本の AI 説明」に出す。表紙の解決は表示開始時に1回だけ worker で行う。
+表示の再入場はeguiのviewport＋panel IDごとの一時履歴のframe／keyで判定し、bundleには持たせない。
+同じキーの連続描画では再送せず、毎フレームのSELECT／statを避ける。表示再入場では読み込み中でも
+genを進めて再送し、旧結果を捨てる。後続readの印を足さずLoading／Loadedの2状態を保つ。
+ZIP内画像・PDFページ個別の説明文、動画・音声では送らない。512件を超えたcacheは全消去する。
+作成ジョブの `item_done` は結果によらずそのキーを失効させる。それ以外の書き手は、
+`ImportChangedSections.ai_captions`／`thumbnail_pins`（動画の固定を含む）、
+`StoreMutationEffects.caption_display_stale`、本への追記の直接削除summaryを
+Appの完了点で採用して全消去する。`caption_display_stale` は説明文・フォルダ固定表紙・
+動画固定表紙のいずれかの DB 行の実変更を表す。`set_folder_thumb_pin`／`remove_folder_thumb_pin`
+そのものと動画固定表紙の変更・解除でも全消去し、呼出元で読み直しの印が消される経路も拾う。
+一覧再読み込みも全消去する。
+消去より前の結果は `epoch`／`gen` の不一致で捨て、次のパネル描画で必要なキーだけ再要求する。
+detachedの述語・viewport・context別cacheを変更せず、Remoteのパネル・IPCへは接続しない。
+境界と簡素化の判断は [画像の設計 §21.11.2](local-vlm-caption-plan.md#21112-v1-4a-画像の説明文の表示) と
+[本の設計 §21.13](local-vlm-caption-plan.md#2113-v1-4b-の設計-2026-11-03) を参照。
+
+### 3.2.5 AI 説明文の索引への反映（V2a・V2b、未リリース）
+
+反映待ちの正本は `ai_caption.db` の `captions.indexed = 0` と `caption_removed`。
+`IndexerManager` が1つの `Arc<AtomicU64>`（`caption_epoch`）を所有し、再構成workerから
+全 metadata supervisor へ同じ参照を渡す。送り手は内容のcommit後、Appの既存完了採用点から
+世代を進めるだけで、UIスレッドのDB参照・管理役一覧への配布・容量付き通知channelを追加しない。
+固定表紙だけの変更は世代を進めない。managerが未準備の間の変更もDBの反映待ちに残る。
+AppがReadyを採用するときにも世代を一度進め、background側の初回反映完了からUI採用までの
+間にcommit終端を採用した場合を拾う。新たな待機状態や未処理フラグは持たない。
+
+各supervisorは自分の `seen` だけを保持し、既存の最大1秒の起床で、読み始める前に取った世代と
+比較する。反映後にその値を `seen` にするため、途中のcommitによる世代更新を消費しない。
+metadata有効の管理役だけが、既存 `OwnedRange` のSQL区間内を最大500件ずつ読み、既存の
+候補作成と `IngestSession::apply` によって再取込または削除する。取消・ActivityGate・I/O優先度・
+バッチ・Tantivy First順序は既存経路を使う。反映済みの更新は索引commit/reloadとmetadata更新の
+完了後、読んだ `(item_key, rev, removed)` に一致するものだけに行う。
+
+初回走査の後（省略した場合も）と、手動・overflow・watch回復の全件走査の後にも反映する。
+ingestのreadonly接続がDB未作成・初期化未完了で開けなかった場合は、次の走査・反映の開始時に開き直す。
+反映待ちの読取は公開済みreaderを確保できた回だけに限る。未公開・open失敗の回はpendingを読まず、
+ACKせず終了し、書き手のcommit後の世代更新を既存の次の起床で拾う。
+初回構成の確定後、全お気に入りrootの外にある削除の印だけを一度整理する。metadata無効の
+お気に入り内や共通除外内の印はこの整理で消さない。反映済み更新の失敗はログを残し、
+次回起動・全件走査で拾い直す。説明文を読めない場合は文書作成を継続するが、applyの読取失敗件数が
+あればACKしない。通常watch/scanが反映済みの説明文を空欄へ置き換えた場合も修復できるよう、
+DB読取失敗は既存writer reporterのログ・通知・次起動再構築予約へ渡す。正常なDB未作成は区別し、
+予約しない。既存の索引書込失敗も同じreporterの通知・再構築予約を維持する。
+
+説明文がある書庫・フォルダの本も同じ候補作成・ingest/delete経路へ通す。
+全件走査では `OwnedRange` 内の `ok` 行をまとめて取得し、workerでパスの実在と種類を判定する。
+走査・反映・watcherは同じ本の候補判定を使い、説明文の削除後は文書とmetadata行を消す。
+フォルダ名が `.json` / `.txt` で終わる場合も、watcherのサイドカー処理だけで終了させない。
+結果にはSTOREDの種類を渡し、UIでフォルダ判定のstatを追加しない。新しいworker・通知queue・
+説明文由来の本を識別する保持フラグは持たない。
+
+Ctrl+Fは索引を使わず、検索workerがreadonly接続を1回開き、表示中の画像と本の `ok` 行を
+読み込んでから既存の2 passで照合する。実装範囲と送り手の監査は
+[説明文計画 §21.16](local-vlm-caption-plan.md#2116-v2a-実装記録)を参照。
 
 ### 3.3 フルスクリーン読み込みの優先度制御
 

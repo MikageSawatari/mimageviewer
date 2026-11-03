@@ -117,6 +117,7 @@ impl Fixture {
                     file_size: 0,
                     norms: crate::ingest_text::PerSourceText {
                         name: format!("cat{i}"),
+                        ai_caption: "captionsecret".into(),
                         ..Default::default()
                     },
                 };
@@ -181,6 +182,7 @@ fn permission_is_live_and_handshake_is_strict() {
             level: AgentLevel::ReadOnly,
             thumbnails: false,
             gps: false,
+            ai_captions: false,
         }
     );
     f.set_level(AgentLevel::Disabled);
@@ -271,20 +273,20 @@ fn cursor_continuation_and_character_budget() {
         })
         .collect();
     let args = serde_json::json!(["猫", null, "path"]);
-    let one = page(items.clone(), 0, 5, false, "items_by_tag", args.clone()).unwrap();
+    let one = page(items.clone(), 0, 5, false, "items_by_tag", args.clone(), 0).unwrap();
     assert!(one.truncated);
     assert!(mcp_content_chars(&one).unwrap() <= MAX_PAGE_CHARS);
-    let offset = decode_cursor(one.cursor.as_deref(), "items_by_tag", &args).unwrap();
-    let two = page(items, offset, 5, false, "items_by_tag", args.clone()).unwrap();
+    let offset = decode_cursor(one.cursor.as_deref(), "items_by_tag", &args, 0).unwrap();
+    let two = page(items, offset, 5, false, "items_by_tag", args.clone(), 0).unwrap();
     assert_ne!(row(&one.items[0]).path, row(&two.items[0]).path);
     assert_eq!(
-        decode_cursor(one.cursor.as_deref(), "search_items", &args)
+        decode_cursor(one.cursor.as_deref(), "search_items", &args, 0)
             .unwrap_err()
             .message,
         "最初からやり直してください"
     );
-    let bad = encode_cursor("items_by_tag", args.clone(), 1);
-    assert!(decode_cursor(Some(&bad), "items_by_tag", &serde_json::json!([])).is_err());
+    let bad = encode_cursor("items_by_tag", args.clone(), 1, 0);
+    assert!(decode_cursor(Some(&bad), "items_by_tag", &serde_json::json!([]), 0).is_err());
     drop(f);
 }
 
@@ -383,6 +385,290 @@ fn fts_fixture_search_uses_live_favorites_and_has_cursor() {
         panic!()
     };
     assert!(other.items.is_empty());
+}
+
+#[test]
+fn search_items_excludes_ai_captions_from_query_and_postfilter() {
+    let f = Fixture::new();
+    f.seed_index();
+    let connection = f.connection();
+    for (id, query, expected) in [
+        (1, "captionsecret", 0),
+        (2, "cat captionsecret", 0),
+        (3, "cat -captionsecret", 4),
+    ] {
+        let Payload::Items(page) = f
+            .call(
+                &connection,
+                id,
+                Command::SearchItems {
+                    query: query.into(),
+                    kind: Some(ItemKind::Image),
+                    limit: None,
+                    cursor: None,
+                },
+            )
+            .result
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(page.items.len(), expected, "{query}");
+    }
+}
+
+#[test]
+fn search_items_allowed_ai_captions_match_images_and_books_in_query_and_postfilter() {
+    let f = Fixture::new();
+    seed_book_search_index(&f);
+    crate::settings_db::with_db_result(|db| {
+        let mut settings = db.load_into_settings()?;
+        settings.agent_show_ai_captions = true;
+        db.save_full(&settings)
+    })
+    .unwrap();
+    let connection = f.connection();
+    for (kind, query, expected) in [
+        (Some(ItemKind::Image), "captionsecret", 4),
+        (Some(ItemKind::Archive), "captionsecret", 5),
+        (Some(ItemKind::Folder), "captionsecret", 3),
+        (None, "cat captionsecret", 4),
+        (None, "book captionsecret", 8),
+        (None, "cat -captionsecret", 0),
+        (None, "book -captionsecret", 0),
+    ] {
+        let Payload::Items(page) = f
+            .call(
+                &connection,
+                1,
+                Command::SearchItems {
+                    query: query.into(),
+                    kind,
+                    limit: None,
+                    cursor: None,
+                },
+            )
+            .result
+            .unwrap()
+        else {
+            panic!("expected search page")
+        };
+        assert_eq!(page.items.len(), expected, "{query} / {kind:?}");
+    }
+}
+
+#[test]
+fn continued_search_and_folder_reject_every_permission_change_from_admission_grant() {
+    for field in ["captions", "gps", "thumbnails", "level"] {
+        let f = Fixture::new();
+        f.seed_index();
+        let root = f._dir.path().join("folder");
+        std::fs::create_dir(&root).unwrap();
+        for name in ["a.png", "b.png"] {
+            std::fs::write(root.join(name), b"fixture").unwrap();
+        }
+        let connection = f.connection();
+        let Payload::Items(search) = f
+            .call(
+                &connection,
+                1,
+                Command::SearchItems {
+                    query: "cat".into(),
+                    kind: None,
+                    limit: Some(1),
+                    cursor: None,
+                },
+            )
+            .result
+            .unwrap()
+        else {
+            panic!()
+        };
+        let folder_command = |cursor| Command::ListFolder {
+            path: root.to_string_lossy().into_owned(),
+            subresource: None,
+            limit: Some(1),
+            cursor,
+        };
+        let Payload::Folder(folder) = f.call(&connection, 2, folder_command(None)).result.unwrap()
+        else {
+            panic!()
+        };
+        assert!(search.cursor.is_some() && folder.cursor.is_some());
+        crate::settings_db::with_db_result(|db| {
+            let mut settings = db.load_into_settings()?;
+            match field {
+                "captions" => settings.agent_show_ai_captions = true,
+                "gps" => settings.agent_show_gps = true,
+                "thumbnails" => settings.agent_show_thumbnails = true,
+                "level" => settings.agent_level = AgentLevel::ReadAndOpen,
+                _ => unreachable!(),
+            }
+            db.save_full(&settings)
+        })
+        .unwrap();
+        for command in [
+            Command::SearchItems {
+                query: "cat".into(),
+                kind: None,
+                limit: Some(1),
+                cursor: search.cursor,
+            },
+            folder_command(folder.cursor),
+        ] {
+            assert_eq!(
+                f.call(&connection, 3, command).result.unwrap_err().code,
+                ErrorCode::PermissionChanged,
+                "{field}"
+            );
+        }
+    }
+}
+
+#[test]
+fn version_two_cursor_is_bad_request_even_when_permission_epoch_matches() {
+    let args = serde_json::json!(["cat", null, "relevance"]);
+    let legacy = serde_json::json!({
+        "version": 2, "tool": "search_items", "args_digest": wire_digest(&args).unwrap(), "returned": 1,
+    });
+    let cursor = serde_json::to_vec(&legacy)
+        .unwrap()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        decode_cursor(Some(&cursor), "search_items", &args, 0)
+            .unwrap_err()
+            .code,
+        ErrorCode::BadRequest
+    );
+}
+
+fn seed_book_search_index(f: &Fixture) {
+    use crate::fts_index::{Container, IndexDoc, IndexKind, upsert_doc};
+    f.seed_index();
+    let favorite_id = f.handlers.readers.favorites().unwrap()[0].id;
+    let fts = f.handlers.readers.fts.read().unwrap().clone().unwrap();
+    let mut writer = fts.writer().unwrap();
+    for (name, kind) in [
+        ("book.zip", IndexKind::Zip),
+        ("book.cbz", IndexKind::Zip),
+        ("book.rar", IndexKind::Zip),
+        ("book.7z", IndexKind::Zip),
+        ("book.lzh", IndexKind::Zip),
+        ("book-folder", IndexKind::Folder),
+        ("book-folder.zip", IndexKind::Folder),
+        ("book-folder.epub", IndexKind::Folder),
+    ] {
+        // No real directory exists at these paths: the stored kind owns result
+        // classification, including folders whose names look like file types.
+        let doc = IndexDoc {
+            path: format!("C:/fixture/{name}"),
+            container: Container::Fs,
+            zip_entry: String::new(),
+            favorite_id,
+            kind,
+            mtime: 0,
+            file_size: 0,
+            norms: crate::ingest_text::PerSourceText {
+                name: name.into(),
+                ai_caption: "captionsecret".into(),
+                ..Default::default()
+            },
+        };
+        upsert_doc(&writer, fts.fields(), &doc).unwrap();
+    }
+    writer.commit().unwrap();
+    fts.reload_reader().unwrap();
+}
+
+#[test]
+fn search_items_classifies_and_filters_captioned_books_by_stored_kind() {
+    let f = Fixture::new();
+    seed_book_search_index(&f);
+    let connection = f.connection();
+    for (id, kind, query, expected) in [
+        (1, Some(ItemKind::Archive), "book", 5),
+        (2, Some(ItemKind::Folder), "book", 3),
+        (3, Some(ItemKind::Image), "book", 0),
+        (4, None, "book", 8),
+        (5, None, "captionsecret", 0),
+        (6, None, "book -captionsecret", 8),
+    ] {
+        let Payload::Items(page) = f
+            .call(
+                &connection,
+                id,
+                Command::SearchItems {
+                    query: query.into(),
+                    kind,
+                    limit: None,
+                    cursor: None,
+                },
+            )
+            .result
+            .unwrap()
+        else {
+            panic!("expected item page")
+        };
+        assert_eq!(page.items.len(), expected, "{query} / {kind:?}");
+        for item in &page.items {
+            let item = row(item);
+            let expected_kind = if item.name.starts_with("book-folder") {
+                ItemKind::Folder
+            } else {
+                ItemKind::Archive
+            };
+            assert_eq!(item.kind, expected_kind, "{}", item.name);
+            assert!(item.subresource.is_none());
+            if let Some(kind) = kind {
+                assert_eq!(item.kind, kind);
+            }
+        }
+    }
+}
+
+#[test]
+fn search_items_captures_ignore_archives_setting_and_keeps_zip_and_folders() {
+    let f = Fixture::new();
+    seed_book_search_index(&f);
+    crate::settings_db::with_db_result(|db| {
+        let mut settings = db.load_into_settings()?;
+        settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+        settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+        db.save_full(&settings)
+    })
+    .unwrap();
+    let connection = f.connection();
+    for (id, kind, expected) in [
+        (1, Some(ItemKind::Archive), 2),
+        (2, Some(ItemKind::Folder), 3),
+        (3, None, 5),
+    ] {
+        let Payload::Items(page) = f
+            .call(
+                &connection,
+                id,
+                Command::SearchItems {
+                    query: "book".into(),
+                    kind,
+                    limit: None,
+                    cursor: None,
+                },
+            )
+            .result
+            .unwrap()
+        else {
+            panic!("expected item page")
+        };
+        assert_eq!(page.items.len(), expected, "{kind:?}");
+        assert!(page.items.iter().all(|item| {
+            let item = row(item);
+            item.kind == ItemKind::Folder
+                || item.path.ends_with(".zip")
+                || item.path.ends_with(".cbz")
+        }));
+    }
 }
 
 /// Cargo exposes CARGO_BIN_EXE only to the package that owns a binary. This
@@ -902,7 +1188,7 @@ fn named_pages_use_actual_serialized_character_cap_and_returned_offset() {
         })
         .collect();
     let (tags, cursor, truncated) =
-        bounded_rows(tags, 50, false, "list_tags", args.clone(), "tags").unwrap();
+        bounded_rows(tags, 50, false, "list_tags", args.clone(), "tags", 0).unwrap();
     assert!(truncated);
     assert!(!tags.is_empty());
     assert!(tags.len() < 20);
@@ -913,7 +1199,7 @@ fn named_pages_use_actual_serialized_character_cap_and_returned_offset() {
     };
     assert!(mcp_content_chars(&page).unwrap() <= MAX_PAGE_CHARS);
     assert_eq!(
-        decode_cursor(page.cursor.as_deref(), "list_tags", &args).unwrap(),
+        decode_cursor(page.cursor.as_deref(), "list_tags", &args, 0).unwrap(),
         50 + page.tags.len()
     );
     let args = serde_json::json!(["catalog_order"]);
@@ -931,6 +1217,7 @@ fn named_pages_use_actual_serialized_character_cap_and_returned_offset() {
         "list_collections",
         args.clone(),
         "collections",
+        0,
     )
     .unwrap();
     let page = CollectionPage {
@@ -942,7 +1229,7 @@ fn named_pages_use_actual_serialized_character_cap_and_returned_offset() {
     assert!(!page.collections.is_empty());
     assert!(mcp_content_chars(&page).unwrap() <= MAX_PAGE_CHARS);
     assert_eq!(
-        decode_cursor(page.cursor.as_deref(), "list_collections", &args).unwrap(),
+        decode_cursor(page.cursor.as_deref(), "list_collections", &args, 0).unwrap(),
         200 + page.collections.len()
     );
     let (tags, cursor, _) = bounded_rows(
@@ -955,6 +1242,7 @@ fn named_pages_use_actual_serialized_character_cap_and_returned_offset() {
         "list_tags",
         serde_json::json!([]),
         "tags",
+        0,
     )
     .unwrap();
     assert_eq!(tags.len(), 1);

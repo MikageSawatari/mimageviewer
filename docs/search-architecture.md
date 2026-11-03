@@ -19,13 +19,13 @@ Everythingは別の名前索引から同じSearch surfaceへ結果を供給す�
 | --- | --- | --- | --- | --- |
 | **Ctrl+S** | コンテナ検索 | フォルダ / ZIP / PDF を名前で横断検索 | お気に入り配下 (再帰) | コンテナ索引 `search_index.db` (SQLite LIKE) |
 | **Ctrl+F** | 現在地フィルタ | 現グリッドの表示中アイテムを名前 / メタ情報で絞り込み | 現在グリッド (非再帰・索引なし) | worker 上の on-demand 判定 |
-| **Ctrl+G** | アイテム検索 | 画像 / PDF / 動画 / 音声を名前 / EXIF / AI プロンプト等で横断検索 | お気に入り配下 (再帰) | アイテム索引 (Tantivy bigram) 候補絞り込み + STORED 原文 post-filter の streaming |
+| **Ctrl+G** | アイテム検索 | 画像 / PDF / EPUB / 動画 / 音声と、説明文がある書庫・フォルダの本を名前 / メタ情報で横断検索 | お気に入り配下 (再帰) | アイテム索引 (Tantivy bigram) 候補絞り込み + STORED 原文 post-filter の streaming |
 | **Ctrl+R** | Everything ファイル名検索 | Everything の構文で実フォルダと対応する実ファイルを探す | Everything の索引範囲（お気に入り外も含む） | worker-only の直接 QUERY2 IPC → 完成dataset → 共通Search prepare/adopt |
 
 - **動画はコンテナ索引 (Ctrl+S) の対象外** — 動画はアイテムなので Ctrl+G で扱う。
 - **音声はコンテナ索引 (Ctrl+S) の対象外** — 音声はアイテムなので Ctrl+G でファイル名を扱う。
-- **ZIP はアイテム索引 (Ctrl+G) の対象外** — ZIP はコンテナなので Ctrl+S で扱う。
-  ZIP 内画像のメタ検索はどのモードでも行わない (§4.6)。
+- **ZIP は原則として Ctrl+S で扱う**。保存済みの AI 説明文がある書庫・フォルダの本は
+  Ctrl+G のアイテム索引にも載せる (U17、§4.6)。ZIP 内画像のメタ検索はどのモードでも行わない。
 - **製本ルート (`Settings.book_root` / 既定 `Pictures\mimageviewer\books`) は
   Ctrl+S/Ctrl+G の自動索引対象外** — 本ページはコピー済みスナップショットで、並べ替え時に
   大量リネームが発生するため二重索引と watcher チャーンを避ける。初期スキャンでは既存の
@@ -221,7 +221,7 @@ separator は `search_norm::ZIP_ENTRY_SEP` = U+001F Unit Separator) を通す。
 
 Ctrl+S の EPUB は既存の `search_index.db` の `PdfFile`、Ctrl+G の EPUB は既存の
 `fts_meta.db` / Tantivy の `Pdf` として追加する。既存行・列・kind 値・索引の schema は
-変えず、`fts_meta::INDEX_VERSION` は 10 のままにする。全利用者へ索引再構築を強制しない。
+変えず、EPUB の追加では `fts_meta::INDEX_VERSION` は当時の 10 のままにした。現在の 11 への変更は AI 説明文による (§4.11)。
 前方互換では新しい EPUB 行だけが増え、移行は不要。
 「EPUB の処理」が「無視する」のとき、Ctrl+S は SQLite の `WHERE` で EPUB を除いてから
 5,000 件の上限を適用する。Ctrl+G は検索ワーカーが EPUB のパスを STORED 原文取得前に
@@ -258,7 +258,8 @@ EPUB は Ctrl+S / Ctrl+G とも元ファイル名を検索対象にし、検索�
 `ingest_worker::build_doc_for_pdf` は EPUB を
 拡張子で明示的に分岐し、未変換・変換済みのどちらでも生成 PDF の Info 辞書を呼ばない。
 EPUB 内のタイトル・著者も索引しない。取込失敗として記録・ログ出力せず、通常の `Pdf` 行を
-登録する。Ctrl+F も EPUB はファイル名だけで判定し、生成 PDF の Info 辞書を読まない。
+登録する。Ctrl+F も EPUB はファイル名と保存済みの AI 説明を検索する。EPUB 内部のタイトル・
+著者は検索せず、生成 PDF の Info 辞書も読まない。
 
 ```
 App 起動
@@ -286,6 +287,22 @@ IngestSession の writer は IndexerManager が保有する dispatcher 経由で
 (Tantivy の writer は Index あたり 1 本制約)。通常タグ操作は tags.db のみを更新し、
 Tantivy writer には触れない。
 ```
+
+AI 説明文は画像・PDF・EPUB と、説明文がある書庫・フォルダの本の ingest 時に
+`CaptionDb::open_read_only` の接続から読む。
+`status = ok` の説明文・画像内の文字・検索語だけを `ai_caption_text` に入れる。
+接続が無かった場合は次の反映・走査開始時に開き直す。動画・音声には説明文を付けない。
+反映待ちを読むのは公開済みのreadonly接続を確保できた回だけとする。未公開・open失敗の回は
+pendingを読まずACKもしない。直後に初回作成がcommitされても、書き手の世代更新を次の起床で拾う。
+説明文の commit は共有の `caption_epoch` を進め、各 supervisor は自分の既処理世代と比較する。
+起動時 (初回走査省略時も)・全件走査後・世代変化時に、自分の `OwnedRange` の反映待ちを
+DB から有界 batch で読み、既存候補作成・ingest/delete 経路へ渡す。索引 commit 成功後だけ
+読み取った `(item_key, rev, removed)` と一致する印を消す。反映途中の書き込みは次世代に残る。
+DB読取失敗時は説明文なしで文書作成を続けるが、反映済みの印は消さない。既に反映済みの文書を
+通常watch/scanが空欄へ置き換えた場合も修復できるよう、既存reporterで次起動の再構築を予約する。
+DB未作成では予約せず、次の走査・反映の開始で接続を試みる。
+反映待ちの正本は `ai_caption.db` の trigger が付ける印であり、命令 channel やメモリ上の queue に依存しない。
+説明文がある書庫・フォルダの本も同じ反映経路を使い、追加・削除の候補判定を走査・watcherと共有する (§4.6)。
 
 アイテム索引の Full は `ScanResult::completeness` で FS の観測結果を
 `ObservationCompleteness::Complete / Incomplete` に分ける。read_dir 失敗、iterator の
@@ -574,13 +591,27 @@ SMB / NAS では `ReadDirectoryChangesW` が発火しないケースがあるの
 
 ### 4.6 ZIP 対応のスコープ
 
-**ZIP はコンテナであり、アイテム索引 (Ctrl+G) の対象外。** ZIP ファイル名での
-横断検索はコンテナ索引 (Ctrl+S) が担う。
+**ZIP は原則としてコンテナ索引 (Ctrl+S) で名前を探す。** 案 B1 への例外として、
+保存済みの AI 説明文がある書庫・フォルダの本は、Ctrl+G にも本として載せる
+(U17、[説明文計画 §21.15.3](local-vlm-caption-plan.md#21153-v2b-説明文のある本を索引と結果に出す))。
 
-- ZIP ファイル自体: アイテム索引には登録しない。`search_walker` は ZIP を
-  `fs_map` に入れない (`CandidateKind::Zip` を作らない) ので、過去バージョンが
-  登録した ZIP doc は FS ↔ SQLite 差分で「FS になし + DB あり」と判定され `to_delete`
-  に落ちて Tantivy から消える (docs/search-container-item-redesign.md §3.2 / task#1)。
+V2bの検証記録と未確認事項は説明文計画 §21.17 に集約する。ZIP内画像の対象範囲は従来どおり。
+
+- ZIP/CBZ・RAR/CBR・7z/CB7・LZH/LHA とフォルダの本: `ai_caption.db` に
+  `status = ok` の行がある場合だけ `Book` 候補を作る。走査・反映・watcherは共通の判定を使う。
+  全件走査は `OwnedRange` 内の `ok` キーを一度に読み、workerでディレクトリを先に判定する。
+  文書は名前と説明文・画像内の文字・検索語を持ち、種類は書庫が `Zip`、フォルダが `Folder`。
+  説明文がない・失敗行だけの場合は載せず、既存の文書と `fts_meta` 行も消す。
+  古い署名の `ok` 行は検索に残し、PDF/EPUBは説明文の有無によらず載せる。
+- `GlobalHit` はSTOREDの種類を保持する。Flat/Drillでは本として項目化し、直接のフォルダ本は
+  実フォルダを開く。Drillで検索の枝と同じパスなら枝を優先する。Aggregatedでは本を親フォルダの
+  件数に含め、代表画像には新しい書庫・フォルダの結果を使わない (既存PDF/EPUB代表は維持)。
+- 種類「書庫・フォルダの本」は `Zip` と `Folder` に絞る。「対応アーカイブを無視する」は
+  検索開始時の `SearchScope` に捕捉し、RAR/7z/LZHを件数上限より前に除く。ZIP/CBZとフォルダは残す。
+  表示種類・EPUB無視も保存済みの種類で判定するので、拡張子に見える名前のフォルダを除かない。
+- MCP `search_items` も保存済みの種類から Archive / Folder を返す。検索対象から `AiCaption` を
+  候補検索・後置照合とも除く既存境界は維持するため、本は名前で一致した場合に返す。
+  非検索の `get_item_info` とライブラリ行も RAR/7z/LZH を Archive に分類する。
 - ZIP 内画像: **どのモードでもメタ検索しない**。アイテム索引は ingest せず、
   Ctrl+F も ZIP 表示中はファイル名フィルタのみ (§5.2、同 §4.1.2)。ZIP は seek
   不可でエントリごとの伸張コストが高く、生成画像を ZIP 保管する需要も低いため。
@@ -662,7 +693,19 @@ catalogは保持し、v1.0〜v1.3から直接更新する旧タグは取り込�
   `purge_favorite_metadata` で `sidecar_text` ごと消える。
 - **動画 / ZIP 内 / PDF ページは対象外** (動画は既存 `.xmp` サイドカーの mIV タグ経路を維持)。
 
-### 4.11 AI 生成メタデータ (INDEX_VERSION=10)
+### 4.11 AI 生成メタデータと保存済み AI 説明文 (INDEX_VERSION=11)
+
+版の履歴:
+- **10**: 生成前テンプレートを検索へ入れない typed provenance による再構築。
+- **11**: `ai_caption_text` (bigram + STORED) を追加。`SourceKind::AiCaption`・
+  `PerSourceText`・必須 schema 検査を揃え、既存の共通再構築 owner で索引を全件作り直す。
+  再構築中は Ctrl+G の結果が一時的に欠ける。
+
+`ai_caption.db` の `status = ok` の行を `ingest_text::caption_search_text` で
+説明文・画像内の文字・検索語の空白区切りへまとめ、他のソースと同じ正規化を行う。
+作成時と署名が違う古い説明文も検索対象に残す。モデルの有無は表示・検索に影響しない。
+保存元 DB の更新・削除・キー移行を索引へ反映する所有境界は §4.1、Ctrl+F は §5.2 を参照。
+MCP `search_items` は独立した許可を追加するまで `AiCaption` を query と後置絞り込みの両方から除外する。
 
 PNG の tEXt/iTXt/zTXt と JPEG/JFIF の EXIF UserComment に埋め込まれた生成メタデータを
 `png_prompt_text` フィールドへ正規化して入れる。実装は
@@ -730,13 +773,16 @@ Tantivy は通さない。SQLite LIKE の方が対象件数 (フォルダ構造�
 UI (render_search_bar)
   → run_metadata_search(tokens, items, xmp_cache, fts_meta, pdf_passwords,
                         target, mode, cancel)
+    worker で readonly CaptionDb を 1 回開き、対象項目の ok 行を HashMap へ読む
+       (AiCaption を対象に含むとき。Image / Folder / ZipFile / ConvertibleArchive / PdfFile)
     Pass 1 (構造アイテム + ZIP 内画像、名前照合中心):
-       - Folder / ZipFile / ConvertibleArchive … ファイル名 (basename) で照合
-       - PdfFile … まずファイル名、外れたら PDF document info も見る
+       - Folder / ZipFile / ConvertibleArchive … ファイル名 (basename) + 保存済み AI 説明
+       - PdfFile … まずファイル名 + 保存済み AI 説明、必要なら PDF document info も見る
          (target が PDF メタを含むとき。get_document_info の IPC、
           保存済みパスワードは pdf_passwords から、PDF 境界でのみ cancel)
        - ZipImage … ファイル名のみ (ZIP を開いてメタを読む経路は持たない)
     Pass 2 (Image / Video、on-demand メタ):
+       - Image は保存済み AI 説明も同じ combined hay に含める
        - target に応じて必要なメタだけ読む (PNG tEXt / JPEG EXIF UserComment AI メタ / EXIF / XMP /
          動画コンテナメタ / dc:subject)
        - 専用 `rayon::ThreadPool` の 8 並列。背景索引用 `ActivityGate` には載せない
@@ -746,9 +792,12 @@ UI (render_search_bar)
     → 合格 idx を HashSet<usize> に反映 (search_filter)
 ```
 
-- **構造アイテムも一貫して絞り込む**: フォルダ / ZIP / PDF も「持っている次元」
-  (ファイル名、PDF は document info も) で判定する。検索対象がファイル名次元を
-  含まない (EXIF / タグ単独指定) なら構造アイテムは全件非表示になる。
+- **構造アイテムも一貫して絞り込む**: フォルダ / ZIP / 対応アーカイブ / PDF・EPUB も
+  ファイル名と保存済みの AI 説明で判定し、PDF は document info も含める。
+  「AI 説明」単独でも本が残る。EXIF 等、その項目が持たない次元だけの指定なら非表示になる。
+  スマートフォルダ等の一覧でも同じ worker を通り、説明文を検索する。子や本の中身は走査しない。
+  DB の open/SELECT は Pass 1 前に worker で完了し、Pass 2 の並列処理は文字列 snapshot だけを読む。
+  開けない・読めないときはログを残し、その説明文なしで評価する。UI では DB を読まない。
 - **PDF のページ表示中は Ctrl+F 自体を無効化** (`grid_is_pdf_pages`): 連番の
   合成ページ名を絞っても意味が無いため、ショートカットを無反応にし開いた
   バーも閉じる。
@@ -794,7 +843,7 @@ UI (global_search_ui::render_global_search_bar)
   [worker] スレッド内ループ:
     0. クエリ検証 (mode ごとの最小長、1 文字語拒否、NOT-only 禁止。§1.2)
     1. 正トークンを bigram 分解し build_bigram_and_query で BooleanQuery を構築
-       - include: target フィールド (filename/exif/xmp_tweet/png_prompt/pdf_meta/video_meta/tags)
+       - include: target フィールド (filename/exif/xmp_tweet/png_prompt/pdf_meta/video_meta/sidecar/ai_caption)
          ごとの OR を各トークンの子クエリにし、mode=AND なら top-level Must で、
          mode=OR なら Should 群を 1 Must にまとめる
        - favorite_id / kind は Must (exact term の OR)
@@ -833,6 +882,11 @@ UI (global_search_ui::render_global_search_bar)
 グリッド中央にも `検索中… 412,000 件を確認 (ヒット 3 件)` の形で表示する。完了後は
 確認件数を外し、従来どおり確定件数だけに戻す。候補総数の分母は実索引での事前 Count が
 200 ms 以内と確認できていないため持たず、索引再構築を伴わない累計値だけを使う。
+
+Ctrl+F / Ctrl+G 共通の `TARGET_CHOICES` は「AI 説明」を持ち、「すべての対象」にも含める。
+MCP の `search_items` は `SearchTarget::Only(SourceKind::ALL から AiCaption を除く)` を
+`SearchScope.target` に捕捉し、同じ対象を bigram query と `doc_text_for_target` の後置絞り込みに使う。
+説明文だけにある語で MCP の結果が増えたり、NOT 語で結果が減ったりしない。
 
 検索結果はフォルダバー履歴の ←/→ 復帰対象にしない。検索は透明な一時オーバーレイであり、
 検索中の移動は back/forward stack に記録せず、検索中は履歴ボタン自体を無効化する。

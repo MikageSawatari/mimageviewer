@@ -6,7 +6,290 @@ fn permission(gps: bool) -> PermissionSnapshot {
         level: AgentLevel::ReadOnly,
         thumbnails: false,
         gps,
+        ai_captions: false,
     }
+}
+
+fn seed_caption(path: &Path, failed: bool) {
+    use crate::ai_caption_db::*;
+    let request = SaveRequest {
+        item_path: path.to_owned(),
+        signature_path: path.to_owned(),
+        signature: FileSignature::from_metadata(&std::fs::metadata(path).unwrap()).unwrap(),
+        cover_ref: String::new(),
+        model_id: "caption-model".into(),
+        prompt_version: 1,
+        lang: "ja".into(),
+        result: if failed {
+            CaptionResult::Failed
+        } else {
+            CaptionResult::Ok {
+                caption: "海辺の本".into(),
+                text: "連絡先 123".into(),
+                keywords: vec!["sea".into()],
+            }
+        },
+    };
+    assert_eq!(
+        CaptionDb::open().unwrap().save(&request).unwrap(),
+        SaveOutcome::Written
+    );
+}
+
+#[test]
+fn ai_caption_permission_rows_and_image_staleness() {
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    let path = directory.path().join("caption.png");
+    std::fs::write(&path, png(&[])).unwrap();
+    let allowed = PermissionSnapshot {
+        ai_captions: true,
+        ..permission(false)
+    };
+    let read_image =
+        |permission| read(&item(&path, None), permission, &AtomicBool::new(false)).unwrap();
+    assert_eq!(read_image(allowed).ai_caption, CaptionField::None);
+    assert!(!crate::ai_caption_db::CaptionDb::db_path().exists());
+    seed_caption(&path, true);
+    assert_eq!(read_image(allowed).ai_caption, CaptionField::None);
+    seed_caption(&path, false);
+    let output = read_image(allowed);
+    let CaptionField::Present(info) = output.ai_caption else {
+        panic!("caption missing")
+    };
+    assert_eq!(info.caption.text, "海辺の本");
+    assert_eq!(info.visible_text.text, "連絡先 123");
+    assert_eq!(info.keywords, ["sea"]);
+    assert_eq!(info.model, "caption-model");
+    assert!(info.created_at > 0);
+    assert_eq!(info.stale, Some(false));
+    assert!(output.container_ai_caption.is_none());
+    assert_eq!(
+        read_image(permission(false)).ai_caption,
+        CaptionField::NotPermitted
+    );
+    std::fs::write(&path, [png(&[]), vec![0]].concat()).unwrap();
+    assert!(matches!(
+        read_image(allowed).ai_caption,
+        CaptionField::Present(AiCaptionInfo {
+            stale: Some(true),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn ai_caption_books_and_partial_items_use_outer_book_without_staleness() {
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    let allowed = PermissionSnapshot {
+        ai_captions: true,
+        ..permission(false)
+    };
+    let cancel = AtomicBool::new(false);
+    for name in ["book.pdf", "book.epub", "book.zip", "book.rar", "folder"] {
+        let path = directory.path().join(name);
+        if name == "folder" {
+            std::fs::create_dir(&path).unwrap();
+        } else if name == "book.zip" {
+            std::fs::write(&path, zip_bytes(&[("chapter/page.png", &png(&[]))])).unwrap();
+        } else {
+            std::fs::write(&path, b"fixture").unwrap();
+        }
+        seed_caption(&path, false);
+        let mut output = read(&item(&path, None), allowed, &cancel).unwrap();
+        assert!(
+            matches!(
+                output.ai_caption,
+                CaptionField::Present(AiCaptionInfo { stale: None, .. })
+            ),
+            "{name}"
+        );
+        assert!(output.container_ai_caption.is_none());
+        // PDF projection uses the same enrichment boundary without launching
+        // the PDF helper just to verify the caption's container ownership.
+        if name == "book.pdf" {
+            output.item.subresource = Some("page_0".into());
+            output.ai_caption = CaptionField::None;
+            enrich_caption(
+                &mut output,
+                &path,
+                Some(&std::fs::metadata(&path).unwrap()),
+                true,
+            )
+            .unwrap();
+            assert_eq!(output.ai_caption, CaptionField::None);
+            assert!(matches!(
+                output.container_ai_caption,
+                Some(CaptionField::Present(AiCaptionInfo { stale: None, .. }))
+            ));
+        }
+        if name == "book.zip" {
+            for member in ["chapter/page.png", "chapter/"] {
+                let output = read(&item(&path, Some(member)), allowed, &cancel).unwrap();
+                assert_eq!(output.ai_caption, CaptionField::None);
+                assert!(matches!(
+                    output.container_ai_caption,
+                    Some(CaptionField::Present(AiCaptionInfo { stale: None, .. }))
+                ));
+                let hidden = read(&item(&path, Some(member)), permission(false), &cancel).unwrap();
+                assert_eq!(hidden.ai_caption, CaptionField::NotPermitted);
+                assert_eq!(
+                    hidden.container_ai_caption,
+                    Some(CaptionField::NotPermitted)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ai_caption_off_does_not_open_store_and_read_failure_is_not_none() {
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    let db_path = crate::ai_caption_db::CaptionDb::db_path();
+    std::fs::write(&db_path, b"unreadable caption database").unwrap();
+    let path = directory.path().join("image.png");
+    std::fs::write(&path, png(&[])).unwrap();
+    assert_eq!(
+        read(
+            &item(&path, None),
+            permission(false),
+            &AtomicBool::new(false)
+        )
+        .unwrap()
+        .ai_caption,
+        CaptionField::NotPermitted
+    );
+    let allowed = PermissionSnapshot {
+        ai_captions: true,
+        ..permission(false)
+    };
+    assert_eq!(
+        read(&item(&path, None), allowed, &AtomicBool::new(false))
+            .unwrap_err()
+            .code,
+        ErrorCode::Internal
+    );
+    assert_eq!(
+        std::fs::read(&db_path).unwrap(),
+        b"unreadable caption database"
+    );
+    let version_zero = directory.path().join("unpublished.db");
+    drop(rusqlite::Connection::open(&version_zero).unwrap());
+    assert_eq!(
+        read_caption(&version_zero, &path, None, true).unwrap(),
+        CaptionField::None
+    );
+}
+
+#[test]
+fn ai_caption_text_budget_trims_after_generation_and_marks_each_text() {
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    let path = directory.path().join("caption.png");
+    std::fs::write(&path, png(&[])).unwrap();
+    seed_caption(&path, false);
+    let mut output = read(
+        &item(&path, None),
+        PermissionSnapshot {
+            ai_captions: true,
+            ..permission(false)
+        },
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    output.generation = InfoField::Present(GenerationInfo {
+        prompt: Some(text("生成情報".repeat(5000))),
+        ..Default::default()
+    });
+    let CaptionField::Present(info) = &mut output.ai_caption else {
+        panic!()
+    };
+    info.caption = text("説明文\\\"".repeat(5000));
+    info.visible_text = text("画像内文字".repeat(5000));
+    trim_descriptions(&mut output).unwrap();
+    assert!(mcp_content_chars(&output).unwrap() <= MAX_ITEM_CHARS);
+    let InfoField::Present(generation) = output.generation else {
+        panic!()
+    };
+    assert_eq!(
+        generation.prompt.unwrap(),
+        TextValue {
+            text: String::new(),
+            truncated: true
+        }
+    );
+    let CaptionField::Present(info) = output.ai_caption else {
+        panic!()
+    };
+    assert!(info.caption.truncated && info.visible_text.truncated);
+    assert_eq!(info.keywords, ["sea"]);
+    assert_eq!(info.model, "caption-model");
+}
+
+#[test]
+fn ai_caption_item_info_is_withheld_when_permission_changes_during_read() {
+    use crate::agent_ipc::{ReadHooks, tests::Fixture};
+    use std::sync::Arc;
+    let mut fixture = Fixture::new();
+    let path = fixture._dir.path().join("caption.png");
+    std::fs::write(&path, png(&[])).unwrap();
+    seed_caption(&path, false);
+    let set_allowed = |allowed| {
+        crate::settings_db::with_db_result(|db| {
+            let mut settings = db.load_into_settings()?;
+            settings.agent_show_ai_captions = allowed;
+            db.save_full(&settings)
+        })
+        .unwrap()
+    };
+    set_allowed(true);
+    let (started_send, started) = crossbeam_channel::bounded(1);
+    let (release, gate) = crossbeam_channel::bounded(1);
+    Arc::get_mut(&mut fixture.handlers).unwrap().read_hooks = Some(Arc::new(ReadHooks {
+        now: Arc::new(std::time::Instant::now),
+        execute: Box::new(move |command, ctx| {
+            let Command::GetItemInfo { items, .. } = command else {
+                panic!("unexpected command")
+            };
+            let output = read(&items[0], ctx.granted.0, &ctx.cancel)?;
+            assert!(matches!(output.ai_caption, CaptionField::Present(_)));
+            started_send.send(ctx.granted).unwrap();
+            gate.recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            Ok(Payload::Info(InfoPage {
+                items: vec![output.into()],
+                cursor: None,
+                truncated: false,
+            }))
+        }),
+    }));
+    let connection = fixture.connection();
+    let (send, recv) = crossbeam_channel::bounded(1);
+    let worker = connection
+        .request(
+            Request {
+                id: 1,
+                command: Command::GetItemInfo {
+                    items: vec![item(&path, None)],
+                    limit: None,
+                    cursor: None,
+                },
+            },
+            send,
+        )
+        .unwrap();
+    let admitted = started
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    assert!(admitted.0.ai_captions);
+    set_allowed(false);
+    release.send(()).unwrap();
+    let reply = recv
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    worker.join().unwrap();
+    assert_eq!(
+        reply.wire().result.unwrap_err().code,
+        ErrorCode::PermissionChanged
+    );
 }
 
 fn item(path: &Path, subresource: Option<&str>) -> ItemRef {
@@ -59,6 +342,33 @@ fn seed_tags(path: &Path, tag: &str) {
 }
 
 #[test]
+fn physical_archives_and_extension_like_folders_have_consistent_kinds() {
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    for extension in ["zip", "cbz", "rar", "cbr", "7z", "cb7", "lzh", "lha"] {
+        let path = directory.path().join(format!("book.{extension}"));
+        std::fs::write(&path, b"identity-only fixture").unwrap();
+        let output = read(
+            &item(&path, None),
+            permission(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(output.kind, ItemKind::Archive, "{extension}");
+    }
+    for name in ["book-folder", "book-folder.zip", "book-folder.epub"] {
+        let path = directory.path().join(name);
+        std::fs::create_dir(&path).unwrap();
+        let output = read(
+            &item(&path, None),
+            permission(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(output.kind, ItemKind::Folder, "{name}");
+    }
+}
+
+#[test]
 fn png_projection_bounds_prompt_and_preserves_file_tags_and_rating() {
     let directory = crate::settings_db::DataDirOverrideGuard::new();
     let path = directory.path().join("long.png");
@@ -108,6 +418,7 @@ fn png_projection_bounds_prompt_and_preserves_file_tags_and_rating() {
         "get_item_info",
         serde_json::json!([item(&path, None)]),
         "items",
+        0,
     )
     .unwrap();
     let page = InfoPage {
@@ -716,7 +1027,7 @@ fn list_folder_zip_books_round_trip_through_item_info_and_rating_preparation() {
     fixture.handlers.readers.install_book_composition(service);
     let ctx = ReadContext::new(
         &fixture.handlers,
-        permission(false),
+        (permission(false), 0),
         Arc::new(AtomicBool::new(false)),
     );
     let ratings = crate::rating_db::RatingDb::open().unwrap();
@@ -1108,6 +1419,8 @@ fn pdf_page_rating_and_container_tags_match_ui_without_starting_pdf_worker() {
         container_tags: vec![],
         exif: InfoField::NotApplicable,
         generation: InfoField::NotApplicable,
+        ai_caption: CaptionField::None,
+        container_ai_caption: None,
     };
     enrich(
         &mut output,

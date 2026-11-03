@@ -1,15 +1,42 @@
-# ローカル AI 説明文 V1-0 worker
+# ローカル AI 説明文 V1 worker
 
-Rust 本体に接続しない Windows x64 の単体試作。製品バイナリ、通常の設定 DB、HTTP server を起動しない。
+Windows x64 の worker と Rust client。GPU 判定・モデル導入の設定画面へ接続済み。
+画像から説明文を作成して DB へ保存するジョブは後続段階で接続する。
+製品バイナリ、通常の設定 DB、HTTP server を起動しない。
 `vendor/llama.cpp` は変更しない。画像は元の場所から読み、JSONL はリポジトリ外の runs に保存する。
 画像・説明文の内容をレビュー文書やリポジトリへ転載しない。
 
-## 前提とビルド
+## 復旧とビルド
+
+現ソースの identity と一致する `vendor/vlm-worker/mimageviewer-vlm.exe` があれば、
+`scripts/build-vlm-worker.ps1` は CMake を探さずそのまま使う。CMake / Vulkan SDK / llama.cpp のソースは不要。
+`-SkipBuild` も identity を検査し、古い exe の再利用は認めない。
+
+worker が無ければ、まず `bootstrap-vendor.sh` が
+`C:\home\mimageviewer_vendor_backup\vlm-worker\mimageviewer-vlm.exe` から復旧する。
+PowerShell から同じ復旧だけを実行する場合:
+
+```powershell
+.\scripts\vlm-worker-identity.ps1 -RestoreBackupRepo .
+```
+
+一時候補を実ファイルでコピーし、現ソースの identity と一致してから公開する。
+バックアップの欠落・不一致では配置しない。既存の worker を上書きせず、APPDATA からは取り込まない。
+
+バックアップで復旧できない場合、`scripts/setup-llama-cpp.ps1` が固定 commit の GitHub ZIP を取得・
+SHA-256 照合・安全に staging へ展開し、欠落している `vendor/llama.cpp` へ公開する入口になる。
+GitHub ZIP の SHA-256 はソースに固定してある (2026-11-03 に中身を照合)。一致しなければ展開しない。
+引数・環境変数で hash / URL を差し替える入口は無い。
+既存 source tree を消さず、archive の traversal・絶対パス・リンク・重複・Windows の不正名を拒否する。
+
+### C++ の再ビルドが必要なとき
 
 - Visual Studio 18 2026 BuildTools、MSVC C++、Windows SDK、CMake 3.24 以上。
 - Vulkan SDK `C:\VulkanSDK\1.4.363.0`。未設定なら CMake がこの場所を使う。
-- llama.cpp **b12032**, commit `dde879bc4f954b809892fd0d660515f42536394a` を `vendor/llama.cpp/` に配置済みであること。
-  提供されたアーカイブの SHA-256 は `2fbadc9cc8552352efbdf3cf5bc7b8c9cce84a12c876cca03c858cb062567e2a`。
+- llama.cpp **b12032**, commit `dde879bc4f954b809892fd0d660515f42536394a` を `vendor/llama.cpp/` に用意する。
+  未配置の場合は上記の固定版 source の復旧手順を使う。
+  V1-0 で提供された別アーカイブの SHA-256 は `2fbadc9cc8552352efbdf3cf5bc7b8c9cce84a12c876cca03c858cb062567e2a`。
+  新しい GitHub ZIP 取得用の pin には使わない。
   ビルドに取得処理はない。別バージョンへの互換性は保証しない。
 
 リポジトリルートの PowerShell から実行する。
@@ -18,11 +45,22 @@ Rust 本体に接続しない Windows x64 の単体試作。製品バイナリ�
 $env:MSBUILDDISABLENODEREUSE = '1'
 $env:CMAKE_BUILD_PARALLEL_LEVEL = '1'
 cmake -S crates/vlm-worker -B crates/vlm-worker/build -G 'Visual Studio 18 2026' -A x64 -DVLM_REFERENCE_TOOLS=OFF
-cmake --build crates/vlm-worker/build --config Release --target mimageviewer-vlm vlm-contract-tests vlm-greedy-tests vlm-image-attempt-tests vlm-output-tests vlm-image-input-tests -- /m:1 /nr:false
+cmake --build crates/vlm-worker/build --config Release --target mimageviewer-vlm vlm-contract-tests vlm-greedy-tests vlm-image-attempt-tests vlm-output-tests vlm-image-input-tests vlm-protocol-tests -- /m:1 /nr:false
 ctest --test-dir crates/vlm-worker/build -C Release --output-on-failure
 ```
 
 出力は `vendor/vlm-worker/mimageviewer-vlm.exe`。MSBuild の並列ノード起動が sandbox で不安定だったため `/m:1` を使う。
+worker だけを明示的に再ビルドする入口は `scripts/build-vlm-worker.ps1 -Rebuild`。
+引数なしでは現ソースと一致する exe を再利用し、missing / stale の場合だけ再ビルドする。
+C++ を変更したときは上記 CTest と identity の検査後、次のように backup も更新する。
+バックアップへの書込みは利用者が実行する手順であり、自動 build は backup を変更しない。
+
+```powershell
+.\scripts\vlm-worker-identity.ps1 -ValidateRepo .
+New-Item -ItemType Directory -Path C:\home\mimageviewer_vendor_backup\vlm-worker -Force | Out-Null
+Copy-Item -LiteralPath .\vendor\vlm-worker\mimageviewer-vlm.exe -Destination C:\home\mimageviewer_vendor_backup\vlm-worker\mimageviewer-vlm.exe -Force
+```
+
 `GGML_VULKAN=ON`, `GGML_NATIVE=OFF`, `GGML_RPC=OFF`, `BUILD_SHARED_LIBS=OFF`, `GGML_BACKEND_DL=OFF`。
 `LLAMA_OPENSSL`, `LLAMA_BUILD_SERVER/TOOLS/EXAMPLES/TESTS/APP/COMMON`, `LLAMA_SUBPROCESS`, `MTMD_VIDEO` は OFF。
 b12032 の `LLAMA_BUILD_MTMD=ON` が `tools/mtmd` のライブラリだけを追加するので、tools 一式を有効にする必要はない。
@@ -58,7 +96,8 @@ IHDR の寸法をデコード前に検査し、検査した同一の byte buffer
 
 モデルと mmproj はプロセスで一度だけ読み込む。各画像で llama context（memory・sequence）と grammar sampler を新規作成し、
 位置 0、sequence 0 から開始して、その画像の最後に破棄する。mtmd の画像チャンク・bitmap も各件で破棄する。
-処理は直列なので supersession、rollback、並行ジョブの状態は作らない。製品の匿名パイプ・共有メモリ・Job Object は未実装。
+処理は直列なので supersession、rollback、並行ジョブの状態は作らない。
+`--selftest` は従来と同じ mtmd helper/STB で PNG を RGB へデコードしてから、`--serve` と共通の `caption_rgb` で推論する。
 
 固定条件は greedy、context 8192、生成上限 800、batch 2048、ubatch 512、flash attention AUTO、CPU threads 24（C9 と同じ）。
 greedy 最大候補を先に文法で検査し、不許可のときだけ全語彙を mask する。常に全語彙を mask する場合と選択結果は同じ。
@@ -95,11 +134,116 @@ Vulkan-Hppの `vk::<型名>::<API名>`＋定義済みのメモリ不足/device�
 元の `run_eval.py` の v0-3l（40文字）は過去比較用として変更せず、worker の `prompt.h` の `kSchema` を32文字にする。
 JSONL の `prompt_version=v0-3l` は元の評価条件名を引き継ぐが、現在の worker の schema 上限は32文字である。
 
+## 常駐用の通信 (`--serve`、protocol version 2)
+
+stdin/stdout の匿名パイプを CRT の `_O_BINARY` にし、stdout は枠の出力だけに使う。
+llama/ggml/mtmd の callback は stderr へ向ける。ネットワーク、共有メモリ、worker 側の画像デコードは使わない。
+親が worker の Job Object と期限を管理する。worker は直列で読み、1要求ずつ答える。
+
+枠は `u32 LE body_length` + `u32 LE json_length` + UTF-8 JSON + 残りのバイト列。
+`body_length` は内側の長さ4バイトも含み、4〜16 MiB。JSON は object で、生NUL、不正UTF-8、末尾の余分な内容を拒否する。
+`caption` の残りだけが RGB8 で、各行を詰めた `width * height * 3` バイト。他の種類には残りのバイトを許可しない。
+長さ、JSON、種類、必須欄、順序、寸法、RGB量の不正は stderr に出し exit 1。やりとりを続けない。
+外側の長さを読む前の EOF は正常終了、途中の EOF は不正な枠として終了する。
+
+| 要求のJSON | 応答のJSON |
+| --- | --- |
+| `{"type":"hello"}` | `type="hello"`, `protocol_version=2`, `prompt_version=1`, `source_identity` (64桁のSHA-256) |
+| `{"type":"load","model_path":"...","mmproj_path":"...","device_luid":"HIGH:LOW","cpu_threads":24}` | `type="load"`, `status="ok"`, `model_load_s`, `device`。読込失敗は `status="fatal"`, `error` を返して終了 |
+| `{"type":"caption","request_id":1,"width":1024,"height":768}` + RGB | `type="caption"`, 同じ `request_id`, `status="ok"` / `"image_failure"` / `"fatal"`, `wall_s`。成功時は `caption`, `text`, `keywords`, `content`, `finish_reason`, `validation`, `generated_tokens`, `usage`, `timings`, `prompt_chunks` |
+| `{"type":"shutdown"}` | 応答せず終了 |
+
+`hello` は最初の1回、`load` はその後1回だけ。以降 `caption` を繰り返す。`shutdown` と EOF はロード前も使える。
+`request_id` は0〜u64最大、寸法は各軸1〜1024、CPU threadsは1〜1024の整数。パスは空文字とNULを拒否。
+LUID は各8桁16進数を `:` で結び、空なら既定GPUを選ぶ。load後にdevice/モデルを変更しない。
+`device` は従来の selftest と同じDXGI/Vulkan/ggml対応情報を含む。
+
+`validation` のbool欄は `encoding_valid`, `ended_on_eog`, `json_complete`, `field_types`, `limits`, `token_limit`, `ok`。
+画像単位の例外では `error`, `finish_reason="error"`, すべて不合格の `validation`, `json_ok=false` を返し、次へ進む。
+完成した出力が検証で不合格でも `image_failure`。致命的例外では `error` を返して終了する。
+推論・検証・失敗の境界は selftest と共通で、自動再試行や自動再起動はしない。
+`prompt_chunks` の画像idは selftest ではPNGのSHA-256、serveでは空。推論結果には使わない。
+
+source identity は `CMakeLists.txt`, `src/*.{cpp,h}`, `tests/*.cpp`, `tools/source-identity.ps1` が対象。
+CRLFだけをバイト単位でLFにし、各SHA-256をordinal順のslash相対名 `name:hash\n` に連結してさらにSHA-256化する。
+ビルド時に同じPowerShellスクリプトで再計算する。vendorコードや生成物は対象外。
+`MIV_VLM_SOURCE_SHA256:<hash>` を PE に 1 つ焼き込む。配布時の source identity gate は
+`scripts/vlm-worker-identity.ps1` が worker を実行せずに現ソースと照合する。
+release Cargo build・通常版の署名と内包前・portable のコピー前に検査し、再利用でも省略しない。
+製品の `prompt_version` は `ai_caption.db` と同じ整数 (現在 1)。selftest JSONL の
+`v0-3l` は従来の比較条件名として残し、製品の版とは区別する。
+
+CTestの `vlm-protocol` はバイナリ画素（NUL/CR/LF/0x1Aを含む）、u64最大、16MiB境界、途中EOF、
+内外長さ、JSON/UTF-8、必須欄、RGB寸法/量、要求順序を非モデルテストで確認する。
+
+### Rust client と確認
+
+`src/ai/vlm_worker.rs` は AI worker の transport として TRT client の隣に置く。
+`job_process` は AI に依存しない Windows 起動 helper で、EPUB と共有する。
+PDFium の外側の枠と同じ u32 LE を使うが、512MiB 上限の PDF 私有関数は変更せず、
+VLM の16MiB上限と JSON/RGB の内側の検査は client 内で所有する。
+
+V1-3 の持ち主は worker スレッドで `worker_executable()` → `VlmWorkerClient::start_at()` を呼び、
+`kill_handle()` を App に渡してから `hello()` → `load()` → `caption()` を直列で呼ぶ。
+起動から hello までまとめた `spawn_at()` もテスト等に使える。
+通常の中止は今の1件の完了後に結果を捨てて `shutdown()`、アプリ終了は App の kill handle から直ちに `kill()`。
+終了は子を先に止め、I/O thread の join は待たない。client は再起動・再試行しない。
+Rust 側でも終了理由・完全JSON・3欄の型/内容一致・Unicode文字数の上限を検査する。
+worker の場所は debug build だけ `MIV_VLM_WORKER` を優先し、その後 portable は exe の隣、
+通常版は core 内包の worker を `<data_dir>/vlm/workers/<内容のSHA256>/` に展開する。
+展開は worker スレッド上で VST3 と同じ regular-file 検査・全バイト照合・一時ファイルからの置換を使う。
+reparse point を拒否し、旧版は消さない。実行時は protocol と prompt_version を照合し、source identity は比較しない。
+GPU の利用条件は選択した同一 device が Vulkan 対応かつ専用 VRAM 総量 7.5GiB 以上。
+通常版・portable の build は `scripts/build-vlm-worker.ps1` で native worker を検査し、一致するものは再利用する。
+missing / stale の場合だけ再ビルドする。
+署名は通常版が内包前、portable がコピー後に行う。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/ai::vlm_worker::tests/) | test(/job_process::tests/) | test(/epub_convert::tests/)'
+```
+
+偽 worker は `tests/support/vlm_fake_worker.rs` の内容のハッシュを名前に含めた
+`target/vlm-fake-worker/<hash>/` に rustc で build し、既存のものを使い回す。
+同じ cache root 内の一時フォルダーで build してから、exe・PDB を含むフォルダーを rename で公開する。
+同時 build で公開に負けた側は既存のものを使い、一時フォルダーを回収する。生成物は `%TEMP%` に残さない。
+製品の exe、画像、モデル、設定は使わない。実モデル照合は次の3つの環境変数がすべてある場合だけ実行する。
+PNG の decode → RGB8 はこのテスト内だけにあり、製品の画像準備・縮小は V1-3 で接続する。
+画像をコピーせず、説明文の内容・画像名をテスト出力に出さず、3欄の完全一致を26枚すべてで検査する。
+
+```powershell
+$env:MIV_VLM_TEST_MODEL = 'G:\home\vlm-eval\models\unsloth__Qwen3.5-4B-GGUF\Qwen3.5-4B-Q4_K_M.gguf'
+$env:MIV_VLM_TEST_MMPROJ = 'G:\home\vlm-eval\models\unsloth__Qwen3.5-4B-GGUF\mmproj-F16.gguf'
+$env:MIV_VLM_TEST_IMAGES = 'G:\home\vlm-eval\inputs\1024'
+cargo nextest run -p mimageviewer --lib -E 'test(/real_model_serve_matches_v1_0/)'
+```
+
+基準は `G:\home\vlm-eval\runs\20261102-V1-0\forward.jsonl`。
+任意の `MIV_VLM_TEST_BASELINE` / `MIV_VLM_TEST_LUID` で基準ファイルとGPUを明示できる。
+CPU threads は V1-0 と同じ24。合成テストと本体 lib 全件を走らせる際は実モデル用の3変数を外す。
+
+### V1-1 の検証記録 (2026-11-02)
+
+実装担当による検証。独立レビューは別途行う。
+CTest は **6/6 成功**。Rust の VLM client・共通起動 helper・既存 EPUB テストは **76/76 成功**。
+上記3変数を指定した実モデルテストは **26/26 枚で3欄が V1-0 と完全一致**し、全件が Rust 側の検証も通過した。
+モデルは Qwen3.5-4B Q4_K_M + mmproj-F16、CPU threads 24、画像は指定済みの1024px版をその場で読み取った。
+画像をコピーせず、説明文・画像名を報告へ転載していない。実モデルテスト全体は92.192秒。
+通信系 import は引き続き無く、exe は ADVAPI32 / KERNEL32 / DXGI / Vulkan の4 DLLだけを import する。
+
+Rust の JUnit と CTest ログは `target/vlm-v1-1/`、import監査は
+`G:\home\vlm-eval\runs\20261102-V1-1-worker-serve\imports`。
+本体 lib 全件は既存の `target/test-lib-full/` 台帳を使う。
+この sandbox の初回依存ビルドでは MSVC の compiler PDB エラー C1090 と MSBuild 並列実行失敗を観測したため、
+検証コマンド内だけで `_CL_=/Z7` と `CARGO_BUILD_JOBS=1` を指定した。
+`MSBUILDDISABLENODEREUSE=1` を指定し、製品のソースや共通ビルド設定は変更していない。
+
 ## GPU の選択
 
 `--device 00000000:00000000` のように `--list-devices` が示す `HIGH:LOW`（各8桁の16進 LUID）を指定できる。
 省略時は DXGI/Vulkan を LUID で結べるアダプタのうち専用メモリ総量が最大のものを選ぶ。
 空き VRAM は選択に使わない。DXGI の専用メモリ総量を結果に残す。
+`--list-devices` は `vulkan_available` と `vulkan_error` も返す。Vulkan runtimeの初期化・列挙が失敗した場合もDXGI一覧を残す。
+ただし静的importの `vulkan-1.dll` が無い場合はworker自体を起動できず、親側の起動失敗になる。
 
 b12032 の Vulkan backend は公開 API に LUID/UUID を出さず、`get_proc_address` も NULL。
 そこで `VkPhysicalDeviceIDProperties.deviceLUID` → Vulkan physical index を求め、ggml の初期化前に

@@ -13,6 +13,7 @@ struct PermissionSelection {
     level: AgentLevel,
     thumbnails: bool,
     gps: bool,
+    ai_captions: bool,
 }
 
 impl From<&Settings> for PermissionSelection {
@@ -21,6 +22,7 @@ impl From<&Settings> for PermissionSelection {
             level: s.agent_level,
             thumbnails: s.agent_show_thumbnails,
             gps: s.agent_show_gps,
+            ai_captions: s.agent_show_ai_captions,
         }
     }
 }
@@ -244,6 +246,12 @@ fn level_label(level: AgentLevel) -> &'static str {
 fn draw_images(ui: &mut egui::Ui, settings: &mut PermissionSelection) {
     ui.checkbox(&mut settings.thumbnails, "縮小画像を AI に見せる");
     ui.checkbox(&mut settings.gps, "撮影位置 (GPS) を AI に見せる");
+    ui.checkbox(&mut settings.ai_captions, "AI 説明文を AI に見せる");
+    ui.label("ON にすると、AI アプリが AI 説明文 (説明文・画像内の文字・検索語) で検索でき、内容も受け取ります");
+    ui.label("画像内の文字には、氏名・連絡先などが含まれる場合があります。");
+    ui.label(
+        "OFF でも、名前での検索結果から、本に AI 説明文があることを推測できる場合があります。",
+    );
     ui.add_space(8.0);
 }
 
@@ -259,7 +267,7 @@ fn exposure(draft: PermissionSelection) -> Exposure {
         shown: Vec::new(),
         hidden: vec![
             "画像・動画・音声の元データ",
-            "PDF / ZIP の中身の本文",
+            "PDF / ZIP の本文そのもの (ページの画像や文章を直接取り出すこと)",
             "mIV の設定・PDF のパスワード・リモート接続の暗証番号",
         ],
         actions: Vec::new(),
@@ -268,7 +276,7 @@ fn exposure(draft: PermissionSelection) -> Exposure {
         result.shown.push("なし (AI 連携は無効です)");
         result
             .hidden
-            .push("ファイルの情報・縮小画像・撮影位置を含む、すべての情報");
+            .push("ファイルの情報・縮小画像・撮影位置・AI 説明文を含む、すべての情報");
         result.actions.push("なし");
         return result;
     }
@@ -286,6 +294,11 @@ fn exposure(draft: PermissionSelection) -> Exposure {
         result.shown.push("撮影位置 (GPS)");
     } else {
         result.hidden.push("撮影位置 (GPS)");
+    }
+    if draft.ai_captions {
+        result.shown.push("AI 説明文 (説明文・画像内の文字・検索語。表紙に固定した本文のページや ZIP の中の画像から読み取った文字も含む)");
+    } else {
+        result.hidden.push("AI 説明文");
     }
     result.actions.push("情報の読み取り・検索");
     if draft.level >= AgentLevel::ReadAndOpen {
@@ -624,6 +637,7 @@ impl App {
         candidate.agent_level = permission.level;
         candidate.agent_show_thumbnails = permission.thumbnails;
         candidate.agent_show_gps = permission.gps;
+        candidate.agent_show_ai_captions = permission.ai_captions;
         if candidate.save_checked() {
             self.settings = candidate;
         } else {
@@ -652,7 +666,7 @@ fn draw_body(
 ) {
     let label = ui.label(egui::RichText::new("許可の範囲").strong());
     draw_permission(ui, settings).labelled_by(label.id);
-    ui.label(egui::RichText::new("縮小画像・撮影位置").strong());
+    ui.label(egui::RichText::new("縮小画像・撮影位置・AI 説明文").strong());
     draw_images(ui, settings);
     ui.label(egui::RichText::new("AI に見せる範囲").strong());
     draw_exposure(ui, settings);
@@ -857,6 +871,7 @@ pub fn draw_agent_integration_snapshot_fixture(ui: &mut egui::Ui, level: u8) {
         level: AgentLevel::Disabled,
         thumbnails: false,
         gps: false,
+        ai_captions: false,
     };
     settings.level = match level {
         0 => AgentLevel::Disabled,
@@ -866,6 +881,7 @@ pub fn draw_agent_integration_snapshot_fixture(ui: &mut egui::Ui, level: u8) {
     };
     settings.thumbnails = level >= 2;
     settings.gps = level >= 2;
+    settings.ai_captions = level >= 2;
     let command = backend::RegistrationCommand {
         command: r"C:\mImageViewer\mimageviewer-mcp.exe".into(),
         args: vec!["--data-dir".into(), r"C:\mImageViewer\data".into()],

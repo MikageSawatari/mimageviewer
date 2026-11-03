@@ -30,7 +30,7 @@
 //! ```
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -69,6 +69,7 @@ thread_local! {
     static FULL_SCAN_GATE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
     static FULL_SCAN_AFTER_APPLY_GATE: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
     static FTS_SCAN_EXTENSIONS_OVERRIDE: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+    static CAPTION_REFLECTION_AFTER_REOPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Supervisor が UI に返す進捗・状態スナップショット。
@@ -233,6 +234,8 @@ impl Drop for SupervisorHandle {
 
 /// Supervisor construction parameters.
 pub struct SupervisorParams {
+    pub caption_epoch: Arc<AtomicU64>,
+    pub caption_db_path: PathBuf,
     pub favorite_id: Uuid,
     pub favorite_root: PathBuf,
     pub excluded_roots: Vec<PathBuf>,
@@ -278,6 +281,8 @@ pub fn spawn(
     let excluded_roots = params.excluded_roots.clone();
     let enable_metadata_index = params.enable_metadata_index;
     let skip_initial_scan = params.skip_initial_scan;
+    let caption_epoch = Arc::clone(&params.caption_epoch);
+    let caption_db_path = params.caption_db_path.clone();
     let similar_notifier = params.similar_notifier.clone();
     let similar_registration = similar_notifier
         .as_ref()
@@ -307,6 +312,8 @@ pub fn spawn(
                 excluded_roots,
                 enable_metadata_index,
                 skip_initial_scan,
+                caption_epoch,
+                caption_db_path,
                 similar_notifier,
                 similar_registration,
                 meta_db,
@@ -365,6 +372,8 @@ fn supervisor_loop(
     excluded_roots: Vec<PathBuf>,
     enable_metadata_index: bool,
     skip_initial_scan: bool,
+    caption_epoch: Arc<AtomicU64>,
+    caption_db_path: PathBuf,
     similar_notifier: Option<crate::similar_index::SimilarIndexNotifier>,
     similar_registration: Option<crate::similar_index::SimilarWatchRegistration>,
     meta_db: Arc<FtsMetaDb>,
@@ -379,8 +388,14 @@ fn supervisor_loop(
     change_tx: Sender<DebouncedChange>,
     change_rx: Receiver<DebouncedChange>,
 ) {
-    let session = IngestSession::new(favorite_id, favorite_root.clone(), &meta_db, &fts)
-        .with_activity_gate(&activity_gate);
+    let mut session = IngestSession::new_with_caption_db_path(
+        favorite_id,
+        favorite_root.clone(),
+        &meta_db,
+        &fts,
+        caption_db_path,
+    )
+    .with_activity_gate(&activity_gate);
 
     // 1. Watcher registration is a barrier for the similar index.  Publish its terminal
     // immediately after recursive registration, before the metadata scan can hold this thread.
@@ -425,11 +440,12 @@ fn supervisor_loop(
         .then(|| Instant::now() + WATCH_RETRY_DELAYS[0]);
 
     // 2. 初期スキャン実行 (cancel は Arc のまま渡す — walker 途中で shutdown 可能に)
+    let mut caption_seen = caption_epoch.load(Ordering::Acquire);
     if enable_metadata_index && !skip_initial_scan {
         run_initial_scan(
             favorite_id,
             &favorite_root,
-            &session,
+            &mut session,
             &writer,
             &io_sem,
             &excluded_roots,
@@ -440,6 +456,17 @@ fn supervisor_loop(
         mark_activity(&stats);
     } else if enable_metadata_index {
         crate::logger::log(format!("indexer[{favorite_id}]: initial scan skipped"));
+    }
+    if enable_metadata_index && skip_initial_scan {
+        reflect_captions(
+            &mut session,
+            &writer,
+            &io_sem,
+            &excluded_roots,
+            &cancel,
+            &stats,
+            &progress,
+        );
     }
     let initial_scan_duration_ms = {
         let mut stats = stats.lock().unwrap();
@@ -476,6 +503,19 @@ fn supervisor_loop(
         if cancel.load(Ordering::SeqCst) {
             break;
         }
+        if enable_metadata_index {
+            poll_caption_epoch(&caption_epoch, &mut caption_seen, || {
+                reflect_captions(
+                    &mut session,
+                    &writer,
+                    &io_sem,
+                    &excluded_roots,
+                    &cancel,
+                    &stats,
+                    &progress,
+                );
+            });
+        }
         if watcher.as_ref().is_some_and(FsWatcher::is_stopped) {
             watcher.take();
             watch_retry_attempt = 0;
@@ -509,7 +549,7 @@ fn supervisor_loop(
                         run_initial_scan(
                             favorite_id,
                             &favorite_root,
-                            &session,
+                            &mut session,
                             &writer,
                             &io_sem,
                             &excluded_roots,
@@ -575,7 +615,7 @@ fn supervisor_loop(
                             run_initial_scan(
                                 favorite_id,
                                 &favorite_root,
-                                &session,
+                                &mut session,
                                 &writer,
                                 &io_sem,
                                 &excluded_roots,
@@ -621,7 +661,7 @@ fn supervisor_loop(
                                 run_initial_scan(
                                     favorite_id,
                                     &favorite_root,
-                                    &session,
+                                    &mut session,
                                     &writer,
                                     &io_sem,
                                     &excluded_roots,
@@ -675,6 +715,144 @@ fn supervisor_loop(
     crate::logger::log(format!("indexer[{favorite_id}]: supervisor exiting"));
 }
 
+/// Sample before reading pending rows. Never consume a write published during reflection.
+fn poll_caption_epoch(epoch: &AtomicU64, seen: &mut u64, reflect: impl FnOnce()) {
+    let current = epoch.load(Ordering::Acquire);
+    if current != *seen {
+        reflect();
+        *seen = current;
+    }
+}
+
+const CAPTION_REFLECTION_LIMIT: usize = 500;
+
+/// Pending rows belong to SQLite; only this supervisor's existing metadata range is read.
+#[allow(clippy::too_many_arguments)]
+fn reflect_captions(
+    session: &mut IngestSession,
+    writer: &crate::fts_writer_dispatcher::FtsWriterDispatcher,
+    io_sem: &GlobalIoSemaphore,
+    excluded_roots: &[PathBuf],
+    cancel: &AtomicBool,
+    stats: &Mutex<SupervisorStats>,
+    progress: &ProgressReporter,
+) {
+    if cancel.load(Ordering::Relaxed) || !session.caption_db_path.exists() {
+        return;
+    }
+    let reader_ready = session.reopen_caption_connection();
+    #[cfg(test)]
+    {
+        let after_reopen = CAPTION_REFLECTION_AFTER_REOPEN.with(|hook| hook.borrow_mut().take());
+        if let Some(after_reopen) = after_reopen {
+            after_reopen();
+        }
+    }
+    // A writer may publish its first rows after the reopen attempt. Do not read
+    // or acknowledge them until this session has a published reader of its own.
+    if !reader_ready {
+        return;
+    }
+    let db =
+        match crate::ai_caption_db::CaptionDb::open_existing_for_write(&session.caption_db_path) {
+            Ok(db) => db,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "indexer[{}]: caption reflection open failed: {error}",
+                    session.favorite_id
+                ));
+                return;
+            }
+        };
+    let ranges = crate::metadata_ownership::OwnedRange {
+        root: crate::metadata_ownership::root_key(&session.favorite_root),
+        exclusions: excluded_roots
+            .iter()
+            .map(|path| crate::metadata_ownership::root_key(path))
+            .collect(),
+    }
+    .sql_ranges();
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let pending = match db.pending_in_ranges(&ranges, CAPTION_REFLECTION_LIMIT) {
+            Ok(pending) => pending,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "indexer[{}]: caption pending read failed: {error}",
+                    session.favorite_id
+                ));
+                break;
+            }
+        };
+        if pending.is_empty() {
+            break;
+        }
+        let mut ingest = Vec::new();
+        let mut delete = Vec::new();
+        let mut keys = std::collections::HashSet::new();
+        for (key, _, _) in &pending {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            if !keys.insert(key) {
+                continue;
+            }
+            match build_candidate_from_path(
+                std::path::Path::new(key),
+                key.clone(),
+                session.caption_db(),
+            ) {
+                Ok(Some(candidate)) => ingest.push(candidate),
+                Ok(None) => delete.push(key.clone()),
+                Err(error) => {
+                    writer.report_failure("caption book candidate read", &error);
+                    return;
+                }
+            }
+        }
+        match session.apply(
+            ingest,
+            delete,
+            writer,
+            io_sem,
+            IoPriority::Low,
+            cancel,
+            Some(progress),
+        ) {
+            Ok(applied) => {
+                update_stats(stats, &applied);
+                mark_activity(stats);
+                if applied.cancelled
+                    || cancel.load(Ordering::Relaxed)
+                    || applied.ingested_failed > 0
+                    || applied.caption_read_errors > 0
+                {
+                    break;
+                }
+            }
+            Err(error) => {
+                crate::logger::log(format!(
+                    "indexer[{}]: caption reflection apply failed: {error}",
+                    session.favorite_id
+                ));
+                break;
+            }
+        }
+        // apply has completed every commit/reload and metadata write. A later revision
+        // cannot be acknowledged by this batch, including delete/reinsert and key swaps.
+        if let Err(error) = db.mark_reflected(&pending) {
+            crate::logger::log(format!(
+                "indexer[{}]: caption acknowledgement failed: {error}",
+                session.favorite_id
+            ));
+            break;
+        }
+    }
+    progress.clear();
+}
+
 fn accept_change_unless_cancelled(
     cancel: &AtomicBool,
     change: DebouncedChange,
@@ -688,6 +866,41 @@ fn accept_change_unless_cancelled(
 
 #[allow(clippy::too_many_arguments)]
 fn run_initial_scan(
+    favorite_id: Uuid,
+    favorite_root: &std::path::Path,
+    session: &mut IngestSession,
+    writer: &crate::fts_writer_dispatcher::FtsWriterDispatcher,
+    io_sem: &GlobalIoSemaphore,
+    excluded_roots: &[PathBuf],
+    cancel: Arc<AtomicBool>,
+    stats: &Mutex<SupervisorStats>,
+    progress: &ProgressReporter,
+) {
+    session.reopen_caption_connection();
+    run_initial_scan_inner(
+        favorite_id,
+        favorite_root,
+        session,
+        writer,
+        io_sem,
+        excluded_roots,
+        Arc::clone(&cancel),
+        stats,
+        progress,
+    );
+    reflect_captions(
+        session,
+        writer,
+        io_sem,
+        excluded_roots,
+        &cancel,
+        stats,
+        progress,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_initial_scan_inner(
     favorite_id: Uuid,
     favorite_root: &std::path::Path,
     session: &IngestSession,
@@ -758,7 +971,7 @@ fn run_initial_scan(
     // 旧実装は `Arc::new(AtomicBool::new(cancel.load()))` でスナップショットを渡しており、
     // 長時間 walk 中に SupervisorHandle::drop() が cancel を立てても伝わらなかった。
     let t_walk = Instant::now();
-    let scan = match search_walker::scan(
+    let scan = match search_walker::scan_with_captions(
         ScanParams {
             favorite_id,
             root: favorite_root.to_path_buf(),
@@ -770,6 +983,7 @@ fn run_initial_scan(
         io_sem,
         IoPriority::Low,
         session.activity_gate,
+        session.caption_db(),
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -919,6 +1133,7 @@ pub(crate) fn fts_scan_fingerprint(
         excluded,
         crate::fts_meta::INDEX_VERSION,
         extensions,
+        "caption-books-v1",
     ))
     .expect("string fingerprint serialization")
 }
@@ -993,7 +1208,21 @@ fn apply_single_change(
         .to_ascii_lowercase();
     if ext == "json" || ext == "txt" {
         reingest_images_for_sidecar(session, writer, io_sem, cancel, stats, progress, &path);
-        return;
+        let is_indexed_book = match session.meta_db.get(&key) {
+            Ok(row) => row.is_some_and(|row| {
+                matches!(
+                    row.kind,
+                    crate::fts_index::IndexKind::Zip | crate::fts_index::IndexKind::Folder
+                )
+            }),
+            Err(error) => {
+                writer.report_failure("sidecar book metadata read", &error);
+                return;
+            }
+        };
+        if !path.is_dir() && !is_indexed_book {
+            return;
+        }
     }
 
     match kind {
@@ -1031,7 +1260,15 @@ fn apply_single_change(
             // 安全側に倒し、候補が作れなければ Remove 経路にフォールバックする。
             // (種別外は通常 DB に行が無く delete 空振りだが、ZIP は旧版が入れた
             //  行をこの経路で掃除できる)。
-            let Some(cand) = build_candidate_from_path(&path, key.clone()) else {
+            let candidate =
+                match build_candidate_from_path(&path, key.clone(), session.caption_db()) {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        writer.report_failure("watcher caption book read", &error);
+                        return;
+                    }
+                };
+            let Some(cand) = candidate else {
                 let ingest_stats = match session.apply(
                     vec![],
                     vec![key],
@@ -1094,7 +1331,14 @@ fn reingest_images_for_sidecar(
             return;
         }
         let key = crate::search_index_db::normalize_path(&img);
-        let Some(cand) = build_candidate_from_path(&img, key) else {
+        let candidate = match build_candidate_from_path(&img, key, session.caption_db()) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                writer.report_failure("sidecar caption book read", &error);
+                return;
+            }
+        };
+        let Some(cand) = candidate else {
             continue;
         };
         match session.apply(
@@ -1115,10 +1359,25 @@ fn reingest_images_for_sidecar(
     }
 }
 
-fn build_candidate_from_path(abs_path: &std::path::Path, key: String) -> Option<CandidateFile> {
-    let metadata = std::fs::metadata(abs_path).ok()?;
+fn build_candidate_from_path(
+    abs_path: &std::path::Path,
+    key: String,
+    captions: Option<&crate::ai_caption_db::CaptionDb>,
+) -> rusqlite::Result<Option<CandidateFile>> {
+    if crate::folder_tree::is_apple_double(abs_path) {
+        return Ok(None);
+    }
+    if let Some(captions) = captions
+        && let search_walker::BookCandidateDecision::Include(kind) =
+            search_walker::caption_book_candidate(abs_path, captions)?
+    {
+        return Ok(search_walker::book_candidate_file(abs_path, kind));
+    }
+    let Some(metadata) = std::fs::metadata(abs_path).ok() else {
+        return Ok(None);
+    };
     if !metadata.is_file() {
-        return None;
+        return Ok(None);
     }
     let mtime = metadata
         .modified()
@@ -1138,7 +1397,7 @@ fn build_candidate_from_path(abs_path: &std::path::Path, key: String) -> Option<
     // アーカイブ系 Susie プラグインが "zip" を申告しても確実に弾けるよう、
     // 拡張子分類より前に明示的に reject する (Codex P2)。
     if ext == "zip" {
-        return None;
+        return Ok(None);
     }
     let kind = if crate::folder_tree::is_paged_document_path(abs_path) {
         search_walker::CandidateKind::Pdf
@@ -1150,11 +1409,11 @@ fn build_candidate_from_path(abs_path: &std::path::Path, key: String) -> Option<
         search_walker::CandidateKind::Image
     } else {
         // 非対応ファイルは無視 (typography 違い / notify が .tmp 等を拾う場合)
-        return None;
+        return Ok(None);
     };
     // Apple Double 除外
     if crate::folder_tree::is_apple_double(abs_path) {
-        return None;
+        return Ok(None);
     }
     // 差分用署名: 画像はサイドカー (同名 .json/.txt) を織り込む (walker と同じロジック、
     // docs/sidecar-metadata-ingest.md §14-3/§14-4)。これで fts_meta にサイドカー込みの
@@ -1167,7 +1426,7 @@ fn build_candidate_from_path(abs_path: &std::path::Path, key: String) -> Option<
     } else {
         (mtime, file_size)
     };
-    Some(CandidateFile {
+    Ok(Some(CandidateFile {
         abs_path: abs_path.to_path_buf(),
         key,
         kind,
@@ -1175,7 +1434,7 @@ fn build_candidate_from_path(abs_path: &std::path::Path, key: String) -> Option<
         file_size,
         diff_mtime,
         diff_size,
-    })
+    }))
 }
 
 fn update_stats(stats: &Mutex<SupervisorStats>, s: &IngestStats) {
@@ -1289,6 +1548,8 @@ mod tests {
         gate.set_paused(true);
         let handle = spawn(
             SupervisorParams {
+                caption_epoch: Arc::new(AtomicU64::new(0)),
+                caption_db_path: tmp.path().join("ai_caption.db"),
                 favorite_id: id,
                 favorite_root: root.clone(),
                 excluded_roots: Vec::new(),
@@ -1349,6 +1610,7 @@ mod tests {
         let worker_cancel = cancel.clone();
         let worker_root = root.clone();
         let watcher_tx = change_tx.clone();
+        let caption_path = tmp.path().join("ai_caption.db");
         let worker = std::thread::spawn(move || {
             supervisor_loop(
                 id,
@@ -1356,6 +1618,8 @@ mod tests {
                 Vec::new(),
                 true,
                 true,
+                Arc::new(AtomicU64::new(0)),
+                caption_path,
                 None,
                 None,
                 worker_meta,
@@ -1448,11 +1712,11 @@ mod tests {
         let worker = std::thread::spawn(move || {
             FULL_SCAN_GATE.with(|gate| *gate.borrow_mut() = Some((started_tx, release_rx)));
             let id = Uuid::new_v4();
-            let session = IngestSession::new(id, root.clone(), &worker_meta, &fts);
+            let mut session = IngestSession::new(id, root.clone(), &worker_meta, &fts);
             run_initial_scan(
                 id,
                 &root,
-                &session,
+                &mut session,
                 &writer,
                 &sem,
                 &[],
@@ -1538,11 +1802,12 @@ mod tests {
         let worker = std::thread::spawn(move || {
             FULL_SCAN_AFTER_APPLY_GATE
                 .with(|gate| *gate.borrow_mut() = Some((committed_tx, release_rx)));
-            let session = IngestSession::new(id, worker_root.clone(), &worker_meta, &worker_fts);
+            let mut session =
+                IngestSession::new(id, worker_root.clone(), &worker_meta, &worker_fts);
             run_initial_scan(
                 id,
                 &worker_root,
-                &session,
+                &mut session,
                 &worker_writer,
                 &worker_sem,
                 &[],
@@ -1590,6 +1855,8 @@ mod tests {
         assert_eq!(skip, !change_extensions);
         let handle = spawn(
             SupervisorParams {
+                caption_epoch: Arc::new(AtomicU64::new(0)),
+                caption_db_path: tmp.path().join("ai_caption.db"),
                 favorite_id: id,
                 favorite_root: root,
                 excluded_roots: vec![],
@@ -1633,11 +1900,11 @@ mod tests {
         // 失効が退行して提出された場合も、gateで待ち続けず後のassertionで失敗させる。
         drop(release);
         let stats = Mutex::new(SupervisorStats::default());
-        let session = IngestSession::new(id, root.clone(), &meta, &fts);
+        let mut session = IngestSession::new(id, root.clone(), &meta, &fts);
         run_initial_scan(
             id,
             &root,
-            &session,
+            &mut session,
             &writer,
             &sem,
             &[],
@@ -1696,12 +1963,12 @@ mod tests {
         // Only the disposable fixture is broken; the product must not reset a failed DB.
         observer.execute_batch("DROP TABLE files").unwrap();
         let id = Uuid::new_v4();
-        let session = IngestSession::new(id, root.clone(), &meta, &fts);
+        let mut session = IngestSession::new(id, root.clone(), &meta, &fts);
         let stats = Mutex::new(SupervisorStats::default());
         run_initial_scan(
             id,
             &root,
-            &session,
+            &mut session,
             &writer,
             &sem,
             &[],
@@ -1729,12 +1996,12 @@ mod tests {
         let connection = rusqlite::Connection::open(tmp.path().join("m.db")).unwrap();
         connection.execute_batch("CREATE TRIGGER fail_complete BEFORE INSERT ON scanned_once BEGIN SELECT RAISE(FAIL, 'injected scan marker failure'); END;").unwrap();
         let id = Uuid::new_v4();
-        let session = IngestSession::new(id, root.clone(), &meta, &fts);
+        let mut session = IngestSession::new(id, root.clone(), &meta, &fts);
         let stats = Mutex::new(SupervisorStats::default());
         run_initial_scan(
             id,
             &root,
-            &session,
+            &mut session,
             &writer,
             &sem,
             &[],
@@ -1760,7 +2027,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         write_image(&root, "watched.jpg");
         let id = Uuid::new_v4();
-        let session = IngestSession::new(id, root.clone(), &meta, &fts);
+        let mut session = IngestSession::new(id, root.clone(), &meta, &fts);
         let stats = Mutex::new(SupervisorStats::default());
         let cancel = AtomicBool::new(false);
         let progress = ProgressReporter::new();
@@ -1828,7 +2095,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         write_image(&root, "first.jpg");
         let id = Uuid::new_v4();
-        let session = IngestSession::new(id, root.clone(), &meta, &fts);
+        let mut session = IngestSession::new(id, root.clone(), &meta, &fts);
         let stats = Mutex::new(SupervisorStats::default());
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = ProgressReporter::new();
@@ -1836,7 +2103,7 @@ mod tests {
         run_initial_scan(
             id,
             &root,
-            &session,
+            &mut session,
             &writer,
             &sem,
             &[],
@@ -1854,7 +2121,7 @@ mod tests {
         run_initial_scan(
             id,
             &root,
-            &session,
+            &mut session,
             &writer,
             &sem,
             &[],
@@ -1875,7 +2142,7 @@ mod tests {
         run_initial_scan(
             id,
             &root,
-            &session,
+            &mut session,
             &writer,
             &sem,
             &[],
@@ -1890,11 +2157,11 @@ mod tests {
         assert_eq!(meta.scanned_once(&root_key).unwrap(), None);
         db.execute_batch("DROP TRIGGER fail_full;").unwrap();
         let missing = tmp.path().join("missing");
-        let missing_session = IngestSession::new(id, missing.clone(), &meta, &fts);
+        let mut missing_session = IngestSession::new(id, missing.clone(), &meta, &fts);
         run_initial_scan(
             id,
             &missing,
-            &missing_session,
+            &mut missing_session,
             &writer,
             &sem,
             &[],
@@ -1946,7 +2213,9 @@ mod tests {
         fs::write(&zip, b"PK").unwrap();
         let zip_key = crate::search_index_db::normalize_path(&zip);
         assert!(
-            build_candidate_from_path(&zip, zip_key).is_none(),
+            build_candidate_from_path(&zip, zip_key, None)
+                .unwrap()
+                .is_none(),
             "ZIP は候補にならない"
         );
         // 回帰確認: 画像は従来どおり候補になる
@@ -1954,7 +2223,9 @@ mod tests {
         fs::write(&jpg, b"x").unwrap();
         let jpg_key = crate::search_index_db::normalize_path(&jpg);
         assert!(
-            build_candidate_from_path(&jpg, jpg_key).is_some(),
+            build_candidate_from_path(&jpg, jpg_key, None)
+                .unwrap()
+                .is_some(),
             "画像は候補になる"
         );
 
@@ -1962,12 +2233,16 @@ mod tests {
         let audio = tmp.path().join("track.FLAC");
         fs::write(&audio, b"fake-flac").unwrap();
         let audio_key = crate::search_index_db::normalize_path(&audio);
-        let candidate = build_candidate_from_path(&audio, audio_key).expect("音声は候補になる");
+        let candidate = build_candidate_from_path(&audio, audio_key, None)
+            .unwrap()
+            .expect("音声は候補になる");
         assert_eq!(candidate.kind, search_walker::CandidateKind::Audio);
         let epub = tmp.path().join("book.EPUB");
         fs::write(&epub, b"epub").unwrap();
         let epub_key = crate::search_index_db::normalize_path(&epub);
-        let candidate = build_candidate_from_path(&epub, epub_key).expect("EPUB は本の候補になる");
+        let candidate = build_candidate_from_path(&epub, epub_key, None)
+            .unwrap()
+            .expect("EPUB は本の候補になる");
         assert_eq!(candidate.kind, search_walker::CandidateKind::Pdf);
     }
 
@@ -1985,6 +2260,8 @@ mod tests {
         let fav_id = Uuid::new_v4();
         let handle = spawn(
             SupervisorParams {
+                caption_epoch: Arc::new(AtomicU64::new(0)),
+                caption_db_path: tmp.path().join("ai_caption.db"),
                 favorite_id: fav_id,
                 favorite_root: fav_root.clone(),
                 excluded_roots: Vec::new(),
@@ -2031,6 +2308,8 @@ mod tests {
         fs::create_dir_all(&fav_root).unwrap();
         let handle = spawn(
             SupervisorParams {
+                caption_epoch: Arc::new(AtomicU64::new(0)),
+                caption_db_path: tmp.path().join("ai_caption.db"),
                 favorite_id: Uuid::new_v4(),
                 favorite_root: fav_root,
                 excluded_roots: Vec::new(),
@@ -2062,6 +2341,8 @@ mod tests {
         let fav_id = Uuid::new_v4();
         let handle = spawn(
             SupervisorParams {
+                caption_epoch: Arc::new(AtomicU64::new(0)),
+                caption_db_path: tmp.path().join("ai_caption.db"),
                 favorite_id: fav_id,
                 favorite_root: fav_root,
                 excluded_roots: Vec::new(),
@@ -2110,6 +2391,8 @@ mod tests {
         let fav_b = Uuid::new_v4();
         let handle_a = spawn(
             SupervisorParams {
+                caption_epoch: Arc::new(AtomicU64::new(0)),
+                caption_db_path: tmp.path().join("ai_caption.db"),
                 favorite_id: fav_a,
                 favorite_root: root_a,
                 excluded_roots: Vec::new(),
@@ -2125,6 +2408,8 @@ mod tests {
         );
         let handle_b = spawn(
             SupervisorParams {
+                caption_epoch: Arc::new(AtomicU64::new(0)),
+                caption_db_path: tmp.path().join("ai_caption.db"),
                 favorite_id: fav_b,
                 favorite_root: root_b,
                 excluded_roots: Vec::new(),
@@ -2169,6 +2454,8 @@ mod tests {
         let fav_id = Uuid::new_v4();
         let handle = spawn(
             SupervisorParams {
+                caption_epoch: Arc::new(AtomicU64::new(0)),
+                caption_db_path: tmp.path().join("ai_caption.db"),
                 favorite_id: fav_id,
                 favorite_root: fav_root.clone(),
                 excluded_roots: Vec::new(),
@@ -2234,6 +2521,8 @@ mod tests {
         let fav_id = Uuid::new_v4();
         let handle = spawn(
             SupervisorParams {
+                caption_epoch: Arc::new(AtomicU64::new(0)),
+                caption_db_path: tmp.path().join("ai_caption.db"),
                 favorite_id: fav_id,
                 favorite_root: fav_root.clone(),
                 excluded_roots: Vec::new(),
@@ -2295,6 +2584,8 @@ mod tests {
 
         let handle = spawn(
             SupervisorParams {
+                caption_epoch: Arc::new(AtomicU64::new(0)),
+                caption_db_path: tmp.path().join("ai_caption.db"),
                 favorite_id: Uuid::new_v4(),
                 favorite_root: fav_root,
                 excluded_roots: Vec::new(),
@@ -2327,6 +2618,692 @@ mod tests {
         assert!(
             !in_full_scan,
             "cancel 経路でも RAII guard が drop されて in_full_scan=false に戻る"
+        );
+    }
+    fn put_caption(path: &Path, key: &str, text: &str) {
+        crate::ai_caption_db::CaptionDb::open_at(path).unwrap();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute(
+            "INSERT INTO captions (item_key, mtime_ms, size, model_id, prompt_version,
+            lang, caption, visible_text, keywords, cover_ref, status, created_at)
+            VALUES (?1,0,0,'test',1,'ja',?2,'','[]','','ok',0)
+            ON CONFLICT(item_key) DO UPDATE SET caption=excluded.caption",
+            rusqlite::params![key, text],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn caption_books_share_scan_reflection_and_watcher_eligibility() {
+        use crate::search_walker::{BookIndexKind, CandidateKind};
+        let (tmp, meta, fts, writer, sem, _) = setup();
+        let root = tmp.path().join("books");
+        fs::create_dir(&root).unwrap();
+        let excluded = root.join("other-owner");
+        fs::create_dir(&excluded).unwrap();
+        let db_path = tmp.path().join("ai_caption.db");
+        let captions = crate::ai_caption_db::CaptionDb::open_at(&db_path).unwrap();
+        let mut books = vec![(root.clone(), BookIndexKind::Folder)];
+        for name in [
+            "book.ZIP", "book.cbz", "book.rar", "book.cbr", "book.7z", "book.cb7", "book.lzh",
+            "book.lha",
+        ] {
+            let path = root.join(name);
+            fs::write(&path, b"archive").unwrap();
+            books.push((path, BookIndexKind::Archive));
+        }
+        for name in [
+            "album.json",
+            "album.txt",
+            "album.epub",
+            "album.zip",
+            "album.jpg",
+        ] {
+            let path = root.join(name);
+            fs::create_dir(&path).unwrap();
+            books.push((path, BookIndexKind::Folder));
+        }
+        let outside = excluded.join("excluded.rar");
+        fs::write(&outside, b"archive").unwrap();
+        let absent = root.join("missing.rar");
+        let failed = root.join("failed.rar");
+        let plain = root.join("plain.zip");
+        fs::write(&failed, b"archive").unwrap();
+        fs::write(&plain, b"archive").unwrap();
+        for path in books
+            .iter()
+            .map(|(path, _)| path)
+            .chain([&outside, &absent, &failed])
+        {
+            put_caption(
+                &db_path,
+                &crate::search_index_db::normalize_path(path),
+                "book-caption unique",
+            );
+        }
+        let failed_key = crate::search_index_db::normalize_path(&failed);
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "UPDATE captions SET status='failed' WHERE item_key=?1",
+                [&failed_key],
+            )
+            .unwrap();
+        let favorite = Uuid::new_v4();
+        let mut session = IngestSession::new_with_caption_db_path(
+            favorite,
+            root.clone(),
+            &meta,
+            &fts,
+            db_path.clone(),
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = ProgressReporter::new();
+        let stats = Mutex::new(SupervisorStats::default());
+        let scan = || {
+            search_walker::scan_with_captions(
+                ScanParams {
+                    favorite_id: favorite,
+                    root: root.clone(),
+                    excluded_roots: vec![excluded.clone()],
+                    cancel: Arc::clone(&cancel),
+                    progress: None,
+                },
+                &meta,
+                &sem,
+                IoPriority::Normal,
+                None,
+                Some(&captions),
+            )
+            .unwrap()
+        };
+        let first = scan();
+        assert_eq!(first.to_ingest.len(), books.len());
+        assert!(first.to_delete.is_empty());
+        for (path, kind) in &books {
+            let key = crate::search_index_db::normalize_path(path);
+            let candidate = build_candidate_from_path(path, key.clone(), Some(&captions))
+                .unwrap()
+                .unwrap();
+            assert_eq!(candidate.kind, CandidateKind::Book(*kind));
+            // Full enumerates normalized DB keys; watcher keeps the event's path
+            // spelling. Their logical identity and signatures must agree.
+            let from_scan = first
+                .to_ingest
+                .iter()
+                .find(|entry| entry.key == candidate.key)
+                .unwrap();
+            assert_eq!(from_scan.kind, candidate.kind);
+            assert_eq!(
+                (
+                    from_scan.mtime,
+                    from_scan.file_size,
+                    from_scan.diff_mtime,
+                    from_scan.diff_size
+                ),
+                (
+                    candidate.mtime,
+                    candidate.file_size,
+                    candidate.diff_mtime,
+                    candidate.diff_size
+                )
+            );
+            if *kind == BookIndexKind::Folder {
+                assert_eq!(candidate.file_size, 0);
+            }
+            assert_eq!(
+                (candidate.mtime, candidate.file_size),
+                (candidate.diff_mtime, candidate.diff_size)
+            );
+        }
+        session
+            .apply(
+                first.to_ingest,
+                first.to_delete,
+                &writer,
+                &sem,
+                IoPriority::Normal,
+                &cancel,
+                None,
+            )
+            .unwrap();
+        assert_eq!(scan().unchanged, books.len());
+        let old_key = crate::search_index_db::normalize_path(&books[1].0);
+        let old_row = meta.get(&old_key).unwrap().unwrap();
+        meta.upsert_meta_ok(
+            &old_key,
+            favorite,
+            &root,
+            crate::fts_index::IndexKind::Image,
+            old_row.mtime,
+            old_row.file_size,
+        )
+        .unwrap();
+        let wrong_kind = scan();
+        assert_eq!(
+            wrong_kind.to_ingest.len(),
+            1,
+            "same signature cannot retain an old kind"
+        );
+        session
+            .apply(
+                wrong_kind.to_ingest,
+                wrong_kind.to_delete,
+                &writer,
+                &sem,
+                IoPriority::Normal,
+                &cancel,
+                None,
+            )
+            .unwrap();
+        for (path, kind) in &books {
+            let key = crate::search_index_db::normalize_path(path);
+            let stored = meta.get(&key).unwrap().unwrap();
+            assert_eq!(
+                stored.kind,
+                match kind {
+                    BookIndexKind::Archive => crate::fts_index::IndexKind::Zip,
+                    BookIndexKind::Folder => crate::fts_index::IndexKind::Folder,
+                }
+            );
+            let address = crate::fts_index::find_doc_by_path(&fts.searcher(), fts.fields(), &key)
+                .unwrap()
+                .unwrap();
+            let sources =
+                crate::fts_index::doc_per_source_text(&fts.searcher(), fts.fields(), address)
+                    .unwrap();
+            assert_eq!(sources.ai_caption, "book-caption unique");
+            assert_eq!(
+                sources,
+                crate::ingest_text::PerSourceText {
+                    name: crate::ingest_text::build_per_source_for_filename(path).name,
+                    ai_caption: "book-caption unique".into(),
+                    ..Default::default()
+                }
+            );
+            apply_single_change(
+                &session,
+                &writer,
+                &sem,
+                &[excluded.clone()],
+                &cancel,
+                &stats,
+                &progress,
+                path.clone(),
+                ChangeKind::Upsert,
+            );
+            assert!(
+                meta.get(&key).unwrap().is_some(),
+                "watcher must preserve {path:?}"
+            );
+        }
+        reflect_captions(
+            &mut session,
+            &writer,
+            &sem,
+            &[excluded.clone()],
+            &cancel,
+            &stats,
+            &progress,
+        );
+        assert!(
+            !captions
+                .get(&crate::search_index_db::normalize_path(&outside))
+                .unwrap()
+                .unwrap()
+                .indexed
+        );
+        assert!(meta.get(&failed_key).unwrap().is_none());
+        assert!(
+            meta.get(&crate::search_index_db::normalize_path(&plain))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            meta.get(&crate::search_index_db::normalize_path(&absent))
+                .unwrap()
+                .is_none()
+        );
+        for (path, _) in &books {
+            captions
+                .delete(&crate::search_index_db::normalize_path(path))
+                .unwrap();
+        }
+        let removed = scan();
+        assert!(removed.to_ingest.is_empty());
+        assert_eq!(removed.to_delete.len(), books.len());
+        reflect_captions(
+            &mut session,
+            &writer,
+            &sem,
+            &[excluded.clone()],
+            &cancel,
+            &stats,
+            &progress,
+        );
+        for (path, _) in &books {
+            let key = crate::search_index_db::normalize_path(path);
+            assert!(meta.get(&key).unwrap().is_none());
+            assert!(caption_text(&fts, &key).is_none());
+            apply_single_change(
+                &session,
+                &writer,
+                &sem,
+                &[],
+                &cancel,
+                &stats,
+                &progress,
+                path.clone(),
+                ChangeKind::Upsert,
+            );
+            assert!(meta.get(&key).unwrap().is_none());
+        }
+        // Reflection is also a producer, not just an updater of already indexed books.
+        put_caption(
+            &db_path,
+            &crate::search_index_db::normalize_path(&plain),
+            "new-caption",
+        );
+        reflect_captions(
+            &mut session,
+            &writer,
+            &sem,
+            &[excluded],
+            &cancel,
+            &stats,
+            &progress,
+        );
+        assert_eq!(
+            caption_text(&fts, &crate::search_index_db::normalize_path(&plain)).as_deref(),
+            Some("new-caption")
+        );
+    }
+
+    #[test]
+    fn caption_book_sidecar_named_directories_are_removed_without_blocking_sibling_reingest() {
+        let (tmp, meta, fts, writer, sem, _) = setup();
+        let root = tmp.path().join("books");
+        fs::create_dir(&root).unwrap();
+        let db_path = tmp.path().join("ai_caption.db");
+        crate::ai_caption_db::CaptionDb::open_at(&db_path).unwrap();
+        let session = IngestSession::new_with_caption_db_path(
+            Uuid::new_v4(),
+            root.clone(),
+            &meta,
+            &fts,
+            db_path.clone(),
+        );
+        let cancel = AtomicBool::new(false);
+        let stats = Mutex::new(SupervisorStats::default());
+        let progress = ProgressReporter::new();
+        for name in ["album.json", "album.txt"] {
+            let path = root.join(name);
+            let image = path.with_extension("jpg");
+            fs::create_dir(&path).unwrap();
+            fs::write(&image, b"image").unwrap();
+            let key = crate::search_index_db::normalize_path(&path);
+            put_caption(&db_path, &key, "folder-caption");
+            apply_single_change(
+                &session,
+                &writer,
+                &sem,
+                &[],
+                &cancel,
+                &stats,
+                &progress,
+                path.clone(),
+                ChangeKind::Upsert,
+            );
+            assert_eq!(
+                meta.get(&key).unwrap().unwrap().kind,
+                crate::fts_index::IndexKind::Folder
+            );
+            fs::remove_dir(&path).unwrap();
+            apply_single_change(
+                &session,
+                &writer,
+                &sem,
+                &[],
+                &cancel,
+                &stats,
+                &progress,
+                path,
+                ChangeKind::Remove,
+            );
+            assert!(meta.get(&key).unwrap().is_none());
+            assert!(caption_text(&fts, &key).is_none());
+            assert!(
+                meta.get(&crate::search_index_db::normalize_path(&image))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    fn caption_text(fts: &FtsIndex, key: &str) -> Option<String> {
+        let searcher = fts.searcher();
+        crate::fts_index::find_doc_by_path(&searcher, fts.fields(), key)
+            .unwrap()
+            .map(|address| {
+                crate::fts_index::doc_per_source_text(&searcher, fts.fields(), address)
+                    .unwrap()
+                    .ai_caption
+            })
+    }
+
+    #[test]
+    fn caption_reflection_defers_rows_published_after_an_uninitialized_reopen() {
+        let (tmp, meta, fts, writer, sem, _) = setup();
+        let root = tmp.path().join("images");
+        fs::create_dir(&root).unwrap();
+        write_image(&root, "first.jpg");
+        let key = crate::search_index_db::normalize_path(&root.join("first.jpg"));
+        let path = tmp.path().join("ai_caption.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA user_version = 0;").unwrap();
+        drop(conn);
+        let mut session = IngestSession::new_with_caption_db_path(
+            Uuid::new_v4(),
+            root,
+            &meta,
+            &fts,
+            path.clone(),
+        );
+        let epoch = Arc::new(AtomicU64::new(1));
+        let mut seen = 0;
+        let stats = Mutex::new(SupervisorStats::default());
+        let progress = ProgressReporter::new();
+        let cancel = AtomicBool::new(false);
+        CAPTION_REFLECTION_AFTER_REOPEN.with(|hook| {
+            let path = path.clone();
+            let key = key.clone();
+            let epoch = Arc::clone(&epoch);
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // Reopen has observed version zero. Publish schema + content before
+                // reflection could open its separate pending/acknowledgement connection.
+                put_caption(&path, &key, "first-caption");
+                epoch.fetch_add(1, Ordering::Release);
+            }));
+        });
+        poll_caption_epoch(&epoch, &mut seen, || {
+            reflect_captions(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
+        });
+        assert_eq!(seen, 1);
+        assert_eq!(epoch.load(Ordering::Acquire), 2);
+        let db = crate::ai_caption_db::CaptionDb::open_read_only(&path)
+            .unwrap()
+            .unwrap();
+        assert!(!db.get(&key).unwrap().unwrap().indexed);
+        assert!(caption_text(&fts, &key).is_none());
+        assert!(meta.get(&key).unwrap().is_none());
+        assert!(!meta.tantivy_rebuild_pending().unwrap());
+        assert_eq!(stats.lock().unwrap().ingested_ok, 0);
+
+        // The pre-read sample cannot consume the commit's new epoch. The next
+        // wakeup reopens the now-published reader and reflects the still-pending row.
+        poll_caption_epoch(&epoch, &mut seen, || {
+            reflect_captions(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
+        });
+        assert_eq!(seen, 2);
+        assert!(db.get(&key).unwrap().unwrap().indexed);
+        assert_eq!(caption_text(&fts, &key).as_deref(), Some("first-caption"));
+        poll_caption_epoch(&epoch, &mut seen, || panic!("unchanged epoch"));
+    }
+
+    #[test]
+    fn caption_reflection_does_not_ingest_or_acknowledge_without_a_usable_reader() {
+        let (tmp, meta, fts, writer, sem, _) = setup();
+        let root = tmp.path().join("images");
+        fs::create_dir(&root).unwrap();
+        write_image(&root, "first.jpg");
+        let key = crate::search_index_db::normalize_path(&root.join("first.jpg"));
+        let path = tmp.path().join("ai_caption.db");
+        put_caption(&path, &key, "pending-caption");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA user_version = 27;").unwrap();
+        let mut session =
+            IngestSession::new_with_caption_db_path(Uuid::new_v4(), root, &meta, &fts, path);
+        assert!(!session.reopen_caption_connection());
+        let stats = Mutex::new(SupervisorStats::default());
+        reflect_captions(
+            &mut session,
+            &writer,
+            &sem,
+            &[],
+            &AtomicBool::new(false),
+            &stats,
+            &ProgressReporter::new(),
+        );
+        let indexed: bool = conn
+            .query_row(
+                "SELECT indexed FROM captions WHERE item_key=?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!indexed);
+        assert!(caption_text(&fts, &key).is_none());
+        assert!(meta.get(&key).unwrap().is_none());
+        assert!(!meta.tantivy_rebuild_pending().unwrap());
+        assert_eq!(stats.lock().unwrap().ingested_ok, 0);
+    }
+
+    #[test]
+    fn caption_reflection_reopens_absent_db_respects_child_and_removes_old_text() {
+        let (tmp, meta, fts, writer, sem, _) = setup();
+        let root = tmp.path().join("images");
+        let child = root.join("child");
+        fs::create_dir_all(&child).unwrap();
+        write_image(&root, "one.jpg");
+        write_image(&child, "two.jpg");
+        let key = crate::search_index_db::normalize_path(&root.join("one.jpg"));
+        let child_key = crate::search_index_db::normalize_path(&child.join("two.jpg"));
+        let path = tmp.path().join("ai_caption.db");
+        let mut session = IngestSession::new(Uuid::new_v4(), root.clone(), &meta, &fts)
+            .with_caption_db_path(path.clone());
+        // The supervisor predates the first successful caption job.
+        put_caption(&path, &key, "caption-one");
+        put_caption(&path, &child_key, "caption-child");
+        let stats = Mutex::new(SupervisorStats::default());
+        let progress = ProgressReporter::new();
+        let cancel = AtomicBool::new(false);
+        reflect_captions(
+            &mut session,
+            &writer,
+            &sem,
+            std::slice::from_ref(&child),
+            &cancel,
+            &stats,
+            &progress,
+        );
+        assert_eq!(caption_text(&fts, &key).as_deref(), Some("caption-one"));
+        assert!(caption_text(&fts, &child_key).is_none());
+        let db = crate::ai_caption_db::CaptionDb::open_read_only(&path)
+            .unwrap()
+            .unwrap();
+        assert!(db.get(&key).unwrap().unwrap().indexed);
+        assert!(!db.get(&child_key).unwrap().unwrap().indexed);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("DELETE FROM captions WHERE item_key=?1", [&key])
+            .unwrap();
+        reflect_captions(
+            &mut session,
+            &writer,
+            &sem,
+            std::slice::from_ref(&child),
+            &cancel,
+            &stats,
+            &progress,
+        );
+        assert_eq!(caption_text(&fts, &key).as_deref(), Some(""));
+        assert!(meta.get(&key).unwrap().is_some());
+        let own = crate::metadata_ownership::OwnedRange {
+            root: crate::metadata_ownership::root_key(&root),
+            exclusions: vec![crate::metadata_ownership::root_key(&child)],
+        };
+        assert!(
+            db.pending_in_ranges(&own.sql_ranges(), 500)
+                .unwrap()
+                .is_empty()
+        );
+        // Missing files follow the same candidate/delete boundary as watcher updates.
+        put_caption(&path, &key, "changed");
+        fs::remove_file(root.join("one.jpg")).unwrap();
+        reflect_captions(
+            &mut session,
+            &writer,
+            &sem,
+            &[child],
+            &cancel,
+            &stats,
+            &progress,
+        );
+        assert!(caption_text(&fts, &key).is_none());
+        assert!(meta.get(&key).unwrap().is_none());
+        assert!(
+            db.pending_in_ranges(&own.sql_ranges(), 500)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn caption_reflection_keeps_pending_on_cancel_or_commit_reload_failure() {
+        let (tmp, meta, fts, writer, sem, _) = setup();
+        let root = tmp.path().join("images");
+        fs::create_dir(&root).unwrap();
+        write_image(&root, "one.jpg");
+        let key = crate::search_index_db::normalize_path(&root.join("one.jpg"));
+        let path = tmp.path().join("ai_caption.db");
+        put_caption(&path, &key, "still-pending");
+        let db = crate::ai_caption_db::CaptionDb::open_read_only(&path)
+            .unwrap()
+            .unwrap();
+        let mut session =
+            IngestSession::new(Uuid::new_v4(), root, &meta, &fts).with_caption_db_path(path);
+        let stats = Mutex::new(SupervisorStats::default());
+        let progress = ProgressReporter::new();
+        let cancel = AtomicBool::new(true);
+        reflect_captions(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
+        assert!(!db.get(&key).unwrap().unwrap().indexed);
+        cancel.store(false, Ordering::Release);
+        writer.test_set_reload_failure(true);
+        reflect_captions(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
+        assert!(!db.get(&key).unwrap().unwrap().indexed);
+        writer.test_set_reload_failure(false);
+        reflect_captions(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
+        assert!(db.get(&key).unwrap().unwrap().indexed);
+        assert_eq!(caption_text(&fts, &key).as_deref(), Some("still-pending"));
+    }
+
+    #[test]
+    fn caption_epoch_retains_writes_during_reflection_for_every_supervisor() {
+        let epoch = AtomicU64::new(1);
+        let mut first_seen = 0;
+        let mut second_seen = 0;
+        let mut first_runs = 0;
+        poll_caption_epoch(&epoch, &mut first_seen, || {
+            first_runs += 1;
+            epoch.fetch_add(1, Ordering::Release);
+        });
+        assert_eq!(first_seen, 1);
+        poll_caption_epoch(&epoch, &mut second_seen, || {});
+        assert_eq!(second_seen, 2);
+        poll_caption_epoch(&epoch, &mut first_seen, || first_runs += 1);
+        poll_caption_epoch(&epoch, &mut first_seen, || panic!("unchanged epoch"));
+        assert_eq!(first_runs, 2);
+        assert_eq!(first_seen, second_seen);
+    }
+
+    #[test]
+    fn skipped_initial_scan_reflects_captions_without_epoch_notification() {
+        let (tmp, meta, fts, writer, sem, gate) = setup();
+        let root = tmp.path().join("images");
+        fs::create_dir(&root).unwrap();
+        write_image(&root, "one.jpg");
+        let key = crate::search_index_db::normalize_path(&root.join("one.jpg"));
+        let path = tmp.path().join("ai_caption.db");
+        put_caption(&path, &key, "startup-pending");
+        let handle = spawn(
+            SupervisorParams {
+                caption_epoch: Arc::new(AtomicU64::new(0)),
+                caption_db_path: path.clone(),
+                favorite_id: Uuid::new_v4(),
+                favorite_root: root,
+                excluded_roots: vec![],
+                enable_metadata_index: true,
+                skip_initial_scan: true,
+                similar_notifier: None,
+            },
+            meta,
+            Arc::clone(&fts),
+            writer,
+            sem,
+            gate,
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !handle.snapshot_stats().initial_scan_done {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.snapshot_stats().initial_scan_skipped);
+        assert_eq!(caption_text(&fts, &key).as_deref(), Some("startup-pending"));
+        let db = crate::ai_caption_db::CaptionDb::open_read_only(path)
+            .unwrap()
+            .unwrap();
+        assert!(db.get(&key).unwrap().unwrap().indexed);
+        drop(handle);
+    }
+    #[test]
+    fn caption_read_failure_retains_pending_until_next_full_scan() {
+        let (tmp, meta, fts, writer, sem, _) = setup();
+        let root = tmp.path().join("images");
+        fs::create_dir(&root).unwrap();
+        write_image(&root, "one.jpg");
+        let key = crate::search_index_db::normalize_path(&root.join("one.jpg"));
+        let path = tmp.path().join("ai_caption.db");
+        put_caption(&path, &key, "recovered-caption");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // get() cannot decode malformed keywords, but pending rows remain readable.
+        conn.execute("UPDATE captions SET keywords='invalid-json'", [])
+            .unwrap();
+        let id = Uuid::new_v4();
+        let mut session =
+            IngestSession::new_with_caption_db_path(id, root.clone(), &meta, &fts, path.clone());
+        let stats = Mutex::new(SupervisorStats::default());
+        let progress = ProgressReporter::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        reflect_captions(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
+        let indexed: bool = conn
+            .query_row(
+                "SELECT indexed FROM captions WHERE item_key=?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!indexed);
+        assert_eq!(caption_text(&fts, &key).as_deref(), Some(""));
+        // No epoch notification and no file-signature change are needed for repair.
+        conn.execute("UPDATE captions SET keywords='[]'", [])
+            .unwrap();
+        run_initial_scan(
+            id,
+            &root,
+            &mut session,
+            &writer,
+            &sem,
+            &[],
+            cancel,
+            &stats,
+            &progress,
+        );
+        let db = crate::ai_caption_db::CaptionDb::open_read_only(path)
+            .unwrap()
+            .unwrap();
+        assert!(db.get(&key).unwrap().unwrap().indexed);
+        assert_eq!(
+            caption_text(&fts, &key).as_deref(),
+            Some("recovered-caption")
         );
     }
 }

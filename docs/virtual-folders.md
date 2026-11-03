@@ -897,7 +897,10 @@ ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く�
 
 ### 3.1 サムネイル生成の分岐
 
-`thumb_loader.rs::process_load_request` 内で `LoadRequest` のフィールドを見て分岐:
+`thumb_loader.rs::process_load_request` 内で `LoadRequest` のフィールドを見て分岐する。
+V1-4b の共通解決では、cache 前の `prepare_load_request_stamp` と cache miss 後の
+`resolve_read_after_cache_miss` に分ける（実装・検証中、検収・実機確認は未完了）。
+サムネイルの `CacheOnly`、cache の優先順、取消・保存の境界は変更しない。
 
 | GridItem | `zip_entry` | `pdf_page` | `cache_key_override` | サムネ取得方法 |
 | --- | --- | --- | --- | --- |
@@ -909,6 +912,37 @@ ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く�
 | ZipImage | Some(entry) | None | なし (entry が自動キー) | ZIP からエントリバイト → decode → bytes から EXIF Orientation 適用 |
 | ZipDir | Some(representative) または None (`ZipDirRepresentative`) | None | `zipdir:{dir_prefix}` | 通常は部分木代表 entry を直接読む。ZipDir source pin は `zip_dir_prefix` を worker に渡し、同じ sort で部分木代表を選び直す |
 | PdfPage | None | Some(page) | `pdf_page_cache_key(page)` | PDF ワーカーでそのページをレンダリング |
+
+#### 本の AI 説明文が読む表紙（V1-4b、検収・実機確認は未完了）
+
+`resolve_book_cover` は worker で一覧と同じ計画・`apply_folder_thumb_pin`・
+`resolve_converted_archive_candidate` を使い、上の2段を cache 参照なしで続けて呼ぶ。
+一覧の UI 側の計画経路は移さない。有効な変換済み ZIP は直接読める RAR より優先し、
+直接読める RAR はそのまま読む。変換が必要で有効な結果が無い書庫・EPUB は未変換として返し、
+ここから変換やパスワード入力を始めない。
+最上位も worker の metadata がディレクトリならフォルダとして扱い、拡張子から作られた閲覧 recipe や UI の種類 hint は変更しない。
+
+`ResolvedRead` は場所に加えて選定証明・取得済み bytes・画像・寸法・子 WebP・有効な署名を運ぶ。
+`ChildCached` では選定結果に固定表紙の持ち主のコンテナと `ResolvedPinTarget` を残し、
+本の説明文はその位置を高解像度で読み直す。子フォルダに属する PDF の3ページ目の固定を、
+PDF の1ページ目へ選び直してはならない。固定の無い子だけ子の本の規則で解決する。
+保存済みの子代表を解決し直す回数は探索深さに数えない。各段の選定はその段の `folder_thumb_depth` で行い、
+再解決の連鎖は `visited` による再訪検出で止める。
+サムネイル側は従来どおり子の WebP を使い、選定や永続 cache の挙動は変えない。
+
+保存キーは本の物理パスで、変換済み書庫でも元の書庫のパスを使う。
+`cover_ref` は本からの相対パス（区切りは `/`）に `#entry=<実エントリ名>` または
+`#page=<0始まりのページ番号>` を加える。本自身なら相対パスは空にする。
+変換済み ZIP ではその ZIP 内の実際の名前を記録し、元書庫の名前へ逆変換しない。
+入力署名はファイルの本では元の本、フォルダの本では実際に読む元の子ファイルから取る。
+EPUB は同じ `ReadTarget` lease が指す世代の `display_source_state` を使い、100ns を
+`FileSignature::from_metadata` と同じ切り捨てでミリ秒へ直す。
+
+PDF は開くときと共通のパスワード選択を使い、現在開いている同じ PDF の検証済みの値を
+保存済みより優先する。無い・違う場合は入力を求めず飛ばす。動画フレームの固定表紙は
+動画の相対パス・固定位置の `cover_ref` と署名を返すが、作成ジョブでは対象外として数える。
+固定先のエントリ・ページが無ければ自動代表へ戻さず、読めなかったとして行を保存しない。
+詳細は [計画 §21.13](local-vlm-caption-plan.md#2113-v1-4b-の設計-2026-11-03)。
 
 ZIP 内 RAW は拡張子で先に LibRaw へ振り分け、entry bytes から info / preview を読む。
 プレビューが要求長辺に足りないときは half 現像を thumbnail queue へ非同期で引き継ぐ。

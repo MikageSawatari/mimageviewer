@@ -239,10 +239,13 @@ pub struct RenameMigrationReport {
 /// `edit_origin` は追加・昇格を各 content-identity worker の増分通知で追える一方、rename / purge /
 /// orphan cleanup の削除・key rewrite は増分通知を持たない。descriptor commit の共通境界でこの
 /// effect を立て、UI 側は SQLite を触らず cancellable worker で authoritative snapshot を再読込する。
+/// 説明文などの共有表示キャッシュは、実際に行が変わったストアの完了印で失効させる。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StoreMutationEffects {
     content_identity_index_stale: bool,
     book_composition_changed: bool,
+    caption_display_stale: bool,
+    ai_captions_changed: bool,
 }
 
 impl StoreMutationEffects {
@@ -250,6 +253,8 @@ impl StoreMutationEffects {
         Self {
             content_identity_index_stale: true,
             book_composition_changed: false,
+            caption_display_stale: false,
+            ai_captions_changed: false,
         }
     }
 
@@ -265,15 +270,30 @@ impl StoreMutationEffects {
     pub(crate) fn record_rows_changed(&mut self, descriptor: &StoreDescriptor, rows: usize) {
         self.record_completed(descriptor);
         self.book_composition_changed |= descriptor.file == "book_composition.db" && rows > 0;
+        self.ai_captions_changed |= descriptor.file == "ai_caption.db" && rows > 0;
+        self.caption_display_stale |= matches!(
+            descriptor.file,
+            "ai_caption.db" | "folder_thumb_pins.db" | "video_pins.db"
+        ) && rows > 0;
     }
 
     pub(crate) fn book_composition_changed(self) -> bool {
         self.book_composition_changed
     }
 
+    pub(crate) fn caption_display_stale(self) -> bool {
+        self.caption_display_stale
+    }
+
+    pub(crate) fn ai_captions_changed(self) -> bool {
+        self.ai_captions_changed
+    }
+
     pub(crate) fn merge(&mut self, other: Self) {
         self.content_identity_index_stale |= other.content_identity_index_stale;
         self.book_composition_changed |= other.book_composition_changed;
+        self.caption_display_stale |= other.caption_display_stale;
+        self.ai_captions_changed |= other.ai_captions_changed;
     }
 
     pub(crate) fn content_identity_index_stale(self) -> bool {
@@ -1041,6 +1061,15 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         StoreKeyNormalization::KeepDrive,
         BookStorePolicy::Follow,
         true,
+    ),
+    store(
+        "ai_caption.db",
+        "captions",
+        "item_key",
+        true,
+        StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        false,
     ),
     store(
         "content_identity.db",
@@ -3229,6 +3258,315 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
 
+    fn caption_fixture(data_dir: &Path) -> rusqlite::Connection {
+        let path = data_dir.join("ai_caption.db");
+        crate::ai_caption_db::CaptionDb::open_at(&path).unwrap();
+        rusqlite::Connection::open(path).unwrap()
+    }
+
+    fn insert_caption(connection: &rusqlite::Connection, key: &str, caption: &str) {
+        connection
+            .execute(
+                "INSERT INTO captions (item_key, mtime_ms, size, model_id, prompt_version, lang,
+                caption, visible_text, cover_ref, keywords, status, created_at, rev, indexed)
+             VALUES (?1, 123, 456, 'test-model', 1, 'ja', ?2, '', '', '[]', 'ok', 789, 0, 0)",
+                rusqlite::params![key, caption],
+            )
+            .unwrap();
+    }
+
+    fn caption_state(connection: &rusqlite::Connection, key: &str) -> (String, i64, i64) {
+        connection
+            .query_row(
+                "SELECT caption, rev, indexed FROM captions WHERE item_key = ?1",
+                [key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn caption_mutation_effect_tracks_changed_rows_and_merges() {
+        let caption = STORES
+            .iter()
+            .find(|store| store.file == "ai_caption.db")
+            .unwrap();
+        let other = STORES
+            .iter()
+            .find(|store| store.file == "rating.db")
+            .unwrap();
+        let mut effects = StoreMutationEffects::default();
+        assert!(!effects.caption_display_stale());
+        assert!(!effects.ai_captions_changed());
+        effects.record_completed(caption);
+        effects.record_rows_changed(caption, 0);
+        effects.record_rows_changed(other, 1);
+        assert!(!effects.caption_display_stale());
+        assert!(!effects.ai_captions_changed());
+        let mut changed = StoreMutationEffects::default();
+        changed.record_rows_changed(caption, 1);
+        assert!(changed.caption_display_stale());
+        assert!(changed.ai_captions_changed());
+        effects.merge(changed);
+        effects.merge(StoreMutationEffects::default());
+        assert!(effects.caption_display_stale());
+        assert!(effects.ai_captions_changed());
+        assert!(!StoreMutationEffects::for_content_identity_index_stale().caption_display_stale());
+        for file in ["folder_thumb_pins.db", "video_pins.db"] {
+            for descriptor in STORES.iter().filter(|store| store.file == file) {
+                let mut effects = StoreMutationEffects::default();
+                effects.record_rows_changed(descriptor, 0);
+                assert!(!effects.caption_display_stale());
+                assert!(!effects.ai_captions_changed());
+                effects.record_rows_changed(descriptor, 1);
+                assert!(effects.caption_display_stale(), "{file}");
+                assert!(!effects.ai_captions_changed(), "pin-only change: {file}");
+            }
+        }
+    }
+
+    #[test]
+    fn ai_caption_copy_restore_rename_and_hard_purge_keep_trigger_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = Path::new(r"C:\Images\old.jpg");
+        let copied = Path::new(r"D:\Images\copy.jpg");
+        let moved = Path::new(r"E:\Images\moved.jpg");
+        let descriptor = STORES
+            .iter()
+            .find(|store| store.table == "captions")
+            .unwrap();
+        assert!(descriptor.unique);
+        assert_eq!(descriptor.book_policy, BookStorePolicy::Follow);
+        assert!(!descriptor.copies_with_book_page);
+        assert_eq!(descriptor.normalization, StoreKeyNormalization::KeepDrive);
+        let connection = caption_fixture(dir.path());
+        let old_key = descriptor.normalize_path(old);
+        let copied_key = descriptor.normalize_path(copied);
+        let moved_key = descriptor.normalize_path(moved);
+        insert_caption(&connection, &old_key, "source caption");
+        connection
+            .execute("UPDATE captions SET indexed = 1", [])
+            .unwrap();
+        let source_rev = caption_state(&connection, &old_key).1;
+
+        // This is the same generic copy boundary used by content identity restore.
+        let report = copy_restore_stores_without_identity_at(
+            dir.path(),
+            &[StoreCopyPathMapping::exact(old, copied)],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.rows, 1);
+        assert!(report.store_mutations.caption_display_stale());
+        assert!(report.store_mutations.ai_captions_changed());
+        let copied_state = caption_state(&connection, &copied_key);
+        assert_eq!(copied_state.0, "source caption");
+        assert!(copied_state.1 > source_rev);
+        assert_eq!(copied_state.2, 0);
+        assert_eq!(caption_state(&connection, &old_key).2, 1);
+
+        let report = run_at(dir.path(), copied, moved);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.store_mutations.caption_display_stale());
+        assert!(report.store_mutations.ai_captions_changed());
+        let moved_state = caption_state(&connection, &moved_key);
+        assert_eq!(moved_state.0, "source caption");
+        assert!(moved_state.1 > copied_state.1);
+        assert_eq!(moved_state.2, 0);
+        let removed: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM caption_removed WHERE item_key = ?1)",
+                [&copied_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(removed);
+
+        let report = purge_removed_paths_at(dir.path(), &[moved.to_path_buf()], &[]);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.rows, 1);
+        assert!(report.store_mutations.caption_display_stale());
+        assert!(report.store_mutations.ai_captions_changed());
+        let tombstone_rev: i64 = connection
+            .query_row(
+                "SELECT MAX(rev) FROM caption_removed WHERE item_key = ?1",
+                [&moved_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(tombstone_rev > moved_state.1);
+        assert_eq!(caption_state(&connection, &old_key).0, "source caption");
+
+        let missing = Path::new(r"C:\Images\missing.jpg");
+        let untouched = Path::new(r"C:\Images\untouched.jpg");
+        let no_copy = copy_restore_stores_without_identity_at(
+            dir.path(),
+            &[StoreCopyPathMapping::exact(missing, untouched)],
+        );
+        assert!(no_copy.errors.is_empty(), "{:?}", no_copy.errors);
+        assert!(!no_copy.store_mutations.caption_display_stale());
+        assert!(!no_copy.store_mutations.ai_captions_changed());
+        let no_rename = run_at(dir.path(), missing, untouched);
+        assert!(no_rename.errors.is_empty(), "{:?}", no_rename.errors);
+        assert!(!no_rename.store_mutations.caption_display_stale());
+        assert!(!no_rename.store_mutations.ai_captions_changed());
+        let no_purge = purge_removed_paths_at(dir.path(), &[moved.to_path_buf()], &[]);
+        assert!(no_purge.errors.is_empty(), "{:?}", no_purge.errors);
+        assert!(!no_purge.store_mutations.caption_display_stale());
+        assert!(!no_purge.store_mutations.ai_captions_changed());
+    }
+
+    #[test]
+    fn ai_caption_book_swap_rejects_old_ack_and_page_copy_clears_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = PathBuf::from(r"C:\Books\one\0001.jpg");
+        let b = PathBuf::from(r"C:\Books\one\0002.jpg");
+        let connection = caption_fixture(dir.path());
+        let a_key = crate::adjustment_db::normalize_path(&a);
+        let b_key = crate::adjustment_db::normalize_path(&b);
+        insert_caption(&connection, &a_key, "A");
+        insert_caption(&connection, &b_key, "B");
+        let a_rev = caption_state(&connection, &a_key).1;
+        let b_rev = caption_state(&connection, &b_key).1;
+        connection
+            .execute("UPDATE captions SET indexed = 1", [])
+            .unwrap();
+        let guard = acquire_store_maintenance(dir.path(), &[]).unwrap();
+        let report = migrate_book_paths_at(
+            dir.path(),
+            &[(a.clone(), b.clone()), (b.clone(), a.clone())],
+            &[],
+            &guard,
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.store_mutations.caption_display_stale());
+        assert!(report.store_mutations.ai_captions_changed());
+        assert_eq!(caption_state(&connection, &a_key).0, "B");
+        assert_eq!(caption_state(&connection, &b_key).0, "A");
+        for (key, old_rev) in [(&a_key, a_rev), (&b_key, b_rev)] {
+            let state = caption_state(&connection, key);
+            assert!(state.1 > a_rev.max(b_rev));
+            assert_eq!(state.2, 0);
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE captions SET indexed = 1 WHERE item_key = ?1 AND rev = ?2",
+                        rusqlite::params![key, old_rev],
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+        let report = migrate_book_paths_at(dir.path(), &[], &[(a, b)], &guard);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.store_mutations.caption_display_stale());
+        assert!(report.store_mutations.ai_captions_changed());
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM captions WHERE item_key = ?1",
+                [&b_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "book page copies must clear stale captions without copying"
+        );
+        assert_eq!(caption_state(&connection, &a_key).0, "B");
+        let missing = PathBuf::from(r"C:\Books\one\missing.jpg");
+        let untouched = PathBuf::from(r"C:\Books\one\untouched.jpg");
+        for (moves, copies) in [
+            (vec![(missing.clone(), untouched.clone())], Vec::new()),
+            (Vec::new(), vec![(missing, untouched)]),
+        ] {
+            let report = migrate_book_paths_at(dir.path(), &moves, &copies, &guard);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert!(!report.store_mutations.caption_display_stale());
+            assert!(!report.store_mutations.ai_captions_changed());
+        }
+    }
+
+    #[test]
+    fn ai_caption_orphan_cleanup_deletes_rows_and_queues_index_removal() {
+        use crate::metadata_cleanup::WorkerResult;
+        let dir = tempfile::tempdir().unwrap();
+        let books = dir.path().join("books");
+        std::fs::create_dir_all(&books).unwrap();
+        let images = dir.path().join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let existing = images.join("keep.jpg");
+        let missing = images.join("gone.jpg");
+        let bookshelf_missing = books.join("gone.jpg");
+        std::fs::write(&existing, b"image").unwrap();
+        let connection = caption_fixture(dir.path());
+        let existing_key = crate::adjustment_db::normalize_path(&existing);
+        let missing_key = crate::adjustment_db::normalize_path(&missing);
+        let bookshelf_key = crate::adjustment_db::normalize_path(&bookshelf_missing);
+        insert_caption(&connection, &existing_key, "keep");
+        insert_caption(&connection, &missing_key, "remove");
+        insert_caption(&connection, &bookshelf_key, "protected book page");
+        let old_rev = caption_state(&connection, &missing_key).1;
+        let pending = crate::metadata_cleanup::spawn_scan(dir.path().to_path_buf(), books.clone());
+        let WorkerResult::Scan(scan) = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+        else {
+            panic!("cleanup scan expected");
+        };
+        assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+        assert_eq!(scan.orphan_total(), 1);
+        let pending =
+            crate::metadata_cleanup::spawn_delete(dir.path().to_path_buf(), books.clone(), scan);
+        let WorkerResult::Delete(report) = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+        else {
+            panic!("cleanup delete expected");
+        };
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.deleted_total(), 1);
+        assert!(report.store_mutations.caption_display_stale());
+        assert!(report.store_mutations.ai_captions_changed());
+        assert_eq!(caption_state(&connection, &existing_key).0, "keep");
+        // Cleanup intentionally excludes the managed bookshelf, even when a
+        // physical page has disappeared. Captions follow the same safety rule.
+        assert_eq!(
+            caption_state(&connection, &bookshelf_key).0,
+            "protected book page"
+        );
+        let rev: i64 = connection
+            .query_row(
+                "SELECT MAX(rev) FROM caption_removed WHERE item_key = ?1",
+                [&missing_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(rev > old_rev);
+
+        let pending = crate::metadata_cleanup::spawn_scan(dir.path().to_path_buf(), books.clone());
+        let WorkerResult::Scan(scan) = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+        else {
+            panic!("cleanup scan expected");
+        };
+        assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+        assert_eq!(scan.orphan_total(), 0);
+        let pending = crate::metadata_cleanup::spawn_delete(dir.path().to_path_buf(), books, scan);
+        let WorkerResult::Delete(report) = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+        else {
+            panic!("cleanup delete expected");
+        };
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(!report.store_mutations.caption_display_stale());
+        assert!(!report.store_mutations.ai_captions_changed());
+    }
+
     #[test]
     fn book_store_policies_and_copy_kinds_are_explicit() {
         let services = STORES
@@ -4218,10 +4556,10 @@ mod tests {
         let covered = STORES.iter().filter(|descriptor| descriptor.unique).count();
         assert_eq!(
             STORES.len(),
-            29,
+            30,
             "watched、endpoint / page-alone preference と logical shift を含む現行 descriptor 数"
         );
-        assert_eq!(covered, 28);
+        assert_eq!(covered, 29);
         assert_eq!(report.rows, covered * 2);
         assert_eq!(report.committed_thumbnail_pins, 4);
 

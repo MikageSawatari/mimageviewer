@@ -1089,114 +1089,18 @@ fn verify_converted_pdf_stage2a(path: &Path, pages: usize) -> Result<(), EpubCon
 #[cfg(windows)]
 mod windows_process {
     use super::*;
-    use std::ffi::OsStr;
-    use std::mem::size_of;
-    use std::os::windows::ffi::OsStrExt as _;
-    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
-    use windows::Win32::Foundation::{
-        HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
-    };
-    use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject,
-    };
-    use windows::Win32::System::Pipes::CreatePipe;
-    use windows::Win32::System::Threading::{
-        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-        GetExitCodeProcess, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW,
-        WaitForMultipleObjects,
-    };
-    use windows::core::{PCWSTR, PWSTR};
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::WaitForMultipleObjects;
 
-    fn wide(value: &OsStr) -> Vec<u16> {
-        value.encode_wide().chain(Some(0)).collect()
-    }
-    fn quote(value: &OsStr) -> String {
-        let value = value.to_string_lossy();
-        let mut out = String::from("\"");
-        let mut slashes = 0;
-        for c in value.chars() {
-            if c == '\\' {
-                slashes += 1;
-            } else if c == '"' {
-                out.push_str(&"\\".repeat(slashes * 2 + 1));
-                out.push('"');
-                slashes = 0;
-            } else {
-                out.push_str(&"\\".repeat(slashes));
-                slashes = 0;
-                out.push(c);
-            }
-        }
-        out.push_str(&"\\".repeat(slashes * 2));
-        out.push('"');
-        out
-    }
-    fn child_environment(environment: &[(OsString, OsString)]) -> Vec<u16> {
-        let mut pairs: Vec<_> = environment.to_vec();
-        pairs.sort_by_key(|(key, _)| key.to_string_lossy().to_ascii_uppercase());
-        let mut block = Vec::new();
-        for (key, value) in pairs {
-            block.extend(key.encode_wide());
-            block.push(b'=' as u16);
-            block.extend(value.encode_wide());
-            block.push(0);
-        }
-        if block.is_empty() {
-            block.push(0);
-        }
-        block.push(0);
-        block
-    }
-    fn pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
-        use windows::Win32::Security::SECURITY_ATTRIBUTES;
-        let attrs = SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            bInheritHandle: true.into(),
-            ..Default::default()
-        };
-        let mut read = HANDLE::default();
-        let mut write = HANDLE::default();
-        unsafe { CreatePipe(&mut read, &mut write, Some(&attrs), 0) }
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        let read = unsafe { OwnedHandle::from_raw_handle(read.0) };
-        let write = unsafe { OwnedHandle::from_raw_handle(write.0) };
-        unsafe {
-            SetHandleInformation(
-                HANDLE(read.as_raw_handle()),
-                HANDLE_FLAG_INHERIT.0,
-                Default::default(),
-            )
-        }
-        .map_err(|error| io::Error::other(error.to_string()))?;
-        Ok((read, write))
-    }
-    pub(super) struct NativeChild {
-        job: OwnedHandle,
-        process: OwnedHandle,
-        stdout: Option<OwnedHandle>,
-        stderr: Option<OwnedHandle>,
-    }
-    impl Drop for NativeChild {
-        fn drop(&mut self) {
-            let _ = unsafe { TerminateJobObject(HANDLE(self.job.as_raw_handle()), 1) };
-        }
-    }
+    struct NativeChild(crate::job_process::JobChild);
+
     impl WorkerChild for NativeChild {
         fn take_stdout(&mut self) -> io::Result<Box<dyn Read + Send>> {
-            Ok(Box::new(File::from(
-                self.stdout
-                    .take()
-                    .ok_or_else(|| io::Error::other("stdout taken"))?,
-            )))
+            Ok(Box::new(self.0.take_stdout()?))
         }
         fn take_stderr(&mut self) -> io::Result<Box<dyn Read + Send>> {
-            Ok(Box::new(File::from(
-                self.stderr
-                    .take()
-                    .ok_or_else(|| io::Error::other("stderr taken"))?,
-            )))
+            Ok(Box::new(self.0.take_stderr()?))
         }
         fn wait(
             &mut self,
@@ -1204,7 +1108,7 @@ mod windows_process {
             timeout: Duration,
         ) -> Result<i32, EpubConvertError> {
             let handles = [
-                HANDLE(self.process.as_raw_handle()),
+                HANDLE(self.0.process_handle().as_raw_handle()),
                 HANDLE(cancel.inner.event.as_raw_handle()),
             ];
             let waited = unsafe {
@@ -1215,12 +1119,9 @@ mod windows_process {
                 )
             };
             if waited == WAIT_OBJECT_0 {
-                let mut code = 0;
-                unsafe { GetExitCodeProcess(handles[0], &mut code) }
-                    .map_err(|error| EpubConvertError::Io(io::Error::other(error.to_string())))?;
-                return Ok(code as i32);
+                return Ok(self.0.exit_code()?);
             }
-            let _ = unsafe { TerminateJobObject(HANDLE(self.job.as_raw_handle()), 1) };
+            let _ = self.0.kill_handle().kill();
             if waited.0 == WAIT_OBJECT_0.0 + 1 {
                 Err(EpubConvertError::Cancelled)
             } else if waited == WAIT_TIMEOUT {
@@ -1233,31 +1134,6 @@ mod windows_process {
         }
     }
     pub(super) fn spawn(spec: &WorkerSpec) -> Result<Box<dyn WorkerChild>, EpubConvertError> {
-        let job_raw = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        let job = unsafe { OwnedHandle::from_raw_handle(job_raw.0) };
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        unsafe {
-            SetInformationJobObject(
-                HANDLE(job.as_raw_handle()),
-                JobObjectExtendedLimitInformation,
-                (&raw const limits).cast(),
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        }
-        .map_err(|error| io::Error::other(error.to_string()))?;
-        let (stdout_read, stdout_write) = pipe()?;
-        let (stderr_read, stderr_write) = pipe()?;
-        let stdin = File::open("NUL")?;
-        unsafe {
-            SetHandleInformation(
-                HANDLE(stdin.as_raw_handle()),
-                HANDLE_FLAG_INHERIT.0,
-                HANDLE_FLAG_INHERIT,
-            )
-        }
-        .map_err(|error| io::Error::other(error.to_string()))?;
         let args = worker_arguments(spec);
         #[cfg(test)]
         let args: Vec<OsString> = if let Some(test_args) = &spec.native_test_args {
@@ -1267,58 +1143,13 @@ mod windows_process {
         } else {
             args
         };
-        let mut cmd = wide(OsStr::new(
-            &args.iter().map(|s| quote(s)).collect::<Vec<_>>().join(" "),
-        ));
-        let exe = wide(spec.executable.as_os_str());
-        let env = child_environment(&spec.environment);
-        let startup = STARTUPINFOW {
-            cb: size_of::<STARTUPINFOW>() as u32,
-            dwFlags: STARTF_USESTDHANDLES,
-            hStdInput: HANDLE(stdin.as_raw_handle()),
-            hStdOutput: HANDLE(stdout_write.as_raw_handle()),
-            hStdError: HANDLE(stderr_write.as_raw_handle()),
-            ..Default::default()
-        };
-        let mut pi = PROCESS_INFORMATION::default();
-        unsafe {
-            CreateProcessW(
-                PCWSTR(exe.as_ptr()),
-                Some(PWSTR(cmd.as_mut_ptr())),
-                None,
-                None,
-                true,
-                CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-                Some(env.as_ptr().cast()),
-                PCWSTR::null(),
-                &startup,
-                &mut pi,
-            )
-        }
-        .map_err(|error| io::Error::other(error.to_string()))?;
-        let process = unsafe { OwnedHandle::from_raw_handle(pi.hProcess.0) };
-        let thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread.0) };
-        if let Err(error) = unsafe {
-            AssignProcessToJobObject(HANDLE(job.as_raw_handle()), HANDLE(process.as_raw_handle()))
-        } {
-            use windows::Win32::System::Threading::TerminateProcess;
-            let _ = unsafe { TerminateProcess(HANDLE(process.as_raw_handle()), 1) };
-            return Err(EpubConvertError::Io(io::Error::other(error.to_string())));
-        }
-        if unsafe { ResumeThread(HANDLE(thread.as_raw_handle())) } == u32::MAX {
-            return Err(EpubConvertError::Io(io::Error::other(
-                "ResumeThread failed",
-            )));
-        }
-        drop(thread);
-        drop(stdout_write);
-        drop(stderr_write);
-        Ok(Box::new(NativeChild {
-            job,
-            process,
-            stdout: Some(stdout_read),
-            stderr: Some(stderr_read),
-        }))
+        let child = crate::job_process::spawn(
+            &spec.executable,
+            &args[1..],
+            &spec.environment,
+            crate::job_process::StdinMode::Null,
+        )?;
+        Ok(Box::new(NativeChild(child)))
     }
 }
 

@@ -53,6 +53,12 @@ impl App {
         &mut self,
         effects: crate::rename_key_migration::StoreMutationEffects,
     ) {
+        if effects.ai_captions_changed() {
+            self.notify_caption_changed();
+        }
+        if effects.caption_display_stale() {
+            self.caption_display.clear();
+        }
         if !effects.content_identity_index_stale() || !self.settings.edit_restore_prompt_enabled {
             return;
         }

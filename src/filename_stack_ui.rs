@@ -2329,6 +2329,7 @@ impl crate::app::App {
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
         self.metadata_cache.clear();
+        self.caption_display.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
         self.clear_tags_cache();
@@ -2353,6 +2354,39 @@ impl crate::app::App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caption_stack_view_adoption_clears_shared_display() {
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("caption-stack");
+        let page = folder.join("page_01.jpg");
+        let key = crate::ai_caption_db::CaptionDb::normalize_path(&page);
+        let prepared = read_stack_candidate(
+            StackCandidateOrder::new(vec![GridItem::Image(page.clone())], vec![None]),
+            Default::default(),
+            false,
+            false,
+            &AtomicBool::new(false),
+            Default::default(),
+            None,
+        )
+        .into_prepared()
+        .unwrap()
+        .unwrap();
+        app.caption_display.seed_for_test(&key);
+        app.caption_display.seed_for_test("d:/other/caption.jpg");
+        let epoch = app.caption_display.epoch_for_test();
+
+        app.swap_stack_view_items(prepared, &folder, Some(0));
+
+        assert_eq!(app.items, vec![GridItem::Image(page)]);
+        assert!(!app.caption_display.contains_for_test(&key));
+        assert!(
+            !app.caption_display
+                .contains_for_test("d:/other/caption.jpg")
+        );
+        assert_ne!(app.caption_display.epoch_for_test(), epoch);
+    }
 
     #[test]
     fn visibility_settings_ok_retires_extracting_and_grouping_on_worker_scan_path() {

@@ -31,6 +31,7 @@ impl SettingsWindow {
                 "許可の範囲",
                 "縮小画像を AI に見せる",
                 "撮影位置 (GPS) を AI に見せる",
+                "AI 説明文を AI に見せる",
                 "AI に見せる範囲",
                 "最近使った AI アプリ",
                 "AI による変更",
@@ -683,6 +684,20 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         AiBackend,
         "TensorRT",
         ["パック", "ダウンロード", "削除", "engine", "CUDA"]
+    ),
+    entry!(
+        "ai-caption/manage",
+        AiCaption,
+        "AI 説明文",
+        [
+            "Qwen",
+            "Vulkan",
+            "モデル",
+            "GPU",
+            "VRAM",
+            "ダウンロード",
+            "削除"
+        ]
     ),
     entry!(
         "editing-addon/manage",
@@ -1599,6 +1614,7 @@ mod tests {
             "許可の範囲",
             "登録",
             "GPS",
+            "AI 説明文を AI に見せる",
             "最近使った AI アプリ",
             "AI による変更",
         ] {

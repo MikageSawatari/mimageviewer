@@ -11,11 +11,15 @@ use std::time::{Duration, Instant};
 fn context(fixture: &Fixture) -> ReadContext {
     ReadContext::new(
         &fixture.handlers,
-        PermissionSnapshot {
-            level: AgentLevel::Organize,
-            thumbnails: false,
-            gps: false,
-        },
+        (
+            PermissionSnapshot {
+                level: AgentLevel::Organize,
+                thumbnails: false,
+                gps: false,
+                ai_captions: false,
+            },
+            0,
+        ),
         Arc::new(AtomicBool::new(false)),
     )
 }

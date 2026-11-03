@@ -5506,6 +5506,10 @@ pub struct Settings {
     #[serde(default)]
     pub agent_show_gps: bool,
 
+    /// AI アプリへ AI 説明文を渡し、説明文での検索を許可する。既定 OFF。
+    #[serde(default)]
+    pub agent_show_ai_captions: bool,
+
     /// ラベル、ボタン、メニュー、ダイアログ、フルスクリーン HUD の文字コントラスト。
     #[serde(default)]
     pub text_contrast: TextContrast,
@@ -7944,6 +7948,7 @@ impl Default for Settings {
             agent_level: AgentLevel::default(),
             agent_show_thumbnails: false,
             agent_show_gps: false,
+            agent_show_ai_captions: false,
             text_contrast: TextContrast::default(),
             notification_duration: NotificationDuration::default(),
             ui_scale_factor: default_ui_scale_factor(),

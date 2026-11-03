@@ -80,7 +80,7 @@ fn host_content_id() -> String {
 }
 
 #[cfg(not(feature = "portable"))]
-fn plain_directory(path: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn plain_directory(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
     let metadata = std::fs::symlink_metadata(path)?;
     #[cfg(windows)]
@@ -120,7 +120,7 @@ fn prepare_bridge(base: &std::path::Path) -> std::io::Result<PathBuf> {
 }
 
 #[cfg(not(feature = "portable"))]
-fn ensure_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn ensure_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {

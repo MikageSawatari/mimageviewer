@@ -1,0 +1,20 @@
+mImageViewer local AI caption model (vlm-model-v1)
+
+This package contains files derived from Qwen3.5-4B
+(https://huggingface.co/Qwen/Qwen3.5-4B), Copyright 2026 Alibaba Cloud,
+licensed under the Apache License, Version 2.0. A copy of the license is
+included in the LICENSE file.
+
+Changes made by Mikage Sawatari for mImageViewer:
+
+- The original safetensors weights were converted to GGUF with llama.cpp
+  b12032 (convert_hf_to_gguf.py).
+- The language model was quantized to Q4_K_M with llama-quantize, using an
+  importance matrix computed from the text of the mImageViewer manual.
+- The vision projector (mmproj) is stored in F16.
+- No fine-tuning or retraining was performed.
+- The language model file is split into parts for distribution.
+  Concatenating the parts in order restores the original file.
+
+These files are provided on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied.

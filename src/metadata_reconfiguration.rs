@@ -81,6 +81,8 @@ pub(crate) struct Runtime {
 
 #[derive(Clone)]
 pub(crate) struct Stores {
+    pub caption_epoch: Arc<std::sync::atomic::AtomicU64>,
+    pub caption_db_path: PathBuf,
     pub meta: Arc<crate::fts_meta::FtsMetaDb>,
     pub fts: Arc<crate::fts_index::FtsIndex>,
     pub writer: Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher>,
@@ -392,6 +394,29 @@ pub(crate) fn startup_cleanup(
     Ok(roots)
 }
 
+fn cleanup_caption_removed(path: &std::path::Path, config: &Configuration) {
+    if !path.exists() {
+        return;
+    }
+    let result = crate::ai_caption_db::CaptionDb::open_existing_for_write(path).and_then(|db| {
+        let ranges: Vec<_> = config
+            .favorites
+            .iter()
+            .flat_map(|favorite| {
+                crate::metadata_ownership::OwnedRange {
+                    root: root_key(&favorite.path),
+                    exclusions: Vec::new(),
+                }
+                .sql_ranges()
+            })
+            .collect();
+        db.cleanup_removed_outside_ranges(&ranges)
+    });
+    if let Err(error) = result {
+        crate::logger::log(format!("caption removed cleanup failed: {error}"));
+    }
+}
+
 fn dispatch_full_check(stores: &Stores, view: &mut View) {
     for control in view.controls.values() {
         control.request_metadata_full_rescan();
@@ -642,6 +667,8 @@ fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bo
             }
             let h = indexer_supervisor::spawn(
                 SupervisorParams {
+                    caption_epoch: Arc::clone(&stores.caption_epoch),
+                    caption_db_path: stores.caption_db_path.clone(),
                     favorite_id: favorite.id,
                     favorite_root: favorite.path.clone(),
                     excluded_roots: owned.excluded_roots.clone(),
@@ -661,6 +688,10 @@ fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bo
             );
             view.controls.insert(favorite.id, h.control());
             handles.insert(favorite.id, h);
+        }
+        // Keep tombstones under all favorite roots, including metadata-disabled favorites.
+        if initial_configuration {
+            cleanup_caption_removed(&stores.caption_db_path, &next);
         }
         old = next;
         let mut view = shared.state.lock().unwrap();
@@ -732,6 +763,8 @@ mod tests {
             Arc::clone(&reporter),
         );
         Stores {
+            caption_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            caption_db_path: tmp.join("ai_caption.db"),
             meta,
             fts,
             writer,
@@ -2013,6 +2046,52 @@ mod tests {
         assert!(path.exists());
         assert!(stores.meta.get(&key).unwrap().is_none());
         assert!(!has_doc(&stores, &key));
+        runtime.shutdown();
+    }
+    #[test]
+    fn caption_removed_cleanup_runs_once_after_initial_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let stores = stores(temp.path());
+        crate::ai_caption_db::CaptionDb::open_at(&stores.caption_db_path).unwrap();
+        let conn = rusqlite::Connection::open(&stores.caption_db_path).unwrap();
+        let root = temp.path().join("disabled");
+        let inside = format!("{}/removed.jpg", root_key(&root));
+        conn.execute("INSERT INTO caption_removed VALUES (?1, 1)", [&inside])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO caption_removed VALUES ('c:/outside/old.jpg',2)",
+            [],
+        )
+        .unwrap();
+        let favorite = favorite(98, root, false);
+        let mut runtime = Runtime::start(
+            stores,
+            Configuration::new(std::slice::from_ref(&favorite), vec![]),
+        )
+        .unwrap();
+        settled(&runtime);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM caption_removed", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "disabled favorite retains its tombstones");
+        let kept: String = conn
+            .query_row("SELECT item_key FROM caption_removed", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, inside);
+        conn.execute(
+            "INSERT INTO caption_removed VALUES ('c:/outside/new.jpg',3)",
+            [],
+        )
+        .unwrap();
+        runtime.submit(Configuration::new(&[favorite], vec![]));
+        settled(&runtime);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM caption_removed", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            rows, 2,
+            "later reconfigurations do not repeat startup cleanup"
+        );
         runtime.shutdown();
     }
 }

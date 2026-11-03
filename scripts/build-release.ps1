@@ -117,6 +117,7 @@ $expectedRepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $releaseDir = Join-Path $repoRoot 'target\release'
 . (Join-Path $PSScriptRoot 'effetune-distribution.ps1')
 . (Join-Path $PSScriptRoot 'vst3-host-identity.ps1')
+. (Join-Path $PSScriptRoot 'vlm-worker-identity.ps1')
 $null = Assert-MivEffetuneSource -SourceRoot (Join-Path $repoRoot $MivSound.SOURCE_ROOT) `
     -NoticesRoot (Join-Path $repoRoot $MivSound.NOTICES_ROOT)
 if ($PreserveRuntime) {
@@ -328,6 +329,9 @@ if (-not $SkipVst3Bridge) {
 # signing or embedding. Signature/PE validity alone cannot detect an old host.
 Assert-MivVst3HostIdentity -RepoRoot $repoRoot
 
+& (Join-Path $PSScriptRoot 'build-vlm-worker.ps1') -RepoRoot $repoRoot
+Assert-MivVlmWorkerIdentity -RepoRoot $repoRoot
+
 # Use a fresh complete copy: signed distribution builds must not mutate the
 # upstream EffeTune bundle. This path is also the final embedded-PE gate input.
 $effetuneStage = New-MivEffetuneStage -RepoRoot $repoRoot
@@ -343,6 +347,7 @@ if ($Sign) {
         'vendor\pdfium\bin\pdfium.dll',
         'vendor\susie-worker\mimageviewer-susie32.exe',
         'vendor\vst3-host\mimageviewer-vst3-host.exe',
+        'vendor\vlm-worker\mimageviewer-vlm.exe',
         'vendor\ffmpeg\bin\avcodec-61.dll',
         'vendor\ffmpeg\bin\avformat-61.dll',
         'vendor\ffmpeg\bin\avutil-59.dll',
@@ -371,6 +376,7 @@ $coreCmd = @('build', '--release', '--bin', 'mimageviewer-core')
 if ($CargoArgs) { $coreCmd += $CargoArgs }
 Write-Host ("[build-release] (2/7) CARGO_INCREMENTAL=0 cargo {0}" -f ($coreCmd -join ' '))
 Assert-MivVst3HostIdentity -RepoRoot $repoRoot
+Assert-MivVlmWorkerIdentity -RepoRoot $repoRoot
 $coreExit = Invoke-ReleaseCargo -Args $coreCmd -ExpectedExecutable $releaseCoreExe
 if ($coreExit -ne 0) { exit $coreExit }
 
@@ -473,6 +479,7 @@ $embeddedPe = @(
     (Join-Path $repoRoot 'vendor\ffmpeg\bin'),
     (Join-Path $repoRoot 'vendor\susie-worker\mimageviewer-susie32.exe'),
     (Join-Path $repoRoot 'vendor\vst3-host\mimageviewer-vst3-host.exe'),
+    (Join-Path $repoRoot 'vendor\vlm-worker\mimageviewer-vlm.exe'),
     (Join-Path $effetuneStage $MivSound.BUNDLE_NAME)
 )
 & (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1') `

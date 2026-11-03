@@ -3,7 +3,7 @@ use super::*;
 #[derive(Clone)]
 pub(super) struct ReadContext {
     pub(super) cancel: Arc<AtomicBool>,
-    pub(super) permission: PermissionSnapshot,
+    pub(super) granted: PermissionGrant,
     progress: Arc<Mutex<Option<Payload>>>,
     deadline: Instant,
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
@@ -11,13 +11,13 @@ pub(super) struct ReadContext {
 impl ReadContext {
     pub(super) fn new(
         handlers: &Handlers,
-        permission: PermissionSnapshot,
+        granted: PermissionGrant,
         cancel: Arc<AtomicBool>,
     ) -> Self {
         let clock = handlers.clock();
         Self {
             cancel,
-            permission,
+            granted,
             progress: Arc::new(Mutex::new(None)),
             deadline: clock() + Duration::from_secs(20),
             clock,

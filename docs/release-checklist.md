@@ -38,9 +38,9 @@
   と `cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo --target-dir target-portable`
   (非portable core を上書きしないよう専用 target dir に分離) → loose 同梱フォルダ +
   `dist\mImageViewer_portable_v<VER>.zip` を生成する。`portable` feature で native 依存
-  (pdfium / onnxruntime / susie / vst3-host / モデル) を埋め込まず exe 隣から解決し、`data_dir` を
+  (pdfium / onnxruntime / susie / vst3-host / VLM worker / モデル) を埋め込まず exe 隣から解決し、`data_dir` を
   `<exe_dir>\data` に向ける。launcher は使わず core を `mimageviewer.exe` にリネームし、
-  remote service・EPUB converter・`mimageviewer-mcp.exe`・music-video editor をその隣へ同梱。
+  remote service・EPUB converter・`mimageviewer-mcp.exe`・music-video editor・`mimageviewer-vlm.exe` をその隣へ同梱。
   VST host と EffeTune bundle は利用者決定により非同梱。音響調整は bundle 不在で利用不可のまま。
   `portable` build flavor では音響調整ボタン・カスタマイズ候補・v4.3.0の関連告知も表示しない。
   保存済みセクション順は維持し、描画対象だけを除外する。通常版のbundle欠落は表示で隠さない。
@@ -84,6 +84,12 @@
   `vcruntime*` / `concrt*` import は gate failure とし、追加 DLL を場当たり的に配布しない。
   app-local CRT は Windows Update で更新されないため、toolchain / native dependency 更新時に
   `vendor/vcrt/provenance.json` と実体を一体で見直す。
+- **VLM worker の配布境界**: 通常版は `vendor/vlm-worker/mimageviewer-vlm.exe` を core に内包し、
+  ポータブル版は exe の隣に置く。release / portable は内包・コピー前に `build-vlm-worker.ps1` を呼び、
+  現ソースに一致する worker は再利用し、不足・不一致なら再ビルドする。`-SkipBuild` でも identity を照合する。
+  release は vendor worker を core 内包前に署名し、portable はコピー後の `$portablePe` に含めて署名・検証する。
+  両方の PE gate に含め、`VLM-WORKER-LICENSE.txt` は本体の全文表示と portable の loose file に保持する。
+  モデルは内包せず追加ダウンロードとする。復旧・固定ソース・SDK の前提は [native-dependencies.md](native-dependencies.md#ローカル-ai-説明文-worker)。
 - **設定保存先**: インストーラ版・単体exe版は `%APPDATA%\mimageviewer`、
   ポータブル版は `<exe_dir>\data` (書込不可なら APPDATA へフォールバックせずエラー起動拒否)。
 
@@ -465,7 +471,7 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
       単体 exe / portable の手動交換前も AI アプリを終了する。
     - **コード署名は build-dist.ps1 が既定で ON** (Certum Open Source Code Signing 証明書、SimplySign Desktop
       のクラウド鍵)。配布する全 PE に Authenticode 署名 + RFC3161 タイムスタンプを付ける: 単体exe (launcher) /
-      core / remote / EPUB worker / MCP / editor / susie32 / vst3-host / pdfium / FFmpeg 6 DLL / EffeTune plugin (`.vst3` PE) / `mImageViewer_setup.exe` / portable の各 loose PE。
+      core / remote / EPUB worker / MCP / editor / VLM worker / susie32 / vst3-host / pdfium / FFmpeg 6 DLL / EffeTune plugin (`.vst3` PE) / `mImageViewer_setup.exe` / portable の各 loose PE。
       **`include_bytes!` で埋め込む物は「埋め込み前」に署名する**
       (内側 vendor PE → core + remote + EPUB worker + MCP + editor → launcher → setup.exe の順)。
       EffeTune は vendor 原本ではなく target staging の全 PE を署名し、`MIMV_EFFETUNE_DIR` で
@@ -509,7 +515,7 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
       検証チェックリスト全項目は [docs/portable-build-plan.md](portable-build-plan.md) §8。
 12. **全 PE / app-local VC runtime gate** — `build-dist.ps1` が installer / portable 完成後に
     `scripts/check-vcrt-pe-dependencies.ps1` を必須実行する。launcher / core / remote / EPUB worker / MCP / editor / installer、
-    portable 配下、埋め込み元 PDFium / DirectML ORT / FFmpeg / Susie / VST host / EffeTune plugin PE を filesystem から
+    portable 配下、埋め込み元 PDFium / DirectML ORT / FFmpeg / Susie / VST host / VLM worker / EffeTune plugin PE を filesystem から
     列挙し、artifact 別 machine、direct import closure、全 input SHA-256 を report に残す。
     4 CRT は Microsoft 署名、manifest exact hash、全4本同一版かつ最低 14.44 を必須とし、
     `onnxruntime*.dll` も Microsoft 署名を必須にする。未知の VC runtime import、companion CRT 欠落、

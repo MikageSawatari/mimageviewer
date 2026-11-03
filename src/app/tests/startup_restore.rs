@@ -1999,6 +1999,7 @@ fn section1335_filtered_search_with_retained_physical_path_keeps_parent_cursor_o
     env.open_global_search();
     env.global_search
         .accumulate_hit(&crate::global_search::GlobalHit {
+            kind: crate::fts_index::IndexKind::Image,
             path: hit.to_string_lossy().into_owned(),
             score: 1.0,
             mtime: 0,

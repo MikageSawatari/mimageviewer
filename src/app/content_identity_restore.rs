@@ -414,6 +414,16 @@ impl App {
         };
         self.content_identity_restore_pending = None;
 
+        // Successful restores publish ledger entries incrementally below; they
+        // do not require an authoritative ledger reload. Captions are shared
+        // across viewer contexts and must still reflect the committed copies.
+        if report.store_mutations.ai_captions_changed() {
+            self.notify_caption_changed();
+        }
+        if report.store_mutations.caption_display_stale() {
+            self.caption_display.clear();
+        }
+
         self.advance_collection_thumbnail_source_epoch_for_pin_commit(
             report.committed_thumbnail_pins,
             "content_identity_restore",
@@ -875,6 +885,92 @@ mod tests {
             entry.tags.as_deref(),
             Some(["#current".to_string()].as_slice())
         );
+    }
+
+    #[test]
+    fn caption_restore_completion_clears_shared_display_without_ledger_reload() {
+        let mut app = crate::app::setup_app_for_test();
+        let index_data = app.tmp.path().join("caption-index");
+        let caption_epoch = app.caption_epoch_for_test(&index_data);
+        // Model a completed startup load, with no earlier loader still owned.
+        if let Some(pending) = app.content_identity_index_load_pending.take() {
+            pending.cancel();
+        }
+        assert!(app.content_identity_index_load_pending.is_none());
+        app.settings.edit_restore_prompt_enabled = true;
+        app.content_identity_ledger_state =
+            crate::content_identity::ContentIdentityLedgerState::Ready;
+        let descriptor = crate::rename_key_migration::STORES
+            .iter()
+            .find(|descriptor| descriptor.file == "ai_caption.db")
+            .unwrap();
+        let mut effects = crate::rename_key_migration::StoreMutationEffects::default();
+        effects.record_rows_changed(descriptor, 1);
+        // STORES also copies the identity ledger during real restores. The
+        // successful completion must keep its incremental adoption contract.
+        effects.merge(
+            crate::rename_key_migration::StoreMutationEffects::for_content_identity_index_stale(),
+        );
+        let mut mutations = vec![Default::default(), effects];
+        for file in ["folder_thumb_pins.db", "video_pins.db"] {
+            let descriptor = crate::rename_key_migration::STORES
+                .iter()
+                .find(|descriptor| descriptor.file == file)
+                .unwrap();
+            let mut pins = crate::rename_key_migration::StoreMutationEffects::default();
+            pins.record_rows_changed(descriptor, 1);
+            mutations.push(pins);
+        }
+        for mutation in mutations {
+            app.caption_display.seed_for_test("c:/images/restored.jpg");
+            app.caption_display
+                .seed_for_test("d:/images/other-viewer.jpg");
+            let epoch = app.caption_display.epoch_for_test();
+            let before = caption_epoch.load(std::sync::atomic::Ordering::Acquire);
+            let (tx, rx) = mpsc::channel();
+            tx.send(crate::content_identity::ContentRestoreReport {
+                // An actual store commit owns invalidation even without any
+                // requested restore/decline count in the terminal report.
+                store_mutations: mutation,
+                ..Default::default()
+            })
+            .unwrap();
+            app.content_identity_restore_pending = Some(ContentIdentityRestorePending { rx });
+
+            app.poll_content_identity_restore(&egui::Context::default());
+
+            assert_eq!(
+                caption_epoch.load(std::sync::atomic::Ordering::Acquire),
+                before + u64::from(mutation.ai_captions_changed())
+            );
+            assert!(app.content_identity_restore_pending.is_none());
+            assert!(app.content_identity_index_load_pending.is_none());
+            assert_eq!(
+                app.content_identity_ledger_state,
+                crate::content_identity::ContentIdentityLedgerState::Ready,
+            );
+            if mutation.caption_display_stale() {
+                assert!(
+                    !app.caption_display
+                        .contains_for_test("c:/images/restored.jpg")
+                );
+                assert!(
+                    !app.caption_display
+                        .contains_for_test("d:/images/other-viewer.jpg")
+                );
+                assert_ne!(app.caption_display.epoch_for_test(), epoch);
+            } else {
+                assert!(
+                    app.caption_display
+                        .contains_for_test("c:/images/restored.jpg")
+                );
+                assert!(
+                    app.caption_display
+                        .contains_for_test("d:/images/other-viewer.jpg")
+                );
+                assert_eq!(app.caption_display.epoch_for_test(), epoch);
+            }
+        }
     }
 
     #[test]

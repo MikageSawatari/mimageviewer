@@ -113,10 +113,11 @@ fn main() {
     // 代わって復旧手順付きの明確なメッセージを出す。
     if target_is_windows {
         check_vendor_files();
-        if std::env::var("PROFILE").as_deref() == Ok("release")
-            && std::env::var_os("CARGO_FEATURE_PORTABLE").is_none()
-        {
-            check_release_vst3_host_identity();
+        if std::env::var("PROFILE").as_deref() == Ok("release") {
+            check_release_vlm_worker_identity();
+            if std::env::var_os("CARGO_FEATURE_PORTABLE").is_none() {
+                check_release_vst3_host_identity();
+            }
         }
     }
 
@@ -177,6 +178,46 @@ fn main() {
             eprintln!("winresource compile error: {e}");
         }
     }
+}
+
+fn check_release_vlm_worker_identity() {
+    for path in [
+        "scripts/vlm-worker-identity.ps1",
+        "scripts/sign-files.ps1",
+        "crates/vlm-worker/CMakeLists.txt",
+        "crates/vlm-worker/src",
+        "crates/vlm-worker/tests",
+        "crates/vlm-worker/tools/source-identity.ps1",
+        "vendor/vlm-worker/mimageviewer-vlm.exe",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    let mut command = std::process::Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            "scripts/vlm-worker-identity.ps1",
+            "-ValidateRepo",
+        ])
+        .arg(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let output = command
+        .output()
+        .expect("VLM worker identity gate requires PowerShell");
+    assert!(
+        output.status.success(),
+        "Release VLM worker identity gate failed. Run scripts/build-vlm-worker.ps1:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn check_release_vst3_host_identity() {
@@ -746,6 +787,11 @@ fn check_vendor_files() {
             "cmake -S crates/vst3-host -B crates/vst3-host/build -G \"Visual Studio 18 2026\" -A x64 && cmake --build crates/vst3-host/build --config Release",
         ));
     }
+
+    required.push((
+        "vendor/vlm-worker/mimageviewer-vlm.exe",
+        "powershell -NoProfile -File scripts/build-vlm-worker.ps1 (see crates/vlm-worker/README.md for pinned llama.cpp / Vulkan SDK prerequisites)",
+    ));
 
     let missing: Vec<&(&str, &str)> = required
         .iter()

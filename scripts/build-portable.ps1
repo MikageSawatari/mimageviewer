@@ -30,6 +30,7 @@ $ErrorActionPreference = 'Stop'
 Assert-MivFixedCargoOutput -WorkingDirectory (Join-Path $PSScriptRoot '..') -Portable -SmokeTestScript:$SmokeTestScript
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 . (Join-Path $PSScriptRoot 'build-process-policy.ps1')
+. (Join-Path $PSScriptRoot 'vlm-worker-identity.ps1')
 
 if ($SmokeTestScript -and $Sign) {
     throw '[portable-smoke-build] -Sign is not supported for diagnostic smoke artifacts'
@@ -388,6 +389,7 @@ if ($KeepRunning) {
 # ---------------------------------------------------------------------------
 $smokeBuildManifest = Join-Path $portableTargetDir 'release\mimageviewer-core.build-manifest.json'
 Assert-NoReparsePath $portableTargetDir $repoRoot 'portable-target'
+& (Join-Path $PSScriptRoot 'build-vlm-worker.ps1') -RepoRoot $repoRoot -SkipBuild:$SkipBuild
 $sourceFingerprint = $null
 if ($SmokeTestScript) {
     $sourceFingerprint = Get-MivSourceFingerprint $repoRoot
@@ -473,7 +475,10 @@ New-Item -ItemType Directory -Path $pkgDir | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $pkgDir 'models') | Out-Null
 
 # (source relative to repo root, destination relative to pkgDir)
+Assert-MivVlmWorkerIdentity -RepoRoot $repoRoot
 $copies = @(
+    @{ src = 'vendor\vlm-worker\mimageviewer-vlm.exe'; dst = 'mimageviewer-vlm.exe' }
+    @{ src = 'VLM-WORKER-LICENSE.txt'; dst = 'VLM-WORKER-LICENSE.txt' }
     @{ src = $coreExe; dst = 'mimageviewer.exe' }
     @{ src = $remoteExe; dst = 'mimageviewer-remote.exe' }
     @{ src = $epubWorkerExe; dst = 'mimageviewer-epub-pdf.exe' }
@@ -575,6 +580,7 @@ if ($Sign) {
         'mimageviewer-epub-pdf.exe',
         'mimageviewer-mcp.exe',
         'mimageviewer-musicvideo.exe',
+        'mimageviewer-vlm.exe',
         'pdfium.dll',
         'mimageviewer-susie32.exe',
         'avcodec-61.dll', 'avformat-61.dll', 'avutil-59.dll',

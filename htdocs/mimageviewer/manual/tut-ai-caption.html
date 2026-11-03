@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>画像から AI で説明文を作って探す — チュートリアル — mImageViewer</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="画像や本の表紙から PC 内の AI で説明文を作る手順。モデルの取得、進捗と中止、情報パネルでの確認、説明文での検索と持ち運びを説明します。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/tut-ai-caption.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/tut-ai-caption.html">
+  <meta property="og:title" content="画像から AI で説明文を作って探す｜mImageViewer">
+  <meta property="og:description" content="画像や本の表紙から PC 内の AI で説明文を作る手順。モデルの取得、進捗と中止、情報パネルでの確認、説明文での検索と持ち運びを説明します。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="画像から AI で説明文を作って探す｜mImageViewer">
+  <meta name="twitter:description" content="画像や本の表紙から PC 内の AI で説明文を作る手順。モデルの取得、進捗と中止、情報パネルでの確認、説明文での検索と持ち運びを説明します。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>画像から AI で説明文を作って探す</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+    <h1 class="page-title">画像から AI で説明文を作って探す</h1>
+    <p class="page-desc">
+      画像や本の表紙を AI が読み取り、内容の説明文・画像内の文字の書き写し・検索語を PC 内に保存します。
+      先に説明文を作っておくと、ファイル名にない言葉でも画像や本を探せます。まずは少数の画像で、作成から検索まで試してみましょう。
+    </p>
+
+    <div class="box info">
+      <div class="box-body">
+        <strong>説明文の作成は PC 内で行い、画像・表紙・読み取った文字や説明文を外へ送りません。</strong>
+        モデルの取得時には通信します。また、別の機能である AI アプリとの連携で「AI 説明文を AI に見せる」をオンにすると、
+        保存済みの説明文などが AI アプリへ渡り、その提供元へ送られます。この許可は既定ではオフです。
+        詳しくは<a href="../privacy.html">プライバシーポリシー</a>をご覧ください。
+      </div>
+    </div>
+
+    <h2 id="prepare">1. 使える PC とモデルを確認する</h2>
+    <p><strong>Vulkan 対応で VRAM 8 GB 以上の GPU が必要</strong>です。対応していない GPU やドライバ、VRAM が足りない PC では作成できません。
+      環境設定の<a href="settings.html#ai-captions">「AI 説明文」</a>で、GPU が利用条件を満たすかとモデルの状態を確認できます。</p>
+    <p>8 GB 級の GPU で表示時の AI 処理を<strong>「高画質」</strong>にしている場合、同時に使うと遅くなることがあります。
+      快適に使うには「設定」→「環境設定…」の「全体設定」にある<strong>「表示時の AI 処理 (アップスケール / ノイズ除去)」</strong>を
+      <strong>「軽量」</strong>にして「OK」で閉じ、mIV を再起動してください。</p>
+    <p>初めて説明文を作るときは、追加のモデルをダウンロードします。取得元・大きさ・必要な空き容量は確認画面に表示されます。
+      詳しくは<a href="grid.html#ai-captions">AI 説明文を作る</a>をご覧ください。通常の起動や閲覧だけでは、自動で取得・作成しません。</p>
+
+    <h2 id="create">2. 画像や本を選んで作成する</h2>
+    <ol class="step-list">
+      <li>一覧で、説明文を作りたい画像や本を選びます。本は開かずに選べます。複数ならチェックし、チェックした項目の一つを右クリックします。</li>
+      <li>右クリックメニューの<strong>「AI 説明文を作る」</strong>を選びます。チェックした項目に現在の選択が含まれる場合は、チェックした全項目が対象です。</li>
+      <li>モデルがまだない場合は<strong>「AI 説明文のモデル」</strong>の案内が出ます。内容を確認して<strong>「ダウンロード」</strong>を押します。今回は取得しない場合は「今はしない」で閉じられます。</li>
+      <li>取得が終わると、手順 2 の時点で選んでいた対象で作成が始まります。モデルを取得済みの場合は、手順 2 から作成へ進みます。</li>
+    </ol>
+    <p>先に環境設定の「AI 説明文」でモデルだけを取得しても構いません。その場合は取得だけで、作成は始まりません。
+      取得後に一覧で画像や本を選び、右クリックから作成してください。</p>
+    <p>一覧の空白部分を右クリックした場合は、現在のフォルダ直下の画像と ZIP・PDF などの本を処理します。
+      サブフォルダの中までは処理しません。フォルダの表紙から作るときは、そのフォルダ自体を選んでください。</p>
+
+    <h3>本は表紙だけを読む</h3>
+    <p>対象は PC 上の静止画ファイルと、本（フォルダ・ZIP・PDF・EPUB・対応する書庫）の表紙です。
+      表紙は一覧のサムネイルと同じ位置を使い、固定した表紙があればそれを読みます。本全体のあらすじを作る機能ではありません。</p>
+    <ul>
+      <li>ZIP などの書庫内の画像、PDF のページを個別に選んだ場合は対象外です。書庫内のフォルダ、動画・音声、動画のフレームを表紙に固定した本も対象外です。</li>
+      <li>変換が必要な書庫や EPUB に変換済みデータがなければ飛ばします。一度開いて変換してから、改めて作成してください。</li>
+      <li>パスワード付き PDF は保存済み、または現在開いている PDF のパスワードを使います。使えるパスワードがなければ、入力を求めず飛ばします。</li>
+    </ul>
+
+    <h2 id="progress">3. 進み具合を見る・中止する</h2>
+    <p><strong>「AI 説明文を作成」</strong>の小窓に、件数と現在の項目、作成済みで飛ばした数、対象外や失敗などの数が表示されます。
+      作成中も画像や本を閲覧できます。別の対象で「AI 説明文を作る」を選ぶと、今の処理の後ろへ追加します。</p>
+    <p><strong>「中止」</strong>を押すと、処理中の 1 件が終わってから停止し、その 1 件の結果は保存しません。
+      それまでに保存した説明文は残ります。終了処理中は、終わってから対象を選び直してください。</p>
+    <p>モデルの取得は、取得画面の<strong>「キャンセル」</strong>で中止できます。次回は続きから取得しますが、作成対象は選び直してください。</p>
+
+    <h2 id="view">4. 情報パネルで読む・作り直す</h2>
+    <ol class="step-list">
+      <li>作成した画像や本を開き、右側の<a href="fullscreen.html#ai-captions">情報パネル</a>を表示して、上部の<strong>「情報」</strong>を選びます。パネルの表示方法は<a href="fullscreen.html">フルスクリーン表示</a>をご覧ください。</li>
+      <li>画像では<strong>「AI 説明」</strong>、本では<strong>「この本の AI 説明」</strong>を確認します。説明文・画像内の文字・検索語をコピーでき、作成日も見られます。</li>
+      <li>「画像が変わっています」「表紙が変わっています」と出たら、一覧へ戻り、その画像や本を右クリックして<strong>「AI 説明文を作る」</strong>で作り直します。</li>
+    </ol>
+    <p>本の説明文は、開いているページに関係なく、その本の表紙の内容です。一覧で本を選ぶだけでは表示しません。
+      同じ画像や表紙に同じ条件で作成済みなら飛ばすため、もう一度選ぶだけで必ず文章が変わるわけではありません。</p>
+    <div class="box warn">
+      <div class="box-body">
+        <strong>説明文や書き写した文字は正確とは限りません。</strong>元の画像・表紙と見比べてください。
+        検索語は探すための文章で、mIV のタグを自動で付けるものではありません。
+      </div>
+    </div>
+
+    <h2 id="search">5. 説明文から画像や本を探す</h2>
+    <ol class="step-list">
+      <li>対象の場所をお気に入りに登録し、「お気に入り」→「編集」で、その行の<strong>「アイテム索引 (Ctrl+G)」</strong>をオンにします。詳しくは<a href="grid.html#favorite-index">お気に入りの索引</a>をご覧ください。</li>
+      <li>一覧で <kbd>Ctrl</kbd>+<kbd>G</kbd> を押してアイテム検索を開きます。</li>
+      <li>「検索対象」を<strong>「AI 説明」</strong>にし、保存した説明文にある言葉を入れます。たとえば説明文に「コーヒー」とあれば、その語で探せます。説明文・画像内の文字・検索語が対象で、「すべての対象」にも含まれます。</li>
+      <li>本を探すときは「種類」の<strong>「書庫・フォルダの本」</strong>で絞り込めます。PDF・EPUB は「PDF / EPUB ファイル」を選びます。結果から本を開くと、その中身を表示します。</li>
+    </ol>
+    <p>検索できるのはアイテム索引を有効にしたお気に入りの範囲です。日本語などは 2 文字以上、英数字は 3 文字以上で入力してください。
+      表紙の説明文がある書庫・フォルダの本も結果に出ます。説明文のない書庫・フォルダを名前で探すときは <kbd>Ctrl</kbd>+<kbd>S</kbd> を使います。</p>
+    <p>モデルを削除した後も、保存した説明文の表示・検索はできます。今の一覧だけを絞り込む方法などは<a href="search.html#ctrl-g">検索機能</a>をご覧ください。</p>
+
+    <h2 id="transfer">6. 説明文を別の環境へ持っていく</h2>
+    <p>保存済みの説明文・画像内の文字・検索語は、<a href="metadata-transfer.html">メタ情報の移行</a>に含まれます。
+      対象の実フォルダで「ファイル」→<strong>「メタ情報をエクスポート…」</strong>を使い、書き出したメタ情報を画像や本と一緒にコピーします。
+      移行先では「ファイル」→<strong>「メタ情報をインポート…」</strong>で取り込めます。作成失敗の記録は含みません。</p>
+    <p>画像内の氏名・連絡先なども書き出される場合があります。ほかの人に渡す際は、説明文や書き写した文字の内容も確認してください。</p>
+
+    <h2 id="share">7. 必要なら AI アプリにも見せる</h2>
+    <p>Claude Desktop や ChatGPT (Codex) から説明文を使って探したい場合は、<a href="tut-ai-integration.html">AI アプリとの連携のチュートリアル</a>で登録し、
+      「設定」→「AI 連携…」の<strong>「AI 説明文を AI に見せる」</strong>をオンにします。既定ではオフです。</p>
+    <p>オンにすると、保存済みの説明文・画像内の文字・検索語で検索でき、ファイルや本の情報を調べたときに内容も AI アプリへ渡ります。
+      渡った情報は AI アプリの提供元へ送られます。表紙に固定した本文のページや ZIP 内の画像から読み取った文字、氏名・連絡先なども含まれるため、
+      内容を確認してから許可してください。説明文の作成自体は AI アプリからは頼めず、mIV で始めます。</p>
+    <p>追加の許可がオフでも、説明文がある書庫・フォルダの本が名前での検索結果に出るため、説明文があることは推測できます。
+      詳しくは<a href="ai-integration.html#permissions">許可の範囲</a>をご覧ください。</p>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>
