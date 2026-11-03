@@ -541,3 +541,13 @@ reparse point 0と確認してNTFS圧縮（ファイル内容保持、削除0）
 - 利用者が v5 の dev build で、初回表示・字幕の読みやすさ・マイクのダイアログが出ないこと・アナライザーの 4 点を確認し (観測者: 利用者)、承認を指示した。
 - `.\scripts\build-miv-sound.ps1 -Approve -Candidate 4b7a3eba…` を実行し、`third_party/miv-sound/0.15.0-miv.1/` を `636b2936b` でコミット。バックアップは `C:\home\mimageviewer_vendor_backup\miv-sound-0.15.0-miv.1\`。以後の v5 の検査に `MIV_SOUND_CANDIDATE` は要らない。
 - 承認後の `cargo check --workspace --all-targets` は、承認物の検査を通過し、launcher が release の exe 5 本を要求するところで止まった (未ビルドのため。公開前ゲートで `build-release.ps1` から作る)。
+
+## 9. mIV Sound 0.15.0-miv.2 (候補 4d2a0fc3…) の承認 (2026-11-03)
+
+- 内容: 「起動時の表示」に「前回の表示 (デフォルト)」を足し、新しい利用者の既定にした (記録が無いときは Visualizer の mIV Original)。Effects の選択肢から「(デフォルト)」を外した。保存状態の無い初回に作る既定のパイプラインの Volume を -6 dB から 0 dB にした。既存の利用者が選んだ起動時の表示と保存済みのパイプラインは変えない。
+- 経緯: v5 全般チェック (サブ PC 依頼 7、観測者: サブ PC 担当) で、再起動すると毎回 Visualizer で開くことが分かり、利用者が「前回の表示を残す」を選んだ。候補 302a5bef… を利用者が確かめた際に (観測者: 利用者)、「(デフォルト)」の表記と、初めて開いたときに音量が 6 dB 下がることの指摘があり、0 dB にすることを利用者が決めた。
+- miv-sound `miv` ブランチ: `4570657` (前回の表示)、`1df923f`・`f6efd03` (テスト)、`295db5a`・`026df1c` (表記・0 dB・ビルドの安全策)、`a97108e` (版 0.15.0-miv.2)。0.15.0-miv.1 は承認済みで同じ版を上書きできないため、版を上げた。mIV 側は `config/miv-sound.rs` の `VERSION` を合わせた。
+- 独立レビュー (gpt-6.1-sol / xhigh): 前回の表示は ACCEPT (P3 1 件はテスト追加で対応)。表記と 0 dB は 1 回目 REJECT (P2 locale 置換の欠落でビルドが止まらない、P3 文書の書き方) → 対応後 ACCEPT。
+- ctest: 候補 `4d2a0fc3be02aa77c59ceedbb9a454f628adbe83ecc778217b0c8f9391b5d541` で 117/117。途中の候補 `302a5bef…` (`1df923f` で ctest 2 件失敗、テスト側の誤り)、`2c00671d…` (中断したビルドが残した記録) は `target/miv-sound-candidates-rejected/` へよけた。
+- 利用者の確認 (観測者: 利用者、v5 dev build に候補 `302a5bef…`、続いて `2c00671d…` を入れたもの。`4d2a0fc3…` との違いは版番号の表示だけ): 初回の Visualizer、再起動後の Effects / Visualizer の復元、明示値の優先、初回の音量が下がらないこと、起動時の表示の表記。
+- `.\scripts\build-miv-sound.ps1 -Approve -Candidate 4d2a0fc3…` で `third_party/miv-sound/0.15.0-miv.2/` を作成。バックアップは `C:\home\mimageviewer_vendor_backup\miv-sound-0.15.0-miv.2\`。旧 `third_party/miv-sound/0.15.0-miv.1/` は残している (削除は管理担当の判断)。
