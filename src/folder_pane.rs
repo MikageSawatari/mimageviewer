@@ -128,6 +128,15 @@ enum PaneParticipation {
     Displayed,
 }
 
+/// One cursor reveal, including listings adopted while the pane is opening.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FolderPaneCursorScroll {
+    #[default]
+    Idle,
+    Requested,
+    FollowingRefresh,
+}
+
 #[cfg(test)]
 type TestScanBackend = Arc<
     dyn Fn(&Path, FolderPaneListingOptions, &AtomicBool) -> Result<CachedListing, String>
@@ -137,7 +146,7 @@ type TestScanBackend = Arc<
 
 pub(crate) struct FolderPaneState {
     pub has_focus: bool,
-    pub scroll_to_cursor: bool,
+    pub(crate) cursor_scroll: FolderPaneCursorScroll,
     pub selected_drive: Option<PathBuf>,
     cursor_path: Option<PathBuf>,
     active_path: Option<PathBuf>,
@@ -160,7 +169,7 @@ impl Default for FolderPaneState {
         let drives = crate::known_folders::available_drives();
         Self {
             has_focus: false,
-            scroll_to_cursor: false,
+            cursor_scroll: FolderPaneCursorScroll::Idle,
             selected_drive: drives.first().cloned(),
             drives,
             cursor_path: None,
@@ -215,7 +224,7 @@ impl FolderPaneState {
                 .clone()
                 .or_else(|| self.selected_drive.clone());
         }
-        self.scroll_to_cursor = true;
+        self.cursor_scroll = FolderPaneCursorScroll::Requested;
     }
 
     pub(crate) fn set_focus_tree_at_active(&mut self) {
@@ -279,7 +288,7 @@ impl FolderPaneState {
         self.demand.clear();
         self.selected_drive = Some(drive.clone());
         self.cursor_path = Some(drive.clone());
-        self.scroll_to_cursor = true;
+        self.cursor_scroll = FolderPaneCursorScroll::Requested;
         self.ensure_node(drive);
         self.reconcile_demand();
     }
@@ -303,7 +312,7 @@ impl FolderPaneState {
             .active_path
             .clone()
             .or_else(|| self.selected_drive.clone());
-        self.scroll_to_cursor = true;
+        self.cursor_scroll = FolderPaneCursorScroll::Requested;
     }
 
     pub(crate) fn sync_to_active(
@@ -325,7 +334,7 @@ impl FolderPaneState {
             self.active_key = key;
             if !self.has_focus || self.cursor_path.is_none() {
                 self.cursor_path = active.clone();
-                self.scroll_to_cursor = true;
+                self.cursor_scroll = FolderPaneCursorScroll::Requested;
             }
         }
         self.active_path = active;
@@ -672,7 +681,7 @@ impl FolderPaneState {
 
     pub(crate) fn set_cursor(&mut self, path: PathBuf) {
         self.cursor_path = Some(path);
-        self.scroll_to_cursor = true;
+        self.cursor_scroll = FolderPaneCursorScroll::Requested;
     }
 
     pub(crate) fn handle_tree_key(&mut self, key: FolderPaneTreeKey) -> Option<FolderPaneCommand> {
@@ -730,7 +739,7 @@ impl FolderPaneState {
                 node.scan = NodeScan::Unverified;
             }
             self.reconcile_demand();
-            self.scroll_to_cursor = true;
+            self.cursor_scroll = FolderPaneCursorScroll::Requested;
         } else if let Some(parent) = cursor
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -750,7 +759,7 @@ impl FolderPaneState {
             self.ensure_node(cursor.clone());
             self.request_recheck(&cursor);
             self.reconcile_demand();
-            self.scroll_to_cursor = true;
+            self.cursor_scroll = FolderPaneCursorScroll::Requested;
         } else if let Some(child) = self
             .nodes
             .get(&key)
@@ -848,7 +857,7 @@ impl FolderPaneState {
         } else {
             self.selected_drive.clone()
         };
-        self.scroll_to_cursor = true;
+        self.cursor_scroll = FolderPaneCursorScroll::Requested;
     }
 }
 
@@ -1122,6 +1131,43 @@ mod refresh_tests;
 
 #[cfg(test)]
 impl FolderPaneState {
+    /// Keep host drive contents/permissions out of App tests, while scanning the
+    /// disposable subtree with the production filesystem scanner and worker.
+    pub(crate) fn test_scan_subtree(&mut self, root: PathBuf) {
+        self.scan_backend = Some(Arc::new(move |path, options, cancel| {
+            if path != root && path_is_same_or_descendant(&root, path) {
+                let child = root
+                    .ancestors()
+                    .find(|ancestor| ancestor.parent() == Some(path))
+                    .unwrap();
+                let children = vec![child.to_path_buf()];
+                Ok(CachedListing {
+                    membership: children.iter().map(|child| key_for(child)).collect(),
+                    children,
+                    options,
+                })
+            } else {
+                scan_complete_listing(path, options, Some(cancel)).map_err(|err| err.to_string())
+            }
+        }));
+    }
+
+    pub(crate) fn test_hold_next_scan(&mut self, held: PathBuf) -> mpsc::Sender<()> {
+        let backend = self.scan_backend.take().expect("test subtree backend");
+        let (tx, rx) = mpsc::channel();
+        let gate = std::sync::Mutex::new(Some(rx));
+        self.scan_backend = Some(Arc::new(move |path, options, cancel| {
+            if crate::folder_tree::path_eq(path, &held)
+                && let Some(rx) = gate.lock().unwrap().take()
+            {
+                // Test worker only. Dropping the sender also releases the worker.
+                let _ = rx.recv();
+            }
+            backend(path, options, cancel)
+        }));
+        tx
+    }
+
     pub(crate) fn test_tree(root: &Path, children: Vec<PathBuf>) -> Self {
         let mut state = Self::default();
         state.selected_drive = Some(root.to_path_buf());

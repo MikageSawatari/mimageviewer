@@ -1,7 +1,356 @@
 use super::section375_tests::{fixture, settle};
 use super::*;
-use crate::folder_pane::FolderPaneState;
+use crate::folder_pane::{FolderPaneCursorScroll, FolderPaneState};
 use std::time::SystemTime;
+
+fn tree_frame(app: &mut App, ctx: &egui::Context, frame: &mut u64, toggle: bool) {
+    let events = if toggle {
+        vec![egui::Event::Key {
+            // The current default binding is F (not T).
+            key: egui::Key::F,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]
+    } else {
+        vec![]
+    };
+    tree_event_frame(app, ctx, frame, events);
+}
+
+fn tree_event_frame(app: &mut App, ctx: &egui::Context, frame: &mut u64, events: Vec<egui::Event>) {
+    *frame += 1;
+    ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 360.0),
+            )),
+            time: Some(*frame as f64 / 60.0),
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            app.handle_keyboard(ctx);
+            app.render_folder_pane(ui);
+        },
+    )
+    .drop_without_applying_deltas();
+}
+
+fn settle_tree_scans(app: &mut App, ctx: &egui::Context, frame: &mut u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        tree_frame(app, ctx, frame, false);
+        if !app.folder_pane.has_pending() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tree scans did not finish"
+        );
+        std::thread::yield_now();
+    }
+}
+
+fn tree_scrolls(ctx: &egui::Context) -> usize {
+    ctx.data(|data| data.get_temp(egui::Id::unique("folder_pane_test_cursor_scrolls")))
+        .unwrap_or_default()
+}
+
+fn assert_tree_location(app: &mut App, ctx: &egui::Context, frame: &mut u64, active: &Path) {
+    settle_tree_scans(app, ctx, frame);
+    let settled_scrolls = tree_scrolls(ctx);
+    // Allow egui's scroll animation to finish, without changing the requested scroll.
+    for _ in 0..90 {
+        tree_frame(app, ctx, frame, false);
+    }
+    assert_eq!(
+        tree_scrolls(ctx),
+        settled_scrolls,
+        "idle frames must not force cursor scrolling"
+    );
+    assert_eq!(app.folder_pane.cursor_scroll, FolderPaneCursorScroll::Idle);
+    let rows = app.folder_pane.visible_rows();
+    let row = rows
+        .iter()
+        .find(|row| row.path == active)
+        .expect("(a) current location row");
+    assert!(row.is_active, "(c) active location highlight");
+    assert!(row.is_cursor, "(c) current location cursor");
+    let rect = ctx
+        .data(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::unique(("folder_pane_test_row_rect", active)))
+        })
+        .unwrap();
+    let viewport = ctx
+        .data(|data| data.get_temp::<egui::Rect>(egui::Id::unique("folder_pane_test_viewport")))
+        .unwrap();
+    assert!(
+        rect.top() >= viewport.top() && rect.bottom() <= viewport.bottom(),
+        "(b) current location must fit in viewport: row={rect:?}, viewport={viewport:?}"
+    );
+}
+
+fn tree_open_scenario(route: &str) {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    // Real subtree scans, many preceding siblings, and multiple ancestors.
+    // Ancestors above the fixture use synthetic listings, so the host drive's
+    // protected/hidden directories cannot change the test result.
+    let root = app.tmp.path().join("tree-open");
+    let branch = root.join("z-branch");
+    let active = branch.join("z-current");
+    std::fs::create_dir_all(&active).unwrap();
+    for parent in [&root, &branch] {
+        for index in 0..80 {
+            std::fs::create_dir(parent.join(format!("a-{index:03}"))).unwrap();
+        }
+    }
+    app.folder_pane.test_scan_subtree(root.clone());
+    app.current_folder = Some(active.clone());
+    app.items_are_drive_list = false;
+    app.settings.folder_tree_pane_visible = false;
+    let mut frame = 0;
+    if route == "startup_visible" {
+        // App construction has no separate pane-visible startup path: the
+        // loaded setting is read at the first chrome draw. Start visible there.
+        app.settings.folder_tree_pane_visible = true;
+    } else {
+        tree_frame(&mut app, &ctx, &mut frame, false);
+        assert!(
+            app.folder_pane.active_path().is_none(),
+            "hidden pane stays unsynchronized"
+        );
+        if route == "key" {
+            tree_frame(&mut app, &ctx, &mut frame, true);
+        } else {
+            app.set_folder_tree_pane_visible(true);
+        }
+    }
+    assert!(
+        app.settings.folder_tree_pane_visible,
+        "real opening entry ran"
+    );
+    assert_tree_location(&mut app, &ctx, &mut frame, &active);
+    if route == "click_supersedes_request" {
+        ctx.options_mut(|options| options.max_passes = std::num::NonZeroUsize::new(1).unwrap());
+        let clicked = branch.join("a-078");
+        ctx.enable_accesskit();
+        tree_frame(&mut app, &ctx, &mut frame, false);
+        let id = ctx
+            .data(|data| {
+                data.get_temp::<egui::Id>(egui::Id::unique((
+                    "folder_pane_test_label_id",
+                    clicked.as_path(),
+                )))
+            })
+            .unwrap();
+        // Activate the actual row response. This isolates request ownership
+        // from pointer hit testing and the native content-drag recognizer.
+        app.folder_pane.set_cursor(root.clone());
+        tree_event_frame(
+            &mut app,
+            &ctx,
+            &mut frame,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target_tree: egui::accesskit::TreeId::ROOT,
+                    target_node: id.accesskit_id(),
+                    data: None,
+                },
+            )],
+        );
+        assert!(
+            app.folder_pane
+                .visible_rows()
+                .iter()
+                .any(|row| row.path == clicked && row.is_cursor)
+        );
+        assert_eq!(
+            app.folder_pane.cursor_scroll,
+            FolderPaneCursorScroll::Requested,
+            "the old root reveal must leave the new click request with the owner"
+        );
+        for _ in 0..3 {
+            tree_frame(&mut app, &ctx, &mut frame, false);
+        }
+        assert!(
+            app.folder_pane
+                .visible_rows()
+                .iter()
+                .any(|row| row.path == clicked && row.is_cursor)
+        );
+        let rect = ctx
+            .data(|data| {
+                data.get_temp::<egui::Rect>(egui::Id::unique((
+                    "folder_pane_test_row_rect",
+                    clicked.as_path(),
+                )))
+            })
+            .unwrap();
+        let viewport = ctx
+            .data(|data| data.get_temp::<egui::Rect>(egui::Id::unique("folder_pane_test_viewport")))
+            .unwrap();
+        assert!(
+            rect.top() >= viewport.top() && rect.bottom() <= viewport.bottom(),
+            "new row click must supersede the old root reveal: {rect:?} / {viewport:?}"
+        );
+    }
+    if route.starts_with("reopen_changed_during_scroll") {
+        app.folder_pane.set_cursor(root.clone());
+        for _ in 0..90 {
+            tree_frame(&mut app, &ctx, &mut frame, false);
+        }
+        app.set_folder_tree_pane_visible(false);
+        let changed_parent = if route.ends_with("branch") {
+            &branch
+        } else {
+            &root
+        };
+        for index in 0..160 {
+            std::fs::create_dir(changed_parent.join(format!("b-{index:03}"))).unwrap();
+        }
+        let release = app.folder_pane.test_hold_next_scan(changed_parent.clone());
+        app.set_folder_tree_pane_visible(true);
+        // Begin the real cursor scroll against the retained cache, then permit
+        // the real refresh to insert preceding siblings during that scroll.
+        tree_frame(&mut app, &ctx, &mut frame, false);
+        assert!(app.folder_pane.has_pending());
+        assert_eq!(
+            app.folder_pane.cursor_scroll,
+            FolderPaneCursorScroll::FollowingRefresh
+        );
+        let first_scrolls = tree_scrolls(&ctx);
+        for _ in 0..4 {
+            tree_frame(&mut app, &ctx, &mut frame, false);
+        }
+        assert_eq!(
+            tree_scrolls(&ctx),
+            first_scrolls,
+            "unchanged pending layout must not force scrolling"
+        );
+        if route.contains("wheel") {
+            let disabled = route.ends_with("wheel_disabled");
+            let inside = !route.ends_with("wheel_outside");
+            let pos = if inside {
+                egui::pos2(100.0, 200.0)
+            } else {
+                egui::pos2(700.0, 200.0)
+            };
+            app.show_preferences = disabled;
+            tree_event_frame(
+                &mut app,
+                &ctx,
+                &mut frame,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, 100.0),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
+                    },
+                ],
+            );
+            assert_eq!(
+                app.folder_pane.cursor_scroll,
+                if inside && !disabled {
+                    FolderPaneCursorScroll::Idle
+                } else {
+                    FolderPaneCursorScroll::FollowingRefresh
+                }
+            );
+            if disabled {
+                // Keep the modal gate in place while the scan finishes and the
+                // unconsumed disabled wheel tail decays. This fixture does not
+                // draw the dialog which would normally consume that wheel.
+                release.send(()).unwrap();
+                assert_tree_location(&mut app, &ctx, &mut frame, &active);
+                app.show_preferences = false;
+                assert_tree_location(&mut app, &ctx, &mut frame, &active);
+                return;
+            }
+            if inside && !disabled {
+                let manual_scrolls = tree_scrolls(&ctx);
+                release.send(()).unwrap();
+                settle_tree_scans(&mut app, &ctx, &mut frame);
+                assert_eq!(
+                    tree_scrolls(&ctx),
+                    manual_scrolls,
+                    "manual tree scroll owns the viewport after refresh"
+                );
+                return;
+            }
+        }
+        release.send(()).unwrap();
+        assert_tree_location(&mut app, &ctx, &mut frame, &active);
+    }
+    if matches!(route, "reopen_moved" | "reopen_same") {
+        app.set_folder_tree_pane_visible(false);
+        tree_frame(&mut app, &ctx, &mut frame, false);
+        let next = if route == "reopen_moved" {
+            let next = root.join("z-other").join("z-current");
+            std::fs::create_dir_all(&next).unwrap();
+            app.current_folder = Some(next.clone());
+            tree_frame(&mut app, &ctx, &mut frame, false);
+            next
+        } else {
+            active
+        };
+        app.set_folder_tree_pane_visible(true);
+        assert_tree_location(&mut app, &ctx, &mut frame, &next);
+    }
+}
+
+#[test]
+fn folder_pane_open_hidden_reveals_current_location() {
+    tree_open_scenario("menu");
+}
+#[test]
+fn folder_pane_open_key_reveals_current_location() {
+    tree_open_scenario("key");
+}
+#[test]
+fn folder_pane_open_startup_visible_reveals_current_location() {
+    tree_open_scenario("startup_visible");
+}
+#[test]
+fn folder_pane_open_reopen_after_hidden_navigation_reveals_current_location() {
+    tree_open_scenario("reopen_moved");
+}
+#[test]
+fn folder_pane_open_reopen_unchanged_reveals_current_location() {
+    tree_open_scenario("reopen_same");
+}
+#[test]
+fn folder_pane_open_reopen_refresh_during_scroll_reveals_current_location() {
+    tree_open_scenario("reopen_changed_during_scroll");
+}
+#[test]
+fn folder_pane_open_reopen_parent_refresh_during_scroll_reveals_current_location() {
+    tree_open_scenario("reopen_changed_during_scroll_branch");
+}
+#[test]
+fn folder_pane_open_tree_wheel_cancels_refresh_following() {
+    tree_open_scenario("reopen_changed_during_scroll_wheel_inside");
+}
+#[test]
+fn folder_pane_open_grid_wheel_preserves_refresh_following() {
+    tree_open_scenario("reopen_changed_during_scroll_wheel_outside");
+}
+#[test]
+fn folder_pane_open_disabled_tree_wheel_preserves_refresh_following() {
+    tree_open_scenario("reopen_changed_during_scroll_wheel_disabled");
+}
+#[test]
+fn folder_pane_open_new_row_click_supersedes_captured_request() {
+    tree_open_scenario("click_supersedes_request");
+}
 
 #[test]
 fn folder_pane_reported_delete_is_reflected_after_main_list_acceptance_without_tree_input() {

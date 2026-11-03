@@ -134,7 +134,7 @@ fn refresh_failure_disconnect_and_option_changes_keep_cache_and_do_not_retry_per
             state.poll_pending();
         }
         assert!(!state.has_pending());
-        assert!(!state.scroll_to_cursor);
+        assert_eq!(state.cursor_scroll, FolderPaneCursorScroll::Idle);
     }
     let root = p(r"C:\");
     let mut state = synthetic_tree(&root, vec![root.join("old")]);
@@ -164,7 +164,7 @@ fn sort_hidden_refresh_preserves_manual_expansion_cursor_and_cached_rows_until_s
     state.active_path = Some(active.clone());
     state.active_key = Some(key_for(&active));
     state.cursor_path = Some(manual.clone());
-    state.scroll_to_cursor = false;
+    state.cursor_scroll = FolderPaneCursorScroll::Idle;
     state.scan_backend = Some(Arc::new(|_, _, _| Err("not yet verified".into())));
     let mut options = state.listing_options;
     options.sort_order = FolderTreeSortOrder::DateDesc;
@@ -173,11 +173,11 @@ fn sort_hidden_refresh_preserves_manual_expansion_cursor_and_cached_rows_until_s
     assert_eq!(state.test_children(&manual), vec![manual.join("old")]);
     assert!(state.user_expanded.contains(&key_for(&manual)));
     assert_eq!(state.cursor_path, Some(manual.clone()));
-    assert!(!state.scroll_to_cursor);
+    assert_eq!(state.cursor_scroll, FolderPaneCursorScroll::Idle);
     state.test_settle();
     assert_eq!(state.test_children(&manual), vec![manual.join("old")]);
     assert_eq!(state.cursor_path, Some(manual));
-    assert!(!state.scroll_to_cursor);
+    assert_eq!(state.cursor_scroll, FolderPaneCursorScroll::Idle);
 }
 
 #[test]
@@ -455,7 +455,7 @@ fn keyboard_navigation_and_manual_reset_contract_are_preserved() {
     assert!(state.user_expanded.is_empty());
     assert!(state.user_collapsed.is_empty());
     assert_eq!(state.cursor_path, Some(a));
-    assert!(state.scroll_to_cursor);
+    assert_eq!(state.cursor_scroll, FolderPaneCursorScroll::Requested);
 }
 
 #[test]
