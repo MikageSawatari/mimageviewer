@@ -16,8 +16,8 @@
 //! - FS walker + FS/SQLite comparison の計算のみ
 //! - メタ抽出・Tantivy commit は **このモジュールの責務外**
 //!   (Ingest Worker = §16 step 9 に切り出す)
-//! - ZIP はアイテム索引 (Ctrl+G) の対象外なので候補に含めない
-//!   (docs/search-container-item-redesign.md §3.2)。ZIP のコンテナ検索は Ctrl+S 専属。
+//! - 書庫・フォルダは成功した説明文のある本だけ候補に含める (U17)。
+//!   説明文がない本とZIP内部は従来どおり対象外 (§3.2 案B1)。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -86,6 +86,93 @@ pub enum CandidateKind {
     Video,
     /// 音声 (ファイル名のみ。ID3 等の埋め込みタグは対象外)
     Audio,
+    /// U17: a physical archive/folder with a successful saved caption.
+    Book(BookIndexKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BookIndexKind {
+    Archive,
+    Folder,
+}
+
+impl CandidateKind {
+    pub(crate) fn index_kind(self) -> crate::fts_index::IndexKind {
+        use crate::fts_index::IndexKind;
+        match self {
+            Self::Image => IndexKind::Image,
+            Self::Pdf => IndexKind::Pdf,
+            Self::Video => IndexKind::Video,
+            Self::Audio => IndexKind::Audio,
+            Self::Book(BookIndexKind::Archive) => IndexKind::Zip,
+            Self::Book(BookIndexKind::Folder) => IndexKind::Folder,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BookCandidateDecision {
+    Include(BookIndexKind),
+    Exclude,
+}
+
+/// Worker-only eligibility boundary shared by Full, caption reflection and watcher.
+/// Directory identity takes precedence over its extension. Saved captions remain
+/// searchable when stale; only status, not the cover signature, controls admission.
+pub fn caption_book_candidate(
+    path: &Path,
+    db: &crate::ai_caption_db::CaptionDb,
+) -> rusqlite::Result<BookCandidateDecision> {
+    let Some(metadata) = std::fs::metadata(path).ok() else {
+        return Ok(BookCandidateDecision::Exclude);
+    };
+    let kind = if metadata.is_dir() {
+        BookIndexKind::Folder
+    } else if metadata.is_file()
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                crate::archive_converter::ArchiveFormat::nested_from_extension(ext).is_some()
+            })
+    {
+        BookIndexKind::Archive
+    } else {
+        return Ok(BookCandidateDecision::Exclude);
+    };
+    Ok(
+        if db
+            .get(&normalize_path(path))?
+            .is_some_and(|row| row.status == crate::ai_caption_db::CaptionStatus::Ok)
+        {
+            BookCandidateDecision::Include(kind)
+        } else {
+            BookCandidateDecision::Exclude
+        },
+    )
+}
+
+pub(crate) fn book_candidate_file(path: &Path, kind: BookIndexKind) -> Option<CandidateFile> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |time| time.as_secs() as i64);
+    let file_size = if kind == BookIndexKind::Folder {
+        0
+    } else {
+        metadata.len() as i64
+    };
+    Some(CandidateFile {
+        abs_path: path.to_path_buf(),
+        key: normalize_path(path),
+        kind: CandidateKind::Book(kind),
+        mtime,
+        file_size,
+        diff_mtime: mtime,
+        diff_size: file_size,
+    })
 }
 
 /// FS/SQLite comparison 結果。
@@ -294,6 +381,26 @@ pub fn scan(
     scan_with_io(params, db, io_sem, priority, activity_gate, &FsWalkerIo)
 }
 
+/// Production Full uses the session's published read-only caption connection.
+pub fn scan_with_captions(
+    params: ScanParams,
+    db: &FtsMetaDb,
+    io_sem: &GlobalIoSemaphore,
+    priority: IoPriority,
+    activity_gate: Option<&crate::activity_gate::ActivityGate>,
+    captions: Option<&crate::ai_caption_db::CaptionDb>,
+) -> Result<ScanResult, ScanError> {
+    scan_with_io_and_captions(
+        params,
+        db,
+        io_sem,
+        priority,
+        activity_gate,
+        &FsWalkerIo,
+        captions,
+    )
+}
+
 fn scan_with_io(
     params: ScanParams,
     db: &FtsMetaDb,
@@ -301,6 +408,18 @@ fn scan_with_io(
     priority: IoPriority,
     activity_gate: Option<&crate::activity_gate::ActivityGate>,
     io: &impl WalkerIo,
+) -> Result<ScanResult, ScanError> {
+    scan_with_io_and_captions(params, db, io_sem, priority, activity_gate, io, None)
+}
+
+fn scan_with_io_and_captions(
+    params: ScanParams,
+    db: &FtsMetaDb,
+    io_sem: &GlobalIoSemaphore,
+    priority: IoPriority,
+    activity_gate: Option<&crate::activity_gate::ActivityGate>,
+    io: &impl WalkerIo,
+    captions: Option<&crate::ai_caption_db::CaptionDb>,
 ) -> Result<ScanResult, ScanError> {
     let ScanParams {
         favorite_id,
@@ -341,6 +460,29 @@ fn scan_with_io(
             .map(|p| crate::metadata_ownership::root_key(p))
             .collect(),
     };
+    if let Some(captions) = captions {
+        let keys = captions
+            .ok_keys_in_ranges(&scope.sql_ranges())
+            .map_err(ScanError::Metadata)?;
+        for key in keys {
+            if crate::activity_gate::wait_and_check_cancel(activity_gate, &cancel) {
+                return Err(ScanError::Cancelled);
+            }
+            let Some(_permit) = io_sem.acquire_cancellable(priority, &cancel) else {
+                return Err(ScanError::Cancelled);
+            };
+            let path = Path::new(&key);
+            if folder_tree::is_apple_double(path) {
+                continue;
+            }
+            if let BookCandidateDecision::Include(kind) =
+                caption_book_candidate(path, captions).map_err(ScanError::Metadata)?
+                && let Some(candidate) = book_candidate_file(path, kind)
+            {
+                fs_map.insert(key, candidate);
+            }
+        }
+    }
     let db_entries = db.list_range_files(&scope).map_err(ScanError::Metadata)?;
     crate::perf::event(
         "indexer",
@@ -376,6 +518,7 @@ fn scan_with_io(
                 // 差分判定は **差分用** 署名 (画像 + サイドカーを織り込んだ値) で行う。
                 // fts_meta には ingest_worker が diff_mtime/diff_size を保存している。
                 if row.status == 0
+                    && row.kind == cand.kind.index_kind()
                     && row.favorite_id == favorite_id.to_string()
                     && crate::metadata_ownership::root_key(Path::new(&row.favorite_root))
                         == scope.root

@@ -1682,6 +1682,7 @@ impl App {
         if self.global_search.active {
             had_active = true;
             self.global_search.active = false;
+            self.global_search.clear_projection_branches();
             self.global_search.last_change_at = None;
             self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Metadata);
             self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Everything);

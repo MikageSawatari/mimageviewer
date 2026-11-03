@@ -19,13 +19,13 @@ Everythingは別の名前索引から同じSearch surfaceへ結果を供給す�
 | --- | --- | --- | --- | --- |
 | **Ctrl+S** | コンテナ検索 | フォルダ / ZIP / PDF を名前で横断検索 | お気に入り配下 (再帰) | コンテナ索引 `search_index.db` (SQLite LIKE) |
 | **Ctrl+F** | 現在地フィルタ | 現グリッドの表示中アイテムを名前 / メタ情報で絞り込み | 現在グリッド (非再帰・索引なし) | worker 上の on-demand 判定 |
-| **Ctrl+G** | アイテム検索 | 画像 / PDF / 動画 / 音声を名前 / EXIF / AI プロンプト等で横断検索 | お気に入り配下 (再帰) | アイテム索引 (Tantivy bigram) 候補絞り込み + STORED 原文 post-filter の streaming |
+| **Ctrl+G** | アイテム検索 | 画像 / PDF / EPUB / 動画 / 音声と、説明文がある書庫・フォルダの本を名前 / メタ情報で横断検索 | お気に入り配下 (再帰) | アイテム索引 (Tantivy bigram) 候補絞り込み + STORED 原文 post-filter の streaming |
 | **Ctrl+R** | Everything ファイル名検索 | Everything の構文で実フォルダと対応する実ファイルを探す | Everything の索引範囲（お気に入り外も含む） | worker-only の直接 QUERY2 IPC → 完成dataset → 共通Search prepare/adopt |
 
 - **動画はコンテナ索引 (Ctrl+S) の対象外** — 動画はアイテムなので Ctrl+G で扱う。
 - **音声はコンテナ索引 (Ctrl+S) の対象外** — 音声はアイテムなので Ctrl+G でファイル名を扱う。
-- **ZIP はアイテム索引 (Ctrl+G) の対象外** — ZIP はコンテナなので Ctrl+S で扱う。
-  ZIP 内画像のメタ検索はどのモードでも行わない (§4.6)。
+- **ZIP は原則として Ctrl+S で扱う**。保存済みの AI 説明文がある書庫・フォルダの本は
+  Ctrl+G のアイテム索引にも載せる (U17、§4.6)。ZIP 内画像のメタ検索はどのモードでも行わない。
 - **製本ルート (`Settings.book_root` / 既定 `Pictures\mimageviewer\books`) は
   Ctrl+S/Ctrl+G の自動索引対象外** — 本ページはコピー済みスナップショットで、並べ替え時に
   大量リネームが発生するため二重索引と watcher チャーンを避ける。初期スキャンでは既存の
@@ -288,7 +288,8 @@ IngestSession の writer は IndexerManager が保有する dispatcher 経由で
 Tantivy writer には触れない。
 ```
 
-AI 説明文は画像・PDF・EPUB の ingest 時に `CaptionDb::open_read_only` の接続から読む。
+AI 説明文は画像・PDF・EPUB と、説明文がある書庫・フォルダの本の ingest 時に
+`CaptionDb::open_read_only` の接続から読む。
 `status = ok` の説明文・画像内の文字・検索語だけを `ai_caption_text` に入れる。
 接続が無かった場合は次の反映・走査開始時に開き直す。動画・音声には説明文を付けない。
 反映待ちを読むのは公開済みのreadonly接続を確保できた回だけとする。未公開・open失敗の回は
@@ -301,7 +302,7 @@ DB読取失敗時は説明文なしで文書作成を続けるが、反映済み
 通常watch/scanが空欄へ置き換えた場合も修復できるよう、既存reporterで次起動の再構築を予約する。
 DB未作成では予約せず、次の走査・反映の開始で接続を試みる。
 反映待ちの正本は `ai_caption.db` の trigger が付ける印であり、命令 channel やメモリ上の queue に依存しない。
-本の文書を新たに載せる V2b は未実装で、現段階の Ctrl+G 対象は従来の画像・PDF・EPUB・動画・音声のまま。
+説明文がある書庫・フォルダの本も同じ反映経路を使い、追加・削除の候補判定を走査・watcherと共有する (§4.6)。
 
 アイテム索引の Full は `ScanResult::completeness` で FS の観測結果を
 `ObservationCompleteness::Complete / Incomplete` に分ける。read_dir 失敗、iterator の
@@ -590,13 +591,27 @@ SMB / NAS では `ReadDirectoryChangesW` が発火しないケースがあるの
 
 ### 4.6 ZIP 対応のスコープ
 
-**ZIP はコンテナであり、アイテム索引 (Ctrl+G) の対象外。** ZIP ファイル名での
-横断検索はコンテナ索引 (Ctrl+S) が担う。
+**ZIP は原則としてコンテナ索引 (Ctrl+S) で名前を探す。** 案 B1 への例外として、
+保存済みの AI 説明文がある書庫・フォルダの本は、Ctrl+G にも本として載せる
+(U17、[説明文計画 §21.15.3](local-vlm-caption-plan.md#21153-v2b-説明文のある本を索引と結果に出す))。
 
-- ZIP ファイル自体: アイテム索引には登録しない。`search_walker` は ZIP を
-  `fs_map` に入れない (`CandidateKind::Zip` を作らない) ので、過去バージョンが
-  登録した ZIP doc は FS ↔ SQLite 差分で「FS になし + DB あり」と判定され `to_delete`
-  に落ちて Tantivy から消える (docs/search-container-item-redesign.md §3.2 / task#1)。
+V2bの検証記録と未確認事項は説明文計画 §21.17 に集約する。ZIP内画像の対象範囲は従来どおり。
+
+- ZIP/CBZ・RAR/CBR・7z/CB7・LZH/LHA とフォルダの本: `ai_caption.db` に
+  `status = ok` の行がある場合だけ `Book` 候補を作る。走査・反映・watcherは共通の判定を使う。
+  全件走査は `OwnedRange` 内の `ok` キーを一度に読み、workerでディレクトリを先に判定する。
+  文書は名前と説明文・画像内の文字・検索語を持ち、種類は書庫が `Zip`、フォルダが `Folder`。
+  説明文がない・失敗行だけの場合は載せず、既存の文書と `fts_meta` 行も消す。
+  古い署名の `ok` 行は検索に残し、PDF/EPUBは説明文の有無によらず載せる。
+- `GlobalHit` はSTOREDの種類を保持する。Flat/Drillでは本として項目化し、直接のフォルダ本は
+  実フォルダを開く。Drillで検索の枝と同じパスなら枝を優先する。Aggregatedでは本を親フォルダの
+  件数に含め、代表画像には新しい書庫・フォルダの結果を使わない (既存PDF/EPUB代表は維持)。
+- 種類「書庫・フォルダの本」は `Zip` と `Folder` に絞る。「対応アーカイブを無視する」は
+  検索開始時の `SearchScope` に捕捉し、RAR/7z/LZHを件数上限より前に除く。ZIP/CBZとフォルダは残す。
+  表示種類・EPUB無視も保存済みの種類で判定するので、拡張子に見える名前のフォルダを除かない。
+- MCP `search_items` も保存済みの種類から Archive / Folder を返す。検索対象から `AiCaption` を
+  候補検索・後置照合とも除く既存境界は維持するため、本は名前で一致した場合に返す。
+  非検索の `get_item_info` とライブラリ行も RAR/7z/LZH を Archive に分類する。
 - ZIP 内画像: **どのモードでもメタ検索しない**。アイテム索引は ingest せず、
   Ctrl+F も ZIP 表示中はファイル名フィルタのみ (§5.2、同 §4.1.2)。ZIP は seek
   不可でエントリごとの伸張コストが高く、生成画像を ZIP 保管する需要も低いため。

@@ -361,6 +361,30 @@ impl CaptionDb {
             .optional()
     }
 
+    /// Enumerate successful rows for a Full in one query, including root itself
+    /// and excluding child ownership. Keys use OwnedRange's BINARY intervals.
+    pub fn ok_keys_in_ranges(
+        &self,
+        ranges: &[crate::metadata_ownership::PathRange],
+    ) -> rusqlite::Result<Vec<String>> {
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let clauses = ranges
+            .iter()
+            .map(|_| "(item_key >= ? COLLATE BINARY AND item_key < ? COLLATE BINARY)")
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "SELECT item_key FROM captions WHERE status = 'ok' AND ({clauses}) ORDER BY item_key"
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let bounds = ranges.iter().flat_map(|range| [&range.start, &range.end]);
+        statement
+            .query_map(rusqlite::params_from_iter(bounds), |row| row.get(0))?
+            .collect()
+    }
+
     /// Read pending changes only inside the caller's existing metadata ownership.
     /// Each interval is half-open and uses the same BINARY keys as OwnedRange.
     pub fn pending_in_ranges(

@@ -59,6 +59,33 @@ fn seed_tags(path: &Path, tag: &str) {
 }
 
 #[test]
+fn physical_archives_and_extension_like_folders_have_consistent_kinds() {
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    for extension in ["zip", "cbz", "rar", "cbr", "7z", "cb7", "lzh", "lha"] {
+        let path = directory.path().join(format!("book.{extension}"));
+        std::fs::write(&path, b"identity-only fixture").unwrap();
+        let output = read(
+            &item(&path, None),
+            permission(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(output.kind, ItemKind::Archive, "{extension}");
+    }
+    for name in ["book-folder", "book-folder.zip", "book-folder.epub"] {
+        let path = directory.path().join(name);
+        std::fs::create_dir(&path).unwrap();
+        let output = read(
+            &item(&path, None),
+            permission(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(output.kind, ItemKind::Folder, "{name}");
+    }
+}
+
+#[test]
 fn png_projection_bounds_prompt_and_preserves_file_tags_and_rating() {
     let directory = crate::settings_db::DataDirOverrideGuard::new();
     let path = directory.path().join("long.png");

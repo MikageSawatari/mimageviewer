@@ -56,6 +56,7 @@ pub struct RangeFileStamp {
     pub mtime: i64,
     pub file_size: i64,
     pub status: i64,
+    pub kind: IndexKind,
 }
 
 #[cfg(test)]
@@ -833,7 +834,7 @@ impl FtsMetaDb {
         scope: &crate::metadata_ownership::OwnedRange,
     ) -> rusqlite::Result<Vec<RangeFileStamp>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT path, favorite_id, favorite_root, mtime, file_size, status FROM files WHERE path >= ?1 AND path < ?2")?;
+        let mut stmt = conn.prepare("SELECT path, favorite_id, favorite_root, mtime, file_size, status, kind FROM files WHERE path >= ?1 AND path < ?2")?;
         let mut out = Vec::new();
         for range in scope.sql_ranges() {
             let rows = stmt.query_map(params![range.start, range.end], |r| {
@@ -844,6 +845,7 @@ impl FtsMetaDb {
                     mtime: r.get(3)?,
                     file_size: r.get(4)?,
                     status: r.get(5)?,
+                    kind: IndexKind::from_i64(r.get(6)?),
                 })
             })?;
             for row in rows {

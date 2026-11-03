@@ -1356,7 +1356,7 @@ detachedの述語・viewport・context別cacheを変更せず、Remoteのパネ�
 境界と簡素化の判断は [画像の設計 §21.11.2](local-vlm-caption-plan.md#21112-v1-4a-画像の説明文の表示) と
 [本の設計 §21.13](local-vlm-caption-plan.md#2113-v1-4b-の設計-2026-11-03) を参照。
 
-### 3.2.5 AI 説明文の索引への反映（V2a、未リリース）
+### 3.2.5 AI 説明文の索引への反映（V2a・V2b、未リリース）
 
 反映待ちの正本は `ai_caption.db` の `captions.indexed = 0` と `caption_removed`。
 `IndexerManager` が1つの `Arc<AtomicU64>`（`caption_epoch`）を所有し、再構成workerから
@@ -1383,6 +1383,13 @@ ACKせず終了し、書き手のcommit後の世代更新を既存の次の起�
 あればACKしない。通常watch/scanが反映済みの説明文を空欄へ置き換えた場合も修復できるよう、
 DB読取失敗は既存writer reporterのログ・通知・次起動再構築予約へ渡す。正常なDB未作成は区別し、
 予約しない。既存の索引書込失敗も同じreporterの通知・再構築予約を維持する。
+
+説明文がある書庫・フォルダの本も同じ候補作成・ingest/delete経路へ通す。
+全件走査では `OwnedRange` 内の `ok` 行をまとめて取得し、workerでパスの実在と種類を判定する。
+走査・反映・watcherは同じ本の候補判定を使い、説明文の削除後は文書とmetadata行を消す。
+フォルダ名が `.json` / `.txt` で終わる場合も、watcherのサイドカー処理だけで終了させない。
+結果にはSTOREDの種類を渡し、UIでフォルダ判定のstatを追加しない。新しいworker・通知queue・
+説明文由来の本を識別する保持フラグは持たない。
 
 Ctrl+Fは索引を使わず、検索workerがreadonly接続を1回開き、表示中の画像と本の `ok` 行を
 読み込んでから既存の2 passで照合する。実装範囲と送り手の監査は

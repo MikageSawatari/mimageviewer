@@ -416,6 +416,133 @@ fn search_items_excludes_ai_captions_from_query_and_postfilter() {
     }
 }
 
+fn seed_book_search_index(f: &Fixture) {
+    use crate::fts_index::{Container, IndexDoc, IndexKind, upsert_doc};
+    f.seed_index();
+    let favorite_id = f.handlers.readers.favorites().unwrap()[0].id;
+    let fts = f.handlers.readers.fts.read().unwrap().clone().unwrap();
+    let mut writer = fts.writer().unwrap();
+    for (name, kind) in [
+        ("book.zip", IndexKind::Zip),
+        ("book.cbz", IndexKind::Zip),
+        ("book.rar", IndexKind::Zip),
+        ("book.7z", IndexKind::Zip),
+        ("book.lzh", IndexKind::Zip),
+        ("book-folder", IndexKind::Folder),
+        ("book-folder.zip", IndexKind::Folder),
+        ("book-folder.epub", IndexKind::Folder),
+    ] {
+        // No real directory exists at these paths: the stored kind owns result
+        // classification, including folders whose names look like file types.
+        let doc = IndexDoc {
+            path: format!("C:/fixture/{name}"),
+            container: Container::Fs,
+            zip_entry: String::new(),
+            favorite_id,
+            kind,
+            mtime: 0,
+            file_size: 0,
+            norms: crate::ingest_text::PerSourceText {
+                name: name.into(),
+                ai_caption: "captionsecret".into(),
+                ..Default::default()
+            },
+        };
+        upsert_doc(&writer, fts.fields(), &doc).unwrap();
+    }
+    writer.commit().unwrap();
+    fts.reload_reader().unwrap();
+}
+
+#[test]
+fn search_items_classifies_and_filters_captioned_books_by_stored_kind() {
+    let f = Fixture::new();
+    seed_book_search_index(&f);
+    let connection = f.connection();
+    for (id, kind, query, expected) in [
+        (1, Some(ItemKind::Archive), "book", 5),
+        (2, Some(ItemKind::Folder), "book", 3),
+        (3, Some(ItemKind::Image), "book", 0),
+        (4, None, "book", 8),
+        (5, None, "captionsecret", 0),
+        (6, None, "book -captionsecret", 8),
+    ] {
+        let Payload::Items(page) = f
+            .call(
+                &connection,
+                id,
+                Command::SearchItems {
+                    query: query.into(),
+                    kind,
+                    limit: None,
+                    cursor: None,
+                },
+            )
+            .result
+            .unwrap()
+        else {
+            panic!("expected item page")
+        };
+        assert_eq!(page.items.len(), expected, "{query} / {kind:?}");
+        for item in &page.items {
+            let item = row(item);
+            let expected_kind = if item.name.starts_with("book-folder") {
+                ItemKind::Folder
+            } else {
+                ItemKind::Archive
+            };
+            assert_eq!(item.kind, expected_kind, "{}", item.name);
+            assert!(item.subresource.is_none());
+            if let Some(kind) = kind {
+                assert_eq!(item.kind, kind);
+            }
+        }
+    }
+}
+
+#[test]
+fn search_items_captures_ignore_archives_setting_and_keeps_zip_and_folders() {
+    let f = Fixture::new();
+    seed_book_search_index(&f);
+    crate::settings_db::with_db_result(|db| {
+        let mut settings = db.load_into_settings()?;
+        settings.set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+        settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+        db.save_full(&settings)
+    })
+    .unwrap();
+    let connection = f.connection();
+    for (id, kind, expected) in [
+        (1, Some(ItemKind::Archive), 2),
+        (2, Some(ItemKind::Folder), 3),
+        (3, None, 5),
+    ] {
+        let Payload::Items(page) = f
+            .call(
+                &connection,
+                id,
+                Command::SearchItems {
+                    query: "book".into(),
+                    kind,
+                    limit: None,
+                    cursor: None,
+                },
+            )
+            .result
+            .unwrap()
+        else {
+            panic!("expected item page")
+        };
+        assert_eq!(page.items.len(), expected, "{kind:?}");
+        assert!(page.items.iter().all(|item| {
+            let item = row(item);
+            item.kind == ItemKind::Folder
+                || item.path.ends_with(".zip")
+                || item.path.ends_with(".cbz")
+        }));
+    }
+}
+
 /// Cargo exposes CARGO_BIN_EXE only to the package that owns a binary. This
 /// core-library test instead resolves the adapter from Cargo's executable
 /// artifact, so custom target directories/profiles cannot select a stale guess.

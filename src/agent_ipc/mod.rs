@@ -891,6 +891,7 @@ impl Handlers {
                         .collect(),
                 ),
                 ignore_epub: settings.epub_file_handling_ignores_epub(),
+                ignore_archives: settings.archive_file_handling_ignores_convertible(),
                 visibility: settings.file_type_visibility,
                 ..Default::default()
             };
@@ -1055,7 +1056,7 @@ fn collect_search(
                 .min(Duration::from_millis(25)),
         ) {
             Ok(crate::global_search::SearchStreamEvent::Batch { hits, .. }) => {
-                items.extend(hits.into_iter().map(|h| item_from_hit(&h.path)));
+                items.extend(hits.iter().map(item_from_hit));
                 if let Err(error) = prefix(&items) {
                     break Err(error);
                 }
@@ -1095,26 +1096,20 @@ fn index_kind(kind: ItemKind) -> crate::fts_index::IndexKind {
         ItemKind::Folder | ItemKind::Other => K::Folder,
     }
 }
-fn item_from_hit(path: &str) -> Item {
+fn item_from_hit(hit: &crate::global_search::GlobalHit) -> Item {
+    use crate::fts_index::IndexKind as K;
+    let path = hit.path.as_str();
     let (path, member) = path
         .split_once(crate::search_norm::ZIP_ENTRY_SEP)
         .map_or((path, None), |(p, m)| (p, Some(m)));
     let leaf = member.unwrap_or(path);
-    let extension = leaf.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    let kind = if member.is_some() || crate::folder_tree::is_recognized_image_ext(&extension) {
-        ItemKind::Image
-    } else if extension == "pdf" || extension == "epub" {
-        ItemKind::Pdf
-    } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&extension.as_str()) {
-        ItemKind::Video
-    } else if crate::folder_tree::is_audio_ext(&extension) {
-        ItemKind::Audio
-    } else if crate::folder_tree::is_zip_extension(&extension) {
-        ItemKind::Archive
-    } else if Path::new(path).is_dir() {
-        ItemKind::Folder
-    } else {
-        ItemKind::Other
+    let kind = match hit.kind {
+        K::Image => ItemKind::Image,
+        K::Pdf => ItemKind::Pdf,
+        K::Video => ItemKind::Video,
+        K::Audio => ItemKind::Audio,
+        K::Zip => ItemKind::Archive,
+        K::Folder => ItemKind::Folder,
     };
     Item {
         path: path.to_owned(),
@@ -1124,6 +1119,26 @@ fn item_from_hit(path: &str) -> Item {
         tags: if member.is_some() { None } else { Some(vec![]) },
         container_tags: None,
         rating: 0,
+    }
+}
+
+// For projections without an indexed kind, callers resolve directories from
+// their existing metadata/source kind first. This hint performs no filesystem I/O.
+fn item_kind_from_extension(extension: &str) -> ItemKind {
+    if crate::folder_tree::is_recognized_image_ext(extension) {
+        ItemKind::Image
+    } else if extension == "pdf" || extension == "epub" {
+        ItemKind::Pdf
+    } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&extension) {
+        ItemKind::Video
+    } else if crate::folder_tree::is_audio_ext(extension) {
+        ItemKind::Audio
+    } else if crate::folder_tree::is_zip_extension(extension)
+        || crate::archive_converter::ArchiveFormat::from_extension(extension).is_some()
+    {
+        ItemKind::Archive
+    } else {
+        ItemKind::Other
     }
 }
 

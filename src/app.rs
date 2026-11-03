@@ -44221,6 +44221,7 @@ impl App {
         }
         self.persist_pending_view_trim_state();
         self.items = items;
+        self.global_search.clear_projection_branches();
         self.tag_view_applied_times.clear();
         self.projection_recipe = Default::default();
         self.image_metas = image_metas;
@@ -66474,8 +66475,9 @@ impl App {
             );
         }
         if auto_fullscreen && let Some(GridItem::Folder(path)) = self.items.get(idx) {
-            // Ctrl+G drill folders are navigation nodes, not physical book containers.
-            if self.global_search.active && self.global_search.drill.is_some() {
+            // Only projected search branches are navigation nodes; direct folder-book
+            // hits use the ordinary physical-container path, including inside a drill.
+            if self.global_search_folder_is_branch(path) {
                 return DetachedBuild::NotApplicable;
             }
             return DetachedBuild::Built(DetachedGridItemOpenPlan::FolderCandidate {

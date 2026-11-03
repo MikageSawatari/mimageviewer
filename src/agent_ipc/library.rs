@@ -288,21 +288,7 @@ fn library_row(path: String) -> LibraryItem {
         .rsplit_once('.')
         .map(|(_, ext)| ext.to_ascii_lowercase())
         .unwrap_or_default();
-    let kind = if crate::folder_tree::is_recognized_image_ext(&extension) {
-        ItemKind::Image
-    } else if extension == "pdf" || extension == "epub" {
-        ItemKind::Pdf
-    } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&extension.as_str()) {
-        ItemKind::Video
-    } else if crate::folder_tree::is_audio_ext(&extension) {
-        ItemKind::Audio
-    } else if crate::folder_tree::is_zip_extension(&extension)
-        || crate::archive_converter::ArchiveFormat::from_extension(&extension).is_some()
-    {
-        ItemKind::Archive
-    } else {
-        ItemKind::Other
-    };
+    let kind = super::item_kind_from_extension(&extension);
     LibraryItem {
         path,
         subresource: None,

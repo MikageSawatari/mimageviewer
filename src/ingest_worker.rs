@@ -35,8 +35,8 @@
 //! ## v1 スコープ
 //!
 //! - FS 上の画像 / PDF ファイル / 動画ファイルの ingest
-//! - ZIP はアイテム索引 (Ctrl+G) の対象外。walker が候補に含めないので本モジュールにも
-//!   到達しない (docs/search-container-item-redesign.md §3.2)
+//! - 書庫・フォルダは説明文のある本だけ Filename + AiCaption を取り込む (U17)。
+//!   書庫内部は読み込まない (docs/search-container-item-redesign.md §3.2)。
 //! - PDFium document info の取り込みは §16 step 17 (別モジュール)
 
 use std::cell::Cell;
@@ -145,6 +145,10 @@ impl<'a> IngestSession<'a> {
             });
         }
         matches!(self.caption_db, Ok(Some(_)))
+    }
+
+    pub(crate) fn caption_db(&self) -> Option<&CaptionDb> {
+        self.caption_db.as_ref().ok().and_then(Option::as_ref)
     }
 
     /// Override the worker's store location, including for disposable tests.
@@ -346,6 +350,12 @@ impl<'a> IngestSession<'a> {
                 CandidateKind::Pdf => self.build_doc_for_pdf(&cand),
                 CandidateKind::Video => self.build_doc_for_video(&cand),
                 CandidateKind::Audio => self.build_doc_for_audio(&cand),
+                CandidateKind::Book(_) => self.build_doc(
+                    &cand,
+                    Container::Fs,
+                    cand.kind.index_kind(),
+                    crate::ingest_text::build_per_source_for_filename(&cand.abs_path),
+                ),
             };
             drop(_permit);
             match built {
@@ -473,7 +483,10 @@ impl<'a> IngestSession<'a> {
         kind: IndexKind,
         mut norms: crate::ingest_text::PerSourceText,
     ) -> Result<IndexDoc, String> {
-        if matches!(kind, IndexKind::Image | IndexKind::Pdf) {
+        if matches!(
+            kind,
+            IndexKind::Image | IndexKind::Pdf | IndexKind::Zip | IndexKind::Folder
+        ) {
             norms.ai_caption = self.caption_text(&cand.key);
         }
         if crate::perf::is_enabled() {

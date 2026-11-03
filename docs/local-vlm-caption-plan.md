@@ -2387,3 +2387,121 @@ Drill で本の直接の結果と検索の枝を区別し、本は実際のフ�
   公開済みの接続を確保できた回だけ反映待ちを読むようにした (§21.16.5)。3 回目: 閉じ、新しい指摘は無し。
 - 修正後の 2 コミットは `ai_caption_db`・`indexer_supervisor`・`ingest_worker` に閉じ、関連 75 件は実装担当の環境で成功。本体 lib 全件は V2b の後にまとめて流す。
 - 実機での確認は未実施。
+
+### 21.17 V2b 実装記録（2026-11-03、検収・実機確認待ち）
+
+基準 `2262bca58`、`vlm-caption` の未コミット差分。正本は §21.15（独立設計レビュー
+§19.22・§19.23）。本節は実装担当の記録であり、独立コードレビュー・検収の判定ではない。
+
+#### 21.17.1 実装と判断
+
+- `caption_book_candidate` をFull・説明文反映・watcherで共有。実在するディレクトリを拡張子より
+  先に判定し、ZIP/CBZ・ArchiveFormatのRAR/CBR・7z/CB7・LZH/LHAとフォルダの `ok` 行だけを
+  `CandidateKind::Book(BookIndexKind::{Archive, Folder})` とする。署名が古い説明文も対象。
+  PDF/EPUBは説明文の有無によらず従来どおり載せる。
+- Fullはsessionの公開済みreadonly接続からOwnedRange内のokキーを1回の問い合わせで列挙。
+  共通判定で各キーの現在のstatusを再確認し、workerのI/O permitとActivityGateを通して候補に加える。
+  書庫は本体mtime/size、フォルダはmtime/size 0。説明文を消すと差分の削除対象にもなる。
+  同じ署名でも旧kindを保持しないよう、`RangeFileStamp`は既存kind列を読み、差分条件へ含めた。
+  走査指紋に `caption-books-v1` を追加し、INDEX_VERSIONは11のまま。
+- 本の文書はFilenameとAiCaptionだけ。IndexKindは書庫がZip、フォルダがFolder。
+  `fts_meta`も従来どおり作成/削除する。反映の世代・ACK・取消・batch・Tantivy First順序は維持。
+  watcherのjson/txt入口は兄弟画像の再取込を残し、ディレクトリまたは索引上の本なら本自身の更新/削除へ進む。
+- `search_page`からSTORED kindを読み、`GlobalHit.kind`へ渡す。UIでstat/DB読取を追加しない。
+  Flat/DrillはZipをZipFile/ConvertibleArchive、FolderをFolderへ項目化。旧ZIP内部結果のFlat除外は維持。
+  Drillの直接Folder本と子の検索枝が重なる場合は枝を優先する。
+  Aggregatedでは本も親フォルダ群の件数に含め、新しいZip/Folderだけを代表から外す。
+  画像・PDF/EPUB代表と既存動画/音声の扱いは維持。変換書庫もZIP同様の戻り経路を使う。
+- 種類選択Some(Zip)を「書庫・フォルダの本」とし、scopeは[Zip,Folder]へ展開。選択の型は維持。
+  Folderは表示種類を常に通し、EPUB無視はPdfのEPUBだけに適用する。
+  対応アーカイブ無視設定をCtrl+GとMCPのSearchScopeへ捕捉し、ZipのRAR/7z/LZHを件数上限前に除く。
+  ZIP/CBZとフォルダは残す。
+- MCP検索は保存済みkindから分類。非検索のitem_info/libraryの分類も共有してRAR等をArchiveへ揃える。
+  `Archive`/`Folder`絞込みは本の文書に当たる。V2aのAiCaption除外を候補検索・後置照合の双方で維持するため、
+  MCPの本の検索結果は名前で当たった場合だけ。EPUB/RAR等のページ指定範囲は広げない。
+- 新しいworker・通知queue・説明文由来の本を識別する保持フラグ・自動retryは追加しない。
+  まれなDB/索引失敗は既存reporterのログ・通知・次起動再構築を使い、原本を消さない。
+- 仕様書、検索設計/非同期文書、検索マニュアル、製品の機能一覧へU17と種類選択を反映した。
+  プライバシー文書の索引保存対象にも説明文のある書庫/フォルダの本を追加し、製品ページの端末内保存の説明と突き合わせた。
+  説明文のない本、既存のメディア結果、Ctrl+Sのコンテナ索引は変更しない。
+
+#### 21.17.2 枝集合の所有と設計担当の合意
+
+検索の枝集合は `GlobalSearchState` 一つが所有する。workerとfallbackの両方が評価絞り込み後に生成し、
+itemsの採用と同じ境界で置き換える。refresh/Drill退出の意図だけでは表示中の旧集合を消さず、新しい列の
+採用時に切り替える。Everything採用は空集合、物理一覧の `install_new_items_inner` は旧集合を破棄する。
+GlobalSearchStateはviewer context swap対象で、兄弟のinstallはmainの集合に影響しない。
+
+**閉じる・取り消しは検索投影の終了境界**。設計担当ClaudeCodeは追加指示で、当初の「項目と同時に捨てる」を
+「検索として解釈する間は同じ採用境界、終了境界では集合を捨てる」と確定した。
+`dismiss_global_search_with_origin`とsnapshotの`cancel_active_searches`で集合を消す。
+非同期復帰の読み込み中に旧itemsが残っても、active=falseなら共通判定は枝ではないと返し、
+従来どおり物理項目として開ける。旧項目の非表示・操作禁止・新pending・rollbackは加えない。
+終了回帰は、集合破棄と検索無効化に加え、旧Folder行が残り、物理openを受理できることを検査する。
+
+detachedの元の述語は「Drill中なら全Folderが枝」という仮定だったため、着手前に設計担当へ返した。
+ClaudeCodeとCodexは、採用済みの行と同じ所有境界の事実から意味を決める構造修正であり、症状パッチではないと
+明示合意した。detached述語に触れる変更は `detached_grid_item_open_plan` のFolder条件を
+`global_search_folder_is_branch`へ置き換える箇所だけ。viewport/window owner/配置/focus/待機は変えない。
+合意と範囲は `detached-rework-plan.md` §11にも記録。独立コードレビュー時の構造合意確認は設計担当が依頼する。
+
+#### 21.17.3 Folderを開く入口の監査
+
+| 入口 | 判定・維持する動作 |
+| --- | --- |
+| `ui_main`のFolder doubleclick | 共通別窓受付後、共通枝判定に当たる行だけdrill。直接本は既存の物理Folder open |
+| `detached_grid_item_open_plan` | 上記の共通枝判定。直接本は既存FolderCandidate、枝は従来受付へ返す |
+| Enter | 共通別窓受付を通り、その後の`accept_grid_container_open`は従来どおり物理open。pointer-only drill契約を維持 |
+| gamepadの一覧決定 | 共通別窓受付後、従来どおり物理open。新たな枝drill化はしない |
+| 右クリック「ページを開く／一覧を開く」 | `open_grid_container_with_mode`。Folderは元から対象外であり変更しない |
+| F12 | 開いたメディアの`toggle_detached_viewer_mode`による表示先変更。Folder open planには到達せず変更不要 |
+
+`global_search.drill.is_some()`でFolderの意味を決めていたのはdoubleclickと別窓受付の2箇所。
+grepの残存箇所は、ui_mainのアドレス欄可否/ツリー前後移動、appのCtrl+上下/評価tooltip、
+gamepad_inputのツリー/フォルダ前後移動2箇所、grid_parentの親可否、context_menuの検索面判定2箇所、
+page_overviewの親可否、ui_fullscreenのフォルダ前後移動。いずれもFolderを枝/直接本に分類する述語ではなく維持した。
+既存detached回帰の期待は保ち、手製Folder fixtureだけを実際の検索投影にそろえた。既存GlobalHit fixtureも
+PDF/EPUB・動画・音声・書庫/ZIPエントリそれぞれの種類へ追従した。
+
+#### 21.17.4 検証と引き継ぎ
+
+通常feature、offline、基準 `2262bca58`からの未コミット差分で実施。検証中にソースを変えない。
+本体lib全件は依頼どおり設計担当へ残す。終了時の今回の変更はテストとコメント/文書のみのため、
+影響しない519件の検証と通常core checkを再利用し、確定した終了契約の回帰を絞って再実行した。
+先行のコンパイル時の型追従不足2件とパス表記比較のfixture不備1件は修正し、下表は修正後の結果。
+
+終了契約を確定した最終回帰5件と確認用buildは成功。今回の実装範囲に未解決の実装判断はない。
+独立コードレビュー、検収、実機確認は未実施。本体lib全件は設計担当が実施する。
+製品起動・外部通信・評価用フォルダ参照・commitは行っていない。
+
+
+| 対象・command | 結果と証拠 |
+| --- | --- |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/caption_books_share_scan\|caption_book_sidecar\|caption_book_kinds_drive\|search_items_classifies_and_filters_captioned_books\|search_items_captures_ignore_archives\|physical_archives_and_extension_like_folders/)' --no-fail-fast` | 6件成功、失敗0、exit 0。run `bf411bc9-4738-49af-bbd1-95e5be18437f`、`target/v2b-focused-tests-r3.log`、`target/v2b-focused-tests.junit.xml` |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/ai_caption_db::\|search_walker::\|search_watcher::\|indexer_supervisor::\|indexer_manager::\|ingest_worker::\|ingest_text::\|fts_index::\|fts_meta::\|fts_writer_dispatcher::\|global_search::\|global_search_ui::\|agent_ipc::\|file_type_visibility::\|caption_folder_book_and_search_branch\|caption_search_branch_projection/)' --test-threads 4 --no-fail-fast` | 519件中517件成功、2件失敗、exit 100。35.6秒。run `580d51e9-c45f-4c80-9412-d76d9e7b96ef`、`target/v2b-related-tests.log`、`target/v2b-related-tests.junit.xml` |
+| `cargo check --offline -p mimageviewer --bin mimageviewer-core` | 通常feature / dev profile、exit 0、47.2秒。警告あり。`target/v2b-core-check.log` |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/caption_drill_branch_identity_lives_with_installed_rows\|caption_drill_worker_adopts_branch_identity_with_rows\|caption_folder_book_and_search_branch\|caption_search_branch_projection\|folder_candidate_mode_matrix_has_one_loading_shell_entrypoint/)' --test-threads 4 --no-fail-fast` | 終了契約と採用/別窓受付の最終回帰5件成功、exit 0。run `62b751c7-8636-456c-b34d-6cea4a10e404`、`target/v2b-final-projection-tests.log`、`target/v2b-final-projection-tests.junit.xml` |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/folder_candidate_mode_matrix_has_one_loading_shell_entrypoint\|detached_plan_classifies_every_grid_item_kind\|detached_grid_archive_candidate_does_not_change_zip_pdf_descriptor_plans\|detached_collection_plans_carry_origin/)' --test-threads 4 --no-fail-fast` | 既存detached受付回帰4件成功、exit 0。run `f28d06fe-dbc8-493b-aecf-c3b179279547`、`target/v2b-detached-admission-tests.log`、`target/v2b-detached-admission-tests.junit.xml` |
+| `python scripts/check_site_cards.py` / `python scripts/check_ui_glyphs.py` | exit 0、50カード/超過0、危険なUIグリフ0件 |
+| `cargo fmt --check` | 最終回帰と同じソースでexit 0 |
+| `CARGO_NET_OFFLINE=true`で `.\scripts\build-dev.ps1 -PreserveRuntime` | 通常feature / dev-runtime、exit 0。core（6分13秒）・Remote・EPUB worker・MCP adapterの4本成功、PE検査runtime=4/pe=4成功。`target/v2b-build-dev.log`、`target/vcrt-pe-reports/dev-runtime.json`。製品は起動していない |
+| `git diff --check` / 最後に引数なし `cargo fmt` | 引き継ぎ時に実施 |
+
+失敗2件は `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`
+（`pipe.rs`の名前付きpipeへの接続）と `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`
+（fixture server準備）。どちらもWindows code 5 / PermissionDeniedであり、V2aの記録にある
+実装環境で失敗した既存2件と同名。変更のないIPC準備/接続の地点で失敗しており、今回の新規検索回帰は成功。
+設計担当から「設計担当の全件では成功しており、作業環境の制限としてそのまま記録してよい」との
+追加指示を受領。この環境で成功したとは扱わず、制限を回避する変更・同条件の再実行は行わない。
+
+確認用の起動はリポジトリルートから利用者が実行する：
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+通常の `%APPDATA%\mimageviewer` を使い、実際の設定/データを更新し得る。
+単一インスタンスmutexを共有するため、先にインストール版/トレイ常駐版を終了する。
+確認対象は、作成/取り込み済みの説明文で書庫とフォルダをCtrl+Gから見つけて本として開くこと、
+「書庫・フォルダの本」で絞れること、説明文削除後は結果から消えること、
+直接Folder本と子ヒットを持つ検索枝の開き分けおよび検索を閉じた後の従来のフォルダ操作。

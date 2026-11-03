@@ -55,7 +55,12 @@ pub(super) fn read(
     let kind = if metadata.as_ref().is_some_and(std::fs::Metadata::is_dir) {
         ItemKind::Folder
     } else {
-        super::item_from_hit(&input.path).kind
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        super::item_kind_from_extension(&extension)
     };
     let mut output = ItemInfo {
         item: input.clone(),

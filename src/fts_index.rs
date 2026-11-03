@@ -649,7 +649,7 @@ pub fn build_bigram_and_query(
 
 /// 1 ページ分の検索結果を取得 (§9.1 ステップ 5)。
 ///
-/// 戻り値は (path, DocAddress, score) のリスト。`DocAddress` は post-filter で
+/// 戻り値は (path, DocAddress, score, stored kind) のリスト。`DocAddress` は post-filter で
 /// `searcher.doc(addr)` を呼んで STORED 原文を取り出すために返している
 /// (INDEX_VERSION=5 で fts_meta.db の `*_norm` 列を撤去した移行に伴う変更)。
 ///
@@ -660,7 +660,7 @@ pub fn search_page(
     query: &BooleanQuery,
     offset: usize,
     limit: usize,
-) -> tantivy::Result<Vec<(String, DocAddress, Score)>> {
+) -> tantivy::Result<Vec<(String, DocAddress, Score, IndexKind)>> {
     let top_docs: Vec<(Score, DocAddress)> = searcher.search(
         query,
         &TopDocs::with_limit(limit)
@@ -672,7 +672,15 @@ pub fn search_page(
         let doc: TantivyDocument = searcher.doc(addr)?;
         if let Some(v) = doc.get_first(fields.path) {
             if let Some(p) = v.as_str() {
-                out.push((p.to_string(), addr, score));
+                let kind = match doc.get_first(fields.kind).and_then(|value| value.as_str()) {
+                    Some("folder") => IndexKind::Folder,
+                    Some("zip") => IndexKind::Zip,
+                    Some("pdf") => IndexKind::Pdf,
+                    Some("video") => IndexKind::Video,
+                    Some("audio") => IndexKind::Audio,
+                    _ => IndexKind::Image,
+                };
+                out.push((p.to_string(), addr, score, kind));
             }
         }
     }
@@ -1352,7 +1360,7 @@ mod tests {
         let q = q_all(idx.fields(), &["夕焼け", "海辺"]).unwrap();
         let searcher = idx.searcher();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
-        let paths: Vec<_> = hits.iter().map(|(p, _, _)| p.as_str()).collect();
+        let paths: Vec<_> = hits.iter().map(|(p, _, _, _)| p.as_str()).collect();
         assert!(
             paths.contains(&"c:/a.jpg"),
             "句読点挟み doc がヒットするはず"
@@ -1388,7 +1396,7 @@ mod tests {
         let q = q_all(idx.fields(), &["夕焼け"]).unwrap();
         let searcher = idx.searcher();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
-        let paths: Vec<_> = hits.iter().map(|(p, _, _)| p.as_str()).collect();
+        let paths: Vec<_> = hits.iter().map(|(p, _, _, _)| p.as_str()).collect();
         assert!(paths.contains(&"c:/a.jpg"));
         assert!(paths.contains(&"c:/c.jpg"));
         assert!(
@@ -1426,7 +1434,7 @@ mod tests {
             .iter()
             .chain(page1.iter())
             .chain(page2.iter())
-            .map(|(p, _, _)| p.clone())
+            .map(|(p, _, _, _)| p.clone())
             .collect();
         assert_eq!(all_paths.len(), 30);
     }
@@ -1647,7 +1655,7 @@ mod tests {
         )
         .unwrap();
         let exif_hits = search_page(&searcher, idx.fields(), &q_exif, 0, 10).unwrap();
-        let exif_paths: Vec<_> = exif_hits.iter().map(|(p, _, _)| p.as_str()).collect();
+        let exif_paths: Vec<_> = exif_hits.iter().map(|(p, _, _, _)| p.as_str()).collect();
         assert_eq!(exif_hits.len(), 1, "EXIF target は 1 件");
         assert_eq!(exif_paths[0], "c:/a.jpg");
 
@@ -1662,7 +1670,7 @@ mod tests {
         )
         .unwrap();
         let xmp_hits = search_page(&searcher, idx.fields(), &q_xmp, 0, 10).unwrap();
-        let xmp_paths: Vec<_> = xmp_hits.iter().map(|(p, _, _)| p.as_str()).collect();
+        let xmp_paths: Vec<_> = xmp_hits.iter().map(|(p, _, _, _)| p.as_str()).collect();
         assert_eq!(xmp_hits.len(), 1);
         assert_eq!(xmp_paths[0], "c:/b.jpg");
 
@@ -1677,7 +1685,7 @@ mod tests {
         )
         .unwrap();
         let name_hits = search_page(&searcher, idx.fields(), &q_name, 0, 10).unwrap();
-        let name_paths: Vec<_> = name_hits.iter().map(|(p, _, _)| p.as_str()).collect();
+        let name_paths: Vec<_> = name_hits.iter().map(|(p, _, _, _)| p.as_str()).collect();
         assert_eq!(name_hits.len(), 1);
         assert_eq!(name_paths[0], "c:/c.jpg");
     }
@@ -1728,7 +1736,8 @@ mod tests {
         .unwrap();
         let searcher = idx.searcher();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
-        let paths: std::collections::HashSet<_> = hits.iter().map(|(p, _, _)| p.as_str()).collect();
+        let paths: std::collections::HashSet<_> =
+            hits.iter().map(|(p, _, _, _)| p.as_str()).collect();
         assert_eq!(hits.len(), 2, "EXIF + XMP の OR で a,b だけヒット");
         assert!(paths.contains("c:/a.jpg"));
         assert!(paths.contains("c:/b.jpg"));
@@ -1861,7 +1870,8 @@ mod tests {
         )
         .unwrap();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
-        let paths: std::collections::HashSet<_> = hits.iter().map(|(p, _, _)| p.as_str()).collect();
+        let paths: std::collections::HashSet<_> =
+            hits.iter().map(|(p, _, _, _)| p.as_str()).collect();
         assert_eq!(hits.len(), 3);
         assert!(paths.contains("c:/a.zip"));
         assert!(paths.contains("c:/b.pdf"));
@@ -1958,7 +1968,8 @@ mod tests {
         .unwrap();
         let searcher = idx.searcher();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
-        let paths: std::collections::HashSet<_> = hits.iter().map(|(p, _, _)| p.as_str()).collect();
+        let paths: std::collections::HashSet<_> =
+            hits.iter().map(|(p, _, _, _)| p.as_str()).collect();
         assert!(paths.contains("c:/a.jpg"));
         assert!(paths.contains("c:/b.jpg"));
         assert!(!paths.contains("c:/c.jpg"), "どちらも含まない doc は除外");
@@ -1996,12 +2007,12 @@ mod tests {
         let and_hits: Vec<_> = search_page(&searcher, idx.fields(), &q_and, 0, 10)
             .unwrap()
             .into_iter()
-            .map(|(p, _, _)| p)
+            .map(|(p, _, _, _)| p)
             .collect();
         let or_hits: Vec<_> = search_page(&searcher, idx.fields(), &q_or, 0, 10)
             .unwrap()
             .into_iter()
-            .map(|(p, _, _)| p)
+            .map(|(p, _, _, _)| p)
             .collect();
         assert_eq!(and_hits, or_hits, "1 token では AND/OR ヒット集合が一致");
         assert_eq!(and_hits, vec!["c:/a.jpg".to_string()]);
