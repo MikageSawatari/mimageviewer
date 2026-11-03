@@ -1056,3 +1056,35 @@ portable zip実物の生成・内容確認、署名あり配布とVirusTotal (�
   mIV Sound の生成器と日本語 locale で確認した。
 - Rust/cargo のビルド・テスト、製品の起動、署名・候補承認・公開・コミットは行っていない。
   `target/` と実際の `config/miv-sound.rs` は編集していない。候補のビルド・承認とコミットは設計担当へ引き継ぐ。
+
+### 19.4 0.15.0-miv.4 と公開ソースへのリンク (2026-11-04)
+
+対象は `v5-integration`、開始時 HEAD `83a50d7c4`。利用者が指定した mIV Sound `499ef51`
+(`0.15.0-miv.4`) のリポジトリ公開とリンク変更に合わせた、文書と Python 生成器・生成回帰だけの更新。
+`config/miv-sound.rs` の未コミットの版更新は設計担当の変更としてそのまま利用し、編集していない。
+
+- `c506bbab/SOURCE.md` の対応版を miv.4 に更新し、派生版のソース公開先
+  <https://github.com/MikageSawatari/miv-sound> を追記した。上流説明書は同じ v0.15.0 で、
+  原文・LICENSE・画像と、過去 snapshot の SOURCE.md は変更していない。
+- 生成器で `manual/sound/v0.15.0-miv.4/` に133 HTML＋4画像を作り直した。
+  miv.3 の137ファイルは、絶対パス・再解析ポイント不在・追跡ファイル集合・HEAD との一致・生成印・
+  画像一致を確認して削除した。未公開の miv.3 専用転送は追加せず、既存の他版向け共通規則を維持した。
+  旧 `manual/effetune/v0.15.0/` からの301、入口、canonical、案内ページの相互リンクとサイトマップを miv.4 に揃えた。
+  サイドバーは既存の版非依存入口 `sound/index.html` を維持し、生成ページ内のリンクも検証した。
+- `manual/effetune.html` に「mIV Sound のソース」を追加し、EffeTune / EffeTune Mixwright の GitHub は
+  「元にしたソフト」として残した。生成説明書には派生版ソースへのリンクを転載注記に追加した。
+  原作・作者・MIT のクレジットと原文ドキュメントへのリンク、ライセンス全文は維持する。
+  生成本文に Mixwright をこの派生版のリポジトリとして指す箇所はなかった。
+- 製品ページの mIV Sound クレジットと、privacy の日英の派生版・保存先説明にもソース公開先を追記した。
+  カード本文や通信・保存動作の説明は変更していない。overrides/README の現行版と更新手順の説明も揃えた。
+- `python scripts/test_gen_effetune_docs.py`: **33件成功**。現行版の生成物一致、旧版との対応違いの拒否、
+  派生版ソースと上流原文リンクの併存、旧 EffeTune・Sound 各版の301と現行版の転送ループ不在を確認した。
+- `python scripts/gen-effetune-docs.py --check`: **137ファイル＋入口＋301が一致**。
+  `python scripts/gen-sitemap-xml.py` で再生成後、`--check`: **216 URL 一致**。
+  公開ツリーとサイトマップに miv.3 の URL は残っていない。
+- 公開マニュアル全体・製品ページ・privacy の **206ページ、相対リンク・画像等7,897件、欠落0**。
+  フラグメントも照合し、更新履歴に残る旧説明書リンク1件は実際の `.htaccess` の規則で解決した。
+  Apache 実サーバの HTTP 応答は未測定。
+- `python scripts/check_site_cards.py`: **52枚、超過0**。`git diff --check`: **成功**。
+  cargo のビルド・テスト、製品起動、コミット・公開は行っていない。`target/` と実際の
+  `config/miv-sound.rs` には触れず、候補のビルド・承認は設計担当へ引き継ぐ。
