@@ -356,31 +356,3 @@ P2-2の不変条件は「未確定時の代替位置と利用者が選んだ位�
 | 引数なし`cargo fmt`、`cargo fmt --check`、`git diff --check` | **各exit0**、snapshot基準画像の差分なし | `tree-p2-fmt-check.log`、作業終了時のdiff検査 |
 
 今回の指定により`build-dev.ps1`、全snapshot、全lib gate、WebView2試験、製品起動、コミットは実施しない。確認用binaryの再作成と最終受入は設計担当へ引き継ぐ。初回全snapshotのexit2173に関する制限は上記の歴史的記録として残す。
-
-### サブPC Cのfocus差・入力順序の追補 (2026-11-03)
-
-対象はmaster `2c5b502c3`。worktreeは開始時点でこのHEAD・cleanだった。指定のff-onlyはgit領域の書込み制限で失敗したが、更新は不要だった。サブPC担当の`C:\miv-subpc\results-6\notes.md`、`c2/notes.md`、`c2/logs`とC2画像を読んだ。A/Bは正常、C（起動引数target→初回設定終了→最大化→grid空白click→F）は行・枝・viewportが正常で薄青、Dの明示操作は正常。初回Cは`--perf-log`がtargetを引数として受けた試行なので除外し、正しく解決したc2だけを起動引数の証拠とする。
-
-製品修正前の追加3試験は**2成功/1失敗**（`tree-c-focus-repro.log`）。実startup resolver・実初回設定終了・1920×1080へのlayout変更・3画像の一覧・tree/grid描画を通す通常順序と、folderbar相当のload後の通常順序は成功。一方、**同じraw frameでgrid release→F**にすると、Fがcurrent cursorとtree focusを設定した後、後段のgridが先行releaseを受理して`set_focus_grid`を行い、cursorは現在地なのにfocusだけ失った。(c)の薄青を説明できる再現である。サブPCの入力ログにはframe内順序が無いため、c2もこの順序だったとは断定しない。起動引数・setup固有の退行は確認できず、`655e79211^`にも同じF先行／grid後段のsetter経路があり、今回の2コミットで導入したものではない。
-
-不変条件は「受理済みfocus遷移を描画順で逆転させず、viewport/frame内の入力順で最新ownerを保つ。古いgrid focus要求は明示位置の由来も解放しない。受理済みのgrid選択・menu・row Open・枝操作は残す」。`has_focus`を単一`FolderPaneFocus`（宛先と入力由来）のgetterへ変更し、F、toolbar、tree行/arrow/drive、固定キー、gamepadとgridの同型入口を接続した。非表示・Snapshotによるdisabled等の既存force移譲と、raw twinのない受理commandの`AfterInputBatch`を区別する。Keymapは共通consumerから**実際に成功したchord**の結果だけを返し、raw位置が一意でない場合もbatch終端へ置く。native受理のEnter/数字slotはrawが1件でも物理slotを識別できないため、投影先を調べて同じbatch終端へ置く（通常Fとegui fallbackは維持）。既存bool consumerの優先順・消費・診断を維持する。rawは残存・受理入力の由来の注釈だけに使い、消費済み入力からclickを再生成しない。
-
-枝操作はfocus移譲から分離した。古いcollapse→後のEscは枝操作を処理した境界で最新cursorの祖先revealへ整合し、逆順では自身の行をcollapseしたままにする。現在地とcursorのrevealは成功membership/表示childrenの同じ停止条件を共有し、**cursor自身を除く祖先**だけを解除する。新たな展開需要は最初の描画前に既存queueへ接続し、scan寿命と表示要求を一致させる。追加pending/毎frame focus・scroll/遅延・retry・追加repaintは無い。全キー配送をraw順へ作り直す案は採らず、受理済みfocusと表示要求のowner境界へ局所化した。
-
-「下寄り」は修正しない。`Align::Center`は希望offsetで、実offsetは`0..max(content高−viewport高,0)`へclampされ、末尾に空白を加える指定ではない。C2画像でもtargetの下にrootの兄弟が約9行、scrollbarは下端にあり、この制限と整合する。回帰で下側に十分な行があれば中央（誤差1pt未満）、下側9行なら末尾clampで下寄り・行全体がviewport内となることを確認した。`FolderPaneScrollMemory.restore`はIdle時の行変更だけで、能動Centerを上書きする経路ではない。
-
-独立Sol/xhighレビューは、古いfocusを理由にOpen/枝操作まで捨てる初案、祖先collapseで後のEscのrevealが破られる途中案をREJECT。操作を分離し、最新cursorのrevealを同じ境界で整合した最終製品差分は**ACCEPT、重要な未解決指摘なし**。reviewerはread-onlyでsource/ログを確認し、build/testを重複実行していない。
-
-途中結果は成功根拠にしない。`tree-c-focus-fixed.log`はcontext情報をinputロック内で再取得した実装ミスにより3件がdebug lock失敗。metadata取得をロック外へ移した。`tree-c-folder-tests.log`はtestでKeymapとSettingsのAPIを取り違えた2 compile error。`tree-c-folder-verified.log`は87件中86成功/1失敗で、同値rawのfixtureがeguiにrepeat有無へ分けられていたため、前frameでkeyをholdしたfixtureへ補正した。祖先collapse/response回帰も含む次の`tree-c-folder-final.log`は**89成功/失敗0、12.062秒、exit0**。その後、gamepadを含む90件・focused811実行・check・関連snapshot4件も成功したが、最終auditでnative folded slotの位置を保守化し、Enter/NumpadEnter/Num0/Numpad0の回帰を加えた。以下はその最終sourceの検証。
-
-追加18回帰はApp 10件（通常startup/setupとcontrol、release→F/逆順/同batch全click/remap、toolbar/同batch toolbar、古いrow/arrow保持、祖先collapse/Esc両順）、state 2件、UI 2件（response相関、中央と末尾clamp）、keymap 3件、gamepad 1件。Windows MSVC/default features、`MSBUILDDISABLENODEREUSE=1`と`target/tree-open-env.ps1`の既存native依存環境を使った。
-
-| コマンド・範囲 | 最終結果 | 証跡 (`target/`) |
-| --- | --- | --- |
-| `cargo nextest run -p mimageviewer --lib -E 'test(/folder_pane/)' --no-fail-fast` | **91成功/失敗0、12.818秒、exit0** | `tree-c-slot-folder.log` |
-| `scripts/test-focused.ps1 -Path src/folder_pane.rs,src/folder_pane/refresh_tests.rs,src/ui_folder_pane.rs,src/app/folder_pane_refresh_tests.rs,src/ui_main.rs,src/keymap.rs,src/app/gamepad_input.rs` | **49/25/20/34/384/189/111件の7群すべて成功、exit0**。812実行は重複を含む | `tree-c-slot-focused.log`、`test-focused/runs/20261103T0331*`〜`0334*`のJUnit/command/log |
-| `cargo check -p mimageviewer --bin mimageviewer-core` | **exit0、22.12秒**。warningあり | `tree-c-slot-check.log` |
-| `cargo test --test ui_snapshot folder_pane -- --test-threads=4` | **4成功/失敗0、2.12秒、exit0**。画像更新なし | `tree-c-slot-snapshot.log` |
-| 引数なし`cargo fmt`実行、`cargo fmt --check`、`git diff --check` | **成功、各check exit0**、基準画像差分なし | `tree-c-slot-fmt-check.log`、終了時diff検査 |
-
-`src/app.rs`は広いdispatchファイルなのでfocused runnerの自動全件要求には広げず、今回の実入力回帰で接続を検査した。利用者指定によりlib全件・全snapshot・build-dev・WebView2試験・製品起動・コミットは行っていない。本追補を含む確認用binaryの作成とサブPC Cとの実機一致確認は設計担当へ引き継ぐ。

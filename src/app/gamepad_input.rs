@@ -4530,7 +4530,7 @@ impl App {
                 }
                 if let Some(dir) = button_dir(action.button) {
                     if !self.gamepad_targets_viewer()
-                        && self.handle_gamepad_folder_tree_direction(ctx, dir)
+                        && self.handle_gamepad_folder_tree_direction(dir)
                     {
                         return None;
                     }
@@ -4678,7 +4678,7 @@ impl App {
             return true;
         }
         if !self.gamepad_targets_viewer() {
-            return self.dispatch_gamepad_grid_analog(ctx, now);
+            return self.dispatch_gamepad_grid_analog(now);
         }
         let Some(fs_idx) = self.fullscreen_idx else {
             return false;
@@ -4724,7 +4724,7 @@ impl App {
         })
     }
 
-    fn dispatch_gamepad_grid_analog(&mut self, ctx: &egui::Context, now: Instant) -> bool {
+    fn dispatch_gamepad_grid_analog(&mut self, now: Instant) -> bool {
         if !self.grid_item_input_allowed() {
             self.reset_gamepad_continuous_steps(now);
             return false;
@@ -4740,7 +4740,7 @@ impl App {
                 .left_stick_step_due(stick_active, now, STICK_STEP_INTERVAL)
                 && let Some(dir) = stick_dir
             {
-                changed = self.handle_gamepad_folder_tree_direction(ctx, dir);
+                changed = self.handle_gamepad_folder_tree_direction(dir);
             }
             let _ = self
                 .gamepad
@@ -9039,7 +9039,7 @@ impl App {
                 );
                 return;
             }
-            self.toggle_folder_tree_pane_from_key(ctx);
+            self.toggle_folder_tree_pane_from_key();
             return;
         }
         let Some(fs_idx) = self.fullscreen_idx else {
@@ -9120,7 +9120,7 @@ impl App {
         }
     }
 
-    fn handle_gamepad_folder_tree_direction(&mut self, ctx: &egui::Context, dir: PadDir) -> bool {
+    fn handle_gamepad_folder_tree_direction(&mut self, dir: PadDir) -> bool {
         if !self.folder_pane_blocks_grid_keyboard() {
             return false;
         }
@@ -9130,12 +9130,6 @@ impl App {
             PadDir::Left => FolderPaneTreeKey::Left,
             PadDir::Right => FolderPaneTreeKey::Right,
         };
-        self.folder_pane.note_focus_input(
-            crate::ui_folder_pane::folder_pane_focus_input_for_command(
-                ctx,
-                crate::keymap::KeyActionInputOrder::AfterInputBatch,
-            ),
-        );
         let _ = self.folder_pane.handle_tree_key(key);
         true
     }
@@ -11094,40 +11088,6 @@ mod tests {
         GAMEPAD_LIST_VISIBLE_ROWS, GamepadListPickerHeading,
         draw_gamepad_list_picker_overlay_layout, draw_gamepad_ring_picker_overlay_layout,
     };
-
-    #[test]
-    fn folder_pane_gamepad_direction_owns_focus_ahead_of_the_current_pointer_batch() {
-        let mut app = crate::app::setup_app_for_test();
-        let root = app.tmp.path().join("pad-tree");
-        let a = root.join("a");
-        let b = root.join("b");
-        app.folder_pane =
-            crate::folder_pane::FolderPaneState::test_tree(&root, vec![a.clone(), b.clone()]);
-        app.folder_pane.set_cursor(a);
-        app.settings.folder_tree_pane_visible = true;
-        let ctx = egui::Context::default();
-        ctx.begin_pass(egui::RawInput {
-            events: vec![egui::Event::PointerMoved(egui::pos2(50.0, 50.0))],
-            ..Default::default()
-        });
-        assert!(app.handle_gamepad_folder_tree_direction(&ctx, super::PadDir::Down));
-        app.folder_pane
-            .focus_grid_from_input(crate::folder_pane::FolderPaneFocusInput::Ordered(
-                crate::folder_pane::FolderPaneInputOrder {
-                    viewport: ctx.viewport_id(),
-                    frame: ctx.cumulative_frame_nr(),
-                    position: crate::folder_pane::FolderPaneInputPosition::Event(0),
-                },
-            ));
-        assert!(app.folder_pane.has_focus());
-        assert!(
-            app.folder_pane
-                .visible_rows()
-                .iter()
-                .any(|row| row.path == b && row.is_cursor)
-        );
-        ctx.end_pass().drop_without_applying_deltas();
-    }
 
     fn list_order_gamepad_fixture() -> crate::app::tests::phase_c_support::AppTestEnv {
         use crate::app::top_level_grid_view::TopLevelGridSurface;

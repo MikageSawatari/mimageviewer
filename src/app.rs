@@ -58039,13 +58039,11 @@ impl App {
             && !self.tag_view.has_focus
             && !self.viewer_session_blocks_main_window()
             && !self.any_dialog_open()
-            && let Some(input_order) = self
+            && self
                 .keymap
-                .consume_action_with_input_order(ctx, KeyAction::GridToggleFolderTreePane)
+                .consume_action(ctx, KeyAction::GridToggleFolderTreePane)
         {
-            self.toggle_folder_tree_pane_from_input(
-                crate::ui_folder_pane::folder_pane_focus_input_for_command(ctx, input_order),
-            );
+            self.toggle_folder_tree_pane_from_key();
             return None;
         }
         if self.folder_pane_blocks_grid_keyboard() {

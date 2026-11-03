@@ -137,51 +137,6 @@ pub(crate) enum FolderPaneCursorScroll {
     FollowingRefresh,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct FolderPaneInputOrder {
-    pub viewport: egui::ViewportId,
-    pub frame: u64,
-    pub position: FolderPaneInputPosition,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum FolderPaneInputPosition {
-    Event(usize),
-    AfterInputBatch,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) enum FolderPaneFocusInput {
-    #[default]
-    Programmatic,
-    Ordered(FolderPaneInputOrder),
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-enum FolderPaneFocusTarget {
-    #[default]
-    Grid,
-    Tree,
-}
-
-#[derive(Default)]
-struct FolderPaneFocus {
-    target: FolderPaneFocusTarget,
-    input: FolderPaneFocusInput,
-}
-
-impl FolderPaneFocus {
-    fn accepts(&self, input: FolderPaneFocusInput) -> bool {
-        match (self.input, input) {
-            (FolderPaneFocusInput::Ordered(previous), FolderPaneFocusInput::Ordered(next)) => {
-                previous.viewport != next.viewport
-                    || (next.frame, next.position) > (previous.frame, previous.position)
-            }
-            _ => true,
-        }
-    }
-}
-
 #[derive(Clone, Default, PartialEq, Eq)]
 struct FolderPanePosition {
     drive: Option<PathBuf>,
@@ -244,7 +199,7 @@ type TestScanBackend = Arc<
 >;
 
 pub(crate) struct FolderPaneState {
-    focus: FolderPaneFocus,
+    pub has_focus: bool,
     pub(crate) cursor_scroll: FolderPaneCursorScroll,
     selection: FolderPaneSelection,
     active_path: Option<PathBuf>,
@@ -266,7 +221,7 @@ impl Default for FolderPaneState {
     fn default() -> Self {
         let drives = crate::known_folders::available_drives();
         Self {
-            focus: FolderPaneFocus::default(),
+            has_focus: false,
             cursor_scroll: FolderPaneCursorScroll::Idle,
             selection: FolderPaneSelection::FollowActive(FolderPanePosition {
                 drive: drives.first().cloned(),
@@ -290,49 +245,6 @@ impl Default for FolderPaneState {
 }
 
 impl FolderPaneState {
-    pub(crate) fn has_focus(&self) -> bool {
-        matches!(self.focus.target, FolderPaneFocusTarget::Tree)
-    }
-
-    /// Annotate a just-accepted command; raw input order survives key consumption.
-    pub(crate) fn note_focus_input(&mut self, input: FolderPaneFocusInput) {
-        if self.focus.accepts(input) {
-            self.focus.input = input;
-        }
-    }
-
-    pub(crate) fn focus_tree_from_input(&mut self, input: FolderPaneFocusInput) -> bool {
-        if self.focus.accepts(input) {
-            self.set_focus_tree();
-            self.note_focus_input(input);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub(crate) fn focus_active_from_input(&mut self, input: FolderPaneFocusInput) {
-        if self.focus.accepts(input) {
-            self.set_focus_tree_at_active();
-            self.note_focus_input(input);
-        }
-    }
-
-    pub(crate) fn select_drive_from_input(&mut self, drive: PathBuf, input: FolderPaneFocusInput) {
-        if self.focus.accepts(input) {
-            self.select_drive(drive);
-            self.note_focus_input(input);
-        }
-    }
-
-    pub(crate) fn focus_grid_from_input(&mut self, input: FolderPaneFocusInput) {
-        if self.focus.accepts(input) {
-            // Do not relinquish explicit selection ownership for an older click.
-            self.set_focus_grid();
-            self.note_focus_input(input);
-        }
-    }
-
     pub(crate) fn selected_drive(&self) -> Option<&Path> {
         self.selection.position().drive.as_deref()
     }
@@ -378,10 +290,7 @@ impl FolderPaneState {
     }
 
     pub(crate) fn set_focus_tree(&mut self) {
-        self.focus = FolderPaneFocus {
-            target: FolderPaneFocusTarget::Tree,
-            ..Default::default()
-        };
+        self.has_focus = true;
         if self.cursor_path().is_none() {
             self.selection.position_mut().cursor = self
                 .active_path
@@ -393,12 +302,19 @@ impl FolderPaneState {
 
     pub(crate) fn set_focus_tree_at_active(&mut self) {
         self.resolve_follow_position();
-        self.reveal_cursor_ancestors();
+        if let Some(active) = self.active_path.clone() {
+            if let Some(root) = self.selected_drive() {
+                for ancestor in ancestor_chain(root, &active) {
+                    self.user_collapsed.remove(&key_for(&ancestor));
+                }
+            }
+            self.reveal_active(false);
+        }
         self.set_focus_tree();
     }
 
     pub(crate) fn set_focus_grid(&mut self) {
-        self.focus = FolderPaneFocus::default();
+        self.has_focus = false;
         // Preserve the shown cursor until the next location change, as before.
         self.selection.follow_next_active_change();
     }
@@ -456,10 +372,7 @@ impl FolderPaneState {
     }
 
     pub(crate) fn select_drive(&mut self, drive: PathBuf) {
-        self.focus = FolderPaneFocus {
-            target: FolderPaneFocusTarget::Tree,
-            ..Default::default()
-        };
+        self.has_focus = true;
         // An actual selection, including the selected drive, is an explicit recheck.
         // Invalidate all participants, so an unchanged root also refreshes its open branches.
         self.cancel_pending();
@@ -542,39 +455,8 @@ impl FolderPaneState {
         {
             return;
         }
-        self.reveal_path(&root, &active, changed);
-    }
-
-    fn reveal_cursor_ancestors(&mut self) {
-        let (Some(root), Some(cursor)) = (
-            self.selection.position().drive.clone(),
-            self.selection.position().cursor.clone(),
-        ) else {
-            return;
-        };
-        if !path_is_same_or_descendant(&cursor, &root) {
-            return;
-        }
-        let chain = ancestor_chain(&root, &cursor);
-        let ancestors = &chain[..chain.len().saturating_sub(1)];
-        let expansion_changed = ancestors
-            .iter()
-            .any(|path| !self.is_expanded_key(&key_for(path)));
-        for path in ancestors {
-            self.user_collapsed.remove(&key_for(path));
-        }
-        self.reveal_path(&root, &cursor, false);
-        if expansion_changed {
-            // Newly revealed demand belongs to this request before its first draw.
-            self.reconcile_demand();
-            self.start_queued();
-        }
-    }
-
-    fn reveal_path(&mut self, root: &Path, target: &Path, changed: bool) {
-        let root = root.to_path_buf();
         self.ensure_node(root.clone());
-        for pair in ancestor_chain(&root, target).windows(2) {
+        for pair in ancestor_chain(&root, &active).windows(2) {
             let parent_key = key_for(&pair[0]);
             self.auto_expanded.insert(parent_key.clone());
             if self.user_collapsed.contains(&parent_key) {
@@ -900,7 +782,6 @@ impl FolderPaneState {
             drive,
             cursor: Some(path),
         });
-        self.reveal_cursor_ancestors();
         self.cursor_scroll = FolderPaneCursorScroll::Requested;
     }
 
@@ -953,7 +834,16 @@ impl FolderPaneState {
         self.selection.make_explicit();
         let key = key_for(&cursor);
         if self.is_expanded_key(&key) {
-            self.set_branch_expanded(&cursor, false);
+            self.user_expanded.remove(&key);
+            if self.auto_expanded.contains(&key) {
+                self.user_collapsed.insert(key);
+            }
+            // The root is always demanded, but its next expansion must also recheck.
+            if let Some(node) = self.nodes.get_mut(&key_for(&cursor)) {
+                node.scan = NodeScan::Unverified;
+            }
+            self.reconcile_demand();
+            self.cursor_scroll = FolderPaneCursorScroll::Requested;
         } else if let Some(parent) = cursor
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -969,7 +859,12 @@ impl FolderPaneState {
         self.selection.make_explicit();
         let key = key_for(&cursor);
         if !self.is_expanded_key(&key) {
-            self.set_branch_expanded(&cursor, true);
+            self.user_expanded.insert(key.clone());
+            self.user_collapsed.remove(&key);
+            self.ensure_node(cursor.clone());
+            self.request_recheck(&cursor);
+            self.reconcile_demand();
+            self.cursor_scroll = FolderPaneCursorScroll::Requested;
         } else if let Some(child) = self
             .nodes
             .get(&key)
@@ -977,42 +872,6 @@ impl FolderPaneState {
             .cloned()
         {
             self.set_cursor(child);
-        }
-    }
-
-    /// Disclosure is a branch action, independent of who now owns input focus.
-    pub(crate) fn set_branch_expanded(&mut self, path: &Path, expanded: bool) {
-        let key = key_for(path);
-        if expanded {
-            self.user_expanded.insert(key.clone());
-            self.user_collapsed.remove(&key);
-            self.ensure_node(path.to_path_buf());
-            self.request_recheck(path);
-        } else {
-            self.user_expanded.remove(&key);
-            if self.auto_expanded.contains(&key) {
-                self.user_collapsed.insert(key.clone());
-            }
-            // The root remains demanded, but its next expansion must recheck.
-            if let Some(node) = self.nodes.get_mut(&key) {
-                node.scan = NodeScan::Unverified;
-            }
-        }
-        self.reconcile_demand();
-        self.cursor_scroll = FolderPaneCursorScroll::Requested;
-    }
-
-    pub(crate) fn set_branch_expanded_from_input(
-        &mut self,
-        path: &Path,
-        expanded: bool,
-        input: FolderPaneFocusInput,
-    ) {
-        self.set_branch_expanded(path, expanded);
-        if self.has_focus() && !self.focus.accepts(input) {
-            // Apply the branch action, then reconcile the later cursor reveal.
-            // Its own row is excluded, so the latest collapse still stays closed.
-            self.reveal_cursor_ancestors();
         }
     }
 
@@ -1425,7 +1284,7 @@ impl FolderPaneState {
             drive: Some(root.to_path_buf()),
             cursor: None,
         });
-        state.focus.target = FolderPaneFocusTarget::Tree;
+        state.has_focus = true;
         state.last_drive_refresh = Some(std::time::Instant::now());
         state.resume_display();
         state.test_seed_listing(root, children, true);

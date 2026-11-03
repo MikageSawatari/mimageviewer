@@ -1138,16 +1138,11 @@ enum GridCellPaint {
     },
 }
 
-struct OrderedGridPrimaryInput {
-    event: crate::app::GridPrimaryInput,
-    focus_input: crate::folder_pane::FolderPaneFocusInput,
-}
-
 fn grid_primary_input_events(
     ctx: &egui::Context,
     touch: &crate::touch_correlation::TouchFrame,
     background: bool,
-) -> Vec<OrderedGridPrimaryInput> {
+) -> Vec<crate::app::GridPrimaryInput> {
     use crate::app::{GridClickSource, GridPrimaryInput};
     let witnesses = ctx
         .data(|data| data.get_temp::<GridPressWitnesses>(egui::Id::unique("grid_press_witnesses")))
@@ -1155,49 +1150,18 @@ fn grid_primary_input_events(
         .map(|witness| witness.widgets)
         .unwrap_or_else(|| ctx.pointer_button_targets());
     let mut witnesses = witnesses.into_iter();
-    let viewport = ctx.viewport_id();
-    let frame = ctx.cumulative_frame_nr();
     ctx.input(|input| {
         let mut releases = input.pointer.released_buttons_with_click_counts();
         let mut ordinal = 0;
         let mut events = Vec::new();
-        let mut raw = input.raw.events.iter().enumerate();
-        let cancelled = || {
-            vec![OrderedGridPrimaryInput {
-                event: GridPrimaryInput::Cancelled,
-                focus_input: crate::folder_pane::FolderPaneFocusInput::Programmatic,
-            }]
-        };
         for event in &input.events {
-            // Annotate only the remaining, adjudicated stream. Never regenerate
-            // an edge removed by another input owner from the immutable raw list.
-            let focus_input =
-                if let Some((index, _)) = raw.clone().find(|(_, original)| *original == event) {
-                    let _ = raw.find(|(raw_index, _)| *raw_index == index);
-                    crate::folder_pane::FolderPaneFocusInput::Ordered(
-                        crate::folder_pane::FolderPaneInputOrder {
-                            viewport,
-                            frame,
-                            position: crate::folder_pane::FolderPaneInputPosition::Event(index),
-                        },
-                    )
-                } else {
-                    crate::folder_pane::FolderPaneFocusInput::Ordered(
-                        crate::folder_pane::FolderPaneInputOrder {
-                            viewport,
-                            frame,
-                            position: crate::folder_pane::FolderPaneInputPosition::AfterInputBatch,
-                        },
-                    )
-                };
-            let mut emit = |event| events.push(OrderedGridPrimaryInput { event, focus_input });
             match *event {
-                egui::Event::WindowFocused(false) => emit(GridPrimaryInput::FocusLost),
-                egui::Event::PointerMoved(pos) => emit(GridPrimaryInput::Moved(pos)),
+                egui::Event::WindowFocused(false) => events.push(GridPrimaryInput::FocusLost),
+                egui::Event::PointerMoved(pos) => events.push(GridPrimaryInput::Moved(pos)),
                 egui::Event::Touch {
                     phase: egui::TouchPhase::Cancel,
                     ..
-                } => emit(GridPrimaryInput::TouchCancelled),
+                } => events.push(GridPrimaryInput::TouchCancelled),
                 egui::Event::PointerButton {
                     pos,
                     button,
@@ -1212,21 +1176,21 @@ fn grid_primary_input_events(
                         {
                             (widget, allowed)
                         }
-                        _ => return cancelled(),
+                        _ => return vec![GridPrimaryInput::Cancelled],
                     };
                     let click = if !pressed {
                         let Some((released_button, click)) = releases.next() else {
-                            return cancelled();
+                            return vec![GridPrimaryInput::Cancelled];
                         };
                         if released_button != button {
-                            return cancelled();
+                            return vec![GridPrimaryInput::Cancelled];
                         }
                         click
                     } else {
                         None
                     };
                     if button != egui::PointerButton::Primary {
-                        emit(if button == egui::PointerButton::Secondary {
+                        events.push(if button == egui::PointerButton::Secondary {
                             GridPrimaryInput::Secondary {
                                 pos,
                                 pressed,
@@ -1246,7 +1210,7 @@ fn grid_primary_input_events(
                         GridClickSource::Mouse
                     };
                     if pressed {
-                        emit(GridPrimaryInput::Press {
+                        events.push(GridPrimaryInput::Press {
                             pos,
                             widget,
                             source,
@@ -1254,7 +1218,7 @@ fn grid_primary_input_events(
                         });
                     } else {
                         ordinal += 1;
-                        emit(GridPrimaryInput::Release {
+                        events.push(GridPrimaryInput::Release {
                             click,
                             modifiers,
                             source,
@@ -1277,7 +1241,7 @@ fn grid_primary_input_events(
         // Earlier input owners can consume raw events. Never join a remaining raw
         // edge to a different adjudicated release or carry its old click pair on.
         if releases.next().is_some() || witnesses.next().is_some() {
-            return cancelled();
+            return vec![GridPrimaryInput::Cancelled];
         }
         events
     })
@@ -11377,10 +11341,8 @@ impl App {
                     let resp = ui
                         .add(egui::Button::selectable(active, "ツリー").sense(tree_sense))
                         .on_hover_text(format!("左側に実フォルダツリーを表示\n{lead_hint}"));
-                    #[cfg(test)]
-                    ui.ctx().data_mut(|data| data.insert_temp(egui::Id::unique("folder_pane_test_toolbar_rect"), resp.rect));
                     if resp.clicked() {
-                        self.set_folder_tree_pane_visible_from_input(!active, crate::ui_folder_pane::folder_pane_focus_input_for_response(&resp));
+                        self.set_folder_tree_pane_visible(!active);
                     }
                     self.finish_toolbar_section_lead(
                         ui,
@@ -17620,6 +17582,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let primary_clicked = !clicks.is_empty();
         let primary_double_clicked =
             primary_clicked && response.double_clicked_by(egui::PointerButton::Primary);
+        if primary_clicked || secondary_clicked {
+            self.folder_pane.set_focus_grid();
+        }
         let mut badge_clicked = false;
         let mut activate = false;
         // Apply each accepted release, including its own modifiers and selection
@@ -18139,9 +18104,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let background_events = grid_primary_input_events(ctx, touch, true);
         let mut nav = None;
         let mut dispatched = std::collections::HashSet::new();
-        for (ordered, background_ordered) in events.iter().zip(&background_events) {
-            let event = &ordered.event;
-            let background_event = &background_ordered.event;
+        for (event, background_event) in events.iter().zip(&background_events) {
             let background_allowed = ctx.input(|input| input.focused)
                 && !self.any_dialog_open()
                 && self.context_menu_idx.is_none();
@@ -18294,7 +18257,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         self.update_grid_mouse_ring_flick_at(ctx, pos, false, true);
                         if clicked && !suppressed {
                             if let Some(cell) = cell {
-                                self.folder_pane.focus_grid_from_input(ordered.focus_input);
                                 dispatched.insert(cell.index);
                                 nav = self.dispatch_grid_cell_input(
                                     ctx,
@@ -18327,7 +18289,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 match target {
                     GridPressTarget::Cell(idx) => {
                         if let Some(cell) = cells.iter().find(|cell| cell.index == idx) {
-                            self.folder_pane.focus_grid_from_input(ordered.focus_input);
                             dispatched.insert(cell.index);
                             nav =
                                 self.dispatch_grid_cell_input(ctx, cell, vec![click], None, false);
@@ -18337,7 +18298,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         if self.settings.grid_click_selection_mode.normalized()
                             == GridClickSelectionMode::Explorer
                         {
-                            self.folder_pane.focus_grid_from_input(ordered.focus_input);
+                            self.folder_pane.set_focus_grid();
                         }
                         self.clear_grid_background_selection();
                         if click.paired && self.settings.grid_background_double_click_parent {
@@ -18367,7 +18328,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             })
             && !events.iter().any(|event| {
                 matches!(
-                    &event.event,
+                    event,
                     GridPrimaryInput::Moved(_) | GridPrimaryInput::Secondary { pressed: false, .. }
                 )
             })
@@ -18398,15 +18359,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     let long_touch = cell.response.long_touched()
                         && !events
                             .iter()
-                            .any(|event| matches!(event.event, GridPrimaryInput::Cancelled));
-                    if long_touch {
-                        self.folder_pane.focus_grid_from_input(
-                            crate::ui_folder_pane::folder_pane_focus_input_for_command(
-                                ctx,
-                                crate::keymap::KeyActionInputOrder::AfterInputBatch,
-                            ),
-                        );
-                    }
+                            .any(|event| matches!(event, GridPrimaryInput::Cancelled));
                     self.dispatch_grid_cell_input(
                         ctx,
                         cell,
