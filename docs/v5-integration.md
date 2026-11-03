@@ -551,3 +551,17 @@ reparse point 0と確認してNTFS圧縮（ファイル内容保持、削除0）
 - ctest: 候補 `4d2a0fc3be02aa77c59ceedbb9a454f628adbe83ecc778217b0c8f9391b5d541` で 117/117。途中の候補 `302a5bef…` (`1df923f` で ctest 2 件失敗、テスト側の誤り)、`2c00671d…` (中断したビルドが残した記録) は `target/miv-sound-candidates-rejected/` へよけた。
 - 利用者の確認 (観測者: 利用者、v5 dev build に候補 `302a5bef…`、続いて `2c00671d…` を入れたもの。`4d2a0fc3…` との違いは版番号の表示だけ): 初回の Visualizer、再起動後の Effects / Visualizer の復元、明示値の優先、初回の音量が下がらないこと、起動時の表示の表記。
 - `.\scripts\build-miv-sound.ps1 -Approve -Candidate 4d2a0fc3…` で `third_party/miv-sound/0.15.0-miv.2/` を作成。バックアップは `C:\home\mimageviewer_vendor_backup\miv-sound-0.15.0-miv.2\`。旧 `third_party/miv-sound/0.15.0-miv.1/` は残している (削除は管理担当の判断)。
+
+## 10. 配布構成の試走 (2026-11-03、利用者の指示)
+
+v5-integration `4cecdcd57` (mIV Sound 0.15.0-miv.2 承認後、§1.693・§1.694・§1.695・§1.696 を含む)。公開用の `build-dist.ps1` ではなく、署名・インストーラ・ポータブル版を作らない試走。ローカル AI 説明文 (vlm-caption) は未取り込みで対象外。
+
+| 段 | 結果 |
+| --- | --- |
+| `build-release.ps1 -PreserveRuntime` | 成功。core・remote・EPUB・MCP・editor・launcher (単体 exe 541,201,408 bytes)。VC runtime gate は runtime=4 / pe=6 と embedded pe=12 の両方 passed。VST3 bridge は C++ 変更なしで既存 exe (11-02 00:34) のまま |
+| `test-full.ps1` 1 回目 | テスト実行前に停止。テスト実行ファイルの並列ビルドで commit 上限に達し `os error 1455` (ページング ファイルが小さすぎる)。metadata の読み込み失敗が `E0786`/`E0460` として大量に出るが、ソースの不具合ではない |
+| `test-full.ps1` 2 回目 (`CARGO_BUILD_JOBS=6`) | 18,012 件中 18,011 成功、77 skip、1,035 秒。失敗 1 件 `archive_conversion_failure_diagnostics::locked_zip_publish_reports_plain_message_and_native_error_without_overwrite` (ログのフォルダが見つからない NotFound) は単独で成功。同時実行の影響と見ているが、何がフォルダを消したかは未調査 |
+| `test-lib-full.ps1 -Features test-script` | 16,125 件中 16,123 成功、71 skip。失敗 2 件 (`page_turn::draw_submit_tests::page_turn_mainwindow_submits_visible_vacant_leaf_both_directions`、`phase_c_folder_nav_history_tests::section1328_pdf_history_back_control_preserves_parent_position`) は単独の再実行 1 回目で exit 100、2 回目で 2 件とも成功。不安定なテストとして扱う |
+
+- 公開前の全体テストでは、メイン PC でほかのアプリが動いている場合に備えて `CARGO_BUILD_JOBS` を絞る (6 で通った)。`build-dist.ps1` も同じ並列ビルドを行う。
+- 残り: ローカル AI 説明文 (V2 検索・V3 MCP) の実装と取り込み、版 5.0.0 と更新履歴、公開文書、`build-dist.ps1` での本番ビルド・署名、配布物での受入、Phase 2 の依存物確認・perf smoke (`ui-smoke.ps1 -Scenario ReleaseChecks`)・panic log の棚卸し。
