@@ -5621,3 +5621,12 @@ description 単体の固定長テストは無いが、`stage2_complete_tool_disc
 | HEAD とのコード照合 | `schema.rs` の description 本体・共通の制限説明と、`lib.rs` の `INSTRUCTIONS` 以外の製品コードは同一。tool 名・inputSchema・outputSchema・annotations の不変を確認 |
 
 製品・AI アプリは起動せず、実際の Codex / Claude の設定ファイルにはアクセスしていない。マニュアルも変更せず、コミットは設計担当へ引き渡す。
+
+### 34.x サブ PC での確認 (依頼 8、2026-11-03) とマニュアルの追記
+
+観測者はサブ PC 担当 (記録 `C:\miv-subpc\results-8\`)。ビルドは v5-integration `2790b7d19` の dev build (本節の説明文を含む)。Codex CLI v0.166.0 + gpt-6.1-sol、`codex.cmd exec -s read-only`、頼み方は依頼 7 と同じ文のまま。
+
+- 「mImageViewer で C:\miv-test\fixtures\library の中身を一覧して」: 1 回目は computer-use を試して失敗し、mIV の tool は呼ばれなかった。2 回目は computer-use を 1 回試した後に `list_folder` へ切り替え、8 件を返した。
+- 「loose_images の img_002.jpg を mImageViewer で開いて」: 新しい会話では computer-use を使わず mIV の tool だけを使ったが、場所が分からず「フルパスを教えてください」で終わった。前の会話を続けた場合は `open_in_viewer` で開いた。
+- 「loose_images の img_003.jpg に subpc-test2 のタグを付けて、★2 にして」: 新しい会話で、最初から mIV の tool だけを使い、タグと★が付いた。
+- 判断 (設計担当): 説明文の改良で mIV の tool が選ばれる場面は増えたが、一覧の頼みでは Codex がまず画面操作を試すことが残る。tool の選び方は AI アプリ側の判断で、説明文だけでは決め切れない。マニュアルの「頼めることの例」に、mIV の機能が使われないときは「mImageViewer の MCP ツールを使って」と書き添えること、場所はフルパスで伝えることを追記した。
