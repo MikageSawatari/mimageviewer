@@ -14,11 +14,28 @@ use super::vlm_worker::{
 use crate::ai_caption_db::{
     CaptionDb, CaptionResult, CaptionStatus, FileSignature, SaveOutcome, SaveRequest,
 };
+use crate::app::book_cover::{
+    BookCover, BookCoverEnv, BookCoverFailure, BookKind, ResolvedBookCover, resolve_book_cover,
+};
 use crate::canonical_image_loader::{
     AnimationPolicy, CanonicalDecodeOptions, CanonicalImageDecode, CanonicalImageSource,
     RawDecodeRuntime, RawStage, decode_canonical_image,
 };
 use crate::rotation_db::{Rotation, RotationDb};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaptionTarget {
+    Image(PathBuf),
+    Book { path: PathBuf, kind: BookKind },
+}
+
+impl CaptionTarget {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Image(path) | Self::Book { path, .. } => path,
+        }
+    }
+}
 
 pub struct CaptionWorkerConfig {
     /// None resolves/extracts the bundled worker on this job's thread.
@@ -28,11 +45,12 @@ pub struct CaptionWorkerConfig {
     pub caption_db_path: PathBuf,
     pub rotation_db_path: PathBuf,
     pub raw: crate::raw::RawDecodeContext,
+    pub book_cover_env: BookCoverEnv,
 }
 
 #[derive(Debug)]
 pub enum CaptionWorkerCommand {
-    Item(PathBuf),
+    Item(CaptionTarget),
     Finish,
 }
 
@@ -41,6 +59,9 @@ pub enum CaptionItemOutcome {
     Created,
     AlreadyCreated,
     Missing,
+    Unconverted,
+    PasswordRequired,
+    VideoCover,
     Failed,
     Discarded,
     Cancelled,
@@ -251,17 +272,17 @@ fn run_started_worker(
     while let Ok(command) = commands.recv() {
         match command {
             CaptionWorkerCommand::Finish => break,
-            CaptionWorkerCommand::Item(path) => {
+            CaptionWorkerCommand::Item(target) => {
                 request_id += 1;
                 let outcome = if stopped(cancel, lifetime) {
                     CaptionItemOutcome::Cancelled
                 } else {
-                    process_item(
+                    process_target(
                         config,
                         &db,
                         rotation.as_ref(),
                         cancel,
-                        &path,
+                        &target,
                         request_id,
                         &mut |id, width, height, rgb| client.caption(id, width, height, rgb),
                     )?
@@ -279,6 +300,235 @@ fn run_started_worker(
         crate::logger::log(format!("caption_job: discarded={discarded}"));
     }
     Ok(())
+}
+
+fn process_target(
+    config: &CaptionWorkerConfig,
+    db: &CaptionDb,
+    rotation: Option<&RotationDb>,
+    cancel: &Arc<AtomicBool>,
+    target: &CaptionTarget,
+    request_id: u64,
+    infer: &mut impl FnMut(u64, u32, u32, Vec<u8>) -> Result<CaptionOutcome, VlmError>,
+) -> Result<CaptionItemOutcome, String> {
+    if cancel.load(Ordering::Acquire) {
+        return Ok(CaptionItemOutcome::Cancelled);
+    }
+    match target {
+        CaptionTarget::Image(path) => {
+            process_item(config, db, rotation, cancel, path, request_id, infer)
+        }
+        CaptionTarget::Book { path, kind } => {
+            let started = Instant::now();
+            let cover = resolve_book_cover(path, kind.clone(), &config.book_cover_env);
+            stage_event(
+                "cover_resolve",
+                started,
+                matches!(&cover, BookCover::Readable(_)),
+            );
+            process_book_cover(
+                config,
+                db,
+                cancel,
+                path,
+                cover,
+                request_id,
+                infer,
+                &mut |cover| decode_book_input(config, rotation, cover, cancel),
+            )
+        }
+    }
+}
+
+/// Resolution and source-read failures never create a failed caption row.
+fn process_book_cover(
+    config: &CaptionWorkerConfig,
+    db: &CaptionDb,
+    cancel: &Arc<AtomicBool>,
+    path: &Path,
+    cover: BookCover,
+    request_id: u64,
+    infer: &mut impl FnMut(u64, u32, u32, Vec<u8>) -> Result<CaptionOutcome, VlmError>,
+    read: &mut impl FnMut(
+        &ResolvedBookCover,
+    ) -> Result<Result<image::RgbImage, CaptionItemOutcome>, String>,
+) -> Result<CaptionItemOutcome, String> {
+    if cancel.load(Ordering::Acquire) {
+        return Ok(CaptionItemOutcome::Cancelled);
+    }
+    let cover = match cover {
+        BookCover::Readable(cover) => cover,
+        BookCover::VideoFrame { .. } => return Ok(CaptionItemOutcome::VideoCover),
+        BookCover::Unreadable(reason) => {
+            return Ok(match reason {
+                BookCoverFailure::Unconverted => CaptionItemOutcome::Unconverted,
+                BookCoverFailure::PasswordRequired => CaptionItemOutcome::PasswordRequired,
+                BookCoverFailure::Missing => CaptionItemOutcome::Missing,
+                BookCoverFailure::ReadFailed => CaptionItemOutcome::Failed,
+            });
+        }
+    };
+    let existing = db
+        .get(&path.to_string_lossy())
+        .map_err(|error| error.to_string())?;
+    if existing.is_some_and(|row| {
+        row.status == CaptionStatus::Ok
+            && row.cover_ref == cover.cover_ref
+            && row.signature == cover.signature
+            && row.model_id == config.model_id
+            && row.prompt_version == PROMPT_VERSION
+    }) {
+        return Ok(CaptionItemOutcome::AlreadyCreated);
+    }
+    let started = Instant::now();
+    let decoded = read(&cover);
+    stage_event("image_load", started, matches!(&decoded, Ok(Ok(_))));
+    if cancel.load(Ordering::Acquire) {
+        return Ok(CaptionItemOutcome::Cancelled);
+    }
+    let rgb = match decoded? {
+        Ok(rgb) => rgb,
+        Err(outcome) => return Ok(outcome),
+    };
+    let started = Instant::now();
+    let inferred = infer(request_id, rgb.width(), rgb.height(), rgb.into_raw());
+    stage_event("infer", started, inferred.is_ok());
+    if cancel.load(Ordering::Acquire) {
+        return Ok(CaptionItemOutcome::Cancelled);
+    }
+    let result = match inferred.map_err(|error| error.to_string())? {
+        CaptionOutcome::Ok(result) => CaptionResult::Ok {
+            caption: result.caption,
+            text: result.text,
+            keywords: deduplicate_keywords(result.keywords),
+        },
+        CaptionOutcome::ImageFailure { message } => {
+            crate::logger::log(format!("caption_job: book inference: {message}"));
+            CaptionResult::Failed
+        }
+    };
+    save_request(
+        db,
+        cancel,
+        SaveRequest {
+            item_path: path.to_owned(),
+            signature_path: cover.signature_path,
+            signature: cover.signature,
+            cover_ref: cover.cover_ref,
+            model_id: config.model_id.clone(),
+            prompt_version: PROMPT_VERSION,
+            lang: "ja".into(),
+            result,
+        },
+    )
+}
+
+fn decode_book_input(
+    config: &CaptionWorkerConfig,
+    rotation: Option<&RotationDb>,
+    cover: &ResolvedBookCover,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Result<image::RgbImage, CaptionItemOutcome>, String> {
+    use crate::pdf_loader::{CancelWaitPolicy, JobPriority, PdfRenderValidity};
+    use crate::thumb_loader::ReadLocation;
+    let decoded = match &cover.location {
+        ReadLocation::File(path) => {
+            return decode_input(config, rotation, path, cancel).map(|result| {
+                result.map_err(|message| {
+                    crate::logger::log(format!("caption_job: book image decode: {message}"));
+                    CaptionItemOutcome::Failed
+                })
+            });
+        }
+        ReadLocation::ArchiveEntry { archive, entry } => {
+            let source = match cover.preloaded_bytes.as_deref() {
+                Some(bytes) => CanonicalImageSource::File {
+                    path: Path::new(entry),
+                    verified_bytes: Some(bytes),
+                },
+                None => CanonicalImageSource::ArchiveEntry {
+                    archive_path: archive,
+                    entry_name: entry,
+                },
+            };
+            decode_canonical_image(source, decode_options(config, cancel))
+                .map_err(|error| format!("{error:?}"))
+                .and_then(|result| match result {
+                    CanonicalImageDecode::Static(image) => Ok(image.image),
+                    _ => Err("first-frame decode did not return a static image".into()),
+                })
+        }
+        ReadLocation::PdfPage { pdf, page } => {
+            let rendered = match cover.epub_read.as_ref() {
+                Some(read) => crate::pdf_loader::render_page_with_read_target(
+                    pdf,
+                    read,
+                    *page,
+                    1024,
+                    cover.pdf_password.as_deref(),
+                    Some(cancel.clone()),
+                    JobPriority::Normal,
+                    PdfRenderValidity::Unscoped,
+                    CancelWaitPolicy::AbortOnCancel,
+                ),
+                None => crate::pdf_loader::render_page(
+                    pdf,
+                    *page,
+                    1024,
+                    cover.pdf_password.as_deref(),
+                    Some(cancel.clone()),
+                    JobPriority::Normal,
+                    PdfRenderValidity::Unscoped,
+                    CancelWaitPolicy::AbortOnCancel,
+                ),
+            };
+            match rendered {
+                Ok(result) => Ok(result.image),
+                Err(error) => {
+                    crate::logger::log(format!("caption_job: book PDF render: {error}"));
+                    return Ok(Err(pdf_failure_outcome(&error)));
+                }
+            }
+        }
+        ReadLocation::ChildCached | ReadLocation::Unreadable { .. } => {
+            return Ok(Err(CaptionItemOutcome::Failed));
+        }
+    };
+    Ok(decoded.map(|image| resize_rgb(&image)).map_err(|message| {
+        crate::logger::log(format!("caption_job: book cover decode: {message}"));
+        CaptionItemOutcome::Failed
+    }))
+}
+
+fn pdf_failure_outcome(error: &io::Error) -> CaptionItemOutcome {
+    if crate::pdf_loader::is_password_required_error(error) {
+        CaptionItemOutcome::PasswordRequired
+    } else {
+        CaptionItemOutcome::Failed
+    }
+}
+
+fn decode_options<'a>(
+    config: &'a CaptionWorkerConfig,
+    cancel: &'a Arc<AtomicBool>,
+) -> CanonicalDecodeOptions<'a> {
+    CanonicalDecodeOptions::fullscreen_cancellable(
+        AnimationPolicy::FirstFrameOnly,
+        cancel,
+        RawStage::Full,
+    )
+    .with_avif_workload(crate::avif_decoder::Workload::Background)
+    .with_raw_runtime(RawDecodeRuntime {
+        executor: &config.raw.executor,
+        brightness: config.raw.brightness,
+        priority: crate::raw::RawPriority::Background,
+        on_submitted: None,
+    })
+}
+
+fn resize_rgb(image: &image::DynamicImage) -> image::RgbImage {
+    crate::fast_resize::resize_dynamic_fit(image, 1024, 1024, crate::fast_resize::Quality::Lanczos3)
+        .into_rgb8()
 }
 
 fn process_item(
@@ -372,18 +622,7 @@ fn decode_input(
             path,
             verified_bytes: None,
         },
-        CanonicalDecodeOptions::fullscreen_cancellable(
-            AnimationPolicy::FirstFrameOnly,
-            cancel,
-            RawStage::Full,
-        )
-        .with_avif_workload(crate::avif_decoder::Workload::Background)
-        .with_raw_runtime(RawDecodeRuntime {
-            executor: &config.raw.executor,
-            brightness: config.raw.brightness,
-            priority: crate::raw::RawPriority::Background,
-            on_submitted: None,
-        }),
+        decode_options(config, cancel),
     );
     let image = match decoded {
         Ok(CanonicalImageDecode::Static(image)) => image.image,
@@ -395,13 +634,7 @@ fn decode_input(
         Err(error) => return Ok(Err(format!("{error:?}"))),
     };
     let image = crate::capture::rotate_dynamic_image(image, angle);
-    Ok(Ok(crate::fast_resize::resize_dynamic_fit(
-        &image,
-        1024,
-        1024,
-        crate::fast_resize::Quality::Lanczos3,
-    )
-    .into_rgb8()))
+    Ok(Ok(resize_rgb(&image)))
 }
 
 fn deduplicate_keywords(keywords: Vec<String>) -> Vec<String> {
@@ -426,7 +659,6 @@ fn save_result(
     if cancel.load(Ordering::Acquire) {
         return Ok(CaptionItemOutcome::Cancelled);
     }
-    let failed = matches!(result, CaptionResult::Failed);
     let request = SaveRequest {
         item_path: path.to_owned(),
         signature_path: path.to_owned(),
@@ -437,6 +669,15 @@ fn save_result(
         lang: "ja".into(),
         result,
     };
+    save_request(db, cancel, request)
+}
+
+fn save_request(
+    db: &CaptionDb,
+    cancel: &Arc<AtomicBool>,
+    request: SaveRequest,
+) -> Result<CaptionItemOutcome, String> {
+    let failed = matches!(request.result, CaptionResult::Failed);
     let started = Instant::now();
     let saved = db.save_unless_cancelled(&request, cancel);
     stage_event("save", started, saved.is_ok());
@@ -453,6 +694,9 @@ fn save_result(
 }
 
 fn stage_event(stage: &str, started: Instant, success: bool) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
     crate::perf::event(
         "caption",
         stage,
@@ -477,6 +721,7 @@ mod tests {
     fn config(root: &Path) -> CaptionWorkerConfig {
         CaptionWorkerConfig {
             worker_executable: None,
+            book_cover_env: BookCoverEnv::default(),
             load: LoadRequest {
                 model_path: "synthetic model.gguf".into(),
                 mmproj_path: "synthetic mmproj.gguf".into(),
@@ -607,7 +852,9 @@ mod tests {
         .unwrap();
         worker
             .commands
-            .send(CaptionWorkerCommand::Item(path.clone()))
+            .send(CaptionWorkerCommand::Item(CaptionTarget::Image(
+                path.clone(),
+            )))
             .unwrap();
         assert!(matches!(next(&worker), CaptionWorkerEvent::Started(_)));
         assert!(matches!(
@@ -620,7 +867,7 @@ mod tests {
         assert_eq!(row.keywords, ["binary"]);
         worker
             .commands
-            .send(CaptionWorkerCommand::Item(path))
+            .send(CaptionWorkerCommand::Item(CaptionTarget::Image(path)))
             .unwrap();
         assert!(matches!(
             next(&worker),
@@ -850,5 +1097,357 @@ mod tests {
             assert!(kill.is_killed());
             assert!(!client.is_usable());
         }
+    }
+    fn book_cover(source: &Path, cover_ref: &str) -> BookCover {
+        BookCover::Readable(ResolvedBookCover {
+            location: crate::thumb_loader::ReadLocation::File(source.to_owned()),
+            signature_path: source.to_owned(),
+            signature: FileSignature::from_metadata(&std::fs::metadata(source).unwrap()).unwrap(),
+            cover_ref: cover_ref.into(),
+            epub_read: None,
+            pdf_password: None,
+            preloaded_bytes: None,
+        })
+    }
+
+    #[test]
+    fn book_job_saves_folder_key_cover_signature_and_recreates_changed_cover() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path());
+        let db = CaptionDb::open_at(&config.caption_db_path).unwrap();
+        let source = image(temp.path());
+        let folder = temp.path();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut calls = 0;
+        let mut infer = |_, _, _, _| {
+            calls += 1;
+            Ok(ok_result())
+        };
+        let mut read = |cover: &ResolvedBookCover| decode_book_input(&config, None, cover, &cancel);
+        assert_eq!(
+            process_book_cover(
+                &config,
+                &db,
+                &cancel,
+                folder,
+                book_cover(&source, "synthetic.png"),
+                1,
+                &mut infer,
+                &mut read
+            )
+            .unwrap(),
+            CaptionItemOutcome::Created
+        );
+        let row = db.get(&folder.to_string_lossy()).unwrap().unwrap();
+        assert_eq!(row.cover_ref, "synthetic.png");
+        assert_eq!(
+            row.signature,
+            FileSignature::from_metadata(&std::fs::metadata(&source).unwrap()).unwrap()
+        );
+        assert_eq!(row.model_id, config.model_id);
+        assert_eq!(row.prompt_version, PROMPT_VERSION);
+        assert!(db.get(&source.to_string_lossy()).unwrap().is_none());
+        assert_eq!(
+            process_book_cover(
+                &config,
+                &db,
+                &cancel,
+                folder,
+                book_cover(&source, "synthetic.png"),
+                2,
+                &mut infer,
+                &mut |_| panic!("unchanged book decoded")
+            )
+            .unwrap(),
+            CaptionItemOutcome::AlreadyCreated
+        );
+        assert_eq!(
+            process_book_cover(
+                &config,
+                &db,
+                &cancel,
+                folder,
+                book_cover(&source, "different.png"),
+                3,
+                &mut infer,
+                &mut read
+            )
+            .unwrap(),
+            CaptionItemOutcome::Created
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(
+            db.get(&folder.to_string_lossy())
+                .unwrap()
+                .unwrap()
+                .cover_ref,
+            "different.png"
+        );
+    }
+
+    #[test]
+    fn book_job_uses_original_container_signature_not_converted_read_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path());
+        let db = CaptionDb::open_at(&config.caption_db_path).unwrap();
+        let original = temp.path().join("original.7z");
+        std::fs::write(&original, b"original archive").unwrap();
+        let source = image(temp.path());
+        let mut cover = match book_cover(&source, "#entry=normalized/001.png") {
+            BookCover::Readable(cover) => cover,
+            _ => unreachable!(),
+        };
+        cover.signature_path = original.clone();
+        cover.signature =
+            FileSignature::from_metadata(&std::fs::metadata(&original).unwrap()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = process_book_cover(
+            &config,
+            &db,
+            &cancel,
+            &original,
+            BookCover::Readable(cover),
+            1,
+            &mut |_, _, _, _| Ok(ok_result()),
+            &mut |cover| decode_book_input(&config, None, cover, &cancel),
+        )
+        .unwrap();
+        assert_eq!(result, CaptionItemOutcome::Created);
+        let row = db.get(&original.to_string_lossy()).unwrap().unwrap();
+        assert_eq!(row.cover_ref, "#entry=normalized/001.png");
+        assert_eq!(row.signature.size, 16);
+    }
+
+    #[test]
+    fn book_job_unreadable_unconverted_password_and_video_never_read_infer_or_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path());
+        let db = CaptionDb::open_at(&config.caption_db_path).unwrap();
+        let source = image(temp.path());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cases = [
+            (
+                BookCover::Unreadable(BookCoverFailure::Unconverted),
+                CaptionItemOutcome::Unconverted,
+            ),
+            (
+                BookCover::Unreadable(BookCoverFailure::PasswordRequired),
+                CaptionItemOutcome::PasswordRequired,
+            ),
+            (
+                BookCover::Unreadable(BookCoverFailure::Missing),
+                CaptionItemOutcome::Missing,
+            ),
+            (
+                BookCover::Unreadable(BookCoverFailure::ReadFailed),
+                CaptionItemOutcome::Failed,
+            ),
+            (
+                BookCover::VideoFrame {
+                    cover_ref: "movie.mp4#frame=10".into(),
+                    signature_path: source.clone(),
+                    signature: FileSignature::from_metadata(&std::fs::metadata(&source).unwrap())
+                        .unwrap(),
+                },
+                CaptionItemOutcome::VideoCover,
+            ),
+        ];
+        for (cover, expected) in cases {
+            assert_eq!(
+                process_book_cover(
+                    &config,
+                    &db,
+                    &cancel,
+                    temp.path(),
+                    cover,
+                    1,
+                    &mut |_, _, _, _| panic!("unreadable book inferred"),
+                    &mut |_| panic!("unreadable book decoded")
+                )
+                .unwrap(),
+                expected
+            );
+            assert!(db.get(&temp.path().to_string_lossy()).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn book_job_decode_failures_do_not_save_and_pdf_password_errors_are_classified() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path());
+        let db = CaptionDb::open_at(&config.caption_db_path).unwrap();
+        let source = image(temp.path());
+        let cancel = Arc::new(AtomicBool::new(false));
+        for message in [
+            "Password required",
+            "wrong password",
+            "page not found",
+            "PDF render failed",
+        ] {
+            let expected = if message.contains("assword") {
+                CaptionItemOutcome::PasswordRequired
+            } else {
+                CaptionItemOutcome::Failed
+            };
+            let result = process_book_cover(
+                &config,
+                &db,
+                &cancel,
+                temp.path(),
+                book_cover(&source, "book.pdf#page=3"),
+                1,
+                &mut |_, _, _, _| panic!("failed PDF inferred"),
+                &mut |_| Ok(Err(pdf_failure_outcome(&io::Error::other(message)))),
+            )
+            .unwrap();
+            assert_eq!(result, expected);
+            assert!(db.get(&temp.path().to_string_lossy()).unwrap().is_none());
+        }
+        std::fs::write(&source, b"invalid PNG").unwrap();
+        assert_eq!(
+            process_book_cover(
+                &config,
+                &db,
+                &cancel,
+                temp.path(),
+                book_cover(&source, "synthetic.png"),
+                2,
+                &mut |_, _, _, _| panic!("bad cover inferred"),
+                &mut |cover| decode_book_input(&config, None, cover, &cancel)
+            )
+            .unwrap(),
+            CaptionItemOutcome::Failed
+        );
+        assert!(db.get(&temp.path().to_string_lossy()).unwrap().is_none());
+    }
+
+    #[test]
+    fn book_job_cancel_after_read_and_inference_and_source_change_prevents_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path());
+        let db = CaptionDb::open_at(&config.caption_db_path).unwrap();
+        let source = image(temp.path());
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            process_book_cover(
+                &config,
+                &db,
+                &cancel,
+                temp.path(),
+                book_cover(&source, "synthetic.png"),
+                1,
+                &mut |_, _, _, _| panic!("cancelled read inferred"),
+                &mut |_| {
+                    cancel.store(true, Ordering::Release);
+                    Ok(Ok(image::RgbImage::new(1, 1)))
+                }
+            )
+            .unwrap(),
+            CaptionItemOutcome::Cancelled
+        );
+        cancel.store(false, Ordering::Release);
+        assert_eq!(
+            process_book_cover(
+                &config,
+                &db,
+                &cancel,
+                temp.path(),
+                book_cover(&source, "synthetic.png"),
+                2,
+                &mut |_, _, _, _| {
+                    cancel.store(true, Ordering::Release);
+                    Ok(ok_result())
+                },
+                &mut |cover| decode_book_input(&config, None, cover, &cancel)
+            )
+            .unwrap(),
+            CaptionItemOutcome::Cancelled
+        );
+        cancel.store(false, Ordering::Release);
+        assert_eq!(
+            process_book_cover(
+                &config,
+                &db,
+                &cancel,
+                temp.path(),
+                book_cover(&source, "synthetic.png"),
+                3,
+                &mut |_, _, _, _| {
+                    std::fs::write(&source, b"changed").unwrap();
+                    Ok(ok_result())
+                },
+                &mut |cover| decode_book_input(&config, None, cover, &cancel)
+            )
+            .unwrap(),
+            CaptionItemOutcome::Discarded
+        );
+        assert!(db.get(&temp.path().to_string_lossy()).unwrap().is_none());
+    }
+
+    #[test]
+    fn book_job_preloaded_archive_image_uses_entry_extension_and_ignores_rotation() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path());
+        let source = image(temp.path());
+        let rotation = RotationDb::open_at(&config.rotation_db_path).unwrap();
+        rotation.set(&source, Rotation::Cw90).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut cover = match book_cover(&source, "#entry=cover.png") {
+            BookCover::Readable(cover) => cover,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            decode_book_input(&config, Some(&rotation), &cover, &cancel)
+                .unwrap()
+                .unwrap()
+                .dimensions(),
+            (1, 2)
+        );
+        cover.location = crate::thumb_loader::ReadLocation::ArchiveEntry {
+            archive: temp.path().join("missing.zip"),
+            entry: "cover.png".into(),
+        };
+        cover.preloaded_bytes = Some(std::fs::read(&source).unwrap());
+        let rgb = decode_book_input(&config, Some(&rotation), &cover, &cancel)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rgb.dimensions(), (2, 1));
+        assert_eq!(rgb.into_raw(), [13, 10, 0, 26, 255, 128]);
+    }
+
+    #[test]
+    fn fake_book_job_resolves_folder_cover_and_saves_book_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = config(temp.path());
+        config.worker_executable = Some(fake_worker().to_owned());
+        let source = image(temp.path());
+        let worker = spawn_caption_worker(
+            config,
+            Arc::new(AtomicBool::new(false)),
+            egui::Context::default(),
+        )
+        .unwrap();
+        worker
+            .commands
+            .send(CaptionWorkerCommand::Item(CaptionTarget::Book {
+                path: temp.path().to_owned(),
+                kind: BookKind::Folder,
+            }))
+            .unwrap();
+        assert!(matches!(next(&worker), CaptionWorkerEvent::Started(_)));
+        assert!(matches!(
+            next(&worker),
+            CaptionWorkerEvent::ItemDone(CaptionItemOutcome::Created)
+        ));
+        let db = CaptionDb::open_at(temp.path().join("ai_caption.db")).unwrap();
+        let row = db.get(&temp.path().to_string_lossy()).unwrap().unwrap();
+        assert_eq!(row.cover_ref, "synthetic.png");
+        assert_eq!(row.caption, "0d0a001aff80");
+        assert!(db.get(&source.to_string_lossy()).unwrap().is_none());
+        worker.commands.send(CaptionWorkerCommand::Finish).unwrap();
+        assert!(matches!(
+            next(&worker),
+            CaptionWorkerEvent::Finished(Ok(()))
+        ));
     }
 }

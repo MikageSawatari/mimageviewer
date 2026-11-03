@@ -417,7 +417,7 @@ impl App {
         // Successful restores publish ledger entries incrementally below; they
         // do not require an authoritative ledger reload. Captions are shared
         // across viewer contexts and must still reflect the committed copies.
-        if report.store_mutations.captions_changed() {
+        if report.store_mutations.caption_display_stale() {
             self.caption_display.clear();
         }
 
@@ -929,7 +929,7 @@ mod tests {
                 app.content_identity_ledger_state,
                 crate::content_identity::ContentIdentityLedgerState::Ready,
             );
-            if mutation.captions_changed() {
+            if mutation.caption_display_stale() {
                 assert!(
                     !app.caption_display
                         .contains_for_test("c:/images/restored.jpg")

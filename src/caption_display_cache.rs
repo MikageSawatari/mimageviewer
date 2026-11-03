@@ -10,13 +10,52 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
 use crate::ai_caption_db::{CaptionDb, CaptionRow, FileSignature};
+use crate::app::book_cover::{BookCover, BookCoverEnv, BookKind, resolve_book_cover};
 
 const MAX_ENTRIES: usize = 512;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CaptionDisplayValue {
     pub row: Option<CaptionRow>,
-    pub current: Option<FileSignature>,
+    pub current: Option<CurrentCaptionSource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CurrentCaptionSource {
+    Image(FileSignature),
+    Book {
+        signature: FileSignature,
+        cover_ref: String,
+    },
+    VideoFrame {
+        signature: FileSignature,
+        cover_ref: String,
+    },
+}
+
+impl CurrentCaptionSource {
+    fn differs_from(&self, row: &CaptionRow) -> bool {
+        match self {
+            Self::Image(signature) => row.signature != *signature,
+            Self::Book {
+                signature,
+                cover_ref,
+            }
+            | Self::VideoFrame {
+                signature,
+                cover_ref,
+            } => row.signature != *signature || row.cover_ref != *cover_ref,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn signature_mut(&mut self) -> &mut FileSignature {
+        match self {
+            Self::Image(signature)
+            | Self::Book { signature, .. }
+            | Self::VideoFrame { signature, .. } => signature,
+        }
+    }
 }
 
 impl CaptionDisplayValue {
@@ -24,9 +63,18 @@ impl CaptionDisplayValue {
     pub fn is_stale(&self) -> bool {
         self.row
             .as_ref()
-            .zip(self.current)
-            .is_some_and(|(row, current)| row.signature != current)
+            .zip(self.current.as_ref())
+            .is_some_and(|(row, current)| current.differs_from(row))
     }
+
+    pub fn has_video_cover(&self) -> bool {
+        matches!(self.current, Some(CurrentCaptionSource::VideoFrame { .. }))
+    }
+}
+
+enum DisplaySource {
+    Image,
+    Book { kind: BookKind, env: BookCoverEnv },
 }
 
 enum Entry {
@@ -57,6 +105,7 @@ impl Entry {
 struct ReadRequest {
     key: String,
     path: PathBuf,
+    source: DisplaySource,
     epoch: u64,
     generation: u64,
     ctx: egui::Context,
@@ -85,7 +134,12 @@ impl Worker {
                 // Resolve the application data path on the worker as well.
                 let db_path = db_path.unwrap_or_else(CaptionDb::db_path);
                 while let Ok(request) = request_rx.recv() {
-                    let value = read_value(&db_path, &request.key, &request.path);
+                    let value = read_value_for_source(
+                        &db_path,
+                        &request.key,
+                        &request.path,
+                        &request.source,
+                    );
                     let result = ReadResult {
                         key: request.key,
                         epoch: request.epoch,
@@ -104,7 +158,17 @@ impl Worker {
     }
 }
 
+#[cfg(test)]
 fn read_value(db_path: &Path, key: &str, path: &Path) -> CaptionDisplayValue {
+    read_value_for_source(db_path, key, path, &DisplaySource::Image)
+}
+
+fn read_value_for_source(
+    db_path: &Path,
+    key: &str,
+    path: &Path,
+    source: &DisplaySource,
+) -> CaptionDisplayValue {
     let started = Instant::now();
     // Open anew for each request so a store first created by a job, or replaced
     // by an import, is observed. get() finishes its statement before stat().
@@ -119,10 +183,33 @@ fn read_value(db_path: &Path, key: &str, path: &Path) -> CaptionDisplayValue {
             (None, true)
         }
     };
-    let current = std::fs::metadata(path)
-        .ok()
-        .as_ref()
-        .and_then(FileSignature::from_metadata);
+    let current = match source {
+        DisplaySource::Image => std::fs::metadata(path)
+            .ok()
+            .as_ref()
+            .and_then(FileSignature::from_metadata)
+            .map(CurrentCaptionSource::Image),
+        // No saved row means there is nothing to compare. In particular, merely
+        // viewing an uncatalogued folder does not start a representative scan.
+        DisplaySource::Book { kind, env } if row.is_some() => {
+            match resolve_book_cover(path, *kind, env) {
+                BookCover::Readable(cover) => Some(CurrentCaptionSource::Book {
+                    signature: cover.signature,
+                    cover_ref: cover.cover_ref,
+                }),
+                BookCover::VideoFrame {
+                    signature,
+                    cover_ref,
+                    ..
+                } => Some(CurrentCaptionSource::VideoFrame {
+                    signature,
+                    cover_ref,
+                }),
+                BookCover::Unreadable(_) => None,
+            }
+        }
+        DisplaySource::Book { .. } => None,
+    };
     if crate::perf::is_enabled() {
         crate::perf::event(
             "ai",
@@ -173,6 +260,34 @@ impl CaptionDisplayCache {
         path: &Path,
         refresh: bool,
     ) -> Result<bool, String> {
+        self.request_source(ctx, key, path, refresh, DisplaySource::Image)
+    }
+
+    /// UI callers check demand before capturing the password/settings snapshot.
+    pub fn needs_request(&self, key: &str, refresh: bool) -> bool {
+        refresh || !self.entries.contains_key(key)
+    }
+
+    pub fn request_book(
+        &mut self,
+        ctx: &egui::Context,
+        key: &str,
+        path: &Path,
+        refresh: bool,
+        kind: BookKind,
+        env: BookCoverEnv,
+    ) -> Result<bool, String> {
+        self.request_source(ctx, key, path, refresh, DisplaySource::Book { kind, env })
+    }
+
+    fn request_source(
+        &mut self,
+        ctx: &egui::Context,
+        key: &str,
+        path: &Path,
+        refresh: bool,
+        source: DisplaySource,
+    ) -> Result<bool, String> {
         if self.entries.contains_key(key) {
             if !refresh {
                 return Ok(false);
@@ -196,6 +311,7 @@ impl CaptionDisplayCache {
         let request = ReadRequest {
             key: key.to_owned(),
             path: path.to_owned(),
+            source,
             epoch: self.epoch,
             generation,
             ctx: ctx.clone(),
@@ -341,7 +457,9 @@ mod tests {
         };
         CaptionDisplayValue {
             row: Some(row(signature)),
-            current: Some(signature),
+            current: Some(crate::caption_display_cache::CurrentCaptionSource::Image(
+                signature,
+            )),
         }
     }
 
@@ -555,18 +673,20 @@ mod tests {
     fn caption_display_stale_requires_a_row_and_an_available_different_signature() {
         let mut value = value();
         assert!(!value.is_stale());
-        value.current.as_mut().unwrap().size += 1;
+        value.current.as_mut().unwrap().signature_mut().size += 1;
         assert!(value.is_stale());
-        value.current = Some(value.row.as_ref().unwrap().signature);
-        value.current.as_mut().unwrap().mtime_ms += 1;
+        value.current = Some(CurrentCaptionSource::Image(
+            value.row.as_ref().unwrap().signature,
+        ));
+        value.current.as_mut().unwrap().signature_mut().mtime_ms += 1;
         assert!(value.is_stale());
         value.current = None;
         assert!(!value.is_stale());
         value.row = None;
-        value.current = Some(FileSignature {
+        value.current = Some(CurrentCaptionSource::Image(FileSignature {
             size: 1,
             mtime_ms: 2,
-        });
+        }));
         assert!(!value.is_stale());
     }
 
@@ -600,7 +720,9 @@ mod tests {
             cache.get("image"),
             Some(&CaptionDisplayValue {
                 row: None,
-                current: Some(signature)
+                current: Some(crate::caption_display_cache::CurrentCaptionSource::Image(
+                    signature
+                ))
             })
         );
         assert!(!cache.request(&ctx, "image", &path, false).unwrap());
@@ -682,5 +804,148 @@ mod tests {
             cache.get(&key).unwrap().row.as_ref().unwrap().caption,
             "更新後"
         );
+    }
+
+    #[test]
+    fn caption_book_display_worker_resolves_changed_pin_and_missing_book_without_rewriting_row() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource, FolderThumbPinDb};
+        use std::sync::Arc;
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("book");
+        std::fs::create_dir(&folder).unwrap();
+        let first = folder.join("a.png");
+        std::fs::write(&first, b"cover A").unwrap();
+        std::fs::write(folder.join("b.png"), b"cover B").unwrap();
+        let signature = FileSignature::from_metadata(&std::fs::metadata(&first).unwrap()).unwrap();
+        let db_path = tmp.path().join("ai_caption.db");
+        let db = CaptionDb::open_at(&db_path).unwrap();
+        db.save(&SaveRequest {
+            item_path: folder.clone(),
+            signature_path: first,
+            signature,
+            cover_ref: "a.png".into(),
+            model_id: "fixture".into(),
+            prompt_version: 1,
+            lang: "ja".into(),
+            result: CaptionResult::Ok {
+                caption: "saved book description".into(),
+                text: String::new(),
+                keywords: Vec::new(),
+            },
+        })
+        .unwrap();
+        let pins = Arc::new(FolderThumbPinDb::open_at(&tmp.path().join("pins.db")).unwrap());
+        let source = |rel: &str| FolderPinSource::File {
+            rel: rel.into(),
+            kind: FileKind::Image,
+        };
+        pins.set(&folder, &source("a.png")).unwrap();
+        let env = BookCoverEnv {
+            pin_db: Some(Arc::clone(&pins)),
+            ..Default::default()
+        };
+        let key = CaptionDb::normalize_path(&folder);
+        let ctx = egui::Context::default();
+        let mut cache = CaptionDisplayCache {
+            worker: Some(Worker::start(Some(db_path)).unwrap()),
+            ..Default::default()
+        };
+        cache
+            .request_book(&ctx, &key, &folder, false, BookKind::Folder, env.clone())
+            .unwrap();
+        receive_worker(&mut cache);
+        assert!(!cache.get(&key).unwrap().is_stale());
+        assert!(
+            !cache
+                .request_book(&ctx, &key, &folder, false, BookKind::Folder, env.clone())
+                .unwrap()
+        );
+        let original = db.get(&key).unwrap().unwrap();
+        pins.set(&folder, &source("b.png")).unwrap();
+        cache.clear();
+        cache
+            .request_book(&ctx, &key, &folder, false, BookKind::Folder, env.clone())
+            .unwrap();
+        receive_worker(&mut cache);
+        let value = cache.get(&key).unwrap();
+        assert!(value.is_stale());
+        assert!(
+            matches!(&value.current, Some(CurrentCaptionSource::Book { cover_ref, .. }) if cover_ref == "b.png")
+        );
+        assert_eq!(db.get(&key).unwrap(), Some(original.clone()));
+        std::fs::rename(&folder, tmp.path().join("removed-book")).unwrap();
+        cache
+            .request_book(&ctx, &key, &folder, true, BookKind::Folder, env)
+            .unwrap();
+        receive_worker(&mut cache);
+        let value = cache.get(&key).unwrap();
+        assert!(value.current.is_none());
+        assert!(!value.is_stale());
+        assert_eq!(value.row.as_ref(), Some(&original));
+    }
+
+    #[test]
+    fn caption_book_display_cover_identity_changes_even_when_file_signature_does_not() {
+        let mut value = value();
+        let row = value.row.as_mut().unwrap();
+        row.cover_ref = "#page=0".into();
+        value.current = Some(CurrentCaptionSource::Book {
+            signature: row.signature,
+            cover_ref: "#page=2".into(),
+        });
+        assert!(value.is_stale());
+        assert!(!value.has_video_cover());
+        value.current = Some(CurrentCaptionSource::VideoFrame {
+            signature: value.row.as_ref().unwrap().signature,
+            cover_ref: "clip.mp4#frame=3".into(),
+        });
+        assert!(value.is_stale());
+        assert!(value.has_video_cover());
+        value.current = None;
+        assert!(!value.is_stale());
+    }
+
+    #[test]
+    fn caption_book_display_invalidation_discards_pending_old_cover_result() {
+        let (mut cache, requests, results) = fake_cache();
+        let ctx = egui::Context::default();
+        let path = Path::new("book.zip");
+        cache
+            .request_book(
+                &ctx,
+                "book",
+                path,
+                false,
+                BookKind::Zip,
+                BookCoverEnv::default(),
+            )
+            .unwrap();
+        let old = requests.try_recv().unwrap();
+        cache.clear();
+        cache
+            .request_book(
+                &ctx,
+                "book",
+                path,
+                false,
+                BookKind::Zip,
+                BookCoverEnv::default(),
+            )
+            .unwrap();
+        let new = requests.try_recv().unwrap();
+        assert!(matches!(
+            new.source,
+            DisplaySource::Book {
+                kind: BookKind::Zip,
+                ..
+            }
+        ));
+        results.send(result(old, value())).unwrap();
+        assert!(!cache.poll());
+        results
+            .send(result(new, CaptionDisplayValue::default()))
+            .unwrap();
+        assert!(cache.poll());
+        assert_eq!(cache.get("book"), Some(&CaptionDisplayValue::default()));
     }
 }

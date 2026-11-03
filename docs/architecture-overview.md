@@ -570,7 +570,8 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `audio_normalize_db.rs` | 動画音量ノーマライズの per-file 測定値 (integrated LUFS / true peak / 算出ゲイン) の SQLite 永続化 |
 | `rating_db.rs` | レーティング (★1〜5) の SQLite 永続化 |
 | `ai_caption_db.rs` | ローカル AI 説明文の保存基盤。作成ジョブの保存役が worker thread 上で `BEGIN IMMEDIATE` 後に入力署名を照合し、成功／失敗の上書き規則を適用する。DB trigger が全体 revision と索引反映待ちを管理し、STORES 経由の改名・削除・復元にも適用する。表示 worker は DB を作らない読み取り専用 open を使う。検索接続は後段 |
-| `caption_display_cache.rs` | bundle外の共有 `CaptionDisplayCache`、最大512件の保持と `epoch`／`gen`、専用の単一read-only SELECT＋stat workerを持つ。Appがroot pollと書き手の完了採用点から接続する |
+| `caption_display_cache.rs` | bundle外の共有 `CaptionDisplayCache`、最大512件の保持と `epoch`／`gen`、専用の単一read-only SELECT＋画像署名／本の表紙照合workerを持つ。Appがroot pollと書き手・固定表紙の変更の採用点から接続する |
+| `app/book_cover.rs` | 本の AI 説明文用の表紙解決。既存の一覧計画・固定表紙・変換 cache 候補とサムネイルの2段の解決をworkerから呼び、読む位置・`cover_ref`・元ファイルの署名と世代leaseを返す。未変換・パスワード不足・動画の表紙を値で区別し、変換や入力画面は起動しない |
 | `vlm_addon.rs` / `vlm_addon_download.rs` | ローカル AI 説明文モデルの導入 (V1-3b)。固定配布一覧・安全な名前・分割と全体の SHA-256 を検証する。App の単一 owner が導入／取消／削除を完了通知まで排他にし、状態確認・HTTP・連結・配置・削除は worker 上だけで行う |
 | `ui_dialogs/vlm_addon.rs` | GPU 判定を必要時に一度だけ worker で実行し、設定ページへ cached view を渡す。初回の確認だけ modal、長い取得は modeless。取得成功時だけ操作時点の対象パスを作成ジョブへ一回渡す。設定からの導入だけではジョブを開始しない |
 | `mask_db.rs` | 消しゴムマスクの SQLite 永続化 (1bit/pixel deflate 圧縮 + ベクタオブジェクト JSON) |
@@ -586,11 +587,14 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `exif_reader.rs` | EXIF 読み取り (rexif)。構造タグの抑止と Exif 2.3x 拡張タグの日本語名マップを持つ |
 | `xmp_reader.rs` | XMP 読み取り (quick-xml)。`xtw:*` 名前空間のツイート情報を抽出し「XMP ツイート情報」パネルに表示 |
 
-#### ローカル AI 説明文の作成ジョブ (V1-3c)
+#### ローカル AI 説明文の作成ジョブ (V1-3c / V1-4b)
+
+本の表紙への拡張（V1-4b）は実装・検証中で、検収・実機確認は未完了。
 
 `App::caption_job` が全 viewport 共通の単一ジョブを所有する。右クリックから既存の選択規則で
 対象をパスへ凍結し、無選択・空白部分なら現在の一覧直下を対象にする。UI はファイルを読まず、
-実パスの画像だけを渡す。本・仮想ページ・動画・音声は対象外として数える（本の表紙は V1-4）。
+`CaptionTarget` の画像または本を渡す。選択した ZIP・PDF・EPUB・書庫・フォルダは本の対象、
+無選択の直下対象は画像とファイルの本で、サブフォルダは含めない。仮想ページ・`ZipDir`・動画・音声は対象外として数える。
 待ち行列・追加の受付・次の1件・ジョブの終了判断も App に集約し、worker が空キューを見て自律終了しない。
 状態は `Running` / `Stopping`。中止操作または最後の結果の採用で先に受付を閉じ、
 処理中の1件が無くなってから `Finish` を送る。worker 完了を非blocking poll で採用して初めて owner を解放する。
@@ -601,22 +605,37 @@ RGB8 → 別プロセスの推論 → 署名を再確認して保存、を1件�
 即時停止して join しない。detached を閉じてもジョブは続き、モデルの削除はジョブ終了まで受け付けない。
 詳細は [計画 §21.7.3](local-vlm-caption-plan.md#2173-v1-3c-作成ジョブ)。
 
-#### ローカル AI 説明文の表示 (V1-4a)
+本の `resolve_book_cover` は worker で既存の一覧計画・固定表紙・変換済み書庫の判定を使う。
+`thumb_loader` から cache 前の `prepare_load_request_stamp` と miss 後の
+`resolve_read_after_cache_miss` を切り出して共有し、一覧の計画は UI 側に残す。
+`ResolvedRead` は読む場所・選定証明・取得済み bytes・画像・子 WebP・寸法・署名を運び、
+EPUB は署名確定から描画まで同じ世代 lease を保持する。子の保存済み代表では固定の持ち主と
+解決済みの位置を残して、同じページを高解像度で読む。サムネイルの cache／取消／保存規約は変えない。
+本の作成済み判定は `cover_ref`・署名・モデル・プロンプト版の一致を必要とし、保存キーは元の本のパスとする。
+変換とパスワードのモーダルは起動せず、未変換・パスワード不足・動画の表紙・読み込み失敗を数える。
+詳細は [計画 §21.13](local-vlm-caption-plan.md#2113-v1-4b-の設計-2026-11-03)。
+
+#### ローカル AI 説明文の表示 (V1-4a / V1-4b)
 
 `App::caption_display: CaptionDisplayCache` は `ViewerContextBundle` の外に一つだけ置く。
-物理画像のキーごとに読み込み中／読み込み済みの行・現在のファイル署名を最大512件保持し、
+物理画像・本のキーごとに読み込み中／読み込み済みの行・現在の署名と表紙照合結果を最大512件保持し、
 全消去の `epoch` とキーごとの `gen` で古い結果を棄却する。上限超過は全消去し、LRUは持たない。
-専用の単一workerを必要時に起動し、1件のread-only SELECTとstatを行う。結果はrootの
+専用の単一workerを必要時に起動し、read-only SELECTと画像のstatまたは本の表紙解決を行う。結果はrootの
 `App::ui`で非blocking pollし、共通情報パネルの「AI 説明」欄に投影する。既存のcontext別
 メタデータcache／workerには追加しない。表示への再入場時も読み直し、完了までは既存の値を表示する。
 表示開始の判定はeguiのviewport＋panel IDごとの一時履歴（frame／key）で行い、bundleへ状態を足さない。
 
 作成ジョブの1件完了では結果によらずそのキーを消す。取り込み、STORESの付け替え・コピー・
 復元・削除・孤児整理、本への追記による直接削除はAppの完了採用点で全消去する。
-一覧の再読み込みでも全消去する。署名不一致は保存済みの文を残して「古い」と案内し、
-モデルがなくても表示できる。ZIP内画像・PDFページ・本の説明は対象外、本の表紙はV1-4b。
+一覧の再読み込みでも全消去する。固定表紙・動画固定表紙の変更／解除と、その DB 行が変わる取り込み・
+STORES でも全消去する。STORES の通知は `caption_display_stale` で3 DBの実変更を表す。
+署名または本の `cover_ref` の不一致は保存済みの文を残して「古い」と案内し、モデルがなくても表示できる。
+本は「この本」の★と同じ `physical_container_rating_key`（変換済み書庫は元パス）で
+「この本の AI 説明」に出す。表紙は表示開始時に一度だけ worker で解決し、読めないときは古いと警告しない。
+動画の表紙への変更は作り直しを案内せず、作成できない旨を出す。ZIP内画像・PDFページ個別の説明は対象外。
 detachedは既存の共通パネルを使い、述語・viewport・bundleの交換は変えない。Remoteの表示とIPCは対象外。
-詳細は [計画 §21.11.2](local-vlm-caption-plan.md#21112-v1-4a-画像の説明文の表示)。
+詳細は [画像の設計 §21.11.2](local-vlm-caption-plan.md#21112-v1-4a-画像の説明文の表示) と
+[本の設計 §21.13](local-vlm-caption-plan.md#2113-v1-4b-の設計-2026-11-03)。
 
 ### UI オーバーレイ / ダイアログ
 

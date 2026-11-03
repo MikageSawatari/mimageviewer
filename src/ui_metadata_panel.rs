@@ -37,12 +37,25 @@ impl CaptionPanelVisit {
 }
 
 fn caption_panel_visit(ctx: &egui::Context, key: Option<&str>) -> bool {
-    let id = egui::Id::unique(("caption_panel_visit", ctx.viewport_id()));
+    caption_panel_visit_source(ctx, "image", key)
+}
+
+fn caption_panel_visit_source(
+    ctx: &egui::Context,
+    source: &'static str,
+    key: Option<&str>,
+) -> bool {
+    let id = egui::Id::unique(("caption_panel_visit", source, ctx.viewport_id()));
     let frame = ctx.cumulative_frame_nr();
     ctx.data_mut(|data| {
         data.get_temp_mut_or_default::<CaptionPanelVisit>(id)
             .observe(key, frame)
     })
+}
+
+fn reset_caption_panel_visits(ctx: &egui::Context) {
+    caption_panel_visit(ctx, None);
+    caption_panel_visit_source(ctx, "book", None);
 }
 
 #[cfg(test)]
@@ -2264,7 +2277,7 @@ impl App {
         lock_effective: bool,
         seek_height: f32,
     ) -> bool {
-        caption_panel_visit(ctx, None);
+        reset_caption_panel_visits(ctx);
         let Some(content_rect) = self.begin_metadata_panel_frame(
             ui,
             ctx,
@@ -2274,7 +2287,7 @@ impl App {
             false,
             None,
         ) else {
-            caption_panel_visit(ctx, None);
+            reset_caption_panel_visits(ctx);
             return false;
         };
         let similar_feature_capability = self.similar_feature_capability();
@@ -2343,7 +2356,7 @@ impl App {
             tag_picker_open,
             navigator_exclusion,
         ) else {
-            caption_panel_visit(ctx, None);
+            reset_caption_panel_visits(ctx);
             return false;
         };
 
@@ -2492,7 +2505,7 @@ impl App {
                 }
 
                 if book_query_demanded {
-                    caption_panel_visit(ctx, None);
+                    reset_caption_panel_visits(ctx);
                     // 見開き中は**両方のページ**を見ている。片方だけ調べると、もう片方に
                     // 別バージョンがあっても気付けない。補正パネルが左右を切り替えるのは
                     // 編集が一度に 1 ページだからで、閲覧側にその制約はない。
@@ -2598,7 +2611,7 @@ impl App {
                 }
 
                 if self.fullscreen_tag_picker_open {
-                    caption_panel_visit(ctx, None);
+                    reset_caption_panel_visits(ctx);
                     draw_fullscreen_tag_picker_panel(
                         ui,
                         &tag_catalog,
@@ -2638,6 +2651,38 @@ impl App {
                 let caption_row = caption_display
                     .as_ref()
                     .and_then(|value| value.row.as_ref());
+                let book_target = (self.similar_panel.tab == MetadataPanelTab::Info)
+                    .then(|| self.current_caption_book_target())
+                    .flatten();
+                let book_refresh = caption_panel_visit_source(
+                    ctx,
+                    "book",
+                    book_target.as_ref().map(|(key, _, _)| key.as_str()),
+                );
+                let book_caption = book_target.and_then(|(key, path, kind)| {
+                    // Capturing passwords/settings is only needed for a new demand,
+                    // never for every continuous frame of the panel.
+                    if self.caption_display.needs_request(&key, book_refresh) {
+                        let env = self.book_cover_env();
+                        if let Err(error) = self.caption_display.request_book(
+                            ctx,
+                            &key,
+                            &path,
+                            book_refresh,
+                            kind,
+                            env,
+                        ) {
+                            self.show_feedback_warning(format!(
+                                "この本の AI 説明を読み込めませんでした: {error}"
+                            ));
+                        }
+                    }
+                    self.caption_display.get(&key).cloned()
+                });
+                let has_caption_row = caption_row.is_some()
+                    || book_caption
+                        .as_ref()
+                        .is_some_and(|value| value.row.is_some());
 
                 let show_rating = rating_idx.is_some() || container_rating.is_some();
                 if show_rating {
@@ -2658,7 +2703,7 @@ impl App {
                         || exif_info.is_some()
                         || sidecar_info.is_some()
                         || current_palette.is_some()
-                        || caption_row.is_some()
+                        || has_caption_row
                     {
                         ui.add_space(8.0);
                         ui.separator();
@@ -2686,12 +2731,26 @@ impl App {
                         || exif_info.is_some()
                         || sidecar_info.is_some()
                         || current_palette.is_some()
-                        || caption_row.is_some()
+                        || has_caption_row
                     {
                         ui.add_space(8.0);
                         ui.separator();
                         ui.add_space(8.0);
                     }
+                }
+
+                if let Some(ref caption) = book_caption
+                    && draw_book_caption_section(ui, ctx, caption)
+                    && (current_palette.is_some()
+                        || caption_row.is_some()
+                        || tweet_info.is_some()
+                        || ai_metadata.is_some()
+                        || exif_info.is_some()
+                        || sidecar_info.is_some())
+                {
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
                 }
 
                 // 画像色パレット
@@ -2784,7 +2843,7 @@ impl App {
                     && current_palette.is_none()
                     && rating_idx.is_none()
                     && container_rating.is_none()
-                    && caption_row.is_none()
+                    && !has_caption_row
                 {
                     draw_no_metadata(ui);
                 }
@@ -3038,6 +3097,34 @@ impl App {
             _ => return None,
         };
         Some((label, self.current_folder_rating()))
+    }
+
+    /// Same physical owner as the container stars, without filesystem queries.
+    /// Synthetic ZIP directories have no V1 caption storage key.
+    pub(crate) fn current_caption_book_target(
+        &self,
+    ) -> Option<(String, PathBuf, crate::app::book_cover::BookKind)> {
+        self.fullscreen_idx?;
+        if self.global_search.active {
+            return None;
+        }
+        let physical = self.physical_container_rating_key()?;
+        if physical.dir_prefix.is_some() {
+            return None;
+        }
+        use crate::app::book_cover::BookKind;
+        use crate::app::book_materialization::{BookScope, ProjectionRecipe};
+        let kind = match &self.projection_recipe {
+            ProjectionRecipe::Book(BookScope::Document(_)) => BookKind::Pdf,
+            ProjectionRecipe::Book(BookScope::Archive { .. }) => {
+                BookKind::for_path(&physical.source)
+            }
+            _ if self.zip_nav.is_some() => BookKind::for_path(&physical.source),
+            // The accepted folder recipe also covers directories whose name
+            // happens to end with .pdf/.zip. Classify without a UI-thread stat.
+            _ => BookKind::Folder,
+        };
+        Some((physical.key, physical.source, kind))
     }
 
     fn collect_fullscreen_tag_panel_rows(&mut self) -> Vec<TagPanelRow> {
@@ -5847,6 +5934,39 @@ fn draw_caption_section(
     ctx: &egui::Context,
     value: &crate::caption_display_cache::CaptionDisplayValue,
 ) -> bool {
+    draw_caption_section_with_kind(ui, ctx, value, false)
+}
+
+fn draw_book_caption_section(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    value: &crate::caption_display_cache::CaptionDisplayValue,
+) -> bool {
+    draw_caption_section_with_kind(ui, ctx, value, true)
+}
+
+fn caption_stale_message(
+    value: &crate::caption_display_cache::CaptionDisplayValue,
+    book: bool,
+) -> Option<&'static str> {
+    if !value.is_stale() {
+        return None;
+    }
+    Some(if !book {
+        "画像が変わっています。右クリックの『AI 説明文を作る』で作り直せます"
+    } else if value.has_video_cover() {
+        "表紙が変わっています。動画の表紙からは説明文を作れません"
+    } else {
+        "表紙が変わっています。右クリックの『AI 説明文を作る』で作り直せます"
+    })
+}
+
+fn draw_caption_section_with_kind(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    value: &crate::caption_display_cache::CaptionDisplayValue,
+    book: bool,
+) -> bool {
     let Some(row) = value.row.as_ref() else {
         return false;
     };
@@ -5857,10 +5977,14 @@ fn draw_caption_section(
         crate::os_theme::apply_dark_ui(ui);
         apply_metadata_panel_dark_widget_style(ui);
         ui.label(
-            egui::RichText::new("AI 説明")
-                .color(ui.visuals().text_color())
-                .size(16.0)
-                .strong(),
+            egui::RichText::new(if book {
+                "この本の AI 説明"
+            } else {
+                "AI 説明"
+            })
+            .color(ui.visuals().text_color())
+            .size(16.0)
+            .strong(),
         );
         ui.add_space(8.0);
         match row.status {
@@ -5874,7 +5998,11 @@ fn draw_caption_section(
                 draw_text_section(ui, ctx, "検索語", &row.keywords.join("、"));
             }
             crate::ai_caption_db::CaptionStatus::Failed => {
-                ui.label("この画像の説明文を作れませんでした");
+                ui.label(if book {
+                    "この本の説明文を作れませんでした"
+                } else {
+                    "この画像の説明文を作れませんでした"
+                });
             }
         }
         ui.add_space(8.0);
@@ -5885,12 +6013,9 @@ fn draw_caption_section(
                 .size(11.0),
         )
         .on_hover_text(&row.model_id);
-        if value.is_stale() {
+        if let Some(message) = caption_stale_message(value, book) {
             ui.add_space(8.0);
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                "画像が変わっています。右クリックの『AI 説明文を作る』で作り直せます",
-            );
+            ui.colored_label(ui.visuals().warn_fg_color, message);
         }
     });
     true
@@ -5919,7 +6044,7 @@ mod caption_panel_tests {
                 cover_ref: String::new(), status: CaptionStatus::Ok,
                 created_at: 1_793_665_800_000, rev: 1, indexed: false,
             }),
-            current: Some(signature),
+            current: Some(crate::caption_display_cache::CurrentCaptionSource::Image(signature)),
         }
     }
 
@@ -5936,9 +6061,18 @@ mod caption_panel_tests {
         theme: crate::os_theme::ResolvedTheme,
         contrast: crate::settings::TextContrast,
     ) -> egui_kittest::Harness<'static> {
+        section_harness(value, theme, contrast, false)
+    }
+
+    fn section_harness(
+        value: CaptionDisplayValue,
+        theme: crate::os_theme::ResolvedTheme,
+        contrast: crate::settings::TextContrast,
+        book: bool,
+    ) -> egui_kittest::Harness<'static> {
         let mut fonts_ready = false;
         crate::test_ui::builder()
-            .with_size(egui::vec2(340.0, 390.0))
+            .with_size(egui::vec2(340.0, if book { 430.0 } else { 390.0 }))
             .build_ui(move |root_ui| {
                 let ctx = &root_ui.ctx().clone();
                 crate::os_theme::apply_resolved_with_contrast(ctx, theme, contrast);
@@ -5959,7 +6093,7 @@ mod caption_panel_tests {
                         let parent_style = ui.style().clone();
                         let light_style = ctx.style_of(egui::Theme::Light);
                         let dark_style = ctx.style_of(egui::Theme::Dark);
-                        if !draw_caption_section(ui, ctx, &value) {
+                        if !draw_caption_section_with_kind(ui, ctx, &value, book) {
                             draw_no_metadata(ui);
                         }
                         assert_eq!(
@@ -5971,6 +6105,74 @@ mod caption_panel_tests {
                         assert_eq!(ctx.style_of(egui::Theme::Dark), dark_style);
                     });
             })
+    }
+
+    fn book_fixture(video: bool, stale: bool) -> CaptionDisplayValue {
+        use crate::caption_display_cache::CurrentCaptionSource;
+        let mut value = fixture();
+        let row = value.row.as_mut().unwrap();
+        row.cover_ref = "cover.png".into();
+        row.caption = "青い表紙に本の題名と著者名が書かれています。".into();
+        row.visible_text = "写真のある暮らし / 山田 花子".into();
+        let cover_ref = if stale { "other.png" } else { "cover.png" }.into();
+        value.current = Some(if video {
+            CurrentCaptionSource::VideoFrame {
+                signature: row.signature,
+                cover_ref: "movie.mp4#frame=2.5".into(),
+            }
+        } else {
+            CurrentCaptionSource::Book {
+                signature: row.signature,
+                cover_ref,
+            }
+        });
+        value
+    }
+
+    fn book_harness(value: CaptionDisplayValue) -> egui_kittest::Harness<'static> {
+        section_harness(
+            value,
+            crate::os_theme::ResolvedTheme::Light,
+            crate::settings::TextContrast::Standard,
+            true,
+        )
+    }
+
+    #[test]
+    fn caption_panel_book_snapshot_ok() {
+        let mut ui = book_harness(book_fixture(false, false));
+        ui.run();
+        ui.get_by_label("この本の AI 説明");
+        assert_eq!(ui.get_all_by_label("Copy").count(), 3);
+        ui.snapshot("caption_panel_book_ok");
+    }
+
+    #[test]
+    fn caption_panel_book_snapshot_changed_cover_keeps_text() {
+        let mut ui = book_harness(book_fixture(false, true));
+        ui.run();
+        ui.get_by_label("青い表紙に本の題名と著者名が書かれています。");
+        ui.get_by_label("表紙が変わっています。右クリックの『AI 説明文を作る』で作り直せます");
+        ui.snapshot("caption_panel_book_stale");
+    }
+
+    #[test]
+    fn caption_panel_book_snapshot_video_cover_does_not_offer_recreation() {
+        let value = book_fixture(true, true);
+        assert_eq!(
+            caption_stale_message(&value, true),
+            Some("表紙が変わっています。動画の表紙からは説明文を作れません")
+        );
+        let mut ui = book_harness(value);
+        ui.run();
+        ui.get_by_label("表紙が変わっています。動画の表紙からは説明文を作れません");
+        assert!(
+            ui.query_by_label(
+                "表紙が変わっています。右クリックの『AI 説明文を作る』で作り直せます"
+            )
+            .is_none()
+        );
+        ui.snapshot("caption_panel_book_video_cover");
     }
 
     #[test]
@@ -5998,7 +6200,7 @@ mod caption_panel_tests {
     #[test]
     fn caption_panel_snapshot_stale_keeps_description() {
         let mut value = fixture();
-        value.current.as_mut().unwrap().size += 1;
+        value.current.as_mut().unwrap().signature_mut().size += 1;
         let mut ui = harness(value);
         ui.run();
         ui.get_by_label("説明文");
@@ -6012,7 +6214,7 @@ mod caption_panel_tests {
         name: &str,
     ) {
         let mut value = fixture();
-        value.current.as_mut().unwrap().size += 1;
+        value.current.as_mut().unwrap().signature_mut().size += 1;
         let mut ui = themed_harness(value, theme, contrast);
         ui.run();
         ui.snapshot(name);
@@ -6077,7 +6279,7 @@ mod caption_panel_tests {
                 for status in [CaptionStatus::Ok, CaptionStatus::Failed] {
                     let mut value = fixture();
                     value.row.as_mut().unwrap().status = status;
-                    value.current.as_mut().unwrap().size += 1;
+                    value.current.as_mut().unwrap().signature_mut().size += 1;
                     let mut ui = themed_harness(value, theme, contrast);
                     ui.run();
                     let dark = crate::os_theme::dark_visuals(contrast);
@@ -6144,6 +6346,18 @@ mod caption_panel_tests {
         let mut sibling = CaptionPanelVisit::default();
         assert!(sibling.observe(Some("b"), 1));
         assert!(!visit.observe(Some("a"), 1));
+    }
+
+    #[test]
+    fn caption_panel_book_visit_is_independent_of_page_and_resets_with_panel() {
+        let ctx = egui::Context::default();
+        assert!(caption_panel_visit_source(&ctx, "book", Some("book")));
+        assert!(caption_panel_visit(&ctx, Some("page-a")));
+        assert!(caption_panel_visit(&ctx, Some("page-b")));
+        assert!(!caption_panel_visit_source(&ctx, "book", Some("book")));
+        reset_caption_panel_visits(&ctx);
+        assert!(caption_panel_visit_source(&ctx, "book", Some("book")));
+        assert!(caption_panel_visit(&ctx, Some("page-b")));
     }
 }
 

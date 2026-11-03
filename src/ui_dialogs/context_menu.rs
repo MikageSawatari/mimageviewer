@@ -3409,7 +3409,10 @@ mod caption_menu_tests {
                 app.vlm_setup
                     .captured_caption_targets_for_test()
                     .unwrap()
-                    .paths,
+                    .paths
+                    .iter()
+                    .map(|target| target.path().to_path_buf())
+                    .collect::<Vec<_>>(),
                 expected
             );
         }

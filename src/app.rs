@@ -586,6 +586,7 @@ mod page_param_writes;
 #[cfg(test)]
 mod rar_archive_cache_tests;
 pub(crate) use facet_navigation::{FacetNavigationState, FacetRoute, FacetScope};
+pub(crate) mod book_cover;
 pub(crate) mod book_materialization;
 pub(crate) mod book_preferred_rating;
 use book_preferred_rating::{ContainerRatingTarget, ContainerRatingToast};
@@ -7390,7 +7391,7 @@ fn thumbnail_keep_projection(
     }
 }
 
-fn resolve_converted_archive_candidate(
+pub(crate) fn resolve_converted_archive_candidate(
     candidate: &ConvertedArchiveCandidate,
     db: Option<&crate::archive_cache::ArchiveCacheDb>,
     cancel: &AtomicBool,
@@ -40167,26 +40168,12 @@ impl App {
     /// 「保存しない」を選んだ PDF を開けなくなる。開く経路と外部ツールの実体化が
     /// **同じ順序**で解決するよう、綴りは 1 か所に置く (Codex Sol 指摘 #10)。
     pub(crate) fn pdf_open_password(&self, pdf_path: &Path) -> Option<String> {
-        if !pdf_path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| crate::folder_tree::is_pdf_extension(&ext.to_ascii_lowercase()))
-        {
-            return None;
-        }
-        // A validated password from the current PDF session wins over an older saved value.
-        // New destinations still consult their per-file saved value first below.
-        if self
-            .current_folder
-            .as_ref()
-            .is_some_and(|current| crate::folder_tree::path_eq(current, pdf_path))
-            && let Some(password) = &self.pdf_current_password
-        {
-            return Some(password.clone());
-        }
-        self.pdf_passwords
-            .get(pdf_path)
-            .or_else(|| self.pdf_current_password.clone())
+        crate::pdf_passwords::pdf_open_password(
+            &self.pdf_passwords,
+            self.current_folder.as_deref(),
+            self.pdf_current_password.as_deref(),
+            pdf_path,
+        )
     }
 
     pub fn load_pdf_as_folder(&mut self, pdf_path: PathBuf) {
@@ -45608,6 +45595,7 @@ impl App {
         };
         match db.set(container, &source) {
             Ok(()) => {
+                self.caption_display.clear();
                 self.invalidate_converted_archive_pin_root_states();
                 let key = crate::path_key::normalize_keep_drive(container);
                 self.folder_pin_map.insert(key, source);
@@ -45640,6 +45628,7 @@ impl App {
         };
         match db.remove(container) {
             Ok(()) => {
+                self.caption_display.clear();
                 self.invalidate_converted_archive_pin_root_states();
                 let key = crate::path_key::normalize_keep_drive(container);
                 self.folder_pin_map.remove(&key);
@@ -48799,7 +48788,7 @@ impl App {
         changed: crate::metadata_transfer::ImportChangedSections,
     ) -> (Vec<String>, bool) {
         // DB writes have committed even if a context needs another terminal refresh.
-        if changed.ai_captions {
+        if changed.ai_captions || changed.thumbnail_pins {
             self.caption_display.clear();
         }
         #[cfg(windows)]

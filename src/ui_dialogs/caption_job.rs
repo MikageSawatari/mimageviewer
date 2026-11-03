@@ -9,9 +9,10 @@ use std::sync::mpsc;
 use eframe::egui;
 
 use crate::ai::caption_job_worker::{
-    CaptionItemOutcome, CaptionWorker, CaptionWorkerCommand, CaptionWorkerConfig,
+    CaptionItemOutcome, CaptionTarget, CaptionWorker, CaptionWorkerCommand, CaptionWorkerConfig,
     CaptionWorkerEvent, spawn_caption_worker,
 };
+use crate::app::book_cover::BookKind;
 use crate::app::{ActionSurface, App};
 use crate::feedback::FeedbackKind;
 use crate::grid_item::GridItem;
@@ -22,14 +23,14 @@ const STOPPING_MESSAGE: &str = "前のジョブを終えています。終わっ
 /// Unsupported items need no file reads, but remain in the final/progress counts.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CaptionTargets {
-    pub paths: Vec<PathBuf>,
+    pub paths: Vec<CaptionTarget>,
     pub unsupported: usize,
 }
 
 impl From<Vec<PathBuf>> for CaptionTargets {
     fn from(paths: Vec<PathBuf>) -> Self {
         Self {
-            paths,
+            paths: paths.into_iter().map(CaptionTarget::Image).collect(),
             unsupported: 0,
         }
     }
@@ -49,14 +50,17 @@ struct CaptionProgress {
     already_created: usize,
     unsupported: usize,
     missing: usize,
+    unconverted: usize,
+    password_required: usize,
+    video_cover: usize,
     failed: usize,
     discarded: usize,
 }
 
 pub(crate) struct CaptionJob {
     state: JobState,
-    queue: VecDeque<PathBuf>,
-    current: Option<PathBuf>,
+    queue: VecDeque<CaptionTarget>,
+    current: Option<CaptionTarget>,
     progress: Arc<CaptionProgress>,
     cancel: Arc<AtomicBool>,
     worker: CaptionWorker,
@@ -65,7 +69,10 @@ pub(crate) struct CaptionJob {
 impl CaptionJob {
     #[cfg(test)]
     pub(super) fn queued_paths_for_test(&self) -> Vec<PathBuf> {
-        self.queue.iter().cloned().collect()
+        self.queue
+            .iter()
+            .map(|target| target.path().to_owned())
+            .collect()
     }
 
     pub(super) fn new(worker: CaptionWorker, cancel: Arc<AtomicBool>) -> Self {
@@ -90,13 +97,13 @@ impl CaptionJob {
         let mut seen: HashSet<_> = self
             .queue
             .iter()
-            .map(|path| crate::path_key::normalize_keep_drive(path))
+            .map(|target| crate::path_key::normalize_keep_drive(target.path()))
             .collect();
-        for path in targets.paths {
-            if !seen.insert(crate::path_key::normalize_keep_drive(&path)) {
+        for target in targets.paths {
+            if !seen.insert(crate::path_key::normalize_keep_drive(target.path())) {
                 continue;
             }
-            self.queue.push_back(path);
+            self.queue.push_back(target);
             progress.total += 1;
         }
         true
@@ -137,7 +144,9 @@ impl CaptionJob {
     ) -> Result<(), String> {
         // Every outcome rechecks this path. Failed inference may retain an older ok row.
         if let Some(path) = self.current.take() {
-            display.invalidate(&crate::ai_caption_db::CaptionDb::normalize_path(&path));
+            display.invalidate(&crate::ai_caption_db::CaptionDb::normalize_path(
+                path.path(),
+            ));
         }
         let progress = Arc::make_mut(&mut self.progress);
         progress.done += 1;
@@ -145,6 +154,12 @@ impl CaptionJob {
             CaptionItemOutcome::Created => progress.created += 1,
             CaptionItemOutcome::AlreadyCreated => progress.already_created += 1,
             CaptionItemOutcome::Missing => progress.missing += 1,
+            CaptionItemOutcome::Unconverted => progress.unconverted += 1,
+            CaptionItemOutcome::PasswordRequired => progress.password_required += 1,
+            CaptionItemOutcome::VideoCover => {
+                progress.unsupported += 1;
+                progress.video_cover += 1;
+            }
             CaptionItemOutcome::Failed => progress.failed += 1,
             CaptionItemOutcome::Discarded => progress.discarded += 1,
             CaptionItemOutcome::Cancelled => {}
@@ -159,10 +174,22 @@ impl CaptionJob {
         } else {
             "作成が終わりました"
         };
-        format!(
-            "AI 説明文の{completion} (作成 {}、作成済み {}、対象外 {}、ファイルなし {}、失敗 {}、変更により破棄 {})",
-            p.created, p.already_created, p.unsupported, p.missing, p.failed, p.discarded,
-        )
+        let mut summary = format!(
+            "AI 説明文の{completion} (作成 {}、作成済み {}、対象外 {} (動画の表紙 {})、ファイルなし {}、未変換 {}、パスワードが必要 {}、読めなかった・失敗 {}、変更により破棄 {})",
+            p.created,
+            p.already_created,
+            p.unsupported,
+            p.video_cover,
+            p.missing,
+            p.unconverted,
+            p.password_required,
+            p.failed,
+            p.discarded,
+        );
+        if p.unconverted != 0 {
+            summary.push_str("。未変換の本は一度開いて変換すると作れます");
+        }
+        summary
     }
 }
 
@@ -198,13 +225,31 @@ fn collect_caption_targets(
                 continue;
             }
         }
-        match item {
-            GridItem::Image(path) => {
-                if seen.insert(crate::path_key::normalize_keep_drive(path)) {
-                    targets.paths.push(path.clone());
-                }
+        let target = match item {
+            GridItem::Image(path) => CaptionTarget::Image(path.clone()),
+            GridItem::ZipFile(path) => CaptionTarget::Book {
+                path: path.clone(),
+                kind: BookKind::Zip,
+            },
+            GridItem::PdfFile(path) => CaptionTarget::Book {
+                path: path.clone(),
+                kind: BookKind::Pdf,
+            },
+            GridItem::ConvertibleArchive { path, format } => CaptionTarget::Book {
+                path: path.clone(),
+                kind: BookKind::Archive(*format),
+            },
+            GridItem::Folder(path) => CaptionTarget::Book {
+                path: path.clone(),
+                kind: BookKind::Folder,
+            },
+            _ => {
+                targets.unsupported += 1;
+                continue;
             }
-            _ => targets.unsupported += 1,
+        };
+        if seen.insert(crate::path_key::normalize_keep_drive(target.path())) {
+            targets.paths.push(target);
         }
     }
     targets
@@ -225,7 +270,7 @@ fn collect_folder_caption_targets(
     let mut seen: HashSet<_> = targets
         .paths
         .iter()
-        .map(|path| crate::path_key::normalize_keep_drive(path))
+        .map(|target| crate::path_key::normalize_keep_drive(target.path()))
         .collect();
     for member in stack.groups.iter().flat_map(|group| &group.members) {
         if !member.is_video
@@ -235,7 +280,9 @@ fn collect_folder_caption_targets(
                 .is_some_and(|parent| same_path(parent, folder))
             && seen.insert(crate::path_key::normalize_keep_drive(&member.path))
         {
-            targets.paths.push(member.path.clone());
+            targets
+                .paths
+                .push(CaptionTarget::Image(member.path.clone()));
         }
     }
     targets
@@ -276,7 +323,7 @@ impl App {
         if targets.paths.is_empty() {
             self.show_feedback_result(
                 format!(
-                    "AI 説明文を作れる画像がありません (対象外 {})",
+                    "AI 説明文を作れる画像や本がありません (対象外 {})",
                     targets.unsupported
                 ),
                 FeedbackKind::Info,
@@ -372,7 +419,12 @@ impl App {
         let Some(job) = self.caption_job.as_mut() else {
             return;
         };
-        if draw_caption_progress(ctx, &job.progress, job.current.as_deref(), job.state) {
+        if draw_caption_progress(
+            ctx,
+            &job.progress,
+            job.current.as_ref().map(CaptionTarget::path),
+            job.state,
+        ) {
             job.stop();
         }
     }
@@ -405,11 +457,15 @@ fn draw_caption_progress(
                 .truncate(),
             );
             ui.label(format!(
-                "飛ばした数: 作成済み {} / 対象外 {} / ファイルなし {}",
-                progress.already_created, progress.unsupported, progress.missing
+                "作成済み {} / 対象外 {} (動画の表紙 {})",
+                progress.already_created, progress.unsupported, progress.video_cover
             ));
             ui.label(format!(
-                "失敗 {} / 変更により破棄 {}",
+                "ファイルなし {} / 未変換 {} / パスワードが必要 {}",
+                progress.missing, progress.unconverted, progress.password_required
+            ));
+            ui.label(format!(
+                "読めなかった・失敗 {} / 変更により破棄 {}",
                 progress.failed, progress.discarded
             ));
             ui.horizontal(|ui| {
@@ -441,7 +497,9 @@ mod tests {
 
     fn assert_item(commands: &mpsc::Receiver<CaptionWorkerCommand>, expected: &str) {
         match commands.try_recv().unwrap() {
-            CaptionWorkerCommand::Item(path) => assert!(same_path(&path, Path::new(expected))),
+            CaptionWorkerCommand::Item(path) => {
+                assert!(same_path(path.path(), Path::new(expected)))
+            }
             CaptionWorkerCommand::Finish => panic!("premature Finish"),
         }
     }
@@ -452,6 +510,9 @@ mod tests {
             CaptionItemOutcome::Created,
             CaptionItemOutcome::AlreadyCreated,
             CaptionItemOutcome::Missing,
+            CaptionItemOutcome::Unconverted,
+            CaptionItemOutcome::PasswordRequired,
+            CaptionItemOutcome::VideoCover,
             CaptionItemOutcome::Failed,
             CaptionItemOutcome::Discarded,
             CaptionItemOutcome::Cancelled,
@@ -484,7 +545,13 @@ mod tests {
     fn caption_job_additions_before_and_after_result_keep_fifo_without_duplicates() {
         let (mut job, commands, _) = job();
         assert!(
-            job.append(vec![PathBuf::from("C:/images/a.png"), "C:/images/b.png".into()].into())
+            job.append(
+                vec![
+                    PathBuf::from("C:/images/a.png"),
+                    PathBuf::from("C:/images/b.png")
+                ]
+                .into()
+            )
         );
         job.advance().unwrap();
         assert_item(&commands, "C:/images/a.png");
@@ -593,12 +660,15 @@ mod tests {
         app.checked = [0, 1].into_iter().collect();
         assert_eq!(
             app.caption_targets(false).paths,
-            vec![PathBuf::from("C:/images/a.png"), "C:/images/b.png".into()]
+            vec![
+                CaptionTarget::Image("C:/images/a.png".into()),
+                CaptionTarget::Image("C:/images/b.png".into())
+            ]
         );
         app.checked = [0, 2].into_iter().collect();
         assert_eq!(
             app.caption_targets(false).paths,
-            vec![PathBuf::from("C:/images/b.png")]
+            vec![CaptionTarget::Image("C:/images/b.png".into())]
         );
         app.selected = None;
         app.checked.clear();
@@ -608,13 +678,24 @@ mod tests {
     }
 
     #[test]
-    fn caption_job_targets_only_real_images_and_direct_children_without_io() {
+    fn caption_job_targets_images_selected_books_and_direct_file_books_without_io() {
         let items = vec![
             GridItem::Image("C:/images/a.png".into()),
             GridItem::Image("C:/images/sub/child.png".into()),
             GridItem::Folder("C:/images/sub".into()),
             GridItem::ZipFile("C:/images/book.zip".into()),
             GridItem::PdfFile("C:/images/book.pdf".into()),
+            GridItem::PdfFile("C:/images/book.epub".into()),
+            GridItem::ConvertibleArchive {
+                path: "C:/images/book.7z".into(),
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+            },
+            GridItem::ZipDir {
+                zip_path: "C:/images/book.zip".into(),
+                dir_prefix: "sub/".into(),
+                is_archive: false,
+                representative: None,
+            },
             GridItem::ZipImage {
                 zip_path: "C:/images/book.zip".into(),
                 entry_name: "p.png".into(),
@@ -628,12 +709,47 @@ mod tests {
             GridItem::Audio("C:/images/audio.mp3".into()),
         ];
         let selected = collect_caption_targets(&items, 0..items.len(), None);
-        assert_eq!(selected.paths.len(), 2);
-        assert_eq!(selected.unsupported, 7);
+        assert_eq!(selected.paths.len(), 7);
+        assert_eq!(selected.unsupported, 5);
+        assert_eq!(
+            selected.paths[2],
+            CaptionTarget::Book {
+                path: "C:/images/sub".into(),
+                kind: BookKind::Folder
+            }
+        );
+        assert_eq!(
+            selected.paths[6],
+            CaptionTarget::Book {
+                path: "C:/images/book.7z".into(),
+                kind: BookKind::Archive(crate::archive_converter::ArchiveFormat::SevenZ)
+            }
+        );
         let background =
             collect_caption_targets(&items, 0..items.len(), Some(Path::new("C:/images")));
-        assert_eq!(background.paths, vec![PathBuf::from("C:/images/a.png")]);
-        assert_eq!(background.unsupported, 2);
+        assert_eq!(
+            background.paths,
+            vec![
+                CaptionTarget::Image("C:/images/a.png".into()),
+                CaptionTarget::Book {
+                    path: "C:/images/book.zip".into(),
+                    kind: BookKind::Zip
+                },
+                CaptionTarget::Book {
+                    path: "C:/images/book.pdf".into(),
+                    kind: BookKind::Pdf
+                },
+                CaptionTarget::Book {
+                    path: "C:/images/book.epub".into(),
+                    kind: BookKind::Pdf
+                },
+                CaptionTarget::Book {
+                    path: "C:/images/book.7z".into(),
+                    kind: BookKind::Archive(crate::archive_converter::ArchiveFormat::SevenZ)
+                },
+            ]
+        );
+        assert_eq!(background.unsupported, 0);
     }
 
     fn stack_fixture() -> crate::filename_stack::StackView {
@@ -679,11 +795,11 @@ mod tests {
             targets
                 .paths
                 .iter()
-                .map(|p| crate::path_key::normalize_keep_drive(p))
+                .map(|target| crate::path_key::normalize_keep_drive(target.path()))
                 .collect()
         };
-        assert_eq!(plain.paths.len(), 3);
-        assert_eq!(plain.unsupported, 1);
+        assert_eq!(plain.paths.len(), 4);
+        assert_eq!(plain.unsupported, 0);
         app.items = view.materialize_aggregated().0;
         app.stack_view = Some(Arc::new(view));
         for background in [false, true] {
@@ -741,6 +857,72 @@ mod tests {
             commands.try_recv(),
             Ok(CaptionWorkerCommand::Finish)
         ));
+    }
+
+    #[test]
+    fn caption_job_book_dedup_uses_path_across_target_kinds_and_cancel_retains_lifecycle() {
+        let (mut job, commands, _) = job();
+        let book = CaptionTarget::Book {
+            path: "C:/books/a.zip".into(),
+            kind: BookKind::Zip,
+        };
+        job.append(CaptionTargets {
+            paths: vec![book.clone(), CaptionTarget::Image("c:/books/A.zip".into())],
+            unsupported: 0,
+        });
+        assert_eq!(job.queue.len(), 1);
+        job.advance().unwrap();
+        assert!(
+            matches!(commands.try_recv().unwrap(), CaptionWorkerCommand::Item(target) if target == book)
+        );
+        job.append(CaptionTargets {
+            paths: vec![book.clone(), book],
+            unsupported: 0,
+        });
+        assert_eq!(job.queue.len(), 1);
+        assert_eq!(job.progress.total, 2);
+        job.stop();
+        assert!(job.current.is_some());
+        assert!(job.queue.is_empty());
+        assert!(!job.append(vec!["late.png".into()].into()));
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        job.item_done(CaptionItemOutcome::Cancelled, &mut Default::default())
+            .unwrap();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(CaptionWorkerCommand::Finish)
+        ));
+    }
+
+    #[test]
+    fn caption_job_book_outcomes_have_separate_counts_and_conversion_guidance() {
+        let (mut job, commands, _) = job();
+        job.append(vec!["one.7z".into(), "two.pdf".into(), "three.zip".into()].into());
+        job.advance().unwrap();
+        for outcome in [
+            CaptionItemOutcome::Unconverted,
+            CaptionItemOutcome::PasswordRequired,
+            CaptionItemOutcome::VideoCover,
+        ] {
+            assert!(matches!(
+                commands.try_recv(),
+                Ok(CaptionWorkerCommand::Item(_))
+            ));
+            job.item_done(outcome, &mut Default::default()).unwrap();
+        }
+        assert_eq!(job.progress.unconverted, 1);
+        assert_eq!(job.progress.password_required, 1);
+        assert_eq!(job.progress.unsupported, 1);
+        assert_eq!(job.progress.video_cover, 1);
+        assert_eq!(job.progress.done, 3);
+        assert!(job.summary().contains("一度開いて変換すると作れます"));
+        assert!(job.summary().contains("動画の表紙 1"));
+        assert!(job.summary().contains("パスワードが必要 1"));
+        let (job, _, _) = self::job();
+        assert!(!job.summary().contains("一度開いて変換すると作れます"));
     }
 
     #[test]

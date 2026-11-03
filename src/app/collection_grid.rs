@@ -4109,7 +4109,9 @@ mod tests {
         wait_for_caption(&mut app);
         assert_eq!(
             app.caption_display.get(&key).unwrap().current,
-            Some(original)
+            Some(crate::caption_display_cache::CurrentCaptionSource::Image(
+                original
+            ))
         );
         assert_eq!(
             app.caption_display
@@ -4174,7 +4176,12 @@ mod tests {
             let value = owner.caption_display.get(&key).unwrap();
             assert!(value.is_stale());
             assert_eq!(value.row.as_ref().unwrap().caption, "original caption");
-            assert_ne!(value.current, Some(original));
+            assert_ne!(
+                value.current,
+                Some(crate::caption_display_cache::CurrentCaptionSource::Image(
+                    original
+                ))
+            );
             assert!(
                 !owner
                     .caption_display

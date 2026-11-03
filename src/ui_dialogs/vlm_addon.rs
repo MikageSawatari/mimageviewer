@@ -278,6 +278,7 @@ impl App {
         };
         let config = crate::ai::caption_job_worker::CaptionWorkerConfig {
             worker_executable: None,
+            book_cover_env: self.book_cover_env(),
             model_id: model_id.clone(),
             load: crate::ai::vlm_worker::LoadRequest {
                 model_path: model_path.clone(),
@@ -677,6 +678,23 @@ mod tests {
         assert_eq!(setup.installed(true), None);
         assert_eq!(setup.dialog, Some(Dialog::Cancelled));
         setup.dialog = None; // Window close already discarded pending targets.
+        assert_eq!(setup.installed(false), None);
+    }
+
+    #[test]
+    fn vlm_setup_retains_book_kind_and_unsupported_count_through_install() {
+        use crate::ai::caption_job_worker::CaptionTarget;
+        use crate::app::book_cover::BookKind;
+        let targets = CaptionTargets {
+            paths: vec![CaptionTarget::Book {
+                path: "captured-before-navigation.epub".into(),
+                kind: BookKind::Pdf,
+            }],
+            unsupported: 3,
+        };
+        let mut setup = VlmSetup::default();
+        setup.dialog = Some(Dialog::Running(targets.clone()));
+        assert_eq!(setup.installed(false), Some(targets));
         assert_eq!(setup.installed(false), None);
     }
 

@@ -1923,3 +1923,82 @@ P2 5 件・P3 1 件。§21.13 に足した: 解決を cache の参照の前後�
 
 20 回目の 6 件はすべて閉じた。新しい P3 1 件: 今の表紙が動画のフレームのときに「作り直せます」と案内しない (§21.13.3 の 3 に反映)。
 P3 1 件の文言の修正なので、V1-4b の設計のレビューはここで閉じる。
+
+### 21.14 V1-4b の実装記録（2026-11-03、検収・実機確認待ち）
+
+- 着手時は `vlm-caption` / `528f1186a`、作業ツリーは clean。§21.13 を正本として既存経路を照合した。
+  一覧の計画作成・固定表紙の UI 経路は移さず、検索・MCP・変換の開始・パスワードの問い合わせは追加していない。
+- 最初に `thumb_loader` の前段 `prepare_load_request_stamp` と後段 `resolve_read_after_cache_miss` だけを切り出した。
+  EPUB の同じ lease、cache 前後の順序、CacheOnly の終端、取消／request 相関、既存の保存位置を保持する。
+  `ResolvedRead` で選定証明・取得済み ZIP bytes・子の WebP／画像／寸法・有効な署名を後段へ渡す。
+  切り出しだけの状態を確認してから、本の実装を始めた。
+- 先行検証は通常 feature / offline で、サムネイル・固定表紙・archive cache・ZIP・RAR・EPUB の279件が全成功
+  （run `59c67adc-3017-4562-a39f-2a5b8c06c095`、compile 7分05秒、実行17.812秒、
+  `target/vlm-book-extraction-tests.log`）。実 RAR／変換済み ZIP・ChildCached mirror の bytes／寸法／proof と
+  App の pin／変換書庫経路を追加した66件も全成功（run `040327ac-aa11-4d83-a382-5b789a64db3c`、27.205秒、
+  `target/vlm-book-extraction-additional.log`）。親キーを残した4 strategy と動画 seed miss の追加1件も成功
+  （run `8e9dec01-1ab3-41a4-9243-88d7e8da89c8`、0.710秒、`target/vlm-book-extraction-pin-dispatch.log`）。
+  別 context のコード確認担当からは、切り出し範囲の追加停止理由なしとの報告を受けた。全体の検収とは区別する。
+- `app/book_cover.rs` に worker 用の `BookCoverEnv`／`resolve_book_cover` を追加した。既存の計画・pin・変換済み判定を使い、
+  ChildCached が採った固定表紙の持ち主と解決済み位置を保持する。AutoSelected の fallback 行へ pin の位置を誤って付けない。
+  変換済み ZIP の実エントリ名、元の本／フォルダの実採用ファイルの署名、EPUB 世代の元ファイルのミリ秒署名を返す。
+  署名は読み取り前に捕捉し、保存側の既存再確認で並行変更を捨てる。
+- `pdf_open_password` を App 非依存 helper に切り出し、元の優先順を App と worker で共用する。
+  PDF の固定ページ不存在を解決時に検証しながら認証不足を別集計できるよう、内部結果に `PasswordRequired` を持たせた。
+  列挙と描画は同じ ReadTarget／password を使う。未変換・動画の表紙・読めない表紙は行を書かない。
+- 待ち行列を `CaptionTarget::Image`／`Book` へ拡張し、既存の `Running`／`Stopping` と受付／Finish の境界を保持する。
+  フォルダは明示選択時だけ、選択なしの直下対象は画像とファイルの本。スタックの保持メンバー規則と ZipDir の除外を保つ。
+  本の作成済み判定は cover_ref／署名／model／prompt の一致を要求し、通常ファイルの表紙だけ回転 DB を適用する。
+- 共有表示 cache は既存の epoch／gen を使い、今の入力を画像／本／動画の表紙の一つの enum で保持する。
+  本の行がある場合に worker で表紙を一度解決する。UI は需要がある時だけ環境を捕捉し、毎フレーム複製しない。
+  情報パネルに「この本の AI 説明」を追加し、キーは `physical_container_rating_key` と一致させる。
+  種類は受理済みの Document／Archive／フォルダの状態から決め、拡張子付きのフォルダを UI の stat で判別しない。
+  動画の表紙の警告では作り直しを案内しない。detached 述語／viewport 経路／bundle は変更していない（§11 記録も更新）。
+- 固定表紙 set／remove と動画 pin の成功点、取り込みの thumbnail_pins を共有 cache の全消去へ接続した。
+  `StoreMutationEffects::caption_display_stale` は ai_caption／folder_thumb_pins／video_pins の実変更を表す。
+  通常のサムネイル選定・保存データ形式や caption DB schema の変更はない。まれな失敗は既定どおりログと既存の通知／件数に留める。
+- マニュアル（一覧・情報パネル・設定）、製品ページと privacy（日英）、architecture／async／display／virtual-folders／
+  UI responsiveness／spec を更新した。自動検証・snapshot・確認用 build の結果は下へ追記する。
+- 全体の別 context のコード確認で、AutoSelected fallback の子の行がさらに子の PDF 固定表紙を採った場合、
+  proof の leaf PDF から選び直すと固定した3ページ目が先頭へ戻る P2 が報告された。
+  `CachedChildSelection` に元の行の子コンテナを常に残し、pin が無い行もその子の本の規則から解決し直す。
+  `A/B.pdf/C/book.pdf`（B.pdf は実フォルダ）の非表示 ZIP pin の fallback と C の固定 page2 を含む実キャッシュ連鎖で、
+  読むページと既存 WebP／proof／provenance／stamp 不変の回帰を追加した。
+  確認担当からは該当経路の修正後に追加指摘なしとの報告を受けた。設計の検収・実行結果とは区別する。
+- 本機能の初回 focused（通常 feature / offline / snapshot 更新指定）は、テストコードの型追従3件で compile が exit101。
+  `collection_grid` の旧 FileSignature 比較2件を新しい型へ揃え、ジョブの既存 FIFO テスト1件の
+  `Vec<CaptionTarget>.into()` を既存の `From<Vec<PathBuf>>` で受ける形へ戻した。
+  追加の From 実装や製品動作の変更は行わず、テストは未実行のまま修正後の focused を開始した。
+  初回ログは `target/vlm-book-focused.log`。この試行をテスト成功の証拠には含めない。
+- 修正後 focused は compile 成功（9分51秒）、144件中143成功／1失敗、実行6.383秒。
+  run `d78e10f8-5c93-41b8-a39e-d75f5d4866cd`、`target/vlm-book-focused-fixed.log`。
+  失敗は新規フォルダ順序テストが FileName を文字列順と誤って期待したものだった。
+  既存の Windows に近い名前順では `2.jpg` が `10.jpg` より先で、製品コードの変更は不要。
+  名前順の期待値を直し、別の勝者を選ぶ検査は FileTimes で日時を固定した DateDesc にした。
+  NumericDesc はフォルダの許容順ではなく FileName へ正規化されるため、その中間修正案は使わない。
+  143件の成功を再利用し、最終の日時 fixture を別に実行して確認する。
+- snapshot は本の成功／表紙変更／動画表紙の3枚（新規111,010 bytes）と進捗小窓1枚（更新29,675 bytes）、
+  計140,685 bytes。共通の純粋描画と本体フォントを使い、App や実ウィンドウは起動しない。
+  実装担当と別 context の確認担当が4枚をそれぞれ目視し、本文・Copy・作成日・警告・中止ボタンに
+  欠け・重なり・豆腐がないことを確認した。最終順序 fixture の静的確認でも追加指摘なしの報告を受けた。
+- 関連範囲の拡大（通常 feature / offline / snapshot 更新指定なし）は719件中718成功／1失敗、35.600秒。
+  run `1e84d375-1387-4c2e-b59e-1b1b60cd03ef`、`target/vlm-book-regression.log`。
+  サムネイル／folder pins／archive cache・converter／ZIP・RAR・EPUB／変換済み書庫／STORES key migration／
+  メタ情報取り込み／content identity／filename stack／本の評価キーと、説明文パネル・進捗の通常snapshot比較を含む。
+  失敗は上記順序テストの中間修正（NumericDesc が FileName へ正規化される）のままコンパイルされた1件だけ。
+  その718件と先の143件の成功は製品コードが同一なので再利用する。
+- 最終の FileName／固定日時 DateDesc／深さを検査する1件は、通常 feature / offline で単独実行して成功（0.211秒）。
+  run `db40c3c5-570e-477c-ba43-8a46619a9717`、`target/vlm-book-folder-sort-final.log`。
+  これにより focused 144件と関連719件の必要な確認を揃えた。重複する件数を合算したり、単一実行で全成功した結果とはしない。
+  本体lib全件は依頼どおり設計担当へ残し、実行していない。
+- `cargo fmt --check`、UI glyph 検査（0件）、サイトカード検査（50件・超過0）、`git diff --check` は成功。
+  通常 feature の `scripts/build-dev.ps1 -PreserveRuntime` は `CARGO_NET_OFFLINE=true` で成功した。
+  core は5分30秒、remote／EPUB PDF worker／MCP adapter のビルド・配置も成功し、VC runtime PE 検査は `runtime=4 pe=4`。
+  ビルド手順と成果物は `target/vlm-book-build-dev.log`、検査は `target/vcrt-pe-reports/dev-runtime.json` に記録されている。
+  成果物は `target/dev-runtime/mimageviewer-core.exe`（通常設定用、portable feature なし）。
+  最後に引数なしの `cargo fmt` を実行する。
+- 実モデル／実機の確認、本体lib全件、設計担当の検収は未完了として引き継ぐ。
+  利用者の確認は、本の作成と表示、表紙の変更後の警告、未変換／パスワード不足／動画表紙の集計を対象とする。
+  通常の検証用 core は `%APPDATA%\mimageviewer` を使い設定・データを更新し得るため、利用者が起動する前に
+  インストール版／tray 常駐版を閉じる（single-instance mutex を共有）。エージェントは起動しない。
+  製品バイナリの起動・外部通信・`G:\home\vlm-eval` の読み込み・コミットは行っていない。

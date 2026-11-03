@@ -309,6 +309,17 @@ egui pass を続けても `SurfaceAbsent` となり screenshot と表示更新�
 
 `thumb_loader.rs::process_load_request`:
 
+V1-4b では読み込み先の解決を次の2段へ切り出し、本の AI 説明文と共有する
+（実装・検証中、検収・実機確認は未完了）。`prepare_load_request_stamp` は cache 参照前に
+EPUB の世代と有効な署名を確定し、`resolve_read_after_cache_miss` は cache miss 後に
+フォルダ・ZipDir の代表と ZIP/RAR の先頭画像を決める。`CacheOnly` は後段へ進まず、
+元ソースを開かない。編集 preview／catalog の優先順、取消・終了位置、保存条件は変えない。
+
+後段の `ResolvedRead` は `ReadLocation` だけでなく、`FolderSelectionProof`、取得済み bytes・
+画像・寸法、子の保存済み WebP と寸法、有効な署名も読み込み・保存段へ運ぶ。
+取得済み bytes は読み直さず、選定証明も従来どおり保存する。EPUB の前段で得た
+`ReadTarget` lease は、署名確定から描画完了まで同じ世代を保持する。
+
 ```
 1. 編集済みページでは `edit_preview_cache.db` の対応表を先に確認
    ├─ ヒット (`source_policy != SourceOnly`): 最大辺 2048px の edit-result 下地 WebP (q=90) と
@@ -445,8 +456,8 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
    ヒット時は表示速度を優先して毎回の再スキャンは行わないが、cache key には
    自動選定アルゴリズム版・sort・depth を含めるため、番号順ロジックや設定が
    変わったときは自然にミスして再スキャンされる。キャッシュミス時の Folder
-   自動選定は、グリッドのブロック順に揃えて「サブフォルダ (folder_thumb_sort 順) →
-   直接画像 (sort 順)」で候補を辿る。途中の子フォルダに非 Image の代表 pin がある場合は、
+   自動選定は、まず直下の画像を `folder_thumb_sort` 順に探し、無ければ子フォルダと
+   子の本の保存済み代表を設定順で辿る。途中の子フォルダに非 Image の代表 pin がある場合は、
    子が直上一覧で既に生成した完全一致 WebP だけを読み取り専用で再利用する。WebP が無い・
    stale・破損の場合は PDF/ZIP/動画を生成せず、そのまま従来の画像候補探索を続ける。
    再利用した WebP は `ThumbLoadOrigin::FinalCache` として UI へ渡し、idle

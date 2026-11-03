@@ -268,3 +268,100 @@ fn caption_metadata_import_stale_refresh_still_clears_committed_captions() {
     assert!(stale);
     assert_display_cleared(&app, epoch);
 }
+
+#[test]
+fn caption_thumbnail_pin_import_and_store_effects_invalidate_all_viewer_values() {
+    let mut app = setup_app_for_test();
+    let epoch = seed_display(&mut app);
+    app.apply_metadata_import_terminal_refresh(
+        metadata_refresh(Vec::new()),
+        crate::metadata_transfer::ImportChangedSections {
+            thumbnail_pins: true,
+            ..Default::default()
+        },
+    );
+    assert_display_cleared(&app, epoch);
+    for file in ["folder_thumb_pins.db", "video_pins.db"] {
+        let descriptor = crate::rename_key_migration::STORES
+            .iter()
+            .find(|store| store.file == file)
+            .unwrap();
+        let mut effects = StoreMutationEffects::default();
+        effects.record_rows_changed(descriptor, 1);
+        let epoch = seed_display(&mut app);
+        app.apply_content_identity_store_mutations(effects);
+        assert_display_cleared(&app, epoch);
+    }
+}
+
+#[test]
+fn caption_folder_pin_set_and_remove_clear_at_database_mutation_boundary() {
+    use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("book");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("cover.png"), b"cover").unwrap();
+    let epoch = seed_display(&mut app);
+    assert!(app.set_folder_thumb_pin(
+        &folder,
+        FolderPinSource::File {
+            rel: "cover.png".into(),
+            kind: FileKind::Image
+        }
+    ));
+    assert_display_cleared(&app, epoch);
+    // The ZIP caller can consume the thumbnail dirty marker immediately;
+    // invalidation must already have happened inside the writer itself.
+    app.folder_thumb_pin_dirty.clear();
+    let epoch = seed_display(&mut app);
+    assert!(app.remove_folder_thumb_pin(&folder));
+    assert_display_cleared(&app, epoch);
+}
+
+#[test]
+fn caption_book_panel_key_matches_saved_key_and_physical_stars_for_converted_archive() {
+    use crate::app::book_cover::BookKind;
+    let mut app = setup_app_for_test();
+    app.fullscreen_idx = Some(0);
+    let folder = app.tmp.path().join("folder-book");
+    app.current_folder = Some(folder.clone());
+    let (key, path, kind) = app.current_caption_book_target().unwrap();
+    assert_eq!(
+        key,
+        crate::ai_caption_db::CaptionDb::normalize_path(&folder)
+    );
+    assert_eq!(key, app.physical_container_rating_key().unwrap().key);
+    assert_eq!(path, folder);
+    assert_eq!(kind, BookKind::Folder);
+    app.current_folder = Some(app.tmp.path().join("folder.pdf"));
+    assert_eq!(
+        app.current_caption_book_target().unwrap().2,
+        BookKind::Folder
+    );
+
+    let original = app.tmp.path().join("original.7z");
+    let converted = app.tmp.path().join("cached.zip");
+    app.current_folder = Some(converted.clone());
+    app.archive_source_override = Some(original.clone());
+    app.zip_nav = Some(crate::zip_tree::ZipNavState::new(std::sync::Arc::new(
+        crate::zip_tree::ZipTree::build(
+            converted,
+            vec![crate::zip_loader::ZipImageEntry {
+                entry_name: "cover.png".into(),
+                uncompressed_size: 1,
+                mtime: 0,
+                container_ancestry: Vec::new(),
+            }],
+        ),
+    )));
+    let (key, path, kind) = app.current_caption_book_target().unwrap();
+    assert_eq!(path, original);
+    assert_eq!(key, crate::ai_caption_db::CaptionDb::normalize_path(&path));
+    assert_eq!(key, app.physical_container_rating_key().unwrap().key);
+    assert_eq!(
+        kind,
+        BookKind::Archive(crate::archive_converter::ArchiveFormat::SevenZ)
+    );
+    app.fullscreen_idx = None;
+    assert!(app.current_caption_book_target().is_none());
+}

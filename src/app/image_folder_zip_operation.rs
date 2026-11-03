@@ -563,7 +563,7 @@ impl App {
                     };
                     // Folder ZIP uses its own chunked source adoption, rather
                     // than apply_metadata_import_terminal_refresh.
-                    if changed.ai_captions {
+                    if changed.ai_captions || changed.thumbnail_pins {
                         self.caption_display.clear();
                     }
                     let mut requests = if matches!(op.exit, Exit::None) {

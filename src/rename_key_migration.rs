@@ -244,7 +244,7 @@ pub struct RenameMigrationReport {
 pub struct StoreMutationEffects {
     content_identity_index_stale: bool,
     book_composition_changed: bool,
-    captions_changed: bool,
+    caption_display_stale: bool,
 }
 
 impl StoreMutationEffects {
@@ -252,7 +252,7 @@ impl StoreMutationEffects {
         Self {
             content_identity_index_stale: true,
             book_composition_changed: false,
-            captions_changed: false,
+            caption_display_stale: false,
         }
     }
 
@@ -268,21 +268,24 @@ impl StoreMutationEffects {
     pub(crate) fn record_rows_changed(&mut self, descriptor: &StoreDescriptor, rows: usize) {
         self.record_completed(descriptor);
         self.book_composition_changed |= descriptor.file == "book_composition.db" && rows > 0;
-        self.captions_changed |= descriptor.file == "ai_caption.db" && rows > 0;
+        self.caption_display_stale |= matches!(
+            descriptor.file,
+            "ai_caption.db" | "folder_thumb_pins.db" | "video_pins.db"
+        ) && rows > 0;
     }
 
     pub(crate) fn book_composition_changed(self) -> bool {
         self.book_composition_changed
     }
 
-    pub(crate) fn captions_changed(self) -> bool {
-        self.captions_changed
+    pub(crate) fn caption_display_stale(self) -> bool {
+        self.caption_display_stale
     }
 
     pub(crate) fn merge(&mut self, other: Self) {
         self.content_identity_index_stale |= other.content_identity_index_stale;
         self.book_composition_changed |= other.book_composition_changed;
-        self.captions_changed |= other.captions_changed;
+        self.caption_display_stale |= other.caption_display_stale;
     }
 
     pub(crate) fn content_identity_index_stale(self) -> bool {
@@ -3285,18 +3288,27 @@ mod tests {
             .find(|store| store.file == "rating.db")
             .unwrap();
         let mut effects = StoreMutationEffects::default();
-        assert!(!effects.captions_changed());
+        assert!(!effects.caption_display_stale());
         effects.record_completed(caption);
         effects.record_rows_changed(caption, 0);
         effects.record_rows_changed(other, 1);
-        assert!(!effects.captions_changed());
+        assert!(!effects.caption_display_stale());
         let mut changed = StoreMutationEffects::default();
         changed.record_rows_changed(caption, 1);
-        assert!(changed.captions_changed());
+        assert!(changed.caption_display_stale());
         effects.merge(changed);
         effects.merge(StoreMutationEffects::default());
-        assert!(effects.captions_changed());
-        assert!(!StoreMutationEffects::for_content_identity_index_stale().captions_changed());
+        assert!(effects.caption_display_stale());
+        assert!(!StoreMutationEffects::for_content_identity_index_stale().caption_display_stale());
+        for file in ["folder_thumb_pins.db", "video_pins.db"] {
+            for descriptor in STORES.iter().filter(|store| store.file == file) {
+                let mut effects = StoreMutationEffects::default();
+                effects.record_rows_changed(descriptor, 0);
+                assert!(!effects.caption_display_stale());
+                effects.record_rows_changed(descriptor, 1);
+                assert!(effects.caption_display_stale(), "{file}");
+            }
+        }
     }
 
     #[test]
@@ -3330,7 +3342,7 @@ mod tests {
         );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.rows, 1);
-        assert!(report.store_mutations.captions_changed());
+        assert!(report.store_mutations.caption_display_stale());
         let copied_state = caption_state(&connection, &copied_key);
         assert_eq!(copied_state.0, "source caption");
         assert!(copied_state.1 > source_rev);
@@ -3339,7 +3351,7 @@ mod tests {
 
         let report = run_at(dir.path(), copied, moved);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
-        assert!(report.store_mutations.captions_changed());
+        assert!(report.store_mutations.caption_display_stale());
         let moved_state = caption_state(&connection, &moved_key);
         assert_eq!(moved_state.0, "source caption");
         assert!(moved_state.1 > copied_state.1);
@@ -3356,7 +3368,7 @@ mod tests {
         let report = purge_removed_paths_at(dir.path(), &[moved.to_path_buf()], &[]);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.rows, 1);
-        assert!(report.store_mutations.captions_changed());
+        assert!(report.store_mutations.caption_display_stale());
         let tombstone_rev: i64 = connection
             .query_row(
                 "SELECT MAX(rev) FROM caption_removed WHERE item_key = ?1",
@@ -3374,13 +3386,13 @@ mod tests {
             &[StoreCopyPathMapping::exact(missing, untouched)],
         );
         assert!(no_copy.errors.is_empty(), "{:?}", no_copy.errors);
-        assert!(!no_copy.store_mutations.captions_changed());
+        assert!(!no_copy.store_mutations.caption_display_stale());
         let no_rename = run_at(dir.path(), missing, untouched);
         assert!(no_rename.errors.is_empty(), "{:?}", no_rename.errors);
-        assert!(!no_rename.store_mutations.captions_changed());
+        assert!(!no_rename.store_mutations.caption_display_stale());
         let no_purge = purge_removed_paths_at(dir.path(), &[moved.to_path_buf()], &[]);
         assert!(no_purge.errors.is_empty(), "{:?}", no_purge.errors);
-        assert!(!no_purge.store_mutations.captions_changed());
+        assert!(!no_purge.store_mutations.caption_display_stale());
     }
 
     #[test]
@@ -3406,7 +3418,7 @@ mod tests {
             &guard,
         );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
-        assert!(report.store_mutations.captions_changed());
+        assert!(report.store_mutations.caption_display_stale());
         assert_eq!(caption_state(&connection, &a_key).0, "B");
         assert_eq!(caption_state(&connection, &b_key).0, "A");
         for (key, old_rev) in [(&a_key, a_rev), (&b_key, b_rev)] {
@@ -3425,7 +3437,7 @@ mod tests {
         }
         let report = migrate_book_paths_at(dir.path(), &[], &[(a, b)], &guard);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
-        assert!(report.store_mutations.captions_changed());
+        assert!(report.store_mutations.caption_display_stale());
         let count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM captions WHERE item_key = ?1",
@@ -3446,7 +3458,7 @@ mod tests {
         ] {
             let report = migrate_book_paths_at(dir.path(), &moves, &copies, &guard);
             assert!(report.errors.is_empty(), "{:?}", report.errors);
-            assert!(!report.store_mutations.captions_changed());
+            assert!(!report.store_mutations.caption_display_stale());
         }
     }
 
@@ -3491,7 +3503,7 @@ mod tests {
         };
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.deleted_total(), 1);
-        assert!(report.store_mutations.captions_changed());
+        assert!(report.store_mutations.caption_display_stale());
         assert_eq!(caption_state(&connection, &existing_key).0, "keep");
         // Cleanup intentionally excludes the managed bookshelf, even when a
         // physical page has disappeared. Captions follow the same safety rule.
@@ -3527,7 +3539,7 @@ mod tests {
             panic!("cleanup delete expected");
         };
         assert!(report.errors.is_empty(), "{:?}", report.errors);
-        assert!(!report.store_mutations.captions_changed());
+        assert!(!report.store_mutations.caption_display_stale());
     }
 
     #[test]
