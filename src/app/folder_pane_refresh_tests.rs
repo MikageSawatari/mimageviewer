@@ -59,6 +59,243 @@ fn tree_scrolls(ctx: &egui::Context) -> usize {
         .unwrap_or_default()
 }
 
+fn assert_tree_cursor_visible(app: &App, ctx: &egui::Context, expected: &Path) {
+    assert!(
+        app.folder_pane
+            .visible_rows()
+            .iter()
+            .any(|row| row.path == expected && row.is_cursor),
+        "expected cursor: {expected:?}"
+    );
+    let rect = ctx
+        .data(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::unique(("folder_pane_test_row_rect", expected)))
+        })
+        .unwrap();
+    let viewport = ctx
+        .data(|data| data.get_temp::<egui::Rect>(egui::Id::unique("folder_pane_test_viewport")))
+        .unwrap();
+    assert!(
+        rect.top() >= viewport.top() && rect.bottom() <= viewport.bottom(),
+        "{rect:?} / {viewport:?}"
+    );
+}
+
+fn folder_pane_late_location(initial: &str, from_key: bool, other_drive: bool) {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    let root = app.tmp.path().join("late-tree");
+    let active = root.join("z-branch").join("z-current");
+    std::fs::create_dir_all(&active).unwrap();
+    for i in 0..80 {
+        std::fs::create_dir(root.join(format!("a-{i:03}"))).unwrap();
+    }
+    app.folder_pane.test_scan_subtree(root.clone());
+    let actual_drive = active.ancestors().last().unwrap().to_path_buf();
+    let fallback = if other_drive {
+        if actual_drive == Path::new(r"C:\") {
+            PathBuf::from(r"G:\")
+        } else {
+            PathBuf::from(r"C:\")
+        }
+    } else {
+        actual_drive
+    };
+    app.folder_pane.test_set_default_drive(Some(fallback));
+    app.items_are_drive_list = false;
+    app.current_folder = match initial {
+        "zip" => Some(root.join("book.zip")),
+        "pdf" => Some(root.join("book.pdf")),
+        "search" => Some(search_results_synthetic_path()),
+        _ => None,
+    };
+    app.settings.folder_tree_pane_visible = false;
+    let mut frame = 0;
+    if from_key {
+        tree_frame(&mut app, &ctx, &mut frame, true);
+    } else {
+        app.set_folder_tree_pane_visible(true);
+    }
+    for _ in 0..4 {
+        tree_frame(&mut app, &ctx, &mut frame, false);
+    }
+    assert!(app.settings.folder_tree_pane_visible && app.folder_pane.has_focus);
+    app.current_folder = Some(active.clone());
+    assert_tree_location(&mut app, &ctx, &mut frame, &active);
+}
+
+#[test]
+fn folder_pane_late_active_menu_same_drive_is_revealed() {
+    folder_pane_late_location("none", false, false);
+}
+#[test]
+fn folder_pane_late_active_key_other_drive_is_revealed() {
+    folder_pane_late_location("none", true, true);
+}
+#[test]
+fn folder_pane_late_active_menu_other_drive_is_revealed() {
+    folder_pane_late_location("none", false, true);
+}
+#[test]
+fn folder_pane_late_active_key_same_drive_is_revealed() {
+    folder_pane_late_location("none", true, false);
+}
+#[test]
+fn folder_pane_search_to_physical_tracks_location() {
+    folder_pane_late_location("search", false, false);
+}
+#[test]
+fn folder_pane_zip_to_physical_tracks_location() {
+    folder_pane_late_location("zip", false, false);
+}
+#[test]
+fn folder_pane_pdf_to_physical_tracks_location() {
+    folder_pane_late_location("pdf", true, false);
+}
+
+#[test]
+fn folder_pane_explicit_arrow_then_active_change_and_grid_focus_keeps_f_commit() {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    let root = app.tmp.path().join("manual-tree");
+    let a = root.join("a");
+    let b = root.join("b");
+    let c = root.join("c");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    std::fs::create_dir(&c).unwrap();
+    app.folder_pane.test_scan_subtree(root.clone());
+    app.current_folder = Some(a.clone());
+    app.items_are_drive_list = false;
+    app.set_folder_tree_pane_visible(true);
+    let mut frame = 0;
+    assert_tree_location(&mut app, &ctx, &mut frame, &a);
+    tree_event_frame(
+        &mut app,
+        &ctx,
+        &mut frame,
+        vec![egui::Event::Key {
+            key: egui::Key::ArrowDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    // Keep the same ancestor expanded, so this checks selection ownership
+    // independently of the existing automatic-branch replacement behavior.
+    app.current_folder = Some(c);
+    settle_tree_scans(&mut app, &ctx, &mut frame);
+    assert_tree_cursor_visible(&app, &ctx, &b);
+    app.folder_pane.set_focus_grid();
+    tree_frame(&mut app, &ctx, &mut frame, false);
+    assert_tree_cursor_visible(&app, &ctx, &b);
+    tree_frame(&mut app, &ctx, &mut frame, true);
+    assert!(!app.settings.folder_tree_pane_visible);
+    assert_eq!(
+        app.folder_pane_open_pending
+            .as_ref()
+            .map(|pending| &pending.path),
+        Some(&b),
+        "F must still commit the explicit cursor after grid focus"
+    );
+}
+
+fn pane_scroll_state(ctx: &egui::Context) -> egui::scroll_area::State {
+    ctx.data(|data| data.get_temp(egui::Id::unique("folder_pane_test_scroll_state")))
+        .unwrap()
+}
+
+#[test]
+fn folder_pane_drag_inertia_then_arrow_reveal_stays_visible() {
+    for (key, index, pending) in [
+        (egui::Key::ArrowUp, 149, false),
+        (egui::Key::ArrowDown, 151, true),
+    ] {
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let root = app.tmp.path().join("inertia-tree");
+        std::fs::create_dir(&root).unwrap();
+        for i in 0..300 {
+            std::fs::create_dir(root.join(format!("row-{i:03}"))).unwrap();
+        }
+        let active = root.join("row-150");
+        app.current_folder = Some(active.clone());
+        app.items_are_drive_list = false;
+        app.folder_pane.test_scan_subtree(root.clone());
+        app.set_folder_tree_pane_visible(true);
+        let mut frame = 0;
+        assert_tree_location(&mut app, &ctx, &mut frame, &active);
+        let release = pending.then(|| {
+            let release = app.folder_pane.test_hold_next_scan(root.clone());
+            app.folder_pane.observe_accepted_folder(&root);
+            release
+        });
+        let pointer = |y, pressed| egui::Event::PointerButton {
+            pos: egui::pos2(80.0, y),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        tree_event_frame(
+            &mut app,
+            &ctx,
+            &mut frame,
+            vec![egui::Event::PointerMoved(egui::pos2(80.0, 260.0))],
+        );
+        tree_event_frame(&mut app, &ctx, &mut frame, vec![pointer(260.0, true)]);
+        for y in [200.0, 140.0, 80.0] {
+            tree_event_frame(
+                &mut app,
+                &ctx,
+                &mut frame,
+                vec![egui::Event::PointerMoved(egui::pos2(80.0, y))],
+            );
+        }
+        tree_event_frame(&mut app, &ctx, &mut frame, vec![pointer(80.0, false)]);
+        let moving = pane_scroll_state(&ctx);
+        assert!(
+            moving.velocity().y > 100.0,
+            "real drag release must leave inertia: {:?}",
+            moving.velocity()
+        );
+        tree_frame(&mut app, &ctx, &mut frame, false);
+        assert!(
+            pane_scroll_state(&ctx).unclamped_offset().y > moving.unclamped_offset().y,
+            "normal inertia must advance"
+        );
+        tree_event_frame(
+            &mut app,
+            &ctx,
+            &mut frame,
+            vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(
+            pane_scroll_state(&ctx).velocity().y,
+            0.0,
+            "new reveal must stop old inertia"
+        );
+        let cursor = root.join(format!("row-{index:03}"));
+        for _ in 0..30 {
+            tree_frame(&mut app, &ctx, &mut frame, false);
+            assert_tree_cursor_visible(&app, &ctx, &cursor);
+        }
+        if let Some(release) = release {
+            release.send(()).unwrap();
+            settle_tree_scans(&mut app, &ctx, &mut frame);
+        }
+    }
+}
+
 fn assert_tree_location(app: &mut App, ctx: &egui::Context, frame: &mut u64, active: &Path) {
     settle_tree_scans(app, ctx, frame);
     let settled_scrolls = tree_scrolls(ctx);

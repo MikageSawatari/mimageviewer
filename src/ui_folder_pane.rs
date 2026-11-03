@@ -412,7 +412,10 @@ impl App {
 
     fn render_folder_pane_header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let selected_drive = self.folder_pane.selected_drive.clone();
+            let selected_drive = self
+                .folder_pane
+                .selected_drive()
+                .map(std::path::Path::to_path_buf);
             let selected_text = selected_drive
                 .as_deref()
                 .map(folder_pane::drive_label)
@@ -530,7 +533,8 @@ impl App {
         {
             scroll = scroll.vertical_scroll_offset(offset);
         }
-        let output = scroll.show(ui, |ui| {
+        let mut output = scroll.show(ui, |ui| {
+            let mut cursor_revealed = false;
             ui.set_width(ui.available_width());
             for row in rows {
                 let (arrow_resp, resp, row_rect) =
@@ -572,6 +576,7 @@ impl App {
                         || (drawn_pitch - pitch).abs() > 0.1
                     {
                         resp.scroll_to_me(Some(egui::Align::Center));
+                        cursor_revealed = true;
                         #[cfg(test)]
                         ui.ctx().data_mut(|data| {
                             let id = egui::Id::unique("folder_pane_test_cursor_scrolls");
@@ -581,12 +586,23 @@ impl App {
                     }
                 }
             }
+            cursor_revealed
         });
+        if output.inner {
+            // The new reveal owns this vertical position. Retire the previous
+            // drag/animation motion even when the reveal's delta was zero.
+            output.state.stop_vertical_scroll_motion();
+            output.state.store(ui.ctx(), output.id);
+        }
         #[cfg(test)]
         ui.ctx().data_mut(|data| {
             data.insert_temp(
                 egui::Id::unique("folder_pane_test_viewport"),
                 output.inner_rect,
+            );
+            data.insert_temp(
+                egui::Id::unique("folder_pane_test_scroll_state"),
+                output.state,
             );
         });
         ui.ctx().data_mut(|data| {

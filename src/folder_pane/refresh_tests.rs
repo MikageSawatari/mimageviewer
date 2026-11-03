@@ -16,6 +16,132 @@ fn listing(options: FolderPaneListingOptions, children: Vec<PathBuf>) -> CachedL
     }
 }
 
+#[test]
+fn folder_pane_unresolved_drive_arrival_is_a_following_fallback_not_an_open_target() {
+    let mut state = FolderPaneState::default();
+    state.last_drive_refresh = Some(std::time::Instant::now());
+    state.drives.clear();
+    state.selection = FolderPaneSelection::FollowActive(FolderPanePosition::default());
+    state.set_focus_tree_at_active();
+    assert!(state.cursor_path().is_none());
+    state.apply_drive_list(vec![p(r"C:\"), p(r"G:\")]);
+    state.sync_to_active(None, state.listing_options);
+    assert_eq!(state.cursor_path(), Some(Path::new(r"C:\")));
+    assert!(state.cursor_nav_target_if_moved().is_none());
+    state.sync_to_active(Some(Path::new(r"G:\late\current")), state.listing_options);
+    assert_eq!(state.selected_drive(), Some(Path::new(r"G:\")));
+    assert_eq!(state.cursor_path(), Some(Path::new(r"G:\late\current")));
+    assert!(state.selection.follows_active());
+}
+
+#[test]
+fn folder_pane_explicit_cursor_is_preserved_until_grid_navigation_changes_active() {
+    let root = p(r"C:\");
+    let a = root.join("a");
+    let b = root.join("b");
+    let mut state = synthetic_tree(&root, vec![a.clone(), b.clone()]);
+    state.active_path = Some(a.clone());
+    state.active_key = Some(key_for(&a));
+    state.set_cursor(b.clone());
+    state.sync_to_active(Some(&root), state.listing_options);
+    assert_eq!(state.cursor_path(), Some(b.as_path()));
+    state.set_focus_grid();
+    state.set_focus_grid();
+    state.sync_to_active(Some(&root), state.listing_options);
+    assert_eq!(
+        state.cursor_path(),
+        Some(b.as_path()),
+        "focus loss alone must preserve the shown position"
+    );
+    assert_eq!(state.cursor_nav_target_if_moved(), Some(b));
+    state.sync_to_active(Some(&a), state.listing_options);
+    assert_eq!(state.cursor_path(), Some(a.as_path()));
+}
+
+#[test]
+fn folder_pane_explicit_drive_is_preserved_and_focus_loss_does_not_split_the_pair() {
+    let mut state = synthetic_tree(Path::new(r"C:\"), vec![]);
+    state.active_path = Some(p(r"C:\a"));
+    state.active_key = Some(key_for(Path::new(r"C:\a")));
+    state.select_drive(p(r"G:\"));
+    state.sync_to_active(Some(Path::new(r"C:\b")), state.listing_options);
+    assert_eq!(state.selected_drive(), Some(Path::new(r"G:\")));
+    assert_eq!(state.cursor_path(), Some(Path::new(r"G:\")));
+    assert_eq!(state.cursor_nav_target_if_moved(), Some(p(r"G:\")));
+    state.set_focus_grid();
+    state.sync_to_active(Some(Path::new(r"C:\b")), state.listing_options);
+    assert_eq!(state.selected_drive(), Some(Path::new(r"G:\")));
+    assert_eq!(state.cursor_path(), Some(Path::new(r"G:\")));
+    state.sync_to_active(Some(Path::new(r"C:\c")), state.listing_options);
+    assert_eq!(state.selected_drive(), Some(Path::new(r"C:\")));
+    assert_eq!(state.cursor_path(), Some(Path::new(r"C:\c")));
+}
+
+#[test]
+fn folder_pane_expand_and_collapse_without_cursor_motion_are_explicit_choices() {
+    for key in [FolderPaneTreeKey::Left, FolderPaneTreeKey::Right] {
+        let root = p(r"C:\");
+        let child = root.join("child");
+        let mut state = synthetic_tree(&root, vec![child.clone()]);
+        state.active_path = Some(root.clone());
+        state.active_key = Some(key_for(&root));
+        if key == FolderPaneTreeKey::Right {
+            state.user_expanded.clear();
+        }
+        state.set_focus_tree_at_active();
+        state.handle_tree_key(key);
+        assert!(!state.selection.follows_active());
+        state.sync_to_active(Some(&child), state.listing_options);
+        assert_eq!(state.cursor_path(), Some(root.as_path()));
+    }
+}
+
+#[test]
+fn folder_pane_drive_disappearance_repairs_both_fields_and_keeps_origin() {
+    let mut state = synthetic_tree(Path::new(r"G:\"), vec![]);
+    state.set_cursor(p(r"G:\manual"));
+    state.apply_drive_list(vec![p(r"C:\")]);
+    assert_eq!(state.selected_drive(), Some(Path::new(r"C:\")));
+    assert_eq!(state.cursor_path(), Some(Path::new(r"C:\")));
+    assert!(!state.selection.follows_active());
+    state.set_focus_grid();
+    state.apply_drive_list(vec![p(r"G:\")]);
+    assert_eq!(state.selected_drive(), Some(Path::new(r"G:\")));
+    assert_eq!(state.cursor_path(), Some(Path::new(r"G:\")));
+    assert!(state.selection.follows_active());
+    assert!(state.selection.has_explicit_position());
+    state.selection = FolderPaneSelection::FollowActive(FolderPanePosition::default());
+    state.active_path = Some(p(r"G:\late"));
+    state.apply_drive_list(vec![]);
+    assert_eq!(
+        state.selected_drive(),
+        Some(Path::new(r"G:\")),
+        "active root need not await enumeration"
+    );
+    assert_eq!(state.cursor_path(), Some(Path::new(r"G:\late")));
+    assert!(state.selection.follows_active());
+}
+
+#[test]
+fn folder_pane_passive_cursor_repair_keeps_follow_origin_without_reviving_a_missing_active() {
+    let root = p(r"C:\");
+    let active = root.join("missing");
+    let mut state = synthetic_tree(&root, vec![active.clone()]);
+    state.active_path = Some(active.clone());
+    state.active_key = Some(key_for(&active));
+    state.set_focus_tree_at_active();
+    let reply = pending(&mut state, &root);
+    reply
+        .send(Ok(listing(state.listing_options, vec![])))
+        .unwrap();
+    state.poll_pending();
+    assert_eq!(state.cursor_path(), Some(root.as_path()));
+    assert!(state.selection.follows_active());
+    state.sync_to_active(Some(&active), state.listing_options);
+    assert_eq!(state.cursor_path(), Some(root.as_path()));
+    assert!(!state.nodes.contains_key(&key_for(&active)));
+}
+
 struct Reply {
     tx: mpsc::Sender<Result<CachedListing, String>>,
     cancel: Arc<AtomicBool>,
@@ -58,7 +184,7 @@ fn successful_refresh_prunes_only_missing_components_and_rejects_child_late_repl
         let mut state = synthetic_tree(&root, vec![aaa.clone(), aaa2.clone()]);
         state.test_seed_listing(&aaa, vec![aaa.join("deep")], true);
         state.test_seed_listing(&aaa2, vec![aaa2.join("keep")], true);
-        state.cursor_path = Some(aaa.join("deep"));
+        state.selection.position_mut().cursor = Some(aaa.join("deep"));
         state.active_path = Some(aaa.clone());
         let parent_tx = pending(&mut state, &root);
         let child_tx = pending(&mut state, &aaa);
@@ -81,7 +207,7 @@ fn successful_refresh_prunes_only_missing_components_and_rejects_child_late_repl
         assert!(!state.nodes.contains_key(&key_for(&aaa.join("late"))));
         assert_eq!(state.test_children(&aaa2), vec![aaa2.join("keep")]);
         assert!(state.user_expanded.contains(&key_for(&aaa2)));
-        assert_eq!(state.cursor_path.as_deref(), Some(root.as_path()));
+        assert_eq!(state.cursor_path(), Some(root.as_path()));
         assert!(
             child_tx
                 .send(Ok(listing(state.listing_options, vec![])))
@@ -163,7 +289,7 @@ fn sort_hidden_refresh_preserves_manual_expansion_cursor_and_cached_rows_until_s
     state.test_seed_listing(&manual, vec![manual.join("old")], true);
     state.active_path = Some(active.clone());
     state.active_key = Some(key_for(&active));
-    state.cursor_path = Some(manual.clone());
+    state.selection.position_mut().cursor = Some(manual.clone());
     state.cursor_scroll = FolderPaneCursorScroll::Idle;
     state.scan_backend = Some(Arc::new(|_, _, _| Err("not yet verified".into())));
     let mut options = state.listing_options;
@@ -172,11 +298,11 @@ fn sort_hidden_refresh_preserves_manual_expansion_cursor_and_cached_rows_until_s
     state.sync_to_active(Some(&active), options);
     assert_eq!(state.test_children(&manual), vec![manual.join("old")]);
     assert!(state.user_expanded.contains(&key_for(&manual)));
-    assert_eq!(state.cursor_path, Some(manual.clone()));
+    assert_eq!(state.selection.position().cursor, Some(manual.clone()));
     assert_eq!(state.cursor_scroll, FolderPaneCursorScroll::Idle);
     state.test_settle();
     assert_eq!(state.test_children(&manual), vec![manual.join("old")]);
-    assert_eq!(state.cursor_path, Some(manual));
+    assert_eq!(state.selection.position().cursor, Some(manual));
     assert_eq!(state.cursor_scroll, FolderPaneCursorScroll::Idle);
 }
 
@@ -249,6 +375,7 @@ fn active_change_rechecks_first_stale_ancestor_once_but_same_location_cannot_rev
     state.test_seed_listing(&data, vec![], true);
     state.active_path = Some(work.clone());
     state.active_key = Some(key_for(&work));
+    state.set_focus_tree_at_active();
     state.sync_to_active(Some(&new), state.listing_options);
     assert!(matches!(
         state.nodes[&key_for(&data)].scan,
@@ -319,7 +446,7 @@ fn collapse_drive_switch_and_suspend_cancel_private_receivers_only_in_the_pane()
         let mut state = synthetic_tree(&root, vec![branch.clone()]);
         state.test_seed_listing(&branch, vec![], true);
         let tx = pending(&mut state, &branch);
-        state.cursor_path = Some(branch.clone());
+        state.selection.position_mut().cursor = Some(branch.clone());
         match route {
             "collapse" => state.collapse_cursor(),
             "drive" => state.select_drive(p(r"D:\")),
@@ -344,7 +471,7 @@ fn explicitly_collapsed_auto_ancestor_leaves_demand_and_cannot_retry_in_the_back
     state.auto_expanded.insert(key_for(&parent));
     state.demand.insert(key_for(&parent));
     let tx = pending(&mut state, &parent);
-    state.cursor_path = Some(parent.clone());
+    state.selection.position_mut().cursor = Some(parent.clone());
     state.collapse_cursor();
     assert!(!state.demand.contains(&key_for(&parent)));
     assert!(tx.send(Ok(listing(state.listing_options, vec![]))).is_err());
@@ -373,7 +500,7 @@ fn same_path_replacement_is_retrieved_by_reexpand_redisplay_or_explicit_reload()
         assert_eq!(state.test_children(&branch), vec![branch.join("old")]);
         match route {
             "expand" => {
-                state.cursor_path = Some(branch.clone());
+                state.selection.position_mut().cursor = Some(branch.clone());
                 state.collapse_cursor();
                 state.expand_cursor();
             }
@@ -385,10 +512,10 @@ fn same_path_replacement_is_retrieved_by_reexpand_redisplay_or_explicit_reload()
             _ => {
                 state.reload_for_active(None, state.listing_options);
                 state.test_settle();
-                state.cursor_path = Some(root.to_path_buf());
+                state.selection.position_mut().cursor = Some(root.to_path_buf());
                 state.expand_cursor();
                 state.test_settle();
-                state.cursor_path = Some(branch.clone());
+                state.selection.position_mut().cursor = Some(branch.clone());
                 state.expand_cursor();
             }
         }
@@ -443,7 +570,7 @@ fn keyboard_navigation_and_manual_reset_contract_are_preserved() {
     let a = root.join("a");
     let b = root.join("b");
     let mut state = synthetic_tree(&root, vec![a.clone(), b.clone()]);
-    state.cursor_path = Some(root.clone());
+    state.selection.position_mut().cursor = Some(root.clone());
     state.handle_tree_key(FolderPaneTreeKey::Down);
     assert_eq!(
         state.handle_tree_key(FolderPaneTreeKey::Enter),
@@ -454,7 +581,7 @@ fn keyboard_navigation_and_manual_reset_contract_are_preserved() {
     state.reload_for_active(Some(&a), state.listing_options);
     assert!(state.user_expanded.is_empty());
     assert!(state.user_collapsed.is_empty());
-    assert_eq!(state.cursor_path, Some(a));
+    assert_eq!(state.selection.position().cursor, Some(a));
     assert_eq!(state.cursor_scroll, FolderPaneCursorScroll::Requested);
 }
 
