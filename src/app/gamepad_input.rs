@@ -9039,7 +9039,9 @@ impl App {
                 );
                 return;
             }
-            self.toggle_folder_tree_pane_from_key();
+            self.request_folder_tree_pane_toggle(
+                crate::ui_folder_pane::FolderPaneToggleKind::CommitCursorOnClose,
+            );
             return;
         }
         let Some(fs_idx) = self.fullscreen_idx else {
@@ -9568,9 +9570,7 @@ impl App {
             if let Some(FolderPaneCommand::Open(path)) =
                 self.folder_pane.handle_tree_key(FolderPaneTreeKey::Enter)
             {
-                self.settings.folder_tree_pane_visible = false;
-                self.folder_pane.set_focus_grid();
-                self.settings.save();
+                self.request_folder_tree_pane_close();
                 // worker scan 経由で開く (UI スレッドの read_dir ブロック回避)。
                 self.start_folder_pane_open(path);
                 return None;
@@ -13772,6 +13772,7 @@ mod physical_boundary_tests {
             assert_eq!(ctx.cumulative_frame_nr(), 0);
             let batch = app.sample_gamepad_input(&ctx);
             app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+            app.finish_folder_pane_presentation(&ctx, true);
             assert!(app.gamepad.state.y_modifier_used());
             for event in [
                 PadEvent::ButtonReleased(PadButton::North),
@@ -13783,6 +13784,7 @@ mod physical_boundary_tests {
             let batch = app.sample_gamepad_input(&ctx);
             assert_eq!(batch.actions_for_test().len(), 2);
             app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+            app.finish_folder_pane_presentation(&ctx, true);
             assert!(
                 !app.settings.folder_tree_pane_visible,
                 "old modifier release cannot become a tap"
@@ -13797,6 +13799,7 @@ mod physical_boundary_tests {
             integration.update_logic_only(&mut app.app, Default::default());
             let batch = app.sample_gamepad_input(&ctx);
             app.dispatch_gamepad_batch_with_admission(&ctx, batch, |_, _| true);
+            app.finish_folder_pane_presentation(&ctx, true);
             assert!(
                 app.settings.folder_tree_pane_visible,
                 "the new hold still has its own tap"

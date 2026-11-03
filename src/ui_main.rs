@@ -11341,8 +11341,12 @@ impl App {
                     let resp = ui
                         .add(egui::Button::selectable(active, "ツリー").sense(tree_sense))
                         .on_hover_text(format!("左側に実フォルダツリーを表示\n{lead_hint}"));
+                    #[cfg(test)]
+                    ui.ctx().data_mut(|data| data.insert_temp(egui::Id::unique("folder_pane_test_toggle_rect"), resp.rect));
                     if resp.clicked() {
-                        self.set_folder_tree_pane_visible(!active);
+                        self.request_folder_tree_pane_toggle(
+                            crate::ui_folder_pane::FolderPaneToggleKind::VisibilityOnly,
+                        );
                     }
                     self.finish_toolbar_section_lead(
                         ui,
@@ -12056,11 +12060,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         for fav in &self.settings.favorites {
                             let selected =
                                 current.as_ref().map(|c| c == &fav.path).unwrap_or(false);
-                            if ui
+                            let response = ui
                                 .selectable_label(selected, &fav.name)
-                                .hover_tip(fav.path.to_string_lossy())
-                                .clicked()
-                            {
+                                .hover_tip(fav.path.to_string_lossy());
+                            #[cfg(test)]
+                            ui.ctx().data_mut(|data| data.insert_temp(egui::Id::unique(("folder_pane_test_favorite_rect", &fav.path)), response.rect));
+                            if response.clicked() {
                                 toolbar_fav_nav = Some(fav.path.clone());
                             }
                         }

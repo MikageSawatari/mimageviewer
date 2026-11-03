@@ -17,6 +17,20 @@ const FOLDER_PANE_ROW_HEIGHT: f32 = 24.0;
 const FOLDER_PANE_INDENT_WIDTH: f32 = 14.0;
 const FOLDER_PANE_ARROW_WIDTH: f32 = 24.0;
 
+/// The final visibility requested by this frame's accepted commands.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FolderPaneVisibilityRequest {
+    Show,
+    Hide,
+    HideAndNavigate,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum FolderPaneToggleKind {
+    CommitCursorOnClose,
+    VisibilityOnly,
+}
+
 fn show_folder_pane_panel<R>(
     root_ui: &mut egui::Ui,
     saved_ratio: f32,
@@ -219,6 +233,69 @@ fn draw_folder_pane_row(
 }
 
 impl App {
+    pub(crate) fn request_folder_tree_pane_toggle(&mut self, kind: FolderPaneToggleKind) {
+        use FolderPaneVisibilityRequest::{Hide, HideAndNavigate, Show};
+        let visible = self
+            .folder_pane_visibility_request
+            .map_or(self.settings.folder_tree_pane_visible, |request| {
+                matches!(request, Show)
+            });
+        // Compose accepted toggles against the projected state. Even toggles
+        // retain Show so reopening refocuses without committing an intermediate close.
+        self.folder_pane_visibility_request = Some(if !visible {
+            Show
+        } else {
+            match kind {
+                FolderPaneToggleKind::CommitCursorOnClose => HideAndNavigate,
+                FolderPaneToggleKind::VisibilityOnly => Hide,
+            }
+        });
+    }
+
+    pub(crate) fn request_folder_tree_pane_close(&mut self) {
+        // Gamepad A has already started its Open; closing must not commit again.
+        self.folder_pane_visibility_request = Some(FolderPaneVisibilityRequest::Hide);
+    }
+
+    /// An explicit main navigation retires the commit, preserving visibility.
+    pub(crate) fn retire_folder_tree_pane_close_navigation(&mut self) {
+        if matches!(
+            self.folder_pane_visibility_request,
+            Some(FolderPaneVisibilityRequest::HideAndNavigate)
+        ) {
+            self.folder_pane_visibility_request = Some(FolderPaneVisibilityRequest::Hide);
+        }
+    }
+
+    /// Only the main navigation arbiter may accept the cursor commit.
+    pub(crate) fn take_folder_tree_pane_close_navigation(&mut self) -> Option<std::path::PathBuf> {
+        if !matches!(
+            self.folder_pane_visibility_request,
+            Some(FolderPaneVisibilityRequest::HideAndNavigate)
+        ) {
+            return None;
+        }
+        self.retire_folder_tree_pane_close_navigation();
+        self.settings
+            .folder_tree_pane_visible
+            .then(|| self.folder_pane.cursor_nav_target_if_moved())
+            .flatten()
+    }
+
+    fn apply_folder_tree_pane_visibility_request(&mut self, ctx: &egui::Context) {
+        use FolderPaneVisibilityRequest::{Hide, HideAndNavigate, Show};
+        match self.folder_pane_visibility_request.take() {
+            Some(Show) => self.set_folder_tree_pane_visible(true),
+            // Cursor commits belong to navigation arbitration. A frame without
+            // main chrome still closes, but cannot start an unarbitrated Open.
+            Some(Hide | HideAndNavigate) if self.settings.folder_tree_pane_visible => {
+                self.set_folder_tree_pane_visible(false);
+            }
+            _ => return,
+        }
+        ctx.request_repaint();
+    }
+
     pub(crate) fn set_folder_tree_pane_visible(&mut self, visible: bool) {
         self.settings.folder_tree_pane_visible = visible;
         if visible {
@@ -233,25 +310,6 @@ impl App {
             self.folder_pane.set_focus_grid();
         }
         self.settings.save();
-    }
-
-    /// トグルキー (キーボード F / ゲームパッド Y) でフォルダツリーペインを開閉する。
-    /// - 非表示 → 表示 (カーソルはアクティブフォルダに置かれる)。
-    /// - 表示中 → 閉じる。ただしカーソルが別フォルダへ動いていれば、Enter と同じく
-    ///   そのフォルダへ移動してグリッド一覧に戻ってから閉じる
-    ///   (worker scan 経由なので UI スレッドの read_dir で固まらない)。
-    pub(crate) fn toggle_folder_tree_pane_from_key(&mut self) {
-        if !self.settings.folder_tree_pane_visible {
-            self.set_folder_tree_pane_visible(true);
-            return;
-        }
-        // 閉じる前に「カーソルが別フォルダへ動いていれば」その移動先を取得する。
-        let target = self.folder_pane.cursor_nav_target_if_moved();
-        // set_folder_tree_pane_visible(false) が focus をグリッドへ戻し settings も保存する。
-        self.set_folder_tree_pane_visible(false);
-        if let Some(target) = target {
-            self.start_folder_pane_open(target);
-        }
     }
 
     pub(crate) fn sync_folder_pane_state(&mut self, ctx: &egui::Context) {
@@ -368,6 +426,7 @@ impl App {
         if !main_chrome_drawn {
             self.folder_pane.suspend_display();
         }
+        self.apply_folder_tree_pane_visibility_request(ctx);
         self.service_folder_pane_visibility(ctx);
     }
 
