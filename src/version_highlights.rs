@@ -1216,6 +1216,41 @@ const TABLE: &[VersionHighlights] = &[
             },
         ],
     },
+    VersionHighlights {
+        version: "5.0.0",
+        // 音響調整のプリセット共有の終了と、アイテム検索の索引の作り直しは、リリース済みの動きの変更なので必読に置く。
+        must_read: &[
+            HighlightItem {
+                title: "音響調整は mImageViewer 用の「mIV Sound」になりました",
+                body: "設定やプリセットは mImageViewer のデータフォルダに保存し、これまでのデータは最初の起動で一度だけ引き継ぎます。\
+                       DAW で使う EffeTune Mixwright やデスクトップ版の EffeTune とはプリセットを共有しなくなりました。\
+                       行き来するときは、プリセットの書き出し・読み込みを使ってください。",
+            },
+            HighlightItem {
+                title: "アイテム検索の索引を作り直しています",
+                body: "AI 説明文で探せるようにするため、更新後の最初の起動でアイテム検索 (Ctrl+G) の索引を作り直します。\
+                       作り直している間は、検索の結果が揃わないことがあります。",
+            },
+        ],
+        highlights: &[
+            HighlightItem {
+                title: "AI アプリから mImageViewer のライブラリを検索・整理",
+                body: "「設定」→「AI 連携…」で Claude Desktop や ChatGPT (Codex) を登録すると、ふだんの言葉で検索やタグ付けを頼めます。既定では無効です。",
+            },
+            HighlightItem {
+                title: "画像や本の表紙から AI で説明文を作る",
+                body: "一覧で右クリックして「AI 説明文を作る」を選びます。PC の中で作り、説明文でアイテム検索 (Ctrl+G) から探せます。",
+            },
+            HighlightItem {
+                title: "音声から音楽ビデオを作成",
+                body: "音声ファイルを右クリックして「音楽ビデオを作成」を選ぶと、画像・スペクトラム・歌詞などを重ねた MP4 を作れます。",
+            },
+            HighlightItem {
+                title: "音響調整に歌詞と「mIV Original」の表示",
+                body: "再生中の曲の歌詞をビジュアライザーに再生に合わせて表示します。ポータブル版でも音響調整を使えるようになりました。",
+            },
+        ],
+    },
 ];
 
 #[cfg(test)]
