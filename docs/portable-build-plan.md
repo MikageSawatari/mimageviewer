@@ -47,7 +47,9 @@ MCP は AI アプリから launcher の先頭 `--mcp` で起動する。この�
 portable は `musicvideo-editor` の製品 bin を `target-portable` でビルドし、core の隣へ loose 同梱する。
 build は出力先や配布フォルダのエディタを停止せず、保存・終了を求めて中止する。
 この統合では mIV Sound／VST3 host の portable 同梱・有効化は行わない。
-[派生版への切替計画](effetune-fork-plan.md) の F3（公開文書）・F4（ポータブル有効化）は別段階であり、
+[派生版への切替計画](effetune-fork-plan.md) が mIV Sound の正本（名前・保存 §2・§4〜5、ポータブル §6、公開文書 §10）。
+F3 の生成器・公開文書は更新済みだが、ポータブルに関する記述は変更せず同計画の F3 実装記録に列挙する。
+F4（ポータブル有効化）は別段階であり、
 現行の音響調整非同梱・利用不可の境界を維持する。
 ランチャーが存在する主な理由は **FFmpeg がロード時リンク**で、
 Rust コードが走る前に Windows ローダが DLL を解決する必要があるため

@@ -194,13 +194,14 @@
       ネットワーク共有や同期フォルダを選ぶ場合は、その保存先や同期ソフトの動作に従います。
     </div>
     <div class="info-box">
+      mIV Sound は EffeTune / EffeTune Mixwright（作者: Frieve、MIT License）を元にした派生版です。
       音響調整 (mIV Sound) のプリセット・設定は、mImageViewer のデータフォルダ内の
       <code>effetune\plugin\</code> に保存します。SFZ 音源の登録もこの中の <code>sfz-references.json</code> に名前と保存場所を記録します。
       取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像などの画面用データは
       <code>effetune\webview\</code> に保存します。Windows または WebView2 の管理ポリシーで別の保存先が指定されている場合は、その設定に従います。
       サンプルは元のフォルダから読み取り、コピーしません。Remove は登録だけを削除し、元のファイルは削除しません。
       これらの保存先は mImageViewer のデータフォルダに従い、ほかの EffeTune 製品とは分かれています。
-      旧版の共通保存先から引き継ぐ場合はデータをコピーし、元のデータは残します。
+      初回起動時に従来の共通保存先から一度だけコピーし、元のデータは残します。mIV Sound は共通保存先へ書き込みません。
       従来の共通保存先の <code>%APPDATA%\effetune\</code>、<code>%APPDATA%\Frieve\EffeTunePlugin\</code>、
       <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> は、追加した VST プラグインやほかの EffeTune 製品が使うことがあります。
       それらでも不要になったことを確認し、関連するアプリを終了してから手動で削除できます。
@@ -435,13 +436,14 @@
       See <a href="manual/music-video.html">Creating music videos</a> for instructions.
     </div>
     <div class="info-box">
+      mIV Sound is derived from EffeTune / EffeTune Mixwright by Frieve (MIT License).
       mIV Sound stores presets and configuration in <code>effetune\plugin\</code> within mImageViewer's data folder.
       SFZ registration records instrument names and locations in <code>sfz-references.json</code> in that folder.
       Display data, including imported IR files, measurements, and visualizer layouts and background images, is stored in
       <code>effetune\webview\</code>. A different location specified by Windows or WebView2 administrative policy takes precedence.
       Samples are read from their original folder and are not copied. Remove deletes only the reference, leaving the source files untouched.
       These locations follow mImageViewer's data folder and are separate from other EffeTune products.
-      When data is inherited from the shared locations used by older versions, it is copied and the originals remain.
+      On first startup, data is copied once from the existing shared locations and the originals remain. mIV Sound does not write to those shared locations.
       The existing shared <code>%APPDATA%\effetune\</code>, <code>%APPDATA%\Frieve\EffeTunePlugin\</code>, and
       <code>%APPDATA%\mimageviewer-vst3-host.exe\</code> locations may still be used by VST plug-ins you add or other EffeTune products.
       Delete them manually only after checking that those uses no longer need them and closing the related apps.

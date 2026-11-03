@@ -1,7 +1,7 @@
 {
   "README.md": {
     "include": true,
-    "reason": "Select VST-applicable operations by exact heading; standalone player, LAN remote and MCP sections are excluded. Tour guidance is inserted in README.json using bundled ja locale tour.menu.",
+    "reason": "Select exact VST-applicable headings for mIV Sound. Exclude standalone player/library, LAN remote, MCP, browser extension, CUE and desktop-only settings. Corrections apply before branding.",
     "title": "基本操作 - EffeTune",
     "sections": [
       "Visualizer",
@@ -25,7 +25,7 @@
   },
   "controller-mapping.md": {
     "include": true,
-    "reason": "v0.15.0 vst-bootstrap.js:43 exposes physical-control-section; effect/automation and non-player app targets are available. VST-specific limits in controller-mapping.json."
+    "reason": "Keep effect, automation, master bypass, A/B and preset operations. Remove standalone playback operation guidance; mIV playback uses its own controls."
   },
   "double-blind-test.md": {
     "include": false,
@@ -53,7 +53,7 @@
   },
   "visualizer.md": {
     "include": true,
-    "reason": "Bundled native telemetry, expanded layouts, graph types, editing and sharing; standalone menus/configuration corrected."
+    "reason": "mIV Sound: native graphs, mIV Original, host lyrics and Lyric Stage. Remove Counter/Counter Gallery and desktop-only controls in visualizer.json."
   },
   "plugins/analyzer.md": {
     "include": true,

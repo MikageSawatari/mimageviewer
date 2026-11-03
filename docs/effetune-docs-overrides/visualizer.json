@@ -8,7 +8,7 @@
   {
     "operation": "replace_inline",
     "anchor": "PCでは、**Effect Pipeline**と**Music Library**の隣にある**Visualizer**を選びます。モバイルでは、右上の**Visualizer**アイコンをタップします。デスクトップアプリでは**表示 > Visualizer**を選びます。[ブラウザ拡張版](browser-extension.md)では、Pipeline Editorのヘッダーにある**Visualizer**を選びます。**設定 > 環境設定...**で、Visualizerを起動時の表示にすることもできます。",
-    "replacement": "EffeTune 画面のヘッダーにある **Visualizer** ボタンを選びます。**設定 > 環境設定...** で起動時の表示にも指定できます。mImageViewer には、デスクトップ版 EffeTune の「表示」メニューやミニプレーヤーはありません。",
+    "replacement": "mIV Sound 画面のヘッダーにある **Visualizer** ボタンを選びます。初めて開いたときは **mIV Original** を表示します。**設定 > 環境設定... > 起動** の **起動時の表示** は **前回の表示 (デフォルト)** が初期設定です。前回の Visualizer または Effect Pipeline の表示を引き継ぎ、特定の表示に固定することもできます。",
     "reason": "Bundled effetune.html visualizerButton; standalone menu absent."
   },
   {
@@ -20,13 +20,13 @@
   {
     "operation": "replace_inline",
     "anchor": "ツールバーの**共有**を選ぶと、現在のレイアウトへのリンクをコピーできます（リンクに背景画像は含まれません。画像は**バックアップ / 復元**で渡してください）。デスクトップアプリやブラウザ拡張版では、共有リンクをコピーしてから、Visualizerで**リンクを読み込む**を選ぶか**Ctrl+V**（Macでは**⌘V**）を押します。読み込んだレイアウトは、確認なしで現在のレイアウトを置き換えます。元に戻すには、**Edit**を開いて**元に戻す**を選びます。",
-    "replacement": "ツールバーの **共有** を選ぶと、現在のレイアウトのリンクをコピーできます。リンクには背景色は含まれますが、背景画像は含まれません。画像ごと渡したいときは **バックアップ / 復元** を使ってください。共有したリンクは EffeTune Web アプリで開きます。mImageViewer の EffeTune へ取り込むには、リンクをコピーしてツールバーの **リンクを読み込む** を選ぶか、Visualizerの表示中にCtrl+Vを押してください。Effect Pipelineの表示中に貼り付けても、Visualizerが開いて適用されます。読み込んだレイアウトは確認なしで現在のレイアウトを置き換えます。元のレイアウトに戻すには、**Edit** を開いて **元に戻す** を選んでください。",
+    "replacement": "ツールバーの **共有** を選ぶと、現在のレイアウトのリンクをコピーできます。リンクには背景色は含まれますが、背景画像は含まれません。画像ごと渡したいときは **バックアップ / 復元** を使ってください。共有したリンクは 上流の Web アプリで開きます。mImageViewer の EffeTune へ取り込むには、リンクをコピーしてツールバーの **リンクを読み込む** を選ぶか、Visualizerの表示中にCtrl+Vを押してください。Effect Pipelineの表示中に貼り付けても、Visualizerが開いて適用されます。読み込んだレイアウトは確認なしで現在のレイアウトを置き換えます。元のレイアウトに戻すには、**Edit** を開いて **元に戻す** を選んでください。",
     "reason": "Keep bundled Visualizer sharing/import and undo; remove desktop/extension and Mac instructions."
   },
   {
     "operation": "replace_inline",
     "anchor": "**設定 > 環境設定...**で**表示を音声に同期**を有効にすると、表示をスピーカーからの音に合わせます。同期のために音声が遅延することがあります。グラフが動かない場合は、**オーディオ設定**で**WebAssembly 音声処理を使用する**が有効になっていること、EffeTuneを通して音声が再生されていることを確認してください。",
-    "replacement": "mImageViewer の EffeTune 画面には、デスクトップ版のオーディオ設定はありません。音声グラフは EffeTune に渡された音を表示します。リモート配信中は EffeTune の窓が非表示になり、配信を終えると元の表示状態に戻ります。",
+    "replacement": "音声グラフは mIV Sound に渡された音を表示します。リモート配信中は音響調整の窓が非表示になり、配信を終えると元の表示状態に戻ります。",
     "reason": "Native telemetry replaces standalone WASM/audio-device settings; Remote suppression is the current mIV contract."
   },
   {
@@ -39,43 +39,19 @@
     "operation": "replace_inline",
     "anchor": "このほかの8種類は、それぞれが最も映える比率に用意されています。",
     "replacement": "このほかの7種類は、それぞれが最も映える比率に用意されています。",
-    "reason": "Bundled presets omit Lyric Stage; Counter Gallery is bundled."
+    "reason": "mIV Sound retains Lyric Stage and omits Counter Gallery."
   },
   {
     "operation": "replace_html",
-    "anchor": "<li><p><strong>Lyric Stage</strong>（16:9、9:16）: 低音に反応するアートワークの光の上に同期歌詞を表示し、現在の行を単語ごとに塗り進めます（歌詞がないときは落ち着いたアートワーク画面になります）。</p></li>",
-    "replacement": "",
-    "reason": "Lyric Stage is not bundled and mIV supplies no lyrics."
-  },
-  {
-    "operation": "replace_inline",
-    "anchor": "**Cinema Strip**（21:9）: 画面幅いっぱいのスペクトログラム、10秒分の波形、流れる歌詞の行を並べます。",
-    "replacement": "**Cinema Strip**（21:9）: 画面幅いっぱいのスペクトログラムと10秒分の波形を並べます。",
-    "reason": "Imported Lyrics items remain editable but receive no live lyrics."
-  },
-  {
-    "operation": "replace_inline",
-    "anchor": "**Counter**を追加すると、内蔵プレーヤーの現在の再生位置を表示し、一時停止やシークにも追従します。外部入力では、Counterを追加した時点、または現在のセッションでレイアウトを読み込んだ時点からの経過時間を表示し、Visualizerを隠している間も進みます。**Edit**以外でクリックまたはタップすると、そのCounterの外部入力用の経過時間だけが0に戻ります。プレーヤーの再生には影響しません。",
-    "replacement": "**Counter**を追加すると、音響調整が処理した音声の累積時間を表示します。mImageViewer の曲の再生位置とは一致せず、シーク先の時刻にも移りません。音声処理が止まると進まず、曲の切り替えでも必ず0に戻るわけではありません。クリックして0へ戻す外部入力用の操作は使えません。",
-    "reason": "VST visualizer-view.js uses hostTransport project samples; mIV supplies a process-block sample counter, not media PTS, and external=false."
-  },
-  {
-    "operation": "replace_inline",
-    "anchor": "**プレイリスト番号**、**時**、**分**、**秒**、**秒未満**の表示を個別に切り替えられます。既定の表示は`hh:mm:ss.mmm`で、番号は非表示です。番号はプレーヤーのプレイリストの1曲目を1とし、外部入力では00になります。表示する最上位の単位には合計時間を表示します。時を隠すと合計分、時と分を隠すと合計秒になります。",
-    "replacement": "**プレイリスト番号**、**時**、**分**、**秒**、**秒未満**の表示を個別に切り替えられます。既定の表示は`hh:mm:ss.mmm`で、番号は非表示です。mImageViewer では番号は00になります。表示する最上位の単位には合計時間を表示します。時を隠すと合計分、時と分を隠すと合計秒になります。",
-    "reason": "VST Counter metadata uses trackIndex=0; mIV has no playlist transport metadata."
+    "anchor": "<p><strong>Counter</strong>を追加すると、内蔵プレーヤーの現在の再生位置を表示し、一時停止やシークにも追従します。外部入力では、Counterを追加した時点、または現在のセッションでレイアウトを読み込んだ時点からの経過時間を表示し、Visualizerを隠している間も進みます。<strong>Edit</strong>以外でクリックまたはタップすると、そのCounterの外部入力用の経過時間だけが0に戻ります。プレーヤーの再生には影響しません。</p>",
+    "replacement": "<h3 id=\"miv-counter\">Counter</h3>\n<p><strong>Counter</strong>を追加すると、内蔵プレーヤーの現在の再生位置を表示し、一時停止やシークにも追従します。外部入力では、Counterを追加した時点、または現在のセッションでレイアウトを読み込んだ時点からの経過時間を表示し、Visualizerを隠している間も進みます。<strong>Edit</strong>以外でクリックまたはタップすると、そのCounterの外部入力用の経過時間だけが0に戻ります。プレーヤーの再生には影響しません。</p>",
+    "reason": "Counter has no upstream heading; exact paragraph anchor gives remove_section its ownership boundary."
   },
   {
     "operation": "replace_inline",
     "anchor": "**Lyrics**を追加すると、内蔵プレーヤーで再生中の曲の同期歌詞または通常の歌詞を表示できます（クリーンフィードにも表示されます）。歌詞は、埋め込みタグか、同じフォルダーにある同じ名前の`.lrc`ファイルから読み込みます（CUEシートでは、アルバム単位の時刻付き歌詞よりも`Artist - Title.lrc`または`Title.lrc`を優先します）。ブラウザーで音楽ファイルを直接開くかドロップする場合は、`.lrc`ファイルも一緒に選択またはドロップしてください。ストリームには歌詞がありません。**Edit**の外では、時刻付き歌詞の行をクリックまたはタップすると、その行へ再生位置が移動します。",
-    "replacement": "mImageViewer の EffeTune は歌詞を表示しません。**Lyrics** は追加メニューにありません。既存または読み込んだレイアウトにある Lyrics アイテムは編集できますが、再生中の歌詞は渡されません。",
-    "reason": "visualizer-editor.js:575 excludes lyrics; native host sends no lyrics."
-  },
-  {
-    "operation": "replace_inline",
-    "anchor": "**一覧**または**1行**を選びます（1行では**次の行を表示**も選べます）。一覧表示では、**スクロール（縦）**、**ステップ（縦）**、**スクロール（横）**、**ステップ（横）**を選べ、**ステップ遷移時間**（0～2秒、既定値0.18秒）と**現在行の位置**（0～100%、既定値50%）を調整できます。**単語のハイライト**は、単語ごとの時刻がある場合に現在の行を徐々に塗り進めます。**オフセット**（−10～+10秒）で同期を微調整します。正の値にすると歌詞が遅れて表示されます。時刻のない歌詞は常に一覧で表示され、曲の進行に合わせてスクロールします。ハイライトはしません。",
-    "replacement": "既存または読み込んだ Lyrics アイテムを編集する場合、**一覧**または**1行**を選びます（1行では**次の行を表示**も選べます）。一覧表示では、**スクロール（縦）**、**ステップ（縦）**、**スクロール（横）**、**ステップ（横）**を選べ、**ステップ遷移時間**（0～2秒、既定値0.18秒）と**現在行の位置**（0～100%、既定値50%）を調整できます。**単語のハイライト**は、単語ごとの時刻がある場合に現在の行を徐々に塗り進めます。**オフセット**（−10～+10秒）で同期を微調整します。正の値にすると歌詞が遅れて表示されます。時刻のない歌詞は常に一覧で表示され、曲の進行に合わせてスクロールします。ハイライトはしません。",
-    "reason": "Retain existing/imported item editing controls."
+    "replacement": "**Lyrics** を追加すると、mImageViewer で再生中の曲の歌詞を表示できます。同じフォルダーの同名 `.lrc` ファイルや、曲ファイルに埋め込まれた歌詞を使います。時刻付きの `.lrc`、時刻付きの埋め込み歌詞、時刻なしの `.lrc`、時刻なしの埋め込み歌詞の順で選びます。一時停止やシーク、速度変更に表示が追従します。歌詞の行をクリックしても再生位置は移動しません。リモート配信中は歌詞を表示しません。",
+    "reason": "mIV Sound receives lyrics and the playback clock; seek from the Visualizer is intentionally unavailable."
   },
   {
     "operation": "replace_inline",
@@ -98,7 +74,7 @@
   {
     "operation": "replace_inline",
     "anchor": "**Oscilloscope**、**Spectrum**、**Spectrogram**、**Stereo**、**Level Meter**、**Analog Meter**、**Notes**、**Guitar**、**Chroma Spiral**、**Phase Map**、**Rhythm Analyzer**のグラフ、または**Lyrics**、**Artwork**、**Video**、**Title**、**Album**、**Artist**、**Counter**、**Text**、**Shape**を追加します。アイテムはドラッグで移動し、ハンドルをドラッグしてサイズを変えます（**Shift**で縦横比を保ち、**Ctrl**/**Cmd**で中心を基準にサイズを変えます）。位置を揃えるには**グリッドに吸着**を使い、吸着を無視するには**Alt**を押しながらドラッグします。重なり順は**上へ移動**、**下へ移動**、**最前面へ**、**最背面へ**で変えます（一覧で下にあるアイテムほど手前に表示されます）。選択中のアイテムを複製するには、**Ctrl+D**（Macでは**Cmd+D**）を押すか、**Altを押しながらドラッグ**します。",
-    "replacement": "**Oscilloscope**、**Spectrum**、**Spectrogram**、**Stereo**、**Level Meter**、**Analog Meter**、**Notes**、**Guitar**、**Chroma Spiral**、**Phase Map**、**Rhythm Analyzer**のグラフ、または**Artwork**、**Title**、**Album**、**Artist**、**Counter**、**Text**、**Shape**を追加します。アイテムはドラッグで移動し、ハンドルをドラッグしてサイズを変えます（**Shift**で縦横比を保ち、**Ctrl**で中心を基準にサイズを変えます）。位置を揃えるには**グリッドに吸着**を使い、吸着を無視するには**Alt**を押しながらドラッグします。重なり順は**上へ移動**、**下へ移動**、**最前面へ**、**最背面へ**で変えます（一覧で下にあるアイテムほど手前に表示されます）。選択中のアイテムを複製するには、**Ctrl+D**を押すか、**Altを押しながらドラッグ**します。",
+    "replacement": "**Oscilloscope**、**Spectrum**、**Spectrogram**、**Stereo**、**Level Meter**、**Analog Meter**、**Notes**、**Guitar**、**Chroma Spiral**、**Phase Map**、**Rhythm Analyzer**のグラフ、または**Lyrics**、**Artwork**、**Title**、**Album**、**Artist**、**Text**、**Shape**を追加します。アイテムはドラッグで移動し、ハンドルをドラッグしてサイズを変えます（**Shift**で縦横比を保ち、**Ctrl**で中心を基準にサイズを変えます）。位置を揃えるには**グリッドに吸着**を使い、吸着を無視するには**Alt**を押しながらドラッグします。重なり順は**上へ移動**、**下へ移動**、**最前面へ**、**最背面へ**で変えます（一覧で下にあるアイテムほど手前に表示されます）。選択中のアイテムを複製するには、**Ctrl+D**を押すか、**Altを押しながらドラッグ**します。",
     "reason": "Windows VST modifiers; retain editing operations and omit unavailable Add items."
   },
   {
@@ -120,15 +96,26 @@
     "reason": "Independent review P2: mIV sends artwork and metadata, not video; align introduction with unavailable Video item."
   },
   {
-    "operation": "replace_inline",
-    "anchor": "**秒未満の形式**は**小数**または**フレーム**から選びます。小数桁数は小数表示に適用されます。フレームは再生時間と**フレームレート**（1～120、既定値30）から計算し、0から設定値の1つ手前までを表示します。必要に応じて動画に合わせて設定してください。ファイル内の実際のフレームを正確に読み出す表示ではありません。",
-    "replacement": "**秒未満の形式**は**小数**または**フレーム**から選びます。小数桁数は小数表示に適用されます。フレームは音声の処理累積時間と**フレームレート**（1～120、既定値30）から計算し、0から設定値の1つ手前までを表示します。mImageViewerで再生中の動画の時刻や実際のフレームを読み出す表示ではありません。",
-    "reason": "Counter derives frames from VST process samples, not media playback time."
+    "operation": "replace_html",
+    "anchor": "<p><strong>Lyrics</strong> を追加すると、",
+    "replacement": "<h3 id=\"miv-lyrics\">Lyrics</h3>\n<p><strong>Lyrics</strong> を追加すると、",
+    "reason": "Give Lyrics an explicit heading, ending the Counter-only span."
+  },
+  {
+    "operation": "remove_section",
+    "heading_id": "miv-counter",
+    "reason": "Counter is not available in mIV Sound; remove all its controls together."
+  },
+  {
+    "operation": "replace_html",
+    "anchor": "<li><p><strong>Counter Gallery</strong>（16:9）：機械式、LED、VFD、LCD、ドットマトリクス、フリップ、ニキシー管風の8つのカウンターを同時に表示します。30 fpsで計算したフレーム表示も含みます。動きを見比べたり、眺めて楽しんだり、気に入ったCounterだけを自分のレイアウトにコピーしたりできます。</p></li>",
+    "replacement": "",
+    "reason": "mIV Sound removes Counter Gallery from the preset inventory."
   },
   {
     "operation": "replace_inline",
-    "anchor": "歌詞の背後に落ち着いた背景を作るなら",
-    "replacement": "曲情報の背後に落ち着いた背景を作るなら",
-    "reason": "mIV sends no lyrics (see the note at the top of this page), so the colour example targets the track text instead."
+    "anchor": "どの比率にも、共通の10種類のプリセットがあります。",
+    "replacement": "どの比率にも **mIV Original** と、共通の10種類のプリセットがあります。**mIV Original** は、代表画像、曲情報、歌詞と音声グラフをまとめた初期表示です。",
+    "reason": "mIV Original is available for every bundled aspect ratio."
   }
 ]

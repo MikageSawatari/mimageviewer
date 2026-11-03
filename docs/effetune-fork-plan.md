@@ -536,7 +536,8 @@ F2a の候補ビルド・確認・承認の手順は [mIV Sound のビルド](mi
 F2a は §7.3〜7.4、bridge 環境と表記までで、§5 の移行本体は F2b。
 固定値は `config/miv-sound.rs` に集約する。`-SkipCTest` の候補は未承認のまま保持し、
 `-TestCandidate -Candidate <ID>` で同じ出力の ctest 成功記録を作ってから承認する。
-F3 まで公開説明書は同定義の `DOCS_VERSION` で既存 snapshot を維持する。
+F3 で公開説明書を mIV Sound 向けに更新した。URL は `v` 付きの `VERSION`、元の上流資料の版は `DOCS_VERSION` として分ける。
+生成器・公開文書・F4 の照合待ちは末尾の「F3 の実装記録」を参照。
 F2a はコミット済み（`e5731ca69`、`28f706c8a`）。実際の候補ビルドと ctest 111/111 は外部で確認済みだが、
 その旧候補には新しい構成・登録テストの記録が無いため承認には使わない。承認・release launcher は未完了。
 F2b-1 の移行本体・起動ゲート・検証入口は実装済み（§5.7）。実物の WebView2 と旧版素材による受け入れは別途行う。
@@ -747,3 +748,84 @@ ClaudeCode が根拠を読み、3 件を妥当と判断して第 8 版に反映�
 - 移行先のパスの長さ: 実物確認の最初の実行 (`run-migration-20261026-185550-453-24436`) は道具のフォルダが深く、IndexedDB の保存先が 260 文字を超えて失敗した。
   2 回目 (`target\wm\73d4d473`) は、短くしたルートを試作のホストの安全装置が「使い捨てのルートの外」として拒んだ (道具の不備、2424f124e で修正)。製品では
   `<data_dir>` の長さ + 116 文字が必要になる (深いフォルダに置いたポータブル版で超え得る。F4 で扱う)。
+
+## 17. F3 の実装記録 (2026-11-03)
+
+対象: `sound-f3`（`v5-integration` の `ea813e726` から分岐）。実装・執筆は Codex、設計・検収は ClaudeCode。
+文書と Python 生成器だけの作業。Rust のビルド・テスト、製品の起動、コミットは行っていない。
+
+### 17.1 生成器と公開文書
+
+- `scripts/gen-effetune-docs.py` は `config/miv-sound.rs` の `VERSION` に `v` を付けた版を公開 URL に使う。
+  現在は `manual/sound/v0.15.0-miv.2/`。上流資料の版 `DOCS_VERSION=v0.15.0` とは分け、
+  snapshot の `SOURCE.md` の `mIV Sound` / `Docs version` とそれぞれ照合する。
+  `DOCS_VERSION` の F3 待ちコメントと、生成器・説明書更新手順の F3 待ち記述を更新した。
+- 本文・title・description は完全一致の訂正を適用した後で EffeTune → mIV Sound に置換する。
+  上流のクレジットは後から付け、EffeTune / EffeTune Mixwright、Frieve、MIT を残す。LICENSE の全文は不変。
+  URL 共有の送り先は上流の Web アプリであり、「mIV Sound Web アプリ」と誤記しないよう訂正文を調整した。
+- 日本語 snapshot `c506bbab8a3dcd75bc5049ebb9b92572b526c557` の全 Markdown・LICENSE・4画像を
+  `G:\home\miv-sound\external\effetune` とバイト照合し、一致した。原文と画像は変更せず、現在版の `SOURCE.md` の対応情報だけ更新した。
+- `selection.json` の完全な採否台帳と README の見出し選別を維持する。内蔵プレーヤー、音楽ライブラリ、
+  LAN リモート操作、MCP、ブラウザ拡張、CUE、デスクトップだけの設定は取り込まない。
+  コントローラーの再生操作説明を除き、エフェクト・自動化・全体バイパス・A/B・プリセット操作を残した。
+- Counter の追加操作と Counter Gallery を除いた。原文には Counter の専用見出しがないため、完全一致の
+  段落に開始見出しを、続く Lyrics に終了境界となる見出しを足し、既存の `remove_section` で Counter の全設定を一括削除した。
+  各アンカーは従来どおり一意一致を要求し、削除後のフラグメントも検査する。
+- Lyrics / Lyric Stage と Cinema Strip の歌詞を説明し、LRC・埋め込み歌詞の優先順位、再生への追従、Remote では
+  歌詞非表示、行クリックでシークしないことを反映した。初回の mIV Original、起動時の「前回の表示 (デフォルト)」、
+  新規 Volume の 0 dB も反映した。実 UI は参照先の mIV と派生版のコード・日本語 locale で確認した。
+- `manual/effetune.html`、settings・music・video・目次、製品ページ、privacy 日英、installer/readme を更新した。
+  mIV data_dir 内の保存、旧共通先から一度だけコピーして原本を残すこと、DAW / デスクトップ版との自動共有をせず
+  バックアップで書き出し・読み込みすることを説明する。ユーザー VST の独自の保存先とは区別した。
+  旧 `effetune.html` は外部リンク・検索とプラグインのヘルプを維持するため改名しない。
+- マニュアル33ページのサイドバーを「音響調整」と `sound/index.html` に変更した。
+  利用者の「更新履歴は変えない」を優先し、`manual/changelog.html` はサイドバーを含め変更していない。
+  その旧説明書リンクは301で到達する。`CHANGELOG.md` と過去の版の実装・検証記録も書き換えていない。
+- integration-plan（§0・§5.1・§7・§10〜10.6・§17.4〜17.5）、now-playing-plan §1、release-checklist、
+  release-operations、native-dependencies、portable-build-plan、overrides/README に本計画を正本として参照させた。
+  過去の無改変版の記録と現在の手順を区別した。
+
+### 17.2 URL と検証
+
+- 新生成物は133 HTML（カテゴリ・ガイド・目次・license 20、個別エフェクト113）＋4画像＝137ファイルと入口1本。
+  `.gitattributes` に `sound/**/*.html` の LF 指定を追加した。
+- 旧 `manual/effetune/v0.15.0/` の133 HTML＋4画像の全137ファイルに同名の新転送先があることを確認して、
+  入口1本と合わせ138生成ファイルを撤去した。ディレクトリ・ファイルの再解析ポイントと生成印を確認し、未知のものは削除しなかった。
+- `.htaccess` の生成ブロックは301の規則3本（旧 EffeTune の全版、旧入口、Sound の他版）。
+  旧公開138 URL（HTML134・画像4）と、旧ディレクトリ入口の末尾 `/` 有無を扱う。
+  他版にも同じ規則を適用し、同名ファイルが無ければ現在の目次へ送る。現在の Sound 版や案内ページには転送を掛けない。
+  `--check` は旧 Sound 版に加え、旧 `manual/effetune/` の残存も拒否する。生成器は自動削除しない。
+- `python scripts/test_gen_effetune_docs.py`: **33件成功**。版の別々の照合、クレジットと原文保持、
+  歌詞・既定・保存先・Counter 除去、全生成ファイルと旧版の転送、旧ディレクトリ残存拒否を含む。
+- `python scripts/gen-effetune-docs.py --check`: **137ファイル＋入口＋301が一致**。
+- 公開マニュアル全体・製品ページ・privacy の **206ページ、相対リンクと画像等7,893件、欠落0**。
+  変更しない更新履歴の旧リンク1件も301で到達する。フラグメントも照合した。
+- `python scripts/check_site_cards.py`: **52枚、超過0**。
+- `python scripts/gen-sitemap-xml.py` で再生成し、`--check`: **216 URL 一致**。旧生成 URL は含まれない。
+- `git diff --check`: **成功**。更新履歴2ファイルの差分はない。
+- 独立レビュー（GPT-6.1 Sol / xhigh）は、起動時表示の設定場所が「表示」ではなく「起動」であると指摘した。
+  案内ページ・override・生成ページを訂正し、生成回帰に追加した。ほかの実質的指摘はなかった。
+  Apache 実サーバへの公開・HTTP応答の実測は行わず、規則のパターンと条件を模擬して検証した。
+
+### 17.3 F4 の取り込み時に揃える箇所（F3 ではポータブルの記述を維持）
+
+| 場所 | F4 後の照合内容 |
+| --- | --- |
+| `manual/effetune.html#open`、`#storage` | 「ポータブル版では音響調整を利用できません」を外す段階で、`data/effetune/` と初回移行の対象外条件を説明する |
+| `manual/settings.html` の動画・音声 / 音響調整の3段落 | 入力ピーク保護、タスクバー、最小化中表示の「ポータブル版には表示されません」を UI・検索の解禁と合わせる。自動表示設定の適用範囲も確認する |
+| `privacy.html` 日英の mIV Sound 保存先の info-box | 音響調整の利用不可を直し、ポータブルは `data/effetune/`、追加したユーザー VST の保存先・通信は別であることを説明する |
+| 製品ページ `index.html` のダウンロード比較表 | VST3 プラグインのポータブル「非対応」を同梱 host と実際の機能に合わせる |
+| 同ページの mIV Sound / VST3 SDK クレジット | 「単体exe版・インストーラ版」の範囲と「ポータブル版は mIV Sound と VST3 ホストを同梱しません」を通知全文の同梱と合わせる |
+| `docs/effetune-integration-plan.md` §7・§10.1・§17.5 | 旧版の非同梱理由・決定の履歴を保ち、現行 F4 仕様への案内を更新する |
+| `docs/release-checklist.md` Distribution、Phase 2 の署名・配布検査 | host / bundle 非同梱・UI 非表示の境界、ポータブルの APPDATA 不使用の範囲を合わせ、§6 の署名・VirusTotal（送信ごとに了承）の確認を加える |
+| `docs/release-operations.md` のポータブル誤検出と非同梱の節 | 過去の未署名 host の事故を履歴として残し、署名した host と plugin の再同梱の現行手順を示す |
+| `docs/portable-build-plan.md` §2・§4.7・§4.8・§8・§9 | 配布レイアウト、host 非同梱・自動無効化、診断 smoke の制限、確認項目と APPDATA 不使用の範囲を合わせる |
+
+### 17.4 判断と検収上の注意
+
+- URL の版は派生版の `VERSION`、上流資料の版は `DOCS_VERSION` と分けた。同じ上流版でも派生版の
+  挙動が変わるためで、対応を `SOURCE.md` に明示して付け替えを検査する。案内ページ自体の URL は維持した。
+- Counter は今回の F3 指示どおり除去した。一方、参照先 `G:\home\miv-sound` の Counter 関連コードは
+  独立レビュー中に並行更新されていた。将来の Counter 復帰・候補版変更は設計担当が採否を確定してから文書と版を揃える。
+  この作業は外部リポジトリを変更しておらず、並行更新を承認済み `0.15.0-miv.2` の仕様として採用していない。
+- F4 を反映していないこの差分を最終公開文書とせず、§17.3 を統合時に照合する。更新履歴の執筆と公開は設計担当へ引き継ぐ。

@@ -8,7 +8,7 @@
   {
     "operation": "replace_paragraph",
     "anchor": "**全体操作**では、エフェクトではなくアプリと音楽プレーヤーを操作します。**マスターバイパス**、**A/B切替**、**再生/一時停止**、**停止**、**次/前のトラック**、**10秒送り/戻し**、**再生速度**、**ピッチ固定**、**リピート**、**シャッフル**、**次/前のプリセット**を選べます。",
-    "replacement": "**全体操作**では、EffeTune の **マスターバイパス**、**A/B切替**、**次/前のプリセット**を操作できます。再生/一時停止、停止、トラック移動、10秒送り/戻し、再生速度、ピッチ固定、リピート、シャッフルは独立版 EffeTune のプレーヤー用で、mImageViewer の再生には働きません。",
+    "replacement": "**全体操作**では、mIV Sound の **マスターバイパス**、**A/B切替**、**次/前のプリセット**を操作できます。",
     "reason": "app-targets.js playerAction requires uiManager.audioPlayer, absent in VST; master bypass, A/B and preset step operate without it."
   },
   {

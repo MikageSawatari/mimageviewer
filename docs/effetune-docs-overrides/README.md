@@ -1,10 +1,14 @@
-# EffeTune 説明書の再生成
+# mIV Sound 説明書の再生成
 
 日本語スナップショットだけを使用する、ネットワーク不要の変換器。
 生成 HTML は編集せず、`scripts/gen-effetune-docs.py` またはこのフォルダーの
 訂正ルールを変更する。
 
-2026-10-10 の v0.13.0 実装レビュー訂正:
+仕様の正本は [派生版計画 §10](../effetune-fork-plan.md#10-マニュアル製品ページ公開文書)。
+名称・クレジットは §2、保存と初回コピーは §4〜5、ポータブルの有効化は別作業 F4。
+原文 EffeTune / EffeTune Mixwright（Frieve、MIT）の名前は転載注記・license に残す。
+
+2026-10-10 の v0.13.0 実装レビュー訂正（履歴）:
 
 - `resonator.json`: Adaptive Prediction は同梱 VST の native 処理を使うため、
   独立版の WebAssembly 音声設定を有効にする条件を除去する。
@@ -14,18 +18,22 @@
   新版の更新時にも独立版の操作条件が再流入しないことを確認する。
 
 ```powershell
-python scripts/gen-effetune-docs.py --version v0.15.0
+python scripts/gen-effetune-docs.py
 python scripts/test_gen_effetune_docs.py
-python scripts/gen-effetune-docs.py --version v0.15.0 --check
+python scripts/gen-effetune-docs.py --check
+python scripts/check_site_cards.py
+python scripts/gen-sitemap-xml.py
+python scripts/gen-sitemap-xml.py --check
 ```
 
-版の正本は `config/miv-sound.rs` の `DOCS_VERSION`。指定された `--version` よりも優先し、
-派生版の配布の版とは分ける。mIV Sound 用の本文・表記の作り替えは F3 で行う。
-スナップショットと同梱版の対応は `SOURCE.md` でも検証する。
+版の正本は `config/miv-sound.rs`。`VERSION` に `v` を付けた版が公開 URL となり、`--version` より優先する。
+`DOCS_VERSION` は元の上流説明書の版。`SOURCE.md` の `mIV Sound` と `Docs version` の両方を照合し、
+同じ snapshot の無審査の付け替えを拒否する。本文・title・description の「EffeTune」は訂正後に「mIV Sound」へ置換する。
+上流サービスの案内は訂正で「上流の Web アプリ」などにしてから置換し、URL・拡張子・上流のクレジットを保つ。
 
 ## 出力とリンク
 
-- `htdocs/mimageviewer/manual/effetune/index.html`: 同梱版の目次への入口。
+- `htdocs/mimageviewer/manual/sound/index.html`: 同梱版の目次への入口。
   meta refresh、canonical、表示リンクを持ち、noindex のためサイトマップには入らない。
 - `<version>/<category>.html`: カテゴリの導入・共通操作・プラグイン一覧。
 - `<version>/<category>-<heading-id>.html`: 一覧で指定された各プラグインの説明。
@@ -44,10 +52,10 @@ python scripts/gen-effetune-docs.py --version v0.15.0 --check
 
 `--check` は版フォルダー内のファイルに加え入口ページの欠落・古い内容も検出する。
 現在版だけを公開する。入口の切り替え後は、以前の版フォルダーを明示的に公開ツリーから除く。
-旧版URLは `.htaccess` の生成ブロックで現在版へ301転送する。同名ページが無ければ目次へ送る。
+旧 `manual/effetune/` の入口・全版と `manual/sound/` の他版は `.htaccess` の生成ブロックで現在版へ301転送する。同名ページが無ければ目次へ送る。
 `--check` は空の旧版フォルダーも拒否する。予期しないファイルがある場合、通常生成も
 勝手に削除せず失敗する。
-生成 HTML には `.gitattributes` の `effetune/**/*.html` の LF 指定が適用される。
+生成 HTML には `.gitattributes` の `sound/**/*.html` の LF 指定が適用される。案内ページ `manual/effetune.html` は外部リンクと検索のため維持する。
 
 ## 訂正ルールと分割
 
@@ -75,7 +83,7 @@ README の Web アプリ用 HTML は変換対象に入らない。
 
 個別ページには共通操作を読めるカテゴリへのリンクも置く。
 公開するページ構成や訂正内容が変わったら、テストとサイトマップを再生成・検証する。
-サイトマップは今回の段Dでは変更せず、コミット後に設計担当が再生成する。
+サイトマップも再生成して検証する。コミット後の日付確定は設計担当が再生成する。
 
 ## README の節採否 (2026-10-03)
 
@@ -107,7 +115,21 @@ README の Web アプリ用 HTML は変換対象に入らない。
 | トラブルシューティングとFAQ、技術情報（ブラウザ互換性、ブラウザサポートの詳細、推奨サンプルレート） | ブラウザ／独立アプリの要件・設定。mIV の利用条件は mIV ページで案内 |
 | 利用可能なエフェクト、開発ガイド | エフェクト一覧は生成目次に全111件掲載済み。開発ガイドは利用者向け操作の対象外 |
 
-## 現在の同梱版と訂正 (2026-10-28)
+## mIV Sound 向け訂正 (F3、2026-11-03)
+
+- 原文は `c506bbab` の日本語 snapshot（上流 v0.15.0）。派生版 `0.15.0-miv.2` と対応づけて
+  `manual/sound/v0.15.0-miv.2/` に133 HTML＋4画像を生成する。上流原文・LICENSE・画像は変更しない。
+- `selection.json` の完全なページ台帳と README の見出し選別で、内蔵プレーヤー・ライブラリ・LAN・MCP・
+  ブラウザ拡張・CUE・デスクトップだけの設定を除外する。コントローラーの再生操作説明も除く。
+- Counter は原文に専用見出しがないため、完全一致の段落に見出しを挿入し、Lyrics の見出しまでを既存の
+  `remove_section` で一括削除する。Counter Gallery と追加一覧の Counter も除く。一意一致の検査は維持する。
+- Lyrics と Lyric Stage、Cinema Strip の歌詞を説明し、mIV の LRC・タグ・再生追従・Remote での非表示と
+  行クリックでシークしない条件を明記する。mIV Original と「前回の表示 (デフォルト)」、新規 Volume 0 dB を反映する。
+- IR・SFZ 参照の保存先を mIV data_dir 内へ変更。プリセットの自動共有は行わず、バックアップで受け渡す。
+  上流 Web アプリへ開く共有 URL は保持し、架空の mIV Sound Web アプリとは書かない。
+- 旧公開生成物は除去し、旧入口と全版の各ページを301転送する。F4 待ちのポータブル文言と更新履歴は変更しない。
+
+## 同梱版と訂正 (2026-10-28、履歴)
 
 既定 snapshot は `c506bbab8a3dcd75bc5049ebb9b92572b526c557`。
 Mixwright v0.15.0 release commit `8c9a0a561d2ee88d2eef6b06bab138bbd639b3c1` の
