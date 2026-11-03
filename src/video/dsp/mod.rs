@@ -16,6 +16,7 @@
 pub mod bridge;
 pub mod coordinator;
 pub mod extract;
+pub(crate) mod foreground;
 pub mod gui;
 pub mod scanner;
 
@@ -1732,11 +1733,7 @@ impl DspBridge {
             return Err("GUI or presentation gate is not attached".into());
         }
         if auto_revision.is_none() {
-            unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
-                    bridge.process_id(),
-                );
-            }
+            foreground::allow_host(bridge.process_id());
         }
         // Only the ordered host signal stream publishes slot visibility.
         bridge

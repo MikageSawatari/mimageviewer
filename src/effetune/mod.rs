@@ -33,7 +33,7 @@ pub(crate) fn running_gui_tooltip(effective: Option<EffectiveState>) -> String {
             "音響調整にエフェクトが無いか、全体バイパス中です (設定の窓を閉じた時点の内容で判定しています)"
         }
         Some(EffectiveState::Unparseable(_)) => "音響調整の設定を判定できません",
-        None => "音響調整の設定を確認中です",
+        None => "音響調整の設定は未確認です (設定の窓を閉じると判定します)",
     };
     format!(
         "音響調整の窓を表示して前面に出します。窓を隠すにはタイトルバーの × を押します。\n点灯は音響調整が有効なことを示します。\n{status}"
@@ -300,8 +300,26 @@ impl Default for LatestCapture {
 
 struct CaptureJob {
     generation: u64,
+    confirmation: CaptureConfirmation,
     bridge: Arc<DspBridge>,
     reply: mpsc::Sender<Result<Vec<u8>, CaptureError>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CaptureConfirmation {
+    // With no restored state, WebView JS may not have created its default
+    // chain yet. Keep the captured bytes, but do not publish a DSP verdict.
+    InitialUnsaved,
+    Confirmed,
+}
+
+impl CaptureConfirmation {
+    fn effective_state(self, state: EffectiveState) -> Option<EffectiveState> {
+        match self {
+            Self::InitialUnsaved => None,
+            Self::Confirmed => Some(state),
+        }
+    }
 }
 
 enum CaptureCommand {
@@ -451,12 +469,13 @@ impl CaptureQueue {
                             &state_path,
                             job.generation,
                             &bytes,
-                            effective.clone(),
+                            job.confirmation.effective_state(effective.clone()),
                             &worker_publication,
                         )?;
                         crate::logger::log(format!(
-                            "[EffeTune] capture generation={} state={effective:?} bytes={} elapsed_ms={}",
+                            "[EffeTune] capture generation={} confirmation={:?} state={effective:?} bytes={} elapsed_ms={}",
                             job.generation,
+                            job.confirmation,
                             bytes.len(),
                             started.elapsed().as_millis()
                         ));
@@ -486,23 +505,48 @@ impl CaptureQueue {
         &self,
         bridge: Arc<DspBridge>,
     ) -> Result<mpsc::Receiver<Result<Vec<u8>, CaptureError>>, CaptureError> {
+        self.request_with_confirmation(bridge, CaptureConfirmation::Confirmed)
+    }
+
+    fn request_with_confirmation(
+        &self,
+        bridge: Arc<DspBridge>,
+        confirmation: CaptureConfirmation,
+    ) -> Result<mpsc::Receiver<Result<Vec<u8>, CaptureError>>, CaptureError> {
         if !self.accepting.load(Ordering::Acquire) {
             return Err(CaptureError::Interrupted(
                 "state capture is stopping".into(),
             ));
         }
-        self.enqueue(bridge)
+        self.enqueue(bridge, confirmation)
+    }
+
+    fn request_initial(
+        &self,
+        bridge: Arc<DspBridge>,
+        has_saved_state: bool,
+    ) -> Result<mpsc::Receiver<Result<Vec<u8>, CaptureError>>, CaptureError> {
+        self.request_with_confirmation(
+            bridge,
+            if has_saved_state {
+                CaptureConfirmation::Confirmed
+            } else {
+                CaptureConfirmation::InitialUnsaved
+            },
+        )
     }
 
     fn enqueue(
         &self,
         bridge: Arc<DspBridge>,
+        confirmation: CaptureConfirmation,
     ) -> Result<mpsc::Receiver<Result<Vec<u8>, CaptureError>>, CaptureError> {
         let generation = self.next_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let (reply, rx) = mpsc::channel();
         self.tx
             .send(CaptureCommand::Capture(CaptureJob {
                 generation,
+                confirmation,
                 bridge,
                 reply,
             }))
@@ -527,7 +571,7 @@ impl CaptureQueue {
         self.accepting.store(false, Ordering::Release);
         let deadline = Instant::now() + EXIT_FENCE;
         self.publication.begin_exit(deadline);
-        let rx = self.enqueue(Arc::clone(&bridge));
+        let rx = self.enqueue(Arc::clone(&bridge), CaptureConfirmation::Confirmed);
         let _ = self.tx.send(CaptureCommand::Stop);
         match rx {
             Ok(rx) => Some(ExitCaptureFence {
@@ -599,7 +643,7 @@ fn publish_capture_state(
     path: &Path,
     generation: u64,
     bytes: &[u8],
-    effective: EffectiveState,
+    effective: Option<EffectiveState>,
     publication: &PublicationGate,
 ) -> Result<(), CaptureError> {
     // Only this serial worker writes the file, so the generation check and I/O need no lock.
@@ -613,7 +657,7 @@ fn publish_capture_state(
     let mut current = latest.lock().unwrap();
     current.generation = generation;
     current.bytes = Some(bytes.to_vec());
-    current.effective = Some(effective);
+    current.effective = effective;
     Ok(())
 }
 
@@ -1308,10 +1352,48 @@ impl EffetuneController {
     }
 
     pub fn request_show_gui_with_permit(&self, permit: ShowIntent) {
+        self.request_show_gui_with_presenter(permit, |bridge| {
+            let snapshot = crate::video::dsp::read_editor_ui_snapshot(&bridge.editor_ui_snapshot());
+            snapshot
+                .hwnd_pids
+                .iter()
+                .next()
+                .is_some_and(|(&hwnd, &pid)| {
+                    crate::video::dsp::foreground::activate_visible_editor(hwnd, pid)
+                })
+        });
+    }
+
+    fn request_show_gui_with_presenter(
+        &self,
+        permit: ShowIntent,
+        activate_visible: impl FnOnce(&DspBridge) -> bool,
+    ) {
         if remote_playback_active(&self.remote_session) {
             return;
         }
         if let Some(bridge) = self.bridge.as_ref() {
+            // This path runs on the input/UI thread. It changes neither host
+            // visibility nor its requested state; hidden/iconic editors still
+            // need the checked worker/host show and restore lifecycle.
+            if matches!(permit, ShowIntent::Manual(_))
+                && let Ok(gate) = self.main_window.gate()
+                && permit.allows(
+                    show_permit(&self.main_window, &self.remote_session),
+                    false,
+                    bridge.main_window_is_minimized(),
+                    &gate,
+                )
+                && activate_visible(bridge)
+            {
+                self.auto_open.note_show_result(
+                    permit,
+                    crate::video::dsp::bridge::GuiVisibilityOutcome::Shown,
+                    &gate,
+                );
+                return;
+            }
+            crate::logger::log(format!("[EffeTune GUI] show via host intent={permit:?}"));
             let _ = self.host_tx.send(HostCommand::Show {
                 bridge: Arc::clone(bridge),
                 permit,
@@ -1738,7 +1820,7 @@ fn load_worker(
         .try_reset_plugins_sync()
         .map_err(EffetuneFailure::ProcessFailed)?;
     let rx = captures
-        .request(Arc::clone(&bridge))
+        .request_initial(Arc::clone(&bridge), saved.is_some())
         .map_err(|error| EffetuneFailure::LoadFailed(error.to_string()))?;
     match rx.recv_timeout(INITIAL_CAPTURE_WAIT) {
         Ok(Ok(_)) => {}
@@ -2005,6 +2087,93 @@ mod tests {
             crate::runtime_locks::exclusive(&container.join(second), crate::runtime_locks::IN_USE)
                 .is_ok()
         );
+    }
+
+    #[test]
+    #[cfg(not(feature = "portable"))]
+    fn manual_visible_editor_activates_on_caller_without_host_show_or_visibility_mutation() {
+        let mut controller = auto_test_controller();
+        let (host_tx, host_rx) = mpsc::channel();
+        controller.host_tx = host_tx;
+        let bridge = new_bridge();
+        let (host, _commands, _events) = crate::video::dsp::bridge::Bridge::fake_host_for_test();
+        bridge.install_fake_host_for_test(host);
+        bridge.mark_enabled_without_bridge_for_test();
+        controller.publish_running(Arc::clone(&bridge));
+        assert!(matches!(
+            host_rx.try_recv(),
+            Ok(HostCommand::RegisterBridge(_))
+        ));
+        let gate = controller.gui_gate().unwrap();
+        let before = gate.auto_snapshot();
+        let intent = ShowIntent::Manual(show_permit(
+            &controller.main_window,
+            &controller.remote_session,
+        ));
+        let caller = std::thread::current().id();
+        let visibility = bridge.slot(0).unwrap().gui_visible;
+        controller.request_show_gui_with_presenter(intent, |target| {
+            assert!(std::ptr::eq(target, bridge.as_ref()));
+            assert_eq!(std::thread::current().id(), caller);
+            true // Native boundary reports an existing visible, restored HWND.
+        });
+        assert!(host_rx.try_recv().is_err());
+        assert_eq!(bridge.slot(0).unwrap().gui_visible, visibility);
+        assert!(controller.slot.snapshot().is_some());
+        assert!(controller.auto_open.spent.load(Ordering::Acquire));
+        assert_ne!(gate.auto_snapshot().revision, before.revision);
+    }
+
+    #[test]
+    #[cfg(not(feature = "portable"))]
+    fn hidden_editor_and_auto_show_keep_checked_host_delivery() {
+        let mut controller = auto_test_controller();
+        let (host_tx, host_rx) = mpsc::channel();
+        controller.host_tx = host_tx;
+        let bridge = new_bridge();
+        let (host, _commands, _events) = crate::video::dsp::bridge::Bridge::fake_host_for_test();
+        bridge.install_fake_host_for_test(host);
+        bridge.mark_enabled_without_bridge_for_test();
+        controller.publish_running(Arc::clone(&bridge));
+        assert!(matches!(
+            host_rx.try_recv(),
+            Ok(HostCommand::RegisterBridge(_))
+        ));
+        let manual = show_permit(&controller.main_window, &controller.remote_session);
+        controller.request_show_gui_with_presenter(ShowIntent::Manual(manual), |_| false);
+        assert!(
+            matches!(host_rx.try_recv(), Ok(HostCommand::Show { permit: ShowIntent::Manual(value), .. }) if value == manual)
+        );
+        assert!(!controller.auto_open.spent.load(Ordering::Acquire));
+        let auto = AutoPermit {
+            manual,
+            projection: controller.gui_gate().unwrap().auto_snapshot(),
+        };
+        controller.request_show_gui_with_presenter(ShowIntent::AutoVideo(auto), |_| {
+            panic!("AutoVideo must never foreground on the UI thread")
+        });
+        assert!(
+            matches!(host_rx.try_recv(), Ok(HostCommand::Show { permit: ShowIntent::AutoVideo(value), .. }) if value == auto)
+        );
+        assert!(host_rx.try_recv().is_err());
+        assert!(!bridge.slot(0).unwrap().gui_visible);
+    }
+
+    #[test]
+    #[cfg(not(feature = "portable"))]
+    fn revoked_manual_intent_never_activates_a_visible_editor() {
+        let mut controller = auto_test_controller();
+        let (host_tx, _host_rx) = mpsc::channel();
+        controller.host_tx = host_tx;
+        let bridge = new_bridge();
+        bridge.mark_enabled_without_bridge_for_test();
+        controller.publish_running(bridge);
+        let manual = show_permit(&controller.main_window, &controller.remote_session);
+        controller.gui_gate().unwrap().note_minimized();
+        controller.request_show_gui_with_presenter(ShowIntent::Manual(manual), |_| {
+            panic!("revoked request must remain checked by host")
+        });
+        assert!(!controller.auto_open.spent.load(Ordering::Acquire));
     }
 
     #[test]
@@ -2460,6 +2629,87 @@ mod tests {
     }
 
     #[test]
+    fn initial_capture_without_saved_state_stays_unknown_until_the_window_closes() {
+        initial_capture_confirmation_transition(false);
+    }
+
+    #[test]
+    fn initial_capture_with_saved_state_is_confirmed_immediately() {
+        initial_capture_confirmation_transition(true);
+    }
+
+    fn initial_capture_confirmation_transition(has_saved_state: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixwright-state.json");
+        let initial = if has_saved_state {
+            fixture(r#"[{"name":"Volume","enabled":true}]"#, "[]", "A", false)
+        } else {
+            fixture("[]", "[]", "A", false)
+        };
+        let closed = fixture(
+            r#"[{"name":"Volume","enabled":true},{"name":"Level Meter","enabled":true}]"#,
+            "[]",
+            "A",
+            false,
+        );
+        let initial_reply = initial.clone();
+        let closed_reply = closed.clone();
+        let calls = AtomicU64::new(0);
+        let queue = CaptureQueue::new_with_capture(path.clone(), move |_| {
+            Ok(if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                initial_reply.clone()
+            } else {
+                closed_reply.clone()
+            })
+        });
+        let mut app = crate::app::setup_app_for_test();
+        app.effetune.captures = Arc::new(queue);
+        let bridge = new_bridge();
+        app.effetune.publish_running(Arc::clone(&bridge));
+        let result = app
+            .effetune
+            .captures
+            .request_initial(bridge, has_saved_state)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, initial);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            initial,
+            "provisional capture still preserves the bytes"
+        );
+        assert_eq!(
+            app.effetune.effective_state(),
+            has_saved_state.then_some(EffectiveState::Effective)
+        );
+        assert_eq!(app.effetune_toolbar_active(), has_saved_state);
+        if !has_saved_state {
+            assert!(app.effetune_toolbar_tooltip().contains("未確認"));
+            assert!(!app.effetune_toolbar_tooltip().contains("エフェクトが無い"));
+        }
+        app.effetune.capture_on_hide();
+        app.effetune
+            .pending_capture
+            .take()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            app.effetune.effective_state(),
+            Some(EffectiveState::Effective)
+        );
+        assert!(app.effetune_toolbar_active());
+        assert!(
+            app.effetune_toolbar_tooltip()
+                .contains("音響調整は有効です")
+        );
+        assert_eq!(fs::read(&path).unwrap(), closed);
+    }
+
+    #[test]
     fn older_capture_cannot_replace_newer_state_or_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mixwright-state.json");
@@ -2470,7 +2720,7 @@ mod tests {
             &path,
             2,
             b"new",
-            EffectiveState::Effective,
+            Some(EffectiveState::Effective),
             &publication,
         )
         .unwrap();
@@ -2479,7 +2729,7 @@ mod tests {
             &path,
             1,
             b"old",
-            EffectiveState::Inert,
+            Some(EffectiveState::Inert),
             &publication,
         )
         .unwrap();
@@ -2496,7 +2746,7 @@ mod tests {
             &directory_target,
             3,
             b"not written",
-            EffectiveState::Inert,
+            Some(EffectiveState::Inert),
             &publication,
         );
         assert!(error.is_err());

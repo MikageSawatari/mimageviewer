@@ -21902,9 +21902,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     ///
     /// これは受動的なヒントなので、ビューアがメインウィンドウを専有している間 (独自の
     /// ホバーヘッダーを持つ) と、モーダル相当のダイアログが画面を持っている間は出さない。
-    /// 後者を入れているのは、ツールチップが同じ `Order::Middle` の後ろに描かれるため、
-    /// 放っておくと「重要な変更点」のようなダイアログの手前へ重なるから (実機 2026-09-07)。
-    /// 順序を入れ替えるのではなく描かないことで、どのダイアログでも同じ結果になる。
+    /// モーダル中のヒントは不要なので抑止する。非モーダルの Window が開いている間は
+    /// 一覧操作を続けられるため表示し、専用の背景直上 layer で常に Window より下へ置く。
+    /// 同じ Middle order の登録順や Window を開いた順には依存させない。
     pub(crate) fn selection_info_tooltip_suppressed(&self) -> bool {
         self.viewer_session_blocks_main_window()
             || self.common_modal_dialog_open()
@@ -21997,8 +21997,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let y = selection_info_popup_y(cell_rect, viewport, measured_h);
         let area_pos = egui::pos2(x, y);
 
-        egui::Area::new(egui::Id::unique("selection_info"))
-            .order(egui::Order::Middle)
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::unique("selection_info"));
+        // Keep the passive hint above the root grid/bars, below all Windows,
+        // even when this Area is first registered after an existing Window.
+        ctx.set_sublayer(egui::LayerId::background(), layer);
+        egui::Area::new(layer.id)
+            .order(layer.order)
             .interactable(false)
             .fixed_pos(area_pos)
             .show(ctx, |ui| {
@@ -23067,8 +23071,8 @@ mod selection_info_tests {
             "通常の一覧では出す"
         );
 
-        // 「重要な変更点」は共通のモーダル一覧に載っている。ツールチップは同じ
-        // `Order::Middle` の後ろに描かれるので、出したままだとダイアログへ重なる。
+        // 「重要な変更点」は共通のモーダル一覧に載っている。
+        // layer順とは独立に、モーダル中は受動的なヒントそのものを描かない。
         app.show_whats_new = true;
         assert!(
             app.selection_info_tooltip_suppressed(),
@@ -23081,6 +23085,145 @@ mod selection_info_tests {
             app.selection_info_tooltip_suppressed(),
             "個別のダイアログ名ではなく共通の述語で決める"
         );
+    }
+
+    #[test]
+    fn selection_info_stays_below_a_nonmodal_window_opened_first() {
+        selection_info_layer_transitions(true);
+    }
+
+    #[test]
+    fn selection_info_stays_below_a_nonmodal_window_opened_later() {
+        selection_info_layer_transitions(false);
+    }
+
+    fn selection_info_layer_transitions(window_first: bool) {
+        fn collect_text(shape: &egui::Shape, text: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(shape) => text.push(shape.galley.job.text.clone()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut app = app_with_item(
+            GridItem::Image(PathBuf::from(r"C:\pics\selection-layer.jpg")),
+            Some((1_600_000_000, 100)),
+        );
+        app.selected_cell_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(30.0, 30.0),
+            egui::vec2(120.0, 50.0),
+        ));
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let phases = [
+            (window_first, !window_first),
+            (true, true),
+            (false, true),
+            (true, true),
+            (true, false),
+            (true, true),
+        ];
+        let mut frame = 0;
+        for (show_window, show_info) in phases {
+            for warmup in 0..4 {
+                let output = crate::test_ui::headless_paint_output(ctx.run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(640.0, 400.0),
+                        )),
+                        time: Some(frame as f64 * 0.1),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        let draw_window = || {
+                            if show_window {
+                                egui::Window::new("nonmodal-window")
+                                    .id(egui::Id::unique("nonmodal-window"))
+                                    .fixed_pos(egui::pos2(20.0, 70.0))
+                                    .min_size(egui::vec2(300.0, 140.0))
+                                    .collapsible(false)
+                                    .show(ctx, |ui| {
+                                        ui.label("modeless-contents");
+                                    });
+                                // A fixed Middle Area must also stay above the hint.
+                                egui::Area::new(egui::Id::unique("middle-panel"))
+                                    .order(egui::Order::Middle)
+                                    .fixed_pos(egui::pos2(400.0, 70.0))
+                                    .interactable(false)
+                                    .show(ctx, |ui| {
+                                        ui.label("middle-panel");
+                                    });
+                            }
+                        };
+                        // Exercise both invocation orders independently of open order.
+                        if warmup % 2 == 0 {
+                            draw_window();
+                        }
+                        if show_info {
+                            app.render_selection_info(ctx);
+                        }
+                        if warmup % 2 != 0 {
+                            draw_window();
+                        }
+                        // Draw root last too: sublayer ordering must keep the hint above it.
+                        ctx.root_ui(|ui| {
+                            ui.label("grid-background");
+                        });
+                    },
+                ));
+                frame += 1;
+                if show_info && show_window && warmup >= 2 {
+                    assert!(
+                        !app.selection_info_tooltip_suppressed(),
+                        "nonmodal windows must not suppress the hint or list input"
+                    );
+                    let mut text = Vec::new();
+                    for shape in &output.shapes {
+                        collect_text(&shape.shape, &mut text);
+                    }
+                    let index = |needle: &str| {
+                        text.iter()
+                            .position(|text| text.contains(needle))
+                            .unwrap_or_else(|| panic!("missing {needle}: {text:?}"))
+                    };
+                    let info = index("selection-layer.jpg");
+                    assert!(
+                        index("grid-background") < info,
+                        "hint must remain above the root grid: {text:?}"
+                    );
+                    assert!(
+                        info < index("modeless-contents"),
+                        "hint must remain below Window regardless of registration order: {text:?}"
+                    );
+                    assert!(
+                        info < index("middle-panel"),
+                        "hint must remain below fixed Middle Areas: {text:?}"
+                    );
+                    let info_rect = ctx
+                        .memory(|m| m.area_rect(egui::Id::unique("selection_info")))
+                        .unwrap();
+                    let window_layer = egui::LayerId::new(
+                        egui::Order::Middle,
+                        egui::Id::unique("nonmodal-window"),
+                    );
+                    let window_rect = ctx.memory(|m| m.area_rect(window_layer.id)).unwrap();
+                    let overlap = info_rect.intersect(window_rect);
+                    assert!(overlap.is_positive(), "exercise actual overlap");
+                    assert_eq!(
+                        ctx.layer_id_at(overlap.center()),
+                        Some(window_layer),
+                        "passive hint must not capture Window input"
+                    );
+                }
+                output.drop_without_applying_deltas();
+            }
+        }
     }
 
     #[test]
