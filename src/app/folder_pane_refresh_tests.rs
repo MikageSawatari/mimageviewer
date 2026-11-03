@@ -34,9 +34,307 @@ fn tree_event_frame(app: &mut App, ctx: &egui::Context, frame: &mut u64, events:
         |ui| {
             app.handle_keyboard(ctx);
             app.render_folder_pane(ui);
+            app.finish_folder_pane_presentation(ctx, true);
         },
     )
     .drop_without_applying_deltas();
+}
+
+fn complete_tree_frame(
+    app: &mut App,
+    ctx: &egui::Context,
+    frame: &mut u64,
+    events: Vec<egui::Event>,
+) {
+    *frame += 1;
+    ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 480.0),
+            )),
+            time: Some(*frame as f64 / 60.0),
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            app.handle_keyboard(ctx);
+            assert!(app.render_toolbar(ui).0.is_none());
+            app.render_folder_pane(ui);
+            assert!(app.render_grid(ui).is_none());
+            app.finish_folder_pane_presentation(ctx, true);
+        },
+    )
+    .drop_without_applying_deltas();
+}
+
+fn frame_end_tree_toggle_scenario(case: &str) {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    let root = app.tmp.path().join("frame-end-tree");
+    let branch = root.join("z-branch");
+    let active = branch.join("z-current");
+    std::fs::create_dir_all(&active).unwrap();
+    for parent in [&root, &branch] {
+        for index in 0..80 {
+            std::fs::create_dir(parent.join(format!("a-{index:03}"))).unwrap();
+        }
+    }
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(8, 8)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    for index in 0..3 {
+        std::fs::write(active.join(format!("img{index}.png")), png.get_ref()).unwrap();
+    }
+    app.folder_pane.test_scan_subtree(root);
+    app.load_folder(active.clone());
+    settle(&mut app, &ctx);
+    app.settings.folder_tree_pane_visible = false;
+    let mut frame = 0;
+    if case == "toolbar_close_then_f" {
+        app.set_folder_tree_pane_visible(true);
+        assert_tree_location(&mut app, &ctx, &mut frame, &active);
+        // Toolbar close never commits this explicit cursor. A temporary F close
+        // caused by processing the packet backwards must not start an Open.
+        app.folder_pane.set_cursor(branch.join("a-079"));
+    }
+    for _ in 0..3 {
+        complete_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+    }
+    let toolbar: egui::Rect = ctx
+        .data(|data| data.get_temp(egui::Id::unique("folder_pane_test_toggle_rect")))
+        .unwrap();
+    let pos = if case.starts_with("toolbar") {
+        toolbar.center()
+    } else {
+        egui::pos2(900.0, 400.0)
+    };
+    let pointer = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let key = egui::Event::Key {
+        key: egui::Key::F,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    if case != "key_only" && case != "accepted_f_then_arrow" {
+        complete_tree_frame(
+            &mut app,
+            &ctx,
+            &mut frame,
+            vec![egui::Event::PointerMoved(pos), pointer(true)],
+        );
+    }
+    if case == "accepted_f_then_arrow" {
+        app.selected = Some(0);
+    }
+    let events = match case {
+        "key_only" => vec![key],
+        "accepted_f_then_arrow" => vec![
+            key,
+            egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+        "toolbar_only" => vec![pointer(false)],
+        "accepted_f_then_grid_release" => vec![key, pointer(false)],
+        _ => vec![pointer(false), key],
+    };
+    complete_tree_frame(&mut app, &ctx, &mut frame, events);
+    if case == "accepted_f_then_arrow" {
+        assert_eq!(app.selected, Some(1));
+    }
+    assert!(app.settings.folder_tree_pane_visible, "{case}");
+    assert!(
+        app.folder_pane.has_focus,
+        "frame-end toggle must own focus: {case}"
+    );
+    assert!(
+        app.folder_pane_open_pending.is_none(),
+        "an intermediate close must not navigate: {case}"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        complete_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+        if !app.folder_pane.has_pending() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_tree_location(&mut app, &ctx, &mut frame, &active);
+}
+
+#[test]
+fn folder_pane_frame_end_grid_release_then_f_reveals_and_focuses_current() {
+    frame_end_tree_toggle_scenario("grid_then_f");
+}
+
+#[test]
+fn folder_pane_frame_end_toolbar_close_then_f_opens_without_intermediate_navigation() {
+    frame_end_tree_toggle_scenario("toolbar_close_then_f");
+}
+
+#[test]
+fn folder_pane_frame_end_f_alone_reveals_current() {
+    frame_end_tree_toggle_scenario("key_only");
+}
+
+#[test]
+fn folder_pane_frame_end_toolbar_alone_reveals_current() {
+    frame_end_tree_toggle_scenario("toolbar_only");
+}
+
+#[test]
+fn folder_pane_accepted_frame_end_tradeoff_f_before_grid_release_keeps_tree_focus() {
+    // User-approved limitation: all frame clicks run before the queued toggle,
+    // including a grid release that physically followed F in the same packet.
+    frame_end_tree_toggle_scenario("accepted_f_then_grid_release");
+}
+
+#[test]
+fn folder_pane_accepted_frame_end_tradeoff_f_before_arrow_moves_grid() {
+    // User-approved limitation: hidden F does not change routing until frame end.
+    frame_end_tree_toggle_scenario("accepted_f_then_arrow");
+}
+
+#[test]
+fn folder_pane_frame_end_composes_accepted_toggle_parity_without_intermediate_commit() {
+    use crate::ui_folder_pane::FolderPaneToggleKind::{CommitCursorOnClose, VisibilityOnly};
+    for shown in [false, true] {
+        for count in 1..=3 {
+            let mut app = setup_app_for_test();
+            let ctx = egui::Context::default();
+            let active = app.tmp.path().join("active");
+            let other = active.join("other");
+            std::fs::create_dir_all(&other).unwrap();
+            app.current_folder = Some(active.clone());
+            app.items_are_drive_list = false;
+            app.folder_pane.test_scan_subtree(active.clone());
+            app.set_folder_tree_pane_visible(shown);
+            if shown {
+                app.folder_pane.set_cursor(other.clone());
+            }
+            for _ in 0..count {
+                app.request_folder_tree_pane_toggle(CommitCursorOnClose);
+            }
+            assert_eq!(
+                app.settings.folder_tree_pane_visible, shown,
+                "deferred until finish"
+            );
+            app.finish_folder_pane_presentation(&ctx, true);
+            let visible = shown ^ (count % 2 != 0);
+            assert_eq!(app.settings.folder_tree_pane_visible, visible);
+            assert_eq!(app.folder_pane.has_focus, visible);
+            assert!(app.folder_pane_visibility_request.is_none());
+            if visible {
+                // No drawing/scans have run: inspect the cursor directly via
+                // Enter's read-only command, independently of cached rows.
+                assert_eq!(
+                    app.folder_pane
+                        .handle_tree_key(crate::folder_pane::FolderPaneTreeKey::Enter),
+                    Some(crate::folder_pane::FolderPaneCommand::Open(active.clone()))
+                );
+                assert!(app.folder_pane_open_pending.is_none());
+            } else {
+                assert_eq!(
+                    app.folder_pane_open_pending
+                        .as_ref()
+                        .map(|pending| &pending.path),
+                    shown.then_some(&other)
+                );
+            }
+            app.finish_folder_pane_presentation(&ctx, true);
+            assert_eq!(
+                app.settings.folder_tree_pane_visible, visible,
+                "consumed once"
+            );
+        }
+    }
+    // The final accepted handler determines close semantics (not raw event order).
+    for last in [CommitCursorOnClose, VisibilityOnly] {
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        let active = app.tmp.path().join("active");
+        let other = active.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        app.current_folder = Some(active.clone());
+        app.items_are_drive_list = false;
+        app.folder_pane.test_scan_subtree(active);
+        app.set_folder_tree_pane_visible(true);
+        app.folder_pane.set_cursor(other);
+        for kind in [VisibilityOnly, CommitCursorOnClose, last] {
+            app.request_folder_tree_pane_toggle(kind);
+        }
+        app.finish_folder_pane_presentation(&ctx, true);
+        assert!(!app.settings.folder_tree_pane_visible);
+        assert_eq!(
+            app.folder_pane_open_pending.is_some(),
+            matches!(last, CommitCursorOnClose)
+        );
+    }
+}
+
+#[test]
+fn folder_pane_frame_end_non_main_chrome_consumes_show_without_starting_scans() {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    let active = app.tmp.path().join("active");
+    std::fs::create_dir_all(&active).unwrap();
+    app.current_folder = Some(active);
+    app.items_are_drive_list = false;
+    app.settings.folder_tree_pane_visible = false;
+    app.request_folder_tree_pane_toggle(
+        crate::ui_folder_pane::FolderPaneToggleKind::CommitCursorOnClose,
+    );
+    app.finish_folder_pane_presentation(&ctx, false);
+    assert!(app.settings.folder_tree_pane_visible);
+    assert!(app.folder_pane.has_focus);
+    assert!(app.folder_pane_visibility_request.is_none());
+    assert!(!app.folder_pane.has_pending());
+}
+
+#[test]
+fn folder_pane_frame_end_gamepad_accept_closes_without_restarting_open() {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    let active = app.tmp.path().join("active");
+    let other = active.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    app.current_folder = Some(active.clone());
+    app.items_are_drive_list = false;
+    app.folder_pane.test_scan_subtree(active);
+    app.set_folder_tree_pane_visible(true);
+    app.folder_pane.set_cursor(other.clone());
+    app.request_folder_tree_pane_toggle(
+        crate::ui_folder_pane::FolderPaneToggleKind::CommitCursorOnClose,
+    );
+    assert!(app.handle_gamepad_grid_accept(&ctx).is_none());
+    let cancel = app
+        .folder_pane_open_pending
+        .as_ref()
+        .unwrap()
+        .cancel
+        .clone();
+    app.finish_folder_pane_presentation(&ctx, true);
+    assert!(!app.settings.folder_tree_pane_visible);
+    assert!(!app.folder_pane.has_focus);
+    let pending = app.folder_pane_open_pending.as_ref().unwrap();
+    assert_eq!(pending.path, other);
+    assert!(std::sync::Arc::ptr_eq(&cancel, &pending.cancel));
+    assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(app.folder_pane_visibility_request.is_none());
 }
 
 fn settle_tree_scans(app: &mut App, ctx: &egui::Context, frame: &mut u64) {

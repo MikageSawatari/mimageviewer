@@ -11341,8 +11341,12 @@ impl App {
                     let resp = ui
                         .add(egui::Button::selectable(active, "ツリー").sense(tree_sense))
                         .on_hover_text(format!("左側に実フォルダツリーを表示\n{lead_hint}"));
+                    #[cfg(test)]
+                    ui.ctx().data_mut(|data| data.insert_temp(egui::Id::unique("folder_pane_test_toggle_rect"), resp.rect));
                     if resp.clicked() {
-                        self.set_folder_tree_pane_visible(!active);
+                        self.request_folder_tree_pane_toggle(
+                            crate::ui_folder_pane::FolderPaneToggleKind::VisibilityOnly,
+                        );
                     }
                     self.finish_toolbar_section_lead(
                         ui,
