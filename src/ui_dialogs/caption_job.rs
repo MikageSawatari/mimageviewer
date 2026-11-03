@@ -160,7 +160,7 @@ impl CaptionJob {
                 progress.unsupported += 1;
                 progress.video_cover += 1;
             }
-            CaptionItemOutcome::Failed => progress.failed += 1,
+            CaptionItemOutcome::Failed | CaptionItemOutcome::FailedWritten => progress.failed += 1,
             CaptionItemOutcome::Discarded => progress.discarded += 1,
             CaptionItemOutcome::Cancelled => {}
         }
@@ -378,6 +378,15 @@ impl App {
             let result = match job.worker.events.try_recv() {
                 Ok(CaptionWorkerEvent::Started(_kill)) => continue,
                 Ok(CaptionWorkerEvent::ItemDone(outcome)) => {
+                    if matches!(
+                        outcome,
+                        CaptionItemOutcome::Created | CaptionItemOutcome::FailedWritten
+                    ) {
+                        // These outcomes alone carry SaveOutcome::Written.
+                        if let Some(manager) = self.indexer_init.as_ref() {
+                            manager.notify_caption_changed();
+                        }
+                    }
                     if let Err(error) = job.item_done(outcome, &mut self.caption_display) {
                         Some(Err(error))
                     } else {
@@ -514,10 +523,14 @@ mod tests {
             CaptionItemOutcome::PasswordRequired,
             CaptionItemOutcome::VideoCover,
             CaptionItemOutcome::Failed,
+            CaptionItemOutcome::FailedWritten,
             CaptionItemOutcome::Discarded,
             CaptionItemOutcome::Cancelled,
         ] {
             let mut app = crate::app::setup_app_for_test();
+            let index_data = app.tmp.path().join("caption-index");
+            let caption_epoch = app.caption_epoch_for_test(&index_data);
+            let before = caption_epoch.load(Ordering::Acquire);
             let (mut job, commands, events) = job();
             job.append(vec!["C:/images/a.png".into(), "C:/images/b.png".into()].into());
             job.advance().unwrap();
@@ -537,6 +550,22 @@ mod tests {
                 "{outcome:?}"
             );
             assert_eq!(app.caption_display.epoch_for_test(), epoch);
+            let committed = matches!(
+                outcome,
+                CaptionItemOutcome::Created | CaptionItemOutcome::FailedWritten
+            );
+            assert_eq!(
+                caption_epoch.load(Ordering::Acquire),
+                before + u64::from(committed),
+                "{outcome:?}"
+            );
+            assert_eq!(
+                app.caption_job.as_ref().unwrap().progress.failed,
+                usize::from(matches!(
+                    outcome,
+                    CaptionItemOutcome::Failed | CaptionItemOutcome::FailedWritten
+                ))
+            );
             assert_item(&commands, "C:/images/b.png");
         }
     }

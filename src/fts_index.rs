@@ -1,6 +1,6 @@
 //! Tantivy ベースの全文検索インデックス (docs/search-architecture.md)。
 //!
-//! ## 役割 (INDEX_VERSION=10)
+//! ## 役割 (INDEX_VERSION=11)
 //!
 //! - bigram tokenizer (`NgramTokenizer(2, 2)` + `lower_caser`) で画像 / PDF / 動画メタと
 //!   音声ファイル名を転置索引化
@@ -14,7 +14,7 @@
 //!   通常タグ操作は tags.db のみを書き、Tantivy へ投影しない。
 //!   詳細は [search-architecture.md §4.2](../docs/search-architecture.md)
 //!
-//! ## スキーマ (INDEX_VERSION=10)
+//! ## スキーマ (INDEX_VERSION=11)
 //!
 //! ```text
 //! path             STRING | STORED            完全一致キー、正規化済み
@@ -32,6 +32,7 @@
 //! video_meta_text  TEXT   bigram | STORED     FFmpeg container metadata (video only)
 //! tags             TEXT   STORED              旧タグschema互換用 (通常検索/移行対象外)
 //! sidecar_text     TEXT   bigram | STORED     外部メタデータサイドカー (JSON/TXT) の値 (image only)
+//! ai_caption_text  TEXT   bigram | STORED     AI 説明文・画像内の文字・検索語 (image / PDF / EPUB)
 //! ```
 //!
 //! per-source に分けているのは、「検索対象フィルタ」 (`SearchTarget::Only`) で
@@ -84,6 +85,8 @@ pub enum SourceKind {
     /// 外部メタデータサイドカー (画像と同名の JSON/TXT) の値テキスト。
     /// mIV タグ (`Tags`) とは別系統の読み取り専用フリーテキスト (docs/sidecar-metadata-ingest.md)。
     Sidecar,
+    /// Local AI descriptions, visible text and keywords.
+    AiCaption,
 }
 
 impl SourceKind {
@@ -95,6 +98,7 @@ impl SourceKind {
         SourceKind::PdfMeta,
         SourceKind::VideoMeta,
         SourceKind::Sidecar,
+        SourceKind::AiCaption,
     ];
 }
 
@@ -272,6 +276,7 @@ pub struct Fields {
     pub video_meta_text: Field,
     pub tags: Field,
     pub sidecar_text: Field,
+    pub ai_caption_text: Field,
 }
 
 impl Fields {
@@ -304,6 +309,9 @@ impl Fields {
             sidecar_text: schema
                 .get_field("sidecar_text")
                 .expect("schema: sidecar_text"),
+            ai_caption_text: schema
+                .get_field("ai_caption_text")
+                .expect("schema: ai_caption_text"),
         }
     }
 
@@ -318,6 +326,7 @@ impl Fields {
             SourceKind::VideoMeta => self.video_meta_text,
             SourceKind::Tags => self.tags,
             SourceKind::Sidecar => self.sidecar_text,
+            SourceKind::AiCaption => self.ai_caption_text,
         }
     }
 }
@@ -489,6 +498,7 @@ pub fn upsert_doc(writer: &IndexWriter, fields: &Fields, d: &IndexDoc) -> tantiv
         fields.video_meta_text => d.norms.video_meta.as_str(),
         fields.tags            => d.norms.tags.as_str(),
         fields.sidecar_text    => d.norms.sidecar.as_str(),
+        fields.ai_caption_text => d.norms.ai_caption.as_str(),
     ))?;
     Ok(())
 }
@@ -510,7 +520,7 @@ pub fn delete_doc(writer: &IndexWriter, fields: &Fields, path: &str) {
 /// ## フィールド間の OR (§19 分割対応)
 ///
 /// `SearchTarget::All` では `name / exif_text / xmp_tweet_text / png_prompt_text /
-/// pdf_meta_text / video_meta_text / sidecar_text` に対して OR を取る
+/// pdf_meta_text / video_meta_text / sidecar_text / ai_caption_text` に対して OR を取る
 /// (ソースを跨いでトークンが見つかれば OK)。
 /// `SearchTarget::Only([...])` では指定フィールドのみで OR。
 /// トークン 1 つあたり: (AND of bigrams) を各対象フィールドで作り、フィールド間を OR でまとめる。
@@ -707,6 +717,7 @@ pub fn doc_per_source_text(
         video_meta: read(fields.video_meta_text),
         tags: read(fields.tags),
         sidecar: read(fields.sidecar_text),
+        ai_caption: read(fields.ai_caption_text),
     })
 }
 
@@ -791,7 +802,8 @@ fn schema_is_stale(schema: &Schema) -> bool {
         && schema.get_field("tags").is_ok()
         // INDEX_VERSION=8: 外部メタデータサイドカーのフィールド。これを欠く v7 以前の
         // index は stale 扱いにして wipe + 再構築させる (無いと Fields::from_schema が panic)。
-        && schema.get_field("sidecar_text").is_ok();
+        && schema.get_field("sidecar_text").is_ok()
+        && schema.get_field("ai_caption_text").is_ok();
     if !has_new {
         return true;
     }
@@ -808,6 +820,7 @@ fn schema_is_stale(schema: &Schema) -> bool {
         "video_meta_text",
         "tags",
         "sidecar_text",
+        "ai_caption_text",
     ] {
         let Ok(field) = schema.get_field(name) else {
             return true;
@@ -849,6 +862,8 @@ fn build_schema() -> Schema {
     // 外部メタデータサイドカー (JSON/TXT) の値テキスト (INDEX_VERSION=8)。bigram + STORED。
     // mIV タグとは別系統の読み取り専用フリーテキスト (docs/sidecar-metadata-ingest.md)。
     b.add_text_field("sidecar_text", text_opts.clone());
+    // INDEX_VERSION=11: successful local captions, including visible text and keywords.
+    b.add_text_field("ai_caption_text", text_opts.clone());
     // 旧schema互換用に STORED fieldを残す。通常検索/旧タグ移行には使わない。
     b.add_text_field("tags", text_opts);
     b.build()
@@ -924,6 +939,7 @@ mod tests {
                 video_meta: String::new(),
                 tags: String::new(),
                 sidecar: String::new(),
+                ai_caption: String::new(),
             },
         }
     }
@@ -980,6 +996,7 @@ mod tests {
         assert!(s.get_field("pdf_meta_text").is_ok());
         assert!(s.get_field("video_meta_text").is_ok());
         assert!(s.get_field("tags").is_ok());
+        assert!(s.get_field("ai_caption_text").is_ok());
         assert!(
             s.get_field("sidecar_text").is_ok(),
             "INDEX_VERSION=8 で sidecar_text フィールドが追加されている"
@@ -1043,6 +1060,82 @@ mod tests {
             },
         );
         assert!(q_tags.is_none());
+    }
+
+    #[test]
+    fn ai_caption_round_trips_and_is_excluded_by_explicit_target() {
+        let (_tmp, idx) = new_index();
+        let mut writer = idx.writer().unwrap();
+        let mut document = sample_doc("c:/caption.jpg", Uuid::new_v4(), "ordinary name");
+        document.norms.ai_caption = "captionsecret visibleletters keywordtoken".into();
+        upsert_doc(&writer, idx.fields(), &document).unwrap();
+        writer.commit().unwrap();
+        idx.reload_reader().unwrap();
+        let searcher = idx.searcher();
+        for target in [
+            SearchTarget::All,
+            SearchTarget::Only(vec![SourceKind::AiCaption]),
+        ] {
+            let query = build_bigram_and_query(
+                idx.fields(),
+                &["captionsecret"],
+                &QueryFilters {
+                    target: target.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let hits = search_page(&searcher, idx.fields(), &query, 0, 10).unwrap();
+            assert_eq!(hits.len(), 1);
+            let stored = doc_per_source_text(&searcher, idx.fields(), hits[0].1).unwrap();
+            assert_eq!(stored.ai_caption, document.norms.ai_caption);
+            assert!(
+                doc_text_for_target(&searcher, idx.fields(), hits[0].1, &target)
+                    .unwrap()
+                    .contains("visibleletters")
+            );
+        }
+        let without_captions = SearchTarget::Only(
+            SourceKind::ALL
+                .iter()
+                .copied()
+                .filter(|source| *source != SourceKind::AiCaption)
+                .collect(),
+        );
+        let query = build_bigram_and_query(
+            idx.fields(),
+            &["captionsecret"],
+            &QueryFilters {
+                target: without_captions.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            search_page(&searcher, idx.fields(), &query, 0, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let all = q_all(idx.fields(), &["captionsecret"]).unwrap();
+        let hits = search_page(&searcher, idx.fields(), &all, 0, 10).unwrap();
+        assert!(
+            !doc_text_for_target(&searcher, idx.fields(), hits[0].1, &without_captions)
+                .unwrap()
+                .contains("captionsecret")
+        );
+    }
+
+    #[test]
+    fn pre_caption_schema_requires_rebuild() {
+        let current = build_schema();
+        let mut old = Schema::builder();
+        for (_, entry) in current.fields() {
+            if entry.name() != "ai_caption_text" {
+                old.add_field(entry.clone());
+            }
+        }
+        assert!(schema_is_stale(&old.build()));
+        assert!(!schema_is_stale(&current));
     }
 
     #[test]

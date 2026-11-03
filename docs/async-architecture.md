@@ -1319,7 +1319,8 @@ worker の完了通知を poll で採用するまで App の owner とモデル�
 
 画像の読み込み・回転DBの参照・推論・保存は job worker 内で行い、保存は `BEGIN IMMEDIATE` 後に
 入力署名を再確認する。モデルの出力を保存する前に、前後の空白を除いた完全一致の検索語だけを重複除去する。
-表示キャッシュの無効化はworkerの保存hookから行わず、App側の1件完了採用点から行う（§3.2.4）。索引接続は後段。
+表示キャッシュの無効化はworkerの保存hookから行わず、App側の1件完了採用点から行う（§3.2.4）。
+説明文DBへの保存が commit された終端では、索引用の共有世代番号も進める（§3.2.5）。
 フォルダ移動・detachedのclose・Remote利用では止めない。App終了だけは共有kill handleで子を即時停止し、
 UI threadでworkerをjoinしない。詳細と状態簡素化の判断は [計画 §21.7.3](local-vlm-caption-plan.md#2173-v1-3c-作成ジョブ)。
 
@@ -1354,6 +1355,36 @@ Appの完了点で採用して全消去する。`caption_display_stale` は説�
 detachedの述語・viewport・context別cacheを変更せず、Remoteのパネル・IPCへは接続しない。
 境界と簡素化の判断は [画像の設計 §21.11.2](local-vlm-caption-plan.md#21112-v1-4a-画像の説明文の表示) と
 [本の設計 §21.13](local-vlm-caption-plan.md#2113-v1-4b-の設計-2026-11-03) を参照。
+
+### 3.2.5 AI 説明文の索引への反映（V2a、未リリース）
+
+反映待ちの正本は `ai_caption.db` の `captions.indexed = 0` と `caption_removed`。
+`IndexerManager` が1つの `Arc<AtomicU64>`（`caption_epoch`）を所有し、再構成workerから
+全 metadata supervisor へ同じ参照を渡す。送り手は内容のcommit後、Appの既存完了採用点から
+世代を進めるだけで、UIスレッドのDB参照・管理役一覧への配布・容量付き通知channelを追加しない。
+固定表紙だけの変更は世代を進めない。managerが未準備の間の変更もDBの反映待ちに残る。
+AppがReadyを採用するときにも世代を一度進め、background側の初回反映完了からUI採用までの
+間にcommit終端を採用した場合を拾う。新たな待機状態や未処理フラグは持たない。
+
+各supervisorは自分の `seen` だけを保持し、既存の最大1秒の起床で、読み始める前に取った世代と
+比較する。反映後にその値を `seen` にするため、途中のcommitによる世代更新を消費しない。
+metadata有効の管理役だけが、既存 `OwnedRange` のSQL区間内を最大500件ずつ読み、既存の
+候補作成と `IngestSession::apply` によって再取込または削除する。取消・ActivityGate・I/O優先度・
+バッチ・Tantivy First順序は既存経路を使う。反映済みの更新は索引commit/reloadとmetadata更新の
+完了後、読んだ `(item_key, rev, removed)` に一致するものだけに行う。
+
+初回走査の後（省略した場合も）と、手動・overflow・watch回復の全件走査の後にも反映する。
+ingestのreadonly接続がDB未作成で開けなかった場合は、次の走査・反映の開始時に開き直す。
+初回構成の確定後、全お気に入りrootの外にある削除の印だけを一度整理する。metadata無効の
+お気に入り内や共通除外内の印はこの整理で消さない。反映済み更新の失敗はログを残し、
+次回起動・全件走査で拾い直す。説明文を読めない場合は文書作成を継続するが、applyの読取失敗件数が
+あればACKしない。通常watch/scanが反映済みの説明文を空欄へ置き換えた場合も修復できるよう、
+DB読取失敗は既存writer reporterのログ・通知・次起動再構築予約へ渡す。正常なDB未作成は区別し、
+予約しない。既存の索引書込失敗も同じreporterの通知・再構築予約を維持する。
+
+Ctrl+Fは索引を使わず、検索workerがreadonly接続を1回開き、表示中の画像と本の `ok` 行を
+読み込んでから既存の2 passで照合する。実装範囲と送り手の監査は
+[説明文計画 §21.16](local-vlm-caption-plan.md#2116-v2a-実装記録)を参照。
 
 ### 3.3 フルスクリーン読み込みの優先度制御
 

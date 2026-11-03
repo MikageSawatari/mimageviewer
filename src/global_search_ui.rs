@@ -229,6 +229,7 @@ impl TargetChoice {
             TargetChoice::Only(SourceKind::VideoMeta) => "動画メタ情報",
             TargetChoice::Only(SourceKind::Tags) => "タグ",
             TargetChoice::Only(SourceKind::Sidecar) => "サイドカー",
+            TargetChoice::Only(SourceKind::AiCaption) => "AI 説明",
         }
     }
 
@@ -260,6 +261,7 @@ pub const TARGET_CHOICES: &[TargetChoice] = &[
     TargetChoice::Only(SourceKind::PdfMeta),
     TargetChoice::Only(SourceKind::VideoMeta),
     TargetChoice::Only(SourceKind::Sidecar),
+    TargetChoice::Only(SourceKind::AiCaption),
 ];
 
 // アイテム検索 (Ctrl+G) の対象は 画像 / PDF / 動画 / 音声。フォルダ・ZIP はコンテナなので

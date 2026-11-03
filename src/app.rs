@@ -33350,6 +33350,9 @@ impl App {
         self.indexer_init = match outcome {
             crate::indexer_manager::StartupInitOutcome::Ready(manager) => {
                 // Current SW_HIDE state, not a snapshot taken when the worker began.
+                // Terminals consumed while Pending cannot reach this manager. Resample
+                // durable pending rows after adoption, even if its initial drain finished.
+                manager.notify_caption_changed();
                 manager.set_io_throttled(!self.window_visible);
                 if crate::perf::is_enabled() {
                     crate::perf::event("startup", "metadata_search_ready", None, 0, &[]);
@@ -48782,12 +48785,43 @@ impl App {
         crate::logger::log(message);
     }
 
+    /// DB writers publish only committed caption changes. Startup also drains
+    /// durable pending rows when the manager is not ready yet.
+    pub(crate) fn notify_caption_changed(&self) {
+        if let Some(manager) = self.indexer_init.as_ref() {
+            manager.notify_caption_changed();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn caption_epoch_for_test(
+        &mut self,
+        data_dir: &std::path::Path,
+    ) -> Arc<std::sync::atomic::AtomicU64> {
+        if self.indexer_init.as_ref().is_none() {
+            self.indexer_init = IndexerInit::Ready(
+                crate::indexer_manager::IndexerManager::new_at(
+                    data_dir,
+                    &[],
+                    crate::settings::IndexerSpeedProfile::default(),
+                    Arc::clone(&self.activity_gate),
+                    Vec::new(),
+                )
+                .expect("caption sender test manager"),
+            );
+        }
+        self.indexer_init.as_ref().unwrap().caption_epoch()
+    }
+
     pub(crate) fn apply_metadata_import_terminal_refresh(
         &mut self,
         result: metadata_import_refresh::RefreshResult,
         changed: crate::metadata_transfer::ImportChangedSections,
     ) -> (Vec<String>, bool) {
         // DB writes have committed even if a context needs another terminal refresh.
+        if changed.ai_captions {
+            self.notify_caption_changed();
+        }
         if changed.ai_captions || changed.thumbnail_pins {
             self.caption_display.clear();
         }

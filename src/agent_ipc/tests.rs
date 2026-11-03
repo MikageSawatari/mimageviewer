@@ -117,6 +117,7 @@ impl Fixture {
                     file_size: 0,
                     norms: crate::ingest_text::PerSourceText {
                         name: format!("cat{i}"),
+                        ai_caption: "captionsecret".into(),
                         ..Default::default()
                     },
                 };
@@ -383,6 +384,36 @@ fn fts_fixture_search_uses_live_favorites_and_has_cursor() {
         panic!()
     };
     assert!(other.items.is_empty());
+}
+
+#[test]
+fn search_items_excludes_ai_captions_from_query_and_postfilter() {
+    let f = Fixture::new();
+    f.seed_index();
+    let connection = f.connection();
+    for (id, query, expected) in [
+        (1, "captionsecret", 0),
+        (2, "cat captionsecret", 0),
+        (3, "cat -captionsecret", 4),
+    ] {
+        let Payload::Items(page) = f
+            .call(
+                &connection,
+                id,
+                Command::SearchItems {
+                    query: query.into(),
+                    kind: Some(ItemKind::Image),
+                    limit: None,
+                    cursor: None,
+                },
+            )
+            .result
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(page.items.len(), expected, "{query}");
+    }
 }
 
 /// Cargo exposes CARGO_BIN_EXE only to the package that owns a binary. This

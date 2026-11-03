@@ -63,6 +63,8 @@ pub enum CaptionItemOutcome {
     PasswordRequired,
     VideoCover,
     Failed,
+    /// A failed row was committed; unlike a retained old ok row, it needs reflection.
+    FailedWritten,
     Discarded,
     Cancelled,
 }
@@ -685,7 +687,7 @@ fn save_request(
         None => Ok(CaptionItemOutcome::Cancelled),
         Some(SaveOutcome::Discarded) => Ok(CaptionItemOutcome::Discarded),
         Some(SaveOutcome::Written) => Ok(if failed {
-            CaptionItemOutcome::Failed
+            CaptionItemOutcome::FailedWritten
         } else {
             CaptionItemOutcome::Created
         }),
@@ -918,7 +920,7 @@ mod tests {
         };
         assert_eq!(
             process_item(&config, &db, None, &cancel, &path, 1, &mut failed).unwrap(),
-            CaptionItemOutcome::Failed
+            CaptionItemOutcome::FailedWritten
         );
         assert_eq!(
             db.get(&path.to_string_lossy()).unwrap().unwrap().status,
@@ -1044,7 +1046,7 @@ mod tests {
                 &mut |_, _, _, _| panic!("undecodable input inferred")
             )
             .unwrap(),
-            CaptionItemOutcome::Failed
+            CaptionItemOutcome::FailedWritten
         );
         assert_eq!(
             db.get(&path.to_string_lossy()).unwrap().unwrap().status,

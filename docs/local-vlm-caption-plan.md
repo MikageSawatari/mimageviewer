@@ -2205,6 +2205,100 @@ V2b は V2a の反映の仕組みと読み込みの関数を使うので、こ�
   - 種類の絞り込み。
   - MCP の分類。
 
+### 21.16 V2a 実装記録
+
+2026-11-03、基準 `2771e7c06`、`vlm-caption` の未コミット差分。正本は §21.15
+（独立設計レビューの履歴は §19.22・§19.23）。この記録は実装担当の記録で、独立実装レビューの判定ではない。
+
+#### 21.16.1 実装範囲と判断
+
+- `ai_caption_text`／`SourceKind::AiCaption`／`PerSourceText.ai_caption` と INDEX_VERSION 11。
+  説明文・画像内の文字・検索語は `ok` 行だけを空白で連結し、既存bigram／STORED／後置照合を通す。
+  画像・PDF・EPUBのingestで読む。署名が古い説明文も検索対象とする既定を維持する。
+- ingestのreadonly接続はセッション内で保持し、未作成で開けなかった場合は次の走査・反映の開始で
+  開き直す。管理役にはmanagerと同じdata_dirのDBパスを渡す（`new_at` の隔離も維持）。
+- `CaptionDb::pending_in_ranges` は既存 `OwnedRange::sql_ranges()` の半開区間だけを読み、
+  `mark_reflected` は `(item_key, rev, removed)` が一致する行だけを更新・削除する。
+  管理役は最大500件を既存候補作成→ingestへ流し、全commit/reload・metadata更新が完了した後に
+  ACKする。取消・索引失敗時はACKせず、その回の反映を終える。
+- DB未作成とopen失敗は接続の `Result<Option<CaptionDb>, String>` で区別する。
+  open/get失敗でも通常ingestは説明文なしの文書を作るが、そのapplyの読取失敗件数を返し、反映は
+  ACKせず終了する。通常watch/scanが既に反映済みの説明文を空欄で置き換えた場合も拾い直せるよう、
+  読取失敗は既存writer reporterのログ・通知・次起動再構築予約へ渡す。DB未作成では予約しない。
+  caption原本は変更せず、新しいretryや回復手順を足さない。単にログだけでは、同じ署名の文書と
+  `indexed = 1` の組が次回Fullにも残るため、この既存の粗い出口が必要だった。
+- 全管理役に共有する `caption_epoch` と管理役ごとの `seen` だけを使用。世代は反映前に取得し、
+  反映後にその値を採用する。初回走査の後（省略時を含む）、全件走査の後、世代更新時に反映する。
+  全件走査本体の順序は保ち、開始時の接続確認と終了後の反映を外側に置いた。
+- 起動時にmanagerをAppが受け取る前の終端は、Ready採用時に同じ世代を一度進めて拾う。
+  起動pollの後にbackgroundでReadyと初回反映が完了し、同じframeのジョブ完了pollがまだPendingを
+  見る順序も通常の操作で到達できるため、初回反映だけには依存しない。追加状態は持たない。
+- 初回構成後に一度だけ全お気に入りroot外の削除印を整理する。実効metadata所有範囲とは分け、
+  metadata無効・共通除外・子のお気に入りの中の印はこの整理で消さない。
+- Ctrl+Fのworkerがreadonly DBを1回開いて、画像・本（PDF/EPUB・ZIP・変換書庫・フォルダ）の
+  `ok` 行を先に読む。Pass 1/2で既存の比較文字列へ加える。ZIP内のファイル名固定は維持。
+  Ctrl+G/ Ctrl+F共通の選択肢に「AI 説明」を追加。MCPは同じSearchScopeの対象指定を使い、
+  候補検索と後置照合の双方からAiCaptionを除く。
+- 状態を減らす判断は §21.15.4 のとおり。追加queue・旗の配布・DB更新ごとの独自索引文書生成・
+  自動retryを作らない。まれなDB失敗はログ＋次回起動/全件走査、索引書込失敗は既存reporterを使う。
+- 旧Tantivy 0.26.2 fixtureは旧schemaのまま保存し、raw APIの読取・更新・削除・merge・再open検査を
+  残した。現行アプリAPIからは新しい必須欄が無い索引を作り直す検査を分けた。fixture再生成は不要。
+- V2bの候補追加・結果の種類・Flat/Drill・種類絞り込み・MCP分類は変更していない。
+  マニュアル・製品ページ・privacyに説明文の検索と端末内の索引への保存を追記した。
+
+#### 21.16.2 書き手の再監査と通知
+
+`src` の `ai_caption.db`／`CaptionDb`／`captions` のSQLと、V1の表示失効の呼出箇所をgrepで再監査した。
+内容を変えるcommitの所有者は次の5群。反映用ACKと削除印の整理は内容更新の通知対象に含めない。
+
+| 書き手とcommitの所有者 | commit後の通知境界 |
+| --- | --- |
+| `ai/caption_job_worker::save_request` → `CaptionDb::save_unless_cancelled` | `poll_caption_job` の `Created` / `FailedWritten`。失敗行のWrittenと既存okを保持したKeptExistingOkが同じFailedに畳まれていたため、保存済みだけを区別するvariantを追加。従来の失敗集計は維持し、Discarded/取消/未保存では通知しない |
+| `metadata_transfer::apply_ai_caption`（attached DBのDELETE / INSERT ON CONFLICT、import batch commit） | commit済み `ImportChangedSections.ai_captions` を `apply_metadata_import_terminal_refresh` で採用。元contextが古い場合も通知する |
+| STORES: `rename_key_migration::migrate_store`、`migrate_book_store`、`copy_store_transaction`、`purge_store`、`metadata_cleanup::delete_store` | 各commit後の `record_rows_changed` → 新しい `StoreMutationEffects.ai_captions_changed` → `apply_content_identity_store_mutations`。一般改名・移動、本の一時キー経由の入替、コピー、復元、hard purge、孤児整理とその各完了経路を含む |
+| `content_identity::restore` の `copy_stores_at_with_maintenance` | `app/content_identity_restore` の復元完了採用。既存ledger増分採用を維持するため、成功時の直接採用箇所でAI変更効果を通知する |
+| `book_append_undo::MetadataWriter::initialize_entry` の追記先 `CaptionDb::delete` | 削除件数が正の場合の `captions_changed` を `finish_book_append_metadata` で採用 |
+
+STORESの効果は説明文DBだけの実変更を表し、固定表紙を含む `caption_display_stale` と分けた。
+0行変更・pin-only・read-onlyの表示再入場・一覧再読込は索引用世代を進めない。
+画像フォルダZIP化の `image_folder_zip_metadata::copy_store_rows` はpage/container/ratingsだけを
+allowlistしており、説明文の書き手ではない。従来の表示失効用の人工 `ai_captions = true` を外し、
+既存の表示キャッシュ全消去は維持した。これ以外の直接save/delete/生SQLはテストfixtureだった。
+
+#### 21.16.3 検証
+
+検証担当は実装担当に集約。対象はこの節の未コミット差分、通常feature、test/dev-runtime profile。
+Cargoは `--offline` または `CARGO_NET_OFFLINE=true` で実行した。
+
+| 確認 | 結果と証拠 |
+| --- | --- |
+| `cargo check --offline -p mimageviewer --bin mimageviewer-core`（初期統合時） | exit 0。後続の読取失敗修正は統合テスト・確認用buildで通常featureのコンパイルを再確認する |
+| nextest、`--lib -E 'test(/caption_reflection\|caption_read_failure\|caption_epoch\|skipped_initial_scan_reflects\|ai_caption_db::tests\|ingest_worker::tests\|fts_index::tests\|fts_meta::tests\|ingest_text::tests\|caption_removed_cleanup_runs_once/)'` | **115件成功**、exit 0、run `84574ce8-78d4-454c-94d3-f5642049bef6`。`target/v2a-focused.log` |
+| nextest、libの関連範囲（FTS writer/integrity、管理役、所有範囲、walker/watcher、global search、metadata_ops、agent_ipc、caption、STORES、metadata_transfer、append/undo、content identity、Ctrl+F/検索バー。上の115件は除外して再利用） | **901件実行、899成功、2失敗**、exit 100、run `2e48a6ed-82ce-4c4d-90d3-d1d6acc36bee`。`target/v2a-related.log` / `target/v2a-related.junit.xml` |
+| MCPのquery/postfilter除外、Ctrl+Fの画像と本、Ready採用前の通知 | 上の関連実行で各新規テスト成功をJUnitでも確認 |
+| nextest、`--test search_metadata_e2e --test fts_tantivy_compat --test fts_tantivy_integrity` | 33件のうち32件成功。旧fixtureのアプリ再構築テスト1件は、単独openで自動wipeするという期待が誤っており失敗。単独openの拒否・原本保持→`IndexerManager::new_at` の共通ownerによる再構築へ直し、その1件を次行で再確認。run `25dcab65-485f-49b3-9c09-7506d3c8317d`、`target/v2a-integration.log` |
+| nextest、`--test fts_tantivy_compat -E 'test(=application_rebuilds_historical_fixture_without_caption_schema)'` | **1件成功**、exit 0。元の32件と合わせ統合33件の成功を確認。test-onlyの修正なので元の32件は再実行しない。run `5200d377-48bf-4148-9a08-6ae2bd7e2715`、`target/v2a-compat-recheck.log` |
+| `scripts/build-dev.ps1 -PreserveRuntime` | **exit 0**。最終ソースの通常feature、dev-runtime。core 2分49秒、remote 0.53秒、EPUB worker 0.52秒、MCP adapter 0.36秒。PE検査 runtime=4 / pe=4成功。`target/v2a-build-dev.log`、`target/vcrt-pe-reports/dev-runtime.json`。portableは有効にせず、製品は起動していない |
+| UIグリフ / 製品カード長 / 差分空白 | `python scripts/check_ui_glyphs.py` 0件、`python scripts/check_site_cards.py` 50件・超過0、`git diff --check` exit 0 |
+
+関連実行の2失敗は既存の
+`agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry` と
+`agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`。
+前者は名前付きパイプのclient open（`pipe.rs`）、後者はfixture serverの作成で
+Windowsエラー5 `PermissionDenied`。後者はadapter実行体の取得・起動より前に停止した。
+この環境でのIPC実transport検証は未完了とし、権限を変更した再実行や製品起動は行わない。
+新規MCP検索ハンドラテストは成功しており、これら2件を成功扱いにはしていない。
+
+初回の焦点実行（113件）は109成功・4失敗だった。4件は空のvisible_text/keywordsを連結して
+末尾空白が入ったことによる新規期待値との差で、空欄を連結から除き、上の115件で再確認した。
+型確認時の欄・引数・テスト配置の追従漏れも実行前に修正した。正常終了していないコンパイルを
+成功証拠には含めない。
+
+最終整形は引数なしの `cargo fmt`。本体lib全件は設計担当が実行する。
+実装とは別の担当が差分を点検し、起動採用前の通知とDB読取失敗の2経路を指摘したため、
+§21.16.1の修正と回帰を追加した。その後の追加指摘はなかった。設計担当の検収・実機確認は未実施。
+製品起動・外部通信・`G:\home\vlm-eval\` の参照・コミットは行っていない。
+
 ### 19.22 22 回目 (2026-11-03、同じ担当の続き、基準 `220cb5fb3`、V2 の設計)
 
 P2 6 件・P3 2 件。§21.15 に足した: 起動時に DB が無かった接続は次の反映・走査で開き直す (P2) / 走査の本の候補はディレクトリを先に判定する (P2) /

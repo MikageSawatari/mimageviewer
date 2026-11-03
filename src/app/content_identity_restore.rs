@@ -417,6 +417,9 @@ impl App {
         // Successful restores publish ledger entries incrementally below; they
         // do not require an authoritative ledger reload. Captions are shared
         // across viewer contexts and must still reflect the committed copies.
+        if report.store_mutations.ai_captions_changed() {
+            self.notify_caption_changed();
+        }
         if report.store_mutations.caption_display_stale() {
             self.caption_display.clear();
         }
@@ -887,6 +890,8 @@ mod tests {
     #[test]
     fn caption_restore_completion_clears_shared_display_without_ledger_reload() {
         let mut app = crate::app::setup_app_for_test();
+        let index_data = app.tmp.path().join("caption-index");
+        let caption_epoch = app.caption_epoch_for_test(&index_data);
         // Model a completed startup load, with no earlier loader still owned.
         if let Some(pending) = app.content_identity_index_load_pending.take() {
             pending.cancel();
@@ -906,11 +911,22 @@ mod tests {
         effects.merge(
             crate::rename_key_migration::StoreMutationEffects::for_content_identity_index_stale(),
         );
-        for mutation in [Default::default(), effects] {
+        let mut mutations = vec![Default::default(), effects];
+        for file in ["folder_thumb_pins.db", "video_pins.db"] {
+            let descriptor = crate::rename_key_migration::STORES
+                .iter()
+                .find(|descriptor| descriptor.file == file)
+                .unwrap();
+            let mut pins = crate::rename_key_migration::StoreMutationEffects::default();
+            pins.record_rows_changed(descriptor, 1);
+            mutations.push(pins);
+        }
+        for mutation in mutations {
             app.caption_display.seed_for_test("c:/images/restored.jpg");
             app.caption_display
                 .seed_for_test("d:/images/other-viewer.jpg");
             let epoch = app.caption_display.epoch_for_test();
+            let before = caption_epoch.load(std::sync::atomic::Ordering::Acquire);
             let (tx, rx) = mpsc::channel();
             tx.send(crate::content_identity::ContentRestoreReport {
                 // An actual store commit owns invalidation even without any
@@ -923,6 +939,10 @@ mod tests {
 
             app.poll_content_identity_restore(&egui::Context::default());
 
+            assert_eq!(
+                caption_epoch.load(std::sync::atomic::Ordering::Acquire),
+                before + u64::from(mutation.ai_captions_changed())
+            );
             assert!(app.content_identity_restore_pending.is_none());
             assert!(app.content_identity_index_load_pending.is_none());
             assert_eq!(

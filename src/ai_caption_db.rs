@@ -354,6 +354,87 @@ impl CaptionDb {
             .optional()
     }
 
+    /// Read pending changes only inside the caller's existing metadata ownership.
+    /// Each interval is half-open and uses the same BINARY keys as OwnedRange.
+    pub fn pending_in_ranges(
+        &self,
+        ranges: &[crate::metadata_ownership::PathRange],
+        limit: usize,
+    ) -> rusqlite::Result<Vec<(String, i64, bool)>> {
+        let mut pending = Vec::new();
+        let mut statement = self.conn.prepare(
+            "SELECT item_key, rev, removed FROM (
+                SELECT item_key, rev, 0 AS removed FROM captions WHERE indexed = 0
+                UNION ALL
+                SELECT item_key, rev, 1 AS removed FROM caption_removed
+             ) WHERE item_key >= ?1 COLLATE BINARY AND item_key < ?2 COLLATE BINARY
+             ORDER BY item_key, rev, removed LIMIT ?3",
+        )?;
+        for range in ranges {
+            let remaining = limit.saturating_sub(pending.len());
+            if remaining == 0 {
+                break;
+            }
+            let rows = statement.query_map(
+                params![
+                    range.start,
+                    range.end,
+                    i64::try_from(remaining).unwrap_or(i64::MAX)
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            for row in rows {
+                pending.push(row?);
+            }
+        }
+        Ok(pending)
+    }
+
+    /// Acknowledge only the exact revisions whose index commit succeeded.
+    /// Content/key updates allocate a new global revision, so stale acks are inert.
+    pub fn mark_reflected(&self, changes: &[(String, i64, bool)]) -> rusqlite::Result<()> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        {
+            let mut indexed =
+                tx.prepare("UPDATE captions SET indexed = 1 WHERE item_key = ?1 AND rev = ?2")?;
+            let mut removed =
+                tx.prepare("DELETE FROM caption_removed WHERE item_key = ?1 AND rev = ?2")?;
+            for (key, rev, is_removed) in changes {
+                if *is_removed {
+                    removed.execute(params![key, rev])?;
+                } else {
+                    indexed.execute(params![key, rev])?;
+                }
+            }
+        }
+        tx.commit()
+    }
+
+    /// Startup cleanup uses all favorite roots (including metadata-disabled ones),
+    /// never the narrower exclusive owner ranges used for reflection.
+    pub fn cleanup_removed_outside_ranges(
+        &self,
+        ranges: &[crate::metadata_ownership::PathRange],
+    ) -> rusqlite::Result<usize> {
+        if ranges.is_empty() {
+            return self.conn.execute("DELETE FROM caption_removed", []);
+        }
+        let values = std::iter::repeat_n("(?, ?)", ranges.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH roots(start, end) AS (VALUES {values})
+             DELETE FROM caption_removed WHERE NOT EXISTS (
+                SELECT 1 FROM roots WHERE item_key >= start COLLATE BINARY
+                  AND item_key < end COLLATE BINARY
+             )"
+        );
+        self.conn.execute(
+            &sql,
+            rusqlite::params_from_iter(ranges.iter().flat_map(|range| [&range.start, &range.end])),
+        )
+    }
+
     /// Worker-only: reserve the writer before rechecking the input, so a rename
     /// cannot migrate DB keys between this check and commit. Exactly one
     /// filesystem metadata call is made inside the transaction. DB failures are
@@ -946,6 +1027,137 @@ mod tests {
         assert_eq!(copied.rev, 2);
         assert!(!copied.indexed);
         assert!(read(&db, &req).unwrap().indexed);
+    }
+
+    fn seed_caption_key(db: &CaptionDb, key: &str) {
+        db.conn
+            .execute(
+                "INSERT INTO captions SELECT ?1, mtime_ms, size, model_id, prompt_version,
+             lang, caption, visible_text, cover_ref, keywords, status, created_at, rev, indexed
+             FROM captions LIMIT 1",
+                [key],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn pending_caption_ranges_respect_ownership_boundaries_and_limit() {
+        let (_temp, db, req) = fixture();
+        db.save(&req).unwrap();
+        for key in [
+            "c:/fav",
+            "c:/fav/a.jpg",
+            "c:/fav/child",
+            "c:/fav/child/a.jpg",
+            "c:/fav/excluded/a.jpg",
+            "c:/favorite/a.jpg",
+            "c:/outside/a.jpg",
+            "c:/fav/removed.jpg",
+            "c:/fav/child/removed.jpg",
+        ] {
+            seed_caption_key(&db, key);
+        }
+        db.delete("c:/fav/removed.jpg").unwrap();
+        db.delete("c:/fav/child/removed.jpg").unwrap();
+        let scope = crate::metadata_ownership::OwnedRange {
+            root: "c:/fav".into(),
+            exclusions: vec!["c:/fav/child".into(), "c:/fav/excluded".into()],
+        };
+        let pending = db.pending_in_ranges(&scope.sql_ranges(), 100).unwrap();
+        let keys: std::collections::BTreeSet<_> = pending
+            .iter()
+            .map(|(key, _, removed)| (key.as_str(), *removed))
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                ("c:/fav", false),
+                ("c:/fav/a.jpg", false),
+                ("c:/fav/removed.jpg", true),
+            ])
+        );
+        assert_eq!(
+            db.pending_in_ranges(&scope.sql_ranges(), 1).unwrap().len(),
+            1
+        );
+        assert!(
+            db.pending_in_ranges(&scope.sql_ranges(), 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.pending_in_ranges(&[], 100).unwrap().is_empty());
+        db.mark_reflected(&pending).unwrap();
+        assert!(
+            db.pending_in_ranges(&scope.sql_ranges(), 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!db.get("c:/fav/child/a.jpg").unwrap().unwrap().indexed);
+    }
+
+    #[test]
+    fn caption_acknowledgements_preserve_new_content_and_new_tombstones() {
+        let (_temp, db, req) = fixture();
+        db.save(&req).unwrap();
+        let key = CaptionDb::normalize_path(&req.item_path);
+        let ranges = crate::metadata_ownership::OwnedRange {
+            root: key.clone(),
+            exclusions: Vec::new(),
+        }
+        .sql_ranges();
+        let old = db.pending_in_ranges(&ranges, 100).unwrap();
+        db.conn
+            .execute("UPDATE captions SET caption='replacement'", [])
+            .unwrap();
+        db.mark_reflected(&old).unwrap();
+        assert!(!read(&db, &req).unwrap().indexed);
+        let updated = db.pending_in_ranges(&ranges, 100).unwrap();
+        assert_ne!(old, updated);
+        db.mark_reflected(&updated).unwrap();
+        assert!(read(&db, &req).unwrap().indexed);
+        db.delete(&key).unwrap();
+        let removed = db.pending_in_ranges(&ranges, 100).unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(removed[0].2);
+        db.save(&req).unwrap();
+        db.delete(&key).unwrap();
+        db.mark_reflected(&removed).unwrap();
+        let latest = db.pending_in_ranges(&ranges, 100).unwrap();
+        assert_eq!(latest.len(), 1);
+        assert!(latest[0].2 && latest[0].1 > removed[0].1);
+        db.mark_reflected(&latest).unwrap();
+        assert!(db.pending_in_ranges(&ranges, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn caption_tombstone_cleanup_preserves_all_favorite_root_ranges() {
+        let (_temp, db, req) = fixture();
+        db.save(&req).unwrap();
+        for key in [
+            "c:/fav",
+            "c:/fav/child/a.jpg",
+            "c:/disabled/a.jpg",
+            "c:/favorite/a.jpg",
+            "c:/temp",
+        ] {
+            seed_caption_key(&db, key);
+            db.delete(key).unwrap();
+        }
+        let ranges: Vec<_> = ["c:/fav", "c:/disabled"]
+            .into_iter()
+            .flat_map(|root| {
+                crate::metadata_ownership::OwnedRange {
+                    root: root.into(),
+                    exclusions: Vec::new(),
+                }
+                .sql_ranges()
+            })
+            .collect();
+        assert_eq!(db.cleanup_removed_outside_ranges(&ranges).unwrap(), 2);
+        assert_eq!(db.pending_in_ranges(&ranges, 100).unwrap().len(), 3);
+        assert!(read(&db, &req).is_some());
+        assert_eq!(db.cleanup_removed_outside_ranges(&[]).unwrap(), 3);
+        assert!(read(&db, &req).is_some());
     }
 
     thread_local! {

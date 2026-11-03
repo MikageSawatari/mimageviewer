@@ -3,7 +3,7 @@
 //! Walker が返した `to_ingest` / `to_delete` キューを受け取り、以下を行う:
 //!
 //! 1. **メタ抽出 + IndexDoc 構築**: `ingest_text::build_per_source_*` を呼んで
-//!    `IndexDoc` を作る。SQLite には触れない。
+//!    `IndexDoc` を作る。説明文の SQLite は読み取り専用で参照する。
 //! 2. **Tantivy にバッファリング**: `IndexDoc` を `batch_upserts` に積み、削除候補は
 //!    `batch_deletes` に積む。
 //! 3. **バッチ境界で Tantivy commit + reader reload** (`writer.batch(commit=true,
@@ -39,12 +39,14 @@
 //!   到達しない (docs/search-container-item-redesign.md §3.2)
 //! - PDFium document info の取り込みは §16 step 17 (別モジュール)
 
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
+use crate::ai_caption_db::CaptionDb;
 #[cfg(test)]
 use crate::fts_index;
 use crate::fts_index::{Container, FtsIndex, IndexDoc, IndexKind};
@@ -64,6 +66,8 @@ pub struct IngestStats {
     pub ingested_failed: usize,
     pub deleted: usize,
     pub skipped_unsupported: usize,
+    /// Per-batch diagnostics; reflection must not acknowledge unread caption content.
+    pub caption_read_errors: usize,
     pub cancelled: bool,
 }
 
@@ -87,6 +91,9 @@ pub struct IngestSession<'a> {
     /// UI 操作中は ingest を一時停止するためのゲート (2026-04)。
     /// `None` なら停止しない (単体テスト用)。
     pub activity_gate: Option<&'a crate::activity_gate::ActivityGate>,
+    pub caption_db_path: PathBuf,
+    caption_db: Result<Option<CaptionDb>, String>,
+    caption_read_errors: Cell<usize>,
 }
 
 impl<'a> IngestSession<'a> {
@@ -96,12 +103,78 @@ impl<'a> IngestSession<'a> {
         meta_db: &'a FtsMetaDb,
         fts: &'a FtsIndex,
     ) -> Self {
-        Self {
+        Self::new_with_caption_db_path(
+            favorite_id,
+            favorite_root,
+            meta_db,
+            fts,
+            CaptionDb::db_path(),
+        )
+    }
+
+    /// Use the manager's store location before opening any connection (also for new_at).
+    pub fn new_with_caption_db_path(
+        favorite_id: Uuid,
+        favorite_root: PathBuf,
+        meta_db: &'a FtsMetaDb,
+        fts: &'a FtsIndex,
+        caption_db_path: PathBuf,
+    ) -> Self {
+        let mut session = Self {
             favorite_id,
             favorite_root,
             meta_db,
             fts,
             activity_gate: None,
+            caption_db_path,
+            caption_db: Ok(None),
+            caption_read_errors: Cell::new(0),
+        };
+        session.reopen_caption_connection();
+        session
+    }
+
+    /// Retry a store absent at startup before a scan or pending reflection.
+    /// A live read-only connection sees later commits without being reopened.
+    pub fn reopen_caption_connection(&mut self) {
+        if matches!(self.caption_db, Ok(Some(_))) {
+            return;
+        }
+        self.caption_db = CaptionDb::open_read_only(&self.caption_db_path).map_err(|error| {
+            crate::logger::log(format!("ingest: opening AI caption store failed: {error}"));
+            error.to_string()
+        });
+    }
+
+    /// Override the worker's store location, including for disposable tests.
+    pub fn with_caption_db_path(mut self, path: PathBuf) -> Self {
+        self.caption_db_path = path;
+        self.caption_db = Ok(None);
+        self.reopen_caption_connection();
+        self
+    }
+
+    fn caption_text(&self, key: &str) -> String {
+        let db = match &self.caption_db {
+            Ok(Some(db)) => db,
+            Ok(None) => return String::new(),
+            Err(_) => {
+                self.caption_read_errors
+                    .set(self.caption_read_errors.get() + 1);
+                return String::new();
+            }
+        };
+        match db.get(key) {
+            Ok(Some(row)) => crate::ingest_text::caption_search_text(&row),
+            Ok(None) => String::new(),
+            Err(error) => {
+                crate::logger::log(format!(
+                    "ingest: reading AI caption for {key} failed: {error}"
+                ));
+                self.caption_read_errors
+                    .set(self.caption_read_errors.get() + 1);
+                String::new()
+            }
         }
     }
 
@@ -127,6 +200,7 @@ impl<'a> IngestSession<'a> {
     ) -> tantivy::Result<IngestStats> {
         use crate::fts_writer_dispatcher::WriterPriority;
 
+        self.caption_read_errors.set(0);
         let mut stats = IngestStats::default();
         let mut batch_upserts: Vec<IndexDoc> = Vec::with_capacity(BATCH_FLUSH_COUNT);
         let mut batch_deletes: Vec<String> = Vec::new();
@@ -315,6 +389,12 @@ impl<'a> IngestSession<'a> {
         if let Some(p) = progress {
             p.clear_count();
         }
+        stats.caption_read_errors = self.caption_read_errors.take();
+        if stats.caption_read_errors > 0 {
+            // A normal scan/watch may replace an already-indexed caption with an empty
+            // field. Existing next-start rebuild reservation repairs that case too.
+            writer.report_failure("ingest AI caption read", &"caption text could not be read");
+        }
         Ok(stats)
     }
 
@@ -329,7 +409,7 @@ impl<'a> IngestSession<'a> {
         total >= BATCH_FLUSH_COUNT || (total > 0 && last_flush.elapsed() >= BATCH_FLUSH_INTERVAL)
     }
 
-    /// 画像ファイルから IndexDoc を組み立てる。SQLite には触れない build phase。
+    /// 画像ファイルから IndexDoc を組み立てる。build phase は書き込みを行わない。
     fn build_doc_for_image(&self, cand: &CandidateFile) -> Result<IndexDoc, String> {
         let norms = crate::ingest_text::build_per_source_for_file(&cand.abs_path);
         self.build_doc(cand, Container::Fs, IndexKind::Image, norms)
@@ -382,7 +462,7 @@ impl<'a> IngestSession<'a> {
         self.build_doc(cand, Container::Fs, IndexKind::Pdf, norms)
     }
 
-    /// IndexDoc ビルド。SQLite には触れず Tantivy 投入用の構造体のみ返す。
+    /// IndexDoc ビルド。説明文は読み、Tantivy 投入用の構造体のみ返す。
     /// SQLite 側の status=Ok 書き込みは `flush_batch` 内で Tantivy commit 成功後に行う。
     /// `norms` は move で受けて IndexDoc に埋め込む — per-file で複製は発生しない。
     fn build_doc(
@@ -390,8 +470,11 @@ impl<'a> IngestSession<'a> {
         cand: &CandidateFile,
         container: Container,
         kind: IndexKind,
-        norms: crate::ingest_text::PerSourceText,
+        mut norms: crate::ingest_text::PerSourceText,
     ) -> Result<IndexDoc, String> {
+        if matches!(kind, IndexKind::Image | IndexKind::Pdf) {
+            norms.ai_caption = self.caption_text(&cand.key);
+        }
         if crate::perf::is_enabled() {
             let (stored_total_bytes, png_prompt_bytes) = norms.stored_text_byte_sizes();
             crate::perf::event(
@@ -464,6 +547,141 @@ mod tests {
             diff_mtime: mtime,
             diff_size: meta.len() as i64,
         }
+    }
+
+    fn save_caption(db: &CaptionDb, cand: &CandidateFile, failed: bool) {
+        use crate::ai_caption_db::{CaptionResult, FileSignature, SaveRequest};
+        db.save(&SaveRequest {
+            item_path: cand.abs_path.clone(),
+            signature_path: cand.abs_path.clone(),
+            signature: FileSignature::from_metadata(&cand.abs_path.metadata().unwrap()).unwrap(),
+            cover_ref: String::new(),
+            model_id: "test-model".into(),
+            prompt_version: 1,
+            lang: "ja".into(),
+            result: if failed {
+                CaptionResult::Failed
+            } else {
+                CaptionResult::Ok {
+                    caption: "BLUE Sky".into(),
+                    text: "Visible Letters".into(),
+                    keywords: vec!["Search Keyword".into()],
+                }
+            },
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn caption_ingest_reads_only_ok_rows_for_images_pdf_and_epub() {
+        let (tmp, meta, fts) = setup();
+        let path = tmp.path().join("ai_caption.db");
+        let db = CaptionDb::open_at(&path).unwrap();
+        let image = make_image_file(tmp.path(), "ok.jpg");
+        let mut pdf = make_image_file(tmp.path(), "ok.pdf");
+        pdf.kind = CandidateKind::Pdf;
+        let mut epub = make_image_file(tmp.path(), "ok.epub");
+        epub.kind = CandidateKind::Pdf;
+        let failed = make_image_file(tmp.path(), "failed.jpg");
+        for cand in [&image, &pdf, &epub] {
+            save_caption(&db, cand, false);
+        }
+        save_caption(&db, &failed, true);
+        let session = IngestSession::new(Uuid::new_v4(), tmp.path().into(), &meta, &fts)
+            .with_caption_db_path(path);
+        let expected = "blue sky visible letters search keyword";
+        assert_eq!(
+            session
+                .build_doc_for_image(&image)
+                .unwrap()
+                .norms
+                .ai_caption,
+            expected
+        );
+        assert_eq!(
+            session.build_doc_for_pdf(&epub).unwrap().norms.ai_caption,
+            expected
+        );
+        // Exercise the shared PDF build boundary without launching PDFium.
+        assert_eq!(
+            session
+                .build_doc(
+                    &pdf,
+                    Container::Fs,
+                    IndexKind::Pdf,
+                    crate::ingest_text::build_per_source_for_filename(&pdf.abs_path)
+                )
+                .unwrap()
+                .norms
+                .ai_caption,
+            expected
+        );
+        assert!(
+            session
+                .build_doc_for_image(&failed)
+                .unwrap()
+                .norms
+                .ai_caption
+                .is_empty()
+        );
+        assert!(
+            session
+                .build_doc_for_audio(&image)
+                .unwrap()
+                .norms
+                .ai_caption
+                .is_empty()
+        );
+        // Even if a row exists, out-of-scope video/audio kinds never read it.
+        assert!(
+            session
+                .build_doc(&image, Container::Fs, IndexKind::Video, Default::default())
+                .unwrap()
+                .norms
+                .ai_caption
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn caption_ingest_reopens_absent_store_and_live_connection_sees_later_commits() {
+        let (tmp, meta, fts) = setup();
+        let path = tmp.path().join("ai_caption.db");
+        let cand = make_image_file(tmp.path(), "image.jpg");
+        let mut session = IngestSession::new(Uuid::new_v4(), tmp.path().into(), &meta, &fts)
+            .with_caption_db_path(path.clone());
+        assert!(matches!(session.caption_db, Ok(None)));
+        assert!(!path.exists());
+        let db = CaptionDb::open_at(&path).unwrap();
+        save_caption(&db, &cand, false);
+        session.reopen_caption_connection();
+        assert!(matches!(session.caption_db, Ok(Some(_))));
+        assert!(
+            session
+                .build_doc_for_image(&cand)
+                .unwrap()
+                .norms
+                .ai_caption
+                .contains("blue sky")
+        );
+        db.delete(&cand.key).unwrap();
+        assert!(
+            session
+                .build_doc_for_image(&cand)
+                .unwrap()
+                .norms
+                .ai_caption
+                .is_empty()
+        );
+        save_caption(&db, &cand, false);
+        assert!(
+            session
+                .build_doc_for_image(&cand)
+                .unwrap()
+                .norms
+                .ai_caption
+                .contains("blue sky")
+        );
     }
 
     #[test]
@@ -1290,5 +1508,85 @@ mod tests {
         let searcher = fts.searcher();
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert!(!hits.is_empty());
+    }
+    #[test]
+    fn caption_ingest_read_failure_reserves_rebuild_but_absent_store_does_not() {
+        let (tmp, meta, fts) = setup();
+        let path = tmp.path().join("ai_caption.db");
+        let candidate = make_image_file(tmp.path(), "one.jpg");
+        let key = candidate.key.clone();
+        let mut session = IngestSession::new_with_caption_db_path(
+            Uuid::new_v4(),
+            tmp.path().into(),
+            &meta,
+            &fts,
+            path.clone(),
+        );
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start_with_reporter(
+            fts.writer().unwrap(),
+            std::sync::Arc::clone(&fts),
+            crate::fts_integrity::FailureReporter::new(std::sync::Arc::new(
+                FtsMetaDb::open_at(&tmp.path().join("meta.db")).unwrap(),
+            )),
+        );
+        let sem = GlobalIoSemaphore::new(1);
+        let cancel = AtomicBool::new(false);
+        let result = session
+            .apply(
+                vec![candidate.clone()],
+                vec![],
+                &writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.caption_read_errors, 0);
+        assert!(!meta.tantivy_rebuild_pending().unwrap());
+        let db = CaptionDb::open_at(&path).unwrap();
+        save_caption(&db, &candidate, false);
+        session.reopen_caption_connection();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // Simulate unreadable stored content which had already been acknowledged.
+        conn.execute(
+            "UPDATE captions SET keywords='invalid-json' WHERE item_key=?1",
+            [&key],
+        )
+        .unwrap();
+        conn.execute("UPDATE captions SET indexed=1 WHERE item_key=?1", [&key])
+            .unwrap();
+        let result = session
+            .apply(
+                vec![candidate],
+                vec![],
+                &writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            result.ingested_ok, 1,
+            "ordinary metadata ingest continues without caption text"
+        );
+        assert_eq!(result.caption_read_errors, 1);
+        assert!(meta.tantivy_rebuild_pending().unwrap());
+        let indexed: bool = conn
+            .query_row(
+                "SELECT indexed FROM captions WHERE item_key=?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            indexed,
+            "user-created caption state is never rewritten during read failure"
+        );
+        assert_eq!(
+            writer.test_take_failure_notifications(),
+            vec![crate::fts_integrity::UPDATE_FAILURE_NOTICE]
+        );
     }
 }

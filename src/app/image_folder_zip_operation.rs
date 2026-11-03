@@ -558,14 +558,12 @@ impl App {
                     let changed = crate::metadata_transfer::ImportChangedSections {
                         tags: true,
                         page_state: true,
-                        ai_captions: true,
                         ..Default::default()
                     };
-                    // Folder ZIP uses its own chunked source adoption, rather
-                    // than apply_metadata_import_terminal_refresh.
-                    if changed.ai_captions || changed.thumbnail_pins {
-                        self.caption_display.clear();
-                    }
+                    // Folder ZIP uses its own chunked source adoption. Its
+                    // metadata allowlist does not copy captions; refresh the
+                    // displayed cover identity without publishing a DB change.
+                    self.caption_display.clear();
                     let mut requests = if matches!(op.exit, Exit::None) {
                         self.take_metadata_import_refresh_requests(changed, &Default::default())
                     } else {
@@ -1317,6 +1315,9 @@ mod tests {
     #[test]
     fn caption_folder_zip_refresh_poll_clears_shared_display() {
         let mut app = setup_app_for_test();
+        let index_data = app.tmp.path().join("caption-index");
+        let caption_epoch = app.caption_epoch_for_test(&index_data);
+        let before = caption_epoch.load(std::sync::atomic::Ordering::Acquire);
         let source = app.tmp.path().join("photos");
         app.image_folder_zip_operation = Some(Box::new(Operation {
             owner: app.projected_viewer_context_id(),
@@ -1368,6 +1369,10 @@ mod tests {
                 .contains_for_test("d:/images/other-viewer.jpg")
         );
         assert_ne!(app.caption_display.epoch_for_test(), epoch);
+        assert_eq!(
+            caption_epoch.load(std::sync::atomic::Ordering::Acquire),
+            before
+        );
     }
 
     fn finish_actual_worker(app: &mut App, ctx: &egui::Context, source: PathBuf, cancel: bool) {

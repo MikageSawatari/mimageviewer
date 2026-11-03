@@ -881,6 +881,15 @@ impl Handlers {
                 .map_err(|_| internal())?;
             let scope = crate::global_search::SearchScope {
                 kinds: kind.map(|k| vec![index_kind(k)]),
+                // Caption access remains unavailable until its separate V3 permission exists.
+                // SearchScope applies this target to both the query and STORED post-filter.
+                target: crate::fts_index::SearchTarget::Only(
+                    crate::fts_index::SourceKind::ALL
+                        .iter()
+                        .copied()
+                        .filter(|source| *source != crate::fts_index::SourceKind::AiCaption)
+                        .collect(),
+                ),
                 ignore_epub: settings.epub_file_handling_ignores_epub(),
                 visibility: settings.file_type_visibility,
                 ..Default::default()
