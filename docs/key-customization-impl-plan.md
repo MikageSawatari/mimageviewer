@@ -1,5 +1,11 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+§1.705/§1.708（2026-11-04）: 履歴は既存GridHistoryBack/Forwardを維持し、Local検索欄の
+Focused/PendingFocus/FocusRecoveryには限定permitで実効Alt（Ctrlなし）chordだけを通す。
+修飾なし/Ctrl/AltGrの編集割当・IME・別widgetへ一般gateを広げない。
+検索Enterは新ActionにせずTextEdit確定の固定操作として、既存検索Submit入口でegui/native twinとfocus予約を終端する。
+
+
 §1.662 (2026-10-30): `FsPageOverviewToggle` と `ImagePageOverview` の短い操作名を
 「ページ一覧の表示切替」に統一する。コマンド一覧・割り当て編集・候補・ガイドで使い、
 短縮後も「表示切替」を残す。詳細欄には標準Oキーとの対応と再実行で一覧を閉じる説明を出す。

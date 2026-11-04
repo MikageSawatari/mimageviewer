@@ -16,8 +16,9 @@ App・bundle・SmartRootのowner移譲、入力寿命と自動検証の状況は
 Snapshot 由来 rows を除く。戻り先の表示採用は初回 layout より前、サブ展開の並びの入力も宛先投影を使う。
 保存・復元の正本は [最上位一覧のセッション位置](top-level-grid-view.md#セッション内のグリッド位置1328)。
 閲覧履歴のメニュー入場は先頭、Ctrl+F は入場時に閉じる既存仕様を維持する。
-検索バー表示中の ←/→ は既存仕様どおり無効であり、検索カーソル方針・R9 は撤去した。
-他の入口から検索バーを開いたまま戻る場合も、検索再適用による先頭復帰を受け入れ、Ctrl+F 処理は変更しない。
+Ctrl+F の現在地フィルタ中（空のバーを含む）も ←/→ を許可する（§1.705、2026-11-04利用者決定）。
+履歴の行き先一覧の採用境界で旧フィルタを終了し、全件表示する。検索カーソル方針・R9 は撤去済み。
+検索バーを開いたまま履歴で戻る場合も、行き先一覧へ旧フィルタを再適用せず、一覧採用境界で終了する。
 永続化、起動復元、ブックマークの位置 owner、detached predicates / viewport は変更しない。
 
 回帰テストは `src/app/tests/section1328_session.rs`（既存の履歴遷移 fixture を再利用）にまとめる。
@@ -235,7 +236,10 @@ main の back/forward に実 load から有効な target を用意した上で�
 
 ## 10. 独立実装レビュー後の修正（2026-09-27）
 
-検索 Ctrl+G/S/T の一時 surface 中に ring / gamepad の履歴 command が通り、`return_to` を現在地として main の Back/Forward stack を消費し得た。keyboard / toolbar / ring / gamepad の入力が合流した後の `AddressBarNav::HistoryBack/Forward` 共通 dispatch で、検索・local filter・Snapshot 中の履歴操作を拒否する。検索内の Ctrl+↑↓ と BS は各検索の navigation を使い、main history cursor は退出まで休止する。ring route と keyboard route の回帰テストは修正前に失敗し、修正後に通過した。
+検索 Ctrl+G/S/T の一時 surface 中に ring / gamepad の履歴 command が通り、`return_to` を現在地として main の Back/Forward stack を消費し得た。keyboard / toolbar / ring / gamepad の入力が合流した後の `AddressBarNav::HistoryBack/Forward` 共通 dispatch で、Ctrl+G/S/T（Everythingを含む）の検索結果・Snapshot 中の履歴操作を拒否する。
+§1.705: `history_nav_availability()` の単一判定をボタンのenabled/理由、キー2入口、
+ring/gamepad合流後のdispatchで共有する。拒否したキーとdispatchは同じ理由をInfo通知する。
+Ctrl+Fは現在地のフィルタなので履歴移動を許し、既存一覧採用で解除する。検索内の Ctrl+↑↓ と BS は各検索の navigation を使い、main history cursor は退出まで休止する。ring route と keyboard route の回帰テストは修正前に失敗し、修正後に通過した。
 
 追加されていた UI-thread の `Path::is_file()` は `will_stage_archive_navigation`、`load_folder_or_convert_archive_with_auto_fullscreen_owned`、`load_folder_with_scan_claimed`、RequiredFullscreen の ZIP/PDF 分岐から除いた。表示済みの `GridItem::Folder` と RequiredFullscreen の `SnapshotTarget` は既知の型を使う。未分類の archive 風 suffix は worker preflight に渡し、worker が folder と確定した場合も folder として採用する。`directory.zip` のような実 directory を誤って ZIP と断定しない。worker が folder scan を返した後の legacy file 判定も省く。`.rar` / `.7z` / `.lzh` 名の directory は書庫 Ignore 設定でも worker が directory と確定してから開き、実際の変換書庫だけを Ignore する。新規 UI 経路の filesystem probe は追加していない。
 

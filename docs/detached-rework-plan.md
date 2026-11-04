@@ -7025,3 +7025,27 @@ rollbackは加えない（VLM計画 §21.17）。`GlobalSearchState` は viewer 
 planを迂回する入口の監査漏れが見つかった。設計担当の指示どおり、分類開始前に採用済みの枝を
 共通判定してfalseを返す。続きには呼び出し元のdrillへ戻る経路がないため、分類後の拒否にはしない。
 新しいdetached状態・待機・retry・viewport/window ownerは追加しない。本修正の再レビューは未実施。
+
+
+### 2026-11-05: §1.708 検索入力予約のMain scope（依頼12の既存全画面保持）
+
+§2を読んだうえで、検索入力Submitを整理する他機能の修正として記録する。
+Mainの一時検索欄にある既存focus_requestをKeyboardOwner::TextInput/PendingFocusへ投影する際、
+Rootであることだけでは、そのpassが既存ShortcutSurface::MainかFullscreenかを区別できない。
+未表示のMain入力予約がFullscreen raw-key permitを奪い、既存Everything closeの3回帰が失敗した。
+
+新しいstate・window owner・時間窓は作らず、keyboard_ownership_snapshotが既に使う
+viewer_session_blocks_main_window / fs_nav_deferred_reopen_wait_activeを含むsurface判定で、
+legacy検索予約の投影とSubmit受付をMain scopeに限定する。一般typed PendingFocusのS3規則は維持する。
+HWND同定・detached述語の実装・viewport生成/close/配置/focus routingには変更を加えない。
+実装担当と独立gpt-6.1-sol/xhigh reviewerは、症状guardではなく予約producerの所有範囲を正す
+構造的修正であることに合意した。設計担当の依頼にある既存機能保持の範囲として判断したもので、
+未実施のClaudeCode検収・実機確認まで完了したとは扱わない。
+
+既存Everythingのclose回帰3件は書き換えずに維持し、legacy予約がFullscreenを所有しないApp回帰を加える。
+検索結果のGridOpenを検査するphysical-parent fixtureだけは、query同一/root/rows保持をassertしたうえで
+既存共通Submitを通してからEnterを送る。検証結果はnext-release-backlog §1.705〜§1.709の台帳へ集約する。
+
+補足自動試験は523/523成功（既存Everything close3件・physical-parent・5検索種のscope回帰を含む）、
+最終core check・fmt/glyphも成功。実機でのdetached/window動作は未確認であり、
+全件1回の実行結果と修正後の補足結果は台帳で区別している。

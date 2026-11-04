@@ -7643,9 +7643,6 @@ impl App {
         ) {
             return None;
         }
-        if self.is_snapshot_active() || self.items_are_drive_list {
-            return None;
-        }
         let nav = if forward {
             AddressBarNav::HistoryForward
         } else {

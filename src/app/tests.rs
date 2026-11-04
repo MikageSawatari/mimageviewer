@@ -11568,48 +11568,141 @@ fn metadata_transfer_quiesces_and_resumes_all_context_writer_handles() {
 
 #[test]
 fn main_window_title_hides_internal_synthetic_paths() {
-    let internal = PathBuf::from(r"C:\data\__reading_history__");
-    assert_eq!(
-        main_window_title(Some(&internal), true, false, false, None, None, false),
-        "閲覧履歴 - mimageviewer"
+    use super::top_level_grid_view::{
+        CollectionGridIdentity, ReadingHistoryRootRestore, SmartFolderViewState,
+        TopLevelGridSurface as S, TopLevelSearchView as Search,
+    };
+    let mut app = phase_c_support::setup_app();
+    app.current_folder = Some(search_results_synthetic_path());
+    app.favsearch.active = true;
+    app.favsearch.last_executed = "mixed".into();
+    app.tag_view.active = true;
+    app.tag_view.last_executed = "tag".into();
+    app.global_search.active = true;
+    app.global_search.metadata_draft = "photo".into();
+    app.items_are_rating_view = true;
+    let id = uuid::Uuid::new_v4();
+    for surface in [
+        S::DriveList,
+        S::ReadingHistory(ReadingHistoryRootRestore::unavailable()),
+        S::Bookmarks,
+        S::SubfolderExpansion,
+        S::Snapshot,
+        S::Rating { stars: 3 },
+        S::SmartFolder(SmartFolderViewState::root(id, vec![])),
+        S::Collection(CollectionGridIdentity {
+            collection_id: crate::collection_store::CollectionId::from_uuid(id),
+        }),
+        S::Search(Search::Favorite),
+        S::Search(Search::Global),
+        S::Search(Search::Tag),
+    ] {
+        app.top_level_grid_view.replace_surface(surface.clone());
+        let label = app
+            .main_window_location_label()
+            .expect("every synthetic surface has a visible name");
+        let title = main_window_title(Some(&label), false);
+        assert!(!title.contains("__"), "{surface:?}: {title}");
+        assert!(
+            !title.contains(&crate::data_dir::get().display().to_string()),
+            "{surface:?}: {title}"
+        );
+        match surface {
+            S::Search(Search::Favorite) => {
+                app.update_favsearch_address();
+                assert_eq!(label, app.address);
+            }
+            S::Search(Search::Global) => {
+                app.update_global_search_address();
+                assert_eq!(label, app.address);
+            }
+            S::Search(Search::Tag) => {
+                app.update_tag_view_address();
+                assert_eq!(label, app.address);
+            }
+            S::Rating { .. } => assert_eq!(label, "★★★ レーティング一覧"),
+            _ => {}
+        }
+        app.address = "編集中の文字".into();
+        assert_eq!(
+            app.main_window_location_label().as_deref(),
+            Some(label.as_str())
+        );
+    }
+    app.top_level_grid_view
+        .replace_surface(S::Search(Search::Global));
+    let ctx = egui::Context::default();
+    crate::global_search_ui::adopt_everything_for_test(
+        &mut app,
+        &ctx,
+        "accepted Everything",
+        crate::global_search_ui::everything_dataset_for_test(Vec::new()),
     );
-    assert_eq!(
-        main_window_title(Some(&internal), false, true, false, None, None, false),
-        "ブックマーク - mimageviewer"
-    );
-    assert_eq!(
-        main_window_title(Some(&internal), false, false, true, None, None, false),
-        "サブフォルダ展開 - mimageviewer"
-    );
-    assert_eq!(
-        main_window_title(
-            Some(&internal),
-            false,
-            false,
-            false,
-            Some("未整理"),
-            None,
-            false,
-        ),
-        "スマートフォルダ: 未整理 - mimageviewer"
-    );
-    assert_eq!(
-        main_window_title(None, false, false, false, None, Some("旅の写真"), false),
-        "コレクション: 旅の写真 - mimageviewer"
-    );
+    for child in [None, Some(PathBuf::from(r"C:\Pictures\Child"))] {
+        if let Some(child) = child {
+            if let crate::global_search_ui::SearchAccepted::Everything { position, .. } =
+                &mut app.global_search.accepted
+            {
+                *position = crate::global_search_ui::EverythingPosition::PhysicalChild {
+                    logical_source: child.clone(),
+                    return_anchor: child,
+                    route: Default::default(),
+                };
+            }
+        }
+        app.update_global_search_address();
+        let label = app.main_window_location_label().unwrap();
+        assert!(label.starts_with("Everything:"));
+        assert!(label.contains("accepted Everything"));
+        assert_eq!(label, app.address);
+        assert!(!main_window_title(Some(&label), false).contains("__"));
+    }
+}
+
+#[test]
+fn main_window_title_hides_synthetic_path_during_search_close_and_restores_adopted_path() {
+    for mode in 0..4 {
+        let mut app = phase_c_support::setup_app();
+        let origin = app.tmp.path().join("title-origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        app.load_folder_with_scan(origin.clone(), None);
+        match mode {
+            0 => app.open_favsearch(),
+            1 => app.open_global_search(),
+            2 => app.open_tag_view(),
+            _ => app.open_everything_search(),
+        }
+        app.current_folder = Some(search_results_synthetic_path());
+        match mode {
+            0 => app.close_favsearch(),
+            1 | 3 => app.close_global_search(),
+            _ => app.close_tag_view(),
+        }
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&search_results_synthetic_path()),
+            "the regression exercises the close/adoption gap"
+        );
+        assert_eq!(
+            main_window_title(app.main_window_location_label().as_deref(), false),
+            "mimageviewer"
+        );
+        phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&origin));
+        assert_eq!(
+            app.main_window_location_label(),
+            Some(origin.display().to_string())
+        );
+    }
 }
 
 #[test]
 fn main_window_title_preserves_real_path_and_indexing_suffix() {
-    let folder = PathBuf::from(r"C:\Pictures");
     assert_eq!(
-        main_window_title(Some(&folder), false, false, false, None, None, true),
+        main_window_title(Some(r"C:\Pictures"), true),
         r"C:\Pictures - mimageviewer  (インデックス更新中)"
     );
-    assert_eq!(
-        main_window_title(None, false, false, false, None, None, false),
-        "mimageviewer"
-    );
+    assert_eq!(main_window_title(None, false), "mimageviewer");
 }
 
 /// `App::new_for_test` に渡すテスト設定。
@@ -20619,9 +20712,186 @@ mod phase_c_folder_nav_history_tests {
     }
 
     #[test]
+    fn section1705_local_filter_and_empty_bar_allow_history_keys_and_dispatch() {
+        for filtered in [false, true] {
+            for (key, direction) in [
+                (egui::Key::ArrowLeft, FolderHistoryDirection::Back),
+                (egui::Key::ArrowRight, FolderHistoryDirection::Forward),
+            ] {
+                let mut app = setup_app();
+                app.active_quick_folder_slot = None;
+                app.settings.auto_fullscreen_zip_pdf = false;
+                app.settings.auto_fullscreen_image_folders = false;
+                let origin = app.tmp.path().join("origin");
+                let target = app.tmp.path().join("target");
+                std::fs::create_dir_all(&origin).unwrap();
+                std::fs::create_dir_all(&target).unwrap();
+                for name in ["first.jpg", "second.jpg"] {
+                    std::fs::write(target.join(name), []).unwrap();
+                    std::fs::write(origin.join(name), []).unwrap();
+                }
+                app.load_folder_with_scan(origin.clone(), None);
+                assert_eq!(
+                    app.modal_dialog_block_reason(),
+                    Some("sidecar_restore"),
+                    "nonempty fixture must exercise initial identity preparation"
+                );
+                app.finish_page_identity_preparation_for_test();
+                assert!(app.modal_dialog_block_reason().is_none());
+                app.show_search_bar = true;
+                app.search_focus_request = false;
+                if filtered {
+                    app.search_query = "first".into();
+                    app.search_filter = Some(HashSet::from([0]).into());
+                    app.search_filter_origin_folder = Some(origin.clone());
+                }
+                match direction {
+                    FolderHistoryDirection::Back => {
+                        app.folder_nav_back_stack =
+                            vec![FolderNavHistoryTarget::Path(target.clone()).into()]
+                    }
+                    FolderHistoryDirection::Forward => {
+                        app.folder_nav_forward_stack =
+                            vec![FolderNavHistoryTarget::Path(target.clone()).into()]
+                    }
+                }
+                assert!(app.history_nav_availability().is_ok());
+                let nav = history_key_nav(&mut app, key);
+                assert!(
+                    nav.is_some(),
+                    "filtered={filtered} key={key:?} modal={:?} sidecar={} viewer={}",
+                    app.modal_dialog_block_reason(),
+                    app.sidecar_restore_active(),
+                    app.viewer_session_blocks_main_window()
+                );
+                app.dispatch_main_folder_history_input(direction);
+                finish_staged_physical_history_for_test(&mut app);
+                assert_eq!(app.current_folder.as_ref(), Some(&target));
+                assert!(app.search_filter.is_none());
+                assert!(app.search_pending.is_none());
+                assert!(app.search_query.is_empty());
+                assert_eq!(app.visible_indices.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn section1705_alt_history_from_focused_empty_local_input_moves_and_retires_focus() {
+        use crate::ui_pinned_search::PinnedSearchKind as Kind;
+        let _input = crate::key_input::lock_test_input();
+        for pinned in [false, true] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.show_toolbar_search_local = pinned;
+            let origin = app.tmp.path().join("focused-origin");
+            let target = app.tmp.path().join("focused-target");
+            std::fs::create_dir_all(&origin).unwrap();
+            std::fs::create_dir_all(&target).unwrap();
+            app.load_folder_with_scan(origin.clone(), None);
+            app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(target.clone()).into()];
+            let ctx = egui::Context::default();
+            crate::ime_focus::install_ime_input_policy(&ctx);
+            crate::ui_fonts::configure_fonts(&ctx);
+            app.open_search_shortcut(&ctx, Kind::Local);
+            let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.update_ime_state(ctx);
+                ctx.root_ui(|root| {
+                    if pinned {
+                        egui::CentralPanel::default().show(root, |ui| {
+                            let response = app.draw_pinned_search_section(ui, Kind::Local);
+                            app.handle_pinned_search_actions(ctx, response.inner.actions);
+                        });
+                    } else {
+                        app.render_search_bar(root);
+                    }
+                });
+            });
+            let _ = crate::test_ui::headless_paint_output(output);
+            let field = if pinned {
+                Kind::Local.input_id()
+            } else {
+                Kind::Local.temporary_id()
+            };
+            assert_eq!(ctx.memory(|memory| memory.focused()), Some(field));
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::ArrowLeft,
+                    physical_key: Some(egui::Key::ArrowLeft),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::ALT,
+                }],
+                ..Default::default()
+            });
+            app.update_ime_state(&ctx);
+            let other_viewport = egui::ViewportId::from_hash_of("other-history-editor");
+            app.claim_pending_text_input_focus(
+                other_viewport,
+                field.with("other"),
+                ctx.cumulative_pass_nr(),
+            );
+            let other_claim = app.pending_text_input_focus.get();
+            let nav = app.handle_keyboard(&ctx);
+            assert_eq!(app.pending_text_input_focus.get(), other_claim);
+            assert!(
+                matches!(nav, Some(crate::ui_main::AddressBarNav::HistoryBack)),
+                "pinned={pinned}"
+            );
+            assert_eq!(ctx.memory(|memory| memory.focused()), None);
+            assert!(!app.search_focus_request);
+            app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+            ctx.end_pass().drop_without_applying_deltas();
+            finish_staged_physical_history_for_test(&mut app);
+            assert_eq!(app.current_folder.as_ref(), Some(&target));
+            assert!(app.search_filter.is_none());
+        }
+    }
+
+    #[test]
+    fn section1705_search_and_snapshot_history_rejections_explain_the_reason() {
+        for mode in 0..5 {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.folder_nav_back_stack =
+                vec![FolderNavHistoryTarget::Path(app.tmp.path().join("back")).into()];
+            match mode {
+                0 => app.open_global_search(),
+                1 => app.open_favsearch(),
+                2 => app.open_tag_view(),
+                3 => {
+                    app.top_level_grid_view
+                        .replace_surface(super::top_level_grid_view::TopLevelGridSurface::Snapshot);
+                }
+                _ => {
+                    app.open_everything_search();
+                }
+            }
+            let reason = app.history_nav_availability().unwrap_err();
+            let before = app.folder_nav_history_snapshot();
+            assert!(history_key_nav(&mut app, egui::Key::ArrowLeft).is_none());
+            assert!(
+                app.feedback_toasts_for_test
+                    .iter()
+                    .any(|(text, kind)| text == reason
+                        && *kind == crate::feedback::FeedbackKind::Info)
+            );
+            app.feedback_toasts_for_test.clear();
+            app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+            assert!(
+                app.feedback_toasts_for_test
+                    .iter()
+                    .any(|(text, kind)| text == reason
+                        && *kind == crate::feedback::FeedbackKind::Info)
+            );
+            assert_eq!(app.folder_nav_back_stack, before.back_stack);
+            assert_eq!(app.folder_nav_forward_stack, before.forward_stack);
+        }
+    }
+
+    #[test]
     fn ring_history_input_is_rejected_at_shared_boundary_during_search() {
         use crate::ring_shortcut::{RingActionId, RingShortcutContext};
-        for mode in 0..3 {
+        for mode in 0..4 {
             for (action, expected, direction) in [
                 (
                     RingActionId::GridHistoryBack,
@@ -20646,7 +20916,15 @@ mod phase_c_folder_nav_history_tests {
                 match mode {
                     0 => app.open_global_search(),
                     1 => app.open_favsearch(),
-                    _ => app.open_tag_view(),
+                    2 => app.open_tag_view(),
+                    _ => {
+                        app.items = vec![GridItem::Image(origin.join("snapshot.jpg"))];
+                        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+                        app.image_metas = vec![None];
+                        app.visible_indices = vec![0];
+                        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+                        assert!(app.is_snapshot_active());
+                    }
                 }
                 let before = app.folder_nav_history_snapshot();
                 let nav = app.apply_ring_action(
@@ -20671,6 +20949,33 @@ mod phase_c_folder_nav_history_tests {
                 assert_eq!(app.folder_nav_forward_stack, before.forward_stack);
             }
         }
+    }
+
+    #[test]
+    fn section1705_ring_history_from_drive_list_uses_the_shared_admission() {
+        use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let target = app.tmp.path().join("ring-drive-target");
+        std::fs::create_dir_all(&target).unwrap();
+        app.current_folder = Some(super::drive_list_synthetic_path());
+        app.items_are_drive_list = true;
+        app.top_level_grid_view
+            .replace_surface(super::top_level_grid_view::TopLevelGridSurface::DriveList);
+        app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(target.clone()).into()];
+        assert!(app.history_nav_availability().is_ok());
+        assert!(matches!(
+            app.apply_ring_action(
+                &egui::Context::default(),
+                RingShortcutContext::Grid,
+                RingActionId::GridHistoryBack,
+                "test-ring-drive"
+            ),
+            Some(crate::ui_main::AddressBarNav::HistoryBack)
+        ));
+        app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&target));
     }
 
     #[test]

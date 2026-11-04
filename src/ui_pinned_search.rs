@@ -195,6 +195,10 @@ pub fn draw_pinned_search(
                     let mut draw_input =
                         |ui: &mut egui::Ui, actions: &mut Vec<PinnedSearchAction>| {
                             let mut request = focus && enabled.is_ok();
+                            let owns_submit = crate::keyboard_input::text_input_owns_submit(
+                                ui.ctx(),
+                                kind.input_id(),
+                            );
                             let output = ui
                                 .add_enabled_ui(enabled.is_ok(), |ui| {
                                     let mut output = crate::ime_focus::show_singleline(
@@ -239,7 +243,7 @@ pub fn draw_pinned_search(
                                     if output.response.has_focus() {
                                         actions.push(PinnedSearchAction::Focused(kind));
                                     }
-                                    if output.response.lost_focus() && enter {
+                                    if owns_submit && output.response.lost_focus() && enter {
                                         actions.push(PinnedSearchAction::Submit(kind));
                                     }
                                     output.response.response

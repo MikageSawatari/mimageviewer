@@ -86,6 +86,41 @@ impl ShortcutPermit {
     }
 }
 
+/// A focused text owner may explicitly yield a history-navigation chord.
+/// The App restricts issuance requests to its Local search input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TextInputHistoryPermit {
+    viewport: egui::ViewportId,
+    widget_id: egui::Id,
+}
+
+impl TextInputHistoryPermit {
+    pub(crate) fn allows(self, ctx: &egui::Context) -> bool {
+        self.viewport == ctx.viewport_id()
+            && text_input_history_permit(ctx, self.widget_id) == Some(self)
+    }
+}
+
+pub(crate) fn text_input_history_permit(
+    ctx: &egui::Context,
+    widget_id: egui::Id,
+) -> Option<TextInputHistoryPermit> {
+    match cached_keyboard_owner(ctx)? {
+        KeyboardOwner::TextInput {
+            viewport,
+            widget_id: owner_widget,
+            phase:
+                TextInputPhase::Focused | TextInputPhase::PendingFocus | TextInputPhase::FocusRecovery,
+        } if viewport == ctx.viewport_id() && owner_widget == widget_id => {
+            Some(TextInputHistoryPermit {
+                viewport,
+                widget_id,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Proof that the fullscreen fixed-key router may consume a raw egui key.
 ///
 /// This is intentionally separate from [`ShortcutPermit`]. A focused non-text
@@ -219,6 +254,53 @@ pub(crate) fn clipboard_semantic_requests(events: &[egui::Event]) -> (bool, bool
         }
     }
     (copy, cut)
+}
+
+/// Finish a field's accepted Enter before its focus is released to grid navigation.
+///
+/// The text owner covers this viewport's native deliveries for the backend frame,
+/// including characters/clipboard/native-only keys preceding Enter. egui does not
+/// replay its RawInput events on layout retries, but native edges otherwise remain.
+/// A button submission without that text owner only claims Enter. Sibling viewports
+/// and the next backend frame keep their own deliveries.
+pub(crate) fn claim_text_input_submit(ctx: &egui::Context, widget_id: egui::Id) {
+    #[cfg(windows)]
+    {
+        let owns_text_batch = matches!(cached_keyboard_owner(ctx), Some(KeyboardOwner::TextInput {
+            viewport,
+            phase: TextInputPhase::Focused | TextInputPhase::FocusRecovery | TextInputPhase::PendingFocus,
+            ..
+        }) if viewport == ctx.viewport_id());
+        crate::key_input::consume_key_edges(ctx.viewport_id(), |edge| {
+            owns_text_batch || edge.virtual_key == 0x0D
+        });
+    }
+    ctx.input_mut(|input| {
+        input.events.retain(|event| {
+            !matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    ..
+                }
+            )
+        });
+    });
+    ctx.memory_mut(|memory| memory.surrender_focus(widget_id));
+}
+
+/// Capture the submit owner before drawing a field. `lost_focus` alone includes
+/// two passes of egui history and can therefore name a different, stale field.
+pub(crate) fn text_input_owns_submit(ctx: &egui::Context, widget_id: egui::Id) -> bool {
+    if crate::ime_focus::ime_input_active(ctx)
+        || matches!(cached_keyboard_owner(ctx), Some(KeyboardOwner::Modal))
+    {
+        return false;
+    }
+    match ctx.memory(|memory| memory.focused()) {
+        Some(focused) => focused == widget_id,
+        None => crate::ime_focus::recovering_text_input(ctx) == Some(widget_id),
+    }
 }
 
 /// Preserve Shell paste's current Win32 high-bit level plus V transition bit.
@@ -978,6 +1060,70 @@ mod tests {
 #[cfg(test)]
 mod input_projection_tests {
     use super::*;
+
+    #[test]
+    fn section1708_text_submit_claim_is_viewport_local_and_preserves_other_keys() {
+        let _input = crate::key_input::lock_test_input();
+        let ctx = egui::Context::default();
+        let field = egui::Id::unique("submitted-field");
+        ctx.begin_pass(egui::RawInput {
+            events: [egui::Key::Enter, egui::Key::ArrowDown]
+                .into_iter()
+                .map(|key| egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                })
+                .collect(),
+            ..Default::default()
+        });
+        ctx.memory_mut(|memory| memory.request_focus(field));
+        #[cfg(windows)]
+        let sibling = egui::ViewportId::from_hash_of("submit-sibling");
+        #[cfg(windows)]
+        {
+            let edge = |viewport, virtual_key, extended| crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
+                source_hwnd: 0,
+                source_viewport: viewport,
+                virtual_key,
+                scan_code: 0,
+                extended,
+                pressed: true,
+                repeat: false,
+                ctrl: false,
+                shift: false,
+                alt: false,
+            };
+            crate::key_input::set_test_routed_frame(vec![
+                edge(egui::ViewportId::ROOT, 0x0D, false),
+                edge(egui::ViewportId::ROOT, 0x0D, true),
+                edge(egui::ViewportId::ROOT, 0x28, false),
+                edge(sibling, 0x0D, false),
+            ]);
+        }
+        claim_text_input_submit(&ctx, field);
+        assert!(ctx.memory(|memory| memory.focused()).is_none());
+        assert!(!ctx.input(|input| input.key_pressed(egui::Key::Enter)));
+        assert!(ctx.input(|input| input.key_pressed(egui::Key::ArrowDown)));
+        #[cfg(windows)]
+        {
+            assert!(!crate::key_input::pressed_key_down(
+                egui::ViewportId::ROOT,
+                |edge| { edge.virtual_key == 0x0D }
+            ));
+            assert!(crate::key_input::pressed_key_down(
+                egui::ViewportId::ROOT,
+                |edge| { edge.virtual_key == 0x28 }
+            ));
+            assert!(crate::key_input::pressed_key_down(sibling, |edge| {
+                edge.virtual_key == 0x0D
+            }));
+        }
+        let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
+    }
 
     #[test]
     fn clipboard_shell_paste_requires_transition_and_both_held_keys() {

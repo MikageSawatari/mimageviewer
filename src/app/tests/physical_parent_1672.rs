@@ -340,6 +340,26 @@ fn section1672_history_and_search_books_exit_to_physical_list_without_old_return
                     vec![None],
                 );
                 app.visible_indices = vec![0];
+                // The fixture is testing grid-open after search confirmation, not the
+                // first Enter reserved for the newly opened search field (§1.708).
+                assert_eq!(app.favsearch.query, app.favsearch.last_executed);
+                assert!(app.favsearch.nav_stack.is_empty());
+                assert!(app.favsearch_pending.is_none());
+                let ctx = egui::Context::default();
+                ctx.begin_pass(Default::default());
+                assert!(app.submit_search_input(
+                    &ctx,
+                    crate::ui_pinned_search::PinnedSearchKind::Container,
+                    crate::ui_pinned_search::PinnedSearchKind::Container.temporary_id(),
+                ));
+                ctx.end_pass().drop_without_applying_deltas();
+                assert!(!app.favsearch.focus_request);
+                assert_eq!(app.favsearch.query, app.favsearch.last_executed);
+                assert!(app.favsearch.nav_stack.is_empty());
+                assert!(app.favsearch_pending.is_none());
+                assert_eq!(app.items.len(), 1);
+                assert_eq!(app.items[0].container_path(), Some(source.as_path()));
+                assert_eq!(app.visible_indices, vec![0]);
             }
             open_container_path(&mut app, &source);
             if entrance == "global" {

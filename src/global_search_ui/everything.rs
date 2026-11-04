@@ -615,9 +615,9 @@ impl App {
         true
     }
 
-    pub(super) fn update_everything_address(&mut self) -> bool {
+    pub(super) fn everything_location_label(&self) -> Option<String> {
         if !self.global_search.active {
-            return false;
+            return None;
         }
         let SearchAccepted::Everything {
             submitted,
@@ -625,7 +625,7 @@ impl App {
             position,
         } = &self.global_search.accepted
         else {
-            return false;
+            return None;
         };
         let suffix = match position {
             EverythingPosition::Root => String::new(),
@@ -633,15 +633,14 @@ impl App {
                 format!(" > {}", logical_source.display())
             }
         };
-        self.address = format!(
+        Some(format!(
             "Everything: \"{}\"{} / {} 件中 {} 件取得 / 表示対象 {} 件",
             submitted.query,
             suffix,
             dataset.stats.total_items,
             dataset.stats.raw_returned,
             dataset.rows.len()
-        );
-        true
+        ))
     }
 
     pub(crate) fn accepted_everything_query_matches_draft(&self) -> bool {
@@ -650,7 +649,11 @@ impl App {
 
     pub(super) fn render_everything_search_bar(&mut self, root_ui: &mut egui::Ui) {
         let ctx = &root_ui.ctx().clone();
-        let enter = self.dialog_enter_pressed(ctx);
+        let enter = self.dialog_enter_pressed(ctx)
+            && crate::keyboard_input::text_input_owns_submit(
+                ctx,
+                crate::ui_pinned_search::PinnedSearchKind::Everything.temporary_id(),
+            );
         let mut send = false;
         let mut close = false;
         let mut back = false;
@@ -682,7 +685,8 @@ impl App {
         } else if back {
             self.return_from_everything_child(EverythingReturn::Results);
         } else if send {
-            self.send_everything_search(ctx);
+            let kind = crate::ui_pinned_search::PinnedSearchKind::Everything;
+            self.submit_search_input(ctx, kind, kind.temporary_id());
         }
     }
 

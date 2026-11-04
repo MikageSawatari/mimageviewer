@@ -8495,6 +8495,33 @@ impl Keymap {
         false
     }
 
+    /// Local-search input may navigate history with Alt chords while retaining text editing.
+    /// Unmodified/Ctrl chords (including AltGr) keep belonging to the editor.
+    pub(crate) fn consume_text_input_history_action(
+        &self,
+        ctx: &egui::Context,
+        action: KeyAction,
+        permit: crate::keyboard_input::TextInputHistoryPermit,
+    ) -> bool {
+        if !matches!(
+            action,
+            KeyAction::GridHistoryBack | KeyAction::GridHistoryForward
+        ) || !permit.allows(ctx)
+        {
+            return false;
+        }
+        self.effective_chords(action).into_iter().any(|chord| {
+            matches!(
+                chord,
+                Chord::Key {
+                    alt: true,
+                    ctrl: false,
+                    ..
+                }
+            ) && self.consume_owned_chord(ctx, chord, true)
+        })
+    }
+
     pub fn consume_action_no_repeat(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         #[cfg(all(windows, feature = "test-script"))]
@@ -9406,6 +9433,11 @@ impl Keymap {
         if crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
             return false;
         }
+        self.consume_owned_chord(ctx, chord, allow_repeat)
+    }
+
+    /// The caller must already have proved the keyboard owner may consume this chord.
+    fn consume_owned_chord(&self, ctx: &egui::Context, chord: Chord, allow_repeat: bool) -> bool {
         #[cfg(windows)]
         if crate::key_input::is_frame_active(ctx.viewport_id()) {
             if crate::key_input::frame_had_key_down(ctx.viewport_id()) {
@@ -17028,5 +17060,117 @@ mod tests {
         assert!(!result.imported);
         assert!(settings.legacy_ini_migration_done);
         assert!(settings.overrides.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod local_search_history_tests {
+    use super::*;
+    use crate::keyboard_input::{self, KeyboardOwner, TextInputPhase};
+
+    #[test]
+    fn section1705_text_history_permit_preserves_editor_keys_ime_and_other_widgets() {
+        let _input = crate::key_input::lock_test_input();
+        let field = egui::Id::unique("local-field");
+        for (phase, requested, modifiers, ini, expected) in [
+            (
+                TextInputPhase::Focused,
+                field,
+                egui::Modifiers::ALT,
+                "",
+                true,
+            ),
+            (
+                TextInputPhase::PendingFocus,
+                field,
+                egui::Modifiers::ALT,
+                "",
+                true,
+            ),
+            (
+                TextInputPhase::FocusRecovery,
+                field,
+                egui::Modifiers::ALT,
+                "",
+                true,
+            ),
+            (
+                TextInputPhase::ImeComposing,
+                field,
+                egui::Modifiers::ALT,
+                "",
+                false,
+            ),
+            (
+                TextInputPhase::Focused,
+                field.with("other"),
+                egui::Modifiers::ALT,
+                "",
+                false,
+            ),
+            (
+                TextInputPhase::Focused,
+                field,
+                egui::Modifiers::NONE,
+                "[Grid]\nGridHistoryBack = Left\n",
+                false,
+            ),
+            (
+                TextInputPhase::Focused,
+                field,
+                egui::Modifiers::CTRL,
+                "[Grid]\nGridHistoryBack = Ctrl+Left\n",
+                false,
+            ),
+            (
+                TextInputPhase::Focused,
+                field,
+                egui::Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    ..egui::Modifiers::NONE
+                },
+                "[Grid]\nGridHistoryBack = Ctrl+Alt+Left\n",
+                false,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::ArrowLeft,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            });
+            keyboard_input::cache_keyboard_owner(
+                &ctx,
+                KeyboardOwner::TextInput {
+                    viewport: ctx.viewport_id(),
+                    widget_id: field,
+                    phase,
+                },
+            );
+            let keymap = Keymap::from_ini_str(ini);
+            let matched =
+                keyboard_input::text_input_history_permit(&ctx, requested).is_some_and(|permit| {
+                    keymap.consume_text_input_history_action(
+                        &ctx,
+                        KeyAction::GridHistoryBack,
+                        permit,
+                    )
+                });
+            assert_eq!(matched, expected, "{phase:?} {ini}");
+            assert_eq!(
+                ctx.input(|input| input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }))),
+                !expected
+            );
+            ctx.end_pass().drop_without_applying_deltas();
+        }
     }
 }

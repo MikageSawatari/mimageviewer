@@ -796,10 +796,34 @@ UI (render_favsearch_bar)
   `VideoFile` を弾くので、旧バージョン由来の VideoFile 行が残っていても結果に出ない。
 - バインド順は include → exclude → favorite_roots → kind。
 
+§1.708: 入力変更ごとの検索を維持し、Enterは検索確定と結果一覧への移動として受け取る。
+一時/常設欄とfocus予約中の入力は共通Submit ownerへ渡す。確定した同viewportのegui/native Enterを
+同時消費して、TextEditのfocus解放後に同じbackend frameのlayout再passでGridOpenSelectedへ漏らさない。
+TextInput ownerが所有した同viewportのnative入力群は同時に終端し、R等の文字・clipboard・native-onlyキーも
+再passでgridへ再所属させない。非text ownerのボタンはEnterだけを消費し、兄弟viewportと次frameは維持する。
+一時欄のfocus_requestも既存Main shortcut scopeのPendingFocus ownerへ純投影し、一般S3 gateを変更しない。
+RootでもMainWindow/Fullscreen viewer中は未表示のMain予約を投影せず、Submitも受け付けない。
+既存surface判定を共用し、DetachedWindowでMainが使える場合の予約は維持する。
+同queryでも子表示からSubmitすれば、既存navigationを退役させてroot結果へ戻す。
+F/G/Tの確定も同じ所有規則（Tは即検索timing維持）を使い、IME/他widget focus・予約を優先する。
+
 Tantivy は通さない。SQLite LIKE の方が対象件数 (フォルダ構造の粒度) に対して
 速く、実装もシンプル。
 
 ### 5.2 Ctrl+F — 現在地フィルタ (現グリッドの表示中アイテムのみ)
+
+§1.705（2026-11-04利用者決定）: Ctrl+F中は空のバーも含めて履歴の←/→・Alt+←/→を許可する。
+場所▼・ツリーと同じ一覧採用境界で絞り込みを終了し、行き先の全件を表示する。
+Local欄に実focusがある場合も、一時/常設欄の既知widgetから限定permitを発行し、
+既存History KeyActionの実効Alt（Ctrlなし）chordだけを受理する。IME・文字編集用割当は入力欄を優先する。
+履歴入力の受付と表示は`history_nav_availability()`へ集約し、Ctrl+G/S/T・EverythingとSnapshotは
+従来どおり拒否する。キー・ring/gamepadの拒否にはInfo、ボタンにはdisabled tooltipで理由を示す。
+Ctrl+↑↓/兄弟移動、親移動、A/B切替は検索内の専用経路や作業場所所有にも関わるため、
+今回の履歴仕様変更に含めず既存仕様を維持する（判断はbacklog §1.705）。
+
+§1.706: タイトルは`TopLevelGridSurface`の網羅matchで場所を選び、Ctrl+S/T/G・Everythingは
+アドレス欄と同じ純粋なlocation labelを使う。アドレス欄の編集中draftをタイトルへ流さない。
+新しいsurfaceにはタイトルの分岐も必要となる。
 
 2026-11-04 受入 A: 一覧全体を採用する `install_loading_items_inner` は、旧一覧の
 `search_filter`・origin・未完了検索を終了してから `rebuild_visible_indices` を行う。

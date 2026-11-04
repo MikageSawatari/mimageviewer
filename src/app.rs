@@ -13738,30 +13738,11 @@ pub(crate) fn subfolder_expansion_synthetic_path() -> PathBuf {
     crate::data_dir::get().join("__subfolder_expansion__")
 }
 
-fn main_window_title(
-    effective_folder: Option<&Path>,
-    reading_history_view: bool,
-    bookmark_view: bool,
-    subfolder_expansion_view: bool,
-    smart_folder_name: Option<&str>,
-    collection_name: Option<&str>,
-    indexing_active: bool,
-) -> String {
-    let base = if reading_history_view {
-        "閲覧履歴 - mimageviewer".to_string()
-    } else if bookmark_view {
-        "ブックマーク - mimageviewer".to_string()
-    } else if subfolder_expansion_view {
-        "サブフォルダ展開 - mimageviewer".to_string()
-    } else if let Some(name) = smart_folder_name {
-        format!("スマートフォルダ: {name} - mimageviewer")
-    } else if let Some(name) = collection_name {
-        format!("コレクション: {name} - mimageviewer")
-    } else if let Some(path) = effective_folder {
-        format!("{} - mimageviewer", path.display())
-    } else {
-        "mimageviewer".to_string()
-    };
+fn main_window_title(location_label: Option<&str>, indexing_active: bool) -> String {
+    let base = location_label.map_or_else(
+        || "mimageviewer".to_string(),
+        |label| format!("{label} - mimageviewer"),
+    );
     if indexing_active {
         format!("{base}  (インデックス更新中)")
     } else {
@@ -23730,6 +23711,22 @@ impl App {
         crate::ime_focus::ime_input_active(ctx)
     }
 
+    /// Main search reservations and shortcut routing share the adopted viewer scope.
+    fn keyboard_shortcut_surface(
+        &self,
+        viewport: egui::ViewportId,
+    ) -> crate::keyboard_input::ShortcutSurface {
+        use crate::keyboard_input::ShortcutSurface;
+        if viewport != egui::ViewportId::ROOT
+            || self.viewer_session_blocks_main_window()
+            || self.fs_nav_deferred_reopen_wait_active()
+        {
+            ShortcutSurface::Fullscreen
+        } else {
+            ShortcutSurface::Main
+        }
+    }
+
     /// Gather every App/egui input needed by the pass owner in one place.
     ///
     /// This is the only impure ownership entry: the decision function itself
@@ -23749,6 +23746,7 @@ impl App {
         };
 
         let viewport = ctx.viewport_id();
+        let shortcut_surface = self.keyboard_shortcut_surface(viewport);
         let viewport_focused = ctx.input(|input| input.viewport().focused).unwrap_or(true);
         let focused_widget = ctx.memory(|memory| memory.focused());
         let pending_transition = transition_pending_focus_claim(
@@ -23760,13 +23758,18 @@ impl App {
             },
         );
         self.pending_text_input_focus.set(pending_transition.claim);
-        let pending_text_input =
-            pending_transition
-                .ownership
-                .and_then(|(claim_viewport, widget_id, phase)| {
-                    (claim_viewport == viewport && phase == TextInputPhase::PendingFocus)
-                        .then_some(widget_id)
-                });
+        let pending_text_input = pending_transition
+            .ownership
+            .and_then(|(claim_viewport, widget_id, phase)| {
+                (claim_viewport == viewport && phase == TextInputPhase::PendingFocus)
+                    .then_some(widget_id)
+            })
+            .or_else(|| {
+                (shortcut_surface == ShortcutSurface::Main
+                    && self.pending_text_input_focus.get().is_none())
+                .then(|| self.temporary_search_focus_reservation())
+                .flatten()
+            });
         let claimed_focused_text_input =
             pending_transition
                 .ownership
@@ -23810,17 +23813,7 @@ impl App {
                     .map(|widget_id| TextInputClaim::new(widget_id, TextInputPhase::PendingFocus))
             });
 
-        let fullscreen_surface = !is_root
-            || self.viewer_session_blocks_main_window()
-            || self.fs_nav_deferred_reopen_wait_active();
-        let shortcut_scope = Some(ShortcutScope::new(
-            viewport,
-            if fullscreen_surface {
-                ShortcutSurface::Fullscreen
-            } else {
-                ShortcutSurface::Main
-            },
-        ));
+        let shortcut_scope = Some(ShortcutScope::new(viewport, shortcut_surface));
         let modal = if is_root {
             self.any_dialog_open()
         } else {
@@ -25004,22 +24997,153 @@ impl App {
         }
     }
 
-    // A history command is dispatched after keyboard, toolbar, ring, and gamepad input merge.
-    // Search/Snapshot own a transient grid; their return_to is an exit target, not the current
-    // history position. Keep the cursor paused until that grid has been left.
-    fn history_input_nav_allowed(&self) -> bool {
-        self.main_folder_history_available()
-            && !self.document_open_modal_admission_blocked()
-            && !self.global_search.active
-            && !self.favsearch.active
-            && !self.tag_view.active
-            && !self.show_search_bar
-            && !self.is_snapshot_active()
-            && !matches!(
+    /// Visible location names are derived from the adopted surface, never address edit text.
+    fn main_window_location_label(&self) -> Option<String> {
+        use top_level_grid_view::{
+            CollectionGridPosition, SmartFolderPosition, TopLevelGridSurface as Surface,
+            TopLevelSearchView as Search,
+        };
+        // Dismissing a synthetic surface releases its owner before the destination
+        // worker adopts physical rows. Until then no physical location is available.
+        let physical = || {
+            self.effective_folder()
+                .filter(|path| !is_synthetic_view_path(path))
+                .map(|path| path.display().to_string())
+        };
+        match self.top_level_grid_view.surface() {
+            Surface::Folder => physical(),
+            Surface::DriveList => Some("ドライブ一覧".into()),
+            Surface::Search(Search::Global) => self.global_search_location_label(),
+            Surface::Search(Search::Favorite) => self.favsearch_location_label(),
+            Surface::Search(Search::Tag) => self.tag_view_location_label(),
+            Surface::Snapshot => Some("★固定".into()),
+            Surface::SubfolderExpansion => Some("サブフォルダ展開".into()),
+            Surface::ReadingHistory(_) => Some("閲覧履歴".into()),
+            Surface::Bookmarks => Some("ブックマーク".into()),
+            Surface::Rating { stars } => {
+                Some(format!("{} レーティング一覧", "★".repeat(*stars as usize)))
+            }
+            Surface::SmartFolder(state) => {
+                if matches!(state.position, SmartFolderPosition::Root) {
+                    let name = self
+                        .settings
+                        .smart_folders
+                        .iter()
+                        .find(|definition| definition.id == state.definition_id)
+                        .map_or("読み込み中", |definition| definition.name.as_str());
+                    Some(format!("スマートフォルダ: {name}"))
+                } else {
+                    physical()
+                }
+            }
+            Surface::Collection(_) => {
+                if let Some(session) = self.top_level_grid_view.collection_session() {
+                    if matches!(session.position, CollectionGridPosition::Root) {
+                        Some(format!(
+                            "コレクション: {}",
+                            session.prepared().map_or("読み込み中", |prepared| prepared
+                                .collection_name
+                                .as_str())
+                        ))
+                    } else {
+                        physical()
+                    }
+                } else {
+                    Some("コレクション: 読み込み中".into())
+                }
+            }
+        }
+    }
+
+    /// Search/Snapshot own transient grids; their return_to is an exit target.
+    /// Ctrl+F only filters the current location and does not pause the history cursor.
+    pub(crate) fn history_nav_availability(&self) -> Result<(), &'static str> {
+        if !self.main_folder_history_available() {
+            Err("メイン一覧でのみフォルダ履歴を使用できます")
+        } else if self.document_open_modal_admission_blocked() {
+            Err("処理中はフォルダ履歴を使用できません")
+        } else if self.is_snapshot_active()
+            || matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Snapshot
+            )
+        {
+            Err("★固定中は履歴ナビを使用できません")
+        } else if self.global_search.active
+            || self.favsearch.active
+            || self.tag_view.active
+            || matches!(
                 self.top_level_grid_view.surface(),
                 top_level_grid_view::TopLevelGridSurface::Search(_)
-                    | top_level_grid_view::TopLevelGridSurface::Snapshot
             )
+        {
+            Err("検索中はフォルダ履歴を使用できません")
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Only the current Local search editor may hand an Alt history chord to navigation.
+    fn local_search_history_key_navigation(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<crate::ui_main::AddressBarNav> {
+        use crate::ui_pinned_search::PinnedSearchKind;
+        if !self.show_search_bar
+            || self.ime_input_active(ctx)
+            || self
+                .pinned_search_availability(PinnedSearchKind::Local)
+                .is_err()
+        {
+            return None;
+        }
+        self.keyboard_owner_for_pass(ctx);
+        let id = if PinnedSearchKind::Local.pinned(&self.settings) {
+            PinnedSearchKind::Local.input_id()
+        } else {
+            PinnedSearchKind::Local.temporary_id()
+        };
+        let permit = crate::keyboard_input::text_input_history_permit(ctx, id)?;
+        for (action, direction) in [
+            (KeyAction::GridHistoryBack, FolderHistoryDirection::Back),
+            (
+                KeyAction::GridHistoryForward,
+                FolderHistoryDirection::Forward,
+            ),
+        ] {
+            if self
+                .keymap
+                .consume_text_input_history_action(ctx, action, permit)
+            {
+                let nav = self.history_key_navigation(direction);
+                if nav.is_some() {
+                    self.search_has_focus = false;
+                    self.search_focus_request = false;
+                    if self.pending_text_input_focus.get().is_some_and(|claim| {
+                        claim.viewport == ctx.viewport_id() && claim.widget_id == id
+                    }) {
+                        self.clear_pending_text_input_focus();
+                    }
+                    ctx.memory_mut(|memory| memory.surrender_focus(id));
+                }
+                return nav;
+            }
+        }
+        None
+    }
+
+    fn history_key_navigation(
+        &mut self,
+        direction: FolderHistoryDirection,
+    ) -> Option<crate::ui_main::AddressBarNav> {
+        if let Err(reason) = self.history_nav_availability() {
+            self.show_feedback_result(reason.into(), crate::feedback::FeedbackKind::Info);
+            return None;
+        }
+        Some(match direction {
+            FolderHistoryDirection::Back => crate::ui_main::AddressBarNav::HistoryBack,
+            FolderHistoryDirection::Forward => crate::ui_main::AddressBarNav::HistoryForward,
+        })
     }
 
     fn push_folder_nav_stack(
@@ -26669,7 +26793,8 @@ impl App {
         &mut self,
         direction: FolderHistoryDirection,
     ) -> Option<PathBuf> {
-        if !self.history_input_nav_allowed() {
+        if let Err(reason) = self.history_nav_availability() {
+            self.show_feedback_result(reason.into(), crate::feedback::FeedbackKind::Info);
             return None;
         }
         let smart_direction = match direction {
@@ -34365,17 +34490,22 @@ impl App {
     }
 
     pub(crate) fn update_tag_view_address(&mut self) {
+        if let Some(label) = self.tag_view_location_label() {
+            self.address = label;
+        }
+    }
+
+    fn tag_view_location_label(&self) -> Option<String> {
         if !self.tag_view.active {
-            return;
+            return None;
         }
         let query = self.tag_view.last_executed.trim();
         if self.tag_view.nav_stack.is_empty() {
-            self.address = if query.is_empty() {
+            return Some(if query.is_empty() {
                 "タグビュー".to_string()
             } else {
                 format!("タグビュー: {query}")
-            };
-            return;
+            });
         }
         let trail: Vec<String> = self
             .tag_view
@@ -34388,11 +34518,11 @@ impl App {
         } else {
             format!("タグビュー: {query}")
         };
-        if trail.is_empty() {
-            self.address = base;
+        Some(if trail.is_empty() {
+            base
         } else {
-            self.address = format!("{base} > {}", trail.join(" > "));
-        }
+            format!("{base} > {}", trail.join(" > "))
+        })
     }
 
     pub(crate) fn execute_tag_view(&mut self) {
@@ -34765,14 +34895,19 @@ impl App {
     /// 現在地を包含するお気に入りフォルダを特定し、その配下の相対パスを表示する
     /// (例: "🔍 検索結果: "query" > Photos > 2024 > Vacation")。
     pub(crate) fn update_favsearch_address(&mut self) {
+        if let Some(label) = self.favsearch_location_label() {
+            self.address = label;
+        }
+    }
+
+    fn favsearch_location_label(&self) -> Option<String> {
         if !self.favsearch.active {
-            return;
+            return None;
         }
         let query = self.favsearch.last_executed.clone();
         let count = self.favsearch.results_paths.len();
         if self.favsearch.nav_stack.is_empty() {
-            self.address = format!("🔍 検索結果: \"{}\"  ({} 件)", query, count);
-            return;
+            return Some(format!("🔍 検索結果: \"{}\"  ({} 件)", query, count));
         }
         // 現在地 = スタックの末尾 (深い場所)
         let current = self.favsearch.nav_stack.last().cloned().unwrap();
@@ -34796,7 +34931,11 @@ impl App {
                     .map(|s| vec![s.to_string()])
                     .unwrap_or_default(),
             };
-        self.address = format!("🔍 検索結果: \"{}\" > {}", query, segments.join(" > "));
+        Some(format!(
+            "🔍 検索結果: \"{}\" > {}",
+            query,
+            segments.join(" > ")
+        ))
     }
 
     /// 現在のクエリで検索を実行し、結果をグリッドに反映する。
@@ -34804,7 +34943,9 @@ impl App {
     /// SQLite FTS クエリは通常数 ms だが、インデックスが大きいと数十〜数百 ms に
     /// 達し UI を止め得る。結果は `poll_favsearch` で受信する。
     pub(crate) fn execute_favsearch(&mut self) {
-        if self.favsearch.query != self.favsearch.last_executed {
+        if self.favsearch.query != self.favsearch.last_executed
+            || !self.favsearch.nav_stack.is_empty()
+        {
             self.retire_main_list_requests_for_surface_switch();
         }
         self.favsearch.last_executed = self.favsearch.query.clone();
@@ -58117,21 +58258,14 @@ impl App {
         {
             return self.handle_grid_physical_parent_action();
         }
-        let history_shortcut_allowed = !self.global_search.active
-            && !self.favsearch.active
-            && !self.tag_view.active
-            && !self.show_search_bar
-            && !self.is_snapshot_active();
-        if history_shortcut_allowed {
-            if self.keymap.consume_action(ctx, KeyAction::GridHistoryBack) {
-                return Some(crate::ui_main::AddressBarNav::HistoryBack);
-            }
-            if self
-                .keymap
-                .consume_action(ctx, KeyAction::GridHistoryForward)
-            {
-                return Some(crate::ui_main::AddressBarNav::HistoryForward);
-            }
+        if self.keymap.consume_action(ctx, KeyAction::GridHistoryBack) {
+            return self.history_key_navigation(FolderHistoryDirection::Back);
+        }
+        if self
+            .keymap
+            .consume_action(ctx, KeyAction::GridHistoryForward)
+        {
+            return self.history_key_navigation(FolderHistoryDirection::Forward);
         }
         for (action, forward, mode) in [
             (KeyAction::GridTreeFolderPrev, false, FolderNavMode::Grid),
@@ -58216,6 +58350,12 @@ impl App {
                 }
             }
             return None;
+        }
+        if self.route_pending_search_submit(ctx) {
+            return None;
+        }
+        if let Some(nav) = self.local_search_history_key_navigation(ctx) {
+            return Some(nav);
         }
         // フルスクリーン、ダイアログ、テキスト入力中はショートカットを無効化
         if self.shortcuts_blocked_by_text_input(ctx) {
@@ -58971,16 +59111,11 @@ impl App {
             return self.handle_grid_physical_parent_action();
         }
 
-        let history_shortcut_allowed = !self.global_search.active
-            && !self.favsearch.active
-            && !self.tag_view.active
-            && !self.show_search_bar
-            && !self.is_snapshot_active(); // Codex P2-1: ★固定 中は履歴ナビ block
-        if history_back_key && history_shortcut_allowed {
-            return Some(crate::ui_main::AddressBarNav::HistoryBack);
+        if history_back_key {
+            return self.history_key_navigation(FolderHistoryDirection::Back);
         }
-        if history_forward_key && history_shortcut_allowed {
-            return Some(crate::ui_main::AddressBarNav::HistoryForward);
+        if history_forward_key {
+            return self.history_key_navigation(FolderHistoryDirection::Forward);
         }
 
         // Ctrl+↓: 深さ優先で次のフォルダへ（画像なしはスキップ）

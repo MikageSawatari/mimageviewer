@@ -38,6 +38,76 @@
 
 ## 1. 優先候補
 
+### 1.705 Ctrl+F の絞り込み中に履歴の←/→が黙って無視される (2026-11-04、v5.0.0受入・依頼12)
+
+- **観測者・資料**: サブPC担当。`C:\miv-subpc\results-12\notes.md` A-2/その他5、同所`logs/`。Dorico 1/2等で←2回・Alt+←1回が無反応、×後は戻れた。実装担当の実機観測ではない。4件ともv4.11.0からある挙動をv5で直す利用者決定。
+- **確認した原因**: `history_input_nav_allowed`とキー2入口は`show_search_bar`だけでも拒否し、ボタンはCtrl+G/S/T・Snapshotだけで表示を決めていた。受付と見た目が不一致だった。
+- **修正・不変条件**: `history_nav_availability() -> Result<(), &'static str>`で受付と拒否理由を所有し、ボタンのenabled/tooltip、キー2入口、ring/gamepad合流後dispatchが共有する。Ctrl+Fは空のバー・提出済みfilterとも許可し、行き先の既存一覧採用で旧filter/pendingを終了する。Ctrl+G/S/T・Everything結果とSnapshotは拒否し、キー・dispatchは同じ理由をInfo通知する。ring/gamepad producerに残っていたSnapshot/DriveListの独自gateも取り除き、DriveListは他の履歴入口と同じくtargetがあれば移動する。履歴を空にする新しい状態や待機は足さない。一時/常設Local欄に実focusがある場合も、既存KeyActionの実効Alt（Ctrl併用なし）chordを限定permitで受け付ける。IME・他の入力欄・修飾なし/Ctrl/AltGrの編集用割当は入力欄優先を維持する。
+- **範囲の判断**: Ctrl+↑↓/兄弟移動は検索内DFS、親移動は現在地フィルタ起点、A/Bはworkspace切替をそれぞれ所有する。履歴と同じ述語へ寄せると検索内移動やworkspace寿命の仕様を拡張するため、今回は履歴に限定し、これらの既存仕様は維持した。特にSnapshot内Ctrl+↑↓は履歴と異なり有効である。組合せを増やす専用filter維持/復旧処理は作らず、既存一覧採用の終了境界を再利用した。
+- **検証**: 最終の開発検証台帳を参照。
+- **実機確認**: 未実施。絞り込み済み/未提出の空バーの両方で←/→ボタン・Alt+←/→が移動し全件となること、検索結果・★固定はボタンの無効理由とキーの通知を確認する。
+
+### 1.706 検索結果のウィンドウタイトルに内部の仮のフォルダ名が出る (2026-11-04)
+
+- **観測者・資料**: サブPC担当、依頼12 notesのその他3（依頼11でも観測）。検索結果で`<data_dir>\__search_results__ - mimageviewer`が表示された。
+- **確認した原因**: 旧`main_window_title`は閲覧履歴・ブックマーク・サブ展開・Smart・Collectionのフラグだけを置換し、Search/Rating/DriveList等は`effective_folder()`へ落ちていた。
+- **修正・判断**: `TopLevelGridSurface`の網羅matchでタイトルの場所を選ぶ。検索Ctrl+G/S/T・Everythingはアドレス欄の生成を純粋location labelへ抽出して共用し、入力中のaddress draftを読まない。Smart/Collectionの物理子は実logical pathを保持する。検索closeでsurfaceを離してから物理一覧が採用されるまでの旧synthetic keyも実pathとして扱わず、既存の読込中表示（アプリ名のみ）にする。全surfaceの表示更新経路を作り替える拡張は避け、依頼で許容された網羅match案を採用した。新しいsurfaceはmatch追加が必要となる。
+- **検証**: 全surface、Everything、検索label/アドレス欄の一致、編集中address非依存、実pathと索引更新suffixを回帰に含める。結果は最終台帳を参照。
+- **実機確認**: 未実施。検索各種・レーティング・ドライブ一覧等で内部名が出ず、検索の文言がアドレス欄と一致すること。
+
+### 1.707 Ctrl+G の結果から開いた画像のサイズが0.0 KBになる (2026-11-04)
+
+- **観測者・資料**: サブPC担当、依頼12 notesその他4。約80KBのMixedPhoto.JPGをCtrl+Gから開くと0.0KBと表示された。
+- **確認した原因**: `fs_hit_thumbnail_meta`は索引の`ListingSortMetadata(mtime,file_size)`を本・フォルダだけへ渡し、画像/動画/音声/PDFを`Some((0,0))`に置換していた。Flat/DrilledIntoとも同じhelperを通る。
+- **修正・判断**: 直接hit全種へ索引のmtime/sizeを渡す。欠落時だけ既存placeholderを維持し、UIでstatしない。集約のSearchContainer行は構造行なのでplaceholder維持、開くと直接hitで再構築される。旧ZIP内hitは現行索引の対象外で、実ZIPを開く場合のページmeta採用は通常materializationが担当する。Ctrl+Tはworker stat由来のサイズを保持済み。Ctrl+Sの正常行はFolder/ZIP/PDFのみで、open時は通常materializationへ移る（旧索引のVideoFile行は現行queryが結果から除外するため、旧行用のsize0は今回対象外）。
+- **検証**: Flat/DrilledIntoの共通projection、直接hit全種、実0byte、旧索引のサイズ欠落、4GiBのEPUBを検査。結果は最終台帳を参照。
+- **実機確認**: 未実施。Ctrl+Gの一覧・集約から画像/動画/音声を開いた情報サイズを実ファイルと比較し、本内部ページの表示も確認する。
+
+### 1.708 Ctrl+S のEnterで先頭のZIPが開く (2026-11-04)
+
+- **観測者・資料**: サブPC担当、依頼12 notesその他2と同所ログ。Ctrl+S「mixed」のEnter後にMixedArchive.ZIPへ入り、BSで2件の結果へ戻った。
+- **確認した原因**: TextEditはEnterでfocusを離す。eguiの次のlayout passには同じRawInputのキーイベントを再送しない一方、同じbackend frameのnative Enterは未消費で残る。次passでは入力ownerがTextInputでなくなり、`GridOpenSelected`へ届く。修正前headlessは一時F/S/G/Tと固定Sの5件全てで`[false,true]`（最初のpassは抑止・再passでopen）を確認した。ログは報告時のEnter→ZIPを確認する資料であり、その一回がこのlayout replayだったと断定できる相関はない。
+- **同型入口の確認**: 固定欄のtyped PendingFocusも一般S3 gateではまだshortcutを許す。一時欄はfocus_requestだけを立てるので、TextEditに実focusが来る前のEnterにはSubmit ownerが無かった。これも検索の予約中だけを対象に実handler回帰を追加する。一時欄の既存focus_requestはMain shortcut scopeの既存KeyboardOwner::TextInput/PendingFocusへ純投影し、typed予約・実focus・recovery・modalの優先を維持する。一般PendingFocusのS3許可/拒否規則は変更しない。
+- **修正・判断**: `submit_search_input`を一時/常設/描画前予約の確定入口にし、既存IME判定後の同viewportのegui/native Enterを同時に消費してfocus/既存予約を終端する。modal・実focus/FocusRecovery・他widgetの予約を優先する。Ctrl+Sの通常の入力即検索は維持し、Enterは確定して結果一覧へ移る。同queryの子表示からのSubmitもroot検索へ戻し、既存navigation ownerをretireしてから開始する。タグは即検索timingを維持して確定入力とfocusだけを終端する。`lost_focus`は2pass分の履歴で旧欄にも成立するため、描画前の実focus/既存recovery ownerを既知widgetと照合する。古い別欄やmodalのEnterを奪わず、Everythingの空query等で検索を始めない確定も同じ境界で消費する。Enterと同じbackend frameでTextInputが所有した文字/clipboard/native-onlyキーも、同viewportのnative deliveryとして終端する（Enterだけを消して次passでR等がgridへ再所属する経路を残さない）。ApplicationShortcut ownerからの検索ボタンはEnter限定、兄弟viewportと別backend frameの入力は維持する。focus/予約のclearはSubmit対象本人だけとする。新しいKeyAction・状態field・遅延/retryは足さない。
+- **検証**: 修正前`target/acceptance12-enter-red.log`は5/5失敗。初回のcompile不備（run→run_pass、CollectionId型）はテストfixtureの不備として直し、このredとは区別する。最終結果は開発検証台帳を参照。
+- **実機確認**: 未実施。一時/常設Container欄で検索入力→Enterが結果一覧に留まり、次の別のEnterで選択結果を開くこと。IME確定、Ctrl+F/G/T、同queryのchildからSubmitも確認する。
+
+### 1.709 音声・動画を閉じた直後のDBの位置が最大5秒古い (2026-11-04、記録のみ・v5では直さない)
+
+- **観測者・資料**: サブPC担当、依頼12 notesその他1/F-1。画面0:09に対してDB4.63秒、後の2回はほぼ一致。続きからの再生自体は設定を一時変更すると保存位置から始まった。
+- **コードで確認した順序**: `handle_fullscreen_close_request`が`accept_current_page_list_request`でsettings保存した後、close側の`save_all_video_resume_positions`がメモリを更新する。定期保存/終了保存までDBが古くても、通常の再openはメモリ値を使う。異常終了時の最大5秒分だけを失う既定のまれな失敗の割り切りとし、v5では変更しない。
+- **後続候補・検証**: 永続化の確定境界を1か所へまとめる候補。今回の実装・追加テスト・実機確認は行わない。位置メモリ更新と既存終了保存を撤去しない。
+
+#### 依頼12の開発検証台帳（2026-11-04着手、実装担当）
+
+- 対象は`v5-integration` / HEAD `8f40d5e77`からの未コミット差分。Windows、既定feature、test profile、nextest default、関連試験6並列。製品の起動・commit・`build-dev.ps1`は利用者指定どおり実施しない。`config/miv-sound.rs`は変更なし。
+- 修正前のEnter再現: `cargo nextest run -p mimageviewer --lib -E 'test(/section1708_/)'`、**0成功/5失敗、runner exit 1**。一時F/S/G/T・固定Sの全てで最初のpassはOpenなし、再passでOpenあり（`[false,true]`）。`target/acceptance12-enter-red.log`。ログのサブPC実行と、このheadless再現の原因を同一と断定しない。
+- 関連試験の最終製品ソース: **365成功/368実行、runner exit 1、74.725秒**（`target/acceptance12-related-final.log`）。filterは`section1705_|section1708_|main_window_title|global_search_ui|pinned_search|phase_c_key_tests|phase_c_folder_nav_history_tests|search_ime_commit|search_bar_focus_recovery|physical_parent_folder_bar_snapshot`。残る3件はfixtureの初期identity準備未完了2件と、`set_test_frame`が全viewportをRootへ書き換えるAPI誤用1件で、製品期待は変えずfixtureを修正した。この実行自体を全件成功とは扱わない。
+- 失敗修正と入力owner関連: `cargo nextest run -p mimageviewer --lib -j 6 -E 'test(/section1705_|section1708_|main_window_title|keyboard_owner|keyboard_input/)'`、**49成功/50実行、runner exit 1、5.769秒**（`target/acceptance12-corrections.log`）。初期sourceのmodal reasonが実際に`sidecar_restore`であることをassertし、既存のidentity準備完了待ち後に履歴キーが通ることを確認。native batchは実TextInput/legacy予約、文字R+Text+Enterの再pass、clipboard等のnative-onlyキー、非text owner、兄弟viewport、別frameを確認した。
+- 最後のtoolbar fixtureは非同期中も`Harness::run`の4step静止を要求していたため、`step`で既存workerをpollする形へ修正。`cargo nextest run -p mimageviewer --lib -j 6 -E 'test(/section1705_history_buttons_allow_local_filter/)'`は**1/1成功、exit 0、1.229秒**（`target/acceptance12-toolbar-final.log`）。空バー/フィルタ適用中の実ボタンclick、宛先のhydration終了、全件表示とForward有効化を確認した。上記365件・49件の有効な成功結果は再利用する。
+- 途中のfixture不備は`target/acceptance12-new-focused.log`（19/20）、`target/acceptance12-related.log`（363/366）にも残す。全surfaceの人工loop後にGlobalへ戻さずEverythingを採用したfixtureも訂正し、accepted Everythingのroot/PhysicalChild双方でtitle/address一致を確認した。画像フォルダの自動表示は試験条件としてOFFにしたが、入力を止めた確認済みの原因は初期identity/sidecar準備だった。
+- `cargo fmt` / `cargo fmt --check`はexit 0（`target/acceptance12-fmt-check.log`）。UI glyph検査は危険glyph 0（`target/acceptance12-glyphs.log`）。
+- `cargo check -p mimageviewer --bin mimageviewer-core`: **exit 0、1分11秒**（`target/acceptance12-core-check.log`、既存警告あり）。
+- `cargo nextest run -p mimageviewer --test ui_snapshot -j 1 -E 'test(/search|folder_toolbar/)'`: **16/16成功、exit 0、70.602秒**（`target/acceptance12-snapshots.log`）。`UPDATE_SNAPSHOTS`を解除した通常比較で、既存PNGは変更しない。
+- 全件試験前の独立した`gpt-6.1-sol` / `xhigh`が設計・実装・関連文書と上記の有効な試験結果を確認し、いったんACCEPTとした（全件で見つかった下記回帰の再確認は別途必要）。検索Submitのownerとnative batch、Local履歴permit、ring/gamepad、title採用待ち境界、索引meta引継ぎを確認した。
+
+
+- 指定の本体lib全件1回: `NEXTEST_TEST_THREADS=6`で`./scripts/test-lib-full.ps1`を実行し、**16,291実行、16,285成功（slow 2）、6失敗、71skip、exit 100、1,579.915秒**。`target/test-lib-full/runs/20261104T150450027Z-6a023920/`、run UUID `a9ad3699-ae29-4893-97b9-9c31c5da1939`、開始source ID `f0ee80cff250ccbf84e4d7f8d9a8f4514268e422198932151f0c3ba7bce9ce76`。実行中はRustを変更しなかった（記録文書のみ追記）。この実行を全件成功とは扱わない。
+- 失敗2件は未変更の`agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`と`agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`で、既知の名前付きパイプOS error 5（アクセス拒否）。製品IPCコードは変更しない。
+- 残る4件: `everything_close_return::{escape_and_enter_close_use_the_everything_return_owner, extension_named_image_folder_book_close_returns_results, extension_named_ordinary_directory_close_keeps_its_list}`の3件は、今回加えた一時検索focus予約のRoot全体への投影が未表示Main入力にFullscreenのEnterを所属させた製品回帰。既存surface判定を`keyboard_shortcut_surface`へ抽出し、予約producerとSubmit受付をMain scopeに限定する。detached述語の実装やviewport/window寿命は変更せず、DetachedWindowではMain予約を保持する。独立reviewerと構造的修正で合意し、[detached計画 §11](detached-rework-plan.md)へ記録した。3件の既存テストは変更しない。
+- `physical_parent_1672::section1672_history_and_search_books_exit_to_physical_list_without_old_return`は`open_favsearch`直後のfocus予約を残したままGrid Enterを送る旧fixtureだった。新仕様の初回Enterは検索確定となるため、共通Submit後にGrid Enterを送る準備へ変更。query同一・root・worker不在・結果rows保持を前後でassertし、物理親へ抜ける本来の検査は維持する。
+
+- 追加scope回帰の初回compileは`ViewerPresentation`のimport漏れでexit 101（実行0件、`target/acceptance12-scope-compile-error.log`）。importを補い、製品期待を変えず下記の再実行で解消した。
+
+- scope修正後の補足試験: `cargo nextest run -p mimageviewer --lib -j 6 -E 'test(/everything_close_return|physical_parent_1672|section1705_|section1708_|main_window_title|keyboard_owner|keyboard_input|phase_c_key_tests|phase_c_folder_nav_history_tests|search_ime_commit|search_bar_focus_recovery|global_search_ui|pinned_search/)' --no-fail-fast`は**523/523成功、exit 0、67.913秒**（compile 3分49秒、run UUID `c3cfc005-d3a4-4b57-8af5-7406ba5d904c`、`target/acceptance12-scope-followup.log`）。全件で失敗した製品回帰3件とfixture1件、5検索種×MainWindow/Fullscreen/DetachedWindowの新しいApp回帰を含む。detachedでもMain予約を保つこと、他surfaceではegui/native Enterを消費しないことを確認した。
+- 最終core checkは**exit 0、1分51秒**（`target/acceptance12-core-check-final.log`、既存警告317）。`cargo fmt`後の`cargo fmt --check`もexit 0（`target/acceptance12-fmt-final.log`）、UI glyphは0件（`target/acceptance12-glyphs-final.log`）。
+- 本体lib全件は利用者指定の1回で終了し、最終修正後に再度の全件は実行しない。上記523件が変更した所有範囲と全件で出た4件を補足し、影響しない成功結果を再利用する。全件実行自体の6失敗は取り消さず記録する。名前付きパイプ2件の既知制約と実機確認未実施は残る。
+
+- 最終差分と523件/core checkの証拠を独立`gpt-6.1-sol` / `xhigh`が再確認し、**最終ACCEPT、未解決P1/P2なし**。Main/Fullscreen予約所有境界、未変更のEverything3件、fixture期待の維持を確認。既知pipe失敗と未実施実機は受入成功として扱わない。
+
+- 最終snapshot通常比較: `UPDATE_SNAPSHOTS`なし、`cargo nextest run -p mimageviewer --test ui_snapshot -j 1 -E 'test(/search|folder_toolbar/)'`は**16/16成功、exit 0、50.849秒**（compile 1分29秒、run UUID `0990e7e9-4cd6-445c-a6a2-510574957a7f`、`target/acceptance12-snapshots-final.log`）。既存PNG更新なし。最終`git diff --check`も成功。全4件の実機確認・設計担当の検収は未実施。commit・製品起動・確認用buildは行わず、依頼どおり引き継ぐ。
+
+
 ### 1.704 場所▼へビデオ・ミュージックを追加 (2026-11-04、v5.0.0)
 
 - 利用者の観測: ツールバーの場所▼にビデオとミュージックが無い。

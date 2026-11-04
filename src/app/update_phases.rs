@@ -697,36 +697,8 @@ impl App {
         // 名前索引 / メタ索引の supervisor が `in_full_scan=true` を示している間は
         // 「(インデックス更新中)」をサフィックスに付け、検索結果が不完全である
         // 可能性をユーザーに示唆する (notify-rs の watcher 待ちだけなら付けない)。
-        let smart_folder_name = self.current_smart_folder_id.and_then(|id| {
-            self.settings
-                .smart_folders
-                .iter()
-                .find(|definition| definition.id == id)
-                .map(|definition| definition.name.as_str())
-        });
-        let title = main_window_title(
-            self.effective_folder().as_deref(),
-            self.items_are_reading_history_view,
-            self.items_are_bookmark_view,
-            self.items_are_subfolder_expansion_view,
-            self.items_are_smart_folder_view
-                .then_some(smart_folder_name)
-                .flatten(),
-            self.top_level_grid_view
-                .collection_session()
-                .filter(|session| {
-                    matches!(
-                        session.position,
-                        top_level_grid_view::CollectionGridPosition::Root
-                    )
-                })
-                .map(|session| {
-                    session.prepared().map_or("読み込み中", |prepared| {
-                        prepared.collection_name.as_str()
-                    })
-                }),
-            self.any_indexer_in_full_scan(),
-        );
+        let location = self.main_window_location_label();
+        let title = main_window_title(location.as_deref(), self.any_indexer_in_full_scan());
         // タイトルが変わったときだけ送信する (2026-05-10 修正)。
         // 無条件に send_viewport_cmd(Title(...)) すると egui 内部の `request_repaint_of`
         // が毎フレーム発火し、App::update が 60fps で回り続けて他アプリ FPS を奪う。

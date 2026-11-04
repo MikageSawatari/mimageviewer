@@ -15498,6 +15498,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let parent_action = self.grid_parent_action();
         let parent_action_available = parent_action.available();
         let parent_nav_target = parent_action.into_nav_target();
+        let history_availability = self.history_nav_availability();
         let back_target = self.folder_history_back_target().cloned();
         let forward_target = self.folder_history_forward_target().cloned();
         let back_target_label = back_target
@@ -15777,10 +15778,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         // 検索 (Ctrl+G / Ctrl+S) 中は ←/→ を無効化する。検索は透明な
                         // 一時オーバーレイで、フォルダ履歴の概念が適用されないため。
                         // ★固定 中も同様に無効化 (Codex P2-1)。
-                        let back_hover = if snapshot_active {
-                            "★固定中は履歴ナビを使用できません".to_string()
-                        } else if search_active {
-                            "検索中はフォルダ履歴を使用できません".to_string()
+                        let back_hover = if let Err(reason) = history_availability {
+                            reason.to_string()
                         } else {
                             back_target_label
                                 .as_ref()
@@ -15789,10 +15788,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         };
                         let back_response = ui
                             .add_enabled(
-                                back_target.is_some() && !search_active && !snapshot_active,
+                                back_target.is_some() && history_availability.is_ok(),
                                 egui::Button::new("←"),
                             )
-                            .hover_tip(back_hover);
+                            .hover_tip(back_hover.clone())
+                            .hover_tip_disabled(back_hover);
                         #[cfg(feature = "test-script")]
                         crate::test_script::register_clickable_widget(
                             "history-back",
@@ -15801,10 +15801,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         if back_response.clicked() {
                             result = Some(AddressBarNav::HistoryBack);
                         }
-                        let forward_hover = if snapshot_active {
-                            "★固定中は履歴ナビを使用できません".to_string()
-                        } else if search_active {
-                            "検索中はフォルダ履歴を使用できません".to_string()
+                        let forward_hover = if let Err(reason) = history_availability {
+                            reason.to_string()
                         } else {
                             forward_target_label
                                 .as_ref()
@@ -15813,10 +15811,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         };
                         let forward_response = ui
                             .add_enabled(
-                                forward_target.is_some() && !search_active && !snapshot_active,
+                                forward_target.is_some() && history_availability.is_ok(),
                                 egui::Button::new("→"),
                             )
-                            .hover_tip(forward_hover);
+                            .hover_tip(forward_hover.clone())
+                            .hover_tip_disabled(forward_hover);
                         #[cfg(feature = "test-script")]
                         crate::test_script::register_clickable_widget(
                             "history-forward",
@@ -16619,7 +16618,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let zip_view = self.grid_is_zip_entries();
 
         // IME 変換確定の Enter は送信に使わず、確定後の通常 Enter だけを検索実行に使う。
-        let enter_pressed = self.dialog_enter_pressed(ctx);
+        let enter_pressed = self.dialog_enter_pressed(ctx)
+            && crate::keyboard_input::text_input_owns_submit(
+                ctx,
+                crate::ui_pinned_search::PinnedSearchKind::Local.temporary_id(),
+            );
         let local_search_label = self
             .keymap
             .first_chord_action_label("現在地フィルタ", KeyAction::GlobalLocalSearch);
@@ -16656,10 +16659,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
                 // Enter で検索実行 (IME 変換確定の Enter は除外)
                 if response.lost_focus() && enter_pressed {
-                    self.execute_search(ctx);
-                    // フォーカスを外してカーソルキーでグリッド操作できるようにする
-                    response.surrender_focus();
-                    self.search_has_focus = false;
+                    self.submit_search_input(ctx, crate::ui_pinned_search::PinnedSearchKind::Local, response.id);
                 }
 
                 // × ボタン
@@ -16785,10 +16785,15 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if !self.favsearch.active {
             return;
         }
-        let enter_pressed = self.dialog_enter_pressed(ctx);
+        let enter_pressed = self.dialog_enter_pressed(ctx)
+            && crate::keyboard_input::text_input_owns_submit(
+                ctx,
+                crate::ui_pinned_search::PinnedSearchKind::Container.temporary_id(),
+            );
 
         let mut close_requested = false;
         let mut query_changed = false;
+        let mut submit_requested = false;
 
         egui::Panel::top("favsearch_bar").show(root_ui, |ui| {
             self.gate_main_chrome(ui);
@@ -16826,7 +16831,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     }
                     // Enter で確定的に再実行 (IME 変換確定の Enter は除外)
                     if response.lost_focus() && enter_pressed {
-                        query_changed = true;
+                        submit_requested = true;
                     }
 
                     if ui.small_button("×").hover_tip("検索を閉じる").clicked() {
@@ -16934,7 +16939,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.close_favsearch();
             return;
         }
-        if query_changed && self.favsearch.query != self.favsearch.last_executed {
+        if submit_requested {
+            let kind = crate::ui_pinned_search::PinnedSearchKind::Container;
+            self.submit_search_input(ctx, kind, kind.temporary_id());
+        } else if query_changed && self.favsearch.query != self.favsearch.last_executed {
             self.execute_favsearch();
         }
     }
@@ -16942,6 +16950,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     /// タグビュー (Ctrl+T) の検索バーを描画する。
     pub(crate) fn render_tag_view_bar(&mut self, root_ui: &mut egui::Ui) {
         let ctx = &root_ui.ctx().clone();
+        let enter_pressed = self.dialog_enter_pressed(ctx)
+            && crate::keyboard_input::text_input_owns_submit(ctx, Self::tag_search_input_id());
         if !self.tag_view.active {
             self.tag_view.has_focus = false;
             return;
@@ -16964,7 +16974,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     &mut self.tag_view.query,
                     Some(&mut self.tag_view.focus_request),
                     |edit| {
-                        edit.hint_text("#タグ")
+                        edit.id(Self::tag_search_input_id())
+                            .hint_text("#タグ")
                             .desired_width(260.0)
                             .min_size(egui::vec2(260.0, 20.0))
                     },
@@ -16977,6 +16988,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 let response = output.response;
 
                 self.tag_view.has_focus = response.has_focus();
+                if response.lost_focus() && enter_pressed {
+                    self.submit_tag_search_input(ctx, response.id);
+                }
 
                 if response.changed() || menu_changed {
                     query_changed = true;
@@ -35188,6 +35202,83 @@ mod section207_tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn section1705_history_buttons_allow_local_filter_and_empty_bar() {
+        use crate::app::{FolderHistoryDirection, FolderNavHistoryTarget};
+        for filtered in [false, true] {
+            let mut env = crate::app::setup_app_for_test();
+            only_folder_and_tree(&mut env);
+            env.active_quick_folder_slot = None;
+            env.settings.auto_fullscreen_zip_pdf = false;
+            env.settings.auto_fullscreen_image_folders = false;
+            let source = env.tmp.path().join("source");
+            let target = env.tmp.path().join("target");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::create_dir_all(&target).unwrap();
+            for name in ["first.jpg", "second.jpg"] {
+                std::fs::write(target.join(name), []).unwrap();
+                std::fs::write(source.join(name), []).unwrap();
+            }
+            env.load_folder_with_scan(source.clone(), None);
+            assert_eq!(
+                env.modal_dialog_block_reason(),
+                Some("sidecar_restore"),
+                "nonempty fixture prepares identities before grid input"
+            );
+            env.finish_page_identity_preparation_for_test();
+            env.show_search_bar = true;
+            env.search_focus_request = false;
+            if filtered {
+                env.search_query = "first".into();
+                env.search_filter = Some(std::collections::HashSet::from([0]).into());
+                env.search_filter_origin_folder = Some(source.clone());
+            }
+            env.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(target.clone()).into()];
+            env.folder_nav_forward_stack.clear();
+            let app = Rc::new(RefCell::new(env));
+            let render = Rc::clone(&app);
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(1200.0, 280.0))
+                .build_ui(move |root_ui| {
+                    let ctx = root_ui.ctx().clone();
+                    let mut app = render.borrow_mut();
+                    match app.render_toolbar(root_ui).1 {
+                        Some(AddressBarNav::HistoryBack) => {
+                            app.dispatch_folder_history_input_for_test(FolderHistoryDirection::Back)
+                        }
+                        Some(AddressBarNav::HistoryForward) => app
+                            .dispatch_folder_history_input_for_test(
+                                FolderHistoryDirection::Forward,
+                            ),
+                        _ => {}
+                    }
+                    app.settle_open_path_classification_for_test();
+                    app.poll_history_navigation_transition_for_test(&ctx);
+                    app.poll_sidecar_restore(&ctx);
+                });
+            harness.run();
+            assert!(!harness.get_by_label("←").accesskit_node().is_disabled());
+            harness.get_by_label("←").click();
+            harness.step();
+            // Finish worker adoption without launching a product window.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.borrow().current_folder.as_ref() != Some(&target)
+                || app.borrow().sidecar_restore_active()
+            {
+                assert!(std::time::Instant::now() < deadline);
+                harness.step();
+                std::thread::yield_now();
+            }
+            assert!(app.borrow().search_filter.is_none());
+            assert!(app.borrow().search_query.is_empty());
+            assert_eq!(app.borrow().visible_indices.len(), 2);
+            assert!(app.borrow().folder_history_forward_target().is_some());
+            harness.step();
+            assert!(!harness.get_by_label("→").accesskit_node().is_disabled());
         }
     }
 

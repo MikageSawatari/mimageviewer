@@ -5,6 +5,10 @@ use crate::ui_pinned_search::{
     PinnedSearchAction as Action, PinnedSearchKind as Kind, PinnedSearchState as State,
 };
 
+#[cfg(test)]
+#[path = "tests/search_submit.rs"]
+mod submit_tests;
+
 impl From<SearchSource> for Kind {
     fn from(source: SearchSource) -> Self {
         match source {
@@ -615,6 +619,13 @@ impl SearchInputId {
             Self::TemporaryBar(kind) => kind.temporary_id(),
         }
     }
+
+    fn from_widget(widget: egui::Id) -> Option<Self> {
+        Kind::ALL
+            .into_iter()
+            .flat_map(|kind| [Self::Pinned(kind), Self::TemporaryBar(kind)])
+            .find(|input| input.id() == widget)
+    }
 }
 
 #[derive(Default)]
@@ -768,6 +779,163 @@ mod production_tests {
 }
 
 impl App {
+    pub(crate) fn tag_search_input_id() -> egui::Id {
+        egui::Id::unique("tag_search_input")
+    }
+
+    /// Finish the one accepted text-submit operation, including its focus reservation.
+    fn finish_search_input_submit(&mut self, ctx: &egui::Context, widget: egui::Id) {
+        crate::keyboard_input::claim_text_input_submit(ctx, widget);
+        if self
+            .pending_text_input_focus
+            .get()
+            .is_some_and(|claim| claim.viewport == ctx.viewport_id() && claim.widget_id == widget)
+        {
+            self.clear_pending_text_input_focus();
+        }
+    }
+
+    pub(crate) fn submit_search_input(
+        &mut self,
+        ctx: &egui::Context,
+        kind: Kind,
+        widget: egui::Id,
+    ) -> bool {
+        if self.pinned_search_availability(kind).is_err() {
+            return false;
+        }
+        self.ensure_search_session(kind);
+        self.finish_search_input_submit(ctx, widget);
+        match kind {
+            Kind::Local => {
+                self.search_focus_request = false;
+                self.search_has_focus = false;
+                self.execute_search(ctx);
+            }
+            Kind::Container => {
+                self.favsearch.focus_request = false;
+                self.favsearch.has_focus = false;
+                if self.favsearch.query != self.favsearch.last_executed
+                    || !self.favsearch.nav_stack.is_empty()
+                {
+                    self.execute_favsearch();
+                }
+            }
+            Kind::Metadata | Kind::Everything => {
+                self.global_search.focus_request = false;
+                self.global_search.has_focus = false;
+                match kind {
+                    Kind::Metadata => self.reset_global_search_for_query_change(ctx),
+                    _ => self.send_everything_search(ctx),
+                }
+            }
+        }
+        true
+    }
+
+    pub(crate) fn submit_tag_search_input(
+        &mut self,
+        ctx: &egui::Context,
+        widget: egui::Id,
+    ) -> bool {
+        if !self.tag_view.active
+            || widget != Self::tag_search_input_id()
+            || self.any_dialog_open()
+            || self.common_modal_dialog_open()
+            || self.ime_input_active(ctx)
+            || matches!(
+                self.keyboard_owner_for_pass(ctx),
+                crate::keyboard_input::KeyboardOwner::Modal
+            )
+        {
+            return false;
+        }
+        self.finish_search_input_submit(ctx, widget);
+        self.tag_view.focus_request = false;
+        self.tag_view.has_focus = false;
+        true
+    }
+
+    pub(super) fn temporary_search_focus_reservation(&self) -> Option<egui::Id> {
+        if self.show_search_bar && self.search_focus_request && !Kind::Local.pinned(&self.settings)
+        {
+            Some(Kind::Local.temporary_id())
+        } else if self.favsearch.active
+            && self.favsearch.focus_request
+            && !Kind::Container.pinned(&self.settings)
+        {
+            Some(Kind::Container.temporary_id())
+        } else if self.global_search.active && self.global_search.focus_request {
+            let kind = Kind::from(self.global_search.source);
+            (!kind.pinned(&self.settings)).then_some(kind.temporary_id())
+        } else if self.tag_view.active && self.tag_view.focus_request {
+            Some(Self::tag_search_input_id())
+        } else {
+            None
+        }
+    }
+
+    /// Called after Main's discrete-input and active-detached admission, before grid keys.
+    /// A real widget or its recovery claim wins over a not-yet-drawn search reservation.
+    pub(crate) fn route_pending_search_submit(&mut self, ctx: &egui::Context) -> bool {
+        use crate::keyboard_input::{
+            KeyboardOwner, ShortcutScope, ShortcutSurface, TextInputPhase,
+        };
+
+        if self.keyboard_shortcut_surface(ctx.viewport_id()) != ShortcutSurface::Main
+            || !self.dialog_enter_pressed(ctx)
+            || self.any_dialog_open()
+            || self.common_modal_dialog_open()
+            || ctx.memory(|memory| memory.focused()).is_some()
+            || crate::ime_focus::focused_text_input(ctx).is_some()
+            || crate::ime_focus::recovering_text_input(ctx).is_some()
+            || matches!(
+                self.keyboard_owner_for_pass(ctx),
+                KeyboardOwner::Modal
+                    | KeyboardOwner::FocusedUi { .. }
+                    | KeyboardOwner::ApplicationShortcut {
+                        scope: ShortcutScope {
+                            surface: ShortcutSurface::Fullscreen,
+                            ..
+                        }
+                    }
+                    | KeyboardOwner::TextInput {
+                        phase: TextInputPhase::Focused
+                            | TextInputPhase::FocusRecovery
+                            | TextInputPhase::ImeComposing,
+                        ..
+                    }
+            )
+        {
+            return false;
+        }
+
+        if let Some(claim) = self.pending_text_input_focus.get() {
+            // Another editor's typed reservation outranks legacy search focus latches.
+            if claim.viewport != ctx.viewport_id() {
+                return false;
+            }
+            if let Some(input) = SearchInputId::from_widget(claim.widget_id) {
+                return self.edit_owner(input.kind())
+                    && self.submit_search_input(ctx, input.kind(), input.id());
+            }
+            if claim.widget_id == Self::tag_search_input_id() && self.tag_view.active {
+                return self.submit_tag_search_input(ctx, claim.widget_id);
+            }
+            return false;
+        }
+
+        if let Some(widget) = self.temporary_search_focus_reservation() {
+            if let Some(input) = SearchInputId::from_widget(widget) {
+                return self.submit_search_input(ctx, input.kind(), widget);
+            }
+            if widget == Self::tag_search_input_id() {
+                return self.submit_tag_search_input(ctx, widget);
+            }
+        }
+        false
+    }
+
     pub(crate) fn search_draft(&self, kind: Kind) -> &str {
         match kind {
             Kind::Local => &self.search_query,
@@ -943,7 +1111,10 @@ impl App {
                     self.search_draft_mut(kind).clear();
                 }
                 Action::Edited(_) if kind == Kind::Everything => {}
-                Action::Edited(_) | Action::Submit(_) => {
+                Action::Submit(_) => {
+                    self.submit_search_input(ctx, kind, kind.input_id());
+                }
+                Action::Edited(_) => {
                     self.ensure_search_session(kind);
                     // An edit already owns focus. Entry latches must not refocus it on redraw.
                     match kind {
@@ -952,9 +1123,6 @@ impl App {
                         _ => self.global_search.focus_request = false,
                     }
                     match kind {
-                        Kind::Local if matches!(action, Action::Submit(_)) => {
-                            self.execute_search(ctx)
-                        }
                         Kind::Local => {}
                         Kind::Container => {
                             if self.favsearch.query != self.favsearch.last_executed {

@@ -1291,7 +1291,7 @@ fn build_aggregated_items_prepared(
 /// `state.all_hits` を走査して各ヒットを `GridItem::{Image, PdfFile, Video, Audio}` に変換し、
 /// メインの `sort_order` で一律ソートする。ZIP 内画像ヒットはアイテム索引に存在しない
 /// が (§3.2)、stale な索引が残るケースに備えて防御的にスキップする。
-/// 直接の本は取得済みの署名を渡す。他の行は従来のplaceholderを使い、
+/// 直接のヒットは取得済みの署名を表示・サムネイルへ渡し、
 /// UI スレッドでの `fs::metadata` 同期呼び出しは避ける。
 pub(crate) fn build_flat_items(
     state: &GlobalSearchState,
@@ -1357,7 +1357,7 @@ fn build_flat_items_with_recipe(
 /// 含む子フォルダ (Folder 枝、件数バッジ付き) だけを並べる。ヒットを含まない枝は
 /// 枝刈りされる。
 ///
-/// 直接の本はサムネイルにもSTORED署名を引き継ぐ。検索枝と既存メディアは従来のplaceholder。
+/// 直接のヒットは表示・サムネイルにもSTORED署名を引き継ぐ。検索枝は従来のplaceholder。
 /// 並べ替えも worker が得た `GlobalHit::{mtime,file_size}` を使い、UI thread のstatは増やさない。
 pub(crate) fn build_drilled_items(
     state: &GlobalSearchState,
@@ -1500,8 +1500,9 @@ fn build_drilled_items_with_recipe(
     (items, image_metas, drill_branches)
 }
 
-/// Direct books need their indexed source stamp for conversion-cache validation
-/// and the existing folder thumbnail path. Do not stat or invent an unknown size.
+/// Direct hits share their indexed source stamp between thumbnail requests and
+/// file-size display. Preserve the legacy media placeholder only when the index
+/// has no size; direct books still require a known stamp for their thumbnail path.
 fn fs_hit_thumbnail_meta(
     item: &GridItem,
     meta: crate::settings::ListingSortMetadata,
@@ -1510,7 +1511,7 @@ fn fs_hit_thumbnail_meta(
         GridItem::ZipFile(_) | GridItem::ConvertibleArchive { .. } | GridItem::Folder(_) => {
             meta.file_size.map(|size| (meta.mtime, size))
         }
-        _ => Some((0, 0)),
+        _ => Some(meta.file_size.map_or((0, 0), |size| (meta.mtime, size))),
     }
 }
 
@@ -4471,11 +4472,18 @@ impl App {
     /// - Aggregated: `🌐 アイテム検索: "query" (N 件)`
     /// - DrilledInto: `🌐 アイテム検索: "query" > container_name > sub_path...`
     pub(crate) fn update_global_search_address(&mut self) {
-        if self.update_everything_address() {
-            return;
+        if let Some(label) = self.global_search_location_label() {
+            self.address = label;
+        }
+    }
+
+    /// 検索の現在地表示。アドレス欄の編集中テキストに依存せず、表示も更新しない。
+    pub(crate) fn global_search_location_label(&self) -> Option<String> {
+        if let Some(label) = self.everything_location_label() {
+            return Some(label);
         }
         if !self.global_search.active {
-            return;
+            return None;
         }
         let query = match &self.global_search.accepted {
             SearchAccepted::Metadata {
@@ -4487,7 +4495,7 @@ impl App {
             SearchAccepted::Metadata { .. } => self.global_search.metadata_draft.clone(),
             SearchAccepted::Everything { .. } => unreachable!(),
         };
-        match self.global_search.view() {
+        Some(match self.global_search.view() {
             GlobalSearchView::Flat | GlobalSearchView::Aggregated => {
                 // 集約時はコンテナ数、一覧時はヒット数を件数として表示する。
                 let searching = self.global_search.is_searching();
@@ -4503,23 +4511,23 @@ impl App {
                 };
                 let n = crate::ui_helpers::format_count(n as u64);
                 if query.is_empty() {
-                    self.address = "🌐 アイテム検索".to_string();
+                    "🌐 アイテム検索".to_string()
                 } else if searching {
                     let scanned =
                         crate::ui_helpers::format_count(self.global_search.total_scanned as u64);
                     if self.global_search.aggregate {
                         let hits =
                             crate::ui_helpers::format_count(self.global_search.total_valid as u64);
-                        self.address = format!(
+                        format!(
                             "🌐 アイテム検索: \"{query}\"  ({n} 件 / 検索中 · ヒット {hits} 件 · {scanned} 件を確認)"
-                        );
+                        )
                     } else {
-                        self.address = format!(
+                        format!(
                             "🌐 アイテム検索: \"{query}\"  ({n} 件 / 検索中 · {scanned} 件を確認)"
-                        );
+                        )
                     }
                 } else {
-                    self.address = format!("🌐 アイテム検索: \"{query}\"  ({n} 件)");
+                    format!("🌐 アイテム検索: \"{query}\"  ({n} 件)")
                 }
             }
             GlobalSearchView::DrilledInto {
@@ -4556,12 +4564,12 @@ impl App {
                 } else {
                     String::new()
                 };
-                self.address = format!(
+                format!(
                     "🌐 アイテム検索: \"{query}\" > {}{suffix}",
                     segs.join(" > ")
-                );
+                )
             }
-        }
+        })
     }
 
     /// Ctrl+G の空グリッドに出す進捗文言。
@@ -4591,10 +4599,15 @@ impl App {
         }
         let running = self.everything_search_progress_visible();
         self.show_everything_search_progress(ctx);
-        let enter_pressed = self.dialog_enter_pressed(ctx);
+        let enter_pressed = self.dialog_enter_pressed(ctx)
+            && crate::keyboard_input::text_input_owns_submit(
+                ctx,
+                crate::ui_pinned_search::PinnedSearchKind::Metadata.temporary_id(),
+            );
 
         let mut close_requested = false;
         let mut query_changed = false;
+        let mut submit_requested = false;
         let mut filter_changed = false;
         let mut sort_changed = false;
         let mut toggle_changed = false;
@@ -4664,7 +4677,7 @@ impl App {
                     query_changed = true;
                 }
                 if response.lost_focus() && enter_pressed {
-                    query_changed = true;
+                    submit_requested = true;
                 }
                 if ui.small_button("×").on_hover_text("検索を閉じる").clicked() {
                     close_requested = true;
@@ -4904,7 +4917,10 @@ impl App {
                 self.spawn_global_search(ctx);
             }
         }
-        if query_changed {
+        if submit_requested {
+            let kind = crate::ui_pinned_search::PinnedSearchKind::Metadata;
+            self.submit_search_input(ctx, kind, kind.temporary_id());
+        } else if query_changed {
             self.reset_global_search_for_query_change(ctx);
         }
         if sort_changed {
@@ -5131,7 +5147,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn caption_book_thumbnail_stamps_follow_direct_hits_in_both_projections() {
+    fn direct_hit_thumbnail_stamps_follow_index_in_both_projections() {
         let root = Path::new("C:/caption-stamps");
         let mut state = GlobalSearchState::default();
         for (name, kind, mtime, size) in [
@@ -5145,6 +5161,11 @@ pub(crate) mod tests {
             ("document.pdf", IndexKind::Pdf, 108, Some(98)),
             ("video.mp4", IndexKind::Video, 109, Some(99)),
             ("audio.flac", IndexKind::Audio, 110, Some(100)),
+            ("empty.jpg", IndexKind::Image, 111, Some(0)),
+            ("legacy-image.jpg", IndexKind::Image, 112, None),
+            ("legacy-video.mp4", IndexKind::Video, 113, None),
+            ("legacy-audio.flac", IndexKind::Audio, 114, None),
+            ("document.epub", IndexKind::Pdf, 115, Some(4_294_967_296)),
         ] {
             let mut hit = caption_book_hit(&root.join(name), kind, 0);
             hit.mtime = mtime;
@@ -5165,10 +5186,10 @@ pub(crate) mod tests {
                     .iter()
                     .find(|hit| Path::new(&hit.path) == item.drag_source_path().unwrap())
                     .unwrap();
-                let expected = if matches!(hit.kind, IndexKind::Zip | IndexKind::Folder) {
-                    hit.file_size.map(|size| (hit.mtime, size))
-                } else {
-                    Some((0, 0))
+                let expected = match hit.file_size {
+                    Some(size) => Some((hit.mtime, size)),
+                    None if matches!(hit.kind, IndexKind::Zip | IndexKind::Folder) => None,
+                    None => Some((0, 0)),
                 };
                 assert_eq!(*meta, expected, "{item:?}");
             }
