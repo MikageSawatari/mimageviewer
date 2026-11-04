@@ -8064,6 +8064,13 @@ pub(crate) struct LocalSearchSubmission {
     or_mode: bool,
 }
 
+/// Install handoff: the draft is presentation, while the shared submission alone
+/// owns the accepted conditions. None means an open, never-submitted search bar.
+pub(crate) struct LocalSearchReplay {
+    submitted: Option<Arc<LocalSearchSubmission>>,
+    draft: String,
+}
+
 /// Completed membership and the conditions that produced it have one lifetime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LocalSearchFilter {
@@ -18485,7 +18492,7 @@ pub struct App {
     pub(crate) smart_folder_open_origin: Option<smart_folder::SmartFolderOpenOrigin>,
     /// Ctrl+F is an in-view filter for an installed smart folder. A prepare replaces item indices,
     /// so the query is re-run against the new order after installation.
-    pub(crate) smart_folder_local_search_reapply: Option<String>,
+    pub(crate) smart_folder_local_search_reapply: Option<LocalSearchReplay>,
     /// snapshot / prepare worker と共有中に削除された実パス。定義ごとに保持し、
     /// ソート変更や履歴復元で削除済み項目を再構築しないための tombstone。
     pub(crate) smart_folder_removed_paths:
@@ -34040,9 +34047,11 @@ impl App {
         if let Some(origin) = transferred_origin {
             self.restore_view_return_origin(origin);
             if restore_smart_folder {
-                // Keep the pending smart restore as the owner of the grid.  Its install boundary
-                // will run the query typed while the worker is active against the final indices.
-                self.smart_folder_local_search_reapply = Some(String::new());
+                // The restore owns the destination list; opening a bar does not submit its draft.
+                self.smart_folder_local_search_reapply = Some(LocalSearchReplay {
+                    submitted: None,
+                    draft: String::new(),
+                });
             }
         }
         // スタック集約計算待ち (通常フォルダ表示中) に Ctrl+F が来たら、検索を優先する。
@@ -75187,18 +75196,30 @@ impl App {
     /// 既存検索をキャンセルできるよう `SearchPending.cancel` を立てる。
     pub(crate) fn execute_search(&mut self, ctx: &egui::Context) {
         self.move_grid_cursor(self.selected, GridCursorIntent::ExplicitKeep);
-        self.reexecute_search_for_installed_list(ctx);
-    }
-
-    /// Existing query reapplication after automatic list installation is not a
-    /// new explicit selection. Result publication retains its Automatic intent.
-    pub(crate) fn reexecute_search_for_installed_list(&mut self, ctx: &egui::Context) {
+        // Only explicit submission may turn the UI draft/controls into conditions.
         let submitted = Arc::new(LocalSearchSubmission {
             query: self.search_query.clone(),
             target: self.search_target.clone(),
             or_mode: self.search_or_mode,
         });
         self.execute_submitted_local_search(ctx, submitted);
+    }
+
+    fn capture_local_search_replay(&self) -> Option<LocalSearchReplay> {
+        self.show_search_bar.then(|| LocalSearchReplay {
+            submitted: self.submitted_local_search(),
+            draft: self.search_query.clone(),
+        })
+    }
+
+    fn apply_local_search_replay(&mut self, ctx: &egui::Context, replay: LocalSearchReplay) {
+        self.show_search_bar = true;
+        if !self.settings.show_toolbar_search_local {
+            self.search_query = replay.draft;
+        }
+        if let Some(submitted) = replay.submitted {
+            self.execute_submitted_local_search(ctx, submitted);
+        }
     }
 
     fn local_search_list_identity(&self) -> LocalSearchListIdentity {

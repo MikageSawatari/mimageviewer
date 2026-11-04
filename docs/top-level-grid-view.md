@@ -1,5 +1,13 @@
 # 最上位一覧ビューの ownership とスマートフォルダ scope
 
+2026-11-04 受入A再レビュー: Smartのsort/refreshでは旧一覧の検索を準備開始時に
+取り消さず、採用直前に提出済み`LocalSearchSubmission`のArcと最新draftを分けて捕捉する。
+installerが旧要求を終了した後、同じ提出済み条件を新一覧へ再適用する。
+準備中の編集だけでは条件を変えず、Enterは新しい提出、closeは再適用の終了となる。
+staged RefreshとLocalのSmart復帰も対象とし、別SmartへのDirect入場へ旧条件を持ち越さない。
+サブ展開の採用も同じtyped replayを使う。固定欄は現在のdraft、非固定欄は採用直前のdraftを
+維持する。条件の単一所有者・全入口監査・回帰は [検索設計 §5.2](search-architecture.md#52-ctrlf--現在地フィルタ-現グリッドの表示中アイテムのみ)。
+
 ## 合成一覧の親と完全な帰路（§1.473）
 
 一覧の親入力とtoolbar previewは `app/grid_parent` の同じ純粋なaction解決を使う。

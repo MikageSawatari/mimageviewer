@@ -2707,8 +2707,7 @@ impl App {
 
         let item_count = items.len();
         let start_loading_t0 = Instant::now();
-        let local_search =
-            (ctx.is_some() && self.show_search_bar).then(|| self.search_query.clone());
+        let local_search = ctx.and_then(|_| self.capture_local_search_replay());
         let mut hydration = self.install_loading_items_inner(
             subfolder_expansion_synthetic_path(),
             items,
@@ -2778,10 +2777,8 @@ impl App {
         self.subfolder_expansion_diag = Some(diag.clone());
         self.address =
             subfolder_expansion_view_label("サブ展開", &root, &roots, Some(&scan_filter));
-        if let (Some(ctx), Some(query)) = (ctx, local_search) {
-            self.show_search_bar = true;
-            self.search_query = query;
-            self.reexecute_search_for_installed_list(ctx);
+        if let (Some(ctx), Some(replay)) = (ctx, local_search) {
+            self.apply_local_search_replay(ctx, replay);
         }
         if perf_on {
             crate::perf::event(
@@ -4763,6 +4760,84 @@ mod tests {
         .unwrap();
         assert_eq!(indices, [1, 2, 0]);
         assert_eq!(facts.write_generation(), 7);
+    }
+
+    #[test]
+    fn review2_a_subfolder_install_reuses_submission_and_keeps_unsubmitted_draft() {
+        for pinned in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let ctx = egui::Context::default();
+            let root = app.tmp.path().join("search-handoff");
+            std::fs::create_dir(&root).unwrap();
+            let paths = [root.join("cat.jpg"), root.join("dog.jpg")];
+            for path in &paths {
+                std::fs::write(path, b"image").unwrap();
+            }
+            app.items = paths.iter().cloned().map(GridItem::Image).collect();
+            app.rebuild_visible_indices();
+            app.settings.show_toolbar_search_local = pinned;
+            app.show_search_bar = true;
+            app.search_query = "cat".into();
+            app.search_target =
+                crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
+            app.execute_search(&ctx);
+            let submitted = app.submitted_local_search().unwrap();
+            app.search_query = "dog".into();
+            let snapshot = SubfolderExpansionSnapshot {
+                file_type_visibility: Default::default(),
+                root: root.clone(),
+                roots: vec![root],
+                scan_filter: Default::default(),
+                entries: Arc::new(
+                    paths
+                        .into_iter()
+                        .rev()
+                        .map(|path| SubfolderExpansionEntry {
+                            path,
+                            kind: SubfolderExpansionEntryKind::Image,
+                            mtime: 1,
+                            file_size: 5,
+                        })
+                        .collect(),
+                ),
+                video_thumb_overrides: Default::default(),
+                diag: Default::default(),
+                stack_rating_source: Default::default(),
+                stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                    crate::settings::SortOrder::FileName,
+                ),
+            };
+            app.start_subfolder_expansion_prepare(snapshot, false);
+            let pending = app.subfolder_expansion_install_pending.take().unwrap();
+            let prepared = loop {
+                match pending.rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    SubfolderExpansionPrepareEvent::Progress(_) => {}
+                    SubfolderExpansionPrepareEvent::Done(prepared) => break *prepared,
+                    other => panic!(
+                        "unexpected preparation event: {}",
+                        match other {
+                            SubfolderExpansionPrepareEvent::Cancelled => "cancelled",
+                            SubfolderExpansionPrepareEvent::Error(_) => "error",
+                            _ => unreachable!(),
+                        }
+                    ),
+                }
+            };
+            app.install_prepared_subfolder_expansion(prepared, Some(&ctx));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.search_pending.is_some() {
+                assert!(Instant::now() < deadline);
+                app.poll_search(&ctx);
+                std::thread::yield_now();
+            }
+            assert_eq!(app.search_query, "dog");
+            assert_eq!(
+                app.submitted_local_search().as_deref(),
+                Some(submitted.as_ref())
+            );
+            assert_eq!(app.visible_indices.len(), 1);
+            assert_eq!(app.items[app.visible_indices[0]].name(), "cat.jpg");
+        }
     }
 
     #[test]

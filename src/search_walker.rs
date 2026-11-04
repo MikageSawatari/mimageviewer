@@ -464,14 +464,18 @@ fn scan_with_io_and_captions(
         let keys = captions
             .ok_keys_in_ranges(&scope.sql_ranges())
             .map_err(ScanError::Metadata)?;
-        for key in keys {
+        let mut path_casing = crate::path_key::ExistingPathCasingCache::default();
+        for (index, key) in keys.into_iter().enumerate() {
+            if index % 500 == 0 {
+                path_casing = crate::path_key::ExistingPathCasingCache::default();
+            }
             if crate::activity_gate::wait_and_check_cancel(activity_gate, &cancel) {
                 return Err(ScanError::Cancelled);
             }
             let Some(_permit) = io_sem.acquire_cancellable(priority, &cancel) else {
                 return Err(ScanError::Cancelled);
             };
-            let restored = crate::path_key::restore_existing_path_casing(Path::new(&key));
+            let restored = path_casing.restore(Path::new(&key));
             let path = restored.as_deref().unwrap_or_else(|| Path::new(&key));
             if folder_tree::is_apple_double(path) {
                 continue;

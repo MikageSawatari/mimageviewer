@@ -2588,7 +2588,20 @@ fn rating_grid_explicit_scope_and_search_acceptance_cancel_return_but_auto_keeps
                 "explicit-noop" => app.move_grid_cursor(current, GridCursorIntent::ExplicitKeep),
                 "automatic" => app.move_grid_cursor(Some(2), GridCursorIntent::Automatic),
                 "automatic-search" => {
-                    app.reexecute_search_for_installed_list(&egui::Context::default())
+                    app.show_search_bar = true;
+                    app.search_filter = Some(LocalSearchFilter {
+                        matches: (0..app.items.len()).collect(),
+                        submitted: Arc::new(LocalSearchSubmission {
+                            query: "a".into(),
+                            target: crate::fts_index::SearchTarget::Only(vec![
+                                crate::fts_index::SourceKind::Filename,
+                            ]),
+                            or_mode: false,
+                        }),
+                    });
+                    let replay = app.capture_local_search_replay().unwrap();
+                    app.apply_local_search_replay(&egui::Context::default(), replay);
+                    assert!(app.search_pending.is_some());
                 }
                 _ => unreachable!(),
             }

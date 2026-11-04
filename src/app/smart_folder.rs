@@ -3492,11 +3492,18 @@ impl App {
         }
         let target =
             super::top_level_grid_view::SmartFolderViewState::root(definition_id, Vec::new());
+        let retains_local_search = matches!(
+            navigation.history,
+            super::MainHistoryOperation::SameLocation
+        ) || self.smart_folder_local_search_reapply.is_some();
         let destination = self.smart_navigation_destination(&navigation, target);
         let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
             self.retire_smart_folder_payloads([Box::new(prepared) as RetiredSmartFolderPayload]);
             return false;
         };
+        let local_search = retains_local_search
+            .then(|| self.capture_local_search_replay())
+            .flatten();
         self.adopt_main_list_navigation(adoption, |app| {
             app.install_adopted_smart_transition_root(
                 request_id,
@@ -3504,6 +3511,7 @@ impl App {
                 record_history,
                 anchor,
                 prior_origin,
+                local_search,
             );
             None
         })
@@ -3516,14 +3524,12 @@ impl App {
         record_history: bool,
         anchor: Option<PathBuf>,
         prior_origin: Option<super::top_level_grid_view::TopLevelGridOrigin>,
+        local_search: Option<super::LocalSearchReplay>,
     ) {
         let definition_id = prepared.snapshot.definition.id;
         // All fallible work is complete. This is the first point at which the prior viewer may
         // be dismissed or its workers cancelled. In particular, Search and Collection remain
         // live while the new Smart root is scanning and preparing offscreen.
-        if self.smart_folder_local_search_reapply.is_some() && self.show_search_bar {
-            self.smart_folder_local_search_reapply = Some(self.search_query.clone());
-        }
         let departed = self.close_transient_views_before_smart_folder();
         let prior = prior_origin
             .as_ref()
@@ -3555,6 +3561,7 @@ impl App {
             Some(prior),
         );
         self.top_level_grid_view.replace_return_origin(prior_origin);
+        self.smart_folder_local_search_reapply = local_search;
         self.install_current_prepared_smart_folder(prepared);
         if let Some(session) = self.top_level_grid_view.smart_folder_session_mut() {
             session.adopted_request_id = Some(request_id);
@@ -8043,10 +8050,8 @@ impl App {
             let _ = self.refresh_smart_folder_staged(snapshot.definition.id);
             return;
         }
-        if self.items_are_smart_folder_view && self.show_search_bar {
-            self.smart_folder_local_search_reapply = Some(self.search_query.clone());
-            self.cancel_search_pending();
-        }
+        // Keep the search over the still-visible list alive. Capture its latest
+        // submission only at adoption, after all reprepare/rejection checks.
         let retired =
             cancelled_smart_folder_payloads(None, self.smart_folder_prepare_pending.take(), None);
         self.retire_smart_folder_payloads(retired);
@@ -9238,11 +9243,6 @@ impl App {
             let _ = self.refresh_smart_folder_staged(id);
             return false;
         }
-        if self.smart_folder_local_search_reapply.is_some() && self.show_search_bar {
-            // The user can keep typing while scan/prepare is active. Capture the last UI-owned
-            // value before `start_loading_subfolder_items` clears index-based search state.
-            self.smart_folder_local_search_reapply = Some(self.search_query.clone());
-        }
         let PreparedSmartFolder {
             snapshot,
             presentation,
@@ -9378,6 +9378,9 @@ impl App {
     /// Freshness was checked by the prepare owner before adoption. No worker or
     /// other UI event can interleave this install with that admission boundary.
     fn install_current_prepared_smart_folder(&mut self, prepared: PreparedSmartFolder) {
+        if self.items_are_smart_folder_view && self.show_search_bar {
+            self.smart_folder_local_search_reapply = self.capture_local_search_replay();
+        }
         self.save_departing_session_grid_positions();
         self.retire_rating_navigation_owner();
         let install_started = Instant::now();
@@ -9541,27 +9544,10 @@ impl App {
     }
 
     fn reapply_local_search_after_smart_folder_prepare(&mut self, ctx: &egui::Context) {
-        let Some(query) = self.smart_folder_local_search_reapply.take() else {
+        let Some(replay) = self.smart_folder_local_search_reapply.take() else {
             return;
         };
-        self.show_search_bar = true;
-        if !self.settings.show_toolbar_search_local {
-            self.search_query = query.clone();
-        }
-        self.search_filter = None;
-        self.search_filter_origin_folder = self.effective_folder();
-        if query.trim().is_empty() {
-            self.rebuild_visible_indices();
-        } else {
-            self.execute_submitted_local_search(
-                ctx,
-                Arc::new(super::LocalSearchSubmission {
-                    query,
-                    target: self.search_target.clone(),
-                    or_mode: self.search_or_mode,
-                }),
-            );
-        }
+        self.apply_local_search_replay(ctx, replay);
     }
 
     pub(crate) fn reprepare_current_smart_folder_for_sort(&mut self) -> bool {
@@ -12132,7 +12118,16 @@ mod tests {
         install_smart_identity_test_root(&mut app, Default::default());
         app.settings.show_toolbar_search_local = true;
         app.search_query = "new child draft".into();
-        app.smart_folder_local_search_reapply = Some("root submission".into());
+        app.smart_folder_local_search_reapply = Some(super::super::LocalSearchReplay {
+            submitted: Some(Arc::new(super::super::LocalSearchSubmission {
+                query: "root submission".into(),
+                target: crate::fts_index::SearchTarget::Only(vec![
+                    crate::fts_index::SourceKind::Filename,
+                ]),
+                or_mode: false,
+            })),
+            draft: "old root draft".into(),
+        });
         app.search_target =
             crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
         let ctx = egui::Context::default();

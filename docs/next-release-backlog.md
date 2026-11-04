@@ -47,6 +47,8 @@
 
 - 独立レビュー追補（`1ab6992b8`、P2、ソース指摘）: Collection再採用がfilterだけを解除し、未完了要求を残すことを確認。修正前回帰は旧cancel tokenが終了しないため失敗した（`target/review-a-red.log`）。世代を見送った判断を撤回し、要求と結果の単一ownerに既存viewer context ID＋items_generationを捕捉する。受信時の不一致はXMP/filter/cursorへ適用せず破棄する。再採用では旧要求を終了し、新一覧で同じ提出済み条件を再実行する。未提出draft、確定済みfilterのstable ID remap、snapshot復帰は維持する。回帰は`review_a_collection_reorder_retires_pending_search_and_reapplies_submission`と`review_a_search_completion_requires_current_list_and_request_identity`。実機では検索中にCollectionを並べ替え、旧indexの別項目が絞り込み結果にならないことを確認する。
 
+- 再レビュー残件（HEAD `a53adaeaf`、P2）: Smart prepare開始・採用前の3か所が入力Stringを捕捉し、再実行時にその時点のtarget/AND・ORも新条件にしていた。実sort入口の修正前回帰で、提出済み`a / Filename / OR`が`latest draft / AiCaption / AND`になる失敗を確認（`target/review2-a-red.log`）。旧一覧が見える間は検索を止めず、実採用直前に提出済みArcと最新draftを分離捕捉する形へ簡素化した。製品の条件生成を明示実行1か所へ集約し、サブ展開・reload分岐も同じtyped replayへ統一。全8群の再実行入口、修正前2→修正後1の製品factory、明示受付4入口の監査は[検索設計 §5.2](search-architecture.md#52-ctrlf--現在地フィルタ-現グリッドの表示中アイテムのみ)。実sortから完成/pending、準備中編集/Enter/close、未提出、固定/非固定、再prepare、staged Refreshを検査し、サブ展開も実採用入口から検査する。実機では固定欄でcatを検索→dogへ編集のみ→並べ替えで、draftはdog、結果はcatを維持することを確認する。
+
 ### 1.699 v5 受入 B: AI連携の初回「書き換える」が効かない (2026-11-04)
 
 - 観測: サブPC担当（同受入記録）。v5新機能の不具合。
@@ -69,6 +71,8 @@
 - 検証: 元の大小文字の画像・フォルダ本・説明文のあるZIP本をFull／caption反映の両方から検索し、Flat／Drillの一覧とopen dispatchのpath保持が成功。実機では索引再構築後に検索→開く→履歴／ブックマークから再表示して名前を確認する。
 
 - 独立レビュー追補（P2、ソース指摘）: full形式sidecarの逆引きはstemの表記を返すため、`MixedPhoto.JPG`と`mixedphoto.jpg.json`の組で更新後の表示pathが小文字になった。修正前回帰で検索結果の不一致を確認（`target/review-d-red.log`）。復元をworkerの共通候補生成`build_candidate_from_path`へ集約し、watcher・sidecar追加/削除・caption反映を対象にした。通常FS列挙とFullのcaption本追加の契約、照合key、INDEX_VERSION=11は維持する。回帰`acceptance_d_sidecar_watch_preserves_physical_path_casing`はsidecar追加/削除と画像の小文字通知から実検索まで検査する。実機では大小文字の異なるsidecarを編集後、Ctrl+Gの名前・開くpathを確認する。
+
+- 再レビュー残件（HEAD `a53adaeaf`、P2）: 復元helperがcanonicalizeでjunction先へ解決されたpathを同一論理pathでないとして拒否し、小文字のalias pathを候補へ残すことを確認。junctionを通したsidecar通知→実検索の修正前回帰が失敗（`target/review2-d-red.log`）。Windowsは各componentのexact名問い合わせで論理aliasを維持し、操作内の成功prefix cache（最大4096件）を全worker callerで共有する。Full/反映500件、watchイベント、タグ/評価/Remote requestの寿命で破棄し、directory全列挙・常駐cache失効state・UI同期I/Oを増やさない。コストと所有境界は[sidecar設計](sidecar-metadata-ingest.md#14-実装上の確定追補-codex-レビュー反映)、[検索設計 §4.11](search-architecture.md#411-ai-生成メタデータと保存済み-ai-説明文-index_version11)を参照。実機ではdirectory link経由で大小文字の異なるsidecarを更新し、結果/openが元のaliasとファイル名を保持することを確認する。照合key・INDEX_VERSION=11は維持。
 
 ### 1.702 v5 受入 E: PDF/EPUBページ内でCtrl+Fが無反応 (2026-11-04)
 
@@ -113,6 +117,19 @@
 - snapshotは更新指定なしの`cargo test -p mimageviewer --test ui_snapshot agent_`: **11/11成功、exit 0、3.06秒**（`target/review-snapshot.log`）。既存画像の変更なし。検索E2Eは`cargo test -p mimageviewer --test search_metadata_e2e`: **17/17成功、exit 0、1.00秒**（`target/review-search-e2e.log`）。
 - `cargo fmt`（引数なし）・`cargo fmt --check`・`git diff --check`はexit 0。`python scripts/check_ui_glyphs.py`もexit 0、危険glyphなし。
 - 独立した`gpt-6.1-sol` / `xhigh`のread-onlyレビューは追加の修正必須指摘なし。要求identity、Collectionの条件引継ぎ、共通候補生成、stop後のRemote進捗まで確認した。lib全件・本体とRemoteを含むbuild-dev・実機受入は設計担当へ引き継ぐ。製品起動・commitは実施しない。
+
+#### 再レビュー残件 A・D の検証台帳 (2026-11-04、実装担当)
+
+- 対象: `v5-integration` / HEAD `a53adaeaf`からの未コミット差分。Windows、`CARGO_BUILD_JOBS=6`、`MSBUILDDISABLENODEREUSE=1`、既定feature。実機再現ではなくコード確認と非対話の回帰試験である。前回確認済みのCollection/F/Eの実装は変更しない。
+- 修正前の失敗: `target/review2-a-red.log`は実sort入口で提出済み条件がdraft/現在controlへ変わるassert失敗、`target/review2-d-red.log`は実junction経由のsidecar通知から検索したpathの大小文字不一致。両方exit 101。junctionは使い捨てfixture内に作り、aliasのみ非再帰で除去してからfixtureを解放した。
+- 新規・直接関連の8テスト: **8/8成功、1並列、46.926秒、exit 0**（`target/review2-new-green.log`）。Smartの実sort/Refresh入口とサブ展開の実install、junction検索、128 siblingsのprobe回数・重複hit・fresh cacheでのcase-only rename・namespace/wildcard/rootを検査した。
+- `test-focused.ps1`のmodule選択: path **13/13**、タグ **12/12**、評価 **18/18**（`target/review2-focused.log`）、索引管理 **35/35**、walker **31/31**（`target/review2-index-focused.log`、exit 0）。1並列で実行。Remoteタグは同script内で44成功/1timeout、exit 100。全module一括成功とは扱わない。引数なしは共有App/文書を広域対象として**exit 2／未実行**（`target/review2-focused-plan.log`）。
+- Remoteタグの既存`tag_all_visibility_uses_filtered_scan_bound_for_late_visible_target`は実ファイル10,001件＋末尾PDFとタグDBを作る試験で、nextestの300秒上限で打切り。assert失敗ではない。内容を変えず、十分な時間枠の単独`cargo test --lib <exact filter>`で**1/1成功、265.05秒、exit 0**（`target/review2-remote-large-single.log`）。実行中の非変更観察ではZIP 5,711件/PDF未作成というfixture生成段階を確認した。初回timeoutと単独成功は別記録とし、既存gateの制限は変更していない。
+- App関連filter: **328/328成功、1並列、175.814秒、exit 0**（`target/review2-related.log`、正確なfilterは`target/review2-related-filter.txt`）。Smart prepare/transition、サブ展開、ローカル検索・提出条件・起動/履歴復元、既存A〜F、固定欄、rating自動検索の帰還権限を対象にした。WebView2を呼ぶ試験は選ばず、EPUBの状態試験は既存のtyped test backend/変換済みcacheを使用する。
+- `cargo check -p mimageviewer --bin mimageviewer-core`: **exit 0、27.75秒**（`target/review2-core-check.log`、既存警告あり）。
+- `cargo test -p mimageviewer --test ui_snapshot search`: **12/12成功、2.29秒、exit 0**（`target/review2-snapshot.log`）。更新指定なし、既存PNGの変更なし。`cargo test -p mimageviewer --test search_metadata_e2e`: **17/17成功、1.06秒、exit 0**（`target/review2-search-e2e.log`）。
+- `cargo fmt`（引数なし）・`cargo fmt --check`（`target/review2-fmt.log`）・glyph検査（`target/review2-glyph.log`、危険glyphなし）・`git diff --check`はexit 0。
+- 実装と別contextの`gpt-6.1-sol` / `xhigh`が設計前提と最終差分を確認し、A/Dとも**ACCEPT、追加findingなし**。lib全件・build-devと実機確認は指定どおり設計担当へ引き継ぐ。製品起動・commitは実施していない。
 
 ### v4.11.0 で出荷した 5ch・X 由来の項目と、報告者への案内 (2026-11-02)
 

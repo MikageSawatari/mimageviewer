@@ -971,6 +971,7 @@ impl App {
     }
     pub(crate) fn close_local_search(&mut self, ctx: &egui::Context) {
         self.cancel_pending_folder_nav();
+        self.smart_folder_local_search_reapply = None;
         self.show_search_bar = false;
         self.clear_search_draft_on_end(Kind::Local);
         self.search_filter = None;

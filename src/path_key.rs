@@ -148,27 +148,233 @@ pub(crate) fn physical_path_is_strict_descendant(path: &Path, root: &Path) -> bo
     physical_path_is_within(path, root)
         && physical_path_spelling(path) != physical_path_spelling(root)
 }
-/// 実在するパスの表示用表記を取得する。保存キーの大小文字と区切りは変えてよいが、
-/// symlink 解決などで別の論理パスになった場合は採用しない。
-///
-/// Windows の `canonicalize` が返す verbatim prefix を通常の絶対パスへ戻す。
-/// ファイルシステム I/O を行うため、一覧構築 worker からだけ呼ぶ。
-pub(crate) fn restore_existing_path_casing(path: &Path) -> Option<PathBuf> {
-    let canonical = std::fs::canonicalize(path).ok()?;
-    let s = canonical.to_string_lossy();
-    let spelled = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{rest}"))
-    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-        PathBuf::from(rest)
-    } else {
-        canonical
-    };
-    eq_keep_drive(&spelled, path).then_some(spelled)
+/// Worker-operation-local display spelling resolver. Never share across requests:
+/// a new operation must observe case-only renames rather than reuse old spellings.
+/// Successful exact prefixes are cached (including leaves), at most 4096 entries.
+/// Storage is proportional to the total length of those input/output prefixes.
+/// Each uncached Windows component uses one exact name probe, no directory scan;
+/// shared parents and repeated paths need no further probes within the operation.
+#[derive(Default)]
+pub(crate) struct ExistingPathCasingCache {
+    #[cfg(windows)]
+    prefixes: std::collections::HashMap<PathBuf, PathBuf>,
+    #[cfg(all(windows, test))]
+    probes: usize,
+}
+
+impl ExistingPathCasingCache {
+    #[cfg(windows)]
+    const MAX_PREFIXES: usize = 4096;
+
+    /// Filesystem I/O: call only from a worker. Preserve drive/share roots and
+    /// logical directory symlink/junction aliases; change only component casing.
+    #[cfg(windows)]
+    pub(crate) fn restore(&mut self, path: &Path) -> Option<PathBuf> {
+        use std::path::{Component, Prefix};
+
+        let input = normalize_input_path(path);
+        let mut components = input.components();
+        let Component::Prefix(prefix) = components.next()? else {
+            return None;
+        };
+        if !matches!(
+            prefix.kind(),
+            Prefix::Disk(_)
+                | Prefix::UNC(_, _)
+                | Prefix::VerbatimDisk(_)
+                | Prefix::VerbatimUNC(_, _)
+        ) || components.next() != Some(Component::RootDir)
+        {
+            return None;
+        }
+        if self.prefixes.len() >= Self::MAX_PREFIXES {
+            self.prefixes.clear();
+        }
+        let mut key = PathBuf::from(prefix.as_os_str());
+        key.push(std::path::MAIN_SEPARATOR_STR);
+        let mut spelled = key.clone();
+        for component in components {
+            let Component::Normal(name) = component else {
+                return None;
+            };
+            // Exact paths, not lowercased keys: case-sensitive directories may
+            // contain distinct entries whose names differ only by case.
+            key.push(name);
+            if let Some(cached) = self.prefixes.get(&key) {
+                spelled.clone_from(cached);
+                continue;
+            }
+            let query = spelled.join(name);
+            #[cfg(test)]
+            {
+                self.probes += 1;
+            }
+            let actual = existing_component_name(&query)?;
+            if !eq_keep_drive(Path::new(&actual), Path::new(name)) {
+                // In particular, do not replace an 8.3 alias with a long name.
+                return None;
+            }
+            spelled.push(actual);
+            if self.prefixes.len() < Self::MAX_PREFIXES {
+                self.prefixes.insert(key.clone(), spelled.clone());
+            }
+        }
+        eq_keep_drive(&spelled, &input).then_some(spelled)
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn restore(&mut self, path: &Path) -> Option<PathBuf> {
+        let canonical = std::fs::canonicalize(path).ok()?;
+        eq_keep_drive(&canonical, path).then_some(canonical)
+    }
+}
+
+#[cfg(windows)]
+fn existing_component_name(path: &Path) -> Option<std::ffi::OsString> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+    use windows::core::PCWSTR;
+
+    struct FindHandle(HANDLE);
+    impl Drop for FindHandle {
+        fn drop(&mut self) {
+            let _ = unsafe { FindClose(self.0) };
+        }
+    }
+
+    // FindFirstFile interprets wildcards. Only the namespace prefix may contain
+    // '?'; reject it (and NUL) in every ordinary component before calling Win32.
+    if path.components().any(|component| {
+        matches!(component, std::path::Component::Normal(name) if name.encode_wide().any(|unit| matches!(unit, 0 | 42 | 63)))
+    }) {
+        return None;
+    }
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    // Keep long paths supported without changing the displayed namespace.
+    if !wide.starts_with(&[92, 92, 63, 92]) {
+        wide = if wide.starts_with(&[92, 92]) {
+            [vec![92, 92, 63, 92, 85, 78, 67, 92], wide[2..].to_vec()].concat()
+        } else {
+            [vec![92, 92, 63, 92], wide].concat()
+        };
+    }
+    wide.push(0);
+    let mut data = WIN32_FIND_DATAW::default();
+    let _handle = FindHandle(unsafe { FindFirstFileW(PCWSTR(wide.as_ptr()), &mut data) }.ok()?);
+    let length = data.cFileName.iter().position(|unit| *unit == 0)?;
+    Some(std::ffi::OsString::from_wide(&data.cFileName[..length]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn casing_cache_shares_exact_parent_probes_across_many_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("MixedShelf").join("MixedChapter");
+        std::fs::create_dir_all(&parent).unwrap();
+        let mut cache = ExistingPathCasingCache::default();
+        let mut first_probes = 0;
+        for index in 0..128 {
+            let actual = parent.join(format!("MixedPhoto{index:03}.JPG"));
+            std::fs::write(&actual, b"image").unwrap();
+            let input = PathBuf::from(normalize_keep_drive(&actual));
+            assert_eq!(cache.restore(&input), Some(actual.clone()));
+            if index == 0 {
+                first_probes = cache.probes;
+            }
+            // Every later sibling needs one exact leaf query. Its ancestors
+            // (and then its repeated full path) are entirely cache hits.
+            assert_eq!(cache.probes, first_probes + index);
+            let probes = cache.probes;
+            assert_eq!(cache.restore(&input), Some(actual));
+            assert_eq!(cache.probes, probes);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn fresh_casing_cache_observes_case_only_directory_and_file_renames() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("MixedShelf");
+        std::fs::create_dir(&directory).unwrap();
+        let before = directory.join("MixedPhoto.JPG");
+        std::fs::write(&before, b"image").unwrap();
+        let input = PathBuf::from(normalize_keep_drive(&before));
+        assert_eq!(
+            ExistingPathCasingCache::default().restore(&input),
+            Some(before.clone())
+        );
+        let after_directory = temp.path().join("MIXEDSHELF");
+        std::fs::rename(&directory, &after_directory).unwrap();
+        let after = after_directory.join("MIXEDPHOTO.JPG");
+        std::fs::rename(after_directory.join("MixedPhoto.JPG"), &after).unwrap();
+        assert_eq!(
+            ExistingPathCasingCache::default().restore(&input),
+            Some(after)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn casing_cache_rejects_wildcards_and_nonphysical_namespaces() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("MixedPhoto.JPG"), b"image").unwrap();
+        for pattern in ["*.JPG", "MixedPhot?.JPG"] {
+            assert!(
+                ExistingPathCasingCache::default()
+                    .restore(&temp.path().join(pattern))
+                    .is_none()
+            );
+        }
+        for input in [
+            r"\\.\C:\MixedPhoto.JPG",
+            r"\\?\Volume{abc}\MixedPhoto.JPG",
+            r"C:MixedPhoto.JPG",
+            "relative.jpg",
+        ] {
+            assert!(
+                ExistingPathCasingCache::default()
+                    .restore(Path::new(input))
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn casing_cache_preserves_known_verbatim_prefix_and_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let actual = temp.path().join("MixedPhoto.JPG");
+        std::fs::write(&actual, b"image").unwrap();
+        let input = PathBuf::from(format!(
+            r"\\?\{}",
+            normalize_keep_drive(&actual).replace('/', r"\")
+        ));
+        let mut cache = ExistingPathCasingCache::default();
+        let restored = cache.restore(&input).unwrap();
+        assert!(eq_keep_drive(&restored, &input));
+        // Drive spelling is preserved from the namespace prefix; every normal
+        // component is spelled exactly as on disk.
+        assert_eq!(restored.components().next(), input.components().next());
+        assert_eq!(
+            restored.components().skip(1).collect::<Vec<_>>(),
+            actual.components().skip(1).collect::<Vec<_>>()
+        );
+        for root in [
+            r"C:\",
+            r"\\Server\Share\",
+            r"\\?\C:\",
+            r"\\?\UNC\Server\Share\",
+        ] {
+            let before = cache.probes;
+            assert_eq!(cache.restore(Path::new(root)), Some(PathBuf::from(root)));
+            assert_eq!(cache.probes, before);
+        }
+    }
 
     #[test]
     fn strict_descendant_uses_physical_source_spelling_and_component_boundaries() {

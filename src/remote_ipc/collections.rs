@@ -136,11 +136,14 @@ impl CollectionEngine {
         let keys = crate::tag_view::select_tag_view_item_keys(&db, tag, scan_limit + 1);
         let truncated = keys.len() > scan_limit;
         let mut items = Vec::new();
+        let mut path_casing = crate::path_key::ExistingPathCasingCache::default();
         for key in keys.into_iter().take(scan_limit) {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
-            let Some(candidate) = candidate_from_tag_item_key(key, TagItemKind::All) else {
+            let Some(candidate) =
+                candidate_from_tag_item_key(key, TagItemKind::All, &mut path_casing)
+            else {
                 continue;
             };
             if !include_collection_candidate(&settings, &candidate) {
@@ -1253,13 +1256,18 @@ fn validate_tag_items_request(request: &TagItemsRequest) -> Result<(), Collectio
     Ok(())
 }
 
-fn candidate_from_tag_item_key(key: String, filter: TagItemKind) -> Option<CandidateEntry> {
-    let classified = match crate::tag_view::classify_tag_view_path(PathBuf::from(key)) {
-        crate::tag_view::ClassifiedTagViewPath::Existing(classified) => classified,
-        // missing は外付け切断 / NAS offline でも起きる。結果から隠すだけで、
-        // tags.db は変更しない。
-        crate::tag_view::ClassifiedTagViewPath::Missing => return None,
-    };
+fn candidate_from_tag_item_key(
+    key: String,
+    filter: TagItemKind,
+    path_casing: &mut crate::path_key::ExistingPathCasingCache,
+) -> Option<CandidateEntry> {
+    let classified =
+        match crate::tag_view::classify_tag_view_path_with_cache(PathBuf::from(key), path_casing) {
+            crate::tag_view::ClassifiedTagViewPath::Existing(classified) => classified,
+            // missing は外付け切断 / NAS offline でも起きる。結果から隠すだけで、
+            // tags.db は変更しない。
+            crate::tag_view::ClassifiedTagViewPath::Missing => return None,
+        };
     let remote_kind = if classified.is_directory {
         RemoteEntryKind::Folder
     } else {
@@ -1365,8 +1373,9 @@ fn map_tag_item_keys_with_visibility(
     let key_limit_reached = item_keys.len() > key_scan_limit;
     let mapped_limit = entry_limit.saturating_add(1);
     let mut candidates = Vec::with_capacity(mapped_limit);
+    let mut path_casing = crate::path_key::ExistingPathCasingCache::default();
     for key in item_keys.into_iter().take(key_scan_limit) {
-        let Some(candidate) = candidate_from_tag_item_key(key, filter) else {
+        let Some(candidate) = candidate_from_tag_item_key(key, filter, &mut path_casing) else {
             continue;
         };
         if candidate.kind != RemoteEntryKind::Folder

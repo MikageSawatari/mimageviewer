@@ -703,9 +703,16 @@ catalogは保持し、v1.0〜v1.3から直接更新する旧タグは取り込�
 版12・移行処理・UIでのstatや文字列の大小文字推測は追加しない。
 
 watcher・サイドカー逆引き・caption reflection（画像・PDF/EPUBも含む）は、共通の
-`build_candidate_from_path`が既存worker用`restore_existing_path_casing`で実在する
+`build_candidate_from_path`がworker操作所有の`ExistingPathCasingCache`で実在する
 同じ論理pathの表記を復元する。通知やsidecar stemの表記を実ファイルの表記とみなさない。
 通常FS列挙は実pathを保持し、caption DBのkeyから候補を作るFullの本追加はwalkerで復元する。
+再レビュー追補: Windowsは`canonicalize`を使わず、各logical componentの名前を
+`FindFirstFileW`のexact probeで得る。directory symlink/junction aliasをリンク先へ置換しない。
+成功prefixのexact PathBufを最大4096件cacheし、watch 1イベント・caption反映500件・
+Fullの本追加500件ごとにfreshにする。タグ/評価一覧・Remoteタグもworker/requestの寿命で共有する。
+共有親の解決後は未解決leafにつきexact probe 1回、同じpathはcache hitとなる。
+directory全列挙を追加せず、OS内部の所要時間がO(1)とは保証しない。UI同期I/Oは追加しない。
+case-sensitive directoryの既存救済、8.3等のlogical identity、照合keyは変えない。
 Flat/DrillのGridItem・開く操作は結果pathを保持し、履歴・ブックマークへ渡す元pathも
 そこから導く。キーを作る境界だけがnormalizeする。旧ZIP memberの比較もkeyへ正規化する。
 集約の`containers`は正規化した親pathをキー、`ContainerHit.path`を表示/open用の値として
@@ -808,6 +815,38 @@ Collection再採用は旧要求を終了し、新しい一覧の採用完了後�
 未提出の入力欄を条件として採用しない。新たな世代カウンタやpending状態は追加しない。
 確定済みfilterの同一項目への明示remap・itemsとfilterを対で戻すsnapshotの契約は維持する。
 回帰: `acceptance_a_list_replacement_retires_local_filter_before_visibility`。
+
+再レビュー追補: 提出済みのquery/target/AND・ORを所有するのは不変な
+`LocalSearchSubmission`のみ。製品での生成は`execute_search`の1か所に集約する。
+pending/result/filter/一覧採用intentは同じArcを運び、入力欄の`search_query`と混ぜない。
+`LocalSearchReplay`はそのArc（未提出ならNone）と表示用draftを分けた一時handoffである。
+Smart prepare開始時の検索取消・String捕捉を撤去し、旧一覧が可視な間は検索を維持する。
+再prepare/reject判定を通過した実採用直前にpending/filterと最新draftを捕捉し、
+一覧installerで旧要求を終了してから再実行する。staged Refreshも同じ条件で捕捉し、
+別SmartへのDirect入場は旧Localを引き継がない。close済みの欄は再開しない。
+準備中の編集だけなら旧条件、Enterなら新しい条件を採用する。pinned draftは現在値を維持する。
+
+再実行入口の全監査（HEAD `a53adaeaf`）:
+
+| 経路 | 捕捉・再適用の扱い |
+| --- | --- |
+| Smart sort/metadata prepare | 旧draft代入3か所と早期cancelを廃止し、採用直前のtyped replayへ統一 |
+| Smart staged Refresh / Localを開いたままのSmart復帰 | 検証済み採用の直前でcapture。既存open-onlyは未提出として扱う |
+| サブ展開install | draftだけの捕捉をtyped replayへ置換 |
+| 非物理Folder reload分岐 | draftだけの捕捉をtyped replayへ置換。現行の物理判定・早期returnでは到達しない分岐も監査対象に含めた |
+| 物理reload（履歴・F5等のRefreshList） | 既存StartupListIntentのArcとsearch_draft分離を維持 |
+| ZIP pin更新 | 既存filterを保持し、pendingの提出済みArcを再実行 |
+| 閲覧履歴hydration | 採用前に提出済みArcを捕捉して再実行 |
+| Collection再採用 | pendingの提出済みArcを再実行、確定filterはstable entry IDでremap |
+
+製品の条件生成は修正前2か所→修正後1か所。明示受付は固定欄Submit、通常欄Enter、
+検索対象変更、AND/OR変更の4入口で、従来の受付仕様を維持する。
+旧draft再生成helperの製品呼出しは明示submit 1＋自動2で、helperを廃止した。
+Smartのdraft→再適用String代入3か所と空String sentinelも廃止し、
+snapshotのlabel/draft保存（実行を伴わない）と提出済みfilterの対応復元は維持する。
+回帰は`review2_a_smart_sort_captures_submitted_conditions_from_the_sort_entry`が実sort入口から
+完成・pending・未提出・固定/非固定・準備中Enter/close・再prepare・staged Refreshを通し、
+`review2_a_subfolder_install_reuses_submission_and_keeps_unsubmitted_draft`が実install入口を通す。
 
 受入 E: PDF/EPUBのページ内は従来どおり現在地フィルタ対象外。
 `pinned_search_availability(Local)`をmenu・固定欄・shortcutで共有し、menuはdisabled tooltip、

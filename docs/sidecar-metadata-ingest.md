@@ -380,9 +380,28 @@ if !is_video_sidecar {
    例: `MixedPhoto.JPG` の隣の `mixedphoto.jpg.json`。watcher・サイドカー逆引き・caption反映で
    共有する `build_candidate_from_path` が、workerで実在する同一論理pathの表記を復元してから
    候補を作り、ingestが検索結果の表示/open用 `display_path` へ保存する。正規化した照合keyは
-   変更しない。symlink解決などで論理pathが変わる場合は元のpathを維持する。
+   変更しない。Windowsでは`ExistingPathCasingCache`が各componentを
+   `FindFirstFileW`のexact-name問い合わせで復元する。`canonicalize`でdirectory symlink /
+   junctionの参照先へ置換せず、論理aliasを保持する。ワイルドカードを拒否し、長い名前への
+   8.3展開など、大小文字・区切り以外の変更は採用しない。問い合わせ失敗時は従来どおり
+   元pathを維持し、通常のmetadata確認へ進む。非Windowsの同一論理path確認は従来どおり。
+   directory全列挙は追加しない。最初のpathは祖先component分、以降の同じ親の画像は
+   未解決leafごとに1回のexact probeを行い、同じpathの再確認はcacheを使う。
+   これは問い合わせ回数の説明であり、OS/ネットワーク上の所要時間の保証ではない。
+   cacheは正確な`PathBuf`をキーとする成功prefix→表示prefixのみを最大4096件保持し、
+   メモリ量はその範囲のpath文字列の合計長に比例する。満杯なら次のpathの開始時に全消去する。
+   索引ではwatchイベント1件（兄弟画像間で共有）、
+   caption反映のpending最大500件、Fullのcaption本追加500件ごとに新しく作る。
+   同じresolverを使うタグ・評価一覧とRemoteタグ結果もworker/request単位で所有し、
+   case-sensitive directory向けの既存sibling探索は残す。UIからの同期I/Oは追加しない。
+   操作間でcacheを持ち越さずcase-only renameを次の操作で観測するため、常駐共有cacheの
+   無効化・再試行・新しい非同期状態は不要。
    Windows回帰 `acceptance_d_sidecar_watch_preserves_physical_path_casing` は、上記full形式の
    サイドカー追加・削除と、小文字の画像path通知を実検索まで通して実ファイル名の保持を検査する。
+   `acceptance_d_sidecar_watch_preserves_junction_alias_and_component_casing`は実junctionを作り、
+   完全小文字のサイドカー通知から同じ検査を通してaliasと各componentの表記を検査する。
+   `path_key`の回帰は128 siblingで最初の祖先問い合わせ後にleafあたり1probe、重複pathで
+   追加probeなし、fresh cacheによるcase-only renameの観測、ワイルドカード拒否を検査する。
 
 3. **削除・古いサイドカー・優先順位切替の差分検出 (P1 + Codex 実装 P3)**: 実効 mtime =
    `max(画像, サイドカー)` **だけでは不十分**。サイドカー mtime が画像 mtime 以下のとき、サイドカーを

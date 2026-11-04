@@ -405,6 +405,7 @@ fn run_tag_view_search_with_visibility(
     let scan_truncated = matches.len() > scan_limit;
     let mut truncated = false;
     let mut entries = Vec::with_capacity(matches.len().min(TAG_VIEW_RESULT_LIMIT));
+    let mut path_casing = crate::path_key::ExistingPathCasingCache::default();
     for matched in matches.into_iter().take(scan_limit) {
         if cancel.load(Ordering::Relaxed) {
             return Ok(TagViewResult {
@@ -417,7 +418,7 @@ fn run_tag_view_search_with_visibility(
             });
         }
         let path = PathBuf::from(&matched.item_key);
-        match classify_tag_view_path(path) {
+        match classify_tag_view_path_with_cache(path, &mut path_casing) {
             ClassifiedTagViewPath::Existing(classified) => {
                 let mut entry = classified.entry;
                 entry.applied_at_ms = matched.applied_at.checked_mul(1000);
@@ -533,12 +534,20 @@ pub(crate) enum ClassifiedTagViewPath {
     Missing,
 }
 
+#[cfg(test)]
 pub(crate) fn classify_tag_view_path(path: PathBuf) -> ClassifiedTagViewPath {
+    classify_tag_view_path_with_cache(
+        path,
+        &mut crate::path_key::ExistingPathCasingCache::default(),
+    )
+}
+
+pub(crate) fn classify_tag_view_path_with_cache(
+    path: PathBuf,
+    path_casing: &mut crate::path_key::ExistingPathCasingCache,
+) -> ClassifiedTagViewPath {
     match std::fs::metadata(&path) {
-        Ok(meta) => existing_tag_view_entry(
-            crate::path_key::restore_existing_path_casing(&path).unwrap_or(path),
-            meta,
-        ),
+        Ok(meta) => existing_tag_view_entry(path_casing.restore(&path).unwrap_or(path), meta),
         Err(_) => {
             // 大文字小文字を区別するディレクトリ (DevDrive / WSL の case-sensitive
             // フラグ) では、小文字正規化された item_key の metadata が**実在ファイル
@@ -548,7 +557,7 @@ pub(crate) fn classify_tag_view_path(path: PathBuf) -> ClassifiedTagViewPath {
             if let Some(real) = find_case_insensitive_sibling(&path)
                 && let Ok(meta) = std::fs::metadata(&real)
             {
-                return existing_tag_view_entry(real, meta);
+                return existing_tag_view_entry(path_casing.restore(&real).unwrap_or(real), meta);
             }
             ClassifiedTagViewPath::Missing
         }

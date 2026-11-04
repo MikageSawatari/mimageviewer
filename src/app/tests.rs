@@ -102652,6 +102652,26 @@ mod smart_folder_transition_tests {
 
     #[test]
     fn smart_folder_sort_reapplies_active_local_search() {
+        check_smart_sort_search_handoff("unchanged");
+    }
+
+    #[test]
+    fn review2_a_smart_sort_captures_submitted_conditions_from_the_sort_entry() {
+        for scenario in [
+            "completed",
+            "pending",
+            "open-only",
+            "un-pinned",
+            "new-submit",
+            "close",
+            "resort",
+            "refresh",
+        ] {
+            check_smart_sort_search_handoff(scenario);
+        }
+    }
+
+    fn check_smart_sort_search_handoff(scenario: &str) {
         use crate::app::smart_folder::{
             SmartFolderDiag, SmartFolderEntry, SmartFolderEntryKind, SmartFolderSnapshot,
         };
@@ -102679,6 +102699,21 @@ mod smart_folder_transition_tests {
             matching_rule_indices: vec![0],
         };
         let entries = vec![entry("b.jpg", 2), entry("a.jpg", 1)];
+        if scenario == "refresh" {
+            for (name, seconds) in [("a.jpg", 1), ("b.jpg", 2)] {
+                let path = source.join(name);
+                std::fs::write(&path, b"x").unwrap();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_modified(
+                        std::time::UNIX_EPOCH
+                            + std::time::Duration::from_secs(1_600_000_000 + seconds),
+                    )
+                    .unwrap();
+            }
+        }
         let snapshot = SmartFolderSnapshot {
             file_type_visibility: Default::default(),
             definition,
@@ -102698,26 +102733,85 @@ mod smart_folder_transition_tests {
         ));
 
         app.open_local_metadata_search();
+        app.settings.show_toolbar_search_local = !matches!(scenario, "unchanged" | "un-pinned");
         app.search_query = "a".into();
-        app.execute_search(&ctx);
-        wait_for_smart_folder_idle(&mut app, &ctx, id);
+        app.search_target =
+            crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
+        app.search_or_mode = true;
+        if scenario != "open-only" {
+            app.execute_search(&ctx);
+            if scenario != "pending" {
+                wait_for_smart_folder_idle(&mut app, &ctx, id);
+            }
+        }
+        let submitted = app.submitted_local_search();
+        if scenario != "unchanged" {
+            app.search_query = "b".into();
+            app.search_target =
+                crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::AiCaption]);
+            app.search_or_mode = false;
+        }
         app.settings.sort_order = crate::settings::SortOrder::DateDesc;
-        assert!(app.reprepare_current_smart_folder_for_sort());
+        if scenario == "refresh" {
+            app.reload_top_level_grid(&ctx);
+        } else {
+            app.apply_sort_change_reload();
+        }
+        if scenario != "unchanged" {
+            app.search_query = "latest draft".into();
+        }
+        if scenario == "resort" {
+            app.apply_sort_change_reload();
+        } else if scenario == "new-submit" {
+            app.search_query = "b".into();
+            app.search_target =
+                crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
+            app.execute_search(&ctx);
+        } else if scenario == "close" {
+            app.close_local_search(&ctx);
+        }
         wait_for_smart_folder_idle(&mut app, &ctx, id);
 
-        assert!(app.show_search_bar);
-        assert_eq!(app.search_query, "a");
+        assert_eq!(app.show_search_bar, scenario != "close", "{scenario}");
+        if scenario == "open-only" || scenario == "close" {
+            assert!(app.search_filter.is_none(), "{scenario}");
+            assert_eq!(app.visible_indices.len(), 2, "{scenario}");
+            if scenario == "open-only" {
+                assert_eq!(app.search_query, "latest draft");
+            }
+            return;
+        }
+        let expected_query = if scenario == "unchanged" {
+            "a"
+        } else if scenario == "new-submit" {
+            "b"
+        } else {
+            "latest draft"
+        };
+        assert_eq!(app.search_query, expected_query, "{scenario}");
+        if scenario != "new-submit" {
+            assert_eq!(
+                app.submitted_local_search(),
+                submitted,
+                "{scenario}: query/target/mode must retain submission"
+            );
+        }
         assert!(matches!(
             app.items.as_slice(),
             [GridItem::Image(b), GridItem::Image(a)]
                 if b.file_name().and_then(|name| name.to_str()) == Some("b.jpg")
                     && a.file_name().and_then(|name| name.to_str()) == Some("a.jpg")
         ));
-        assert_eq!(app.visible_indices.len(), 1);
+        assert_eq!(app.visible_indices.len(), 1, "{scenario}");
+        let expected_name = if scenario == "new-submit" {
+            "b.jpg"
+        } else {
+            "a.jpg"
+        };
         assert!(matches!(
             &app.items[app.visible_indices[0]],
             GridItem::Image(path)
-                if path.file_name().and_then(|name| name.to_str()) == Some("a.jpg")
+                if path.file_name().and_then(|name| name.to_str()) == Some(expected_name)
         ));
     }
 

@@ -792,6 +792,8 @@ fn reflect_captions(
         let mut ingest = Vec::new();
         let mut delete = Vec::new();
         let mut keys = std::collections::HashSet::new();
+        // A fresh spelling snapshot for each pending batch, never supervisor-wide.
+        let mut path_casing = crate::path_key::ExistingPathCasingCache::default();
         for (key, _, _) in &pending {
             if cancel.load(Ordering::Relaxed) {
                 return;
@@ -799,10 +801,11 @@ fn reflect_captions(
             if !keys.insert(key) {
                 continue;
             }
-            match build_candidate_from_path(
+            match build_candidate_from_path_with_cache(
                 std::path::Path::new(key),
                 key.clone(),
                 session.caption_db(),
+                &mut path_casing,
             ) {
                 Ok(Some(candidate)) => ingest.push(candidate),
                 Ok(None) => delete.push(key.clone()),
@@ -1196,6 +1199,8 @@ fn apply_single_change(
     }
     // watcher から来るのは abs path。walker と同じ正規化で key を作る。
     let key = crate::search_index_db::normalize_path(&path);
+    // Share across sibling images of this event; the next event observes renames afresh.
+    let mut path_casing = crate::path_key::ExistingPathCasingCache::default();
 
     // 外部メタデータサイドカー (*.json / *.txt) の変更は、それ自体をアイテム索引の doc に
     // するのではなく、**対応する兄弟画像の再 ingest** に変換する (docs §14-2)。
@@ -1207,7 +1212,16 @@ fn apply_single_change(
         .unwrap_or("")
         .to_ascii_lowercase();
     if ext == "json" || ext == "txt" {
-        reingest_images_for_sidecar(session, writer, io_sem, cancel, stats, progress, &path);
+        reingest_images_for_sidecar(
+            session,
+            writer,
+            io_sem,
+            cancel,
+            stats,
+            progress,
+            &path,
+            &mut path_casing,
+        );
         let is_indexed_book = match session.meta_db.get(&key) {
             Ok(row) => row.is_some_and(|row| {
                 matches!(
@@ -1260,14 +1274,18 @@ fn apply_single_change(
             // 安全側に倒し、候補が作れなければ Remove 経路にフォールバックする。
             // (種別外は通常 DB に行が無く delete 空振りだが、ZIP は旧版が入れた
             //  行をこの経路で掃除できる)。
-            let candidate =
-                match build_candidate_from_path(&path, key.clone(), session.caption_db()) {
-                    Ok(candidate) => candidate,
-                    Err(error) => {
-                        writer.report_failure("watcher caption book read", &error);
-                        return;
-                    }
-                };
+            let candidate = match build_candidate_from_path_with_cache(
+                &path,
+                key.clone(),
+                session.caption_db(),
+                &mut path_casing,
+            ) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    writer.report_failure("watcher caption book read", &error);
+                    return;
+                }
+            };
             let Some(cand) = candidate else {
                 let ingest_stats = match session.apply(
                     vec![],
@@ -1325,13 +1343,19 @@ fn reingest_images_for_sidecar(
     stats: &Mutex<SupervisorStats>,
     progress: &ProgressReporter,
     sidecar_path: &std::path::Path,
+    path_casing: &mut crate::path_key::ExistingPathCasingCache,
 ) {
     for img in crate::external_metadata::images_for_sidecar(sidecar_path) {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         let key = crate::search_index_db::normalize_path(&img);
-        let candidate = match build_candidate_from_path(&img, key, session.caption_db()) {
+        let candidate = match build_candidate_from_path_with_cache(
+            &img,
+            key,
+            session.caption_db(),
+            path_casing,
+        ) {
             Ok(candidate) => candidate,
             Err(error) => {
                 writer.report_failure("sidecar caption book read", &error);
@@ -1359,17 +1383,32 @@ fn reingest_images_for_sidecar(
     }
 }
 
+#[cfg(test)]
 fn build_candidate_from_path(
     abs_path: &std::path::Path,
     key: String,
     captions: Option<&crate::ai_caption_db::CaptionDb>,
+) -> rusqlite::Result<Option<CandidateFile>> {
+    build_candidate_from_path_with_cache(
+        abs_path,
+        key,
+        captions,
+        &mut crate::path_key::ExistingPathCasingCache::default(),
+    )
+}
+
+fn build_candidate_from_path_with_cache(
+    abs_path: &std::path::Path,
+    key: String,
+    captions: Option<&crate::ai_caption_db::CaptionDb>,
+    path_casing: &mut crate::path_key::ExistingPathCasingCache,
 ) -> rusqlite::Result<Option<CandidateFile>> {
     if crate::folder_tree::is_apple_double(abs_path) {
         return Ok(None);
     }
     // notify やサイドカー逆引き、caption の保存キーは実ファイルと大小文字が異なり得る。
     // 表示/open 用 path の復元は候補生成で共有し、照合 key と論理 path は保持する。
-    let restored = crate::path_key::restore_existing_path_casing(abs_path);
+    let restored = path_casing.restore(abs_path);
     let abs_path = restored.as_deref().unwrap_or(abs_path);
     if let Some(captions) = captions
         && let search_walker::BookCandidateDecision::Include(kind) =
@@ -2737,9 +2776,50 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn acceptance_d_sidecar_watch_preserves_physical_path_casing() {
+        check_sidecar_watch_path_casing(false);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn acceptance_d_sidecar_watch_preserves_junction_alias_and_component_casing() {
+        check_sidecar_watch_path_casing(true);
+    }
+
+    #[cfg(windows)]
+    fn check_sidecar_watch_path_casing(through_junction: bool) {
+        use std::os::windows::process::CommandExt;
+
+        struct JunctionGuard(PathBuf);
+        impl Drop for JunctionGuard {
+            fn drop(&mut self) {
+                // Remove only the alias itself before TempDir's recursive cleanup.
+                fs::remove_dir(&self.0).unwrap();
+            }
+        }
+
         let (tmp, meta, fts, writer, sem, _) = setup();
-        let root = tmp.path().join("MixedShelf");
-        fs::create_dir(&root).unwrap();
+        let physical_root = tmp.path().join("MixedShelf");
+        fs::create_dir(&physical_root).unwrap();
+        let junction = through_junction.then(|| {
+            let alias = tmp.path().join("LinkedShelf");
+            // Both explicit mklink paths are direct children of this disposable fixture.
+            assert_eq!(alias.parent(), Some(tmp.path()));
+            assert_eq!(physical_root.parent(), Some(tmp.path()));
+            assert!(physical_root.is_absolute());
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(&alias)
+                .arg(&physical_root)
+                .creation_flags(0x08000000)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            JunctionGuard(alias)
+        });
+        let root = junction
+            .as_ref()
+            .map(|junction| junction.0.clone())
+            .unwrap_or(physical_root);
         let image = root.join("MixedPhoto.JPG");
         write_image(&root, "MixedPhoto.JPG");
         let sidecar = root.join("mixedphoto.jpg.json");
@@ -2757,7 +2837,10 @@ mod tests {
                     (sidecar.clone(), ChangeKind::Remove)
                 }
                 "image_upsert" => (root.join("mixedphoto.jpg"), ChangeKind::Upsert),
-                _ => (sidecar.clone(), ChangeKind::Upsert),
+                _ => (
+                    PathBuf::from(crate::search_index_db::normalize_path(&sidecar)),
+                    ChangeKind::Upsert,
+                ),
             };
             apply_single_change(
                 &session,

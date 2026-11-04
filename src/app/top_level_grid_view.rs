@@ -1531,12 +1531,10 @@ impl super::App {
         } else {
             match surface {
                 TopLevelGridSurface::Folder => {
-                    let local_search = self.show_search_bar.then(|| self.search_query.clone());
+                    let local_search = self.capture_local_search_replay();
                     self.reload_current_folder_preserving_override();
-                    if let Some(query) = local_search {
-                        self.show_search_bar = true;
-                        self.search_query = query;
-                        self.reexecute_search_for_installed_list(ctx);
+                    if let Some(replay) = local_search {
+                        self.apply_local_search_replay(ctx, replay);
                     }
                 }
                 TopLevelGridSurface::SmartFolder(state) => {

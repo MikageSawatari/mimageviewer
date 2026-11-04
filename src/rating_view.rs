@@ -205,11 +205,12 @@ fn build_rating_view_rows_with_recipe(
         .collect::<std::collections::HashMap<_, _>>();
     let mut out = Vec::with_capacity(rows.len());
     let mut skipped = 0usize;
+    let mut path_casing = crate::path_key::ExistingPathCasingCache::default();
     for row in rows {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        match rating_row_to_view_row(&row) {
+        match rating_row_to_view_row_with_cache(&row, &mut path_casing) {
             Some(view_row) => out.push(view_row),
             None => skipped += 1,
         }
@@ -232,7 +233,7 @@ fn build_rating_view_rows_with_recipe(
             continue;
         }
         let row = if let Some(stored) = stored {
-            rating_row_to_view_row(&stored)
+            rating_row_to_view_row_with_cache(&stored, &mut path_casing)
         } else {
             source_path_for_item(&leave.item)
                 .and_then(|path| std::fs::metadata(path).ok())
@@ -531,9 +532,20 @@ fn cmp_optional_i64_none_last(
 }
 
 pub fn rating_row_to_view_row(row: &RatingRow) -> Option<RatingViewRow> {
+    rating_row_to_view_row_with_cache(
+        row,
+        &mut crate::path_key::ExistingPathCasingCache::default(),
+    )
+}
+
+fn rating_row_to_view_row_with_cache(
+    row: &RatingRow,
+    path_casing: &mut crate::path_key::ExistingPathCasingCache,
+) -> Option<RatingViewRow> {
     let item = match row.kind {
-        Some(kind) => item_from_kind(row, kind).or_else(|| item_from_legacy_key(row))?,
-        None => item_from_legacy_key(row)?,
+        Some(kind) => item_from_kind(row, kind, path_casing)
+            .or_else(|| item_from_legacy_key(row, path_casing))?,
+        None => item_from_legacy_key(row, path_casing)?,
     };
     let meta_path = source_path_for_item(&item)?;
     let fs_meta = std::fs::metadata(meta_path).ok()?;
@@ -549,16 +561,38 @@ pub fn rating_row_to_view_row(row: &RatingRow) -> Option<RatingViewRow> {
     })
 }
 
-fn item_from_kind(row: &RatingRow, kind: RatingItemKind) -> Option<GridItem> {
+fn item_from_kind(
+    row: &RatingRow,
+    kind: RatingItemKind,
+    path_casing: &mut crate::path_key::ExistingPathCasingCache,
+) -> Option<GridItem> {
     match kind {
-        RatingItemKind::Image => Some(GridItem::Image(existing_source_or_key_path(row)?)),
-        RatingItemKind::Video => Some(GridItem::Video(existing_source_or_key_path(row)?)),
-        RatingItemKind::Audio => Some(GridItem::Audio(existing_source_or_key_path(row)?)),
-        RatingItemKind::Folder => Some(GridItem::Folder(existing_source_or_key_path(row)?)),
-        RatingItemKind::ZipFile => Some(GridItem::ZipFile(existing_source_or_key_path(row)?)),
-        RatingItemKind::PdfFile => Some(GridItem::PdfFile(existing_source_or_key_path(row)?)),
+        RatingItemKind::Image => Some(GridItem::Image(existing_source_or_key_path(
+            row,
+            path_casing,
+        )?)),
+        RatingItemKind::Video => Some(GridItem::Video(existing_source_or_key_path(
+            row,
+            path_casing,
+        )?)),
+        RatingItemKind::Audio => Some(GridItem::Audio(existing_source_or_key_path(
+            row,
+            path_casing,
+        )?)),
+        RatingItemKind::Folder => Some(GridItem::Folder(existing_source_or_key_path(
+            row,
+            path_casing,
+        )?)),
+        RatingItemKind::ZipFile => Some(GridItem::ZipFile(existing_source_or_key_path(
+            row,
+            path_casing,
+        )?)),
+        RatingItemKind::PdfFile => Some(GridItem::PdfFile(existing_source_or_key_path(
+            row,
+            path_casing,
+        )?)),
         RatingItemKind::ConvertibleArchive => {
-            let path = existing_source_or_key_path(row)?;
+            let path = existing_source_or_key_path(row, path_casing)?;
             let format = row
                 .archive_format
                 .as_deref()
@@ -567,7 +601,7 @@ fn item_from_kind(row: &RatingRow, kind: RatingItemKind) -> Option<GridItem> {
             Some(GridItem::ConvertibleArchive { path, format })
         }
         RatingItemKind::ZipImage => {
-            let zip_path = existing_source_or_key_path(row)?;
+            let zip_path = existing_source_or_key_path(row, path_casing)?;
             let entry_name = row.entry_name.clone().or_else(|| {
                 legacy_entry_from_key(&row.key)
                     .and_then(|entry| resolve_legacy_zip_entry_name(&zip_path, &entry))
@@ -578,7 +612,7 @@ fn item_from_kind(row: &RatingRow, kind: RatingItemKind) -> Option<GridItem> {
             })
         }
         RatingItemKind::PdfPage => {
-            let pdf_path = existing_source_or_key_path(row)?;
+            let pdf_path = existing_source_or_key_path(row, path_casing)?;
             let page_num = row
                 .page_num
                 .or_else(|| legacy_pdf_page_from_key(&row.key))?;
@@ -589,7 +623,7 @@ fn item_from_kind(row: &RatingRow, kind: RatingItemKind) -> Option<GridItem> {
             })
         }
         RatingItemKind::ZipDir => {
-            let zip_path = existing_source_or_key_path(row)?;
+            let zip_path = existing_source_or_key_path(row, path_casing)?;
             let dir_prefix = row.dir_prefix.clone()?;
             let is_archive = row
                 .zipdir_is_archive
@@ -604,11 +638,14 @@ fn item_from_kind(row: &RatingRow, kind: RatingItemKind) -> Option<GridItem> {
     }
 }
 
-fn item_from_legacy_key(row: &RatingRow) -> Option<GridItem> {
+fn item_from_legacy_key(
+    row: &RatingRow,
+    path_casing: &mut crate::path_key::ExistingPathCasingCache,
+) -> Option<GridItem> {
     let Some((left, right)) = row.key.split_once("::") else {
-        return item_from_plain_path(&existing_path(PathBuf::from(&row.key))?);
+        return item_from_plain_path(&existing_path(PathBuf::from(&row.key), path_casing)?);
     };
-    let container = existing_path(PathBuf::from(left))?;
+    let container = existing_path(PathBuf::from(left), path_casing)?;
     if crate::folder_tree::is_paged_document_path(&container)
         && let Some(page_num) = parse_page_key(right)
     {
@@ -657,12 +694,15 @@ fn item_from_plain_path(path: &Path) -> Option<GridItem> {
     }
 }
 
-fn existing_source_or_key_path(row: &RatingRow) -> Option<PathBuf> {
+fn existing_source_or_key_path(
+    row: &RatingRow,
+    path_casing: &mut crate::path_key::ExistingPathCasingCache,
+) -> Option<PathBuf> {
     row.source_path
         .as_ref()
         .map(PathBuf::from)
-        .and_then(existing_path)
-        .or_else(|| key_source_path(&row.key).and_then(existing_path))
+        .and_then(|path| existing_path(path, path_casing))
+        .or_else(|| key_source_path(&row.key).and_then(|path| existing_path(path, path_casing)))
 }
 
 fn key_source_path(key: &str) -> Option<PathBuf> {
@@ -670,13 +710,16 @@ fn key_source_path(key: &str) -> Option<PathBuf> {
     (!left.is_empty()).then(|| PathBuf::from(left))
 }
 
-fn existing_path(path: PathBuf) -> Option<PathBuf> {
+fn existing_path(
+    path: PathBuf,
+    path_casing: &mut crate::path_key::ExistingPathCasingCache,
+) -> Option<PathBuf> {
     let existing = if matches!(path.try_exists(), Ok(true)) {
         path
     } else {
         find_case_insensitive_sibling(&path)?
     };
-    Some(crate::path_key::restore_existing_path_casing(&existing).unwrap_or(existing))
+    Some(path_casing.restore(&existing).unwrap_or(existing))
 }
 
 fn find_case_insensitive_sibling(path: &Path) -> Option<PathBuf> {
