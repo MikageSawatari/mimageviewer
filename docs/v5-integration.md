@@ -696,3 +696,9 @@ git add / commit / merge等のgit書き込みも行わない。
 - 実機確認: サブ PC 依頼 10 (観測者: サブ PC 担当) で、再生中・一時停止・再生中のシーク・0.5/2 倍・曲の切り替え・動画・クリックで位置が飛ばないこと、最後まで再生すると 00:00、前回の表示と Volume 0 dB の引き継ぎが期待どおり。利用者も手元で確認 (観測者: 利用者。最初は以前のプロセスを見ていた可能性があり、改めて確認して期待どおり)。未確認: 一時停止中のシーク、再生を続けたまま音響調整の窓を開き直す操作。
 - `.\scripts\build-miv-sound.ps1 -Approve -Candidate c2c45d51…` で `third_party/miv-sound/0.15.0-miv.3/` を作成。バックアップは `C:\home\mimageviewer_vendor_backup\miv-sound-0.15.0-miv.3\`。
 - 同じ日に F3 (`55015b2e6`、マニュアル・公開文書。fork-plan §18)、F4 (`b6f4406dc`、ポータブル版で音響調整を有効化。§17)、その後片付け (`f52d99047`、ポータブル版の記述と Counter の説明、説明書を `manual/sound/v0.15.0-miv.3/` に生成。§19) を v5 に入れた。いずれも独立レビュー ACCEPT。
+
+## 13. v5.0.0 の公開と同時に行う作業 (2026-11-04 利用者指示)
+
+- **音楽ビデオのサンプルプロジェクト (AbyssalGlow) の公開**: 正本は `docs/music-video-export-plan.md` の Q11。v5.0.0 のエディタで保存し直し、曲・イラスト 3 枚・ロゴの元画像・プロジェクトファイルと利用条件 (無料ダウンロードのみ、再配布・素材の再利用は不可、書き出した動画の公開は不可) を zip にする。素材の控えは `C:\home\musicvideo-sample\AbyssalGlow\`。置き場所は Cloudflare R2 (`dl.mikage.jp`、`musicvideo/samples/v5.0.0/AbyssalGlow.zip`、上書きしない、`scripts/upload-store-installer.ps1` と同じ照合)。GitHub Releases には置かない。マニュアルの音楽ビデオのページからダウンロードへ案内する。告知用に、完成版エディタでサンプルを開いたタイムラインの画面写真を設計担当が撮り、利用者が選ぶ。書き出し例の動画は利用者が YouTube に上げ、告知の返信でリンクする。
+- **mIV Sound のソース**: https://github.com/MikageSawatari/miv-sound として 2026-11-04 に公開済み (Frieve-A/effetune-mixwright のフォーク)。公開時は承認した版のコミットが `miv` ブランチに送られていることを確かめる。作者への次の連絡 (F5) は v5 の公開後。
+- **v5 の master への取り込み**: 公開の前に、v5-integration を master (GitHub の main) へ取り込み、master を v5 系に切り替えるかを利用者に確かめる。
