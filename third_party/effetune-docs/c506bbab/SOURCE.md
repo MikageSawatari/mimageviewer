@@ -4,7 +4,7 @@
 - Commit: c506bbab8a3dcd75bc5049ebb9b92572b526c557
 - Why this commit: it is the `external/effetune` submodule of EffeTune Mixwright v0.15.0,
   release commit 8c9a0a561d2ee88d2eef6b06bab138bbd639b3c1. mIV Sound derives from that release.
-- mIV Sound: 0.15.0-miv.4
+- mIV Sound: 0.15.0-miv.5
 - Fork source: https://github.com/MikageSawatari/miv-sound
 - Docs version: v0.15.0
 - Fork corrections: docs/effetune-docs-overrides; see docs/effetune-fork-plan.md section 10.

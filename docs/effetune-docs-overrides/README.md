@@ -118,7 +118,7 @@ README の Web アプリ用 HTML は変換対象に入らない。
 ## mIV Sound 向け訂正 (F3・F4 統合、2026-11-04 更新)
 
 - 原文は `c506bbab` の日本語 snapshot（上流 v0.15.0）。派生版 `0.15.0-miv.4` と対応づけて
-  `manual/sound/v0.15.0-miv.4/` に133 HTML＋4画像を生成する。上流原文・LICENSE・画像は変更しない。
+  `manual/sound/v0.15.0-miv.5/` に133 HTML＋4画像を生成する。上流原文・LICENSE・画像は変更しない。
 - 転載注記に [mIV Sound のソース](https://github.com/MikageSawatari/miv-sound)を案内する。
   原作・作者・MIT のクレジットと、原文ドキュメントの参照先は維持する。
 - `selection.json` の完全なページ台帳と README の見出し選別で、内蔵プレーヤー・ライブラリ・LAN・MCP・
