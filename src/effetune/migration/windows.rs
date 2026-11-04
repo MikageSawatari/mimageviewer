@@ -1,7 +1,7 @@
 //! Windows ownership boundary: a nonsharing Chromium lock plus synchronized
 //! process handles. No WebView controller is created by this module.
 
-use super::{MigrationBackend, Owner, ProcessCandidate, io_error};
+use super::{MigrationBackend, Owner, ParentState, ProcessCandidate, io_error};
 use std::ffi::{OsString, c_void};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -16,8 +16,8 @@ use windows::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
 use windows::Win32::UI::Shell::CommandLineToArgvW;
 use windows::core::PCWSTR;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_NO_MORE_FILES, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, FILETIME, GENERIC_READ,
+    GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::{
     EqualSid, GetLengthSid, GetTokenInformation, IsValidSid, TOKEN_QUERY, TOKEN_USER, TokenUser,
@@ -27,8 +27,9 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess, OpenProcessToken,
+    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
 };
 
 pub(super) struct Backend {
@@ -228,8 +229,31 @@ impl MigrationBackend for Backend {
                     .unwrap_or(row.szExeFile.len());
                 let name = String::from_utf16_lossy(&row.szExeFile[..length]);
                 if name.eq_ignore_ascii_case("msedgewebview2.exe") {
-                    let query = open_process(PROCESS_QUERY_LIMITED_INFORMATION, row.th32ProcessID);
-                    let command = match query.as_ref() {
+                    // Inspect, terminate and wait through one retained handle.
+                    // The snapshot PID may already belong to a new process;
+                    // no metadata from the snapshot authorizes termination.
+                    let synchronize = open_process(
+                        PROCESS_QUERY_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+                        row.th32ProcessID,
+                    )
+                    .or_else(|| {
+                        open_process(
+                            PROCESS_QUERY_INFORMATION | PROCESS_SYNCHRONIZE,
+                            row.th32ProcessID,
+                        )
+                    })
+                    .or_else(|| {
+                        open_process(
+                            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                            row.th32ProcessID,
+                        )
+                    })
+                    .or_else(|| open_process(PROCESS_SYNCHRONIZE, row.th32ProcessID));
+                    let verified_webview = synchronize.as_ref().is_some_and(|handle| {
+                        image_name(handle.0)
+                            .is_some_and(|name| name.eq_ignore_ascii_case("msedgewebview2.exe"))
+                    });
+                    let command = match synchronize.as_ref().filter(|_| verified_webview) {
                         Some(handle) => match command_line(handle.0) {
                             Ok(command) => Some(command),
                             Err(reason) => {
@@ -251,7 +275,7 @@ impl MigrationBackend for Backend {
                     };
                     let owner = match (
                         self.current_sid.as_ref(),
-                        query.as_ref().and_then(|handle| user_sid(handle.0)),
+                        synchronize.as_ref().and_then(|handle| user_sid(handle.0)),
                     ) {
                         (Some(current), Some(other)) => {
                             if EqualSid(
@@ -266,9 +290,12 @@ impl MigrationBackend for Backend {
                         }
                         _ => Owner::Unknown,
                     };
+                    let parent = synchronize
+                        .as_ref()
+                        .filter(|_| verified_webview)
+                        .map_or(ParentState::Unknown, |handle| parent_state(handle.0));
                     // A terminating process can deny command-line/token reads
                     // while still granting SYNCHRONIZE. Do not discard it.
-                    let synchronize = open_process(PROCESS_SYNCHRONIZE, row.th32ProcessID);
                     if synchronize.is_none() {
                         crate::logger::log(format!(
                             "[EffeTune migration] WebView2 PID {} synchronization handle unavailable: {}",
@@ -280,6 +307,7 @@ impl MigrationBackend for Backend {
                         pid: row.th32ProcessID,
                         command,
                         owner,
+                        parent,
                         synchronize,
                     });
                 }
@@ -295,7 +323,7 @@ impl MigrationBackend for Backend {
         }
     }
 
-    fn wait(&mut self, handle: OwnedHandle, remaining: Duration) -> Result<bool, String> {
+    fn wait(&mut self, handle: &OwnedHandle, remaining: Duration) -> Result<bool, String> {
         // Round down and never exceed the shared deadline. A zero-ms final
         // check is fine; callers reject zero remaining before reaching here.
         let milliseconds = remaining.as_millis().min(u32::MAX as u128) as u32;
@@ -316,6 +344,130 @@ impl MigrationBackend for Backend {
     fn matches_udf(&self, command: &str, expected: &Path) -> Result<bool, String> {
         matches_udf(command, expected)
     }
+
+    fn is_host_browser(&self, command: &str) -> Result<bool, String> {
+        is_host_browser(command)
+    }
+
+    fn terminate(&mut self, handle: &OwnedHandle) -> Result<(), String> {
+        if unsafe { TerminateProcess(handle.0, 1) } != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error().to_string())
+        }
+    }
+}
+
+unsafe fn image_name(process: HANDLE) -> Option<String> {
+    let mut image = vec![0u16; 32768];
+    let mut length = image.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(process, 0, image.as_mut_ptr(), &mut length) } == 0 {
+        return None;
+    }
+    let path = String::from_utf16(&image[..length as usize]).ok()?;
+    Path::new(&path).file_name()?.to_str().map(str::to_owned)
+}
+
+unsafe fn creation_time(process: HANDLE) -> Option<u64> {
+    let mut creation: FILETIME = unsafe { zeroed() };
+    let mut exit = unsafe { zeroed() };
+    let mut kernel = unsafe { zeroed() };
+    let mut user = unsafe { zeroed() };
+    if unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        return None;
+    }
+    Some((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+}
+
+#[repr(C)]
+struct ProcessBasicInformation {
+    reserved1: *mut c_void,
+    peb: *mut c_void,
+    reserved2: [*mut c_void; 2],
+    process_id: usize,
+    parent_id: usize,
+}
+
+unsafe fn parent_state(child: HANDLE) -> ParentState {
+    // Query the retained child object, not its stale snapshot parent PID.
+    let Some(child_creation) = (unsafe { creation_time(child) }) else {
+        return ParentState::Unknown;
+    };
+    let mut info: ProcessBasicInformation = unsafe { zeroed() };
+    let status = unsafe {
+        NtQueryInformationProcess(
+            child,
+            0,
+            (&mut info as *mut ProcessBasicInformation).cast(),
+            size_of::<ProcessBasicInformation>() as u32,
+            null_mut(),
+        )
+    };
+    let Ok(parent_pid) = u32::try_from(info.parent_id) else {
+        return ParentState::Unknown;
+    };
+    if status < 0 || parent_pid == 0 {
+        return ParentState::Unknown;
+    }
+    let parent = unsafe {
+        open_process(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            parent_pid,
+        )
+    };
+    let Some(parent) = parent else {
+        return if unsafe { GetLastError() } == ERROR_INVALID_PARAMETER {
+            ParentState::Missing
+        } else {
+            ParentState::Unknown
+        };
+    };
+    match unsafe { WaitForSingleObject(parent.0, 0) } {
+        WAIT_OBJECT_0 => return ParentState::Missing,
+        WAIT_TIMEOUT => {}
+        _ => return ParentState::Unknown,
+    }
+    let Some(parent_creation) = (unsafe { creation_time(parent.0) }) else {
+        return ParentState::Unknown;
+    };
+    classify_live_parent(
+        child_creation,
+        parent_creation,
+        unsafe { image_name(parent.0) }.as_deref(),
+    )
+}
+
+fn classify_live_parent(
+    child_creation: u64,
+    parent_creation: u64,
+    image: Option<&str>,
+) -> ParentState {
+    if parent_creation > child_creation {
+        return ParentState::Reused;
+    }
+    match image {
+        Some(name) if name.eq_ignore_ascii_case("mimageviewer-vst3-host.exe") => ParentState::Host,
+        Some(_) => ParentState::DifferentExe,
+        None => ParentState::Unknown,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn parent_identity_uses_creation_time_before_trusting_reused_host_pid() {
+    assert_eq!(
+        classify_live_parent(100, 99, Some("mimageviewer-vst3-host.exe")),
+        ParentState::Host
+    );
+    assert_eq!(
+        classify_live_parent(100, 101, Some("mimageviewer-vst3-host.exe")),
+        ParentState::Reused
+    );
+    assert_eq!(
+        classify_live_parent(100, 99, Some("other.exe")),
+        ParentState::DifferentExe
+    );
+    assert_eq!(classify_live_parent(100, 99, None), ParentState::Unknown);
 }
 
 unsafe fn open_process(access: u32, pid: u32) -> Option<OwnedHandle> {
@@ -486,37 +638,17 @@ unsafe fn command_line(process: HANDLE) -> Result<String, String> {
 /// Use Windows' own argv rules: quoted `--user-data-dir=...`, separate values,
 /// and renderer/crashpad arguments all pass through the same exact comparison.
 pub(super) fn matches_udf(command: &str, expected: &Path) -> Result<bool, String> {
-    let command: Vec<u16> = command.encode_utf16().chain(Some(0)).collect();
-    let mut count = 0;
-    let argv = unsafe { CommandLineToArgvW(PCWSTR(command.as_ptr()), &mut count) };
-    if argv.is_null() {
-        return Err(format!(
-            "parse WebView2 argv: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    struct Argv(*mut windows::core::PWSTR);
-    impl Drop for Argv {
-        fn drop(&mut self) {
-            unsafe { LocalFree(Some(HLOCAL(self.0.cast()))) };
-        }
-    }
-    let _argv_owner = Argv(argv);
-    let args = unsafe { std::slice::from_raw_parts(argv, count.max(0) as usize) };
+    let args = command_arguments(command)?;
     let mut values = Vec::new();
     let mut index = 1;
     while index < args.len() {
-        let argument =
-            unsafe { args[index].to_string() }.map_err(|e| format!("decode WebView2 argv: {e}"))?;
+        let argument = &args[index];
         if argument.eq_ignore_ascii_case("--user-data-dir") {
             index += 1;
             if index >= args.len() {
                 return Err("WebView2 --user-data-dir is missing its value".into());
             }
-            values.push(
-                unsafe { args[index].to_string() }
-                    .map_err(|e| format!("decode WebView2 user-data-dir: {e}"))?,
-            );
+            values.push(args[index].clone());
         } else if argument
             .get(..16)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("--user-data-dir="))
@@ -537,6 +669,57 @@ pub(super) fn matches_udf(command: &str, expected: &Path) -> Result<bool, String
     let actual = normalized_path(Path::new(&values[0]))?;
     let expected = normalized_path(expected)?;
     Ok(unsafe { CompareStringOrdinal(&actual, &expected, true) } == CSTR_EQUAL)
+}
+
+pub(super) fn is_host_browser(command: &str) -> Result<bool, String> {
+    let args = command_arguments(command)?;
+    let mut host_switches = 0;
+    for argument in args.iter().skip(1) {
+        // Even an empty --type or separate value is not a browser process.
+        if argument.eq_ignore_ascii_case("--type")
+            || argument
+                .get(..7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("--type="))
+        {
+            return Ok(false);
+        }
+        if argument
+            .get(..19)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("--webview-exe-name="))
+        {
+            if !argument[19..].eq_ignore_ascii_case("mimageviewer-vst3-host.exe") {
+                return Ok(false);
+            }
+            host_switches += 1;
+        } else if argument.eq_ignore_ascii_case("--webview-exe-name") {
+            // Only the complete, unambiguous = form authorizes termination.
+            return Ok(false);
+        }
+    }
+    Ok(host_switches == 1)
+}
+
+fn command_arguments(command: &str) -> Result<Vec<String>, String> {
+    let command: Vec<u16> = command.encode_utf16().chain(Some(0)).collect();
+    let mut count = 0;
+    let argv = unsafe { CommandLineToArgvW(PCWSTR(command.as_ptr()), &mut count) };
+    if argv.is_null() {
+        return Err(format!(
+            "parse WebView2 argv: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    struct Argv(*mut windows::core::PWSTR);
+    impl Drop for Argv {
+        fn drop(&mut self) {
+            unsafe { LocalFree(Some(HLOCAL(self.0.cast()))) };
+        }
+    }
+    let _argv_owner = Argv(argv);
+    let args = unsafe { std::slice::from_raw_parts(argv, count.max(0) as usize) };
+    args.iter()
+        .map(|arg| unsafe { arg.to_string() }.map_err(|e| format!("decode WebView2 argv: {e}")))
+        .collect()
 }
 
 fn normalized_path(path: &Path) -> Result<Vec<u16>, String> {
@@ -571,9 +754,34 @@ fn normalized_path(path: &Path) -> Result<Vec<u16>, String> {
 
 #[cfg(test)]
 pub(super) fn test_current_process_query() {
-    let command =
-        unsafe { command_line(GetCurrentProcess()) }.expect("native current-process command line");
+    let current = unsafe {
+        open_process(
+            PROCESS_QUERY_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+            GetCurrentProcessId(),
+        )
+    }
+    .expect("production inspection/termination handle rights for our own test process");
+    let command = unsafe { command_line(current.0) }.expect("native current-process command line");
     assert!(!command.is_empty());
-    let sid = unsafe { user_sid(GetCurrentProcess()) }.expect("current user SID");
+    assert!(unsafe { image_name(current.0) }.is_some_and(|image| !image.is_empty()));
+    assert!(unsafe { creation_time(current.0) }.is_some_and(|time| time > 0));
+    let mut info: ProcessBasicInformation = unsafe { zeroed() };
+    let status = unsafe {
+        NtQueryInformationProcess(
+            current.0,
+            0,
+            (&mut info as *mut ProcessBasicInformation).cast(),
+            size_of::<ProcessBasicInformation>() as u32,
+            null_mut(),
+        )
+    };
+    assert!(
+        status >= 0,
+        "native parent query status=0x{:08X}",
+        status as u32
+    );
+    assert_eq!(info.process_id, unsafe { GetCurrentProcessId() } as usize);
+    assert!(u32::try_from(info.parent_id).is_ok_and(|pid| pid > 0));
+    let sid = unsafe { user_sid(current.0) }.expect("current user SID");
     assert!(unsafe { IsValidSid(sid.as_ptr() as *mut c_void) } != 0);
 }

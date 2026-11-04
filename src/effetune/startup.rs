@@ -8,8 +8,21 @@ use std::sync::{
 };
 
 mod path_identity;
+use super::migration::{MigrationFailure, MigrationOutcome};
 
 pub(crate) const FAILURE_NOTICE: &str = "音響調整のデータを引き継げませんでした。この mImageViewer も含め、トレイに常駐しているものもすべて終了してから、1 つだけ起動してください";
+
+pub(crate) fn failure_notice(reason: &MigrationFailure) -> String {
+    match reason {
+        MigrationFailure::ProcessesStillRunning(pids) => format!(
+            "{FAILURE_NOTICE}。終了後も失敗する場合は、タスク マネージャーで残っている msedgewebview2.exe (PID: {}) を確認してください",
+            super::migration::process_ids(pids)
+        ),
+        MigrationFailure::Detail(_) | MigrationFailure::QuiescenceDeadlineExceeded => {
+            FAILURE_NOTICE.into()
+        }
+    }
+}
 
 pub(crate) struct HostStartupGate(AtomicU8);
 
@@ -33,7 +46,7 @@ impl HostStartupGate {
 
 enum Phase {
     NotStarted,
-    Pending(mpsc::Receiver<Result<super::migration::MigrationOutcome, String>>),
+    Pending(mpsc::Receiver<Result<MigrationOutcome, MigrationFailure>>),
     Complete,
 }
 
@@ -74,7 +87,7 @@ impl StartupMigration {
     #[cfg(test)]
     pub(crate) fn pending_for_test() -> (
         Self,
-        mpsc::Sender<Result<super::migration::MigrationOutcome, String>>,
+        mpsc::Sender<Result<MigrationOutcome, MigrationFailure>>,
     ) {
         let (tx, rx) = mpsc::channel();
         (
@@ -96,6 +109,7 @@ impl StartupMigration {
             .name("miv-sound-migration".into())
             .spawn(move || {
                 let result = migration_request(data_dir)
+                    .map_err(MigrationFailure::from)
                     .and_then(|request| super::migration::migrate(&request));
                 let _ = tx.send(result);
                 if let Some(ctx) = wake {
@@ -105,12 +119,12 @@ impl StartupMigration {
         if let Err(error) = spawn {
             // Feed spawn failure through the same one-shot terminal path.
             let (tx, rx) = mpsc::channel();
-            let _ = tx.send(Err(format!("migration worker spawn: {error}")));
+            let _ = tx.send(Err(format!("migration worker spawn: {error}").into()));
             self.phase = Phase::Pending(rx);
         }
     }
 
-    pub(crate) fn poll(&mut self) -> Option<Result<super::migration::MigrationOutcome, String>> {
+    pub(crate) fn poll(&mut self) -> Option<Result<MigrationOutcome, MigrationFailure>> {
         let Phase::Pending(rx) = &self.phase else {
             return None;
         };

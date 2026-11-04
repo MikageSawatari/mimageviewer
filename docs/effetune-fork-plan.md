@@ -205,6 +205,8 @@ v4.6〜v4.7.1 が v0.13、v4.8 が v0.14 で、Windows の WebView の origin �
        その間だけ開けない。その mIV は開き直せば使える)。
     2. **押さえたまま、その保存領域を使うプロセスがすべて終わるまで待つ**。対象は `msedgewebview2.exe` のうち、コマンドラインの `--user-data-dir` が
        `<旧 WebView 領域>\EBWebView` と完全一致するもの (ブラウザ・子プロセス・crashpad handler のすべて。パスは大文字小文字と区切り文字を正規化して比べる)。
+       §1.710 では、§5.2a の全条件で旧 host の残した browser 本体と確認できた候補だけ、待つ前に終了要求を出す。
+       判定できないものも含め、終了待ち・再列挙と共通の 5 秒上限は維持する。
        コマンドラインを読めない `msedgewebview2.exe` は、**別の利用者のプロセスと確認できたもの (トークンの利用者 SID が自分と違う) だけを除外**する。
        それ以外 (終了処理中の STATUS_PROCESS_IS_TERMINATING を含め、持ち主が分からないもの) は、移行元のものかもしれないとして、取得したハンドルで
        終了を待つ (上限は下と共通)。ハンドルも取れなければ §5.4 の失敗にする (第 7 回レビュー P2。終わりかけの移行元が読み取りだけ失敗する場合に、
@@ -224,6 +226,93 @@ v4.6〜v4.7.1 が v0.13、v4.8 が v0.14 で、Windows の WebView の origin �
 - 自分以外の mIV の本体 (`mimageviewer-core.exe`、ポータブル版の `mimageviewer.exe`) と `mimageviewer-vst3-host.exe` が動いているかは、
   写すかどうかの根拠にはしない (上の lockfile と、押さえた後の WebView2 のプロセスの終了待ちが根拠)。通知の文で「すべて終了」を案内するためにだけ、ログに残す。
 - プロセス間の待ち合わせ (mutex など) は作らない。旧版の mIV はそれに従わないが、lockfile には従う (WebView2 自身の仕組みなので)。
+
+### 5.2a 旧 host が残した browser 本体の回収 (§1.710、2026-11-05)
+
+利用者の PC で、親 host が既に存在しない `msedgewebview2.exe` の browser 本体 (PID 55360) が
+2026-11-02 から残り、共有 5 秒の待ちで移行が失敗していた。設計担当が利用者のログを読み、
+利用者はその PID を終了して再起動すると引き継げた。開発テスト由来の可能性は推定であり、
+実装担当は実機再現をしていない。製品 host の強制終了でも子が残り得ることは終了コード経路で確認した。
+
+**lockfile の排他取得後だけ**、待つ候補から次の全条件を満たす browser 本体を回収する。
+
+- 現利用者と同じ SID、既存の規則で旧 UDF が完全一致。
+- コマンドラインの `--webview-exe-name=mimageviewer-vst3-host.exe` が一致し、`--type` 指定が無い。
+- 親の不在、親の生成時刻が子より後 (PID 再利用)、親の実行ファイル名が host と異なる、のいずれか。
+  親が生存する同名 host、必要な SID / コマンドライン / 親の情報を取得できないものは回収しない。
+
+候補 PID で終了時に開き直さず、実体の識別と親情報を読んだ同じ保持 handle に対して
+`TerminateProcess` を実行する。終了権限が取れない場合も従来の待ちを続ける。
+終了要求を出した事実と PID をログへ残し、その後の共有 5 秒の待ちと再列挙は維持する。
+期限切れは同じ保持 handle の 0 ms 確認で終了済みを除き、typed な失敗に残った PID を載せる。
+確認対象が全て終了済みなら PID のない一般の期限失敗とする。従来の「mIV とトレイ常駐をすべて終了」の通知へ
+`msedgewebview2.exe` と PID の案内を足す。印やコピーの失敗処理、原本の保護は変えない。
+
+ここで終了してよい根拠は、旧 UDF の lockfile を移行が排他保持しており、その領域の現役利用と
+新規 browser の起動が抑止され、かつ mIV host の browser 本体が親を失ったことを確認できる点である。
+別 SID、別 UDF、別 exe-name、renderer / utility / crashpad、同名 host が生存するもの、不明なものを
+終了対象へ広げない。プロセス一覧の PID だけや「全 msedgewebview2」を終了する方式は採らない。
+§5.5 の「ホストの強制終了は行わない」は旧データ素材作り・実物 WebView2 受入試験の制約として維持する。
+製品での限定回収の自動試験は backend の差し替えで行い、実 WebView2 の強制終了や実データを使わない。
+
+### 5.2b host とその子の終了所有 (§1.711、2026-11-05 設計のみ・実装停止)
+
+**結論**: 下記は実装前に書いた候補設計。独立レビューで通常利用の所有衝突が見つかったため、
+利用者が許可した「既存の終了順序と衝突する場合は設計のみ」の扱いで実装を停止した。
+host の起動・終了コードや `job_process` は変更しない。以下の「する」は候補案であり現行動作ではない。
+
+- **対象と所有者**: EffeTune / mIV Sound 専用 host とユーザー VST 用 host の両方を、
+  1 Bridge = 1 個の `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job に入れる。Bridge が
+  `job_process::JobChild` を所有する。既存 VLM worker / EPUB 変換器と同じ
+  `job_process::spawn` で停止状態のプロセスを作り、Job に割り当ててから再開する。
+  通常の `Command::spawn` の後で割り当てる方式は、その前に WebView2 が生まれる隙間があるので採らない。
+- **環境と IPC**: 既存 `BridgeEnvironment::apply` の子環境を維持し、ユーザー VST から
+  `MIV_SOUND_DATA_DIR`、音響調整から `WEBVIEW2_USER_DATA_FOLDER` を除く。親環境は変えない。
+  private pipe / handle list の共通実装を使い、stdin/stdout/stderr の IPC は変えない。
+- **強制終了の境界**: Bridge Drop の `Child::kill` と exit fence の `terminate_now` を
+  Job 全体の終了へ置き換える。前者の host 終了待ちは従来どおり保つ。Job handle は子に継承せず、
+  pump thread にも持たせない。通常の mIV 終了では最後の Bridge の Drop、mIV 自体の異常終了では
+  OS による handle close により子孫も終了する。host 内の親 watchdog は変更しない。
+- **正常終了**: Shutdown コマンドと既存の host 終了待ちを変えず、プラグインが WebView controller を
+  Close して正常終了する機会を保つ。Job は強制終了・所有者消滅時の process tree の寿命を保証する。
+- **host 単体のクラッシュ**: host が落ちただけでは Bridge が所有する Job は閉じないため、子が一時的に
+  残ることはある。Bridge を破棄する時点、または mIV の終了時に Job が終了させる。
+  §1.710 の移行回収は旧 `%APPDATA%\mimageviewer-vst3-host.exe\EBWebView` 専用であり、
+  新しい `<data_dir>\effetune\webview` を走査・回収しない。新領域で controller 作成を再試行する前に
+  古い Bridge が破棄されていなければ ERROR_BUSY の可能性は残る。ここへ任意 UDF のプロセス探索や
+  再試行機構を広げず、Job の Bridge 所有で後始末を限定する。
+- **単純化と失敗**: 新しい watchdog・子 PID 台帳・終了待ち worker は追加せず、既存の Job 所有を再利用する。
+  Job 生成・割当失敗は host 起動失敗として返し、Job の外で起動を続けない。まれな失敗は既定の
+  ログ + 通知で割り切り、保存データの削除や回復ループは作らない。
+- **検証**: 一時フォルダだけを使う非対話 fixture で host 相当の親から子を作り、Bridge の
+  `terminate_now` / Drop / 正常 shutdown 後の Drop を通じて保持した親子 handle の終了を確認する。
+  実 WebView2 を起こす GUI 試験・製品起動とは区別する。独立レビュー用の設計と実装証跡を残す。
+
+#### 独立レビューで確認した衝突と再開条件
+
+2026-11-05、GPT-6.1 Sol / xhigh の独立レビューと実装担当のコード照合で確認した。
+実 WebView2 を起動した再現結果ではなく、既存コードと公式の process model からの判断である。
+
+- `src/single_instance.rs` の `ProcessNames::for_data_dir` は `--data-dir` ごとに mutex を分ける。
+  別のデータフォルダの通常版を並行利用できる。
+- `src/video/dsp/extract.rs::prepare_bridge` はユーザー VST の既存 WebView データを保つため
+  host の basename を固定しており、§5.3 の旧共通 UDF を複数 host が使い得る。
+  [Microsoft の UDF 仕様](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/user-data-folder)
+  と [process model](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/process-model) は、
+  同じ UDF の browser process を別 host でも共有するとしている。
+- 後発 host が browser を共有しても、browser の Job 所有は最初の host に残る。
+  先発の VST 無効化・mIV 終了で先発 Bridge の Job を終了すると、後発で利用中の画面まで終了させ得る。
+  後発 Job には共有 browser が入らず、残留防止も全 host では保証できない。
+  [Job の公式仕様](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects) の
+  子の所属と Job 全体終了をそのまま使った結果であり、まれな故障の回復問題ではない。
+- mIV Sound の `<data_dir>\effetune\webview` だけならこの反例を避けられるが、両方の host を
+  対象とする依頼の一部だけを無断で実装しない。ユーザー VST の UDF を分離して既存データの共有・参照を
+  変えることも、正常終了で Job の kill を外すことも、解決として採用しない。
+- 再開には、UDF の利用者と process tree の所有をどう一致させるかを設計担当が決め、通常利用の
+  データ共有・別インスタンスの画面を保つことについて独立レビューを受ける必要がある。
+  親子 fixture だけではこの共有反例を検証できないため、単純な Job 終了試験を成功扱いで残さない。
+  §1.710 は **旧 lockfile を排他保持できた後だけ**回収するため、現役 browser がその lockfile を
+  保持している間は回収経路へ入らず、この Job 所有の衝突は生じない。
 
 ### 5.3 何をどこから
 
@@ -247,6 +336,7 @@ v4.6〜v4.7.1 が v0.13、v4.8 が v0.14 で、Windows の WebView の origin �
   **その起動では音響調整を使えない状態にする**。通知の文:「音響調整のデータを引き継げませんでした。この mImageViewer も含め、
   トレイに常駐しているものもすべて終了してから、1 つだけ起動してください」(第 3 回レビュー P2。すでに起動している mIV を残したまま起動し直すと、
   既存の窓が前面に出るだけで移行はやり直されない。`src/lib.rs:1297`、`src/tray.rs:3`)。ログに理由 (動いていたプロセス、失敗した段) を残す。ユーザー VST は旧 WebView 領域を使えるので起動してよい。
+  §1.710 以降、終了待ちの期限切れで残存を確認した場合は、この通知へ `msedgewebview2.exe` と PID、タスク マネージャーでの確認案内を加える (§5.2a)。
 - 次の起動で再び試す。再試行の繰り返しや部分的な取り込みは作らない。まれな失敗は割り切り (CLAUDE.md)。原本が残るので、利用者のデータは失われない。
 - 通常終了・強制終了・電源断でも終了待ちは加えず、印の無いコピーは次回に破棄して原本から写し直す。残りを消せない場合も移行失敗とし、印は全コピー・検査が済んだ最後にだけ置く。
 

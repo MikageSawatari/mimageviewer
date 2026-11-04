@@ -833,6 +833,7 @@ impl App {
         if !self.admit_book_append_followup_mutation() {
             return false;
         }
+        let previous_anchor = self.spread_shift.anchor_idx();
         self.spread_shift.projection = None;
         self.spread_shift.scope = scope;
         if let Some(anchor_ref) = reference {
@@ -849,6 +850,9 @@ impl App {
         } else {
             self.spread_shift.state = ViewerShift::Ordinary(anchor_idx);
             self.show_feedback_toast("見開きを1ページずらしました（この閲覧中のみ）".into());
+        }
+        if previous_anchor != Some(anchor_idx) {
+            self.similar_panel.reset_info_target();
         }
         self.invalidate_fullscreen_display_unit_owners();
         true
@@ -874,6 +878,9 @@ impl App {
         }
         self.spread_shift.state = ViewerShift::None;
         self.spread_shift.projection = None;
+        if had_shift {
+            self.similar_panel.reset_info_target();
+        }
         if persists_clear {
             self.persist_live_shift(true);
         } else if had_shift {

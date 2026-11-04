@@ -25469,6 +25469,7 @@ impl App {
         }
         let current_page_changed = self.fullscreen_idx != Some(target_idx);
         if current_page_changed {
+            self.similar_panel.reset_info_target();
             self.supersede_required_fullscreen_folder_open();
             self.cancel_superseded_fs_navigation_display_target(target_idx);
             if self.adjustment_mode.is_open() {
@@ -29787,6 +29788,7 @@ impl App {
                                         self.reset_analysis_mode();
                                     }
                                     self.adjust_spread_target = None;
+                                    self.similar_panel.reset_info_target();
                                     if !spread_changed_from_direction {
                                         self.normalize_spread_position(ctx);
                                     }
@@ -44899,6 +44901,9 @@ impl App {
     /// final-cover setting. The spread-unit topology and navigation anchor remain canonical;
     /// an in-flight Display sequence is rebound to the new role-aware demand on the same owner.
     pub(crate) fn invalidate_final_cover_spread_display(&mut self, ctx: &egui::Context) {
+        if self.spread_mode.has_cover() {
+            self.similar_panel.reset_info_target();
+        }
         self.invalidate_fullscreen_display_unit_owners();
         // A source-reload holdover captures the complete old presentation unit. Keeping it
         // across a preference change could reintroduce or omit the supplement after the live
@@ -45032,6 +45037,7 @@ impl App {
             crate::content_identity::ContentIdentityTrigger::Edit,
         );
         if self.spread_mode.has_cover() {
+            self.similar_panel.reset_info_target();
             self.invalidate_singleton_spread_placement_display(ctx);
         }
     }
@@ -45340,6 +45346,7 @@ impl App {
         self.spread_popup_open = false;
         self.panorama_projection_popup_open = false;
         self.adjust_spread_target = None;
+        self.similar_panel.reset_info_target();
         if !self.reading_flow.is_paged() {
             self.reset_continuous_reading_transform();
             self.disable_non_paged_fullscreen_modes(fs_idx);
@@ -45642,6 +45649,7 @@ impl App {
         self.spread_popup_open = false;
         self.panorama_projection_popup_open = false;
         self.adjust_spread_target = None;
+        self.similar_panel.reset_info_target();
         if !self.reading_flow.is_paged() {
             self.reset_continuous_reading_transform();
             self.disable_non_paged_fullscreen_modes(fs_idx);
@@ -45709,6 +45717,7 @@ impl App {
             self.settings.update_active_favorite_spread_mode(new_mode);
         }
         self.adjust_spread_target = None;
+        self.similar_panel.reset_info_target();
         true
     }
 
@@ -47198,6 +47207,7 @@ impl App {
         let current_page_changed = self.fullscreen_idx != Some(new_idx);
         let display_unit_changed = current_page_changed || self.fullscreen_page_slice != new_slice;
         if display_unit_changed {
+            self.similar_panel.reset_info_target();
             self.invalidate_fullscreen_display_unit_owners();
             self.supersede_required_fullscreen_folder_open();
             self.finish_stale_fs_navigation_diagnostic_for_target(new_idx);
@@ -86182,6 +86192,7 @@ mod tests {
             last: Preference::Off,
         };
         let old = app.page_alone_preferences;
+        app.similar_panel.seed_info_target_for_test();
         app.fullscreen_page_layout
             .begin(crate::displayed_image_transform::FullscreenPageLayoutKind::Spread);
         rusqlite::Connection::open(&path)
@@ -86193,6 +86204,7 @@ mod tests {
             .unwrap();
         app.set_page_alone_preferences_for_fullscreen(&ctx, requested);
         assert_eq!(app.page_alone_preferences, old);
+        assert!(app.similar_panel.has_info_target_for_test());
         assert_eq!(
             app.fullscreen_page_layout.kind(),
             crate::displayed_image_transform::FullscreenPageLayoutKind::Spread
@@ -86203,6 +86215,17 @@ mod tests {
             .unwrap();
         app.set_page_alone_preferences_for_fullscreen(&ctx, requested);
         assert_eq!(app.page_alone_preferences, requested);
+        assert!(!app.similar_panel.has_info_target_for_test());
+        app.similar_panel.seed_info_target_for_test();
+        app.set_page_alone_preferences_for_fullscreen(&ctx, requested);
+        assert!(
+            app.similar_panel.has_info_target_for_test(),
+            "no-op preserves selection"
+        );
+        // A hidden pair/Single/pair round trip must not resurrect the old choice.
+        app.set_page_alone_preferences_for_fullscreen(&ctx, old);
+        app.set_page_alone_preferences_for_fullscreen(&ctx, requested);
+        assert!(!app.similar_panel.has_info_target_for_test());
         assert_eq!(
             app.fullscreen_page_layout.kind(),
             crate::displayed_image_transform::FullscreenPageLayoutKind::Empty

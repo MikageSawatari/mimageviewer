@@ -7505,7 +7505,12 @@ mod tests {
     #[cfg(windows)]
     fn remote_opening_with_pending_migration() -> (
         crate::app::AppTestEnvForTest,
-        std::sync::mpsc::Sender<Result<crate::effetune::migration::MigrationOutcome, String>>,
+        std::sync::mpsc::Sender<
+            Result<
+                crate::effetune::migration::MigrationOutcome,
+                crate::effetune::migration::MigrationFailure,
+            >,
+        >,
     ) {
         let mut app = crate::app::setup_app_for_test();
         app.settings.remote_video_streaming_enabled = true;

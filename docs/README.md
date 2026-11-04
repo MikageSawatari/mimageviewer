@@ -8,6 +8,7 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
+| [metadata-panel-spread-target-plan.md](metadata-panel-spread-target-plan.md) | §1.712 情報タブの左右ページ選択。編集／読書位置から独立したcontext所有、全ページ情報の対象、末尾補助表紙と初期化規則、検証 |
 | [list-order-book-navigation-plan.md](list-order-book-navigation-plan.md) | §1.444 一覧の表示順で前後の本へ移る操作。凍結列の context 所有・都度位置解決・既存 fullscreen 採用経路・検証記録 |
 | [section445-stepped-slider-input.md](section445-stepped-slider-input.md) | §1.445、GPUメモリ上限などの手入力。eguiの編集状態とstep丸めの原因、共通修正、兄弟欄とheadless回帰・検証記録 |
 | [section443-font-color-fix.md](section443-font-color-fix.md) | §1.443、単色 EBDT 字形のカラー誤判定。epaint 0.37 の vendor 差分、実フォント・mesh 回帰と検証記録 |

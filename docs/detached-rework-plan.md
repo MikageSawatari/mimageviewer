@@ -1455,6 +1455,39 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-05 §1.712 情報タブの左右ページ選択
+
+利用者依頼に基づく実装担当Codexと、実装と別contextの独立review担当は、情報タブの左右選択を
+既存viewer contextのパネルownerへ置き、読書位置・補正対象とは分ける方針に合意した。
+`ui_fullscreen.rs`のpopup callback内では、persist成功後の実mode変更を採用する既存分岐へ
+情報選択ownerを退役する1行だけを足す。隠れたパネルのSingle→Spread往復で古い選択が復活する
+問題を、表示modeの採用境界で防ぐためであり、detachedの症状を条件や時間窓で抑止する変更ではない。
+detached述語、viewport routing／生成／identity／geometry、HWND、focus、placementは変更しない。
+同じ退役は通常／構成管理本のmode採用・方向同期・shift実変更／解除・編集Single入場にも置く。
+末尾補助表紙と表紙直後／末尾の単ページ規則は、既存の本別／全体設定採用境界と、
+parked contextへ影響するFollowGlobalの条件付き配布に同じ情報owner退役を揃える。
+既存のoverride／表紙なし条件を保ち、影響しない兄弟contextの情報選択を消さない。
+既存の多窓fixtureへaffected／unaffectedの情報選択検査を加える。新しいcontext交換や世代は追加しない。
+明示回転は `apply_rotation` の既存 cache へ異なる回転値を採用したときだけ同contextの情報選択を退役する。
+一般の landscape epoch や自動寸法観測には解除を置かず、無関係な先読みで左右選択を変えない。
+rootと独立review担当は、この限定的な表示選択の採用がdetached経路の構造変更には当たらないと判断した。
+ClaudeCodeレビューを取得したという記録ではない。
+設計・producer棚卸し・試験の正本は[情報パネルの見開き対象](metadata-panel-spread-target-plan.md)。
+
+独立レビューREJECTのP2／P3追補（2026-11-05）:
+連結読みのseek／reanchorは既存admission通過後の実表示単位変更branchへ同じ情報owner退役を置く。
+defer・拒否・no-opでは解除せず、別contextの状態を操作しない。表示側への照合追加によるABAの抑止ではない。
+全体の補助表紙変更ではactive／parkedの情報選択解除だけを`has_cover()`で限定し、
+表紙なしLtr／RtlのFollowGlobal兄弟と明示overrideを保持する。既存geometry／cache失効はそのまま。
+利用者が提示した受理境界／影響範囲の修正方針を、実装担当と別contextのSol / xhighが実装前に確認し、
+所有境界を揃える構造修正であって症状パッチではないことに合意した。viewport routing／生成／identityの変更はない。
+
+P2／P3完成差分も独立gpt-6.1-sol／xhighレビューで追加指摘なし・コード受入可。
+関連12件のコンパイルは成功し、selector snapshotの通常比較は1件成功した。
+残る11件は指定TEMPへの一時フォルダ作成がアクセス拒否で停止し、製品経路は未確認。
+このセッションでは指定TEMPが書込許可範囲外にあるため、実行成功や全件ゲート通過とは扱わない。
+詳細は[backlog §1.712の追補](next-release-backlog.md)へ記録する。
+
 ### 2026-11-01 §1.670 A案の実装：独立readerのcloseはmain不変
 
 利用者決定（2026-11-01）により、第4.6版追加合意 (1) の**独立reader部分を廃止**する。

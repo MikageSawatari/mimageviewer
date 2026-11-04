@@ -38,6 +38,49 @@
 
 ## 1. 優先候補
 
+### 1.710 初回起動の引き継ぎが、旧 host の残した WebView2 browser 待ちで失敗する (2026-11-05)
+
+- **観測者・資料**: 利用者の PC のログを設計担当が確認。PID 55360 の `msedgewebview2.exe` browser 本体が 2026-11-02 から残り、親 host PID 83216 は不存在、移行は共通 5 秒の期限で失敗。利用者が当該 PID を終了して再起動すると成功した。開発テスト起源は推定であり、実装担当の実機観測ではない。利用者決定で v5 に入れる。
+- **確認した原因**: 移行は旧 UDF を照合して終了を待つだけで、親を失った mIV host 専用 browser 本体も待ち続けていた。host の強制終了経路は子孫の寿命を所有していない。従来通知は mIV/トレイ常駐の終了だけを案内し、残存 WebView2 の PID が分からなかった。
+- **修正・判断**: lockfile 排他保持後の候補のうち、同 SID・旧 UDF 完全一致・host exe-name 一致・type 指定なし・親不存在/PID 再利用/親 exe 違いを全て確認できたものだけ、識別に使用した保持 handle で終了する。不明・権限不足は従来どおり待つ。終了要求と PID をログへ残し、既存の共通 5 秒待ちと再列挙を維持。期限切れは残 PID を typed failure で通知へ運ぶ。詳しくは [移行設計 §5.2a](effetune-fork-plan.md)。
+- **検証**: 判定の組合せ、終了要求→待ち→再列挙→成功、残存時の PID 通知を差し替え backend / App 回帰で確認済み。本番と同じ権限で自プロセスを開く native 照会試験も成功。実行結果は下の開発検証台帳を参照。製品・実 WebView2 は起動していない。
+
+### 1.711 host の Job 化による WebView2 の取り残し防止 (2026-11-05、設計のみ・実装停止)
+
+- **確認した原因**: Bridge の通常 spawn と host 単体 kill は WebView2 を含む子孫を所有しない。KILL_ON_JOB_CLOSE の既存 `job_process` 再利用で、停止生成→Job 割当→再開、Bridge Drop/exit fence/mIV 異常終了時の tree 終了、正常 Shutdown の待ち維持を設計した。
+- **停止の理由・判断**: 独立レビュー (GPT-6.1 Sol / xhigh) とコード照合で、別 `--data-dir` の同時起動とユーザー VST の既存共通 UDF を確認した。[Microsoft の仕様](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/user-data-folder) 上、同 UDF の browser は host 間で共有される。先発 Bridge の Job 終了が後発の現役画面まで終了し、後発 Job だけでは共有 browser を回収できない。既存の終了順序・所有との衝突に当たるため、利用者が許可した設計のみの停止を適用し、host/Job の製品コード差分は残さない。
+- **残り**: UDF 利用者と process tree の所有を一致させる設計判断。mIV Sound だけへ限定した部分実装、ユーザー VST の保存先変更、正常終了時だけ kill を外す回避策は採らない。[移行設計 §5.2b](effetune-fork-plan.md) に候補設計・衝突経路・再開条件を記録。実 WebView2 による再現試験や Job fixture の成功は主張しない。
+
+### 1.712 見開き中の情報タブを左右ページで切り替える (2026-11-05)
+
+- **観測者**: 利用者。見開きの AI 説明が片側しか表示されず、どちらのページかも分からない。編集パネルと同じ左右切り替え UI にする利用者決定。
+- **確認した原因**: 情報タブは常に `fullscreen_idx` を使い、パレット・メタデータ読込も canonical ページに固定していた。
+- **修正・判断**: 「左ページ」「右ページ」と対象表示を先頭に追加し、★・パレット・AI 説明・ツイート・生成 prompt・EXIF・サイドカーを選択ページへ揃える。読む順の先頭が既定。見開き・方向・単ページ・開き直しで既定へ戻す。表示・ページ送り・`fullscreen_idx`、編集対象、キーボードの★対象を維持するため、情報選択は既存の context 所有パネル状態に独立した typed owner として置く。タグ行・類似タブは両ページのまま。補助表紙も明示選択できるが、既定は本文の navigation ページ。単ページに切り替え UI は出さない。隠れたパネルでも、受理済みの表示方式・方向・shift・編集 Single 入場・補助表紙/単ページ規則・明示回転の実変更で選択を退役する。設定の影響しない兄弟 context や override は保持し、自動寸法観測一般では解除しない。既存 items 世代も照合して同一 key 再採用の ABA を防ぐ。
+- **検証・文書**: ページ別の情報/AI 対象、navigation と編集の不変、ページ送り・RTL・単ページ・補助表紙を回帰に含め、共通 selector の UI snapshot 1 枚を追加。情報パネルのマニュアルと仕様・[設計](metadata-panel-spread-target-plan.md)を更新。実行結果は下の開発検証台帳へ記録する。
+
+#### §1.712 独立レビューREJECTの追補（2026-11-05）
+
+- **P2の確認した原因と修正**: 連結読みのseek／reanchorは`open_fullscreen`を経由せず、旧情報ownerが残っていた。Info非表示／類似タブのまま往復するとanchor・pair・世代が再一致するため、描画時照合だけでは旧選択を区別できない。seekのadmission／defer判定通過後の実anchor変更、reanchorのadmission通過後の実表示単位変更（slice含む）の既存退役branchへ、所有contextの情報選択退役を追加。拒否・保留・no-opは保持し、別contextや編集対象へ広げない。
+- **P3の確認した原因と修正**: 全体の補助表紙変更はFollowGlobalだけで情報選択を解除していた。`has_cover()`が偽のLtr／Rtlには表示構成の依存がないため、parkedだけでなくactiveの同型経路も、情報選択の退役だけを`has_cover()`に限定した。既存geometry／cache失効は変更しない。4見開きmode×3設定のparked affected／unaffectedとactiveの表紙なしを回帰へ追加。
+- **TEMPの原因追補（観測者: 設計担当、今回の利用者指示で共有）**: 旧`%TEMP%`にテスト残骸が約77万件あり、前回全件の75失敗・21timeoutにつながっていた。空のTEMPで同じ1519件が全成功したことを設計担当が確認した。以下の前回ゲート非成功・当時原因未確定の記録は履歴として残す。今回のテストはすべて`TEMP`／`TMP`を`G:\home\tmp-test-env`へ指定し、古いTEMPの削除や全件再実行は行わない。
+- **独立レビュー**: gpt-6.1-sol / xhighでP2／P3の完成差分を再確認し、追加指摘なし・コード受入可。実行結果の成功とは区別する。
+- **関連検証（default features）**: `TEMP`／`TMP`を指定先へ設定して、`cargo nextest run --offline -p mimageviewer --lib -j 6 -E 'test(metadata_info_target) | test(=app::viewer_context_registry::tests::global_final_cover_change_invalidates_only_parked_follow_global_geometry)' --no-fail-fast --retries 0`を実行。コンパイル成功（2分31秒）、12件中1成功・11失敗（実行1.308秒、exit 100）。成功はselector snapshotの更新指定なし通常比較。11件はすべて共通fixtureの`tempdir`作成が`G:\home\tmp-test-env`でアクセス拒否（OS 5）となり、製品経路へ到達していない。ログは`target/section1712-review-focused.log`。このセッションの書込許可は作業ツリー内で、指定TEMPは範囲外。通常ACLに拒否はなく、reparse pointでもない。別TEMPへ変更したりfixtureを変更したりして回避せず、同じfixtureに依存する追加filterは未実行とした。P2／P3の回帰成功は未確認で、指定TEMPへ書込可能な環境で再実行が必要。
+- **最終確認・未実施**: `cargo fmt`適用後の`cargo fmt --check`・`git diff --check`は成功。全件ゲートは設計担当が別途実行する。製品起動・commit・`build-dev.ps1`・`config/miv-sound.rs`変更は行っていない。§1.711のJob／Bridgeもこの追補では変更していない。
+
+#### 依頼12後の3件の開発検証台帳（2026-11-05、実装担当）
+
+- 対象: `v5-integration` / `d83ed8f85` 上の未コミット差分。Windows、既定 feature。製品起動・`config/miv-sound.rs` 変更・コミット・`build-dev.ps1` は利用者指定により行わない。
+- 情報対象の最終検証: `UPDATE_SNAPSHOTS=1 cargo test --offline -p mimageviewer --lib metadata_info_target` は **7/7 成功、exit 0、2.79 秒**（compile 3分23秒、`target/metadata-info-final-generate.log`）。更新指定を外した同じ filter の通常比較も **7/7 成功、exit 0、1.99 秒**（`target/metadata-info-final-compare.log`）。新 PNG は `tests/snapshots/metadata_info_target_selector.png` 1枚、340×300、16,264 bytes。実装担当と独立 review 担当が目視し、左右 selector・対象・★・Prompt 全文が収まることを確認した。
+- 関連検証: `cargo nextest run --offline -p mimageviewer --lib --features test-script -j 6 -E <関連filter> --no-fail-fast` は **133/133 成功、exit 0、5.552 秒**（compile 5分11秒、run `eee77c7a-b986-4b3e-8ff3-9142d985c685`、`target/post12-related-feature.log`）。filter は `effetune::migration::|effetune::startup::|audio_plugin_migration::|remote_stream_start_.*migration|ui_metadata_panel::|global_final_cover_change_invalidates_only_parked_follow_global_geometry|page_alone_preference_survives_context_exchange_and_only_inherited_changes_invalidate|failed_page_alone_write_keeps_previous_pair_and_paint_layout` の正規表現。移行専用入口の feature 付き compile、native 自 PID の同一 handle 照会、metadata/AI 対象と既存 caption snapshot、多窓設定の affected/unaffected を含む。
+- `cargo check -p mimageviewer --bin mimageviewer-core` は **exit 0、52.29 秒**（`target/post12-core-check.log`）。全体 `cargo fmt` と `cargo fmt --check`、`git diff --check` は成功。`python scripts/check_ui_glyphs.py` は危険文字0、`python scripts/check_site_cards.py` は52件・超過0。既存の compiler warning は修正範囲に広げていない。
+- 指定の本体 lib 全件は `scripts/test-lib-full.ps1` を **1回だけ完走**した。既定並列（24 test process を観測）、test profile、default を継承した miv-tool profile、retryなし。**16,305実行、16,209成功（229 slow）、75失敗・21 timeout、71 skip、exit 100、3,245.082秒**。全件成功とは扱わない。run `bfdc0160-3aef-4883-9010-5fba635ad90d`、ログ・JUnit は `target/test-lib-full/runs/20261104T163052936Z-53ca71a5/`、呼出ログは `target/post12-lib-full.log`。開始 source ID は `3ee83b8e20b0b1f530080861ef6ee530dba686b1fbb00acd553d028c2dcdefba`。この default-feature 全件の JUnit でも、今回関連の **130/130 件は成功**した。
+- 全件の既知2失敗は `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry` と `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`。両方とも Win32 code 5 / PermissionDenied。残る **94件（App 78、Remote 6、indexer 4、collection dialog 3、global search 2、main UI 1）** は、一覧/履歴準備・actor返信・取込完了の待機失敗や timeout 等。失敗名は `target/post12-full-failed-names.json` に保持した。
+- 全件終了後、既知2件を除いた94件だけの exact filter を同じ source/default feature・6並列・retryなしで再確認した（`target/post12-failed-recheck.log`）。この集合でも複数の待機失敗と timeout が続いたため、**完走前に実装担当が中断、exit -1**。完了済み全件の再実行ではなく、成功した集合とも扱わない。停止はこの再確認に属する Nextest と直系 test process だけに限定した。中断後の runner/channel エラーを製品テスト失敗へ加算しない。
+- 続く、他のテストを併走させない1並列の対照では `indexer_supervisor::tests::initial_scan_populates_stats` が **1/1成功、exit 0、0.435秒**（`target/post12-isolated-indexer.log`）。`app::startup_ops::tests::section1419_activation_and_bookmark_retire_earlier_main_requests` と `app::tests::audio_favsearch_sidecar_tests::favorite_search_worker_installs_sources_before_loading_and_requeries_on_refresh` も **2/2成功、exit 0、135.692秒（1 slow）**（`target/post12-isolated-app.log`）。source・待機閾値・期待値は変更していない。
+- 独立 read-only 調査では、新 metadata pending/ROOT wake/Info 選択から上の共通失敗群へ至る具体的な不具合経路は見つからなかった。純 indexer、10万ファイル走査、Remote タグの10001ファイル準備は App/metadata を使わず、history-parent の代表は40 App fixtureを順に処理して正常な親復帰まで進行していた。5秒の待機に対して約29秒、10秒の fixture 待ちに対して51〜153秒、60秒の session 生存期間に対して約80秒の観測もある。ただし **並列負荷が原因、または今回差分と無関係と確定したとは扱わない**。単独対照の成功で元の全件非ゼロを上書きせず、広い gate は未通過として引き継ぐ。
+- 初回の移行 compile は copy 閉包の型注記不足と Remote test helper の Sender 型不一致でテスト未実行、情報側の初回 compile も fixture の HistoryTrigger 引数漏れで未実行だった。いずれも訂正済み。情報側の途中7件は6成功/1失敗（`target/metadata-info-first-seven.log`）。末尾補助表紙の fixture が `current_folder=None` で既存 eligibility を満たさなかったため temp folder を設定して訂正し、最終7/7で解消した。初回 PNG の下端切れも高さ300へ直してから最終生成・通常比較・目視を行った。
+- 実装者と別 context の GPT-6.1 Sol / xhigh が設計・最終製品差分・snapshot を独立確認し、§1.710/§1.712 の未解消 P1/P2 はなし、§1.711 の設計停止に合意。全件未通過と原因未確定の記録はこの code-review 判断と別に保持する。検証後の変更は本節等の記録文書だけ。製品起動・commit・`build-dev.ps1` は未実施で、`config/miv-sound.rs` と Job/Bridge の製品コードは変更なし。
+
 ### 1.705 Ctrl+F の絞り込み中に履歴の←/→が黙って無視される (2026-11-04、v5.0.0受入・依頼12)
 
 - **観測者・資料**: サブPC担当。`C:\miv-subpc\results-12\notes.md` A-2/その他5、同所`logs/`。Dorico 1/2等で←2回・Alt+←1回が無反応、×後は戻れた。実装担当の実機観測ではない。4件ともv4.11.0からある挙動をv5で直す利用者決定。

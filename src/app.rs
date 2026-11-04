@@ -7515,6 +7515,7 @@ pub(crate) struct FolderNavResult {
 /// (AI metadata と EXIF は数 ms だが、XMP が主犯)。
 /// 新 fullscreen idx が開かれたら旧 pending を cancel する (連打時は最新のみ処理)。
 pub(crate) struct MetadataLoadPending {
+    key: String,
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<MetadataLoadResult>,
 }
@@ -13093,6 +13094,7 @@ impl App {
     /// 単ページ表示へ倒す。見開きを解除し、対象ページへ寄せ、ズーム / パンを戻す。
     pub(crate) fn enter_page_edit_single_view(&mut self, target_idx: usize) {
         self.cancel_superseded_fs_navigation_display_target(target_idx);
+        self.similar_panel.reset_info_target();
         self.spread_mode = crate::settings::SpreadMode::Single;
         self.fullscreen_idx = Some(target_idx);
         #[cfg(windows)]
@@ -32633,9 +32635,11 @@ impl App {
                 Err(reason) => {
                     crate::logger::log(format!("[mIV Sound migration] FAILED: {reason}"));
                     self.effetune
-                        .fail(crate::effetune::EffetuneFailure::LoadFailed(reason));
+                        .fail(crate::effetune::EffetuneFailure::LoadFailed(
+                            reason.to_string(),
+                        ));
                     self.show_feedback_toast_with_duration(
-                        crate::effetune::startup::FAILURE_NOTICE.into(),
+                        crate::effetune::startup::failure_notice(&reason),
                         15.0,
                     );
                 }
@@ -71213,6 +71217,7 @@ impl App {
             refresh_video_markers_perf_t0,
         );
         self.adjust_spread_target = None;
+        self.similar_panel.reset_info_target();
         // PDF pool の Critical 予約は `pdf_loader::CRITICAL_RESERVATION_ACTIVE` を
         // 常時 ON にする方針 (v1.0.0)。グリッドからの Enter (= Critical な
         // enumerate_pages_async) が、サムネ先読みの Normal ジョブ in-flight 待ちで
@@ -71593,6 +71598,18 @@ impl App {
         }
     }
 
+    /// 情報パネルの需要。同じkeyのin-flightは明示openが開始した要求を再利用する。
+    pub(crate) fn ensure_metadata_load(&mut self, idx: usize) {
+        if self
+            .metadata_pending
+            .as_ref()
+            .is_some_and(|pending| self.metadata_cache_key(idx).as_ref() == Some(&pending.key))
+        {
+            return;
+        }
+        self.start_metadata_load(idx);
+    }
+
     /// 指定 idx の AI/EXIF/XMP メタデータ読み込みをバックグラウンドで開始する。
     /// 全キャッシュが既にヒットしていれば spawn しない (no-op)。
     /// 既存 pending があれば cancel して置き換える (連打時は最新だけ処理)。
@@ -71627,6 +71644,7 @@ impl App {
         let relative_page_provenance = self.relative_page_provenance_for_idx(idx);
         let hidden: Vec<String> = self.settings.exif_hidden_tags.clone();
         let key_owned = key.clone();
+        let repaint = self.edit_preview_repaint_ctx.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
@@ -71646,11 +71664,14 @@ impl App {
                 }
                 if let Some(r) = result {
                     let _ = tx.send(r);
+                    if let Some(ctx) = repaint {
+                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                    }
                 }
             })
             .ok();
 
-        self.metadata_pending = Some(MetadataLoadPending { cancel, rx });
+        self.metadata_pending = Some(MetadataLoadPending { key, cancel, rx });
     }
 
     /// メタデータ読み込み結果を非同期に受信してキャッシュに投入する。
@@ -75775,7 +75796,9 @@ impl App {
                 db.set_key(&key, rot)
                     .map_err(|error| format!("回転を保存できませんでした: {error}"))
             });
-        self.rotation_cache.insert(idx, rot);
+        if self.rotation_cache.insert(idx, rot) != Some(rot) {
+            self.similar_panel.reset_info_target();
+        }
         self.update_prepared_composed_rotation(idx, rot);
         self.reconcile_spread_landscape_with_rotation(idx, rot);
         Self::set_page_key_presence(&mut self.rotation_page_keys, &key, !rot.is_none());

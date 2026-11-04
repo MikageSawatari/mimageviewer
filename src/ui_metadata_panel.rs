@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
-use crate::app::App;
+use crate::app::{AdjustSpreadTarget, App, VisibleSpreadEditPages};
 use crate::exif_reader::{self, ExifInfo};
 use crate::png_metadata::{
     A1111Metadata, AiMetadata, ComfyPromptRole, ComfyUIMetadata, UnresolvedInputSafety,
@@ -221,8 +221,10 @@ fn maintain_similar_item_query_progress(
     }
 }
 
+/// Viewer-local owner of both Info and Similar tab presentation.
 pub(crate) struct SimilarPanelState {
     tab: MetadataPanelTab,
+    info_target: Option<MetadataInfoTarget>,
     origin_key: Option<String>,
     /// Viewer-local, nonpersistent completed visits. Unresolved navigation intent belongs to the
     /// scan/navigation request instead, so cancellation cannot create a ghost entry here.
@@ -256,11 +258,83 @@ pub(crate) struct SimilarPanelState {
     thumb_rx: std::sync::mpsc::Receiver<SimilarThumbResult>,
 }
 
+/// A choice belongs to one displayed unit, never to the canonical reading position or editor.
+#[derive(Clone, Debug, PartialEq)]
+struct MetadataInfoTarget {
+    anchor_key: String,
+    items_generation: u64,
+    mode: crate::settings::SpreadMode,
+    spread: Option<MetadataInfoSpread>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MetadataInfoSpread {
+    keys: [String; 2],
+    reading_start: AdjustSpreadTarget,
+    selected: AdjustSpreadTarget,
+}
+
+impl MetadataInfoTarget {
+    fn reconcile(&mut self, mut current: Self) {
+        if self.anchor_key == current.anchor_key
+            && self.items_generation == current.items_generation
+            && self.mode == current.mode
+        {
+            if let (Some(old), Some(new)) = (&self.spread, &mut current.spread) {
+                if old.keys == new.keys && old.reading_start == new.reading_start {
+                    new.selected = old.selected;
+                }
+            }
+        }
+        *self = current;
+    }
+
+    fn idx(&self, anchor: usize, pages: Option<VisibleSpreadEditPages>) -> usize {
+        match (&self.spread, pages) {
+            (Some(spread), Some(pages)) => pages.target_idx(spread.selected),
+            _ => anchor,
+        }
+    }
+}
+
+fn draw_metadata_info_target_selector(
+    ui: &mut egui::Ui,
+    selected: &mut AdjustSpreadTarget,
+) -> bool {
+    let before = *selected;
+    ui.horizontal(|ui| {
+        for (side, label) in [
+            (AdjustSpreadTarget::Left, "左ページ"),
+            (AdjustSpreadTarget::Right, "右ページ"),
+        ] {
+            if ui
+                .add(egui::Button::selectable(*selected == side, label))
+                .clicked()
+            {
+                *selected = side;
+            }
+        }
+    });
+    ui.label(
+        egui::RichText::new(match selected {
+            AdjustSpreadTarget::Left => "対象: 左ページ",
+            AdjustSpreadTarget::Right => "対象: 右ページ",
+        })
+        .color(LABEL_COLOR)
+        .size(11.0),
+    );
+    ui.add_space(4.0);
+    ui.separator();
+    ui.add_space(8.0);
+    *selected != before
+}
+
 impl Default for SimilarPanelState {
     fn default() -> Self {
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         Self {
             tab: MetadataPanelTab::Info,
+            info_target: None,
             origin_key: None,
             book_history: SimilarBookVisitHistory::Inactive,
             move_trace_pressed: std::cell::RefCell::new(None),
@@ -285,6 +359,29 @@ impl Default for SimilarPanelState {
 }
 
 impl SimilarPanelState {
+    pub(crate) fn reset_info_target(&mut self) {
+        self.info_target = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_info_target_for_test(&mut self) {
+        self.info_target = Some(MetadataInfoTarget {
+            anchor_key: "fixture-page0".into(),
+            items_generation: 0,
+            mode: crate::settings::SpreadMode::Ltr,
+            spread: Some(MetadataInfoSpread {
+                keys: ["fixture-page0".into(), "fixture-page1".into()],
+                reading_start: AdjustSpreadTarget::Left,
+                selected: AdjustSpreadTarget::Right,
+            }),
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_info_target_for_test(&self) -> bool {
+        self.info_target.is_some()
+    }
+
     /// Borrow every uploaded thumbnail, including while this viewer is parked.
     pub(crate) fn resident_thumbnail_textures(&self) -> impl Iterator<Item = &egui::TextureHandle> {
         self.thumbnails
@@ -2360,11 +2457,6 @@ impl App {
             return false;
         };
 
-        let ai_metadata = self.get_current_ai_metadata();
-        let exif_info = self.get_current_exif();
-        let tweet_info = self.get_current_tweet_info();
-        let sidecar_info = self.get_current_sidecar();
-        let current_palette = self.current_fullscreen_color_palette();
         let similar_feature_capability = self.similar_feature_capability();
         project_metadata_panel_tab(similar_feature_capability, &mut self.similar_panel.tab);
         // Collect CPU completions before drawing. Which of them may upload, and which queued jobs
@@ -2428,10 +2520,7 @@ impl App {
         let compare_pin_preparing = self.compare_pin_pending.is_some();
         // ★ レーティング (画像/動画/音声で統一。★ → タグ → 内容 の先頭)。レーティング可能な
         // 単一アイテム (画像 / ZIP 内画像 / PDF ページ) でページ★を出す。
-        let rating_idx = self
-            .fullscreen_idx
-            .filter(|&i| self.items.get(i).is_some_and(|it| it.accepts_rating()));
-        let rating_stars = rating_idx.map(|i| self.get_rating(i)).unwrap_or(0);
+        let mut rating_idx = None;
         let mut set_rating: Option<u8> = None;
         // ページ★とは独立したコンテナ★を、タグ行の表示ラベルではなく現在の
         // container-rating ownership から解決する。これにより PDF / ZIP / 変換書庫でも
@@ -2629,15 +2718,44 @@ impl App {
 
                 // ── ★ レーティング (最上段。★ → タグ → 内容 の統一順序) ──
                 // ページ★とコンテナ★を両方出す (コンテナ行があるときはページを明記)。
-                let caption_target = (self.similar_panel.tab == MetadataPanelTab::Info)
-                    .then_some(self.fullscreen_idx)
-                    .flatten()
-                    .and_then(|idx| match self.items.get(idx) {
-                        Some(crate::grid_item::GridItem::Image(path)) => {
-                            self.metadata_cache_key(idx).map(|key| (key, path.clone()))
-                        }
-                        _ => None,
+                // Every page-specific section and action uses one target in this pass.
+                // Tags, Similar, container stars and book captions keep their existing owners.
+                let (anchor, spread_pages, target_changed) = self.resolve_metadata_info_target();
+                let selector_changed = self
+                    .similar_panel
+                    .info_target
+                    .as_mut()
+                    .and_then(|target| target.spread.as_mut())
+                    .is_some_and(|spread| {
+                        draw_metadata_info_target_selector(ui, &mut spread.selected)
                     });
+                let info_idx = anchor.map(|anchor| {
+                    self.similar_panel
+                        .info_target
+                        .as_ref()
+                        .map_or(anchor, |target| target.idx(anchor, spread_pages))
+                });
+                if (target_changed || selector_changed)
+                    && let Some(idx) = info_idx
+                {
+                    self.ensure_metadata_load(idx);
+                }
+                let ai_metadata = self.get_ai_metadata_for_idx(info_idx);
+                let exif_info = self.get_exif_for_idx(info_idx);
+                let tweet_info = self.get_tweet_info_for_idx(info_idx);
+                let sidecar_info = self.get_sidecar_for_idx(info_idx);
+                let current_palette =
+                    info_idx.and_then(|idx| self.fullscreen_color_palette_for_idx(idx));
+                rating_idx = info_idx.filter(|&idx| {
+                    self.items
+                        .get(idx)
+                        .is_some_and(|item| item.accepts_rating())
+                });
+                let rating_stars = rating_idx.map(|idx| self.get_rating(idx)).unwrap_or(0);
+                let caption_target = (self.similar_panel.tab == MetadataPanelTab::Info)
+                    .then_some(info_idx)
+                    .flatten()
+                    .and_then(|idx| self.metadata_info_caption_target(idx));
                 let refresh =
                     caption_panel_visit(ctx, caption_target.as_ref().map(|(key, _)| key.as_str()));
                 let caption_display = caption_target.and_then(|(key, path)| {
@@ -3057,31 +3175,84 @@ impl App {
         }
     }
 
-    /// 現在のフルスクリーン画像の AI メタデータを取得する。
-    fn get_current_ai_metadata(&self) -> Option<AiMetadata> {
-        let idx = self.fullscreen_idx?;
+    /// Resolve the information tab without changing navigation, image layout or editing state.
+    fn resolve_metadata_info_target(
+        &mut self,
+    ) -> (Option<usize>, Option<VisibleSpreadEditPages>, bool) {
+        let Some(anchor) = self.fullscreen_idx else {
+            self.similar_panel.reset_info_target();
+            return (None, None, false);
+        };
+        let Some(anchor_key) = self.metadata_cache_key(anchor) else {
+            self.similar_panel.reset_info_target();
+            return (Some(anchor), None, false);
+        };
+        let pages = self.resolve_visible_spread_edit_pages(anchor);
+        let spread = pages.and_then(|pages| {
+            Some(MetadataInfoSpread {
+                keys: [
+                    self.metadata_cache_key(pages.pair.0)?,
+                    self.metadata_cache_key(pages.pair.1)?,
+                ],
+                reading_start: pages.reading_start,
+                selected: pages.reading_start,
+            })
+        });
+        let current = MetadataInfoTarget {
+            anchor_key,
+            items_generation: self.items_generation,
+            mode: self.spread_mode,
+            spread,
+        };
+        let before = self.similar_panel.info_target.clone();
+        match &mut self.similar_panel.info_target {
+            Some(target) => target.reconcile(current),
+            target @ None => *target = Some(current),
+        }
+        (
+            Some(anchor),
+            pages,
+            before != self.similar_panel.info_target,
+        )
+    }
+
+    /// 選択した情報対象の AI メタデータを取得する。
+    fn get_ai_metadata_for_idx(&self, idx: Option<usize>) -> Option<AiMetadata> {
+        let idx = idx?;
         let key = self.metadata_cache_key(idx)?;
         self.metadata_cache.get(&key).cloned().flatten()
     }
 
+    fn metadata_info_caption_target(&self, idx: usize) -> Option<(String, PathBuf)> {
+        match self.items.get(idx)? {
+            crate::grid_item::GridItem::Image(path) => {
+                self.metadata_cache_key(idx).map(|key| (key, path.clone()))
+            }
+            _ => None,
+        }
+    }
+
     /// 現在のフルスクリーン画像の EXIF 情報を取得する。
-    fn get_current_exif(&self) -> Option<ExifInfo> {
-        let idx = self.fullscreen_idx?;
+    fn get_exif_for_idx(&self, idx: Option<usize>) -> Option<ExifInfo> {
+        let idx = idx?;
         let key = self.metadata_cache_key(idx)?;
         self.exif_cache.get(&key).cloned().flatten()
     }
 
     /// 現在のフルスクリーン画像の XMP (X/Twitter) 情報を取得する。
-    fn get_current_tweet_info(&self) -> Option<XmpTweetInfo> {
-        let idx = self.fullscreen_idx?;
+    fn get_tweet_info_for_idx(&self, idx: Option<usize>) -> Option<XmpTweetInfo> {
+        let idx = idx?;
         let key = self.metadata_cache_key(idx)?;
         self.xmp_cache.get(&key).cloned().flatten()
     }
 
     /// 現在のフルスクリーン画像の外部メタデータサイドカー (表示用) を取得する。
     /// worker (`run_metadata_load`) が FS 画像のみ埋めるので、動画 / ZIP / PDF は常に None。
-    fn get_current_sidecar(&self) -> Option<crate::external_metadata::SidecarDisplay> {
-        let idx = self.fullscreen_idx?;
+    fn get_sidecar_for_idx(
+        &self,
+        idx: Option<usize>,
+    ) -> Option<crate::external_metadata::SidecarDisplay> {
+        let idx = idx?;
         let key = self.metadata_cache_key(idx)?;
         self.sidecar_display_cache.get(&key).cloned().flatten()
     }
@@ -6019,6 +6190,607 @@ fn draw_caption_section_with_kind(
         }
     });
     true
+}
+
+#[cfg(test)]
+mod metadata_info_target_tests {
+    use super::*;
+    use crate::app::{AppTestEnvForTest as AppTestEnv, setup_app_for_test as setup_app};
+    use crate::grid_item::GridItem;
+    use crate::settings::SpreadMode;
+    use egui_kittest::kittest::Queryable;
+
+    fn spread_app(mode: SpreadMode) -> AppTestEnv {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.current_folder = Some(app.tmp.path().to_path_buf());
+        app.items = (0..4)
+            .map(|idx| GridItem::Image(app.tmp.path().join(format!("{idx}.png"))))
+            .collect();
+        app.image_metas = vec![Some((1, 1)); 4];
+        app.thumbnails = (0..4)
+            .map(|_| crate::grid_item::ThumbnailState::Pending)
+            .collect();
+        app.visible_indices = (0..4).collect();
+        app.details_order = (0..4).collect();
+        for idx in 0..4 {
+            let pixels = egui::ColorImage::filled(
+                [4, 6],
+                if idx == 0 {
+                    egui::Color32::RED
+                } else {
+                    egui::Color32::BLUE
+                },
+            );
+            app.fs_cache.insert(
+                idx,
+                crate::fs_animation::FsCacheEntry::Static {
+                    pdf_rerender_failures: Vec::new(),
+                    pdf_metadata: None,
+                    tex: ctx.load_texture(
+                        format!("metadata-info-{idx}"),
+                        pixels.clone(),
+                        egui::TextureOptions::LINEAR,
+                    ),
+                    pixels: std::sync::Arc::new(pixels),
+                    source_dims: Some([4, 6]),
+                    load_seq: 0,
+                    animation: crate::fs_animation::StaticAnimationState::Still,
+                },
+            );
+            let key = app.metadata_cache_key(idx).unwrap();
+            app.metadata_cache.insert(
+                key.clone(),
+                Some(AiMetadata::A1111(A1111Metadata {
+                    tool: crate::png_metadata::AiToolKind::A1111,
+                    prompt: format!("page-{idx}"),
+                    negative_prompt: String::new(),
+                    params: vec![],
+                    raw: String::new(),
+                })),
+            );
+            app.exif_cache.insert(
+                key.clone(),
+                Some(ExifInfo {
+                    sections: vec![(
+                        exif_reader::TagGroup::Camera,
+                        vec![("Make".into(), format!("camera-{idx}"))],
+                    )],
+                }),
+            );
+            app.xmp_cache.insert(
+                key.clone(),
+                Some(XmpTweetInfo {
+                    tweet_id: Some(format!("tweet-{idx}")),
+                    ..Default::default()
+                }),
+            );
+            app.sidecar_display_cache.insert(
+                key.clone(),
+                Some(crate::external_metadata::SidecarDisplay::Text(format!(
+                    "sidecar-{idx}"
+                ))),
+            );
+            app.xmp_panorama_info.insert(key, None);
+            app.rating_cache.insert(idx, idx as u8 + 1);
+        }
+        app.spread_mode = mode;
+        app.fullscreen_idx = Some(0);
+        app
+    }
+
+    fn target_idx(app: &mut App) -> (usize, Option<VisibleSpreadEditPages>) {
+        let (anchor, pages, _) = app.resolve_metadata_info_target();
+        (
+            app.similar_panel
+                .info_target
+                .as_ref()
+                .unwrap()
+                .idx(anchor.unwrap(), pages),
+            pages,
+        )
+    }
+
+    fn select(app: &mut App, side: AdjustSpreadTarget) {
+        app.similar_panel
+            .info_target
+            .as_mut()
+            .unwrap()
+            .spread
+            .as_mut()
+            .unwrap()
+            .selected = side;
+    }
+
+    #[test]
+    fn metadata_info_target_routes_all_page_sources_without_moving_navigation_or_editor() {
+        for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+            let mut app = spread_app(mode);
+            app.adjust_spread_target = Some(AdjustSpreadTarget::Left);
+            let edit_idx = app.current_adjust_target_idx();
+            let layout = app.fullscreen_page_layout.clone();
+            assert_eq!(target_idx(&mut app).0, 0, "reading start {mode:?}");
+            let side = if mode.is_rtl() {
+                AdjustSpreadTarget::Left
+            } else {
+                AdjustSpreadTarget::Right
+            };
+            select(&mut app, side);
+            let (idx, pages) = target_idx(&mut app);
+            assert_eq!(idx, 1);
+            assert_eq!(
+                pages.unwrap().pair,
+                if mode.is_rtl() { (1, 0) } else { (0, 1) }
+            );
+            assert!(
+                matches!(app.get_ai_metadata_for_idx(Some(idx)), Some(AiMetadata::A1111(meta)) if meta.prompt == "page-1")
+            );
+            assert_eq!(
+                app.get_exif_for_idx(Some(idx)).unwrap().sections[0].1[0].1,
+                "camera-1"
+            );
+            assert_eq!(
+                app.get_tweet_info_for_idx(Some(idx))
+                    .unwrap()
+                    .tweet_id
+                    .as_deref(),
+                Some("tweet-1")
+            );
+            assert!(
+                matches!(app.get_sidecar_for_idx(Some(idx)), Some(crate::external_metadata::SidecarDisplay::Text(text)) if text == "sidecar-1")
+            );
+            assert_eq!(
+                app.metadata_info_caption_target(idx).unwrap().1,
+                app.tmp.path().join("1.png")
+            );
+            assert_eq!(app.get_rating(idx), 2);
+            assert!(app.set_rating(idx, 5));
+            assert_eq!(
+                app.get_rating(0),
+                1,
+                "panel stars leave the navigation page untouched"
+            );
+            assert_eq!(
+                app.fullscreen_color_palette_for_idx(idx).unwrap().colors[0].rgb,
+                [0, 0, 255]
+            );
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.spread_mode, mode);
+            assert_eq!(app.current_adjust_target_idx(), edit_idx);
+            assert_eq!(app.adjust_spread_target, Some(AdjustSpreadTarget::Left));
+            assert_eq!(
+                app.fullscreen_page_layout.spread_occurrences(),
+                layout.spread_occurrences()
+            );
+            assert_eq!(
+                similar_shown_indices(
+                    app.fullscreen_idx,
+                    crate::ui_fullscreen::SpreadPair::Double {
+                        left: pages.unwrap().pair.0,
+                        right: pages.unwrap().pair.1
+                    }
+                )
+                .len(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_info_target_resets_on_page_pair_direction_and_single_changes() {
+        let mut app = spread_app(SpreadMode::Ltr);
+        target_idx(&mut app);
+        select(&mut app, AdjustSpreadTarget::Right);
+        assert_eq!(target_idx(&mut app).0, 1);
+        app.fullscreen_idx = Some(2);
+        assert_eq!(
+            target_idx(&mut app).0,
+            2,
+            "new spread resets to reading start"
+        );
+        select(&mut app, AdjustSpreadTarget::Right);
+        app.spread_mode = SpreadMode::Rtl;
+        assert_eq!(target_idx(&mut app).0, 2, "direction resets physical side");
+        select(&mut app, AdjustSpreadTarget::Left);
+        app.spread_mode = SpreadMode::Single;
+        assert!(target_idx(&mut app).1.is_none());
+        assert!(
+            app.similar_panel
+                .info_target
+                .as_ref()
+                .unwrap()
+                .spread
+                .is_none()
+        );
+        app.spread_mode = SpreadMode::Ltr;
+        assert_eq!(target_idx(&mut app).0, 2);
+        select(&mut app, AdjustSpreadTarget::Right);
+        app.items[3] = GridItem::Image(app.tmp.path().join("replacement.png"));
+        assert_eq!(
+            target_idx(&mut app).0,
+            2,
+            "pair identity changes reset selection"
+        );
+        select(&mut app, AdjustSpreadTarget::Right);
+        app.items_generation = app.items_generation.wrapping_add(1);
+        assert_eq!(
+            target_idx(&mut app).0,
+            2,
+            "same-key projection readoption resets selection"
+        );
+        select(&mut app, AdjustSpreadTarget::Right);
+        app.open_fullscreen(2, crate::app::HistoryTrigger::UserChosen);
+        assert!(app.similar_panel.info_target.is_none());
+        assert_eq!(target_idx(&mut app).0, 2, "reopen resets selection");
+    }
+
+    #[test]
+    fn metadata_info_target_final_cover_defaults_to_navigation_and_can_select_supplement() {
+        for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
+            let mut app = spread_app(mode);
+            app.settings.final_cover_spread_enabled = true;
+            app.final_cover_spread_preference = crate::settings::FinalCoverSpreadPreference::On;
+            app.fullscreen_idx = Some(3);
+            let (idx, pages) = target_idx(&mut app);
+            assert_eq!(idx, 3);
+            let pages = pages.expect("final cover spread");
+            select(
+                &mut app,
+                if pages.pair.0 == 0 {
+                    AdjustSpreadTarget::Left
+                } else {
+                    AdjustSpreadTarget::Right
+                },
+            );
+            assert_eq!(target_idx(&mut app).0, 0);
+            assert_eq!(app.fullscreen_idx, Some(3));
+            // No Info pass runs between the two accepted setting changes.
+            let ctx = egui::Context::default();
+            app.final_cover_spread_preference = crate::settings::FinalCoverSpreadPreference::Off;
+            app.invalidate_final_cover_spread_display(&ctx);
+            app.final_cover_spread_preference = crate::settings::FinalCoverSpreadPreference::On;
+            app.invalidate_final_cover_spread_display(&ctx);
+            assert_eq!(
+                target_idx(&mut app).0,
+                3,
+                "hidden supplement round trip resets"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_info_target_hidden_continuous_navigation_round_trip_resets_selection() {
+        use crate::app::HistoryTrigger;
+        use crate::fs_page_load_scheduler::FsPageLoadContract;
+        use crate::page_split::PageSlice;
+        use crate::settings::ReadingFlow;
+
+        for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+            for flow in [ReadingFlow::Vertical, ReadingFlow::Horizontal] {
+                for seek in [true, false] {
+                    for tab in [MetadataPanelTab::Info, MetadataPanelTab::Similar] {
+                        let mut app = spread_app(mode);
+                        let ctx = egui::Context::default();
+                        app.reading_flow = flow;
+                        app.similar_panel.tab = tab;
+                        app.fs_info_panel.locked = false;
+                        app.adjust_spread_target = Some(AdjustSpreadTarget::Left);
+                        let edit_idx = app.current_adjust_target_idx();
+                        let generation = app.items_generation;
+                        assert_eq!(target_idx(&mut app).0, 0);
+                        select(
+                            &mut app,
+                            if mode.is_rtl() {
+                                AdjustSpreadTarget::Left
+                            } else {
+                                AdjustSpreadTarget::Right
+                            },
+                        );
+                        assert_eq!(target_idx(&mut app).0, 1);
+
+                        // No Info draw or target reconciliation occurs between accepted moves.
+                        for (position, index) in [(1, 2), (0, 0)] {
+                            if seek {
+                                app.seek_to_continuous_page_with_contract(
+                                    &ctx,
+                                    index,
+                                    FsPageLoadContract::Sequential,
+                                );
+                            } else {
+                                app.reanchor_continuous_reading_viewer(
+                                    &ctx,
+                                    &[0.0, 100.0],
+                                    position,
+                                    index,
+                                    PageSlice::Full,
+                                    HistoryTrigger::AutoAdvance,
+                                );
+                            }
+                            assert_eq!(app.fullscreen_idx, Some(index));
+                        }
+                        assert_eq!(app.items_generation, generation);
+                        assert_eq!(
+                            target_idx(&mut app).0,
+                            0,
+                            "hidden round trip {mode:?}/{flow:?}/seek={seek}/{tab:?}"
+                        );
+                        assert_eq!(app.adjust_spread_target, Some(AdjustSpreadTarget::Left));
+                        assert_eq!(app.current_adjust_target_idx(), edit_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_info_target_continuous_noop_and_invalid_keep_choice_but_slice_change_retires_it() {
+        use crate::app::HistoryTrigger;
+        use crate::fs_page_load_scheduler::FsPageLoadContract;
+        use crate::page_split::PageSlice;
+        use crate::settings::ReadingFlow;
+
+        let mut app = spread_app(SpreadMode::Ltr);
+        let ctx = egui::Context::default();
+        app.reading_flow = ReadingFlow::Vertical;
+        target_idx(&mut app);
+        select(&mut app, AdjustSpreadTarget::Right);
+        let selected = app.similar_panel.info_target.clone();
+        app.seek_to_continuous_page_with_contract(&ctx, 0, FsPageLoadContract::Sequential);
+        app.reanchor_continuous_reading_viewer(
+            &ctx,
+            &[0.0],
+            0,
+            0,
+            PageSlice::Full,
+            HistoryTrigger::AutoAdvance,
+        );
+        assert_eq!(
+            app.similar_panel.info_target, selected,
+            "same display unit keeps the choice"
+        );
+        app.seek_to_continuous_page_with_contract(&ctx, usize::MAX, FsPageLoadContract::Sequential);
+        app.reanchor_continuous_reading_viewer(
+            &ctx,
+            &[0.0],
+            0,
+            usize::MAX,
+            PageSlice::Full,
+            HistoryTrigger::AutoAdvance,
+        );
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(
+            app.similar_panel.info_target, selected,
+            "unaccepted targets keep the choice"
+        );
+        app.spread_mode = SpreadMode::SplitLtr;
+        app.fullscreen_page_slice = PageSlice::Right;
+        assert!(target_idx(&mut app).1.is_none());
+        app.reanchor_continuous_reading_viewer(
+            &ctx,
+            &[0.0],
+            0,
+            0,
+            PageSlice::Left,
+            HistoryTrigger::AutoAdvance,
+        );
+        assert!(
+            app.similar_panel.info_target.is_none(),
+            "same-index slice movement retires the previous unit choice"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn metadata_info_target_continuous_navigation_retires_only_its_context() {
+        use crate::app::HistoryTrigger;
+        use crate::fs_page_load_scheduler::FsPageLoadContract;
+        use crate::page_split::PageSlice;
+        use crate::settings::ReadingFlow;
+
+        let mut app = spread_app(SpreadMode::Ltr);
+        let ctx = egui::Context::default();
+        app.reading_flow = ReadingFlow::Horizontal;
+        target_idx(&mut app);
+        select(&mut app, AdjustSpreadTarget::Right);
+        let sibling = app.build_window_context_for_test(17129, |app| {
+            app.similar_panel.seed_info_target_for_test()
+        });
+        for seek in [true, false] {
+            target_idx(&mut app);
+            select(&mut app, AdjustSpreadTarget::Right);
+            for (position, index) in [(1, 2), (0, 0)] {
+                if seek {
+                    app.seek_to_continuous_page_with_contract(
+                        &ctx,
+                        index,
+                        FsPageLoadContract::Sequential,
+                    );
+                } else {
+                    app.reanchor_continuous_reading_viewer(
+                        &ctx,
+                        &[0.0, 100.0],
+                        position,
+                        index,
+                        PageSlice::Full,
+                        HistoryTrigger::AutoAdvance,
+                    );
+                }
+            }
+            assert_eq!(target_idx(&mut app).0, 0);
+            assert!(
+                app.with_window_context_for_test(sibling, |app| app
+                    .similar_panel
+                    .has_info_target_for_test()),
+                "navigation must retain the sibling choice"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_info_target_final_cover_setting_preserves_non_cover_modes() {
+        for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+            let mut app = spread_app(mode);
+            let ctx = egui::Context::default();
+            app.final_cover_spread_preference =
+                crate::settings::FinalCoverSpreadPreference::FollowGlobal;
+            target_idx(&mut app);
+            select(
+                &mut app,
+                if mode.is_rtl() {
+                    AdjustSpreadTarget::Left
+                } else {
+                    AdjustSpreadTarget::Right
+                },
+            );
+            let selected = app.similar_panel.info_target.clone();
+            for enabled in [true, false] {
+                app.settings.final_cover_spread_enabled = enabled;
+                app.invalidate_final_cover_spread_display(&ctx);
+                assert_eq!(app.similar_panel.info_target, selected);
+                assert_eq!(target_idx(&mut app).0, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_info_target_hidden_panel_resets_at_accepted_mode_direction_and_shift_boundaries() {
+        use crate::settings::ReadingDirection;
+        let mut app = spread_app(SpreadMode::Ltr);
+        let ctx = egui::Context::default();
+        target_idx(&mut app);
+        select(&mut app, AdjustSpreadTarget::Right);
+        assert!(app.apply_fullscreen_spread_mode(&ctx, 0, SpreadMode::Ltr));
+        assert_eq!(target_idx(&mut app).0, 1, "no-op mode preserves selection");
+        assert!(app.apply_fullscreen_spread_mode(&ctx, 0, SpreadMode::Single));
+        assert!(app.apply_fullscreen_spread_mode(&ctx, 0, SpreadMode::Ltr));
+        assert_eq!(target_idx(&mut app).0, 0, "hidden Single round trip resets");
+        select(&mut app, AdjustSpreadTarget::Right);
+        app.set_reading_direction_for_fullscreen(&ctx, 0, ReadingDirection::Rtl);
+        app.set_reading_direction_for_fullscreen(&ctx, 0, ReadingDirection::Ltr);
+        assert_eq!(
+            target_idx(&mut app).0,
+            0,
+            "hidden direction round trip resets"
+        );
+        select(&mut app, AdjustSpreadTarget::Right);
+        assert!(!app.reset_live_spread_shift(false));
+        assert_eq!(
+            target_idx(&mut app).0,
+            1,
+            "no-op shift reset preserves selection"
+        );
+        app.settings.remember_spread_shift_per_book = false;
+        assert!(app.set_live_spread_shift(1));
+        assert!(app.reset_live_spread_shift(false));
+        assert_eq!(target_idx(&mut app).0, 0, "hidden shift round trip resets");
+        select(&mut app, AdjustSpreadTarget::Right);
+        app.enter_page_edit_single_view(0);
+        app.leave_page_edit_single_view(Some(crate::app::PageEditSpreadPivot {
+            saved_mode: SpreadMode::Ltr,
+            pair: (0, 1),
+            navigation_anchor_idx: 0,
+        }));
+        assert_eq!(
+            target_idx(&mut app).0,
+            0,
+            "hidden editor pivot round trip resets"
+        );
+        select(&mut app, AdjustSpreadTarget::Right);
+        app.set_image_rotation(0, crate::rotation_db::Rotation::None)
+            .unwrap();
+        assert_eq!(
+            target_idx(&mut app).0,
+            1,
+            "cached no-op rotation preserves selection"
+        );
+        app.rotate_image_cw(0);
+        app.rotate_image_ccw(0);
+        assert_eq!(target_idx(&mut app).0, 0, "hidden R/L round trip resets");
+    }
+
+    #[test]
+    fn metadata_info_target_product_panel_click_changes_prompt_in_same_pass() {
+        let mut app = spread_app(SpreadMode::Rtl);
+        app.fs_info_panel.locked = true;
+        let mut fonts_ready = false;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1200.0, 800.0))
+            .build_ui_state(
+                move |root_ui, app| {
+                    let ctx = root_ui.ctx().clone();
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(&ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        assert!(app.draw_metadata_panel(
+                            ui,
+                            &ctx,
+                            ctx.content_rect(),
+                            true,
+                            0.0,
+                            Default::default()
+                        ));
+                    });
+                },
+                app,
+            );
+        harness.run();
+        harness.get_by_label("page-0");
+        harness.get_by_label("左ページ").click();
+        harness.run();
+        harness.get_by_label("対象: 左ページ");
+        harness.get_by_label("page-1");
+        assert_eq!(harness.state().fullscreen_idx, Some(0));
+        assert_eq!(harness.state().spread_mode, SpreadMode::Rtl);
+    }
+
+    #[test]
+    fn metadata_info_target_selector_snapshot_and_click() {
+        let mut fonts_ready = false;
+        let mut side = AdjustSpreadTarget::Right;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(340.0, 300.0))
+            .build_ui(move |root_ui| {
+                crate::os_theme::apply_resolved(
+                    root_ui.ctx(),
+                    crate::os_theme::ResolvedTheme::Dark,
+                );
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(root_ui.ctx());
+                    fonts_ready = true;
+                    root_ui.ctx().request_repaint();
+                    return;
+                }
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    apply_metadata_panel_dark_widget_style(ui);
+                    draw_metadata_panel_tabs(
+                        ui,
+                        &mut MetadataPanelTab::Info,
+                        crate::similar_index::SimilarFeatureCapability::Enabled,
+                    );
+                    ui.separator();
+                    draw_metadata_info_target_selector(ui, &mut side);
+                    ui.label(egui::RichText::new("ページ").color(LABEL_COLOR).size(11.0));
+                    crate::ui_helpers::draw_rating_stars(ui, 3);
+                    ui.separator();
+                    draw_text_section(
+                        ui,
+                        &ui.ctx().clone(),
+                        "Prompt",
+                        "A quiet forest, morning light",
+                    );
+                });
+            });
+        harness.run();
+        harness.get_by_label("対象: 右ページ");
+        harness.snapshot("metadata_info_target_selector");
+        harness.get_by_label("左ページ").click();
+        harness.run();
+        harness.get_by_label("対象: 左ページ");
+    }
 }
 
 #[cfg(test)]

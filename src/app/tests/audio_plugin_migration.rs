@@ -2,7 +2,12 @@ use super::*;
 
 fn pending(
     app: &mut App,
-) -> mpsc::Sender<Result<crate::effetune::migration::MigrationOutcome, String>> {
+) -> mpsc::Sender<
+    Result<
+        crate::effetune::migration::MigrationOutcome,
+        crate::effetune::migration::MigrationFailure,
+    >,
+> {
     let (migration, tx) = crate::effetune::startup::StartupMigration::pending_for_test();
     app.dsp_bridge = crate::video::dsp::DspBridge::new_waiting_for_migration(migration.gate());
     app.effetune = crate::effetune::EffetuneController::new_with_startup_gate(migration.gate());
@@ -77,6 +82,24 @@ fn failed_migration_notifies_once_and_allows_only_user_vst_for_this_process() {
     app.poll_audio_plugin_migration(&ctx);
     assert_eq!(app.fs_feedback_toast.as_ref().unwrap().1, recorded);
     assert!(!app.effetune_toolbar_available());
+}
+
+#[test]
+fn migration_timeout_notice_identifies_remaining_webview_processes() {
+    let mut env = setup_app_for_test();
+    let app = &mut env.app;
+    let tx = pending(app);
+    tx.send(Err(
+        crate::effetune::migration::MigrationFailure::ProcessesStillRunning(vec![55360, 73]),
+    ))
+    .unwrap();
+    app.poll_audio_plugin_migration(&egui::Context::default());
+    let notice = &app.fs_feedback_toast.as_ref().unwrap().0;
+    assert!(notice.contains("msedgewebview2.exe"), "{notice}");
+    assert!(notice.contains("55360, 73"), "{notice}");
+    assert!(notice.contains("タスク マネージャー"), "{notice}");
+    assert!(!app.audio_plugin_migration.gate().sound_allowed());
+    assert!(app.audio_plugin_migration.gate().user_vst_allowed());
 }
 
 #[test]

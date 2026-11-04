@@ -40,7 +40,49 @@ pub(crate) enum MigrationOutcome {
     AlreadyDecided,
 }
 
-pub(crate) fn migrate(request: &MigrationRequest) -> Result<MigrationOutcome, String> {
+#[derive(Debug)]
+pub(crate) enum MigrationFailure {
+    Detail(String),
+    ProcessesStillRunning(Vec<u32>),
+    QuiescenceDeadlineExceeded,
+}
+
+impl From<String> for MigrationFailure {
+    fn from(reason: String) -> Self {
+        Self::Detail(reason)
+    }
+}
+
+impl From<&str> for MigrationFailure {
+    fn from(reason: &str) -> Self {
+        Self::Detail(reason.into())
+    }
+}
+
+impl std::fmt::Display for MigrationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Detail(reason) => f.write_str(reason),
+            Self::QuiescenceDeadlineExceeded => {
+                f.write_str("WebView2 process quiescence exceeded the shared 5 second deadline")
+            }
+            Self::ProcessesStillRunning(pids) => write!(
+                f,
+                "WebView2 process quiescence exceeded the shared 5 second deadline; remaining msedgewebview2.exe PID(s): {}",
+                process_ids(pids)
+            ),
+        }
+    }
+}
+
+pub(super) fn process_ids(pids: &[u32]) -> String {
+    pids.iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub(crate) fn migrate(request: &MigrationRequest) -> Result<MigrationOutcome, MigrationFailure> {
     migrate_with_observer(request, |_| Ok(()))
 }
 
@@ -49,7 +91,7 @@ pub(crate) fn migrate(request: &MigrationRequest) -> Result<MigrationOutcome, St
 pub(crate) fn migrate_with_observer(
     request: &MigrationRequest,
     observer: impl FnMut(&str) -> Result<(), String>,
-) -> Result<MigrationOutcome, String> {
+) -> Result<MigrationOutcome, MigrationFailure> {
     #[cfg(windows)]
     {
         migrate_using(request, &mut windows::Backend::new(), observer)
@@ -68,11 +110,27 @@ enum Owner {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParentState {
+    Host,
+    Missing,
+    Reused,
+    DifferentExe,
+    Unknown,
+}
+
+impl ParentState {
+    fn is_orphan(self) -> bool {
+        matches!(self, Self::Missing | Self::Reused | Self::DifferentExe)
+    }
+}
+
 struct ProcessCandidate<H> {
     pid: u32,
     /// Unreadable includes processes already in STATUS_PROCESS_IS_TERMINATING.
     command: Option<String>,
     owner: Owner,
+    parent: ParentState,
     synchronize: Option<H>,
 }
 
@@ -84,16 +142,20 @@ trait MigrationBackend {
     fn lock(&mut self, path: &Path) -> Result<Self::Lease, String>;
     /// Return every msedgewebview2.exe, not only browser parent processes.
     fn processes(&mut self) -> Result<Vec<ProcessCandidate<Self::Process>>, String>;
-    fn wait(&mut self, handle: Self::Process, remaining: Duration) -> Result<bool, String>;
+    fn wait(&mut self, handle: &Self::Process, remaining: Duration) -> Result<bool, String>;
     fn elapsed(&self) -> Duration;
     fn matches_udf(&self, command: &str, expected: &Path) -> Result<bool, String>;
+    fn is_host_browser(&self, command: &str) -> Result<bool, String>;
+    /// Use the same process object whose command, SID and parent were read.
+    /// Never reopen its PID to obtain termination rights.
+    fn terminate(&mut self, handle: &Self::Process) -> Result<(), String>;
 }
 
 fn migrate_using<B: MigrationBackend>(
     request: &MigrationRequest,
     backend: &mut B,
     mut observer: impl FnMut(&str) -> Result<(), String>,
-) -> Result<MigrationOutcome, String> {
+) -> Result<MigrationOutcome, MigrationFailure> {
     if present(&request.destination)? {
         require_directory(&request.destination)?;
     }
@@ -180,7 +242,7 @@ fn migrate_using<B: MigrationBackend>(
     fs::create_dir_all(&request.destination)
         .map_err(|e| io_error("create migration destination", &request.destination, e))?;
     let mut owned = Vec::new();
-    let result = (|| {
+    let result: Result<MigrationOutcome, String> = (|| {
         observer("copy_begin")?;
         if !json_sources.is_empty() {
             let plugin = request.destination.join("plugin");
@@ -214,7 +276,7 @@ fn migrate_using<B: MigrationBackend>(
             }
         }
     }
-    result
+    result.map_err(MigrationFailure::from)
 }
 
 fn clear_uncommitted_copies(request: &MigrationRequest) -> Result<(), String> {
@@ -254,11 +316,11 @@ fn wait_for_source_processes<B: MigrationBackend>(
     backend: &mut B,
     udf: &Path,
     observer: &mut impl FnMut(&str) -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<(), MigrationFailure> {
     let started = backend.elapsed();
     loop {
         if backend.elapsed().saturating_sub(started) >= PROCESS_WAIT_LIMIT {
-            return Err("WebView2 process quiescence exceeded 5 seconds".into());
+            return Err(MigrationFailure::QuiescenceDeadlineExceeded);
         }
         let mut waiting = Vec::new();
         for candidate in backend.processes()? {
@@ -285,6 +347,26 @@ fn wait_for_source_processes<B: MigrationBackend>(
                 ));
             }
             if wait {
+                if readable_match == Some(true)
+                    && candidate.owner == Owner::SameUser
+                    && candidate.parent.is_orphan()
+                    && candidate
+                        .command
+                        .as_deref()
+                        .is_some_and(|command| backend.is_host_browser(command).unwrap_or(false))
+                    && let Some(handle) = &candidate.synchronize
+                {
+                    match backend.terminate(handle) {
+                        Ok(()) => crate::logger::log(format!(
+                            "[EffeTune migration] terminated orphan msedgewebview2.exe PID {} (parent={:?})",
+                            candidate.pid, candidate.parent
+                        )),
+                        Err(reason) => crate::logger::log(format!(
+                            "[EffeTune migration] orphan msedgewebview2.exe PID {} termination unavailable; waiting: {reason}",
+                            candidate.pid
+                        )),
+                    }
+                }
                 crate::logger::log(format!(
                     "[EffeTune migration] waiting for WebView2 PID {} (command readable={}, owner={:?})",
                     candidate.pid,
@@ -303,25 +385,42 @@ fn wait_for_source_processes<B: MigrationBackend>(
             }
         }
         if backend.elapsed().saturating_sub(started) >= PROCESS_WAIT_LIMIT {
-            return Err("WebView2 process quiescence exceeded 5 seconds".into());
+            return Err(process_timeout(backend, &waiting));
         }
         if waiting.is_empty() {
             return Ok(());
         }
-        for (pid, handle) in waiting {
+        for (pid, handle) in &waiting {
             let remaining =
                 PROCESS_WAIT_LIMIT.saturating_sub(backend.elapsed().saturating_sub(started));
             observer(&format!("process_wait_pid_begin:{pid}"))?;
             if remaining.is_zero() || !backend.wait(handle, remaining)? {
-                return Err(format!(
-                    "WebView2 PID {pid} did not exit within the shared 5 second deadline"
-                ));
+                return Err(process_timeout(backend, &waiting));
             }
             observer(&format!("process_wait_pid_end:{pid}"))?;
             crate::logger::log(format!("[EffeTune migration] WebView2 PID {pid} exited"));
         }
         // Re-enumerate after exit: failed startup attempts can still be exiting.
         // The held lock prevents any new successful source-profile browser.
+    }
+}
+
+fn process_timeout<B: MigrationBackend>(
+    backend: &mut B,
+    waiting: &[(u32, B::Process)],
+) -> MigrationFailure {
+    // Later members of the batch may have exited during an earlier wait.
+    // Keep all objects alive through this final nonblocking observation.
+    let pids: Vec<_> = waiting
+        .iter()
+        .filter_map(|(pid, handle)| {
+            (!matches!(backend.wait(handle, Duration::ZERO), Ok(true))).then_some(*pid)
+        })
+        .collect();
+    if pids.is_empty() {
+        MigrationFailure::QuiescenceDeadlineExceeded
+    } else {
+        MigrationFailure::ProcessesStillRunning(pids)
     }
 }
 

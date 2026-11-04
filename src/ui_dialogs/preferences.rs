@@ -2984,6 +2984,7 @@ impl App {
                             && self.page_alone_preferences.last
                                 == crate::settings::PageAlonePreference::FollowGlobal)
                 {
+                    self.similar_panel.reset_info_target();
                     self.invalidate_singleton_spread_placement_display(ctx);
                 }
             }

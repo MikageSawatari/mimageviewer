@@ -5226,6 +5226,9 @@ impl App {
             {
                 continue;
             }
+            if bundle.spread_mode.has_cover() {
+                bundle.similar_panel.reset_info_target();
+            }
             bundle.similar_panel.preview.invalidate();
             bundle
                 .fs_lanczos_cache
@@ -5307,6 +5310,7 @@ impl App {
             {
                 continue;
             }
+            bundle.similar_panel.reset_info_target();
             bundle.similar_panel.preview.invalidate();
             bundle
                 .fs_lanczos_cache
@@ -8957,6 +8961,7 @@ mod tests {
                 after_cover: P::FollowGlobal,
                 last: P::Off,
             };
+            owner.similar_panel.seed_info_target_for_test();
             owner.fs_vertical_scroll = 111.0;
         });
         let explicit_after = app.build_window_context_for_test(732, |owner| {
@@ -8965,11 +8970,13 @@ mod tests {
                 after_cover: P::On,
                 last: P::FollowGlobal,
             };
+            owner.similar_panel.seed_info_target_for_test();
             owner.fs_vertical_scroll = 222.0;
         });
         let cover_off = app.build_window_context_for_test(733, |owner| {
             owner.spread_mode = crate::settings::SpreadMode::Ltr;
             owner.page_alone_preferences = PageAlonePreferences::default();
+            owner.similar_panel.seed_info_target_for_test();
             owner.fs_vertical_scroll = 333.0;
         });
         app.invalidate_page_alone_in_parked_contexts(true, false);
@@ -8995,16 +9002,22 @@ mod tests {
             app.with_viewer_context(id, |owner| {
                 assert_eq!(owner.page_alone_preferences, preference);
                 assert_eq!(owner.fs_vertical_scroll, scroll);
+                assert_eq!(
+                    owner.similar_panel.has_info_target_for_test(),
+                    scroll != 0.0
+                );
             })
             .unwrap();
         }
         app.invalidate_page_alone_in_parked_contexts(false, true);
         app.with_viewer_context(explicit_after, |owner| {
             assert_eq!(owner.fs_vertical_scroll, 0.0);
+            assert!(!owner.similar_panel.has_info_target_for_test());
         })
         .unwrap();
         app.with_viewer_context(cover_off, |owner| {
             assert_eq!(owner.fs_vertical_scroll, 333.0);
+            assert!(owner.similar_panel.has_info_target_for_test());
         })
         .unwrap();
     }
@@ -9074,36 +9087,63 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn global_final_cover_change_invalidates_only_parked_follow_global_geometry() {
-        use crate::settings::FinalCoverSpreadPreference;
+        use crate::settings::{FinalCoverSpreadPreference, SpreadMode};
 
         let mut app = crate::app::setup_app_for_test();
-        let inherited = app.build_window_context_for_test(717, |app| {
-            app.final_cover_spread_preference = FinalCoverSpreadPreference::FollowGlobal;
-            app.fs_vertical_scroll = 123.0;
-            app.fullscreen_page_layout
-                .begin(crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous);
-        });
-        let explicit = app.build_window_context_for_test(718, |app| {
-            app.final_cover_spread_preference = FinalCoverSpreadPreference::On;
-            app.fs_vertical_scroll = 456.0;
-            app.fullscreen_page_layout
-                .begin(crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous);
-        });
+        app.similar_panel.seed_info_target_for_test();
+        let mut contexts = Vec::new();
+        for mode in [
+            SpreadMode::Ltr,
+            SpreadMode::Rtl,
+            SpreadMode::LtrCover,
+            SpreadMode::RtlCover,
+        ] {
+            for preference in [
+                FinalCoverSpreadPreference::FollowGlobal,
+                FinalCoverSpreadPreference::On,
+                FinalCoverSpreadPreference::Off,
+            ] {
+                let id = app.build_window_context_for_test(17120 + contexts.len() as u64, |app| {
+                    app.spread_mode = mode;
+                    app.final_cover_spread_preference = preference;
+                    app.similar_panel.seed_info_target_for_test();
+                    app.fs_vertical_scroll = 123.0;
+                    app.fullscreen_page_layout.begin(
+                        crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous,
+                    );
+                });
+                contexts.push((id, mode, preference));
+            }
+        }
 
         app.invalidate_final_cover_spread_display_in_parked_contexts();
 
-        let inherited = app.viewer_contexts.table.at_rest(inherited).unwrap();
-        assert_eq!(inherited.fs_vertical_scroll, 0.0);
-        assert_eq!(
-            inherited.fullscreen_page_layout.kind(),
-            crate::displayed_image_transform::FullscreenPageLayoutKind::Empty
+        assert!(
+            app.similar_panel.has_info_target_for_test(),
+            "parked updates leave the active owner unchanged"
         );
-        let explicit = app.viewer_contexts.table.at_rest(explicit).unwrap();
-        assert_eq!(explicit.fs_vertical_scroll, 456.0);
-        assert_eq!(
-            explicit.fullscreen_page_layout.kind(),
-            crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous
-        );
+        for (id, mode, preference) in contexts {
+            let bundle = app.viewer_contexts.table.at_rest(id).unwrap();
+            let inherited = preference == FinalCoverSpreadPreference::FollowGlobal;
+            assert_eq!(
+                bundle.similar_panel.has_info_target_for_test(),
+                !(inherited && mode.has_cover()),
+                "info choice {mode:?}/{preference:?}"
+            );
+            // Preserve the existing geometry invalidation independently of the Info choice.
+            assert_eq!(
+                bundle.fs_vertical_scroll,
+                if inherited { 0.0 } else { 123.0 }
+            );
+            assert_eq!(
+                bundle.fullscreen_page_layout.kind(),
+                if inherited {
+                    crate::displayed_image_transform::FullscreenPageLayoutKind::Empty
+                } else {
+                    crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous
+                }
+            );
+        }
     }
 
     #[cfg(windows)]

@@ -198,10 +198,10 @@ impl App {
         self.show_feedback_toast(format!("[画像色 {}]", crate::color_search::hex_rgb(rgb)));
     }
 
-    pub(crate) fn current_fullscreen_color_palette(
+    pub(crate) fn fullscreen_color_palette_for_idx(
         &mut self,
+        idx: usize,
     ) -> Option<crate::color_search::Palette> {
-        let idx = self.fullscreen_idx?;
         let (key, mtime, file_size) = self.color_identity_for_idx(idx)?;
         if let Some(entry) = self
             .color_filter

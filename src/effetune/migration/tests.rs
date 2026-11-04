@@ -1,6 +1,6 @@
 use super::*;
 use std::cell::Cell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 
 struct Fixture {
@@ -43,7 +43,7 @@ impl Fixture {
     }
 
     fn run(&self, backend: &mut FakeBackend) -> Result<MigrationOutcome, String> {
-        migrate_using(&self.request, backend, |_| Ok(()))
+        migrate_using(&self.request, backend, |_| Ok(())).map_err(|error| error.to_string())
     }
 
     fn no_decision(&self) {
@@ -94,11 +94,15 @@ struct FakeBackend {
     inventories: VecDeque<Vec<ProcessCandidate<u32>>>,
     waits: VecDeque<(Duration, bool)>,
     waited: Vec<u32>,
+    terminated: Vec<u32>,
+    actions: Vec<String>,
+    exited: BTreeSet<u32>,
     lock_calls: usize,
     diagnostic_calls: usize,
     lock_error: bool,
     inventory_error: bool,
     wait_error: bool,
+    terminate_error: bool,
 }
 
 struct FakeLease(Rc<Cell<bool>>);
@@ -129,6 +133,7 @@ impl MigrationBackend for FakeBackend {
 
     fn processes(&mut self) -> Result<Vec<ProcessCandidate<u32>>, String> {
         assert!(self.held.get());
+        self.actions.push("enumerate".into());
         if self.inventory_error {
             Err("inventory failed".into())
         } else {
@@ -136,9 +141,13 @@ impl MigrationBackend for FakeBackend {
         }
     }
 
-    fn wait(&mut self, handle: u32, remaining: Duration) -> Result<bool, String> {
+    fn wait(&mut self, handle: &u32, remaining: Duration) -> Result<bool, String> {
         assert!(self.held.get());
-        self.waited.push(handle);
+        if remaining.is_zero() {
+            return Ok(self.exited.contains(handle));
+        }
+        self.waited.push(*handle);
+        self.actions.push(format!("wait:{handle}"));
         if self.wait_error {
             return Err("wait handle failed".into());
         }
@@ -147,7 +156,11 @@ impl MigrationBackend for FakeBackend {
             .pop_front()
             .unwrap_or((Duration::from_millis(20), true));
         self.time += elapsed.min(remaining);
-        Ok(elapsed <= remaining && exited)
+        let exited = elapsed <= remaining && exited;
+        if exited {
+            self.exited.insert(*handle);
+        }
+        Ok(exited)
     }
 
     fn elapsed(&self) -> Duration {
@@ -156,9 +169,24 @@ impl MigrationBackend for FakeBackend {
 
     fn matches_udf(&self, command: &str, _: &Path) -> Result<bool, String> {
         match command {
-            "source" => Ok(true),
+            "source" | "source browser" | "source renderer" | "source wrong-host" => Ok(true),
             "other" => Ok(false),
             _ => Err("unreadable arguments".into()),
+        }
+    }
+
+    fn is_host_browser(&self, command: &str) -> Result<bool, String> {
+        Ok(command == "source browser")
+    }
+
+    fn terminate(&mut self, handle: &u32) -> Result<(), String> {
+        assert!(self.held.get());
+        self.terminated.push(*handle);
+        self.actions.push(format!("terminate:{handle}"));
+        if self.terminate_error {
+            Err("termination access denied".into())
+        } else {
+            Ok(())
         }
     }
 }
@@ -168,6 +196,7 @@ fn candidate(pid: u32, command: Option<&str>, owner: Owner, handle: bool) -> Pro
         pid,
         command: command.map(str::to_owned),
         owner,
+        parent: ParentState::Unknown,
         synchronize: handle.then_some(pid),
     }
 }
@@ -782,6 +811,219 @@ fn migration_reenumerates_after_terminating_children_exit_before_copy() {
 }
 
 #[test]
+fn migration_terminates_only_confirmed_same_user_source_orphan_browsers() {
+    for (command, owner, parent, terminate) in [
+        (
+            Some("source browser"),
+            Owner::SameUser,
+            ParentState::Missing,
+            true,
+        ),
+        (
+            Some("source browser"),
+            Owner::SameUser,
+            ParentState::Reused,
+            true,
+        ),
+        (
+            Some("source browser"),
+            Owner::SameUser,
+            ParentState::DifferentExe,
+            true,
+        ),
+        (
+            Some("source browser"),
+            Owner::SameUser,
+            ParentState::Host,
+            false,
+        ),
+        (
+            Some("source browser"),
+            Owner::SameUser,
+            ParentState::Unknown,
+            false,
+        ),
+        (
+            Some("source renderer"),
+            Owner::SameUser,
+            ParentState::Missing,
+            false,
+        ),
+        (
+            Some("source wrong-host"),
+            Owner::SameUser,
+            ParentState::Missing,
+            false,
+        ),
+        (
+            Some("source browser"),
+            Owner::OtherUser,
+            ParentState::Missing,
+            false,
+        ),
+        (
+            Some("source browser"),
+            Owner::Unknown,
+            ParentState::Missing,
+            false,
+        ),
+        (Some("other"), Owner::SameUser, ParentState::Missing, false),
+        (None, Owner::SameUser, ParentState::Missing, false),
+        (
+            Some("malformed"),
+            Owner::SameUser,
+            ParentState::Missing,
+            false,
+        ),
+    ] {
+        let f = Fixture::new();
+        f.webview();
+        let mut process = candidate(55360, command, owner, true);
+        process.parent = parent;
+        // An opaque handle identity deliberately differs from the discovered
+        // PID: neither termination nor waiting may reopen the PID.
+        process.synchronize = Some(9001);
+        let mut backend = FakeBackend {
+            inventories: [vec![process], vec![]].into(),
+            ..Default::default()
+        };
+        assert_eq!(f.run(&mut backend).unwrap(), MigrationOutcome::Done);
+        assert_eq!(
+            !backend.terminated.is_empty(),
+            terminate,
+            "{command:?} {owner:?} {parent:?}"
+        );
+        if terminate {
+            assert_eq!(backend.terminated, [9001]);
+            assert_eq!(
+                backend.actions,
+                ["enumerate", "terminate:9001", "wait:9001", "enumerate"]
+            );
+        }
+    }
+}
+
+#[test]
+fn migration_failed_or_incomplete_orphan_termination_still_waits_and_reports_remaining_pids() {
+    for terminate_error in [false, true] {
+        let f = Fixture::new();
+        f.webview();
+        let mut process = candidate(55360, Some("source browser"), Owner::SameUser, true);
+        process.parent = ParentState::Missing;
+        let mut backend = FakeBackend {
+            inventories: [vec![
+                candidate(1, Some("source"), Owner::SameUser, true),
+                process,
+                candidate(73, None, Owner::Unknown, true),
+            ]]
+            .into(),
+            waits: [
+                (Duration::from_millis(20), true),
+                (Duration::from_secs(5), false),
+            ]
+            .into(),
+            terminate_error,
+            ..Default::default()
+        };
+        let error = migrate_using(&f.request, &mut backend, |_| Ok(())).unwrap_err();
+        assert!(
+            matches!(&error, MigrationFailure::ProcessesStillRunning(pids) if pids == &[55360, 73])
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("msedgewebview2.exe PID(s): 55360, 73")
+        );
+        assert_eq!(backend.terminated, [55360]);
+        assert_eq!(backend.waited, [1, 55360]);
+        assert_eq!(backend.time, PROCESS_WAIT_LIMIT);
+        f.no_partial_copy();
+    }
+}
+
+#[test]
+fn migration_timeout_rechecks_later_handles_and_never_reports_an_empty_pid_list() {
+    for all_exited in [false, true] {
+        let f = Fixture::new();
+        f.webview();
+        let mut backend = FakeBackend {
+            inventories: [vec![
+                candidate(55360, Some("source"), Owner::SameUser, true),
+                candidate(73, None, Owner::Unknown, true),
+            ]]
+            .into(),
+            waits: [(Duration::from_secs(5), all_exited)].into(),
+            // The later process exits while the first one consumes the budget.
+            exited: [73].into(),
+            ..Default::default()
+        };
+        let error = migrate_using(&f.request, &mut backend, |_| Ok(())).unwrap_err();
+        if all_exited {
+            assert!(matches!(
+                error,
+                MigrationFailure::QuiescenceDeadlineExceeded
+            ));
+            assert_eq!(
+                super::super::startup::failure_notice(&error),
+                super::super::startup::FAILURE_NOTICE
+            );
+        } else {
+            assert!(
+                matches!(error, MigrationFailure::ProcessesStillRunning(ref pids) if pids == &[55360])
+            );
+        }
+        f.no_partial_copy();
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn migration_windows_only_exact_browser_host_switch_without_any_type_can_be_recovered() {
+    for (arguments, expected) in [
+        ("--webview-exe-name=mimageviewer-vst3-host.exe", true),
+        ("--WEBVIEW-EXE-NAME=MIMAGEVIEWER-VST3-HOST.EXE", true),
+        (
+            "--webview-exe-name=mimageviewer-vst3-host.exe --type=renderer",
+            false,
+        ),
+        (
+            "--webview-exe-name=mimageviewer-vst3-host.exe --type=crashpad-handler",
+            false,
+        ),
+        (
+            "--webview-exe-name=mimageviewer-vst3-host.exe --type renderer",
+            false,
+        ),
+        (
+            "--webview-exe-name=mimageviewer-vst3-host.exe --type=",
+            false,
+        ),
+        ("--webview-exe-name=other.exe", false),
+        ("--webview-exe-name=mimageviewer-vst3-host.exe-other", false),
+        (
+            "--webview-exe-name=mimageviewer-vst3-host.exe --webview-exe-name=other.exe",
+            false,
+        ),
+        (
+            "--webview-exe-name=mimageviewer-vst3-host.exe --webview-exe-name=mimageviewer-vst3-host.exe",
+            false,
+        ),
+        ("--webview-exe-name mimageviewer-vst3-host.exe", false),
+        (
+            "--unrelated=--webview-exe-name=mimageviewer-vst3-host.exe",
+            false,
+        ),
+        ("", false),
+    ] {
+        assert_eq!(
+            windows::is_host_browser(&format!("msedgewebview2.exe {arguments}")).unwrap(),
+            expected,
+            "{arguments}"
+        );
+    }
+}
+
+#[test]
 fn migration_rejects_overlapping_source_and_destination_without_copying() {
     let mut f = Fixture::new();
     f.webview();
@@ -819,7 +1061,12 @@ fn migration_probe_checkpoint_failure_cleans_copies_without_publishing_a_decisio
                 Ok(())
             }
         });
-        assert!(outcome.unwrap_err().contains("probe checkpoint failed"));
+        assert!(
+            outcome
+                .unwrap_err()
+                .to_string()
+                .contains("probe checkpoint failed")
+        );
         f.no_partial_copy();
         assert!(!backend.held.get());
     }
@@ -879,7 +1126,12 @@ fn migration_mark_publication_failure_cleans_both_copies_and_preserves_other_dat
         }
         Ok(())
     });
-    assert!(result.unwrap_err().contains("publish migration decision"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("publish migration decision")
+    );
     assert!(!f.request.destination.join("plugin").exists());
     assert!(!f.request.destination.join("webview").exists());
     assert_eq!(
@@ -944,6 +1196,7 @@ fn migration_windows_active_external_lock_fails_without_mark_or_copies() {
     assert!(
         migrate(&f.request)
             .unwrap_err()
+            .to_string()
             .contains("exclusive WebView2 lock")
     );
     f.no_partial_copy();

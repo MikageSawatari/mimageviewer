@@ -345,10 +345,35 @@ fn metadata_ready(app: &mut App) -> mpsc::Sender<MetadataLoadResult> {
     })
     .unwrap();
     app.metadata_pending = Some(MetadataLoadPending {
+        key: "connection-metadata".into(),
         cancel: Arc::new(AtomicBool::new(false)),
         rx,
     });
     tx
+}
+
+#[test]
+fn metadata_info_target_dedup_only_applies_to_panel_ensure_not_explicit_open() {
+    let mut app = setup_app_for_test();
+    app.items = vec![GridItem::Image(app.tmp.path().join("metadata-info.png"))];
+    let key = app.metadata_cache_key(0).unwrap();
+    let (_tx, rx) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    app.metadata_pending = Some(MetadataLoadPending {
+        key,
+        cancel: Arc::clone(&cancel),
+        rx,
+    });
+    app.ensure_metadata_load(0);
+    assert!(
+        !cancel.load(Ordering::Relaxed),
+        "panel demand reuses the existing request"
+    );
+    app.start_metadata_load(0);
+    assert!(
+        cancel.load(Ordering::Relaxed),
+        "explicit reopen restarts the existing request"
+    );
 }
 
 fn update_ready(app: &mut App) -> mpsc::Sender<Result<crate::update_check::UpdateInfo, String>> {
