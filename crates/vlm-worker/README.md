@@ -100,7 +100,11 @@ IHDR の寸法をデコード前に検査し、検査した同一の byte buffer
 `--selftest` は従来と同じ mtmd helper/STB で PNG を RGB へデコードしてから、`--serve` と共通の `caption_rgb` で推論する。
 
 固定条件は greedy、context 8192、生成上限 800、batch 2048、ubatch 512、flash attention AUTO、CPU threads 24（C9 と同じ）。
-greedy 最大候補を先に文法で検査し、不許可のときだけ全語彙を mask する。常に全語彙を mask する場合と選択結果は同じ。
+文字列の値だけに DRY (0.8、底1.75、許容長2、直近256トークン) を適用してから greedy 最大候補を文法で検査し、
+不許可のときだけ全語彙を mask する。常に全語彙を mask する場合と選択結果は同じ。
+各値の引用符を含まないトークンだけを履歴へ入れ、欄・配列要素・画像の境界でリセットする。
+JSON の構造・キー・EOG は罰さず、改行は履歴に含める。決定性と800トークンの上限を維持する。
+方式の理由・限界・基準 exe との比較手順は [計画 §18.9](../../docs/local-vlm-caption-plan.md#worker-repeat-suppression) を参照。
 `prompt.h` のプロンプトは `run_eval.py` の v0-3、会話は Qwen3.5 の user 1件・tools/system なし・`enable_thinking=false` 専用。
 任意モデルの chat template には対応しない。
 

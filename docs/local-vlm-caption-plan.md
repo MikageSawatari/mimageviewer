@@ -853,6 +853,125 @@ TensorRT は `bench_ai` が `target\release\mimageviewer.exe` をワーカーと
 - V0 の後片付け: `G:\home\vlm-eval\inputs\` (利用者の画像の縮小コピー) を消す。比較ページと結果 (説明文を含む) を残すかは利用者に確認する。
 - 独立レビュー (Sol / xhigh) は 1 回目を受けた (§19)。
 
+<a id="worker-repeat-suppression"></a>
+
+### 18.9 worker の生成中の反復抑制 (2026-11-05、§1.716 の前段)
+
+利用者が手書きの新聞写真 3 枚の一括作成で、画像内の文字に単語・行・2 行交互の反復が上限まで続くのを観測した。
+内容はここへ転載しない。ソースでは `caption_rgb` の生成が文法付き greedy だけで、反復履歴・罰が無いことを確認した。
+800 トークンの制限と文字数文法は出力を有界にするが、同じ続きを選び続ける経路を抑制しない。
+時間の悪化はこの観測だけでは未計測。利用者は v5 へ生成中の抑制を採用し、書き写しの多少の変化を許容した。
+Rust 側で保存前に連続 3 回以上の反復を切る処理は別担当・別作業ツリーの §1.716。この変更には含めない。
+
+**採用: llama.cpp b12032 の DRY + 文字列値ごとの履歴**
+
+- 固定値は `multiplier=0.8`, `base=1.75`, `allowed_length=2`, `penalty_last_n=256`。
+  同じ並びの続きを繰り返す候補の logit から `0.8 × 1.75^(一致長 - 2)` を引く (b12032 の実装と同じ)。
+  一般的な文字の再登場だけを一律に罰する repetition penalty より、連続した同じ続きの抑制に絞れる。
+  途中で生成を打ち切る方式は未完成の JSON を作るため採らず、800 トークン・EOG・文法・出力検証を従来どおり残す。
+- `ValueRepetition` は **各画像の `caption_rgb` 内**で作成・破棄し、prompt は履歴に入れない。
+  固定 schema の字句状態 (構造 / キー / 文字列値、エスケープ、平坦な検索語配列) だけを追う。JSON の妥当性の正本は既存 GBNF。
+  値の途中で始まり、引用符を一切含まないトークンだけを DRY に accept する。
+  それ以外のトークンでは履歴を reset。引用符入りの混合トークンでは、その中の値の一部分を拾い直さない。
+  そのため閉じ引用符・引用符と区切りが結合したトークンは履歴に入らず、罰が掛からない。
+  構造とキーの途中では DRY 自体を apply せず、EOG も accept しない。
+  値の中の `,` / `:` / 括弧は本文として扱い、構造を閉じる候補との混同を避ける。
+- raw sequence breaker は **0 個**。改行・`\n` で履歴を切ると交互の行のループを見逃すため、改行は通常の値トークンとして履歴へ入れる。
+  欄・検索語の各要素・画像をまたいだ罰は掛けない。エスケープされた引用符入りトークンも保守的に履歴を切る。
+  これは字句状態を増やして部分トークンの履歴を再構成するより単純で、JSON 構造の保護を優先する選択。
+- 値の中では、候補全体へ DRY を **1 回だけ** apply してから最大値を探す。
+  その最大値の文法検査が通れば既存の高速経路、不許可なら同じ罰適用済み候補へ全文法 mask → greedy。
+  fallback で再び DRY を掛けない。罰は grammar/greedy の chain に入れず、accept は値の字句状態側で所有する。
+  乱数・temperature・新しい終了条件は追加せず、同点は既存同様に token ID 順で選ぶ。
+- 履歴の保持は最大 256 トークン。各値内で全語彙への罰の適用・候補作成が増える。
+  すべての反復の消滅や OCR の正確性を保証する方式ではない (長周期、引用符入りトークン、別の続きへ移った後の反復等は残り得る)。
+  値をまたぐ重複検索語は既存の Rust 保存前の重複除去が担当する。プロンプト・protocol/prompt_version は変更しない。
+- 非同期の待ち・再開・rollback・追加のジョブ状態は不要。既存の直列推論と画像単位の寿命へ収める。
+  まれな失敗は既定どおりエラー・通知で割り切り、再試行や回復状態を足さない。
+
+**比較の入口 (製品本体は起動しない)**
+
+`run-bench-ai.ps1` は AI 補正の DirectML 用なので、この比較には使わない。
+既存の worker の `--serve` / `caption_rgb` / 出力検証と同じ経路を使う
+`scripts/vlm-eval/compare_worker_repeat.py` を用意した (Pillow が必要)。
+画像を元の場所で読み、EXIF 方向を適用し、白背景・RGB8・長辺 1024 以下 (拡大なし、Pillow Lanczos) へ変換する。
+両 exe に同じ順・同じ CPU threads=24・同じ配布モデル (imatrix あり) を使い、RGB と寸法の hash の一致も検査する。
+worker は基準 → 新版の順に各 1 プロセス、画像も 1 枚ずつ。Pillow の縮小は製品の fast_resize と画素単位の同一性を保証しないが、
+両 worker の比較入力は同一。通常 profile・画像コピー・HTTP server は使わない。
+各 JSONL は worker の生の結果 (Rust の保存前加工なし)、source identity、入力 RGB hash、モデル読込時間、device を保持する。
+stdout と summary は成否・JSON/上限の検証・トークン数・時間・連続 3 回以上の反復の最大範囲長だけで本文を出さない。
+反復検出は caption / text / 検索語の各要素を独立に調べる文字列の機械的な診断で、画像との正誤照合や品質評価ではない。
+検索語の要素をまたぐ重複はこの指標へ含めない (既存の保存前の重複除去の対象)。
+
+ビルド前の基準 exe は `target/vlm-worker-baseline/mimageviewer-vlm.exe` へ実ファイルで退避した。
+SHA-256 は `15921e46f0e5a1f8b06a059852b437fa44730962a01303df098454ba23078798`、
+source identity は `79c6482ae05f4aee923ff0b207af1386462658546a431f6e2bc1685331641fd9`。
+backup (`C:\home\mimageviewer_vendor_backup`) は更新しない。採用後に設計担当が扱う。
+
+GPU が空いた後、リポジトリルートの PowerShell から全体比較を実行する (今回この全体比較は走らせない):
+
+```powershell
+$run = 'G:\home\vlm-eval\runs\20261105-repeat\full-01' # 再実行は未使用の名前へ
+python scripts/vlm-eval/compare_worker_repeat.py `
+  --baseline target/vlm-worker-baseline/mimageviewer-vlm.exe `
+  --candidate vendor/vlm-worker/mimageviewer-vlm.exe `
+  --model-dir 'G:\home\vlm-eval\models\miv-qwen3.5-4b' `
+  --inputs-dir 'G:\home\vlm-eval\inputs\768' --out-dir $run
+```
+
+軽い確認は同じ引数の `--inputs-dir` 以降を以下へ替える (新聞 3 枚 + 評価セットの先頭 2 枚):
+
+```powershell
+  --image 'D:\home\photo\2025PEN\P5053038.JPG' `
+  --image 'D:\home\photo\2025PEN\P5053039.JPG' `
+  --image 'D:\home\photo\2025PEN\P5053040.JPG' `
+  --inputs-dir 'G:\home\vlm-eval\inputs\768' --limit 2 `
+  --out-dir 'G:\home\vlm-eval\runs\20261105-repeat\light-01'
+```
+
+外部 runs に書き込めない sandbox では `--out-dir <path>` を `--summary-only` に替える。
+この場合、本文はメモリだけで扱い、JSONL・stderr log は保存しない。リポジトリ内への JSONL 出力は道具側でも拒否する。
+既存出力を上書きしない。worker 全件成功は exit 0、画像単位の検証不合格を含む完走は exit 2、準備・通信・致命的失敗は非ゼロ。
+
+**実装・検証記録 (2026-11-05、基準 HEAD `8f40d5e77` の未コミット差分)**
+
+- `build-vlm-worker.ps1 -Rebuild` 成功。MSBuild node reuse 無効、Vulkan SDK `1.4.363.0`、Release。
+  初回は PowerShell 5.1 の `*>` リダイレクトで CMake の stderr が `NativeCommandError` になり configure が中断した。
+  script をリダイレクトせず呼び直して完走した。製品のコンパイル失敗ではない。
+- 先に greedy の焦点 CTest **1/1 成功**、その後 README の 6 target を build して CTest **6/6 成功** (exit 0、1.70 秒)。
+  単一トークン・交互の行・エスケープされた引用符・混合境界 token・キー保護・欄/配列要素/画像の履歴分離・生成 JSON の契約検証・
+  DRY 適用済み argmax の高速/fallback 両経路の同値性を非モデルテストで検証した。
+  ログは `target/vlm-repeat-ctest-build.log` / `target/vlm-repeat-ctest.log`。
+- `vlm-worker-identity.ps1 -ValidateRepo .` 成功。
+  新 exe は **48,108,544 bytes**、SHA-256 `95fe0ba151f46094365cdb0a23ecaac97b9d73e558ee6059f233ace80467cfc7`、
+  source identity `9159b4a136c36f98cce52eacfb6d6fbbcfd09a49b548fc8837ae68ddb45fae26`。
+- 独立レビュー `gpt-6.1-sol / xhigh`: 本体に P1/P2 なし。診断の外側反復の過小計測を修正し、検索語の各要素を診断へ含める P3 も修正・再確認済み。
+  未解決指摘なし。レビュー担当はビルドや GPU 比較を重複実行していない。
+- 比較ツールは help、反復の合成 7 ケース、検索語の独立診断 2 ケース、白背景/拡大なし/縮小/EXIF 方向と pipe の読取/途中 EOF を
+  メモリ上の合成データで確認した。Pillow 11.0.0 はこの機械の user site にあるため、実行コマンドは `python` (`-I` なし) を使う。
+
+軽い比較は上の 5 枚・配布モデル・長辺1024・CPU threads24、基準 → 新版、各画像1回ずつで exit 0。
+両実行の寸法込み RGB hash は **5/5 完全一致**。観測者は実装担当 (worker の応答と機械的な集計)。
+内容の正誤・品質は評価していない。
+
+| 入力 (本文は記録しない) | 連続3回以上の反復の最大範囲長 基準 → 新 | 生成トークン 基準 → 新 | `wall_s` 基準 → 新 | JSON / 全validation (両版) |
+| --- | --- | --- | --- | --- |
+| 新聞 `P5053038.JPG` | 350 → 0 | 449 → 502 | 39.267 → 32.525 秒 | 成功 |
+| 新聞 `P5053039.JPG` | 0 → 0 | 197 → 197 | 2.395 → 3.002 秒 | 成功 |
+| 新聞 `P5053040.JPG` | 376 → 0 | 533 → 225 | 4.975 → 3.126 秒 | 成功 |
+| 評価セット768の先頭1枚 | 0 → 0 | 137 → 137 | 2.135 → 2.036 秒 | 成功 |
+| 評価セット768の先頭2枚目 | 0 → 0 | 135 → 135 | 1.739 → 2.096 秒 | 成功 |
+
+両版とも5/5 EOG正常終了であり、今回の入力では800トークン到達は再現しなかったが、基準の新聞2枚で長い反復を再現し、新版では検出しなかった。
+モデル読込は基準6.406秒、新版3.396秒。`wall_s` はモデル読込を除き、画像ごとの context 作成・推論・解放を含む。
+両版の先頭画像は初回 Vulkan 準備の影響を含む。mIV の一括作成と GPU を併用中の単発測定なので、全般的な高速化や精度向上とは結論しない。
+反復しなかった画像でも時間の増減があり、DRY の CPU 処理費用と GPU 競合はこの測定では分離していない。
+全体比較・安定した速度比較・同一入力の実モデル再実行による決定性の照合は未実施 (全体の GPU 比較は利用者が空き時間に実行する)。
+
+外部 `G:\home\vlm-eval\runs\20261105-repeat` の作成は sandbox に拒否されたため、今回は `--summary-only` を使い、本文はメモリだけで扱った。
+**生の結果 JSONL は保存していない**。集計だけのログは `target/vlm-repeat-light-summary.log`。本文・画像のコピーやリポジトリへの転載は無い。
+製品本体・通常 profile は起動せず、Rust・別 worktree・backup は変更せず、コミットしていない。
+
 ## 19. 独立レビューの記録
 
 ### 19.1 1 回目 (2026-11-02、gpt-6.1-sol / xhigh、基準 `e6c70624a`)

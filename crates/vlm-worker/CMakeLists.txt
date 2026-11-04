@@ -73,7 +73,7 @@ target_include_directories(vlm-contract-tests PRIVATE src "${LLAMA_ROOT}/vendor"
 target_compile_options(vlm-contract-tests PRIVATE /utf-8)
 add_test(NAME vlm-contracts COMMAND vlm-contract-tests)
 add_executable(vlm-greedy-tests tests/greedy.cpp)
-target_include_directories(vlm-greedy-tests PRIVATE src)
+target_include_directories(vlm-greedy-tests PRIVATE src "${LLAMA_ROOT}/vendor")
 target_link_libraries(vlm-greedy-tests PRIVATE llama)
 target_compile_options(vlm-greedy-tests PRIVATE /utf-8)
 add_test(NAME vlm-greedy-equivalence COMMAND vlm-greedy-tests)

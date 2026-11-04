@@ -4,6 +4,7 @@
 #include "caption-grammar.h"
 #include "chunks.h"
 #include "greedy.h"
+#include "repetition.h"
 #include "image_input.h"
 #include <cstdio>
 #include <stdexcept>
@@ -76,6 +77,7 @@ void InferenceEngine::caption_rgb(json & rec, uint32_t width, uint32_t height, c
     if (!grammar) throw std::runtime_error("Grammar creation failed");
     llama_sampler_chain_add(sampler.get(), grammar);
     llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
+    ValueRepetition repetition(vocab);
     rec["timings"]["sampler_init_s"] = seconds(phase);
     phase = Clock::now();
     auto prompt = fixed_prompt(mtmd_default_marker());
@@ -97,10 +99,12 @@ void InferenceEngine::caption_rgb(json & rec, uint32_t width, uint32_t height, c
     Handle<llama_batch_ext, llama_batch_ext_free> batch(llama_batch_ext_init(context.get()), llama_batch_ext_free);
     if (!batch) throw std::runtime_error("Generation batch creation failed");
     for (int i = 0; i < 800; ++i) {
-        auto token = greedy_with_grammar(sampler.get(), grammar, llama_get_logits_ith(context.get(), -1), llama_vocab_n_tokens(vocab));
+        auto token = greedy_with_grammar(sampler.get(), grammar, llama_get_logits_ith(context.get(), -1), llama_vocab_n_tokens(vocab), repetition.sampler());
         ++generated; // server usage includes the terminal token
         if (llama_vocab_is_eog(vocab, token)) { ended = true; break; }
-        content += piece(vocab, token);
+        auto token_piece = piece(vocab, token);
+        repetition.accept(token, token_piece);
+        content += token_piece;
         llama_batch_ext_clear(batch.get());
         int slot = llama_batch_ext_add_token(batch.get(), 0, token);
         if (slot < 0 || !llama_batch_ext_set_pos(batch.get(), slot, &position)
