@@ -702,3 +702,10 @@ git add / commit / merge等のgit書き込みも行わない。
 - **音楽ビデオのサンプルプロジェクト (AbyssalGlow) の公開**: 正本は `docs/music-video-export-plan.md` の Q11。v5.0.0 のエディタで保存し直し、曲・イラスト 3 枚・ロゴの元画像・プロジェクトファイルと利用条件 (無料ダウンロードのみ、再配布・素材の再利用は不可、書き出した動画の公開は不可) を zip にする。素材の控えは `C:\home\musicvideo-sample\AbyssalGlow\`。置き場所は Cloudflare R2 (`dl.mikage.jp`、`musicvideo/samples/v5.0.0/AbyssalGlow.zip`、上書きしない、`scripts/upload-store-installer.ps1` と同じ照合)。GitHub Releases には置かない。マニュアルの音楽ビデオのページからダウンロードへ案内する。告知用に、完成版エディタでサンプルを開いたタイムラインの画面写真を設計担当が撮り、利用者が選ぶ。書き出し例の動画は利用者が YouTube に上げ、告知の返信でリンクする。
 - **mIV Sound のソース**: https://github.com/MikageSawatari/miv-sound として 2026-11-04 に公開済み (Frieve-A/effetune-mixwright のフォーク)。公開時は承認した版のコミットが `miv` ブランチに送られていることを確かめる。作者への次の連絡 (F5) は v5 の公開後。
 - **v5 の master への取り込み**: 公開の前に、v5-integration を master (GitHub の main) へ取り込み、master を v5 系に切り替えるかを利用者に確かめる。
+
+## 14. mIV Sound 0.15.0-miv.5 (候補 355585fd…) の承認と rc2 (2026-11-04)
+
+- 内容: 歯車メニューの「Based on EffeTune」項目と設定画面の GitHub ボタンを外し、About に「ソースコード」ボタン (https://github.com/MikageSawatari/miv-sound) を足した (miv-sound `413c1eb`、利用者指示「リンクは mIV Sound 側に置き、フォーク元は GitHub 上で示す」「About から飛べるほうが分かりやすい」)。0.15.0-miv.4 (`499ef51`、候補 24377f6d…) はリンクの置き場所を変える前の版で、承認していない。
+- 独立レビュー (xhigh): ACCEPT、指摘なし。
+- 実機確認: サブ PC 依頼 12 (観測者: サブ PC 担当)。版 0.15.0-miv.5、前回の表示で始まる、About のボタンは「Third party notices」「ソースコード」「Close」の順で開き直しても二重にならない、Chrome で miv-sound が開き上部に「forked from Frieve-A/effetune-mixwright」、設定画面に GitHub ボタンが無い。About の「Close」「Third party notices」が英語のまま (上流の About が固定の英語) なのは、次の版 (miv.6) で訳す (利用者決定)。
+- 利用者が rc2 でのテストを先に始めたいと判断したため、利用者自身の手元確認の前にサブ PC の確認で承認した。`.\scripts\build-miv-sound.ps1 -Approve -Candidate 355585fd…` で `third_party/miv-sound/0.15.0-miv.5/` を作成。バックアップは `C:\home\mimageviewer_vendor_backup\miv-sound-0.15.0-miv.5\`。
