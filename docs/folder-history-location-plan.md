@@ -18,6 +18,10 @@ Snapshot 由来 rows を除く。戻り先の表示採用は初回 layout より
 閲覧履歴のメニュー入場は先頭、Ctrl+F は入場時に閉じる既存仕様を維持する。
 Ctrl+F の現在地フィルタ中（空のバーを含む）も ←/→ を許可する（§1.705、2026-11-04利用者決定）。
 履歴の行き先一覧の採用境界で旧フィルタを終了し、全件表示する。検索カーソル方針・R9 は撤去済み。
+§1.705追補（2026-11-05）: `MainHistoryOperation::Replay`の成功採用tailでLocal寿命を終了する。
+Smartの退避済みrootをmoveして復元する場合も同じ規則で、旧rootのfilterを復活させない。
+通常の親戻り（Direct/Restore）でitemsとfilterを対に戻す既存仕様、SameLocationの再prepare、
+取消・拒否時の元表示は維持する。filterを外した時だけ可視列と色検索scopeを再投影する。
 検索バーを開いたまま履歴で戻る場合も、行き先一覧へ旧フィルタを再適用せず、一覧採用境界で終了する。
 永続化、起動復元、ブックマークの位置 owner、detached predicates / viewport は変更しない。
 

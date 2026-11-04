@@ -7082,3 +7082,24 @@ HWND同定・detached述語の実装・viewport生成/close/配置/focus routing
 補足自動試験は523/523成功（既存Everything close3件・physical-parent・5検索種のscope回帰を含む）、
 最終core check・fmt/glyphも成功。実機でのdetached/window動作は未確認であり、
 全件1回の実行結果と修正後の補足結果は台帳で区別している。
+
+### 2026-11-05: §1.708追補 検索結果採用でMain入力予約を終端
+
+§2を読み、`d83ed8f85`の入力予約Submit整理に対する寿命終了漏れの追補として記録する。
+検索結果から物理childを採用してもMain検索欄のfocus_requestが残り、次のGrid Enterが
+旧欄の再Submitとなり得た。新しいstateや時間窓を足さず、既存search origin付きの成功採用で
+発行元のfocus予約だけを終了する。G hit-only drillは既存Main adoptionのroute変更成功時だけ、
+direct viewerは既存fullscreen_idx.is_none()で新sessionを採用する成功時だけ同じ規則を使う。
+既存sessionのページ移動や同route再投影では、新しく発行されたMain編集予約を終了しない。
+
+予約helperはprojected_viewer_context_idとviewer_context_mainの既存identityを照合し、
+別contextのreaderがMainのROOT widget予約を消費しない。Metadata/Everything共用latchは
+現在の編集ownerと発行元kindの一致、typed予約はROOTと対象widget IDの一致で終了する。
+実widget focus、IME/native入力、query/dataset、HWND・detached述語の実装・viewport生成/close/配置は変更しない。
+Modal化や独立した予約世代/保留stateは不要で、既存の採用ownerとsession/routeの寿命境界を共有する。
+実装担当と独立gpt-6.1-sol/xhigh reviewerは、症状guardではなく入力予約の終了ownerを正す
+構造的修正であることに合意した。未実施の設計担当検収・実機確認まで完了とは扱わない。
+元の4件の失敗報告と今回の再現範囲を区別した検証台帳はnext-release-backlog §1.705/§1.708追補に置く。
+
+本追補の関連717件は全成功、core check・fmt/glyph・diff checkも成功。
+独立reviewerが証拠と本記録を確認して最終ACCEPTとした。製品起動・実機確認は未実施。

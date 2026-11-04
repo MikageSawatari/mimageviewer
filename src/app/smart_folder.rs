@@ -12075,6 +12075,127 @@ mod tests {
         );
     }
 
+    fn section1705_smart_root_filter_return(history: bool, pinned: bool) {
+        use crate::app::{FolderHistoryDirection, StartupListIntent};
+        let mut app = crate::app::setup_app_for_test();
+        app.active_quick_folder_slot = None;
+        app.settings.auto_fullscreen_image_folders = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.show_toolbar_search_local = pinned;
+        let root = app.tmp.path().join("smart-history-local-filter");
+        install_rating_rule_test_root(
+            &mut app,
+            root,
+            &[
+                ("alpha", SmartFolderEntryKind::Folder, 0),
+                ("beta", SmartFolderEntryKind::Folder, 0),
+            ],
+            [true; 6],
+            false,
+        );
+        let definition = app
+            .top_level_grid_view
+            .smart_folder_session()
+            .unwrap()
+            .root_snapshot()
+            .unwrap()
+            .definition
+            .clone();
+        let definition_id = definition.id;
+        app.settings.smart_folders.push(definition);
+        app.finish_page_identity_preparation_for_test();
+        let ctx = egui::Context::default();
+        app.search_target =
+            crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
+        app.show_search_bar = true;
+        app.search_query = "alpha".into();
+        app.execute_search(&ctx);
+        wait_for_local_search(&mut app, &ctx);
+        assert_eq!(app.visible_indices, [0]);
+        let child = app.items[0].container_path().unwrap().to_owned();
+        std::fs::write(child.join("child.jpg"), b"image").unwrap();
+        app.selected = Some(0);
+        assert!(app.modal_dialog_block_reason().is_none());
+        assert!(app.begin_smart_grid_container_navigation(
+            0,
+            child.clone(),
+            false,
+            StartupListIntent::ExplicitList
+        ));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.effective_folder().as_deref() != Some(child.as_path())
+            || app.smart_folder_busy()
+            || app.sidecar_restore_active()
+        {
+            assert!(Instant::now() < deadline, "Smart child did not adopt");
+            app.settle_open_path_classification_for_test();
+            app.poll_smart_folder(&ctx);
+            app.finish_page_identity_preparation_for_test();
+            app.poll_sidecar_restore(&ctx);
+            std::thread::yield_now();
+        }
+        assert!(app.resident_smart_root_restore_is_exact(&app.settings.smart_folders[0]));
+        app.show_search_bar = true;
+        app.search_query = "child draft".into();
+        app.execute_search(&ctx);
+        let cancel = Arc::clone(&app.search_pending.as_ref().unwrap().cancel);
+        if !history {
+            wait_for_local_search(&mut app, &ctx);
+        }
+        if history {
+            assert!(app.history_nav_availability().is_ok());
+            app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
+        } else {
+            assert!(
+                app.restore_smart_folder_for_synthetic_path(&smart_folder_synthetic_path(
+                    definition_id
+                ))
+            );
+        }
+        assert_eq!(
+            app.effective_folder(),
+            Some(smart_folder_synthetic_path(definition_id))
+        );
+        assert_eq!(app.items.len(), 2);
+        if history {
+            assert!(
+                app.search_filter.is_none(),
+                "history must not resurrect parked root filter"
+            );
+            assert!(app.search_pending.is_none());
+            assert!(
+                cancel.load(Ordering::Relaxed),
+                "departing child's search must be retired"
+            );
+            assert!(!app.show_search_bar);
+            assert_eq!(app.visible_indices, [0, 1]);
+            assert_eq!(app.search_query, if pinned { "child draft" } else { "" });
+        } else {
+            assert!(app.show_search_bar);
+            assert!(app.search_filter.is_some());
+            assert_eq!(app.visible_indices, [0]);
+            assert_eq!(
+                app.search_query,
+                if pinned { "child draft" } else { "alpha" }
+            );
+        }
+    }
+
+    #[test]
+    fn section1705_smart_history_return_ends_parked_root_and_child_local_filters() {
+        for pinned in [false, true] {
+            section1705_smart_root_filter_return(true, pinned);
+        }
+    }
+
+    #[test]
+    fn section1705_smart_parent_return_preserves_parked_root_local_filter() {
+        for pinned in [false, true] {
+            section1705_smart_root_filter_return(false, pinned);
+        }
+    }
+
     #[test]
     fn section1409_smart_park_restore_keeps_pinned_local_draft_outside_listing_payload() {
         for (pin_at_park, pin_at_return) in

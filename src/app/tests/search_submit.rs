@@ -672,3 +672,155 @@ fn section1708_legacy_search_reservation_uses_main_shortcut_scope() {
         }
     }
 }
+
+#[test]
+fn section1708_result_navigation_retires_only_its_search_focus_claim() {
+    for kind in Kind::ALL {
+        for claim_case in ["temporary", "pinned", "other-widget", "sibling-viewport"] {
+            let _input = crate::key_input::lock_test_input();
+            let mut app = super::super::setup_app_for_test();
+            app.ensure_search_session(kind);
+            *app.search_draft_mut(kind) = "keep this draft".into();
+            let ctx = egui::Context::default();
+            ctx.begin_pass(enter_input());
+            #[cfg(windows)]
+            stage_native_text_and_enter();
+            let widget = match claim_case {
+                "temporary" => kind.temporary_id(),
+                "pinned" | "sibling-viewport" => kind.input_id(),
+                _ => egui::Id::unique("unrelated-input"),
+            };
+            let viewport = if claim_case == "sibling-viewport" {
+                egui::ViewportId::from_hash_of("search-navigation-sibling")
+            } else {
+                egui::ViewportId::ROOT
+            };
+            app.claim_pending_text_input_focus(viewport, widget, ctx.cumulative_pass_nr());
+            let before = app.pending_text_input_focus.get();
+            app.retire_search_input_focus(kind);
+            assert!(app.edit_owner(kind));
+            assert_eq!(app.search_draft(kind), "keep this draft");
+            let request = match kind {
+                Kind::Local => app.search_focus_request,
+                Kind::Container => app.favsearch.focus_request,
+                _ => app.global_search.focus_request,
+            };
+            assert!(!request, "{kind:?}/{claim_case}");
+            assert_eq!(
+                app.pending_text_input_focus.get(),
+                if matches!(claim_case, "temporary" | "pinned") {
+                    None
+                } else {
+                    before
+                }
+            );
+            assert!(ctx.input(|input| input.key_pressed(egui::Key::Enter)));
+            #[cfg(windows)]
+            {
+                assert!(crate::key_input::pressed_key_down(
+                    ctx.viewport_id(),
+                    |edge| edge.virtual_key == 0x52
+                ));
+                assert!(crate::key_input::pressed_key_down(
+                    ctx.viewport_id(),
+                    |edge| edge.virtual_key == 0x0D
+                ));
+                crate::key_input::clear_test_frame();
+            }
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+    }
+}
+
+#[test]
+fn section1708_result_navigation_keeps_the_new_shared_search_editor() {
+    use crate::global_search_ui::SearchSource;
+    for (old, new) in [
+        (Kind::Metadata, Kind::Everything),
+        (Kind::Everything, Kind::Metadata),
+    ] {
+        let mut app = super::super::setup_app_for_test();
+        app.ensure_search_session(old);
+        app.switch_search_source(if new == Kind::Everything {
+            SearchSource::Everything
+        } else {
+            SearchSource::Metadata
+        });
+        assert!(app.global_search.focus_request);
+        app.claim_pending_text_input_focus(egui::ViewportId::ROOT, new.input_id(), 0);
+        let pending = app.pending_text_input_focus.get();
+        app.retire_search_input_focus(old);
+        assert!(app.global_search.focus_request);
+        assert_eq!(app.pending_text_input_focus.get(), pending);
+    }
+}
+
+#[test]
+fn section1708_tag_navigation_preserves_foreign_focus_claim() {
+    let _input = crate::key_input::lock_test_input();
+    let mut app = super::super::setup_app_for_test();
+    app.tag_view.active = true;
+    app.tag_view.focus_request = true;
+    app.tag_view.query = "keep tag".into();
+    let other = egui::Id::unique("tag-unrelated-editor");
+    app.claim_pending_text_input_focus(egui::ViewportId::ROOT, other, 0);
+    let pending = app.pending_text_input_focus.get();
+    app.retire_tag_search_input_focus();
+    assert!(!app.tag_view.focus_request);
+    assert!(app.tag_view.active);
+    assert_eq!(app.tag_view.query, "keep tag");
+    assert_eq!(app.pending_text_input_focus.get(), pending);
+    app.claim_pending_text_input_focus(egui::ViewportId::ROOT, App::tag_search_input_id(), 0);
+    app.retire_tag_search_input_focus();
+    assert!(app.pending_text_input_focus.get().is_none());
+}
+
+#[cfg(windows)]
+#[test]
+fn section1708_result_viewing_in_sibling_context_keeps_main_search_reservation() {
+    use crate::app::viewer_context_registry::BuildOutcome;
+    let mut app = super::super::setup_app_for_test();
+    let sibling = app
+        .build_viewer_context("search-focus-sibling", |_, _| BuildOutcome::Commit)
+        .unwrap();
+    app.ensure_search_session(Kind::Metadata);
+    app.claim_pending_text_input_focus(egui::ViewportId::ROOT, Kind::Metadata.temporary_id(), 0);
+    let pending = app.pending_text_input_focus.get();
+    app.with_viewer_context(sibling, |owner| {
+        owner.global_search.active = true;
+        owner.global_search.focus_request = true;
+        owner.retire_result_search_input_focus();
+        owner.retire_search_input_focus(Kind::Metadata);
+        assert!(owner.global_search.focus_request);
+        assert_eq!(owner.pending_text_input_focus.get(), pending);
+    })
+    .unwrap();
+    assert!(app.global_search.focus_request);
+    assert_eq!(app.pending_text_input_focus.get(), pending);
+}
+
+#[test]
+fn section1708_existing_viewer_page_open_preserves_new_main_search_reservation() {
+    let mut app = super::super::setup_app_for_test();
+    app.settings.detached_viewer_open_images_in_window = false;
+    app.settings.show_toolbar_search_metadata = true;
+    let paths = [
+        app.tmp.path().join("page0.png"),
+        app.tmp.path().join("page1.png"),
+    ];
+    for path in &paths {
+        image::RgbImage::new(2, 3).save(path).unwrap();
+    }
+    let ctx = egui::Context::default();
+    app.adopt_c1_search_results_for_test(&ctx, &paths, false);
+    app.finish_page_identity_preparation_for_test();
+    app.open_fullscreen(0, super::super::HistoryTrigger::UserChosen);
+    assert_eq!(app.fullscreen_idx, Some(0));
+    assert!(!app.global_search.focus_request);
+    app.request_pinned_search_focus(&ctx, Kind::Metadata);
+    let pending = app.pending_text_input_focus.get();
+    app.open_fullscreen(1, super::super::HistoryTrigger::UserChosen);
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert!(app.global_search.focus_request);
+    assert_eq!(app.pending_text_input_focus.get(), pending);
+}

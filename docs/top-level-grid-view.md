@@ -140,8 +140,9 @@ continuation に seed を渡し、実 rows の hydrate 後に可視な安定キ�
 prepare は synthetic 宛先の favorite 表示設定を読み取り投影し、その sort / カテゴリ順で行を作る。
 本棚直下の番号順例外と既存の評価読取失敗 fallback は維持する。install では閲覧履歴・Rating と同様に
 宛先の列数・表示モード・比率を初回 layout 前に採用する。Return の位置と seed は同じ install で戻す。
-Ctrl+F 表示中は既存仕様どおり ←/→ の履歴移動が無効なので、検索カーソル方針と R9 は設計担当の判断で撤去した。
-他の入口から検索バーを開いたまま戻る場合も、自動再適用による先頭復帰を従来どおり受け入れ、検索処理は変更しない。
+当時のCtrl+F中の履歴禁止を前提にした検索カーソル方針とR9は撤去済み。
+2026-11-04の§1.705で履歴移動を許す仕様へ変更した。履歴Replayは採用後にLocalを終了し全件表示する。
+通常の親戻りや同じ一覧の再prepareで保存済みfilterを復元・再適用する仕様は維持する。
 
 簡素化として位置 owner と採用境界を共通化し、戻り予約・rollback・追加の待機や再 ensure loop は作らない。
 準備中は既存 modal なので並び設定の stamp / 再比較を足さない。shell 中の検索割込み、保存後の稀な失敗、
@@ -218,6 +219,9 @@ ZIP内の子階層は既存ZIPナビゲーションで一段ずつ戻り、root�
 スマートフォルダのrootへ戻って開いた行を選択する。BS / 親ボタン / 全画面closeのDirect要求は、
 共通のopen dispatcherで合成pathを既存Smart復元へ配送し、実フォルダscanへ渡さない。
 履歴の型付きSmartFolder帰路と同じsession / root復元を使い、専用flagや再試行は設けない。
+§1.705（2026-11-05追補）: 復元payloadが同じでも、履歴Replayとして採用する場合はLocalの
+filter/pending/入力予約を共通採用tailで終了して全件を表示する。通常のBS/親戻りのDirect/Restoreは
+保存済みrootのfilterを復元する。成功採用前の取消・拒否では元filterを変更しない。
 簡素化として既存ownerの復元とprepare / adoptionへ揃え、別の待機・rollback ownerは作らない。
 
 通常の戻る / 進む履歴では scoped drill や root container 内の実パスをそのまま保存せず、

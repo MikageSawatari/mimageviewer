@@ -25754,6 +25754,14 @@ impl App {
             }
             MainListRestoreDestination::Native => {}
         }
+        // History adopts the destination list as a whole, even when its installer moves
+        // a parked Smart root instead of rebuilding rows through install_loading_items.
+        if matches!(navigation.history, MainHistoryOperation::Replay(_))
+            && self.retire_local_search_for_list_adoption()
+        {
+            self.mark_color_filter_scope_dirty();
+            self.rebuild_visible_indices();
+        }
         if (enters_list || navigation.source_slot != self.active_quick_folder_slot)
             && self.grid_scroll.session() == session_before
         {
@@ -38122,14 +38130,19 @@ impl App {
         global_search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
     ) {
         if favsearch_origin && self.favsearch.active {
+            self.retire_search_input_focus(crate::ui_pinned_search::PinnedSearchKind::Container);
             self.favsearch.nav_stack.push(path.to_path_buf());
             self.update_favsearch_address();
         }
         if tag_view_origin && self.tag_view.active {
+            self.retire_tag_search_input_focus();
             self.record_tag_view_nav_open(path);
             self.update_tag_view_address();
         }
-        if global_search_origin.is_some_and(|origin| self.search_open_origin_is_current(origin)) {
+        if let Some(origin) =
+            global_search_origin.filter(|origin| self.search_open_origin_is_current(*origin))
+        {
+            self.retire_search_open_input_focus(origin);
             self.advance_drilled_current_path(path);
         }
     }
@@ -71151,8 +71164,11 @@ impl App {
         {
             self.cleanup_normalize_state_for_fs_idx(previous_idx);
         }
-        if self.fullscreen_idx.is_none() && self.extracted_result_surface().is_some() {
-            self.begin_extracted_result_view();
+        if self.fullscreen_idx.is_none() {
+            self.retire_result_search_input_focus();
+            if self.extracted_result_surface().is_some() {
+                self.begin_extracted_result_view();
+            }
         }
         self.fullscreen_idx = Some(idx);
         #[cfg(windows)]

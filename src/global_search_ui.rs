@@ -4010,12 +4010,18 @@ impl App {
                 navigation,
                 destination,
             } => {
+                let input_owner = (self.facet_navigation.route() != &destination.route)
+                    .then(|| self.capture_search_open_origin())
+                    .flatten();
                 let Some(adoption) = self.prepare_main_list_adoption(navigation, destination)
                 else {
                     return false;
                 };
                 self.adopt_main_list_navigation(adoption, |app| {
                     install(app);
+                    if let Some(origin) = input_owner {
+                        app.retire_search_open_input_focus(origin);
+                    }
                     None
                 })
             }
@@ -5506,6 +5512,71 @@ pub(crate) mod tests {
                 app.global_search.accepted.applied_query()
             );
             std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn section1708_metadata_drill_focus_ends_only_after_changed_route_adopts() {
+        use crate::ui_pinned_search::PinnedSearchKind as Kind;
+        for reject in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            app.settings.show_toolbar_search_metadata = true;
+            let folder = app.tmp.path().join("focus-drill");
+            std::fs::create_dir(&folder).unwrap();
+            let paths = [folder.join("first.png"), folder.join("second.png")];
+            for path in &paths {
+                image::RgbImage::new(2, 3).save(path).unwrap();
+            }
+            let ctx = egui::Context::default();
+            g1_publish_search_hits(&mut app, &ctx, &paths);
+            app.finish_page_identity_preparation_for_test();
+            app.request_pinned_search_focus(&ctx, Kind::Metadata);
+            let pending = app.search_focus_claim_for_test();
+            let route = app.facet_navigation.route().clone();
+            app.hold_next_search_ready_for_test();
+            app.drill_into_container(folder, false);
+            assert!(app.global_search.focus_request, "request is not adoption");
+            assert_eq!(app.search_focus_claim_for_test(), pending);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !app.search_ready_is_held_for_test() {
+                assert!(Instant::now() < deadline, "drill Ready missing");
+                app.poll_global_search_events(&ctx);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(app.facet_navigation.route(), &route);
+            assert!(
+                app.global_search.focus_request,
+                "held Ready has not adopted"
+            );
+            if reject {
+                app.execute_clear_quick_folder_slots();
+            }
+            app.release_search_ready_for_test();
+            app.poll_global_search_events(&ctx);
+            if reject {
+                assert_eq!(app.facet_navigation.route(), &route);
+                assert!(
+                    app.global_search.focus_request,
+                    "rejected adoption retains the editor"
+                );
+                assert_eq!(app.search_focus_claim_for_test(), pending);
+                continue;
+            }
+            section1409_settle_metadata(&mut app, &ctx, |app| {
+                app.facet_navigation.route() != &route
+            });
+            assert!(!app.global_search.focus_request);
+            assert!(app.search_focus_claim_for_test().is_none());
+            app.request_pinned_search_focus(&ctx, Kind::Metadata);
+            let pending = app.search_focus_claim_for_test();
+            app.rebuild_items_from_global_search();
+            section1409_settle_metadata(&mut app, &ctx, |_| true);
+            assert!(
+                app.global_search.focus_request,
+                "same-route reprojection preserves a new editor"
+            );
+            assert_eq!(app.search_focus_claim_for_test(), pending);
         }
     }
 

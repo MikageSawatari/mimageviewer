@@ -1137,18 +1137,101 @@ impl App {
             }
         }
     }
-    pub(crate) fn close_local_search(&mut self, ctx: &egui::Context) {
-        self.cancel_pending_folder_nav();
+    #[cfg(test)]
+    pub(crate) fn search_focus_claim_for_test(
+        &self,
+    ) -> Option<crate::keyboard_input::PendingTextInputFocusClaim> {
+        self.pending_text_input_focus.get()
+    }
+
+    /// Successful result navigation ends its Main editor reservation, not the search session.
+    /// A retained Metadata result may be opened while a new Everything draft owns the shared UI.
+    pub(crate) fn retire_search_input_focus(&mut self, kind: Kind) {
+        if self.projected_viewer_context_id() != self.viewer_context_main() {
+            return;
+        }
+        if self.edit_owner(kind) {
+            match kind {
+                Kind::Local => {
+                    self.search_focus_request = false;
+                    self.search_has_focus = false;
+                }
+                Kind::Container => {
+                    self.favsearch.focus_request = false;
+                    self.favsearch.has_focus = false;
+                }
+                Kind::Metadata | Kind::Everything => {
+                    self.global_search.focus_request = false;
+                    self.global_search.has_focus = false;
+                }
+            }
+        }
+        if self.pending_text_input_focus.get().is_some_and(|claim| {
+            claim.viewport == egui::ViewportId::ROOT
+                && [kind.input_id(), kind.temporary_id()].contains(&claim.widget_id)
+        }) {
+            self.clear_pending_text_input_focus();
+        }
+    }
+
+    pub(crate) fn retire_search_open_input_focus(
+        &mut self,
+        origin: crate::global_search_ui::SearchOpenOrigin,
+    ) {
+        let kind = match origin {
+            crate::global_search_ui::SearchOpenOrigin::Metadata => Kind::Metadata,
+            crate::global_search_ui::SearchOpenOrigin::Everything { .. } => Kind::Everything,
+        };
+        self.retire_search_input_focus(kind);
+    }
+
+    pub(in crate::app) fn retire_tag_search_input_focus(&mut self) {
+        if self.projected_viewer_context_id() != self.viewer_context_main() {
+            return;
+        }
+        self.tag_view.focus_request = false;
+        self.tag_view.has_focus = false;
+        if self.pending_text_input_focus.get().is_some_and(|claim| {
+            claim.viewport == egui::ViewportId::ROOT
+                && claim.widget_id == Self::tag_search_input_id()
+        }) {
+            self.clear_pending_text_input_focus();
+        }
+    }
+
+    /// Direct media viewing has no physical-list adoption, but ends the same result editor.
+    pub(in crate::app) fn retire_result_search_input_focus(&mut self) {
+        if let Some(origin) = self.capture_search_open_origin() {
+            self.retire_search_open_input_focus(origin);
+        } else if self.favsearch.active {
+            self.retire_search_input_focus(Kind::Container);
+        } else if self.tag_view.active {
+            self.retire_tag_search_input_focus();
+        } else if self.show_search_bar {
+            self.retire_search_input_focus(Kind::Local);
+        }
+    }
+
+    /// Replay installs may move a parked grid, including its old Local membership.
+    /// Retire that membership at adoption; ordinary parent returns keep their saved filter.
+    pub(in crate::app) fn retire_local_search_for_list_adoption(&mut self) -> bool {
+        self.retire_search_input_focus(Kind::Local);
         self.smart_folder_local_search_reapply = None;
         self.show_search_bar = false;
         self.clear_search_draft_on_end(Kind::Local);
-        self.search_filter = None;
+        let membership_changed = self.search_filter.take().is_some();
         self.search_filter_origin_folder = None;
         self.search_has_focus = false;
         self.search_focus_request = false;
         self.search_tag_bridge.clear();
-        self.move_grid_cursor(self.selected, super::GridCursorIntent::ExplicitKeep);
         self.cancel_search_pending();
+        membership_changed
+    }
+
+    pub(crate) fn close_local_search(&mut self, ctx: &egui::Context) {
+        self.cancel_pending_folder_nav();
+        self.retire_local_search_for_list_adoption();
+        self.move_grid_cursor(self.selected, super::GridCursorIntent::ExplicitKeep);
         self.rebuild_visible_indices();
         self.refresh_color_filter_for_scope_change(ctx);
     }

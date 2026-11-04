@@ -805,6 +805,12 @@ TextInput ownerが所有した同viewportのnative入力群は同時に終端し
 RootでもMainWindow/Fullscreen viewer中は未表示のMain予約を投影せず、Submitも受け付けない。
 既存surface判定を共用し、DetachedWindowでMainが使える場合の予約は維持する。
 同queryでも子表示からSubmitすれば、既存navigationを退役させてroot結果へ戻す。
+2026-11-05追補: 検索結果の物理child採用・G hit-only drill採用・direct viewer新規入場は、
+発行元の入力focus予約だけを成功境界で終端する。検索session/query/draft/accepted datasetは保持し、
+Submitのegui/native入力消費を呼ばない。Metadata/Everything共用latchは現在のedit owner一致時だけ
+終端し、typed予約はROOT＋発行元widget IDを照合する。他widget/viewport/別contextの予約は保持する。
+同routeの後着batch/再投影や既存viewerのページ移動では、新しく発行した入力予約を終了しない。
+子で再び入力を開いた明示Submitの仕様、失敗/取消/stale時の元入力は維持する。
 F/G/Tの確定も同じ所有規則（Tは即検索timing維持）を使い、IME/他widget focus・予約を優先する。
 
 Tantivy は通さない。SQLite LIKE の方が対象件数 (フォルダ構造の粒度) に対して
@@ -818,6 +824,9 @@ Local欄に実focusがある場合も、一時/常設欄の既知widgetから限
 既存History KeyActionの実効Alt（Ctrlなし）chordだけを受理する。IME・文字編集用割当は入力欄を優先する。
 履歴入力の受付と表示は`history_nav_availability()`へ集約し、Ctrl+G/S/T・EverythingとSnapshotは
 従来どおり拒否する。キー・ring/gamepadの拒否にはInfo、ボタンにはdisabled tooltipで理由を示す。
+2026-11-05追補: 履歴Replayの成功採用後は、Smartのparked Visible rootをmoveした場合も
+Local filter/pending/編集予約を終了し、filterを外した場合だけ可視列と色scopeを再投影する。
+通常の親戻り・検索closeのRestore・SameLocation再prepareはこの履歴規則に含めない。
 Ctrl+↑↓/兄弟移動、親移動、A/B切替は検索内の専用経路や作業場所所有にも関わるため、
 今回の履歴仕様変更に含めず既存仕様を維持する（判断はbacklog §1.705）。
 

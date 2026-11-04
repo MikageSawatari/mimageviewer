@@ -90,6 +90,9 @@
 - **検証**: 最終の開発検証台帳を参照。
 - **実機確認**: 未実施。絞り込み済み/未提出の空バーの両方で←/→ボタン・Alt+←/→が移動し全件となること、検索結果・★固定はボタンの無効理由とキーの通知を確認する。
 
+
+- **2026-11-05独立レビューREJECTへの追補（ソース指摘）**: Smart child→退避済みrootの履歴は通常installerを迂回し、payload内の旧filterを復元していた。「通常一覧採用を共有するから終了済み」という前提が不足していた。共通`MainHistoryOperation::Replay`成功採用後にLocalの寿命終了を所有させる。root/childのfilterとpendingを終了し、pinned draft保持規則を維持する。filterを外した時だけ可視列を再構築し、既存の色scope再計算予約を立てる。通常の親戻りDirect/RestoreとSameLocation再prepareは変更しない。専用Smartフラグや追加worker・待機は作らない。
+
 ### 1.706 検索結果のウィンドウタイトルに内部の仮のフォルダ名が出る (2026-11-04)
 
 - **観測者・資料**: サブPC担当、依頼12 notesのその他3（依頼11でも観測）。検索結果で`<data_dir>\__search_results__ - mimageviewer`が表示された。
@@ -114,6 +117,9 @@
 - **修正・判断**: `submit_search_input`を一時/常設/描画前予約の確定入口にし、既存IME判定後の同viewportのegui/native Enterを同時に消費してfocus/既存予約を終端する。modal・実focus/FocusRecovery・他widgetの予約を優先する。Ctrl+Sの通常の入力即検索は維持し、Enterは確定して結果一覧へ移る。同queryの子表示からのSubmitもroot検索へ戻し、既存navigation ownerをretireしてから開始する。タグは即検索timingを維持して確定入力とfocusだけを終端する。`lost_focus`は2pass分の履歴で旧欄にも成立するため、描画前の実focus/既存recovery ownerを既知widgetと照合する。古い別欄やmodalのEnterを奪わず、Everythingの空query等で検索を始めない確定も同じ境界で消費する。Enterと同じbackend frameでTextInputが所有した文字/clipboard/native-onlyキーも、同viewportのnative deliveryとして終端する（Enterだけを消して次passでR等がgridへ再所属する経路を残さない）。ApplicationShortcut ownerからの検索ボタンはEnter限定、兄弟viewportと別backend frameの入力は維持する。focus/予約のclearはSubmit対象本人だけとする。新しいKeyAction・状態field・遅延/retryは足さない。
 - **検証**: 修正前`target/acceptance12-enter-red.log`は5/5失敗。初回のcompile不備（run→run_pass、CollectionId型）はテストfixtureの不備として直し、このredとは区別する。最終結果は開発検証台帳を参照。
 - **実機確認**: 未実施。一時/常設Container欄で検索入力→Enterが結果一覧に留まり、次の別のEnterで選択結果を開くこと。IME確定、Ctrl+F/G/T、同queryのchildからSubmitも確認する。
+
+
+- **2026-11-05追加調査**: `d83ed8f85`の新しい予約Submit入口に対し、検索から物理childを採用しても旧`focus_request`が残る終了漏れを確認。成功後の次のGrid Enterを再Submitへ所属させ得る。G/S/T/Everythingの既存origin条件付き成功commit、G drillのReady成功採用、direct viewerの新規session採用で発行元予約だけ終端する。query/datasetやnative配送は変更せず、現在の別source入力、他widget/viewport/context、新しく開いたchild欄は保護する。既存viewerのページ送りや同route再投影では終端しない。元の4件の空行失敗と、この入力予約残留の実証は検証台帳で区別する。
 
 ### 1.709 音声・動画を閉じた直後のDBの位置が最大5秒古い (2026-11-04、記録のみ・v5では直さない)
 
@@ -150,6 +156,27 @@
 
 - 最終snapshot通常比較: `UPDATE_SNAPSHOTS`なし、`cargo nextest run -p mimageviewer --test ui_snapshot -j 1 -E 'test(/search|folder_toolbar/)'`は**16/16成功、exit 0、50.849秒**（compile 1分29秒、run UUID `0990e7e9-4cd6-445c-a6a2-510574957a7f`、`target/acceptance12-snapshots-final.log`）。既存PNG更新なし。最終`git diff --check`も成功。全4件の実機確認・設計担当の検収は未実施。commit・製品起動・確認用buildは行わず、依頼どおり引き継ぐ。
 
+
+
+##### d83ed8f85の独立レビュー追補2件（2026-11-05、HEAD add448539）
+
+- 開始時`v5-integration` / HEAD `add448539c0e3c688c158344efd61a7c29e65b41`、作業ツリーclean。§1.710〜1.712の製品変更、`config/miv-sound.rs`は対象外。製品起動・commit・`build-dev.ps1`・本体lib全件は実施せず、全件は設計担当へ引き継ぐ。
+- 検証processの`TEMP`/`TMP`を`G:\home\mimageviewer-badge-1663\target\tmp-test-env`へ設定し、既定TEMPの約77万件の残骸を避ける。設定は当該processだけで、作業ツリー外の一時領域や個人設定を操作しない。
+- 未修正HEADで指定4件を`cargo nextest run -p mimageviewer --lib -j 4 -E 'test(/everything_close_return::rating1671::(zip_level_directory|zip_level_nested_archive|converted_zip_level_directory|converted_zip_level_nested_archive)::everything_results_after_level_request/)' --no-fail-fast`実行し、**4/4成功、exit 0、1.077秒**（compile 5分07秒、run `1fdab031-dd14-4951-a010-f12a6b83c4eb`、`target/acceptance12-followup-everything-red.log`。ファイル名redは予定名で、結果はredではない）。設計担当が旧baselineとd83で確認した4件のfailを撤回する証拠ではなく、同HEAD＋空TEMPの今回条件では空行まで再現しなかった記録である。
+- 製品修正前の追加回帰`section1708_physical_result_open_retires_search_focus_without_resubmitting`は、実際のEverything結果→物理Folder採用後に旧focus_requestがtrueであるため失敗した（valid red、0.852秒）。同runのSmart2件はFolder非対応の明示書庫用APIをfixtureが呼んでおり10秒でtimeoutしたため、bug redの証拠には数えない。実際のSmart gridのFolder入口へ修正し、通常の親戻りとの対照検査を維持する。ログ`target/acceptance12-followup-boundary-red.log`、run `886f99e7-4157-4636-bf3e-8c5dc56b9c74`、3実行/0成功/3失敗/exit 100。
+- 原因の証拠範囲: 旧予約を新しい`route_pending_search_submit`が受けると`send_everything_search`へ到達し、実IPC再検索を発行するコード経路を確認した。実検索が0件なら旧fixture datasetを置換して空行に至り得るが、今回の既存4件の実行ではその最終段の相関は取れていない。履歴可否の共通化・索引mtime/size・Submit後のnative batch消費をこの空行の原因と断定しない。
+
+
+- 途中関連run: `test(/section1705_|section1708_|everything_close_return|physical_parent_1672|smart_folder|local_search|submitted_search|phase_c_folder_nav_history_tests|phase_c_key_tests|search_bar_focus_recovery|search_ime_commit|pinned_search/)`を4並列で実行し、**602実行/601成功/1失敗、exit 100、177.316秒**（compile 2分39秒、run `e57209b1-4a49-4d6a-b923-2518e3d6cc4a`、`target/acceptance12-followup-related.log`）。Smart履歴・通常親戻りと指定4件は成功。残る追加Everything回帰はMainのEnterをFullscreen専用helperへ送っていたfixture不備で、Main handlerへ訂正した。
+- 独立レビューで、direct viewerの全page openに予約終端を呼ぶ案は広過ぎるため新session入場時に限定し、G drill入口での早期終端は非同期Ready成功採用へ移した。既存routeが変わる成功時だけcaptured SearchOpenOriginを使い、同route再投影・拒否・別source編集を保護する。既存viewerの実0→1 page open、G request/held Ready/拒否/成功/同route新入力保持の回帰を追加した。scope境界への合意とMain/sibling保護は[detached計画 §11](detached-rework-plan.md)にも追記した。
+
+- 最終回帰の初回compileは、新しいG非同期テストからAppのprivate fieldを読んだためE0616・exit 101（実行0件、`target/acceptance12-followup-test-visibility-error.log`）。fieldの公開範囲は変えず、`cfg(test)`の読み取り専用seamでclaimを検査する形へ直した。製品側の状態や期待は変更しない。
+
+
+- 最終関連run: `cargo nextest run -p mimageviewer --lib -j 4 -E 'test(/section1705_|section1708_|everything_close_return|physical_parent_1672|smart_folder|local_search|submitted_search|phase_c_folder_nav_history_tests|phase_c_key_tests|search_bar_focus_recovery|search_ime_commit|pinned_search|global_search_ui/)' --no-fail-fast`は**717/717成功、15,672対象外、exit 0、187.609秒**（compile 2分33秒、run `a18be50c-1462-40d7-b482-efef56095bfc`、`target/acceptance12-followup-final.log`）。指定4件の期待は変更していない。Smart root→実child→history/parentの対照（pinned/temporary）、child pendingの終了、物理Folder/ZIP/PDF/変換からの再Submitなし、Gの非同期成功/拒否/same-route、実viewer page open、別source/widget/viewport/contextを含む。
+- `cargo check -p mimageviewer --bin mimageviewer-core`は**exit 0、1分11秒**（既存警告317、`target/acceptance12-followup-core-check.log`）。最終製品ロジック後の結果で、その後の`cfg(test)`読み取りgetter追加とfixture修正は非test製品を変更しないため再利用する。
+- 最終`cargo fmt --check`はexit 0（`target/acceptance12-followup-fmt-final.log`）、UI glyphは0件（`target/acceptance12-followup-glyphs.log`）、`git diff --check`は成功。UIレイアウト/文言・PNG変更なしで、今回は状態/handler/非同期採用回帰を実施しsnapshotは再実行しない。本体lib全件と確認用buildは利用者指定で設計担当へ引き継ぐ。
+- 独立`gpt-6.1-sol` / `xhigh`が最終source・717件/core checkのログ・§11記録を確認し、**最終ACCEPT、未解決P1/P2なし**。実機確認、設計担当の検収、元4件の報告時の空行と今回の予約残留との実行時相関は未確認として残す。製品起動・commit・`build-dev.ps1`は未実施。§1.710〜1.712の記録とSound設定はHEAD照合でも未変更。
 
 ### 1.704 場所▼へビデオ・ミュージックを追加 (2026-11-04、v5.0.0)
 

@@ -744,3 +744,51 @@ fn detached_close_keeps_main_results_in_both_window_modes() {
         );
     }
 }
+
+#[test]
+fn section1708_physical_result_open_retires_search_focus_without_resubmitting() {
+    for book in [Book::Folder, Book::Zip, Book::Pdf, Book::Converted] {
+        let mut app = setup_app_for_test();
+        app.active_quick_folder_slot = None;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.settings.auto_fullscreen_image_folders = false;
+        app.settings.detached_viewer_open_images_in_window = false;
+        let ctx = egui::Context::default();
+        let root = app.tmp.path().to_owned();
+        let (row, _) = fixture(&mut app, &root, book);
+        let result = dataset(vec![row.clone()]);
+        adopt(&mut app, &ctx, "outer book", Arc::clone(&result));
+        assert!(
+            app.global_search.focus_request,
+            "opening the search reserves its input"
+        );
+        let run = app.global_search.run_sequence;
+        open(&mut app, &ctx, &row, false);
+        assert!(
+            !app.global_search.focus_request,
+            "the adopted child owns grid input: {book:?}"
+        );
+        assert!(!app.global_search.has_focus);
+        assert_eq!(app.global_search.run_sequence, run);
+        assert!(app.global_search.pending.is_none());
+        assert!(matches!(&app.global_search.accepted,
+            SearchAccepted::Everything { dataset, .. } if Arc::ptr_eq(dataset, &result)));
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        let _ = app.handle_keyboard(&ctx);
+        ctx.end_pass().drop_without_applying_deltas();
+        assert_eq!(
+            app.global_search.run_sequence, run,
+            "child Enter must not resubmit Everything"
+        );
+        assert!(app.global_search.pending.is_none());
+    }
+}
