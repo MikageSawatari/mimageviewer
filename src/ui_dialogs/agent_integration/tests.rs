@@ -631,6 +631,54 @@ fn agent_registration_confirmation_ime_enter_escape_and_cancel_return() {
 }
 
 #[test]
+fn acceptance_b_registration_geometry_is_stable_across_frames() {
+    for scale in [1.0, 2.0] {
+        let mut state = injected(&Settings::default());
+        state.confirm(AppTarget::ClaudeDesktop, Action::Register, 0);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1093.0, 614.0))
+            .with_context_setup(move |ctx| {
+                crate::ui_fonts::configure_fonts(ctx);
+                crate::settings::apply_ui_scale_factor(ctx, scale);
+            })
+            .build_ui_state(
+                |root, state| draw_registration_dialog(root.ctx(), state, false, false, false),
+                state,
+            );
+        harness.run_steps(3);
+        let initial = harness.get_by_label("書き換える").rect();
+        let close = harness.get_by_label("Close window").rect();
+        let window = harness
+            .ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("agent_registration_confirmation")))
+            .expect("confirmation window");
+        for frame in 0..40 {
+            harness.run_steps(1);
+            assert_eq!(
+                harness.ctx.memory(
+                    |memory| memory.area_rect(egui::Id::new("agent_registration_confirmation"))
+                ),
+                Some(window)
+            );
+            assert_eq!(
+                harness.get_by_label("書き換える").rect(),
+                initial,
+                "frame={frame} scale={scale}"
+            );
+            assert_eq!(harness.get_by_label("Close window").rect(), close);
+            for label in ["書き換える", "キャンセル", "Close window"] {
+                assert!(
+                    harness
+                        .ctx
+                        .content_rect()
+                        .contains_rect(harness.get_by_label(label).rect())
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn agent_registration_long_confirmation_controls_and_scroll_small_200_percent() {
     use crate::test_ui::scroll_layout::HeightExpectation;
     for scale in [1.0, 2.0] {

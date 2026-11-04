@@ -18,6 +18,7 @@
 //!
 //! ```text
 //! path             STRING | STORED            完全一致キー、正規化済み
+//! display_path     STORED                     表示・open用の元の大小文字を保ったパス
 //! container        STRING | STORED            "fs" / "zip"
 //! zip_entry        STRING | STORED            container="zip" のとき ZIP 内相対パス
 //! favorite_id      STRING | STORED            UUID (exact term filter 用)
@@ -230,6 +231,8 @@ pub struct QueryFilters<'a> {
 pub struct IndexDoc {
     /// 正規化済みキー (fts_meta.db と同じ path)
     pub path: String,
+    /// Original spelling for display/open; never used as a storage identity.
+    pub display_path: String,
     pub container: Container,
     /// container=Zip のとき、ZIP 内相対パス ("" なら Fs)
     pub zip_entry: String,
@@ -262,6 +265,7 @@ impl Container {
 /// Tantivy index のフィールドハンドル集合。
 pub struct Fields {
     pub path: Field,
+    pub display_path: Field,
     pub container: Field,
     pub zip_entry: Field,
     pub favorite_id: Field,
@@ -283,6 +287,9 @@ impl Fields {
     fn from_schema(schema: &Schema) -> Self {
         Self {
             path: schema.get_field("path").expect("schema: path"),
+            display_path: schema
+                .get_field("display_path")
+                .expect("schema: display_path"),
             container: schema.get_field("container").expect("schema: container"),
             zip_entry: schema.get_field("zip_entry").expect("schema: zip_entry"),
             favorite_id: schema
@@ -484,6 +491,7 @@ pub fn upsert_doc(writer: &IndexWriter, fields: &Fields, d: &IndexDoc) -> tantiv
     writer.delete_term(Term::from_field_text(fields.path, &d.path));
     writer.add_document(doc!(
         fields.path            => d.path.as_str(),
+        fields.display_path    => d.display_path.as_str(),
         fields.container       => d.container.as_str(),
         fields.zip_entry       => d.zip_entry.as_str(),
         fields.favorite_id     => d.favorite_id.to_string().as_str(),
@@ -649,7 +657,7 @@ pub fn build_bigram_and_query(
 
 /// 1 ページ分の検索結果を取得 (§9.1 ステップ 5)。
 ///
-/// 戻り値は (path, DocAddress, score, stored kind) のリスト。`DocAddress` は post-filter で
+/// 戻り値は (display/open path, DocAddress, score, stored kind) のリスト。`DocAddress` は post-filter で
 /// `searcher.doc(addr)` を呼んで STORED 原文を取り出すために返している
 /// (INDEX_VERSION=5 で fts_meta.db の `*_norm` 列を撤去した移行に伴う変更)。
 ///
@@ -670,7 +678,7 @@ pub fn search_page(
     let mut out = Vec::with_capacity(top_docs.len());
     for (score, addr) in top_docs {
         let doc: TantivyDocument = searcher.doc(addr)?;
-        if let Some(v) = doc.get_first(fields.path) {
+        if let Some(v) = doc.get_first(fields.display_path) {
             if let Some(p) = v.as_str() {
                 let kind = match doc.get_first(fields.kind).and_then(|value| value.as_str()) {
                     Some("folder") => IndexKind::Folder,
@@ -820,6 +828,7 @@ fn schema_is_stale(schema: &Schema) -> bool {
     }
     // text 系フィールドはすべて STORED 必須 (INDEX_VERSION=5+)
     for name in [
+        "display_path",
         "name",
         "exif_text",
         "xmp_tweet_text",
@@ -845,6 +854,7 @@ fn schema_is_stale(schema: &Schema) -> bool {
 fn build_schema() -> Schema {
     let mut b = Schema::builder();
     b.add_text_field("path", STRING | STORED);
+    b.add_text_field("display_path", STORED);
     b.add_text_field("container", STRING | STORED);
     b.add_text_field("zip_entry", STRING | STORED);
     b.add_text_field("favorite_id", STRING | STORED);
@@ -906,6 +916,7 @@ mod tests {
     fn sample_doc(path: &str, fav: Uuid, text: &str) -> IndexDoc {
         let base = path.rsplit('/').next().unwrap_or(path);
         IndexDoc {
+            display_path: path.to_string(),
             path: path.to_string(),
             container: Container::Fs,
             zip_entry: String::new(),
@@ -931,6 +942,7 @@ mod tests {
         png_prompt: &str,
     ) -> IndexDoc {
         IndexDoc {
+            display_path: path.to_string(),
             path: path.to_string(),
             container: Container::Fs,
             zip_entry: String::new(),
@@ -955,6 +967,7 @@ mod tests {
     /// テスト用 doc (tags フィールドのみ書き込む版)。
     fn sample_doc_with_tags(path: &str, fav: Uuid, tags: &str) -> IndexDoc {
         IndexDoc {
+            display_path: path.to_string(),
             path: path.to_string(),
             container: Container::Fs,
             zip_entry: String::new(),
@@ -972,6 +985,7 @@ mod tests {
     /// テスト用 doc (video_meta フィールドのみ書き込む版)。
     fn sample_video_doc_with_meta(path: &str, fav: Uuid, video_meta: &str) -> IndexDoc {
         IndexDoc {
+            display_path: path.to_string(),
             path: path.to_string(),
             container: Container::Fs,
             zip_entry: String::new(),
@@ -994,6 +1008,10 @@ mod tests {
     #[test]
     fn build_schema_exposes_expected_fields() {
         let s = build_schema();
+        let display = s.get_field("display_path").unwrap();
+        assert!(
+            matches!(s.get_field_entry(display).field_type(), FieldType::Str(options) if options.is_stored() && options.get_indexing_options().is_none())
+        );
         assert!(s.get_field("path").is_ok());
         assert!(s.get_field("favorite_id").is_ok());
         assert!(s.get_field("kind").is_ok());

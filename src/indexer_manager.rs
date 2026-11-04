@@ -889,6 +889,7 @@ mod tests {
                 &writer,
                 fts.fields(),
                 &IndexDoc {
+                    display_path: "c:/old.jpg".into(),
                     path: "c:/old.jpg".into(),
                     container: Container::Fs,
                     zip_entry: String::new(),
@@ -1649,6 +1650,7 @@ mod tests {
                 &w,
                 fts.fields(),
                 &IndexDoc {
+                    display_path: "c:/a/1.jpg".into(),
                     path: "c:/a/1.jpg".into(),
                     container: Container::Fs,
                     zip_entry: String::new(),

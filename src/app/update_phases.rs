@@ -926,9 +926,8 @@ impl App {
         //     run_metadata_search が SearchContainer を常に一致扱いするためフィルタ不能になる
         //   - Codex P2 #2: `has_focus` だけだと Ctrl+G active でグリッドにフォーカスが
         //     落ちた状態で Ctrl+F が通ってしまう → `active` も条件に入れる
-        // §4.1.1: PDF のページ表示中は Ctrl+F 自体を無効化する (連番ページ名を
-        // 絞っても得るものが無いため)。グリッドが PdfPage で構成されるときは
-        // ショートカットを無反応にする (検索バーは render_search_bar 側で閉じる)。
+        // Paged documents reject local filtering at the shared shortcut admission,
+        // with the same reason as the disabled menu/pinned input.
         if !self.address_has_focus
             && !main_viewer_blocked
             && !self.any_dialog_open()
@@ -936,7 +935,6 @@ impl App {
             && !self.global_search.has_focus
             && !self.tag_view.has_focus
             && !self.global_search.active
-            && !self.grid_is_pdf_pages()
         {
             let ctrl_f = self
                 .keymap

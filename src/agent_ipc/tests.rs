@@ -108,6 +108,7 @@ impl Fixture {
             let mut writer = fts.writer().unwrap();
             for i in 0..4 {
                 let doc = IndexDoc {
+                    display_path: format!("C:/fixture/cat{i}.png"),
                     path: format!("C:/fixture/cat{i}.png"),
                     container: Container::Fs,
                     zip_entry: String::new(),
@@ -563,6 +564,7 @@ fn seed_book_search_index(f: &Fixture) {
         // No real directory exists at these paths: the stored kind owns result
         // classification, including folders whose names look like file types.
         let doc = IndexDoc {
+            display_path: format!("C:/fixture/{name}"),
             path: format!("C:/fixture/{name}"),
             container: Container::Fs,
             zip_entry: String::new(),

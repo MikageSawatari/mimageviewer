@@ -106,6 +106,7 @@ fn nested_ownership_second_scan_is_unchanged_and_parent_filter_includes_inner_on
         db.upsert_meta_ok(&key, id, fixture.path(), old.kind, old.mtime, old.file_size)
             .unwrap();
         docs.push(IndexDoc {
+            display_path: key.clone(),
             path: key,
             container: Container::Fs,
             zip_entry: String::new(),
@@ -127,6 +128,7 @@ fn nested_ownership_second_scan_is_unchanged_and_parent_filter_includes_inner_on
     )
     .unwrap();
     docs.push(IndexDoc {
+        display_path: missing_key.clone(),
         path: missing_key.clone(),
         container: Container::Fs,
         zip_entry: String::new(),
@@ -709,13 +711,13 @@ fn camera_model_search_accepts_two_char_term_with_long_term_in_and_mode() {
     assert_eq!(
         search("EOS R5"),
         [
-            normalize_path(&root.path().join("a.jpg")),
-            normalize_path(&root.path().join("b.jpg")),
+            root.path().join("a.jpg").to_string_lossy().into_owned(),
+            root.path().join("b.jpg").to_string_lossy().into_owned(),
         ]
     );
     assert_eq!(
         search(r#""EOS R5""#),
-        [normalize_path(&root.path().join("a.jpg"))]
+        [root.path().join("a.jpg").to_string_lossy().into_owned()]
     );
 }
 

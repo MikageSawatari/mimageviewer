@@ -9388,6 +9388,14 @@ impl VideoPlayer {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_has_video_for_test(&mut self, has_video: bool) {
+        self.info
+            .as_mut()
+            .expect("test player must have VideoInfo")
+            .has_video = has_video;
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_chapters_for_test(&mut self, starts: &[f64]) {
         if let Some(info) = self.info.as_mut() {
             info.chapters = starts

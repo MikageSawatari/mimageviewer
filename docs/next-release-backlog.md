@@ -38,6 +38,60 @@
 
 ## 1. 優先候補
 
+### 1.698 v5 受入 A: フォルダ移動後に見えない現在地フィルタが残る (2026-11-04)
+
+- 観測: サブPC担当 `C:\miv-subpc\results-11\<部>\notes.md`、利用者の実装指示に引用された結果。移動元のindex 2だけが移動先12件でも表示され、×で全件に戻る。v4.11.0にもある不具合。
+- 原因: 実装担当がHEAD `60291ac32`で確認。`install_loading_items_inner` が旧filterで可視列を構築した後にfilterを終了していた。型は単純なHashSetではなく、条件を保持する`LocalSearchFilter`。
+- 修正: filter・origin・未完了検索の終了を可視列構築の前へ移す。世代追加の採否と他入口の監査は [検索設計 §5.2](search-architecture.md#52-ctrlf--現在地フィルタ-現グリッドの表示中アイテムのみ)。固定入力の寿命は変更しない。
+- 検証: 修正前の状態遷移テストで `[2]` 対 全12件の失敗を確認。修正後は下記関連425件で成功。実機ではCtrl+F「cole」のまま別フォルダへ移り、全件と入力欄の終了を確認する。
+
+### 1.699 v5 受入 B: AI連携の初回「書き換える」が効かない (2026-11-04)
+
+- 観測: サブPC担当（同受入記録）。v5新機能の不具合。
+- 原因: 確認窓のavailable heightから本文高を決め、footerの不足分で窓が成長する。実装担当のheadless検査でも連続フレーム間にボタンが2px移動した。
+- 修正: 共通のfooter計測・scroll styleを使い、画面下端・枠・本文開始位置から本文上限を決める。短文は自然高にし、見出しと操作行をスクロール外へ置く。共通本文helperをそのまま使う案では1pxの変動が残ったため採らない。[AI連携計画 §25](mcp-integration-plan.md#25-ai-連携を環境設定の外の窓へ移す-2026-11-01)。
+- 検証: 40フレームの窓・ボタン矩形不変、1093×614の100%/200%、長文末尾到達が成功。新規確認snapshot1枚を目視し、関連snapshot11件の通常比較も成功。実機では確認を開いた直後の「書き換える」が1回で効くか確認する。
+
+### 1.700 v5 受入 C: 対象外のページでAI説明文の操作が無反応に見える (2026-11-04)
+
+- 観測: サブPC担当（同受入記録、押し間違いの可能性は残る）。v5新機能の不具合。
+- 原因: menu modelが種類を問わず有効、ジョブ追加時は対象外件数だけを加算して通知しない。コードで確認。
+- 修正: 実際の受付と同じ選択集合でメニューを無効化し、理由を既存disabled tooltipへ渡す。混在選択は受け付け、初回の対象外数と、既存ジョブへの重複を除いた追加数・対象外数を知らせる。
+- 検証: 対象外だけの単独／チェック選択・混在・追加／重複追加の回帰が成功。実モデルは使用していない。実機ではPDFページの無効表示・理由、画像との混在選択、作成中の追加通知を確認する。
+
+### 1.701 v5 受入 D: Ctrl+Gの名前が小文字になる (2026-11-04)
+
+- 観測: サブPC担当（同受入記録）。v4.11.0にもある不具合。
+- 原因: ingestが照合用の小文字pathを保存し、結果の表示とopenにも使う。説明文のある本はcaption DBの小文字keyから候補を作る。コードで確認。依頼にあった`global_search.rs:737`はテスト用文書の生成で、製品の結果取得は`fts_index::search_page`からの経路。
+- 修正: `display_path`をSTOREDへ追加し、結果・openは元の表記、照合・削除は従来のkeyを使う。Fullの本追加とcaption反映はworkerで表記を復元。集約mapの親キー、Drillの包含・相対位置・件数・DFS・帰路も表示pathとは分けて正規化する。追加回帰では同じ場所の表記違いが4つの集約になることを確認してから修正した（`target/acceptance-d-spelling-before.log`）。INDEX_VERSIONは未公開11のまま、schema不足は既存ownerで再構築する。
+- 検証: 元の大小文字の画像・フォルダ本・説明文のあるZIP本をFull／caption反映の両方から検索し、Flat／Drillの一覧とopen dispatchのpath保持が成功。実機では索引再構築後に検索→開く→履歴／ブックマークから再表示して名前を確認する。
+
+### 1.702 v5 受入 E: PDF/EPUBページ内でCtrl+Fが無反応 (2026-11-04)
+
+- 観測: サブPC担当（同受入記録）。v4.11.0にもある不具合。
+- 原因: shortcutで単に拒否し、menuは開いたbarを同frameで閉じる。pinned欄の理由もPDF限定の文言。コードで確認。
+- 修正: 仕様を維持し、menu／固定欄／shortcutで同じ可否・理由を共有する。「本のページ表示中は現在地を絞り込めません」に統一し、shortcutは既存KeyAction経由でInfo通知する。
+- 検証: PDF／EPUBで実メニューの無効化と、入力所有者を設定したCtrl+F発火・理由通知が成功。実機では各本のページ一覧でCtrl+Fとファイルメニューの理由を確認する。
+
+### 1.703 v5 受入 F: 音声を閉じるたびに動画の続き画像を作ろうとする (2026-11-04)
+
+- 観測: サブPC担当（同受入記録）、FFmpegが`video stream not found`。v4.11.0にもある不具合。
+- 原因: 音声もVideo player cacheに入り、resume flushが映像有無を問わずthumbnailを要求する。コードで確認。
+- 修正: 通常flushとcontext終了時の退避保存で、プレイヤー生存中の映像能力を確認／捕捉してからthumbnailを要求する。共通受付も音声拡張子を除外し、Remote音声の位置保存からの要求も防ぐ。位置保存の条件は変更しない。
+- 検証: 音声・表紙あり音声・映像なしMP4・通常動画・動画の音声モードについて、通常flush／退避保存の位置と要求有無が成功。Remote音声の位置保存・画像なしも成功。実機では音声を途中で閉じて再開でき、`video stream not found`が増えず、動画の続き画像が従来どおり出るか確認する。
+
+#### A〜F の開発検証台帳 (2026-11-04、実装担当)
+
+- 対象: `v5-integration` / HEAD `60291ac32` からの未コミット差分。Windows、`CARGO_BUILD_JOBS=6`、`MSBUILDDISABLENODEREUSE=1`、既定feature／test profile。製品起動・commitは実施していない。
+- 修正前の失敗: `target/acceptance-ab-before.log`（A・B）、`target/acceptance-c-before.log`（C）、`target/acceptance-d-before.log`（D）、`target/acceptance-e-before.log`（Eのmenu）、`target/acceptance-ef-before-corrected.log`（入力所有・表示PTSを正したE shortcut／F）。Bの共通本文helper案で残った1px変動は`target/acceptance-ab-after.log`。fixture不足の初回結果を製品の原因と混同しない。
+- 関連filterのnextest: **425/425成功、exit 0、20.958秒**。`target/acceptance-final-focused.log`。filterは`acceptance_[a-f]_`、`ui_dialogs::agent_integration`、`context_menu_model`、`fts_index`、`ingest_worker`、`fts_writer_dispatcher`、`search_walker`、`indexer_supervisor`、`global_search`、`global_search_ui::tests`、`phase_c_key_tests`、`section1409`、`pinned_search`、`book_resume_meter`、resume保存の関連3filter。Dの集約キー追補前の424件成功後、影響する検索UIと共有入口を含めて再検査した。WebView2を使用するテストは選んでいない。
+- `scripts/test-focused.ps1 -Path src/ui_dialogs/caption_job.rs`: **15/15成功、exit 0、4.003秒**。`target/acceptance-caption-focused.log`。引数なしの同scriptは共有App/libと文書を広域対象として**exit 2／未実行**（`target/acceptance-focused-plan.log`）。これを全件成功とは扱わず、利用者の担当指定どおりlib全件は設計担当へ引き継ぐ。
+- `cargo fmt`／`cargo fmt --check`: exit 0。`python scripts/check_ui_glyphs.py`: exit 0、危険glyphなし。
+- `cargo check -p mimageviewer --bin mimageviewer-core`: **exit 0、19.15秒**。`target/acceptance-core-check.log`。D追補後の最終Rustソースで実施（警告あり）。
+- `cargo test -p mimageviewer --test search_metadata_e2e`: **17/17成功、exit 0、0.99秒**。`target/acceptance-search-e2e.log`。旧テスト1件が返却pathを正規化キーと比較していたため、元の大小文字を持つpathとの厳密比較に改めた。旧結果は`target/acceptance-search-e2e-before-display-contract.log`。
+- snapshotは`UPDATE_SNAPSHOTS=1`を新規`agent_registration_confirmation_small_light`の生成だけに指定し、目視後に更新指定なしで`cargo test --test ui_snapshot agent_`: **11/11成功、exit 0、1.80秒**。`target/acceptance-snapshot-generate.log`／`target/acceptance-snapshot-compare.log`。新規PNG1枚70,109 bytes、既存PNGの変更なし。
+- lib全件・build-devは利用者の指定どおり設計担当へ引き継ぐ。製品起動・WebView2試験・実機受入・commitは未実施。
+
 ### v4.11.0 で出荷した 5ch・X 由来の項目と、報告者への案内 (2026-11-02)
 
 v4.11.0 (2026-11-02 公開) で出荷し、本書から外した項目のうち、5ch・X の報告・要望から来たもの。案内したら行を消す。経緯は git 履歴 (`6def65e3b` 以前の本書) と [リリース記録](release-verification-records.md) にある。

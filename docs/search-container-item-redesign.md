@@ -222,6 +222,11 @@ PDF document info を使うときは `run_metadata_search` から `pdf_loader::g
 
 #### 4.1.1 Ctrl+F と PDF
 
+2026-11-04 受入 E: この節のページ内フィルタ不可はEPUBにも共通。
+menuは無効＋理由tooltip、`GlobalLocalSearch` shortcutは理由通知とする。
+文言は「本のページ表示中は現在地を絞り込めません」。機能範囲は変更せず、
+`pinned_search_availability(Local)`を可否・理由の共通境界にする。
+
 現状、`PdfFile` は常に残り、`PdfPage` はページ名だけで判定され、PDF document info
 (タイトル / 著者 / 件名 / キーワード) は Ctrl+F では実質使われていない。新仕様では
 ユーザー期待 (「検索対象 = PDF メタ情報」なら PDF のタイトル等も対象になる) に合わせる。

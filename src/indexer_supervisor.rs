@@ -799,8 +799,11 @@ fn reflect_captions(
             if !keys.insert(key) {
                 continue;
             }
+            let restored = crate::path_key::restore_existing_path_casing(std::path::Path::new(key));
             match build_candidate_from_path(
-                std::path::Path::new(key),
+                restored
+                    .as_deref()
+                    .unwrap_or_else(|| std::path::Path::new(key)),
                 key.clone(),
                 session.caption_db(),
             ) {
@@ -2631,6 +2634,103 @@ mod tests {
             rusqlite::params![key, text],
         )
         .unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn acceptance_d_search_preserves_physical_path_casing_for_scan_and_reflection() {
+        let (tmp, meta, fts, writer, sem, _) = setup();
+        let root = tmp.path().join("MixedShelf");
+        fs::create_dir(&root).unwrap();
+        let paths = [
+            root.join("MixedPhoto.JPG"),
+            root.join("MixedFolder"),
+            root.join("MixedBook.ZIP"),
+        ];
+        write_image(&root, "MixedPhoto.JPG");
+        fs::create_dir(&paths[1]).unwrap();
+        fs::write(&paths[2], b"archive").unwrap();
+        let db_path = tmp.path().join("ai_caption.db");
+        for path in &paths[1..] {
+            put_caption(
+                &db_path,
+                &crate::search_index_db::normalize_path(path),
+                "caption",
+            );
+        }
+        let favorite = Uuid::new_v4();
+        let mut session = IngestSession::new_with_caption_db_path(
+            favorite,
+            root.clone(),
+            &meta,
+            &fts,
+            db_path.clone(),
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stats = Mutex::new(SupervisorStats::default());
+        let progress = ProgressReporter::new();
+        run_initial_scan(
+            favorite,
+            &root,
+            &mut session,
+            &writer,
+            &sem,
+            &[],
+            cancel.clone(),
+            &stats,
+            &progress,
+        );
+        for phase in ["scan", "reflection"] {
+            if phase == "reflection" {
+                let keys = paths
+                    .iter()
+                    .map(|path| crate::search_index_db::normalize_path(path))
+                    .collect();
+                session
+                    .apply(
+                        vec![],
+                        keys,
+                        &writer,
+                        &sem,
+                        IoPriority::Normal,
+                        &cancel,
+                        None,
+                    )
+                    .unwrap();
+                for path in &paths {
+                    put_caption(
+                        &db_path,
+                        &crate::search_index_db::normalize_path(path),
+                        "updated caption",
+                    );
+                }
+                reflect_captions(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
+            }
+            let (tx, rx) = crossbeam_channel::unbounded();
+            crate::global_search::run(
+                "mixed",
+                &[favorite],
+                &Default::default(),
+                &fts,
+                &cancel,
+                &tx,
+                None,
+            );
+            let hits = rx
+                .try_iter()
+                .flat_map(|event| match event {
+                    crate::global_search::SearchStreamEvent::Batch { hits, .. } => hits,
+                    _ => Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(hits.len(), paths.len(), "{phase}");
+            for path in &paths {
+                assert!(
+                    hits.iter().any(|hit| PathBuf::from(&hit.path) == *path),
+                    "{phase}: {path:?}, {hits:?}"
+                );
+            }
+        }
     }
 
     #[test]

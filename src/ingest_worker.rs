@@ -509,6 +509,7 @@ impl<'a> IngestSession<'a> {
             );
         }
         Ok(IndexDoc {
+            display_path: cand.abs_path.to_string_lossy().into_owned(),
             path: cand.key.clone(),
             container,
             zip_entry: String::new(),
@@ -1086,7 +1087,7 @@ mod tests {
         let searcher = fts.searcher();
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].0, key);
+        assert_eq!(Path::new(&hits[0].0), tmp.path().join("sunset_夕焼け.jpg"));
     }
 
     #[test]
@@ -1149,7 +1150,7 @@ mod tests {
             .unwrap();
             fts_index::search_page(&fts.searcher(), fts.fields(), &q, 0, 10).unwrap()
         };
-        assert_eq!(search("sunflower_book")[0].0, key);
+        assert_eq!(Path::new(&search("sunflower_book")[0].0), logical);
         assert!(search("SecretMetadataTitle").is_empty());
     }
 
@@ -1334,7 +1335,7 @@ mod tests {
         fts.reload_reader().unwrap();
         let hits = fts_index::search_page(&fts.searcher(), fts.fields(), &q, 0, 10).unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].0, key);
+        assert_eq!(Path::new(&hits[0].0), tmp.path().join("SearchableSong.MP3"));
     }
 
     /// Codex P1 回帰: ingest commit 後に reader が確実に reload 済みであること。

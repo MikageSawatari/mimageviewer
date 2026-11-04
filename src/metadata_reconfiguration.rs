@@ -817,6 +817,7 @@ mod tests {
         let docs = paths
             .into_iter()
             .map(|(path, favorite_id)| crate::fts_index::IndexDoc {
+                display_path: path.clone(),
                 path,
                 container: crate::fts_index::Container::Fs,
                 zip_entry: String::new(),
@@ -868,6 +869,7 @@ mod tests {
                 )
                 .unwrap();
             docs.push(crate::fts_index::IndexDoc {
+                display_path: path.into(),
                 path: path.into(),
                 container: crate::fts_index::Container::Fs,
                 zip_entry: String::new(),
@@ -1062,6 +1064,7 @@ mod tests {
                     &writer,
                     fts.fields(),
                     &crate::fts_index::IndexDoc {
+                        display_path: path.clone(),
                         path,
                         container: crate::fts_index::Container::Fs,
                         zip_entry: String::new(),
@@ -1948,6 +1951,7 @@ mod tests {
         initial_done(&runtime);
         let key = crate::search_index_db::normalize_path(&f.path.join("ghost.jpg"));
         let doc = crate::fts_index::IndexDoc {
+            display_path: key.clone(),
             path: key.clone(),
             container: crate::fts_index::Container::Fs,
             zip_entry: String::new(),
@@ -1989,6 +1993,7 @@ mod tests {
         initial_done(&runtime);
         let key = crate::search_index_db::normalize_path(&excluded.join("ghost.jpg"));
         let doc = crate::fts_index::IndexDoc {
+            display_path: key.clone(),
             path: key.clone(),
             container: crate::fts_index::Container::Fs,
             zip_entry: String::new(),

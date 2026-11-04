@@ -734,6 +734,7 @@ mod tests {
         meta.upsert_meta_ok(&key, fav, &PathBuf::from("C:/"), IndexKind::Image, 0, 0)
             .unwrap();
         let doc = IndexDoc {
+            display_path: key.clone(),
             path: key.clone(),
             container: Container::Fs,
             zip_entry: String::new(),
@@ -902,6 +903,7 @@ mod tests {
                     &writer,
                     fts.fields(),
                     &IndexDoc {
+                        display_path: format!("c:/{id}.jpg"),
                         path: format!("c:/{id}.jpg"),
                         container: Container::Fs,
                         zip_entry: String::new(),
@@ -1000,6 +1002,7 @@ mod tests {
             for index in 0..count {
                 let path = format!("c:/progress/{index:04}.jpg");
                 let doc = IndexDoc {
+                    display_path: normalize_path(&PathBuf::from(&path)),
                     path: normalize_path(&PathBuf::from(&path)),
                     container: Container::Fs,
                     zip_entry: String::new(),
@@ -1036,6 +1039,7 @@ mod tests {
                     &writer,
                     fts.fields(),
                     &IndexDoc {
+                        display_path: path.into(),
                         path: path.into(),
                         container: Container::Fs,
                         zip_entry: String::new(),
@@ -1127,6 +1131,7 @@ mod tests {
                     &writer,
                     fts.fields(),
                     &IndexDoc {
+                        display_path: path.into(),
                         path: path.into(),
                         container: Container::Fs,
                         zip_entry: String::new(),
@@ -1511,6 +1516,7 @@ mod tests {
                 &w,
                 fts.fields(),
                 &crate::fts_index::IndexDoc {
+                    display_path: key.clone(),
                     path: key.clone(),
                     container: crate::fts_index::Container::Fs,
                     zip_entry: String::new(),
@@ -1571,6 +1577,7 @@ mod tests {
                 &w,
                 fts.fields(),
                 &IndexDoc {
+                    display_path: key.clone(),
                     path: key.clone(),
                     container: Container::Fs,
                     zip_entry: String::new(),

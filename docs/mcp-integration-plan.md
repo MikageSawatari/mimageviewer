@@ -4613,6 +4613,19 @@ single-instance mutexを共有するため、先にインストール版/常駐t
 
 ## 25. 「AI 連携」を環境設定の外の窓へ移す (2026-11-01)
 
+2026-11-04 受入 B: 登録確認窓は共通のfooter計測とscroll styleを使う。
+操作行を実際のラベル・フォント・折り返し幅で測り、separator/spacing込みで予約する。
+画面下端・枠・本文開始位置から本文上限を直接決め、短文は自然高へ縮める。
+`startup_dialog_scroll_body`をそのまま使う案は、resizable Window自身のavailable heightを
+参照するため1pxの連続変動が残り、不採用。自分の前フレームの高さに本文が
+追従して窓が成長する循環を除いた。見出し・操作行はスクロール外。
+`acceptance_b_registration_geometry_is_stable_across_frames` は1093×614・100%/200%で
+40フレームのボタンとタイトル×の矩形不変・画面内配置を検査する。
+既存長文テストは末尾到達・キャンセル操作を検査する。実アプリでの初回クリックは未確認。
+最終自動検査は関連425件（他の受入項目も含む）すべて成功。
+`agent_registration_confirmation_small_light`を1枚追加し、1093×614で本文・操作行・×を
+実装担当が目視した。更新指定を外した`cargo test --test ui_snapshot agent_`も11/11成功。
+
 ### 25.1 利用者の判断 (U13)
 
 - サブ PC での確認の後、利用者から「環境設定は OK を押すまで反映されないページなので、リモート接続のように環境設定の外側の

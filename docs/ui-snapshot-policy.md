@@ -1,5 +1,13 @@
 # UI スナップショットテスト運用方針
 
+v5受入B（2026-11-04）の登録確認は`agent_registration_confirmation_small_light`
+（1093×614、70,109 bytes）を1枚追加する。実環境・設定ファイル・登録workerを使わない
+固定fixtureで製品と共通の確認Windowを描く。本文・設定path・追加する内容・backupの説明・
+固定操作行とタイトル×が収まることを生成後に目視した。既存10枚は更新しない。
+`cargo test --test ui_snapshot agent_`の更新指定なし通常比較11件が成功した。
+100%/200%の40frame geometry不変と長文の末尾到達／操作可視性はlibの専用回帰で検査し、
+実アプリ初回クリック・実際の登録ファイル書き換えの証拠とは分ける。
+
 §1.677の種類iconは利用者採択の配色A・既定ON・セル枠左上(4,4)pt・図形20pt＋背景24ptで固定する。
 `thumbnail_type_icon_dark/light`の既存baselineはそのまま維持し、今回の仕上げでPNGは更新しない。
 比較候補のB/C・色なし・16/24ptはsourceから撤去する。ignoredの`thumbnail_type_icon_write_previews`は残し、

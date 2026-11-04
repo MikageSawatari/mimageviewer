@@ -1478,6 +1478,11 @@ impl crate::app::App {
             checked_count: target.checked_count,
             checked_file_operation_selection: target.checked_file_operation_selection,
             can_use_folder_commands: target.folder_command_target.is_some(),
+            can_create_ai_captions: target.surface == ContextMenuSurface::Grid
+                && !self
+                    .caption_targets(target.is_folder_context)
+                    .paths
+                    .is_empty(),
             can_paste_edit_bundle: self.has_page_edit_bundle_clipboard(),
             has_explorer_folder: target.explorer_folder.is_some(),
             collection_reference: match &target.collection_root_delete {
@@ -4302,6 +4307,65 @@ mod delete_confirm_tests {
         let mut commands = Vec::new();
         visit(&app.context_menu_nodes(&target, false), &mut commands);
         commands
+    }
+
+    #[test]
+    fn acceptance_c_caption_menu_checks_effective_selection() {
+        fn caption_state(nodes: &[MenuNode]) -> Option<(bool, bool)> {
+            nodes.iter().find_map(|node| match node {
+                MenuNode::Item {
+                    command: MenuCommand::CreateAiCaptions,
+                    enabled,
+                    disabled_reason,
+                    ..
+                } => Some((*enabled, disabled_reason.is_some())),
+                MenuNode::Submenu { children, .. } => caption_state(children),
+                _ => None,
+            })
+        }
+        let mut app = crate::app::setup_app_for_test();
+        app.current_folder = Some("C:/book.pdf".into());
+        let page = GridItem::PdfPage {
+            pdf_path: "C:/book.pdf".into(),
+            page_num: 0,
+            content_type: None,
+        };
+        let zip_image = GridItem::ZipImage {
+            zip_path: "C:/book.zip".into(),
+            entry_name: "page.jpg".into(),
+        };
+        let zip_dir = GridItem::ZipDir {
+            zip_path: "C:/book.zip".into(),
+            dir_prefix: "chapter/".into(),
+            is_archive: false,
+            representative: None,
+        };
+        for unsupported in [page, zip_image, zip_dir] {
+            app.items = vec![
+                unsupported.clone(),
+                unsupported.clone(),
+                GridItem::Image("C:/Photo.jpg".into()),
+            ];
+            app.selected = Some(0);
+            app.checked.clear();
+            let mut target = target(&app, unsupported, ContextMenuSurface::Grid);
+            assert_eq!(
+                caption_state(&app.context_menu_nodes(&target, false)),
+                Some((false, true))
+            );
+            app.checked = [0, 1].into_iter().collect();
+            target.has_checked = true;
+            target.checked_count = 2;
+            assert_eq!(
+                caption_state(&app.context_menu_nodes(&target, false)),
+                Some((false, true))
+            );
+            app.checked = [0, 2].into_iter().collect();
+            assert_eq!(
+                caption_state(&app.context_menu_nodes(&target, false)),
+                Some((true, false))
+            );
+        }
     }
 
     #[test]

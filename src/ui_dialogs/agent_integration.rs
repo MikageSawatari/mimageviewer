@@ -768,13 +768,20 @@ fn draw_registration_dialog(
         .enabled(!writing)
         .open(&mut open)
         .show(ctx, |ui| {
-            let button_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
-            let body_height = (ui.available_height() - button_height - 12.0).max(24.0);
-            ui.spacing_mut().scroll = panel_scroll_style();
+            let footer =
+                super::startup_dialog_footer_height(ui, &["書き換える", "キャンセル"], 0.0);
+            // Use the viewport, never this resizable Window's previous content height.
+            // Reserving the measured footer prevents a body/footer sizing feedback loop.
+            let frame = egui::Frame::window(ui.style()).total_margin();
+            let body_height =
+                (screen.bottom() - 24.0 - frame.bottom - ui.cursor().top() - footer).max(1.0);
+            ui.spacing_mut().scroll =
+                super::non_overlapping_dialog_scroll_style(panel_scroll_style());
             let output = egui::ScrollArea::vertical()
                 .id_salt("agent_registration_body")
                 .max_height(body_height)
-                .auto_shrink([false, false])
+                .min_scrolled_height(0.0)
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     match operation {
@@ -863,6 +870,33 @@ fn registration_action_requested(
     response.clicked_by(egui::PointerButton::Primary)
         || (keyboard_allowed && response.clicked() && !ime_keyboard_click)
         || (keyboard_allowed && focus_allows_action && dialog_key)
+}
+
+/// Fixed confirmation preview; no environment capture, filesystem access or workers.
+#[doc(hidden)]
+pub fn draw_agent_registration_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut state = AgentIntegrationState::new();
+    state.operation = Some(RegistrationOperation::Confirming {
+        env: backend::RegistrationEnvironment {
+            local_app_data: None, app_data: None, user_profile: None,
+            codex_home: None, launcher_exe: None,
+            current_exe: r"C:\mImageViewer\mimageviewer-core.exe".into(),
+            data_dir: r"C:\mImageViewer\data".into(),
+            working_dir: r"C:\mImageViewer".into(),
+        },
+        request: backend::WriteRequest {
+            target: AppTarget::ClaudeDesktop,
+            path: r"C:\Users\User\AppData\Roaming\Claude\claude_desktop_config.json".into(),
+            action: Action::Register,
+            command: backend::RegistrationCommand { command: String::new(), args: Vec::new() },
+            preview: backend::RegistrationPreview {
+                removed: String::new(),
+                added: "{\n  \"mcpServers\": {\n    \"mimageviewer\": {\n      \"command\": \"C:/mImageViewer/mimageviewer-mcp.exe\"\n    }\n  }\n}".into(),
+            },
+        },
+        opened_frame: ui.ctx().cumulative_frame_nr(),
+    });
+    draw_registration_dialog(ui.ctx(), &mut state, false, false, false);
 }
 
 /// No environment capture, filesystem access, process enumeration, or workers.

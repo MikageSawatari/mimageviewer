@@ -35,6 +35,17 @@ fn agent_integration_snapshot(name: &str, theme: mimageviewer::os_theme::Resolve
 }
 
 #[test]
+fn agent_registration_confirmation_small_light() {
+    snapshot_with_theme_at_size(
+        "agent_registration_confirmation_small_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(1093.0, 614.0),
+        None,
+        mimageviewer::draw_agent_registration_snapshot_fixture,
+    );
+}
+
+#[test]
 fn agent_integration_window_disabled_light() {
     agent_integration_snapshot(
         "agent_integration_window_disabled_light",

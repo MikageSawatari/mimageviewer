@@ -2,6 +2,184 @@
 use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
 
+#[test]
+#[cfg(windows)]
+fn acceptance_f_resume_thumbnails_require_a_video_stream_and_keep_audio_positions() {
+    for (name, has_video, audio_mode, expected) in [
+        ("Audio.mp3", false, false, false),
+        ("AudioWithCover.mp3", true, false, false),
+        ("NoVideo.mp4", false, false, false),
+        ("Movie.mp4", true, false, true),
+        ("MovieAudioMode.mp4", true, true, true),
+    ] {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().join(name);
+        let mut player =
+            crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.set_has_video_for_test(has_video);
+        player.set_position_for_test(15.0);
+        player.set_last_displayed_pts_for_test(15.0);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        app.video_audio_mode = audio_mode.then_some(0);
+        let key = crate::adjustment_db::normalize_path(&path);
+        let width = crate::settings::VIDEO_RESUME_PREVIEW_EXTRACT_WIDTH;
+        app.video_tile_cache
+            .as_ref()
+            .unwrap()
+            .store_resume_webp(&path, width, 15_000, 0, 1, &[1])
+            .unwrap();
+        app.save_all_video_resume_positions();
+        assert_eq!(
+            app.settings.video_resume_positions.get(&key),
+            Some(&15.0),
+            "{name}"
+        );
+        assert_eq!(
+            app.video_resume_thumb_last_request.contains_key(&key),
+            expected,
+            "{name}"
+        );
+        app.video_resume_thumb_last_request.clear();
+        let plan = viewer_context_media_teardown_plan(
+            app.projected_viewer_context_id(),
+            ContextRef::mounted(&app),
+            app.media_memory_clear_generation,
+        );
+        app.save_viewer_context_media_teardown_resumes(&[plan]);
+        assert_eq!(
+            app.settings.video_resume_positions.get(&key),
+            Some(&15.0),
+            "teardown {name}"
+        );
+        assert_eq!(
+            app.video_resume_thumb_last_request.contains_key(&key),
+            expected,
+            "teardown {name}"
+        );
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn acceptance_f_remote_audio_progress_saves_position_without_thumbnail() {
+    let mut app = setup_app_for_test();
+    let path = app.tmp.path().join("RemoteAudio.MP3");
+    let key = crate::adjustment_db::normalize_path(&path);
+    app.apply_remote_media_resume_update(path, 15.0, 60.0, false);
+    assert_eq!(app.settings.video_resume_positions.get(&key), Some(&15.0));
+    assert!(!app.video_resume_thumb_last_request.contains_key(&key));
+}
+
+#[test]
+fn acceptance_e_paged_document_shortcut_reports_why_local_filter_is_unavailable() {
+    for extension in ["epub", "pdf"] {
+        let mut app = setup_app_for_test();
+        app.current_folder = Some(PathBuf::from(format!("C:/Book.{extension}")));
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
+                egui::Event::Key {
+                    key: egui::Key::F,
+                    physical_key: Some(egui::Key::F),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                },
+            ],
+            ..Default::default()
+        });
+        crate::keyboard_input::cache_keyboard_owner(
+            &ctx,
+            crate::keyboard_input::KeyboardOwner::ApplicationShortcut {
+                scope: crate::keyboard_input::ShortcutScope::new(
+                    ctx.viewport_id(),
+                    crate::keyboard_input::ShortcutSurface::Main,
+                ),
+            },
+        );
+        assert!(
+            app.keymap
+                .pressed_action(&ctx, crate::keymap::KeyAction::GlobalLocalSearch)
+        );
+        app.input_main_grid_shortcuts(&ctx, false);
+        ctx.end_pass().drop_without_applying_deltas();
+        assert!(!app.show_search_bar);
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some("本のページ表示中は現在地を絞り込めません"),
+            "{extension}"
+        );
+    }
+}
+
+#[test]
+fn acceptance_e_local_filter_menu_is_disabled_inside_pdf_and_epub() {
+    use egui_kittest::kittest::{NodeT, Queryable};
+    for extension in ["epub", "pdf"] {
+        let mut app = setup_app_for_test();
+        app.current_folder = Some(PathBuf::from(format!("C:/Book.{extension}")));
+        let label = app
+            .keymap
+            .menu_command_label(crate::keymap::MenuCommandId::FileLocalSearch);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1093.0, 614.0))
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .build_ui_state(
+                |ui, app| {
+                    let _ = app.render_menubar(ui);
+                },
+                app,
+            );
+        harness.run_steps(3);
+        harness.get_by_label("ファイル").click();
+        harness.run_steps(3);
+        assert!(
+            harness.get_by_label(&label).accesskit_node().is_disabled(),
+            "{extension}"
+        );
+    }
+}
+
+#[test]
+fn acceptance_a_list_replacement_retires_local_filter_before_visibility() {
+    let mut app = setup_app_for_test();
+    let source = app.tmp.path().join("source");
+    let destination = app.tmp.path().join("destination");
+    app.current_folder = Some(source.clone());
+    app.items = (0..12)
+        .map(|i| GridItem::Image(source.join(format!("{i:03}.jpg"))))
+        .collect();
+    app.image_metas = vec![None; 12];
+    app.thumbnails = vec![ThumbnailState::Pending; 12];
+    app.search_filter = Some(HashSet::from([2]).into());
+    app.search_filter_origin_folder = Some(source);
+    app.show_search_bar = true;
+    app.search_query = "cole".into();
+    app.rebuild_visible_indices();
+    assert_eq!(app.visible_indices, vec![2]);
+    let items = (0..12)
+        .map(|i| GridItem::Image(destination.join(format!("{i:03}.jpg"))))
+        .collect();
+    app.start_loading_items(
+        destination,
+        items,
+        vec![None; 12],
+        Default::default(),
+        Vec::new(),
+        None,
+    );
+    assert!(app.search_filter.is_none());
+    assert!(app.search_query.is_empty());
+    assert_eq!(app.visible_indices, (0..12).collect::<Vec<_>>());
+}
+
 #[path = "tests/same_position_double_click.rs"]
 mod same_position_double_click;
 
@@ -80379,6 +80557,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             crate::adjustment_db::normalize_path(std::path::Path::new(r"C:\clips\finished.mp4"));
         let updates = vec![
             MediaResumeUpdate {
+                has_video: true,
                 clear_generation: 0,
                 path: PathBuf::from(r"C:\clips\keep.mp4"),
                 key: kept.clone(),
@@ -80388,6 +80567,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 audio_track_choice: None,
             },
             MediaResumeUpdate {
+                has_video: true,
                 clear_generation: 0,
                 path: PathBuf::from(r"C:\clips\finished.mp4"),
                 key: finished.clone(),

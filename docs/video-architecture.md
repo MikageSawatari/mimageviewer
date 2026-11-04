@@ -1,5 +1,15 @@
 # 動画再生サブシステム アーキテクチャ
 
+2026-11-04 受入 F: 再生位置は音声・動画とも従来の共通保存規則を使うが、続きの画像は
+プレイヤーの`VideoInfo.has_video`が確定している場合だけ要求する。通常flushとcontext終了時の
+退避保存を両方対象にし、後者は既存`MediaResumeUpdate`へプレイヤー生存中の映像能力を
+不変値として捕捉する。新しいviewer状態・待機・判定I/Oは作らない。音声拡張子は共通の
+thumbnail受付でも除外し、Remoteからの音声位置保存も画像生成へ進めない。
+動画の音声モードは元ソースの映像能力を保持するので、動画の続き画像は従来どおり。
+`acceptance_f_resume_thumbnails_require_a_video_stream_and_keep_audio_positions`は音声・
+映像なしMP4・通常動画・動画の音声モードで位置保存と要求有無を検査する。
+音声の表紙があっても除外し、Remote音声も別の回帰で位置保存を確認する。
+
 mimageviewer の動画インライン再生機能の設計指針と内部構造をまとめる。
 NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終構成** を記述する。
 撤回経緯は本書末尾の「Appendix: Phase 2 撤回理由」を参照。

@@ -620,7 +620,7 @@ pub struct GlobalSearchState {
     pub(crate) pending: Option<SearchProducer>,
     /// One prepare owner per Ctrl+G run. Hit batches use a FIFO; view wishes coalesce.
     pub(crate) page_edit_prepare: Option<SearchPageEditPrepare>,
-    /// 親コンテナ path → 集約済みヒット (docs §10.4.2 ContainerHit)
+    /// Normalized parent-container key → hit with original display/open path.
     pub containers: HashMap<PathBuf, ContainerHit>,
     /// 生の全ヒット (drill-down 時に container でフィルタするため保持)
     pub all_hits: Vec<GlobalHit>,
@@ -886,7 +886,7 @@ impl GlobalSearchState {
         };
         let container_has_hit = self.all_hits.iter().any(|hit| {
             if drill.is_zip {
-                parent_container(&hit.path).0 == drill.container_root
+                crate::folder_tree::path_eq(&parent_container(&hit.path).0, &drill.container_root)
             } else {
                 !is_zip_hit_path(&hit.path)
                     && Path::new(&hit.path)
@@ -905,7 +905,7 @@ impl GlobalSearchState {
             return false;
         }
         let original = drill.current_path.clone();
-        while drill.current_path != drill.container_root {
+        while !crate::folder_tree::path_eq(&drill.current_path, &drill.container_root) {
             let has_hit = self.all_hits.iter().any(|hit| {
                 if is_zip_hit_path(&hit.path) {
                     return false;
@@ -939,7 +939,7 @@ impl GlobalSearchState {
         let representative = image_representative_from_hit(&hit.path, hit.kind);
         let entry = self
             .containers
-            .entry(container_path.clone())
+            .entry(search_path_key(&container_path))
             .or_insert_with(|| ContainerHit {
                 path: container_path,
                 kind,
@@ -1111,7 +1111,7 @@ fn compute_drilled_subfolder_counts(
     if is_zip {
         return HashMap::new();
     }
-    let mut sub_counts: HashMap<PathBuf, [u32; 6]> = HashMap::new();
+    let mut sub_counts: HashMap<String, [u32; 6]> = HashMap::new();
     for h in &state.all_hits {
         if is_zip_hit_path(&h.path) {
             continue;
@@ -1124,24 +1124,23 @@ fn compute_drilled_subfolder_counts(
             continue;
         }
         // 直下のヒットはサブフォルダバッジに含めない (current_path 自身のバッジは出さない)
-        if hp_parent == current_path {
+        if crate::folder_tree::path_eq(hp_parent, current_path) {
             continue;
         }
-        let rel = match hp_parent.strip_prefix(current_path) {
-            Ok(r) => r,
-            Err(_) => continue,
+        let rel = match relative_search_path(hp_parent, current_path) {
+            Some(r) => r,
+            None => continue,
         };
         if let Some(first) = rel.components().next() {
             let child = current_path.join(first.as_os_str());
             let bucket = h.stars.min(5) as usize;
-            sub_counts.entry(child).or_insert([0u32; 6])[bucket] += 1;
+            sub_counts
+                .entry(crate::adjustment_db::normalize_path(&child))
+                .or_insert([0u32; 6])[bucket] += 1;
         }
     }
     // App 側のキー形式 (= folder_rating_counts と同じ正規化文字列) に合わせる
     sub_counts
-        .into_iter()
-        .map(|(p, c)| (crate::adjustment_db::normalize_path(&p), c))
-        .collect()
 }
 
 /// 指定したモードで ContainerHit をソートして返す。
@@ -1399,7 +1398,7 @@ fn build_drilled_items_with_recipe(
     let mut direct_files: Vec<(PathBuf, IndexKind, crate::settings::ListingSortMetadata)> =
         Vec::new();
     // 直下子フォルダ → その配下のヒット件数 (rating_filter 通過後)
-    let mut sub_counts: HashMap<PathBuf, usize> = HashMap::new();
+    let mut sub_counts: HashMap<PathBuf, (PathBuf, usize)> = HashMap::new();
 
     for h in &state.all_hits {
         if is_zip_hit_path(&h.path) {
@@ -1419,7 +1418,7 @@ fn build_drilled_items_with_recipe(
         if !path_is_under_or_eq(hp_parent, current_path) {
             continue;
         }
-        if hp_parent == current_path {
+        if crate::folder_tree::path_eq(hp_parent, current_path) {
             direct_files.push((
                 hp,
                 h.kind,
@@ -1427,23 +1426,27 @@ fn build_drilled_items_with_recipe(
             ));
         } else {
             // current_path の直下の子フォルダ名を拾う
-            let rel = match hp_parent.strip_prefix(current_path) {
-                Ok(r) => r,
-                Err(_) => continue,
+            let rel = match relative_search_path(hp_parent, current_path) {
+                Some(r) => r,
+                None => continue,
             };
             if let Some(first) = rel.components().next() {
                 let child = current_path.join(first.as_os_str());
-                *sub_counts.entry(child).or_insert(0) += 1;
+                sub_counts
+                    .entry(search_path_key(&child))
+                    .or_insert((child, 0))
+                    .1 += 1;
             }
         }
     }
 
     // A surviving search branch takes precedence over the direct folder-book hit.
-    direct_files
-        .retain(|(path, kind, _)| *kind != IndexKind::Folder || !sub_counts.contains_key(path));
-    let drill_branches = sub_counts.keys().cloned().collect();
+    direct_files.retain(|(path, kind, _)| {
+        *kind != IndexKind::Folder || !sub_counts.contains_key(&search_path_key(path))
+    });
+    let drill_branches = sub_counts.values().map(|(path, _)| path.clone()).collect();
     // サブフォルダ (Folder) を名前昇順 → 続いて直下ファイル (Image) を名前昇順
-    let mut sub_vec: Vec<(PathBuf, usize)> = sub_counts.into_iter().collect();
+    let mut sub_vec: Vec<(PathBuf, usize)> = sub_counts.into_values().collect();
     if sort_order.is_size() {
         sub_vec.sort_by(|a, b| {
             let a_name = a.0.file_name().and_then(|name| name.to_str()).unwrap_or("");
@@ -1538,7 +1541,7 @@ fn build_drilled_zip_items_with_recipe(
         let Some((zip_part, entry)) = split_zip_hit_path(&h.path) else {
             continue;
         };
-        if zip_part != zip_key {
+        if crate::search_index_db::normalize_path(Path::new(zip_part)) != zip_key {
             continue;
         }
         if rf_active && !recipe.allows(&hit_rating_key(&h.path), h.stars, rating_filter) {
@@ -1617,10 +1620,12 @@ fn search_rating_keys_for_view(state: &GlobalSearchState, view: &GlobalSearchVie
             let Some(parent) = path.parent() else {
                 continue;
             };
-            if !path_is_under_or_eq(parent, current_path) || parent == current_path {
+            if !path_is_under_or_eq(parent, current_path)
+                || crate::folder_tree::path_eq(parent, current_path)
+            {
                 continue;
             }
-            if let Ok(relative) = parent.strip_prefix(current_path)
+            if let Some(relative) = relative_search_path(parent, current_path)
                 && let Some(first) = relative.components().next()
             {
                 keys.push(crate::adjustment_db::normalize_path(
@@ -1689,7 +1694,23 @@ fn sort_search_items_by_rating_values(
 
 /// `child` が `ancestor` と等しいか配下にあれば true。
 fn path_is_under_or_eq(child: &Path, ancestor: &Path) -> bool {
-    child == ancestor || child.starts_with(ancestor)
+    search_path_key(child).starts_with(search_path_key(ancestor))
+}
+
+/// Search identities keep the existing normalized key; visible paths stay untouched.
+fn search_path_key(path: &Path) -> PathBuf {
+    PathBuf::from(crate::search_index_db::normalize_path(path))
+}
+
+fn relative_search_path(child: &Path, ancestor: &Path) -> Option<PathBuf> {
+    path_is_under_or_eq(child, ancestor).then(|| {
+        // Component-boundary identity was checked above. Slice components, not bytes,
+        // so casing/separator differences cannot change the retained suffix spelling.
+        child
+            .components()
+            .skip(ancestor.components().count())
+            .collect()
+    })
 }
 
 /// Ctrl+G の通常 FS ヒットを表示用 GridItem へ変換する共通境界。
@@ -1740,8 +1761,11 @@ pub(crate) fn collect_hit_folders_dfs(
     container_root: &Path,
 ) -> Vec<PathBuf> {
     // ヒットの直上フォルダ + その container_root までの祖先を全部集める
-    let mut folders: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
-    folders.insert(container_root.to_path_buf());
+    let mut folders = std::collections::BTreeMap::<PathBuf, PathBuf>::new();
+    folders.insert(
+        search_path_key(container_root),
+        container_root.to_path_buf(),
+    );
     for h in all_hits {
         if is_zip_hit_path(&h.path) {
             continue; // ZIP ヒットはスキップ (container_root が ZIP のときは未対応)
@@ -1751,8 +1775,10 @@ pub(crate) fn collect_hit_folders_dfs(
             continue;
         };
         while path_is_under_or_eq(&cur, container_root) {
-            folders.insert(cur.clone());
-            if cur == container_root {
+            folders
+                .entry(search_path_key(&cur))
+                .or_insert_with(|| cur.clone());
+            if crate::folder_tree::path_eq(&cur, container_root) {
                 break;
             }
             match cur.parent() {
@@ -1762,7 +1788,7 @@ pub(crate) fn collect_hit_folders_dfs(
         }
     }
     // PathBuf の lexicographic 順 = DFS pre-order (親 < 子、兄弟は名前順) になる
-    folders.into_iter().collect()
+    folders.into_values().collect()
 }
 
 /// `replace_search_view_items` でストリーミング rebuild 間にサムネを使い回すための
@@ -2013,7 +2039,7 @@ fn search_prepare_worker(
                 ctx.request_repaint_of(egui::ViewportId::ROOT);
             }
             SearchPrepareCommand::Mtime(result) => {
-                if let Some(container) = state.containers.get_mut(&result.path) {
+                if let Some(container) = state.containers.get_mut(&search_path_key(&result.path)) {
                     container.mtime = result.mtime;
                 }
             }
@@ -3117,7 +3143,11 @@ impl App {
                     if let Some(prepare) = self.global_search.page_edit_prepare.as_ref() {
                         let _ = prepare.tx.send(SearchPrepareCommand::Mtime(result.clone()));
                     }
-                    if let Some(container) = self.global_search.containers.get_mut(&result.path) {
+                    if let Some(container) = self
+                        .global_search
+                        .containers
+                        .get_mut(&search_path_key(&result.path))
+                    {
                         if container.mtime.is_none() {
                             container.mtime = result.mtime;
                             applied += 1;
@@ -3931,13 +3961,13 @@ impl App {
                 FacetScope::path(container_root)
             };
             route = route.child(root);
-            if current_path != container_root {
+            if !crate::folder_tree::path_eq(current_path, container_root) {
                 if *is_zip {
-                    if let Ok(prefix) = current_path.strip_prefix(container_root) {
+                    if let Some(prefix) = relative_search_path(current_path, container_root) {
                         route = route
                             .child(FacetScope::book(container_root, &prefix.to_string_lossy()));
                     }
-                } else if let Ok(relative) = current_path.strip_prefix(container_root) {
+                } else if let Some(relative) = relative_search_path(current_path, container_root) {
                     let mut path = container_root.clone();
                     for component in relative.components() {
                         path.push(component);
@@ -4264,12 +4294,12 @@ impl App {
         let Some(d) = self.global_search.drill.clone() else {
             return;
         };
-        if d.current_path == d.container_root {
+        if crate::folder_tree::path_eq(&d.current_path, &d.container_root) {
             self.drill_back_to_top();
         } else if let Some(parent) = d.current_path.parent() {
             let parent_pb = parent.to_path_buf();
             // container_root 外へは出さない (出るならトップレベルに戻る)
-            if parent_pb.starts_with(&d.container_root) {
+            if path_is_under_or_eq(&parent_pb, &d.container_root) {
                 // suppression anchor (= 開いたコンテナ) の subtree 内に
                 // 留まっているので、★一時解除を維持する (Codex P2)。
                 // 「本の中で上の階層へ戻った」だけで未評価の中身が再非表示に
@@ -4374,7 +4404,10 @@ impl App {
         // 現コンテナを Aggregated と同じ並び順で求め、その中での位置を取る。
         let containers =
             sort_containers_with_mode(&self.global_search.containers, self.global_search.sort_mode);
-        let Some(cur_idx) = containers.iter().position(|c| c.path == container_root) else {
+        let Some(cur_idx) = containers
+            .iter()
+            .position(|c| crate::folder_tree::path_eq(&c.path, &container_root))
+        else {
             return;
         };
         let cur = &containers[cur_idx];
@@ -4388,7 +4421,9 @@ impl App {
             }
             SearchContainerKind::Zip => vec![container_root.clone()],
         };
-        let dfs_pos = dfs.iter().position(|p| p == &current_path);
+        let dfs_pos = dfs
+            .iter()
+            .position(|p| crate::folder_tree::path_eq(p, &current_path));
 
         // 1) 現コンテナ subtree 内での次/前を試す。
         if let Some(i) = dfs_pos {
@@ -4498,18 +4533,18 @@ impl App {
                     .and_then(|n| n.to_str())
                     .map(str::to_string)
                     .unwrap_or_else(|| container_root.to_string_lossy().to_string());
-                let rel: Vec<String> = if current_path == container_root {
-                    Vec::new()
-                } else {
-                    current_path
-                        .strip_prefix(&container_root)
-                        .map(|rel| {
-                            rel.components()
-                                .map(|c| c.as_os_str().to_string_lossy().to_string())
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                };
+                let rel: Vec<String> =
+                    if crate::folder_tree::path_eq(&current_path, &container_root) {
+                        Vec::new()
+                    } else {
+                        relative_search_path(&current_path, &container_root)
+                            .map(|rel| {
+                                rel.components()
+                                    .map(|c| c.as_os_str().to_string_lossy().to_string())
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
                 let mut segs = vec![root_name];
                 segs.extend(rel);
                 let suffix = if self.global_search.is_searching() {
@@ -4947,6 +4982,98 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn acceptance_d_display_spellings_share_container_and_drill_keys() {
+        let mut state = GlobalSearchState::default();
+        for (path, kind) in [
+            ("C:/Shelf/Photo.JPG", IndexKind::Image),
+            ("c:/shelf/Other.JPG", IndexKind::Image),
+            ("C:/Shelf/Chapter/One.JPG", IndexKind::Image),
+            ("c:/shelf/chapter/Two.JPG", IndexKind::Image),
+            ("c:/shelf/chapter", IndexKind::Folder),
+        ] {
+            state.accumulate_hit(&caption_book_hit(Path::new(path), kind, 0));
+        }
+        assert_eq!(
+            state.containers.len(),
+            2,
+            "identity must ignore display spelling"
+        );
+        assert_eq!(
+            state.containers[&search_path_key(Path::new("c:/shelf"))].path,
+            Path::new("C:/Shelf")
+        );
+        let root = Path::new("c:/SHELF");
+        let (rows, _, branches) = build_drilled_items_with_recipe(
+            &state,
+            root,
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+            &Default::default(),
+        );
+        assert_eq!(rows.len(), 3, "two images and one search branch");
+        assert_eq!(branches.len(), 1);
+        assert!(rows.contains(&GridItem::Image("C:/Shelf/Photo.JPG".into())));
+        assert!(rows.contains(&GridItem::Image("c:/shelf/Other.JPG".into())));
+        let counts = compute_drilled_subfolder_counts(&state, root, false);
+        assert_eq!(counts["c:/shelf/chapter"][0], 2);
+        let (pages, _) = build_drilled_items(
+            &state,
+            Path::new("c:/SHELF/CHAPTER"),
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+        );
+        assert_eq!(pages.len(), 2);
+        assert_eq!(collect_hit_folders_dfs(&state.all_hits, root).len(), 2);
+    }
+
+    #[test]
+    fn acceptance_d_rows_and_open_dispatch_preserve_result_path_spelling() {
+        let root = Path::new("C:/MixedShelf");
+        let paths = [
+            (root.join("MixedPhoto.JPG"), IndexKind::Image),
+            (root.join("MixedFolder"), IndexKind::Folder),
+            (root.join("MixedBook.ZIP"), IndexKind::Zip),
+        ];
+        let mut state = GlobalSearchState::default();
+        for (path, kind) in &paths {
+            state.accumulate_hit(&caption_book_hit(path, *kind, 0));
+        }
+        let (flat, _) = build_flat_items(&state, crate::settings::SortOrder::FileName, &[true; 6]);
+        let (drill, _, _) = build_drilled_items_with_recipe(
+            &state,
+            root,
+            false,
+            crate::settings::SortOrder::FileName,
+            &[true; 6],
+            &Default::default(),
+        );
+        assert_eq!(flat, drill);
+        for (path, _) in &paths {
+            assert!(
+                flat.iter()
+                    .any(|item| item.drag_source_path() == Some(path.as_path()))
+            );
+        }
+        let mut app = crate::app::setup_app_for_test();
+        app.items = flat;
+        for (path, _) in &paths[1..] {
+            let index = app
+                .items
+                .iter()
+                .position(|item| item.drag_source_path() == Some(path.as_path()))
+                .unwrap();
+            let opened = match app.accept_grid_container_open(&egui::Context::default(), index) {
+                Some(crate::ui_main::AddressBarNav::Direct(open, _)) => open,
+                Some(crate::ui_main::AddressBarNav::GridVirtual(intent)) => intent.path,
+                other => panic!("unexpected open route: {other:?}"),
+            };
+            assert_eq!(opened, *path);
+        }
+    }
+
+    #[test]
     fn caption_books_use_stored_kind_in_flat_drill_and_aggregate() {
         use crate::archive_converter::ArchiveFormat;
         let mut state = GlobalSearchState::default();
@@ -4989,7 +5116,7 @@ pub(crate) mod tests {
                 format
             }));
         }
-        let container = &state.containers[Path::new("C:/books")];
+        let container = &state.containers[&search_path_key(Path::new("C:/books"))];
         assert_eq!(container.hit_count, 7);
         assert_eq!(
             container.representative.as_ref().unwrap().path,
@@ -5086,7 +5213,7 @@ pub(crate) mod tests {
         }
         assert_eq!(state.all_hits.len(), 2);
         assert!(
-            state.containers[Path::new("C:/books")]
+            state.containers[&search_path_key(Path::new("C:/books"))]
                 .representative
                 .is_none()
         );
@@ -7948,14 +8075,12 @@ pub(crate) mod tests {
     /// ZIP コンテナへ drill-in したときは、その ZIP のエントリだけがフラットに
     /// 並ぶこと (他の ZIP や通常フォルダのヒットは含まれない)。
     ///
-    /// 注意: Tantivy 側で hit.path は `normalize_path` 済み (小文字化 + '/')
-    /// なのでテスト入力も同じ形で用意する。`build_drilled_zip_items` は
-    /// `normalize_path(zip_path)` と hit の zip 部分を文字列比較する。
+    /// Result paths retain display spelling; container matching uses normalized keys.
     #[test]
     fn build_drilled_zip_items_shows_only_entries_of_target_zip() {
         let mut state = GlobalSearchState::default();
         for p in [
-            zip_hit("c:/archives/target.zip", "folder/pic1.jpg"),
+            zip_hit("C:/Archives/Target.ZIP", "folder/pic1.jpg"),
             zip_hit("c:/archives/target.zip", "folder/pic2.jpg"),
             zip_hit("c:/archives/other.zip", "x.jpg"), // 別 ZIP
             "c:/loose/z.jpg".to_string(),              // 通常ファイル

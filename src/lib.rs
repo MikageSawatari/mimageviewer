@@ -86,6 +86,7 @@ pub use app::draw_thumbnail_name_style_snapshot_fixture;
 #[doc(hidden)]
 pub use app::draw_video_thumbnail_indicator_snapshot_fixture;
 pub use ui_dialogs::agent_integration::draw_agent_integration_snapshot_fixture;
+pub use ui_dialogs::agent_integration::draw_agent_registration_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_book_resume_meter_settings_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_file_organize_destinations_settings_snapshot_fixture;

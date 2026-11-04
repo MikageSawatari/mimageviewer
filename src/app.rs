@@ -15301,6 +15301,8 @@ fn viewer_bundle_references_removed(
 
 #[derive(Clone, Debug)]
 struct MediaResumeUpdate {
+    /// Stream capability captured while the owning player is still alive.
+    has_video: bool,
     clear_generation: u64,
     path: PathBuf,
     key: String,
@@ -15431,6 +15433,7 @@ fn viewer_context_media_teardown_plan(
                 position: video_resume_position_for_save(player, audio_mode_without_vst),
                 duration: player.duration(),
                 at_eof: player.is_at_eof(),
+                has_video: player.info().is_some_and(|info| info.has_video),
                 audio_track_choice: player.take_confirmed_audio_track_choice(),
             });
         }
@@ -43526,6 +43529,13 @@ impl App {
                 )],
             );
         }
+        // Retire membership owned by the departing list before deriving visibility.
+        self.search_filter = None;
+        self.search_filter_origin_folder = None;
+        if !detached_physical {
+            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
+            self.cancel_search_pending();
+        }
         let rebuild_t0 = std::time::Instant::now();
         self.rebuild_visible_indices();
         if crate::perf::is_enabled() {
@@ -43559,16 +43569,6 @@ impl App {
         self.panorama_projection_popup_open = false;
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
-        self.search_filter = None;
-        self.search_filter_origin_folder = None;
-        if !detached_physical {
-            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
-            // 非同期検索 in-flight があればキャンセル (フォルダ切替で items が変わるため
-            // 検索結果インデックスが意味を失う)
-            if let Some(pending) = self.search_pending.take() {
-                pending.cancel.store(true, Ordering::Relaxed);
-            }
-        }
         // メタデータ読み込みも idx ベースなのでフォルダ切替時にキャンセル
         if let Some(pending) = self.metadata_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
@@ -65188,6 +65188,7 @@ impl App {
         }
         for update in &updates {
             if update.clear_generation == self.media_memory_clear_generation
+                && update.has_video
                 && self
                     .settings
                     .video_resume_positions
@@ -96788,6 +96789,7 @@ impl App {
             position,
             duration,
             at_eof: ended,
+            has_video: false,
             audio_track_choice: None,
         }]);
         #[cfg(windows)]
@@ -96813,7 +96815,9 @@ impl App {
                         .is_some_and(|state| state.fs_idx == *idx);
                 let pos = video_resume_position_for_save(player, audio_mode_without_vst);
                 #[cfg(windows)]
-                thumb_requests.push((player.path().clone(), key.clone(), pos));
+                if player.info().is_some_and(|info| info.has_video) {
+                    thumb_requests.push((player.path().clone(), key.clone(), pos));
+                }
                 updates.push(MediaResumeUpdate {
                     clear_generation: self.media_memory_clear_generation,
                     path: player.path().clone(),
@@ -96821,6 +96825,7 @@ impl App {
                     position: pos,
                     duration: player.duration(),
                     at_eof: player.is_at_eof(),
+                    has_video: player.info().is_some_and(|info| info.has_video),
                     audio_track_choice: player.take_confirmed_audio_track_choice(),
                 });
             }
@@ -96841,6 +96846,15 @@ impl App {
         key: &str,
         position_secs: f64,
     ) {
+        // Audio progress (including Remote) shares the resume store, but never
+        // owns a video resume image. No stat/SQLite/FFmpeg work is needed here.
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| crate::folder_tree::is_audio_ext(&ext.to_ascii_lowercase()))
+        {
+            return;
+        }
         if !position_secs.is_finite() || position_secs < VIDEO_RESUME_MIN_POSITION_SECS {
             return;
         }
@@ -98501,6 +98515,7 @@ impl App {
                         position: pos,
                         duration: player.duration(),
                         at_eof: player.is_at_eof(),
+                        has_video: player.info().is_some_and(|info| info.has_video),
                         audio_track_choice: player.take_confirmed_audio_track_choice(),
                     });
                 }

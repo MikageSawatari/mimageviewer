@@ -471,7 +471,8 @@ fn scan_with_io_and_captions(
             let Some(_permit) = io_sem.acquire_cancellable(priority, &cancel) else {
                 return Err(ScanError::Cancelled);
             };
-            let path = Path::new(&key);
+            let restored = crate::path_key::restore_existing_path_casing(Path::new(&key));
+            let path = restored.as_deref().unwrap_or_else(|| Path::new(&key));
             if folder_tree::is_apple_double(path) {
                 continue;
             }

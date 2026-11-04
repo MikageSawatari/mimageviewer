@@ -716,6 +716,7 @@ mod tests {
     fn sample_doc(path: &str, fav: Uuid, text: &str) -> IndexDoc {
         let key = normalize_path(&PathBuf::from(path));
         IndexDoc {
+            display_path: key.clone(),
             path: key,
             container: Container::Fs,
             zip_entry: String::new(),

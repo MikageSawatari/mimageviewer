@@ -170,6 +170,7 @@ fn saved_position_media_clear_preserves_books_and_other_settings_then_saves_and_
     let key = crate::adjustment_db::normalize_path(&path);
     let clear_generation = app.media_memory_clear_generation;
     app.apply_media_resume_updates(vec![MediaResumeUpdate {
+        has_video: true,
         clear_generation,
         path,
         key: key.clone(),

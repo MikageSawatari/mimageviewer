@@ -842,7 +842,7 @@ impl App {
             return Err("ほかの操作が完了してから検索してください");
         }
         if kind == Kind::Local && self.grid_is_pdf_pages() {
-            return Err("PDF のページ表示中は現在地を絞り込めません");
+            return Err("本のページ表示中は現在地を絞り込めません");
         }
         Ok(())
     }
@@ -871,6 +871,12 @@ impl App {
         ctx.request_repaint();
     }
     pub(crate) fn open_search_shortcut(&mut self, ctx: &egui::Context, kind: Kind) {
+        if kind == Kind::Local
+            && let Err(reason) = self.pinned_search_availability(kind)
+        {
+            self.show_feedback_result(reason.into(), crate::feedback::FeedbackKind::Info);
+            return;
+        }
         if kind.pinned(&self.settings) {
             self.ensure_search_session(kind);
             self.request_pinned_search_focus(ctx, kind);

@@ -695,6 +695,28 @@ catalogは保持し、v1.0〜v1.3から直接更新する旧タグは取り込�
 
 ### 4.11 AI 生成メタデータと保存済み AI 説明文 (INDEX_VERSION=11)
 
+2026-11-04 受入 D: 同じ未公開の版11に、Tantivyの`display_path`（STOREDのみ）を含める。
+`IndexDoc.path`・Tantivyの`path` term・`fts_meta`・caption DBの照合キーは従来どおり正規化する。
+`display_path`は`CandidateFile.abs_path`の元の大小文字を保存し、`search_page`はこの値を
+表示/open用の結果pathとして返す。名前・メタ情報の正規化、検索条件、照合キーは変えない。
+必須STORED fieldのschema検査にも加え、開発途中の旧版11は既存の共通ownerで再構築する。
+版12・移行処理・UIでのstatや文字列の大小文字推測は追加しない。
+
+caption DBのkeyから候補を作るFullの本追加とcaption reflection（画像・PDF/EPUBも含む）は、
+既存worker用`restore_existing_path_casing`で実在する同じ論理pathの表記を復元してから
+通常の候補生成へ渡す。watcherと通常FS列挙は元のpathを保持する。
+Flat/DrillのGridItem・開く操作は結果pathを保持し、履歴・ブックマークへ渡す元pathも
+そこから導く。キーを作る境界だけがnormalizeする。旧ZIP memberの比較もkeyへ正規化する。
+集約の`containers`は正規化した親pathをキー、`ContainerHit.path`を表示/open用の値として
+分離する。mtime完了も同じキーへ適用する。Drillの包含・相対位置・直下子の集約・件数・
+DFS・戻る/次の本・facet帰路は、正規化キーで同一性とcomponent境界を確認し、
+表示用pathのcomponentから相対部分を取り出す。大小文字や区切りだけが異なる同じ場所を
+別の集約へ分けたり、Drillの対象から落としたりしない。I/Oは追加しない。
+`acceptance_d_display_spellings_share_container_and_drill_keys`は同じ場所の大小文字違いを
+混在させ、集約2件・Drill3行・子の件数2件・ページ2件・DFS2箇所を検査する。
+`acceptance_d_search_preserves_physical_path_casing_for_scan_and_reflection`が、実ファイルの
+画像・フォルダ本・説明文のあるZIP本をFullとcaption反映の両方で検索する。
+
 版の履歴:
 - **10**: 生成前テンプレートを検索へ入れない typed provenance による再構築。
 - **11**: `ai_caption_text` (bigram + STORED) を追加。`SourceKind::AiCaption`・
@@ -768,6 +790,20 @@ Tantivy は通さない。SQLite LIKE の方が対象件数 (フォルダ構造�
 速く、実装もシンプル。
 
 ### 5.2 Ctrl+F — 現在地フィルタ (現グリッドの表示中アイテムのみ)
+
+2026-11-04 受入 A: 一覧全体を採用する `install_loading_items_inner` は、旧一覧の
+`search_filter`・origin・未完了検索を終了してから `rebuild_visible_indices` を行う。
+入力の固定表示／終了時消去の規則は維持する。実フォルダ（履歴・再読込を含む）、
+PDF/EPUB、書庫初回、検索結果はこの境界を共有する。ZIP内階層、検索の再投影、
+Collection の別入口も解除後に可視列を作り、snapshot復帰は対応するitemsとfilterを対で戻す。
+世代付きfilterも検討したが今回は採らない。同じ一覧の削除・再配置・snapshotでは
+membershipを明示転送する既存経路があり、世代だけを追加するとその契約も変更するため。
+一覧採用の既存終了境界を先に確定する順序へ揃え、旧index集合を新しい可視列へ使う機会を除く。
+回帰: `acceptance_a_list_replacement_retires_local_filter_before_visibility`。
+
+受入 E: PDF/EPUBのページ内は従来どおり現在地フィルタ対象外。
+`pinned_search_availability(Local)`をmenu・固定欄・shortcutで共有し、menuはdisabled tooltip、
+既存`GlobalLocalSearch`の発火は理由をInfo通知する。空に見えるbarを開いて即閉じる導線をなくす。
 
 ```
 UI (render_search_bar)

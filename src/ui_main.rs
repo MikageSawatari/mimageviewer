@@ -8612,7 +8612,10 @@ impl App {
                                             rating_menu_drawn = true;
                                         }
                                         MenuCommandId::FileLocalSearch => {
-                                            if ui.button(&local_search_menu_label).clicked() {
+                                            let availability = self.pinned_search_availability(crate::ui_pinned_search::PinnedSearchKind::Local);
+                                            let response = ui.add_enabled(availability.is_ok(), egui::Button::new(&local_search_menu_label));
+                                            let response = if let Err(reason) = availability { response.on_disabled_hover_text(reason) } else { response };
+                                            if response.clicked() {
                                                 // 相互排他は open_local_metadata_search 内で (Ctrl+S/Ctrl+G を閉じる)
                                                 self.open_local_metadata_search();
                                                 ui.close();

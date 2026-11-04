@@ -289,7 +289,7 @@ fn collect_folder_caption_targets(
 }
 
 impl App {
-    fn caption_targets(&self, background: bool) -> CaptionTargets {
+    pub(super) fn caption_targets(&self, background: bool) -> CaptionTargets {
         let indices = self.selection_target_indices(ActionSurface::MainWindow);
         if background || indices.is_empty() {
             let Some(folder) = self.current_folder.as_deref() else {
@@ -316,8 +316,8 @@ impl App {
             return;
         }
         let targets = self.caption_targets(background);
-        if let Some(job) = self.caption_job.as_mut() {
-            job.append(targets);
+        if self.caption_job.is_some() {
+            self.append_caption_job_targets(targets);
             return;
         }
         if targets.paths.is_empty() {
@@ -330,7 +330,28 @@ impl App {
             );
             return;
         }
+        if targets.unsupported != 0 {
+            self.show_feedback_result(
+                format!("AI 説明文を作成します (対象外 {})", targets.unsupported),
+                FeedbackKind::Info,
+            );
+        }
         self.request_vlm_caption_setup_targets(ctx, targets);
+    }
+
+    fn append_caption_job_targets(&mut self, targets: CaptionTargets) {
+        let job = self.caption_job.as_mut().expect("existing caption job");
+        let before = job.queue.len();
+        let unsupported = targets.unsupported;
+        let message = if job.append(targets) {
+            format!(
+                "AI 説明文の作成に追加しました (追加 {}、対象外 {unsupported})",
+                job.queue.len() - before
+            )
+        } else {
+            STOPPING_MESSAGE.into()
+        };
+        self.show_feedback_result(message, FeedbackKind::Info);
     }
 
     pub(crate) fn start_caption_job(
@@ -339,10 +360,8 @@ impl App {
         targets: CaptionTargets,
         config: CaptionWorkerConfig,
     ) {
-        if let Some(job) = self.caption_job.as_mut() {
-            if !job.append(targets) {
-                self.show_feedback_result(STOPPING_MESSAGE.into(), FeedbackKind::Info);
-            }
+        if self.caption_job.is_some() {
+            self.append_caption_job_targets(targets);
             return;
         }
         if targets.paths.is_empty() {
@@ -511,6 +530,35 @@ mod tests {
             }
             CaptionWorkerCommand::Finish => panic!("premature Finish"),
         }
+    }
+
+    #[test]
+    fn acceptance_c_appending_reports_added_and_unsupported_counts() {
+        let mut app = crate::app::setup_app_for_test();
+        let (job, _commands, _events) = job();
+        app.caption_job = Some(job);
+        app.items = vec![
+            GridItem::Image("C:/Photo.jpg".into()),
+            GridItem::PdfPage {
+                pdf_path: "C:/Book.pdf".into(),
+                page_num: 0,
+                content_type: None,
+            },
+        ];
+        app.selected = Some(0);
+        app.checked = [0, 1].into_iter().collect();
+        app.request_create_ai_captions(&egui::Context::default(), false);
+        let text = &app.fs_feedback_toast.as_ref().expect("append feedback").0;
+        assert!(text.contains("追加 1"), "{text}");
+        assert!(text.contains("対象外 1"), "{text}");
+        app.request_create_ai_captions(&egui::Context::default(), false);
+        let text = &app
+            .fs_feedback_toast
+            .as_ref()
+            .expect("duplicate append feedback")
+            .0;
+        assert!(text.contains("追加 0"), "{text}");
+        assert!(text.contains("対象外 1"), "{text}");
     }
 
     #[test]
