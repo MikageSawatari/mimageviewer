@@ -181,7 +181,7 @@ impl App {
                         ui.end_row();
 
                         ui.label("AVIF (libavif / dav1d / libyuv)");
-                        ui.label("BSD ? AOMedia / VideoLAN / libyuv authors");
+                        ui.label("BSD — AOMedia / VideoLAN / libyuv authors");
                         ui.end_row();
                         ui.label("LibRaw");
                         ui.label("CDDL-1.0 — LibRaw LLC");
