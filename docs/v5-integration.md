@@ -709,3 +709,12 @@ git add / commit / merge等のgit書き込みも行わない。
 - 独立レビュー (xhigh): ACCEPT、指摘なし。
 - 実機確認: サブ PC 依頼 12 (観測者: サブ PC 担当)。版 0.15.0-miv.5、前回の表示で始まる、About のボタンは「Third party notices」「ソースコード」「Close」の順で開き直しても二重にならない、Chrome で miv-sound が開き上部に「forked from Frieve-A/effetune-mixwright」、設定画面に GitHub ボタンが無い。About の「Close」「Third party notices」が英語のまま (上流の About が固定の英語) なのは、次の版 (miv.6) で訳す (利用者決定)。
 - 利用者が rc2 でのテストを先に始めたいと判断したため、利用者自身の手元確認の前にサブ PC の確認で承認した。`.\scripts\build-miv-sound.ps1 -Approve -Candidate 355585fd…` で `third_party/miv-sound/0.15.0-miv.5/` を作成。バックアップは `C:\home\mimageviewer_vendor_backup\miv-sound-0.15.0-miv.5\`。
+
+## 15. VLM worker の生成中の反復抑制 (DRY) の採用 (2026-11-05)
+
+- 内容: `docs/local-vlm-caption-plan.md` §18.9。説明文の文字列値の中だけに llama.cpp b12032 の DRY を掛け、同じ単語・行が上限まで続くのを抑える (利用者決定「v5 に入れる」「文字列化の結果が多少かわることは問題ない」)。ブランチ `vlm-repeat` (`758f6177e`) を v5-integration へ取り込んだ。
+- 独立レビュー (xhigh): ACCEPT。
+- 比較 (設計担当が開発機で worker を直接実行、製品は起動していない。結果は `G:\home\vlm-eval\runs\20261105-repeat\`): 評価用セット 26 枚は出力が全て同一、中央値 1.61→1.72 秒。利用者の DB でループしていた 11 枚は、768 で大きな反復 (240〜396 文字) 7 枚→0 枚 (6〜9 文字の重なりが 3 枚残る)、1024 で 7 枚→0 枚。JSON はすべて妥当。
+- worker 本体: `vendor/vlm-worker/mimageviewer-vlm.exe` を新しいソースの identity `9159b4a1…` に更新し、`scripts/vlm-worker-identity.ps1 -ValidateRepo` で照合した。`C:\home\mimageviewer_vendor_backup\vlm-worker\` も更新し、旧版 (`79c6482a…`) は `C:\home\mimageviewer_vendor_backup\vlm-worker-79c6482a-before-dry.exe` に残した。
+- 保存前に反復を切る処理 (§1.716) は、取りこぼしへの保険として別に入れる。
+- 実機確認: 未確認 (rc3 で利用者・サブ PC が確認する)。
